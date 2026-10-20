@@ -5237,13 +5237,69 @@ done
         assert!(err.contains("which is more than half the 300 KB free on its disk to save first") && !err.contains("DISCARD_MAX_GB"), "{err}");
         untouched("over half the free space");
         // What the line says moves it out of the way, and the switch then goes through.
-        let fix = line.split_once("(cd ").and_then(|(_, r)| r.split_once("), or delete it")).map(|(f, _)| f).expect("the move");
-        assert_eq!(fix, format!("'{repo}' && mv -- 'checkpoints' '../checkpoints.kept'"));
-        assert!(s.run(&format!("cd {fix}")).status.success());
+        let (fix, kept) = suggested_move(line, repo, "checkpoints");
+        assert!(s.run(&fix).status.success());
         let o = s.run(&checkout_command_limited(repo, "main", None, true, 100));
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/main"]));
-        assert_eq!(std::fs::read(s.base.join("checkpoints.kept/model.pt")).unwrap(), weights.as_bytes());
+        assert_eq!(std::fs::read(s.base.join(kept).join("model.pt")).unwrap(), weights.as_bytes());
+    }
+
+    /// The move a refused `--hard` save's line suggests for `path` (review ai-review claude #5):
+    /// `(cd '<repo>' && mv -n -- '<path>' '../<name>.kept-<UTC time>')`, every word as
+    /// [`shell_quote`] quotes it. Returns the command and the kept copy's name.
+    #[cfg(unix)]
+    fn suggested_move(line: &str, repo: &str, path: &str) -> (String, String) {
+        let fix = line
+            .split_once("move it out of the checkout ")
+            .and_then(|(_, r)| r.split_once(", or delete it, then switch again"))
+            .map(|(f, _)| f.to_string())
+            .unwrap_or_else(|| panic!("no move in: {line}"));
+        let name = std::path::Path::new(path).file_name().unwrap().to_string_lossy().into_owned();
+        let at = fix.find(".kept-").unwrap_or_else(|| panic!("{fix}")) + ".kept-".len();
+        let stamp = &fix[at..at + 16];
+        assert!(
+            stamp.len() == 16 && stamp.as_bytes()[8] == b'T' && stamp.ends_with('Z') && stamp[..8].bytes().chain(stamp[9..15].bytes()).all(|b| b.is_ascii_digit()),
+            "a UTC time: {fix}"
+        );
+        let kept = format!("{name}.kept-{stamp}");
+        assert_eq!(fix, format!("(cd {} && mv -n -- {} {})", shell_quote(repo), shell_quote(path), shell_quote(&format!("../{kept}"))));
+        (fix, kept)
+    }
+
+    /// Review ai-review claude #5: the move a refused save suggested wrote `'…'` around the path
+    /// by hand — a path with a `'` in it came out broken — and always named the copy `<name>.kept`,
+    /// so a second switch's paste replaced the first's kept file (or nested a directory in it).
+    /// Now each word is quoted by the real quoting (`ds_quote`, as [`shell_quote`]), the copy is
+    /// `<name>.kept-<UTC time>`, and `mv -n` never replaces one: the same paste again moves
+    /// nothing, the first copy and the new file both kept.
+    #[cfg(unix)]
+    #[test]
+    fn the_suggested_move_pastes_as_it_is_and_never_replaces_a_kept_copy() {
+        let s = GitSandbox::new("discarded-move", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let name = "it's model.pt";
+        let staff = s.base.join("staff");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), staff.to_str().unwrap()]);
+        std::fs::write(staff.join(name), "the staff's\n").unwrap();
+        s.git(&staff, &["add", "-A"]);
+        s.git(&staff, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "staff"]);
+        s.git(&staff, &["push", "-q", "origin", "main"]);
+        std::fs::write(s.work.join(".git/info/exclude"), "*.pt\n").unwrap();
+        let (first, second) = (body("0123456789abcdef", 8 * 1024, 6), body("0123456789abcdef", 8 * 1024, 7));
+        std::fs::write(s.work.join(name), &first).unwrap();
+        let plain = std::env::var("PATH").unwrap_or_default();
+        let (code, out, err) = run_on_path(&checkout_command_limited(repo, "main", None, true, 1), &plain);
+        assert_ne!(code, Some(0), "{out}{err}");
+        let line = err.lines().find(|l| l.starts_with("arena set-branch: not reset — ")).unwrap_or_else(|| panic!("{err}"));
+        let (fix, kept) = suggested_move(line, repo, name);
+        let kept = s.base.join(kept);
+        assert!(s.run(&fix).status.success(), "{fix}");
+        assert_eq!((std::fs::read_to_string(&kept).unwrap(), s.work.join(name).exists()), (first.clone(), false), "moved: {fix}");
+        // The same paste again, a new file there: nothing replaced.
+        std::fs::write(s.work.join(name), &second).unwrap();
+        s.run(&fix);
+        assert_eq!((std::fs::read_to_string(&kept).unwrap(), s.read(name)), (first, second.into_bytes()), "{fix}");
     }
 
     /// Review ai-review claude #4, to verify: could the gentle switch's refusal of a pod mid-merge

@@ -192,7 +192,8 @@ ds_abandon() {
 # `ds_fits <list> <git dir> <max KiB>`: whether the paths listed (relative to the repo's top) fit
 # in a save — `du -sk` of each, totalled — under <max KiB> and under half what's free on the
 # filesystem of <git dir> (`df -Pk`; a `df` that can't tell leaves only the max). If not, says on
-# stderr which path is biggest, how much is too much, and how to move it out of the way.
+# stderr which path is biggest, how much is too much, and how to move it out of the way
+# (`ds_move`).
 ds_fits() {
     tr '\n' '\0' < "$1" | xargs -0 du -sk -- 2>/dev/null | LC_ALL=C sort -rn > "$1.du" || true
     ds_kb=$(awk '{ s += $1 } END { printf "%.0f\n", s + 0 }' "$1.du")
@@ -207,8 +208,25 @@ ds_fits() {
     ds_what="$ds_big ($(ds_size "$(head -n 1 "$1.du" | cut -f1)"))"
     ds_n=$(wc -l < "$1.du")
     if [ "$ds_n" -gt 1 ]; then ds_what="$ds_what and $((ds_n - 1)) more path(s), $(ds_size "$ds_kb") in all"; fi
-    printf '%s\n' "arena set-branch: not reset — the --hard reset would remove $ds_what, which is $ds_over to save first: move it out of the checkout (cd '$(pwd)' && mv -- '$ds_big' '../$(basename -- "$ds_big").kept'), or delete it, then switch again" >&2
+    printf '%s\n' "arena set-branch: not reset — the --hard reset would remove $ds_what, which is $ds_over to save first: move it out of the checkout $(ds_move "$ds_big"), or delete it, then switch again" >&2
     return 1
+}
+
+# `ds_move <path>`: the command that moves <path> (relative to the repo's top) out of the checkout,
+# next to it, as `<its name>.kept-<UTC time>` (review ai-review claude #5): a name no earlier
+# kept copy has, and `mv -n` besides, so a second switch's advice never replaces the first's copy
+# (or, for a directory, nests in it). Each word quoted by `ds_quote`: a path with a `'` in it
+# pastes as it is.
+ds_move() {
+    printf '(cd %s && mv -n -- %s %s)' "$(ds_quote "$(pwd)")" "$(ds_quote "$1")" \
+        "$(ds_quote "../$(basename -- "$1").kept-$(date -u +%Y%m%dT%H%M%SZ)")"
+}
+
+# `ds_quote <word>`: <word> single-quoted for a POSIX shell, each `'` in it as `'\''` —
+# arena_core::backup's shell_quote. (The `.` keeps a trailing newline from the substitution.)
+ds_quote() {
+    ds_qw=$(printf '%s.' "$1" | sed "s/'/'\\\\''/g")
+    printf "'%s'" "${ds_qw%.}"
 }
 
 # `ds_size <KiB>`: in words, GB to one decimal.

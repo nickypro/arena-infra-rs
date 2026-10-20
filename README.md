@@ -921,8 +921,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (default 5) or over half what's free on that disk (`df`), nothing of it is copied and the pod
     isn't reset — `arena set-branch: not reset — the --hard reset would remove checkpoints (31.2
     GB), which is more than DISCARD_MAX_GB allows (5.0 GB) to save first: move it out of the
-    checkout (cd '/root/ARENA_materials' && mv -- 'checkpoints' '../checkpoints.kept'), or delete
-    it, then switch again`. `--hard` with `--include-non-cohort` is refused unless the pods are
+    checkout (cd '/root/ARENA_materials' && mv -n -- 'checkpoints'
+    '../checkpoints.kept-20261020T071500Z'), or delete it, then switch again` — every word quoted
+    (a `'` in a path pastes as it is), the kept copy under a name of its own, never over an earlier
+    one (`mv -n`; review ai-review claude #5). `--hard` with `--include-non-cohort` is refused unless the pods are
     named: it would reset staff boxes and other cohorts' pods too. A file the
     backup committed with a key redacted keeps the real key on disk: around the switch it's set
     aside in `.git/arena-unredacted/<time>-<pid>/` (so gentle doesn't refuse it and `--hard`
