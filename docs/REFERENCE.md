@@ -1336,8 +1336,12 @@ tools are off — not asked (…)`, naming it). The prompt goes on stdin (never 
 private temporary directory, with a minimal environment (`PATH`, `HOME`, the locale, XDG and proxy
 variables, and the AI's own config dir and API key — not the rest of yours), and in a session of its
 own: no controlling terminal, so it can't draw on the dashboard or read your keys through
-`/dev/tty`. `--timeout` (default 300 s), Ctrl-C, or closing the dashboard stops it and everything it
-started. A missing binary is an error naming the other one.
+`/dev/tty`. `--timeout` (default 300 s), Ctrl-C, a hangup or a TERM (to `pods ask` or the
+dashboard: each handled as Ctrl-C), or closing the dashboard stops it and everything it started —
+TERM, then KILL 2 s later for whatever ignores it — and so does its own exit: what it leaves behind
+goes the same way. Should arena be killed outright (SIGKILL, a crash), the kernel TERMs the AI CLI
+itself (Linux: `PR_SET_PDEATHSIG`), though what that started is then the CLI's own to stop. A missing
+binary is an error naming the other one.
 
 #### Where answers are saved
 
@@ -1675,8 +1679,9 @@ action with `timed out after …`; only `c` (your interactive shell) is a plain 
 ### Navigating
 
 **Navigate** with `↑/↓`/`j/k`; `enter` opens a per-pod detail pane (per-GPU breakdown, full
-branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit; `Esc` only steps back (detail →
-list; on the list it clears the marks).
+branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit (so does a hangup or a TERM: the
+terminal restored, a question still out stopped); `Esc` only steps back (detail → list; on the list
+it clears the marks).
 
 ### Acting on pods
 

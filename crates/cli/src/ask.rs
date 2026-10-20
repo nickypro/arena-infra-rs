@@ -5,6 +5,7 @@
 //! prints exactly the prompt and sends nothing, the first-use note, the answer on stdout and
 //! everything else on stderr (so `arena pods ask … > answer.txt` keeps only the answer).
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -80,15 +81,42 @@ fn ai_command_line(ai: Ai, model: Option<&str>) -> String {
     )
 }
 
+/// What stops the AI while it answers: the operator's Ctrl-C (`ctrl_c`, the command's latched
+/// one), a hangup — the SSH session to this box dropped — or a TERM (`kill`, `timeout`): review
+/// ai-review claude #2, either signal killed arena outright, and the AI, in a session of its own,
+/// ran on as root with no timeout. Handled like Ctrl-C instead: `pods ask` stops the AI and what it
+/// started, says why and saves the run. Both are listened for from this call on (registered here,
+/// not on a first poll, so none slips in before). Resolves to the cause, for the message.
+pub(crate) fn stop_signals(ctrl_c: impl Future<Output = ()>) -> impl Future<Output = &'static str> {
+    use tokio::signal::unix::{signal, Signal, SignalKind};
+    let (hangup, term) = (signal(SignalKind::hangup()).ok(), signal(SignalKind::terminate()).ok());
+    // A listener's next signal; never, without one (or once its driver is gone).
+    async fn next(listener: Option<Signal>) {
+        if let Some(mut s) = listener {
+            if s.recv().await.is_some() {
+                return;
+            }
+        }
+        std::future::pending::<()>().await
+    }
+    async move {
+        tokio::select! {
+            () = ctrl_c => "Ctrl-C",
+            () = next(hangup) => "a hangup",
+            () = next(term) => "SIGTERM",
+        }
+    }
+}
+
 /// `pods ask`: every selected pod's bundle (stopped and unreachable ones from their listing)
 /// in one prompt, sent to `run.ai` with no tools; the answer on `out`, progress and notes on
 /// `note`. A dry run prints the exact prompt and sends — and saves — nothing. A real run saves
 /// the prompt and the answer (or why there is none) under the fleet's state dir and fails when
-/// the AI did. `stop` (the operator's Ctrl-C, listened for once the AI is started) stops the AI —
-/// the terminal's own Ctrl-C doesn't reach it, in a session of its own
-/// (`arena_core::remote::run_local_input`).
+/// the AI did. `stop` (listened for once the AI is started: [`stop_signals`] — Ctrl-C, a hangup,
+/// a TERM) stops the AI, its cause in the message — the terminal's own signals don't reach it, in
+/// a session of its own (`arena_core::remote::run_local_input`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn handle_ask<S: std::future::Future<Output = ()>>(
+pub(crate) async fn handle_ask<S: Future<Output = &'static str>>(
     remote: Arc<dyn Remote>,
     cfg: &Config,
     sel: &Selected,
@@ -137,7 +165,7 @@ pub(crate) async fn handle_ask<S: std::future::Future<Output = ()>>(
     let stop = stop();
     let outcome = tokio::select! {
         outcome = ai::ask(run.ai, &prompt, run.model.as_deref(), run.timeout, env) => outcome,
-        () = stop => Err(format!("interrupted (Ctrl-C): {} was stopped", run.ai.name())),
+        why = stop => Err(format!("interrupted ({why}): {} was stopped", run.ai.name())),
     };
     if let Ok(answer) = &outcome {
         out(answer);
@@ -211,7 +239,7 @@ mod tests {
     }
 
     /// A Ctrl-C that never comes.
-    fn never() -> std::future::Pending<()> {
+    fn never() -> std::future::Pending<&'static str> {
         std::future::pending()
     }
 
@@ -324,6 +352,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
+            "Ctrl-C"
         };
         let started = Instant::now();
         let mut notes = Vec::new();
@@ -341,6 +370,68 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(!alive(&leader) && !alive(&left), "the AI, or what it started, is still running");
+    }
+
+    /// Review ai-review claude #2 (lane ASK7 item H): a hangup (the operator's SSH session to this
+    /// box dropped) or a TERM stops the AI like Ctrl-C — `pods ask` says so, the AI and what it
+    /// started are gone, the run is saved — where either signal used to kill arena outright and
+    /// leave the AI, in a session of its own, running. The signal is sent to this test process
+    /// itself once the stub AI runs; `stop_signals` (what `pods ask` listens with) has its handler
+    /// registered by then, and one is made first here so no stray signal can end the test binary.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_hangup_or_a_term_stops_the_ai_like_ctrl_c() {
+        use arena_core::ask::ai::fixtures::{claude_help, on_path, stub};
+        use tokio::signal::unix::{signal, SignalKind};
+        let _held = (signal(SignalKind::hangup()).unwrap(), signal(SignalKind::terminate()).unwrap());
+        for (sig, why) in [("-HUP", "a hangup"), ("-TERM", "SIGTERM")] {
+            let t = Tmp::new(&format!("signal{sig}"));
+            let bin = t.0.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let (leader, left) = (t.0.join("leader.pid"), t.0.join("left.pid"));
+            stub(
+                &bin,
+                "claude",
+                &format!(
+                    "if [ \"$1\" = --help ]; then cat <<'EOF'\n{}EOF\nexit 0; fi\nsleep 60 & echo $! > {}\necho $$ > {}\ncat > /dev/null\nexec sleep 60",
+                    claude_help(&[]),
+                    left.display(),
+                    leader.display()
+                ),
+            );
+            let env = AiEnv { path: Some(on_path(&bin)), home: None, tmp: t.0.clone(), vars: Vec::new() };
+            let c = cfg(&t.0.join("state"));
+            let sel = Selected::all(vec![pod("alpha", Some(22001))]);
+            let leader_seen = leader.clone();
+            let stop = move || {
+                let stopping = stop_signals(std::future::pending());
+                tokio::spawn(async move {
+                    while !leader_seen.exists() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let sent = std::process::Command::new("kill").args([sig, &std::process::id().to_string()]).status().unwrap();
+                    assert!(sent.success());
+                });
+                stopping
+            };
+            let started = Instant::now();
+            let mut notes = Vec::new();
+            let e = handle_ask(fake_alpha(), &c, &sel, run(Ai::Claude, false, None), &env, stop, &mut |_| {}, &mut |l| notes.push(l.to_string())).await.unwrap_err();
+            assert_eq!(e.to_string(), format!("interrupted ({why}): claude was stopped"));
+            assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+            let saved = notes.iter().find_map(|n| n.strip_prefix("saved: ")).expect("saved");
+            assert_eq!(std::fs::read_to_string(std::path::Path::new(saved).join("answer.md")).unwrap(), format!("(no answer: interrupted ({why}): claude was stopped)\n"));
+            let alive = |p: &std::path::Path| {
+                let pid = std::fs::read_to_string(p).unwrap().trim().to_string();
+                std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().next()).map(|st| st != "Z" && st != "X")).unwrap_or(false)
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while (alive(&leader) || alive(&left)) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!alive(&leader) && !alive(&left), "{why}: the AI, or what it started, is still running");
+        }
     }
 
     /// The AI missing: an error naming the other one — and the failed run is still saved.

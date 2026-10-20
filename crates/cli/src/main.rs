@@ -7980,7 +7980,8 @@ async fn handle_pods_bal(
             let sel = cohort_only(cfg, sel, cohort);
             let run = ask::AskRun { ai: chosen, model, timeout: Duration::from_secs(timeout), dry_run, question };
             let env = arena_core::ask::AiEnv::from_process();
-            ask::handle_ask(remote, cfg, &sel, run, &env, || interrupt.wait(), &mut |l| println!("{l}"), &mut |l| eprintln!("{l}")).await?;
+            let stop = || ask::stop_signals(interrupt.wait());
+            ask::handle_ask(remote, cfg, &sel, run, &env, stop, &mut |l| println!("{l}"), &mut |l| eprintln!("{l}")).await?;
         }
         PodCmd::Idle { hours, json, sel } => {
             // Read-only: no confirm. The report prints commands; it never runs them.

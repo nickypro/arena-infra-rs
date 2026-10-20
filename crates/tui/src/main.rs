@@ -386,8 +386,9 @@ async fn main() -> Result<()> {
         last_table: std::cell::Cell::new((Rect::default(), 0)),
     };
 
+    let quit = quit_signals();
     let mut terminal = setup_terminal()?;
-    let res = run(&mut terminal, &shared, &provider, &interval, &nudge, &details_wanted, ui).await;
+    let res = run(&mut terminal, &shared, &provider, &interval, &nudge, &details_wanted, &quit, ui).await;
     restore_terminal(&mut terminal)?;
     res
 }
@@ -944,6 +945,28 @@ fn new_pod_mode(ui: &Ui, listed: std::result::Result<Vec<Pod>, String>) -> Mode 
     }
 }
 
+/// A hangup or a TERM, latched: the dashboard quits on either as on Ctrl-C (review ai-review
+/// claude #2) — the terminal restored, and a question still being asked (`?`) dropped, which stops
+/// the AI and everything it started (`arena_core::remote::run_local_input`). Before, either signal
+/// killed the dashboard outright, and the AI, in a session of its own, ran on. Listened for from
+/// this call on.
+fn quit_signals() -> Arc<AtomicBool> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let quit = Arc::new(AtomicBool::new(false));
+    for kind in [SignalKind::hangup(), SignalKind::terminate()] {
+        if let Ok(mut listener) = signal(kind) {
+            let quit = quit.clone();
+            tokio::spawn(async move {
+                if listener.recv().await.is_some() {
+                    quit.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+    }
+    quit
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     shared: &Arc<Mutex<Shared>>,
@@ -951,9 +974,14 @@ async fn run(
     interval: &AtomicU64,
     nudge: &Notify,
     details_wanted: &AtomicBool,
+    quit: &AtomicBool,
     mut ui: Ui,
 ) -> Result<()> {
     loop {
+        // A hangup or a TERM ([`quit_signals`]): as Ctrl-C.
+        if quit.load(Ordering::SeqCst) {
+            break;
+        }
         // A finished background action surfaces as a Result modal (then nudge a refresh).
         {
             let msg = shared.lock().unwrap().action_result.take();
@@ -5541,5 +5569,25 @@ deep_check_end=1
         let Mode::NewPod(form) = new_pod_mode(&ui, listed) else { panic!("no form") };
         assert_eq!(form.free.first().map(String::as_str), Some("devtest-bravo"), "alpha is taken");
         assert!(matches!(new_pod_mode(&ui, Err("vast 429".into())), Mode::Result(r) if r == "✗ list failed: vast 429"));
+    }
+
+    /// Review ai-review claude #2 (lane ASK7 item H): a hangup or a TERM latches `quit_signals`,
+    /// which the loop takes as Ctrl-C at its next round — the terminal restored, a question still
+    /// out dropped and with it the AI's whole group — where either signal used to kill the
+    /// dashboard outright, the AI running on in its own session. The signal is sent to this test
+    /// process, its listeners registered before.
+    #[tokio::test]
+    async fn a_hangup_or_a_term_quits_like_ctrl_c() {
+        for sig in ["-HUP", "-TERM"] {
+            let quit = quit_signals();
+            assert!(!quit.load(Ordering::SeqCst), "{sig}");
+            let sent = std::process::Command::new("kill").args([sig, &std::process::id().to_string()]).status().unwrap();
+            assert!(sent.success(), "{sig}");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !quit.load(Ordering::SeqCst) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(quit.load(Ordering::SeqCst), "{sig}: not latched");
+        }
     }
 }
