@@ -309,7 +309,6 @@ fn tmux_panes() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_script_runs_under_sh() {
-    use std::os::unix::fs::PermissionsExt;
     let root = std::env::temp_dir().join(format!("arena-reap-probe-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let (bin, home) = (root.join("bin"), root.join("home"));
@@ -317,8 +316,7 @@ fn the_script_runs_under_sh() {
     std::fs::create_dir_all(&home).unwrap();
     let stub = |name: &str, body: &str| {
         let p = bin.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::remote::write_test_script(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
     };
     stub("who", "exit 0");
     stub("tmux", "echo bash; echo python3");
@@ -365,7 +363,6 @@ fn the_script_runs_under_sh() {
 #[cfg(target_os = "linux")]
 #[test]
 fn review_rs6_a_symlinked_home_is_scanned_not_skipped() {
-    use std::os::unix::fs::PermissionsExt;
     let root = std::env::temp_dir().join(format!("arena-reap-probe-rv6-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let (bin, real, link) = (root.join("bin"), root.join("home_real"), root.join("home"));
@@ -374,8 +371,7 @@ fn review_rs6_a_symlinked_home_is_scanned_not_skipped() {
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let stub = |name: &str, body: &str| {
         let p = bin.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::remote::write_test_script(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
     };
     stub("nvidia-smi", "case \"$1\" in --query-gpu*) echo '0, 3';; *) ;; esac");
     // The link (and the dir) are older than the scan's start; the participant's file is newer.
@@ -454,7 +450,6 @@ fn home_mounts_and_processes_parse() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_script_lists_processes_and_sweep_folders() {
-    use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
     let root = std::env::temp_dir().join(format!("arena-reap-probe-rs7-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -464,8 +459,7 @@ fn the_script_lists_processes_and_sweep_folders() {
     std::fs::create_dir_all(real.join(".ipython/profile_default")).unwrap();
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let p = bin.join("nvidia-smi");
-    std::fs::write(&p, "#!/bin/sh\ncase \"$1\" in --query-gpu*) echo '0, 3';; *) ;; esac\n").unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::remote::write_test_script(&p, "#!/bin/sh\ncase \"$1\" in --query-gpu*) echo '0, 3';; *) ;; esac\n").unwrap();
     std::fs::write(real.join("ARENA_materials/TEMP_FOLDER_FOR_SWEEPS/run1/ckpt.pt"), "w").unwrap();
     std::fs::write(real.join(".ipython/profile_default/notes.ipynb"), "{}").unwrap();
     // Two processes in sessions of their own: a dormant job, and a login shell waiting on input.
@@ -513,7 +507,6 @@ fn the_script_lists_processes_and_sweep_folders() {
 #[cfg(target_os = "linux")]
 #[test]
 fn review_rr_idle_tmux_pane_is_not_a_who_login() {
-    use std::os::unix::fs::PermissionsExt;
     let root = std::env::temp_dir().join(format!("arena-reap-rr-who-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let (bin, home) = (root.join("bin"), root.join("home"));
@@ -521,8 +514,7 @@ fn review_rr_idle_tmux_pane_is_not_a_who_login() {
     std::fs::create_dir_all(&home).unwrap();
     let stub = |name: &str, body: &str| {
         let p = bin.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::remote::write_test_script(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
     };
     // What `who` prints on Ubuntu 24.04 for one detached tmux session with one pane.
     stub("who", "echo 'root     pts/1        2026-10-12 08:41 (tmux(4011013).%0)'");
@@ -546,10 +538,8 @@ fn review_rr_idle_tmux_pane_is_not_a_who_login() {
 /// Stand-in commands for running the real probe script here: `bin/<name>` with `body`.
 #[cfg(target_os = "linux")]
 fn review2_stub(bin: &std::path::Path, name: &str, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
     let p = bin.join(name);
-    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::remote::write_test_script(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
 }
 
 /// The real probe under `sh`, HOME = `home`, PATH = `bin` first.

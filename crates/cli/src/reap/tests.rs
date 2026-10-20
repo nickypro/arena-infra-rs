@@ -495,14 +495,13 @@ impl Drop for World {
 
 impl World {
     fn new(tag: &str, extra_cfg: &str) -> World {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("arena-reap-cli-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("snap/big")).unwrap();
         std::fs::write(dir.join("snap/.arena-backup-tier"), "snapshot\n").unwrap();
         std::fs::write(dir.join("snap/big/.arena-backup-tier"), "big\n").unwrap();
         let rsync = dir.join("rsync");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             &rsync,
             r#"#!/bin/sh
 d=$(dirname "$0")
@@ -529,7 +528,6 @@ exit "$(cat "$d/exit_snap" 2>/dev/null || echo 0)"
 "#,
         )
         .unwrap();
-        std::fs::set_permissions(&rsync, std::fs::Permissions::from_mode(0o755)).unwrap();
         let text = format!(
             "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=( alpha bravo charlie delta echo foxtrot \"@devtest-boss\" )\n\
              RUNPOD_API=v2\nARENA_STATE_DIR={d}/state\nLOCAL_BACKUP_DIR={d}/snap\nARENA_START_DATE=2026-10-05\n\
@@ -2216,13 +2214,12 @@ async fn review_rr_concurrent_reap_set_keeps_both_changes() {
 /// operator's `pods pull <other pod>` waits 120 s and FAILS as "busy", where before it ran.
 #[tokio::test]
 async fn review_rr_a_pull_releases_each_pods_lock_when_that_pod_is_done() {
-    use std::os::unix::fs::PermissionsExt;
     let w = World::new("rr-hold", "");
     let snap = w.dir.join("bk");
     std::fs::create_dir_all(&snap).unwrap();
     let mark = w.dir.join("alpha.done");
     let rsync = w.dir.join("rsync-slow-bravo");
-    std::fs::write(
+    arena_core::remote::write_test_script(
         &rsync,
         format!(
             "#!/bin/sh\ncase \"$1\" in --version) echo rsync; exit 0;; esac\nfor a in \"$@\"; do last=\"$a\"; done\n\
@@ -2232,7 +2229,6 @@ async fn review_rr_a_pull_releases_each_pods_lock_when_that_pod_is_done() {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&rsync, std::fs::Permissions::from_mode(0o755)).unwrap();
     let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=( alpha bravo )\nLOCAL_BACKUP_DIR={}\n", snap.display()));
     let sel = super::super::Selected { pods: vec![rp("devtest-alpha", "pa", 22001), rp("devtest-bravo", "pb", 22002)], named: true };
     let remote: Arc<dyn Remote> = Arc::new(arena_core::remote::FakeRemote::new());

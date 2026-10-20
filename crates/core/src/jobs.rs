@@ -1379,10 +1379,8 @@ mod tests {
 
         /// An executable `name` on the pod's PATH, ahead of the real one.
         fn stub(&self, name: &str, body: &str) {
-            use std::os::unix::fs::PermissionsExt;
             let f = self.bin.join(name);
-            std::fs::write(&f, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(&f, format!("#!/bin/sh\n{body}\n")).unwrap();
         }
 
         /// What sshd does with a remote command: hand it to the login shell's `-c`.

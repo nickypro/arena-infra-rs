@@ -3218,7 +3218,7 @@ mod tests {
     /// Answers `--version` like rsync 3.2.7.
     fn rsync_stub(dir: &Path) -> String {
         let stub = dir.join("rsync-stub");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             &stub,
             "#!/bin/sh\nd=$(dirname \"$0\")\n[ \"$1\" = --version ] && { echo 'rsync  version 3.2.7  protocol version 31'; exit 0; }\n\
              for a; do last=$a; done\nprintf '%s\\n' \"$*\" >> \"$d/rsync-calls\"\n\
@@ -3229,11 +3229,6 @@ mod tests {
              printf 'Number of files: 5 (reg: 3, dir: 2)\\nNumber of regular files transferred: 2\\nTotal file size: 300 bytes\\nTotal transferred file size: 200 bytes\\n'\n",
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
         stub.display().to_string()
     }
 
@@ -3572,7 +3567,6 @@ mod tests {
     }
 
     fn real_push(w: &World) -> Option<String> {
-        use std::os::unix::fs::PermissionsExt;
         let rrsync = ["/usr/bin/rrsync", "/usr/share/doc/rsync/scripts/rrsync"].into_iter().find(|p| Path::new(p).exists())?;
         if !have("rsync") || !have("python3") || !have("bash") {
             return None;
@@ -3582,9 +3576,9 @@ mod tests {
         let line = render::render_push_key_line(rrsync, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPushPushPushPushPushPushPushPushPushPus1 x").unwrap();
         let forced = line.split("command=\"").nth(1).unwrap().split('"').next().unwrap().replace(arena_core::archive::PUSH_ROOT, &push.display().to_string());
         let shim = w.dir.join("sshd-shim");
-        std::fs::write(&shim, format!("#!/bin/sh\nwhile [ $# -gt 0 ] && [ \"$1\" != rsync ]; do shift; done\nSSH_ORIGINAL_COMMAND=\"$*\" exec {forced}\n")).unwrap();
+        arena_core::remote::write_test_script(&shim, format!("#!/bin/sh\nwhile [ $# -gt 0 ] && [ \"$1\" != rsync ]; do shift; done\nSSH_ORIGINAL_COMMAND=\"$*\" exec {forced}\n")).unwrap();
         let wrapper = w.dir.join("rsync-real");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             &wrapper,
             format!(
                 "#!/bin/bash\na=()\nwhile [ $# -gt 0 ]; do if [ \"$1\" = -e ]; then a+=(-e {}); shift 2; else a+=(\"$1\"); shift; fi; done\nexec rsync \"${{a[@]}}\"\n",
@@ -3592,9 +3586,6 @@ mod tests {
             ),
         )
         .unwrap();
-        for f in [&shim, &wrapper] {
-            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
         Some(wrapper.display().to_string())
     }
 
@@ -4139,15 +4130,13 @@ mod tests {
     async fn cron_archive_lines_merge_and_refuse() {
         use crate::{handle_cron, Cli, Cmd, CronKind};
         use clap::Parser;
-        use std::os::unix::fs::PermissionsExt;
         let w = world("cron");
         let stub = w.dir.join("crontab");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             &stub,
             "#!/bin/sh\ntab=\"$(dirname \"$0\")/tab\"\ncase \"$1\" in\n  -l) [ -f \"$tab\" ] && exec cat \"$tab\"; exit 1;;\n  -) cat > \"$tab\";;\nesac\n",
         )
         .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let tab = w.dir.join("tab");
         let config = w.dir.join("config.env");
         std::fs::write(&config, "").unwrap();
@@ -4643,12 +4632,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn review3_a_pod_cut_off_by_another_pods_share_of_the_budget_is_never_sealed_partial() {
-        use std::os::unix::fs::PermissionsExt;
         let w = world_with("rv3-budget", "ARCHIVE_SNAP_TIMEOUT_SECS=5\n");
         seed(&w);
         file(&w, "w0d1/devtest-bravo/b.py");
         let stub = w.dir.join("slow-rsync");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             &stub,
             "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'rsync  version 3.2.7  protocol version 31'; exit 0; }\n\
              for a; do last=$a; done\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/rsync-calls\"\n\
@@ -4656,7 +4644,6 @@ mod tests {
              printf 'Number of files: 1 (reg: 1)\\nNumber of regular files transferred: 1\\nTotal file size: 1 bytes\\nTotal transferred file size: 1 bytes\\n'\n",
         )
         .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let stub = stub.display().to_string();
         let now = day_end("w0d1") + 3 * 3600;
         for run in 0..3u64 {
@@ -4720,12 +4707,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_pod_making_progress_is_never_charged_for_the_budget() {
-        use std::os::unix::fs::PermissionsExt;
         let w = world_with("progress", "ARCHIVE_SNAP_TIMEOUT_SECS=4\n");
         seed(&w);
         file(&w, "w0d1/devtest-bravo/b.py");
         let stub = w.dir.join("slow-rsync");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             &stub,
             "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'rsync  version 3.2.7  protocol version 31'; exit 0; }\nd=$(dirname \"$0\"); log=''\n\
              for a; do last=$a; case \"$a\" in --log-file=*) log=${a#--log-file=};; esac; done\nprintf '%s\\n' \"$*\" >> \"$d/rsync-calls\"\n\
@@ -4734,7 +4720,6 @@ mod tests {
              printf 'Number of files: 1 (reg: 1)\\nNumber of regular files transferred: 1\\nTotal file size: 1 bytes\\nTotal transferred file size: 1 bytes\\n'\n",
         )
         .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let stub = stub.display().to_string();
         let now = day_end("w0d2") + 3 * 3600;
         std::fs::write(w.dir.join("progress"), "").unwrap();
@@ -4785,7 +4770,6 @@ mod tests {
     /// pod not in `pods_tried` is seeded even when forced.)
     #[tokio::test]
     async fn review_w7la_a_killed_first_push_never_seals_unchecked_files() {
-        use std::os::unix::fs::PermissionsExt;
         let w = world("rv-killed-seed");
         seed_state_only(&w);
         let Some(real) = real_push(&w) else {
@@ -4797,7 +4781,7 @@ mod tests {
         // The state on disk while alpha's push of w0d1 runs: exactly what a kill then leaves.
         let at_push = w.dir.join("state-at-push");
         let wrapper = w.dir.join("rsync-capture");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             &wrapper,
             format!(
                 "#!/bin/sh\ncase \"$*\" in *:snap/w0d1/devtest-alpha/*) if [ ! -e '{c}' ] && [ ! -e '{c}.absent' ]; then \
@@ -4807,7 +4791,6 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let rsync = wrapper.display().to_string();
         let t0 = 1_791_800_000;
         rv_put(&w, "w0d1/devtest-alpha/notes.txt", "notes v1\n", t0, 0);

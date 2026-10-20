@@ -1758,14 +1758,13 @@ mod tests {
         /// `work` on branch `autocommit-x`, pushed (with an upstream), from a `main` that is
         /// on origin too; `data.bin` (10 bytes) tracked.
         fn new(tag: &str, limit: u64) -> Self {
-            use std::os::unix::fs::PermissionsExt;
             let base = std::env::temp_dir().join(format!("arena-backup-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&base);
             std::fs::create_dir_all(&base).unwrap();
             let s = GitSandbox { origin: base.join("origin.git"), work: base.join("work"), base, limit, skip: limit, want: None, course: None };
             s.git(&s.base, &["init", "-q", "--bare", s.origin.to_str().unwrap()]);
             let hook = s.origin.join("hooks/pre-receive");
-            std::fs::write(
+            crate::remote::write_test_script(
                 &hook,
                 format!(
                     "#!/bin/sh\nwhile read old new ref; do\n  [ \"$new\" = 0000000000000000000000000000000000000000 ] && continue\n  \
@@ -1774,7 +1773,6 @@ mod tests {
                 ),
             )
             .unwrap();
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
             s.git(&s.base, &["init", "-q", "-b", "main", s.work.to_str().unwrap()]);
             s.git(&s.work, &["config", "user.name", "t"]);
             s.git(&s.work, &["config", "user.email", "t@t"]);
@@ -1826,10 +1824,8 @@ mod tests {
         /// stand-in `ssh` that runs git's remote command in `<base>/github` and logs each call
         /// to `<base>/ssh.log`. Its scp-style URL is `git@github.com:<owner_name>.git`.
         fn github(&self, owner_name: &str) -> std::path::PathBuf {
-            use std::os::unix::fs::PermissionsExt;
             let ssh = self.base.join("fake-ssh");
-            std::fs::write(&ssh, "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/ssh.log\"\nfor a; do last=$a; done\ncd \"$(dirname \"$0\")/github\" && exec sh -c \"$last\"\n").unwrap();
-            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(&ssh, "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/ssh.log\"\nfor a; do last=$a; done\ncd \"$(dirname \"$0\")/github\" && exec sh -c \"$last\"\n").unwrap();
             let bare = self.base.join("github").join(format!("{owner_name}.git"));
             if !bare.exists() {
                 std::fs::create_dir_all(&bare).unwrap();
@@ -1883,7 +1879,6 @@ mod tests {
         /// are skipped, as GitHub's scanning skips them. `accepted` runs (in origin) after a push
         /// passes the scan; the file size hook is gone.
         fn push_protect(&self, accepted: &str) {
-            use std::os::unix::fs::PermissionsExt;
             let hook = self.origin.join("hooks/pre-receive");
             let script = r#"#!/bin/sh
 KNOWN='@KNOWN@'
@@ -1919,8 +1914,7 @@ while read old new ref; do
 done
 @ACCEPTED@
 "#;
-            std::fs::write(&hook, script.replace("@KNOWN@", &secret_regex()).replace("@ACCEPTED@", accepted)).unwrap();
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(&hook, script.replace("@KNOWN@", &secret_regex()).replace("@ACCEPTED@", accepted)).unwrap();
         }
 
         /// Whether any object in origin — reachable or not — holds `needle`.
@@ -2710,7 +2704,6 @@ done
     #[cfg(unix)]
     #[test]
     fn a_scan_or_rewrite_that_fails_stops_the_run_and_commits_nothing() {
-        use std::os::unix::fs::PermissionsExt;
         let real = |tool: &str| ["/usr/bin", "/bin"].iter().map(|d| format!("{d}/{tool}")).find(|p| std::path::Path::new(p).exists()).unwrap();
         for (tool, wrapper) in [
             // grep given the key patterns: exit 2, as a grep that can't run them would.
@@ -2721,8 +2714,7 @@ done
             let s = GitSandbox::new(&format!("failclosed-{tool}"), 1_000_000);
             let bin = s.base.join("bin");
             std::fs::create_dir_all(&bin).unwrap();
-            std::fs::write(bin.join(tool), wrapper).unwrap();
-            std::fs::set_permissions(bin.join(tool), std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(bin.join(tool), wrapper).unwrap();
             let key = openrouter_key(11);
             std::fs::write(s.work.join("ex.py"), format!("k = '{key}'\nmore = 1\n")).unwrap();
             let head = s.git(&s.work, &["rev-parse", "HEAD"]);
@@ -4134,14 +4126,13 @@ done
     /// participant's own command, at one precise moment of a run.
     #[cfg(unix)]
     fn git_acting_at(s: &GitSandbox, at: &str, script: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let bin = s.base.join("bin-hook");
         std::fs::create_dir_all(&bin).unwrap();
         let once = s.base.join("hook.sh");
         let _ = std::fs::remove_file(s.base.join("hook.sh.ran"));
         std::fs::write(&once, script).unwrap();
         let once = shell_quote(once.to_str().unwrap());
-        std::fs::write(
+        crate::remote::write_test_script(
             bin.join("git"),
             format!(
                 "#!/bin/sh\nif [ \"$*\" = {} ] && [ -f {once} ]; then mv {once} {once}.ran; sh {once}.ran >/dev/null 2>&1; fi\nexec {} \"$@\"\n",
@@ -4150,7 +4141,6 @@ done
             ),
         )
         .unwrap();
-        std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
         format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
     }
 
@@ -4474,7 +4464,6 @@ done
     #[cfg(unix)]
     #[test]
     fn a_main_check_killed_midway_leaves_no_copy_of_the_index() {
-        use std::os::unix::fs::PermissionsExt;
         let s = GitSandbox::new("main-killed", 1_000_000);
         s.git(&s.work, &["checkout", "-q", "main"]);
         let index = s.work.join(".git/index");
@@ -4491,7 +4480,7 @@ done
         for (signal, code) in [("TERM", 143), ("HUP", 129)] {
             let bin = s.base.join(format!("bin-{signal}"));
             std::fs::create_dir_all(&bin).unwrap();
-            std::fs::write(
+            crate::remote::write_test_script(
                 bin.join("git"),
                 format!(
                     "#!/bin/sh\nif [ \"$*\" = 'update-index -q --refresh' ] && [ -n \"$GIT_INDEX_FILE\" ]; then : > \"$GIT_INDEX_FILE.lock\"; \
@@ -4500,7 +4489,6 @@ done
                 ),
             )
             .unwrap();
-            std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
             let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
             let (got, out, err) = run_on_path(&script, &path);
             assert_eq!(got, Some(code), "{signal}: {out}{err}");
@@ -4624,7 +4612,6 @@ done
     #[cfg(unix)]
     #[test]
     fn a_gentle_switch_whose_fast_forward_fails_goes_back_where_it_was() {
-        use std::os::unix::fs::PermissionsExt;
         let s = GitSandbox::new("switch-back", 1_000_000);
         let repo = s.work.to_str().unwrap();
         let rev = |r: &str| s.git(&s.work, &["rev-parse", r]);
@@ -4681,12 +4668,11 @@ done
         // Going back fails too: said, with the branch it is on.
         let bin = s.base.join("bin-noback");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(
+        crate::remote::write_test_script(
             bin.join("git"),
             format!("#!/bin/sh\nif [ \"$*\" = 'checkout -q autocommit-x' ]; then echo 'error: no going back' >&2; exit 1; fi\nexec {} \"$@\"\n", shell_quote(&real_git())),
         )
         .unwrap();
-        std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
         let (code, _, err) = switch("main", Some(&path));
         assert_ne!(code, Some(0));
@@ -4710,7 +4696,6 @@ done
     #[cfg(unix)]
     #[test]
     fn a_switch_bounds_itself_on_the_pod_and_puts_the_keys_back_under_any_login_shell() {
-        use std::os::unix::fs::PermissionsExt;
         let s = GitSandbox::new("switch-bound", 1_000_000);
         let repo = s.work.to_str().unwrap();
         let ex = format!("KEY = \"{}\"\n", openrouter_key(25));
@@ -4724,8 +4709,7 @@ done
             let bin = s.base.join(dir);
             std::fs::create_dir_all(&bin).unwrap();
             let (name, text) = body.split_once('\n').unwrap();
-            std::fs::write(bin.join(name), text).unwrap();
-            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(bin.join(name), text).unwrap();
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
         };
         let hang = stand_in(
@@ -4873,7 +4857,7 @@ done
         assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "");
         let (d, pinned, readme) = hard(1);
         let pin = format!("refs/arena-discarded/{}-main", d.file_name().unwrap().to_string_lossy());
-        assert_eq!(pinned, [pin.clone()], "the autocommit branch is pushed: HEAD needs no ref");
+        assert_eq!(pinned, std::slice::from_ref(&pin), "the autocommit branch is pushed: HEAD needs no ref");
         assert!(
             readme.contains(&format!("Its local main was at commit {mine}, with 1 commit(s) origin/main doesn't have"))
                 && readme.contains(&format!("the ref {pin} keeps them from git's gc. `git branch main-rescue {mine}` brings them back.")),
@@ -4899,7 +4883,7 @@ done
         let detached = s.git(&s.work, &["rev-parse", "HEAD"]);
         let (d, pinned, readme) = hard(1);
         let pin = format!("refs/arena-discarded/{}", d.file_name().unwrap().to_string_lossy());
-        assert_eq!(pinned, [pin.clone()]);
+        assert_eq!(pinned, std::slice::from_ref(&pin));
         assert!(readme.contains(&format!("It was on HEAD at commit {detached} (the ref {pin} keeps it")), "{readme}");
         gc();
         assert_eq!(s.git(&s.work, &["rev-parse", &pin]), detached);
@@ -5054,7 +5038,6 @@ done
     #[cfg(unix)]
     #[test]
     fn a_save_stopped_midway_leaves_nothing_and_one_too_big_is_refused() {
-        use std::os::unix::fs::PermissionsExt;
         let s = GitSandbox::new("discarded-bounds", 1_000_000);
         let repo = s.work.to_str().unwrap();
         // A real key the backup committed redacted (set aside around the switch).
@@ -5088,8 +5071,7 @@ done
         let stand_in = |dir: &str, name: &str, text: &str| {
             let bin = s.base.join(dir);
             std::fs::create_dir_all(&bin).unwrap();
-            std::fs::write(bin.join(name), text).unwrap();
-            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(bin.join(name), text).unwrap();
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
         };
         let real = |tool: &str| {
@@ -5144,7 +5126,6 @@ done
     #[cfg(unix)]
     #[test]
     fn a_refused_or_killed_switch_never_leaves_the_real_keys_set_aside() {
-        use std::os::unix::fs::PermissionsExt;
         let s = GitSandbox::new("keys-busy", 1_000_000);
         let repo = s.work.to_str().unwrap();
         let ex = format!("KEY = \"{}\"\n", openrouter_key(22));
@@ -5171,7 +5152,7 @@ done
         // Killed as the checkout starts (after the set-aside): a `git` that TERMs the command.
         let bin = s.base.join("bin-kill");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(
+        crate::remote::write_test_script(
             bin.join("git"),
             format!(
                 "#!/bin/sh\ncase \"$*\" in *\" checkout main\" | \"checkout -f -B main origin/main\") kill -TERM \"$PPID\"; exit 1;; esac\nexec {} \"$@\"\n",
@@ -5179,7 +5160,6 @@ done
             ),
         )
         .unwrap();
-        std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
         for hard in [false, true] {
             let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, hard), &path);

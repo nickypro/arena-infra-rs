@@ -302,6 +302,34 @@ pub async fn within<T>(
 #[cfg(any(test, feature = "test-util"))]
 pub use fake::{FakeRemote, FakeReply, RemoteCall};
 
+/// Write `text` to `path` as an executable (0755) script, for a test that then has it run — a
+/// stand-in `rsync`, `ssh`, `git` or hook — with this process never holding the file open for
+/// writing. Written here (`std::fs::write`), the open descriptor is copied into any child another
+/// test thread forks meanwhile and stays open there until that child's exec closes it; the script
+/// run in that window fails to start with "Text file busy" (ETXTBSY: seen in CI, a stub rsync of
+/// `pull::tests::the_rsync_is_retried_once…`). Renaming a finished file into place wouldn't help —
+/// that descriptor is on the same file — and the spawn is often the code under test, not the
+/// test's own. So a short-lived `sh` writes it, the only process that ever has it open for
+/// writing, and is waited for. Test code only: nothing in arena runs a file it has just written.
+#[cfg(all(unix, any(test, feature = "test-util")))]
+pub fn write_test_script(path: impl AsRef<std::path::Path>, text: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let path = path.as_ref();
+    let mut sh = std::process::Command::new("sh")
+        .args(["-c", "cat > \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    let wrote = sh.stdin.take().map_or(Ok(()), |mut stdin| stdin.write_all(text.as_ref()));
+    let status = sh.wait()?;
+    wrote?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!("writing {}: sh {status}", path.display())));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+}
+
 /// Scripted [`Remote`] for tests (here and in downstream crates via `test-util`).
 #[cfg(any(test, feature = "test-util"))]
 mod fake {
@@ -529,6 +557,41 @@ mod tests {
         c.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect()
     }
 
+    /// The CI flake (lane FIX4A: `spawning rsync: Text file busy`): a test wrote its stand-in script
+    /// in this process, and another test thread's fork carried the open descriptor until its exec,
+    /// so the script couldn't start. `write_test_script` never has the file open here: with a
+    /// thread forking all the while, each script it writes runs at once, every time — and holds
+    /// what was given, executable.
+    #[cfg(unix)]
+    #[test]
+    fn a_test_script_runs_at_once_while_other_threads_fork() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("arena-remote-script-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let forker = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                }
+            })
+        };
+        for i in 0..200 {
+            let script = dir.join(format!("stub-{i}"));
+            write_test_script(&script, format!("#!/bin/sh\necho ran {i}\n")).unwrap();
+            let out = std::process::Command::new(&script).output().unwrap_or_else(|e| panic!("run {i}: {e}"));
+            assert_eq!(String::from_utf8_lossy(&out.stdout), format!("ran {i}\n"));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        forker.join().unwrap();
+        let last = dir.join("stub-199");
+        assert_eq!(std::fs::metadata(&last).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(std::fs::read_to_string(&last).unwrap(), "#!/bin/sh\necho ran 199\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn ssh_remote_builds_killable_ssh_and_scp_children() {
         // exec: `ssh <the shared fail-fast args> <cmd>`, killed if the call is abandoned.
@@ -658,9 +721,7 @@ mod tests {
         let dir = scratch("scp");
         let pidfile = dir.join("transport.pid");
         let transport = dir.join("fake-ssh.sh");
-        std::fs::write(&transport, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", pidfile.display())).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&transport, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_test_script(&transport, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", pidfile.display())).unwrap();
         let local = dir.join("payload");
         std::fs::write(&local, "x").unwrap();
 
@@ -687,9 +748,7 @@ mod tests {
         let dir = scratch("rsync");
         let pidfile = dir.join("transport.pid");
         let transport = dir.join("fake-ssh.sh");
-        std::fs::write(&transport, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", pidfile.display())).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&transport, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_test_script(&transport, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", pidfile.display())).unwrap();
         let dest = format!("{}/", dir.join("dest").display());
         let args: Vec<String> =
             ["-a", "--timeout=300", "-e", &transport.display().to_string(), "root@10.0.0.1:", &dest].map(String::from).into();
@@ -740,7 +799,6 @@ mod tests {
     #[test]
     fn a_timed_out_rsync_is_fully_stopped_before_the_runtime_goes() {
         use std::io::Read;
-        use std::os::unix::fs::PermissionsExt;
         if std::process::Command::new("rsync").arg("--version").output().is_err() {
             eprintln!("rsync not installed — skipping");
             return;
@@ -758,7 +816,7 @@ mod tests {
         let transport = dir.join("fake-ssh.sh");
         // rsync runs `<transport> [-l user] host rsync --server --sender …`: skip to the
         // remote command and run it locally.
-        std::fs::write(
+        crate::remote::write_test_script(
             &transport,
             format!(
                 "#!/bin/sh\necho $$ > '{}'\nwhile [ $# -gt 0 ] && [ \"$1\" != rsync ]; do shift; done\nexec \"$@\"\n",
@@ -766,7 +824,6 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&transport, std::fs::Permissions::from_mode(0o755)).unwrap();
         let args: Vec<String> = vec![
             "-avz".into(),
             "--timeout=300".into(),

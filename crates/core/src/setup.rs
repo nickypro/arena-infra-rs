@@ -2234,15 +2234,13 @@ mod tests {
         /// path stays a link, the volume copy gets the new commits.
         #[test]
         fn the_update_acts_on_the_volume_copy_through_the_link() {
-            use std::os::unix::fs::PermissionsExt;
             let Some(f) = Fixture::new("volume") else { return };
             f.clone_pod(&[]);
             let (ws, bin) = (f.root.join("workspace"), f.root.join("bin"));
             std::fs::create_dir_all(&ws).unwrap();
             std::fs::create_dir_all(&bin).unwrap();
             let stub = bin.join("mountpoint");
-            std::fs::write(&stub, format!("#!/bin/sh\n[ \"$2\" = '{}' ]\n", ws.display())).unwrap();
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(&stub, format!("#!/bin/sh\n[ \"$2\" = '{}' ]\n", ws.display())).unwrap();
             let site = crate::volume::RelocationSite {
                 volume: ws.display().to_string(),
                 lock: f.root.join("lock").display().to_string(),

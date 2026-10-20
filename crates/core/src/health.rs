@@ -2307,7 +2307,6 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
     #[cfg(target_os = "linux")]
     #[test]
     fn script_reports_a_mig_slice_from_nvidia_smi_l() {
-        use std::os::unix::fs::PermissionsExt;
         if !(have("bash") && have("timeout") && have("base64")) {
             eprintln!("bash/timeout/base64 missing — skipping");
             return;
@@ -2315,8 +2314,7 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         let dir = scratch("stubs-mig");
         let stub = |name: &str, body: &str| {
             let p = dir.join(name);
-            std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(&p, format!("#!/bin/sh\n{body}")).unwrap();
         };
         stub(
             "nvidia-smi",
@@ -2349,7 +2347,6 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
     #[cfg(target_os = "linux")]
     #[test]
     fn script_runs_against_stub_tools_and_parses() {
-        use std::os::unix::fs::PermissionsExt;
         if !(have("bash") && have("timeout") && have("base64")) {
             eprintln!("bash/timeout/base64 missing — skipping");
             return;
@@ -2357,8 +2354,7 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         let dir = scratch("stubs");
         let stub = |name: &str, body: &str| {
             let p = dir.join(name);
-            std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(&p, format!("#!/bin/sh\n{body}")).unwrap();
         };
         stub(
             "nvidia-smi",

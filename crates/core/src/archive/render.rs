@@ -644,7 +644,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn forget_removes_only_that_pods_dirs_and_never_with_a_volume_unmounted() {
-        use std::os::unix::fs::PermissionsExt;
         let t = std::env::temp_dir().join(format!("arena-archive-forget-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&t);
         let root = t.join("push");
@@ -663,8 +662,7 @@ mod tests {
         let bin = t.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let mounted = |yes: bool| {
-            std::fs::write(bin.join("mountpoint"), format!("#!/bin/sh\nexit {}\n", if yes { 0 } else { 1 })).unwrap();
-            std::fs::set_permissions(bin.join("mountpoint"), std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(bin.join("mountpoint"), format!("#!/bin/sh\nexit {}\n", if yes { 0 } else { 1 })).unwrap();
         };
         let pods: Vec<String> = ["devtest-bravo", "devtest-bravo-old", "devtest-bravo-new"].map(String::from).to_vec();
         let run = |delete: bool| {

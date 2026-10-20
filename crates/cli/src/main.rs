@@ -18703,7 +18703,6 @@ mod tests {
     fn every_cron_line_runs_with_its_folders_deleted() {
         use super::{cron_lines, CronJob, CronKind};
         use arena_core::cron;
-        use std::os::unix::fs::PermissionsExt;
         if std::process::Command::new("flock").arg("--version").output().is_err() {
             eprintln!("skipped: no flock here");
             return;
@@ -18713,8 +18712,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let h = home.display().to_string();
         let exe = home.join("fake-arena");
-        std::fs::write(&exe, "#!/bin/sh\necho \"fake arena ran: $*\"\nenv | grep '^ARENA_' | sort\n").unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        arena_core::remote::write_test_script(&exe, "#!/bin/sh\necho \"fake arena ran: $*\"\nenv | grep '^ARENA_' | sort\n").unwrap();
         let exe = exe.display().to_string();
         let kept = [(CronKind::Proxy, format!("{h}/logs/cron/arena-proxy-cron.log")), (CronKind::ArchiveBig, format!("{h}/logs/big.log"))];
         let job = CronJob {
@@ -19201,20 +19199,18 @@ mod tests {
     #[cfg(unix)]
     impl CronStub {
         fn new(tag: &str) -> CronStub {
-            use std::os::unix::fs::PermissionsExt;
             let dir = std::env::temp_dir().join(format!("arena-cron-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(dir.join("www")).unwrap();
             std::fs::create_dir_all(dir.join("home")).unwrap();
             let stub = dir.join("crontab");
-            std::fs::write(
+            arena_core::remote::write_test_script(
                 &stub,
                 "#!/bin/sh\ntab=\"$(dirname \"$0\")/tab\"\ncase \"$1\" in\n  \
                  -l) [ -f \"$tab\" ] && exec cat \"$tab\"; echo 'no crontab for u' >&2; exit 1;;\n  \
                  -) cat > \"$tab\";;\nesac\n",
             )
             .unwrap();
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
             let config = dir.join("config.env");
             std::fs::write(&config, "").unwrap();
             CronStub { stub: stub.display().to_string(), config, home: dir.join("home").display().to_string(), dir }
@@ -21402,18 +21398,16 @@ mod remote_tests {
 
     impl StubRsync {
         fn new(tag: &str) -> Self {
-            use std::os::unix::fs::PermissionsExt;
             let dir = std::env::temp_dir().join(format!("arena-rsync-{}-{tag}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let script = dir.join("rsync");
-            std::fs::write(
+            arena_core::remote::write_test_script(
                 &script,
                 "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
                  echo \"$*\" >> \"$(dirname \"$0\")/args.log\"\n",
             )
             .unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
             StubRsync(dir)
         }
         fn path(&self) -> String {
@@ -21724,17 +21718,15 @@ mod remote_tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_wedged_pods_rsync_is_stopped_at_its_budget_and_named() {
-        use std::os::unix::fs::PermissionsExt;
         let stub = StubRsync::new("wedged");
         // bloom's rsync records its pid and hangs like a wedged pod; the others log and exit.
-        std::fs::write(
+        arena_core::remote::write_test_script(
             stub.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\ncase \"$last\" in\n  \
              */devtest-bloom/) echo $$ >> \"$(dirname \"$0\")/hung.pids\"; exec sleep 30;;\nesac\n\
              echo \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n",
         )
         .unwrap();
-        std::fs::set_permissions(stub.0.join("rsync"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let base = stub.0.join("backups").display().to_string();
         let with_budget = |budget: &str| {
             Config::parse(&format!(
@@ -21791,16 +21783,14 @@ mod remote_tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_wedged_pods_repo_rsyncs_are_bounded_too() {
-        use std::os::unix::fs::PermissionsExt;
         let stub = StubRsync::new("wedged-repo");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             stub.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\ncase \"$last\" in\n  \
              */devtest-bloom/|*/devtest-bloom/*) echo $$ >> \"$(dirname \"$0\")/hung.pids\"; exec sleep 30;;\nesac\n\
              echo \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n",
         )
         .unwrap();
-        std::fs::set_permissions(stub.0.join("rsync"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let base = stub.0.join("backups").display().to_string();
         let cfg = Config::parse(&format!(
             "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\n\
@@ -21922,9 +21912,8 @@ mod remote_tests {
     /// (the image's), `work.txt` with a new one — so a snapshot exists afterwards, and a
     /// baseline has something to keep and something to drop. Logs every argv.
     fn writing_rsync(tag: &str) -> StubRsync {
-        use std::os::unix::fs::PermissionsExt;
         let stub = StubRsync::new(tag);
-        std::fs::write(
+        arena_core::remote::write_test_script(
             stub.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$*\" >> \"$(dirname \"$0\")/args.log\"\n\
              mkdir -p \"$last\" && printf img > \"$last/image.txt\" && touch -d @1000000000 \"$last/image.txt\" && \
@@ -21932,7 +21921,6 @@ mod remote_tests {
              touch -d @1000000000 \"$last/carried.txt\"\n",
         )
         .unwrap();
-        std::fs::set_permissions(stub.0.join("rsync"), std::fs::Permissions::from_mode(0o755)).unwrap();
         stub
     }
 
@@ -22256,15 +22244,13 @@ mod remote_tests {
 
     #[tokio::test]
     async fn a_failed_or_stuck_restore_says_nothing_was_deleted() {
-        use std::os::unix::fs::PermissionsExt;
         let stub = StubRsync::new("restore-fail");
         let dir = backups(&stub.0);
         let f = fleet();
         let remote: Arc<dyn Remote> = Arc::new(FakeRemote::new());
         let script = |name: &str, body: &str| {
             let p = stub.0.join(name);
-            std::fs::write(&p, body).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            arena_core::remote::write_test_script(&p, body).unwrap();
             p.display().to_string()
         };
         let failing = script("rsync-fails", "#!/bin/sh\necho 'rsync: connection unexpectedly closed' >&2\nexit 12\n");
@@ -22659,7 +22645,7 @@ mod remote_tests {
 
         // The copy fails too: both in the error (and on the pod's line, below).
         let failing = StubRsync::new("fallback-fail");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             failing.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
              case \"$last\" in *devtest-bloom*) echo 'rsync: connection unexpectedly closed' >&2; exit 12;; esac\n",
@@ -22885,14 +22871,13 @@ mod remote_tests {
     /// A stand-in `rsync` that runs the real one with the pull's own argv, the pod's side
     /// (`root@10.0.0.1:<path>`) read from the local tree `pod` instead. `None` without an rsync.
     fn local_pod_rsync(tag: &str, pod: &std::path::Path) -> Option<StubRsync> {
-        use std::os::unix::fs::PermissionsExt;
         let real = std::process::Command::new("sh").args(["-c", "command -v rsync"]).output().ok()?;
         let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
         if real.is_empty() {
             return None;
         }
         let stub = StubRsync::new(tag);
-        std::fs::write(
+        arena_core::remote::write_test_script(
             stub.0.join("rsync"),
             format!(
                 "#!/bin/sh\nfor a do\n  shift\n  case $a in root@10.0.0.1:*) a=\"{}/${{a#root@10.0.0.1:}}\";; esac\n  set -- \"$@\" \"$a\"\ndone\n\
@@ -22901,7 +22886,6 @@ mod remote_tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(stub.0.join("rsync"), std::fs::Permissions::from_mode(0o755)).unwrap();
         Some(stub)
     }
 
@@ -22985,9 +22969,8 @@ mod remote_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_pull_never_moves_anything_rsync_names_outside_its_destination() {
-        use std::os::unix::fs::PermissionsExt;
         let stub = StubRsync::new("makeway-spoof");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             stub.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
              echo 'could not make way for new symlink: ../../outside/victim' >&2\n\
@@ -22995,7 +22978,6 @@ mod remote_tests {
              echo 'could not make way for new regular file: /etc' >&2\nexit 23\n",
         )
         .unwrap();
-        std::fs::set_permissions(stub.0.join("rsync"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let base = stub.0.join("backups");
         let outside = stub.0.join("outside");
         std::fs::create_dir_all(outside.join("victim")).unwrap();
@@ -23244,7 +23226,7 @@ mod remote_tests {
 
         // The copy fails too: not switched, its line says why both failed.
         let failing = StubRsync::new("busy-copyfail");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             failing.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
              echo 'rsync: No space left on device (28)' >&2; exit 11\n",
@@ -23377,7 +23359,7 @@ mod remote_tests {
         use super::{resolve_week_day, set_branch_and_init, SetBranchRun};
         let stub = StubRsync::new("chain-busy-fail");
         let failing = StubRsync::new("chain-busy-copyfail");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             failing.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
              echo 'rsync: No space left on device (28)' >&2; exit 11\n",
@@ -23536,7 +23518,7 @@ mod remote_tests {
 
         // The copy fails: not reset.
         let failing = StubRsync::new("main-dirty-copyfail");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             failing.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
              echo 'rsync: No space left on device (28)' >&2; exit 11\n",
@@ -23684,7 +23666,7 @@ mod remote_tests {
     #[tokio::test]
     async fn set_branch_never_switches_a_pod_with_neither_a_push_nor_a_copy_and_holds_each_lock_through_its_switch() {
         let failing = StubRsync::new("setbranch-copyfail");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             failing.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
              case \"$last\" in *devtest-bloom*) echo 'rsync: No space left on device (28)' >&2; exit 11;; esac\n",
@@ -24184,7 +24166,7 @@ mod remote_tests {
         // push (to `user@host:`) exits `push`.
         let stub = |name: &str, size: &str, push: u8| {
             let path = root.join(name);
-            std::fs::write(
+            arena_core::remote::write_test_script(
                 &path,
                 format!(
                     "#!/bin/sh\ndry=; for a in \"$@\"; do last=$a; [ \"$a\" = --dry-run ] && dry=1; done\n\
@@ -24194,7 +24176,6 @@ mod remote_tests {
                 ),
             )
             .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path.display().to_string()
         };
         let (free, total) = arena_core::replica::disk_space(&root).unwrap();

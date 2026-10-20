@@ -752,15 +752,13 @@ pub(crate) mod fake_ssh {
     /// Write the fake transport into `dir`; returns its path. `FAKE_HOME` (set on the rsync
     /// command) is the "pod"'s login home.
     pub fn install(dir: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-ssh");
-        std::fs::write(
+        crate::remote::write_test_script(
             &path,
             "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -p|-o|-i|-l) shift 2;; -*) shift;; *) break;; esac; done\n\
              shift\ncd \"$FAKE_HOME\" && HOME=\"$FAKE_HOME\" exec sh -c \"$*\"\n",
         )
         .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
 
@@ -1621,7 +1619,6 @@ mod tests {
             /// `workspace/`, the volume mounted or not, and the container mark made after all
             /// that. `None` without git.
             fn new(tag: &str, mounted: bool) -> Option<Self> {
-                use std::os::unix::fs::PermissionsExt;
                 if !have_git() {
                     eprintln!("git not installed — skipping");
                     return None;
@@ -1633,8 +1630,7 @@ mod tests {
                 }
                 let stub = root.join("bin/mountpoint");
                 let ws = root.join("workspace");
-                std::fs::write(&stub, format!("#!/bin/sh\n[ -e '{}' ] && [ \"$2\" = '{}' ]\n", root.join("mounted").display(), ws.display())).unwrap();
-                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+                crate::remote::write_test_script(&stub, format!("#!/bin/sh\n[ -e '{}' ] && [ \"$2\" = '{}' ]\n", root.join("mounted").display(), ws.display())).unwrap();
                 let pod = Pod { root, copy_secs: 60 };
                 pod.image_checkout();
                 if mounted {
@@ -1675,10 +1671,8 @@ mod tests {
 
             /// A stub for `name` first on PATH (`body` is the script after the shebang).
             fn stub(&self, name: &str, body: &str) {
-                use std::os::unix::fs::PermissionsExt;
                 let p = self.p(&format!("bin/{name}"));
-                std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+                crate::remote::write_test_script(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
             }
 
             fn unstub(&self, name: &str) {

@@ -2800,20 +2800,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_rsync_is_retried_once_and_only_when_a_directory_was_moved_in_time() {
-        use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("arena-pull-retry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dest = root.join("dest");
         std::fs::create_dir_all(dest.join("L/sub")).unwrap();
         // A stand-in rsync: counts its runs, and fails like the live one every time.
         let stub = root.join("rsync");
-        std::fs::write(
+        crate::remote::write_test_script(
             &stub,
             "#!/bin/sh\necho run >> \"$(dirname \"$0\")/runs\"\n[ -z \"$1\" ] || sleep \"$1\"\n\
              echo 'could not make way for new symlink: L' >&2\necho 'rsync error: (code 23)' >&2\nexit 23\n",
         )
         .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let program = stub.display().to_string();
         let runs = || {
             let n = std::fs::read_to_string(root.join("runs")).map(|t| t.lines().count()).unwrap_or(0);

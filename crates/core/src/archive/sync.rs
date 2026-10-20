@@ -2542,14 +2542,12 @@ mod tests {
 
     /// A transport whose ssh is a shim that runs `forced_cmd` as sshd would.
     fn shim_transport(dir: &Path, name: &str, forced_cmd: &str) -> PushTransport {
-        use std::os::unix::fs::PermissionsExt;
         let shim = dir.join(name);
-        std::fs::write(
+        crate::remote::write_test_script(
             &shim,
             format!("#!/bin/sh\nwhile [ $# -gt 0 ] && [ \"$1\" != rsync ]; do shift; done\nSSH_ORIGINAL_COMMAND=\"$*\" exec {forced_cmd}\n"),
         )
         .unwrap();
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         PushTransport { rsh: format!("{} -p 22 -o BatchMode=yes", shim.display()), dest: "arena-push@archive".into() }
     }
 
