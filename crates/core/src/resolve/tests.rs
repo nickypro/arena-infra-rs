@@ -1269,46 +1269,53 @@ fn recent_activity_or_a_change_since_the_copy_leaves_it_busy() {
 /// markers, but not what the merge left — the whole merge stays BUSY, the file named. Judged by
 /// making git's conflicted output again: with `git merge-file` and the file's own labels (the
 /// default style, and diff3); where merge-file joins two conflicts the merge kept apart, by the
-/// merge's own way (`checkout --conflict`, labels aside); and where it can't be made again (a
-/// marker line's label gone), by time — a file changed more than 2 minutes after the merge started.
+/// merge's own way (`checkout --conflict`, labels aside). Where it can't be made again — a marker
+/// line deleted, or its label — nothing says the file is as git left it: BUSY too, said, however
+/// soon after the merge it was written (review ai-review codex #5: a 2-minute allowance let a
+/// participant's quick start, a marker deleted and the hunk edited, be overwritten).
 #[cfg(unix)]
 #[test]
 fn a_file_begun_by_hand_is_left_alone_and_one_as_the_merge_left_it_is_merged() {
-    // (case, the file's base/course/mine, diff3, what the participant did, finished?)
-    type Case<'a> = (&'a str, [&'a [u8]; 3], bool, Box<dyn Fn(&Repo)>, bool);
+    let begun = "you started resolving f.py by hand — finish it (and git add it) or abort, on the pod";
+    let unknown = "can't tell whether you started resolving f.py by hand (a marker line or its label is gone, or a side is binary: \
+                   git's conflicted output can't be made again to compare) — finish it (and git add it) or abort, on the pod";
+    // (case, the file's base/course/mine, diff3, what the participant did, why it stays BUSY — or
+    // finished)
+    type Case<'a> = (&'a str, [&'a [u8]; 3], bool, Box<dyn Fn(&Repo)>, Option<&'a str>);
     let plain: [&[u8]; 3] = [b"a\nb\nc\n", b"a\nB course\nc\n", b"a\nB mine\nc\n"];
     // Two conflicts four lines without letters or digits apart: merge-file makes them one.
     let apart: [&[u8]; 3] = [b"x = 1\n}\n\n}\n)\ny = 1\nz\n", b"x = 2\n}\n\n}\n)\ny = 2\nz\n", b"x = 3\n}\n\n}\n)\ny = 3\nz\n"];
     let mtime = |ago: u64| move |r: &Repo| r.touch("f.py", ago);
+    // f.py with its `>>>>>>>` line changed by `edit` (`None`: deleted), written `ago` seconds ago.
+    let closer = move |edit: Option<&'static str>, ago: u64| {
+        move |r: &Repo| {
+            let t = r.text("f.py");
+            let kept: Vec<&str> = t.lines().filter_map(|l| if l.starts_with(">>>>>>>") { edit } else { Some(l) }).collect();
+            r.put("f.py", format!("{}\n", kept.join("\n")).as_bytes());
+            mtime(ago)(r);
+        }
+    };
     let cases: Vec<Case> = vec![
-        ("as-left", plain, false, Box::new(|_: &Repo| {}), true),
-        ("as-left-diff3", plain, true, Box::new(|_: &Repo| {}), true),
-        ("as-left-apart", apart, false, Box::new(|_: &Repo| {}), true),
+        ("as-left", plain, false, Box::new(|_: &Repo| {}), None),
+        ("as-left-diff3", plain, true, Box::new(|_: &Repo| {}), None),
+        ("as-left-apart", apart, false, Box::new(|_: &Repo| {}), None),
         // Edited inside its markers — written within a minute of the merge, so only the bytes tell.
         ("begun", plain, false, Box::new(move |r: &Repo| {
             r.put("f.py", r.text("f.py").replace("B mine", "B mine, and some of the course's").as_bytes());
             mtime(4 * HOUR - 60)(r);
-        }), false),
+        }), Some(begun)),
         ("begun-diff3", plain, true, Box::new(move |r: &Repo| {
             r.put("f.py", r.text("f.py").replace("B course", "B course too").as_bytes());
             mtime(4 * HOUR - 60)(r);
-        }), false),
-        // Its `>>>>>>>` line deleted (labels unreadable): later than the merge by 5 minutes — begun.
-        ("no-labels-late", plain, false, Box::new(move |r: &Repo| {
-            let t = r.text("f.py");
-            let kept: Vec<&str> = t.lines().filter(|l| !l.starts_with(">>>>>>>")).collect();
-            r.put("f.py", format!("{}\n", kept.join("\n")).as_bytes());
-            mtime(4 * HOUR - 300)(r);
-        }), false),
-        // … by 1 minute: as the merge left it.
-        ("no-labels-soon", plain, false, Box::new(move |r: &Repo| {
-            let t = r.text("f.py");
-            let kept: Vec<&str> = t.lines().filter(|l| !l.starts_with(">>>>>>>")).collect();
-            r.put("f.py", format!("{}\n", kept.join("\n")).as_bytes());
-            mtime(4 * HOUR - 60)(r);
-        }), true),
+        }), Some(begun)),
+        // Its `>>>>>>>` line deleted (labels unreadable), 5 minutes after the merge or 1: can't be
+        // made again — BUSY either way.
+        ("no-labels-late", plain, false, Box::new(closer(None, 4 * HOUR - 300)), Some(unknown)),
+        ("no-labels-soon", plain, false, Box::new(closer(None, 4 * HOUR - 60)), Some(unknown)),
+        // Its label alone deleted, the line kept, a minute after: the same.
+        ("no-label-text-soon", plain, false, Box::new(closer(Some(">>>>>>>"), 4 * HOUR - 60)), Some(unknown)),
     ];
-    for (case, [base, course, mine], diff3, did, finished) in cases {
+    for (case, [base, course, mine], diff3, did, busy) in cases {
         let r = Repo::new(&format!("left-{case}"));
         r.add_base(&[("f.py", base)]);
         if diff3 {
@@ -1322,17 +1329,16 @@ fn a_file_begun_by_hand_is_left_alone_and_one_as_the_merge_left_it_is_merged() {
         did(&r);
         let conflicts = r.unmerged();
         let (code, rep, said) = r.resolve(3, &r.look());
-        if finished {
-            assert_eq!(code, Some(0), "{case}: {said}");
-            assert_eq!(taken(&rep), [("f.py".to_string(), "theirs".to_string(), Taken::Hunks)], "{case}");
-            assert_eq!(r.read("f.py"), course, "{case}: the newer side's");
-        } else {
-            assert_eq!(
-                (code, rep.refused.as_deref()),
-                (Some(RESOLVE_REFUSED_EXIT), Some("you started resolving f.py by hand — finish it (and git add it) or abort, on the pod")),
-                "{case}: {said}"
-            );
-            r.untouched(&conflicts, case);
+        match busy {
+            None => {
+                assert_eq!(code, Some(0), "{case}: {said}");
+                assert_eq!(taken(&rep), [("f.py".to_string(), "theirs".to_string(), Taken::Hunks)], "{case}");
+                assert_eq!(r.read("f.py"), course, "{case}: the newer side's");
+            }
+            Some(why) => {
+                assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some(why)), "{case}: {said}");
+                r.untouched(&conflicts, case);
+            }
         }
     }
 }

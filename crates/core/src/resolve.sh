@@ -10,8 +10,9 @@
 # touched. Then each conflicted path is decided, nothing changed yet:
 #   - a regular text file with no conflict marker left (at the path's `conflict-marker-size`),
 #     both sides there: resolved by hand — kept as it is on disk;
-#   - one whose markers are still there but which isn't what the merge left (`as_left`): being
-#     resolved by hand — the whole operation is left alone, and said;
+#   - one whose markers are still there but which isn't what the merge left (`as_left`), or which
+#     can't be compared with it (a marker's label gone): being, or maybe being, resolved by hand —
+#     the whole operation is left alone, and said;
 #   - else the side whose last change to that path is the more recent (`git log -1 --format=%ct
 #     <side> -- <path>`, HEAD's against the operation's other side; a tie keeps HEAD's) — for a
 #     text file per hunk: `git merge-file --ours|--theirs` keeps the clean hunks of both sides and
@@ -179,15 +180,18 @@ stages() {
 # File $1 with the label text on its marker lines (size $2) left out.
 unlabelled() { LC_ALL=C sed -E "s/^(<{$2}|\\|{$2}|>{$2})( .*)?\$/\\1/" -- "$1"; }
 # as_left <path> <marker size> <base blob|-> <ours blob> <theirs blob>: whether a file still in
-# conflict is as the operation left it, markers and all (`same`), or was begun by hand (`begun`).
-# git's conflicted output is made again from the stages with `git merge-file`, given the labels on
-# the file's own `<<<<<<<`/`>>>>>>>` lines, the path's marker size, and `--diff3`/`--zdiff3` when
-# the file has base sections — the same bytes: as left. Different bytes get a second opinion:
-# `merge-file` joins conflicts that only lines without letters or digits separate, where the merge
-# itself (and `checkout --conflict`, which merges as it does) doesn't — so the merge is made again
-# that way too, into a scratch tree through a copy of the index (nothing of the participant's
-# written), its labels set aside. When there are no labels to read or a stage is binary, it can't
-# be made again: then a file changed more than 2 minutes after the operation started is `begun`.
+# conflict is as the operation left it, markers and all (`same`), was begun by hand (`begun`), or
+# can't be told (`unknown`). git's conflicted output is made again from the stages with `git
+# merge-file`, given the labels on the file's own `<<<<<<<`/`>>>>>>>` lines, the path's marker
+# size, and `--diff3`/`--zdiff3` when the file has base sections — the same bytes: as left.
+# Different bytes get a second opinion: `merge-file` joins conflicts that only lines without
+# letters or digits separate, where the merge itself (and `checkout --conflict`, which merges as it
+# does) doesn't — so the merge is made again that way too, into a scratch tree through a copy of
+# the index (nothing of the participant's written), its labels set aside. When there are no labels
+# to read (a marker line deleted, or its label) or a stage is binary, it can't be made again, so
+# nothing says the file is as git left it: `unknown`, and the operation stays BUSY. Never judged
+# by the file's time instead: a participant who starts at once, deletes a marker and edits the
+# hunk would have that edit overwritten (review ai-review codex #5).
 as_left() {
     _p=$1 _n=$2
     _l1=$(LC_ALL=C grep -a -m1 -E "^<{$_n} " -- "$_p" | cut -c"$((_n + 2))"-)
@@ -195,7 +199,7 @@ as_left() {
     _l2=$(LC_ALL=C grep -a -m1 -E "^\\|{$_n} " -- "$_p" | cut -c"$((_n + 2))"-)
     if LC_ALL=C grep -aqE "^\\|{$_n}( |\$)" -- "$_p"; then _styles='diff3 zdiff3'; else _styles=merge; fi
     if [ -z "$_l1" ] || [ -z "$_l3" ] || binary_blob "$4" || binary_blob "$5" || { [ "$3" != - ] && binary_blob "$3"; }; then
-        if [ $(($(stat -c %Y -- "$_p") - mt)) -gt 120 ]; then echo begun; else echo same; fi
+        echo unknown
         return 0
     fi
     for _s in $_styles; do
@@ -235,9 +239,11 @@ while IFS="$TAB" read -r st m1 b1 m2 b2 m3 b3 p; do
             act=hand
         else
             stages "$b1" "$b2" "$b3" || refuse "$p's sides couldn't be read"
-            if [ "$(as_left "$p" "$n" "$b1" "$b2" "$b3")" = begun ]; then
-                refuse "you started resolving $p by hand — finish it (and git add it) or abort, on the pod"
-            fi
+            case $(as_left "$p" "$n" "$b1" "$b2" "$b3") in
+                same) ;;
+                begun) refuse "you started resolving $p by hand — finish it (and git add it) or abort, on the pod" ;;
+                *) refuse "can't tell whether you started resolving $p by hand (a marker line or its label is gone, or a side is binary: git's conflicted output can't be made again to compare) — finish it (and git add it) or abort, on the pod" ;;
+            esac
             # Per hunk when both sides (and the base) are regular text files.
             case "$m1 $m2 $m3" in
                 *120000* | *160000*) ;;
