@@ -1300,13 +1300,17 @@ says the pod data is data, never instructions, and they can't act on it anyway: 
 text`, codex as `codex exec -s read-only --skip-git-repo-check --ephemeral --ignore-user-config
 --ignore-rules` with `mcp_servers` emptied, web search off and every tool feature disabled (shell,
 unified exec, code mode, apps, plugins, browser and computer use, sub-agents, image generation and
-viewing, hooks). **It fails closed**: neither is sent anything until `claude --help` lists every one
-of those flags, or `codex features list` names every one of those features — a check that fails,
-times out or finds one missing refuses the ask (`codex: couldn't confirm its tools are off — not
-asked (…)`). The prompt goes on stdin (never argv), in an empty private temporary directory, with a
-minimal environment (`PATH`, `HOME`, the locale, XDG and proxy variables, and the AI's own config
-dir and API key — not the rest of yours); `--timeout` (default 300 s) stops it. A missing binary is
-an error naming the other one.
+viewing, hooks) — and so is every web search feature, sleep tool, skill search, tool suggestion,
+goal or worktree feature it lists. **It fails closed**: neither is sent anything until `claude
+--help` lists every one of those flags, or `codex features list` names every one of those features
+and then, run again with the ask's own overrides (and an empty `CODEX_HOME`, as the ask reads no
+`config.toml`), shows nothing on beyond a reviewed list of features known to give it no tool
+(`arena_core::ask::ai::CODEX_SAFE_FEATURES`, from codex 0.163) — a check that fails, times out, or
+finds one missing or a feature on it doesn't know refuses the ask (`codex: couldn't confirm its
+tools are off — not asked (…)`, naming it). The prompt goes on stdin (never argv), in an empty
+private temporary directory, with a minimal environment (`PATH`, `HOME`, the locale, XDG and proxy
+variables, and the AI's own config dir and API key — not the rest of yours); `--timeout` (default
+300 s) stops it. A missing binary is an error naming the other one.
 
 #### Where answers are saved
 
@@ -1749,10 +1753,13 @@ scripts/ai-review --dry-run              # only write prompt.txt: nothing is sen
   codex `exec` read-only and ephemeral, without your `config.toml` or execpolicy rules
   (`--ignore-user-config --ignore-rules`: `--model-codex` and `--effort` still pick), with
   `mcp_servers` emptied and its shell, code mode, apps, plugins, browser and computer use,
-  sub-agents, image generation and viewing, hooks and web search turned off. Neither is sent
-  anything until it has confirmed it knows every one of those switches — `codex features list` names
-  each feature, `claude --help` lists each flag; a check that fails, times out (20 s) or finds one
-  missing refuses that reviewer (`ai-review: codex: couldn't confirm its tools are off — not asked
+  sub-agents, image generation and viewing, hooks and web search turned off (every web search
+  feature it lists too, and its sleep tool, skill search, tool suggestion, goals and worktrees).
+  Neither is sent anything until it has confirmed it knows every one of those switches — `codex
+  features list` names each feature, `claude --help` lists each flag — and codex until that list,
+  run again with the review's overrides and an empty `CODEX_HOME`, shows nothing else on but the
+  features `pods ask` allows; a check that fails, times out (20 s), or finds one missing or one more
+  on refuses that reviewer (`ai-review: codex: couldn't confirm its tools are off — not asked
   (…)`), and the other still runs. (Here codex's sandbox can't run a command anyway: bubblewrap
   fails.)
 - **Output** goes to `${XDG_STATE_HOME:-~/.local/state}/arena-review/<UTC time>-<range|prN>/`

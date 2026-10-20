@@ -52,15 +52,27 @@ pub(crate) struct AskRun {
 
 /// The command line the AI runs with, for the dry run (the prompt goes on its stdin), and the
 /// check that comes first: it is run only once `claude --help` / `codex features list` shows it
-/// knows every switch that takes its tools away.
+/// knows every switch that takes its tools away — and codex only once that list, with them, shows
+/// nothing else on that isn't known to give it no tool (it then also turns off each web search
+/// feature, and each of `CODEX_OFF_WHEN_LISTED`, it lists).
 fn ai_command_line(ai: Ai, model: Option<&str>) -> String {
     let args = match ai {
         Ai::Claude => ai::claude_args(model),
-        Ai::Codex => ai::codex_args(std::path::Path::new("<empty temp dir>"), std::path::Path::new("<answer file>"), model),
+        Ai::Codex => {
+            let tools: Vec<String> = ai::CODEX_TOOL_FEATURES.iter().map(|f| f.to_string()).collect();
+            ai::codex_args(std::path::Path::new("<empty temp dir>"), std::path::Path::new("<answer file>"), model, &tools)
+        }
     };
     let words: Vec<String> = args.iter().map(|a| arena_core::ssh::shell_word(a)).collect();
+    let more = match ai {
+        Ai::Claude => "",
+        Ai::Codex => {
+            " and, with them, shows nothing else on that isn't known to give it no tool (each web search feature, and each \
+             other one arena_core::ask::ai::CODEX_OFF_WHEN_LISTED names, that it lists is disabled too)"
+        }
+    };
     format!(
-        "{} {}` — once `{} {}` confirms it knows each of those no-tools switches",
+        "{} {}` — once `{} {}` confirms it knows each of those no-tools switches{more}",
         ai.name(),
         words.join(" "),
         ai.name(),

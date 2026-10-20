@@ -7,18 +7,22 @@
 //! `--safe-mode`, `--strict-mcp-config` with an explicitly empty `--mcp-config`, no slash
 //! commands and no saved session (verified with `scripts/ai-review` to list `tools: []`); and
 //! codex read-only, ephemeral, without the operator's `config.toml` (its MCP servers, hooks,
-//! profiles) and with `mcp_servers` emptied, web search off and every tool feature in
-//! [`CODEX_TOOL_FEATURES`] disabled. Everything the model sees is in the prompt.
+//! profiles) and with `mcp_servers` emptied, web search off, every tool feature in
+//! [`CODEX_TOOL_FEATURES`] disabled, and so every one of [`CODEX_OFF_WHEN_LISTED`] (and any web
+//! search one) it has. Everything the model sees is in the prompt.
 //! `scripts/ai-review` runs both exactly so — the same argv, check and environment; a test holds
 //! its lists to these.
 //!
 //! **Fail closed.** Neither is sent anything until the CLI itself has confirmed it knows every
 //! switch that takes its tools away — claude's `--help` lists each of [`CLAUDE_NO_TOOL_FLAGS`],
-//! codex's `features list` names each of [`CODEX_TOOL_FEATURES`] ([`confirm_tools_off`]). A
-//! check that fails, times out or finds one missing refuses the ask: a codex that doesn't know a
-//! feature can't be told to turn it off, and one run without those switches could read files on
-//! this machine through its shell. Both get an empty working directory and a minimal environment
-//! ([`child_env`]: not the operator's provider keys).
+//! codex's `features list` names each of [`CODEX_TOOL_FEATURES`] ([`confirm_tools_off`]) — and,
+//! for codex, that nothing else stays on: its `features list` run again with the very overrides
+//! the ask gets may show on only what [`CODEX_SAFE_FEATURES`] allows ([`codex_still_on`]; review
+//! ai-review claude #1: a feature it has under a name not listed here, or an override it ignored,
+//! would have stayed on). A check that fails, times out or finds one missing or one more on
+//! refuses the ask: a codex that doesn't know a feature can't be told to turn it off, and one run
+//! without those switches could read files on this machine through its shell. Both get an empty
+//! working directory and a minimal environment ([`child_env`]: not the operator's provider keys).
 //!
 //! The binaries are looked up on `PATH`, then in `~/.local/bin` (where both install), as
 //! `ai-review` does; a missing one is an error that names the other option. The pure parts —
@@ -167,8 +171,8 @@ pub fn claude_args(model: Option<&str>) -> Vec<String> {
 /// codex features that give it a tool, every one turned off (`scripts/ai-review` turns off the
 /// same list), `view_image` included: it reads an image file anywhere on this machine. Its
 /// `features list` must name each before it is asked anything ([`confirm_tools_off`]): a feature
-/// it doesn't know can't be disabled (`--disable` of an unknown name is an error), and one it has
-/// under another name would stay on.
+/// it doesn't know can't be disabled (`--disable` of an unknown name is an error). One it has
+/// under another name is caught by what may stay on ([`CODEX_SAFE_FEATURES`]).
 pub const CODEX_TOOL_FEATURES: &[&str] = &[
     "shell_tool",
     "unified_exec",
@@ -186,22 +190,118 @@ pub const CODEX_TOOL_FEATURES: &[&str] = &[
     "view_image",
 ];
 
+/// codex features also turned off whenever its `features list` names one (none has to be there):
+/// each gives the model a tool, keeps what it's told or makes files on this machine — a `sleep`
+/// tool, `skill_search` (reads this machine's skills), `skill_mcp_dependency_install` (installs MCP
+/// servers), `tool_suggest`, `goals` (a goal the model sets, kept), `in_app_local_automation`,
+/// `worktrees` (git worktrees) — or does what no review here has pinned down
+/// (`workspace_dependencies`). So is any feature with `web_search` in its name
+/// ([`off_when_listed`]): `-c web_search="disabled"` alone is a key a codex that didn't know it
+/// would ignore without a word.
+pub const CODEX_OFF_WHEN_LISTED: &[&str] =
+    &["sleep_tool", "skill_search", "skill_mcp_dependency_install", "tool_suggest", "goals", "in_app_local_automation", "workspace_dependencies", "worktrees"];
+
+/// codex features that may stay on for an ask — reviewed against codex 0.163's `features list`,
+/// run with the ask's own overrides: what it still shows on, each known to give the model no
+/// tool. Any other feature it shows on, one unknown here included, refuses the ask
+/// ([`codex_still_on`]).
+pub const CODEX_SAFE_FEATURES: &[&str] = &[
+    // Auth, models, the network and the wire; the CLI's own runtime (its app-server daemon, the
+    // Daybreak model programme).
+    "api_key_cyber_access_programs",
+    "api_key_model_discovery",
+    "auth_elicitation",
+    "enable_request_compression",
+    "system_proxy_fallback",
+    "unbounded_connection_retries",
+    "fast_mode",
+    "ultrafast_mode",
+    "cli_daybreak",
+    "daemon_auto_start",
+    // The conversation, and the interactive app's own UI.
+    "compaction_image_budget",
+    "content_item_kinds",
+    "instant_interrupt",
+    "mentions_v2",
+    "realtime_conversation",
+    "in_app_chat",
+    "in_app_dictation",
+    "in_app_updates",
+    "in_app_voice",
+    "guardian_approval",
+    "guardian_reuse_parent_compaction",
+    // Parts of a tool family that is off: the shell (`shell_tool`: unified exec is how it runs —
+    // and codex 0.163 shows `unified_exec` on whatever `--disable` says), the browser, code mode,
+    // plugins, MCP (no servers).
+    "unified_exec",
+    "unified_exec_tty",
+    "write_stdin_approval",
+    "shell_snapshot",
+    "browser_annotation_api",
+    "browser_use_full_cdp_access",
+    "code_mode_interrupt",
+    "plugin_sharing",
+    "tool_call_mcp_elicitation",
+    // Removed: the flag does nothing any more.
+    "collaboration_modes",
+    "item_ids",
+    "resize_all_images",
+    "sqlite",
+    "steer",
+    "terminal_resize_reflow",
+    "tool_search_always_defer_mcp_tools",
+    "tui_app_server",
+];
+
+/// Whether codex is to turn `name` off when its `features list` names it: one of
+/// [`CODEX_OFF_WHEN_LISTED`], or any web search feature (`web_search_request`, …).
+pub fn off_when_listed(name: &str) -> bool {
+    CODEX_OFF_WHEN_LISTED.contains(&name) || name.contains("web_search")
+}
+
+/// What codex is run with `--disable` for: every one of [`CODEX_TOOL_FEATURES`], then each feature
+/// `listed` ([`parse_features`]) names that [`off_when_listed`] takes, in its order.
+pub fn codex_disabled(listed: &[(String, bool)]) -> Vec<String> {
+    let mut d: Vec<String> = CODEX_TOOL_FEATURES.iter().map(|f| f.to_string()).collect();
+    for (name, _) in listed {
+        if off_when_listed(name) && !d.contains(name) {
+            d.push(name.clone());
+        }
+    }
+    d
+}
+
+/// The features `listed` shows on that [`CODEX_SAFE_FEATURES`] doesn't allow — unknown names
+/// included. Empty: nothing on that could give it a tool.
+pub fn codex_still_on(listed: &[(String, bool)]) -> Vec<String> {
+    listed.iter().filter(|(name, on)| *on && !CODEX_SAFE_FEATURES.contains(&name.as_str())).map(|(name, _)| name.clone()).collect()
+}
+
+/// The overrides every codex run gets — its `features list` check's too, so the check sees what
+/// the ask gets: web search off, the MCP servers emptied, and `--disable` for each of `disabled`
+/// ([`codex_disabled`]).
+pub fn codex_overrides(disabled: &[String]) -> Vec<String> {
+    let mut a: Vec<String> = ["-c", "web_search=\"disabled\"", "-c", "mcp_servers={}"].map(String::from).to_vec();
+    for f in disabled {
+        a.extend(["--disable".to_string(), f.clone()]);
+    }
+    a
+}
+
 /// codex's argv: `exec` read-only and ephemeral, in `workdir` (an empty directory), its answer
 /// written to `out`; without the operator's `config.toml` (`--ignore-user-config`: its MCP
 /// servers, hooks, profiles, notify program) or execpolicy rules, and `mcp_servers` emptied
-/// besides (a system or managed config layer is still read); web search off, every tool feature
-/// in [`CODEX_TOOL_FEATURES`] disabled — always all of them: [`ask`] runs it only once its
-/// `features list` has named each — and the prompt on stdin (`-`).
-pub fn codex_args(workdir: &Path, out: &Path, model: Option<&str>) -> Vec<String> {
+/// besides (a system or managed config layer is still read); web search off, `disabled`
+/// ([`codex_disabled`]: every tool feature, always — [`ask`] runs it only once its `features list`
+/// has named each and shown nothing else on) turned off — and the prompt on stdin (`-`).
+pub fn codex_args(workdir: &Path, out: &Path, model: Option<&str>, disabled: &[String]) -> Vec<String> {
     let mut a: Vec<String> =
         ["exec", "-s", "read-only", "--skip-git-repo-check", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--color", "never", "-C"]
             .map(String::from)
             .to_vec();
     a.push(workdir.display().to_string());
-    a.extend(["-o", &out.display().to_string(), "-c", "web_search=\"disabled\"", "-c", "mcp_servers={}"].map(String::from));
-    for f in CODEX_TOOL_FEATURES {
-        a.extend(["--disable".to_string(), f.to_string()]);
-    }
+    a.extend(["-o".to_string(), out.display().to_string()]);
+    a.extend(codex_overrides(disabled));
     if let Some(m) = model {
         a.extend(["-m".to_string(), m.to_string()]);
     }
@@ -209,9 +309,16 @@ pub fn codex_args(workdir: &Path, out: &Path, model: Option<&str>) -> Vec<String
     a
 }
 
-/// The feature names in `codex features list`'s output: each line's first word.
-pub fn parse_features(stdout: &str) -> Vec<String> {
-    stdout.lines().filter_map(|l| l.split_whitespace().next()).map(String::from).collect()
+/// `codex features list`'s rows: each line's first word, and whether its last is `true` (on).
+pub fn parse_features(stdout: &str) -> Vec<(String, bool)> {
+    stdout
+        .lines()
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            let name = w.next()?;
+            Some((name.to_string(), w.next_back() == Some("true")))
+        })
+        .collect()
 }
 
 /// How `ai` describes itself before it is asked anything: `claude --help`, `codex features list`.
@@ -234,7 +341,7 @@ pub fn confirm_tools_off(ai: Ai, described: &str) -> Result<(), Vec<&'static str
         }
         Ai::Codex => {
             let known = parse_features(described);
-            CODEX_TOOL_FEATURES.iter().copied().filter(|f| !known.iter().any(|k| k == f)).collect()
+            CODEX_TOOL_FEATURES.iter().copied().filter(|f| !known.iter().any(|(k, _)| k == f)).collect()
         }
     };
     if missing.is_empty() {
@@ -353,7 +460,8 @@ pub fn missing(ai: Ai) -> String {
 }
 
 /// A private scratch directory (0700), removed when dropped: the AI's empty working directory
-/// is `empty/` inside it, codex's answer file beside that.
+/// is `empty/` inside it, codex's answer file beside that, and the empty `CODEX_HOME` its
+/// `features list` check runs with (`codex-home/`).
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -371,11 +479,16 @@ impl Scratch {
         b.create(&dir)?;
         let s = Scratch(dir);
         b.create(s.empty())?;
+        b.create(s.codex_home())?;
         Ok(s)
     }
 
     fn empty(&self) -> PathBuf {
         self.0.join("empty")
+    }
+
+    fn codex_home(&self) -> PathBuf {
+        self.0.join("codex-home")
     }
 }
 
@@ -400,22 +513,53 @@ pub fn printable(answer: &str) -> String {
     answer.lines().map(|l| crate::jobs::sanitize(l).trim_end().to_string()).collect::<Vec<_>>().join("\n").trim().to_string()
 }
 
-/// Run `ai`'s self-description ([`discovery_args`]) and hold it to [`confirm_tools_off`]:
-/// `Ok` only when it ran, within `budget`, and named every switch. Otherwise why not, as the
-/// refusal `ask` returns — nothing has been sent.
-async fn check_tools_off(ai: Ai, bin: &Path, cwd: &Path, vars: &[(OsString, OsString)], budget: Duration) -> Result<(), String> {
-    let args = discovery_args(ai);
-    let cmd = format!("{} {}", ai.name(), args.join(" "));
-    let refuse = |why: String| format!("{}: couldn't confirm its tools are off — not asked ({why})", ai.name());
+/// One run of `ai`'s self-description with `extra` arguments after [`discovery_args`]: its stdout,
+/// or why there is none (for the refusal).
+async fn describe(ai: Ai, bin: &Path, extra: &[String], cwd: &Path, vars: &[(OsString, OsString)], budget: Duration) -> Result<String, String> {
+    let args: Vec<String> = discovery_args(ai).into_iter().chain(extra.iter().cloned()).collect();
+    let cmd = format!("{} {}", ai.name(), discovery_args(ai).join(" "));
     let run = LocalRun { program: bin, args: &args, cwd, env: vars, input: b"" };
     match run_local_input(&run, &cmd, Some(budget)).await {
-        Ok(out) if out.success => confirm_tools_off(ai, &out.stdout).map_err(|missing| {
-            let what = if ai == Ai::Claude { "list" } else { "name" };
-            refuse(format!("`{cmd}` doesn't {what} {}", missing.join(", ")))
-        }),
-        Ok(out) => Err(refuse(format!("`{cmd}` failed ({}): {}", out.exit_label(), last_line(&out.stderr)))),
-        Err(crate::Error::Timeout { after, .. }) => Err(refuse(format!("`{cmd}` didn't answer within {}", crate::error::human_duration(&after)))),
-        Err(e) => Err(refuse(format!("`{cmd}`: {e}"))),
+        Ok(out) if out.success => Ok(out.stdout),
+        Ok(out) => Err(format!("`{cmd}` failed ({}): {}", out.exit_label(), last_line(&out.stderr))),
+        Err(crate::Error::Timeout { after, .. }) => Err(format!("`{cmd}` didn't answer within {}", crate::error::human_duration(&after))),
+        Err(e) => Err(format!("`{cmd}`: {e}")),
+    }
+}
+
+/// Hold `ai` to its own description before it is sent anything, each run within `budget`:
+/// claude's `--help` must list every one of [`CLAUDE_NO_TOOL_FLAGS`]; codex's `features list` must
+/// name every one of [`CODEX_TOOL_FEATURES`] ([`confirm_tools_off`]), then — run again with the
+/// overrides the ask will get ([`codex_overrides`] of [`codex_disabled`]) — show nothing on that
+/// [`CODEX_SAFE_FEATURES`] doesn't allow ([`codex_still_on`]). codex's checks run with an empty
+/// `CODEX_HOME` of their own (`codex_home`): `features list` has no `--ignore-user-config`, and the
+/// operator's `config.toml` that the ask doesn't read must not show a feature off there that the
+/// ask then has on. `Ok`: what codex is to run with `--disable` for (nothing for claude).
+/// Otherwise why not, as the refusal `ask` returns — nothing has been sent.
+async fn check_tools_off(ai: Ai, bin: &Path, cwd: &Path, vars: &[(OsString, OsString)], codex_home: &Path, budget: Duration) -> Result<Vec<String>, String> {
+    let refuse = |why: String| format!("{}: couldn't confirm its tools are off — not asked ({why})", ai.name());
+    let cmd = format!("{} {}", ai.name(), discovery_args(ai).join(" "));
+    match ai {
+        Ai::Claude => {
+            let help = describe(ai, bin, &[], cwd, vars, budget).await.map_err(refuse)?;
+            confirm_tools_off(ai, &help).map_err(|missing| refuse(format!("`{cmd}` doesn't list {}", missing.join(", "))))?;
+            Ok(Vec::new())
+        }
+        Ai::Codex => {
+            let home = (OsString::from("CODEX_HOME"), codex_home.as_os_str().to_os_string());
+            let vars: Vec<(OsString, OsString)> = vars.iter().filter(|(k, _)| k != "CODEX_HOME").cloned().chain([home]).collect();
+            let listed = describe(ai, bin, &codex_overrides(&[]), cwd, &vars, budget).await.map_err(refuse)?;
+            confirm_tools_off(ai, &listed).map_err(|missing| refuse(format!("`{cmd}` doesn't name {}", missing.join(", "))))?;
+            let disabled = codex_disabled(&parse_features(&listed));
+            let after = describe(ai, bin, &codex_overrides(&disabled), cwd, &vars, budget).await.map_err(refuse)?;
+            match codex_still_on(&parse_features(&after)).as_slice() {
+                [] => Ok(disabled),
+                on => Err(refuse(format!(
+                    "`{cmd}` shows {} on with the ask's overrides — not known to give it no tool (arena_core::ask::ai::CODEX_SAFE_FEATURES)",
+                    on.join(", ")
+                ))),
+            }
+        }
     }
 }
 
@@ -429,10 +573,10 @@ pub async fn ask(ai: Ai, prompt: &str, model: Option<&str>, timeout: Duration, e
     let empty = scratch.empty();
     let answer_file = scratch.0.join("answer.md");
     let vars = child_env(ai, env);
-    check_tools_off(ai, &bin, &empty, &vars, timeout.min(DISCOVERY_TIMEOUT)).await?;
+    let disabled = check_tools_off(ai, &bin, &empty, &vars, &scratch.codex_home(), timeout.min(DISCOVERY_TIMEOUT)).await?;
     let args = match ai {
         Ai::Claude => claude_args(model),
-        Ai::Codex => codex_args(&empty, &answer_file, model),
+        Ai::Codex => codex_args(&empty, &answer_file, model, &disabled),
     };
     let run = LocalRun { program: &bin, args: &args, cwd: &empty, env: &vars, input: prompt.as_bytes() };
     let out = match run_local_input(&run, ai.name(), Some(timeout)).await {
@@ -485,23 +629,51 @@ pub mod fixtures {
         h
     }
 
-    /// What a stub `codex features list` prints: every feature in [`CODEX_TOOL_FEATURES`] and
-    /// a few others, as `name  stage  enabled` rows, less `without`.
+    /// A stub codex's features, in its order: every one of [`CODEX_TOOL_FEATURES`], a web search
+    /// one, two of [`CODEX_OFF_WHEN_LISTED`] and two of [`CODEX_SAFE_FEATURES`] — less `without`,
+    /// plus `extra`.
+    pub fn codex_feature_names(without: &[&str], extra: &[&str]) -> Vec<String> {
+        let names = CODEX_TOOL_FEATURES.iter().chain(&["web_search_request", "goals", "sleep_tool", "fast_mode", "steer"]).chain(extra);
+        names.filter(|f| !without.contains(f)).map(|f| f.to_string()).collect()
+    }
+
+    /// What a stub `codex features list` prints, all on: [`codex_feature_names`] less `without`,
+    /// as `name  stage  enabled` rows.
     pub fn codex_features(without: &[&str]) -> String {
-        let names = CODEX_TOOL_FEATURES.iter().chain(&["web_search_request", "goals", "zzz_new"]);
-        names.filter(|f| !without.contains(f)).map(|f| format!("{f:<40} stable             true\n")).collect()
+        codex_feature_names(without, &[]).iter().map(|f| format!("{f:<40} stable             true\n")).collect()
+    }
+
+    /// A stub codex's `features …` answer, as sh: [`codex_feature_names`] (less `without`, plus
+    /// `extra`) as `name  stage  enabled` rows, each on unless the call `--disable`s it — less
+    /// `ignored`, which stay on whatever it says, as `unified_exec` does in codex 0.163. Each call's
+    /// arguments go to `<rec>/codex.features.argv` and its `CODEX_HOME` to `…features.home`, when
+    /// `rec` is given.
+    pub fn codex_features_sh(without: &[&str], extra: &[&str], ignored: &[&str], rec: Option<&Path>) -> String {
+        let names = codex_feature_names(without, extra).join(" ");
+        let ignored = ignored.join(" ");
+        let record = rec.map_or(String::new(), |r| {
+            format!("printf '%s\\n' \"$*\" >> {0}/codex.features.argv\nprintf '%s\\n' \"${{CODEX_HOME:-}}\" >> {0}/codex.features.home\n", r.display())
+        });
+        format!(
+            "{record}off=' '; prev=; for a; do [ \"$prev\" = --disable ] && off=\"$off$a \"; prev=$a; done\n\
+             for f in {names}; do\n\
+             case \" {ignored} \" in *\" $f \"*) s=true ;; *) case \"$off\" in *\" $f \"*) s=false ;; *) s=true ;; esac ;; esac\n\
+             printf '%-40s stable             %s\\n' \"$f\" \"$s\"\n\
+             done"
+        )
     }
 
     /// Stub `claude` and `codex` in `<tmp>/bin` that record their argv (one per line), stdin,
     /// working directory and environment under `<tmp>/rec/<name>.*` and answer `ANSWER from
     /// <name>` — codex into its `-o` file, as the real one does. `claude --help` lists the no-tools
-    /// flags ([`claude_help`]) and `codex features list` every tool feature ([`codex_features`]),
-    /// without recording anything.
+    /// flags ([`claude_help`]) and `codex features list` its features as codex does
+    /// ([`codex_features_sh`]: each call's arguments and `CODEX_HOME` recorded).
     #[cfg(unix)]
     pub fn recording_stubs(tmp: &Path) -> AiEnv {
         let (bin, rec) = (tmp.join("bin"), tmp.join("rec"));
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&rec).unwrap();
+        let features = codex_features_sh(&[], &[], &["unified_exec"], Some(&rec));
         let rec = rec.display();
         stub(
             &bin,
@@ -517,11 +689,11 @@ pub mod fixtures {
             &bin,
             "codex",
             &format!(
-                "if [ \"$1\" = features ]; then cat <<'EOF'\n{}EOF\nexit 0; fi\n\
+                "if [ \"$1\" = features ]; then\n{}\nexit 0; fi\n\
                  printf '%s\\n' \"$@\" > {rec}/codex.argv\ncat > {rec}/codex.stdin\npwd > {rec}/codex.cwd\nenv > {rec}/codex.env\n\
                  out=; prev=; for a; do [ \"$prev\" = -o ] && out=$a; prev=$a; done\n\
                  echo 'ANSWER from codex' > \"$out\"\necho 'codex chatter on stdout'",
-                codex_features(&[])
+                features
             ),
         );
         AiEnv { path: Some(on_path(&bin)), home: None, tmp: tmp.to_path_buf(), vars: vec![("LANG".into(), "C.UTF-8".into())] }
@@ -651,10 +823,12 @@ pub(crate) mod tests {
         ] {
             want.extend(words(&["--disable", f]));
         }
-        want.extend(words(&["-m", "gpt-x", "-"]));
-        assert_eq!(codex_args(Path::new("/t/empty"), Path::new("/t/a.md"), Some("gpt-x")), want);
-        assert_eq!(codex_args(Path::new("/t/empty"), Path::new("/t/a.md"), None).last().map(String::as_str), Some("-"), "the prompt on stdin");
-        assert_eq!(parse_features("shell_tool stable true\n\napps beta false\n"), ["shell_tool", "apps"]);
+        want.extend(words(&["--disable", "web_search_request", "-m", "gpt-x", "-"]));
+        let disabled: Vec<String> = CODEX_TOOL_FEATURES.iter().chain(&["web_search_request"]).map(|f| f.to_string()).collect();
+        assert_eq!(codex_args(Path::new("/t/empty"), Path::new("/t/a.md"), Some("gpt-x"), &disabled), want);
+        assert_eq!(codex_args(Path::new("/t/empty"), Path::new("/t/a.md"), None, &disabled).last().map(String::as_str), Some("-"), "the prompt on stdin");
+        let rows = |v: &[(&str, bool)]| v.iter().map(|(n, on)| (n.to_string(), *on)).collect::<Vec<_>>();
+        assert_eq!(parse_features("shell_tool stable true\n\napps beta false\nin_app_voice under development  true\nlonely\n"), rows(&[("shell_tool", true), ("apps", false), ("in_app_voice", true), ("lonely", false)]));
     }
 
     /// The check before anything is sent: claude's --help must list every no-tools flag (as a
@@ -697,8 +871,9 @@ pub(crate) mod tests {
 
     /// `scripts/ai-review` runs codex and claude as `ask` does — it had the same fail-open codex
     /// check and no MCP override (lane ASK3's note) — so the two can't drift apart: the same tool
-    /// features, no-tools flags, MCP config and environment lists, the same argv, and both its
-    /// check and its review started under `env -i`. (Its runs themselves are tested with stub
+    /// features, features turned off when listed, features that may stay on, no-tools flags, MCP
+    /// config and environment lists, the same argv and the same codex check (the overrides, an
+    /// empty `CODEX_HOME`), and both its check and its review started under `env -i`. (Its runs themselves are tested with stub
     /// CLIs; this holds the text.)
     #[test]
     fn ai_review_runs_claude_and_codex_as_ask_does() {
@@ -708,6 +883,8 @@ pub(crate) mod tests {
             script[start..start + script[start..].find(')').unwrap()].split_whitespace().collect()
         };
         assert_eq!(array("CODEX_TOOL_FEATURES"), CODEX_TOOL_FEATURES);
+        assert_eq!(array("CODEX_OFF_WHEN_LISTED"), CODEX_OFF_WHEN_LISTED);
+        assert_eq!(array("CODEX_SAFE_FEATURES"), CODEX_SAFE_FEATURES);
         assert_eq!(array("CLAUDE_NO_TOOL_FLAGS"), CLAUDE_NO_TOOL_FLAGS);
         assert_eq!(array("COMMON_VARS"), COMMON_VARS);
         assert_eq!(array("CLAUDE_VARS"), own_vars(Ai::Claude));
@@ -725,10 +902,16 @@ pub(crate) mod tests {
         };
         let printf = |words: &[String]| format!("printf '%s\\0' {}", words.iter().map(sh).collect::<Vec<_>>().join(" "));
         assert!(text.contains(&printf(&claude_args(None))), "claude's argv");
-        let codex = codex_args(Path::new("$WORK/empty"), Path::new("$DIR/codex.md"), None);
+        let tools: Vec<String> = CODEX_TOOL_FEATURES.iter().map(|f| f.to_string()).collect();
+        let codex = codex_args(Path::new("$WORK/empty"), Path::new("$DIR/codex.md"), None, &tools);
         let first_disable = codex.iter().position(|a| a == "--disable").unwrap();
         assert!(text.contains(&printf(&codex[..first_disable])), "codex's argv up to the features");
-        assert!(text.contains(r#"for f in "${CODEX_TOOL_FEATURES[@]}"; do printf '%s\0' --disable "$f"; done"#), "every feature, always");
+        assert!(text.contains(r#"mapfile -t disable <"$WORK/codex.disable""#), "the features its check chose");
+        assert!(text.contains(r#"for f in "${disable[@]}"; do printf '%s\0' --disable "$f"; done"#), "each of them");
+        assert!(text.contains(r#"printf '%s\n' "${CODEX_TOOL_FEATURES[@]}""#), "every tool feature, always");
+        assert!(text.contains(r#"case $f in *web_search*) echo "$f" ;; esac"#), "web search, as off_when_listed");
+        assert!(text.contains(r#"args=(features list -c 'web_search="disabled"' -c 'mcp_servers={}')"#), "its check gets the overrides");
+        assert!(text.contains(r#"envs+=("CODEX_HOME=$WORK/codex-home")"#), "its check: an empty CODEX_HOME");
         assert_eq!(text.matches(r#"exec timeout -k "#).count(), 2, "the check and the review");
         assert_eq!(text.matches(r#"env -i "${envs[@]}" "$bin" "${args[@]}""#).count(), 2, "both under env -i");
     }
@@ -783,7 +966,8 @@ pub(crate) mod tests {
         let at = |flag: &str| argv.iter().position(|a| a == flag).map(|i| argv[i + 1].clone()).unwrap();
         let (cwd, out) = (at("-C"), at("-o"));
         assert_eq!(cwd, rec(&t.0, "codex.cwd").trim(), "-C is where it runs: the empty dir");
-        assert_eq!(argv, codex_args(Path::new(&cwd), Path::new(&out), None), "exactly the no-tools argv, the MCP override included");
+        let disabled = codex_disabled(&parse_features(&codex_features(&[])));
+        assert_eq!(argv, codex_args(Path::new(&cwd), Path::new(&out), None, &disabled), "exactly the no-tools argv, the MCP override included");
         assert_eq!(rec(&t.0, "codex.stdin"), "PROMPT");
         assert!(!rec(&t.0, "codex.env").lines().any(|l| l.starts_with("CARGO")), "{}", rec(&t.0, "codex.env"));
     }
@@ -809,13 +993,91 @@ pub(crate) mod tests {
         ];
         for (ai, describe, secs, why) in cases {
             let discovery = discovery_args(ai).join(" ");
-            stub(&bin, ai.name(), &format!("if [ \"$*\" = '{discovery}' ]; then\n{describe}\nexit $?\nfi\ncat > {}\necho ANSWER", ran.display()));
+            stub(&bin, ai.name(), &format!("case \"$*\" in '{discovery}'*)\n{describe}\nexit $? ;;\nesac\ncat > {}\necho ANSWER", ran.display()));
             let started = std::time::Instant::now();
             let e = ask(ai, "the PROMPT", None, Duration::from_secs(secs), &env).await.unwrap_err();
             assert!(e.starts_with(&format!("{}: couldn't confirm its tools are off — not asked (", ai.name())), "{e}");
             assert!(e.contains(why), "{why} in {e}");
             assert!(!ran.exists(), "{}: it was run with the prompt after {why}", ai.name());
             assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+        }
+    }
+
+    /// Review ai-review claude #1: what may stay on. The features turned off are every tool
+    /// feature, then each web search one and each of [`CODEX_OFF_WHEN_LISTED`] that codex lists;
+    /// once they are, anything it still shows on outside [`CODEX_SAFE_FEATURES`] is named — an
+    /// unknown feature, or one whose `--disable` it ignored. No tool feature may stay on but
+    /// `unified_exec` (the shell's implementation, which codex 0.163 keeps on), never `shell_tool`.
+    #[test]
+    fn codex_may_keep_on_only_the_reviewed_features() {
+        let listed = parse_features(&codex_features(&[]));
+        let disabled = codex_disabled(&listed);
+        assert_eq!(disabled[..CODEX_TOOL_FEATURES.len()], *CODEX_TOOL_FEATURES);
+        assert_eq!(disabled[CODEX_TOOL_FEATURES.len()..], ["web_search_request", "goals", "sleep_tool"]);
+        assert!(off_when_listed("web_search_cached") && off_when_listed("standalone_web_search") && off_when_listed("worktrees"));
+        assert!(!off_when_listed("fast_mode") && !off_when_listed("shell_snapshot"));
+        let row = |n: &str, on| (n.to_string(), on);
+        assert_eq!(codex_still_on(&[row("fast_mode", true), row("unified_exec", true), row("shell_tool", false), row("zzz_new", false)]), Vec::<String>::new());
+        assert_eq!(codex_still_on(&[row("fast_mode", true), row("zzz_new", true), row("shell_tool", true), row("goals", true)]), ["zzz_new", "shell_tool", "goals"]);
+        for f in CODEX_TOOL_FEATURES.iter().chain(CODEX_OFF_WHEN_LISTED) {
+            assert!(!CODEX_SAFE_FEATURES.contains(f) || *f == "unified_exec", "{f} may stay on");
+        }
+        assert!(!CODEX_SAFE_FEATURES.iter().any(|f| f.contains("web_search") || *f == "shell_tool"));
+    }
+
+    /// The allow-list is codex 0.163's own: its real `features list` (run on this box with the ask's
+    /// overrides — an empty `CODEX_HOME`, `-c web_search="disabled" -c mcp_servers={}` and a
+    /// `--disable` for each of [`codex_disabled`]; no prompt) shows on nothing else, every allowed
+    /// feature is one it has on, and what it was told to turn off is off — but `unified_exec`.
+    #[test]
+    fn codex_0_163_keeps_on_only_what_is_allowed() {
+        let listed = parse_features(include_str!("testdata/codex-0.163-features-list.txt"));
+        assert_eq!(listed.len(), 175);
+        assert_eq!(codex_still_on(&listed), Vec::<String>::new());
+        for f in CODEX_SAFE_FEATURES {
+            assert!(listed.iter().any(|(n, on)| n == f && *on), "{f} isn't on in 0.163");
+        }
+        let disabled = codex_disabled(&listed);
+        let still: Vec<&str> = listed.iter().filter(|(n, on)| *on && disabled.contains(n)).map(|(n, _)| n.as_str()).collect();
+        assert_eq!(still, ["unified_exec"]);
+        let web: Vec<&str> = disabled.iter().map(String::as_str).filter(|f| f.contains("web_search")).collect();
+        assert_eq!(web, ["standalone_web_search", "web_search_cached", "web_search_request"]);
+    }
+
+    /// codex is asked only once its `features list`, with the ask's own overrides, shows nothing on
+    /// beyond what may stay on: all known → asked, every web search feature and every one of
+    /// [`CODEX_OFF_WHEN_LISTED`] it lists off too; a feature unknown here on, or an override it
+    /// ignored (`shell_tool` still on) → refused, naming it, never sent the prompt. Both checks run
+    /// with an empty `CODEX_HOME` of their own — the operator's `config.toml`, which the ask
+    /// doesn't read, can't hide one — and the ask itself with the operator's (its login).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_is_asked_only_when_nothing_unreviewed_stays_on() {
+        let t = Tmp::new("allow");
+        let mut env = recording_stubs(&t.0);
+        let operator = t.0.join("operator-codex");
+        env.vars.push(("CODEX_HOME".into(), operator.clone().into_os_string()));
+        assert_eq!(ask(Ai::Codex, "PROMPT", None, Duration::from_secs(20), &env).await.unwrap(), "ANSWER from codex");
+        let argv = rec(&t.0, "codex.argv");
+        for f in ["web_search_request", "goals", "sleep_tool", "shell_tool"] {
+            assert!(argv.contains(&format!("--disable\n{f}\n")), "{f}: {argv}");
+        }
+        let checks: Vec<String> = rec(&t.0, "codex.features.argv").lines().map(String::from).collect();
+        let disabled = codex_disabled(&parse_features(&codex_features(&[])));
+        let line = |d: &[String]| ["features", "list"].map(String::from).into_iter().chain(codex_overrides(d)).collect::<Vec<_>>().join(" ");
+        assert_eq!(checks, [line(&[]), line(&disabled)], "the names, then the overrides the ask gets");
+        let homes: Vec<String> = rec(&t.0, "codex.features.home").lines().map(String::from).collect();
+        assert!(homes.len() == 2 && homes.iter().all(|h| h.ends_with("/codex-home") && h.contains("arena-ask-")), "{homes:?}");
+        assert!(rec(&t.0, "codex.env").lines().any(|l| l == format!("CODEX_HOME={}", operator.display())), "the ask keeps its login");
+
+        let bin = t.0.join("bin");
+        let ran = t.0.join("ran");
+        for (extra, ignored, named) in [(&["zzz_new"][..], &["unified_exec"][..], "zzz_new"), (&[][..], &["unified_exec", "shell_tool"][..], "shell_tool")] {
+            stub(&bin, "codex", &format!("if [ \"$1\" = features ]; then\n{}\nexit 0; fi\ncat > {}\necho ANSWER", codex_features_sh(&[], extra, ignored, None), ran.display()));
+            let e = ask(Ai::Codex, "the PROMPT", None, Duration::from_secs(20), &env).await.unwrap_err();
+            assert!(e.starts_with("codex: couldn't confirm its tools are off — not asked (`codex features list` shows "), "{e}");
+            assert!(e.contains(&format!("shows {named} on with the ask's overrides — not known to give it no tool")), "{e}");
+            assert!(!ran.exists(), "{named}: it was sent the prompt");
         }
     }
 
