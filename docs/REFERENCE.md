@@ -1315,7 +1315,9 @@ masked over the whole read (the log's last 64 KB) before its last 40 lines are t
 can keep a key's body without its header, nor a value whose name is above the cut. Where the read
 starts part-way into the log, a value whose name it never saw may run on at its top over any lines,
 so nothing is shown from its first 16 KB: what's shown begins where that tracking has settled (a
-log that fits in the read is tracked from its first byte). At the start of what's shown, lines that
+log that fits in the read is tracked from its first byte). One case is left: a multi-line value
+that starts more than 16 KiB above the shown lines and contains a short plain password line could
+show that line — logs aren't a place for secrets. At the start of what's shown, lines that
 look like base64 key material (40+ of `[A-Za-z0-9+/=]`, nothing else) are dropped. The AI CLI's
 own error line, printed and saved when it fails, is masked the same way. Each pod's part is at most
 6 KB (less when many pods share a prompt: 240 KB in all), trimmed from the log's oldest lines first.
