@@ -4,7 +4,7 @@
 //! the pod's terminals and processes stood in for by directories the tests fill.
 
 use super::*;
-use crate::backup::{backup_command_limited, parse_backup_report, BackupReport, BACKUP_BUSY_EXIT, BACKUP_PUSHED};
+use crate::backup::{backup_command_limited, backup_command_with_course, parse_backup_report, BackupReport, BACKUP_BUSY_EXIT, BACKUP_PUSHED};
 use std::path::{Path, PathBuf};
 
 const HOUR: u64 = 3600;
@@ -509,6 +509,25 @@ fn a_resolve_is_read_back_and_said_in_a_line() {
     );
     let clean = parse_resolve("RESOLVED merge\n");
     assert_eq!(resolved_note(&clean, 3, "/b/x"), "finished a merge left for 3h+ (nothing was left in conflict; today's copy: /b/x)");
+    // A course the resolve couldn't ask (FIX7): said, after the keys.
+    let gone = parse_resolve("COURSE_UNVERIFIED https://github.com/o/r.git\nREDACTED 1 a.md\nRESOLVED merge\n");
+    assert_eq!((gone.course_unverified.as_deref(), gone.course_rewritten.as_deref()), (Some("https://github.com/o/r.git"), None));
+    assert_eq!(
+        resolved_note(&gone, 3, "/b/x"),
+        "finished a merge left for 3h+ (nothing was left in conflict; keys redacted in the commit (kept on disk): a.md; couldn't reach \
+         the course repo (https://github.com/o/r.git) to verify the merged commit is its own, so what came in from it was redacted like \
+         the participant's own; today's copy: /b/x)"
+    );
+    let rewritten = parse_resolve("COURSE_REWRITTEN https://github.com/o/r.git\nRESOLVED merge\n");
+    assert_eq!((rewritten.course_unverified.as_deref(), rewritten.course_rewritten.as_deref()), (None, Some("https://github.com/o/r.git")));
+    assert!(
+        resolved_note(&rewritten, 3, "/b/x").contains(
+            "; the pod's git config rewrites the course repo's URL (https://github.com/o/r.git: a `url.<base>.insteadOf`), so the merged \
+             commit wasn't verified and what came in from it was redacted like the participant's own; today's copy"
+        ),
+        "{}",
+        resolved_note(&rewritten, 3, "/b/x")
+    );
     let refused = parse_resolve("REFUSED changed: files changed since the copy\n");
     assert_eq!((refused.refused.as_deref(), refused.resolved), (Some("changed: files changed since the copy"), None));
     assert_eq!(parse_resolve("SAVED /x\nNEWER ours file 1 2 a\nFAILED git commit\n").failed.as_deref(), Some("git commit"));
@@ -536,8 +555,12 @@ fn a_resolve_is_read_back_and_said_in_a_line() {
 #[cfg(unix)]
 #[test]
 fn the_scripts_parse_under_sh() {
-    let cmd = resolve_command("/root/ARENA_materials", 3, "merge 1760000000 abc", "1-2", "w1d1/devtest-a");
-    let script = format!("set -- /root/ARENA_materials 10800 'merge 1760000000 abc' 1-2 3 w1d1/devtest-a 99614720 104857600\n{}", resolve_script());
+    let cmd = resolve_command("/root/ARENA_materials", 3, "merge 1760000000 abc", "1-2", "w1d1/devtest-a", Some("ARENA-education/ARENA_materials"));
+    let script = format!(
+        "set -- /root/ARENA_materials 10800 'merge 1760000000 abc' 1-2 3 w1d1/devtest-a 99614720 104857600 ARENA-education/ARENA_materials\n{}",
+        resolve_script()
+    );
+
     for (name, script) in [("look", look_script()), ("resolve", resolve_script()), ("resolve with its arguments", script.clone())] {
         let o = std::process::Command::new("sh").arg("-n").arg("-c").arg(&script).output().unwrap();
         assert!(o.status.success(), "{name}: {}", String::from_utf8_lossy(&o.stderr));
@@ -547,6 +570,9 @@ fn the_scripts_parse_under_sh() {
     assert!(look_command("/root/my repo").ends_with(" arena-look '/root/my repo'"));
     let (stopped, killed) = resolve_stop_words(270, 10);
     assert!(cmd == crate::backup::bounded_sh(&script, "arena-resolve", 270, 10, &stopped, &killed), "bounded_sh's, for the resolve's script");
+    // No course: an empty argument, nothing verified.
+    let none = format!("set -- /r 10800 o p 3 c 99614720 104857600 ''\n{}", resolve_script());
+    assert!(resolve_command("/r", 3, "o", "p", "c", None) == crate::backup::bounded_sh(&none, "arena-resolve", 270, 10, &stopped, &killed));
     assert!(stopped.starts_with("arena resolve: it ran past its 270 s on the pod and was stopped there (TERM)"), "{stopped}");
     assert!(killed.starts_with("arena resolve: it ran past its 270 s on the pod and was killed there (10 s after the TERM)"), "{killed}");
     assert_eq!((RESOLVE_BOUND_SECS, RESOLVE_KILL_AFTER_SECS), (270, 10));
@@ -565,7 +591,10 @@ fn the_scripts_parse_under_sh() {
 /// two directories of the sandbox, empty unless [`Repo::pts`] / [`Repo::process`] fill them (the
 /// build machine's own terminals and git processes — other tests' — never count). The base
 /// commit, 20 days old, has `README.md`, `notes.py`, `old.py`, `data.bin` (binary), `link` (→
-/// README.md), `sub dir/we*ird.py`, and a `.gitignore` of `ignored/`.
+/// README.md), `sub dir/we*ird.py`, and a `.gitignore` of `ignored/`. The course repo the resolve
+/// is given (`course_repo`, what it fetches to verify the course's commits) is a path nothing is
+/// at, unless a test names one ([`Repo::set_course`]): no test reaches GitHub, and only a ref
+/// written by hand ([`Repo::verified_course`]) verifies anything.
 #[cfg(unix)]
 struct Repo {
     base: PathBuf,
@@ -573,6 +602,7 @@ struct Repo {
     course: PathBuf,
     work: PathBuf,
     now: u64,
+    course_repo: std::cell::RefCell<PathBuf>,
 }
 
 #[cfg(unix)]
@@ -583,7 +613,14 @@ impl Repo {
         for d in ["home", "bin", "proc", "pts"] {
             std::fs::create_dir_all(base.join(d)).unwrap();
         }
-        let r = Repo { origin: base.join("origin.git"), course: base.join("course"), work: base.join("work"), now: now(), base };
+        let r = Repo {
+            origin: base.join("origin.git"),
+            course: base.join("course"),
+            work: base.join("work"),
+            now: now(),
+            course_repo: std::cell::RefCell::new(base.join("no-such-course.git")),
+            base,
+        };
         r.login(None);
         r.git(&r.base, &["init", "-q", "--bare", r.origin.to_str().unwrap()]);
         r.git(&r.base, &["init", "-q", "-b", "main", r.work.to_str().unwrap()]);
@@ -783,6 +820,18 @@ impl Repo {
         (code, parse_backup_report(&out), format!("{out}{err}"))
     }
 
+    /// The backup as `pods backup` runs it, the course repo [`Repo::course_repo`].
+    fn backup_with_course(&self) -> (Option<i32>, BackupReport, String) {
+        let course = self.course_repo.borrow().to_str().unwrap().to_string();
+        let (code, out, err) = self.sh(&backup_command_with_course(self.work.to_str().unwrap(), None, "arena backup", None, Some(&course)));
+        (code, parse_backup_report(&out), format!("{out}{err}"))
+    }
+
+    /// The course repo the resolve (and [`Repo::backup_with_course`]) is given from now on.
+    fn set_course(&self, course: &Path) {
+        *self.course_repo.borrow_mut() = course.to_path_buf();
+    }
+
     fn look(&self) -> Look {
         self.look_of(self.work.to_str().unwrap())
     }
@@ -801,7 +850,8 @@ impl Repo {
 
     /// [`Repo::resolve`] with a size limit and an environment (the tests' hooks).
     fn resolve_with(&self, hours: u64, look: &Look, max: u64, env: &[(&str, &str)]) -> (Option<i32>, ResolveReport, String) {
-        let cmd = resolve_command_limited(self.work.to_str().unwrap(), hours, &look.op_key(), &look.print, "w1d1/devtest-x", max);
+        let course = self.course_repo.borrow().to_str().unwrap().to_string();
+        let cmd = resolve_command_limited(self.work.to_str().unwrap(), hours, &look.op_key(), &look.print, "w1d1/devtest-x", max, Some(&course));
         let (code, out, err) = self.sh_with(&cmd, env);
         (code, parse_resolve(&out), format!("{out}{err}"))
     }
@@ -853,9 +903,9 @@ impl Repo {
         self.git(&self.work, &["ls-files", "-u"])
     }
 
-    /// `refs/arena/course-main` at `rev` (of the checkout): what the backup's fetch from the
-    /// configured course URL leaves — the course's own history, verified (written by hand here:
-    /// the fetch is the backup's).
+    /// `refs/arena/course-main` at `rev` (of the checkout): what a fetch from the configured course
+    /// URL leaves — the backup's, or the resolve's own — the course's own history, verified (written
+    /// by hand here; [`Repo::set_course`] for the fetch itself).
     fn verified_course(&self, rev: &str) {
         self.git(&self.work, &["update-ref", "refs/arena/course-main", rev]);
     }
@@ -1764,7 +1814,9 @@ fn every_path_the_commit_takes_is_checked_not_only_the_conflicted_ones() {
 /// course changed — goes in as published. Matching the other side proves nothing by itself: a
 /// cherry-pick of the participant's own commit with a key (its side chosen; its commit in the ref
 /// too — a pick never counts), a merge of their own branch with the ref there, the course's merge
-/// with no ref, or with a ref behind it — each committed redacted, the disk keeping the key.
+/// with no ref, or with a ref behind it — the course then asked (FIX7), and unreachable here, said
+/// — or the ref there but the course URL rewritten by the pod's git config (trusted by the backup's
+/// rule only when it isn't; said) — each committed redacted, the disk keeping the key.
 #[cfg(unix)]
 #[test]
 fn only_the_verified_courses_content_escapes_redaction() {
@@ -1801,7 +1853,12 @@ fn only_the_verified_courses_content_escapes_redaction() {
     // The course's merge: a key-like string in the conflicted keyed.py (the course's side newer)
     // and in example.md (only the course changed it). Verified: as published. No ref, or a ref
     // behind the merged commit (the course's older history only): redacted.
-    for (case, verified) in [("verify-course", Some("MERGE_HEAD")), ("verify-none", None), ("verify-behind", Some("MERGE_HEAD~1"))] {
+    for (case, verified) in [
+        ("verify-course", Some("MERGE_HEAD")),
+        ("verify-none", None),
+        ("verify-behind", Some("MERGE_HEAD~1")),
+        ("verify-rewritten", Some("MERGE_HEAD")),
+    ] {
         let r = Repo::new(case);
         r.add_base(&[("keyed.py", b"k = 0\n")]);
         r.course_commit(&[("keyed.py", keyed.as_bytes()), ("example.md", example.as_bytes())], r.now - 5 * DAY);
@@ -1810,10 +1867,22 @@ fn only_the_verified_courses_content_escapes_redaction() {
         if let Some(rev) = verified {
             r.verified_course(rev);
         }
+        // The pod's git config rewrites the course URL: the ref proves nothing then (FIX7, the
+        // backup's rule), and the course isn't asked.
+        let course_repo = r.course_repo.borrow().display().to_string();
+        if case == "verify-rewritten" {
+            r.git(&r.work, &["config", &format!("url.{}.insteadOf", r.course.display()), &course_repo]);
+        }
         r.age(4 * HOUR);
         let (code, rep, said) = r.resolve(3, &r.look());
         assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{case}: {said}");
         assert_eq!(taken(&rep), [("keyed.py".to_string(), "theirs".to_string(), Taken::Hunks)], "{case}: {said}");
+        let said_why = match case {
+            "verify-course" => (None, None),
+            "verify-rewritten" => (None, Some(course_repo.clone())),
+            _ => (Some(course_repo.clone()), None),
+        };
+        assert_eq!((rep.course_unverified.clone(), rep.course_rewritten.clone()), said_why, "{case}: the course asked only when the ref doesn't have it: {said}");
         if case == "verify-course" {
             assert!(rep.redacted.is_empty(), "{case}: {said}");
             assert_eq!((format!("{}\n", r.committed("keyed.py")), format!("{}\n", r.committed("example.md"))), (keyed.clone(), example.clone()), "{case}: as published");
@@ -1844,17 +1913,87 @@ fn only_the_verified_courses_content_escapes_redaction() {
     let (code, rep, said) = r.resolve(3, &r.look());
     assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{said}");
     assert_eq!(rep.redacted, ["keyed.py"], "{said}");
+    assert_eq!(rep.course_unverified, None, "not upstream's: the course not asked: {said}");
     redacted_in_head(&r, "keyed.py", redacted, &keyed, "own merge");
 }
 
+/// FIX7 (review ai-review claude #1, codex #3), end to end, nothing written by hand: the course's
+/// exemption was never fed in production. A BUSY pod's backup stops before its scan, so it never
+/// fetches the course; the resolve trusted only a ref some earlier run happened to leave — and the
+/// course's own key-like strings were committed redacted in the merge. Now the resolve asks the
+/// course itself, as the backup does (course.sh), when a merge of what `git pull upstream main`
+/// brought has a key-like string on the course's side: with the course there (a local bare repo
+/// standing in for GitHub's), its content goes in as published, the ref fetched; the backup after
+/// pushes it all with every id as it was. With the course unreachable: redacted like the
+/// participant's own, and the line says why — and the backup after holds its push (FIX7 claude #2).
+#[cfg(unix)]
+#[test]
+fn a_busy_pods_course_merge_is_verified_by_the_resolve_itself() {
+    let key = format!("sk-or-v1-{}", "ab".repeat(32));
+    let keyed = format!("k = \"{key}\"\n");
+    let example = format!("# Set your key: OPENROUTER_API_KEY = \"{key}\"\n");
+    for reachable in [true, false] {
+        let r = Repo::new(if reachable { "e2e-course" } else { "e2e-course-gone" });
+        r.add_base(&[("keyed.py", b"k = 0\n")]);
+        r.course_commit(&[("keyed.py", keyed.as_bytes()), ("example.md", example.as_bytes())], r.now - 5 * DAY);
+        let bare = r.base.join("course.git");
+        r.git(&r.base, &["clone", "-q", "--bare", r.course.to_str().unwrap(), bare.to_str().unwrap()]);
+        r.set_course(&if reachable { bare.clone() } else { r.base.join("gone.git") });
+        r.my_commit(&[("keyed.py", b"k = 1\n")], r.now - 10 * DAY);
+        r.pull_conflicted();
+        let course_tip = r.git(&r.work, &["rev-parse", "MERGE_HEAD"]);
+        let course_main = || {
+            let (ok, said) = r.git_try(&r.work, &["rev-parse", "-q", "--verify", "refs/arena/course-main"]);
+            (ok, said.trim().to_string())
+        };
+        // The backup, as the pod's tick runs it: BUSY, nothing fetched.
+        let (code, b, said) = r.backup_with_course();
+        assert_eq!((code, b.busy.as_deref()), (Some(BACKUP_BUSY_EXIT), Some("merge")), "{said}");
+        assert!(!course_main().0, "the BUSY backup fetched nothing");
+        r.age(4 * HOUR);
+        let (code, rep, said) = r.resolve(3, &r.look());
+        assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{reachable}: {said}");
+        let note = resolved_note(&rep, 3, "/b/w1d1/devtest-x");
+        let words = format!(
+            "couldn't reach the course repo ({}) to verify the merged commit is its own, so what came in from it was redacted like the \
+             participant's own",
+            r.base.join("gone.git").display()
+        );
+        if reachable {
+            assert!(rep.redacted.is_empty() && rep.course_unverified.is_none(), "{said}");
+            assert_eq!((format!("{}\n", r.committed("keyed.py")), format!("{}\n", r.committed("example.md"))), (keyed.clone(), example.clone()), "as published");
+            assert_eq!(course_main(), (true, course_tip.clone()), "the ref, fetched by the resolve");
+            assert!(!note.contains("couldn't reach"), "{note}");
+        } else {
+            let mut got = rep.redacted.clone();
+            got.sort();
+            assert_eq!(got, ["example.md", "keyed.py"], "{said}");
+            assert!(!r.git_try(&r.work, &["grep", "-q", "-F", &key, "HEAD"]).0, "no key in the merge's tree");
+            assert_eq!(rep.course_unverified, Some(r.base.join("gone.git").display().to_string()), "{said}");
+            assert!(note.contains(&words), "{note}");
+        }
+        // The backup after, as `pods backup` runs it.
+        let merge = r.git(&r.work, &["rev-parse", "HEAD"]);
+        let (code, b, said) = r.backup_with_course();
+        if reachable {
+            assert_eq!((code, b.outcome, b.history), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".to_string())), None), "{said}");
+            assert_eq!(r.git(&r.work, &["rev-parse", "origin/autocommit-x"]), merge, "every id as it was");
+            r.git(&r.work, &["merge-base", "--is-ancestor", &course_tip, "origin/autocommit-x"]);
+        } else {
+            assert_eq!((code, b.course_held, b.outcome), (Some(1), true, None), "{said}");
+            assert_eq!(r.git(&r.work, &["rev-parse", "HEAD"]), merge, "nothing rewritten");
+        }
+    }
+}
+
 /// The course's own content isn't refused as the participant's (review ai-review claude #3). What
-/// a verified course merge stages as MERGE_HEAD has it is sized by GitHub's limit (100 MiB), as the
-/// backup sizes what it pushes: a 96 MB course file goes in. Unverified (no course ref), git's
-/// 95 MB limit holds and it stays BUSY — in words that never tell the participant to unstage what
-/// they never staged. A course submodule (a gitlink the staged .gitmodules lists, as the backup's
-/// `is_submodule` reads it) isn't refused; a course gitlink .gitmodules doesn't list is, in the
-/// course's words. And a conflicted binary file taken whole from the verified course is sized the
-/// same way (a 1000-byte limit here).
+/// a course merge stages as MERGE_HEAD has it is sized by GitHub's limit (100 MiB), as the backup
+/// sizes what it pushes: a 96 MB course file goes in — verified or not (FIX7, claude #1: its blob
+/// goes out with MERGE_HEAD's commit anyway, and git's 95 MB limit left such a merge BUSY for good,
+/// protecting nothing). A course submodule (a gitlink the staged .gitmodules lists, as the backup's
+/// `is_submodule` reads it) isn't refused; a course gitlink .gitmodules doesn't list is, in words
+/// that never tell the participant to unstage what they never staged. And a conflicted binary file
+/// taken whole from the course is sized the same way (a 1000-byte limit here).
 #[cfg(unix)]
 #[test]
 fn the_courses_own_content_is_sized_by_githubs_limit_and_its_submodules_kept() {
@@ -1867,20 +2006,9 @@ fn the_courses_own_content_is_sized_by_githubs_limit_and_its_submodules_kept() {
             r.verified_course("MERGE_HEAD");
         }
         r.age(4 * HOUR);
-        let conflicts = r.unmerged();
         let (code, rep, said) = r.resolve(3, &r.look());
-        if verified {
-            assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{said}");
-            assert_eq!(r.git(&r.work, &["cat-file", "-s", "HEAD:model.pt"]), (96u64 << 20).to_string());
-        } else {
-            let why = format!(
-                "model.pt comes in from the merged branch (MERGE_HEAD) at {} bytes, over git's {GIT_MAX_FILE_BYTES_FOR_TESTS}-byte limit: \
-                 arena won't commit it — finish the merge yourself, or abort it, on the pod",
-                96 << 20
-            );
-            assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some(why.as_str())), "{said}");
-            r.untouched(&conflicts, "unverified");
-        }
+        assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{verified}: {said}");
+        assert_eq!(r.git(&r.work, &["cat-file", "-s", "HEAD:model.pt"]), (96u64 << 20).to_string());
     }
 
     // A course commit adding a gitlink (`lib` listed in .gitmodules, or `vendor` not), after the
@@ -1925,7 +2053,7 @@ fn the_courses_own_content_is_sized_by_githubs_limit_and_its_submodules_kept() {
     }
 
     // A binary file both changed, the course's side newer and taken whole: under a 1000-byte limit,
-    // 4096 bytes go in from the verified course, and are refused unverified.
+    // 4096 bytes go in from the course, verified or not.
     let bin = |b: u8| {
         let mut v = vec![b; 4096];
         v[0] = 0;
@@ -1941,19 +2069,63 @@ fn the_courses_own_content_is_sized_by_githubs_limit_and_its_submodules_kept() {
             r.verified_course("MERGE_HEAD");
         }
         r.age(4 * HOUR);
+        let (code, rep, said) = r.resolve_with(3, &r.look(), 1000, &[]);
+        assert_eq!((code, taken(&rep)), (Some(0), vec![("w.bin".to_string(), "theirs".to_string(), Taken::File)]), "{verified}: {said}");
+        assert_eq!(r.read("w.bin"), bin(2));
+    }
+}
+
+/// What would be staged exactly as the other side has it is sized by GitHub's limit however the
+/// conflict was resolved (review ai-review codex #3: only a file taken whole was; a 96 MiB text file
+/// or notebook merged per hunk into exactly MERGE_HEAD's version was refused at git's limit before
+/// `unfit`, which knows it as the other side's, was reached). Under a 1000-byte limit, a 4096-byte
+/// text file in conflict, nothing verified: the course's side newer, merged per hunk into the
+/// course's version — committed; resolved by hand into it — committed; a cherry-pick's side newer,
+/// merged per hunk into the picked commit's version — committed. The participant's side newer, its
+/// own 4096 bytes: refused at git's limit, as before.
+#[cfg(unix)]
+#[test]
+fn whats_staged_as_the_other_side_has_it_is_sized_by_githubs_limit_however_resolved() {
+    let text = |c: &str| c.repeat(2048).into_bytes();
+    for case in ["hunks", "hand", "mine", "pick"] {
+        let r = Repo::new(&format!("other-side-{case}"));
+        r.add_base(&[("big.txt", b"base\n")]);
+        let (theirs_at, mine_at) = if case == "mine" { (r.now - 10 * DAY, r.now - 5 * DAY) } else { (r.now - 5 * DAY, r.now - 10 * DAY) };
+        if case == "pick" {
+            r.git(&r.work, &["checkout", "-q", "-b", "side", "main"]);
+            r.put("big.txt", &text("s\n"));
+            r.commit_all(&r.work, "the side's change", theirs_at);
+            r.git(&r.work, &["checkout", "-q", "autocommit-x"]);
+            r.my_commit(&[("big.txt", &text("m\n")[..])], mine_at);
+            assert!(!r.git_try(&r.work, &["cherry-pick", "side"]).0);
+        } else {
+            r.course_commit(&[("big.txt", &text("c\n")[..])], theirs_at);
+            r.my_commit(&[("big.txt", &text("m\n")[..])], mine_at);
+            r.pull_conflicted();
+        }
+        if case == "hand" {
+            r.put("big.txt", &text("c\n"));
+        }
+        r.age(4 * HOUR);
         let conflicts = r.unmerged();
         let (code, rep, said) = r.resolve_with(3, &r.look(), 1000, &[]);
-        if verified {
-            assert_eq!((code, taken(&rep)), (Some(0), vec![("w.bin".to_string(), "theirs".to_string(), Taken::File)]), "{said}");
-            assert_eq!(r.read("w.bin"), bin(2));
-        } else {
+        let want = match case {
+            "pick" => text("s\n"),
+            _ => text("c\n"),
+        };
+        if case == "mine" {
             assert_eq!(
                 (code, rep.refused.as_deref()),
-                (Some(RESOLVE_REFUSED_EXIT), Some("w.bin would be 4096 bytes, over git's 1000-byte limit: never committed — resolve it on the pod")),
-                "{said}"
+                (Some(RESOLVE_REFUSED_EXIT), Some("big.txt would be 4096 bytes, over git's 1000-byte limit: never committed — resolve it on the pod")),
+                "{case}: {said}"
             );
-            r.untouched(&conflicts, "bin unverified");
+            r.untouched(&conflicts, case);
+            continue;
         }
+        assert_eq!(code, Some(0), "{case}: {said}");
+        let how = if case == "hand" { rep.hand.clone() } else { taken(&rep).into_iter().map(|(p, s, t)| format!("{p} {s} {t:?}")).collect() };
+        assert_eq!(how, [if case == "hand" { "big.txt".to_string() } else { "big.txt theirs Hunks".to_string() }], "{case}: {said}");
+        assert_eq!(format!("{}\n", r.committed("big.txt")).into_bytes(), want, "{case}");
     }
 }
 
@@ -2223,7 +2395,7 @@ fn the_resolve_bounds_itself_on_the_pod_under_any_login_shell() {
         let conflicts = r.unmerged();
         let look = r.look();
         let work = r.work.to_str().unwrap();
-        let bounded = resolve_command_bounded(work, 3, &look.op_key(), &look.print, "w1d1/devtest-x", GIT_MAX_FILE_BYTES_FOR_TESTS, (2, 1));
+        let bounded = resolve_command_bounded(work, 3, &look.op_key(), &look.print, "w1d1/devtest-x", GIT_MAX_FILE_BYTES_FOR_TESTS, None, (2, 1));
         let t0 = std::time::Instant::now();
         let (code, out, err) = r.shell_with(shell, &bounded, &[("ARENA_TEST_HOOK_BEFORE_CHANGE", "sleep 30")]);
         assert_eq!(code, Some(124), "{shell}: {out}{err}");
@@ -2233,7 +2405,7 @@ fn the_resolve_bounds_itself_on_the_pod_under_any_login_shell() {
         assert_eq!(temp_files(&r), Vec::<String>::new(), "{shell}: its temporary files removed");
         assert!(r.work.join(".git/MERGE_HEAD").exists() && r.unmerged() == conflicts, "{shell}: the merge as it was");
         // The real command under that shell: finished.
-        let (code, out, err) = r.shell_with(shell, &resolve_command(work, 3, &look.op_key(), &look.print, "w1d1/devtest-x"), &[]);
+        let (code, out, err) = r.shell_with(shell, &resolve_command(work, 3, &look.op_key(), &look.print, "w1d1/devtest-x", None), &[]);
         assert_eq!((code, parse_resolve(&out).resolved.as_deref()), (Some(0), Some("merge")), "{shell}: {out}{err}");
         assert_eq!(temp_files(&r), Vec::<String>::new(), "{shell}");
     }

@@ -37,7 +37,8 @@
 #                              verified: refs/arena/course-main) — the course's own key-like string,
 #                              public already, not a leak
 #   COURSE_UNVERIFIED <url>    the course's main couldn't be fetched from <url> to verify which commits
-#                              are its own, so none were exempt (said once)
+#                              are its own, so none were exempt but those an earlier fetch verified
+#                              (said once)
 #   COURSE_REWRITTEN <url>     the pod's git config rewrites <url> (`url.<base>.insteadOf`, a remote
 #                              of that name): the course isn't asked, so none of its commits are exempt
 #                              — scanned and redacted like the rest (said once; the run goes on)
@@ -78,14 +79,16 @@ origin_check "$ORIGIN"
 # says nothing of where its commits came from: a participant's fork fetched as `upstream/main`,
 # then `upstream` repointed at the course, left their own key-bearing commit trusted. So only the
 # commits reachable from refs/arena/course-main are exempt ($COURSE_REFS), a ref only a fetch from
-# the configured course repo itself ($COURSE_URL) writes (`course_verify`, below) — lazily: when
-# the scan of the outgoing commits finds a key in a commit upstream's main has too. No course
-# configured, no such fetch this run (none needed, or it failed): nothing is exempt. "Pushed"
-# still means on origin.
+# the configured course repo itself ($COURSE_URL) writes (course.sh's `course_verify`) — this run's,
+# lazily, when the scan of the outgoing commits finds a key in a commit upstream's main has too, or
+# an earlier run's (`course_trust`: the resolve trusts it by the same rule). No course configured,
+# or a course URL the pod's git config rewrites: nothing is exempt. "Pushed" still means on origin.
+# @ARENA_COURSE_SH@
 COURSE_URL=
 if [ -n "$COURSE" ]; then COURSE_URL=$(course_url "$COURSE"); fi
 COURSE_REFS=
 COURSE_TRIED=
+COURSE_WHO='arena backup'
 if [ -n "$KEY" ]; then
     export GIT_SSH_COMMAND="ssh -i $KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
 fi
@@ -365,66 +368,6 @@ push_block_reason() {
     echo "${_pr:-refused by GitHub push protection}"
 }
 
-# `course_verify`: fetch the course's main from $COURSE_URL into refs/arena/course-main — the one
-# proof that commits are the course's own, which the resolve reads too, by that name — and exempt
-# what it holds ($COURSE_REFS). Over https with no credentials (no helper, no prompt: a private
-# course can't be verified, so its commits are scanned like the rest), bounded (`timeout 60`, where
-# there is one), never touching the participant's tags — nor their FETCH_HEAD, which every fetch
-# writes: it's kept aside and put back after, or removed when there was none
-# (`--no-write-fetch-head` needs git 2.29, and Ubuntu 20.04's is 2.25: there every fetch failed,
-# review ai-review claude #2). Tried once a run: a fetch that fails exempts nothing — not even a
-# ref an earlier fetch left — and is said once (`COURSE_UNVERIFIED`, git's own words on stderr).
-# The fetch can't be steered (review ai-review claude #3): it reads no global or system config
-# (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM`; a git older than 2.32 reads its global
-# config still, and the check below sees what it sees), and the URL it would use — the repo's own
-# `url.<base>.insteadOf` applied — must be $COURSE_URL itself (`course_direct`): else nothing is
-# fetched or exempt, said (`COURSE_REWRITTEN`). An insteadOf pointing at a fork filled the ref with
-# the fork's commits, all then exempt; one turning https into ssh sent it with the deploy key, to
-# fail every time. No submodules fetched. A ref lock a run before this one left (one killed by the
-# `timeout` mid-update) is removed first: it failed every later fetch. Its outcome stays in
-# $COURSE_TRIED: `ok`, `failed`, or `rewritten`.
-course_verify() {
-    if [ -n "$COURSE_TRIED" ]; then [ "$COURSE_TRIED" = ok ]; return; fi
-    if ! course_direct; then
-        COURSE_TRIED=rewritten
-        echo "COURSE_REWRITTEN $COURSE_URL"
-        return 1
-    fi
-    COURSE_TRIED=failed
-    _cvl=$(git rev-parse --git-path refs/arena/course-main.lock)
-    if [ -e "$_cvl" ] && [ -n "$(find "$_cvl" ! -newer "$T.start" 2>/dev/null)" ]; then rm -f "$_cvl"; fi
-    _cvh=$(git rev-parse --git-path FETCH_HEAD)
-    _cvk=none
-    if [ -e "$_cvh" ]; then
-        if cp -p "$_cvh" "$T.fhead" 2>/dev/null; then _cvk=kept; else _cvk=; fi
-    fi
-    _cvt=
-    if timeout 1 true >/dev/null 2>&1; then _cvt='timeout 60'; fi
-    if GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= $_cvt \
-        git -c credential.helper= fetch --no-tags --no-recurse-submodules --quiet \
-        "$COURSE_URL" '+refs/heads/main:refs/arena/course-main' > /dev/null 2> "$T.cfetch" \
-        && git rev-parse -q --verify 'refs/arena/course-main^{commit}' > /dev/null; then
-        COURSE_TRIED=ok
-    fi
-    case $_cvk in
-        kept) mv -f "$T.fhead" "$_cvh" || true ;;
-        none) rm -f "$_cvh" ;;
-    esac
-    if [ "$COURSE_TRIED" = ok ]; then
-        COURSE_REFS=refs/arena/course-main
-        return 0
-    fi
-    echo "COURSE_UNVERIFIED $COURSE_URL"
-    sed 's/^/arena backup: fetching the course to verify its commits: /' "$T.cfetch" >&2 || true
-    return 1
-}
-# `course_direct`: whether git, with the config the fetch reads, fetches $COURSE_URL from that very
-# URL — `ls-remote --get-url` applies `url.<base>.insteadOf` (and a remote named by it), contacting
-# nothing.
-course_direct() {
-    [ "$(GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git ls-remote --get-url "$COURSE_URL" 2>/dev/null)" = "$COURSE_URL" ]
-}
-
 # `named_in <rev>`: whether each blob GitHub's refusal named ($T.where: `commit<TAB>path`) is in
 # <rev>'s history.
 named_in() {
@@ -439,19 +382,19 @@ named_in() {
 # `commit:` and `path: <path>:<line>`) is in a file as the course published it — that commit's blob
 # at that path is one the course's verified history has ($COURSE_REFS) — writing those commits to
 # $T.course. Not when any location is otherwise, or none could be read: then it's a secret the
-# redaction doesn't know, as ever. A secret the scan didn't know left the course unasked: it is
-# asked now (`course_verify`) when each blob is one upstream's main has.
+# redaction doesn't know, as ever. A secret the scan didn't know left the course unasked (or the
+# ref is an earlier run's, from before that commit): it is asked now (`course_verify`) when each
+# blob is one upstream's main has.
 course_blocked() {
     tr -d '\r' < "$1" | LC_ALL=C awk '
         /^remote: *- *commit: *[0-9a-f]/ { c = $0; sub(/.*commit: */, "", c); sub(/[^0-9a-f].*$/, "", c); next }
         /^remote: *path: / && c != "" { p = $0; sub(/^remote: *path: */, "", p); sub(/:[0-9]+ *$/, "", p); print c "\t" p }' \
         | awk '!seen[$0]++' > "$T.where"
     [ -s "$T.where" ] || return 1
-    if [ -z "$COURSE_REFS" ]; then
+    if [ -z "$COURSE_REFS" ] || ! named_in "$COURSE_REFS"; then
         [ -n "$COURSE_URL" ] && git rev-parse -q --verify 'refs/remotes/upstream/main^{commit}' > /dev/null || return 1
-        named_in refs/remotes/upstream/main && course_verify || return 1
+        named_in refs/remotes/upstream/main && course_verify && named_in "$COURSE_REFS" || return 1
     fi
-    named_in "$COURSE_REFS" || return 1
     cut -f1 "$T.where" | awk '!seen[$0]++' | paste -sd ' ' - > "$T.course"
 }
 
@@ -473,6 +416,7 @@ course_blocked() {
 # fast-forward (never forced), and only then does the branch move — compare-and-swap, so a
 # commit made meanwhile is never lost: the run stops there (HEAL_ABORTED), and the next one redoes
 # the same rewrite (same ids: a fast-forward of what was pushed) with that commit on top.
+course_trust
 # `scan_out`: the blobs of the commits going out — but the course's verified own ($COURSE_REFS) —
 # into $T.blobs, and each holding a key, with its redacted copy, into $T.hmap (redact_blob's
 # lines; empty: nothing to redact).

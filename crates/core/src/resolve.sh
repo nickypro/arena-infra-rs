@@ -1,7 +1,7 @@
 # arena resolve: finish an operation left in progress in one pod's checkout once nothing in it has
 # changed for a while — what `pods backup` runs on a pod whose backup said BUSY, after copying it.
 #
-#   set -- <repo> <quiet secs> <op> <print> <hours> <copy> <max file bytes> <limit bytes>   (its first line)
+#   set -- <repo> <quiet secs> <op> <print> <hours> <copy> <max file bytes> <limit bytes> <course>   (its first line)
 #
 # Rendered and parsed by arena_core::resolve (resolve_command / parse_resolve), which prepends that
 # first line and runs it under `sh -c`, whatever the pod's login shell, bounded by `timeout` there
@@ -25,9 +25,10 @@
 # A file over <max file bytes> (the backup's git limit) anywhere in that is never committed: left
 # alone, said — nor, for a merge or a cherry-pick (whose commit takes the whole index), any path
 # already staged: a blob over that limit, a new gitlink no submodule in .gitmodules, or a notebook
-# that isn't valid JSON (or can't be checked). The verified course's own content (below) is sized
-# by <limit bytes> instead — GitHub's, which the backup sizes what it pushes by — and what the
-# participant never staged is never said as theirs to unstage. The state before is kept first in
+# that isn't valid JSON (or can't be checked). What is staged exactly as the other side has it —
+# however it was resolved — is sized by <limit bytes> instead, GitHub's, which the backup sizes
+# what it pushes by: its blob goes out with the other side's commit anyway. What the participant
+# never staged is never said as theirs to unstage. The state before is kept first in
 # <git dir>/arena-resolved/<UTC stamp>/ (the conflicted files as they were, git's own state files,
 # the old HEAD, the index, a README), then the state is read again — the operation and its commit,
 # HEAD, the conflicts, the index, every file — and the pod looked at again for anyone at work
@@ -36,7 +37,8 @@
 # path is checked again, and each staged regular file that isn't HEAD's version has its keys
 # redacted in the index as the backup redacts them (the file on disk keeps its keys) — all but the
 # verified course's: for a merge whose MERGE_HEAD is in refs/arena/course-main (fetched from the
-# configured course URL alone), what is staged as MERGE_HEAD has it goes in as published; and —
+# configured course URL <course> alone, by the backup or by this, as course.sh says), what is staged
+# as MERGE_HEAD has it goes in as published; and —
 # HEAD and the operation checked once more, no conflict marker staged, and the index still the
 # tree that was checked (`git write-tree`: nothing staged since) — the operation is
 # finished: a merge, a merge commit; a cherry-pick, `--continue`; a `git stash pop`'s conflicts,
@@ -52,6 +54,10 @@
 #   GONE <side> <HEAD's time> <the other side's time> <path>   removed: the newer side deleted it
 #   HAND <path>              kept as it is on disk (resolved by hand) and added
 #   REDACTED <n> <path>      staged with its n key(s) redacted; the file on disk keeps them
+#   COURSE_UNVERIFIED <url>  the course couldn't be fetched from <url> to verify the merged commit is
+#                            its own: what came in from it is redacted like the participant's own
+#   COURSE_REWRITTEN <url>   the pod's git config rewrites <url> (`url.<base>.insteadOf`): the course
+#                            isn't asked, and what came in from it is redacted the same way
 #   RESOLVED <what>          finished (exit 0)
 #   FAILED <step>            a step failed midway (exit 8): SAVED has the state before
 # ARENA_TEST_HOOK_BEFORE_CHANGE and ARENA_TEST_HOOK_BEFORE_FINISH, commands run right before the
@@ -73,6 +79,7 @@ HOURS=$5
 COPY=$6
 MAX=$7
 LIMIT=$8
+COURSE_REPO=${9:-}
 cd "$REPO" || exit 2
 cd "$(git rev-parse --show-toplevel)" || exit 2
 TOP=$(pwd)
@@ -85,8 +92,15 @@ export GIT_OPTIONAL_LOCKS=0
 REVERT_WORDS=@ARENA_REVERT_WORDS@
 T="$G/arena-resolve.$$"
 trap 'rm -rf "$T".*' EXIT
+: > "$T.start"
 TAB=$(printf '\t')
 # @ARENA_REDACT_SH@
+# @ARENA_COURSE_SH@
+COURSE_URL=
+if [ -n "$COURSE_REPO" ]; then COURSE_URL=$(course_url "$COURSE_REPO"); fi
+COURSE_REFS=
+COURSE_TRIED=
+COURSE_WHO='arena resolve'
 refuse() { echo "REFUSED $*"; exit 7; }
 fail() { echo "FAILED $*"; exit 8; }
 LOOKED=$(arena_look)
@@ -149,13 +163,17 @@ esac
 [ "$head" != - ] || refuse "conflicts with no stash entry they came from"
 # Whether the other side is the course's own history, verified (review ai-review codex #3): only a
 # merge whose MERGE_HEAD is in refs/arena/course-main — the ref nothing but a fetch from the
-# configured course URL writes (the backup's, when it needs to know). Then what is staged as
-# MERGE_HEAD has it is the course's, public already: committed as published, and sized by GitHub's
-# own limit. Matching the other side proves nothing by itself: a cherry-pick of the participant's
-# own commit, a merge of their own branch — or any merge with that ref missing — is theirs, keys and
-# all, so it's redacted and sized like anything they made.
+# configured course URL writes (course.sh: an earlier run's, the backup's or this one's, trusted by
+# the backup's own rule, `course_trust`; or this run's, below). Then what is staged as MERGE_HEAD has
+# it is the course's, public already: committed as published. Matching the other side proves
+# nothing by itself: a cherry-pick of the participant's own commit, a merge of their own branch — or
+# any merge the course can't be asked about — is theirs, keys and all, so it's redacted like
+# anything they made.
 COURSE=no
-if [ "$what" = merge ] && git merge-base --is-ancestor "$head" refs/arena/course-main 2>/dev/null; then COURSE=yes; fi
+if [ "$what" = merge ]; then
+    course_trust
+    if [ -n "$COURSE_REFS" ] && git merge-base --is-ancestor "$head" refs/arena/course-main 2>/dev/null; then COURSE=yes; fi
+fi
 if [ "$what" = merge ] && [ "$(wc -l < "$G/MERGE_HEAD")" -ne 1 ]; then refuse "a merge of several branches"; fi
 HEAD0=$(git rev-parse -q --verify HEAD) || refuse "no HEAD commit"
 ours_tip=$(git log -1 --no-show-signature --format=%ct HEAD 2>/dev/null) || refuse "no HEAD commit"
@@ -260,15 +278,15 @@ unfit() {
     fi
     awk '{ split($0, m, " ") } m[2] == "100644" || m[2] == "100755" || m[2] == "120000" { print m[3] }' "$T.st" | sort -u \
         | git cat-file --batch-check='%(objectname) %(objectsize)' > "$T.ss" || { echo "the staged files' sizes couldn't be read"; return; }
-    # Sized by git's limit (<max file bytes>) — but the verified course's own content (COURSE, and
-    # staged as MERGE_HEAD has it) by GitHub's (<limit bytes>): the backup pushes a file between the
-    # two, and the course's own would otherwise leave every such merge BUSY for good (review
-    # ai-review claude #3).
-    _s=$(awk -v max="$MAX" -v limit="$LIMIT" -v course="$COURSE" -v them="$them ($ref)" -v what="$what" '
+    # Sized by git's limit (<max file bytes>) — but what is staged as the other side has it by
+    # GitHub's (<limit bytes>), verified or not (review ai-review claude #1): its blob goes out with
+    # the other side's commit anyway, which the backup sizes by that limit, and refusing it here
+    # would leave every such merge BUSY for good (claude #3), protecting nothing.
+    _s=$(awk -v max="$MAX" -v limit="$LIMIT" -v them="$them ($ref)" -v what="$what" '
         FILENAME == ARGV[1] { s[$1] = $2; next }
         { i = index($0, "\t"); p = substr($0, i + 1); split(substr($0, 1, i - 1), m, " ") }
         !(m[3] in s) { next }
-        { theirs = m[5] == "theirs"; lim = (theirs && course == "yes") ? limit : max }
+        { theirs = m[5] == "theirs"; lim = theirs ? limit : max }
         s[m[3]] + 0 > lim + 0 && !theirs {
             printf "%s is staged at %s bytes, over git'"'"'s %s-byte limit: never committed — unstage it, or abort, on the pod\n", p, s[m[3]], lim
             exit
@@ -316,6 +334,25 @@ case $what in
         [ -z "$why" ] || refuse "$why"
         ;;
 esac
+# The course asked, as the backup asks it (course.sh's `course_verify`), when that matters — and
+# only then (review ai-review claude #1: a BUSY pod's backup stops before its own scan, so for a
+# conflicted `git pull upstream main` nothing had fetched the ref, and the course's own key-like
+# strings were committed redacted, every time): a merge of a commit upstream's main has that the
+# ref doesn't (yet), and a key-like string in what may be staged from it — a path staged as
+# MERGE_HEAD has it, or a conflicted path's MERGE_HEAD side. Asked before anything is touched. A
+# fetch that fails, or a course URL the pod's config rewrites: nothing exempt, said (its line).
+if [ "$what" = merge ] && [ "$COURSE" = no ] && [ -n "$COURSE_URL" ] \
+    && git merge-base --is-ancestor "$head" refs/remotes/upstream/main 2>/dev/null; then
+    {
+        awk '{ i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") } (m[2] == "100644" || m[2] == "100755") && m[5] == "theirs" { print m[3] }' "$T.st"
+        tr '\0' '\n' < "$T.u" | awk '{ i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") } m[3] == "3" && (m[1] == "100644" || m[1] == "100755") { print m[2] }'
+    } | LC_ALL=C sort -u > "$T.ob"
+    if [ -s "$T.ob" ]; then
+        # (A failed scan counts as a key: then the course is asked, which costs one fetch.)
+        git cat-file --batch < "$T.ob" | LC_ALL=C grep -aqE -- "$SECRET_RE"
+        if [ "$?" -ne 1 ] && course_verify && git merge-base --is-ancestor "$head" refs/arena/course-main 2>/dev/null; then COURSE=yes; fi
+    fi
+fi
 
 # --- Each conflicted path's way (nothing touched yet) ---------------------------------------
 # One line per path: its stages (e.g. 123, 23), each stage's mode and blob (- for none), the path.
@@ -326,6 +363,11 @@ tr '\0' '\n' < "$T.u" | awk '
     END { for (k = 0; k < n; k++) { p = order[k]; printf "%s", st[p]
             for (s = 1; s <= 3; s++) printf "\t%s\t%s", ((p, s) in mode) ? mode[p, s] : "-", ((p, s) in blob) ? blob[p, s] : "-"
             printf "\t%s\n", p } }' > "$T.p"
+# The other side's entry at path $1, `<mode> <blob>` — nothing where it has none: what `unfit` calls
+# staged as the other side has it. (Literally: a `*` in a name is no glob, nor a `:` magic.)
+other_entry() {
+    GIT_LITERAL_PATHSPECS=1 git ls-tree -z "$head" -- "$1" 2>/dev/null | tr '\0' '\n' | head -n 1 | cut -f1 | awk '{ print $1 " " $3 }'
+}
 # git's binary test: a NUL in the first 8000 bytes (of a file, of a blob).
 binary_file() { [ "$(head -c 8000 -- "$1" | tr -d -c '\000' | wc -c)" -ne 0 ]; }
 binary_blob() { [ "$(git cat-file blob "$1" | head -c 8000 | tr -d -c '\000' | wc -c)" -ne 0 ]; }
@@ -468,11 +510,22 @@ while IFS="$TAB" read -r st m1 b1 m2 b2 m3 b3 p; do
         file) size=$(git cat-file -s "$wb") ;;
         *) size=0 ;;
     esac
-    # The verified course's own version, taken whole, is sized as `unfit` sizes it: by GitHub's limit.
-    if [ "$COURSE" = yes ] && [ "$act" = file ] && [ "$wb" = "$(git rev-parse -q --verify "$head:$p" 2>/dev/null)" ]; then
-        [ "$size" -le "$LIMIT" ] || refuse "$p would be $size bytes, over GitHub's $LIMIT-byte limit: never committed — resolve it on the pod"
-    else
-        [ "$size" -le "$MAX" ] || refuse "$p would be $size bytes, over git's $MAX-byte limit: never committed — resolve it on the pod"
+    # For a merge or a cherry-pick, what would be staged exactly as the other side has it — its mode
+    # and blob, whichever way it was resolved: taken whole, merged per hunk (the other side's at
+    # every hunk), by hand — is sized as `unfit` sizes it: by GitHub's limit (review ai-review codex
+    # #3). Asked only of what's over git's. (A stash pop's conflicts make no commit here: the backup
+    # after keeps a file over git's limit out of its own.)
+    if [ "$size" -gt "$MAX" ]; then
+        case $act in
+            hunks) rmb="$wm $(git hash-object --path="$p" -- "$T.r$i")" ;;
+            hand) if [ -x "$p" ]; then rmb=100755; else rmb=100644; fi; rmb="$rmb $(git hash-object --path="$p" -- "$p")" ;;
+            *) rmb="$wm $wb" ;;
+        esac
+        if [ "$what" != conflicts ] && [ "$rmb" = "$(other_entry "$p")" ]; then
+            [ "$size" -le "$LIMIT" ] || refuse "$p would be $size bytes, over GitHub's $LIMIT-byte limit: never committed — resolve it on the pod"
+        else
+            refuse "$p would be $size bytes, over git's $MAX-byte limit: never committed — resolve it on the pod"
+        fi
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$act" "$side" "$ot" "$tt" "$i" "$wm" "$p" >> "$T.plan"
 done < "$T.p"

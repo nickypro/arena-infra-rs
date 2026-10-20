@@ -437,19 +437,31 @@ pub fn origin_sh() -> &'static str {
     include_str!("origin.sh")
 }
 
+/// The verified course's shell functions (`course.sh`), shared by the backup script and the
+/// resolve's ([`crate::resolve::resolve_script`]), so the two ask the course the same way and trust
+/// what it says by one rule (FIX7): `course_url` (the URL of [`course_repo`]'s `owner/name`),
+/// `course_trust` (a `refs/arena/course-main` already there), `course_verify` (the fetch that
+/// writes it — never through a URL the pod's git config rewrites), `course_direct`.
+pub fn course_sh() -> &'static str {
+    include_str!("course.sh")
+}
+
 /// The lines of `backup.sh` that [`backup_script`] replaces with [`redact_sh`],
-/// [`NO_BYPASS_URL_SH`], [`origin_sh`] and [`BUSY_OP_SH`].
+/// [`NO_BYPASS_URL_SH`], [`origin_sh`], [`course_sh`] and [`BUSY_OP_SH`].
 const REDACT_SH_MARK: &str = "# @ARENA_REDACT_SH@";
 const NO_BYPASS_URL_MARK: &str = "# @ARENA_NO_BYPASS_URL@";
 const ORIGIN_SH_MARK: &str = "# @ARENA_ORIGIN_SH@";
+/// Also `resolve.sh`'s.
+pub(crate) const COURSE_SH_MARK: &str = "# @ARENA_COURSE_SH@";
 const BUSY_OP_MARK: &str = "# @ARENA_BUSY_OP_SH@";
 
 /// The backup script ([`backup_command`]): `backup.sh` with [`redact_sh`], [`NO_BYPASS_URL_SH`],
-/// [`origin_sh`] and [`BUSY_OP_SH`] rendered in. POSIX `sh`, so it runs the same whatever the
-/// pod's login shell; its header documents every line it prints.
+/// [`origin_sh`], [`course_sh`] and [`BUSY_OP_SH`] rendered in. POSIX `sh`, so it runs the same
+/// whatever the pod's login shell; its header documents every line it prints.
 pub fn backup_script() -> String {
     include_str!("backup.sh")
         .replacen(ORIGIN_SH_MARK, origin_sh().trim_end(), 1)
+        .replacen(COURSE_SH_MARK, course_sh().trim_end(), 1)
         .replacen(REDACT_SH_MARK, redact_sh().trim_end(), 1)
         .replacen(NO_BYPASS_URL_MARK, NO_BYPASS_URL_SH, 1)
         .replacen(BUSY_OP_MARK, BUSY_OP_SH, 1)
@@ -513,7 +525,7 @@ pub fn backup_command(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &s
 
 /// [`backup_command`] with the course repo whose own commits it leaves as they are (`owner/name`,
 /// [`course_repo`]; `None`: nothing exempt). Tests pass a local bare repo's path instead, which the
-/// script fetches as it is (origin.sh's `course_url`), so that none reaches GitHub.
+/// script fetches as it is (course.sh's `course_url`), so that none reaches GitHub.
 pub fn backup_command_with_course(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, origin: Option<&str>, course: Option<&str>) -> String {
     rendered(repo_path, git_ssh_key, commit_msg, GIT_MAX_FILE_BYTES, GITHUB_FILE_LIMIT_BYTES, origin, course)
 }
@@ -3311,17 +3323,26 @@ done
             ("o/..", ""),
             ("o/r;touch x", ""),
         ] {
-            assert_eq!(origin_fn("course_url", course), want, "{course:?}");
+            assert_eq!(course_fn("course_url", course), want, "{course:?}");
         }
         // The same URL setup gives `upstream`, for every course_repo spelling of the config.
         for text in ["", "ARENA_UPSTREAM_REPO=callummcdougall/ARENA_3.0\n", "ARENA_UPSTREAM_REPO=git@github.com:o/r.git\n"] {
             let cfg = Config::parse(text);
             let url = crate::setup::upstream_url(&cfg).unwrap().unwrap();
-            assert_eq!(origin_fn("course_url", &course_repo(&cfg).unwrap()), url, "{text:?}");
+            assert_eq!(course_fn("course_url", &course_repo(&cfg).unwrap()), url, "{text:?}");
         }
         // No `upstream_is_course` any more: the URLs of the pod's `upstream` decide nothing.
         let script = backup_script();
         assert!(!script.contains("upstream_is_course") && !script.contains("get-url --all upstream") && !script.contains("get-url --push --all upstream"));
+    }
+
+    /// `course_url` from the very snippet, under `sh`.
+    #[cfg(unix)]
+    fn course_fn(func: &str, course: &str) -> String {
+        let script = format!("{}\n{func} \"$1\"", course_sh());
+        let o = std::process::Command::new("sh").arg("-c").arg(script).arg("sh").arg(course).output().unwrap();
+        assert!(o.status.success(), "{func} {course}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim_end_matches('\n').to_string()
     }
 
     /// `origin_key` and `origin_shown` from the very script, under `sh`.
@@ -4276,7 +4297,7 @@ done
 
     /// The configured course repo, as the backup is given it in tests: the path of the bare repo
     /// standing in for `github.com/ARENA-education/ARENA_materials` on [`GitSandbox::github`]
-    /// (created with origin's `main` if it isn't there yet) — fetched as it is (origin.sh's
+    /// (created with origin's `main` if it isn't there yet) — fetched as it is (course.sh's
     /// `course_url`), so no test reaches GitHub.
     #[cfg(unix)]
     fn the_course(s: &GitSandbox) -> String {
@@ -4437,6 +4458,46 @@ done
         assert!(!s.run(&format!("git -C {} cat-file -e upstream/main:course_key.md", shell_quote(s.work.to_str().unwrap()))).status.success());
         let (out, _, r) = check(&s, &key, "upstream/experiment");
         assert_eq!((r.course_unverified, course_main(&s)), (None, None), "{out}");
+    }
+
+    /// Review ai-review claude #1 (FIX7): the backup trusted `refs/arena/course-main` only when it
+    /// had fetched it that run, the resolve whenever it was there. One rule now, for both (course.sh's
+    /// `course_trust`): a ref an earlier fetch left — here the resolve's, of a commit the course has
+    /// — is trusted as this run's would be, since nothing else writes it: the course's commit goes
+    /// out as published with the course unreachable, never asked. Unless no course is configured,
+    /// or the pod's git config rewrites its URL (a ref fetched through such a rewrite, before FIX7,
+    /// proves nothing): then nothing is exempt — redacted, the rewrite said.
+    #[cfg(unix)]
+    #[test]
+    fn a_ref_an_earlier_fetch_left_is_trusted_by_the_backup_as_by_the_resolve() {
+        for case in ["trusted", "no course", "rewritten"] {
+            let mut s = GitSandbox::new(&format!("course-ref-{}", case.replace(' ', "-")), 1_000_000);
+            let key = openrouter_key(38);
+            course_upstream(&s, "ARENA-education/ARENA_materials", &key);
+            s.git(&s.work, &["update-ref", "refs/arena/course-main", "upstream/main"]);
+            let gone = s.base.join("no-such-course.git").to_str().unwrap().to_string();
+            s.course = (case != "no course").then(|| gone.clone());
+            if case == "rewritten" {
+                s.git(&s.work, &["config", &format!("url.{}.insteadOf", s.github("ARENA-education/ARENA_materials").display()), &gone]);
+            }
+            s.git(&s.work, &["merge", "-q", "--no-edit", "--no-ff", "upstream/main"]);
+            let merge = s.git(&s.work, &["rev-parse", "HEAD"]);
+            let (code, out, err) = s.backup_raw();
+            let r = parse_backup_report(&out);
+            assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{case}: {out}{err}");
+            assert_eq!(r.course_unverified, None, "{case}: the course never fetched: {out}");
+            match case {
+                "trusted" => {
+                    assert_eq!((r.history, s.git(&s.work, &["rev-parse", "origin/autocommit-x"])), (None, merge), "{case}: as published");
+                    assert!(s.origin_holds(&key), "{case}");
+                }
+                _ => {
+                    assert_eq!(r.history.map(|h| h.0), Some(2), "{case}: redacted: {out}");
+                    assert!(!s.origin_holds(&key), "{case}");
+                    assert_eq!(r.course_rewritten, (case == "rewritten").then_some(gone.clone()), "{case}: {out}");
+                }
+            }
+        }
     }
 
     /// Review ai-review claude #2 (FIX7): one failed verification rewrote the course's own commits
@@ -4645,8 +4706,14 @@ done
         assert_eq!((code, r.push_blocked_course.as_deref()), (Some(BACKUP_BLOCKED_EXIT), Some(merge.as_str())), "{out}{err}");
         assert!(out.contains("PUSH_BLOCKED Devtest Unknown Token at course_key.md:2"), "{out}");
         assert_eq!(course_main(&s), Some(s.git(&s.work, &["rev-parse", "upstream/main"])), "asked then");
-        // …the course unreachable: a secret, as ever, and that said once.
+        // …the course unreachable since: the ref that fetch left still says it (FIX7: trusted as
+        // the resolve trusts it), the course not asked again.
         s.course = Some(s.base.join("no-such-course.git").to_str().unwrap().to_string());
+        let (code, out, err) = s.backup_raw();
+        let r = parse_backup_report(&out);
+        assert_eq!((code, r.push_blocked_course.as_deref(), r.course_unverified), (Some(BACKUP_BLOCKED_EXIT), Some(merge.as_str()), None), "{out}{err}");
+        // …no such ref, the course unreachable: a secret, as ever, and that said once.
+        s.git(&s.work, &["update-ref", "-d", "refs/arena/course-main"]);
         let (code, out, err) = s.backup_raw();
         let r = parse_backup_report(&out);
         assert_eq!((code, r.push_blocked_course.clone()), (Some(BACKUP_BLOCKED_EXIT), None), "{out}{err}");

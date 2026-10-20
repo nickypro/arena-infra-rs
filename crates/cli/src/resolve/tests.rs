@@ -216,9 +216,12 @@ async fn a_merge_left_alone_is_backed_up_copied_finished_and_backed_up_again() {
         assert_eq!(calls[2], (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT)), "then its copy");
         let root = w.snapshot_root(&cfg);
         let label = root.rsplit('/').next().unwrap();
-        // The resolve is given what the look saw, and the copy's name.
+        // The resolve is given what the look saw, the copy's name, and the course repo as the backup
+        // is given it.
         let op = format!("merge {} {SHA}", n - 24 * HOUR);
-        let resolve = core_resolve::resolve_command(REPO, 3, &op, "11-22", &format!("{label}/devtest-bloom"));
+        let course = arena_core::backup::course_repo(&cfg);
+        assert_eq!(course.as_deref(), Some("ARENA-education/ARENA_materials"));
+        let resolve = core_resolve::resolve_command(REPO, 3, &op, "11-22", &format!("{label}/devtest-bloom"), course.as_deref());
         assert_eq!(calls[3], (resolve, Some(Duration::from_secs(300))));
         assert_eq!(calls[4], backup("bloom"), "and backed up again");
         let copied = w.copied();
@@ -370,6 +373,9 @@ async fn a_paced_pod_is_finished_from_its_recorded_copy() {
     let calls = execs(&fake, 22002);
     assert_eq!(calls.len(), 4, "{calls:#?}");
     assert!(calls[2].0.contains(" 'arena-resolve' ") && calls[3] == backup("bloom"), "{calls:#?}");
+    // The resolve is given the course repo, as the backup is (FIX7): it asks it the same way.
+    let limit = arena_core::backup::GITHUB_FILE_LIMIT_BYTES;
+    assert!(calls[2].0.contains(&format!(" {limit} ARENA-education/ARENA_materials\n")), "{}", calls[2].0.lines().next().unwrap_or(""));
     assert!(w.copied().is_empty(), "not copied again");
     let said = crate::take_said();
     assert!(said.iter().any(|l| l.starts_with("✓ devtest-bloom -> autocommit-b — finished a merge left for 3h+ (") && l.ends_with(&format!("; today's copy: {})", copy.to))), "{said:#?}");
