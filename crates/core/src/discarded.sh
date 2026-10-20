@@ -237,11 +237,15 @@ ds_fits() {
 
 # `ds_move <path>`: the command that moves <path> (relative to the repo's top) out of the checkout,
 # next to it, as `<its name>.kept-<UTC time>` (review ai-review claude #5): a name no earlier
-# kept copy has, and `mv -n` besides, so a second switch's advice never replaces the first's copy
-# (or, for a directory, nests in it). Each word quoted by `ds_quote`: a path with a `'` in it
-# pastes as it is.
+# kept copy has, and `mv -n` besides, so a second switch's advice never replaces the first's copy.
+# And `-T` (GNU's): the kept copy's name is the target itself, never a directory to move into —
+# with `-n` alone, the same advice pasted again after the directory was made anew moved it inside
+# the kept copy (review ai-review codex #4). A `mv` without `-T` (busybox's) gets `mv -n`: a probe
+# asks (`-nT --help` is refused there, and only prints help where `-T` is known). Each word quoted
+# by `ds_quote`: a path with a `'` in it pastes as it is.
 ds_move() {
-    printf '(cd %s && mv -n -- %s %s)' "$(ds_quote "$(pwd)")" "$(ds_quote "$1")" \
+    if mv -nT --help > /dev/null 2>&1; then ds_mv='mv -nT'; else ds_mv='mv -n'; fi
+    printf '(cd %s && %s -- %s %s)' "$(ds_quote "$(pwd)")" "$ds_mv" "$(ds_quote "$1")" \
         "$(ds_quote "../$(basename -- "$1").kept-$(date -u +%Y%m%dT%H%M%SZ)")"
 }
 

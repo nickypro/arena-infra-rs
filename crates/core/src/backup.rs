@@ -5591,10 +5591,17 @@ done
     }
 
     /// The move a refused `--hard` save's line suggests for `path` (review ai-review claude #5):
-    /// `(cd '<repo>' && mv -n -- '<path>' '../<name>.kept-<UTC time>')`, every word as
-    /// [`shell_quote`] quotes it. Returns the command and the kept copy's name.
+    /// `(cd '<repo>' && mv -nT -- '<path>' '../<name>.kept-<UTC time>')`, every word as
+    /// [`shell_quote`] quotes it (`mv -n` where `mv` has no `-T`: [`suggested_move_with`]). Returns
+    /// the command and the kept copy's name.
     #[cfg(unix)]
     fn suggested_move(line: &str, repo: &str, path: &str) -> (String, String) {
+        suggested_move_with(line, repo, path, "mv -nT")
+    }
+
+    /// [`suggested_move`], its `mv` words `mv`.
+    #[cfg(unix)]
+    fn suggested_move_with(line: &str, repo: &str, path: &str, mv: &str) -> (String, String) {
         let fix = line
             .split_once("move it out of the checkout ")
             .and_then(|(_, r)| r.split_once(", or delete it, then switch again"))
@@ -5608,7 +5615,7 @@ done
             "a UTC time: {fix}"
         );
         let kept = format!("{name}.kept-{stamp}");
-        assert_eq!(fix, format!("(cd {} && mv -n -- {} {})", shell_quote(repo), shell_quote(path), shell_quote(&format!("../{kept}"))));
+        assert_eq!(fix, format!("(cd {} && {mv} -- {} {})", shell_quote(repo), shell_quote(path), shell_quote(&format!("../{kept}"))));
         (fix, kept)
     }
 
@@ -5617,7 +5624,9 @@ done
     /// so a second switch's paste replaced the first's kept file (or nested a directory in it).
     /// Now each word is quoted by the real quoting (`ds_quote`, as [`shell_quote`]), the copy is
     /// `<name>.kept-<UTC time>`, and `mv -n` never replaces one: the same paste again moves
-    /// nothing, the first copy and the new file both kept.
+    /// nothing, the first copy and the new file both kept. A directory, pasted again once made anew,
+    /// isn't moved inside the kept copy either (`-T`, review ai-review codex #4); a `mv` without
+    /// `-T` (busybox's) is told `mv -n`.
     #[cfg(unix)]
     #[test]
     fn the_suggested_move_pastes_as_it_is_and_never_replaces_a_kept_copy() {
@@ -5644,7 +5653,50 @@ done
         // The same paste again, a new file there: nothing replaced.
         std::fs::write(s.work.join(name), &second).unwrap();
         s.run(&fix);
-        assert_eq!((std::fs::read_to_string(&kept).unwrap(), s.read(name)), (first, second.into_bytes()), "{fix}");
+        assert_eq!((std::fs::read_to_string(&kept).unwrap(), s.read(name)), (first.clone(), second.clone().into_bytes()), "{fix}");
+
+        // A directory (review ai-review codex #4): `mv -n` alone, pasted again once it was made
+        // anew, moved it inside the kept copy. `-T`: the kept copy is the target itself — nothing
+        // nested, nothing replaced.
+        let dir = "it's ckpts";
+        std::fs::remove_file(s.work.join(name)).unwrap();
+        std::fs::write(staff.join(dir), "the staff's\n").unwrap();
+        s.git(&staff, &["add", "-A"]);
+        s.git(&staff, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "staff's file where the pod has a directory"]);
+        s.git(&staff, &["push", "-q", "origin", "main"]);
+        std::fs::write(s.work.join(".git/info/exclude"), "*.pt\nit's ckpts/\n").unwrap();
+        std::fs::create_dir_all(s.work.join(dir)).unwrap();
+        std::fs::write(s.work.join(dir).join("model.pt"), &first).unwrap();
+        let (code, out, err) = run_on_path(&checkout_command_limited(repo, "main", None, true, 1), &plain);
+        assert_ne!(code, Some(0), "{out}{err}");
+        let line = err.lines().find(|l| l.starts_with("arena set-branch: not reset — ")).unwrap_or_else(|| panic!("{err}"));
+        let (fix, kept) = suggested_move(line, repo, dir);
+        let kept = s.base.join(kept);
+        assert!(s.run(&fix).status.success(), "{fix}");
+        assert_eq!(std::fs::read_to_string(kept.join("model.pt")).unwrap(), first, "moved: {fix}");
+        std::fs::create_dir_all(s.work.join(dir)).unwrap();
+        std::fs::write(s.work.join(dir).join("model.pt"), &second).unwrap();
+        s.run(&fix);
+        assert!(!kept.join(dir).exists(), "nested into the kept copy: {fix}");
+        assert_eq!((std::fs::read_to_string(kept.join("model.pt")).unwrap(), s.read(&format!("{dir}/model.pt"))), (first, second.into_bytes()));
+
+        // A `mv` with no `-T` (busybox's): the advice says `mv -n`.
+        let bin = s.base.join("bin-busybox-mv");
+        std::fs::create_dir_all(&bin).unwrap();
+        let o = std::process::Command::new("sh").args(["-c", "command -v mv"]).output().unwrap();
+        let real_mv = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        crate::remote::write_test_script(
+            bin.join("mv"),
+            format!(
+                "#!/bin/sh\nfor a; do case $a in --*) ;; -*T*) echo \"mv: invalid option -- 'T'\" >&2; exit 1;; esac; done\nexec {} \"$@\"\n",
+                shell_quote(&real_mv)
+            ),
+        )
+        .unwrap();
+        let (code, out, err) = run_on_path(&checkout_command_limited(repo, "main", None, true, 1), &format!("{}:{plain}", bin.display()));
+        assert_ne!(code, Some(0), "{out}{err}");
+        let line = err.lines().find(|l| l.starts_with("arena set-branch: not reset — ")).unwrap_or_else(|| panic!("{err}"));
+        suggested_move_with(line, repo, dir, "mv -n");
     }
 
     /// Review ai-review claude #4, to verify: could the gentle switch's refusal of a pod mid-merge
