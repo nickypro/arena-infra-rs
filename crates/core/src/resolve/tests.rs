@@ -229,8 +229,9 @@ fn a_recorded_copy_counts_only_while_it_is_still_there_under_this_backup_dir() {
     assert_eq!(old.git, "");
 }
 
-/// Part 1's gate: on, a look, an operation finished here and not a sequence, quiet, this run's
-/// copy not failed, and a recorded copy of this operation with the work tree as it is now.
+/// Part 1's gate: on, a look, an operation finished here and not a sequence or a revert, quiet,
+/// this run's copy not failed, and a recorded copy of this operation with the work tree as it is
+/// now.
 #[test]
 fn the_resolve_waits_for_quiet_and_a_copy_taken_after_the_last_change() {
     let n = 1_760_900_000;
@@ -245,6 +246,10 @@ fn the_resolve_waits_for_quiet_and_a_copy_taken_after_the_last_change() {
         let l = Look { what: what.into(), since: None, ..look.clone() };
         assert_eq!(ok(Some(3), Some(&l), CopiedNow::Yes, Some(&copy)), Err(Hold::Never(what.into())));
     }
+    // A revert, however quiet: never (review ai-review claude #2).
+    let revert = Look { what: "revert".into(), ..look.clone() };
+    assert!(!finishes("revert"));
+    assert_eq!(ok(Some(3), Some(&revert), CopiedNow::Yes, Some(&copy_of(&revert, n - 600))), Err(Hold::Never("revert".into())));
     let seq = Look { what: "cherry-pick".into(), sequence: true, ..look.clone() };
     assert_eq!(ok(Some(3), Some(&seq), CopiedNow::Yes, Some(&copy)), Err(Hold::Never("sequence".into())));
     let busy = look_at(n, Some(n - DAY), n - 600, None);
@@ -356,30 +361,54 @@ fn a_copy_holds_the_checkout_when_it_pulls_the_home_or_a_dir_the_checkout_is_in(
 
 #[test]
 fn a_resolve_is_read_back_and_said_in_a_line() {
-    let out = "SAVED /root/ARENA_materials/.git/arena-resolved/20261019T140200Z\nHAND notes.py\nNEWER README.md\nGONE old.py\n\
-               NEWER sub dir/we*ird.py\n[autocommit-x 1234] x\nRESOLVED merge theirs 1760000000 1760500000\n";
+    let out = "SAVED /root/ARENA_materials/.git/arena-resolved/20261019T140200Z\nHAND notes.py\n\
+               NEWER theirs hunks 1760000000 1760500000 README.md\nGONE theirs 1760000000 1760500000 old.py\n\
+               NEWER ours file 1760600000 1760500000 sub dir/we*ird.py\nREDACTED 1 notes.py\n[autocommit-x 1234] x\nRESOLVED merge\n";
     let r = parse_resolve(out);
-    assert_eq!(r.resolved, Some(("merge".to_string(), "theirs".to_string(), 1_760_000_000, 1_760_500_000)));
-    assert_eq!((r.newer.clone(), r.gone.clone(), r.hand.clone()), (vec!["README.md".to_string(), "old.py".into(), "sub dir/we*ird.py".into()], vec!["old.py".to_string()], vec!["notes.py".to_string()]));
+    assert_eq!(r.resolved.as_deref(), Some("merge"));
+    let c = |path: &str, side: &str, taken, ours, theirs| Choice { path: path.into(), side: side.into(), taken, ours, theirs };
+    assert_eq!(
+        r.newer,
+        [
+            c("README.md", "theirs", Taken::Hunks, 1_760_000_000, 1_760_500_000),
+            c("old.py", "theirs", Taken::Gone, 1_760_000_000, 1_760_500_000),
+            c("sub dir/we*ird.py", "ours", Taken::File, 1_760_600_000, 1_760_500_000),
+        ]
+    );
+    assert_eq!((r.hand.clone(), r.redacted.clone()), (vec!["notes.py".to_string()], vec!["notes.py".to_string()]));
     assert_eq!(r.saved.as_deref(), Some("/root/ARENA_materials/.git/arena-resolved/20261019T140200Z"));
+    // Times as the words give them: UTC, to the minute.
+    assert_eq!((minute_words(1_760_000_000), minute_words(1_760_500_000)), ("2025-10-09 08:53Z".to_string(), "2025-10-15 03:46Z".to_string()));
+    // Each path's way, with both sides' last change; the state before first, then today's copy.
     assert_eq!(
         resolved_note(&r, 3, "/b/w1d1/devtest-a"),
-        "finished a merge left for 3h+ (kept the newer side, MERGE_HEAD's, for 3 files and the hand-resolved version of 1; \
-         before: /b/w1d1/devtest-a, and /root/ARENA_materials/.git/arena-resolved/20261019T140200Z on the pod)"
+        "finished a merge left for 3h+ (README.md: MERGE_HEAD's side of each conflict, HEAD 2025-10-09 08:53Z / MERGE_HEAD \
+         2025-10-15 03:46Z; old.py: removed, as on MERGE_HEAD, HEAD 2025-10-09 08:53Z / MERGE_HEAD 2025-10-15 03:46Z; sub \
+         dir/we*ird.py: HEAD's version, HEAD 2025-10-16 07:33Z / MERGE_HEAD 2025-10-15 03:46Z; notes.py: as resolved by hand; \
+         keys redacted in the commit (kept on disk): notes.py; before: \
+         /root/ARENA_materials/.git/arena-resolved/20261019T140200Z/ on the pod; today's copy: /b/w1d1/devtest-a)"
     );
-    let ours = parse_resolve("NEWER a.py\nRESOLVED cherry-pick ours 2 1\n");
-    assert_eq!(resolved_note(&ours, 5, "/b/x"), "finished a cherry-pick left for 5h+ (kept the newer side, HEAD's, for 1 file; before: /b/x)");
-    let stash = parse_resolve("HAND a.py\nRESOLVED conflicts theirs 1 2\n");
+    let ours = parse_resolve("NEWER ours hunks 2 1 a.py\nRESOLVED cherry-pick\n");
+    assert_eq!(
+        resolved_note(&ours, 5, "/b/x"),
+        "finished a cherry-pick left for 5h+ (a.py: HEAD's side of each conflict, HEAD 1970-01-01 00:00Z / CHERRY_PICK_HEAD \
+         1970-01-01 00:00Z; today's copy: /b/x)"
+    );
+    let stash = parse_resolve("HAND a.py\nRESOLVED conflicts\n");
     assert_eq!(
         resolved_note(&stash, 3, "/b/x"),
-        "resolved the conflicts a `git stash pop` left for 3h+ (its stash entry kept) (the hand-resolved version of 1; before: /b/x)"
+        "resolved the conflicts a `git stash pop` left for 3h+ (its stash entry kept) (a.py: as resolved by hand; today's copy: /b/x)"
     );
-    let clean = parse_resolve("RESOLVED revert ours 2 1\n");
-    assert_eq!(resolved_note(&clean, 3, "/b/x"), "finished a revert left for 3h+ (nothing was left in conflict; before: /b/x)");
+    let clean = parse_resolve("RESOLVED merge\n");
+    assert_eq!(resolved_note(&clean, 3, "/b/x"), "finished a merge left for 3h+ (nothing was left in conflict; today's copy: /b/x)");
     let refused = parse_resolve("REFUSED changed: files changed since the copy\n");
     assert_eq!((refused.refused.as_deref(), refused.resolved), (Some("changed: files changed since the copy"), None));
-    assert_eq!(parse_resolve("SAVED /x\nNEWER a\nFAILED git commit\n").failed.as_deref(), Some("git commit"));
-    assert_eq!(parse_resolve("RESOLVED merge theirs soon 1\n").resolved, None);
+    assert_eq!(parse_resolve("SAVED /x\nNEWER ours file 1 2 a\nFAILED git commit\n").failed.as_deref(), Some("git commit"));
+    // Lines it can't read are left out.
+    for bad in ["NEWER theirs hunks soon 1 a.py", "NEWER sideways file 1 2 a.py", "NEWER ours lines 1 2 a.py", "GONE ours 1 2", "RESOLVED"] {
+        let r = parse_resolve(&format!("{bad}\n"));
+        assert!(r.newer.is_empty() && r.resolved.is_none(), "{bad}: {r:?}");
+    }
 }
 
 /// The scripts are POSIX sh: dash (the images' `sh`) parses them.
@@ -389,11 +418,12 @@ fn the_scripts_parse_under_sh() {
     for (name, script) in [("look", look_script()), ("resolve", resolve_script())] {
         let o = std::process::Command::new("sh").arg("-n").arg("-c").arg(&script).output().unwrap();
         assert!(o.status.success(), "{name}: {}", String::from_utf8_lossy(&o.stderr));
-        assert!(!script.contains("# @ARENA_"), "{name}: a mark left unrendered");
+        assert!(!script.contains("@ARENA_"), "{name}: a mark left unrendered");
     }
+    assert!(resolve_script().contains(&format!("REVERT_WORDS={}", shell_word(REVERT_WORDS))));
     assert!(look_command("/root/my repo").ends_with(" arena-look '/root/my repo'"));
     let cmd = resolve_command("/root/ARENA_materials", 3, "merge 1760000000 abc", "1-2", "w1d1/devtest-a");
-    assert!(cmd.ends_with(" arena-resolve /root/ARENA_materials 10800 'merge 1760000000 abc' 1-2 3 w1d1/devtest-a"), "{cmd}");
+    assert!(cmd.ends_with(" arena-resolve /root/ARENA_materials 10800 'merge 1760000000 abc' 1-2 3 w1d1/devtest-a 99614720"), "{cmd}");
 }
 
 // --- Real git ---------------------------------------------------------------------------------
@@ -446,6 +476,34 @@ impl Repo {
         r.git(&r.course, &["config", "user.email", "u@u"]);
         r.git(&r.work, &["remote", "add", "upstream", r.course.to_str().unwrap()]);
         r
+    }
+
+    /// More files in the base (19 days old), on main, the course and the checkout alike.
+    fn add_base(&self, files: &[(&str, &[u8])]) {
+        self.git(&self.work, &["checkout", "-q", "main"]);
+        for (rel, bytes) in files {
+            self.put(rel, bytes);
+        }
+        self.commit_all(&self.work, "more base", self.now - 19 * DAY);
+        self.git(&self.work, &["push", "-q", "origin", "main"]);
+        self.git(&self.work, &["checkout", "-q", "autocommit-x"]);
+        self.git(&self.work, &["merge", "-q", "--ff-only", "main"]);
+        self.git(&self.course, &["pull", "-q", "--ff-only", "origin", "main"]);
+    }
+
+    /// A commit of the course's (on upstream's `main`) and one of the participant's, at those times.
+    fn course_commit(&self, files: &[(&str, &[u8])], at: u64) {
+        for (rel, bytes) in files {
+            self.put_in(&self.course, rel, bytes);
+        }
+        self.commit_all(&self.course, "the course's change", at);
+    }
+
+    fn my_commit(&self, files: &[(&str, &[u8])], at: u64) {
+        for (rel, bytes) in files {
+            self.put(rel, bytes);
+        }
+        self.commit_all(&self.work, "mine", at);
     }
 
     /// `git pull upstream main`, which must conflict.
@@ -564,13 +622,26 @@ impl Repo {
         std::fs::read(self.work.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
     }
 
+    fn text(&self, rel: &str) -> String {
+        String::from_utf8(self.read(rel)).unwrap()
+    }
+
     fn link(&self, rel: &str) -> String {
         std::fs::read_link(self.work.join(rel)).unwrap().display().to_string()
     }
 
+    /// A path's content in HEAD's commit.
+    fn committed(&self, rel: &str) -> String {
+        self.git(&self.work, &["show", &format!("HEAD:{rel}")])
+    }
+
     /// `bash -c cmd` in the sandbox: (exit code, stdout, stderr).
     fn sh(&self, cmd: &str) -> (Option<i32>, String, String) {
-        let o = self.cmd(&self.base, "bash").arg("-c").arg(cmd).output().expect("bash");
+        self.sh_with(cmd, &[])
+    }
+
+    fn sh_with(&self, cmd: &str, env: &[(&str, &str)]) -> (Option<i32>, String, String) {
+        let o = self.cmd(&self.base, "bash").arg("-c").arg(cmd).envs(env.iter().copied()).output().expect("bash");
         (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
     }
 
@@ -592,8 +663,13 @@ impl Repo {
 
     /// The resolve, as `pods backup` runs it after a copy that followed `look`.
     fn resolve(&self, hours: u64, look: &Look) -> (Option<i32>, ResolveReport, String) {
-        let cmd = resolve_command(self.work.to_str().unwrap(), hours, &look.op_key(), &look.print, "w1d1/devtest-x");
-        let (code, out, err) = self.sh(&cmd);
+        self.resolve_with(hours, look, GIT_MAX_FILE_BYTES_FOR_TESTS, &[])
+    }
+
+    /// [`Repo::resolve`] with a size limit and an environment (the tests' hooks).
+    fn resolve_with(&self, hours: u64, look: &Look, max: u64, env: &[(&str, &str)]) -> (Option<i32>, ResolveReport, String) {
+        let cmd = resolve_command_limited(self.work.to_str().unwrap(), hours, &look.op_key(), &look.print, "w1d1/devtest-x", max);
+        let (code, out, err) = self.sh_with(&cmd, env);
         (code, parse_resolve(&out), format!("{out}{err}"))
     }
 
@@ -660,6 +736,17 @@ impl Drop for Repo {
     }
 }
 
+/// The backup's own limit, as the CLI passes it.
+#[cfg(unix)]
+const GIT_MAX_FILE_BYTES_FOR_TESTS: u64 = crate::backup::GIT_MAX_FILE_BYTES;
+
+/// The conflicted paths a resolve took from their newer side, sorted, as `(path, side, how)`.
+fn taken(r: &ResolveReport) -> Vec<(String, String, Taken)> {
+    let mut v: Vec<_> = r.newer.iter().map(|c| (c.path.clone(), c.side.clone(), c.taken)).collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
 /// This test process's session (the 4th field after its name in `/proc/self/stat`): what the
 /// look, run from here, shares — its own processes.
 #[cfg(unix)]
@@ -668,18 +755,20 @@ fn own_session() -> u64 {
     stat.rsplit_once(") ").unwrap().1.split_whitespace().nth(3).unwrap().parse().unwrap()
 }
 
-/// The human's rule, on a merge left alone for 3h+: each conflicted path from the side whose
-/// commit is newer — a text file, a binary one, a symlink, an odd name, and one deleted there
-/// (removed when that side is the newer) — except a file the participant resolved by hand (no
-/// conflict marker left), kept as it is; a binary file "resolved" is never taken as such. A real
-/// merge commit in the repo's own identity, saying what it did and where the state before is; the
-/// files as they were kept in the git dir; then the backup commits and pushes as always.
+/// The human's rule, on a merge left alone for 3h+, per conflicted path: the side whose last change
+/// to it is the more recent — a text file per hunk, a binary one, a symlink and an odd name whole,
+/// one deleted there removed when that side is the newer — except a file the participant resolved
+/// by hand (no conflict marker left), kept as it is; a binary file "resolved" is never taken as
+/// such. A real merge commit in the repo's own identity whose message names, per path, the side
+/// that won and both sides' last change to it, to the minute (item 15b), then where the state
+/// before is; that state kept in the git dir; then the backup commits and pushes as always.
 #[cfg(unix)]
 #[test]
 fn a_merge_left_alone_is_finished_by_the_newer_side_and_the_hand_resolved_file_kept() {
     for theirs_newer in [true, false] {
         let r = Repo::new(if theirs_newer { "merge-theirs" } else { "merge-ours" });
-        let (course_at, mine_at) = if theirs_newer { (r.now - 5 * DAY, r.now - 10 * DAY) } else { (r.now - 10 * DAY, r.now - 5 * DAY) };
+        // To the second, so the message's minutes are checked.
+        let (course_at, mine_at) = if theirs_newer { (r.now - 5 * DAY + 77, r.now - 10 * DAY + 3) } else { (r.now - 10 * DAY + 77, r.now - 5 * DAY + 3) };
         r.merge_conflict(course_at, mine_at);
         let merged = r.git(&r.work, &["rev-parse", "MERGE_HEAD"]);
         let head = r.git(&r.work, &["rev-parse", "HEAD"]);
@@ -693,18 +782,22 @@ fn a_merge_left_alone_is_finished_by_the_newer_side_and_the_hand_resolved_file_k
         r.age(4 * HOUR);
         let look = r.look();
         assert_eq!((look.what.as_str(), look.since, look.head.as_str(), look.sequence), ("merge", Some(r.now - 4 * HOUR), merged.as_str(), false));
-        assert_eq!((look.newest, look.input, not_quiet(&look, 3)), (r.now - 4 * HOUR, None, None));
+        assert_eq!((look.newest, look.input, look.index, look.locked, look.tty, look.at_work.clone()), (r.now - 4 * HOUR, None, Some(r.now - 4 * HOUR), false, None, None));
+        assert_eq!(not_quiet(&look, 3), None);
         assert_eq!(not_quiet(&look, 5).as_deref(), Some("the merge started less than 5h ago"));
 
         let (code, rep, said) = r.resolve(3, &look);
         assert_eq!(code, Some(0), "{said}");
-        let side = if theirs_newer { "theirs" } else { "ours" };
-        assert_eq!(rep.resolved, Some(("merge".to_string(), side.to_string(), mine_at, course_at)), "{said}");
+        assert_eq!(rep.resolved.as_deref(), Some("merge"), "{said}");
         assert_eq!(rep.hand, ["notes.py"], "{said}");
-        let mut newer = rep.newer.clone();
-        newer.sort();
-        assert_eq!(newer, ["README.md", "data.bin", "link", "old.py", "sub dir/we*ird.py"], "{said}");
-        assert_eq!(rep.gone, if theirs_newer { vec!["old.py".to_string()] } else { vec![] }, "{said}");
+        let side = if theirs_newer { "theirs" } else { "ours" };
+        let old_py = if theirs_newer { Taken::Gone } else { Taken::File };
+        let want: Vec<(String, String, Taken)> = [("README.md", Taken::Hunks), ("data.bin", Taken::File), ("link", Taken::File), ("old.py", old_py), ("sub dir/we*ird.py", Taken::Hunks)]
+            .into_iter()
+            .map(|(p, t)| (p.to_string(), side.to_string(), t))
+            .collect();
+        assert_eq!(taken(&rep), want, "{said}");
+        assert!(rep.newer.iter().all(|c| (c.ours, c.theirs) == (mine_at, course_at)), "each side's last change: {:?}", rep.newer);
         // The tree: the newer side's, notes.py as the participant left it.
         assert_eq!(r.read("notes.py"), b"x = 3\n");
         if theirs_newer {
@@ -720,24 +813,33 @@ fn a_merge_left_alone_is_finished_by_the_newer_side_and_the_hand_resolved_file_k
         assert!(!r.work.join(".git/MERGE_HEAD").exists() && r.unmerged().is_empty());
         assert_eq!(r.git(&r.work, &["rev-list", "--parents", "-n1", "HEAD"]), format!("{} {head} {merged}", r.git(&r.work, &["rev-parse", "HEAD"])));
         assert_eq!(r.git(&r.work, &["log", "-1", "--format=%an <%ae>|%cn <%ce>"]), "t <t@t>|t <t@t>");
-        let day = |t: u64| crate::schedule::ymd_string((t / DAY) as i64);
         let saved = rep.saved.clone().unwrap();
         let stamp = saved.rsplit('/').next().unwrap();
         let body = r.git(&r.work, &["log", "-1", "--format=%B"]);
-        let newer_list = "README.md, data.bin, link, old.py, sub dir/we*ird.py";
+        // Item 15b: per path, the side that won and both sides' last change, UTC to the minute.
+        let (m, c) = (minute_words(mine_at), minute_words(course_at));
+        let dates = format!("last changed: yours (HEAD) {m}, the merged branch (MERGE_HEAD) {c}");
+        let (won, its) = if theirs_newer { ("the merged branch won", "its") } else { ("yours won", "your") };
+        let old_line = if theirs_newer { format!("- old.py: {won} (removed: deleted there) — {dates}") } else { format!("- old.py: {won} ({its} whole version) — {dates}") };
         assert_eq!(
             body,
             format!(
                 "arena: finished a merge left in progress for 3h+\n\nNothing in this checkout changed for 3h+ while a merge was in \
-                 progress, so arena finished it: kept the newer side (HEAD {} / MERGE_HEAD {}) for {newer_list}; kept your \
-                 hand-resolved notes.py; the state before is in the backup copy w1d1/devtest-x and on this machine in \
-                 .git/arena-resolved/{stamp}/.\n\nMerge branch 'main' of {} into autocommit-x",
-                day(mine_at),
-                day(course_at),
+                 progress, so arena finished it: each conflicted file from the side whose last change to it is the more recent (a \
+                 tie keeps yours), a file you resolved by hand kept as it is.\n\
+                 - README.md: {won} ({its} side of each conflict; the other changes of both sides kept) — {dates}\n\
+                 - data.bin: {won} ({its} whole version) — {dates}\n\
+                 - link: {won} ({its} whole version) — {dates}\n\
+                 - notes.py: kept as you resolved it by hand\n\
+                 {old_line}\n\
+                 - sub dir/we*ird.py: {won} ({its} side of each conflict; the other changes of both sides kept) — {dates}\n\n\
+                 The state before is in .git/arena-resolved/{stamp}/ on this machine (its README says how to see it or do this \
+                 again yourself); today's copy: w1d1/devtest-x.\n\nMerge branch 'main' of {} into autocommit-x",
                 r.course.display()
             )
         );
-        // The files as they were, in the git dir: the markers, the hand edit, the binary.
+        assert!(m.ends_with('Z') && m.len() == "2026-10-20 13:05Z".len(), "{m}");
+        // The state before, in the git dir: the markers, the hand edit, the binary — and git's own state.
         let kept = PathBuf::from(&saved).join("files");
         assert!(saved.starts_with(&format!("{}/.git/arena-resolved/", r.work.display())), "{saved}");
         assert!(String::from_utf8_lossy(&std::fs::read(kept.join("README.md")).unwrap()).contains("<<<<<<< HEAD"));
@@ -758,13 +860,123 @@ fn a_merge_left_alone_is_finished_by_the_newer_side_and_the_hand_resolved_file_k
     }
 }
 
-/// A single cherry-pick and a revert: finished by `--continue` (their own message, and authorship,
-/// with the words added); one whose result is empty — the newer side HEAD's everywhere, as a
-/// revert's always is — committed empty, as git advises. A revert's other side is the commit it
-/// reverts: older than HEAD, so HEAD's side is kept.
+/// "Before:" names something no later copy overwrites (review ai-review claude #8): the folder on
+/// the pod holds the conflicted files as they were, git's own state files, the old HEAD, the index
+/// (with its conflicts — copying it back is the state before, exactly) and a README that says how
+/// to see it or do it again; the message names it first, and the day's copy as today's.
 #[cfg(unix)]
 #[test]
-fn a_cherry_pick_or_a_revert_left_alone_is_finished_by_continuing() {
+fn the_state_before_is_kept_whole_on_the_pod() {
+    let r = Repo::new("before");
+    r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+    let head = r.git(&r.work, &["rev-parse", "HEAD"]);
+    let merged = r.git(&r.work, &["rev-parse", "MERGE_HEAD"]);
+    let unmerged = r.unmerged();
+    let index = std::fs::read(r.work.join(".git/index")).unwrap();
+    let msg = std::fs::read(r.work.join(".git/MERGE_MSG")).unwrap();
+    r.age(4 * HOUR);
+    let (code, rep, said) = r.resolve(3, &r.look());
+    assert_eq!(code, Some(0), "{said}");
+    let saved = PathBuf::from(rep.saved.unwrap());
+    assert_eq!(std::fs::read_to_string(saved.join("HEAD")).unwrap(), format!("{head}\n"));
+    assert_eq!(std::fs::read_to_string(saved.join("MERGE_HEAD")).unwrap().trim(), merged);
+    assert_eq!(std::fs::read(saved.join("MERGE_MSG")).unwrap(), msg);
+    assert_eq!(std::fs::read_to_string(saved.join("ORIG_HEAD")).unwrap().trim(), head);
+    assert_eq!(std::fs::read(saved.join("index")).unwrap(), index, "the index with its conflicts");
+    assert_eq!(std::fs::read_to_string(saved.join("unmerged")).unwrap().trim(), unmerged);
+    assert!(saved.join("files/README.md").exists());
+    let readme = std::fs::read_to_string(saved.join("README")).unwrap();
+    for want in [
+        "files/      the conflicted files as they were on disk (markers and all)",
+        &format!("HEAD        the commit the merge was on: {head}"),
+        &format!("To do it again yourself (commit or copy anything newer first: this discards it): git reset --hard {head} && git merge {merged}"),
+        "Today's copy on the backup machine: w1d1/devtest-x (a later copy that day replaces it).",
+        "- README.md: the merged branch won (its side of each conflict; the other changes of both sides kept) — last changed: yours (HEAD) ",
+    ] {
+        assert!(readme.contains(want), "{want}\n{readme}");
+    }
+    let body = r.git(&r.work, &["log", "-1", "--format=%B"]);
+    let stamp = saved.file_name().unwrap().to_str().unwrap();
+    assert!(
+        body.contains(&format!(
+            "The state before is in .git/arena-resolved/{stamp}/ on this machine (its README says how to see it or do this again \
+             yourself); today's copy: w1d1/devtest-x."
+        )),
+        "{body}"
+    );
+}
+
+/// Per hunk, not per file (review ai-review claude #2): only the conflicting hunks take the newer
+/// side; the clean changes of both sides in the same file survive — the course's when HEAD's side
+/// wins (else the merge commit would record the course's fix as merged and dropped), the
+/// participant's when the course's wins.
+#[cfg(unix)]
+#[test]
+fn the_newer_side_wins_each_conflicting_hunk_and_both_sides_clean_hunks_are_kept() {
+    let base = b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
+    for theirs_newer in [false, true] {
+        let r = Repo::new(if theirs_newer { "hunks-theirs" } else { "hunks-ours" });
+        r.add_base(&[("lines.txt", base)]);
+        let (course_at, mine_at) = if theirs_newer { (r.now - 5 * DAY, r.now - 10 * DAY) } else { (r.now - 10 * DAY, r.now - 5 * DAY) };
+        // Both change line 1; the course alone line 10, the participant alone line 5.
+        r.course_commit(&[("lines.txt", b"c1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nc10\n")], course_at);
+        r.my_commit(&[("lines.txt", b"m1\nl2\nl3\nl4\nm5\nl6\nl7\nl8\nl9\nl10\n")], mine_at);
+        r.pull_conflicted();
+        assert!(r.text("lines.txt").contains("<<<<<<< HEAD\nm1\n=======\nc1\n>>>>>>> "), "{}", r.text("lines.txt"));
+        r.age(4 * HOUR);
+        let (code, rep, said) = r.resolve(3, &r.look());
+        assert_eq!(code, Some(0), "{said}");
+        let side = if theirs_newer { "theirs" } else { "ours" };
+        assert_eq!(taken(&rep), [("lines.txt".to_string(), side.to_string(), Taken::Hunks)], "{said}");
+        let first = if theirs_newer { "c1" } else { "m1" };
+        let want = format!("{first}\nl2\nl3\nl4\nm5\nl6\nl7\nl8\nl9\nc10\n");
+        assert_eq!(r.text("lines.txt"), want, "the participant's line 5 and the course's line 10 both kept");
+        assert_eq!(format!("{}\n", r.committed("lines.txt")), want, "and committed so");
+    }
+}
+
+/// Newer per path, not by the tips (review ai-review claude #2): HEAD's tip is the last autocommit,
+/// newer than the course's whole commit — yet the course changed a.py after the participant last
+/// did, and the participant changed b.py after the course last did. Each path its own newer side.
+#[cfg(unix)]
+#[test]
+fn the_newer_side_is_judged_per_path_by_each_sides_last_change_to_it() {
+    let r = Repo::new("per-path");
+    r.add_base(&[("a.py", b"a\n"), ("b.py", b"b\n")]);
+    let (course_b, course_a) = (r.now - 18 * DAY, r.now - 5 * DAY);
+    r.course_commit(&[("b.py", b"b course\n")], course_b);
+    r.course_commit(&[("a.py", b"a course\n")], course_a);
+    let (mine_a, mine_b, mine_tip) = (r.now - 15 * DAY, r.now - 10 * DAY, r.now - DAY);
+    r.my_commit(&[("a.py", b"a mine\n")], mine_a);
+    r.my_commit(&[("b.py", b"b mine\n")], mine_b);
+    r.my_commit(&[("c.txt", b"an autocommit\n")], mine_tip);
+    r.pull_conflicted();
+    r.age(4 * HOUR);
+    let (code, rep, said) = r.resolve(3, &r.look());
+    assert_eq!(code, Some(0), "{said}");
+    let mut got: Vec<(String, String, u64, u64)> = rep.newer.iter().map(|c| (c.path.clone(), c.side.clone(), c.ours, c.theirs)).collect();
+    got.sort();
+    assert_eq!(got, [("a.py".to_string(), "theirs".to_string(), mine_a, course_a), ("b.py".to_string(), "ours".to_string(), mine_b, course_b)]);
+    assert_eq!((r.text("a.py"), r.text("b.py")), ("a course\n".to_string(), "b mine\n".to_string()));
+    let body = r.git(&r.work, &["log", "-1", "--format=%B"]);
+    assert!(
+        body.contains(&format!(
+            "- a.py: the merged branch won (its side of each conflict; the other changes of both sides kept) — last changed: yours \
+             (HEAD) {}, the merged branch (MERGE_HEAD) {}\n",
+            minute_words(mine_a),
+            minute_words(course_a)
+        )),
+        "{body}"
+    );
+    assert!(body.contains(&format!("- b.py: yours won (your side of each conflict; the other changes of both sides kept) — last changed: yours (HEAD) {}, ", minute_words(mine_b))), "{body}");
+}
+
+/// A single cherry-pick: finished by `--continue` (its own message and authorship, with the words
+/// added, the picked commit named); one whose result is empty — the newer side HEAD's everywhere —
+/// committed empty, as git advises.
+#[cfg(unix)]
+#[test]
+fn a_cherry_pick_left_alone_is_finished_by_continuing() {
     for (case, theirs_newer) in [("pick-theirs", true), ("pick-ours", false)] {
         let r = Repo::new(case);
         let (side_at, mine_at) = if theirs_newer { (r.now - 5 * DAY, r.now - 10 * DAY) } else { (r.now - 10 * DAY, r.now - 5 * DAY) };
@@ -786,21 +998,37 @@ fn a_cherry_pick_or_a_revert_left_alone_is_finished_by_continuing() {
         r.age(4 * HOUR);
         let (code, rep, said) = r.resolve(3, &r.look());
         assert_eq!(code, Some(0), "{case}: {said}");
-        assert_eq!(rep.newer, ["README.md"], "{case}");
+        let side = if theirs_newer { "theirs" } else { "ours" };
+        assert_eq!(taken(&rep), [("README.md".to_string(), side.to_string(), Taken::Hunks)], "{case}");
         assert!(!r.work.join(".git/CHERRY_PICK_HEAD").exists(), "{case}");
         assert_eq!(r.git(&r.work, &["rev-parse", "HEAD~1"]), head, "{case}: one commit on top");
         assert_eq!(r.read("README.md"), if theirs_newer { b"side\n".to_vec() } else { b"mine\n".to_vec() }, "{case}");
         assert_eq!(r.read("side.py"), b"s = 1\n", "{case}: the pick's other change, applied either way");
         assert_eq!(r.git(&r.work, &["log", "-1", "--format=%an|%cn"]), "s|t", "{case}: the pick's author, the repo's committer");
         let body = r.git(&r.work, &["log", "-1", "--format=%B"]);
-        assert!(body.starts_with("the side's change\n\narena: finished this cherry-pick, left in progress for 3h+ — kept the newer side (HEAD "), "{case}: {body}");
-        assert!(body.contains(" for README.md; the state before is in the backup copy w1d1/devtest-x and on this machine in .git/arena-resolved/"), "{body}");
+        let won = if theirs_newer { "the picked commit won (its side" } else { "yours won (your side" };
+        let dates = format!("last changed: yours (HEAD) {}, the picked commit (CHERRY_PICK_HEAD) {}", minute_words(mine_at), minute_words(side_at));
+        assert!(
+            body.starts_with(&format!(
+                "the side's change\n\narena: finished this cherry-pick, left in progress for 3h+: each conflicted file from the side \
+                 whose last change to it is the more recent (a tie keeps yours), a file you resolved by hand kept as it is.\n\
+                 - README.md: {won} of each conflict; the other changes of both sides kept) — {dates}\n\nThe state before is in \
+                 .git/arena-resolved/"
+            )),
+            "{case}: {body}"
+        );
+        assert!(body.ends_with("today's copy: w1d1/devtest-x."), "{body}");
         assert!(!body.contains("Conflicts:"), "{body}");
         assert_eq!(r.backup().1.outcome, Some((BACKUP_PUSHED, "autocommit-x".to_string())), "{case}");
     }
+}
 
-    // A revert of an older commit whose line changed since: HEAD's side kept, so nothing changes —
-    // committed empty with the revert's message.
+/// A revert is never finished (review ai-review claude #2): its other side is the commit it undoes,
+/// always older than HEAD, so "the newer side" would keep HEAD's everywhere and commit a revert
+/// that reverts nothing. The gate says so; the script refuses, touching nothing; it stays BUSY.
+#[cfg(unix)]
+#[test]
+fn a_revert_is_never_finished() {
     let r = Repo::new("revert");
     for (text, at) in [("a", r.now - 9 * DAY), ("b", r.now - 8 * DAY)] {
         r.put("README.md", format!("{text}\n").as_bytes());
@@ -811,14 +1039,15 @@ fn a_cherry_pick_or_a_revert_left_alone_is_finished_by_continuing() {
     assert!(!ok && r.work.join(".git/REVERT_HEAD").exists(), "{said}");
     assert_eq!(r.backup().1.busy.as_deref(), Some("revert"));
     r.age(4 * HOUR);
-    let (code, rep, said) = r.resolve(3, &r.look());
-    assert_eq!(code, Some(0), "{said}");
-    assert_eq!(rep.resolved.as_ref().map(|(w, s, ..)| (w.as_str(), s.as_str())), Some(("revert", "ours")));
-    assert!(!r.work.join(".git/REVERT_HEAD").exists());
-    assert_eq!((r.read("README.md"), r.git(&r.work, &["rev-parse", "HEAD~1"])), (b"b\n".to_vec(), head));
-    assert_eq!(r.git(&r.work, &["diff", "--stat", "HEAD~1", "HEAD"]), "", "empty");
-    assert!(r.git(&r.work, &["log", "-1", "--format=%B"]).starts_with("Revert \"a\""));
-    assert_eq!(r.backup().1.outcome, Some((BACKUP_PUSHED, "autocommit-x".to_string())));
+    let look = r.look();
+    assert_eq!(not_quiet(&look, 3), None, "quiet, all the same");
+    assert_eq!(hold(Some(3), Some(&look), CopiedNow::Yes, Some(&copy_of(&look, r.now))), Err(Hold::Never("revert".into())));
+    let before = r.unmerged();
+    let (code, rep, said) = r.resolve(3, &look);
+    assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some(REVERT_WORDS)), "{said}");
+    assert!(r.work.join(".git/REVERT_HEAD").exists() && !r.work.join(".git/arena-resolved").exists());
+    assert_eq!((r.unmerged(), r.git(&r.work, &["rev-parse", "HEAD"])), (before, head));
+    assert_eq!(r.backup().1.busy.as_deref(), Some("revert"), "still BUSY");
 }
 
 /// A `git stash pop`'s conflicts: each path from the newer side — HEAD's or the stash entry's
@@ -848,7 +1077,9 @@ fn a_stash_pops_conflicts_are_resolved_and_its_stash_entry_kept() {
         assert_eq!((look.what.as_str(), look.head.clone()), ("conflicts", r.git(&r.work, &["rev-parse", "refs/stash"])));
         let (code, rep, said) = r.resolve(3, &look);
         assert_eq!(code, Some(0), "{case}: {said}");
-        assert_eq!((rep.newer.clone(), rep.hand.clone()), (vec!["README.md".to_string()], vec!["notes.py".to_string()]), "{case}");
+        let side = if stash_newer { "theirs" } else { "ours" };
+        assert_eq!((taken(&rep), rep.hand.clone()), (vec![("README.md".to_string(), side.to_string(), Taken::Hunks)], vec!["notes.py".to_string()]), "{case}");
+        assert_eq!(rep.newer[0].ours, head_at, "{case}");
         assert_eq!(r.read("README.md"), if stash_newer { b"stashed\n".to_vec() } else { b"committed\n".to_vec() }, "{case}");
         assert_eq!(r.read("notes.py"), b"x = both\n");
         assert!(r.unmerged().is_empty(), "{case}");
@@ -1031,7 +1262,217 @@ fn recent_activity_or_a_change_since_the_copy_leaves_it_busy() {
     assert_eq!(not_quiet(&look, 3), None, "{look:?}");
     assert_eq!((look.input, look.tty), (Some(r.now - 5 * HOUR), Some(r.now - 5 * HOUR)));
     let (code, rep, said) = r.resolve(3, &look);
-    assert_eq!((code, rep.resolved.map(|(w, s, ..)| (w, s))), (Some(0), Some(("merge".to_string(), "ours".to_string()))), "{said}");
+    assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{said}");
+}
+
+/// A file the participant began resolving is left alone (review ai-review claude #2): still with
+/// markers, but not what the merge left — the whole merge stays BUSY, the file named. Judged by
+/// making git's conflicted output again: with `git merge-file` and the file's own labels (the
+/// default style, and diff3); where merge-file joins two conflicts the merge kept apart, by the
+/// merge's own way (`checkout --conflict`, labels aside); and where it can't be made again (a
+/// marker line's label gone), by time — a file changed more than 2 minutes after the merge started.
+#[cfg(unix)]
+#[test]
+fn a_file_begun_by_hand_is_left_alone_and_one_as_the_merge_left_it_is_merged() {
+    // (case, the file's base/course/mine, diff3, what the participant did, finished?)
+    type Case<'a> = (&'a str, [&'a [u8]; 3], bool, Box<dyn Fn(&Repo)>, bool);
+    let plain: [&[u8]; 3] = [b"a\nb\nc\n", b"a\nB course\nc\n", b"a\nB mine\nc\n"];
+    // Two conflicts four lines without letters or digits apart: merge-file makes them one.
+    let apart: [&[u8]; 3] = [b"x = 1\n}\n\n}\n)\ny = 1\nz\n", b"x = 2\n}\n\n}\n)\ny = 2\nz\n", b"x = 3\n}\n\n}\n)\ny = 3\nz\n"];
+    let mtime = |ago: u64| move |r: &Repo| r.touch("f.py", ago);
+    let cases: Vec<Case> = vec![
+        ("as-left", plain, false, Box::new(|_: &Repo| {}), true),
+        ("as-left-diff3", plain, true, Box::new(|_: &Repo| {}), true),
+        ("as-left-apart", apart, false, Box::new(|_: &Repo| {}), true),
+        // Edited inside its markers — written within a minute of the merge, so only the bytes tell.
+        ("begun", plain, false, Box::new(move |r: &Repo| {
+            r.put("f.py", r.text("f.py").replace("B mine", "B mine, and some of the course's").as_bytes());
+            mtime(4 * HOUR - 60)(r);
+        }), false),
+        ("begun-diff3", plain, true, Box::new(move |r: &Repo| {
+            r.put("f.py", r.text("f.py").replace("B course", "B course too").as_bytes());
+            mtime(4 * HOUR - 60)(r);
+        }), false),
+        // Its `>>>>>>>` line deleted (labels unreadable): later than the merge by 5 minutes — begun.
+        ("no-labels-late", plain, false, Box::new(move |r: &Repo| {
+            let t = r.text("f.py");
+            let kept: Vec<&str> = t.lines().filter(|l| !l.starts_with(">>>>>>>")).collect();
+            r.put("f.py", format!("{}\n", kept.join("\n")).as_bytes());
+            mtime(4 * HOUR - 300)(r);
+        }), false),
+        // … by 1 minute: as the merge left it.
+        ("no-labels-soon", plain, false, Box::new(move |r: &Repo| {
+            let t = r.text("f.py");
+            let kept: Vec<&str> = t.lines().filter(|l| !l.starts_with(">>>>>>>")).collect();
+            r.put("f.py", format!("{}\n", kept.join("\n")).as_bytes());
+            mtime(4 * HOUR - 60)(r);
+        }), true),
+    ];
+    for (case, [base, course, mine], diff3, did, finished) in cases {
+        let r = Repo::new(&format!("left-{case}"));
+        r.add_base(&[("f.py", base)]);
+        if diff3 {
+            r.git(&r.work, &["config", "merge.conflictStyle", "diff3"]);
+        }
+        r.course_commit(&[("f.py", course)], r.now - 5 * DAY);
+        r.my_commit(&[("f.py", mine)], r.now - 10 * DAY);
+        r.pull_conflicted();
+        assert_eq!(r.text("f.py").contains("|||||||"), diff3, "{case}: {}", r.text("f.py"));
+        r.age(4 * HOUR);
+        did(&r);
+        let conflicts = r.unmerged();
+        let (code, rep, said) = r.resolve(3, &r.look());
+        if finished {
+            assert_eq!(code, Some(0), "{case}: {said}");
+            assert_eq!(taken(&rep), [("f.py".to_string(), "theirs".to_string(), Taken::Hunks)], "{case}");
+            assert_eq!(r.read("f.py"), course, "{case}: the newer side's");
+        } else {
+            assert_eq!(
+                (code, rep.refused.as_deref()),
+                (Some(RESOLVE_REFUSED_EXIT), Some("you started resolving f.py by hand — finish it (and git add it) or abort, on the pod")),
+                "{case}: {said}"
+            );
+            r.untouched(&conflicts, case);
+        }
+    }
+}
+
+/// Re-checked right before anything changes (review ai-review codex #2): the participant aborts the
+/// merge, or aborts it and starts a rebase, while the state before is being kept — nothing is
+/// touched (the plan made for the merge is never applied to the rebase). And again right before
+/// the commit: the merge gone by then, or git's index locked — stopped, said, the state before
+/// already kept.
+#[cfg(unix)]
+#[test]
+fn the_state_is_read_again_right_before_changing_anything_and_before_the_commit() {
+    let hook = "ARENA_TEST_HOOK_BEFORE_CHANGE";
+    let cases = [
+        ("abort", "git merge --abort", "changed: the merge isn't the one planned for any more while the state before was kept"),
+        ("rebase", "git merge --abort && git rebase upstream/main", "changed: the merge isn't the one planned for any more while the state before was kept"),
+        ("edit", "echo more >> notes.py", "changed: files changed while the state before was kept"),
+        ("stage", "git add notes.py", "changed: git's index changed while the state before was kept"),
+        ("lock", ": > .git/index.lock", "changed: git's index is locked while the state before was kept"),
+    ];
+    for (case, cmd, why) in cases {
+        let r = Repo::new(&format!("again-{case}"));
+        r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+        let head = r.git(&r.work, &["rev-parse", "HEAD"]);
+        r.age(4 * HOUR);
+        let look = r.look();
+        let (code, rep, said) = r.resolve_with(3, &look, GIT_MAX_FILE_BYTES_FOR_TESTS, &[(hook, &format!("cd '{}' && {cmd}", r.work.display()))]);
+        assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some(why)), "{case}: {said}");
+        assert!(!r.work.join(".git/arena-resolved").exists(), "{case}: nothing kept, nothing done");
+        if case == "rebase" {
+            assert!(r.work.join(".git/rebase-merge").exists(), "the participant's rebase, as they left it");
+        } else {
+            assert_eq!(r.git(&r.work, &["rev-parse", "HEAD"]), head, "{case}");
+        }
+    }
+    // Right before the commit.
+    let hook = "ARENA_TEST_HOOK_BEFORE_FINISH";
+    for (case, cmd, why) in [
+        ("finish-abort", "git merge --abort", "changed before the commit: the merge isn't the one resolved any more — "),
+        ("finish-lock", ": > .git/index.lock", "changed before the commit: git's index is locked — "),
+    ] {
+        let r = Repo::new(case);
+        r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+        let head = r.git(&r.work, &["rev-parse", "HEAD"]);
+        r.age(4 * HOUR);
+        let (code, rep, said) = r.resolve_with(3, &r.look(), GIT_MAX_FILE_BYTES_FOR_TESTS, &[(hook, &format!("cd '{}' && {cmd}", r.work.display()))]);
+        assert_eq!(code, Some(RESOLVE_FAILED_EXIT), "{case}: {said}");
+        let failed = rep.failed.clone().unwrap_or_default();
+        let stamp = rep.saved.as_deref().and_then(|s| s.rsplit('/').next()).unwrap_or("?").to_string();
+        assert_eq!(failed, format!("{why}the state before is in .git/arena-resolved/{stamp}/"), "{case}: {said}");
+        assert_eq!(r.git(&r.work, &["rev-parse", "HEAD"]), head, "{case}: nothing committed");
+        assert!(r.work.join(".git/arena-resolved").join(&stamp).join("files/README.md").exists(), "{case}");
+    }
+}
+
+/// What the resolve stages goes through the backup's redaction (review ai-review codex #5): a key
+/// in a file the participant resolved by hand is committed redacted — the file on disk keeps it,
+/// and the push goes through. A resolved file over the git limit is never committed: refused,
+/// nothing touched.
+#[cfg(unix)]
+#[test]
+fn keys_are_redacted_and_a_file_over_the_limit_is_left_alone() {
+    let key = format!("sk-or-v1-{}", "ab".repeat(32));
+    let r = Repo::new("keys");
+    r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+    let hand = format!("KEY = \"{key}\"\nx = 3\n");
+    r.put("notes.py", hand.as_bytes());
+    r.age(4 * HOUR);
+    let (code, rep, said) = r.resolve(3, &r.look());
+    assert_eq!(code, Some(0), "{said}");
+    assert_eq!((rep.hand.clone(), rep.redacted.clone()), (vec!["notes.py".to_string()], vec!["notes.py".to_string()]), "{said}");
+    assert_eq!(r.committed("notes.py"), "KEY = \"REDACTED-OPENROUTER-KEY\"\nx = 3", "the commit has it redacted");
+    assert_eq!(r.text("notes.py"), hand, "the disk keeps the key");
+    assert!(!r.git_try(&r.work, &["grep", "-q", "-F", &key, "HEAD"]).0, "no key in the merge commit's tree");
+    let (code, report, said) = r.backup();
+    assert_eq!((code, report.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".to_string()))), "{said}");
+
+    // Over the limit (a small one here): never committed — refused, nothing touched.
+    let r = Repo::new("limit");
+    r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+    r.put("notes.py", &vec![b'x'; 4096]);
+    r.age(4 * HOUR);
+    let conflicts = r.unmerged();
+    let (code, rep, said) = r.resolve_with(3, &r.look(), 1000, &[]);
+    assert_eq!(
+        (code, rep.refused.as_deref()),
+        (Some(RESOLVE_REFUSED_EXIT), Some("notes.py would be 4096 bytes, over git's 1000-byte limit: never committed — resolve it on the pod")),
+        "{said}"
+    );
+    r.untouched(&conflicts, "limit");
+}
+
+/// The path's `conflict-marker-size` (review ai-review codex #9): with 10, git's markers are ten
+/// characters long, and the file still has them — not resolved by hand: taken per hunk from the
+/// newer side, no marker committed.
+#[cfg(unix)]
+#[test]
+fn a_conflict_marker_size_of_10_is_still_a_conflict() {
+    let r = Repo::new("marker-size");
+    r.add_base(&[(".gitattributes", b"*.txt conflict-marker-size=10\n"), ("t.txt", b"a\nb\nc\n")]);
+    r.course_commit(&[("t.txt", b"a\nb course\nc\n")], r.now - 5 * DAY);
+    r.my_commit(&[("t.txt", b"a\nb mine\nc\n")], r.now - 10 * DAY);
+    r.pull_conflicted();
+    assert!(r.text("t.txt").contains("<<<<<<<<<< HEAD\n"), "{}", r.text("t.txt"));
+    r.age(4 * HOUR);
+    let (code, rep, said) = r.resolve(3, &r.look());
+    assert_eq!(code, Some(0), "{said}");
+    assert!(rep.hand.is_empty(), "not resolved by hand: {said}");
+    assert_eq!(taken(&rep), [("t.txt".to_string(), "theirs".to_string(), Taken::Hunks)]);
+    assert_eq!(r.committed("t.txt"), "a\nb course\nc");
+}
+
+/// Conflict markers already staged (review ai-review claude #9): the participant `git add`ed a file
+/// with its markers still in it — nothing unmerged is left, but the merge isn't resolved: left
+/// BUSY, said. A marker-like line the course's own file has (merged in as it is) is no marker.
+#[cfg(unix)]
+#[test]
+fn markers_already_staged_are_never_committed() {
+    let r = Repo::new("staged");
+    r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+    r.git(&r.work, &["add", "README.md"]);
+    r.age(4 * HOUR);
+    let conflicts = r.unmerged();
+    let (code, rep, said) = r.resolve(3, &r.look());
+    assert_eq!(
+        (code, rep.refused.as_deref()),
+        (Some(RESOLVE_REFUSED_EXIT), Some("conflict markers were added in README.md (staged with them still in it): resolve it, or abort, on the pod")),
+        "{said}"
+    );
+    r.untouched(&conflicts, "staged");
+
+    // The course's doc about conflicts, merged in cleanly beside a real conflict: finished.
+    let r = Repo::new("staged-doc");
+    let doc = b"How a conflict looks:\n<<<<<<< HEAD\nyours\n=======\ntheirs\n>>>>>>> branch\n";
+    r.course_commit(&[("conflicts.md", doc)], r.now - 6 * DAY);
+    r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+    r.age(4 * HOUR);
+    let (code, rep, said) = r.resolve(3, &r.look());
+    assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{said}");
+    assert_eq!(format!("{}\n", r.committed("conflicts.md")).as_bytes(), doc);
 }
 
 /// A repo linked onto the volume (review ai-review claude #6): the look gives the checkout's top as

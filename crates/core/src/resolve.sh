@@ -1,26 +1,46 @@
 # arena resolve: finish an operation left in progress in one pod's checkout once nothing in it has
 # changed for a while — what `pods backup` runs on a pod whose backup said BUSY, after copying it.
 #
-#   sh -c "$THIS_SCRIPT" arena-resolve <repo> <quiet secs> <op> <print> <hours> <copy>
+#   sh -c "$THIS_SCRIPT" arena-resolve <repo> <quiet secs> <op> <print> <hours> <copy> <max file bytes>
 #
 # Rendered and parsed by arena_core::resolve (resolve_command / parse_resolve). <op> (`OP`'s
 # `<what> <mtime> <commit>`) and <print> (`PRINT`) are what the look before the copy saw: the
-# checkout is looked at again first, and anything changed since — or younger than <quiet secs>,
-# anyone at work in git there, or unusual — and nothing is touched. Then each conflicted path is kept as the participant
-# resolved it by hand (a regular text file with no conflict markers left, both sides there),
-# else taken from the side whose commit is newer (committer time; a tie keeps HEAD's) — removed
-# when that side deleted it; the operation is finished (a merge: a merge commit; a cherry-pick or
-# revert: `--continue`; a `git stash pop`'s conflicts: added, the stash entry kept), in the
-# repo's own identity. The conflicted paths' files as they were are kept first in
-# <git dir>/arena-resolved/<UTC stamp>/files/. <hours> and <copy> (where the backup copy is)
-# are for the words. Prints, on stdout:
+# checkout is looked at again first, and if anything changed since — or anything in it is younger
+# than <quiet secs>, or someone is at work in git there, or the state is unusual — nothing is
+# touched. Then each conflicted path is decided, nothing changed yet:
+#   - a regular text file with no conflict marker left (at the path's `conflict-marker-size`),
+#     both sides there: resolved by hand — kept as it is on disk;
+#   - one whose markers are still there but which isn't what the merge left (`as_left`): being
+#     resolved by hand — the whole operation is left alone, and said;
+#   - else the side whose last change to that path is the more recent (`git log -1 --format=%ct
+#     <side> -- <path>`, HEAD's against the operation's other side; a tie keeps HEAD's) — for a
+#     text file per hunk: `git merge-file --ours|--theirs` keeps the clean hunks of both sides and
+#     takes that side of each conflict; for a binary file, a symlink or a modify/delete, the whole
+#     side, removed when that side deleted it.
+# A file over <max file bytes> (the backup's git limit) anywhere in that is never committed: left
+# alone, said. The state before is kept first in <git dir>/arena-resolved/<UTC stamp>/ (the
+# conflicted files as they were, git's own state files, the old HEAD, the index, a README), then
+# the state is read again — the operation and its commit, HEAD, the conflicts, the index, every
+# file — and if any of it changed, nothing is touched. Then the paths are staged, each staged
+# file's keys redacted in the index as the backup redacts them (the file on disk keeps its keys),
+# and — HEAD and the operation checked once more, and no conflict marker staged — the operation is
+# finished: a merge, a merge commit; a cherry-pick, `--continue`; a `git stash pop`'s conflicts,
+# added (the stash entry kept) — in the repo's own identity. A revert is never finished: its other
+# side is the commit it undoes, always older, so "the newer side" would undo nothing. <hours> and
+# <copy> (today's copy, on the backup machine) are for the words. Prints, on stdout:
 #   REFUSED <why>            nothing touched (exit 7)
-#   SAVED <dir>              where the conflicted paths' files were kept as they were
-#   NEWER <path>             taken from the newer side
-#   GONE <path>              removed: the newer side deleted it
+#   SAVED <dir>              where the state before was kept
+#   NEWER <side> <how> <HEAD's time> <the other side's time> <path>   taken from the newer side
+#                            (<side> ours|theirs; <how> hunks: that side of each conflict, the
+#                            clean hunks of both kept; file: the whole file); the times are each
+#                            side's last change to the path
+#   GONE <side> <HEAD's time> <the other side's time> <path>   removed: the newer side deleted it
 #   HAND <path>              kept as it is on disk (resolved by hand) and added
-#   RESOLVED <what> <ours|theirs> <HEAD's committer time> <the other side's>   finished (exit 0)
-#   FAILED <step>            a step failed midway (exit 8): SAVED has the files as they were
+#   REDACTED <n> <path>      staged with its n key(s) redacted; the file on disk keeps them
+#   RESOLVED <what>          finished (exit 0)
+#   FAILED <step>            a step failed midway (exit 8): SAVED has the state before
+# ARENA_TEST_HOOK_BEFORE_CHANGE and ARENA_TEST_HOOK_BEFORE_FINISH, commands run right before the
+# re-reads, are set by tests only.
 set -u
 REPO=$1
 SECS=$2
@@ -28,12 +48,20 @@ WANT_OP=$3
 WANT_PRINT=$4
 HOURS=$5
 COPY=$6
+MAX=$7
 cd "$REPO" || exit 2
 cd "$(git rev-parse --show-toplevel)" || exit 2
 TOP=$(pwd)
 G=$(git rev-parse --absolute-git-dir) || exit 2
+# Until the changes start, no git run here may write the participant's index (not even the stat
+# refresh a porcelain command does in passing): the re-read below compares it.
+export GIT_OPTIONAL_LOCKS=0
 # @ARENA_BUSY_OP_SH@
 # @ARENA_LOOK_SH@
+REVERT_WORDS=@ARENA_REVERT_WORDS@
+T="$G/arena-resolve.$$"
+trap 'rm -rf "$T".*' EXIT
+# @ARENA_REDACT_SH@
 refuse() { echo "REFUSED $*"; exit 7; }
 fail() { echo "FAILED $*"; exit 8; }
 LOOKED=$(arena_look)
@@ -43,8 +71,9 @@ val() { printf '%s\n' "$LOOKED" | sed -n "s/^$1 //p" | head -n 1; }
 set -- $(val OP)
 what=${1:-none}
 case $what in
-    merge | cherry-pick | revert | conflicts) ;;
+    merge | cherry-pick | conflicts) ;;
     none) refuse "changed: nothing is in progress any more" ;;
+    revert) refuse "$REVERT_WORDS" ;;
     am) refuse "a git am is in progress: never finished automatically" ;;
     sequence) refuse "a cherry-pick or revert sequence is in progress: never finished automatically" ;;
     *) refuse "a $what is in progress: never finished automatically" ;;
@@ -57,105 +86,279 @@ seq=$4
 [ "$(val PRINT)" = "$WANT_PRINT" ] || refuse "changed: files changed since the copy"
 [ "$seq" = 0 ] || refuse "a cherry-pick or revert sequence: never finished automatically"
 now=$(val NOW)
-set -- $(val NEWEST)
-newest=${1:-0}
-input=$(val INPUT)
-[ $((now - mt)) -ge "$SECS" ] || refuse "recent: the $what started less than ${HOURS}h ago"
-[ $((now - newest)) -ge "$SECS" ] || refuse "recent: a file changed less than ${HOURS}h ago"
-[ -z "$input" ] || [ $((now - input)) -ge "$SECS" ] || refuse "recent: a terminal login typed less than ${HOURS}h ago"
 # Old enough (or not there): at least <quiet secs> before the pod's clock, never in its future.
 old() { [ -z "$1" ] || { [ "$1" -le "$now" ] && [ $((now - $1)) -ge "$SECS" ]; }; }
+old "$mt" || refuse "recent: the $what started less than ${HOURS}h ago"
+set -- $(val NEWEST)
+old "${1:-0}" || refuse "recent: a file changed less than ${HOURS}h ago"
 old "$(val INDEX)" || refuse "recent: git's index changed less than ${HOURS}h ago (something was staged)"
 [ -z "$(val LOCKED)" ] || refuse "busy: git's index is locked (.git/index.lock): a git command is at work, or died holding it"
+old "$(val INPUT)" || refuse "recent: a terminal login typed less than ${HOURS}h ago"
 old "$(val TTY)" || refuse "recent: a terminal was used less than ${HOURS}h ago"
 set -- $(val PROC)
 [ $# -eq 0 ] || refuse "busy: a git command, or an editor one waits on, is running (pid $1: ${2:-?})"
 [ -n "$(git config user.name)" ] && [ -n "$(git config user.email)" ] || refuse "no git identity configured in the repo"
 
-# --- Which side is newer ---------------------------------------------------------------------
+# --- What is in progress, as it is now ------------------------------------------------------
 case $what in
     merge) other=MERGE_HEAD ;;
     cherry-pick) other=CHERRY_PICK_HEAD ;;
-    revert) other=REVERT_HEAD ;;
     *) other='the stash' ;;
 esac
 [ "$head" != - ] || refuse "conflicts with no stash entry they came from"
 if [ "$what" = merge ] && [ "$(wc -l < "$G/MERGE_HEAD")" -ne 1 ]; then refuse "a merge of several branches"; fi
-ours_t=$(git log -1 --no-show-signature --format=%ct HEAD 2>/dev/null) || refuse "no HEAD commit"
-theirs_t=$(git log -1 --no-show-signature --format=%ct "$head" 2>/dev/null) || refuse "$other's commit is missing"
-if [ "$theirs_t" -gt "$ours_t" ]; then win=theirs; s=3; else win=ours; s=2; fi
-
-# --- What to do with each conflicted path (nothing touched yet) ------------------------------
-T="$G/arena-resolve.$$"
-trap 'rm -f "$T".*' EXIT
-TAB=$(printf '\t')
+HEAD0=$(git rev-parse -q --verify HEAD) || refuse "no HEAD commit"
+ours_tip=$(git log -1 --no-show-signature --format=%ct HEAD 2>/dev/null) || refuse "no HEAD commit"
+theirs_tip=$(git log -1 --no-show-signature --format=%ct "$head" 2>/dev/null) || refuse "$other's commit is missing"
+INDEX0=$(stat -c '%y %s' -- "$G/index" 2>/dev/null) || refuse "git's index couldn't be read"
 git ls-files -u -z > "$T.u" || refuse "the conflicts couldn't be listed"
 [ "$(tr -d -c '\n' < "$T.u" | wc -c)" -eq 0 ] || refuse "a conflicted path has a newline in its name"
 if tr '\0' '\n' < "$T.u" | grep -q '^160000 '; then refuse "a submodule is in conflict"; fi
-# One line per path: its stages (e.g. 123, 13), stage 3's blob (- for none), the path.
+
+# The path's conflict-marker size: its `conflict-marker-size` attribute, else git's 7.
+msize() {
+    _m=$(git check-attr conflict-marker-size -- "$1" 2>/dev/null | sed -n 's/.*: conflict-marker-size: \([1-9][0-9]\{0,2\}\)$/\1/p')
+    echo "${_m:-7}"
+}
+# Whether file $1 has a conflict marker line of size $2 (`<` or `>` that many times, then a space
+# or the line's end) — `=======` alone is no marker: Markdown's setext headings use it.
+markers() { LC_ALL=C grep -aqE "^(<{$2}|>{$2})( |\$)" -- "$1"; }
+# The first path staged with conflict markers in it (`git add` of a file still in conflict): a
+# marker line (at the path's size) staged against HEAD that the other side's version doesn't have
+# either — a line like that the course itself has is no marker.
+staged_markers() {
+    git diff --cached --name-only -z HEAD -- > "$T.sn" || return 0
+    _min=$(git check-attr -z --stdin conflict-marker-size < "$T.sn" 2>/dev/null | tr '\0' '\n' \
+        | awk 'NR % 3 == 0 && $0 ~ /^[1-9][0-9]*$/ && $0 + 0 < m { m = $0 + 0 } END { print m }' m=7)
+    git diff --cached -U0 --no-color --no-ext-diff --no-textconv HEAD -- 2>/dev/null \
+        | LC_ALL=C grep -aqE "^\\+(<{$_min,}|>{$_min,})" || return 0
+    tr '\0' '\n' < "$T.sn" | while IFS= read -r _p; do
+        _n=$(msize "$_p")
+        _re="^\\+(<{$_n}|>{$_n})( |\$)"
+        git diff --cached -U0 --no-color --no-ext-diff --no-textconv HEAD -- ":(literal)$_p" | LC_ALL=C grep -aE "$_re" | LC_ALL=C sort -u > "$T.sm"
+        [ -s "$T.sm" ] || continue
+        git diff --cached -U0 --no-color --no-ext-diff --no-textconv "$head" -- ":(literal)$_p" | LC_ALL=C grep -aE "$_re" | LC_ALL=C sort -u > "$T.sm2"
+        if [ -n "$(LC_ALL=C comm -12 "$T.sm" "$T.sm2" | head -n 1)" ]; then printf '%s\n' "$_p"; break; fi
+    done
+}
+p=$(staged_markers)
+[ -z "$p" ] || refuse "conflict markers were added in $p (staged with them still in it): resolve it, or abort, on the pod"
+
+# --- Each conflicted path's way (nothing touched yet) ---------------------------------------
+TAB=$(printf '\t')
+# One line per path: its stages (e.g. 123, 23), each stage's mode and blob (- for none), the path.
 tr '\0' '\n' < "$T.u" | awk '
     { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " "); p = substr($0, i + 1)
       if (!(p in st)) { order[n++] = p; st[p] = "" }
-      st[p] = st[p] m[3]; if (m[3] == 3) b3[p] = m[2] }
-    END { for (k = 0; k < n; k++) { p = order[k]; printf "%s\t%s\t%s\n", st[p], (p in b3) ? b3[p] : "-", p } }' > "$T.p"
+      st[p] = st[p] m[3]; mode[p, m[3]] = m[1]; blob[p, m[3]] = m[2] }
+    END { for (k = 0; k < n; k++) { p = order[k]; printf "%s", st[p]
+            for (s = 1; s <= 3; s++) printf "\t%s\t%s", ((p, s) in mode) ? mode[p, s] : "-", ((p, s) in blob) ? blob[p, s] : "-"
+            printf "\t%s\n", p } }' > "$T.p"
+# git's binary test: a NUL in the first 8000 bytes (of a file, of a blob).
+binary_file() { [ "$(head -c 8000 -- "$1" | tr -d -c '\000' | wc -c)" -ne 0 ]; }
+binary_blob() { [ "$(git cat-file blob "$1" | head -c 8000 | tr -d -c '\000' | wc -c)" -ne 0 ]; }
+# Merged as text: not `-merge`/`merge=binary`, and no filter (an LFS pointer is no text to merge).
+text_attrs() {
+    _a=$(git check-attr merge filter -- "$1") || return 1
+    if printf '%s\n' "$_a" | grep -qE ': merge: (unset|binary)$'; then return 1; fi
+    printf '%s\n' "$_a" | grep -qE ': filter: (unspecified|unset)$'
+}
+# When side $1 last changed path $2: its last commit touching it. A side whose history has no such
+# path — a rename: its commits name the file otherwise, and following that is no cheap lookup —
+# counts from its own commit, $3 (the tip's time).
+changed() {
+    _c=$(git log -1 --no-show-signature --format=%ct "$1" -- ":(literal)$2" 2>/dev/null) || _c=
+    echo "${_c:-$3}"
+}
+# The stages' blobs ($1 base or -, $2 ours, $3 theirs) as files, for git merge-file: an add/add's
+# missing base is empty.
+stages() {
+    if [ "$1" = - ]; then : > "$T.s1"; else git cat-file blob "$1" > "$T.s1" || return 1; fi
+    git cat-file blob "$2" > "$T.s2" && git cat-file blob "$3" > "$T.s3"
+}
+# File $1 with the label text on its marker lines (size $2) left out.
+unlabelled() { LC_ALL=C sed -E "s/^(<{$2}|\\|{$2}|>{$2})( .*)?\$/\\1/" -- "$1"; }
+# as_left <path> <marker size> <base blob|-> <ours blob> <theirs blob>: whether a file still in
+# conflict is as the operation left it, markers and all (`same`), or was begun by hand (`begun`).
+# git's conflicted output is made again from the stages with `git merge-file`, given the labels on
+# the file's own `<<<<<<<`/`>>>>>>>` lines, the path's marker size, and `--diff3`/`--zdiff3` when
+# the file has base sections — the same bytes: as left. Different bytes get a second opinion:
+# `merge-file` joins conflicts that only lines without letters or digits separate, where the merge
+# itself (and `checkout --conflict`, which merges as it does) doesn't — so the merge is made again
+# that way too, into a scratch tree through a copy of the index (nothing of the participant's
+# written), its labels set aside. When there are no labels to read or a stage is binary, it can't
+# be made again: then a file changed more than 2 minutes after the operation started is `begun`.
+as_left() {
+    _p=$1 _n=$2
+    _l1=$(LC_ALL=C grep -a -m1 -E "^<{$_n} " -- "$_p" | cut -c"$((_n + 2))"-)
+    _l3=$(LC_ALL=C grep -a -m1 -E "^>{$_n} " -- "$_p" | cut -c"$((_n + 2))"-)
+    _l2=$(LC_ALL=C grep -a -m1 -E "^\\|{$_n} " -- "$_p" | cut -c"$((_n + 2))"-)
+    if LC_ALL=C grep -aqE "^\\|{$_n}( |\$)" -- "$_p"; then _styles='diff3 zdiff3'; else _styles=merge; fi
+    if [ -z "$_l1" ] || [ -z "$_l3" ] || binary_blob "$4" || binary_blob "$5" || { [ "$3" != - ] && binary_blob "$3"; }; then
+        if [ $(($(stat -c %Y -- "$_p") - mt)) -gt 120 ]; then echo begun; else echo same; fi
+        return 0
+    fi
+    for _s in $_styles; do
+        if [ "$_s" = merge ]; then _o=; else _o=--$_s; fi
+        git merge-file -p $_o --marker-size="$_n" -L "$_l1" -L "$_l2" -L "$_l3" "$T.s2" "$T.s1" "$T.s3" > "$T.g" 2>/dev/null
+        if [ $? -lt 128 ] && cmp -s "$T.g" "$_p"; then echo same; return 0; fi
+    done
+    unlabelled "$_p" "$_n" > "$T.n1"
+    for _s in $_styles; do
+        rm -rf "$T.wt" && mkdir "$T.wt" && cp "$G/index" "$T.idx" || break
+        if GIT_INDEX_FILE="$T.idx" git --work-tree="$T.wt" checkout --conflict="$_s" -- ":(literal)$_p" > /dev/null 2>&1 \
+            && unlabelled "$T.wt/$_p" "$_n" > "$T.n2" && cmp -s "$T.n1" "$T.n2"; then
+            echo same
+            return 0
+        fi
+    done
+    echo begun
+}
+i=0
 : > "$T.plan"
-while IFS="$TAB" read -r st b3 p; do
+while IFS="$TAB" read -r st m1 b1 m2 b2 m3 b3 p; do
+    i=$((i + 1))
     if [ -d "$p" ] && [ ! -L "$p" ]; then refuse "a directory is where $p is in conflict"; fi
     if [ "$what" = conflicts ]; then
         # The other side must be that stash entry's (`git stash pop` keeps it on a conflict).
         want=$(git rev-parse -q --verify "$head:$p" 2>/dev/null) || want=-
         [ "$want" = "$b3" ] || refuse "conflicts that aren't the newest stash entry's ($p)"
     fi
+    ot=$(changed HEAD "$p" "$ours_tip")
+    tt=$(changed "$head" "$p" "$theirs_tip")
+    if [ "$tt" -gt "$ot" ]; then side=theirs; s=3; wb=$b3; wm=$m3; else side=ours; s=2; wb=$b2; wm=$m2; fi
+    n=$(msize "$p")
     act=
-    case $st in
-        *2*3*)
-            # Resolved by hand: a regular text file (no NUL in its first 8000 bytes, as git judges;
-            # not merged as binary) with no conflict marker left. Both sides are there: a path one
-            # side deleted is left by git without markers, unresolved.
-            if [ -f "$p" ] && [ ! -L "$p" ] && [ "$(head -c 8000 -- "$p" | tr -d -c '\000' | wc -c)" -eq 0 ] \
-                && ! git check-attr merge -- "$p" | grep -qE ': merge: (unset|binary)$' \
-                && ! grep -qE -e '^(<<<<<<<|>>>>>>>)( |$)' -- "$p"; then
-                act=hand
+    # A regular text file on disk, both sides there: resolved by hand, or still in conflict.
+    if [ -f "$p" ] && [ ! -L "$p" ] && [ "$b2" != - ] && [ "$b3" != - ] && ! binary_file "$p" && text_attrs "$p"; then
+        if ! markers "$p" "$n"; then
+            act=hand
+        else
+            stages "$b1" "$b2" "$b3" || refuse "$p's sides couldn't be read"
+            if [ "$(as_left "$p" "$n" "$b1" "$b2" "$b3")" = begun ]; then
+                refuse "you started resolving $p by hand — finish it (and git add it) or abort, on the pod"
             fi
-            ;;
-    esac
+            # Per hunk when both sides (and the base) are regular text files.
+            case "$m1 $m2 $m3" in
+                *120000* | *160000*) ;;
+                *) if ! binary_blob "$b2" && ! binary_blob "$b3" && { [ "$b1" = - ] || ! binary_blob "$b1"; }; then act=hunks; fi ;;
+            esac
+        fi
+    fi
     if [ -z "$act" ]; then
         case $st in
-            *"$s"*) act=$win ;;
+            *"$s"*) act=file ;;
             *) act=gone ;;
         esac
     fi
-    printf '%s\t%s\n' "$act" "$p" >> "$T.plan"
+    case $act in
+        hunks)
+            git merge-file -p "--$side" --marker-size="$n" "$T.s2" "$T.s1" "$T.s3" > "$T.r$i" 2>/dev/null \
+                || refuse "$p couldn't be merged per hunk"
+            size=$(wc -c < "$T.r$i")
+            ;;
+        hand) size=$(stat -c %s -- "$p") ;;
+        file) size=$(git cat-file -s "$wb") ;;
+        *) size=0 ;;
+    esac
+    [ "$size" -le "$MAX" ] || refuse "$p would be $size bytes, over git's $MAX-byte limit: never committed — resolve it on the pod"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$act" "$side" "$ot" "$tt" "$i" "$wm" "$p" >> "$T.plan"
 done < "$T.p"
 
-# --- The files as they were, kept first ------------------------------------------------------
+# --- The words -------------------------------------------------------------------------------
+# A time as the words give it: UTC, to the minute (`2026-10-20 13:05Z`).
+day() { date -u -d "@$1" '+%Y-%m-%d %H:%MZ'; }
+# The operation's other side, as a participant reading `git log` knows it.
+case $what in
+    merge) them="the merged branch" ref=MERGE_HEAD ;;
+    cherry-pick) them="the picked commit" ref=CHERRY_PICK_HEAD ;;
+    *) them="the stash" ref='stash@{0}' ;;
+esac
+# Each path's way, one line each — which side won, and both sides' last change to it: what the
+# commit message, and the README of the state before, list.
+choices() {
+    while IFS="$TAB" read -r act side ot tt i wm p; do
+        dates="last changed: yours (HEAD) $(day "$ot"), $them ($ref) $(day "$tt")"
+        if [ "$side" = ours ]; then won="yours won"; its=your; else won="$them won"; its=its; fi
+        case $act in
+            hand) echo "- $p: kept as you resolved it by hand" ;;
+            hunks) echo "- $p: $won ($its side of each conflict; the other changes of both sides kept) — $dates" ;;
+            file) echo "- $p: $won ($its whole version) — $dates" ;;
+            gone) echo "- $p: $won (removed: deleted there) — $dates" ;;
+        esac
+    done < "$T.plan"
+}
+choices > "$T.words"
+RULE="each conflicted file from the side whose last change to it is the more recent (a tie keeps yours), a file you resolved by hand kept as it is"
+
+# --- The state before, kept first ------------------------------------------------------------
 S="$G/arena-resolved/$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "$G/arena-resolved" || refuse "the files as they were couldn't be kept"
+mkdir -p "$G/arena-resolved" || refuse "the state before couldn't be kept"
 if ! mkdir "$S" 2>/dev/null; then
     S="$S-$$"
-    mkdir "$S" || refuse "the files as they were couldn't be kept"
+    mkdir "$S" || refuse "the state before couldn't be kept"
 fi
-{
-    echo "arena finished a $what left in progress for ${HOURS}h+ (the backup copy: $COPY)"
-    echo "HEAD $(git rev-parse HEAD) ($ours_t)"
-    echo "$other $head ($theirs_t)"
-    echo "kept the newer side: $win"
-} > "$S/README"
-tr '\0' '\n' < "$T.u" > "$S/unmerged"
-mkdir "$S/files" || refuse "the files as they were couldn't be kept"
-if ! cut -f2- "$T.plan" | while IFS= read -r p; do
+unkept() {
+    rm -rf "$S"
+    rmdir "$G/arena-resolved" 2> /dev/null
+    refuse "$@"
+}
+for f in MERGE_HEAD MERGE_MSG MERGE_MODE CHERRY_PICK_HEAD ORIG_HEAD AUTO_MERGE; do
+    if [ -e "$G/$f" ]; then cp -p -- "$G/$f" "$S/$f" || unkept "the state before couldn't be kept"; fi
+done
+printf '%s\n' "$HEAD0" > "$S/HEAD" && cp -p -- "$G/index" "$S/index" && tr '\0' '\n' < "$T.u" > "$S/unmerged" \
+    && mkdir "$S/files" || unkept "the state before couldn't be kept"
+if ! cut -f7- "$T.plan" | while IFS= read -r p; do
     if [ -e "$p" ] || [ -L "$p" ]; then
         case $p in */*) mkdir -p "$S/files/${p%/*}" || exit 1 ;; esac
         cp -P -p -- "$p" "$S/files/$p" || exit 1
     fi
 done; then
-    rm -rf "$S"
-    refuse "the files as they were couldn't be kept"
+    unkept "the state before couldn't be kept"
 fi
+case $what in
+    merge) redo="git reset --hard $HEAD0 && git merge $head" ;;
+    cherry-pick) redo="git reset --hard $HEAD0 && git cherry-pick $head" ;;
+    *) redo="git reset --hard $HEAD0 && git stash apply $head" ;;
+esac
+{
+    echo "arena finished a $what left in progress for ${HOURS}h+ on $(date -u '+%Y-%m-%d %H:%M') UTC:"
+    echo "$RULE."
+    cat "$T.words"
+    echo
+    echo "The state before, here:"
+    echo "  files/      the conflicted files as they were on disk (markers and all)"
+    echo "  HEAD        the commit the $what was on: $HEAD0"
+    echo "  index       git's index as it was, the conflicts in it; unmerged lists them"
+    echo "  MERGE_HEAD, MERGE_MSG, CHERRY_PICK_HEAD, ORIG_HEAD …: git's own files as they were (those there were)"
+    echo "To see a file as it was: cat files/<path>"
+    echo "To do it again yourself (commit or copy anything newer first: this discards it): $redo"
+    echo "Today's copy on the backup machine: $COPY (a later copy that day replaces it)."
+} > "$S/README" || unkept "the state before couldn't be kept"
 echo "SAVED $S"
 
+# --- Nothing changed since? ------------------------------------------------------------------
+# The changes start here. Right before, the state the look saw is read again — the operation and
+# its commit, HEAD, the conflicts, the index, every file, no index lock, nobody at work in git —
+# and nothing is touched if any of it changed: the participant may have aborted the merge and
+# started a rebase meanwhile, and the plan made for the merge must never be applied to that.
+if [ -n "${ARENA_TEST_HOOK_BEFORE_CHANGE:-}" ]; then (sh -c "$ARENA_TEST_HOOK_BEFORE_CHANGE") > /dev/null 2>&1; fi
+again() {
+    _l=$(arena_look)
+    if [ "$(printf '%s\n' "$_l" | sed -n 's/^OP //p')" != "$what $mt $head $seq" ]; then echo "the $what isn't the one planned for any more"; return; fi
+    if [ "$(printf '%s\n' "$_l" | sed -n 's/^PRINT //p')" != "$WANT_PRINT" ]; then echo "files changed"; return; fi
+    if [ -n "$(printf '%s\n' "$_l" | sed -n 's/^PROC //p')" ]; then echo "a git command started"; return; fi
+    if [ "$(git rev-parse -q --verify HEAD)" != "$HEAD0" ]; then echo "HEAD moved"; return; fi
+    if [ -e "$G/index.lock" ]; then echo "git's index is locked"; return; fi
+    if [ "$(stat -c '%y %s' -- "$G/index" 2>/dev/null)" != "$INDEX0" ]; then echo "git's index changed"; return; fi
+    if ! git ls-files -u -z | cmp -s - "$T.u"; then echo "the conflicts changed"; return; fi
+}
+why=$(again)
+[ -z "$why" ] || unkept "changed: $why while the state before was kept"
+unset GIT_OPTIONAL_LOCKS
+
 # --- Resolve ---------------------------------------------------------------------------------
-while IFS="$TAB" read -r act p; do
+while IFS="$TAB" read -r act side ot tt i wm p; do
     case $act in
         hand)
             git add -- ":(literal)$p" || fail "git add $p"
@@ -163,33 +366,65 @@ while IFS="$TAB" read -r act p; do
             ;;
         gone)
             git rm -q -f -- ":(literal)$p" > /dev/null || fail "git rm $p"
-            echo "GONE $p"
+            echo "GONE $side $ot $tt $p"
             ;;
-        *)
-            git checkout "--$act" -- ":(literal)$p" || fail "git checkout --$act $p"
+        file)
+            git checkout "--$side" -- ":(literal)$p" || fail "git checkout --$side $p"
             git add -- ":(literal)$p" || fail "git add $p"
-            echo "NEWER $p"
+            echo "NEWER $side file $ot $tt $p"
+            ;;
+        hunks)
+            cat "$T.r$i" > "$p" || fail "writing $p"
+            # The winning side's mode (an executable bit either side may have changed).
+            if [ "$wm" = 100755 ]; then chmod a+x -- "$p"; else chmod a-x -- "$p"; fi || fail "chmod $p"
+            git add -- ":(literal)$p" || fail "git add $p"
+            echo "NEWER $side hunks $ot $tt $p"
             ;;
     esac
 done < "$T.plan"
 [ -z "$(git ls-files -u | head -n 1)" ] || fail "conflicts were left"
 
+# --- Keys, as the backup commits them --------------------------------------------------------
+# Every file staged above goes into the commit with the keys redact.sh knows redacted — in the
+# index only: the file on disk keeps them, so the participant's code still runs. A key the
+# participant pasted into a file they resolved by hand never enters a commit (the backup after
+# this would redact what it commits, but this commit is made first).
+cut -f7- "$T.plan" | while IFS= read -r p; do git ls-files -s -- ":(literal)$p"; done \
+    | awk '$1 == "100644" || $1 == "100755" { print $2 }' | sort -u > "$T.sb"
+(
+    set -e
+    while read -r b; do redact_blob "$b"; done < "$T.sb" > "$T.map"
+    redact_index "$T.map" > "$T.upd"
+) || fail "redacting keys in the resolved files"
+tr '\0' '\n' < "$T.upd" \
+    | awk 'NR == FNR { n[$2] = $3; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " "); print "REDACTED " n[m[2]] " " substr($0, i + 1) }' "$T.map" -
+p=$(staged_markers)
+[ -z "$p" ] || fail "conflict markers were added in $p"
+
 # --- Finish ----------------------------------------------------------------------------------
-day() { date -u -d "@$1" +%Y-%m-%d; }
-# The paths of the plan's lines whose action is one of $1 (a regexp), joined with ", ".
-paths() { awk -v a="^($1)\$" -F "$TAB" '$1 ~ a { printf "%s%s", (n++ ? ", " : ""), substr($0, index($0, "\t") + 1) } END { print "" }' "$T.plan"; }
-newer=$(paths 'ours|theirs|gone')
-hand=$(paths hand)
-words=
-if [ -n "$newer" ]; then words="kept the newer side (HEAD $(day "$ours_t") / $other $(day "$theirs_t")) for $newer"; fi
-if [ -n "$hand" ]; then words="${words:+$words; }kept your hand-resolved $hand"; fi
-words="${words:-nothing was left in conflict}; the state before is in the backup copy $COPY and on this machine in ${S#"$TOP"/}/"
+# Once more, right before the commit: still this operation, on this HEAD, and git's index free.
+if [ -n "${ARENA_TEST_HOOK_BEFORE_FINISH:-}" ]; then (sh -c "$ARENA_TEST_HOOK_BEFORE_FINISH") > /dev/null 2>&1; fi
+kept="the state before is in ${S#"$TOP"/}/"
+case $what in
+    merge | cherry-pick)
+        cur=$(busy_op "$G")
+        if [ "${cur%% *}" != "$what" ] || [ "$(git rev-parse -q --verify "$other" 2>/dev/null)" != "$head" ]; then
+            fail "changed before the commit: the $what isn't the one resolved any more — $kept"
+        fi
+        [ "$(git rev-parse -q --verify HEAD)" = "$HEAD0" ] || fail "changed before the commit: HEAD moved — $kept"
+        [ ! -e "$G/index.lock" ] || fail "changed before the commit: git's index is locked — $kept"
+        ;;
+esac
+where="The state before is in ${S#"$TOP"/}/ on this machine (its README says how to see it or do this again yourself); today's copy: $COPY."
 case $what in
     merge)
         {
             echo "arena: finished a merge left in progress for ${HOURS}h+"
             echo
-            echo "Nothing in this checkout changed for ${HOURS}h+ while a merge was in progress, so arena finished it: $words."
+            echo "Nothing in this checkout changed for ${HOURS}h+ while a merge was in progress, so arena finished it: $RULE."
+            cat "$T.words"
+            echo
+            echo "$where"
             if [ -s "$G/MERGE_MSG" ]; then
                 echo
                 grep -v '^#' "$G/MERGE_MSG"
@@ -197,20 +432,25 @@ case $what in
         } > "$T.msg"
         GIT_EDITOR=true git commit -q --no-edit --cleanup=strip -F "$T.msg" || fail "git commit"
         ;;
-    cherry-pick | revert)
-        printf '\narena: finished this %s, left in progress for %sh+ — %s.\n' "$what" "$HOURS" "$words" >> "$G/MERGE_MSG"
+    cherry-pick)
+        {
+            echo
+            echo "arena: finished this cherry-pick, left in progress for ${HOURS}h+: $RULE."
+            cat "$T.words"
+            echo
+            echo "$where"
+        } >> "$G/MERGE_MSG"
         if git diff --cached --quiet HEAD --; then
             # Nothing left to change (the newer side was HEAD's everywhere): `--continue` refuses an
             # empty commit, so the commit it would make, empty — git's own advice.
             GIT_EDITOR=true git commit -q --allow-empty --no-edit --cleanup=strip || fail "git commit --allow-empty"
         else
-            GIT_EDITOR=true git "$what" --continue > /dev/null || fail "git $what --continue"
+            GIT_EDITOR=true git cherry-pick --continue > /dev/null || fail "git cherry-pick --continue"
         fi
         ;;
 esac
 case $what in
     merge) [ ! -e "$G/MERGE_HEAD" ] ;;
     cherry-pick) [ ! -e "$G/CHERRY_PICK_HEAD" ] ;;
-    revert) [ ! -e "$G/REVERT_HEAD" ] ;;
 esac || fail "the $what is still in progress"
-echo "RESOLVED $what $win $ours_t $theirs_t"
+echo "RESOLVED $what"

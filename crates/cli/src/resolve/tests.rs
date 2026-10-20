@@ -1,7 +1,7 @@
 //! `pods backup` with a BUSY pod over a scripted `FakeRemote` and a stand-in rsync: the order
 //! (its backup, its look, its copy, its resolve, its backup again), its line, what keeps it from
-//! being finished (a copy that failed in any part, `BUSY_AUTO_RESOLVE_HOURS=0`, the resolve
-//! refusing or failing), part 2's pacing of its copies (unchanged: none; changed or an
+//! being finished (a copy that failed in any part, `BUSY_AUTO_RESOLVE_HOURS=0`, a revert, the
+//! resolve refusing or failing), part 2's pacing of its copies (unchanged: none; changed or an
 //! hour old: copied; the record missing, corrupt, or of a copy gone since: copied), and the run's
 //! failures once a pod is finished.
 
@@ -167,9 +167,15 @@ fn repo_in_place() -> FakeReply {
 
 fn resolved() -> FakeReply {
     FakeReply::stdout(&format!(
-        "SAVED {REPO}/.git/arena-resolved/20261019T140200Z\nNEWER README.md\nGONE old.py\nHAND notes.py\nRESOLVED merge theirs 1760000000 1760500000\n"
+        "SAVED {REPO}/.git/arena-resolved/20261019T140200Z\nNEWER theirs hunks 1760000000 1760500000 README.md\n\
+         GONE theirs 1760000000 1760500000 old.py\nHAND notes.py\nRESOLVED merge\n"
     ))
 }
+
+/// The words [`resolved`]'s line has for its paths.
+const RESOLVED_WAYS: &str = "README.md: MERGE_HEAD's side of each conflict, HEAD 2025-10-09 08:53Z / MERGE_HEAD 2025-10-15 03:46Z; \
+                             old.py: removed, as on MERGE_HEAD, HEAD 2025-10-09 08:53Z / MERGE_HEAD 2025-10-15 03:46Z; notes.py: \
+                             as resolved by hand";
 
 fn execs(fake: &FakeRemote, port: u16) -> Vec<(String, Option<Duration>)> {
     fake.calls_to(&host(port))
@@ -221,8 +227,8 @@ async fn a_merge_left_alone_is_backed_up_copied_finished_and_backed_up_again() {
         assert_eq!(copied.iter().filter(|p| *p == "devtest-bloom").count(), 3, "both tiers: {copied:?}");
         let said = crate::take_said();
         let line = format!(
-            "✓ devtest-bloom -> autocommit-b — finished a merge left for 3h+ (kept the newer side, MERGE_HEAD's, for 2 files and the \
-             hand-resolved version of 1; before: {root}/devtest-bloom, and {REPO}/.git/arena-resolved/20261019T140200Z on the pod)"
+            "✓ devtest-bloom -> autocommit-b — finished a merge left for 3h+ ({RESOLVED_WAYS}; before: \
+             {REPO}/.git/arena-resolved/20261019T140200Z/ on the pod; today's copy: {root}/devtest-bloom)"
         );
         assert!(said.contains(&line), "{said:#?}");
         assert_eq!(w.recorded(), None, "finished: its record forgotten");
@@ -368,7 +374,7 @@ async fn a_paced_pod_is_finished_from_its_recorded_copy() {
     assert!(calls[2].0.contains(" arena-resolve ") && calls[3] == backup("bloom"), "{calls:#?}");
     assert!(w.copied().is_empty(), "not copied again");
     let said = crate::take_said();
-    assert!(said.iter().any(|l| l.starts_with("✓ devtest-bloom -> autocommit-b — finished a merge left for 3h+ (") && l.contains(&format!("before: {}, and ", copy.to))), "{said:#?}");
+    assert!(said.iter().any(|l| l.starts_with("✓ devtest-bloom -> autocommit-b — finished a merge left for 3h+ (") && l.ends_with(&format!("; today's copy: {})", copy.to))), "{said:#?}");
     assert!(said.iter().any(|l| l.starts_with("✗ devtest-bloom: not backed up to git (") && l.ends_with("unchanged since")), "the paced line first: {said:#?}");
 }
 
@@ -458,6 +464,29 @@ async fn a_pod_that_failed_before_its_push_stays_a_failure_when_another_is_finis
         let said = crate::take_said();
         assert!(said.iter().any(|l| l.starts_with("✓ devtest-bloom -> autocommit-b — finished a merge")), "{case}: {said:#?}");
     }
+}
+
+/// A revert stays BUSY however quiet, and its line says arena won't finish one; it is copied and
+/// paced as any BUSY pod.
+#[tokio::test]
+async fn a_revert_is_never_finished_and_said() {
+    let w = World::new("revert");
+    let cfg = w.cfg("");
+    let fake = Arc::new(FakeRemote::new());
+    fake.script(&host(22001), [pushed("autocommit-a")]);
+    let n = now();
+    let revert = look_text(n, 4 * HOUR, "11-22").replace(&format!("OP merge {} {SHA} 0", n - 24 * HOUR), &format!("OP revert {} {SHA} 0", n - 24 * HOUR));
+    let busy_revert = FakeReply::exit(BACKUP_BUSY_EXIT, "").with_stdout("BRANCH autocommit-b\nBUSY autocommit-b revert unmerged\n");
+    fake.script(&host(22002), [busy_revert, FakeReply::stdout(&revert), repo_in_place(), resolved()]);
+    let _ = crate::take_said();
+    let err = handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &w.rsync_path()).await.unwrap_err();
+    assert_eq!(err.to_string(), "1 pod(s) failed to back up");
+    let calls = execs(&fake, 22002);
+    assert_eq!(calls.len(), 3, "its backup, look and copy — no resolve: {calls:#?}");
+    let said = crate::take_said();
+    let line = format!("⊘ devtest-bloom: not finished automatically — {}", core_resolve::REVERT_WORDS);
+    assert!(said.contains(&line), "{said:#?}");
+    assert!(w.recorded().is_some(), "copied and recorded, as any BUSY pod");
 }
 
 /// A repo linked onto the `/workspace` volume (review ai-review claude #6): the look's top is the

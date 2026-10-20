@@ -1,10 +1,13 @@
-//! An operation left in progress on a pod — a conflicted merge, cherry-pick or revert, or a `git
-//! stash pop`'s conflicts (`BUSY`: [`crate::backup::BUSY_OP_SH`]) — stops its git backup until the
+//! An operation left in progress on a pod — a conflicted merge or cherry-pick, or a `git stash
+//! pop`'s conflicts (`BUSY`: [`crate::backup::BUSY_OP_SH`]) — stops its git backup until the
 //! participant ends it. Most do; one left alone for a while (`BUSY_AUTO_RESOLVE_HOURS`, 3 h by
-//! default) is finished by `pods backup` by a plain rule — the side whose commit is newer, a file
-//! the participant resolved by hand kept as it is — once the pod has a copy taken after its last
-//! change, and backed up again in the same run (the human's call, 2026-10-19: "backup files + some
-//! automated heuristic … whatever changes are most recent … after like 3h of no activity").
+//! default) is finished by `pods backup` by a plain rule — per conflicted file, the side whose last
+//! change to it is the more recent, per hunk where the file is text (the clean changes of both
+//! sides kept); a file the participant resolved by hand kept as it is — once the pod has a copy
+//! taken after its last change, and backed up again in the same run (the human's call,
+//! 2026-10-19: "backup files + some automated heuristic … whatever changes are most recent … after
+//! like 3h of no activity"; applied per file and per hunk so that neither side's work is silently
+//! lost). A revert is never finished: its other side is the commit it undoes, always the older.
 //!
 //! Meanwhile such a pod is copied by rsync instead of its git backup, but not every 15-minute
 //! tick: only when nothing since the operation started is recorded, when its work tree changed
@@ -59,6 +62,12 @@ pub fn auto_resolve_words(hours: Option<u64>, set: bool) -> String {
 /// The lines of the scripts that [`look_script`] and [`resolve_script`] replace.
 const BUSY_OP_MARK: &str = "# @ARENA_BUSY_OP_SH@";
 const LOOK_SH_MARK: &str = "# @ARENA_LOOK_SH@";
+const REDACT_SH_MARK: &str = "# @ARENA_REDACT_SH@";
+const REVERT_WORDS_MARK: &str = "@ARENA_REVERT_WORDS@";
+
+/// Why a revert is never finished, as the resolve refuses it and a pod's line says it.
+pub const REVERT_WORDS: &str = "arena won't finish a revert (its other side is the commit it undoes, always older than HEAD, \
+     so the newer side would undo nothing) — end it on the pod: `git revert --continue` or `git revert --abort`";
 
 /// The look's shell function (`resolve_look.sh`): what is in progress, when anything in the
 /// checkout last changed and whether anyone is at work in it, read-only. Its header lists the
@@ -84,17 +93,29 @@ pub fn look_command(repo: &str) -> String {
     format!("sh -c {} arena-look {}", shell_word(&look_script()), shell_word(repo))
 }
 
-/// The resolve script (`resolve.sh`, its header documents it), the look rendered in.
+/// The resolve script (`resolve.sh`, its header documents it), the look, the redaction
+/// ([`crate::backup::redact_sh`], as the backup commits) and [`REVERT_WORDS`] rendered in.
 pub fn resolve_script() -> String {
-    include_str!("resolve.sh").replacen(BUSY_OP_MARK, crate::backup::BUSY_OP_SH, 1).replacen(LOOK_SH_MARK, look_sh().trim_end(), 1)
+    include_str!("resolve.sh")
+        .replacen(BUSY_OP_MARK, crate::backup::BUSY_OP_SH, 1)
+        .replacen(LOOK_SH_MARK, look_sh().trim_end(), 1)
+        .replacen(REDACT_SH_MARK, crate::backup::redact_sh().trim_end(), 1)
+        .replacen(REVERT_WORDS_MARK, &shell_word(REVERT_WORDS), 1)
+}
+
+/// The resolve of one pod: [`resolve_command_limited`] with the backup's own size limit
+/// ([`crate::backup::GIT_MAX_FILE_BYTES`]): a resolved file over it is never committed.
+pub fn resolve_command(repo: &str, hours: u64, op: &str, print: &str, copy: &str) -> String {
+    resolve_command_limited(repo, hours, op, print, copy, crate::backup::GIT_MAX_FILE_BYTES)
 }
 
 /// The resolve of one pod: [`resolve_script`] with the repo, the quiet period (`hours`), the
 /// operation and the files as the look before the copy saw them ([`Look::op_key`],
-/// [`Look::print`]), and the copy's name for the commit's words (`copy`: `w2d1/devtest-alice`).
-pub fn resolve_command(repo: &str, hours: u64, op: &str, print: &str, copy: &str) -> String {
+/// [`Look::print`]), the copy's name for the commit's words (`copy`: `w2d1/devtest-alice`), and
+/// the largest file it may commit (`max_bytes`; tests pass a small one).
+pub fn resolve_command_limited(repo: &str, hours: u64, op: &str, print: &str, copy: &str, max_bytes: u64) -> String {
     format!(
-        "sh -c {} arena-resolve {} {} {} {} {hours} {}",
+        "sh -c {} arena-resolve {} {} {} {} {hours} {} {max_bytes}",
         shell_word(&resolve_script()),
         shell_word(repo),
         hours * 3600,
@@ -203,10 +224,10 @@ pub fn parse_look(stdout: &str) -> Option<Look> {
 }
 
 /// The operations this finishes ([`BUSY_OP_SH`](crate::backup::BUSY_OP_SH)'s words): a merge, a
-/// single cherry-pick or revert, a `git stash pop`'s conflicts. Never `git am`, a rebase or a
-/// sequence: what they'd go on to do is the participant's.
+/// single cherry-pick, a `git stash pop`'s conflicts. Never `git am`, a rebase or a sequence: what
+/// they'd go on to do is the participant's. Never a revert ([`REVERT_WORDS`]).
 pub fn finishes(what: &str) -> bool {
-    matches!(what, "merge" | "cherry-pick" | "revert" | "conflicts")
+    matches!(what, "merge" | "cherry-pick" | "conflicts")
 }
 
 /// Why a look says the pod isn't quiet for `hours` — all on the pod's clock: the operation
@@ -467,7 +488,7 @@ pub enum Hold {
     Off,
     /// The look failed.
     NoLook,
-    /// What is in progress is never finished here (am, rebase, a sequence, …).
+    /// What is in progress is never finished here (am, rebase, a sequence, a revert, …).
     Never(String),
     /// Not quiet long enough ([`not_quiet`]).
     Recent(String),
@@ -501,17 +522,40 @@ pub fn hold<'a>(hours: Option<u64>, look: Option<&Look>, copied: CopiedNow, last
     last.filter(|l| l.op == look.op_key() && l.print == look.print).ok_or(Hold::NoCopy)
 }
 
+/// How a conflicted path was taken from its newer side ([`Choice`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Taken {
+    /// That side of each conflict, the clean hunks of both kept (`git merge-file`).
+    Hunks,
+    /// The whole file (a binary file, a symlink, a modify/delete).
+    File,
+    /// Removed: that side deleted it.
+    Gone,
+}
+
+/// One conflicted path taken from its newer side: which side (`ours`: HEAD's; `theirs`), how, and
+/// each side's last change to it (`ours`, `theirs`: committer times).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub path: String,
+    pub side: String,
+    pub taken: Taken,
+    pub ours: u64,
+    pub theirs: u64,
+}
+
 /// What a resolve said ([`parse_resolve`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolveReport {
-    /// `(what, newer side, HEAD's committer time, the other side's)` once finished.
-    pub resolved: Option<(String, String, u64, u64)>,
-    /// Paths taken from the newer side (`gone` among them: removed, that side deleted them).
-    pub newer: Vec<String>,
-    pub gone: Vec<String>,
+    /// What it finished (`merge`, `cherry-pick`, `conflicts`), once finished.
+    pub resolved: Option<String>,
+    /// The paths taken from their newer side, removed ones among them.
+    pub newer: Vec<Choice>,
     /// Paths kept as the participant resolved them.
     pub hand: Vec<String>,
-    /// Where the files were kept as they were (the pod's git dir).
+    /// Paths staged with keys redacted (the file on disk keeps them).
+    pub redacted: Vec<String>,
+    /// Where the state before was kept (the pod's git dir).
     pub saved: Option<String>,
     /// Why it touched nothing.
     pub refused: Option<String>,
@@ -520,41 +564,52 @@ pub struct ResolveReport {
 }
 
 /// Parse a resolve's stdout (`resolve.sh`'s header lists the lines). Unknown lines (git's own)
-/// are ignored.
+/// are ignored, and so is a NEWER or GONE line it can't read.
 pub fn parse_resolve(stdout: &str) -> ResolveReport {
     let mut r = ResolveReport::default();
+    let choice = |side: &str, taken: Taken, ours: &str, theirs: &str, path: &str| -> Option<Choice> {
+        if !matches!(side, "ours" | "theirs") || path.is_empty() {
+            return None;
+        }
+        Some(Choice { path: path.to_string(), side: side.to_string(), taken, ours: ours.parse().ok()?, theirs: theirs.parse().ok()? })
+    };
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
         let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
         match word {
-            "NEWER" if !rest.is_empty() => r.newer.push(rest.to_string()),
-            "GONE" if !rest.is_empty() => {
-                r.newer.push(rest.to_string());
-                r.gone.push(rest.to_string());
+            "NEWER" => {
+                let f: Vec<&str> = rest.splitn(5, ' ').collect();
+                if let [side, how, ours, theirs, path] = f[..] {
+                    let taken = match how {
+                        "hunks" => Some(Taken::Hunks),
+                        "file" => Some(Taken::File),
+                        _ => None,
+                    };
+                    r.newer.extend(taken.and_then(|t| choice(side, t, ours, theirs, path)));
+                }
+            }
+            "GONE" => {
+                if let [side, ours, theirs, path] = rest.splitn(4, ' ').collect::<Vec<_>>()[..] {
+                    r.newer.extend(choice(side, Taken::Gone, ours, theirs, path));
+                }
             }
             "HAND" if !rest.is_empty() => r.hand.push(rest.to_string()),
+            "REDACTED" => {
+                if let Some((_, path)) = rest.split_once(' ').filter(|(_, p)| !p.is_empty()) {
+                    r.redacted.push(path.to_string());
+                }
+            }
             "SAVED" if !rest.is_empty() => r.saved = Some(rest.to_string()),
             "REFUSED" => r.refused = Some(rest.trim().to_string()),
             "FAILED" => r.failed = Some(rest.trim().to_string()),
-            "RESOLVED" => {
-                if let [what, side, ours, theirs] = rest.split_whitespace().collect::<Vec<_>>()[..] {
-                    if let (Ok(o), Ok(t)) = (ours.parse(), theirs.parse()) {
-                        r.resolved = Some((what.to_string(), side.to_string(), o, t));
-                    }
-                }
-            }
+            "RESOLVED" if !rest.trim().is_empty() => r.resolved = Some(rest.trim().to_string()),
             _ => {}
         }
     }
     r
 }
 
-/// `1 file`, `2 files`.
-fn files(n: usize) -> String {
-    format!("{n} file{}", if n == 1 { "" } else { "s" })
-}
-
-/// The side an operation brings in, as the resolve's words name it: `MERGE_HEAD`, …, `the stash`.
+/// The side an operation brings in, as the words name it: `MERGE_HEAD`, …, `the stash`.
 fn other_side(what: &str) -> &'static str {
     match what {
         "merge" => "MERGE_HEAD",
@@ -564,28 +619,44 @@ fn other_side(what: &str) -> &'static str {
     }
 }
 
-/// What a finished resolve did, for the pod's line (`hours`: the quiet period; `before`: the copy
-/// that holds the state before): `finished a merge left for 3h+ (kept the newer side, HEAD's, for 2
-/// files and the hand-resolved version of 1; before: /b/w2d1/devtest-alice, and
-/// /root/ARENA_materials/.git/arena-resolved/20261019T140200Z on the pod)`. For a `git stash
-/// pop`'s conflicts, that its stash entry is kept. Pure.
-pub fn resolved_note(r: &ResolveReport, hours: u64, before: &str) -> String {
-    let (what, side) = r.resolved.as_ref().map_or(("merge", "ours"), |(w, s, ..)| (w.as_str(), s.as_str()));
+/// A time as the words give it: UTC, to the minute (`2026-10-20 13:05Z`).
+pub fn minute_words(t: u64) -> String {
+    format!("{} {:02}:{:02}Z", crate::schedule::ymd_string((t / 86_400) as i64), t % 86_400 / 3600, t % 3600 / 60)
+}
+
+/// What a finished resolve did, for the pod's line (`hours`: the quiet period; `copy`: today's
+/// copy, on this machine) — each path's way with both sides' last change to it, then where the
+/// state before is: first the folder on the pod that no later copy overwrites, then today's copy
+/// (which a later copy that day updates): `finished a merge left for 3h+ (README.md:
+/// MERGE_HEAD's side of each conflict, HEAD 2026-10-09 12:00Z / MERGE_HEAD 2026-10-14 08:30Z;
+/// notes.py: as resolved by hand; before: /root/ARENA_materials/.git/arena-resolved/20261019T140200Z/
+/// on the pod; today's copy: /b/w2d1/devtest-alice)`. For a `git stash pop`'s conflicts, that its
+/// stash entry is kept; keys redacted in the commit, named. Pure.
+pub fn resolved_note(r: &ResolveReport, hours: u64, copy: &str) -> String {
+    let what = r.resolved.as_deref().unwrap_or("merge");
     let done = match what {
         "conflicts" => format!("resolved the conflicts a `git stash pop` left for {hours}h+ (its stash entry kept)"),
         w => format!("finished a {w} left for {hours}h+"),
     };
-    let mut kept = Vec::new();
-    if !r.newer.is_empty() {
-        let newer = if side == "ours" { "HEAD's".to_string() } else { format!("{}'s", other_side(what)) };
-        kept.push(format!("kept the newer side, {newer}, for {}", files(r.newer.len())));
-    }
-    if !r.hand.is_empty() {
-        kept.push(format!("the hand-resolved version of {}", r.hand.len()));
-    }
-    let kept = if kept.is_empty() { "nothing was left in conflict".to_string() } else { kept.join(" and ") };
-    let saved = r.saved.as_ref().map_or_else(String::new, |s| format!(", and {s} on the pod"));
-    format!("{done} ({kept}; before: {before}{saved})")
+    let other = other_side(what);
+    let mut ways: Vec<String> = r
+        .newer
+        .iter()
+        .map(|c| {
+            let side = if c.side == "ours" { "HEAD" } else { other };
+            let way = match c.taken {
+                Taken::Hunks => format!("{side}'s side of each conflict"),
+                Taken::File => format!("{side}'s version"),
+                Taken::Gone => format!("removed, as on {side}"),
+            };
+            format!("{}: {way}, HEAD {} / {other} {}", c.path, minute_words(c.ours), minute_words(c.theirs))
+        })
+        .collect();
+    ways.extend(r.hand.iter().map(|p| format!("{p}: as resolved by hand")));
+    let ways = if ways.is_empty() { "nothing was left in conflict".to_string() } else { ways.join("; ") };
+    let keys = if r.redacted.is_empty() { String::new() } else { format!("; keys redacted in the commit (kept on disk): {}", r.redacted.join(", ")) };
+    let before = r.saved.as_ref().map_or_else(String::new, |s| format!("before: {}/ on the pod; ", s.trim_end_matches('/')));
+    format!("{done} ({ways}{keys}; {before}today's copy: {copy})")
 }
 
 #[cfg(test)]

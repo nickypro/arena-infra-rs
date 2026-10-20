@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use arena_core::backup::{self, parse_backup_report};
 use arena_core::remote::{describe_error, Remote};
-use arena_core::resolve::{self as core_resolve, BusyCopies, BusyCopy, CopiedNow, CopyWhy, Look};
+use arena_core::resolve::{self as core_resolve, BusyCopies, BusyCopy, CopiedNow, CopyWhy, Hold, Look};
 use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
@@ -144,7 +144,7 @@ impl Busy {
     /// then finish each BUSY pod [`core_resolve::hold`] lets through, on a recorded copy that is
     /// still there — under its lock, the resolve and then its backup again (`message`: the
     /// backup's commit message, `pods backup -m`), its record forgotten once finished — and say
-    /// what became of each.
+    /// what became of each (a revert: that arena won't finish it).
     pub(crate) async fn settle(self, remote: &Arc<dyn Remote>, cfg: &Config, pulled: &anyhow::Result<Pulled>, all: bool, message: Option<&str>) -> Settled {
         let mut out = Settled::default();
         let Busy { hours, record, mut copies, pods, dir, now } = self;
@@ -190,8 +190,12 @@ impl Busy {
                 }
             }
             let last = copies.pods.get(&pod.name).filter(|l| core_resolve::copy_still_there(l, &dir));
-            if let Ok(last) = core_resolve::hold(hours, pod.look.as_ref(), copied, last) {
-                candidates.push((pod.name.clone(), pod.target.clone(), pod.look.clone(), last.clone()));
+            match core_resolve::hold(hours, pod.look.as_ref(), copied, last) {
+                Ok(last) => candidates.push((pod.name.clone(), pod.target.clone(), pod.look.clone(), last.clone())),
+                Err(Hold::Never(what)) if what == "revert" => {
+                    out.lines.push(format!("⊘ {}: not finished automatically — {}", pod.name, core_resolve::REVERT_WORDS));
+                }
+                Err(_) => {}
             }
         }
         save(record.clone(), changes, now).await;
