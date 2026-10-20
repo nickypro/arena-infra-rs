@@ -3,16 +3,25 @@
 //!
 //! Why no tools: this runs on the fleet's control box, next to the config and the keys, and the
 //! bundle holds text participants control (process arguments, file names, commit subjects, job
-//! logs) — a prompt injection must have nothing to act with. So claude runs exactly as
+//! logs) — a prompt injection must have nothing to act with. So claude runs as
 //! `scripts/ai-review` runs it (`--tools ''` with `--safe-mode`, `--strict-mcp-config`, no slash
-//! commands, no saved session: verified there to list `tools: []`), and codex read-only,
-//! ephemeral, with web search and every tool feature its `features list` knows of turned off
-//! (codex's own sandbox can't run commands on this machine anyway). Everything the model sees is
-//! in the prompt.
+//! commands, no saved session: verified there to list `tools: []`), plus an explicitly empty
+//! `--mcp-config`; and codex read-only, ephemeral, without the operator's `config.toml` (its MCP
+//! servers, hooks, profiles) and with `mcp_servers` emptied, web search off and every tool
+//! feature in [`CODEX_TOOL_FEATURES`] disabled. Everything the model sees is in the prompt.
+//!
+//! **Fail closed.** Neither is sent anything until the CLI itself has confirmed it knows every
+//! switch that takes its tools away — claude's `--help` lists each of [`CLAUDE_NO_TOOL_FLAGS`],
+//! codex's `features list` names each of [`CODEX_TOOL_FEATURES`] ([`confirm_tools_off`]). A
+//! check that fails, times out or finds one missing refuses the ask: a codex that doesn't know a
+//! feature can't be told to turn it off, and one run without those switches could read files on
+//! this machine through its shell. Both get an empty working directory and a minimal environment
+//! ([`child_env`]: not the operator's provider keys).
 //!
 //! The binaries are looked up on `PATH`, then in `~/.local/bin` (where both install), as
 //! `ai-review` does; a missing one is an error that names the other option. The pure parts —
-//! the argv, the config value, the lookup — are separate from the one spawn.
+//! the argv, the checks, the environment, the config value, the lookup — are separate from the
+//! spawns.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -120,9 +129,17 @@ pub fn choose(cfg: &Config, flag: Option<Ai>) -> Result<Ai, String> {
     }
 }
 
+/// claude's MCP configuration for a run: no servers ([`claude_args`]'s `--mcp-config`).
+pub const CLAUDE_NO_MCP: &str = r#"{"mcpServers":{}}"#;
+
+/// The flags [`claude_args`] takes claude's tools away with — each must be in its `--help`
+/// before it is asked anything ([`confirm_tools_off`]).
+pub const CLAUDE_NO_TOOL_FLAGS: &[&str] = &["--tools", "--safe-mode", "--strict-mcp-config", "--mcp-config", "--disable-slash-commands", "--no-session-persistence"];
+
 /// claude's argv: print mode, no tools of any kind (`--tools ''`, and `--safe-mode`: no hooks,
-/// MCP servers, CLAUDE.md or skills; `--strict-mcp-config`: no MCP servers from anywhere), no
-/// slash commands, no saved session, plain text out. The flags `scripts/ai-review` runs it with.
+/// MCP servers, CLAUDE.md or skills; `--strict-mcp-config` with an empty `--mcp-config`: no MCP
+/// servers from anywhere), no slash commands, no saved session, plain text out. The flags
+/// `scripts/ai-review` runs it with, plus the explicit empty MCP config.
 pub fn claude_args(model: Option<&str>) -> Vec<String> {
     let mut a: Vec<String> = [
         "-p",
@@ -130,6 +147,8 @@ pub fn claude_args(model: Option<&str>) -> Vec<String> {
         "--tools",
         "",
         "--strict-mcp-config",
+        "--mcp-config",
+        CLAUDE_NO_MCP,
         "--disable-slash-commands",
         "--no-session-persistence",
         "--output-format",
@@ -143,8 +162,11 @@ pub fn claude_args(model: Option<&str>) -> Vec<String> {
     a
 }
 
-/// codex features that give it a tool, each turned off when its `features list` names it (an
-/// unknown name is an error to codex) — `scripts/ai-review`'s list.
+/// codex features that give it a tool, every one turned off — `scripts/ai-review`'s list, plus
+/// `view_image` (it reads an image file anywhere on this machine). Its `features list` must name
+/// each before it is asked anything ([`confirm_tools_off`]): a feature it doesn't know can't be
+/// disabled (`--disable` of an unknown name is an error), and one it has under another name
+/// would stay on.
 pub const CODEX_TOOL_FEATURES: &[&str] = &[
     "shell_tool",
     "unified_exec",
@@ -159,21 +181,24 @@ pub const CODEX_TOOL_FEATURES: &[&str] = &[
     "multi_agent",
     "image_generation",
     "hooks",
+    "view_image",
 ];
 
 /// codex's argv: `exec` read-only and ephemeral, in `workdir` (an empty directory), its answer
-/// written to `out`, web search off, every tool feature in [`CODEX_TOOL_FEATURES`] that `known`
-/// (its `features list`) has turned off, the prompt on stdin (`-`).
-pub fn codex_args(known: &[String], workdir: &Path, out: &Path, model: Option<&str>) -> Vec<String> {
-    let mut a: Vec<String> = ["exec", "-s", "read-only", "--skip-git-repo-check", "--ephemeral", "--color", "never", "-C"]
-        .map(String::from)
-        .to_vec();
+/// written to `out`; without the operator's `config.toml` (`--ignore-user-config`: its MCP
+/// servers, hooks, profiles, notify program) or execpolicy rules, and `mcp_servers` emptied
+/// besides (a system or managed config layer is still read); web search off, every tool feature
+/// in [`CODEX_TOOL_FEATURES`] disabled — always all of them: [`ask`] runs it only once its
+/// `features list` has named each — and the prompt on stdin (`-`).
+pub fn codex_args(workdir: &Path, out: &Path, model: Option<&str>) -> Vec<String> {
+    let mut a: Vec<String> =
+        ["exec", "-s", "read-only", "--skip-git-repo-check", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--color", "never", "-C"]
+            .map(String::from)
+            .to_vec();
     a.push(workdir.display().to_string());
-    a.extend(["-o".to_string(), out.display().to_string(), "-c".to_string(), "web_search=\"disabled\"".to_string()]);
+    a.extend(["-o", &out.display().to_string(), "-c", "web_search=\"disabled\"", "-c", "mcp_servers={}"].map(String::from));
     for f in CODEX_TOOL_FEATURES {
-        if known.iter().any(|k| k == f) {
-            a.extend(["--disable".to_string(), f.to_string()]);
-        }
+        a.extend(["--disable".to_string(), f.to_string()]);
     }
     if let Some(m) = model {
         a.extend(["-m".to_string(), m.to_string()]);
@@ -187,21 +212,110 @@ pub fn parse_features(stdout: &str) -> Vec<String> {
     stdout.lines().filter_map(|l| l.split_whitespace().next()).map(String::from).collect()
 }
 
-/// Where the AI's binary is looked for, and where its scratch directory goes.
+/// How `ai` describes itself before it is asked anything: `claude --help`, `codex features list`.
+pub fn discovery_args(ai: Ai) -> Vec<String> {
+    match ai {
+        Ai::Claude => vec!["--help".to_string()],
+        Ai::Codex => vec!["features".to_string(), "list".to_string()],
+    }
+}
+
+/// Whether `ai`'s self-description ([`discovery_args`]'s output) shows it knows every switch
+/// its argv takes its tools away with: claude's `--help` lists each of [`CLAUDE_NO_TOOL_FLAGS`]
+/// (as a word: `--tools,` or `--tools <tools...>`), codex's `features list` names each of
+/// [`CODEX_TOOL_FEATURES`]. `Err`: the ones it doesn't.
+pub fn confirm_tools_off(ai: Ai, described: &str) -> Result<(), Vec<&'static str>> {
+    let missing: Vec<&'static str> = match ai {
+        Ai::Claude => {
+            let words: Vec<&str> = described.split(|c: char| c.is_whitespace() || c == ',').collect();
+            CLAUDE_NO_TOOL_FLAGS.iter().copied().filter(|f| !words.contains(f)).collect()
+        }
+        Ai::Codex => {
+            let known = parse_features(described);
+            CODEX_TOOL_FEATURES.iter().copied().filter(|f| !known.iter().any(|k| k == f)).collect()
+        }
+    };
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing)
+    }
+}
+
+/// What every AI process may keep of this one's environment, besides `PATH` and `HOME` (which
+/// [`AiEnv`] carries): the locale, the temp dir, the XDG dirs, proxies and CA bundles. Nothing
+/// else — not the operator's provider keys, not a variable that could turn a tool back on.
+pub const COMMON_VARS: &[&str] = &[
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "TZ",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+];
+
+/// What `ai`'s own process also keeps: where its login lives and its own vendor's API key.
+pub fn own_vars(ai: Ai) -> &'static [&'static str] {
+    match ai {
+        Ai::Claude => &["CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY"],
+        Ai::Codex => &["CODEX_HOME", "OPENAI_API_KEY", "CODEX_API_KEY"],
+    }
+}
+
+/// `ai`'s whole environment: `PATH` and `HOME` from `env`, then those of `env.vars` that
+/// [`COMMON_VARS`] or [`own_vars`] name.
+pub fn child_env(ai: Ai, env: &AiEnv) -> Vec<(OsString, OsString)> {
+    let mut v: Vec<(OsString, OsString)> = Vec::new();
+    v.extend(env.path.clone().map(|p| (OsString::from("PATH"), p)));
+    v.extend(env.home.clone().map(|h| (OsString::from("HOME"), h.into_os_string())));
+    let keep = |k: &str| COMMON_VARS.contains(&k) || own_vars(ai).contains(&k);
+    v.extend(env.vars.iter().filter(|(k, _)| keep(k)).map(|(k, val)| (OsString::from(k), val.clone())));
+    v
+}
+
+/// Where the AI's binary is looked for, where its scratch directory goes, and what of this
+/// process's environment its process gets ([`child_env`]).
 #[derive(Debug, Clone)]
 pub struct AiEnv {
     /// `PATH` (also the child's).
     pub path: Option<OsString>,
-    /// `HOME`, for `~/.local/bin`.
+    /// `HOME`, for `~/.local/bin` (also the child's: its login is under it).
     pub home: Option<PathBuf>,
     /// Where the empty working directory is made.
     pub tmp: PathBuf,
+    /// Variables the child may keep, from this process — only those [`child_env`] names pass.
+    pub vars: Vec<(String, OsString)>,
 }
 
 impl AiEnv {
-    /// This process's `PATH`, `HOME` and temp dir.
+    /// This process's `PATH`, `HOME`, temp dir, and the variables [`COMMON_VARS`] and either
+    /// AI's [`own_vars`] name.
     pub fn from_process() -> AiEnv {
-        AiEnv { path: std::env::var_os("PATH"), home: std::env::var_os("HOME").map(PathBuf::from), tmp: std::env::temp_dir() }
+        let names = COMMON_VARS.iter().chain(own_vars(Ai::Claude)).chain(own_vars(Ai::Codex));
+        AiEnv {
+            path: std::env::var_os("PATH"),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            tmp: std::env::temp_dir(),
+            vars: names.filter_map(|k| std::env::var_os(k).map(|v| (k.to_string(), v))).collect(),
+        }
     }
 }
 
@@ -269,8 +383,8 @@ impl Drop for Scratch {
     }
 }
 
-/// How long `codex features list` may take.
-const FEATURES_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long `claude --help` / `codex features list` may take (at most the ask's own budget).
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The last non-empty stderr line, made printable and short — what a failed run says.
 fn last_line(stderr: &str) -> String {
@@ -284,27 +398,41 @@ pub fn printable(answer: &str) -> String {
     answer.lines().map(|l| crate::jobs::sanitize(l).trim_end().to_string()).collect::<Vec<_>>().join("\n").trim().to_string()
 }
 
+/// Run `ai`'s self-description ([`discovery_args`]) and hold it to [`confirm_tools_off`]:
+/// `Ok` only when it ran, within `budget`, and named every switch. Otherwise why not, as the
+/// refusal `ask` returns — nothing has been sent.
+async fn check_tools_off(ai: Ai, bin: &Path, cwd: &Path, vars: &[(OsString, OsString)], budget: Duration) -> Result<(), String> {
+    let args = discovery_args(ai);
+    let cmd = format!("{} {}", ai.name(), args.join(" "));
+    let refuse = |why: String| format!("{}: couldn't confirm its tools are off — not asked ({why})", ai.name());
+    let run = LocalRun { program: bin, args: &args, cwd, env: vars, input: b"" };
+    match run_local_input(&run, &cmd, Some(budget)).await {
+        Ok(out) if out.success => confirm_tools_off(ai, &out.stdout).map_err(|missing| {
+            let what = if ai == Ai::Claude { "list" } else { "name" };
+            refuse(format!("`{cmd}` doesn't {what} {}", missing.join(", ")))
+        }),
+        Ok(out) => Err(refuse(format!("`{cmd}` failed ({}): {}", out.exit_label(), last_line(&out.stderr)))),
+        Err(crate::Error::Timeout { after, .. }) => Err(refuse(format!("`{cmd}` didn't answer within {}", crate::error::human_duration(&after)))),
+        Err(e) => Err(refuse(format!("`{cmd}`: {e}"))),
+    }
+}
+
 /// Ask `ai` `prompt` (on stdin) with `model` (or the CLI's own default), within `timeout`; the
-/// answer, made printable, or why there is none — a missing binary, a timeout (the AI is
-/// stopped: SIGTERM, then SIGKILL), a failed run, an empty answer.
+/// answer, made printable, or why there is none — a missing binary, a CLI that couldn't confirm
+/// its tools are off (it is then never sent the prompt), a timeout (the AI is stopped: SIGTERM,
+/// then SIGKILL), a failed run, an empty answer.
 pub async fn ask(ai: Ai, prompt: &str, model: Option<&str>, timeout: Duration, env: &AiEnv) -> Result<String, String> {
     let bin = find_bin(ai.name(), env).ok_or_else(|| missing(ai))?;
     let scratch = Scratch::new(&env.tmp).map_err(|e| format!("can't make a scratch directory in {}: {e}", env.tmp.display()))?;
     let empty = scratch.empty();
     let answer_file = scratch.0.join("answer.md");
+    let vars = child_env(ai, env);
+    check_tools_off(ai, &bin, &empty, &vars, timeout.min(DISCOVERY_TIMEOUT)).await?;
     let args = match ai {
         Ai::Claude => claude_args(model),
-        Ai::Codex => {
-            let list = ["features".to_string(), "list".to_string()];
-            let run = LocalRun { program: &bin, args: &list, cwd: &empty, path: env.path.as_deref(), input: b"" };
-            let known = match run_local_input(&run, "codex features list", Some(FEATURES_TIMEOUT)).await {
-                Ok(out) if out.success => parse_features(&out.stdout),
-                _ => Vec::new(),
-            };
-            codex_args(&known, &empty, &answer_file, model)
-        }
+        Ai::Codex => codex_args(&empty, &answer_file, model),
     };
-    let run = LocalRun { program: &bin, args: &args, cwd: &empty, path: env.path.as_deref(), input: prompt.as_bytes() };
+    let run = LocalRun { program: &bin, args: &args, cwd: &empty, env: &vars, input: prompt.as_bytes() };
     let out = match run_local_input(&run, ai.name(), Some(timeout)).await {
         Ok(out) => out,
         Err(crate::Error::Timeout { after, .. }) => {
@@ -344,9 +472,29 @@ pub mod fixtures {
         crate::remote::write_test_script(dir.join(name), format!("#!/bin/sh\n{body}\n")).unwrap();
     }
 
-    /// Stub `claude` and `codex` in `<tmp>/bin` that record their argv (one per line), stdin
-    /// and working directory under `<tmp>/rec/<name>.*` and answer `ANSWER from <name>` — codex
-    /// into its `-o` file, as the real one does; `codex features list` lists a few features.
+    /// What a stub `claude --help` prints: an option table listing every flag in
+    /// [`CLAUDE_NO_TOOL_FLAGS`] the way claude's own does (`--tools <tools...>`, an alias before
+    /// a comma), less `without`.
+    pub fn claude_help(without: &[&str]) -> String {
+        let mut h = String::from("Usage: claude [options] [command] [prompt]\n\nOptions:\n  --allowedTools, --allowed-tools <tools...>  allow\n");
+        for f in CLAUDE_NO_TOOL_FLAGS.iter().filter(|f| !without.contains(f)) {
+            h.push_str(&format!("  {f} <x>   what it does\n"));
+        }
+        h
+    }
+
+    /// What a stub `codex features list` prints: every feature in [`CODEX_TOOL_FEATURES`] and
+    /// a few others, as `name  stage  enabled` rows, less `without`.
+    pub fn codex_features(without: &[&str]) -> String {
+        let names = CODEX_TOOL_FEATURES.iter().chain(&["web_search_request", "goals", "zzz_new"]);
+        names.filter(|f| !without.contains(f)).map(|f| format!("{f:<40} stable             true\n")).collect()
+    }
+
+    /// Stub `claude` and `codex` in `<tmp>/bin` that record their argv (one per line), stdin,
+    /// working directory and environment under `<tmp>/rec/<name>.*` and answer `ANSWER from
+    /// <name>` — codex into its `-o` file, as the real one does. `claude --help` lists the no-tools
+    /// flags ([`claude_help`]) and `codex features list` every tool feature ([`codex_features`]),
+    /// without recording anything.
     #[cfg(unix)]
     pub fn recording_stubs(tmp: &Path) -> AiEnv {
         let (bin, rec) = (tmp.join("bin"), tmp.join("rec"));
@@ -356,19 +504,25 @@ pub mod fixtures {
         stub(
             &bin,
             "claude",
-            &format!("printf '%s\\n' \"$@\" > {rec}/claude.argv\ncat > {rec}/claude.stdin\npwd > {rec}/claude.cwd\nls -A > {rec}/claude.ls\necho 'ANSWER from claude'"),
+            &format!(
+                "if [ \"$1\" = --help ]; then cat <<'EOF'\n{}EOF\nexit 0; fi\n\
+                 printf '%s\\n' \"$@\" > {rec}/claude.argv\ncat > {rec}/claude.stdin\npwd > {rec}/claude.cwd\nls -A > {rec}/claude.ls\n\
+                 env > {rec}/claude.env\necho 'ANSWER from claude'",
+                claude_help(&[])
+            ),
         );
         stub(
             &bin,
             "codex",
             &format!(
-                "if [ \"$1\" = features ]; then printf 'shell_tool  stable  true\\nweb_search  stable  true\\napps  beta  false\\nhooks  beta  false\\n'; exit 0; fi\n\
-                 printf '%s\\n' \"$@\" > {rec}/codex.argv\ncat > {rec}/codex.stdin\npwd > {rec}/codex.cwd\n\
+                "if [ \"$1\" = features ]; then cat <<'EOF'\n{}EOF\nexit 0; fi\n\
+                 printf '%s\\n' \"$@\" > {rec}/codex.argv\ncat > {rec}/codex.stdin\npwd > {rec}/codex.cwd\nenv > {rec}/codex.env\n\
                  out=; prev=; for a; do [ \"$prev\" = -o ] && out=$a; prev=$a; done\n\
-                 echo 'ANSWER from codex' > \"$out\"\necho 'codex chatter on stdout'"
+                 echo 'ANSWER from codex' > \"$out\"\necho 'codex chatter on stdout'",
+                codex_features(&[])
             ),
         );
-        AiEnv { path: Some(on_path(&bin)), home: None, tmp: tmp.to_path_buf() }
+        AiEnv { path: Some(on_path(&bin)), home: None, tmp: tmp.to_path_buf(), vars: vec![("LANG".into(), "C.UTF-8".into())] }
     }
 
     /// `PATH` with `dir` first: the stubs found before any real `claude`/`codex`, the tools
@@ -427,26 +581,116 @@ pub(crate) mod tests {
         assert!(c("ASK_AI=of", Some(Ai::Claude)).is_err());
     }
 
+    /// The exact argv: claude with no built-in tools and no MCP server from anywhere (an empty
+    /// `--mcp-config` under `--strict-mcp-config`); codex read-only, without the operator's
+    /// config.toml and with `mcp_servers` emptied, every tool feature disabled — all of them,
+    /// always — and the prompt on stdin.
     #[test]
     fn argv_have_no_tools() {
-        let a = claude_args(Some("opus"));
-        let i = a.iter().position(|x| x == "--tools").unwrap();
-        assert_eq!(a[i + 1], "", "--tools '' = no built-in tools");
-        for f in ["-p", "--safe-mode", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"] {
-            assert!(a.iter().any(|x| x == f), "{f}");
-        }
-        assert!(a.ends_with(&["--model".to_string(), "opus".to_string()]));
+        let words = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            claude_args(Some("opus")),
+            words(&[
+                "-p",
+                "--safe-mode",
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--mcp-config",
+                r#"{"mcpServers":{}}"#,
+                "--disable-slash-commands",
+                "--no-session-persistence",
+                "--output-format",
+                "text",
+                "--model",
+                "opus"
+            ])
+        );
         assert!(!claude_args(None).contains(&"--model".to_string()));
+        // Every flag claude's --help must list is one the argv uses.
+        for f in CLAUDE_NO_TOOL_FLAGS {
+            assert!(claude_args(None).iter().any(|a| a == f), "{f}");
+        }
 
-        let known: Vec<String> = ["shell_tool", "apps", "web_search", "zzz"].map(String::from).to_vec();
-        let c = codex_args(&known, Path::new("/t/empty"), Path::new("/t/a.md"), None);
-        let joined = c.join(" ");
-        assert!(joined.starts_with("exec -s read-only --skip-git-repo-check --ephemeral"), "{joined}");
-        assert!(joined.contains("-C /t/empty -o /t/a.md -c web_search=\"disabled\""), "{joined}");
-        assert!(joined.contains("--disable shell_tool --disable apps"), "{joined}");
-        assert!(!joined.contains("--disable web_search") && !joined.contains("zzz"), "only tool features it knows");
-        assert_eq!(c.last().map(String::as_str), Some("-"), "the prompt on stdin");
+        let mut want = words(&[
+            "exec",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--color",
+            "never",
+            "-C",
+            "/t/empty",
+            "-o",
+            "/t/a.md",
+            "-c",
+            "web_search=\"disabled\"",
+            "-c",
+            "mcp_servers={}",
+        ]);
+        for f in [
+            "shell_tool",
+            "unified_exec",
+            "code_mode_host",
+            "apps",
+            "plugins",
+            "remote_plugin",
+            "browser_use",
+            "browser_use_external",
+            "in_app_browser",
+            "computer_use",
+            "multi_agent",
+            "image_generation",
+            "hooks",
+            "view_image",
+        ] {
+            want.extend(words(&["--disable", f]));
+        }
+        want.extend(words(&["-m", "gpt-x", "-"]));
+        assert_eq!(codex_args(Path::new("/t/empty"), Path::new("/t/a.md"), Some("gpt-x")), want);
+        assert_eq!(codex_args(Path::new("/t/empty"), Path::new("/t/a.md"), None).last().map(String::as_str), Some("-"), "the prompt on stdin");
         assert_eq!(parse_features("shell_tool stable true\n\napps beta false\n"), ["shell_tool", "apps"]);
+    }
+
+    /// The check before anything is sent: claude's --help must list every no-tools flag (as a
+    /// word — `--tools-extra` or `--mcp-config-file` isn't `--tools`/`--mcp-config`), codex's
+    /// features list must name every tool feature; what's missing is named.
+    #[test]
+    fn tools_off_is_confirmed_by_the_clis_own_description() {
+        assert_eq!(confirm_tools_off(Ai::Claude, &fixtures::claude_help(&[])), Ok(()));
+        assert_eq!(confirm_tools_off(Ai::Claude, &fixtures::claude_help(&["--strict-mcp-config", "--tools"])), Err(vec!["--tools", "--strict-mcp-config"]));
+        let lookalikes = "  --tools-extra <x>\n  --safe-mode\n  --strict-mcp-config\n  --mcp-config-file\n  --disable-slash-commands\n  --no-session-persistence\n";
+        assert_eq!(confirm_tools_off(Ai::Claude, lookalikes), Err(vec!["--tools", "--mcp-config"]));
+        assert_eq!(confirm_tools_off(Ai::Claude, ""), Err(CLAUDE_NO_TOOL_FLAGS.to_vec()));
+        assert_eq!(confirm_tools_off(Ai::Codex, &fixtures::codex_features(&[])), Ok(()));
+        assert_eq!(confirm_tools_off(Ai::Codex, &fixtures::codex_features(&["hooks", "view_image"])), Err(vec!["hooks", "view_image"]));
+        // A name inside another line's text isn't a feature it lists.
+        assert_eq!(confirm_tools_off(Ai::Codex, "web_search  stable  true  (not shell_tool)\n").unwrap_err().len(), CODEX_TOOL_FEATURES.len());
+        assert_eq!(discovery_args(Ai::Claude), ["--help"]);
+        assert_eq!(discovery_args(Ai::Codex), ["features", "list"]);
+    }
+
+    /// The AI's environment: `PATH`, `HOME`, the locale/XDG/proxy variables, and its own login
+    /// dir and API key — never the other AI's key, the operator's provider keys or anything else.
+    #[test]
+    fn the_ai_gets_a_minimal_environment() {
+        let env = AiEnv {
+            path: Some("/bin".into()),
+            home: Some("/home/op".into()),
+            tmp: "/tmp".into(),
+            vars: [("LANG", "C.UTF-8"), ("HTTPS_PROXY", "http://p:3128"), ("ANTHROPIC_API_KEY", "a"), ("OPENAI_API_KEY", "o"), ("CODEX_HOME", "/c"), ("RUNPOD_API_KEY", "r"), ("CLAUDE_CODE_ENTRYPOINT", "x")]
+                .map(|(k, v)| (k.to_string(), OsString::from(v)))
+                .to_vec(),
+        };
+        let names = |ai| child_env(ai, &env).into_iter().map(|(k, _)| k.into_string().unwrap()).collect::<Vec<_>>();
+        assert_eq!(names(Ai::Claude), ["PATH", "HOME", "LANG", "HTTPS_PROXY", "ANTHROPIC_API_KEY"]);
+        assert_eq!(names(Ai::Codex), ["PATH", "HOME", "LANG", "HTTPS_PROXY", "OPENAI_API_KEY", "CODEX_HOME"]);
+        assert_eq!(child_env(Ai::Claude, &env)[1], (OsString::from("HOME"), OsString::from("/home/op")));
+        let bare = AiEnv { path: None, home: None, tmp: "/tmp".into(), vars: Vec::new() };
+        assert!(child_env(Ai::Codex, &bare).is_empty());
     }
 
     #[cfg(unix)]
@@ -460,7 +704,7 @@ pub(crate) mod tests {
         std::fs::write(a.join("claude"), "not executable").unwrap();
         stub(&b, "claude", "true");
         stub(&home.join(".local/bin"), "codex", "true");
-        let env = AiEnv { path: Some(std::env::join_paths([&a, &b]).unwrap()), home: Some(home.clone()), tmp: t.0.clone() };
+        let env = AiEnv { path: Some(std::env::join_paths([&a, &b]).unwrap()), home: Some(home.clone()), tmp: t.0.clone(), vars: Vec::new() };
         assert_eq!(find_bin("claude", &env), Some(b.join("claude")), "the first *executable* one");
         assert_eq!(find_bin("codex", &env), Some(home.join(".local/bin/codex")));
         assert_eq!(find_bin("nope", &env), None);
@@ -478,6 +722,11 @@ pub(crate) mod tests {
         assert_eq!(rec(&t.0, "claude.stdin"), "the PROMPT\nline 2\n", "the prompt on stdin, never argv");
         assert!(rec(&t.0, "claude.cwd").trim().ends_with("/empty"), "{}", rec(&t.0, "claude.cwd"));
         assert_eq!(rec(&t.0, "claude.ls"), "", "nothing to read where it runs");
+        // Its environment is only what child_env gives: none of this test process's own
+        // (cargo's CARGO_*, the build VM's HOME and USER).
+        let vars = rec(&t.0, "claude.env");
+        assert!(vars.lines().any(|l| l == "LANG=C.UTF-8") && vars.lines().any(|l| l.starts_with("PATH=")), "{vars}");
+        assert!(!vars.lines().any(|l| l.starts_with("CARGO") || l.starts_with("HOME=") || l.starts_with("USER=")), "{vars}");
         // The scratch directory is gone afterwards.
         let left: Vec<_> = std::fs::read_dir(&t.0).unwrap().flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with("arena-ask-")).collect();
         assert!(left.is_empty(), "{left:?}");
@@ -491,17 +740,49 @@ pub(crate) mod tests {
         let answer = ask(Ai::Codex, "PROMPT", None, Duration::from_secs(20), &env).await.unwrap();
         assert_eq!(answer, "ANSWER from codex", "the -o file, not its stdout chatter");
         let argv: Vec<String> = rec(&t.0, "codex.argv").lines().map(String::from).collect();
-        let joined = argv.join(" ");
-        assert!(joined.starts_with("exec -s read-only --skip-git-repo-check"), "{joined}");
-        assert!(joined.contains("--disable shell_tool --disable apps --disable hooks"), "{joined}");
-        assert_eq!(argv.last().map(String::as_str), Some("-"));
+        let at = |flag: &str| argv.iter().position(|a| a == flag).map(|i| argv[i + 1].clone()).unwrap();
+        let (cwd, out) = (at("-C"), at("-o"));
+        assert_eq!(cwd, rec(&t.0, "codex.cwd").trim(), "-C is where it runs: the empty dir");
+        assert_eq!(argv, codex_args(Path::new(&cwd), Path::new(&out), None), "exactly the no-tools argv, the MCP override included");
         assert_eq!(rec(&t.0, "codex.stdin"), "PROMPT");
+        assert!(!rec(&t.0, "codex.env").lines().any(|l| l.starts_with("CARGO")), "{}", rec(&t.0, "codex.env"));
+    }
+
+    /// Fail closed: a codex whose `features list` fails, hangs or doesn't name every tool
+    /// feature, and a claude whose `--help` fails or doesn't list every no-tools flag, is refused
+    /// — and never run with the prompt (nothing recorded, nothing read from stdin).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cli_that_cant_confirm_its_tools_are_off_is_never_asked() {
+        let t = Tmp::new("unconfirmed");
+        let bin = t.0.join("bin");
+        let ran = t.0.join("ran");
+        std::fs::create_dir_all(&bin).unwrap();
+        let env = AiEnv { path: Some(on_path(&bin)), home: None, tmp: t.0.clone(), vars: Vec::new() };
+        let cases: Vec<(Ai, String, u64, &str)> = vec![
+            (Ai::Codex, "echo 'error: unrecognized subcommand' >&2; exit 2".into(), 10, "(`codex features list` failed (exit 2): error: unrecognized subcommand)"),
+            (Ai::Codex, "exec sleep 30".into(), 1, "(`codex features list` didn't answer within 1s)"),
+            (Ai::Codex, format!("cat <<'EOF'\n{}EOF", codex_features(&["hooks", "view_image"])), 10, "(`codex features list` doesn't name hooks, view_image)"),
+            (Ai::Codex, "true".into(), 10, "doesn't name shell_tool, unified_exec,"),
+            (Ai::Claude, "echo 'Error: unknown option' >&2; exit 1".into(), 10, "(`claude --help` failed (exit 1): Error: unknown option)"),
+            (Ai::Claude, format!("cat <<'EOF'\n{}EOF", claude_help(&["--strict-mcp-config", "--mcp-config"])), 10, "(`claude --help` doesn't list --strict-mcp-config, --mcp-config)"),
+        ];
+        for (ai, describe, secs, why) in cases {
+            let discovery = discovery_args(ai).join(" ");
+            stub(&bin, ai.name(), &format!("if [ \"$*\" = '{discovery}' ]; then\n{describe}\nexit $?\nfi\ncat > {}\necho ANSWER", ran.display()));
+            let started = std::time::Instant::now();
+            let e = ask(ai, "the PROMPT", None, Duration::from_secs(secs), &env).await.unwrap_err();
+            assert!(e.starts_with(&format!("{}: couldn't confirm its tools are off — not asked (", ai.name())), "{e}");
+            assert!(e.contains(why), "{why} in {e}");
+            assert!(!ran.exists(), "{}: it was run with the prompt after {why}", ai.name());
+            assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+        }
     }
 
     #[tokio::test]
     async fn a_missing_binary_names_the_other_option() {
         let t = Tmp::new("missing");
-        let env = AiEnv { path: Some(t.0.clone().into_os_string()), home: None, tmp: t.0.clone() };
+        let env = AiEnv { path: Some(t.0.clone().into_os_string()), home: None, tmp: t.0.clone(), vars: Vec::new() };
         let e = ask(Ai::Claude, "p", None, Duration::from_secs(5), &env).await.unwrap_err();
         assert!(e.contains("claude not found") && e.contains("--ai codex") && e.contains("ASK_AI=codex"), "{e}");
         let e = ask(Ai::Codex, "p", None, Duration::from_secs(5), &env).await.unwrap_err();
@@ -517,8 +798,9 @@ pub(crate) mod tests {
         let bin = t.0.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let pidfile = t.0.join("pid");
-        stub(&bin, "claude", &format!("echo $$ > {}\ncat > /dev/null\nexec sleep 30", pidfile.display()));
-        let env = AiEnv { path: Some(on_path(&bin)), home: None, tmp: t.0.clone() };
+        let help = format!("if [ \"$1\" = --help ]; then cat <<'EOF'\n{}EOF\nexit 0; fi", claude_help(&[]));
+        stub(&bin, "claude", &format!("{help}\necho $$ > {}\ncat > /dev/null\nexec sleep 30", pidfile.display()));
+        let env = AiEnv { path: Some(on_path(&bin)), home: None, tmp: t.0.clone(), vars: Vec::new() };
         let started = std::time::Instant::now();
         let e = ask(Ai::Claude, "p", None, Duration::from_secs(1), &env).await.unwrap_err();
         assert!(e.contains("didn't answer within 1s") && e.contains("stopped"), "{e}");
@@ -526,10 +808,10 @@ pub(crate) mod tests {
         let pid = std::fs::read_to_string(&pidfile).unwrap();
         assert!(!Path::new(&format!("/proc/{}", pid.trim())).exists(), "the stub is gone (pid {pid})");
 
-        stub(&bin, "claude", "echo 'partial' ; echo 'Error: not logged in' >&2; exit 3");
+        stub(&bin, "claude", &format!("{help}\necho 'partial' ; echo 'Error: not logged in' >&2; exit 3"));
         let e = ask(Ai::Claude, "p", None, Duration::from_secs(10), &env).await.unwrap_err();
         assert_eq!(e, "claude failed (exit 3): Error: not logged in");
-        stub(&bin, "claude", "cat > /dev/null; printf '  \\n'");
+        stub(&bin, "claude", &format!("{help}\ncat > /dev/null; printf '  \\n'"));
         let e = ask(Ai::Claude, "p", None, Duration::from_secs(10), &env).await.unwrap_err();
         assert!(e.starts_with("claude answered nothing"), "{e}");
     }

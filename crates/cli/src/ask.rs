@@ -50,15 +50,22 @@ pub(crate) struct AskRun {
     pub question: Option<String>,
 }
 
-/// The command line the AI runs with, for the dry run (the prompt goes on its stdin).
+/// The command line the AI runs with, for the dry run (the prompt goes on its stdin), and the
+/// check that comes first: it is run only once `claude --help` / `codex features list` shows it
+/// knows every switch that takes its tools away.
 fn ai_command_line(ai: Ai, model: Option<&str>) -> String {
     let args = match ai {
         Ai::Claude => ai::claude_args(model),
-        Ai::Codex => ai::codex_args(&[], std::path::Path::new("<empty temp dir>"), std::path::Path::new("<answer file>"), model),
+        Ai::Codex => ai::codex_args(std::path::Path::new("<empty temp dir>"), std::path::Path::new("<answer file>"), model),
     };
     let words: Vec<String> = args.iter().map(|a| arena_core::ssh::shell_word(a)).collect();
-    let extra = if ai == Ai::Codex { " (plus --disable for each tool feature its `features list` names)" } else { "" };
-    format!("{} {}{extra}", ai.name(), words.join(" "))
+    format!(
+        "{} {}` — once `{} {}` confirms it knows each of those no-tools switches",
+        ai.name(),
+        words.join(" "),
+        ai.name(),
+        ai::discovery_args(ai).join(" ")
+    )
 }
 
 /// `pods ask`: every selected pod's bundle (stopped and unreachable ones from their listing)
@@ -89,7 +96,7 @@ pub(crate) async fn handle_ask(
     if run.dry_run {
         out(&prompt);
         note(&format!(
-            "[dry-run] nothing sent: the prompt above ({} bytes) would go to {} on the stdin of `{}`",
+            "[dry-run] nothing sent: the prompt above ({} bytes) would go to {} on the stdin of `{}",
             prompt.len(),
             run.ai.vendor(),
             ai_command_line(run.ai, run.model.as_deref())
@@ -217,7 +224,14 @@ mod tests {
         let prompt = &out[0];
         assert!(prompt.contains("The operator's question: anything odd?") && prompt.contains("## devtest-alpha") && prompt.contains("## devtest-bravo"), "{prompt}");
         assert!(notes.last().unwrap().starts_with("[dry-run] nothing sent: the prompt above"), "{notes:?}");
-        assert!(notes.last().unwrap().contains("to Anthropic on the stdin of `claude -p --safe-mode --tools '' --strict-mcp-config"), "{notes:?}");
+        assert!(
+            notes.last().unwrap().contains(
+                "to Anthropic on the stdin of `claude -p --safe-mode --tools '' --strict-mcp-config --mcp-config '{\"mcpServers\":{}}' \
+                 --disable-slash-commands --no-session-persistence --output-format text` — once `claude --help` confirms it knows each of \
+                 those no-tools switches"
+            ),
+            "{notes:?}"
+        );
         assert!(!t.0.join("rec").join("claude.argv").exists() && !t.0.join("rec").join("claude.stdin").exists(), "the AI ran");
         assert!(!t.0.join("state").exists(), "a dry run saves nothing");
     }
@@ -260,7 +274,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_ai_fails_naming_the_other() {
         let t = Tmp::new("missing");
-        let env = AiEnv { path: Some(t.0.clone().into_os_string()), home: None, tmp: t.0.clone() };
+        let env = AiEnv { path: Some(t.0.clone().into_os_string()), home: None, tmp: t.0.clone(), vars: Vec::new() };
         let c = cfg(&t.0.join("state"));
         let sel = Selected::all(vec![pod("alpha", Some(22001))]);
         let mut notes = Vec::new();

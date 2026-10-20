@@ -1277,11 +1277,18 @@ when many pods share a prompt: 240 KB in all), trimmed from the log's oldest lin
 claude sends the prompt to **Anthropic**, codex to **OpenAI**, through your own `claude`/`codex`
 login on this machine (a one-line note says so on first use). Both get **no tools** — the prompt
 says the pod data is data, never instructions, and they can't act on it anyway: claude runs as
-`scripts/ai-review` runs it (`claude -p --safe-mode --tools '' --strict-mcp-config
---disable-slash-commands --no-session-persistence --output-format text`), codex as `codex exec -s
-read-only --skip-git-repo-check --ephemeral` with web search and every tool feature its `features
-list` names turned off; the prompt goes on stdin (never argv), in an empty private temporary
-directory; `--timeout` (default 300 s) stops it. A missing binary is an error naming the other one.
+`scripts/ai-review` runs it, plus an empty MCP config (`claude -p --safe-mode --tools ''
+--strict-mcp-config --mcp-config '{"mcpServers":{}}' --disable-slash-commands
+--no-session-persistence --output-format text`), codex as `codex exec -s read-only
+--skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules` with `mcp_servers` emptied,
+web search off and every tool feature disabled (shell, unified exec, code mode, apps, plugins,
+browser and computer use, sub-agents, image generation and viewing, hooks). **It fails closed**:
+neither is sent anything until `claude --help` lists every one of those flags, or `codex features
+list` names every one of those features — a check that fails, times out or finds one missing refuses
+the ask (`codex: couldn't confirm its tools are off — not asked (…)`). The prompt goes on stdin
+(never argv), in an empty private temporary directory, with a minimal environment (`PATH`, `HOME`,
+the locale, XDG and proxy variables, and the AI's own config dir and API key — not the rest of
+yours); `--timeout` (default 300 s) stops it. A missing binary is an error naming the other one.
 
 #### Where answers are saved
 

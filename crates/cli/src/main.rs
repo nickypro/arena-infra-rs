@@ -17740,7 +17740,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("arena-cli-askrow-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let empty = arena_core::ask::AiEnv { path: Some(dir.clone().into_os_string()), home: None, tmp: dir.clone() };
+        let empty = arena_core::ask::AiEnv { path: Some(dir.clone().into_os_string()), home: None, tmp: dir.clone(), vars: Vec::new() };
         let key = format!("{:<28}", "ASK_AI");
         let rows = |text: &str| ask_ai_rows(&Config::parse(text), &empty);
         assert_eq!(

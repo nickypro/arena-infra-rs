@@ -172,8 +172,8 @@ pub struct LocalRun<'a> {
     pub args: &'a [String],
     /// Its working directory.
     pub cwd: &'a std::path::Path,
-    /// The `PATH` it gets (`None`: this process's own).
-    pub path: Option<&'a std::ffi::OsStr>,
+    /// Its whole environment: nothing of this process's is inherited.
+    pub env: &'a [(std::ffi::OsString, std::ffi::OsString)],
     /// What it reads on stdin, then end of file.
     pub input: &'a [u8],
 }
@@ -182,13 +182,13 @@ pub struct LocalRun<'a> {
 /// (a prompt never goes in argv, where `ps` would show it to every user of the machine).
 /// `input` is written while the output is read, so a large prompt can't deadlock on a full
 /// pipe; a child that exits without reading it all has given its answer, which is not an
-/// error here. Same budget and SIGTERM-then-SIGKILL stop as [`run_local`].
+/// error here. Same budget and SIGTERM-then-SIGKILL stop as [`run_local`]. The child gets
+/// `run.env` and nothing else (the AI CLIs run on the fleet's control box, whose environment can
+/// hold the operator's provider keys).
 pub async fn run_local_input(run: &LocalRun<'_>, what: &str, timeout: Option<Duration>) -> Result<SshOutput> {
     let mut c = Command::new(run.program);
     c.args(run.args).current_dir(run.cwd).stdin(Stdio::piped()).kill_on_drop(true);
-    if let Some(path) = run.path {
-        c.env("PATH", path);
-    }
+    c.env_clear().envs(run.env.iter().map(|(k, v)| (k, v)));
     output_feeding(c, Some(run.input.to_vec()), what, timeout).await
 }
 
