@@ -268,8 +268,12 @@ struct Ui {
     /// Pods marked for a bulk action (space, a click, or `/`), by `state::mark_key`
     /// (`provider:id` — a bare id can belong to two providers' pods).
     marked: std::collections::HashSet<String>,
-    /// Scroll offset for the result modal (so long fleet outputs are readable).
+    /// Scroll offset for the result modal (so long fleet outputs are readable) and the `?`
+    /// answer popup.
     result_scroll: u16,
+    /// How far the result or answer popup last drawn can scroll — its text's height less its
+    /// view's — set as it's drawn, so a key never scrolls past the end ([`scroll_by`]).
+    result_max: std::cell::Cell<u16>,
     /// The pods table's last-rendered `(area, scroll_offset)`, set by `pods_table` each
     /// frame so mouse clicks can be mapped back to a pod row. Cell because `view` borrows
     /// `&Ui` (the TUI is single-threaded, so interior mutability is safe here).
@@ -378,6 +382,7 @@ async fn main() -> Result<()> {
         selected: 0,
         marked: std::collections::HashSet::new(),
         result_scroll: 0,
+        result_max: std::cell::Cell::new(0),
         last_table: std::cell::Cell::new((Rect::default(), 0)),
     };
 
@@ -718,14 +723,14 @@ fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared>>) {
     match m.kind {
         MouseEventKind::ScrollUp => {
             if in_result {
-                ui.result_scroll = ui.result_scroll.saturating_sub(1);
+                ui.result_scroll = scroll_by(ui.result_scroll, ui.result_max.get(), -1);
             } else if in_list {
                 ui.selected = ui.selected.saturating_sub(1);
             }
         }
         MouseEventKind::ScrollDown => {
             if in_result {
-                ui.result_scroll = ui.result_scroll.saturating_add(1);
+                ui.result_scroll = scroll_by(ui.result_scroll, ui.result_max.get(), 1);
             } else if in_list {
                 let len = shared.lock().unwrap().pods.len();
                 if len > 0 {
@@ -1276,25 +1281,38 @@ async fn run(
             Mode::Working(_) => {}
             // Handled by `ask::key` above.
             Mode::Ask { .. } | Mode::Answer(_) => {}
-            Mode::Result(_) => match code {
-                // Scroll long outputs (e.g. a fleet test); other keys dismiss.
-                KeyCode::Up | KeyCode::Char('k') => {
-                    ui.result_scroll = ui.result_scroll.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    ui.result_scroll = ui.result_scroll.saturating_add(1);
-                }
-                KeyCode::PageUp => ui.result_scroll = ui.result_scroll.saturating_sub(10),
-                KeyCode::PageDown => ui.result_scroll = ui.result_scroll.saturating_add(10),
-                _ => {
+            Mode::Result(_) => {
+                if !result_key(&mut ui, code) {
                     ui.result_scroll = 0;
                     ui.mode = Mode::List;
                     nudge.notify_one();
                 }
-            },
+            }
         }
     }
     Ok(())
+}
+
+/// A popup's scroll offset moved by `delta` lines, kept within `0..=max` (`max`: how far the
+/// popup last drawn can scroll, [`Ui::result_max`]). An offset already past `max` — the window
+/// grew since — counts as `max`, so the first key back moves the text at once.
+pub(crate) fn scroll_by(scroll: u16, max: u16, delta: i32) -> u16 {
+    let s = (i32::from(scroll.min(max)) + delta).clamp(0, i32::from(max));
+    u16::try_from(s).unwrap_or(max)
+}
+
+/// The result modal's keys: ↑↓/jk a line, PgUp/PgDn ten, never past the end of the text.
+/// `false`: any other key, which dismisses it.
+fn result_key(ui: &mut Ui, code: KeyCode) -> bool {
+    let delta = match code {
+        KeyCode::Up | KeyCode::Char('k') => -1,
+        KeyCode::Down | KeyCode::Char('j') => 1,
+        KeyCode::PageUp => -10,
+        KeyCode::PageDown => 10,
+        _ => return false,
+    };
+    ui.result_scroll = scroll_by(ui.result_scroll, ui.result_max.get(), delta);
+    true
 }
 
 /// Run an action against every pod concurrently, returning a summary line, then each pod's
@@ -2277,10 +2295,10 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         Mode::NewPod(form) => render_new_pod(f, form),
         Mode::Input { action, scope, value } => render_input(f, shared, ui, *action, scope, value),
         Mode::Select { value } => render_select(f, value),
-        Mode::Working(msg) => render_result(f, msg, 0),
-        Mode::Result(msg) => render_result(f, msg, ui.result_scroll),
+        Mode::Working(msg) => render_result(f, msg, 0, &ui.result_max),
+        Mode::Result(msg) => render_result(f, msg, ui.result_scroll, &ui.result_max),
         Mode::Ask { scope, value, ai } => ask::render_input(f, shared, ui, scope, value, *ai),
-        Mode::Answer(answer) => ask::render_answer(f, answer, ui.result_scroll),
+        Mode::Answer(answer) => ask::render_answer(f, answer, ui.result_scroll, &ui.result_max),
         _ => {}
     }
 }
@@ -3432,7 +3450,7 @@ fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
     );
 }
 
-fn render_result(f: &mut Frame, msg: &str, scroll: u16) {
+fn render_result(f: &mut Frame, msg: &str, scroll: u16, max: &std::cell::Cell<u16>) {
     // Grow the box for multi-line results (e.g. a per-pod fleet readout); it scrolls if
     // taller than the screen.
     let n = msg.lines().count() as u16;
@@ -3440,9 +3458,10 @@ fn render_result(f: &mut Frame, msg: &str, scroll: u16) {
     let area = centered_rect(70, pct_y, f.area());
     f.render_widget(Clear, area);
     let color = if msg.contains('✗') { Color::Red } else { Color::Green };
-    // Clamp scroll so you can't page past the end.
+    // Clamp scroll so you can't page past the end, and tell the keys where that is.
     let visible = area.height.saturating_sub(2);
-    let max_scroll = n.saturating_sub(visible.saturating_sub(1));
+    let max_scroll = n.saturating_sub(visible);
+    max.set(max_scroll);
     let scroll = scroll.min(max_scroll);
     let footer = if n + 2 > visible { "  [↑↓] scroll · [esc] dismiss" } else { "" };
     f.render_widget(
@@ -3569,6 +3588,7 @@ deep_check_end=1
             selected: 0,
             marked: HashSet::new(),
             result_scroll: 0,
+            result_max: std::cell::Cell::new(0),
             last_table: std::cell::Cell::new((Rect::default(), 0)),
             asker: fake_asker(Arc::default()),
         }
@@ -4891,6 +4911,58 @@ deep_check_end=1
         }
     }
 
+    /// Live ASK F3: both popups — the `?` answer and the older result modal — scroll no further
+    /// than their text's end, so after PgDn past it one PgUp moves the text at once (it took
+    /// 11 after 10 extra PgDn). The offset is clamped by `scroll_by` to what the popup last
+    /// drawn can scroll; one that fits doesn't scroll at all.
+    #[test]
+    fn a_popup_scrolls_no_further_than_its_text() {
+        assert_eq!([scroll_by(0, 5, -1), scroll_by(3, 5, 10), scroll_by(5, 5, -10), scroll_by(0, 0, 10), scroll_by(2, 5, 1)], [0, 5, 0, 0, 3]);
+        assert_eq!(scroll_by(40, 5, -1), 4, "past the end (the window grew): the first key back moves");
+        assert_eq!(scroll_by(u16::MAX, u16::MAX, 10), u16::MAX);
+        let shared = fixture_shared();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let none = KeyModifiers::NONE;
+        let long: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let shared_arc = Arc::new(Mutex::new(fixture_shared()));
+        let answer = || Mode::Answer(ask::Answer { title: "t".into(), text: long.clone() });
+        for (popup, mode) in [("answer", answer()), ("result", Mode::Result(long.clone()))] {
+            ui.mode = mode;
+            ui.result_scroll = 0;
+            let press = |ui: &mut Ui, code: KeyCode| {
+                if popup == "answer" {
+                    assert!(ask::key(ui, &shared_arc, code, none));
+                } else {
+                    assert!(result_key(ui, code));
+                }
+            };
+            draw(120, 40, &shared, &ui);
+            let max = ui.result_max.get();
+            assert!(max > 50 && max < 100, "{popup}: {max}");
+            for _ in 0..30 {
+                press(&mut ui, KeyCode::PageDown);
+            }
+            assert_eq!(ui.result_scroll, max, "{popup}: PgDn stops at the end");
+            assert!(draw(120, 40, &shared, &ui).join("\n").contains("line 99"), "{popup}");
+            press(&mut ui, KeyCode::Up);
+            assert_eq!(ui.result_scroll, max - 1, "{popup}: one Up moves at once");
+            press(&mut ui, KeyCode::PageUp);
+            assert_eq!(ui.result_scroll, max - 11, "{popup}");
+            for _ in 0..30 {
+                press(&mut ui, KeyCode::PageUp);
+            }
+            assert_eq!(ui.result_scroll, 0, "{popup}");
+            press(&mut ui, KeyCode::Down);
+            assert_eq!(ui.result_scroll, 1, "{popup}");
+        }
+        // A result that fits: no scrolling, and any other key dismisses it (left to the loop).
+        ui.mode = Mode::Result("✓ done".into());
+        ui.result_scroll = 0;
+        draw(120, 40, &shared, &ui);
+        assert!(result_key(&mut ui, KeyCode::PageDown) && ui.result_scroll == 0);
+        assert!(!result_key(&mut ui, KeyCode::Esc));
+    }
+
     /// `?` opens the question for the cursor pod, prefilled; typing edits it (Ctrl+U clears),
     /// Enter asks in the background — the dashboard stays live, the footer says so — and the
     /// answer opens in its own popup when it lands (a modal open meanwhile keeps it waiting),
@@ -4955,7 +5027,7 @@ deep_check_end=1
         let text = screen(&ui, 140, 40).join("\n");
         assert!(text.contains("claude · test") && text.contains("ANSWER to is it busy?"), "{text}");
         ask::key(&mut ui, &shared, KeyCode::Down, none);
-        assert_eq!(ui.result_scroll, 1);
+        assert_eq!(ui.result_scroll, 0, "a one-line answer fits: nothing to scroll");
         assert!(ask::key(&mut ui, &shared, KeyCode::Esc, none));
         assert!(matches!(ui.mode, Mode::List) && ui.result_scroll == 0);
 

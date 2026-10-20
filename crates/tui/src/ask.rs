@@ -20,7 +20,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use super::{centered_rect, marked_pods, scope_names, scope_pods, InputScope, Mode, Scope, Shared, Ui};
+use super::{centered_rect, marked_pods, scope_names, scope_pods, scroll_by, InputScope, Mode, Scope, Shared, Ui};
 
 /// An answer to show: the popup's title and its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,11 +173,14 @@ pub(crate) fn key(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, code: KeyCode, mods:
             true
         }
         Mode::Answer(_) => {
+            // Never past the end of the text (`result_max`, set as it's drawn): PgDn there and
+            // PgUp moves it back at once.
+            let by = |ui: &Ui, delta| scroll_by(ui.result_scroll, ui.result_max.get(), delta);
             match code {
-                KeyCode::Up | KeyCode::Char('k') => ui.result_scroll = ui.result_scroll.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => ui.result_scroll = ui.result_scroll.saturating_add(1),
-                KeyCode::PageUp => ui.result_scroll = ui.result_scroll.saturating_sub(10),
-                KeyCode::PageDown | KeyCode::Char(' ') => ui.result_scroll = ui.result_scroll.saturating_add(10),
+                KeyCode::Up | KeyCode::Char('k') => ui.result_scroll = by(ui, -1),
+                KeyCode::Down | KeyCode::Char('j') => ui.result_scroll = by(ui, 1),
+                KeyCode::PageUp => ui.result_scroll = by(ui, -10),
+                KeyCode::PageDown | KeyCode::Char(' ') => ui.result_scroll = by(ui, 10),
                 KeyCode::Home | KeyCode::Char('g') => ui.result_scroll = 0,
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                     ui.result_scroll = 0;
@@ -239,13 +242,15 @@ fn wrapped_lines(text: &str, width: u16) -> u16 {
     u16::try_from(n).unwrap_or(u16::MAX)
 }
 
-/// The answer: a large popup, wrapped, scrolled by `scroll` (clamped to the end).
-pub(crate) fn render_answer(f: &mut Frame, answer: &Answer, scroll: u16) {
+/// The answer: a large popup, wrapped, scrolled by `scroll` (clamped to the end, which `max`
+/// is set to for the keys).
+pub(crate) fn render_answer(f: &mut Frame, answer: &Answer, scroll: u16, max: &std::cell::Cell<u16>) {
     let area = centered_rect(90, 85, f.area());
     f.render_widget(Clear, area);
     let inner = area.height.saturating_sub(2);
     let total = wrapped_lines(&answer.text, area.width.saturating_sub(2));
-    let scroll = scroll.min(total.saturating_sub(inner));
+    max.set(total.saturating_sub(inner));
+    let scroll = scroll.min(max.get());
     let color = if answer.text.contains('✗') { Color::Red } else { Color::Green };
     f.render_widget(
         Paragraph::new(answer.text.clone()).wrap(Wrap { trim: false }).scroll((scroll, 0)).block(
