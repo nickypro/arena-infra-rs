@@ -633,9 +633,17 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     keeps the key (the code still runs) and shows as modified; reported per pod (`redacted N
     pasted key(s) in …`). **Unpushed commits holding a key** — an older backup's, or one the
     participant made by hand — are rewritten before the push, whatever GitHub would do: just
-    those commits (none origin has — one only the course's `upstream` has, its `main` merged in,
-    is scanned too: origin never had it), the key redacted — same messages, authors, dates — and
-    pushed as a fast-forward, never forced; files on disk untouched. A secret the patterns don't
+    those commits (none origin has — one only an `upstream` elsewhere has is scanned too: origin
+    never had it), the key redacted — same messages, authors, dates — and pushed as a
+    fast-forward, never forced; files on disk untouched. **The course's own commits are left as
+    the course published them**: on a pod whose `upstream` is the course repo
+    (`ARENA_UPSTREAM_REPO`, default `ARENA-education/ARENA_materials`; any spelling of its URL),
+    what `upstream` has is never scanned or rewritten — it's public already, and a redacted copy
+    of a course commit broke its ancestry, so every later `git pull upstream main` conflicted on
+    the redacted lines (review ai-review claude #4); they're pushed with their commit ids
+    unchanged. If GitHub's push protection refuses one, the pod's line says it's the course's
+    own key-like string, public already — allow it in the cohort repo's push protection — not a
+    participant's leak. A secret the patterns don't
     know, refused by GitHub, fails the pod with GitHub's name for it and its path:line (never the
     secret, never GitHub's allow-URL). **A pod whose push itself fails** (a refusal, a big file,
     the network) **is rsynced into `LOCAL_BACKUP_DIR` in the same run — even under `--no-pull`**

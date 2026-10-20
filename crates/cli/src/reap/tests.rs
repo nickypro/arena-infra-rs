@@ -1072,7 +1072,8 @@ async fn the_reaps_git_step_never_pushes_to_a_wrong_origin() {
     assert!(!w.order().iter().any(|l| l.starts_with("rsync")), "no rsync after a refused git step");
     assert!(w.state().pods[&core_reap::key("runpod", &a.id)].retry_after.is_some());
     let cmds = w.remote.git_cmds.lock().unwrap().clone();
-    assert!(!cmds.is_empty() && cmds.iter().all(|c| c.ends_with(" 'o/r'")), "{cmds:#?}");
+    // The configured repo, then the course repo whose own commits the backup leaves as they are.
+    assert!(!cmds.is_empty() && cmds.iter().all(|c| c.ends_with(" 'o/r' 'ARENA-education/ARENA_materials'")), "{cmds:#?}");
 }
 
 /// Scenario 7 (I7): Vast's listing fails while RunPod's works — only RunPod is considered;

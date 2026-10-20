@@ -2229,7 +2229,11 @@ async fn backup(
         // Never a push to an `origin` that isn't the configured repo: the backup refuses it
         // (WRONG_ORIGIN, exit 5), the git step fails, and the pod isn't reaped until `pods setup`.
         let origin = arena_core::backup::configured_repo(env.cfg);
-        let cmd = arena_core::replica::guarded(Some(cond), &arena_core::backup::backup_command(&ctx.repo, key, &msg, origin.as_deref()));
+        let course = arena_core::backup::course_repo(env.cfg);
+        let cmd = arena_core::replica::guarded(
+            Some(cond),
+            &arena_core::backup::backup_command_with_course(&ctx.repo, key, &msg, origin.as_deref(), course.as_deref()),
+        );
         let r = env.remote.exec(t, &cmd, Some(left(super::BACKUP_TIMEOUT.min(dest.budget)))).await;
         ev.git = Some(step_end(r));
         // No rsync after a git step that didn't end with its sentinel (R32).
