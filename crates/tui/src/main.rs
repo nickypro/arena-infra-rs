@@ -105,8 +105,9 @@ const BACKUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// set-branch`.
 const BRANCH_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
-// The switch bounds itself on the pod (`timeout`, then a KILL) inside that budget, so its pod side
-// has ended before arena reports a timeout and releases the pod's lock (review ai-review claude #13).
+// set-branch's switch and init-branches bound themselves on the pod (`timeout`, then a KILL) inside
+// that budget, so their pod side has ended before arena reports a timeout and releases the pod's
+// lock (review ai-review claude #13).
 const _: () = assert!(arena_core::backup::SWITCH_BOUND_SECS + arena_core::backup::SWITCH_KILL_AFTER_SECS < BRANCH_TIMEOUT.as_secs());
 
 /// How long one details query (`Provider::enrich`) may take before the refresh carries on

@@ -957,7 +957,27 @@ pub fn uncommitted_reason(what: &str, on: &str) -> String {
 /// merge, …: [`BUSY_OP_SH`]) is refused next, before anything is fetched or switched (exit
 /// [`BACKUP_BUSY_EXIT`], what and how to end it on stderr): `git checkout -b` would drop its
 /// `MERGE_HEAD` and carry the conflicted index onto the new branch, with no merge left to abort.
+///
+/// Its script runs under `sh`, whatever the login shell that `-c`s the command — zsh on the pods,
+/// where a glob with no match is fatal: `unredacted_restore`'s `"$1"/*.branch`, with a set-aside
+/// run left without its `.branch`, ended the whole command there, before the push (the restore
+/// run under zsh skipped too; found in FIX4B, item 9). And it bounds itself on the pod like
+/// set-branch's switch ([`checkout_command`], [`SWITCH_BOUND_SECS`]): it runs within the same
+/// 2-minute `BRANCH_TIMEOUT`.
 pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
+    let stopped = format!(
+        "arena init-branches: it ran past its {SWITCH_BOUND_SECS} s on the pod and was stopped there (TERM) — the day's branch may \
+         be made but not pushed, or not made: check the branch on the pod"
+    );
+    let killed = format!(
+        "arena init-branches: it ran past its {SWITCH_BOUND_SECS} s on the pod and was killed there ({SWITCH_KILL_AFTER_SECS} s after \
+         the TERM) — the day's branch may be made but not pushed, or not made: check the branch on the pod"
+    );
+    bounded_sh(&init_branch_script(cfg, machine_name), "arena-init-branches", SWITCH_BOUND_SECS, SWITCH_KILL_AFTER_SECS, &stopped, &killed)
+}
+
+/// What [`init_branch_command`] runs on the pod, a POSIX `sh` script.
+fn init_branch_script(cfg: &BackupConfig, machine_name: &str) -> String {
     let branch = cfg.branch_for(machine_name);
     let bq = shell_quote(&branch);
     let mut parts: Vec<String> =
@@ -1092,6 +1112,23 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
     bounded_switch(&switch_script(repo_path, branch, git_ssh_key, hard), SWITCH_BOUND_SECS, SWITCH_KILL_AFTER_SECS)
 }
 
+/// `script` as the pod runs it: under `sh -c` (`$0` = `name`), whatever the login shell that `-c`s
+/// this — zsh on the pods, whose own rules (a glob with no match is fatal, an EXIT trap that then
+/// doesn't run) a script that sets real keys aside or puts them back must never meet — bounded by
+/// `timeout -k <kill_after> <secs>` when the pod has a `timeout` that takes `-k` (coreutils'; a
+/// probe finds out), else unbounded. A run `timeout` stopped says `stopped` (exit 124), or
+/// `killed` (137), on stderr. The script is in a variable, so it's carried once.
+fn bounded_sh(script: &str, name: &str, secs: u64, kill_after: u64, stopped: &str, killed: &str) -> String {
+    format!(
+        "ARENA_SH={}\nif timeout -k 1 1 true >/dev/null 2>&1; then timeout -k {kill_after} {secs} sh -c \"$ARENA_SH\" {name}; \
+         r=$?; if [ \"$r\" = 124 ]; then printf '%s\\n' {} >&2; elif [ \"$r\" = 137 ]; then printf '%s\\n' {} >&2; fi; exit \"$r\"; \
+         else exec sh -c \"$ARENA_SH\" {name}; fi",
+        shell_quote(script),
+        shell_quote(stopped),
+        shell_quote(killed)
+    )
+}
+
 /// How long a branch switch may run on the pod before `timeout` stops it there with TERM
 /// ([`checkout_command`]): a little under the CLI's and the TUI's `BRANCH_TIMEOUT` (2 min, which
 /// each checks at compile time against this plus [`SWITCH_KILL_AFTER_SECS`]), so the pod's side
@@ -1102,10 +1139,7 @@ pub const SWITCH_BOUND_SECS: u64 = 100;
 /// `timeout` KILLs it.
 pub const SWITCH_KILL_AFTER_SECS: u64 = 10;
 
-/// `script` as the pod runs it: under `sh -c` (whatever the login shell that `-c`s this), bounded by
-/// `timeout -k <kill_after> <secs>` when the pod has a `timeout` that takes `-k` (coreutils'; a
-/// probe finds out), else unbounded. A run `timeout` stopped says so on stderr. The script is in a
-/// variable, so it's carried once.
+/// [`bounded_sh`] for set-branch's switch, with its own words for a switch the bound stopped.
 fn bounded_switch(script: &str, secs: u64, kill_after: u64) -> String {
     let stopped = format!(
         "arena set-branch: the switch ran past its {secs} s on the pod and was stopped there (TERM, the real keys put back) — not switched, \
@@ -1116,14 +1150,7 @@ fn bounded_switch(script: &str, secs: u64, kill_after: u64) -> String {
          switched, or stopped part-way: check the branch and `git status` on the pod; real keys it set aside may still be in \
          .git/arena-unredacted/"
     );
-    format!(
-        "ARENA_SWITCH={}\nif timeout -k 1 1 true >/dev/null 2>&1; then timeout -k {kill_after} {secs} sh -c \"$ARENA_SWITCH\" arena-set-branch; \
-         r=$?; if [ \"$r\" = 124 ]; then printf '%s\\n' {} >&2; elif [ \"$r\" = 137 ]; then printf '%s\\n' {} >&2; fi; exit \"$r\"; \
-         else exec sh -c \"$ARENA_SWITCH\" arena-set-branch; fi",
-        shell_quote(script),
-        shell_quote(&stopped),
-        shell_quote(&killed)
-    )
+    bounded_sh(script, "arena-set-branch", secs, kill_after, &stopped, &killed)
 }
 
 /// The switch itself ([`checkout_command`]), a POSIX `sh` script.
@@ -2784,6 +2811,59 @@ done
         assert_eq!(s.read("README.md"), readme.as_bytes());
     }
 
+    /// FIX4B item 9: init-branches puts real keys back (`unredacted_restore`) — the participant's
+    /// working code — and ran under the login shell's `-c`, zsh on the pods, where a glob with no
+    /// match is fatal: a set-aside run left without its `.branch` ended the whole command at the
+    /// restore's `"$1"/*.branch`, before the push (nor did an EXIT trap run after it). Now its script
+    /// runs under `sh` whatever the login shell: under bash and zsh, the restore onto a day branch
+    /// that exists brings the key back, and in that no-match state the day's branch is still made
+    /// and pushed, the stray run left as it was.
+    #[cfg(unix)]
+    #[test]
+    fn init_branches_runs_under_sh_whatever_the_login_shell() {
+        let has = |sh: &str| std::process::Command::new(sh).args(["-c", "true"]).output().is_ok_and(|o| o.status.success());
+        let shells: Vec<&str> = ["bash", "zsh"].into_iter().filter(|sh| has(sh)).collect();
+        if !shells.contains(&"zsh") {
+            eprintln!("zsh isn't installed here: init-branches runs under bash only");
+        }
+        let path = std::env::var("PATH").unwrap_or_default();
+        for shell in shells {
+            let s = GitSandbox::new(&format!("init-{shell}"), 1_000_000);
+            let repo = s.work.to_str().unwrap();
+            let day = |d: u32| BackupConfig { repo_path: repo.to_string(), prefix: "devtest".into(), week: 1, day: d, git_ssh_key: None, origin: None };
+            let run = |cmd: String| {
+                let (code, out, err) = run_in(shell, &cmd, &path);
+                assert_eq!(code, Some(0), "{shell}: {out}{err}");
+                out
+            };
+            let head = || s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]);
+            // A key backed up redacted on today's branch, set aside by a reset to main, put back by
+            // the second init of the day.
+            run(init_branch_command(&day(2), "devtest-x"));
+            let readme = format!("notes\nKEY = \"{}\"\n", openrouter_key(27));
+            std::fs::write(s.work.join("README.md"), &readme).unwrap();
+            let (code, r, err) = s.backup();
+            assert_eq!((code, r.redacted.len()), (Some(0), 1), "{shell}: {err}");
+            assert!(run(checkout_command(repo, "main", None, true)).contains("UNREDACTED_KEPT README.md"), "{shell}");
+            let out = run(init_branch_command(&day(2), "devtest-x"));
+            assert!(out.contains("UNREDACTED_RESTORED README.md") && s.read("README.md") == readme.as_bytes(), "{shell}: {out}");
+            // A set-aside run with no `.branch`: no `*.branch` matches. The next day's branch is
+            // still made and pushed; the run stays.
+            let stray = s.work.join(".git/arena-unredacted/20260101T000000Z-1");
+            std::fs::create_dir_all(&stray).unwrap();
+            std::fs::write(stray.join("notes.md"), "kept\n").unwrap();
+            s.git(&s.work, &["checkout", "-q", "-f", "main"]);
+            run(init_branch_command(&day(3), "devtest-x"));
+            assert_eq!(head(), "autocommit-devtest-w1d3-x", "{shell}");
+            assert_eq!(
+                s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-devtest-w1d3-x"]),
+                s.git(&s.work, &["rev-parse", "HEAD"]),
+                "{shell}: pushed"
+            );
+            assert_eq!(std::fs::read_to_string(stray.join("notes.md")).unwrap(), "kept\n", "{shell}");
+        }
+    }
+
     /// The dry run's per-pod line pastes: next to the file its here-doc writes, it runs the
     /// backup (here through a stand-in `ssh` running the remote command locally); without the
     /// file the shell refuses to start it. The old line (`sh -c "$ARENA_BACKUP_SH" …`) expanded
@@ -2906,7 +2986,7 @@ done
         let mut c = cfg();
         c.week = 1;
         c.day = 4;
-        let cmd = init_branch_command(&c, "arena8-apple");
+        let cmd = init_branch_script(&c, "arena8-apple");
         assert!(cmd.contains("git fetch --prune origin") && !cmd.contains("--all"), "{cmd}");
         assert!(cmd.contains("git checkout -b 'autocommit-arena8-w1d4-apple'"));
         assert!(cmd.contains("git push -u origin 'autocommit-arena8-w1d4-apple'"));
@@ -2958,15 +3038,22 @@ done
         for hard in [false, true] {
             let c = checkout_command("/r", "main", Some("/k"), hard);
             let script = switch_script("/r", "main", Some("/k"), hard);
-            let head = format!("ARENA_SWITCH={}\n", shell_quote(&script));
+            let head = format!("ARENA_SH={}\n", shell_quote(&script));
             assert!(c.starts_with(&head), "{c}");
             let rest = &c[head.len()..];
-            assert!(rest.starts_with("if timeout -k 1 1 true >/dev/null 2>&1; then timeout -k 10 100 sh -c \"$ARENA_SWITCH\" arena-set-branch; r=$?;"), "{rest}");
-            assert!(rest.ends_with("exit \"$r\"; else exec sh -c \"$ARENA_SWITCH\" arena-set-branch; fi"), "{rest}");
+            assert!(rest.starts_with("if timeout -k 1 1 true >/dev/null 2>&1; then timeout -k 10 100 sh -c \"$ARENA_SH\" arena-set-branch; r=$?;"), "{rest}");
+            assert!(rest.ends_with("exit \"$r\"; else exec sh -c \"$ARENA_SH\" arena-set-branch; fi"), "{rest}");
             assert!(rest.contains("if [ \"$r\" = 124 ]") && rest.contains("ran past its 100 s on the pod and was stopped there"));
             assert!(rest.contains("elif [ \"$r\" = 137 ]") && rest.contains("was killed there (10 s after the TERM)"));
         }
         assert_eq!((SWITCH_BOUND_SECS, SWITCH_KILL_AFTER_SECS), (100, 10));
+        // init-branches the same way (FIX4B item 9: it puts real keys back too).
+        let init = init_branch_command(&cfg(), "arena8-apple");
+        let head = format!("ARENA_SH={}\n", shell_quote(&init_branch_script(&cfg(), "arena8-apple")));
+        assert!(init.starts_with(&head), "{init}");
+        let rest = &init[head.len()..];
+        assert!(rest.starts_with("if timeout -k 1 1 true >/dev/null 2>&1; then timeout -k 10 100 sh -c \"$ARENA_SH\" arena-init-branches; r=$?;"), "{rest}");
+        assert!(rest.ends_with("else exec sh -c \"$ARENA_SH\" arena-init-branches; fi") && rest.contains("arena init-branches: it ran past its 100 s"), "{rest}");
     }
 
     #[test]
@@ -3648,7 +3735,7 @@ done
         let gentle = switch_script("/r", "main", None, false);
         assert!(gentle.contains(BUSY_OP_SH) && gentle.find("busy_op").unwrap() < gentle.find("git fetch").unwrap());
         assert!(!switch_script("/r", "main", None, true).contains("busy_op"));
-        let init = init_branch_command(&cfg(), "arena8-apple");
+        let init = init_branch_script(&cfg(), "arena8-apple");
         assert!(init.find("busy_op").unwrap() < init.find("git checkout -b").unwrap());
         // On a branch it skips, the work there is only said, read-only, before the SKIP.
         let skip = &s[s.find("if [ \"$B\" = main ]").unwrap()..s.find("echo \"SKIP $B\"").unwrap()];

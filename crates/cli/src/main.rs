@@ -3181,8 +3181,9 @@ const BACKUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// GitHub — seconds normally, so 2 min means stuck (a hung fetch, a held lock).
 const BRANCH_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
-// The switch bounds itself on the pod (`timeout`, then a KILL) inside that budget, so its pod side
-// has ended before arena reports a timeout and releases the pod's lock (review ai-review claude #13).
+// set-branch's switch and init-branches bound themselves on the pod (`timeout`, then a KILL) inside
+// that budget, so their pod side has ended before arena reports a timeout and releases the pod's
+// lock (review ai-review claude #13).
 const _: () = assert!(arena_core::backup::SWITCH_BOUND_SECS + arena_core::backup::SWITCH_KILL_AFTER_SECS < BRANCH_TIMEOUT.as_secs());
 
 /// `pods cp`'s scp budget floor: connection setup, a small file, a slow start — 10 min.
@@ -22792,7 +22793,8 @@ mod remote_tests {
         let bcfg = BackupConfig::from_config(&cfg, 1, 2);
         for (name, port) in [("apple", 22001), ("cloud", 22003)] {
             let init = init_branch_command(&bcfg, &format!("devtest-{name}"));
-            assert!(init.contains("origin_check 'o/r'"), "the init command checks too");
+            // (The check is in the script the command runs under `sh -c`: its quotes escaped.)
+            assert!(init.contains(r"origin_check '\''o/r'\''"), "the init command checks too");
             assert_eq!(execs(&fake, port), [backup(name), (init, Some(BRANCH_TIMEOUT))], "{name}");
         }
     }

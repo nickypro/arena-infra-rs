@@ -867,7 +867,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     refused, touching nothing (`arena init-branches: a merge is in progress on <branch> — not
     switched …`, exit 6): `git checkout -b` would drop the merge and carry its conflicts onto the
     new branch, with nothing left to abort — and carry a `git am`, rebase or sequence onto it
-    half-done. No targets =
+    half-done. Landing on a day branch that exists, it puts back the real keys a switch set aside
+    on it; its script runs under `sh`, whatever the login shell (zsh on the pods, where a glob
+    with no match is fatal: a set-aside run left without its `.branch` ended the whole command
+    before the push), bounded on the pod like `set-branch`'s switch (100 s, then a KILL 10 s
+    later). No targets =
     this cohort's pods, as for `backup`.
   - `pods run [-t <targets>] [--timeout <secs>] <cmd>` / `pods test [targets]` — run an
     arbitrary command on every (selected) pod (concurrent, confirms first naming the pods;
