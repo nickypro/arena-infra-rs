@@ -34,7 +34,8 @@
 # redacted in the index as the backup redacts them (the file on disk keeps its keys) — all but the
 # verified course's: for a merge whose MERGE_HEAD is in refs/arena/course-main (fetched from the
 # configured course URL alone), what is staged as MERGE_HEAD has it goes in as published; and —
-# HEAD and the operation checked once more, and no conflict marker staged — the operation is
+# HEAD and the operation checked once more, no conflict marker staged, and the index still the
+# tree that was checked (`git write-tree`: nothing staged since) — the operation is
 # finished: a merge, a merge commit; a cherry-pick, `--continue`; a `git stash pop`'s conflicts,
 # added (the stash entry kept) — in the repo's own identity. A revert is never finished: its other
 # side is the commit it undoes, always older, so "the newer side" would undo nothing. <hours> and
@@ -537,13 +538,20 @@ case $what in
             tr '\n' '\0' < "$T.upd" | git update-index -z --index-info
         ) || fail "redacting keys in the staged files"
         awk 'FILENAME == ARGV[1] { n[$2] = $3; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " "); print "REDACTED " n[m[2]] " " substr($0, i + 1) }' "$T.map" "$T.upd"
+        # The index as checked and redacted, as a tree (its conflicts are resolved by now): what
+        # the commit must take, exactly. A `git add` the participant finishes after this — a key,
+        # a big file, a gitlink none of the checks saw — would go in with it (review ai-review
+        # codex #2), so it's compared again right before the commit.
+        TREE=$(git write-tree) || fail "writing the index as a tree"
         ;;
 esac
 p=$(staged_markers)
 [ -z "$p" ] || fail "conflict markers were added in $p"
 
 # --- Finish ----------------------------------------------------------------------------------
-# Once more, right before the commit: still this operation, on this HEAD, and git's index free.
+# Once more, right before the commit: still this operation, on this HEAD, git's index free, and
+# the index still the tree checked above — nothing staged since. (What's left is the instant
+# between that and git's own index lock in the commit: git has no lock that spans commands.)
 if [ -n "${ARENA_TEST_HOOK_BEFORE_FINISH:-}" ]; then (sh -c "$ARENA_TEST_HOOK_BEFORE_FINISH") > /dev/null 2>&1; fi
 kept="the state before is in ${S#"$TOP"/}/"
 case $what in
@@ -554,6 +562,7 @@ case $what in
         fi
         [ "$(git rev-parse -q --verify HEAD)" = "$HEAD0" ] || fail "changed before the commit: HEAD moved — $kept"
         [ ! -e "$G/index.lock" ] || fail "changed before the commit: git's index is locked — $kept"
+        [ "$(git write-tree 2>/dev/null)" = "$TREE" ] || fail "the index changed while arena was finishing it — nothing committed — $kept"
         ;;
 esac
 where="The state before is in ${S#"$TOP"/}/ on this machine (its README says how to see it or do this again yourself); today's copy: $COPY."

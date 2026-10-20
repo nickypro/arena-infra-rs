@@ -1482,8 +1482,8 @@ fn a_file_begun_by_hand_is_left_alone_and_one_as_the_merge_left_it_is_merged() {
 /// Re-checked right before anything changes (review ai-review codex #2): the participant aborts the
 /// merge, or aborts it and starts a rebase, while the state before is being kept — nothing is
 /// touched (the plan made for the merge is never applied to the rebase). And again right before
-/// the commit: the merge gone by then, or git's index locked — stopped, said, the state before
-/// already kept.
+/// the commit: the merge gone by then, git's index locked, or anything staged since the checks
+/// (review ai-review codex #2) — stopped, said, nothing committed, the state before already kept.
 #[cfg(unix)]
 #[test]
 fn the_state_is_read_again_right_before_changing_anything_and_before_the_commit() {
@@ -1545,23 +1545,43 @@ fn the_state_is_read_again_right_before_changing_anything_and_before_the_commit(
         r.untouched(&conflicts, case);
         assert_eq!(r.git(&r.work, &["rev-parse", "HEAD"]), head, "{case}");
     }
-    // Right before the commit.
+    // Right before the commit: the merge gone, git's index locked — or something staged after the
+    // checks and the redaction (review ai-review codex #2): a key-bearing file, one over the size
+    // limit (1000 bytes here), a nested repo (a gitlink) — each a `git add` finished in the
+    // meantime, which the commit would take unchecked. The index is no longer the tree checked:
+    // nothing committed.
     let hook = "ARENA_TEST_HOOK_BEFORE_FINISH";
-    for (case, cmd, why) in [
-        ("finish-abort", "git merge --abort", "changed before the commit: the merge isn't the one resolved any more — "),
-        ("finish-lock", ": > .git/index.lock", "changed before the commit: git's index is locked — "),
-    ] {
+    let key = format!("sk-or-v1-{}", "ab".repeat(32));
+    let changed = "the index changed while arena was finishing it — nothing committed — ";
+    let cases: [(&str, String, &str, u64); 5] = [
+        ("finish-abort", "git merge --abort".into(), "changed before the commit: the merge isn't the one resolved any more — ", GIT_MAX_FILE_BYTES_FOR_TESTS),
+        ("finish-lock", ": > .git/index.lock".into(), "changed before the commit: git's index is locked — ", GIT_MAX_FILE_BYTES_FOR_TESTS),
+        ("finish-key", format!("printf 'KEY = \"{key}\"\\n' > secret.py && git add secret.py"), changed, GIT_MAX_FILE_BYTES_FOR_TESTS),
+        ("finish-big", "head -c 4096 /dev/zero > big.bin && git add big.bin".into(), changed, 1000),
+        (
+            "finish-gitlink",
+            "git init -q nested && cd nested && echo 'n = 1' > n.py && git add n.py && git -c user.name=n -c user.email=n@n commit -q -m n && cd .. \
+             && git add nested"
+                .into(),
+            changed,
+            GIT_MAX_FILE_BYTES_FOR_TESTS,
+        ),
+    ];
+    for (case, cmd, why, max) in cases {
         let r = Repo::new(case);
         r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
         let head = r.git(&r.work, &["rev-parse", "HEAD"]);
         r.age(4 * HOUR);
-        let (code, rep, said) = r.resolve_with(3, &r.look(), GIT_MAX_FILE_BYTES_FOR_TESTS, &[(hook, &format!("cd '{}' && {cmd}", r.work.display()))]);
+        let (code, rep, said) = r.resolve_with(3, &r.look(), max, &[(hook, &format!("cd '{}' && {cmd}", r.work.display()))]);
         assert_eq!(code, Some(RESOLVE_FAILED_EXIT), "{case}: {said}");
         let failed = rep.failed.clone().unwrap_or_default();
         let stamp = rep.saved.as_deref().and_then(|s| s.rsplit('/').next()).unwrap_or("?").to_string();
         assert_eq!(failed, format!("{why}the state before is in .git/arena-resolved/{stamp}/"), "{case}: {said}");
         assert_eq!(r.git(&r.work, &["rev-parse", "HEAD"]), head, "{case}: nothing committed");
         assert!(r.work.join(".git/arena-resolved").join(&stamp).join("files/README.md").exists(), "{case}");
+        if why == changed {
+            assert!(r.work.join(".git/MERGE_HEAD").exists(), "{case}: the merge still in progress");
+        }
     }
 }
 
