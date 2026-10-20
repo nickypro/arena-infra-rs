@@ -6,8 +6,10 @@
 # (sent in the same call, before this) don't give: the pod's clock and uptime, load, disks,
 # logins and tmux sessions, the busiest processes, and the repo's working tree. Rendered and
 # parsed by arena_core::ask::bundle. POSIX sh (dash on the images); every step that could hang
-# runs under `timeout` where the pod has it. git runs with GIT_OPTIONAL_LOCKS=0, so `git status`
-# never refreshes (writes) the index or takes its lock from under a participant's git.
+# runs under `timeout` where the pod has it. Every git — `busy_op`'s included — is `ro_git`
+# (arena_core::metrics::RO_GIT_SH, rendered in below): no optional locks (the index is never
+# refreshed, written or locked from under a participant's git), and nothing the repository
+# configures is run — no fsmonitor hook, no clean/process filter, no gpg.program. No `git status`.
 #
 # Output, on stdout: `ARENA_ASK <key>=<value>` lines, and repeated `ARENA_ASK_<KIND> <fields>`
 # lines (PS, WHO, TMUX, FILE). Never a file's contents, shell history or the environment:
@@ -94,33 +96,43 @@ fi
 
 # --- The repo ------------------------------------------------------------------------------------
 # @ARENA_BUSY_OP_SH@
+# @ARENA_RO_GIT_SH@
 if [ -z "$REPO" ]; then
     o git none
 elif ! cd "$REPO" 2>/dev/null; then
     o git absent
 elif ! command -v git >/dev/null 2>&1; then
     o git nogit
-elif ! top=$(git rev-parse --show-toplevel 2>/dev/null) || ! cd "$top" 2>/dev/null; then
-    o git notrepo
 else
-    o git ok
-    o real "$(pwd -P)"
-    o branch "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
-    gd=$(git rev-parse --absolute-git-dir 2>/dev/null)
-    op=$(busy_op "$gd" 2>/dev/null)
-    if [ -z "$op" ] && { [ -d "$gd/rebase-merge" ] || [ -d "$gd/rebase-apply" ]; }; then op=rebase; fi
-    if [ -z "$op" ] && [ -f "$gd/BISECT_LOG" ]; then op=bisect; fi
-    o op "${op:--}"
-    if s=$(t 20 git status --porcelain=v1 --untracked-files=normal 2>/dev/null); then
-        o status ok
-        o modified "$(printf '%s\n' "$s" | grep . | grep -c -v '^??')"
-        o untracked "$(printf '%s\n' "$s" | grep -c '^??')"
-        printf '%s\n' "$s" | grep . | head -n 20 | sed -e 's/^/ARENA_ASK_FILE /'
+    # From here every `git` is `ro_git`, busy_op's `git ls-files -u` (an index read: an
+    # fsmonitor hook would run) included; `ro_git` itself reaches the binary.
+    git() { ro_git "$@"; }
+    if ! top=$(git rev-parse --show-toplevel 2>/dev/null) || ! cd "$top" 2>/dev/null; then
+        o git notrepo
     else
-        o status err
+        o git ok
+        o real "$(pwd -P)"
+        o branch "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+        gd=$(git rev-parse --absolute-git-dir 2>/dev/null)
+        op=$(busy_op "$gd" 2>/dev/null)
+        if [ -z "$op" ] && { [ -d "$gd/rebase-merge" ] || [ -d "$gd/rebase-apply" ]; }; then op=rebase; fi
+        if [ -z "$op" ] && [ -f "$gd/BISECT_LOG" ]; then op=bisect; fi
+        o op "${op:--}"
+        # The working tree from plumbing (`ro_changes`: a file only touched may count as
+        # modified), each git call within 10 s.
+        ro_timeout=10
+        if ro_setup && s=$(ro_changes 2>/dev/null); then
+            o status ok
+            o modified "$(printf '%s\n' "$s" | grep . | grep -c -v '^??')"
+            o untracked "$(printf '%s\n' "$s" | grep -c '^??')"
+            printf '%s\n' "$s" | grep . | head -n 20 | sed -e 's/^/ARENA_ASK_FILE /'
+        else
+            o status err
+        fi
+        ro_timeout=
+        o last "$(git log -1 --format='%ct %s' 2>/dev/null | head -c 300)"
+        o upstream "$(git rev-parse --abbrev-ref '@{u}' 2>/dev/null)"
+        o stashes "$(git stash list 2>/dev/null | wc -l | tr -cd '0-9')"
     fi
-    o last "$(git log -1 --format='%ct %s' 2>/dev/null | head -c 300)"
-    o upstream "$(git rev-parse --abbrev-ref '@{u}' 2>/dev/null)"
-    o stashes "$(git stash list 2>/dev/null | wc -l | tr -cd '0-9')"
 fi
 o done 1

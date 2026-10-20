@@ -9,7 +9,9 @@
 //! the progress column is simply blank — we don't guess.
 //!
 //! All of this is read-only: it only ever *reads* `nvidia-smi`, git state, a couple of
-//! file existence checks, and runs the operator's progress command. Parsing is pure and
+//! file existence checks, and runs the operator's progress command. Its git runs through
+//! [`RO_GIT_SH`]: nothing the participant's repository configures (an fsmonitor hook, a clean
+//! filter, a `gpg.program` for signed commits) is run, and nothing is written. Parsing is pure and
 //! unit-tested; the SSH call is thin, goes through a [`Remote`] (so it is testable with
 //! `FakeRemote`) and is bounded by [`PROBE_TIMEOUT`], so a wedged pod shows as an error
 //! row instead of stalling a `pods list` or a dashboard refresh.
@@ -25,6 +27,58 @@ pub const SENTINEL: &str = "@@ARENA_PROBE@@";
 /// output. Process names can contain `=`/`,`, so they get their own CSV section rather
 /// than going through the key=value parser.
 pub const PROC_SENTINEL: &str = "@@ARENA_PROC@@";
+
+/// POSIX sh functions for git that runs nothing the repository configures and writes nothing —
+/// the dashboard's probe and `pods ask`'s (`ask/probe.sh`, `busy_op`'s `git ls-files -u`
+/// included) read the participants' repos with them, as root, every few seconds:
+/// - `ro_git ARGS…`: `git --no-optional-locks` (no index refresh written, no `index.lock`), with
+///   `core.fsmonitor=` (no fsmonitor hook or daemon: an *empty* value is off in every git —
+///   `false` would be run as a hook path by git < 2.36), `core.untrackedCache=false`,
+///   `log.showSignature=false` (a signed commit would run `gpg.program`), and `$ro_filters`.
+///   `-c` reaches git's own children too (`stash list`'s `git log`). With `$ro_timeout` set, under
+///   `timeout` where the pod has it.
+/// - `ro_setup` (in the repo): `$ro_filters` empties every filter driver the config defines —
+///   no clean/smudge/process, not required: git hashes a racily-clean file's content even in
+///   plumbing, and that would run its clean filter. A driver a `.gitattributes` names but no
+///   config defines runs nothing anyway. Fails (nothing to compare with) when the config can't
+///   be read or a driver's name couldn't be passed back as one `-c` word.
+/// - `ro_changes`: `git status --porcelain`'s `XY path` lines, from plumbing that never reads a
+///   file's contents unless racily clean (then without filters): `diff-index --cached` (X),
+///   `diff-files` without refreshing (Y; submodules ignored — their `git status` would run their
+///   own helpers) and `ls-files --others` (`?? path`, an untracked directory as `dir/`). It may
+///   overcount: a file only touched (its stat changed, its content not) reads as modified until
+///   git refreshes the index — fine for a count. Fails when any of them does.
+pub const RO_GIT_SH: &str = r#"ro_git() {
+    if [ -n "${ro_timeout:-}" ] && command -v timeout >/dev/null 2>&1; then
+        set -- timeout "$ro_timeout" git --no-optional-locks -c core.fsmonitor= -c core.untrackedCache=false -c log.showSignature=false $ro_filters "$@"
+    else
+        set -- command git --no-optional-locks -c core.fsmonitor= -c core.untrackedCache=false -c log.showSignature=false $ro_filters "$@"
+    fi
+    "$@"
+}
+ro_setup() {
+    ro_filters=
+    ro_k=$(command git -c core.fsmonitor= config --name-only --get-regexp '^filter[.]' 2>/dev/null)
+    case $? in 0 | 1) ;; *) return 1 ;; esac
+    if printf '%s\n' "$ro_k" | LC_ALL=C grep -q '[^A-Za-z0-9._-]'; then return 1; fi
+    for ro_d in $(printf '%s\n' "$ro_k" | sed -e 's/^filter[.]//' -e 's/[.][^.]*$//' | sort -u); do
+        ro_filters="$ro_filters -c filter.$ro_d.clean= -c filter.$ro_d.smudge= -c filter.$ro_d.process= -c filter.$ro_d.required=false"
+    done
+}
+ro_changes() {
+    ro_base=HEAD
+    ro_git rev-parse -q --verify HEAD >/dev/null 2>&1 || ro_base=$(ro_git hash-object -t tree --stdin </dev/null) || return 1
+    ro_i=$(ro_git diff-index --cached --name-status --no-renames "$ro_base" --) || return 1
+    ro_w=$(ro_git diff-files --name-status --no-renames --ignore-submodules=all) || return 1
+    ro_o=$(ro_git ls-files --others --exclude-standard --directory --no-empty-directory) || return 1
+    { printf '%s\n' "$ro_i" | sed -e '/^$/d' -e 's/^/I /'; printf '%s\n' "$ro_w" | sed -e '/^$/d' -e 's/^/W /'; } |
+        awk '{ k = substr($0, 1, 1); r = substr($0, 3); t = index(r, "\t"); if (t < 2) next
+               p = substr(r, t + 1); if (!(p in seen)) { seen[p] = 1; order[++n] = p }
+               if (k == "I") { if (!(p in x)) x[p] = substr(r, 1, 1) } else if (!(p in y)) y[p] = substr(r, 1, 1) }
+             END { for (i = 1; i <= n; i++) { p = order[i]; printf "%s%s %s\n", ((p in x) ? x[p] : " "), ((p in y) ? y[p] : " "), p } }'
+    printf '%s\n' "$ro_o" | sed -e '/^$/d' -e 's/^/?? /'
+}
+"#;
 
 /// One GPU's stats. Fields are optional so a partial/odd row degrades gracefully.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -228,33 +282,35 @@ fn remote_command(opts: &ProbeOpts) -> String {
     let mut s = format!("{NVIDIA_SMI_QUERY} 2>/dev/null; echo '{SENTINEL}'; ");
     if let Some(repo) = &opts.repo_path {
         let q = shell_quote(repo);
+        // Every git here is `ro_git` ([`RO_GIT_SH`]): nothing the participant's repo configures
+        // runs, nothing is written (a plain `git status` would refresh and write the index
+        // under `index.lock`, so a refresh could fail the participant's own `git commit`).
+        s.push_str(RO_GIT_SH);
         s.push_str(&format!(
-            "echo \"branch=$(cd {q} 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null)\"; "
+            "echo \"branch=$(cd {q} 2>/dev/null && ro_git rev-parse --abbrev-ref HEAD 2>/dev/null)\"; "
         ));
         s.push_str(&format!(
-            "echo \"origin=$(cd {q} 2>/dev/null && git config --get remote.origin.url 2>/dev/null)\"; "
+            "echo \"origin=$(cd {q} 2>/dev/null && ro_git config --get remote.origin.url 2>/dev/null)\"; "
         ));
         // Last commit time (= last backup, since `pods backup` commits + pushes) and how
-        // many entries are uncommitted (work since that backup; 0 = clean tree).
+        // many entries are uncommitted (work since that backup; 0 = clean tree — a file only
+        // touched counts until git refreshes the index: see `ro_changes`).
         s.push_str(&format!(
-            "echo \"committed=$(cd {q} 2>/dev/null && git log -1 --format=%ct 2>/dev/null)\"; "
+            "echo \"committed=$(cd {q} 2>/dev/null && ro_git log -1 --format=%ct 2>/dev/null)\"; "
         ));
-        // `--no-optional-locks`: a plain `git status` refreshes the index and writes it back under
-        // `index.lock`, so a dashboard refresh could make the participant's own `git commit` fail
-        // with "index.lock exists". The read-only form never takes that lock.
         s.push_str(&format!(
-            "echo \"dirty=$(cd {q} 2>/dev/null && git --no-optional-locks status --porcelain 2>/dev/null | wc -l)\"; "
+            "echo \"dirty=$(cd {q} 2>/dev/null && ro_setup && ro_c=$(ro_changes 2>/dev/null) && printf '%s\\n' \"$ro_c\" | grep -c .)\"; "
         ));
         // Divergence vs the upstream: "<behind>\t<ahead>" (empty when there's no
         // upstream). ahead>0 means committed-but-unpushed — e.g. a push GitHub blocked.
         s.push_str(&format!(
-            "echo \"sync=$(cd {q} 2>/dev/null && git rev-list --left-right --count '@{{u}}...HEAD' 2>/dev/null)\"; "
+            "echo \"sync=$(cd {q} 2>/dev/null && ro_git rev-list --left-right --count '@{{u}}...HEAD' 2>/dev/null)\"; "
         ));
         // The last few commits, newest first — a compact backup/work history. One
         // `clog=` line per commit; the subject is free text (may contain '=') but it's
         // the whole value after the first '=', so it survives the key=value parse.
         s.push_str(&format!(
-            "(cd {q} 2>/dev/null && git log -n 4 --format='clog=%h  %cr  %s' 2>/dev/null); "
+            "(cd {q} 2>/dev/null && ro_git log -n 4 --format='clog=%h  %cr  %s' 2>/dev/null); "
         ));
     }
     s.push_str("([ -e \"$HOME/.name\" ] && echo name=1 || echo name=0); ");
@@ -638,7 +694,9 @@ mod tests {
         assert!(cmd.contains("git log -1 --format=%ct"));
         assert!(cmd.contains("git log -n 4 --format='clog=%h"));
         assert!(cmd.contains("--query-compute-apps=pid,used_memory,process_name"));
-        assert!(cmd.contains("git --no-optional-locks status --porcelain"));
+        // Its git is the read-only kind, and never `git status` (refresh, filters, fsmonitor).
+        assert!(cmd.contains(RO_GIT_SH) && cmd.contains("ro_setup && ro_c=$(ro_changes"));
+        assert!(!cmd.contains("git status") && !cmd.contains("&& git "), "{cmd}");
         assert!(cmd.contains("echo hf=1"));
         assert!(cmd.contains("echo cc=1"));
         assert!(cmd.contains("/proc/stat"));

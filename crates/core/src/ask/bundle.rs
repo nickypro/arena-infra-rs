@@ -59,9 +59,10 @@ const END: &str = "@@ARENA_ASK_END@@";
 pub const PROBE_SCRIPT: &str = include_str!("probe.sh");
 
 /// [`PROBE_SCRIPT`] with the backup's `busy_op` function in place of its marker — one
-/// definition of "an operation in progress" for the backup, the branch switches and this.
+/// definition of "an operation in progress" for the backup, the branch switches and this — and
+/// the dashboard probe's read-only git ([`metrics::RO_GIT_SH`]) in place of its own.
 pub fn probe_script() -> String {
-    PROBE_SCRIPT.replacen("# @ARENA_BUSY_OP_SH@", crate::backup::BUSY_OP_SH, 1)
+    PROBE_SCRIPT.replacen("# @ARENA_BUSY_OP_SH@", crate::backup::BUSY_OP_SH, 1).replacen("# @ARENA_RO_GIT_SH@", metrics::RO_GIT_SH, 1)
 }
 
 fn sq(s: &str) -> String {
@@ -69,9 +70,10 @@ fn sq(s: &str) -> String {
 }
 
 /// The one remote command for a pod's bundle (see the module doc). `GIT_OPTIONAL_LOCKS=0` first:
-/// the metrics probe's own `git status` already passes `--no-optional-locks`, and this keeps any
-/// other git in the call from refreshing (writing) the index or taking its lock under a
-/// participant's git too (the extra probe, under `env -i`, sets its own). The extra probe goes base64 (no quoting of its own) under `env -i`
+/// the metrics probe's and the extra probe's git is `ro_git` ([`metrics::RO_GIT_SH`]: no locks,
+/// nothing of the repo's own run), and this keeps any other git in the call from refreshing
+/// (writing) the index or taking its lock under a participant's git too (the extra probe, under
+/// `env -i`, sets its own). The extra probe goes base64 (no quoting of its own) under `env -i`
 /// with a fixed `PATH` — nothing from the pod's environment but `HOME` — as POSIX `sh`, like the
 /// reaper's probe; `repo` is quoted, never spliced into the script.
 pub fn probe_command(opts: &ProbeOpts, repo: &str) -> String {
@@ -130,7 +132,7 @@ pub struct Repo {
     pub op: Option<String>,
     pub modified: Option<u32>,
     pub untracked: Option<u32>,
-    /// `git status --porcelain` lines (`XY path`), the first [`FILES_SHOWN`]; empty when the
+    /// `git status --porcelain`-style lines (`XY path`, from `ro_changes`), the first [`FILES_SHOWN`]; empty when the
     /// status couldn't be read (then `modified`/`untracked` are `None` too).
     pub files: Vec<String>,
     /// The last commit: committer time (unix) and subject.
@@ -780,7 +782,7 @@ fn repo_blocks(repo_path: &str, m: Option<&PodMetrics>, x: Option<&Extra>, local
     if !repo.files.is_empty() {
         let files: Vec<String> = repo.files.iter().map(|f| status_line(f)).collect();
         blocks.push(Block::list(
-            format!("    changed files (git status XY codes, `.` = unchanged; the first {FILES_SHOWN}):"),
+            format!("    changed files (git status XY codes, `.` = unchanged; a file only touched can show as M; the first {FILES_SHOWN}):"),
             files,
             3,
             5,
@@ -1213,6 +1215,138 @@ mod tests {
         assert!(c.contains(&jobs::list_command()) && c.contains(&jobs::read_tail_command(LOG_BYTES)), "the jobs reads, as is");
         assert!(c.ends_with(&format!(" arena-ask-probe '/root/it'\\''s'; echo '{END}'")), "{}", &c[c.len() - 80..]);
         assert!(probe_script().contains("busy_op() {") && !probe_script().contains("@ARENA_BUSY_OP_SH@"));
+        assert!(probe_script().contains(metrics::RO_GIT_SH) && !probe_script().contains("@ARENA_RO_GIT_SH@"));
+        // No `git status` anywhere it runs (comments aside): it refreshes, filters, asks fsmonitor.
+        let code = |text: &str| text.lines().filter(|l| !l.trim_start().starts_with('#')).collect::<Vec<_>>().join("\n");
+        assert!(!code(&probe_script()).contains("git status") && !code(&c).contains("git status"));
+    }
+
+    /// Strictly read-only, for real: a repo whose config runs a helper at every turn — an
+    /// fsmonitor hook (any index read), a clean filter on every file (made racily clean, so
+    /// even plumbing compares contents), a submodule with its own clean filter and a touched
+    /// file, a signed HEAD with `log.showSignature` and a `gpg.program` — and each helper writes
+    /// a marker. Neither the dashboard's probe nor `pods ask`'s whole command runs any of them,
+    /// and the index is untouched; plain git, on the same repo, runs every one (the fixture is
+    /// armed).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_probes_run_nothing_the_repository_configures() {
+        use std::process::{Command, Stdio};
+        let have = |t: &str| Command::new("sh").arg("-c").arg(format!("command -v {t}")).output().is_ok_and(|o| o.status.success());
+        if !["git", "ps", "base64", "timeout", "df", "du", "touch"].iter().all(|t| have(t)) {
+            eprintln!("git/ps/base64/timeout/df/du/touch missing — skipping");
+            return;
+        }
+        let t = crate::ask::ai::tests::Tmp::new("helpers");
+        let (home, marks) = (t.0.join("home"), t.0.join("marks"));
+        let (repo, sub) = (home.join("ARENA_materials"), home.join("ARENA_materials/sub"));
+        for d in [&marks, &sub] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let helper = |name: &str, then: &str| {
+            let p = t.0.join(name);
+            crate::remote::write_test_script(&p, format!("#!/bin/sh\necho \"$*\" >> {}/{name}\n{then}\n", marks.display())).unwrap();
+            p.display().to_string()
+        };
+        let (fsmonitor, clean, sub_clean, gpg) =
+            (helper("fsmonitor", "exit 1"), helper("clean-filter", "cat"), helper("submodule-clean-filter", "cat"), helper("gpg", "cat >/dev/null; exit 1"));
+        let git_in = |dir: &std::path::Path, args: &[&str], input: Option<&str>| {
+            let mut c = Command::new("git");
+            c.args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main", "-c", "advice.addEmbeddedRepo=false"])
+                .args(args)
+                .current_dir(dir)
+                .env("HOME", &home)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = c.spawn().unwrap();
+            if let Some(i) = input {
+                use std::io::Write;
+                child.stdin.take().unwrap().write_all(i.as_bytes()).unwrap();
+            }
+            let o = child.wait_with_output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let git = |args: &[&str]| git_in(&repo, args, None);
+        // The repo and its submodule, committed before any helper is configured.
+        git_in(&sub, &["init", "-q"], None);
+        std::fs::write(sub.join("s.txt"), "s\n").unwrap();
+        std::fs::write(sub.join(".gitattributes"), "* filter=subevil\n").unwrap();
+        git_in(&sub, &["add", "."], None);
+        git_in(&sub, &["commit", "-q", "-m", "s"], None);
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        std::fs::write(repo.join("c.txt"), "c\n").unwrap();
+        std::fs::write(repo.join(".gitattributes"), "* filter=evil\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "first"]);
+        // A signed HEAD: a gpgsig header is all `log --show-signature` needs to call gpg.program.
+        let signed = format!(
+            "tree {}\nparent {}\nauthor t <t@example.com> 1700000000 +0000\ncommitter t <t@example.com> 1700000000 +0000\n\
+             gpgsig -----BEGIN PGP SIGNATURE-----\n \n iQEzBAABCAAdFiEE\n -----END PGP SIGNATURE-----\n\nsigned\n",
+            git(&["rev-parse", "HEAD^{tree}"]),
+            git(&["rev-parse", "HEAD"])
+        );
+        let commit = git_in(&repo, &["hash-object", "-w", "-t", "commit", "--stdin"], Some(&signed));
+        git(&["update-ref", "refs/heads/main", &commit]);
+        // The helpers.
+        git_in(&sub, &["config", "filter.subevil.clean", &format!("{sub_clean} %f")], None);
+        for (k, v) in [
+            ("core.fsmonitor", fsmonitor.as_str()),
+            ("filter.evil.clean", &format!("{clean} %f")),
+            ("filter.evil.required", "true"),
+            ("log.showSignature", "true"),
+            ("gpg.program", gpg.as_str()),
+        ] {
+            git(&["config", k, v]);
+        }
+        // Work: a.txt modified, notes.txt new; the submodule's file touched (stat-dirty, which
+        // its own `git status` would hash through its filter); every index entry racily clean.
+        std::fs::write(repo.join("a.txt"), "a2\n").unwrap();
+        std::fs::write(repo.join("notes.txt"), "n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(sub.join("s.txt"), "s\n").unwrap();
+        let touched = Command::new("touch").args(["-d", "@978307200"]).arg(repo.join(".git/index")).status().unwrap();
+        assert!(touched.success());
+        let index = std::fs::read(repo.join(".git/index")).unwrap();
+        let fired = || {
+            let mut v: Vec<String> = std::fs::read_dir(&marks).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            v.sort();
+            v
+        };
+        let clear = || std::fs::read_dir(&marks).unwrap().flatten().for_each(|e| std::fs::remove_file(e.path()).unwrap());
+        clear();
+
+        let opts = ProbeOpts { repo_path: Some(repo.display().to_string()), key_remote: None, progress_cmd: None };
+        let sh = |cmd: String| {
+            let o = Command::new("sh").arg("-c").arg(cmd).current_dir(&home).env("HOME", &home).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        };
+        let dashboard = metrics::parse_probe_output(&sh(metrics::probe_command(&opts)));
+        assert_eq!(fired(), Vec::<String>::new(), "the dashboard's probe ran the repo's helpers");
+        assert_eq!((dashboard.dirty_files, dashboard.recent_commits.first().map(|c| c.ends_with("signed"))), (Some(2), Some(true)), "{dashboard:?}");
+        let stdout = sh(probe_command(&opts, &repo.display().to_string()));
+        assert_eq!(fired(), Vec::<String>::new(), "`pods ask`'s probe ran the repo's helpers");
+        let r = parse_reply(&stdout).unwrap();
+        let Some(Git::Repo(g)) = r.extra.as_ref().and_then(|x| x.git.as_ref()) else { panic!("{stdout}") };
+        assert_eq!((g.modified, g.untracked, g.files.clone()), (Some(1), Some(1), vec![" M a.txt".to_string(), "?? notes.txt".into()]), "{stdout}");
+        assert_eq!(g.last.as_ref().map(|(_, s)| s.as_str()), Some("signed"));
+        assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), index, "the index was written");
+
+        // Armed: plain git runs every helper here.
+        git(&["status", "--porcelain"]);
+        assert_eq!(fired(), ["clean-filter", "fsmonitor", "submodule-clean-filter"]);
+        clear();
+        git(&["-c", "core.fsmonitor=", "diff-files"]);
+        assert_eq!(fired(), ["clean-filter", "submodule-clean-filter"], "plumbing hashes racily-clean files through their filter");
+        clear();
+        git(&["-c", "core.fsmonitor=", "log", "-1", "--format=%ct"]);
+        assert_eq!(fired(), ["gpg"]);
+        clear();
+        git(&["ls-files", "-u"]);
+        assert_eq!(fired(), ["fsmonitor"], "busy_op's index read asks fsmonitor");
     }
 
     /// The command for real, under `sh` against a temp home with a real git checkout (a merge
@@ -1272,8 +1406,9 @@ mod tests {
         assert!(x.done, "{stdout}");
         let Some(Git::Repo(g)) = &x.git else { panic!("{:?}\n{stdout}", x.git) };
         assert_eq!(g.branch.as_deref(), Some("autocommit-devtest-w1d2-alpha"));
-        assert_eq!((g.modified, g.untracked, g.op.as_deref(), g.stashes), (Some(1), Some(1), Some("merge"), Some(0)), "{stdout}");
-        assert_eq!(g.files, [" M a.py", "?? notes.txt"]);
+        // b.py, only touched, counts as modified: the plumbing doesn't refresh (or read) it.
+        assert_eq!((g.modified, g.untracked, g.op.as_deref(), g.stashes), (Some(2), Some(1), Some("merge"), Some(0)), "{stdout}");
+        assert_eq!(g.files, [" M a.py", " M b.py", "?? notes.txt"]);
         assert_eq!(g.last.as_ref().map(|(_, s)| s.as_str()), Some("first"));
         assert_eq!(g.upstream, None);
         assert!(x.df_root.is_some() && x.home_kb.is_some() && x.uptime.is_some() && x.nvidia_smi.is_some(), "{x:?}");
@@ -1281,7 +1416,7 @@ mod tests {
         let ps = x.procs.as_ref().unwrap().as_ref().unwrap();
         assert!(!ps.is_empty() && ps.iter().all(|p| !p.args.contains("arena-ask-probe") && !p.args.contains("ps -eo")), "{ps:?}");
         let m = r.metrics.as_ref().unwrap();
-        assert_eq!((m.branch.as_deref(), m.dirty_files, m.has_name, m.has_key), (Some("autocommit-devtest-w1d2-alpha"), Some(2), Some(false), Some(false)));
+        assert_eq!((m.branch.as_deref(), m.dirty_files, m.has_name, m.has_key), (Some("autocommit-devtest-w1d2-alpha"), Some(3), Some(false), Some(false)));
         assert!(matches!(&r.jobs, Some(Ok(j)) if j.is_empty()), "{:?}", r.jobs);
         assert!(matches!(&r.log, Some(Ok(ReadReply::NoJobs))), "{:?}", r.log);
         assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), index, "the probe wrote the index");

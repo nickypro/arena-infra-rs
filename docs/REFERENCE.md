@@ -1242,22 +1242,26 @@ Name pods or pass `--all` (this cohort's; `--include-non-cohort` for every pod; 
 
 #### What it reads
 
-Read-only, one SSH call per pod (60 s budget; `GIT_OPTIONAL_LOCKS=0`, so not even git's index is
-written): the dashboard's metrics probe (GPUs and their processes, CPU, memory, the root disk, the
-repo's branch, origin, commits not pushed, recent commit subjects, whether `~/.name`, the deploy key
-and the API/HF/Claude Code tokens are set up), `pods jobs`' listing and the newest job's last 40 log
-lines, and a small probe: the pod's clock and uptime, load, `/`, `/workspace` and the home's size,
-logins (user, tty, time — **not** where from), tmux sessions, the busiest processes by CPU and
-memory with their arguments, the repo's working tree (counts, the first 20 changed file **names**,
-stashes, the last commit, and an operation in progress by the backup's own test — a merge,
-cherry-pick, revert, `git am`, rebase, sequence or a stash pop's conflicts — read as what it means:
-the backup is BUSY, how the participant ends it, and whether `pods backup` finishes it after
-`BUSY_AUTO_RESOLVE_HOURS`). With it, from this machine: the pod's listing row (status, GPU, $/h,
-endpoint, age, lock, maintenance), its last `pods test --deep` verdict, which local file backups
-(`pods pull`) exist of it, the backup's record of its last whole copy while BUSY
-(`busy-copies.json`: the operation, how long ago, the snapshot label and whether that copy is still
-here — never the local path), and the branch today's backups go to. A stopped or unreachable pod is
-its listing and why.
+Read-only, one SSH call per pod (60 s budget). It reads: the dashboard's metrics probe (GPUs and
+their processes, CPU, memory, the root disk, the repo's branch, origin, commits not pushed, recent
+commit subjects, whether `~/.name`, the deploy key and the API/HF/Claude Code tokens are set up),
+`pods jobs`' listing and the newest job's last 40 log lines, and a small probe: the pod's clock and
+uptime, load, `/`, `/workspace` and the home's size, logins (user, tty, time — **not** where from),
+tmux sessions, the busiest processes by CPU and memory with their arguments, the repo's working tree
+(counts, the first 20 changed file **names**, stashes, the last commit, and an operation in progress
+by the backup's own test — a merge, cherry-pick, revert, `git am`, rebase, sequence or a stash pop's
+conflicts — read as what it means: the backup is BUSY, how the participant ends it, and whether
+`pods backup` finishes it after `BUSY_AUTO_RESOLVE_HOURS`). With it, from this machine: the pod's
+listing row (status, GPU, $/h, endpoint, age, lock, maintenance), its last `pods test --deep`
+verdict, which local file backups (`pods pull`) exist of it, the backup's record of its last whole
+copy while BUSY (`busy-copies.json`: the operation, how long ago, the snapshot label and whether
+that copy is still here — never the local path), and the branch today's backups go to. A stopped or
+unreachable pod is its listing and why.
+
+Its git — the dashboard's probe's too — writes nothing and runs nothing the participant's repo
+configures: no optional locks (not even the index is refreshed), no fsmonitor hook, no clean/process
+filter, no `gpg.program`, no submodule's own `git status`; the working tree is read from plumbing
+that doesn't refresh, so a file only touched counts as modified until git next refreshes the index.
 
 **Never read or sent**: file contents, shell history, the environment, `~/.arena` beyond the jobs'
 status and the newest log tail, where a login comes from, arena's config or keys.
