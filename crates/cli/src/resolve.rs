@@ -17,7 +17,7 @@ use arena_core::resolve::{self as core_resolve, BusyCopies, BusyCopy, CopiedNow,
 use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
-use crate::{each_pod, exec_each_pod, failure_why, take_pod_locks, Pulled, Selected, Unpushed, BACKUP_TIMEOUT, POD_LOCK_WAIT};
+use crate::{each_pod, exec_each_pod, failure_why, take_pod_locks, BackupFailed, Pulled, Selected, Unpushed, BACKUP_TIMEOUT, POD_LOCK_WAIT};
 
 /// How long a look may take: a `git ls-files` and a `stat` of the checkout.
 const LOOK_TIMEOUT: Duration = Duration::from_secs(120);
@@ -296,15 +296,19 @@ impl Settled {
         unpushed.iter().filter(|u| !self.done.contains(&u.pod)).cloned().collect()
     }
 
-    /// The git step's result once finished pods are backed up: the failures `unpushed` counted
-    /// less those; none left — `Ok`. Nothing finished: `git` as it was.
-    pub(crate) fn git(&self, git: anyhow::Result<()>, unpushed: &[Unpushed]) -> anyhow::Result<()> {
-        if self.done.is_empty() || git.is_ok() {
-            return git;
-        }
-        match unpushed.iter().filter(|u| !self.done.contains(&u.pod)).count() {
-            0 => Ok(()),
-            n => Err(anyhow::anyhow!("{n} pod(s) failed to back up")),
+    /// The git step's result once finished pods are backed up: its failure ([`BackupFailed`],
+    /// which names every pod that failed — before its push or at it, any way) less the pods
+    /// finished and backed up since; none left — `Ok`. Any other failure, or nothing finished:
+    /// `git` as it was. The count is never rebuilt from anything but those names: a pod that
+    /// failed some other way stays a failure.
+    pub(crate) fn git(&self, git: anyhow::Result<()>) -> anyhow::Result<()> {
+        let Err(e) = git else { return Ok(()) };
+        let Some(failed) = e.downcast_ref::<BackupFailed>().filter(|_| !self.done.is_empty()) else { return Err(e) };
+        let left: Vec<String> = failed.pods.iter().filter(|p| !self.done.contains(p)).cloned().collect();
+        if left.is_empty() {
+            Ok(())
+        } else {
+            Err(BackupFailed { pods: left }.into())
         }
     }
 }

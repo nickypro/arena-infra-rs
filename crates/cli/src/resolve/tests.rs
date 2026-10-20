@@ -5,7 +5,7 @@
 //! missing or corrupt: copied).
 
 use super::Settled;
-use crate::{handle_full_backup, Selected, Unpushed, BACKUP_TIMEOUT};
+use crate::{handle_full_backup, BackupFailed, Selected, Unpushed, BACKUP_TIMEOUT};
 use arena_core::backup::{backup_command, BACKUP_BUSY_EXIT};
 use arena_core::remote::{FakeRemote, FakeReply, RemoteCall, PROBE_TIMEOUT};
 use arena_core::resolve::{self as core_resolve, BusyCopy};
@@ -381,22 +381,53 @@ async fn a_resolve_that_fails_or_a_backup_after_it_that_fails_is_said() {
     }
 }
 
-/// A pod finished and backed up is no longer one of the run's failures, nor given the line of one.
+/// A pod finished and backed up is no longer one of the run's failures, nor given the line of one —
+/// and only those pods come off the count: the git step's failure names each pod that failed,
+/// whichever way (review ai-review claude #3, codex #8), never rebuilt from the BUSY pods.
 #[test]
-fn a_finished_pod_is_no_longer_a_failure() {
+fn a_finished_pod_is_no_longer_a_failure_and_no_other_failure_is_hidden() {
     let u = |p: &str| Unpushed { pod: p.into(), why: "w".into(), branch: None, at_push: true, wrong_origin: false, busy: Some("merge".into()) };
     let unpushed = vec![u("devtest-a"), u("devtest-b")];
-    let failed = || Err(anyhow::anyhow!("2 pod(s) failed to back up"));
+    let failed = |pods: &[&str]| -> anyhow::Result<()> { Err(BackupFailed { pods: pods.iter().map(|p| p.to_string()).collect() }.into()) };
     let one = Settled { lines: vec![], done: vec!["devtest-a".into()] };
     assert_eq!(one.unsettled(&unpushed), vec![u("devtest-b")]);
-    assert_eq!(one.git(failed(), &unpushed).unwrap_err().to_string(), "1 pod(s) failed to back up");
+    assert_eq!(one.git(failed(&["devtest-a", "devtest-b"])).unwrap_err().to_string(), "1 pod(s) failed to back up");
+    // One that failed before its push (ssh refused, a `set -e` exit): never taken back.
+    let left = one.git(failed(&["devtest-a", "devtest-c"])).unwrap_err();
+    assert_eq!((left.to_string(), left.downcast_ref::<BackupFailed>().map(|f| f.pods.clone())), ("1 pod(s) failed to back up".to_string(), Some(vec!["devtest-c".to_string()])));
+    assert!(one.git(failed(&["devtest-a"])).is_ok());
     let both = Settled { lines: vec![], done: vec!["devtest-a".into(), "devtest-b".into()] };
     assert!(both.unsettled(&unpushed).is_empty());
-    assert!(both.git(failed(), &unpushed).is_ok());
+    assert!(both.git(failed(&["devtest-a", "devtest-b"])).is_ok());
+    assert_eq!(both.git(failed(&["devtest-a", "devtest-b", "devtest-c", "devtest-d"])).unwrap_err().to_string(), "2 pod(s) failed to back up");
     let none = Settled::default();
     assert_eq!(none.unsettled(&unpushed), unpushed);
-    assert_eq!(none.git(failed(), &unpushed).unwrap_err().to_string(), "2 pod(s) failed to back up");
-    assert!(none.git(Ok(()), &unpushed).is_ok());
+    assert_eq!(none.git(failed(&["devtest-a", "devtest-b"])).unwrap_err().to_string(), "2 pod(s) failed to back up");
+    assert!(none.git(Ok(())).is_ok());
+    // Any other failure of the git step: as it was.
+    assert_eq!(one.git(Err(anyhow::anyhow!("no SSH targets"))).unwrap_err().to_string(), "no SSH targets");
+}
+
+/// The cron's run where one pod's backup fails before its push (ssh refused) while another, BUSY,
+/// is finished: the run still fails, for the one.
+#[tokio::test]
+async fn a_pod_that_failed_before_its_push_stays_a_failure_when_another_is_finished() {
+    for (case, apple) in [
+        ("ssh", FakeReply::exit(255, "ssh: connect to host 10.0.0.1 port 22001: Connection refused")),
+        ("set-e", FakeReply::exit(128, "fatal: not a git repository (or any of the parent directories): .git")),
+    ] {
+        let w = World::new(&format!("other-failure-{case}"));
+        let cfg = w.cfg("");
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [apple]);
+        fake.script(&host(22002), [busy(), look(now(), 4 * HOUR, "11-22"), repo_in_place(), resolved(), pushed("autocommit-b")]);
+        let _ = crate::take_said();
+        let err = handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &w.rsync_path()).await.unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) failed to back up", "{case}");
+        assert_eq!(err.downcast_ref::<BackupFailed>().map(|f| f.pods.clone()), Some(vec!["devtest-apple".to_string()]), "{case}");
+        let said = crate::take_said();
+        assert!(said.iter().any(|l| l.starts_with("✓ devtest-bloom -> autocommit-b — finished a merge")), "{case}: {said:#?}");
+    }
 }
 
 /// `config check` says when a BUSY pod is finished — by default, as set, or never — and a value it

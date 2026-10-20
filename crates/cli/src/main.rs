@@ -5645,17 +5645,37 @@ async fn handle_backup(
     let t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}"), |name| locks.done(name)).await;
     println!(
         "\nDone: {} pushed, {} unchanged, {} skipped (main/master), {} failed.",
-        t.pushed, t.unchanged, t.skipped, t.failed
+        t.pushed,
+        t.unchanged,
+        t.skipped,
+        t.failed.len()
     );
     // The pods on main/master, after the counts — the line the operator acts on (never a failure).
     let fleet_wide = !sel.named && t.pushed + t.unchanged == 0;
     on_protected_lines(&Naming::from_config(cfg), &t.on_protected, fleet_wide).iter().for_each(|l| say(l));
     unpushed.extend(t.unpushed);
-    if t.failed > 0 {
-        anyhow::bail!("{} pod(s) failed to back up", t.failed);
+    if !t.failed.is_empty() {
+        return Err(BackupFailed { pods: t.failed }.into());
     }
     Ok(())
 }
+
+/// `pods backup`'s git step failed for these pods — whichever way (before the push: no repo, ssh
+/// refused, a `set -e` exit; or at it) — said as `N pod(s) failed to back up`. It names them so
+/// the step that finishes an operation left in progress ([`resolve::Settled::git`]) can take back
+/// exactly the pods it finished and backed up, and no other failure (review ai-review claude #3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackupFailed {
+    pods: Vec<String>,
+}
+
+impl std::fmt::Display for BackupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} pod(s) failed to back up", self.pods.len())
+    }
+}
+
+impl std::error::Error for BackupFailed {}
 
 /// `pods backup`: git-push the selected pods' current branches, then (unless `no_pull`)
 /// rsync their homes — both over the SAME selection, resolved once by the caller. Under
@@ -5735,7 +5755,7 @@ async fn handle_full_backup(
         let settled = busy.settle(&remote, cfg, &pulled, true, message.as_deref()).await;
         print_fallback_copies(&settled.unsettled(&unpushed), &pulled);
         settled.print();
-        return both_failures(settled.git(git_result, &unpushed), pulled.and_then(Pulled::result), &locks.busy);
+        return both_failures(settled.git(git_result), pulled.and_then(Pulled::result), &locks.busy);
     }
     if no_pull && dry_run {
         println!(
@@ -5748,7 +5768,7 @@ async fn handle_full_backup(
     let settled = busy.settle(&remote, cfg, &pulled, false, message.as_deref()).await;
     print_fallback_copies(&settled.unsettled(&copying), &pulled);
     settled.print();
-    both_failures(settled.git(git_result, &unpushed), pulled.and_then(Pulled::result), &locks.busy)
+    both_failures(settled.git(git_result), pulled.and_then(Pulled::result), &locks.busy)
 }
 
 /// A pod whose git push failed must never be left with no copy at all: live, the */15 cron runs
@@ -5841,7 +5861,8 @@ struct BackupTally {
     pushed: usize,
     unchanged: usize,
     skipped: usize,
-    failed: usize,
+    /// The pods that failed, by name (in finishing order), whichever way.
+    failed: Vec<String>,
     /// The pods whose git push failed — for the copy the backup makes of them instead.
     unpushed: Vec<Unpushed>,
     /// The `skipped` pods, each with the protected branch it's on (`(name, branch)`): said in
@@ -6017,7 +6038,7 @@ async fn backup_fleet(
             // A failure the script explained (a big file or a key GitHub refuses, a heal cut short,
             // an operation in progress).
             Ok(out) if report.failure(repo, name, out.code).is_some() => {
-                t.failed += 1;
+                t.failed.push(name.clone());
                 let why = report.failure_brief(out.code).unwrap_or_else(|| failure_why(&call));
                 let wrong_origin = report.wrong_origin_why(out.code).is_some();
                 let busy = report.in_progress(out.code).map(String::from);
@@ -6025,7 +6046,7 @@ async fn backup_fleet(
                 format!("[{done}/{total}] ✗ {name}: {}", report.failure(repo, name, out.code).unwrap_or_default())
             }
             _ => {
-                t.failed += 1;
+                t.failed.push(name.clone());
                 let at_push = report.failed_at_push();
                 t.unpushed.push(Unpushed { pod: name.clone(), why: failure_why(&call), branch: report.branch.clone(), at_push, wrong_origin: false, busy: None });
                 failure_line(done, total, name, &call)
@@ -22396,7 +22417,7 @@ mod remote_tests {
                 pushed: 1,
                 unchanged: 1,
                 skipped: 1,
-                failed: 2,
+                failed: vec!["devtest-echo".to_string(), "devtest-bloom".to_string()],
                 unpushed: vec![
                     failed("devtest-echo", "exit 128: fatal: Could not read from remote repository."),
                     failed("devtest-bloom", "timed out after 300s"),
@@ -22664,7 +22685,7 @@ mod remote_tests {
         let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
         let mut lines = Vec::new();
         let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
-        assert_eq!((tally.pushed, tally.failed), (1, 1));
+        assert_eq!((tally.pushed, tally.failed.len()), (1, 1));
         let bloom = Unpushed { pod: "devtest-bloom".into(), why: WRONG_WHY.into(), branch: None, at_push: false, wrong_origin: true, busy: None };
         assert_eq!(tally.unpushed, std::slice::from_ref(&bloom));
         let mut got = unnumbered(&lines);
@@ -22986,7 +23007,7 @@ mod remote_tests {
         let jobs = targets(&fleet()).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
         let mut lines = Vec::new();
         let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
-        assert_eq!((tally.pushed, tally.unchanged, tally.failed), (1, 1, 1));
+        assert_eq!((tally.pushed, tally.unchanged, tally.failed.len()), (1, 1, 1));
         let mut got = unnumbered(&lines);
         got.sort();
         assert_eq!(
