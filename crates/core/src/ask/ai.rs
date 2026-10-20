@@ -336,13 +336,12 @@ pub async fn ask(ai: Ai, prompt: &str, model: Option<&str>, timeout: Duration, e
 pub mod fixtures {
     use super::*;
 
-    /// An executable `name` in `dir` running `body` under sh.
+    /// An executable `name` in `dir` running `body` under sh — written by
+    /// [`crate::remote::write_test_script`], never held open here, so another test thread's fork
+    /// can't make it "Text file busy" when it runs.
     #[cfg(unix)]
     pub fn stub(dir: &Path, name: &str, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let f = dir.join(name);
-        std::fs::write(&f, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::remote::write_test_script(dir.join(name), format!("#!/bin/sh\n{body}\n")).unwrap();
     }
 
     /// Stub `claude` and `codex` in `<tmp>/bin` that record their argv (one per line), stdin
