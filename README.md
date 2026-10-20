@@ -1008,17 +1008,25 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `/` and `/workspace`; host load + uptime; what setup's VS Code warm-up left (newest
     server, extensions, default interpreter — an informational `vscode` line, Pass or Skip,
     never WARN/FAIL). The provider's maintenance window comes from
-    the API. **FAIL**: any CUDA/tensor/copy/NCCL error, count mismatch, missing
-    torch/nvidia-smi, driver below the floor, unreachable/timed out. On a **MIG slice**, or
-    wherever nvidia-smi can't answer (missing, an error such as NVML's `Insufficient
-    Permissions`, no GPUs listed), the GPUs are judged by torch's own checks (its count, a
-    tensor op on each, the memory it reports): if they all pass, a MIG slice PASSes and any
-    other machine WARNs (else it FAILs as before), the driver comes from
-    `/proc/driver/nvidia/version` or, failing that, torch's CUDA driver version against the CUDA
-    floor (the CUDA column marks it `12.8*`), and torch's count is matched with the slices
-    `nvidia-smi -L` lists (fewer passes: CUDA may show a process just one slice). **WARN**: download
-    < 2 MB/s or unreachable, < 10 GB free, host load above max(32, host CPUs), a
-    maintenance window. Driver floor: `MIN_DRIVER_VERSION` (`none` = off), else derived from
+    the API. **FAIL**: any CUDA/tensor/copy/NCCL error, count mismatch (torch's count against
+    nvidia-smi's, and against the GPUs the provider reports for the pod: fewer fails),
+    missing torch/nvidia-smi, driver below the floor, unreachable/timed out. The torch
+    fallback is for **MIG slices only**: where a slice's nvidia-smi can't answer (missing, an
+    error such as NVML's `Insufficient Permissions`, a timeout, no GPUs listed), torch's own
+    checks stand in (its count, a tensor op on each, the memory it reports) and the slice
+    PASSes if they all pass. Anywhere else a failing nvidia-smi FAILs whatever torch says: on
+    whole cards that is how a GPU fallen off the bus looks, and torch sees only the survivors.
+    With no driver version from nvidia-smi, the driver comes from
+    `/proc/driver/nvidia/version` or, failing that, the CUDA version the driver supports
+    (libcuda's, else torch's) against the CUDA floor (the CUDA column marks it `12.8*`). Under
+    MIG, torch's count is matched with the slices `nvidia-smi -L` lists and the provider's
+    count: the same PASSes, more FAILs, fewer **WARNs** — `torch sees 1 of the 2 MIG slices —
+    CUDA may show a process one slice; check each with CUDA_VISIBLE_DEVICES=<MIG uuid>`, as the
+    other slice may be inaccessible or broken. A machine with whole cards beside its slices is
+    counted as whole GPUs when `--query-gpu` lists more cards than there are slices; one whose
+    whole cards don't outnumber its slices can't be told from a pure MIG one, and isn't
+    supported. **WARN**: download < 2 MB/s or unreachable, < 10 GB free, host load above
+    max(32, host CPUs), a maintenance window, a MIG undercount. Driver floor: `MIN_DRIVER_VERSION` (`none` = off), else derived from
     the create's CUDA floor — `MIN_CUDA_VERSION`, else the lowest of `ALLOWED_CUDA_VERSIONS`
     / `EXACT_CUDA_VERSIONS` (13.x → 580, 12.8 → 570, 12.4 → 550, …; one that isn't a version
     is an error, as a malformed `MIN_DRIVER_VERSION` is) — else no driver check. Hetzner CPU VMs skip the GPU checks (decided by
