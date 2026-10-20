@@ -39,9 +39,6 @@ t() {
 
 # --- Clock, uptime, load ------------------------------------------------------------------------
 o now "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
-# The zone `who` prints its times in — the pod's own (/etc/localtime: no TZ here) — its name and
-# offset.
-o tz "$(date +%Z 2>/dev/null) $(date +%z 2>/dev/null)"
 up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
 up=${up%%.*}
 o uptime "$up"
@@ -69,8 +66,10 @@ o home_kb "$(t 10 du -skx "$HOME" 2>/dev/null | cut -f1)"
 # more than ISO's `2026-10-20 15:27`): every field up to the `(source)` comment is kept, never it.
 # The comment only says how the login came: `(tmux(8987).%0)` a tmux pane, `(:0)` or none a local
 # one, anything else (an address, a host) over ssh — the first word of each line, before the user.
+# Its times in UTC (`TZ=UTC`): in the pod's own zone each would be at that time's offset, and one
+# label can't be right for a login from before a clock change.
 if command -v who >/dev/null 2>&1; then
-    if w=$(t 5 who 2>/dev/null); then
+    if w=$(TZ=UTC; export TZ; t 5 who 2>/dev/null); then
         o who ok
         printf '%s\n' "$w" |
             awk -v t="ARENA_ASK_WHO.$N" 'NF >= 2 {

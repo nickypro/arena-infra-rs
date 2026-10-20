@@ -1252,7 +1252,7 @@ processes, CPU, memory, the root disk, the repo's branch, origin, commits not pu
 subjects, whether `~/.name`, the deploy key and the API/HF/Claude Code tokens are set up — never
 `PROGRESS_CMD`, your own command, which may write), `pods jobs`' listing and the newest job's last
 40 log lines, and a small probe: the pod's clock and uptime, load, `/`, `/workspace` and the home's
-size, logins (user, tty, time — labelled with the pod's time zone — and whether each is an SSH
+size, logins (user, tty, time — in UTC, whatever the pod's zone — and whether each is an SSH
 session, a tmux pane or local — **not** where from), tmux sessions, the busiest processes by CPU and
 memory (each command's shape only: below), the repo's working tree (counts, the first 20 changed file **names**,
 stashes, the last commit, and an operation in progress by the backup's own test — a merge,
