@@ -1,7 +1,7 @@
 # arena resolve: finish an operation left in progress in one pod's checkout once nothing in it has
 # changed for a while — what `pods backup` runs on a pod whose backup said BUSY, after copying it.
 #
-#   set -- <repo> <quiet secs> <op> <print> <hours> <copy> <max file bytes> <limit bytes> <course>   (its first line)
+#   set -- <repo> <quiet secs> <op> <print> <hours> <copy> <max file bytes> <limit bytes>   (its first line)
 #
 # Rendered and parsed by arena_core::resolve (resolve_command / parse_resolve), which prepends that
 # first line and runs it under `sh -c`, whatever the pod's login shell, bounded by `timeout` there
@@ -34,11 +34,10 @@
 # HEAD, the conflicts, the index, every file — and the pod looked at again for anyone at work
 # (every condition of the first look: a terminal used, a git command running, …), and if any of it
 # changed, nothing is touched. Then the paths are staged; for a merge or a cherry-pick every staged
-# path is checked again, and each staged regular file that isn't HEAD's version has its keys
-# redacted in the index as the backup redacts them (the file on disk keeps its keys) — all but the
-# verified course's: for a merge whose MERGE_HEAD is in refs/arena/course-main (fetched from the
-# configured course URL <course> alone, by the backup or by this, as course.sh says), what is staged
-# as MERGE_HEAD has it goes in as published; and —
+# path is checked again, and each staged regular file that is neither HEAD's version nor the other
+# side's (what the participant made) has its keys redacted in the index as the backup redacts them
+# (the file on disk keeps its keys) — what is staged exactly as the other side has it is left to
+# the backup, whose scan of the commits going out redacts it before any push; and —
 # HEAD and the operation checked once more, no conflict marker staged, and the index still the
 # tree that was checked (`git write-tree`: nothing staged since) — the operation is
 # finished: a merge, a merge commit; a cherry-pick, `--continue`; a `git stash pop`'s conflicts,
@@ -54,10 +53,6 @@
 #   GONE <side> <HEAD's time> <the other side's time> <path>   removed: the newer side deleted it
 #   HAND <path>              kept as it is on disk (resolved by hand) and added
 #   REDACTED <n> <path>      staged with its n key(s) redacted; the file on disk keeps them
-#   COURSE_UNVERIFIED <url>  the course couldn't be fetched from <url> to verify the merged commit is
-#                            its own: what came in from it is redacted like the participant's own
-#   COURSE_REWRITTEN <url>   the pod's git config rewrites <url> (`url.<base>.insteadOf`): the course
-#                            isn't asked, and what came in from it is redacted the same way
 #   RESOLVED <what>          finished (exit 0)
 #   FAILED <step>            a step failed midway (exit 8): SAVED has the state before
 # ARENA_TEST_HOOK_BEFORE_CHANGE and ARENA_TEST_HOOK_BEFORE_FINISH, commands run right before the
@@ -80,7 +75,6 @@ HOURS=$5
 COPY=$6
 MAX=$7
 LIMIT=$8
-COURSE_REPO=${9:-}
 cd "$REPO" || exit 2
 cd "$(git rev-parse --show-toplevel)" || exit 2
 TOP=$(pwd)
@@ -93,15 +87,8 @@ export GIT_OPTIONAL_LOCKS=0
 REVERT_WORDS=@ARENA_REVERT_WORDS@
 T="$G/arena-resolve.$$"
 trap 'rm -rf "$T".*' EXIT
-: > "$T.start"
 TAB=$(printf '\t')
 # @ARENA_REDACT_SH@
-# @ARENA_COURSE_SH@
-COURSE_URL=
-if [ -n "$COURSE_REPO" ]; then COURSE_URL=$(course_url "$COURSE_REPO"); fi
-COURSE_REFS=
-COURSE_TRIED=
-COURSE_WHO='arena resolve'
 refuse() { echo "REFUSED $*"; exit 7; }
 fail() { echo "FAILED $*"; exit 8; }
 LOOKED=$(arena_look)
@@ -162,19 +149,6 @@ case $what in
     *) other='the stash' them="the stash" ref='stash@{0}' ;;
 esac
 [ "$head" != - ] || refuse "conflicts with no stash entry they came from"
-# Whether the other side is the course's own history, verified (review ai-review codex #3): only a
-# merge whose MERGE_HEAD is in refs/arena/course-main — the ref nothing but a fetch from the
-# configured course URL writes (course.sh: an earlier run's, the backup's or this one's, trusted by
-# the backup's own rule, `course_trust`; or this run's, below). Then what is staged as MERGE_HEAD has
-# it is the course's, public already: committed as published. Matching the other side proves
-# nothing by itself: a cherry-pick of the participant's own commit, a merge of their own branch — or
-# any merge the course can't be asked about — is theirs, keys and all, so it's redacted like
-# anything they made.
-COURSE=no
-if [ "$what" = merge ]; then
-    course_trust
-    if [ -n "$COURSE_REFS" ] && git merge-base --is-ancestor "$head" refs/arena/course-main 2>/dev/null; then COURSE=yes; fi
-fi
 if [ "$what" = merge ] && [ "$(wc -l < "$G/MERGE_HEAD")" -ne 1 ]; then refuse "a merge of several branches"; fi
 HEAD0=$(git rev-parse -q --verify HEAD) || refuse "no HEAD commit"
 ours_tip=$(git log -1 --no-show-signature --format=%ct HEAD 2>/dev/null) || refuse "no HEAD commit"
@@ -286,9 +260,9 @@ unfit() {
     awk '{ split($0, m, " ") } m[2] == "100644" || m[2] == "100755" || m[2] == "120000" { print m[3] }' "$T.st" | sort -u \
         | git cat-file --batch-check='%(objectname) %(objectsize)' > "$T.ss" || { echo "the staged files' sizes couldn't be read"; return; }
     # Sized by git's limit (<max file bytes>) — but what is staged as the other side has it by
-    # GitHub's (<limit bytes>), verified or not (review ai-review claude #1): its blob goes out with
-    # the other side's commit anyway, which the backup sizes by that limit, and refusing it here
-    # would leave every such merge BUSY for good (claude #3), protecting nothing.
+    # GitHub's (<limit bytes>) (review ai-review claude #1): its blob goes out with the other side's
+    # commit anyway, which the backup sizes by that limit, and refusing it here would leave every
+    # such merge BUSY for good (claude #3), protecting nothing.
     _s=$(awk -v max="$MAX" -v limit="$LIMIT" -v them="$them ($ref)" -v what="$what" '
         FILENAME == ARGV[1] { s[$1] = $2; next }
         { i = index($0, "\t"); p = substr($0, i + 1); split(substr($0, 1, i - 1), m, " ") }
@@ -341,25 +315,6 @@ case $what in
         [ -z "$why" ] || refuse "$why"
         ;;
 esac
-# The course asked, as the backup asks it (course.sh's `course_verify`), when that matters — and
-# only then (review ai-review claude #1: a BUSY pod's backup stops before its own scan, so for a
-# conflicted `git pull upstream main` nothing had fetched the ref, and the course's own key-like
-# strings were committed redacted, every time): a merge of a commit upstream's main has that the
-# ref doesn't (yet), and a key-like string in what may be staged from it — a path staged as
-# MERGE_HEAD has it, or a conflicted path's MERGE_HEAD side. Asked before anything is touched. A
-# fetch that fails, or a course URL the pod's config rewrites: nothing exempt, said (its line).
-if [ "$what" = merge ] && [ "$COURSE" = no ] && [ -n "$COURSE_URL" ] \
-    && git merge-base --is-ancestor "$head" refs/remotes/upstream/main 2>/dev/null; then
-    {
-        awk '{ i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") } (m[2] == "100644" || m[2] == "100755") && m[5] == "theirs" { print m[3] }' "$T.st"
-        tr '\0' '\n' < "$T.u" | awk '{ i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") } m[3] == "3" && (m[1] == "100644" || m[1] == "100755") { print m[2] }'
-    } | LC_ALL=C sort -u > "$T.ob"
-    if [ -s "$T.ob" ]; then
-        # (A failed scan counts as a key: then the course is asked, which costs one fetch.)
-        git cat-file --batch < "$T.ob" | LC_ALL=C grep -aqE -- "$SECRET_RE"
-        if [ "$?" -ne 1 ] && course_verify && git merge-base --is-ancestor "$head" refs/arena/course-main 2>/dev/null; then COURSE=yes; fi
-    fi
-fi
 
 # --- Each conflicted path's way (nothing touched yet) ---------------------------------------
 # One line per path: its stages (e.g. 123, 23), each stage's mode and blob (- for none), the path.
@@ -654,15 +609,17 @@ done < "$T.plan"
 
 # --- What the commit takes: every staged path, keys redacted ---------------------------------
 # Every path staged against HEAD fits (`unfit`, as before anything was touched — now with what was
-# staged above). Then each regular file the commit takes — a file resolved by hand, now or `git
-# add`ed before this ran, one merged per hunk, one taken whole from either side, one added
-# mid-merge, one only the other side changed — goes in with the keys redact.sh knows redacted, in
-# the index only: the file on disk keeps them, so the participant's code still runs. A key in it
-# never enters a commit (the backup after this would redact what it commits, but this commit is
-# made first). Only the verified course's own content (COURSE: a merge of refs/arena/course-main's
-# history) — what is staged as MERGE_HEAD has it — goes in as it was published; HEAD's is
-# committed already. A stash pop's conflicts make no commit here: the backup after commits them,
-# redacted.
+# staged above). Then each regular file the commit takes that the participant made — neither
+# HEAD's version nor the other side's: a file resolved by hand, now or `git add`ed before this ran,
+# one merged per hunk into something of both sides, one added mid-merge — goes in with the keys
+# redact.sh knows redacted, in the index only: the file on disk keeps them, so the participant's
+# code still runs. A key in it never enters a commit (the backup after this would redact what it
+# commits, but this commit is made first). What is staged exactly as the other side has it
+# (MERGE_HEAD's, CHERRY_PICK_HEAD's version of that path: one only that side changed, one taken
+# whole from it) goes in as that side has it, as HEAD's is committed already: the backup scans
+# every commit origin doesn't have before it pushes — the course's own too (FIX8) — and rewrites
+# one holding a key redacted. A stash pop's conflicts make no commit here: the backup after
+# commits them, redacted.
 #
 # The checks cover exactly what is committed (review ai-review codex #2, claude #5): the index is
 # taken as a tree first ($TREE0), then checked — `unfit` (sizes, gitlinks, notebooks) and the
@@ -682,13 +639,13 @@ case $what in
         [ -z "$p" ] || fail "conflict markers were added in $p"
         [ "$(git write-tree 2>/dev/null)" = "$TREE0" ] || fail "the index changed while arena was checking it — nothing committed — $kept"
         # Each such file: `<mode> <blob><TAB><path>`.
-        awk -v course="$COURSE" '{ i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
-            (m[2] == "100644" || m[2] == "100755") && !(course == "yes" && m[5] == "theirs") { print m[2] " " m[3] "\t" substr($0, i + 1) }' "$T.st" > "$T.rc"
+        awk '{ i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
+            (m[2] == "100644" || m[2] == "100755") && m[5] == "yours" { print m[2] " " m[3] "\t" substr($0, i + 1) }' "$T.st" > "$T.rc"
         (
             set -e
             cut -f1 "$T.rc" | cut -d' ' -f2 | sort -u > "$T.rcb"
             while read -r b; do redact_blob "$b"; done < "$T.rcb" > "$T.map"
-            # Those paths alone (the same blob elsewhere, the course's, stays as it is).
+            # Those paths alone (the same blob elsewhere, the other side's, stays as it is).
             awk 'FILENAME == ARGV[1] { r[$1] = $2; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
                 m[2] in r { print m[1] " " r[m[2]] " 0\t" substr($0, i + 1) }' "$T.map" "$T.rc" > "$T.upd"
         ) || fail "redacting keys in the staged files"

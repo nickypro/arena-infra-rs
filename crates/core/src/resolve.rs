@@ -94,21 +94,19 @@ pub fn look_command(repo: &str) -> String {
 }
 
 /// The resolve script (`resolve.sh`, its header documents it), the look, the redaction
-/// ([`crate::backup::redact_sh`], as the backup commits), the verified course
-/// ([`crate::backup::course_sh`], as the backup asks it) and [`REVERT_WORDS`] rendered in.
+/// ([`crate::backup::redact_sh`], as the backup commits) and [`REVERT_WORDS`] rendered in.
 pub fn resolve_script() -> String {
     include_str!("resolve.sh")
         .replacen(BUSY_OP_MARK, crate::backup::BUSY_OP_SH, 1)
         .replacen(LOOK_SH_MARK, look_sh().trim_end(), 1)
         .replacen(REDACT_SH_MARK, crate::backup::redact_sh().trim_end(), 1)
-        .replacen(crate::backup::COURSE_SH_MARK, crate::backup::course_sh().trim_end(), 1)
         .replacen(REVERT_WORDS_MARK, &shell_word(REVERT_WORDS), 1)
 }
 
 /// The resolve of one pod: [`resolve_command_limited`] with the backup's own size limit
 /// ([`crate::backup::GIT_MAX_FILE_BYTES`]): a resolved file over it is never committed.
-pub fn resolve_command(repo: &str, hours: u64, op: &str, print: &str, copy: &str, course: Option<&str>) -> String {
-    resolve_command_limited(repo, hours, op, print, copy, crate::backup::GIT_MAX_FILE_BYTES, course)
+pub fn resolve_command(repo: &str, hours: u64, op: &str, print: &str, copy: &str) -> String {
+    resolve_command_limited(repo, hours, op, print, copy, crate::backup::GIT_MAX_FILE_BYTES)
 }
 
 /// How long the resolve may run on the pod before `timeout` stops it there with TERM: under the
@@ -130,13 +128,9 @@ pub const RESOLVE_KILL_AFTER_SECS: u64 = 10;
 /// [`Look::print`]), the copy's name for the commit's words (`copy`: `w2d1/devtest-alice`), and
 /// the largest file it may commit (`max_bytes`; tests pass a small one) — what is staged as the
 /// other side has it by GitHub's limit instead ([`crate::backup::GITHUB_FILE_LIMIT_BYTES`], what
-/// the backup sizes the commits it pushes by) — and the course repo, as the backup is given it
-/// (`course`: [`crate::backup::course_repo`]'s `owner/name`; tests pass a local path; `None`: no
-/// course, nothing verified): a merge of what `git pull upstream main` brought, holding a
-/// key-like string, asks it which commits are its own the way the backup does (FIX7, review
-/// ai-review claude #1) — bounded on the pod ([`RESOLVE_BOUND_SECS`]).
-pub fn resolve_command_limited(repo: &str, hours: u64, op: &str, print: &str, copy: &str, max_bytes: u64, course: Option<&str>) -> String {
-    resolve_command_bounded(repo, hours, op, print, copy, max_bytes, course, (RESOLVE_BOUND_SECS, RESOLVE_KILL_AFTER_SECS))
+/// the backup sizes the commits it pushes by) — bounded on the pod ([`RESOLVE_BOUND_SECS`]).
+pub fn resolve_command_limited(repo: &str, hours: u64, op: &str, print: &str, copy: &str, max_bytes: u64) -> String {
+    resolve_command_bounded(repo, hours, op, print, copy, max_bytes, (RESOLVE_BOUND_SECS, RESOLVE_KILL_AFTER_SECS))
 }
 
 /// [`resolve_command_limited`] bounded by `bound`: TERM after `.0` seconds, KILL `.1` later
@@ -146,12 +140,11 @@ pub fn resolve_command_limited(repo: &str, hours: u64, op: &str, print: &str, co
 /// the pod has a `timeout` that takes it (else unbounded, as before). Its arguments are the
 /// script's first line (`set -- …`), so the wrapper hands it nothing but the script. Stopped there,
 /// it says so on stderr (exit 124, or 137 after the KILL).
-#[allow(clippy::too_many_arguments)]
-fn resolve_command_bounded(repo: &str, hours: u64, op: &str, print: &str, copy: &str, max_bytes: u64, course: Option<&str>, bound: (u64, u64)) -> String {
+fn resolve_command_bounded(repo: &str, hours: u64, op: &str, print: &str, copy: &str, max_bytes: u64, bound: (u64, u64)) -> String {
     let (secs, kill_after) = bound;
     let (quiet, h, max) = ((hours * 3600).to_string(), hours.to_string(), max_bytes.to_string());
     let limit = crate::backup::GITHUB_FILE_LIMIT_BYTES.to_string();
-    let args = [repo, &quiet, op, print, &h, copy, &max, &limit, course.unwrap_or("")].map(shell_word).join(" ");
+    let args = [repo, &quiet, op, print, &h, copy, &max, &limit].map(shell_word).join(" ");
     let script = format!("set -- {args}\n{}", resolve_script());
     let (stopped, killed) = resolve_stop_words(secs, kill_after);
     crate::backup::bounded_sh(&script, "arena-resolve", secs, kill_after, &stopped, &killed)
@@ -682,12 +675,6 @@ pub struct ResolveReport {
     pub refused: Option<String>,
     /// The step that failed midway.
     pub failed: Option<String>,
-    /// The course couldn't be fetched to verify the merged commit is its own
-    /// (`COURSE_UNVERIFIED <url>`): what came in from it was redacted like the participant's own.
-    pub course_unverified: Option<String>,
-    /// The pod's git config rewrites the course URL (`COURSE_REWRITTEN <url>`): the course wasn't
-    /// asked, and what came in from it was redacted the same way.
-    pub course_rewritten: Option<String>,
 }
 
 /// Parse a resolve's stdout (`resolve.sh`'s header lists the lines). Unknown lines (git's own)
@@ -729,8 +716,6 @@ pub fn parse_resolve(stdout: &str) -> ResolveReport {
             "SAVED" if !rest.is_empty() => r.saved = Some(rest.to_string()),
             "REFUSED" => r.refused = Some(rest.trim().to_string()),
             "FAILED" => r.failed = Some(rest.trim().to_string()),
-            "COURSE_UNVERIFIED" if !rest.trim().is_empty() => r.course_unverified = Some(rest.trim().to_string()),
-            "COURSE_REWRITTEN" if !rest.trim().is_empty() => r.course_rewritten = Some(rest.trim().to_string()),
             "RESOLVED" if !rest.trim().is_empty() => r.resolved = Some(rest.trim().to_string()),
             _ => {}
         }
@@ -760,8 +745,7 @@ pub fn minute_words(t: u64) -> String {
 /// MERGE_HEAD's side of each conflict, HEAD 2026-10-09 12:00Z / MERGE_HEAD 2026-10-14 08:30Z;
 /// notes.py: as resolved by hand; before: /root/ARENA_materials/.git/arena-resolved/20261019T140200Z/
 /// on the pod; today's copy: /b/w2d1/devtest-alice)`. For a `git stash pop`'s conflicts, that its
-/// stash entry is kept; keys redacted in the commit, named; and a course that couldn't be asked
-/// whether the merged commit is its own, said (its key-like strings then redacted). Pure.
+/// stash entry is kept; keys redacted in the commit, named. Pure.
 pub fn resolved_note(r: &ResolveReport, hours: u64, copy: &str) -> String {
     let what = r.resolved.as_deref().unwrap_or("merge");
     let done = match what {
@@ -784,18 +768,7 @@ pub fn resolved_note(r: &ResolveReport, hours: u64, copy: &str) -> String {
         .collect();
     ways.extend(r.hand.iter().map(|p| format!("{p}: as resolved by hand")));
     let ways = if ways.is_empty() { "nothing was left in conflict".to_string() } else { ways.join("; ") };
-    let mut keys = if r.redacted.is_empty() { String::new() } else { format!("; keys redacted in the commit (kept on disk): {}", r.redacted.join(", ")) };
-    if let Some(url) = &r.course_unverified {
-        keys.push_str(&format!(
-            "; couldn't reach the course repo ({url}) to verify the merged commit is its own, so what came in from it was redacted like \
-             the participant's own"
-        ));
-    } else if let Some(url) = &r.course_rewritten {
-        keys.push_str(&format!(
-            "; the pod's git config rewrites the course repo's URL ({url}: a `url.<base>.insteadOf`), so the merged commit wasn't \
-             verified and what came in from it was redacted like the participant's own"
-        ));
-    }
+    let keys = if r.redacted.is_empty() { String::new() } else { format!("; keys redacted in the commit (kept on disk): {}", r.redacted.join(", ")) };
     let before = r.saved.as_ref().map_or_else(String::new, |s| format!("before: {}/ on the pod; ", s.trim_end_matches('/')));
     format!("{done} ({ways}{keys}; {before}today's copy: {copy})")
 }

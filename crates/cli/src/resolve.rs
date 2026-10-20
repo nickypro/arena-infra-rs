@@ -224,15 +224,14 @@ impl Busy {
         let repo = backup::repo_path(cfg);
         let key = cfg.get("GIT_SSH_KEY_REMOTE").map(String::from);
         let origin = backup::configured_repo(cfg);
-        // The course repo, as every other backup passes it: its own commits go out unrewritten — and
-        // the resolve asks it the same way whether a merge's other side is its own.
+        // The course repo, as every other backup passes it: its own commits go out unrewritten.
         let course = backup::course_repo(cfg);
         let jobs = candidates
             .into_iter()
             .filter(|(n, ..)| !locks.busy.contains(n))
             .filter_map(|(name, target, look, last)| {
                 let look = look?;
-                let resolve = core_resolve::resolve_command(&repo, hours, &look.op_key(), &look.print, &last.label, course.as_deref());
+                let resolve = core_resolve::resolve_command(&repo, hours, &look.op_key(), &look.print, &last.label);
                 // The backup's own message, as `pods backup` gave it.
                 let msg = message.map_or_else(|| format!("arena backup {name}"), String::from);
                 let again = backup::backup_command_with_course(&repo, key.as_deref(), &msg, origin.as_deref(), course.as_deref());
