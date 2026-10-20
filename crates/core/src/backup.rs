@@ -1361,14 +1361,10 @@ mod tests {
         (run("sed", &["-E", &redact_sed()]), run("grep", &["-aoE", "--", &secret_regex()]).lines().count())
     }
 
-    /// The patterns, through the very sed/grep programs the pods run: every kind of key (in the
-    /// places a participant pastes one — code, `.env` lines, a notebook's JSON after a `\n`
-    /// escape) becomes its REDACTED text with everything around it byte-identical; look-alikes
-    /// (`sklearn`, `task-or-v1-…`, short or long bodies, UUIDs, `hf_hub_download`, a bare
-    /// `sk-…`, a notebook's base64 image) stay exactly as they are.
-    #[cfg(unix)]
-    #[test]
-    fn secret_patterns_redact_every_kind_of_key_and_no_lookalike() {
+    /// A line holding each kind of key, in the places a participant pastes one (code, `.env`
+    /// lines, a notebook's JSON after a `\n` escape, coloured output, a URL), as `(the line, what
+    /// the redaction makes of it, how many keys it counts)`.
+    fn key_cases() -> Vec<(String, String, usize)> {
         let or = openrouter_key(1);
         let or2 = openrouter_key(2);
         let ant = |kind: &str| format!("{}{kind}-{}AA", "sk-ant-", body(URLSAFE, 93, 3));
@@ -1378,7 +1374,7 @@ mod tests {
         let google = format!("{}{}", "AIza", body(URLSAFE, 35, 14));
         let groq = format!("{}{}", "gsk_", body(ALNUM, 52, 15));
         // (input line, what git gets, keys counted)
-        let keys: Vec<(String, String, usize)> = vec![
+        vec![
             (format!("export OPENROUTER_API_KEY={or}"), "export OPENROUTER_API_KEY=REDACTED-OPENROUTER-KEY".into(), 1),
             (or.clone(), "REDACTED-OPENROUTER-KEY".into(), 1),
             (format!("client = OpenAI(api_key=\"{or}\", base_url=u)"), "client = OpenAI(api_key=\"REDACTED-OPENROUTER-KEY\", base_url=u)".into(), 1),
@@ -1407,16 +1403,16 @@ mod tests {
             (format!("GET /v1?key=%22{or}%22"), "GET /v1?key=%22REDACTED-OPENROUTER-KEY%22".into(), 1),
             (format!("genai.configure(api_key=\"{google}\")"), "genai.configure(api_key=\"REDACTED-GOOGLE-API-KEY\")".into(), 1),
             (format!("GROQ_API_KEY={groq}"), "GROQ_API_KEY=REDACTED-GROQ-KEY".into(), 1),
-        ];
-        for (input, want, n) in &keys {
-            let (got, counted) = redact(&format!("{input}\n"));
-            assert_eq!(got, format!("{want}\n"), "{want}");
-            assert_eq!(counted, *n, "{want}");
-        }
+        ]
+    }
+
+    /// Lines no pattern may touch: look-alikes (`sklearn`, `task-or-v1-…`, short or long bodies,
+    /// UUIDs, `hf_hub_download`, a bare `sk-…`) and a notebook's base64 image.
+    fn lookalikes() -> Vec<String> {
         // A notebook's inline image (base64 of arbitrary bytes, one long line) and every
         // look-alike: byte-identical, nothing counted.
         let image: Vec<u8> = (0..30_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
-        let lookalikes: Vec<String> = vec![
+        vec![
             "from sklearn.linear_model import LogisticRegression".into(),
             "pip install scikit-learn sk-learn".into(),
             format!("task-or-v1-{}", body(HEX, 64, 1)),
@@ -1449,7 +1445,24 @@ mod tests {
             format!("{}{}", "gsk_", body(ALNUM, 51, 15)),
             format!("x{}{}", "gsk_", body(ALNUM, 52, 15)),
             format!("      \"image/png\": \"{}\"", crate::base64::encode(&image)),
-        ];
+        ]
+    }
+
+    /// The patterns, through the very sed/grep programs the pods run: every kind of key (in the
+    /// places a participant pastes one — code, `.env` lines, a notebook's JSON after a `\n`
+    /// escape) becomes its REDACTED text with everything around it byte-identical; look-alikes
+    /// (`sklearn`, `task-or-v1-…`, short or long bodies, UUIDs, `hf_hub_download`, a bare
+    /// `sk-…`, a notebook's base64 image) stay exactly as they are.
+    #[cfg(unix)]
+    #[test]
+    fn secret_patterns_redact_every_kind_of_key_and_no_lookalike() {
+        let keys = key_cases();
+        for (input, want, n) in &keys {
+            let (got, counted) = redact(&format!("{input}\n"));
+            assert_eq!(got, format!("{want}\n"), "{want}");
+            assert_eq!(counted, *n, "{want}");
+        }
+        let lookalikes = lookalikes();
         for line in &lookalikes {
             let (got, counted) = redact(&format!("{line}\n"));
             assert_eq!((got.trim_end_matches('\n'), counted), (line.as_str(), 0), "{}", &line[..line.len().min(80)]);
@@ -1464,6 +1477,90 @@ mod tests {
             }
         }
         assert!(!secret_regex().contains('\'') && !redact_sed().contains('\''));
+    }
+
+    /// Review ai-review claude #14: `scripts/ai-review` screened only the changed paths' names, so a
+    /// real key in a fixture or a test would have gone, whole, to OpenAI and Anthropic. Now the
+    /// backup's own patterns — read from this file at the repo's HEAD, from git objects — run over
+    /// the whole prompt first: every kind of key becomes its placeholder, the rest byte-identical
+    /// (as the backup's `redact`), wherever it is (the diff, a changed script's full text, a commit
+    /// subject); it says how many; `--dry-run` writes the masked prompt. Patterns it can't read
+    /// refuse the run (exit 2), nothing written. (Run on a temp repo, `--dry-run` only, with no
+    /// reviewer binary it could find.)
+    #[cfg(unix)]
+    #[test]
+    fn ai_review_masks_every_key_in_its_prompt() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/ai-review");
+        let base = std::env::temp_dir().join(format!("arena-ai-review-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (repo, out, tmp) = (base.join("repo"), base.join("out"), base.join("tmp"));
+        for d in [&repo, &out, &tmp] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git").current_dir(&repo).args(args).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        };
+        let review = || {
+            let o = std::process::Command::new("bash")
+                .arg(script)
+                .args(["--dry-run", "--out", out.to_str().unwrap(), "HEAD~1..HEAD"])
+                .current_dir(&repo)
+                .env("AI_REVIEW_CODEX", "/nonexistent")
+                .env("AI_REVIEW_CLAUDE", "/nonexistent")
+                .env("TMPDIR", &tmp)
+                .output()
+                .unwrap();
+            (o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned())
+        };
+        git(&["init", "-q", "-b", "master"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@t"]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        // No backup.rs at HEAD: no patterns, nothing sent or written.
+        std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "b"]);
+        let (code, err) = review();
+        assert!(code == Some(2) && err.contains("can't read the key patterns") && err.contains("nothing sent"), "{err}");
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "no run folder");
+        // The patterns at HEAD (this very file), then a change full of keys: every kind of key in a
+        // file, one in a changed script (its diff and its full text), one in the commit subject;
+        // and every look-alike.
+        std::fs::create_dir_all(repo.join("crates/core/src")).unwrap();
+        std::fs::write(repo.join("crates/core/src/backup.rs"), include_str!("backup.rs")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "patterns"]);
+        let keys = key_cases();
+        let lines: Vec<String> = keys.iter().map(|(input, ..)| input.clone()).chain(lookalikes()).collect();
+        std::fs::write(repo.join("keys.py"), lines.join("\n") + "\n").unwrap();
+        let tool = format!("#!/bin/sh\nexport HF_TOKEN={}{}\n", "hf_", body(LETTERS, 34, 30));
+        std::fs::write(repo.join("tool.sh"), &tool).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", &format!("keys {}", openrouter_key(30))]);
+        let (code, err) = review();
+        assert_eq!(code, Some(0), "{err}");
+        let want: usize = keys.iter().map(|(_, _, n)| n).sum::<usize>() + 3;
+        assert!(err.contains(&format!("ai-review: masked {want} key-like strings\n")), "{err}");
+        assert!(err.contains("nothing sent"), "{err}");
+        let runs: Vec<std::path::PathBuf> = std::fs::read_dir(&out).unwrap().flatten().map(|e| e.path()).collect();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        let prompt = String::from_utf8(std::fs::read(runs[0].join("prompt.txt")).unwrap()).unwrap();
+        // Nothing the backup's patterns would count is left; each key's line is its redacted line,
+        // the rest of it as it was; the look-alikes (one holds a key's body after `ta`) untouched.
+        assert_eq!(redact(&prompt).1, 0, "a key left in the prompt");
+        for (input, masked, _) in &keys {
+            assert!(prompt.contains(&format!("\n+{masked}\n")), "{masked}");
+            assert!(!prompt.contains(&format!("\n+{input}\n")), "{masked}: the key itself");
+        }
+        for line in lookalikes() {
+            assert!(prompt.contains(&format!("\n+{line}\n")), "{}", &line[..line.len().min(80)]);
+        }
+        assert!(prompt.contains("\n+export HF_TOKEN=REDACTED-HUGGINGFACE-TOKEN\n") && prompt.contains("\nexport HF_TOKEN=REDACTED-HUGGINGFACE-TOKEN\n"));
+        assert!(prompt.contains(" keys REDACTED-OPENROUTER-KEY\n"), "the commit subject");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The patterns are rendered into what runs on the pods — from the one list, nothing left to

@@ -1948,6 +1948,13 @@ scripts/ai-review --dry-run              # only write prompt.txt: nothing is sen
   that goes to **OpenAI** (codex) **and Anthropic** (claude); `--codex`/`--claude` sends it to one.
   Over `--max-bytes` (600 KB) it keeps the stat and the riskiest files and names the rest as left
   out. A changed path that looks like a secret (`config.env`, `*.key`, `id_rsa*`, …) is refused.
+  **Key-like strings are masked** before anything is written or sent (review ai-review claude
+  #14: only path names were screened): the backup's own `SECRET_PATTERNS`, read from
+  `crates/core/src/backup.rs` at HEAD (git objects, as the rest), run over the whole prompt as
+  the backup runs them — each key becomes its `REDACTED-…` placeholder — and it says `masked N
+  key-like strings`; `--dry-run`'s `prompt.txt` is the masked one. The repo's own test fixtures
+  with fake keys are masked too. Patterns it can't read, or a key-like string left after the
+  masking, refuse the run (exit 2, nothing sent).
 - **No tools.** Everything the reviewer needs is in the prompt, so it runs with none, in an empty
   temporary directory: claude with `--tools ''`, `--safe-mode` (no hooks, MCP servers or
   CLAUDE.md) and no saved session; codex `exec` read-only and ephemeral, with its shell, code
@@ -1958,7 +1965,8 @@ scripts/ai-review --dry-run              # only write prompt.txt: nothing is sen
   stderr in `codex.log`/`claude.log`. It ends by printing those paths and each review's last line,
   `Blocks merging: yes|no (…)`. Exit 0 when every reviewer that ran answered, whatever it found;
   1 when one failed or timed out (`--timeout`, 3600 s each) or none could run (a missing `codex`
-  or `claude` is skipped with a message); 2 for a usage error or an empty diff (refused).
+  or `claude` is skipped with a message); 2 for a usage error, an empty diff or key patterns it
+  can't read (refused).
 - **Cost.** It runs on the operator's own codex and Claude Code logins, so it spends their
   subscriptions' usage, not the project's API keys: a 16-commit, ~420 KB prompt is roughly 125k
   input tokens per reviewer, and took codex 2½ minutes and claude 5. `--effort` (default `high`,

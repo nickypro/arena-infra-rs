@@ -4,14 +4,15 @@
 #
 # Everything the reviewers see goes *inside the prompt*: the commit list, the diff, and the full
 # text of every changed shell script, all read from git objects (never the working tree, never a
-# file outside the repository). Both reviewers run with their tools disabled, in an empty
+# file outside the repository) — with every key-like string in it masked first, by the backup's own
+# patterns (arena_core::backup::SECRET_PATTERNS). Both reviewers run with their tools disabled, in an empty
 # directory. Why: this runs on prod's control box, where a reviewer that could run commands could
 # read prod's config or keys; and codex's own sandbox can't run anything here anyway (bubblewrap
 # fails with `loopback: Failed RTM_NEWADDR`), so a review that relied on reading files got nothing.
 #
 # Exit status: 0 = every reviewer that ran answered (whatever it found); 1 = one failed, timed out
-# or answered nothing, or none could run; 2 = usage, an unknown revision, an empty diff, or a
-# changed path that looks like a secret (refused, nothing sent).
+# or answered nothing, or none could run; 2 = usage, an unknown revision, an empty diff, a
+# changed path that looks like a secret, or key patterns that can't be read (refused, nothing sent).
 set -euo pipefail
 umask 077 # the prompt holds the whole diff: keep the run's folder private
 
@@ -22,7 +23,9 @@ Usage: scripts/ai-review [RANGE | --pr N] [--codex | --claude | --both] [options
 A second-opinion code review of a change by codex and/or Claude Code (both by default, run in
 parallel). The prompt holds everything they see: review instructions, the commits, the diff
 and the full text of every changed *.sh. The diff goes to OpenAI (codex) and/or Anthropic
-(claude), on your own codex/claude logins. The reviewers get no tools.
+(claude), on your own codex/claude logins. The reviewers get no tools. Every key-like string
+in the prompt is masked first (the backup's SECRET_PATTERNS, from crates/core/src/backup.rs at
+HEAD), as REDACTED-...; "masked N key-like strings" says how many.
 
   RANGE             what to review (default origin/master..HEAD; `git fetch` first). A..B and
                     A...B both review the diff from their merge base to B; REV alone = REV..HEAD
@@ -39,13 +42,14 @@ and the full text of every changed *.sh. The diff goes to OpenAI (codex) and/or 
   --timeout SECS    per reviewer (default 3600)
   --max-bytes N     prompt size cap (default 600000): over it, the stat and the riskiest files
                     go in first and the prompt names what was left out
-  --dry-run         write prompt.txt and stop: nothing is sent
+  --dry-run         write prompt.txt (masked) and stop: nothing is sent
   -h, --help        this help
 
 Each run writes <out>/<UTC time>-<range|prN>/: prompt.txt, codex.md, claude.md, and the
 reviewers' stderr in codex.log and claude.log. AI_REVIEW_CODEX / AI_REVIEW_CLAUDE override
 the binaries. Exit status: 0 every reviewer that ran answered; 1 one failed or timed out, or
-none could run; 2 usage, an unknown revision, an empty diff, or a secret-looking changed path.
+none could run; 2 usage, an unknown revision, an empty diff, a secret-looking changed path, or
+key patterns that can't be read from crates/core/src/backup.rs at HEAD.
 EOF
 }
 
@@ -329,6 +333,64 @@ kind_name() { if [ "$1" = 1 ]; then echo "diff"; else echo "full text"; fi; }
   done <"$WORK/in"
   cat "$WORK/tail"
 } >"$WORK/prompt"
+
+# --- keys masked -------------------------------------------------------------------------------
+# Only path names were screened, so a real key in a fixture, a test or a pasted config would have
+# gone to OpenAI and Anthropic (review ai-review claude #14). The backup's own patterns
+# (arena_core::backup::SECRET_PATTERNS, and the SECRET_LEAD* consts they use) are read from
+# crates/core/src/backup.rs at HEAD — from git objects, like everything else here — and run over
+# the whole prompt as the backup runs them on a pod (GNU sed/grep -E, as bytes): each key becomes
+# its REDACTED-… placeholder, what came before it kept. The repo's own fixtures with fake keys are
+# masked too. Patterns that can't be read refuse the run (nothing sent); a key-like string still
+# there after the masking does too. (A placeholder can be longer than its key — AWS's by 6 bytes —
+# so the prompt can end a little over --max-bytes.)
+secret_patterns() { # prints "<lead><TAB><regex><TAB><placeholder>", one line per pattern
+  git cat-file blob HEAD:crates/core/src/backup.rs 2>/dev/null | LC_ALL=C awk '
+    /^pub const SECRET_LEAD[A-Z0-9_]*: &str = r"/ {
+      name = $3; sub(/:$/, "", name)
+      v = $0; sub(/^[^"]*r"/, "", v); sub(/";[ \t]*$/, "", v)
+      lead[name] = v; next
+    }
+    /^pub const SECRET_PATTERNS: &\[SecretPattern\] = &\[/ { inlist = 1; next }
+    inlist && /^\];/ { inlist = 0; done = 1; next }
+    inlist { buf = buf " " $0 }
+    function field(e, key, close_,   i, v) {
+      i = index(e, key); if (i == 0) return ""
+      v = substr(e, i + length(key)); i = index(v, close_); if (i == 0) return ""
+      return substr(v, 1, i - 1)
+    }
+    END {
+      if (!done) exit 1
+      n = split(buf, parts, "SecretPattern \\{")
+      for (p = 2; p <= n; p++) {
+        l = field(parts[p], "lead: ", ","); gsub(/ /, "", l)
+        re = field(parts[p], "re: r\"", "\"")
+        rep = field(parts[p], "replacement: \"", "\"")
+        if (!(l in lead) || lead[l] == "" || re == "" || rep !~ /^[A-Z-]+$/ || re ~ /#/ || lead[l] ~ /#/) exit 1
+        print lead[l] "\t" re "\t" rep
+        k++
+      }
+      if (k == 0) exit 1
+    }'
+}
+secret_patterns >"$WORK/patterns" && [ -s "$WORK/patterns" ] ||
+  die "can't read the key patterns (SECRET_PATTERNS in crates/core/src/backup.rs at HEAD): nothing sent"
+# The same programs as arena_core::backup::secret_regex and redact_sed (`#` as sed's delimiter).
+SECRET_RE=$(awk -F'\t' '{ printf "%s%s%s", (NR > 1 ? "|" : ""), $1, $2 }' "$WORK/patterns")
+awk -F'\t' '{ printf "s#%s%s#\\1%s#g\n", $1, $2, $3 }' "$WORK/patterns" >"$WORK/redact.sed"
+MASKED=$({ LC_ALL=C grep -aoE -- "$SECRET_RE" "$WORK/prompt" || [ $? -eq 1 ]; } | wc -l) ||
+  die "scanning the prompt for keys failed: nothing sent"
+LC_ALL=C sed -E -f "$WORK/redact.sed" "$WORK/prompt" >"$WORK/prompt.masked" ||
+  die "masking the keys in the prompt failed: nothing sent"
+mv "$WORK/prompt.masked" "$WORK/prompt"
+left=0
+LC_ALL=C grep -aqE -- "$SECRET_RE" "$WORK/prompt" || left=$?
+case $left in
+  1) ;;
+  0) die "a key-like string is still in the prompt after the masking: nothing sent" ;;
+  *) die "checking the masked prompt for keys failed: nothing sent" ;;
+esac
+[ "$MASKED" -eq 0 ] || note "masked $MASKED key-like strings"
 
 # --- run ---------------------------------------------------------------------------------------
 ROOT=${OUT:-${XDG_STATE_HOME:-$HOME/.local/state}/arena-review}
