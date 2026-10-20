@@ -21604,6 +21604,71 @@ mod remote_tests {
         assert!(fake.calls().is_empty() && stub.take().is_empty());
     }
 
+    /// Review ai-review claude #10, checked: since FIX4A a pod with no SSH endpoint (stopped,
+    /// booting) is in `Pulled::failed` — for the backup's per-pod fallback lines, which ask where
+    /// a pod's copy went. Every reader was checked: `pods pull`'s exit and its error come from the
+    /// failed rsync jobs (`failures`), where such a pod never is, and its summary counts jobs — not
+    /// a failed copy, nor counted twice; `whole` (the resolve's gate on a copy) holds only pods
+    /// all of whose rsyncs ran; `pods backup` (pull or `--no-pull`) copies instead only pods its
+    /// git step reached, never such a pod, so no line names it a failed copy and the run's verdict
+    /// is as without it. (The reaper's backup and its verify run their own rsync, and the archive's
+    /// "pull running" reads the pod's lock: neither reads a `Pulled`.)
+    #[tokio::test]
+    async fn a_pod_with_no_endpoint_is_no_failed_copy_to_any_reader_of_the_pull() {
+        use super::{pull_pods, LockMode, PullRun};
+        let stub = StubRsync::new("no-endpoint");
+        let base = stub.0.join("backups");
+        let cfg = Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\n\
+             GIT_SSH_KEY_REMOTE={KEY}\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nARENA_START_DATE=2026-01-05\n\
+             LOCAL_BACKUP_DIR={}\n",
+            base.display()
+        ));
+        let base = base.display().to_string();
+        let stopped = Pod { status: "EXITED".into(), ssh_ip: None, ssh_port: None, ..pod("bloom", 22002) };
+        let both = Selected { pods: vec![pod("apple", 22001), stopped.clone()], named: true };
+        let args = || PullRun { label: Some("w1d1".into()), max_size: None, remote_path: None, no_git: false, no_big: false, dry_run: false, yes: true };
+        let pull = |sel: Selected| {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [repo_in_place()]);
+            let remote: Arc<dyn Remote> = fake;
+            let (cfg, base, rsync) = (cfg.clone(), base.clone(), stub.path());
+            async move { pull_pods(&remote, &cfg, &base, args(), &sel, &rsync, LockMode::Take(Duration::from_millis(300))).await.unwrap() }
+        };
+        let no_endpoint = [("devtest-bloom".to_string(), "no SSH endpoint to pull from".to_string())];
+        let p = pull(both.clone()).await;
+        assert!(p.failures.is_empty(), "no failed rsync: {:?}", p.failures);
+        assert_eq!((p.failed.as_slice(), p.whole.as_slice()), (&no_endpoint[..], &["devtest-apple".to_string()][..]));
+        assert!(p.copied_to("devtest-apple").is_some() && p.copied_to("devtest-bloom").is_none());
+        p.result().unwrap();
+        assert_eq!(stub.take().len(), 3, "apple's tiers only");
+        // Every pod without one, fleet-wide (named, that's refused before anything: unchanged):
+        // the same, from the early return.
+        let p = pull(Selected { pods: vec![stopped.clone()], named: false }).await;
+        assert!(p.failures.is_empty() && p.whole.is_empty() && stub.take().is_empty());
+        assert_eq!(p.failed, no_endpoint);
+        p.result().unwrap();
+        // `pods pull` itself: exit 0.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [repo_in_place()]);
+        let remote: Arc<dyn Remote> = fake;
+        handle_pull(&remote, &cfg, Some("w1d1".into()), &base, None, None, false, false, &both, false, true, &stub.path()).await.unwrap();
+        assert_eq!(stub.take().len(), 3);
+        // `pods backup`, with the pull and without: apple pushed (and pulled), bloom neither, and
+        // no line says a copy of bloom failed.
+        for no_pull in [false, true] {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"), repo_in_place()]);
+            let _ = take_said();
+            handle_full_backup(fake.clone(), &cfg, &both, no_pull, None, false, true, &stub.path()).await.unwrap();
+            assert_eq!(stub.take().len(), if no_pull { 0 } else { 3 }, "no_pull={no_pull}");
+            assert!(!take_said().iter().any(|l| l.contains("devtest-bloom")), "no_pull={no_pull}");
+        }
+        let unpushed = [Unpushed { pod: "devtest-bloom".into(), why: "x".into(), branch: None, at_push: true, wrong_origin: false, busy: None }];
+        assert_eq!(fallback_lines(&unpushed, &Ok(pull(both.clone()).await)), ["✗ devtest-bloom: git push failed (x); the fallback copy failed too: no SSH endpoint to pull from"]);
+        let _ = stub.take();
+    }
+
     /// S17 + AD7: every pull rsync writes its temp files to its tier root's `.rsync-tmp`
     /// (`<dir>/<label>/.rsync-tmp`, `<dir>/big/.rsync-tmp`) — beside the pod trees the archive
     /// pushes, never in one — created owner-only once confirmed; a dry run shows it and creates
