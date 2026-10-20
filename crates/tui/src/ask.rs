@@ -267,8 +267,8 @@ pub(crate) fn render_input(f: &mut Frame, shared: &Shared, ui: &Ui, scope: &Inpu
     }
     let text = format!(
         "ask {} about {who}\n\nEach pod is read once (read-only); its state — listing, GPU, disks, logins, the busiest \
-         processes' arguments, the repo's changed file names, the newest job's last lines, keys and tokens masked — goes \
-         to {} with no tools. The prompt and the answer are saved in arena's state dir.\n\n  > {value}\n\n\
+         processes' and the jobs' commands (program, script and flag names, never their values), the repo's changed file \
+         names, the newest job's last lines, keys and tokens masked — goes to {} with no tools. The prompt and the answer are saved in arena's state dir.\n\n  > {value}\n\n\
          [enter] ask (in the background)  [ctrl-u] clear  [esc] cancel",
         ai.name(),
         ai.vendor()

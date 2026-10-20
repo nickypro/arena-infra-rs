@@ -1379,7 +1379,8 @@ enum PodCmd {
     /// Ask claude or codex about pods' current state (reads only)
     ///
     /// Reads each pod once over SSH (listing, GPU, disks, logins, top processes, the repo's
-    /// working tree, jobs and the newest job's log — keys and tokens masked) and sends it all in
+    /// working tree, jobs and the newest job's log — commands without their values, keys and
+    /// tokens masked) and sends it all in
     /// one prompt to claude (ASK_AI, the default) or codex, with no tools. The answer is printed,
     /// and saved with the prompt under the state dir (<state>/<prefix>/ask/). Name pods, or
     /// --all for this cohort's. Quote the question: `arena pods ask apple "why is it slow?"`.

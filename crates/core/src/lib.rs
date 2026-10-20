@@ -42,6 +42,7 @@ pub mod retry;
 pub mod schedule;
 pub mod selector;
 pub mod setup;
+pub mod shape;
 pub mod snapshot;
 pub mod sshconfig;
 pub mod ssh;

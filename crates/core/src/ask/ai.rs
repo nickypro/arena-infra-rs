@@ -2,8 +2,8 @@
 //! in an empty temporary directory, within a time budget.
 //!
 //! Why no tools: this runs on the fleet's control box, next to the config and the keys, and the
-//! bundle holds text participants control (process arguments, file names, commit subjects, job
-//! logs) — a prompt injection must have nothing to act with. So claude runs with `--tools ''`,
+//! bundle holds text participants control (the programs and scripts they run, file names, commit
+//! subjects, job logs) — a prompt injection must have nothing to act with. So claude runs with `--tools ''`,
 //! `--safe-mode`, `--strict-mcp-config` with an explicitly empty `--mcp-config`, no slash
 //! commands and no saved session (verified with `scripts/ai-review` to list `tools: []`); and
 //! codex read-only, ephemeral, without the operator's `config.toml` (its MCP servers, hooks,

@@ -19,9 +19,13 @@
 //!   ([`CONT_MASK`]).
 //! - [`long_tokens`]: any run of 32 or more `[A-Za-z0-9_-]` — the shape of almost every API key,
 //!   session id and bearer token — becomes [`MASK`], and so does base64 key material
-//!   ([`base64_runs`]) and a private-key block ([`PEM_MASK`]). Applied to free text (process
-//!   arguments, log lines, commands, commit subjects), not to names (a branch, a file name), which
-//!   can legitimately run that long and carry no secret of their own.
+//!   ([`base64_runs`]) and a private-key block ([`PEM_MASK`]). Applied to free text (log lines,
+//!   commit subjects, a check's reasons), not to names (a branch, a file name), which can
+//!   legitimately run that long and carry no secret of their own.
+//!
+//! A command — a process's arguments, a job's command — isn't masked here: only its shape is ever
+//! sent ([`crate::shape::command`]: no value of it at all), since masking its words one value at a
+//! time kept missing new forms.
 //!
 //! Everything here is pure.
 
@@ -800,12 +804,11 @@ pub fn name(s: &str, max: usize) -> String {
     crate::fleet::clip(&secrets(&one_line(&secrets(s))), max)
 }
 
-/// Free text from a pod (a process's arguments, a log line, a command, a commit subject) for
-/// the prompt: [`name`]'s treatment, then a private-key block in it ([`pem_inline`]), the
-/// secret-named values ([`named_values`]), base64 key material ([`base64_runs`]) and any long
-/// token ([`long_tokens`]) masked, then clipped to `max` characters. (The heuristics a log gets
-/// across its lines — [`log_tail`] — work on one line here too: a key pasted into a command's
-/// arguments is on one; review ai-review claude #7.)
+/// Free text from a pod (a log line, a commit subject) for the prompt: [`name`]'s treatment, then
+/// a private-key block in it ([`pem_inline`]), the secret-named values ([`named_values`]), base64
+/// key material ([`base64_runs`]) and any long token ([`long_tokens`]) masked, then clipped to
+/// `max` characters. (The heuristics a log gets across its lines — [`log_tail`] — work on one line
+/// here too: a key pasted into a line is on one; review ai-review claude #7.)
 pub fn text(s: &str, max: usize) -> String {
     crate::fleet::clip(&long_tokens(&base64_runs(&named_values(&pem_inline(&secrets(&one_line(&secrets(s))))))), max)
 }

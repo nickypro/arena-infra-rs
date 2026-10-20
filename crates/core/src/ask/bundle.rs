@@ -23,9 +23,10 @@
 //! alone, saying why.
 //!
 //! **What is never in a bundle:** a file's contents, shell history, the environment, `~/.arena`'s
-//! other files, or where a login comes from. Process arguments, job commands and log lines,
-//! commit subjects and file names are in it — masked: the backup's key patterns, secret-named
-//! values, any 32+ character token ([`super::redact`]).
+//! other files, where a login comes from — or a value a process or a job was started with: a
+//! command is its shape ([`crate::shape::command`]: the program, the script it runs, its flag
+//! names, `…` for every value). Log lines, commit subjects and file names are in it — masked: the
+//! backup's key patterns, secret-named values, any 32+ character token ([`super::redact`]).
 
 use std::time::Duration;
 
@@ -691,7 +692,7 @@ fn gpu_lines(m: Option<&PodMetrics>, x: Option<&Extra>) -> Vec<String> {
             .gpu_procs
             .iter()
             .take(8)
-            .map(|p| format!("{} {} ({})", p.pid, redact::text(&p.name, 60), p.mem_mb.map_or(UNKNOWN.into(), |mb| format!("{mb} MiB"))))
+            .map(|p| format!("{} {} ({})", p.pid, command_shape(&p.name), p.mem_mb.map_or(UNKNOWN.into(), |mb| format!("{mb} MiB"))))
             .collect();
         v.push(format!("    processes on the GPUs: {}", procs.join("; ")));
     }
@@ -944,42 +945,26 @@ fn shown_id(id: &jobs::JobId, cmd: &str) -> String {
     }
 }
 
-/// Every job id `r` names that [`shown_id`] doesn't show whole, and what it shows instead — to
-/// take out of the processes' arguments too (a job's wrapper runs as `sh …/jobs/<id>/run`).
-fn masked_ids(r: &Reply) -> Vec<(String, String)> {
-    let listed = r.jobs.iter().flatten().flatten().map(|j| (&j.id, j.cmd.as_str()));
-    let read = match &r.log {
-        Some(Ok(ReadReply::Job { info, .. })) => Some((&info.id, info.cmd.as_str())),
-        _ => None,
-    };
-    let mut v: Vec<(String, String)> = Vec::new();
-    for (id, cmd) in listed.chain(read) {
-        let shown = shown_id(id, cmd);
-        if shown != id.as_str() && !v.iter().any(|(raw, _)| raw == id.as_str()) {
-            v.push((id.as_str().to_string(), shown));
-        }
-    }
-    v
+/// A command from the pod — a process's arguments, a job's command — as the prompt may show it:
+/// its shape alone ([`crate::shape::command`]: the program, the script it runs, its flag names,
+/// `…` for every value, `<job>` for a job's own files), never a value. Masking a command's words
+/// one value at a time kept missing new forms (review ai-review codex #1, claude #4, #5); a
+/// command not sent can't leak. The shape is held to [`redact::name`] besides (a key-shaped
+/// script or program name; escapes, framing).
+fn command_shape(cmd: &str) -> String {
+    redact::name(&crate::shape::command(&jobs::sanitize(cmd)), ARGS_MAX)
 }
 
-/// `args` with each id of `ids` in its shown form.
-fn without_ids(args: &str, ids: &[(String, String)]) -> String {
-    ids.iter().fold(args.to_string(), |a, (raw, shown)| a.replace(raw.as_str(), shown))
-}
-
-fn procs_block(x: Option<&Extra>, ids: &[(String, String)]) -> Block {
+fn procs_block(x: Option<&Extra>) -> Block {
     match x.and_then(|x| x.procs.as_ref()) {
         Some(Ok(ps)) if !ps.is_empty() => {
             let items = ps
                 .iter()
                 .take(PROCS_SHOWN)
-                .map(|p| {
-                    let args = redact::text(&without_ids(&p.args, ids), ARGS_MAX);
-                    format!("{} {} cpu {:.1}% mem {:.1}% up {}: {args}", p.pid, redact::name(&p.user, 20), p.cpu, p.mem, age(p.age))
-                })
+                .map(|p| format!("{} {} cpu {:.1}% mem {:.1}% up {}: {}", p.pid, redact::name(&p.user, 20), p.cpu, p.mem, age(p.age), command_shape(&p.args)))
                 .collect();
             Block::list(
-                "processes (busiest by CPU — ps's %cpu is the average since each started — then by memory; this probe's own ssh session included):".into(),
+                "processes (busiest by CPU — ps's %cpu is the average since each started — then by memory; this probe's own ssh session included; each command as its program, script and flag names, `…` for its values):".into(),
                 items,
                 2,
                 5,
@@ -994,7 +979,7 @@ fn procs_block(x: Option<&Extra>, ids: &[(String, String)]) -> Block {
 
 fn job_text(j: &JobInfo) -> String {
     let started = j.started.as_deref().map(|s| format!(", started {}", redact::name(s, 30))).unwrap_or_default();
-    format!("{} — {}{started}: {}", shown_id(&j.id, &j.cmd), jobs::state_label(j), redact::text(&j.cmd, ARGS_MAX))
+    format!("{} — {}{started}: {}", shown_id(&j.id, &j.cmd), jobs::state_label(j), command_shape(&j.cmd))
 }
 
 fn jobs_blocks(r: &Reply) -> Vec<Block> {
@@ -1002,7 +987,7 @@ fn jobs_blocks(r: &Reply) -> Vec<Block> {
     match &r.jobs {
         Some(Ok(list)) if list.is_empty() => v.push(Block::fixed(vec!["jobs (`pods run --background`): none".into()])),
         Some(Ok(list)) => v.push(Block::list(
-            format!("jobs (`pods run --background`, newest first, {} in all):", list.len()),
+            format!("jobs (`pods run --background`, newest first, {} in all; each command as its program, script and flag names, `…` for its values):", list.len()),
             list.iter().take(JOBS_SHOWN).map(job_text).collect(),
             4,
             2,
@@ -1070,7 +1055,7 @@ pub fn render(pod: &Pod, look: &Look, local: &Local, repo_path: &str, now: u64, 
     // shouldn't make a fresh commit look old).
     let clock = pod_now(x).unwrap_or(now);
     blocks.extend(repo_blocks(repo_path, m, x, local, clock));
-    blocks.push(procs_block(x, &masked_ids(reply)));
+    blocks.push(procs_block(x));
     blocks.extend(jobs_blocks(reply));
     fit(blocks, cap)
 }
@@ -1228,7 +1213,7 @@ mod tests {
             "pod clock 2026-10-19T12:00:00Z · machine up 12d0h · sleep (pid 1) up 3h10m · load 1.02 0.98 0.90 on 16 CPUs · cpu 37%",
             "gpu: 1×RTX A4000",
             "#0: util 97% · memory 14000 MiB/16376 MiB · 71°C",
-            "processes on the GPUs: 4242 /opt/conda/envs/arena-env/bin/python (13000 MiB)",
+            "processes on the GPUs: 4242 python (13000 MiB)",
             "disk: / 12.0 GiB of 100.0 GiB used (12%) · /workspace 5.0 GiB of 50.0 GiB used (10%) · home /root on /, holds 3.2 GiB",
             "setup: ~/.name yes · deploy key yes · API keys in the shell rc yes · HF token yes · Claude Code token no",
             "sessions: 1 ssh login (who): root pts/0 2026-10-19 10:00 UTC (ssh) · 1 tmux session(s): lab (2 windows, attached, active 5m ago)",
@@ -1245,8 +1230,9 @@ mod tests {
             "    UU chapter1/solutions.py",
             "    .M chapter1/part4_interp_on_algorithmic_model.ipynb",
             "    ?? notes.txt",
-            "4242 root cpu 98.5% mem 6.1% up 2h0m: python train.py --epochs 3",
-            "20261019-101500-pytest-x-chapter1 — running (pid 777), started 2026-10-08T14:23:01Z: pytest -x chapter1",
+            "4242 root cpu 98.5% mem 6.1% up 2h0m: python train.py --epochs …\n",
+            "777 root cpu 0.0% mem 0.0% up 1h0m: sh <job>\n",
+            "20261019-101500-pytest-x-chapter1 — running (pid 777), started 2026-10-08T14:23:01Z: pytest -x …\n",
             "newest job's log (20261019-101500-pytest-x-chapter1, still running), last 3 lines:",
             "    test_b PASSED",
         ] {
@@ -1321,8 +1307,9 @@ mod tests {
             assert!(text.contains(repl), "{repl} in\n{text}");
         }
         assert!(text.contains(redact::MASK), "the plain token is masked");
-        // The rest of those lines survives.
-        assert!(text.contains("python train.py --epochs 3 --opt0 REDACTED-OPENROUTER-KEY"), "{text}");
+        // The rest of those lines survives — a command as its shape.
+        assert!(text.contains(": python train.py --epochs … --opt0 … --opt1 … --opt2 …"), "{text}");
+        assert!(text.contains(": python eval.py --key=… --hf …\n"), "{text}");
         assert!(text.contains("Using key REDACTED-AWS-ACCESS-KEY-ID for the run"), "{text}");
     }
 
@@ -1339,11 +1326,57 @@ mod tests {
         for secret in ["cohort-db-pass", "cohort-login-pass", "cohort-yaml-pass", "cohort-json-pass", "hunter"] {
             assert!(!text.contains(secret), "{secret} reached the bundle:\n{text}");
         }
-        for want in ["5100 root cpu 0.1% mem 0.1% up 1m: redis-cli -a <redacted> ping", "sshpass -p <redacted> ssh root@10.0.0.9 pytest", "password: <redacted>", "login password:<redacted>"] {
+        for want in ["5100 root cpu 0.1% mem 0.1% up 1m: redis-cli -a … …\n", ": sshpass -p … …\n", "password: <redacted>", "login password:<redacted>"] {
             assert!(text.contains(want), "missing {want:?} in\n{text}");
         }
         assert_eq!(text.matches(redact::CONT_MASK).count(), 2, "{text}");
         assert!(text.contains(redact::LINE_MASK), "{text}");
+    }
+
+    /// Item A, end to end: a process's arguments and a job's command reach the bundle as their
+    /// shape — the program, the script, the flag names, `…` — and no value of theirs at all: the
+    /// forms masking missed (review ai-review codex #1: a shell's `-c` script, `mysql -p'two
+    /// words'`, `sshpass -p -hunter2`; claude #5: `docker login -p`, `zip -P`, `smbclient -U
+    /// user%pass`, `htpasswd -b`, `lftp -u user,pass`; claude #4: an old job id in a wrapper's
+    /// path the listing doesn't name), a job started with a password, a GPU process's name.
+    #[test]
+    fn no_value_of_a_command_reaches_the_bundle() {
+        let procs = [
+            (5101, "bash -lc sshpass -p cohort-login-pass ssh root@10.0.0.9"),
+            (5102, "mysql -p'cohort two words' appdb"),
+            (5103, "sshpass -p -cohortdash ssh host"),
+            (5104, "docker login -u cohortuser -p cohortdocker registry.example.com"),
+            (5105, "zip -P cohortzip out.zip notes.txt"),
+            (5106, "smbclient -U cohortuser%cohortsmb //files/share"),
+            (5107, "htpasswd -b .htpasswd cohortuser cohorthtpw"),
+            (5108, "lftp -u cohortuser,cohortftp ftp.example.com"),
+            (5109, "sh /root/.arena/jobs/20261018-090000-curl-u-bob-cohortoldid/run"),
+            (5110, "/opt/conda/envs/arena-env/bin/python /root/ARENA_materials/train.py --lr 0.1 --hf-token cohorthf"),
+        ];
+        let lines: String = procs.iter().map(|(pid, args)| format!("ARENA_ASK_PS {pid} root 0.1 0.1 60 {args}\n")).collect();
+        let mut reply = busy_reply("", "", "sshpass -p cohortjob ssh root@10.0.0.9 pytest -x");
+        reply = reply.replace(&t("ARENA_ASK git=ok\n"), &t(&format!("{lines}ARENA_ASK git=ok\n")));
+        reply = reply.replace("4242, 13000, /opt/conda/envs/arena-env/bin/python\n", "4242, 13000, /opt/conda/bin/python cohortgpu --key x\n");
+        let text = bundle(&reply, 64 * 1024);
+        for secret in ["cohort", "hunter", "bob", "10.0.0.9", "0.1 ", "registry.example", "ftp.example", "/root/.arena"] {
+            assert!(!text.contains(secret), "{secret} reached the bundle:\n{text}");
+        }
+        for want in [
+            "5101 root cpu 0.1% mem 0.1% up 1m: bash -c …\n",
+            "5102 root cpu 0.1% mem 0.1% up 1m: mysql …\n",
+            "5103 root cpu 0.1% mem 0.1% up 1m: sshpass -p … …\n",
+            "5104 root cpu 0.1% mem 0.1% up 1m: docker … -u … -p … …\n",
+            "5105 root cpu 0.1% mem 0.1% up 1m: zip -P … …\n",
+            "5106 root cpu 0.1% mem 0.1% up 1m: smbclient -U … …\n",
+            "5107 root cpu 0.1% mem 0.1% up 1m: htpasswd -b … …\n",
+            "5108 root cpu 0.1% mem 0.1% up 1m: lftp -u … …\n",
+            "5109 root cpu 0.1% mem 0.1% up 1m: sh <job>\n",
+            "5110 root cpu 0.1% mem 0.1% up 1m: python train.py --lr … --hf-token …\n",
+            "running (pid 777), started 2026-10-08T14:23:01Z: sshpass -p … … -x\n",
+            "processes on the GPUs: 4242 python … --key … (13000 MiB)",
+        ] {
+            assert!(text.contains(want), "missing {want:?} in\n{text}");
+        }
     }
 
     /// Live ASK2 G1: a job's id is made from its command, and one made before ids were masked
@@ -1370,7 +1403,7 @@ mod tests {
             let reply = busy_reply("", "", cmd).replace(&new, &format!("20261019-101500-{old}"));
             let text = bundle(&reply, BUNDLE_CAP);
             assert!(!text.to_lowercase().contains(&secret), "{secret} reached the bundle:\n{text}");
-            for want in ["20261019-101500-<masked> — running (pid 777)", "newest job's log (20261019-101500-<masked>, still running)", "sh /root/.arena/jobs/20261019-101500-<masked>/run"] {
+            for want in ["20261019-101500-<masked> — running (pid 777)", "newest job's log (20261019-101500-<masked>, still running)", "up 1h0m: sh <job>\n"] {
                 assert!(text.contains(want), "missing {want:?} in\n{text}");
             }
         }

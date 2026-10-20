@@ -1253,7 +1253,7 @@ subjects, whether `~/.name`, the deploy key and the API/HF/Claude Code tokens ar
 40 log lines, and a small probe: the pod's clock and uptime, load, `/`, `/workspace` and the home's
 size, logins (user, tty, time — labelled with the pod's time zone — and whether each is an SSH
 session, a tmux pane or local — **not** where from), tmux sessions, the busiest processes by CPU and
-memory with their arguments, the repo's working tree (counts, the first 20 changed file **names**,
+memory (each command's shape only: below), the repo's working tree (counts, the first 20 changed file **names**,
 stashes, the last commit, and an operation in progress by the backup's own test — a merge,
 cherry-pick, revert, `git am`, rebase, sequence or a stash pop's conflicts — read as what it means:
 the backup is BUSY, how the participant ends it, and whether `pods backup` finishes it after
@@ -1274,7 +1274,16 @@ status and the newest log tail, where a login comes from, arena's config or keys
 
 #### Masked before anything leaves
 
-Every text field is masked through the backup's own key patterns
+**Commands: never their values.** A process's arguments and a job's command are sent as their shape
+alone (`arena_core::shape`): the program's name (`python3`, `jupyter-lab`), the first script or
+notebook it runs (`train.py`, `part1.ipynb`, or python's `-m pytest`), each flag's name (`--lr`,
+`-p`, `--token=…`), and `…` for every value — `python3 /w/train.py --lr 0.1 --token X` is `python3
+train.py --lr … --token …`, `sshpass -p pw ssh host` is `sshpass -p … …`. A shell's or python's `-c`
+code is `bash -c …`, a path under the jobs dir `<job>`, and a name that looks like a key (a long run
+of letters and digits) a value too. Only a value spelled exactly like a flag's name (`-x`, `--fast`)
+can still show: no shape can tell it without knowing every program's options.
+
+Every other text field is masked through the backup's own key patterns
 (`arena_core::backup::SECRET_PATTERNS`: OpenRouter, Anthropic incl. Claude Code tokens, OpenAI,
 Hugging Face, GitHub, Google, Groq, AWS — the same replacements, `REDACTED-…`). Also masked: the
 whole value of anything named like a secret (`HF_TOKEN=…` and `MY_SECRET='x y'`, `--api-key …`,
@@ -1285,14 +1294,13 @@ user:pass`, `--user user:pass`, `https://user:pass@…`) and a command's own pas
 delimited (an unclosed quote or bracket) or whose quoting can't be told (`Couldn't … PASSWORD='a
 b'`) is replaced whole, and in a log so is every line such a value runs on into (a YAML block
 scalar, a value on the line after its name, a quote or bracket closed lines later) — any run of 32+
-`[A-Za-z0-9_-]` in arguments, commands, commit subjects and log lines (`<redacted>`), any run of 40+
-of `[A-Za-z0-9+/=]` with upper case, lower case and digits (base64 key material), and a private-key
-block, in an argument list or a log — in a log masked over the whole 16 KB read before its last 40
-lines are taken, so neither cut can keep a key's body without its header; at the start of a cut
-window, lines that look like base64 key material (40+ of `[A-Za-z0-9+/=]`, nothing else) are
-dropped. The AI CLI's own error line, printed and saved when it fails, is masked the same way. Each
-pod's part is at most 6 KB (less when many pods share a prompt: 240 KB in all), trimmed from the
-log's oldest lines first.
+`[A-Za-z0-9_-]` in commit subjects and log lines (`<redacted>`), any run of 40+ of `[A-Za-z0-9+/=]`
+with upper case, lower case and digits (base64 key material), and a private-key block — in a log
+masked over the whole 16 KB read before its last 40 lines are taken, so neither cut can keep a key's
+body without its header; at the start of a cut window, lines that look like base64 key material (40+
+of `[A-Za-z0-9+/=]`, nothing else) are dropped. The AI CLI's own error line, printed and saved when
+it fails, is masked the same way. Each pod's part is at most 6 KB (less when many pods share a
+prompt: 240 KB in all), trimmed from the log's oldest lines first.
 
 **Framing a pod can't forge.** Each pod's reply is framed by marker lines carrying a random nonce of
 that call's own, and so is every line of the small probe's: pod text that runs over lines (a path,
