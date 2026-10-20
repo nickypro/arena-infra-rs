@@ -831,7 +831,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     a failure; one line after the run names those pods. **Before any `--hard` reset, what it
     discards is saved on the pod** — in `.git/arena-discarded/<UTC time>/`: `changes.patch` (HEAD →
     the files), and `staged.patch` (HEAD → the index) and `unstaged.patch` (the index → the files)
-    apart — a version staged and then undone in the files is in the staged one only —, the files
+    apart — a version staged and then undone in the files is in the staged one only (on `main` and
+    the other branches no backup commits; on a branch the backup commits, see below) —, the files
     with unresolved conflicts, the operation's state (`MERGE_HEAD`,
     `MERGE_MSG`, `rebase-merge/`, …), the untracked or ignored files, links and directories the
     reset removes (a directory where the branch has a file or a link goes whole — ignored
@@ -849,11 +850,16 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     when it has commits no remote has, as `refs/arena-discarded/<UTC time>` — whether or not
     anything else is saved (then the folder holds just the README, naming them and how to make a
     branch of each again); the pod's line names the refs (`its commits kept by …`), and the
-    README's last line deletes them all. In `.git`, so the reset doesn't touch it and every later copy (snapshot, big,
-    archive) carries it under a name no later save reuses: the copy into `LOCAL_BACKUP_DIR` is the
-    day's label, which the next pull of that label overwrites from the reset pod (review ai-review
-    claude #2). Nothing to discard, no folder; a save that fails leaves the pod as it was, not
-    reset (a failed switch), and removes what it had copied, refs and all. So does a save the
+    README's last line deletes them all. In `.git`, so the reset doesn't touch it and every later
+    copy (snapshot, big, archive) carries it under a name no later save reuses: the copy into
+    `LOCAL_BACKUP_DIR` is the day's label, which the next pull of that label overwrites from the
+    reset pod (review ai-review claude #2). What no save can keep (review ai-review codex #2, not
+    taken: inherent to the backup): on a branch the backup commits, a version staged and then
+    changed again on disk. The backup `set-branch` runs first is the ordinary one, whose `git add
+    -A` stages each file as it is on disk — as every */15 backup does — so the staged version is
+    replaced before the save runs (what is on disk is committed and pushed instead); `--hard`'s
+    first backup is no different from the cron's next one. Nothing to discard, no folder; a save that fails leaves the pod as it
+    was, not reset (a failed switch), and removes what it had copied, refs and all. So does a save the
     switch is stopped in the middle of — its 100 s bound's TERM, a dropped connection (review
     ai-review claude #2: a 30 GB directory's copy never finished, and each try left another partial
     copy in `.git`): the switch's exit trap puts the keys back, then removes it (a KILL runs no
