@@ -21039,7 +21039,16 @@ mod placement_cli_tests {
         let lines = money::balance_preflight(&fake, &cfg(), &bal, 1, Some(&plan), &base, None).await;
         // The options' prices are preset estimates (no key): raised to the known GPU's
         // stand-in (RunPod's recorded catalog), marked `~`.
-        assert!(lines[0].starts_with("balance: runpod $0.10 live · $0.47/h now + ≤~$") && lines[0].ends_with("‼ under 24h"), "{lines:?}");
+        // The reading's age shows once it's a second old (`live 1s`): a loaded machine gets there
+        // between `balance_of` and here, so it's taken out before comparing.
+        let first = match lines[0].split_once("live ") {
+            Some((head, rest)) => match rest.split_once("s ·") {
+                Some((n, tail)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => format!("{head}live ·{tail}"),
+                _ => lines[0].clone(),
+            },
+            None => lines[0].clone(),
+        };
+        assert!(first.starts_with("balance: runpod $0.10 live · $0.47/h now + ≤~$") && first.ends_with("‼ under 24h"), "{lines:?}");
         assert!(lines.iter().any(|l| l.starts_with("⚠ RunPod needs ≥1h of credit for the new pods (≈~$")), "{lines:?}");
         assert_eq!(lines.last().unwrap(), "‼ RunPod reports the account under its minimum balance — creates will likely fail");
     }
