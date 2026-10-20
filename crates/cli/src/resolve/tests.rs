@@ -298,7 +298,7 @@ async fn a_busy_pods_copy_is_paced_by_its_look() {
             let err = handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &rsync).await.unwrap_err();
             assert_eq!(err.to_string(), "1 pod(s) failed to back up");
             let calls = execs(&fake, 22002);
-            assert!(calls.len() <= 3 && !calls.iter().any(|(c, _)| c.contains(" arena-resolve")), "{calls:#?}");
+            assert!(calls.len() <= 3 && !calls.iter().any(|(c, _)| c.contains(" 'arena-resolve' ")), "{calls:#?}");
             (calls.len() == 3, crate::take_said())
         }
     };
@@ -369,7 +369,7 @@ async fn a_paced_pod_is_finished_from_its_recorded_copy() {
     handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &w.rsync_path()).await.unwrap();
     let calls = execs(&fake, 22002);
     assert_eq!(calls.len(), 4, "{calls:#?}");
-    assert!(calls[2].0.contains(" arena-resolve") && calls[3] == backup("bloom"), "{calls:#?}");
+    assert!(calls[2].0.contains(" 'arena-resolve' ") && calls[3] == backup("bloom"), "{calls:#?}");
     assert!(w.copied().is_empty(), "not copied again");
     let said = crate::take_said();
     assert!(said.iter().any(|l| l.starts_with("✓ devtest-bloom -> autocommit-b — finished a merge left for 3h+ (") && l.ends_with(&format!("; today's copy: {})", copy.to))), "{said:#?}");
@@ -564,7 +564,7 @@ async fn a_repo_linked_onto_the_volume_is_finished_from_a_pull_of_the_home() {
     let _ = crate::take_said();
     handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &w.rsync_path()).await.unwrap();
     let calls = execs(&fake, 22002);
-    assert!(calls.len() == 5 && calls[3].0.contains(" arena-resolve"), "{calls:#?}");
+    assert!(calls.len() == 5 && calls[3].0.contains(" 'arena-resolve' "), "{calls:#?}");
     // Without the link's path in the look, the top alone isn't in the home: no resolve.
     let w = World::new("linked-unseen");
     let fake = Arc::new(FakeRemote::new());
@@ -648,7 +648,7 @@ async fn a_backup_dir_spelled_relatively_or_through_a_link_holds_the_same_copy()
             (fake, crate::take_said())
         }
     };
-    let resolves = |fake: &FakeRemote| execs(fake, 22002).iter().filter(|(c, _)| c.contains(" arena-resolve")).count();
+    let resolves = |fake: &FakeRemote| execs(fake, 22002).iter().filter(|(c, _)| c.contains(" 'arena-resolve' ")).count();
 
     // Relative to this process's working directory.
     let w = World::new("dir-relative");
@@ -736,7 +736,7 @@ async fn a_busy_pods_copy_counts_only_when_whole() {
             now: n,
         };
         let settled = busy.settle(&remote, &cfg, &pulled, false, None).await;
-        let resolves = execs(&fake, 22002).iter().filter(|(c, _)| c.contains(" arena-resolve")).count();
+        let resolves = execs(&fake, 22002).iter().filter(|(c, _)| c.contains(" 'arena-resolve' ")).count();
         assert_eq!((resolves, settled.done.contains(&name)), (usize::from(finished), finished), "{case}");
         assert!(w.recorded().is_none(), "{case}: forgotten once finished, else never recorded");
     }
