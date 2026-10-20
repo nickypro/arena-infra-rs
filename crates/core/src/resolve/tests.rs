@@ -411,19 +411,35 @@ fn a_resolve_is_read_back_and_said_in_a_line() {
     }
 }
 
-/// The scripts are POSIX sh: dash (the images' `sh`) parses them.
+/// `s` as one single-quoted shell word, as the wrapper carries a script.
+fn quoted(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The scripts are POSIX sh: dash (the images' `sh`) parses them. The resolve's command carries
+/// its script once — its arguments its first line — bounded on the pod a little under the CLI's
+/// timeout (review ai-review claude #7): `timeout -k 10 270`, under `sh -c`.
 #[cfg(unix)]
 #[test]
 fn the_scripts_parse_under_sh() {
-    for (name, script) in [("look", look_script()), ("resolve", resolve_script())] {
+    let cmd = resolve_command("/root/ARENA_materials", 3, "merge 1760000000 abc", "1-2", "w1d1/devtest-a");
+    let script = format!("set -- /root/ARENA_materials 10800 'merge 1760000000 abc' 1-2 3 w1d1/devtest-a 99614720\n{}", resolve_script());
+    for (name, script) in [("look", look_script()), ("resolve", resolve_script()), ("resolve with its arguments", script.clone())] {
         let o = std::process::Command::new("sh").arg("-n").arg("-c").arg(&script).output().unwrap();
         assert!(o.status.success(), "{name}: {}", String::from_utf8_lossy(&o.stderr));
         assert!(!script.contains("@ARENA_"), "{name}: a mark left unrendered");
     }
     assert!(resolve_script().contains(&format!("REVERT_WORDS={}", shell_word(REVERT_WORDS))));
     assert!(look_command("/root/my repo").ends_with(" arena-look '/root/my repo'"));
-    let cmd = resolve_command("/root/ARENA_materials", 3, "merge 1760000000 abc", "1-2", "w1d1/devtest-a");
-    assert!(cmd.ends_with(" arena-resolve /root/ARENA_materials 10800 'merge 1760000000 abc' 1-2 3 w1d1/devtest-a 99614720"), "{cmd}");
+    assert_eq!(cmd.matches(&quoted(&script)).count(), 1, "the script, carried once");
+    let wrapper = cmd.replace(&quoted(&script), "<script>");
+    assert!(wrapper.contains("timeout -k 10 270 sh -c ") && wrapper.contains("arena-resolve"), "{wrapper}");
+    assert!(wrapper.contains("ran past its 270 s on the pod and was stopped there (TERM)"), "{wrapper}");
+    assert_eq!((RESOLVE_BOUND_SECS, RESOLVE_KILL_AFTER_SECS), (270, 10));
+    // A resolve's temporary files go when a signal ends it: HUP, INT, TERM and PIPE are exits.
+    for (sig, code) in [("HUP", 129), ("INT", 130), ("TERM", 143), ("PIPE", 141)] {
+        assert!(resolve_script().contains(&format!("trap 'exit {code}' {sig}\n")), "{sig}");
+    }
 }
 
 // --- Real git ---------------------------------------------------------------------------------
@@ -641,7 +657,12 @@ impl Repo {
     }
 
     fn sh_with(&self, cmd: &str, env: &[(&str, &str)]) -> (Option<i32>, String, String) {
-        let o = self.cmd(&self.base, "bash").arg("-c").arg(cmd).envs(env.iter().copied()).output().expect("bash");
+        self.shell_with("bash", cmd, env)
+    }
+
+    /// `<shell> -c cmd` in the sandbox — the pod's login shell, which sshd hands the command to.
+    fn shell_with(&self, shell: &str, cmd: &str, env: &[(&str, &str)]) -> (Option<i32>, String, String) {
+        let o = self.cmd(&self.base, shell).arg("-c").arg(cmd).envs(env.iter().copied()).output().expect(shell);
         (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
     }
 
@@ -1762,6 +1783,50 @@ fn an_equal_size_replacement_that_keeps_the_mtime_is_a_change() {
     let (code, rep, said) = r.resolve(3, &look);
     assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some("changed: files changed since the copy")), "{said}");
     r.untouched(&conflicts, "ctime");
+}
+
+/// The resolve bounds itself on the pod (review ai-review claude #7): arena's own timeout kills only
+/// the local ssh client, and the resolve ran on — it could commit the merge after arena had said it
+/// failed and released the pod's lock. Under bash and under zsh, the pods' login shell (which `-c`s
+/// the command), it runs under `sh` and `timeout`: one stopped at its bound (here 2 s, while the
+/// pre-change hook sleeps) exits 124, says so, and its TERM trap removes its temporary files from
+/// the git dir — the merge as it was. The real command, under that shell, finishes it.
+#[cfg(unix)]
+#[test]
+fn the_resolve_bounds_itself_on_the_pod_under_any_login_shell() {
+    let has = |sh: &str| std::process::Command::new(sh).args(["-c", "true"]).output().is_ok_and(|o| o.status.success());
+    let shells: Vec<&str> = ["bash", "zsh"].into_iter().filter(|sh| has(sh)).collect();
+    if !shells.contains(&"zsh") {
+        eprintln!("zsh isn't installed here: the resolve's login-shell checks run under bash only");
+    }
+    let temp_files = |r: &Repo| -> Vec<String> {
+        std::fs::read_dir(r.work.join(".git"))
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.starts_with("arena-resolve."))
+            .collect()
+    };
+    for shell in shells {
+        let r = Repo::new(&format!("bound-{shell}"));
+        r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+        r.age(4 * HOUR);
+        let conflicts = r.unmerged();
+        let look = r.look();
+        let work = r.work.to_str().unwrap();
+        let bounded = resolve_command_bounded(work, 3, &look.op_key(), &look.print, "w1d1/devtest-x", GIT_MAX_FILE_BYTES_FOR_TESTS, (2, 1));
+        let t0 = std::time::Instant::now();
+        let (code, out, err) = r.shell_with(shell, &bounded, &[("ARENA_TEST_HOOK_BEFORE_CHANGE", "sleep 30")]);
+        assert_eq!(code, Some(124), "{shell}: {out}{err}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(20), "{shell}: bounded");
+        assert!(err.contains("arena resolve: it ran past its 2 s on the pod and was stopped there (TERM)"), "{shell}: {err}");
+        assert!(out.contains("SAVED "), "{shell}: stopped after the state before was kept: {out}");
+        assert_eq!(temp_files(&r), Vec::<String>::new(), "{shell}: its temporary files removed");
+        assert!(r.work.join(".git/MERGE_HEAD").exists() && r.unmerged() == conflicts, "{shell}: the merge as it was");
+        // The real command under that shell: finished.
+        let (code, out, err) = r.shell_with(shell, &resolve_command(work, 3, &look.op_key(), &look.print, "w1d1/devtest-x"), &[]);
+        assert_eq!((code, parse_resolve(&out).resolved.as_deref()), (Some(0), Some("merge")), "{shell}: {out}{err}");
+        assert_eq!(temp_files(&r), Vec::<String>::new(), "{shell}");
+    }
 }
 
 /// A missing identity: refused, nothing touched — the resolve never makes one up (`-c user.*`).

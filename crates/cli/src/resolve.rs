@@ -25,8 +25,11 @@ const LOOK_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a pod's lock is waited for, for its look: one another backup holds (a pull) means
 /// no look — the pod is then copied as before, and not finished this run.
 const LOOK_LOCK_WAIT: Duration = Duration::from_secs(10);
-/// How long a resolve may take (its look, a checkout of each conflicted path, the commit).
+/// How long a resolve may take (its look, a checkout of each conflicted path, the commit). The
+/// pod's side bounds itself a little under it (`RESOLVE_BOUND_SECS`, then a KILL), so it has ended
+/// there before this times out and the pod's lock is released.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(300);
+const _: () = assert!(core_resolve::RESOLVE_BOUND_SECS + core_resolve::RESOLVE_KILL_AFTER_SECS < RESOLVE_TIMEOUT.as_secs());
 
 /// One BUSY pod of the run.
 struct BusyPod {

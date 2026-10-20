@@ -1,9 +1,11 @@
 # arena resolve: finish an operation left in progress in one pod's checkout once nothing in it has
 # changed for a while — what `pods backup` runs on a pod whose backup said BUSY, after copying it.
 #
-#   sh -c "$THIS_SCRIPT" arena-resolve <repo> <quiet secs> <op> <print> <hours> <copy> <max file bytes>
+#   set -- <repo> <quiet secs> <op> <print> <hours> <copy> <max file bytes>   (its first line)
 #
-# Rendered and parsed by arena_core::resolve (resolve_command / parse_resolve). <op> (`OP`'s
+# Rendered and parsed by arena_core::resolve (resolve_command / parse_resolve), which prepends that
+# first line and runs it under `sh -c`, whatever the pod's login shell, bounded by `timeout` there
+# (backup::bounded_sh: TERM after RESOLVE_BOUND_SECS, under the CLI's own timeout). <op> (`OP`'s
 # `<what> <mtime> <commit>`) and <print> (`PRINT`) are what the look before the copy saw: the
 # checkout is looked at again first, and if anything changed since — or anything in it is younger
 # than <quiet secs>, or someone is at work in git there, or the state is unusual — nothing is
@@ -52,6 +54,14 @@
 # ARENA_TEST_HOOK_BEFORE_CHANGE and ARENA_TEST_HOOK_BEFORE_FINISH, commands run right before the
 # re-reads, are set by tests only.
 set -u
+# A hangup, an interrupt, a TERM (the bound above, sent to the whole process group) or a broken
+# pipe ends the run as an exit, so the EXIT trap that removes its temporary files ($T.*, in the
+# git dir) runs: dash runs none for a signal left at its default. (The trap runs once the command
+# running then returns.) A KILL runs no trap.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 141' PIPE
 REPO=$1
 SECS=$2
 WANT_OP=$3

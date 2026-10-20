@@ -109,20 +109,51 @@ pub fn resolve_command(repo: &str, hours: u64, op: &str, print: &str, copy: &str
     resolve_command_limited(repo, hours, op, print, copy, crate::backup::GIT_MAX_FILE_BYTES)
 }
 
+/// How long the resolve may run on the pod before `timeout` stops it there with TERM: under the
+/// CLI's `RESOLVE_TIMEOUT` (5 min, which checks this plus [`RESOLVE_KILL_AFTER_SECS`] against it
+/// at compile time), so the pod's side has ended before arena reports a timeout and releases the
+/// pod's lock. arena's own timeout kills only the local ssh client, and a non-pty session's shell
+/// is usually never signalled: the resolve ran on, and could commit the merge after arena had said
+/// it failed — while the next tick's backup, or a `set-branch`, ran on the same checkout (review
+/// ai-review claude #7). Its cost grows with the conflicts (a `git log` per side, a scratch
+/// checkout, `merge-file` per path), so it gets most of those 5 minutes.
+pub const RESOLVE_BOUND_SECS: u64 = 270;
+
+/// After the TERM, how long the resolve has to end (its traps turn the signal into an exit, so
+/// its temporary files in the git dir are removed) before `timeout` KILLs it.
+pub const RESOLVE_KILL_AFTER_SECS: u64 = 10;
+
 /// The resolve of one pod: [`resolve_script`] with the repo, the quiet period (`hours`), the
 /// operation and the files as the look before the copy saw them ([`Look::op_key`],
 /// [`Look::print`]), the copy's name for the commit's words (`copy`: `w2d1/devtest-alice`), and
-/// the largest file it may commit (`max_bytes`; tests pass a small one).
+/// the largest file it may commit (`max_bytes`; tests pass a small one) — bounded on the pod
+/// ([`RESOLVE_BOUND_SECS`]).
 pub fn resolve_command_limited(repo: &str, hours: u64, op: &str, print: &str, copy: &str, max_bytes: u64) -> String {
-    format!(
-        "sh -c {} arena-resolve {} {} {} {} {hours} {} {max_bytes}",
-        shell_word(&resolve_script()),
-        shell_word(repo),
-        hours * 3600,
-        shell_word(op),
-        shell_word(print),
-        shell_word(copy)
-    )
+    resolve_command_bounded(repo, hours, op, print, copy, max_bytes, (RESOLVE_BOUND_SECS, RESOLVE_KILL_AFTER_SECS))
+}
+
+/// [`resolve_command_limited`] bounded by `bound`: TERM after `.0` seconds, KILL `.1` later
+/// (tests pass a short one). It runs through [`crate::backup::bounded_sh`], as set-branch's switch
+/// does: under `sh -c` whatever the login shell that `-c`s the command (zsh on the pods, whose own
+/// rules — a glob with no match is fatal — the script never meets), and under `timeout -k` where
+/// the pod has a `timeout` that takes it (else unbounded, as before). Its arguments are the
+/// script's first line (`set -- …`), so the wrapper hands it nothing but the script. Stopped there,
+/// it says so on stderr (exit 124, or 137 after the KILL).
+fn resolve_command_bounded(repo: &str, hours: u64, op: &str, print: &str, copy: &str, max_bytes: u64, bound: (u64, u64)) -> String {
+    let (secs, kill_after) = bound;
+    let (quiet, h, max) = ((hours * 3600).to_string(), hours.to_string(), max_bytes.to_string());
+    let args = [repo, &quiet, op, print, &h, copy, &max].map(shell_word).join(" ");
+    let script = format!("set -- {args}\n{}", resolve_script());
+    let stopped = format!(
+        "arena resolve: it ran past its {secs} s on the pod and was stopped there (TERM) — it may have stopped part-way: see `git \
+         status` on the pod; the state before, once kept, is in .git/arena-resolved/"
+    );
+    let killed = format!(
+        "arena resolve: it ran past its {secs} s on the pod and was killed there ({kill_after} s after the TERM) — it may have stopped \
+         part-way: see `git status` on the pod; the state before, once kept, is in .git/arena-resolved/, and its temporary files may \
+         be left in .git/ (arena-resolve.*)"
+    );
+    crate::backup::bounded_sh(&script, "arena-resolve", secs, kill_after, &stopped, &killed)
 }
 
 /// The resolve's exit when it touched nothing (`REFUSED`).
