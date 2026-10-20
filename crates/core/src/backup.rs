@@ -71,13 +71,13 @@ pub fn configured_repo(cfg: &Config) -> Option<String> {
 
 /// The course repo whose own commits the backup leaves as they are, as `owner/name`: the public
 /// repo setup adds as each checkout's `upstream` remote (`ARENA_UPSTREAM_REPO`, default
-/// [`crate::setup::DEFAULT_UPSTREAM_REPO`]; [`crate::setup::upstream_url`]). What a pod's
-/// `refs/remotes/upstream/main` holds, when every URL its `upstream` fetches from and pushes to is
-/// this repo (any spelling), is never scanned for keys or rewritten — public already, and a
-/// rewritten copy breaks its ancestry with the course (review ai-review claude #4); any other
-/// `upstream/*` ref is scanned (codex #1, claude #5). So it should name a public repo: its commits
-/// go into the cohort repo unscanned (claude #6). `None` (an `upstream`'s commits scanned like the
-/// rest) for `none`, the cohort repo itself, or a value setup refuses.
+/// [`crate::setup::DEFAULT_UPSTREAM_REPO`]; [`crate::setup::upstream_url`]). The commits this
+/// repo's own `main` has — fetched from `https://github.com/<owner>/<name>.git` by the backup
+/// itself into the pod's `refs/arena/course-main`, never read off the pod's `upstream` (review
+/// ai-review codex #1, FIX6) — are never scanned for keys or rewritten: public already, and a
+/// rewritten copy breaks their ancestry with the course (claude #4). The fetch has no credentials,
+/// so a private repo can't be verified and its commits are scanned like the rest. `None` (nothing
+/// exempt) for `none`, the cohort repo itself, or a value setup refuses.
 pub fn course_repo(cfg: &Config) -> Option<String> {
     let url = crate::setup::upstream_url(cfg).ok().flatten()?;
     url.strip_prefix("https://github.com/").and_then(|r| r.strip_suffix(".git")).map(String::from)
@@ -475,16 +475,18 @@ pub fn backup_script() -> String {
 /// *and* `HEAD == refs/remotes/origin/<branch>` prints `NO_CHANGES <branch>` (exit 0); a push
 /// prints `PUSHED <branch>`. "Already pushed" always means on origin — the branch's configured
 /// upstream and the course repo setup adds as `upstream` don't count (review ai-review claude
-/// #6). The course's own commits are left as the course published them, though: when `upstream`
-/// fetches from and pushes to the course repo alone ([`course_repo`], any spelling of its URLs),
-/// what its `main` (`refs/remotes/upstream/main`, and that alone) has is never scanned for
-/// keys or rewritten (review ai-review claude #4: a redacted copy of a course commit broke its
-/// ancestry, so every later `git pull upstream main` conflicted on the redacted lines, and the
-/// merge was rewritten again) — and if GitHub's push protection then refuses a course's
-/// key-like string, the report says so (`PUSH_BLOCKED_COURSE`), never a participant's leak. A
-/// commit only another `upstream/*` ref has (codex #1, claude #5: one a successful `git push
-/// upstream` or a fetch from a fork left there), an `upstream` elsewhere or a participant's own
-/// remote has, is scanned and redacted like any other. This takes the default course repo
+/// #6). The course's own commits are left as the course published them, though (review ai-review
+/// claude #4: a redacted copy of a course commit broke its ancestry, so every later `git pull
+/// upstream main` conflicted on the redacted lines, and the merge was rewritten again) — the
+/// course's, verified (codex #1, FIX6): when the scan finds a key in a blob
+/// `refs/remotes/upstream/main` has too, and only then, the script fetches the course repo's
+/// `main` ([`course_repo`], over https, no credentials, `timeout 60`) into `refs/arena/course-main`,
+/// leaves out of the scan and the rewrite only the commits that ref has, and scans again. What the
+/// pod's `upstream` holds, or its URLs say, proves nothing: a fork's commit fetched before
+/// `upstream` was repointed at the course is scanned and redacted like any other. A fetch that
+/// fails exempts nothing (`COURSE_UNVERIFIED`, [`BackupReport::course_unverified`]). If GitHub's
+/// push protection then refuses a course's key-like string, the report says so
+/// (`PUSH_BLOCKED_COURSE`), never a participant's leak. This takes the default course repo
 /// ([`crate::setup::DEFAULT_UPSTREAM_REPO`]); a caller with the config passes [`course_repo`] to
 /// [`backup_command_with_course`]. A
 /// file over GitHub's limit already in the unpushed commits fails it with
@@ -510,7 +512,8 @@ pub fn backup_command(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &s
 }
 
 /// [`backup_command`] with the course repo whose own commits it leaves as they are (`owner/name`,
-/// [`course_repo`]; `None`: an `upstream`'s commits are scanned like any other's).
+/// [`course_repo`]; `None`: nothing exempt). Tests pass a local bare repo's path instead, which the
+/// script fetches as it is (origin.sh's `course_url`), so that none reaches GitHub.
 pub fn backup_command_with_course(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, origin: Option<&str>, course: Option<&str>) -> String {
     rendered(repo_path, git_ssh_key, commit_msg, GIT_MAX_FILE_BYTES, GITHUB_FILE_LIMIT_BYTES, origin, course)
 }
@@ -641,6 +644,10 @@ pub struct BackupReport {
     /// (`PUSH_BLOCKED_COURSE <commit>…`): the course's own key-like string, public already, which
     /// the backup leaves as it is — not a participant's leak. The commits GitHub named.
     pub push_blocked_course: Option<String>,
+    /// The course's `main` couldn't be fetched to verify which commits are its own
+    /// (`COURSE_UNVERIFIED <url>`), so none were exempt: a key-like string in what `upstream/main`
+    /// brought was scanned, and redacted, like the participant's own. The URL.
+    pub course_unverified: Option<String>,
     /// The push itself failed otherwise (the network, a non-fast-forward…): `PUSH_FAILED`.
     pub push_failed: bool,
     /// `origin` isn't the configured repo, so nothing was committed or pushed (`WRONG_ORIGIN`):
@@ -706,6 +713,7 @@ pub fn parse_backup_report(stdout: &str) -> BackupReport {
                 }
             }
             "PUSH_BLOCKED_COURSE" => r.push_blocked_course = Some(rest.trim().to_string()),
+            "COURSE_UNVERIFIED" => r.course_unverified = Some(rest.trim().to_string()),
             "PUSH_BLOCKED" => {
                 let why = rest.trim();
                 r.push_blocked = Some(if why.is_empty() { "refused by GitHub push protection".into() } else { why.to_string() });
@@ -788,6 +796,15 @@ impl BackupReport {
                 short_id(new)
             ));
         }
+        if let Some(url) = &self.course_unverified {
+            let then = if self.history.is_some() {
+                ": the course's own key-like strings were redacted with the rest, so a later `git pull upstream main` may conflict \
+                 on those lines"
+            } else {
+                ""
+            };
+            notes.push(format!("couldn't reach the course repo ({url}) to verify which commits are its own, so none were left unscanned{then}"));
+        }
         notes
     }
 
@@ -814,7 +831,7 @@ impl BackupReport {
             let ids: Vec<&str> = commits.split_whitespace().map(short_id).collect();
             return Some(format!(
                 "GitHub push protection refuses {branch}: {why} — a key-like string the course published itself (in its own \
-                 commit {}, from `upstream`, the course repo: public already), not a key of the participant's. The backup \
+                 commit {}, verified against the course repo: public already), not a key of the participant's. The backup \
                  never rewrites the course's commits (every later `git pull upstream main` would conflict on them); to let \
                  it through, allow that secret in the cohort repo's push protection on GitHub",
                 ids.join(", ")
@@ -3207,57 +3224,40 @@ done
         }
     }
 
-    /// `upstream_is_course`, from the very script under `sh`, in a repo whose `upstream` fetches
-    /// from each of `urls` (and pushes to them, with no pushurl of its own): every spelling of the
-    /// course repo is it; a fork, another host, a local path, no `upstream`, or one URL of two
-    /// elsewhere is not — and nor is a pushurl elsewhere (review ai-review claude #5: a `git push
-    /// upstream` there updated `refs/remotes/upstream/*` with the participant's own commits).
+    /// `course_url`, from the very script under `sh`: the course repo as the backup is given it
+    /// ([`course_repo`]'s `owner/name`) is its public https URL, the one setup adds as `upstream`
+    /// ([`crate::setup::upstream_url`]) — what the backup fetches the course's `main` from to verify
+    /// its commits (review ai-review codex #1, FIX6). A local path or a `file://` URL, which only a
+    /// test passes, is used as it is. Anything else is no course: nothing printed, nothing exempt.
     #[cfg(unix)]
     #[test]
-    fn upstream_is_the_course_in_any_spelling_and_nothing_else_is() {
-        let s = GitSandbox::new("course-spelling", 1_000_000);
-        let is_course_pushing_to = |urls: &[&str], push: &[&str]| {
-            let _ = s.run(&format!("cd {} && git remote remove upstream", shell_quote(s.work.to_str().unwrap())));
-            for (i, u) in urls.iter().enumerate() {
-                let args: &[&str] = if i == 0 { &["remote", "add", "upstream", u] } else { &["remote", "set-url", "--add", "upstream", u] };
-                s.git(&s.work, args);
-            }
-            for u in push {
-                s.git(&s.work, &["remote", "set-url", "--add", "--push", "upstream", u]);
-            }
-            let script = format!("cd {} || exit 2\n{}\nupstream_is_course ARENA-education/ARENA_materials", shell_quote(s.work.to_str().unwrap()), origin_sh());
-            std::process::Command::new("sh").arg("-c").arg(script).status().unwrap().success()
-        };
-        let is_course = |urls: &[&str]| is_course_pushing_to(urls, &[]);
-        let course = "https://github.com/ARENA-education/ARENA_materials";
-        assert!(is_course_pushing_to(&[course], &["git@github.com:arena-education/ARENA_materials.git"]), "a pushurl that is the course too");
-        for push in [
-            &["git@github.com:someone/ARENA_materials.git"][..],
-            &["git@github.com:ARENA-education/ARENA_materials.git", "git@github.com:someone/ARENA_materials.git"],
-            &["/srv/fork.git"],
+    fn the_course_url_is_its_https_one_or_a_path_a_test_gives() {
+        for (course, want) in [
+            ("ARENA-education/ARENA_materials", "https://github.com/ARENA-education/ARENA_materials.git"),
+            ("callummcdougall/ARENA_3.0", "https://github.com/callummcdougall/ARENA_3.0.git"),
+            ("/tmp/arena-backup-x/github/ARENA-education/ARENA_materials.git", "/tmp/arena-backup-x/github/ARENA-education/ARENA_materials.git"),
+            ("file:///srv/course.git", "file:///srv/course.git"),
+            ("", ""),
+            ("o/r/x", ""),
+            ("a b/r", ""),
+            ("git@github.com:o/r.git", ""),
+            ("https://github.com/o/r", ""),
+            ("../course.git", ""),
+            ("./r", ""),
+            ("o/..", ""),
+            ("o/r;touch x", ""),
         ] {
-            assert!(!is_course_pushing_to(&[course], push), "pushing to {push:?}");
+            assert_eq!(origin_fn("course_url", course), want, "{course:?}");
         }
-        for url in [
-            "https://github.com/ARENA-education/ARENA_materials.git",
-            "https://github.com/arena-education/arena_materials",
-            "https://devtest-user:x@github.com/ARENA-education/ARENA_materials/",
-            "git@github.com:ARENA-education/ARENA_materials.git",
-            "ssh://git@github.com/ARENA-education/ARENA_materials",
-        ] {
-            assert!(is_course(&[url]), "{url}");
+        // The same URL setup gives `upstream`, for every course_repo spelling of the config.
+        for text in ["", "ARENA_UPSTREAM_REPO=callummcdougall/ARENA_3.0\n", "ARENA_UPSTREAM_REPO=git@github.com:o/r.git\n"] {
+            let cfg = Config::parse(text);
+            let url = crate::setup::upstream_url(&cfg).unwrap().unwrap();
+            assert_eq!(origin_fn("course_url", &course_repo(&cfg).unwrap()), url, "{text:?}");
         }
-        assert!(is_course(&["https://github.com/ARENA-education/ARENA_materials", "git@github.com:arena-education/ARENA_materials.git"]));
-        for urls in [
-            &["https://github.com/someone/ARENA_materials.git"][..],
-            &["https://github.com/ARENA-education/ARENA_materials-fork"],
-            &["https://gitlab.com/ARENA-education/ARENA_materials"],
-            &["/srv/github.com/ARENA-education/ARENA_materials.git"],
-            &["https://github.com/ARENA-education/ARENA_materials", "https://github.com/someone/ARENA_materials"],
-            &[],
-        ] {
-            assert!(!is_course(urls), "{urls:?}");
-        }
+        // No `upstream_is_course` any more: the URLs of the pod's `upstream` decide nothing.
+        let script = backup_script();
+        assert!(!script.contains("upstream_is_course") && !script.contains("get-url --all upstream") && !script.contains("get-url --push --all upstream"));
     }
 
     /// `origin_key` and `origin_shown` from the very script, under `sh`.
@@ -4188,20 +4188,39 @@ done
         staff
     }
 
+    /// The configured course repo, as the backup is given it in tests: the path of the bare repo
+    /// standing in for `github.com/ARENA-education/ARENA_materials` on [`GitSandbox::github`]
+    /// (created with origin's `main` if it isn't there yet) — fetched as it is (origin.sh's
+    /// `course_url`), so no test reaches GitHub.
+    #[cfg(unix)]
+    fn the_course(s: &GitSandbox) -> String {
+        let bare = s.github("ARENA-education/ARENA_materials");
+        s.git(&s.work, &["push", "-q", bare.to_str().unwrap(), "refs/remotes/origin/main:refs/heads/main"]);
+        bare.to_str().unwrap().to_string()
+    }
+
+    /// `refs/arena/course-main` on the pod, if the backup fetched it.
+    #[cfg(unix)]
+    fn course_main(s: &GitSandbox) -> Option<String> {
+        let o = s.run(&format!("git -C {} rev-parse -q --verify refs/arena/course-main", shell_quote(s.work.to_str().unwrap())));
+        o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    }
+
     /// Review ai-review claude #6 (FIX3), kept under claude #4's rule: setup adds the course repo
     /// as `upstream`, and "already pushed" meant "on any remote" — so a commit only `upstream` had
     /// (its `main` merged into the day's branch) was never scanned for keys and went to origin with
     /// a key in it (or was refused by push protection every tick); and a branch made from
     /// `upstream/main`, tracking it, read as in sync (`NO_CHANGES`) though origin had none of it.
     /// "Pushed" means on origin. An `upstream` that isn't the configured course repo — here a
-    /// fork's URL, the course repo configured — is scanned like the rest: its commit goes out
-    /// redacted, the file on disk and upstream's own ref untouched, and that branch is pushed. (The
-    /// course repo's own commits are left as they are: the next test.)
+    /// fork's URL, the course repo configured, which doesn't have the fork's commit — is scanned
+    /// like the rest: its commit goes out redacted, the file on disk and upstream's own ref
+    /// untouched, and that branch is pushed. (The course repo's own commits are left as they are:
+    /// the next test.)
     #[cfg(unix)]
     #[test]
     fn a_key_in_a_commit_only_another_upstream_has_is_redacted_before_it_reaches_origin() {
         let mut s = GitSandbox::new("upstream-key", 1_000_000);
-        s.course = Some(crate::setup::DEFAULT_UPSTREAM_REPO.into());
+        s.course = Some(the_course(&s));
         let key = openrouter_key(21);
         course_upstream(&s, "someone/ARENA_materials", &key);
         let theirs = s.git(&s.work, &["rev-parse", "upstream/main"]);
@@ -4237,15 +4256,18 @@ done
     /// `git pull upstream main` — were scanned like any unpushed commit, and one holding a
     /// key-like string was rewritten. The participant's branch then had a redacted copy, not the
     /// course's commit, so the next `git pull upstream main` merged from a base before it,
-    /// conflicted on the redacted lines (BUSY), and every pod looped. Now, when `upstream` is the
-    /// configured course repo (any spelling of its URL), what it has is never scanned or rewritten:
-    /// the merge is pushed with every commit id as it was, and the course's next commit merges
-    /// cleanly.
+    /// conflicted on the redacted lines (BUSY), and every pod looped. Now the commits the
+    /// configured course repo's own `main` has — fetched from it by the backup, into
+    /// `refs/arena/course-main` (codex #1, FIX6) — are never scanned or rewritten: the merge is
+    /// pushed with every commit id as it was, and the course's next commit merges cleanly. The
+    /// course is asked only when a key turns up in what upstream's main brought: a run without one
+    /// fetches nothing. And `upstream`'s URLs decide nothing: a dead push URL (`no_push`, claude #2)
+    /// leaves the course's commits as they are.
     #[cfg(unix)]
     #[test]
     fn the_courses_own_commits_are_pushed_as_they_are_and_the_next_pull_merges_cleanly() {
         let mut s = GitSandbox::new("course-key", 1_000_000);
-        s.course = Some(crate::setup::DEFAULT_UPSTREAM_REPO.into());
+        s.course = Some(the_course(&s));
         let key = openrouter_key(23);
         let staff = course_upstream(&s, "ARENA-education/ARENA_materials", &key);
         let course_commit = s.git(&s.work, &["rev-parse", "upstream/main"]);
@@ -4253,10 +4275,13 @@ done
         std::fs::write(s.work.join("mine.py"), "mine = 1\n").unwrap();
         let (code, r, err) = s.backup();
         assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        assert_eq!(course_main(&s), None, "no key in what went out: the course not asked");
         s.git(&s.work, &["merge", "-q", "--no-edit", "--no-ff", "upstream/main"]);
         let merge = s.git(&s.work, &["rev-parse", "HEAD"]);
-        let (code, r, err) = s.backup();
-        assert_eq!((code, r.outcome.clone(), r.history.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into())), None), "{err}");
+        let (code, out, err) = s.backup_raw();
+        let r = parse_backup_report(&out);
+        assert_eq!((code, r.outcome.clone(), r.history.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into())), None), "{out}{err}");
+        assert_eq!((r.course_unverified, course_main(&s)), (None, Some(course_commit.clone())), "verified against the course: {out}");
         assert_eq!((s.git(&s.work, &["rev-parse", "HEAD"]), origin_ref()), (merge.clone(), merge), "pushed as it was, nothing rewritten");
         s.git(&s.work, &["merge-base", "--is-ancestor", &course_commit, "origin/autocommit-x"]);
         assert!(s.origin_holds(&key), "the course's own example, as the course published it");
@@ -4272,30 +4297,32 @@ done
         assert_eq!(std::fs::read_to_string(s.work.join("course_key.md")).unwrap(), text);
         let fix = s.git(&s.work, &["rev-parse", "upstream/main"]);
         let pulled = s.git(&s.work, &["rev-parse", "HEAD"]);
-        // Any spelling of the course repo's URL is it (here https, no .git, another case).
-        s.git(&s.work, &["remote", "set-url", "upstream", "https://github.com/arena-education/arena_materials"]);
+        // A dead push URL on `upstream` (`no_push`): the course's commits still go out as they are.
+        s.git(&s.work, &["remote", "set-url", "--push", "upstream", "no_push"]);
         let (code, r, err) = s.backup();
         assert_eq!((code, r.outcome, r.history), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into())), None), "{err}");
-        assert_eq!(origin_ref(), pulled);
+        assert_eq!((origin_ref(), course_main(&s)), (pulled, Some(fix.clone())));
         s.git(&s.work, &["merge-base", "--is-ancestor", &fix, "origin/autocommit-x"]);
     }
 
-    /// Review ai-review codex #1 / claude #5: the exemption covered every `refs/remotes/upstream/*`
-    /// ref whenever `upstream` *fetched* from the course repo — but a `git push upstream <branch>`
-    /// to a pushurl of the participant's own fork, or a fetch from a fork before `upstream` was
-    /// repointed at the course, leaves their own commit in such a ref, and it went out unscanned.
-    /// Now only upstream's `main`, and only when every URL `upstream` fetches from *and pushes to*
-    /// is the course repo. A pushurl of a fork: the commit `upstream/main` brought is scanned, and
-    /// its key redacted. A key on `upstream/experiment`, `upstream/main` clean: scanned and
-    /// redacted. (`upstream/main` from the course alone stays exempt: the test before.)
+    /// Review ai-review codex #1 (FIX6): the exemption trusted whatever `refs/remotes/upstream/main`
+    /// held once `upstream`'s URLs were the course's — but a participant's fork fetched as
+    /// `upstream/main`, then `upstream` repointed at the course (both URLs), left their own
+    /// key-bearing commit there, and it went out unscanned. Now only what the course repo itself
+    /// has is exempt, fetched from it then and there: the fork's commit, which the course doesn't
+    /// have, is redacted. The course unreachable: nothing is exempt — not even what an earlier
+    /// fetch left in `refs/arena/course-main` — the course's own commit is redacted too, and the
+    /// line says so, once. A key on `upstream/experiment`, upstream's main clean: redacted, the
+    /// course never asked.
     #[cfg(unix)]
     #[test]
-    fn only_upstreams_main_from_the_course_alone_goes_out_unscanned() {
+    fn only_what_the_course_itself_has_goes_out_unscanned() {
         let check = |s: &GitSandbox, key: &str, merge: &str| {
             s.git(&s.work, &["merge", "-q", "--no-edit", "--no-ff", merge]);
             let example = s.read("course_key.md");
-            let (code, r, err) = s.backup();
-            assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{merge}: {err}");
+            let (code, out, err) = s.backup_raw();
+            let r = parse_backup_report(&out);
+            assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{merge}: {out}{err}");
             assert_eq!(r.history.as_ref().map(|h| h.0), Some(2), "{merge}: the commit and the merge, rewritten");
             assert!(!s.origin_holds(key), "{merge}: the key reached origin");
             assert_eq!(
@@ -4303,33 +4330,61 @@ done
                 "# Keys\nSet your key: OPENROUTER_API_KEY = \"REDACTED-OPENROUTER-KEY\"\nThen run it."
             );
             assert_eq!(s.read("course_key.md"), example, "{merge}: the file on disk keeps it");
+            (out, err, r)
         };
-        // The course's URL to fetch from, a fork's to push to.
-        let mut s = GitSandbox::new("course-pushurl", 1_000_000);
-        s.course = Some(crate::setup::DEFAULT_UPSTREAM_REPO.into());
+        // A fork's main fetched as upstream/main, then both of upstream's URLs repointed at the
+        // course, which doesn't have the fork's commit.
+        let mut s = GitSandbox::new("course-fork", 1_000_000);
+        s.course = Some(the_course(&s));
         let key = openrouter_key(27);
+        course_upstream(&s, "someone/ARENA_materials", &key);
+        for args in [&["remote", "set-url", "upstream"][..], &["remote", "set-url", "--push", "upstream"]] {
+            s.git(&s.work, &[args, &["git@github.com:ARENA-education/ARENA_materials.git"]].concat());
+        }
+        let (out, _, r) = check(&s, &key, "upstream/main");
+        assert_eq!(r.course_unverified, None, "{out}");
+        assert_eq!(course_main(&s), Some(s.git(&s.work, &["rev-parse", "origin/main"])), "the course asked: its main is origin's");
+
+        // The course unreachable, a ref an earlier fetch left in place: nothing exempt, said once.
+        let mut s = GitSandbox::new("course-unreachable", 1_000_000);
+        let key = openrouter_key(30);
         course_upstream(&s, "ARENA-education/ARENA_materials", &key);
-        s.git(&s.work, &["remote", "set-url", "--add", "--push", "upstream", "git@github.com:someone/ARENA_materials.git"]);
-        check(&s, &key, "upstream/main");
-        // The course alone, but the key on another of its refs.
+        s.git(&s.work, &["update-ref", "refs/arena/course-main", "upstream/main"]);
+        let gone = s.base.join("no-such-course.git");
+        s.course = Some(gone.to_str().unwrap().to_string());
+        let (out, err, r) = check(&s, &key, "upstream/main");
+        assert_eq!(out.lines().filter(|l| l.starts_with("COURSE_UNVERIFIED ")).count(), 1, "{out}");
+        assert_eq!(r.course_unverified.as_deref(), gone.to_str(), "{out}");
+        assert!(err.contains("arena backup: fetching the course to verify its commits: "), "{err}");
+        let note = format!(
+            "couldn't reach the course repo ({}) to verify which commits are its own, so none were left unscanned: the course's own \
+             key-like strings were redacted with the rest, so a later `git pull upstream main` may conflict on those lines",
+            gone.display()
+        );
+        assert!(r.notes().contains(&note), "{:?}", r.notes());
+
+        // The course alone, but the key on another of its refs: the course isn't asked.
         let mut s = GitSandbox::new("course-experiment", 1_000_000);
-        s.course = Some(crate::setup::DEFAULT_UPSTREAM_REPO.into());
+        s.course = Some(the_course(&s));
         let key = openrouter_key(28);
         course_upstream_on(&s, "ARENA-education/ARENA_materials", &key, "experiment");
         assert!(!s.run(&format!("git -C {} cat-file -e upstream/main:course_key.md", shell_quote(s.work.to_str().unwrap()))).status.success());
-        check(&s, &key, "upstream/experiment");
+        let (out, _, r) = check(&s, &key, "upstream/experiment");
+        assert_eq!((r.course_unverified, course_main(&s)), (None, None), "{out}");
     }
 
     /// The course's key-like string, refused by GitHub's push protection, is said for what it is:
     /// `PUSH_BLOCKED_COURSE`, the course's own commit, public already — never "a secret the backup
     /// doesn't redact … take it out by hand", which would send someone to rewrite the course's
     /// history. A secret of the participant's own, with the course repo as `upstream`, is still
-    /// that.
+    /// that, and the course isn't asked about it. One GitHub knows and the redaction doesn't, in
+    /// the course's own commit (the scan found nothing, so the course wasn't asked yet): the course
+    /// is asked then (FIX6), and it is said as the course's — unless the course can't be reached.
     #[cfg(unix)]
     #[test]
     fn a_refusal_of_the_courses_own_string_is_said_as_that_never_as_a_leak() {
         let mut s = GitSandbox::new("course-blocked", 1_000_000);
-        s.course = Some(crate::setup::DEFAULT_UPSTREAM_REPO.into());
+        s.course = Some(the_course(&s));
         let key = openrouter_key(24);
         course_upstream(&s, "ARENA-education/ARENA_materials", &key);
         s.push_protect("");
@@ -4340,6 +4395,7 @@ done
         let r = parse_backup_report(&out);
         assert_eq!((code, r.push_blocked_course.clone()), (Some(BACKUP_BLOCKED_EXIT), None), "{out}{err}");
         assert!(r.failure("/r", "devtest-x", code).unwrap().contains("a secret the backup doesn't redact"));
+        assert_eq!(course_main(&s), None, "not upstream's: the course not asked");
         s.git(&s.work, &["reset", "-q", "--hard", "HEAD~1"]);
         std::fs::remove_file(s.work.join("scratch.py")).unwrap_or(());
         // The course's: said as the course's.
@@ -4359,6 +4415,27 @@ done
         assert!(r.failure_brief(code).unwrap().contains("the course's own commit"));
         assert!(r.failed_at_push());
         assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), merge, "nothing rewritten");
+
+        // A string GitHub knows and the redaction doesn't, in the course's own commit.
+        let mut s = GitSandbox::new("course-blocked-unknown", 1_000_000);
+        s.course = Some(the_course(&s));
+        let token = format!("DEVTEST-UNKNOWN-{}", body("0123456789", 20, 5));
+        course_upstream(&s, "ARENA-education/ARENA_materials", &token);
+        s.push_protect("");
+        s.git(&s.work, &["merge", "-q", "--no-edit", "--no-ff", "upstream/main"]);
+        let merge = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let (code, out, err) = s.backup_raw();
+        let r = parse_backup_report(&out);
+        assert_eq!((code, r.push_blocked_course.as_deref()), (Some(BACKUP_BLOCKED_EXIT), Some(merge.as_str())), "{out}{err}");
+        assert!(out.contains("PUSH_BLOCKED Devtest Unknown Token at course_key.md:2"), "{out}");
+        assert_eq!(course_main(&s), Some(s.git(&s.work, &["rev-parse", "upstream/main"])), "asked then");
+        // …the course unreachable: a secret, as ever, and that said once.
+        s.course = Some(s.base.join("no-such-course.git").to_str().unwrap().to_string());
+        let (code, out, err) = s.backup_raw();
+        let r = parse_backup_report(&out);
+        assert_eq!((code, r.push_blocked_course.clone()), (Some(BACKUP_BLOCKED_EXIT), None), "{out}{err}");
+        assert_eq!(out.lines().filter(|l| l.starts_with("COURSE_UNVERIFIED ")).count(), 1, "{out}");
+        assert!(r.failure("/r", "devtest-x", code).unwrap().contains("a secret the backup doesn't redact"));
     }
 
     /// Review ai-review codex #1: the operation check ran once, before the scans. A participant's

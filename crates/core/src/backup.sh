@@ -33,8 +33,11 @@
 #   PUSH_BLOCKED <reason>      GitHub's push protection still refuses the push — a secret the redaction
 #                              doesn't know; the reason names GitHub's secret type and path:line (exit 4)
 #   PUSH_BLOCKED_COURSE <commit>…  after PUSH_BLOCKED: every secret GitHub named is in a file as the
-#                              course published it (`upstream` is the course repo, and the blob is in the
-#                              history of its main) — the course's own key-like string, public already, not a leak
+#                              course published it (the blob is in the history of the course's main,
+#                              verified: refs/arena/course-main) — the course's own key-like string,
+#                              public already, not a leak
+#   COURSE_UNVERIFIED <url>    the course's main couldn't be fetched from <url> to verify which commits
+#                              are its own, so none were exempt (said once; the run goes on)
 #   PUSH_FAILED                the push failed otherwise (the network, a non-fast-forward…; exit 1)
 # Any other failure exits non-zero via `set -e`.
 set -e
@@ -60,20 +63,22 @@ TOP=$(pwd)
 # git and nothing said so (live, 2026-10-17). An empty ORIGIN (no repo configured) checks nothing.
 # @ARENA_ORIGIN_SH@
 origin_check "$ORIGIN"
-# The course's own commits — what refs/remotes/upstream/main has, when `upstream` fetches from and
-# pushes to the configured course repo alone (any spelling) — are never scanned for keys or
-# rewritten (review ai-review claude #4): they are public already, and a rewritten copy breaks
-# their ancestry with the course, so every later `git pull upstream main` re-applied them,
-# conflicted on the redacted lines and was rewritten again. Only `main` (review ai-review codex #1,
-# claude #5): any other upstream/* ref — one a successful `git push upstream`, or a fetch from
-# before `upstream` was repointed at the course, left holding the participant's own commit — is
-# scanned like the rest, and so is an `upstream` anywhere else, or a participant's own remote. What
-# that one ref holds is trusted as the course's (a fetch from another URL before the repointing
-# stays trusted until the next fetch: the README says so). "Pushed" still means on origin.
+# The course's own commits are never scanned for keys or rewritten (review ai-review claude #4):
+# they are public already, and a rewritten copy breaks their ancestry with the course, so every
+# later `git pull upstream main` re-applied them, conflicted on the redacted lines and was
+# rewritten again. Which commits are the course's is verified, never read off the pod (review
+# ai-review codex #1, FIX6): refs/remotes/upstream/main — and whatever URLs `upstream` has now —
+# says nothing of where its commits came from: a participant's fork fetched as `upstream/main`,
+# then `upstream` repointed at the course, left their own key-bearing commit trusted. So only the
+# commits reachable from refs/arena/course-main are exempt ($COURSE_REFS), a ref only a fetch from
+# the configured course repo itself ($COURSE_URL) writes (`course_verify`, below) — lazily: when
+# the scan of the outgoing commits finds a key in a commit upstream's main has too. No course
+# configured, no such fetch this run (none needed, or it failed): nothing is exempt. "Pushed"
+# still means on origin.
+COURSE_URL=
+if [ -n "$COURSE" ]; then COURSE_URL=$(course_url "$COURSE"); fi
 COURSE_REFS=
-if [ -n "$COURSE" ] && upstream_is_course "$COURSE" && git rev-parse -q --verify 'refs/remotes/upstream/main^{commit}' >/dev/null; then
-    COURSE_REFS=refs/remotes/upstream/main
-fi
+COURSE_TRIED=
 if [ -n "$KEY" ]; then
     export GIT_SSH_COMMAND="ssh -i $KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
 fi
@@ -344,23 +349,57 @@ push_block_reason() {
     echo "${_pr:-refused by GitHub push protection}"
 }
 
+# `course_verify`: fetch the course's main from $COURSE_URL into refs/arena/course-main — the one
+# proof that commits are the course's own, which the resolve reads too, by that name — and exempt
+# what it holds ($COURSE_REFS). Over https with no credentials (no helper, no prompt: a private
+# course can't be verified, so its commits are scanned like the rest), bounded (`timeout 60`, where
+# there is one), never touching the participant's FETCH_HEAD or tags. Tried once a run: a fetch
+# that fails exempts nothing — not even a ref an earlier fetch left — and is said once
+# (`COURSE_UNVERIFIED`, git's own words on stderr).
+course_verify() {
+    if [ -n "$COURSE_TRIED" ]; then [ -n "$COURSE_REFS" ]; return; fi
+    COURSE_TRIED=1
+    _cvt=
+    if timeout 1 true >/dev/null 2>&1; then _cvt='timeout 60'; fi
+    if GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= $_cvt git -c credential.helper= fetch --no-tags --no-write-fetch-head --quiet \
+        "$COURSE_URL" '+refs/heads/main:refs/arena/course-main' > /dev/null 2> "$T.cfetch" \
+        && git rev-parse -q --verify 'refs/arena/course-main^{commit}' > /dev/null; then
+        COURSE_REFS=refs/arena/course-main
+        return 0
+    fi
+    echo "COURSE_UNVERIFIED $COURSE_URL"
+    sed 's/^/arena backup: fetching the course to verify its commits: /' "$T.cfetch" >&2 || true
+    return 1
+}
+
+# `named_in <rev>`: whether each blob GitHub's refusal named ($T.where: `commit<TAB>path`) is in
+# <rev>'s history.
+named_in() {
+    git rev-list --objects "$1" | cut -d' ' -f1 | LC_ALL=C sort -u > "$T.history"
+    while IFS="$(printf '\t')" read -r _bc _bp; do
+        _bb=$(git rev-parse -q --verify "$_bc:$_bp" 2>/dev/null) || return 1
+        LC_ALL=C grep -qxF -- "$_bb" "$T.history" || return 1
+    done < "$T.where"
+}
+
 # `course_blocked <push output>`: whether every secret GitHub's refusal names (each location's
 # `commit:` and `path: <path>:<line>`) is in a file as the course published it — that commit's blob
-# at that path is one the course's history has (`$COURSE_REFS`, upstream's main: what the scan left
-# out) — printing those commits. Not when any location is otherwise, or none could be read:
-# then it's a secret the redaction doesn't know, as ever.
+# at that path is one the course's verified history has ($COURSE_REFS) — writing those commits to
+# $T.course. Not when any location is otherwise, or none could be read: then it's a secret the
+# redaction doesn't know, as ever. A secret the scan didn't know left the course unasked: it is
+# asked now (`course_verify`) when each blob is one upstream's main has.
 course_blocked() {
     tr -d '\r' < "$1" | LC_ALL=C awk '
         /^remote: *- *commit: *[0-9a-f]/ { c = $0; sub(/.*commit: */, "", c); sub(/[^0-9a-f].*$/, "", c); next }
         /^remote: *path: / && c != "" { p = $0; sub(/^remote: *path: */, "", p); sub(/:[0-9]+ *$/, "", p); print c "\t" p }' \
         | awk '!seen[$0]++' > "$T.where"
     [ -s "$T.where" ] || return 1
-    git rev-list --objects "$COURSE_REFS" | cut -d' ' -f1 | LC_ALL=C sort -u > "$T.course-objects"
-    while IFS="$(printf '\t')" read -r _bc _bp; do
-        _bb=$(git rev-parse -q --verify "$_bc:$_bp" 2>/dev/null) || return 1
-        LC_ALL=C grep -qxF -- "$_bb" "$T.course-objects" || return 1
-    done < "$T.where"
-    cut -f1 "$T.where" | awk '!seen[$0]++' | paste -sd ' ' -
+    if [ -z "$COURSE_REFS" ]; then
+        [ -n "$COURSE_URL" ] && git rev-parse -q --verify 'refs/remotes/upstream/main^{commit}' > /dev/null || return 1
+        named_in refs/remotes/upstream/main && course_verify || return 1
+    fi
+    named_in "$COURSE_REFS" || return 1
+    cut -f1 "$T.where" | awk '!seen[$0]++' | paste -sd ' ' - > "$T.course"
 }
 
 # --- Keys in the commits going out ----------------------------------------------------------
@@ -371,11 +410,10 @@ course_blocked() {
 # the repo's push-protection settings; it must never leave the pod either way. So the blobs of
 # the commits going out — only those on no branch of origin's, `HEAD --not --remotes=origin`,
 # never anything this repo on GitHub already has (a commit only `upstream` has is scanned: origin
-# has never had it — unless it is on upstream's main and `upstream` is the course repo,
-# $COURSE_REFS: the course's own commits and their files are left as the course published them) —
-# are scanned before the push (one `cat-file --batch |
-# grep -q`: usually a single commit this run made, already clean), and if one holds a key those
-# commits are rewritten with it redacted, by plumbing alone: each commit's tree through a
+# has never had it — unless the course's own, verified: $COURSE_REFS, above; the course's commits
+# and their files are left as the course published them) — are scanned before the push (one
+# `cat-file --batch | grep -q`: usually a single commit this run made, already clean), and if one
+# holds a key those commits are rewritten with it redacted, by plumbing alone: each commit's tree through a
 # temporary index, then `commit-tree` with its own author, committer, dates, message and
 # (mapped) parents, merges included. Deterministic, and a commit with nothing to redact and unchanged parents keeps its
 # id. The participant's files are never read or written. The new tip is pushed as a
@@ -383,10 +421,14 @@ course_blocked() {
 # commit made meanwhile is never lost: the run stops there (HEAL_ABORTED), and the next one redoes
 # the same rewrite (same ids: a fast-forward of what was pushed) with that commit on top.
 TIP=$(git rev-parse HEAD)
-git rev-list --objects HEAD --not --remotes=origin $COURSE_REFS | git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' \
-    | awk '$1 == "blob" { print $2 }' | sort -u > "$T.blobs"
-: > "$T.hmap"
-if [ -s "$T.blobs" ]; then
+# `scan_out`: the blobs of the commits going out — but the course's verified own ($COURSE_REFS) —
+# into $T.blobs, and each holding a key, with its redacted copy, into $T.hmap (redact_blob's
+# lines; empty: nothing to redact).
+scan_out() {
+    git rev-list --objects HEAD --not --remotes=origin $COURSE_REFS | git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' \
+        | awk '$1 == "blob" { print $2 }' | sort -u > "$T.blobs"
+    : > "$T.hmap"
+    [ -s "$T.blobs" ] || return 0
     # A failed cat-file must not read as "no key": the grep then saw only part of the blobs.
     rm -f "$T.catfail"
     { git cat-file --batch < "$T.blobs" || : > "$T.catfail"; } | LC_ALL=C grep -aqE -- "$SECRET_RE" && K=0 || K=$?
@@ -394,6 +436,17 @@ if [ -s "$T.blobs" ]; then
     if [ "$K" -gt 1 ]; then echo "arena backup: scanning the outgoing commits for keys failed - nothing pushed" >&2; exit 2; fi
     if [ "$K" = 0 ]; then
         while read -r b; do redact_blob "$b"; done < "$T.blobs" > "$T.hmap"
+    fi
+}
+scan_out
+# A key in a blob upstream's main has too (what `git pull upstream main` brought — or a fork's
+# commit, fetched before `upstream` was repointed): then, and only then, the course is asked which
+# commits are its own (`course_verify`), and the scan runs again without them. Never on a run with
+# no such key: most runs fetch nothing.
+if [ -s "$T.hmap" ] && [ -n "$COURSE_URL" ] && git rev-parse -q --verify 'refs/remotes/upstream/main^{commit}' > /dev/null; then
+    git rev-list --objects refs/remotes/upstream/main --not --remotes=origin | cut -d' ' -f1 | LC_ALL=C sort -u > "$T.upstream"
+    if cut -d' ' -f1 "$T.hmap" | LC_ALL=C sort -u | LC_ALL=C comm -12 - "$T.upstream" | grep -q . && course_verify; then
+        scan_out
     fi
 fi
 : > "$T.cmap"
@@ -445,7 +498,7 @@ if [ -z "$pushed" ]; then
     # Still refused: a secret the patterns don't know (or a binary GitHub scans) — said, by type.
     if push_protected "$T.push"; then
         echo "PUSH_BLOCKED $(push_block_reason "$T.push")"
-        if [ -n "$COURSE_REFS" ] && course_blocked "$T.push" > "$T.course"; then echo "PUSH_BLOCKED_COURSE $(cat "$T.course")"; fi
+        if course_blocked "$T.push"; then echo "PUSH_BLOCKED_COURSE $(cat "$T.course")"; fi
         exit 4
     fi
     echo "PUSH_FAILED"

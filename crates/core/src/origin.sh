@@ -1,5 +1,6 @@
 # arena origin check: is this repo's `origin` the configured repo? Rendered into the backup script
 # and into init-branches' command (arena_core::backup::origin_sh), which both push to `origin`.
+# Also the course repo's URL the backup verifies the course's own commits against (`course_url`).
 #
 # origin_key URL: what every spelling of one repo has in common: host/owner/name, lowercased. It
 # accepts scp-style (git@github.com:o/n.git), ssh:// and https:// (with any user or credentials, and
@@ -29,19 +30,20 @@ origin_key() {
 origin_shown() {
     printf '%s\n' "$1" | LC_ALL=C sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://).*@#\1#; t q; s#^[^/]*@##; :q; s|[?#].*$||'
 }
-# upstream_is_course OWNER/NAME: whether this repo's `upstream` remote is that GitHub repo — every
-# URL it fetches from (`git remote get-url --all`, insteadOf applied) and every URL it pushes to
-# (`--push --all`, pushInsteadOf applied), however each is spelled — so what a fetch writes into
-# refs/remotes/upstream/main is that repo's published history. The push URLs too (review ai-review
-# claude #5): a `git push upstream <branch>` that succeeds updates refs/remotes/upstream/<branch>,
-# and with a pushurl of the participant's own fork it would hold their commit. No `upstream`, a
-# URL elsewhere (a local path included: it has no key), or an OWNER/NAME with no key of its own: no.
-upstream_is_course() {
-    _cw=$(origin_key "git@github.com:$1.git")
-    [ -n "$_cw" ] || return 1
-    _cu=$({ git remote get-url --all upstream && git remote get-url --push --all upstream; } 2>/dev/null) || return 1
-    [ -n "$_cu" ] || return 1
-    printf '%s\n' "$_cu" | while IFS= read -r _u; do [ "$(origin_key "$_u")" = "$_cw" ] || exit 1; done
+# course_url COURSE: where the backup fetches the course's `main` from to learn which commits are
+# the course's own (backup.sh's `course_verify`), for COURSE as the backup is given it: OWNER/NAME
+# (arena_core::backup::course_repo: ARENA_UPSTREAM_REPO, always that spelling by then) is
+# https://github.com/OWNER/NAME.git — public, so fetched with no credentials. A local path (`/…`)
+# or a `file://` URL is used as it is: only tests pass one, a local bare repo standing in for the
+# course, so that no test reaches GitHub. Anything else prints nothing: no course, no exemption.
+# The pod's own `upstream` remote and its URLs play no part (review ai-review codex #1, FIX6): a
+# ref they filled says nothing of where its commits came from.
+course_url() {
+    case $1 in
+        /* | file://*) printf '%s\n' "$1" ;;
+        ./* | ../* | */. | */..) ;;
+        *) printf '%s\n' "$1" | LC_ALL=C sed -E -n 's#^([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)$#https://github.com/\1/\2.git#p' ;;
+    esac
 }
 # origin_check OWNER/NAME: stop the run unless every URL this repo fetches from or pushes to as
 # `origin` is that GitHub repo. On a mismatch it prints `WRONG_ORIGIN OWNER/NAME <url>` (no URL when
