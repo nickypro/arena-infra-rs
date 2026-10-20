@@ -4864,6 +4864,56 @@ done
         assert!(exists(&detached));
     }
 
+    /// Review ai-review claude #9, checked: the patches are plumbing with no refresh of the index,
+    /// so a file whose stat changed but whose content didn't (after an rsync, a restore, a `touch`)
+    /// is listed by `diff-files --name-only` — would `diff-files -p` / `diff-index -p` then write a
+    /// bare `diff --git` header for it, which `git apply` refuses when a patch has nothing else? No:
+    /// on git 2.43 (the build VM's) they write nothing for such a file, staged or not, text or
+    /// binary; and the switch's set-aside (`unredacted_aside`'s porcelain `git diff`) has refreshed
+    /// the index's stat data before the save anyway. Pinned here: a staged file touched after its
+    /// `git add`, a file touched alone, and a real unstaged change — no header for a file only
+    /// touched, and the README's restore line gives back the index and the files exactly.
+    #[cfg(unix)]
+    #[test]
+    fn hard_saves_patches_that_apply_when_files_were_only_touched() {
+        let s = GitSandbox::new("discarded-touched", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let touch = |rel: &str| {
+            let f = std::fs::File::options().write(true).open(s.work.join(rel)).unwrap();
+            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600)).unwrap();
+        };
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        std::fs::write(s.work.join("ex.py"), "x = 1\n").unwrap();
+        s.git(&s.work, &["add", "ex.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "ex"]);
+        let old = s.git(&s.work, &["rev-parse", "HEAD"]);
+        // README.md: version B staged, then touched; data.bin: touched alone; ex.py: a real change.
+        std::fs::write(s.work.join("README.md"), "version B, staged\n").unwrap();
+        s.git(&s.work, &["add", "README.md"]);
+        touch("README.md");
+        touch("data.bin");
+        std::fs::write(s.work.join("ex.py"), "x = 2  # not staged\n").unwrap();
+        // (Plumbing only from here: a porcelain command would refresh the index.)
+        assert_eq!(s.git(&s.work, &["diff-files", "--name-only"]), "README.md\ndata.bin\nex.py", "stat-dirty as meant");
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        let d = s.work.join(out.lines().find_map(|l| l.strip_prefix("DISCARDED_SAVED ")).expect("saved"));
+        let patch = |name: &str| String::from_utf8_lossy(&std::fs::read(d.join(name)).unwrap()).into_owned();
+        let headers = |p: &str| p.lines().filter_map(|l| l.strip_prefix("diff --git a/")).map(|l| l.split(' ').next().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(headers(&patch("staged.patch")), ["README.md"]);
+        assert_eq!(headers(&patch("unstaged.patch")), ["ex.py"], "no header for a file only touched");
+        assert_eq!(headers(&patch("changes.patch")), ["README.md", "ex.py"]);
+        let readme = patch("README");
+        let restore = readme.lines().find(|l| l.contains("git apply --index") && l.contains("staged.patch")).expect("the README's line").trim();
+        let o = s.run(&format!("cd {} && {restore}", shell_quote(repo)));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), old);
+        assert_eq!(s.git(&s.work, &["show", ":README.md"]), "version B, staged");
+        assert_eq!((s.read("README.md"), s.read("ex.py")), (b"version B, staged\n".to_vec(), b"x = 2  # not staged\n".to_vec()));
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "M  README.md\n M ex.py");
+    }
+
     /// Review ai-review codex #1 / claude #7: the save kept only files and links, but `checkout -f`
     /// removes a whole directory standing where the new branch has a file or a link — ignored
     /// contents, a nested repo's .git and all (git's `remove_subtree`) — and the reset went ahead
