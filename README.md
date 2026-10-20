@@ -769,14 +769,17 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     a failure; one line after the run names those pods. **Before any `--hard` reset, what it
     discards is saved on the pod** — in `.git/arena-discarded/<UTC time>/`: `changes.patch` (`git
     diff --binary HEAD`), the files with unresolved conflicts, the operation's state (`MERGE_HEAD`,
-    `MERGE_MSG`, `rebase-merge/`, …), the untracked or ignored files the reset replaces, and a
+    `MERGE_MSG`, `rebase-merge/`, …), the untracked or ignored files, links and directories the
+    reset removes (a directory where the branch has a file or a link goes whole — ignored
+    contents, a nested repo's `.git` and all — so it's copied whole, its links kept as links;
+    a big one costs its size there), and a
     README on getting them back (`git apply --index …` on the commit it was on, which it names) —
     and the pod's line says `what it discarded was saved to .git/arena-discarded/<time>/ on the
     pod first`. In `.git`, so the reset doesn't touch it and every later copy (snapshot, big,
     archive) carries it under a name no later save reuses: the copy into `LOCAL_BACKUP_DIR` is the
     day's label, which the next pull of that label overwrites from the reset pod (review ai-review
     claude #2). Nothing to discard, no folder; a save that fails leaves the pod as it was, not
-    reset (a failed switch). `--hard` with `--include-non-cohort` is refused unless the pods are
+    reset (a failed switch), and removes what it had copied. `--hard` with `--include-non-cohort` is refused unless the pods are
     named: it would reset staff boxes and other cohorts' pods too. A file the
     backup committed with a key redacted keeps the real key on disk: around the switch it's set
     aside in `.git/arena-unredacted/<time>-<pid>/` (so gentle doesn't refuse it and `--hard`

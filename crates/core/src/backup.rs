@@ -950,12 +950,16 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 ///
 /// What `--hard` is about to discard is first saved on the pod (`discarded.sh`): the uncommitted
 /// changes to tracked files (`git diff --binary HEAD`), the files with unresolved conflicts, an
-/// operation's state files (`MERGE_HEAD`, …) and the untracked or ignored files the reset
-/// replaces, with a README saying how to get them back — in `.git/arena-discarded/<UTC time>/`,
+/// operation's state files (`MERGE_HEAD`, …) and the untracked or ignored files, links and
+/// directories the reset removes — a directory where the branch has a file or a link goes whole
+/// (`checkout -f` deletes it, ignored contents and a nested repo's `.git` with it: review
+/// ai-review codex #1, claude #7), so it is copied whole — with a README saying how to get them
+/// back — in `.git/arena-discarded/<UTC time>/`,
 /// which the reset doesn't touch and no later save reuses (review ai-review claude #2, codex #2:
 /// set-branch's own rsync of such a pod went to the day's snapshot label and the big mirror, which
 /// the next `pods pull` overwrites from the reset pod). Said as `DISCARDED_SAVED <path>` on
-/// stdout. A save that fails stops the switch before the reset: the pod isn't switched.
+/// stdout. A save that fails stops the switch before the reset: the pod isn't switched, and the
+/// part saved so far is removed.
 ///
 /// A nested clone the backup adopted (its files tracked by the course repo) is tracked on the
 /// autocommit branches only — the course's `main` doesn't have it — so switching to such a
@@ -3833,6 +3837,93 @@ done
         assert!(o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("DISCARDED_SAVED"), "{}", String::from_utf8_lossy(&o.stderr));
         assert_eq!(saves(), std::slice::from_ref(&d));
         assert_eq!(read("untracked/solutions.py"), "mine\n");
+    }
+
+    /// Review ai-review codex #1 / claude #7: the save kept only files and links, but `checkout -f`
+    /// removes a whole directory standing where the new branch has a file or a link — ignored
+    /// contents, a nested repo's .git and all (git's `remove_subtree`) — and the reset went ahead
+    /// with none of it saved. Now every such directory is copied whole into `untracked/` (links in it
+    /// kept as links), and so is a link on a leading path of one the branch tracks — the link
+    /// itself, never what it points to (git removes the link, not its target's files). A copy that
+    /// fails leaves the pod as it was, and the part already copied is removed.
+    #[cfg(unix)]
+    #[test]
+    fn hard_saves_the_directories_it_removes_whole() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let s = GitSandbox::new("discarded-dirs", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let path = |rel: &str| s.work.join(rel);
+        // The staff's main since: files where the pod has directories, a link, and a file in a
+        // directory the pod has as a link.
+        let staff = s.base.join("staff");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), staff.to_str().unwrap()]);
+        std::fs::write(staff.join("checkpoints"), "the staff's checkpoints file\n").unwrap();
+        std::fs::write(staff.join("Grokking"), "the staff's Grokking file\n").unwrap();
+        symlink("README.md", staff.join("data")).unwrap();
+        std::fs::create_dir_all(staff.join("exercises")).unwrap();
+        std::fs::write(staff.join("exercises/ex1.py"), "ex = 1\n").unwrap();
+        s.git(&staff, &["add", "-A"]);
+        s.git(&staff, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "staff"]);
+        s.git(&staff, &["push", "-q", "origin", "main"]);
+        // The pod: an ignored checkpoints/ (a file and a link in it); an untracked data/; a nested
+        // repo Grokking/ with a commit of its own; the tracked data.bin replaced by a directory; and
+        // exercises, a link to a directory elsewhere.
+        std::fs::write(s.work.join(".git/info/exclude"), "checkpoints/\n").unwrap();
+        std::fs::create_dir_all(path("checkpoints")).unwrap();
+        std::fs::write(path("checkpoints/model.pt"), "my weights\n").unwrap();
+        symlink("model.pt", path("checkpoints/latest")).unwrap();
+        std::fs::create_dir_all(path("data")).unwrap();
+        std::fs::write(path("data/train.csv"), "1,2\n").unwrap();
+        std::fs::create_dir_all(path("Grokking")).unwrap();
+        s.git(&path("Grokking"), &["init", "-q", "-b", "main"]);
+        std::fs::write(path("Grokking/g.py"), "g = 1\n").unwrap();
+        s.git(&path("Grokking"), &["add", "-A"]);
+        s.git(&path("Grokking"), &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "mine"]);
+        let grok = s.git(&path("Grokking"), &["rev-parse", "HEAD"]);
+        std::fs::remove_file(path("data.bin")).unwrap();
+        std::fs::create_dir_all(path("data.bin")).unwrap();
+        std::fs::write(path("data.bin/part1"), "mine\n").unwrap();
+        let elsewhere = s.base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("mine.py"), "mine = 1\n").unwrap();
+        symlink(&elsewhere, path("exercises")).unwrap();
+        let head = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+
+        // A copy that fails (a file in a directory it can't read): not reset, nothing touched, and
+        // no partial save left behind.
+        std::fs::set_permissions(path("checkpoints/model.pt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && err.contains("couldn't save the untracked files") && err.contains("not reset"), "{err}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), head);
+        assert!(path("checkpoints").is_dir() && path("data").is_dir() && path("Grokking/.git").is_dir() && path("data.bin").is_dir());
+        assert!(!s.work.join(".git/arena-discarded").exists(), "the partial save removed");
+        std::fs::set_permissions(path("checkpoints/model.pt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Saved, then reset.
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        let saved: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("DISCARDED_SAVED ")).collect();
+        assert_eq!(saved.len(), 1, "{out}");
+        let d = s.work.join(saved[0]).join("untracked");
+        // The reset happened: the staff's files, link and directory where the pod's were.
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/main"]));
+        assert_eq!(read(&path("checkpoints")), "the staff's checkpoints file\n");
+        assert_eq!(read(&path("Grokking")), "the staff's Grokking file\n");
+        assert_eq!(std::fs::read_link(path("data")).unwrap(), std::path::Path::new("README.md"));
+        assert_eq!(std::fs::read(path("data.bin")).unwrap().len(), 10, "data.bin as main has it");
+        assert!(path("exercises").is_dir() && !path("exercises").is_symlink() && path("exercises/ex1.py").is_file());
+        // …and the save has each directory whole: the ignored one (its link a link), the untracked
+        // one, the nested repo with its history, the one where data.bin was; the link itself.
+        assert_eq!(read(&d.join("checkpoints/model.pt")), "my weights\n");
+        assert_eq!(std::fs::read_link(d.join("checkpoints/latest")).unwrap(), std::path::Path::new("model.pt"));
+        assert_eq!(read(&d.join("data/train.csv")), "1,2\n");
+        assert_eq!((read(&d.join("Grokking/g.py")), s.git(&d.join("Grokking"), &["rev-parse", "HEAD"])), ("g = 1\n".to_string(), grok));
+        assert_eq!(read(&d.join("data.bin/part1")), "mine\n");
+        assert_eq!(std::fs::read_link(d.join("exercises")).unwrap(), elsewhere);
+        assert_eq!(read(&elsewhere.join("mine.py")), "mine = 1\n", "what the link pointed to, untouched");
     }
 
     /// Review ai-review claude #4, to verify: could the gentle switch's refusal of a pod mid-merge
