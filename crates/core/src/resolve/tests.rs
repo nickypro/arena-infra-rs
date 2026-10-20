@@ -844,6 +844,13 @@ impl Repo {
         self.git(&self.work, &["ls-files", "-u"])
     }
 
+    /// `refs/arena/course-main` at `rev` (of the checkout): what the backup's fetch from the
+    /// configured course URL leaves — the course's own history, verified (written by hand here:
+    /// the fetch is the backup's).
+    fn verified_course(&self, rev: &str) {
+        self.git(&self.work, &["update-ref", "refs/arena/course-main", rev]);
+    }
+
     /// Nothing touched by a refused resolve: the merge as it was (`conflicts`: `git ls-files -u`
     /// before), nothing kept in `.git/arena-resolved/`.
     fn untouched(&self, conflicts: &str, why: &str) {
@@ -1600,8 +1607,8 @@ fn keys_are_redacted_and_a_file_over_the_limit_is_left_alone() {
 /// and `git add`ed before the resolve ran — while another file is still in conflict, or with
 /// every conflict already staged (an empty plan) — is committed redacted, the disk keeping it; so
 /// is one in a file added mid-cherry-pick. A 96 MB file or a nested repo (a gitlink) staged by hand
-/// is never committed: BUSY, said, nothing touched. And what only the course changed goes in as
-/// the course published it, a key-like string in it and all.
+/// is never committed: BUSY, said, nothing touched. And what only the verified course changed goes
+/// in as the course published it, a key-like string in it and all.
 #[cfg(unix)]
 #[test]
 fn every_path_the_commit_takes_is_checked_not_only_the_conflicted_ones() {
@@ -1702,21 +1709,113 @@ fn every_path_the_commit_takes_is_checked_not_only_the_conflicted_ones() {
         r.untouched(&conflicts, case);
     }
 
-    // The course's own file, a key-like string in it (only the course changed it): committed as the
-    // course has it — the participant made none of it. Either side newer: with the course's, the
-    // index is the merged branch's tree everywhere; with the participant's, it isn't.
+    // The course's own file, a key-like string in it (only the course changed it), the merge's
+    // MERGE_HEAD in the verified course ref: committed as the course has it — the participant made
+    // none of it. Either side newer: with the course's, the index is the merged branch's tree
+    // everywhere; with the participant's, it isn't. (Unverified: `only_the_verified_courses_…`.)
     for course_newer in [true, false] {
         let r = Repo::new(if course_newer { "staged-theirs-course" } else { "staged-theirs-mine" });
         let example = format!("# Set your key: OPENROUTER_API_KEY = \"{key}\"\n");
         r.course_commit(&[("example.md", example.as_bytes())], r.now - 11 * DAY);
         let (course_at, mine_at) = if course_newer { (r.now - 5 * DAY, r.now - 10 * DAY) } else { (r.now - 10 * DAY, r.now - 5 * DAY) };
         r.merge_conflict(course_at, mine_at);
+        r.verified_course("MERGE_HEAD");
         r.age(4 * HOUR);
         let (code, rep, said) = r.resolve(3, &r.look());
         assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{course_newer}: {said}");
         assert!(rep.redacted.is_empty(), "{course_newer}: {said}");
         assert_eq!(format!("{}\n", r.committed("example.md")), example, "{course_newer}: as the course published it");
     }
+}
+
+/// Content equal to the other side's is the course's own only when that is verified (review
+/// ai-review codex #3): a merge whose MERGE_HEAD is in `refs/arena/course-main`, which only the
+/// backup's fetch from the configured course URL writes (here `git update-ref`). Then a key-like
+/// string the course published — in a conflicted file the course's side won, and in one only the
+/// course changed — goes in as published. Matching the other side proves nothing by itself: a
+/// cherry-pick of the participant's own commit with a key (its side chosen; its commit in the ref
+/// too — a pick never counts), a merge of their own branch with the ref there, the course's merge
+/// with no ref, or with a ref behind it — each committed redacted, the disk keeping the key.
+#[cfg(unix)]
+#[test]
+fn only_the_verified_courses_content_escapes_redaction() {
+    let key = format!("sk-or-v1-{}", "ab".repeat(32));
+    let keyed = format!("k = \"{key}\"\n");
+    let redacted = "k = \"REDACTED-OPENROUTER-KEY\"";
+    let example = format!("# Set your key: OPENROUTER_API_KEY = \"{key}\"\n");
+    let example_redacted = "# Set your key: OPENROUTER_API_KEY = \"REDACTED-OPENROUTER-KEY\"";
+    // Committed redacted, the disk keeping the key.
+    let redacted_in_head = |r: &Repo, rel: &str, want: &str, disk: &str, case: &str| {
+        assert_eq!(r.committed(rel), want, "{case}: {rel} committed redacted");
+        assert_eq!(r.text(rel), disk, "{case}: {rel} on disk keeps the key");
+    };
+
+    // A cherry-pick of the participant's own commit, a key in its side of the conflict, that side
+    // newer: redacted — even with that very commit in the course ref.
+    let r = Repo::new("verify-pick");
+    r.add_base(&[("keyed.py", b"k = 0\n")]);
+    r.git(&r.work, &["checkout", "-q", "-b", "side", "main"]);
+    r.put("keyed.py", keyed.as_bytes());
+    r.commit_all(&r.work, "the side's key", r.now - 5 * DAY);
+    r.git(&r.work, &["checkout", "-q", "autocommit-x"]);
+    r.put("keyed.py", b"k = 1\n");
+    r.commit_all(&r.work, "mine", r.now - 10 * DAY);
+    assert!(!r.git_try(&r.work, &["cherry-pick", "side"]).0);
+    r.verified_course("side");
+    r.age(4 * HOUR);
+    let (code, rep, said) = r.resolve(3, &r.look());
+    assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("cherry-pick")), "{said}");
+    assert_eq!(taken(&rep), [("keyed.py".to_string(), "theirs".to_string(), Taken::Hunks)], "{said}");
+    assert_eq!(rep.redacted, ["keyed.py"], "{said}");
+    redacted_in_head(&r, "keyed.py", redacted, &keyed, "pick");
+
+    // The course's merge: a key-like string in the conflicted keyed.py (the course's side newer)
+    // and in example.md (only the course changed it). Verified: as published. No ref, or a ref
+    // behind the merged commit (the course's older history only): redacted.
+    for (case, verified) in [("verify-course", Some("MERGE_HEAD")), ("verify-none", None), ("verify-behind", Some("MERGE_HEAD~1"))] {
+        let r = Repo::new(case);
+        r.add_base(&[("keyed.py", b"k = 0\n")]);
+        r.course_commit(&[("keyed.py", keyed.as_bytes()), ("example.md", example.as_bytes())], r.now - 5 * DAY);
+        r.my_commit(&[("keyed.py", b"k = 1\n")], r.now - 10 * DAY);
+        r.pull_conflicted();
+        if let Some(rev) = verified {
+            r.verified_course(rev);
+        }
+        r.age(4 * HOUR);
+        let (code, rep, said) = r.resolve(3, &r.look());
+        assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{case}: {said}");
+        assert_eq!(taken(&rep), [("keyed.py".to_string(), "theirs".to_string(), Taken::Hunks)], "{case}: {said}");
+        if case == "verify-course" {
+            assert!(rep.redacted.is_empty(), "{case}: {said}");
+            assert_eq!((format!("{}\n", r.committed("keyed.py")), format!("{}\n", r.committed("example.md"))), (keyed.clone(), example.clone()), "{case}: as published");
+        } else {
+            let mut got = rep.redacted.clone();
+            got.sort();
+            assert_eq!(got, ["example.md", "keyed.py"], "{case}: {said}");
+            redacted_in_head(&r, "keyed.py", redacted, &keyed, case);
+            redacted_in_head(&r, "example.md", example_redacted, &example, case);
+        }
+    }
+
+    // A merge of the participant's own branch (its side newer, a key in it), the course ref there
+    // (the course's main): redacted.
+    let r = Repo::new("verify-own-merge");
+    r.add_base(&[("keyed.py", b"k = 0\n")]);
+    r.git(&r.work, &["checkout", "-q", "-b", "exp", "main"]);
+    r.put("keyed.py", keyed.as_bytes());
+    r.commit_all(&r.work, "my experiment", r.now - 5 * DAY);
+    r.git(&r.work, &["checkout", "-q", "autocommit-x"]);
+    r.put("keyed.py", b"k = 1\n");
+    r.commit_all(&r.work, "mine", r.now - 10 * DAY);
+    r.git(&r.work, &["fetch", "-q", "upstream"]);
+    r.verified_course("refs/remotes/upstream/main");
+    let (ok, said) = r.git_try(&r.work, &["merge", "--no-edit", "exp"]);
+    assert!(!ok && r.work.join(".git/MERGE_HEAD").exists(), "{said}");
+    r.age(4 * HOUR);
+    let (code, rep, said) = r.resolve(3, &r.look());
+    assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{said}");
+    assert_eq!(rep.redacted, ["keyed.py"], "{said}");
+    redacted_in_head(&r, "keyed.py", redacted, &keyed, "own merge");
 }
 
 /// A notebook stays valid JSON (review ai-review claude #3). Merged per hunk, one side's conflict

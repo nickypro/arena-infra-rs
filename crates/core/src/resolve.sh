@@ -30,10 +30,11 @@
 # HEAD, the conflicts, the index, every file — and the pod looked at again for anyone at work
 # (every condition of the first look: a terminal used, a git command running, …), and if any of it
 # changed, nothing is touched. Then the paths are staged; for a merge or a cherry-pick every staged
-# path is checked again, and each staged regular file that is neither HEAD's version nor the other
-# side's (what the participant made) has its keys redacted in the index as the backup redacts them
-# (the file on disk keeps its keys); and — HEAD and the operation checked once more, and no
-# conflict marker staged — the operation is
+# path is checked again, and each staged regular file that isn't HEAD's version has its keys
+# redacted in the index as the backup redacts them (the file on disk keeps its keys) — all but the
+# verified course's: for a merge whose MERGE_HEAD is in refs/arena/course-main (fetched from the
+# configured course URL alone), what is staged as MERGE_HEAD has it goes in as published; and —
+# HEAD and the operation checked once more, and no conflict marker staged — the operation is
 # finished: a merge, a merge commit; a cherry-pick, `--continue`; a `git stash pop`'s conflicts,
 # added (the stash entry kept) — in the repo's own identity. A revert is never finished: its other
 # side is the commit it undoes, always older, so "the newer side" would undo nothing. <hours> and
@@ -135,12 +136,22 @@ why=$(unquiet "$LOOKED")
 [ -n "$(git config user.name)" ] && [ -n "$(git config user.email)" ] || refuse "no git identity configured in the repo"
 
 # --- What is in progress, as it is now ------------------------------------------------------
+# The operation's other side: its ref, and as a participant reading `git log` knows it.
 case $what in
-    merge) other=MERGE_HEAD ;;
-    cherry-pick) other=CHERRY_PICK_HEAD ;;
-    *) other='the stash' ;;
+    merge) other=MERGE_HEAD them="the merged branch" ref=MERGE_HEAD ;;
+    cherry-pick) other=CHERRY_PICK_HEAD them="the picked commit" ref=CHERRY_PICK_HEAD ;;
+    *) other='the stash' them="the stash" ref='stash@{0}' ;;
 esac
 [ "$head" != - ] || refuse "conflicts with no stash entry they came from"
+# Whether the other side is the course's own history, verified (review ai-review codex #3): only a
+# merge whose MERGE_HEAD is in refs/arena/course-main — the ref nothing but a fetch from the
+# configured course URL writes (the backup's, when it needs to know). Then what is staged as
+# MERGE_HEAD has it is the course's, public already: committed as published, and sized by GitHub's
+# own limit. Matching the other side proves nothing by itself: a cherry-pick of the participant's
+# own commit, a merge of their own branch — or any merge with that ref missing — is theirs, keys and
+# all, so it's redacted and sized like anything they made.
+COURSE=no
+if [ "$what" = merge ] && git merge-base --is-ancestor "$head" refs/arena/course-main 2>/dev/null; then COURSE=yes; fi
 if [ "$what" = merge ] && [ "$(wc -l < "$G/MERGE_HEAD")" -ne 1 ]; then refuse "a merge of several branches"; fi
 HEAD0=$(git rev-parse -q --verify HEAD) || refuse "no HEAD commit"
 ours_tip=$(git log -1 --no-show-signature --format=%ct HEAD 2>/dev/null) || refuse "no HEAD commit"
@@ -185,11 +196,18 @@ p=$(staged_markers)
 # `unfit` says the first that can't go in, in words: a blob over <max file bytes> (GitHub refuses
 # the push, and every later backup is stuck), or a gitlink new to HEAD (a nested repo's commit id,
 # none of its files: the backup takes those back out of the index). Nothing: all fit. It leaves
-# the staged changes in $T.st, one per line: `<HEAD's mode> <mode> <blob> <status><TAB><path>`.
+# the staged changes in $T.st, one per line: `<HEAD's mode> <mode> <blob> <status> <whose><TAB><path>`
+# — <whose> `theirs` when it's staged as the other side has it (mode and blob), else `yours`.
 unfit() {
     git diff-index --cached --no-renames -z HEAD -- > "$T.sz" || { echo "the staged changes couldn't be listed"; return; }
     if [ "$(tr -d -c '\n' < "$T.sz" | wc -c)" -ne 0 ]; then echo "a staged path has a newline in its name"; return; fi
-    tr '\0' '\n' < "$T.sz" | awk 'NR % 2 == 1 { split(substr($0, 2), m, " "); next } { print m[1] " " m[2] " " m[4] " " m[5] "\t" $0 }' > "$T.st"
+    tr '\0' '\n' < "$T.sz" | awk 'NR % 2 == 1 { split(substr($0, 2), m, " "); next } { print m[1] " " m[2] " " m[4] " " m[5] "\t" $0 }' > "$T.sd"
+    git diff-index --cached --no-renames --name-only -z "$head" -- > "$T.soz" || { echo "the staged changes couldn't be listed"; return; }
+    tr '\0' '\n' < "$T.soz" > "$T.so"
+    # (The first file is told apart by its name, not by `NR == FNR`: an empty one — everything
+    # staged is the other side's — would make the second read as the first.)
+    awk 'FILENAME == ARGV[1] { o[$0] = 1; next } { i = index($0, "\t"); p = substr($0, i + 1)
+        print substr($0, 1, i - 1) " " ((p in o) ? "yours" : "theirs") "\t" p }' "$T.so" "$T.sd" > "$T.st"
     _g=$(awk '{ i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") } m[2] == "160000" && m[1] != "160000" { print substr($0, i + 1); exit }' "$T.st")
     if [ -n "$_g" ]; then
         echo "$_g is staged as a nested repo (a gitlink: its commit id, none of its files): never committed — unstage it, or abort, on the pod"
@@ -377,12 +395,6 @@ done < "$T.p"
 # --- The words -------------------------------------------------------------------------------
 # A time as the words give it: UTC, to the minute (`2026-10-20 13:05Z`).
 day() { date -u -d "@$1" '+%Y-%m-%d %H:%MZ'; }
-# The operation's other side, as a participant reading `git log` knows it.
-case $what in
-    merge) them="the merged branch" ref=MERGE_HEAD ;;
-    cherry-pick) them="the picked commit" ref=CHERRY_PICK_HEAD ;;
-    *) them="the stash" ref='stash@{0}' ;;
-esac
 # Each path's way, one line each — which side won, and both sides' last change to it: what the
 # commit message, and the README of the state before, list.
 choices() {
@@ -499,26 +511,22 @@ done < "$T.plan"
 
 # --- What the commit takes: every staged path, keys redacted ---------------------------------
 # Every path staged against HEAD fits (`unfit`, as before anything was touched — now with what was
-# staged above). Then each regular file the commit takes whose staged version is neither HEAD's
-# nor the operation's other side's (MERGE_HEAD's, CHERRY_PICK_HEAD's) — content the participant
-# made: a file resolved by hand, now or `git add`ed before this ran, one merged per hunk, one
-# added mid-merge — goes in with the keys redact.sh knows redacted, in the index only: the file on
-# disk keeps them, so the participant's code still runs. A key in it never enters a commit (the
-# backup after this would redact what it commits, but this commit is made first). The course's or
-# the picked commit's own content — a file only that side changed, one taken whole from it — goes
-# in as it was published, and HEAD's is committed already. A stash pop's conflicts make no commit
-# here: the backup after commits them, redacted.
+# staged above). Then each regular file the commit takes — a file resolved by hand, now or `git
+# add`ed before this ran, one merged per hunk, one taken whole from either side, one added
+# mid-merge, one only the other side changed — goes in with the keys redact.sh knows redacted, in
+# the index only: the file on disk keeps them, so the participant's code still runs. A key in it
+# never enters a commit (the backup after this would redact what it commits, but this commit is
+# made first). Only the verified course's own content (COURSE: a merge of refs/arena/course-main's
+# history) — what is staged as MERGE_HEAD has it — goes in as it was published; HEAD's is
+# committed already. A stash pop's conflicts make no commit here: the backup after commits them,
+# redacted.
 case $what in
     merge | cherry-pick)
         why=$(unfit)
         [ -z "$why" ] || fail "$why"
-        git diff-index --cached --no-renames --name-only -z "$head" -- > "$T.soz" || fail "listing the staged changes"
-        tr '\0' '\n' < "$T.soz" > "$T.so"
-        # Each such file: `<mode> <blob><TAB><path>`. (The first file is told apart by its name, not
-        # by `NR == FNR`: an empty one — everything staged is the other side's — would make the
-        # second read as the first.)
-        awk 'FILENAME == ARGV[1] { o[$0] = 1; next } { i = index($0, "\t"); p = substr($0, i + 1); split(substr($0, 1, i - 1), m, " ") }
-            (m[2] == "100644" || m[2] == "100755") && (p in o) { print m[2] " " m[3] "\t" p }' "$T.so" "$T.st" > "$T.rc"
+        # Each such file: `<mode> <blob><TAB><path>`.
+        awk -v course="$COURSE" '{ i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
+            (m[2] == "100644" || m[2] == "100755") && !(course == "yes" && m[5] == "theirs") { print m[2] " " m[3] "\t" substr($0, i + 1) }' "$T.st" > "$T.rc"
         (
             set -e
             cut -f1 "$T.rc" | cut -d' ' -f2 | sort -u > "$T.rcb"
