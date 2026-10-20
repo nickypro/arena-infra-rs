@@ -163,13 +163,16 @@ discarded_save() {
         ds_fail "$ds_d" "its README"
         return 1
     fi
+    # Each ref named in $ds_refs before it's made (review ai-review claude #7): a save stopped
+    # between the two then removes it all the same (`ds_remove` passes over one never made), where
+    # one named after was left pinning its commits, unnamed by any README.
     if [ -n "$ds_pin" ]; then
-        if ! git update-ref "$ds_pin" "$ds_head"; then ds_fail "$ds_d" "the ref $ds_pin"; return 1; fi
         ds_refs=$ds_pin
+        if ! git update-ref "$ds_pin" "$ds_head"; then ds_fail "$ds_d" "the ref $ds_pin"; return 1; fi
     fi
     if [ -n "$ds_bpin" ]; then
-        if ! git update-ref "$ds_bpin" "$ds_tip"; then ds_fail "$ds_d" "the ref $ds_bpin"; return 1; fi
         ds_refs="$ds_refs $ds_bpin"
+        if ! git update-ref "$ds_bpin" "$ds_tip"; then ds_fail "$ds_d" "the ref $ds_bpin"; return 1; fi
     fi
     ds_done=1
     printf 'DISCARDED_SAVED %s\n' "${ds_d#"$(pwd)/"}"

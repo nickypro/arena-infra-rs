@@ -4967,6 +4967,59 @@ done
         assert!(exists(&detached));
     }
 
+    /// Review ai-review claude #7: a save stopped between a pin's `git update-ref` and its naming in
+    /// `$ds_refs` left the ref behind — `ds_abandon` removed the folder, not the ref it didn't know
+    /// — pinning its commits with no README to name it. Now each is named first. A stand-in `git`
+    /// TERMs the switch as it makes the first pin, then the second (on main with a commit of its
+    /// own, both are made: HEAD's and local main's): the ref made, or not yet — either way nothing of
+    /// the save is left, no ref, and the pod isn't reset.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_stopped_as_it_pins_leaves_no_ref_behind() {
+        let s = GitSandbox::new("discarded-pin-term", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        std::fs::write(s.work.join("mine.py"), "mine = 1\n").unwrap();
+        s.git(&s.work, &["add", "mine.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "mine, on main"]);
+        let mine = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let bin = s.base.join("bin-pin-term");
+        std::fs::create_dir_all(&bin).unwrap();
+        let (count, fired) = (s.base.join("pins.count"), s.base.join("pins.fired"));
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        for made in [true, false] {
+            for nth in [1, 2] {
+                let _ = (std::fs::remove_file(&count), std::fs::remove_file(&fired));
+                // The `nth` pin's update-ref: TERM to the switch, then the ref made (or not).
+                let then = if made { format!("exec {} \"$@\"", shell_quote(&real_git())) } else { "exit 1".to_string() };
+                crate::remote::write_test_script(
+                    bin.join("git"),
+                    format!(
+                        "#!/bin/sh\ncase \"$1 $2\" in \"update-ref refs/arena-discarded/\"*)\n  n=$(($(cat {c} 2>/dev/null || echo 0) + 1)); echo $n > {c}\n  \
+                         if [ $n = {nth} ]; then echo \"$2\" > {f}; kill -TERM \"$PPID\"; {then}; fi;;\nesac\nexec {g} \"$@\"\n",
+                        c = shell_quote(count.to_str().unwrap()),
+                        f = shell_quote(fired.to_str().unwrap()),
+                        g = shell_quote(&real_git()),
+                    ),
+                )
+                .unwrap();
+                let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, true), &path);
+                let case = format!("made={made} pin #{nth}");
+                assert_eq!(code, Some(143), "{case}: {out}{err}");
+                let pin = std::fs::read_to_string(&fired).unwrap_or_else(|_| panic!("{case}: the stand-in never fired: {out}{err}"));
+                assert!(pin.starts_with("refs/arena-discarded/20"), "{case}: {pin}");
+                assert_eq!(s.git(&s.work, &["for-each-ref", "refs/arena-discarded/"]), "", "{case}: no ref left");
+                assert!(!s.work.join(".git/arena-discarded").exists(), "{case}: nothing of the save left");
+                assert_eq!((s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), s.git(&s.work, &["rev-parse", "HEAD"])), ("main".to_string(), mine.clone()), "{case}: not reset");
+            }
+        }
+        // Not stopped: both pins made, as before.
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(out.lines().filter(|l| l.starts_with("DISCARDED_PINNED refs/arena-discarded/")).count(), 2, "{out}");
+    }
+
     /// Review ai-review claude #9, checked: the patches are plumbing with no refresh of the index,
     /// so a file whose stat changed but whose content didn't (after an rsync, a restore, a `touch`)
     /// is listed by `diff-files --name-only` — would `diff-files -p` / `diff-index -p` then write a
