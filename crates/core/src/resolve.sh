@@ -18,13 +18,14 @@
 #   - else the side whose last change to that path is the more recent (`git log -1 --format=%ct
 #     <side> -- <path>`, HEAD's against the operation's other side; a tie keeps HEAD's) — for a
 #     text file per hunk: `git merge-file --ours|--theirs` keeps the clean hunks of both sides and
-#     takes that side of each conflict — but a notebook (`*.ipynb`) that isn't valid JSON merged so
-#     (or can't be checked) whole; for a binary file, a symlink or a modify/delete, the whole side,
-#     removed when that side deleted it. A notebook resolved by hand that isn't valid JSON leaves
-#     the operation alone, said.
+#     takes that side of each conflict; for a binary file, a symlink or a modify/delete, the whole
+#     side, removed when that side deleted it. A notebook (`*.ipynb`) merged per hunk that isn't
+#     valid JSON so, or one resolved by hand that isn't — or either that nothing here can check —
+#     leaves the operation alone, said: never taken whole from one side instead.
 # A file over <max file bytes> (the backup's git limit) anywhere in that is never committed: left
 # alone, said — nor, for a merge or a cherry-pick (whose commit takes the whole index), any path
-# already staged: a blob over that limit, or a new gitlink. The state before is kept first in
+# already staged: a blob over that limit, a new gitlink, or a notebook that isn't valid JSON (or
+# can't be checked). The state before is kept first in
 # <git dir>/arena-resolved/<UTC stamp>/ (the conflicted files as they were, git's own state files,
 # the old HEAD, the index, a README), then the state is read again — the operation and its commit,
 # HEAD, the conflicts, the index, every file — and the pod looked at again for anyone at work
@@ -44,10 +45,8 @@
 #   SAVED <dir>              where the state before was kept
 #   NEWER <side> <how> <HEAD's time> <the other side's time> <path>   taken from the newer side
 #                            (<side> ours|theirs; <how> hunks: that side of each conflict, the
-#                            clean hunks of both kept; file: the whole file; notjson, nocheck: the
-#                            whole notebook, since merged per hunk it wasn't valid JSON / no
-#                            python3 or jq was there to tell); the times are each side's last
-#                            change to the path
+#                            clean hunks of both kept; file: the whole file); the times are each
+#                            side's last change to the path
 #   GONE <side> <HEAD's time> <the other side's time> <path>   removed: the newer side deleted it
 #   HAND <path>              kept as it is on disk (resolved by hand) and added
 #   REDACTED <n> <path>      staged with its n key(s) redacted; the file on disk keeps them
@@ -83,6 +82,7 @@ export GIT_OPTIONAL_LOCKS=0
 REVERT_WORDS=@ARENA_REVERT_WORDS@
 T="$G/arena-resolve.$$"
 trap 'rm -rf "$T".*' EXIT
+TAB=$(printf '\t')
 # @ARENA_REDACT_SH@
 refuse() { echo "REFUSED $*"; exit 7; }
 fail() { echo "FAILED $*"; exit 8; }
@@ -191,12 +191,43 @@ staged_markers() {
 p=$(staged_markers)
 [ -z "$p" ] || refuse "conflict markers were added in $p (staged with them still in it): resolve it, or abort, on the pod"
 
+# Whether file $1 is one JSON document, as Jupyter needs a notebook to be: `yes`, `no` — or `none`,
+# nothing here could tell. python3's json (the images have it), else jq's (one value, nothing
+# after it). Each says "not JSON" by an exit code of its own (python3 3, for a ValueError; jq 9,
+# by halt_error: codes neither uses itself), so a checker that fails any other way — a broken
+# python3 (a conda shim whose env is gone), a jq too old for halt_error — is no answer, never a
+# `no` (review ai-review claude #1), and the next one is asked. python3 runs isolated (`-I`): this
+# runs at the checkout's top, and a participant's json.py there must never be imported in place of
+# the stdlib's — nor its __pycache__ written into the tree (review ai-review claude #4).
+# ARENA_TEST_JSON_TOOLS, set by tests only, names the tools to try instead.
+JSON_PY='import json, sys
+try:
+    json.load(open(sys.argv[1], "rb"))
+except ValueError:
+    sys.exit(3)'
+NOCHECK="nothing on the pod could check it: no working python3 or jq"
+json_ok() {
+    for _j in ${ARENA_TEST_JSON_TOOLS-python3 jq}; do
+        command -v "$_j" > /dev/null 2>&1 || continue
+        case $_j in
+            python3) _bad=3; python3 -I -c "$JSON_PY" "$1" ;;
+            jq) _bad=9; jq -R -s 'try (fromjson | empty) catch ("" | halt_error(9))' "$1" ;;
+            *) _bad=; false ;;
+        esac > /dev/null 2>&1
+        _rc=$?
+        if [ "$_rc" -eq 0 ]; then echo yes; return 0; fi
+        if [ "$_rc" = "$_bad" ]; then echo no; return 0; fi
+    done
+    echo none
+}
+
 # The commit takes the whole index, not only the paths in conflict: a file the participant
 # resolved, or added, and `git add`ed before this ran goes in too (review ai-review codex #4,
 # claude #4). So every path staged against HEAD is checked as the backup checks what it commits —
 # `unfit` says the first that can't go in, in words: a blob over <max file bytes> (GitHub refuses
-# the push, and every later backup is stuck), or a gitlink new to HEAD (a nested repo's commit id,
-# none of its files: the backup takes those back out of the index). Nothing: all fit. It leaves
+# the push, and every later backup is stuck), a gitlink new to HEAD (a nested repo's commit id,
+# none of its files: the backup takes those back out of the index), or a notebook that isn't one
+# JSON document (or can't be checked). Nothing: all fit. It leaves
 # the staged changes in $T.st, one per line: `<HEAD's mode> <mode> <blob> <status> <whose><TAB><path>`
 # — <whose> `theirs` when it's staged as the other side has it (mode and blob), else `yours`.
 unfit() {
@@ -216,11 +247,41 @@ unfit() {
     fi
     awk '{ split($0, m, " ") } m[2] == "100644" || m[2] == "100755" || m[2] == "120000" { print m[3] }' "$T.st" | sort -u \
         | git cat-file --batch-check='%(objectname) %(objectsize)' > "$T.ss" || { echo "the staged files' sizes couldn't be read"; return; }
-    awk -v max="$MAX" 'FILENAME == ARGV[1] { s[$1] = $2; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
+    _s=$(awk -v max="$MAX" 'FILENAME == ARGV[1] { s[$1] = $2; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
         (m[3] in s) && s[m[3]] + 0 > max + 0 {
             printf "%s is staged at %s bytes, over git'"'"'s %s-byte limit: never committed — unstage it, or abort, on the pod\n", substr($0, i + 1), s[m[3]], max
             exit
-        }' "$T.ss" "$T.st"
+        }' "$T.ss" "$T.st")
+    if [ -n "$_s" ]; then
+        echo "$_s"
+        return
+    fi
+    # Every notebook staged, not only one in conflict — one resolved and `git add`ed before this
+    # ran, one only the other side changed — is one JSON document, or Jupyter won't open it
+    # (review ai-review codex #4); one nothing here can check isn't committed either. Each blob
+    # parsed once ($T.nbok: those that parsed).
+    : >> "$T.nbok"
+    awk '{ i = index($0, "\t"); p = substr($0, i + 1); split(substr($0, 1, i - 1), m, " ") }
+        (m[2] == "100644" || m[2] == "100755") && p ~ /\.ipynb$/ { print m[3] "\t" m[5] "\t" p }' "$T.st" > "$T.nb"
+    while IFS="$TAB" read -r _b _w _p; do
+        if grep -qxF -- "$_b" "$T.nbok"; then continue; fi
+        git cat-file blob "$_b" > "$T.nbj" || { echo "$_p's staged version couldn't be read"; return; }
+        case $(json_ok "$T.nbj") in
+            yes) echo "$_b" >> "$T.nbok" ;;
+            no)
+                if [ "$_w" = theirs ]; then
+                    echo "$_p isn't valid JSON as $them ($ref) has it: Jupyter can't open it — finish the $what yourself, or abort it, on the pod"
+                else
+                    echo "$_p isn't valid JSON as staged: Jupyter can't open it — fix it (and git add it) or abort, on the pod"
+                fi
+                return
+                ;;
+            *)
+                echo "$_p can't be checked as JSON ($NOCHECK) — finish the $what yourself, or abort it, on the pod"
+                return
+                ;;
+        esac
+    done < "$T.nb"
 }
 # A stash pop's conflicts make no commit here: the backup after commits them, as it commits anything.
 case $what in
@@ -231,7 +292,6 @@ case $what in
 esac
 
 # --- Each conflicted path's way (nothing touched yet) ---------------------------------------
-TAB=$(printf '\t')
 # One line per path: its stages (e.g. 123, 23), each stage's mode and blob (- for none), the path.
 tr '\0' '\n' < "$T.u" | awk '
     { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " "); p = substr($0, i + 1)
@@ -243,21 +303,6 @@ tr '\0' '\n' < "$T.u" | awk '
 # git's binary test: a NUL in the first 8000 bytes (of a file, of a blob).
 binary_file() { [ "$(head -c 8000 -- "$1" | tr -d -c '\000' | wc -c)" -ne 0 ]; }
 binary_blob() { [ "$(git cat-file blob "$1" | head -c 8000 | tr -d -c '\000' | wc -c)" -ne 0 ]; }
-# Whether file $1 is one JSON document, as Jupyter needs a notebook to be: `yes`/`no` by python3's
-# json (the images have it), else jq's (one value, nothing after it); `none` when neither is here.
-# ARENA_TEST_JSON_TOOLS, set by tests only, names the tools to try instead.
-json_ok() {
-    for _j in ${ARENA_TEST_JSON_TOOLS-python3 jq}; do
-        command -v "$_j" > /dev/null 2>&1 || continue
-        case $_j in
-            python3) python3 -c 'import json, sys; json.load(open(sys.argv[1], "rb"))' "$1" ;;
-            jq) jq -e -s 'length == 1' "$1" ;;
-            *) false ;;
-        esac > /dev/null 2>&1 && echo yes || echo no
-        return 0
-    done
-    echo none
-}
 # Merged as text: not `-merge`/`merge=binary`, and no filter (an LFS pointer is no text to merge).
 text_attrs() {
     _a=$(git check-attr merge filter -- "$1") || return 1
@@ -364,29 +409,37 @@ while IFS="$TAB" read -r st m1 b1 m2 b2 m3 b3 p; do
             # A notebook merged per hunk must still be one JSON document, or Jupyter won't open it:
             # one side's conflict next to the other side's clean hunk can leave a bracket or a comma
             # wrong (review ai-review claude #3). If it doesn't parse — or nothing here can tell —
-            # the whole notebook comes from the newer side instead, and the words say why.
+            # the operation is left to the participant, said: the whole notebook from one side
+            # instead would drop the other side's changes to it, clean hunks and all (review
+            # ai-review claude #1).
             case $p in
                 *.ipynb)
                     case $(json_ok "$T.r$i") in
                         yes) ;;
-                        no) act=notjson ;;
-                        *) act=nocheck ;;
+                        no) refuse "$p can't be merged per hunk into valid JSON — resolve it in Jupyter, or abort" ;;
+                        *) refuse "$p can't be merged per hunk into valid JSON — resolve it in Jupyter, or abort ($NOCHECK)" ;;
                     esac
                     ;;
             esac
             ;;
         hand)
-            # A notebook resolved by hand that doesn't parse is the participant's to fix: committed,
-            # Jupyter would refuse it (with no parser here, it's taken as it is).
+            # A notebook resolved by hand that doesn't parse — or that nothing here can check — is
+            # the participant's to fix: committed, Jupyter might refuse it.
             case $p in
-                *.ipynb) [ "$(json_ok "$p")" != no ] || refuse "$p isn't valid JSON: Jupyter can't open it as it is — fix it (and git add it) or abort, on the pod" ;;
+                *.ipynb)
+                    case $(json_ok "$p") in
+                        yes) ;;
+                        no) refuse "$p isn't valid JSON: Jupyter can't open it as it is — fix it (and git add it) or abort, on the pod" ;;
+                        *) refuse "$p can't be checked as JSON ($NOCHECK) — finish it (and git add it) or abort, on the pod" ;;
+                    esac
+                    ;;
             esac
             ;;
     esac
     case $act in
         hunks) size=$(wc -c < "$T.r$i") ;;
         hand) size=$(stat -c %s -- "$p") ;;
-        file | notjson | nocheck) size=$(git cat-file -s "$wb") ;;
+        file) size=$(git cat-file -s "$wb") ;;
         *) size=0 ;;
     esac
     [ "$size" -le "$MAX" ] || refuse "$p would be $size bytes, over git's $MAX-byte limit: never committed — resolve it on the pod"
@@ -406,8 +459,6 @@ choices() {
             hand) echo "- $p: kept as you resolved it by hand" ;;
             hunks) echo "- $p: $won ($its side of each conflict; the other changes of both sides kept) — $dates" ;;
             file) echo "- $p: $won ($its whole version) — $dates" ;;
-            notjson) echo "- $p: $won ($its whole version: merged per hunk, the notebook wasn't valid JSON) — $dates" ;;
-            nocheck) echo "- $p: $won ($its whole version: no python3 or jq here to check a notebook merged per hunk) — $dates" ;;
             gone) echo "- $p: $won (removed: deleted there) — $dates" ;;
         esac
     done < "$T.plan"
@@ -494,7 +545,7 @@ while IFS="$TAB" read -r act side ot tt i wm p; do
             git rm -q -f -- ":(literal)$p" > /dev/null || fail "git rm $p"
             echo "GONE $side $ot $tt $p"
             ;;
-        file | notjson | nocheck)
+        file)
             git checkout "--$side" -- ":(literal)$p" || fail "git checkout --$side $p"
             git add -- ":(literal)$p" || fail "git add $p"
             echo "NEWER $side $act $ot $tt $p"

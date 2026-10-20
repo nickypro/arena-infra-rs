@@ -513,7 +513,16 @@ fn a_resolve_is_read_back_and_said_in_a_line() {
     assert_eq!((refused.refused.as_deref(), refused.resolved), (Some("changed: files changed since the copy"), None));
     assert_eq!(parse_resolve("SAVED /x\nNEWER ours file 1 2 a\nFAILED git commit\n").failed.as_deref(), Some("git commit"));
     // Lines it can't read are left out.
-    for bad in ["NEWER theirs hunks soon 1 a.py", "NEWER sideways file 1 2 a.py", "NEWER ours lines 1 2 a.py", "GONE ours 1 2", "RESOLVED"] {
+    // (A notebook is never taken whole any more: `notjson` and `nocheck` are no way to read.)
+    for bad in [
+        "NEWER theirs hunks soon 1 a.py",
+        "NEWER sideways file 1 2 a.py",
+        "NEWER ours lines 1 2 a.py",
+        "NEWER theirs notjson 1 2 nb.ipynb",
+        "NEWER ours nocheck 1 2 nb.ipynb",
+        "GONE ours 1 2",
+        "RESOLVED",
+    ] {
         let r = parse_resolve(&format!("{bad}\n"));
         assert!(r.newer.is_empty() && r.resolved.is_none(), "{bad}: {r:?}");
     }
@@ -1838,84 +1847,143 @@ fn only_the_verified_courses_content_escapes_redaction() {
     redacted_in_head(&r, "keyed.py", redacted, &keyed, "own merge");
 }
 
-/// A notebook stays valid JSON (review ai-review claude #3). Merged per hunk, one side's conflict
-/// beside the other side's clean hunk can break it: the participant grouped cells into a list (an
-/// opening `[` three lines above the conflict, a clean hunk), the course changed the cell where
-/// the list closes (the conflict) — the course's side of it drops the `]`. So the result is parsed
-/// (python3, else jq): not valid — the whole notebook from the newer side, said; valid (the
-/// participant's side newer) — per hunk as any file. With nothing to parse it, whole too, said. A
-/// notebook resolved by hand that isn't valid JSON leaves the merge BUSY; a valid one is kept.
+/// A notebook stays valid JSON (review ai-review claude #3), and is never taken whole from one
+/// side instead (claude #1: that drops the other side's changes to it, clean hunks and all).
+/// Merged per hunk, one side's conflict beside the other side's clean hunk can break it: the
+/// participant grouped cells into a list (an opening `[` three lines above the conflict, a clean
+/// hunk), the course changed the cell where the list closes (the conflict) — the course's side of
+/// it drops the `]`. So the result is parsed (python3, else jq): valid (the participant's side
+/// newer) — per hunk as any file; not valid — BUSY, said, untouched; and so with nothing on the
+/// pod to tell: no parser, or a python3 that fails whatever it's given (a conda shim whose env is
+/// gone), which is no answer, never "not JSON" — jq, there, is asked next. A participant's json.py
+/// at the checkout's top is never imported in place of the stdlib's, nor its `__pycache__` written
+/// into the tree (claude #4: `python3 -I`). A notebook resolved by hand that isn't valid JSON, or
+/// that nothing can check, leaves it BUSY; a valid one is kept. And every notebook the commit takes
+/// is checked, not only the conflicted ones (codex #4): one malformed and already staged — beside a
+/// conflict still left, or with every conflict staged — or one only the course changed: BUSY, said.
 #[cfg(unix)]
 #[test]
-fn a_notebook_merged_per_hunk_stays_valid_json_or_is_taken_whole() {
+fn a_notebook_that_wont_merge_per_hunk_into_valid_json_leaves_it_busy() {
     let base = b"{\n \"cells\": [\n  \"a\",\n  \"b\",\n  \"c\",\n  \"d\"\n ]\n}\n";
     let course = b"{\n \"cells\": [\n  \"a\",\n  \"b\",\n  \"C\",\n  \"d\"\n ]\n}\n";
     let mine = b"{\n \"cells\": [\n  [\"a\",\n  \"b\",\n  \"c\"],\n  \"d\"\n ]\n}\n";
+    // A comma lost.
+    let bad = b"{\n \"cells\": [\n  \"a\"\n  \"C\"\n ]\n}\n";
     let has = |tool: &str| std::process::Command::new("sh").args(["-c", &format!("command -v {tool}")]).output().is_ok_and(|o| o.status.success());
-    // A merge of nb.ipynb, the course's side newer or not, left alone 4h.
-    let merged = |case: &str, course_newer: bool| {
+    // A merge of nb.ipynb, the course's side newer or not (with `also` from the course too).
+    let merged = |case: &str, course_newer: bool, also: &[(&str, &[u8])]| {
         let r = Repo::new(case);
         r.add_base(&[("nb.ipynb", base)]);
         let (course_at, mine_at) = if course_newer { (r.now - 5 * DAY, r.now - 10 * DAY) } else { (r.now - 10 * DAY, r.now - 5 * DAY) };
-        r.course_commit(&[("nb.ipynb", course)], course_at);
+        let mut theirs: Vec<(&str, &[u8])> = vec![("nb.ipynb", course)];
+        theirs.extend_from_slice(also);
+        r.course_commit(&theirs, course_at);
         r.my_commit(&[("nb.ipynb", mine)], mine_at);
         r.pull_conflicted();
         r
     };
     let parses = |r: &Repo| serde_json::from_slice::<serde_json::Value>(&r.read("nb.ipynb")).is_ok();
-    // (case, the JSON tools the resolve may use, the course's side newer, how it's taken, the words)
-    let mut cases: Vec<(&str, &str, bool, Taken, &str)> = vec![
-        ("nb-python", "python3", true, Taken::NotJson, "its whole version: merged per hunk, the notebook wasn't valid JSON"),
-        ("nb-valid", "python3", false, Taken::Hunks, "your side of each conflict; the other changes of both sides kept"),
-        ("nb-none", "", true, Taken::NoCheck, "its whole version: no python3 or jq here to check a notebook merged per hunk"),
+    let busy = "nb.ipynb can't be merged per hunk into valid JSON — resolve it in Jupyter, or abort";
+    let nocheck = "nothing on the pod could check it: no working python3 or jq";
+    fn nothing(_: &Repo) {}
+    // A python3 first on PATH that fails whatever it's given.
+    fn broken_python(r: &Repo) {
+        crate::remote::write_test_script(r.base.join("bin/python3"), "#!/bin/sh\nexit 1\n").unwrap();
+    }
+    // A participant's json.py at the checkout's top: one whose `load` takes anything, one that
+    // exits 3 (python3's "not JSON") when imported.
+    fn json_py_lenient(r: &Repo) {
+        r.put("json.py", b"def load(*args, **kwargs):\n    return None\n");
+    }
+    fn json_py_exits(r: &Repo) {
+        r.put("json.py", b"import sys\nsys.exit(3)\n");
+    }
+    // (case, the JSON tools the resolve may use, the course's side newer, what else is on the pod,
+    // why it stays BUSY — None: merged per hunk)
+    let mut cases: Vec<(&str, &str, bool, fn(&Repo), Option<String>)> = vec![
+        ("nb-python", "python3", true, nothing, Some(busy.to_string())),
+        ("nb-valid", "python3", false, nothing, None),
+        ("nb-none", "", false, nothing, Some(format!("{busy} ({nocheck})"))),
+        ("nb-broken-python", "python3", false, broken_python, Some(format!("{busy} ({nocheck})"))),
+        ("nb-json-py", "python3", true, json_py_lenient, Some(busy.to_string())),
+        ("nb-json-py-valid", "python3", false, json_py_exits, None),
     ];
     if has("jq") {
-        cases.push(("nb-jq", "jq", true, Taken::NotJson, "its whole version: merged per hunk, the notebook wasn't valid JSON"));
-        cases.push(("nb-jq-valid", "jq", false, Taken::Hunks, "your side of each conflict; the other changes of both sides kept"));
+        cases.push(("nb-jq", "jq", true, nothing, Some(busy.to_string())));
+        cases.push(("nb-jq-valid", "jq", false, nothing, None));
+        cases.push(("nb-broken-python-jq", "python3 jq", false, broken_python, None));
     } else {
         eprintln!("jq isn't installed here: the notebook checks run with python3 alone");
     }
     assert!(has("python3"), "python3, the images' own, is what the check uses first");
-    for (case, tools, course_newer, how, words) in cases {
-        let r = merged(case, course_newer);
+    for (case, tools, course_newer, setup, why) in cases {
+        let r = merged(case, course_newer, &[]);
+        setup(&r);
         r.age(4 * HOUR);
+        let conflicts = r.unmerged();
         let (code, rep, said) = r.resolve_with(3, &r.look(), GIT_MAX_FILE_BYTES_FOR_TESTS, &[("ARENA_TEST_JSON_TOOLS", tools)]);
-        assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{case}: {said}");
-        let side = if course_newer { "theirs" } else { "ours" };
-        assert_eq!(taken(&rep), [("nb.ipynb".to_string(), side.to_string(), how)], "{case}: {said}");
-        assert!(parses(&r), "{case}: {}", r.text("nb.ipynb"));
-        assert_eq!(r.read("nb.ipynb"), if course_newer { course.to_vec() } else { mine.to_vec() }, "{case}: the newer side's");
-        let body = r.git(&r.work, &["log", "-1", "--format=%B"]);
-        let won = if course_newer { "the merged branch won" } else { "yours won" };
-        assert!(body.contains(&format!("- nb.ipynb: {won} ({words}) — last changed: ")), "{case}: {body}");
+        match why {
+            None => {
+                assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{case}: {said}");
+                assert_eq!(taken(&rep), [("nb.ipynb".to_string(), "ours".to_string(), Taken::Hunks)], "{case}: {said}");
+                assert!(parses(&r), "{case}: {}", r.text("nb.ipynb"));
+                assert_eq!(r.read("nb.ipynb"), mine, "{case}: the newer side's");
+            }
+            Some(why) => {
+                assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some(why.as_str())), "{case}: {said}");
+                r.untouched(&conflicts, case);
+                assert!(r.text("nb.ipynb").contains("<<<<<<< HEAD"), "{case}: as git left it");
+            }
+        }
+        assert!(!r.work.join("__pycache__").exists(), "{case}: nothing written into the tree");
     }
-    // The line names it too.
-    let r = parse_resolve("NEWER theirs notjson 1760000000 1760500000 nb.ipynb\nNEWER ours nocheck 1760600000 1760500000 b.ipynb\nRESOLVED merge\n");
-    assert_eq!(
-        resolved_note(&r, 3, "/b/x"),
-        "finished a merge left for 3h+ (nb.ipynb: MERGE_HEAD's version, whole: merged per hunk the notebook wasn't valid JSON, HEAD \
-         2025-10-09 08:53Z / MERGE_HEAD 2025-10-15 03:46Z; b.ipynb: HEAD's version, whole: no python3 or jq on the pod to check the \
-         notebook merged per hunk, HEAD 2025-10-16 07:33Z / MERGE_HEAD 2025-10-15 03:46Z; today's copy: /b/x)"
-    );
 
-    // Resolved by hand: not valid JSON (a comma lost) — BUSY, said, untouched; valid — kept.
-    for (case, by_hand, kept) in [("nb-hand-bad", &b"{\n \"cells\": [\n  \"a\"\n  \"C\"\n ]\n}\n"[..], false), ("nb-hand", &mine[..], true)] {
-        let r = merged(case, true);
+    // Resolved by hand: not valid JSON — BUSY, said, untouched; nothing to check it — BUSY too;
+    // valid — kept.
+    let hand_none = format!("nb.ipynb can't be checked as JSON ({nocheck}) — finish it (and git add it) or abort, on the pod");
+    for (case, by_hand, tools, why) in [
+        ("nb-hand-bad", &bad[..], "python3", Some("nb.ipynb isn't valid JSON: Jupyter can't open it as it is — fix it (and git add it) or abort, on the pod")),
+        ("nb-hand-none", &mine[..], "", Some(hand_none.as_str())),
+        ("nb-hand", &mine[..], "python3", None),
+    ] {
+        let r = merged(case, true, &[]);
         r.put("nb.ipynb", by_hand);
         r.age(4 * HOUR);
         let conflicts = r.unmerged();
-        let (code, rep, said) = r.resolve(3, &r.look());
-        if kept {
-            assert_eq!((code, rep.hand.clone()), (Some(0), vec!["nb.ipynb".to_string()]), "{case}: {said}");
-            assert_eq!(r.read("nb.ipynb"), by_hand, "{case}");
-        } else {
-            assert_eq!(
-                (code, rep.refused.as_deref()),
-                (Some(RESOLVE_REFUSED_EXIT), Some("nb.ipynb isn't valid JSON: Jupyter can't open it as it is — fix it (and git add it) or abort, on the pod")),
-                "{case}: {said}"
-            );
-            r.untouched(&conflicts, case);
+        let (code, rep, said) = r.resolve_with(3, &r.look(), GIT_MAX_FILE_BYTES_FOR_TESTS, &[("ARENA_TEST_JSON_TOOLS", tools)]);
+        match why {
+            None => {
+                assert_eq!((code, rep.hand.clone()), (Some(0), vec!["nb.ipynb".to_string()]), "{case}: {said}");
+                assert_eq!(r.read("nb.ipynb"), by_hand, "{case}");
+            }
+            Some(why) => {
+                assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some(why)), "{case}: {said}");
+                r.untouched(&conflicts, case);
+            }
         }
+    }
+
+    // Already staged, malformed: a notebook of the participant's added mid-merge while conflicts
+    // are left; the conflicted notebook resolved badly and added, nothing left in conflict; and a
+    // notebook only the course changed, malformed as it has it (the conflicted one merging fine).
+    let staged = |words: &str| format!("{words} isn't valid JSON as staged: Jupyter can't open it — fix it (and git add it) or abort, on the pod");
+    let part = Repo::new("nb-staged-part");
+    part.merge_conflict(part.now - 5 * DAY, part.now - 10 * DAY);
+    part.put("mine.ipynb", bad);
+    part.git(&part.work, &["add", "mine.ipynb"]);
+    let all = merged("nb-staged-all", true, &[]);
+    all.put("nb.ipynb", bad);
+    all.git(&all.work, &["add", "nb.ipynb"]);
+    assert!(all.unmerged().is_empty());
+    let theirs = merged("nb-staged-theirs", false, &[("broken.ipynb", bad)]);
+    let theirs_why = "broken.ipynb isn't valid JSON as the merged branch (MERGE_HEAD) has it: Jupyter can't open it — finish the merge yourself, or \
+                      abort it, on the pod";
+    for (r, why) in [(&part, staged("mine.ipynb")), (&all, staged("nb.ipynb")), (&theirs, theirs_why.to_string())] {
+        r.age(4 * HOUR);
+        let conflicts = r.unmerged();
+        let (code, rep, said) = r.resolve(3, &r.look());
+        assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some(why.as_str())), "{said}");
+        r.untouched(&conflicts, &why);
     }
 }
 
