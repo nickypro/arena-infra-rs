@@ -642,7 +642,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     push, whatever GitHub would do: just those commits and the ones on top of them (none origin
     has — one only the course's `upstream` has, its `main` merged in, is scanned too: origin
     never had it), the key redacted — same messages (a key in one redacted the same way), authors,
-    dates — and pushed as a fast-forward, never forced; files on disk untouched. **The course's own commits
+    dates — and pushed as a fast-forward, never forced, the commit alone (`--no-follow-tags`: a
+    participant's `push.followTags` sent the annotated tags on it too, their messages unscanned);
+    files on disk untouched. **The course's own commits
     get no exemption** (FIX8): every exemption tried (FIX4B to FIX7) trusted something a pod could
     get wrong, and Live 7 found no key-like string in the real course's 2187 commits. What that
     leaves: if the course ever commits a key-like string, each pod that merges it pushes those
