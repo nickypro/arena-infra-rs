@@ -3986,6 +3986,53 @@ done
         check("SKIP main\n");
     }
 
+    /// Review ai-review claude #10: on main the copy of the index was removed at the end of the
+    /// check, with no trap — the run's EXIT trap was set only later, on a branch it backs up — so a
+    /// tick killed mid-check (a timeout, a dropped connection) left `.git/arena-backup.<pid>.index`
+    /// and its `.lock` behind, a full copy of the index each time. Now its removal is the EXIT trap,
+    /// set before the copy, and a hangup or TERM ends the run as an exit, so the trap runs. (A
+    /// stand-in `git` signals the run as the refresh of the copy starts, its lock taken.)
+    #[cfg(unix)]
+    #[test]
+    fn a_main_check_killed_midway_leaves_no_copy_of_the_index() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = GitSandbox::new("main-killed", 1_000_000);
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        let index = s.work.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+        let ours = || {
+            std::fs::read_dir(s.work.join(".git"))
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("arena-backup"))
+                .collect::<Vec<_>>()
+        };
+        let script = backup_command_limited(s.work.to_str().unwrap(), None, "arena backup", s.skip, s.limit, None);
+        for (signal, code) in [("TERM", 143), ("HUP", 129)] {
+            let bin = s.base.join(format!("bin-{signal}"));
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(
+                bin.join("git"),
+                format!(
+                    "#!/bin/sh\nif [ \"$*\" = 'update-index -q --refresh' ] && [ -n \"$GIT_INDEX_FILE\" ]; then : > \"$GIT_INDEX_FILE.lock\"; \
+                     kill -{signal} \"$PPID\"; exit 1; fi\nexec {} \"$@\"\n",
+                    shell_quote(&real_git())
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+            let (got, out, err) = run_on_path(&script, &path);
+            assert_eq!(got, Some(code), "{signal}: {out}{err}");
+            assert_eq!(ours(), Vec::<String>::new(), "{signal}: the copy and its lock removed");
+            assert_eq!(std::fs::read(&index).unwrap(), before, "{signal}: the participant's index untouched");
+        }
+        // Not killed: the check as ever, nothing left.
+        assert_eq!(s.backup_raw().1, "SKIP main\n");
+        assert_eq!(ours(), Vec::<String>::new());
+    }
+
     /// Review ai-review claude #2 / codex #2: the work `set-branch --hard` discards — a merge in
     /// progress and its conflicted file, an edit to a tracked file, untracked or ignored files the
     /// reset replaces — was kept only in set-branch's rsync into the day's snapshot label, which the

@@ -38,6 +38,13 @@
 #   PUSH_FAILED                the push failed otherwise (the network, a non-fast-forward…; exit 1)
 # Any other failure exits non-zero via `set -e`.
 set -e
+# A hangup, an interrupt, a TERM or a broken pipe (the ssh connection gone, met at the next write)
+# ends the run as an exit, so the EXIT trap that removes its temporary files runs: dash runs none
+# for a signal left at its default. (The trap runs once the command running then returns.)
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 141' PIPE
 REPO=$1
 MSG=$2
 MAX=$3
@@ -74,9 +81,12 @@ B=$(git rev-parse --abbrev-ref HEAD)
 # it. Plumbing alone, so no porcelain refresh and no index.lock of ours. The copy is gone after,
 # its refresh with it: such a file is hashed again next run, until the participant's own git
 # refreshes their index (an editor's `git status` does, often). Without an index to copy, the
-# porcelain diff, read-only.
+# porcelain diff, read-only. The copy's removal is the EXIT trap, set before the copy exists
+# (review ai-review claude #10): a run killed mid-check (a timeout, a dropped connection) left a
+# full copy of the index, and its lock, in .git every time.
 tracked_changed() {
     _ti="$1/arena-backup.$$.index"
+    trap 'rm -f "$_ti" "$_ti.lock"' EXIT
     if cp "$1/index" "$_ti" 2>/dev/null; then
         GIT_INDEX_FILE="$_ti" git update-index -q --refresh >/dev/null 2>&1 || true
         if GIT_INDEX_FILE="$_ti" git diff-index --quiet HEAD -- 2>/dev/null; then _tc=1; else _tc=0; fi
