@@ -2100,6 +2100,42 @@ fn the_courses_own_content_is_sized_by_githubs_limit_and_its_submodules_kept() {
     }
 }
 
+/// Review ai-review claude #6: `unfit` read the submodules from the staged .gitmodules alone, which
+/// a .gitmodules still in conflict doesn't have — so a submodule the course added in a merge where
+/// .gitmodules conflicted too was refused as a nested repo before anything was resolved, and the
+/// pod stayed BUSY. Now, while it's in conflict, both sides' lists count: the course's newer side
+/// of the .gitmodules conflict taken, its submodule committed as a gitlink, listed.
+#[cfg(unix)]
+#[test]
+fn a_course_submodule_is_kept_when_its_gitmodules_conflicts_too() {
+    let r = Repo::new("course-gitmodules");
+    let gitmodules = |url: &str, lib: bool| {
+        let mut s = format!("[submodule \"old\"]\n\tpath = old\n\turl = {url}\n");
+        if lib {
+            s.push_str("[submodule \"lib\"]\n\tpath = lib\n\turl = https://example.invalid/lib.git\n");
+        }
+        s
+    };
+    r.add_base(&[(".gitmodules", gitmodules("https://example.invalid/old.git", false).as_bytes())]);
+    let pinned = r.git(&r.course, &["rev-parse", "HEAD"]);
+    r.put_in(&r.course, ".gitmodules", gitmodules("https://example.invalid/old2.git", true).as_bytes());
+    r.git(&r.course, &["add", ".gitmodules"]);
+    r.git(&r.course, &["update-index", "--add", "--cacheinfo", &format!("160000,{pinned},lib")]);
+    let (ok, said) = r.git_at(&r.course, r.now - 5 * DAY, &["commit", "-q", "-m", "a submodule"]);
+    assert!(ok, "{said}");
+    r.my_commit(&[(".gitmodules", gitmodules("https://example.invalid/mine.git", false).as_bytes())], r.now - 10 * DAY);
+    r.pull_conflicted();
+    let conflicts = r.unmerged();
+    assert!(conflicts.contains("\t.gitmodules") && !conflicts.contains("\tlib"), "{conflicts}");
+    assert_eq!(r.git(&r.work, &["ls-files", "-s", "lib"]), format!("160000 {pinned} 0\tlib"), "the gitlink staged");
+    r.age(4 * HOUR);
+    let (code, rep, said) = r.resolve(3, &r.look());
+    assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{said}");
+    assert_eq!(taken(&rep), [(".gitmodules".to_string(), "theirs".to_string(), Taken::Hunks)], "{said}");
+    assert_eq!(r.git(&r.work, &["ls-tree", "HEAD", "lib"]), format!("160000 commit {pinned}\tlib"), "the submodule committed");
+    assert_eq!(format!("{}\n", r.committed(".gitmodules")), gitmodules("https://example.invalid/old2.git", true));
+}
+
 /// What would be staged exactly as the other side has it is sized by GitHub's limit however the
 /// conflict was resolved (review ai-review codex #3: only a file taken whole was; a 96 MiB text file
 /// or notebook merged per hunk into exactly MERGE_HEAD's version was refused at git's limit before

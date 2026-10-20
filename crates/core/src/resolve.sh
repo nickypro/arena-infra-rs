@@ -264,8 +264,14 @@ unfit() {
         print substr($0, 1, i - 1) " " ((p in o) ? "yours" : "theirs") "\t" p }' "$T.so" "$T.sd" > "$T.st"
     # A submodule is no nested repo to refuse: a gitlink whose path .gitmodules lists, as the
     # backup's `is_submodule` reads it (review ai-review claude #3) — here the .gitmodules staged,
-    # the one the commit takes.
-    git config --blob :.gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | cut -d' ' -f2- > "$T.subs"
+    # the one the commit takes. One still in conflict has no staged version yet: then both sides'
+    # lists, together (review ai-review claude #6: a submodule the course adds in a merge where
+    # .gitmodules conflicts too was refused as a nested repo, and the pod left BUSY); the check
+    # after the conflicts are resolved reads the one staged.
+    if [ -n "$(git ls-files -u -- .gitmodules | head -n 1)" ]; then _gms=':2:.gitmodules :3:.gitmodules'; else _gms=':.gitmodules'; fi
+    for _gm in $_gms; do
+        git config --blob "$_gm" --get-regexp '^submodule\..*\.path$' 2>/dev/null | cut -d' ' -f2-
+    done > "$T.subs"
     _g=$(awk 'FILENAME == ARGV[1] { s[$0] = 1; next } { i = index($0, "\t"); p = substr($0, i + 1); split(substr($0, 1, i - 1), m, " ") }
         m[2] == "160000" && m[1] != "160000" && !(p in s) { print m[5] "\t" p; exit }' "$T.subs" "$T.st")
     if [ -n "$_g" ]; then
