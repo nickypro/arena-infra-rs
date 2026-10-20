@@ -29,10 +29,18 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::Config(format!("reading {}: {e}", path.display())))?;
-        let mut cfg = Self::parse(&text);
-        cfg.apply_overrides(|k| std::env::var(k).ok());
+        let mut cfg = Self::parse_with_env(&text, |k| std::env::var(k).ok());
         cfg.source = Some(path.to_path_buf());
         Ok(cfg)
+    }
+
+    /// [`Self::parse`], then the environment's overrides as [`Self::load`] applies them, each
+    /// variable read through `lookup` (the process environment, for `load`) — so a test sees
+    /// exactly what a variable in the environment does without setting one process-wide.
+    pub fn parse_with_env<F: Fn(&str) -> Option<String>>(text: &str, lookup: F) -> Self {
+        let mut cfg = Self::parse(text);
+        cfg.apply_overrides(lookup);
+        cfg
     }
 
     /// The file this config was loaded from, if any.
@@ -90,6 +98,12 @@ impl Config {
         "ARCHIVE_BWLIMIT",
         "ARCHIVE_SNAP_TIMEOUT_SECS",
         "ARCHIVE_BIG_TIMEOUT_SECS",
+        // The most `set-branch --hard` saves on a pod before its reset (`backup::discard_max_kb`):
+        // a non-secret tuning knob an operator — or a live test — lowers for one `--hard`
+        // (`DISCARD_MAX_GB=0.001 arena pods set-branch main <pod> --hard`) without editing the
+        // shared config (Live 6 couldn't reach the "too big to save" path: the sandbox's file
+        // doesn't set it).
+        "DISCARD_MAX_GB",
     ];
 
     /// Keys starting with this are **file-only**: the environment can neither override nor
@@ -418,6 +432,25 @@ MACHINE_NAME_LIST=(
         let mut c = Config::parse("IMAGE=base:1");
         c.apply_overrides(|k| (k == "BALANCE_UNPRICED_PER_GPU").then(|| "5".to_string()));
         assert_eq!(c.get("BALANCE_UNPRICED_PER_GPU"), Some("5"));
+    }
+
+    /// Live 6: the "too big to save" path of `set-branch --hard` couldn't be tried — the sandbox's
+    /// file doesn't set `DISCARD_MAX_GB`, and the environment couldn't introduce it. Now it can,
+    /// for one command, and overrides a file's value too; what `--hard` then reads is the
+    /// environment's ([`crate::backup::discard_max_kb`]). `parse_with_env` is `load`'s own path.
+    #[test]
+    fn env_can_introduce_the_discard_limit() {
+        let env = |v: &'static str| move |k: &str| (k == "DISCARD_MAX_GB").then(|| v.to_string());
+        let c = Config::parse_with_env("IMAGE=base:1", env("0.001"));
+        assert_eq!((c.get("DISCARD_MAX_GB"), crate::backup::discard_max_kb(&c)), (Some("0.001"), Ok(1049)));
+        let c = Config::parse_with_env("DISCARD_MAX_GB=20\nIMAGE=base:1", env("0.5"));
+        assert_eq!(crate::backup::discard_max_kb(&c), Ok(512 * 1024));
+        // A bad one from the environment is as bad as from the file: `--hard` refuses it.
+        let c = Config::parse_with_env("IMAGE=base:1", env("lots"));
+        assert!(crate::backup::discard_max_kb(&c).unwrap_err().contains("`lots`"));
+        // Without it: the file's, else the default.
+        assert_eq!(crate::backup::discard_max_kb(&Config::parse_with_env("IMAGE=base:1", |_| None)), Ok(1024 * 1024));
+        assert!(Config::ENV_INTRODUCIBLE.contains(&"DISCARD_MAX_GB") && !Config::is_file_only("DISCARD_MAX_GB"));
     }
 
     /// REVIEW RS3 (fails today): the reaper's whole authority AND every veto (`reap hold`,

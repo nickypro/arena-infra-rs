@@ -920,7 +920,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     trap), and says what it was saving — stopped mid-copy, what and how big, and the same move
     out of the way as below (claude #6). And what `untracked/` would hold is totalled first (`du -sk`): over `DISCARD_MAX_GB`
     (default 1: the save runs within the switch's 100 s — review ai-review claude #6; `config check`
-    shows it) or over half what's free on that disk (`df`), nothing of it is copied and the pod
+    shows it; settable from the environment for one `--hard`, even when the file lacks it) or over half what's free on that disk (`df`), nothing of it is copied and the pod
     isn't reset — `arena set-branch: not reset — the --hard reset would remove checkpoints (31.2
     GB), which is more than DISCARD_MAX_GB allows (1.0 GB) to save first: move it out of the
     checkout (cd '/root/ARENA_materials' && mv -n -- 'checkpoints'
@@ -1827,7 +1827,7 @@ Notes / sharp edges to know:
 
 Any key in `config.env` can be overridden by an **environment variable of the same
 name** (env wins; it can't introduce brand-new keys — except a short allowlist such as
-`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD` and `RUNPOD_API`, e.g. `RUNPOD_API=v1 arena pods
+`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API` and `DISCARD_MAX_GB`, e.g. `RUNPOD_API=v1 arena pods
 list` to use the retiring RunPod v1 backend for one command, until 2026-11-15; v2 is the default). This is how you point at an SSH
 key the current user can actually read, without editing the shared, read-only prod
 config — e.g. when the dashboard's metrics show `ssh connect failed … key unreadable`

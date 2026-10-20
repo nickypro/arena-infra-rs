@@ -4965,31 +4965,9 @@ fn config_which(cfg: &Config, provider_name: &str, config_path: &std::path::Path
     println!("\nLoaded: provider {provider_name} · {} key(s) · {} machine name(s)",
         cfg.values.len(), cfg.machine_names.len());
 
-    // Keys whose value is currently coming from the environment (env overrides the file
-    // at load — easy to forget, so surface it).
-    let mut from_env: Vec<&str> = cfg
-        .values
-        .keys()
-        .map(String::as_str)
-        .filter(|k| !Config::is_file_only(k) && std::env::var(k).is_ok())
-        .collect();
-    // The name list too (parsed apart from `values`): the environment's wins when the file has one.
-    let list = arena_core::config::NAME_LIST_KEY;
-    if cfg.file_sets_name_list() && std::env::var(list).is_ok() {
-        from_env.push(list);
-    }
-    from_env.sort();
-    // The reaper's keys are file-only: an env var of that name is ignored — say so, since
-    // it looks like it should win.
-    let mut ignored: Vec<&String> =
-        cfg.values.keys().filter(|k| Config::is_file_only(k) && std::env::var(k.as_str()).is_ok()).collect();
-    ignored.sort();
+    let (from_env, ignored) = env_keys(cfg, |k| std::env::var(k).is_ok());
     if !ignored.is_empty() {
-        println!(
-            "\nIgnored from the environment (file-only, {}*): {}",
-            Config::FILE_ONLY_PREFIX,
-            ignored.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
-        );
+        println!("\nIgnored from the environment (file-only, {}*): {}", Config::FILE_ONLY_PREFIX, ignored.join(", "));
     }
     if from_env.is_empty() {
         println!("\nEnvironment overrides: none (all values come from the file)");
@@ -5000,6 +4978,25 @@ fn config_which(cfg: &Config, provider_name: &str, config_path: &std::path::Path
         }
     }
     Ok(())
+}
+
+/// What `config which` says of the environment (`is_set`: whether a variable of that name is set):
+/// the keys whose value now comes from it — every key of the loaded config with a variable of its
+/// name, whether that overrode the file's value or introduced one the file lacks
+/// (`Config::ENV_INTRODUCIBLE`: `DISCARD_MAX_GB`, …); env overrides the file at load, easy to
+/// forget, so it's said — and the name list when the file has one (parsed apart from `values`:
+/// the environment's wins then). Then the file-only keys whose variable is ignored (the reaper's:
+/// it looks like it should win). Each sorted. Pure.
+fn env_keys(cfg: &Config, is_set: impl Fn(&str) -> bool) -> (Vec<&str>, Vec<&str>) {
+    let mut from_env: Vec<&str> = cfg.values.keys().map(String::as_str).filter(|k| !Config::is_file_only(k) && is_set(k)).collect();
+    let list = arena_core::config::NAME_LIST_KEY;
+    if cfg.file_sets_name_list() && is_set(list) {
+        from_env.push(list);
+    }
+    from_env.sort_unstable();
+    let mut ignored: Vec<&str> = cfg.values.keys().map(String::as_str).filter(|k| Config::is_file_only(k) && is_set(k)).collect();
+    ignored.sort_unstable();
+    (from_env, ignored)
 }
 
 /// The `config check` row for `CREATE_EXTRA_JSON` (`None` when unset), and whether it
@@ -17728,6 +17725,29 @@ mod tests {
         assert!(report.contains("  ⚠ shared SSH key") && report.contains("  ⚠ iteration start date       unset"), "{report}");
     }
 
+    /// Live 6 (FIX6B item 5): `DISCARD_MAX_GB` from the environment, the file without it — as in
+    /// `DISCARD_MAX_GB=0.001 arena pods set-branch main <pod> --hard`. `config which` lists it among
+    /// the environment's overrides, and `config check` shows the value (a bad one is ✗ and fails
+    /// the check); a key the environment may not introduce is listed by neither, and the reaper's
+    /// file-only keys are said to be ignored. With no variable, nothing is listed.
+    #[test]
+    fn a_discard_limit_from_the_environment_shows_in_config_which_and_check() {
+        use super::{config_report, env_keys, Config};
+        let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
+                    GPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\nREAP_ENABLED=0\n";
+        let env = |v: &'static str| move |k: &str| matches!(k, "DISCARD_MAX_GB" | "SOME_NEW_KEY" | "REAP_ENABLED").then(|| v.to_string());
+        let cfg = Config::parse_with_env(base, env("0.001"));
+        assert_eq!(env_keys(&cfg, |k| env("0.001")(k).is_some()), (vec!["DISCARD_MAX_GB"], vec!["REAP_ENABLED"]));
+        let (report, missing) = config_report(&cfg, "runpod");
+        assert!(report.lines().any(|l| l == "  · --hard save max per pod    1 MB (DISCARD_MAX_GB)"), "{report}");
+        assert!(missing.is_empty(), "{missing:?}");
+        let (report, missing) = config_report(&Config::parse_with_env(base, env("lots")), "runpod");
+        assert!(report.contains("\n  ✗ --hard save max per pod    DISCARD_MAX_GB must be a number of GB above 0"), "{report}");
+        assert_eq!(missing, ["DISCARD_MAX_GB (must be a number of GB above 0, like 5 or 0.5)"]);
+        let cfg = Config::parse_with_env(&format!("{base}DISCARD_MAX_GB=2\n"), |_| None);
+        assert_eq!(env_keys(&cfg, |_| false), (vec![], vec![]));
+    }
+
     /// Merge of wave 7 reaper ("✗ means fail"): switched on (REAP_ENABLED=1), every ✗ row in the
     /// reaper's section is a gap the check fails on — named in the error — and its other rows
     /// are ✓/⚠/·; only observing (its cron line in, REAP_ENABLED unset), the same gaps are ⚠
@@ -23292,14 +23312,15 @@ mod remote_tests {
         let stub = StubRsync::new("discard-limit");
         let dir = stub.0.join("backups");
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = |extra: &str| {
-            Config::parse(&format!(
+        let text = |extra: &str| {
+            format!(
                 "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\n\
                  GIT_SSH_KEY_REMOTE={KEY}\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nARENA_START_DATE=2026-01-05\n\
                  LOCAL_BACKUP_DIR={}\n{extra}",
                 dir.display()
-            ))
+            )
         };
+        let cfg = |extra: &str| Config::parse(&text(extra));
         let apple = everyone(&fleet_of(&[("apple", 22001)]));
         let backup = (backup_command(REPO, Some(KEY), "arena backup devtest-apple", None), Some(BACKUP_TIMEOUT));
         let pushed = || [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"), FakeReply::ok()];
@@ -23310,6 +23331,13 @@ mod remote_tests {
             let hard = (checkout_command_limited(REPO, "main", Some(KEY), true, kb), Some(BRANCH_TIMEOUT));
             assert_eq!(execs(&fake, 22001), [backup.clone(), hard], "{extra:?}");
         }
+        // From the environment alone, the file without it (Live 6, FIX6B item 5): the same.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), pushed());
+        let from_env = Config::parse_with_env(&text(""), |k| (k == "DISCARD_MAX_GB").then(|| "0.5".to_string()));
+        handle_set_branch(fake.clone(), &from_env, "main", &apple, true, false, true, &stub.path()).await.unwrap();
+        let hard = (checkout_command_limited(REPO, "main", Some(KEY), true, 512 * 1024), Some(BRANCH_TIMEOUT));
+        assert_eq!(execs(&fake, 22001), [backup.clone(), hard]);
         let fake = Arc::new(FakeRemote::new());
         let err = handle_set_branch(fake.clone(), &cfg("DISCARD_MAX_GB=lots\n"), "main", &apple, true, false, true, &stub.path()).await.unwrap_err();
         assert_eq!(err.to_string(), "DISCARD_MAX_GB must be a number of GB above 0, like 5 or 0.5 (got `lots`)");
