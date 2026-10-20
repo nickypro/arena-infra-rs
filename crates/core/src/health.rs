@@ -2606,6 +2606,8 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
             ("a tensor op failed", &op_failed, Fail, "Failed to initialize NVML: Insufficient Permissions", Fail),
             ("a tensor op missing", &op_missing, Fail, "Failed to initialize NVML: Insufficient Permissions", Fail),
             ("torch missing", &no_torch, Fail, "Failed to initialize NVML: Insufficient Permissions", Fail),
+            // CUDA not said to be available (its line lost), whatever else came: no proof.
+            ("CUDA not reported", &edit(&mig_nvml, &[("cuda_available", None)]), Fail, "Failed to initialize NVML: Insufficient Permissions", Fail),
             ("nvidia-smi missing, CUDA unavailable", &edit(&cuda_off, &[("smi", Some("missing"))]), Fail, "not found (no NVIDIA driver in the container)", Fail),
         ];
         for (label, out, status, detail, verdict) in cases {
