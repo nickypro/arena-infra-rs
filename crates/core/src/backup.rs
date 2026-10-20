@@ -1427,8 +1427,11 @@ mod tests {
         assert!(s.contains(r#"git commit -q -m "$MSG""#));
         // "Nothing staged" isn't "nothing to do": push whenever ahead of origin's branch, or origin
         // has none — origin's, never the branch's own upstream (ai-review claude #6).
-        assert!(s.contains(r#"git rev-list --count "refs/remotes/origin/$B..HEAD""#) && !s.contains("@{u}"));
-        assert!(s.contains(r#"set -- -u origin "$B""#) && s.contains(r#"git push "$@""#) && s.contains("PUSHED $B"));
+        assert!(s.contains(r#"git rev-list --count "refs/remotes/origin/$B..$TIP""#) && !s.contains("@{u}"));
+        // Exactly the commit it scanned, by its id (review ai-review codex #1, FIX7), the branch
+        // tracking origin's as `push -u` made it.
+        assert!(s.contains(r#"git push origin "$NEW:refs/heads/$B""#) && !s.contains(r#"git push -u"#) && s.contains("PUSHED $B"));
+        assert!(s.contains(r#"git branch --set-upstream-to="origin/$B" "$B""#));
         assert!(s.contains("Arena Autocommit"));
         assert!(s.contains(r#"export GIT_SSH_COMMAND="ssh -i $KEY"#));
         assert_eq!(GIT_MAX_FILE_BYTES, 99_614_720, "95 MiB: headroom under GitHub's 100 MiB");
@@ -4164,6 +4167,28 @@ done
         format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
     }
 
+    /// [`git_acting_at`] on the first call whose arguments match the shell pattern `glob` (`push *`,
+    /// its spaces matched as spaces): a moment the old and the new form of a command both reach.
+    #[cfg(unix)]
+    fn git_acting_on(s: &GitSandbox, glob: &str, script: &str) -> String {
+        let glob = glob.replace(' ', "\\ ");
+        let bin = s.base.join("bin-hook");
+        std::fs::create_dir_all(&bin).unwrap();
+        let once = s.base.join("hook.sh");
+        let _ = std::fs::remove_file(s.base.join("hook.sh.ran"));
+        std::fs::write(&once, script).unwrap();
+        let once = shell_quote(once.to_str().unwrap());
+        crate::remote::write_test_script(
+            bin.join("git"),
+            format!(
+                "#!/bin/sh\ncase \"$*\" in {glob}) if [ -f {once} ]; then mv {once} {once}.ran; sh {once}.ran >/dev/null 2>&1; fi;; esac\nexec {} \"$@\"\n",
+                shell_quote(&real_git())
+            ),
+        )
+        .unwrap();
+        format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+    }
+
     /// `bash -c cmd` with this PATH: (exit code, stdout, stderr).
     #[cfg(unix)]
     fn run_on_path(cmd: &str, path: &str) -> (Option<i32>, String, String) {
@@ -4510,6 +4535,40 @@ done
         let (code, r, err) = s.backup();
         assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
         assert_eq!(s.git(&s.work, &["rev-list", "--parents", "-n1", "origin/autocommit-x"]).split(' ').count(), 3, "their merge, pushed");
+    }
+
+    /// Review ai-review codex #1 (FIX7, the one finding that blocked merging): the scans read the
+    /// live HEAD and the push sent the branch by name, so a commit the participant made after the
+    /// scan — a key in it — went out with it unscanned (arena's lock is no lock on their own git).
+    /// Now the run fixes its commit first (`TIP`), scans and rewrites that, and pushes exactly it,
+    /// by id: a commit made between the scan and the push (a stand-in `git` makes it as the push
+    /// starts) stays local, and the next run scans it — redacted, pushed. The branch still tracks
+    /// origin's, as `push -u` made it: set when it had no upstream.
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_made_after_the_scan_stays_local_until_the_next_run_scans_it() {
+        let s = GitSandbox::new("late-commit", 1_000_000);
+        let key = openrouter_key(31);
+        let origin_ref = || s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "refs/heads/autocommit-x"]);
+        let script = backup_command_limited(s.work.to_str().unwrap(), None, "arena backup", s.skip, s.limit, None);
+        s.git(&s.work, &["branch", "--unset-upstream"]);
+        std::fs::write(s.work.join("notes.md"), "notes\n").unwrap();
+        let path = git_acting_on(&s, "push *", &format!("printf 'KEY = \"{key}\"\\n' > late.py && git add late.py && git commit -q -m late\n"));
+        let (code, out, err) = run_on_path(&script, &path);
+        assert!(s.base.join("hook.sh.ran").exists(), "the commit was made mid-backup");
+        assert_eq!((code, parse_backup_report(&out).outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{out}{err}");
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%s"]), "late", "the participant's commit, on top");
+        assert_eq!(origin_ref(), s.git(&s.work, &["rev-parse", "HEAD~1"]), "what was scanned went out, nothing after it");
+        assert!(!s.origin_holds(&key), "the late commit's key reached origin");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "autocommit-x@{u}"]), "origin/autocommit-x");
+        // The next run scans it: redacted, pushed.
+        let late = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        assert_eq!(r.history.map(|h| (h.0, h.1)), Some((1, late)), "{err}");
+        assert!(!s.origin_holds(&key));
+        assert_eq!(s.git(&s.work, &["show", "origin/autocommit-x:late.py"]), "KEY = \"REDACTED-OPENROUTER-KEY\"");
+        assert_eq!(origin_ref(), s.git(&s.work, &["rev-parse", "HEAD"]), "the rewrite, pushed and checked out");
     }
 
     /// Review ai-review claude #9: on main the check for changes to tracked files was the porcelain

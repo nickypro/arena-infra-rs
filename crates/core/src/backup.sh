@@ -289,6 +289,13 @@ tr '\0' '\n' < "$T.upd" \
     | awk 'NR == FNR { n[$2] = $3; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " "); print "REDACTED " n[m[2]] " " substr($0, i + 1) }' "$T.map" -
 busy_stop
 if ! git diff --cached --quiet; then git commit -q -m "$MSG"; fi
+# What this run pushes, fixed here (review ai-review codex #1, FIX7): every check below — what's
+# ahead, the files over GitHub's limit, the keys — and the rewrite take this commit, never the live
+# HEAD, and the push sends exactly it (or its rewrite) by an explicit refspec. The participant's
+# own git is no party to the lock arena holds, so a commit they make while the scans run — a key
+# pasted in after the scan, `git commit -am` — went out unscanned with a push of the branch by name.
+# Now it stays local, and the next run scans it like any other.
+TIP=$(git rev-parse HEAD)
 
 # --- Push -----------------------------------------------------------------------------------
 # Ahead of origin's copy of the branch (or origin has none yet) → there is something to push,
@@ -299,11 +306,11 @@ if ! git diff --cached --quiet; then git commit -q -m "$MSG"; fi
 # branch made from `upstream/main` and tracking it, read as already pushed while origin had none
 # of it (review ai-review claude #6).
 if git rev-parse -q --verify "refs/remotes/origin/$B" >/dev/null; then
-    AHEAD=$(git rev-list --count "refs/remotes/origin/$B..HEAD")
-    set -- "refs/remotes/origin/$B..HEAD"
+    AHEAD=$(git rev-list --count "refs/remotes/origin/$B..$TIP")
+    set -- "refs/remotes/origin/$B..$TIP"
 else
     AHEAD=new
-    set -- HEAD --not --remotes=origin
+    set -- "$TIP" --not --remotes=origin
 fi
 if [ "$AHEAD" = 0 ]; then echo "NO_CHANGES $B"; exit 0; fi
 # A file over GitHub's own limit already in the unpushed commits (committed before this guard,
@@ -420,12 +427,11 @@ course_blocked() {
 # fast-forward (never forced), and only then does the branch move — compare-and-swap, so a
 # commit made meanwhile is never lost: the run stops there (HEAL_ABORTED), and the next one redoes
 # the same rewrite (same ids: a fast-forward of what was pushed) with that commit on top.
-TIP=$(git rev-parse HEAD)
 # `scan_out`: the blobs of the commits going out — but the course's verified own ($COURSE_REFS) —
 # into $T.blobs, and each holding a key, with its redacted copy, into $T.hmap (redact_blob's
 # lines; empty: nothing to redact).
 scan_out() {
-    git rev-list --objects HEAD --not --remotes=origin $COURSE_REFS | git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' \
+    git rev-list --objects "$TIP" --not --remotes=origin $COURSE_REFS | git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' \
         | awk '$1 == "blob" { print $2 }' | sort -u > "$T.blobs"
     : > "$T.hmap"
     [ -s "$T.blobs" ] || return 0
@@ -453,7 +459,7 @@ fi
 N=0
 NEW=$TIP
 if [ -s "$T.hmap" ]; then
-    git rev-list --reverse --topo-order HEAD --not --remotes=origin $COURSE_REFS > "$T.commits"
+    git rev-list --reverse --topo-order "$TIP" --not --remotes=origin $COURSE_REFS > "$T.commits"
     while read -r c; do
         ps=
         same=1
@@ -482,17 +488,14 @@ if [ -s "$T.hmap" ]; then
     NEW=$(sed -n "s/^$TIP //p" "$T.cmap")
 fi
 
-# The tip, or its redacted rewrite (as a fast-forward of the remote branch).
-if [ "$NEW" != "$TIP" ]; then
-    if [ "$(git rev-parse HEAD)" != "$TIP" ]; then
-        echo "HEAL_ABORTED $B moved while its unpushed commits were being redacted — the next backup redoes it"
-        exit 1
-    fi
-    set -- origin "$NEW:refs/heads/$B"
-else
-    set -- -u origin "$B"
+# The tip, or its redacted rewrite (as a fast-forward of the remote branch): that commit, by its
+# id, to origin's branch — never the branch by name, which is wherever the participant has moved it
+# since.
+if [ "$NEW" != "$TIP" ] && [ "$(git rev-parse HEAD)" != "$TIP" ]; then
+    echo "HEAL_ABORTED $B moved while its unpushed commits were being redacted — the next backup redoes it"
+    exit 1
 fi
-if git push "$@" 2>"$T.push"; then pushed=1; else pushed=; fi
+if git push origin "$NEW:refs/heads/$B" 2>"$T.push"; then pushed=1; else pushed=; fi
 no_bypass_url < "$T.push" >&2
 if [ -z "$pushed" ]; then
     # Still refused: a secret the patterns don't know (or a binary GitHub scans) — said, by type.
@@ -514,6 +517,9 @@ if [ "$NEW" != "$TIP" ]; then
     # the index matches the new tip and `git status` shows just the files on disk with their real
     # keys as modified — the state the redaction above leaves. No file on disk is touched.
     redact_index "$T.hmap" > /dev/null
+fi
+# The branch tracks origin's, as `push -u` made it (an id pushed sets no upstream): set once.
+if [ "$(git rev-parse --symbolic-full-name "$B@{upstream}" 2>/dev/null)" != "refs/remotes/origin/$B" ]; then
     git branch --set-upstream-to="origin/$B" "$B" > /dev/null 2>&1 || true
 fi
 echo "PUSHED $B"
