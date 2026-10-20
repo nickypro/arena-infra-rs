@@ -1089,11 +1089,20 @@ fn gpu_checks(f: &DeepFacts, out: &mut Vec<Check>) {
             f.device_count_error.as_deref().map(reason).unwrap_or_else(|| f.python_cut()),
         ),
         (Some(0), _) => Check::new("device_count", Fail, "torch sees no GPU"),
+        // A CUDA process is shown one MIG slice (NVIDIA's MIG guide: a single process enumerates a
+        // single MIG device), so a pod given two slices has torch see 1: fewer than the slices is
+        // fine, more is not.
+        (Some(t), Some((s, said))) if slices.is_some() && t <= s => Check::new(
+            "device_count",
+            Pass,
+            if t == s {
+                format!("{t} (matches nvidia-smi's {said})")
+            } else {
+                format!("{t} of nvidia-smi's {said} (CUDA shows a process one MIG slice)")
+            },
+        ),
         (Some(t), Some((s, said))) if t != s => {
             Check::new("device_count", Fail, format!("torch sees {t} GPU(s), nvidia-smi {said}"))
-        }
-        (Some(t), Some((_, said))) if slices.is_some() => {
-            Check::new("device_count", Pass, format!("{t} (matches nvidia-smi's {said})"))
         }
         (Some(t), Some(_)) => Check::new("device_count", Pass, format!("{t} (matches nvidia-smi)")),
         (Some(t), None) if f.is_mig() => {
@@ -2650,8 +2659,9 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         assert!(condemns_machine(check(&h.checks, "nvidia-smi"), h.facts.as_ref().unwrap()));
     }
 
-    /// Two slices of one parent: torch sees 2, `--query-gpu` lists the 1 parent — the count to
-    /// match is the slices `nvidia-smi -L` lists.
+    /// Two slices of one parent: `--query-gpu` lists the 1 parent — the count to match is the
+    /// slices `nvidia-smi -L` lists. CUDA may show a process just one of them, so torch seeing
+    /// fewer passes; more never does.
     #[test]
     fn mig_slices_are_counted_against_nvidia_smi_l() {
         use Status::*;
@@ -2677,7 +2687,7 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         // (label, output, status, detail)
         let cases: &[(&str, &str, Status, &str)] = &[
             ("2 slices, 1 parent row", &two_slices, Pass, "2 (matches nvidia-smi's 2 MIG slice(s))"),
-            ("2 slices, torch sees 1", &one_seen, Fail, "torch sees 1 GPU(s), nvidia-smi 2 MIG slice(s)"),
+            ("2 slices, torch sees 1", &one_seen, Pass, "1 of nvidia-smi's 2 MIG slice(s) (CUDA shows a process one MIG slice)"),
             ("2 slices, torch sees 3", &three_seen, Fail, "torch sees 3 GPU(s), nvidia-smi 2 MIG slice(s)"),
             ("a slice, nvidia-smi can't count", &mig_unknown, Pass, "1 (MIG slice(s); nvidia-smi count unknown)"),
             // Not MIG: as before.

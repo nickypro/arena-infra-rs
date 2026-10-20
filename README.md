@@ -1016,7 +1016,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     other machine WARNs (else it FAILs as before), the driver comes from
     `/proc/driver/nvidia/version` or, failing that, torch's CUDA driver version against the CUDA
     floor (the CUDA column marks it `12.8*`), and torch's count is matched with the slices
-    `nvidia-smi -L` lists. **WARN**: download
+    `nvidia-smi -L` lists (fewer passes: CUDA may show a process just one slice). **WARN**: download
     < 2 MB/s or unreachable, < 10 GB free, host load above max(32, host CPUs), a
     maintenance window. Driver floor: `MIN_DRIVER_VERSION` (`none` = off), else derived from
     the create's CUDA floor — `MIN_CUDA_VERSION`, else the lowest of `ALLOWED_CUDA_VERSIONS`
