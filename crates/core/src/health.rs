@@ -228,6 +228,18 @@ impl DeepFacts {
         }
     }
 
+    /// torch's own proof that the GPUs work: imported, CUDA available, at least one device, and
+    /// the tensor op `ok` on every one (none missing, none failed). What stands in for
+    /// nvidia-smi when it can't answer — and nothing short of all of it: a GPU torch can't use
+    /// is exactly what nvidia-smi's FAIL would have been about.
+    fn torch_proves_gpus(&self) -> bool {
+        let Some(n) = self.device_count.filter(|&n| n > 0) else { return false };
+        self.torch.as_deref() == Some("ok")
+            && self.cuda_available == Some(true)
+            && (0..n).all(|i| self.tensor.get(&i).is_some_and(|r| r == "ok"))
+            && self.tensor.values().all(|r| r == "ok")
+    }
+
     /// GPUs as the machine sees them — `2×RTX A4000`, `1×A100 80GB PCIe+1×H100` for a
     /// mixed box — else torch's count (`2×GPU`), else `-`. A MIG slice is labelled as the
     /// slice (finding #24): the provider's name for it when known (`1×B300 MIG 34GB`), else
@@ -462,6 +474,10 @@ pub struct DriverFloor {
     /// Dotted version, e.g. `[580]` or `[580, 65, 6]`; compared component-wise.
     pub version: Vec<u32>,
     pub why: String,
+    /// The host CUDA version the floor was derived from (`13.0`; `None` for an explicit
+    /// `MIN_DRIVER_VERSION`): what the CUDA version torch says the driver supports is held to
+    /// when no driver version is known (nvidia-smi can't run, no `/proc/driver/nvidia/version`).
+    pub cuda: Option<String>,
 }
 
 /// What [`evaluate`] judges against. Fleet-wide (built once from config); the per-pod
@@ -512,7 +528,7 @@ impl HealthPolicy {
             let version = parse_version(raw).ok_or_else(|| {
                 Error::Config(format!("MIN_DRIVER_VERSION={raw:?} is not a driver version like 580 or 580.65.06"))
             })?;
-            policy.min_driver = Some(DriverFloor { version, why: "MIN_DRIVER_VERSION".into() });
+            policy.min_driver = Some(DriverFloor { version, why: "MIN_DRIVER_VERSION".into(), cuda: None });
             return Ok(policy);
         }
         // The same host CUDA floor creates ask for (`crate::pod::cuda_from_config`: the
@@ -571,7 +587,17 @@ pub fn driver_floor_for_cuda(versions: &[&str]) -> Option<DriverFloor> {
         .iter()
         .filter_map(|v| floor(v).map(|d| (d, *v)))
         .min_by_key(|(d, _)| *d)
-        .map(|(d, v)| DriverFloor { version: vec![d], why: format!("CUDA {v}") })
+        .map(|(d, v)| DriverFloor { version: vec![d], why: format!("CUDA {v}"), cuda: Some(v.trim().to_string()) })
+}
+
+/// The CUDA version a driver must support to meet the floor derived from host CUDA `cuda`
+/// ([`driver_floor_for_cuda`]): `cuda` itself (`12.4` → `[12, 4]`), except that any 13.x needs
+/// only a 13.0 driver — the minor-version compatibility that maps every 13.x to the 580
+/// branch there, so the two ways of judging the driver agree. `None` if `cuda` isn't a version.
+fn driver_cuda_needed(cuda: &str) -> Option<Vec<u32>> {
+    let v = parse_version(cuda)?;
+    let major = v[0];
+    Some(if major >= 13 { vec![major, 0] } else { vec![major, v.get(1).copied().unwrap_or(0)] })
 }
 
 /// `"580.65.06"` → `[580, 65, 6]`; `None` unless every dot-separated part is a number.
@@ -944,24 +970,64 @@ fn smi_check(f: &DeepFacts) -> Check {
     }
 }
 
+/// The driver against the floor: nvidia-smi's version, else `/proc/driver/nvidia/version`'s
+/// (said so), else [`driver_check_by_cuda`].
 fn driver_check(f: &DeepFacts, p: &HealthPolicy) -> Check {
     use Status::*;
-    let Some(driver) = f.smi_driver() else {
-        return match f.smi.as_deref() {
-            Some("ok") => Check::new("driver", Warn, "version not reported"),
-            _ => Check::new("driver", Skip, "needs nvidia-smi"),
-        };
+    let (driver, from) = match (f.smi_driver(), f.driver_proc.as_deref()) {
+        (Some(d), _) => (d, ""),
+        (None, Some(d)) => (d, "; from /proc/driver/nvidia/version"),
+        (None, None) => return driver_check_by_cuda(f, p),
     };
     let Some(floor) = &p.min_driver else {
-        return Check::new("driver", Skip, format!("{driver} (no minimum configured)"));
+        return Check::new("driver", Skip, format!("{driver} (no minimum configured{from})"));
     };
-    let want = floor.version.iter().map(u32::to_string).collect::<Vec<_>>().join(".");
+    let want = dotted(&floor.version);
     let have = parse_version(driver).unwrap_or_default();
     if cmp_versions(&have, &floor.version).is_lt() {
-        Check::new("driver", Fail, format!("{driver} < {want} ({} needs ≥ {want})", floor.why))
+        Check::new("driver", Fail, format!("{driver} < {want} ({} needs ≥ {want}{from})", floor.why))
     } else {
-        Check::new("driver", Pass, format!("{driver} ≥ {want} ({})", floor.why))
+        Check::new("driver", Pass, format!("{driver} ≥ {want} ({}{from})", floor.why))
     }
+}
+
+/// No driver version anywhere: judge the CUDA version torch says the driver supports against
+/// the CUDA floor the minimum was derived from ([`driver_cuda_needed`]). An explicit
+/// `MIN_DRIVER_VERSION` can't be judged that way (a CUDA version only bounds the driver
+/// branch), nor can anything without torch's reading: today's WARN, or a Skip where the
+/// nvidia-smi check FAILs anyway.
+fn driver_check_by_cuda(f: &DeepFacts, p: &HealthPolicy) -> Check {
+    use Status::*;
+    let smi_ok = f.smi.as_deref() == Some("ok");
+    let via = if smi_ok { "via torch; nvidia-smi gave no driver version" } else { "via torch; nvidia-smi unavailable" };
+    if let Some(have) = f.torch_driver_cuda.as_deref() {
+        let Some(floor) = &p.min_driver else {
+            return Check::new("driver", Skip, format!("driver supports CUDA {have} (no minimum configured; {via})"));
+        };
+        if let (Some(need), Some(got)) = (floor.cuda.as_deref().and_then(driver_cuda_needed), parse_version(have)) {
+            let need_s = dotted(&need);
+            return if cmp_versions(&got, &need).is_lt() {
+                Check::new("driver", Fail, format!("driver supports CUDA {have} < {need_s} (needed for {}; {via})", floor.why))
+            } else {
+                Check::new("driver", Pass, format!("driver supports CUDA {have} ≥ {need_s} ({via})"))
+            };
+        }
+    }
+    if smi_ok || f.torch_proves_gpus() {
+        let torch = f
+            .torch_driver_cuda
+            .as_deref()
+            .map(|c| format!(" (torch: the driver supports CUDA {c}, which can't be held to MIN_DRIVER_VERSION)"))
+            .unwrap_or_default();
+        Check::new("driver", Warn, format!("version not reported{torch}"))
+    } else {
+        Check::new("driver", Skip, "needs nvidia-smi")
+    }
+}
+
+/// `[580, 65, 6]` → `580.65.6`.
+fn dotted(v: &[u32]) -> String {
+    v.iter().map(u32::to_string).collect::<Vec<_>>().join(".")
 }
 
 /// Device count, per-GPU tensor op, peer copies and NCCL — only once CUDA is available.
@@ -1632,7 +1698,9 @@ deep_check_end=1
     fn driver_floor_derives_from_config() {
         let cfg = |text: &str| Config::parse(text);
         let floor = |text: &str| HealthPolicy::from_config(&cfg(text)).unwrap().min_driver;
-        let v = |d: u32, why: &str| Some(DriverFloor { version: vec![d], why: why.into() });
+        let v = |d: u32, why: &str| {
+            Some(DriverFloor { version: vec![d], why: why.into(), cuda: why.strip_prefix("CUDA ").map(String::from) })
+        };
         let cases: &[(&str, Option<DriverFloor>)] = &[
             ("ALLOWED_CUDA_VERSIONS=\"13.0\"", v(580, "CUDA 13.0")),
             ("ALLOWED_CUDA_VERSIONS=13.1", v(580, "CUDA 13.1")),
@@ -1648,6 +1716,7 @@ deep_check_end=1
             ("MIN_DRIVER_VERSION=575.51.03\nALLOWED_CUDA_VERSIONS=13.0", Some(DriverFloor {
                 version: vec![575, 51, 3],
                 why: "MIN_DRIVER_VERSION".into(),
+                cuda: None,
             })),
             ("MIN_DRIVER_VERSION=none\nALLOWED_CUDA_VERSIONS=13.0", None),
             ("MIN_DRIVER_VERSION=\nALLOWED_CUDA_VERSIONS=13.0", v(580, "CUDA 13.0")),
@@ -1671,7 +1740,7 @@ deep_check_end=1
             assert!(err.contains("isn't a CUDA version like 13.0") && err.contains("MIN_DRIVER_VERSION"), "{text}: {err}");
         }
         // An explicit driver floor doesn't need one.
-        assert_eq!(floor("MIN_DRIVER_VERSION=580\nALLOWED_CUDA_VERSIONS=x"), Some(DriverFloor { version: vec![580], why: "MIN_DRIVER_VERSION".into() }));
+        assert_eq!(floor("MIN_DRIVER_VERSION=580\nALLOWED_CUDA_VERSIONS=x"), Some(DriverFloor { version: vec![580], why: "MIN_DRIVER_VERSION".into(), cuda: None }));
     }
 
     #[test]
@@ -2422,6 +2491,66 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         // An older script prints none of it.
         let f = parse_deep(HEALTHY_2GPU);
         assert_eq!((f.driver_proc, f.torch_driver_cuda, f.torch_gpus.len()), (None, None, 0));
+    }
+
+    /// No driver version from nvidia-smi: `/proc/driver/nvidia/version`'s, judged the same way;
+    /// else the CUDA version torch says the driver supports, against the CUDA floor the minimum
+    /// was derived from; else as before.
+    #[test]
+    fn the_driver_falls_back_on_proc_then_on_torchs_cuda() {
+        use Status::*;
+        let down = smi_down("error: Failed to initialize NVML: Insufficient Permissions", A100_SLICE);
+        let proc_only = |v: &str| edit(&down, &[("driver_proc", Some(v)), ("torch_driver_cuda", None)]);
+        let torch_only = |v: &str| edit(&down, &[("driver_proc", Some("missing")), ("torch_driver_cuda", Some(v))]);
+        let neither = edit(&down, &[("driver_proc", Some("missing")), ("torch_driver_cuda", None)]);
+        // nvidia-smi answers, but with no driver version: its own placeholders.
+        let smi_no_version = edit(
+            HEALTHY_2GPU,
+            &[("gpu.0.driver", Some("[N/A]")), ("gpu.1.driver", Some("[N/A]")), ("torch_driver_cuda", Some("12.8"))],
+        );
+        let floor = |cuda: &str| HealthPolicy { min_driver: driver_floor_for_cuda(&[cuda]), ..Default::default() };
+        let explicit = HealthPolicy {
+            min_driver: Some(DriverFloor { version: vec![550], why: "MIN_DRIVER_VERSION".into(), cuda: None }),
+            ..Default::default()
+        };
+        let none = HealthPolicy::default();
+        let (c124, c13, c131) = (cuda124(), cuda13(), floor("13.1"));
+        // (label, output, policy, status, detail)
+        let cases: Vec<(&str, String, &HealthPolicy, Status, &str)> = vec![
+            ("/proc ≥ floor", proc_only("570.86.15"), &c124, Pass, "570.86.15 ≥ 550 (CUDA 12.4; from /proc/driver/nvidia/version)"),
+            ("/proc < floor", proc_only("535.129.03"), &c13, Fail, "535.129.03 < 580 (CUDA 13.0 needs ≥ 580; from /proc/driver/nvidia/version)"),
+            ("/proc, no floor", proc_only("570.86.15"), &none, Skip, "570.86.15 (no minimum configured; from /proc/driver/nvidia/version)"),
+            ("/proc vs an explicit floor", proc_only("545.23.08"), &explicit, Fail, "545.23.08 < 550 (MIN_DRIVER_VERSION needs ≥ 550; from /proc/driver/nvidia/version)"),
+            ("nvidia-smi's beats /proc's", edit(HEALTHY_2GPU, &[("driver_proc", Some("535.129.03"))]), &c13, Pass, "580.65.06 ≥ 580 (CUDA 13.0)"),
+            ("torch's CUDA ≥ floor", torch_only("12.8"), &c124, Pass, "driver supports CUDA 12.8 ≥ 12.4 (via torch; nvidia-smi unavailable)"),
+            ("torch's CUDA = floor", torch_only("12.4"), &c124, Pass, "driver supports CUDA 12.4 ≥ 12.4 (via torch; nvidia-smi unavailable)"),
+            ("torch's CUDA < floor", torch_only("12.2"), &c124, Fail, "driver supports CUDA 12.2 < 12.4 (needed for CUDA 12.4; via torch; nvidia-smi unavailable)"),
+            ("torch's CUDA < a 13 floor", torch_only("12.9"), &c13, Fail, "driver supports CUDA 12.9 < 13.0 (needed for CUDA 13.0; via torch"),
+            // Any 13.x runs on a 13.0 driver (the 580 branch), as the version check says.
+            ("13.0 driver, 13.1 floor", torch_only("13.0"), &c131, Pass, "driver supports CUDA 13.0 ≥ 13.0 (via torch; nvidia-smi unavailable)"),
+            ("13.2 driver, 13.0 floor", torch_only("13.2"), &c13, Pass, "driver supports CUDA 13.2 ≥ 13.0"),
+            ("torch's CUDA, no floor", torch_only("12.8"), &none, Skip, "driver supports CUDA 12.8 (no minimum configured; via torch; nvidia-smi unavailable)"),
+            ("torch's CUDA vs an explicit floor", torch_only("12.8"), &explicit, Warn, "version not reported (torch: the driver supports CUDA 12.8"),
+            ("nvidia-smi's [N/A]: torch's CUDA", smi_no_version, &c124, Pass, "driver supports CUDA 12.8 ≥ 12.4 (via torch; nvidia-smi gave no driver version)"),
+            ("neither, torch proves the GPUs", neither.clone(), &c124, Warn, "version not reported"),
+            (
+                "neither, no proof",
+                edit(&neither, &[("tensor.0", Some("error: RuntimeError: CUDA error: unknown error"))]),
+                &c124,
+                Skip,
+                "needs nvidia-smi",
+            ),
+        ];
+        for (label, out, policy, status, detail) in cases {
+            let c = check(&evaluate(&parse_deep(&out), policy, None), "driver").clone();
+            assert_eq!(c.status, status, "{label}: {c:?}");
+            assert!(c.detail.contains(detail), "{label}: {:?} lacks {detail:?}", c.detail);
+        }
+        // The floor remembers the CUDA it came from (none for an explicit one).
+        assert_eq!(cuda124().min_driver.unwrap().cuda.as_deref(), Some("12.4"));
+        assert_eq!(driver_cuda_needed("13.1"), Some(vec![13, 0]));
+        assert_eq!(driver_cuda_needed("12.8"), Some(vec![12, 8]));
+        assert_eq!(driver_cuda_needed("x"), None);
     }
 
     /// Labels and the table's columns where nvidia-smi can't name the GPUs: torch's names

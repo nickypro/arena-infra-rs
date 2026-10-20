@@ -1637,7 +1637,7 @@ mod tests {
     fn only_definite_machine_evidence_is_remembered() {
         let p = Pod { machine_id: Some("m8x2k".into()), ..at(pod("devtest-apple", "runpod", "rp1"), "70.167.32.130", 40100) };
         let floor_590 = crate::health::HealthPolicy {
-            min_driver: Some(crate::health::DriverFloor { version: vec![590], why: "CUDA 13.1".into() }),
+            min_driver: Some(crate::health::DriverFloor { version: vec![590], why: "CUDA 13.1".into(), cuda: Some("13.1".into()) }),
             ..crate::health::HealthPolicy::default()
         };
         let default = crate::health::HealthPolicy::default();
