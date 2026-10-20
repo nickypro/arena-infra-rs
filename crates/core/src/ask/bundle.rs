@@ -68,9 +68,10 @@ fn sq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The one remote command for a pod's bundle (see the module doc). `GIT_OPTIONAL_LOCKS=0` first,
-/// so not even the metrics probe's `git status` refreshes (writes) the index or takes its lock
-/// under a participant's git. The extra probe goes base64 (no quoting of its own) under `env -i`
+/// The one remote command for a pod's bundle (see the module doc). `GIT_OPTIONAL_LOCKS=0` first:
+/// the metrics probe's own `git status` already passes `--no-optional-locks`, and this keeps any
+/// other git in the call from refreshing (writing) the index or taking its lock under a
+/// participant's git too (the extra probe, under `env -i`, sets its own). The extra probe goes base64 (no quoting of its own) under `env -i`
 /// with a fixed `PATH` — nothing from the pod's environment but `HOME` — as POSIX `sh`, like the
 /// reaper's probe; `repo` is quoted, never spliced into the script.
 pub fn probe_command(opts: &ProbeOpts, repo: &str) -> String {
@@ -123,8 +124,9 @@ pub struct Repo {
     /// Its real path (through a symlink: on the `/workspace` volume?).
     pub real: Option<String>,
     pub branch: Option<String>,
-    /// An operation in progress (`merge`, `merge unmerged`, `cherry-pick`, `revert`,
-    /// `conflicts`, `rebase`, `bisect`); `Some("")` = none, `None` = unknown.
+    /// An operation in progress: the backup's `busy_op` line (one of
+    /// [`crate::backup::BUSY_WORDS`], then ` unmerged` while conflicts are unresolved), else
+    /// `rebase` or `bisect`; `Some("")` = none, `None` = unknown.
     pub op: Option<String>,
     pub modified: Option<u32>,
     pub untracked: Option<u32>,
@@ -392,6 +394,13 @@ pub struct Local {
     pub backups: Option<String>,
     /// The branch today's backups go to, for a cohort pod when the start date is known.
     pub expected_branch: Option<String>,
+    /// The backup's record of its last copy of the pod while an operation was in progress on it
+    /// (`busy-copies.json`), rendered, masked — or that the record can't be read. `None`: none
+    /// recorded.
+    pub busy_copy: Option<String>,
+    /// `BUSY_AUTO_RESOLVE_HOURS` in words: whether, and after how long, `pods backup` finishes an
+    /// operation left in progress (`None`: unknown).
+    pub auto_finish: Option<String>,
 }
 
 /// `3h12m`, `2d4h`, `45s`.
@@ -413,7 +422,7 @@ fn df_text(d: &Df) -> String {
     format!("{} of {} used ({pct}%)", gib(d.used_kb), gib(d.total_kb))
 }
 
-const UNKNOWN: &str = "unknown";
+pub(super) const UNKNOWN: &str = "unknown";
 
 fn yes_no(b: Option<bool>) -> &'static str {
     match b {
@@ -532,6 +541,9 @@ fn local_lines(local: &Local) -> Vec<String> {
     let mut v = vec![format!("last deep check (`pods test --deep`): {}", local.health.as_deref().unwrap_or("never run from here"))];
     if let Some(b) = &local.backups {
         v.push(format!("local file backups (`pods pull`): {b}"));
+    }
+    if let Some(b) = &local.busy_copy {
+        v.push(format!("backup's copies while BUSY (`busy-copies.json`): {b}"));
     }
     if let Some(b) = &local.expected_branch {
         v.push(format!("today's backup branch would be: {}", redact::name(b, NAME_MAX)));
@@ -690,7 +702,35 @@ fn pod_now(x: Option<&Extra>) -> Option<u64> {
     u64::try_from(days).ok().map(|d| d * 86_400 + h * 3_600 + mi * 60 + se)
 }
 
-fn repo_blocks(repo_path: &str, m: Option<&PodMetrics>, x: Option<&Extra>, now: u64) -> Vec<Block> {
+/// What an operation in progress (`op`: the probe's `busy_op` line) means for the pod's backup:
+/// BUSY — nothing committed or pushed, its files copied to this machine instead — how the
+/// participant ends it (the backup's own words), and whether `pods backup` would finish it once
+/// left alone (`BUSY_AUTO_RESOLVE_HOURS`: a merge, a single cherry-pick or a stash pop's
+/// conflicts, never the rest). `None` for no operation, or one the backup doesn't stop for
+/// (`bisect`). Pure.
+fn busy_line(op: &str, branch: &str, local: &Local) -> Option<String> {
+    let mut words = op.split_whitespace();
+    let what = words.next()?;
+    let unmerged = words.next() == Some("unmerged");
+    if !crate::backup::BUSY_WORDS.contains(&what) {
+        return None;
+    }
+    let noun = crate::backup::busy_noun(what);
+    let finish = if crate::resolve::finishes(what) {
+        format!("auto-finish by `pods backup` (BUSY_AUTO_RESOLVE_HOURS): {}", local.auto_finish.as_deref().map_or(UNKNOWN.to_string(), |w| redact::name(w, LINE_MAX)))
+    } else {
+        format!("`pods backup` never finishes {noun} on its own")
+    };
+    let recorded = if local.busy_copy.is_none() { " · no copy of it recorded here yet" } else { "" };
+    Some(format!(
+        "    backup: BUSY — {}, so the git backup commits and pushes nothing (the pod's files are copied to this machine \
+         instead) · the participant ends it: {} · {finish}{recorded}",
+        crate::backup::busy_situation(what, branch),
+        crate::backup::busy_advice(what, unmerged)
+    ))
+}
+
+fn repo_blocks(repo_path: &str, m: Option<&PodMetrics>, x: Option<&Extra>, local: &Local, now: u64) -> Vec<Block> {
     let path = redact::name(repo_path, NAME_MAX);
     let origin = m.and_then(|m| m.origin.as_deref()).map_or(UNKNOWN.to_string(), |o| redact::text(o, NAME_MAX));
     let sync = match m.map(|m| (m.ahead, m.behind)) {
@@ -727,6 +767,7 @@ fn repo_blocks(repo_path: &str, m: Option<&PodMetrics>, x: Option<&Extra>, now: 
         count(repo.untracked),
         count(repo.stashes)
     ));
+    head.extend(repo.op.as_deref().and_then(|op| busy_line(op, &branch, local)));
     head.push(match &repo.last {
         Some((t, subject)) => format!("    last commit {} ago: {}", age(now.saturating_sub(*t)), redact::text(subject, NAME_MAX)),
         None => format!("    last commit: {UNKNOWN}"),
@@ -854,7 +895,7 @@ pub fn render(pod: &Pod, look: &Look, local: &Local, repo_path: &str, now: u64, 
     // Ages of commits run on the pod's clock when there is one (a skewed control box
     // shouldn't make a fresh commit look old).
     let clock = pod_now(x).unwrap_or(now);
-    blocks.extend(repo_blocks(repo_path, m, x, clock));
+    blocks.extend(repo_blocks(repo_path, m, x, local, clock));
     blocks.push(procs_block(x));
     blocks.extend(jobs_blocks(reply));
     fit(blocks, cap)
@@ -929,6 +970,8 @@ mod tests {
             health: Some("pass 12m ago".into()),
             backups: Some("snapshots w1d2, w1d1 (newest first); all-files mirror: yes".into()),
             expected_branch: Some("autocommit-devtest-w1d2-alpha".into()),
+            busy_copy: Some("last whole copy while BUSY with a merge: taken 40m ago, snapshot w1d2/devtest-alpha, still on this machine".into()),
+            auto_finish: Some("after 3h with nothing changed (default)".into()),
         }
     }
 
@@ -963,6 +1006,12 @@ mod tests {
             "repo /root/ARENA_materials (really /workspace/ARENA_materials): branch autocommit-devtest-w1d2-alpha · upstream origin/autocommit-devtest-w1d2-alpha",
             "2 commit(s) not pushed, 0 behind its upstream",
             "working tree: 2 modified/staged, 1 untracked · operation in progress: merge unmerged · stashes 1",
+            "\n    backup: BUSY — a merge is in progress on autocommit-devtest-w1d2-alpha, so the git backup commits and pushes \
+             nothing (the pod's files are copied to this machine instead) · the participant ends it: resolve the conflicts and \
+             `git add` them, then `git commit` — or abort it (`git merge --abort`) · auto-finish by `pods backup` \
+             (BUSY_AUTO_RESOLVE_HOURS): after 3h with nothing changed (default)\n",
+            "backup's copies while BUSY (`busy-copies.json`): last whole copy while BUSY with a merge: taken 40m ago, snapshot \
+             w1d2/devtest-alpha, still on this machine\n",
             "last commit 2h13m ago: Merge branch main",
             "    UU chapter1/solutions.py",
             "    .M chapter1/part4_interp_on_algorithmic_model.ipynb",
@@ -1069,6 +1118,38 @@ mod tests {
         assert!(tiny.len() <= 700 && tiny.ends_with("[… bundle cut to its size cap]\n"), "{tiny}");
     }
 
+    /// What an operation in progress means for the backup, per `busy_op` word: BUSY, how the
+    /// participant ends it, and whether `pods backup` finishes it on its own (a merge, a single
+    /// cherry-pick, a stash pop's conflicts — never `git am`, a rebase, a revert or a sequence);
+    /// no line for no operation or one the backup doesn't stop for (bisect); "no copy recorded"
+    /// only when the record says so, the setting `unknown` when it isn't known.
+    #[test]
+    fn an_operation_in_progress_says_the_backup_is_busy_and_how_it_ends() {
+        let l = local();
+        let line = |op: &str| busy_line(op, "b", &l);
+        for (op, situation, ends, finish) in [
+            ("merge", "a merge is in progress on b", "finish it (`git commit`) or abort it (`git merge --abort`)", true),
+            ("cherry-pick unmerged", "a cherry-pick is in progress on b", "resolve the conflicts and `git add` them, then `git cherry-pick --continue`", true),
+            ("conflicts", "b has unresolved conflicts", "resolve them and `git add` them, or undo them (`git reset --merge`)", true),
+            ("revert", "a revert is in progress on b", "`git revert --abort`", false),
+            ("am", "a `git am` is in progress on b", "`git am --continue`", false),
+            ("rebase unmerged", "a rebase is in progress on b", "`git rebase --continue`", false),
+            ("sequence", "a cherry-pick or revert sequence is in progress on b", "`git revert --continue` for a revert", false),
+        ] {
+            let got = line(op).unwrap_or_else(|| panic!("{op}: no line"));
+            assert!(got.starts_with(&format!("    backup: BUSY — {situation}, so the git backup commits and pushes nothing")), "{op}: {got}");
+            assert!(got.contains(ends), "{op}: {got}");
+            assert_eq!(got.contains("auto-finish by `pods backup` (BUSY_AUTO_RESOLVE_HOURS): after 3h"), finish, "{op}: {got}");
+            assert_eq!(got.contains("`pods backup` never finishes"), !finish, "{op}: {got}");
+            assert!(!got.contains("no copy of it recorded"), "{op}: the record has one: {got}");
+        }
+        for op in ["", "bisect", "garbage words"] {
+            assert_eq!(line(op), None, "{op:?}");
+        }
+        let bare = busy_line("merge unmerged", "b", &Local::default()).unwrap();
+        assert!(bare.ends_with("· auto-finish by `pods backup` (BUSY_AUTO_RESOLVE_HOURS): unknown · no copy of it recorded here yet"), "{bare}");
+    }
+
     #[test]
     fn an_unreachable_or_stopped_pod_is_its_listing_and_why() {
         let mut p = pod();
@@ -1166,6 +1247,12 @@ mod tests {
         assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), index, "the probe wrote the index");
         let text = render(&pod(), &Look::Probed(Box::new(r)), &Local::default(), &repo.display().to_string(), NOW, BUNDLE_CAP);
         assert!(text.contains("reached: yes\n") && text.contains("operation in progress: merge"), "{text}");
+        // The backup's own `busy_op`, for real: BUSY, and how this merge (nothing unmerged) ends.
+        assert!(
+            text.contains("backup: BUSY — a merge is in progress on autocommit-devtest-w1d2-alpha, so the git backup commits")
+                && text.contains("the participant ends it: finish it (`git commit`) or abort it (`git merge --abort`)"),
+            "{text}"
+        );
     }
 
     #[test]
