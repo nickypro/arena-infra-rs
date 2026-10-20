@@ -27,8 +27,9 @@
 #                              conflicts aren't resolved and added yet: nothing staged, committed or
 #                              pushed, so it stays resumable and abortable (exit 6)
 #   REDACTED <n> <path>        a file committed with its n key(s) redacted; the file on disk keeps them
-#   REDACTED_HISTORY <n> <old> <new>  a key in older unpushed commits (an earlier backup's, or one the
-#                              participant made): those n commits rewritten redacted, pushed as a fast-forward
+#   REDACTED_HISTORY <n> <old> <new>  a key in older unpushed commits, in a file or a commit message (an
+#                              earlier backup's, or one the participant made): those n commits rewritten
+#                              redacted, pushed as a fast-forward
 #   HEAL_ABORTED <why>         that rewrite stopped short (the branch moved meanwhile): the next run ends it (exit 1)
 #   PUSH_BLOCKED <reason>      GitHub's push protection still refuses the push — a secret the redaction
 #                              doesn't know; the reason names GitHub's secret type and path:line (exit 4)
@@ -350,24 +351,34 @@ push_block_reason() {
 # fast-forward (never forced), and only then does the branch move — compare-and-swap, so a
 # commit made meanwhile is never lost: the run stops there (HEAL_ABORTED), and the next one redoes
 # the same rewrite (same ids: a fast-forward of what was pushed) with that commit on top.
+# A key in a commit's *message* goes out the same way (review codex #1: `git commit -m '<a key>'`
+# with clean files had nothing to redact, so the message went to GitHub as it was, and a rewrite
+# for a file's key copied its message unchanged). So the same commits' objects are scanned too
+# (one more `cat-file --batch | grep -q`), and on a hit the rewrite runs: each commit's message
+# goes through the same sed as the files, and one whose message changes is rewritten — so are its
+# descendants (their parents change). A hit outside every message (a key in an author's name) is
+# no message's: the rewrite then changes nothing, every id kept. A rewrite for a file's key
+# redacts the messages of the commits it writes the same way.
+git rev-list --reverse --topo-order "$TIP" --not --remotes=origin > "$T.commits"
 git rev-list --objects "$TIP" --not --remotes=origin | git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' \
     | awk '$1 == "blob" { print $2 }' | sort -u > "$T.blobs"
-: > "$T.hmap"
-if [ -s "$T.blobs" ]; then
-    # A failed cat-file must not read as "no key": the grep then saw only part of the blobs.
+# `scan_hits <list of objects>`: 0 when one of them holds a key, 1 when none does. A failed
+# cat-file must not read as "no key" (the grep then saw only part of them): it stops the run.
+scan_hits() {
     rm -f "$T.catfail"
-    { git cat-file --batch < "$T.blobs" || : > "$T.catfail"; } | LC_ALL=C grep -aqE -- "$SECRET_RE" && K=0 || K=$?
-    if [ "$K" = 1 ] && [ -e "$T.catfail" ]; then K=2; fi
-    if [ "$K" -gt 1 ]; then echo "arena backup: scanning the outgoing commits for keys failed - nothing pushed" >&2; exit 2; fi
-    if [ "$K" = 0 ]; then
-        while read -r b; do redact_blob "$b"; done < "$T.blobs" > "$T.hmap"
-    fi
+    { git cat-file --batch < "$1" || : > "$T.catfail"; } | LC_ALL=C grep -aqE -- "$SECRET_RE" && _sk=0 || _sk=$?
+    if [ "$_sk" = 1 ] && [ -e "$T.catfail" ]; then _sk=2; fi
+    if [ "$_sk" -gt 1 ]; then echo "arena backup: scanning the outgoing commits for keys failed - nothing pushed" >&2; exit 2; fi
+    return "$_sk"
+}
+: > "$T.hmap"
+if [ -s "$T.blobs" ] && scan_hits "$T.blobs"; then
+    while read -r b; do redact_blob "$b"; done < "$T.blobs" > "$T.hmap"
 fi
 : > "$T.cmap"
 N=0
 NEW=$TIP
-if [ -s "$T.hmap" ]; then
-    git rev-list --reverse --topo-order "$TIP" --not --remotes=origin > "$T.commits"
+if [ -s "$T.hmap" ] || { [ -s "$T.commits" ] && scan_hits "$T.commits"; }; then
     while read -r c; do
         ps=
         same=1
@@ -382,9 +393,18 @@ if [ -s "$T.hmap" ]; then
         GIT_INDEX_FILE="$T.idx" git read-tree "$t"
         redact_index "$T.hmap" "$T.idx" > "$T.changed"
         if [ -s "$T.changed" ]; then nt=$(GIT_INDEX_FILE="$T.idx" git write-tree); fi
+        # Its message, each step its own command under `set -e`: a cat-file that fails stops the
+        # run, never reads as an empty message.
+        git cat-file commit "$c" > "$T.obj"
+        sed '1,/^$/d' "$T.obj" > "$T.msg"
+        mk=
+        if key_in_file "$T.msg"; then
+            LC_ALL=C sed -E "$REDACT_SED" "$T.msg" > "$T.rmsg"
+            mv -f "$T.rmsg" "$T.msg"
+            mk=1
+        fi
         n=$c
-        if [ "$nt" != "$t" ] || [ -z "$same" ]; then
-            git cat-file commit "$c" | sed '1,/^$/d' > "$T.msg"
+        if [ "$nt" != "$t" ] || [ -z "$same" ] || [ -n "$mk" ]; then
             git log -1 --no-show-signature --date=raw --format='%an%n%ae%n%ad%n%cn%n%ce%n%cd' "$c" > "$T.who"
             { IFS= read -r an; IFS= read -r ae; IFS= read -r ad; IFS= read -r cn; IFS= read -r ce; IFS= read -r cdate; } < "$T.who"
             n=$(GIT_AUTHOR_NAME=$an GIT_AUTHOR_EMAIL=$ae GIT_AUTHOR_DATE=$ad GIT_COMMITTER_NAME=$cn GIT_COMMITTER_EMAIL=$ce \

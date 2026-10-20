@@ -633,11 +633,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (`arena_core::backup::SECRET_PATTERNS`: OpenRouter, Anthropic, OpenAI, Hugging Face, GitHub,
     AWS) and committed with each key replaced by `REDACTED-…` — in git only: the file on disk
     keeps the key (the code still runs) and shows as modified; reported per pod (`redacted N
-    pasted key(s) in …`). **Unpushed commits holding a key** — an older backup's, or one the
-    participant made by hand — are rewritten before the push, whatever GitHub would do: just
-    those commits (none origin has — one only the course's `upstream` has, its `main` merged in,
-    is scanned too: origin never had it), the key redacted — same messages, authors, dates — and
-    pushed as a fast-forward, never forced; files on disk untouched. **The course's own commits
+    pasted key(s) in …`). **Unpushed commits holding a key** — in a file or in the commit
+    message; an older backup's, or one the participant made by hand — are rewritten before the
+    push, whatever GitHub would do: just those commits and the ones on top of them (none origin
+    has — one only the course's `upstream` has, its `main` merged in, is scanned too: origin
+    never had it), the key redacted — same messages (a key in one redacted the same way), authors,
+    dates — and pushed as a fast-forward, never forced; files on disk untouched. **The course's own commits
     get no exemption** (FIX8): every exemption tried (FIX4B to FIX7) trusted something a pod could
     get wrong, and Live 7 found no key-like string in the real course's 2187 commits. What that
     leaves: if the course ever commits a key-like string, each pod that merges it pushes those

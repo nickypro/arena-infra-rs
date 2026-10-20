@@ -13,8 +13,9 @@
 //! The image's nested clones are adopted instead — the course repo tracks their files where they
 //! are, their own `.git` untouched — once; other nested repos are kept out and reported. A file
 //! holding a key is committed with the key redacted, the file on disk untouched; and unpushed
-//! commits holding one (an older backup's, or the participant's own) are rewritten redacted before
-//! the push, which goes out as a fast-forward. The script is [`backup_script`].
+//! commits holding one, in a file or in their message (an older backup's, or the participant's
+//! own), are rewritten redacted before the push, which goes out as a fast-forward. The script is
+//! [`backup_script`].
 //!
 //! Before any of that, a checkout whose `origin` isn't the configured repo ([`configured_repo`])
 //! is refused: nothing committed, nothing pushed, `WRONG_ORIGIN` said
@@ -2633,6 +2634,70 @@ done
         // And a clean branch costs no rewrite.
         let (code, r, _) = s.backup();
         assert_eq!((code, r.outcome, r.history), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-x".into())), None));
+    }
+
+    /// Review codex #1 (FIX9B item 1): the outgoing scan read blobs only, so a key in a commit's
+    /// message — `git commit -m '…<key>'`, the files clean — had nothing to redact and went to
+    /// GitHub as it was. Now the messages of the commits going out are scanned too: against an
+    /// origin that refuses nothing, no object there holds the key (`cat-file
+    /// --batch-all-objects`), and the local commit is rewritten — its message redacted by the
+    /// same sed as the files, its tree as it was — with its descendant on top (its parent
+    /// changed), as a fast-forward of what origin had. The next run has nothing to do.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_only_in_a_commit_message_never_leaves_the_pod() {
+        let s = GitSandbox::new("msg-key", 1_000_000);
+        let key = openrouter_key(40);
+        let pushed = s.git(&s.work, &["rev-parse", "HEAD"]);
+        s.put("notes.md", 20);
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", &format!("configure {key}"), "-m", &format!("export OPENROUTER_API_KEY={key}")]);
+        s.put("more.md", 10);
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "after it"]);
+        let old_tip = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let old_trees = s.git(&s.work, &["log", "--format=%T", &format!("{pushed}..HEAD")]);
+        let (code, out, err) = s.backup_raw();
+        let r = parse_backup_report(&out);
+        assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{out}{err}");
+        let (n, old, new) = r.history.clone().expect("rewritten");
+        assert_eq!((n, old.as_str()), (2, old_tip.as_str()), "the message's commit and the one on top of it");
+        assert!(!s.origin_holds(&key), "the key reached origin in a commit message");
+        assert!(!out.contains(&key) && !err.contains(&key), "{out}{err}");
+        // Rewritten locally, pushed exactly: the message redacted, every tree as it was, on top of
+        // what origin had.
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), new);
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]), new);
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%B", "HEAD^"]), "configure REDACTED-OPENROUTER-KEY\n\nexport OPENROUTER_API_KEY=REDACTED-OPENROUTER-KEY");
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%s", "HEAD"]), "after it");
+        assert_eq!(s.git(&s.work, &["log", "--format=%T", &format!("{pushed}..HEAD")]), old_trees);
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD~2"]), pushed);
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "");
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome, r.history), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-x".into())), None), "{err}");
+    }
+
+    /// FIX9B item 1, with a key in a file *and* a different one in the same commit's message: the
+    /// rewrite the file's key starts redacts the message too (it used to copy it as it was) —
+    /// neither key in any object on origin, both redacted in the commit.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_in_a_file_and_another_in_its_commits_message_are_both_redacted() {
+        let s = GitSandbox::new("msg-and-file-key", 1_000_000);
+        let (in_file, in_msg) = (openrouter_key(41), format!("{}{}", "hf_", body(LETTERS, 34, 42)));
+        std::fs::write(s.work.join("ex.py"), format!("k = '{in_file}'\n")).unwrap();
+        s.git(&s.work, &["add", "ex.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", &format!("login with {in_msg}")]);
+        let (code, out, err) = s.backup_raw();
+        let r = parse_backup_report(&out);
+        assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{out}{err}");
+        assert_eq!(r.history.as_ref().map(|h| h.0), Some(1), "{out}");
+        assert!(!s.origin_holds(&in_file), "the file's key reached origin");
+        assert!(!s.origin_holds(&in_msg), "the message's key reached origin");
+        assert_eq!(s.git(&s.work, &["show", "HEAD:ex.py"]), "k = 'REDACTED-OPENROUTER-KEY'");
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%B", "HEAD"]), "login with REDACTED-HUGGINGFACE-TOKEN");
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]));
+        assert_eq!(s.read("ex.py"), format!("k = '{in_file}'\n").as_bytes(), "the file on disk keeps its key");
     }
 
     /// Review: `redact_blob` failed open — a grep that couldn't run read as "no key", and a sed
