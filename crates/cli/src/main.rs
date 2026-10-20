@@ -1129,7 +1129,7 @@ enum PodCmd {
     /// only. No targets (or --all) = this cohort's reachable pods (`<prefix>-*`, not @ staff
     /// entries); name a staff box to include it, or --include-non-cohort for every pod.
     /// A pod mid-merge is copied instead; one left alone BUSY_AUTO_RESOLVE_HOURS (3) is
-    /// finished by the newer side, then backed up.
+    /// finished, per file and hunk by the side changed last, then backed up.
     #[command(verbatim_doc_comment)]
     Backup {
         /// Only do the git push; skip the rsync file backup.
