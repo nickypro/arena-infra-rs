@@ -190,6 +190,49 @@ pub enum Git {
     Repo(Repo),
 }
 
+/// How a login came in, by `who`'s comment (never what the comment names: the host it came
+/// from).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    /// From afar — an address or a host name: an SSH session.
+    Ssh,
+    /// A tmux pane (`(tmux(<pid>).%<n>)`): a terminal inside the pod, not a session from outside.
+    Tmux,
+    /// The console or a local display (no comment, `(:0)`).
+    Local,
+}
+
+/// One login, as `who` lists it: how it came in (`None`: a line of another shape) and the user,
+/// the tty and the time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Login {
+    pub via: Option<Via>,
+    pub line: String,
+}
+
+/// A list the probe read (`ok`, its items), couldn't (`absent`: not installed; anything else),
+/// or didn't say (`None`: unknown).
+fn listed<T>(state: Option<&str>, items: Vec<T>) -> Option<Result<Vec<T>, String>> {
+    match state {
+        Some("ok") => Some(Ok(items)),
+        Some("absent") => Some(Err("not installed".to_string())),
+        Some(_) => Some(Err("couldn't be read".to_string())),
+        None => None,
+    }
+}
+
+/// One `ARENA_ASK_WHO` line: `<via> <user> <tty> <time…>` (probe.sh's).
+fn parse_login(rest: &str) -> Login {
+    let via = match word(rest) {
+        Some(("ssh", _)) => Some(Via::Ssh),
+        Some(("tmux", _)) => Some(Via::Tmux),
+        Some(("local", _)) => Some(Via::Local),
+        _ => None,
+    };
+    let line = if via.is_some() { word(rest).map_or("", |(_, r)| r) } else { rest };
+    Login { via, line: line.trim().to_string() }
+}
+
 /// The extra probe's facts. `None` everywhere means unknown (its line was missing or odd);
 /// an `Err` says why a list couldn't be read at all.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -207,7 +250,7 @@ pub struct Extra {
     pub df_workspace: Option<Option<Df>>,
     pub home: Option<String>,
     pub home_kb: Option<u64>,
-    pub who: Option<Result<Vec<String>, String>>,
+    pub who: Option<Result<Vec<Login>, String>>,
     pub tmux: Option<Result<Vec<Tmux>, String>>,
     pub procs: Option<Result<Vec<Proc>, String>>,
     pub git: Option<Git>,
@@ -340,7 +383,7 @@ pub fn parse_extra(text: &str, nonce: &str) -> Extra {
                 None => bad_ps += 1,
             }
         } else if let Some(rest) = line.strip_prefix(t_who.as_str()) {
-            who.push(rest.trim().to_string());
+            who.push(parse_login(rest));
         } else if let Some(rest) = line.strip_prefix(t_tmux.as_str()) {
             tmux.push(parse_tmux(rest));
         } else if let Some(rest) = line.strip_prefix(t_file.as_str()) {
@@ -349,12 +392,6 @@ pub fn parse_extra(text: &str, nonce: &str) -> Extra {
     }
     let raw = |k: &str| kv.get(k).copied().flatten().map(str::trim);
     let get = |k: &str| raw(k).filter(|v| !v.is_empty() && *v != "-");
-    let list = |state: Option<&str>, items: Vec<String>| match state {
-        Some("ok") => Some(Ok(items)),
-        Some("absent") => Some(Err("not installed".to_string())),
-        Some(_) => Some(Err("couldn't be read".to_string())),
-        None => None,
-    };
     let git = match get("git") {
         None => None,
         Some("none") => Some(Git::NotSet),
@@ -402,7 +439,7 @@ pub fn parse_extra(text: &str, nonce: &str) -> Extra {
         },
         home: get("home").map(String::from),
         home_kb: get("home_kb").and_then(number),
-        who: list(get("who"), who),
+        who: listed(get("who"), who),
         tmux: match get("tmux") {
             Some("ok") => Some(Ok(tmux.into_iter().take(20).collect())),
             Some("absent") => Some(Err("not installed".to_string())),
@@ -706,11 +743,27 @@ fn sessions_line(x: Option<&Extra>, now: Option<u64>) -> String {
     let Some(x) = x else { return format!("sessions: {UNKNOWN}") };
     let who = match &x.who {
         Some(Ok(v)) if v.is_empty() => "no logins (who)".to_string(),
-        Some(Ok(v)) => format!(
-            "{} login(s) (who): {}",
-            v.len(),
-            v.iter().take(6).map(|w| redact::name(w, 60)).collect::<Vec<_>>().join("; ")
-        ),
+        Some(Ok(v)) => {
+            // Told apart (live ASK2 G4: 4 tmux panes and an SSH session read "5 logins"), never by
+            // where one came from.
+            let kinds = [(Some(Via::Ssh), "ssh login"), (Some(Via::Tmux), "tmux pane"), (Some(Via::Local), "local login"), (None, "login")];
+            let counts: Vec<String> = kinds
+                .iter()
+                .filter_map(|(via, what)| match v.iter().filter(|l| l.via == *via).count() {
+                    0 => None,
+                    1 => Some(format!("1 {what}")),
+                    n => Some(format!("{n} {what}s")),
+                })
+                .collect();
+            let via = |l: &Login| match l.via {
+                Some(Via::Ssh) => " (ssh)",
+                Some(Via::Tmux) => " (tmux)",
+                Some(Via::Local) => " (local)",
+                None => "",
+            };
+            let list: Vec<String> = v.iter().take(6).map(|l| format!("{}{}", redact::name(&l.line, 60), via(l))).collect();
+            format!("{} (who): {}", counts.join(", "), list.join("; "))
+        }
         Some(Err(why)) => format!("logins (who): {why}"),
         None => format!("logins: {UNKNOWN}"),
     };
@@ -1057,7 +1110,7 @@ pub mod fixtures {
                 "ARENA_ASK now=2026-10-19T12:00:00Z\nARENA_ASK uptime=1036800\nARENA_ASK load=1.02 0.98 0.90\nARENA_ASK cpus=16\nARENA_ASK pid1=sleep\n\
                  ARENA_ASK pid1_age=11400\nARENA_ASK nvsmi=yes\nARENA_ASK df_root=12582912 104857600 /\nARENA_ASK home=/root\n\
                  ARENA_ASK df_home=12582912 104857600 /\nARENA_ASK df_workspace=5242880 52428800 /workspace\nARENA_ASK home_kb=3355443\n\
-                 ARENA_ASK who=ok\nARENA_ASK_WHO root pts/0 2026-10-19 10:00\nARENA_ASK tmux=ok\nARENA_ASK_TMUX 2:1:1792410900:lab\n\
+                 ARENA_ASK who=ok\nARENA_ASK_WHO ssh root pts/0 2026-10-19 10:00\nARENA_ASK tmux=ok\nARENA_ASK_TMUX 2:1:1792410900:lab\n\
                  ARENA_ASK ps=ok\nARENA_ASK_PS  4242 root      98.5  6.1   7200 python train.py --epochs 3 {extra_args}\n\
                  ARENA_ASK_PS   777 root       0.0  0.0   3600 sh /root/.arena/jobs/{id}/run\n\
                  ARENA_ASK_PS  4242 root      98.5  6.1   7200 python train.py (a duplicate pid, from the by-memory list)\n\
@@ -1152,7 +1205,7 @@ mod tests {
             "processes on the GPUs: 4242 /opt/conda/envs/arena-env/bin/python (13000 MiB)",
             "disk: / 12.0 GiB of 100.0 GiB used (12%) · /workspace 5.0 GiB of 50.0 GiB used (10%) · home /root on /, holds 3.2 GiB",
             "setup: ~/.name yes · deploy key yes · API keys in the shell rc yes · HF token yes · Claude Code token no",
-            "sessions: 1 login(s) (who): root pts/0 2026-10-19 10:00 · 1 tmux session(s): lab (2 windows, attached, active 5m ago)",
+            "sessions: 1 ssh login (who): root pts/0 2026-10-19 10:00 (ssh) · 1 tmux session(s): lab (2 windows, attached, active 5m ago)",
             "repo /root/ARENA_materials (really /workspace/ARENA_materials): branch autocommit-devtest-w1d2-alpha · upstream origin/autocommit-devtest-w1d2-alpha",
             "2 commit(s) not pushed, 0 behind its upstream",
             "working tree: 2 modified/staged, 1 untracked · operation in progress: merge unmerged · stashes 1",
@@ -1420,7 +1473,7 @@ mod tests {
     fn planted_framing_is_ignored_or_makes_the_reply_malformed() {
         let [begin, jobs_m, log_m, extra_m, end] = marks();
         let real = |text: &str| {
-            for want in ["reached: yes\n", "operation in progress: merge unmerged", "1 login(s) (who): root pts/0", "1 tmux session(s): lab", "4242 root cpu 98.5%"] {
+            for want in ["reached: yes\n", "operation in progress: merge unmerged", "1 ssh login (who): root pts/0", "1 tmux session(s): lab", "4242 root cpu 98.5%"] {
                 assert!(text.contains(want), "missing {want:?} in\n{text}");
             }
         };
@@ -1706,8 +1759,10 @@ mod tests {
 
     /// probe.sh runs in the C locale: tmux 3.4 there turns each tab of its `-F` output into `_`,
     /// and `who` prints `Oct 20 15:27`. A stub tmux doing exactly that, and a stub who in both
-    /// time formats (with a source host): the sessions read whole, the logins keep their time
-    /// of day, and the source host never appears.
+    /// time formats: the sessions read whole, the logins keep their time of day. Live ASK2's
+    /// `who` (live ASK2 G4: four tmux panes and an SSH session read "5 logins"): each login is
+    /// told by its comment — a tmux pane, an SSH session (an address or a host), a local one (no
+    /// comment, `(:0)`) — and the comment itself, the host it names, never appears.
     #[cfg(target_os = "linux")]
     #[test]
     fn tmux_and_who_read_right_in_the_c_locale() {
@@ -1728,7 +1783,13 @@ mod tests {
              -e \"s/#{session_activity}/$4/g\" | tr '\\t' '_'\n\
              done",
         );
-        crate::ask::ai::fixtures::stub(&bin, "who", "printf 'root     pts/0        Oct 20 15:27 (10.1.2.3)\\nubuntu   pts/1        2026-10-20 15:30 (host.example)\\n'");
+        crate::ask::ai::fixtures::stub(
+            &bin,
+            "who",
+            "printf '%s\\n' 'root     pts/0        Oct 20 16:15 (tmux(8987).%0)' 'root     pts/1        Oct 20 16:15 (tmux(8987).%1)' \
+             'root     pts/4        Oct 20 16:15 (91.98.121.135)' 'ubuntu   pts/5        2026-10-20 15:30 (host.example)' \
+             'root     tty1         Oct 20 09:00' 'root     pts/6        Oct 20 09:01 (:0)'",
+        );
         let out = Command::new("sh")
             .arg("-c")
             .arg(probe_script())
@@ -1743,8 +1804,33 @@ mod tests {
         let x = parse_extra(&stdout, NONCE);
         let tmux = |name: &str, w, a, act| Tmux { name: name.into(), windows: Some(w), attached: Some(a), activity: Some(act) };
         assert_eq!(x.tmux, Some(Ok(vec![tmux("notes", 2, 1, 1_792_506_455), tmux("train", 1, 0, 1_792_506_400)])), "{stdout}");
-        assert_eq!(x.who, Some(Ok(vec!["root pts/0 Oct 20 15:27".to_string(), "ubuntu pts/1 2026-10-20 15:30".into()])), "{stdout}");
-        assert!(!stdout.contains("10.1.2.3") && !stdout.contains("host.example"), "{stdout}");
+        let login = |via, line: &str| Login { via: Some(via), line: line.into() };
+        assert_eq!(
+            x.who,
+            Some(Ok(vec![
+                login(Via::Tmux, "root pts/0 Oct 20 16:15"),
+                login(Via::Tmux, "root pts/1 Oct 20 16:15"),
+                login(Via::Ssh, "root pts/4 Oct 20 16:15"),
+                login(Via::Ssh, "ubuntu pts/5 2026-10-20 15:30"),
+                login(Via::Local, "root tty1 Oct 20 09:00"),
+                login(Via::Local, "root pts/6 Oct 20 09:01"),
+            ])),
+            "{stdout}"
+        );
+        for source in ["91.98", "host.example", "tmux(", "%0", "(:0)"] {
+            assert!(!stdout.contains(source), "{source} in\n{stdout}");
+        }
+        let line = sessions_line(Some(&x), None);
+        assert!(
+            line.starts_with(
+                "sessions: 2 ssh logins, 2 tmux panes, 2 local logins (who): root pts/0 Oct 20 16:15 (tmux); root pts/1 Oct 20 16:15 (tmux); \
+                 root pts/4 Oct 20 16:15 (ssh); ubuntu pts/5 2026-10-20 15:30 (ssh); root tty1 Oct 20 09:00 (local); root pts/6 Oct 20 09:01 (local) · "
+            ),
+            "{line}"
+        );
+        // The live shape: four panes and one session.
+        let live = Extra { who: Some(Ok([Via::Tmux, Via::Tmux, Via::Tmux, Via::Tmux, Via::Ssh].map(|v| login(v, "root pts/0 Oct 20 16:15")).to_vec())), ..Default::default() };
+        assert!(sessions_line(Some(&live), None).starts_with("sessions: 1 ssh login, 4 tmux panes (who): "));
         // The parse, tolerant: a count it can't read is unknown; a line of another shape is a name.
         assert_eq!(parse_tmux("2:1::lab"), Tmux { name: "lab".into(), windows: Some(2), attached: Some(1), activity: None });
         assert_eq!(parse_tmux("notes_2_1_1792506455"), Tmux { name: "notes_2_1_1792506455".into(), windows: None, attached: None, activity: None });

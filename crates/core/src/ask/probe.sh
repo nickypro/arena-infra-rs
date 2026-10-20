@@ -63,11 +63,16 @@ o home_kb "$(t 10 du -skx "$HOME" 2>/dev/null | cut -f1)"
 # --- Logins and tmux ------------------------------------------------------------------------------
 # This runs in the C locale (env -i), where `who` prints the time as `Oct 20 15:27` (one field
 # more than ISO's `2026-10-20 15:27`): every field up to the `(source)` comment is kept, never it.
+# The comment only says how the login came: `(tmux(8987).%0)` a tmux pane, `(:0)` or none a local
+# one, anything else (an address, a host) over ssh — the first word of each line, before the user.
 if command -v who >/dev/null 2>&1; then
     if w=$(t 5 who 2>/dev/null); then
         o who ok
         printf '%s\n' "$w" |
-            awk -v t="ARENA_ASK_WHO.$N" 'NF >= 2 { s = t " " $1; for (i = 2; i <= NF && i <= 6 && substr($i, 1, 1) != "("; i++) s = s " " $i; print s }' |
+            awk -v t="ARENA_ASK_WHO.$N" 'NF >= 2 {
+                via = "local"
+                for (i = 2; i <= NF; i++) if (substr($i, 1, 1) == "(") { via = substr($i, 1, 6) == "(tmux(" ? "tmux" : (substr($i, 1, 2) == "(:" ? "local" : "ssh"); break }
+                s = t " " via " " $1; for (i = 2; i <= NF && i <= 6 && substr($i, 1, 1) != "("; i++) s = s " " $i; print s }' |
             head -n 20
     else
         o who err
