@@ -1926,14 +1926,15 @@ fn the_courses_own_content_is_sized_by_githubs_limit_and_its_submodules_kept() {
     assert_eq!(r.read("w.bin"), bin(2));
 }
 
-/// Review ai-review claude #6: `unfit` read the submodules from the staged .gitmodules alone, which
-/// a .gitmodules still in conflict doesn't have — so a submodule the course added in a merge where
-/// .gitmodules conflicted too was refused as a nested repo before anything was resolved, and the
-/// pod stayed BUSY. Now, while it's in conflict, both sides' lists count: the course's newer side
-/// of the .gitmodules conflict taken, its submodule committed as a gitlink, listed.
+/// A merge that brings a submodule while .gitmodules is itself in conflict: which side's
+/// .gitmodules the commit takes — and so whether it lists the submodule — isn't known until the
+/// conflict is resolved. Reading both sides' lists (FIX7) let one through that the side taken
+/// then dropped, and the check after the changes refused it with every file staged, half done
+/// (review ai-review claude #2). So it's refused before anything is touched, said: the course adds
+/// a submodule (`lib`) and changes the line of .gitmodules the participant changed too.
 #[cfg(unix)]
 #[test]
-fn a_course_submodule_is_kept_when_its_gitmodules_conflicts_too() {
+fn a_conflicted_gitmodules_beside_a_new_submodule_is_left_busy_untouched() {
     let r = Repo::new("course-gitmodules");
     let gitmodules = |url: &str, lib: bool| {
         let mut s = format!("[submodule \"old\"]\n\tpath = old\n\turl = {url}\n");
@@ -1954,12 +1955,16 @@ fn a_course_submodule_is_kept_when_its_gitmodules_conflicts_too() {
     let conflicts = r.unmerged();
     assert!(conflicts.contains("\t.gitmodules") && !conflicts.contains("\tlib"), "{conflicts}");
     assert_eq!(r.git(&r.work, &["ls-files", "-s", "lib"]), format!("160000 {pinned} 0\tlib"), "the gitlink staged");
+    let on_disk = r.read(".gitmodules");
     r.age(4 * HOUR);
     let (code, rep, said) = r.resolve(3, &r.look());
-    assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{said}");
-    assert_eq!(taken(&rep), [(".gitmodules".to_string(), "theirs".to_string(), Taken::Hunks)], "{said}");
-    assert_eq!(r.git(&r.work, &["ls-tree", "HEAD", "lib"]), format!("160000 commit {pinned}\tlib"), "the submodule committed");
-    assert_eq!(format!("{}\n", r.committed(".gitmodules")), gitmodules("https://example.invalid/old2.git", true));
+    assert_eq!(
+        (code, rep.refused.as_deref()),
+        (Some(RESOLVE_REFUSED_EXIT), Some(".gitmodules is in conflict and the merge brings a submodule — resolve it by hand")),
+        "{said}"
+    );
+    r.untouched(&conflicts, "gitmodules");
+    assert_eq!(r.read(".gitmodules"), on_disk, "its markers as the merge left them");
 }
 
 /// What would be staged exactly as the other side has it is sized by GitHub's limit however the

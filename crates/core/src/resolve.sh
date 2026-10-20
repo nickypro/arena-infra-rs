@@ -24,11 +24,12 @@
 #     leaves the operation alone, said: never taken whole from one side instead.
 # A file over <max file bytes> (the backup's git limit) anywhere in that is never committed: left
 # alone, said — nor, for a merge or a cherry-pick (whose commit takes the whole index), any path
-# already staged: a blob over that limit, a new gitlink no submodule in .gitmodules, or a notebook
-# that isn't valid JSON (or can't be checked). What is staged exactly as the other side has it —
-# however it was resolved — is sized by <limit bytes> instead, GitHub's, which the backup sizes
-# what it pushes by: its blob goes out with the other side's commit anyway. What the participant
-# never staged is never said as theirs to unstage. The state before is kept first in
+# already staged: a blob over that limit, a new gitlink no submodule in .gitmodules (any new one
+# while .gitmodules is itself in conflict), or a notebook that isn't valid JSON (or can't be
+# checked). What is staged exactly as the other side has it — however it was resolved — is sized
+# by <limit bytes> instead, GitHub's, which the backup sizes what it pushes by: its blob goes out
+# with the other side's commit anyway. What the participant never staged is never said as theirs
+# to unstage. The state before is kept first in
 # <git dir>/arena-resolved/<UTC stamp>/ (the conflicted files as they were, git's own state files,
 # the old HEAD, the index, a README), then the state is read again — the operation and its commit,
 # HEAD, the conflicts, the index, every file — and the pod looked at again for anyone at work
@@ -238,14 +239,17 @@ unfit() {
         print substr($0, 1, i - 1) " " ((p in o) ? "yours" : "theirs") "\t" p }' "$T.so" "$T.sd" > "$T.st"
     # A submodule is no nested repo to refuse: a gitlink whose path .gitmodules lists, as the
     # backup's `is_submodule` reads it (review ai-review claude #3) — here the .gitmodules staged,
-    # the one the commit takes. One still in conflict has no staged version yet: then both sides'
-    # lists, together (review ai-review claude #6: a submodule the course adds in a merge where
-    # .gitmodules conflicts too was refused as a nested repo, and the pod left BUSY); the check
-    # after the conflicts are resolved reads the one staged.
-    if [ -n "$(git ls-files -u -- .gitmodules | head -n 1)" ]; then _gms=':2:.gitmodules :3:.gitmodules'; else _gms=':.gitmodules'; fi
-    for _gm in $_gms; do
-        git config --blob "$_gm" --get-regexp '^submodule\..*\.path$' 2>/dev/null | cut -d' ' -f2-
-    done > "$T.subs"
+    # the one the commit takes. One still in conflict has none staged yet, and which side's list
+    # the commit will take isn't known before it's resolved: so a gitlink new to HEAD beside it
+    # leaves the operation to the participant, before anything is touched (review ai-review
+    # claude #2, FIX8: both sides' lists together let a submodule through that the side taken then
+    # dropped from .gitmodules — the check after the changes refused it, half done).
+    if [ -n "$(git ls-files -u -- .gitmodules | head -n 1)" ] && awk '{ i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
+        m[2] == "160000" && m[1] != "160000" { f = 1; exit } END { exit !f }' "$T.st"; then
+        echo ".gitmodules is in conflict and the $what brings a submodule — resolve it by hand"
+        return
+    fi
+    git config --blob :.gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | cut -d' ' -f2- > "$T.subs"
     _g=$(awk 'FILENAME == ARGV[1] { s[$0] = 1; next } { i = index($0, "\t"); p = substr($0, i + 1); split(substr($0, 1, i - 1), m, " ") }
         m[2] == "160000" && m[1] != "160000" && !(p in s) { print m[5] "\t" p; exit }' "$T.subs" "$T.st")
     if [ -n "$_g" ]; then

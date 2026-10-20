@@ -752,9 +752,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     commit takes the whole index, so every path staged against HEAD counts, not only the
     conflicted ones — a file resolved or added and `git add`ed before: a blob over 95 MB, a
     nested repo staged as a gitlink (not a submodule the staged `.gitmodules` lists, as the
-    backup's own check reads it — both sides' lists while `.gitmodules` is itself in conflict), or a notebook that isn't valid JSON (or can't be checked)
+    backup's own check reads it), or a notebook that isn't valid JSON (or can't be checked)
     leaves it BUSY too (`model.pt is staged at … bytes, over git's …-byte limit: never committed —
-    unstage it, or abort, on the pod`). What the other side brings as it has it, the participant
+    unstage it, or abort, on the pod`) — and so does any new gitlink while `.gitmodules` is itself
+    in conflict (`.gitmodules is in conflict and the merge brings a submodule — resolve it by
+    hand`: which side's list the commit takes isn't known until then). What the other side brings as it has it, the participant
     never staged, and the words say so (`… comes in from the merged branch (MERGE_HEAD) at …
     bytes, …: arena won't commit it — finish the merge yourself, or abort it, on the pod`); what
     is staged exactly as the other side has it — taken whole, merged per hunk, or by hand into
