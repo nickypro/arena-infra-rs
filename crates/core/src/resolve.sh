@@ -197,7 +197,7 @@ unfit() {
     fi
     awk '{ split($0, m, " ") } m[2] == "100644" || m[2] == "100755" || m[2] == "120000" { print m[3] }' "$T.st" | sort -u \
         | git cat-file --batch-check='%(objectname) %(objectsize)' > "$T.ss" || { echo "the staged files' sizes couldn't be read"; return; }
-    awk -v max="$MAX" 'NR == FNR { s[$1] = $2; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
+    awk -v max="$MAX" 'FILENAME == ARGV[1] { s[$1] = $2; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
         (m[3] in s) && s[m[3]] + 0 > max + 0 {
             printf "%s is staged at %s bytes, over git'"'"'s %s-byte limit: never committed — unstage it, or abort, on the pod\n", substr($0, i + 1), s[m[3]], max
             exit
@@ -514,19 +514,21 @@ case $what in
         [ -z "$why" ] || fail "$why"
         git diff-index --cached --no-renames --name-only -z "$head" -- > "$T.soz" || fail "listing the staged changes"
         tr '\0' '\n' < "$T.soz" > "$T.so"
-        # Each such file: `<mode> <blob><TAB><path>`.
-        awk 'NR == FNR { o[$0] = 1; next } { i = index($0, "\t"); p = substr($0, i + 1); split(substr($0, 1, i - 1), m, " ") }
+        # Each such file: `<mode> <blob><TAB><path>`. (The first file is told apart by its name, not
+        # by `NR == FNR`: an empty one — everything staged is the other side's — would make the
+        # second read as the first.)
+        awk 'FILENAME == ARGV[1] { o[$0] = 1; next } { i = index($0, "\t"); p = substr($0, i + 1); split(substr($0, 1, i - 1), m, " ") }
             (m[2] == "100644" || m[2] == "100755") && (p in o) { print m[2] " " m[3] "\t" p }' "$T.so" "$T.st" > "$T.rc"
         (
             set -e
             cut -f1 "$T.rc" | cut -d' ' -f2 | sort -u > "$T.rcb"
             while read -r b; do redact_blob "$b"; done < "$T.rcb" > "$T.map"
             # Those paths alone (the same blob elsewhere, the course's, stays as it is).
-            awk 'NR == FNR { r[$1] = $2; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
+            awk 'FILENAME == ARGV[1] { r[$1] = $2; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
                 m[2] in r { print m[1] " " r[m[2]] " 0\t" substr($0, i + 1) }' "$T.map" "$T.rc" > "$T.upd"
             tr '\n' '\0' < "$T.upd" | git update-index -z --index-info
         ) || fail "redacting keys in the staged files"
-        awk 'NR == FNR { n[$2] = $3; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " "); print "REDACTED " n[m[2]] " " substr($0, i + 1) }' "$T.map" "$T.upd"
+        awk 'FILENAME == ARGV[1] { n[$2] = $3; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " "); print "REDACTED " n[m[2]] " " substr($0, i + 1) }' "$T.map" "$T.upd"
         ;;
 esac
 p=$(staged_markers)

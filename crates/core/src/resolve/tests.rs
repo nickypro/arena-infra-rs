@@ -1708,16 +1708,20 @@ fn every_path_the_commit_takes_is_checked_not_only_the_conflicted_ones() {
     }
 
     // The course's own file, a key-like string in it (only the course changed it): committed as the
-    // course has it — the participant made none of it.
-    let r = Repo::new("staged-theirs");
-    let example = format!("# Set your key: OPENROUTER_API_KEY = \"{key}\"\n");
-    r.course_commit(&[("example.md", example.as_bytes())], r.now - 6 * DAY);
-    r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
-    r.age(4 * HOUR);
-    let (code, rep, said) = r.resolve(3, &r.look());
-    assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{said}");
-    assert!(rep.redacted.is_empty(), "{said}");
-    assert_eq!(format!("{}\n", r.committed("example.md")), example, "as the course published it");
+    // course has it — the participant made none of it. Either side newer: with the course's, the
+    // index is the merged branch's tree everywhere; with the participant's, it isn't.
+    for course_newer in [true, false] {
+        let r = Repo::new(if course_newer { "staged-theirs-course" } else { "staged-theirs-mine" });
+        let example = format!("# Set your key: OPENROUTER_API_KEY = \"{key}\"\n");
+        r.course_commit(&[("example.md", example.as_bytes())], r.now - 11 * DAY);
+        let (course_at, mine_at) = if course_newer { (r.now - 5 * DAY, r.now - 10 * DAY) } else { (r.now - 10 * DAY, r.now - 5 * DAY) };
+        r.merge_conflict(course_at, mine_at);
+        r.age(4 * HOUR);
+        let (code, rep, said) = r.resolve(3, &r.look());
+        assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{course_newer}: {said}");
+        assert!(rep.redacted.is_empty(), "{course_newer}: {said}");
+        assert_eq!(format!("{}\n", r.committed("example.md")), example, "{course_newer}: as the course published it");
+    }
 }
 
 /// A notebook stays valid JSON (review ai-review claude #3). Merged per hunk, one side's conflict
