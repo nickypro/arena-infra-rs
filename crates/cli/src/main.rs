@@ -8774,7 +8774,8 @@ impl Switched {
 /// neither a push nor a copy — the copy failed too, the backup failed before the push, or
 /// another backup held its lock for the whole wait — is NOT switched: `--hard` would throw away
 /// what nothing has saved. `reset_onto`: the branch a `--hard` switch resets (a pod already on it
-/// loses its unpushed commits from the branch — they stay in its reflog — and its line says so).
+/// loses its unpushed commits from the branch — the switch pins them on the pod first, by a ref
+/// under refs/arena-discarded/ — and its line says so).
 #[allow(clippy::too_many_arguments)]
 async fn switch_guarded(
     remote: &Arc<dyn Remote>,
@@ -8923,8 +8924,10 @@ async fn switch_batch(
 
 /// The loud part of a pod's line when it was switched with its branch copied, not pushed: which
 /// branch, why, where its files went — and where its commits are now (`reset_onto`: the branch a
-/// `--hard` switch resets; on that branch, its unpushed commits are left only in the reflog; a
-/// detached HEAD's are left only in the pod's HEAD reflog).
+/// `--hard` switch resets; on that branch, its unpushed commits are pinned on the pod by
+/// `refs/arena-discarded/<time>-<branch>`, and a detached HEAD's by `refs/arena-discarded/<time>`
+/// — review ai-review codex #3: they were left to the reflog, and git's gc after it; a gentle
+/// switch from a detached HEAD leaves its commits in the pod's HEAD reflog).
 ///
 /// A pod with an operation in progress (`u.busy`: a merge, …) had nothing committed at all: its
 /// line says what is in progress instead of a push's failure. A gentle switch (and init-branches)
@@ -8941,7 +8944,9 @@ fn not_pushed_note(u: &Unpushed, copied_to: &str, reset_onto: Option<&str>) -> S
     use arena_core::backup::{busy_noun, uncommitted_reason, uncommitted_situation};
     let branch = u.branch.as_deref().unwrap_or("the branch it was on");
     let commits = if reset_onto.is_some() && u.branch.as_deref() == reset_onto {
-        format!("the --hard reset leaves its unpushed commits only in the branch's reflog on the pod (`git reflog {branch}`)")
+        format!("the --hard reset moves {branch} to origin's, and its unpushed commits stay on the pod under refs/arena-discarded/<time>-{branch}")
+    } else if branch == "HEAD" && reset_onto.is_some() {
+        "the commits of its detached HEAD stay on the pod under refs/arena-discarded/<time>".to_string()
     } else if branch == "HEAD" {
         "the commits of its detached HEAD stay on the pod only in its reflog (`git reflog`)".to_string()
     } else {
@@ -8997,11 +9002,17 @@ fn unredacted_note(stdout: &str) -> String {
 /// Where a `--hard` switch saved, on the pod, what it then discarded (`DISCARDED_SAVED <path>`:
 /// its uncommitted changes, an operation's state, untracked files the reset replaced —
 /// [`arena_core::backup::checkout_command`]), for the pod's line: a folder no later save or copy
-/// overwrites, with a README on getting it back. Empty when it saved nothing (nothing to discard).
+/// overwrites, with a README on getting it back — and the refs that keep the commits the reset left
+/// on no branch from git's gc (`DISCARDED_PINNED <ref>`: review ai-review codex #3), named. Empty
+/// when it saved nothing (nothing to discard).
 fn discarded_note(stdout: &str) -> String {
-    stdout.lines().find_map(|l| l.trim_end_matches('\r').strip_prefix("DISCARDED_SAVED ")).map_or_else(String::new, |path| {
-        format!(" — what it discarded was saved to {}/ on the pod first (its README says how to get it back)", path.trim_end_matches('/'))
-    })
+    let said = |word: &str| -> Vec<&str> { stdout.lines().filter_map(|l| l.trim_end_matches('\r').strip_prefix(word)).collect() };
+    let Some(path) = said("DISCARDED_SAVED ").first().copied() else {
+        return String::new();
+    };
+    let pinned = said("DISCARDED_PINNED ");
+    let refs = if pinned.is_empty() { String::new() } else { format!("; its commits kept by {}", pinned.join(", ")) };
+    format!(" — what it discarded was saved to {}/ on the pod first (its README says how to get it back{refs})", path.trim_end_matches('/'))
 }
 
 /// The per-pod note for the nested repos a switch put back (`RESTORED <path>` lines;
@@ -21140,7 +21151,7 @@ mod remote_tests {
         target_is_pod, BackupTally, Unpushed, Cli, Cmd, CopyLeg, CopyPlan, PodCmd, RestoreOpts, RestoreSource, RunResult, Select, SelectByFlag, Selected,
         Unscoped, BACKUP_TIMEOUT, BRANCH_TIMEOUT, CP_BASE_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS, TEST_TIMEOUT,
     };
-    use super::{copy_failure_reason, fallback_lines, mirror_refusal_text, not_pushed_note, sync_time_label, unredacted_note, Pulled};
+    use super::{copy_failure_reason, discarded_note, fallback_lines, mirror_refusal_text, not_pushed_note, sync_time_label, unredacted_note, Pulled};
     use super::{failure_why, local_backup_dir, push_first_note, take_pod_locks, take_said, telling_line, PodCall};
     use arena_core::selector::{Naming, SelectArgs};
     use arena_core::backup::{backup_command, checkout_command, init_branch_command, BackupConfig, BACKUP_BUSY_EXIT};
@@ -22972,7 +22983,7 @@ mod remote_tests {
         assert!(got.len() == 3 && got.iter().all(|d| d.ends_with("/devtest-bloom")), "only bloom copied: {got:?}");
 
         // Its line: which branch, why, where its files went, and where its commits are now — in
-        // the branch, or (review) after `--hard` onto that same branch, only in its reflog.
+        // the branch, or after `--hard` onto that same branch, pinned by a ref (codex #3).
         let u = Unpushed {
             pod: "devtest-bloom".into(),
             why: "GitHub push protection: OpenRouter API Key at ex.py:3".into(),
@@ -22990,8 +23001,8 @@ mod remote_tests {
         );
         assert!(
             not_pushed_note(&u, to, Some("autocommit-devtest-w1d1-bloom")).ends_with(
-                "and the --hard reset leaves its unpushed commits only in the branch's reflog on the pod \
-                 (`git reflog autocommit-devtest-w1d1-bloom`)"
+                "and the --hard reset moves autocommit-devtest-w1d1-bloom to origin's, and its unpushed commits stay on the pod \
+                 under refs/arena-discarded/<time>-autocommit-devtest-w1d1-bloom"
             ),
             "{}",
             not_pushed_note(&u, to, Some("autocommit-devtest-w1d1-bloom"))
@@ -23194,6 +23205,22 @@ mod remote_tests {
     /// What a `--hard` switch prints when it saved what it discarded ([`checkout_command`]).
     const SAVED_BLOOM: &str = "Switched to and reset branch 'main'\nDISCARDED_SAVED .git/arena-discarded/20261019T090102Z\n";
 
+    /// Review ai-review codex #3: the refs a `--hard` switch pinned the commits it left on no branch
+    /// with (`DISCARDED_PINNED`) are named on the pod's line, after where it saved the rest; with
+    /// none, no words for them.
+    #[test]
+    fn a_hard_switchs_line_names_the_refs_it_pinned() {
+        assert_eq!(discarded_note("Switched to and reset branch 'main'\n"), "");
+        let saved = " — what it discarded was saved to .git/arena-discarded/20261019T090102Z/ on the pod first (its README says how to get it back";
+        assert_eq!(discarded_note(SAVED_BLOOM), format!("{saved})"));
+        let pinned = "DISCARDED_SAVED .git/arena-discarded/20261019T090102Z\r\nDISCARDED_PINNED refs/arena-discarded/20261019T090102Z\r\n\
+                      DISCARDED_PINNED refs/arena-discarded/20261019T090102Z-main\n";
+        assert_eq!(
+            discarded_note(pinned),
+            format!("{saved}; its commits kept by refs/arena-discarded/20261019T090102Z, refs/arena-discarded/20261019T090102Z-main)")
+        );
+    }
+
     /// Review fb2 F2: the morning's `set-branch main --all --hard --init-branches` skipped
     /// init-branches for the whole fleet when one pod was mid-merge — that pod was copied and
     /// switched, yet counted as an error, so every pod stayed on main, where no backup commits.
@@ -23379,7 +23406,7 @@ mod remote_tests {
         assert!(!copied.is_empty() && copied.iter().all(|d| d.ends_with("/devtest-apple") || d.ends_with("/devtest-cloud")), "{copied:?}");
         let said = unnumbered(&crate::take_said());
         let line = |pod: &str| said.iter().find(|l| l.starts_with(&format!("✓ {pod} (on main)"))).cloned().unwrap_or_else(|| panic!("{said:#?}"));
-        let reflog = "the --hard reset leaves its unpushed commits only in the branch's reflog on the pod (`git reflog main`)";
+        let reflog = "the --hard reset moves main to origin's, and its unpushed commits stay on the pod under refs/arena-discarded/<time>-main";
         let apple = line("devtest-apple");
         assert!(
             apple.starts_with(
@@ -23480,8 +23507,8 @@ mod remote_tests {
                 "✓ devtest-apple (on main) — ⚠ NOT PUSHED FIRST: main has commits no remote has, and no backup pushes main; its \
                  files were copied to "
             ) && apple.ends_with(
-                " first, and that copy has its .git, those commits with it; the --hard reset leaves its unpushed commits only in \
-                 the branch's reflog on the pod (`git reflog main`)"
+                " first, and that copy has its .git, those commits with it; the --hard reset moves main to origin's, and its \
+                 unpushed commits stay on the pod under refs/arena-discarded/<time>-main"
             ),
             "{apple}"
         );
@@ -23492,7 +23519,7 @@ mod remote_tests {
                  a detached HEAD; its files were copied to "
             ) && cloud.ends_with(
                 " first, and the --hard switch overwrites any of them origin/main tracks; the commits of its detached HEAD stay \
-                 on the pod only in its reflog (`git reflog`)"
+                 on the pod under refs/arena-discarded/<time>"
             ),
             "{cloud}"
         );

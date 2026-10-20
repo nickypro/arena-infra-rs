@@ -1054,7 +1054,10 @@ fn init_branch_script(cfg: &BackupConfig, machine_name: &str) -> String {
 /// changes to tracked files — in one (HEAD -> the files) and staged and not apart (review ai-review
 /// codex #3: a version staged, then undone in the work tree, was in no patch), the commit they
 /// apply to kept by `refs/arena-discarded/<save>` (claude #11: else git's gc drops it once the
-/// reflog expires) — the files with unresolved conflicts, an
+/// reflog expires) — as the commits the reset leaves on no branch are, whether or not anything
+/// else is saved: the local `<branch>`'s that origin's doesn't have, by
+/// `refs/arena-discarded/<save>-<branch>` (the checkout moves it, whichever branch the pod was on),
+/// and HEAD's that no remote has (review ai-review codex #3) — the files with unresolved conflicts, an
 /// operation's state files (`MERGE_HEAD`, …) and the untracked or ignored files, links and
 /// directories the reset removes — a directory where the branch has a file or a link goes whole
 /// (`checkout -f` deletes it, ignored contents and a nested repo's `.git` with it: review
@@ -1180,13 +1183,14 @@ fn switch_script(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard:
     parts.push("PREV=$(git symbolic-ref -q --short HEAD) || PREV=".into());
     let switch = if hard {
         let remote_ref = shell_quote(&format!("origin/{branch}"));
-        // What the reset discards, saved first (no save, no reset); then force-switch to the
+        // What the reset discards, saved first (no save, no reset) — the local branch's commits
+        // origin's doesn't have, and HEAD's no remote has, pinned by refs; then force-switch to the
         // branch reset to origin (discards local changes/commits on it), then end any `git am`,
         // rebase or sequence the switch left behind (their state only).
         format!(
-            "discarded_save \"$G\" {remote_ref} && git checkout -f -B {} {remote_ref} && git reset --hard {remote_ref} && \
+            "discarded_save \"$G\" {remote_ref} {b} && git checkout -f -B {b} {remote_ref} && git reset --hard {remote_ref} && \
              {{ git rebase --quit >/dev/null 2>&1; git am --quit >/dev/null 2>&1; git cherry-pick --quit >/dev/null 2>&1; true; }}",
-            shell_quote(branch)
+            b = shell_quote(branch)
         )
     } else {
         // `checkout.defaultRemote`: with an `upstream` remote too (the course repo, whose branch
@@ -3024,7 +3028,7 @@ done
         assert!(c.contains("git fetch --prune origin"));
         // What it discards saved first — no save, no reset — then force-switch the branch to
         // origin and hard-reset (destructive).
-        assert!(c.contains("discarded_save() {") && c.contains("if discarded_save \"$G\" 'origin/main' && git checkout -f -B 'main' 'origin/main'"));
+        assert!(c.contains("discarded_save() {") && c.contains("if discarded_save \"$G\" 'origin/main' 'main' && git checkout -f -B 'main' 'origin/main'"));
         assert!(c.contains("git reset --hard 'origin/main'"));
         assert!(!c.contains("--ff-only"));
         // The keys' restore is the EXIT trap, set before the set-aside (claude #4).
@@ -4698,9 +4702,11 @@ done
         assert!(d.join("staged.patch").is_file() && d.join("unstaged.patch").is_file());
         let pin = format!("refs/arena-discarded/{name}");
         assert_eq!(s.git(&s.work, &["rev-parse", &pin]), old, "the base kept by a ref");
+        // (Local main had a commit origin's doesn't: pinned on its own too — codex #3.)
+        assert_eq!(s.git(&s.work, &["rev-parse", &format!("{pin}-main")]), old);
         let readme = std::fs::read_to_string(d.join("README")).unwrap();
-        let undo = format!("git update-ref -d {pin}");
-        assert!(readme.contains(&pin) && readme.contains(&undo), "{readme}");
+        let undo = readme.lines().find_map(|l| l.strip_prefix("When none of it is wanted any more: ")).expect("the README's line");
+        assert_eq!(undo, format!("git update-ref -d {pin} && git update-ref -d {pin}-main && rm -rf {}", d.display()));
         // Nothing but that ref keeps the old commit now: gc after the reflog expires keeps it.
         let gc = || {
             s.git(&s.work, &["reflog", "expire", "--expire=now", "--all"]);
@@ -4721,9 +4727,85 @@ done
         // Done with it: what the README says to delete lets git drop it.
         s.git(&s.work, &["checkout", "-q", "-f", "main"]);
         s.git(&s.work, &["branch", "-D", "-q", "rescue"]);
-        s.git(&s.work, &["update-ref", "-d", &pin]);
+        let o = s.run(&format!("cd {} && {undo}", shell_quote(repo)));
+        assert!(o.status.success() && !d.exists(), "{}", String::from_utf8_lossy(&o.stderr));
         gc();
         assert!(!s.run(&format!("git -C {} cat-file -e {old}", shell_quote(repo))).status.success(), "gone without the ref");
+    }
+
+    /// Review ai-review codex #3: `checkout -f -B <branch> origin/<branch>` moves the local
+    /// `<branch>` to origin's, whichever branch the pod was on, and the save kept only the commit
+    /// HEAD was on — and that only when there was something else to save. A pod on a clean, pushed
+    /// autocommit branch whose local `main` had an unpushed commit lost it to git's gc once the
+    /// reflog expired. Now the local branch's tip, when it has commits origin's doesn't, is pinned
+    /// by `refs/arena-discarded/<save>-<branch>` — and HEAD, when it has commits no remote has, by
+    /// `refs/arena-discarded/<save>` — whether or not anything else is saved: the folder then holds
+    /// just a README naming them, and the output names them too (`DISCARDED_PINNED`).
+    #[cfg(unix)]
+    #[test]
+    fn hard_pins_the_local_commits_it_leaves_on_no_branch() {
+        let s = GitSandbox::new("discarded-pins", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let gc = || {
+            s.git(&s.work, &["reflog", "expire", "--expire-unreachable=now", "--all"]);
+            s.git(&s.work, &["gc", "-q", "--prune=now"]);
+        };
+        let exists = |c: &str| s.run(&format!("git -C {} cat-file -e {c}^{{commit}}", shell_quote(repo))).status.success();
+        let hard = |pins: usize| {
+            let o = s.run(&checkout_command(repo, "main", None, true));
+            let out = String::from_utf8_lossy(&o.stdout).into_owned();
+            assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+            assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/main"]), "reset");
+            let saved: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("DISCARDED_SAVED ")).collect();
+            assert_eq!(saved.len(), 1, "{out}");
+            let d = s.work.join(saved[0]);
+            let names: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            assert_eq!(names, ["README"], "nothing else to save: the README alone");
+            let pinned: Vec<String> = out.lines().filter_map(|l| l.strip_prefix("DISCARDED_PINNED ")).map(String::from).collect();
+            assert_eq!(pinned.len(), pins, "{out}");
+            (d.clone(), pinned, std::fs::read_to_string(d.join("README")).unwrap())
+        };
+        // Local main: an unpushed commit. The pod: on its clean, pushed autocommit branch.
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        std::fs::write(s.work.join("mine.py"), "mine = 1\n").unwrap();
+        s.git(&s.work, &["add", "mine.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "mine, on main"]);
+        let mine = s.git(&s.work, &["rev-parse", "HEAD"]);
+        s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "");
+        let (d, pinned, readme) = hard(1);
+        let pin = format!("refs/arena-discarded/{}-main", d.file_name().unwrap().to_string_lossy());
+        assert_eq!(pinned, [pin.clone()], "the autocommit branch is pushed: HEAD needs no ref");
+        assert!(
+            readme.contains(&format!("Its local main was at commit {mine}, with 1 commit(s) origin/main doesn't have"))
+                && readme.contains(&format!("the ref {pin} keeps them from git's gc. `git branch main-rescue {mine}` brings them back.")),
+            "{readme}"
+        );
+        // Every reflog expired, gc run: the commit is still there, by the ref.
+        gc();
+        assert_eq!(s.git(&s.work, &["rev-parse", &pin]), mine);
+        assert!(exists(&mine));
+        // What the README says to run once none of it is wanted lets git drop it.
+        let undo = readme.lines().find_map(|l| l.strip_prefix("When none of it is wanted any more: ")).expect("the README's line");
+        assert_eq!(undo, format!("git update-ref -d {pin} && rm -rf {}", d.display()));
+        assert!(s.run(&format!("cd {} && {undo}", shell_quote(repo))).status.success());
+        gc();
+        assert!(!exists(&mine), "gone without the ref");
+
+        // A detached HEAD with a commit no remote has, the tree clean: pinned by
+        // refs/arena-discarded/<save> (local main is origin's now: no ref for it).
+        s.git(&s.work, &["checkout", "-q", "--detach"]);
+        std::fs::write(s.work.join("detached.py"), "d = 1\n").unwrap();
+        s.git(&s.work, &["add", "detached.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "on a detached HEAD"]);
+        let detached = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let (d, pinned, readme) = hard(1);
+        let pin = format!("refs/arena-discarded/{}", d.file_name().unwrap().to_string_lossy());
+        assert_eq!(pinned, [pin.clone()]);
+        assert!(readme.contains(&format!("It was on HEAD at commit {detached} (the ref {pin} keeps it")), "{readme}");
+        gc();
+        assert_eq!(s.git(&s.work, &["rev-parse", &pin]), detached);
+        assert!(exists(&detached));
     }
 
     /// Review ai-review codex #1 / claude #7: the save kept only files and links, but `checkout -f`

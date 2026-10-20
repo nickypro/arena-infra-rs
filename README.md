@@ -800,7 +800,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     legacy `./backup`, no lock is taken, and the dry run and the run say so in one line). A pod
     whose push fails is rsynced into `LOCAL_BACKUP_DIR` first, then switched, its
     line saying so (its unpushed commits stay in that branch on the pod — or, after `--hard` onto
-    that same branch, in its reflog); a pod that can be **neither pushed nor copied** (the copy
+    that same branch, under the ref `refs/arena-discarded/<UTC time>-<branch>` the switch pins them
+    with); a pod that can be **neither pushed nor copied** (the copy
     failed too, the backup failed before its push, or another backup held its lock for the whole
     2-min wait) is **not switched** (`✗ … not switched: <why>`), and the run fails. A pod with
     an operation in progress on a branch the backup commits (a merge, …: see `pods backup`) is
@@ -840,7 +841,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     the commit it was on, which it names; the ref `refs/arena-discarded/<UTC time>` keeps that
     commit from git's gc — `git update-ref -d` it, and remove the folder, once it's not wanted) —
     and the pod's line says `what it discarded was saved to .git/arena-discarded/<time>/ on the
-    pod first`. In `.git`, so the reset doesn't touch it and every later copy (snapshot, big,
+    pod first`. **The commits the reset leaves on no branch are pinned too** (review ai-review
+    codex #3: `checkout -f -B <branch> origin/<branch>` moves the local `<branch>`, whichever branch
+    the pod was on — a pod on a clean, pushed autocommit branch lost an unpushed commit on its local
+    `main` to git's gc once the reflog expired): the local `<branch>`'s tip, when it has commits
+    origin's doesn't, as `refs/arena-discarded/<UTC time>-<branch>`, and the commit HEAD was on,
+    when it has commits no remote has, as `refs/arena-discarded/<UTC time>` — whether or not
+    anything else is saved (then the folder holds just the README, naming them and how to make a
+    branch of each again); the pod's line names the refs (`its commits kept by …`), and the
+    README's last line deletes them all. In `.git`, so the reset doesn't touch it and every later copy (snapshot, big,
     archive) carries it under a name no later save reuses: the copy into `LOCAL_BACKUP_DIR` is the
     day's label, which the next pull of that label overwrites from the reset pod (review ai-review
     claude #2). Nothing to discard, no folder; a save that fails leaves the pod as it was, not

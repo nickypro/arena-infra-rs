@@ -23,20 +23,29 @@
 #   README          what this is and how to get it back
 # The patches are plumbing (`diff-index`, `diff-files`, binary and full-index): no participant's diff
 # config (colour, no prefix, an external diff) gets into them, and the index is never refreshed.
-# The commit it was on is kept by the ref refs/arena-discarded/<the folder's name> (review
-# ai-review claude #11): the patches apply to it, and once the reflog expires nothing else may keep
-# it from git's gc. Nothing to keep, no folder and no ref. Prints, on stdout:
+# The commits the reset can leave on no branch are kept from git's gc by refs (no reflog of their
+# own: once a branch's reflog expires, nothing else may keep them):
+#   refs/arena-discarded/<the folder's name>  the commit it was on (review ai-review claude #11): when
+#                   anything else is saved (the patches apply to it), or when it has commits no
+#                   remote has (a detached HEAD's, or a branch's the reset moves)
+#   refs/arena-discarded/<the folder's name>-<branch>  the local <branch>'s tip, when it has commits
+#                   <ref> doesn't (review ai-review codex #3): `checkout -f -B <branch> <ref>` moves
+#                   it to <ref>, whichever branch the checkout was on (a pod on a clean, pushed
+#                   autocommit branch with an unpushed commit on its local main lost that commit)
+# A save of refs alone is a folder with just the README, naming them. Nothing to keep, no folder
+# and no ref. Prints, on stdout:
 #   DISCARDED_SAVED <path>   the folder, relative to the repo's top
-# `discarded_save <git dir> <ref>`: non-zero, said on stderr, when it couldn't save — the caller then
-# doesn't reset, and the part saved so far is removed (the work is all still in place; a copy cut
-# short by a full disk mustn't stay to fill it). A <ref> that isn't a commit saves nothing: the
-# switch fails on it, discarding nothing.
+#   DISCARDED_PINNED <ref>   each ref it made
+# `discarded_save <git dir> <ref> <branch>`: non-zero, said on stderr, when it couldn't save — the
+# caller then doesn't reset, and the part saved so far is removed, refs and all (the work is all
+# still in place; a copy cut short by a full disk mustn't stay to fill it). A <ref> that isn't a
+# commit saves nothing: the switch fails on it, discarding nothing.
 discarded_save() {
     if ! git rev-parse -q --verify "$2^{commit}" >/dev/null 2>&1; then return 0; fi
     ds_head=$(git rev-parse -q --verify HEAD 2>/dev/null) || ds_head=
     ds_on=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || ds_on=HEAD
     ds_d="$1/arena-discarded/$(date -u +%Y%m%dT%H%M%SZ)"
-    ds_made=
+    ds_made= ds_refs=
     # Never into an earlier save's folder: a second reset in the same second gets its own.
     mkdir -p "$1/arena-discarded" 2>/dev/null || true
     if ! mkdir "$ds_d" 2>/dev/null; then
@@ -125,17 +134,39 @@ discarded_save() {
         return 1
     fi
     rm -rf "$ds_w"
-    if [ -z "$(ls -A "$ds_d")" ]; then
+    # The refs (above), whether or not anything else was saved.
+    ds_name=$(basename -- "$ds_d")
+    ds_pin=
+    if [ -n "$ds_head" ] && { [ -n "$(ls -A "$ds_d")" ] || [ -n "$(git rev-list -n1 "$ds_head" --not --remotes 2>/dev/null)" ]; }; then
+        ds_pin="refs/arena-discarded/$ds_name"
+    fi
+    ds_bpin=
+    if [ -n "$3" ] && ds_tip=$(git rev-parse -q --verify "refs/heads/$3^{commit}" 2>/dev/null) \
+        && [ -n "$(git rev-list -n1 "$2..$ds_tip" 2>/dev/null)" ]; then
+        ds_bpin="refs/arena-discarded/$ds_name-$3"
+    else
+        ds_tip=
+    fi
+    if [ -z "$ds_pin" ] && [ -z "$ds_bpin" ] && [ -z "$(ls -A "$ds_d")" ]; then
         rmdir "$ds_d"
         rmdir "$1/arena-discarded" 2>/dev/null || true
+        ds_made=
         return 0
     fi
-    ds_pin="refs/arena-discarded/$(basename -- "$ds_d")"
-    if [ -z "$ds_head" ]; then ds_pin=; fi
-    if ! ds_readme "$ds_d" "$2" "$ds_on" "$ds_head" "$ds_pin" > "$ds_d/README"; then ds_fail "$ds_d" "its README"; return 1; fi
-    # The base the patches apply to, kept from git's gc (no reflog of its own: it's no branch).
-    if [ -n "$ds_pin" ] && ! git update-ref "$ds_pin" "$ds_head"; then ds_fail "$ds_d" "the ref $ds_pin"; return 1; fi
+    if ! ds_readme "$ds_d" "$2" "$ds_on" "$ds_head" "$ds_pin" "$3" "$ds_tip" "$ds_bpin" > "$ds_d/README"; then
+        ds_fail "$ds_d" "its README"
+        return 1
+    fi
+    if [ -n "$ds_pin" ]; then
+        if ! git update-ref "$ds_pin" "$ds_head"; then ds_fail "$ds_d" "the ref $ds_pin"; return 1; fi
+        ds_refs=$ds_pin
+    fi
+    if [ -n "$ds_bpin" ]; then
+        if ! git update-ref "$ds_bpin" "$ds_tip"; then ds_fail "$ds_d" "the ref $ds_bpin"; return 1; fi
+        ds_refs="$ds_refs $ds_bpin"
+    fi
     printf 'DISCARDED_SAVED %s\n' "${ds_d#"$(pwd)/"}"
+    for ds_r in $ds_refs; do printf 'DISCARDED_PINNED %s\n' "$ds_r"; done
 }
 
 # `ds_copy <list> <dir>`: each path listed (one per line, relative to the repo's top) copied into
@@ -149,23 +180,33 @@ ds_copy() {
 }
 
 # `ds_fail <dir> <what>`: says what couldn't be saved, and removes the save's own folder (made by
-# this run: $ds_made) — the pod isn't reset, so nothing in it is needed.
+# this run: $ds_made) and the refs it made ($ds_refs) — the pod isn't reset, so nothing in it is
+# needed.
 ds_fail() {
     printf '%s\n' "arena set-branch: couldn't save $2 into $1 before the --hard reset - not reset" >&2
     if [ -n "$ds_made" ]; then
         rm -rf "$1"
         rmdir "$(dirname -- "$1")" 2>/dev/null || true
     fi
+    for ds_r in $ds_refs; do git update-ref -d "$ds_r" 2>/dev/null || true; done
+    ds_made= ds_refs=
 }
 
-# `ds_readme <dir> <ref> <branch> <commit> <pin>`: the README, naming only the parts this save has
-# (<commit> and <pin> empty: there was no commit).
+# `ds_readme <dir> <ref> <branch> <commit> <pin> <target branch> <its tip> <its pin>`: the README,
+# naming only the parts this save has (<commit> empty: there was no commit; <pin> or <its pin>
+# empty: no such ref).
 ds_readme() {
     printf '%s\n' "What \`arena pods set-branch --hard\` discarded when it reset this checkout to $2 (UTC $(basename -- "$1"))." \
         "Saved here first; nothing here is pushed, and the rsync backups copy it with the rest of .git."
-    if [ -n "$4" ]; then
-        printf '%s\n' "It was on $3 at commit $4 (the ref $5 keeps it from git's gc: the patches below apply to it)." \
+    if [ -n "$5" ]; then
+        printf '%s\n' "It was on $3 at commit $4 (the ref $5 keeps it, and the commits before it, from git's gc: any patches below apply to it)." \
             "\`git branch rescue $4\` brings that commit back, and any commits before it no branch has."
+    elif [ -n "$4" ]; then
+        printf '%s\n' "It was on $3 at commit $4."
+    fi
+    if [ -n "$8" ]; then
+        printf '%s\n' "Its local $6 was at commit $7, with $(git rev-list --count "$2..$7") commit(s) $2 doesn't have: the reset moved $6 to $2," \
+            "and the ref $8 keeps them from git's gc. \`git branch $6-rescue $7\` brings them back."
     fi
     if [ -f "$1/staged.patch" ] || [ -f "$1/unstaged.patch" ]; then
         _rd="git branch rescue $4 && git checkout rescue"
@@ -194,9 +235,7 @@ ds_readme() {
         printf '%s\n' "- untracked/: untracked or ignored files, links and directories the reset removed (it replaced them with $2's" \
             "  version, or a directory of $2's went where they were): copy them back from here, e.g. cp -pPR $1/untracked/<path> <path>"
     fi
-    if [ -n "$5" ]; then
-        printf '%s\n' "When none of it is wanted any more: git update-ref -d $5 && rm -rf $1"
-    else
-        printf '%s\n' "When none of it is wanted any more: rm -rf $1"
-    fi
+    _rd=
+    for _r in $5 $8; do _rd="${_rd}git update-ref -d $_r && "; done
+    printf '%s\n' "When none of it is wanted any more: ${_rd}rm -rf $1"
 }
