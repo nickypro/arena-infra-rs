@@ -2010,7 +2010,8 @@ fn a_notebook_that_wont_merge_per_hunk_into_valid_json_leaves_it_busy() {
     }
     // (case, the JSON tools the resolve may use, the course's side newer, what else is on the pod,
     // why it stays BUSY — None: merged per hunk)
-    let mut cases: Vec<(&str, &str, bool, fn(&Repo), Option<String>)> = vec![
+    type Case<'a> = (&'a str, &'a str, bool, fn(&Repo), Option<String>);
+    let mut cases: Vec<Case> = vec![
         ("nb-python", "python3", true, nothing, Some(busy.to_string())),
         ("nb-valid", "python3", false, nothing, None),
         ("nb-none", "", false, nothing, Some(format!("{busy} ({nocheck})"))),
