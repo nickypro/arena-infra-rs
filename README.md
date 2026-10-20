@@ -1116,7 +1116,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     config file** (state: `reap.json`, log: `reap-log.jsonl`) — a shell exporting a different
     one is refused (it would put a `hold` where the cron never looks); every state change
     prints the file it wrote — RunPod on REST v2, the default (pods on `RUNPOD_API=v1` and Vast
-    are never reaped), absolute `LOCAL_BACKUP_DIR`, a `.arena-backup-tier` marker on each backup root
+    are never reaped; since v2 became the default — 70bce78, 2026-10-19 — a config with no
+    `RUNPOD_API` line, which ran v1, has its RunPod pods reapable without anyone choosing v2, so
+    `reap status` and every plan say `RunPod: REST v2 (…) — RunPod pods with a policy can be
+    reaped: terminated, container disk and all, after their backup` whenever one has a policy,
+    and `config check`'s RUNPOD_API row says it too; nothing acts by itself: `--apply` still needs
+    `REAP_ENABLED=1` in the file), absolute `LOCAL_BACKUP_DIR`, a `.arena-backup-tier` marker on each backup root
     (`snapshot` / `big`; the big tier's root is `LOCAL_BACKUP_BIG_DIR`, default
     `<LOCAL_BACKUP_DIR>/big`), `ARENA_START_DATE` and no `BACKUP_REMOTE_PATH`; `config check`
     lists what's missing once the reaper is on or its cron line is installed (off: one `·

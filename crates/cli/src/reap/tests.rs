@@ -2470,11 +2470,44 @@ fn reaper_runpod_api_row_follows_the_default() {
     for extra in ["", "RUNPOD_API=\n", "RUNPOD_API=v2\n"] {
         let l = row(extra);
         assert!(l.trim_start().starts_with("✓ RUNPOD_API") && l.contains("v2 — RunPod pods report their lock"), "{extra:?}: {l}");
+        // What that means for the reaper, and whether anyone chose it (review ai-review claude #1).
+        assert!(l.contains("so one with a policy can be reaped") && l.contains("(on v1 none ever was)"), "{extra:?}: {l}");
+        assert_eq!(l.contains("(the default since 70bce78, 2026-10-19)"), extra != "RUNPOD_API=v2\n", "{extra:?}: {l}");
     }
     let l = row("RUNPOD_API=v1\n");
     assert!(l.trim_start().starts_with("⚠ RUNPOD_API") && l.contains("no RunPod pod is ever reaped") && l.contains(RUNPOD_V1_REMEDY), "{l}");
     let l = row("RUNPOD_API=v3\n");
     assert!(l.trim_start().starts_with("⚠ RUNPOD_API") && l.contains("invalid") && !l.contains(RUNPOD_V1_REMEDY), "{l}");
+}
+
+/// Review ai-review claude #1: v2 became RunPod's default, so a config with no RUNPOD_API line —
+/// which ran v1, where no RunPod pod is ever reaped — now has RunPod pods reapable. `reap status`
+/// and the plan say so (words only) whenever a RunPod pod has a policy on v2, and whether the
+/// config chose it; not on v1, nor when only other providers' pods have one.
+#[tokio::test]
+async fn status_and_the_plan_say_when_runpod_pods_are_reapable() {
+    let said = |out: &str| out.lines().filter(|l| l.starts_with("RunPod: REST v2")).map(String::from).collect::<Vec<_>>();
+    let default = "RunPod: REST v2 (the default since 70bce78, 2026-10-19: no RUNPOD_API line chose it) — RunPod pods with a policy can be \
+                   reaped: terminated, container disk and all, after their backup (on RUNPOD_API=v1 none ever was)";
+    let chosen = default.replace("the default since 70bce78, 2026-10-19: no RUNPOD_API line chose it", "RUNPOD_API=v2");
+    for (tag, extra, provider, want) in [
+        ("note-default", "RUNPOD_API=", "runpod", Some(default.to_string())),
+        ("note-chosen", "", "runpod", Some(chosen)),
+        ("note-v1", "RUNPOD_API=v1", "runpod", None),
+        ("note-hz", "RUNPOD_API=", "hetzner", None),
+    ] {
+        let w = World::new(tag, extra);
+        let a = if provider == "runpod" { rp("devtest-alpha", "pa", 22001) } else { hz("devtest-alpha", "pa", 22001) };
+        w.add(a.clone(), Sim::new("pa", provider));
+        w.policy(&a, None, Some(900));
+        w.out.lock().unwrap().clear();
+        w.reap(&["status"]).await.unwrap();
+        let status = w.out.lock().unwrap().join("\n");
+        let (_, plan) = w.run("observe").await;
+        let want: Vec<String> = want.into_iter().collect();
+        assert_eq!((said(&status), said(&plan)), (want.clone(), want), "{tag}: {status}\n---\n{plan}");
+        assert!(w.terminated().is_empty(), "{tag}: words only");
+    }
 }
 
 /// RR9: `--json` errors are one JSON document too.

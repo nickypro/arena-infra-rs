@@ -532,6 +532,31 @@ fn never_reaped(pod: &Pod, all: &[Pod], naming: &Naming, runpod_v2: bool) -> Opt
     None
 }
 
+/// When RunPod's REST v2 became the default ([`runpod_reapable_note`]).
+const RUNPOD_V2_DEFAULT_SINCE: &str = "70bce78, 2026-10-19";
+
+/// Review ai-review claude #1: RunPod's REST v2 became the default ([`RUNPOD_V2_DEFAULT_SINCE`]).
+/// Before, a config without `RUNPOD_API` ran v1, on which no RunPod pod is ever reaped (no lock
+/// state); the same config is v2 now, so a RunPod pod with a policy can be. Nothing acts by itself
+/// — `--apply` still needs `REAP_ENABLED=1` in the config file — but an operator who turns the
+/// reaper on after this release gets RunPod pods reapable without having chosen v2. So `reap
+/// status` and the plan say so, in this line, whenever a RunPod pod has a policy and RunPod is on
+/// v2. Words only: what is reaped doesn't change. `None` on v1, or with no RunPod policy.
+pub(crate) fn runpod_reapable_note<'a>(cfg: &Config, providers: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    if !runpod_v2(cfg) || !providers.into_iter().any(|p| p == "runpod") {
+        return None;
+    }
+    let chosen = if cfg.get("RUNPOD_API").is_some_and(|v| !v.trim().is_empty()) {
+        "RUNPOD_API=v2".to_string()
+    } else {
+        format!("the default since {RUNPOD_V2_DEFAULT_SINCE}: no RUNPOD_API line chose it")
+    };
+    Some(format!(
+        "RunPod: REST v2 ({chosen}) — RunPod pods with a policy can be reaped: terminated, container disk and all, after \
+         their backup (on RUNPOD_API=v1 none ever was)"
+    ))
+}
+
 fn runpod_v2(cfg: &Config) -> bool {
     matches!(arena_core::provider::RunpodApi::from_config(cfg), Ok(arena_core::provider::RunpodApi::V2))
 }
@@ -880,6 +905,9 @@ fn handle_status(env: &ReapEnv<'_>, sel: &Select, json: bool) -> Result<()> {
     (env.out)(&format!("Reap state {} · {} attempt(s) in the last 24h", store.state_path().display(), state.attempts_today(now)));
     if let Some(h) = &state.hold {
         (env.out)(&format!("ON HOLD since {} ({}): {}", render::fmt_local(h.set_at, env.tz), if h.auto { "automatic" } else { "operator" }, h.reason));
+    }
+    if let Some(note) = runpod_reapable_note(env.cfg, state.pods.values().map(|p| p.provider.as_str())) {
+        (env.out)(&note);
     }
     let rows: Vec<Vec<String>> = state
         .pods
@@ -1665,6 +1693,9 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
     let mut footer: Vec<String> = std::mem::take(&mut *ctx.notes.lock().unwrap());
     if unpoliced > 0 {
         footer.push(format!("{unpoliced} cohort pod(s) without a reap policy (never probed)"));
+    }
+    if let Some(note) = runpod_reapable_note(cfg, final_state.pods.values().map(|p| p.provider.as_str())) {
+        footer.push(note);
     }
     let header = PlanHeader {
         now,
@@ -2619,7 +2650,17 @@ pub(crate) fn readiness_rows_for(cfg: &Config, rsync: &str, full: bool) -> (Vec<
         Err(e) => row(Some(false), "state (ARENA_STATE_DIR)", e, Gap::Blocks("ARENA_STATE_DIR (explicit, absolute)")),
     }
     let (v2, detail) = match arena_core::provider::RunpodApi::from_config(cfg) {
-        Ok(arena_core::provider::RunpodApi::V2) => (true, "v2 — RunPod pods report their lock".to_string()),
+        Ok(arena_core::provider::RunpodApi::V2) => (
+            true,
+            format!(
+                "v2 — RunPod pods report their lock, so one with a policy can be reaped{} (on v1 none ever was)",
+                if cfg.get("RUNPOD_API").is_some_and(|v| !v.trim().is_empty()) {
+                    String::new()
+                } else {
+                    format!(" (the default since {RUNPOD_V2_DEFAULT_SINCE})")
+                }
+            ),
+        ),
         Ok(arena_core::provider::RunpodApi::V1) => (
             false,
             format!("v1 — no RunPod pod is ever reaped (the reaper needs REST v2): {}", arena_core::provider::RUNPOD_V1_REMEDY),
