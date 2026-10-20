@@ -1699,9 +1699,9 @@ branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit. A hangup or 
 once (exit status 129 or 143), and so does its terminal hanging up (a dropped SSH session, a killed
 tmux server: 129) — never waiting on its event loop, which a dead terminal stalls. However it ends,
 nothing new is started from then on, the terminal is put back first (as far as it can be; not while
-`c`'s ssh has it), and then every child still running is stopped — a question's AI, an action's, a
-refresh's or a backup's ssh, scp and rsync — TERM, then KILL 2 s later; the wait for that is never
-on a raw screen. `Esc` only steps back (detail → list; on the list it
+`c`'s ssh has it — that's ssh's), and then every child still running is stopped — a question's AI,
+an action's, a refresh's or a backup's ssh, scp and rsync, `c`'s ssh — TERM, then KILL 2 s later;
+the wait for that is never on a raw screen. `Esc` only steps back (detail → list; on the list it
 clears the marks).
 
 ### Acting on pods

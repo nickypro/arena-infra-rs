@@ -475,9 +475,10 @@ impl Drop for LastStop {
 /// Why a child isn't started, or is stopped as it starts: [`end_children`].
 const ENDING: &str = "arena is ending";
 
-/// Every child [`output_feeding`] started that is still its own pid's — `pods ask`'s
-/// claude/codex, the dashboard's `?`, and every ssh, scp and rsync of its refreshes, actions and
-/// backups — and the latch for a process about to end: what [`stop_all_children`] stops.
+/// Every child [`output_feeding`] and [`run_foreground`] started that is still its own pid's —
+/// `pods ask`'s claude/codex, the dashboard's `?`, and every ssh, scp and rsync of its refreshes,
+/// actions and backups, `c`'s ssh — and the latch for a process about to end: what
+/// [`stop_all_children`] stops.
 struct Children {
     /// Set by [`end_children`]: no child starts any more.
     ending: bool,
@@ -548,8 +549,8 @@ pub fn ending() -> bool {
 }
 
 /// The latch for a process about to end — set before anything else it does on the way out: from
-/// now on no child starts ([`output_feeding`] refuses, and one whose spawn was under way is
-/// stopped as it starts). `true` for the call that set it — the first; a later
+/// now on no child starts ([`output_feeding`] and [`run_foreground`] refuse, and one whose spawn
+/// was under way is stopped as it starts). `true` for the call that set it — the first; a later
 /// cause of the end leaves the ending to that one.
 pub fn end_children() -> bool {
     !std::mem::replace(&mut children().ending, true)
@@ -611,6 +612,38 @@ fn signal_children(sig: Signal) -> bool {
 fn children_running() -> bool {
     let live = children().live.clone();
     live.into_iter().any(|(pid, group)| if group { group_running(pid) } else { !has_exited(pid) })
+}
+
+/// Run `cmd` to its exit — a child that takes this process's terminal: the dashboard's `c` ssh —
+/// tracked as [`output_feeding`]'s children are: not started once the process is ending, stopped
+/// straight away if the end overtook its spawn, and stopped with the rest by
+/// [`stop_all_children`]; its exit waited for unreaped first, then it is taken off, then reaped.
+/// Blocking. `what` names it in an error.
+pub fn run_foreground(cmd: &mut std::process::Command, what: &str) -> Result<ExitStatus> {
+    let starting = Starting::begin(what)?;
+    let mut child = cmd.spawn().map_err(|e| Error::provider(format!("spawning {what}: {e}")))?;
+    let pid = child.id();
+    if starting.started(pid, false) {
+        terminate(pid);
+    }
+    #[cfg(unix)]
+    exited_blocking(pid);
+    forget(pid);
+    child.wait().map_err(|e| Error::provider(format!("waiting for {what}: {e}")))
+}
+
+/// Until our child `pid` has exited, left unreaped: a blocking `waitid` with `WNOWAIT`.
+#[cfg(unix)]
+fn exited_blocking(pid: u32) {
+    loop {
+        // SAFETY: an all-zero `siginfo_t` is a valid one for waitid to fill.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: a plain waitid(2) on our own child, writing only `info`.
+        let r = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return;
+        }
+    }
 }
 
 /// How often a group being stopped is looked at ([`drained`]) and, without SIGCHLD, a leader's

@@ -738,18 +738,24 @@ fn status_line(s: &FleetSummary, warnings: &[&str]) -> String {
 
 /// Whether the terminal is the dashboard's now — raw mode, the alternate screen, the mouse — so
 /// an end from outside the loop puts it back ([`restore_best_effort`]); not while `c`'s ssh has
-/// it. Held while the terminal changes hands ([`setup_terminal`], [`restore_terminal`]), while a
-/// frame is drawn ([`while_ours`]) and while that end puts it back: so none of them interleaves
-/// with another, and no frame is drawn once it's back (on the main screen).
+/// it ([`hand_over`]). Held while the terminal changes hands ([`setup_terminal`],
+/// [`restore_terminal`]), while a frame is drawn ([`while_ours`]) and while that end puts it back:
+/// so none of them interleaves with another, no frame is drawn once it's back (on the main
+/// screen), and once the dashboard is ending (`arena_core::remote::ending`) it isn't taken again —
+/// `c`'s ssh stopped by the end, the dashboard doesn't set up its screen again under the exit.
 static TERMINAL: Mutex<bool> = Mutex::new(false);
 
 fn terminal_ours() -> std::sync::MutexGuard<'static, bool> {
     TERMINAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Take the terminal: raw mode, the alternate screen, the mouse.
+/// Take the terminal: raw mode, the alternate screen, the mouse. Refused once the dashboard is
+/// ending.
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     let mut ours = terminal_ours();
+    if arena_core::remote::ending() {
+        anyhow::bail!("the dashboard is ending");
+    }
     *ours = true;
     enable_raw_mode()?;
     let mut out = stdout();
@@ -827,8 +833,8 @@ const HANGUP_POLL: Duration = Duration::from_millis(200);
 /// 3. stdin parked (`arena_core::tty::park_stdin`): the loop's next read waits, no longer spinning
 ///    a core on a dead terminal meanwhile (live ASK5 F1);
 /// 4. every child still running stopped — the AI's whole group, and every ssh, scp and rsync of a
-///    refresh, an action or a backup, which an `exit` left running before (review ai-review
-///    claude #1) — TERM, then KILL after the grace (`arena_core::remote::stop_all_children`);
+///    refresh, an action or a backup, and `c`'s ssh, which an `exit` left running before (review
+///    ai-review claude #1) — TERM, then KILL after the grace (`arena_core::remote::stop_all_children`);
 /// 5. the asks' scratch directories removed (`exit` drops nothing:
 ///    `arena_core::ask::ai::remove_scratch`);
 /// 6. `exit(code)`.
@@ -910,8 +916,8 @@ fn selected_pod(shared: &Arc<Mutex<Shared>>, idx: usize) -> Option<Pod> {
 }
 
 /// Open an interactive SSH shell to the selected pod: suspend the dashboard (leave the
-/// alternate screen + raw mode), hand the terminal to `ssh`, then restore on exit. The one
-/// SSH call that doesn't go through `Remote`, on purpose: it's the operator's own shell —
+/// alternate screen + raw mode), hand the terminal to `ssh`, then restore on exit ([`hand_over`]).
+/// The one SSH call that doesn't go through `Remote`, on purpose: it's the operator's own shell —
 /// it needs the terminal (a PTY, stdin) and has no time budget.
 fn connect_ssh(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -926,19 +932,32 @@ fn connect_ssh(
             return Ok(());
         }
     };
-    restore_terminal(terminal)?;
-    println!(
-        "Connecting to {} ({}@{}:{}) — exit the shell to return to the dashboard…\n",
-        pod.name, target.user, target.host, target.port
-    );
-    // Blocking, inherits this terminal (interactive PTY). ssh_args carries the port/keys.
-    let status = std::process::Command::new("ssh").args(target.ssh_args()).status();
-    *terminal = setup_terminal()?;
-    while_ours(terminal, |t| t.clear())?;
-    if let Err(e) = status {
+    let banner = format!("Connecting to {} ({}@{}:{}) — exit the shell to return to the dashboard…\n", pod.name, target.user, target.host, target.port);
+    // ssh_args carries the port/keys.
+    let mut ssh = std::process::Command::new("ssh");
+    ssh.args(target.ssh_args());
+    if let Err(e) = hand_over(terminal, &banner, &mut ssh)? {
         ui.mode = Mode::Result(format!("✗ ssh {}: {e}", pod.name));
     }
     Ok(())
+}
+
+/// Hand the terminal to `cmd` until it exits — `c`'s ssh: blocking, it inherits this terminal
+/// (an interactive PTY) — `banner` said first on the main screen, then take the terminal back.
+/// While `cmd` has it the terminal isn't the dashboard's ([`TERMINAL`]): a hangup or a TERM then
+/// stops `cmd` with every other child (it's tracked: `arena_core::remote::run_foreground`) and puts
+/// nothing back — the terminal is `cmd`'s to restore — and, the dashboard ending, the terminal
+/// isn't taken back: `Err`, which ends the loop, the exit [`end_now`]'s. Never started once the
+/// dashboard is ending. `Ok(Err)`: `cmd` couldn't be run.
+fn hand_over(terminal: &mut Terminal<CrosstermBackend<Stdout>>, banner: &str, cmd: &mut std::process::Command) -> Result<arena_core::Result<std::process::ExitStatus>> {
+    if !restore_terminal(terminal)? {
+        anyhow::bail!("the dashboard is ending");
+    }
+    println!("{banner}");
+    let status = arena_core::remote::run_foreground(cmd, "ssh");
+    *terminal = setup_terminal()?;
+    while_ours(terminal, |t| t.clear())?;
+    Ok(status)
 }
 
 /// Advance the cadence to the next step in `REFRESH_STEPS` (wrapping).
@@ -5975,6 +5994,14 @@ deep_check_end=1
             }
         }
 
+        /// Keys typed on the terminal.
+        fn keys(&mut self, keys: &str) {
+            use std::io::Write;
+            let stdin = self.script.stdin.as_mut().unwrap();
+            stdin.write_all(keys.as_bytes()).unwrap();
+            stdin.flush().unwrap();
+        }
+
         /// `sig` (`-HUP`, `-TERM`) to the copy.
         fn signal(&self, sig: &str) -> Instant {
             assert!(std::process::Command::new("kill").args([sig, &self.tui]).status().unwrap().success());
@@ -6100,5 +6127,73 @@ deep_check_end=1
         assert!(took >= arena_core::remote::TERM_GRACE - Duration::from_millis(300), "gone {took:?} after: the rsync wasn't waited for");
         assert!(!lone_ran_on, "the rsync {lone} outlived the dashboard");
         assert!(used < 50, "the dashboard used {used} ticks of CPU in the {took:?} it took to end");
+    }
+
+    /// Review ai-review claude #6 (lane ASK9 item 3): `c` hands the terminal to ssh and takes it
+    /// back — and while ssh has it, the terminal isn't the dashboard's. A first `c`, its ssh
+    /// exiting at once: the dashboard's screen is back (left, then entered again). A second `c`,
+    /// its ssh still running, then a HUP: that ssh is stopped with the other children, the
+    /// dashboard exits 129, and writes nothing to the terminal ssh has — no restore into ssh's
+    /// session, no screen set up again as it goes. The dashboard for real, `ssh` a stub on PATH,
+    /// in a copy on a pty ([`OnPty`]). The second stub ignores HUP: the copy leads the terminal's
+    /// session, so its exit would have the kernel HUP its foreground group, ssh in it — which a
+    /// dashboard under a shell, or ended by a TERM from elsewhere, doesn't get (review claude #1:
+    /// that ssh was left a stopped background job); only the dashboard's own stop may end it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hangup_during_cs_ssh_stops_it_and_leaves_its_terminal_alone() {
+        if let Some(dir) = std::env::var_os(ON_PTY) {
+            play_dashboard(std::path::Path::new(&dir));
+        }
+        let dir = pty_dir("ssh", false);
+        let ssh = |n: u32| dir.join(format!("ssh{n}.pid"));
+        arena_core::remote::write_test_script(
+            dir.join("bin/ssh"),
+            format!(
+                "#!/bin/sh\nn=$(cat '{0}/count' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{0}/count'\n\
+                 echo $$ > '{0}'/ssh$n.pid.tmp; mv '{0}'/ssh$n.pid.tmp '{0}'/ssh$n.pid\n[ $n = 1 ] && exit 0\ntrap '' HUP\nexec sleep 60\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let Some(mut on) = OnPty::start("a_hangup_during_cs_ssh_stops_it_and_leaves_its_terminal_alone", &dir) else { return };
+        let wait_file = |p: &std::path::Path| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !p.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            p.exists()
+        };
+        // `c`, ssh exiting at once: the terminal handed over and taken back.
+        let mark = on.len();
+        on.keys("c");
+        let first = wait_file(&ssh(1));
+        let left = on.wait_for(LEAVE, mark, Duration::from_secs(5));
+        let back = left.and_then(|(at, _)| on.wait_for(ENTER, at, Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(300));
+        // `c` again, ssh staying: a HUP while it has the terminal.
+        let mark = on.len();
+        on.keys("c");
+        let second = wait_file(&ssh(2));
+        let handed = on.wait_for(LEAVE, mark, Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(300));
+        let mark = on.len();
+        let sent = on.signal("-HUP");
+        let exited = on.exited_within(arena_core::remote::TERM_GRACE + Duration::from_secs(4));
+        let after = on.text(mark);
+        let ssh2 = std::fs::read_to_string(ssh(2)).unwrap_or_default().trim().to_string();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while running(&ssh2) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ssh_ran_on = !ssh2.is_empty() && running(&ssh2);
+        let all = on.text(0);
+        on.end();
+        assert!(first && left.is_some() && back.is_some(), "the first `c`: ssh ran {first}, handed over {left:?}, back {back:?}: {all:?}");
+        assert!(second && handed.is_some(), "the second `c`: ssh ran {second}, handed over {handed:?}: {all:?}");
+        let (status, _) = exited.unwrap_or_else(|| panic!("the dashboard is still running {:?} after the HUP", sent.elapsed()));
+        assert_eq!(status.code(), Some(129));
+        assert!(!ssh_ran_on, "ssh {ssh2} outlived the dashboard");
+        assert!(!after.contains("\x1b[?1049") && !after.contains("\x1b[?1000"), "the dashboard wrote to ssh's terminal: {after:?}");
     }
 }
