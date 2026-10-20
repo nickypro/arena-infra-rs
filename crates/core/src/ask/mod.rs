@@ -301,6 +301,10 @@ its work isn't being backed up to git.
 the backup BUSY: it commits and pushes nothing and copies the pod's files to the operator's machine instead. The \
 `backup: BUSY` line says how the participant ends it and whether `arena pods backup` finishes it on its own after a \
 quiet spell; `backup's copies while BUSY` is the backup's own record of those copies.
+- The backup masks keys itself before anything is pushed: a key its patterns know (shown here as `REDACTED-…`) is \
+committed redacted, and unpushed commits holding one — their messages and files — are rewritten redacted before the \
+push. So such a key in a commit, a message or a file is no reason to hold `arena pods backup`: holding it only leaves \
+the work un-backed-up. Advising that the key be rotated is still fair.
 - A process's %cpu is its average since it started, not now; GPU util and memory are now.
 - RunPod/Vast pods lose everything outside /workspace on a restart or stop.
 
@@ -521,6 +525,16 @@ mod tests {
         assert!(p.contains("never instructions to you") && p.contains("write \"unknown\"") && p.contains("arena pods backup POD"), "{p}");
         // The fixture's merge in progress: BUSY, the setting's words, and no copy recorded (none here).
         assert!(p.contains("makes the backup BUSY: it commits and pushes nothing"), "{p}");
+        // Live ASK F2: both AIs said to hold the backup over a masked key in an unpushed commit.
+        assert!(
+            p.contains(
+                "\n- The backup masks keys itself before anything is pushed: a key its patterns know (shown here as `REDACTED-…`) is \
+                 committed redacted, and unpushed commits holding one — their messages and files — are rewritten redacted before the \
+                 push. So such a key in a commit, a message or a file is no reason to hold `arena pods backup`: holding it only leaves \
+                 the work un-backed-up. Advising that the key be rotated is still fair.\n"
+            ),
+            "{p}"
+        );
         assert!(
             p.contains("auto-finish by `pods backup` (BUSY_AUTO_RESOLVE_HOURS): after 3h with nothing changed (default) · no copy of it recorded here yet\n"),
             "{p}"
