@@ -1,8 +1,9 @@
 //! RunPod backend, talking to the REST API (https://rest.runpod.io/v1), plus GraphQL for
 //! the few things REST can't do (restart-free rename, GPU catalog/prices, host details).
 //!
-//! RunPod retires REST v1 on 2026-11-15; its replacement is [`super::runpod_v2`], picked
-//! with `RUNPOD_API=v2`. Of the GraphQL helpers here only the pod details (maintenance
+//! RunPod retires REST v1 on 2026-11-15; its replacement is [`super::runpod_v2`], the
+//! default — this backend is used only with an explicit `RUNPOD_API=v1` (see
+//! [`super::RunpodApi`]). Of the GraphQL helpers here only the pod details (maintenance
 //! windows) are shared with it, plus the network-volume listing as its fallback — v2 renames
 //! and reads the GPU catalog over REST (see "GraphQL dependency inventory" in `runpod_v2`).
 //!
@@ -15,7 +16,7 @@ use async_trait::async_trait;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Value};
 
-use super::{ContainerReset, Provider};
+use super::{ContainerReset, Provider, RUNPOD_V1_REMEDY};
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, ProviderErrorKind, Result};
 use crate::http::{send_json, send_ok};
@@ -126,7 +127,7 @@ const MANAGED: &[Managed] = &[
     managed(&["env", "MACHINE_NAME"], "the machine name"),
     managed(&["dockerStartCmd"], "--bootstrap, else the image's own, which starts sshd"),
     managed(&["dockerEntrypoint"], "the image's own, which starts sshd"),
-    managed(&["locked"], "`pods up --lock` (RUNPOD_API=v2)"),
+    managed(&["locked"], "`pods up --lock`, on REST v2 only — remove RUNPOD_API=v1 (v2 is the default)"),
     managed(&["templateId"], "the flags above — a template would override the start command and volume arena sets"),
     managed(&["computeType"], "--gpu / GPU_TYPE: arena makes GPU pods"),
 ];
@@ -135,7 +136,7 @@ const MANAGED: &[Managed] = &[
 /// enum (docs.runpod.io "Create a Pod", checked 2026-10-09), newest first. It stops at 13.0 —
 /// live, `13.1`/`13.2` were refused with `400 … does not meet the schema requirements`. v1
 /// has no `minCudaVersion`, so a floor is sent as every version here at or above it — which
-/// can't reach a 13.1+ host (RUNPOD_API=v2 sends a real floor).
+/// can't reach a 13.1+ host (v2, the default, sends a real floor).
 pub const V1_CUDA_VERSIONS: [&str; 12] = ["13.0", "12.9", "12.8", "12.7", "12.6", "12.5", "12.4", "12.3", "12.2", "12.1", "12.0", "11.8"];
 
 /// The `allowedCudaVersions` REST v1 should send for `spec`: its exact set (every entry must
@@ -154,7 +155,7 @@ pub fn v1_cuda_versions(spec: &PodSpec) -> Result<Option<Vec<String>>> {
             .collect();
         if !bad.is_empty() {
             return Err(Error::Config(format!(
-                "EXACT_CUDA_VERSIONS {}: RunPod REST v1 accepts only {} — set RUNPOD_API=v2 for newer hosts",
+                "EXACT_CUDA_VERSIONS {}: RunPod REST v1 accepts only {} — {RUNPOD_V1_REMEDY} for newer hosts",
                 bad.join(", "),
                 accepted()
             )));
@@ -172,7 +173,7 @@ pub fn v1_cuda_versions(spec: &PodSpec) -> Result<Option<Vec<String>>> {
         V1_CUDA_VERSIONS.iter().filter(|v| cuda_key(v).is_some_and(|k| k >= min)).map(|v| v.to_string()).collect();
     if at_least.is_empty() {
         return Err(Error::Config(format!(
-            "CUDA floor {floor}: RunPod REST v1 can't ask for it (its newest is {}) — set RUNPOD_API=v2, which sends a real minimum",
+            "CUDA floor {floor}: RunPod REST v1 can't ask for it (its newest is {}) — {RUNPOD_V1_REMEDY}: v2 sends a real minimum",
             V1_CUDA_VERSIONS[0]
         )));
     }
@@ -269,7 +270,7 @@ fn parse_pod(v: &Value) -> Pod {
         // checks — several RunPod hosts share one public IP (finding #23).
         machine_id: v.get("machineId").and_then(loose_string),
         // REST v1's pod carries `locked` too, when it says (best-effort: v1 can't change
-        // it — `pods lock`/`unlock` need RUNPOD_API=v2 — but a lock set in the console is
+        // it — `pods lock`/`unlock` need REST v2, the default — but a lock set in the console is
         // still shown, and still refused up front by stop/restart/terminate).
         locked: v.get("locked").and_then(Value::as_bool),
         // REST v1 can't tell a host without a public IP from one still booting; v1 creates
@@ -316,7 +317,7 @@ impl Provider for RunpodProvider {
         // v1 can't send a floor: say what its version list leaves out (finding #10).
         let note = match (spec.allowed_cuda.is_empty(), v1_cuda_versions(spec)) {
             (true, Ok(Some(_))) => format!(
-                " (REST v1 sends its list's versions ≥ the floor, up to {} — newer hosts aren't eligible; RUNPOD_API=v2 sends a real floor)",
+                " (REST v1 sends its list's versions ≥ the floor, up to {} — newer hosts aren't eligible; {RUNPOD_V1_REMEDY}: v2 sends a real floor)",
                 V1_CUDA_VERSIONS[0]
             ),
             (_, Err(e)) => format!(" (refused: {e})"),
@@ -395,7 +396,7 @@ impl Provider for RunpodProvider {
     fn lock_support(&self, _pod: &Pod) -> Result<()> {
         // REST v1's only pod PATCH resets the container (see `reimage_pod`), so it can't be
         // used to flip a lock; v2's PATCH can.
-        Err(Error::NotImplemented("not supported on RUNPOD_API=v1 — set RUNPOD_API=v2 to lock RunPod pods".into()))
+        Err(Error::NotImplemented(format!("not supported on RUNPOD_API=v1 — {RUNPOD_V1_REMEDY} to lock RunPod pods")))
     }
 
     async fn set_locked(&self, id: &str, _locked: bool) -> Result<()> {
@@ -1120,7 +1121,8 @@ mod tests {
 
     /// Finding #10 on v1: a floor goes out as every schema version at or above it (v1 has no
     /// `minCudaVersion`); its schema stops at 13.0, so 13.1/13.2 — live 400s — are refused
-    /// before the request, with RUNPOD_API=v2 named; the dry-run says what v1 can't reach.
+    /// before the request, naming the way back to v2 (the default); the dry-run says what v1
+    /// can't reach.
     #[test]
     fn v1_sends_a_floor_as_its_enum_values_at_or_above_it() {
         let mut s = spec();
@@ -1129,14 +1131,14 @@ mod tests {
         s.min_cuda = Some("12.8".into());
         assert_eq!(create_payload(&s).unwrap()["allowedCudaVersions"], json!(["13.0", "12.9", "12.8"]));
         let d = RunpodProvider::new("k").describe(&s);
-        assert!(d.contains("CUDA ≥ 12.8") && d.contains("newer hosts aren't eligible") && d.contains("RUNPOD_API=v2"), "{d}");
+        assert!(d.contains("CUDA ≥ 12.8") && d.contains("newer hosts aren't eligible") && d.contains(RUNPOD_V1_REMEDY), "{d}");
         s.min_cuda = Some("13.1".into());
         let e = create_payload(&s).unwrap_err().to_string();
-        assert!(e.contains("can't ask for it") && e.contains("RUNPOD_API=v2"), "{e}");
+        assert!(e.contains("can't ask for it") && e.contains(RUNPOD_V1_REMEDY), "{e}");
         s.min_cuda = None;
         s.allowed_cuda = vec!["13.0".into(), "13.1".into(), "13.2".into()];
         let e = create_payload(&s).unwrap_err().to_string();
-        assert!(e.contains("EXACT_CUDA_VERSIONS 13.1, 13.2") && e.contains("RUNPOD_API=v2"), "{e}");
+        assert!(e.contains("EXACT_CUDA_VERSIONS 13.1, 13.2") && e.contains(RUNPOD_V1_REMEDY), "{e}");
         assert!(RunpodProvider::new("k").describe(&s).contains("refused"), "the dry run says so too");
         s.allowed_cuda = vec!["12.8".into()];
         assert_eq!(create_payload(&s).unwrap()["allowedCudaVersions"], json!(["12.8"]));

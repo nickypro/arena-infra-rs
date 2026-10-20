@@ -2,6 +2,11 @@
 
 **Last updated: 2026-10-07**
 
+> **REST v1 only.** Since 2026-10-19 the default backend is REST **v2** (`api.runpod.io/v2`,
+> `provider/runpod_v2.rs` — its module doc is the v2 reference, GraphQL inventory included).
+> What follows describes REST v1, used only with an explicit `RUNPOD_API=v1` until RunPod
+> retires it on 2026-11-15.
+
 > Hand-maintained reference — it may drift from RunPod's live API. When in doubt, re-verify
 > against the live OpenAPI spec at `https://rest.runpod.io/v1/openapi.json` and the RunPod web
 > dashboard (watch its network tab for the GraphQL calls). See also the project memory note

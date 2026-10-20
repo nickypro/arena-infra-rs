@@ -31,6 +31,7 @@ mod hetzner_setup_tests;
 mod jobs;
 mod money;
 mod reap;
+mod resolve;
 mod teardown;
 mod up;
 
@@ -306,6 +307,15 @@ impl SelectOpts {
     }
 }
 
+/// Who a fleet-wide backup command (`backup`, `pull`, `init-branches`, `set-branch --all`)
+/// acts on when it names no pod: this cohort's ([`split_cohort`]), or with the flag every pod.
+#[derive(clap::Args, Debug, Clone, Copy, Default)]
+struct CohortScope {
+    /// With no pods named (or --all): every pod, staff boxes and other prefixes too
+    #[arg(long)]
+    include_non_cohort: bool,
+}
+
 #[derive(clap::Args, Debug, Clone, Default)]
 #[command(next_help_heading = "Target selection")]
 struct Select {
@@ -454,6 +464,8 @@ enum CronCmd {
     /// Each flag names one line (backup, proxy, snapshot, archive, reap); only those are
     /// (re)written and the rest are kept. No flag = the backup line. A rewritten backup line
     /// keeps the installed one's --pull, start date and schedule unless you change them.
+    /// Locks live in ~/.local/state/arena-cron/, logs too (backup.log, …) unless the installed
+    /// line logs elsewhere already: that path is kept. Old default logs (~/arena-cron.log) move.
     #[command(verbatim_doc_comment)]
     Install {
         /// The backup line: `pods backup` every 15 min (git only unless --pull)
@@ -921,12 +933,13 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Restart a pod in place (RunPod v2 WIPES its disk; v1 and Vast may)
+    /// Restart a pod in place (RunPod WIPES its disk; RunPod v1, Vast may)
     ///
-    /// On RunPod v2 everything outside a /workspace volume is lost (files, ~/.name, keys); RunPod
-    /// v1 and Vast may lose it, so they're gated the same. Refused without --wipe-ok unless the
-    /// pod's repo is on a volume, even with --yes. Then waits for SSH, re-runs setup and syncs the
-    /// proxy. Hetzner's reset keeps the disk. A stopped pod is refused: use `pods start`.
+    /// On RunPod (REST v2, the default) everything outside a /workspace volume (VOLUME_GB) is
+    /// lost (files, ~/.name, keys); RunPod v1 and Vast may lose it, so they're gated the same.
+    /// Refused without --wipe-ok unless the pod's repo is on a volume, even with --yes. Then
+    /// waits for SSH, re-runs setup and syncs the proxy. Hetzner's reset keeps the disk. A
+    /// stopped pod is refused: use `pods start`.
     #[command(verbatim_doc_comment)]
     Restart {
         /// Machine name (e.g. arena8-apple) or raw provider id.
@@ -1114,7 +1127,9 @@ enum PodCmd {
     ///
     /// Pushes the current branch (never main/master), then runs `pods pull`; --no-pull = git
     /// only. No targets (or --all) = this cohort's reachable pods (`<prefix>-*`, not @ staff
-    /// entries); name a staff box to include it.
+    /// entries); name a staff box to include it, or --include-non-cohort for every pod.
+    /// A pod mid-merge is copied instead; one left alone BUSY_AUTO_RESOLVE_HOURS (3) is
+    /// finished, per file and hunk by the side changed last, then backed up.
     #[command(verbatim_doc_comment)]
     Backup {
         /// Only do the git push; skip the rsync file backup.
@@ -1127,12 +1142,15 @@ enum PodCmd {
         #[arg(long)]
         message: Option<String>,
         #[command(flatten)]
+        cohort: CohortScope,
+        #[command(flatten)]
         sel: Select,
     },
     /// Rsync each pod's home to the local backup folder
     ///
     /// Writes a dated snapshot (files under --max-size) and the complete `big/` mirror. No
-    /// targets (or --all) = this cohort's pods with an SSH endpoint (not @ staff entries).
+    /// targets (or --all) = this cohort's pods with an SSH endpoint (not @ staff entries;
+    /// --include-non-cohort: every pod).
     /// Each pod's rsync is time-limited (BACKUP_TIMEOUT_SECS).
     #[command(verbatim_doc_comment)]
     Pull {
@@ -1160,6 +1178,8 @@ enum PodCmd {
         /// The old spelling of the targets (`pods pull -t bravo`), still accepted.
         #[arg(long = "target", short = 't', value_name = "TARGET", hide = true)]
         target_flag: Vec<String>,
+        #[command(flatten)]
+        cohort: CohortScope,
         #[command(flatten)]
         sel: Select,
     },
@@ -1221,7 +1241,8 @@ enum PodCmd {
     },
     /// Create + push each pod's wNdM autocommit branch
     ///
-    /// No targets (or --all) = this cohort's pods (`<prefix>-*`, not @ staff entries).
+    /// No targets (or --all) = this cohort's pods (`<prefix>-*`, not @ staff entries;
+    /// --include-non-cohort: every pod).
     #[command(verbatim_doc_comment)]
     InitBranches {
         /// Override the iteration week (default: computed from ARENA_START_DATE).
@@ -1234,25 +1255,30 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
         #[command(flatten)]
+        cohort: CohortScope,
+        #[command(flatten)]
         sel: Select,
     },
     /// Switch pods' git branch (ff-only; --hard force-resets)
     ///
     /// --all = this cohort's pods (`<prefix>-*`, not @ staff entries); name a staff box to
-    /// include it. On main/master no backup commits until `init-branches` (or --init-branches).
+    /// include it, or --include-non-cohort for every pod. On main/master no backup commits until
+    /// `init-branches` (or --init-branches).
     #[command(verbatim_doc_comment)]
     SetBranch {
         /// Branch to check out (e.g. main, or a feature branch).
         branch: String,
-        /// DESTRUCTIVE: reset to `origin/<branch>`, dropping local commits and changes
+        /// DESTRUCTIVE: reset to `origin/<branch>`, dropping local commits/changes; overwrites files it tracks
         #[arg(long)]
         hard: bool,
-        /// Then create + push each pod's day branch, as `init-branches` does
+        /// Then create + push the day branch of each pod that switched, as `init-branches` does
         #[arg(long)]
         init_branches: bool,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        #[command(flatten)]
+        cohort: CohortScope,
         #[command(flatten)]
         sel: Select,
     },
@@ -2380,8 +2406,8 @@ async fn checked_gpu(cfg: &Config, provider_name: &str, gpu: Option<String>) -> 
 /// live catalog: live (finding #22), `PRO 6000 MIG 24GB` passed the catalog check, ranked
 /// first in `offers`, and its create was a `400 … schema requirements`. So on v1, with the
 /// enum at hand, a `--gpu` id outside it is refused before anything is listed or created —
-/// naming RUNPOD_API=v2, whose create takes it. An empty enum (couldn't be read) refuses
-/// nothing: placement then skips an option the API rejects. Pure.
+/// saying how to get back to v2 (the default), whose create takes it. An empty enum
+/// (couldn't be read) refuses nothing: placement then skips an option the API rejects. Pure.
 fn v1_creatable_check(ids: &str, catalog: &[arena_core::provider::runpod::GpuType], creatable: &[String]) -> Result<()> {
     if creatable.is_empty() {
         return Ok(());
@@ -2399,8 +2425,9 @@ fn v1_creatable_check(ids: &str, catalog: &[arena_core::provider::runpod::GpuTyp
     }
     anyhow::bail!(
         "--gpu {}: in RunPod's catalog, but REST v1's create API rejects it (not in its gpuTypeIds list) — \
-         set RUNPOD_API=v2 (which creates it), or pick another --gpu (`arena gpus` hides what v1 can't create)",
-        bad.join(", ")
+         v2's create takes it: {}, or pick another --gpu (`arena gpus` hides what v1 can't create)",
+        bad.join(", "),
+        arena_core::provider::RUNPOD_V1_REMEDY
     )
 }
 
@@ -2782,7 +2809,7 @@ async fn run() -> Result<()> {
         Cmd::Tui => launch_tui(&cli.provider, &cli.config),
         Cmd::Plan(c) => handle_plan(c, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &cli.config),
-        Cmd::Cron(c) => handle_cron(c, &cfg, &cli.config, cli.yes, CRONTAB).await,
+        Cmd::Cron(c) => handle_cron(c, &cfg, &cli.config, cli.yes, CRONTAB, std::env::var("HOME").ok().as_deref()).await,
         Cmd::Archive(c) => archive::handle_archive(c, &cfg, remote.as_ref(), cli.yes).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
@@ -3150,9 +3177,14 @@ const RUN_TIMEOUT_SECS: u64 = 30 * 60;
 /// a first push of notebooks/outputs can take minutes. 5 min.
 const BACKUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// `pods set-branch` / `init-branches`: a fetch + checkout (+ ff-pull or push) against
+/// `pods set-branch` / `init-branches`: a fetch + checkout (+ fast-forward or push) against
 /// GitHub — seconds normally, so 2 min means stuck (a hung fetch, a held lock).
 const BRANCH_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+
+// set-branch's switch and init-branches bound themselves on the pod (`timeout`, then a KILL) inside
+// that budget, so their pod side has ended before arena reports a timeout and releases the pod's
+// lock (review ai-review claude #13).
+const _: () = assert!(arena_core::backup::SWITCH_BOUND_SECS + arena_core::backup::SWITCH_KILL_AFTER_SECS < BRANCH_TIMEOUT.as_secs());
 
 /// `pods cp`'s scp budget floor: connection setup, a small file, a slow start — 10 min.
 /// What's copied adds to it ([`cp_timeout`]). Its `mkdir -p` and post-copy size check are
@@ -3622,8 +3654,9 @@ fn with_arena_block(existing: &str, lines: &[String]) -> String {
 const CRONTAB: &str = "crontab";
 
 /// `arena cron …`. `crontab` is the program that reads (`-l`) and replaces (`-`) the user's
-/// crontab: [`CRONTAB`] for real, a stub over a file in tests.
-async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, yes: bool, crontab: &str) -> Result<()> {
+/// crontab: [`CRONTAB`] for real, a stub over a file in tests. `home` is `$HOME` (a temp dir in
+/// tests): the home the lines run in, which `install`/`remove` check first ([`cron_home`]).
+async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, yes: bool, crontab: &str, home: Option<&str>) -> Result<()> {
     use tokio::process::Command;
 
     // Read the current crontab (no crontab installed => empty, not an error).
@@ -3648,19 +3681,30 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             Ok(())
         }
         CronCmd::Remove { backup, proxy, snapshot, archive, reap, dry_run } => {
+            cron_home(home, effective_uid()?)?;
             let mut kinds = CronKind::selected(backup, proxy, snapshot, archive);
             if reap {
                 kinds.push(CronKind::Reap);
             }
             // No flag: the whole block, hand edits inside it included (as always).
             let after = if kinds.is_empty() { Vec::new() } else { merge_cron_block(&before, &kinds, &[]) };
-            apply_cron_change(&current, &before, &after, &[], dry_run, yes, crontab).await
+            apply_cron_change(&current, &before, &after, &[], dry_run, yes, crontab).await.map(|_| ())
         }
         CronCmd::Install { backup, schedule, start_date, no_start_date, pull, no_pull, proxy, snapshot, archive, reap, dry_run } => {
+            // Once, before anything is written: the tidy after the write uses it too, so nothing
+            // can fail once the crontab is in (review ai-review claude #10).
+            let euid = effective_uid()?;
+            let home = &cron_home(home, euid)?;
             let exe = std::env::current_exe().context("finding the arena executable path")?;
             let cfg_abs = std::fs::canonicalize(config_path)
                 .unwrap_or_else(|_| config_path.to_path_buf());
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            // Every path the lines carry unquoted: refused before anything is shown or written.
+            crontab_word("HOME", home)?;
+            crontab_word("the arena binary", &exe.display().to_string())?;
+            crontab_word("the config path", &cfg_abs.display().to_string())?;
+            // The logs the installed lines chose themselves: kept (arena never moves those).
+            let kept_logs = kept_logs(&before, home);
+            let kept_log = |k: CronKind| kept_logs.iter().find(|(x, _)| *x == k).map(|(_, l)| l.as_str());
             let start_date = start_date.map(|d| d.trim().to_string());
             if let Some(d) = &start_date {
                 arena_core::schedule::parse_ymd(d).context("--start-date must be YYYY-MM-DD")?;
@@ -3677,7 +3721,7 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             );
             let reap_line = reap
                 .as_deref()
-                .map(|mode| reap_cron_line(mode == "apply", config_path, &exe.display().to_string(), &cfg_abs.display().to_string(), &home))
+                .map(|mode| reap_cron_line(mode == "apply", config_path, &exe.display().to_string(), &cfg_abs.display().to_string(), home, kept_log(CronKind::Reap)))
                 .transpose()?;
             let mut notes = Vec::new();
             // The backup line's options: each flag, else the installed line's (so a
@@ -3685,13 +3729,6 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             // start date), else the default.
             let installed = before.iter().find(|l| CronKind::of(l) == Some(CronKind::Backup));
             let read_back = installed.and_then(|l| BackupOpts::of_line(l));
-            if backup && installed.is_some() && read_back.is_none() {
-                notes.push(
-                    "note: couldn't read the installed backup line's options (hand-edited?) — it is rewritten from \
-                     these flags alone; check the diff"
-                        .to_string(),
-                );
-            }
             let flags = BackupFlags {
                 schedule: schedule.as_deref(),
                 start_date: start_date.as_deref(),
@@ -3699,6 +3736,7 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
                 pull,
                 no_pull,
             };
+            notes.extend(backup_read_note(backup, installed.map(String::as_str), read_back.as_ref(), &flags));
             let (opts, kept) = resolve_backup_opts(read_back.as_ref(), &flags);
             if backup && !kept.is_empty() {
                 notes.push(format!(
@@ -3744,13 +3782,14 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
                 env_prefix: &env_prefix,
                 exe: &exe.display().to_string(),
                 config: &cfg_abs.display().to_string(),
-                home: &home,
+                home,
                 backup,
                 pull: opts.pull,
                 proxy,
                 snapshot_dir: snapshot_dir.as_deref(),
                 archive: archive || rerender_archive,
                 archive_state_dir: archive_state_dir.as_deref(),
+                kept_logs: &kept_logs,
             });
             let mut lines = lines;
             if let Some(l) = reap_line {
@@ -3758,6 +3797,16 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             }
             let kinds: Vec<CronKind> = lines.iter().map(|(k, _)| *k).collect();
             let after = merge_cron_block(&before, &kinds, &lines);
+            let kept: Vec<String> =
+                kinds.iter().filter_map(|&k| kept_log(k).map(|l| format!("{l} ({})", k.label()))).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+            if !kept.is_empty() {
+                notes.push(format!(
+                    "note: keeping each installed line's own log: {} (arena's default, for a new line: ~/{}/)",
+                    kept.join(", "),
+                    arena_core::cron::DIR
+                ));
+            }
+            notes.extend(unread_logs_note(&before, &kinds));
             // The archive pushes what the backup line's `--pull` writes: without it there is
             // nothing new to push.
             if archive && !after.iter().any(|l| BackupOpts::of_line(l).is_some_and(|o| o.pull)) {
@@ -3776,14 +3825,22 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
                         .to_string(),
                 );
             }
-            apply_cron_change(&current, &before, &after, &notes, dry_run, yes, crontab).await
+            if apply_cron_change(&current, &before, &after, &notes, dry_run, yes, crontab).await? {
+                // Only once it's written: until then, the old lines still use their old files.
+                let plan = tidy_plan(&kinds, &before, &after, home, &with_arena_block(&current, &after));
+                if let Some(line) = tidy_line(&tidy_old_cron_files(&plan, home, euid)) {
+                    println!("{line}");
+                }
+            }
+            Ok(())
         }
     }
 }
 
 /// Show what a `cron install`/`remove` changes in arena's block — the [`cron_diff`], then
 /// the `notes` — then confirm and write the whole crontab back with only that block
-/// changed. Nothing to change, or a dry run: say so and write nothing.
+/// changed. Nothing to change, or a dry run: say so and write nothing. Returns whether the
+/// crontab was written.
 async fn apply_cron_change(
     current: &str,
     before: &[String],
@@ -3792,13 +3849,13 @@ async fn apply_cron_change(
     dry_run: bool,
     yes: bool,
     crontab: &str,
-) -> Result<()> {
+) -> Result<bool> {
     if before == after {
         println!("The arena cron lines are already as asked — nothing to change.");
         for n in notes {
             println!("{n}");
         }
-        return Ok(());
+        return Ok(false);
     }
     println!("arena cron lines, before → after (- removed, + added):");
     for l in cron_diff(before, after) {
@@ -3809,15 +3866,346 @@ async fn apply_cron_change(
     }
     if dry_run {
         println!("\nPreview only — run without --dry-run to change the crontab.");
-        return Ok(());
+        return Ok(false);
     }
     if !confirm(yes, "\nWrite this crontab change?")? {
         println!("aborted.");
-        return Ok(());
+        return Ok(false);
     }
     write_crontab(&with_arena_block(current, after), crontab).await?;
     println!("Crontab updated (view with `arena cron show`).");
+    Ok(true)
+}
+
+/// The home `cron install`/`remove` writes lines for: `$HOME`, checked — set, absolute, free
+/// of whitespace, `%` and newlines (the lines carry it unquoted, and crontab turns a `%` into a
+/// newline), and a directory the effective user (`euid`) owns. Under `sudo -E` it would be
+/// another user's home: root's lines would create folders there, and the tidy would act on
+/// that user's files. (`install` also holds it to [`crontab_word`]'s alphabet: `remove` writes
+/// no path.)
+fn cron_home(home: Option<&str>, euid: u32) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    const AS_USER: &str = "run as the user whose crontab this is (sudo -i / sudo -H)";
+    let home = match home {
+        None | Some("") => anyhow::bail!("HOME isn't set — {AS_USER}"),
+        Some(h) if !h.starts_with('/') => anyhow::bail!("HOME={h} isn't an absolute path — {AS_USER}"),
+        Some(h) => h,
+    };
+    if let Some(c) = home.chars().find(|c| c.is_whitespace() || *c == '%') {
+        anyhow::bail!("HOME={home:?} holds {}, which a crontab line can't carry", char_named(c));
+    }
+    let meta = std::fs::metadata(home).map_err(|e| anyhow::anyhow!("HOME={home}: {e} — {AS_USER}"))?;
+    if !meta.is_dir() {
+        anyhow::bail!("HOME={home} isn't a directory — {AS_USER}");
+    }
+    if meta.uid() != euid {
+        anyhow::bail!("HOME={home} isn't this user's home (owner uid {}, running as {euid}) — {AS_USER}, not sudo -E", meta.uid());
+    }
+    Ok(home.to_string())
+}
+
+/// This process's effective uid: the owner of a file it has just created in the temp dir (and
+/// removed), else of `/proc/self`, else `id -u`. Why the file first (review fb2 F10): a new
+/// file is owned by the uid this process makes files as — what the HOME check and the tidy
+/// compare with — whereas `/proc/<pid>` is made root's for a process that isn't dumpable (a
+/// setuid or capability wrapper, `fs.suid_dumpable=0` after a credential change), which would
+/// read a user as uid 0. No libc call: no new crate.
+fn effective_uid() -> Result<u32> {
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(test)]
+    if let Some(left) = EUID_ANSWERS.with(std::cell::Cell::get) {
+        anyhow::ensure!(left > 0, "the effective uid can't be read (a test's)");
+        EUID_ANSWERS.with(|n| n.set(Some(left - 1)));
+    }
+    if let Some(uid) = created_file_owner(&std::env::temp_dir()) {
+        return Ok(uid);
+    }
+    if let Ok(m) = std::fs::metadata("/proc/self") {
+        return Ok(m.uid());
+    }
+    let out = std::process::Command::new("id").arg("-u").output().context("running `id -u`")?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().context("reading the effective uid from `id -u`")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Under test: how many more times [`effective_uid`] answers before it fails (`None`: it always
+    /// answers) — so a test can make any read after the first fail. A `#[tokio::test]` runs the
+    /// command on its own thread, so this is that test's.
+    static EUID_ANSWERS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The owner of a file created new in `dir` (`create_new`, so never someone else's file), read
+/// from the open file and removed at once. `None` when none could be made.
+fn created_file_owner(dir: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    (0..4).find_map(|i| {
+        let path = dir.join(format!(".arena-euid-{}-{nanos}-{i}", std::process::id()));
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).ok()?;
+        let uid = file.metadata().ok().map(|m| m.uid());
+        let _ = std::fs::remove_file(&path);
+        uid
+    })
+}
+
+/// `value` (`what`: HOME, the arena binary, the config path), an absolute path `cron install`
+/// writes into its lines as one plain, unquoted shell word — refused, in one line naming the
+/// first character at fault, unless it is absolute and every character is in
+/// [`CRON_PATH_CHARS`]. Whitespace or `%` (crontab turns it into a newline) silently cut the
+/// command short, but so does more (review pr4): a valid, owned HOME `/srv/o'neil` or a config
+/// `/srv/course(2026)/config.env` is a shell syntax error on every tick, so arena never runs;
+/// `&`, `;`, `$`, a backtick change what the line runs. Refused rather than quoted, so reading an
+/// installed line back stays splitting it into words.
+fn crontab_word(what: &str, value: &str) -> Result<()> {
+    if !value.starts_with('/') {
+        anyhow::bail!("{what} ({value:?}) can't go into a crontab line: it isn't an absolute path");
+    }
+    if let Some(c) = cron_unsafe_char(value) {
+        anyhow::bail!(
+            "{what} ({value:?}) can't go into a crontab line: it holds {} — the line carries it unquoted, so only letters, \
+             digits and `{CRON_PATH_CHARS}` may be in it; use a path without it",
+            char_named(c)
+        );
+    }
     Ok(())
+}
+
+/// The characters besides ASCII letters and digits a path may hold to go into a crontab line
+/// unquoted ([`crontab_word`]): none of them means anything to `sh` inside a word that starts with
+/// `/` (no `~`, `$`, quotes, globs, `#`, separators or redirections), nor to crontab (no `%`).
+const CRON_PATH_CHARS: &str = "./_+@:,=-";
+
+/// The first character of `path` outside ASCII letters, digits and [`CRON_PATH_CHARS`], if any.
+/// Pure.
+fn cron_unsafe_char(path: &str) -> Option<char> {
+    path.chars().find(|c| !c.is_ascii_alphanumeric() && !CRON_PATH_CHARS.contains(*c))
+}
+
+/// A character as a refusal names it: `' (U+0027)`, `a space (U+0020)` — whitespace and control
+/// characters by name, so the line stays one line. Pure.
+fn char_named(c: char) -> String {
+    let name = match c {
+        ' ' => "a space".to_string(),
+        '\t' => "a tab".to_string(),
+        '\n' => "a newline".to_string(),
+        c if c.is_whitespace() || c.is_control() => "a control or space character".to_string(),
+        c => c.to_string(),
+    };
+    format!("{name} (U+{:04X})", u32::from(c))
+}
+
+/// A crontab line's log: `PATH` when the line ends in an append of its output to one file —
+/// `>> PATH 2>&1` as arena's lines do, or a hand edit's `>>PATH 2>&1`, `>> PATH` or `>>PATH`
+/// (review fb2 F8: those moved to the default log, said only by the diff). `None` for any other
+/// ending — none, `> PATH`, `2>>ERR`, a comment after it, a quoted path with a space — which
+/// [`unread_log`] tells apart from a line that logs nowhere. Pure.
+fn cron_log_target(line: &str) -> Option<&str> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let words = words.strip_suffix(&["2>&1"]).unwrap_or(&words);
+    let path = match words {
+        [.., ">>", path] => *path,
+        [.., last] => last.strip_prefix(">>")?,
+        [] => return None,
+    };
+    Some(path).filter(|p| !p.is_empty() && !p.starts_with(['>', '&']))
+}
+
+/// The output redirection of a crontab line whose log [`cron_log_target`] can't read (from its
+/// first word with a `>` other than `2>&1`: `> /x.log 2>&1`, `>> /x.log 2>>/err`, …) — a re-install
+/// logs it to arena's default instead, which the install's note says. `None`: its log was read,
+/// or it has none. Pure.
+fn unread_log(line: &str) -> Option<String> {
+    if cron_log_target(line).is_some() {
+        return None;
+    }
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let from = words.iter().position(|w| w.contains('>') && *w != "2>&1")?;
+    Some(words[from..].join(" "))
+}
+
+/// The note `cron install` adds when an installed line of a kind it rewrites (`kinds`; the first
+/// of each, the one replaced in place: [`kept_logs`]) has a log it couldn't read
+/// ([`unread_log`]): those lines now log to arena's default, and how to keep one. Pure.
+fn unread_logs_note(before: &[String], kinds: &[CronKind]) -> Option<String> {
+    let mut seen = Vec::new();
+    let mut unread = Vec::new();
+    for line in before {
+        let Some(kind) = CronKind::of(line).filter(|k| kinds.contains(k) && !seen.contains(k)) else { continue };
+        seen.push(kind);
+        if let Some(redirect) = unread_log(line) {
+            unread.push(format!("{} (`{redirect}`)", kind.label()));
+        }
+    }
+    (!unread.is_empty()).then(|| {
+        format!(
+            "note: couldn't read where these installed lines log — their new lines log to arena's default (~/{}/) instead; end \
+             a line with `>> PATH 2>&1` for a re-install to keep its log; check the diff: {}",
+            arena_core::cron::DIR,
+            unread.join(", ")
+        )
+    })
+}
+
+/// A crontab line's `flock` file: the word after `flock` and its `-…` options.
+fn cron_lock_target(line: &str) -> Option<&str> {
+    let mut words = line.split_whitespace().skip_while(|w| *w != "flock").skip(1);
+    words.find(|w| !w.starts_with('-'))
+}
+
+/// The logs the installed lines chose themselves ([`arena_core::cron::LogPlace::Chosen`]), by
+/// kind: a re-install keeps each, so arena never moves a log path someone picked (a folder
+/// logrotate rotates, say). The first line of a kind decides — the one a re-install replaces in
+/// place. Pure.
+fn kept_logs(before: &[String], home: &str) -> Vec<(CronKind, String)> {
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for line in before {
+        let Some(kind) = CronKind::of(line).filter(|k| !seen.contains(k)) else { continue };
+        seen.push(kind);
+        if let Some(log) = cron_log_target(line).filter(|l| arena_core::cron::log_place(home, kind.job(), l) == arena_core::cron::LogPlace::Chosen) {
+            out.push((kind, log.to_string()));
+        }
+    }
+    out
+}
+
+/// An old file of a line `cron install` replaced, tidied once the crontab is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OldCronFile {
+    /// An earlier default log: moved to the new line's log.
+    Log { old: String, new: String },
+    /// An earlier default lock: deleted.
+    Lock(String),
+}
+
+/// What to tidy after an install: for each of the installed `kinds` whose lines it changed and
+/// whose new line logs to arena's default (a kept log means no tidy for that kind), the exact
+/// paths each replaced line named — its log and its lock — when that path is an earlier arena
+/// default for `home` ([`arena_core::cron::log_place`], [`arena_core::cron::is_old_lock`]) and
+/// the `written` crontab doesn't still name it (by its path under the home, so a hand-added
+/// line's `~/arena-cron.log` counts). Never `$HOME` plus a name: only paths the replaced lines
+/// themselves used. Pure.
+fn tidy_plan(kinds: &[CronKind], before: &[String], after: &[String], home: &str, written: &str) -> Vec<OldCronFile> {
+    use arena_core::cron::{self, LogPlace};
+    let of = |lines: &[String], k: CronKind| lines.iter().filter(|l| CronKind::of(l) == Some(k)).cloned().collect::<Vec<_>>();
+    let still_named = |path: &str| written.contains(path.strip_prefix(&format!("{home}/")).unwrap_or(path));
+    let mut plan = Vec::new();
+    for &k in kinds {
+        let (old_lines, new_lines) = (of(before, k), of(after, k));
+        let Some(new) = new_lines.first().and_then(|l| cron_log_target(l)).filter(|l| *l == cron::log(home, k.job())) else { continue };
+        if old_lines == new_lines {
+            continue;
+        }
+        for line in &old_lines {
+            let log = cron_log_target(line).filter(|l| cron::log_place(home, k.job(), l) == LogPlace::OldDefault && !still_named(l));
+            let lock = cron_lock_target(line).filter(|l| cron::is_old_lock(home, k.job(), l) && !still_named(l));
+            for file in [log.map(|old| OldCronFile::Log { old: old.into(), new: new.into() }), lock.map(|l| OldCronFile::Lock(l.into()))].into_iter().flatten() {
+                if !plan.contains(&file) {
+                    plan.push(file);
+                }
+            }
+        }
+    }
+    plan
+}
+
+/// What [`tidy_old_cron_files`] did, by old path.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CronTidy {
+    /// Old logs moved to the new ones (appended when a new log was already there).
+    moved: Vec<String>,
+    /// Old logs left where they are, with why: not a regular file of this user's (a symlink is
+    /// never followed), or a new log that isn't a regular file.
+    left: Vec<String>,
+    /// Old files that couldn't be moved or removed, with why.
+    failed: Vec<String>,
+}
+
+/// Carry out a [`tidy_plan`] once the crontab is written: each old log moves to its new log,
+/// each old lock is deleted (nothing uses that path any more; a run still holding it keeps its
+/// lock on the inode). Only regular files the effective user (`euid`) owns: a symlink is left
+/// alone, never followed, and so is a new log that isn't a regular file.
+fn tidy_old_cron_files(plan: &[OldCronFile], home: &str, euid: u32) -> CronTidy {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = CronTidy::default();
+    let shown = |p: &str| p.strip_prefix(home).filter(|r| r.starts_with('/')).map_or_else(|| p.to_string(), |r| format!("~{r}"));
+    // Ok(true): a regular file of this user's; Ok(false): something else, left alone.
+    let ours = |p: &str| std::fs::symlink_metadata(p).map(|m| m.file_type().is_file() && m.uid() == euid);
+    for file in plan {
+        match file {
+            OldCronFile::Log { old, new } => match ours(old) {
+                Ok(true) => match move_cron_log(std::path::Path::new(old), std::path::Path::new(new)) {
+                    Ok(true) => out.moved.push(shown(old)),
+                    Ok(false) => out.left.push(format!("{} ({} isn't a regular file)", shown(old), shown(new))),
+                    Err(e) => out.failed.push(format!("{}: {e}", shown(old))),
+                },
+                Ok(false) => out.left.push(format!("{} (not a regular file of this user's)", shown(old))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => out.failed.push(format!("{}: {e}", shown(old))),
+            },
+            OldCronFile::Lock(lock) => {
+                if ours(lock).unwrap_or(false) {
+                    if let Err(e) = std::fs::remove_file(lock) {
+                        out.failed.push(format!("{}: {e}", shown(lock)));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Move the old log `old` (a regular file) to `new`; `Ok(false)`, touching nothing, when `new`
+/// exists and isn't a regular file (a symlink, a directory). Hard-linked, then unlinked, when
+/// `new` doesn't exist yet — the same file, so a run still appending to it goes on logging into
+/// the new place, and never over a `new` a tick created meanwhile (as a rename would) — else
+/// (`new` already there, or on another filesystem) appended to `new`, then removed. `new`
+/// already being `old` (a tidy cut short between its link and its unlink) is just unlinked:
+/// appending a file to itself would never end. And only `old`'s length as it was is copied, so
+/// a run still writing to it can't keep the copy going either.
+///
+/// The append path's known rough edges, accepted as rare (it needs a tick that already wrote
+/// the new log, or `~/.local` on another filesystem): what a still-running old-line job writes
+/// after the copy is lost with the unlinked file; on a full disk a partial copy stays in the new
+/// log (and the old file too, for a later retry by hand); the old lines land after the new log's
+/// first ones; a new log created here gets the default mode, not the old one's.
+fn move_cron_log(old: &std::path::Path, new: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    if let Some(dir) = new.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if std::fs::hard_link(old, new).is_err() {
+        let was = std::fs::symlink_metadata(old)?;
+        match std::fs::symlink_metadata(new) {
+            Ok(m) if !m.file_type().is_file() => return Ok(false),
+            Ok(m) if (m.dev(), m.ino()) == (was.dev(), was.ino()) => {}
+            _ => {
+                let from = std::fs::File::open(old)?;
+                let mut to = std::fs::OpenOptions::new().append(true).create(true).open(new)?;
+                std::io::copy(&mut from.take(was.len()), &mut to)?;
+            }
+        }
+    }
+    std::fs::remove_file(old)?;
+    Ok(true)
+}
+
+/// The one line `cron install` prints after [`tidy_old_cron_files`]; `None` when it found
+/// no old log.
+fn tidy_line(t: &CronTidy) -> Option<String> {
+    let mut parts = Vec::new();
+    if !t.moved.is_empty() {
+        parts.push(format!("moved: {}", t.moved.join(", ")));
+    }
+    if !t.left.is_empty() {
+        parts.push(format!("left alone: {}", t.left.join(", ")));
+    }
+    if !t.failed.is_empty() {
+        parts.push(format!("couldn't tidy: {}", t.failed.join("; ")));
+    }
+    (!parts.is_empty()).then(|| format!("· cron logs now in ~/{}/ ({})", arena_core::cron::DIR, parts.join("; ")))
 }
 
 /// Which arena-managed crontab line a line is. Each has a stable identity, so `cron
@@ -3852,6 +4240,18 @@ impl CronKind {
         }
     }
 
+    /// The job whose files in the cron folder the line writes (both archive lines: the archive's).
+    fn job(self) -> arena_core::cron::Job {
+        use arena_core::cron::Job;
+        match self {
+            CronKind::Backup => Job::Backup,
+            CronKind::Proxy => Job::Proxy,
+            CronKind::Snapshot => Job::Snapshot,
+            CronKind::ArchiveSnap | CronKind::ArchiveBig => Job::Archive,
+            CronKind::Reap => Job::Reap,
+        }
+    }
+
     /// The kinds named by `cron remove`'s flags, in a fixed order (`--archive` is both of its lines).
     fn selected(backup: bool, proxy: bool, snapshot: bool, archive: bool) -> Vec<CronKind> {
         [
@@ -3867,13 +4267,14 @@ impl CronKind {
     }
 
     /// The kind of a crontab line, by the arena subcommand it runs — whole words, so the
-    /// lock/log file names (`.arena-proxy-cron.lock`) never count: `pods backup`, `proxy
-    /// apply`, `snapshot`. Read from the command itself rather than from a tag we add, so
-    /// the lines every earlier `cron install` wrote are recognized too. A line that matches
-    /// none — or more than one (a hand-edited `a && b`) — is `None`: kept as it is by a
-    /// targeted install/remove, never guessed at. So is any comment: a paused (commented-out)
-    /// backup line isn't a backup, and an operator's note that mentions a snapshot isn't the
-    /// snapshot line — neither is replaced or removed by a targeted install/remove.
+    /// lock/log file names (`cron/proxy.lock`, an older `.arena-proxy-cron.lock`) and the
+    /// leading `mkdir -p <dir> &&` never count: `pods backup`, `proxy apply`, `snapshot`. Read
+    /// from the command itself rather than from a tag we add, so the lines every earlier `cron
+    /// install` wrote are recognized too. A line that matches none — or more than one (a
+    /// hand-edited `a && b`) — is `None`: kept as it is by a targeted install/remove, never
+    /// guessed at. So is any comment: a paused (commented-out) backup line isn't a backup, and
+    /// an operator's note that mentions a snapshot isn't the snapshot line — neither is
+    /// replaced or removed by a targeted install/remove.
     fn of(line: &str) -> Option<CronKind> {
         if line.trim_start().starts_with('#') {
             return None;
@@ -3922,26 +4323,25 @@ struct BackupOpts {
 impl BackupOpts {
     /// Read an installed backup line's options back — any version's: the schedule (five
     /// fields, or one `@…` macro), an `ARENA_START_DATE=` among the inline env assignments
-    /// before the command (only a valid date), and whether it pulls (`pods backup` does
+    /// before the command (only a valid date; after the `mkdir -p … &&` this version's line
+    /// starts with: [`cron_line_parts`]), and whether it pulls (`pods backup` does
     /// unless `--no-pull`). `None` for a line that isn't a backup line or has no readable
-    /// schedule. Pure.
+    /// schedule. A start date that can't be read that way (behind a `cd … &&`, invalid, in a
+    /// comment) is left out and the rest kept — [`unread_start_date`] says so, for the install's
+    /// note (review fb2 F7: the whole line used to read as unreadable, so a re-install dropped its
+    /// schedule and `--pull` with the date). Pure.
     fn of_line(line: &str) -> Option<BackupOpts> {
         if CronKind::of(line) != Some(CronKind::Backup) {
             return None;
         }
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let n = if words.first()?.starts_with('@') { 1 } else { 5 };
-        if words.len() <= n {
-            return None;
-        }
-        let schedule = words[..n].join(" ");
+        let (schedule, words) = cron_line_parts(line)?;
         let is_assignment = |w: &str| {
             w.split_once('=').is_some_and(|(name, _)| {
                 name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
                     && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             })
         };
-        let start_date = words[n..]
+        let start_date = words
             .iter()
             .copied()
             .take_while(|w| is_assignment(w))
@@ -3949,6 +4349,34 @@ impl BackupOpts {
             .find(|d| arena_core::schedule::parse_ymd(d).is_some())
             .map(String::from);
         Some(BackupOpts { schedule, start_date, pull: !words.contains(&"--no-pull") })
+    }
+}
+
+/// Whether an installed backup line names an `ARENA_START_DATE=` that [`BackupOpts::of_line`]
+/// couldn't read (behind a `cd … &&`, an invalid date, in a comment …): its re-install keeps the
+/// line's schedule and `--pull` and drops only the date, which [`backup_read_note`] says. Pure.
+fn unread_start_date(line: &str) -> bool {
+    line.contains("ARENA_START_DATE=") && BackupOpts::of_line(line).is_some_and(|o| o.start_date.is_none())
+}
+
+/// What `cron install` says about the installed backup line it rewrites (`backup`; `installed`,
+/// and `read`: what [`BackupOpts::of_line`] read of it) — that it couldn't read the line's
+/// options at all, so the flags alone decide; or only its start date, dropped while the rest is
+/// kept, unless `--start-date` / `--no-start-date` decides that too. `None`: nothing to say. Pure.
+fn backup_read_note(backup: bool, installed: Option<&str>, read: Option<&BackupOpts>, f: &BackupFlags) -> Option<String> {
+    let line = installed.filter(|_| backup)?;
+    match read {
+        None => Some(
+            "note: couldn't read the installed backup line's options (hand-edited?) — it is rewritten from these flags alone; \
+             check the diff"
+                .to_string(),
+        ),
+        Some(_) if f.start_date.is_none() && !f.no_start_date && unread_start_date(line) => Some(
+            "note: couldn't read the installed backup line's ARENA_START_DATE (hand-edited?) — the new line has none \
+             (--start-date YYYY-MM-DD sets one); its schedule and --pull are kept; check the diff"
+                .to_string(),
+        ),
+        Some(_) => None,
     }
 }
 
@@ -4090,6 +4518,9 @@ struct CronJob<'a> {
     archive: bool,
     /// The state root (`ARENA_STATE_DIR`) those lines run with.
     archive_state_dir: Option<&'a str>,
+    /// The logs the installed lines chose themselves, kept ([`kept_logs`]); any other line logs
+    /// to arena's default.
+    kept_logs: &'a [(CronKind, String)],
 }
 
 /// The backup line's default schedule: every 15 minutes.
@@ -4148,29 +4579,39 @@ const PROXY_CRON_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/us
 ///   one landing between the write and the reload would leave a file nginx never loaded,
 ///   which later ticks would read as up to date.
 /// - **snapshot** (`snapshot_dir`): the public dashboard JSON every 2 minutes.
+///
+/// Each line's lock is in one hidden folder ([`arena_core::cron::DIR`]), and so is its log
+/// unless the installed line already logged somewhere else (`kept_logs`: arena never moves a
+/// log path someone chose), so they add nothing to the home. Each line recreates those folders
+/// before anything else ([`arena_core::cron::mkdir`]): cron's `sh` skips a command whose `>>`
+/// or lock points into a missing directory, so a deleted folder would otherwise silently stop
+/// the backups.
 fn cron_lines(job: &CronJob) -> Vec<(CronKind, String)> {
-    let CronJob { schedule, env_prefix, exe, config, home, backup, pull, proxy, snapshot_dir, archive, archive_state_dir } = job;
+    use arena_core::cron;
+    let CronJob { schedule, env_prefix, exe, config, home, backup, pull, proxy, snapshot_dir, archive, archive_state_dir, kept_logs } = job;
+    // A line's `mkdir -p … && `, lock and log: the kept log, else the default. Every line
+    // recreates its folders first: cron's `sh` skips a line whose `>>`/lock dir is gone.
+    let files = |k: CronKind| {
+        let log = kept_logs.iter().find(|(x, _)| *x == k).map_or_else(|| cron::log(home, k.job()), |(_, l)| l.clone());
+        (cron::mkdir(home, &log), cron::lock(home, k.job()), log)
+    };
     let mut lines = Vec::new();
     if *backup {
         // `pods backup` also rsyncs the home (the file backup); default the cron to git-only
         // (`--no-pull`) since it runs frequently, and let `--pull` opt into the full backup
         // each tick (rsync is incremental, so repeats only move deltas).
         let no_pull = if *pull { "" } else { " --no-pull" };
+        let (mkdir, lock, log) = files(CronKind::Backup);
         lines.push((
             CronKind::Backup,
-            format!(
-                "{schedule} {env_prefix}flock -n -o {home}/.arena-backup-cron.lock {exe} --config {config} \
-                 pods backup{no_pull} --yes >> {home}/arena-cron.log 2>&1"
-            ),
+            format!("{schedule} {mkdir}{env_prefix}flock -n -o {lock} {exe} --config {config} pods backup{no_pull} --yes >> {log} 2>&1"),
         ));
     }
     if *proxy {
+        let (mkdir, lock, log) = files(CronKind::Proxy);
         lines.push((
             CronKind::Proxy,
-            format!(
-                "{PROXY_CRON_SCHEDULE} {PROXY_CRON_PATH} flock -n {home}/.arena-proxy-cron.lock \
-                 {exe} --config {config} proxy apply --yes >> {home}/arena-proxy-cron.log 2>&1"
-            ),
+            format!("{PROXY_CRON_SCHEDULE} {mkdir}{PROXY_CRON_PATH} flock -n {lock} {exe} --config {config} proxy apply --yes >> {log} 2>&1"),
         ));
     }
     // The public dashboard JSON. Read-only (lists pods, TCP-probes their SSH ports, reads
@@ -4179,12 +4620,10 @@ fn cron_lines(job: &CronJob) -> Vec<(CronKind, String)> {
     // file (a killed tick just leaves the previous one, which the page then shows as stale).
     if let Some(dir) = snapshot_dir {
         let out = shell_quote(&format!("{}/fleet.json", dir.trim_end_matches('/')));
+        let (mkdir, lock, log) = files(CronKind::Snapshot);
         lines.push((
             CronKind::Snapshot,
-            format!(
-                "{SNAPSHOT_CRON_SCHEDULE} flock -n {home}/.arena-snapshot-cron.lock \
-                 {exe} --config {config} snapshot --public --out {out} >> {home}/arena-snapshot-cron.log 2>&1"
-            ),
+            format!("{SNAPSHOT_CRON_SCHEDULE} {mkdir}flock -n {lock} {exe} --config {config} snapshot --public --out {out} >> {log} 2>&1"),
         ));
     }
     // The backup archive's pushes (`archive sync`): snap 7 minutes after each */15 backup tick
@@ -4196,10 +4635,11 @@ fn cron_lines(job: &CronJob) -> Vec<(CronKind, String)> {
     if *archive {
         let state = archive_state_dir.map(|d| format!("ARENA_STATE_DIR={d} ")).unwrap_or_default();
         for (kind, sched, tier) in [(CronKind::ArchiveSnap, ARCHIVE_SNAP_CRON_SCHEDULE, "snap"), (CronKind::ArchiveBig, ARCHIVE_BIG_CRON_SCHEDULE, "big")] {
+            let (mkdir, _, log) = files(kind);
             lines.push((
                 kind,
                 format!(
-                    "{sched} {env_prefix}{state}nice -n 10 {exe} --config {config} archive sync --tier {tier} >> {home}/arena-archive-cron.log 2>&1"
+                    "{sched} {mkdir}{env_prefix}{state}nice -n 10 {exe} --config {config} archive sync --tier {tier} >> {log} 2>&1"
                 ),
             ));
         }
@@ -4207,11 +4647,30 @@ fn cron_lines(job: &CronJob) -> Vec<(CronKind, String)> {
     lines
 }
 
-/// The value of an inline env assignment (`NAME=value`) among a cron line's leading words.
+/// The value of an inline env assignment (`NAME=value`) among a cron line's leading words
+/// (after its schedule and any `mkdir -p <dir> &&`: [`cron_line_parts`]).
 fn env_assignment(line: &str, name: &str) -> Option<String> {
+    let (_, words) = cron_line_parts(line)?;
+    words.iter().take_while(|w| w.contains('=') && !w.starts_with('-')).find_map(|w| w.strip_prefix(&format!("{name}="))).map(String::from)
+}
+
+/// A crontab line's schedule (five fields, or one `@…` macro) and its command's words — after
+/// the `mkdir -p <dir>… &&` arena's lines start with (their folders, recreated), so the inline
+/// env assignments before the command (`ARENA_START_DATE=…`) are read the same from every
+/// version's line. `None`: no schedule, or nothing after it. Pure.
+fn cron_line_parts(line: &str) -> Option<(String, Vec<&str>)> {
     let words: Vec<&str> = line.split_whitespace().collect();
     let n = if words.first()?.starts_with('@') { 1 } else { 5 };
-    words.get(n..)?.iter().take_while(|w| w.contains('=') && !w.starts_with('-')).find_map(|w| w.strip_prefix(&format!("{name}="))).map(String::from)
+    let command = words.get(n..)?;
+    let command = match command {
+        [] => return None,
+        ["mkdir", "-p", dirs @ ..] => match dirs.iter().position(|w| *w == "&&") {
+            Some(i) if i > 0 => &dirs[i + 1..],
+            _ => command,
+        },
+        _ => command,
+    };
+    Some((words[..n].join(" "), command.to_vec()))
 }
 
 /// When the archive's snap push runs: 7 minutes after each */15 backup tick.
@@ -4225,8 +4684,9 @@ const ARCHIVE_BIG_CRON_SCHEDULE: &str = "40 * * * *";
 /// settings and an explicit, absolute ARENA_STATE_DIR in the config FILE (the reaper reads the
 /// file's only — RS3 — so a hold set from any shell lands where the cron looks).
 /// ARENA_START_DATE is written into the line when it comes from the environment rather than the
-/// file (cron doesn't inherit a shell's environment).
-fn reap_cron_line(apply: bool, config_path: &std::path::Path, exe: &str, cfg_abs: &str, home: &str) -> Result<String> {
+/// file (cron doesn't inherit a shell's environment). `log`: the log the installed reap line
+/// chose, kept ([`kept_logs`]).
+fn reap_cron_line(apply: bool, config_path: &std::path::Path, exe: &str, cfg_abs: &str, home: &str, log: Option<&str>) -> Result<String> {
     let text = std::fs::read_to_string(config_path).with_context(|| format!("reading {}", config_path.display()))?;
     let file = Config::parse(&text);
     let cfg = Config::load(config_path)?;
@@ -4254,7 +4714,7 @@ fn reap_cron_line(apply: bool, config_path: &std::path::Path, exe: &str, cfg_abs
             anyhow::bail!("--reap: {what} ({v}) can't hold `%` or a newline in a crontab line");
         }
     }
-    Ok(arena_core::reap::render::cron_line(apply, exe, cfg_abs, home, &env))
+    Ok(arena_core::reap::render::cron_line(apply, exe, cfg_abs, home, log, &env))
 }
 
 /// Whether this user's crontab has the reap line — `config check` then shows the reaper's
@@ -4505,31 +4965,9 @@ fn config_which(cfg: &Config, provider_name: &str, config_path: &std::path::Path
     println!("\nLoaded: provider {provider_name} · {} key(s) · {} machine name(s)",
         cfg.values.len(), cfg.machine_names.len());
 
-    // Keys whose value is currently coming from the environment (env overrides the file
-    // at load — easy to forget, so surface it).
-    let mut from_env: Vec<&str> = cfg
-        .values
-        .keys()
-        .map(String::as_str)
-        .filter(|k| !Config::is_file_only(k) && std::env::var(k).is_ok())
-        .collect();
-    // The name list too (parsed apart from `values`): the environment's wins when the file has one.
-    let list = arena_core::config::NAME_LIST_KEY;
-    if cfg.file_sets_name_list() && std::env::var(list).is_ok() {
-        from_env.push(list);
-    }
-    from_env.sort();
-    // The reaper's keys are file-only: an env var of that name is ignored — say so, since
-    // it looks like it should win.
-    let mut ignored: Vec<&String> =
-        cfg.values.keys().filter(|k| Config::is_file_only(k) && std::env::var(k.as_str()).is_ok()).collect();
-    ignored.sort();
+    let (from_env, ignored) = env_keys(cfg, |k| std::env::var(k).is_ok());
     if !ignored.is_empty() {
-        println!(
-            "\nIgnored from the environment (file-only, {}*): {}",
-            Config::FILE_ONLY_PREFIX,
-            ignored.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
-        );
+        println!("\nIgnored from the environment (file-only, {}*): {}", Config::FILE_ONLY_PREFIX, ignored.join(", "));
     }
     if from_env.is_empty() {
         println!("\nEnvironment overrides: none (all values come from the file)");
@@ -4540,6 +4978,25 @@ fn config_which(cfg: &Config, provider_name: &str, config_path: &std::path::Path
         }
     }
     Ok(())
+}
+
+/// What `config which` says of the environment (`is_set`: whether a variable of that name is set):
+/// the keys whose value now comes from it — every key of the loaded config with a variable of its
+/// name, whether that overrode the file's value or introduced one the file lacks
+/// (`Config::ENV_INTRODUCIBLE`: `DISCARD_MAX_GB`, …); env overrides the file at load, easy to
+/// forget, so it's said — and the name list when the file has one (parsed apart from `values`:
+/// the environment's wins then). Then the file-only keys whose variable is ignored (the reaper's:
+/// it looks like it should win). Each sorted. Pure.
+fn env_keys(cfg: &Config, is_set: impl Fn(&str) -> bool) -> (Vec<&str>, Vec<&str>) {
+    let mut from_env: Vec<&str> = cfg.values.keys().map(String::as_str).filter(|k| !Config::is_file_only(k) && is_set(k)).collect();
+    let list = arena_core::config::NAME_LIST_KEY;
+    if cfg.file_sets_name_list() && is_set(list) {
+        from_env.push(list);
+    }
+    from_env.sort_unstable();
+    let mut ignored: Vec<&str> = cfg.values.keys().map(String::as_str).filter(|k| Config::is_file_only(k) && is_set(k)).collect();
+    ignored.sort_unstable();
+    (from_env, ignored)
 }
 
 /// The `config check` row for `CREATE_EXTRA_JSON` (`None` when unset), and whether it
@@ -4562,17 +5019,22 @@ fn create_extra_row(cfg: &Config) -> Option<(String, bool)> {
 }
 
 /// The `config check` row for `RUNPOD_API`, and whether it's valid. Pure, for testing.
-/// v1 gets a warning with the retirement date: past it, every RunPod call fails.
+/// v2 is the default (unset or empty, said so). An explicit v1 still works but gets a
+/// warning with the retirement date — past it, every RunPod call fails — and the way back.
 fn runpod_api_row(cfg: &Config) -> (String, bool) {
-    use arena_core::provider::{RunpodApi, RUNPOD_V1_RETIREMENT};
+    use arena_core::provider::{RunpodApi, RUNPOD_V1_REMEDY, RUNPOD_V1_RETIREMENT};
     let key = "RUNPOD_API";
     match RunpodApi::from_config(cfg) {
-        Ok(RunpodApi::V2) => (format!("  ✓ {key:<24} v2 (api.runpod.io/v2)"), true),
+        Ok(RunpodApi::V2) => (
+            format!(
+                "  ✓ {key:<24} v2{} (api.runpod.io/v2)",
+                if cfg.get(key).is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" }
+            ),
+            true,
+        ),
         Ok(RunpodApi::V1) => (
             format!(
-                "  ⚠ {key:<24} v1{} (rest.runpod.io/v1) — RunPod retires REST v1 on {RUNPOD_V1_RETIREMENT}; \
-                 set RUNPOD_API=v2 once it's been live-tested",
-                if cfg.get(key).is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" }
+                "  ⚠ {key:<24} v1 (rest.runpod.io/v1) — RunPod retires REST v1 on {RUNPOD_V1_RETIREMENT}; {RUNPOD_V1_REMEDY}"
             ),
             true,
         ),
@@ -4587,7 +5049,8 @@ fn runpod_api_row(cfg: &Config) -> (String, bool) {
 /// - ⚠ an exact set — RunPod matches it exactly, so a host on a newer CUDA is "no capacity";
 ///   ⚠ an `ALLOWED_CUDA_VERSIONS` list (it used to be an exact set; now only its lowest
 ///   version counts); ⚠ keys shadowed by a stronger one.
-/// - ✗ (not ok) on RunPod v1 when its schema can't express the constraint (13.1+).
+/// - ✗ (not ok) on RunPod v1 (only ever an explicit `RUNPOD_API=v1`) when its schema can't
+///   express the constraint (13.1+).
 /// - ✗ alone, in place of the ✓/⚠ row, for a value that isn't a version (`13.x`): creates
 ///   are refused, so nothing about it is fine (live BPF S5 printed `✓ ≥ 13.x` above the ✗).
 ///
@@ -4631,17 +5094,18 @@ fn cuda_rows(cfg: &Config, runpod_v1: bool) -> (Vec<String>, std::result::Result
     }
     let mut ok = Ok(());
     if runpod_v1 {
+        use arena_core::provider::RUNPOD_V1_REMEDY;
         let spec = PodSpec { allowed_cuda: cuda.exact.clone(), min_cuda: cuda.floor.clone(), ..PodSpec::from_config(cfg) };
         match arena_core::provider::runpod::v1_cuda_versions(&spec) {
             Ok(Some(_)) if cuda.exact.is_empty() => out.push(format!(
                 "      └ RUNPOD_API=v1 has no real floor: it sends its list's versions ≥ the floor, newest {} — \
-                 RUNPOD_API=v2 reaches newer hosts",
+                 {RUNPOD_V1_REMEDY} to reach newer hosts",
                 arena_core::provider::runpod::V1_CUDA_VERSIONS[0]
             )),
             Ok(_) => {}
             Err(e) => {
                 out.push(format!("  ✗ {key:<27}{e}"));
-                ok = Err("a host CUDA constraint RunPod v1 can express (or RUNPOD_API=v2)".to_string());
+                ok = Err(format!("a host CUDA constraint RunPod v1 can express, or {RUNPOD_V1_REMEDY}"));
             }
         }
     }
@@ -4807,8 +5271,8 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
             missing.push(key.to_string());
         }
     }
-    // Which RunPod REST generation `runpod` talks to — shown whenever RunPod is in play,
-    // because v1 is retired by RunPod and this is the switch.
+    // Which RunPod REST generation `runpod` talks to — shown whenever RunPod is in play:
+    // v2 by default, and a leftover `RUNPOD_API=v1` (which RunPod retires) is flagged here.
     if provider_name == "runpod" || cfg.get("RUNPOD_API_KEY").is_some_and(|v| !v.is_empty()) || cfg.get("RUNPOD_API").is_some() {
         let (line, ok) = runpod_api_row(cfg);
         println!("{line}");
@@ -4845,9 +5309,10 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
     println!("\nMachine naming:");
     cfg_row(&mut out, cfg, &mut missing, "MACHINE_NAME_PREFIX", false, false);
     println!(
-        "  {} MACHINE_NAME_LIST          {} names",
+        "  {} MACHINE_NAME_LIST          {} name{}",
         if cfg.machine_names.is_empty() { "✗" } else { "✓" },
-        cfg.machine_names.len()
+        cfg.machine_names.len(),
+        if cfg.machine_names.len() == 1 { "" } else { "s" }
     );
     if cfg.machine_names.is_empty() {
         missing.push("MACHINE_NAME_LIST".into());
@@ -4899,6 +5364,18 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
 
     println!("\nBackup (git `backup` + file `pull`):");
     cfg_row(&mut out, cfg, &mut missing, "ARENA_REPO_NAME", false, false);
+    // The `upstream` remote setup adds to each pod's checkout: a default, so not cfg_row's view.
+    match arena_core::setup::upstream_url(cfg) {
+        Ok(Some(url)) => println!(
+            "  · ARENA_UPSTREAM_REPO          {url}{} — each pod's `upstream` remote (setup adds it when missing)",
+            if cfg.get("ARENA_UPSTREAM_REPO").is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" }
+        ),
+        Ok(None) => println!("  · ARENA_UPSTREAM_REPO          none — setup adds no `upstream` remote"),
+        Err(e) => {
+            println!("  ✗ ARENA_UPSTREAM_REPO          {e}");
+            note_invalid(&mut missing, &e);
+        }
+    }
     cfg_row(&mut out, cfg, &mut missing, "GIT_SSH_KEY_REMOTE", false, false);
     cfg_row(&mut out, cfg, &mut missing, "ARENA_START_DATE", false, false); // wNdM label (init-branches / pull)
     // Where `pods pull` rsyncs pod files to locally (config LOCAL_BACKUP_DIR, else ./backup),
@@ -4938,6 +5415,36 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
         Err(e) => {
             println!("  ✗ pull time budget per pod   {e}");
             note_invalid(&mut missing, &e);
+        }
+    }
+    // When `pods backup` finishes an operation left in progress on a pod (a bad value: never).
+    let resolve_key = arena_core::resolve::AUTO_RESOLVE_KEY;
+    match arena_core::resolve::auto_resolve_hours(cfg.get(resolve_key)) {
+        Ok(h) => println!(
+            "  · finish a BUSY pod's merge  {} ({resolve_key})",
+            arena_core::resolve::auto_resolve_words(h, cfg.get(resolve_key).is_some_and(|v| !v.trim().is_empty()))
+        ),
+        Err(e) => {
+            println!("  ✗ finish a BUSY pod's merge  {e}");
+            note_invalid(&mut missing, &e);
+        }
+    }
+    // The most `set-branch --hard` saves on a pod before its reset (review ai-review claude #6: a
+    // bad value used to surface only when `--hard` ran, and stops it there before anything else).
+    // A value the environment gave (for one run) is said so, as the file doesn't have it.
+    match arena_core::backup::discard_max_kb(cfg) {
+        Ok(kb) => println!(
+            "  · --hard save max per pod    {}{} (DISCARD_MAX_GB)",
+            arena_core::backup::discard_max_words(kb),
+            match cfg.get("DISCARD_MAX_GB").filter(|v| !v.trim().is_empty()) {
+                None => " (default)",
+                Some(v) if cfg.file_value("DISCARD_MAX_GB") != Some(v) => " (from the environment)",
+                Some(_) => "",
+            }
+        ),
+        Err(e) => {
+            println!("  ✗ --hard save max per pod    {e}");
+            note_invalid_text(&mut missing, &e);
         }
     }
 
@@ -5152,17 +5659,37 @@ async fn handle_backup(
     let t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}"), |name| locks.done(name)).await;
     println!(
         "\nDone: {} pushed, {} unchanged, {} skipped (main/master), {} failed.",
-        t.pushed, t.unchanged, t.skipped, t.failed
+        t.pushed,
+        t.unchanged,
+        t.skipped,
+        t.failed.len()
     );
     // The pods on main/master, after the counts — the line the operator acts on (never a failure).
     let fleet_wide = !sel.named && t.pushed + t.unchanged == 0;
     on_protected_lines(&Naming::from_config(cfg), &t.on_protected, fleet_wide).iter().for_each(|l| say(l));
     unpushed.extend(t.unpushed);
-    if t.failed > 0 {
-        anyhow::bail!("{} pod(s) failed to back up", t.failed);
+    if !t.failed.is_empty() {
+        return Err(BackupFailed { pods: t.failed }.into());
     }
     Ok(())
 }
+
+/// `pods backup`'s git step failed for these pods — whichever way (before the push: no repo, ssh
+/// refused, a `set -e` exit; or at it) — said as `N pod(s) failed to back up`. It names them so
+/// the step that finishes an operation left in progress ([`resolve::Settled::git`]) can take back
+/// exactly the pods it finished and backed up, and no other failure (review ai-review claude #3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackupFailed {
+    pods: Vec<String>,
+}
+
+impl std::fmt::Display for BackupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} pod(s) failed to back up", self.pods.len())
+    }
+}
+
+impl std::error::Error for BackupFailed {}
 
 /// `pods backup`: git-push the selected pods' current branches, then (unless `no_pull`)
 /// rsync their homes — both over the SAME selection, resolved once by the caller. Under
@@ -5229,15 +5756,20 @@ async fn handle_full_backup(
     let git_result = if sel.pods.is_empty() {
         Ok(())
     } else {
-        handle_backup(remote.clone(), cfg, !dry_run, message, &sel, &mut locks, &mut unpushed).await
+        handle_backup(remote.clone(), cfg, !dry_run, message.clone(), &sel, &mut locks, &mut unpushed).await
     };
     locks.held.clear();
+    // The pods with an operation in progress (BUSY): a look at each first, which paces their copy
+    // and, after it, finishes the ones left alone long enough (`resolve`).
+    let busy = resolve::Busy::look(&remote, cfg, &dir, &sel, &unpushed).await;
     if !no_pull && !sel.pods.is_empty() {
         println!();
         let args = PullRun { label: None, max_size: None, remote_path: None, no_git: false, no_big: false, dry_run, yes: true };
         let pulled = pull_pods(&remote, cfg, &dir, args, &sel, rsync, LockMode::Take(POD_LOCK_WAIT)).await;
-        print_fallback_copies(&unpushed, &pulled);
-        return both_failures(git_result, pulled.and_then(Pulled::result), &locks.busy);
+        let settled = busy.settle(&remote, cfg, &pulled, true, message.as_deref()).await;
+        print_fallback_copies(&settled.unsettled(&unpushed), &pulled);
+        settled.print();
+        return both_failures(settled.git(git_result), pulled.and_then(Pulled::result), &locks.busy);
     }
     if no_pull && dry_run {
         println!(
@@ -5245,9 +5777,12 @@ async fn handle_full_backup(
              {dir} by rsync — even under --no-pull)"
         );
     }
-    let pulled = copy_unpushed(&remote, cfg, &dir, &sel, &unpushed, rsync, LockMode::Take(POD_LOCK_WAIT)).await;
-    print_fallback_copies(&unpushed, &pulled);
-    both_failures(git_result, pulled.and_then(Pulled::result), &locks.busy)
+    let copying = busy.to_copy(&unpushed);
+    let pulled = copy_unpushed(&remote, cfg, &dir, &sel, &copying, rsync, LockMode::Take(POD_LOCK_WAIT)).await;
+    let settled = busy.settle(&remote, cfg, &pulled, false, message.as_deref()).await;
+    print_fallback_copies(&settled.unsettled(&copying), &pulled);
+    settled.print();
+    both_failures(settled.git(git_result), pulled.and_then(Pulled::result), &locks.busy)
 }
 
 /// A pod whose git push failed must never be left with no copy at all: live, the */15 cron runs
@@ -5303,7 +5838,8 @@ fn fallback_lines(unpushed: &[Unpushed], pulled: &Result<Pulled>) -> Vec<String>
                 Ok(to) => format!(" → files copied to {to}"),
                 Err(why) => format!("; the fallback copy failed too: {why}"),
             };
-            let failed = if u.wrong_origin { "not backed up to git" } else { "git push failed" };
+            // Nothing was committed (a wrong origin, an operation in progress): no push to fail.
+            let failed = if u.wrong_origin || u.busy.is_some() { "not backed up to git" } else { "git push failed" };
             format!("✗ {}: {failed} ({}){copy}", u.pod, u.why)
         })
         .collect()
@@ -5339,12 +5875,18 @@ struct BackupTally {
     pushed: usize,
     unchanged: usize,
     skipped: usize,
-    failed: usize,
+    /// The pods that failed, by name (in finishing order), whichever way.
+    failed: Vec<String>,
     /// The pods whose git push failed — for the copy the backup makes of them instead.
     unpushed: Vec<Unpushed>,
     /// The `skipped` pods, each with the protected branch it's on (`(name, branch)`): said in
     /// one line after the run ([`on_protected_lines`]), not one per pod.
     on_protected: Vec<(String, String)>,
+    /// The `skipped` pods with work on that branch no backup saves (`UNCOMMITTED`: an operation in
+    /// progress, changes to tracked files, commits no remote has, untracked files): what
+    /// `set-branch --hard` copies before its reset ([`switch_guarded`]). `pods backup` leaves them
+    /// as it always has — skipped, not a failure, and not said: the cron's output is unchanged.
+    uncommitted: Vec<Unpushed>,
 }
 
 /// A pod whose git backup failed this run: why (a few words), the branch it left unpushed (when
@@ -5352,7 +5894,11 @@ struct BackupTally {
 /// ([`arena_core::backup::BackupReport::failed_at_push`]), and whether its `origin` isn't the
 /// configured repo (`WRONG_ORIGIN`: nothing was committed or pushed). Those two are the failures
 /// `pods backup` copies by rsync instead ([`copy_unpushed`]). A pod with no repo, or ssh refused,
-/// fails the same way every run and isn't.
+/// fails the same way every run and isn't. `busy`: what was in progress on the branch (`BUSY`: a
+/// merge, …), so nothing was committed — a failure at the push for the copy, said as what it is;
+/// for a pod on a branch no backup commits, the work there no backup saves (`UNCOMMITTED`: the
+/// same words, or `changes`, `commits`, `untracked`), which a `--hard` switch copies first
+/// ([`BackupTally::uncommitted`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Unpushed {
     pod: String,
@@ -5360,6 +5906,7 @@ struct Unpushed {
     branch: Option<String>,
     at_push: bool,
     wrong_origin: bool,
+    busy: Option<String>,
 }
 
 impl Unpushed {
@@ -5387,14 +5934,20 @@ fn failure_why(call: &PodCall) -> String {
 
 /// The stderr line that says what went wrong: the first one that starts (trimmed) like git's or
 /// ssh's own verdict — `ERROR:`, `fatal:`, `error:`, `remote: error`, `! [rejected]`,
-/// `! [remote rejected]` — else the last non-empty line. The last line alone is often the tail
-/// of a longer message (live: a push to a missing repo gave `and the repository exists.`, the end
-/// of git's advice, where its first line said `ERROR: Repository not found.`). `None` for an
-/// empty stderr. Pure.
+/// `! [remote rejected]`, `ssh:` — or that holds ssh's `Permission denied (publickey`, else the
+/// last non-empty line. The last line alone is often the tail of a longer message (live: a push to a missing
+/// repo gave `and the repository exists.`, the end of git's advice, where its first line said
+/// `ERROR: Repository not found.`). ssh's own line comes before git's `fatal: Could not read
+/// from remote repository.` and names the cause that one hides: `git@github.com: Permission
+/// denied (publickey).` (live: the deploy key gone), `ssh: connect to host … timed out`. Only
+/// ssh's wording: a `warning: could not open directory …: Permission denied` from `git add`
+/// says nothing about a failed push (review fb2 R5). `None` for an empty stderr. Pure.
 fn telling_line(stderr: &str) -> Option<&str> {
-    const VERDICTS: &[&str] = &["ERROR:", "fatal:", "error:", "remote: error", "! [rejected]", "! [remote rejected]"];
+    const VERDICTS: &[&str] = &["ERROR:", "fatal:", "error:", "remote: error", "! [rejected]", "! [remote rejected]", "ssh:"];
     let lines = || stderr.lines().map(str::trim).filter(|l| !l.is_empty());
-    lines().find(|l| VERDICTS.iter().any(|v| l.starts_with(v))).or_else(|| lines().next_back())
+    lines()
+        .find(|l| VERDICTS.iter().any(|v| l.starts_with(v)) || l.contains("Permission denied (publickey"))
+        .or_else(|| lines().next_back())
 }
 
 /// Is `branch` one `pods backup` never commits on (`backup.sh`'s SKIP: main, master, a
@@ -5414,7 +5967,7 @@ fn is_protected_branch(branch: &str) -> bool {
 /// on disk, and the window between the reset and `init-branches` is routine every morning — a
 /// non-zero exit there would be a daily false alarm that teaches the operator to ignore the one
 /// that means a push or a pod broke. The cron's exit status goes nowhere anyway (its line
-/// appends to `arena-cron.log`); this line, and `set-branch`'s reminder at the reset itself,
+/// appends to `~/.local/state/arena-cron/backup.log`); this line, and `set-branch`'s reminder at the reset itself,
 /// are what make the gap loud.
 fn on_protected_line(pods: &[(String, String)], fleet_wide: bool) -> Option<String> {
     if pods.is_empty() {
@@ -5485,6 +6038,10 @@ async fn backup_fleet(
                     t.skipped += 1;
                     // Said once for all of them after the run (`on_protected_lines`).
                     t.on_protected.push((name.to_string(), branch.clone()));
+                    if let Some(why) = report.uncommitted_why() {
+                        let (pod, branch, busy) = (name.clone(), Some(branch.clone()), report.uncommitted.clone());
+                        t.uncommitted.push(Unpushed { pod, why, branch, at_push: true, wrong_origin: false, busy });
+                    }
                     String::new()
                 }
                 _ => {
@@ -5492,18 +6049,20 @@ async fn backup_fleet(
                     format!("[{done}/{total}] ✓ {name} (done){also}")
                 }
             },
-            // A failure the script explained (a big file or a key GitHub refuses, a heal cut short).
+            // A failure the script explained (a big file or a key GitHub refuses, a heal cut short,
+            // an operation in progress).
             Ok(out) if report.failure(repo, name, out.code).is_some() => {
-                t.failed += 1;
+                t.failed.push(name.clone());
                 let why = report.failure_brief(out.code).unwrap_or_else(|| failure_why(&call));
                 let wrong_origin = report.wrong_origin_why(out.code).is_some();
-                t.unpushed.push(Unpushed { pod: name.clone(), why, branch: report.branch.clone(), at_push: report.failed_at_push(), wrong_origin });
+                let busy = report.in_progress(out.code).map(String::from);
+                t.unpushed.push(Unpushed { pod: name.clone(), why, branch: report.branch.clone(), at_push: report.failed_at_push(), wrong_origin, busy });
                 format!("[{done}/{total}] ✗ {name}: {}", report.failure(repo, name, out.code).unwrap_or_default())
             }
             _ => {
-                t.failed += 1;
+                t.failed.push(name.clone());
                 let at_push = report.failed_at_push();
-                t.unpushed.push(Unpushed { pod: name.clone(), why: failure_why(&call), branch: report.branch.clone(), at_push, wrong_origin: false });
+                t.unpushed.push(Unpushed { pod: name.clone(), why: failure_why(&call), branch: report.branch.clone(), at_push, wrong_origin: false, busy: None });
                 failure_line(done, total, name, &call)
             }
         };
@@ -7109,19 +7668,19 @@ async fn handle_pods_bal(
         }
 
 
-        PodCmd::InitBranches { sel, week, day, dry_run } => {
+        PodCmd::InitBranches { sel, cohort, week, day, dry_run } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
-            let sel = cohort_only(cfg, sel);
+            let sel = cohort_only(cfg, sel, cohort);
             handle_init_branches(remote, cfg, week, day, &sel, dry_run, yes, RSYNC).await?;
         }
 
-        PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, target_flag, sel, dry_run } => {
+        PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, target_flag, cohort, sel, dry_run } => {
             let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
             let (label, sel, note) = resolve_pull(provider, cfg, label, sel, &target_flag).await?;
             if let Some(note) = &note {
                 eprintln!("{note}");
             }
-            let mut sel = cohort_only(cfg, sel);
+            let mut sel = cohort_only(cfg, sel, cohort);
             refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             handle_pull(&remote, cfg, label, &dir, max_size, remote_path, no_git, no_big, &sel, dry_run, yes, RSYNC).await?;
         }
@@ -7228,11 +7787,11 @@ async fn handle_pods_bal(
             handle_terminate(provider, cfg, &book, target.as_deref(), opts).await?;
         }
 
-        PodCmd::Backup { sel, no_pull, dry_run, message } => {
+        PodCmd::Backup { sel, cohort, no_pull, dry_run, message } => {
             // Resolved once, before the prompt (a typo fails before asking), and shared by the
             // git push and the pull.
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
-            let mut sel = cohort_only(cfg, sel);
+            let mut sel = cohort_only(cfg, sel, cohort);
             refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             handle_full_backup(remote, cfg, &sel, no_pull, message, dry_run, yes, RSYNC).await?;
         }
@@ -7263,20 +7822,20 @@ async fn handle_pods_bal(
             handle_setup(remote, cfg, !dry_run, force, hf_token, cc_token, zsh_install, no_vscode, timeouts, &sel, KEYS_DIR, Some(provider))
                 .await?;
         }
-        PodCmd::SetBranch { branch, sel, hard, dry_run, init_branches } => {
-            let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("switch")).await?;
-            let sel = cohort_only(cfg, sel);
+        PodCmd::SetBranch { branch, sel, cohort, hard, dry_run, init_branches } => {
+            let sel = sel.args();
+            if let Some(why) = hard_non_cohort_refusal(hard, cohort, sel.names_pods()) {
+                anyhow::bail!("{why}");
+            }
+            let sel = select(provider, cfg, &sel, Unscoped::Refuse("switch")).await?;
+            let sel = cohort_only(cfg, sel, cohort);
             // The day `--init-branches` would init, before anything switches: a missing start
             // date fails here, not after the reset.
             if init_branches {
                 resolve_week_day(cfg, None, None)?;
             }
-            handle_set_branch(remote.clone(), cfg, &branch, &sel, hard, dry_run, yes, RSYNC).await?;
-            // The same pods, once every one has switched (a failed switch has bailed above).
-            if init_branches {
-                println!();
-                handle_init_branches(remote, cfg, None, None, &sel, dry_run, yes, RSYNC).await?;
-            }
+            let how = SetBranchRun { branch: &branch, hard, dry_run, yes, init_branches };
+            set_branch_and_init(remote, cfg, &sel, &how, RSYNC).await?;
         }
         PodCmd::Run { sel, command, timeout, dry_run, background } => {
             if let Some(why) = misplaced_run_flags(&command) {
@@ -7285,6 +7844,10 @@ async fn handle_pods_bal(
             let cmd = command.join(" ");
             let budget = Duration::from_secs(timeout);
             let mut sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let names: Vec<(&str, &str)> = sel.pods.iter().map(|p| (p.name.as_str(), short_of(cfg, &p.name))).collect();
+            if let Some(why) = pod_name_as_command(&command, &names) {
+                anyhow::bail!("{why}");
+            }
             refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             if background {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -7403,6 +7966,25 @@ fn misplaced_run_flags(command: &[String]) -> Option<String> {
         hits.join(" "),
         command.join(" "),
         command.join(" ")
+    ))
+}
+
+/// Why `run`'s command can't be taken as typed: its first word is the name of a selected pod
+/// (full, `devtest-apple`, or short, `apple`). `pods run apple 'ls'` — the `-t` forgotten — runs
+/// `apple ls` on every pod; a live test did exactly that once, and only the missing terminal (no
+/// `-y`) stopped it. `names` = each selected pod's (full, short) name. A command that really
+/// starts with such a word can be written `command apple …`. Pure, so table-tested.
+fn pod_name_as_command(command: &[String], names: &[(&str, &str)]) -> Option<String> {
+    let first = command.first()?.split_whitespace().next()?;
+    let (full, _) = names.iter().find(|(full, short)| first == *full || first == *short)?;
+    let rest = command.join(" ");
+    let rest = rest.trim_start().strip_prefix(first).unwrap_or(&rest).trim_start();
+    Some(format!(
+        "`{first}` is a pod's name ({full}) — as typed, `pods run` would run `{}` on all {} selected pod(s), \
+         since the pods are named with -t BEFORE the command. Nothing was run. Did you mean `arena pods run -t \
+         {first} '{rest}'`? (A command that really starts with `{first}`: `arena pods run 'command {first} …'`.)",
+        command.join(" "),
+        names.len()
     ))
 }
 
@@ -7910,49 +8492,140 @@ fn duplicate_names(pods: &[arena_core::Pod]) -> Vec<(String, Vec<String>)> {
     by_name.into_iter().filter(|(_, ids)| ids.len() > 1).map(|(n, ids)| (n.to_string(), ids)).collect()
 }
 
-/// Switch the selected pods (those with an SSH endpoint) to `branch` over SSH.
-/// Gentle (fetch+checkout+ff-pull) by default; `hard` force-resets to `origin/<branch>`,
-/// discarding local commits/changes. Dry-run prints the exact command per pod. Pods run
-/// concurrently, each within [`BRANCH_TIMEOUT`] (it used to be serial, so one wedged pod
-/// held up every pod after it).
+/// What `pods set-branch` was asked: the branch, `--hard`, `--dry-run`, `--yes`, and
+/// `--init-branches` (init the pods it switched, once every one has had its switch).
+struct SetBranchRun<'a> {
+    branch: &'a str,
+    hard: bool,
+    dry_run: bool,
+    yes: bool,
+    init_branches: bool,
+}
+
+/// How a `set-branch` run ended ([`switch_branch`]), for `--init-branches` to go on from.
+enum SwitchEnd {
+    /// A dry run: the init's dry run follows, for every selected pod.
+    Previewed,
+    /// Nothing switched — no pod to switch, or the operator said no: no init either.
+    Stopped,
+    /// The switches ran: the pods that switched (`landed`, their branch copied first or not), and
+    /// the run's verdict ([`Switched::result`]).
+    Ran { landed: Vec<String>, verdict: Result<()> },
+}
+
+/// `pods set-branch`, then — with `--init-branches` — `pods init-branches` on every pod that
+/// switched. A pod that switched is on the branch like the rest, whatever its switch said: one
+/// whose push failed (the network, push protection, a non-fast-forward, an operation in progress)
+/// and was copied first included — so one participant's failed push never leaves the whole fleet
+/// on main, where no backup commits (review pr4; fb2 F2 for a merge in progress). A pod that
+/// didn't switch (no copy, its switch failed, the gentle switch refused it, its lock was busy, the
+/// wrong origin) is left out: an init would branch its day from where it still is. The run
+/// still fails after the init, with set-branch's verdict (naming every pod copied instead of
+/// pushed, and every one not switched) and then the init's own.
+async fn set_branch_and_init(remote: Arc<dyn Remote>, cfg: &Config, sel: &Selected, how: &SetBranchRun<'_>, rsync: &str) -> Result<()> {
+    let (landed, verdict) = match switch_branch(remote.clone(), cfg, sel, how, rsync).await? {
+        SwitchEnd::Previewed if how.init_branches => {
+            println!();
+            return handle_init_branches(remote, cfg, None, None, sel, true, how.yes, rsync).await;
+        }
+        SwitchEnd::Previewed | SwitchEnd::Stopped => return Ok(()),
+        SwitchEnd::Ran { landed, verdict } => (landed, verdict),
+    };
+    if !how.init_branches {
+        return verdict;
+    }
+    println!();
+    let init = match init_selection(sel, &landed) {
+        None => {
+            say("init-branches NOT run: no pod switched");
+            Ok(())
+        }
+        Some((on, left_out)) => {
+            if !left_out.is_empty() {
+                say(&format!(
+                    "init-branches on the {} pod(s) that switched — not on {}, which didn't (see each one's line above)",
+                    on.pods.len(),
+                    left_out.join(", ")
+                ));
+            }
+            handle_init_branches(remote, cfg, None, None, &on, false, how.yes, rsync).await
+        }
+    };
+    match (verdict, init) {
+        (Ok(()), init) => init,
+        (Err(e), Ok(())) => Err(e),
+        (Err(e), Err(i)) => Err(anyhow::anyhow!("{e}; then init-branches: {i}")),
+    }
+}
+
+/// The pods `--init-branches` inits after a set-branch run: those of `sel` that switched
+/// (`landed`), in selection order, and the names of the rest — left out. `None` when none did.
+/// Pure.
+fn init_selection(sel: &Selected, landed: &[String]) -> Option<(Selected, Vec<String>)> {
+    let (on, out): (Vec<arena_core::Pod>, Vec<arena_core::Pod>) = sel.pods.iter().cloned().partition(|p| landed.contains(&p.name));
+    (!on.is_empty()).then(|| (Selected { pods: on, named: sel.named }, out.into_iter().map(|p| p.name).collect()))
+}
+
+/// `pods set-branch` alone, as its tests drive it: [`switch_branch`] and its verdict.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_set_branch(
-    // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
     remote: Arc<dyn Remote>,
     cfg: &Config,
     branch: &str,
-    // The pods to switch, resolved by the caller (which demands names or --all).
     sel: &Selected,
     hard: bool,
     dry_run: bool,
     yes: bool,
-    // The rsync a pod whose branch can't be pushed is copied with: [`RSYNC`], a stub in tests.
     rsync: &str,
 ) -> Result<()> {
+    let how = SetBranchRun { branch, hard, dry_run, yes, init_branches: false };
+    match switch_branch(remote, cfg, sel, &how, rsync).await? {
+        SwitchEnd::Ran { verdict, .. } => verdict,
+        SwitchEnd::Previewed | SwitchEnd::Stopped => Ok(()),
+    }
+}
+
+/// Switch the selected pods (those with an SSH endpoint) to `how.branch` over SSH.
+/// Gentle (fetch+checkout+fast-forward to origin's branch) by default; `how.hard` force-resets
+/// to `origin/<branch>`, discarding local commits/changes (saved on the pod first, its line
+/// saying where: [`discarded_note`]). Dry-run prints the exact command per pod. Pods run
+/// concurrently, each within [`BRANCH_TIMEOUT`] (it used to be serial, so one wedged pod
+/// held up every pod after it). `rsync`: the rsync a pod whose branch can't be pushed is copied
+/// with ([`RSYNC`], a stub in tests); `remote`: `SshRemote` for real, `FakeRemote` in tests.
+async fn switch_branch(remote: Arc<dyn Remote>, cfg: &Config, sel: &Selected, how: &SetBranchRun<'_>, rsync: &str) -> Result<SwitchEnd> {
+    let SetBranchRun { branch, hard, dry_run, yes, .. } = *how;
     let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
         format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_materials"))
     });
     let key = cfg.get("GIT_SSH_KEY_REMOTE");
-    let cmd = arena_core::backup::checkout_command(&repo_path, branch, key, hard);
+    // `--hard`'s save is bounded by DISCARD_MAX_GB (a value it can't read stops the run here,
+    // before anything is backed up or switched); the gentle switch saves nothing.
+    let cmd = if hard {
+        let max = arena_core::backup::discard_max_kb(cfg).map_err(anyhow::Error::msg)?;
+        arena_core::backup::checkout_command_limited(&repo_path, branch, key, hard, max)
+    } else {
+        arena_core::backup::checkout_command(&repo_path, branch, key, hard)
+    };
 
     // Unreachable pods are reported — a silently-skipped pod left on a stale/diverged branch
     // (especially under --hard) is exactly what we don't want.
     let targets = sel.named_targets(cfg)?;
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to switch)");
-        return Ok(());
+        return Ok(SwitchEnd::Stopped);
     }
 
     if dry_run {
-        println!("{}\n", push_first_note(cfg));
+        println!("{}\n", push_first_note(cfg, hard));
         for (name, t) in &targets {
             println!("# {name}");
             println!("{}\n", t.display_command(&cmd));
         }
         println!("Dry-run only — nothing changed (preview).");
-        return Ok(());
+        return Ok(SwitchEnd::Previewed);
     }
-    let how = if hard {
+    let what = if hard {
         format!("HARD-reset {} pod(s) to 'origin/{branch}' — DISCARDS local commits/changes", targets.len())
     } else {
         format!("switch {} pod(s) to branch '{branch}' (gentle, no reset)", targets.len())
@@ -7962,9 +8635,9 @@ async fn handle_set_branch(
     if let Some(line) = switch_unlocked_line(cfg) {
         say(&line);
     }
-    if !confirm(yes, &format!("Will {how} (each pod's current branch committed + pushed first): {names}"))? {
+    if !confirm(yes, &format!("Will {what} (each pod's current branch committed + pushed first): {names}"))? {
         println!("aborted.");
-        return Ok(());
+        return Ok(SwitchEnd::Stopped);
     }
     let total = targets.len();
     let doing = format!("to '{branch}'");
@@ -7974,31 +8647,53 @@ async fn handle_set_branch(
         // disk (staged) so their exercises keep working.
         let restored: Vec<&str> = out.stdout.lines().filter_map(|l| l.trim_end_matches('\r').strip_prefix("RESTORED ")).collect();
         landed.push(name.to_string());
-        format!("✓ {name} (on {branch}){}{}{note}", restored_note(&restored, branch), unredacted_note(&out.stdout))
+        format!(
+            "✓ {name} (on {branch}){}{}{note}{}",
+            restored_note(&restored, branch),
+            unredacted_note(&out.stdout),
+            discarded_note(&out.stdout)
+        )
     })
     .await;
     println!("\nswitched {}/{total}", run.ok);
+    if let Some(line) = run.ended_line() {
+        say(&line);
+    }
     if let Some(line) = set_branch_reminder(&Naming::from_config(cfg), branch, &landed, !sel.named) {
         say(&line);
     }
-    run.result("switch branch")
+    Ok(SwitchEnd::Ran { landed, verdict: run.result("switch branch") })
 }
 
 /// What a dry run of a branch switch says first: the push that comes before it — under each
 /// pod's backup lock, or, when none is taken, the one line that says so
-/// ([`switch_unlocked_line`]).
-fn push_first_note(cfg: &Config) -> String {
+/// ([`switch_unlocked_line`]) — and what happens to a pod with a merge in progress, which can't
+/// be committed first: copied too, then the gentle switch (and init-branches) refuses to end it,
+/// while `hard` (`--hard`) ends it with its uncommitted changes to tracked files (review F5: the
+/// note said every such pod "is copied … and then switched") — and copies a pod on a branch no
+/// backup commits with work there too, untracked files included: `--hard` overwrites one the new
+/// branch tracks (review pr4: the note said untracked files stay).
+fn push_first_note(cfg: &Config, hard: bool) -> String {
     let origin = arena_core::backup::configured_repo(cfg).map_or_else(String::new, |o| format!(", nor one whose origin isn't {o}"));
     let unlocked = switch_unlocked_line(cfg);
     let (under_lock, or_busy) = match unlocked {
         Some(_) => ("", ""),
         None => (" — under the pod's backup lock, held until its switch ends", ", or whose lock another backup holds,"),
     };
+    let busy = if hard {
+        "the --hard switch then ends it, discarding its uncommitted changes to tracked files; so is a pod on main/master or \
+         a detached HEAD, which no backup commits, with an operation in progress, changes to tracked files, commits no \
+         remote has or untracked files (the --hard switch overwrites any the new branch tracks); on every pod, what the \
+         --hard reset discards is saved there first, in .git/arena-discarded/<time>/"
+    } else {
+        "then NOT switched: the switch refuses to end it"
+    };
     let mut note = format!(
         "(first, each pod's current branch is backed up — the `pods backup --no-pull` commit + push, keys redacted{under_lock}; \
-         a pod whose push fails is copied into {} and then switched, its line saying so; a pod that can be neither pushed nor \
-         copied{or_busy} is NOT switched{origin})",
-        local_backup_dir(cfg)
+         a pod whose push fails is copied into {dir} and then switched, its line saying so; a pod with a merge (cherry-pick, \
+         revert, `git am`, rebase, conflicts) in progress can't be committed: it is copied into {dir} too, and {busy}; a pod that \
+         can be neither pushed nor copied{or_busy} is NOT switched{origin})",
+        dir = local_backup_dir(cfg)
     );
     if let Some(line) = unlocked {
         note.push('\n');
@@ -8014,40 +8709,73 @@ struct Switched {
     ok: usize,
     /// The switch command itself failed on these.
     failed: Vec<String>,
-    /// Not switched: their branch could be neither pushed nor copied, or another backup held
-    /// their lock — `(pod, why)`.
+    /// Not switched: their branch could be neither pushed nor copied, their origin isn't the
+    /// configured repo, or another backup held their lock — `(pod, why)`.
     not_switched: Vec<(String, String)>,
-    /// Switched after their files were copied, their push having failed.
+    /// Copied, their push having failed, before their switch (in `failed` too when it failed).
     copied: Vec<String>,
+    /// Of `copied`, those with work a `--hard` switch discards on purpose — an operation in
+    /// progress (`BUSY`), or work on a branch no backup commits (`UNCOMMITTED`: changes, commits
+    /// no remote has, untracked files): nothing failed there, so once switched they are switched
+    /// like the rest (review fb2 F2), the copy holding that work, said on their line and in
+    /// [`Switched::ended_line`].
+    ended: Vec<String>,
 }
 
 impl Switched {
     /// The command's result: every pod switched after its push, else what went wrong (`verb`:
-    /// what a failed switch failed to do — "switch branch", "init branch").
+    /// what a failed switch failed to do — "switch branch", "init branch"). A pod copied because
+    /// its push failed and then switched is named here, so the run fails and the operator sees it
+    /// — but it did switch: `--init-branches` still inits it ([`set_branch_and_init`]).
     fn result(self, verb: &str) -> Result<()> {
         let mut problems = Vec::new();
         if !self.failed.is_empty() {
             problems.push(format!("{} pod(s) failed to {verb}", self.failed.len()));
         }
         if !self.not_switched.is_empty() {
+            // The reasons differ (no push and no copy, the wrong origin, a busy lock): each pod's
+            // own line has its why, so this one only counts and names them.
             let names: Vec<&str> = self.not_switched.iter().map(|(n, _)| n.as_str()).collect();
             problems.push(format!(
-                "{} pod(s) NOT switched — their branch could be neither pushed nor copied first (see each one's line): {}",
+                "{} pod(s) NOT switched — each one's line says why: {}",
                 names.len(),
                 names.join(", ")
             ));
         }
-        if !self.copied.is_empty() {
+        // Copied, then switched — a copied pod whose switch failed (one that refuses to end a
+        // merge in progress) is counted with the failures above, never said to be switched; one
+        // whose uncommitted work --hard ended on purpose is switched like the rest (`ended`).
+        let copied: Vec<&str> =
+            self.copied.iter().filter(|p| !self.failed.contains(p) && !self.ended.contains(p)).map(String::as_str).collect();
+        if !copied.is_empty() {
             problems.push(format!(
                 "{} pod(s) switched with their branch copied, not pushed (see each one's line): {}",
-                self.copied.len(),
-                self.copied.join(", ")
+                copied.len(),
+                copied.join(", ")
             ));
         }
         if !problems.is_empty() {
             anyhow::bail!("{}", problems.join("; "));
         }
         Ok(())
+    }
+
+    /// The pods `--hard` switched after copying the work no backup had saved (`ended`, its switch
+    /// done): one line after the run, since they aren't failures — each pod's own line says what
+    /// that work was, where its copy went and where on the pod the switch saved what it discarded
+    /// (`.git/arena-discarded/<time>/`, which no later copy overwrites — the copy's label is
+    /// re-pulled from the reset pod: review ai-review claude #2). `None` when there are none.
+    fn ended_line(&self) -> Option<String> {
+        let names: Vec<&str> = self.ended.iter().filter(|p| !self.failed.contains(p)).map(String::as_str).collect();
+        (!names.is_empty()).then(|| {
+            format!(
+                "⚠ {} pod(s) had work no backup had saved (an operation in progress, or changes, commits or untracked files on a \
+                 branch no backup commits), copied before the --hard switch discarded or overwrote it — what it discarded is also \
+                 saved on the pod, in .git/arena-discarded/<time>/, which no later copy overwrites (see each one's line): {}",
+                names.len(),
+                names.join(", ")
+            )
+        })
     }
 }
 
@@ -8060,11 +8788,14 @@ impl Switched {
 /// ([`switch_unlocked_line`]); then the branch it's on is backed up — commit,
 /// redact, push (a no-op on `main`/`master` or a branch in sync) — and the pods it pushed are
 /// switched. A pod whose push failed at the push itself is copied into LOCAL_BACKUP_DIR under the
-/// lock it still holds, then switched, its line saying so ([`not_pushed_note`]). A pod with
+/// lock it still holds, then switched, its line saying so ([`not_pushed_note`]); before a `--hard`
+/// reset, so is a pod on a branch no backup commits (main, …) with work there a reset could
+/// discard or overwrite (`UNCOMMITTED`: [`BackupTally::uncommitted`]; review fb2 F3, pr4). A pod with
 /// neither a push nor a copy — the copy failed too, the backup failed before the push, or
 /// another backup held its lock for the whole wait — is NOT switched: `--hard` would throw away
 /// what nothing has saved. `reset_onto`: the branch a `--hard` switch resets (a pod already on it
-/// loses its unpushed commits from the branch — they stay in its reflog — and its line says so).
+/// loses its unpushed commits from the branch — the switch pins them on the pod first, by a ref
+/// under refs/arena-discarded/ — and its line says so).
 #[allow(clippy::too_many_arguments)]
 async fn switch_guarded(
     remote: &Arc<dyn Remote>,
@@ -8114,15 +8845,24 @@ async fn switch_guarded(
         .collect();
     // Each pod's lock stays held through its push: it goes as that pod's switch ends.
     let t = backup_fleet(remote, jobs, &repo, |l| println!("{l}"), |_| {}).await;
-    let pushed: Vec<(String, SshTarget)> = targets.iter().filter(|(n, _)| !t.unpushed.iter().any(|u| &u.pod == n)).cloned().collect();
+    // Before a --hard reset, a pod on a branch no backup commits (main, …) with work there — an
+    // operation in progress, changes to tracked files, commits no remote has, untracked files — is
+    // copied first like a failed push, .git and all, and not reset if it can't be (review fb2 F3,
+    // pr4). A gentle switch or init-branches discards nothing (git refuses to overwrite an
+    // untracked file there).
+    let mut unpushed = t.unpushed;
+    if reset_onto.is_some() {
+        unpushed.extend(t.uncommitted);
+    }
+    let pushed: Vec<(String, SshTarget)> = targets.iter().filter(|(n, _)| !unpushed.iter().any(|u| &u.pod == n)).cloned().collect();
     let none = std::collections::HashMap::new();
     switch_batch(remote, pushed, &cmd_for, budget, doing, &none, &mut ok_line, &mut locks, &mut run).await;
     // The rest: copied first, under the lock each still holds — or not switched at all. A pod
     // with the wrong origin is neither copied nor switched: nothing on it changes here.
-    let at_push: Vec<Unpushed> = t.unpushed.iter().filter(|u| u.at_push).cloned().collect();
+    let at_push: Vec<Unpushed> = unpushed.iter().filter(|u| u.at_push).cloned().collect();
     let pulled = copy_unpushed(remote, cfg, &dir, sel, &at_push, rsync, LockMode::Held).await;
     let mut notes = std::collections::HashMap::new();
-    for u in &t.unpushed {
+    for u in &unpushed {
         let copied = if u.at_push {
             copy_outcome(&pulled, &u.pod).map_err(|why| format!("copying its files into {dir} failed too: {why}"))
         } else {
@@ -8132,10 +8872,16 @@ async fn switch_guarded(
             Ok(to) => {
                 notes.insert(u.pod.clone(), not_pushed_note(u, &to, reset_onto));
                 run.copied.push(u.pod.clone());
+                // --hard ends the merge / discards those changes on purpose, the copy holding them.
+                if u.busy.is_some() && reset_onto.is_some() {
+                    run.ended.push(u.pod.clone());
+                }
             }
             Err(also) => {
                 let why = if u.wrong_origin {
                     format!("{} — not backed up to git; run `arena pods setup {}`", u.why, u.pod)
+                } else if u.busy.is_some() {
+                    format!("its work couldn't be committed ({}) and {also}", u.why)
                 } else {
                     format!("its branch couldn't be pushed ({}) and {also}", u.why)
                 };
@@ -8183,7 +8929,7 @@ async fn switch_batch(
                 run.ok += 1;
             }
             _ => {
-                println!("{}{note}", failure_line(done, total, name, &call));
+                say(&format!("{}{note}", failure_line(done, total, name, &call)));
                 run.failed.push(name.clone());
             }
         }
@@ -8194,14 +8940,55 @@ async fn switch_batch(
 
 /// The loud part of a pod's line when it was switched with its branch copied, not pushed: which
 /// branch, why, where its files went — and where its commits are now (`reset_onto`: the branch a
-/// `--hard` switch resets; on that branch, its unpushed commits are left only in the reflog).
+/// `--hard` switch resets; on that branch, its unpushed commits are pinned on the pod by
+/// `refs/arena-discarded/<time>-<branch>`, and a detached HEAD's by `refs/arena-discarded/<time>`
+/// — review ai-review codex #3: they were left to the reflog, and git's gc after it; a gentle
+/// switch from a detached HEAD leaves its commits in the pod's HEAD reflog).
+///
+/// A pod with an operation in progress (`u.busy`: a merge, …) had nothing committed at all: its
+/// line says what is in progress instead of a push's failure. A gentle switch (and init-branches)
+/// refuses to end it, on the same line ([`arena_core::backup::checkout_command`]); `--hard`
+/// (`reset_onto` set) ends it and discards its uncommitted changes to tracked files with it — said
+/// here; the switch saves them on the pod first, and its own line says where ([`discarded_note`]).
+/// The copy isn't said to be the only one (review ai-review claude #2: it is the day's snapshot
+/// label, which the next pull of that label overwrites from the reset pod). On a branch no backup
+/// commits (`UNCOMMITTED`), `u.busy` is that work: changes to tracked files (discarded), commits no
+/// remote has (the copy has the `.git`), untracked files — which `checkout -f` and `reset --hard`
+/// overwrite wherever the new branch tracks the same path (review pr4: the line said untracked
+/// files stay).
 fn not_pushed_note(u: &Unpushed, copied_to: &str, reset_onto: Option<&str>) -> String {
+    use arena_core::backup::{busy_noun, uncommitted_reason, uncommitted_situation};
     let branch = u.branch.as_deref().unwrap_or("the branch it was on");
     let commits = if reset_onto.is_some() && u.branch.as_deref() == reset_onto {
-        format!("the --hard reset leaves its unpushed commits only in the branch's reflog on the pod (`git reflog {branch}`)")
+        format!("the --hard reset moves {branch} to origin's, and its unpushed commits stay on the pod under refs/arena-discarded/<time>-{branch}")
+    } else if branch == "HEAD" && reset_onto.is_some() {
+        "the commits of its detached HEAD stay on the pod under refs/arena-discarded/<time>".to_string()
+    } else if branch == "HEAD" {
+        "the commits of its detached HEAD stay on the pod only in its reflog (`git reflog`)".to_string()
     } else {
         "its commits stay on the pod in that branch (switching deletes no branch)".to_string()
     };
+    if let Some(what) = &u.busy {
+        // On main (…) nothing is ever committed: the work is uncommitted, not "not committed now".
+        let protected = u.branch.as_deref().is_some_and(is_protected_branch);
+        let on = if branch == "HEAD" { "a detached HEAD" } else { branch };
+        let situation = uncommitted_situation(what, on);
+        let why = if protected { format!("and {}", uncommitted_reason(what, on)) } else { "so nothing was committed".to_string() };
+        let ended = match (reset_onto, what.as_str()) {
+            (None, _) => String::new(),
+            (Some(_), "changes") => "the --hard switch discards them; ".to_string(),
+            (Some(_), "commits") => "that copy has its .git, those commits with it; ".to_string(),
+            (Some(onto), "untracked") => {
+                format!("the --hard switch overwrites any of them origin/{onto} tracks; ")
+            }
+            (Some(_), _) => format!(
+                "the --hard switch ends {} and discards its uncommitted changes to tracked files; ",
+                busy_noun(what)
+            ),
+        };
+        let first = if what == "commits" { "NOT PUSHED FIRST" } else { "NOT COMMITTED FIRST" };
+        return format!(" — ⚠ {first}: {situation}, {why}; its files were copied to {copied_to} first, and {ended}{commits}");
+    }
     format!(" — ⚠ NOT PUSHED FIRST: branch {branch} ({}); its files were copied to {copied_to} first, and {commits}", u.why)
 }
 
@@ -8226,6 +9013,41 @@ fn unredacted_note(stdout: &str) -> String {
         note.push_str(&format!(" — real key(s) back in {} file(s) git has redacted: {}", back.len(), back.join(", ")));
     }
     note
+}
+
+/// What `init-branches` left unpushed on the new branch ([`arena_core::backup::parse_init_unpushed`]):
+/// commits origin doesn't have, which it never pushes unscanned (review claude #2, FIX9B) — the
+/// next backup scans them for keys and pushes them. The branch went to origin at the newest
+/// commit origin has, or not at all when origin has none of it. Empty when it pushed the whole
+/// branch.
+fn unpushed_note(stdout: &str) -> String {
+    match arena_core::backup::parse_init_unpushed(stdout) {
+        None => String::new(),
+        Some((n, Some(at))) => format!(
+            " — {n} commit(s) origin doesn't have stay on it on the pod, unpushed (the branch went to origin at {}, the newest \
+             commit origin has): the next backup scans them for keys and pushes them",
+            at.get(..10).unwrap_or(&at)
+        ),
+        Some((n, None)) => format!(
+            " — not pushed: origin has none of its {n} commit(s); the next backup scans them for keys and pushes the branch"
+        ),
+    }
+}
+
+/// Where a `--hard` switch saved, on the pod, what it then discarded (`DISCARDED_SAVED <path>`:
+/// its uncommitted changes, an operation's state, untracked files the reset replaced —
+/// [`arena_core::backup::checkout_command`]), for the pod's line: a folder no later save or copy
+/// overwrites, with a README on getting it back — and the refs that keep the commits the reset left
+/// on no branch from git's gc (`DISCARDED_PINNED <ref>`: review ai-review codex #3), named. Empty
+/// when it saved nothing (nothing to discard).
+fn discarded_note(stdout: &str) -> String {
+    let said = |word: &str| -> Vec<&str> { stdout.lines().filter_map(|l| l.trim_end_matches('\r').strip_prefix(word)).collect() };
+    let Some(path) = said("DISCARDED_SAVED ").first().copied() else {
+        return String::new();
+    };
+    let pinned = said("DISCARDED_PINNED ");
+    let refs = if pinned.is_empty() { String::new() } else { format!("; its commits kept by {}", pinned.join(", ")) };
+    format!(" — what it discarded was saved to {}/ on the pod first (its README says how to get it back{refs})", path.trim_end_matches('/'))
 }
 
 /// The per-pod note for the nested repos a switch put back (`RESTORED <path>` lines;
@@ -8300,23 +9122,33 @@ fn take_would_refuse() -> Vec<String> {
 }
 
 /// Under test: take `lock` (a per-pod backup lock file), retrying for up to 2 s — whether a lock
-/// this process just released is free. It can read as held for a moment after its release: a
-/// child another test thread forks meanwhile (a git, an rsync stub) holds a copy of every open
-/// file — the lock's too — until it execs (`O_CLOEXEC` closes it only then), and a flock belongs
-/// to the open file, not to the process. A lock still held after 2 s is a real one. Says on
-/// stderr when it had to wait (`--nocapture` shows it).
+/// this process just released is free. A [`arena_core::pull::PodLock`] unlocks when dropped, so
+/// one of ours is free at once; one released by a close alone (a run that was killed) can read
+/// as held for a moment: a child another test thread forks meanwhile (a git, an rsync stub)
+/// holds a copy of every open file — the lock's too — until it execs (`O_CLOEXEC` closes it only
+/// then), and a flock belongs to the open file, not to the process. A lock still held after 2 s
+/// is a real one. Says on stderr when it had to wait (`--nocapture` shows it).
 #[cfg(test)]
-fn lock_settles_free(lock: &std::fs::File) -> bool {
+fn lock_settles_free(lock: std::fs::File) -> bool {
+    lock_settles(lock).is_some()
+}
+
+/// Under test: [`lock_settles_free`]'s lock, taken and held (until the guard is dropped).
+#[cfg(test)]
+fn lock_settles(mut lock: std::fs::File) -> Option<arena_core::pull::PodLock> {
     let start = std::time::Instant::now();
     loop {
-        if arena_core::pull::try_lock(lock).unwrap() {
-            if !start.elapsed().is_zero() {
-                eprintln!("(lock_settles_free: free after {:?})", start.elapsed());
+        match arena_core::pull::try_lock(lock).unwrap() {
+            Ok(held) => {
+                if !start.elapsed().is_zero() {
+                    eprintln!("(lock_settles_free: free after {:?})", start.elapsed());
+                }
+                return Some(held);
             }
-            return true;
+            Err(f) => lock = f,
         }
         if start.elapsed() > Duration::from_secs(2) {
-            return false;
+            return None;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -12540,14 +13372,32 @@ async fn select(provider: &dyn Provider, cfg: &Config, sel: &SelectArgs, unscope
 
 /// Narrow a fleet-wide selection of the git backup commands (`pods backup`, `pull`,
 /// `init-branches`, `set-branch`) to this cohort's machines, saying in one line who was left
-/// out ([`split_cohort`], [`non_cohort_line`]). A selection that named pods comes back as it was.
-fn cohort_only(cfg: &Config, sel: Selected) -> Selected {
+/// out ([`split_cohort`], [`non_cohort_line`]). A selection that named pods comes back as it was,
+/// and so does every selection with `--include-non-cohort` (nothing left out, nothing said).
+fn cohort_only(cfg: &Config, sel: Selected, scope: CohortScope) -> Selected {
+    if scope.include_non_cohort {
+        return sel;
+    }
     let naming = Naming::from_config(cfg);
     let (kept, left_out) = split_cohort(&naming, sel);
     if let Some(line) = non_cohort_line(naming.prefix, &left_out) {
         say(&line);
     }
     kept
+}
+
+/// `set-branch --hard --include-non-cohort` with no pod named: refused, before any pod is listed
+/// (review ai-review claude #5). The flag takes every pod on the account — staff boxes, other
+/// cohorts' pods, a pod the provider named — which is harmless for a `pull`, but `--hard` resets
+/// each one, discarding its uncommitted work. Naming the pods (the flag then changes nothing:
+/// named pods are acted on exactly) is how to reset one of them. `None` otherwise. Pure.
+fn hard_non_cohort_refusal(hard: bool, scope: CohortScope, names_pods: bool) -> Option<String> {
+    (hard && scope.include_non_cohort && !names_pods).then(|| {
+        "set-branch --hard with --include-non-cohort refused: that takes every pod on the account, so --hard would reset staff \
+         boxes and other cohorts' pods too, discarding their uncommitted work — name the pods to reset \
+         (`arena pods set-branch <branch> <pod>... --hard`), or leave --include-non-cohort out to reset this cohort's"
+            .to_string()
+    })
 }
 
 /// What a fleet-wide backup command acts on — one that names no pod (no targets, `all` or
@@ -12582,7 +13432,7 @@ fn non_cohort_line(prefix: &str, names: &[String]) -> Option<String> {
     }
     let n = names.len();
     Some(format!(
-        "⊘ skipped {n} non-cohort pod{} (not {prefix}-…, or an @ staff entry): {list} — name one to include it",
+        "⊘ skipped {n} non-cohort pod{} (not {prefix}-…, or an @ staff entry): {list} — name one to include it, or pass --include-non-cohort",
         if n == 1 { "" } else { "s" }
     ))
 }
@@ -12655,7 +13505,7 @@ async fn handle_init_branches(
     }
 
     if dry_run {
-        println!("{}\n", push_first_note(cfg));
+        println!("{}\n", push_first_note(cfg, false));
         println!("Dry-run — would init the w{week}d{day} branch on {} pod(s):\n", targets.len());
         for (name, t) in &targets {
             let cmd = arena_core::backup::init_branch_command(&bcfg, name);
@@ -12684,7 +13534,7 @@ async fn handle_init_branches(
     // A day branch that already exists gets back the real keys set aside on it (the morning's
     // `set-branch main` run twice): said as set-branch says it.
     let run = switch_guarded(&remote, cfg, sel, targets, rsync, None, cmd_for, BRANCH_TIMEOUT, &doing, |name, out, note| {
-        format!("✓ {name} -> {}{}{note}", bcfg.branch_for(name), unredacted_note(&out.stdout))
+        format!("✓ {name} -> {}{}{}{note}", bcfg.branch_for(name), unpushed_note(&out.stdout), unredacted_note(&out.stdout))
     })
     .await;
     println!("\nDone: {} initialized, {} failed, {} not switched (of {total}).", run.ok, run.failed.len(), run.not_switched.len());
@@ -12770,7 +13620,7 @@ const POD_LOCK_WAIT: Duration = Duration::from_secs(120);
 struct PodLocks {
     /// Held (until released or this is dropped), with how many pieces of this run's work are
     /// still to end under each.
-    held: std::collections::HashMap<String, (std::fs::File, usize)>,
+    held: std::collections::HashMap<String, (arena_core::pull::PodLock, usize)>,
     /// Names whose lock stayed busy: skipped, a failure.
     busy: Vec<String>,
 }
@@ -12839,11 +13689,11 @@ async fn take_pod_locks(dir: &str, names: &[String], wait: Duration) -> PodLocks
     loop {
         let mut still = Vec::new();
         for (name, f) in pending {
-            match arena_core::pull::try_lock(&f) {
-                Ok(true) => {
-                    out.held.insert(name, (f, 0));
+            match arena_core::pull::try_lock(f) {
+                Ok(Ok(lock)) => {
+                    out.held.insert(name, (lock, 0));
                 }
-                Ok(false) => still.push((name, f)),
+                Ok(Err(f)) => still.push((name, f)),
                 Err(e) => {
                     eprintln!("warning: locking {name}'s backup failed ({e}) — going ahead without its lock");
                 }
@@ -12931,6 +13781,12 @@ struct Pulled {
     /// `<big root>/<pod>` — the pod's name is appended.
     snapshot_root: String,
     big_root: Option<String>,
+    /// The pods copied whole: every rsync planned for them, in both tiers — the snapshot's
+    /// uncapped `.git` pass among them — succeeded. Only such a copy may hold an operation's state
+    /// before it is finished (`resolve`): a pod left out for any reason (its lock busy, no
+    /// endpoint, a timeout, a tier or a pass that failed, not pulled at all) isn't here. Empty for a
+    /// pull with `--no-big` or `--no-git`.
+    whole: Vec<String>,
 }
 
 impl Pulled {
@@ -13040,9 +13896,17 @@ async fn pull_pods(
     );
 
     let targets = sel.named_targets(cfg)?;
+    // A pod with no endpoint isn't pulled: a failure for a caller that reports per pod (the
+    // backup's copy of a pod git didn't back up), though not a failed rsync for `pods pull`.
+    let unreachable: Vec<(String, String)> = sel
+        .pods
+        .iter()
+        .filter(|p| !targets.iter().any(|(n, _)| *n == p.name))
+        .map(|p| (p.name.clone(), "no SSH endpoint to pull from".to_string()))
+        .collect();
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to pull)");
-        return Ok(Pulled::default());
+        return Ok(Pulled { failed: unreachable, ..Pulled::default() });
     }
 
     // Per-pod tiers: (tier name, dest, config). `big` is dropped when --no-big. The snapshot
@@ -13107,7 +13971,7 @@ async fn pull_pods(
     // the whole wait is skipped — a failure of this run, named.
     let mut lock_failures: Vec<String> = Vec::new();
     // Every failure by pod too (`Pulled::failed`), for a caller that reports per pod.
-    let mut by_pod: Vec<(String, String)> = Vec::new();
+    let mut by_pod: Vec<(String, String)> = unreachable;
     let mut locks = match locking {
         LockMode::Held => PodLocks::default(),
         LockMode::Take(wait) => {
@@ -13159,6 +14023,8 @@ async fn pull_pods(
     println!("Pulling {total_pods} pod(s) into {dest_msg}…");
     // Every rsync: per pod, per tier, the home job — plus the repo job when it's split out.
     let mut planned = Vec::new();
+    // How many rsync jobs each pod has, and how many succeeded: all of them = copied whole.
+    let mut jobs_of: std::collections::HashMap<String, (usize, usize)> = Default::default();
     for (name, t) in &targets {
         for (tier, dest, pc) in tiers_for(name) {
             for job in arena_core::volume::pull_jobs(&pc, &dest, splits.get(name)) {
@@ -13167,6 +14033,7 @@ async fn pull_pods(
                     (true, "big") => "big repo",
                     (true, _) => "snapshot repo",
                 };
+                jobs_of.entry(name.clone()).or_default().0 += 1;
                 planned.push((name, t, tier, job));
             }
         }
@@ -13300,6 +14167,7 @@ async fn pull_pods(
                 let summary = stats.map_or_else(|| "done".into(), |s| s.summary());
                 say(&format!("[{done}/{jobs}] ✓ {name} [{tier}] ({summary}){moved}"));
                 ok += 1;
+                jobs_of.entry(name.clone()).or_default().1 += 1;
             }
             Err((git, Ok(o))) => {
                 let pass = if git { ", .git" } else { "" };
@@ -13340,7 +14208,16 @@ async fn pull_pods(
     }
     println!("\nDone: {ok} rsync job(s) ok, {failed} failed across {total_pods} pod(s).");
     failures.splice(0..0, lock_failures.iter().cloned());
-    Ok(Pulled { failures, failed: by_pod, snapshot_root: format!("{dir}/{label}"), big_root: (!no_big).then_some(big_root) })
+    let whole = if no_big || no_git {
+        Vec::new()
+    } else {
+        targets
+            .iter()
+            .map(|(n, _)| n.clone())
+            .filter(|n| jobs_of.get(n).is_some_and(|(all, ok)| *all > 0 && ok == all) && !by_pod.iter().any(|(p, _)| p == n))
+            .collect()
+    };
+    Ok(Pulled { failures, failed: by_pod, snapshot_root: format!("{dir}/{label}"), big_root: (!no_big).then_some(big_root), whole })
 }
 
 /// `p` absolute: canonical once it exists, else made absolute against the working directory (the
@@ -15161,8 +16038,8 @@ mod replacement_spec_tests {
     }
 
     /// Finding #22: on REST v1 a catalog GPU its create enum lacks (the PRO 6000 MIG slices)
-    /// is refused before any create, by its display name, pointing at RUNPOD_API=v2; an
-    /// unreadable enum refuses nothing.
+    /// is refused before any create, by its display name, saying how to get back to v2 (the
+    /// default); an unreadable enum refuses nothing.
     #[test]
     fn v1_refuses_a_gpu_its_create_api_rejects() {
         use super::v1_creatable_check;
@@ -15174,7 +16051,11 @@ mod replacement_spec_tests {
         let creatable = vec!["NVIDIA RTX A4000".to_string(), "NVIDIA B300 SXM6 AC MIG 1g.34gb".to_string()];
         assert!(v1_creatable_check("NVIDIA RTX A4000", &catalog, &creatable).is_ok());
         let e = v1_creatable_check(&format!("NVIDIA RTX A4000,{mig}"), &catalog, &creatable).unwrap_err().to_string();
-        assert!(e.contains("`PRO 6000 MIG 24GB`") && e.contains("REST v1's create API rejects it") && e.contains("RUNPOD_API=v2"), "{e}");
+        assert!(
+            e.contains("`PRO 6000 MIG 24GB`") && e.contains("REST v1's create API rejects it")
+                && e.contains("v2's create takes it: remove RUNPOD_API=v1 (v2 is the default), or pick another --gpu"),
+            "{e}"
+        );
         assert!(!e.contains("`RTX A4000`"), "only the bad token: {e}");
         assert!(v1_creatable_check(mig, &catalog, &[]).is_ok(), "no enum: nothing refused");
     }
@@ -15289,7 +16170,7 @@ mod replacement_spec_tests {
 mod selection_tests {
     use super::lifecycle_tests::FakeKeys;
     use super::{
-        handle_keys, handle_pods, keys_preview, keys_targets, keys_with, misplaced_run_flags, select, Cli, Cmd, KeysAction,
+        handle_keys, handle_pods, keys_preview, keys_targets, keys_with, misplaced_run_flags, pod_name_as_command, select, Cli, Cmd, KeysAction,
         KeysCmd, PodCmd, Unscoped,
     };
     use arena_core::remote::FakeRemote;
@@ -15960,6 +16841,36 @@ mod selection_tests {
     }
 
     #[test]
+    fn run_refuses_a_command_that_starts_with_a_pods_name() {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let names = [("devtest-hz4", "hz4"), ("devtest-apple", "apple")];
+        for (cmd, bad) in [
+            // the `-t` forgotten: the pod's name (full or short) taken as the command
+            (&["devtest-hz4", "git status"][..], Some(("devtest-hz4", "devtest-hz4"))),
+            (&["apple", "ls", "-la"], Some(("apple", "devtest-apple"))),
+            (&["apple ls"], Some(("apple", "devtest-apple"))),
+            // ordinary commands, a name inside a command, the `command` escape, other words
+            (&["git", "status"], None),
+            (&["ls apple"], None),
+            (&["command", "apple", "x"], None),
+            (&["apples"], None),
+            (&["devtest-hz"], None),
+        ] {
+            let got = pod_name_as_command(&words(cmd), &names);
+            match bad {
+                None => assert_eq!(got, None, "{cmd:?}"),
+                Some((first, full)) => {
+                    let e = got.unwrap_or_else(|| panic!("{cmd:?}: not refused"));
+                    assert!(e.starts_with(&format!("`{first}` is a pod's name ({full})")), "{cmd:?}: {e}");
+                    assert!(e.contains("Nothing was run") && e.contains(&format!("-t {first} '")), "{cmd:?}: {e}");
+                }
+            }
+        }
+        assert_eq!(pod_name_as_command(&[], &names), None);
+        assert!(pod_name_as_command(&words(&["apple"]), &names).is_some_and(|e| e.contains("on all 2 selected pod(s)")));
+    }
+
+    #[test]
     fn every_old_spelling_still_parses() {
         let ok: &[&[&str]] = &[
             &["pods", "stop", "apple"],
@@ -16133,6 +17044,7 @@ mod setup_tests {
             key_remote: "/root/.ssh/id_ed25519".into(),
             repo_path: "/root/ARENA_materials".into(),
             repo_url: "git@github.com:o/r.git".into(),
+            upstream_url: None,
             branch: "main".into(),
             prefix: "devtest".into(),
             authorized_pubkeys: vec![],
@@ -16687,22 +17599,57 @@ mod setup_tests {
 mod tests {
     use super::{strip_arena_block, with_arena_block, CRON_BEGIN, CRON_END};
 
-    /// `config check` says which RunPod API is selected, warns on v1 with the retirement
-    /// date, and fails on a value that's neither.
+    /// `config check` says which RunPod API is selected — v2, "(default)" when RUNPOD_API is
+    /// unset or empty — warns on an explicit v1 with the retirement date and the way back,
+    /// and fails on a value that's neither.
     #[test]
     fn config_check_runpod_api_row() {
         use super::{runpod_api_row, Config};
-        let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API_KEY=k"));
-        assert!(ok && line.contains("⚠") && line.contains("v1 (default)") && line.contains("2026-11-15"), "{line}");
-        let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=v1"));
-        assert!(ok && line.contains("v1 (rest.runpod.io/v1)") && line.contains("2026-11-15"), "{line}");
-        let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=v2"));
-        assert!(ok && line.contains("✓") && line.contains("v2") && !line.contains("retires"), "{line}");
+        let key = format!("{:<24}", "RUNPOD_API");
+        for text in ["RUNPOD_API_KEY=k", "RUNPOD_API=", "RUNPOD_API=\"  \""] {
+            let row = runpod_api_row(&Config::parse(text));
+            assert_eq!(row, (format!("  ✓ {key} v2 (default) (api.runpod.io/v2)"), true), "{text:?}");
+        }
+        for text in ["RUNPOD_API=v2", "RUNPOD_API=V2"] {
+            let row = runpod_api_row(&Config::parse(text));
+            assert_eq!(row, (format!("  ✓ {key} v2 (api.runpod.io/v2)"), true), "{text:?}");
+        }
+        for text in ["RUNPOD_API=v1", "RUNPOD_API=\"V1\""] {
+            let row = runpod_api_row(&Config::parse(text));
+            let want = format!(
+                "  ⚠ {key} v1 (rest.runpod.io/v1) — RunPod retires REST v1 on 2026-11-15; remove RUNPOD_API=v1 (v2 is the default)"
+            );
+            assert_eq!(row, (want, true), "{text:?}: a warning, not a failure");
+        }
         let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=v3"));
         assert!(!ok && line.contains("✗") && line.contains("must be `v1` or `v2`"), "{line}");
         // `config check` never shows secret values — not even a key pasted into RUNPOD_API.
         let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=rpa_SECRETKEY123"));
         assert!(!ok && line.contains("✗") && !line.contains("SECRETKEY"), "{line}");
+    }
+
+    /// The whole `config check` of a RunPod config without RUNPOD_API: v2, said to be the
+    /// default, and a CUDA floor above 13.0 is fine (v2 sends a real floor). The same config
+    /// with an explicit `RUNPOD_API=v1` still passes that row (⚠, not ✗) but fails on the
+    /// floor v1 can't ask for — both saying how to get back to v2.
+    #[test]
+    fn config_check_without_runpod_api_is_v2_and_an_explicit_v1_warns() {
+        use super::{config_report, Config};
+        let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
+                    GPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\nMIN_CUDA_VERSION=13.1\n";
+        let row = |report: &str| report.lines().find(|l| l.contains("RUNPOD_API ")).unwrap_or_default().trim_start().to_string();
+        let (report, missing) = config_report(&Config::parse(base), "runpod");
+        assert!(row(&report).starts_with("✓ RUNPOD_API") && row(&report).ends_with(" v2 (default) (api.runpod.io/v2)"), "{report}");
+        assert!(report.contains("✓ host CUDA") && report.contains("≥ 13.1 (a floor, from MIN_CUDA_VERSION)"), "{report}");
+        assert!(missing.is_empty() && !report.contains("rest.runpod.io/v1"), "{missing:?}\n{report}");
+        let (report, missing) = config_report(&Config::parse(&format!("{base}RUNPOD_API=v1\n")), "runpod");
+        assert!(
+            row(&report).starts_with("⚠ RUNPOD_API")
+                && row(&report).ends_with(" v1 (rest.runpod.io/v1) — RunPod retires REST v1 on 2026-11-15; remove RUNPOD_API=v1 (v2 is the default)"),
+            "{report}"
+        );
+        assert!(report.contains("✗ host CUDA") && report.contains("can't ask for it"), "{report}");
+        assert_eq!(missing, ["a host CUDA constraint RunPod v1 can express, or remove RUNPOD_API=v1 (v2 is the default)"]);
     }
 
     /// "✗ means fail": every key set to a value its parser refuses shows a ✗ row and is named —
@@ -16717,11 +17664,18 @@ mod tests {
         let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
                     HETZNER_API_KEY=not-a-real-key\nGPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\n";
         // (what's added to the base, the keys the check must fail on)
-        let cases: [(&str, &[&str]); 24] = [
+        let cases: [(&str, &[&str]); 30] = [
             ("", &[]),
             ("SHARED_SSH_KEY_PATH=/nonexistent/k\nGIT_SSH_KEY_LOCAL=/nonexistent/d", &[]),
             ("BACKUP_TIMEOUT_SECS=soon", &["BACKUP_TIMEOUT_SECS"]),
+            // `set-branch --hard`'s save limit (review ai-review claude #6).
+            ("DISCARD_MAX_GB=lots", &["DISCARD_MAX_GB"]),
+            ("DISCARD_MAX_GB=0", &["DISCARD_MAX_GB"]),
+            ("DISCARD_MAX_GB=0.5", &[]),
             ("BACKUP_TIMEOUT_SECS=0", &["BACKUP_TIMEOUT_SECS"]),
+            ("BUSY_AUTO_RESOLVE_HOURS=3h", &["BUSY_AUTO_RESOLVE_HOURS"]),
+            ("BUSY_AUTO_RESOLVE_HOURS=721", &["BUSY_AUTO_RESOLVE_HOURS"]),
+            ("BUSY_AUTO_RESOLVE_HOURS=off", &[]),
             ("SETUP_TIMEOUT_SECS=5m", &["SETUP_TIMEOUT_SECS"]),
             ("MIN_DRIVER_VERSION=abc", &["MIN_DRIVER_VERSION"]),
             ("VSCODE_PREINSTALL=maybe", &["VSCODE_PREINSTALL"]),
@@ -16773,9 +17727,53 @@ mod tests {
                 "MIN_DRIVER_VERSION (\"abc\" is not a driver version like 580 or 580.65.06)",
             ]
         );
+        let (_, missing) = config_report(&Config::parse(&format!("{base}DISCARD_MAX_GB=lots\n")), "runpod");
+        assert_eq!(missing, ["DISCARD_MAX_GB (must be a number of GiB above 0, a fraction too, like 1 or 0.5)"]);
+        // The save limit is shown, in binary units labelled so, its default said so.
+        for (extra, row) in [
+            ("", "  · --hard save max per pod    1.0 GiB (default) (DISCARD_MAX_GB)"),
+            ("DISCARD_MAX_GB=0.5\n", "  · --hard save max per pod    512 MiB (DISCARD_MAX_GB)"),
+            ("DISCARD_MAX_GB=0.05\n", "  · --hard save max per pod    51 MiB (DISCARD_MAX_GB)"),
+            (
+                "DISCARD_MAX_GB=lots\n",
+                "  ✗ --hard save max per pod    DISCARD_MAX_GB must be a number of GiB above 0, a fraction too, like 1 or 0.5 (got `lots`)",
+            ),
+        ] {
+            let (report, _) = config_report(&Config::parse(&format!("{base}{extra}")), "runpod");
+            assert!(report.lines().any(|l| l == row), "{extra:?}:\n{report}");
+        }
         // Not ready here is ⚠, and named.
         let (report, _) = config_report(&Config::parse(&format!("{base}SHARED_SSH_KEY_PATH=/nonexistent/k\n")), "runpod");
         assert!(report.contains("  ⚠ shared SSH key") && report.contains("  ⚠ iteration start date       unset"), "{report}");
+    }
+
+    /// Live 6 (FIX6B item 5): `DISCARD_MAX_GB` from the environment, the file without it — as in
+    /// `DISCARD_MAX_GB=0.001 arena pods set-branch main <pod> --hard`. `config which` lists it among
+    /// the environment's overrides, and `config check` shows the value (a bad one is ✗ and fails
+    /// the check); a key the environment may not introduce is listed by neither, and the reaper's
+    /// file-only keys are said to be ignored. With no variable, nothing is listed.
+    #[test]
+    fn a_discard_limit_from_the_environment_shows_in_config_which_and_check() {
+        use super::{config_report, env_keys, Config};
+        let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
+                    GPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\nREAP_ENABLED=0\n";
+        let env = |v: &'static str| move |k: &str| matches!(k, "DISCARD_MAX_GB" | "SOME_NEW_KEY" | "REAP_ENABLED").then(|| v.to_string());
+        let cfg = Config::parse_with_env(base, env("0.001"));
+        assert_eq!(env_keys(&cfg, |k| env("0.001")(k).is_some()), (vec!["DISCARD_MAX_GB"], vec!["REAP_ENABLED"]));
+        let (report, missing) = config_report(&cfg, "runpod");
+        assert!(report.lines().any(|l| l == "  · --hard save max per pod    1 MiB (from the environment) (DISCARD_MAX_GB)"), "{report}");
+        assert!(missing.is_empty(), "{missing:?}");
+        let (report, missing) = config_report(&Config::parse_with_env(base, env("lots")), "runpod");
+        assert!(report.contains("\n  ✗ --hard save max per pod    DISCARD_MAX_GB must be a number of GiB above 0"), "{report}");
+        assert_eq!(missing, ["DISCARD_MAX_GB (must be a number of GiB above 0, a fraction too, like 1 or 0.5)"]);
+        let cfg = Config::parse_with_env(&format!("{base}DISCARD_MAX_GB=2\n"), |_| None);
+        assert_eq!(env_keys(&cfg, |_| false), (vec![], vec![]));
+        // The file's value, then the environment's over it (Live 7): said where it came from.
+        let (report, _) = config_report(&cfg, "runpod");
+        assert!(report.lines().any(|l| l == "  · --hard save max per pod    2.0 GiB (DISCARD_MAX_GB)"), "{report}");
+        let cfg = Config::parse_with_env(&format!("{base}DISCARD_MAX_GB=2\n"), env("0.5"));
+        let (report, _) = config_report(&cfg, "runpod");
+        assert!(report.lines().any(|l| l == "  · --hard save max per pod    512 MiB (from the environment) (DISCARD_MAX_GB)"), "{report}");
     }
 
     /// Merge of wave 7 reaper ("✗ means fail"): switched on (REAP_ENABLED=1), every ✗ row in the
@@ -16844,7 +17842,7 @@ mod tests {
         let (l, ok) = rows("ALLOWED_CUDA_VERSIONS=\"13.0\"", false);
         assert!(ok && l.contains("✓") && l.contains("≥ 13.0 (a floor, from ALLOWED_CUDA_VERSIONS)") && !l.contains("└"), "{l}");
         let (l, ok) = rows("ALLOWED_CUDA_VERSIONS=\"13.0\"", true);
-        assert!(ok && l.contains("has no real floor") && l.contains("RUNPOD_API=v2"), "{l}");
+        assert!(ok && l.contains("has no real floor") && l.contains("remove RUNPOD_API=v1 (v2 is the default) to reach newer hosts"), "{l}");
         let (l, _) = rows("ALLOWED_CUDA_VERSIONS=\"13.0, 12.8\"", false);
         assert!(l.contains("≥ 12.8") && l.contains("lists several versions"), "{l}");
         let (l, ok) = rows("EXACT_CUDA_VERSIONS=13.0", false);
@@ -16852,7 +17850,7 @@ mod tests {
         let (l, _) = rows("MIN_CUDA_VERSION=13.0\nALLOWED_CUDA_VERSIONS=12.8", false);
         assert!(l.contains("≥ 13.0 (a floor, from MIN_CUDA_VERSION)") && l.contains("ALLOWED_CUDA_VERSIONS is ignored"), "{l}");
         let (l, ok) = rows("MIN_CUDA_VERSION=13.1", true);
-        assert!(!ok && l.contains("✗") && l.contains("RUNPOD_API=v2"), "{l}");
+        assert!(!ok && l.contains("✗") && l.contains("remove RUNPOD_API=v1 (v2 is the default)"), "{l}");
         assert!(rows("MIN_CUDA_VERSION=13.1", false).1, "v2 sends any floor");
         let (l, ok) = rows("EXACT_CUDA_VERSIONS=13.0,13.2", true);
         assert!(!ok && l.contains("13.2"), "{l}");
@@ -16876,7 +17874,7 @@ mod tests {
         assert_eq!(ok, Err("EXACT_CUDA_VERSIONS (`latest` isn't a version like 13.0)".to_string()));
         // What v1 can't express keeps its own wording.
         let (_, ok) = cuda_rows(&Config::parse("MIN_CUDA_VERSION=13.1"), true);
-        assert_eq!(ok, Err("a host CUDA constraint RunPod v1 can express (or RUNPOD_API=v2)".to_string()));
+        assert_eq!(ok, Err("a host CUDA constraint RunPod v1 can express, or remove RUNPOD_API=v1 (v2 is the default)".to_string()));
     }
 
     /// `config check` shows CREATE_EXTRA_JSON's keys (never its values) and fails a value
@@ -17118,6 +18116,7 @@ mod tests {
             snapshot_dir,
             archive: false,
             archive_state_dir: None,
+            kept_logs: &[],
         })
     }
 
@@ -17129,8 +18128,9 @@ mod tests {
         // Every 2 minutes, flock'd like the proxy line, public JSON only, atomically to DIR/fleet.json.
         assert_eq!(
             lines[2],
-            "*/2 * * * * flock -n /home/u/.arena-snapshot-cron.lock /opt/arena --config /srv/config.env \
-             snapshot --public --out '/var/www/fleet/fleet.json' >> /home/u/arena-snapshot-cron.log 2>&1"
+            "*/2 * * * * mkdir -p /home/u/.local/state/arena-cron && flock -n /home/u/.local/state/arena-cron/snapshot.lock \
+             /opt/arena --config /srv/config.env snapshot --public --out '/var/www/fleet/fleet.json' \
+             >> /home/u/.local/state/arena-cron/snapshot.log 2>&1"
         );
         // A quote in the directory can't break out of the shell word.
         let odd = cron_job_with(false, false, Some("/srv/it's"));
@@ -17160,11 +18160,12 @@ mod tests {
     #[test]
     fn cron_lines_add_the_proxy_resync_only_when_asked() {
         // The backup line is flock'd too: a tick that finds the last backup still running
-        // (a wedged pod's rsync, up to BACKUP_TIMEOUT_SECS) exits instead of stacking.
+        // (a wedged pod's rsync, up to BACKUP_TIMEOUT_SECS) exits instead of stacking. Its lock
+        // and log are in the cron folder, which it recreates first.
         assert_eq!(
             cron_job(false, false),
-            ["*/15 * * * * flock -n -o /home/u/.arena-backup-cron.lock /opt/arena --config /srv/config.env \
-              pods backup --no-pull --yes >> /home/u/arena-cron.log 2>&1"]
+            ["*/15 * * * * mkdir -p /home/u/.local/state/arena-cron && flock -n -o /home/u/.local/state/arena-cron/backup.lock \
+              /opt/arena --config /srv/config.env pods backup --no-pull --yes >> /home/u/.local/state/arena-cron/backup.log 2>&1"]
         );
         // The proxy line carries a PATH with /usr/sbin (cron's default lacks it, and that's
         // where nginx lives on Ubuntu) and a `flock -n` so a slow tick can't pile up.
@@ -17172,11 +18173,11 @@ mod tests {
         assert_eq!(
             both,
             [
-                "*/15 * * * * flock -n -o /home/u/.arena-backup-cron.lock /opt/arena --config /srv/config.env \
-                 pods backup --yes >> /home/u/arena-cron.log 2>&1",
-                "*/5 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-                 flock -n /home/u/.arena-proxy-cron.lock /opt/arena --config /srv/config.env proxy apply --yes \
-                 >> /home/u/arena-proxy-cron.log 2>&1",
+                "*/15 * * * * mkdir -p /home/u/.local/state/arena-cron && flock -n -o /home/u/.local/state/arena-cron/backup.lock \
+                 /opt/arena --config /srv/config.env pods backup --yes >> /home/u/.local/state/arena-cron/backup.log 2>&1",
+                "*/5 * * * * mkdir -p /home/u/.local/state/arena-cron && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+                 flock -n /home/u/.local/state/arena-cron/proxy.lock /opt/arena --config /srv/config.env proxy apply --yes \
+                 >> /home/u/.local/state/arena-cron/proxy.log 2>&1",
             ]
         );
         // Without the backup line selected, only the asked-for lines render.
@@ -17212,7 +18213,8 @@ mod tests {
     }
 
     /// `--start-date` goes before `flock` (an inline env assignment applies to the command it
-    /// prefixes; flock hands it on to arena) — after it, flock would try to run it.
+    /// prefixes; flock hands it on to arena) — after it, flock would try to run it — and after
+    /// the `mkdir -p … &&`, which would otherwise take it.
     #[test]
     fn cron_backup_line_keeps_the_start_date_ahead_of_flock() {
         let lines = super::cron_lines(&super::CronJob {
@@ -17227,24 +18229,40 @@ mod tests {
             snapshot_dir: None,
             archive: false,
             archive_state_dir: None,
+            kept_logs: &[],
         });
         assert_eq!(
             lines,
             [(
                 super::CronKind::Backup,
-                "0 * * * * ARENA_START_DATE=2026-10-05 flock -n -o /root/.arena-backup-cron.lock /opt/arena --config \
-                 /srv/config.env pods backup --yes >> /root/arena-cron.log 2>&1"
+                "0 * * * * mkdir -p /root/.local/state/arena-cron && ARENA_START_DATE=2026-10-05 flock -n -o \
+                 /root/.local/state/arena-cron/backup.lock /opt/arena --config /srv/config.env pods backup --yes \
+                 >> /root/.local/state/arena-cron/backup.log 2>&1"
                     .to_string()
             )]
         );
     }
 
     /// Each managed line's identity, read from the subcommand it runs — the lines earlier
-    /// versions wrote (no flock, no tag) included; hand edits and look-alikes are `None`.
+    /// versions wrote (no flock, no tag, the logs in the home) included; hand edits and
+    /// look-alikes are `None`.
     #[test]
     fn cron_kind_of_lines_table() {
         use super::CronKind::{self, *};
         let cases: &[(&str, Option<CronKind>)] = &[
+            // This version's: the cron folder (and a kept log's) recreated first, the lock in there.
+            ("*/15 * * * * mkdir -p /h/.local/state/arena-cron && ARENA_START_DATE=2026-01-05 flock -n -o /h/.local/state/arena-cron/backup.lock /opt/arena --config /c pods backup --yes >> /h/.local/state/arena-cron/backup.log 2>&1", Some(Backup)),
+            ("*/5 * * * * mkdir -p /h/.local/state/arena-cron /h/logs/cron && PATH=/usr/sbin:/usr/bin flock -n /h/.local/state/arena-cron/proxy.lock /opt/arena --config /c proxy apply --yes >> /h/logs/cron/arena-proxy-cron.log 2>&1", Some(Proxy)),
+            ("*/2 * * * * mkdir -p /h/.local/state/arena-cron && flock -n /h/.local/state/arena-cron/snapshot.lock /opt/arena --config /c snapshot --public --out '/w/fleet.json' >> /h/.local/state/arena-cron/snapshot.log 2>&1", Some(Snapshot)),
+            ("40 * * * * mkdir -p /h/.local/state/arena-cron /h/logs && nice -n 10 /opt/arena --config /c archive sync --tier big >> /h/logs/archive.log 2>&1", Some(ArchiveBig)),
+            ("11 * * * * mkdir -p /h/.local/state/arena-cron && PATH=/bin flock -n -o /h/.local/state/arena-cron/reap.lock /opt/arena --config /c pods reap run >> /h/.local/state/arena-cron/reap.log 2>&1", Some(Reap)),
+            // a663f65's: one folder under the state root.
+            ("*/15 * * * * mkdir -p /h/.local/state/arena/cron && ARENA_START_DATE=2026-01-05 flock -n -o /h/.local/state/arena/cron/backup.lock /opt/arena --config /c pods backup --yes >> /h/.local/state/arena/cron/backup.log 2>&1", Some(Backup)),
+            ("*/5 * * * * mkdir -p /h/.local/state/arena/cron && PATH=/usr/sbin:/usr/bin flock -n /h/.local/state/arena/cron/proxy.lock /opt/arena --config /c proxy apply --yes >> /h/.local/state/arena/cron/proxy.log 2>&1", Some(Proxy)),
+            ("*/2 * * * * mkdir -p /h/.local/state/arena/cron && flock -n /h/.local/state/arena/cron/snapshot.lock /opt/arena --config /c snapshot --public --out '/w/fleet.json' >> /h/.local/state/arena/cron/snapshot.log 2>&1", Some(Snapshot)),
+            ("7,22,37,52 * * * * mkdir -p /h/.local/state/arena/cron && ARENA_STATE_DIR=/s nice -n 10 /opt/arena --config /c archive sync --tier snap >> /h/.local/state/arena/cron/archive.log 2>&1", Some(ArchiveSnap)),
+            ("40 * * * * mkdir -p /h/.local/state/arena/cron && nice -n 10 /opt/arena --config /c archive sync --tier big >> /h/.local/state/arena/cron/archive.log 2>&1", Some(ArchiveBig)),
+            ("11 * * * * mkdir -p /h/.local/state/arena/cron && PATH=/bin flock -n -o /h/.local/state/arena/cron/reap.lock /opt/arena --config /c pods reap run >> /h/.local/state/arena/cron/reap.log 2>&1", Some(Reap)),
             // Written by an earlier `cron install` (no flock on the backup line).
             ("*/15 * * * * /usr/local/bin/arena --config /c pods backup --no-pull --yes >> /root/arena-cron.log 2>&1", Some(Backup)),
             ("*/15 * * * * ARENA_START_DATE=2026-01-05 /opt/arena --config /c pods backup --yes >> /h/arena-cron.log 2>&1", Some(Backup)),
@@ -17344,6 +18362,519 @@ mod tests {
         assert_eq!(with_arena_block(&tab, &merge_cron_block(&[backup[0].1.clone()], &[Backup], &[])), "0 9 * * * keep-me\n");
     }
 
+    /// `line` (logging to arena's default) as 026c308 wrote it: no `mkdir -p … &&`, and its
+    /// lock and log directly in `home` under their old names ([`arena_core::cron::Job::legacy_log`]).
+    fn legacy_cron_line(line: &str, home: &str) -> String {
+        use arena_core::cron::{self, Job};
+        let mut old = line.replacen(&format!("mkdir -p {} && ", cron::dir(home)), "", 1);
+        for job in Job::ALL {
+            old = old.replace(&format!(" >> {} ", cron::log(home, job)), &format!(" >> {home}/{} ", job.legacy_log()));
+            if let Some(lock) = job.legacy_lock() {
+                old = old.replace(&format!(" {} ", cron::lock(home, job)), &format!(" {home}/{lock} "));
+            }
+        }
+        old
+    }
+
+    /// `line` (logging to arena's default) as a663f65 wrote it: the same, in its folder under the
+    /// state root ([`arena_core::cron::PREV_DIR`]).
+    fn prev_cron_line(line: &str, home: &str) -> String {
+        line.replace(&arena_core::cron::dir(home), &format!("{home}/{}", arena_core::cron::PREV_DIR))
+    }
+
+    /// Exactly what 026c308's `cron install --pull --start-date 2026-10-05 --proxy --archive
+    /// --reap observe` wrote for root, and the job that renders today's lines for the same flags.
+    fn root_cron_026c308() -> Vec<String> {
+        [
+            "*/15 * * * * ARENA_START_DATE=2026-10-05 flock -n -o /root/.arena-backup-cron.lock /usr/local/bin/arena \
+             --config /root/arena/config.env pods backup --yes >> /root/arena-cron.log 2>&1",
+            "*/5 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin flock -n \
+             /root/.arena-proxy-cron.lock /usr/local/bin/arena --config /root/arena/config.env proxy apply --yes \
+             >> /root/arena-proxy-cron.log 2>&1",
+            "7,22,37,52 * * * * ARENA_START_DATE=2026-10-05 ARENA_STATE_DIR=/var/lib/arena nice -n 10 /usr/local/bin/arena \
+             --config /root/arena/config.env archive sync --tier snap >> /root/arena-archive-cron.log 2>&1",
+            "40 * * * * ARENA_START_DATE=2026-10-05 ARENA_STATE_DIR=/var/lib/arena nice -n 10 /usr/local/bin/arena \
+             --config /root/arena/config.env archive sync --tier big >> /root/arena-archive-cron.log 2>&1",
+            "11,27,41,57 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin flock -n -o \
+             /root/.arena-reap-cron.lock /usr/local/bin/arena --config /root/arena/config.env pods reap run \
+             >> /root/arena-reap-cron.log 2>&1",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    /// Today's lines for those flags, root's, logging where `kept` says (else the default).
+    fn root_cron_now(kept: &[(super::CronKind, String)]) -> Vec<(super::CronKind, String)> {
+        let job = super::CronJob {
+            schedule: "*/15 * * * *",
+            env_prefix: "ARENA_START_DATE=2026-10-05 ",
+            exe: "/usr/local/bin/arena",
+            config: "/root/arena/config.env",
+            home: "/root",
+            backup: true,
+            pull: true,
+            proxy: true,
+            snapshot_dir: None,
+            archive: true,
+            archive_state_dir: Some("/var/lib/arena"),
+            kept_logs: kept,
+        };
+        let mut lines = super::cron_lines(&job);
+        let reap = kept.iter().find(|(k, _)| *k == super::CronKind::Reap).map(|(_, l)| l.as_str());
+        lines.push((super::CronKind::Reap, arena_core::reap::render::cron_line(false, "/usr/local/bin/arena", "/root/arena/config.env", "/root", reap, &[])));
+        lines
+    }
+
+    /// The upgrade: a crontab holding the lines 026c308 wrote — each logging (and locking) at
+    /// arena's old default directly in the home — or a663f65's (in the state root) is upgraded in
+    /// place by `cron install`: each line replaced by its new one, never doubled, since a line's
+    /// kind is the command it runs, not its files. The tidy plan names exactly the old default
+    /// files those replaced lines used: never a line the install didn't touch, nor a path the
+    /// crontab still names.
+    #[test]
+    fn cron_install_replaces_the_old_lines_in_place() {
+        use super::{cron_diff, kept_logs, merge_cron_block, tidy_plan, CronKind::*, OldCronFile};
+        let before = root_cron_026c308();
+        assert_eq!(kept_logs(&before, "/root"), [], "arena's own old defaults: nothing kept");
+        let new = root_cron_now(&[]);
+        let kinds: Vec<super::CronKind> = new.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, [Backup, Proxy, ArchiveSnap, ArchiveBig, Reap]);
+        let tab = |lines: &[String]| with_arena_block("0 9 * * * keep-me\n", lines);
+
+        // The same install today: each line replaced where it stood, one per kind — the same
+        // line but for the `mkdir -p` and where its files are.
+        let after = merge_cron_block(&before, &kinds, &new);
+        assert_eq!(after, new.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>());
+        for (old, now) in before.iter().zip(&after) {
+            assert!(now.contains(" >> /root/.local/state/arena-cron/") && !now.contains("/root/arena-"), "{now}");
+            assert_eq!(legacy_cron_line(now, "/root"), *old, "only the folder and the files change");
+        }
+        for k in &kinds {
+            assert_eq!(after.iter().filter(|l| super::CronKind::of(l) == Some(*k)).count(), 1, "one {} line", k.label());
+        }
+        assert_eq!(cron_diff(&before, &after).iter().filter(|l| l.starts_with("- ")).count(), 5, "every old line goes");
+        let log = |old: &str, job: &str| OldCronFile::Log { old: format!("/root/{old}"), new: format!("/root/.local/state/arena-cron/{job}.log") };
+        let lock = |old: &str| OldCronFile::Lock(format!("/root/{old}"));
+        assert_eq!(
+            tidy_plan(&kinds, &before, &after, "/root", &tab(&after)),
+            [
+                log("arena-cron.log", "backup"),
+                lock(".arena-backup-cron.lock"),
+                log("arena-proxy-cron.log", "proxy"),
+                lock(".arena-proxy-cron.lock"),
+                log("arena-archive-cron.log", "archive"),
+                log("arena-reap-cron.log", "reap"),
+                lock(".arena-reap-cron.lock"),
+            ]
+        );
+        // Again: nothing changes, nothing to tidy.
+        assert_eq!(merge_cron_block(&after, &kinds, &new), after);
+        assert_eq!(tidy_plan(&kinds, &after, &after, "/root", &tab(&after)), []);
+
+        // `cron install --proxy` alone: only the proxy line's old files go.
+        let proxy_only = merge_cron_block(&before, &[Proxy], &new[1..2]);
+        assert_eq!(proxy_only[1], new[1].1);
+        assert_eq!(proxy_only.iter().filter(|l| *l != &new[1].1).collect::<Vec<_>>(), before.iter().filter(|l| *l != &before[1]).collect::<Vec<_>>());
+        assert_eq!(tidy_plan(&[Proxy], &before, &proxy_only, "/root", &tab(&proxy_only)), [log("arena-proxy-cron.log", "proxy"), lock(".arena-proxy-cron.lock")]);
+        // A paused (commented-out) old backup line would use the old files again once
+        // un-paused: they stay.
+        let paused = format!("# {}", before[0]);
+        let with_paused: Vec<String> = vec![before[0].clone(), paused.clone()];
+        let rewritten = merge_cron_block(&with_paused, &[Backup], &new[..1]);
+        assert_eq!(rewritten, [new[0].1.clone(), paused]);
+        assert_eq!(tidy_plan(&[Backup], &with_paused, &rewritten, "/root", &tab(&rewritten)), []);
+
+        // a663f65's lines (one folder in the state root) are arena's own too: moved to the new
+        // folder, their files tidied from those exact paths.
+        let prev: Vec<String> = after.iter().map(|l| prev_cron_line(l, "/root")).collect();
+        assert!(prev.iter().all(|l| l.contains("/root/.local/state/arena/cron/") && !l.contains("arena-cron")), "{prev:?}");
+        assert_eq!(kept_logs(&prev, "/root"), []);
+        let upgraded = merge_cron_block(&prev, &kinds, &new);
+        assert_eq!(upgraded, after);
+        let plan = tidy_plan(&kinds, &prev, &upgraded, "/root", &tab(&upgraded));
+        assert_eq!(plan.len(), 7, "{plan:?}");
+        assert_eq!(plan[..2], [log(".local/state/arena/cron/backup.log", "backup"), lock(".local/state/arena/cron/backup.lock")]);
+    }
+
+    /// CL1: a line that logs somewhere someone chose (a folder logrotate rotates, another home)
+    /// keeps that log on a re-install — only the lock moves into arena's folder, and the mkdir
+    /// makes the kept log's folder too. Nothing of that kind is tidied. Again is a no-op.
+    #[test]
+    fn cron_install_keeps_a_log_path_someone_chose() {
+        use super::{kept_logs, merge_cron_block, tidy_plan, CronKind::*};
+        let chosen = |l: &str, log: &str| l.replace(" >> /root/arena-", &format!(" >> {log}/arena-"));
+        let mut before = root_cron_026c308();
+        before[0] = chosen(&before[0], "/srv/x/logs/cron");
+        before[1] = chosen(&before[1], "/home/other");
+        let kept = kept_logs(&before, "/root");
+        assert_eq!(kept, [(Backup, "/srv/x/logs/cron/arena-cron.log".to_string()), (Proxy, "/home/other/arena-proxy-cron.log".to_string())]);
+        let new = root_cron_now(&kept);
+        let kinds: Vec<super::CronKind> = new.iter().map(|(k, _)| *k).collect();
+        let after = merge_cron_block(&before, &kinds, &new);
+        assert_eq!(
+            after[0],
+            "*/15 * * * * mkdir -p /root/.local/state/arena-cron /srv/x/logs/cron && ARENA_START_DATE=2026-10-05 flock -n -o \
+             /root/.local/state/arena-cron/backup.lock /usr/local/bin/arena --config /root/arena/config.env pods backup --yes \
+             >> /srv/x/logs/cron/arena-cron.log 2>&1"
+        );
+        assert!(after[1].starts_with("*/5 * * * * mkdir -p /root/.local/state/arena-cron /home/other && PATH="), "{}", after[1]);
+        assert!(after[1].ends_with(" >> /home/other/arena-proxy-cron.log 2>&1") && after[1].contains(" /root/.local/state/arena-cron/proxy.lock "));
+        // The kept kinds tidy nothing (not even their old locks); the others as before.
+        let plan = tidy_plan(&kinds, &before, &after, "/root", &with_arena_block("", &after));
+        assert!(
+            plan.iter().all(|f| !format!("{f:?}").contains("backup") && !format!("{f:?}").contains("proxy") && !format!("{f:?}").contains("/root/arena-cron.log")),
+            "{plan:?}"
+        );
+        assert_eq!(plan.len(), 3, "the archive's log, the reap's log and lock: {plan:?}");
+        // Re-installed: read back as kept again, the same lines, nothing to change.
+        assert_eq!(kept_logs(&after, "/root"), kept);
+        assert_eq!(merge_cron_block(&after, &kinds, &root_cron_now(&kept_logs(&after, "/root"))), after);
+    }
+
+    /// The home `cron install`/`remove` work in (CL2/CL5): `$HOME` set, absolute, a directory the
+    /// effective user owns, free of whitespace, `%` and newlines — `sudo -E` is refused, by name.
+    /// The arena binary and config path go into the lines unquoted: the same characters refused.
+    #[cfg(unix)]
+    #[test]
+    fn cron_home_must_be_this_users_and_fit_a_crontab_line() {
+        use super::{cron_home, crontab_word};
+        use std::os::unix::fs::MetadataExt;
+        let base = std::env::temp_dir().join(format!("arena-cron-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("home")).unwrap();
+        std::fs::write(base.join("file"), "").unwrap();
+        let home = base.join("home").display().to_string();
+        let uid = std::fs::metadata(&home).unwrap().uid();
+        assert_eq!(cron_home(Some(&home), uid).unwrap(), home);
+        let refused = |h: Option<&str>, euid: u32| cron_home(h, euid).unwrap_err().to_string();
+        let file = base.join("file").display().to_string();
+        let missing = base.join("missing").display().to_string();
+        let cases: Vec<(Option<&str>, u32, String)> = vec![
+            (None, uid, "HOME isn't set — run as the user whose crontab this is (sudo -i / sudo -H)".into()),
+            (Some(""), uid, "HOME isn't set".into()),
+            (Some("home/dev"), uid, "HOME=home/dev isn't an absolute path".into()),
+            (Some("/home/a b"), uid, "HOME=\"/home/a b\" holds a space (U+0020), which a crontab line can't carry".into()),
+            (Some("/home/50%"), uid, "HOME=\"/home/50%\" holds % (U+0025), which a crontab line can't carry".into()),
+            (Some("/home/a\nb"), uid, "HOME=\"/home/a\\nb\" holds a newline (U+000A)".into()),
+            (Some(&file), uid, format!("HOME={file} isn't a directory")),
+            (Some(&missing), uid, format!("HOME={missing}: ")),
+            (
+                Some(&home),
+                uid + 1,
+                format!(
+                    "HOME={home} isn't this user's home (owner uid {uid}, running as {}) — run as the user whose crontab this is \
+                     (sudo -i / sudo -H), not sudo -E",
+                    uid + 1
+                ),
+            ),
+        ];
+        for (h, euid, want) in cases {
+            let e = refused(h, euid);
+            assert!(e.contains(&want), "{h:?}: {e}");
+        }
+        assert!(crontab_word("the config path", "/srv/arena/config.env").is_ok());
+        for bad in ["/srv/my arena/config.env", "/srv/50%/config.env", "/srv/a\nb", "/srv/a\tb"] {
+            assert!(crontab_word("the arena binary", bad).unwrap_err().to_string().starts_with("the arena binary ("), "{bad:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Review pr4: a crontab line carries HOME, the arena binary and the config path unquoted, and
+    /// refusing only whitespace and `%` let through paths `sh` can't run (a valid, owned HOME
+    /// `/srv/o'neil`, a config in `course(2026)/`: a syntax error on every tick, so arena never
+    /// ran) or runs as something else (`&`, `;`, `$`, a backtick). `cron install` now refuses
+    /// any character outside letters, digits and `./_+@:,=-`, in one line naming it, before
+    /// anything is written — and the archive's state dir, carried the same way, by the same rule.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_install_refuses_a_path_a_crontab_line_cant_carry_unquoted() {
+        use super::{cron_unsafe_char, crontab_word};
+        // (the path, the character as named)
+        let cases = [
+            ("/srv/o'neil", "' (U+0027)"),
+            ("/srv/course(2026)/config.env", "( (U+0028)"),
+            ("/srv/a&b", "& (U+0026)"),
+            ("/srv/a;b", "; (U+003B)"),
+            ("/srv/$HOME/x", "$ (U+0024)"),
+            ("/srv/a`id`", "` (U+0060)"),
+            ("/srv/my arena", "a space (U+0020)"),
+            ("/srv/a\tb", "a tab (U+0009)"),
+            ("/srv/a\nb", "a newline (U+000A)"),
+            ("/srv/50%", "% (U+0025)"),
+            ("/srv/~/x", "~ (U+007E)"),
+            ("/srv/a\"b", "\" (U+0022)"),
+            ("/srv/a|b", "| (U+007C)"),
+            ("/srv/a#b", "# (U+0023)"),
+            ("/srv/a*", "* (U+002A)"),
+            ("/srv/caf\u{e9}", "\u{e9} (U+00E9)"),
+        ];
+        for (path, named) in cases {
+            for what in ["HOME", "the arena binary", "the config path"] {
+                let e = crontab_word(what, path).unwrap_err().to_string();
+                assert_eq!(
+                    e,
+                    format!(
+                        "{what} ({path:?}) can't go into a crontab line: it holds {named} — the line carries it unquoted, so only \
+                         letters, digits and `./_+@:,=-` may be in it; use a path without it"
+                    )
+                );
+                assert!(!e.contains('\n'), "one line: {e:?}");
+            }
+        }
+        for ok in ["/root", "/home/dev/.local/bin/arena", "/srv/arena-2026/config.env", "/opt/a_b+c@d:e,f=g/x.y"] {
+            assert_eq!((crontab_word("the config path", ok).ok(), cron_unsafe_char(ok)), (Some(()), None), "{ok}");
+        }
+        assert_eq!(
+            crontab_word("the config path", "config.env").unwrap_err().to_string(),
+            "the config path (\"config.env\") can't go into a crontab line: it isn't an absolute path"
+        );
+        // End to end: refused before anything is written — a HOME this user owns, a config path.
+        let mut s = CronStub::new("unsafe-path");
+        let home = s.dir.join("o'neil");
+        std::fs::create_dir_all(&home).unwrap();
+        let e = s.run_as(&["install", "--backup"], true, Some(home.to_str().unwrap())).await.unwrap_err().to_string();
+        assert!(e.starts_with(&format!("HOME ({:?}) can't go into a crontab line: it holds ' (U+0027)", home.display().to_string())), "{e}");
+        s.config = s.dir.join("course(2026)").join("config.env");
+        std::fs::create_dir_all(s.config.parent().unwrap()).unwrap();
+        std::fs::write(&s.config, "").unwrap();
+        let e = s.run_as(&["install", "--backup"], true, Some(&s.home)).await.unwrap_err().to_string();
+        assert!(e.starts_with("the config path (") && e.contains("course(2026)/config.env\") can't go into a crontab line: it holds ( (U+0028)"), "{e}");
+        assert!(!s.dir.join("tab").exists(), "no crontab written");
+        // The archive's state dir, carried as `ARENA_STATE_DIR=<root>`: the same rule.
+        for (dir, named) in [("/srv/course(2026)/state", "( (U+0028)"), ("/srv/a&b/state", "& (U+0026)"), ("/srv/o'neil/state", "' (U+0027)")] {
+            let cfg = arena_core::Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR={dir}\n"));
+            let e = super::archive::cron_state_root(&cfg).unwrap_err();
+            assert!(e.starts_with(&format!("the state dir {dir:?} holds {named} — a crontab line carries it unquoted")), "{e}");
+        }
+        let cfg = arena_core::Config::parse("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR=/srv/arena-state\n");
+        assert_eq!(super::archive::cron_state_root(&cfg).unwrap(), "/srv/arena-state");
+    }
+
+    /// The tidy (CL2/CL7/CL12): exactly the old default files the replaced lines named — never
+    /// `$HOME` plus a name. Each old log is moved (hard-linked, or appended to a new log that's
+    /// there already); each old lock deleted; regular files of this user's only — a symlink is
+    /// left alone, never followed, and so is a new log that's a symlink or a directory; a stale
+    /// file at an old default name the replaced line didn't use stays; files of a kind that
+    /// wasn't rewritten stay. A tidy cut short (old and new already one file) just unlinks.
+    #[cfg(unix)]
+    #[test]
+    fn tidy_moves_exactly_the_old_files_the_replaced_lines_named() {
+        use super::{merge_cron_block, tidy_line, tidy_old_cron_files, tidy_plan, CronKind::*, CronTidy};
+        use arena_core::cron::{self, Job};
+        use std::os::unix::fs::MetadataExt;
+        let home = std::env::temp_dir().join(format!("arena-cron-tidy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let h = home.display().to_string();
+        let euid = std::fs::metadata(&home).unwrap().uid();
+        let put = |name: &str, text: &str| {
+            std::fs::create_dir_all(home.join(name).parent().unwrap()).unwrap();
+            std::fs::write(home.join(name), text).unwrap()
+        };
+        let read = |path: &str| std::fs::read_to_string(path).unwrap();
+        // Lines logging to arena's defaults in this home, as 026c308 wrote them — but the
+        // archive's as a663f65 did (its folder under the state root).
+        let job = super::CronJob {
+            schedule: "*/15 * * * *",
+            env_prefix: "",
+            exe: "/a",
+            config: "/c",
+            home: &h,
+            backup: true,
+            pull: false,
+            proxy: true,
+            snapshot_dir: Some("/w"),
+            archive: true,
+            archive_state_dir: None,
+            kept_logs: &[],
+        };
+        let mut new = super::cron_lines(&job);
+        new.push((Reap, arena_core::reap::render::cron_line(false, "/a", "/c", &h, None, &[])));
+        let before: Vec<String> = new
+            .iter()
+            .map(|(k, l)| if matches!(k, ArchiveSnap | ArchiveBig) { prev_cron_line(l, &h) } else { legacy_cron_line(l, &h) })
+            .collect();
+        let kinds: Vec<super::CronKind> = new.iter().map(|(k, _)| *k).collect();
+        let after = merge_cron_block(&before, &kinds, &new);
+        let plan = tidy_plan(&kinds, &before, &after, &h, &with_arena_block("", &after));
+
+        put("arena-cron.log", "old backup\n");
+        put(".arena-backup-cron.lock", "");
+        // The new proxy log is there already (a tick ran): the old one is appended to it.
+        put("arena-proxy-cron.log", "old proxy\n");
+        put(".arena-proxy-cron.lock", "");
+        put(".local/state/arena-cron/proxy.log", "new proxy\n");
+        // The new snapshot log is a symlink, the new archive log a directory: left alone.
+        put("arena-snapshot-cron.log", "old snapshot\n");
+        put("elsewhere.log", "not arena's\n");
+        std::os::unix::fs::symlink(home.join("elsewhere.log"), cron::log(&h, Job::Snapshot)).unwrap();
+        put(".local/state/arena/cron/archive.log", "old archive\n");
+        std::fs::create_dir_all(cron::log(&h, Job::Archive)).unwrap();
+        // A stale file at the archive's 026c308 name: the replaced (a663f65) line didn't use it.
+        put("arena-archive-cron.log", "stale\n");
+        // The old reap log is a symlink: left alone, never followed; its old lock a symlink too.
+        std::os::unix::fs::symlink(home.join("elsewhere.log"), home.join("arena-reap-cron.log")).unwrap();
+        std::os::unix::fs::symlink(home.join("elsewhere.log"), home.join(".arena-reap-cron.lock")).unwrap();
+
+        // Not this user's (another euid): nothing touched.
+        let other = tidy_old_cron_files(&plan, &h, euid + 1);
+        assert!(other.moved.is_empty() && other.failed.is_empty() && other.left.len() == 5, "{other:?}");
+        assert_eq!(read(&home.join("arena-cron.log").display().to_string()), "old backup\n");
+
+        let t = tidy_old_cron_files(&plan, &h, euid);
+        assert_eq!(
+            t,
+            CronTidy {
+                moved: vec!["~/arena-cron.log".into(), "~/arena-proxy-cron.log".into()],
+                left: vec![
+                    "~/arena-snapshot-cron.log (~/.local/state/arena-cron/snapshot.log isn't a regular file)".into(),
+                    "~/.local/state/arena/cron/archive.log (~/.local/state/arena-cron/archive.log isn't a regular file)".into(),
+                    "~/arena-reap-cron.log (not a regular file of this user's)".into(),
+                ],
+                failed: vec![],
+            }
+        );
+        assert_eq!(read(&cron::log(&h, Job::Backup)), "old backup\n");
+        assert_eq!(read(&cron::log(&h, Job::Proxy)), "new proxy\nold proxy\n");
+        assert_eq!(read(&home.join("elsewhere.log").display().to_string()), "not arena's\n");
+        assert!(std::fs::symlink_metadata(home.join(".arena-reap-cron.lock")).unwrap().file_type().is_symlink());
+        let mut top: Vec<String> = std::fs::read_dir(&home).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        top.sort();
+        assert_eq!(
+            top,
+            [".arena-reap-cron.lock", ".local", "arena-archive-cron.log", "arena-reap-cron.log", "arena-snapshot-cron.log", "elsewhere.log"],
+            "moved: backup, proxy; their locks gone; left: the snapshot's (its new log a symlink), the stale archive name, the reap symlinks"
+        );
+        assert_eq!(read(&home.join("arena-archive-cron.log").display().to_string()), "stale\n");
+        assert_eq!(
+            tidy_line(&t).as_deref(),
+            Some(
+                "· cron logs now in ~/.local/state/arena-cron/ (moved: ~/arena-cron.log, ~/arena-proxy-cron.log; left alone: \
+                 ~/arena-snapshot-cron.log (~/.local/state/arena-cron/snapshot.log isn't a regular file), \
+                 ~/.local/state/arena/cron/archive.log (~/.local/state/arena-cron/archive.log isn't a regular file), \
+                 ~/arena-reap-cron.log (not a regular file of this user's))"
+            )
+        );
+        assert_eq!(tidy_line(&CronTidy::default()), None);
+        // A tidy cut short between its link and its unlink: the old log already is the new one —
+        // just unlinked, never appended to itself.
+        put("arena-cron.log", "once\n");
+        std::fs::remove_file(cron::log(&h, Job::Backup)).unwrap();
+        std::fs::hard_link(home.join("arena-cron.log"), cron::log(&h, Job::Backup)).unwrap();
+        let t = tidy_old_cron_files(&plan[..1], &h, euid);
+        assert_eq!(t.moved, ["~/arena-cron.log"]);
+        assert_eq!(read(&cron::log(&h, Job::Backup)), "once\n");
+        assert!(!home.join("arena-cron.log").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Every line recreates its folders first — arena's cron folder, and a kept log's own: cron's
+    /// `sh` doesn't run a command whose `>>` (or flock's lock) points into a missing directory, so
+    /// without it a deleted folder would silently stop the backups. Each line `cron install`
+    /// renders — its schedule stripped — run by a real `sh` the way cron would, with both folders
+    /// deleted before each: a fake arena runs, sees the line's inline env (ARENA_START_DATE,
+    /// ARENA_STATE_DIR) through `&&` and flock/nice, and its output lands in the recreated log.
+    #[cfg(unix)]
+    #[test]
+    fn every_cron_line_runs_with_its_folders_deleted() {
+        use super::{cron_lines, CronJob, CronKind};
+        use arena_core::cron;
+        if std::process::Command::new("flock").arg("--version").output().is_err() {
+            eprintln!("skipped: no flock here");
+            return;
+        }
+        let home = std::env::temp_dir().join(format!("arena-cron-sh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let h = home.display().to_string();
+        let exe = home.join("fake-arena");
+        arena_core::remote::write_test_script(&exe, "#!/bin/sh\necho \"fake arena ran: $*\"\nenv | grep '^ARENA_' | sort\n").unwrap();
+        let exe = exe.display().to_string();
+        let kept = [(CronKind::Proxy, format!("{h}/logs/cron/arena-proxy-cron.log")), (CronKind::ArchiveBig, format!("{h}/logs/big.log"))];
+        let job = CronJob {
+            schedule: "*/15 * * * *",
+            env_prefix: "ARENA_START_DATE=2026-10-05 ",
+            exe: &exe,
+            config: "/c",
+            home: &h,
+            backup: true,
+            pull: false,
+            proxy: true,
+            snapshot_dir: Some(&h),
+            archive: true,
+            archive_state_dir: Some(&h),
+            kept_logs: &kept,
+        };
+        let mut lines = cron_lines(&job);
+        let state = vec![("ARENA_STATE_DIR".to_string(), h.clone())];
+        let reap_log = format!("{h}/logs/reap/reap.log");
+        lines.push((CronKind::Reap, arena_core::reap::render::cron_line(false, &exe, "/c", &h, Some(&reap_log), &state)));
+        assert_eq!(lines.len(), 6);
+        for (kind, line) in &lines {
+            let _ = std::fs::remove_dir_all(cron::dir(&h));
+            let _ = std::fs::remove_dir_all(home.join("logs"));
+            let command = line.splitn(6, ' ').nth(5).unwrap();
+            let out = std::process::Command::new("sh")
+                .args(["-c", command])
+                .env_clear()
+                .env("HOME", &h)
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}: {command}\n{}", kind.label(), String::from_utf8_lossy(&out.stderr));
+            let log_path = super::cron_log_target(line).unwrap();
+            let log = std::fs::read_to_string(log_path).unwrap_or_default();
+            assert!(log.starts_with("fake arena ran: --config /c "), "{}: the log in the recreated folder: {log:?}", kind.label());
+            let start = log.contains("\nARENA_START_DATE=2026-10-05\n");
+            let state = log.contains(&format!("\nARENA_STATE_DIR={h}\n"));
+            let want = match kind {
+                CronKind::Backup => (true, false),
+                CronKind::ArchiveSnap | CronKind::ArchiveBig => (true, true),
+                CronKind::Reap => (false, true),
+                CronKind::Proxy | CronKind::Snapshot => (false, false),
+            };
+            assert_eq!((start, state), want, "{}: the env arena saw: {log:?}", kind.label());
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The inline env a line carries (`ARENA_START_DATE`, the archive's `ARENA_STATE_DIR`) is read
+    /// from every version's line: this one's after its `mkdir -p … &&` (one folder or more), the
+    /// older ones' straight after the schedule — never from an argument.
+    #[test]
+    fn env_assignments_are_read_from_every_versions_line() {
+        use super::env_assignment;
+        // (line, ARENA_START_DATE, ARENA_STATE_DIR)
+        let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+            (
+                "40 * * * * mkdir -p /h/.local/state/arena-cron /h/logs && ARENA_START_DATE=2026-10-01 ARENA_STATE_DIR=/s nice -n 10 \
+                 /a --config /c archive sync --tier big >> /h/logs/archive.log 2>&1",
+                Some("2026-10-01"),
+                Some("/s"),
+            ),
+            (
+                "40 * * * * mkdir -p /h/.local/state/arena/cron && ARENA_START_DATE=2026-10-01 ARENA_STATE_DIR=/s nice -n 10 /a --config /c \
+                 archive sync --tier big >> /h/.local/state/arena/cron/archive.log 2>&1",
+                Some("2026-10-01"),
+                Some("/s"),
+            ),
+            (
+                "40 * * * * ARENA_START_DATE=2026-10-01 ARENA_STATE_DIR=/s nice -n 10 /a --config /c archive sync --tier big >> /h/arena-archive-cron.log 2>&1",
+                Some("2026-10-01"),
+                Some("/s"),
+            ),
+            ("@hourly mkdir -p /d && ARENA_STATE_DIR=/s /a archive sync --tier big", None, Some("/s")),
+            ("40 * * * * mkdir -p /d && nice -n 10 /a --x ARENA_STATE_DIR=/s", None, None),
+            ("40 * * * * mkdir -p && ARENA_STATE_DIR=/s /a", None, None),
+            ("40 * * * * nice ARENA_START_DATE=2026-10-01", None, None),
+            ("40 * * * *", None, None),
+        ];
+        for (line, start, state) in cases {
+            assert_eq!(env_assignment(line, "ARENA_START_DATE").as_deref(), *start, "{line}");
+            assert_eq!(env_assignment(line, "ARENA_STATE_DIR").as_deref(), *state, "{line}");
+        }
+    }
+
     /// Review finding: comments inside the block are nobody's line. A paused backup line and
     /// a note that mentions the snapshot survive a targeted install/remove of that kind, and
     /// a paused backup line doesn't count as "there is a backup".
@@ -17387,8 +18918,9 @@ mod tests {
             snapshot_dir: None,
             archive: true,
             archive_state_dir: Some("/var/lib/arena"),
+            kept_logs: &[],
         };
-        let reap = |apply: bool| (Reap, arena_core::reap::render::cron_line(apply, "/opt/arena", "/srv/config.env", "/home/u", &[]));
+        let reap = |apply: bool| (Reap, arena_core::reap::render::cron_line(apply, "/opt/arena", "/srv/config.env", "/home/u", None, &[]));
         let mut lines = cron_lines(&job);
         lines.push(reap(false));
         let mut kinds: Vec<super::CronKind> = lines.iter().map(|(k, _)| *k).collect();
@@ -17452,11 +18984,12 @@ mod tests {
             snapshot_dir: Some("/srv/www"),
             archive: true,
             archive_state_dir: None,
+            kept_logs: &[],
         };
         let lines = cron_lines(&job);
         let kinds: Vec<super::CronKind> = lines.iter().map(|(k, _)| *k).collect();
         assert_eq!(kinds, [Backup, Proxy, Snapshot, ArchiveSnap, ArchiveBig], "every other line arena renders");
-        let reap = minutes(&arena_core::reap::render::cron_line(true, "/opt/arena", "/srv/config.env", "/home/u", &[]));
+        let reap = minutes(&arena_core::reap::render::cron_line(true, "/opt/arena", "/srv/config.env", "/home/u", None, &[]));
         assert_eq!(reap.len(), 4, "four times an hour: {reap:?}");
         for (k, l) in &lines {
             let other = minutes(l);
@@ -17498,7 +19031,14 @@ mod tests {
             Some(BackupOpts { schedule: schedule.into(), start_date: start.map(String::from), pull })
         };
         let cases: &[(&str, Option<BackupOpts>)] = &[
-            // This version's line (flock -n -o), with the start date and --pull.
+            // This version's line (the cron folder recreated first), with the start date and --pull.
+            (
+                "*/15 * * * * mkdir -p /h/.local/state/arena/cron && ARENA_START_DATE=2026-01-05 flock -n -o \
+                 /h/.local/state/arena/cron/backup.lock /opt/arena --config /c pods backup --yes >> /h/.local/state/arena/cron/backup.log 2>&1",
+                o("*/15 * * * *", Some("2026-01-05"), true),
+            ),
+            ("@hourly mkdir -p /d && ARENA_START_DATE=2026-02-02 flock -n -o /d/backup.lock /opt/arena pods backup --no-pull --yes", o("@hourly", Some("2026-02-02"), false)),
+            // The previous version's (flock -n -o, its lock and log in the home).
             (
                 "*/15 * * * * ARENA_START_DATE=2026-01-05 flock -n -o /h/.arena-backup-cron.lock /opt/arena --config /c pods backup --yes >> /h/arena-cron.log 2>&1",
                 o("*/15 * * * *", Some("2026-01-05"), true),
@@ -17509,9 +19049,18 @@ mod tests {
             ("*/15 * * * * ARENA_START_DATE=2026-01-05 /usr/local/bin/arena --config /c pods backup --yes >> /root/arena-cron.log 2>&1", o("*/15 * * * *", Some("2026-01-05"), true)),
             // Tabs, a macro schedule, another env var first.
             ("@hourly\tPATH=/usr/bin ARENA_START_DATE=2026-02-02 /opt/arena pods backup --no-pull --yes", o("@hourly", Some("2026-02-02"), false)),
-            // A start date that isn't one, or one that isn't an env assignment, isn't read.
+            // A start date that isn't one, one that isn't a leading env assignment (a hand edit
+            // behind `cd … &&`, an argument): left out, the rest read (review fb2 F7) — the install
+            // says so ([`super::unread_start_date`]).
             ("*/15 * * * * ARENA_START_DATE=soon /opt/arena pods backup --yes", o("*/15 * * * *", None, true)),
             ("*/15 * * * * /opt/arena pods backup --yes # ARENA_START_DATE=2026-01-05", o("*/15 * * * *", None, true)),
+            ("*/30 * * * * cd /root && ARENA_START_DATE=2026-10-05 flock -n /l /opt/arena pods backup --no-pull --yes", o("*/30 * * * *", None, false)),
+            // Several folders made first (a kept log elsewhere): still read.
+            (
+                "*/15 * * * * mkdir -p /h/.local/state/arena-cron /h/logs/cron && ARENA_START_DATE=2026-01-05 flock -n -o \
+                 /h/.local/state/arena-cron/backup.lock /opt/arena pods backup --no-pull --yes >> /h/logs/cron/arena-cron.log 2>&1",
+                o("*/15 * * * *", Some("2026-01-05"), false),
+            ),
             // Not a backup line, a paused one, or no schedule to read.
             ("*/5 * * * * /opt/arena proxy apply --yes", None),
             ("# */15 * * * * /opt/arena pods backup --yes", None),
@@ -17520,6 +19069,155 @@ mod tests {
         for (line, want) in cases {
             assert_eq!(&BackupOpts::of_line(line), want, "{line}");
         }
+    }
+
+    /// Review fb2 F7: an installed backup line whose start date can't be read (a hand edit's `cd
+    /// /root && ARENA_START_DATE=…`) read as unreadable altogether, so a re-install dropped its
+    /// schedule and `--pull` with the date. Now only the date goes, and the note says so; when
+    /// the flags decide the date, or the line isn't rewritten, there's nothing to say.
+    #[test]
+    fn an_unreadable_start_date_drops_only_the_date() {
+        use super::{backup_read_note, resolve_backup_opts, unread_start_date, BackupFlags, BackupOpts};
+        let line = "*/30 * * * * cd /root && ARENA_START_DATE=2026-10-05 /usr/local/bin/arena --config /c pods backup --yes >> \
+                    /root/logs/cron/arena-cron.log 2>&1";
+        let read = BackupOpts::of_line(line).unwrap();
+        assert_eq!(read, BackupOpts { schedule: "*/30 * * * *".into(), start_date: None, pull: true });
+        assert!(unread_start_date(line));
+        let none = BackupFlags { schedule: None, start_date: None, no_start_date: false, pull: false, no_pull: false };
+        let (opts, kept) = resolve_backup_opts(Some(&read), &none);
+        assert_eq!(opts, BackupOpts { schedule: "*/30 * * * *".into(), start_date: None, pull: true });
+        assert_eq!(kept, ["schedule `*/30 * * * *`", "--pull"]);
+        assert_eq!(
+            backup_read_note(true, Some(line), Some(&read), &none).unwrap(),
+            "note: couldn't read the installed backup line's ARENA_START_DATE (hand-edited?) — the new line has none (--start-date \
+             YYYY-MM-DD sets one); its schedule and --pull are kept; check the diff"
+        );
+        // The flags decide the date, or the backup line isn't rewritten: nothing to say.
+        assert_eq!(backup_read_note(true, Some(line), Some(&read), &BackupFlags { start_date: Some("2026-10-05"), ..none }), None);
+        assert_eq!(backup_read_note(true, Some(line), Some(&read), &BackupFlags { no_start_date: true, ..none }), None);
+        assert_eq!(backup_read_note(false, Some(line), Some(&read), &none), None);
+        // A line read in full: nothing; none installed: nothing; no readable schedule: the flags alone, said.
+        let fine = "*/15 * * * * ARENA_START_DATE=2026-10-05 /opt/arena pods backup --yes";
+        assert!(!unread_start_date(fine) && !unread_start_date("*/15 * * * * /opt/arena pods backup --yes"));
+        assert_eq!(backup_read_note(true, Some(fine), BackupOpts::of_line(fine).as_ref(), &none), None);
+        assert_eq!(backup_read_note(true, None, None, &none), None);
+        assert!(backup_read_note(true, Some("* * * pods backup"), None, &none).unwrap().contains("rewritten from these flags alone"));
+    }
+
+    /// Review fb2 F8: a hand edit's `>>PATH 2>&1` (no space), `>> PATH` or `>>PATH` is a log
+    /// someone chose, kept like arena's own `>> PATH 2>&1`. Any other ending isn't read: the new
+    /// line logs to the default, as before — now said by the install's note, naming the line's
+    /// redirection, not only by the diff. A line that logs nowhere has nothing to say.
+    #[test]
+    fn a_lines_log_is_read_in_its_hand_edited_forms() {
+        use super::{cron_log_target, kept_logs, unread_log, unread_logs_note, CronKind::*};
+        let cmd = "*/15 * * * * /usr/local/bin/arena --config /c pods backup --yes";
+        // (ending, the log read, the redirection not read)
+        let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+            (" >> /root/logs/cron/arena-cron.log 2>&1", Some("/root/logs/cron/arena-cron.log"), None),
+            (" >>/root/logs/cron/arena-cron.log 2>&1", Some("/root/logs/cron/arena-cron.log"), None),
+            (" >> /root/logs/cron/arena-cron.log", Some("/root/logs/cron/arena-cron.log"), None),
+            (" >>/root/logs/cron/arena-cron.log", Some("/root/logs/cron/arena-cron.log"), None),
+            ("\t>>\t/x.log\t2>&1", Some("/x.log"), None),
+            (" > /x.log 2>&1", None, Some("> /x.log 2>&1")),
+            (" >> /x.log 2>>/x.err", None, Some(">> /x.log 2>>/x.err")),
+            (" >> /x.log 2>&1 # mine", None, Some(">> /x.log 2>&1 # mine")),
+            (" >>\"/x y.log\" 2>&1", None, Some(">>\"/x y.log\" 2>&1")),
+            (" 2>>/x.err", None, Some("2>>/x.err")),
+            (" >>", None, Some(">>")),
+            (" >>&2", None, Some(">>&2")),
+            (" 2>&1", None, None),
+            ("", None, None),
+        ];
+        for (end, log, unread) in cases {
+            let line = format!("{cmd}{end}");
+            assert_eq!((cron_log_target(&line), unread_log(&line).as_deref()), (*log, *unread), "{line:?}");
+        }
+        // The live shape (`>>PATH 2>&1`, review F8's scenario) is a chosen log: kept.
+        let attached = format!("{cmd} >>/srv/x/logs/cron/arena-cron.log 2>&1");
+        assert_eq!(kept_logs(std::slice::from_ref(&attached), "/root"), [(Backup, "/srv/x/logs/cron/arena-cron.log".to_string())]);
+        assert_eq!(unread_logs_note(std::slice::from_ref(&attached), &[Backup]), None);
+        // The note: only the kinds being rewritten, the first line of each, its redirection named.
+        let before = vec![
+            format!("{cmd} > /x.log 2>&1"),
+            format!("{cmd} >> /second.log 2>>/err"),
+            "*/5 * * * * /usr/local/bin/arena --config /c proxy apply --yes >> /p.log 2>>/p.err".to_string(),
+            "*/5 * * * * /usr/local/bin/arena --config /c snapshot --public --out /w/fleet.json".to_string(),
+        ];
+        assert_eq!(
+            unread_logs_note(&before, &[Backup, Proxy, Snapshot]).unwrap(),
+            "note: couldn't read where these installed lines log — their new lines log to arena's default \
+             (~/.local/state/arena-cron/) instead; end a line with `>> PATH 2>&1` for a re-install to keep its log; check the \
+             diff: backup (`> /x.log 2>&1`), proxy (`>> /p.log 2>>/p.err`)"
+        );
+        assert!(unread_logs_note(&before, &[Proxy]).unwrap().ends_with("check the diff: proxy (`>> /p.log 2>>/p.err`)"));
+        assert_eq!(unread_logs_note(&before, &[Snapshot]), None);
+    }
+
+    /// Review fb2 F7/F8 end to end: a hand-edited backup line — its start date behind `cd … &&`,
+    /// its log `>>PATH` with no space — re-installed keeps its schedule, `--pull` and log; only the
+    /// date goes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_install_keeps_what_it_can_read_of_a_hand_edited_line() {
+        let s = CronStub::new("handedit");
+        let log = format!("{}/logs/cron/arena-cron.log", s.dir.display());
+        s.set_tab(&format!(
+            "{}\n*/30 * * * * cd /root && ARENA_START_DATE=2026-10-05 /usr/local/bin/arena --config /c pods backup --yes >>{log} 2>&1\n{}\n",
+            super::CRON_BEGIN,
+            super::CRON_END
+        ));
+        s.run(&["install", "--backup"]).await;
+        let lines = s.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("*/30 * * * * mkdir -p "), "the schedule kept: {lines:?}");
+        assert!(lines[0].ends_with(&format!(" pods backup --yes >> {log} 2>&1")), "--pull and the log kept: {lines:?}");
+        assert!(!lines[0].contains("ARENA_START_DATE") && !lines[0].contains("cd /root"), "{lines:?}");
+    }
+
+    /// Review fb2 F10: the effective uid is the owner of a file the process just made — not
+    /// `/proc/self`'s, which the kernel makes root's for a process that isn't dumpable. Here that
+    /// is the current user: the HOME check passes for a home this user owns, `id -u` agrees, and
+    /// the file is gone afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn the_effective_uid_is_this_users_and_its_home_passes() {
+        use super::{created_file_owner, cron_home, effective_uid};
+        use std::os::unix::fs::MetadataExt;
+        let base = std::env::temp_dir().join(format!("arena-euid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("home")).unwrap();
+        let mine = std::fs::metadata(base.join("home")).unwrap().uid();
+        assert_eq!(created_file_owner(&base), Some(mine));
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 1, "only home/: the file made is removed");
+        assert_eq!(effective_uid().unwrap(), mine);
+        let home = base.join("home").display().to_string();
+        assert_eq!(cron_home(Some(&home), effective_uid().unwrap()).unwrap(), home);
+        let id = std::process::Command::new("id").arg("-u").output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&id.stdout).trim().parse::<u32>().unwrap(), mine, "`id -u` agrees");
+        // Nowhere to make one: no answer (effective_uid falls back to /proc/self, then `id -u`).
+        assert_eq!(created_file_owner(&base.join("missing")), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Review ai-review claude #10: `cron install` read the effective uid a second time for the
+    /// tidy, after it had written the crontab — a failure there reported the install as failed
+    /// once it was in, and the operator re-ran or rolled back for nothing. Now it's read once,
+    /// before anything is written: with every read after the first failing, the install goes
+    /// through and says nothing failed; with the first failing, nothing is written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_install_reads_the_uid_once_before_it_writes_the_crontab() {
+        let s = CronStub::new("euid-once");
+        super::EUID_ANSWERS.with(|n| n.set(Some(0)));
+        let refused = s.run_as(&["install", "--pull", "--start-date", "2026-01-05"], true, Some(&s.home)).await;
+        assert!(refused.unwrap_err().to_string().contains("the effective uid can't be read"));
+        assert_eq!(s.tab(), "", "nothing written");
+        super::EUID_ANSWERS.with(|n| n.set(Some(1)));
+        s.run(&["install", "--pull", "--start-date", "2026-01-05"]).await;
+        assert_eq!(super::EUID_ANSWERS.with(std::cell::Cell::get), Some(0), "read once");
+        assert_eq!(s.lines().len(), 1, "{}", s.tab());
+        super::EUID_ANSWERS.with(|n| n.set(None));
     }
 
     /// The backup line a (re-)install writes: each option from its flag, else the installed
@@ -17564,103 +19262,246 @@ mod tests {
         }
     }
 
-    /// `arena cron …` end to end against a stub `crontab` over a file (the real crontab is
-    /// never touched): a later `--proxy` keeps the earlier `--pull --start-date` backup line
-    /// byte for byte, `--snapshot` adds its line, `remove --proxy` drops only that one, a
-    /// dry run writes nothing, and plain `remove` clears the block — the user's own entries
+    /// `arena cron …` end to end against a stub `crontab` over a file (the real crontab is never
+    /// touched), in a temp dir whose `home/` is the HOME the lines run in.
+    #[cfg(unix)]
+    struct CronStub {
+        dir: std::path::PathBuf,
+        stub: String,
+        config: std::path::PathBuf,
+        home: String,
+    }
+
+    #[cfg(unix)]
+    impl CronStub {
+        fn new(tag: &str) -> CronStub {
+            let dir = std::env::temp_dir().join(format!("arena-cron-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("www")).unwrap();
+            std::fs::create_dir_all(dir.join("home")).unwrap();
+            let stub = dir.join("crontab");
+            arena_core::remote::write_test_script(
+                &stub,
+                "#!/bin/sh\ntab=\"$(dirname \"$0\")/tab\"\ncase \"$1\" in\n  \
+                 -l) [ -f \"$tab\" ] && exec cat \"$tab\"; echo 'no crontab for u' >&2; exit 1;;\n  \
+                 -) cat > \"$tab\";;\nesac\n",
+            )
+            .unwrap();
+            let config = dir.join("config.env");
+            std::fs::write(&config, "").unwrap();
+            CronStub { stub: stub.display().to_string(), config, home: dir.join("home").display().to_string(), dir }
+        }
+
+        /// `arena cron <args>`, confirming with `--yes` (`yes`), with this `home` as `$HOME`.
+        async fn run_as(&self, args: &[&str], yes: bool, home: Option<&str>) -> anyhow::Result<()> {
+            use clap::Parser;
+            let argv = ["arena", "cron"].iter().chain(args).copied();
+            let super::Cmd::Cron(c) = super::Cli::try_parse_from(argv).unwrap().cmd else { unreachable!() };
+            super::handle_cron(c, &arena_core::Config::default(), &self.config, yes, &self.stub, home).await
+        }
+
+        async fn run(&self, args: &[&str]) {
+            self.run_as(args, true, Some(&self.home)).await.unwrap()
+        }
+
+        fn tab(&self) -> String {
+            std::fs::read_to_string(self.dir.join("tab")).unwrap_or_default()
+        }
+
+        fn set_tab(&self, text: &str) {
+            std::fs::write(self.dir.join("tab"), text).unwrap()
+        }
+
+        fn lines(&self) -> Vec<String> {
+            super::arena_cron_lines(&self.tab()).managed
+        }
+
+        /// What's directly in the home, sorted.
+        fn home_entries(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&self.home).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CronStub {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// `arena cron …` end to end: a later `--proxy` keeps the earlier `--pull --start-date`
+    /// backup line byte for byte, `--snapshot` adds its line, `remove --proxy` drops only that
+    /// one, a dry run writes nothing, 026c308's lines are upgraded in place — their old default
+    /// files moved into the cron folder only once the crontab is written: never on a dry run, a
+    /// refused prompt or a no-op — and plain `remove` clears the block, the user's own entries
     /// surviving throughout.
     #[cfg(unix)]
     #[tokio::test]
     async fn cron_commands_merge_lines_into_the_real_crontab_text() {
-        use super::{handle_cron, Cli, Cmd};
-        use clap::Parser;
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("arena-cron-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("www")).unwrap();
-        let stub = dir.join("crontab");
-        std::fs::write(
-            &stub,
-            "#!/bin/sh\ntab=\"$(dirname \"$0\")/tab\"\ncase \"$1\" in\n  \
-             -l) [ -f \"$tab\" ] && exec cat \"$tab\"; echo 'no crontab for u' >&2; exit 1;;\n  \
-             -) cat > \"$tab\";;\nesac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let (stub, tab) = (stub.display().to_string(), dir.join("tab"));
-        let config = dir.join("config.env");
-        std::fs::write(&config, "").unwrap();
-        let www = dir.join("www").display().to_string();
-        let run = |args: Vec<String>| {
-            let (stub, config) = (stub.clone(), config.clone());
-            async move {
-                let argv = ["arena".to_string(), "cron".to_string()].into_iter().chain(args);
-                let Cmd::Cron(c) = Cli::try_parse_from(argv).unwrap().cmd else { unreachable!() };
-                handle_cron(c, &arena_core::Config::default(), &config, true, &stub).await.unwrap();
-            }
-        };
-        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let lines = || super::arena_cron_lines(&std::fs::read_to_string(&tab).unwrap()).managed;
+        use std::io::IsTerminal;
+        let s = CronStub::new("e2e");
+        let (home, www) = (s.home.clone(), s.dir.join("www").display().to_string());
+        let mkdir = format!("mkdir -p {} && ", arena_core::cron::dir(&home));
 
         // No crontab yet: the backup line with --pull and the start date, flock'd.
-        run(args(&["install", "--pull", "--start-date", "2026-01-05"])).await;
-        let backup = lines();
+        s.run(&["install", "--pull", "--start-date", "2026-01-05"]).await;
+        let backup = s.lines();
         assert_eq!(backup.len(), 1, "{backup:?}");
         assert!(
-            backup[0].starts_with("*/15 * * * * ARENA_START_DATE=2026-01-05 flock -n -o ")
+            backup[0].starts_with(&format!("*/15 * * * * {mkdir}ARENA_START_DATE=2026-01-05 flock -n -o "))
                 && backup[0].contains(" pods backup --yes >> "),
             "{backup:?}"
         );
         // The user adds their own entry by hand.
-        let tab_text = std::fs::read_to_string(&tab).unwrap();
-        std::fs::write(&tab, format!("0 9 * * * /usr/bin/keep-me\n{tab_text}")).unwrap();
+        s.set_tab(&format!("0 9 * * * /usr/bin/keep-me\n{}", s.tab()));
 
         // `--proxy` then `--snapshot`: each adds only its own line.
-        run(args(&["install", "--proxy"])).await;
-        run(args(&["install", "--snapshot", &www])).await;
-        let all = lines();
+        s.run(&["install", "--proxy"]).await;
+        s.run(&["install", "--snapshot", &www]).await;
+        let all = s.lines();
         assert_eq!(all.len(), 3, "{all:?}");
         assert_eq!(all[0], backup[0], "the backup line is untouched");
         assert!(all[1].contains(" proxy apply --yes ") && all[2].contains(" snapshot --public --out "), "{all:?}");
 
         // A dry run changes nothing; `remove --proxy` drops just that line.
-        run(args(&["remove", "--backup", "--dry-run"])).await;
-        assert_eq!(lines(), all);
-        run(args(&["remove", "--proxy"])).await;
-        assert_eq!(lines(), [all[0].clone(), all[2].clone()]);
+        s.run(&["remove", "--backup", "--dry-run"]).await;
+        assert_eq!(s.lines(), all);
+        s.run(&["remove", "--proxy"]).await;
+        assert_eq!(s.lines(), [all[0].clone(), all[2].clone()]);
         // Re-installing what's there is a no-op.
-        run(args(&["install", "--snapshot", &www])).await;
-        assert_eq!(lines(), [all[0].clone(), all[2].clone()]);
+        s.run(&["install", "--snapshot", &www]).await;
+        assert_eq!(s.lines(), [all[0].clone(), all[2].clone()]);
 
         // Re-installing the backup line (to pick up a new line shape) keeps its --pull and
         // start date — even from an older version's line, which it upgrades in place — and
         // only the opposite flags drop them. The other lines never move.
-        let legacy = all[0].replace(" flock -n -o ", " flock -n ");
-        let tab_text = std::fs::read_to_string(&tab).unwrap().replace(&all[0], &legacy);
-        std::fs::write(&tab, tab_text).unwrap();
-        assert_eq!(lines()[0], legacy);
-        run(args(&["install", "--backup"])).await;
-        assert_eq!(lines(), [all[0].clone(), all[2].clone()], "the legacy line upgraded, --pull and the start date kept");
-        run(args(&["install", "--no-pull"])).await;
-        let git_only = lines();
+        let legacy = legacy_cron_line(&all[0], &home).replace(" flock -n -o ", " flock -n ");
+        s.set_tab(&s.tab().replace(&all[0], &legacy));
+        assert_eq!(s.lines()[0], legacy);
+        s.run(&["install", "--backup"]).await;
+        assert_eq!(s.lines(), [all[0].clone(), all[2].clone()], "the legacy line upgraded, --pull and the start date kept");
+        s.run(&["install", "--no-pull"]).await;
+        let git_only = s.lines();
         assert!(
-            git_only[0].starts_with("*/15 * * * * ARENA_START_DATE=2026-01-05 flock -n -o ")
+            git_only[0].starts_with(&format!("*/15 * * * * {mkdir}ARENA_START_DATE=2026-01-05 flock -n -o "))
                 && git_only[0].contains(" pods backup --no-pull --yes >> "),
             "{git_only:?}"
         );
-        run(args(&["install", "--schedule", "0 * * * *"])).await;
-        let hourly = lines();
-        assert!(hourly[0].starts_with("0 * * * * ARENA_START_DATE=2026-01-05 flock") && hourly[0].contains("--no-pull"), "{hourly:?}");
-        run(args(&["install", "--no-start-date", "--pull"])).await;
-        let undated = lines();
-        assert!(undated[0].starts_with("0 * * * * flock -n -o ") && undated[0].contains(" pods backup --yes >> "), "{undated:?}");
+        s.run(&["install", "--schedule", "0 * * * *"]).await;
+        let hourly = s.lines();
+        assert!(hourly[0].starts_with(&format!("0 * * * * {mkdir}ARENA_START_DATE=2026-01-05 flock")) && hourly[0].contains("--no-pull"), "{hourly:?}");
+        s.run(&["install", "--no-start-date", "--pull"]).await;
+        let undated = s.lines();
+        assert!(undated[0].starts_with(&format!("0 * * * * {mkdir}flock -n -o ")) && undated[0].contains(" pods backup --yes >> "), "{undated:?}");
         assert_eq!(undated[1], all[2], "the snapshot line never moved");
 
+        // 026c308's lines, their logs and locks directly in the home, and those files there.
+        let old: Vec<String> = undated.iter().map(|l| legacy_cron_line(l, &home)).collect();
+        assert!(old.iter().zip(&undated).all(|(o, n)| o != n && !o.contains(".local/state")), "{old:?}");
+        s.set_tab(&s.tab().replace(&undated[0], &old[0]).replace(&undated[1], &old[1]));
+        assert_eq!(s.lines(), old);
+        let put = |f: &str, text: &str| std::fs::write(std::path::Path::new(&home).join(f), text).unwrap();
+        for f in ["arena-cron.log", ".arena-backup-cron.lock", "arena-snapshot-cron.log", ".arena-snapshot-cron.lock", "arena-proxy-cron.log"] {
+            put(f, &format!("{f}\n"));
+        }
+        let files = s.home_entries();
+        // A dry run, and a prompt refused (no terminal, no --yes): nothing written, nothing tidied.
+        s.run(&["install", "--backup", "--snapshot", &www, "--dry-run"]).await;
+        assert_eq!((s.lines(), s.home_entries()), (old.clone(), files.clone()), "a dry run tidies nothing");
+        if !std::io::stdin().is_terminal() {
+            let e = s.run_as(&["install", "--backup", "--snapshot", &www], false, Some(&home)).await.unwrap_err();
+            assert!(e.downcast_ref::<super::NoTerminal>().is_some(), "{e}");
+            assert_eq!((s.lines(), s.home_entries()), (old.clone(), files.clone()), "a refused prompt tidies nothing");
+        }
+        // Written: each line replaced in place — never doubled — the backup line keeping its
+        // options, read back from the old line; then the rewritten lines' old logs move into the
+        // cron folder and their locks go. The proxy's old log stays: no line was rewritten for it.
+        s.run(&["install", "--backup", "--snapshot", &www]).await;
+        assert_eq!(s.lines(), undated, "upgraded in place, one line each");
+        assert_eq!(s.home_entries(), [".local", "arena-proxy-cron.log"]);
+        for (job, was) in [(arena_core::cron::Job::Backup, "arena-cron.log"), (arena_core::cron::Job::Snapshot, "arena-snapshot-cron.log")] {
+            assert_eq!(std::fs::read_to_string(arena_core::cron::log(&home, job)).unwrap(), format!("{was}\n"));
+        }
+        // A no-op install tidies nothing either: an old default log put back stays.
+        put("arena-cron.log", "again\n");
+        s.run(&["install", "--backup", "--snapshot", &www]).await;
+        assert_eq!(s.home_entries(), [".local", "arena-cron.log", "arena-proxy-cron.log"]);
+
         // Plain `remove`: the whole block goes; the user's entry stays.
-        run(args(&["remove"])).await;
-        let text = std::fs::read_to_string(&tab).unwrap();
-        assert_eq!(text, "0 9 * * * /usr/bin/keep-me\n");
-        let _ = std::fs::remove_dir_all(&dir);
+        s.run(&["remove"]).await;
+        assert_eq!(s.tab(), "0 9 * * * /usr/bin/keep-me\n");
+    }
+
+    /// CL1 end to end: an installed backup line logging to a folder someone chose (its lock in
+    /// another home) is re-installed with that log kept, its folder in the mkdir, the lock in
+    /// arena's folder — and nothing tidied: the chosen log, the line's old lock, and old-default
+    /// files sitting in this HOME all stay. Again: nothing to change.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_install_keeps_a_chosen_log_and_tidies_nothing_of_it() {
+        use arena_core::cron::{self, Job};
+        let s = CronStub::new("kept");
+        let home = s.home.clone();
+        let logs = s.dir.join("srv/x/logs/cron").display().to_string();
+        let other = s.dir.join("oldhome").display().to_string();
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let chosen = format!("{logs}/arena-cron.log");
+        let line = format!(
+            "*/15 * * * * ARENA_START_DATE=2026-10-05 flock -n -o {other}/.arena-backup-cron.lock /usr/local/bin/arena --config /c \
+             pods backup --yes >> {chosen} 2>&1"
+        );
+        s.set_tab(&with_arena_block("", std::slice::from_ref(&line)));
+        let mut old_files = vec![chosen.clone()];
+        for d in [&home, &other] {
+            for f in ["arena-cron.log", ".arena-backup-cron.lock"] {
+                old_files.push(format!("{d}/{f}"));
+            }
+        }
+        for f in &old_files {
+            std::fs::write(f, "old\n").unwrap();
+        }
+        s.run(&["install", "--backup"]).await;
+        let now = s.lines();
+        assert_eq!(now.len(), 1, "{now:?}");
+        assert!(
+            now[0].starts_with(&format!(
+                "*/15 * * * * mkdir -p {} {logs} && ARENA_START_DATE=2026-10-05 flock -n -o {} ",
+                cron::dir(&home),
+                cron::lock(&home, Job::Backup)
+            )) && now[0].ends_with(&format!(" pods backup --yes >> {chosen} 2>&1")),
+            "{now:?}"
+        );
+        for f in &old_files {
+            assert_eq!(std::fs::read_to_string(f).unwrap(), "old\n", "{f} untouched");
+        }
+        assert!(!std::path::Path::new(&cron::log(&home, Job::Backup)).exists());
+        s.run(&["install", "--backup"]).await;
+        assert_eq!(s.lines(), now, "kept again: nothing to change");
+    }
+
+    /// CL2/CL5 end to end: `install` and `remove` refuse a HOME they can't use (unset, relative,
+    /// not a directory) and a config path a crontab line can't carry — before anything changes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_install_and_remove_refuse_a_home_or_config_a_line_cant_carry() {
+        let mut s = CronStub::new("refuse");
+        s.run(&["install", "--backup"]).await;
+        let tab = s.tab();
+        let file = s.dir.join("config.env").display().to_string();
+        for home in [None, Some("home/dev"), Some(file.as_str())] {
+            for args in [&["install", "--backup", "--no-pull"][..], &["remove"][..]] {
+                let e = s.run_as(args, true, home).await.unwrap_err().to_string();
+                assert!(e.starts_with("HOME") && e.contains("run as the user whose crontab this is"), "{home:?} {args:?}: {e}");
+            }
+        }
+        s.config = s.dir.join("50%.env");
+        std::fs::write(&s.config, "").unwrap();
+        let e = s.run_as(&["install", "--backup", "--no-pull"], true, Some(&s.home)).await.unwrap_err().to_string();
+        assert!(e.starts_with("the config path (") && e.contains("it holds % (U+0025)"), "{e}");
+        assert_eq!(s.tab(), tab, "nothing changed");
     }
 
     #[test]
@@ -19226,7 +21067,16 @@ mod placement_cli_tests {
         let lines = money::balance_preflight(&fake, &cfg(), &bal, 1, Some(&plan), &base, None).await;
         // The options' prices are preset estimates (no key): raised to the known GPU's
         // stand-in (RunPod's recorded catalog), marked `~`.
-        assert!(lines[0].starts_with("balance: runpod $0.10 live · $0.47/h now + ≤~$") && lines[0].ends_with("‼ under 24h"), "{lines:?}");
+        // The reading's age shows once it's a second old (`live 1s`): a loaded machine gets there
+        // between `balance_of` and here, so it's taken out before comparing.
+        let first = match lines[0].split_once("live ") {
+            Some((head, rest)) => match rest.split_once("s ·") {
+                Some((n, tail)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => format!("{head}live ·{tail}"),
+                _ => lines[0].clone(),
+            },
+            None => lines[0].clone(),
+        };
+        assert!(first.starts_with("balance: runpod $0.10 live · $0.47/h now + ≤~$") && first.ends_with("‼ under 24h"), "{lines:?}");
         assert!(lines.iter().any(|l| l.starts_with("⚠ RunPod needs ≥1h of credit for the new pods (≈~$")), "{lines:?}");
         assert_eq!(lines.last().unwrap(), "‼ RunPod reports the account under its minimum balance — creates will likely fail");
     }
@@ -19389,10 +21239,10 @@ mod remote_tests {
         target_is_pod, BackupTally, Unpushed, Cli, Cmd, CopyLeg, CopyPlan, PodCmd, RestoreOpts, RestoreSource, RunResult, Select, SelectByFlag, Selected,
         Unscoped, BACKUP_TIMEOUT, BRANCH_TIMEOUT, CP_BASE_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS, TEST_TIMEOUT,
     };
-    use super::{copy_failure_reason, fallback_lines, mirror_refusal_text, not_pushed_note, sync_time_label, unredacted_note, Pulled};
+    use super::{copy_failure_reason, discarded_note, fallback_lines, mirror_refusal_text, not_pushed_note, sync_time_label, unpushed_note, unredacted_note, Pulled};
     use super::{failure_why, local_backup_dir, push_first_note, take_pod_locks, take_said, telling_line, PodCall};
     use arena_core::selector::{Naming, SelectArgs};
-    use arena_core::backup::{backup_command, checkout_command, init_branch_command, BackupConfig};
+    use arena_core::backup::{backup_command, checkout_command, checkout_command_limited, init_branch_command, BackupConfig, BACKUP_BUSY_EXIT};
     use arena_core::remote::{FakeRemote, FakeReply, Remote, RemoteCall, PROBE_TIMEOUT};
     use arena_core::ssh::{login_shell_wrap, SshTarget};
     use arena_core::{Config, Pod, PodSpec, Provider, Result};
@@ -19633,18 +21483,16 @@ mod remote_tests {
 
     impl StubRsync {
         fn new(tag: &str) -> Self {
-            use std::os::unix::fs::PermissionsExt;
             let dir = std::env::temp_dir().join(format!("arena-rsync-{}-{tag}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let script = dir.join("rsync");
-            std::fs::write(
+            arena_core::remote::write_test_script(
                 &script,
                 "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
                  echo \"$*\" >> \"$(dirname \"$0\")/args.log\"\n",
             )
             .unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
             StubRsync(dir)
         }
         fn path(&self) -> String {
@@ -19835,6 +21683,71 @@ mod remote_tests {
         assert!(fake.calls().is_empty() && stub.take().is_empty());
     }
 
+    /// Review ai-review claude #10, checked: since FIX4A a pod with no SSH endpoint (stopped,
+    /// booting) is in `Pulled::failed` — for the backup's per-pod fallback lines, which ask where
+    /// a pod's copy went. Every reader was checked: `pods pull`'s exit and its error come from the
+    /// failed rsync jobs (`failures`), where such a pod never is, and its summary counts jobs — not
+    /// a failed copy, nor counted twice; `whole` (the resolve's gate on a copy) holds only pods
+    /// all of whose rsyncs ran; `pods backup` (pull or `--no-pull`) copies instead only pods its
+    /// git step reached, never such a pod, so no line names it a failed copy and the run's verdict
+    /// is as without it. (The reaper's backup and its verify run their own rsync, and the archive's
+    /// "pull running" reads the pod's lock: neither reads a `Pulled`.)
+    #[tokio::test]
+    async fn a_pod_with_no_endpoint_is_no_failed_copy_to_any_reader_of_the_pull() {
+        use super::{pull_pods, LockMode, PullRun};
+        let stub = StubRsync::new("no-endpoint");
+        let base = stub.0.join("backups");
+        let cfg = Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\n\
+             GIT_SSH_KEY_REMOTE={KEY}\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nARENA_START_DATE=2026-01-05\n\
+             LOCAL_BACKUP_DIR={}\n",
+            base.display()
+        ));
+        let base = base.display().to_string();
+        let stopped = Pod { status: "EXITED".into(), ssh_ip: None, ssh_port: None, ..pod("bloom", 22002) };
+        let both = Selected { pods: vec![pod("apple", 22001), stopped.clone()], named: true };
+        let args = || PullRun { label: Some("w1d1".into()), max_size: None, remote_path: None, no_git: false, no_big: false, dry_run: false, yes: true };
+        let pull = |sel: Selected| {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [repo_in_place()]);
+            let remote: Arc<dyn Remote> = fake;
+            let (cfg, base, rsync) = (cfg.clone(), base.clone(), stub.path());
+            async move { pull_pods(&remote, &cfg, &base, args(), &sel, &rsync, LockMode::Take(Duration::from_millis(300))).await.unwrap() }
+        };
+        let no_endpoint = [("devtest-bloom".to_string(), "no SSH endpoint to pull from".to_string())];
+        let p = pull(both.clone()).await;
+        assert!(p.failures.is_empty(), "no failed rsync: {:?}", p.failures);
+        assert_eq!((p.failed.as_slice(), p.whole.as_slice()), (&no_endpoint[..], &["devtest-apple".to_string()][..]));
+        assert!(p.copied_to("devtest-apple").is_some() && p.copied_to("devtest-bloom").is_none());
+        p.result().unwrap();
+        assert_eq!(stub.take().len(), 3, "apple's tiers only");
+        // Every pod without one, fleet-wide (named, that's refused before anything: unchanged):
+        // the same, from the early return.
+        let p = pull(Selected { pods: vec![stopped.clone()], named: false }).await;
+        assert!(p.failures.is_empty() && p.whole.is_empty() && stub.take().is_empty());
+        assert_eq!(p.failed, no_endpoint);
+        p.result().unwrap();
+        // `pods pull` itself: exit 0.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [repo_in_place()]);
+        let remote: Arc<dyn Remote> = fake;
+        handle_pull(&remote, &cfg, Some("w1d1".into()), &base, None, None, false, false, &both, false, true, &stub.path()).await.unwrap();
+        assert_eq!(stub.take().len(), 3);
+        // `pods backup`, with the pull and without: apple pushed (and pulled), bloom neither, and
+        // no line says a copy of bloom failed.
+        for no_pull in [false, true] {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"), repo_in_place()]);
+            let _ = take_said();
+            handle_full_backup(fake.clone(), &cfg, &both, no_pull, None, false, true, &stub.path()).await.unwrap();
+            assert_eq!(stub.take().len(), if no_pull { 0 } else { 3 }, "no_pull={no_pull}");
+            assert!(!take_said().iter().any(|l| l.contains("devtest-bloom")), "no_pull={no_pull}");
+        }
+        let unpushed = [Unpushed { pod: "devtest-bloom".into(), why: "x".into(), branch: None, at_push: true, wrong_origin: false, busy: None }];
+        assert_eq!(fallback_lines(&unpushed, &Ok(pull(both.clone()).await)), ["✗ devtest-bloom: git push failed (x); the fallback copy failed too: no SSH endpoint to pull from"]);
+        let _ = stub.take();
+    }
+
     /// S17 + AD7: every pull rsync writes its temp files to its tier root's `.rsync-tmp`
     /// (`<dir>/<label>/.rsync-tmp`, `<dir>/big/.rsync-tmp`) — beside the pod trees the archive
     /// pushes, never in one — created owner-only once confirmed; a dry run shows it and creates
@@ -19890,17 +21803,15 @@ mod remote_tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_wedged_pods_rsync_is_stopped_at_its_budget_and_named() {
-        use std::os::unix::fs::PermissionsExt;
         let stub = StubRsync::new("wedged");
         // bloom's rsync records its pid and hangs like a wedged pod; the others log and exit.
-        std::fs::write(
+        arena_core::remote::write_test_script(
             stub.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\ncase \"$last\" in\n  \
              */devtest-bloom/) echo $$ >> \"$(dirname \"$0\")/hung.pids\"; exec sleep 30;;\nesac\n\
              echo \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n",
         )
         .unwrap();
-        std::fs::set_permissions(stub.0.join("rsync"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let base = stub.0.join("backups").display().to_string();
         let with_budget = |budget: &str| {
             Config::parse(&format!(
@@ -19957,16 +21868,14 @@ mod remote_tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_wedged_pods_repo_rsyncs_are_bounded_too() {
-        use std::os::unix::fs::PermissionsExt;
         let stub = StubRsync::new("wedged-repo");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             stub.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\ncase \"$last\" in\n  \
              */devtest-bloom/|*/devtest-bloom/*) echo $$ >> \"$(dirname \"$0\")/hung.pids\"; exec sleep 30;;\nesac\n\
              echo \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n",
         )
         .unwrap();
-        std::fs::set_permissions(stub.0.join("rsync"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let base = stub.0.join("backups").display().to_string();
         let cfg = Config::parse(&format!(
             "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\n\
@@ -20088,9 +21997,8 @@ mod remote_tests {
     /// (the image's), `work.txt` with a new one — so a snapshot exists afterwards, and a
     /// baseline has something to keep and something to drop. Logs every argv.
     fn writing_rsync(tag: &str) -> StubRsync {
-        use std::os::unix::fs::PermissionsExt;
         let stub = StubRsync::new(tag);
-        std::fs::write(
+        arena_core::remote::write_test_script(
             stub.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$*\" >> \"$(dirname \"$0\")/args.log\"\n\
              mkdir -p \"$last\" && printf img > \"$last/image.txt\" && touch -d @1000000000 \"$last/image.txt\" && \
@@ -20098,7 +22006,6 @@ mod remote_tests {
              touch -d @1000000000 \"$last/carried.txt\"\n",
         )
         .unwrap();
-        std::fs::set_permissions(stub.0.join("rsync"), std::fs::Permissions::from_mode(0o755)).unwrap();
         stub
     }
 
@@ -20422,15 +22329,13 @@ mod remote_tests {
 
     #[tokio::test]
     async fn a_failed_or_stuck_restore_says_nothing_was_deleted() {
-        use std::os::unix::fs::PermissionsExt;
         let stub = StubRsync::new("restore-fail");
         let dir = backups(&stub.0);
         let f = fleet();
         let remote: Arc<dyn Remote> = Arc::new(FakeRemote::new());
         let script = |name: &str, body: &str| {
             let p = stub.0.join(name);
-            std::fs::write(&p, body).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            arena_core::remote::write_test_script(&p, body).unwrap();
             p.display().to_string()
         };
         let failing = script("rsync-fails", "#!/bin/sh\necho 'rsync: connection unexpectedly closed' >&2\nexit 12\n");
@@ -20687,19 +22592,20 @@ mod remote_tests {
         let start = Instant::now();
         let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
         let on_main = vec![("devtest-delta".to_string(), "main".to_string())];
-        let failed = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: None, at_push: false, wrong_origin: false };
+        let failed = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: None, at_push: false, wrong_origin: false, busy: None };
         assert_eq!(
             tally,
             BackupTally {
                 pushed: 1,
                 unchanged: 1,
                 skipped: 1,
-                failed: 2,
+                failed: vec!["devtest-echo".to_string(), "devtest-bloom".to_string()],
                 unpushed: vec![
                     failed("devtest-echo", "exit 128: fatal: Could not read from remote repository."),
                     failed("devtest-bloom", "timed out after 300s"),
                 ],
                 on_protected: on_main,
+                uncommitted: vec![],
             }
         );
         assert_eq!(start.elapsed(), BACKUP_TIMEOUT);
@@ -20752,8 +22658,8 @@ mod remote_tests {
         let names: Vec<String> = f.pods.iter().map(|p| p.name.clone()).collect();
         let mut locks = crate::take_pod_locks(&d, &names, Duration::from_millis(10)).await;
         assert!(locks.holds("devtest-apple") && locks.holds("devtest-bloom"));
-        let held = |n: &str| !arena_core::pull::try_lock(&arena_core::pull::open_pod_lock(&d, n).unwrap()).unwrap();
-        let free = |n: &str| crate::lock_settles_free(&arena_core::pull::open_pod_lock(&d, n).unwrap());
+        let held = |n: &str| arena_core::pull::try_lock(arena_core::pull::open_pod_lock(&d, n).unwrap()).unwrap().is_err();
+        let free = |n: &str| crate::lock_settles_free(arena_core::pull::open_pod_lock(&d, n).unwrap());
         let (sel, c) = (everyone(&f), cfg());
         let mut unpushed = Vec::new();
         let backup = handle_backup(fake.clone(), &c, true, None, &sel, &mut locks, &mut unpushed);
@@ -20824,7 +22730,7 @@ mod remote_tests {
 
         // The copy fails too: both in the error (and on the pod's line, below).
         let failing = StubRsync::new("fallback-fail");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             failing.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
              case \"$last\" in *devtest-bloom*) echo 'rsync: connection unexpectedly closed' >&2; exit 12;; esac\n",
@@ -20865,11 +22771,15 @@ mod remote_tests {
                        Please make sure you have the correct access rights\nand the repository exists.\n";
         let cases: &[(&str, Option<&str>)] = &[
             (missing, Some("ERROR: Repository not found.")),
-            ("ssh: connect to host github.com port 22: Connection timed out\r\nfatal: Could not read from remote repository.\r\n\r\nand the repository exists.\r\n", Some("fatal: Could not read from remote repository.")),
+            ("ssh: connect to host github.com port 22: Connection timed out\r\nfatal: Could not read from remote repository.\r\n\r\nand the repository exists.\r\n", Some("ssh: connect to host github.com port 22: Connection timed out")),
+            // Live (hz2): the deploy key moved away — ssh's line names the cause git's `fatal:` hides.
+            ("Warning: Identity file /root/.ssh/id_ed25519 not accessible: No such file or directory.\nno such identity: /root/.ssh/id_ed25519: No such file or directory\ngit@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n", Some("git@github.com: Permission denied (publickey).")),
             ("To github.com:o/r.git\n ! [rejected]        autocommit-x -> autocommit-x (non-fast-forward)\nerror: failed to push some refs to 'github.com:o/r.git'\nhint: Updates were rejected\n", Some("! [rejected]        autocommit-x -> autocommit-x (non-fast-forward)")),
             ("remote: Resolving deltas: 100% (3/3)\nremote: error: File big.bin is 120.00 MB; this exceeds GitHub's file size limit\nTo github.com:o/r.git\n ! [remote rejected] x -> x (pre-receive hook declined)\nerror: failed to push some refs\n", Some("remote: error: File big.bin is 120.00 MB; this exceeds GitHub's file size limit")),
             ("To /root/gh013.git\n ! [remote rejected] x -> x (pre-receive hook declined)\n", Some("! [remote rejected] x -> x (pre-receive hook declined)")),
             ("error: src refspec x does not match any\n", Some("error: src refspec x does not match any")),
+            // A harmless `Permission denied` earlier on (git add, a mount it can't read) isn't the push's.
+            ("warning: could not open directory 'data/mnt/': Permission denied\nTo github.com:o/r.git\n ! [rejected]        x -> x (non-fast-forward)\n", Some("! [rejected]        x -> x (non-fast-forward)")),
             // No verdict: the last non-empty line, as before.
             ("Warning: Permanently added 'github.com' to the list of known hosts.\nsh: 1: cd: can't cd to /root/x\n\n", Some("sh: 1: cd: can't cd to /root/x")),
             // A verdict word mid-line is not a verdict line.
@@ -20892,18 +22802,19 @@ mod remote_tests {
     /// or why the copy failed too.
     #[test]
     fn each_failed_push_says_where_its_files_went_or_why_they_didnt() {
-        let u = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: Some("autocommit-x".into()), at_push: true, wrong_origin: false };
+        let u = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: Some("autocommit-x".into()), at_push: true, wrong_origin: false, busy: None };
         let mut unpushed = vec![
             u("devtest-bloom", "GitHub push protection: OpenRouter API Key at ex.py:3"),
             u("devtest-cloud", "exit 128: fatal: Could not read from remote repository."),
         ];
         // One that failed before its push: its own failure line is all it gets.
-        unpushed.push(Unpushed { pod: "devtest-delta".into(), why: "exit 2: no repo".into(), branch: None, at_push: false, wrong_origin: false });
+        unpushed.push(Unpushed { pod: "devtest-delta".into(), why: "exit 2: no repo".into(), branch: None, at_push: false, wrong_origin: false, busy: None });
         let pulled: anyhow::Result<Pulled> = Ok(Pulled {
             failures: vec!["devtest-cloud [big]".into()],
             failed: vec![("devtest-cloud".into(), "[big] rsync exit 12".into())],
             snapshot_root: "/b/w41d5".into(),
             big_root: Some("/b/big".into()),
+            whole: vec![],
         });
         assert_eq!(
             fallback_lines(&unpushed, &pulled),
@@ -20922,6 +22833,37 @@ mod remote_tests {
         );
         assert!(fallback_lines(&[], &pulled).is_empty());
         assert!(fallback_lines(&unpushed[2..], &pulled).is_empty(), "never copied: never said to be");
+    }
+
+    /// FIX10: the backup's own last scan finding a key left after the redaction (exit 4,
+    /// `PUSH_BLOCKED key left after redaction`) fails at the push like GitHub's refusal: the pod
+    /// goes to the fallback copy, and its line says what was left and what to do — never that
+    /// GitHub refused it, or that a pattern is missing.
+    #[tokio::test]
+    async fn a_key_left_after_the_redaction_fails_at_the_push_and_is_copied() {
+        let f = fleet_of(&[("bloom", 22002)]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [FakeReply::exit(4, "").with_stdout("BRANCH autocommit-b\nPUSH_BLOCKED key left after redaction\n")]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
+        let mut lines = Vec::new();
+        let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
+        assert_eq!(
+            lines,
+            ["[1/1] ✗ devtest-bloom: a key is still in the unpushed commits of autocommit-b after the redaction — in a commit's \
+              author, committer or merged tag, a binary file or a symlink, or a redaction that didn't take — so nothing was \
+              pushed. Take it out of those commits on devtest-bloom by hand"]
+        );
+        let why = "a key left in the unpushed commits after the redaction";
+        let left = Unpushed { pod: "devtest-bloom".into(), why: why.into(), branch: Some("autocommit-b".into()), at_push: true, wrong_origin: false, busy: None };
+        assert_eq!(tally.failed, ["devtest-bloom"]);
+        assert_eq!(tally.unpushed, [left]);
+        let pulled: anyhow::Result<Pulled> =
+            Ok(Pulled { failures: vec![], failed: vec![], snapshot_root: "/b/w41d5".into(), big_root: Some("/b/big".into()), whole: vec![] });
+        assert_eq!(
+            fallback_lines(&tally.unpushed, &pulled),
+            [format!("✗ devtest-bloom: git push failed ({why}) → files copied to /b/w41d5/devtest-bloom (and /b/big/devtest-bloom)")]
+        );
     }
 
     /// [`backup_cfg`] with a configured repo, `o/r`: every backup checks each pod's `origin`.
@@ -20957,8 +22899,8 @@ mod remote_tests {
         let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
         let mut lines = Vec::new();
         let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
-        assert_eq!((tally.pushed, tally.failed), (1, 1));
-        let bloom = Unpushed { pod: "devtest-bloom".into(), why: WRONG_WHY.into(), branch: None, at_push: false, wrong_origin: true };
+        assert_eq!((tally.pushed, tally.failed.len()), (1, 1));
+        let bloom = Unpushed { pod: "devtest-bloom".into(), why: WRONG_WHY.into(), branch: None, at_push: false, wrong_origin: true, busy: None };
         assert_eq!(tally.unpushed, std::slice::from_ref(&bloom));
         let mut got = unnumbered(&lines);
         got.sort();
@@ -20988,7 +22930,7 @@ mod remote_tests {
         assert!(copied.len() == 3 && copied.iter().all(|d| d.ends_with("/devtest-bloom")), "only bloom, both tiers: {copied:?}");
         // Its line once copied.
         let pulled: anyhow::Result<Pulled> =
-            Ok(Pulled { failures: vec![], failed: vec![], snapshot_root: "/b/w41d5".into(), big_root: Some("/b/big".into()) });
+            Ok(Pulled { failures: vec![], failed: vec![], snapshot_root: "/b/w41d5".into(), big_root: Some("/b/big".into()), whole: vec![] });
         assert_eq!(
             fallback_lines(&[bloom], &pulled),
             [format!("✗ devtest-bloom: not backed up to git ({WRONG_WHY}) → files copied to /b/w41d5/devtest-bloom (and /b/big/devtest-bloom)")]
@@ -21015,7 +22957,7 @@ mod remote_tests {
         let err = handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &stub.path()).await.unwrap_err();
         assert_eq!(
             err.to_string(),
-            "1 pod(s) NOT switched — their branch could be neither pushed nor copied first (see each one's line): devtest-bloom"
+            "1 pod(s) NOT switched — each one's line says why: devtest-bloom"
         );
         assert!(crate::take_said().contains(&refused), "{refused}");
         assert_eq!(execs(&fake, 22002), [backup("bloom")], "bloom: refused, never copied or switched");
@@ -21036,7 +22978,8 @@ mod remote_tests {
         let bcfg = BackupConfig::from_config(&cfg, 1, 2);
         for (name, port) in [("apple", 22001), ("cloud", 22003)] {
             let init = init_branch_command(&bcfg, &format!("devtest-{name}"));
-            assert!(init.contains("origin_check 'o/r'"), "the init command checks too");
+            // (The check is in the script the command runs under `sh -c`: its quotes escaped.)
+            assert!(init.contains(r"origin_check '\''o/r'\''"), "the init command checks too");
             assert_eq!(execs(&fake, port), [backup(name), (init, Some(BRANCH_TIMEOUT))], "{name}");
         }
     }
@@ -21044,14 +22987,13 @@ mod remote_tests {
     /// A stand-in `rsync` that runs the real one with the pull's own argv, the pod's side
     /// (`root@10.0.0.1:<path>`) read from the local tree `pod` instead. `None` without an rsync.
     fn local_pod_rsync(tag: &str, pod: &std::path::Path) -> Option<StubRsync> {
-        use std::os::unix::fs::PermissionsExt;
         let real = std::process::Command::new("sh").args(["-c", "command -v rsync"]).output().ok()?;
         let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
         if real.is_empty() {
             return None;
         }
         let stub = StubRsync::new(tag);
-        std::fs::write(
+        arena_core::remote::write_test_script(
             stub.0.join("rsync"),
             format!(
                 "#!/bin/sh\nfor a do\n  shift\n  case $a in root@10.0.0.1:*) a=\"{}/${{a#root@10.0.0.1:}}\";; esac\n  set -- \"$@\" \"$a\"\ndone\n\
@@ -21060,7 +23002,6 @@ mod remote_tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(stub.0.join("rsync"), std::fs::Permissions::from_mode(0o755)).unwrap();
         Some(stub)
     }
 
@@ -21144,9 +23085,8 @@ mod remote_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_pull_never_moves_anything_rsync_names_outside_its_destination() {
-        use std::os::unix::fs::PermissionsExt;
         let stub = StubRsync::new("makeway-spoof");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             stub.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
              echo 'could not make way for new symlink: ../../outside/victim' >&2\n\
@@ -21154,7 +23094,6 @@ mod remote_tests {
              echo 'could not make way for new regular file: /etc' >&2\nexit 23\n",
         )
         .unwrap();
-        std::fs::set_permissions(stub.0.join("rsync"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let base = stub.0.join("backups");
         let outside = stub.0.join("outside");
         std::fs::create_dir_all(outside.join("victim")).unwrap();
@@ -21214,13 +23153,14 @@ mod remote_tests {
         assert!(got.len() == 3 && got.iter().all(|d| d.ends_with("/devtest-bloom")), "only bloom copied: {got:?}");
 
         // Its line: which branch, why, where its files went, and where its commits are now — in
-        // the branch, or (review) after `--hard` onto that same branch, only in its reflog.
+        // the branch, or after `--hard` onto that same branch, pinned by a ref (codex #3).
         let u = Unpushed {
             pod: "devtest-bloom".into(),
             why: "GitHub push protection: OpenRouter API Key at ex.py:3".into(),
             branch: Some("autocommit-devtest-w1d1-bloom".into()),
             at_push: true,
             wrong_origin: false,
+            busy: None,
         };
         let to = "/b/w1d1/devtest-bloom (and /b/big/devtest-bloom)";
         assert_eq!(
@@ -21231,8 +23171,8 @@ mod remote_tests {
         );
         assert!(
             not_pushed_note(&u, to, Some("autocommit-devtest-w1d1-bloom")).ends_with(
-                "and the --hard reset leaves its unpushed commits only in the branch's reflog on the pod \
-                 (`git reflog autocommit-devtest-w1d1-bloom`)"
+                "and the --hard reset moves autocommit-devtest-w1d1-bloom to origin's, and its unpushed commits stay on the pod \
+                 under refs/arena-discarded/<time>-autocommit-devtest-w1d1-bloom"
             ),
             "{}",
             not_pushed_note(&u, to, Some("autocommit-devtest-w1d1-bloom"))
@@ -21246,6 +23186,578 @@ mod remote_tests {
         );
         assert_eq!(unredacted_note("UNREDACTED_RESTORED joep.py\n"), " — real key(s) back in 1 file(s) git has redacted: joep.py");
         assert_eq!(unredacted_note("RESTORED Grokking\n"), "");
+        // What init-branches left for the next backup to scan and push (FIX9B item 2).
+        assert_eq!(
+            unpushed_note("Switched to a new branch 'x'\nUNPUSHED 2 0123456789abcdef0123456789abcdef01234567\n"),
+            " — 2 commit(s) origin doesn't have stay on it on the pod, unpushed (the branch went to origin at 0123456789, the \
+             newest commit origin has): the next backup scans them for keys and pushes them"
+        );
+        assert_eq!(
+            unpushed_note("UNPUSHED 3 none\n"),
+            " — not pushed: origin has none of its 3 commit(s); the next backup scans them for keys and pushes the branch"
+        );
+        assert_eq!(unpushed_note("Switched to a new branch 'x'\nUNREDACTED_RESTORED a.py\n"), "");
+    }
+
+    /// A backup that found a merge in progress on the pod, its conflicts unresolved (a conflicted
+    /// `git pull upstream main`; exit 6): nothing committed.
+    fn busy_merge(branch: &str) -> FakeReply {
+        FakeReply::exit(BACKUP_BUSY_EXIT, "").with_stdout(&format!("BRANCH {branch}\nBUSY {branch} merge unmerged\n"))
+    }
+
+    const MERGE_WHY: &str = "a merge is in progress on autocommit-b — not committed; resolve the conflicts and `git add` them, then \
+                             `git commit` — or abort it (`git merge --abort`) on the pod";
+
+    /// Review R3: the 15-min backup committed a participant's conflicted `git pull upstream main`
+    /// — conflict markers and all, as a merge commit, pushed — and `git merge --abort` no longer
+    /// worked. Now that pod's backup stops before anything is staged (`BUSY`, exit 6): its line
+    /// says what is in progress and how to end it either way, it is copied by rsync in the same
+    /// run like a failed push (both tiers, even under --no-pull: its uncommitted work is nowhere
+    /// else), and the run fails. The other pods back up as always.
+    #[tokio::test]
+    async fn a_pod_mid_merge_is_left_as_it_is_said_how_to_end_it_and_copied() {
+        // bloom's look at its merge (`resolve`) fails here: it is copied as before, never finished.
+        let script = |fake: &FakeRemote| {
+            fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n")]);
+            fake.script(&host(22002), [busy_merge("autocommit-b"), FakeReply::exit(2, "sh: cd: no such dir"), repo_in_place()]);
+            fake.script(&host(22003), [FakeReply::stdout("BRANCH autocommit-c\nNO_CHANGES autocommit-c\n")]);
+        };
+        // Each pod's line: bloom's says what is in progress and both ways to end it.
+        let fake = Arc::new(FakeRemote::new());
+        script(&fake);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let jobs = targets(&fleet()).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
+        let mut lines = Vec::new();
+        let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
+        assert_eq!((tally.pushed, tally.unchanged, tally.failed.len()), (1, 1, 1));
+        let mut got = unnumbered(&lines);
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "= devtest-cloud (no changes, on autocommit-c)".to_string(),
+                "✓ devtest-apple -> autocommit-a".to_string(),
+                "✗ devtest-bloom: a merge is in progress on autocommit-b — not committed (a backup now would commit the merge's \
+                 state, unresolved conflicts and all, and end the merge); resolve the conflicts and `git add` them, then `git \
+                 commit` — or abort it (`git merge --abort`) on the pod"
+                    .to_string(),
+            ]
+        );
+        // Its record: what is in progress, failed at the push (so it's copied), said as what it is.
+        let bloom = Unpushed {
+            pod: "devtest-bloom".into(),
+            why: MERGE_WHY.into(),
+            branch: Some("autocommit-b".into()),
+            at_push: true,
+            wrong_origin: false,
+            busy: Some("merge".into()),
+        };
+        assert_eq!(tally.unpushed, std::slice::from_ref(&bloom));
+
+        // `pods backup --no-pull` (the cron's): bloom alone copied, both tiers; the run fails.
+        let stub = StubRsync::new("busy");
+        let fake = Arc::new(FakeRemote::new());
+        script(&fake);
+        let err = handle_full_backup(fake.clone(), &cfg_at(&stub), &everyone(&fleet()), true, None, false, true, &stub.path()).await.unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) failed to back up");
+        let copied = stub.take();
+        assert!(copied.len() == 3 && copied.iter().all(|d| d.ends_with("/devtest-bloom")), "only bloom, both tiers: {copied:?}");
+        let bloom_calls = execs(&fake, 22002);
+        assert_eq!(bloom_calls.len(), 3, "its backup, its look, its copy");
+        assert_eq!(bloom_calls[1].0, arena_core::resolve::look_command(REPO), "bloom's look");
+        assert_eq!(bloom_calls[2], (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT)), "bloom's copy");
+        for port in [22001, 22003] {
+            assert_eq!(execs(&fake, port).len(), 1, "{port}: its backup only");
+        }
+        // Its line after the copy: not "git push failed" — nothing was committed.
+        let pulled: anyhow::Result<Pulled> =
+            Ok(Pulled { failures: vec![], failed: vec![], snapshot_root: "/b/w41d5".into(), big_root: Some("/b/big".into()), whole: vec![] });
+        assert_eq!(
+            fallback_lines(std::slice::from_ref(&bloom), &pulled),
+            [format!("✗ devtest-bloom: not backed up to git ({MERGE_WHY}) → files copied to /b/w41d5/devtest-bloom (and /b/big/devtest-bloom)")]
+        );
+        let refused: anyhow::Result<Pulled> = Err(anyhow::anyhow!("no space"));
+        assert_eq!(
+            fallback_lines(&[bloom], &refused),
+            [format!("✗ devtest-bloom: not backed up to git ({MERGE_WHY}); the fallback copy failed too: no space")]
+        );
+    }
+
+    /// `set-branch` backs up each pod's branch first; a pod mid-merge can't be (`BUSY`). Its files
+    /// are copied first, as for a failed push, and then the switch: `--hard` ends the merge with
+    /// the uncommitted changes it discards — said, with where the copy is and where on the pod the
+    /// switch saved them first (`DISCARDED_SAVED`: review ai-review claude #2) — while the
+    /// gentle switch and init-branches refuse to end it (their command's own refusal, on the pod's
+    /// line with the copy's note), and the run never calls that pod switched. A pod whose copy
+    /// failed too is not switched at all.
+    #[tokio::test]
+    async fn set_branch_copies_a_pod_mid_merge_first_and_its_line_names_the_merge() {
+        let stub = StubRsync::new("busy-switch");
+        let cfg = cfg_at(&stub);
+        let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None), Some(BACKUP_TIMEOUT));
+        let probe = (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT));
+        let copied_first = " — ⚠ NOT COMMITTED FIRST: a merge is in progress on autocommit-b, so nothing was committed; its files were \
+                            copied to ";
+        let stays = "its commits stay on the pod in that branch (switching deletes no branch)";
+
+        // --hard: copied, then switched; the line says the switch ended the merge. Switched like
+        // the rest — not a failure (review fb2 F2) — and one line after the run names it.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"), FakeReply::ok()]);
+        fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place(), FakeReply::stdout(SAVED_BLOOM)]);
+        let _ = crate::take_said();
+        handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &stub.path()).await.unwrap();
+        let hard = (checkout_command(REPO, "main", Some(KEY), true), Some(BRANCH_TIMEOUT));
+        assert_eq!(execs(&fake, 22002), [backup("bloom"), probe.clone(), hard]);
+        assert!(stub.take().iter().all(|d| d.ends_with("/devtest-bloom")));
+        let said = unnumbered(&crate::take_said());
+        assert!(said.contains(&ENDED_BLOOM.to_string()), "{said:#?}");
+        let line = said.iter().find(|l| l.starts_with("✓ devtest-bloom (on main)")).unwrap_or_else(|| panic!("{said:#?}"));
+        assert!(line.starts_with(&format!("✓ devtest-bloom (on main){copied_first}")), "{line}");
+        assert!(
+            line.ends_with(&format!(
+                " first, and the --hard switch ends the merge and discards its uncommitted changes to tracked files; {stays} — what \
+                 it discarded was saved to .git/arena-discarded/20261019T090102Z/ on the pod first (its README says how to get it \
+                 back)"
+            )),
+            "{line}"
+        );
+
+        // Gentle, and init-branches: copied, then the switch refuses to end the merge — said on
+        // the pod's line with the copy's note, and counted as a failed switch, never a switched one.
+        let refusal = |who: &str| {
+            format!(
+                "{who}: a merge is in progress on autocommit-b — not switched (a switch now would end the merge); resolve the \
+                 conflicts and `git add` them, then `git commit` — or abort it (`git merge --abort`) on the pod, then switch again"
+            )
+        };
+        for (who, init) in [("arena set-branch", false), ("arena init-branches", true)] {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"), FakeReply::ok()]);
+            fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place(), FakeReply::exit(BACKUP_BUSY_EXIT, &refusal(who))]);
+            let err = if init {
+                handle_init_branches(fake.clone(), &cfg, Some(1), Some(2), &everyone(&fleet()), false, true, &stub.path()).await
+            } else {
+                handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), false, false, true, &stub.path()).await
+            }
+            .unwrap_err();
+            let verb = if init { "init branch" } else { "switch branch" };
+            assert_eq!(err.to_string(), format!("1 pod(s) failed to {verb}"), "{who}: never said to be switched");
+            assert_eq!(execs(&fake, 22002).len(), 3, "{who}: backup, copy, switch");
+            assert!(stub.take().iter().all(|d| d.ends_with("/devtest-bloom")), "{who}");
+            let said = unnumbered(&crate::take_said());
+            let line = said.iter().find(|l| l.starts_with("✗ devtest-bloom (exit 6): ")).unwrap_or_else(|| panic!("{who}: {said:#?}"));
+            assert!(line.starts_with(&format!("✗ devtest-bloom (exit 6): {}{copied_first}", refusal(who))), "{line}");
+            assert!(line.ends_with(&format!(" first, and {stays}")), "{line}");
+        }
+
+        // The copy fails too: not switched, its line says why both failed.
+        let failing = StubRsync::new("busy-copyfail");
+        arena_core::remote::write_test_script(
+            failing.0.join("rsync"),
+            "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
+             echo 'rsync: No space left on device (28)' >&2; exit 11\n",
+        )
+        .unwrap();
+        let cfg = cfg_at(&failing);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place()]);
+        let err = handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet_of(&[("bloom", 22002)])), true, false, true, &failing.path())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) NOT switched — each one's line says why: devtest-bloom");
+        assert_eq!(execs(&fake, 22002), [backup("bloom"), probe], "never switched");
+        let said = crate::take_said();
+        let line = said.iter().find(|l| l.starts_with("✗ devtest-bloom not switched: ")).unwrap_or_else(|| panic!("{said:#?}"));
+        assert!(
+            line.starts_with(&format!(
+                "✗ devtest-bloom not switched: its work couldn't be committed ({MERGE_WHY}) and copying its files into "
+            )),
+            "{line}"
+        );
+    }
+
+    /// The line after a `--hard` run that ended bloom's merge after copying it.
+    const ENDED_BLOOM: &str = "⚠ 1 pod(s) had work no backup had saved (an operation in progress, or changes, commits or untracked \
+                               files on a branch no backup commits), copied before the --hard switch discarded or overwrote it — what \
+                               it discarded is also saved on the pod, in .git/arena-discarded/<time>/, which no later copy overwrites \
+                               (see each one's line): devtest-bloom";
+
+    /// Review ai-review claude #2: the most a `--hard` save copies (`DISCARD_MAX_GB`, GB) reaches
+    /// the switch's command from the config; a value it can't read stops the run before anything
+    /// is backed up or switched. The gentle switch saves nothing, so never reads it.
+    #[tokio::test]
+    async fn hard_takes_its_save_limit_from_the_config_and_a_bad_one_stops_it_first() {
+        let stub = StubRsync::new("discard-limit");
+        let dir = stub.0.join("backups");
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = |extra: &str| {
+            format!(
+                "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\n\
+                 GIT_SSH_KEY_REMOTE={KEY}\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nARENA_START_DATE=2026-01-05\n\
+                 LOCAL_BACKUP_DIR={}\n{extra}",
+                dir.display()
+            )
+        };
+        let cfg = |extra: &str| Config::parse(&text(extra));
+        let apple = everyone(&fleet_of(&[("apple", 22001)]));
+        let backup = (backup_command(REPO, Some(KEY), "arena backup devtest-apple", None), Some(BACKUP_TIMEOUT));
+        let pushed = || [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"), FakeReply::ok()];
+        for (extra, kb) in [("", 1024 * 1024), ("DISCARD_MAX_GB=0.5\n", 512 * 1024)] {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), pushed());
+            handle_set_branch(fake.clone(), &cfg(extra), "main", &apple, true, false, true, &stub.path()).await.unwrap();
+            let hard = (checkout_command_limited(REPO, "main", Some(KEY), true, kb), Some(BRANCH_TIMEOUT));
+            assert_eq!(execs(&fake, 22001), [backup.clone(), hard], "{extra:?}");
+        }
+        // From the environment alone, the file without it (Live 6, FIX6B item 5): the same.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), pushed());
+        let from_env = Config::parse_with_env(&text(""), |k| (k == "DISCARD_MAX_GB").then(|| "0.5".to_string()));
+        handle_set_branch(fake.clone(), &from_env, "main", &apple, true, false, true, &stub.path()).await.unwrap();
+        let hard = (checkout_command_limited(REPO, "main", Some(KEY), true, 512 * 1024), Some(BRANCH_TIMEOUT));
+        assert_eq!(execs(&fake, 22001), [backup.clone(), hard]);
+        let fake = Arc::new(FakeRemote::new());
+        let err = handle_set_branch(fake.clone(), &cfg("DISCARD_MAX_GB=lots\n"), "main", &apple, true, false, true, &stub.path()).await.unwrap_err();
+        assert_eq!(err.to_string(), "DISCARD_MAX_GB must be a number of GiB above 0, a fraction too, like 1 or 0.5 (got `lots`)");
+        assert!(execs(&fake, 22001).is_empty(), "nothing backed up or switched");
+        fake.script(&host(22001), pushed());
+        handle_set_branch(fake.clone(), &cfg("DISCARD_MAX_GB=lots\n"), "main", &apple, false, false, true, &stub.path()).await.unwrap();
+        assert_eq!(execs(&fake, 22001), [backup, (checkout_command(REPO, "main", Some(KEY), false), Some(BRANCH_TIMEOUT))]);
+    }
+
+    /// What a `--hard` switch prints when it saved what it discarded ([`checkout_command`]).
+    const SAVED_BLOOM: &str = "Switched to and reset branch 'main'\nDISCARDED_SAVED .git/arena-discarded/20261019T090102Z\n";
+
+    /// Review ai-review codex #3: the refs a `--hard` switch pinned the commits it left on no branch
+    /// with (`DISCARDED_PINNED`) are named on the pod's line, after where it saved the rest; with
+    /// none, no words for them.
+    #[test]
+    fn a_hard_switchs_line_names_the_refs_it_pinned() {
+        assert_eq!(discarded_note("Switched to and reset branch 'main'\n"), "");
+        let saved = " — what it discarded was saved to .git/arena-discarded/20261019T090102Z/ on the pod first (its README says how to get it back";
+        assert_eq!(discarded_note(SAVED_BLOOM), format!("{saved})"));
+        let pinned = "DISCARDED_SAVED .git/arena-discarded/20261019T090102Z\r\nDISCARDED_PINNED refs/arena-discarded/20261019T090102Z\r\n\
+                      DISCARDED_PINNED refs/arena-discarded/20261019T090102Z-main\n";
+        assert_eq!(
+            discarded_note(pinned),
+            format!("{saved}; its commits kept by refs/arena-discarded/20261019T090102Z, refs/arena-discarded/20261019T090102Z-main)")
+        );
+    }
+
+    /// Review fb2 F2: the morning's `set-branch main --all --hard --init-branches` skipped
+    /// init-branches for the whole fleet when one pod was mid-merge — that pod was copied and
+    /// switched, yet counted as an error, so every pod stayed on main, where no backup commits.
+    /// Now it is switched like the rest (its line's ⚠ says what the copy holds) and the init goes
+    /// on, on every pod.
+    #[tokio::test]
+    async fn hard_init_branches_goes_on_past_a_pod_mid_merge_it_switched() {
+        use super::{resolve_week_day, set_branch_and_init, SetBranchRun};
+        let stub = StubRsync::new("chain-busy");
+        let cfg = cfg_at(&stub);
+        let (week, day) = resolve_week_day(&cfg, None, None).unwrap();
+        let bcfg = BackupConfig::from_config(&cfg, week, day);
+        let fake = Arc::new(FakeRemote::new());
+        let pushed = |b: &str| FakeReply::stdout(&format!("BRANCH {b}\nPUSHED {b}\n"));
+        let on_main = || FakeReply::stdout("SKIP main\n");
+        fake.script(&host(22001), [pushed("autocommit-a"), FakeReply::ok(), on_main(), FakeReply::ok()]);
+        fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place(), FakeReply::ok(), on_main(), FakeReply::ok()]);
+        fake.script(&host(22003), [pushed("autocommit-c"), FakeReply::ok(), on_main(), FakeReply::ok()]);
+        let _ = crate::take_said();
+        let how = SetBranchRun { branch: "main", hard: true, dry_run: false, yes: true, init_branches: true };
+        set_branch_and_init(fake.clone(), &cfg, &everyone(&fleet()), &how, &stub.path()).await.unwrap();
+        let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None), Some(BACKUP_TIMEOUT));
+        let hard = (checkout_command(REPO, "main", Some(KEY), true), Some(BRANCH_TIMEOUT));
+        let init = |name: &str| (init_branch_command(&bcfg, &format!("devtest-{name}")), Some(BRANCH_TIMEOUT));
+        let probe = (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT));
+        assert_eq!(execs(&fake, 22001), [backup("apple"), hard.clone(), backup("apple"), init("apple")]);
+        assert_eq!(execs(&fake, 22002), [backup("bloom"), probe, hard.clone(), backup("bloom"), init("bloom")], "bloom: copied, switched, init'd");
+        assert_eq!(execs(&fake, 22003), [backup("cloud"), hard, backup("cloud"), init("cloud")]);
+        assert!(stub.take().iter().all(|d| d.ends_with("/devtest-bloom")), "only bloom copied");
+        let said = unnumbered(&crate::take_said());
+        assert!(said.contains(&ENDED_BLOOM.to_string()), "{said:#?}");
+        assert!(said.iter().any(|l| l.starts_with("✓ devtest-bloom (on main) — ⚠ NOT COMMITTED FIRST: a merge is in progress on autocommit-b")), "{said:#?}");
+        for name in ["apple", "bloom", "cloud"] {
+            let line = format!("✓ devtest-{name} -> {}", bcfg.branch_for(&format!("devtest-{name}")));
+            assert!(said.contains(&line), "{line}: {said:#?}");
+        }
+    }
+
+    /// The reverse of [`hard_init_branches_goes_on_past_a_pod_mid_merge_it_switched`]: a pod that
+    /// really wasn't switched — its copy failed, its `--hard` switch failed, or the gentle switch
+    /// refused its merge (a BUSY pod not switched is a failure, as before) — is left out of the
+    /// init, said in one line, and the run fails naming it. The pods that did switch are init'd
+    /// all the same (review pr4: one pod used to stop the init for the whole fleet). With none
+    /// switched, no init at all.
+    #[tokio::test]
+    async fn init_branches_leaves_out_a_pod_that_wasnt_switched_and_inits_the_rest() {
+        use super::{resolve_week_day, set_branch_and_init, SetBranchRun};
+        let stub = StubRsync::new("chain-busy-fail");
+        let failing = StubRsync::new("chain-busy-copyfail");
+        arena_core::remote::write_test_script(
+            failing.0.join("rsync"),
+            "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
+             echo 'rsync: No space left on device (28)' >&2; exit 11\n",
+        )
+        .unwrap();
+        let pushed = || FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n");
+        let refused = FakeReply::exit(BACKUP_BUSY_EXIT, "arena set-branch: a merge is in progress on autocommit-b — not switched");
+        let left_out = "init-branches on the 1 pod(s) that switched — not on devtest-bloom, which didn't (see each one's line above)";
+        // (case, hard, the rsync, bloom's replies after its backup, the run's error)
+        let cases: Vec<(&str, bool, &StubRsync, Vec<FakeReply>, &str)> = vec![
+            ("copy failed", true, &failing, vec![repo_in_place()], "1 pod(s) NOT switched — each one's line says why: devtest-bloom"),
+            ("--hard failed", true, &stub, vec![repo_in_place(), FakeReply::exit(1, "fatal: couldn't find remote ref main")], "1 pod(s) failed to switch branch"),
+            ("gentle refused", false, &stub, vec![repo_in_place(), refused], "1 pod(s) failed to switch branch"),
+        ];
+        for (case, hard, rsync, after, want) in cases {
+            let cfg = cfg_at(rsync);
+            let (week, day) = resolve_week_day(&cfg, None, None).unwrap();
+            let apple_init = (init_branch_command(&BackupConfig::from_config(&cfg, week, day), "devtest-apple"), Some(BRANCH_TIMEOUT));
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [pushed(), FakeReply::ok(), FakeReply::stdout("SKIP main\n"), FakeReply::ok()]);
+            fake.script(&host(22002), std::iter::once(busy_merge("autocommit-b")).chain(after).collect::<Vec<_>>());
+            let _ = crate::take_said();
+            let how = SetBranchRun { branch: "main", hard, dry_run: false, yes: true, init_branches: true };
+            let err = set_branch_and_init(fake.clone(), &cfg, &everyone(&fleet_of(&[("apple", 22001), ("bloom", 22002)])), &how, &rsync.path())
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), want, "{case}");
+            assert!(!execs(&fake, 22002).iter().any(|(c, _)| c.contains("git checkout -b")), "{case}: bloom init'd");
+            let apple = execs(&fake, 22001);
+            assert_eq!((apple.len(), apple.last()), (4, Some(&apple_init)), "{case}: apple switched, then init'd");
+            let said = crate::take_said();
+            assert!(said.iter().any(|l| l == left_out), "{case}: {said:#?}");
+            assert!(!said.iter().any(|l| l.starts_with("⚠ ") && l.contains("had work no backup had saved")), "{case}");
+        }
+        // Nobody switched: no init at all, said.
+        let cfg = cfg_at(&failing);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place()]);
+        let how = SetBranchRun { branch: "main", hard: true, dry_run: false, yes: true, init_branches: true };
+        let err = set_branch_and_init(fake.clone(), &cfg, &everyone(&fleet_of(&[("bloom", 22002)])), &how, &failing.path()).await.unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) NOT switched — each one's line says why: devtest-bloom");
+        assert_eq!(execs(&fake, 22002).len(), 2, "its backup and the copy's probe, nothing more");
+        assert!(crate::take_said().iter().any(|l| l == "init-branches NOT run: no pod switched"));
+    }
+
+    /// Review pr4: a pod whose push failed for an ordinary reason — the network, a non-fast-forward,
+    /// GitHub's push protection — was copied and switched like the rest, yet `set-branch main
+    /// --hard --init-branches` then skipped the init for the whole fleet, leaving every pod on main
+    /// where no backup commits (the */15 cron SKIPs them all). Now every pod that switched is
+    /// init'd, the copied one too; the run still fails after the init, naming that pod.
+    #[tokio::test]
+    async fn init_branches_runs_on_every_switched_pod_even_one_copied_after_a_failed_push() {
+        use super::{resolve_week_day, set_branch_and_init, SetBranchRun};
+        let stub = StubRsync::new("chain-pushfail");
+        let cfg = cfg_at(&stub);
+        let (week, day) = resolve_week_day(&cfg, None, None).unwrap();
+        let bcfg = BackupConfig::from_config(&cfg, week, day);
+        let pushed = |b: &str| FakeReply::stdout(&format!("BRANCH {b}\nPUSHED {b}\n"));
+        let on_main = || FakeReply::stdout("SKIP main\n");
+        let push_failed = |stderr: &str| FakeReply::exit(1, stderr).with_stdout("BRANCH autocommit-b\nPUSH_FAILED\n");
+        let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None), Some(BACKUP_TIMEOUT));
+        let hard = (checkout_command(REPO, "main", Some(KEY), true), Some(BRANCH_TIMEOUT));
+        let init = |name: &str| (init_branch_command(&bcfg, &format!("devtest-{name}")), Some(BRANCH_TIMEOUT));
+        let probe = (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT));
+        let failures = [
+            ("network", push_failed("ssh: connect to host github.com port 22: Connection timed out\nfatal: Could not read from remote repository.")),
+            ("non-fast-forward", push_failed(" ! [rejected]        autocommit-b -> autocommit-b (fetch first)\nerror: failed to push some refs")),
+            ("push protection", push_blocked("autocommit-b")),
+        ];
+        for (case, failed) in failures {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [pushed("autocommit-a"), FakeReply::ok(), on_main(), FakeReply::ok()]);
+            fake.script(&host(22002), [failed, repo_in_place(), FakeReply::ok(), on_main(), FakeReply::ok()]);
+            fake.script(&host(22003), [pushed("autocommit-c"), FakeReply::ok(), on_main(), FakeReply::ok()]);
+            let _ = crate::take_said();
+            let how = SetBranchRun { branch: "main", hard: true, dry_run: false, yes: true, init_branches: true };
+            let err = set_branch_and_init(fake.clone(), &cfg, &everyone(&fleet()), &how, &stub.path()).await.unwrap_err();
+            assert_eq!(err.to_string(), "1 pod(s) switched with their branch copied, not pushed (see each one's line): devtest-bloom", "{case}");
+            assert_eq!(execs(&fake, 22002), [backup("bloom"), probe.clone(), hard.clone(), backup("bloom"), init("bloom")], "{case}");
+            for (name, port) in [("apple", 22001), ("cloud", 22003)] {
+                assert_eq!(execs(&fake, port), [backup(name), hard.clone(), backup(name), init(name)], "{case}: {name}");
+            }
+            assert!(stub.take().iter().all(|d| d.ends_with("/devtest-bloom")), "{case}: only bloom copied");
+            let said = unnumbered(&crate::take_said());
+            assert!(said.iter().any(|l| l.starts_with("✓ devtest-bloom (on main) — ⚠ NOT PUSHED FIRST: branch autocommit-b (")), "{case}: {said:#?}");
+            for name in ["apple", "bloom", "cloud"] {
+                let line = format!("✓ devtest-{name} -> {}", bcfg.branch_for(&format!("devtest-{name}")));
+                assert!(said.contains(&line), "{case}: {line}: {said:#?}");
+            }
+            assert!(!said.iter().any(|l| l.starts_with("init-branches")), "{case}: nobody left out");
+        }
+        // An init that fails too: both said, set-branch's first.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [push_blocked("autocommit-b"), repo_in_place(), FakeReply::ok(), on_main(), FakeReply::exit(1, "fatal: the remote end hung up")]);
+        let how = SetBranchRun { branch: "main", hard: true, dry_run: false, yes: true, init_branches: true };
+        let err = set_branch_and_init(fake.clone(), &cfg, &everyone(&fleet_of(&[("bloom", 22002)])), &how, &stub.path()).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "1 pod(s) switched with their branch copied, not pushed (see each one's line): devtest-bloom; then init-branches: 1 \
+             pod(s) failed to init branch"
+        );
+    }
+
+    /// Review fb2 F3: a pod on main — where no backup commits — with a merge in progress or
+    /// changes to tracked files was reset by `set-branch --hard` with no copy (its backup said
+    /// only SKIP). Now its backup says so (`UNCOMMITTED`) and `--hard` copies it first, then
+    /// switches it — its line saying what the copy holds, not a failure — and doesn't reset it if
+    /// the copy fails. A clean pod on main isn't copied; the gentle switch and `pods backup`
+    /// copy none of them, as before.
+    #[tokio::test]
+    async fn hard_copies_a_pod_on_main_with_uncommitted_work_before_resetting_it() {
+        let stub = StubRsync::new("main-dirty");
+        let cfg = cfg_at(&stub);
+        let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None), Some(BACKUP_TIMEOUT));
+        let probe = (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT));
+        let dirty = || FakeReply::stdout("UNCOMMITTED main changes\nSKIP main\n");
+        let merging = || FakeReply::stdout("UNCOMMITTED main merge unmerged\nSKIP main\n");
+        let clean = || FakeReply::stdout("SKIP main\n");
+        let script = |fake: &FakeRemote| {
+            fake.script(&host(22001), [dirty(), repo_in_place(), FakeReply::stdout(SAVED_BLOOM)]);
+            fake.script(&host(22002), [clean(), FakeReply::ok()]);
+            fake.script(&host(22003), [merging(), repo_in_place(), FakeReply::ok()]);
+        };
+        let fake = Arc::new(FakeRemote::new());
+        script(&fake);
+        let _ = crate::take_said();
+        handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &stub.path()).await.unwrap();
+        let hard = (checkout_command(REPO, "main", Some(KEY), true), Some(BRANCH_TIMEOUT));
+        assert_eq!(execs(&fake, 22001), [backup("apple"), probe.clone(), hard.clone()]);
+        assert_eq!(execs(&fake, 22002), [backup("bloom"), hard.clone()], "clean: not copied");
+        assert_eq!(execs(&fake, 22003), [backup("cloud"), probe.clone(), hard.clone()]);
+        let copied = stub.take();
+        assert!(!copied.is_empty() && copied.iter().all(|d| d.ends_with("/devtest-apple") || d.ends_with("/devtest-cloud")), "{copied:?}");
+        let said = unnumbered(&crate::take_said());
+        let line = |pod: &str| said.iter().find(|l| l.starts_with(&format!("✓ {pod} (on main)"))).cloned().unwrap_or_else(|| panic!("{said:#?}"));
+        let reflog = "the --hard reset moves main to origin's, and its unpushed commits stay on the pod under refs/arena-discarded/<time>-main";
+        let apple = line("devtest-apple");
+        assert!(
+            apple.starts_with(
+                "✓ devtest-apple (on main) — ⚠ NOT COMMITTED FIRST: main has uncommitted changes to tracked files, and no backup \
+                 commits on main; its files were copied to "
+            ) && apple.ends_with(&format!(
+                " first, and the --hard switch discards them; {reflog} — what it discarded was saved to \
+                 .git/arena-discarded/20261019T090102Z/ on the pod first (its README says how to get it back)"
+            )),
+            "{apple}"
+        );
+        let cloud = line("devtest-cloud");
+        assert!(
+            cloud.starts_with("✓ devtest-cloud (on main) — ⚠ NOT COMMITTED FIRST: a merge is in progress on main, and no backup commits on main; ")
+                && cloud.contains(" first, and the --hard switch ends the merge and discards its uncommitted changes to tracked files"),
+            "{cloud}"
+        );
+        assert_eq!(line("devtest-bloom"), "✓ devtest-bloom (on main)");
+        assert!(said.iter().any(|l| l.starts_with("⚠ 2 pod(s) had work no backup had saved") && l.ends_with(": devtest-apple, devtest-cloud")), "{said:#?}");
+
+        // The copy fails: not reset.
+        let failing = StubRsync::new("main-dirty-copyfail");
+        arena_core::remote::write_test_script(
+            failing.0.join("rsync"),
+            "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
+             echo 'rsync: No space left on device (28)' >&2; exit 11\n",
+        )
+        .unwrap();
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [dirty(), repo_in_place(), FakeReply::ok()]);
+        let err = handle_set_branch(fake.clone(), &cfg_at(&failing), "main", &everyone(&fleet_of(&[("apple", 22001)])), true, false, true, &failing.path())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) NOT switched — each one's line says why: devtest-apple");
+        assert_eq!(execs(&fake, 22001), [backup("apple"), probe], "never reset");
+        let said = crate::take_said();
+        assert!(
+            said.iter().any(|l| l.starts_with(
+                "✗ devtest-apple not switched: its work couldn't be committed (main has uncommitted changes to tracked files — no \
+                 backup commits on main) and copying its files into "
+            )),
+            "{said:#?}"
+        );
+
+        // Gentle: nothing discarded, nothing copied.
+        let fake = Arc::new(FakeRemote::new());
+        script(&fake);
+        handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), false, false, true, &stub.path()).await.unwrap();
+        let gentle = (checkout_command(REPO, "main", Some(KEY), false), Some(BRANCH_TIMEOUT));
+        for (name, port) in [("apple", 22001), ("bloom", 22002), ("cloud", 22003)] {
+            assert_eq!(execs(&fake, port), [backup(name), gentle.clone()], "{name}");
+        }
+        assert!(stub.take().is_empty());
+
+        // `pods backup --no-pull` (the cron's): skipped as always — no copy, no failure.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [dirty()]);
+        fake.script(&host(22003), [merging()]);
+        fake.script(&host(22002), [clean()]);
+        handle_full_backup(fake.clone(), &cfg, &everyone(&fleet()), true, None, false, true, &stub.path()).await.unwrap();
+        assert!(stub.take().is_empty());
+        for port in [22001, 22002, 22003] {
+            assert_eq!(execs(&fake, port).len(), 1, "{port}: its backup only");
+        }
+    }
+
+    /// Review pr4: on a branch no backup commits, commits no remote has and untracked files —
+    /// `UNCOMMITTED main commits`, `UNCOMMITTED HEAD untracked` — are copied before `--hard` as
+    /// changes are, `.git` and all, each pod's line saying what the copy holds (the commits are
+    /// pushed nowhere, so NOT PUSHED; an untracked file is overwritten where origin's branch tracks
+    /// it); switched, not failures. A clean pod isn't copied, and the gentle switch copies none.
+    #[tokio::test]
+    async fn hard_copies_a_pod_on_main_with_commits_or_untracked_files_first() {
+        let stub = StubRsync::new("main-commits");
+        let cfg = cfg_at(&stub);
+        let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None), Some(BACKUP_TIMEOUT));
+        let probe = (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT));
+        let script = |fake: &FakeRemote| {
+            fake.script(&host(22001), [FakeReply::stdout("UNCOMMITTED main commits\nSKIP main\n"), repo_in_place(), FakeReply::ok()]);
+            fake.script(&host(22002), [FakeReply::stdout("SKIP main\n"), FakeReply::ok()]);
+            fake.script(&host(22003), [FakeReply::stdout("UNCOMMITTED HEAD untracked\nSKIP HEAD\n"), repo_in_place(), FakeReply::ok()]);
+        };
+        let fake = Arc::new(FakeRemote::new());
+        script(&fake);
+        let _ = crate::take_said();
+        handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &stub.path()).await.unwrap();
+        let hard = (checkout_command(REPO, "main", Some(KEY), true), Some(BRANCH_TIMEOUT));
+        assert_eq!(execs(&fake, 22001), [backup("apple"), probe.clone(), hard.clone()]);
+        assert_eq!(execs(&fake, 22002), [backup("bloom"), hard.clone()], "clean: not copied");
+        assert_eq!(execs(&fake, 22003), [backup("cloud"), probe, hard]);
+        let copied = stub.take();
+        assert!(!copied.is_empty() && copied.iter().all(|d| d.ends_with("/devtest-apple") || d.ends_with("/devtest-cloud")), "{copied:?}");
+        let said = unnumbered(&crate::take_said());
+        let line = |pod: &str| said.iter().find(|l| l.starts_with(&format!("✓ {pod} (on main)"))).cloned().unwrap_or_else(|| panic!("{said:#?}"));
+        let apple = line("devtest-apple");
+        assert!(
+            apple.starts_with(
+                "✓ devtest-apple (on main) — ⚠ NOT PUSHED FIRST: main has commits no remote has, and no backup pushes main; its \
+                 files were copied to "
+            ) && apple.ends_with(
+                " first, and that copy has its .git, those commits with it; the --hard reset moves main to origin's, and its \
+                 unpushed commits stay on the pod under refs/arena-discarded/<time>-main"
+            ),
+            "{apple}"
+        );
+        let cloud = line("devtest-cloud");
+        assert!(
+            cloud.starts_with(
+                "✓ devtest-cloud (on main) — ⚠ NOT COMMITTED FIRST: a detached HEAD has untracked files, and no backup commits on \
+                 a detached HEAD; its files were copied to "
+            ) && cloud.ends_with(
+                " first, and the --hard switch overwrites any of them origin/main tracks; the commits of its detached HEAD stay \
+                 on the pod under refs/arena-discarded/<time>"
+            ),
+            "{cloud}"
+        );
+        assert_eq!(line("devtest-bloom"), "✓ devtest-bloom (on main)");
+        assert!(said.iter().any(|l| l.starts_with("⚠ 2 pod(s) had work no backup had saved") && l.ends_with(": devtest-apple, devtest-cloud")), "{said:#?}");
+        // Gentle: nothing discarded or overwritten (git refuses to), nothing copied.
+        let fake = Arc::new(FakeRemote::new());
+        script(&fake);
+        handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), false, false, true, &stub.path()).await.unwrap();
+        let gentle = (checkout_command(REPO, "main", Some(KEY), false), Some(BRANCH_TIMEOUT));
+        for (name, port) in [("apple", 22001), ("bloom", 22002), ("cloud", 22003)] {
+            assert_eq!(execs(&fake, port), [backup(name), gentle.clone()], "{name}");
+        }
+        assert!(stub.take().is_empty());
     }
 
     /// A [`Remote`] that, at every call, notes whether the pod's backup lock was held right then
@@ -21268,8 +23780,7 @@ mod remote_tests {
         async fn exec(&self, t: &SshTarget, cmd: &str, timeout: Option<Duration>) -> Result<arena_core::ssh::SshOutput> {
             let pod = fleet().pods.into_iter().find(|p| p.ssh_port == Some(t.port)).map(|p| p.name).unwrap();
             let f = arena_core::pull::open_pod_lock(&self.dir, &pod).unwrap();
-            let free = arena_core::pull::try_lock(&f).unwrap();
-            drop(f);
+            let free = arena_core::pull::try_lock(f).unwrap().is_ok();
             self.seen.lock().unwrap().push((t.port, !free));
             self.inner.exec(t, cmd, timeout).await
         }
@@ -21290,7 +23801,7 @@ mod remote_tests {
     #[tokio::test]
     async fn set_branch_never_switches_a_pod_with_neither_a_push_nor_a_copy_and_holds_each_lock_through_its_switch() {
         let failing = StubRsync::new("setbranch-copyfail");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             failing.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
              case \"$last\" in *devtest-bloom*) echo 'rsync: No space left on device (28)' >&2; exit 11;; esac\n",
@@ -21308,7 +23819,7 @@ mod remote_tests {
         let probe = Arc::new(LockProbe { inner: fake.clone(), dir: base.display().to_string(), seen: Default::default() });
         let err = handle_set_branch(probe.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &failing.path()).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.starts_with("2 pod(s) NOT switched — their branch could be neither pushed nor copied first"), "{msg}");
+        assert!(msg.starts_with("2 pod(s) NOT switched — each one's line says why: "), "{msg}");
         assert!(msg.contains("devtest-bloom") && msg.contains("devtest-cloud") && !msg.contains("devtest-apple"), "{msg}");
         let hard = checkout_command(REPO, "main", Some(KEY), true);
         let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None), Some(BACKUP_TIMEOUT));
@@ -21323,7 +23834,7 @@ mod remote_tests {
         assert_eq!(probe.held(22003), [true]);
         for pod in ["devtest-apple", "devtest-bloom", "devtest-cloud"] {
             let f = arena_core::pull::open_pod_lock(&base.display().to_string(), pod).unwrap();
-            assert!(crate::lock_settles_free(&f), "{pod}'s lock still held after the run");
+            assert!(crate::lock_settles_free(f), "{pod}'s lock still held after the run");
         }
     }
 
@@ -21336,13 +23847,12 @@ mod remote_tests {
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = backup_cfg(&dir);
         let d = dir.display().to_string();
-        let held = arena_core::pull::open_pod_lock(&d, "devtest-bloom").unwrap();
-        assert!(arena_core::pull::try_lock(&held).unwrap());
+        let held = arena_core::pull::try_lock(arena_core::pull::open_pod_lock(&d, "devtest-bloom").unwrap()).unwrap().expect("free");
         let fake = Arc::new(FakeRemote::new());
         let err = handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, "rsync").await.unwrap_err();
         assert_eq!(
             err.to_string(),
-            "1 pod(s) NOT switched — their branch could be neither pushed nor copied first (see each one's line): devtest-bloom"
+            "1 pod(s) NOT switched — each one's line says why: devtest-bloom"
         );
         assert!(fake.calls_to(&host(22002)).is_empty(), "bloom touched: {:?}", fake.calls_to(&host(22002)));
         let hard = checkout_command(REPO, "main", Some(KEY), true);
@@ -21380,7 +23890,7 @@ mod remote_tests {
         ];
         let names = vec!["devtest-apple".to_string()];
         for (cfg, line) in &cases {
-            let note = push_first_note(cfg);
+            let note = push_first_note(cfg, false);
             let dir = local_backup_dir(cfg);
             match line {
                 Some(line) => {
@@ -21412,6 +23922,35 @@ mod remote_tests {
         let said = take_said();
         assert!(!said.iter().any(|l| l.contains("no per-pod backup locks")), "{said:#?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review F5: the dry run said every pod whose push fails "is copied … and then switched" — a
+    /// pod mid-merge is copied, then the gentle switch (and init-branches) refuses to end the
+    /// merge, while `--hard` ends it, discarding its uncommitted changes to tracked files only.
+    /// Each note says which.
+    #[test]
+    fn the_dry_runs_note_says_what_becomes_of_a_pod_mid_merge() {
+        let gentle = push_first_note(&cfg(), false);
+        assert!(
+            gentle.contains(
+                "; a pod with a merge (cherry-pick, revert, `git am`, rebase, conflicts) in progress can't be committed: it is \
+                 copied into ./backup too, and then NOT switched: the switch refuses to end it; a pod that can be neither pushed \
+                 nor copied"
+            ),
+            "{gentle}"
+        );
+        let hard = push_first_note(&cfg(), true);
+        assert!(
+            hard.contains(
+                "it is copied into ./backup too, and the --hard switch then ends it, discarding its uncommitted changes to tracked \
+                 files; so is a pod on main/master or a detached HEAD, which no backup commits, with an operation in progress, \
+                 changes to tracked files, commits no remote has or untracked files (the --hard switch overwrites any the new \
+                 branch tracks); on every pod, what the --hard reset discards is saved there first, in \
+                 .git/arena-discarded/<time>/; "
+            ),
+            "{hard}"
+        );
+        assert!(!hard.contains("refuses") && !hard.contains("untracked files stay"), "{hard}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -21485,6 +24024,26 @@ mod remote_tests {
             "{said:#?}"
         );
         assert!(init_branch_command(&BackupConfig::from_config(&cfg(), 1, 2), "devtest-apple").contains("unredacted_restore "));
+    }
+
+    /// Review claude #2 (FIX9B item 2): init-branches no longer pushes commits origin doesn't have
+    /// (no backup has scanned them). Its line says so, and that the next backup scans and pushes
+    /// them — the run still succeeds: the day's branch is made and on origin.
+    #[tokio::test(start_paused = true)]
+    async fn init_branches_says_what_it_left_for_the_next_backup() {
+        let fake = Arc::new(FakeRemote::new());
+        let at = "89abcdef0123456789abcdef0123456789abcdef";
+        fake.script(&host(22001), [FakeReply::stdout("SKIP main\n"), FakeReply::stdout(&format!("Switched to a new branch 'x'\nUNPUSHED 2 {at}\n"))]);
+        take_said();
+        handle_init_branches(fake.clone(), &cfg(), Some(1), Some(2), &everyone(&fleet_of(&[("apple", 22001)])), false, true, "rsync").await.unwrap();
+        let said = take_said();
+        assert!(
+            said.iter().any(|l| l
+                == "[1/1] ✓ devtest-apple -> autocommit-devtest-w1d2-apple — 2 commit(s) origin doesn't have stay on it on the pod, \
+                    unpushed (the branch went to origin at 89abcdef01, the newest commit origin has): the next backup scans them for \
+                    keys and pushes them"),
+            "{said:#?}"
+        );
     }
 
     /// A local file to copy, removed on drop.
@@ -21762,7 +24321,7 @@ mod remote_tests {
         // push (to `user@host:`) exits `push`.
         let stub = |name: &str, size: &str, push: u8| {
             let path = root.join(name);
-            std::fs::write(
+            arena_core::remote::write_test_script(
                 &path,
                 format!(
                     "#!/bin/sh\ndry=; for a in \"$@\"; do last=$a; [ \"$a\" = --dry-run ] && dry=1; done\n\
@@ -21772,7 +24331,6 @@ mod remote_tests {
                 ),
             )
             .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path.display().to_string()
         };
         let (free, total) = arena_core::replica::disk_space(&root).unwrap();
@@ -22454,8 +25012,8 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
     /// pods it left out and the cohort pods it found on main (spec items 2 and 3).
     mod cohort_scope {
         use super::super::{
-            non_cohort_line, on_protected_line, on_protected_lines, resolve_week_day, restored_note, set_branch_reminder,
-            split_cohort, take_said,
+            cohort_only, non_cohort_line, on_protected_line, on_protected_lines, resolve_week_day, restored_note,
+            set_branch_reminder, split_cohort, take_said, Cli, Cmd, CohortScope, PodCmd,
         };
         use super::*;
 
@@ -22492,7 +25050,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         /// The cohort's three; the line for the other four (in selection order: list slot, then name).
         const COHORT_PORTS: [u16; 3] = [22001, 22002, 22003];
         const LEFT_OUT: &str = "⊘ skipped 4 non-cohort pods (not devtest-…, or an @ staff entry): \
-            devtest-zebra, staff-gpu, devtest2-apple, quiet_blue_fox — name one to include it";
+            devtest-zebra, staff-gpu, devtest2-apple, quiet_blue_fox — name one to include it, or pass --include-non-cohort";
         /// What a branch switch says first with [`account_cfg`]'s legacy `./backup` (no locks).
         const NO_LOCKS: &str = "(no per-pod backup locks: LOCAL_BACKUP_DIR (./backup) is relative — set an absolute path to keep \
             other backups out during the switch)";
@@ -22539,6 +25097,40 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             assert_eq!(split_cohort(&naming, Selected::all(vec![nameless])).1, ["id-x"]);
         }
 
+        /// The human (2026-10-19): fleet-wide = cohort pods only, with a way to take the others
+        /// too. `--include-non-cohort` parses on all four commands, and with it the selection
+        /// comes back whole and nothing is said; without it, the cohort's and the one line.
+        #[test]
+        fn include_non_cohort_takes_every_pod_and_says_nothing() {
+            let scope = |argv: &[&str]| -> CohortScope {
+                use clap::Parser;
+                let cli = Cli::try_parse_from(["arena", "pods"].iter().chain(argv).copied()).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                match cli.cmd {
+                    Cmd::Pods(PodCmd::Backup { cohort, .. })
+                    | Cmd::Pods(PodCmd::Pull { cohort, .. })
+                    | Cmd::Pods(PodCmd::InitBranches { cohort, .. })
+                    | Cmd::Pods(PodCmd::SetBranch { cohort, .. }) => cohort,
+                    _ => panic!("{argv:?}: not a backup command"),
+                }
+            };
+            for argv in [&["backup"][..], &["pull"], &["init-branches"], &["set-branch", "main", "--all"]] {
+                assert!(!scope(argv).include_non_cohort, "{argv:?}: off by default");
+                let with = [argv, &["--include-non-cohort"]].concat();
+                assert!(scope(&with).include_non_cohort, "{with:?}");
+            }
+            let cfg = account_cfg("");
+            let every = || Selected::all(account().pods);
+            let _ = take_said();
+            let sel = cohort_only(&cfg, every(), CohortScope { include_non_cohort: true });
+            assert_eq!(names(&sel), names(&every()), "every pod, in order");
+            assert!(take_said().is_empty(), "nothing left out, nothing said");
+            let sel = cohort_only(&cfg, every(), CohortScope::default());
+            assert_eq!(names(&sel), ["devtest-apple", "devtest-bloom", "devtest-extra"]);
+            // (In fleet order here: `select` orders a real run's by list slot, as LEFT_OUT has it.)
+            let out = ["devtest-zebra", "staff-gpu", "quiet_blue_fox", "devtest2-apple"].map(String::from);
+            assert_eq!(take_said(), [non_cohort_line("devtest", &out).unwrap()]);
+        }
+
         #[test]
         fn the_left_out_pods_get_one_line() {
             let many: Vec<String> = (1..=8).map(|i| format!("box{i}")).collect();
@@ -22546,17 +25138,17 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
                 (&[], None),
                 (
                     &many[..1],
-                    Some("⊘ skipped 1 non-cohort pod (not devtest-…, or an @ staff entry): box1 — name one to include it"),
+                    Some("⊘ skipped 1 non-cohort pod (not devtest-…, or an @ staff entry): box1 — name one to include it, or pass --include-non-cohort"),
                 ),
                 (
                     &many[..2],
-                    Some("⊘ skipped 2 non-cohort pods (not devtest-…, or an @ staff entry): box1, box2 — name one to include it"),
+                    Some("⊘ skipped 2 non-cohort pods (not devtest-…, or an @ staff entry): box1, box2 — name one to include it, or pass --include-non-cohort"),
                 ),
                 (
                     &many,
                     Some(
                         "⊘ skipped 8 non-cohort pods (not devtest-…, or an @ staff entry): box1, box2, box3, box4, box5, box6 \
-                         (+2 more) — name one to include it",
+                         (+2 more) — name one to include it, or pass --include-non-cohort",
                     ),
                 ),
             ];
@@ -22690,6 +25282,75 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             take_said();
         }
 
+        /// Review (fb2 R8): each of the four commands passes `--include-non-cohort` through. Without
+        /// it the ⊘ line is said (the rest left out); with it nothing is left out, so nothing is said —
+        /// and `backup` reaches every pod. (`pull` and the switches as dry runs: no rsync, no switch.)
+        #[tokio::test(start_paused = true)]
+        async fn include_non_cohort_reaches_every_pod_through_each_command() {
+            let cfg = account_cfg("");
+            take_said();
+            let runs: &[&[&str]] = &[
+                &["backup", "--no-pull"],
+                &["pull", "--label", "w1d2", "--dry-run"],
+                &["init-branches", "--week", "1", "--day", "2", "--dry-run"],
+                &["set-branch", "main", "--all", "--dry-run"],
+            ];
+            for argv in runs {
+                let fake = Arc::new(FakeRemote::new());
+                handle_pods(pods(argv), &account(), fake.clone(), &cfg, true).await.unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                assert!(take_said().iter().any(|l| l == LEFT_OUT), "{argv:?}: the default leaves them out");
+                let with = [*argv, &["--include-non-cohort"]].concat();
+                let fake = Arc::new(FakeRemote::new());
+                handle_pods(pods(&with), &account(), fake.clone(), &cfg, true).await.unwrap_or_else(|e| panic!("{with:?}: {e}"));
+                assert!(!take_said().iter().any(|l| l.starts_with("⊘ skipped")), "{with:?}: nothing left out");
+                if argv[0] == "backup" {
+                    assert_eq!(ports(&fake), [22001, 22002, 22003, 22004, 22005, 22006, 22007], "{with:?}");
+                }
+            }
+        }
+
+        /// Review ai-review claude #5: `--include-non-cohort` takes every pod on the account — fine
+        /// for a pull, but `set-branch --all --hard` with it reset the staff boxes and the other
+        /// cohort's pods too, with nothing in the way. Now that is refused before a pod is listed or
+        /// touched (a dry run too, and with --init-branches), saying why; pods named outright (the
+        /// flag then changes nothing), a gentle switch, and `--hard` on this cohort go on.
+        #[tokio::test(start_paused = true)]
+        async fn hard_with_include_non_cohort_is_refused_unless_the_pods_are_named() {
+            use super::super::hard_non_cohort_refusal;
+            const REFUSED: &str = "set-branch --hard with --include-non-cohort refused: that takes every pod on the account, so \
+                --hard would reset staff boxes and other cohorts' pods too, discarding their uncommitted work — name the pods to \
+                reset (`arena pods set-branch <branch> <pod>... --hard`), or leave --include-non-cohort out to reset this cohort's";
+            let cfg = account_cfg("");
+            take_said();
+            for argv in [
+                &["set-branch", "main", "--all", "--hard", "--include-non-cohort"][..],
+                &["set-branch", "main", "all", "--hard", "--include-non-cohort", "--dry-run"],
+                &["set-branch", "main", "--all", "--hard", "--include-non-cohort", "--init-branches"],
+                &["set-branch", "main", "--all", "--exclude", "staff-gpu", "--hard", "--include-non-cohort"],
+            ] {
+                let fake = Arc::new(FakeRemote::new());
+                let err = handle_pods(pods(argv), &account(), fake.clone(), &cfg, true).await.unwrap_err();
+                assert_eq!(err.to_string(), REFUSED, "{argv:?}");
+                assert!(fake.calls().is_empty() && take_said().is_empty(), "{argv:?}: nothing touched or said");
+            }
+            // Named pods (a staff box, another cohort's): exactly those, the flag or not.
+            for argv in [
+                &["set-branch", "main", "@staff-gpu", "devtest2-apple", "--hard", "--include-non-cohort", "--dry-run"][..],
+                // Gentle, fleet-wide: every pod, as before; --hard on this cohort's: as before.
+                &["set-branch", "main", "--all", "--include-non-cohort", "--dry-run"],
+                &["set-branch", "main", "--all", "--hard", "--dry-run"],
+            ] {
+                let fake = Arc::new(FakeRemote::new());
+                handle_pods(pods(argv), &account(), fake.clone(), &cfg, true).await.unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            }
+            take_said();
+            let on = CohortScope { include_non_cohort: true };
+            assert_eq!(hard_non_cohort_refusal(true, on, false).as_deref(), Some(REFUSED));
+            for (hard, scope, named) in [(true, on, true), (false, on, false), (true, CohortScope::default(), false)] {
+                assert_eq!(hard_non_cohort_refusal(hard, scope, named), None, "{hard} {scope:?} {named}");
+            }
+        }
+
         #[tokio::test(start_paused = true)]
         async fn backup_says_once_which_cohort_pods_sit_on_main_and_still_exits_zero() {
             let cfg = account_cfg("");
@@ -22788,7 +25449,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         }
 
         #[tokio::test(start_paused = true)]
-        async fn set_branch_init_branches_inits_the_same_pods_once_every_one_has_switched() {
+        async fn set_branch_init_branches_inits_the_pods_that_switched() {
             let cfg = account_cfg("ARENA_START_DATE=2026-10-05\n");
             let (week, day) = resolve_week_day(&cfg, None, None).unwrap();
             let bcfg = BackupConfig::from_config(&cfg, week, day);
@@ -22809,14 +25470,19 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
                 );
             }
             take_said();
-            // A failed switch: no pod gets a day branch (the operator re-runs once all are on main).
+            // A failed switch: that pod gets no day branch — it isn't on main — the others do, and the
+            // run fails naming it (review pr4: one failed pod used to keep every pod on main).
             let fake = Arc::new(FakeRemote::new());
             fake.script(&host(22002), [FakeReply::ok(), FakeReply::exit(1, "fatal: unable to access")]);
             let err = handle_pods(pods(&["set-branch", "main", "--all", "--hard", "--init-branches"]), &account(), fake.clone(), &cfg, true)
                 .await
                 .unwrap_err();
             assert_eq!(err.to_string(), "1 pod(s) failed to switch branch");
-            assert!(COHORT_PORTS.iter().all(|&p| execs(&fake, p).len() == 2), "its backup and the switch, no init: {:?}", fake.calls());
+            assert_eq!(execs(&fake, 22002).len(), 2, "bloom: its backup and the switch, no init: {:?}", fake.calls());
+            for (name, port) in [("devtest-apple", 22001), ("devtest-extra", 22003)] {
+                let init = (init_branch_command(&bcfg, name), Some(BRANCH_TIMEOUT));
+                assert_eq!(execs(&fake, port).last(), Some(&init), "{name}: init'd");
+            }
             // No start date to name the day: refused before any pod is switched.
             let fake = Arc::new(FakeRemote::new());
             let err = handle_pods(pods(&["set-branch", "main", "--all", "--hard", "--init-branches"]), &account(), fake.clone(), &account_cfg(""), true)
@@ -23044,7 +25710,7 @@ mod lifecycle_tests {
         fn lock_support(&self, pod: &Pod) -> Result<()> {
             match pod.provider.as_str() {
                 "runpod" => Ok(()),
-                other => Err(Error::NotImplemented(format!("not supported on {other} — only RunPod pods can be locked, with RUNPOD_API=v2"))),
+                other => Err(Error::NotImplemented(format!("not supported on {other} — only RunPod pods can be locked (on RunPod REST v2, the default)"))),
             }
         }
         async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {

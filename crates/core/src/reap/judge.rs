@@ -172,7 +172,8 @@ pub enum Listed<'a> {
 /// The run's context for [`pre_ssh_gate`].
 pub struct GateCtx<'a> {
     pub naming: &'a Naming<'a>,
-    /// `RUNPOD_API=v2`: RunPod reports its lock (on v1 it's unknown — no RunPod pod is reapable).
+    /// RunPod on REST v2 (the default): it reports its lock (on an explicit `RUNPOD_API=v1`
+    /// it's unknown — no RunPod pod is reapable).
     pub runpod_v2: bool,
     pub pins: &'a [Pin],
     /// Every pod of every provider that listed fine (for the duplicate / twin check).

@@ -8,7 +8,11 @@
 #                              none): checked first, before the SKIP; nothing committed or pushed (exit 5).
 #                              The URL is printed with any credentials taken out.
 #   SKIP <branch>              on main/master/a detached HEAD: nothing done (exit 0)
-#   NO_CHANGES <branch>        clean tree and HEAD == its upstream: nothing to push (exit 0)
+#   UNCOMMITTED <branch> <what> [unmerged]  before a SKIP, when the checkout has work no backup
+#                              saves there (what a `set-branch --hard` copies first, .git and all):
+#                              <what> is the first of BUSY's word, `changes` (to tracked files),
+#                              `commits` (that no remote has), `untracked` (files not ignored)
+#   NO_CHANGES <branch>        clean tree and HEAD == origin's <branch>: nothing to push (exit 0)
 #   PUSHED <branch>            committed what there was and/or pushed unpushed commits (exit 0)
 #   BIGSKIP <bytes> <path>     a file over <max file bytes>, kept out of the commit (stays on disk)
 #   NESTED_ADOPTED <path>      a nested clone whose files this repo now tracks (its .git untouched)
@@ -16,15 +20,32 @@
 #   BIGSTUCK <bytes> <path>    a file over <push limit bytes> already in unpushed commits (exit 3)
 #   BIGSTUCK_BASE <sha>|none   what `git reset` to, to rewrite those commits without it
 #   BRANCH <branch>            the branch it backs up (before anything else, unless SKIP)
+#   BUSY <branch> <what> [unmerged]  an operation is in progress on it — <what> is rebase, am, merge,
+#                              cherry-pick, revert, sequence (a multi-commit cherry-pick or revert paused
+#                              between commits), or conflicts (unmerged paths with none of those: a `git
+#                              stash pop` that conflicted); `unmerged` after an operation while some of its
+#                              conflicts aren't resolved and added yet: nothing staged, committed or
+#                              pushed, so it stays resumable and abortable (exit 6)
 #   REDACTED <n> <path>        a file committed with its n key(s) redacted; the file on disk keeps them
-#   REDACTED_HISTORY <n> <old> <new>  a key in older unpushed commits (an earlier backup's, or one the
-#                              participant made): those n commits rewritten redacted, pushed as a fast-forward
+#   REDACTED_HISTORY <n> <old> <new>  a key in older unpushed commits, in a file or a commit message (an
+#                              earlier backup's, or one the participant made): those n commits rewritten
+#                              redacted, pushed as a fast-forward
 #   HEAL_ABORTED <why>         that rewrite stopped short (the branch moved meanwhile): the next run ends it (exit 1)
 #   PUSH_BLOCKED <reason>      GitHub's push protection still refuses the push — a secret the redaction
-#                              doesn't know; the reason names GitHub's secret type and path:line (exit 4)
+#                              doesn't know; the reason names GitHub's secret type and path:line (exit 4).
+#                              `PUSH_BLOCKED key left after redaction`: the last scan found a key still in
+#                              what would go out (a header, a binary file, a redaction that didn't take),
+#                              so nothing was pushed (exit 4)
 #   PUSH_FAILED                the push failed otherwise (the network, a non-fast-forward…; exit 1)
 # Any other failure exits non-zero via `set -e`.
 set -e
+# A hangup, an interrupt, a TERM or a broken pipe (the ssh connection gone, met at the next write)
+# ends the run as an exit, so the EXIT trap that removes its temporary files runs: dash runs none
+# for a signal left at its default. (The trap runs once the command running then returns.)
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 141' PIPE
 REPO=$1
 MSG=$2
 MAX=$3
@@ -44,12 +65,79 @@ if [ -n "$KEY" ]; then
 fi
 # Stay on the current branch; never push a protected/detached one.
 B=$(git rev-parse --abbrev-ref HEAD)
-if [ "$B" = main ] || [ "$B" = master ] || [ "$B" = HEAD ]; then echo "SKIP $B"; exit 0; fi
+# @ARENA_BUSY_OP_SH@
+# `tracked_changed <git dir>`: whether any tracked file differs from HEAD (staged or not), with the
+# participant's index never written — not even its stat cache (review ai-review claude #9). The
+# check runs on a copy of the index: `update-index --refresh` brings the copy's stat data up to date
+# (a file whose stat changed but whose content didn't — after a restore, an rsync, a `touch` — is
+# hashed and then reads as clean), and `diff-index` then compares HEAD with the work tree through
+# it. Plumbing alone, so no porcelain refresh and no index.lock of ours. The copy is gone after,
+# its refresh with it: such a file is hashed again next run, until the participant's own git
+# refreshes their index (an editor's `git status` does, often). Without an index to copy, the
+# porcelain diff, read-only. The copy's removal is the EXIT trap, set before the copy exists
+# (review ai-review claude #10): a run killed mid-check (a timeout, a dropped connection) left a
+# full copy of the index, and its lock, in .git every time.
+tracked_changed() {
+    _ti="$1/arena-backup.$$.index"
+    trap 'rm -f "$_ti" "$_ti.lock"' EXIT
+    if cp "$1/index" "$_ti" 2>/dev/null; then
+        GIT_INDEX_FILE="$_ti" git update-index -q --refresh >/dev/null 2>&1 || true
+        if GIT_INDEX_FILE="$_ti" git diff-index --quiet HEAD -- 2>/dev/null; then _tc=1; else _tc=0; fi
+        rm -f "$_ti" "$_ti.lock"
+        return "$_tc"
+    fi
+    ! git --no-optional-locks diff --quiet HEAD -- 2>/dev/null
+}
+if [ "$B" = main ] || [ "$B" = master ] || [ "$B" = HEAD ]; then
+    # No backup commits or pushes here, so the work a `set-branch --hard` could discard is said
+    # first, and it copies the pod — .git and all — before resetting it (review fb2 F3). The first
+    # of: an operation in progress; changes to tracked files; commits no remote has (review pr4:
+    # work committed on main, its tree clean, was reset away uncopied — only the reflog kept it);
+    # untracked files git doesn't ignore (review pr4: --hard overwrites one wherever the branch it
+    # resets to tracks the same path, and which branch that is, or what origin's copy of it holds
+    # since the switch's own fetch, nothing here knows — so any counts). A nested repo (listed as
+    # `dir/`) doesn't: the image ships clones like that, and the switch leaves them be. Read-only
+    # for the participant's git: no optional locks, the tracked files compared through a copy of
+    # the index (`tracked_changed`), so their own git never meets an index.lock of ours. Commits
+    # count only when *no* remote has them, `upstream` included: those a `git pull upstream main`
+    # brought are the course's, which a reset doesn't lose.
+    GD=$(git rev-parse --absolute-git-dir)
+    W=$(busy_op "$GD")
+    if [ -z "$W" ] && tracked_changed "$GD"; then W=changes; fi
+    if [ -z "$W" ] && [ -n "$(git --no-optional-locks rev-list -n1 HEAD --not --remotes 2>/dev/null)" ]; then W=commits; fi
+    if [ -z "$W" ] && [ -n "$(git --no-optional-locks ls-files --others --exclude-standard 2>/dev/null | grep -v '/$' | head -n 1)" ]; then
+        W=untracked
+    fi
+    if [ -n "$W" ]; then echo "UNCOMMITTED $B $W"; fi
+    echo "SKIP $B"; exit 0
+fi
 echo "BRANCH $B"
 # A committer identity, in case the pod has none configured.
 git config user.name >/dev/null 2>&1 || git config user.name 'Arena Autocommit'
 git config user.email >/dev/null 2>&1 || git config user.email 'autocommit@arena.education'
 G=$(git rev-parse --absolute-git-dir)
+
+# --- An operation in progress ---------------------------------------------------------------
+# A participant mid-way through a conflicted `git pull upstream main` (a merge), a cherry-pick or a
+# revert — or with the conflicts a `git stash pop` left — has conflict markers in the tree: `add
+# -A` would stage them as resolved and the commit would end the operation (a merge committed as a
+# merge, markers and all, then pushed), after which `git merge --abort` and the editor's conflict
+# view no longer work. So while one lasts nothing is staged, committed or pushed: the run says
+# what is in progress and stops (exit 6), the operation stays where the participant left it, and
+# the caller copies the pod by rsync instead. So does a `git am` (HEAD attached, often nothing
+# unmerged: a patch that didn't apply) and a sequence paused between its commits. A rebase
+# detaches HEAD (SKIP), unless it kept HEAD attached.
+# (`busy_op` is defined above, before the SKIP.) Checked here, and again right before the staging
+# and right before the commit (review ai-review codex #1): a merge the participant starts while
+# the nested repos and the files are scanned is caught there, before `add -A` resolves its
+# conflicts or the commit ends it. What's left is the moment between the last check and git
+# taking its index lock — git has no lock that spans commands, so no check can close it.
+busy_stop() {
+    W=$(busy_op "$G")
+    if [ -n "$W" ]; then echo "BUSY $B $W"; exit 6; fi
+}
+busy_stop
+
 T="$G/arena-backup.$$"
 trap 'rm -f "$T".*' EXIT
 # @ARENA_REDACT_SH@
@@ -152,6 +240,7 @@ while IFS= read -r f; do
     set -- "$@" ":(exclude,literal)$f"
     echo "BIGSKIP $(stat -c %s -- "$f" 2>/dev/null || echo 0) $f"
 done < "$T.big"
+busy_stop
 git add -A -- "$@"
 # One staged by hand (`git add` of a checkpoint) is taken back out of the index, before it's
 # committed — the file itself untouched.
@@ -179,18 +268,30 @@ git diff --cached --raw --no-renames --diff-filter=d --no-abbrev \
 redact_index "$T.map" > "$T.upd"
 tr '\0' '\n' < "$T.upd" \
     | awk 'NR == FNR { n[$2] = $3; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " "); print "REDACTED " n[m[2]] " " substr($0, i + 1) }' "$T.map" -
+busy_stop
 if ! git diff --cached --quiet; then git commit -q -m "$MSG"; fi
+# What this run pushes, fixed here (review ai-review codex #1, FIX7): every check below — what's
+# ahead, the files over GitHub's limit, the keys — and the rewrite take this commit, never the live
+# HEAD, and the push sends exactly it (or its rewrite) by an explicit refspec. The participant's
+# own git is no party to the lock arena holds, so a commit they make while the scans run — a key
+# pasted in after the scan, `git commit -am` — went out unscanned with a push of the branch by name.
+# Now it stays local, and the next run scans it like any other.
+TIP=$(git rev-parse HEAD)
 
 # --- Push -----------------------------------------------------------------------------------
-# Ahead of the upstream (or no upstream yet) → there is something to push, whether it was
-# committed just now or by an earlier run whose push failed: "nothing staged" isn't "nothing to
-# do". Only a clean tree *and* HEAD == @{u} is NO_CHANGES.
-if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
-    AHEAD=$(git rev-list --count '@{u}..HEAD')
-    set -- '@{u}..HEAD'
+# Ahead of origin's copy of the branch (or origin has none yet) → there is something to push,
+# whether it was committed just now or by an earlier run whose push failed: "nothing staged"
+# isn't "nothing to do". Only a clean tree *and* HEAD == origin's branch is NO_CHANGES. Origin's
+# — the remote this pushes to — never "any remote's" or the branch's configured upstream: setup
+# adds the course repo as `upstream`, and a commit only it has (a `git pull upstream main`), or a
+# branch made from `upstream/main` and tracking it, read as already pushed while origin had none
+# of it (review ai-review claude #6).
+if git rev-parse -q --verify "refs/remotes/origin/$B" >/dev/null; then
+    AHEAD=$(git rev-list --count "refs/remotes/origin/$B..$TIP")
+    set -- "refs/remotes/origin/$B..$TIP"
 else
     AHEAD=new
-    set -- HEAD --not --remotes
+    set -- "$TIP" --not --remotes=origin
 fi
 if [ "$AHEAD" = 0 ]; then echo "NO_CHANGES $B"; exit 0; fi
 # A file over GitHub's own limit already in the unpushed commits (committed before this guard,
@@ -206,7 +307,7 @@ if [ -s "$T.stuck" ]; then
         oldest=$(git rev-list "$@" | tail -n 1)
         base=$(git rev-parse -q --verify "$oldest^" 2>/dev/null) || base=none
     else
-        base=$(git rev-parse '@{u}')
+        base=$(git rev-parse "refs/remotes/origin/$B")
     fi
     echo "BIGSTUCK_BASE $base"
     echo "a file over $((LIMIT / 1048576)) MB is in the unpushed commits of $B: GitHub refuses every push of it (GH001) until they're rewritten." >&2
@@ -242,35 +343,46 @@ push_block_reason() {
 # 14-24 commits each, fixed by hand with filter-branch) or by the participant by hand ("commit
 # all" on a file whose key the backup keeps out of git). Whether GitHub refuses it depends on
 # the repo's push-protection settings; it must never leave the pod either way. So the blobs of
-# the commits going out — only those on no remote branch, `HEAD --not --remotes`, never anything
-# GitHub already has — are scanned before the push (one `cat-file --batch | grep -q`: usually a
-# single commit this run made, already clean), and if one holds a key those commits are
-# rewritten with it redacted, by plumbing alone: each commit's tree through a temporary index,
-# then `commit-tree` with its own author, committer, dates, message and (mapped) parents, merges
-# included. Deterministic, and a commit with nothing to redact and unchanged parents keeps its
+# the commits going out — only those on no branch of origin's, `$TIP --not --remotes=origin`,
+# never anything this repo on GitHub already has (a commit only `upstream`, the course repo, has
+# is scanned: origin has never had it) — are scanned before the push (one `cat-file --batch |
+# grep -q`: usually a single commit this run made, already clean), and if one holds a key those
+# commits are rewritten with it redacted, by plumbing alone: each commit's tree through a
+# temporary index, then `commit-tree` with its own author, committer, dates, message and
+# (mapped) parents, merges included. Deterministic, and a commit with nothing to redact and unchanged parents keeps its
 # id. The participant's files are never read or written. The new tip is pushed as a
 # fast-forward (never forced), and only then does the branch move — compare-and-swap, so a
 # commit made meanwhile is never lost: the run stops there (HEAL_ABORTED), and the next one redoes
 # the same rewrite (same ids: a fast-forward of what was pushed) with that commit on top.
-TIP=$(git rev-parse HEAD)
-git rev-list --objects HEAD --not --remotes | git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' \
+# A key in a commit's *message* goes out the same way (review codex #1: `git commit -m '<a key>'`
+# with clean files had nothing to redact, so the message went to GitHub as it was, and a rewrite
+# for a file's key copied its message unchanged). So the same commits' objects are scanned too
+# (one more `cat-file --batch | grep -q`), and on a hit the rewrite runs: each commit's message
+# goes through the same sed as the files, and one whose message changes is rewritten — so are its
+# descendants (their parents change). A hit outside every message (a key in an author's name) is
+# no message's: the rewrite then changes nothing, every id kept — and the last scan, right before
+# the push, stops it there. A rewrite for a file's key redacts the messages of the commits it
+# writes the same way.
+git rev-list --reverse --topo-order "$TIP" --not --remotes=origin > "$T.commits"
+git rev-list --objects "$TIP" --not --remotes=origin | git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' \
     | awk '$1 == "blob" { print $2 }' | sort -u > "$T.blobs"
-: > "$T.hmap"
-if [ -s "$T.blobs" ]; then
-    # A failed cat-file must not read as "no key": the grep then saw only part of the blobs.
+# `scan_hits <list of objects>`: 0 when one of them holds a key, 1 when none does. A failed
+# cat-file must not read as "no key" (the grep then saw only part of them): it stops the run.
+scan_hits() {
     rm -f "$T.catfail"
-    { git cat-file --batch < "$T.blobs" || : > "$T.catfail"; } | LC_ALL=C grep -aqE -- "$SECRET_RE" && K=0 || K=$?
-    if [ "$K" = 1 ] && [ -e "$T.catfail" ]; then K=2; fi
-    if [ "$K" -gt 1 ]; then echo "arena backup: scanning the outgoing commits for keys failed - nothing pushed" >&2; exit 2; fi
-    if [ "$K" = 0 ]; then
-        while read -r b; do redact_blob "$b"; done < "$T.blobs" > "$T.hmap"
-    fi
+    { git cat-file --batch < "$1" || : > "$T.catfail"; } | LC_ALL=C grep -aqE -- "$SECRET_RE" && _sk=0 || _sk=$?
+    if [ "$_sk" = 1 ] && [ -e "$T.catfail" ]; then _sk=2; fi
+    if [ "$_sk" -gt 1 ]; then echo "arena backup: scanning the outgoing commits for keys failed - nothing pushed" >&2; exit 2; fi
+    return "$_sk"
+}
+: > "$T.hmap"
+if [ -s "$T.blobs" ] && scan_hits "$T.blobs"; then
+    while read -r b; do redact_blob "$b"; done < "$T.blobs" > "$T.hmap"
 fi
 : > "$T.cmap"
 N=0
 NEW=$TIP
-if [ -s "$T.hmap" ]; then
-    git rev-list --reverse --topo-order HEAD --not --remotes > "$T.commits"
+if [ -s "$T.hmap" ] || { [ -s "$T.commits" ] && scan_hits "$T.commits"; }; then
     while read -r c; do
         ps=
         same=1
@@ -285,9 +397,18 @@ if [ -s "$T.hmap" ]; then
         GIT_INDEX_FILE="$T.idx" git read-tree "$t"
         redact_index "$T.hmap" "$T.idx" > "$T.changed"
         if [ -s "$T.changed" ]; then nt=$(GIT_INDEX_FILE="$T.idx" git write-tree); fi
+        # Its message, each step its own command under `set -e`: a cat-file that fails stops the
+        # run, never reads as an empty message.
+        git cat-file commit "$c" > "$T.obj"
+        sed '1,/^$/d' "$T.obj" > "$T.msg"
+        mk=
+        if key_in_file "$T.msg"; then
+            LC_ALL=C sed -E "$REDACT_SED" "$T.msg" > "$T.rmsg"
+            mv -f "$T.rmsg" "$T.msg"
+            mk=1
+        fi
         n=$c
-        if [ "$nt" != "$t" ] || [ -z "$same" ]; then
-            git cat-file commit "$c" | sed '1,/^$/d' > "$T.msg"
+        if [ "$nt" != "$t" ] || [ -z "$same" ] || [ -n "$mk" ]; then
             git log -1 --no-show-signature --date=raw --format='%an%n%ae%n%ad%n%cn%n%ce%n%cd' "$c" > "$T.who"
             { IFS= read -r an; IFS= read -r ae; IFS= read -r ad; IFS= read -r cn; IFS= read -r ce; IFS= read -r cdate; } < "$T.who"
             n=$(GIT_AUTHOR_NAME=$an GIT_AUTHOR_EMAIL=$ae GIT_AUTHOR_DATE=$ad GIT_COMMITTER_NAME=$cn GIT_COMMITTER_EMAIL=$ce \
@@ -299,17 +420,32 @@ if [ -s "$T.hmap" ]; then
     NEW=$(sed -n "s/^$TIP //p" "$T.cmap")
 fi
 
-# The tip, or its redacted rewrite (as a fast-forward of the remote branch).
-if [ "$NEW" != "$TIP" ]; then
-    if [ "$(git rev-parse HEAD)" != "$TIP" ]; then
-        echo "HEAL_ABORTED $B moved while its unpushed commits were being redacted — the next backup redoes it"
-        exit 1
-    fi
-    set -- origin "$NEW:refs/heads/$B"
-else
-    set -- -u origin "$B"
+# The tip, or its redacted rewrite (as a fast-forward of the remote branch): that commit, by its
+# id, to origin's branch — never the branch by name, which is wherever the participant has moved it
+# since. That commit alone: `--no-follow-tags`, since a participant's `push.followTags` sent every
+# annotated tag on the commits going out along with them, its message scanned by nothing.
+if [ "$NEW" != "$TIP" ] && [ "$(git rev-parse HEAD)" != "$TIP" ]; then
+    echo "HEAL_ABORTED $B moved while its unpushed commits were being redacted — the next backup redoes it"
+    exit 1
 fi
-if git push "$@" 2>"$T.push"; then pushed=1; else pushed=; fi
+# A last scan of exactly what goes out, fail closed (review claude #1, FIX10): the commits and
+# blobs of `$NEW --not --remotes=origin`, by the same `scan_hits`. The rewrite above takes keys
+# out of commit messages and text files only, so a hit it couldn't redact went out with the
+# push: a key in a commit's header (an author's or committer's name or email, a `mergetag`
+# carrying a signed tag's message), in a file it never rewrites (a binary one, a symlink's
+# target), or one a redaction missed (the sed and the scan's grep drifting apart). Any hit:
+# nothing is pushed, `PUSH_BLOCKED key left after redaction`, and the pod is copied by rsync as
+# for any refused push (exit 4) — every run, until the key is taken out of the unpushed commits
+# by hand. Each step its own command under `set -e`: a rev-list or cat-file that fails stops the
+# run, never leaves a shorter list to scan.
+git rev-list --objects "$NEW" --not --remotes=origin > "$T.last"
+git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' < "$T.last" > "$T.lastk"
+awk '$1 == "commit" || $1 == "blob" { print $2 }' "$T.lastk" > "$T.lasto"
+if [ -s "$T.lasto" ] && scan_hits "$T.lasto"; then
+    echo "PUSH_BLOCKED key left after redaction"
+    exit 4
+fi
+if git push --no-follow-tags origin "$NEW:refs/heads/$B" 2>"$T.push"; then pushed=1; else pushed=; fi
 no_bypass_url < "$T.push" >&2
 if [ -z "$pushed" ]; then
     # Still refused: a secret the patterns don't know (or a binary GitHub scans) — said, by type.
@@ -317,6 +453,13 @@ if [ -z "$pushed" ]; then
     echo "PUSH_FAILED"
     exit 1
 fi
+# Origin has $NEW now: so says its remote-tracking ref, set here (review claude #4, FIX9B). A push
+# updates it only where `remote.origin.fetch` maps the branch; a checkout whose fetch is narrowed
+# (an image cloned `--single-branch`) never had it, so every run took the branch as new — never
+# NO_CHANGES, pushing, re-scanning and size-checking every commit since origin's main, a cost
+# growing through the cohort; and a pattern learnt later would rewrite commits origin already has,
+# a push refused as a non-fast-forward every run. Where the fetch maps it, the push set it already.
+git update-ref "refs/remotes/origin/$B" "$NEW" || true
 if [ "$NEW" != "$TIP" ]; then
     echo "REDACTED_HISTORY $N $TIP $NEW"
     if ! git update-ref -m "arena backup: keys redacted from unpushed commits" "refs/heads/$B" "$NEW" "$TIP"; then
@@ -327,6 +470,16 @@ if [ "$NEW" != "$TIP" ]; then
     # the index matches the new tip and `git status` shows just the files on disk with their real
     # keys as modified — the state the redaction above leaves. No file on disk is touched.
     redact_index "$T.hmap" > /dev/null
-    git branch --set-upstream-to="origin/$B" "$B" > /dev/null 2>&1 || true
 fi
+# The branch tracks origin's, as `push -u` made it (an id pushed sets no upstream), when it tracks
+# nothing yet — written to the config itself: `--set-upstream-to=origin/$B` needs the
+# remote-tracking ref, which a checkout whose `remote.origin.fetch` is narrowed (an image cloned
+# `--single-branch`, `origin` repointed by setup) never gets, and that branch had no upstream for
+# good — a bare `git push`/`git pull` saying so (review ai-review claude #7). An upstream the
+# branch has already is left as it is. Each key on its own (review claude #3, FIX9B): a run whose
+# second write failed (the participant's git holding `config.lock`) left `remote` without `merge`,
+# and every later run, seeing `remote`, skipped — the bare `git pull` failing for good; and a
+# `merge` the participant set alone was never given its `remote`. Whichever is missing is written.
+if [ -z "$(git config "branch.$B.remote")" ]; then git config "branch.$B.remote" origin || true; fi
+if [ -z "$(git config "branch.$B.merge")" ]; then git config "branch.$B.merge" "refs/heads/$B" || true; fi
 echo "PUSHED $B"

@@ -14,8 +14,11 @@ pub struct Pod {
     pub provider: String,
     pub status: String,
     pub gpu_type: Option<String>,
-    /// GPUs attached to the pod, when the provider reports it (RunPod `gpuCount`, Vast
-    /// `num_gpus`). `None` for CPU VMs and providers that don't say.
+    /// GPUs attached to the pod, when the provider reports it (RunPod `gpuCount`, REST v2
+    /// `gpu.count`; Vast `num_gpus`; Shadeform `configuration.num_gpus`): the GPUs rented for
+    /// this pod, never the host's total (Vast's `num_gpus` is the rental's: a recorded offer has
+    /// `num_gpus` 1 beside `gpu_frac` 0.25 of a 4-GPU host). `None` for CPU VMs (Hetzner), staff
+    /// machines and providers that don't say.
     #[serde(default)]
     pub gpu_count: Option<u32>,
     pub cost_per_hr: Option<f64>,

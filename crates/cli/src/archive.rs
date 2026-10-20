@@ -884,8 +884,17 @@ pub(crate) struct SyncOpts {
     pub dry_run: bool,
 }
 
-/// A held sync lock (`flock`, released when dropped).
-struct Lock(#[allow(dead_code)] std::fs::File);
+/// A held sync lock (`flock`). Dropping it unlocks rather than only closing the file: a process
+/// forked meanwhile by another thread holds a copy of the descriptor until its `exec`, and a
+/// close alone leaves the lock held through that copy — so an `unforget` right after a sync
+/// (it doesn't wait) was refused with "a sync is running" (a test flaked on the build VM).
+struct Lock(std::fs::File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
 
 /// Take a tier's lock without waiting: `None` = another sync of that tier holds it.
 fn try_lock(path: &Path) -> Result<Option<Lock>> {
@@ -909,8 +918,9 @@ fn try_lock(path: &Path) -> Result<Option<Lock>> {
 const LOCK_PATIENCE: Duration = Duration::from_secs(2);
 
 /// [`try_lock`], retried for up to `patience`: a lock just released can still look held for a
-/// moment — any process forked meanwhile (cron, another thread's spawn) holds a copy of the
-/// descriptor until its `exec` closes it.
+/// moment — one released by a close alone (a run that was killed) stays held while a process
+/// forked meanwhile (cron, another thread's spawn) keeps a copy of the descriptor, until its
+/// `exec` closes it. ([`Lock`] itself unlocks when dropped.)
 async fn lock_within(path: &Path, patience: Duration) -> Result<Option<Lock>> {
     let deadline = tokio::time::Instant::now() + patience;
     loop {
@@ -2476,12 +2486,19 @@ pub(crate) fn cron_refusals(cfg: &Config, start_date: bool) -> Vec<String> {
 
 /// The state ROOT (`ARENA_STATE_DIR`) the archive's cron lines carry, as this run resolves it —
 /// so cron, without this shell's environment, finds the same state (AD10). Refused when it can't
-/// go into a crontab line plainly.
+/// go into a crontab line plainly: it's carried unquoted (`ARENA_STATE_DIR=<root>`), so held to
+/// the same alphabet as the other paths there (`crate::crontab_word`; review pr4: a `(` or `&`
+/// passed the old check, a quote-and-space one).
 pub(crate) fn cron_state_root(cfg: &Config) -> std::result::Result<String, String> {
     let dir = arena_core::snapshot::state_dir_for(cfg)?;
     let root = dir.parent().ok_or("the state dir has no parent")?.display().to_string();
-    if root.chars().any(|c| c.is_whitespace() || "%'\"\\$`".contains(c)) {
-        return Err(format!("the state dir {root} holds a space, `%` or a quote, which a crontab line can't carry — set ARENA_STATE_DIR"));
+    if let Some(c) = crate::cron_unsafe_char(&root) {
+        return Err(format!(
+            "the state dir {root:?} holds {} — a crontab line carries it unquoted, so only letters, digits and `{}` may be in \
+             it; set ARENA_STATE_DIR",
+            crate::char_named(c),
+            crate::CRON_PATH_CHARS
+        ));
     }
     Ok(root)
 }
@@ -3201,7 +3218,7 @@ mod tests {
     /// Answers `--version` like rsync 3.2.7.
     fn rsync_stub(dir: &Path) -> String {
         let stub = dir.join("rsync-stub");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             &stub,
             "#!/bin/sh\nd=$(dirname \"$0\")\n[ \"$1\" = --version ] && { echo 'rsync  version 3.2.7  protocol version 31'; exit 0; }\n\
              for a; do last=$a; done\nprintf '%s\\n' \"$*\" >> \"$d/rsync-calls\"\n\
@@ -3212,11 +3229,6 @@ mod tests {
              printf 'Number of files: 5 (reg: 3, dir: 2)\\nNumber of regular files transferred: 2\\nTotal file size: 300 bytes\\nTotal transferred file size: 200 bytes\\n'\n",
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
         stub.display().to_string()
     }
 
@@ -3541,11 +3553,11 @@ mod tests {
     /// The real rsync, its `-e` swapped for a shim that runs the push key's forced command (the
     /// real rrsync, `-munge -wo -no-del -no-lock`, rooted at `<w>/push`) as sshd would: `archive
     /// sync` end to end, offline. `None` without rsync, python3 or rrsync.
-    /// Let go of a pod's backup lock as a finished pull does, and wait until it really is free:
-    /// a child that another test thread forked (and hasn't exec'd yet) holds a copy of the lock's
-    /// descriptor for a moment, and flock frees the lock only when every copy is closed (seen on
-    /// a loaded CI runner).
-    fn release_pull(pull: std::fs::File, backup: &str, pod: &str) {
+    /// Let go of a pod's backup lock as a finished pull does, and check that it really is free
+    /// (within 10 s): before [`arena_core::pull::PodLock`] unlocked on drop, a child that another
+    /// test thread forked (and hadn't exec'd yet) held a copy of the lock's descriptor for a
+    /// moment, and flock freed the lock only when every copy was closed (seen on a loaded CI runner).
+    fn release_pull(pull: arena_core::pull::PodLock, backup: &str, pod: &str) {
         drop(pull);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while arena_core::pull::try_pod_lock_now(backup, pod).is_err() {
@@ -3555,7 +3567,6 @@ mod tests {
     }
 
     fn real_push(w: &World) -> Option<String> {
-        use std::os::unix::fs::PermissionsExt;
         let rrsync = ["/usr/bin/rrsync", "/usr/share/doc/rsync/scripts/rrsync"].into_iter().find(|p| Path::new(p).exists())?;
         if !have("rsync") || !have("python3") || !have("bash") {
             return None;
@@ -3565,9 +3576,9 @@ mod tests {
         let line = render::render_push_key_line(rrsync, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPushPushPushPushPushPushPushPushPushPus1 x").unwrap();
         let forced = line.split("command=\"").nth(1).unwrap().split('"').next().unwrap().replace(arena_core::archive::PUSH_ROOT, &push.display().to_string());
         let shim = w.dir.join("sshd-shim");
-        std::fs::write(&shim, format!("#!/bin/sh\nwhile [ $# -gt 0 ] && [ \"$1\" != rsync ]; do shift; done\nSSH_ORIGINAL_COMMAND=\"$*\" exec {forced}\n")).unwrap();
+        arena_core::remote::write_test_script(&shim, format!("#!/bin/sh\nwhile [ $# -gt 0 ] && [ \"$1\" != rsync ]; do shift; done\nSSH_ORIGINAL_COMMAND=\"$*\" exec {forced}\n")).unwrap();
         let wrapper = w.dir.join("rsync-real");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             &wrapper,
             format!(
                 "#!/bin/bash\na=()\nwhile [ $# -gt 0 ]; do if [ \"$1\" = -e ]; then a+=(-e {}); shift 2; else a+=(\"$1\"); shift; fi; done\nexec rsync \"${{a[@]}}\"\n",
@@ -3575,9 +3586,6 @@ mod tests {
             ),
         )
         .unwrap();
-        for f in [&shim, &wrapper] {
-            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
         Some(wrapper.display().to_string())
     }
 
@@ -3788,6 +3796,21 @@ mod tests {
         assert!(try_lock(&paths.sync_lock(Tier::Snap)).unwrap().is_none(), "still held");
         drop(held);
         assert!(lock_within(&paths.sync_lock(Tier::Snap), Duration::from_secs(5)).await.unwrap().is_some());
+    }
+
+    /// A dropped lock is free at once, even while a copy of its descriptor lives on (what a
+    /// process forked meanwhile holds until its `exec`): a check that doesn't wait finds it free.
+    #[test]
+    fn a_dropped_lock_is_free_while_a_copy_of_its_descriptor_lives() {
+        let w = world("lock-copy");
+        let path = w.env().paths.sync_lock(Tier::Snap);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let held = try_lock(&path).unwrap().expect("free");
+        assert!(try_lock(&path).unwrap().is_none(), "held");
+        let copy = held.0.try_clone().unwrap();
+        drop(held);
+        assert!(try_lock(&path).unwrap().is_some(), "free once dropped, the copy notwithstanding");
+        drop(copy);
     }
 
     /// No state for this user / no start date / a dry run: nothing is spawned. AD9: a dry run
@@ -4107,24 +4130,22 @@ mod tests {
     async fn cron_archive_lines_merge_and_refuse() {
         use crate::{handle_cron, Cli, Cmd, CronKind};
         use clap::Parser;
-        use std::os::unix::fs::PermissionsExt;
         let w = world("cron");
         let stub = w.dir.join("crontab");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             &stub,
             "#!/bin/sh\ntab=\"$(dirname \"$0\")/tab\"\ncase \"$1\" in\n  -l) [ -f \"$tab\" ] && exec cat \"$tab\"; exit 1;;\n  -) cat > \"$tab\";;\nesac\n",
         )
         .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let tab = w.dir.join("tab");
         let config = w.dir.join("config.env");
         std::fs::write(&config, "").unwrap();
         let run = |cfg: Config, args: Vec<&'static str>| {
-            let (stub, config) = (stub.display().to_string(), config.clone());
+            let (stub, config, home) = (stub.display().to_string(), config.clone(), w.dir.display().to_string());
             async move {
                 let argv = ["arena", "cron"].into_iter().chain(args);
                 let Cmd::Cron(c) = Cli::try_parse_from(argv).unwrap().cmd else { unreachable!() };
-                handle_cron(c, &cfg, &config, true, &stub).await
+                handle_cron(c, &cfg, &config, true, &stub, Some(&home)).await
             }
         };
         let lines = || crate::arena_cron_lines(&std::fs::read_to_string(&tab).unwrap_or_default()).managed;
@@ -4149,8 +4170,11 @@ mod tests {
         assert_eq!(CronKind::of(&all[3]), Some(CronKind::ArchiveBig));
         // The state dir is in the lines (AD10): cron resolves the one `up` used, not $HOME's.
         let state_root = format!("ARENA_STATE_DIR={}/state", w.dir.display());
-        assert!(all[2].starts_with(&format!("7,22,37,52 * * * * ARENA_START_DATE=2026-10-01 {state_root} nice -n 10 ")) && all[2].contains(" archive sync --tier snap >> "), "{}", all[2]);
-        assert!(all[3].starts_with(&format!("40 * * * * ARENA_START_DATE=2026-10-01 {state_root} nice -n 10 ")) && all[3].ends_with("/arena-archive-cron.log 2>&1"), "{}", all[3]);
+        // Each recreating the cron folder first, which holds the archive's one log.
+        let log = arena_core::cron::log(&w.dir.display().to_string(), arena_core::cron::Job::Archive);
+        let mkdir = arena_core::cron::mkdir(&w.dir.display().to_string(), &log);
+        assert!(all[2].starts_with(&format!("7,22,37,52 * * * * {mkdir}ARENA_START_DATE=2026-10-01 {state_root} nice -n 10 ")) && all[2].contains(" archive sync --tier snap >> "), "{}", all[2]);
+        assert!(all[3].starts_with(&format!("40 * * * * {mkdir}ARENA_START_DATE=2026-10-01 {state_root} nice -n 10 ")) && all[3].ends_with(&format!(" >> {log} 2>&1")), "{}", all[3]);
         assert_eq!(CronKind::of(&all[0]), Some(CronKind::Backup));
         // Re-installing is a no-op; remove --archive drops just those two.
         run(w.cfg.clone(), vec!["install", "--archive"]).await.unwrap();
@@ -4159,6 +4183,12 @@ mod tests {
         assert_eq!(lines(), first);
         // An archive line is never mistaken for the snapshot line (or vice versa).
         assert_eq!(CronKind::of("*/2 * * * * flock -n /h/.arena-snapshot-cron.lock /a --config /c snapshot --public --out /w/fleet.json"), Some(CronKind::Snapshot));
+        for line in [
+            "*/2 * * * * mkdir -p /h/.local/state/arena/cron && flock -n /h/.local/state/arena/cron/snapshot.lock /a --config /c snapshot --public --out /w/fleet.json",
+            "*/2 * * * * mkdir -p /h/.local/state/arena-cron /h/logs && flock -n /h/.local/state/arena-cron/snapshot.lock /a --config /c snapshot --public --out /w/fleet.json >> /h/logs/snapshot.log 2>&1",
+        ] {
+            assert_eq!(CronKind::of(line), Some(CronKind::Snapshot), "{line}");
+        }
         assert_eq!(CronKind::of("# 7 * * * * /a archive sync --tier snap"), None);
 
         // AD3 (the reviewer's R3, adapted): whatever changes the backup line's start date changes
@@ -4602,12 +4632,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn review3_a_pod_cut_off_by_another_pods_share_of_the_budget_is_never_sealed_partial() {
-        use std::os::unix::fs::PermissionsExt;
         let w = world_with("rv3-budget", "ARCHIVE_SNAP_TIMEOUT_SECS=5\n");
         seed(&w);
         file(&w, "w0d1/devtest-bravo/b.py");
         let stub = w.dir.join("slow-rsync");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             &stub,
             "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'rsync  version 3.2.7  protocol version 31'; exit 0; }\n\
              for a; do last=$a; done\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/rsync-calls\"\n\
@@ -4615,7 +4644,6 @@ mod tests {
              printf 'Number of files: 1 (reg: 1)\\nNumber of regular files transferred: 1\\nTotal file size: 1 bytes\\nTotal transferred file size: 1 bytes\\n'\n",
         )
         .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let stub = stub.display().to_string();
         let now = day_end("w0d1") + 3 * 3600;
         for run in 0..3u64 {
@@ -4679,12 +4707,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_pod_making_progress_is_never_charged_for_the_budget() {
-        use std::os::unix::fs::PermissionsExt;
         let w = world_with("progress", "ARCHIVE_SNAP_TIMEOUT_SECS=4\n");
         seed(&w);
         file(&w, "w0d1/devtest-bravo/b.py");
         let stub = w.dir.join("slow-rsync");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             &stub,
             "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'rsync  version 3.2.7  protocol version 31'; exit 0; }\nd=$(dirname \"$0\"); log=''\n\
              for a; do last=$a; case \"$a\" in --log-file=*) log=${a#--log-file=};; esac; done\nprintf '%s\\n' \"$*\" >> \"$d/rsync-calls\"\n\
@@ -4693,7 +4720,6 @@ mod tests {
              printf 'Number of files: 1 (reg: 1)\\nNumber of regular files transferred: 1\\nTotal file size: 1 bytes\\nTotal transferred file size: 1 bytes\\n'\n",
         )
         .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let stub = stub.display().to_string();
         let now = day_end("w0d2") + 3 * 3600;
         std::fs::write(w.dir.join("progress"), "").unwrap();
@@ -4744,7 +4770,6 @@ mod tests {
     /// pod not in `pods_tried` is seeded even when forced.)
     #[tokio::test]
     async fn review_w7la_a_killed_first_push_never_seals_unchecked_files() {
-        use std::os::unix::fs::PermissionsExt;
         let w = world("rv-killed-seed");
         seed_state_only(&w);
         let Some(real) = real_push(&w) else {
@@ -4756,7 +4781,7 @@ mod tests {
         // The state on disk while alpha's push of w0d1 runs: exactly what a kill then leaves.
         let at_push = w.dir.join("state-at-push");
         let wrapper = w.dir.join("rsync-capture");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             &wrapper,
             format!(
                 "#!/bin/sh\ncase \"$*\" in *:snap/w0d1/devtest-alpha/*) if [ ! -e '{c}' ] && [ ! -e '{c}.absent' ]; then \
@@ -4766,7 +4791,6 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let rsync = wrapper.display().to_string();
         let t0 = 1_791_800_000;
         rv_put(&w, "w0d1/devtest-alpha/notes.txt", "notes v1\n", t0, 0);

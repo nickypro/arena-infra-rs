@@ -495,14 +495,13 @@ impl Drop for World {
 
 impl World {
     fn new(tag: &str, extra_cfg: &str) -> World {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("arena-reap-cli-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("snap/big")).unwrap();
         std::fs::write(dir.join("snap/.arena-backup-tier"), "snapshot\n").unwrap();
         std::fs::write(dir.join("snap/big/.arena-backup-tier"), "big\n").unwrap();
         let rsync = dir.join("rsync");
-        std::fs::write(
+        arena_core::remote::write_test_script(
             &rsync,
             r#"#!/bin/sh
 d=$(dirname "$0")
@@ -529,7 +528,6 @@ exit "$(cat "$d/exit_snap" 2>/dev/null || echo 0)"
 "#,
         )
         .unwrap();
-        std::fs::set_permissions(&rsync, std::fs::Permissions::from_mode(0o755)).unwrap();
         let text = format!(
             "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=( alpha bravo charlie delta echo foxtrot \"@devtest-boss\" )\n\
              RUNPOD_API=v2\nARENA_STATE_DIR={d}/state\nLOCAL_BACKUP_DIR={d}/snap\nARENA_START_DATE=2026-10-05\n\
@@ -985,6 +983,82 @@ async fn a_directory_in_the_way_of_the_reaps_snapshot_rsync_is_moved_aside_and_t
     assert_eq!(std::fs::read_to_string(Path::new(tomb.snapshot_dir.as_deref().unwrap()).join(&aside).join("old.py")).unwrap(), "old snap work\n");
 }
 
+/// Review fb2 F1: a pod left mid-merge isn't reaped — its backup's git step says `BUSY` (exit 6),
+/// a failed git step (R32) like any other: not reaped, no rsync, retried in 6 h, backing off
+/// meanwhile. That decision is unchanged; what changed is what's said. The run's WHY and the
+/// notification name what is in progress and that it holds the reap, and the notification says
+/// how to end it either way — not a generic "git backup failed". A branch that isn't a plain ref
+/// name is never echoed; any other git failure keeps the generic words.
+#[tokio::test]
+async fn a_merge_in_progress_holds_the_reap_and_says_so() {
+    let (w, a) = due_world("git-busy", "").await;
+    w.sim(22001, |s| s.git = (6, "BRANCH autocommit-x\nBUSY autocommit-x merge unmerged\n".into()));
+    let (r, out) = w.run("apply").await;
+    assert!(w.terminated().is_empty(), "{out}");
+    assert_eq!(exit_code(&r), Some(3), "a failed git step needs attention, as before");
+    assert!(!w.order().iter().any(|l| l.starts_with("rsync")), "no rsync after a failed git step");
+    let why = "a merge is in progress on autocommit-x — not reaped until it's finished or aborted";
+    assert!(out.contains(why) && !out.contains("git backup failed"), "{out}");
+    let p = &w.state().pods[&core_reap::key("runpod", &a.id)];
+    assert!(p.retry_after.is_some_and(|t| t >= w.now() + core_reap::BACKUP_FAIL_RETRY - 5), "{p:?}");
+    assert_eq!(
+        w.notified(),
+        [format!(
+            "arena reap [devtest] git_failed devtest-alpha: {why}; on the pod: resolve the conflicts and `git add` them, then `git \
+             commit` — or abort it (`git merge --abort`); retried in 6h"
+        )]
+    );
+    // The log keeps its fixed vocabulary: the row is the git step's.
+    let log = w.store().read_log().unwrap();
+    assert!(log.iter().any(|l| l.contains("\"kind\":\"act\"") && l.contains("\"row\":\"git_failed\"")), "{log:#?}");
+    // And the next run backs off, as for any failed backup.
+    w.tick(300);
+    w.step("apply").await;
+    assert!(w.terminated().is_empty());
+    assert_eq!(w.last_row(&a), Some(Row::BackoffAfterFailure));
+
+    // The other operations' words; a branch that isn't a plain ref name isn't echoed.
+    for (case, git, said) in [
+        (
+            "busy-cherry",
+            "BUSY autocommit-x cherry-pick\n",
+            "a cherry-pick is in progress on autocommit-x — not reaped until it's finished or aborted; on the pod: finish it (`git \
+             cherry-pick --continue`) or abort it (`git cherry-pick --abort`); retried in 6h",
+        ),
+        // Review pr4: `git am` (and a rebase, a paused sequence) is one of the fixed words too.
+        (
+            "busy-am",
+            "BUSY autocommit-x am\n",
+            "a `git am` is in progress on autocommit-x — not reaped until it's finished or aborted; on the pod: finish it (`git \
+             am --continue`) or abort it (`git am --abort`); retried in 6h",
+        ),
+        (
+            "busy-conflicts",
+            "BUSY $(reboot)\u{1b}[2J conflicts\n",
+            "its branch has unresolved conflicts — not reaped until they're resolved or undone; on the pod: resolve them and `git \
+             add` them, or undo them (`git reset --merge`); retried in 6h",
+        ),
+    ] {
+        let (w, _) = due_world(case, "").await;
+        w.sim(22001, |s| s.git = (6, git.into()));
+        let (_, out) = w.run("apply").await;
+        assert!(w.terminated().is_empty(), "{case}");
+        assert_eq!(w.notified(), [format!("arena reap [devtest] git_failed devtest-alpha: {said}")], "{case}");
+        let why = said.split("; on the pod").next().unwrap();
+        assert!(out.contains(why), "{case}: {out}");
+    }
+    // Any other git failure — exit 6 without a BUSY line, a BUSY line with another exit — is the
+    // git step failing, said as before.
+    for (case, git) in [("git-6-bare", (6, "BRANCH b\n")), ("git-busy-exit1", (1, "BUSY b merge\n"))] {
+        let (w, _) = due_world(case, "").await;
+        w.sim(22001, |s| s.git = (git.0, git.1.into()));
+        let (_, out) = w.run("apply").await;
+        assert!(w.terminated().is_empty(), "{case}");
+        assert_eq!(w.notified(), ["arena reap [devtest] git_failed devtest-alpha: the reap's git backup failed — not reaped; retried in 6h"], "{case}");
+        assert!(out.contains("git backup failed"), "{case}: {out}");
+    }
+}
+
 /// The reap's git step is the backup's, with the configured repo: a pod whose `origin` isn't it
 /// is refused there (nothing pushed), so it isn't reaped until `pods setup`.
 #[tokio::test]
@@ -1331,8 +1405,7 @@ async fn inv_hold() {
 async fn a_held_backup_lock_skips_the_look_without_breaking_the_streak() {
     let (w, a) = due_world("lock-held", "").await;
     let dir = w.cfg.get("LOCAL_BACKUP_DIR").unwrap().to_string();
-    let held = arena_core::pull::open_pod_lock(&dir, &a.name).unwrap();
-    assert!(arena_core::pull::try_lock(&held).unwrap());
+    let held = arena_core::pull::try_lock(arena_core::pull::open_pod_lock(&dir, &a.name).unwrap()).unwrap().expect("free");
     w.tick(0);
     let before = w.calls_to(22001).len();
     w.step("apply").await;
@@ -1565,23 +1638,30 @@ fn reap_cron_line_rules() {
     let write = |text: &str| std::fs::write(&path, text).unwrap();
     let state = w.dir.join("state").display().to_string();
     write(&format!("ARENA_STATE_DIR={state}\nMACHINE_NAME_PREFIX=devtest\n"));
-    let e = super::super::reap_cron_line(true, &path, "/usr/local/bin/arena", "/root/c.env", "/root").unwrap_err().to_string();
+    let e = super::super::reap_cron_line(true, &path, "/usr/local/bin/arena", "/root/c.env", "/root", None).unwrap_err().to_string();
     assert!(e.contains("REAP_ENABLED isn't 1") && e.contains("--reap observe"), "{e}");
-    let observe = super::super::reap_cron_line(false, &path, "/usr/local/bin/arena", "/root/c.env", "/root").unwrap();
-    assert!(observe.ends_with("pods reap run >> /root/arena-reap-cron.log 2>&1") && !observe.contains("ARENA_STATE_DIR="), "{observe}");
+    let observe = super::super::reap_cron_line(false, &path, "/usr/local/bin/arena", "/root/c.env", "/root", None).unwrap();
+    assert!(observe.ends_with("pods reap run >> /root/.local/state/arena-cron/reap.log 2>&1") && !observe.contains("ARENA_STATE_DIR="), "{observe}");
     assert_eq!(super::super::CronKind::of(&observe), Some(super::super::CronKind::Reap));
     write(&format!("ARENA_STATE_DIR={state}\nREAP_ENABLED=1\n"));
-    let apply = super::super::reap_cron_line(true, &path, "/usr/local/bin/arena", "/root/c.env", "/root").unwrap();
-    assert!(apply.contains(" pods reap run --apply --yes >> ") && apply.contains("flock -n -o /root/.arena-reap-cron.lock"), "{apply}");
+    let apply = super::super::reap_cron_line(true, &path, "/usr/local/bin/arena", "/root/c.env", "/root", None).unwrap();
+    assert!(apply.contains(" pods reap run --apply --yes >> ") && apply.contains("flock -n -o /root/.local/state/arena-cron/reap.lock"), "{apply}");
     assert_eq!(super::super::CronKind::of(&apply), Some(super::super::CronKind::Reap));
     // No state dir anywhere: refused.
     write("REAP_ENABLED=1\n");
-    assert!(super::super::reap_cron_line(false, &path, "/a", "/c", "/root").unwrap_err().to_string().contains("ARENA_STATE_DIR"));
+    assert!(super::super::reap_cron_line(false, &path, "/a", "/c", "/root", None).unwrap_err().to_string().contains("ARENA_STATE_DIR"));
     // Invalid settings: refused.
     write(&format!("ARENA_STATE_DIR={state}\nREAP_MAX_PER_DAY=500\n"));
-    assert!(super::super::reap_cron_line(false, &path, "/a", "/c", "/root").unwrap_err().to_string().contains("REAP_MAX_PER_DAY"));
+    assert!(super::super::reap_cron_line(false, &path, "/a", "/c", "/root", None).unwrap_err().to_string().contains("REAP_MAX_PER_DAY"));
     // The other lines are never taken for it.
-    for other in ["*/15 * * * * flock -n -o /root/.arena-backup-cron.lock /a --config /c pods backup --yes >> /root/arena-cron.log 2>&1", "# 7 * * * * arena pods reap run"] {
+    for other in [
+        "*/15 * * * * flock -n -o /root/.arena-backup-cron.lock /a --config /c pods backup --yes >> /root/arena-cron.log 2>&1",
+        "*/15 * * * * mkdir -p /root/.local/state/arena/cron && flock -n -o /root/.local/state/arena/cron/backup.lock /a --config /c \
+         pods backup --yes >> /root/.local/state/arena/cron/backup.log 2>&1",
+        "*/15 * * * * mkdir -p /root/.local/state/arena-cron /root/logs/cron && flock -n -o /root/.local/state/arena-cron/backup.lock \
+         /a --config /c pods backup --yes >> /root/logs/cron/arena-cron.log 2>&1",
+        "# 7 * * * * arena pods reap run",
+    ] {
         assert_ne!(super::super::CronKind::of(other), Some(super::super::CronKind::Reap), "{other}");
     }
 }
@@ -1617,9 +1697,8 @@ async fn pull_two_volume_markers_and_the_per_pod_lock() {
     assert!(!std::path::Path::new(&snap.join("big")).exists(), "no big/ under the snapshot root");
     // Busy: another backup holds the pod's lock.
     std::fs::remove_file(w.dir.join("calls.log")).unwrap();
-    let held = arena_core::pull::open_pod_lock(&dir, "devtest-alpha").unwrap();
-    // The pull above released it; a fork in another test thread can keep it a moment longer.
-    assert!(super::super::lock_settles_free(&held));
+    // The pull above released it (a fork in another test thread can't keep it: it unlocks).
+    let held = super::super::lock_settles(arena_core::pull::open_pod_lock(&dir, "devtest-alpha").unwrap()).expect("free");
     let e = pull(super::super::LockMode::Take(Duration::from_millis(300))).await.unwrap_err().to_string();
     assert!(e.contains("devtest-alpha (busy)"), "{e}");
     assert!(w.order().is_empty(), "no rsync of a busy pod: {:?}", w.order());
@@ -2035,7 +2114,7 @@ async fn rs2_the_reaps_big_tier_keeps_dot_dirs() {
 // ---------------------------------------------------------------------------------------
 
 /// RR: `up/create --expire-in` on a pod the reaper never acts on — Vast, or RunPod on REST v1
-/// (the default `RUNPOD_API`, which lists `locked: None`) — is recorded without a word (`reap
+/// (`RUNPOD_API=v1`, the default when this was found; it lists `locked: None`) — is recorded without a word (`reap
 /// set` refuses the very same pod), and `pods list`'s ENDS column then counts down to the end
 /// time and shows `OVERDUE …` past it, as if the pod were going to be reaped. It never is (R3 /
 /// R8 every run): the operator replaced `at` + destroy with `up --expire-in` and the pod bills on.
@@ -2134,13 +2213,12 @@ async fn review_rr_concurrent_reap_set_keeps_both_changes() {
 /// operator's `pods pull <other pod>` waits 120 s and FAILS as "busy", where before it ran.
 #[tokio::test]
 async fn review_rr_a_pull_releases_each_pods_lock_when_that_pod_is_done() {
-    use std::os::unix::fs::PermissionsExt;
     let w = World::new("rr-hold", "");
     let snap = w.dir.join("bk");
     std::fs::create_dir_all(&snap).unwrap();
     let mark = w.dir.join("alpha.done");
     let rsync = w.dir.join("rsync-slow-bravo");
-    std::fs::write(
+    arena_core::remote::write_test_script(
         &rsync,
         format!(
             "#!/bin/sh\ncase \"$1\" in --version) echo rsync; exit 0;; esac\nfor a in \"$@\"; do last=\"$a\"; done\n\
@@ -2150,7 +2228,6 @@ async fn review_rr_a_pull_releases_each_pods_lock_when_that_pod_is_done() {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&rsync, std::fs::Permissions::from_mode(0o755)).unwrap();
     let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=( alpha bravo )\nLOCAL_BACKUP_DIR={}\n", snap.display()));
     let sel = super::super::Selected { pods: vec![rp("devtest-alpha", "pa", 22001), rp("devtest-bravo", "pb", 22002)], named: true };
     let remote: Arc<dyn Remote> = Arc::new(arena_core::remote::FakeRemote::new());
@@ -2168,7 +2245,7 @@ async fn review_rr_a_pull_releases_each_pods_lock_when_that_pod_is_done() {
         assert!(mark.exists(), "alpha's big tier never ran");
         tokio::time::sleep(Duration::from_millis(1000)).await; // alpha's jobs are all done; bravo still sleeping
         let f = arena_core::pull::open_pod_lock(&dir, "devtest-alpha").unwrap();
-        arena_core::pull::try_lock(&f).unwrap()
+        arena_core::pull::try_lock(f).unwrap().is_ok()
     };
     let (r, alpha_free) = tokio::join!(pull, check);
     r.unwrap();
@@ -2235,13 +2312,13 @@ async fn review_rr_two_pods_sharing_a_name_are_still_backed_up() {
 /// RR: the reap cron line is `flock -n LOCK arena …` WITHOUT `-o`, so the locked fd that
 /// flock(1) hands to arena is inherited by everything arena spawns (ssh, the reap's rsyncs,
 /// REAP_NOTIFY_CMD and whatever it backgrounds). If arena dies (killed, OOM) while one of them
-/// lives on, that orphan keeps `.arena-reap-cron.lock` and every later tick exits at once,
+/// lives on, that orphan keeps the reap line's lock and every later tick exits at once,
 /// silently (`flock -n` prints nothing) — the reaper just stops. The backup line uses
 /// `flock -n -o` for exactly this reason ("a stray rsync outliving an arena that was itself
 /// killed would otherwise keep every later tick skipping").
 #[test]
 fn review_rr_reap_cron_lock_is_not_inherited_by_arenas_children() {
-    let line = arena_core::reap::render::cron_line(true, "/usr/local/bin/arena", "/root/c.env", "/root", &[]);
+    let line = arena_core::reap::render::cron_line(true, "/usr/local/bin/arena", "/root/c.env", "/root", None, &[]);
     assert!(line.contains("flock -n -o "), "{line}");
 }
 
@@ -2277,7 +2354,7 @@ async fn rr_pod_locks_once_per_name_released_per_pod() {
         locks.expect(n);
     }
     locks.release_idle();
-    let free = |n: &str| arena_core::pull::try_lock(&arena_core::pull::open_pod_lock(&d, n).unwrap()).unwrap();
+    let free = |n: &str| arena_core::pull::try_lock(arena_core::pull::open_pod_lock(&d, n).unwrap()).unwrap().is_ok();
     assert!(free("devtest-charlie"), "no work under it: released at once");
     assert!(!free("devtest-alpha") && !free("devtest-bravo"));
     locks.done("devtest-alpha");
@@ -2288,8 +2365,7 @@ async fn rr_pod_locks_once_per_name_released_per_pod() {
     drop(locks);
     assert!(free("devtest-bravo"));
     // Another process's hold (here: an open lock of our own, outside the run) is "busy".
-    let other = arena_core::pull::open_pod_lock(&d, "devtest-bravo").unwrap();
-    assert!(arena_core::pull::try_lock(&other).unwrap());
+    let _other = arena_core::pull::try_lock(arena_core::pull::open_pod_lock(&d, "devtest-bravo").unwrap()).unwrap().expect("free");
     let locks = super::super::take_pod_locks(&d, &names, Duration::from_millis(200)).await;
     assert_eq!(locks.busy, ["devtest-bravo"]);
 }
@@ -2314,16 +2390,30 @@ async fn rr_locks_make_only_their_own_folder() {
 }
 
 /// RR2: `up/create --expire-*/--idle-after` refuse a provider the reaper never acts on — before
-/// anything is created — with `reap set`'s words; RunPod v2 and Hetzner are fine.
+/// anything is created — with `reap set`'s words; RunPod v2 (the default) and Hetzner are
+/// fine. RunPod's refusal says how to leave v1; Vast's has nothing to say about RunPod's API.
 #[test]
 fn rr_create_flags_refuse_never_reaped_providers() {
+    use arena_core::provider::RUNPOD_V1_REMEDY;
     let v1 = Config::parse("RUNPOD_API=v1");
     let v2 = Config::parse("RUNPOD_API=v2");
     let r = super::create_flags_refusal(&v1, "runpod").unwrap();
-    assert!(r.contains("RunPod REST v1") && r.contains("only acts on RunPod (RUNPOD_API=v2) and Hetzner") && r.contains("nothing was created"), "{r}");
-    assert!(super::create_flags_refusal(&v2, "vast").unwrap().contains("pods on vast"));
+    assert!(
+        r.contains("RunPod REST v1") && r.contains("only acts on RunPod (REST v2) and Hetzner") && r.contains(RUNPOD_V1_REMEDY)
+            && r.contains("nothing was created"),
+        "{r}"
+    );
+    let r = super::create_flags_refusal(&v2, "vast").unwrap();
+    assert!(r.contains("pods on vast") && !r.contains("RUNPOD_API"), "{r}");
     assert_eq!(super::create_flags_refusal(&v2, "runpod"), None);
+    assert_eq!(super::create_flags_refusal(&Config::parse(""), "runpod"), None, "unset RUNPOD_API is v2");
     assert_eq!(super::create_flags_refusal(&v1, "hetzner"), None);
+    // `reap set`'s refusal of the same pod, in the same words.
+    let cohort = Config::parse("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=( alpha )\nRUNPOD_API=v1\n");
+    let naming = Naming::from_config(&cohort);
+    let pod = rp("devtest-alpha", "pa", 22001);
+    let why = never_reaped(&pod, std::slice::from_ref(&pod), &naming, false).unwrap_or_default();
+    assert!(why.contains("only acts on RunPod (REST v2) and Hetzner") && why.contains(RUNPOD_V1_REMEDY), "{why}");
     // ENDS: a record made inert by a rename outside arena, or a shared name, says so too.
     let w = World::new("rr-inert", "");
     let a = rp("devtest-alpha", "pa", 22001);
@@ -2359,6 +2449,60 @@ fn rr_config_check_reaper_rows_off_and_on() {
     let on = Config::parse("MACHINE_NAME_PREFIX=devtest\nREAP_ENABLED=1\n");
     let (lines, blockers) = super::readiness_rows_for(&on, "/nonexistent/rsync", true);
     assert!(lines.iter().any(|l| l.contains('✗') && l.contains("rsync")) && blockers.contains(&"rsync".to_string()), "{lines:#?}");
+}
+
+/// The reaper's RUNPOD_API row follows RunPod's default: unset (or empty) is v2 — ✓, RunPod
+/// pods report their lock; an explicit v1 is ⚠ with the way back; an invalid value says so
+/// without suggesting v1 is the trouble (its ✗ row is `config check`'s RunPod section's).
+#[test]
+fn reaper_runpod_api_row_follows_the_default() {
+    use arena_core::provider::RUNPOD_V1_REMEDY;
+    let row = |extra: &str| {
+        let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nREAP_ENABLED=1\n{extra}"));
+        let (lines, _) = super::readiness_rows_for(&cfg, "/nonexistent/rsync", true);
+        lines.into_iter().find(|l| l.contains("RUNPOD_API")).unwrap_or_default()
+    };
+    for extra in ["", "RUNPOD_API=\n", "RUNPOD_API=v2\n"] {
+        let l = row(extra);
+        assert!(l.trim_start().starts_with("✓ RUNPOD_API") && l.contains("v2 — RunPod pods report their lock"), "{extra:?}: {l}");
+        // What that means for the reaper, and whether anyone chose it (review ai-review claude #1).
+        assert!(l.contains("so one with a policy can be reaped") && l.contains("(on v1 none ever was)"), "{extra:?}: {l}");
+        assert_eq!(l.contains("(the default since 70bce78, 2026-10-19)"), extra != "RUNPOD_API=v2\n", "{extra:?}: {l}");
+    }
+    let l = row("RUNPOD_API=v1\n");
+    assert!(l.trim_start().starts_with("⚠ RUNPOD_API") && l.contains("no RunPod pod is ever reaped") && l.contains(RUNPOD_V1_REMEDY), "{l}");
+    let l = row("RUNPOD_API=v3\n");
+    assert!(l.trim_start().starts_with("⚠ RUNPOD_API") && l.contains("invalid") && !l.contains(RUNPOD_V1_REMEDY), "{l}");
+}
+
+/// Review ai-review claude #1: v2 became RunPod's default, so a config with no RUNPOD_API line —
+/// which ran v1, where no RunPod pod is ever reaped — now has RunPod pods reapable. `reap status`
+/// and the plan say so (words only) whenever a RunPod pod has a policy on v2, and whether the
+/// config chose it; not on v1, nor when only other providers' pods have one.
+#[tokio::test]
+async fn status_and_the_plan_say_when_runpod_pods_are_reapable() {
+    let said = |out: &str| out.lines().filter(|l| l.starts_with("RunPod: REST v2")).map(String::from).collect::<Vec<_>>();
+    let default = "RunPod: REST v2 (the default since 70bce78, 2026-10-19: no RUNPOD_API line chose it) — RunPod pods with a policy can be \
+                   reaped: terminated, container disk and all, after their backup (on RUNPOD_API=v1 none ever was)";
+    let chosen = default.replace("the default since 70bce78, 2026-10-19: no RUNPOD_API line chose it", "RUNPOD_API=v2");
+    for (tag, extra, provider, want) in [
+        ("note-default", "RUNPOD_API=", "runpod", Some(default.to_string())),
+        ("note-chosen", "", "runpod", Some(chosen)),
+        ("note-v1", "RUNPOD_API=v1", "runpod", None),
+        ("note-hz", "RUNPOD_API=", "hetzner", None),
+    ] {
+        let w = World::new(tag, extra);
+        let a = if provider == "runpod" { rp("devtest-alpha", "pa", 22001) } else { hz("devtest-alpha", "pa", 22001) };
+        w.add(a.clone(), Sim::new("pa", provider));
+        w.policy(&a, None, Some(900));
+        w.out.lock().unwrap().clear();
+        w.reap(&["status"]).await.unwrap();
+        let status = w.out.lock().unwrap().join("\n");
+        let (_, plan) = w.run("observe").await;
+        let want: Vec<String> = want.into_iter().collect();
+        assert_eq!((said(&status), said(&plan)), (want.clone(), want), "{tag}: {status}\n---\n{plan}");
+        assert!(w.terminated().is_empty(), "{tag}: words only");
+    }
 }
 
 /// RR9: `--json` errors are one JSON document too.

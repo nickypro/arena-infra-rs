@@ -1090,7 +1090,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_probe_runs_under_a_real_sh_and_its_reply_parses() {
-        use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
         let have = |t: &str| Command::new("sh").arg("-c").arg(format!("command -v {t}")).output().is_ok_and(|o| o.status.success());
         if !["awk", "find", "touch", "date", "getconf", "sed", "head"].iter().all(|t| have(t)) {
@@ -1121,8 +1120,7 @@ mod tests {
             }
         }
         let smi = bin.join("nvidia-smi");
-        std::fs::write(&smi, "#!/bin/sh\necho '7, 512'\n").unwrap();
-        std::fs::set_permissions(&smi, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::remote::write_test_script(&smi, "#!/bin/sh\necho '7, 512'\n").unwrap();
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
         let out = Command::new("sh")
             .arg("-c")

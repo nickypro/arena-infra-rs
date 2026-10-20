@@ -379,8 +379,7 @@ done
 
         fn write_exec(path: &Path, body: &str) {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, body).unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(path, body).unwrap();
         }
 
         fn sh(dir: &Path, cmd: &str) -> String {

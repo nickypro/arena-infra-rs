@@ -101,9 +101,14 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// minutes. 5 min, as `pods backup`.
 const BACKUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// `set-branch`: fetch + checkout + ff-pull against GitHub — 2 min means stuck, as `pods
+/// `set-branch`: fetch + checkout + fast-forward against GitHub — 2 min means stuck, as `pods
 /// set-branch`.
 const BRANCH_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+
+// set-branch's switch and init-branches bound themselves on the pod (`timeout`, then a KILL) inside
+// that budget, so their pod side has ended before arena reports a timeout and releases the pod's
+// lock (review ai-review claude #13).
+const _: () = assert!(arena_core::backup::SWITCH_BOUND_SECS + arena_core::backup::SWITCH_KILL_AFTER_SECS < BRANCH_TIMEOUT.as_secs());
 
 /// How long one details query (`Provider::enrich`) may take before the refresh carries on
 /// without it — the HTTP client has no timeout of its own (`pods list` uses the same 20s).
@@ -1874,16 +1879,20 @@ fn run_report(name: &str, out: &arena_core::ssh::SshOutput) -> String {
 /// within [`BRANCH_TIMEOUT`] — after the branch it's on is backed up ([`run_backup`]), as the
 /// CLI does: after a switch, commits that couldn't be pushed live only in a local branch on the
 /// pod. A branch that can't be pushed isn't switched away from here, since the TUI can't copy
-/// the pod's files first; the line names the CLI command that does.
+/// the pod's files first; the line names the CLI command that does. A pod with a merge in
+/// progress is never switched by a gentle switch, the CLI's included: its line says what is in
+/// progress and how to end it ([`busy_not_switched`]).
 async fn run_set_branch(remote: &dyn Remote, cfg: &Config, pod: &Pod, branch: &str) -> String {
     let target = match SshTarget::from_pod(pod, cfg) {
         Ok(t) => t,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
-    let (backed, wrong_origin) = backup_and_report(remote, cfg, pod).await;
-    // A pod whose `origin` isn't the configured repo: the CLI doesn't switch it either.
-    if let Some(why) = wrong_origin {
-        return format!("✗ {} not switched to {branch}: {why}", pod.name);
+    let (backed, kept) = backup_and_report(remote, cfg, pod).await;
+    match kept {
+        // A pod whose `origin` isn't the configured repo: the CLI doesn't switch it either.
+        Some(Kept::WrongOrigin(why)) => return format!("✗ {} not switched to {branch}: {why}", pod.name),
+        Some(Kept::Busy { what, on, unmerged }) => return busy_not_switched(&pod.name, branch, &what, &on, unmerged),
+        None => {}
     }
     if backed.starts_with('✗') || backed.contains(" — busy:") {
         return format!(
@@ -1911,9 +1920,39 @@ async fn run_backup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
     backup_and_report(remote, cfg, pod).await.0
 }
 
-/// [`run_backup`]'s line, and, when the pod's `origin` isn't the configured repo, the refusal in
-/// its own words (`origin is …, not the configured … — not backed up to git; run …`).
-async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (String, Option<String>) {
+/// Why a pod's backup leaves it where it is for the TUI's set-branch — said in words of its own,
+/// not as a push that failed ([`backup_and_report`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Kept {
+    /// Its `origin` isn't the configured repo: the refusal in its own words (`origin is …, not the
+    /// configured … — not backed up to git; run …`).
+    WrongOrigin(String),
+    /// An operation in progress (`BUSY`): what it is (`merge`, …: `arena_core::backup::BUSY_OP_SH`),
+    /// on which branch, and whether paths are still unmerged.
+    Busy { what: String, on: String, unmerged: bool },
+}
+
+/// The TUI set-branch's line for a pod with an operation in progress (review F5): what it is and
+/// how to end it, as the CLI's gentle switch would refuse it (copying the pod first only to
+/// refuse, the CLI's advice before, would gain nothing) — and `--hard` named as the destructive
+/// way, which copies the files first and then discards the uncommitted changes to tracked files,
+/// the operation with them. Pure.
+fn busy_not_switched(pod: &str, branch: &str, what: &str, on: &str, unmerged: bool) -> String {
+    use arena_core::backup::{busy_advice, busy_noun, busy_situation, busy_switch_why};
+    let noun = busy_noun(what);
+    let why = busy_switch_why(what).map_or_else(String::new, |w| format!(" ({w})"));
+    format!(
+        "✗ {pod} not switched to {branch}: {} — not committed or switched{why}; {} on the pod, then switch again. Or, \
+         destructively: `arena pods set-branch {branch} {pod} --hard` copies its files first, then discards its uncommitted \
+         changes to tracked files ({noun} with them)",
+        busy_situation(what, on),
+        busy_advice(what, unmerged)
+    )
+}
+
+/// [`run_backup`]'s line, and why the pod must stay where it is beyond a failed push, when it
+/// must ([`Kept`]).
+async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (String, Option<Kept>) {
     use arena_core::backup::{self, parse_backup_report};
     let target = match SshTarget::from_pod(pod, cfg) {
         Ok(t) => t,
@@ -1950,7 +1989,16 @@ async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (Str
                 Some(fix) => format!("✗ backup {}: {fix}", pod.name),
                 None => format!("✗ backup {} ({}): {}", pod.name, out.exit_label(), out.stderr.trim()),
             };
-            (line, fix.filter(|_| report.wrong_origin_why(out.code).is_some()))
+            let kept = match (report.wrong_origin_why(out.code), report.in_progress(out.code)) {
+                (Some(_), _) => fix.map(Kept::WrongOrigin),
+                (None, Some(what)) => Some(Kept::Busy {
+                    what: what.to_string(),
+                    on: report.branch.clone().unwrap_or_else(|| "its branch".to_string()),
+                    unmerged: report.unmerged,
+                }),
+                (None, None) => None,
+            };
+            (line, kept)
         }
         Err(e) => (format!("✗ backup {} failed: {}", pod.name, describe_error(&e)), None),
     }
@@ -4608,6 +4656,38 @@ deep_check_end=1
                  nickypro/arena-sandbox-materials — not backed up to git; run `arena pods setup devtest-alpha`",
                 vec![BACKUP_TIMEOUT],
             ),
+            // A pod mid-merge (review F5): not switched, said as what is in progress and how to end
+            // it, `--hard` named as the destructive way — never "the CLI copies its files, then
+            // switches": the CLI's gentle switch refuses it too.
+            (
+                "set-branch",
+                vec![FakeReply::exit(6, "").with_stdout("BRANCH autocommit-x\nBUSY autocommit-x merge unmerged\n"), FakeReply::ok()],
+                "✗ devtest-alpha not switched to w1d2: a merge is in progress on autocommit-x — not committed or switched (a switch \
+                 now would end the merge); resolve the conflicts and `git add` them, then `git commit` — or abort it (`git merge \
+                 --abort`) on the pod, then switch again. Or, destructively: `arena pods set-branch w1d2 devtest-alpha --hard` \
+                 copies its files first, then discards its uncommitted changes to tracked files (the merge with them)",
+                vec![BACKUP_TIMEOUT],
+            ),
+            (
+                "set-branch",
+                vec![FakeReply::exit(6, "").with_stdout("BRANCH autocommit-x\nBUSY autocommit-x conflicts\n"), FakeReply::ok()],
+                "✗ devtest-alpha not switched to w1d2: autocommit-x has unresolved conflicts — not committed or switched; resolve \
+                 them and `git add` them, or undo them (`git reset --merge`) on the pod, then switch again. Or, destructively: \
+                 `arena pods set-branch w1d2 devtest-alpha --hard` copies its files first, then discards its uncommitted changes to \
+                 tracked files (the unresolved conflicts with them)",
+                vec![BACKUP_TIMEOUT],
+            ),
+            // Review pr4: `git am` (HEAD attached) — a gentle switch would carry it onto the other
+            // branch, half-done, not end it.
+            (
+                "set-branch",
+                vec![FakeReply::exit(6, "").with_stdout("BRANCH autocommit-x\nBUSY autocommit-x am\n"), FakeReply::ok()],
+                "✗ devtest-alpha not switched to w1d2: a `git am` is in progress on autocommit-x — not committed or switched (a \
+                 switch now would carry the `git am`, half-done, onto the other branch); finish it (`git am --continue`) or abort it \
+                 (`git am --abort`) on the pod, then switch again. Or, destructively: `arena pods set-branch w1d2 devtest-alpha \
+                 --hard` copies its files first, then discards its uncommitted changes to tracked files (the `git am` with them)",
+                vec![BACKUP_TIMEOUT],
+            ),
             (
                 "set-branch",
                 vec![wrong_origin(), FakeReply::ok()],
@@ -4671,8 +4751,7 @@ deep_check_end=1
             "ARENA_REPO_OWNER=nickypro\nARENA_REPO_NAME=arena-sandbox-materials\nGIT_SSH_KEY_LOCAL=/nonexistent/deploy_key\nLOCAL_BACKUP_DIR={}\n",
             dir.display()
         ));
-        let held = arena_core::pull::open_pod_lock(&dir.display().to_string(), &alpha.name).unwrap();
-        assert!(arena_core::pull::try_lock(&held).unwrap());
+        let held = arena_core::pull::try_lock(arena_core::pull::open_pod_lock(&dir.display().to_string(), &alpha.name).unwrap()).unwrap().expect("free");
         let quiet = FakeRemote::new();
         let line = run_backup(&quiet, &locked, &alpha).await;
         assert!(line.starts_with("⊘ ") && line.contains("busy"), "{line}");
@@ -4681,6 +4760,31 @@ deep_check_end=1
         let _ = std::fs::remove_dir_all(&dir);
         assert!(fake.calls().is_empty());
     }
+    /// Review ai-review claude #6, checked: does the TUI's set-branch honour `DISCARD_MAX_GB`, the
+    /// most a `--hard` save copies? It has nothing to honour: the TUI only ever switches gently —
+    /// `--hard` is the CLI's — and a gentle switch saves nothing. Pinned: the switch it sends is
+    /// `checkout_command(…, false)`, holding no save, the same whatever the limit says (a bad value
+    /// included), and the same as the limited command with any limit. Were the TUI ever to switch
+    /// with `--hard`, this fails, and the limit would have to be passed as the CLI passes it.
+    #[tokio::test]
+    async fn the_tuis_set_branch_is_gentle_so_no_save_limit_applies() {
+        use arena_core::backup::{checkout_command, checkout_command_limited, discard_max_kb};
+        let alpha = pod("alpha", "runpod", "rp1", 1, Some(22001));
+        for extra in ["", "DISCARD_MAX_GB=0.001\n", "DISCARD_MAX_GB=lots\n"] {
+            let cfg = cfg(&format!("GIT_SSH_KEY_REMOTE=/k\n{extra}"));
+            let fake = FakeRemote::new();
+            fake.script("10.0.0.1:22001", vec![FakeReply::stdout("NO_CHANGES autocommit-x\n"), FakeReply::ok()]);
+            assert_eq!(run_set_branch(&fake, &cfg, &alpha, "w1d2").await, "✓ devtest-alpha → w1d2", "{extra:?}");
+            let sent: Vec<String> = fake.calls().into_iter().filter_map(|c| match c { RemoteCall::Exec { cmd, .. } => Some(cmd), _ => None }).collect();
+            let gentle = checkout_command("/root/ARENA_materials", "w1d2", Some("/k"), false);
+            assert_eq!(sent.get(1), Some(&gentle), "{extra:?}");
+            assert!(!gentle.contains("discarded_save"));
+            if let Ok(kb) = discard_max_kb(&cfg) {
+                assert_eq!(checkout_command_limited("/root/ARENA_materials", "w1d2", Some("/k"), false, kb), gentle, "{extra:?}");
+            }
+        }
+    }
+
     /// A provider for the action tests that never answers a fleet call it isn't asked.
     fn quiet_fleet() -> FakeFleet {
         FakeFleet { pods: vec![], lists: AtomicUsize::new(0), details: AtomicUsize::new(0), details_error: None }
@@ -4889,10 +4993,12 @@ deep_check_end=1
     /// aren't known to — from the real fleet's answers, as the refresh records them; a marked
     /// set's menu says the worst of its pods'. It used to say "WIPES" for every pod. The confirm
     /// is as strict as before: the name typed back, and a ⚠ wherever the backend may wipe.
+    /// A config without `RUNPOD_API` ("") is v2's: its RunPod pods say WIPES.
     #[test]
     fn the_restart_label_follows_each_pods_backend() {
         let fleet = |api: &str| -> Arc<dyn Provider> {
-            let keys = format!("RUNPOD_API_KEY=r\nRUNPOD_API={api}\nVAST_API_KEY=v\nHETZNER_API_KEY=h\n");
+            let line = if api.is_empty() { String::new() } else { format!("RUNPOD_API={api}\n") };
+            let keys = format!("RUNPOD_API_KEY=r\n{line}VAST_API_KEY=v\nHETZNER_API_KEY=h\n");
             Arc::from(arena_core::provider::build_fleet("runpod", &Config::parse(&keys), false).unwrap())
         };
         let (rp, va, hz) = (pod("alpha", "runpod", "rp1", 1, Some(22001)), pod("bravo", "vast", "va1", 2, Some(22002)), pod("charlie", "hetzner", "hz1", 3, Some(22)));
@@ -4905,7 +5011,7 @@ deep_check_end=1
         // Nothing recorded yet: never "keeps", never "WIPES".
         ui.mode = Mode::Menu { sel: 0 };
         assert!(draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("restart — may wipe the container disk"));
-        for (api, runpod) in [("v2", "WIPES the container disk"), ("v1", "may wipe the container disk")] {
+        for (api, runpod) in [("v2", "WIPES the container disk"), ("v1", "may wipe the container disk"), ("", "WIPES the container disk")] {
             let f = fleet(api);
             shared.lock().unwrap().resets = backend_resets(f.as_ref(), &pods);
             for (id, want) in [("rp1", runpod), ("va1", "may wipe the container disk"), ("hz1", "keeps the disk")] {
@@ -4922,7 +5028,7 @@ deep_check_end=1
             ui.marked.clear();
             // The single-pod confirm: the name typed back whatever the answer; the warning where
             // the backend may wipe, worded by its answer.
-            for (id, warn) in [("rp1", if api == "v2" { "⚠ WIPES THE CONTAINER DISK" } else { "⚠ MAY WIPE THE CONTAINER DISK" }), ("va1", "⚠ MAY WIPE"), ("hz1", "the disk is kept")] {
+            for (id, warn) in [("rp1", if api == "v1" { "⚠ MAY WIPE THE CONTAINER DISK" } else { "⚠ WIPES THE CONTAINER DISK" }), ("va1", "⚠ MAY WIPE"), ("hz1", "the disk is kept")] {
                 (ui.selected, ui.mode) = (at(id), Mode::List);
                 choose_pod_action(&shared, &mut ui, &f, Action::Restart);
                 let Mode::Confirm(c) = &ui.mode else { panic!("{:?}", ui.mode) };

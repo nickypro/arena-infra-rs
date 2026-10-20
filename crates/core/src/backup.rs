@@ -13,12 +13,16 @@
 //! The image's nested clones are adopted instead — the course repo tracks their files where they
 //! are, their own `.git` untouched — once; other nested repos are kept out and reported. A file
 //! holding a key is committed with the key redacted, the file on disk untouched; and unpushed
-//! commits holding one (an older backup's, or the participant's own) are rewritten redacted before
-//! the push, which goes out as a fast-forward. The script is [`backup_script`].
+//! commits holding one, in a file or in their message (an older backup's, or the participant's
+//! own), are rewritten redacted before the push, which goes out as a fast-forward. The script is
+//! [`backup_script`].
 //!
 //! Before any of that, a checkout whose `origin` isn't the configured repo ([`configured_repo`])
 //! is refused: nothing committed, nothing pushed, `WRONG_ORIGIN` said
-//! ([`BACKUP_WRONG_ORIGIN_EXIT`]). `init-branches`' command checks the same.
+//! ([`BACKUP_WRONG_ORIGIN_EXIT`]). `init-branches`' command checks the same. And a branch with an
+//! operation in progress (a participant's conflicted `git pull upstream main`, …) is left as it is
+//! — `BUSY`, [`BACKUP_BUSY_EXIT`] — since committing would end it, conflict markers and all; the
+//! gentle switches refuse to end one too.
 //!
 //! This module only *renders* the command (pure, unit-tested). Running it — and thus
 //! mutating remote git state — is gated behind the CLI's `--apply`.
@@ -114,8 +118,16 @@ pub const GITHUB_FILE_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 pub const BACKUP_STUCK_EXIT: i32 = 3;
 
 /// The exit status of a backup whose push GitHub's push protection still refuses after the
-/// redaction and the heal: a key [`SECRET_PATTERNS`] doesn't know (`PUSH_BLOCKED <reason>`).
+/// redaction and the heal: a key [`SECRET_PATTERNS`] doesn't know (`PUSH_BLOCKED <reason>`) — or
+/// whose own last scan found a key still in what would go out, so it never pushed ([`KEY_LEFT`]).
 pub const BACKUP_BLOCKED_EXIT: i32 = 4;
+
+/// `PUSH_BLOCKED`'s reason when the backup's last scan before the push — of exactly the commits
+/// and blobs going out — still finds a key (review claude #1, FIX10): in a commit's header (an
+/// author's or committer's name or email, a merged signed tag's `mergetag`), in a file the
+/// redaction never rewrites (binary, a symlink's target), or one a redaction missed. Nothing was
+/// pushed; the pod is copied as for a refused push ([`BackupReport::failed_at_push`]).
+pub const KEY_LEFT: &str = "key left after redaction";
 
 /// The exit status of a backup (or `init-branches`) on a pod whose `origin` isn't the configured
 /// repo ([`configured_repo`]): `WRONG_ORIGIN`, checked before anything else, so nothing is
@@ -123,6 +135,14 @@ pub const BACKUP_BLOCKED_EXIT: i32 = 4;
 /// course repo as `origin` and no deploy key, so it was never backed up to git, and nothing said
 /// so.
 pub const BACKUP_WRONG_ORIGIN_EXIT: i32 = 5;
+
+/// The exit status of a backup that found an operation in progress on the branch ([`BUSY_OP_SH`]:
+/// a merge, a cherry-pick, a revert, or conflicts a `git stash pop` left): `BUSY <branch> <what>`,
+/// nothing staged, committed or pushed. Committing then would stage the conflict markers and end
+/// the operation — a participant's conflicted `git pull upstream main` became a merge commit,
+/// markers and all, pushed, and `git merge --abort` no longer worked (review R3). A branch switch
+/// that would end one refuses with it too ([`checkout_command`], [`init_branch_command`]).
+pub const BACKUP_BUSY_EXIT: i32 = 6;
 
 /// One kind of key the backup never lets into git ([`SECRET_PATTERNS`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +264,158 @@ pub fn redact_sed() -> String {
 /// secret) — never printed, never passed on to a report line or a log.
 pub const NO_BYPASS_URL_SH: &str = "no_bypass_url() { LC_ALL=C grep -viE 'https?://[^ ]*(unblock|bypass|secret-scanning)' || true; }";
 
+/// `busy_op <git dir>`, run from the checkout's top: what is in progress there that a commit or a
+/// branch switch would end or break — the first of `rebase` (`rebase-merge/`, or `rebase-apply/`
+/// without `applying`), `am` (`rebase-apply/applying`: `git am`, which keeps HEAD attached),
+/// `merge`, `cherry-pick` or `revert` (its `*_HEAD` file), `sequence` (`sequencer/` alone: a
+/// multi-commit cherry-pick or revert paused between its commits, e.g. after one was resolved and
+/// committed by hand) — git's own tests for them (`wt-status.c`), in the order git checks them —
+/// followed by ` unmerged` while the index still has unmerged paths (conflicts not yet resolved
+/// and added), else `conflicts` (unmerged paths and none of those: a `git stash pop` that
+/// conflicted) — or nothing. Every path is under `<git dir>`, the worktree's own (`git rev-parse
+/// --absolute-git-dir`: in a linked worktree, `.git/worktrees/<name>`, where git keeps these). The
+/// `unmerged` word lets the words name conflicts only when there are some, and give the step git
+/// wants first (review F4: a merge whose conflicts are all staged, a clean `git merge --no-commit`
+/// or `git revert -n` has none; with some, `git commit` is refused until they're added). Review
+/// pr4: `git am` with a patch that didn't apply has no unmerged path and no `*_HEAD`, so the
+/// backup committed and pushed the participant's half-applied patch mid-`am`. A rebase detaches
+/// HEAD, so on a branch the backup commits only a rebase that kept HEAD attached meets this; on
+/// a detached HEAD it's said before the `SKIP` (`UNCOMMITTED`). Shared by the backup script
+/// (`BUSY`, [`BACKUP_BUSY_EXIT`]) and the switches that refuse to end one ([`checkout_command`]'s
+/// gentle switch, [`init_branch_command`]).
+pub const BUSY_OP_SH: &str = "busy_op() { if [ -n \"$(git ls-files -u | head -n 1)\" ]; then busy_u=' unmerged'; else busy_u=; fi; \
+     if [ -d \"$1/rebase-merge\" ]; then echo \"rebase$busy_u\"; \
+     elif [ -d \"$1/rebase-apply\" ]; then if [ -e \"$1/rebase-apply/applying\" ]; then echo \"am$busy_u\"; else echo \"rebase$busy_u\"; fi; \
+     elif [ -e \"$1/MERGE_HEAD\" ]; then echo \"merge$busy_u\"; elif [ -e \"$1/CHERRY_PICK_HEAD\" ]; then echo \"cherry-pick$busy_u\"; \
+     elif [ -e \"$1/REVERT_HEAD\" ]; then echo \"revert$busy_u\"; elif [ -d \"$1/sequencer\" ]; then echo \"sequence$busy_u\"; \
+     elif [ -n \"$busy_u\" ]; then echo conflicts; fi; }";
+
+/// Every word [`BUSY_OP_SH`] prints first: the operations, then `conflicts` (a `git stash pop`'s).
+pub const BUSY_WORDS: [&str; 7] = ["merge", "cherry-pick", "revert", "am", "rebase", "sequence", "conflicts"];
+
+/// Every line [`BUSY_OP_SH`] prints, as `(what, unmerged)`: each operation with its conflicts
+/// resolved or not, and `conflicts` (unmerged by definition).
+const BUSY_LINES: [(&str, bool); 13] = [
+    ("merge", false),
+    ("merge", true),
+    ("cherry-pick", false),
+    ("cherry-pick", true),
+    ("revert", false),
+    ("revert", true),
+    ("am", false),
+    ("am", true),
+    ("rebase", false),
+    ("rebase", true),
+    ("sequence", false),
+    ("sequence", true),
+    ("conflicts", true),
+];
+
+/// What is in progress on `branch` (`what`: [`BUSY_OP_SH`]'s word), in words: "a merge is in
+/// progress on b", "a `git am` is in progress on b", "b has unresolved conflicts".
+pub fn busy_situation(what: &str, branch: &str) -> String {
+    match what {
+        "merge" | "cherry-pick" | "revert" | "rebase" => format!("a {what} is in progress on {branch}"),
+        "am" => format!("a `git am` is in progress on {branch}"),
+        "sequence" => format!("a cherry-pick or revert sequence is in progress on {branch}"),
+        "conflicts" => format!("{branch} has unresolved conflicts"),
+        _ => format!("a git operation ({what}) is in progress on {branch}"),
+    }
+}
+
+/// How to end an operation in progress either way — since only the participant knows which they
+/// want — with the step git asks for first: while paths are `unmerged`, `git commit` (or
+/// `--continue`) is refused until they're resolved and added (review F4), so that comes first.
+/// A merge: "finish it (`git commit`) or abort it (`git merge --abort`)", or with unmerged paths
+/// "resolve the conflicts and `git add` them, then `git commit` — or abort it (`git merge
+/// --abort`)"; `git am`, a rebase: their own `--continue`/`--abort`. A sequence paused between its
+/// commits may be a cherry-pick's or a revert's (only `--continue` with the right one works), so
+/// both are named. A `git stash pop`'s conflicts have nothing to commit or continue: resolve and
+/// add them, or undo them.
+pub fn busy_advice(what: &str, unmerged: bool) -> String {
+    let (finish, abort) = match what {
+        "merge" => ("`git commit`", "`git merge --abort`"),
+        "cherry-pick" => ("`git cherry-pick --continue`", "`git cherry-pick --abort`"),
+        "revert" => ("`git revert --continue`", "`git revert --abort`"),
+        "am" => ("`git am --continue`", "`git am --abort`"),
+        "rebase" => ("`git rebase --continue`", "`git rebase --abort`"),
+        "sequence" => ("`git cherry-pick --continue`, or `git revert --continue` for a revert", "`git cherry-pick --abort`, or `git revert --abort`"),
+        "conflicts" => return "resolve them and `git add` them, or undo them (`git reset --merge`)".to_string(),
+        _ => return "finish it or abort it".to_string(),
+    };
+    if unmerged {
+        format!("resolve the conflicts and `git add` them, then {finish} — or abort it ({abort})")
+    } else {
+        format!("finish it ({finish}) or abort it ({abort})")
+    }
+}
+
+/// [`busy_situation`]'s operation as the object of a sentence: `the merge`, `the \`git am\``,
+/// `the sequence`, `the unresolved conflicts`.
+pub fn busy_noun(what: &str) -> String {
+    match what {
+        "conflicts" => "the unresolved conflicts".to_string(),
+        "am" => "the `git am`".to_string(),
+        _ => format!("the {what}"),
+    }
+}
+
+/// Why a branch switch must not happen mid-operation, as the parenthesis of a refusal: a merge,
+/// cherry-pick or revert would be ended (its `*_HEAD` dropped); `git am`, a rebase or a paused
+/// sequence would be carried, half-done, onto the other branch (their state stays: a `--continue`
+/// there applies the rest onto it). `None` for a `git stash pop`'s conflicts: nothing to end.
+pub fn busy_switch_why(what: &str) -> Option<String> {
+    match what {
+        "conflicts" => None,
+        "am" | "rebase" | "sequence" => Some(format!("a switch now would carry {}, half-done, onto the other branch", busy_noun(what))),
+        _ => Some(format!("a switch now would end {}", busy_noun(what))),
+    }
+}
+
+/// What a backup's commit would do now, mid-operation: commit the operation's state — its
+/// conflicts named only when there are unmerged paths (a merge with its conflicts staged, a clean
+/// `git revert -n`, has no conflict markers to commit: review F4) — and end it; for `git am`, a
+/// rebase or a sequence, commit what is there in the middle of it.
+fn busy_would(what: &str, unmerged: bool) -> String {
+    let conflicts = if unmerged { ", unresolved conflicts and all," } else { "" };
+    match what {
+        "conflicts" => "a backup now would commit the conflicted files as they are".to_string(),
+        "am" | "rebase" | "sequence" => format!("a backup now would commit what is there{conflicts} in the middle of {}", busy_noun(what)),
+        _ => format!("a backup now would commit the {what}'s state{conflicts} and end {}", busy_noun(what)),
+    }
+}
+
+/// A branch switch's first step (`who` names it on stderr: `arena set-branch`), from the checkout's
+/// top: while an operation is in progress ([`BUSY_OP_SH`]) it refuses — what is in progress and how
+/// to end it ([`busy_situation`], [`busy_advice`]) on stderr, exit [`BACKUP_BUSY_EXIT`] — before
+/// anything is touched. Checked with real git, mid-merge: `git checkout -b` (init-branches)
+/// succeeds and drops `MERGE_HEAD`, leaving the conflicted index on the new branch with no merge to
+/// abort; a gentle `git checkout` refuses unmerged paths but silently ends a merge whose conflicts
+/// are resolved and staged, carrying them onto the other branch. Mid-`git am` (a patch that didn't
+/// apply) a gentle checkout goes through and takes the `am` along. `--hard` doesn't run this: it
+/// discards uncommitted changes to tracked files by design, the operation with them.
+fn busy_refusal_sh(who: &str) -> String {
+    let cases: String = BUSY_LINES
+        .iter()
+        .map(|&(what, unmerged)| {
+            let why = busy_switch_why(what).map_or_else(String::new, |w| format!(" ({w})"));
+            let msg = format!(
+                "{who}: {} — not switched{why}; {} on the pod, then switch again",
+                busy_situation(what, "@BRANCH@"),
+                busy_advice(what, unmerged)
+            );
+            // The branch as the shell knows it, outside the quotes: the words never are code.
+            let shell = msg.split("@BRANCH@").map(shell_quote).collect::<Vec<_>>().join("\"$BUSY_B\"");
+            let printed = if unmerged && what != "conflicts" { format!("{what} unmerged") } else { what.to_string() };
+            format!("{}) printf '%s\\n' {shell} >&2;; ", shell_quote(&printed))
+        })
+        .collect();
+    format!(
+        "cd \"$(git rev-parse --show-toplevel)\"; {BUSY_OP_SH}; BUSY_W=$(busy_op \"$(git rev-parse --absolute-git-dir)\"); \
+         if [ -n \"$BUSY_W\" ]; then BUSY_B=$(git rev-parse --abbrev-ref HEAD); case $BUSY_W in {cases}esac; exit {BACKUP_BUSY_EXIT}; fi"
+    )
+}
+
 /// The redaction's shell functions (`redact.sh`), with [`secret_regex`] and [`redact_sed`]
 /// rendered in — shared by the backup script and `set-branch`'s command.
 pub fn redact_sh() -> String {
@@ -261,19 +433,21 @@ pub fn origin_sh() -> &'static str {
 }
 
 /// The lines of `backup.sh` that [`backup_script`] replaces with [`redact_sh`],
-/// [`NO_BYPASS_URL_SH`] and [`origin_sh`].
+/// [`NO_BYPASS_URL_SH`], [`origin_sh`] and [`BUSY_OP_SH`].
 const REDACT_SH_MARK: &str = "# @ARENA_REDACT_SH@";
 const NO_BYPASS_URL_MARK: &str = "# @ARENA_NO_BYPASS_URL@";
 const ORIGIN_SH_MARK: &str = "# @ARENA_ORIGIN_SH@";
+const BUSY_OP_MARK: &str = "# @ARENA_BUSY_OP_SH@";
 
-/// The backup script ([`backup_command`]): `backup.sh` with [`redact_sh`], [`NO_BYPASS_URL_SH`]
-/// and [`origin_sh`] rendered in. POSIX `sh`, so it runs the same whatever the pod's login shell;
-/// its header documents every line it prints.
+/// The backup script ([`backup_command`]): `backup.sh` with [`redact_sh`], [`NO_BYPASS_URL_SH`],
+/// [`origin_sh`] and [`BUSY_OP_SH`] rendered in. POSIX `sh`, so it runs the same whatever the
+/// pod's login shell; its header documents every line it prints.
 pub fn backup_script() -> String {
     include_str!("backup.sh")
         .replacen(ORIGIN_SH_MARK, origin_sh().trim_end(), 1)
         .replacen(REDACT_SH_MARK, redact_sh().trim_end(), 1)
         .replacen(NO_BYPASS_URL_MARK, NO_BYPASS_URL_SH, 1)
+        .replacen(BUSY_OP_MARK, BUSY_OP_SH, 1)
 }
 
 /// Render the remote shell command that commits + pushes one machine's working tree **on
@@ -289,18 +463,34 @@ pub fn backup_script() -> String {
 /// Flow: resolve the current branch; skip if protected; ensure a git identity; adopt the
 /// image's nested clones into the repo once (their files tracked in place, their own `.git`
 /// untouched), keep any other nested repo out of the commit (never a gitlink); stage everything but files over the limit; commit if anything is
-/// staged; then push whenever the branch has **no upstream yet or is ahead of it** — not
-/// only when this run committed. A push that failed last tick (network blip, GitHub outage,
-/// a key briefly missing) leaves its commit local and the tree clean, so "nothing staged"
-/// must not read as "nothing to do": the next tick retries the push. Only a clean tree *and*
-/// `HEAD == @{u}` prints `NO_CHANGES <branch>` (exit 0); a push prints `PUSHED <branch>`. A
-/// file over GitHub's limit already in the unpushed commits fails it with
-/// [`BACKUP_STUCK_EXIT`] and what to reset to — before a push GitHub would refuse.
+/// staged; then push whenever **origin has no such branch yet or the branch is ahead of
+/// origin's** — not only when this run committed — exactly the commit the run fixed and scanned
+/// (or its rewrite), by its id: a commit the participant makes meanwhile waits for the next run
+/// (review ai-review codex #1, FIX7). A push that failed last tick (network blip,
+/// GitHub outage, a key briefly missing) leaves its commit local and the tree clean, so "nothing
+/// staged" must not read as "nothing to do": the next tick retries the push. Only a clean tree
+/// *and* `HEAD == refs/remotes/origin/<branch>` prints `NO_CHANGES <branch>` (exit 0); a push
+/// prints `PUSHED <branch>`. "Already pushed" always means on origin — the branch's configured
+/// upstream and the course repo setup adds as `upstream` don't count (review ai-review claude
+/// #6): a commit only `upstream` has — the course's own included (FIX8) — is scanned for keys and
+/// redacted like any other. A file over GitHub's limit already in the unpushed commits fails it
+/// with [`BACKUP_STUCK_EXIT`] and what to reset to — before a push GitHub would refuse.
 /// `set -e` aborts on any other error, so a rejected push is a failure.
 ///
 /// `origin` is the configured repo ([`configured_repo`]). Before anything else, the main/master
 /// SKIP included, a checkout whose `origin` isn't that repo ends the run with `WRONG_ORIGIN` and
 /// [`BACKUP_WRONG_ORIGIN_EXIT`]: nothing committed, nothing pushed. `None`: no check.
+///
+/// On a branch it backs up, an operation in progress — a conflicted merge, cherry-pick or revert,
+/// or a `git stash pop`'s conflicts ([`BUSY_OP_SH`]) — ends the run before anything is staged:
+/// `BUSY <branch> <what>`, [`BACKUP_BUSY_EXIT`], nothing committed or pushed, so the participant
+/// can still finish or abort it ([`BackupReport::failure`] says how). It is checked again right
+/// before the staging and right before the commit, so one started during the scans is caught
+/// too (review ai-review codex #1). On one it skips, the work
+/// there no backup saves — that, changes to tracked files, commits no remote has, or untracked
+/// files — is only said (`UNCOMMITTED`, [`BackupReport::uncommitted`]) before the `SKIP`,
+/// read-only: the run still skips it, exit 0, and `set-branch --hard` copies the pod before
+/// resetting it.
 pub fn backup_command(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, origin: Option<&str>) -> String {
     backup_command_limited(repo_path, git_ssh_key, commit_msg, GIT_MAX_FILE_BYTES, GITHUB_FILE_LIMIT_BYTES, origin)
 }
@@ -403,6 +593,18 @@ pub struct BackupReport {
     /// `(the configured owner/name, origin's URL with any credentials taken out)`. The URL is
     /// empty when there is no `origin` at all.
     pub wrong_origin: Option<(String, String)>,
+    /// What is in progress on the branch (`BUSY <branch> <what>`: `merge`, `cherry-pick`, `revert`
+    /// or `conflicts`), so nothing was staged, committed or pushed.
+    pub busy: Option<String>,
+    /// The index has unmerged paths — conflicts not yet resolved and added (`BUSY`'s or
+    /// `UNCOMMITTED`'s `unmerged` word; always so for `conflicts`).
+    pub unmerged: bool,
+    /// On a branch no backup commits (a `SKIP`), the work there that a `--hard` reset could
+    /// discard (`UNCOMMITTED <branch> <what>`), the first of: an operation in progress
+    /// ([`BUSY_OP_SH`]'s word), `changes` to tracked files, `commits` no remote has, `untracked`
+    /// files (not ignored, nested repos aside). `set-branch --hard` copies such a pod first, `.git`
+    /// with it.
+    pub uncommitted: Option<String>,
 }
 
 /// Parse a backup's stdout ([`backup_script`]'s header lists the lines). Unknown lines (git's
@@ -436,6 +638,19 @@ pub fn parse_backup_report(stdout: &str) -> BackupReport {
                 r.wrong_origin = Some((want.trim().to_string(), url.trim().to_string()));
             }
             "HEAL_ABORTED" => r.heal_aborted = Some(rest.trim().to_string()),
+            "BUSY" => {
+                if let [branch, what, ref more @ ..] = rest.split_whitespace().collect::<Vec<_>>()[..] {
+                    r.busy = Some(what.to_string());
+                    r.unmerged = what == "conflicts" || more.contains(&"unmerged");
+                    r.branch.get_or_insert_with(|| branch.to_string());
+                }
+            }
+            "UNCOMMITTED" => {
+                if let [_, what, ref more @ ..] = rest.split_whitespace().collect::<Vec<_>>()[..] {
+                    r.uncommitted = Some(what.to_string());
+                    r.unmerged = what == "conflicts" || more.contains(&"unmerged");
+                }
+            }
             "PUSH_BLOCKED" => {
                 let why = rest.trim();
                 r.push_blocked = Some(if why.is_empty() { "refused by GitHub push protection".into() } else { why.to_string() });
@@ -523,11 +738,16 @@ impl BackupReport {
 
     /// For a run that failed in a way the script explained — a file over GitHub's limit in the
     /// unpushed commits ([`Self::stuck_fix`]), a key GitHub refuses that the redaction doesn't
-    /// know, a heal cut short — what happened and what to do; `None` for any other run (exit
-    /// `code`). `repo` is the checkout on `pod`.
+    /// know, a heal cut short, an operation in progress ([`Self::in_progress`]) — what happened
+    /// and what to do; `None` for any other run (exit `code`). `repo` is the checkout on `pod`.
     pub fn failure(&self, repo: &str, pod: &str, code: Option<i32>) -> Option<String> {
         if let Some(why) = self.wrong_origin_why(code) {
             return Some(format!("{why} — not backed up to git; run `arena pods setup {pod}`"));
+        }
+        if let Some(what) = self.in_progress(code) {
+            let situation = busy_situation(what, self.branch.as_deref().unwrap_or("its branch"));
+            let (would, advice) = (busy_would(what, self.unmerged), busy_advice(what, self.unmerged));
+            return Some(format!("{situation} — not committed ({would}); {advice} on the pod"));
         }
         if code == Some(BACKUP_STUCK_EXIT) {
             if let Some(fix) = self.stuck_fix(repo, pod) {
@@ -536,6 +756,13 @@ impl BackupReport {
         }
         if let (Some(BACKUP_BLOCKED_EXIT), Some(why)) = (code, &self.push_blocked) {
             let branch = self.branch.as_deref().unwrap_or("its branch");
+            if why == KEY_LEFT {
+                return Some(format!(
+                    "a key is still in the unpushed commits of {branch} after the redaction — in a commit's author, committer \
+                     or merged tag, a binary file or a symlink, or a redaction that didn't take — so nothing was pushed. Take \
+                     it out of those commits on {pod} by hand"
+                ));
+            }
             return Some(format!(
                 "GitHub push protection refuses {branch}: {why} — a secret the backup doesn't redact. Its pattern belongs in \
                  arena_core::backup::SECRET_PATTERNS; until then, take it out of the unpushed commits on {pod} by hand \
@@ -550,12 +777,15 @@ impl BackupReport {
 
     /// Whether the run reached the repo and failed at the push itself — refused, a big file in
     /// the way, a rewrite cut short, or the push failing outright: the failures where the
-    /// pod's work is there but not on GitHub, so it gets the fallback copy. A run that never got
-    /// that far (no repo, ssh denied, a timeout: nothing says how far it got) fails as it
-    /// always did, and isn't rsynced every 15 minutes. A wrong `origin` is not one of these
+    /// pod's work is there but not on GitHub, so it gets the fallback copy. An operation in
+    /// progress (`BUSY`) counts too: the run reached the repo and stopped before the commit, so
+    /// GitHub has the work only up to the last backup, every run until the participant ends it —
+    /// the copy is all that keeps the rest. A run that never got that far (no repo, ssh denied, a
+    /// timeout: nothing says how far it got) fails as it always did, and isn't rsynced every 15
+    /// minutes. A wrong `origin` is not one of these
     /// either (nothing was tried): what to do with it is the caller's ([`Self::wrong_origin`]).
     pub fn failed_at_push(&self) -> bool {
-        self.push_failed || self.push_blocked.is_some() || self.heal_aborted.is_some() || !self.big_stuck.is_empty()
+        self.push_failed || self.push_blocked.is_some() || self.heal_aborted.is_some() || !self.big_stuck.is_empty() || self.busy.is_some()
     }
 
     /// [`Self::failure`] in a few words, for a line that says what else happened (the fallback
@@ -564,10 +794,17 @@ impl BackupReport {
         if let Some(why) = self.wrong_origin_why(code) {
             return Some(why);
         }
+        if let Some(what) = self.in_progress(code) {
+            let situation = busy_situation(what, self.branch.as_deref().unwrap_or("its branch"));
+            return Some(format!("{situation} — not committed; {} on the pod", busy_advice(what, self.unmerged)));
+        }
         if code == Some(BACKUP_STUCK_EXIT) && !self.big_stuck.is_empty() {
             return Some(format!("file(s) over {} MB in unpushed commits", GITHUB_FILE_LIMIT_BYTES / (1024 * 1024)));
         }
         if let (Some(BACKUP_BLOCKED_EXIT), Some(why)) = (code, &self.push_blocked) {
+            if why == KEY_LEFT {
+                return Some("a key left in the unpushed commits after the redaction".into());
+            }
             return Some(format!("GitHub push protection: {why}"));
         }
         self.heal_aborted.as_ref().map(|_| "the branch moved while its commits were being redacted".to_string())
@@ -583,6 +820,25 @@ impl BackupReport {
         } else {
             format!("origin is {url}, not the configured {want}")
         })
+    }
+
+    /// For a run that stopped because an operation is in progress on the branch (`BUSY`, exit
+    /// [`BACKUP_BUSY_EXIT`]): what it is (`merge`, `cherry-pick`, `revert`, `conflicts`). `None` for
+    /// any other run.
+    pub fn in_progress(&self, code: Option<i32>) -> Option<&str> {
+        self.busy.as_deref().filter(|_| code == Some(BACKUP_BUSY_EXIT))
+    }
+
+    /// For a run that skipped a protected branch (`SKIP`) with work there no backup saves
+    /// ([`Self::uncommitted`]): that work in words, and why only a copy can keep it — "main has
+    /// uncommitted changes to tracked files — no backup commits on main", "a merge is in progress
+    /// on main — no backup commits on main", "main has commits no remote has — no backup pushes
+    /// main", "main has untracked files — no backup commits on main". `None` for any other run.
+    pub fn uncommitted_why(&self) -> Option<String> {
+        let what = self.uncommitted.as_deref()?;
+        let (_, branch) = self.outcome.as_ref().filter(|(sentinel, _)| *sentinel == BACKUP_SKIPPED)?;
+        let on = if branch == "HEAD" { "a detached HEAD" } else { branch.as_str() };
+        Some(format!("{} — {}", uncommitted_situation(what, on), uncommitted_reason(what, on)))
     }
 
     /// For a run that found files over GitHub's limit in the unpushed commits: why nothing can be
@@ -610,18 +866,66 @@ impl BackupReport {
     }
 }
 
+/// The work on a branch no backup commits (`on`: `main`, `a detached HEAD`) that an `UNCOMMITTED`
+/// line names (`what`: [`BUSY_OP_SH`]'s word, `changes`, `commits` or `untracked`), in words: "main
+/// has uncommitted changes to tracked files", "main has commits no remote has", "main has
+/// untracked files", "a merge is in progress on main".
+pub fn uncommitted_situation(what: &str, on: &str) -> String {
+    match what {
+        "changes" => format!("{on} has uncommitted changes to tracked files"),
+        "commits" => format!("{on} has commits no remote has"),
+        "untracked" => format!("{on} has untracked files"),
+        _ => busy_situation(what, on),
+    }
+}
+
+/// Why no backup keeps that work (`what` as for [`uncommitted_situation`]): "no backup commits on
+/// main" — or, for commits already made, "no backup pushes main".
+pub fn uncommitted_reason(what: &str, on: &str) -> String {
+    match what {
+        "commits" => format!("no backup pushes {on}"),
+        _ => format!("no backup commits on {on}"),
+    }
+}
+
 /// Render the remote command that *creates* (or switches to) a machine's autocommit
 /// branch for the iteration and pushes it upstream — **without committing any work**
 /// (legacy `init_branches.sh`). Run at the start of a day so the branch exists (with an
-/// upstream) before any `backup`; later backups then just commit onto it. `set -e`
+/// upstream) before any `backup`; later backups then just commit onto it. It pushes only
+/// commits origin already has, never one no backup has scanned ([`INIT_PUSH_SH`]): the rest stay
+/// on the new branch on the pod (`UNPUSHED`, [`parse_init_unpushed`]) for the next backup, which
+/// scans them for keys and pushes them. `set -e`
 /// aborts on the first real error. A checkout whose `origin` isn't the configured repo
 /// (`cfg.origin`) is refused before anything else, as the backup refuses it (`WRONG_ORIGIN`,
 /// [`BACKUP_WRONG_ORIGIN_EXIT`]): the new branch is neither made nor pushed. After the checkout,
 /// the real keys a switch set aside on the branch now checked out go back where the file holds
 /// exactly their redacted version (`UNREDACTED_RESTORED <path>`) — `unredacted.sh`'s restore,
 /// the step [`checkout_command`] ends with — so a day branch that already exists isn't left with
-/// them set aside, unsaid (live bsec O1).
+/// them set aside, unsaid (live bsec O1). A checkout with an operation in progress (a conflicted
+/// merge, …: [`BUSY_OP_SH`]) is refused next, before anything is fetched or switched (exit
+/// [`BACKUP_BUSY_EXIT`], what and how to end it on stderr): `git checkout -b` would drop its
+/// `MERGE_HEAD` and carry the conflicted index onto the new branch, with no merge left to abort.
+///
+/// Its script runs under `sh`, whatever the login shell that `-c`s the command — zsh on the pods,
+/// where a glob with no match is fatal: `unredacted_restore`'s `"$1"/*.branch`, with a set-aside
+/// run left without its `.branch`, ended the whole command there, before the push (the restore
+/// run under zsh skipped too; found in FIX4B, item 9). And it bounds itself on the pod like
+/// set-branch's switch ([`checkout_command`], [`SWITCH_BOUND_SECS`]): it runs within the same
+/// 2-minute `BRANCH_TIMEOUT`.
 pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
+    let stopped = format!(
+        "arena init-branches: it ran past its {SWITCH_BOUND_SECS} s on the pod and was stopped there (TERM) — the day's branch may \
+         be made but not pushed, or not made: check the branch on the pod"
+    );
+    let killed = format!(
+        "arena init-branches: it ran past its {SWITCH_BOUND_SECS} s on the pod and was killed there ({SWITCH_KILL_AFTER_SECS} s after \
+         the TERM) — the day's branch may be made but not pushed, or not made: check the branch on the pod"
+    );
+    bounded_sh(&init_branch_script(cfg, machine_name), "arena-init-branches", SWITCH_BOUND_SECS, SWITCH_KILL_AFTER_SECS, &stopped, &killed)
+}
+
+/// What [`init_branch_command`] runs on the pod, a POSIX `sh` script.
+fn init_branch_script(cfg: &BackupConfig, machine_name: &str) -> String {
     let branch = cfg.branch_for(machine_name);
     let bq = shell_quote(&branch);
     let mut parts: Vec<String> =
@@ -633,6 +937,9 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
         parts.push(functions.join("\n"));
         parts.push(format!("origin_check {}", shell_quote(origin)));
     }
+    // Never a participant's merge (cherry-pick, revert, conflicts) ended by the switch:
+    // `checkout -b` would drop its MERGE_HEAD and leave the conflicts on the new branch.
+    parts.push(busy_refusal_sh("arena init-branches"));
     if let Some(key) = &cfg.git_ssh_key {
         parts.push(format!(
             "export GIT_SSH_COMMAND={}",
@@ -641,7 +948,10 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
             ))
         ));
     }
-    parts.push("git fetch --all --prune".into());
+    // Origin only — the remote this pushes to and branches from. Not `--all`: setup adds the
+    // public course repo as `upstream`, and under `set -e` one unreachable remote (a typo, an
+    // outage, a renamed repo) stopped every pod's day branch (review fb2 R1).
+    parts.push("git fetch --prune origin".into());
     // Create the branch from the current HEAD, or switch to it if it already exists.
     parts.push(format!("git checkout -b {bq} 2>/dev/null || git checkout {bq}"));
     // Landing on a day branch that already exists (`set-branch main --hard --init-branches` run
@@ -651,23 +961,108 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
     parts.push(format!("REDACT_SED={}", shell_quote(&redact_sed())));
     parts.push(unredacted_sh());
     parts.push("cd \"$(git rev-parse --show-toplevel)\"; unredacted_restore \"$(git rev-parse --absolute-git-dir)/arena-unredacted\"".into());
-    // The new branch carries any commit of the old one GitHub refuses (the next backup redacts
-    // and pushes it): the refusal goes to the operator without GitHub's allow-the-secret URL.
+    // Only what origin already has is pushed (review claude #2, FIX9B): [`INIT_PUSH_SH`].
+    parts.push(format!("NB={bq}"));
     parts.push(NO_BYPASS_URL_SH.into());
-    parts.push("P=$(git rev-parse --absolute-git-dir)/arena-init-push.$$".into());
-    parts.push(format!("if git push -u origin {bq} 2>\"$P\"; then R=0; else R=$?; fi"));
-    parts.push("no_bypass_url < \"$P\" >&2; rm -f \"$P\"; exit $R".into());
+    parts.push(INIT_PUSH_SH.trim_end().into());
     parts.join("; ")
+}
+
+/// How [`init_branch_command`] pushes the new branch `$NB`, now checked out: only what origin
+/// already has (review claude #2, FIX9B). The branch starts from HEAD, which may hold commits no
+/// backup has scanned — yesterday's whose push failed (the pod was rsynced and switched anyway),
+/// one the participant made since, a resolve's — and a push of the branch by name sent them raw: a
+/// key in them reached GitHub whenever its push protection didn't catch it. So the push is by id:
+/// HEAD when origin has all of it; else the newest commit of it origin has — origin's own copy of
+/// the branch when that is an ancestor (a second init the same day), so the push stays a
+/// fast-forward — or no push at all when origin has none of it. The rest stays on the new branch
+/// on the pod, said (`UNPUSHED <n> <id>|none`, [`parse_init_unpushed`]), and goes out with the next
+/// backup, which scans it. That commit alone, as the backup pushes (`--no-follow-tags`: a
+/// participant's `push.followTags` sends annotated tags along, unscanned). A refusal reaches the
+/// operator without GitHub's allow-the-secret URL
+/// (`no_bypass_url`). Pushed, the branch tracks origin's, as `push -u` made it (an id pushed sets
+/// no upstream), written to the config itself (a narrowed fetch has no remote-tracking ref).
+/// Before the push, that the commit is one origin has is checked, not assumed (review claude #1,
+/// FIX10): by the choice above it always is, so no key scan is needed — and a later change to that
+/// choice fails closed (not pushed, said, exit 1) instead of sending unscanned commits out.
+const INIT_PUSH_SH: &str = r#"TIP=$(git rev-parse HEAD)
+U=$(git rev-list --count "$TIP" --not --remotes=origin)
+AT=$TIP
+if [ "$U" != 0 ]; then
+    if git rev-parse -q --verify "refs/remotes/origin/$NB" >/dev/null && git merge-base --is-ancestor "refs/remotes/origin/$NB" "$TIP"; then
+        AT=$(git rev-parse "refs/remotes/origin/$NB")
+    else
+        AT=$(git rev-list --boundary "$TIP" --not --remotes=origin | sed -n 's/^-//p')
+        if [ -n "$AT" ]; then AT=$(git rev-list --no-walk $AT | head -n 1); fi
+    fi
+    echo "UNPUSHED $U ${AT:-none}"
+fi
+if [ -z "$AT" ]; then exit 0; fi
+if ! UNSEEN=$(git rev-list -n 1 "$AT" --not --remotes=origin) || [ -n "$UNSEEN" ]; then
+    echo "arena init-branches: $AT has commits origin doesn't have - not pushed (the next backup scans and pushes them)" >&2
+    exit 1
+fi
+P=$(git rev-parse --absolute-git-dir)/arena-init-push.$$
+if git push --no-follow-tags origin "$AT:refs/heads/$NB" 2>"$P"; then R=0; else R=$?; fi
+no_bypass_url < "$P" >&2; rm -f "$P"
+if [ "$R" = 0 ]; then git config "branch.$NB.remote" origin && git config "branch.$NB.merge" "refs/heads/$NB" || true; fi
+exit $R
+"#;
+
+/// What [`init_branch_command`] said it left unpushed (`UNPUSHED <n> <id>|none`): `n` commits of
+/// the new branch that origin doesn't have, left on the pod for the next backup to scan and push,
+/// and the commit the branch was pushed at (`None`: not pushed, origin has none of it). `None`
+/// when it pushed the whole branch.
+pub fn parse_init_unpushed(stdout: &str) -> Option<(u64, Option<String>)> {
+    stdout.lines().find_map(|l| {
+        let f: Vec<&str> = l.trim_end_matches('\r').strip_prefix("UNPUSHED ")?.split_whitespace().collect();
+        let [n, at] = f[..] else { return None };
+        Some((n.parse().ok()?, Some(at).filter(|a| *a != "none").map(String::from)))
+    })
 }
 
 /// Render the remote command that switches a pod's ARENA checkout to `branch`.
 ///
-/// `hard == false` (default): **gentle** — fetch, checkout, fast-forward pull. A
-/// diverged/dirty tree makes the `--ff-only` pull fail loudly rather than clobbering
-/// work. `hard == true`: **destructive** — fetch, then force the local branch to exactly
-/// match `origin/<branch>` (`checkout -f -B … origin/<branch>` + `reset --hard`),
-/// **discarding any local commits/changes on it** (untracked files are left in place).
-/// Used by `pods set-branch [--hard]` (e.g. reset everyone back to `main`).
+/// `hard == false` (default): **gentle** — fetch origin, checkout, then fast-forward to
+/// origin's branch (`git merge --ff-only refs/remotes/origin/<branch>`). A diverged/dirty tree
+/// makes the fast-forward fail loudly rather than clobbering work, and git refuses to overwrite an
+/// untracked file. All or nothing: when the checkout went through but the fast-forward didn't, it
+/// goes back to the branch it was on and says why (`switch_back`, [`SWITCH_BACK_SH`]) — or, if that
+/// fails too, which branch the pod is on now. Origin's branch, named outright — never the local branch's configured upstream
+/// (review ai-review codex #5: a `git pull --ff-only` there followed the upstream a participant's
+/// own `feat` tracked, `upstream/feat`, so it reached the course repo — failing the switch when that
+/// was unreachable, and merging the course's branch rather than the cohort's when it wasn't).
+/// `hard == true`: **destructive** — fetch, then force the local branch to exactly match
+/// `origin/<branch>` (`checkout -f -B … origin/<branch>` + `reset --hard`), **discarding any
+/// local commits/changes on it** — and **overwriting any untracked file at a path
+/// `origin/<branch>` tracks** (review pr4: checked with real git, a participant's untracked
+/// `solutions.py` on main became origin's); other untracked
+/// files stay. So `set-branch --hard` copies a pod on main with untracked files first. A `git am`,
+/// rebase or paused cherry-pick/revert sequence it switches away from would outlive the reset (git
+/// keeps their state across a checkout) and stop every later switch and backup as `BUSY`, and a
+/// `git rebase --abort` would then take the pod back off the branch: once switched, `--hard` ends
+/// them as it ends a merge (`--quit`: their state only — the stash a rebase's `--autostash` made
+/// is kept in the stash list). Used by `pods set-branch [--hard]` (e.g. reset everyone back to
+/// `main`).
+///
+/// What `--hard` is about to discard is first saved on the pod (`discarded.sh`): the uncommitted
+/// changes to tracked files — in one (HEAD -> the files) and staged and not apart (review ai-review
+/// codex #3: a version staged, then undone in the work tree, was in no patch), the commit they
+/// apply to kept by `refs/arena-discarded/<save>` (claude #11: else git's gc drops it once the
+/// reflog expires) — as the commits the reset leaves on no branch are, whether or not anything
+/// else is saved: the local `<branch>`'s that origin's doesn't have, by
+/// `refs/arena-discarded/<save>-<branch>` (the checkout moves it, whichever branch the pod was on),
+/// and HEAD's that no remote has (review ai-review codex #3) — the files with unresolved conflicts, an
+/// operation's state files (`MERGE_HEAD`, …) and the untracked or ignored files, links and
+/// directories the reset removes — a directory where the branch has a file or a link goes whole
+/// (`checkout -f` deletes it, ignored contents and a nested repo's `.git` with it: review
+/// ai-review codex #1, claude #7), so it is copied whole — with a README saying how to get them
+/// back — in `.git/arena-discarded/<UTC time>/`,
+/// which the reset doesn't touch and no later save reuses (review ai-review claude #2, codex #2:
+/// set-branch's own rsync of such a pod went to the day's snapshot label and the big mirror, which
+/// the next `pods pull` overwrites from the reset pod). Said as `DISCARDED_SAVED <path>` on
+/// stdout. A save that fails stops the switch before the reset: the pod isn't switched, and the
+/// part saved so far is removed.
 ///
 /// A nested clone the backup adopted (its files tracked by the course repo) is tracked on the
 /// autocommit branches only — the course's `main` doesn't have it — so switching to such a
@@ -685,11 +1080,160 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 /// difference from the index is keys the redaction knows is set aside in
 /// `.git/arena-unredacted/` and put back to git's version; after the switch, one whose path
 /// holds exactly that version again gets its real keys back (`UNREDACTED_RESTORED <path>`), the
-/// rest stay set aside (`UNREDACTED_KEPT <path>`) until a switch back. Even a failed switch puts
-/// them back before it exits. A file with any other uncommitted change is left to the switch, as
-/// before.
+/// rest stay set aside (`UNREDACTED_KEPT <path>`) until a switch back. The putting back is the
+/// command's EXIT trap, set just before the set-aside (review ai-review claude #4): a failed
+/// switch, a step that fails under `set -e`, and a hangup, interrupt or TERM sent to the switch's
+/// shell (each made an exit) all put them back before the command ends — never a participant left
+/// with the redacted placeholder in their code. A file with any other uncommitted change is left
+/// to the switch, as before.
+///
+/// What that trap does *not* cover: arena's own timeout (the CLI's and the TUI's 2-minute
+/// `BRANCH_TIMEOUT`) kills only the local ssh client, and the shell of a non-pty ssh session is
+/// usually never signalled — it ran on, and could switch the pod after arena had reported a
+/// timeout and released the pod's lock (review ai-review claude #13). So the switch bounds itself
+/// on the pod: it runs under coreutils' `timeout` ([`SWITCH_BOUND_SECS`], a little under
+/// `BRANCH_TIMEOUT`), which sends TERM to the switch's process group — the trap puts the keys
+/// back — and KILL [`SWITCH_KILL_AFTER_SECS`] later if it's still running (a KILL runs no trap:
+/// keys set aside then stay in `.git/arena-unredacted/` until a switch back to their branch puts
+/// them back). Stopped there, it says so on stderr (exit 124, or 137 after the KILL); it may have
+/// stopped part-way through the checkout. A pod without a working `timeout` runs the switch
+/// unbounded, as before. Nor does any trap cover the pod itself going away (a stop, a reboot).
+///
+/// The switch's script runs under `sh -c` (dash on the images), whatever the pod's login shell:
+/// sshd hands the command to the login shell's `-c` — zsh on the pods — which now parses only one
+/// simple command, `sh -c '<wrapper>' arena-set-branch '<script>'` ([`bounded_sh`]): the wrapper
+/// starts the script under `timeout` and `sh`.
+///
+/// An operation in progress (a participant's conflicted `git pull upstream main`, a cherry-pick,
+/// a revert, a `git stash pop`'s conflicts: [`BUSY_OP_SH`]) is never ended by the gentle switch:
+/// it refuses first — what is in progress and how to end it, on stderr, exit
+/// [`BACKUP_BUSY_EXIT`] — touching nothing (the keys are set aside only after it), where `git
+/// checkout` would silently drop a merge whose conflicts are resolved and staged and carry them
+/// onto the other branch. `--hard` goes ahead and ends it with the other local changes it
+/// discards — saved first, as above (`set-branch` copies such a pod too, and says so).
 pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard: bool) -> String {
+    checkout_command_limited(repo_path, branch, git_ssh_key, hard, DISCARD_MAX_GB * 1024 * 1024)
+}
+
+/// [`checkout_command`] with the most a `--hard` save may copy into `untracked/`, in KiB
+/// ([`discard_max_kb`]: config `DISCARD_MAX_GB`). Over that, or over half what's free on the
+/// pod's disk there, the save is refused before anything of it is copied — not reset, and the
+/// line says what was too big and how to move it out of the way (review ai-review claude #2: a
+/// 30 GB directory copied under the switch's bound was cut short every time, each try leaving
+/// another partial copy in `.git`). A save the bound (or a dropped connection) stops in the middle
+/// of is removed by the switch's EXIT trap, after the keys are put back: no partial folder or ref
+/// is left, and the pod isn't reset.
+pub fn checkout_command_limited(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard: bool, discard_max_kb: u64) -> String {
+    bounded_switch(&switch_script(repo_path, branch, git_ssh_key, hard, discard_max_kb), SWITCH_BOUND_SECS, SWITCH_KILL_AFTER_SECS)
+}
+
+/// The most a `--hard` save copies into `.git/arena-discarded/<save>/untracked/` by default, in GB
+/// (config `DISCARD_MAX_GB`, [`discard_max_kb`]). 1, not 5 (review ai-review claude #6): the copy —
+/// and the `du` before it, over a tree of many files — runs within the switch's
+/// [`SWITCH_BOUND_SECS`] (100 s, the fetch included), which near 5 GB on a RunPod network volume
+/// it often didn't, and each try was stopped the same way.
+pub const DISCARD_MAX_GB: u64 = 1;
+
+/// [`checkout_command_limited`]'s limit, in KiB: config `DISCARD_MAX_GB` (in GiB — the `GB` of its
+/// name is binary, as the save's `du -sk` counts — a positive number, a fraction too: `1`, `0.5`,
+/// `40`), else [`DISCARD_MAX_GB`]. `Err` names the key and the value it can't read — `config
+/// check` shows both ([`discard_max_words`]).
+pub fn discard_max_kb(cfg: &Config) -> std::result::Result<u64, String> {
+    match cfg.get("DISCARD_MAX_GB").map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(DISCARD_MAX_GB * 1024 * 1024),
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(gb) if gb.is_finite() && gb > 0.0 && gb <= 1_000_000.0 => Ok(((gb * 1024.0 * 1024.0).round() as u64).max(1)),
+            _ => Err(format!("DISCARD_MAX_GB must be a number of GiB above 0, a fraction too, like 1 or 0.5 (got `{raw}`)")),
+        },
+    }
+}
+
+/// A `--hard` save's limit ([`discard_max_kb`]) in words, the same words the save's own lines give
+/// a size (`discarded.sh`'s `ds_size`): binary units, labelled so — GiB to one decimal, else whole
+/// MiB, else KiB (Live 7: `0.05` showed as `51 MB`, a binary count under a decimal label).
+pub fn discard_max_words(kb: u64) -> String {
+    match kb {
+        k if k >= 1024 * 1024 => format!("{:.1} GiB", k as f64 / (1024.0 * 1024.0)),
+        k if k >= 1024 => format!("{} MiB", k / 1024),
+        k => format!("{k} KiB"),
+    }
+}
+
+/// `script` as the pod runs it: under `sh -c` (`$0` = `name`), whatever the login shell that `-c`s
+/// this — zsh on the pods, whose own rules (a glob with no match is fatal, an EXIT trap that then
+/// doesn't run) a script that sets real keys aside or puts them back must never meet — bounded by
+/// `timeout -k <kill_after> <secs>` when the pod has a `timeout` that takes `-k` (coreutils'; a
+/// probe finds out), else unbounded. A run `timeout` stopped says `stopped` (exit 124), or
+/// `killed` (137), on stderr.
+///
+/// The command is one simple command — `sh -c '<wrapper>' <name> '<script>'` — so the login shell
+/// only ever parses that (review ai-review claude #11: the wrapper was an assignment and an
+/// `if … fi`, which bash and zsh take but fish refuses, so nothing ran there). The wrapper, under
+/// `sh`, holds the probe and the fallback, and starts the script from its `$1`. Each word is
+/// quoted for any login shell ([`login_quote`]). Shared with the resolve's command (FIX5A).
+pub fn bounded_sh(script: &str, name: &str, secs: u64, kill_after: u64, stopped: &str, killed: &str) -> String {
+    let wrapper = format!(
+        "if timeout -k 1 1 true >/dev/null 2>&1; then timeout -k {kill_after} {secs} sh -c \"$1\" \"$0\"; r=$?; \
+         if [ \"$r\" = 124 ]; then printf '%s\\n' {} >&2; elif [ \"$r\" = 137 ]; then printf '%s\\n' {} >&2; fi; exit \"$r\"; \
+         else exec sh -c \"$1\" \"$0\"; fi",
+        shell_quote(stopped),
+        shell_quote(killed)
+    );
+    format!("sh -c {} {} {}", login_quote(&wrapper), login_quote(name), login_quote(script))
+}
+
+/// `s` single-quoted for whichever login shell sshd hands a command to: the POSIX ones (sh, bash,
+/// zsh) and fish read it the same. Inside single quotes fish takes `\\` and `\'` as escapes, where
+/// a POSIX shell takes nothing — so a script with a backslash in it (the redaction's sed has many)
+/// came out changed under fish. Every backslash and quote goes outside the quotes, escaped (`'\\'`,
+/// `'\''`), where each of them reads the one character.
+fn login_quote(s: &str) -> String {
+    let mut q = String::with_capacity(s.len() + 2);
+    q.push('\'');
+    for c in s.chars() {
+        match c {
+            '\'' => q.push_str("'\\''"),
+            '\\' => q.push_str("'\\\\'"),
+            c => q.push(c),
+        }
+    }
+    q.push('\'');
+    q
+}
+
+/// How long a branch switch may run on the pod before `timeout` stops it there with TERM
+/// ([`checkout_command`]): a little under the CLI's and the TUI's `BRANCH_TIMEOUT` (2 min, which
+/// each checks at compile time against this plus [`SWITCH_KILL_AFTER_SECS`]), so the pod's side
+/// has ended before arena reports a timeout and releases the pod's lock.
+pub const SWITCH_BOUND_SECS: u64 = 100;
+
+/// After the TERM, how long the switch has to end (its EXIT trap puts the keys back) before
+/// `timeout` KILLs it.
+pub const SWITCH_KILL_AFTER_SECS: u64 = 10;
+
+/// [`bounded_sh`] for set-branch's switch, with its own words for a switch the bound stopped.
+fn bounded_switch(script: &str, secs: u64, kill_after: u64) -> String {
+    let stopped = format!(
+        "arena set-branch: the switch ran past its {secs} s on the pod and was stopped there (TERM, the real keys put back) — not switched, \
+         or stopped part-way through the checkout: check the branch and `git status` on the pod"
+    );
+    let killed = format!(
+        "arena set-branch: the switch ran past its {secs} s on the pod and was killed there ({kill_after} s after the TERM) — not \
+         switched, or stopped part-way: check the branch and `git status` on the pod; real keys it set aside may still be in \
+         .git/arena-unredacted/"
+    );
+    bounded_sh(script, "arena-set-branch", secs, kill_after, &stopped, &killed)
+}
+
+/// The switch itself ([`checkout_command`]), a POSIX `sh` script; `discard_max_kb`: the most a
+/// `--hard` save copies into `untracked/` ([`checkout_command_limited`]).
+fn switch_script(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard: bool, discard_max_kb: u64) -> String {
     let mut parts: Vec<String> = vec!["set -e".into(), format!("cd {}", shell_quote(repo_path))];
+    if !hard {
+        // A participant's merge (cherry-pick, revert, conflicts) is never ended by the gentle
+        // switch: it refuses, saying what and how, before anything else.
+        parts.push(busy_refusal_sh("arena set-branch"));
+    }
     if let Some(key) = git_ssh_key {
         parts.push(format!(
             "export GIT_SSH_COMMAND={}",
@@ -698,20 +1242,59 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
             ))
         ));
     }
-    parts.push("git fetch origin".into());
+    // Origin only, pruned: a branch origin no longer has is no branch to switch to.
+    parts.push("git fetch --prune origin".into());
     parts.push("OLD=$(git rev-parse -q --verify HEAD) || OLD=".into());
+    // The branch it is on (none: a detached HEAD), for a gentle switch to go back to.
+    parts.push("PREV=$(git symbolic-ref -q --short HEAD) || PREV=".into());
     let switch = if hard {
         let remote_ref = shell_quote(&format!("origin/{branch}"));
-        // Force-switch to the branch reset to origin (discards local changes/commits on it).
-        format!("git checkout -f -B {} {remote_ref} && git reset --hard {remote_ref}", shell_quote(branch))
+        // What the reset discards, saved first (no save, no reset) — the local branch's commits
+        // origin's doesn't have, and HEAD's no remote has, pinned by refs; then force-switch to the
+        // branch reset to origin (discards local changes/commits on it), then end any `git am`,
+        // rebase or sequence the switch left behind (their state only).
+        format!(
+            "discarded_save \"$G\" {remote_ref} {b} {discard_max_kb} && git checkout -f -B {b} {remote_ref} && git reset --hard {remote_ref} && \
+             {{ git rebase --quit >/dev/null 2>&1; git am --quit >/dev/null 2>&1; git cherry-pick --quit >/dev/null 2>&1; true; }}",
+            b = shell_quote(branch)
+        )
     } else {
-        format!("git checkout {} && git pull --ff-only", shell_quote(branch))
+        // `checkout.defaultRemote`: with an `upstream` remote too (the course repo, whose branch
+        // names the cohort's copy shares), a plain checkout of a branch both have refused as
+        // "matched multiple remote tracking branches" (review fb2 R2); origin's is the one. Then
+        // origin's branch, by its full name — never the branch's own upstream (codex #5). All or
+        // nothing: a fast-forward that fails goes back where it was (`switch_back`, Live 4).
+        format!(
+            "git -c checkout.defaultRemote=origin checkout {b} && {{ git merge --ff-only {} || {{ switch_back {b}; false; }}; }}",
+            shell_quote(&format!("refs/remotes/origin/{branch}")),
+            b = shell_quote(branch),
+        )
     };
     let mut lines = vec![parts.join("; ")];
     // The keys set aside around the switch (from the repo's top: git's paths are relative to it).
     lines.push(format!("REDACT_SED={}", shell_quote(&redact_sed())));
     lines.push(unredacted_sh());
-    lines.push("cd \"$(git rev-parse --show-toplevel)\"; G=$(git rev-parse --absolute-git-dir); unredacted_aside \"$G/arena-unredacted\"".into());
+    if hard {
+        lines.push(discarded_sh());
+    } else {
+        lines.push(SWITCH_BACK_SH.into());
+    }
+    // The putting back is the EXIT trap, set before anything is set aside: whatever ends the
+    // command from here on — the switch failing, `set -e`, a signal (made an exit, so the trap
+    // runs) — the keys go back first (claude #4). Under `--hard`, then a save the switch was
+    // stopped in the middle of is removed (`ds_abandon`, review ai-review claude #2), and a restore
+    // that failed still fails the command, as it did alone.
+    let on_exit = if hard {
+        "ds_rc=0; unredacted_restore \"$G/arena-unredacted\" || ds_rc=$?; ds_abandon; [ \"$ds_rc\" = 0 ]"
+    } else {
+        "unredacted_restore \"$G/arena-unredacted\""
+    };
+    lines.push(format!(
+        "cd \"$(git rev-parse --show-toplevel)\"; G=$(git rev-parse --absolute-git-dir); \
+         trap {} EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+         unredacted_aside \"$G/arena-unredacted\"",
+        shell_quote(on_exit)
+    ));
     lines.push(format!("if {switch}; then SWITCHED=1; else SWITCHED=; fi"));
     // The adopted clones (listed by the backup in `$G/arena-nested`) the switch removed: back
     // from the old HEAD, staged.
@@ -722,8 +1305,37 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
          echo \"RESTORED $d\"; fi; done < \"$G/arena-nested\"; fi"
             .into(),
     );
-    lines.push("unredacted_restore \"$G/arena-unredacted\"; [ -n \"$SWITCHED\" ]".into());
+    lines.push("[ -n \"$SWITCHED\" ]".into());
     lines.join("\n")
+}
+
+/// `switch_back <branch>`: the gentle switch is all or nothing (Live 4: a local `main` 216 commits
+/// ahead of origin's — made from `upstream/main` — was checked out, its fast-forward to origin's
+/// refused, and the pod left on it while its line said "not switched"). Its checkout went through
+/// and the fast-forward to origin's `<branch>` didn't, so it checks out again what it was on —
+/// `$PREV`, or the detached commit `$OLD` — by the same rules (that checkout just carried the tree
+/// here, so it carries it back), and says why on stderr: origin has no `<branch>`, the local one has
+/// commits origin's doesn't, or else the fast-forward failed (git said why above). If going back
+/// fails too, it says which branch the pod is on now.
+const SWITCH_BACK_SH: &str = r#"switch_back() {
+    if ! git rev-parse -q --verify "refs/remotes/origin/$1" >/dev/null; then sb_why="origin has no $1"
+    elif ! git merge-base --is-ancestor HEAD "refs/remotes/origin/$1"; then
+        sb_why="its local $1 has $(git rev-list --count "refs/remotes/origin/$1..HEAD") commit(s) origin's $1 doesn't, so it can't fast-forward to it"
+    else sb_why="the fast-forward to origin's $1 failed (git's message above)"; fi
+    if [ -n "$PREV" ]; then sb_to=$PREV sb_at=$PREV; else sb_to=$OLD sb_at="its detached HEAD ($(printf '%.10s' "$OLD"))"; fi
+    if [ -n "$sb_to" ] && git checkout -q "$sb_to"; then
+        printf '%s
+' "arena set-branch: $sb_why — not switched: back on $sb_at" >&2
+    else
+        printf '%s
+' "arena set-branch: $sb_why — not switched, and going back to $sb_at failed: it is on $(git rev-parse --abbrev-ref HEAD 2>/dev/null) now" >&2
+    fi
+}"#;
+
+/// `discarded.sh`'s functions, comments and blank lines left out: what `--hard` saves before its
+/// reset ([`checkout_command`]).
+fn discarded_sh() -> String {
+    include_str!("discarded.sh").lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')).collect::<Vec<_>>().join("\n")
 }
 
 /// `unredacted.sh`'s functions, comments and blank lines left out, for a command to define and
@@ -742,6 +1354,9 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default limit of a `--hard` save, in KiB ([`DISCARD_MAX_GB`]).
+    const KB_DEFAULT: u64 = DISCARD_MAX_GB * 1024 * 1024;
 
     fn cfg() -> BackupConfig {
         BackupConfig {
@@ -788,9 +1403,14 @@ mod tests {
         assert!(s.contains(r#"git add -A -- "$@""#));
         assert!(s.contains("NO_CHANGES $B"));
         assert!(s.contains(r#"git commit -q -m "$MSG""#));
-        // "Nothing staged" isn't "nothing to do": push whenever ahead of / without an upstream.
-        assert!(s.contains("git rev-list --count '@{u}..HEAD'"));
-        assert!(s.contains(r#"set -- -u origin "$B""#) && s.contains(r#"git push "$@""#) && s.contains("PUSHED $B"));
+        // "Nothing staged" isn't "nothing to do": push whenever ahead of origin's branch, or origin
+        // has none — origin's, never the branch's own upstream (ai-review claude #6).
+        assert!(s.contains(r#"git rev-list --count "refs/remotes/origin/$B..$TIP""#) && !s.contains("@{u}"));
+        // Exactly the commit it scanned, by its id (review ai-review codex #1, FIX7), a branch with
+        // no upstream then tracking origin's as `push -u` made it — in the config itself (claude #7).
+        assert!(s.contains(r#"git push --no-follow-tags origin "$NEW:refs/heads/$B""#) && !s.contains(r#"git push -u"#) && s.contains("PUSHED $B"));
+        assert!(s.contains(r#"git config "branch.$B.remote" origin"#) && s.contains(r#"git config "branch.$B.merge" "refs/heads/$B""#));
+        assert!(!s.contains("git branch --set-upstream-to"));
         assert!(s.contains("Arena Autocommit"));
         assert!(s.contains(r#"export GIT_SSH_COMMAND="ssh -i $KEY"#));
         assert_eq!(GIT_MAX_FILE_BYTES, 99_614_720, "95 MiB: headroom under GitHub's 100 MiB");
@@ -854,14 +1474,10 @@ mod tests {
         (run("sed", &["-E", &redact_sed()]), run("grep", &["-aoE", "--", &secret_regex()]).lines().count())
     }
 
-    /// The patterns, through the very sed/grep programs the pods run: every kind of key (in the
-    /// places a participant pastes one — code, `.env` lines, a notebook's JSON after a `\n`
-    /// escape) becomes its REDACTED text with everything around it byte-identical; look-alikes
-    /// (`sklearn`, `task-or-v1-…`, short or long bodies, UUIDs, `hf_hub_download`, a bare
-    /// `sk-…`, a notebook's base64 image) stay exactly as they are.
-    #[cfg(unix)]
-    #[test]
-    fn secret_patterns_redact_every_kind_of_key_and_no_lookalike() {
+    /// A line holding each kind of key, in the places a participant pastes one (code, `.env`
+    /// lines, a notebook's JSON after a `\n` escape, coloured output, a URL), as `(the line, what
+    /// the redaction makes of it, how many keys it counts)`.
+    fn key_cases() -> Vec<(String, String, usize)> {
         let or = openrouter_key(1);
         let or2 = openrouter_key(2);
         let ant = |kind: &str| format!("{}{kind}-{}AA", "sk-ant-", body(URLSAFE, 93, 3));
@@ -871,7 +1487,7 @@ mod tests {
         let google = format!("{}{}", "AIza", body(URLSAFE, 35, 14));
         let groq = format!("{}{}", "gsk_", body(ALNUM, 52, 15));
         // (input line, what git gets, keys counted)
-        let keys: Vec<(String, String, usize)> = vec![
+        vec![
             (format!("export OPENROUTER_API_KEY={or}"), "export OPENROUTER_API_KEY=REDACTED-OPENROUTER-KEY".into(), 1),
             (or.clone(), "REDACTED-OPENROUTER-KEY".into(), 1),
             (format!("client = OpenAI(api_key=\"{or}\", base_url=u)"), "client = OpenAI(api_key=\"REDACTED-OPENROUTER-KEY\", base_url=u)".into(), 1),
@@ -900,16 +1516,16 @@ mod tests {
             (format!("GET /v1?key=%22{or}%22"), "GET /v1?key=%22REDACTED-OPENROUTER-KEY%22".into(), 1),
             (format!("genai.configure(api_key=\"{google}\")"), "genai.configure(api_key=\"REDACTED-GOOGLE-API-KEY\")".into(), 1),
             (format!("GROQ_API_KEY={groq}"), "GROQ_API_KEY=REDACTED-GROQ-KEY".into(), 1),
-        ];
-        for (input, want, n) in &keys {
-            let (got, counted) = redact(&format!("{input}\n"));
-            assert_eq!(got, format!("{want}\n"), "{want}");
-            assert_eq!(counted, *n, "{want}");
-        }
+        ]
+    }
+
+    /// Lines no pattern may touch: look-alikes (`sklearn`, `task-or-v1-…`, short or long bodies,
+    /// UUIDs, `hf_hub_download`, a bare `sk-…`) and a notebook's base64 image.
+    fn lookalikes() -> Vec<String> {
         // A notebook's inline image (base64 of arbitrary bytes, one long line) and every
         // look-alike: byte-identical, nothing counted.
         let image: Vec<u8> = (0..30_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
-        let lookalikes: Vec<String> = vec![
+        vec![
             "from sklearn.linear_model import LogisticRegression".into(),
             "pip install scikit-learn sk-learn".into(),
             format!("task-or-v1-{}", body(HEX, 64, 1)),
@@ -942,7 +1558,24 @@ mod tests {
             format!("{}{}", "gsk_", body(ALNUM, 51, 15)),
             format!("x{}{}", "gsk_", body(ALNUM, 52, 15)),
             format!("      \"image/png\": \"{}\"", crate::base64::encode(&image)),
-        ];
+        ]
+    }
+
+    /// The patterns, through the very sed/grep programs the pods run: every kind of key (in the
+    /// places a participant pastes one — code, `.env` lines, a notebook's JSON after a `\n`
+    /// escape) becomes its REDACTED text with everything around it byte-identical; look-alikes
+    /// (`sklearn`, `task-or-v1-…`, short or long bodies, UUIDs, `hf_hub_download`, a bare
+    /// `sk-…`, a notebook's base64 image) stay exactly as they are.
+    #[cfg(unix)]
+    #[test]
+    fn secret_patterns_redact_every_kind_of_key_and_no_lookalike() {
+        let keys = key_cases();
+        for (input, want, n) in &keys {
+            let (got, counted) = redact(&format!("{input}\n"));
+            assert_eq!(got, format!("{want}\n"), "{want}");
+            assert_eq!(counted, *n, "{want}");
+        }
+        let lookalikes = lookalikes();
         for line in &lookalikes {
             let (got, counted) = redact(&format!("{line}\n"));
             assert_eq!((got.trim_end_matches('\n'), counted), (line.as_str(), 0), "{}", &line[..line.len().min(80)]);
@@ -959,6 +1592,90 @@ mod tests {
         assert!(!secret_regex().contains('\'') && !redact_sed().contains('\''));
     }
 
+    /// Review ai-review claude #14: `scripts/ai-review` screened only the changed paths' names, so a
+    /// real key in a fixture or a test would have gone, whole, to OpenAI and Anthropic. Now the
+    /// backup's own patterns — read from this file at the repo's HEAD, from git objects — run over
+    /// the whole prompt first: every kind of key becomes its placeholder, the rest byte-identical
+    /// (as the backup's `redact`), wherever it is (the diff, a changed script's full text, a commit
+    /// subject); it says how many; `--dry-run` writes the masked prompt. Patterns it can't read
+    /// refuse the run (exit 2), nothing written. (Run on a temp repo, `--dry-run` only, with no
+    /// reviewer binary it could find.)
+    #[cfg(unix)]
+    #[test]
+    fn ai_review_masks_every_key_in_its_prompt() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/ai-review");
+        let base = std::env::temp_dir().join(format!("arena-ai-review-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (repo, out, tmp) = (base.join("repo"), base.join("out"), base.join("tmp"));
+        for d in [&repo, &out, &tmp] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git").current_dir(&repo).args(args).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        };
+        let review = || {
+            let o = std::process::Command::new("bash")
+                .arg(script)
+                .args(["--dry-run", "--out", out.to_str().unwrap(), "HEAD~1..HEAD"])
+                .current_dir(&repo)
+                .env("AI_REVIEW_CODEX", "/nonexistent")
+                .env("AI_REVIEW_CLAUDE", "/nonexistent")
+                .env("TMPDIR", &tmp)
+                .output()
+                .unwrap();
+            (o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned())
+        };
+        git(&["init", "-q", "-b", "master"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@t"]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        // No backup.rs at HEAD: no patterns, nothing sent or written.
+        std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "b"]);
+        let (code, err) = review();
+        assert!(code == Some(2) && err.contains("can't read the key patterns") && err.contains("nothing sent"), "{err}");
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "no run folder");
+        // The patterns at HEAD (this very file), then a change full of keys: every kind of key in a
+        // file, one in a changed script (its diff and its full text), one in the commit subject;
+        // and every look-alike.
+        std::fs::create_dir_all(repo.join("crates/core/src")).unwrap();
+        std::fs::write(repo.join("crates/core/src/backup.rs"), include_str!("backup.rs")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "patterns"]);
+        let keys = key_cases();
+        let lines: Vec<String> = keys.iter().map(|(input, ..)| input.clone()).chain(lookalikes()).collect();
+        std::fs::write(repo.join("keys.py"), lines.join("\n") + "\n").unwrap();
+        let tool = format!("#!/bin/sh\nexport HF_TOKEN={}{}\n", "hf_", body(LETTERS, 34, 30));
+        std::fs::write(repo.join("tool.sh"), &tool).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", &format!("keys {}", openrouter_key(30))]);
+        let (code, err) = review();
+        assert_eq!(code, Some(0), "{err}");
+        let want: usize = keys.iter().map(|(_, _, n)| n).sum::<usize>() + 3;
+        assert!(err.contains(&format!("ai-review: masked {want} key-like strings\n")), "{err}");
+        assert!(err.contains("nothing sent"), "{err}");
+        let runs: Vec<std::path::PathBuf> = std::fs::read_dir(&out).unwrap().flatten().map(|e| e.path()).collect();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        let prompt = String::from_utf8(std::fs::read(runs[0].join("prompt.txt")).unwrap()).unwrap();
+        // Nothing the backup's patterns would count is left; each key's line is its redacted line,
+        // the rest of it as it was; the look-alikes (one holds a key's body after `ta`) untouched.
+        assert_eq!(redact(&prompt).1, 0, "a key left in the prompt");
+        for (input, masked, _) in &keys {
+            assert!(prompt.contains(&format!("\n+{masked}\n")), "{masked}");
+            assert!(!prompt.contains(&format!("\n+{input}\n")), "{masked}: the key itself");
+        }
+        for line in lookalikes() {
+            assert!(prompt.contains(&format!("\n+{line}\n")), "{}", &line[..line.len().min(80)]);
+        }
+        assert!(prompt.contains("\n+export HF_TOKEN=REDACTED-HUGGINGFACE-TOKEN\n") && prompt.contains("\nexport HF_TOKEN=REDACTED-HUGGINGFACE-TOKEN\n"));
+        assert!(prompt.contains(" keys REDACTED-OPENROUTER-KEY\n"), "the commit subject");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The patterns are rendered into what runs on the pods — from the one list, nothing left to
     /// fill in — and the script that carries them is still POSIX sh.
     #[test]
@@ -973,11 +1690,16 @@ mod tests {
             assert!(secret_regex().contains(&format!("{}{}", p.lead, p.re)));
             assert!(redact_sed().contains(&format!("s#{}{}#\\1{}#g", p.lead, p.re, p.replacement)));
         }
-        let set_branch = checkout_command("/r", "main", None, false);
+        let set_branch = switch_script("/r", "main", None, false, KB_DEFAULT);
         assert!(set_branch.contains(&format!("REDACT_SED='{}'", redact_sed())));
         assert!(set_branch.contains("unredacted_aside()") && set_branch.contains("unredacted_restore()"));
         for shell in ["sh", "bash"] {
-            for cmd in [checkout_command("/r", "main", None, false), checkout_command("/r", "main", Some("/k"), true)] {
+            for cmd in [
+                checkout_command("/r", "main", None, false),
+                checkout_command("/r", "main", Some("/k"), true),
+                switch_script("/r", "main", None, false, KB_DEFAULT),
+                switch_script("/r", "main", Some("/k"), true, KB_DEFAULT),
+            ] {
                 let o = std::process::Command::new(shell).arg("-n").arg("-c").arg(&cmd).output().expect(shell);
                 assert!(o.status.success(), "{shell} -n: {}", String::from_utf8_lossy(&o.stderr));
             }
@@ -1047,14 +1769,13 @@ mod tests {
         /// `work` on branch `autocommit-x`, pushed (with an upstream), from a `main` that is
         /// on origin too; `data.bin` (10 bytes) tracked.
         fn new(tag: &str, limit: u64) -> Self {
-            use std::os::unix::fs::PermissionsExt;
             let base = std::env::temp_dir().join(format!("arena-backup-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&base);
             std::fs::create_dir_all(&base).unwrap();
             let s = GitSandbox { origin: base.join("origin.git"), work: base.join("work"), base, limit, skip: limit, want: None };
             s.git(&s.base, &["init", "-q", "--bare", s.origin.to_str().unwrap()]);
             let hook = s.origin.join("hooks/pre-receive");
-            std::fs::write(
+            crate::remote::write_test_script(
                 &hook,
                 format!(
                     "#!/bin/sh\nwhile read old new ref; do\n  [ \"$new\" = 0000000000000000000000000000000000000000 ] && continue\n  \
@@ -1063,7 +1784,6 @@ mod tests {
                 ),
             )
             .unwrap();
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
             s.git(&s.base, &["init", "-q", "-b", "main", s.work.to_str().unwrap()]);
             s.git(&s.work, &["config", "user.name", "t"]);
             s.git(&s.work, &["config", "user.email", "t@t"]);
@@ -1115,10 +1835,8 @@ mod tests {
         /// stand-in `ssh` that runs git's remote command in `<base>/github` and logs each call
         /// to `<base>/ssh.log`. Its scp-style URL is `git@github.com:<owner_name>.git`.
         fn github(&self, owner_name: &str) -> std::path::PathBuf {
-            use std::os::unix::fs::PermissionsExt;
             let ssh = self.base.join("fake-ssh");
-            std::fs::write(&ssh, "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/ssh.log\"\nfor a; do last=$a; done\ncd \"$(dirname \"$0\")/github\" && exec sh -c \"$last\"\n").unwrap();
-            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(&ssh, "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/ssh.log\"\nfor a; do last=$a; done\ncd \"$(dirname \"$0\")/github\" && exec sh -c \"$last\"\n").unwrap();
             let bare = self.base.join("github").join(format!("{owner_name}.git"));
             if !bare.exists() {
                 std::fs::create_dir_all(&bare).unwrap();
@@ -1172,7 +1890,6 @@ mod tests {
         /// are skipped, as GitHub's scanning skips them. `accepted` runs (in origin) after a push
         /// passes the scan; the file size hook is gone.
         fn push_protect(&self, accepted: &str) {
-            use std::os::unix::fs::PermissionsExt;
             let hook = self.origin.join("hooks/pre-receive");
             let script = r#"#!/bin/sh
 KNOWN='@KNOWN@'
@@ -1208,8 +1925,7 @@ while read old new ref; do
 done
 @ACCEPTED@
 "#;
-            std::fs::write(&hook, script.replace("@KNOWN@", &secret_regex()).replace("@ACCEPTED@", accepted)).unwrap();
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(&hook, script.replace("@KNOWN@", &secret_regex()).replace("@ACCEPTED@", accepted)).unwrap();
         }
 
         /// Whether any object in origin — reachable or not — holds `needle`.
@@ -1584,31 +2300,41 @@ done
     }
 
     /// Only text files are rewritten: a binary file (a NUL in its first 8000 bytes) holding a
-    /// key's bytes and a symlink whose target is key-shaped are committed exactly as they are
-    /// (origin here scans nothing — GitHub skips binaries; the symlink is just a shape test).
+    /// key's bytes and a symlink whose target is key-shaped are committed exactly as they are (the
+    /// symlink is just a shape test). Pushed, they would put the key on GitHub, whose push
+    /// protection skips binaries; so the last scan before the push stops it (FIX10): nothing
+    /// leaves the pod, the commit stays on it as it was, each file a separate case.
     #[cfg(unix)]
     #[test]
-    fn binary_files_and_symlinks_are_never_rewritten() {
-        let s = GitSandbox::new("redact-skip", 1_000_000);
+    fn binary_files_and_symlinks_are_never_rewritten_and_a_key_in_them_never_pushed() {
         let key = openrouter_key(3);
         let mut bin = vec![0u8, 1, 2];
         bin.extend_from_slice(format!(" {key} ").as_bytes());
-        std::fs::write(s.work.join("weights.bin"), &bin).unwrap();
-        std::os::unix::fs::symlink(&key, s.work.join("link")).unwrap();
-        std::fs::write(s.work.join("a.py"), format!("k='{key}'\n")).unwrap();
-        let (code, r, err) = s.backup();
-        assert_eq!((code, r.redacted.clone()), (Some(0), vec![(1, "a.py".to_string())]), "{err}");
-        let blob = |path: &str| {
-            let o = std::process::Command::new("git")
-                .args(["--git-dir", s.origin.to_str().unwrap(), "cat-file", "blob", &format!("autocommit-x:{path}")])
-                .output()
-                .unwrap();
-            o.stdout
-        };
-        assert_eq!(blob("weights.bin"), bin, "a binary file is committed byte for byte");
-        assert_eq!(blob("link"), key.as_bytes(), "a symlink is committed as it is");
-        assert!(s.origin_tree("autocommit-x").contains(&("120000".to_string(), "link".to_string())));
-        assert_eq!(blob("a.py"), b"k='REDACTED-OPENROUTER-KEY'\n");
+        for case in ["binary", "symlink"] {
+            let s = GitSandbox::new(&format!("redact-skip-{case}"), 1_000_000);
+            let pushed = s.git(&s.work, &["rev-parse", "HEAD"]);
+            if case == "binary" {
+                std::fs::write(s.work.join("weights.bin"), &bin).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&key, s.work.join("link")).unwrap();
+            }
+            std::fs::write(s.work.join("a.py"), format!("k='{key}'\n")).unwrap();
+            let (code, r, err) = s.backup();
+            assert_eq!((code, r.redacted.clone(), r.push_blocked.as_deref()), (Some(BACKUP_BLOCKED_EXIT), vec![(1, "a.py".to_string())], Some(KEY_LEFT)), "{case}: {err}");
+            let blob = |path: &str| {
+                let o = std::process::Command::new("git").current_dir(&s.work).args(["cat-file", "blob", &format!("HEAD:{path}")]).output().unwrap();
+                o.stdout
+            };
+            if case == "binary" {
+                assert_eq!(blob("weights.bin"), bin, "a binary file is committed byte for byte");
+            } else {
+                assert_eq!(blob("link"), key.as_bytes(), "a symlink is committed as it is");
+                assert!(s.git(&s.work, &["ls-tree", "HEAD", "link"]).starts_with("120000 "), "{case}");
+            }
+            assert_eq!(blob("a.py"), b"k='REDACTED-OPENROUTER-KEY'\n", "{case}");
+            assert!(!s.origin_holds(&key), "{case}: the key reached origin");
+            assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]), pushed, "{case}");
+        }
     }
 
     /// The live case: keys committed by backups from before the redaction, 3 unpushed commits,
@@ -1886,30 +2612,146 @@ done
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `init-branches` from a branch whose unpushed commits GitHub refuses: the new day's branch
-    /// carries them (created from HEAD), so its first push is refused too — and the next backup
-    /// heals the new branch (no upstream yet). Nothing of the old branch is left behind.
+    /// Review claude #2 (FIX9B item 2): `init-branches` pushed the new day's branch by name, from
+    /// HEAD — so a pod still on yesterday's branch, whose push had failed (it was rsynced and
+    /// switched anyway), sent yesterday's unscanned commits out raw, a key in them reaching GitHub
+    /// wherever push protection didn't stop it (this origin stops nothing). Now the new branch
+    /// goes to origin at the newest commit origin has, said (`UNPUSHED 1 <id>`), the participant's
+    /// commit kept on it on the pod; no object on origin holds either key (one in the file, one in
+    /// the message); the next backup scans the commit and pushes it redacted, a fast-forward.
     #[cfg(unix)]
     #[test]
-    fn a_new_days_branch_carrying_a_refused_commit_is_healed_by_the_next_backup() {
-        let s = GitSandbox::new("init-heal", 1_000_000);
-        s.push_protect("");
-        let key = openrouter_key(8);
+    fn init_branches_never_pushes_unscanned_commits_and_the_next_backup_pushes_them_redacted() {
+        let s = GitSandbox::new("init-unscanned", 1_000_000);
+        let pushed = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let (key, in_msg) = (openrouter_key(8), format!("{}{}", "hf_", body(LETTERS, 34, 43)));
+        // Yesterday: the participant's own commit, a key in the file and another in the message…
         std::fs::write(s.work.join("ex.py"), format!("k = '{key}'\n")).unwrap();
         s.git(&s.work, &["add", "-A"]);
-        s.git(&s.work, &["commit", "-q", "-m", "yesterday, with a key"]);
-        let cfg = BackupConfig { repo_path: s.work.display().to_string(), prefix: "devtest".into(), week: 1, day: 2, git_ssh_key: None, origin: None };
-        let o = std::process::Command::new("bash").arg("-c").arg(init_branch_command(&cfg, "devtest-x")).output().unwrap();
-        assert!(!o.status.success(), "the new branch's push carries the key");
-        // Its refusal reaches the operator — without GitHub's allow-the-secret URL (review: it
-        // used to pass the push's stderr through as it was).
-        let err = String::from_utf8_lossy(&o.stderr);
-        assert!(err.contains("GH013") && err.contains("locations:"), "{err}");
-        assert!(!err.contains("unblock-secret") && !err.contains("secret-scanning") && !err.contains(&key), "{err}");
-        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-devtest-w1d2-x");
+        s.git(&s.work, &["commit", "-q", "-m", &format!("yesterday, with {in_msg}")]);
+        let mine = s.git(&s.work, &["rev-parse", "HEAD"]);
+        // …and the backup's push of it failed (the network): nothing of it on origin.
+        let hook = s.origin.join("hooks/pre-receive");
+        crate::remote::write_test_script(&hook, "#!/bin/sh\necho 'fatal: the network is down' >&2\nexit 1\n").unwrap();
         let (code, r, err) = s.backup();
-        assert_eq!((code, r.outcome, r.history.map(|h| h.0)), (Some(0), Some((BACKUP_PUSHED, "autocommit-devtest-w1d2-x".into())), Some(1)), "{err}");
-        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "log", "-1", "--format=%s", "autocommit-devtest-w1d2-x"]), "yesterday, with a key");
+        assert_eq!((code, r.push_failed), (Some(1), true), "{err}");
+        std::fs::remove_file(&hook).unwrap();
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), mine, "a failed push moves nothing");
+
+        let cfg = BackupConfig { repo_path: s.work.display().to_string(), prefix: "devtest".into(), week: 1, day: 2, git_ssh_key: None, origin: None };
+        let o = s.run(&init_branch_command(&cfg, "devtest-x"));
+        let (out, err) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(o.status.success(), "{out}{err}");
+        assert_eq!(parse_init_unpushed(&out), Some((1, Some(pushed.clone()))), "{out}");
+        assert!(!s.origin_holds(&key) && !s.origin_holds(&in_msg), "init-branches pushed an unscanned commit's key");
+        let new = "autocommit-devtest-w1d2-x";
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", new]), pushed, "at the newest commit origin has");
+        // The participant's work is on the new branch, on the pod; it tracks origin's.
+        assert_eq!((s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), s.git(&s.work, &["rev-parse", "HEAD"])), (new.to_string(), mine));
+        let config = |k: &str| s.git(&s.work, &["config", &format!("branch.{new}.{k}")]);
+        assert_eq!((config("remote"), config("merge")), ("origin".to_string(), format!("refs/heads/{new}")));
+
+        // The next backup scans it: both keys redacted, pushed as a fast-forward of the new branch.
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome, r.history.map(|h| h.0)), (Some(0), Some((BACKUP_PUSHED, new.into())), Some(1)), "{err}");
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "log", "-1", "--format=%s", new]), "yesterday, with REDACTED-HUGGINGFACE-TOKEN");
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", &format!("{new}^")]), pushed);
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "show", &format!("{new}:ex.py")]), "k = 'REDACTED-OPENROUTER-KEY'");
+        assert!(!s.origin_holds(&key) && !s.origin_holds(&in_msg));
+    }
+
+    /// FIX9B: with the participant's `push.followTags` set, a push of a commit took every annotated
+    /// tag on the commits going out along with it — a tag's message scanned by nothing, a key in it
+    /// on GitHub. Both pushes now send the commit alone: the backup's and init-branches'.
+    #[cfg(unix)]
+    #[test]
+    fn neither_push_takes_the_participants_tags_along() {
+        let s = GitSandbox::new("follow-tags", 1_000_000);
+        let key = openrouter_key(44);
+        s.git(&s.work, &["config", "push.followTags", "true"]);
+        std::fs::write(s.work.join("notes.md"), "n\n").unwrap();
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "mine"]);
+        s.git(&s.work, &["tag", "-a", "v1", "-m", &format!("works with {key}")]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        let cfg = BackupConfig { repo_path: s.work.display().to_string(), prefix: "devtest".into(), week: 1, day: 2, git_ssh_key: None, origin: None };
+        let o = s.run(&init_branch_command(&cfg, "devtest-x"));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "tag"]), "", "a tag was pushed");
+        assert!(!s.origin_holds(&key), "a tag's message reached origin");
+    }
+
+    /// FIX9B item 2, the other two cases: a second init the same day, on a day branch origin has
+    /// with a commit on top that it doesn't — origin's copy stays as it is (the push a no-op, never
+    /// a non-fast-forward), the commit said and kept; and a HEAD origin has none of (no commit of it
+    /// on origin at all) — the branch made on the pod, not pushed, said, and the next backup
+    /// creates it on origin. A HEAD origin has all of goes out whole, as before, said nothing.
+    #[cfg(unix)]
+    #[test]
+    fn init_branches_pushes_only_what_origin_has_and_says_what_waits_for_the_backup() {
+        let s = GitSandbox::new("init-only-origins", 1_000_000);
+        let origin_ref = |b: &str| s.run(&format!("git --git-dir {} rev-parse -q --verify refs/heads/{b}", shell_quote(s.origin.to_str().unwrap())));
+        let cfg = |d: u32| BackupConfig { repo_path: s.work.display().to_string(), prefix: "devtest".into(), week: 1, day: d, git_ssh_key: None, origin: None };
+        let init = |d: u32| {
+            let o = s.run(&init_branch_command(&cfg(d), "devtest-x"));
+            let out = String::from_utf8_lossy(&o.stdout).into_owned();
+            assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+            out
+        };
+        // All on origin: pushed whole, nothing said.
+        let out = init(2);
+        assert_eq!(parse_init_unpushed(&out), None, "{out}");
+        let day2 = s.git(&s.work, &["rev-parse", "HEAD"]);
+        assert_eq!(String::from_utf8_lossy(&origin_ref("autocommit-devtest-w1d2-x").stdout).trim(), day2);
+        // A commit on it origin doesn't have, then init again the same day.
+        std::fs::write(s.work.join("notes.md"), "n\n").unwrap();
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "not pushed yet"]);
+        let out = init(2);
+        assert_eq!(parse_init_unpushed(&out), Some((1, Some(day2.clone()))), "{out}");
+        assert_eq!(String::from_utf8_lossy(&origin_ref("autocommit-devtest-w1d2-x").stdout).trim(), day2, "origin's copy as it was");
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%s"]), "not pushed yet");
+        // A history origin has none of: the branch made, not pushed.
+        s.git(&s.work, &["checkout", "-q", "--orphan", "fresh"]);
+        s.git(&s.work, &["commit", "-q", "-m", "a root of its own"]);
+        let out = init(3);
+        assert_eq!(parse_init_unpushed(&out), Some((1, None)), "{out}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-devtest-w1d3-x");
+        assert!(!origin_ref("autocommit-devtest-w1d3-x").status.success(), "pushed with no commit on origin");
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-devtest-w1d3-x".into()))), "{err}");
+        assert_eq!(String::from_utf8_lossy(&origin_ref("autocommit-devtest-w1d3-x").stdout).trim(), s.git(&s.work, &["rev-parse", "HEAD"]));
+    }
+
+    /// FIX10 (review claude #1): init-branches pushes only a commit origin already has — by its
+    /// choice of the commit, so it needs no key scan of its own — and checks that before the push
+    /// rather than assume it. Were that choice ever to pick a commit origin lacks (here the choice
+    /// skipped: HEAD, an unscanned commit with a key on top of what origin has), nothing is
+    /// pushed, it says why, and it fails. The script as it is pushes the newest commit origin has.
+    #[cfg(unix)]
+    #[test]
+    fn init_branches_checks_it_pushes_only_what_origin_has() {
+        let s = GitSandbox::new("init-guard", 1_000_000);
+        let pushed = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let key = openrouter_key(54);
+        std::fs::write(s.work.join("ex.py"), format!("k = '{key}'\n")).unwrap();
+        s.git(&s.work, &["add", "ex.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "not scanned yet"]);
+        let origin_ref = || s.run(&format!("git --git-dir {} rev-parse -q --verify refs/heads/autocommit-new", shell_quote(s.origin.to_str().unwrap())));
+        let push = |script: &str| s.run(&format!("cd {} && NB=autocommit-new; {NO_BYPASS_URL_SH}; {script}", shell_quote(s.work.to_str().unwrap())));
+        let drifted = INIT_PUSH_SH.replacen(r#"if [ "$U" != 0 ]; then"#, "if false; then", 1);
+        assert_ne!(drifted, INIT_PUSH_SH);
+        let o = push(&drifted);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(1), "{err}");
+        assert!(err.contains("has commits origin doesn't have - not pushed (the next backup scans and pushes them)"), "{err}");
+        assert!(!origin_ref().status.success() && !s.origin_holds(&key), "{err}");
+        let o = push(INIT_PUSH_SH);
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(parse_init_unpushed(&out), Some((1, Some(pushed.clone()))), "{out}");
+        assert_eq!(String::from_utf8_lossy(&origin_ref().stdout).trim(), pushed);
         assert!(!s.origin_holds(&key));
     }
 
@@ -1993,13 +2835,139 @@ done
         assert_eq!((code, r.outcome, r.history), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-x".into())), None));
     }
 
+    /// Review codex #1 (FIX9B item 1): the outgoing scan read blobs only, so a key in a commit's
+    /// message — `git commit -m '…<key>'`, the files clean — had nothing to redact and went to
+    /// GitHub as it was. Now the messages of the commits going out are scanned too: against an
+    /// origin that refuses nothing, no object there holds the key (`cat-file
+    /// --batch-all-objects`), and the local commit is rewritten — its message redacted by the
+    /// same sed as the files, its tree as it was — with its descendant on top (its parent
+    /// changed), as a fast-forward of what origin had. The next run has nothing to do.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_only_in_a_commit_message_never_leaves_the_pod() {
+        let s = GitSandbox::new("msg-key", 1_000_000);
+        let key = openrouter_key(40);
+        let pushed = s.git(&s.work, &["rev-parse", "HEAD"]);
+        s.put("notes.md", 20);
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", &format!("configure {key}"), "-m", &format!("export OPENROUTER_API_KEY={key}")]);
+        s.put("more.md", 10);
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "after it"]);
+        let old_tip = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let old_trees = s.git(&s.work, &["log", "--format=%T", &format!("{pushed}..HEAD")]);
+        let (code, out, err) = s.backup_raw();
+        let r = parse_backup_report(&out);
+        assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{out}{err}");
+        let (n, old, new) = r.history.clone().expect("rewritten");
+        assert_eq!((n, old.as_str()), (2, old_tip.as_str()), "the message's commit and the one on top of it");
+        assert!(!s.origin_holds(&key), "the key reached origin in a commit message");
+        assert!(!out.contains(&key) && !err.contains(&key), "{out}{err}");
+        // Rewritten locally, pushed exactly: the message redacted, every tree as it was, on top of
+        // what origin had.
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), new);
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]), new);
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%B", "HEAD^"]), "configure REDACTED-OPENROUTER-KEY\n\nexport OPENROUTER_API_KEY=REDACTED-OPENROUTER-KEY");
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%s", "HEAD"]), "after it");
+        assert_eq!(s.git(&s.work, &["log", "--format=%T", &format!("{pushed}..HEAD")]), old_trees);
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD~2"]), pushed);
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "");
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome, r.history), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-x".into())), None), "{err}");
+    }
+
+    /// FIX9B item 1, with a key in a file *and* a different one in the same commit's message: the
+    /// rewrite the file's key starts redacts the message too (it used to copy it as it was) —
+    /// neither key in any object on origin, both redacted in the commit.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_in_a_file_and_another_in_its_commits_message_are_both_redacted() {
+        let s = GitSandbox::new("msg-and-file-key", 1_000_000);
+        let (in_file, in_msg) = (openrouter_key(41), format!("{}{}", "hf_", body(LETTERS, 34, 42)));
+        std::fs::write(s.work.join("ex.py"), format!("k = '{in_file}'\n")).unwrap();
+        s.git(&s.work, &["add", "ex.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", &format!("login with {in_msg}")]);
+        let (code, out, err) = s.backup_raw();
+        let r = parse_backup_report(&out);
+        assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{out}{err}");
+        assert_eq!(r.history.as_ref().map(|h| h.0), Some(1), "{out}");
+        assert!(!s.origin_holds(&in_file), "the file's key reached origin");
+        assert!(!s.origin_holds(&in_msg), "the message's key reached origin");
+        assert_eq!(s.git(&s.work, &["show", "HEAD:ex.py"]), "k = 'REDACTED-OPENROUTER-KEY'");
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%B", "HEAD"]), "login with REDACTED-HUGGINGFACE-TOKEN");
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]));
+        assert_eq!(s.read("ex.py"), format!("k = '{in_file}'\n").as_bytes(), "the file on disk keeps its key");
+    }
+
+    /// Review claude #1 (FIX10): the rewrite takes keys out of messages and text files only, and
+    /// the push went ahead whatever was left — a key in a commit's header (here the author's name
+    /// alone) went to GitHub as it was. Now a last scan of exactly what goes out (`$NEW --not
+    /// --remotes=origin`, commits and blobs) stops the push: `PUSH_BLOCKED key left after
+    /// redaction`, exit 4, a failure at the push (the pod is copied by rsync) — every run, nothing
+    /// on origin, the commit kept on the pod as it was. A key in a file is redacted and pushed as
+    /// before: the last scan passes it. So does a redaction that didn't take (a sed drifting from
+    /// the scan's grep; here one that leaves the text as it was): the key is committed, never
+    /// pushed.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_left_after_the_redaction_is_never_pushed() {
+        let s = GitSandbox::new("key-left", 1_000_000);
+        let origin_tip = || s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]);
+        // A key in a file: redacted, pushed.
+        let in_file = openrouter_key(51);
+        std::fs::write(s.work.join("ex.py"), format!("k = '{in_file}'\n")).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome, r.redacted), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into())), vec![(1, "ex.py".to_string())]), "{err}");
+        let pushed = s.git(&s.work, &["rev-parse", "HEAD"]);
+        assert_eq!(origin_tip(), pushed);
+        assert!(!s.origin_holds(&in_file), "the file's key reached origin");
+        // A key in the author's name only: committer, message and files clean.
+        let in_author = format!("{}{}", "hf_", body(LETTERS, 34, 52));
+        s.put("notes.md", 20);
+        s.git(&s.work, &["add", "notes.md"]);
+        s.git(&s.work, &["commit", "-q", "--author", &format!("Dev {in_author} <dev@example.invalid>"), "-m", "notes"]);
+        let tip = s.git(&s.work, &["rev-parse", "HEAD"]);
+        for run in 1..=2 {
+            let (code, out, err) = s.backup_raw();
+            let r = parse_backup_report(&out);
+            assert_eq!((code, r.push_blocked.as_deref()), (Some(BACKUP_BLOCKED_EXIT), Some(KEY_LEFT)), "run {run}: {out}{err}");
+            assert!(r.outcome.is_none() && r.history.is_none() && r.failed_at_push(), "run {run}: {r:?}");
+            assert!(!out.contains(&in_author) && !err.contains(&in_author), "run {run}: the key printed: {out}{err}");
+            assert!(!s.origin_holds(&in_author), "run {run}: the author's key reached origin");
+            assert_eq!((origin_tip(), s.git(&s.work, &["rev-parse", "HEAD"])), (pushed.clone(), tip.clone()), "run {run}");
+            let fail = r.failure("/root/ARENA_materials", "devtest-x", code).unwrap();
+            assert!(fail.starts_with("a key is still in the unpushed commits of autocommit-x after the redaction — "), "{fail}");
+            assert!(fail.ends_with("so nothing was pushed. Take it out of those commits on devtest-x by hand"), "{fail}");
+            assert_eq!(r.failure_brief(code).as_deref(), Some("a key left in the unpushed commits after the redaction"));
+        }
+
+        // A redaction that didn't take: a sed that, given the redaction, leaves the text as it was.
+        let s = GitSandbox::new("key-left-sed", 1_000_000);
+        let bin = s.base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let sed = ["/usr/bin/sed", "/bin/sed"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
+        crate::remote::write_test_script(
+            bin.join("sed"),
+            format!("#!/bin/sh\ncase \"$*\" in *REDACTED-*) for a; do last=$a; done; exec cat \"$last\";; esac\nexec {sed} \"$@\"\n"),
+        )
+        .unwrap();
+        let key = openrouter_key(53);
+        std::fs::write(s.work.join("ex.py"), format!("k = '{key}'\n")).unwrap();
+        let cmd = backup_command_limited(s.work.to_str().unwrap(), None, "arena backup", s.skip, s.limit, None);
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let o = std::process::Command::new("bash").arg("-c").arg(cmd).env("PATH", path).output().unwrap();
+        let (out, err) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert_eq!((o.status.code(), parse_backup_report(&out).push_blocked.as_deref()), (Some(BACKUP_BLOCKED_EXIT), Some(KEY_LEFT)), "{out}{err}");
+        assert_eq!(s.git(&s.work, &["show", "HEAD:ex.py"]), format!("k = '{key}'"), "committed as it was, on the pod");
+        assert!(!s.origin_holds(&key), "the key reached origin");
+    }
+
     /// Review: `redact_blob` failed open — a grep that couldn't run read as "no key", and a sed
     /// dying mid-blob committed a truncated "redacted" copy (the pipeline hid its status). Now
     /// either stops the run: nothing committed, nothing pushed, no key anywhere on origin.
     #[cfg(unix)]
     #[test]
     fn a_scan_or_rewrite_that_fails_stops_the_run_and_commits_nothing() {
-        use std::os::unix::fs::PermissionsExt;
         let real = |tool: &str| ["/usr/bin", "/bin"].iter().map(|d| format!("{d}/{tool}")).find(|p| std::path::Path::new(p).exists()).unwrap();
         for (tool, wrapper) in [
             // grep given the key patterns: exit 2, as a grep that can't run them would.
@@ -2010,8 +2978,7 @@ done
             let s = GitSandbox::new(&format!("failclosed-{tool}"), 1_000_000);
             let bin = s.base.join("bin");
             std::fs::create_dir_all(&bin).unwrap();
-            std::fs::write(bin.join(tool), wrapper).unwrap();
-            std::fs::set_permissions(bin.join(tool), std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(bin.join(tool), wrapper).unwrap();
             let key = openrouter_key(11);
             std::fs::write(s.work.join("ex.py"), format!("k = '{key}'\nmore = 1\n")).unwrap();
             let head = s.git(&s.work, &["rev-parse", "HEAD"]);
@@ -2064,6 +3031,66 @@ done
         assert_eq!(s.read("ex.py"), day2.as_bytes());
     }
 
+    /// Review (fb2 R1, R2): setup adds the public course repo as `upstream`. The switches must not
+    /// depend on it: init-branches fetched `--all` under `set -e`, so an unreachable upstream (a
+    /// typo, an outage) stopped every pod's day branch; and a gentle switch to a branch both
+    /// remotes have (the cohort repo is a copy of the course's) failed as "matched multiple remote
+    /// tracking branches" once upstream's refs were there. Now init fetches origin only, and the
+    /// switch takes origin's branch — fast-forwarding to it by name, even for a local branch that
+    /// tracks upstream's (ai-review codex #5).
+    #[cfg(unix)]
+    #[test]
+    fn the_switches_never_depend_on_an_upstream_remote() {
+        let s = GitSandbox::new("upstream-switch", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let up = s.base.join("upstream.git");
+        s.git(&s.base, &["init", "-q", "--bare", up.to_str().unwrap()]);
+        // `feat` on both: origin's with one more commit, upstream's = main.
+        s.git(&s.work, &["checkout", "-q", "-b", "feat", "main"]);
+        s.put("feat.txt", 3);
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "feat"]);
+        s.git(&s.work, &["push", "-q", "origin", "feat"]);
+        s.git(&s.work, &["push", "-q", up.to_str().unwrap(), "main:feat"]);
+        s.git(&s.work, &["remote", "add", "upstream", up.to_str().unwrap()]);
+        s.git(&s.work, &["fetch", "-q", "upstream"]);
+        s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+        s.git(&s.work, &["branch", "-q", "-D", "feat"]);
+        let run = |cmd: String| {
+            let o = s.run(&cmd);
+            (o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
+        };
+        let (ok, out) = run(checkout_command(repo, "feat", None, false));
+        assert!(ok, "{out}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/feat"]));
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "feat@{u}"]), "origin/feat");
+        // A `feat` of the participant's own, tracking upstream's (review ai-review codex #5): the
+        // switch fast-forwards it to origin's. (A `git pull --ff-only` merged from upstream's —
+        // nothing new there — and left it behind origin's.)
+        let own_feat = || {
+            s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+            s.git(&s.work, &["branch", "-q", "-f", "--track", "feat", "upstream/feat"]);
+            assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "feat@{u}"]), "upstream/feat");
+        };
+        own_feat();
+        let (ok, out) = run(checkout_command(repo, "feat", None, false));
+        assert!(ok, "{out}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/feat"]), "origin's feat");
+        // Upstream unreachable: https, which this sandbox's git refuses at once (as a typo'd or
+        // down repo would fail on a pod).
+        s.git(&s.work, &["remote", "set-url", "upstream", "https://github.com/ARENA-education/ARENA_material.git"]);
+        let cfg = BackupConfig { repo_path: repo.to_string(), prefix: "devtest".into(), week: 1, day: 4, git_ssh_key: None, origin: None };
+        let (ok, out) = run(init_branch_command(&cfg, "devtest-x"));
+        assert!(ok, "{out}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-devtest-w1d4-x");
+        assert_eq!(s.git(&s.origin, &["rev-parse", "autocommit-devtest-w1d4-x"]), s.git(&s.work, &["rev-parse", "HEAD"]));
+        // …and the gentle switch never asks upstream either: its own `feat` still lands on origin's.
+        own_feat();
+        let (ok, out) = run(checkout_command(repo, "feat", None, false));
+        assert!(ok, "{out}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/feat"]), "origin's feat");
+    }
+
     /// Live (bsec O1): `set-branch main --hard --init-branches` run twice in a day landed the pod
     /// back on its day branch with the real keys still set aside, and nothing said so — init's
     /// checkout ran no restore. Now it runs set-branch's: back, byte for byte, and said. A new
@@ -2111,6 +3138,54 @@ done
         // …until a switch back to that branch.
         assert!(run(checkout_command(repo, "autocommit-devtest-w1d2-x", None, false)).0.contains("UNREDACTED_RESTORED README.md"));
         assert_eq!(s.read("README.md"), readme.as_bytes());
+    }
+
+    /// FIX4B item 9: init-branches puts real keys back (`unredacted_restore`) — the participant's
+    /// working code — and ran under the login shell's `-c`, zsh on the pods, where a glob with no
+    /// match is fatal: a set-aside run left without its `.branch` ended the whole command at the
+    /// restore's `"$1"/*.branch`, before the push (nor did an EXIT trap run after it). Now its script
+    /// runs under `sh` whatever the login shell: under bash, zsh and fish, the restore onto a day branch
+    /// that exists brings the key back, and in that no-match state the day's branch is still made
+    /// and pushed, the stray run left as it was.
+    #[cfg(unix)]
+    #[test]
+    fn init_branches_runs_under_sh_whatever_the_login_shell() {
+        let path = std::env::var("PATH").unwrap_or_default();
+        for shell in login_shells() {
+            let s = GitSandbox::new(&format!("init-{shell}"), 1_000_000);
+            let repo = s.work.to_str().unwrap();
+            let day = |d: u32| BackupConfig { repo_path: repo.to_string(), prefix: "devtest".into(), week: 1, day: d, git_ssh_key: None, origin: None };
+            let run = |cmd: String| {
+                let (code, out, err) = run_in(shell, &cmd, &path);
+                assert_eq!(code, Some(0), "{shell}: {out}{err}");
+                out
+            };
+            let head = || s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]);
+            // A key backed up redacted on today's branch, set aside by a reset to main, put back by
+            // the second init of the day.
+            run(init_branch_command(&day(2), "devtest-x"));
+            let readme = format!("notes\nKEY = \"{}\"\n", openrouter_key(27));
+            std::fs::write(s.work.join("README.md"), &readme).unwrap();
+            let (code, r, err) = s.backup();
+            assert_eq!((code, r.redacted.len()), (Some(0), 1), "{shell}: {err}");
+            assert!(run(checkout_command(repo, "main", None, true)).contains("UNREDACTED_KEPT README.md"), "{shell}");
+            let out = run(init_branch_command(&day(2), "devtest-x"));
+            assert!(out.contains("UNREDACTED_RESTORED README.md") && s.read("README.md") == readme.as_bytes(), "{shell}: {out}");
+            // A set-aside run with no `.branch`: no `*.branch` matches. The next day's branch is
+            // still made and pushed; the run stays.
+            let stray = s.work.join(".git/arena-unredacted/20260101T000000Z-1");
+            std::fs::create_dir_all(&stray).unwrap();
+            std::fs::write(stray.join("notes.md"), "kept\n").unwrap();
+            s.git(&s.work, &["checkout", "-q", "-f", "main"]);
+            run(init_branch_command(&day(3), "devtest-x"));
+            assert_eq!(head(), "autocommit-devtest-w1d3-x", "{shell}");
+            assert_eq!(
+                s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-devtest-w1d3-x"]),
+                s.git(&s.work, &["rev-parse", "HEAD"]),
+                "{shell}: pushed"
+            );
+            assert_eq!(std::fs::read_to_string(stray.join("notes.md")).unwrap(), "kept\n", "{shell}");
+        }
     }
 
     /// The dry run's per-pod line pastes: next to the file its here-doc writes, it runs the
@@ -2235,34 +3310,146 @@ done
         let mut c = cfg();
         c.week = 1;
         c.day = 4;
-        let cmd = init_branch_command(&c, "arena8-apple");
-        assert!(cmd.contains("git fetch --all --prune"));
+        let cmd = init_branch_script(&c, "arena8-apple");
+        assert!(cmd.contains("git fetch --prune origin") && !cmd.contains("--all"), "{cmd}");
         assert!(cmd.contains("git checkout -b 'autocommit-arena8-w1d4-apple'"));
-        assert!(cmd.contains("git push -u origin 'autocommit-arena8-w1d4-apple'"));
-        // It only creates/pushes the branch — never stages or commits work.
-        assert!(!cmd.contains("git add"));
-        assert!(!cmd.contains("git commit"));
+        // Pushed by id, only what origin has (FIX9B item 2), never the branch by name.
+        assert!(cmd.contains("NB='autocommit-arena8-w1d4-apple'") && cmd.contains(INIT_PUSH_SH.trim_end()), "{cmd}");
+        assert!(INIT_PUSH_SH.contains(r#"git push --no-follow-tags origin "$AT:refs/heads/$NB""#) && !cmd.contains("git push -u"), "{cmd}");
+        // It only creates/pushes the branch — never stages or commits work. (The refusal of a
+        // checkout mid-merge names `git add`/`git commit` in the words it prints, never runs them.)
+        let refusal = busy_refusal_sh("arena init-branches");
+        assert!(cmd.contains(&refusal) && refusal.contains("printf '%s\\n' 'arena init-branches: a merge is in progress on '"));
+        let run = cmd.replace(&refusal, "");
+        assert!(!run.contains("git add"));
+        assert!(!run.contains("git commit"));
     }
 
     #[test]
     fn checkout_is_gentle_ff_only() {
-        let c = checkout_command("/root/ARENA_3.0", "main", Some("/root/.ssh/id_ed25519"), false);
+        let c = switch_script("/root/ARENA_3.0", "main", Some("/root/.ssh/id_ed25519"), false, KB_DEFAULT);
         assert!(c.contains("cd '/root/ARENA_3.0'"));
-        assert!(c.contains("git fetch origin"));
-        assert!(c.contains("git checkout 'main'"));
-        assert!(c.contains("git pull --ff-only")); // no hard reset
-        assert!(!c.contains("reset --hard"));
+        assert!(c.contains("git fetch --prune origin"));
+        // Origin's branch by its full name, never the local branch's upstream (codex #5).
+        assert!(c.contains(
+            "git -c checkout.defaultRemote=origin checkout 'main' && { git merge --ff-only 'refs/remotes/origin/main' || { switch_back 'main'; false; }; }"
+        ));
+        assert!(c.contains("PREV=$(git symbolic-ref -q --short HEAD) || PREV=") && c.contains(SWITCH_BACK_SH));
+        assert!(!c.contains("git pull") && !c.contains("@{u}")); // no hard reset
+        assert!(!c.contains("reset --hard") && !c.contains("discarded_save"), "gentle discards nothing, so saves nothing");
         assert!(c.contains("GIT_SSH_COMMAND='ssh -i /root/.ssh/id_ed25519"));
     }
 
     #[test]
     fn checkout_hard_resets_to_origin() {
-        let c = checkout_command("/root/ARENA_3.0", "main", None, true);
-        assert!(c.contains("git fetch origin"));
-        // Force-switch the branch to origin and hard-reset (destructive).
-        assert!(c.contains("git checkout -f -B 'main' 'origin/main'"));
+        let c = switch_script("/root/ARENA_3.0", "main", None, true, KB_DEFAULT);
+        assert!(c.contains("git fetch --prune origin"));
+        // What it discards saved first — no save, no reset — then force-switch the branch to
+        // origin and hard-reset (destructive).
+        assert!(c.contains("discarded_save() {") && c.contains("if discarded_save \"$G\" 'origin/main' 'main' 1048576 && git checkout -f -B 'main' 'origin/main'"));
         assert!(c.contains("git reset --hard 'origin/main'"));
         assert!(!c.contains("--ff-only"));
+        // The keys' restore is the EXIT trap, set before the set-aside (claude #4) — under --hard,
+        // followed by the removal of a save stopped part-way (claude #2), a failed restore still
+        // failing the command.
+        let hard_trap = "trap 'ds_rc=0; unredacted_restore \"$G/arena-unredacted\" || ds_rc=$?; ds_abandon; [ \"$ds_rc\" = 0 ]' EXIT";
+        for (cmd, trap) in [(c.clone(), hard_trap), (switch_script("/r", "main", None, false, KB_DEFAULT), "trap 'unredacted_restore \"$G/arena-unredacted\"' EXIT")] {
+            let trap = cmd.find(trap).expect("the trap");
+            assert!(trap < cmd.find("unredacted_aside \"$G").unwrap() && cmd.contains("trap 'exit 143' TERM"));
+        }
+        assert!(!switch_script("/r", "main", None, false, KB_DEFAULT).contains("ds_abandon"));
+        assert!(switch_script("/r", "main", None, true, 77).contains("'origin/main' 'main' 77 && git checkout"));
+    }
+
+    /// The switch runs under `sh`, whatever the login shell that `-c`s the command (zsh on the
+    /// pods), bounded on the pod by `timeout` a little under arena's own 2 minutes — a pod without
+    /// one runs it unbounded (review ai-review claude #13). The command is one simple command,
+    /// `sh -c '<wrapper>' <name> '<script>'` (claude #11: the login shell parsed an assignment and
+    /// an `if … fi`, which fish refuses): every login shell here — bash, zsh, fish — reads it as
+    /// those words, the script byte for byte (its backslashes too, which fish reads differently
+    /// inside single quotes).
+    #[cfg(unix)]
+    #[test]
+    fn the_switch_bounds_itself_on_the_pod_under_sh() {
+        let words = |shell: &str, cmd: &str| -> Vec<String> {
+            let rest = cmd.strip_prefix("sh -c ").unwrap_or_else(|| panic!("one `sh -c` command: {cmd}"));
+            let o = std::process::Command::new(shell).arg("-c").arg(format!("command printf '%s\\0' {rest}")).output().unwrap();
+            assert!(o.status.success(), "{shell}: {}", String::from_utf8_lossy(&o.stderr));
+            let mut w: Vec<String> = o.stdout.split(|b| *b == 0).map(|w| String::from_utf8_lossy(w).into_owned()).collect();
+            assert_eq!(w.pop().as_deref(), Some(""), "{shell}");
+            w
+        };
+        let wrapper = |w: &str, name: &str, stopped: &str| {
+            assert!(w.starts_with("if timeout -k 1 1 true >/dev/null 2>&1; then timeout -k 10 100 sh -c \"$1\" \"$0\"; r=$?;"), "{name}: {w}");
+            assert!(w.ends_with("exit \"$r\"; else exec sh -c \"$1\" \"$0\"; fi"), "{name}: {w}");
+            assert!(w.contains("if [ \"$r\" = 124 ]") && w.contains(stopped), "{name}: {w}");
+            assert!(w.contains("elif [ \"$r\" = 137 ]") && w.contains("was killed there (10 s after the TERM)"), "{name}: {w}");
+        };
+        assert!(redact_sed().contains('\\'), "a script with backslashes in it");
+        for shell in login_shells() {
+            for hard in [false, true] {
+                let w = words(shell, &checkout_command("/r", "main", Some("/k"), hard));
+                assert_eq!(w[1..], ["arena-set-branch".to_string(), switch_script("/r", "main", Some("/k"), hard, KB_DEFAULT)], "{shell} hard={hard}");
+                wrapper(&w[0], "arena-set-branch", "the switch ran past its 100 s on the pod and was stopped there");
+            }
+            // init-branches the same way (FIX4B item 9: it puts real keys back too).
+            let w = words(shell, &init_branch_command(&cfg(), "arena8-apple"));
+            assert_eq!(w[1..], ["arena-init-branches".to_string(), init_branch_script(&cfg(), "arena8-apple")], "{shell}");
+            wrapper(&w[0], "arena-init-branches", "arena init-branches: it ran past its 100 s on the pod and was stopped there");
+        }
+        assert_eq!((SWITCH_BOUND_SECS, SWITCH_KILL_AFTER_SECS), (100, 10));
+    }
+
+    /// The login shells a remote command is tried under here: bash, and zsh (the pods') and fish
+    /// when installed — said when one isn't.
+    #[cfg(unix)]
+    fn login_shells() -> Vec<&'static str> {
+        let has = |sh: &str| std::process::Command::new(sh).args(["-c", "true"]).output().is_ok_and(|o| o.status.success());
+        let shells: Vec<&str> = ["bash", "zsh", "fish"].into_iter().filter(|sh| has(sh)).collect();
+        for sh in ["zsh", "fish"].into_iter().filter(|sh| !shells.contains(sh)) {
+            eprintln!("{sh} isn't installed here: not tried as the login shell");
+        }
+        shells
+    }
+
+    /// `DISCARD_MAX_GB`: GiB, a positive number, a fraction too, else 1 (review ai-review claude #6:
+    /// 5 GB didn't fit in the switch's 100 s) — in KiB, as the save's `du -sk` counts; in words as
+    /// its lines say sizes, binary and labelled so (Live 7: `0.05` showed as `51 MB`): the very same
+    /// words from the shell's `ds_size` (the refusal's and the stopped save's lines) and from
+    /// `config check`'s row, for the same KiB. A bad value's message leads with the default, 1, and a
+    /// fraction.
+    #[test]
+    fn the_discard_limit_is_the_configs_gb_else_one() {
+        assert_eq!((DISCARD_MAX_GB, KB_DEFAULT), (1, 1024 * 1024));
+        for (text, want) in [
+            ("", KB_DEFAULT),
+            ("DISCARD_MAX_GB= \n", KB_DEFAULT),
+            ("DISCARD_MAX_GB=20\n", 20 * 1024 * 1024),
+            ("DISCARD_MAX_GB=0.5\n", 512 * 1024),
+            ("DISCARD_MAX_GB=0.05\n", 52_429),
+        ] {
+            assert_eq!(discard_max_kb(&Config::parse(text)), Ok(want), "{text:?}");
+        }
+        let sizes: [(u64, &str); 7] = [
+            (KB_DEFAULT, "1.0 GiB"),
+            (20 * 1024 * 1024, "20.0 GiB"),
+            (3 * 512 * 1024, "1.5 GiB"),
+            (512 * 1024, "512 MiB"),
+            (52_429, "51 MiB"),
+            (1049, "1 MiB"),
+            (100, "100 KiB"),
+        ];
+        let script = format!("{}\nfor k; do ds_size \"$k\"; echo; done", discarded_sh());
+        let o = std::process::Command::new("sh").arg("-c").arg(&script).arg("sh").args(sizes.iter().map(|(k, _)| k.to_string())).output().unwrap();
+        let shell: Vec<String> = String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect();
+        for (i, (kb, words)) in sizes.iter().enumerate() {
+            assert_eq!(discard_max_words(*kb), *words, "{kb}");
+            assert_eq!(shell.get(i).map(String::as_str), Some(*words), "ds_size {kb}");
+        }
+        for bad in ["0", "-1", "lots", "5GB", "inf", "NaN"] {
+            let err = discard_max_kb(&Config::parse(&format!("DISCARD_MAX_GB={bad}\n"))).unwrap_err();
+            assert_eq!(err, format!("DISCARD_MAX_GB must be a number of GiB above 0, a fraction too, like 1 or 0.5 (got `{bad}`)"));
+        }
     }
 
     #[test]
@@ -2495,7 +3682,10 @@ done
         assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "no branch made or switched to");
         assert!(s.git(&s.work, &["branch", "--list", "autocommit-devtest-w1d2-x"]).is_empty());
         assert!(s.ssh_calls().is_empty());
-        // The configured repo (scp-style, served by the stand-in): made and pushed, as before.
+        // The configured repo (scp-style, served by the stand-in), holding the course's main as a
+        // cohort repo does: made and pushed, as before. (On a repo with none of HEAD's commits it
+        // would be made and left for the next backup to push: FIX9B item 2.)
+        s.git(&s.work, &["push", "-q", github.to_str().unwrap(), "main"]);
         s.git(&s.work, &["remote", "set-url", "origin", "git@github.com:Styme3279/ARENA_materials.git"]);
         let o = s.run(&init_branch_command(&cfg, "devtest-x"));
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -2516,5 +3706,1855 @@ done
         assert!(check < s.find("echo \"SKIP $B\"").unwrap() && check < s.find("git add -A").unwrap());
         assert!(s.contains(origin_sh().trim_end()));
         assert!(s.contains("ORIGIN=${6:-}"));
+    }
+
+    /// `BUSY <branch> <what> [unmerged]`: what is in progress, said with how to end it either way —
+    /// the verbs of the operation it is — and a failure at the push (the pod is copied instead).
+    /// Review F4: conflicts are named only when there are unmerged paths (a merge whose conflicts
+    /// are staged, a clean `git revert -n`, has no markers to commit), and then the advice starts
+    /// with resolving and adding them — git refuses `git commit` / `--continue` until then. Every
+    /// variant's words, pinned.
+    #[test]
+    fn the_busy_line_says_whats_in_progress_and_how_to_end_it() {
+        let code = Some(BACKUP_BUSY_EXIT);
+        let r = parse_backup_report("BRANCH autocommit-x\nBUSY autocommit-x merge unmerged\n");
+        assert_eq!((r.busy.as_deref(), r.unmerged, r.branch.as_deref(), r.outcome.clone()), (Some("merge"), true, Some("autocommit-x"), None));
+        assert!(r.failed_at_push(), "copied instead, like a failed push");
+        assert_eq!((r.in_progress(code), r.in_progress(Some(1)), r.in_progress(Some(0))), (Some("merge"), None, None));
+        assert_eq!(
+            r.failure_brief(code).unwrap(),
+            "a merge is in progress on autocommit-x — not committed; resolve the conflicts and `git add` them, then `git commit` \
+             — or abort it (`git merge --abort`) on the pod"
+        );
+        assert_eq!((r.failure("/r", "p", Some(1)), r.failure_brief(Some(1))), (None, None), "only with its own exit");
+        // (the BUSY line, the whole failure line)
+        let cases: &[(&str, &str)] = &[
+            (
+                "BUSY b merge unmerged",
+                "a merge is in progress on b — not committed (a backup now would commit the merge's state, unresolved conflicts \
+                 and all, and end the merge); resolve the conflicts and `git add` them, then `git commit` — or abort it (`git \
+                 merge --abort`) on the pod",
+            ),
+            (
+                "BUSY b merge",
+                "a merge is in progress on b — not committed (a backup now would commit the merge's state and end the merge); \
+                 finish it (`git commit`) or abort it (`git merge --abort`) on the pod",
+            ),
+            (
+                "BUSY b cherry-pick unmerged",
+                "a cherry-pick is in progress on b — not committed (a backup now would commit the cherry-pick's state, unresolved \
+                 conflicts and all, and end the cherry-pick); resolve the conflicts and `git add` them, then `git cherry-pick \
+                 --continue` — or abort it (`git cherry-pick --abort`) on the pod",
+            ),
+            (
+                "BUSY b cherry-pick",
+                "a cherry-pick is in progress on b — not committed (a backup now would commit the cherry-pick's state and end the \
+                 cherry-pick); finish it (`git cherry-pick --continue`) or abort it (`git cherry-pick --abort`) on the pod",
+            ),
+            (
+                "BUSY b revert unmerged",
+                "a revert is in progress on b — not committed (a backup now would commit the revert's state, unresolved conflicts \
+                 and all, and end the revert); resolve the conflicts and `git add` them, then `git revert --continue` — or abort \
+                 it (`git revert --abort`) on the pod",
+            ),
+            (
+                "BUSY b revert",
+                "a revert is in progress on b — not committed (a backup now would commit the revert's state and end the revert); \
+                 finish it (`git revert --continue`) or abort it (`git revert --abort`) on the pod",
+            ),
+            (
+                "BUSY b conflicts",
+                "b has unresolved conflicts — not committed (a backup now would commit the conflicted files as they are); resolve \
+                 them and `git add` them, or undo them (`git reset --merge`) on the pod",
+            ),
+            // Review pr4: `git am`, a rebase that kept HEAD attached, a sequence paused between
+            // its commits — each with its own way out (a sequence's may be a cherry-pick's or a
+            // revert's).
+            (
+                "BUSY b am",
+                "a `git am` is in progress on b — not committed (a backup now would commit what is there in the middle of the `git \
+                 am`); finish it (`git am --continue`) or abort it (`git am --abort`) on the pod",
+            ),
+            (
+                "BUSY b am unmerged",
+                "a `git am` is in progress on b — not committed (a backup now would commit what is there, unresolved conflicts and \
+                 all, in the middle of the `git am`); resolve the conflicts and `git add` them, then `git am --continue` — or abort \
+                 it (`git am --abort`) on the pod",
+            ),
+            (
+                "BUSY b rebase",
+                "a rebase is in progress on b — not committed (a backup now would commit what is there in the middle of the \
+                 rebase); finish it (`git rebase --continue`) or abort it (`git rebase --abort`) on the pod",
+            ),
+            (
+                "BUSY b rebase unmerged",
+                "a rebase is in progress on b — not committed (a backup now would commit what is there, unresolved conflicts and \
+                 all, in the middle of the rebase); resolve the conflicts and `git add` them, then `git rebase --continue` — or \
+                 abort it (`git rebase --abort`) on the pod",
+            ),
+            (
+                "BUSY b sequence",
+                "a cherry-pick or revert sequence is in progress on b — not committed (a backup now would commit what is there in \
+                 the middle of the sequence); finish it (`git cherry-pick --continue`, or `git revert --continue` for a revert) or \
+                 abort it (`git cherry-pick --abort`, or `git revert --abort`) on the pod",
+            ),
+            (
+                "BUSY b sequence unmerged",
+                "a cherry-pick or revert sequence is in progress on b — not committed (a backup now would commit what is there, \
+                 unresolved conflicts and all, in the middle of the sequence); resolve the conflicts and `git add` them, then `git \
+                 cherry-pick --continue`, or `git revert --continue` for a revert — or abort it (`git cherry-pick --abort`, or `git \
+                 revert --abort`) on the pod",
+            ),
+        ];
+        for (line, want) in cases {
+            let r = parse_backup_report(&format!("BRANCH b\n{line}\n"));
+            assert_eq!(r.failure("/r", "p", code).unwrap(), *want, "{line}");
+            assert!(!r.failure("/r", "p", code).unwrap().contains("conflict markers"), "{line}");
+        }
+        // Every word the script prints has its own words — none falls back to the generic ones —
+        // and every line it can print is a case of the switches' refusal.
+        assert_eq!(cases.len(), BUSY_LINES.len());
+        for what in BUSY_WORDS {
+            assert!(!busy_situation(what, "b").contains("git operation (") && busy_advice(what, false) != "finish it or abort it", "{what}");
+            assert!(BUSY_LINES.iter().any(|(w, _)| *w == what), "{what}");
+            let printed = if what == "conflicts" { "BUSY b conflicts".to_string() } else { format!("BUSY b {what}") };
+            assert!(cases.iter().any(|(l, _)| *l == printed), "{what}");
+        }
+        // A conflicts line is unmerged by definition; an unknown word after the operation isn't.
+        assert!(parse_backup_report("BUSY b conflicts\n").unmerged);
+        assert!(!parse_backup_report("BUSY b merge later\n").unmerged);
+        // The branch from the BUSY line when no BRANCH came first; a line without its word is no BUSY.
+        assert_eq!(parse_backup_report("BUSY feature merge\n").branch.as_deref(), Some("feature"));
+        assert_eq!(parse_backup_report("BUSY feature\n").busy, None);
+        assert!(!parse_backup_report("BUSY feature\n").failed_at_push());
+    }
+
+    /// [`GitSandbox`] with the course repo as `upstream` (a clone of origin's `main`, as setup adds
+    /// it) holding a change to README.md, and the participant's own change to it committed on
+    /// `autocommit-x` (not pushed): `git pull upstream main` conflicts. Returns the course repo.
+    #[cfg(unix)]
+    fn with_conflicting_upstream(s: &GitSandbox) -> std::path::PathBuf {
+        let course = s.base.join("course");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), course.to_str().unwrap()]);
+        std::fs::write(course.join("README.md"), "the course's version\n").unwrap();
+        s.git(&course, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-am", "upstream"]);
+        s.git(&s.work, &["remote", "add", "upstream", course.to_str().unwrap()]);
+        std::fs::write(s.work.join("README.md"), "the participant's version\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-am", "mine"]);
+        course
+    }
+
+    /// git, expected to fail (a conflict): (exit code, stdout + stderr).
+    #[cfg(unix)]
+    fn git_failing(dir: &std::path::Path, args: &[&str]) -> (Option<i32>, String) {
+        let o = std::process::Command::new("git").current_dir(dir).args(args).env("GIT_EDITOR", "true").output().expect("git");
+        (o.status.code(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
+    }
+
+    /// Review R3: a participant mid-way through a conflicted `git pull upstream main` (setup adds
+    /// the `upstream` remote) had the conflict markers committed by the next backup — a merge
+    /// commit, pushed — after which `git merge --abort` and VS Code's conflict view no longer
+    /// worked. Now a merge, a cherry-pick or a revert in progress, or a `git stash pop`'s
+    /// conflicts, stop the run before anything is staged: `BUSY`, exit 6, HEAD, the index and the
+    /// tree exactly as they were, nothing pushed — and the participant's abort still brings back
+    /// the tree they had. Once it's ended the next run backs up as always, and so does a merge
+    /// that went through.
+    #[cfg(unix)]
+    #[test]
+    fn an_operation_in_progress_is_never_committed_and_can_still_be_aborted() {
+        let s = GitSandbox::new("busy", 1_000_000);
+        let course = with_conflicting_upstream(&s);
+        // Commits for the cherry-pick (a side branch) and the revert (two edits of one line) to conflict on.
+        s.git(&s.work, &["checkout", "-q", "-b", "side", "main"]);
+        std::fs::write(s.work.join("README.md"), "the side branch's version\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-am", "side"]);
+        s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+        let origin_ref = || s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "refs/heads/autocommit-x"]);
+        // What each case commits first (nothing, or the commits its operation conflicts over).
+        type Prepare = Box<dyn Fn(&GitSandbox)>;
+        // (what, its commits first, the command that conflicts, the participant's way out, its `*_HEAD`)
+        type Case<'a> = (&'a str, Prepare, &'a [&'a str], &'a [&'a str], Option<&'a str>);
+        let edit = |s: &GitSandbox, text: &str| {
+            std::fs::write(s.work.join("README.md"), format!("{text}\n")).unwrap();
+            s.git(&s.work, &["commit", "-q", "-am", text]);
+        };
+        let cases: Vec<Case> = vec![
+            ("merge", Box::new(|_| ()), &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"], &["merge", "--abort"], Some("MERGE_HEAD")),
+            ("cherry-pick", Box::new(|_| ()), &["cherry-pick", "side"], &["cherry-pick", "--abort"], Some("CHERRY_PICK_HEAD")),
+            ("revert", Box::new(move |s| ["a", "b"].iter().for_each(|v| edit(s, v))), &["revert", "--no-edit", "HEAD~1"], &["revert", "--abort"], Some("REVERT_HEAD")),
+            (
+                "conflicts",
+                Box::new(move |s| {
+                    std::fs::write(s.work.join("README.md"), "stashed\n").unwrap();
+                    s.git(&s.work, &["stash", "-q"]);
+                    edit(s, "committed");
+                }),
+                &["stash", "pop"],
+                &["reset", "--merge"],
+                None,
+            ),
+        ];
+        for (what, prepare, start, abort, head_file) in &cases {
+            // New work beside the operation, never staged by the backup while it lasts.
+            s.put(&format!("notes-{what}.md"), 20);
+            prepare(&s);
+            let before = (s.git(&s.work, &["rev-parse", "HEAD"]), s.read("README.md"), s.git(&s.work, &["status", "--porcelain"]));
+            let (code, said) = git_failing(&s.work, start);
+            assert_ne!(code, Some(0), "{what}: no conflict: {said}");
+            let during = s.git(&s.work, &["status", "--porcelain"]);
+            assert!(during.contains("UU README.md"), "{what}: {during}");
+            let pushed = origin_ref();
+            let (code, out, err) = s.backup_raw();
+            assert_eq!(code, Some(BACKUP_BUSY_EXIT), "{what}: {out}{err}");
+            // Conflicted, so `unmerged` after an operation's word (a stash pop's conflicts are that already).
+            let printed = if *what == "conflicts" { what.to_string() } else { format!("{what} unmerged") };
+            assert_eq!(out, format!("BRANCH autocommit-x\nBUSY autocommit-x {printed}\n"), "{what}: nothing else done");
+            assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), before.0, "{what}: nothing committed");
+            assert_eq!(s.git(&s.work, &["status", "--porcelain"]), during, "{what}: nothing staged");
+            assert_eq!(origin_ref(), pushed, "{what}: nothing pushed");
+            if let Some(f) = head_file {
+                assert!(s.work.join(".git").join(f).exists(), "{what}: {f} gone");
+            }
+            let words = parse_backup_report(&out).failure("/r", "p", code).unwrap();
+            assert!(words.contains(&abort.join(" ")) && words.contains("`git add` them"), "{what}: says how to abort, and to add first: {words}");
+            if *what == "merge" {
+                // Why the words say to resolve and add first: git refuses the commit until then (review F4).
+                let (c, said) = git_failing(&s.work, &["commit", "--no-edit"]);
+                assert!(c != Some(0) && said.contains("unmerged"), "{said}");
+            }
+            // The participant's way out still works, and brings back what they had.
+            s.git(&s.work, abort);
+            let after = (s.git(&s.work, &["rev-parse", "HEAD"]), s.read("README.md"), s.git(&s.work, &["status", "--porcelain"]));
+            assert_eq!(after, before, "{what}: the abort restores the tree");
+            // Ended: backed up as always.
+            let (code, r, err) = s.backup();
+            assert_eq!((code, r.outcome, r.busy), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into())), None), "{what}: {err}");
+        }
+        assert_eq!(s.git(&s.work, &["stash", "list"]).lines().count(), 1, "the conflicted stash is kept");
+
+        // Nothing unmerged, still in progress (review F4): a clean `git revert -n` (git 2.43 leaves
+        // REVERT_HEAD), and a conflicted merge whose conflicts are resolved and added. BUSY without
+        // `unmerged`, words that name no conflicts — and the way out they give works as said.
+        s.git(&s.work, &["revert", "-n", "HEAD"]);
+        assert!(s.work.join(".git/REVERT_HEAD").exists() && s.git(&s.work, &["ls-files", "-u"]).is_empty());
+        let (code, out, _) = s.backup_raw();
+        assert_eq!((code, out.as_str()), (Some(BACKUP_BUSY_EXIT), "BRANCH autocommit-x\nBUSY autocommit-x revert\n"));
+        assert_eq!(
+            parse_backup_report(&out).failure("/r", "p", code).unwrap(),
+            "a revert is in progress on autocommit-x — not committed (a backup now would commit the revert's state and end the \
+             revert); finish it (`git revert --continue`) or abort it (`git revert --abort`) on the pod"
+        );
+        s.git(&s.work, &["-c", "core.editor=true", "revert", "--continue"]);
+        assert_eq!(s.backup().1.outcome, Some((BACKUP_PUSHED, "autocommit-x".into())), "finished: backed up");
+        git_failing(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
+        std::fs::write(s.work.join("README.md"), "resolved\n").unwrap();
+        s.git(&s.work, &["add", "README.md"]);
+        let (code, out, _) = s.backup_raw();
+        assert_eq!((code, out.as_str()), (Some(BACKUP_BUSY_EXIT), "BRANCH autocommit-x\nBUSY autocommit-x merge\n"));
+        assert_eq!(
+            parse_backup_report(&out).failure("/r", "p", code).unwrap(),
+            "a merge is in progress on autocommit-x — not committed (a backup now would commit the merge's state and end the \
+             merge); finish it (`git commit`) or abort it (`git merge --abort`) on the pod"
+        );
+        s.git(&s.work, &["commit", "-q", "--no-edit"]);
+        assert_eq!(s.backup().1.outcome, Some((BACKUP_PUSHED, "autocommit-x".into())), "finished: backed up");
+
+        // A merge that went through (no conflict, committed) is backed up like any commit.
+        s.git(&course, &["checkout", "-q", "-b", "extra", "main~1"]);
+        std::fs::write(course.join("extra.py"), "x = 1\n").unwrap();
+        s.git(&course, &["add", "extra.py"]);
+        s.git(&course, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "extra"]);
+        s.git(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "extra"]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome, r.busy), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into())), None), "{err}");
+        assert_eq!(origin_ref(), s.git(&s.work, &["rev-parse", "HEAD"]));
+        assert_eq!(s.git(&s.work, &["rev-list", "--parents", "-n1", "HEAD"]).split(' ').count(), 3, "a merge commit, pushed");
+        assert!(s.origin_tree("autocommit-x").iter().any(|(_, p)| p == "extra.py"));
+    }
+
+    /// Checked with real git, mid-merge: `git checkout -b` (init-branches) succeeded, dropped
+    /// MERGE_HEAD and carried the conflicted index onto the new branch — no merge left to abort —
+    /// and a gentle `git checkout` ends a merge whose conflicts are resolved and staged. Now both
+    /// refuse first, touching nothing, with what is in progress and how to end it (exit 6); the
+    /// merge can still be aborted afterwards. `--hard` goes ahead and ends it with the other local
+    /// changes it discards, as `--hard` does (set-branch copies such a pod first and says so).
+    #[cfg(unix)]
+    #[test]
+    fn a_gentle_switch_or_init_branches_never_ends_an_operation_in_progress() {
+        let s = GitSandbox::new("busy-switch", 1_000_000);
+        with_conflicting_upstream(&s);
+        let repo = s.work.to_str().unwrap();
+        let cfg = BackupConfig { repo_path: repo.into(), prefix: "devtest".into(), week: 1, day: 2, git_ssh_key: None, origin: None };
+        let head = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let mine = s.read("README.md");
+        git_failing(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
+        let during = s.git(&s.work, &["status", "--porcelain"]);
+        let merge = "a merge is in progress on autocommit-x — not switched (a switch now would end the merge); resolve the \
+                     conflicts and `git add` them, then `git commit` — or abort it (`git merge --abort`) on the pod, then switch \
+                     again\n";
+        for (cmd, who) in [(checkout_command(repo, "main", None, false), "arena set-branch"), (init_branch_command(&cfg, "devtest-x"), "arena init-branches")] {
+            let o = s.run(&cmd);
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert_eq!((o.status.code(), err.as_ref()), (Some(BACKUP_BUSY_EXIT), format!("{who}: {merge}").as_str()), "{who}");
+            assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "{who}: not switched");
+            assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), head, "{who}");
+            assert_eq!(s.git(&s.work, &["status", "--porcelain"]), during, "{who}: nothing touched");
+            assert!(s.work.join(".git/MERGE_HEAD").exists(), "{who}: the merge ended");
+        }
+        assert!(s.git(&s.work, &["branch", "--list", "autocommit-devtest-w1d2-x"]).is_empty(), "no day branch made");
+        // Resolved and staged, still a merge: still refused (git's own checkout would carry it off).
+        std::fs::write(s.work.join("README.md"), "resolved\n").unwrap();
+        s.git(&s.work, &["add", "README.md"]);
+        let o = s.run(&checkout_command(repo, "main", None, false));
+        assert_eq!(
+            (o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned()),
+            (
+                Some(BACKUP_BUSY_EXIT),
+                "arena set-branch: a merge is in progress on autocommit-x — not switched (a switch now would end the merge); \
+                 finish it (`git commit`) or abort it (`git merge --abort`) on the pod, then switch again\n"
+                    .to_string()
+            ),
+            "nothing unmerged now: the plain way to finish it"
+        );
+        s.git(&s.work, &["merge", "--abort"]);
+        assert_eq!((s.git(&s.work, &["rev-parse", "HEAD"]), s.read("README.md")), (head.clone(), mine), "aborted as if never switched");
+
+        // A `git stash pop`'s conflicts: refused too, with their own way out — whichever directory
+        // of the checkout the command starts in (the conflict is at its top).
+        s.put("exercises/keep.py", 3);
+        let sub = BackupConfig { repo_path: s.work.join("exercises").display().to_string(), ..cfg.clone() };
+        std::fs::write(s.work.join("README.md"), "stashed\n").unwrap();
+        s.git(&s.work, &["stash", "-q"]);
+        std::fs::write(s.work.join("README.md"), "committed\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-am", "committed"]);
+        git_failing(&s.work, &["stash", "pop"]);
+        let o = s.run(&init_branch_command(&sub, "devtest-x"));
+        assert_eq!(
+            (o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned()),
+            (
+                Some(BACKUP_BUSY_EXIT),
+                "arena init-branches: autocommit-x has unresolved conflicts — not switched; resolve them and `git add` them, or \
+                 undo them (`git reset --merge`) on the pod, then switch again\n"
+                    .to_string()
+            )
+        );
+        s.git(&s.work, &["reset", "--merge"]);
+
+        // --hard: switched, the merge ended with the local changes it discards.
+        let tip = s.git(&s.work, &["rev-parse", "HEAD"]);
+        git_failing(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
+        assert!(s.work.join(".git/MERGE_HEAD").exists());
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert!(!s.work.join(".git/MERGE_HEAD").exists() && s.git(&s.work, &["ls-files", "-u"]).is_empty());
+        assert_eq!(s.git(&s.work, &["rev-parse", "autocommit-x"]), tip, "its commits stay in the branch");
+        // A clean checkout switches as before (the guard lets it through).
+        let o = s.run(&checkout_command(repo, "autocommit-x", None, false));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x");
+    }
+
+    /// The check is rendered into the script once, after the branch is known (the SKIP before it)
+    /// and before anything is staged — the nested-clone adoption, `update-index`, `git add` — and
+    /// called again right before the staging and right before the commit (codex #1).
+    #[test]
+    fn the_busy_check_comes_before_anything_is_staged() {
+        let s = backup_script();
+        assert!(!s.contains("@ARENA_BUSY_OP_SH@") && s.matches(BUSY_OP_SH).count() == 1);
+        assert!(s.contains("busy_stop() {\n    W=$(busy_op \"$G\")\n    if [ -n \"$W\" ]; then echo \"BUSY $B $W\"; exit 6; fi\n}"));
+        let calls: Vec<usize> = s.match_indices("\nbusy_stop\n").map(|(i, _)| i).collect();
+        assert_eq!(calls.len(), 3, "first, before the staging, before the commit");
+        let check = calls[0];
+        assert!(s.find("echo \"SKIP $B\"").unwrap() < check && s.find("G=$(git rev-parse --absolute-git-dir)").unwrap() < check);
+        let branch = s.find("echo \"BRANCH $B\"").unwrap();
+        for later in ["update-index", "git add -A", "git rm -q --cached", "git commit", "git push"] {
+            assert!(check < branch + s[branch..].find(later).unwrap(), "{later}");
+        }
+        // Right before each: nothing in between.
+        assert!(s.contains("\nbusy_stop\ngit add -A -- \"$@\"\n") && calls[1] == s.find("\nbusy_stop\ngit add -A").unwrap());
+        assert!(calls[2] == s.find("\nbusy_stop\nif ! git diff --cached --quiet; then git commit").unwrap());
+        // The gentle switch and init-branches check it too, first; --hard doesn't.
+        let gentle = switch_script("/r", "main", None, false, KB_DEFAULT);
+        assert!(gentle.contains(BUSY_OP_SH) && gentle.find("busy_op").unwrap() < gentle.find("git fetch").unwrap());
+        assert!(!switch_script("/r", "main", None, true, KB_DEFAULT).contains("busy_op"));
+        let init = init_branch_script(&cfg(), "arena8-apple");
+        assert!(init.find("busy_op").unwrap() < init.find("git checkout -b").unwrap());
+        // On a branch it skips, the work there is only said, read-only, before the SKIP.
+        let skip = &s[s.find("if [ \"$B\" = main ]").unwrap()..s.find("echo \"SKIP $B\"").unwrap()];
+        assert!(skip.contains("echo \"UNCOMMITTED $B $W\"") && skip.contains("tracked_changed \"$GD\""), "{skip}");
+        // Changes to tracked files: through a copy of the index, never the participant's (claude #9).
+        let tracked = &s[s.find("tracked_changed() {").unwrap()..s.find("if [ \"$B\" = main ]").unwrap()];
+        assert!(tracked.contains("cp \"$1/index\" \"$_ti\"") && tracked.contains("rm -f \"$_ti\" \"$_ti.lock\""), "{tracked}");
+        for plumbing in ["git update-index -q --refresh", "git diff-index --quiet HEAD --"] {
+            assert!(tracked.contains(&format!("GIT_INDEX_FILE=\"$_ti\" {plumbing}")), "{plumbing}");
+        }
+        // Commits no remote has, untracked files (review pr4): read-only too.
+        assert!(skip.contains("git --no-optional-locks rev-list -n1 HEAD --not --remotes"), "{skip}");
+        assert!(skip.contains("git --no-optional-locks ls-files --others --exclude-standard"), "{skip}");
+        let order = ["W=changes", "W=commits", "W=untracked"].map(|w| skip.find(w).unwrap_or_else(|| panic!("{w}")));
+        assert!(order.windows(2).all(|p| p[0] < p[1]), "{order:?}");
+        // The --hard switch ends a `git am`, rebase or sequence once it has switched; gentle never does.
+        let hard = switch_script("/r", "main", None, true, KB_DEFAULT);
+        let quits = hard.find("git rebase --quit").expect("quit");
+        assert!(hard.find("git reset --hard").unwrap() < quits && hard.contains("git am --quit") && hard.contains("git cherry-pick --quit"));
+        assert!(!switch_script("/r", "main", None, false, KB_DEFAULT).contains("--quit"));
+        for write in ["git add", "update-index", "git commit", "git push", "git stash", "git reset"] {
+            assert!(!skip.contains(write), "{write}");
+        }
+    }
+
+    /// Review fb2 F3: a pod on main — no backup commits there — with a merge in progress or
+    /// changes to tracked files was reset by `set-branch --hard` with no copy: its backup said
+    /// only `SKIP`. Now the run says what a reset could discard first (`UNCOMMITTED main <what>`),
+    /// still exit 0 and SKIP, touching nothing — not even the index's stat cache. Review pr4 adds
+    /// commits no remote has (a participant's work committed on main, its tree clean, was reset
+    /// away uncopied) and untracked files (`--hard` overwrites one the new branch tracks:
+    /// [`an_untracked_file_the_new_branch_tracks_is_overwritten_by_hard_so_any_is_said`]), on main
+    /// or a detached HEAD. A fresh pod — main as on origin, a nested clone as the image ships
+    /// them, an ignored file — says nothing, so `--hard` copies none of them.
+    #[cfg(unix)]
+    #[test]
+    fn on_main_the_work_a_hard_reset_would_discard_is_said_before_the_skip() {
+        let s = GitSandbox::new("uncommitted", 1_000_000);
+        with_conflicting_upstream(&s);
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        let index = || std::fs::read(s.work.join(".git/index")).unwrap();
+        let said = |want: &str| {
+            let before = (s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["status", "--porcelain"]));
+            let index_before = index();
+            let (code, out, err) = s.backup_raw();
+            assert_eq!(index(), index_before, "{want}: the index untouched");
+            assert_eq!((code, out.as_str()), (Some(0), want), "{err}");
+            assert_eq!((s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["status", "--porcelain"])), before, "{want}");
+            parse_backup_report(&out)
+        };
+        let r = said("SKIP main\n");
+        assert_eq!((r.uncommitted.as_deref(), r.uncommitted_why()), (None, None), "clean");
+        // What a fresh pod has besides: a nested clone (its own .git, listed as `dir/`), an ignored file.
+        s.clone_upstream("exercises/clone");
+        std::fs::write(s.work.join(".git/info/exclude"), "*.log\n").unwrap();
+        std::fs::write(s.work.join("run.log"), "ignored\n").unwrap();
+        assert_eq!(said("SKIP main\n").uncommitted, None, "nothing of the participant's");
+        s.put("scratch.py", 4);
+        let r = said("UNCOMMITTED main untracked\nSKIP main\n");
+        assert_eq!(r.uncommitted_why().unwrap(), "main has untracked files — no backup commits on main");
+        std::fs::write(s.work.join("README.md"), "edited on main\n").unwrap();
+        let r = said("UNCOMMITTED main changes\nSKIP main\n");
+        assert_eq!(r.outcome, Some((BACKUP_SKIPPED, "main".into())));
+        assert_eq!(r.uncommitted_why().unwrap(), "main has uncommitted changes to tracked files — no backup commits on main");
+        // Committed on main, not pushed: the tree is clean, the commit is on no remote.
+        s.git(&s.work, &["commit", "-q", "-am", "committed on main"]);
+        std::fs::remove_file(s.work.join("scratch.py")).unwrap();
+        let r = said("UNCOMMITTED main commits\nSKIP main\n");
+        assert!(!r.unmerged && r.busy.is_none() && !r.failed_at_push(), "{r:?}");
+        assert_eq!(r.uncommitted_why().unwrap(), "main has commits no remote has — no backup pushes main");
+        // A conflicted `git pull upstream main` on main itself.
+        git_failing(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
+        assert!(s.work.join(".git/MERGE_HEAD").exists());
+        let r = said("UNCOMMITTED main merge unmerged\nSKIP main\n");
+        assert!(r.unmerged && r.busy.is_none() && !r.failed_at_push(), "{r:?}");
+        assert_eq!(r.uncommitted_why().unwrap(), "a merge is in progress on main — no backup commits on main");
+        s.git(&s.work, &["merge", "--abort"]);
+        assert_eq!(said("UNCOMMITTED main commits\nSKIP main\n").uncommitted.as_deref(), Some("commits"), "aborted: the commit is still only here");
+        // Once a remote has it (init-branches pushed it on the day's branch), nothing.
+        s.git(&s.work, &["push", "-q", "origin", "main:refs/heads/autocommit-y"]);
+        assert_eq!(said("SKIP main\n").uncommitted, None);
+        // A detached HEAD: its own commits, else nothing.
+        s.git(&s.work, &["checkout", "-q", "--detach", "origin/main"]);
+        assert_eq!(said("SKIP HEAD\n").uncommitted, None);
+        std::fs::write(s.work.join("README.md"), "committed on a detached HEAD\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-am", "detached"]);
+        let r = said("UNCOMMITTED HEAD commits\nSKIP HEAD\n");
+        assert_eq!(r.uncommitted_why().unwrap(), "a detached HEAD has commits no remote has — no backup pushes a detached HEAD");
+        // Parsed only with its words; never on a run that didn't skip.
+        assert_eq!(parse_backup_report("UNCOMMITTED main\nSKIP main\n").uncommitted, None);
+        assert_eq!(parse_backup_report("UNCOMMITTED main changes\nBRANCH b\nPUSHED b\n").uncommitted_why(), None);
+        assert_eq!(
+            parse_backup_report("UNCOMMITTED HEAD conflicts\nSKIP HEAD\n").uncommitted_why().unwrap(),
+            "a detached HEAD has unresolved conflicts — no backup commits on a detached HEAD"
+        );
+        assert_eq!(
+            parse_backup_report("UNCOMMITTED HEAD rebase unmerged\nSKIP HEAD\n").uncommitted_why().unwrap(),
+            "a rebase is in progress on a detached HEAD — no backup commits on a detached HEAD"
+        );
+    }
+
+    /// Review pr4: `set-branch --hard`'s `checkout -f` and `reset --hard` overwrite an untracked
+    /// file wherever the branch they reset to tracks the same path — checked here with real git:
+    /// a participant's `solutions.py` on main, never committed, becomes the one the course staff
+    /// pushed to origin's main since. Which path origin's branch tracks, the backup can't tell: it
+    /// doesn't know the branch, and the pod's `origin/main` doesn't have the new file until the
+    /// switch's own fetch (the backup here runs before it, as set-branch's does). So any untracked
+    /// file on a branch no backup commits is said (`UNCOMMITTED main untracked`), and `--hard`
+    /// copies the pod first. An untracked file the new branch doesn't track stays.
+    #[cfg(unix)]
+    #[test]
+    fn an_untracked_file_the_new_branch_tracks_is_overwritten_by_hard_so_any_is_said() {
+        let s = GitSandbox::new("untracked-hard", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        std::fs::write(s.work.join("solutions.py"), "the participant's own work\n").unwrap();
+        std::fs::write(s.work.join("notes.md"), "notes\n").unwrap();
+        // The staff push a solutions.py to the cohort's main; the pod hasn't fetched it.
+        let staff = s.base.join("staff");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), staff.to_str().unwrap()]);
+        std::fs::write(staff.join("solutions.py"), "the staff's solutions\n").unwrap();
+        s.git(&staff, &["add", "solutions.py"]);
+        s.git(&staff, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "solutions"]);
+        s.git(&staff, &["push", "-q", "origin", "main"]);
+        assert!(s.git(&s.work, &["ls-tree", "-r", "--name-only", "origin/main"]).lines().all(|p| p != "solutions.py"), "not fetched yet");
+        let (code, out, err) = s.backup_raw();
+        assert_eq!((code, out.as_str()), (Some(0), "UNCOMMITTED main untracked\nSKIP main\n"), "{err}");
+        // What the copy is for: --hard makes the participant's file the staff's.
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(std::fs::read_to_string(s.work.join("solutions.py")).unwrap(), "the staff's solutions\n", "overwritten");
+        assert_eq!(std::fs::read_to_string(s.work.join("notes.md")).unwrap(), "notes\n", "one the branch doesn't track stays");
+        // The gentle switch refuses instead (git's own check), so it needs no copy.
+        s.git(&s.work, &["reset", "-q", "--hard", "HEAD~1"]);
+        std::fs::write(s.work.join("solutions.py"), "the participant's own work\n").unwrap();
+        let o = s.run(&checkout_command(repo, "main", None, false));
+        assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("would be overwritten"), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(std::fs::read_to_string(s.work.join("solutions.py")).unwrap(), "the participant's own work\n");
+    }
+
+    /// Review pr4: `git am` keeps HEAD attached, and a patch that doesn't apply leaves no unmerged
+    /// path and no `*_HEAD` — only `rebase-apply/` — so the backup committed and pushed what the
+    /// participant had half-applied by hand, mid-`am`; a rebase (`rebase-merge/`) and a cherry-pick
+    /// sequence paused between its commits (`sequencer/` alone, one conflict resolved and committed
+    /// by hand) went unseen too. Now each is `BUSY` on a branch the backup commits (`am`,
+    /// `sequence`) and said before the SKIP elsewhere (`UNCOMMITTED HEAD rebase …`): nothing
+    /// staged, committed or pushed; the gentle switch and init-branches refuse it, its own way out
+    /// named; `--hard` switches and ends it, so the init and the backup after it go on; and the way
+    /// out each names works.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_am_a_rebase_or_a_paused_sequence_is_never_committed_or_switched_away_from() {
+        let s = GitSandbox::new("busy-am", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let cfg = BackupConfig { repo_path: repo.into(), prefix: "devtest".into(), week: 1, day: 2, git_ssh_key: None, origin: None };
+        let origin_ref = || s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "refs/heads/autocommit-x"]);
+        let state = || (s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["status", "--porcelain"]));
+        let refused = |cmd: &str, want: &str| {
+            let before = state();
+            let o = s.run(cmd);
+            assert_eq!((o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned()), (Some(BACKUP_BUSY_EXIT), want.to_string()));
+            assert_eq!(state(), before, "{want}: nothing touched");
+        };
+        // A patch of README.md from a side branch, and three commits to cherry-pick (the first conflicting).
+        s.git(&s.work, &["checkout", "-q", "-b", "side", "main"]);
+        std::fs::write(s.work.join("README.md"), "the side branch's version\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-am", "side"]);
+        let patches = s.base.join("patches");
+        s.git(&s.work, &["format-patch", "-q", "-1", "-o", patches.to_str().unwrap()]);
+        let patch = std::fs::read_dir(&patches).unwrap().next().unwrap().unwrap().path();
+        for f in ["x.py", "y.py"] {
+            s.put(f, 3);
+            s.git(&s.work, &["add", f]);
+            s.git(&s.work, &["commit", "-q", "-m", f]);
+        }
+        s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+        std::fs::write(s.work.join("README.md"), "the participant's version\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-am", "mine"]);
+        assert_eq!(s.backup().1.outcome, Some((BACKUP_PUSHED, "autocommit-x".into())));
+
+        // `git am`: the patch doesn't apply; the participant applies it by hand, half-way.
+        let (code, said) = git_failing(&s.work, &["am", patch.to_str().unwrap()]);
+        assert_ne!(code, Some(0), "{said}");
+        assert!(s.work.join(".git/rebase-apply/applying").exists() && s.git(&s.work, &["ls-files", "-u"]).is_empty());
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "HEAD attached");
+        std::fs::write(s.work.join("README.md"), "half-applied by hand\n").unwrap();
+        let (before, pushed) = (state(), origin_ref());
+        let (code, out, err) = s.backup_raw();
+        assert_eq!((code, out.as_str()), (Some(BACKUP_BUSY_EXIT), "BRANCH autocommit-x\nBUSY autocommit-x am\n"), "{err}");
+        assert_eq!((state(), origin_ref()), (before, pushed), "nothing staged, committed or pushed");
+        assert_eq!(
+            parse_backup_report(&out).failure("/r", "p", code).unwrap(),
+            "a `git am` is in progress on autocommit-x — not committed (a backup now would commit what is there in the middle of \
+             the `git am`); finish it (`git am --continue`) or abort it (`git am --abort`) on the pod"
+        );
+        // git's own checkout takes the `am` along to the other branch; the switches refuse.
+        let am = "a `git am` is in progress on autocommit-x — not switched (a switch now would carry the `git am`, half-done, onto \
+                  the other branch); finish it (`git am --continue`) or abort it (`git am --abort`) on the pod, then switch again\n";
+        refused(&checkout_command(repo, "main", None, false), &format!("arena set-branch: {am}"));
+        refused(&init_branch_command(&cfg, "devtest-x"), &format!("arena init-branches: {am}"));
+        assert!(s.work.join(".git/rebase-apply").exists());
+        // Its way out works; the next backup goes on.
+        s.git(&s.work, &["am", "--abort"]);
+        assert!(!s.work.join(".git/rebase-apply").exists());
+        // (`am --abort` keeps an edit made since: the backup commits it, now the `am` is over.)
+        assert_eq!(s.read("README.md"), b"half-applied by hand\n");
+        assert_eq!(s.backup().1.outcome, Some((BACKUP_PUSHED, "autocommit-x".into())));
+
+        // A cherry-pick of three commits: the first conflicts (`cherry-pick unmerged`); resolved and
+        // committed by hand, two still to come: only `sequencer/` is left (`sequence`).
+        let (code, said) = git_failing(&s.work, &["cherry-pick", "main..side"]);
+        assert_ne!(code, Some(0), "{said}");
+        let (code, out, _) = s.backup_raw();
+        assert_eq!((code, out.as_str()), (Some(BACKUP_BUSY_EXIT), "BRANCH autocommit-x\nBUSY autocommit-x cherry-pick unmerged\n"));
+        std::fs::write(s.work.join("README.md"), "resolved\n").unwrap();
+        s.git(&s.work, &["add", "README.md"]);
+        s.git(&s.work, &["commit", "-q", "--no-edit"]);
+        assert!(s.work.join(".git/sequencer").is_dir() && !s.work.join(".git/CHERRY_PICK_HEAD").exists());
+        let (before, pushed) = (state(), origin_ref());
+        let (code, out, _) = s.backup_raw();
+        assert_eq!((code, out.as_str()), (Some(BACKUP_BUSY_EXIT), "BRANCH autocommit-x\nBUSY autocommit-x sequence\n"));
+        assert_eq!((state(), origin_ref()), (before, pushed), "the commit made by hand isn't pushed mid-sequence either");
+        refused(
+            &init_branch_command(&cfg, "devtest-x"),
+            "arena init-branches: a cherry-pick or revert sequence is in progress on autocommit-x — not switched (a switch now \
+             would carry the sequence, half-done, onto the other branch); finish it (`git cherry-pick --continue`, or `git revert \
+             --continue` for a revert) or abort it (`git cherry-pick --abort`, or `git revert --abort`) on the pod, then switch \
+             again\n",
+        );
+        s.git(&s.work, &["-c", "core.editor=true", "cherry-pick", "--continue"]);
+        assert!(!s.work.join(".git/sequencer").exists());
+        assert_eq!(s.backup().1.outcome, Some((BACKUP_PUSHED, "autocommit-x".into())), "finished: backed up");
+        let pushed: Vec<String> = s.origin_tree("autocommit-x").into_iter().map(|(_, p)| p).collect();
+        assert!(pushed.contains(&"x.py".to_string()) && pushed.contains(&"y.py".to_string()), "{pushed:?}");
+
+        // A rebase detaches HEAD: said before the SKIP; --hard switches and ends it, and the init goes on.
+        let (code, said) = git_failing(&s.work, &["rebase", "side"]);
+        assert_ne!(code, Some(0), "{said}");
+        assert!(s.work.join(".git/rebase-merge").is_dir());
+        let (code, out, _) = s.backup_raw();
+        assert_eq!((code, out.as_str()), (Some(0), "UNCOMMITTED HEAD rebase unmerged\nSKIP HEAD\n"));
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert!(!s.work.join(".git/rebase-merge").exists(), "ended with the switch");
+        assert_eq!(s.backup_raw().1, "SKIP main\n");
+
+        // `git am` on main: said before the SKIP; --hard ends it too, and init-branches goes on.
+        std::fs::write(s.work.join("README.md"), "edited on main\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-am", "main edit"]);
+        git_failing(&s.work, &["am", patch.to_str().unwrap()]);
+        assert_eq!(s.backup_raw().1, "UNCOMMITTED main am\nSKIP main\n");
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(!s.work.join(".git/rebase-apply").exists(), "ended with the switch");
+        assert_eq!(s.backup_raw().1, "SKIP main\n");
+        let o = s.run(&init_branch_command(&cfg, "devtest-x"));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), cfg.branch_for("devtest-x"));
+    }
+
+    /// The real `git`'s path, for a stand-in to hand on to.
+    #[cfg(unix)]
+    fn real_git() -> String {
+        let o = std::process::Command::new("sh").args(["-c", "command -v git"]).output().expect("sh");
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    /// A PATH whose `git` is the real one, but runs `script` first (`sh -c`, from where it was
+    /// called) — once, its output dropped — on the call whose arguments are exactly `at`: the
+    /// participant's own command, at one precise moment of a run.
+    #[cfg(unix)]
+    fn git_acting_at(s: &GitSandbox, at: &str, script: &str) -> String {
+        let bin = s.base.join("bin-hook");
+        std::fs::create_dir_all(&bin).unwrap();
+        let once = s.base.join("hook.sh");
+        let _ = std::fs::remove_file(s.base.join("hook.sh.ran"));
+        std::fs::write(&once, script).unwrap();
+        let once = shell_quote(once.to_str().unwrap());
+        crate::remote::write_test_script(
+            bin.join("git"),
+            format!(
+                "#!/bin/sh\nif [ \"$*\" = {} ] && [ -f {once} ]; then mv {once} {once}.ran; sh {once}.ran >/dev/null 2>&1; fi\nexec {} \"$@\"\n",
+                shell_quote(at),
+                shell_quote(&real_git())
+            ),
+        )
+        .unwrap();
+        format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+    }
+
+    /// [`git_acting_at`] on the first call whose arguments match the shell pattern `glob` (`push *`,
+    /// its spaces matched as spaces): a moment the old and the new form of a command both reach.
+    #[cfg(unix)]
+    fn git_acting_on(s: &GitSandbox, glob: &str, script: &str) -> String {
+        let glob = glob.replace(' ', "\\ ");
+        let bin = s.base.join("bin-hook");
+        std::fs::create_dir_all(&bin).unwrap();
+        let once = s.base.join("hook.sh");
+        let _ = std::fs::remove_file(s.base.join("hook.sh.ran"));
+        std::fs::write(&once, script).unwrap();
+        let once = shell_quote(once.to_str().unwrap());
+        crate::remote::write_test_script(
+            bin.join("git"),
+            format!(
+                "#!/bin/sh\ncase \"$*\" in {glob}) if [ -f {once} ]; then mv {once} {once}.ran; sh {once}.ran >/dev/null 2>&1; fi;; esac\nexec {} \"$@\"\n",
+                shell_quote(&real_git())
+            ),
+        )
+        .unwrap();
+        format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+    }
+
+    /// `bash -c cmd` with this PATH: (exit code, stdout, stderr).
+    #[cfg(unix)]
+    fn run_on_path(cmd: &str, path: &str) -> (Option<i32>, String, String) {
+        run_in("bash", cmd, path)
+    }
+
+    /// `<shell> -c cmd` with this PATH — as sshd runs a command under the login shell: (exit code,
+    /// stdout, stderr).
+    #[cfg(unix)]
+    fn run_in(shell: &str, cmd: &str, path: &str) -> (Option<i32>, String, String) {
+        let o = std::process::Command::new(shell).arg("-c").arg(cmd).env("PATH", path).output().expect(shell);
+        (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
+    }
+
+    /// Review ai-review claude #6: setup adds the course repo as `upstream`, and "already pushed"
+    /// meant "on any remote" — so a commit only `upstream` had (its `main` merged into the day's
+    /// branch) was never scanned for keys and went to origin with the course's key-shaped example
+    /// in it (or was refused by push protection every tick); and a branch made from
+    /// `upstream/main`, tracking it, read as in sync (`NO_CHANGES`) though origin had none of it.
+    /// Now "pushed" means on origin: the course's commit goes out redacted, the file on disk and
+    /// upstream's own ref untouched, and that branch is pushed. (FIX4B to FIX7 exempted the course's
+    /// own commits; FIX8 took that out again, so this is the rule for them too.)
+    #[cfg(unix)]
+    #[test]
+    fn a_key_in_a_commit_only_upstream_has_is_redacted_before_it_reaches_origin() {
+        let s = GitSandbox::new("upstream-key", 1_000_000);
+        let key = openrouter_key(21);
+        let course = s.base.join("course");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), course.to_str().unwrap()]);
+        let example = format!("Set your key: OPENROUTER_API_KEY = \"{key}\"\n");
+        std::fs::write(course.join("course_key.md"), &example).unwrap();
+        s.git(&course, &["add", "course_key.md"]);
+        s.git(&course, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "course update"]);
+        let theirs = s.git(&course, &["rev-parse", "HEAD"]);
+        s.git(&s.work, &["remote", "add", "upstream", course.to_str().unwrap()]);
+        s.git(&s.work, &["fetch", "-q", "upstream"]);
+        // The participant's own work, backed up; then the course's update merged in.
+        std::fs::write(s.work.join("mine.py"), "mine = 1\n").unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        s.git(&s.work, &["merge", "-q", "--no-edit", "--no-ff", "upstream/main"]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        assert_eq!(r.history.as_ref().map(|h| h.0), Some(2), "the course's commit and the merge, rewritten");
+        assert!(!s.origin_holds(&key), "the key reached origin");
+        assert_eq!(
+            s.git(&s.work, &["show", "origin/autocommit-x:course_key.md"]),
+            "Set your key: OPENROUTER_API_KEY = \"REDACTED-OPENROUTER-KEY\""
+        );
+        assert_eq!(s.read("course_key.md"), example.as_bytes(), "the file on disk keeps it");
+        assert_eq!(s.git(&s.work, &["rev-parse", "upstream/main"]), theirs, "upstream's own ref untouched");
+        // A branch made from upstream's main, tracking it: origin has none of it, so it's pushed
+        // (redacted). The upstream it has is left as it is (FIX8, claude #7: only a branch with
+        // none is given origin's).
+        s.git(&s.work, &["checkout", "-q", "-f", "-b", "mine", "upstream/main"]);
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "mine@{u}"]), "upstream/main");
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "mine".into()))), "{err}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "mine@{u}"]), "upstream/main");
+        assert!(!s.origin_holds(&key));
+        let (code, r, _) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_NO_CHANGES, "mine".into()))));
+    }
+
+    /// Review ai-review codex #1: the operation check ran once, before the scans. A participant's
+    /// `git pull upstream main` that conflicted while the backup scanned the nested repos and the
+    /// files had its conflicts staged as resolved by `add -A`; a `git merge --no-commit` begun
+    /// after the staging was ended by the backup's own commit (a merge commit, pushed). Now the
+    /// check runs again right before each: the run stops `BUSY`, nothing staged or committed, the
+    /// operation where the participant left it. (A stand-in `git` starts the participant's command
+    /// at the exact moment: the BIGSKIP scan, then the key scan.)
+    #[cfg(unix)]
+    #[test]
+    fn an_operation_begun_during_the_scans_is_caught_before_the_staging_and_the_commit() {
+        let s = GitSandbox::new("busy-late", 1_000_000);
+        let course = with_conflicting_upstream(&s);
+        let origin_ref = || s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "refs/heads/autocommit-x"]);
+        let script = backup_command_limited(s.work.to_str().unwrap(), None, "arena backup", s.skip, s.limit, None);
+        std::fs::write(s.work.join("notes.md"), "notes\n").unwrap();
+        let before = (s.git(&s.work, &["rev-parse", "HEAD"]), origin_ref());
+        // A conflicted pull, begun while the files are scanned: after the first check.
+        let path = git_acting_at(
+            &s,
+            "ls-files -z -o -m --exclude-standard",
+            "git -c user.name=u -c user.email=u@u pull -q --no-rebase --no-edit upstream main\n",
+        );
+        let (code, out, err) = run_on_path(&script, &path);
+        assert!(s.base.join("hook.sh.ran").exists(), "the pull ran mid-backup");
+        assert_eq!((code, out.as_str()), (Some(BACKUP_BUSY_EXIT), "BRANCH autocommit-x\nBUSY autocommit-x merge unmerged\n"), "{err}");
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "UU README.md\n?? notes.md", "its conflict not staged, nor anything else");
+        assert_eq!((s.git(&s.work, &["rev-parse", "HEAD"]), origin_ref()), before, "nothing committed or pushed");
+        s.git(&s.work, &["merge", "--abort"]);
+        assert_eq!(s.read("README.md"), b"the participant's version\n", "the abort works");
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+
+        // A clean merge left uncommitted (`--no-commit`), begun after the staging (at the key scan):
+        // the backup's commit would have made it a merge commit and ended it.
+        s.git(&course, &["checkout", "-q", "-b", "extra", "main~1"]);
+        std::fs::write(course.join("extra.py"), "x = 1\n").unwrap();
+        s.git(&course, &["add", "extra.py"]);
+        s.git(&course, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "extra"]);
+        s.git(&s.work, &["fetch", "-q", "upstream"]);
+        let before = (s.git(&s.work, &["rev-parse", "HEAD"]), origin_ref());
+        let path = git_acting_at(&s, "diff --cached --raw --no-renames --diff-filter=d --no-abbrev", "git merge -q --no-commit --no-ff upstream/extra\n");
+        let (code, out, err) = run_on_path(&script, &path);
+        assert!(s.base.join("hook.sh.ran").exists(), "the merge ran mid-backup");
+        assert_eq!((code, out.as_str()), (Some(BACKUP_BUSY_EXIT), "BRANCH autocommit-x\nBUSY autocommit-x merge\n"), "{err}");
+        assert_eq!((s.git(&s.work, &["rev-parse", "HEAD"]), origin_ref()), before, "not committed: still the participant's merge");
+        assert!(s.work.join(".git/MERGE_HEAD").exists());
+        assert_eq!(s.git(&s.work, &["diff", "--cached", "--name-only"]), "extra.py");
+        // The participant finishes it; the next backup pushes their merge.
+        s.git(&s.work, &["commit", "-q", "--no-edit"]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        assert_eq!(s.git(&s.work, &["rev-list", "--parents", "-n1", "origin/autocommit-x"]).split(' ').count(), 3, "their merge, pushed");
+    }
+
+    /// Review ai-review codex #1 (FIX7, the one finding that blocked merging): the scans read the
+    /// live HEAD and the push sent the branch by name, so a commit the participant made after the
+    /// scan — a key in it — went out with it unscanned (arena's lock is no lock on their own git).
+    /// Now the run fixes its commit first (`TIP`), scans and rewrites that, and pushes exactly it,
+    /// by id: a commit made between the scan and the push (a stand-in `git` makes it as the push
+    /// starts) stays local, and the next run scans it — redacted, pushed. The branch still tracks
+    /// origin's, as `push -u` made it: set when it had no upstream.
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_made_after_the_scan_stays_local_until_the_next_run_scans_it() {
+        let s = GitSandbox::new("late-commit", 1_000_000);
+        let key = openrouter_key(31);
+        let origin_ref = || s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "refs/heads/autocommit-x"]);
+        let script = backup_command_limited(s.work.to_str().unwrap(), None, "arena backup", s.skip, s.limit, None);
+        s.git(&s.work, &["branch", "--unset-upstream"]);
+        std::fs::write(s.work.join("notes.md"), "notes\n").unwrap();
+        let path = git_acting_on(&s, "push *", &format!("printf 'KEY = \"{key}\"\\n' > late.py && git add late.py && git commit -q -m late\n"));
+        let (code, out, err) = run_on_path(&script, &path);
+        assert!(s.base.join("hook.sh.ran").exists(), "the commit was made mid-backup");
+        assert_eq!((code, parse_backup_report(&out).outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{out}{err}");
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%s"]), "late", "the participant's commit, on top");
+        assert_eq!(origin_ref(), s.git(&s.work, &["rev-parse", "HEAD~1"]), "what was scanned went out, nothing after it");
+        assert!(!s.origin_holds(&key), "the late commit's key reached origin");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "autocommit-x@{u}"]), "origin/autocommit-x");
+        // The next run scans it: redacted, pushed.
+        let late = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        assert_eq!(r.history.map(|h| (h.0, h.1)), Some((1, late)), "{err}");
+        assert!(!s.origin_holds(&key));
+        assert_eq!(s.git(&s.work, &["show", "origin/autocommit-x:late.py"]), "KEY = \"REDACTED-OPENROUTER-KEY\"");
+        assert_eq!(origin_ref(), s.git(&s.work, &["rev-parse", "HEAD"]), "the rewrite, pushed and checked out");
+    }
+
+    /// Review ai-review claude #7 (FIX7's verification): pushing an id sets no upstream, and the
+    /// `--set-upstream-to=origin/<branch>` that stood in for `push -u` needs the remote-tracking
+    /// ref, which a checkout whose `remote.origin.fetch` is narrowed (an image cloned
+    /// `--single-branch`, `origin` repointed by setup) never gets: its branch had no upstream for
+    /// good, and the participant's bare `git push`/`git pull` said so. Now the first push writes
+    /// `branch.<branch>.remote`/`.merge` itself when the branch tracks nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_branch_with_no_upstream_tracks_origins_after_its_first_push_whatever_the_fetch() {
+        let s = GitSandbox::new("narrow-fetch", 1_000_000);
+        s.git(&s.work, &["config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main"]);
+        s.git(&s.work, &["checkout", "-q", "-b", "autocommit-y"]);
+        std::fs::write(s.work.join("notes.md"), "notes\n").unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-y".into()))), "{err}");
+        let config = |key: &str| s.git(&s.work, &["config", &format!("branch.autocommit-y.{key}")]);
+        assert_eq!((config("remote"), config("merge")), ("origin".to_string(), "refs/heads/autocommit-y".to_string()));
+    }
+
+    /// Review claude #4 (FIX9B item 4): a push sets no remote-tracking ref the fetch doesn't map, so
+    /// a checkout whose `remote.origin.fetch` is narrowed (a `--single-branch` clone: origin's main
+    /// alone) never settled — every run took its branch as new: never `NO_CHANGES`, pushing,
+    /// re-scanning and size-checking every commit since origin's main, more each day. Now the
+    /// backup sets `refs/remotes/origin/<branch>` to what it pushed: the second run says
+    /// `NO_CHANGES`, nothing already pushed is left to scan (`HEAD --not --remotes=origin` is empty),
+    /// and a new commit is all the next one scans.
+    #[cfg(unix)]
+    #[test]
+    fn a_narrowed_fetch_settles_after_a_push_and_scans_nothing_already_pushed() {
+        let s = GitSandbox::new("narrow-settle", 1_000_000);
+        s.git(&s.work, &["config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main"]);
+        s.git(&s.work, &["update-ref", "-d", "refs/remotes/origin/autocommit-x"]);
+        s.git(&s.work, &["checkout", "-q", "-b", "autocommit-y"]);
+        let unscanned = || s.git(&s.work, &["rev-list", "--count", "HEAD", "--not", "--remotes=origin"]);
+        let origins = || s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-y"]);
+        std::fs::write(s.work.join("notes.md"), "notes\n").unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-y".into()))), "{err}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "refs/remotes/origin/autocommit-y"]), origins());
+        assert_eq!(unscanned(), "0", "what was pushed is still read as unpushed");
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-y".into()))), "{err}");
+        // A new commit: it alone is left to scan, and once pushed, nothing is.
+        std::fs::write(s.work.join("more.md"), "more\n").unwrap();
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "more"]);
+        assert_eq!(unscanned(), "1");
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-y".into()))), "{err}");
+        assert_eq!((unscanned(), s.git(&s.work, &["rev-parse", "HEAD"])), ("0".to_string(), origins()));
+        let (code, r, _) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-y".into()))));
+    }
+
+    /// Review claude #3 (FIX9B item 3): the upstream was written only when `branch.<b>.remote` was
+    /// unset, both keys at once — so one run's failed second write (a `config.lock` the
+    /// participant's git held) left `remote` without `merge` for good, and a `merge` the
+    /// participant set alone never got its `remote`. Each key is now checked on its own: with one
+    /// of them pre-set, the next push writes the other and leaves the pre-set one as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_half_written_upstream_gets_the_missing_key_and_keeps_the_other() {
+        for (preset, value, want_remote, want_merge) in [
+            ("remote", "origin", "origin", "refs/heads/autocommit-x"),
+            ("merge", "refs/heads/elsewhere", "origin", "refs/heads/elsewhere"),
+        ] {
+            let s = GitSandbox::new(&format!("half-upstream-{preset}"), 1_000_000);
+            s.git(&s.work, &["branch", "--unset-upstream"]);
+            s.git(&s.work, &["config", &format!("branch.autocommit-x.{preset}"), value]);
+            std::fs::write(s.work.join("notes.md"), "notes\n").unwrap();
+            let (code, r, err) = s.backup();
+            assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{preset}: {err}");
+            let config = |key: &str| s.git(&s.work, &["config", &format!("branch.autocommit-x.{key}")]);
+            assert_eq!((config("remote"), config("merge")), (want_remote.to_string(), want_merge.to_string()), "{preset}");
+        }
+    }
+
+    /// Review ai-review claude #9: on main the check for changes to tracked files was the porcelain
+    /// diff under `--no-optional-locks`. Now it is plumbing, as the review asked, on a copy of the
+    /// index — refreshed there, `diff-index` there, removed after — so the participant's index,
+    /// its bytes and its mtime, is never written; a file whose stat changed but not its content is
+    /// no change (the refresh sees that: without it `diff-index` reads it as changed); a real one,
+    /// in the tree or staged, still is.
+    #[cfg(unix)]
+    #[test]
+    fn the_main_check_compares_through_a_copy_of_the_index_and_never_writes_it() {
+        let s = GitSandbox::new("main-index", 1_000_000);
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        let index = s.work.join(".git/index");
+        let snap = || (std::fs::read(&index).unwrap(), std::fs::metadata(&index).unwrap().modified().unwrap());
+        let touch = |rel: &str| {
+            let f = std::fs::File::options().write(true).open(s.work.join(rel)).unwrap();
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000)).unwrap();
+        };
+        let ours = || std::fs::read_dir(s.work.join(".git")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("arena-backup")).count();
+        let check = |want: &str| {
+            let before = snap();
+            let (code, out, err) = s.backup_raw();
+            assert_eq!((code, out.as_str()), (Some(0), want), "{err}");
+            assert_eq!(snap(), before, "{want}: the participant's index never written");
+            assert_eq!(ours(), 0, "{want}: the copy is gone");
+        };
+        check("SKIP main\n");
+        // Touched: its stat changed, not its content — no change.
+        touch("README.md");
+        check("SKIP main\n");
+        // Its content changed (the same size, the same old mtime): a change.
+        std::fs::write(s.work.join("README.md"), b"XXXXX").unwrap();
+        touch("README.md");
+        check("UNCOMMITTED main changes\nSKIP main\n");
+        // Staged, the tree as staged: still a change against HEAD.
+        s.git(&s.work, &["add", "README.md"]);
+        check("UNCOMMITTED main changes\nSKIP main\n");
+        s.git(&s.work, &["reset", "-q", "--hard"]);
+        check("SKIP main\n");
+    }
+
+    /// Review ai-review claude #10: on main the copy of the index was removed at the end of the
+    /// check, with no trap — the run's EXIT trap was set only later, on a branch it backs up — so a
+    /// tick killed mid-check (a timeout, a dropped connection) left `.git/arena-backup.<pid>.index`
+    /// and its `.lock` behind, a full copy of the index each time. Now its removal is the EXIT trap,
+    /// set before the copy, and a hangup or TERM ends the run as an exit, so the trap runs. (A
+    /// stand-in `git` signals the run as the refresh of the copy starts, its lock taken.)
+    #[cfg(unix)]
+    #[test]
+    fn a_main_check_killed_midway_leaves_no_copy_of_the_index() {
+        let s = GitSandbox::new("main-killed", 1_000_000);
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        let index = s.work.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+        let ours = || {
+            std::fs::read_dir(s.work.join(".git"))
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("arena-backup"))
+                .collect::<Vec<_>>()
+        };
+        let script = backup_command_limited(s.work.to_str().unwrap(), None, "arena backup", s.skip, s.limit, None);
+        for (signal, code) in [("TERM", 143), ("HUP", 129)] {
+            let bin = s.base.join(format!("bin-{signal}"));
+            std::fs::create_dir_all(&bin).unwrap();
+            crate::remote::write_test_script(
+                bin.join("git"),
+                format!(
+                    "#!/bin/sh\nif [ \"$*\" = 'update-index -q --refresh' ] && [ -n \"$GIT_INDEX_FILE\" ]; then : > \"$GIT_INDEX_FILE.lock\"; \
+                     kill -{signal} \"$PPID\"; exit 1; fi\nexec {} \"$@\"\n",
+                    shell_quote(&real_git())
+                ),
+            )
+            .unwrap();
+            let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+            let (got, out, err) = run_on_path(&script, &path);
+            assert_eq!(got, Some(code), "{signal}: {out}{err}");
+            assert_eq!(ours(), Vec::<String>::new(), "{signal}: the copy and its lock removed");
+            assert_eq!(std::fs::read(&index).unwrap(), before, "{signal}: the participant's index untouched");
+        }
+        // Not killed: the check as ever, nothing left.
+        assert_eq!(s.backup_raw().1, "SKIP main\n");
+        assert_eq!(ours(), Vec::<String>::new());
+    }
+
+    /// Review ai-review claude #2 / codex #2: the work `set-branch --hard` discards — a merge in
+    /// progress and its conflicted file, an edit to a tracked file, untracked or ignored files the
+    /// reset replaces — was kept only in set-branch's rsync into the day's snapshot label, which the
+    /// next pull of that label overwrites from the reset pod. Now the switch saves it on the pod
+    /// first, in `.git/arena-discarded/<time>/`, and says where; what its README says gets the edit
+    /// back. A save that fails leaves the pod as it was, not reset; a reset with nothing to discard
+    /// saves nothing, and never touches an earlier save.
+    #[cfg(unix)]
+    #[test]
+    fn hard_saves_what_it_discards_on_the_pod_first() {
+        let s = GitSandbox::new("discarded", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        // The pod: ex.py tracked; a conflicted `git pull upstream main`; then ex.py edited, and its
+        // own solutions.py, results.log (ignored), data (a file) and notes.md, none tracked.
+        std::fs::write(s.work.join("ex.py"), "v = 1\n").unwrap();
+        s.git(&s.work, &["add", "ex.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "ex"]);
+        with_conflicting_upstream(&s);
+        let tip = s.git(&s.work, &["rev-parse", "HEAD"]);
+        git_failing(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
+        let merging = s.git(&s.work, &["rev-parse", "MERGE_HEAD"]);
+        let edit = "v = 2  # the participant's edit\n";
+        std::fs::write(s.work.join("ex.py"), edit).unwrap();
+        std::fs::write(s.work.join(".git/info/exclude"), "*.log\n").unwrap();
+        for (f, text) in [("solutions.py", "mine\n"), ("results.log", "my log\n"), ("data", "my data\n"), ("notes.md", "notes\n")] {
+            std::fs::write(s.work.join(f), text).unwrap();
+        }
+        // The staff push to the cohort's main since: a solutions.py, a log, data/x.py.
+        let staff = s.base.join("staff");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), staff.to_str().unwrap()]);
+        for (f, text) in [("solutions.py", "the staff's\n"), ("results.log", "the staff's log\n"), ("data/x.py", "x = 1\n")] {
+            std::fs::create_dir_all(staff.join(f).parent().unwrap()).unwrap();
+            std::fs::write(staff.join(f), text).unwrap();
+        }
+        s.git(&staff, &["add", "-A"]);
+        s.git(&staff, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "solutions"]);
+        s.git(&staff, &["push", "-q", "origin", "main"]);
+        let saves = || {
+            let mut d: Vec<std::path::PathBuf> =
+                std::fs::read_dir(s.work.join(".git/arena-discarded")).map(|r| r.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+            d.sort();
+            d
+        };
+        // The save fails (its folder can't be made): not reset, nothing touched.
+        std::fs::write(s.work.join(".git/arena-discarded"), "in the way\n").unwrap();
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && err.contains("before the --hard reset - not reset"), "{err}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x");
+        assert!(s.work.join(".git/MERGE_HEAD").exists());
+        assert_eq!((s.read("ex.py"), s.read("solutions.py")), (edit.as_bytes().to_vec(), b"mine\n".to_vec()));
+        std::fs::remove_file(s.work.join(".git/arena-discarded")).unwrap();
+
+        // Saved, then reset.
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        let saved: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("DISCARDED_SAVED ")).collect();
+        assert!(saved.len() == 1 && saved[0].starts_with(".git/arena-discarded/20"), "{out}");
+        let d = s.work.join(saved[0]);
+        assert_eq!(saves(), std::slice::from_ref(&d));
+        // The reset happened: main as origin has it, the merge over, the files the staff's.
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/main"]));
+        assert!(!s.work.join(".git/MERGE_HEAD").exists());
+        assert_eq!((s.read("solutions.py"), s.read("results.log")), (b"the staff's\n".to_vec(), b"the staff's log\n".to_vec()));
+        assert!(s.work.join("data/x.py").is_file());
+        assert_eq!(s.read("notes.md"), b"notes\n", "a file the branch doesn't track stays, unsaved");
+        // …and the save has all of it.
+        let read = |rel: &str| std::fs::read_to_string(d.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        let patch = read("changes.patch");
+        assert!(patch.contains("+v = 2  # the participant's edit") && patch.contains("+<<<<<<< "), "{patch}");
+        // Apart: the edit unstaged; the conflicted file in neither (no one staged version of it), and
+        // nothing else staged — so no staged.patch.
+        let unstaged = read("unstaged.patch");
+        assert!(unstaged.contains("+v = 2  # the participant's edit") && !unstaged.contains("README.md"), "{unstaged}");
+        assert!(!d.join("staged.patch").exists());
+        assert!(read("conflicted/README.md").contains("<<<<<<< "));
+        assert_eq!(read("state/MERGE_HEAD").trim(), merging);
+        assert!(d.join("state/MERGE_MSG").is_file());
+        assert_eq!(
+            (read("untracked/solutions.py"), read("untracked/results.log"), read("untracked/data")),
+            ("mine\n".to_string(), "my log\n".to_string(), "my data\n".to_string())
+        );
+        assert!(!d.join("untracked/notes.md").exists() && !d.join(".lists").exists());
+        let readme = read("README");
+        assert!(readme.contains(&format!("It was on autocommit-x at commit {tip}")) && readme.contains("git apply --index"), "{readme}");
+        assert!(readme.contains("Unmerged path") && readme.contains("git apply") && readme.contains("unstaged.patch"), "{readme}");
+        // What the README says gets the edit back.
+        s.git(&s.work, &["branch", "rescue", &tip]);
+        s.git(&s.work, &["checkout", "-q", "rescue"]);
+        s.git(&s.work, &["apply", "--index", d.join("changes.patch").to_str().unwrap()]);
+        assert_eq!(s.read("ex.py"), edit.as_bytes());
+
+        // A reset with nothing to discard saves nothing, and the first save stays.
+        s.git(&s.work, &["reset", "-q", "--hard"]);
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        assert!(o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("DISCARDED_SAVED"), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(saves(), std::slice::from_ref(&d));
+        assert_eq!(read("untracked/solutions.py"), "mine\n");
+    }
+
+    /// Live 4: a gentle switch whose checkout went through but whose fast-forward to origin's
+    /// branch didn't (a local `main` 216 commits ahead of origin's, made from `upstream/main`) left
+    /// the pod on that branch while its line said "not switched". Now it's all or nothing: it goes
+    /// back where it was — the edit it carried carried back, the real keys back in their file — and
+    /// says why: the local branch has commits origin's doesn't, or origin has no such branch. From
+    /// a detached HEAD, back to that commit. If going back fails too, it says which branch the pod
+    /// is on now.
+    #[cfg(unix)]
+    #[test]
+    fn a_gentle_switch_whose_fast_forward_fails_goes_back_where_it_was() {
+        let s = GitSandbox::new("switch-back", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let rev = |r: &str| s.git(&s.work, &["rev-parse", r]);
+        let branch = || s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        // The local main and origin's have diverged: each has a commit the other doesn't (a local
+        // `main` ahead of origin's alone fast-forwards to nothing, and stays).
+        let staff = s.base.join("staff");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), staff.to_str().unwrap()]);
+        std::fs::write(staff.join("staff.py"), "s = 1\n").unwrap();
+        s.git(&staff, &["add", "staff.py"]);
+        s.git(&staff, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "staff"]);
+        s.git(&staff, &["push", "-q", "origin", "main"]);
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        std::fs::write(s.work.join("course.py"), "c = 1\n").unwrap();
+        s.git(&s.work, &["add", "course.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "only here"]);
+        let local_main = rev("main");
+        s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+        s.git(&s.work, &["branch", "-q", "feat", "main"]);
+        let ex = format!("KEY = \"{}\"\n", openrouter_key(26));
+        std::fs::write(s.work.join("ex.py"), &ex).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.redacted.len()), (Some(0), 1), "{err}");
+        let head = rev("HEAD");
+        std::fs::write(s.work.join("README.md"), "an edit, carried\n").unwrap();
+        let switch = |to: &str, path: Option<&str>| {
+            let cmd = checkout_command(repo, to, None, false);
+            match path {
+                Some(path) => run_on_path(&cmd, path),
+                None => {
+                    let o = s.run(&cmd);
+                    (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
+                }
+            }
+        };
+        let back = |to: &str, why: &str| {
+            let (code, out, err) = switch(to, None);
+            assert_ne!(code, Some(0), "{to}: {out}{err}");
+            assert!(err.trim_end().ends_with(&format!("arena set-branch: {why} — not switched: back on autocommit-x")), "{to}: {err}");
+            assert_eq!((branch(), rev("HEAD")), ("autocommit-x".to_string(), head.clone()), "{to}");
+            assert_eq!(s.read("README.md"), b"an edit, carried\n", "{to}");
+            assert!(out.contains("UNREDACTED_RESTORED ex.py") && s.read("ex.py") == ex.as_bytes(), "{to}: the real key back: {out}");
+        };
+        back("main", "its local main has 1 commit(s) origin's main doesn't, so it can't fast-forward to it");
+        assert_eq!(rev("main"), local_main, "main as it was");
+        back("feat", "origin has no feat");
+        // From a detached HEAD: back to that commit.
+        s.git(&s.work, &["checkout", "-q", "--detach"]);
+        let (code, _, err) = switch("main", None);
+        assert_ne!(code, Some(0));
+        assert!(err.contains(&format!("not switched: back on its detached HEAD ({})", &head[..10])), "{err}");
+        assert_eq!((branch(), rev("HEAD")), ("HEAD".to_string(), head.clone()));
+        s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+        // Going back fails too: said, with the branch it is on.
+        let bin = s.base.join("bin-noback");
+        std::fs::create_dir_all(&bin).unwrap();
+        crate::remote::write_test_script(
+            bin.join("git"),
+            format!("#!/bin/sh\nif [ \"$*\" = 'checkout -q autocommit-x' ]; then echo 'error: no going back' >&2; exit 1; fi\nexec {} \"$@\"\n", shell_quote(&real_git())),
+        )
+        .unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let (code, _, err) = switch("main", Some(&path));
+        assert_ne!(code, Some(0));
+        assert!(
+            err.contains("its local main has 1 commit(s) origin's main doesn't, so it can't fast-forward to it — not switched, and going back to \
+                          autocommit-x failed: it is on main now"),
+            "{err}"
+        );
+        assert_eq!(branch(), "main");
+    }
+
+    /// Review ai-review claude #13: the switch's HUP/INT/TERM trap (the keys put back) was said to
+    /// cover a timeout, but arena's timeout kills only the local ssh client, and a non-pty
+    /// session's shell is usually never signalled: the switch ran on, and could land after arena
+    /// had reported a timeout and released the pod's lock. Now it bounds itself on the pod — under
+    /// `timeout`, TERM to its process group (here after 2 s, at a checkout that hangs): exit 124,
+    /// said, the real keys back, the pod on its branch. Under bash, zsh (the pods' login shell,
+    /// which `-c`s the command: sshd) and fish, so it starts the switch's script under `sh`: the
+    /// real command switches and switches back, the keys with it. A pod whose `timeout` doesn't
+    /// work runs it unbounded, as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_switch_bounds_itself_on_the_pod_and_puts_the_keys_back_under_any_login_shell() {
+        let s = GitSandbox::new("switch-bound", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let ex = format!("KEY = \"{}\"\n", openrouter_key(25));
+        std::fs::write(s.work.join("ex.py"), &ex).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.redacted.len()), (Some(0), 1), "{err}");
+        let aside = s.work.join(".git/arena-unredacted");
+        let branch = || s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let shells = login_shells();
+        let stand_in = |dir: &str, body: &str| {
+            let bin = s.base.join(dir);
+            std::fs::create_dir_all(&bin).unwrap();
+            let (name, text) = body.split_once('\n').unwrap();
+            crate::remote::write_test_script(bin.join(name), text).unwrap();
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+        };
+        let hang = stand_in(
+            "bin-hang",
+            &format!(
+                "git\n#!/bin/sh\ncase \"$*\" in *\" checkout main\" | \"checkout -f -B main origin/main\") sleep 30; exit 1;; esac\nexec {} \"$@\"\n",
+                shell_quote(&real_git())
+            ),
+        );
+        let plain = std::env::var("PATH").unwrap_or_default();
+        for shell in &shells {
+            for hard in [false, true] {
+                let t0 = std::time::Instant::now();
+                let (code, out, err) = run_in(shell, &bounded_switch(&switch_script(repo, "main", None, hard, KB_DEFAULT), 2, 1), &hang);
+                assert_eq!(code, Some(124), "{shell} hard={hard}: {out}{err}");
+                assert!(t0.elapsed() < std::time::Duration::from_secs(20), "{shell} hard={hard}: bounded");
+                assert!(err.contains("the switch ran past its 2 s on the pod and was stopped there"), "{shell} hard={hard}: {err}");
+                assert_eq!(s.read("ex.py"), ex.as_bytes(), "{shell} hard={hard}: the real key put back");
+                assert!(!aside.exists(), "{shell} hard={hard}");
+                assert_eq!(branch(), "autocommit-x", "{shell} hard={hard}");
+            }
+            // The real command under that login shell: to main (ex.py's key kept aside: main has
+            // no ex.py) and back (the key back in it).
+            let (code, out, err) = run_in(shell, &checkout_command(repo, "main", None, false), &plain);
+            assert_eq!((code, branch()), (Some(0), "main".to_string()), "{shell}: {out}{err}");
+            assert!(out.contains("UNREDACTED_KEPT ex.py"), "{shell}: {out}");
+            let (code, out, err) = run_in(shell, &checkout_command(repo, "autocommit-x", None, false), &plain);
+            assert_eq!((code, branch()), (Some(0), "autocommit-x".to_string()), "{shell}: {out}{err}");
+            assert!(out.contains("UNREDACTED_RESTORED ex.py") && s.read("ex.py") == ex.as_bytes(), "{shell}: {out}");
+        }
+        // A `timeout` that doesn't work (absent, or not coreutils'): the switch runs unbounded.
+        let broken = stand_in("bin-no-timeout", "timeout\n#!/bin/sh\nexit 127\n");
+        let (code, out, err) = run_in("bash", &checkout_command(repo, "main", None, false), &broken);
+        assert_eq!((code, branch()), (Some(0), "main".to_string()), "{out}{err}");
+    }
+
+    /// Review ai-review codex #3 / claude #11: `changes.patch` is HEAD -> the files, so a version
+    /// staged and then undone in the work tree (B staged, the file put back to HEAD's A) was in no
+    /// patch at all — the save was empty, and the reset discarded B. And no ref kept the commit the
+    /// patch applies to: on main with a local commit, `checkout -f -B main origin/main` left it to
+    /// the reflog, and once that expired git's gc dropped it. Now the staged and unstaged changes
+    /// are saved apart (`staged.patch`: HEAD -> the index; `unstaged.patch`: the index -> the
+    /// files), and `refs/arena-discarded/<save>` keeps the old HEAD; what the README says brings
+    /// back the index and the files exactly, after a gc, and deleting that ref as it says lets go.
+    #[cfg(unix)]
+    #[test]
+    fn hard_saves_the_staged_version_apart_and_keeps_its_base() {
+        let s = GitSandbox::new("discarded-staged", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        // On main: a commit of its own (never pushed), then version B of README.md staged, and the
+        // file put back to HEAD's version A.
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        std::fs::write(s.work.join("mine.py"), "mine = 1\n").unwrap();
+        s.git(&s.work, &["add", "mine.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "mine"]);
+        let old = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let a = s.read("README.md");
+        std::fs::write(s.work.join("README.md"), "version B, staged\n").unwrap();
+        s.git(&s.work, &["add", "README.md"]);
+        std::fs::write(s.work.join("README.md"), &a).unwrap();
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "MM README.md");
+
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        let saved: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("DISCARDED_SAVED ")).collect();
+        assert_eq!(saved.len(), 1, "{out}");
+        let d = s.work.join(saved[0]);
+        let name = d.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/main"]), "reset");
+        assert!(!d.join("changes.patch").exists(), "HEAD -> the files: nothing");
+        assert!(d.join("staged.patch").is_file() && d.join("unstaged.patch").is_file());
+        let pin = format!("refs/arena-discarded/{name}");
+        assert_eq!(s.git(&s.work, &["rev-parse", &pin]), old, "the base kept by a ref");
+        // (Local main had a commit origin's doesn't: pinned on its own too — codex #3.)
+        assert_eq!(s.git(&s.work, &["rev-parse", &format!("{pin}-main")]), old);
+        let readme = std::fs::read_to_string(d.join("README")).unwrap();
+        let undo = readme.lines().find_map(|l| l.strip_prefix("When none of it is wanted any more: ")).expect("the README's line");
+        assert_eq!(undo, format!("git update-ref -d {pin} && git update-ref -d {pin}-main && rm -rf {}", d.display()));
+        // Nothing but that ref keeps the old commit now: gc after the reflog expires keeps it.
+        let gc = || {
+            s.git(&s.work, &["reflog", "expire", "--expire=now", "--all"]);
+            s.git(&s.work, &["gc", "-q", "--prune=now"]);
+        };
+        gc();
+        // What the README says brings back the index and the files exactly.
+        let restore = readme.lines().find(|l| l.contains("git apply --index") && l.contains("staged.patch")).expect("the README's line").trim();
+        assert_eq!(
+            restore,
+            format!("git branch rescue {old} && git checkout rescue && git apply --index {0}/staged.patch && git apply {0}/unstaged.patch", d.display())
+        );
+        let o = s.run(&format!("cd {} && {restore}", shell_quote(repo)));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["show", ":README.md"]), "version B, staged", "the staged version, staged again");
+        assert_eq!(s.read("README.md"), a, "the file as it was");
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "MM README.md");
+        // Done with it: what the README says to delete lets git drop it.
+        s.git(&s.work, &["checkout", "-q", "-f", "main"]);
+        s.git(&s.work, &["branch", "-D", "-q", "rescue"]);
+        let o = s.run(&format!("cd {} && {undo}", shell_quote(repo)));
+        assert!(o.status.success() && !d.exists(), "{}", String::from_utf8_lossy(&o.stderr));
+        gc();
+        assert!(!s.run(&format!("git -C {} cat-file -e {old}", shell_quote(repo))).status.success(), "gone without the ref");
+    }
+
+    /// Review ai-review codex #3: `checkout -f -B <branch> origin/<branch>` moves the local
+    /// `<branch>` to origin's, whichever branch the pod was on, and the save kept only the commit
+    /// HEAD was on — and that only when there was something else to save. A pod on a clean, pushed
+    /// autocommit branch whose local `main` had an unpushed commit lost it to git's gc once the
+    /// reflog expired. Now the local branch's tip, when it has commits origin's doesn't, is pinned
+    /// by `refs/arena-discarded/<save>-<branch>` — and HEAD, when it has commits no remote has, by
+    /// `refs/arena-discarded/<save>` — whether or not anything else is saved: the folder then holds
+    /// just a README naming them, and the output names them too (`DISCARDED_PINNED`).
+    #[cfg(unix)]
+    #[test]
+    fn hard_pins_the_local_commits_it_leaves_on_no_branch() {
+        let s = GitSandbox::new("discarded-pins", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let gc = || {
+            s.git(&s.work, &["reflog", "expire", "--expire-unreachable=now", "--all"]);
+            s.git(&s.work, &["gc", "-q", "--prune=now"]);
+        };
+        let exists = |c: &str| s.run(&format!("git -C {} cat-file -e {c}^{{commit}}", shell_quote(repo))).status.success();
+        let hard = |pins: usize| {
+            let o = s.run(&checkout_command(repo, "main", None, true));
+            let out = String::from_utf8_lossy(&o.stdout).into_owned();
+            assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+            assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/main"]), "reset");
+            let saved: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("DISCARDED_SAVED ")).collect();
+            assert_eq!(saved.len(), 1, "{out}");
+            let d = s.work.join(saved[0]);
+            let names: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            assert_eq!(names, ["README"], "nothing else to save: the README alone");
+            let pinned: Vec<String> = out.lines().filter_map(|l| l.strip_prefix("DISCARDED_PINNED ")).map(String::from).collect();
+            assert_eq!(pinned.len(), pins, "{out}");
+            (d.clone(), pinned, std::fs::read_to_string(d.join("README")).unwrap())
+        };
+        // Local main: an unpushed commit. The pod: on its clean, pushed autocommit branch.
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        std::fs::write(s.work.join("mine.py"), "mine = 1\n").unwrap();
+        s.git(&s.work, &["add", "mine.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "mine, on main"]);
+        let mine = s.git(&s.work, &["rev-parse", "HEAD"]);
+        s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "");
+        let (d, pinned, readme) = hard(1);
+        let pin = format!("refs/arena-discarded/{}-main", d.file_name().unwrap().to_string_lossy());
+        assert_eq!(pinned, std::slice::from_ref(&pin), "the autocommit branch is pushed: HEAD needs no ref");
+        assert!(
+            readme.contains(&format!("Its local main was at commit {mine}, with 1 commit(s) origin/main doesn't have"))
+                && readme.contains(&format!("the ref {pin} keeps them from git's gc. `git branch main-rescue {mine}` brings them back.")),
+            "{readme}"
+        );
+        // Every reflog expired, gc run: the commit is still there, by the ref.
+        gc();
+        assert_eq!(s.git(&s.work, &["rev-parse", &pin]), mine);
+        assert!(exists(&mine));
+        // What the README says to run once none of it is wanted lets git drop it.
+        let undo = readme.lines().find_map(|l| l.strip_prefix("When none of it is wanted any more: ")).expect("the README's line");
+        assert_eq!(undo, format!("git update-ref -d {pin} && rm -rf {}", d.display()));
+        assert!(s.run(&format!("cd {} && {undo}", shell_quote(repo))).status.success());
+        gc();
+        assert!(!exists(&mine), "gone without the ref");
+
+        // A detached HEAD with a commit no remote has, the tree clean: pinned by
+        // refs/arena-discarded/<save> (local main is origin's now: no ref for it).
+        s.git(&s.work, &["checkout", "-q", "--detach"]);
+        std::fs::write(s.work.join("detached.py"), "d = 1\n").unwrap();
+        s.git(&s.work, &["add", "detached.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "on a detached HEAD"]);
+        let detached = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let (d, pinned, readme) = hard(1);
+        let pin = format!("refs/arena-discarded/{}", d.file_name().unwrap().to_string_lossy());
+        assert_eq!(pinned, std::slice::from_ref(&pin));
+        assert!(readme.contains(&format!("It was on HEAD at commit {detached} (the ref {pin} keeps it")), "{readme}");
+        gc();
+        assert_eq!(s.git(&s.work, &["rev-parse", &pin]), detached);
+        assert!(exists(&detached));
+    }
+
+    /// Review ai-review claude #7: a save stopped between a pin's `git update-ref` and its naming in
+    /// `$ds_refs` left the ref behind — `ds_abandon` removed the folder, not the ref it didn't know
+    /// — pinning its commits with no README to name it. Now each is named first. A stand-in `git`
+    /// TERMs the switch as it makes the first pin, then the second (on main with a commit of its
+    /// own, both are made: HEAD's and local main's): the ref made, or not yet — either way nothing of
+    /// the save is left, no ref, and the pod isn't reset.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_stopped_as_it_pins_leaves_no_ref_behind() {
+        let s = GitSandbox::new("discarded-pin-term", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        std::fs::write(s.work.join("mine.py"), "mine = 1\n").unwrap();
+        s.git(&s.work, &["add", "mine.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "mine, on main"]);
+        let mine = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let bin = s.base.join("bin-pin-term");
+        std::fs::create_dir_all(&bin).unwrap();
+        let (count, fired) = (s.base.join("pins.count"), s.base.join("pins.fired"));
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        for made in [true, false] {
+            for nth in [1, 2] {
+                let _ = (std::fs::remove_file(&count), std::fs::remove_file(&fired));
+                // The `nth` pin's update-ref: TERM to the switch, then the ref made (or not).
+                let then = if made { format!("exec {} \"$@\"", shell_quote(&real_git())) } else { "exit 1".to_string() };
+                crate::remote::write_test_script(
+                    bin.join("git"),
+                    format!(
+                        "#!/bin/sh\ncase \"$1 $2\" in \"update-ref refs/arena-discarded/\"*)\n  n=$(($(cat {c} 2>/dev/null || echo 0) + 1)); echo $n > {c}\n  \
+                         if [ $n = {nth} ]; then echo \"$2\" > {f}; kill -TERM \"$PPID\"; {then}; fi;;\nesac\nexec {g} \"$@\"\n",
+                        c = shell_quote(count.to_str().unwrap()),
+                        f = shell_quote(fired.to_str().unwrap()),
+                        g = shell_quote(&real_git()),
+                    ),
+                )
+                .unwrap();
+                let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, true), &path);
+                let case = format!("made={made} pin #{nth}");
+                assert_eq!(code, Some(143), "{case}: {out}{err}");
+                let pin = std::fs::read_to_string(&fired).unwrap_or_else(|_| panic!("{case}: the stand-in never fired: {out}{err}"));
+                assert!(pin.starts_with("refs/arena-discarded/20"), "{case}: {pin}");
+                assert_eq!(s.git(&s.work, &["for-each-ref", "refs/arena-discarded/"]), "", "{case}: no ref left");
+                assert!(!s.work.join(".git/arena-discarded").exists(), "{case}: nothing of the save left");
+                assert_eq!((s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), s.git(&s.work, &["rev-parse", "HEAD"])), ("main".to_string(), mine.clone()), "{case}: not reset");
+            }
+        }
+        // Not stopped: both pins made, as before.
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(out.lines().filter(|l| l.starts_with("DISCARDED_PINNED refs/arena-discarded/")).count(), 2, "{out}");
+    }
+
+    /// Review ai-review claude #9, checked: the patches are plumbing with no refresh of the index,
+    /// so a file whose stat changed but whose content didn't (after an rsync, a restore, a `touch`)
+    /// is listed by `diff-files --name-only` — would `diff-files -p` / `diff-index -p` then write a
+    /// bare `diff --git` header for it, which `git apply` refuses when a patch has nothing else? No:
+    /// on git 2.43 (the build VM's) they write nothing for such a file, staged or not, text or
+    /// binary; and the switch's set-aside (`unredacted_aside`'s porcelain `git diff`) has refreshed
+    /// the index's stat data before the save anyway. Pinned here: a staged file touched after its
+    /// `git add`, a file touched alone, and a real unstaged change — no header for a file only
+    /// touched, and the README's restore line gives back the index and the files exactly.
+    #[cfg(unix)]
+    #[test]
+    fn hard_saves_patches_that_apply_when_files_were_only_touched() {
+        let s = GitSandbox::new("discarded-touched", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let touch = |rel: &str| {
+            let f = std::fs::File::options().write(true).open(s.work.join(rel)).unwrap();
+            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600)).unwrap();
+        };
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        std::fs::write(s.work.join("ex.py"), "x = 1\n").unwrap();
+        s.git(&s.work, &["add", "ex.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "ex"]);
+        let old = s.git(&s.work, &["rev-parse", "HEAD"]);
+        // README.md: version B staged, then touched; data.bin: touched alone; ex.py: a real change.
+        std::fs::write(s.work.join("README.md"), "version B, staged\n").unwrap();
+        s.git(&s.work, &["add", "README.md"]);
+        touch("README.md");
+        touch("data.bin");
+        std::fs::write(s.work.join("ex.py"), "x = 2  # not staged\n").unwrap();
+        // (Plumbing only from here: a porcelain command would refresh the index.)
+        assert_eq!(s.git(&s.work, &["diff-files", "--name-only"]), "README.md\ndata.bin\nex.py", "stat-dirty as meant");
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        let d = s.work.join(out.lines().find_map(|l| l.strip_prefix("DISCARDED_SAVED ")).expect("saved"));
+        let patch = |name: &str| String::from_utf8_lossy(&std::fs::read(d.join(name)).unwrap()).into_owned();
+        let headers = |p: &str| p.lines().filter_map(|l| l.strip_prefix("diff --git a/")).map(|l| l.split(' ').next().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(headers(&patch("staged.patch")), ["README.md"]);
+        assert_eq!(headers(&patch("unstaged.patch")), ["ex.py"], "no header for a file only touched");
+        assert_eq!(headers(&patch("changes.patch")), ["README.md", "ex.py"]);
+        let readme = patch("README");
+        let restore = readme.lines().find(|l| l.contains("git apply --index") && l.contains("staged.patch")).expect("the README's line").trim();
+        let o = s.run(&format!("cd {} && {restore}", shell_quote(repo)));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), old);
+        assert_eq!(s.git(&s.work, &["show", ":README.md"]), "version B, staged");
+        assert_eq!((s.read("README.md"), s.read("ex.py")), (b"version B, staged\n".to_vec(), b"x = 2  # not staged\n".to_vec()));
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "M  README.md\n M ex.py");
+    }
+
+    /// Review ai-review codex #1 / claude #7: the save kept only files and links, but `checkout -f`
+    /// removes a whole directory standing where the new branch has a file or a link — ignored
+    /// contents, a nested repo's .git and all (git's `remove_subtree`) — and the reset went ahead
+    /// with none of it saved. Now every such directory is copied whole into `untracked/` (links in it
+    /// kept as links), and so is a link on a leading path of one the branch tracks — the link
+    /// itself, never what it points to (git removes the link, not its target's files). A copy that
+    /// fails leaves the pod as it was, and the part already copied is removed.
+    #[cfg(unix)]
+    #[test]
+    fn hard_saves_the_directories_it_removes_whole() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let s = GitSandbox::new("discarded-dirs", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let path = |rel: &str| s.work.join(rel);
+        // The staff's main since: files where the pod has directories, a link, and a file in a
+        // directory the pod has as a link.
+        let staff = s.base.join("staff");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), staff.to_str().unwrap()]);
+        std::fs::write(staff.join("checkpoints"), "the staff's checkpoints file\n").unwrap();
+        std::fs::write(staff.join("Grokking"), "the staff's Grokking file\n").unwrap();
+        symlink("README.md", staff.join("data")).unwrap();
+        std::fs::create_dir_all(staff.join("exercises")).unwrap();
+        std::fs::write(staff.join("exercises/ex1.py"), "ex = 1\n").unwrap();
+        s.git(&staff, &["add", "-A"]);
+        s.git(&staff, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "staff"]);
+        s.git(&staff, &["push", "-q", "origin", "main"]);
+        // The pod: an ignored checkpoints/ (a file and a link in it); an untracked data/; a nested
+        // repo Grokking/ with a commit of its own; the tracked data.bin replaced by a directory; and
+        // exercises, a link to a directory elsewhere.
+        std::fs::write(s.work.join(".git/info/exclude"), "checkpoints/\n").unwrap();
+        std::fs::create_dir_all(path("checkpoints")).unwrap();
+        std::fs::write(path("checkpoints/model.pt"), "my weights\n").unwrap();
+        symlink("model.pt", path("checkpoints/latest")).unwrap();
+        std::fs::create_dir_all(path("data")).unwrap();
+        std::fs::write(path("data/train.csv"), "1,2\n").unwrap();
+        std::fs::create_dir_all(path("Grokking")).unwrap();
+        s.git(&path("Grokking"), &["init", "-q", "-b", "main"]);
+        std::fs::write(path("Grokking/g.py"), "g = 1\n").unwrap();
+        s.git(&path("Grokking"), &["add", "-A"]);
+        s.git(&path("Grokking"), &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "mine"]);
+        let grok = s.git(&path("Grokking"), &["rev-parse", "HEAD"]);
+        std::fs::remove_file(path("data.bin")).unwrap();
+        std::fs::create_dir_all(path("data.bin")).unwrap();
+        std::fs::write(path("data.bin/part1"), "mine\n").unwrap();
+        let elsewhere = s.base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("mine.py"), "mine = 1\n").unwrap();
+        symlink(&elsewhere, path("exercises")).unwrap();
+        let head = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+
+        // A copy that fails (a file in a directory it can't read): not reset, nothing touched, and
+        // no partial save left behind.
+        std::fs::set_permissions(path("checkpoints/model.pt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && err.contains("couldn't save the untracked files") && err.contains("not reset"), "{err}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), head);
+        assert!(path("checkpoints").is_dir() && path("data").is_dir() && path("Grokking/.git").is_dir() && path("data.bin").is_dir());
+        assert!(!s.work.join(".git/arena-discarded").exists(), "the partial save removed");
+        std::fs::set_permissions(path("checkpoints/model.pt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Saved, then reset.
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        let saved: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("DISCARDED_SAVED ")).collect();
+        assert_eq!(saved.len(), 1, "{out}");
+        let d = s.work.join(saved[0]).join("untracked");
+        // The reset happened: the staff's files, link and directory where the pod's were.
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/main"]));
+        assert_eq!(read(&path("checkpoints")), "the staff's checkpoints file\n");
+        assert_eq!(read(&path("Grokking")), "the staff's Grokking file\n");
+        assert_eq!(std::fs::read_link(path("data")).unwrap(), std::path::Path::new("README.md"));
+        assert_eq!(std::fs::read(path("data.bin")).unwrap().len(), 10, "data.bin as main has it");
+        assert!(path("exercises").is_dir() && !path("exercises").is_symlink() && path("exercises/ex1.py").is_file());
+        // …and the save has each directory whole: the ignored one (its link a link), the untracked
+        // one, the nested repo with its history, the one where data.bin was; the link itself.
+        assert_eq!(read(&d.join("checkpoints/model.pt")), "my weights\n");
+        assert_eq!(std::fs::read_link(d.join("checkpoints/latest")).unwrap(), std::path::Path::new("model.pt"));
+        assert_eq!(read(&d.join("data/train.csv")), "1,2\n");
+        assert_eq!((read(&d.join("Grokking/g.py")), s.git(&d.join("Grokking"), &["rev-parse", "HEAD"])), ("g = 1\n".to_string(), grok));
+        assert_eq!(read(&d.join("data.bin/part1")), "mine\n");
+        assert_eq!(std::fs::read_link(d.join("exercises")).unwrap(), elsewhere);
+        assert_eq!(read(&elsewhere.join("mine.py")), "mine = 1\n", "what the link pointed to, untouched");
+    }
+
+    /// Review ai-review claude #2: under the switch's bound (100 s on the pod), a `--hard` save whose
+    /// directory copy couldn't finish was stopped by the TERM, and only the keys were put back: the
+    /// partial copy stayed in `.git/arena-discarded/`, and every retry left another. Now the
+    /// switch's EXIT trap removes a save it didn't complete, after putting the keys back: stopped
+    /// mid-copy, nothing is left and nothing is reset. And what the save would copy is totalled
+    /// first: over `DISCARD_MAX_GB`, or over half what's free on the pod's disk, the switch is
+    /// refused before any of it is copied — not reset — saying what was too big and how to move it
+    /// out of the way, which then lets the switch through. A save stopped says what it was doing
+    /// (review ai-review claude #6: "ran past its 100 s" alone said nothing): mid-copy, what it was
+    /// copying, how big, and the same move out of the way; while it totals the sizes, that.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_stopped_midway_leaves_nothing_and_one_too_big_is_refused() {
+        let s = GitSandbox::new("discarded-bounds", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        // A real key the backup committed redacted (set aside around the switch).
+        let ex = format!("KEY = \"{}\"\n", openrouter_key(29));
+        std::fs::write(s.work.join("ex.py"), &ex).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.redacted.len()), (Some(0), 1), "{err}");
+        // The staff's main now tracks a `checkpoints` file; the pod has an ignored checkpoints/.
+        let staff = s.base.join("staff");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), staff.to_str().unwrap()]);
+        std::fs::write(staff.join("checkpoints"), "the staff's checkpoints file\n").unwrap();
+        s.git(&staff, &["add", "-A"]);
+        s.git(&staff, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "staff"]);
+        s.git(&staff, &["push", "-q", "origin", "main"]);
+        std::fs::write(s.work.join(".git/info/exclude"), "checkpoints/\n").unwrap();
+        std::fs::create_dir_all(s.work.join("checkpoints")).unwrap();
+        let weights = body("0123456789abcdef", 200 * 1024, 3);
+        std::fs::write(s.work.join("checkpoints/model.pt"), &weights).unwrap();
+        let head = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let untouched = |what: &str| {
+            assert_eq!(
+                (s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), s.git(&s.work, &["rev-parse", "HEAD"])),
+                ("autocommit-x".to_string(), head.clone()),
+                "{what}: not reset"
+            );
+            assert_eq!(s.read("checkpoints/model.pt"), weights.as_bytes(), "{what}");
+            assert_eq!(s.read("ex.py"), ex.as_bytes(), "{what}: the real key put back");
+            assert!(!s.work.join(".git/arena-discarded").exists(), "{what}: nothing of the save left");
+            assert_eq!(s.git(&s.work, &["for-each-ref", "refs/arena-discarded/"]), "", "{what}: no ref left");
+        };
+        let stand_in = |dir: &str, name: &str, text: &str| {
+            let bin = s.base.join(dir);
+            std::fs::create_dir_all(&bin).unwrap();
+            crate::remote::write_test_script(bin.join(name), text).unwrap();
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+        };
+        let real = |tool: &str| {
+            let o = std::process::Command::new("sh").args(["-c", &format!("command -v {tool}")]).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        // Stopped mid-copy: a `cp` that copies into the save, then hangs; the bound's TERM at 2 s.
+        let slow = stand_in(
+            "bin-slow-cp",
+            "cp",
+            &format!("#!/bin/sh\ncase \"$*\" in *arena-discarded/*) {0} \"$@\"; sleep 30; exit 1;; esac\nexec {0} \"$@\"\n", real("cp")),
+        );
+        let t0 = std::time::Instant::now();
+        let (code, out, err) = run_in("bash", &bounded_switch(&switch_script(repo, "main", None, true, KB_DEFAULT), 2, 1), &slow);
+        assert_eq!(code, Some(124), "{out}{err}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(20) && err.contains("was stopped there"), "{err}");
+        untouched("stopped mid-copy");
+        // …and it said what it was copying, how big, and how to move it out of the way (review
+        // ai-review claude #6), before the bound's own line.
+        let line = err.lines().find(|l| l.starts_with("arena set-branch: stopped while copying checkpoints (")).unwrap_or_else(|| panic!("{err}"));
+        assert!(
+            line.contains(" KiB) into the save, before the --hard reset — the partial save removed, not reset: move it out of the checkout (cd "),
+            "{line}"
+        );
+        suggested_move(line, repo, "checkpoints");
+        assert!(err.find(line).unwrap() < err.find("was stopped there").unwrap(), "{err}");
+        // …and with no stderr to say it on (a dropped connection; review ai-review claude #4): the
+        // save removed all the same — the words come after it, a failed write passed over.
+        let (code, out, err) = run_in("bash", &format!("{} 2>&-", bounded_switch(&switch_script(repo, "main", None, true, KB_DEFAULT), 2, 1)), &slow);
+        assert_eq!((code, err.as_str()), (Some(124), ""), "{out}");
+        untouched("stopped mid-copy, stderr closed");
+        // Stopped while it totals the size first (a `du` that hangs): said, with no size to say yet.
+        let slow_du = stand_in("bin-slow-du", "du", "#!/bin/sh\nsleep 30\n");
+        let (code, out, err) = run_in("bash", &bounded_switch(&switch_script(repo, "main", None, true, KB_DEFAULT), 2, 1), &slow_du);
+        assert_eq!(code, Some(124), "{out}{err}");
+        assert!(
+            err.contains(
+                "arena set-branch: stopped while totalling the size of what the reset would remove (1 path(s)), before the --hard reset — \
+                 the partial save removed, not reset\n"
+            ),
+            "{err}"
+        );
+        untouched("stopped while totalling");
+        // Over DISCARD_MAX_GB (here 100 KiB): refused, nothing copied.
+        let plain = std::env::var("PATH").unwrap_or_default();
+        let (code, out, err) = run_on_path(&checkout_command_limited(repo, "main", None, true, 100), &plain);
+        assert_ne!(code, Some(0), "{out}");
+        let line = err.lines().find(|l| l.starts_with("arena set-branch: not reset — the --hard reset would remove checkpoints (")).unwrap_or_else(|| panic!("{err}"));
+        assert!(line.contains(" KiB), which is more than DISCARD_MAX_GB allows (100 KiB) to save first: move it out of the checkout"), "{line}");
+        untouched("over DISCARD_MAX_GB");
+        // Over half what's free on its disk (a `df` that says 300 KiB): refused the same way.
+        let full = stand_in(
+            "bin-full",
+            "df",
+            "#!/bin/sh\necho 'Filesystem 1024-blocks Used Available Capacity Mounted on'\necho 'overlay 1000 700 300 70% /'\n",
+        );
+        let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, true), &full);
+        assert_ne!(code, Some(0), "{out}");
+        assert!(err.contains("which is more than half the 300 KiB free on its disk to save first") && !err.contains("DISCARD_MAX_GB"), "{err}");
+        untouched("over half the free space");
+        // What the line says moves it out of the way, and the switch then goes through.
+        let (fix, kept) = suggested_move(line, repo, "checkpoints");
+        assert!(s.run(&fix).status.success());
+        let o = s.run(&checkout_command_limited(repo, "main", None, true, 100));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/main"]));
+        assert_eq!(std::fs::read(s.base.join(kept).join("model.pt")).unwrap(), weights.as_bytes());
+    }
+
+    /// The move a refused `--hard` save's line suggests for `path` (review ai-review claude #5,
+    /// codex #4, claude #7): `(cd '<repo>' && if [ -e '<dest>' ] || [ -L '<dest>' ]; then printf
+    /// '%s\n' 'not moved: <dest> exists' >&2; exit 1; fi && mv -n -- '<path>' '<dest>')`, `<dest>`
+    /// `../<name>.kept-<UTC time>`, every word as [`shell_quote`] quotes it. Returns the command and
+    /// the kept copy's name.
+    #[cfg(unix)]
+    fn suggested_move(line: &str, repo: &str, path: &str) -> (String, String) {
+        let fix = line
+            .split_once("move it out of the checkout ")
+            .and_then(|(_, r)| r.split_once(", or delete it, then switch again"))
+            .map(|(f, _)| f.to_string())
+            .unwrap_or_else(|| panic!("no move in: {line}"));
+        let name = std::path::Path::new(path).file_name().unwrap().to_string_lossy().into_owned();
+        let at = fix.find(".kept-").unwrap_or_else(|| panic!("{fix}")) + ".kept-".len();
+        let stamp = &fix[at..at + 16];
+        assert!(
+            stamp.len() == 16 && stamp.as_bytes()[8] == b'T' && stamp.ends_with('Z') && stamp[..8].bytes().chain(stamp[9..15].bytes()).all(|b| b.is_ascii_digit()),
+            "a UTC time: {fix}"
+        );
+        let kept = format!("{name}.kept-{stamp}");
+        let dest = shell_quote(&format!("../{kept}"));
+        let said = shell_quote(&format!("not moved: ../{kept} exists"));
+        assert_eq!(
+            fix,
+            format!(
+                "(cd {} && if [ -e {dest} ] || [ -L {dest} ]; then printf '%s\\n' {said} >&2; exit 1; fi && mv -n -- {} {dest})",
+                shell_quote(repo),
+                shell_quote(path)
+            )
+        );
+        (fix, kept)
+    }
+
+    /// Review ai-review claude #5: the move a refused save suggested wrote `'…'` around the path
+    /// by hand — a path with a `'` in it came out broken — and always named the copy `<name>.kept`,
+    /// so a second switch's paste replaced the first's kept file (or nested a directory in it).
+    /// Now each word is quoted by the real quoting (`ds_quote`, as [`shell_quote`]), the copy is
+    /// `<name>.kept-<UTC time>`, and the advice moves nothing once that name is taken: the same
+    /// paste again fails, the first copy and the new file both kept. A directory, pasted again once
+    /// made anew, isn't moved inside the kept copy either (review ai-review codex #4: `mv -n`
+    /// alone nested it, and FIX7's `-T` was GNU's alone, `mv -n` again where `mv` had none): run
+    /// for real, twice. The second paste says why it moved nothing (review claude #7, FIX9B: it
+    /// exited 1 with no output, as if it had moved something), the first says nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_suggested_move_pastes_as_it_is_and_never_replaces_a_kept_copy() {
+        let s = GitSandbox::new("discarded-move", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let name = "it's model.pt";
+        let staff = s.base.join("staff");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), staff.to_str().unwrap()]);
+        std::fs::write(staff.join(name), "the staff's\n").unwrap();
+        s.git(&staff, &["add", "-A"]);
+        s.git(&staff, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "staff"]);
+        s.git(&staff, &["push", "-q", "origin", "main"]);
+        std::fs::write(s.work.join(".git/info/exclude"), "*.pt\n").unwrap();
+        let (first, second) = (body("0123456789abcdef", 8 * 1024, 6), body("0123456789abcdef", 8 * 1024, 7));
+        std::fs::write(s.work.join(name), &first).unwrap();
+        let plain = std::env::var("PATH").unwrap_or_default();
+        let (code, out, err) = run_on_path(&checkout_command_limited(repo, "main", None, true, 1), &plain);
+        assert_ne!(code, Some(0), "{out}{err}");
+        let line = err.lines().find(|l| l.starts_with("arena set-branch: not reset — ")).unwrap_or_else(|| panic!("{err}"));
+        let (fix, kept_name) = suggested_move(line, repo, name);
+        let kept = s.base.join(&kept_name);
+        let pasted = |fix: &str| {
+            let o = s.run(fix);
+            (o.status.success(), String::from_utf8_lossy(&o.stderr).into_owned())
+        };
+        assert_eq!(pasted(&fix), (true, String::new()), "{fix}");
+        assert_eq!((std::fs::read_to_string(&kept).unwrap(), s.work.join(name).exists()), (first.clone(), false), "moved: {fix}");
+        // The same paste again, a new file there: refused, said, nothing replaced.
+        std::fs::write(s.work.join(name), &second).unwrap();
+        assert_eq!(pasted(&fix), (false, format!("not moved: ../{kept_name} exists\n")), "{fix}");
+        assert_eq!((std::fs::read_to_string(&kept).unwrap(), s.read(name)), (first.clone(), second.clone().into_bytes()), "{fix}");
+
+        // A directory (review ai-review codex #4): `mv -n` alone, pasted again once it was made
+        // anew, moved it inside the kept copy. Now the second paste refuses: nothing nested,
+        // nothing replaced, nothing moved.
+        let dir = "it's ckpts";
+        std::fs::remove_file(s.work.join(name)).unwrap();
+        std::fs::write(staff.join(dir), "the staff's\n").unwrap();
+        s.git(&staff, &["add", "-A"]);
+        s.git(&staff, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "staff's file where the pod has a directory"]);
+        s.git(&staff, &["push", "-q", "origin", "main"]);
+        std::fs::write(s.work.join(".git/info/exclude"), "*.pt\nit's ckpts/\n").unwrap();
+        std::fs::create_dir_all(s.work.join(dir)).unwrap();
+        std::fs::write(s.work.join(dir).join("model.pt"), &first).unwrap();
+        let (code, out, err) = run_on_path(&checkout_command_limited(repo, "main", None, true, 1), &plain);
+        assert_ne!(code, Some(0), "{out}{err}");
+        let line = err.lines().find(|l| l.starts_with("arena set-branch: not reset — ")).unwrap_or_else(|| panic!("{err}"));
+        let (fix, kept_name) = suggested_move(line, repo, dir);
+        let kept = s.base.join(&kept_name);
+        assert_eq!(pasted(&fix), (true, String::new()), "{fix}");
+        assert_eq!(std::fs::read_to_string(kept.join("model.pt")).unwrap(), first, "moved: {fix}");
+        std::fs::create_dir_all(s.work.join(dir)).unwrap();
+        std::fs::write(s.work.join(dir).join("model.pt"), &second).unwrap();
+        assert_eq!(pasted(&fix), (false, format!("not moved: ../{kept_name} exists\n")), "{fix}");
+        assert!(!kept.join(dir).exists(), "nested into the kept copy: {fix}");
+        assert_eq!((std::fs::read_to_string(kept.join("model.pt")).unwrap(), s.read(&format!("{dir}/model.pt"))), (first, second.into_bytes()));
+        assert_eq!(std::fs::read_dir(&kept).unwrap().count(), 1, "the kept copy as the first paste left it");
+    }
+
+    /// Review ai-review claude #4, to verify: could the gentle switch's refusal of a pod mid-merge
+    /// exit with the participant's real keys still set aside (the redacted placeholder left in
+    /// their code)? No: the refusal comes first, before anything is set aside — checked here. But a
+    /// switch that ended any other way between the set-aside and the putting back did leave them
+    /// set aside: the putting back was the command's last step. Now it is its EXIT trap, and a
+    /// hangup, interrupt or TERM (a dropped connection, a timeout's kill) is made an exit: a switch
+    /// killed mid-way puts them back too.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_or_killed_switch_never_leaves_the_real_keys_set_aside() {
+        let s = GitSandbox::new("keys-busy", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let ex = format!("KEY = \"{}\"\n", openrouter_key(22));
+        std::fs::write(s.work.join("ex.py"), &ex).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.redacted.len()), (Some(0), 1), "{err}");
+        let aside = s.work.join(".git/arena-unredacted");
+        // A conflicted pull of README.md; ex.py stays as it is, its real key on disk.
+        let course = s.base.join("course");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), course.to_str().unwrap()]);
+        std::fs::write(course.join("README.md"), "the course's version\n").unwrap();
+        s.git(&course, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-am", "upstream"]);
+        s.git(&s.work, &["remote", "add", "upstream", course.to_str().unwrap()]);
+        std::fs::write(s.work.join("README.md"), "the participant's version\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-m", "mine", "README.md"]);
+        git_failing(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
+        let o = s.run(&checkout_command(repo, "main", None, false));
+        assert_eq!(o.status.code(), Some(BACKUP_BUSY_EXIT), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.read("ex.py"), ex.as_bytes(), "the real key still in the file");
+        assert!(!aside.exists(), "nothing set aside");
+        s.git(&s.work, &["merge", "--abort"]);
+        assert_eq!(s.read("ex.py"), ex.as_bytes());
+
+        // Killed as the checkout starts (after the set-aside): a `git` that TERMs the command.
+        let bin = s.base.join("bin-kill");
+        std::fs::create_dir_all(&bin).unwrap();
+        crate::remote::write_test_script(
+            bin.join("git"),
+            format!(
+                "#!/bin/sh\ncase \"$*\" in *\" checkout main\" | \"checkout -f -B main origin/main\") kill -TERM \"$PPID\"; exit 1;; esac\nexec {} \"$@\"\n",
+                shell_quote(&real_git())
+            ),
+        )
+        .unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        for hard in [false, true] {
+            let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, hard), &path);
+            assert_eq!(code, Some(143), "hard={hard}: {out}{err}");
+            assert_eq!(s.read("ex.py"), ex.as_bytes(), "hard={hard}: the real key put back");
+            assert!(!aside.exists(), "hard={hard}");
+            assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "hard={hard}");
+        }
     }
 }

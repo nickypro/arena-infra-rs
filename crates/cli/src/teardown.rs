@@ -162,8 +162,9 @@ async fn collect(
     report
 }
 
-/// RunPod's network volumes: REST v2 on `RUNPOD_API=v2` (falling back to GraphQL once), else
-/// GraphQL. Bounded like a provider listing; any failure is "couldn't check", never "none".
+/// RunPod's network volumes: REST v2 by default (falling back to GraphQL once), GraphQL alone
+/// on `RUNPOD_API=v1` (REST v1 has no volumes route). Bounded like a provider listing; any
+/// failure is "couldn't check", never "none".
 async fn read_volumes(cfg: &Config) -> Probe<Vec<NetworkVolume>> {
     let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|k| !k.is_empty()) else {
         return Probe::Skipped("RunPod isn't configured (no RUNPOD_API_KEY) — not checked".into());
@@ -606,7 +607,7 @@ mod tests {
         assert_eq!(exit, Ok(()), "{}", report.render());
         assert_eq!(report.items, baseline.items, "the reaper's files are no item");
         // Its cron line: an arena line, remaining, cleared by `arena cron remove`.
-        let reap_line = arena_core::reap::render::cron_line(false, "/usr/local/bin/arena", "/c", "/h", &[]);
+        let reap_line = arena_core::reap::render::cron_line(false, "/usr/local/bin/arena", "/c", "/h", None, &[]);
         let tab = format!("{CRON_BEGIN}\n{reap_line}\n{CRON_END}\n");
         let sched = FakeSched::with(&[("crontab -l", ran(&tab)), ("atq", ran(""))]);
         let (report, exit) = check(&fleet, &cfg, Probe::Got(vec![]), None, &sched).await;

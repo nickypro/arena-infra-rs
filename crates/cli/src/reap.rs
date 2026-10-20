@@ -456,10 +456,24 @@ pub(crate) fn create_flags_refusal(cfg: &Config, provider: &str) -> Option<Strin
     (!judge::provider_supported(&probe, runpod_v2(cfg))).then(|| {
         format!(
             "refusing --expire-in/--expire-at/--idle-after: pods on {} are never reaped — the reaper only acts on RunPod \
-             (RUNPOD_API=v2) and Hetzner pods; nothing was created",
-            if provider == "runpod" { "RunPod REST v1" } else { provider }
+             ({ONLY_ON}) and Hetzner pods{}; nothing was created",
+            if provider == "runpod" { "RunPod REST v1" } else { provider },
+            v1_remedy(provider)
         )
     })
+}
+
+/// The RunPod the reaper acts on, as its refusals word it (a RunPod pod's refusal then says
+/// v2 is the default — [`v1_remedy`]).
+const ONLY_ON: &str = "REST v2";
+
+/// What a refusal adds for a RunPod pod: it is on v1 only because the config says so.
+fn v1_remedy(provider: &str) -> String {
+    if provider == "runpod" {
+        format!(" — {}", arena_core::provider::RUNPOD_V1_REMEDY)
+    } else {
+        String::new()
+    }
 }
 
 /// Record `policy` for a pod the moment its create returned (`up`/`create`, `--check`
@@ -509,12 +523,38 @@ fn never_reaped(pod: &Pod, all: &[Pod], naming: &Naming, runpod_v2: bool) -> Opt
     }
     if !judge::provider_supported(pod, runpod_v2) {
         return Some(format!(
-            "{} is on {} — the reaper only acts on RunPod (RUNPOD_API=v2) and Hetzner pods",
+            "{} is on {} — the reaper only acts on RunPod ({ONLY_ON}) and Hetzner pods{}",
             pod.name,
-            if pod.provider == "runpod" { "RunPod REST v1" } else { &pod.provider }
+            if pod.provider == "runpod" { "RunPod REST v1" } else { &pod.provider },
+            v1_remedy(&pod.provider)
         ));
     }
     None
+}
+
+/// When RunPod's REST v2 became the default ([`runpod_reapable_note`]).
+const RUNPOD_V2_DEFAULT_SINCE: &str = "70bce78, 2026-10-19";
+
+/// Review ai-review claude #1: RunPod's REST v2 became the default ([`RUNPOD_V2_DEFAULT_SINCE`]).
+/// Before, a config without `RUNPOD_API` ran v1, on which no RunPod pod is ever reaped (no lock
+/// state); the same config is v2 now, so a RunPod pod with a policy can be. Nothing acts by itself
+/// — `--apply` still needs `REAP_ENABLED=1` in the config file — but an operator who turns the
+/// reaper on after this release gets RunPod pods reapable without having chosen v2. So `reap
+/// status` and the plan say so, in this line, whenever a RunPod pod has a policy and RunPod is on
+/// v2. Words only: what is reaped doesn't change. `None` on v1, or with no RunPod policy.
+pub(crate) fn runpod_reapable_note<'a>(cfg: &Config, providers: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    if !runpod_v2(cfg) || !providers.into_iter().any(|p| p == "runpod") {
+        return None;
+    }
+    let chosen = if cfg.get("RUNPOD_API").is_some_and(|v| !v.trim().is_empty()) {
+        "RUNPOD_API=v2".to_string()
+    } else {
+        format!("the default since {RUNPOD_V2_DEFAULT_SINCE}: no RUNPOD_API line chose it")
+    };
+    Some(format!(
+        "RunPod: REST v2 ({chosen}) — RunPod pods with a policy can be reaped: terminated, container disk and all, after \
+         their backup (on RUNPOD_API=v1 none ever was)"
+    ))
 }
 
 fn runpod_v2(cfg: &Config) -> bool {
@@ -866,6 +906,9 @@ fn handle_status(env: &ReapEnv<'_>, sel: &Select, json: bool) -> Result<()> {
     if let Some(h) = &state.hold {
         (env.out)(&format!("ON HOLD since {} ({}): {}", render::fmt_local(h.set_at, env.tz), if h.auto { "automatic" } else { "operator" }, h.reason));
     }
+    if let Some(note) = runpod_reapable_note(env.cfg, state.pods.values().map(|p| p.provider.as_str())) {
+        (env.out)(&note);
+    }
     let rows: Vec<Vec<String>> = state
         .pods
         .values()
@@ -986,6 +1029,9 @@ struct RunCtx<'a, 'b> {
     notes: std::sync::Mutex<Vec<String>>,
     /// Notifications to send: (pod key or None for run-level, kind, line).
     notify: std::sync::Mutex<Vec<(Option<String>, NotifyKind, String)>>,
+    /// The plan's WHY for an acted-on pod, by key, where its row's own words would say less
+    /// (a git step that found a merge in progress: [`render::git_busy_why`]).
+    whys: std::sync::Mutex<BTreeMap<String, String>>,
     attention: std::sync::atomic::AtomicBool,
 }
 
@@ -1110,15 +1156,18 @@ async fn notify_one(cmd: Option<&str>, line: &str) {
 /// Take a pod's backup lock without waiting (beyond [`store::LOCK_GRACE`]): `Ok(Some(lock))`;
 /// `Err(())` busy. With no usable lock dir (or a lock file that can't be opened) there's no
 /// lock to take: `Ok(None)` — the probe goes ahead (the reap's backup doesn't: it needs one).
-async fn try_pod_lock(lock_dir: Option<&str>, pod: &str) -> std::result::Result<Option<std::fs::File>, ()> {
+async fn try_pod_lock(lock_dir: Option<&str>, pod: &str) -> std::result::Result<Option<arena_core::pull::PodLock>, ()> {
     let Some(dir) = lock_dir else { return Ok(None) };
-    let Ok(f) = arena_core::pull::open_pod_lock(dir, pod) else { return Ok(None) };
+    let Ok(mut f) = arena_core::pull::open_pod_lock(dir, pod) else { return Ok(None) };
     let deadline = tokio::time::Instant::now() + store::LOCK_GRACE;
     loop {
-        match arena_core::pull::try_lock(&f) {
-            Ok(true) => return Ok(Some(f)),
-            Ok(false) if tokio::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(50)).await,
-            Ok(false) => return Err(()),
+        match arena_core::pull::try_lock(f) {
+            Ok(Ok(lock)) => return Ok(Some(lock)),
+            Ok(Err(back)) if tokio::time::Instant::now() < deadline => {
+                f = back;
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            Ok(Err(_)) => return Err(()),
             Err(_) => return Ok(None),
         }
     }
@@ -1312,6 +1361,7 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
         log: Default::default(),
         notes: Default::default(),
         notify: Default::default(),
+        whys: Default::default(),
         attention: Default::default(),
     };
     if let Some(d) = &demoted {
@@ -1623,6 +1673,7 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
 
     // 13: the table.
     let final_state = store.load().unwrap_or(state);
+    let whys = std::mem::take(&mut *ctx.whys.lock().unwrap());
     let mut rows: Vec<PlanRow> = Vec::new();
     for (k, d) in &decided {
         let row = outcomes.get(k).copied().unwrap_or(d.row);
@@ -1636,12 +1687,15 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
             state: render::state_label(pol, row, now),
             row,
             next: render::next_label(row).to_string(),
-            why: render::why_label(row, &reasons),
+            why: whys.get(k).cloned().unwrap_or_else(|| render::why_label(row, &reasons)),
         });
     }
     let mut footer: Vec<String> = std::mem::take(&mut *ctx.notes.lock().unwrap());
     if unpoliced > 0 {
         footer.push(format!("{unpoliced} cohort pod(s) without a reap policy (never probed)"));
+    }
+    if let Some(note) = runpod_reapable_note(cfg, final_state.pods.values().map(|p| p.provider.as_str())) {
+        footer.push(note);
     }
     let header = PlanHeader {
         now,
@@ -1908,6 +1962,15 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
     let backup_proof = match BackupProof::check(&ev) {
         Ok(b) => b,
         Err(f) => {
+            // A git step that stopped because an operation is in progress on the pod (`BUSY`):
+            // said as what it is and how to end it (review fb2 F1). Only the words: the row, the
+            // retry and the backoff stay the git step's.
+            let busy = match (f.row, ev.git.as_ref()) {
+                (Row::GitFailed, Some(StepEnd::Exit { code, stdout })) => {
+                    render::GitBusy::of(&arena_core::backup::parse_backup_report(stdout), *code)
+                }
+                _ => None,
+            };
             let (retry, obs) = match f.row {
                 // A failed freeze too (R2-3): it would fail the same way next tick, after the
                 // pod's whole backup again and another write-ahead against the daily cap.
@@ -1933,7 +1996,13 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
                     ctx.queue(Some(&key), NotifyKind::FreezeFailed, Some(&name), "the verified backup couldn't be frozen into reaped/ — not reaped; retried in 6h");
                     ctx.attention();
                 }
-                Row::GitFailed => ctx.queue(Some(&key), NotifyKind::GitFailed, Some(&name), "the reap's git backup failed — not reaped; retried in 6h"),
+                Row::GitFailed => match &busy {
+                    Some(b) => {
+                        ctx.queue(Some(&key), NotifyKind::GitFailed, Some(&name), &render::git_busy_notice(b));
+                        ctx.whys.lock().unwrap().insert(key.clone(), render::git_busy_why(b));
+                    }
+                    None => ctx.queue(Some(&key), NotifyKind::GitFailed, Some(&name), "the reap's git backup failed — not reaped; retried in 6h"),
+                },
                 Row::RsyncFailed => ctx.queue(Some(&key), NotifyKind::RsyncFailed, Some(&name), "the reap's file backup failed — not reaped; retried in 6h"),
                 Row::DestUnhealthy => ctx.queue(None, NotifyKind::DestUnhealthy, Some(&name), "backup destination unhealthy at the reap's backup"),
                 _ => {}
@@ -2576,13 +2645,26 @@ pub(crate) fn readiness_rows_for(cfg: &Config, rsync: &str, full: bool) -> (Vec<
         Err(e) if is_invalid_state_dir(&e) => row(Some(false), "state (ARENA_STATE_DIR)", e, Gap::Invalid(Some("ARENA_STATE_DIR (explicit, absolute)"))),
         Err(e) => row(Some(false), "state (ARENA_STATE_DIR)", e, Gap::Blocks("ARENA_STATE_DIR (explicit, absolute)")),
     }
-    let v2 = runpod_v2(cfg);
-    row(
-        Some(v2),
-        "RUNPOD_API",
-        if v2 { "v2 — RunPod pods report their lock".into() } else { "reaper needs RUNPOD_API=v2 (on v1 no RunPod pod is ever reaped)".into() },
-        Gap::None,
-    );
+    let (v2, detail) = match arena_core::provider::RunpodApi::from_config(cfg) {
+        Ok(arena_core::provider::RunpodApi::V2) => (
+            true,
+            format!(
+                "v2 — RunPod pods report their lock, so one with a policy can be reaped{} (on v1 none ever was)",
+                if cfg.get("RUNPOD_API").is_some_and(|v| !v.trim().is_empty()) {
+                    String::new()
+                } else {
+                    format!(" (the default since {RUNPOD_V2_DEFAULT_SINCE})")
+                }
+            ),
+        ),
+        Ok(arena_core::provider::RunpodApi::V1) => (
+            false,
+            format!("v1 — no RunPod pod is ever reaped (the reaper needs REST v2): {}", arena_core::provider::RUNPOD_V1_REMEDY),
+        ),
+        // Its own ✗ row (`config check`'s RunPod section) says what's wrong with it.
+        Err(_) => (false, "invalid — no RunPod pod is ever reaped (the reaper needs REST v2, the default)".to_string()),
+    };
+    row(Some(v2), "RUNPOD_API", detail, Gap::None);
     let snap = cfg.get("LOCAL_BACKUP_DIR").map(str::trim).filter(|d| !d.is_empty()).unwrap_or("./backup").to_string();
     let big = arena_core::pull::big_root(&snap, cfg.get("LOCAL_BACKUP_BIG_DIR"));
     for (root, tier) in [(snap.clone(), arena_core::pull::Tier::Snapshot), (big, arena_core::pull::Tier::Big)] {

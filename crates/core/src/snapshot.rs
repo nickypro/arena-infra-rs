@@ -1637,7 +1637,7 @@ mod tests {
     fn only_definite_machine_evidence_is_remembered() {
         let p = Pod { machine_id: Some("m8x2k".into()), ..at(pod("devtest-apple", "runpod", "rp1"), "70.167.32.130", 40100) };
         let floor_590 = crate::health::HealthPolicy {
-            min_driver: Some(crate::health::DriverFloor { version: vec![590], why: "CUDA 13.1".into() }),
+            min_driver: Some(crate::health::DriverFloor { version: vec![590], why: "CUDA 13.1".into(), cuda: Some("13.1".into()) }),
             ..crate::health::HealthPolicy::default()
         };
         let default = crate::health::HealthPolicy::default();
@@ -1656,6 +1656,9 @@ mod tests {
             ("cuInit 999", cuda_fail("error: RuntimeError: Unexpected error from cudaGetDeviceCount(). Error 999: unknown error"), &default, true),
             ("nvidia-smi error", DeepFacts { smi: Some("error: Unable to determine the device handle for GPU0000:01:00.0: Unknown Error".into()), gpus: vec![], smi_gpus: None, ..one() }, &default, true),
             ("nvidia-smi lists no GPU", DeepFacts { gpus: vec![], smi_gpus: Some(0), ..one() }, &default, true),
+            // Review of 27adfe4..db8dff8, #1: an 8-GPU pod with one fallen off the bus — the query
+            // fails, torch enumerates the 7 survivors and every op on them passes.
+            ("a GPU off the bus: query error, torch sees 7", DeepFacts { smi_query: Some("error: Unable to determine the device handle for GPU 0000:41:00.0: Unknown Error".into()), gpus: vec![], smi_gpus: None, ..healthy_facts(7) }, &default, true),
             ("count mismatch", DeepFacts { device_count: Some(1), tensor: [(0, "ok".to_string())].into(), ..two() }, &default, true),
             ("wrong result", DeepFacts { tensor: [(0, "wrong result: matmul is not finite".to_string())].into(), ..one() }, &default, true),
             ("tensor CUDA error", DeepFacts { tensor: [(0, "error: RuntimeError: CUDA error: an illegal memory access was encountered".to_string())].into(), ..one() }, &default, true),
@@ -1679,6 +1682,16 @@ mod tests {
             }
             assert_eq!(bad_host_record(&p, &h, NOW).is_some(), remembered, "{what}: {:#?}", h.checks);
         }
+        // nvidia-smi failing while torch proves the GPUs work: on a MIG slice (the provider says
+        // so) health's fallback PASSes it, so nothing to remember; on a whole card it is the
+        // nvidia-smi error above, remembered.
+        let smi_error_torch_ok = DeepFacts { smi: Some("error: Failed to initialize NVML: Unknown Error".into()), gpus: vec![], smi_gpus: None, ..one() };
+        let slice = Pod { gpu_type: Some("A100 MIG 1g.5gb".into()), ..p.clone() };
+        let h = crate::health::PodHealth::checked(&slice, smi_error_torch_ok.clone(), &default);
+        let smi = h.checks.iter().find(|c| c.name == "nvidia-smi").map(|c| c.status);
+        assert_eq!((smi, h.status == Status::Fail, bad_host_record(&slice, &h, NOW).is_some()), (Some(Status::Pass), false, false), "{:#?}", h.checks);
+        let h = crate::health::PodHealth::checked(&p, smi_error_torch_ok, &default);
+        assert_eq!((h.status, bad_host_record(&p, &h, NOW).is_some()), (Status::Fail, true), "{:#?}", h.checks);
     }
 
     /// Review G1: a later complete check that doesn't FAIL clears its machine's record — on
@@ -1819,11 +1832,17 @@ mod tests {
             py_done: true,
             ..Default::default()
         };
-        for (what, facts) in [("nvidia-smi timed out", smi_timeout), ("python timed out", py_timeout)] {
+        for (what, facts) in [("nvidia-smi timed out", smi_timeout.clone()), ("python timed out", py_timeout)] {
             let h = PodHealth::checked(&runpod, facts, &policy);
             assert_eq!((h.status, h.failure_kind()), (Status::Fail, Some(FailureKind::Host)), "{what}: {:#?}", h.checks);
             assert_eq!(bad_host_record(&runpod, &h, NOW), None, "{what}: a timeout is remembered for 72 h: {:#?}", h.checks);
         }
+        // On a MIG slice, torch proving the GPU works stands in for nvidia-smi (health's MIG
+        // fallback): no FAIL — so certainly not remembered.
+        let slice = Pod { gpu_type: Some("B300 MIG 34GB".into()), ..runpod.clone() };
+        let h = PodHealth::checked(&slice, smi_timeout, &policy);
+        let smi = h.checks.iter().find(|c| c.name == "nvidia-smi").map(|c| c.status);
+        assert_eq!((smi, h.status == Status::Fail, bad_host_record(&slice, &h, NOW)), (Some(Status::Pass), false, None), "{:#?}", h.checks);
     }
 
     /// Remembered for [`BAD_HOST_TTL_SECS`], then forgotten — and a record from the future

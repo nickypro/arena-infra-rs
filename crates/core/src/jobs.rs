@@ -1370,15 +1370,17 @@ mod tests {
             let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
             let pod = LocalPod { dir, home, bin, path };
             pod.stub("zsh", "[ \"$1\" = -c ] && shift\nexec bash -c \"$1\"");
+            // The jobs' `conda activate` is the pod's business: a CI runner's own conda (if its
+            // PATH has one) must never run here — it can take its time (the first job once sat
+            // 30 s in CI before printing a line, on some runs only).
+            pod.stub("conda", "exit 0");
             Some(pod)
         }
 
         /// An executable `name` on the pod's PATH, ahead of the real one.
         fn stub(&self, name: &str, body: &str) {
-            use std::os::unix::fs::PermissionsExt;
             let f = self.bin.join(name);
-            std::fs::write(&f, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(&f, format!("#!/bin/sh\n{body}\n")).unwrap();
         }
 
         /// What sshd does with a remote command: hand it to the login shell's `-c`.
@@ -1430,10 +1432,20 @@ mod tests {
                     s += &format!("\n  {}/{}: {body}", d.file_name().to_string_lossy(), f.file_name().to_string_lossy());
                 }
             }
-            let ps = std::process::Command::new("ps").args(["-eo", "pid,ppid,sid,stat,etime,args"]).output();
+            // Every process of a job's session (its pid is the session's id), whatever it runs —
+            // with what it sleeps on — so a hang names the child it waits for.
+            let sessions: Vec<String> = std::fs::read_dir(self.home.join(JOBS_DIR))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|d| std::fs::read_to_string(d.path().join("pid")).ok())
+                .map(|p| p.trim().to_string())
+                .collect();
+            let ps = std::process::Command::new("ps").args(["-eo", "pid,ppid,sid,stat,etime,wchan:24,args"]).output();
             let mine = self.dir.display().to_string();
             for l in ps.iter().flat_map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_owned).collect::<Vec<_>>()) {
-                if l.contains(&mine) || l.contains("bash -c") {
+                let sid = l.split_whitespace().nth(2).unwrap_or_default();
+                if l.contains(&mine) || l.contains("bash -c") || sessions.iter().any(|p| p == sid) {
                     s += &format!("\n  ps: {l}");
                 }
             }

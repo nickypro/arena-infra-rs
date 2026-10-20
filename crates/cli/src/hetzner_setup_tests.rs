@@ -21,13 +21,13 @@ impl Drop for Tmp {
 /// `$UV_INSTALL_EXIT` (default 0) and, when `$UV_INSTALL_MAKES_TORCH` is set, "installs" torch;
 /// its `--help` lists `--torch-backend` unless `$UV_OLD` is set (an older uv). `git` logs its argv
 /// to `$STUBS/git.log`; every clone "fails" (nothing is fetched), `remote get-url origin`
-/// answers `$GIT_ORIGIN` (none when unset) and `remote set-url` works.
+/// answers `$GIT_ORIGIN` (none when unset) and `remote set-url` works; `remote get-url upstream`
+/// answers `$GIT_UPSTREAM` (none when unset) and `remote add upstream` works unless
+/// `$GIT_ADD_FAILS` is set.
 fn install_stubs(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
     let stub = |name: &str, body: &str| {
         let p = dir.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        arena_core::remote::write_test_script(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
     };
     for quiet in ["apt-get", "systemctl", "chsh", "ssh-keyscan"] {
         stub(quiet, "exit 0");
@@ -42,6 +42,8 @@ echo "git $*" >> "$S/git.log"
 case "$*" in
   *"remote get-url origin") [ -n "${GIT_ORIGIN:-}" ] && { echo "$GIT_ORIGIN"; exit 0; }; exit 2;;
   *"remote set-url origin "*) exit 0;;
+  *"remote get-url upstream") [ -n "${GIT_UPSTREAM:-}" ] && { echo "$GIT_UPSTREAM"; exit 0; }; exit 2;;
+  *"remote add upstream "*) [ -n "${GIT_ADD_FAILS:-}" ] && exit 3; exit 0;;
 esac
 exit 1"#,
     );
@@ -390,4 +392,36 @@ fn the_configured_repo_is_cloned_or_followed_and_never_guessed() {
     std::fs::write(stubs.join("git.log"), "").unwrap();
     let r = run(&stubs, &home, &repo, &[("REPO_URL", url), ("GIT_ORIGIN", url)]);
     assert!(r.ok && !r.git_log.contains("set-url") && !r.stdout.contains("origin: "), "{}\n{}", r.git_log, r.stdout);
+}
+
+/// The human (2026-10-19): with origin the cohort's repo, the public course repo as `upstream`
+/// too. Added (and said) when the checkout has none; one already there — a participant's own, an
+/// earlier setup's — left alone; nothing without `UPSTREAM_URL` (`ARENA_UPSTREAM_REPO=none`); and a
+/// failed add is a warning, never a failed setup.
+#[test]
+fn the_public_course_repo_becomes_upstream_when_the_checkout_has_none() {
+    let (_t, stubs, home, repo) = setup("course-repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let url = "git@github.com:o/r.git";
+    let up = "https://github.com/ARENA-education/ARENA_materials.git";
+    let base = [("REPO_URL", url), ("GIT_ORIGIN", url), ("UV_INSTALL_MAKES_TORCH", "1")];
+    let with = |extra: &[(&str, &str)]| {
+        std::fs::write(stubs.join("git.log"), "").unwrap();
+        run(&stubs, &home, &repo, &[&base[..], extra].concat())
+    };
+    let r = with(&[("UPSTREAM_URL", up)]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(r.git_log.lines().any(|l| l == format!("git -C {} remote add upstream {up}", repo.display())), "{}", r.git_log);
+    assert!(r.stdout.lines().any(|l| l == format!("upstream: {up}")), "{}", r.stdout);
+    let default_remote = format!("git -C {} config checkout.defaultRemote origin", repo.display());
+    assert!(r.git_log.lines().any(|l| l == default_remote), "{}", r.git_log);
+    let r = with(&[("UPSTREAM_URL", up), ("GIT_UPSTREAM", "https://github.com/someone/fork.git")]);
+    assert!(r.ok && !r.git_log.contains("remote add") && !r.stdout.contains("upstream: "), "{}\n{}", r.git_log, r.stdout);
+    let r = with(&[]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(!r.git_log.contains("remote get-url upstream") && !r.git_log.contains("remote add upstream"), "{}", r.git_log);
+    let r = with(&[("UPSTREAM_URL", up), ("GIT_ADD_FAILS", "1")]);
+    assert!(r.ok, "{}", r.stderr);
+    // On the pod's line: setup shows its `arena-warning:` lines (review fb2 R4).
+    assert!(r.stdout.lines().any(|l| l == format!("arena-warning: couldn't add the upstream remote {up}")), "{}", r.stdout);
 }

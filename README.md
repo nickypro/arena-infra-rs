@@ -18,11 +18,16 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     the legacy bash/python scripts.
   - `provider::Provider` — the single trait every backend implements.
   - `provider::runpod` — RunPod REST **v1** backend: list / create / stop / terminate.
-    RunPod retires REST v1 on **2026-11-15**.
-  - `provider::runpod_v2` — RunPod REST **v2** backend (`api.runpod.io/v2`), opt-in via
-    `RUNPOD_API=v2` (default `v1`; any other value is an error, which quotes the value only
-    if it's short and version-like — never a pasted key; `config check` shows which is
-    active). Same provider name and commands. Differences: real lifecycle statuses
+    RunPod retires REST v1 on **2026-11-15**; used only with an explicit `RUNPOD_API=v1`
+    (which `config check` warns about, with the date and `remove RUNPOD_API=v1 (v2 is the
+    default)`).
+  - `provider::runpod_v2` — RunPod REST **v2** backend (`api.runpod.io/v2`), the **default**:
+    `RUNPOD_API` unset or empty means v2 (`v1`/`v2` in any case select one; any other value
+    is an error, which quotes the value only if it's short and version-like — never a
+    pasted key; `config check` shows which is active, `(default)` when unset). Why the
+    default: v1 retires on 2026-11-15, and v1 can only ask for hosts on CUDA ≤ 13.0 (below),
+    which starved RunPod placement — "no capacity" all day once the 13.0 hosts were taken.
+    Same provider name and commands. Differences: real lifecycle statuses
     (`PROVISIONING`/`STARTING`/`RUNNING`/`EXITED`/`ERROR`); the SSH endpoint comes from
     `ssh.direct` only; create always sends `cloud` (v2 defaults to SECURE) and merges the
     account's registered SSH keys into `PUBLIC_KEY` (v2 skips them when it's set);
@@ -47,7 +52,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     qualifies (an exact `["13.0"]` had made every 13.1/13.2 host — all B300 MIG ones — "no
     capacity"). REST v1 has no floor and its schema stops at 13.0: it sends every listed
     version ≥ the floor (13.1+ hosts unreachable; a 13.1+ floor or `EXACT_CUDA_VERSIONS`
-    entry is refused before the request, naming `RUNPOD_API=v2`). `EXACT_CUDA_VERSIONS` is
+    entry is refused before the request: `remove RUNPOD_API=v1 (v2 is the default)`). `EXACT_CUDA_VERSIONS` is
     the opt-in exact set (`allowedCudaVersions`; never sent with a floor). A value that isn't
     a version (`13.x`, `newest`) fails closed everywhere — every create (RunPod and Vast) is
     refused and the deep check won't derive a driver floor from it — never read as "no floor".
@@ -204,15 +209,16 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     nudge when unknown; an opt-in account — Shadeform, never in the default provider chain —
     at $0 with nothing billing there reads plainly, `shadeform $0.00 live unfunded`: it's
     unfunded on purpose, and alarms like any other once a pod bills there), observed while the list runs — within 5 s, a live read only when
-    the last one is 5 min old, silent whatever happens; `--json` reads no balance at all. GPU/$/maintenance come from one extra read-only
-    RunPod GraphQL query per `list` (on `RUNPOD_API=v2` the REST list already has GPU and $,
-    so GraphQL adds only maintenance) (best-effort: if it fails you get one warning line and
+    the last one is 5 min old, silent whatever happens; `--json` reads no balance at all. The maintenance window comes from one extra read-only
+    RunPod GraphQL query per `list` (on REST v2, the default, the REST list already has GPU and
+    $; on `RUNPOD_API=v1` that query supplies them too) (best-effort: if it fails you get one warning line and
     the list still renders); the `nvidia-smi` probe over SSH (default for the table,
     `--probe`/`--no-probe`) overrides the GPU when a pod answers. `list --json` emits the
     pods incl. `gpu_count`/`cost_per_hr`/`maintenance`. **`restart` WIPES a RunPod pod's
-    container disk** (live finding: on `RUNPOD_API=v2` the container is reset to its image —
-    everything outside a `/workspace` volume, `~/.name`, setup's git remote and keys are gone;
-    a v1 restart was seen keeping it, so on v1 it is gated and set up again the same way, but
+    container disk** (live finding: on REST v2 — the default — the container is reset to its
+    image — everything outside a `/workspace` volume, `~/.name`, setup's git remote and keys
+    are gone, so only `VOLUME_GB` keeps work across a restart;
+    a v1 restart (`RUNPOD_API=v1`) was seen keeping it, so on v1 it is gated and set up again the same way, but
     the output only ever says it *may* have reset; Vast's stop+start is treated the same,
     unverified; a Hetzner hard reset keeps the VM disk). The
     prompt says what's lost and what survives (the volume size comes from the pod's spec);
@@ -274,12 +280,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     name that already has its own row or key is left alone and warned about), then syncs
     the proxy. The pod's `MACHINE_NAME` env var keeps the old name (env only changes with a
     reimage) — the output says so. `--dry-run` lists every step.
-  - `pods lock [targets]` / `pods unlock [targets]` (targets or `--all`; RunPod with
-    `RUNPOD_API=v2`) — a **locked** pod is refused stop, restart and terminate by RunPod
+  - `pods lock [targets]` / `pods unlock [targets]` (targets or `--all`; RunPod on REST v2,
+    the default) — a **locked** pod is refused stop, restart and terminate by RunPod
     itself, from **any** client (this tool, scripts, RunPod's web console; live-verified
     2026-10-08) — the protection for a running cohort. Setup, backups, `run` and SSH are
     unaffected. Already-locked pods are left alone; a pod on a backend that can't lock
-    (v1, Vast, Hetzner) is reported (`not supported — … RUNPOD_API=v2`) and makes the exit
+    (`RUNPOD_API=v1`, Vast, Hetzner) is reported (`not supported on … — …`; on v1 `remove
+    RUNPOD_API=v1 (v2 is the default) to lock RunPod pods`) and makes the exit
     non-zero. `pods up --lock` locks each pod as the pipeline's **last** step (after
     `--check`, whose replacement needs to terminate; a lock that fails is `FAILED lock`, the
     pod left running, unlocked); `--lock` is refused up front where pods can't be locked.
@@ -343,16 +350,17 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (`RTX PRO 6000`, `B300 MIG 34GB` — checked before the aliases, so `RTX PRO 6000` is the
     Server Edition, as listed), an alias (`3070`, `4080super`, `L4`, `2000ada`, `A4500`, …)
     or a unique catalog short name (`RTX 3070`, `H100 SXM`) — must be in RunPod's
-    live GPU catalog (GraphQL on v1, `GET /v2/catalog/gpus` on `RUNPOD_API=v2`), else the
+    live GPU catalog (`GET /v2/catalog/gpus` on v2, the default; GraphQL on `RUNPOD_API=v1`), else the
     command stops before anything is created: ``--gpu: `3070x`
     isn't a RunPod GPU type — did you mean `NVIDIA GeForce RTX 3070` (RTX 3070)?``. If the
     catalog can't be fetched it warns and passes the flag through unchecked. On REST v1 an
     id outside v1's create enum (it lags the catalog — the PRO 6000 MIG slices) is refused
-    too, pointing at `RUNPOD_API=v2`. Vast/Hetzner: passed through as before.
+    too, saying v2's create takes it: `remove RUNPOD_API=v1 (v2 is the default)`. Vast/Hetzner:
+    passed through as before.
   - **Multi-option placement** (`create`/`up`): `--gpu A4000,4000Ada,3090 --cloud
     community,secure --max-price 0.5 [--order cheapest|listed]`. The gpu × cloud options
-    are priced (RunPod's live catalog — v2 `/catalog/gpus` per tier on `RUNPOD_API=v2`, once
-    per tier per run, GraphQL on v1 — falling back to preset estimates, shown `~`), capped
+    are priced (RunPod's live catalog — v2 `/catalog/gpus` per tier (the default), once
+    per tier per run, GraphQL on `RUNPOD_API=v1` — falling back to preset estimates, shown `~`), capped
     per pod (price × `--gpus`; with a cap an option with no known price is dropped, not
     risked) and ordered: `cheapest`
     (default; a price tie goes to the better stock hint, then the listed order) or `listed`
@@ -422,10 +430,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     terminated (even with no attempt left). A host FAIL on a machine the provider names
     (RunPod/Vast machine id — never an IP) is also **remembered for 72 h** in the health cache
     — but only for definite, machine-level evidence: a CUDA/driver error from torch while
-    nvidia-smi lists the GPU, an nvidia-smi error or missing GPUs, a GPU count mismatch, a
-    wrong result (NaN matmul, garbage peer copy). Never a timeout (python's 75 s, nvidia-smi's
-    10 s, NCCL), python dying before it reported, a driver below the floor, or NCCL: those
-    still replace the pod in that run, and are forgotten with it. Any pod that lands on a
+    nvidia-smi lists the GPU, an nvidia-smi error or missing GPUs, a GPU count mismatch
+    between torch and nvidia-smi, a wrong result (NaN matmul, garbage peer copy). Never a
+    timeout (python's 75 s, nvidia-smi's 10 s, NCCL), python dying before it reported, a
+    driver below the floor, NCCL, or fewer GPUs than the provider's count where nvidia-smi
+    agrees with torch or can't count (one wrong provider field would ban machines
+    fleet-wide): those still replace the pod in that run, and are forgotten with it. Any pod that lands on a
     remembered machine later — another name's first pod, or any pod of a later `up` — is
     turned away the same way before setup (`landed on runpod machine …, which failed the deep
     check 3h ago (<UTC time>, <pod>: cuda: …) — rejecting it`; the summary says so too);
@@ -521,18 +531,49 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (and `--no-pull`, `--no-start-date`) imply `--backup`, and a bare `cron install` means
     `--backup`. Rewriting the backup line **keeps the installed one's `--pull`, start date and
     schedule** unless a flag changes them (`--no-pull` / `--no-start-date` drop one; a note
-    says what was kept), so `cron install --backup` just upgrades the line; `--proxy` = a `*/5 … proxy
-    apply --yes` line (log `~/arena-proxy-cron.log`; a `PATH` with `/usr/sbin` so cron finds
+    says what was kept), so `cron install --backup` just upgrades the line — a start date it
+    can't read back (a hand edit's `cd /root && ARENA_START_DATE=…`) is the one thing dropped,
+    with a note (`--start-date` sets it again); `--proxy` = a `*/5 … proxy
+    apply --yes` line (log `proxy.log`; a `PATH` with `/usr/sbin` so cron finds
     nginx) that catches changes made outside the CLI (dashboard terminates, restarts that
     move an endpoint) — remove it before changing `MACHINE_NAME_PREFIX`/`_LIST`: a name that
     leaves the list loses its forward on the next tick; `--snapshot <DIR>` = a `*/2 …
-    snapshot --public --out <DIR>/fleet.json` line (log `~/arena-snapshot-cron.log`) for the
+    snapshot --public --out <DIR>/fleet.json` line (log `snapshot.log`) for the
     [fleet page](#publishing-the-fleet-page); `--archive` = the [backup archive](#backup-archive-arena-archive)'s
     two push lines (`archive sync --tier snap` at :07/:22/:37/:52, `--tier big` at :40, under
-    `nice`, log `~/arena-archive-cron.log`, each tier locked in-process; refused without this
+    `nice`, log `archive.log`, each tier locked in-process; refused without this
     user's archive state, an absolute `LOCAL_BACKUP_DIR` or a start date). Every line runs under `flock -n` (a tick that
     finds the previous one still running exits instead of stacking — the backup's lock is
-    `~/.arena-backup-cron.lock`, held by `flock -o` itself so no stray rsync can keep it).
+    `backup.lock`, held by `flock -o` itself so no stray rsync can keep it). **Locks live in
+    `~/.local/state/arena-cron/`** (`backup.lock`, `proxy.lock`, …), **and so do the logs by
+    default** (`backup.log`, `proxy.log`, `snapshot.log`, `archive.log`, `reap.log`), so nothing
+    new appears in your home. **A line that already logs somewhere else keeps doing so**: a
+    re-install keeps the installed line's `>> PATH` (say `/root/logs/cron/arena-cron.log`, a
+    folder logrotate rotates; `>>PATH`, with or without `2>&1`, too) — only arena's own old
+    defaults move. A line whose log it can't read (`> PATH`, `2>>ERR`, a comment after it, a
+    quoted path with a space) gets the default log, and a note names that line's redirection. Every line starts with
+    `mkdir -p` of the cron folder and of a kept log's folder: cron's `sh` doesn't run a command
+    whose `>>` (or lock) points into a missing directory, so a deleted folder would otherwise
+    silently stop the backups. arena doesn't rotate its logs: add a logrotate rule for whichever
+    folder your lines log to (e.g. `/root/.local/state/arena-cron/*.log { weekly rotate 4
+    compress missingok notifempty copytruncate }` — `copytruncate`, since each line holds its
+    log open with `>>`). Older versions logged and locked directly in the home
+    (`~/arena-cron.log`, `~/arena-<line>-cron.log`, `~/.arena-<line>-cron.lock`; one build used
+    `~/.local/state/arena/cron/`): re-running your `cron install …` replaces each old line in
+    place and, once the crontab is written, moves exactly the old default files the replaced
+    lines named into the folder (appended if the new log exists; regular files of yours only — a
+    symlink, or a new log that isn't a regular file, is left alone) and deletes their old locks,
+    saying so in one `· cron logs now in …` line. The lock moved too: a hand-written job or
+    script that took `~/.arena-backup-cron.lock` to stay out of the cron's way no longer
+    serializes with it (take `~/.local/state/arena-cron/backup.lock` instead), and a run the old
+    line started may overlap the new line's first tick — re-install when no backup is running.
+    `install` and `remove` refuse a `$HOME` that isn't this user's (unset, relative, owned by
+    someone else — `sudo -E` — or holding whitespace, `%` or a newline): run them as the user
+    whose crontab it is (`sudo -i`). The lines carry `$HOME`, the arena binary, the config path
+    and the archive's state dir unquoted, so `install` refuses any of them holding a character
+    other than letters, digits and `./_+@:,=-`, naming the first one (`/srv/o'neil` or a config
+    in `course(2026)/` was a shell syntax error on every tick, so arena never ran; `&`, `;`, `$`
+    or a backtick would run something else). Use a path without it.
     `remove --backup|--proxy|--snapshot` drops just those; plain `remove` drops the whole
     block. Both print the block's before → after diff (every removed copy of a duplicate
     shown) and confirm (`--yes` for scripts, `--dry-run` to preview); `show` labels each line
@@ -546,13 +587,22 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `pods backup [targets]` — the **full save**: git-push the ARENA tree **and** rsync the
     home to the local backups folder (`pull`). The git push is on **whatever branch the
     pod is on** (never switches/creates one, so bespoke branches are respected) and
-    **skips `main`/`master`**; clean trees report `NO_CHANGES`. Selected pods, or — none
+    **skips `main`/`master`**; clean trees in step with origin's copy of the branch report
+    `NO_CHANGES` (origin's — never the branch's own upstream: a branch made from `upstream/main`,
+    tracking it, is pushed like any other, its upstream left as it is; a branch with none tracks
+    origin's after its first push, written to its config even where `remote.origin.fetch` is
+    narrowed — `branch.<b>.remote` and `.merge` each on its own, so one half-written, or set alone
+    by the participant, gets the other at the next push; and every push sets
+    `refs/remotes/origin/<b>` to what it pushed, which a narrowed fetch never maps: such a checkout
+    then reads `NO_CHANGES` and scans only what's new, instead of pushing and re-scanning every
+    commit since origin's main each run). Selected pods, or — none
     named (no targets, `all`/`--all`) — **this cohort's**: `<prefix>-…` pods (one off
     `MACHINE_NAME_LIST` too: an extra pod made for someone, a parked `-old` twin), never an `@`
     staff entry. The rest (staff boxes, another prefix, a pod the provider named) get one
-    `⊘ skipped N non-cohort pods (…): a, b — name one to include it` line, never a failure;
-    named, they're backed up like any pod (list a staff box that wears the prefix as
-    `@<prefix>-name` to leave it out). Cohort pods on `main`/`master` (after `set-branch main`,
+    `⊘ skipped N non-cohort pods (…): a, b — name one to include it, or pass --include-non-cohort`
+    line, never a failure; named, they're backed up like any pod (list a staff box that wears the
+    prefix as `@<prefix>-name` to leave it out). `--include-non-cohort` (on `backup`, `pull`,
+    `init-branches`, `set-branch`) takes every pod instead. Cohort pods on `main`/`master` (after `set-branch main`,
     until `init-branches`) get one line after the run, not a SKIP each:
     ``⚠ 12 cohort pods on main: not backed up until `arena pods init-branches` `` (it names the
     pods when only some are). Not a failure — the exit stays 0: the reset window is routine
@@ -589,11 +639,32 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (`arena_core::backup::SECRET_PATTERNS`: OpenRouter, Anthropic, OpenAI, Hugging Face, GitHub,
     AWS) and committed with each key replaced by `REDACTED-…` — in git only: the file on disk
     keeps the key (the code still runs) and shows as modified; reported per pod (`redacted N
-    pasted key(s) in …`). **Unpushed commits holding a key** — an older backup's, or one the
-    participant made by hand — are rewritten before the push, whatever GitHub would do: just
-    those commits (none a remote has), the key redacted — same messages, authors, dates — and
-    pushed as a fast-forward, never forced; files on disk untouched. A secret the patterns don't
-    know, refused by GitHub, fails the pod with GitHub's name for it and its path:line (never the
+    pasted key(s) in …`). **Unpushed commits holding a key** — in a file or in the commit
+    message; an older backup's, or one the participant made by hand — are rewritten before the
+    push, whatever GitHub would do: just those commits and the ones on top of them (none origin
+    has — one only the course's `upstream` has, its `main` merged in, is scanned too: origin
+    never had it), the key redacted — same messages (a key in one redacted the same way), authors,
+    dates — and pushed as a fast-forward, never forced, the commit alone (`--no-follow-tags`: a
+    participant's `push.followTags` sent the annotated tags on it too, their messages unscanned);
+    files on disk untouched. **Right before the push, what goes out is scanned once more**, fail
+    closed (FIX10): any key still in those commits or files — in a commit's author, committer or
+    merged signed tag (headers the rewrite doesn't touch), in a binary file or a symlink (never
+    rewritten), or one a redaction missed — and nothing is pushed: `✗ <pod>: a key is still in
+    the unpushed commits of <branch> after the redaction — … so nothing was pushed. Take it out of
+    those commits on <pod> by hand`, the pod rsynced as for a refused push, every run until it's
+    out. `init-branches` pushes only a commit origin already has, and checks so before its push
+    (else nothing pushed, exit 1). **The course's own commits
+    get no exemption** (FIX8): every exemption tried (FIX4B to FIX7) trusted something a pod could
+    get wrong, and Live 7 found no key-like string in the real course's 2187 commits. What that
+    leaves: if the course ever commits a key-like string, each pod that merges it pushes those
+    commits rewritten redacted, and a later `git pull upstream main` may conflict on those lines —
+    the fix is to take the string out of the course. And a course string GitHub's push protection
+    knows but the redaction doesn't fails the push on every pod that pulls it (`GitHub push
+    protection refuses …: a secret the backup doesn't redact`, each such pod rsynced instead,
+    every run): fix it at the source — take it out of the course — or allow it in the cohort
+    repo's push protection; rewriting each participant's history by hand isn't the fix (review
+    claude #6). A secret the patterns don't know, refused by
+    GitHub, fails the pod with GitHub's name for it and its path:line (never the
     secret, never GitHub's allow-URL). **A pod whose push itself fails** (a refusal, a big file,
     the network) **is rsynced into `LOCAL_BACKUP_DIR` in the same run — even under `--no-pull`**
     (the cron's) — and its line says where its files went (or why that failed too); the run still
@@ -607,11 +678,176 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (the URL never with its credentials), and the run fails. Its work reaches no git remote at
     all, so it is rsynced like a failed push, even under `--no-pull`. `set-branch` and
     `init-branches` don't switch it, and the reaper doesn't reap it until `pods setup`. No
-    configured repo: no check.
+    configured repo: no check. **A branch with an operation in progress** — a participant
+    mid-way through a conflicted `git pull upstream main` (a merge), a cherry-pick or a revert,
+    a `git am` (HEAD attached; a patch that didn't apply leaves no conflict at all), a rebase that
+    kept HEAD attached, a multi-commit cherry-pick or revert paused between its commits (git's
+    `sequencer/` alone, once one was resolved and committed by hand), or with the conflicts a `git
+    stash pop` left — is left exactly as it is (review R3: the
+    backup committed the conflict markers as a merge commit and pushed it, after which `git
+    merge --abort` and VS Code's conflict view no longer worked): nothing staged, committed or
+    pushed (`BUSY`, exit 6), `✗ <pod>: a merge is in progress on <branch> — not committed (a
+    backup now would commit the merge's state, unresolved conflicts and all, and end the merge);
+    resolve the conflicts and \`git add\` them, then \`git commit\` — or abort it (\`git merge
+    --abort\`) on the pod`. Conflicts are named only while some are unresolved (git refuses the
+    commit until they're added); with none left (all resolved and added, or a clean `git merge
+    --no-commit` / `git revert -n`) it's `… commit the merge's state and end the merge); finish it
+    (\`git commit\`) or abort it (\`git merge --abort\`)`. A cherry-pick, a revert, a `git am`
+    (`BUSY <branch> am`) and a rebase each get their own `--continue`/`--abort`; a paused sequence
+    (`sequence`) names both `git cherry-pick --continue` and `git revert --continue`, since only
+    the right one works; a `git stash pop`'s conflicts `resolve them and \`git add\` them, or
+    undo them (\`git reset --merge\`)`. The run fails. The check runs again right before the
+    staging and right before the commit, so an operation the participant starts while the backup
+    scans is caught too (what's left is the instant before git takes its index lock: git has no
+    lock that spans commands).
+    It is rsynced like a failed push, even under `--no-pull`, until it's ended — but not every
+    tick: a read-only look at the pod first (under its lock) says whether anything changed, and
+    it is copied only when no copy since the operation started is recorded — or the recorded copy
+    is gone from this machine (its `.git` no longer there), or isn't under `LOCAL_BACKUP_DIR` as
+    it is now (compared as real paths: the record holds the copy's own, every link resolved, so a
+    dir spelled through a link or relative to the working directory is the same dir) —, when its
+    work tree changed since the last recorded copy (every file git lists: mtime, size, ctime and
+    path, so a `cp -p`/`rsync -a` replacement that keeps the old mtime and
+    size counts too), or when that copy is an hour old; else its line says so (`✗ <pod>: not
+    backed up to git (…) — copied at 14:02 UTC to <dir>/w2d1/<pod>, unchanged since`). So a
+    course push that leaves many pods conflicted can't make one cron tick outlast the next (whose
+    `flock -n` would skip the healthy pods' backups too). A copy counts only when it is whole:
+    every rsync of both tiers, the snapshot's uncapped `.git` pass among them (a busy lock, no
+    endpoint, a timeout, a failed tier or pass: no copy). The record is `busy-copies.json` in the
+    fleet's state dir (written atomically, owner-only, off the async runtime under the state
+    dir's lock, waited for 10 s at most; missing or corrupt = copy again). (The reaper doesn't reap such a pod
+    meanwhile: its git step fails, retried every 6 h, and the run's table and its notification say
+    `a merge is in progress on <branch> — not reaped until it's finished or aborted` with how to
+    end it, while `reap log` and `reap status` keep their fixed words: `git_failed`,
+    `backoff_after_failure`.) The backup after that commits as always. A rebase detaches HEAD, so
+    it is skipped like `main` — and said (`UNCOMMITTED HEAD rebase`), so `set-branch --hard`
+    copies it first.
+    **Left alone, it is finished** — `BUSY_AUTO_RESOLVE_HOURS` whole hours (default 3; `0`/`off`:
+    never), the human's rule (2026-10-19: "backup files + some automated heuristic … whatever
+    changes are most recent … after like 3h of no activity"), applied per file and per hunk so
+    that neither side's work is silently lost. It needs all of these older than that, on the
+    pod's own clock: the operation's start (its `MERGE_HEAD`/`CHERRY_PICK_HEAD`; the index for a
+    stash pop's conflicts), every file git lists (tracked, and untracked but not ignored; never
+    `.git`), the index (something staged), any terminal login's typing (`who`'s ttys) and any
+    pseudo-terminal's use (`/dev/pts/N`, read directly: the images' containers have no utmp, and
+    VS Code's, Jupyter's and tmux's terminals are no login); and nothing at work in git — no
+    `.git/index.lock`, no `git` running, no process holding `MERGE_MSG`, `COMMIT_EDITMSG`,
+    `git-rebase-todo` or `SQUASH_MSG` (an editor a git command waits on). Unsaved buffers in an
+    editor or a notebook can't be seen: only what reaches the disk counts — the copy and the
+    folder below hold the state before. It also needs a whole copy recorded after the work
+    tree's last change, `.git` with it (this run's or an earlier one's, still there — never when
+    this run's copy failed); a repo linked onto the `/workspace` volume counts as held by a pull
+    of the home, which copies it in the link's place. A pod whose operation is older than that
+    but held back says why, each run, besides its BUSY line — what changed or was used, how long
+    ago on the pod's clock: `⊘ <pod>: not finished automatically — notes.py changed 40 min ago —
+    it waits for 3h of quiet` (or git's index written, something staged or a `git status`
+    refreshing it; a terminal used; a login typing; the index locked; a git command running; this
+    run's copy failed; no copy recorded after its last change); one whose operation is younger
+    isn't a candidate yet, and gets no such line. Then, on the pod, under its lock, each
+    conflicted path, nothing changed yet:
+    - a regular text file with no conflict marker left (at the path's `conflict-marker-size`),
+      both sides there, is kept as the participant resolved it;
+    - one whose markers are still there but which isn't what the merge left — git's conflicted
+      output made again from its stages (`git merge-file` with the file's own labels and marker
+      size, `--diff3`/`--zdiff3` for base sections; else the merge's own way, `checkout
+      --conflict` into a scratch tree, labels aside) — leaves the whole operation BUSY: `⊘ <pod>:
+      not finished automatically — you started resolving x.py by hand — finish it (and git add it)
+      or abort, on the pod`; so does one that can't be compared (a marker line or its label deleted,
+      or a binary side: `can't tell whether you started resolving x.py by hand …`), however soon
+      after the operation it was written;
+    - else it takes the side whose last change to that path is the more recent (`git log -1
+      --format=%ct <side> -- <path>`, HEAD against `MERGE_HEAD`/`CHERRY_PICK_HEAD` or the stash
+      entry; a tie keeps HEAD's; a path renamed on one side counts from that side's own commit):
+      a text file per hunk (`git merge-file --ours|--theirs`: that side of each conflict, the
+      clean changes of both sides kept — so a course fix elsewhere in the file is never recorded
+      as merged and dropped), a binary file, a symlink or a modify/delete whole, a path that side
+      deleted removed. A notebook (`*.ipynb`) merged per hunk must still parse as JSON (python3's
+      json, run isolated — `-I`, so a participant's `json.py` at the checkout's top is never
+      imported nor a `__pycache__` written there — else jq): one side's conflict beside the other
+      side's clean hunk can leave a bracket or a comma wrong, and Jupyter wouldn't open it. Then —
+      or when nothing on the pod can tell (no python3 or jq, or one that fails some other way than
+      "not JSON": a broken conda shim) — it stays BUSY, `x.ipynb can't be merged per hunk into
+      valid JSON — resolve it in Jupyter, or abort`: never taken whole from one side, which would
+      drop the other side's changes to it. A notebook resolved by hand that doesn't parse (or
+      can't be checked) leaves it BUSY too (`x.ipynb isn't valid JSON: …`).
+    A file over 95 MB anywhere in that, or conflict markers the participant already staged
+    (`git add` of a file still in conflict), leaves it BUSY, said. A merge's or a cherry-pick's
+    commit takes the whole index, so every path staged against HEAD counts, not only the
+    conflicted ones — a file resolved or added and `git add`ed before: a blob over 95 MB, a
+    nested repo staged as a gitlink (not a submodule the staged `.gitmodules` lists, as the
+    backup's own check reads it), or a notebook that isn't valid JSON (or can't be checked)
+    leaves it BUSY too (`model.pt is staged at … bytes, over git's …-byte limit: never committed —
+    unstage it, or abort, on the pod`) — and so does any new gitlink while `.gitmodules` is itself
+    in conflict (`.gitmodules is in conflict and the merge brings a submodule — resolve it by
+    hand`: which side's list the commit takes isn't known until then). What the other side brings as it has it, the participant
+    never staged, and the words say so (`… comes in from the merged branch (MERGE_HEAD) at …
+    bytes, …: arena won't commit it — finish the merge yourself, or abort it, on the pod`); what
+    is staged exactly as the other side has it — taken whole, merged per hunk, or by hand into
+    that very blob — is sized by GitHub's 100 MiB instead, as the backup sizes
+    what it pushes (its blob goes out with the other side's commit anyway), so a course file
+    between the two goes in. The state before is
+    kept first in `.git/arena-resolved/<UTC stamp>/` on the pod — the conflicted files as they
+    were, git's own `MERGE_HEAD`/`MERGE_MSG`/`CHERRY_PICK_HEAD`/`ORIG_HEAD`, the old HEAD, the
+    index with its conflicts, and a README that says how to see it or do it again — which no
+    later copy overwrites (the day's snapshot is updated by every pull that day). Right before anything
+    changes, the state is read again (the operation and its commit, HEAD, the conflicts, the
+    index's mtime and size, every file, no index lock), and every condition of quiet asked again
+    (a terminal used, a login typing, a git command running — someone back at a terminal,
+    typing into a buffer not saved yet, touches no file): any difference — the participant
+    aborted the merge, started a rebase, staged a file, used a terminal — and nothing is touched.
+    For a merge or a cherry-pick, every staged regular file the participant made — neither
+    HEAD's version nor the other side's: resolved by hand (now, or added before), merged per hunk
+    into something of both sides, added mid-merge — goes through the backup's key redaction (the
+    redacted blob is committed, the file on disk keeps its key). What is staged exactly as
+    `MERGE_HEAD` or `CHERRY_PICK_HEAD` has it goes in as that side has it, whoever's side it is:
+    the backup after it scans every commit origin doesn't have, that side's and the resolve's
+    own, and rewrites one holding a key redacted before anything is pushed (FIX8; the course's
+    own commits are no exception, above). (A stash pop's conflicts make no commit there: the
+    backup after redacts what it commits.) Right before the commit the
+    operation, HEAD and the index lock are checked once more, every staged path's size and kind
+    again — on the index taken as a tree first and again after those checks (anything staged
+    meanwhile stops it, `the index changed while arena was checking it — nothing committed`:
+    review ai-review codex #2, claude #5) — and the tree the commit must take is that one,
+    redacted apart, which the index must still come out as right before the commit: a `git add`
+    the participant finishes after the checks — a key, a big file, a nested repo none of them
+    saw — stops it, `the index changed while arena was finishing it — nothing committed`. A merge becomes a real merge commit, a cherry-pick is
+    `--continue`d (one left empty is committed empty, as git advises), a stash pop's conflicts
+    are added (its stash entry stays) — in the repo's own identity, never
+    `-c user.*` — the message saying, per path, which side won and both sides' last change to it,
+    UTC to the minute (`- README.md: the merged branch won (its side of each conflict; the other
+    changes of both sides kept) — last changed: yours (HEAD) 2026-10-19 09:12Z, the merged branch
+    (MERGE_HEAD) 2026-10-20 13:05Z`), then where the
+    state before is and today's copy. The resolve looks again first and touches nothing if
+    anything changed since the look its copy followed (`⊘ <pod>: not finished automatically —
+    changed: files changed since the copy`). Then the pod is backed up again in the same run, as
+    any — `✓ <pod> -> <branch> — finished a merge left for 3h+ (README.md: MERGE_HEAD's side of
+    each conflict, HEAD 2026-10-19 09:12Z / MERGE_HEAD 2026-10-20 13:05Z; notes.py: as resolved by
+    hand; before: <repo>/.git/arena-resolved/…/ on the pod; today's copy: <dir>/w2d1/<pod>)` — and
+    it isn't a failure of the run (only the pods finished come off the run's failures; any other
+    pod that failed stays one). Never a revert (`⊘ <pod>: not finished automatically — arena won't
+    finish a revert …`: its other side is the commit it undoes, always older, so the newer side
+    would undo nothing), a `git am`, a rebase or a sequence (what they'd go on to apply is the
+    participant's), nor anything unusual — conflicts not from the newest stash entry, a submodule
+    in conflict, a merge of several branches, no git identity in the repo: those stay BUSY. The
+    TUI's backup and the reaper's git step copy nothing first, so they don't finish one; the next
+    cron backup does, and the reaper's retry then finds the pod backed up. The resolve runs under
+    `sh` on the pod, whatever its login shell, bounded there by `timeout` (270 s, then a KILL
+    10 s later — under arena's own 5-minute timeout, which kills only the local ssh client), so
+    it has ended before arena reports a timeout and lets go of the pod's lock; stopped so, its
+    line says it may have stopped part-way. A HUP, INT, TERM or broken pipe removes its
+    temporary files from the git dir; a KILL doesn't. Nothing tells the
+    participant but the commit and the folder (the reaper's `~/.arena/NOTICE` is its own).
   - `pods set-branch <branch> <targets|--all> [--hard] [--init-branches]` — switch pods'
-    ARENA checkout to a branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
-    tree rather than clobbering work). **`--hard` is destructive**: force the branch to
-    match `origin/<branch>`, discarding local commits/changes (untracked files survive) —
+    ARENA checkout to a branch. Gentle by default (fetch origin + checkout + fast-forward to
+    origin's branch, by name — fails on a diverged/dirty tree rather than clobbering work, and all
+    or nothing: when the checkout went through but the fast-forward didn't (the local branch has
+    commits origin's doesn't — Live 4: a local `main` made from `upstream/main` — or origin has
+    no such branch), the pod goes back to the branch it was on, and its line says why and
+    `back on <branch>` (or, if going back fails too, which branch it is on now); never
+    the local branch's own upstream, so a participant's `feat` tracking `upstream/feat` lands on
+    origin's, and an unreachable `upstream` doesn't matter). **`--hard` is destructive**: force the branch to
+    match `origin/<branch>`, discarding local commits/changes — and overwriting any untracked file
+    at a path `origin/<branch>` tracks (other untracked files stay) —
     e.g. `set-branch main --all --hard` resets the fleet to `main`. Confirms first;
     `--dry-run` previews. Pods switch concurrently, 2-min budget each. A nested clone the
     backup adopted (see `pods backup`) is tracked only on the autocommit branches, so a
@@ -626,22 +862,133 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     legacy `./backup`, no lock is taken, and the dry run and the run say so in one line). A pod
     whose push fails is rsynced into `LOCAL_BACKUP_DIR` first, then switched, its
     line saying so (its unpushed commits stay in that branch on the pod — or, after `--hard` onto
-    that same branch, in its reflog); a pod that can be **neither pushed nor copied** (the copy
+    that same branch, under the ref `refs/arena-discarded/<UTC time>-<branch>` the switch pins them
+    with); a pod that can be **neither pushed nor copied** (the copy
     failed too, the backup failed before its push, or another backup held its lock for the whole
-    2-min wait) is **not switched** (`✗ … not switched: <why>`), and the run fails. A file the
+    2-min wait) is **not switched** (`✗ … not switched: <why>`), and the run fails. A pod with
+    an operation in progress on a branch the backup commits (a merge, …: see `pods backup`) is
+    copied first the same way, its line saying `⚠ NOT COMMITTED FIRST: a merge is in progress on
+    <branch>…`; the gentle switch then refuses to end it (`arena set-branch: a merge is in
+    progress on <branch> — not switched (a switch now would end the merge); <how to end it> on
+    the pod, then switch again`, exit 6 — git's own checkout would drop a merge whose conflicts
+    are staged; the TUI's set-branch says the same, naming `--hard` as the destructive way), and
+    `--hard` ends it, discarding its uncommitted changes to tracked files, its line saying where
+    the copy went (a `git am`, rebase or paused sequence too: git keeps their state across a
+    checkout, so once switched `--hard` quits it — its state only — rather than let it stop the
+    next init and every backup, or a later `git rebase --abort` take the pod back off `main`). On
+    `main`/`master` (or a detached HEAD) no backup commits or pushes: the backup there only says
+    what a reset could discard — the first of an operation in progress, changes to tracked files
+    (compared through a copy of the index, so the participant's own is never written), commits no
+    remote has (one only `upstream` has is the course's, not lost), untracked files git doesn't
+    ignore — and **`--hard` copies such a pod
+    first** too, `.git` and all (`⚠ NOT COMMITTED FIRST: main has uncommitted changes to tracked
+    files, and no backup commits on main; …`, `⚠ NOT PUSHED FIRST: main has commits no remote has,
+    and no backup pushes main; … that copy has its .git, those commits with it; …`), never
+    resetting it if the copy fails. Any untracked file counts: `--hard` overwrites one wherever
+    the branch it resets to tracks the same path (review pr4: a participant's `solutions.py` became
+    the staff's), and which paths that branch tracks after the switch's own fetch the backup can't
+    know. A nested repo doesn't (the image ships clones like that), nor does an ignored file. A pod
+    with nothing of its own on main — main as on origin — isn't copied, and `pods backup` and the
+    cron say nothing of any of it. A pod `--hard` switched after copying such work is switched, not
+    a failure; one line after the run names those pods. **Before any `--hard` reset, what it
+    discards is saved on the pod** — in `.git/arena-discarded/<UTC time>/`: `changes.patch` (HEAD →
+    the files), and `staged.patch` (HEAD → the index) and `unstaged.patch` (the index → the files)
+    apart — a version staged and then undone in the files is in the staged one only (on `main` and
+    the other branches no backup commits; on a branch the backup commits, see below) —, the files
+    with unresolved conflicts, the operation's state (`MERGE_HEAD`,
+    `MERGE_MSG`, `rebase-merge/`, …), the untracked or ignored files, links and directories the
+    reset removes (a directory where the branch has a file or a link goes whole — ignored
+    contents, a nested repo's `.git` and all — so it's copied whole, its links kept as links;
+    a big one costs its size there), and a
+    README on getting them back (`git apply --index …staged.patch && git apply …unstaged.patch` on
+    the commit it was on, which it names; the ref `refs/arena-discarded/<UTC time>` keeps that
+    commit from git's gc — `git update-ref -d` it, and remove the folder, once it's not wanted) —
+    and the pod's line says `what it discarded was saved to .git/arena-discarded/<time>/ on the
+    pod first`. **The commits the reset leaves on no branch are pinned too** (review ai-review
+    codex #3: `checkout -f -B <branch> origin/<branch>` moves the local `<branch>`, whichever branch
+    the pod was on — a pod on a clean, pushed autocommit branch lost an unpushed commit on its local
+    `main` to git's gc once the reflog expired): the local `<branch>`'s tip, when it has commits
+    origin's doesn't, as `refs/arena-discarded/<UTC time>-<branch>`, and the commit HEAD was on,
+    when it has commits no remote has, as `refs/arena-discarded/<UTC time>` — whether or not
+    anything else is saved (then the folder holds just the README, naming them and how to make a
+    branch of each again); the pod's line names the refs (`its commits kept by …`), and the
+    README's last line deletes them all. In `.git`, so the reset doesn't touch it and every later
+    copy (snapshot, big, archive) carries it under a name no later save reuses: the copy into
+    `LOCAL_BACKUP_DIR` is the day's label, which the next pull of that label overwrites from the
+    reset pod (review ai-review claude #2). What no save can keep (review ai-review codex #2, not
+    taken: inherent to the backup): on a branch the backup commits, a version staged and then
+    changed again on disk. The backup `set-branch` runs first is the ordinary one, whose `git add
+    -A` stages each file as it is on disk — as every */15 backup does — so the staged version is
+    replaced before the save runs (what is on disk is committed and pushed instead); `--hard`'s
+    first backup is no different from the cron's next one. Nothing to discard, no folder; a save that fails leaves the pod as it
+    was, not reset (a failed switch), and removes what it had copied, refs and all. So does a save the
+    switch is stopped in the middle of — its 100 s bound's TERM, a dropped connection (review
+    ai-review claude #2: a 30 GB directory's copy never finished, and each try left another partial
+    copy in `.git`): the switch's exit trap puts the keys back, then removes it (a KILL runs no
+    trap), and says what it was saving — stopped mid-copy, what and how big, and the same move
+    out of the way as below (claude #6). And what `untracked/` would hold is totalled first (`du -sk`): over `DISCARD_MAX_GB`
+    (in GiB, binary as `du` counts — a fraction too, `0.5`; every size said in GiB/MiB/KiB;
+    default 1: the save runs within the switch's 100 s — review ai-review claude #6; `config check`
+    shows it; settable from the environment for one run, `DISCARD_MAX_GB=0.5 arena pods
+    set-branch main <pod> --hard`, even when the file lacks it, and `config check` says it came
+    from there) or over half what's free on that disk (`df`), nothing of it is copied and the pod
+    isn't reset — `arena set-branch: not reset — the --hard reset would remove checkpoints (31.2
+    GiB), which is more than DISCARD_MAX_GB allows (1.0 GiB) to save first: move it out of the
+    checkout (cd '/root/ARENA_materials' && if [ -e '../checkpoints.kept-20261020T071500Z' ] ||
+    [ -L '../checkpoints.kept-20261020T071500Z' ]; then printf '%s\n' 'not moved:
+    ../checkpoints.kept-20261020T071500Z exists' >&2; exit 1; fi && mv -n -- 'checkpoints'
+    '../checkpoints.kept-20261020T071500Z'), or delete it, then switch again` — every word quoted
+    (a `'` in a path pastes as it is), the kept copy under a name of its own, never over an earlier
+    one nor into it: pasted twice, the second paste fails, moves nothing and says so (`not moved:
+    ../checkpoints.kept-… exists`; review ai-review claude #5, codex #4, claude #7; plain POSIX,
+    busybox's `mv` too). `--hard` with `--include-non-cohort` is refused unless the pods are
+    named: it would reset staff boxes and other cohorts' pods too. A file the
     backup committed with a key redacted keeps the real key on disk: around the switch it's set
     aside in `.git/arena-unredacted/<time>-<pid>/` (so gentle doesn't refuse it and `--hard`
     doesn't drop the key; a later set-aside never overwrites an earlier one) and put back when
-    the pod returns to that branch. Landing pods on `main`/`master` ends with the reminder
+    the pod returns to that branch. A gentle switch that refuses a pod mid-merge does so before
+    setting anything aside, and the putting back is the command's exit trap: a switch that fails,
+    stops on an error, or gets a hangup, an interrupt or a TERM puts the keys back first. arena's
+    own 2-minute timeout kills only its ssh client — a non-pty session's shell is usually never
+    signalled, and ran on (review ai-review claude #13) — so the switch bounds itself on the pod:
+    it runs under `timeout` for 100 s (TERM, the keys put back; KILL 10 s later if still running,
+    which runs no trap: keys then stay set aside until a switch back to their branch), said on the
+    pod's line if it ran out; a pod without coreutils' `timeout` runs it unbounded. Its script
+    runs under `sh`, whatever the login shell (zsh on the pods): the command sshd hands the login
+    shell is one simple command, `sh -c '<wrapper>' arena-set-branch '<script>'`, quoted so bash,
+    zsh and fish all read it the same (review ai-review claude #11: fish refused the old
+    assignment-and-`if` wrapper); the wrapper, under `sh`, holds the `timeout` probe and fallback.
+    Landing pods on `main`/`master` ends with the reminder
     ``⚠ N cohort pods on main: not backed up until `arena pods init-branches` ``;
-    `--init-branches` runs `init-branches` on the same pods once every one has switched (the
-    start date is checked first; a failed switch inits nobody).
+    `--init-branches` then runs `init-branches` on every pod that switched (the start date is
+    checked first) — one copied first because its push failed included, whatever failed it (the
+    network, push protection, a non-fast-forward, an operation in progress): one participant's
+    failed push used to leave the whole fleet on main, where no backup commits (review pr4). The
+    run still fails afterwards, naming the pods copied instead of pushed. A pod that didn't
+    switch (no copy, its switch failed, the gentle switch refused it, its lock stayed busy, the
+    wrong origin) is left out of the init — `init-branches on the N pod(s) that switched — not on
+    …` — and fails the run too; with none switched, no init.
   - `pods init-branches` — create each pod's `autocommit-…-wNdM-…` branch and push it
     upstream **without committing** (legacy `init_branches`), so a new day's branch
     exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews. 2-min
     budget per pod. A pod still on another branch has it backed up first, as `set-branch` does
-    (and isn't switched if it can be neither pushed nor copied). No targets = this cohort's
-    pods, as for `backup`.
+    (and isn't switched if it can be neither pushed nor copied). It pushes only commits origin
+    already has, by id — never one no backup has scanned (review claude #2: a pod whose backup
+    push had failed, rsynced and switched anyway, sent yesterday's unscanned commits out with the
+    new branch): if the new branch holds commits origin doesn't, it goes to origin at the newest
+    commit origin has (or isn't pushed at all, when origin has none of it), and the rest stay on it
+    on the pod, said on its line (`— 2 commit(s) origin doesn't have stay on it on the pod,
+    unpushed (…): the next backup scans them for keys and pushes them`). A pod with an operation in
+    progress (a merge, cherry-pick, revert, `git am`, rebase, paused sequence, conflicts) is
+    refused, touching nothing (`arena init-branches: a merge is in progress on <branch> — not
+    switched …`, exit 6): `git checkout -b` would drop the merge and carry its conflicts onto the
+    new branch, with nothing left to abort — and carry a `git am`, rebase or sequence onto it
+    half-done. Landing on a day branch that exists, it puts back the real keys a switch set aside
+    on it; its script runs under `sh`, whatever the login shell (zsh on the pods, where a glob
+    with no match is fatal: a set-aside run left without its `.branch` ended the whole command
+    before the push), bounded on the pod like `set-branch`'s switch (100 s, then a KILL 10 s
+    later), through the same one simple command. No targets =
+    this cohort's pods, as for `backup`.
   - `pods run [-t <targets>] [--timeout <secs>] <cmd>` / `pods test [targets]` — run an
     arbitrary command on every (selected) pod (concurrent, confirms first naming the pods;
     each pod gets `--timeout`, default 1800s = 30 min — flags go *before* the command: a bare
@@ -690,10 +1037,31 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `/` and `/workspace`; host load + uptime; what setup's VS Code warm-up left (newest
     server, extensions, default interpreter — an informational `vscode` line, Pass or Skip,
     never WARN/FAIL). The provider's maintenance window comes from
-    the API. **FAIL**: any CUDA/tensor/copy/NCCL error, count mismatch, missing
-    torch/nvidia-smi, driver below the floor, unreachable/timed out. **WARN**: download
-    < 2 MB/s or unreachable, < 10 GB free, host load above max(32, host CPUs), a
-    maintenance window. Driver floor: `MIN_DRIVER_VERSION` (`none` = off), else derived from
+    the API. **FAIL**: any CUDA/tensor/copy/NCCL error, count mismatch (torch's count against
+    nvidia-smi's, and against the GPUs the provider reports for the pod: fewer fails),
+    missing torch/nvidia-smi, driver below the floor, unreachable/timed out. The torch
+    fallback is for **MIG slices only**: where a slice's nvidia-smi can't answer (missing, an
+    error such as NVML's `Insufficient Permissions`, a timeout, no GPUs listed), torch's own
+    checks stand in (its count, a tensor op on each, the memory it reports) and the slice
+    PASSes if they all pass. Anywhere else a failing nvidia-smi FAILs whatever torch says: on
+    whole cards that is how a GPU fallen off the bus looks, and torch sees only the survivors.
+    A slice somewhere isn't enough: every GPU of the pod must be shown to be one — the
+    provider's GPU count, when known, no more than the slices `nvidia-smi -L` lists (else
+    those torch names `… MIG …`), nor than torch sees where nvidia-smi can't count, and torch
+    naming no whole card beside a slice. Else (a mixed pod that lost its whole card, its slice
+    still there) it FAILs as whole GPUs do.
+    With no driver version from nvidia-smi, the driver comes from
+    `/proc/driver/nvidia/version` or, failing that, the CUDA version the driver supports
+    (libcuda's, else torch's) against the CUDA floor (the CUDA column marks it `12.8*`). Under
+    MIG, torch's count is matched with the slices `nvidia-smi -L` lists and the provider's
+    count: the same PASSes, more FAILs, fewer **WARNs** — `torch sees 1 of the 2 MIG slices —
+    CUDA may show a process one slice; check each with CUDA_VISIBLE_DEVICES=<MIG uuid>`, as the
+    other slice may be inaccessible or broken — where every GPU is shown to be a slice (as
+    above), else fewer than the provider's count FAILs. A machine with whole cards beside its slices is
+    counted as whole GPUs when `--query-gpu` lists more cards than there are slices; one whose
+    whole cards don't outnumber its slices can't be told from a pure MIG one, and isn't
+    supported. **WARN**: download < 2 MB/s or unreachable, < 10 GB free, host load above
+    max(32, host CPUs), a maintenance window, a MIG undercount. Driver floor: `MIN_DRIVER_VERSION` (`none` = off), else derived from
     the create's CUDA floor — `MIN_CUDA_VERSION`, else the lowest of `ALLOWED_CUDA_VERSIONS`
     / `EXACT_CUDA_VERSIONS` (13.x → 580, 12.8 → 570, 12.4 → 550, …; one that isn't a version
     is an error, as a malformed `MIN_DRIVER_VERSION` is) — else no driver check. Hetzner CPU VMs skip the GPU checks (decided by
@@ -927,14 +1295,19 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     "locked" sets an automatic hold. Needs an explicit absolute `ARENA_STATE_DIR` **in the
     config file** (state: `reap.json`, log: `reap-log.jsonl`) — a shell exporting a different
     one is refused (it would put a `hold` where the cron never looks); every state change
-    prints the file it wrote — RunPod on `RUNPOD_API=v2` (v1 and Vast are never
-    reaped), absolute `LOCAL_BACKUP_DIR`, a `.arena-backup-tier` marker on each backup root
+    prints the file it wrote — RunPod on REST v2, the default (pods on `RUNPOD_API=v1` and Vast
+    are never reaped; since v2 became the default — 70bce78, 2026-10-19 — a config with no
+    `RUNPOD_API` line, which ran v1, has its RunPod pods reapable without anyone choosing v2, so
+    `reap status` and every plan say `RunPod: REST v2 (…) — RunPod pods with a policy can be
+    reaped: terminated, container disk and all, after their backup` whenever one has a policy,
+    and `config check`'s RUNPOD_API row says it too; nothing acts by itself: `--apply` still needs
+    `REAP_ENABLED=1` in the file), absolute `LOCAL_BACKUP_DIR`, a `.arena-backup-tier` marker on each backup root
     (`snapshot` / `big`; the big tier's root is `LOCAL_BACKUP_BIG_DIR`, default
     `<LOCAL_BACKUP_DIR>/big`), `ARENA_START_DATE` and no `BACKUP_REMOTE_PATH`; `config check`
     lists what's missing once the reaper is on or its cron line is installed (off: one `·
     reaper off (opt-in)` row, a ✗ only for a `REAP_*` value set but invalid). Every `pods reap
     … --json` prints exactly one JSON document on stdout — `{"error": …}` on a failure,
-    `{"skipped": …}` when another run holds the lock — and everything else on stderr. Rollout: `cron install --reap observe` first (logs `would_reap`; the line runs at :11/:27/:41/:57 — minutes no other arena line uses), then
+    `{"skipped": …}` when another run holds the lock — and everything else on stderr. Rollout: `cron install --reap observe` first (logs `would_reap`; the line runs at :11/:27/:41/:57 — minutes no other arena line uses — its output in `~/.local/state/arena-cron/reap.log` unless the line logs elsewhere already), then
     `--reap apply` (refused unless REAP_ENABLED=1). `reap set` also writes `~/.arena/NOTICE` and
     an interactive-only login banner on the pod (also written after `up`'s setup for a pod
     created with a policy, after `pods setup`, and after a restart's re-provision — the 1-hour
@@ -949,7 +1322,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     writable mount, any file in a `TEMP_FOLDER_FOR_SWEEPS/`, data written outside the home since
     the pod was created (or a link out of the home), a pod whose provider gives no creation
     time, a MIG GPU slice (`[N/A]` utilisation reads as unknown), RunPod
-    on `RUNPOD_API=v1` (the default) and Vast (no lock state — `up --expire-*` refuses them,
+    on `RUNPOD_API=v1` and Vast (no lock state — `up --expire-*` refuses them,
     ENDS shows `not reapable (…)`), a pod renamed outside arena or sharing its name, a home
     that's a link to another filesystem, `~/.arena/keep`. A tmux session whose panes run only
     a shell doesn't count (its utmp entries aren't logins); one running anything else does.
@@ -1185,11 +1558,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     Secrets are redacted (env values, key/token/password fields, `rpa_`/`sk-`/`hf_` tokens,
     SSH key material) unless `--raw`; the API key itself is never printed, `--raw` included
     (scrubbed from the body as received, before an error message clips it).
-  - `gpus` — list the GPU types for `--gpu`: RunPod's **full live catalog** (via GraphQL;
-    on `RUNPOD_API=v2` via `GET /v2/catalog/gpus` for both tiers — STOCK shown as
+  - `gpus` — list the GPU types for `--gpu`: RunPod's **full live catalog** (via
+    `GET /v2/catalog/gpus` for both tiers, the default — STOCK shown as
     `community/secure`, counted over hosts at or above the CUDA floor, and the best signal the
-    answer carries (a data center's level, a CUDA version tagged available) — no GraphQL)
-    when on RunPod with a key, else the local presets. Shows VRAM, **live**
+    answer carries (a data center's level, a CUDA version tagged available) — no GraphQL; via
+    GraphQL on `RUNPOD_API=v1`) when on RunPod with a key, else the local presets. Shows VRAM, **live**
     community/secure $/hr (a tier that doesn't offer the card shows `-`: v1's GraphQL quotes
     phantom prices for those, dropped by its `secureCloud`/`communityCloud` flags) and
     RunPod's stock hint (`~` marks a preset estimate). On
@@ -1215,6 +1588,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     re-attached to it and is set up again (up to 3×, 20s apart); elsewhere the refusal is
     reported as before. Confirms first (`--dry-run` previews,
     token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
+    `origin` is pointed at the cohort repo (where backups push); the public course repo
+    (`ARENA_UPSTREAM_REPO`, default `ARENA-education/ARENA_materials`, `none` to skip) is added
+    as the checkout's `upstream` remote over https when it has none — so a participant can
+    `git pull upstream main` the course's own fixes. Setup never fetches it, and an `upstream`
+    already there (a participant's own) is left alone; `checkout.defaultRemote=origin` makes a
+    plain `git checkout <branch>` both repos have take origin's. arena's own fetches name origin
+    (init-branches, set-branch), so an unreachable upstream never stops them.
     The repo update fetches **only the default branch, without tags** (a bare `git fetch`
     would pull every participant's autocommit branch); a tracked non-default branch pulls
     just its own upstream; the default branch is fast-forwarded only when the checkout has
@@ -1489,8 +1869,8 @@ Notes / sharp edges to know:
 
 Any key in `config.env` can be overridden by an **environment variable of the same
 name** (env wins; it can't introduce brand-new keys — except a short allowlist such as
-`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD` and `RUNPOD_API`, e.g. `RUNPOD_API=v2 arena pods
-list` to try the RunPod v2 backend for one command). This is how you point at an SSH
+`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API` and `DISCARD_MAX_GB`, e.g. `RUNPOD_API=v1 arena pods
+list` to use the retiring RunPod v1 backend for one command, until 2026-11-15; v2 is the default). This is how you point at an SSH
 key the current user can actually read, without editing the shared, read-only prod
 config — e.g. when the dashboard's metrics show `ssh connect failed … key unreadable`
 because the configured key lives under `/root`:
@@ -1707,7 +2087,7 @@ cd /home/dev/sandbox/arena-infra-rs
 ARENA_LIVE_SMOKE=1 ARENA_LIVE_CONFIG=/home/dev/sandbox/config.env \
   ARENA_LIVE_BIN=/home/dev/sandbox/bin/arena-dev \
   cargo test --release -p arena-cli --test live_smoke -- --ignored --nocapture
-# also: RUNPOD_API=v2 (smoke the v2 backend) · ARENA_LIVE_GPU=3070 (the --gpu list)
+# also: RUNPOD_API=v1 (smoke the retiring v1 backend; unset = the config's line, else v2) · ARENA_LIVE_GPU=3070 (the --gpu list)
 ```
 
 `ARENA_LIVE_BIN` (optional, recommended in the sandbox) runs the commands through a wrapper
@@ -1732,6 +2112,59 @@ after 8 rounds without one it prints the commands to finish by hand. Only Ctrl+C
 it, so after an interrupted run check `teardown --check`. A COMMUNITY pod that never gets a
 public IP fails as `FAILED endpoint` (see `docs/TODO.md`); the guard still cleans it up.
 
+## AI review before merging
+
+`scripts/ai-review` gets a second-opinion code review of a change from **codex** (OpenAI's CLI)
+and/or **Claude Code** (`claude -p`), both by default, run in parallel:
+
+```bash
+git fetch origin
+scripts/ai-review                        # origin/master..HEAD, codex + claude
+scripts/ai-review 7fface8..04968c3 --codex --focus "the new cron tidy-up"
+scripts/ai-review --pr 4                 # gh pr diff/view (GH_REPO=owner/name picks the repo)
+scripts/ai-review --dry-run              # only write prompt.txt: nothing is sent
+```
+
+- **What it sends, and where.** One prompt, built from git objects only (never the working tree,
+  never a file outside the repository): fixed review instructions with this repo's production
+  risks (backup.sh under root's cron on every pod, the cron lines, set-branch/init-branches, the
+  reaper, the archive, participants' files and the control box's home), `git log --oneline`, the
+  diff (from the range's merge base) and the full text of every changed `*.sh`. With `--both`
+  that goes to **OpenAI** (codex) **and Anthropic** (claude); `--codex`/`--claude` sends it to one.
+  Over `--max-bytes` (600 KB) it keeps the stat and the riskiest files and names the rest as left
+  out. A changed path that looks like a secret (`config.env`, `*.key`, `id_rsa*`, …) is refused.
+  **Key-like strings are masked** before anything is written or sent (review ai-review claude
+  #14: only path names were screened): the backup's own `SECRET_PATTERNS`, read from
+  `crates/core/src/backup.rs` at HEAD (git objects, as the rest), run over the whole prompt as
+  the backup runs them — each key becomes its `REDACTED-…` placeholder — and it says `masked N
+  key-like strings`; `--dry-run`'s `prompt.txt` is the masked one. The repo's own test fixtures
+  with fake keys are masked too. Patterns it can't read, or a key-like string left after the
+  masking, refuse the run (exit 2, nothing sent).
+- **No tools.** Everything the reviewer needs is in the prompt, so it runs with none, in an empty
+  temporary directory: claude with `--tools ''`, `--safe-mode` (no hooks, MCP servers or
+  CLAUDE.md) and no saved session; codex `exec` read-only and ephemeral, with its shell, code
+  mode, apps, plugins, browser and web search turned off. (Here codex's sandbox can't run a
+  command anyway: bubblewrap fails.)
+- **Output** goes to `${XDG_STATE_HOME:-~/.local/state}/arena-review/<UTC time>-<range|prN>/`
+  (`--out DIR` for another parent): `prompt.txt`, `codex.md`, `claude.md`, and each reviewer's
+  stderr in `codex.log`/`claude.log`. It ends by printing those paths and each review's last line,
+  `Blocks merging: yes|no (…)`. Exit 0 when every reviewer that ran answered, whatever it found;
+  1 when one failed or timed out (`--timeout`, 3600 s each) or none could run (a missing `codex`
+  or `claude` is skipped with a message); 2 for a usage error, an empty diff or key patterns it
+  can't read (refused).
+- **Cost.** It runs on the operator's own codex and Claude Code logins, so it spends their
+  subscriptions' usage, not the project's API keys: a 16-commit, ~420 KB prompt is roughly 125k
+  input tokens per reviewer, and took codex 2½ minutes and claude 5. `--effort` (default `high`,
+  for both) sets how hard they think: codex's own default here is `none`, a skim that answers in
+  25 s. `--model-codex`/`--model-claude` pick the models.
+- It's a second opinion, not a gate: read the findings, fix what's real, note what isn't.
+
+## Release process
+
+Work on `dev/phase0` → `cargo test --release` + the live smoke in the sandbox → PR to master,
+**running `scripts/ai-review` (or `--pr N`) before merging it** → `cargo install` to prod only
+between cohort sessions, keeping the previous binary as `arena.prev` for an instant rollback.
+
 ## Layout
 
 ```
@@ -1739,6 +2172,8 @@ crates/
   core/   library: config, provider trait + impls, Remote, planners/judges (see ARCHITECTURE.md)
   cli/    `arena` binary (clap); tests/live_smoke.rs = the opt-in live smoke test
   tui/    `arena-tui` binary (ratatui)
+scripts/
+  ai-review   a second-opinion review by codex/claude (see "AI review before merging")
 web/
   fleet.html  the public fleet page (reads fleet.json next to it)
 docs/     RunPod API notes, known issues

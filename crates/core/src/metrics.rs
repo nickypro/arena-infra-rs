@@ -239,8 +239,11 @@ fn remote_command(opts: &ProbeOpts) -> String {
         s.push_str(&format!(
             "echo \"committed=$(cd {q} 2>/dev/null && git log -1 --format=%ct 2>/dev/null)\"; "
         ));
+        // `--no-optional-locks`: a plain `git status` refreshes the index and writes it back under
+        // `index.lock`, so a dashboard refresh could make the participant's own `git commit` fail
+        // with "index.lock exists". The read-only form never takes that lock.
         s.push_str(&format!(
-            "echo \"dirty=$(cd {q} 2>/dev/null && git status --porcelain 2>/dev/null | wc -l)\"; "
+            "echo \"dirty=$(cd {q} 2>/dev/null && git --no-optional-locks status --porcelain 2>/dev/null | wc -l)\"; "
         ));
         // Divergence vs the upstream: "<behind>\t<ahead>" (empty when there's no
         // upstream). ahead>0 means committed-but-unpushed — e.g. a push GitHub blocked.
@@ -621,7 +624,7 @@ mod tests {
         assert!(cmd.contains("git log -1 --format=%ct"));
         assert!(cmd.contains("git log -n 4 --format='clog=%h"));
         assert!(cmd.contains("--query-compute-apps=pid,used_memory,process_name"));
-        assert!(cmd.contains("git status --porcelain"));
+        assert!(cmd.contains("git --no-optional-locks status --porcelain"));
         assert!(cmd.contains("echo hf=1"));
         assert!(cmd.contains("echo cc=1"));
         assert!(cmd.contains("/proc/stat"));

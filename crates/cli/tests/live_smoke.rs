@@ -45,6 +45,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use arena_core::naming::{is_absolute, qualify};
+use arena_core::provider::RunpodApi;
 use arena_core::proxy::ProxyConfig;
 use arena_core::snapshot::{PublicHealthStatus, PublicMachine, PublicSnapshot, PublicStatus};
 use arena_core::{Config, Pod};
@@ -64,7 +65,8 @@ const MAX_PRICE: &str = "0.30";
 /// The only environment the binary inherits (see [`child_env`]). No provider keys, no
 /// config overrides, no `SSH_AUTH_SOCK` (ssh uses the configured key file, never whatever
 /// the operator's agent holds — production keys included). `RUNPOD_API` (`v1`/`v2`, not a
-/// secret) passes so the v2 backend can be smoked: `RUNPOD_API=v2 cargo test …`.
+/// secret) passes so the retiring v1 backend can still be smoked until RunPod turns it off:
+/// `RUNPOD_API=v1 cargo test …`. Unset, the config's own line decides, else v2 (the default).
 const PASSED_ENV: [&str; 8] = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "RUNPOD_API"];
 
 /// Deadlines per command. Generous: they exist so a hang fails the run (and the cleanup
@@ -1078,6 +1080,13 @@ fn smoke_proxy_must_be_a_local_write_only_file_outside_etc() {
     // What the child sees is the file plus the forced values.
     let c = child_config("ARENA_STATE_DIR=/elsewhere\nRUNPOD_API=v1\n", state, Some("v2"));
     assert_eq!((c.get("ARENA_STATE_DIR"), c.get("RUNPOD_API")), (Some("/tmp/state"), Some("v2")));
+    // The RunPod API it smokes, as the binary will pick it: with no `RUNPOD_API` exported, the
+    // file's line, else the default (v2); an exported one wins, empty meaning the default too.
+    let api = |file: &str, exported: Option<&str>| RunpodApi::from_config(&child_config(file, state, exported)).unwrap();
+    assert_eq!(api("MACHINE_NAME_PREFIX=devtest\n", None), RunpodApi::V2);
+    assert_eq!(api("RUNPOD_API=v1\n", None), RunpodApi::V1);
+    assert_eq!(api("MACHINE_NAME_PREFIX=devtest\n", Some("v1")), RunpodApi::V1);
+    assert_eq!(api("RUNPOD_API=v1\n", Some("")), RunpodApi::V2);
     // The binary's own spelling rules: only `~/` is expanded, and only with a HOME.
     assert_eq!(proxy_write_path("~/p.conf", Some("/home/dev/"), Path::new("/cfg")), PathBuf::from("/home/dev/p.conf"));
     assert_eq!(proxy_write_path("~/p.conf", None, Path::new("/cfg")), PathBuf::from("/cfg/~/p.conf"));

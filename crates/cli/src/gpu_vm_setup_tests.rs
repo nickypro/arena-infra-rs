@@ -20,11 +20,9 @@ impl Drop for Tmp {
 /// python, asked about `cuda`, answers only once `$STUBS/cuda-ok` exists (`$UV_INSTALL_MAKES_CUDA`
 /// makes it at install).
 fn install_stubs(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
     let stub = |name: &str, body: &str| {
         let p = dir.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        arena_core::remote::write_test_script(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
     };
     for quiet in ["apt-get", "systemctl", "chsh", "ssh-keyscan"] {
         stub(quiet, "exit 0");

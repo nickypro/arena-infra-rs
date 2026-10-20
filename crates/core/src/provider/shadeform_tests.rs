@@ -741,7 +741,6 @@ async fn review_sf_sf5_rename_refuses_a_name_that_would_disown_the_instance() {
 #[cfg(target_os = "linux")]
 #[test]
 fn review_sf_sf6_bootstrap_root_login_survives_cloud_inits_disable_root_line() {
-    use std::os::unix::fs::PermissionsExt;
     let base = std::env::temp_dir().join(format!("arena-sf-review-boot-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let (stubs, fake) = (base.join("stubs"), base.join("fake"));
@@ -750,8 +749,7 @@ fn review_sf_sf6_bootstrap_root_login_survives_cloud_inits_disable_root_line() {
     }
     let stub = |name: &str, body: &str| {
         let p = stubs.join(name);
-        std::fs::write(&p, format!("#!/bin/bash\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::remote::write_test_script(&p, format!("#!/bin/bash\n{body}\n")).unwrap();
     };
     // Not root: the script goes through `sudo -n`, which the stub runs as-is on the fake root
     // (paths outside the homes mapped under it; ownership changes dropped).
@@ -879,7 +877,6 @@ async fn sf5_rename_keeps_the_prefix_or_is_refused_unsent() {
 #[cfg(target_os = "linux")]
 #[test]
 fn sf6_bootstrap_rewrites_restricted_cohort_lines_and_is_idempotent() {
-    use std::os::unix::fs::PermissionsExt;
     let base = std::env::temp_dir().join(format!("arena-sf6-boot-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let (stubs, fake) = (base.join("stubs"), base.join("fake"));
@@ -888,8 +885,7 @@ fn sf6_bootstrap_rewrites_restricted_cohort_lines_and_is_idempotent() {
     }
     let stub = |name: &str, body: &str| {
         let p = stubs.join(name);
-        std::fs::write(&p, format!("#!/bin/bash\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::remote::write_test_script(&p, format!("#!/bin/bash\n{body}\n")).unwrap();
     };
     stub("id", "echo 1000");
     stub(

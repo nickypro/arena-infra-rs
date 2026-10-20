@@ -64,6 +64,59 @@ pub fn notify_line(prefix: &str, kind: NotifyKind, pod: Option<&str>, detail: &s
     line.chars().filter(|c| !c.is_control()).take(600).collect()
 }
 
+/// What a reap's git step found in progress on the pod (its backup's `BUSY`): the operation
+/// ([`crate::backup::BUSY_OP_SH`]'s word), the branch, and whether paths are still unmerged — for
+/// the words of [`git_busy_why`] / [`git_busy_notice`]. The reap's decision is the git step's
+/// (R32, not reaped); only what is said about it is this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitBusy {
+    pub what: String,
+    pub branch: String,
+    pub unmerged: bool,
+}
+
+impl GitBusy {
+    /// From the backup's report of a git step that exited `code`: `Some` only for a `BUSY` with
+    /// its own exit and one of the fixed words — anything else stays the generic "git backup
+    /// failed".
+    pub fn of(report: &crate::backup::BackupReport, code: i32) -> Option<GitBusy> {
+        let what = report.in_progress(Some(code)).filter(|w| crate::backup::BUSY_WORDS.contains(w))?;
+        Some(GitBusy { what: what.to_string(), branch: report.branch.clone().unwrap_or_default(), unmerged: report.unmerged })
+    }
+
+    /// The branch as said: a plain ref name (letters, digits, `.`, `_`, `-`, `/`; at most 100) as
+    /// it is, anything else `its branch` — never raw pod output in a line or a notification.
+    fn on(&self) -> &str {
+        let b = self.branch.as_str();
+        let plain = !b.is_empty()
+            && b.len() <= 100
+            && !b.starts_with('-')
+            && b.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'));
+        if plain {
+            b
+        } else {
+            "its branch"
+        }
+    }
+}
+
+/// The reap run's WHY for a pod its git step left alone because an operation is in progress
+/// there (review fb2 F1): "a merge is in progress on autocommit-x — not reaped until it's finished
+/// or aborted" — not a generic "git backup failed".
+pub fn git_busy_why(b: &GitBusy) -> String {
+    let situation = crate::backup::busy_situation(&b.what, b.on());
+    match b.what.as_str() {
+        "conflicts" => format!("{situation} — not reaped until they're resolved or undone"),
+        _ => format!("{situation} — not reaped until it's finished or aborted"),
+    }
+}
+
+/// The notification for it: [`git_busy_why`], how to end it either way on the pod (the backup's
+/// own words: [`crate::backup::busy_advice`]), and when the reap is tried again.
+pub fn git_busy_notice(b: &GitBusy) -> String {
+    format!("{}; on the pod: {}; retried in 6h", git_busy_why(b), crate::backup::busy_advice(&b.what, b.unmerged))
+}
+
 /// `(year, month, day, hour, minute)` of `epoch` shifted by `tz` seconds.
 fn parts(epoch: u64, tz: i64) -> (i64, u32, u32, u64, u64) {
     let t = epoch as i64 + tz;
@@ -233,7 +286,7 @@ pub fn why_label(row: Row, reasons: &[Reason]) -> String {
     match row {
         Row::NoPolicy => "no policy",
         Row::ListingFailed => "its provider's listing failed",
-        Row::ProviderUnsupported => "provider not supported (Vast, Shadeform; RunPod needs RUNPOD_API=v2)",
+        Row::ProviderUnsupported => "provider not supported (Vast, Shadeform; RunPod on RUNPOD_API=v1)",
         Row::NotOnList => "not a MACHINE_NAME_LIST machine",
         Row::DuplicateOrTwin => "name shared, or a -old/-new twin listed",
         Row::NameMismatch => "listed under another name than its policy's",
@@ -432,12 +485,16 @@ pub const CRON_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/
 /// keeps the lock from being inherited by what arena spawns (an rsync, ssh, the notify
 /// command): one of them outliving an arena that was killed would otherwise hold it, and every
 /// later tick would skip without a word (RR4; the backup line has had `-o` for that reason).
-pub fn cron_line(apply: bool, exe: &str, config: &str, home: &str, env: &[(String, String)]) -> String {
+/// Its lock is in arena's cron folder, and so is its log unless `log` keeps one the installed
+/// line already used elsewhere; the line recreates both folders first ([`crate::cron::mkdir`]:
+/// without it, a deleted folder would silently stop the reaper).
+pub fn cron_line(apply: bool, exe: &str, config: &str, home: &str, log: Option<&str>, env: &[(String, String)]) -> String {
+    use crate::cron::{self, Job};
     let env: String = env.iter().map(|(k, v)| format!("{k}={v} ")).collect();
     let act = if apply { " --apply --yes" } else { "" };
-    format!(
-        "{CRON_SCHEDULE} {CRON_PATH} {env}flock -n -o {home}/.arena-reap-cron.lock {exe} --config {config} pods reap run{act} >> {home}/arena-reap-cron.log 2>&1"
-    )
+    let log = log.map_or_else(|| cron::log(home, Job::Reap), String::from);
+    let (mkdir, lock) = (cron::mkdir(home, &log), cron::lock(home, Job::Reap));
+    format!("{CRON_SCHEDULE} {mkdir}{CRON_PATH} {env}flock -n -o {lock} {exe} --config {config} pods reap run{act} >> {log} 2>&1")
 }
 
 /// One line of `reap-log.jsonl` — fixed vocabulary only (spec I15).

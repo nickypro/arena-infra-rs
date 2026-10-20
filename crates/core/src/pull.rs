@@ -666,29 +666,45 @@ pub fn open_pod_lock(local_backup_dir: &str, pod: &str) -> std::io::Result<std::
     std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)
 }
 
+/// A held per-pod backup lock ([`try_lock`]). Dropping it unlocks, rather than only closing the
+/// file: a process forked meanwhile by another thread (a git, an rsync, an ssh) holds a copy of
+/// the descriptor until its `exec`, and a close alone leaves the lock held through that copy — so
+/// a backup or a set-branch that doesn't wait could find a pod busy just after its lock was
+/// released (a test flaked so on the build VM: "free once `a` is dropped"). The archive's sync
+/// lock was fixed the same way.
+#[derive(Debug)]
+pub struct PodLock(std::fs::File);
+
+impl Drop for PodLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// A one-pod writer's lock (the TUI's git backup, RR10), without waiting: `Ok(Some(lock))`
 /// held until dropped; `Ok(None)` no lock to take — a relative or missing backup dir, or a
 /// lock that can't be opened, as before the locks; `Err(())` another backup of the pod (a
 /// pull, the cron's push, the reaper) holds it.
 #[allow(clippy::result_unit_err)] // `Err(())` is only "busy": callers (cli, tui) branch on it, never report it
-pub fn try_pod_lock_now(local_backup_dir: &str, pod: &str) -> std::result::Result<Option<std::fs::File>, ()> {
+pub fn try_pod_lock_now(local_backup_dir: &str, pod: &str) -> std::result::Result<Option<PodLock>, ()> {
     if !Path::new(local_backup_dir).is_absolute() {
         return Ok(None);
     }
     let Ok(f) = open_pod_lock(local_backup_dir, pod) else { return Ok(None) };
-    match try_lock(&f) {
-        Ok(true) => Ok(Some(f)),
-        Ok(false) => Err(()),
+    match try_lock(f) {
+        Ok(Ok(lock)) => Ok(Some(lock)),
+        Ok(Err(_)) => Err(()),
         Err(_) => Ok(None),
     }
 }
 
-/// Take `lock` exclusively without waiting: `Ok(true)` taken (held until the file is
-/// dropped), `Ok(false)` someone else holds it.
-pub fn try_lock(lock: &std::fs::File) -> std::io::Result<bool> {
+/// Take `lock` (a file [`open_pod_lock`] opened) exclusively without waiting: `Ok(Ok(guard))`
+/// taken, held until the guard is dropped ([`PodLock`]); `Ok(Err(file))` someone else holds it —
+/// the file back, to try again.
+pub fn try_lock(lock: std::fs::File) -> std::io::Result<std::result::Result<PodLock, std::fs::File>> {
     match lock.try_lock() {
-        Ok(()) => Ok(true),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Ok(()) => Ok(Ok(PodLock(lock))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(Err(lock)),
         Err(std::fs::TryLockError::Error(e)) => Err(e),
     }
 }
@@ -1621,18 +1637,34 @@ mod tests {
         assert!(!d.exists());
         assert_eq!(try_pod_lock_now(&dir, "devtest-a").map(|l| l.is_none()), Ok(true), "nothing to take: as before the locks");
         std::fs::create_dir_all(&d).unwrap();
-        let a = open_pod_lock(&dir, "devtest-a").unwrap();
-        let b = open_pod_lock(&dir, "devtest-a").unwrap();
-        let other = open_pod_lock(&dir, "devtest-b").unwrap();
-        assert!(try_lock(&a).unwrap());
-        assert!(!try_lock(&b).unwrap(), "held by `a`");
-        assert!(try_lock(&other).unwrap(), "another pod's lock is its own");
+        let a = try_lock(open_pod_lock(&dir, "devtest-a").unwrap()).unwrap().expect("free");
+        let b = try_lock(open_pod_lock(&dir, "devtest-a").unwrap()).unwrap().expect_err("held by `a`");
+        let other = try_lock(open_pod_lock(&dir, "devtest-b").unwrap()).unwrap();
+        assert!(other.is_ok(), "another pod's lock is its own");
         assert_eq!(try_pod_lock_now(&dir, "devtest-a").map(|l| l.is_some()), Err(()), "busy");
         drop(a);
-        assert!(try_lock(&b).unwrap(), "free once `a` is dropped");
+        let b = try_lock(b).unwrap().expect("free once `a` is dropped");
         drop(b);
         assert_eq!(try_pod_lock_now(&dir, "devtest-a").map(|l| l.is_some()), Ok(true));
         assert_eq!(try_pod_lock_now("relative/backup", "devtest-a").map(|l| l.is_none()), Ok(true));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A dropped pod lock is free at once, even while a copy of its descriptor lives on (what a
+    /// process another thread forked meanwhile holds until its `exec`): a backup or a set-branch
+    /// that doesn't wait finds it free — before, a close alone left it held through that copy.
+    #[test]
+    fn a_dropped_pod_lock_is_free_while_a_copy_of_its_descriptor_lives() {
+        let d = std::env::temp_dir().join(format!("arena-pull-lock-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let dir = d.display().to_string();
+        let held = try_pod_lock_now(&dir, "devtest-a").expect("free").expect("a lock to take");
+        assert_eq!(try_pod_lock_now(&dir, "devtest-a").map(|l| l.is_some()), Err(()), "held");
+        let copy = held.0.try_clone().unwrap();
+        drop(held);
+        assert_eq!(try_pod_lock_now(&dir, "devtest-a").map(|l| l.is_some()), Ok(true), "free once dropped, the copy notwithstanding");
+        drop(copy);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2768,20 +2800,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_rsync_is_retried_once_and_only_when_a_directory_was_moved_in_time() {
-        use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("arena-pull-retry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dest = root.join("dest");
         std::fs::create_dir_all(dest.join("L/sub")).unwrap();
         // A stand-in rsync: counts its runs, and fails like the live one every time.
         let stub = root.join("rsync");
-        std::fs::write(
+        crate::remote::write_test_script(
             &stub,
             "#!/bin/sh\necho run >> \"$(dirname \"$0\")/runs\"\n[ -z \"$1\" ] || sleep \"$1\"\n\
              echo 'could not make way for new symlink: L' >&2\necho 'rsync error: (code 23)' >&2\nexit 23\n",
         )
         .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let program = stub.display().to_string();
         let runs = || {
             let n = std::fs::read_to_string(root.join("runs")).map(|t| t.lines().count()).unwrap_or(0);

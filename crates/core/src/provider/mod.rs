@@ -32,13 +32,23 @@ pub(crate) fn body_excerpt(body: &serde_json::Value) -> String {
 }
 
 /// The day RunPod retires REST v1 (`rest.runpod.io/v1`, the [`runpod`] backend), per its
-/// v1→v2 migration guide. Shown by `config check` while v1 is still selected.
+/// v1→v2 migration guide. `config check` warns with it while v1 is still selected.
 pub const RUNPOD_V1_RETIREMENT: &str = "2026-11-15";
+
+/// What to tell an operator whose config still says `RUNPOD_API=v1`, wherever v1 is the
+/// reason something can't be done (a CUDA floor above 13.0, a GPU v1's create rejects,
+/// locks, the reaper). v2 is the default, so the fix is deleting the line, not setting one.
+pub const RUNPOD_V1_REMEDY: &str = "remove RUNPOD_API=v1 (v2 is the default)";
 
 /// Which RunPod REST generation the `runpod` provider talks to, from `RUNPOD_API`.
 ///
-/// v1 stays the default until v2 has been live-tested — then the operator flips it (one
-/// config line, or `RUNPOD_API=v2` in the environment), and can flip back just as fast.
+/// v2 is the default. RunPod retires REST v1 on [`RUNPOD_V1_RETIREMENT`], and v1 can't
+/// express a host CUDA floor: its create takes an exact `allowedCudaVersions` list whose
+/// schema stops at 13.0, so a v1 fleet can only ask for hosts on CUDA ≤ 13.0 — every
+/// 13.1+ host is out of reach, which starved RunPod placement ("no capacity" all day,
+/// 2026-10-19). v2 sends a real floor (`gpu.minCudaVersion`). `RUNPOD_API=v1` still
+/// selects v1 until the retirement (`config check` warns); one config line, or
+/// `RUNPOD_API=v1` in the environment for a single command.
 /// Both report themselves as provider `runpod`, so pod names, the proxy's provider tags
 /// and `--provider runpod` don't change with the switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,9 +58,9 @@ pub enum RunpodApi {
 }
 
 impl RunpodApi {
-    /// Parse `RUNPOD_API`: unset/empty → v1; `v1`/`v2` (any case); anything else is a
-    /// config error — never a silent fallback, since a typo would otherwise keep a fleet
-    /// on the retiring API (or quietly move it) without anyone noticing.
+    /// Parse `RUNPOD_API`: unset/empty → v2 (the default, see [`RunpodApi`]); `v1`/`v2`
+    /// (any case); anything else is a config error — never a silent fallback, since a
+    /// typo would otherwise quietly pick an API nobody chose.
     ///
     /// The error quotes the bad value only when it's short and version-like (`v3`,
     /// `2.0`): `RUNPOD_API` is one suffix away from `RUNPOD_API_KEY`, so a pasted key is
@@ -58,7 +68,7 @@ impl RunpodApi {
     /// logs and `config check`, which must never show a secret.
     pub fn from_config(cfg: &Config) -> Result<Self> {
         match cfg.get("RUNPOD_API").map(str::trim) {
-            None | Some("") => Ok(Self::V1),
+            None | Some("") => Ok(Self::V2),
             Some(v) if v.eq_ignore_ascii_case("v1") => Ok(Self::V1),
             Some(v) if v.eq_ignore_ascii_case("v2") => Ok(Self::V2),
             Some(other) => {
@@ -449,10 +459,10 @@ pub trait Provider: Send + Sync {
 }
 
 /// Why a backend can't lock a pod (the [`Provider::lock_support`] default). RunPod pods can
-/// be locked only through REST v2; on v1 the RunPod backend says so itself.
+/// be locked only through REST v2 (the default); on v1 the RunPod backend says so itself.
 pub(crate) fn lock_unsupported(provider: &str) -> Error {
     Error::NotImplemented(format!(
-        "not supported on {provider} — only RunPod pods can be locked, with RUNPOD_API=v2"
+        "not supported on {provider} — only RunPod pods can be locked (on RunPod REST v2, the default)"
     ))
 }
 
@@ -481,13 +491,15 @@ mod tests {
         }
     }
 
-    /// Locking is RunPod v2's alone; every other backend says why not, before any request.
+    /// Locking is RunPod v2's alone (the default: an empty `RUNPOD_API` locks too); every other
+    /// backend says why not, before any request — v1 by saying how to get back to v2.
     #[test]
     fn only_runpod_v2_can_lock() {
         let keys = "RUNPOD_API_KEY=k\nVAST_API_KEY=v\nHETZNER_API_KEY=h\n";
         for (name, api, ok, why) in [
             ("runpod", "v2", true, ""),
-            ("runpod", "v1", false, "RUNPOD_API=v2"),
+            ("runpod", "", true, ""),
+            ("runpod", "v1", false, RUNPOD_V1_REMEDY),
             ("vast", "v1", false, "not supported on vast"),
             ("hetzner", "v2", false, "not supported on hetzner"),
         ] {
@@ -623,8 +635,8 @@ mod tests {
     #[test]
     fn runpod_api_parses_known_values_and_rejects_the_rest() {
         let api = |text: &str| RunpodApi::from_config(&Config::parse(text));
-        assert_eq!(api("").unwrap(), RunpodApi::V1); // unset → default
-        assert_eq!(api("RUNPOD_API=\"\"").unwrap(), RunpodApi::V1); // empty = unset
+        assert_eq!(api("").unwrap(), RunpodApi::V2); // unset → default
+        assert_eq!(api("RUNPOD_API=\"\"").unwrap(), RunpodApi::V2); // empty = unset
         assert_eq!(api("RUNPOD_API=v1").unwrap(), RunpodApi::V1);
         assert_eq!(api("RUNPOD_API=v2").unwrap(), RunpodApi::V2);
         assert_eq!(api("RUNPOD_API=\"V2\" # new backend").unwrap(), RunpodApi::V2);
@@ -658,6 +670,7 @@ mod tests {
         for (name, api, wipes, resets) in [
             ("runpod", "v1", true, Unknown),
             ("runpod", "v2", true, Yes),
+            ("runpod", "", true, Yes), // the default is v2: a restart resets the container
             ("vast", "v1", true, Unknown),
             ("hetzner", "v1", false, No),
         ] {
@@ -668,11 +681,15 @@ mod tests {
         }
     }
 
-    /// `build("runpod")` follows RUNPOD_API. Both report as `runpod`; the v2 backend says so
-    /// in its dry-run description, which is how an operator (and this test) tells them apart.
+    /// `build("runpod")` follows RUNPOD_API, v2 when it's unset. Both report as `runpod`;
+    /// the v2 backend says so in its dry-run description, which is how an operator (and this
+    /// test) tells them apart.
     #[test]
     fn build_selects_runpod_backend_by_runpod_api() {
-        let v1 = build("runpod", &Config::parse("RUNPOD_API_KEY=k")).unwrap();
+        let default = build("runpod", &Config::parse("RUNPOD_API_KEY=k")).unwrap();
+        assert_eq!(default.name(), "runpod");
+        assert!(default.describe(&spec()).contains("RunPod API v2"), "{}", default.describe(&spec()));
+        let v1 = build("runpod", &Config::parse("RUNPOD_API_KEY=k\nRUNPOD_API=v1")).unwrap();
         assert_eq!(v1.name(), "runpod");
         assert!(!v1.describe(&spec()).contains("API v2"), "{}", v1.describe(&spec()));
         let v2 = build("runpod", &Config::parse("RUNPOD_API_KEY=k\nRUNPOD_API=v2")).unwrap();
@@ -684,6 +701,35 @@ mod tests {
         // No key is still the "not configured" error, whatever RUNPOD_API says.
         let nokey = build("runpod", &Config::parse("RUNPOD_API=v2")).err().unwrap();
         assert!(nokey.to_string().contains("RUNPOD_API_KEY"), "{nokey}");
+    }
+
+    /// REST v2 is the default (RunPod retires v1 on 2026-11-15, and v1 can't ask for a host on
+    /// CUDA 13.1+): a config without `RUNPOD_API` — or with it empty or blank, as a
+    /// commented-out template line leaves it — builds the v2 backend, its creates sending a
+    /// real CUDA floor. An explicit `v1` (any case) still builds v1 until the retirement;
+    /// `config check` warns about it (and `config`'s tests cover the environment's say).
+    #[test]
+    fn unset_runpod_api_means_v2_and_an_explicit_v1_still_works() {
+        let mut floor = spec();
+        floor.min_cuda = Some("13.1".into());
+        for text in ["RUNPOD_API_KEY=k", "RUNPOD_API_KEY=k\nRUNPOD_API=", "RUNPOD_API_KEY=k\nRUNPOD_API=\"  \""] {
+            let cfg = Config::parse(text);
+            assert_eq!(RunpodApi::from_config(&cfg).unwrap(), RunpodApi::V2, "{text:?}");
+            let p = build("runpod", &cfg).unwrap();
+            assert!(p.describe(&spec()).contains("RunPod API v2"), "{text:?}: {}", p.describe(&spec()));
+            let body = p.preview_create_body(&floor).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            assert_eq!(body["gpu"]["minCudaVersion"], "13.1", "{text:?}: a real floor");
+            assert!(p.lock_support(&Pod { provider: "runpod".into(), ..Default::default() }).is_ok(), "{text:?}");
+            assert!(build_fleet("runpod", &cfg, false).is_ok(), "{text:?}");
+        }
+        for text in ["RUNPOD_API_KEY=k\nRUNPOD_API=v1", "RUNPOD_API_KEY=k\nRUNPOD_API=\"V1\""] {
+            let cfg = Config::parse(text);
+            assert_eq!(RunpodApi::from_config(&cfg).unwrap(), RunpodApi::V1, "{text:?}");
+            let p = build("runpod", &cfg).unwrap();
+            assert!(!p.describe(&spec()).contains("API v2"), "{text:?}: {}", p.describe(&spec()));
+            let e = p.preview_create_body(&floor).unwrap_err().to_string();
+            assert!(e.contains("can't ask for it") && e.contains(RUNPOD_V1_REMEDY), "{text:?}: {e}");
+        }
     }
 
     /// A bad RUNPOD_API must fail the fleet even when RunPod isn't the primary: secondary
