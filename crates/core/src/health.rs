@@ -202,9 +202,15 @@ impl DeepFacts {
         }
     }
 
-    /// The lowest driver version any GPU reports (they share one driver; the lowest is
-    /// the safe one to judge).
+    /// The driver version: the lowest any GPU reports to nvidia-smi (they share one driver;
+    /// the lowest is the safe one to judge), else `/proc/driver/nvidia/version`'s — there even
+    /// when nvidia-smi can't run (a MIG slice).
     pub fn driver(&self) -> Option<&str> {
+        self.smi_driver().or(self.driver_proc.as_deref())
+    }
+
+    /// The driver version as nvidia-smi reports it (see [`Self::driver`]).
+    fn smi_driver(&self) -> Option<&str> {
         self.gpus
             .iter()
             .filter_map(|g| g.driver.as_deref().and_then(|d| parse_version(d).map(|v| (v, d))))
@@ -212,11 +218,23 @@ impl DeepFacts {
             .map(|(_, d)| d)
     }
 
+    /// The newest CUDA the driver supports: nvidia-smi's header, else torch's reading of it —
+    /// `true` when it is torch's (the table marks it).
+    pub fn driver_cuda(&self) -> Option<(&str, bool)> {
+        match (self.smi_cuda.as_deref(), self.torch_driver_cuda.as_deref()) {
+            (Some(c), _) => Some((c, false)),
+            (None, Some(c)) => Some((c, true)),
+            (None, None) => None,
+        }
+    }
+
     /// GPUs as the machine sees them — `2×RTX A4000`, `1×A100 80GB PCIe+1×H100` for a
     /// mixed box — else torch's count (`2×GPU`), else `-`. A MIG slice is labelled as the
     /// slice (finding #24): the provider's name for it when known (`1×B300 MIG 34GB`), else
     /// the parent plus the profile `nvidia-smi -L` shows (`1×B300 SXM6 AC MIG 1g.34gb`) —
-    /// never the bare parent card, which is not what the pod has.
+    /// never the bare parent card, which is not what the pod has. Where nvidia-smi names no
+    /// GPU (it can't run, or answers `[N/A]`) the names are torch's; torch's win outright when
+    /// they name a MIG slice (`1×A100-SXM4-40GB MIG 1g.5gb`), nvidia-smi's row being the parent.
     pub fn gpu_label(&self) -> String {
         let slices = self.mig_devices.filter(|&n| n > 0);
         if let Some(slice) = self.slice.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -227,9 +245,17 @@ impl DeepFacts {
             let profile = self.mig_profile.as_deref().map(|p| format!(" {p}")).unwrap_or_default();
             return format!("{n}×{} MIG{profile}", normalize_gpu_name(parent));
         }
+        let torch_named = self.torch_gpus.iter().any(|g| g.name.is_some());
+        let torch_mig = self.torch_gpus.iter().any(|g| g.name.as_deref().is_some_and(names_mig));
+        let smi_named = self.gpus.iter().any(|g| g.name.is_some());
+        let names: Vec<Option<&str>> = if torch_mig || (torch_named && !smi_named) {
+            self.torch_gpus.iter().map(|g| g.name.as_deref()).collect()
+        } else {
+            self.gpus.iter().map(|g| g.name.as_deref()).collect()
+        };
         let mut groups: Vec<(String, usize)> = Vec::new();
-        for g in &self.gpus {
-            let name = g.name.as_deref().map(normalize_gpu_name).unwrap_or_else(|| "GPU".into());
+        for name in names {
+            let name = name.map(normalize_gpu_name).unwrap_or_else(|| "GPU".into());
             match groups.iter_mut().find(|(n, _)| *n == name) {
                 Some((_, c)) => *c += 1,
                 None => groups.push((name, 1)),
@@ -920,7 +946,7 @@ fn smi_check(f: &DeepFacts) -> Check {
 
 fn driver_check(f: &DeepFacts, p: &HealthPolicy) -> Check {
     use Status::*;
-    let Some(driver) = f.driver() else {
+    let Some(driver) = f.smi_driver() else {
         return match f.smi.as_deref() {
             Some("ok") => Check::new("driver", Warn, "version not reported"),
             _ => Check::new("driver", Skip, "needs nvidia-smi"),
@@ -1126,7 +1152,13 @@ pub struct PodHealth {
 /// else `None`. What labels show instead of the parent card nvidia-smi names. Pure.
 pub fn mig_slice_name(pod: &Pod) -> Option<String> {
     let ty = pod.gpu_type.as_deref()?.trim();
-    ty.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w.eq_ignore_ascii_case("mig")).then(|| normalize_gpu_name(ty))
+    names_mig(ty).then(|| normalize_gpu_name(ty))
+}
+
+/// Whether a GPU name names a MIG slice: the word `MIG` in it (`B300 MIG 34GB`, torch's
+/// `NVIDIA A100-SXM4-40GB MIG 1g.5gb`) — a word, not a substring (`Migrator`).
+fn names_mig(name: &str) -> bool {
+    name.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w.eq_ignore_ascii_case("mig"))
 }
 
 /// What names the machine a pod runs on, for the same-host summary and `up --check`'s
@@ -1262,29 +1294,49 @@ pub fn judge_deep_call(pod: &Pod, call: std::result::Result<SshOutput, String>, 
     }
 }
 
-/// `NAME  RESULT  GPUS  DRIVER  CUDA  NET  NOTES`, one row per pod in the given order.
+/// What marks a CUDA version read by torch rather than nvidia-smi, and the footnote saying so.
+const TORCH_CUDA_MARK: &str = "*";
+const TORCH_CUDA_NOTE: &str = "* from torch: nvidia-smi unavailable";
+
+/// `NAME  RESULT  GPUS  DRIVER  CUDA  NET  NOTES`, one row per pod in the given order. Where
+/// nvidia-smi can't answer, the columns are torch's and `/proc`'s facts ([`DeepFacts::gpu_label`],
+/// [`DeepFacts::driver`]); a CUDA version torch read is marked, with a footnote under the table.
 pub fn render_health_table(results: &[PodHealth]) -> String {
+    let mut marked = false;
     let rows: Vec<Vec<String>> = results
         .iter()
         .map(|h| {
             let f = h.facts.as_ref();
             let or_dash = |s: Option<String>| s.unwrap_or_else(|| "-".into());
+            let cuda = f.and_then(DeepFacts::driver_cuda).map(|(c, torch)| {
+                marked |= torch;
+                if torch {
+                    format!("{c}{TORCH_CUDA_MARK}")
+                } else {
+                    c.to_string()
+                }
+            });
             vec![
                 h.name.clone(),
                 h.status.label().to_string(),
                 f.map(DeepFacts::gpu_label).unwrap_or_else(|| "-".into()),
                 or_dash(f.and_then(|f| f.driver().map(String::from))),
-                or_dash(f.and_then(|f| f.smi_cuda.clone())),
+                or_dash(cuda),
                 or_dash(f.and_then(DeepFacts::hf_mbps).map(|m| format!("{m:.1} MB/s"))),
                 h.notes(),
             ]
         })
         .collect();
-    table::render(
+    let mut out = table::render(
         &["NAME", "RESULT", "GPUS", "DRIVER", "CUDA", "NET", "NOTES"],
         &[Align::Left, Align::Left, Align::Left, Align::Left, Align::Left, Align::Right, Align::Left],
         &rows,
-    )
+    );
+    if marked {
+        out.push_str(TORCH_CUDA_NOTE);
+        out.push('\n');
+    }
+    out
 }
 
 /// `-v`: every check of one pod, `✓ name  detail` (`!` warn, `✗` fail, `-` skip).
@@ -2295,6 +2347,27 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
 
     // ---- MIG: nvidia-smi can't answer, torch can (lane MIG, 2026-10-20) ----
 
+    /// A 12.4 host CUDA floor: driver ≥ 550.
+    fn cuda124() -> HealthPolicy {
+        HealthPolicy { min_driver: driver_floor_for_cuda(&["12.4"]), ..Default::default() }
+    }
+
+    /// One GPU whose nvidia-smi says `smi` (and lists nothing), torch naming it `torch_name` and
+    /// proving it works, `/proc` giving the driver and torch the CUDA it supports.
+    fn smi_down(smi: &str, torch_name: &str) -> String {
+        edit(
+            &without(&one_gpu(), &["smi_", "gpu."]),
+            &[
+                ("smi", Some(smi)),
+                ("driver_proc", Some("570.86.15")),
+                ("torch_driver_cuda", Some("12.8")),
+                ("tgpu.0.name", Some(torch_name)),
+                ("tgpu.0.mem_total_mib", Some("4864")),
+                ("tgpu.0.mem_free_mib", Some("4600")),
+            ],
+        )
+    }
+
     const A100_SLICE: &str = "NVIDIA A100-SXM4-40GB MIG 1g.5gb";
 
     #[test]
@@ -2349,6 +2422,53 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         // An older script prints none of it.
         let f = parse_deep(HEALTHY_2GPU);
         assert_eq!((f.driver_proc, f.torch_driver_cuda, f.torch_gpus.len()), (None, None, 0));
+    }
+
+    /// Labels and the table's columns where nvidia-smi can't name the GPUs: torch's names
+    /// (MIG-aware), `/proc`'s driver, torch's CUDA (marked, with a footnote).
+    #[test]
+    fn labels_and_columns_fall_back_on_torch() {
+        let label = |out: &str| parse_deep(out).gpu_label();
+        let mig = smi_down("error: Failed to initialize NVML: Insufficient Permissions", A100_SLICE);
+        let a4000 = smi_down("error: No devices were found", "NVIDIA RTX A4000");
+        let both = edit(HEALTHY_2GPU, &[("tgpu.0.name", Some("NVIDIA RTX A4000")), ("tgpu.1.name", Some("NVIDIA RTX A4000"))]);
+        let na_names = edit(&both, &[("gpu.0.name", Some("[N/A]")), ("gpu.1.name", Some("[N/A]")), ("tgpu.1.name", Some("NVIDIA RTX A5000"))]);
+        // nvidia-smi lists the parent card (no `-L` slices), torch names the slice.
+        let parent_row = edit(&mig, &[("smi", Some("ok")), ("gpu.0.name", Some("NVIDIA A100-SXM4-40GB")), ("smi_gpus", Some("1"))]);
+        let cases: &[(&str, &str, &str)] = &[
+            ("nvidia-smi down, MIG", &mig, "1×A100-SXM4-40GB MIG 1g.5gb"),
+            ("nvidia-smi down, whole card", &a4000, "1×RTX A4000"),
+            ("nvidia-smi's [N/A] names", &na_names, "1×RTX A4000+1×RTX A5000"),
+            ("torch's slice over nvidia-smi's parent", &parent_row, "1×A100-SXM4-40GB MIG 1g.5gb"),
+            // nvidia-smi's names, when it has them, as before.
+            ("both name it", &both, "2×RTX A4000"),
+            ("nothing named", &without(&a4000, &["tgpu."]), "1×GPU"),
+        ];
+        for (what, out, want) in cases {
+            assert_eq!(label(out), *want, "{what}");
+        }
+
+        // The table: torch's label, /proc's driver, torch's CUDA marked — and the footnote once.
+        let results = vec![
+            PodHealth::checked(&pod("apple", "1.1.1.1"), parse_deep(HEALTHY_2GPU), &cuda124()),
+            PodHealth::checked(&pod("delta", "1.2.3.4"), parse_deep(&mig), &cuda124()),
+            PodHealth::checked(&pod("echo", "1.2.3.5"), parse_deep(&a4000), &cuda124()),
+        ];
+        let table = render_health_table(&results);
+        let row = |name: &str| -> Vec<String> {
+            let line = table.lines().find(|l| l.starts_with(name)).unwrap_or_else(|| panic!("no {name} row in\n{table}"));
+            line.split("  ").map(str::trim).filter(|c| !c.is_empty()).map(String::from).collect()
+        };
+        // NAME, RESULT, then GPUS DRIVER CUDA.
+        assert_eq!(row("devtest-apple")[2..5], ["2×RTX A4000", "580.65.06", "13.0"]);
+        assert_eq!(row("devtest-delta")[2..5], ["1×A100-SXM4-40GB MIG 1g.5gb", "570.86.15", "12.8*"]);
+        assert_eq!(row("devtest-echo")[2..5], ["1×RTX A4000", "570.86.15", "12.8*"]);
+        assert!(table.ends_with("\n* from torch: nvidia-smi unavailable\n"), "{table}");
+        assert_eq!(table.matches("* from torch").count(), 1);
+        // Nothing read by torch, no mark and no footnote (the table as before).
+        let plain = render_health_table(&results[..1]);
+        assert!(!plain.contains('*'), "{plain}");
+        assert!(render_report(&results, false).contains("\n* from torch: nvidia-smi unavailable\n\n"), "under the table");
     }
 
     // ---- the script itself (run locally; no network, no GPU) ----
