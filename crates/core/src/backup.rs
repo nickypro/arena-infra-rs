@@ -1007,7 +1007,9 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 /// `hard == false` (default): **gentle** — fetch origin, checkout, then fast-forward to
 /// origin's branch (`git merge --ff-only refs/remotes/origin/<branch>`). A diverged/dirty tree
 /// makes the fast-forward fail loudly rather than clobbering work, and git refuses to overwrite an
-/// untracked file. Origin's branch, named outright — never the local branch's configured upstream
+/// untracked file. All or nothing: when the checkout went through but the fast-forward didn't, it
+/// goes back to the branch it was on and says why (`switch_back`, [`SWITCH_BACK_SH`]) — or, if that
+/// fails too, which branch the pod is on now. Origin's branch, named outright — never the local branch's configured upstream
 /// (review ai-review codex #5: a `git pull --ff-only` there followed the upstream a participant's
 /// own `feat` tracked, `upstream/feat`, so it reached the course repo — failing the switch when that
 /// was unreachable, and merging the course's branch rather than the cohort's when it wasn't).
@@ -1143,6 +1145,8 @@ fn switch_script(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard:
     // Origin only, pruned: a branch origin no longer has is no branch to switch to.
     parts.push("git fetch --prune origin".into());
     parts.push("OLD=$(git rev-parse -q --verify HEAD) || OLD=".into());
+    // The branch it is on (none: a detached HEAD), for a gentle switch to go back to.
+    parts.push("PREV=$(git symbolic-ref -q --short HEAD) || PREV=".into());
     let switch = if hard {
         let remote_ref = shell_quote(&format!("origin/{branch}"));
         // What the reset discards, saved first (no save, no reset); then force-switch to the
@@ -1157,11 +1161,12 @@ fn switch_script(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard:
         // `checkout.defaultRemote`: with an `upstream` remote too (the course repo, whose branch
         // names the cohort's copy shares), a plain checkout of a branch both have refused as
         // "matched multiple remote tracking branches" (review fb2 R2); origin's is the one. Then
-        // origin's branch, by its full name — never the branch's own upstream (codex #5).
+        // origin's branch, by its full name — never the branch's own upstream (codex #5). All or
+        // nothing: a fast-forward that fails goes back where it was (`switch_back`, Live 4).
         format!(
-            "git -c checkout.defaultRemote=origin checkout {} && git merge --ff-only {}",
-            shell_quote(branch),
-            shell_quote(&format!("refs/remotes/origin/{branch}"))
+            "git -c checkout.defaultRemote=origin checkout {b} && {{ git merge --ff-only {} || {{ switch_back {b}; false; }}; }}",
+            shell_quote(&format!("refs/remotes/origin/{branch}")),
+            b = shell_quote(branch),
         )
     };
     let mut lines = vec![parts.join("; ")];
@@ -1170,6 +1175,8 @@ fn switch_script(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard:
     lines.push(unredacted_sh());
     if hard {
         lines.push(discarded_sh());
+    } else {
+        lines.push(SWITCH_BACK_SH.into());
     }
     // The putting back is the EXIT trap, set before anything is set aside: whatever ends the
     // command from here on — the switch failing, `set -e`, a signal (made an exit, so the trap
@@ -1193,6 +1200,29 @@ fn switch_script(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard:
     lines.push("[ -n \"$SWITCHED\" ]".into());
     lines.join("\n")
 }
+
+/// `switch_back <branch>`: the gentle switch is all or nothing (Live 4: a local `main` 216 commits
+/// ahead of origin's — made from `upstream/main` — was checked out, its fast-forward to origin's
+/// refused, and the pod left on it while its line said "not switched"). Its checkout went through
+/// and the fast-forward to origin's `<branch>` didn't, so it checks out again what it was on —
+/// `$PREV`, or the detached commit `$OLD` — by the same rules (that checkout just carried the tree
+/// here, so it carries it back), and says why on stderr: origin has no `<branch>`, the local one has
+/// commits origin's doesn't, or else the fast-forward failed (git said why above). If going back
+/// fails too, it says which branch the pod is on now.
+const SWITCH_BACK_SH: &str = r#"switch_back() {
+    if ! git rev-parse -q --verify "refs/remotes/origin/$1" >/dev/null; then sb_why="origin has no $1"
+    elif ! git merge-base --is-ancestor HEAD "refs/remotes/origin/$1"; then
+        sb_why="its local $1 has $(git rev-list --count "refs/remotes/origin/$1..HEAD") commit(s) origin's $1 doesn't, so it can't fast-forward to it"
+    else sb_why="the fast-forward to origin's $1 failed (git's message above)"; fi
+    if [ -n "$PREV" ]; then sb_to=$PREV sb_at=$PREV; else sb_to=$OLD sb_at="its detached HEAD ($(printf '%.10s' "$OLD"))"; fi
+    if [ -n "$sb_to" ] && git checkout -q "$sb_to"; then
+        printf '%s
+' "arena set-branch: $sb_why — not switched: back on $sb_at" >&2
+    else
+        printf '%s
+' "arena set-branch: $sb_why — not switched, and going back to $sb_at failed: it is on $(git rev-parse --abbrev-ref HEAD 2>/dev/null) now" >&2
+    fi
+}"#;
 
 /// `discarded.sh`'s functions, comments and blank lines left out: what `--hard` saves before its
 /// reset ([`checkout_command`]).
@@ -2798,7 +2828,10 @@ done
         assert!(c.contains("cd '/root/ARENA_3.0'"));
         assert!(c.contains("git fetch --prune origin"));
         // Origin's branch by its full name, never the local branch's upstream (codex #5).
-        assert!(c.contains("git -c checkout.defaultRemote=origin checkout 'main' && git merge --ff-only 'refs/remotes/origin/main'"));
+        assert!(c.contains(
+            "git -c checkout.defaultRemote=origin checkout 'main' && { git merge --ff-only 'refs/remotes/origin/main' || { switch_back 'main'; false; }; }"
+        ));
+        assert!(c.contains("PREV=$(git symbolic-ref -q --short HEAD) || PREV=") && c.contains(SWITCH_BACK_SH));
         assert!(!c.contains("git pull") && !c.contains("@{u}")); // no hard reset
         assert!(!c.contains("reset --hard") && !c.contains("discarded_save"), "gentle discards nothing, so saves nothing");
         assert!(c.contains("GIT_SSH_COMMAND='ssh -i /root/.ssh/id_ed25519"));
@@ -4219,6 +4252,90 @@ done
         assert!(o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("DISCARDED_SAVED"), "{}", String::from_utf8_lossy(&o.stderr));
         assert_eq!(saves(), std::slice::from_ref(&d));
         assert_eq!(read("untracked/solutions.py"), "mine\n");
+    }
+
+    /// Live 4: a gentle switch whose checkout went through but whose fast-forward to origin's
+    /// branch didn't (a local `main` 216 commits ahead of origin's, made from `upstream/main`) left
+    /// the pod on that branch while its line said "not switched". Now it's all or nothing: it goes
+    /// back where it was — the edit it carried carried back, the real keys back in their file — and
+    /// says why: the local branch has commits origin's doesn't, or origin has no such branch. From
+    /// a detached HEAD, back to that commit. If going back fails too, it says which branch the pod
+    /// is on now.
+    #[cfg(unix)]
+    #[test]
+    fn a_gentle_switch_whose_fast_forward_fails_goes_back_where_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = GitSandbox::new("switch-back", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let rev = |r: &str| s.git(&s.work, &["rev-parse", r]);
+        let branch = || s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        // The local main and origin's have diverged: each has a commit the other doesn't (a local
+        // `main` ahead of origin's alone fast-forwards to nothing, and stays).
+        let staff = s.base.join("staff");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), staff.to_str().unwrap()]);
+        std::fs::write(staff.join("staff.py"), "s = 1\n").unwrap();
+        s.git(&staff, &["add", "staff.py"]);
+        s.git(&staff, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "staff"]);
+        s.git(&staff, &["push", "-q", "origin", "main"]);
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        std::fs::write(s.work.join("course.py"), "c = 1\n").unwrap();
+        s.git(&s.work, &["add", "course.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "only here"]);
+        let local_main = rev("main");
+        s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+        s.git(&s.work, &["branch", "-q", "feat", "main"]);
+        let ex = format!("KEY = \"{}\"\n", openrouter_key(26));
+        std::fs::write(s.work.join("ex.py"), &ex).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.redacted.len()), (Some(0), 1), "{err}");
+        let head = rev("HEAD");
+        std::fs::write(s.work.join("README.md"), "an edit, carried\n").unwrap();
+        let switch = |to: &str, path: Option<&str>| {
+            let cmd = checkout_command(repo, to, None, false);
+            match path {
+                Some(path) => run_on_path(&cmd, path),
+                None => {
+                    let o = s.run(&cmd);
+                    (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
+                }
+            }
+        };
+        let back = |to: &str, why: &str| {
+            let (code, out, err) = switch(to, None);
+            assert_ne!(code, Some(0), "{to}: {out}{err}");
+            assert!(err.trim_end().ends_with(&format!("arena set-branch: {why} — not switched: back on autocommit-x")), "{to}: {err}");
+            assert_eq!((branch(), rev("HEAD")), ("autocommit-x".to_string(), head.clone()), "{to}");
+            assert_eq!(s.read("README.md"), b"an edit, carried\n", "{to}");
+            assert!(out.contains("UNREDACTED_RESTORED ex.py") && s.read("ex.py") == ex.as_bytes(), "{to}: the real key back: {out}");
+        };
+        back("main", "its local main has 1 commit(s) origin's main doesn't, so it can't fast-forward to it");
+        assert_eq!(rev("main"), local_main, "main as it was");
+        back("feat", "origin has no feat");
+        // From a detached HEAD: back to that commit.
+        s.git(&s.work, &["checkout", "-q", "--detach"]);
+        let (code, _, err) = switch("main", None);
+        assert_ne!(code, Some(0));
+        assert!(err.contains(&format!("not switched: back on its detached HEAD ({})", &head[..10])), "{err}");
+        assert_eq!((branch(), rev("HEAD")), ("HEAD".to_string(), head.clone()));
+        s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+        // Going back fails too: said, with the branch it is on.
+        let bin = s.base.join("bin-noback");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join("git"),
+            format!("#!/bin/sh\nif [ \"$*\" = 'checkout -q autocommit-x' ]; then echo 'error: no going back' >&2; exit 1; fi\nexec {} \"$@\"\n", shell_quote(&real_git())),
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let (code, _, err) = switch("main", Some(&path));
+        assert_ne!(code, Some(0));
+        assert!(
+            err.contains("its local main has 1 commit(s) origin's main doesn't, so it can't fast-forward to it — not switched, and going back to \
+                          autocommit-x failed: it is on main now"),
+            "{err}"
+        );
+        assert_eq!(branch(), "main");
     }
 
     /// Review ai-review claude #13: the switch's HUP/INT/TERM trap (the keys put back) was said to
