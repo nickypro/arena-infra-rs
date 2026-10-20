@@ -42,7 +42,7 @@ pub const PROC_SENTINEL: &str = "@@ARENA_PROC@@";
 ///   refused it, and every repo with a filter driver (git-lfs puts `filter.lfs.*` in the global
 ///   config) read `dirty` unknown (review ai-review claude #8). sh, bash and zsh read it alike.
 /// - `ro_setup` (in the repo): `$ro_drivers` (each name then a space) is every filter driver the
-///   config defines, for `ro_git` to empty — no clean/smudge/process, not required: git hashes a
+///   config defines (read through `ro_git`, so within `$ro_timeout` too), for `ro_git` to empty — no clean/smudge/process, not required: git hashes a
 ///   racily-clean file's content even in plumbing, and that would run its clean filter. A driver
 ///   a `.gitattributes` names but no config defines runs nothing anyway. Fails (nothing to
 ///   compare with) when the config can't be read or a driver's name has anything but
@@ -75,7 +75,7 @@ pub const RO_GIT_SH: &str = r#"ro_git() {
 }
 ro_setup() {
     ro_drivers=
-    ro_k=$(command git -c core.fsmonitor= config --name-only --get-regexp '^filter[.]' 2>/dev/null)
+    ro_k=$(ro_git config --name-only --get-regexp '^filter[.]' 2>/dev/null)
     case $? in 0 | 1) ;; *) return 1 ;; esac
     if printf '%s\n' "$ro_k" | LC_ALL=C grep -q '[^A-Za-z0-9._-]'; then return 1; fi
     ro_drivers=$(printf '%s\n' "$ro_k" | sed -e '/^$/d' -e 's/^filter[.]//' -e 's/[.][^.]*$//' | sort -u | tr '\n' ' ')
@@ -130,6 +130,21 @@ pub struct ProbeOpts {
     pub repo_path: Option<String>,
     /// The deploy key path on the pod (`GIT_SSH_KEY_REMOTE`) — enables the key check.
     pub key_remote: Option<String>,
+    /// Bound each `nvidia-smi` to this many seconds where the pod has `timeout` (`pods ask`'s
+    /// probe: a wedged GPU must cost only the GPU's facts, not the whole call's budget); `None`:
+    /// unbounded but for the probe's own budget (the dashboard's).
+    pub nvidia_smi_timeout: Option<u64>,
+}
+
+/// `nvidia-smi ARGS`, within `secs` where the pod has `timeout` — one simple command, which any
+/// login shell reads alike — else as it is.
+fn nvidia_smi(args: &str, secs: Option<u64>) -> String {
+    match secs {
+        None => format!("nvidia-smi {args}"),
+        Some(s) => format!(
+            "sh -c 'if command -v timeout >/dev/null 2>&1; then exec timeout {s} nvidia-smi \"$@\"; else exec nvidia-smi \"$@\"; fi' nvidia-smi {args}"
+        ),
+    }
 }
 
 /// Parse `nvidia-smi --format=csv,noheader,nounits` output into one stat per GPU.
@@ -298,7 +313,8 @@ impl PodMetrics {
 
 /// Build the single combined remote command for a probe.
 fn remote_command(opts: &ProbeOpts) -> String {
-    let mut s = format!("{NVIDIA_SMI_QUERY} 2>/dev/null; echo '{SENTINEL}'; ");
+    let query = NVIDIA_SMI_QUERY.strip_prefix("nvidia-smi ").unwrap_or(NVIDIA_SMI_QUERY);
+    let mut s = format!("{} 2>/dev/null; echo '{SENTINEL}'; ", nvidia_smi(query, opts.nvidia_smi_timeout));
     if let Some(repo) = &opts.repo_path {
         let q = shell_quote(repo);
         // Every git here is `ro_git` ([`RO_GIT_SH`]): nothing the participant's repo configures
@@ -376,7 +392,8 @@ fn remote_command(opts: &ProbeOpts) -> String {
     // names can contain '='/','). `used_memory` before `process_name` so the name is the
     // free-text tail. No-GPU / no-process pods just emit nothing here.
     s.push_str(&format!(
-        "echo '{PROC_SENTINEL}'; nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv,noheader,nounits 2>/dev/null; "
+        "echo '{PROC_SENTINEL}'; {} 2>/dev/null; ",
+        nvidia_smi("--query-compute-apps=pid,used_memory,process_name --format=csv,noheader,nounits", opts.nvidia_smi_timeout)
     ));
     // The probe is a `;`-chain of independent reads, so its overall exit code is just the
     // LAST command's. That last command is nvidia-smi, which doesn't exist on a CPU/Hetzner
@@ -709,6 +726,7 @@ mod tests {
             progress_cmd: Some("cat /tmp/p".into()),
             repo_path: Some("/root/ARENA_3.0".into()),
             key_remote: Some("/root/.ssh/id_ed25519".into()),
+            nvidia_smi_timeout: None,
         });
         assert!(cmd.contains("nvidia-smi"));
         assert!(cmd.contains("git rev-parse --abbrev-ref HEAD"));

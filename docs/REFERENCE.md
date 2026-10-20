@@ -1242,16 +1242,18 @@ Name pods or pass `--all` (this cohort's; `--include-non-cohort` for every pod; 
 
 #### What it reads
 
-Read-only, one SSH call per pod (60 s budget). It reads: the dashboard's metrics probe (GPUs and
-their processes, CPU, memory, the root disk, the repo's branch, origin, commits not pushed, recent
-commit subjects, whether `~/.name`, the deploy key and the API/HF/Claude Code tokens are set up —
-never `PROGRESS_CMD`, your own command, which may write), `pods jobs`' listing and the newest job's
-last 40 log lines, and a small probe: the pod's clock and uptime, load, `/`, `/workspace` and the
-home's size, logins (user, tty, time — **not** where from), tmux sessions, the busiest processes by
-CPU and memory with their arguments, the repo's working tree (counts, the first 20 changed file
-**names**, stashes, the last commit, and an operation in progress by the backup's own test — a
-merge, cherry-pick, revert, `git am`, rebase, sequence or a stash pop's conflicts — read as what it
-means: the backup is BUSY, how the participant ends it, and whether `pods backup` finishes it after
+Read-only, one SSH call per pod (60 s budget; each `nvidia-smi`, each git call of the repo's part,
+and the small probe's `du`, `df`, `ps`, `who` and `tmux` bounded on the pod, so a wedged GPU or a
+hung volume costs only its own facts). It reads: the dashboard's metrics probe (GPUs and their
+processes, CPU, memory, the root disk, the repo's branch, origin, commits not pushed, recent commit
+subjects, whether `~/.name`, the deploy key and the API/HF/Claude Code tokens are set up — never
+`PROGRESS_CMD`, your own command, which may write), `pods jobs`' listing and the newest job's last
+40 log lines, and a small probe: the pod's clock and uptime, load, `/`, `/workspace` and the home's
+size, logins (user, tty, time — **not** where from), tmux sessions, the busiest processes by CPU and
+memory with their arguments, the repo's working tree (counts, the first 20 changed file **names**,
+stashes, the last commit, and an operation in progress by the backup's own test — a merge,
+cherry-pick, revert, `git am`, rebase, sequence or a stash pop's conflicts — read as what it means:
+the backup is BUSY, how the participant ends it, and whether `pods backup` finishes it after
 `BUSY_AUTO_RESOLVE_HOURS`). With it, from this machine: the pod's listing row (status, GPU, $/h,
 endpoint, age, lock, maintenance), its last `pods test --deep` verdict, which local file backups
 (`pods pull`) exist of it, the backup's record of its last whole copy while BUSY

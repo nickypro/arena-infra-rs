@@ -115,8 +115,11 @@ elif ! command -v git >/dev/null 2>&1; then
     o git nogit
 else
     # From here every `git` is `ro_git`, busy_op's `git ls-files -u` (an index read: an
-    # fsmonitor hook would run) included; `ro_git` itself reaches the binary.
+    # fsmonitor hook would run) and ro_setup's config read included; `ro_git` itself reaches the
+    # binary. Each within 10 s, the whole repo section through (a hung /workspace volume costs
+    # this section, never the lines above it).
     git() { ro_git "$@"; }
+    ro_timeout=10
     if ! top=$(git rev-parse --show-toplevel 2>/dev/null) || ! cd "$top" 2>/dev/null; then
         o git notrepo
     else
@@ -129,8 +132,7 @@ else
         if [ -z "$op" ] && [ -f "$gd/BISECT_LOG" ]; then op=bisect; fi
         o op "${op:--}"
         # The working tree from plumbing (`ro_changes`: a file only touched may count as
-        # modified), each git call within 10 s.
-        ro_timeout=10
+        # modified).
         if ro_setup && s=$(ro_changes 2>/dev/null); then
             o status ok
             o modified "$(printf '%s\n' "$s" | grep . | grep -c -v '^??')"
@@ -139,10 +141,10 @@ else
         else
             o status err
         fi
-        ro_timeout=
         o last "$(git log -1 --format='%ct %s' 2>/dev/null | head -c 300)"
         o upstream "$(git rev-parse --abbrev-ref '@{u}' 2>/dev/null)"
         o stashes "$(git stash list 2>/dev/null | wc -l | tr -cd '0-9')"
     fi
+    ro_timeout=
 fi
 o done 1

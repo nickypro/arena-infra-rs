@@ -35,9 +35,13 @@ use crate::jobs::{self, JobInfo, JobState, ReadReply};
 use crate::metrics::{self, PodMetrics, ProbeOpts};
 use crate::pod::Pod;
 
-/// The budget for one pod's call: the extra probe's slowest steps (`du` of the home, `git
-/// status`) are bounded at 10–20 s each on the pod.
+/// The budget for one pod's call: its slow steps are bounded on the pod — each `nvidia-smi`
+/// ([`NVIDIA_SMI_SECS`]), the extra probe's `du`, `df`, `ps`, `who`, `tmux`, and each git call of
+/// its repo section (10 s) — so a hang there costs that section, not the sections after it.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long each `nvidia-smi` in the call may take (`super::probe_opts`).
+pub const NVIDIA_SMI_SECS: u64 = 10;
 
 /// Most bytes one pod's bundle takes in a prompt.
 pub const BUNDLE_CAP: usize = 6 * 1024;
@@ -1503,7 +1507,7 @@ mod tests {
         let clear = || std::fs::read_dir(&marks).unwrap().flatten().for_each(|e| std::fs::remove_file(e.path()).unwrap());
         clear();
 
-        let opts = ProbeOpts { repo_path: Some(repo.display().to_string()), key_remote: None, progress_cmd: None };
+        let opts = ProbeOpts { repo_path: Some(repo.display().to_string()), ..Default::default() };
         let sh = |cmd: String| {
             let o = Command::new("sh").arg("-c").arg(cmd).current_dir(&home).env("HOME", &home).output().unwrap();
             String::from_utf8_lossy(&o.stdout).into_owned()
@@ -1583,7 +1587,7 @@ mod tests {
         std::fs::write(repo.join("b.py"), "y = 1\n").unwrap();
         let index = std::fs::read(repo.join(".git/index")).unwrap();
 
-        let opts = ProbeOpts { repo_path: Some(repo.display().to_string()), key_remote: Some("/nonexistent/key".into()), progress_cmd: None };
+        let opts = ProbeOpts { repo_path: Some(repo.display().to_string()), key_remote: Some("/nonexistent/key".into()), progress_cmd: None, nvidia_smi_timeout: Some(10) };
         let out = Command::new("sh")
             .arg("-c")
             .arg(probe_command(&opts, &repo.display().to_string(), NONCE))

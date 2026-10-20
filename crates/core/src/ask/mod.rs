@@ -75,12 +75,15 @@ pub fn pod_cap(pods: usize) -> usize {
 /// `PROGRESS_CMD`, which an ask never runs (review ai-review codex #4): it is the operator's own
 /// command, run on the pod as root, and nothing holds it to reading — it may write a file or a
 /// cache, or run a plain `git status` (an fsmonitor hook, a filter: what `ro_git` keeps out).
-/// `pods ask` only reads.
+/// `pods ask` only reads. Each `nvidia-smi` within [`bundle::NVIDIA_SMI_SECS`] (review ai-review
+/// claude #6): the GPU facts come first in the call, so a wedged GPU would otherwise take the
+/// whole budget and every section after it.
 pub fn probe_opts(cfg: &Config) -> ProbeOpts {
     ProbeOpts {
         progress_cmd: None,
         repo_path: Some(crate::backup::repo_path(cfg)),
         key_remote: Some(cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string()),
+        nvidia_smi_timeout: Some(bundle::NVIDIA_SMI_SECS),
     }
 }
 
@@ -633,6 +636,27 @@ mod tests {
         let tag = |p: &str| p.split("===== BEGIN POD DATA ").nth(2).and_then(|r| r.split(' ').next()).unwrap().to_string();
         let (one, two) = (prompt("q", &b, &c, NOW), prompt("q", &b, &c, NOW));
         assert!(tag(&one) != tag(&two) && tag(&one).len() == 16, "{} {}", tag(&one), tag(&two));
+    }
+
+    /// Review ai-review claude #6: the call's slow steps are bounded on the pod. Each
+    /// `nvidia-smi` within 10 s where the pod has `timeout` (the GPU facts come first in the call:
+    /// a wedged GPU took the whole budget, every section after it lost); every git of the repo
+    /// section within 10 s — `ro_timeout=10` before its first (the toplevel's), cleared after its
+    /// last, `ro_setup`'s config read through `ro_git` too. The dashboard's own probe keeps
+    /// `nvidia-smi` as it was.
+    #[test]
+    fn the_calls_slow_steps_are_bounded_on_the_pod() {
+        let cmd = bundle::probe_command(&probe_opts(&cfg("")), "/root/ARENA_materials", "0123456789abcdef");
+        let bounded = "sh -c 'if command -v timeout >/dev/null 2>&1; then exec timeout 10 nvidia-smi \"$@\"; else exec nvidia-smi \"$@\"; fi' nvidia-smi --query-";
+        assert_eq!((cmd.matches(bounded).count(), cmd.matches("nvidia-smi --query-").count()), (2, 2), "{cmd}");
+        let script = bundle::probe_script();
+        let at = |needle: &str| script.find(needle).unwrap_or_else(|| panic!("{needle} in probe.sh"));
+        assert!(at("\n    ro_timeout=10\n") < at("top=$(git rev-parse --show-toplevel"), "set before the repo's first git");
+        assert!(at("o stashes") < at("\n    ro_timeout=\nfi\no done 1"), "cleared after its last");
+        assert_eq!(script.matches("ro_timeout=").count(), 2, "set once, cleared once");
+        assert!(crate::metrics::RO_GIT_SH.contains("ro_k=$(ro_git config --name-only --get-regexp '^filter[.]' 2>/dev/null)"));
+        let dashboard = crate::metrics::probe_command(&ProbeOpts { repo_path: Some("/r".into()), ..Default::default() });
+        assert!(dashboard.starts_with("nvidia-smi --query-gpu=") && !dashboard.contains("exec timeout"), "{dashboard}");
     }
 
     #[test]
