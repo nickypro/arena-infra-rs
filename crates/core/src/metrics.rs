@@ -41,6 +41,11 @@ pub const PROC_SENTINEL: &str = "@@ARENA_PROC@@";
 ///   shell — zsh on the pods — which doesn't split one, so git got all of them as one argument,
 ///   refused it, and every repo with a filter driver (git-lfs puts `filter.lfs.*` in the global
 ///   config) read `dirty` unknown (review ai-review claude #8). sh, bash and zsh read it alike.
+///   The driver list is read to its end whatever it holds: its last name's space put back when it
+///   isn't there, a pass that doesn't shrink it ends the loop, an empty name skipped (review
+///   ai-review claude #8: `lfs` without its space never shrank, the loop ran forever and `"$@"`
+///   grew without bound, as root on a pod). `ro_drivers` and `ro_timeout` are set (empty) where the
+///   functions are defined: one inherited from the login shell's environment is never used.
 /// - `ro_setup` (in the repo): `$ro_drivers` (each name then a space) is every filter driver the
 ///   config defines (read through `ro_git`, so within `$ro_timeout` too), for `ro_git` to empty — no clean/smudge/process, not required: git hashes a
 ///   racily-clean file's content even in plumbing, and that would run its clean filter. A driver
@@ -53,12 +58,18 @@ pub const PROC_SENTINEL: &str = "@@ARENA_PROC@@";
 ///   own helpers) and `ls-files --others` (`?? path`, an untracked directory as `dir/`). It may
 ///   overcount: a file only touched (its stat changed, its content not) reads as modified until
 ///   git refreshes the index — fine for a count. Fails when any of them does.
-pub const RO_GIT_SH: &str = r#"ro_git() {
+pub const RO_GIT_SH: &str = r#"ro_drivers=
+ro_timeout=
+ro_git() {
     ro_n=$#
     ro_r=${ro_drivers:-}
+    [ -z "$ro_r" ] || ro_r="${ro_r% } "
     while [ -n "$ro_r" ]; do
         ro_d=${ro_r%% *}
-        ro_r=${ro_r#* }
+        ro_s=${ro_r#* }
+        [ "$ro_s" != "$ro_r" ] || break
+        ro_r=$ro_s
+        [ -n "$ro_d" ] || continue
         set -- "$@" -c "filter.$ro_d.clean=" -c "filter.$ro_d.smudge=" -c "filter.$ro_d.process=" -c "filter.$ro_d.required=false"
     done
     while [ "$ro_n" -gt 0 ]; do
@@ -750,6 +761,45 @@ mod tests {
         // which would otherwise exit 127 as the chain's last command) isn't reported as a
         // wholly-failed probe — see remote_command's trailing `true`.
         assert!(cmd.trim_end().ends_with("true"));
+    }
+
+    /// Review ai-review claude #8 (lane ASK7 item F): `ro_git`'s driver loop ends whatever
+    /// `ro_drivers` holds — `lfs` without its trailing space never shrank, so the loop ran forever,
+    /// `"$@"` growing, as root on a pod; names two spaces apart; none — and a `ro_drivers` (or a
+    /// `ro_timeout`) inherited from the environment is never used: the dashboard's probe runs in
+    /// the pod user's login shell. Under bash and zsh, each run inside a `timeout`, a stub git
+    /// printing what it got.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ro_gits_driver_loop_always_ends() {
+        use std::process::Command;
+        let t = crate::ask::ai::tests::Tmp::new("ro-loop");
+        let bin = t.0.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        crate::remote::write_test_script(bin.join("git"), "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let shells: Vec<&str> = crate::backup::tests::login_shells().into_iter().filter(|s| *s != "fish").collect();
+        assert!(shells.contains(&"bash"), "{shells:?}");
+        let run = |shell: &str, script: String, env: &[(&str, &str)]| {
+            let mut c = Command::new("timeout");
+            c.args(["-k", "1", "5", shell, "-c", &script]).env_clear().env("PATH", &path);
+            c.envs(env.iter().copied());
+            let o = c.output().unwrap();
+            assert!(o.status.success(), "{shell}: {script:?} {env:?} → {:?} (124/137: it spun)", o.status.code());
+            String::from_utf8(o.stdout).unwrap().lines().map(String::from).collect::<Vec<_>>()
+        };
+        for shell in shells {
+            for (drivers, want) in [("lfs", &["lfs"][..]), ("lfs ", &["lfs"]), ("a  b", &["a", "b"]), ("a b ", &["a", "b"]), ("", &[])] {
+                let args = run(shell, format!("{RO_GIT_SH}ro_drivers='{drivers}'\nro_git status"), &[]);
+                let filters: Vec<&str> = args.iter().filter(|a| a.starts_with("filter.")).map(String::as_str).collect();
+                let expect: Vec<String> = want.iter().flat_map(|d| ["clean=", "smudge=", "process=", "required=false"].map(|k| format!("filter.{d}.{k}"))).collect();
+                assert_eq!(filters, expect, "{shell} {drivers:?}");
+                assert_eq!(args.last().map(String::as_str), Some("status"), "{shell} {drivers:?}");
+            }
+            // Inherited from the environment: neither is used (a `timeout abc` would refuse to run git).
+            let args = run(shell, format!("{RO_GIT_SH}ro_git status"), &[("ro_drivers", "evil"), ("ro_timeout", "abc")]);
+            assert!(args.first().is_some_and(|a| a == "--no-optional-locks") && !args.iter().any(|a| a.contains("evil")), "{shell}: {args:?}");
+        }
     }
 
     /// Review ai-review claude #8: the dashboard's probe runs in the pod user's login shell — zsh

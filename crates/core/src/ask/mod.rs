@@ -657,7 +657,7 @@ mod tests {
         let at = |needle: &str| script.find(needle).unwrap_or_else(|| panic!("{needle} in probe.sh"));
         assert!(at("\n    ro_timeout=10\n") < at("top=$(git rev-parse --show-toplevel"), "set before the repo's first git");
         assert!(at("o stashes") < at("\n    ro_timeout=\nfi\no done 1"), "cleared after its last");
-        assert_eq!(script.matches("ro_timeout=").count(), 2, "set once, cleared once");
+        assert_eq!(bundle::PROBE_SCRIPT.matches("ro_timeout=").count(), 2, "set once, cleared once");
         assert!(crate::metrics::RO_GIT_SH.contains("ro_k=$(ro_git config --name-only --get-regexp '^filter[.]' 2>/dev/null)"));
         let dashboard = crate::metrics::probe_command(&ProbeOpts { repo_path: Some("/r".into()), ..Default::default() });
         assert!(dashboard.starts_with("nvidia-smi --query-gpu=") && !dashboard.contains("exec timeout"), "{dashboard}");
