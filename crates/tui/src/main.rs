@@ -386,25 +386,45 @@ async fn main() -> Result<()> {
         last_table: std::cell::Cell::new((Rect::default(), 0)),
     };
 
+    dashboard(&shared, &provider, &interval, &nudge, &details_wanted, ui).await
+}
+
+/// The dashboard on this terminal until it ends — `main`'s, and a test's copy's. However it ends,
+/// the latch comes first (`arena_core::remote::end_children`: no child starts after it), then the
+/// terminal is put back, then every child still running is stopped (TERM, then KILL after the
+/// grace: `arena_core::remote::stop_all_children`) — the operator's terminal back at once, never
+/// held for the grace (review ai-review claude #4). `q` and Ctrl-C end the loop, and that's done
+/// here, the runtime then dropping the rest; a hangup, a TERM, a dead terminal or a failed read or
+/// draw end it from outside the loop ([`end_now`], which exits). A cause after the first leaves
+/// the ending to that one.
+async fn dashboard(
+    shared: &Arc<Mutex<Shared>>,
+    provider: &Arc<dyn Provider>,
+    interval: &AtomicU64,
+    nudge: &Notify,
+    details_wanted: &AtomicBool,
+    ui: Ui,
+) -> Result<()> {
     exit_on_signals();
     let mut terminal = setup_terminal()?;
     exit_on_hangup();
-    let res = run(&mut terminal, &shared, &provider, &interval, &nudge, &details_wanted, ui).await;
-    // However the loop ended — `q`, Ctrl-C, or the terminal failing under a read or a draw — a
-    // question still being asked (`?`) is stopped first: its whole group, TERM, then KILL after
-    // the grace.
-    arena_core::remote::stop_all_groups().await;
-    if let Err(e) = res {
-        // A terminal that fails a read or a draw is taken as gone: no retry, the terminal put
-        // back as far as it can be, the error said where stderr still goes.
-        arena_core::ask::ai::remove_scratch();
-        restore_best_effort();
-        use std::io::Write;
-        let _ = writeln!(std::io::stderr(), "arena-tui: {e:#}");
-        std::process::exit(1);
+    match run(&mut terminal, shared, provider, interval, nudge, details_wanted, ui).await {
+        // `q` or Ctrl-C — or the loop finding the terminal put back by an end already under way,
+        // which exits.
+        Ok(()) => {
+            if !arena_core::remote::end_children() {
+                return std::future::pending().await;
+            }
+            let restored = restore_terminal(&mut terminal);
+            arena_core::remote::stop_all_children().await;
+            restored.map(drop)
+        }
+        // A terminal that fails a read or a draw is taken as gone: no retry.
+        Err(e) => {
+            end_now(1, Some(format!("{e:#}"))).await;
+            Ok(())
+        }
     }
-    restore_terminal(&mut terminal)?;
-    Ok(())
 }
 
 /// When the background refresh runs: every `interval` seconds, or at once on `nudge`;
@@ -717,12 +737,20 @@ fn status_line(s: &FleetSummary, warnings: &[&str]) -> String {
 }
 
 /// Whether the terminal is the dashboard's now — raw mode, the alternate screen, the mouse — so
-/// ending from outside the loop should put it back ([`restore_best_effort`]); not while `c`'s
-/// ssh has it.
-static TERMINAL_OURS: AtomicBool = AtomicBool::new(false);
+/// an end from outside the loop puts it back ([`restore_best_effort`]); not while `c`'s ssh has
+/// it. Held while the terminal changes hands ([`setup_terminal`], [`restore_terminal`]), while a
+/// frame is drawn ([`while_ours`]) and while that end puts it back: so none of them interleaves
+/// with another, and no frame is drawn once it's back (on the main screen).
+static TERMINAL: Mutex<bool> = Mutex::new(false);
 
+fn terminal_ours() -> std::sync::MutexGuard<'static, bool> {
+    TERMINAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Take the terminal: raw mode, the alternate screen, the mouse.
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
-    TERMINAL_OURS.store(true, Ordering::SeqCst);
+    let mut ours = terminal_ours();
+    *ours = true;
     enable_raw_mode()?;
     let mut out = stdout();
     // EnableMouseCapture: wheel-scroll the list + click to select/multi-select rows.
@@ -730,12 +758,28 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     Ok(Terminal::new(CrosstermBackend::new(out))?)
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    TERMINAL_OURS.store(false, Ordering::SeqCst);
+/// Give the terminal back. `false`: it wasn't the dashboard's — an end from outside the loop has
+/// put it back already — and nothing is written.
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<bool> {
+    let mut ours = terminal_ours();
+    if !std::mem::replace(&mut *ours, false) {
+        return Ok(false);
+    }
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
-    Ok(())
+    Ok(true)
+}
+
+/// `f` on the terminal — a frame, a clear — while it is the dashboard's ([`TERMINAL`], held
+/// meanwhile). `false`, `f` not called: it isn't — an end from outside the loop has put it back.
+fn while_ours(terminal: &mut Terminal<CrosstermBackend<Stdout>>, f: impl FnOnce(&mut Terminal<CrosstermBackend<Stdout>>) -> std::io::Result<()>) -> Result<bool> {
+    let ours = terminal_ours();
+    if !*ours {
+        return Ok(false);
+    }
+    f(terminal)?;
+    Ok(true)
 }
 
 /// How long [`restore_best_effort`] waits for the terminal to take its last writes.
@@ -744,16 +788,18 @@ const RESTORE_WAIT: Duration = Duration::from_millis(300);
 /// The terminal put back as [`restore_terminal`] does — raw mode off, the main screen, no mouse
 /// capture, the cursor shown — when the dashboard ends from outside its loop: best effort (on a
 /// hung-up terminal every step fails, and that's fine), on a thread of its own waited for no more
-/// than [`RESTORE_WAIT`] (a terminal that has stopped reading would hold a write for ever).
-/// Nothing when the terminal isn't the dashboard's ([`TERMINAL_OURS`]).
+/// than [`RESTORE_WAIT`] (a terminal that has stopped reading would hold a write for ever, or a
+/// frame's draw the lock). Nothing when the terminal isn't the dashboard's ([`TERMINAL`]): `c`'s
+/// ssh has it, and what ssh did to it is ssh's to undo.
 fn restore_best_effort() {
-    if !TERMINAL_OURS.swap(false, Ordering::SeqCst) {
-        return;
-    }
     let (done, wait) = std::sync::mpsc::channel();
     let restoring = std::thread::Builder::new().name("restore".into()).spawn(move || {
-        let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture, crossterm::cursor::Show);
+        let mut ours = terminal_ours();
+        if std::mem::replace(&mut *ours, false) {
+            let _ = disable_raw_mode();
+            let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture, crossterm::cursor::Show);
+        }
+        drop(ours);
         let _ = done.send(());
     });
     if restoring.is_ok() {
@@ -769,23 +815,35 @@ const SIGTERM: i32 = 15;
 /// How often [`exit_on_hangup`] looks at the terminal.
 const HANGUP_POLL: Duration = Duration::from_millis(200);
 
-/// Set by the first [`end_now`]: a second cause (the hangup's SIGHUP and the dead terminal seen,
-/// a TERM after a HUP) waits for that one's exit.
-static ENDING: AtomicBool = AtomicBool::new(false);
-
 /// End the dashboard now, from outside its event loop — which may never come round again: on a
-/// hung-up terminal crossterm's read spins for ever (live ASK4 3c) — so nothing here waits on
-/// it. Every AI child's group still running is stopped as an ask's is (TERM, then KILL after the
-/// grace: `arena_core::remote::stop_all_groups`), its scratch directory removed (`exit` drops
-/// nothing: `arena_core::ask::ai::remove_scratch`), the terminal put back as far as it can be
-/// ([`restore_best_effort`]), then `exit(code)`.
-async fn end_now(code: i32) {
-    if ENDING.swap(true, Ordering::SeqCst) {
+/// hung-up terminal crossterm's read spins for ever (live ASK4 3c) — so nothing here waits on it.
+/// In order:
+/// 1. the latch (`arena_core::remote::end_children`), before anything else: no child starts after
+///    it (review ai-review codex #3), and a later cause — the hangup's SIGHUP and the dead terminal
+///    both seen, a TERM after a HUP, the loop failing on the dead terminal — waits for this one's
+///    exit;
+/// 2. the terminal put back as far as it can be ([`restore_best_effort`]), at once, never after
+///    the grace (review ai-review claude #4), and `why` said there;
+/// 3. stdin parked (`arena_core::tty::park_stdin`): the loop's next read waits, no longer spinning
+///    a core on a dead terminal meanwhile (live ASK5 F1);
+/// 4. every child still running stopped — the AI's whole group, and every ssh, scp and rsync of a
+///    refresh, an action or a backup, which an `exit` left running before (review ai-review
+///    claude #1) — TERM, then KILL after the grace (`arena_core::remote::stop_all_children`);
+/// 5. the asks' scratch directories removed (`exit` drops nothing:
+///    `arena_core::ask::ai::remove_scratch`);
+/// 6. `exit(code)`.
+async fn end_now(code: i32, why: Option<String>) {
+    if !arena_core::remote::end_children() {
         return std::future::pending().await;
     }
-    arena_core::remote::stop_all_groups().await;
-    arena_core::ask::ai::remove_scratch();
     restore_best_effort();
+    if let Some(why) = why {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "arena-tui: {why}");
+    }
+    arena_core::tty::park_stdin();
+    arena_core::remote::stop_all_children().await;
+    arena_core::ask::ai::remove_scratch();
     std::process::exit(code)
 }
 
@@ -876,7 +934,7 @@ fn connect_ssh(
     // Blocking, inherits this terminal (interactive PTY). ssh_args carries the port/keys.
     let status = std::process::Command::new("ssh").args(target.ssh_args()).status();
     *terminal = setup_terminal()?;
-    terminal.clear()?;
+    while_ours(terminal, |t| t.clear())?;
     if let Err(e) = status {
         ui.mode = Mode::Result(format!("✗ ssh {}: {e}", pod.name));
     }
@@ -1030,7 +1088,7 @@ fn exit_on_signals() {
         if let Ok(mut listener) = signal(kind) {
             tokio::spawn(async move {
                 if listener.recv().await.is_some() {
-                    end_now(128 + signo).await;
+                    end_now(128 + signo, None).await;
                 }
             });
         }
@@ -1048,7 +1106,7 @@ fn exit_on_hangup() {
         loop {
             tokio::time::sleep(HANGUP_POLL).await;
             if fds.iter().any(|&fd| arena_core::tty::hung_up(fd)) {
-                end_now(128 + SIGHUP).await;
+                end_now(128 + SIGHUP, None).await;
             }
         }
     });
@@ -1090,7 +1148,11 @@ async fn run(
         let secs = interval.load(Ordering::Relaxed);
         {
             let s = shared.lock().unwrap();
-            terminal.draw(|f| view(f, &s, &ui, secs))?;
+            // Put back by an end from outside the loop ([`end_now`]): nothing more to draw — the
+            // loop ends, and that end exits.
+            if !while_ours(terminal, |t| t.draw(|f| view(f, &s, &ui, secs)).map(drop))? {
+                return Ok(());
+            }
         }
 
         // Short poll: the loop keeps redrawing (~7 fps) so live data and the
@@ -1303,7 +1365,7 @@ async fn run(
                                     ));
                                     {
                                         let s = shared.lock().unwrap();
-                                        terminal.draw(|f| view(f, &s, &ui, secs))?;
+                                        while_ours(terminal, |t| t.draw(|f| view(f, &s, &ui, secs)).map(drop))?;
                                     }
                                     let (msg, created) = create_pods(
                                         &prov,
@@ -5654,15 +5716,18 @@ deep_check_end=1
         assert!(matches!(new_pod_mode(&ui, Err("vast 429".into())), Mode::Result(r) if r == "✗ list failed: vast 429"));
     }
 
-    /// Live ASK4 3c (lane ASK8 item 4): a hangup or a TERM ends the dashboard from a task of its
-    /// own — never by way of its event loop, which a hung-up terminal never lets come round again
-    /// (crossterm's read spins) — stopping a question still being asked with everything it
-    /// started, and exiting 128 + the signal. A copy of this test binary plays the dashboard: its
-    /// loop's thread stuck as that read leaves it, a question out (`arena_core::ask::ai::ask`, as
-    /// `?` asks it, to a stub claude that — and what it starts — ignores TERM: KILLed after the
-    /// grace), [`exit_on_signals`] listening. Each signal ends it within the grace and a little,
-    /// with its status, and nothing of the AI is left: no process, no scratch directory. (Lane
-    /// ASK7's latch, never looked at by a stuck loop, ended nothing.)
+    /// Live ASK4 3c (lane ASK8 item 4), review ai-review claude #1 (lane ASK9 item 1): a hangup or
+    /// a TERM ends the dashboard from a task of its own — never by way of its event loop, which a
+    /// hung-up terminal never lets come round again (crossterm's read spins) — stopping a question
+    /// still being asked with everything it started, and every other child (an action's rsync,
+    /// which the `exit` left running before), and exiting 128 + the signal. A copy of this test
+    /// binary plays the dashboard: its loop's thread stuck as that read leaves it, a question out
+    /// (`arena_core::ask::ai::ask`, as `?` asks it, to a stub claude that — and what it starts —
+    /// ignores TERM: KILLed after the grace) and a lone child out (`run_local`, as a backup's rsync
+    /// runs, a stub ignoring HUP and TERM), [`exit_on_signals`] listening. Each signal ends it
+    /// within the grace and a little, with its status, and nothing of either child is left: no
+    /// process, no scratch directory. (Lane ASK7's latch, never looked at by a stuck loop, ended
+    /// nothing.)
     #[cfg(target_os = "linux")]
     #[test]
     fn a_hangup_or_a_term_ends_the_dashboard_and_its_ask_at_once() {
@@ -5674,10 +5739,12 @@ deep_check_end=1
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
             rt.block_on(async {
                 exit_on_signals();
+                let lone = dir.join("lone");
                 tokio::spawn(async move {
                     let env = arena_core::ask::AiEnv { path: Some(on_path(&dir.join("bin"))), home: None, tmp: dir.clone(), vars: Vec::new() };
                     let _ = arena_core::ask::ai::ask(arena_core::ask::Ai::Claude, "is it ok?", None, Duration::from_secs(120), &env).await;
                 });
+                tokio::spawn(async move { arena_core::remote::run_local(lone.to_str().unwrap(), &[], "the rsync", Some(Duration::from_secs(120))).await });
                 // The loop, on a dead terminal: its thread never comes back.
                 std::thread::sleep(Duration::from_secs(60));
             });
@@ -5688,8 +5755,9 @@ deep_check_end=1
             let dir = std::env::temp_dir().join(format!("arena-tui-exit-{}-{code}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
-            let (ai, left, bin) = (dir.join("ai.pid"), dir.join("left.pid"), dir.join("bin"));
+            let (ai, left, bin, lone) = (dir.join("ai.pid"), dir.join("left.pid"), dir.join("bin"), dir.join("lone.pid"));
             std::fs::create_dir_all(&bin).unwrap();
+            arena_core::remote::write_test_script(dir.join("lone"), format!("#!/bin/sh\ntrap '' HUP TERM\necho $$ > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nexec sleep 60\n", lone.display())).unwrap();
             stub(
                 &bin,
                 "claude",
@@ -5709,11 +5777,11 @@ deep_check_end=1
                 .spawn()
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(20);
-            while !ai.exists() {
-                assert!(Instant::now() < deadline, "{sig}: the AI never started");
+            while !(ai.exists() && lone.exists()) {
+                assert!(Instant::now() < deadline, "{sig}: the AI or the rsync never started");
                 std::thread::sleep(Duration::from_millis(20));
             }
-            let pids: Vec<String> = [&ai, &left].iter().map(|p| std::fs::read_to_string(p).unwrap().trim().to_string()).collect();
+            let pids: Vec<String> = [&ai, &left, &lone].iter().map(|p| std::fs::read_to_string(p).unwrap().trim().to_string()).collect();
             assert!(pids.iter().all(|p| alive(p)), "{sig}: {pids:?}");
             let scratch = || std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with("arena-ask-")).collect::<Vec<_>>();
             assert_eq!(scratch().len(), 1, "{sig}: the ask's scratch directory");
@@ -5741,11 +5809,296 @@ deep_check_end=1
                 std::thread::sleep(Duration::from_millis(10));
             }
             for pid in &pids {
-                assert!(!alive(pid), "{sig}: the AI's {pid} outlived the dashboard");
+                assert!(!alive(pid), "{sig}: the child {pid} outlived the dashboard");
             }
             let left_behind = scratch();
             assert!(left_behind.is_empty(), "{sig}: the ask's scratch directory was left: {left_behind:?}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// The dashboard's part in a copy of this test binary on a pty ([`OnPty`]): [`dashboard`] for
+    /// real — its loop on that terminal, its signals and its hangup check — over a fleet of one
+    /// pod (`devtest-alpha`; nothing refreshes it), `ssh` on PATH a stub when the test put one in
+    /// `dir/bin`, and, when the test wrote `dir/lone`, a lone child out first (`run_local`, as an
+    /// action's rsync runs). Its pid in `dir/tui.pid` once that child is up. Exits.
+    #[cfg(target_os = "linux")]
+    fn play_dashboard(dir: &std::path::Path) -> ! {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let lone = dir.join("lone");
+            if lone.exists() {
+                tokio::spawn(async move { arena_core::remote::run_local(lone.to_str().unwrap(), &[], "the rsync", Some(Duration::from_secs(120))).await });
+                while !dir.join("lone.pid").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            std::fs::write(dir.join("tui.pid.tmp"), std::process::id().to_string()).unwrap();
+            std::fs::rename(dir.join("tui.pid.tmp"), dir.join("tui.pid")).unwrap();
+            let shared = Arc::new(Mutex::new(Shared { pods: vec![pod("alpha", "runpod", "rp1", 1, Some(22))], status: "test".into(), ..Default::default() }));
+            let provider: Arc<dyn Provider> = Arc::new(Down);
+            let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+            let res = dashboard(&shared, &provider, &AtomicU64::new(3600), &Notify::new(), &AtomicBool::new(false), ui).await;
+            eprintln!("the dashboard ended: {res:?}");
+        });
+        std::process::exit(3)
+    }
+
+    /// Where a copy playing the dashboard on a pty finds its directory.
+    #[cfg(target_os = "linux")]
+    const ON_PTY: &str = "ARENA_TEST_TUI_PTY_DIR";
+
+    /// crossterm's alternate screen, entered and left.
+    #[cfg(target_os = "linux")]
+    const ENTER: &str = "\x1b[?1049h";
+    #[cfg(target_os = "linux")]
+    const LEAVE: &str = "\x1b[?1049l";
+
+    /// Whether `pid` is a process still running (not a zombie, not gone).
+    #[cfg(target_os = "linux")]
+    fn running(pid: &str) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().next()).is_some_and(|st| st != "Z" && st != "X"))
+    }
+
+    /// The CPU `pid` has used, user and system, in clock ticks (100 a second).
+    #[cfg(target_os = "linux")]
+    fn cpu_ticks(pid: &str) -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let f: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+        Some(f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?)
+    }
+
+    /// What a pty showed: its bytes, and where each read of them ended, with when.
+    #[cfg(target_os = "linux")]
+    type Drawn = (Vec<u8>, Vec<(usize, Instant)>);
+
+    /// A copy of this test binary playing the dashboard ([`play_dashboard`]) on a 40×120 pty of
+    /// its own — lane ASK8's harness (`tests/hangup.rs`), for the copy: `script` holds the pty's
+    /// master, its stdin is the terminal's keyboard and `-e` gives the copy's exit status (the
+    /// copy is the terminal's session leader, exec'd by `script`'s shell). Everything drawn, with
+    /// when each piece of it came. No network: nothing refreshes, every `ssh` is the test's stub.
+    #[cfg(target_os = "linux")]
+    struct OnPty {
+        script: std::process::Child,
+        /// What's been drawn, and where each read of it ended, with when.
+        drawn: Arc<Mutex<Drawn>>,
+        reader: Option<std::thread::JoinHandle<()>>,
+        dir: PathBuf,
+        /// The copy's pid.
+        tui: String,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl OnPty {
+        /// `test`'s copy on its pty, its screen up and `dir`'s children started; `None` without
+        /// util-linux's `script`.
+        fn start(test: &str, dir: &std::path::Path) -> Option<OnPty> {
+            if !std::process::Command::new("sh").args(["-c", "command -v script"]).output().is_ok_and(|o| o.status.success()) {
+                eprintln!("script (util-linux) missing — skipping");
+                return None;
+            }
+            let exe = std::env::current_exe().unwrap();
+            let cmd = format!("stty rows 40 cols 120; exec '{}' --exact 'tests::{test}' --test-threads=1 --nocapture", exe.display());
+            let mut script = std::process::Command::new("script")
+                .args(["-qfec", &cmd, "/dev/null"])
+                .env_clear()
+                .envs([("SHELL", "/bin/sh"), ("TERM", "xterm-256color")])
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.join("bin").display()))
+                .env("HOME", dir)
+                .env(ON_PTY, dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let drawn = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+            let (mut pipe, sink) = (script.stdout.take().unwrap(), drawn.clone());
+            let reader = std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = pipe.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let mut d = sink.lock().unwrap();
+                    d.0.extend_from_slice(&buf[..n]);
+                    let end = d.0.len();
+                    d.1.push((end, Instant::now()));
+                }
+            });
+            let mut on = OnPty { script, drawn, reader: Some(reader), dir: dir.to_path_buf(), tui: String::new() };
+            let pidfile = dir.join("tui.pid");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !(pidfile.exists() && on.find(ENTER, 0).is_some()) {
+                if Instant::now() > deadline || on.script.try_wait().unwrap().is_some() {
+                    let drawn = on.text(0);
+                    on.end();
+                    panic!("{test}: the dashboard never came up: {drawn:?}");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            on.tui = std::fs::read_to_string(&pidfile).unwrap();
+            // Its first rounds drawn.
+            std::thread::sleep(Duration::from_millis(400));
+            Some(on)
+        }
+
+        /// How much has been drawn.
+        fn len(&self) -> usize {
+            self.drawn.lock().unwrap().0.len()
+        }
+
+        /// What's been drawn from `from` on.
+        fn text(&self, from: usize) -> String {
+            String::from_utf8_lossy(&self.drawn.lock().unwrap().0[from..]).into_owned()
+        }
+
+        /// Where `pat` first is at or after `from`, and when what holds its end came.
+        fn find(&self, pat: &str, from: usize) -> Option<(usize, Instant)> {
+            let d = self.drawn.lock().unwrap();
+            let at = from + d.0.get(from..)?.windows(pat.len()).position(|w| w == pat.as_bytes())?;
+            let came = d.1.iter().find(|(end, _)| *end >= at + pat.len())?.1;
+            Some((at, came))
+        }
+
+        /// [`OnPty::find`], waiting up to `within` for it.
+        fn wait_for(&self, pat: &str, from: usize, within: Duration) -> Option<(usize, Instant)> {
+            let deadline = Instant::now() + within;
+            loop {
+                if let Some(found) = self.find(pat, from) {
+                    return Some(found);
+                }
+                if Instant::now() > deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// `sig` (`-HUP`, `-TERM`) to the copy.
+        fn signal(&self, sig: &str) -> Instant {
+            assert!(std::process::Command::new("kill").args([sig, &self.tui]).status().unwrap().success());
+            Instant::now()
+        }
+
+        /// The copy's exit status (`script -e`'s), and when it was seen — `None` if it's still
+        /// running after `within`.
+        fn exited_within(&mut self, within: Duration) -> Option<(std::process::ExitStatus, Instant)> {
+            let deadline = Instant::now() + within;
+            loop {
+                if let Some(status) = self.script.try_wait().unwrap() {
+                    let seen = Instant::now();
+                    // All it drew, to its last byte.
+                    let _ = self.reader.take().map(std::thread::JoinHandle::join);
+                    return Some((status, seen));
+                }
+                if Instant::now() > deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// Whatever is left of it gone: the copy, `script`, every pid the test's stubs wrote.
+        fn end(&mut self) {
+            let pids = std::fs::read_dir(&self.dir).into_iter().flatten().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".pid")).filter_map(|e| std::fs::read_to_string(e.path()).ok());
+            for pid in pids.chain([self.tui.clone()]).filter(|p| !p.trim().is_empty()) {
+                let _ = std::process::Command::new("kill").args(["-9", pid.trim()]).stderr(std::process::Stdio::null()).status();
+            }
+            let _ = self.script.kill();
+            let _ = self.script.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A scratch directory for a pty test, with its `bin` (the copy's PATH first) and, when
+    /// `lone`, a lone child's stub (`lone`: ignores HUP and TERM — only a KILL ends it — its pid
+    /// in `lone.pid`).
+    #[cfg(target_os = "linux")]
+    fn pty_dir(tag: &str, lone: bool) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("arena-tui-pty-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        if lone {
+            let pid = dir.join("lone.pid");
+            arena_core::remote::write_test_script(dir.join("lone"), format!("#!/bin/sh\ntrap '' HUP TERM\necho $$ > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nexec sleep 60\n", pid.display())).unwrap();
+        }
+        dir
+    }
+
+    /// Review ai-review claude #4 (lane ASK9 item 1): a TERM on a live terminal puts it back at
+    /// once — the main screen within a second, not after the grace — and only then stops the
+    /// children: here an action's rsync that ignores TERM, KILLed after the grace, so the exit
+    /// (143) comes no sooner than that, the rsync gone with it. Before, the terminal stayed raw on
+    /// the alternate screen, nothing drawn, for the whole grace. The dashboard for real, in a copy
+    /// on a pty ([`OnPty`]).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_term_puts_a_live_terminal_back_before_the_grace() {
+        if let Some(dir) = std::env::var_os(ON_PTY) {
+            play_dashboard(std::path::Path::new(&dir));
+        }
+        let dir = pty_dir("term", true);
+        let Some(mut on) = OnPty::start("a_term_puts_a_live_terminal_back_before_the_grace", &dir) else { return };
+        let lone = std::fs::read_to_string(dir.join("lone.pid")).unwrap().trim().to_string();
+        let mark = on.len();
+        let sent = on.signal("-TERM");
+        let back = on.wait_for(LEAVE, mark, Duration::from_secs(5));
+        let exited = on.exited_within(arena_core::remote::TERM_GRACE + Duration::from_secs(4));
+        let after = on.text(mark);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while running(&lone) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let lone_ran_on = running(&lone);
+        on.end();
+        let (_, back_at) = back.unwrap_or_else(|| panic!("the terminal wasn't put back: {after:?}"));
+        let (status, exited_at) = exited.expect("the dashboard is still running after the grace and more");
+        assert!(back_at - sent < Duration::from_secs(1), "put back {:?} after the TERM", back_at - sent);
+        assert_eq!(status.code(), Some(143));
+        assert!(exited_at - sent >= arena_core::remote::TERM_GRACE - Duration::from_millis(300), "exited {:?} after the TERM: the rsync wasn't waited for", exited_at - sent);
+        assert!(!lone_ran_on, "the rsync {lone} outlived the dashboard");
+        assert!(!after[after.find(LEAVE).unwrap()..].contains(ENTER), "the terminal was taken again: {after:?}");
+    }
+
+    /// Live ASK5 F1, review ai-review claude #1 (lane ASK9 item 1): its terminal hung up (the pty's
+    /// master closed), the dashboard ends — an action's rsync that ignores HUP and TERM KILLed
+    /// after the grace, gone with it — and meanwhile its loop no longer spins on the dead terminal
+    /// (crossterm retries its empty reads for ever: a core, 70–82 ticks in 0.7 s live): stdin
+    /// parked once the end has begun, the dashboard uses a few ticks over the whole grace. The
+    /// dashboard for real, in a copy on a pty ([`OnPty`]); it leads the terminal's session, so
+    /// the kernel's SIGHUP reaches it too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hung_up_dashboard_stops_its_children_without_spinning() {
+        if let Some(dir) = std::env::var_os(ON_PTY) {
+            play_dashboard(std::path::Path::new(&dir));
+        }
+        let dir = pty_dir("hangup", true);
+        let Some(mut on) = OnPty::start("a_hung_up_dashboard_stops_its_children_without_spinning", &dir) else { return };
+        let lone = std::fs::read_to_string(dir.join("lone.pid")).unwrap().trim().to_string();
+        let tui = on.tui.clone();
+        let before = cpu_ticks(&tui).unwrap();
+        on.script.kill().unwrap();
+        on.script.wait().unwrap();
+        let hung = Instant::now();
+        let mut used = 0;
+        while running(&tui) && hung.elapsed() < arena_core::remote::TERM_GRACE + Duration::from_secs(4) {
+            if let Some(now) = cpu_ticks(&tui) {
+                used = now - before;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (took, still) = (hung.elapsed(), running(&tui));
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while running(&lone) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let lone_ran_on = running(&lone);
+        on.end();
+        assert!(!still, "the dashboard is still running {took:?} after its terminal hung up");
+        assert!(took >= arena_core::remote::TERM_GRACE - Duration::from_millis(300), "gone {took:?} after: the rsync wasn't waited for");
+        assert!(!lone_ran_on, "the rsync {lone} outlived the dashboard");
+        assert!(used < 50, "the dashboard used {used} ticks of CPU in the {took:?} it took to end");
     }
 }

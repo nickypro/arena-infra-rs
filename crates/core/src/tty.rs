@@ -22,6 +22,33 @@ pub fn hung_up(_fd: i32) -> bool {
     false
 }
 
+/// Park every later read of stdin for good — for a dashboard that is ending: stdin becomes a pipe
+/// nothing is ever written to (its write end kept open, close-on-exec, and never closed), so a
+/// read of it waits instead of returning. crossterm's event reader reads stdin when it is a
+/// terminal, and on a hung-up one retries its empty reads for ever, a core spinning while the
+/// ending stops the children (live ASK5 F1: 70–82 ticks in 0.7 s); its next read now waits,
+/// until the exit. The terminal stays open on stdout and stderr. Best effort: a pipe that can't
+/// be made leaves stdin as it is.
+#[cfg(unix)]
+pub fn park_stdin() {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: plain pipe/fcntl/dup2/close calls on descriptors of our own; `fds` is ours to fill.
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return;
+        }
+        libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+        if fds[0] != 0 {
+            libc::dup2(fds[0], 0);
+            libc::close(fds[0]);
+        }
+    }
+}
+
+/// Nothing to park off unix.
+#[cfg(not(unix))]
+pub fn park_stdin() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

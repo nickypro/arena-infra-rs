@@ -195,7 +195,7 @@ pub struct LocalRun<'a> {
 /// what is stopped — SIGTERM, SIGKILL after [`TERM_GRACE`] — whatever it started: on a timeout,
 /// when the call is dropped (`pods ask` drops it on Ctrl-C, a hangup or a TERM; the dashboard when
 /// it closes), and once it has exited by itself (what it left — review ai-review codex #5); and,
-/// with every other such group, by [`stop_all_groups`] for a process that must end now. The
+/// with every other child, by [`stop_all_children`] for a process that must end now. The
 /// terminal's signals no longer reach it, so should this process die without dropping the call
 /// (SIGKILL, a crash) the kernel TERMs it (Linux: `PR_SET_PDEATHSIG`, set after the `setsid`, and
 /// a child whose parent already died in between doesn't start; review ai-review claude #2). That
@@ -256,11 +256,24 @@ async fn output_within(cmd: Command, what: &str, timeout: Option<Duration>) -> R
 
 /// [`output_within`], writing `input` to the child's stdin (piped by the caller) meanwhile.
 /// `group`: the child leads a process group of its own (a session: [`run_local_input`]), and
-/// the whole group is what is stopped ([`Stopper`]).
+/// the whole group is what is stopped ([`Stopper`]). Not started once the process is ending
+/// ([`end_children`]); tracked for [`stop_all_children`] from its spawn until it is reaped — and
+/// one whose spawn the end overtook is stopped straight away, never run.
 async fn output_feeding(mut cmd: Command, input: Option<Vec<u8>>, what: &str, timeout: Option<Duration>, group: bool) -> Result<SshOutput> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut spawned = cmd.spawn().map_err(|e| Error::provider(format!("spawning {what}: {e}")))?;
-    let stdin = spawned.stdin.take();
+    let starting = Starting::begin(what)?;
+    let spawned = cmd.spawn().map_err(|e| Error::provider(format!("spawning {what}: {e}")))?;
+    #[cfg(test)]
+    tests::spawn_gate(spawned.id());
+    let (mut child, overtaken) = Stopper::new(spawned, group, starting);
+    if overtaken {
+        // The process began ending between this spawn's look at the latch and its tracking: the
+        // stop under way waited for it and signals it too, and it's stopped here as well — it
+        // never runs on, whichever stop comes first.
+        child.stop().await;
+        return Err(Error::provider(format!("{what} stopped: {ENDING}")));
+    }
+    let stdin = child.child.as_mut().and_then(|c| c.stdin.take());
     let feed = async move {
         if let (Some(mut pipe), Some(input)) = (stdin, input) {
             use tokio::io::AsyncWriteExt;
@@ -268,7 +281,6 @@ async fn output_feeding(mut cmd: Command, input: Option<Vec<u8>>, what: &str, ti
             let _ = pipe.shutdown().await;
         }
     };
-    let mut child = Stopper::new(spawned, group);
     let result = within(what, timeout, async {
         let ((), out) = tokio::join!(feed, child.output(what));
         out
@@ -304,45 +316,66 @@ async fn output_feeding(mut cmd: Command, input: Option<Vec<u8>>, what: &str, ti
 /// unreaped (review ai-review claude #3): an exited leader stays a zombie, its pid — the group's
 /// id — taken, until its group has been stopped; reaped first, that id could be a new process
 /// group's by the time it was signalled.
+///
+/// Every child is in [`CHILDREN`] (`tracked`) from its spawn until just before it is reaped, so
+/// [`stop_all_children`] can stop it too: its exit is waited for unreaped ([`exited`]), it leaves
+/// the registry, and only then is it reaped.
 struct Stopper {
     child: Option<Child>,
-    /// The child's process group, when it leads one of its own: its pid.
-    group: Option<u32>,
+    /// Its pid while it is in [`CHILDREN`]: taken off ([`Stopper::untrack`]) before it is reaped.
+    tracked: Option<u32>,
+    /// It leads a process group of its own, whose id is its pid.
+    group: bool,
 }
 
 impl Stopper {
-    fn new(child: Child, group: bool) -> Stopper {
-        let group = if group { child.id() } else { None };
-        if let Some(group) = group {
-            remember_group(group);
+    /// `child`, just spawned, tracked from now ([`Starting::started`]) — and whether the process
+    /// began ending meanwhile (the caller stops it straight away).
+    fn new(child: Child, group: bool, starting: Starting) -> (Stopper, bool) {
+        let tracked = child.id();
+        let overtaken = tracked.is_some_and(|pid| starting.started(pid, group));
+        (Stopper { child: Some(child), tracked, group }, overtaken)
+    }
+
+    /// Off [`CHILDREN`]: called before every reap, once.
+    fn untrack(&mut self) {
+        if let Some(pid) = self.tracked.take() {
+            forget(pid);
         }
-        Stopper { child: Some(child), group }
     }
 
     /// Wait for exit while draining stdout/stderr (concurrently, so a chatty child can't
-    /// block on a full pipe). A group's leader: its exit, left unreaped, then its group stopped
-    /// ([`stop_group`]: what it left — and so the pipes it may hold — goes), then the pipes read
-    /// to their end and the leader reaped.
+    /// block on a full pipe): its exit, left unreaped — a group's leader's, then its group stopped
+    /// ([`stop_group`]: what it left — and so the pipes it may hold — goes) — and the pipes read to
+    /// their end; then off [`CHILDREN`], and reaped.
     async fn output(&mut self, what: &str) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
         let err = |e: std::io::Error| Error::provider(format!("waiting for {what}: {e}"));
         let child = self.child.as_mut().expect("the child is only taken when stopping");
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         #[cfg(unix)]
         {
-            if let Some(group) = self.group {
+            if let Some(pid) = self.tracked {
+                let group = self.group;
                 let ended = async {
-                    exited(group).await;
-                    stop_group(group).await;
+                    exited(pid).await;
+                    if group {
+                        stop_group(pid).await;
+                    }
                     Ok::<(), std::io::Error>(())
                 };
                 let ((), out, errs) = tokio::try_join!(ended, read_all(stdout), read_all(stderr)).map_err(err)?;
-                forget_group(group);
+                if let Some(pid) = self.tracked.take() {
+                    forget(pid);
+                }
                 let status = child.wait().await.map_err(err)?;
-                self.group = None;
                 return Ok((status, out, errs));
             }
         }
-        tokio::try_join!(child.wait(), read_all(stdout), read_all(stderr)).map_err(err)
+        let out = tokio::try_join!(child.wait(), read_all(stdout), read_all(stderr)).map_err(err);
+        if let Some(pid) = self.tracked.take() {
+            forget(pid);
+        }
+        out
     }
 
     /// Stop the child and wait until it is gone: SIGTERM, up to [`TERM_GRACE`] for it to
@@ -350,50 +383,46 @@ impl Stopper {
     /// whole group, for a group's leader. Awaited, so when it returns the stop is over —
     /// whatever the caller does next.
     async fn stop(&mut self) {
-        let Some(mut child) = self.child.take() else { return };
-        if let Some(group) = self.group.take() {
-            // The whole group, its leader exited or not: what it started can hold the output
-            // pipes open after it exits (the wait that timed out was for them too). Reaped only
-            // after — and never signalled once reaped.
-            if child.id().is_some() {
-                stop_group(group).await;
-            }
-            forget_group(group);
-            let _ = child.kill().await;
-            return;
-        }
+        let Some(mut child) = self.child.take() else { return self.untrack() };
         // Already reaped (it finished as the clock ran out): nothing to stop, and the pid
         // may belong to another process by now — never signal it.
-        let Some(pid) = child.id() else { return };
-        terminate(pid);
-        if tokio::time::timeout(TERM_GRACE, child.wait()).await.is_err() {
-            // Ignored SIGTERM: SIGKILL, and reap it.
-            let _ = child.kill().await;
+        let Some(pid) = child.id() else { return self.untrack() };
+        if self.group {
+            // The whole group, its leader exited or not: what it started can hold the output
+            // pipes open after it exits (the wait that timed out was for them too).
+            stop_group(pid).await;
+        } else {
+            terminate(pid);
+            #[cfg(unix)]
+            let _ = tokio::time::timeout(TERM_GRACE, exited(pid)).await;
+            #[cfg(not(unix))]
+            let _ = tokio::time::timeout(TERM_GRACE, child.wait()).await;
         }
+        // Reaped only after — and never signalled once reaped. A child that ignored SIGTERM is
+        // SIGKILLed here.
+        self.untrack();
+        let _ = child.kill().await;
     }
 }
 
 impl Drop for Stopper {
     fn drop(&mut self) {
-        let group = self.group.take();
-        // Stopped already, or its output read (its group stopped then): nothing left here.
-        let Some(mut child) = self.child.take() else { return };
+        // Stopped already, or its output read (reaped then): nothing left here.
+        let Some(child) = self.child.take() else { return self.untrack() };
         // `id()` is `None` once the child has been reaped: nothing to stop — and its pid may
         // already belong to another process, so never signal it.
-        let Some(pid) = child.id() else {
-            if let Some(group) = group {
-                forget_group(group);
-            }
-            return;
-        };
-        match group {
-            Some(group) => signal_group(group, Signal::Term),
-            None => terminate(pid),
+        let Some(pid) = child.id() else { return self.untrack() };
+        let group = self.group;
+        if group {
+            signal_group(pid, Signal::Term);
+        } else {
+            terminate(pid);
         }
-        // The group's KILL comes once nothing of it is running or after the grace — or at once
-        // if that wait is cancelled (the runtime shut down): the guard's drop sends it either
-        // way, while `child` — dropped after it — still holds the leader unreaped.
-        let killer = group.map(GroupKiller);
+        // The KILL comes once nothing of it is running or after the grace — or at once if that
+        // wait is cancelled (the runtime shut down): the guard's drop sends a group's (a lone
+        // child's is its `kill_on_drop`'s, as `child` drops after it) and takes it off
+        // [`CHILDREN`], while `child` still holds it unreaped.
+        let last = LastStop { pid, group, tracked: self.tracked.take().is_some() };
         match tokio::runtime::Handle::try_current() {
             // Let it exit on SIGTERM (scp first takes its ssh transport down); if it is
             // still running after the grace, dropping `child` SIGKILLs it. Best effort: a
@@ -401,93 +430,187 @@ impl Drop for Stopper {
             // the timeout path stops the child inline instead.
             Ok(rt) => {
                 rt.spawn(async move {
-                    match killer.as_ref().map(|k| k.0) {
-                        // A group: until nothing of it runs, its leader left unreaped.
-                        #[cfg(unix)]
-                        Some(group) => {
-                            let _ = tokio::time::timeout(TERM_GRACE, drained(group)).await;
-                        }
-                        _ => {
-                            let _ = tokio::time::timeout(TERM_GRACE, child.wait()).await;
-                        }
-                    }
-                    drop(killer);
+                    // A group: until nothing of it runs; a lone child: until it has exited —
+                    // unreaped either way.
+                    #[cfg(unix)]
+                    let _ = if group { tokio::time::timeout(TERM_GRACE, drained(pid)).await } else { tokio::time::timeout(TERM_GRACE, exited(pid)).await };
+                    #[cfg(not(unix))]
+                    let mut child = child;
+                    #[cfg(not(unix))]
+                    let _ = tokio::time::timeout(TERM_GRACE, child.wait()).await;
+                    drop(last);
                     drop(child);
                 });
             }
             // No runtime to wait on: SIGKILL now, via `kill_on_drop` (and the guard).
             Err(_) => {
-                drop(killer);
+                drop(last);
                 drop(child);
             }
         }
     }
 }
 
-/// SIGKILLs a process group when dropped — after the grace, or when the wait for it is
-/// cancelled — its leader unreaped then (held by whoever holds this), and takes it off
-/// [`GROUPS`] before that leader goes.
-struct GroupKiller(u32);
-
-/// The process group of every [`run_local_input`] child (`pods ask`'s claude/codex, the
-/// dashboard's `?`) that may still have something running: each one's leader unreaped — a group
-/// leaves this before its leader is reaped ([`forget_group`]), and is signalled from here only
-/// under this lock — so each id is still its own group's. What [`stop_all_groups`] stops.
-#[cfg(unix)]
-static GROUPS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
-
-#[cfg(unix)]
-fn groups() -> std::sync::MutexGuard<'static, Vec<u32>> {
-    GROUPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+/// A dropped [`Stopper`]'s last step, when dropped — after the grace, or when the wait for it is
+/// cancelled — its child unreaped then (held by whoever holds this, dropped after it): a group's
+/// SIGKILL, and the child off [`CHILDREN`] before it can be reaped.
+struct LastStop {
+    pid: u32,
+    group: bool,
+    /// It is still in [`CHILDREN`].
+    tracked: bool,
 }
 
-/// A [`run_local_input`] child's group, its leader just spawned: [`stop_all_groups`]'s until
-/// [`forget_group`].
-fn remember_group(group: u32) {
-    #[cfg(unix)]
-    groups().push(group);
-    #[cfg(not(unix))]
-    let _ = group;
+impl Drop for LastStop {
+    fn drop(&mut self) {
+        if self.group {
+            signal_group(self.pid, Signal::Kill);
+        }
+        if self.tracked {
+            forget(self.pid);
+        }
+    }
 }
 
-/// `group`'s leader is about to be reaped: its id may soon be another group's, so it is never
-/// signalled from [`GROUPS`] again. Called before every reap of a group's leader.
-fn forget_group(group: u32) {
-    #[cfg(unix)]
-    groups().retain(|&g| g != group);
-    #[cfg(not(unix))]
-    let _ = group;
+/// Why a child isn't started, or is stopped as it starts: [`end_children`].
+const ENDING: &str = "arena is ending";
+
+/// Every child [`output_feeding`] started that is still its own pid's — `pods ask`'s
+/// claude/codex, the dashboard's `?`, and every ssh, scp and rsync of its refreshes, actions and
+/// backups — and the latch for a process about to end: what [`stop_all_children`] stops.
+struct Children {
+    /// Set by [`end_children`]: no child starts any more.
+    ending: bool,
+    /// Spawns past their look at `ending` and not yet in `live` ([`Starting`]): what a stop waits
+    /// for before it signals.
+    starting: usize,
+    /// `(pid, group)` of each child unreaped — each leaves this before it is reaped ([`forget`]),
+    /// and is signalled from here only under this lock, so each pid is still its own. `group`: it
+    /// leads a process group of its own ([`run_local_input`]), signalled whole.
+    live: Vec<(u32, bool)>,
 }
 
-/// Stop every [`run_local_input`] child's group that may still be running ([`GROUPS`]) — TERM,
-/// then, once nothing of them runs or after [`TERM_GRACE`], KILL of whatever still does (no
-/// group: nothing waited) — for a process that has to end now, its calls not to be waited on:
-/// the dashboard on a hangup or a TERM, whose event loop a hung-up terminal never lets come round
-/// again (live ASK4 3c: its `?` ran on to the end after the terminal had gone, the dashboard
-/// spinning). The calls themselves are left as they are: dropped or ended later, they find
-/// their groups gone.
-pub async fn stop_all_groups() {
+static CHILDREN: std::sync::Mutex<Children> = std::sync::Mutex::new(Children { ending: false, starting: 0, live: Vec::new() });
+
+fn children() -> std::sync::MutexGuard<'static, Children> {
+    CHILDREN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A spawn under way: in [`Children::starting`] from its look at the latch until it is tracked
+/// ([`Starting::started`]), or dropped (the spawn failed).
+struct Starting {
+    counted: bool,
+}
+
+impl Starting {
+    /// Refused once the process is ending ([`end_children`]).
+    fn begin(what: &str) -> Result<Starting> {
+        let mut c = children();
+        if c.ending {
+            return Err(Error::provider(format!("{what} not started: {ENDING}")));
+        }
+        c.starting += 1;
+        Ok(Starting { counted: true })
+    }
+
+    /// The child `pid` is running: tracked from now until [`forget`]. `true` when the process
+    /// began ending meanwhile: the caller stops it straight away (and a stop under way, which has
+    /// waited for this, signals it too).
+    fn started(mut self, pid: u32, group: bool) -> bool {
+        let mut c = children();
+        c.starting -= 1;
+        self.counted = false;
+        c.live.push((pid, group));
+        c.ending
+    }
+}
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        if self.counted {
+            children().starting -= 1;
+        }
+    }
+}
+
+/// `pid` is about to be reaped: it may soon be another process's, so it is never signalled from
+/// [`CHILDREN`] again. Called once before every reap of a tracked child.
+fn forget(pid: u32) {
+    let mut c = children();
+    if let Some(at) = c.live.iter().position(|&(p, _)| p == pid) {
+        c.live.swap_remove(at);
+    }
+}
+
+/// Whether the process is ending ([`end_children`]): no child starts any more.
+pub fn ending() -> bool {
+    children().ending
+}
+
+/// The latch for a process about to end — set before anything else it does on the way out: from
+/// now on no child starts ([`output_feeding`] refuses, and one whose spawn was under way is
+/// stopped as it starts). `true` for the call that set it — the first; a later
+/// cause of the end leaves the ending to that one.
+pub fn end_children() -> bool {
+    !std::mem::replace(&mut children().ending, true)
+}
+
+/// Stop every child still running — `pods ask`'s and `?`'s AI with its whole group, and every
+/// ssh, scp and rsync — for a process that has to end now, its calls not to be waited on: the
+/// dashboard on a hangup, a TERM, a dead terminal or a failed loop (whose event loop a hung-up
+/// terminal never lets come round again: live ASK4 3c), and after `q`. The latch first
+/// ([`end_children`]); then the spawns under way, until each is tracked (a fork and an exec; at
+/// most [`TERM_GRACE`]); then TERM to them all, and — once nothing of them runs, or after
+/// [`TERM_GRACE`] — KILL of whatever still does (nothing tracked: nothing waited). Before, only
+/// the AI's groups were stopped, and an `exit` left every other child running with no budget
+/// (review ai-review claude #1), and one spawned as the sweep ran was missed (codex #3). The
+/// calls themselves are left as they are: dropped or ended later, they find their children gone.
+pub async fn stop_all_children() {
+    end_children();
     #[cfg(unix)]
     {
-        let signal_all = |sig: Signal| {
-            let g = groups();
-            g.iter().for_each(|&group| signal_group(group, sig));
-            !g.is_empty()
-        };
-        if !signal_all(Signal::Term) {
-            return;
-        }
-        let running = || groups().iter().any(|&g| group_running(g));
         let _ = tokio::time::timeout(TERM_GRACE, async {
-            while running() {
+            while children().starting > 0 {
                 tokio::time::sleep(POLL).await;
             }
         })
         .await;
-        if running() {
-            signal_all(Signal::Kill);
+        if !signal_children(Signal::Term) {
+            return;
+        }
+        let _ = tokio::time::timeout(TERM_GRACE, async {
+            while children_running() {
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await;
+        if children_running() {
+            signal_children(Signal::Kill);
         }
     }
+}
+
+/// `sig` to every child tracked — a group's leader's whole group — under [`CHILDREN`]'s lock:
+/// whether there was any.
+#[cfg(unix)]
+fn signal_children(sig: Signal) -> bool {
+    let c = children();
+    for &(pid, group) in &c.live {
+        if group {
+            signal_group(pid, sig);
+        } else {
+            signal_pid(pid, sig);
+        }
+    }
+    !c.live.is_empty()
+}
+
+/// Whether anything of the children tracked still runs: a group's member ([`group_running`]), a
+/// lone child that hasn't exited ([`has_exited`]).
+#[cfg(unix)]
+fn children_running() -> bool {
+    let live = children().live.clone();
+    live.into_iter().any(|(pid, group)| if group { group_running(pid) } else { !has_exited(pid) })
 }
 
 /// How often a group being stopped is looked at ([`drained`]) and, without SIGCHLD, a leader's
@@ -573,13 +696,6 @@ async fn stop_group(group: u32) {
 #[cfg(not(unix))]
 async fn stop_group(_group: u32) {}
 
-impl Drop for GroupKiller {
-    fn drop(&mut self) {
-        signal_group(self.0, Signal::Kill);
-        forget_group(self.0);
-    }
-}
-
 #[derive(Clone, Copy)]
 enum Signal {
     Term,
@@ -607,19 +723,28 @@ fn signal_group(group: u32, sig: Signal) {
 fn signal_group(_group: u32, _sig: Signal) {}
 
 /// SIGTERM `pid` (a child we have not reaped, so the pid can't have been reused).
-#[cfg(unix)]
 fn terminate(pid: u32) {
+    signal_pid(pid, Signal::Term);
+}
+
+/// Signal `pid` alone (a child we have not reaped, so the pid can't have been reused).
+#[cfg(unix)]
+fn signal_pid(pid: u32, sig: Signal) {
+    let sig = match sig {
+        Signal::Term => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+    };
     if let Ok(pid) = libc::pid_t::try_from(pid) {
         // SAFETY: a plain kill(2) on our own live child; no memory is involved.
         unsafe {
-            libc::kill(pid, libc::SIGTERM);
+            libc::kill(pid, sig);
         }
     }
 }
 
-/// No SIGTERM off unix: the `kill_on_drop` kill is all there is.
+/// No signals off unix: the `kill_on_drop` kill is all there is.
 #[cfg(not(unix))]
-fn terminate(_pid: u32) {}
+fn signal_pid(_pid: u32, _sig: Signal) {}
 
 async fn read_all(pipe: Option<impl AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
@@ -1199,76 +1324,182 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Live ASK4 3c (lane ASK8 item 4): a process that must end now — the dashboard on a hangup —
-    /// stops every AI child's group still running, its calls left as they are: TERM, then, once
-    /// the grace is out, KILL of what ignores it (a stub and what it started, both ignoring TERM),
-    /// all of it gone before it returns; a plain stub goes on the TERM. Then the calls end by
-    /// themselves, leaving nothing registered — as a call that ended by itself before left
-    /// nothing — and with nothing running, nothing is waited. Run in a copy of this test binary:
-    /// the registry is the whole process's, and other tests' AI stubs mustn't be stopped.
+    /// Armed by a test: the next spawn in [`output_feeding`] waits here — forked and exec'd, not
+    /// yet tracked — saying its pid on the first channel, until the second says go.
+    #[allow(clippy::type_complexity)]
+    static SPAWN_GATE: std::sync::Mutex<Option<(std::sync::mpsc::Sender<Option<u32>>, std::sync::mpsc::Receiver<()>)>> = std::sync::Mutex::new(None);
+
+    /// [`output_feeding`]'s pause between a spawn and its tracking, when a test has armed
+    /// [`SPAWN_GATE`]: the window a stop must not miss.
+    pub(super) fn spawn_gate(pid: Option<u32>) {
+        let armed = SPAWN_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some((reached, go)) = armed {
+            let _ = reached.send(pid);
+            let _ = go.recv();
+        }
+    }
+
+    /// The tracked children's pids, and how many spawns are under way.
+    fn tracked() -> (Vec<u32>, usize) {
+        let c = children();
+        (c.live.iter().map(|&(pid, _)| pid).collect(), c.starting)
+    }
+
+    /// A copy of this test binary running `test` alone, with `role` set to a scratch dir of its
+    /// own — the registry is the whole process's, and other tests' children mustn't be stopped,
+    /// nor their spawns refused — and passing.
+    #[cfg(target_os = "linux")]
+    fn in_a_copy(test: &str, role: &str) {
+        let dir = scratch(role);
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--test-threads=1", "--nocapture"])
+            .env(role, &dir)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// An executable `#!/bin/sh` script `name` in `dir`.
+    #[cfg(target_os = "linux")]
+    fn sh_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        write_test_script(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        p
+    }
+
+    /// `echo $$` to `<dir>/<name>.pid`, whole once it's there.
+    #[cfg(target_os = "linux")]
+    fn pid_written(dir: &std::path::Path, name: &str) -> String {
+        format!("echo $$ > '{0}.tmp'; mv '{0}.tmp' '{0}'", dir.join(format!("{name}.pid")).display())
+    }
+
+    /// [`run_local_input`] of `program` (the AI's way: a session of its own, its group stopped).
+    #[cfg(target_os = "linux")]
+    async fn run_ai(program: std::path::PathBuf, dir: std::path::PathBuf) -> Result<SshOutput> {
+        let env = [(std::ffi::OsString::from("PATH"), std::ffi::OsString::from("/usr/bin:/bin"))];
+        let run = LocalRun { program: &program, args: &[], cwd: &dir, env: &env, input: b"" };
+        run_local_input(&run, "the AI", Some(Duration::from_secs(60))).await
+    }
+
+    /// Live ASK4 3c (lane ASK8 item 4), review ai-review claude #1 (lane ASK9 item 1): a process
+    /// that must end now — the dashboard on a hangup — stops every child still running, its calls
+    /// left as they are: an AI's whole group, and a lone ssh/scp/rsync child (which an `exit`
+    /// left running before) — TERM, then, once the grace is out, KILL of what ignores it (a
+    /// stub and what it started, both ignoring TERM; a lone stub ignoring it), all of it gone
+    /// before it returns; a plain stub goes on the TERM. Then the calls end by themselves,
+    /// leaving nothing tracked — as a call that ended by itself before left nothing — no child
+    /// starts any more, and with nothing running, nothing is waited. In a copy of this test
+    /// binary ([`in_a_copy`]).
     #[cfg(target_os = "linux")]
     #[test]
-    fn every_ai_group_still_running_can_be_stopped_at_once() {
+    fn every_child_still_running_can_be_stopped_at_once() {
         const ROLE: &str = "ARENA_TEST_STOP_ALL_DIR";
         let Some(dir) = std::env::var_os(ROLE) else {
-            let dir = scratch("stop-all");
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "remote::tests::every_ai_group_still_running_can_be_stopped_at_once", "--test-threads=1", "--nocapture"])
-                .env(ROLE, &dir)
-                .output()
-                .unwrap();
-            let _ = std::fs::remove_dir_all(&dir);
-            assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-            return;
+            return in_a_copy("remote::tests::every_child_still_running_can_be_stopped_at_once", ROLE);
         };
         let dir = std::path::PathBuf::from(dir);
-        let script = |name: &str, body: &str| {
-            let p = dir.join(name);
-            write_test_script(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-            p
-        };
-        let run_it = |program: std::path::PathBuf| {
-            let dir = dir.clone();
-            async move {
-                let env = [(std::ffi::OsString::from("PATH"), std::ffi::OsString::from("/usr/bin:/bin"))];
-                let run = LocalRun { program: &program, args: &[], cwd: &dir, env: &env, input: b"" };
-                run_local_input(&run, "the AI", Some(Duration::from_secs(60))).await
-            }
-        };
         let pid_at = |name: &str| dir.join(format!("{name}.pid"));
-        let written = |name: &str| format!("echo $$ > '{0}.tmp'; mv '{0}.tmp' '{0}'", pid_at(name).display());
-        let quick = script("quick", "echo answered");
-        let plain = script("plain", &format!("{}\nexec sleep 60", written("plain")));
-        let stubborn = script("stubborn", &format!("trap '' TERM\nsleep 60 &\necho $! > '{}'\n{}\nwait", pid_at("left").display(), written("stubborn")));
+        let quick = sh_script(&dir, "quick", "echo answered");
+        let plain = sh_script(&dir, "plain", &format!("{}\nexec sleep 60", pid_written(&dir, "plain")));
+        let stubborn = sh_script(&dir, "stubborn", &format!("trap '' TERM\nsleep 60 &\necho $! > '{}'\n{}\nwait", pid_at("left").display(), pid_written(&dir, "stubborn")));
+        // An rsync's or an ssh's way: no group of its own; TERM ignored, kept across the exec.
+        let lone = sh_script(&dir, "lone", &format!("trap '' TERM\n{}\nexec sleep 60", pid_written(&dir, "lone")));
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            assert_eq!(run_it(quick).await.unwrap().stdout, "answered\n");
-            let registered = groups().clone();
-            assert!(registered.is_empty(), "a finished call left {registered:?}");
-            let calls = [tokio::spawn(run_it(plain)), tokio::spawn(run_it(stubborn))];
-            while !(pid_at("plain").exists() && pid_at("stubborn").exists()) {
+            assert_eq!(run_ai(quick.clone(), dir.clone()).await.unwrap().stdout, "answered\n");
+            assert_eq!(run_local(quick.to_str().unwrap(), &[], "a copy", Some(Duration::from_secs(60))).await.unwrap().stdout, "answered\n");
+            assert_eq!(tracked(), (vec![], 0), "a finished call left its child tracked");
+            let lone_call = tokio::spawn(async move { run_local(lone.to_str().unwrap(), &[], "the rsync", Some(Duration::from_secs(60))).await });
+            let calls = [tokio::spawn(run_ai(plain, dir.clone())), tokio::spawn(run_ai(stubborn, dir.clone())), lone_call];
+            while !["plain", "stubborn", "lone"].iter().all(|n| pid_at(n).exists()) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            let pids: Vec<String> = ["plain", "stubborn", "left"].iter().map(|n| std::fs::read_to_string(pid_at(n)).unwrap().trim().to_string()).collect();
-            let registered = groups().clone();
-            assert_eq!(registered.len(), 2, "{registered:?}");
+            let pids: Vec<String> = ["plain", "stubborn", "left", "lone"].iter().map(|n| std::fs::read_to_string(pid_at(n)).unwrap().trim().to_string()).collect();
+            assert_eq!(tracked().0.len(), 3, "{:?}", tracked());
             let started = std::time::Instant::now();
-            stop_all_groups().await;
+            stop_all_children().await;
             let took = started.elapsed();
             assert!(took >= TERM_GRACE - Duration::from_millis(100) && took < TERM_GRACE + Duration::from_secs(2), "{took:?}");
             // KILLed (or TERMed) by then: gone as soon as the kernel has them exit.
             for pid in &pids {
-                assert_dies(pid, Duration::from_millis(500), "an AI process the stop signalled").await;
+                assert_dies(pid, Duration::from_millis(500), "a child the stop signalled").await;
             }
             for call in calls {
                 let ended = tokio::time::timeout(Duration::from_secs(5), call).await;
                 assert!(matches!(ended, Ok(Ok(Ok(_)))), "{ended:?}");
             }
-            let registered = groups().clone();
-            assert!(registered.is_empty(), "{registered:?}");
+            assert_eq!(tracked(), (vec![], 0));
+            let refused = run_ai(quick, dir.clone()).await.unwrap_err().to_string();
+            assert!(refused.contains("not started: arena is ending"), "{refused}");
+            assert_eq!(tracked(), (vec![], 0));
             let started = std::time::Instant::now();
-            stop_all_groups().await;
+            stop_all_children().await;
             assert!(started.elapsed() < Duration::from_millis(100), "{:?}", started.elapsed());
+        });
+    }
+
+    /// Review ai-review codex #3 (lane ASK9 item 1): a spawn the end overtakes — forked before the
+    /// latch, tracked after it, a stop already under way — is still stopped: the stop waits for
+    /// it before it signals (it isn't finished while the spawn is held), then TERMs it with the
+    /// rest and KILLs what ignores TERM after the grace (an AI stub and its child, both ignoring
+    /// it); the spawn itself, seeing the latch once tracked, stops its group straight away and
+    /// returns `stopped: arena is ending`, never running on. A spawn after the latch is refused,
+    /// nothing started. In a copy of this test binary ([`in_a_copy`]).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_spawn_the_end_overtakes_is_still_stopped() {
+        const ROLE: &str = "ARENA_TEST_OVERTAKEN_DIR";
+        let Some(dir) = std::env::var_os(ROLE) else {
+            return in_a_copy("remote::tests::a_spawn_the_end_overtakes_is_still_stopped", ROLE);
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let pid_at = |name: &str| dir.join(format!("{name}.pid"));
+        let stubborn = sh_script(&dir, "stubborn", &format!("trap '' TERM\nsleep 60 &\necho $! > '{}'\n{}\nwait", pid_at("left").display(), pid_written(&dir, "stubborn")));
+        let late = sh_script(&dir, "late", &pid_written(&dir, "late"));
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        rt.block_on(async {
+            let ((reached_tx, reached), (go, go_rx)) = (std::sync::mpsc::channel(), std::sync::mpsc::channel());
+            *SPAWN_GATE.lock().unwrap() = Some((reached_tx, go_rx));
+            let call = tokio::spawn(run_ai(stubborn, dir.clone()));
+            let pid = tokio::task::spawn_blocking(move || reached.recv().unwrap()).await.unwrap().unwrap();
+            // Forked and exec'd — TERM ignored, its child started — but not yet tracked.
+            while !(pid_at("stubborn").exists() && pid_at("left").exists()) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let pids: Vec<String> = ["stubborn", "left"].iter().map(|n| std::fs::read_to_string(pid_at(n)).unwrap().trim().to_string()).collect();
+            assert_eq!(pids[0], pid.to_string());
+            assert_eq!(tracked(), (vec![], 1));
+            let stop = tokio::spawn(stop_all_children());
+            while !ending() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let refused = run_ai(late.clone(), dir.clone()).await.unwrap_err().to_string();
+            assert!(refused.contains("not started: arena is ending"), "{refused}");
+            let refused = run_local(late.to_str().unwrap(), &[], "an ssh", Some(Duration::from_secs(5))).await.unwrap_err().to_string();
+            assert!(refused.contains("an ssh not started: arena is ending"), "{refused}");
+            // The stop waits for the spawn under way: nothing signalled meanwhile.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!stop.is_finished(), "the stop ended with a spawn still under way");
+            for pid in &pids {
+                assert!(proc_state(pid).is_some_and(|s| s != "Z" && s != "X"), "{pid} gone before the spawn was tracked");
+            }
+            let released = std::time::Instant::now();
+            go.send(()).unwrap();
+            tokio::time::timeout(TERM_GRACE + Duration::from_secs(3), stop).await.expect("the stop never ended").unwrap();
+            let took = released.elapsed();
+            assert!(took >= TERM_GRACE - Duration::from_millis(100) && took < TERM_GRACE + Duration::from_secs(2), "{took:?}");
+            for pid in &pids {
+                assert_dies(pid, Duration::from_millis(500), "a child whose spawn the end overtook").await;
+            }
+            let ended = tokio::time::timeout(Duration::from_secs(5), call).await;
+            let said = match ended {
+                Ok(Ok(Err(e))) => e.to_string(),
+                other => panic!("the overtaken call: {other:?}"),
+            };
+            assert!(said.contains("the AI stopped: arena is ending"), "{said}");
+            assert_eq!(tracked(), (vec![], 0));
+            assert!(!pid_at("late").exists(), "a child started after the latch");
         });
     }
 

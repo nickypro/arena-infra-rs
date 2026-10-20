@@ -1694,9 +1694,12 @@ action with `timed out after …`; only `c` (your interactive shell) is a plain 
 **Navigate** with `↑/↓`/`j/k`; `enter` opens a per-pod detail pane (per-GPU breakdown, full
 branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit. A hangup or a TERM ends it at
 once (exit status 129 or 143), and so does its terminal hanging up (a dropped SSH session, a killed
-tmux server: 129) — never waiting on its event loop, which a dead terminal stalls: a question still
-out is stopped (TERM, then KILL 2 s later), the terminal put back as far as it can be. `Esc` only
-steps back (detail → list; on the list it clears the marks).
+tmux server: 129) — never waiting on its event loop, which a dead terminal stalls. However it ends,
+nothing new is started from then on, the terminal is put back first (as far as it can be; not while
+`c`'s ssh has it), and then every child still running is stopped — a question's AI, an action's, a
+refresh's or a backup's ssh, scp and rsync — TERM, then KILL 2 s later; the wait for that is never
+on a raw screen. `Esc` only steps back (detail → list; on the list it
+clears the marks).
 
 ### Acting on pods
 
