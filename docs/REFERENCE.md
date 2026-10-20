@@ -1286,19 +1286,19 @@ first.
 
 claude sends the prompt to **Anthropic**, codex to **OpenAI**, through your own `claude`/`codex`
 login on this machine (a one-line note says so on first use). Both get **no tools** — the prompt
-says the pod data is data, never instructions, and they can't act on it anyway: claude runs as
-`scripts/ai-review` runs it, plus an empty MCP config (`claude -p --safe-mode --tools ''
---strict-mcp-config --mcp-config '{"mcpServers":{}}' --disable-slash-commands
---no-session-persistence --output-format text`), codex as `codex exec -s read-only
---skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules` with `mcp_servers` emptied,
-web search off and every tool feature disabled (shell, unified exec, code mode, apps, plugins,
-browser and computer use, sub-agents, image generation and viewing, hooks). **It fails closed**:
-neither is sent anything until `claude --help` lists every one of those flags, or `codex features
-list` names every one of those features — a check that fails, times out or finds one missing refuses
-the ask (`codex: couldn't confirm its tools are off — not asked (…)`). The prompt goes on stdin
-(never argv), in an empty private temporary directory, with a minimal environment (`PATH`, `HOME`,
-the locale, XDG and proxy variables, and the AI's own config dir and API key — not the rest of
-yours); `--timeout` (default 300 s) stops it. A missing binary is an error naming the other one.
+says the pod data is data, never instructions, and they can't act on it anyway: both run as
+`scripts/ai-review` runs them, claude as `claude -p --safe-mode --tools '' --strict-mcp-config
+--mcp-config '{"mcpServers":{}}' --disable-slash-commands --no-session-persistence --output-format
+text`, codex as `codex exec -s read-only --skip-git-repo-check --ephemeral --ignore-user-config
+--ignore-rules` with `mcp_servers` emptied, web search off and every tool feature disabled (shell,
+unified exec, code mode, apps, plugins, browser and computer use, sub-agents, image generation and
+viewing, hooks). **It fails closed**: neither is sent anything until `claude --help` lists every one
+of those flags, or `codex features list` names every one of those features — a check that fails,
+times out or finds one missing refuses the ask (`codex: couldn't confirm its tools are off — not
+asked (…)`). The prompt goes on stdin (never argv), in an empty private temporary directory, with a
+minimal environment (`PATH`, `HOME`, the locale, XDG and proxy variables, and the AI's own config
+dir and API key — not the rest of yours); `--timeout` (default 300 s) stops it. A missing binary is
+an error naming the other one.
 
 #### Where answers are saved
 
@@ -1733,18 +1733,27 @@ scripts/ai-review --dry-run              # only write prompt.txt: nothing is sen
   key-like strings`; `--dry-run`'s `prompt.txt` is the masked one. The repo's own test fixtures
   with fake keys are masked too. Patterns it can't read, or a key-like string left after the
   masking, refuse the run (exit 2, nothing sent).
-- **No tools.** Everything the reviewer needs is in the prompt, so it runs with none, in an empty
-  temporary directory: claude with `--tools ''`, `--safe-mode` (no hooks, MCP servers or
-  CLAUDE.md) and no saved session; codex `exec` read-only and ephemeral, with its shell, code
-  mode, apps, plugins, browser and web search turned off. (Here codex's sandbox can't run a
-  command anyway: bubblewrap fails.)
+- **No tools, and it fails closed.** Everything the reviewer needs is in the prompt, so it runs with
+  none, in an empty temporary directory, with a minimal environment (`PATH`, `HOME`, the locale, XDG
+  and proxy variables, and the reviewer's own config dir and API key — not the rest of yours),
+  exactly as [`pods ask`](#pods-ask) runs it: claude with `--tools ''`, `--safe-mode` (no hooks, MCP
+  servers or CLAUDE.md), `--strict-mcp-config` with an empty `--mcp-config` and no saved session;
+  codex `exec` read-only and ephemeral, without your `config.toml` or execpolicy rules
+  (`--ignore-user-config --ignore-rules`: `--model-codex` and `--effort` still pick), with
+  `mcp_servers` emptied and its shell, code mode, apps, plugins, browser and computer use,
+  sub-agents, image generation and viewing, hooks and web search turned off. Neither is sent
+  anything until it has confirmed it knows every one of those switches — `codex features list` names
+  each feature, `claude --help` lists each flag; a check that fails, times out (20 s) or finds one
+  missing refuses that reviewer (`ai-review: codex: couldn't confirm its tools are off — not asked
+  (…)`), and the other still runs. (Here codex's sandbox can't run a command anyway: bubblewrap
+  fails.)
 - **Output** goes to `${XDG_STATE_HOME:-~/.local/state}/arena-review/<UTC time>-<range|prN>/`
   (`--out DIR` for another parent): `prompt.txt`, `codex.md`, `claude.md`, and each reviewer's
   stderr in `codex.log`/`claude.log`. It ends by printing those paths and each review's last line,
-  `Blocks merging: yes|no (…)`. Exit 0 when every reviewer that ran answered, whatever it found;
-  1 when one failed or timed out (`--timeout`, 3600 s each) or none could run (a missing `codex`
-  or `claude` is skipped with a message); 2 for a usage error, an empty diff or key patterns it
-  can't read (refused).
+  `Blocks merging: yes|no (…)`. Exit 0 when every reviewer that ran answered, whatever it found; 1
+  when one failed, timed out (`--timeout`, 3600 s each) or couldn't confirm its tools are off, or
+  none could run (a missing `codex` or `claude` is skipped with a message); 2 for a usage error, an
+  empty diff or key patterns it can't read (refused).
 - **Cost.** It runs on the operator's own codex and Claude Code logins, so it spends their
   subscriptions' usage, not the project's API keys: a 16-commit, ~420 KB prompt is roughly 125k
   input tokens per reviewer, and took codex 2½ minutes and claude 5. `--effort` (default `high`,

@@ -3,12 +3,14 @@
 //!
 //! Why no tools: this runs on the fleet's control box, next to the config and the keys, and the
 //! bundle holds text participants control (process arguments, file names, commit subjects, job
-//! logs) — a prompt injection must have nothing to act with. So claude runs as
-//! `scripts/ai-review` runs it (`--tools ''` with `--safe-mode`, `--strict-mcp-config`, no slash
-//! commands, no saved session: verified there to list `tools: []`), plus an explicitly empty
-//! `--mcp-config`; and codex read-only, ephemeral, without the operator's `config.toml` (its MCP
-//! servers, hooks, profiles) and with `mcp_servers` emptied, web search off and every tool
-//! feature in [`CODEX_TOOL_FEATURES`] disabled. Everything the model sees is in the prompt.
+//! logs) — a prompt injection must have nothing to act with. So claude runs with `--tools ''`,
+//! `--safe-mode`, `--strict-mcp-config` with an explicitly empty `--mcp-config`, no slash
+//! commands and no saved session (verified with `scripts/ai-review` to list `tools: []`); and
+//! codex read-only, ephemeral, without the operator's `config.toml` (its MCP servers, hooks,
+//! profiles) and with `mcp_servers` emptied, web search off and every tool feature in
+//! [`CODEX_TOOL_FEATURES`] disabled. Everything the model sees is in the prompt.
+//! `scripts/ai-review` runs both exactly so — the same argv, check and environment; a test holds
+//! its lists to these.
 //!
 //! **Fail closed.** Neither is sent anything until the CLI itself has confirmed it knows every
 //! switch that takes its tools away — claude's `--help` lists each of [`CLAUDE_NO_TOOL_FLAGS`],
@@ -139,7 +141,7 @@ pub const CLAUDE_NO_TOOL_FLAGS: &[&str] = &["--tools", "--safe-mode", "--strict-
 /// claude's argv: print mode, no tools of any kind (`--tools ''`, and `--safe-mode`: no hooks,
 /// MCP servers, CLAUDE.md or skills; `--strict-mcp-config` with an empty `--mcp-config`: no MCP
 /// servers from anywhere), no slash commands, no saved session, plain text out. The flags
-/// `scripts/ai-review` runs it with, plus the explicit empty MCP config.
+/// `scripts/ai-review` runs it with too.
 pub fn claude_args(model: Option<&str>) -> Vec<String> {
     let mut a: Vec<String> = [
         "-p",
@@ -162,11 +164,11 @@ pub fn claude_args(model: Option<&str>) -> Vec<String> {
     a
 }
 
-/// codex features that give it a tool, every one turned off — `scripts/ai-review`'s list, plus
-/// `view_image` (it reads an image file anywhere on this machine). Its `features list` must name
-/// each before it is asked anything ([`confirm_tools_off`]): a feature it doesn't know can't be
-/// disabled (`--disable` of an unknown name is an error), and one it has under another name
-/// would stay on.
+/// codex features that give it a tool, every one turned off (`scripts/ai-review` turns off the
+/// same list), `view_image` included: it reads an image file anywhere on this machine. Its
+/// `features list` must name each before it is asked anything ([`confirm_tools_off`]): a feature
+/// it doesn't know can't be disabled (`--disable` of an unknown name is an error), and one it has
+/// under another name would stay on.
 pub const CODEX_TOOL_FEATURES: &[&str] = &[
     "shell_tool",
     "unified_exec",
@@ -691,6 +693,44 @@ pub(crate) mod tests {
         assert_eq!(child_env(Ai::Claude, &env)[1], (OsString::from("HOME"), OsString::from("/home/op")));
         let bare = AiEnv { path: None, home: None, tmp: "/tmp".into(), vars: Vec::new() };
         assert!(child_env(Ai::Codex, &bare).is_empty());
+    }
+
+    /// `scripts/ai-review` runs codex and claude as `ask` does — it had the same fail-open codex
+    /// check and no MCP override (lane ASK3's note) — so the two can't drift apart: the same tool
+    /// features, no-tools flags, MCP config and environment lists, the same argv, and both its
+    /// check and its review started under `env -i`. (Its runs themselves are tested with stub
+    /// CLIs; this holds the text.)
+    #[test]
+    fn ai_review_runs_claude_and_codex_as_ask_does() {
+        let script = include_str!("../../../../scripts/ai-review");
+        let array = |name: &str| -> Vec<&str> {
+            let start = script.find(&format!("\n{name}=(")).unwrap_or_else(|| panic!("{name} in ai-review")) + name.len() + 3;
+            script[start..start + script[start..].find(')').unwrap()].split_whitespace().collect()
+        };
+        assert_eq!(array("CODEX_TOOL_FEATURES"), CODEX_TOOL_FEATURES);
+        assert_eq!(array("CLAUDE_NO_TOOL_FLAGS"), CLAUDE_NO_TOOL_FLAGS);
+        assert_eq!(array("COMMON_VARS"), COMMON_VARS);
+        assert_eq!(array("CLAUDE_VARS"), own_vars(Ai::Claude));
+        assert_eq!(array("CODEX_VARS"), own_vars(Ai::Codex));
+        assert!(script.contains(&format!("\nCLAUDE_NO_MCP='{CLAUDE_NO_MCP}'\n")));
+
+        // The argv as the script spells it: continuation lines joined, `"$CLAUDE_NO_MCP"` its value.
+        let text = script.replace("\\\n", " ").replace("\"$CLAUDE_NO_MCP\"", &format!("'{CLAUDE_NO_MCP}'"));
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let sh = |w: &String| match w.as_str() {
+            "" => "''".to_string(),
+            w if w.starts_with('$') => format!("\"{w}\""),
+            w if w.contains(['"', '{']) => format!("'{w}'"),
+            w => w.to_string(),
+        };
+        let printf = |words: &[String]| format!("printf '%s\\0' {}", words.iter().map(sh).collect::<Vec<_>>().join(" "));
+        assert!(text.contains(&printf(&claude_args(None))), "claude's argv");
+        let codex = codex_args(Path::new("$WORK/empty"), Path::new("$DIR/codex.md"), None);
+        let first_disable = codex.iter().position(|a| a == "--disable").unwrap();
+        assert!(text.contains(&printf(&codex[..first_disable])), "codex's argv up to the features");
+        assert!(text.contains(r#"for f in "${CODEX_TOOL_FEATURES[@]}"; do printf '%s\0' --disable "$f"; done"#), "every feature, always");
+        assert_eq!(text.matches(r#"exec timeout -k "#).count(), 2, "the check and the review");
+        assert_eq!(text.matches(r#"env -i "${envs[@]}" "$bin" "${args[@]}""#).count(), 2, "both under env -i");
     }
 
     #[cfg(unix)]
