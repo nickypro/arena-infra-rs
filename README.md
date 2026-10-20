@@ -647,7 +647,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     get wrong, and Live 7 found no key-like string in the real course's 2187 commits. What that
     leaves: if the course ever commits a key-like string, each pod that merges it pushes those
     commits rewritten redacted, and a later `git pull upstream main` may conflict on those lines —
-    the fix is to take the string out of the course. A secret the patterns don't know, refused by
+    the fix is to take the string out of the course. And a course string GitHub's push protection
+    knows but the redaction doesn't fails the push on every pod that pulls it (`GitHub push
+    protection refuses …: a secret the backup doesn't redact`, each such pod rsynced instead,
+    every run): fix it at the source — take it out of the course — or allow it in the cohort
+    repo's push protection; rewriting each participant's history by hand isn't the fix (review
+    claude #6). A secret the patterns don't know, refused by
     GitHub, fails the pod with GitHub's name for it and its path:line (never the
     secret, never GitHub's allow-URL). **A pod whose push itself fails** (a refusal, a big file,
     the network) **is rsynced into `LOCAL_BACKUP_DIR` in the same run — even under `--no-pull`**
