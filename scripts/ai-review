@@ -477,10 +477,23 @@ codex_args() {
   # layer is still read); web search off and every feature tools_off chose disabled
   # ($WORK/codex.disable: every one of CODEX_TOOL_FEATURES, always — it runs only once its
   # `features list` has named each and shown nothing else on — then the web search ones and those
-  # of CODEX_OFF_WHEN_LISTED it lists).
+  # of CODEX_OFF_WHEN_LISTED it lists). Fails closed (review ai-review claude #9): with that file
+  # missing, or lacking any of CODEX_TOOL_FEATURES, it prints why on stderr, writes no argv and
+  # fails — `mapfile` of a missing or cut file gave no --disable at all, every tool feature on.
   local f
-  local -a disable
+  local -a disable=() missing=()
+  if [ ! -r "$WORK/codex.disable" ]; then
+    echo "its --disable list (codex.disable) is missing" >&2
+    return 1
+  fi
   mapfile -t disable <"$WORK/codex.disable"
+  for f in "${CODEX_TOOL_FEATURES[@]}"; do
+    case " ${disable[*]} " in *" $f "*) ;; *) missing+=("$f") ;; esac
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    echo "its --disable list (codex.disable) lacks $(IFS=,; echo "${missing[*]}" | sed 's/,/, /g')" >&2
+    return 1
+  fi
   printf '%s\0' exec -s read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules \
     --color never -C "$WORK/empty" -o "$DIR/codex.md" -c 'web_search="disabled"' -c 'mcp_servers={}'
   for f in "${disable[@]}"; do printf '%s\0' --disable "$f"; done
@@ -624,7 +637,7 @@ start() { # <reviewer>: runs it in the background; leaves "<exit> <seconds>" in 
   local -a args envs
   if [ "$r" = codex ]; then
     bin=$CODEX out=/dev/null # codex writes its answer itself (-o); its stdout repeats it
-    mapfile -d '' -t args < <(codex_args)
+    mapfile -d '' -t args <"$WORK/codex.argv" # codex_args', written once it succeeded
   else
     bin=$CLAUDE out="$DIR/claude.md"
     mapfile -d '' -t args < <(claude_args)
@@ -641,9 +654,12 @@ start() { # <reviewer>: runs it in the background; leaves "<exit> <seconds>" in 
   JOB_PIDS+=("$!")
 }
 
+# A reviewer is started only once its check passed — and, for codex, its argv was built whole
+# (codex_args fails without a whole --disable list: its exit status is looked at here, never lost
+# in a process substitution).
 SEND=()
 for r in "${RUN[@]}"; do
-  if why=$(tools_off "$r"); then
+  if why=$(tools_off "$r") && { [ "$r" != codex ] || why=$(codex_args 2>&1 >"$WORK/codex.argv"); }; then
     SEND+=("$r")
   else
     why="couldn't confirm its tools are off — not asked ($why)"

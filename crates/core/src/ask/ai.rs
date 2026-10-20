@@ -965,6 +965,11 @@ pub(crate) mod tests {
         assert!(text.contains(&printf(&codex[..first_disable])), "codex's argv up to the features");
         assert!(text.contains(r#"mapfile -t disable <"$WORK/codex.disable""#), "the features its check chose");
         assert!(text.contains(r#"for f in "${disable[@]}"; do printf '%s\0' --disable "$f"; done"#), "each of them");
+        // …and never without every tool feature among them (review ai-review claude #9): codex_args
+        // fails then, and the review starts codex only once it didn't.
+        assert!(text.contains(r#"echo "its --disable list (codex.disable) is missing" >&2 return 1"#), "no list, no argv");
+        assert!(text.contains(r#"for f in "${CODEX_TOOL_FEATURES[@]}"; do case " ${disable[*]} " in *" $f "*) ;; *) missing+=("$f") ;; esac done"#), "a short list, no argv");
+        assert!(text.contains(r#"why=$(codex_args 2>&1 >"$WORK/codex.argv"); }; then"#) && text.contains(r#"mapfile -d '' -t args <"$WORK/codex.argv""#), "its status looked at");
         assert!(text.contains(r#"printf '%s\n' "${CODEX_TOOL_FEATURES[@]}""#), "every tool feature, always");
         assert!(text.contains(r#"case $f in *web_search*) echo "$f" ;; esac"#), "web search, as off_when_listed");
         assert!(text.contains(r#"args=(features list -c 'web_search="disabled"' -c 'mcp_servers={}')"#), "its check gets the overrides");
