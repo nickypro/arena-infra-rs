@@ -1267,10 +1267,13 @@ status and the newest log tail, where a login comes from, arena's config or keys
 Every text field is masked through the backup's own key patterns
 (`arena_core::backup::SECRET_PATTERNS`: OpenRouter, Anthropic incl. Claude Code tokens, OpenAI,
 Hugging Face, GitHub, Google, Groq, AWS — the same replacements, `REDACTED-…`). Also masked: the
-value of anything named like a secret (`HF_TOKEN=…`, `--api-key …`, `password=…`, `Bearer …`,
-`https://user:pass@…`), any run of 32+ `[A-Za-z0-9_-]` in arguments, commands, commit subjects and
-log lines (`<redacted>`), and a private-key block in a log. Each pod's part is at most 6 KB (less
-when many pods share a prompt: 240 KB in all), trimmed from the log's oldest lines first.
+whole value of anything named like a secret (`HF_TOKEN=…` and `MY_SECRET='x y'`, `--api-key …`,
+JSON/YAML/Python-dict fields such as `"password": "a b"` or `api_key: …`, `Authorization: …`,
+`Bearer …`, basic auth: `curl -u user:pass`, `--user user:pass`, `https://user:pass@…`) — a line
+whose secret value can't be delimited (an unclosed quote or bracket) is replaced whole — any run of
+32+ `[A-Za-z0-9_-]` in arguments, commands, commit subjects and log lines (`<redacted>`), and a
+private-key block in a log. Each pod's part is at most 6 KB (less when many pods share a prompt: 240
+KB in all), trimmed from the log's oldest lines first.
 
 #### Where it goes
 

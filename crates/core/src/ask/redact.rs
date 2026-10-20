@@ -9,9 +9,11 @@
 //!   those patterns use (literals, bracket expressions, `( | )`, `{n}`/`{n,}`/`{n,m}`/`*`/`+`/`?`
 //!   on one character, `^`, `$`, `\b`); a pattern using anything else fails to compile, which a
 //!   test catches and [`ready`] refuses at run time — never a silently unredacted bundle.
-//! - [`named_values`]: the value of anything *named* like a secret — `HF_TOKEN=…`,
-//!   `--api-key …`, `password=…`, `Bearer …`, `https://user:pass@…` — whatever its shape (a
-//!   short password matches no pattern).
+//! - [`named_values`]: the whole value of anything *named* like a secret, whatever its shape (a
+//!   short password matches no pattern): `HF_TOKEN=…` and `MY_SECRET='x y'`, `--api-key …`,
+//!   JSON/YAML/Python fields (`"password": "a b"`, `'token': '…'`, `api_key: …`), `Bearer …`,
+//!   basic auth (`curl -u user:pass`, `--user user:pass`, `https://user:pass@…`). A value it
+//!   can't find the end of (an unclosed quote or bracket) makes the whole line [`LINE_MASK`].
 //! - [`long_tokens`]: any run of 32 or more `[A-Za-z0-9_-]` — the shape of almost every API key,
 //!   session id and bearer token — becomes [`MASK`]. Applied to free text (process arguments,
 //!   log lines, commands, commit subjects), not to names (a branch, a file name), which can
@@ -31,6 +33,10 @@ pub const LONG_TOKEN: usize = 32;
 
 /// What a private-key block in a log becomes ([`log_lines`]).
 pub const PEM_MASK: &str = "<redacted: private key block>";
+
+/// What a line becomes when [`named_values`] finds a secret-named value it can't delimit (an
+/// unclosed quote or bracket: the value may run on past this line, so nothing of it is kept).
+pub const LINE_MASK: &str = "<redacted: a line holding a secret that couldn't be masked>";
 
 type Set = Box<[bool; 256]>;
 
@@ -377,60 +383,261 @@ fn secret_name(name: &str) -> bool {
         || n.ends_with(".key")
 }
 
-/// The `name` of a `name=value` word (after any leading `-`/`--` and an `export`-free shape):
-/// letters, digits, `_`, `-`, `.`.
-fn assignment(word: &str) -> Option<(&str, &str)> {
-    let (name, value) = word.split_once('=')?;
-    let bare = name.trim_start_matches('-');
-    (!bare.is_empty() && bare.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))).then_some((name, value))
+/// A byte of a name: a variable, a flag (its leading `-`s too), a JSON/YAML key.
+fn name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
 }
 
-/// `scheme://user:password@host` → `scheme://<redacted>@host`, in one word.
+fn quote_byte(b: u8) -> bool {
+    matches!(b, b'"' | b'\'')
+}
+
+/// The quote each byte of `b` sits inside, shell-style (`"` with backslash escapes, `'` with
+/// none), read from the start of the line: `state[i]` is the quote open just before byte `i`.
+fn quote_states(b: &[u8]) -> Vec<Option<u8>> {
+    let mut states = Vec::with_capacity(b.len() + 1);
+    let (mut open, mut escaped) = (None, false);
+    for &c in b {
+        states.push(open);
+        match open {
+            Some(b'"') if escaped => escaped = false,
+            Some(b'"') if c == b'\\' => escaped = true,
+            Some(q) if c == q => open = None,
+            Some(_) => {}
+            None if quote_byte(c) => open = Some(c),
+            None => {}
+        }
+    }
+    states.push(open);
+    states
+}
+
+/// Where the quoted run opened by `b[at]` ends (just past its closing quote): backslash escapes
+/// count inside `"`, and inside `'` too when `escapes` (JSON, Python, YAML — not the shell).
+/// `None`: it never closes on this line.
+fn quoted_end(b: &[u8], at: usize, escapes: bool) -> Option<usize> {
+    let q = b[at];
+    let mut i = at + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' if q == b'"' || escapes => i += 2,
+            c if c == q => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Where the bracketed run opened by `b[at]` (`(`, `[`, `{`) closes, quotes inside skipped.
+/// `None`: not on this line.
+fn bracket_end(b: &[u8], at: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = at;
+    while i < b.len() {
+        match b[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            q if quote_byte(q) => {
+                i = quoted_end(b, i, true)?;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The end of a shell word's value starting at `at`: up to whitespace, or the quote `enclosing`
+/// the whole assignment (`echo "HF_TOKEN=abc"`), through any quoted part it opens itself
+/// (`X='a b'`, `X=a"b c"`). `None`: a quote it opens never closes.
+fn shell_value_end(b: &[u8], at: usize, enclosing: Option<u8>) -> Option<usize> {
+    let mut i = at;
+    while i < b.len() {
+        match b[i] {
+            c if c.is_ascii_whitespace() => break,
+            q if Some(q) == enclosing => break,
+            q if quote_byte(q) => i = quoted_end(b, i, false)?,
+            _ => i += 1,
+        }
+    }
+    Some(i)
+}
+
+/// How a separator reads a value: `=` as the shell does, `:` as JSON/YAML/a header does.
+#[derive(Clone, Copy, PartialEq)]
+enum Sep {
+    Equals,
+    /// After a quoted key (`"k": v`, `'k': v`): a bare value ends at `,` `}` `]`.
+    ColonQuoted,
+    /// After a bare key (`k: v`, a header): a bare value is the rest of the line (or of the
+    /// quoted run the key is in).
+    Colon,
+}
+
+/// Where the value starting at `at` ends. `None`: it can't be told (an unclosed quote or
+/// bracket).
+fn value_end(b: &[u8], at: usize, sep: Sep, enclosing: Option<u8>) -> Option<usize> {
+    match b[at] {
+        b'(' | b'[' | b'{' => bracket_end(b, at),
+        q if quote_byte(q) && sep != Sep::Equals => quoted_end(b, at, true),
+        _ if sep == Sep::Equals => shell_value_end(b, at, enclosing),
+        _ => {
+            let stop = |c: u8| Some(c) == enclosing || (sep == Sep::ColonQuoted && matches!(c, b',' | b'}' | b']'));
+            let end = b[at..].iter().position(|&c| stop(c)).map_or(b.len(), |n| at + n);
+            Some(end)
+        }
+    }
+}
+
+/// `text` with the value of every secret-named field masked whole: `NAME=value` (the value a
+/// shell word: `X='a b'` is all of `'a b'`), `name: value` and `"name": value` (JSON, YAML,
+/// a Python dict, a header — a quoted value to its closing quote, a bracketed one to its
+/// closing bracket, a bare one to the end of the line or the field). A `:` separates only
+/// after a quoted key or before a space or quote, so `auth.py:42:` and `https://` aren't
+/// fields. `None`: a secret-named value whose end can't be told.
+fn fields(text: &str) -> Option<String> {
+    let b = text.as_bytes();
+    let states = quote_states(b);
+    let mut out = String::with_capacity(text.len());
+    let (mut i, mut copied) = (0, 0);
+    while i < b.len() {
+        if !name_byte(b[i]) || (i > 0 && name_byte(b[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut j = i;
+        while j < b.len() && name_byte(b[j]) {
+            j += 1;
+        }
+        // A quoted key: the quote before it closes right after it.
+        let quote = start.checked_sub(1).map(|k| b[k]).filter(|&q| quote_byte(q));
+        let quoted = quote.is_some_and(|q| b.get(j) == Some(&q));
+        let enclosing = if quoted { states[start - 1] } else { states[start] };
+        let mut k = if quoted { j + 1 } else { j };
+        while k < b.len() && b[k] == b' ' {
+            k += 1;
+        }
+        let sep = match (b.get(k), b.get(k + 1)) {
+            (Some(b'='), next) if next != Some(&b'=') => Some((Sep::Equals, k + 1)),
+            (Some(b':'), Some(b'=')) => Some((Sep::Equals, k + 2)),
+            (Some(b':'), _) if quoted => Some((Sep::ColonQuoted, k + 1)),
+            (Some(b':'), next) if next.is_none_or(|&c| c == b' ' || quote_byte(c)) => Some((Sep::Colon, k + 1)),
+            _ => None,
+        };
+        let Some((sep, after)) = sep else {
+            i = j;
+            continue;
+        };
+        if !secret_name(&text[start..j]) {
+            // Not a secret, but its value may hold one (`--env=HF_TOKEN=…`): read on inside it.
+            i = after;
+            continue;
+        }
+        let mut v = after;
+        while v < b.len() && b[v] == b' ' {
+            v += 1;
+        }
+        if v >= b.len() || Some(b[v]) == enclosing {
+            i = v;
+            continue;
+        }
+        let end = value_end(b, v, sep, enclosing)?;
+        if end > v {
+            out.push_str(&text[copied..v]);
+            out.push_str(MASK);
+            copied = end;
+        }
+        i = end.max(v + 1);
+    }
+    out.push_str(&text[copied..]);
+    Some(out)
+}
+
+/// What the previous word asks of the next one.
+#[derive(Clone, Copy, PartialEq)]
+enum Next {
+    Keep,
+    /// A secret-named flag's value, `Bearer`'s, `Authorization: Basic`'s: masked.
+    Secret,
+    /// `-u`/`--user`/`--proxy-user`'s: masked when it is `user:password`.
+    UserPass,
+}
+
+/// `scheme://user:password@host` → `scheme://<redacted>@host`, in one word — up to its last
+/// `@`, so a password holding a `/` or an `@` goes whole (a URL that merely has an `@` in its
+/// path loses a little more than it must).
 fn url_credentials(word: &str) -> Option<String> {
     let at = word.find("://")? + 3;
     let rest = &word[at..];
-    let end = rest.find('@')?;
+    let end = rest.rfind('@')?;
     let cred = &rest[..end];
-    (!cred.is_empty() && !cred.contains('/') && cred.contains(':')).then(|| format!("{}{MASK}{}", &word[..at], &rest[end..]))
+    (!cred.is_empty() && cred.contains(':')).then(|| format!("{}{MASK}{}", &word[..at], &rest[end..]))
 }
 
-/// `text` with the values of secret-named things masked: `NAME=value` and `--name=value`
-/// words, a `--name value` / `-name value` pair, the word after `Bearer` (and after
-/// `Authorization: Basic`), and the credentials in a URL. Whitespace is kept as it was.
-pub fn named_values(text: &str) -> String {
+/// Basic auth glued to its flag: `--user=u:p`, `--proxy-user=u:p`, `-uu:p` → the flag and
+/// [`MASK`].
+fn attached_user(word: &str) -> Option<String> {
+    let (flag, value) = ["--user=", "--proxy-user=", "-u"].iter().find_map(|f| word.strip_prefix(f).map(|v| (*f, v)))?;
+    value.contains(':').then(|| format!("{flag}{MASK}"))
+}
+
+/// `text` with the word after a secret-named flag (`--api-key x`, `--password "a b"`: the
+/// value a shell word, quotes and all), after `Bearer` or `Authorization: Basic`, and basic
+/// auth (`-u user:pass`, `--user user:pass`, either glued, the credentials in a URL) masked.
+/// Whitespace is kept as it was. `None`: a value opens a quote that never closes.
+fn flag_values(text: &str) -> Option<String> {
+    let b = text.as_bytes();
+    let states = quote_states(b);
     let mut out = String::with_capacity(text.len());
-    let (mut mask_next, mut after_authorization) = (false, false);
-    let mut rest = text;
-    while !rest.is_empty() {
-        let ws = rest.len() - rest.trim_start().len();
-        out.push_str(&rest[..ws]);
-        rest = &rest[ws..];
-        if rest.is_empty() {
-            break;
+    let (mut next, mut after_authorization) = (Next::Keep, false);
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            let ws = b[i..].iter().position(|c| !c.is_ascii_whitespace()).map_or(b.len(), |n| i + n);
+            out.push_str(&text[i..ws]);
+            i = ws;
+            continue;
         }
-        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let word = &rest[..end];
-        rest = &rest[end..];
-        if mask_next && !word.starts_with('-') {
-            out.push_str(MASK);
-            mask_next = false;
+        let end = b[i..].iter().position(u8::is_ascii_whitespace).map_or(b.len(), |n| i + n);
+        let word = &text[i..end];
+        if next != Next::Keep && !word.starts_with('-') {
+            let value_end = shell_value_end(b, i, states[i])?;
+            let value = &text[i..value_end];
+            out.push_str(if next == Next::Secret || value.contains(':') { MASK } else { value });
+            next = Next::Keep;
+            i = value_end;
             continue;
         }
         let bare = word.trim_matches(|c| c == '"' || c == '\'').trim_end_matches(':');
         let basic = after_authorization && bare.eq_ignore_ascii_case("basic");
         after_authorization = bare.eq_ignore_ascii_case("authorization");
-        mask_next = false;
-        if let Some((name, _)) = assignment(word.trim_matches(|c| c == '"' || c == '\'')).filter(|(n, v)| secret_name(n) && !v.is_empty()) {
-            out.push_str(&format!("{name}={MASK}"));
-        } else if let Some(masked) = url_credentials(word) {
+        next = Next::Keep;
+        if let Some(masked) = url_credentials(word).or_else(|| attached_user(word)) {
             out.push_str(&masked);
         } else {
             out.push_str(word);
-            let flag = word.starts_with('-') && !word.contains('=') && secret_name(word);
-            mask_next = flag || basic || bare.eq_ignore_ascii_case("bearer");
+            if (word.starts_with('-') && !word.contains('=') && secret_name(word)) || basic || bare.eq_ignore_ascii_case("bearer") {
+                next = Next::Secret;
+            } else if matches!(word, "-u" | "--user" | "--proxy-user") {
+                next = Next::UserPass;
+            }
         }
+        i = end;
     }
-    out
+    Some(out)
+}
+
+/// `text` with the values of secret-named things masked whole ([`fields`], then
+/// [`flag_values`]) — or, when one can't be delimited, [`LINE_MASK`] in place of all of it.
+pub fn named_values(text: &str) -> String {
+    fields(text).and_then(|t| flag_values(&t)).unwrap_or_else(|| LINE_MASK.to_string())
 }
 
 /// One line of pod text made safe to show and send: line breaks and tabs are spaces, other
@@ -614,24 +821,147 @@ pub(crate) mod tests {
         assert_eq!(long_tokens(&format!("é{t40}é")), format!("é{MASK}é"));
     }
 
+    /// The whole value of what is named secret — quoted values with their spaces, JSON, YAML
+    /// and Python-dict fields, headers, basic auth — and nothing of the look-alikes around it
+    /// (`auth.py:42:`, `python -u`, `token ==`, a URL without credentials).
     #[test]
     fn named_values_masks_what_is_named_secret() {
         let cases = [
             ("HF_TOKEN=abc123 python x.py", "HF_TOKEN=<redacted> python x.py"),
             ("prog --api-key short1 --lr 1", "prog --api-key <redacted> --lr 1"),
             ("prog --password=hunter2", "prog --password=<redacted>"),
-            ("curl -H 'Authorization: Bearer abc' u", "curl -H 'Authorization: Bearer <redacted> u"),
-            ("-H 'Authorization: Basic dXNlcjpw'", "-H 'Authorization: Basic <redacted>"),
+            ("curl -H 'Authorization: Bearer abc' u", "curl -H 'Authorization: <redacted>' u"),
+            ("-H 'Authorization: Basic dXNlcjpw'", "-H 'Authorization: <redacted>'"),
             ("Basic usage: run it", "Basic usage: run it"),
             ("git clone https://user:pw@github.com/x/y", "git clone https://<redacted>@github.com/x/y"),
-            ("MY_SECRET='x y'", "MY_SECRET=<redacted> y'"),
+            ("MY_SECRET='x y'", "MY_SECRET=<redacted>"),
+            ("MY_SECRET='x y' next", "MY_SECRET=<redacted> next"),
+            ("export DB_PASSWORD=\"hunter two\" && run", "export DB_PASSWORD=<redacted> && run"),
+            ("TOKEN=a'b c'd tail", "TOKEN=<redacted> tail"),
+            ("echo \"loading HF_TOKEN=abc\"; echo \"next\"", "echo \"loading HF_TOKEN=<redacted>\"; echo \"next\""),
+            ("--password \"a b\" --lr 1", "--password <redacted> --lr 1"),
+            ("--token='a b' x", "--token=<redacted> x"),
+            ("--env=HF_TOKEN=abc x", "--env=HF_TOKEN=<redacted> x"),
+            // JSON, a Python dict, YAML, source code.
+            ("{\"password\": \"cohort db pass\", \"user\": \"bob\"}", "{\"password\": <redacted>, \"user\": \"bob\"}"),
+            ("{\"password\":\"cohort-db-pass\",\"port\":5432}", "{\"password\":<redacted>,\"port\":5432}"),
+            ("{\"token\": \"a\\\"b c\", \"n\": 1}", "{\"token\": <redacted>, \"n\": 1}"),
+            ("{'api_key': 'x y z', 'lr': 0.1}", "{'api_key': <redacted>, 'lr': 0.1}"),
+            ("{\"apiKey\": 12345, \"n\": 1}", "{\"apiKey\": <redacted>, \"n\": 1}"),
+            ("\"Token\" : \"x y\"", "\"Token\" : <redacted>"),
+            ("api_key: abc def", "api_key: <redacted>"),
+            ("password: \"a b\" # set", "password: <redacted> # set"),
+            ("client_secret = \"a b\"", "client_secret = <redacted>"),
+            ("token := os.Getenv(x)", "token := <redacted>"),
+            ("auth=(\"user\", \"pass word\") rest", "auth=<redacted> rest"),
+            ("\"credentials\": {\"u\": \"a\", \"p\": \"b c\"} rest", "\"credentials\": <redacted> rest"),
+            ("secrets: [\"a\", \"b c\"]", "secrets: <redacted>"),
+            // Basic auth.
+            ("curl -u admin:pw https://x", "curl -u <redacted> https://x"),
+            ("curl --user admin:pw https://x", "curl --user <redacted> https://x"),
+            ("curl -u \"admin:p w\" https://x", "curl -u <redacted> https://x"),
+            ("curl --user=admin:pw x", "curl --user=<redacted> x"),
+            ("curl --proxy-user px:pw x", "curl --proxy-user <redacted> x"),
+            ("curl -uadmin:pw x", "curl -u<redacted> x"),
+            // Look-alikes, kept.
+            ("python -u train.py", "python -u train.py"),
+            ("pip install --user torch", "pip install --user torch"),
+            ("auth.py:42: DeprecationWarning: use x", "auth.py:42: DeprecationWarning: use x"),
+            ("site-packages/transformers/tokenization_utils_base.py:1601: FutureWarning: x", "site-packages/transformers/tokenization_utils_base.py:1601: FutureWarning: x"),
+            ("if token == \"abc\":", "if token == \"abc\":"),
             ("python train.py --lr 3e-4 --epochs=2", "python train.py --lr 3e-4 --epochs=2"),
             ("ssh git@github.com", "ssh git@github.com"),
+            ("see https://github.com/x/y", "see https://github.com/x/y"),
+            ("don't stop TOKEN=abc now", "don't stop TOKEN=<redacted> now"),
             ("--token", "--token"),
+            ("TOKEN=", "TOKEN="),
+            ("password:", "password:"),
+            ("echo \"TOKEN=\"", "echo \"TOKEN=\""),
         ];
         for (input, want) in cases {
             assert_eq!(named_values(input), want, "{input}");
         }
+    }
+
+    /// A secret-named value whose end can't be told — a quote or bracket that doesn't close on
+    /// the line — takes the whole line: nothing of it is kept.
+    #[test]
+    fn a_line_that_cant_be_masked_is_a_placeholder() {
+        for line in [
+            "TOKEN=\"never closed and more",
+            "--password \"a b",
+            "{\"password\": \"a b",
+            "\"credentials\": {\"u\": \"a\",",
+            "auth=(\"user\", \"pass",
+            "curl -u 'admin:p w",
+        ] {
+            assert_eq!(named_values(line), LINE_MASK, "{line}");
+            assert_eq!(text(&format!("INFO {line}"), 200), LINE_MASK, "{line}");
+        }
+        // An open quote that isn't a secret's value is no reason.
+        assert_eq!(named_values("it's \"fine"), "it's \"fine");
+    }
+
+    /// Fuzz-ish: every secret name × every shape it's written in (shell, flags, JSON, a Python
+    /// dict, YAML, source, headers, basic auth, URLs) × noise around it — no fragment of the
+    /// value survives `text`, and something says it was masked.
+    #[test]
+    fn no_fragment_of_a_named_value_survives_any_shape() {
+        let keys = ["password", "API_KEY", "token", "client_secret", "db.passwd", "apiKey", "HF_TOKEN", "Private-Key", "Authorization"];
+        // {k} the name, {v} the value: values with spaces, then values that can't have them.
+        let spaced = [
+            "{k}='{v}'",
+            "{k}=\"{v}\"",
+            "export {k}=\"{v}\"",
+            "--{k} \"{v}\"",
+            "--{k} '{v}' --lr 1",
+            "--{k}='{v}'",
+            "{\"{k}\": \"{v}\", \"user\": \"bob\"}",
+            "{\"{k}\":\"{v}\"}",
+            "{'{k}': '{v}', 'lr': 0.1}",
+            "{k}: {v}",
+            "  {k}: \"{v}\"",
+            "{k}: '{v}' # note",
+            "{k} = \"{v}\"",
+            "\"{k}\" : \"{v}\"",
+            "{k}=(\"{v}\", 1)",
+            "{k}: [\"{v}\"]",
+            "echo '{k}: {v}' | x",
+            "Authorization: Basic {v}",
+            "-H \"Authorization: Bearer {v}\" https://h",
+            "curl -u \"admin:{v}\" https://h",
+        ];
+        let tight = [
+            "{k}={v}",
+            "--{k}={v}",
+            "--{k} {v}",
+            "echo \"{k}={v}\"; next",
+            "x?{k}={v}&y=1",
+            "curl -u admin:{v} https://h",
+            "curl --user admin:{v} h",
+            "curl --user=admin:{v} h",
+            "git clone https://admin:{v}@github.com/x",
+            "Bearer {v}",
+        ];
+        let (v_spaced, v_tight) = ("Qx7alpha Qx7bravo+/Qx7charlie=", "Qx7alpha+Qx7bravo/Qx7charlie=");
+        let fragments = ["Qx7alpha", "Qx7bravo", "Qx7charlie"];
+        let mut n = 0;
+        for k in keys {
+            for (shapes, v) in [(&spaced[..], v_spaced), (&tight[..], v_tight)] {
+                for shape in shapes {
+                    for (pre, post) in [("", ""), ("INFO 12:00:01 ", ""), ("[x] ", " (done)")] {
+                        let line = format!("{pre}{}{post}", shape.replace("{k}", k).replace("{v}", v));
+                        let out = text(&line, 1000);
+                        for f in fragments {
+                            assert!(!out.contains(f), "{f} survived: {line:?} -> {out:?}");
+                        }
+                        assert!(out.contains(MASK) || out == LINE_MASK, "{line:?} -> {out:?}");
+                        n += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(n, keys.len() * (spaced.len() + tight.len()) * 3);
     }
 
     #[test]
