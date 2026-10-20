@@ -161,7 +161,10 @@ impl Busy {
                 (true, Ok(p), Some(look)) if p.whole.contains(&pod.name) => match core_resolve::copy_place(&remote_path, look, &pod.target.user) {
                     Some(place) => {
                         let label = p.snapshot_root.rsplit('/').next().unwrap_or_default();
-                        let to = format!("{}/{}", p.snapshot_root, pod.name);
+                        // The copy's real path, every link resolved and never relative to this
+                        // run's working directory: what `copy_still_there` compares, and what the
+                        // lines name, however `LOCAL_BACKUP_DIR` is spelled.
+                        let to = crate::absolute_path(std::path::Path::new(&format!("{}/{}", p.snapshot_root, pod.name))).display().to_string();
                         let git = std::path::Path::new(&to).join(place).join(".git").display().to_string();
                         let copy = BusyCopy {
                             op: look.op_key(),

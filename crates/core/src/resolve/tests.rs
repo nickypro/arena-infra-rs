@@ -197,25 +197,60 @@ fn a_busy_pod_is_copied_only_when_unrecorded_changed_or_an_hour_old() {
     }
 }
 
+/// `p` (absolute) as a path relative to this process's working directory: `../` up to the root,
+/// then `p` — what a relative `LOCAL_BACKUP_DIR` is.
+fn relative_to_cwd(p: &Path) -> String {
+    let cwd = std::env::current_dir().unwrap();
+    let up = cwd.components().filter(|c| matches!(c, std::path::Component::Normal(_))).count();
+    format!("{}{}", "../".repeat(up), p.display().to_string().trim_start_matches('/'))
+}
+
 /// An earlier run's copy is trusted (to skip a copy, or to resolve on) only while it is under the
 /// backup dir as configured now and its `.git` is still on this machine (review ai-review codex
 /// #7): a copy deleted or moved since, a `LOCAL_BACKUP_DIR` changed since, or a record from before
-/// the `.git` was kept, is none — the pod is copied now.
+/// the `.git` was kept, is none — the pod is copied now. Compared as the directories they are
+/// (review ai-review claude #8): the backup dir spelled through a link or relative to the working
+/// directory is the same dir, and so is a record spelled through a link; a record of a relative
+/// path (some other run's working directory) is none.
 #[test]
 fn a_recorded_copy_counts_only_while_it_is_still_there_under_this_backup_dir() {
     let base = std::env::temp_dir().join(format!("arena-copy-there-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let base = std::fs::canonicalize(&base).unwrap();
     let dir = base.join("backups").display().to_string();
     let to = format!("{dir}/w1d1/devtest-a");
     let git = format!("{to}/ARENA_materials/.git");
     std::fs::create_dir_all(&git).unwrap();
+    for other in ["elsewhere", "backups-old", "x/.git"] {
+        std::fs::create_dir_all(base.join(other)).unwrap();
+    }
     let copy = BusyCopy { op: "merge 1 a".into(), print: "1-2".into(), newest: 1, at: 1, to: to.clone(), label: "w1d1/devtest-a".into(), git: git.clone() };
     assert!(copy_still_there(&copy, &dir));
     assert!(copy_still_there(&copy, &format!("{dir}/")), "a trailing slash is the same dir");
+    // The same dir spelled through a link, or relative to the working directory; a record spelled
+    // through the link: the same copy.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(base.join("backups"), base.join("link")).unwrap();
+        let link = base.join("link").display().to_string();
+        assert!(copy_still_there(&copy, &link), "the backup dir through a link");
+        let linked = BusyCopy { to: format!("{link}/w1d1/devtest-a"), git: format!("{link}/w1d1/devtest-a/ARENA_materials/.git"), ..copy.clone() };
+        assert!(copy_still_there(&linked, &dir) && copy_still_there(&linked, &link), "a record through the link");
+        // The link pointed at another dir since: another tree.
+        std::fs::remove_file(base.join("link")).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), base.join("link")).unwrap();
+        assert!(!copy_still_there(&copy, &link), "the link pointed elsewhere since");
+    }
+    let rel = relative_to_cwd(Path::new(&dir));
+    assert!(!Path::new(&rel).is_absolute() && copy_still_there(&copy, &rel), "relative: {rel}");
+    let relative = BusyCopy { to: relative_to_cwd(Path::new(&to)), git: relative_to_cwd(Path::new(&git)), ..copy.clone() };
+    assert!(!copy_still_there(&relative, &dir), "a record of a relative path: whose working directory?");
     // LOCAL_BACKUP_DIR changed since (another dir; one that merely starts the same).
     assert!(!copy_still_there(&copy, &base.join("elsewhere").display().to_string()));
     assert!(!copy_still_there(&copy, &format!("{dir}-old")));
     assert!(!copy_still_there(&copy, ""));
+    assert!(!copy_still_there(&copy, &to), "the copy itself is no backup dir");
     // A record from before the `.git` was kept, or one pointing outside its copy.
     assert!(!copy_still_there(&BusyCopy { git: String::new(), ..copy.clone() }, &dir));
     assert!(!copy_still_there(&BusyCopy { git: base.join("x/.git").display().to_string(), ..copy.clone() }, &dir));

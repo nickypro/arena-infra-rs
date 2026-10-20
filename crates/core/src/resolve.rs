@@ -347,9 +347,10 @@ const BUSY_COPIES_VERSION: u32 = 1;
 
 /// The last copy of a BUSY pod that succeeded: for which operation ([`Look::op_key`]), the work
 /// tree it held ([`Look::print`], [`Look::newest`]: what the look before it saw), when (this
-/// machine's clock), where (`to`: the snapshot dir; `label`: `<wNdM>/<pod>`), and where in it the
-/// checkout's `.git` is (`git`, on this machine: [`copy_still_there`]; empty in a record written
-/// before it was kept, which then counts as no copy).
+/// machine's clock), where (`to`: the pod's snapshot dir, its real path — every link resolved;
+/// `label`: `<wNdM>/<pod>`), and where in it the checkout's `.git` is (`git`, on this machine:
+/// [`copy_still_there`]; empty in a record written before it was kept, which then counts as no
+/// copy).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BusyCopy {
     pub op: String,
@@ -366,11 +367,22 @@ pub struct BusyCopy {
 /// to resolve on: its copy is under the backup dir as it is configured now (`backup_dir`:
 /// `LOCAL_BACKUP_DIR` — one changed since means the record is of another tree), and the copy's
 /// `.git` is still there on this machine (a copy moved or deleted since is no copy). Else the pod
-/// is copied now. Reads the disk (one `stat`).
+/// is copied now.
+///
+/// Both are compared as the directories they are, every link resolved (review ai-review claude
+/// #8): the backup dir as configured may be spelled through a link (`/data` on a volume) or
+/// relative to the working directory (the default `./backup`), and the record holds the copy's
+/// own real path (`settle` writes it so) — so the same directory counts however it is spelled,
+/// and a link pointed at another volume since is another tree. A record whose copy isn't an
+/// absolute path (written from a relative `LOCAL_BACKUP_DIR` before: relative to some other run's
+/// working directory, for all this one knows) is no copy. Reads the disk (each path resolved).
 pub fn copy_still_there(last: &BusyCopy, backup_dir: &str) -> bool {
-    let (to, git) = (Path::new(&last.to), Path::new(&last.git));
-    let dir = backup_dir.trim_end_matches('/');
-    !dir.is_empty() && to.starts_with(dir) && to != Path::new(dir) && git.starts_with(to) && git.is_dir()
+    let real = |p: &str| if p.is_empty() { None } else { std::fs::canonicalize(p).ok() };
+    if !Path::new(&last.to).is_absolute() || !Path::new(&last.git).is_absolute() {
+        return false;
+    }
+    let (Some(dir), Some(to), Some(git)) = (real(backup_dir), real(&last.to), real(&last.git)) else { return false };
+    to.starts_with(&dir) && to != dir && git.starts_with(&to) && git.is_dir()
 }
 
 /// Every pod's [`BusyCopy`], by name.

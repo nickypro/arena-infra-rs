@@ -57,7 +57,8 @@ impl World {
         let base = std::env::temp_dir().join(format!("arena-cli-resolve-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("backups")).unwrap();
-        let w = World { base };
+        // Its real path: the copy record holds the copy's, every link resolved.
+        let w = World { base: std::fs::canonicalize(&base).unwrap() };
         w.rsync(false);
         w
     }
@@ -556,6 +557,69 @@ async fn a_record_whose_copy_is_gone_or_elsewhere_means_copy_now() {
     assert_eq!(execs(&fake, 22002).len(), 3, "copied");
     let now_to = w.recorded().unwrap().to;
     assert!(now_to.starts_with(&elsewhere.display().to_string()), "{now_to}");
+}
+
+/// `p` (absolute) as a path relative to this process's working directory: `../` up to the root,
+/// then `p` — what a relative `LOCAL_BACKUP_DIR` is.
+fn relative_to_cwd(p: &std::path::Path) -> String {
+    let cwd = std::env::current_dir().unwrap();
+    let up = cwd.components().filter(|c| matches!(c, std::path::Component::Normal(_))).count();
+    format!("{}{}", "../".repeat(up), p.display().to_string().trim_start_matches('/'))
+}
+
+/// The copy record holds the copy's real path, and an earlier record counts however the backup dir
+/// is spelled (review ai-review claude #8): a relative `LOCAL_BACKUP_DIR` (the default `./backup`
+/// is one) is recorded as the absolute path it is, and the lines name that; a backup dir spelled
+/// through a link and then by its real path is the same dir — the record still holds, bloom is
+/// not copied again, and is finished from it.
+#[tokio::test]
+async fn a_backup_dir_spelled_relatively_or_through_a_link_holds_the_same_copy() {
+    let n = now();
+    let refuse = || FakeReply::exit(7, "").with_stdout("REFUSED changed: files changed since the copy\n");
+    // One tick under `cfg`: bloom's look quiet and unchanged ("55-66"), then `after` (its copy and
+    // resolve, as scripted) — (the rsync's copies of bloom, the lines).
+    let tick = |w: &World, cfg: &Config, after: Vec<FakeReply>| {
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [pushed("autocommit-a")]);
+        fake.script(&host(22002), [busy(), look(n, 4 * HOUR, "55-66")].into_iter().chain(after).collect::<Vec<_>>());
+        let (cfg, rsync) = (cfg.clone(), w.rsync_path());
+        async move {
+            let _ = crate::take_said();
+            let _ = handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &rsync).await;
+            (fake, crate::take_said())
+        }
+    };
+    let resolves = |fake: &FakeRemote| execs(fake, 22002).iter().filter(|(c, _)| c.contains(" arena-resolve")).count();
+
+    // Relative to this process's working directory.
+    let w = World::new("dir-relative");
+    let rel = relative_to_cwd(&w.base.join("backups"));
+    assert!(!std::path::Path::new(&rel).is_absolute(), "{rel}");
+    let cfg = w.cfg(&format!("LOCAL_BACKUP_DIR={rel}"));
+    let (fake, _) = tick(&w, &cfg, vec![repo_in_place(), refuse()]).await;
+    assert_eq!((w.copied().len(), resolves(&fake)), (3, 1), "copied, then the resolve refused");
+    let first = w.recorded().unwrap();
+    let to = format!("{}/devtest-bloom", w.snapshot_root(&cfg));
+    assert_eq!((first.to.as_str(), first.git.clone()), (to.as_str(), format!("{to}/ARENA_materials/.git")), "absolute, real");
+    let (fake, said) = tick(&w, &cfg, vec![resolved(), pushed("autocommit-b")]).await;
+    assert!(w.copied().is_empty(), "unchanged since: not copied again");
+    assert_eq!(resolves(&fake), 1, "finished from the recorded copy");
+    assert!(said.iter().any(|l| l.starts_with("✗ devtest-bloom: not backed up to git (") && l.ends_with(&format!(" to {to}, unchanged since"))), "{said:#?}");
+    assert!(said.iter().any(|l| l.starts_with("✓ devtest-bloom -> autocommit-b — ") && l.ends_with(&format!("; today's copy: {to})"))), "{said:#?}");
+
+    // Through a link, then by its real path: the same dir.
+    let w = World::new("dir-link");
+    std::os::unix::fs::symlink(w.base.join("backups"), w.base.join("link")).unwrap();
+    let linked = w.cfg(&format!("LOCAL_BACKUP_DIR={}", w.base.join("link").display()));
+    let (fake, _) = tick(&w, &linked, vec![repo_in_place(), refuse()]).await;
+    assert_eq!((w.copied().len(), resolves(&fake)), (3, 1));
+    let first = w.recorded().unwrap();
+    let real = w.cfg("");
+    assert_eq!(first.to, format!("{}/devtest-bloom", w.snapshot_root(&real)), "the real path, not the link's");
+    let (fake, said) = tick(&w, &real, vec![resolved(), pushed("autocommit-b")]).await;
+    assert!(w.copied().is_empty(), "the same copy, the dir spelled otherwise: not copied again");
+    assert_eq!(resolves(&fake), 1, "finished from it: {said:#?}");
+    assert_eq!(w.recorded(), None, "finished: forgotten");
 }
 
 /// A BUSY pod's copy counts — for its record and a resolve — only when whole (review ai-review
