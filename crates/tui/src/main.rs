@@ -4912,6 +4912,32 @@ deep_check_end=1
         }
     }
 
+    /// Review ai-review codex #5: the answer popup's scroll limit counts the lines as the
+    /// `Paragraph` wraps them — word by word, a wide character two columns — so a long paragraph
+    /// and a line of CJK scroll to their very end: at the limit the last line sits on the popup's
+    /// last row, right above its border, at any size. (Counting characters per line came short:
+    /// the last lines were out of reach.)
+    #[test]
+    fn the_answer_scrolls_to_the_end_of_wrapped_text() {
+        let shared_arc = Arc::new(Mutex::new(fixture_shared()));
+        let shared = fixture_shared();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let words: String = (0..400).map(|i| format!("word{i}{} ", "x".repeat(i % 11))).collect();
+        let text = format!("{words}\n{}\nTHE-END", "漢字".repeat(300));
+        for (w, h) in [(120, 40), (80, 24), (61, 17)] {
+            ui.mode = Mode::Answer(ask::Answer { title: "t".into(), text: text.clone() });
+            ui.result_scroll = 0;
+            draw(w, h, &shared, &ui);
+            for _ in 0..200 {
+                assert!(ask::key(&mut ui, &shared_arc, KeyCode::PageDown, KeyModifiers::NONE));
+            }
+            assert_eq!(ui.result_scroll, ui.result_max.get(), "{w}x{h}");
+            let rows = draw(w, h, &shared, &ui);
+            let at = rows.iter().position(|r| r.contains("THE-END")).unwrap_or_else(|| panic!("{w}x{h}: the end is out of reach:\n{}", rows.join("\n")));
+            assert!(rows[at + 1].contains('└'), "{w}x{h}: the last line isn't the last row:\n{}", rows.join("\n"));
+        }
+    }
+
     /// Live ASK F3: both popups — the `?` answer and the older result modal — scroll no further
     /// than their text's end, so after PgDn past it one PgUp moves the text at once (it took
     /// 11 after 10 extra PgDn). The offset is clamped by `scroll_by` to what the popup last

@@ -283,25 +283,22 @@ pub(crate) fn render_input(f: &mut Frame, shared: &Shared, ui: &Ui, scope: &Inpu
     );
 }
 
-/// Lines `text` takes wrapped at `width` (close enough for the scroll limit).
-fn wrapped_lines(text: &str, width: u16) -> u16 {
-    let w = usize::from(width.max(1));
-    let n: usize = text.lines().map(|l| l.chars().count().max(1).div_ceil(w)).sum();
-    u16::try_from(n).unwrap_or(u16::MAX)
-}
-
 /// The answer: a large popup, wrapped, scrolled by `scroll` (clamped to the end, which `max`
-/// is set to for the keys).
+/// is set to for the keys). The end is where the `Paragraph` itself ends it: its own count of
+/// the lines it wraps the text into at the popup's inner width (`line_count`: word by word, a
+/// wide character two columns — review ai-review codex #5: counting characters per line came
+/// short of a long paragraph's, and its last lines couldn't be scrolled to).
 pub(crate) fn render_answer(f: &mut Frame, answer: &Answer, scroll: u16, max: &std::cell::Cell<u16>) {
     let area = centered_rect(90, 85, f.area());
     f.render_widget(Clear, area);
     let inner = area.height.saturating_sub(2);
-    let total = wrapped_lines(&answer.text, area.width.saturating_sub(2));
+    let text = Paragraph::new(answer.text.clone()).wrap(Wrap { trim: false });
+    let total = u16::try_from(text.line_count(area.width.saturating_sub(2))).unwrap_or(u16::MAX);
     max.set(total.saturating_sub(inner));
     let scroll = scroll.min(max.get());
     let color = if answer.text.contains('✗') { Color::Red } else { Color::Green };
     f.render_widget(
-        Paragraph::new(answer.text.clone()).wrap(Wrap { trim: false }).scroll((scroll, 0)).block(
+        text.scroll((scroll, 0)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(color))
