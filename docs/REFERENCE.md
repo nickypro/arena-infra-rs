@@ -1251,17 +1251,18 @@ processes, CPU, memory, the root disk, the repo's branch, origin, commits not pu
 subjects, whether `~/.name`, the deploy key and the API/HF/Claude Code tokens are set up — never
 `PROGRESS_CMD`, your own command, which may write), `pods jobs`' listing and the newest job's last
 40 log lines, and a small probe: the pod's clock and uptime, load, `/`, `/workspace` and the home's
-size, logins (user, tty, time, and whether each is an SSH session, a tmux pane or local — **not**
-where from), tmux sessions, the busiest processes by CPU and memory with their arguments, the repo's
-working tree (counts, the first 20 changed file **names**, stashes, the last commit, and an
-operation in progress by the backup's own test — a merge, cherry-pick, revert, `git am`, rebase,
-sequence or a stash pop's conflicts — read as what it means: the backup is BUSY, how the participant
-ends it, and whether `pods backup` finishes it after `BUSY_AUTO_RESOLVE_HOURS`). With it, from this
-machine: the pod's listing row (status, GPU, $/h, endpoint, age, lock, maintenance), its last `pods
-test --deep` verdict, which local file backups (`pods pull`) exist of it, the backup's record of its
-last whole copy while BUSY (`busy-copies.json`: the operation, how long ago, the snapshot label and
-whether that copy is still here — never the local path), and the branch today's backups go to. A
-stopped or unreachable pod is its listing and why.
+size, logins (user, tty, time — labelled with the pod's time zone — and whether each is an SSH
+session, a tmux pane or local — **not** where from), tmux sessions, the busiest processes by CPU and
+memory with their arguments, the repo's working tree (counts, the first 20 changed file **names**,
+stashes, the last commit, and an operation in progress by the backup's own test — a merge,
+cherry-pick, revert, `git am`, rebase, sequence or a stash pop's conflicts — read as what it means:
+the backup is BUSY, how the participant ends it, and whether `pods backup` finishes it after
+`BUSY_AUTO_RESOLVE_HOURS`). With it, from this machine: the pod's listing row (status, GPU, $/h,
+endpoint, age, lock, maintenance), its last `pods test --deep` verdict, which local file backups
+(`pods pull`) exist of it, the backup's record of its last whole copy while BUSY
+(`busy-copies.json`: the operation, how long ago, the snapshot label and whether that copy is still
+here — never the local path), and the branch today's backups go to. A stopped or unreachable pod is
+its listing and why.
 
 Its git — the dashboard's probe's too — writes nothing and runs nothing the participant's repo
 configures: no optional locks (not even the index is refreshed), no fsmonitor hook, no clean/process

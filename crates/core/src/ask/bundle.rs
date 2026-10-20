@@ -238,6 +238,8 @@ fn parse_login(rest: &str) -> Login {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Extra {
     pub now: Option<String>,
+    /// The pod's own time zone as `date +%Z %z` gives it (`UTC +0000`): what `who`'s times are in.
+    pub tz: Option<String>,
     pub uptime: Option<u64>,
     pub pid1: Option<String>,
     pub pid1_age: Option<u64>,
@@ -424,6 +426,7 @@ pub fn parse_extra(text: &str, nonce: &str) -> Extra {
     };
     Extra {
         now: get("now").map(String::from),
+        tz: get("tz").map(String::from),
         uptime: get("uptime").and_then(number),
         pid1: get("pid1").map(String::from),
         pid1_age: get("pid1_age").and_then(number),
@@ -739,6 +742,24 @@ fn setup_line(m: Option<&PodMetrics>) -> Option<String> {
     ))
 }
 
+/// The pod's time zone ([`Extra::tz`], `date +%Z %z`) as a label for its login times (live
+/// ASK2 G5: `who` prints them in the pod's zone, unlabelled): `UTC`; a named zone with its offset,
+/// `BST (UTC+0100)`; one with no name, `UTC+0530`. `None`: unknown.
+fn tz_label(raw: &str) -> Option<String> {
+    let mut w = raw.split_whitespace().rev();
+    let off = w.next()?;
+    let name = w.next();
+    let b = off.as_bytes();
+    if b.len() != 5 || !matches!(b[0], b'+' | b'-') || !b[1..].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(match name.filter(|n| n.bytes().all(|c| c.is_ascii_alphabetic())) {
+        Some("UTC" | "GMT" | "UCT") if off == "+0000" => "UTC".to_string(),
+        Some(n) => format!("{} (UTC{off})", redact::name(n, 10)),
+        None => format!("UTC{off}"),
+    })
+}
+
 fn sessions_line(x: Option<&Extra>, now: Option<u64>) -> String {
     let Some(x) = x else { return format!("sessions: {UNKNOWN}") };
     let who = match &x.who {
@@ -761,8 +782,13 @@ fn sessions_line(x: Option<&Extra>, now: Option<u64>) -> String {
                 Some(Via::Local) => " (local)",
                 None => "",
             };
-            let list: Vec<String> = v.iter().take(6).map(|l| format!("{}{}", redact::name(&l.line, 60), via(l))).collect();
-            format!("{} (who): {}", counts.join(", "), list.join("; "))
+            // Each time in the pod's zone, said (unknown: said once).
+            let (zone, unknown) = match x.tz.as_deref().and_then(tz_label) {
+                Some(z) => (format!(" {z}"), ""),
+                None => (String::new(), ", times in a zone unknown"),
+            };
+            let list: Vec<String> = v.iter().take(6).map(|l| format!("{}{zone}{}", redact::name(&l.line, 60), via(l))).collect();
+            format!("{} (who{unknown}): {}", counts.join(", "), list.join("; "))
         }
         Some(Err(why)) => format!("logins (who): {why}"),
         None => format!("logins: {UNKNOWN}"),
@@ -1107,7 +1133,7 @@ pub mod fixtures {
         let log: String = ["collecting ...", "test_a PASSED", log_extra, "test_b PASSED"].iter().filter(|l| !l.is_empty()).map(|l| format!("{l}\n")).collect();
         let extra = tagged(
             &format!(
-                "ARENA_ASK now=2026-10-19T12:00:00Z\nARENA_ASK uptime=1036800\nARENA_ASK load=1.02 0.98 0.90\nARENA_ASK cpus=16\nARENA_ASK pid1=sleep\n\
+                "ARENA_ASK now=2026-10-19T12:00:00Z\nARENA_ASK tz=UTC +0000\nARENA_ASK uptime=1036800\nARENA_ASK load=1.02 0.98 0.90\nARENA_ASK cpus=16\nARENA_ASK pid1=sleep\n\
                  ARENA_ASK pid1_age=11400\nARENA_ASK nvsmi=yes\nARENA_ASK df_root=12582912 104857600 /\nARENA_ASK home=/root\n\
                  ARENA_ASK df_home=12582912 104857600 /\nARENA_ASK df_workspace=5242880 52428800 /workspace\nARENA_ASK home_kb=3355443\n\
                  ARENA_ASK who=ok\nARENA_ASK_WHO ssh root pts/0 2026-10-19 10:00\nARENA_ASK tmux=ok\nARENA_ASK_TMUX 2:1:1792410900:lab\n\
@@ -1205,7 +1231,7 @@ mod tests {
             "processes on the GPUs: 4242 /opt/conda/envs/arena-env/bin/python (13000 MiB)",
             "disk: / 12.0 GiB of 100.0 GiB used (12%) · /workspace 5.0 GiB of 50.0 GiB used (10%) · home /root on /, holds 3.2 GiB",
             "setup: ~/.name yes · deploy key yes · API keys in the shell rc yes · HF token yes · Claude Code token no",
-            "sessions: 1 ssh login (who): root pts/0 2026-10-19 10:00 (ssh) · 1 tmux session(s): lab (2 windows, attached, active 5m ago)",
+            "sessions: 1 ssh login (who): root pts/0 2026-10-19 10:00 UTC (ssh) · 1 tmux session(s): lab (2 windows, attached, active 5m ago)",
             "repo /root/ARENA_materials (really /workspace/ARENA_materials): branch autocommit-devtest-w1d2-alpha · upstream origin/autocommit-devtest-w1d2-alpha",
             "2 commit(s) not pushed, 0 behind its upstream",
             "working tree: 2 modified/staged, 1 untracked · operation in progress: merge unmerged · stashes 1",
@@ -1798,6 +1824,8 @@ mod tests {
             .env("PATH", format!("{}:/usr/local/bin:/usr/bin:/bin", bin.display()))
             .env("HOME", &home)
             .env("TMUX_TMPDIR", t.0.join("tmux"))
+            // A pod whose zone isn't UTC: `who`'s times are BST's.
+            .env("TZ", "BST-1")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1823,14 +1851,22 @@ mod tests {
         let line = sessions_line(Some(&x), None);
         assert!(
             line.starts_with(
-                "sessions: 2 ssh logins, 2 tmux panes, 2 local logins (who): root pts/0 Oct 20 16:15 (tmux); root pts/1 Oct 20 16:15 (tmux); \
-                 root pts/4 Oct 20 16:15 (ssh); ubuntu pts/5 2026-10-20 15:30 (ssh); root tty1 Oct 20 09:00 (local); root pts/6 Oct 20 09:01 (local) · "
+                "sessions: 2 ssh logins, 2 tmux panes, 2 local logins (who): root pts/0 Oct 20 16:15 BST (UTC+0100) (tmux); root pts/1 Oct 20 \
+                 16:15 BST (UTC+0100) (tmux); root pts/4 Oct 20 16:15 BST (UTC+0100) (ssh); ubuntu pts/5 2026-10-20 15:30 BST (UTC+0100) (ssh); root \
+                 tty1 Oct 20 09:00 BST (UTC+0100) (local); root pts/6 Oct 20 09:01 BST (UTC+0100) (local) · "
             ),
             "{line}"
         );
         // The live shape: four panes and one session.
         let live = Extra { who: Some(Ok([Via::Tmux, Via::Tmux, Via::Tmux, Via::Tmux, Via::Ssh].map(|v| login(v, "root pts/0 Oct 20 16:15")).to_vec())), ..Default::default() };
-        assert!(sessions_line(Some(&live), None).starts_with("sessions: 1 ssh login, 4 tmux panes (who): "));
+        assert!(sessions_line(Some(&live), None).starts_with("sessions: 1 ssh login, 4 tmux panes (who, times in a zone unknown): "));
+        // Live ASK2 G5: the times are the pod's zone's, and labelled so.
+        assert_eq!(x.tz.as_deref(), Some("BST +0100"), "{stdout}");
+        let labels = ["UTC +0000", "GMT +0000", "BST +0100", "EDT -0400", "+0530 +0530", "+0530", "", "UTC", "x +01"].map(tz_label);
+        assert_eq!(
+            labels,
+            [Some("UTC"), Some("UTC"), Some("BST (UTC+0100)"), Some("EDT (UTC-0400)"), Some("UTC+0530"), Some("UTC+0530"), None, None, None].map(|l| l.map(String::from))
+        );
         // The parse, tolerant: a count it can't read is unknown; a line of another shape is a name.
         assert_eq!(parse_tmux("2:1::lab"), Tmux { name: "lab".into(), windows: Some(2), attached: Some(1), activity: None });
         assert_eq!(parse_tmux("notes_2_1_1792506455"), Tmux { name: "notes_2_1_1792506455".into(), windows: None, attached: None, activity: None });

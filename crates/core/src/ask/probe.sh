@@ -38,6 +38,9 @@ t() {
 
 # --- Clock, uptime, load ------------------------------------------------------------------------
 o now "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+# The zone `who` prints its times in — the pod's own (/etc/localtime: no TZ here) — its name and
+# offset.
+o tz "$(date +%Z 2>/dev/null) $(date +%z 2>/dev/null)"
 up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
 up=${up%%.*}
 o uptime "$up"
