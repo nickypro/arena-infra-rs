@@ -46,6 +46,7 @@ flowchart TD
         Labels["fleet + status<br/>labels · billing · cost"]
         Jobs["jobs<br/>detached runs on pods"]
         Misc["naming · gpu · openrouter · apikeys · backup<br/>pull · restore · volume · sshconfig · metrics · plan · schedule"]
+        Ask["ask<br/>state bundles · masking · claude/codex, no tools"]
 
         Config --> Fleet
         Fleet --> RP1 & RP2 & Vast & Hz & Sf
@@ -58,12 +59,14 @@ flowchart TD
         Tear --> Proxy
         Money --> Http
         Money --> Labels
+        Ask --> Remote
     end
 
     CLI --> Config
     TUI --> Config
-    CLI --> Sel & Place & Pipe & Setup & Health & Proxy & Snap & Tear & Jobs & Money & Misc & Arch
-    TUI --> Snap & Sel & Setup & Health & Money & Misc
+    CLI --> Sel & Place & Pipe & Setup & Health & Proxy & Snap & Tear & Jobs & Money & Misc & Arch & Ask
+    TUI --> Snap & Sel & Setup & Health & Money & Misc & Ask
+    Ask -->|"one prompt on stdin, no tools (pods ask · TUI ?)"| ai[("claude / codex CLI<br/>→ Anthropic / OpenAI")]
     CLI --> Remote
     TUI --> Remote
 
@@ -84,8 +87,8 @@ flowchart TD
 | crate | binary | role |
 |-------|--------|------|
 | `arena-core` | — | config parsing, the `Provider` trait + RunPod v1/v2, Vast, Hetzner backends + `build`/`build_fleet` factories, the `Remote` SSH seam, every planner and judge (selector, placement, pipeline, proxy merge, health, snapshot, teardown, jobs, balance, idle), the `Pod`/`PodSpec` model, errors |
-| `arena-cli` | `arena` | clap CLI over the library: `pods …` (list/create/up/setup/stop/start/restart/rename/reimage/replace/migrate/terminate/backup/pull/baseline/restore/init-branches/set-branch/run/jobs/logs/test/copy-keys/cp), `pods idle`, `proxy plan/apply`, `snapshot`, `teardown --check`, `balance`, `offers`, `gpus`, `keys`, `ssh-config`, `config`, `cron`, `plan`, `archive`, `tui`. Owns the I/O: the `up` executor (`up.rs`), the job fan-out (`jobs.rs`), the teardown readers (`teardown.rs`), the account reads and idle probes (`money.rs`), the backup archive's handlers (`archive.rs`: Hetzner calls, pinned SSH to the VM, the pushes), proxy deploys |
-| `arena-tui` | `arena-tui` | ratatui dashboard: each refresh is one `snapshot::build`; per-pod and marked-set actions behind confirmation modals; background deep checks into the shared health cache; the prepaid balances in the summary bar (observed in the details round) |
+| `arena-cli` | `arena` | clap CLI over the library: `pods …` (list/create/up/setup/stop/start/restart/rename/reimage/replace/migrate/terminate/backup/pull/baseline/restore/init-branches/set-branch/run/jobs/logs/test/ask/copy-keys/cp), `pods idle`, `proxy plan/apply`, `snapshot`, `teardown --check`, `balance`, `offers`, `gpus`, `keys`, `ssh-config`, `config`, `cron`, `plan`, `archive`, `tui`. Owns the I/O: the `up` executor (`up.rs`), the job fan-out (`jobs.rs`), `pods ask`'s shape (`ask.rs`: the question among the targets, the dry run), the teardown readers (`teardown.rs`), the account reads and idle probes (`money.rs`), the backup archive's handlers (`archive.rs`: Hetzner calls, pinned SSH to the VM, the pushes), proxy deploys |
+| `arena-tui` | `arena-tui` | ratatui dashboard: each refresh is one `snapshot::build`; per-pod and marked-set actions behind confirmation modals; background deep checks into the shared health cache; `?` asks an AI about the cursor pod or the marked set in the background (`ask.rs`, core's `ask` flow); the prepaid balances in the summary bar (observed in the details round) |
 
 `web/fleet.html` is not a crate: a self-contained page that renders `fleet.json`
 (`arena snapshot --public`) and can't change anything.
@@ -118,10 +121,11 @@ flowchart TD
 | `lock` | pod locks (`Pod::locked`, RunPod v2): the up-front refusal of a locked pod for every lifecycle command, the API's `Locked` error read as the same `… is locked — arena pods unlock … first`, `pods lock`/`unlock`'s plan | yes |
 | `apiextra`, `apiget` | `--api-json`/`CREATE_EXTRA_JSON` (parse, deep-merge into a backend's create body, refuse its `MANAGED` fields and a `ports` list without `22/tcp`); `arena api get` (path guard: relative to the provider's API base only; secret redaction; no redirects) | yes (one GET in `apiget::get`) |
 | `jobs` | detached runs (`pods run --background`): the on-pod wrapper, ids, status, log reads by byte offset | yes |
+| `ask` | `pods ask` / the TUI's `?`: `bundle` — one read-only SSH call per pod chaining the metrics probe, the jobs listing + newest log tail and `probe.sh` (uptime, disks, logins, tmux, top processes, the working tree, `busy_op`; every git `metrics::RO_GIT_SH`'s `ro_git` — no locks, no fsmonitor, filters or gpg — and no `git status`), read section by section (missing or garbled = `unknown`, never a panic), rendered with the listing, the last deep check, the local backups and the backup's BUSY state (`busy-copies.json`, `BUSY_AUTO_RESOLVE_HOURS`), capped per pod (6 KB; 240 KB a prompt); `redact` — every field through the backup's `SECRET_PATTERNS` (a small ERE reader held byte-identical to the pods' GNU sed; an unsupported pattern refuses), secret-named values (whole: quoted, JSON/YAML fields, basic auth; an undelimitable one takes its line), 32+ char tokens, key blocks masked before the log is cut (and base64-looking lines dropped at each cut); `ai` — `ASK_AI` (off refuses), claude/codex argv with no tools (no MCP servers, no codex user config), run only once `claude --help`/`codex features list` confirms every no-tools switch and codex's list, run with the ask's overrides, shows nothing on beyond `CODEX_SAFE_FEATURES` (else refused: fail closed), on stdin in an empty dir with a minimal environment and a timeout; one prompt for all pods; runs saved in `<state>/<prefix>/ask/` | parse/render/redact/prompt pure; `look` over `Remote`, `ai::ask` spawns the CLI |
 | `balance` | prepaid balances with a fallback chain: live (RunPod GraphQL `myself`, Vast `users/current` — balance fields only), else an estimate (last anchor − max(RunPod v2 billed, arena-metered) spend), else `?`; burn (max of the provider's rate and the listed billing pods; a failed listing = unknown), runway, levels, the fallback check, `balance.json` (flock + atomic 0600), every surface's lines; Hetzner postpaid | tiers/estimate/`apply`/views/renderers pure; `BalanceApi` seam (`HttpBalanceApi`, `FakeBalanceApi`), `observe` bounded per mode |
 | `idle` | `pods idle`: the read-only probe script (`/proc/net/tcp` sessions minus our own, `nvidia-smi` ×3, bounded `find`, PID 1 age), its reply parser, the verdict (candidate only when every reading is known and idle; cohort machines only) and the report with printed — never run — commands | yes (script runs over `Remote`) |
 | `reap` | the opt-in auto-reaper: settings (`REAP_*`, file-only) and the strict `reap.json` types; `probe` — the read-only `idle_probe.sh` (nonce-framed, indexed facts, closed by a POSIX `cksum`) and its strict parser (anything off is `Garbled`, never idle); `judge` — `classify` (Idle only when every applicable signal is read and under threshold; cumulative CPU/net against the previous look at the same container, CPU averaged over at least 3 minutes so a look's own cost never reads as use; `classify_post_backup` records the reap's post-backup look as the next baseline), the idle streak and due rules, the decision table rows, `reconcile` (write-ahead recovery, pruning, still-billing hold), the backup/verify/relist/state-recheck verdicts and the typed proofs — `ReapTicket::issue` is the only constructor of the one value that can terminate (`terminate_pod_on`, routed by provider name); `render` — ENDS label, plan table, notice + interactive-only banner, `wall`, cron line, notification line, JSONL log line; `store` — atomic fsynced state under a flock, the run lock, the log | yes, but `store` (files only) |
-| `naming`, `gpu`, `openrouter`, `apikeys`, `backup`, `pull`, `sshconfig`, `metrics`, `plan`, `schedule`, `ssh`, `table`, `cron` | name allocation (`@` absolute entries), GPU aliases + catalog check, OpenRouter provisioning API, key distribution, git backup (the embedded POSIX `backup.sh`: files over GitHub's limit kept out, nested clones adopted in place / other nested repos kept out, pasted keys redacted from the commit (`redact.sh`, from `SECRET_PATTERNS`), unpushed commits holding one rewritten before the push, a fast-forward) / rsync commands (snapshot passes with a complete `.git`, `--link-dest` dedup to the previous snapshot and the fleet baseline, baseline pruning to the image's files (by mtime, and the pod's ctime listing of what was copied in since), re-pulls that never change a linked file's attributes in place, `du`-style disk use), participant `~/.ssh/config`, TUI probe, scheduled plans, `wNdM` labels, ssh/scp argv (+ `shell_word` for pasteable dry runs), table layout, the cron lines' files (`~/.local/state/arena-cron/`: each job's lock and default log, a kept log's place, the `mkdir -p`, the older versions' defaults) | mostly (backup and pull against real git/rsync in temp dirs) |
+| `naming`, `gpu`, `openrouter`, `apikeys`, `backup`, `pull`, `sshconfig`, `metrics`, `plan`, `schedule`, `ssh`, `table`, `cron` | name allocation (`@` absolute entries), GPU aliases + catalog check, OpenRouter provisioning API, key distribution, git backup (the embedded POSIX `backup.sh`: files over GitHub's limit kept out, nested clones adopted in place / other nested repos kept out, pasted keys redacted from the commit (`redact.sh`, from `SECRET_PATTERNS`), unpushed commits holding one rewritten before the push, a fast-forward) / rsync commands (snapshot passes with a complete `.git`, `--link-dest` dedup to the previous snapshot and the fleet baseline, baseline pruning to the image's files (by mtime, and the pod's ctime listing of what was copied in since), re-pulls that never change a linked file's attributes in place, `du`-style disk use), participant `~/.ssh/config`, TUI probe (its git through `RO_GIT_SH`: nothing of the repo's own run, nothing written), scheduled plans, `wNdM` labels, ssh/scp argv (+ `shell_word` for pasteable dry runs), table layout, the cron lines' files (`~/.local/state/arena-cron/`: each job's lock and default log, a kept log's place, the `mkdir -p`, the older versions' defaults) | mostly (backup and pull against real git/rsync in temp dirs) |
 
 ## Request flow (example: `arena pods up apple --gpu A4000,3070 --cloud community --max-price 0.30 --check`)
 
@@ -158,8 +162,9 @@ flowchart TD
 ## Safety model (cross-cutting)
 
 - **Read-only commands read**: `pods list`, `gpus`, `offers`, `snapshot`, `teardown
-  --check`, `balance`, `proxy plan`, `pods test`, `pods idle`, `pods logs` and `pods jobs` (without `--kill`) only
-  list, query (GraphQL queries, never mutations) or run read-only commands on pods. Keys travel as `Authorization` headers,
+  --check`, `balance`, `proxy plan`, `pods test`, `pods idle`, `pods ask`, `pods logs` and `pods jobs` (without `--kill`) only
+  list, query (GraphQL queries, never mutations) or run read-only commands on pods. `pods ask` (and the TUI's `?`) also
+  sends what it read — masked, and only on `ASK_AI` not `off` — to the operator's claude/codex, which gets no tools. Keys travel as `Authorization` headers,
   never in URLs that errors would print.
 - **Mutations confirm first**: they print what they'll do and prompt; `-y` skips the
   prompt; with no terminal they refuse unless `-y`. `--dry-run` previews and changes

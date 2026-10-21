@@ -75,28 +75,59 @@ pub const LOG_READ_CAP: u64 = 1024 * 1024;
 /// Longest command slug in a [`JobId`].
 const SLUG_MAX: usize = 24;
 
-/// Longest id accepted from the operator (a generated one is at most 40).
+/// Longest id accepted from the operator (a generated one is at most 48).
 const ID_MAX: usize = 64;
+
+/// Hex digits of a new id's random part ([`JobId::generate`]).
+const SALT_LEN: usize = 6;
 
 /// Longest unfinished line a follow holds back waiting for its newline (a progress bar
 /// redrawn with `\r` never prints one): past this it is shown as is, so memory stays
 /// bounded.
 const PARTIAL_MAX: usize = 64 * 1024;
 
-/// A job's id: `YYYYMMDD-HHMMSS-<slug>` (UTC start time, then a slug of the command), e.g.
-/// `20261008-142301-pytest-x-tests`. Sorting ids sorts jobs by start time, the same id
-/// names the run on every pod of a fleet start, and the alphabet (`[0-9a-z-]`) is safe to
+/// A job's id: `YYYYMMDD-HHMMSS-<slug>--<salt>` (UTC start time, a slug of the command's shape,
+/// six random hex digits), e.g. `20261008-142301-pytest-x-k--3fa9c1` — or `YYYYMMDD-HHMMSS--<salt>`
+/// when the command's shape can't be told (`<command>`: no slug); one made before has no
+/// salt and slugs the command as typed (`20261008-142301-pytest-x-tests`) — it keeps its name,
+/// and every read and `--kill` takes it as before. Sorting ids sorts jobs by start time, the same
+/// id names the run on every pod of a fleet start, and the alphabet (`[0-9a-z-]`) is safe to
 /// splice into a remote path or shell word — which is why operator input goes through
 /// [`JobId::parse`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JobId(String);
 
 impl JobId {
-    /// The id for `cmd` started at `unix_secs` (UTC).
+    /// The id for `cmd` started at `unix_secs` (UTC): the time, the slug of the command's shape
+    /// ([`masked_slug`]: its program, script and flag names, never a value), and a random salt
+    /// ([`JobId::named`]). An id is echoed when the job starts, listed by `pods jobs`, sent with
+    /// `pods ask`'s bundle and spelled in remote paths: one made from the command as typed carried
+    /// what masking takes out of it (live ASK2 G1: `curl -u bob:hunter2pass …` →
+    /// `…-curl-u-bob-hunter2pass`), and one made from the masked command alone was the same for
+    /// two commands that differ only in a secret (review ai-review claude #10: started in the same
+    /// second, the second refused). Ids already made stay as they are.
     pub fn generate(unix_secs: u64, cmd: &str) -> JobId {
+        JobId::named(unix_secs, cmd, &salt())
+    }
+
+    /// [`JobId::generate`]'s id with its random part given (`salt`: [`SALT_LEN`] hex digits).
+    pub fn named(unix_secs: u64, cmd: &str, salt: &str) -> JobId {
         let (y, m, d) = crate::schedule::civil_from_days((unix_secs / 86_400) as i64);
         let s = unix_secs % 86_400;
-        JobId(format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}-{}", s / 3600, s % 3600 / 60, s % 60, slug(cmd)))
+        let slug = masked_slug(cmd);
+        let slug = if slug.is_empty() { slug } else { format!("-{slug}") };
+        JobId(format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}{slug}--{salt}", s / 3600, s % 3600 / 60, s % 60))
+    }
+
+    /// Whether this id is one [`JobId::generate`] made for `cmd`: its time, the slug of `cmd`'s
+    /// shape, `--` and a salt — what an id made before never has (a slug never holds `--`), so
+    /// one carrying its command as typed is never taken for one (`pods ask` shows only these
+    /// whole).
+    pub fn named_from(&self, cmd: &str) -> bool {
+        let slug = masked_slug(cmd);
+        let tail = self.0.get(15..).and_then(|t| if slug.is_empty() { Some(t) } else { t.strip_prefix('-') });
+        let salt = tail.and_then(|t| t.strip_prefix(slug.as_str())).and_then(|r| r.strip_prefix("--"));
+        salt.is_some_and(|s| s.len() == SALT_LEN && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
     }
 
     /// An id the operator typed: must have the generated shape and alphabet — anything else
@@ -151,6 +182,30 @@ pub fn split_job_arg(words: &[String]) -> Result<(Vec<String>, Option<JobId>), S
         }
     };
     Ok((targets.into_iter().cloned().collect(), job))
+}
+
+/// An id's slug for `cmd` ([`JobId::generate`]): [`slug`] of the command's shape
+/// ([`crate::shape::command`]: the program, the script it runs, its flag names — no value of it),
+/// the pure, small rule `pods ask` sends commands by — never `ask::redact`'s masking, whose
+/// patterns job creation has no business reading. Empty — no slug, the id the time and the salt
+/// alone — when the shape can't be told ([`crate::shape::UNREAD`]): nothing of such a command
+/// names a job.
+pub fn masked_slug(cmd: &str) -> String {
+    let shape = crate::shape::command(cmd);
+    if shape == crate::shape::UNREAD {
+        return String::new();
+    }
+    slug(&shape)
+}
+
+/// [`SALT_LEN`] hex digits that differ per call: std's randomly keyed hasher (keyed from the OS's
+/// randomness, a new key each time) over the time. Not secret — two jobs started in the same
+/// second with the same shape of command just mustn't share an id.
+fn salt() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    format!("{:0w$x}", h.finish() & 0xff_ffff, w = SALT_LEN)
 }
 
 /// The id's tail: the command's words, lowercased, as `[a-z0-9]` runs joined by `-`,
@@ -414,10 +469,21 @@ pub fn read_command(job: Option<&JobId>, from: Option<u64>) -> String {
 }
 
 fn read_script(job: Option<&JobId>, from: Option<u64>) -> String {
+    read_script_capped(job, from, LOG_READ_CAP)
+}
+
+/// The newest job's status and the last `cap` bytes of its log ([`read_command`] for a quick
+/// look — `pods ask` wants a few dozen lines, not [`LOG_READ_CAP`]); read by [`parse_read`].
+/// `cap` is at most [`LOG_READ_CAP`].
+pub fn read_tail_command(cap: u64) -> String {
+    sh_c(&read_script_capped(None, None, cap.min(LOG_READ_CAP)))
+}
+
+fn read_script_capped(job: Option<&JobId>, from: Option<u64>, cap: u64) -> String {
     let script = READ
         .replace("@ID@", job.map_or("", JobId::as_str))
         .replace("@FROM@", &from.map(|f| f.to_string()).unwrap_or_default())
-        .replace("@CAP@", &LOG_READ_CAP.to_string());
+        .replace("@CAP@", &cap.to_string());
     format!("{PRELUDE}{script}")
 }
 
@@ -845,6 +911,33 @@ pub fn snapshot_lines(chunk: &LogChunk, tail: usize) -> (Vec<String>, bool) {
     (shown, cut)
 }
 
+/// Where, in `chunk`'s bytes, the text of each line [`snapshot_lines`] makes of the whole window
+/// (`tail` unbounded) begins: the line's first byte, or — a progress bar redrawn with `\r` — the
+/// byte after its last `\r` (a CRLF's aside), where what [`display_line`] shows of it begins.
+/// One offset per line, in order (`pods ask` shows none that begins too near a cut read's start:
+/// `crate::ask::bundle::LOG_SETTLE`).
+pub fn snapshot_offsets(chunk: &LogChunk) -> Vec<usize> {
+    let b = &chunk.bytes;
+    let mut starts: Vec<usize> = std::iter::once(0).chain(b.iter().enumerate().filter(|(_, c)| **c == b'\n').map(|(i, _)| i + 1)).collect();
+    // After the last newline: a line only when something is there.
+    if starts.last() == Some(&b.len()) {
+        starts.pop();
+    }
+    // A window starting mid-file starts mid-line: its first line (one with a newline after it)
+    // is dropped.
+    if chunk.start > 0 && b.contains(&b'\n') {
+        starts.remove(0);
+    }
+    starts
+        .into_iter()
+        .map(|start| {
+            let end = b[start..].iter().position(|c| *c == b'\n').map_or(b.len(), |n| start + n);
+            let line = b[start..end].strip_suffix(b"\r").unwrap_or(&b[start..end]);
+            line.iter().rposition(|c| *c == b'\r').map_or(start, |r| start + r + 1)
+        })
+        .collect()
+}
+
 /// One pod's position in a `pods logs --follow`: the next byte to read and an unfinished
 /// line held back until its newline arrives (so a line split across two reads prints
 /// once, whole).
@@ -951,26 +1044,95 @@ mod tests {
         // 2026-10-08 14:23:01 UTC
         let t = 1_791_469_381;
         for (cmd, want) in [
-            ("pytest -x tests/ -k 'part1'", "20261008-142301-pytest-x-tests-k-part1"),
-            ("  /usr/bin/python3 run.py  ", "20261008-142301-usr-bin-python3-run-py"),
-            ("echo \"$HOME\"; ls\nrm -rf x", "20261008-142301-echo-home-ls-rm-rf-x"),
-            ("python -c 'print(1)' && nvidia-smi --query", "20261008-142301-python-c-print-1-nvidia"),
-            ("pytest -x tests/ -k 'part1 and not $SLOW'", "20261008-142301-pytest-x-tests-k-part1"),
-            ("supercalifragilisticexpialidocious", "20261008-142301-supercalifragilisticexpi"),
-            ("ÜBER — ✓", "20261008-142301-ber"),
-            ("'$@!'", "20261008-142301-job"),
-            ("", "20261008-142301-job"),
+            ("pytest -x tests/ -k 'part1'", "20261008-142301-pytest-x-k--c0ffee"),
+            ("  /usr/bin/python3 run.py  ", "20261008-142301-python3-run-py--c0ffee"),
+            ("echo \"$HOME\"; ls\nrm -rf x", "20261008-142301-echo--c0ffee"),
+            ("python -c 'print(1)' && nvidia-smi --query", "20261008-142301-python-c--c0ffee"),
+            ("python3 /w/chapter1/train.py --lr 0.1 --epochs=3", "20261008-142301-python3-train-py-lr--c0ffee"),
+            ("supercalifragilisticexpialidocious01", "20261008-142301-job--c0ffee"),
+            ("supercalifragilistic", "20261008-142301-supercalifragilistic--c0ffee"),
+            // No value in a new id (live ASK2 G1, review ai-review claude #10): the command's shape.
+            ("curl -u bob:hunter2pass http://127.0.0.1:9/", "20261008-142301-curl-u--c0ffee"),
+            ("MY_SECRET='two words' python x.py", "20261008-142301-python-x-py--c0ffee"),
+            // The shell's words (review ai-review codex #1, lane ASK8 item 1): a quoted value with
+            // blanks is one word, every leading assignment is taken before the program, and
+            // quoting that doesn't close leaves nothing of the command but `<command>`, and no slug.
+            ("APP_CONFIG='{\"password\": \"cohort-db-pass\" }' python train.py", "20261008-142301-python-train-py--c0ffee"),
+            ("DB_PASS='correct horse battery staple' python train.py", "20261008-142301-python-train-py--c0ffee"),
+            ("APP_CONFIG='{\"password\": \"cohort-db-pass\" } python train.py", "20261008-142301--c0ffee"),
+            // A construct the shape's reading doesn't follow (review ai-review codex #1, lane ASK9
+            // item 2): no slug either.
+            ("APP_CONFIG=\"$(printf '%s' \"password:\n  cohort-db-pass\nhost: db\")\" python train.py", "20261008-142301--c0ffee"),
+            ("python train.py --token ${TOKEN}", "20261008-142301--c0ffee"),
+            ("ÜBER — ✓", "20261008-142301-job--c0ffee"),
+            ("'$@!'", "20261008-142301-job--c0ffee"),
+            ("", "20261008-142301-job--c0ffee"),
         ] {
-            let got = JobId::generate(t, cmd);
+            let got = JobId::named(t, cmd, "c0ffee");
             assert_eq!(got.as_str(), want, "{cmd:?}");
-            // Every generated id is one `parse` accepts (and so is safe in a remote path).
+            // Every generated id is one `parse` accepts (and so is safe in a remote path), and one
+            // made for its command.
             assert_eq!(JobId::parse(got.as_str()), Ok(got.clone()), "{cmd:?}");
+            assert!(got.named_from(cmd) && got.as_str().len() <= 48, "{cmd:?}");
+            let made = JobId::generate(t, cmd);
+            assert!(made.as_str().starts_with(&want[..want.len() - 6]) && made.named_from(cmd) && JobId::parse(made.as_str()).is_ok(), "{made}");
         }
         // The epoch, a leap day, and lexical order = time order.
-        assert_eq!(JobId::generate(0, "x").as_str(), "19700101-000000-x");
-        assert_eq!(JobId::generate(1_709_164_799, "x").as_str(), "20240228-235959-x");
-        assert_eq!(JobId::generate(1_709_164_800, "x").as_str(), "20240229-000000-x");
+        assert_eq!(JobId::named(0, "x", "000000").as_str(), "19700101-000000-x--000000");
+        assert_eq!(JobId::named(1_709_164_799, "x", "000000").as_str(), "20240228-235959-x--000000");
+        assert_eq!(JobId::named(1_709_164_800, "x", "000000").as_str(), "20240229-000000-x--000000");
         assert!(JobId::generate(t, "zzz") < JobId::generate(t + 1, "aaa"));
+    }
+
+    /// Review ai-review claude #10 (lane ASK7 item J): two commands that differ only in a secret,
+    /// started in the same second, get ids of their own — the time and the shape's words alike,
+    /// the salt not (24 random bits) — and neither id holds the secret. An id made before — the
+    /// command as typed, or lane ASK5's masked slug — is never taken for one made for its command
+    /// (a slug never holds `--`), nor is a salt that isn't hex or is short; and it still parses.
+    /// No `ask::redact` in it: the shape is `crate::shape`'s.
+    #[test]
+    fn ids_of_commands_differing_in_a_secret_differ_and_hold_none() {
+        let t = 1_791_469_381;
+        let ids: Vec<JobId> = ["--token Qx7alpha", "--token Qx7bravo", "X_PASS=a", "X_PASS=b"].iter().map(|v| JobId::generate(t, &format!("python run.py {v}"))).collect();
+        let mut unique: Vec<&str> = ids.iter().map(JobId::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
+        assert!(ids.iter().all(|id| id.as_str().starts_with("20261008-142301-python-run-py") && !id.as_str().contains("qx7")), "{ids:?}");
+        let cmd = "curl -u bob:hunter2pass http://127.0.0.1:9/";
+        for old in ["20261008-142301-curl-u-bob-hunter2pass", "20261008-142301-curl-u-redacted-http-127", "20261008-142301-curl-u--zzzzzz", "20261008-142301-curl-u--c0ffe", "20261008-142301-curl-u-x--c0ffee"] {
+            let id = JobId::parse(old).unwrap();
+            assert!(!id.named_from(cmd), "{old}");
+        }
+        assert!(JobId::named(t, cmd, "c0ffee").named_from(cmd) && !JobId::named(t, cmd, "c0ffee").named_from("wget http://127.0.0.1:9/"));
+        assert!(!include_str!("jobs.rs").contains(&format!("crate::{}::redact", "ask")), "job creation reads no ask masking");
+    }
+
+    /// Review ai-review codex #1, claude #1 (lane ASK8 item 1): a quoted assignment's value —
+    /// blanks, braces and quotes in it — never reaches a new id, the program's or script's name
+    /// taken in its place; nor does a quote left open, nor a name with quotes or braces. Each id is
+    /// still one made for its command.
+    #[test]
+    fn no_piece_of_a_quoted_value_names_a_job() {
+        let t = 1_791_469_381;
+        for cmd in [
+            "APP_CONFIG='{\"password\": \"cohort-db-pass\" }' python train.py",
+            "DB_PASS='correct horse battery staple' python train.py",
+            "PASS=correct\\ horse python train.py",
+            "A=1 B=\"cohort pass\" python train.py",
+            "APP_CONFIG='{\"password\": \"cohort-db-pass\" } python train.py",
+            "python train.py --token \"cohort horse",
+            "'{cohort}' train.py",
+            "\"cohort horse\" train.py",
+            "APP_CONFIG=\"$(printf '%s' \"password:\n  cohort-db-pass\nhost: db\")\" python train.py",
+        ] {
+            let id = JobId::generate(t, cmd);
+            for value in ["cohort", "password", "horse", "staple", "db-pass"] {
+                assert!(!id.as_str().contains(value), "{value} in {id} ({cmd})");
+            }
+            assert!(id.named_from(cmd) && JobId::parse(id.as_str()).is_ok(), "{id}");
+            assert!(id.as_str().contains("-train-py--") || id.as_str()[15..].starts_with("--"), "{id}");
+        }
     }
 
     #[test]
@@ -1299,6 +1461,35 @@ mod tests {
         ];
         for (c, tail, want, cut) in cases {
             assert_eq!(snapshot_lines(c, *tail), (want.iter().map(|s| s.to_string()).collect(), *cut), "{c:?} tail {tail}");
+        }
+    }
+
+    /// Lane ASK8 item 2: where each line of the whole window begins in the read — one offset per
+    /// [`snapshot_lines`] line, at the text it shows (past a progress bar's last `\r`).
+    #[test]
+    fn snapshot_offsets_say_where_each_shown_line_begins() {
+        let chunk = |start: u64, bytes: &[u8]| LogChunk { start, size: start + bytes.len() as u64, bytes: bytes.to_vec() };
+        let cases: &[(LogChunk, &[usize])] = &[
+            (chunk(0, b"a\nbb\nccc\n"), &[0, 2, 5]),
+            (chunk(0, b"a\nbb\nccc"), &[0, 2, 5]),
+            (chunk(0, b""), &[]),
+            (chunk(0, b"\n\n"), &[0, 1]),
+            (chunk(0, b"a\r\nb\n50%\r80%\r100%\n"), &[0, 3, 13]),
+            (chunk(0, b"x\n10%\r20%"), &[0, 6]),
+            (chunk(100, b"tail of x\ny\nz\n"), &[10, 12]),
+            (chunk(100, b"tail of x\ny"), &[10]),
+            (chunk(100, b"tail of x\n"), &[]),
+            (chunk(100, b"one huge line"), &[0]),
+            (chunk(100, b"one huge bar 10%\r20%\r30%"), &[21]),
+        ];
+        for (c, want) in cases {
+            let got = snapshot_offsets(c);
+            assert_eq!(got, *want, "{c:?}");
+            let (lines, _) = snapshot_lines(c, usize::MAX);
+            assert_eq!(got.len(), lines.len(), "{c:?}");
+            for (at, line) in got.iter().zip(&lines) {
+                assert!(c.bytes[*at..].starts_with(line.as_bytes()), "{c:?}: {line:?} at {at}");
+            }
         }
     }
 
@@ -1680,5 +1871,30 @@ mod tests {
         let k = id("20261008-142302-slow");
         let e = parse_started(&pod.run(&start_command(&k, "true", None)), &k).unwrap_err();
         assert!(e.contains("may have started anyway: check `arena pods jobs` before retrying"), "{e}");
+    }
+
+    /// `read_tail_command`: the newest job's status and only the last `cap` bytes of its log —
+    /// what `pods ask` reads — through the same script as `pods logs`, so `parse_read` and
+    /// `snapshot_lines` take it as they are.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_tail_reads_the_newest_jobs_last_bytes() {
+        let Some(pod) = LocalPod::new("tail") else { return };
+        let old = pod.fake_job(&id("20261008-142301-old"), None);
+        std::fs::write(old.join("log"), "old\n").unwrap();
+        let new = pod.fake_job(&id("20261008-142302-new"), Some("999999"));
+        let log: String = (1..=100).map(|i| format!("line {i:03}\n")).collect();
+        std::fs::write(new.join("log"), &log).unwrap();
+        let cmd = read_tail_command(64);
+        assert!(cmd.contains("cap=64"), "{cmd}");
+        let ReadReply::Job { info, chunk } = parse_read(&pod.run(&cmd)).unwrap() else { panic!() };
+        assert_eq!(info.id, id("20261008-142302-new"));
+        assert_eq!((chunk.start, chunk.size, chunk.bytes.len()), (log.len() as u64 - 64, log.len() as u64, 64));
+        let (lines, cut) = snapshot_lines(&chunk, 40);
+        assert_eq!(lines.last().map(String::as_str), Some("line 100"));
+        assert_eq!(lines.len(), 7, "a window starting mid-line drops that line: {lines:?}");
+        assert!(cut, "older lines were cut by the cap");
+        // Never more than a full read's cap.
+        assert!(read_tail_command(u64::MAX).contains(&format!("cap={LOG_READ_CAP}")));
     }
 }

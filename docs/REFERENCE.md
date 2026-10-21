@@ -43,6 +43,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [`pods run` / `pods test`](#pods-run--pods-test)
   - [Background jobs: `run --background`, `jobs`, `logs`](#background-jobs-run---background-jobs-logs)
   - [`pods test --deep`](#pods-test---deep)
+  - [`pods ask`](#pods-ask)
 - [Fleet status and money](#fleet-status-and-money)
   - [`snapshot`](#snapshot)
   - [`teardown --check`](#teardown---check)
@@ -58,6 +59,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [Columns](#columns)
   - [Fleet columns from the core snapshot](#fleet-columns-from-the-core-snapshot)
   - [Deep checks and marked sets](#deep-checks-and-marked-sets)
+  - [Asking an AI about pods](#asking-an-ai-about-pods)
   - [SSH time budgets](#ssh-time-budgets)
   - [Navigating](#navigating)
   - [Acting on pods](#acting-on-pods)
@@ -394,6 +396,9 @@ Spec and recorded fixtures: `specs/shadeform.md`, `crates/core/src/provider/fixt
   max(billed, metered) spend, else `?`; burn, runway, levels, the `balance.json` state and every
   surface's rendering (Hetzner postpaid); `idle` — the read-only `pods idle` probe script, its reply
   parser and the verdict/report (unknown ≠ idle).
+- `ask` — `pods ask` and the TUI's `?`: a read-only, masked, size-capped state bundle per pod (one
+  SSH call reusing the metrics probe and the jobs reads, plus `probe.sh`), the one prompt for all of
+  them, and claude/codex run with no tools (see [`pods ask`](#pods-ask)).
 - `reap` — the opt-in auto-reaper (`pods reap`), pure but for its state store: the strict
   `reap.json` types and settings (`REAP_*`, file-only), the read-only probe (`idle_probe.sh`, framed
   by a nonce, indexed and `cksum`-closed so a damaged reply is never "idle") and its parser,
@@ -1107,10 +1112,15 @@ at once: `[n/N] ✓ <pod>: job <id> (pid …)`. A job that can't record its pid 
 125`); no pid within 5s is reported as "may have started anyway — check `arena pods jobs` before
 retrying", never as a clean failure.
 
-One id per run, e.g. `20261008-142301-pytest-x` (UTC start + command slug); everything stays on the
-pod under `~/.arena/jobs/<id>/` (`cmd`, `run`, `log` = stdout+stderr, `pid`, `started_at`, `exit`),
-so it survives your SSH session and any operator can look — but not a pod restart (container disk),
-and logs are never rotated or pruned. No time limit; `--timeout` is refused with it.
+One id per run, e.g. `20261008-142301-pytest-x-k--3fa9c1`: the UTC start, a slug of the command's
+shape — its program, script and flag names, never a value, as `pods ask` sends commands (`curl -u
+bob:pw …` makes `…-curl-u--…`; a command whose shape is `<command>` gives no slug at all,
+`20261008-142301--3fa9c1`) — and six random hex digits, so two runs whose commands differ only in
+a value never share one. Ids made before keep their names and work as ever. Everything stays on
+the pod under `~/.arena/jobs/<id>/` (`cmd`, `run`, `log` = stdout+stderr, `pid`, `started_at`,
+`exit`), so it survives your SSH session and any operator can look — but not a pod restart
+(container disk), and logs are never rotated or pruned. No time limit; `--timeout` is refused with
+it.
 
 `pods jobs`: a table of each pod's jobs, newest first (`running (pid N)` — the pid must still be
 that job's wrapper, not a recycled one — / `exit N` / `lost` = ended without an exit code, or still
@@ -1210,6 +1220,153 @@ It also holds `up --check`'s **bad machines** (`bad_hosts`: machine id → when,
 dropped 72 h after their failure or when a complete check on the machine passes, never by a listing;
 `pods test --deep` adds none (its pods are in use, and a participant's own job can fail a check),
 but its passes clear them.
+
+### `pods ask`
+
+`pods ask [targets] [--all] [--ai claude|codex] [--model M] [--timeout S] [--dry-run] ["question"]`
+— ask claude (Claude Code) or codex what state a pod is in, or several pods compared, and whether
+anything is wrong or needs attention: **read-only** on the pods (one SSH call each), every pod in
+one prompt, masked, the AI with no tools; the answer printed and saved with the prompt in the state
+dir. The answer is per pod one line of state, then the problems, each with the `arena` command that
+fixes or investigates it; `unknown` where the data doesn't say. The dashboard's `?` asks the same
+([Asking an AI about pods](#asking-an-ai-about-pods)); [`ASK_AI`](#ask_ai) picks the AI or turns it
+off.
+
+```bash
+arena pods ask apple                            # the default question about one pod
+arena pods ask apple "why is its GPU idle?"     # your own (quote it: the word with a space or ? is the question)
+arena pods ask apple..delta -q "who is behind on backups?"
+arena pods ask --all                            # a fleet overview: this cohort's pods, one prompt
+arena pods ask --all --include-non-cohort --ai codex   # every pod, asked of codex (default: ASK_AI)
+arena pods ask apple --model opus --timeout 600
+arena pods ask apple --dry-run                  # print the exact prompt and the AI's command line; send nothing
+```
+
+Name pods or pass `--all` (this cohort's; `--include-non-cohort` for every pod; `--on`, `--exclude`,
+`--gpus` as everywhere). The answer goes to stdout, progress and notes to stderr.
+
+#### What it reads
+
+Read-only, one SSH call per pod (60 s budget; on the pod each `nvidia-smi` within 10 s, the
+metrics probe's repo part as a whole within 15 s, each git call of the small probe's within 10 s,
+and its `du`, `df`, `ps`, `who` and `tmux` bounded too — each KILLed 2 s after its TERM — so a
+wedged GPU or a hung volume costs only its own facts, never the sections after them). It reads: the dashboard's metrics probe (GPUs and their
+processes, CPU, memory, the root disk, the repo's branch, origin, commits not pushed, recent commit
+subjects, whether `~/.name`, the deploy key and the API/HF/Claude Code tokens are set up — never
+`PROGRESS_CMD`, your own command, which may write), `pods jobs`' listing and the newest job's last
+40 log lines, and a small probe: the pod's clock and uptime, load, `/`, `/workspace` and the home's
+size, logins (user, tty, time — in UTC, whatever the pod's zone — and whether each is an SSH
+session, a tmux pane or local — **not** where from), tmux sessions, the busiest processes by CPU and
+memory (each command's shape only: below), the repo's working tree (counts, the first 20 changed file **names**,
+stashes, the last commit, and an operation in progress by the backup's own test — a merge,
+cherry-pick, revert, `git am`, rebase, sequence or a stash pop's conflicts — read as what it means:
+the backup is BUSY, how the participant ends it, and whether `pods backup` finishes it after
+`BUSY_AUTO_RESOLVE_HOURS`). With it, from this machine: the pod's listing row (status, GPU, $/h,
+endpoint, age, lock, maintenance), its last `pods test --deep` verdict, which local file backups
+(`pods pull`) exist of it, the backup's record of its last whole copy while BUSY
+(`busy-copies.json`: the operation, how long ago, the snapshot label and whether that copy is still
+here — never the local path), and the branch today's backups go to. A stopped or unreachable pod is
+its listing and why. What couldn't be read — a git that timed out, a list that failed, the health
+cache or the backup dir unreadable here — is sent as `unknown`, never as none or 0. A checkout is
+"not a git checkout", and an upstream none, only when git says so in its own words (`not a git
+repository`; `no upstream configured`, `no such branch`, `HEAD does not point to a branch`): any
+other fatal error of git's — a checkout it refuses as another user's (dubious ownership), one it
+can't read — is unknown.
+
+Its git — the dashboard's probe's too — writes nothing and runs nothing the participant's repo
+configures: no optional locks (not even the index is refreshed), no fsmonitor hook, no clean/process
+filter, no `gpg.program`, no submodule's own `git status`; the working tree is read from plumbing
+that doesn't refresh, so a file only touched counts as modified until git next refreshes the index.
+
+**Never read or sent**: file contents, shell history, the environment, `~/.arena` beyond the jobs'
+status and the newest log tail, where a login comes from, arena's config or keys.
+
+#### Masked before anything leaves
+
+**Commands: never their values.** A process's arguments and a job's command are sent as their shape
+alone (`arena_core::shape`): the program's name (`python3`, `jupyter-lab`), the first script or
+notebook it runs (`train.py`, `part1.ipynb`, or python's `-m pytest`), each flag's name (`--lr`,
+`-p`, `--token=…`), and `…` for every value — `python3 /w/train.py --lr 0.1 --token X` is `python3
+train.py --lr … --token …`, `sshpass -p pw ssh host` is `sshpass -p … …`. A shell's or python's `-c`
+code is `bash -c …`, a path under the jobs dir `<job>`, and a name that looks like a key (a long run
+of letters and digits) a value too. The words are the shell's (quotes and backslashes taken out, a
+quoted value with blanks one word), every leading `NAME=value` is one `…` before the program
+(`APP_CONFIG='{"password": "x y"}' python train.py` is `… python train.py`), a program's, script's
+or module's name shows only as 1–40 of `[A-Za-z0-9._+-]` (else `…`), and a command whose quoting
+doesn't close is `<command>` whole — so is one with `$(`, a backtick, `${`, `<(`, `>(` or `<<`
+anywhere but in a `-c` script (`X="$(printf "…")" python train.py`: where its words end can't be
+told). Only a value spelled exactly like a flag's name (`-x`, `--fast`)
+can still show: no shape can tell it without knowing every program's options.
+
+Every other text field is masked through the backup's own key patterns
+(`arena_core::backup::SECRET_PATTERNS`: OpenRouter, Anthropic incl. Claude Code tokens, OpenAI,
+Hugging Face, GitHub, Google, Groq, AWS — the same replacements, `REDACTED-…`). Also masked: the
+whole value of anything named like a secret (`HF_TOKEN=…` and `MY_SECRET='x y'`, `--api-key …`,
+`--pass`/`--passphrase …`, `DB_PASS`, `MYSQL_PWD`, JSON/YAML/Python-dict fields such as `"password":
+"a b"` or `api_key: …`, `password:x` glued, `Authorization: …`, `Bearer …`, basic auth: `curl -u
+user:pass`, `--user user:pass`, `https://user:pass@…`) and a command's own password option
+(`redis-cli -a …`, `sshpass -p …`, mysql's `-p…`, glued or not) — a line whose secret value can't be
+delimited (an unclosed quote or bracket) or whose quoting can't be told (`Couldn't … PASSWORD='a
+b'`) is replaced whole, and in a log so is every line such a value runs on into (a YAML block
+scalar, a value on the line after its name, a quote or bracket closed lines later) — any run of 32+
+`[A-Za-z0-9_-]` in commit subjects and log lines (`<redacted>`), any run of 40+ of `[A-Za-z0-9+/=]`
+with upper case, lower case and digits (base64 key material), and a private-key block — in a log
+masked over the whole read (the log's last 64 KB) before its last 40 lines are taken, so neither cut
+can keep a key's body without its header, nor a value whose name is above the cut. Where the read
+starts part-way into the log, a value whose name it never saw may run on at its top over any lines,
+so nothing is shown from its first 16 KB: what's shown begins where that tracking has settled (a
+log that fits in the read is tracked from its first byte). One case is left: a multi-line value
+that starts more than 16 KiB above the shown lines and contains a short plain password line could
+show that line — logs aren't a place for secrets. At the start of what's shown, lines that
+look like base64 key material (40+ of `[A-Za-z0-9+/=]`, nothing else) are dropped. The AI CLI's
+own error line, printed and saved when it fails, is masked the same way. Each pod's part is at most
+6 KB (less when many pods share a prompt: 240 KB in all), trimmed from the log's oldest lines first.
+
+**Framing a pod can't forge.** Each pod's reply is framed by marker lines carrying a random nonce of
+that call's own, and so is every line of the small probe's: pod text that runs over lines (a path,
+a git config value) can't make one of them. A reply with one of the call's markers twice or out of
+order reads `unknown: the probe's reply was malformed`, and a fact the probe gives twice is
+`unknown`. In the prompt, the pod data sits between delimiters with a tag random per prompt, and no
+pod string can spell one (a run of `=` is cut to three).
+
+#### Where it goes
+
+claude sends the prompt to **Anthropic**, codex to **OpenAI**, through your own `claude`/`codex`
+login on this machine (a one-line note says so on first use). Both get **no tools** — the prompt
+says the pod data is data, never instructions, and they can't act on it anyway: both run as
+`scripts/ai-review` runs them, claude as `claude -p --safe-mode --tools '' --strict-mcp-config
+--mcp-config '{"mcpServers":{}}' --disable-slash-commands --no-session-persistence --output-format
+text`, codex as `codex exec -s read-only --skip-git-repo-check --ephemeral --ignore-user-config
+--ignore-rules` with `mcp_servers` emptied, web search off and every tool feature disabled (shell,
+unified exec, code mode, apps, plugins, browser and computer use, sub-agents, image generation and
+viewing, hooks) — and so is every web search feature, sleep tool, skill search, tool suggestion,
+goal or worktree feature it lists. **It fails closed**: neither is sent anything until `claude
+--help` lists every one of those flags, or `codex features list` names every one of those features
+and then, run again with the ask's own overrides (and an empty `CODEX_HOME`, as the ask reads no
+`config.toml`), names each one it turns off and shows nothing on beyond a reviewed list of features
+known to give it no tool (`arena_core::ask::ai::CODEX_SAFE_FEATURES`, from codex 0.163). Both
+listings are read strictly — every row `<name> <stage> true|false`, the state exactly `true` or
+`false`, a stage codex is known to print — so a changed format can't read as "off". A check that
+fails, times out, can't be read whole, or finds one missing or a feature on it doesn't know refuses
+the ask (`codex: couldn't confirm its
+tools are off — not asked (…)`, naming it). The prompt goes on stdin (never argv), in an empty
+private temporary directory, with a minimal environment (`PATH`, `HOME`, the locale, XDG and proxy
+variables, and the AI's own config dir and API key — not the rest of yours), and in a session of its
+own: no controlling terminal, so it can't draw on the dashboard or read your keys through
+`/dev/tty`. `--timeout` (default 300 s), Ctrl-C, a hangup or a TERM (to `pods ask`: handled as
+Ctrl-C; to the dashboard: it ends at once, exit status 129 or 143), the dashboard's terminal hanging
+up, or closing the dashboard stops it and everything it started —
+TERM, then KILL 2 s later for whatever ignores it — and so does its own exit: what it leaves behind
+goes the same way. Should arena be killed outright (SIGKILL, a crash), the kernel TERMs the AI CLI
+itself (Linux: `PR_SET_PDEATHSIG`), though what that started is then the CLI's own to stop. A missing
+binary is an error naming the other one.
+
+#### Where answers are saved
+
+In arena's state dir, never in the home or the working directory — `<state>/<prefix>/ask/<UTC
+time>-<pod or N-pods>/` with `prompt.txt` (exactly what was sent), `answer.md` (or why there is
+none) and `run.txt`; folders 0700, files 0600, the newest 50 kept. `<state>` is `$ARENA_STATE_DIR`,
+else `$XDG_STATE_HOME/arena`, else `~/.local/state/arena`. A `--dry-run` saves nothing.
 
 ## Fleet status and money
 
@@ -1393,6 +1550,13 @@ on stdin** (`printf %s "$TOK" | arena config set HF_TOKEN`, script-friendly, kee
 `config which` shows the active config file (path, readable/**writable**), what parsed, and any keys
 coming from the environment.
 
+#### `ASK_AI`
+
+Which AI [`pods ask`](#pods-ask) and the dashboard's `?` ask: `claude` (the default), `codex`, or
+`off` — which turns `pods ask` and `?` off whatever `--ai` says (`--ai` picks between claude and
+codex only). `config check` shows it in its "Asking an AI (`pods ask`, the dashboard's `?`)" section
+(and where the binary is, or a ⚠); any other value fails the check and refuses to run.
+
 ### `plan check | show`
 
 `plan check | show` — a scheduled provisioning plan (`arena-plan.json`, see
@@ -1512,6 +1676,18 @@ like the whole fleet (smaller sets: the pod count). A marked-set confirm names t
 first 10, then `… and N more`), with the token prompt always on screen. `Esc` on the list clears the
 marks (it never quits).
 
+### Asking an AI about pods
+
+**`?`** asks claude or codex (`ASK_AI`) about the cursor pod — or the marked set, compared in one
+prompt — exactly what [`arena pods ask`](#pods-ask) does: a one-line question, prefilled with the
+default and saying where the data goes (`ctrl-u` clears it); Enter asks **in the background** like
+`d` (the footer says `asking claude about devtest-alpha…`), and the answer opens in its own
+scrollable popup when it lands (Esc closes it; a modal open meanwhile keeps it waiting). Saved like
+`pods ask`'s. With `ASK_AI=off` it opens nothing and the footer says how to turn it on. A marked set
+keeps to this cohort's pods, as `pods ask --all` does: a staff box or another cohort's pod marked
+along is left out (the input names it, the footer says how many); to ask about one, put the cursor
+on it with nothing marked.
+
 ### SSH time budgets
 
 Every pod SSH call (metrics, test/run/backup/set-branch/setup, deep check) goes through `Remote`
@@ -1521,8 +1697,14 @@ action with `timed out after …`; only `c` (your interactive shell) is a plain 
 ### Navigating
 
 **Navigate** with `↑/↓`/`j/k`; `enter` opens a per-pod detail pane (per-GPU breakdown, full
-branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit; `Esc` only steps back (detail →
-list; on the list it clears the marks).
+branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit. A hangup or a TERM ends it at
+once (exit status 129 or 143), and so does its terminal hanging up (a dropped SSH session, a killed
+tmux server: 129) — never waiting on its event loop, which a dead terminal stalls. However it ends,
+nothing new is started from then on, the terminal is put back first (as far as it can be; not while
+`c`'s ssh has it — that's ssh's), and then every child still running is stopped — a question's AI,
+an action's, a refresh's or a backup's ssh, scp and rsync, `c`'s ssh — TERM, then KILL 2 s later;
+the wait for that is never on a raw screen. `Esc` only steps back (detail → list; on the list it
+clears the marks).
 
 ### Acting on pods
 
@@ -1621,18 +1803,31 @@ scripts/ai-review --dry-run              # only write prompt.txt: nothing is sen
   key-like strings`; `--dry-run`'s `prompt.txt` is the masked one. The repo's own test fixtures
   with fake keys are masked too. Patterns it can't read, or a key-like string left after the
   masking, refuse the run (exit 2, nothing sent).
-- **No tools.** Everything the reviewer needs is in the prompt, so it runs with none, in an empty
-  temporary directory: claude with `--tools ''`, `--safe-mode` (no hooks, MCP servers or
-  CLAUDE.md) and no saved session; codex `exec` read-only and ephemeral, with its shell, code
-  mode, apps, plugins, browser and web search turned off. (Here codex's sandbox can't run a
-  command anyway: bubblewrap fails.)
+- **No tools, and it fails closed.** Everything the reviewer needs is in the prompt, so it runs with
+  none, in an empty temporary directory, with a minimal environment (`PATH`, `HOME`, the locale, XDG
+  and proxy variables, and the reviewer's own config dir and API key — not the rest of yours),
+  exactly as [`pods ask`](#pods-ask) runs it: claude with `--tools ''`, `--safe-mode` (no hooks, MCP
+  servers or CLAUDE.md), `--strict-mcp-config` with an empty `--mcp-config` and no saved session;
+  codex `exec` read-only and ephemeral, without your `config.toml` or execpolicy rules
+  (`--ignore-user-config --ignore-rules`: `--model-codex` and `--effort` still pick), with
+  `mcp_servers` emptied and its shell, code mode, apps, plugins, browser and computer use,
+  sub-agents, image generation and viewing, hooks and web search turned off (every web search
+  feature it lists too, and its sleep tool, skill search, tool suggestion, goals and worktrees).
+  Neither is sent anything until it has confirmed it knows every one of those switches — `codex
+  features list` names each feature, `claude --help` lists each flag — and codex until that list,
+  run again with the review's overrides and an empty `CODEX_HOME`, names each one it turns off and
+  shows nothing else on but the features `pods ask` allows; both listings are read strictly, as
+  `pods ask` reads them (every row `<name> <stage> true|false`). A check that fails, times out
+  (20s), can't be read whole, or finds one missing or one more on refuses that reviewer (`ai-review:
+  codex: couldn't confirm its tools are off — not asked (…)`), and the other still runs. (Here
+  codex's sandbox can't run a command anyway: bubblewrap fails.)
 - **Output** goes to `${XDG_STATE_HOME:-~/.local/state}/arena-review/<UTC time>-<range|prN>/`
   (`--out DIR` for another parent): `prompt.txt`, `codex.md`, `claude.md`, and each reviewer's
   stderr in `codex.log`/`claude.log`. It ends by printing those paths and each review's last line,
-  `Blocks merging: yes|no (…)`. Exit 0 when every reviewer that ran answered, whatever it found;
-  1 when one failed or timed out (`--timeout`, 3600 s each) or none could run (a missing `codex`
-  or `claude` is skipped with a message); 2 for a usage error, an empty diff or key patterns it
-  can't read (refused).
+  `Blocks merging: yes|no (…)`. Exit 0 when every reviewer that ran answered, whatever it found; 1
+  when one failed, timed out (`--timeout`, 3600 s each) or couldn't confirm its tools are off, or
+  none could run (a missing `codex` or `claude` is skipped with a message); 2 for a usage error, an
+  empty diff or key patterns it can't read (refused).
 - **Cost.** It runs on the operator's own codex and Claude Code logins, so it spends their
   subscriptions' usage, not the project's API keys: a 16-commit, ~420 KB prompt is roughly 125k
   input tokens per reviewer, and took codex 2½ minutes and claude 5. `--effort` (default `high`,

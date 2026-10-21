@@ -8,6 +8,7 @@
 pub mod apiextra;
 pub mod archive;
 pub mod apiget;
+pub mod ask;
 pub mod apikeys;
 pub mod backup;
 pub mod balance;
@@ -41,12 +42,14 @@ pub mod retry;
 pub mod schedule;
 pub mod selector;
 pub mod setup;
+pub mod shape;
 pub mod snapshot;
 pub mod sshconfig;
 pub mod ssh;
 pub mod status;
 pub mod table;
 pub mod teardown;
+pub mod tty;
 pub mod volume;
 pub mod vscode;
 

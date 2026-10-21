@@ -7,6 +7,7 @@
 //! soon as each sweep finishes. Move the cursor with `↑/↓`/`j/k`, open a per-pod detail
 //! pane (per-GPU breakdown + util/temp sparklines) with `Enter`, act on the selected
 //! pod with `a` (restart / stop / terminate / backup / setup / test / run / set-branch),
+//! ask claude or codex about it (or the marked set) with `?` (`ask.rs`, in the background),
 //! `f` cycles the refresh cadence, `r` refreshes now.
 //!
 //! Each refresh is one `arena_core::snapshot` [`FleetSnapshot`] — the pods as listed, the
@@ -30,6 +31,7 @@
 //! Provider is chosen by `ARENA_PROVIDER` (default `runpod`); config path by
 //! `ARENA_CONFIG`; initial cadence by `ARENA_REFRESH_SECS` (default 5).
 
+mod ask;
 mod prefs;
 mod state;
 
@@ -149,6 +151,11 @@ enum Mode {
     Working(String),
     /// The outcome of the last action; any key dismisses (then we nudge a refresh).
     Result(String),
+    /// `?`: the question about the cursor pod or the marked set, prefilled; Enter asks `ai` in
+    /// the background (`ask.rs`).
+    Ask { scope: InputScope, value: String, ai: arena_core::ask::Ai },
+    /// An answer to a `?` question: scrollable; Esc closes.
+    Answer(ask::Answer),
 }
 
 /// Which pods a multi-pod action targets.
@@ -209,6 +216,10 @@ struct Shared {
     /// (`Provider::restart_resets_container`, pure), set with the rows each refresh — what the
     /// action menus' restart label says ([`Shared::restart_reset`]).
     resets: HashMap<String, ContainerReset>,
+    /// A `?` question out (`asking claude about …`, for the footer); `None` when none is.
+    ask_running: Option<String>,
+    /// Its answer, set by the background task; the loop opens it ([`ask::land`]).
+    ask_answer: Option<ask::Answer>,
 }
 
 impl Shared {
@@ -257,12 +268,18 @@ struct Ui {
     /// Pods marked for a bulk action (space, a click, or `/`), by `state::mark_key`
     /// (`provider:id` — a bare id can belong to two providers' pods).
     marked: std::collections::HashSet<String>,
-    /// Scroll offset for the result modal (so long fleet outputs are readable).
+    /// Scroll offset for the result modal (so long fleet outputs are readable) and the `?`
+    /// answer popup.
     result_scroll: u16,
+    /// How far the result or answer popup last drawn can scroll — its text's height less its
+    /// view's — set as it's drawn, so a key never scrolls past the end ([`scroll_by`]).
+    result_max: std::cell::Cell<u16>,
     /// The pods table's last-rendered `(area, scroll_offset)`, set by `pods_table` each
     /// frame so mouse clicks can be mapped back to a pod row. Cell because `view` borrows
     /// `&Ui` (the TUI is single-threaded, so interior mutability is safe here).
     last_table: std::cell::Cell<(Rect, usize)>,
+    /// What answers `?` ([`ask::real_asker`]; a fake in tests).
+    asker: ask::Asker,
 }
 
 impl Ui {
@@ -356,6 +373,7 @@ async fn main() -> Result<()> {
     let ui = Ui {
         provider_name,
         config_path,
+        asker: ask::real_asker(remote.clone(), cfg.clone()),
         remote,
         prefix,
         short_names: Prefs::load().short_names,
@@ -364,13 +382,49 @@ async fn main() -> Result<()> {
         selected: 0,
         marked: std::collections::HashSet::new(),
         result_scroll: 0,
+        result_max: std::cell::Cell::new(0),
         last_table: std::cell::Cell::new((Rect::default(), 0)),
     };
 
+    dashboard(&shared, &provider, &interval, &nudge, &details_wanted, ui).await
+}
+
+/// The dashboard on this terminal until it ends — `main`'s, and a test's copy's. However it ends,
+/// the latch comes first (`arena_core::remote::end_children`: no child starts after it), then the
+/// terminal is put back, then every child still running is stopped (TERM, then KILL after the
+/// grace: `arena_core::remote::stop_all_children`) — the operator's terminal back at once, never
+/// held for the grace (review ai-review claude #4). `q` and Ctrl-C end the loop, and that's done
+/// here, the runtime then dropping the rest; a hangup, a TERM, a dead terminal or a failed read or
+/// draw end it from outside the loop ([`end_now`], which exits). A cause after the first leaves
+/// the ending to that one.
+async fn dashboard(
+    shared: &Arc<Mutex<Shared>>,
+    provider: &Arc<dyn Provider>,
+    interval: &AtomicU64,
+    nudge: &Notify,
+    details_wanted: &AtomicBool,
+    ui: Ui,
+) -> Result<()> {
+    exit_on_signals();
     let mut terminal = setup_terminal()?;
-    let res = run(&mut terminal, &shared, &provider, &interval, &nudge, &details_wanted, ui).await;
-    restore_terminal(&mut terminal)?;
-    res
+    exit_on_hangup();
+    match run(&mut terminal, shared, provider, interval, nudge, details_wanted, ui).await {
+        // `q` or Ctrl-C — or the loop finding the terminal put back by an end already under way,
+        // which exits.
+        Ok(()) => {
+            if !arena_core::remote::end_children() {
+                return std::future::pending().await;
+            }
+            let restored = restore_terminal(&mut terminal);
+            arena_core::remote::stop_all_children().await;
+            restored.map(drop)
+        }
+        // A terminal that fails a read or a draw is taken as gone: no retry.
+        Err(e) => {
+            end_now(1, Some(format!("{e:#}"))).await;
+            Ok(())
+        }
+    }
 }
 
 /// When the background refresh runs: every `interval` seconds, or at once on `nudge`;
@@ -400,6 +454,8 @@ async fn fetch_loop(
         progress_cmd,
         repo_path: Some(repo_path),
         key_remote: Some(cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string()),
+        nvidia_smi_timeout: None,
+        repo_timeout: None,
     };
     let mut details = DetailsState { balance, ..Default::default() };
     loop {
@@ -680,7 +736,27 @@ fn status_line(s: &FleetSummary, warnings: &[&str]) -> String {
     out
 }
 
+/// Whether the terminal is the dashboard's now — raw mode, the alternate screen, the mouse — so
+/// an end from outside the loop puts it back ([`restore_best_effort`]); not while `c`'s ssh has
+/// it ([`hand_over`]). Held while the terminal changes hands ([`setup_terminal`],
+/// [`restore_terminal`]), while a frame is drawn ([`while_ours`]) and while that end puts it back:
+/// so none of them interleaves with another, no frame is drawn once it's back (on the main
+/// screen), and once the dashboard is ending (`arena_core::remote::ending`) it isn't taken again —
+/// `c`'s ssh stopped by the end, the dashboard doesn't set up its screen again under the exit.
+static TERMINAL: Mutex<bool> = Mutex::new(false);
+
+fn terminal_ours() -> std::sync::MutexGuard<'static, bool> {
+    TERMINAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Take the terminal: raw mode, the alternate screen, the mouse. Refused once the dashboard is
+/// ending.
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    let mut ours = terminal_ours();
+    if arena_core::remote::ending() {
+        anyhow::bail!("the dashboard is ending");
+    }
+    *ours = true;
     enable_raw_mode()?;
     let mut out = stdout();
     // EnableMouseCapture: wheel-scroll the list + click to select/multi-select rows.
@@ -688,11 +764,93 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     Ok(Terminal::new(CrosstermBackend::new(out))?)
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+/// Give the terminal back. `false`: it wasn't the dashboard's — an end from outside the loop has
+/// put it back already — and nothing is written.
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<bool> {
+    let mut ours = terminal_ours();
+    if !std::mem::replace(&mut *ours, false) {
+        return Ok(false);
+    }
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
-    Ok(())
+    Ok(true)
+}
+
+/// `f` on the terminal — a frame, a clear — while it is the dashboard's ([`TERMINAL`], held
+/// meanwhile). `false`, `f` not called: it isn't — an end from outside the loop has put it back.
+fn while_ours(terminal: &mut Terminal<CrosstermBackend<Stdout>>, f: impl FnOnce(&mut Terminal<CrosstermBackend<Stdout>>) -> std::io::Result<()>) -> Result<bool> {
+    let ours = terminal_ours();
+    if !*ours {
+        return Ok(false);
+    }
+    f(terminal)?;
+    Ok(true)
+}
+
+/// How long [`restore_best_effort`] waits for the terminal to take its last writes.
+const RESTORE_WAIT: Duration = Duration::from_millis(300);
+
+/// The terminal put back as [`restore_terminal`] does — raw mode off, the main screen, no mouse
+/// capture, the cursor shown — when the dashboard ends from outside its loop: best effort (on a
+/// hung-up terminal every step fails, and that's fine), on a thread of its own waited for no more
+/// than [`RESTORE_WAIT`] (a terminal that has stopped reading would hold a write for ever, or a
+/// frame's draw the lock). Nothing when the terminal isn't the dashboard's ([`TERMINAL`]): `c`'s
+/// ssh has it, and what ssh did to it is ssh's to undo.
+fn restore_best_effort() {
+    let (done, wait) = std::sync::mpsc::channel();
+    let restoring = std::thread::Builder::new().name("restore".into()).spawn(move || {
+        let mut ours = terminal_ours();
+        if std::mem::replace(&mut *ours, false) {
+            let _ = disable_raw_mode();
+            let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture, crossterm::cursor::Show);
+        }
+        drop(ours);
+        let _ = done.send(());
+    });
+    if restoring.is_ok() {
+        let _ = wait.recv_timeout(RESTORE_WAIT);
+    }
+}
+
+/// The signals that end the dashboard ([`exit_on_signals`]), by number: the exit status is 128 +
+/// it, as a shell reports a process the signal killed (the same on Linux and macOS).
+const SIGHUP: i32 = 1;
+const SIGTERM: i32 = 15;
+
+/// How often [`exit_on_hangup`] looks at the terminal.
+const HANGUP_POLL: Duration = Duration::from_millis(200);
+
+/// End the dashboard now, from outside its event loop — which may never come round again: on a
+/// hung-up terminal crossterm's read spins for ever (live ASK4 3c) — so nothing here waits on it.
+/// In order:
+/// 1. the latch (`arena_core::remote::end_children`), before anything else: no child starts after
+///    it (review ai-review codex #3), and a later cause — the hangup's SIGHUP and the dead terminal
+///    both seen, a TERM after a HUP, the loop failing on the dead terminal — waits for this one's
+///    exit;
+/// 2. the terminal put back as far as it can be ([`restore_best_effort`]), at once, never after
+///    the grace (review ai-review claude #4), and `why` said there;
+/// 3. stdin parked (`arena_core::tty::park_stdin`): the loop's next read waits, no longer spinning
+///    a core on a dead terminal meanwhile (live ASK5 F1);
+/// 4. every child still running stopped — the AI's whole group, and every ssh, scp and rsync of a
+///    refresh, an action or a backup, and `c`'s ssh, which an `exit` left running before (review
+///    ai-review claude #1) — TERM, then KILL after the grace (`arena_core::remote::stop_all_children`);
+/// 5. the asks' scratch directories removed (`exit` drops nothing:
+///    `arena_core::ask::ai::remove_scratch`);
+/// 6. `exit(code)`.
+async fn end_now(code: i32, why: Option<String>) {
+    if !arena_core::remote::end_children() {
+        return std::future::pending().await;
+    }
+    restore_best_effort();
+    if let Some(why) = why {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "arena-tui: {why}");
+    }
+    arena_core::tty::park_stdin();
+    arena_core::remote::stop_all_children().await;
+    arena_core::ask::ai::remove_scratch();
+    std::process::exit(code)
 }
 
 /// Mouse handling: wheel-scroll the pod list (or the result modal), and in the list
@@ -704,14 +862,14 @@ fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared>>) {
     match m.kind {
         MouseEventKind::ScrollUp => {
             if in_result {
-                ui.result_scroll = ui.result_scroll.saturating_sub(1);
+                ui.result_scroll = scroll_by(ui.result_scroll, ui.result_max.get(), -1);
             } else if in_list {
                 ui.selected = ui.selected.saturating_sub(1);
             }
         }
         MouseEventKind::ScrollDown => {
             if in_result {
-                ui.result_scroll = ui.result_scroll.saturating_add(1);
+                ui.result_scroll = scroll_by(ui.result_scroll, ui.result_max.get(), 1);
             } else if in_list {
                 let len = shared.lock().unwrap().pods.len();
                 if len > 0 {
@@ -758,8 +916,8 @@ fn selected_pod(shared: &Arc<Mutex<Shared>>, idx: usize) -> Option<Pod> {
 }
 
 /// Open an interactive SSH shell to the selected pod: suspend the dashboard (leave the
-/// alternate screen + raw mode), hand the terminal to `ssh`, then restore on exit. The one
-/// SSH call that doesn't go through `Remote`, on purpose: it's the operator's own shell —
+/// alternate screen + raw mode), hand the terminal to `ssh`, then restore on exit ([`hand_over`]).
+/// The one SSH call that doesn't go through `Remote`, on purpose: it's the operator's own shell —
 /// it needs the terminal (a PTY, stdin) and has no time budget.
 fn connect_ssh(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -774,19 +932,32 @@ fn connect_ssh(
             return Ok(());
         }
     };
-    restore_terminal(terminal)?;
-    println!(
-        "Connecting to {} ({}@{}:{}) — exit the shell to return to the dashboard…\n",
-        pod.name, target.user, target.host, target.port
-    );
-    // Blocking, inherits this terminal (interactive PTY). ssh_args carries the port/keys.
-    let status = std::process::Command::new("ssh").args(target.ssh_args()).status();
-    *terminal = setup_terminal()?;
-    terminal.clear()?;
-    if let Err(e) = status {
+    let banner = format!("Connecting to {} ({}@{}:{}) — exit the shell to return to the dashboard…\n", pod.name, target.user, target.host, target.port);
+    // ssh_args carries the port/keys.
+    let mut ssh = std::process::Command::new("ssh");
+    ssh.args(target.ssh_args());
+    if let Err(e) = hand_over(terminal, &banner, &mut ssh)? {
         ui.mode = Mode::Result(format!("✗ ssh {}: {e}", pod.name));
     }
     Ok(())
+}
+
+/// Hand the terminal to `cmd` until it exits — `c`'s ssh: blocking, it inherits this terminal
+/// (an interactive PTY) — `banner` said first on the main screen, then take the terminal back.
+/// While `cmd` has it the terminal isn't the dashboard's ([`TERMINAL`]): a hangup or a TERM then
+/// stops `cmd` with every other child (it's tracked: `arena_core::remote::run_foreground`) and puts
+/// nothing back — the terminal is `cmd`'s to restore — and, the dashboard ending, the terminal
+/// isn't taken back: `Err`, which ends the loop, the exit [`end_now`]'s. Never started once the
+/// dashboard is ending. `Ok(Err)`: `cmd` couldn't be run.
+fn hand_over(terminal: &mut Terminal<CrosstermBackend<Stdout>>, banner: &str, cmd: &mut std::process::Command) -> Result<arena_core::Result<std::process::ExitStatus>> {
+    if !restore_terminal(terminal)? {
+        anyhow::bail!("the dashboard is ending");
+    }
+    println!("{banner}");
+    let status = arena_core::remote::run_foreground(cmd, "ssh");
+    *terminal = setup_terminal()?;
+    while_ours(terminal, |t| t.clear())?;
+    Ok(status)
 }
 
 /// Advance the cadence to the next step in `REFRESH_STEPS` (wrapping).
@@ -923,6 +1094,44 @@ fn new_pod_mode(ui: &Ui, listed: std::result::Result<Vec<Pod>, String>) -> Mode 
     }
 }
 
+/// A hangup or a TERM ends the dashboard at once ([`end_now`], exit status 129 or 143), from a
+/// task of its own: a question still being asked (`?`) stopped with everything it started
+/// (review ai-review claude #2: the AI, in a session of its own, ran on when either signal killed
+/// the dashboard outright), the terminal put back. Never through the event loop (lane ASK7 H
+/// latched a flag there): after a hangup crossterm's read never returns, so the flag was never
+/// seen — the dashboard spun a core for ever, SIGTERM no longer stopping it, and its `?` ran on
+/// (live ASK4 3c). Listened for from this call on.
+fn exit_on_signals() {
+    use tokio::signal::unix::{signal, SignalKind};
+    for (kind, signo) in [(SignalKind::hangup(), SIGHUP), (SignalKind::terminate(), SIGTERM)] {
+        if let Ok(mut listener) = signal(kind) {
+            tokio::spawn(async move {
+                if listener.recv().await.is_some() {
+                    end_now(128 + signo, None).await;
+                }
+            });
+        }
+    }
+}
+
+/// A terminal that has hung up (`arena_core::tty::hung_up`: stdout's, and stdin's when it is one)
+/// ends the dashboard as a hangup does ([`end_now`], 129), looked at every [`HANGUP_POLL`] from a
+/// task of its own: without the SIGHUP — ignored, or never sent to this process — the event loop
+/// would spin on the dead terminal for ever.
+fn exit_on_hangup() {
+    use std::io::IsTerminal;
+    let fds: Vec<i32> = [(0, std::io::stdin().is_terminal()), (1, std::io::stdout().is_terminal())].into_iter().filter(|(_, tty)| *tty).map(|(fd, _)| fd).collect();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(HANGUP_POLL).await;
+            if fds.iter().any(|&fd| arena_core::tty::hung_up(fd)) {
+                end_now(128 + SIGHUP, None).await;
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     shared: &Arc<Mutex<Shared>>,
@@ -942,6 +1151,8 @@ async fn run(
                 nudge.notify_one();
             }
         }
+        // A `?` answer landed: its popup (from the list/detail view; otherwise it waits).
+        ask::land(&mut ui, shared);
         // `n`'s listing landed: the add-pod form (or why not).
         {
             let listed = shared.lock().unwrap().new_pod_listing.take();
@@ -956,7 +1167,11 @@ async fn run(
         let secs = interval.load(Ordering::Relaxed);
         {
             let s = shared.lock().unwrap();
-            terminal.draw(|f| view(f, &s, &ui, secs))?;
+            // Put back by an end from outside the loop ([`end_now`]): nothing more to draw — the
+            // loop ends, and that end exits.
+            if !while_ours(terminal, |t| t.draw(|f| view(f, &s, &ui, secs)).map(drop))? {
+                return Ok(());
+            }
         }
 
         // Short poll: the loop keeps redrawing (~7 fps) so live data and the
@@ -979,6 +1194,10 @@ async fn run(
             break;
         }
         let code = k.code;
+        // `?` and its two popups (ask.rs).
+        if ask::key(&mut ui, shared, code, k.modifiers) {
+            continue;
+        }
 
         match ui.mode.clone() {
             Mode::List | Mode::Detail => match list_key(&mut ui, code, len) {
@@ -1165,7 +1384,7 @@ async fn run(
                                     ));
                                     {
                                         let s = shared.lock().unwrap();
-                                        terminal.draw(|f| view(f, &s, &ui, secs))?;
+                                        while_ours(terminal, |t| t.draw(|f| view(f, &s, &ui, secs)).map(drop))?;
                                     }
                                     let (msg, created) = create_pods(
                                         &prov,
@@ -1254,25 +1473,40 @@ async fn run(
             },
             // A background action is running — ignore keys (Ctrl+C still quits, above).
             Mode::Working(_) => {}
-            Mode::Result(_) => match code {
-                // Scroll long outputs (e.g. a fleet test); other keys dismiss.
-                KeyCode::Up | KeyCode::Char('k') => {
-                    ui.result_scroll = ui.result_scroll.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    ui.result_scroll = ui.result_scroll.saturating_add(1);
-                }
-                KeyCode::PageUp => ui.result_scroll = ui.result_scroll.saturating_sub(10),
-                KeyCode::PageDown => ui.result_scroll = ui.result_scroll.saturating_add(10),
-                _ => {
+            // Handled by `ask::key` above.
+            Mode::Ask { .. } | Mode::Answer(_) => {}
+            Mode::Result(_) => {
+                if !result_key(&mut ui, code) {
                     ui.result_scroll = 0;
                     ui.mode = Mode::List;
                     nudge.notify_one();
                 }
-            },
+            }
         }
     }
     Ok(())
+}
+
+/// A popup's scroll offset moved by `delta` lines, kept within `0..=max` (`max`: how far the
+/// popup last drawn can scroll, [`Ui::result_max`]). An offset already past `max` — the window
+/// grew since — counts as `max`, so the first key back moves the text at once.
+pub(crate) fn scroll_by(scroll: u16, max: u16, delta: i32) -> u16 {
+    let s = (i32::from(scroll.min(max)) + delta).clamp(0, i32::from(max));
+    u16::try_from(s).unwrap_or(max)
+}
+
+/// The result modal's keys: ↑↓/jk a line, PgUp/PgDn ten, never past the end of the text.
+/// `false`: any other key, which dismisses it.
+fn result_key(ui: &mut Ui, code: KeyCode) -> bool {
+    let delta = match code {
+        KeyCode::Up | KeyCode::Char('k') => -1,
+        KeyCode::Down | KeyCode::Char('j') => 1,
+        KeyCode::PageUp => -10,
+        KeyCode::PageDown => 10,
+        _ => return false,
+    };
+    ui.result_scroll = scroll_by(ui.result_scroll, ui.result_max.get(), delta);
+    true
 }
 
 /// Run an action against every pod concurrently, returning a summary line, then each pod's
@@ -2255,8 +2489,10 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         Mode::NewPod(form) => render_new_pod(f, form),
         Mode::Input { action, scope, value } => render_input(f, shared, ui, *action, scope, value),
         Mode::Select { value } => render_select(f, value),
-        Mode::Working(msg) => render_result(f, msg, 0),
-        Mode::Result(msg) => render_result(f, msg, ui.result_scroll),
+        Mode::Working(msg) => render_result(f, msg, 0, &ui.result_max),
+        Mode::Result(msg) => render_result(f, msg, ui.result_scroll, &ui.result_max),
+        Mode::Ask { scope, value, ai } => ask::render_input(f, shared, ui, scope, value, *ai),
+        Mode::Answer(answer) => ask::render_answer(f, answer, ui.result_scroll, &ui.result_max),
         _ => {}
     }
 }
@@ -2979,9 +3215,13 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         0 => String::new(),
         n => format!(" · deep-checking {n}"),
     };
+    let checking = match &shared.ask_running {
+        Some(asking) => format!("{checking} · {asking}"),
+        None => checking,
+    };
     let keys = match &ui.mode {
-        Mode::List => "[q] quit  [enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [n] new  [r] refresh",
-        Mode::Detail => "[esc] back  [q] quit  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [n] new  [r] refresh",
+        Mode::List => "[q] quit  [enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [?] ask AI  [n] new  [r] refresh",
+        Mode::Detail => "[esc] back  [q] quit  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [?] ask AI  [n] new  [r] refresh",
         Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::Confirm(c) if c.action.requires_typed_name() => "type the pod's name  [enter] apply  [esc] cancel",
         Mode::Confirm(c) if c.preview.is_some() => "[y] apply  [v] full command  [n/esc] cancel",
@@ -2993,6 +3233,8 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         Mode::Select { .. } => "type a selection  [enter] mark  [esc] cancel",
         Mode::Working(_) => "working… (background) — please wait",
         Mode::Result(_) => "[↑↓] scroll  ·  [any other key] dismiss",
+        Mode::Ask { .. } => "type the question  [enter] ask  [ctrl-u] clear  [esc] cancel",
+        Mode::Answer(_) => "[↑↓ PgUp PgDn] scroll  [esc] close",
     };
     match shared.notice.as_ref().filter(|n| n.at.elapsed() < NOTICE_FOR) {
         Some(n) => {
@@ -3402,7 +3644,7 @@ fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
     );
 }
 
-fn render_result(f: &mut Frame, msg: &str, scroll: u16) {
+fn render_result(f: &mut Frame, msg: &str, scroll: u16, max: &std::cell::Cell<u16>) {
     // Grow the box for multi-line results (e.g. a per-pod fleet readout); it scrolls if
     // taller than the screen.
     let n = msg.lines().count() as u16;
@@ -3410,9 +3652,10 @@ fn render_result(f: &mut Frame, msg: &str, scroll: u16) {
     let area = centered_rect(70, pct_y, f.area());
     f.render_widget(Clear, area);
     let color = if msg.contains('✗') { Color::Red } else { Color::Green };
-    // Clamp scroll so you can't page past the end.
+    // Clamp scroll so you can't page past the end, and tell the keys where that is.
     let visible = area.height.saturating_sub(2);
-    let max_scroll = n.saturating_sub(visible.saturating_sub(1));
+    let max_scroll = n.saturating_sub(visible);
+    max.set(max_scroll);
     let scroll = scroll.min(max_scroll);
     let footer = if n + 2 > visible { "  [↑↓] scroll · [esc] dismiss" } else { "" };
     f.render_widget(
@@ -3539,8 +3782,25 @@ deep_check_end=1
             selected: 0,
             marked: HashSet::new(),
             result_scroll: 0,
+            result_max: std::cell::Cell::new(0),
             last_table: std::cell::Cell::new((Rect::default(), 0)),
+            asker: fake_asker(Arc::default()),
         }
+    }
+
+    /// Every `?` question a [`fake_asker`] got: the pods' names, the question, the AI.
+    type Asked = Arc<Mutex<Vec<(Vec<String>, String, arena_core::ask::Ai)>>>;
+
+    /// An asker that records each question and answers `ANSWER to <question>` at once — never
+    /// a real AI.
+    fn fake_asker(log: Asked) -> ask::Asker {
+        Arc::new(move |pods: Vec<Pod>, question: String, ai: arena_core::ask::Ai| {
+            let log = log.clone();
+            Box::pin(async move {
+                log.lock().unwrap().push((pods.iter().map(|p| p.name.clone()).collect(), question.clone(), ai));
+                ask::Answer { title: format!("{} · test", ai.name()), text: format!("ANSWER to {question}") }
+            })
+        })
     }
 
     /// Forwards alpha → its endpoint (live) and bravo → an old one (stale).
@@ -4845,6 +5105,283 @@ deep_check_end=1
         }
     }
 
+    /// Review ai-review codex #5: the answer popup's scroll limit counts the lines as the
+    /// `Paragraph` wraps them — word by word, a wide character two columns — so a long paragraph
+    /// and a line of CJK scroll to their very end: at the limit the last line sits on the popup's
+    /// last row, right above its border, at any size. (Counting characters per line came short:
+    /// the last lines were out of reach.)
+    #[test]
+    fn the_answer_scrolls_to_the_end_of_wrapped_text() {
+        let shared_arc = Arc::new(Mutex::new(fixture_shared()));
+        let shared = fixture_shared();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let words: String = (0..400).map(|i| format!("word{i}{} ", "x".repeat(i % 11))).collect();
+        let text = format!("{words}\n{}\nTHE-END", "漢字".repeat(300));
+        for (w, h) in [(120, 40), (80, 24), (61, 17)] {
+            ui.mode = Mode::Answer(ask::Answer { title: "t".into(), text: text.clone() });
+            ui.result_scroll = 0;
+            draw(w, h, &shared, &ui);
+            for _ in 0..200 {
+                assert!(ask::key(&mut ui, &shared_arc, KeyCode::PageDown, KeyModifiers::NONE));
+            }
+            assert_eq!(ui.result_scroll, ui.result_max.get(), "{w}x{h}");
+            let rows = draw(w, h, &shared, &ui);
+            let at = rows.iter().position(|r| r.contains("THE-END")).unwrap_or_else(|| panic!("{w}x{h}: the end is out of reach:\n{}", rows.join("\n")));
+            assert!(rows[at + 1].contains('└'), "{w}x{h}: the last line isn't the last row:\n{}", rows.join("\n"));
+        }
+    }
+
+    /// Live ASK F3: both popups — the `?` answer and the older result modal — scroll no further
+    /// than their text's end, so after PgDn past it one PgUp moves the text at once (it took
+    /// 11 after 10 extra PgDn). The offset is clamped by `scroll_by` to what the popup last
+    /// drawn can scroll; one that fits doesn't scroll at all.
+    #[test]
+    fn a_popup_scrolls_no_further_than_its_text() {
+        assert_eq!([scroll_by(0, 5, -1), scroll_by(3, 5, 10), scroll_by(5, 5, -10), scroll_by(0, 0, 10), scroll_by(2, 5, 1)], [0, 5, 0, 0, 3]);
+        assert_eq!(scroll_by(40, 5, -1), 4, "past the end (the window grew): the first key back moves");
+        assert_eq!(scroll_by(u16::MAX, u16::MAX, 10), u16::MAX);
+        let shared = fixture_shared();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let none = KeyModifiers::NONE;
+        let long: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let shared_arc = Arc::new(Mutex::new(fixture_shared()));
+        let answer = || Mode::Answer(ask::Answer { title: "t".into(), text: long.clone() });
+        for (popup, mode) in [("answer", answer()), ("result", Mode::Result(long.clone()))] {
+            ui.mode = mode;
+            ui.result_scroll = 0;
+            let press = |ui: &mut Ui, code: KeyCode| {
+                if popup == "answer" {
+                    assert!(ask::key(ui, &shared_arc, code, none));
+                } else {
+                    assert!(result_key(ui, code));
+                }
+            };
+            draw(120, 40, &shared, &ui);
+            let max = ui.result_max.get();
+            assert!(max > 50 && max < 100, "{popup}: {max}");
+            for _ in 0..30 {
+                press(&mut ui, KeyCode::PageDown);
+            }
+            assert_eq!(ui.result_scroll, max, "{popup}: PgDn stops at the end");
+            assert!(draw(120, 40, &shared, &ui).join("\n").contains("line 99"), "{popup}");
+            press(&mut ui, KeyCode::Up);
+            assert_eq!(ui.result_scroll, max - 1, "{popup}: one Up moves at once");
+            press(&mut ui, KeyCode::PageUp);
+            assert_eq!(ui.result_scroll, max - 11, "{popup}");
+            for _ in 0..30 {
+                press(&mut ui, KeyCode::PageUp);
+            }
+            assert_eq!(ui.result_scroll, 0, "{popup}");
+            press(&mut ui, KeyCode::Down);
+            assert_eq!(ui.result_scroll, 1, "{popup}");
+        }
+        // A result that fits: no scrolling, and any other key dismisses it (left to the loop).
+        ui.mode = Mode::Result("✓ done".into());
+        ui.result_scroll = 0;
+        draw(120, 40, &shared, &ui);
+        assert!(result_key(&mut ui, KeyCode::PageDown) && ui.result_scroll == 0);
+        assert!(!result_key(&mut ui, KeyCode::Esc));
+    }
+
+    /// `?` opens the question for the cursor pod, prefilled; typing edits it (Ctrl+U clears),
+    /// Enter asks in the background — the dashboard stays live, the footer says so — and the
+    /// answer opens in its own popup when it lands (a modal open meanwhile keeps it waiting),
+    /// scrolls, and Esc closes it. With pods marked it asks about the marked set; Esc on the
+    /// input asks nothing; `ASK_AI=off` opens nothing and says how to turn it on. The footer
+    /// lists the key.
+    #[tokio::test]
+    async fn question_mark_asks_in_the_background_and_shows_the_answer() {
+        use arena_core::ask::Ai;
+        let shared = Arc::new(Mutex::new(fixture_shared()));
+        let asked: Asked = Arc::default();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        ui.asker = fake_asker(asked.clone());
+        let none = KeyModifiers::NONE;
+        let screen = |ui: &Ui, w: u16, h: u16| draw(w, h, &shared.lock().unwrap(), ui);
+        for mode in [Mode::List, Mode::Detail] {
+            ui.mode = mode;
+            let footer = screen(&ui, 240, 12).pop().unwrap();
+            assert!(footer.contains("[?] ask AI"), "{footer}");
+        }
+        ui.mode = Mode::List;
+        ui.selected = 2;
+        let cursor = shared.lock().unwrap().pods[2].name.clone();
+        let answered = || async {
+            for _ in 0..400 {
+                if shared.lock().unwrap().ask_answer.is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("no answer landed");
+        };
+
+        // `?`: the input, prefilled, saying where the data goes.
+        assert!(ask::key(&mut ui, &shared, KeyCode::Char('?'), none));
+        let Mode::Ask { value, ai, .. } = &ui.mode else { panic!("{:?}", ui.mode) };
+        assert_eq!((value.as_str(), *ai), ("What is the current state of this pod? Is anything wrong or needing attention?", Ai::Claude));
+        let text = screen(&ui, 140, 40).join("\n");
+        assert!(text.contains("ask claude about") && text.contains("goes") && text.contains("to Anthropic with no tools"), "{text}");
+        assert!(screen(&ui, 240, 40).pop().unwrap().contains("[enter] ask"));
+        ask::key(&mut ui, &shared, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        for c in "is it busy?x".chars() {
+            ask::key(&mut ui, &shared, KeyCode::Char(c), none);
+        }
+        ask::key(&mut ui, &shared, KeyCode::Backspace, none);
+        assert!(matches!(&ui.mode, Mode::Ask { value, .. } if value == "is it busy?"), "{:?}", ui.mode);
+
+        // Enter: asked in the background, the footer says so, the list is back at once.
+        assert!(ask::key(&mut ui, &shared, KeyCode::Enter, none));
+        assert!(matches!(ui.mode, Mode::List));
+        let status = format!("asking claude about {cursor}…");
+        assert_eq!(shared.lock().unwrap().ask_running.as_deref(), Some(status.as_str()));
+        let footer = screen(&ui, 240, 12).pop().unwrap();
+        assert!(footer.contains(&status) && footer.contains("[q] quit"), "{footer}");
+        answered().await;
+        assert!(shared.lock().unwrap().ask_running.is_none());
+        assert_eq!(asked.lock().unwrap().clone(), [(vec![cursor.clone()], "is it busy?".to_string(), Ai::Claude)]);
+
+        // The answer opens; it scrolls; Esc closes it.
+        ask::land(&mut ui, &shared);
+        assert!(matches!(&ui.mode, Mode::Answer(a) if a.text == "ANSWER to is it busy?"), "{:?}", ui.mode);
+        let text = screen(&ui, 140, 40).join("\n");
+        assert!(text.contains("claude · test") && text.contains("ANSWER to is it busy?"), "{text}");
+        ask::key(&mut ui, &shared, KeyCode::Down, none);
+        assert_eq!(ui.result_scroll, 0, "a one-line answer fits: nothing to scroll");
+        assert!(ask::key(&mut ui, &shared, KeyCode::Esc, none));
+        assert!(matches!(ui.mode, Mode::List) && ui.result_scroll == 0);
+
+        // An answer landing while a modal is open waits for it to close.
+        shared.lock().unwrap().ask_answer = Some(ask::Answer { title: "t".into(), text: "later".into() });
+        ui.mode = Mode::Select { value: String::new() };
+        ask::land(&mut ui, &shared);
+        assert!(matches!(ui.mode, Mode::Select { .. }));
+        ui.mode = Mode::List;
+        ask::land(&mut ui, &shared);
+        assert!(matches!(&ui.mode, Mode::Answer(a) if a.text == "later"));
+        ui.mode = Mode::List;
+
+        // Pods marked: the question is about them, compared in one ask.
+        let marked: Vec<Pod> = shared.lock().unwrap().pods.iter().take(2).cloned().collect();
+        ui.marked = marked.iter().map(mark_key).collect();
+        ask::key(&mut ui, &shared, KeyCode::Char('?'), none);
+        assert!(
+            matches!(&ui.mode, Mode::Ask { scope: InputScope::Set(Scope::Marked), value, .. } if value.starts_with("What is the current state of these pods?")),
+            "{:?}",
+            ui.mode
+        );
+        ask::key(&mut ui, &shared, KeyCode::Enter, none);
+        answered().await;
+        let names: Vec<String> = marked.iter().map(|p| p.name.clone()).collect();
+        assert_eq!(asked.lock().unwrap().last().map(|(n, _, _)| n.clone()), Some(names));
+        ask::land(&mut ui, &shared);
+        ask::key(&mut ui, &shared, KeyCode::Esc, none);
+
+        // Esc on the input asks nothing.
+        ui.marked.clear();
+        ask::key(&mut ui, &shared, KeyCode::Char('?'), none);
+        ask::key(&mut ui, &shared, KeyCode::Esc, none);
+        assert!(matches!(ui.mode, Mode::List));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(asked.lock().unwrap().len(), 2);
+
+        // ASK_AI=off: nothing opens; the footer says how to turn it on.
+        ui.cfg = cfg("ASK_AI=off\n");
+        assert!(ask::key(&mut ui, &shared, KeyCode::Char('?'), none));
+        assert!(matches!(ui.mode, Mode::List));
+        let notice = shared.lock().unwrap().notice.clone().unwrap();
+        assert!(notice.error && notice.text.contains("ASK_AI=off") && notice.text.contains("ASK_AI=claude"), "{}", notice.text);
+        // Other keys on the list aren't ask's.
+        assert!(!ask::key(&mut ui, &shared, KeyCode::Char('r'), none));
+    }
+
+    /// Review ai-review claude #9: `?` on a marked set keeps to this cohort, as `pods ask` does
+    /// when no pod is named: a non-cohort pod marked along is left out of the question — the
+    /// input names it, the footer says how many — and a set of only such pods asks nothing; the
+    /// cursor pod alone is asked about whatever it is.
+    #[tokio::test]
+    async fn question_mark_keeps_a_marked_set_to_the_cohort() {
+        use arena_core::ask::Ai;
+        let c = cfg("");
+        let mut pods = fixture_pods();
+        let mut staff = pod("x", "runpod", "rp9", 9, Some(22009));
+        staff.name = "jamesbox".into();
+        pods.push(staff);
+        let snap = dashboard_snapshot(&pods, &[], None, &HealthCache::new(), &Naming::from_config(&c), NOW);
+        let mut fleet = Shared::default();
+        fleet.publish(snap);
+        let shared = Arc::new(Mutex::new(fleet));
+        let asked: Asked = Arc::default();
+        let mut ui = ui(c, Arc::new(FakeRemote::new()));
+        ui.asker = fake_asker(asked.clone());
+        let none = KeyModifiers::NONE;
+        let key_of = |name: &str| mark_key(shared.lock().unwrap().pods.iter().find(|p| p.name == name).unwrap());
+        let answered = || async {
+            for _ in 0..400 {
+                if shared.lock().unwrap().ask_answer.take().is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("no answer landed");
+        };
+
+        ui.marked = [key_of("jamesbox"), key_of("devtest-alpha")].into_iter().collect();
+        assert!(ask::key(&mut ui, &shared, KeyCode::Char('?'), none));
+        assert!(matches!(&ui.mode, Mode::Ask { scope: InputScope::Set(Scope::Marked), value, .. } if value.starts_with("What is the current state of this pod?")), "{:?}", ui.mode);
+        let text = draw(160, 40, &shared.lock().unwrap(), &ui).join("\n");
+        assert!(text.contains("ask claude about alpha — 1 non-cohort pod left out: jamesbox"), "{text}");
+        ask::key(&mut ui, &shared, KeyCode::Enter, none);
+        assert_eq!(shared.lock().unwrap().ask_running.as_deref(), Some("asking claude about devtest-alpha (1 non-cohort pod left out)…"));
+        answered().await;
+        assert_eq!(asked.lock().unwrap().last().cloned(), Some((vec!["devtest-alpha".to_string()], "What is the current state of this pod? Is anything wrong or needing attention?".to_string(), Ai::Claude)));
+
+        // Only non-cohort pods marked: nothing opens, and the footer says why.
+        ui.marked = [key_of("jamesbox")].into_iter().collect();
+        ask::key(&mut ui, &shared, KeyCode::Char('?'), none);
+        assert!(matches!(ui.mode, Mode::List), "{:?}", ui.mode);
+        let notice = shared.lock().unwrap().notice.clone().unwrap();
+        assert!(notice.error && notice.text.contains("none of the marked pods is this cohort's (jamesbox)"), "{}", notice.text);
+
+        // The cursor on it, nothing marked: asked about, as a named pod.
+        ui.marked.clear();
+        ui.selected = shared.lock().unwrap().pods.iter().position(|p| p.name == "jamesbox").unwrap();
+        ask::key(&mut ui, &shared, KeyCode::Char('?'), none);
+        ask::key(&mut ui, &shared, KeyCode::Enter, none);
+        answered().await;
+        assert_eq!(asked.lock().unwrap().last().map(|(n, _, _)| n.clone()), Some(vec!["jamesbox".to_string()]));
+    }
+
+    /// Review ai-review claude #4: a question whose task panics — here the asker itself, as a
+    /// poisoned lock would — doesn't leave `?` refusing ("one question at a time") until the
+    /// dashboard restarts: the footer's `asking …` clears, and `?` opens the question again.
+    #[tokio::test]
+    async fn a_question_whose_task_panics_frees_question_mark() {
+        let shared = Arc::new(Mutex::new(fixture_shared()));
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        ui.asker = Arc::new(|_pods: Vec<Pod>, _question: String, _ai: arena_core::ask::Ai| -> std::pin::Pin<Box<dyn std::future::Future<Output = ask::Answer> + Send>> {
+            Box::pin(async {
+                tokio::task::yield_now().await;
+                let nothing: Option<ask::Answer> = std::hint::black_box(None);
+                nothing.expect("the asker panicked (a test)")
+            })
+        });
+        let none = KeyModifiers::NONE;
+        ask::key(&mut ui, &shared, KeyCode::Char('?'), none);
+        ask::key(&mut ui, &shared, KeyCode::Enter, none);
+        assert!(shared.lock().unwrap().ask_running.is_some(), "asked");
+        for _ in 0..400 {
+            if shared.lock().unwrap().ask_running.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(shared.lock().unwrap().ask_running, None, "the panic left `?` refusing");
+        assert!(shared.lock().unwrap().ask_answer.is_none());
+        assert!(ask::key(&mut ui, &shared, KeyCode::Char('?'), none));
+        assert!(matches!(ui.mode, Mode::Ask { .. }), "{:?}", ui.mode);
+    }
+
     /// `run` shows what the command printed — every line, not the last one (live: `nvidia-smi
     /// -L; hostname` read as just the hostname) — with stderr when it fails, as a terminal would
     /// show it, and past RUN_OUTPUT_LINES the earlier lines counted; per pod for several pods.
@@ -5196,5 +5733,467 @@ deep_check_end=1
         let Mode::NewPod(form) = new_pod_mode(&ui, listed) else { panic!("no form") };
         assert_eq!(form.free.first().map(String::as_str), Some("devtest-bravo"), "alpha is taken");
         assert!(matches!(new_pod_mode(&ui, Err("vast 429".into())), Mode::Result(r) if r == "✗ list failed: vast 429"));
+    }
+
+    /// Live ASK4 3c (lane ASK8 item 4), review ai-review claude #1 (lane ASK9 item 1): a hangup or
+    /// a TERM ends the dashboard from a task of its own — never by way of its event loop, which a
+    /// hung-up terminal never lets come round again (crossterm's read spins) — stopping a question
+    /// still being asked with everything it started, and every other child (an action's rsync,
+    /// which the `exit` left running before), and exiting 128 + the signal. A copy of this test
+    /// binary plays the dashboard: its loop's thread stuck as that read leaves it, a question out
+    /// (`arena_core::ask::ai::ask`, as `?` asks it, to a stub claude that — and what it starts —
+    /// ignores TERM: KILLed after the grace) and a lone child out (`run_local`, as a backup's rsync
+    /// runs, a stub ignoring HUP and TERM), [`exit_on_signals`] listening. Each signal ends it
+    /// within the grace and a little, with its status, and nothing of either child is left: no
+    /// process, no scratch directory. (Lane ASK7's latch, never looked at by a stuck loop, ended
+    /// nothing.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hangup_or_a_term_ends_the_dashboard_and_its_ask_at_once() {
+        use arena_core::ask::ai::fixtures::{claude_help, on_path, stub};
+        const ROLE: &str = "ARENA_TEST_TUI_EXIT_DIR";
+        if let Some(dir) = std::env::var_os(ROLE) {
+            // The dashboard's part, in the copy.
+            let dir = PathBuf::from(dir);
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                exit_on_signals();
+                let lone = dir.join("lone");
+                tokio::spawn(async move {
+                    let env = arena_core::ask::AiEnv { path: Some(on_path(&dir.join("bin"))), home: None, tmp: dir.clone(), vars: Vec::new() };
+                    let _ = arena_core::ask::ai::ask(arena_core::ask::Ai::Claude, "is it ok?", None, Duration::from_secs(120), &env).await;
+                });
+                tokio::spawn(async move { arena_core::remote::run_local(lone.to_str().unwrap(), &[], "the rsync", Some(Duration::from_secs(120))).await });
+                // The loop, on a dead terminal: its thread never comes back.
+                std::thread::sleep(Duration::from_secs(60));
+            });
+            std::process::exit(3);
+        }
+        let alive = |pid: &str| std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().next()).is_some_and(|st| st != "Z" && st != "X"));
+        for (sig, code) in [("-HUP", 129), ("-TERM", 143)] {
+            let dir = std::env::temp_dir().join(format!("arena-tui-exit-{}-{code}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let (ai, left, bin, lone) = (dir.join("ai.pid"), dir.join("left.pid"), dir.join("bin"), dir.join("lone.pid"));
+            std::fs::create_dir_all(&bin).unwrap();
+            arena_core::remote::write_test_script(dir.join("lone"), format!("#!/bin/sh\ntrap '' HUP TERM\necho $$ > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nexec sleep 60\n", lone.display())).unwrap();
+            stub(
+                &bin,
+                "claude",
+                &format!(
+                    "if [ \"$1\" = --help ]; then cat <<'EOF'\n{}EOF\nexit 0; fi\n\
+                     trap '' TERM\nsleep 60 &\necho $! > '{}'\necho $$ > '{2}.tmp'\nmv '{2}.tmp' '{2}'\nwait",
+                    claude_help(&[]),
+                    left.display(),
+                    ai.display()
+                ),
+            );
+            let mut tui = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::a_hangup_or_a_term_ends_the_dashboard_and_its_ask_at_once", "--test-threads=1"])
+                .env(ROLE, &dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !(ai.exists() && lone.exists()) {
+                assert!(Instant::now() < deadline, "{sig}: the AI or the rsync never started");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let pids: Vec<String> = [&ai, &left, &lone].iter().map(|p| std::fs::read_to_string(p).unwrap().trim().to_string()).collect();
+            assert!(pids.iter().all(|p| alive(p)), "{sig}: {pids:?}");
+            let scratch = || std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with("arena-ask-")).collect::<Vec<_>>();
+            assert_eq!(scratch().len(), 1, "{sig}: the ask's scratch directory");
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(std::process::Command::new("kill").args([sig, &tui.id().to_string()]).status().unwrap().success());
+            let sent = Instant::now();
+            let status = loop {
+                if let Some(status) = tui.try_wait().unwrap() {
+                    break status;
+                }
+                if sent.elapsed() > arena_core::remote::TERM_GRACE + Duration::from_secs(4) {
+                    let _ = tui.kill();
+                    let _ = tui.wait();
+                    for p in &pids {
+                        let _ = std::process::Command::new("kill").args(["-9", p]).status();
+                    }
+                    panic!("{sig}: the dashboard is still running {:?} after it", sent.elapsed());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(status.code(), Some(code), "{sig}");
+            // KILLed before the exit: gone as soon as the kernel has them exit.
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while pids.iter().any(|p| alive(p)) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            for pid in &pids {
+                assert!(!alive(pid), "{sig}: the child {pid} outlived the dashboard");
+            }
+            let left_behind = scratch();
+            assert!(left_behind.is_empty(), "{sig}: the ask's scratch directory was left: {left_behind:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The dashboard's part in a copy of this test binary on a pty ([`OnPty`]): [`dashboard`] for
+    /// real — its loop on that terminal, its signals and its hangup check — over a fleet of one
+    /// pod (`devtest-alpha`; nothing refreshes it), `ssh` on PATH a stub when the test put one in
+    /// `dir/bin`, and, when the test wrote `dir/lone`, a lone child out first (`run_local`, as an
+    /// action's rsync runs). Its pid in `dir/tui.pid` once that child is up. Exits.
+    #[cfg(target_os = "linux")]
+    fn play_dashboard(dir: &std::path::Path) -> ! {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let lone = dir.join("lone");
+            if lone.exists() {
+                tokio::spawn(async move { arena_core::remote::run_local(lone.to_str().unwrap(), &[], "the rsync", Some(Duration::from_secs(120))).await });
+                while !dir.join("lone.pid").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            std::fs::write(dir.join("tui.pid.tmp"), std::process::id().to_string()).unwrap();
+            std::fs::rename(dir.join("tui.pid.tmp"), dir.join("tui.pid")).unwrap();
+            let shared = Arc::new(Mutex::new(Shared { pods: vec![pod("alpha", "runpod", "rp1", 1, Some(22))], status: "test".into(), ..Default::default() }));
+            let provider: Arc<dyn Provider> = Arc::new(Down);
+            let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+            let res = dashboard(&shared, &provider, &AtomicU64::new(3600), &Notify::new(), &AtomicBool::new(false), ui).await;
+            eprintln!("the dashboard ended: {res:?}");
+        });
+        std::process::exit(3)
+    }
+
+    /// Where a copy playing the dashboard on a pty finds its directory.
+    #[cfg(target_os = "linux")]
+    const ON_PTY: &str = "ARENA_TEST_TUI_PTY_DIR";
+
+    /// crossterm's alternate screen, entered and left.
+    #[cfg(target_os = "linux")]
+    const ENTER: &str = "\x1b[?1049h";
+    #[cfg(target_os = "linux")]
+    const LEAVE: &str = "\x1b[?1049l";
+
+    /// Whether `pid` is a process still running (not a zombie, not gone).
+    #[cfg(target_os = "linux")]
+    fn running(pid: &str) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().next()).is_some_and(|st| st != "Z" && st != "X"))
+    }
+
+    /// The CPU `pid` has used, user and system, in clock ticks (100 a second).
+    #[cfg(target_os = "linux")]
+    fn cpu_ticks(pid: &str) -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let f: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+        Some(f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?)
+    }
+
+    /// What a pty showed: its bytes, and where each read of them ended, with when.
+    #[cfg(target_os = "linux")]
+    type Drawn = (Vec<u8>, Vec<(usize, Instant)>);
+
+    /// A copy of this test binary playing the dashboard ([`play_dashboard`]) on a 40×120 pty of
+    /// its own — lane ASK8's harness (`tests/hangup.rs`), for the copy: `script` holds the pty's
+    /// master, its stdin is the terminal's keyboard and `-e` gives the copy's exit status (the
+    /// copy is the terminal's session leader, exec'd by `script`'s shell). Everything drawn, with
+    /// when each piece of it came. No network: nothing refreshes, every `ssh` is the test's stub.
+    #[cfg(target_os = "linux")]
+    struct OnPty {
+        script: std::process::Child,
+        /// What's been drawn, and where each read of it ended, with when.
+        drawn: Arc<Mutex<Drawn>>,
+        reader: Option<std::thread::JoinHandle<()>>,
+        dir: PathBuf,
+        /// The copy's pid.
+        tui: String,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl OnPty {
+        /// `test`'s copy on its pty, its screen up and `dir`'s children started; `None` without
+        /// util-linux's `script`.
+        fn start(test: &str, dir: &std::path::Path) -> Option<OnPty> {
+            if !std::process::Command::new("sh").args(["-c", "command -v script"]).output().is_ok_and(|o| o.status.success()) {
+                eprintln!("script (util-linux) missing — skipping");
+                return None;
+            }
+            let exe = std::env::current_exe().unwrap();
+            let cmd = format!("stty rows 40 cols 120; exec '{}' --exact 'tests::{test}' --test-threads=1 --nocapture", exe.display());
+            let mut script = std::process::Command::new("script")
+                .args(["-qfec", &cmd, "/dev/null"])
+                .env_clear()
+                .envs([("SHELL", "/bin/sh"), ("TERM", "xterm-256color")])
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.join("bin").display()))
+                .env("HOME", dir)
+                .env(ON_PTY, dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let drawn = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+            let (mut pipe, sink) = (script.stdout.take().unwrap(), drawn.clone());
+            let reader = std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = pipe.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let mut d = sink.lock().unwrap();
+                    d.0.extend_from_slice(&buf[..n]);
+                    let end = d.0.len();
+                    d.1.push((end, Instant::now()));
+                }
+            });
+            let mut on = OnPty { script, drawn, reader: Some(reader), dir: dir.to_path_buf(), tui: String::new() };
+            let pidfile = dir.join("tui.pid");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !(pidfile.exists() && on.find(ENTER, 0).is_some()) {
+                if Instant::now() > deadline || on.script.try_wait().unwrap().is_some() {
+                    let drawn = on.text(0);
+                    on.end();
+                    panic!("{test}: the dashboard never came up: {drawn:?}");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            on.tui = std::fs::read_to_string(&pidfile).unwrap();
+            // Its first rounds drawn.
+            std::thread::sleep(Duration::from_millis(400));
+            Some(on)
+        }
+
+        /// How much has been drawn.
+        fn len(&self) -> usize {
+            self.drawn.lock().unwrap().0.len()
+        }
+
+        /// What's been drawn from `from` on.
+        fn text(&self, from: usize) -> String {
+            String::from_utf8_lossy(&self.drawn.lock().unwrap().0[from..]).into_owned()
+        }
+
+        /// Where `pat` first is at or after `from`, and when what holds its end came.
+        fn find(&self, pat: &str, from: usize) -> Option<(usize, Instant)> {
+            let d = self.drawn.lock().unwrap();
+            let at = from + d.0.get(from..)?.windows(pat.len()).position(|w| w == pat.as_bytes())?;
+            let came = d.1.iter().find(|(end, _)| *end >= at + pat.len())?.1;
+            Some((at, came))
+        }
+
+        /// [`OnPty::find`], waiting up to `within` for it.
+        fn wait_for(&self, pat: &str, from: usize, within: Duration) -> Option<(usize, Instant)> {
+            let deadline = Instant::now() + within;
+            loop {
+                if let Some(found) = self.find(pat, from) {
+                    return Some(found);
+                }
+                if Instant::now() > deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// Keys typed on the terminal.
+        fn keys(&mut self, keys: &str) {
+            use std::io::Write;
+            let stdin = self.script.stdin.as_mut().unwrap();
+            stdin.write_all(keys.as_bytes()).unwrap();
+            stdin.flush().unwrap();
+        }
+
+        /// `sig` (`-HUP`, `-TERM`) to the copy.
+        fn signal(&self, sig: &str) -> Instant {
+            assert!(std::process::Command::new("kill").args([sig, &self.tui]).status().unwrap().success());
+            Instant::now()
+        }
+
+        /// The copy's exit status (`script -e`'s), and when it was seen — `None` if it's still
+        /// running after `within`.
+        fn exited_within(&mut self, within: Duration) -> Option<(std::process::ExitStatus, Instant)> {
+            let deadline = Instant::now() + within;
+            loop {
+                if let Some(status) = self.script.try_wait().unwrap() {
+                    let seen = Instant::now();
+                    // All it drew, to its last byte.
+                    let _ = self.reader.take().map(std::thread::JoinHandle::join);
+                    return Some((status, seen));
+                }
+                if Instant::now() > deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// Whatever is left of it gone: the copy, `script`, every pid the test's stubs wrote.
+        fn end(&mut self) {
+            let pids = std::fs::read_dir(&self.dir).into_iter().flatten().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".pid")).filter_map(|e| std::fs::read_to_string(e.path()).ok());
+            for pid in pids.chain([self.tui.clone()]).filter(|p| !p.trim().is_empty()) {
+                let _ = std::process::Command::new("kill").args(["-9", pid.trim()]).stderr(std::process::Stdio::null()).status();
+            }
+            let _ = self.script.kill();
+            let _ = self.script.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A scratch directory for a pty test, with its `bin` (the copy's PATH first) and, when
+    /// `lone`, a lone child's stub (`lone`: ignores HUP and TERM — only a KILL ends it — its pid
+    /// in `lone.pid`).
+    #[cfg(target_os = "linux")]
+    fn pty_dir(tag: &str, lone: bool) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("arena-tui-pty-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        if lone {
+            let pid = dir.join("lone.pid");
+            arena_core::remote::write_test_script(dir.join("lone"), format!("#!/bin/sh\ntrap '' HUP TERM\necho $$ > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nexec sleep 60\n", pid.display())).unwrap();
+        }
+        dir
+    }
+
+    /// Review ai-review claude #4 (lane ASK9 item 1): a TERM on a live terminal puts it back at
+    /// once — the main screen within a second, not after the grace — and only then stops the
+    /// children: here an action's rsync that ignores TERM, KILLed after the grace, so the exit
+    /// (143) comes no sooner than that, the rsync gone with it. Before, the terminal stayed raw on
+    /// the alternate screen, nothing drawn, for the whole grace. The dashboard for real, in a copy
+    /// on a pty ([`OnPty`]).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_term_puts_a_live_terminal_back_before_the_grace() {
+        if let Some(dir) = std::env::var_os(ON_PTY) {
+            play_dashboard(std::path::Path::new(&dir));
+        }
+        let dir = pty_dir("term", true);
+        let Some(mut on) = OnPty::start("a_term_puts_a_live_terminal_back_before_the_grace", &dir) else { return };
+        let lone = std::fs::read_to_string(dir.join("lone.pid")).unwrap().trim().to_string();
+        let mark = on.len();
+        let sent = on.signal("-TERM");
+        let back = on.wait_for(LEAVE, mark, Duration::from_secs(5));
+        let exited = on.exited_within(arena_core::remote::TERM_GRACE + Duration::from_secs(4));
+        let after = on.text(mark);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while running(&lone) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let lone_ran_on = running(&lone);
+        on.end();
+        let (_, back_at) = back.unwrap_or_else(|| panic!("the terminal wasn't put back: {after:?}"));
+        let (status, exited_at) = exited.expect("the dashboard is still running after the grace and more");
+        assert!(back_at - sent < Duration::from_secs(1), "put back {:?} after the TERM", back_at - sent);
+        assert_eq!(status.code(), Some(143));
+        assert!(exited_at - sent >= arena_core::remote::TERM_GRACE - Duration::from_millis(300), "exited {:?} after the TERM: the rsync wasn't waited for", exited_at - sent);
+        assert!(!lone_ran_on, "the rsync {lone} outlived the dashboard");
+        assert!(!after[after.find(LEAVE).unwrap()..].contains(ENTER), "the terminal was taken again: {after:?}");
+    }
+
+    /// Live ASK5 F1, review ai-review claude #1 (lane ASK9 item 1): its terminal hung up (the pty's
+    /// master closed), the dashboard ends — an action's rsync that ignores HUP and TERM KILLed
+    /// after the grace, gone with it — and meanwhile its loop no longer spins on the dead terminal
+    /// (crossterm retries its empty reads for ever: a core, 70–82 ticks in 0.7 s live): stdin
+    /// parked once the end has begun, the dashboard uses a few ticks over the whole grace. The
+    /// dashboard for real, in a copy on a pty ([`OnPty`]); it leads the terminal's session, so
+    /// the kernel's SIGHUP reaches it too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hung_up_dashboard_stops_its_children_without_spinning() {
+        if let Some(dir) = std::env::var_os(ON_PTY) {
+            play_dashboard(std::path::Path::new(&dir));
+        }
+        let dir = pty_dir("hangup", true);
+        let Some(mut on) = OnPty::start("a_hung_up_dashboard_stops_its_children_without_spinning", &dir) else { return };
+        let lone = std::fs::read_to_string(dir.join("lone.pid")).unwrap().trim().to_string();
+        let tui = on.tui.clone();
+        let before = cpu_ticks(&tui).unwrap();
+        on.script.kill().unwrap();
+        on.script.wait().unwrap();
+        let hung = Instant::now();
+        let mut used = 0;
+        while running(&tui) && hung.elapsed() < arena_core::remote::TERM_GRACE + Duration::from_secs(4) {
+            if let Some(now) = cpu_ticks(&tui) {
+                used = now - before;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (took, still) = (hung.elapsed(), running(&tui));
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while running(&lone) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let lone_ran_on = running(&lone);
+        on.end();
+        assert!(!still, "the dashboard is still running {took:?} after its terminal hung up");
+        assert!(took >= arena_core::remote::TERM_GRACE - Duration::from_millis(300), "gone {took:?} after: the rsync wasn't waited for");
+        assert!(!lone_ran_on, "the rsync {lone} outlived the dashboard");
+        assert!(used < 50, "the dashboard used {used} ticks of CPU in the {took:?} it took to end");
+    }
+
+    /// Review ai-review claude #6 (lane ASK9 item 3): `c` hands the terminal to ssh and takes it
+    /// back — and while ssh has it, the terminal isn't the dashboard's. A first `c`, its ssh
+    /// exiting at once: the dashboard's screen is back (left, then entered again). A second `c`,
+    /// its ssh still running, then a HUP: that ssh is stopped with the other children, the
+    /// dashboard exits 129, and writes nothing to the terminal ssh has — no restore into ssh's
+    /// session, no screen set up again as it goes. The dashboard for real, `ssh` a stub on PATH,
+    /// in a copy on a pty ([`OnPty`]). The second stub ignores HUP: the copy leads the terminal's
+    /// session, so its exit would have the kernel HUP its foreground group, ssh in it — which a
+    /// dashboard under a shell, or ended by a TERM from elsewhere, doesn't get (review claude #1:
+    /// that ssh was left a stopped background job); only the dashboard's own stop may end it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hangup_during_cs_ssh_stops_it_and_leaves_its_terminal_alone() {
+        if let Some(dir) = std::env::var_os(ON_PTY) {
+            play_dashboard(std::path::Path::new(&dir));
+        }
+        let dir = pty_dir("ssh", false);
+        let ssh = |n: u32| dir.join(format!("ssh{n}.pid"));
+        arena_core::remote::write_test_script(
+            dir.join("bin/ssh"),
+            format!(
+                "#!/bin/sh\nn=$(cat '{0}/count' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{0}/count'\n\
+                 echo $$ > '{0}'/ssh$n.pid.tmp; mv '{0}'/ssh$n.pid.tmp '{0}'/ssh$n.pid\n[ $n = 1 ] && exit 0\ntrap '' HUP\nexec sleep 60\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let Some(mut on) = OnPty::start("a_hangup_during_cs_ssh_stops_it_and_leaves_its_terminal_alone", &dir) else { return };
+        let wait_file = |p: &std::path::Path| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !p.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            p.exists()
+        };
+        // `c`, ssh exiting at once: the terminal handed over and taken back.
+        let mark = on.len();
+        on.keys("c");
+        let first = wait_file(&ssh(1));
+        let left = on.wait_for(LEAVE, mark, Duration::from_secs(5));
+        let back = left.and_then(|(at, _)| on.wait_for(ENTER, at, Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(300));
+        // `c` again, ssh staying: a HUP while it has the terminal.
+        let mark = on.len();
+        on.keys("c");
+        let second = wait_file(&ssh(2));
+        let handed = on.wait_for(LEAVE, mark, Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(300));
+        let mark = on.len();
+        let sent = on.signal("-HUP");
+        let exited = on.exited_within(arena_core::remote::TERM_GRACE + Duration::from_secs(4));
+        let after = on.text(mark);
+        let ssh2 = std::fs::read_to_string(ssh(2)).unwrap_or_default().trim().to_string();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while running(&ssh2) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ssh_ran_on = !ssh2.is_empty() && running(&ssh2);
+        let all = on.text(0);
+        on.end();
+        assert!(first && left.is_some() && back.is_some(), "the first `c`: ssh ran {first}, handed over {left:?}, back {back:?}: {all:?}");
+        assert!(second && handed.is_some(), "the second `c`: ssh ran {second}, handed over {handed:?}: {all:?}");
+        let (status, _) = exited.unwrap_or_else(|| panic!("the dashboard is still running {:?} after the HUP", sent.elapsed()));
+        assert_eq!(status.code(), Some(129));
+        assert!(!ssh_ran_on, "ssh {ssh2} outlived the dashboard");
+        assert!(!after.contains("\x1b[?1049") && !after.contains("\x1b[?1000"), "the dashboard wrote to ssh's terminal: {after:?}");
     }
 }

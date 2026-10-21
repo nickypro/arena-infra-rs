@@ -6,13 +6,17 @@
 # text of every changed shell script, all read from git objects (never the working tree, never a
 # file outside the repository) — with every key-like string in it masked first, by the backup's own
 # patterns (arena_core::backup::SECRET_PATTERNS). Both reviewers run with their tools disabled, in an empty
-# directory. Why: this runs on prod's control box, where a reviewer that could run commands could
-# read prod's config or keys; and codex's own sandbox can't run anything here anyway (bubblewrap
-# fails with `loopback: Failed RTM_NEWADDR`), so a review that relied on reading files got nothing.
+# directory, with a minimal environment — as `arena pods ask` runs them (arena_core::ask::ai) — and
+# fail closed: neither is sent anything until it has itself confirmed it knows every switch that
+# takes its tools away. Why: this runs on prod's control box, where a reviewer that could run
+# commands could read prod's config or keys; and codex's own sandbox can't run anything here anyway
+# (bubblewrap fails with `loopback: Failed RTM_NEWADDR`), so a review that relied on reading files
+# got nothing.
 #
-# Exit status: 0 = every reviewer that ran answered (whatever it found); 1 = one failed, timed out
-# or answered nothing, or none could run; 2 = usage, an unknown revision, an empty diff, a
-# changed path that looks like a secret, or key patterns that can't be read (refused, nothing sent).
+# Exit status: 0 = every reviewer that ran answered (whatever it found); 1 = one failed, timed out,
+# answered nothing or couldn't confirm its tools are off, or none could run; 2 = usage, an unknown
+# revision, an empty diff, a changed path that looks like a secret, or key patterns that can't be
+# read (refused, nothing sent).
 set -euo pipefail
 umask 077 # the prompt holds the whole diff: keep the run's folder private
 
@@ -23,16 +27,20 @@ Usage: scripts/ai-review [RANGE | --pr N] [--codex | --claude | --both] [options
 A second-opinion code review of a change by codex and/or Claude Code (both by default, run in
 parallel). The prompt holds everything they see: review instructions, the commits, the diff
 and the full text of every changed *.sh. The diff goes to OpenAI (codex) and/or Anthropic
-(claude), on your own codex/claude logins. The reviewers get no tools. Every key-like string
-in the prompt is masked first (the backup's SECRET_PATTERNS, from crates/core/src/backup.rs at
-HEAD), as REDACTED-...; "masked N key-like strings" says how many.
+(claude), on your own codex/claude logins. The reviewers get no tools, no MCP servers and a
+minimal environment, and codex doesn't read your config.toml; neither is sent anything until it
+confirms it knows every switch that turns its tools off (`codex features list`, `claude --help`),
+and codex until its features list, with those switches, shows nothing else on but features known
+to give it no tool: one that can't is refused. Every key-like string in the prompt is masked first (the backup's
+SECRET_PATTERNS, from crates/core/src/backup.rs at HEAD), as REDACTED-...; "masked N key-like
+strings" says how many.
 
   RANGE             what to review (default origin/master..HEAD; `git fetch` first). A..B and
                     A...B both review the diff from their merge base to B; REV alone = REV..HEAD
   --pr N            review GitHub PR N instead (gh pr diff/view; GH_REPO=owner/name picks the repo)
   --codex, --claude, --both
                     which reviewer(s) to run (default --both)
-  --model-codex M   codex's model (default: codex's own)
+  --model-codex M   codex's model (default: codex's built-in one; its config.toml isn't read)
   --model-claude M  claude's model (default: claude's own)
   --effort LEVEL    reasoning effort for both: low, medium, high (default) or xhigh; `default`
                     leaves each CLI's own (codex's is `none` here: a skim, not a review)
@@ -47,11 +55,50 @@ HEAD), as REDACTED-...; "masked N key-like strings" says how many.
 
 Each run writes <out>/<UTC time>-<range|prN>/: prompt.txt, codex.md, claude.md, and the
 reviewers' stderr in codex.log and claude.log. AI_REVIEW_CODEX / AI_REVIEW_CLAUDE override
-the binaries. Exit status: 0 every reviewer that ran answered; 1 one failed or timed out, or
-none could run; 2 usage, an unknown revision, an empty diff, a secret-looking changed path, or
-key patterns that can't be read from crates/core/src/backup.rs at HEAD.
+the binaries. Exit status: 0 every reviewer that ran answered; 1 one failed, timed out or
+couldn't confirm its tools are off, or none could run; 2 usage, an unknown revision, an empty
+diff, a secret-looking changed path, or key patterns that can't be read from
+crates/core/src/backup.rs at HEAD.
 EOF
 }
+
+# How each reviewer runs, exactly as `arena pods ask` runs it (arena_core::ask::ai's
+# CODEX_TOOL_FEATURES, CLAUDE_NO_TOOL_FLAGS, CLAUDE_NO_MCP, COMMON_VARS and own_vars; a test there
+# holds these lists to those):
+# - codex's features that give it a tool, every one disabled — its `features list` must name each
+#   (a line's first word) before it is sent anything: an unknown name can't be disabled;
+CODEX_TOOL_FEATURES=(shell_tool unified_exec code_mode_host apps plugins remote_plugin browser_use
+  browser_use_external in_app_browser computer_use multi_agent image_generation hooks view_image)
+# - disabled too whenever its `features list` names one (none has to be there), as is any feature
+#   with `web_search` in its name;
+CODEX_OFF_WHEN_LISTED=(sleep_tool skill_search skill_mcp_dependency_install tool_suggest goals
+  in_app_local_automation workspace_dependencies worktrees)
+# - what may stay on, reviewed against codex 0.163's `features list`, each known to give it no tool:
+#   anything else that list shows on, run with the review's own overrides — a tool it has under a
+#   name not listed here, an override it ignored — refuses it;
+CODEX_SAFE_FEATURES=(api_key_cyber_access_programs api_key_model_discovery auth_elicitation
+  enable_request_compression system_proxy_fallback unbounded_connection_retries fast_mode
+  ultrafast_mode cli_daybreak daemon_auto_start compaction_image_budget content_item_kinds
+  instant_interrupt mentions_v2 realtime_conversation in_app_chat in_app_dictation in_app_updates
+  in_app_voice guardian_approval guardian_reuse_parent_compaction unified_exec unified_exec_tty
+  write_stdin_approval shell_snapshot browser_annotation_api browser_use_full_cdp_access
+  code_mode_interrupt plugin_sharing tool_call_mcp_elicitation collaboration_modes item_ids
+  resize_all_images sqlite steer terminal_resize_reflow tool_search_always_defer_mcp_tools
+  tui_app_server)
+# - the stages `features list` prints between a feature's name and its state: every row must be
+#   `<name> <stage> true|false` with one of these (features_ok), or the reviewer is refused;
+CODEX_STAGES=(stable experimental deprecated removed 'under development')
+# - the flags that take claude's tools away — its `--help` must list each (a whole word);
+CLAUDE_NO_TOOL_FLAGS=(--tools --safe-mode --strict-mcp-config --mcp-config --disable-slash-commands
+  --no-session-persistence)
+CLAUDE_NO_MCP='{"mcpServers":{}}'
+# - its environment: PATH and HOME, these, and its own config dir and API key — not the
+#   operator's provider keys, not a variable that could turn a tool back on.
+COMMON_VARS=(USER LOGNAME LANG LC_ALL LC_CTYPE LC_MESSAGES TZ TMPDIR XDG_CONFIG_HOME XDG_DATA_HOME
+  XDG_STATE_HOME XDG_CACHE_HOME XDG_RUNTIME_DIR HTTPS_PROXY https_proxy HTTP_PROXY http_proxy
+  ALL_PROXY all_proxy NO_PROXY no_proxy SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS)
+CLAUDE_VARS=(CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY)
+CODEX_VARS=(CODEX_HOME OPENAI_API_KEY CODEX_API_KEY)
 
 die() { printf 'ai-review: %s\n' "$*" >&2; exit 2; }
 note() { printf 'ai-review: %s\n' "$*" >&2; }
@@ -94,9 +141,19 @@ done
 case $EFFORT in low | medium | high | xhigh | default) ;; *) die "--effort takes low, medium, high, xhigh or default, not '$EFFORT'" ;; esac
 
 # Which reviewers can run: a missing one is skipped with a message, before anything is built.
+# The path is made absolute: the reviewer runs in an empty directory, started by `env -i`, which
+# would read a path holding a `=` as a variable — such a path isn't used.
 find_bin() { # <override> <name>
-  if [ -n "$1" ]; then [ -x "$1" ] && echo "$1"; return; fi
-  command -v "$2" 2>/dev/null || { [ -x "$HOME/.local/bin/$2" ] && echo "$HOME/.local/bin/$2"; }
+  local p
+  if [ -n "$1" ]; then
+    p=$1
+    [ -x "$p" ] || return 0
+  else
+    p=$(command -v "$2" 2>/dev/null) || { [ -x "$HOME/.local/bin/$2" ] && p=$HOME/.local/bin/$2; } || return 0
+  fi
+  case $p in /*) ;; *) p=$PWD/$p ;; esac
+  case $p in *=*) note "$2: '$p' has a '=' in its path: not used"; return 0 ;; esac
+  echo "$p"
 }
 CODEX=$(find_bin "${AI_REVIEW_CODEX:-}" codex || true)
 CLAUDE=$(find_bin "${AI_REVIEW_CLAUDE:-}" claude || true)
@@ -414,17 +471,32 @@ fi
 mkdir "$WORK/empty" # the reviewers' working directory: nothing to read, no CLAUDE.md/AGENTS.md
 
 codex_args() {
-  # read-only and ephemeral (no session saved), and every tool surface this codex knows of
-  # turned off: shell, code mode (its file tools), apps/connectors, plugins, browser, web search,
-  # sub-agents, image generation, hooks. Only features it lists are named: an unknown one is an error.
-  local known f
-  known=$("$CODEX" features list 2>/dev/null | awk '{ print $1 }') || known=''
-  printf '%s\0' exec -s read-only --skip-git-repo-check --ephemeral --color never \
-    -C "$WORK/empty" -o "$DIR/codex.md" -c 'web_search="disabled"'
-  for f in shell_tool unified_exec code_mode_host apps plugins remote_plugin browser_use \
-    browser_use_external in_app_browser computer_use multi_agent image_generation hooks; do
-    if grep -qx "$f" <<<"$known"; then printf '%s\0' --disable "$f"; fi
+  # read-only and ephemeral (no session saved); without the operator's config.toml (its MCP
+  # servers, hooks, profiles, notify program: --ignore-user-config; auth still comes from
+  # CODEX_HOME) or execpolicy rules, and mcp_servers emptied besides (a system or managed config
+  # layer is still read); web search off and every feature tools_off chose disabled
+  # ($WORK/codex.disable: every one of CODEX_TOOL_FEATURES, always — it runs only once its
+  # `features list` has named each and shown nothing else on — then the web search ones and those
+  # of CODEX_OFF_WHEN_LISTED it lists). Fails closed (review ai-review claude #9): with that file
+  # missing, or lacking any of CODEX_TOOL_FEATURES, it prints why on stderr, writes no argv and
+  # fails — `mapfile` of a missing or cut file gave no --disable at all, every tool feature on.
+  local f
+  local -a disable=() missing=()
+  if [ ! -r "$WORK/codex.disable" ]; then
+    echo "its --disable list (codex.disable) is missing" >&2
+    return 1
+  fi
+  mapfile -t disable <"$WORK/codex.disable"
+  for f in "${CODEX_TOOL_FEATURES[@]}"; do
+    case " ${disable[*]} " in *" $f "*) ;; *) missing+=("$f") ;; esac
   done
+  if [ ${#missing[@]} -gt 0 ]; then
+    echo "its --disable list (codex.disable) lacks $(IFS=,; echo "${missing[*]}" | sed 's/,/, /g')" >&2
+    return 1
+  fi
+  printf '%s\0' exec -s read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules \
+    --color never -C "$WORK/empty" -o "$DIR/codex.md" -c 'web_search="disabled"' -c 'mcp_servers={}'
+  for f in "${disable[@]}"; do printf '%s\0' --disable "$f"; done
   [ -z "$MODEL_CODEX" ] || printf '%s\0' -m "$MODEL_CODEX"
   [ "$EFFORT" = default ] || printf '%s\0' -c "model_reasoning_effort=\"$EFFORT\""
   printf '%s\0' -
@@ -432,26 +504,148 @@ codex_args() {
 
 claude_args() {
   # --tools '': no built-in tools; --safe-mode: no hooks, MCP servers, CLAUDE.md or skills;
-  # --strict-mcp-config: no MCP servers from anywhere; no saved session.
-  printf '%s\0' -p --safe-mode --tools '' --strict-mcp-config --disable-slash-commands \
-    --no-session-persistence --output-format text
+  # --strict-mcp-config with an empty --mcp-config: no MCP servers from anywhere; no slash
+  # commands, no saved session.
+  printf '%s\0' -p --safe-mode --tools '' --strict-mcp-config --mcp-config "$CLAUDE_NO_MCP" \
+    --disable-slash-commands --no-session-persistence --output-format text
   [ -z "$MODEL_CLAUDE" ] || printf '%s\0' --model "$MODEL_CLAUDE"
   [ "$EFFORT" = default ] || printf '%s\0' --effort "$EFFORT"
 }
 
+child_env() { # <reviewer>: NAME=value\0 for each variable its process gets (env -i: nothing else)
+  local v
+  local -a own
+  if [ "$1" = codex ]; then own=("${CODEX_VARS[@]}"); else own=("${CLAUDE_VARS[@]}"); fi
+  for v in PATH HOME "${COMMON_VARS[@]}" "${own[@]}"; do
+    [ -z "${!v+set}" ] || printf '%s=%s\0' "$v" "${!v}"
+  done
+}
+
+# One run of a reviewer's self-description (`claude --help`, `codex features list` and then
+# <args...>), as the review runs (the empty directory, the minimal environment), within 20 s (at
+# most --timeout): its stdout in $WORK/<reviewer>.check. codex's gets an empty CODEX_HOME of its own
+# ($WORK/codex-home; env takes the last value given): `features list` has no --ignore-user-config,
+# and the config.toml the review doesn't read mustn't show a feature off that the review then has
+# on. Status 0 when it ran; else it prints why not.
+describe() { # <reviewer> <args...>
+  local r=$1 bin limit rc=0 err what
+  local -a envs args
+  shift
+  args=("$@")
+  mapfile -d '' -t envs < <(child_env "$r")
+  if [ "$r" = codex ]; then
+    bin=$CODEX what='codex features list'
+    mkdir -p "$WORK/codex-home"
+    envs+=("CODEX_HOME=$WORK/codex-home")
+  else
+    bin=$CLAUDE what='claude --help'
+  fi
+  limit=$((TIMEOUT < 20 ? TIMEOUT : 20))
+  (cd "$WORK/empty" && exec timeout -k 5 "$limit" env -i "${envs[@]}" "$bin" "${args[@]}") \
+    </dev/null >"$WORK/$r.check" 2>"$WORK/$r.check.err" || rc=$?
+  if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+    echo "\`$what\` didn't answer within ${limit}s"
+    return 1
+  elif [ "$rc" != 0 ]; then
+    err=$(grep '[^[:space:]]' "$WORK/$r.check.err" | tail -n 1 | LC_ALL=C tr -cd '[:print:]' | cut -c1-200) || true
+    echo "\`$what\` failed (exit $rc): ${err:-(no output)}"
+    return 1
+  fi
+}
+
+# A `features list` (in <listing>) read strictly, as arena_core::ask::ai::parse_features reads one
+# (review ai-review codex #3, claude #1): every non-blank row `<name> <stage> true|false` — a name
+# of [a-z0-9_.-], one of CODEX_STAGES, the state exactly true or false — no name twice, something
+# listed, and every one of <required...> named. Reading `enabled`, a header or a column more as
+# "off" is how a changed format could pass a new tool as off: anything else prints why and fails.
+FEATURES_AWK='
+  function bad(why) { printf "has a row that can\047t be read: `%s` — %s\n", row, why; failed = 1; exit 1 }
+  NF == 0 { next }
+  {
+    row = $1; for (i = 2; i <= NF; i++) row = row " " $i
+    if (length(row) > 80) row = substr(row, 1, 79) "…"
+    if (NF < 3) bad("it isn\047t `<name> <stage> true|false`")
+    if ($NF != "true" && $NF != "false") bad("its state `" $NF "` isn\047t true or false")
+    stage = $2; for (i = 3; i < NF; i++) stage = stage " " $i
+    if (index(stages, "|" stage "|") == 0) bad("`" stage "` isn\047t a stage it\047s known to print")
+    if ($1 !~ /^[a-z0-9_.-]+$/) bad("`" $1 "` isn\047t a feature\047s name")
+    if ($1 in seen) { printf "names %s twice\n", $1; failed = 1; exit 1 }
+    seen[$1] = 1; n++
+  }
+  END { if (failed) exit 1; if (n == 0) { print "listed nothing"; exit 1 } }'
+features_ok() { # <listing> <required...>
+  local file=$1 f stages
+  local -a missing=()
+  shift
+  stages="|$(IFS='|'; echo "${CODEX_STAGES[*]}")|"
+  LC_ALL=C awk -v stages="$stages" "$FEATURES_AWK" "$file" || return 1
+  for f in "$@"; do awk -v f="$f" '$1 == f { found = 1 } END { exit !found }' "$file" || missing+=("$f"); done
+  [ ${#missing[@]} -eq 0 ] && return 0
+  echo "doesn't name $(IFS=,; echo "${missing[*]}" | sed 's/,/, /g')"
+  return 1
+}
+
+# Fail closed: a reviewer is sent nothing until it has confirmed it knows every switch its argv
+# takes its tools away with — claude's `--help` lists each of CLAUDE_NO_TOOL_FLAGS, codex's
+# `features list` reads whole and names each of CODEX_TOOL_FEATURES (features_ok) — and, for codex,
+# that nothing else stays on: its `features list` run again with the review's own overrides (every
+# one of CODEX_TOOL_FEATURES, then each web search one and each of CODEX_OFF_WHEN_LISTED it lists,
+# disabled: written to $WORK/codex.disable for codex_args) must read whole too, name each of
+# those, and show on only CODEX_SAFE_FEATURES. A check that fails, times out, can't be read, or
+# finds a switch missing or one more feature on refuses that reviewer. Status 0, printing
+# nothing, only when confirmed; else it prints why not.
+tools_off() { # <reviewer>
+  local r=$1 f why
+  local -a missing=() on=() disable args
+  if [ "$r" = claude ]; then
+    describe claude --help || return 1
+    tr -s ' \t,' '\n' <"$WORK/claude.check" >"$WORK/claude.known"
+    for f in "${CLAUDE_NO_TOOL_FLAGS[@]}"; do grep -qxF -- "$f" "$WORK/claude.known" || missing+=("$f"); done
+    [ ${#missing[@]} -eq 0 ] && return 0
+    echo "\`claude --help\` doesn't list $(IFS=,; echo "${missing[*]}" | sed 's/,/, /g')"
+    return 1
+  fi
+  describe codex features list -c 'web_search="disabled"' -c 'mcp_servers={}' || return 1
+  why=$(features_ok "$WORK/codex.check" "${CODEX_TOOL_FEATURES[@]}") || { echo "\`codex features list\` $why"; return 1; }
+  awk '{ print $1 }' "$WORK/codex.check" >"$WORK/codex.known"
+  {
+    printf '%s\n' "${CODEX_TOOL_FEATURES[@]}"
+    while read -r f; do
+      case " ${CODEX_TOOL_FEATURES[*]} " in *" $f "*) continue ;; esac
+      case " ${CODEX_OFF_WHEN_LISTED[*]} " in *" $f "*) echo "$f" && continue ;; esac
+      case $f in *web_search*) echo "$f" ;; esac
+    done <"$WORK/codex.known"
+  } >"$WORK/codex.disable"
+  mapfile -t disable <"$WORK/codex.disable"
+  args=(features list -c 'web_search="disabled"' -c 'mcp_servers={}')
+  for f in "${disable[@]}"; do args+=(--disable "$f"); done
+  describe codex "${args[@]}" || return 1
+  why=$(features_ok "$WORK/codex.check" "${disable[@]}") || {
+    echo "\`codex features list\` with the review's overrides $why"
+    return 1
+  }
+  while read -r f; do
+    case " ${CODEX_SAFE_FEATURES[*]} " in *" $f "*) ;; *) on+=("$f") ;; esac
+  done < <(awk '$NF == "true" { print $1 }' "$WORK/codex.check")
+  [ ${#on[@]} -eq 0 ] && return 0
+  echo "\`codex features list\` shows $(IFS=,; echo "${on[*]}" | sed 's/,/, /g') on with the review's overrides — not known to give it no tool"
+  return 1
+}
+
 start() { # <reviewer>: runs it in the background; leaves "<exit> <seconds>" in $WORK/<r>.status
   local r=$1 bin out
-  local -a args
+  local -a args envs
   if [ "$r" = codex ]; then
     bin=$CODEX out=/dev/null # codex writes its answer itself (-o); its stdout repeats it
-    mapfile -d '' -t args < <(codex_args)
+    mapfile -d '' -t args <"$WORK/codex.argv" # codex_args', written once it succeeded
   else
     bin=$CLAUDE out="$DIR/claude.md"
     mapfile -d '' -t args < <(claude_args)
   fi
+  mapfile -d '' -t envs < <(child_env "$r")
   (
     t0=$(date +%s)
-    (cd "$WORK/empty" && exec timeout -k 30 "$TIMEOUT" "$bin" "${args[@]}") \
+    (cd "$WORK/empty" && exec timeout -k 30 "$TIMEOUT" env -i "${envs[@]}" "$bin" "${args[@]}") \
       <"$DIR/prompt.txt" >"$out" 2>"$DIR/$r.log" &
     echo $! >"$WORK/$r.pid"
     if wait $!; then rc=0; else rc=$?; fi
@@ -460,9 +654,26 @@ start() { # <reviewer>: runs it in the background; leaves "<exit> <seconds>" in 
   JOB_PIDS+=("$!")
 }
 
-note "running $WHO$([ ${#RUN[@]} -eq 1 ] || echo ' in parallel') (effort $EFFORT, timeout ${TIMEOUT}s each)..."
-for r in "${RUN[@]}"; do start "$r"; done
-wait "${JOB_PIDS[@]}" || true
+# A reviewer is started only once its check passed — and, for codex, its argv was built whole
+# (codex_args fails without a whole --disable list: its exit status is looked at here, never lost
+# in a process substitution).
+SEND=()
+for r in "${RUN[@]}"; do
+  if why=$(tools_off "$r") && { [ "$r" != codex ] || why=$(codex_args 2>&1 >"$WORK/codex.argv"); }; then
+    SEND+=("$r")
+  else
+    why="couldn't confirm its tools are off — not asked ($why)"
+    note "$r: $why"
+    printf '%s\n' "$why" >"$WORK/$r.refused"
+    printf '%s\n' "$why" >"$DIR/$r.log"
+  fi
+done
+if [ ${#SEND[@]} -gt 0 ]; then
+  case ${#SEND[@]} in 1) WHO=${SEND[0]} ;; *) WHO="${SEND[0]} and ${SEND[1]}" ;; esac
+  note "running $WHO$([ ${#SEND[@]} -eq 1 ] || echo ' in parallel') (effort $EFFORT, timeout ${TIMEOUT}s each)..."
+  for r in "${SEND[@]}"; do start "$r"; done
+  wait "${JOB_PIDS[@]}" || true
+fi
 
 # --- report ------------------------------------------------------------------------------------
 # codex's stderr starts by echoing the whole prompt back: cut that out of codex.log, so a run
@@ -480,10 +691,15 @@ trim_echo() { # <log>
 FAILED=0
 printf '\nai-review %s\n  prompt  %s (%s bytes)\n' "$WHAT" "$DIR/prompt.txt" "$PROMPT_BYTES"
 for r in "${RUN[@]}"; do
+  md="$DIR/$r.md"
+  if [ -e "$WORK/$r.refused" ]; then # never started: nothing sent
+    printf '  %-7s refused: %s\n' "$r" "$(cat "$WORK/$r.refused")"
+    FAILED=1
+    continue
+  fi
   read -r rc secs 2>/dev/null <"$WORK/$r.status" || { rc=255 secs=0; }
   if [ "$r" = codex ]; then trim_echo "$DIR/codex.log"; fi
   took="$((secs / 60))m$((secs % 60))s"
-  md="$DIR/$r.md"
   if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
     status="TIMED OUT after $took"
   elif [ "$rc" != 0 ]; then
