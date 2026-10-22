@@ -1210,7 +1210,7 @@ another prefix's pod — a staff box may be running someone's job — with one `
 pods …` line for the rest; `--include-non-cohort` checks every pod, and a named staff box is
 checked. Two pods sharing a name each get their own row (with a warning naming their ids).
 
-Every morning on cron: `arena cron install --health 07:30` (this box's time zone; log
+Every morning on cron: `arena cron install --health 07:20` (this box's time zone; log
 `~/.local/state/arena-cron/health.log`; see
 [`cron`](BACKUPS.md#cron-the-lines-that-run-it-all)).
 

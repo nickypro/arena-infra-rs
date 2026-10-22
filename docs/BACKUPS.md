@@ -847,14 +847,22 @@ and `install` adds/replaces **only the lines its flags name**, keeping the rest 
   --tier snap` at :07/:22/:37/:52, `--tier big` at :40, under `nice`, log `archive.log`, each tier
   locked in-process; refused without this user's archive state, an absolute `LOCAL_BACKUP_DIR` or a
   start date);
-- `--health HH:MM` = a daily `pods test --deep` at that time (`07:30`; `7:5` or `25:00` are refused)
-  in **this box's time zone**, as cron reads it — `install` and `show` name the zone. Log
-  `health.log`; `flock -n -o`; read-only, so no `--yes`. It checks **this cohort's pods only**,
-  never a staff box (a fleet-wide deep check's default), and carries `ARENA_STATE_DIR` as the
-  archive's lines do, so its verdicts reach the dashboard's HEALTH column and `snapshot` (re-run
-  `install --health` after changing `ARENA_STATE_DIR`). It exits non-zero when a pod FAILs; the
-  log has the table, ending `N pass, N warn, N fail`. The reaper's line is
-  [`--reap observe|apply`](#pods-reap).
+- `--health HH:MM` = a daily `pods test --deep` at that time (`07:20`; `7:5` or `25:00` are refused)
+  in **this box's time zone**, as cron reads it — `install` and `show` name the zone (and a
+  `CRON_TZ=`/`TZ=` the crontab sets, which some crons use instead). Log `health.log`; `flock -n -o`;
+  read-only, so no `--yes`. It checks **this cohort's pods only**, never a staff box (a fleet-wide
+  deep check's default), and carries `ARENA_STATE_DIR` as the archive's lines do, so its verdicts
+  reach the dashboard's HEALTH column and `snapshot` (re-run `install --health` after changing
+  `ARENA_STATE_DIR`). It exits non-zero when a pod FAILs; the log has the table, ending `N pass, N
+  warn, N fail`.
+  - **Pick a minute no other line uses** — off the backup's quarter-hours, the archive's
+    :07/:22/:37/:52 and :40, and above all the reaper's :11/:27/:41/:57 (`install` warns): the
+    reaper doesn't see the check otherwise (measured: no file in the home changes after a pod's
+    first CUDA use, and its CPU and 32 MiB download stay under the reaper's thresholds), but a
+    check during its look reads as use — every day, so an idle pod would never be reaped.
+  - It runs on pods in use: a participant's job holding all of a GPU's memory can make that pod
+    FAIL. Read the row's reason before `pods replace`.
+  - The reaper's line is [`--reap observe|apply`](#pods-reap).
 
 ### Locks and logs
 
@@ -912,7 +920,7 @@ so arena never ran; `&`, `;`, `$` or a backtick would run something else). Use a
 `remove --backup|--proxy|--snapshot|--archive|--reap|--health` drops just those; plain `remove`
 drops the whole block. Both print the block's before → after diff (every removed copy of a
 duplicate shown) and confirm (`--yes` for scripts, `--dry-run` to preview); `show` labels each line
-with its identity, and says when the health line runs (`↳ daily at 07:30, this box's time zone (BST
+with its identity, and says when the health line runs (`↳ daily at 07:20, this box's time zone (BST
 +0100)`).
 
 Lines written by older versions are recognized by the command they run; comments in the block (a

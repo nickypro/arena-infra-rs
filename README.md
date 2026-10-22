@@ -82,7 +82,7 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 | **Setup** (drop `--no-setup`) | Each pod gets the deploy key, the cohort repo, tokens and the VS Code warm-up | `ARENA_REPO_OWNER`, `ARENA_REPO_NAME`, `GIT_SSH_KEY_LOCAL` |
 | **Day branches** | Each pod's work on its own `autocommit-<prefix>-w1d2-<machine>` branch | `ARENA_START_DATE` |
 | **Backups on cron** | A git push and an rsync copy of every pod, every 15 minutes | `LOCAL_BACKUP_DIR` |
-| **Morning health check on cron** | `pods test --deep` on every cohort pod each morning (`arena cron install --health 07:30`): a pass / warn / fail row per pod, and the dashboard's HEALTH column | |
+| **Morning health check on cron** | `pods test --deep` on every cohort pod each morning (`arena cron install --health 07:20`): a pass / warn / fail row per pod, and the dashboard's HEALTH column | |
 
 <details>
 <summary>Every organiser command at a glance</summary>
@@ -103,7 +103,7 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 | `arena proxy apply` | Write the proxy forwards and reload nginx |
 | `arena ssh-config --proxy` | Print the participants' `~/.ssh/config` |
 | `arena cron install --pull --proxy` | Backups every 15 min (git + rsync), proxy re-sync every 5 |
-| `arena cron install --health 07:30` | A deep check of every cohort pod each morning, in this box's time zone |
+| `arena cron install --health 07:20` | A deep check of every cohort pod each morning, in this box's time zone |
 | `arena pods restore apple` | Push a backup back onto one pod (never deletes) |
 | `arena pods replace apple` | Move a pod to a fresh host, keeping its name and files |
 | `arena pods run -t apple 'nvidia-smi'` | Run a command on pods (all of them without `-t`) |
@@ -201,7 +201,7 @@ arena cron show
 
 Add `--archive` for the [backup archive](docs/BACKUPS.md#backup-archive-arena-archive) (a second
 copy participants can read; `arena archive up` first), `--snapshot DIR` for the
-[public fleet page](docs/REFERENCE.md#publishing-the-fleet-page), `--health 07:30` for a
+[public fleet page](docs/REFERENCE.md#publishing-the-fleet-page), `--health 07:20` for a
 [morning deep check](docs/BACKUPS.md#cron-the-lines-that-run-it-all) of every cohort pod.
 
 ## A cohort day
@@ -215,7 +215,7 @@ flowchart LR
 ```
 
 1. **Morning check.** `arena pods list` (cost, balance, maintenance windows), then
-   `arena pods test --deep` (or read what `cron install --health 07:30` found in
+   `arena pods test --deep` (or read what `cron install --health 07:20` found in
    `~/.local/state/arena-cron/health.log`): a `FAIL` on the host means `arena pods replace <pod>`.
 2. **The day's branches.** `arena pods set-branch main --all --init-branches` backs each pod up,
    switches it to `main` and creates today's `autocommit-<prefix>-w1d2-<machine>` branch. Until

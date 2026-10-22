@@ -3724,7 +3724,7 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
                     println!("[{}] {l}", kind.map_or("other", CronKind::label));
                     // The health line's time is cron's, this box's zone: said, not left to guess.
                     if let Some(at) = HealthAt::of_line(l).filter(|_| kind == Some(CronKind::Health)) {
-                        println!("  ↳ {}", health_when(at, box_zone().as_deref()));
+                        println!("  ↳ {}", health_when(at, box_zone().as_deref(), cron_tz(&current)));
                     }
                 }
             }
@@ -3893,7 +3893,8 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
                 );
             }
             if let Some(at) = health {
-                notes.push(format!("note: the health check runs {}", health_when(at, box_zone().as_deref())));
+                notes.push(format!("note: the health check runs {}", health_when(at, box_zone().as_deref(), cron_tz(&current))));
+                notes.extend(health_minute_warning(at));
             }
             if apply_cron_change(&current, &before, &after, &notes, dry_run, yes, crontab).await? {
                 // Only once it's written: until then, the old lines still use their old files.
@@ -4855,13 +4856,49 @@ fn health_cron_line(at: HealthAt, exe: &str, config: &str, home: &str, state_roo
     )
 }
 
-/// How a health line's time reads (`cron install`'s note, `cron show`): `daily at 07:30, this
-/// box's time zone (BST +0100)`, the zone as [`box_zone`] read it. Pure.
-fn health_when(at: HealthAt, zone: Option<&str>) -> String {
-    match zone {
+/// How a health line's time reads (`cron install`'s note, `cron show`): `daily at 07:20, this
+/// box's time zone (BST +0100)`, the zone as [`box_zone`] read it — and, when the crontab sets a
+/// zone of its own (`set`: [`cron_tz`]), that a cron honouring it runs the line there instead
+/// (cronie reads `CRON_TZ`; Debian's cron doesn't), so the time said is never silently wrong. Pure.
+fn health_when(at: HealthAt, zone: Option<&str>, set: Option<(&str, &str)>) -> String {
+    let mut out = match zone {
         Some(z) => format!("daily at {at}, this box's time zone ({z})"),
         None => format!("daily at {at}, this box's time zone"),
+    };
+    if let Some((name, value)) = set {
+        out.push_str(&format!(" — this crontab sets {name}={value}: a cron that reads it runs the line at {at} there instead"));
     }
+    out
+}
+
+/// The warning for a health line on one of the reaper's minutes
+/// ([`arena_core::reap::render::CRON_SCHEDULE`]): its look then lands during the deep check every
+/// day, and its window checks (CPU, network, GPU) read the check as use — measured live, the check
+/// is otherwise invisible to it (no file in the home changes after a pod's first CUDA use, and its
+/// CPU and download stay under the cumulative thresholds). A pod idle for a day or more would
+/// then never be reaped. `None` on any other minute. Pure.
+fn health_minute_warning(at: HealthAt) -> Option<String> {
+    let reap = arena_core::reap::render::CRON_SCHEDULE.split(' ').next().unwrap_or_default();
+    let minutes: Vec<u32> = reap.split(',').filter_map(|m| m.parse().ok()).collect();
+    minutes.contains(&at.minute).then(|| {
+        let shown = minutes.iter().map(|m| format!(":{m:02}")).collect::<Vec<_>>().join("/");
+        format!(
+            "warning: the reaper looks at {shown}: a deep check at :{:02} reads as use to it every day, so a pod idle for a \
+             day or more is never reaped — pick another minute",
+            at.minute
+        )
+    })
+}
+
+/// The time zone a crontab sets for its lines, if any: its last `CRON_TZ=` or `TZ=` setting (a
+/// line of its own, not a comment, not inside a job's command), quotes dropped. Pure.
+fn cron_tz(crontab: &str) -> Option<(&'static str, &str)> {
+    crontab.lines().rev().find_map(|l| {
+        let (name, value) = l.trim_start().split_once('=')?;
+        let name = ["CRON_TZ", "TZ"].into_iter().find(|n| *n == name.trim_end())?;
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        (!value.is_empty() && !value.contains(char::is_whitespace)).then_some((name, value))
+    })
 }
 
 /// This box's time zone as cron reads it — the system's, so `date` without this shell's `TZ` —
@@ -18451,8 +18488,22 @@ ASK_AI=gpt
         assert_eq!(CronKind::of(&line), Some(CronKind::Health));
         assert!(!line.contains("--yes"), "read-only: {line}");
         assert_eq!(HealthAt::of_line(&line), Some(at));
-        assert_eq!(health_when(at, Some("BST +0100")), "daily at 07:05, this box's time zone (BST +0100)");
-        assert_eq!(health_when(at, None), "daily at 07:05, this box's time zone");
+        assert_eq!(health_when(at, Some("BST +0100"), None), "daily at 07:05, this box's time zone (BST +0100)");
+        assert_eq!(health_when(at, None, None), "daily at 07:05, this box's time zone");
+        // A zone the crontab sets is said beside the box's (review ai-review codex #1, claude #7).
+        assert_eq!(
+            health_when(at, Some("BST +0100"), Some(("CRON_TZ", "UTC"))),
+            "daily at 07:05, this box's time zone (BST +0100) — this crontab sets CRON_TZ=UTC: a cron that reads it runs \
+             the line at 07:05 there instead"
+        );
+        // On one of the reaper's minutes, a warning (review ai-review claude #1, measured live).
+        for minute in [11, 27, 41, 57] {
+            let w = super::health_minute_warning(HealthAt { hour: 7, minute }).unwrap_or_default();
+            assert!(w.starts_with("warning: the reaper looks at :11/:27/:41/:57: a deep check at :") && w.contains(&format!(":{minute:02} reads")), "{w}");
+        }
+        for minute in [0, 5, 20, 30, 59] {
+            assert_eq!(super::health_minute_warning(HealthAt { hour: 7, minute }), None, ":{minute}");
+        }
         // A kept log stays where it is, its folder recreated first.
         let kept = health_cron_line(at, "/opt/arena", "/c", "/home/u", "/s", Some("/home/u/logs/health.log"));
         assert!(kept.starts_with("5 7 * * * mkdir -p /home/u/.local/state/arena-cron /home/u/logs && ARENA_STATE_DIR=/s "), "{kept}");
@@ -18462,6 +18513,28 @@ ASK_AI=gpt
             assert_eq!(HealthAt::of_line(l), None, "{l}");
         }
         assert_eq!(HealthAt::of_line("05 7 * * * a pods test --deep"), Some(at));
+    }
+
+    /// The zone a crontab sets for its lines (`CRON_TZ=`/`TZ=` on a line of its own), for the
+    /// health line's time: the last one wins; comments, a job's inline env and a value with a
+    /// space aren't one.
+    #[test]
+    fn cron_tz_reads_the_crontabs_own_zone_setting() {
+        use super::cron_tz;
+        let cases: &[(&str, Option<(&str, &str)>)] = &[
+            ("CRON_TZ=Europe/London\n0 3 * * * x\n", Some(("CRON_TZ", "Europe/London"))),
+            ("  TZ = UTC\n", Some(("TZ", "UTC"))),
+            ("CRON_TZ=\"America/New_York\"\nTZ='Asia/Tokyo'\n", Some(("TZ", "Asia/Tokyo"))),
+            ("# CRON_TZ=Europe/London\n", None),
+            ("0 3 * * * CRON_TZ=UTC /opt/arena pods backup\n", None),
+            ("MAILTO=ops@example.org\nPATH=/usr/bin\n", None),
+            ("CRON_TZ=\n", None),
+            ("CRON_TZ=Europe/London with words\n", None),
+            ("", None),
+        ];
+        for (tab, want) in cases {
+            assert_eq!(cron_tz(tab), *want, "{tab:?}");
+        }
     }
 
     /// `--health` takes `HH:MM` (or `H:MM`) in this box's time zone: an hour 0–23 and two-digit
