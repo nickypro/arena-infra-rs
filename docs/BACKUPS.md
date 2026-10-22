@@ -826,9 +826,9 @@ findings #5–#7, #13, #16, #17, #19, #20, #26–#30):
 ## `cron`: the lines that run it all
 
 `cron install|remove|show` — manage arena's lines in your crontab (other entries are never touched).
-Each line has an identity — **backup**, **proxy**, **snapshot** — and `install` adds/replaces **only
-the lines its flags name**, keeping the rest (a later `install --proxy` no longer drops an earlier
-`--pull`/`--start-date`/`--snapshot`):
+Each line has an identity — **backup**, **proxy**, **snapshot**, **archive**, **reap**, **health** —
+and `install` adds/replaces **only the lines its flags name**, keeping the rest (a later `install
+--proxy` no longer drops an earlier `--pull`/`--start-date`/`--snapshot`/`--health`):
 
 - `--backup` = `pods backup` every 15 min (`--schedule`), git-only unless `--pull` (git + rsync file
   backup each tick), `--start-date` bakes `ARENA_START_DATE` in — those three (and `--no-pull`,
@@ -846,7 +846,15 @@ the lines its flags name**, keeping the rest (a later `install --proxy` no longe
 - `--archive` = the [backup archive](#backup-archive-arena-archive)'s two push lines (`archive sync
   --tier snap` at :07/:22/:37/:52, `--tier big` at :40, under `nice`, log `archive.log`, each tier
   locked in-process; refused without this user's archive state, an absolute `LOCAL_BACKUP_DIR` or a
-  start date).
+  start date);
+- `--health HH:MM` = a daily `pods test --deep` at that time (`07:30`; `7:5` or `25:00` are refused)
+  in **this box's time zone**, as cron reads it — `install` and `show` name the zone. Log
+  `health.log`; `flock -n -o`; read-only, so no `--yes`. It checks **this cohort's pods only**,
+  never a staff box (a fleet-wide deep check's default), and carries `ARENA_STATE_DIR` as the
+  archive's lines do, so its verdicts reach the dashboard's HEALTH column and `snapshot` (re-run
+  `install --health` after changing `ARENA_STATE_DIR`). It exits non-zero when a pod FAILs; the
+  log has the table, ending `N pass, N warn, N fail`. The reaper's line is
+  [`--reap observe|apply`](#pods-reap).
 
 ### Locks and logs
 
@@ -855,8 +863,8 @@ stacking — the backup's lock is `backup.lock`, held by `flock -o` itself so no
 it).
 
 **Locks live in `~/.local/state/arena-cron/`** (`backup.lock`, `proxy.lock`, …), **and so do the
-logs by default** (`backup.log`, `proxy.log`, `snapshot.log`, `archive.log`, `reap.log`), so nothing
-new appears in your home.
+logs by default** (`backup.log`, `proxy.log`, `snapshot.log`, `archive.log`, `reap.log`,
+`health.log`), so nothing new appears in your home.
 
 **A line that already logs somewhere else keeps doing so**: a re-install keeps the installed line's
 `>> PATH` (say `/root/logs/cron/arena-cron.log`, a folder logrotate rotates; `>>PATH`, with or
@@ -901,9 +909,11 @@ so arena never ran; `&`, `;`, `$` or a backtick would run something else). Use a
 
 ### `cron remove` and `cron show`
 
-`remove --backup|--proxy|--snapshot` drops just those; plain `remove` drops the whole block. Both
-print the block's before → after diff (every removed copy of a duplicate shown) and confirm (`--yes`
-for scripts, `--dry-run` to preview); `show` labels each line with its identity.
+`remove --backup|--proxy|--snapshot|--archive|--reap|--health` drops just those; plain `remove`
+drops the whole block. Both print the block's before → after diff (every removed copy of a
+duplicate shown) and confirm (`--yes` for scripts, `--dry-run` to preview); `show` labels each line
+with its identity, and says when the health line runs (`↳ daily at 07:30, this box's time zone (BST
++0100)`).
 
 Lines written by older versions are recognized by the command they run; comments in the block (a
 paused `# …` line, a note) are never matched, replaced or removed by a targeted install/remove.

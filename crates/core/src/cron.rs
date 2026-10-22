@@ -1,5 +1,5 @@
 //! Where arena's cron lines log and lock, wherever they're rendered: the CLI's `cron install`
-//! lines (backup, proxy, snapshot, archive) and the reaper's (`reap::render::cron_line`). One
+//! lines (backup, proxy, snapshot, archive, health) and the reaper's (`reap::render::cron_line`). One
 //! place for the folder, the names and the earlier versions' names, so the lines, `cron
 //! install`'s tidy-up of the old files and the docs can't drift apart.
 //!
@@ -31,10 +31,11 @@ pub enum Job {
     Snapshot,
     Archive,
     Reap,
+    Health,
 }
 
 impl Job {
-    pub const ALL: [Job; 5] = [Job::Backup, Job::Proxy, Job::Snapshot, Job::Archive, Job::Reap];
+    pub const ALL: [Job; 6] = [Job::Backup, Job::Proxy, Job::Snapshot, Job::Archive, Job::Reap, Job::Health];
 
     /// The name its files go by in [`DIR`]: `backup.log`, `backup.lock`, ….
     pub fn name(self) -> &'static str {
@@ -44,18 +45,22 @@ impl Job {
             Job::Snapshot => "snapshot",
             Job::Archive => "archive",
             Job::Reap => "reap",
+            Job::Health => "health",
         }
     }
 
     /// The log its line appended to before any folder, directly in the home (026c308 and
-    /// earlier) — moved into [`DIR`] when `cron install` rewrites such a line.
-    pub fn legacy_log(self) -> &'static str {
+    /// earlier) — moved into [`DIR`] when `cron install` rewrites such a line. `None`: a job
+    /// newer than both earlier layouts (the health check), whose line has only ever logged in
+    /// [`DIR`] or where someone chose.
+    pub fn legacy_log(self) -> Option<&'static str> {
         match self {
-            Job::Backup => "arena-cron.log",
-            Job::Proxy => "arena-proxy-cron.log",
-            Job::Snapshot => "arena-snapshot-cron.log",
-            Job::Archive => "arena-archive-cron.log",
-            Job::Reap => "arena-reap-cron.log",
+            Job::Backup => Some("arena-cron.log"),
+            Job::Proxy => Some("arena-proxy-cron.log"),
+            Job::Snapshot => Some("arena-snapshot-cron.log"),
+            Job::Archive => Some("arena-archive-cron.log"),
+            Job::Reap => Some("arena-reap-cron.log"),
+            Job::Health => None,
         }
     }
 
@@ -68,6 +73,7 @@ impl Job {
             Job::Snapshot => Some(".arena-snapshot-cron.lock"),
             Job::Archive => None,
             Job::Reap => Some(".arena-reap-cron.lock"),
+            Job::Health => None,
         }
     }
 }
@@ -96,11 +102,14 @@ pub enum LogPlace {
 }
 
 /// Where `path`, an installed `job` line's `>>` target, is — by the exact path, never by a
-/// name alone: `/root/logs/cron/arena-cron.log` is someone's choice, not the old default.
+/// name alone: `/root/logs/cron/arena-cron.log` is someone's choice, not the old default. A job
+/// no earlier layout had ([`Job::legacy_log`] `None`) has no old default: its file in
+/// [`PREV_DIR`] would be someone's, so it is kept, never moved.
 pub fn log_place(home: &str, job: Job, path: &str) -> LogPlace {
+    let old = |legacy: &str| path == format!("{home}/{legacy}") || path == format!("{home}/{PREV_DIR}/{}.log", job.name());
     if path == log(home, job) {
         LogPlace::Default
-    } else if path == format!("{home}/{}", job.legacy_log()) || path == format!("{home}/{PREV_DIR}/{}.log", job.name()) {
+    } else if job.legacy_log().is_some_and(old) {
         LogPlace::OldDefault
     } else {
         LogPlace::Chosen
@@ -108,9 +117,11 @@ pub fn log_place(home: &str, job: Job, path: &str) -> LogPlace {
 }
 
 /// Whether `path`, an installed `job` line's lock, is one an earlier default used in `home`
-/// (`~/.arena-backup-cron.lock`, `~/.local/state/arena/cron/backup.lock`).
+/// (`~/.arena-backup-cron.lock`, `~/.local/state/arena/cron/backup.lock`) — never for a job no
+/// earlier layout had, as [`log_place`].
 pub fn is_old_lock(home: &str, job: Job, path: &str) -> bool {
-    job.legacy_lock().is_some_and(|l| path == format!("{home}/{l}")) || path == format!("{home}/{PREV_DIR}/{}.lock", job.name())
+    job.legacy_lock().is_some_and(|l| path == format!("{home}/{l}"))
+        || (job.legacy_log().is_some() && path == format!("{home}/{PREV_DIR}/{}.lock", job.name()))
 }
 
 /// What every line runs first, right after its schedule: `mkdir -p <DIR> && `, plus the
@@ -141,21 +152,24 @@ mod tests {
             (Job::Snapshot, "/root/.local/state/arena-cron/snapshot.log", "/root/.local/state/arena-cron/snapshot.lock"),
             (Job::Archive, "/root/.local/state/arena-cron/archive.log", "/root/.local/state/arena-cron/archive.lock"),
             (Job::Reap, "/root/.local/state/arena-cron/reap.log", "/root/.local/state/arena-cron/reap.lock"),
+            (Job::Health, "/root/.local/state/arena-cron/health.log", "/root/.local/state/arena-cron/health.lock"),
         ];
         assert_eq!(cases.map(|(j, _, _)| j), Job::ALL);
         for (job, want_log, want_lock) in cases {
             assert_eq!((log("/root", job).as_str(), lock("/root", job).as_str()), (want_log, want_lock), "{job:?}");
         }
-        // The old names, directly in the home: visible logs, hidden locks (none for the archive).
-        let legacy: Vec<(&str, Option<&str>)> = Job::ALL.iter().map(|j| (j.legacy_log(), j.legacy_lock())).collect();
+        // The old names, directly in the home: visible logs, hidden locks (none for the archive);
+        // the health check never had any.
+        let legacy: Vec<(Option<&str>, Option<&str>)> = Job::ALL.iter().map(|j| (j.legacy_log(), j.legacy_lock())).collect();
         assert_eq!(
             legacy,
             [
-                ("arena-cron.log", Some(".arena-backup-cron.lock")),
-                ("arena-proxy-cron.log", Some(".arena-proxy-cron.lock")),
-                ("arena-snapshot-cron.log", Some(".arena-snapshot-cron.lock")),
-                ("arena-archive-cron.log", None),
-                ("arena-reap-cron.log", Some(".arena-reap-cron.lock")),
+                (Some("arena-cron.log"), Some(".arena-backup-cron.lock")),
+                (Some("arena-proxy-cron.log"), Some(".arena-proxy-cron.lock")),
+                (Some("arena-snapshot-cron.log"), Some(".arena-snapshot-cron.lock")),
+                (Some("arena-archive-cron.log"), None),
+                (Some("arena-reap-cron.log"), Some(".arena-reap-cron.lock")),
+                (None, None),
             ]
         );
     }
@@ -175,6 +189,10 @@ mod tests {
             (Job::Backup, "/root/arena-proxy-cron.log", Chosen),
             (Job::Backup, "~/arena-cron.log", Chosen),
             (Job::Archive, "/root/.local/state/arena-cron/backup.log", Chosen),
+            (Job::Health, "/root/.local/state/arena-cron/health.log", Default),
+            // No earlier layout had a health line: a log in the a663f65 folder is someone's.
+            (Job::Health, "/root/.local/state/arena/cron/health.log", Chosen),
+            (Job::Health, "/root/arena-health-cron.log", Chosen),
         ];
         for (job, path, want) in cases {
             assert_eq!(log_place("/root", job, path), want, "{job:?} {path}");
@@ -184,6 +202,7 @@ mod tests {
         assert!(!is_old_lock("/root", Job::Backup, "/root/.arena-proxy-cron.lock"));
         assert!(!is_old_lock("/root", Job::Backup, "/root/.local/state/arena-cron/backup.lock"));
         assert!(!is_old_lock("/root", Job::Backup, "/srv/.arena-backup-cron.lock"));
+        assert!(!is_old_lock("/root", Job::Health, "/root/.local/state/arena/cron/health.lock"));
     }
 
     /// The mkdir makes the cron folder and, for a kept log elsewhere, that log's folder too —

@@ -1098,7 +1098,7 @@ quote a command that takes one, `run 'tmux kill-session -t lab'`; on a timeout t
 killed, and the remote command dies at its next write to the closed connection; a pod whose command
 fails shows what it printed on stdout too, then `exit N: <stderr>` — never `Some(N)`; on a pod with
 no zsh yet — a bare VM before setup — it says so and to run `arena pods setup`) / the read-only
-torch-version health check (90s per pod). Every dry run's `ssh`/`scp`/`rsync` line is shell-quoted,
+torch-version health check (90s per pod; with no targets this cohort's pods, as `--deep`). Every dry run's `ssh`/`scp`/`rsync` line is shell-quoted,
 so it pastes as exactly what would run (globs like `'**/.git/**'` don't expand).
 
 ### Background jobs: `run --background`, `jobs`, `logs`
@@ -1204,8 +1204,15 @@ replacement on a failed machine by the same rule).
 
 `--json` prints per-pod `{id, name, provider, status, checks, facts}` (no IPs) — `[]` when no pod
 could be checked; summary/notes go to stderr. Exits non-zero if any pod FAILs; warnings don't.
-Targets scope the run (a named pod with no SSH endpoint is a FAIL; a typo is an error). Two pods
-sharing a name each get their own row (with a warning naming their ids).
+Targets scope the run (a named pod with no SSH endpoint is a FAIL; a typo is an error). With no
+targets (or `--all`) it checks **this cohort's pods**: `<prefix>-…`, never an `@` staff entry or
+another prefix's pod — a staff box may be running someone's job — with one `⊘ skipped N non-cohort
+pods …` line for the rest; `--include-non-cohort` checks every pod, and a named staff box is
+checked. Two pods sharing a name each get their own row (with a warning naming their ids).
+
+Every morning on cron: `arena cron install --health 07:30` (this box's time zone; log
+`~/.local/state/arena-cron/health.log`; see
+[`cron`](BACKUPS.md#cron-the-lines-that-run-it-all)).
 
 #### The health cache
 

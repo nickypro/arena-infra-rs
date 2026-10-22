@@ -308,8 +308,9 @@ impl SelectOpts {
     }
 }
 
-/// Who a fleet-wide backup command (`backup`, `pull`, `init-branches`, `set-branch --all`)
-/// acts on when it names no pod: this cohort's ([`split_cohort`]), or with the flag every pod.
+/// Who a fleet-wide backup command (`backup`, `pull`, `init-branches`, `set-branch --all`) —
+/// or `ask`/`test`, which reach into pods too — acts on when it names no pod: this cohort's
+/// ([`split_cohort`]), or with the flag every pod.
 #[derive(clap::Args, Debug, Clone, Copy, Default)]
 struct CohortScope {
     /// With no pods named (or --all): every pod, staff boxes and other prefixes too
@@ -467,8 +468,8 @@ enum KeysCmd {
 enum CronCmd {
     /// Add or replace arena cron lines (shows the diff, confirms)
     ///
-    /// Each flag names one line (backup, proxy, snapshot, archive, reap); only those are
-    /// (re)written and the rest are kept. No flag = the backup line. A rewritten backup line
+    /// Each flag names one line (backup, proxy, snapshot, archive, reap, health); only those
+    /// are (re)written and the rest are kept. No flag = the backup line. A rewritten backup line
     /// keeps the installed one's --pull, start date and schedule unless you change them.
     /// Locks live in ~/.local/state/arena-cron/, logs too (backup.log, …) unless the installed
     /// line logs elsewhere already: that path is kept. Old default logs (~/arena-cron.log) move.
@@ -506,6 +507,9 @@ enum CronCmd {
         /// `apply` terminates pods only with REAP_ENABLED=1 in the config file.
         #[arg(long, value_name = "MODE", value_parser = ["observe", "apply"])]
         reap: Option<String>,
+        /// The health line: `pods test --deep` daily at HH:MM, this box's time zone
+        #[arg(long, value_name = "HH:MM")]
+        health: Option<String>,
         /// Preview only: print the diff, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -527,6 +531,9 @@ enum CronCmd {
         /// Remove the auto-reaper line.
         #[arg(long)]
         reap: bool,
+        /// Remove the daily health check line.
+        #[arg(long)]
+        health: bool,
         /// Preview only: print the diff, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -1343,7 +1350,8 @@ enum PodCmd {
     ///
     /// --deep: per-GPU CUDA op, driver vs MIN_DRIVER_VERSION, device count, GPU↔GPU copy + NCCL,
     /// HF download speed, disk, load, maintenance window. One pass/warn/fail row per pod; exits
-    /// non-zero on any FAIL. No targets = every pod with an SSH endpoint.
+    /// non-zero on any FAIL. No targets (or --all) = this cohort's pods with an SSH endpoint
+    /// (not @ staff entries; --include-non-cohort: every pod).
     #[command(verbatim_doc_comment)]
     Test {
         /// Run the deep check instead of the torch-version check.
@@ -1355,6 +1363,8 @@ enum PodCmd {
         /// Print every check of every pod, not just the table.
         #[arg(short, long, requires = "deep")]
         verbose: bool,
+        #[command(flatten)]
+        cohort: CohortScope,
         #[command(flatten)]
         sel: Select,
     },
@@ -3710,23 +3720,30 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
                 println!("(no arena-managed cron lines)");
             } else {
                 for l in &before {
-                    let kind = CronKind::of(l).map_or("other", CronKind::label);
-                    println!("[{kind}] {l}");
+                    let kind = CronKind::of(l);
+                    println!("[{}] {l}", kind.map_or("other", CronKind::label));
+                    // The health line's time is cron's, this box's zone: said, not left to guess.
+                    if let Some(at) = HealthAt::of_line(l).filter(|_| kind == Some(CronKind::Health)) {
+                        println!("  ↳ {}", health_when(at, box_zone().as_deref()));
+                    }
                 }
             }
             Ok(())
         }
-        CronCmd::Remove { backup, proxy, snapshot, archive, reap, dry_run } => {
+        CronCmd::Remove { backup, proxy, snapshot, archive, reap, health, dry_run } => {
             cron_home(home, effective_uid()?)?;
             let mut kinds = CronKind::selected(backup, proxy, snapshot, archive);
             if reap {
                 kinds.push(CronKind::Reap);
             }
+            if health {
+                kinds.push(CronKind::Health);
+            }
             // No flag: the whole block, hand edits inside it included (as always).
             let after = if kinds.is_empty() { Vec::new() } else { merge_cron_block(&before, &kinds, &[]) };
             apply_cron_change(&current, &before, &after, &[], dry_run, yes, crontab).await.map(|_| ())
         }
-        CronCmd::Install { backup, schedule, start_date, no_start_date, pull, no_pull, proxy, snapshot, archive, reap, dry_run } => {
+        CronCmd::Install { backup, schedule, start_date, no_start_date, pull, no_pull, proxy, snapshot, archive, reap, health, dry_run } => {
             // Once, before anything is written: the tidy after the write uses it too, so nothing
             // can fail once the crontab is in (review ai-review claude #10).
             let euid = effective_uid()?;
@@ -3745,19 +3762,30 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             if let Some(d) = &start_date {
                 arena_core::schedule::parse_ymd(d).context("--start-date must be YYYY-MM-DD")?;
             }
+            let health = health.as_deref().map(HealthAt::parse).transpose()?;
             let snapshot_dir = snapshot.as_deref().map(snapshot_cron_dir).transpose()?;
-            // `--reap` names its own line: like `--proxy`, it doesn't bring a backup line along.
+            // `--reap` and `--health` name their own lines: like `--proxy`, neither brings a
+            // backup line along.
             let backup = install_backup_line(
                 backup,
                 schedule.is_some(),
                 start_date.is_some() || no_start_date,
                 pull || no_pull,
-                proxy || reap.is_some(),
+                proxy || reap.is_some() || health.is_some(),
                 snapshot_dir.is_some() || archive,
             );
             let reap_line = reap
                 .as_deref()
                 .map(|mode| reap_cron_line(mode == "apply", config_path, &exe.display().to_string(), &cfg_abs.display().to_string(), home, kept_log(CronKind::Reap)))
+                .transpose()?;
+            // Its verdicts go to the health cache this shell resolves, as the archive's lines
+            // carry their state dir (AD10): the one this shell's dashboard and `snapshot` read.
+            let health_line = health
+                .map(|at| -> Result<String> {
+                    let root = archive::cron_state_root(cfg).map_err(|e| anyhow::anyhow!("--health: {e}"))?;
+                    let (exe, cfg_abs) = (exe.display().to_string(), cfg_abs.display().to_string());
+                    Ok(health_cron_line(at, &exe, &cfg_abs, home, &root, kept_log(CronKind::Health)))
+                })
                 .transpose()?;
             let mut notes = Vec::new();
             // The backup line's options: each flag, else the installed line's (so a
@@ -3831,6 +3859,9 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             if let Some(l) = reap_line {
                 lines.push((CronKind::Reap, l));
             }
+            if let Some(l) = health_line {
+                lines.push((CronKind::Health, l));
+            }
             let kinds: Vec<CronKind> = lines.iter().map(|(k, _)| *k).collect();
             let after = merge_cron_block(&before, &kinds, &lines);
             let kept: Vec<String> =
@@ -3860,6 +3891,9 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
                      the rsync file backup too)"
                         .to_string(),
                 );
+            }
+            if let Some(at) = health {
+                notes.push(format!("note: the health check runs {}", health_when(at, box_zone().as_deref())));
             }
             if apply_cron_change(&current, &before, &after, &notes, dry_run, yes, crontab).await? {
                 // Only once it's written: until then, the old lines still use their old files.
@@ -4262,6 +4296,8 @@ enum CronKind {
     ArchiveBig,
     /// `pods reap run`, the opt-in auto-reaper.
     Reap,
+    /// `pods test --deep`, the daily health check.
+    Health,
 }
 
 impl CronKind {
@@ -4273,6 +4309,7 @@ impl CronKind {
             CronKind::ArchiveSnap => "archive-snap",
             CronKind::ArchiveBig => "archive-big",
             CronKind::Reap => "reap",
+            CronKind::Health => "health",
         }
     }
 
@@ -4285,6 +4322,7 @@ impl CronKind {
             CronKind::Snapshot => Job::Snapshot,
             CronKind::ArchiveSnap | CronKind::ArchiveBig => Job::Archive,
             CronKind::Reap => Job::Reap,
+            CronKind::Health => Job::Health,
         }
     }
 
@@ -4326,6 +4364,7 @@ impl CronKind {
             (runs("archive", Some("sync")) && runs("--tier", Some("snap")), CronKind::ArchiveSnap),
             (runs("archive", Some("sync")) && runs("--tier", Some("big")), CronKind::ArchiveBig),
             (runs("reap", Some("run")), CronKind::Reap),
+            (runs("pods", Some("test")) && runs("--deep", None), CronKind::Health),
         ]
         .into_iter()
         .filter_map(|(hit, k)| hit.then_some(k))
@@ -4751,6 +4790,86 @@ fn reap_cron_line(apply: bool, config_path: &std::path::Path, exe: &str, cfg_abs
         }
     }
     Ok(arena_core::reap::render::cron_line(apply, exe, cfg_abs, home, log, &env))
+}
+
+/// When the daily health check runs (`cron install --health HH:MM`): cron's time, this box's
+/// zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HealthAt {
+    hour: u32,
+    minute: u32,
+}
+
+impl HealthAt {
+    /// `--health`'s `HH:MM` (or `H:MM`): an hour 0–23 and two-digit minutes 00–59 — `07:05` and
+    /// `7:05`, never `7:5` (07:05 or 07:50?), `25:00` or `07:60`. Pure.
+    fn parse(s: &str) -> Result<HealthAt> {
+        let bad = || anyhow::anyhow!("--health takes HH:MM in this box's time zone, e.g. 07:30 (got {s:?})");
+        let (h, m) = s.trim().split_once(':').ok_or_else(bad)?;
+        let digits = |x: &str, len: std::ops::RangeInclusive<usize>| len.contains(&x.len()) && x.bytes().all(|b| b.is_ascii_digit());
+        if !digits(h, 1..=2) || !digits(m, 2..=2) {
+            return Err(bad());
+        }
+        let (hour, minute): (u32, u32) = (h.parse()?, m.parse()?);
+        if hour > 23 || minute > 59 {
+            return Err(bad());
+        }
+        Ok(HealthAt { hour, minute })
+    }
+
+    /// The time an installed health line runs at, read back from its schedule — `M H * * *`, as
+    /// [`health_cron_line`] writes it; `None` for any other (a hand edit). Pure.
+    fn of_line(line: &str) -> Option<HealthAt> {
+        let (schedule, _) = cron_line_parts(line)?;
+        match schedule.split(' ').collect::<Vec<_>>().as_slice() {
+            [m, h, "*", "*", "*"] => HealthAt::parse(&format!("{h}:{m:0>2}")).ok(),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for HealthAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:02}:{:02}", self.hour, self.minute)
+    }
+}
+
+/// The daily health check's line (`cron install --health HH:MM`): `pods test --deep` once a day
+/// at `at`, in this box's time zone (cron's). Read-only, so no `--yes`; and it never reaches
+/// outside the cohort — a deep check that names no pod takes this cohort's ([`cohort_only`]), so
+/// a staff box running someone's job never gets its CUDA, NCCL and download checks. Under `flock
+/// -n -o` like the backup line: a check still running never gets a second one beside it, and no
+/// ssh it started can hold the lock. `ARENA_STATE_DIR` goes into the line, as the archive's does
+/// (AD10): the verdicts land in the health cache this shell's dashboard and `snapshot` read,
+/// whatever cron's environment lacks. It exits non-zero when a pod FAILs — the log has the table.
+/// `log`: the log the installed health line chose, kept ([`kept_logs`]). Pure.
+fn health_cron_line(at: HealthAt, exe: &str, config: &str, home: &str, state_root: &str, log: Option<&str>) -> String {
+    use arena_core::cron::{self, Job};
+    let log = log.map_or_else(|| cron::log(home, Job::Health), String::from);
+    format!(
+        "{} {} * * * {}ARENA_STATE_DIR={state_root} flock -n -o {} {exe} --config {config} pods test --deep >> {log} 2>&1",
+        at.minute,
+        at.hour,
+        cron::mkdir(home, &log),
+        cron::lock(home, Job::Health)
+    )
+}
+
+/// How a health line's time reads (`cron install`'s note, `cron show`): `daily at 07:30, this
+/// box's time zone (BST +0100)`, the zone as [`box_zone`] read it. Pure.
+fn health_when(at: HealthAt, zone: Option<&str>) -> String {
+    match zone {
+        Some(z) => format!("daily at {at}, this box's time zone ({z})"),
+        None => format!("daily at {at}, this box's time zone"),
+    }
+}
+
+/// This box's time zone as cron reads it — the system's, so `date` without this shell's `TZ` —
+/// as `BST +0100`. `None` when `date` can't say.
+fn box_zone() -> Option<String> {
+    let out = std::process::Command::new("date").env_remove("TZ").arg("+%Z %z").stdin(std::process::Stdio::null()).output().ok()?;
+    let zone = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !zone.is_empty()).then_some(zone)
 }
 
 /// Whether this user's crontab has the reap line — `config check` then shows the reaper's
@@ -7989,16 +8108,17 @@ async fn handle_pods_bal(
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
             money::handle_idle(provider, remote, cfg, &sel, hours, json, &mut |l| println!("{l}")).await?;
         }
-        PodCmd::Test { deep: true, sel, json, verbose } => {
+        PodCmd::Test { deep: true, sel, json, verbose, cohort } => {
             // Read-only: no confirm. Config first: a malformed MIN_DRIVER_VERSION fails before
-            // the fleet is even listed.
+            // the fleet is even listed. Fleet-wide = this cohort's pods: the check runs CUDA, NCCL
+            // and a download on each GPU, never on a staff box's (the daily cron line's run).
             arena_core::health::HealthPolicy::from_config(cfg)?;
-            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let sel = cohort_only(cfg, select(provider, cfg, &sel.args(), Unscoped::All).await?, cohort);
             handle_deep_test(provider, remote, cfg, &sel, json, verbose).await?;
         }
-        PodCmd::Test { deep: false, sel, .. } => {
+        PodCmd::Test { deep: false, sel, cohort, .. } => {
             // Read-only: no confirm, compact one-line-per-pod output.
-            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let sel = cohort_only(cfg, select(provider, cfg, &sel.args(), Unscoped::All).await?, cohort);
             handle_run(
                 remote,
                 cfg,
@@ -13358,8 +13478,9 @@ async fn refresh_missing_endpoints(provider: &dyn Provider, sel: &mut Selected, 
 #[derive(Debug, Clone, Copy)]
 enum Unscoped {
     /// The whole fleet: read-only checks, and the commands that always defaulted to it
-    /// (`run`, `test`, `setup`, `copy-keys`, `cp`, `backup`, `pull`, `init-branches` — the
-    /// last three, like `set-branch --all`, then keep only this cohort's pods: [`cohort_only`]).
+    /// (`run`, `test`, `setup`, `copy-keys`, `cp`, `backup`, `pull`, `init-branches` — `test`
+    /// and the last three, like `set-branch --all`, then keep only this cohort's pods:
+    /// [`cohort_only`]).
     All,
     /// Refuse: a command that changes pods (`stop`, `reimage`, `set-branch`, `keys`) must
     /// be told which — names or `--all` (the verb goes in the message).
@@ -18311,6 +18432,53 @@ ASK_AI=gpt
         assert_eq!(kinds, [super::CronKind::Proxy, super::CronKind::Snapshot]);
     }
 
+    /// `cron install --health HH:MM` (spec health-cron): `pods test --deep` once a day at that
+    /// time — cron's, this box's zone — under `flock -n -o` like the backup line, its lock and log
+    /// in the cron folder (or the log the installed line chose, its folder recreated first), the
+    /// state dir carried as the archive's lines carry it, read-only (no `--yes`), recognized as
+    /// the health line, and its time read back for `cron show`.
+    #[test]
+    fn health_cron_line_runs_the_deep_check_daily() {
+        use super::{health_cron_line, health_when, CronKind, HealthAt};
+        let at = HealthAt::parse("07:05").unwrap();
+        let line = health_cron_line(at, "/opt/arena", "/srv/config.env", "/home/u", "/var/lib/arena", None);
+        assert_eq!(
+            line,
+            "5 7 * * * mkdir -p /home/u/.local/state/arena-cron && ARENA_STATE_DIR=/var/lib/arena flock -n -o \
+             /home/u/.local/state/arena-cron/health.lock /opt/arena --config /srv/config.env pods test --deep \
+             >> /home/u/.local/state/arena-cron/health.log 2>&1"
+        );
+        assert_eq!(CronKind::of(&line), Some(CronKind::Health));
+        assert!(!line.contains("--yes"), "read-only: {line}");
+        assert_eq!(HealthAt::of_line(&line), Some(at));
+        assert_eq!(health_when(at, Some("BST +0100")), "daily at 07:05, this box's time zone (BST +0100)");
+        assert_eq!(health_when(at, None), "daily at 07:05, this box's time zone");
+        // A kept log stays where it is, its folder recreated first.
+        let kept = health_cron_line(at, "/opt/arena", "/c", "/home/u", "/s", Some("/home/u/logs/health.log"));
+        assert!(kept.starts_with("5 7 * * * mkdir -p /home/u/.local/state/arena-cron /home/u/logs && ARENA_STATE_DIR=/s "), "{kept}");
+        assert!(kept.ends_with(" pods test --deep >> /home/u/logs/health.log 2>&1"), "{kept}");
+        // A schedule that isn't once a day at a fixed time (a hand edit) isn't read as one.
+        for l in ["*/30 7 * * * a pods test --deep", "5 7 * * 1 a pods test --deep", "@daily a pods test --deep", "5 24 * * * a pods test --deep", "5"] {
+            assert_eq!(HealthAt::of_line(l), None, "{l}");
+        }
+        assert_eq!(HealthAt::of_line("05 7 * * * a pods test --deep"), Some(at));
+    }
+
+    /// `--health` takes `HH:MM` (or `H:MM`) in this box's time zone: an hour 0–23 and two-digit
+    /// minutes — never a guess at `7:5` (07:05 or 07:50?), `25:00` or `07:60`.
+    #[test]
+    fn health_time_must_be_hh_mm() {
+        use super::HealthAt;
+        for (s, hour, minute) in [("07:05", 7, 5), ("7:05", 7, 5), ("00:00", 0, 0), ("23:59", 23, 59), (" 07:30 ", 7, 30)] {
+            assert_eq!(HealthAt::parse(s).unwrap(), HealthAt { hour, minute }, "{s}");
+            assert_eq!(HealthAt::parse(s).unwrap().to_string(), format!("{hour:02}:{minute:02}"));
+        }
+        for s in ["25:00", "24:00", "7:5", "07:60", "07:5", "7", "0730", "07:05:00", "+7:05", "-1:00", "07:+5", "", ":", "007:05", "07h05", "\u{0667}:05"] {
+            let e = HealthAt::parse(s).unwrap_err().to_string();
+            assert_eq!(e, format!("--health takes HH:MM in this box's time zone, e.g. 07:30 (got {s:?})"), "{s}");
+        }
+    }
+
     /// Finding #25: a refusal for lack of a terminal (no --yes) exits 2 — it exited 0 after
     /// "aborted.", indistinguishable from success for a script. Cron runs without a terminal,
     /// so every mutating cron line must carry --yes (the read-only snapshot needs none).
@@ -18382,6 +18550,7 @@ ASK_AI=gpt
             ("*/2 * * * * mkdir -p /h/.local/state/arena-cron && flock -n /h/.local/state/arena-cron/snapshot.lock /opt/arena --config /c snapshot --public --out '/w/fleet.json' >> /h/.local/state/arena-cron/snapshot.log 2>&1", Some(Snapshot)),
             ("40 * * * * mkdir -p /h/.local/state/arena-cron /h/logs && nice -n 10 /opt/arena --config /c archive sync --tier big >> /h/logs/archive.log 2>&1", Some(ArchiveBig)),
             ("11 * * * * mkdir -p /h/.local/state/arena-cron && PATH=/bin flock -n -o /h/.local/state/arena-cron/reap.lock /opt/arena --config /c pods reap run >> /h/.local/state/arena-cron/reap.log 2>&1", Some(Reap)),
+            ("5 7 * * * mkdir -p /h/.local/state/arena-cron && ARENA_STATE_DIR=/s flock -n -o /h/.local/state/arena-cron/health.lock /opt/arena --config /c pods test --deep >> /h/.local/state/arena-cron/health.log 2>&1", Some(Health)),
             // a663f65's: one folder under the state root.
             ("*/15 * * * * mkdir -p /h/.local/state/arena/cron && ARENA_START_DATE=2026-01-05 flock -n -o /h/.local/state/arena/cron/backup.lock /opt/arena --config /c pods backup --yes >> /h/.local/state/arena/cron/backup.log 2>&1", Some(Backup)),
             ("*/5 * * * * mkdir -p /h/.local/state/arena/cron && PATH=/usr/sbin:/usr/bin flock -n /h/.local/state/arena/cron/proxy.lock /opt/arena --config /c proxy apply --yes >> /h/.local/state/arena/cron/proxy.log 2>&1", Some(Proxy)),
@@ -18402,6 +18571,9 @@ ASK_AI=gpt
             ("0 3 * * * /opt/arena --config /c proxy plan", None),
             ("0 3 * * * /opt/arena --config /c pods list >> /h/.arena-proxy-cron.lock.snapshot", None),
             ("*/15 * * * * arena pods backup --yes && arena proxy apply --yes", None),
+            // The torch check isn't the health line; a deep check chained to another job is two.
+            ("0 3 * * * /opt/arena --config /c pods test >> /h/torch.log 2>&1", None),
+            ("0 7 * * * /opt/arena --config /c pods test --deep && /opt/arena --config /c pods backup --yes", None),
             ("# a note", None),
             // Comments are never a kind: a paused (commented-out) line, a note naming one.
             ("# */15 * * * * flock -n /h/.arena-backup-cron.lock /opt/arena --config /c pods backup --yes", None),
@@ -18494,7 +18666,9 @@ ASK_AI=gpt
         use arena_core::cron::{self, Job};
         let mut old = line.replacen(&format!("mkdir -p {} && ", cron::dir(home)), "", 1);
         for job in Job::ALL {
-            old = old.replace(&format!(" >> {} ", cron::log(home, job)), &format!(" >> {home}/{} ", job.legacy_log()));
+            if let Some(log) = job.legacy_log() {
+                old = old.replace(&format!(" >> {} ", cron::log(home, job)), &format!(" >> {home}/{log} "));
+            }
             if let Some(lock) = job.legacy_lock() {
                 old = old.replace(&format!(" {} ", cron::lock(home, job)), &format!(" {home}/{lock} "));
             }
@@ -18935,7 +19109,9 @@ ASK_AI=gpt
         let state = vec![("ARENA_STATE_DIR".to_string(), h.clone())];
         let reap_log = format!("{h}/logs/reap/reap.log");
         lines.push((CronKind::Reap, arena_core::reap::render::cron_line(false, &exe, "/c", &h, Some(&reap_log), &state)));
-        assert_eq!(lines.len(), 6);
+        let health_log = format!("{h}/logs/health/health.log");
+        lines.push((CronKind::Health, super::health_cron_line(super::HealthAt { hour: 7, minute: 30 }, &exe, "/c", &h, &h, Some(&health_log))));
+        assert_eq!(lines.len(), 7);
         for (kind, line) in &lines {
             let _ = std::fs::remove_dir_all(cron::dir(&h));
             let _ = std::fs::remove_dir_all(home.join("logs"));
@@ -18956,7 +19132,7 @@ ASK_AI=gpt
             let want = match kind {
                 CronKind::Backup => (true, false),
                 CronKind::ArchiveSnap | CronKind::ArchiveBig => (true, true),
-                CronKind::Reap => (false, true),
+                CronKind::Reap | CronKind::Health => (false, true),
                 CronKind::Proxy | CronKind::Snapshot => (false, false),
             };
             assert_eq!((start, state), want, "{}: the env arena saw: {log:?}", kind.label());
@@ -19630,6 +19806,37 @@ ASK_AI=gpt
         assert_eq!(s.tab(), tab, "nothing changed");
     }
 
+    /// `cron install --health` end to end (spec health-cron): its one line, no backup line brought
+    /// along; kept byte for byte by later installs of other lines — each flag names its own line,
+    /// so an install without `--health` keeps it (the spec's "dropped" predates the merge by
+    /// identity); replaced in place by a new time; dropped by `remove --health` alone; a time that
+    /// isn't `HH:MM` refused before anything is written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_health_line_is_a_line_of_its_own() {
+        use super::{health_cron_line, CronKind, HealthAt};
+        let s = CronStub::new("health");
+        let kinds = |s: &CronStub| s.lines().iter().filter_map(|l| CronKind::of(l)).collect::<Vec<_>>();
+        let e = s.run_as(&["install", "--health", "7:5"], true, Some(&s.home)).await.unwrap_err().to_string();
+        assert!(e.starts_with("--health takes HH:MM"), "{e}");
+        assert!(!s.dir.join("tab").exists(), "nothing written");
+        s.run(&["install", "--health", "07:30"]).await;
+        let root = super::archive::cron_state_root(&arena_core::Config::default()).unwrap();
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        let cfg = std::fs::canonicalize(&s.config).unwrap().display().to_string();
+        let at = |hour, minute| health_cron_line(HealthAt { hour, minute }, &exe, &cfg, &s.home, &root, None);
+        assert_eq!(s.lines(), [at(7, 30)]);
+        s.run(&["install", "--proxy"]).await;
+        s.run(&["install", "--backup", "--pull"]).await;
+        assert_eq!(kinds(&s), [CronKind::Health, CronKind::Proxy, CronKind::Backup]);
+        assert_eq!(s.lines()[0], at(7, 30), "kept byte for byte");
+        s.run(&["install", "--health", "6:05"]).await;
+        assert_eq!(kinds(&s), [CronKind::Health, CronKind::Proxy, CronKind::Backup]);
+        assert_eq!(s.lines()[0], at(6, 5));
+        s.run(&["remove", "--health"]).await;
+        assert_eq!(kinds(&s), [CronKind::Proxy, CronKind::Backup]);
+    }
+
     #[test]
     fn cron_flags_parse() {
         use super::{Cli, Cmd, CronCmd};
@@ -19655,7 +19862,13 @@ ASK_AI=gpt
         for bad in [&["install", "--pull", "--no-pull"][..], &["install", "--start-date", "2026-01-05", "--no-start-date"]] {
             assert!(Cli::try_parse_from(["arena", "cron"].iter().chain(bad).copied()).is_err(), "{bad:?}");
         }
-        assert!(matches!(cron(&["remove"]), CronCmd::Remove { backup: false, proxy: false, snapshot: false, archive: false, reap: false, dry_run: false }));
+        assert!(matches!(
+            cron(&["remove"]),
+            CronCmd::Remove { backup: false, proxy: false, snapshot: false, archive: false, reap: false, health: false, dry_run: false }
+        ));
+        assert!(matches!(cron(&["remove", "--health"]), CronCmd::Remove { health: true, backup: false, .. }));
+        assert!(matches!(cron(&["install", "--health", "07:30"]), CronCmd::Install { health: Some(t), backup: false, .. } if t == "07:30"));
+        assert!(matches!(cron(&["install"]), CronCmd::Install { health: None, .. }));
         assert!(matches!(cron(&["remove", "--snapshot", "--dry"]), CronCmd::Remove { snapshot: true, dry_run: true, .. }));
         assert_eq!(super::CronKind::selected(true, false, true, false), [super::CronKind::Backup, super::CronKind::Snapshot]);
         assert_eq!(super::CronKind::selected(false, false, false, true), [super::CronKind::ArchiveSnap, super::CronKind::ArchiveBig]);
@@ -22661,7 +22874,7 @@ mod remote_tests {
         let fake = Arc::new(FakeRemote::new());
         fake.script(&host(22003), [FakeReply::hang()]);
         let start = Instant::now();
-        let plain = PodCmd::Test { deep: false, sel: Select::default(), json: false, verbose: false };
+        let plain = PodCmd::Test { deep: false, sel: Select::default(), json: false, verbose: false, cohort: crate::CohortScope::default() };
         let err = handle_pods(plain, &fleet(), fake.clone(), &cfg(), true).await.unwrap_err();
         assert_eq!(err.to_string(), "1 pod(s) failed");
         assert_eq!(start.elapsed(), TEST_TIMEOUT);
@@ -24892,7 +25105,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
     #[tokio::test(start_paused = true)]
     async fn pods_test_deep_exit_status_follows_failures_not_warnings() {
         use arena_core::health::DEEP_CHECK_TIMEOUT;
-        let deep = |json: bool| PodCmd::Test { deep: true, sel: Select::default(), json, verbose: false };
+        let deep = |json: bool| PodCmd::Test { deep: true, sel: Select::default(), json, verbose: false, cohort: crate::CohortScope::default() };
         // Any FAIL fails the command (table or JSON), at the hung pod's budget.
         for json in [false, true] {
             let fake = Arc::new(FakeRemote::new());
@@ -25112,10 +25325,10 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.cmd);
         assert!(matches!(
             parse(&["arena", "pods", "test"]).unwrap(),
-            Cmd::Pods(PodCmd::Test { deep: false, ref sel, json: false, verbose: false }) if sel.targets.is_empty()
+            Cmd::Pods(PodCmd::Test { deep: false, ref sel, json: false, verbose: false, .. }) if sel.targets.is_empty()
         ));
         match parse(&["arena", "pods", "test", "--deep", "apple", "bloom", "--json", "-v"]).unwrap() {
-            Cmd::Pods(PodCmd::Test { deep, sel, json, verbose }) => {
+            Cmd::Pods(PodCmd::Test { deep, sel, json, verbose, .. }) => {
                 assert!(deep && json && verbose);
                 assert_eq!(sel.targets, ["apple", "bloom"]);
             }
@@ -25224,7 +25437,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         }
 
         /// The human (2026-10-19): fleet-wide = cohort pods only, with a way to take the others
-        /// too. `--include-non-cohort` parses on all four commands, and with it the selection
+        /// too. `--include-non-cohort` parses on all four commands (and `test`), and with it the selection
         /// comes back whole and nothing is said; without it, the cohort's and the one line.
         #[test]
         fn include_non_cohort_takes_every_pod_and_says_nothing() {
@@ -25235,11 +25448,12 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
                     Cmd::Pods(PodCmd::Backup { cohort, .. })
                     | Cmd::Pods(PodCmd::Pull { cohort, .. })
                     | Cmd::Pods(PodCmd::InitBranches { cohort, .. })
-                    | Cmd::Pods(PodCmd::SetBranch { cohort, .. }) => cohort,
-                    _ => panic!("{argv:?}: not a backup command"),
+                    | Cmd::Pods(PodCmd::SetBranch { cohort, .. })
+                    | Cmd::Pods(PodCmd::Test { cohort, .. }) => cohort,
+                    _ => panic!("{argv:?}: not a cohort-scoped command"),
                 }
             };
-            for argv in [&["backup"][..], &["pull"], &["init-branches"], &["set-branch", "main", "--all"]] {
+            for argv in [&["backup"][..], &["pull"], &["init-branches"], &["set-branch", "main", "--all"], &["test"], &["test", "--deep"]] {
                 assert!(!scope(argv).include_non_cohort, "{argv:?}: off by default");
                 let with = [argv, &["--include-non-cohort"]].concat();
                 assert!(scope(&with).include_non_cohort, "{with:?}");
@@ -25255,6 +25469,34 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             // (In fleet order here: `select` orders a real run's by list slot, as LEFT_OUT has it.)
             let out = ["devtest-zebra", "staff-gpu", "quiet_blue_fox", "devtest2-apple"].map(String::from);
             assert_eq!(take_said(), [non_cohort_line("devtest", &out).unwrap()]);
+        }
+
+        /// The health check (spec health-cron) reads only, but runs CUDA, NCCL and a download on
+        /// every GPU it reaches, and its daily cron line names no pod: fleet-wide (bare or `--all`)
+        /// it reaches this cohort's pods only and says who it left out — never a staff box or
+        /// another prefix's pod; the torch check (`pods test`) the same. `--include-non-cohort`
+        /// takes every pod; a named staff box is checked, as named.
+        #[tokio::test(start_paused = true)]
+        async fn pods_test_deep_reaches_only_this_cohorts_pods_unless_told() {
+            let cfg = account_cfg("");
+            let run = |argv: &'static [&'static str]| {
+                let cfg = cfg.clone();
+                async move {
+                    let fake = Arc::new(FakeRemote::new());
+                    for port in 22001..=22007 {
+                        fake.script(&host(port), [FakeReply::stdout(DEEP_HEALTHY)]);
+                    }
+                    let _ = take_said();
+                    handle_pods(pods(argv), &account(), fake.clone(), &cfg, true).await.unwrap();
+                    let reached: Vec<u16> = (22001..=22007).filter(|port| !fake.calls_to(&host(*port)).is_empty()).collect();
+                    (reached, take_said())
+                }
+            };
+            for argv in [&["test", "--deep"][..], &["test", "--deep", "--all"], &["test"]] {
+                assert_eq!(run(argv).await, (COHORT_PORTS.to_vec(), vec![LEFT_OUT.to_string()]), "{argv:?}");
+            }
+            assert_eq!(run(&["test", "--deep", "--include-non-cohort"]).await, ((22001..=22007).collect(), vec![]));
+            assert_eq!(run(&["test", "--deep", "@staff-gpu"]).await, (vec![22005], vec![]));
         }
 
         #[test]
