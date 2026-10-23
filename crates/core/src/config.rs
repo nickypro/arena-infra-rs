@@ -280,6 +280,22 @@ fn strip_value(raw: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The shipped `config.env.example` parses, with the original arena-infra's names, each one
+    /// once (a duplicate would hand two machines one proxy port) and fit for a host name.
+    #[test]
+    fn the_example_config_s_names_parse_unique_and_host_safe() {
+        let c = Config::parse(include_str!("../../../config.env.example"));
+        let names = &c.machine_names;
+        assert_eq!(names.len(), 55, "{names:?}");
+        assert_eq!((names[0].as_str(), names[54].as_str()), ("apple", "zebra"));
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "a name listed twice");
+        for n in names {
+            assert!(!n.is_empty() && n.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit()), "{n:?}");
+        }
+        assert_eq!(c.get("MACHINE_NAME_PREFIX"), Some("arena8"));
+    }
+
     #[test]
     fn parses_mixed_config() {
         let text = r#"
