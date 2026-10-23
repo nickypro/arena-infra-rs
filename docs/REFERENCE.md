@@ -929,7 +929,8 @@ cohort (backups, the reaper), leave the key unset: each tick would rewrite that 
 - **With `SSH_CONFIG_FILE` set**, PATH is kept current: after every pod change (create, up, start,
   restart, reimage, replace, migrate, rename, terminate and the reaper — beside their proxy sync,
   one `[ssh-config] after …: rewrote …` line; `--skip-proxy` skips it too), and on `pods list` and
-  each dashboard refresh when an endpoint moved. The layout is the proxy's stable ports when `SSH_PROXY_HOST` is set (no
+  each dashboard refresh when an endpoint moved. `up` writes it once its pods are up; `create`,
+  which doesn't wait, mostly can't yet — the next `pods list` or refresh adds their endpoints. The layout is the proxy's stable ports when `SSH_PROXY_HOST` is set (no
   listing needed), else each pod's own endpoint (a pod without one is left out, as in
   `ssh-config`). It is written atomically (a temp file renamed over it), owner-only, and only when
   the text changed.
