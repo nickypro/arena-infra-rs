@@ -182,7 +182,7 @@ enum Cmd {
     /// `Include PATH` the first line of ~/.ssh/config (shows the change, asks, keeps a copy of
     /// the old file). With SSH_CONFIG_FILE set, every pod change and `pods list` rewrite PATH
     /// when an endpoint moved. --uninstall takes the Include line out again.
-    #[command(verbatim_doc_comment)]
+    #[command(verbatim_doc_comment, group(clap::ArgGroup::new("setup").args(["install", "uninstall"])))]
     SshConfig {
         /// Use the proxy layout (stable `SSH_PROXY_*` ports) instead of direct pod IPs.
         #[arg(long, conflicts_with_all = ["install", "uninstall"])]
@@ -197,7 +197,7 @@ enum Cmd {
         #[arg(long, value_name = "PATH", num_args = 0..=1)]
         uninstall: Option<Option<String>>,
         /// With --install/--uninstall: print what would change, change nothing.
-        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        #[arg(long, visible_aliases = ["dryrun", "dry"], requires = "setup")]
         dry_run: bool,
     },
     /// End-of-program check that nothing is left billing (read-only)
@@ -15969,6 +15969,70 @@ fn keep_copy(path: &std::path::Path, stamp: &str, shown: &str) -> Result<String>
     anyhow::bail!("no free name for a copy of {} beside it", path.display())
 }
 
+/// Whether this process's effective user owns `meta`'s file ([`arena_core::sshconfig::owned_by_me`]).
+fn mine(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        arena_core::sshconfig::owned_by_me(meta)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        true
+    }
+}
+
+/// Whether `a` and `b` name the same file: the same inode when both exist, else the same name
+/// in the same real folder (a folder reached through a link counts as itself).
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    if let (Ok(x), Ok(y)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+        use std::os::unix::fs::MetadataExt;
+        return (x.dev(), x.ino()) == (y.dev(), y.ino());
+    }
+    let real = |p: &std::path::Path| p.parent().and_then(|d| std::fs::canonicalize(d).ok()).zip(p.file_name()).map(|(d, n)| d.join(n));
+    a == b || real(a).is_some_and(|x| Some(x) == real(b))
+}
+
+/// Why `--install` (`target`: PATH) or `--uninstall` (`None`) won't edit anything, checked before
+/// the first write and again after the prompt. `~/.ssh/config` or PATH a symlink or not a regular
+/// file: the rename that replaces it would cut a dotfiles link without a word. Either one, or
+/// `~/.ssh` (the home when there's none yet), owned by another user: run as someone else (sudo
+/// keeping `HOME`) it would leave files there that their owner's ssh can't read. PATH being
+/// `~/.ssh/config` itself: it would Include itself, and every ssh would fail.
+fn ssh_setup_refusal(home: &std::path::Path, config_path: &std::path::Path, target: Option<(&std::path::Path, &str)>) -> Option<String> {
+    let ssh = home.join(".ssh");
+    let (folder, folder_shown) = if std::fs::symlink_metadata(&ssh).is_ok() { (ssh, "~/.ssh") } else { (home.to_path_buf(), "your home") };
+    match std::fs::metadata(&folder) {
+        Ok(m) if !m.is_dir() => return Some(format!("{folder_shown} isn't a folder")),
+        Ok(m) if !mine(&m) => {
+            return Some(format!("{folder_shown} ({}) isn't owned by this user — run it as the user whose ~/.ssh it is", folder.display()))
+        }
+        Ok(_) => {}
+        Err(e) => return Some(format!("{folder_shown} ({}): {e}", folder.display())),
+    }
+    if let Some((path, shown)) = target {
+        if same_file(path, config_path) {
+            return Some(format!("{shown} is ~/.ssh/config itself, which would then Include itself — choose another PATH (default ~/.ssh/arena.conf)"));
+        }
+    }
+    let files = std::iter::once((config_path, "~/.ssh/config")).chain(target);
+    for (path, shown) in files {
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let to = std::fs::read_link(path).map_or_else(|_| "?".to_string(), |t| t.display().to_string());
+                return Some(format!("{shown} is a symlink (to {to}) — arena never replaces a link; edit the file it points to yourself"));
+            }
+            Ok(m) if !m.is_file() => return Some(format!("{shown} isn't a regular file")),
+            Ok(m) if !mine(&m) => return Some(format!("{shown} isn't owned by this user — run it as the user whose ~/.ssh it is")),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Some(format!("{shown}: {e}")),
+        }
+    }
+    None
+}
+
 /// A file's permission bits, `default` when it doesn't exist.
 fn mode_or(path: &std::path::Path, default: u32) -> u32 {
     #[cfg(unix)]
@@ -15996,6 +16060,13 @@ async fn handle_ssh_config_install(provider: &dyn Provider, cfg: &Config, path: 
     let home = ssh_home(home)?;
     let target = install_target(cfg, path, &home)?;
     let (shown, abs) = include_forms(&target, &home);
+    if let Some(why) = sshconfig::include_path_problem(&shown) {
+        anyhow::bail!("not installed: {why}");
+    }
+    let config_path = home.join(".ssh").join("config");
+    if let Some(why) = ssh_setup_refusal(&home, &config_path, Some((&target, &shown))) {
+        anyhow::bail!("not installed: {why}");
+    }
     let pods = if sshconfig::uses_proxy(cfg) {
         Vec::new()
     } else {
@@ -16007,7 +16078,6 @@ async fn handle_ssh_config_install(provider: &dyn Provider, cfg: &Config, path: 
     let want = sshconfig::managed_text(&sshconfig::render_for(cfg, &pods).map_err(anyhow::Error::msg)?);
     let existing = read_opt(&target)?;
     let plan = sshconfig::file_plan(existing.as_deref(), &want);
-    let config_path = home.join(".ssh").join("config");
     let config = read_opt(&config_path)?;
     let at = sshconfig::include_at(config.as_deref().unwrap_or(""), &[&shown, &abs]);
     let stamp = arena_core::restore::stamp(arena_core::snapshot::unix_now());
@@ -16054,6 +16124,15 @@ async fn handle_ssh_config_install(provider: &dyn Provider, cfg: &Config, path: 
         println!("aborted.");
         return Ok(());
     }
+    // What was shown is what gets written: checked again after the prompt — a file edited, or
+    // swapped for a link, meanwhile stops it before anything is written.
+    if let Some(why) = ssh_setup_refusal(&home, &config_path, Some((&target, &shown))) {
+        anyhow::bail!("not installed: {why}");
+    }
+    anyhow::ensure!(
+        read_opt(&target)? == existing && read_opt(&config_path)? == config,
+        "not installed: {shown} or ~/.ssh/config changed while asking — nothing written; run it again"
+    );
     if plan != FilePlan::Unchanged {
         if plan == FilePlan::NotOurs {
             println!("kept {}", keep_copy(&target, &stamp, &shown)?);
@@ -16080,16 +16159,28 @@ async fn handle_ssh_config_install(provider: &dyn Provider, cfg: &Config, path: 
 /// of the old file kept beside it. PATH itself and earlier copies stay. Says what changes and
 /// asks first. `home`: `$HOME`.
 fn handle_ssh_config_uninstall(cfg: &Config, path: Option<&str>, yes: bool, dry_run: bool, home: Option<&str>) -> Result<()> {
+    use arena_core::sshconfig::{include_at, without_include, IncludeAt};
     let home = ssh_home(home)?;
     let target = install_target(cfg, path, &home)?;
     let (shown, abs) = include_forms(&target, &home);
+    let forms = [shown.as_str(), abs.as_str()];
     let config_path = home.join(".ssh").join("config");
-    let new = match read_opt(&config_path)? {
-        Some(config) => arena_core::sshconfig::without_include(&config, &[&shown, &abs]),
-        None => None,
+    if let Some(why) = ssh_setup_refusal(&home, &config_path, None) {
+        anyhow::bail!("not changed: {why}");
+    }
+    let config = read_opt(&config_path)?;
+    let in_block = |text: &str| match include_at(text, &forms) {
+        IncludeAt::InBlock(n) => Some(n),
+        _ => None,
     };
-    let Some(new) = new else {
-        println!("~/.ssh/config doesn't include {shown} — nothing to take out.");
+    let Some(new) = config.as_deref().and_then(|c| without_include(c, &forms)) else {
+        match config.as_deref().and_then(in_block) {
+            Some(n) => println!(
+                "~/.ssh/config includes {shown} only inside a Host/Match block (line {n}) — left as it is: --install never puts \
+                 it there, so it's yours"
+            ),
+            None => println!("~/.ssh/config doesn't include {shown} — nothing to take out."),
+        }
         return Ok(());
     };
     let stamp = arena_core::restore::stamp(arena_core::snapshot::unix_now());
@@ -16098,10 +16189,17 @@ fn handle_ssh_config_uninstall(cfg: &Config, path: Option<&str>, yes: bool, dry_
         println!("\nPreview only — run without --dry-run to make this change.");
         return Ok(());
     }
+    if let Some(n) = in_block(&new) {
+        println!("    (the one inside a Host/Match block, line {n} after this, is left as it is)");
+    }
     if !confirm(yes, "\nMake this change?")? {
         println!("aborted.");
         return Ok(());
     }
+    if let Some(why) = ssh_setup_refusal(&home, &config_path, None) {
+        anyhow::bail!("not changed: {why}");
+    }
+    anyhow::ensure!(read_opt(&config_path)? == config, "not changed: ~/.ssh/config changed while asking — nothing written; run it again");
     println!("kept {}", keep_copy(&config_path, &stamp, "~/.ssh/config")?);
     arena_core::sshconfig::write_atomic(&config_path, &new, mode_or(&config_path, 0o600)).map_err(anyhow::Error::msg)?;
     println!("took `Include {shown}` out of ~/.ssh/config");
@@ -20120,6 +20218,68 @@ ASK_AI=gpt
         }
     }
 
+    /// What `--install`/`--uninstall` must never edit, refused before anything is written: a
+    /// symlinked `~/.ssh/config` or PATH (a dotfiles link would be cut), PATH being
+    /// `~/.ssh/config` itself (directly or through a linked folder: it would Include itself), a
+    /// path ssh's `Include` can't take as one argument, a home owned by someone else (sudo
+    /// keeping HOME). An `Include` only inside a Host/Match block is the user's: `--uninstall`
+    /// leaves it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_config_install_refuses_what_it_must_not_edit() {
+        use super::{handle_ssh_config_install as install, handle_ssh_config_uninstall as uninstall};
+        let pods = vec![arena_core::Pod {
+            id: "id-a".into(),
+            name: "devtest-apple".into(),
+            provider: "runpod".into(),
+            status: "RUNNING".into(),
+            ssh_ip: Some("1.1.1.1".into()),
+            ssh_port: Some(22000),
+            ..Default::default()
+        }];
+        let cfg = arena_core::Config::parse("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\n");
+        let fleet = Listed(pods, false);
+        let refused = |r: anyhow::Result<()>, why: &str| {
+            let e = r.unwrap_err().to_string();
+            assert!(e.contains(why), "{why}: {e}");
+        };
+        // A symlinked ~/.ssh/config: refused, the link and its file as they were, nothing written.
+        let home = ssh_home_with("links", None);
+        let h = home.to_str().unwrap();
+        std::fs::write(home.join("dotfiles-config"), "Host box\n").unwrap();
+        std::os::unix::fs::symlink(home.join("dotfiles-config"), home.join(".ssh/config")).unwrap();
+        refused(install(&fleet, &cfg, None, true, false, Some(h)).await, "~/.ssh/config is a symlink");
+        refused(uninstall(&cfg, None, true, false, Some(h)), "~/.ssh/config is a symlink");
+        assert!(std::fs::symlink_metadata(home.join(".ssh/config")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(home.join("dotfiles-config")).unwrap(), "Host box\n");
+        assert!(!home.join(".ssh/arena.conf").exists() && kept_copies(&home).is_empty());
+        // A symlinked PATH: refused too.
+        std::fs::remove_file(home.join(".ssh/config")).unwrap();
+        std::os::unix::fs::symlink(home.join("dotfiles-config"), home.join(".ssh/arena.conf")).unwrap();
+        refused(install(&fleet, &cfg, None, true, false, Some(h)).await, "~/.ssh/arena.conf is a symlink");
+        assert!(!home.join(".ssh/config").exists());
+        // PATH = ~/.ssh/config, by name or through a linked folder.
+        std::fs::write(home.join(".ssh/config"), "Host box\n").unwrap();
+        refused(install(&fleet, &cfg, Some("~/.ssh/config"), true, false, Some(h)).await, "is ~/.ssh/config itself");
+        std::os::unix::fs::symlink(home.join(".ssh"), home.join("alias")).unwrap();
+        refused(install(&fleet, &cfg, Some("~/alias/config"), true, false, Some(h)).await, "is ~/.ssh/config itself");
+        // A path ssh would split or expand.
+        refused(install(&fleet, &cfg, Some("~/.ssh/my arena.conf"), true, false, Some(h)).await, "can't take as one plain path");
+        assert_eq!(std::fs::read_to_string(home.join(".ssh/config")).unwrap(), "Host box\n");
+        assert!(kept_copies(&home).is_empty());
+        // An Include only inside a block: --uninstall leaves it, and keeps no copy.
+        let block = "Host box\n    Include ~/.ssh/arena.conf\n";
+        std::fs::write(home.join(".ssh/config"), block).unwrap();
+        uninstall(&cfg, None, true, false, Some(h)).unwrap();
+        assert_eq!(std::fs::read_to_string(home.join(".ssh/config")).unwrap(), block);
+        assert!(kept_copies(&home).is_empty());
+        // Someone else's home (here `/`, root's): refused — unless this test runs as `/`'s owner.
+        if !arena_core::sshconfig::owned_by_me(&std::fs::metadata("/").unwrap()) {
+            refused(install(&fleet, &cfg, Some("/nonexistent-arena/x.conf"), true, false, Some("/")).await, "isn't owned by this user");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// `config check`'s SSH_CONFIG_FILE row: off, a bad value (counted), not written yet, not
     /// arena's, and arena's — included by ~/.ssh/config before any block, inside one, or not.
     #[cfg(unix)]
@@ -20175,7 +20335,15 @@ ASK_AI=gpt
         assert!(matches!(parse(&["--install"]).unwrap(), Cmd::SshConfig { install: Some(None), .. }));
         assert!(matches!(parse(&["--install", "~/x.conf"]).unwrap(), Cmd::SshConfig { install: Some(Some(p)), .. } if p == "~/x.conf"));
         assert!(matches!(parse(&["--uninstall", "--dry-run"]).unwrap(), Cmd::SshConfig { uninstall: Some(None), dry_run: true, .. }));
-        for bad in [&["--install", "--uninstall"][..], &["--install", "--proxy"], &["--uninstall", "--out", "/x"]] {
+        for bad in [
+            &["--install", "--uninstall"][..],
+            &["--install", "--proxy"],
+            &["--uninstall", "--out", "/x"],
+            // A dry run of what isn't a setup would be ignored, and `--out` write anyway.
+            &["--dry-run"],
+            &["--out", "/x", "--dry-run"],
+            &["--proxy", "--dry-run"],
+        ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
     }

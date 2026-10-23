@@ -225,10 +225,16 @@ pub fn sync_file(path: &Path, want: &str) -> Result<bool, String> {
 /// Write `text` to `path` atomically: a temp file beside it (mode `mode`, synced), renamed over
 /// it — a reader (ssh) sees the old file or the new one, never half of one. The folder is made
 /// (0700, as `~/.ssh` must be) when missing. The temp file is removed if anything fails.
+///
+/// The temp name is new for every write (pid, a counter, the time) and created exclusively
+/// (`create_new`, O_EXCL — which never follows a symlink): two writes in one process never share
+/// it, and nothing already at that name — a stale temp, or a link someone planted to a key — is
+/// ever opened, truncated or chmod-ed.
 pub fn write_atomic(path: &Path, text: &str, mode: u32) -> Result<(), String> {
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let shown = path.display();
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     if !dir.exists() {
@@ -239,16 +245,27 @@ pub fn write_atomic(path: &Path, text: &str, mode: u32) -> Result<(), String> {
         b.create(dir).map_err(|e| format!("making {}: {e}", dir.display()))?;
     }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.arena-tmp-{}", std::process::id()));
+    let (mut f, tmp) = {
+        let mut tries = 0;
+        loop {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp = dir.join(format!(".{name}.arena-tmp-{}-{seq}-{nanos}", std::process::id()));
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true);
+            #[cfg(unix)]
+            o.mode(mode);
+            match o.open(&tmp) {
+                Ok(f) => break (f, tmp),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 16 => tries += 1,
+                Err(e) => return Err(format!("writing {shown}: {e}")),
+            }
+        }
+    };
     let written = (|| -> std::io::Result<()> {
-        let mut o = std::fs::OpenOptions::new();
-        o.write(true).create(true).truncate(true);
+        // Through the open file (fchmod), so exactly `mode`: the umask narrows it at creation.
         #[cfg(unix)]
-        o.mode(mode);
-        let mut f = o.open(&tmp)?;
-        // `mode` above applies only to a file it creates: a stale temp keeps its own.
-        #[cfg(unix)]
-        std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+        f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)
@@ -332,12 +349,41 @@ pub fn with_include_first(config: &str, path: &str) -> String {
     format!("Include {path}{eol}{config}")
 }
 
-/// `config` without its `Include` line(s) for `forms`, everything else byte for byte; `None`
-/// when it has none. Pure.
+/// `config` without its global `Include` line(s) for `forms` — before any `Host`/`Match` block,
+/// where `--install` puts it — everything else byte for byte; `None` when it has none. One inside
+/// a block is the user's own choice, left as it is (as `--install` leaves it). Pure.
 pub fn without_include(config: &str, forms: &[&str]) -> Option<String> {
-    let kept: Vec<&str> = config.split_inclusive('\n').filter(|l| !is_include_of(l, forms)).collect();
-    let out = kept.concat();
-    (out.len() != config.len()).then_some(out)
+    let (mut in_block, mut removed) = (false, false);
+    let mut out = String::with_capacity(config.len());
+    for line in config.split_inclusive('\n') {
+        if !in_block && is_include_of(line, forms) {
+            removed = true;
+            continue;
+        }
+        in_block |= starts_block(line.trim_start());
+        out.push_str(line);
+    }
+    removed.then_some(out)
+}
+
+/// Why `path` can't go in an `Include` line as one plain argument, if it can't: ssh splits its
+/// arguments on whitespace, reads quotes and `#`, and expands globs (`*?[]`), `${…}`, `%` tokens
+/// and backslash escapes in it — any of which would include some other file, or none. Pure.
+pub fn include_path_problem(path: &str) -> Option<String> {
+    let bad = |c: char| c.is_whitespace() || c.is_control() || "\"'\\#$%*?[]".contains(c);
+    path.chars().find(|c| bad(*c)).map(|c| {
+        format!("{path} has {c:?} in it, which an ssh `Include` line can't take as one plain path — choose a path without it")
+    })
+}
+
+/// Whether `meta`'s owner is this process's effective user — what `ssh-config --install` asks of
+/// `~/.ssh` and every file it edits there: run as someone else (sudo keeping `HOME`), it would
+/// leave them owned by that user, and the files it writes unreadable to their owner's ssh.
+#[cfg(unix)]
+pub fn owned_by_me(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid takes no arguments, can't fail and touches no memory of ours.
+    meta.uid() == unsafe { libc::geteuid() }
 }
 
 #[cfg(test)]
@@ -445,12 +491,28 @@ mod tests {
         assert_eq!(added, format!("Include ~/.ssh/arena.conf\n{mine}"));
         assert_eq!(include_at(&added, &forms), IncludeAt::Global);
         assert_eq!(with_include_first("Host a\r\n  User b\r\n", "~/x"), "Include ~/x\r\nHost a\r\n  User b\r\n");
-        // Removed exactly: every copy of the line, nothing else touched (CRLF kept).
+        // Removed exactly: every global copy of the line, nothing else touched (CRLF kept); one
+        // inside a Host/Match block is the user's, left as it is.
         assert_eq!(without_include(&added, &forms).as_deref(), Some(mine));
+        let twice = "Include ~/.ssh/arena.conf\n# mine\ninclude /home/u/.ssh/arena.conf\nHost a\n";
+        assert_eq!(without_include(twice, &forms).as_deref(), Some("# mine\nHost a\n"));
         let crlf = "Include ~/.ssh/arena.conf\r\nHost a\r\n  User b\r\nInclude=/home/u/.ssh/arena.conf";
-        assert_eq!(without_include(crlf, &forms).as_deref(), Some("Host a\r\n  User b\r\n"));
+        assert_eq!(without_include(crlf, &forms).as_deref(), Some("Host a\r\n  User b\r\nInclude=/home/u/.ssh/arena.conf"));
+        assert_eq!(without_include("Host a\n    Include ~/.ssh/arena.conf\n", &forms), None, "only in a block: nothing");
         assert_eq!(without_include(mine, &forms), None);
         assert_eq!(without_include("Include ~/.ssh/arena.conf.bak\n", &forms), None);
+    }
+
+    /// A path goes in an `Include` line only as one plain argument: nothing ssh would split on,
+    /// unquote, expand or read as a comment.
+    #[test]
+    fn include_paths_are_plain_or_refused() {
+        for ok in ["~/.ssh/arena.conf", "/home/u/.ssh/fleet-2.conf", "~/.ssh/a_b.c@d+e,f=g"] {
+            assert_eq!(include_path_problem(ok), None, "{ok}");
+        }
+        for bad in ["~/.ssh/my arena.conf", "~/.ssh/a\tb", "~/x\"y", "~/x'y", "~/x\\y", "~/x#y", "~/${X}", "~/%d.conf", "~/*.conf", "~/a?", "~/[a]", "~/a\nb"] {
+            assert!(include_path_problem(bad).is_some_and(|e| e.contains("can't take as one plain path")), "{bad:?}");
+        }
     }
 
     /// The layout follows the config: the proxy's stable ports when `SSH_PROXY_HOST` is set,
@@ -520,7 +582,36 @@ mod tests {
         assert!(sync_file(&base.join(".ssh"), &newer).unwrap_err().contains("isn't a regular file"));
         let leftovers: Vec<_> = std::fs::read_dir(base.join(".ssh")).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(leftovers, ["arena.conf"], "no temp file left");
+        // Writes from many threads at once never share a temp file: each one succeeds, and the
+        // file is always one whole text, never a mix. The mode is exact whatever the umask did.
+        let texts: Vec<String> = (0..8).map(|i| managed_text(&format!("Host t{i}\n{}", "    User x\n".repeat(40 * (i + 1))))).collect();
+        std::thread::scope(|s| {
+            for text in &texts {
+                let path = &path;
+                s.spawn(move || {
+                    for _ in 0..20 {
+                        write_atomic(path, text, 0o666).unwrap();
+                    }
+                });
+            }
+        });
+        assert!(texts.contains(&std::fs::read_to_string(&path).unwrap()), "one whole text");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o666);
+        let leftovers: Vec<_> = std::fs::read_dir(base.join(".ssh")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers, ["arena.conf"], "no temp file left");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `owned_by_me`: a file this process made is its own; `/` is root's (unless this is root).
+    #[cfg(unix)]
+    #[test]
+    fn owned_by_me_tells_this_user_s_files_from_root_s() {
+        let f = std::env::temp_dir().join(format!("arena-owned-{}", std::process::id()));
+        std::fs::write(&f, "").unwrap();
+        assert!(owned_by_me(&std::fs::metadata(&f).unwrap()));
+        let _ = std::fs::remove_file(&f);
+        // SAFETY: geteuid can't fail and touches no memory of ours.
+        assert_eq!(owned_by_me(&std::fs::metadata("/").unwrap()), unsafe { libc::geteuid() } == 0);
     }
 
     /// `sync_for`: off without the key; the path's error, or the file's, as the caller's warning.

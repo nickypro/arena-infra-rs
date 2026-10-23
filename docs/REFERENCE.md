@@ -906,7 +906,8 @@ endpoints by default, or stable proxy ports (`--proxy`) anchored to each machine
 #### Keeping your own `~/.ssh/config` current (`SSH_CONFIG_FILE`)
 
 For one person reaching their own pods: `ssh-config --install [PATH]` (once) and
-`SSH_CONFIG_FILE=~/.ssh/arena.conf` in the config.
+`SSH_CONFIG_FILE=~/.ssh/arena.conf` in the config. On a box that runs arena's cron lines for a
+cohort (backups, the reaper), leave the key unset: each tick would rewrite that user's file.
 
 - **`--install`** writes PATH (default `SSH_CONFIG_FILE`, else `~/.ssh/arena.conf`; `~/` is your
   home) and makes `Include PATH` the **first line** of `~/.ssh/config` — ssh applies an `Include`
@@ -917,7 +918,14 @@ For one person reaching their own pods: `ssh-config --install [PATH]` (once) and
   isn't set yet. A second run changes nothing. An `Include` already inside a `Host`/`Match` block
   is left for you to move. A file at PATH that isn't arena's is replaced only after asking, with a
   copy kept. It needs a complete listing (a provider that failed to list would drop its pods).
-- **`--uninstall [PATH]`** takes exactly that `Include` line out (a copy kept); PATH stays.
+- **What it won't edit** (checked before writing anything, and again after asking): a
+  `~/.ssh/config` or PATH that is a symlink (edit the file it points to yourself) or isn't a
+  regular file; one owned by another user, or in a `~/.ssh` that is (run it as the user whose
+  `~/.ssh` it is — not under `sudo`); PATH being `~/.ssh/config` itself; a PATH with whitespace,
+  quotes or any of `#$%*?[]\` (ssh's `Include` would read it as something else); a file edited
+  while it asked.
+- **`--uninstall [PATH]`** takes exactly that `Include` line out — the global one(s); one inside a
+  `Host`/`Match` block is yours and stays — with a copy kept; PATH stays.
 - **With `SSH_CONFIG_FILE` set**, PATH is kept current: after every pod change (create, up, start,
   restart, reimage, replace, migrate, rename, terminate and the reaper — beside their proxy sync,
   one `[ssh-config] after …: rewrote …` line; `--skip-proxy` skips it too), and on `pods list` and
