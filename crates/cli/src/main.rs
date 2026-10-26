@@ -5243,7 +5243,7 @@ fn hetzner_rows(cfg: &Config) -> Vec<String> {
     };
     vec![
         row("HETZNER_SERVER_TYPE", &o.server_type, " — `pods create/up --server-type` overrides it"),
-        row("HETZNER_LOCATION", o.location.as_deref().unwrap_or("-"), ""),
+        row("HETZNER_LOCATION", &o.locations.describe(), ""),
         row("HETZNER_IMAGE", &o.image, ""),
         key_row,
         format!(

@@ -2,11 +2,16 @@
 //!
 //! Unlike RunPod/Vast this isn't a GPU container host: it provisions an ordinary
 //! cloud VM, so the GPU-centric fields of a [`PodSpec`] don't apply. Hetzner instead
-//! takes its sizing (`server_type`), OS (`image`), `location`, and `ssh_keys` from
+//! takes its sizing (`server_type`), OS (`image`), `locations`, and `ssh_keys` from
 //! its own `HETZNER_*` config, read once at construction; from a `PodSpec` it uses
 //! only the `name` and `server_type` (`--server-type`, over `HETZNER_SERVER_TYPE`). VMs come
 //! up on a real public IP with SSH on `:22`, so they slot straight into the same
 //! proxy/`pods up` flow as the GPU providers.
+//!
+//! Where a VM goes is no one's preference by default ([`Locations`]): with `HETZNER_LOCATION`
+//! unset, a create tries every location that sells the server type, cheapest first, and moves
+//! on when one has no room (live 2026-10-26: cx23 read "low availability" in fsn1, nbg1 and hel1
+//! at once). A location set there pins it, or a list orders the walk.
 //!
 //! A refused create is explained from the project itself ([`HetznerProvider::explain_create_error`]):
 //! a missing SSH key names the project's keys and what to set, a server type the location
@@ -34,7 +39,8 @@ pub(crate) const BASE: &str = "https://api.hetzner.cloud/v1";
 pub struct HetznerOpts {
     pub server_type: String,
     pub image: String,
-    pub location: Option<String>,
+    /// Where creates go ([`Locations`]; `HETZNER_LOCATION`). Default: any location.
+    pub locations: Locations,
     /// Names (or ids) of SSH keys already uploaded to the Hetzner project.
     pub ssh_keys: Vec<String>,
     /// The config key that named `ssh_keys`: `HETZNER_SSH_KEY`, or `MACHINE_NAME_PREFIX` when
@@ -51,11 +57,12 @@ impl Default for HetznerOpts {
         Self {
             // cx23: newest Intel **x86** shared vCPU (2 vCPU / 4 GB). The old cx/cax lines
             // had poor availability; cx23 is the current gen. Override via
-            // HETZNER_SERVER_TYPE. Default location nbg1 (EU) — x86 shared types are
-            // EU-only, so a pinned location avoids the US auto-placement failure.
+            // HETZNER_SERVER_TYPE. Any location that sells it ([`Locations::ANY`]): never
+            // Hetzner's own auto-placement, which could land an EU-only x86 type on a US DC
+            // and fail with "error during placement".
             server_type: "cx23".into(),
             image: "ubuntu-24.04".into(),
-            location: Some("nbg1".into()),
+            locations: Locations::ANY,
             ssh_keys: Vec::new(),
             ssh_keys_from: "MACHINE_NAME_PREFIX",
             pubkey_file: None,
@@ -78,15 +85,71 @@ impl HetznerOpts {
             None => (vec![cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string()], "MACHINE_NAME_PREFIX"),
         };
         Self {
-            // cx23 in nbg1 (see `Default`): the location is always pinned — the x86 shared types
-            // live only in the EU DCs, so no-location auto-placement can land on a US DC that
-            // lacks them and fail with "error during placement".
             server_type: cfg.get("HETZNER_SERVER_TYPE").map_or(d.server_type, String::from),
             image: cfg.get("HETZNER_IMAGE").map_or(d.image, String::from),
-            location: Some(cfg.get("HETZNER_LOCATION").unwrap_or("nbg1").to_string()),
+            locations: Locations::parse(cfg.get("HETZNER_LOCATION")),
             ssh_keys,
             ssh_keys_from,
             pubkey_file: set("SHARED_SSH_KEY_PATH").map(|p| format!("{p}.pub")),
+        }
+    }
+}
+
+/// Where creates go, from `HETZNER_LOCATION`: the locations named, in their order, and — when
+/// `any` — then every other location that sells the server type ([`location_walk`]).
+/// - unset, empty or `any`: any location, cheapest first;
+/// - `nbg1`: only nbg1 (as before this setting took a list);
+/// - `nbg1,fsn1`: those two, in that order;
+/// - `nbg1,any`: nbg1 first, then any other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Locations {
+    /// Tried first, in this order (lowercased, deduped).
+    pub listed: Vec<String>,
+    /// Then every other location that sells the type.
+    pub any: bool,
+}
+
+impl Locations {
+    /// Any location: what an unset `HETZNER_LOCATION` means.
+    pub const ANY: Self = Self { listed: Vec::new(), any: true };
+
+    /// `HETZNER_LOCATION`'s value (`None` = unset) — commas or spaces between names. Pure.
+    pub fn parse(raw: Option<&str>) -> Self {
+        let mut listed: Vec<String> = Vec::new();
+        let mut any = false;
+        for word in raw.unwrap_or("").split(|c: char| c == ',' || c.is_whitespace()).map(str::trim).filter(|w| !w.is_empty()) {
+            let word = word.to_ascii_lowercase();
+            if word == "any" {
+                any = true;
+            } else if !listed.contains(&word) {
+                listed.push(word);
+            }
+        }
+        Self { any: any || listed.is_empty(), listed }
+    }
+
+    /// The one location a create is pinned to, if that's all there is to try.
+    pub fn pinned(&self) -> Option<&str> {
+        match (self.listed.as_slice(), self.any) {
+            ([one], false) => Some(one),
+            _ => None,
+        }
+    }
+
+    /// The first location named, if any — the archive's default (one server and its volumes,
+    /// which must share a location, so it can't walk).
+    pub fn first(&self) -> Option<&str> {
+        self.listed.first().map(String::as_str)
+    }
+
+    /// How `config check` and the create preview say it: `any (cheapest first, the next when
+    /// one has no room)`, `nbg1`, `nbg1, fsn1 (in that order)`, `nbg1, then any`. Pure.
+    pub fn describe(&self) -> String {
+        match (self.listed.as_slice(), self.any) {
+            ([], _) => "any (cheapest first, the next when one has no room)".into(),
+            ([one], false) => one.clone(),
+            (many, false) => format!("{} (in that order)", many.join(", ")),
+            (some, true) => format!("{}, then any", some.join(", ")),
         }
     }
 }
@@ -188,13 +251,14 @@ impl HetznerProvider {
     /// an auth failure, a throttle, a 5xx or a transport error — and with two read-only GETs:
     /// - `GET /ssh_keys`: a key the create named that the project lacks → which, the keys it
     ///   has, and what to set or upload ([`missing_key_advice`]);
-    /// - `GET /server_types`: a type that can't be ordered at the location → the types that can
-    ///   ([`type_advice`]), tagged `Rejected`: placement skips the option instead of waiting for
-    ///   capacity that won't come (a "not available in" wording reads as capacity otherwise).
+    /// - `GET /server_types`: a type that can't be ordered at `location` (the one create pinned
+    ///   there; `None` after a walk of several) → the types that can ([`type_advice`]), tagged
+    ///   `Rejected`: placement skips the option instead of waiting for capacity that won't come
+    ///   (a "not available in" wording reads as capacity otherwise).
     ///
     /// The API's own answer stays first, and a lookup that fails or finds nothing wrong adds
     /// nothing: this only ever explains the error, never replaces it.
-    async fn explain_create_error(&self, e: Error, server_type: &str) -> Error {
+    async fn explain_create_error(&self, e: Error, server_type: &str, location: Option<&str>) -> Error {
         use crate::error::ProviderErrorKind as K;
         let (mut kind, message) = match &e {
             Error::Provider { kind, message } if matches!(kind, K::Other | K::Capacity | K::Rejected) => (*kind, message.clone()),
@@ -208,7 +272,7 @@ impl HetznerProvider {
         }
         let now = crate::snapshot::unix_now();
         if let Some(note) =
-            self.get_all("server_types").await.ok().and_then(|types| type_advice(&types, server_type, self.opts.location.as_deref(), now))
+            self.get_all("server_types").await.ok().and_then(|types| type_advice(&types, server_type, location, now))
         {
             notes.push(note);
             kind = K::Rejected;
@@ -217,6 +281,60 @@ impl HetznerProvider {
             return e;
         }
         Error::Provider { kind, message: format!("{message} — {}", notes.join(" — ")) }
+    }
+}
+
+impl HetznerProvider {
+    /// The locations a create of `spec` tries, in order ([`location_walk`]); `None` = no
+    /// `location` in the body. Only a walk with `any` in it reads `GET /server_types`. Without
+    /// that answer the listed locations are all there is — or, with none listed, one create
+    /// without a location: Hetzner then places it, as it would anyway. An `--api-json`
+    /// `datacenter` names the place itself (Hetzner refuses it next to a `location`): one
+    /// create, as asked. `Err`: nothing to try (a type Hetzner doesn't have, or sells nowhere).
+    async fn walk_for(&self, ty: &str, spec: &PodSpec) -> Result<Vec<Option<String>>> {
+        if spec.api_extra.as_ref().is_some_and(|x| x.contains_key("datacenter")) {
+            return Ok(vec![None]);
+        }
+        let locations = &self.opts.locations;
+        if !locations.any {
+            return Ok(locations.listed.iter().cloned().map(Some).collect());
+        }
+        match self.get_all("server_types").await {
+            Ok(types) => {
+                let now = crate::snapshot::unix_now();
+                let walk = location_walk(&types, ty, locations, now).map_err(|why| Error::Provider { kind: crate::error::ProviderErrorKind::Rejected, message: format!("hetzner create: {why}") })?;
+                Ok(walk.into_iter().map(Some).collect())
+            }
+            Err(_) if !locations.listed.is_empty() => Ok(locations.listed.iter().cloned().map(Some).collect()),
+            Err(_) => Ok(vec![None]),
+        }
+    }
+}
+
+/// Whether a refused create means "no room for this type here", so the next location may have
+/// some: Hetzner's `resource_unavailable` (HTTP 412, "error during placement" — which no
+/// capacity wording catches), a `placement_error`, a type or location taken off sale there
+/// ("unsupported location for server type", a 422 — live: cpx41 in nbg1), or any error already
+/// read as capacity. Never an auth failure, a throttle or a 5xx: those
+/// stop the walk (a bad token is bad everywhere; the retry layer owns throttles and blips).
+/// The archive walks its server types on the same test.
+pub fn is_placement_error(e: &Error) -> bool {
+    use crate::error::ProviderErrorKind as K;
+    if matches!(e.kind(), Some(K::Auth | K::RateLimited | K::Transient)) {
+        return false;
+    }
+    let m = e.to_string().to_lowercase();
+    e.kind() == Some(K::Capacity)
+        || ["resource_unavailable", "placement_error", "server_type_unavailable", "server location disabled", "unsupported location"]
+            .iter()
+            .any(|n| m.contains(n))
+}
+
+/// A provider error's own words (without `provider error: `), for a message that quotes several.
+fn message_of(e: &Error) -> String {
+    match e {
+        Error::Provider { message, .. } => message.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -345,14 +463,72 @@ fn type_advice(types: &[Value], ty: &str, location: Option<&str>, now: u64) -> O
     sold.sort_by_key(|t| (low(t), location_flag(t, loc, "recommended") != Some(true)));
     let offered: Vec<String> = sold.iter().map(|t| if low(t) { tagged(&type_label(t), "low availability") } else { type_label(t) }).collect();
     Some(if sold.is_empty() {
-        format!("{why}, and Hetzner lists no type there (`arena api get hetzner server_types`) — pick another HETZNER_LOCATION")
+        format!("{why}, and Hetzner lists no type there (`arena api get hetzner server_types`) — pick another HETZNER_LOCATION (unset: any that sells it)")
     } else {
         format!(
             "{why}; available there: {} — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another \
-             HETZNER_LOCATION",
+             HETZNER_LOCATION (unset: any that sells it)",
             offered.join(", ")
         )
     })
+}
+
+/// `t`'s gross hourly price in `location`, in millionths (prices are strings, `"0.0104000000"`),
+/// or `None` when it lists none there. Pure.
+fn price_in(t: &Value, location: &str) -> Option<i64> {
+    let p = t.get("prices")?.as_array()?.iter().find(|p| p.get("location").and_then(Value::as_str) == Some(location))?;
+    let hourly = p.get("price_hourly")?;
+    let v: f64 = hourly.get("gross").or_else(|| hourly.get("net"))?.as_str()?.parse().ok()?;
+    v.is_finite().then(|| (v * 1_000_000.0).round() as i64)
+}
+
+/// The locations a create of server type `ty` tries, in order (`types`: the `GET /server_types`
+/// items): the ones `locations` lists first, as listed; then, with `any`, every other location
+/// that sells `ty` now ([`orderable_in`]) — cheapest first, then the ones Hetzner doesn't mark low
+/// on stock (`available: false` still goes through at times: live hz2), then the ones not
+/// announced as retiring, then its `recommended` ones, then the API's order. A location that
+/// doesn't sell `ty` is never added; a listed one is tried regardless (the operator asked).
+/// `Err`: what to say when there'd be nothing to try. Pure.
+fn location_walk(types: &[Value], ty: &str, locations: &Locations, now: u64) -> std::result::Result<Vec<String>, String> {
+    let mut walk = locations.listed.clone();
+    if !locations.any {
+        return Ok(walk);
+    }
+    let is = |t: &&Value| {
+        t.get("name").and_then(Value::as_str) == Some(ty) || t.get("id").and_then(Value::as_u64).is_some_and(|i| i.to_string() == ty)
+    };
+    let Some(t) = types.iter().find(is) else {
+        return if walk.is_empty() {
+            Err(format!("Hetzner has no server type `{ty}` (`arena api get hetzner server_types` lists them)"))
+        } else {
+            Ok(walk)
+        };
+    };
+    // Its locations as the answer lists them: the per-location entries, else (an older answer) the prices'.
+    let names: Vec<&str> = match t.get("locations").and_then(Value::as_array) {
+        Some(locs) => locs.iter().filter_map(|l| l.get("name").and_then(Value::as_str)).collect(),
+        None => t.get("prices").and_then(Value::as_array).into_iter().flatten().filter_map(|p| p.get("location").and_then(Value::as_str)).collect(),
+    };
+    let mut sold: Vec<(usize, &str)> = names.into_iter().enumerate().filter(|(_, l)| orderable_in(t, l, now) == Some(true)).collect();
+    sold.sort_by_key(|&(i, l)| {
+        (
+            price_in(t, l).unwrap_or(i64::MAX),
+            location_flag(t, l, "available") == Some(false),
+            deprecated_in(t, l),
+            location_flag(t, l, "recommended") != Some(true),
+            i,
+        )
+    });
+    for (_, l) in sold {
+        if !walk.iter().any(|w| w == l) {
+            walk.push(l.to_string());
+        }
+    }
+    if walk.is_empty() {
+        Err(format!("server type `{ty}` can't be ordered in any Hetzner location right now (`arena api get hetzner server_types` lists them)"))
+    } else {
+        Ok(walk)
+    }
 }
 
 /// The create-body fields this backend sets itself, refused in `--api-json` /
@@ -375,8 +551,9 @@ fn server_type<'a>(opts: &'a HetznerOpts, spec: &'a PodSpec) -> &'a str {
 /// The `POST /servers` body. Pure. Hetzner's `image` is an ID *or* a name: a system image is
 /// a name ("ubuntu-24.04"), but a snapshot has no name — it's referenced by numeric id. Send
 /// all-digits as an int so HETZNER_IMAGE can be a snapshot id. `spec.api_extra` is
-/// deep-merged in last, minus [`MANAGED`].
-fn create_payload(opts: &HetznerOpts, spec: &PodSpec) -> Result<Value> {
+/// deep-merged in last, minus [`MANAGED`]. `location`: this attempt's ([`location_walk`]);
+/// `None` sends none.
+fn create_payload(opts: &HetznerOpts, spec: &PodSpec, location: Option<&str>) -> Result<Value> {
     let image = match opts.image.parse::<u64>() {
         Ok(id) => json!(id),
         Err(_) => json!(opts.image),
@@ -387,7 +564,7 @@ fn create_payload(opts: &HetznerOpts, spec: &PodSpec) -> Result<Value> {
         "image": image,
         "start_after_create": true,
     });
-    if let Some(loc) = &opts.location {
+    if let Some(loc) = location {
         payload["location"] = json!(loc);
     }
     if !opts.ssh_keys.is_empty() {
@@ -420,13 +597,14 @@ fn parse_server(v: &Value) -> Pod {
         // Hourly price from the embedded server_type.prices (Hetzner returns them as
         // strings, per location). Prefer the price for the server's own location, else the
         // first listed; use gross (what's actually billed). EUR — the dashboard column is
-        // currency-agnostic, so it sits alongside runpod's USD as a plain cost/hr.
+        // currency-agnostic, so it sits alongside runpod's USD as a plain cost/hr. The
+        // location is the server's own `location` (live 2026-10-26: no `datacenter` any more),
+        // or an older answer's `datacenter.location` — a VM placed in sin bills sin's price.
         cost_per_hr: v.get("server_type").and_then(|t| t.get("prices")).and_then(Value::as_array).and_then(
             |prices| {
                 let loc = v
-                    .get("datacenter")
-                    .and_then(|d| d.get("location"))
-                    .and_then(|l| l.get("name"))
+                    .pointer("/location/name")
+                    .or_else(|| v.pointer("/datacenter/location/name"))
                     .and_then(Value::as_str);
                 prices
                     .iter()
@@ -520,13 +698,7 @@ impl Provider for HetznerProvider {
     fn describe(&self, spec: &PodSpec) -> String {
         // CPU VM: describe what we actually send (server type/image/location), not the
         // GPU fields the spec carries and we ignore.
-        let loc = self
-            .opts
-            .location
-            .as_deref()
-            .map(|l| format!(", location {l}"))
-            .unwrap_or_default();
-        format!("{} CPU VM, image {}{}", server_type(&self.opts, spec), self.opts.image, loc)
+        format!("{} CPU VM, image {}, location {}", server_type(&self.opts, spec), self.opts.image, self.opts.locations.describe())
     }
 
     async fn list_pods(&self) -> Result<Vec<Pod>> {
@@ -557,15 +729,52 @@ impl Provider for HetznerProvider {
         )))
     }
 
+    /// One create per location of the walk ([`HetznerProvider::walk_for`]), until one takes it:
+    /// a location with no room ([`is_placement_error`]) moves on to the next; any other refusal
+    /// stops, explained. When no location had room the error is `Capacity` (so `--keep-trying`
+    /// waits for some) and says what each answered. A refused create makes no server, so the
+    /// name is still free for the next location.
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
-        let payload = create_payload(&self.opts, spec)?;
-        let body = match send_json(self.auth(self.client.post(format!("{}/servers", self.base)).json(&payload)), "hetzner create").await {
-            Ok(body) => body,
-            Err(e) => return Err(self.explain_create_error(e, server_type(&self.opts, spec)).await),
-        };
-        // The created server is under `server`; parse what's there (IP may not be
-        // populated until it finishes provisioning — `pods up` polls for that).
-        Ok(parse_server(body.get("server").unwrap_or(&body)))
+        use crate::error::ProviderErrorKind as K;
+        let ty = server_type(&self.opts, spec);
+        let walk = self.walk_for(ty, spec).await?;
+        let url = format!("{}/servers", self.base);
+        let mut no_room: Vec<String> = Vec::new();
+        for (i, loc) in walk.iter().enumerate() {
+            let payload = create_payload(&self.opts, spec, loc.as_deref())?;
+            let e = match send_json(self.auth(self.client.post(&url).json(&payload)), "hetzner create").await {
+                // The created server is under `server`; parse what's there (IP may not be
+                // populated until it finishes provisioning — `pods up` polls for that).
+                Ok(body) => return Ok(parse_server(body.get("server").unwrap_or(&body))),
+                Err(e) => e,
+            };
+            let full = is_placement_error(&e);
+            let here = loc.as_deref().unwrap_or("Hetzner's choice");
+            if full && i + 1 < walk.len() {
+                no_room.push(format!("{here}: {}", message_of(&e)));
+                continue;
+            }
+            let e = match (full, no_room.is_empty()) {
+                (true, true) => Error::Provider { kind: K::Capacity, message: message_of(&e) },
+                (true, false) => {
+                    no_room.push(format!("{here}: {}", message_of(&e)));
+                    let tried: Vec<&str> = walk.iter().map(|l| l.as_deref().unwrap_or("Hetzner's choice")).collect();
+                    Error::Provider {
+                        kind: K::Capacity,
+                        message: format!("hetzner create: no room for {ty} in {} — {}", tried.join(", "), no_room.join("; ")),
+                    }
+                }
+                (false, true) => e,
+                (false, false) => match e {
+                    Error::Provider { kind, message } => {
+                        Error::Provider { kind, message: format!("{message} (in {here}, after no room in: {})", no_room.join("; ")) }
+                    }
+                    other => other,
+                },
+            };
+            return Err(self.explain_create_error(e, ty, if walk.len() == 1 { loc.as_deref() } else { None }).await);
+        }
+        Err(Error::provider("hetzner create: no location to try"))
     }
 
     async fn stop_pod(&self, id: &str) -> Result<()> {
@@ -621,8 +830,10 @@ impl Provider for HetznerProvider {
         apiextra::check(extra, MANAGED, None)
     }
 
+    /// The body of the walk's first create when that needs no lookup: the first listed
+    /// location (or none, for `any` alone — `describe` says where it would go).
     fn preview_create_body(&self, spec: &PodSpec) -> Result<Value> {
-        create_payload(&self.opts, spec)
+        create_payload(&self.opts, spec, self.opts.locations.first())
     }
 }
 
@@ -836,28 +1047,29 @@ mod tests {
         let opts = HetznerOpts::from_config(&crate::config::Config::parse("HETZNER_SERVER_TYPE=cx33\n"));
         let p = HetznerProvider::new("k", opts.clone());
         for (flag, want) in [(Some("cpx42"), "cpx42"), (None, "cx33")] {
-            let body = create_payload(&opts, &spec("devtest-a", flag)).unwrap();
+            let body = create_payload(&opts, &spec("devtest-a", flag), None).unwrap();
             assert_eq!(body["server_type"], want, "{flag:?}");
             assert_eq!(p.preview_create_body(&spec("devtest-a", flag)).unwrap()["server_type"], want);
             assert!(p.describe(&spec("devtest-a", flag)).starts_with(&format!("{want} CPU VM")), "{flag:?}");
         }
-        assert_eq!(create_payload(&HetznerOpts::default(), &spec("x", None)).unwrap()["server_type"], "cx23");
+        assert_eq!(create_payload(&HetznerOpts::default(), &spec("x", None), None).unwrap()["server_type"], "cx23");
     }
 
     /// The options as `build` reads them: the default key named after the prefix — and that
     /// it was the default, for the missing-key advice — or HETZNER_SSH_KEY's; the cohort key's
-    /// `.pub` to upload. Unset keys keep today's defaults.
+    /// `.pub` to upload. Unset keys keep their defaults — any location, since that setting was
+    /// added (before, nbg1).
     #[test]
     fn options_from_config_say_where_the_key_name_came_from() {
         let o = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=arena9\nSHARED_SSH_KEY_PATH=/k/arena9_key\n"));
         assert_eq!((o.ssh_keys.as_slice(), o.ssh_keys_from), (&["arena9".to_string()][..], "MACHINE_NAME_PREFIX"));
         assert_eq!(o.pubkey_file.as_deref(), Some("/k/arena9_key.pub"));
-        assert_eq!((o.server_type.as_str(), o.image.as_str(), o.location.as_deref()), ("cx23", "ubuntu-24.04", Some("nbg1")));
+        assert_eq!((o.server_type.as_str(), o.image.as_str(), &o.locations), ("cx23", "ubuntu-24.04", &Locations::ANY));
         let o = HetznerOpts::from_config(&crate::config::Config::parse(
             "MACHINE_NAME_PREFIX=arena9\nHETZNER_SSH_KEY=arena8\nHETZNER_LOCATION=fsn1\nHETZNER_SERVER_TYPE=cpx42\n",
         ));
         assert_eq!((o.ssh_keys.as_slice(), o.ssh_keys_from), (&["arena8".to_string()][..], "HETZNER_SSH_KEY"));
-        assert_eq!((o.server_type.as_str(), o.location.as_deref(), o.pubkey_file), ("cpx42", Some("fsn1"), None));
+        assert_eq!((o.server_type.as_str(), o.locations.pinned(), o.pubkey_file), ("cpx42", Some("fsn1"), None));
         // An empty HETZNER_SSH_KEY is unset, as before: the prefix's key.
         let o = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=arena9\nHETZNER_SSH_KEY=\n"));
         assert_eq!((o.ssh_keys[0].as_str(), o.ssh_keys_from), ("arena9", "MACHINE_NAME_PREFIX"));
@@ -950,7 +1162,9 @@ mod tests {
             canned(200, "application/json", SSH_KEYS),
             canned(200, "application/json", SERVER_TYPES),
         ]);
-        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=arena9\nSHARED_SSH_KEY_PATH=/k/arena9_key\n"));
+        let opts = HetznerOpts::from_config(&crate::config::Config::parse(
+            "MACHINE_NAME_PREFIX=arena9\nSHARED_SSH_KEY_PATH=/k/arena9_key\nHETZNER_LOCATION=nbg1\n",
+        ));
         let e = provider(&srv.base, opts).create_pod(&spec("arena9-evals", None)).await.unwrap_err();
         let m = e.to_string();
         assert!(m.contains("hetzner create HTTP 404") && m.contains("SSH key not found"), "the API's answer first: {m}");
@@ -991,7 +1205,9 @@ mod tests {
                 canned(200, "application/json", SSH_KEYS),
                 canned(200, "application/json", SERVER_TYPES),
             ]);
-            let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=arena9\nHETZNER_SSH_KEY=arena8\n"));
+            let opts = HetznerOpts::from_config(&crate::config::Config::parse(
+                "MACHINE_NAME_PREFIX=arena9\nHETZNER_SSH_KEY=arena8\nHETZNER_LOCATION=nbg1\n",
+            ));
             let e = provider(&srv.base, opts).create_pod(&spec("arena9-evals", Some("cpx41"))).await.unwrap_err();
             let m = e.to_string();
             assert!(m.contains(&format!("hetzner create HTTP {status}")), "{m}");
@@ -1016,7 +1232,7 @@ mod tests {
     async fn only_a_refusal_is_explained_and_a_failed_lookup_adds_nothing() {
         use crate::error::ProviderErrorKind as K;
         use crate::http::test_server::{canned, serve};
-        let opts = || HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=arena9\n"));
+        let opts = || HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=arena9\nHETZNER_LOCATION=nbg1\n"));
         for (status, kind) in [(401, K::Auth), (429, K::RateLimited), (503, K::Transient)] {
             let srv = serve(vec![canned(status, "application/json", r#"{"error":{"code":"x","message":"no"}}"#)]);
             let e = provider(&srv.base, opts()).create_pod(&spec("arena9-a", None)).await.unwrap_err();
@@ -1147,12 +1363,12 @@ mod tests {
             ("cx33", Some("nbg1"), None),  // low on stock there right now: capacity, which a retry may get
             ("cx23", Some("hel1"), None),
             ("114", Some("nbg1"), None),   // by id
-            ("cpx41", Some("nbg1"), Some(format!("server type `cpx41` can't be ordered in nbg1; available there: {sold} — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION"))),
-            ("cpx99", Some("nbg1"), Some(format!("Hetzner has no server type `cpx99`; available there: {sold} — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION"))),
-            ("cx23", Some("ash"), Some("server type `cx23` can't be ordered in ash; available there: cpx41 (8 vCPU, 16 GB), ccx13 (2 vCPU, 8 GB) — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION".into())),
+            ("cpx41", Some("nbg1"), Some(format!("server type `cpx41` can't be ordered in nbg1; available there: {sold} — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION (unset: any that sells it)"))),
+            ("cpx99", Some("nbg1"), Some(format!("Hetzner has no server type `cpx99`; available there: {sold} — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION (unset: any that sells it)"))),
+            ("cx23", Some("ash"), Some("server type `cx23` can't be ordered in ash; available there: cpx41 (8 vCPU, 16 GB), ccx13 (2 vCPU, 8 GB) — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION (unset: any that sells it)".into())),
             // hel1: both free ones are recommended (live), and come first; the low-on-stock cx23 and cx33 last, tagged.
-            ("cpx41", Some("hel1"), Some("server type `cpx41` can't be ordered in hel1; available there: cpx42 (8 vCPU, 16 GB), cax11 (2 vCPU, 4 GB, arm), cx23 (2 vCPU, 4 GB, low availability), cx33 (4 vCPU, 8 GB, low availability) — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION".into())),
-            ("cx23", Some("hil"), Some("server type `cx23` can't be ordered in hil, and Hetzner lists no type there (`arena api get hetzner server_types`) — pick another HETZNER_LOCATION".into())),
+            ("cpx41", Some("hel1"), Some("server type `cpx41` can't be ordered in hel1; available there: cpx42 (8 vCPU, 16 GB), cax11 (2 vCPU, 4 GB, arm), cx23 (2 vCPU, 4 GB, low availability), cx33 (4 vCPU, 8 GB, low availability) — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION (unset: any that sells it)".into())),
+            ("cx23", Some("hil"), Some("server type `cx23` can't be ordered in hil, and Hetzner lists no type there (`arena api get hetzner server_types`) — pick another HETZNER_LOCATION (unset: any that sells it)".into())),
             ("cpx41", None, None),
             ("cpx99", None, Some("Hetzner has no server type `cpx99` (`arena api get hetzner server_types` lists them)".into())),
         ];
@@ -1171,7 +1387,7 @@ mod tests {
             type_advice(&low, "cpx41", Some("nbg1"), now).as_deref(),
             Some(
                 "Hetzner has no server type `cpx41`; available there: cx23 (2 vCPU, 4 GB, low availability), cx33 (low availability) \
-                 — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION"
+                 — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION (unset: any that sells it)"
             )
         );
         // Low on stock outranks recommended and the API's order: a type that's available goes first.
@@ -1187,5 +1403,235 @@ mod tests {
         // An older answer without the flags: offered as before.
         let unflagged = [json!({"name": "cx22", "cores": 2, "memory": 4, "locations": [{"name": "nbg1", "deprecation": null}]})];
         assert!(type_advice(&unflagged, "cpx41", Some("nbg1"), now).unwrap().contains("available there: cx22 (2 vCPU, 4 GB) — "));
+    }
+
+    /// `HETZNER_LOCATION`: unset, empty or `any` is any location; one name pins it; a list orders
+    /// the walk (commas or spaces, case and repeats ignored); `any` in a list adds the rest.
+    #[test]
+    fn hetzner_location_reads_as_any_one_or_an_ordered_list() {
+        let l = |raw: Option<&str>| Locations::parse(raw);
+        for raw in [None, Some(""), Some("  "), Some("any"), Some("ANY"), Some(",")] {
+            assert_eq!(l(raw), Locations::ANY, "{raw:?}");
+        }
+        assert_eq!(l(Some("nbg1")).pinned(), Some("nbg1"));
+        assert_eq!(l(Some(" NBG1, fsn1 nbg1 ")), Locations { listed: vec!["nbg1".into(), "fsn1".into()], any: false });
+        assert_eq!(l(Some("hel1,any")), Locations { listed: vec!["hel1".into()], any: true });
+        assert_eq!(l(Some("hel1,any")).pinned(), None);
+        assert_eq!((l(None).first(), l(Some("fsn1,nbg1")).first()), (None, Some("fsn1")));
+        let said: Vec<String> = [None, Some("nbg1"), Some("nbg1,fsn1"), Some("nbg1,any")].iter().map(|r| l(*r).describe()).collect();
+        assert_eq!(said, ["any (cheapest first, the next when one has no room)", "nbg1", "nbg1, fsn1 (in that order)", "nbg1, then any"]);
+    }
+
+    /// The walk for `any`, from the recorded `GET /server_types`: every location that sells the
+    /// type now — cheapest, then not low on stock, then not retiring, then recommended, then
+    /// the API's order — after the listed ones. Retired and unlisted locations never join; a
+    /// type Hetzner doesn't have, or sells nowhere now, is said instead. Pure.
+    #[test]
+    fn the_location_walk_takes_every_location_that_sells_the_type() {
+        let types: Vec<Value> = serde_json::from_str::<Value>(SERVER_TYPES).unwrap()["server_types"].as_array().unwrap().clone();
+        let now = 1_792_000_000; // 2026-10: cpx41 retired in the EU DCs, cpx22's retirement in nbg1 only announced.
+        let walk = |ty: &str, raw: Option<&str>| location_walk(&types, ty, &Locations::parse(raw), now);
+        // cx23: one price; nbg1 isn't low on stock, fsn1 and hel1 are (API order between them).
+        assert_eq!(walk("cx23", None).unwrap(), ["nbg1", "fsn1", "hel1"]);
+        assert_eq!(walk("114", None).unwrap(), ["nbg1", "fsn1", "hel1"], "by id too");
+        // cpx42: all in stock, one price; Hetzner's recommended ones first.
+        assert_eq!(walk("cpx42", None).unwrap(), ["nbg1", "hel1", "fsn1"]);
+        // Retired everywhere but ash; sold only in ash; a retirement only announced still sells.
+        assert_eq!(walk("cpx41", None).unwrap(), ["ash"]);
+        assert_eq!(walk("ccx13", None).unwrap(), ["ash"]);
+        assert_eq!(walk("cpx22", None).unwrap(), ["nbg1"]);
+        // Listed first, as listed (even where it isn't sold — the operator asked), then the rest.
+        assert_eq!(walk("cx23", Some("hel1,any")).unwrap(), ["hel1", "nbg1", "fsn1"]);
+        assert_eq!(walk("cx23", Some("ash, hel1")).unwrap(), ["ash", "hel1"]);
+        assert_eq!(walk("cpx99", Some("fsn1,any")).unwrap(), ["fsn1"]);
+        let e = walk("cpx99", None).unwrap_err();
+        assert!(e.contains("Hetzner has no server type `cpx99`"), "{e}");
+        let after = 4_100_000_000; // 2099: cpx22 retired in nbg1, its only location.
+        let e = location_walk(&types, "cpx22", &Locations::ANY, after).unwrap_err();
+        assert!(e.contains("server type `cpx22` can't be ordered in any Hetzner location right now"), "{e}");
+
+        // Price first (a cheaper location wins over stock and API order); a location with no
+        // price last; an older answer without per-location entries is read from its prices.
+        let priced = json!([{"name": "t1",
+            "prices": [{"location": "fsn1", "price_hourly": {"gross": "0.0200"}}, {"location": "sin", "price_hourly": {"gross": "0.0100"}},
+                       {"location": "hel1", "price_hourly": {"net": "0.0150"}}],
+            "locations": [{"name": "fsn1", "deprecation": null, "available": true}, {"name": "nbg1", "deprecation": null, "available": true},
+                          {"name": "sin", "deprecation": null, "available": false}, {"name": "hel1", "deprecation": null, "available": true}]},
+            {"name": "old", "deprecation": null,
+             "prices": [{"location": "hel1", "price_hourly": {"gross": "0.0300"}}, {"location": "fsn1", "price_hourly": {"gross": "0.0100"}}]}]);
+        let types = priced.as_array().unwrap();
+        assert_eq!(location_walk(types, "t1", &Locations::ANY, now).unwrap(), ["sin", "hel1", "fsn1", "nbg1"]);
+        assert_eq!(location_walk(types, "old", &Locations::ANY, now).unwrap(), ["fsn1", "hel1"]);
+    }
+
+    fn server_created(name: &str, location: &str) -> String {
+        json!({"server": {"id": 77, "name": name, "status": "initializing", "public_net": {"ipv4": {"ip": "203.0.113.9"}},
+            "server_type": {"name": "cx23"}, "location": {"name": location}}})
+        .to_string()
+    }
+
+    /// The location of each create, as sent (`None`: no `location` in the body).
+    fn sent_locations(srv: &crate::http::test_server::Server) -> Vec<Option<String>> {
+        let (requests, bodies) = (srv.requests.lock().unwrap().clone(), srv.bodies.lock().unwrap().clone());
+        requests.iter().zip(bodies).filter(|(r, _)| r.starts_with("POST /servers ")).map(|(_, b)| {
+            serde_json::from_str::<Value>(&b).unwrap().get("location").and_then(Value::as_str).map(String::from)
+        }).collect()
+    }
+
+    /// The default walk, over the real request path: the catalog once, then one create per
+    /// location until one has room. Hetzner's "no room" (`resource_unavailable`, "error during
+    /// placement" — no capacity wording) moves on; the same name goes to the next location.
+    #[tokio::test]
+    async fn a_location_with_no_room_moves_the_create_to_the_next() {
+        use crate::http::test_server::{canned, serve};
+        let full = r#"{"error":{"code":"resource_unavailable","message":"error during placement","details":{}}}"#;
+        let srv = serve(vec![
+            canned(200, "application/json", SERVER_TYPES),
+            canned(412, "application/json", full),
+            canned(201, "application/json", &server_created("devtest-a", "fsn1")),
+        ]);
+        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\n"));
+        let pod = provider(&srv.base, opts).create_pod(&spec("devtest-a", None)).await.unwrap();
+        assert_eq!((pod.id.as_str(), pod.name.as_str(), pod.ssh_ip.as_deref()), ("77", "devtest-a", Some("203.0.113.9")));
+        assert_eq!(
+            *srv.requests.lock().unwrap(),
+            ["GET /server_types?page=1&per_page=50 HTTP/1.1", "POST /servers HTTP/1.1", "POST /servers HTTP/1.1"]
+        );
+        assert_eq!(sent_locations(&srv), [Some("nbg1".into()), Some("fsn1".into())]);
+        let names: Vec<String> = srv.bodies.lock().unwrap()[1..].iter().map(|b| serde_json::from_str::<Value>(b).unwrap()["name"].to_string()).collect();
+        assert_eq!(names, ["\"devtest-a\"", "\"devtest-a\""]);
+    }
+
+    /// No room anywhere: `Capacity` (so `--keep-trying` waits for some, where "error during
+    /// placement" alone read as `Other` and failed at once), naming every location tried and
+    /// what each said. A pinned location that's full is `Capacity` too, and walks nowhere.
+    #[tokio::test]
+    async fn no_room_in_any_location_is_capacity_and_says_where_it_tried() {
+        use crate::error::ProviderErrorKind as K;
+        use crate::http::test_server::{canned, serve};
+        let full = |loc: &str| format!(r#"{{"error":{{"code":"resource_unavailable","message":"error during placement ({loc})"}}}}"#);
+        let keys = r#"{"ssh_keys": [{"id": 1, "name": "devtest"}]}"#;
+        let srv = serve(vec![
+            canned(200, "application/json", SERVER_TYPES),
+            canned(412, "application/json", &full("nbg1")),
+            canned(412, "application/json", &full("fsn1")),
+            canned(412, "application/json", &full("hel1")),
+            canned(200, "application/json", keys),
+            canned(200, "application/json", SERVER_TYPES),
+        ]);
+        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\n"));
+        let e = provider(&srv.base, opts).create_pod(&spec("devtest-a", None)).await.unwrap_err();
+        let m = e.to_string();
+        assert_eq!(e.kind(), Some(K::Capacity), "{m}");
+        assert!(m.contains("hetzner create: no room for cx23 in nbg1, fsn1, hel1 — nbg1: hetzner create HTTP 412"), "{m}");
+        for loc in ["nbg1", "fsn1", "hel1"] {
+            assert!(m.contains(&format!("error during placement ({loc})")), "{loc}: {m}");
+        }
+        assert_eq!(sent_locations(&srv), [Some("nbg1".into()), Some("fsn1".into()), Some("hel1".into())]);
+
+        let srv = serve(vec![canned(412, "application/json", &full("hel1")), canned(200, "application/json", keys), canned(200, "application/json", SERVER_TYPES)]);
+        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\nHETZNER_LOCATION=hel1\n"));
+        let e = provider(&srv.base, opts).create_pod(&spec("devtest-a", None)).await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Capacity), "{e}");
+        assert_eq!(sent_locations(&srv), [Some("hel1".into())], "pinned: no catalog read, no other location");
+        assert!(!srv.requests.lock().unwrap()[0].starts_with("GET"), "the create came first");
+    }
+
+    /// Anything but "no room" stops the walk at once — a bad token or a throttle is the same in
+    /// every location, a 5xx is the retry layer's — and an explained refusal after a full location
+    /// says where each happened.
+    #[tokio::test]
+    async fn a_refusal_that_isnt_about_room_stops_the_walk() {
+        use crate::error::ProviderErrorKind as K;
+        use crate::http::test_server::{canned, serve};
+        let opts = || HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\n"));
+        for (status, kind) in [(401, K::Auth), (429, K::RateLimited), (503, K::Transient)] {
+            let srv = serve(vec![canned(200, "application/json", SERVER_TYPES), canned(status, "application/json", r#"{"error":{"code":"x","message":"no"}}"#)]);
+            let e = provider(&srv.base, opts()).create_pod(&spec("devtest-a", None)).await.unwrap_err();
+            assert_eq!(e.kind(), Some(kind), "{e}");
+            assert_eq!(sent_locations(&srv), [Some("nbg1".into())], "{status}: one create");
+        }
+        let srv = serve(vec![
+            canned(200, "application/json", SERVER_TYPES),
+            canned(412, "application/json", r#"{"error":{"code":"resource_unavailable","message":"error during placement"}}"#),
+            canned(404, "application/json", r#"{"error":{"code":"not_found","message":"SSH key not found"}}"#),
+            canned(200, "application/json", SSH_KEYS),
+            canned(200, "application/json", SERVER_TYPES),
+        ]);
+        let e = provider(&srv.base, opts()).create_pod(&spec("devtest-a", None)).await.unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains("SSH key not found") && m.contains("(in fsn1, after no room in: nbg1: hetzner create HTTP 412"), "{m}");
+        assert!(m.contains("the Hetzner project has no SSH key `devtest`"), "still explained: {m}");
+        assert_eq!(sent_locations(&srv), [Some("nbg1".into()), Some("fsn1".into())]);
+    }
+
+    /// Without the catalog (its read failed) `any` can't choose: one create without a location,
+    /// so Hetzner places it — or, with locations listed, just those. An `--api-json` `datacenter`
+    /// is the place itself: one create, no `location` (Hetzner refuses both), no catalog read.
+    #[tokio::test]
+    async fn without_the_catalog_or_with_a_datacenter_there_is_one_place_to_try() {
+        use crate::http::test_server::{canned, serve};
+        let cfg = |text: &str| HetznerOpts::from_config(&crate::config::Config::parse(text));
+        let srv = serve(vec![canned(500, "text/html", "<html>oops</html>"), canned(201, "application/json", &server_created("devtest-a", "hel1"))]);
+        provider(&srv.base, cfg("MACHINE_NAME_PREFIX=devtest\n")).create_pod(&spec("devtest-a", None)).await.unwrap();
+        assert_eq!(sent_locations(&srv), [None]);
+        let srv = serve(vec![
+            canned(500, "text/html", "<html>oops</html>"),
+            canned(412, "application/json", r#"{"error":{"code":"resource_unavailable","message":"error during placement"}}"#),
+            canned(201, "application/json", &server_created("devtest-a", "fsn1")),
+        ]);
+        provider(&srv.base, cfg("MACHINE_NAME_PREFIX=devtest\nHETZNER_LOCATION=\"hel1 fsn1 any\"\n")).create_pod(&spec("devtest-a", None)).await.unwrap();
+        assert_eq!(sent_locations(&srv), [Some("hel1".into()), Some("fsn1".into())]);
+
+        let srv = serve(vec![canned(201, "application/json", &server_created("devtest-a", "fsn1"))]);
+        let mut with_dc = spec("devtest-a", None);
+        with_dc.api_extra = Some(serde_json::from_str(r#"{"datacenter": "fsn1-dc14"}"#).unwrap());
+        provider(&srv.base, cfg("MACHINE_NAME_PREFIX=devtest\n")).create_pod(&with_dc).await.unwrap();
+        assert_eq!(sent_locations(&srv), [None]);
+        assert_eq!(serde_json::from_str::<Value>(&srv.bodies.lock().unwrap()[0]).unwrap()["datacenter"], "fsn1-dc14");
+    }
+
+    /// What `describe` and the preview say for each setting: the old pinned wording unchanged.
+    #[test]
+    fn the_preview_says_where_a_create_goes() {
+        let p = |text: &str| HetznerProvider::new("k", HetznerOpts::from_config(&crate::config::Config::parse(text)));
+        let s = spec("devtest-a", None);
+        assert_eq!(p("HETZNER_LOCATION=nbg1\n").describe(&s), "cx23 CPU VM, image ubuntu-24.04, location nbg1");
+        assert_eq!(p("").describe(&s), "cx23 CPU VM, image ubuntu-24.04, location any (cheapest first, the next when one has no room)");
+        assert_eq!(p("").preview_create_body(&s).unwrap().get("location"), None);
+        assert_eq!(p("HETZNER_LOCATION=hel1,any\n").preview_create_body(&s).unwrap()["location"], "hel1");
+    }
+
+    /// One test for both walks (fleet locations, archive server types): no room → walk on; a
+    /// token, quota or throttle → stop.
+    #[test]
+    fn no_room_is_told_apart_from_refusals_that_follow_everywhere() {
+        use crate::error::ProviderErrorKind as K;
+        let http = |status: u16, body: &str| Error::provider_http(reqwest::StatusCode::from_u16(status).unwrap(), &body, "hetzner create");
+        assert!(is_placement_error(&http(412, r#"{"error":{"code":"resource_unavailable","message":"error during placement"}}"#)));
+        assert!(is_placement_error(&http(412, r#"{"error":{"code":"resource_unavailable","message":"server type cpx41 not available in nbg1"}}"#)));
+        assert!(is_placement_error(&Error::capacity("no capacity")));
+        assert!(is_placement_error(&http(422, r#"{"error":{"code":"invalid_input","message":"unsupported location for server type"}}"#)));
+        assert!(!is_placement_error(&http(401, r#"{"error":{"code":"unauthorized","message":"placement_error"}}"#)));
+        assert!(!is_placement_error(&http(429, r#"{"error":{"code":"rate_limit_exceeded","message":"resource_unavailable"}}"#)));
+        assert!(!is_placement_error(&http(503, r#"{"error":{"code":"unavailable","message":"resource_unavailable"}}"#)));
+        assert!(!is_placement_error(&http(403, r#"{"error":{"code":"resource_limit_exceeded","message":"server limit reached"}}"#)));
+        assert!(!is_placement_error(&http(404, r#"{"error":{"code":"not_found","message":"SSH key not found"}}"#)));
+        assert_eq!(http(412, r#"{"error":{"code":"resource_unavailable","message":"error during placement"}}"#).kind(), Some(K::Other), "why the walk tags it");
+    }
+
+    /// The $/h is the price where the server is: its own `location` (today's answers), else an
+    /// older answer's `datacenter.location`, else the first price listed.
+    #[test]
+    fn the_hourly_price_is_the_one_where_the_server_runs() {
+        let prices = json!([{"location": "fsn1", "price_hourly": {"gross": "0.0368"}}, {"location": "sin", "price_hourly": {"gross": "0.0497"}}]);
+        let server = |place: Value| {
+            let mut v = json!({"id": 1, "name": "devtest-a", "status": "running", "server_type": {"name": "cpx22", "prices": prices}});
+            v.as_object_mut().unwrap().extend(place.as_object().unwrap().clone());
+            parse_server(&v).cost_per_hr
+        };
+        assert_eq!(server(json!({"location": {"name": "sin"}})), Some(0.0497));
+        assert_eq!(server(json!({"datacenter": {"location": {"name": "sin"}}})), Some(0.0497));
+        assert_eq!(server(json!({})), Some(0.0368));
     }
 }

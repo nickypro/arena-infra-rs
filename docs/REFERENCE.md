@@ -309,6 +309,17 @@ ignores the GPU-centric `PodSpec` fields and takes its sizing/OS/location/SSH-ke
 config (`create`/`up --server-type` over `HETZNER_SERVER_TYPE`; `--gpu`/`--gpus` are refused there,
 `--server-type` everywhere else).
 
+**Location:** `HETZNER_LOCATION` unset (or `any`) means any location. A create reads the
+server types (`GET /server_types`) and tries every location that sells the type now: cheapest
+first, then those not marked low on stock, then Hetzner's recommended ones. When a location has
+no room (`resource_unavailable` / "error during placement"), it tries the next one with the same
+name.
+- No room anywhere is a capacity error that names each location tried, so `--keep-trying` waits.
+- Any other refusal (token, quota, throttle, SSH key) stops at once.
+- One location (`nbg1`) pins creates there, with no lookup. A list (`nbg1,fsn1`) is tried in its
+  order, and `nbg1,any` tries nbg1, then the rest.
+- An `--api-json` `datacenter` is one create where it says.
+
 VMs come up on a real public IP with SSH on `:22`, so they use the same proxy/`pods up` flow as GPU
 providers. A refused create is explained from the project (read-only `GET /ssh_keys` + `GET
 /server_types`): a missing SSH key names the project's keys and what to set or upload; a type the
