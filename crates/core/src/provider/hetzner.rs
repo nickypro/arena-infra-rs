@@ -9,9 +9,10 @@
 //! proxy/`pods up` flow as the GPU providers.
 //!
 //! Where a VM goes is no one's preference by default ([`Locations`]): with `HETZNER_LOCATION`
-//! unset, a create tries every location that sells the server type, cheapest first, and moves
-//! on when one has no room (live 2026-10-26: cx23 read "low availability" in fsn1, nbg1 and hel1
-//! at once). A location set there pins it, or a list orders the walk.
+//! unset, a create tries every location that sells the server type, nearest first (timed from
+//! where arena runs, [`Distances`]), and moves on when one has no room (live 2026-10-26: cx23
+//! read "low availability" in fsn1, nbg1 and hel1 at once). A location set there pins it, or a
+//! list orders the walk.
 //!
 //! A refused create is explained from the project itself ([`HetznerProvider::explain_create_error`]):
 //! a missing SSH key names the project's keys and what to set, a server type the location
@@ -31,6 +32,8 @@ use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, Result};
 use crate::http::{send_json, send_ok};
 use crate::pod::{Pod, PodSpec};
+use std::collections::HashMap;
+use std::time::Duration;
 
 pub(crate) const BASE: &str = "https://api.hetzner.cloud/v1";
 
@@ -97,7 +100,7 @@ impl HetznerOpts {
 
 /// Where creates go, from `HETZNER_LOCATION`: the locations named, in their order, and — when
 /// `any` — then every other location that sells the server type ([`location_walk`]).
-/// - unset, empty or `any`: any location, cheapest first;
+/// - unset, empty or `any`: any location, nearest first;
 /// - `nbg1`: only nbg1 (as before this setting took a list);
 /// - `nbg1,fsn1`: those two, in that order;
 /// - `nbg1,any`: nbg1 first, then any other.
@@ -142,11 +145,11 @@ impl Locations {
         self.listed.first().map(String::as_str)
     }
 
-    /// How `config check` and the create preview say it: `any (cheapest first, the next when
+    /// How `config check` and the create preview say it: `any (nearest first, the next when
     /// one has no room)`, `nbg1`, `nbg1, fsn1 (in that order)`, `nbg1, then any`. Pure.
     pub fn describe(&self) -> String {
         match (self.listed.as_slice(), self.any) {
-            ([], _) => "any (cheapest first, the next when one has no room)".into(),
+            ([], _) => "any (nearest first, the next when one has no room)".into(),
             ([one], false) => one.clone(),
             (many, false) => format!("{} (in that order)", many.join(", ")),
             (some, true) => format!("{}, then any", some.join(", ")),
@@ -173,12 +176,102 @@ impl ShutdownWait {
     }
 }
 
+/// How far each Hetzner location is from here, for the `any` walk ([`location_walk`]): the
+/// fastest of [`PROBE_TRIES`] TCP connects to the location's speed-test host
+/// (`nbg1-speed.hetzner.com:443`, Hetzner's own; not part of the API). Where arena runs is
+/// where the SSH comes from: on prod that's the proxy box every student connection goes
+/// through. Live 2026-10-26, from ap and the dev box (both in nbg1): nbg1 0.4 ms, fsn1 2.8,
+/// hel1 24, ash 95, sin 159, hil 167 — and the EU prices are one price, so cheapest-first
+/// couldn't tell nbg1 from hel1.
+///
+/// Each location is timed once per process, all at once, and only for a walk with `any` in it.
+/// One that doesn't answer is unmeasured and walks after the measured ones (by price). A round
+/// where nothing answered (no network, connects blocked) is forgotten, so the next walk tries
+/// again.
+struct Distances {
+    /// Where location `l` is timed (`host:port`); `None`: nothing is (tests).
+    host: Option<ProbeHost>,
+    /// Each location timed so far (`None`: no answer).
+    timed: std::sync::Mutex<HashMap<String, Option<Duration>>>,
+}
+
+/// Location → the `host:port` its distance is timed against.
+type ProbeHost = Box<dyn Fn(&str) -> String + Send + Sync>;
+
+/// Connects per location; the fastest counts (the first can pay for a route lookup).
+const PROBE_TRIES: u32 = 3;
+
+/// How long the name lookup or one connect may take before the location counts as unmeasured:
+/// far above any real round trip (Singapore from nbg1: 159 ms).
+const PROBE_WAIT: Duration = Duration::from_secs(1);
+
+impl Distances {
+    fn timed_from_here() -> Self {
+        Self { host: Some(Box::new(|l: &str| format!("{l}-speed.hetzner.com:443"))), timed: Default::default() }
+    }
+
+    #[cfg(test)]
+    fn known(d: &[(&str, u64)]) -> Self {
+        let timed = d.iter().map(|&(l, ms)| (l.to_string(), Some(Duration::from_millis(ms)))).collect();
+        Self { host: None, timed: std::sync::Mutex::new(timed) }
+    }
+
+    /// The distances to `names` that are known, timing the ones not timed yet.
+    async fn to(&self, names: &[&str]) -> HashMap<String, Duration> {
+        let timed = || self.timed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(host) = &self.host {
+            let untimed: Vec<String> = {
+                let t = timed();
+                names.iter().filter(|l| !t.contains_key(**l)).map(|l| l.to_string()).collect()
+            };
+            let mut set = tokio::task::JoinSet::new();
+            for l in untimed {
+                let addr = host(&l);
+                set.spawn(async move { (l, rtt_to(addr).await) });
+            }
+            let mut round = Vec::new();
+            while let Some(r) = set.join_next().await {
+                round.extend(r.ok());
+            }
+            let mut t = timed();
+            if round.iter().any(|(_, d)| d.is_some()) || t.values().any(Option::is_some) {
+                t.extend(round);
+            }
+        }
+        timed().iter().filter_map(|(l, d)| d.map(|d| (l.clone(), d))).collect()
+    }
+}
+
+/// The fastest of [`PROBE_TRIES`] TCP connects to `addr` (`host:port`), to the first of its
+/// addresses that answers; `None`: it didn't resolve, or nothing answered within [`PROBE_WAIT`].
+async fn rtt_to(addr: String) -> Option<Duration> {
+    use tokio::time::{timeout, Instant};
+    let connect = |a: std::net::SocketAddr| async move {
+        let t = Instant::now();
+        matches!(timeout(PROBE_WAIT, tokio::net::TcpStream::connect(a)).await, Ok(Ok(_))).then(|| t.elapsed())
+    };
+    let mut addrs = timeout(PROBE_WAIT, tokio::net::lookup_host(addr)).await.ok()?.ok()?;
+    let (a, mut best) = loop {
+        let a = addrs.next()?;
+        if let Some(d) = connect(a).await {
+            break (a, d);
+        }
+    };
+    for _ in 1..PROBE_TRIES {
+        if let Some(d) = connect(a).await {
+            best = best.min(d);
+        }
+    }
+    Some(best)
+}
+
 pub struct HetznerProvider {
     api_key: String,
     client: Client,
     base: String,
     opts: HetznerOpts,
     shutdown: ShutdownWait,
+    distances: Distances,
 }
 
 impl HetznerProvider {
@@ -189,6 +282,7 @@ impl HetznerProvider {
             base: BASE.to_string(),
             opts,
             shutdown: SHUTDOWN_WAIT,
+            distances: Distances::timed_from_here(),
         }
     }
 
@@ -286,7 +380,8 @@ impl HetznerProvider {
 
 impl HetznerProvider {
     /// The locations a create of `spec` tries, in order ([`location_walk`]); `None` = no
-    /// `location` in the body. Only a walk with `any` in it reads `GET /server_types`. Without
+    /// `location` in the body. Only a walk with `any` in it reads `GET /server_types` and times
+    /// the type's locations ([`Distances`]). Without
     /// that answer the listed locations are all there is — or, with none listed, one create
     /// without a location: Hetzner then places it, as it would anyway. An `--api-json`
     /// `datacenter` names the place itself (Hetzner refuses it next to a `location`): one
@@ -302,7 +397,8 @@ impl HetznerProvider {
         match self.get_all("server_types").await {
             Ok(types) => {
                 let now = crate::snapshot::unix_now();
-                let walk = location_walk(&types, ty, locations, now).map_err(|why| Error::Provider { kind: crate::error::ProviderErrorKind::Rejected, message: format!("hetzner create: {why}") })?;
+                let near = self.distances.to(&find_type(&types, ty).map(locations_of).unwrap_or_default()).await;
+                let walk = location_walk(&types, ty, locations, now, &near).map_err(|why| Error::Provider { kind: crate::error::ProviderErrorKind::Rejected, message: format!("hetzner create: {why}") })?;
                 Ok(walk.into_iter().map(Some).collect())
             }
             Err(_) if !locations.listed.is_empty() => Ok(locations.listed.iter().cloned().map(Some).collect()),
@@ -482,36 +578,52 @@ fn price_in(t: &Value, location: &str) -> Option<i64> {
     v.is_finite().then(|| (v * 1_000_000.0).round() as i64)
 }
 
+/// Server type `ty` in the `GET /server_types` items, by name or id. Pure.
+fn find_type<'a>(types: &'a [Value], ty: &str) -> Option<&'a Value> {
+    types.iter().find(|t| {
+        t.get("name").and_then(Value::as_str) == Some(ty) || t.get("id").and_then(Value::as_u64).is_some_and(|i| i.to_string() == ty)
+    })
+}
+
+/// `t`'s locations as the answer lists them: the per-location entries, else (an older answer)
+/// the prices'. Pure.
+fn locations_of(t: &Value) -> Vec<&str> {
+    match t.get("locations").and_then(Value::as_array) {
+        Some(locs) => locs.iter().filter_map(|l| l.get("name").and_then(Value::as_str)).collect(),
+        None => t.get("prices").and_then(Value::as_array).into_iter().flatten().filter_map(|p| p.get("location").and_then(Value::as_str)).collect(),
+    }
+}
+
 /// The locations a create of server type `ty` tries, in order (`types`: the `GET /server_types`
 /// items): the ones `locations` lists first, as listed; then, with `any`, every other location
-/// that sells `ty` now ([`orderable_in`]) — cheapest first, then the ones Hetzner doesn't mark low
-/// on stock (`available: false` still goes through at times: live hz2), then the ones not
-/// announced as retiring, then its `recommended` ones, then the API's order. A location that
-/// doesn't sell `ty` is never added; a listed one is tried regardless (the operator asked).
-/// `Err`: what to say when there'd be nothing to try. Pure.
-fn location_walk(types: &[Value], ty: &str, locations: &Locations, now: u64) -> std::result::Result<Vec<String>, String> {
+/// that sells `ty` now ([`orderable_in`]) — nearest first (`near`, [`Distances`]; unmeasured
+/// ones after), then cheapest, then the ones Hetzner doesn't mark low on stock (`available:
+/// false` still goes through at times: live hz2), then the ones not announced as retiring, then
+/// its `recommended` ones, then the API's order. A location that doesn't sell `ty` is never
+/// added; a listed one is tried regardless (the operator asked). `Err`: what to say when
+/// there'd be nothing to try. Pure.
+fn location_walk(
+    types: &[Value],
+    ty: &str,
+    locations: &Locations,
+    now: u64,
+    near: &HashMap<String, Duration>,
+) -> std::result::Result<Vec<String>, String> {
     let mut walk = locations.listed.clone();
     if !locations.any {
         return Ok(walk);
     }
-    let is = |t: &&Value| {
-        t.get("name").and_then(Value::as_str) == Some(ty) || t.get("id").and_then(Value::as_u64).is_some_and(|i| i.to_string() == ty)
-    };
-    let Some(t) = types.iter().find(is) else {
+    let Some(t) = find_type(types, ty) else {
         return if walk.is_empty() {
             Err(format!("Hetzner has no server type `{ty}` (`arena api get hetzner server_types` lists them)"))
         } else {
             Ok(walk)
         };
     };
-    // Its locations as the answer lists them: the per-location entries, else (an older answer) the prices'.
-    let names: Vec<&str> = match t.get("locations").and_then(Value::as_array) {
-        Some(locs) => locs.iter().filter_map(|l| l.get("name").and_then(Value::as_str)).collect(),
-        None => t.get("prices").and_then(Value::as_array).into_iter().flatten().filter_map(|p| p.get("location").and_then(Value::as_str)).collect(),
-    };
-    let mut sold: Vec<(usize, &str)> = names.into_iter().enumerate().filter(|(_, l)| orderable_in(t, l, now) == Some(true)).collect();
+    let mut sold: Vec<(usize, &str)> = locations_of(t).into_iter().enumerate().filter(|(_, l)| orderable_in(t, l, now) == Some(true)).collect();
     sold.sort_by_key(|&(i, l)| {
         (
+            near.get(l).copied().unwrap_or(Duration::MAX),
             price_in(t, l).unwrap_or(i64::MAX),
             location_flag(t, l, "available") == Some(false),
             deprecated_in(t, l),
@@ -859,6 +971,7 @@ mod tests {
             base: srv.base.clone(),
             opts: HetznerOpts::default(),
             shutdown: SHUTDOWN_WAIT,
+            distances: Distances::known(&[]),
         };
         let e = p.list_pods().await.unwrap_err();
         assert_eq!(e.kind(), Some(K::Auth), "{e}");
@@ -886,6 +999,7 @@ mod tests {
             base: base.to_string(),
             opts: HetznerOpts::default(),
             shutdown: ShutdownWait { polls: 3, every: std::time::Duration::ZERO },
+            distances: Distances::known(&[]),
         };
         // Shuts down within the wait (a failed read on the way is just "not yet"): stopped,
         // never powered off.
@@ -941,7 +1055,7 @@ mod tests {
             canned(200, "application/json", &page1.to_string()),
             canned(200, "application/json", &page2.to_string()),
         ]);
-        let p = HetznerProvider { api_key: "k".into(), client: client(), base: srv.base.clone(), opts: HetznerOpts::default(), shutdown: SHUTDOWN_WAIT };
+        let p = HetznerProvider { api_key: "k".into(), client: client(), base: srv.base.clone(), opts: HetznerOpts::default(), shutdown: SHUTDOWN_WAIT, distances: Distances::known(&[]) };
         let names: Vec<String> = p.list_pods().await.unwrap().into_iter().map(|p| p.name).collect();
         assert_eq!(names, ["arena9-apple", "devtest-archive", "odd", "arena9-bloom"]);
     }
@@ -1144,7 +1258,7 @@ mod tests {
 
     fn provider(base: &str, opts: HetznerOpts) -> HetznerProvider {
         use crate::http::test_server::client;
-        HetznerProvider { api_key: "k".into(), client: client(), base: base.to_string(), opts, shutdown: SHUTDOWN_WAIT }
+        HetznerProvider { api_key: "k".into(), client: client(), base: base.to_string(), opts, shutdown: SHUTDOWN_WAIT, distances: Distances::known(&[]) }
     }
 
     /// Item 4, live (evals node, 2026-10-15): `pods up --provider hetzner` asked for the key named
@@ -1419,18 +1533,18 @@ mod tests {
         assert_eq!(l(Some("hel1,any")).pinned(), None);
         assert_eq!((l(None).first(), l(Some("fsn1,nbg1")).first()), (None, Some("fsn1")));
         let said: Vec<String> = [None, Some("nbg1"), Some("nbg1,fsn1"), Some("nbg1,any")].iter().map(|r| l(*r).describe()).collect();
-        assert_eq!(said, ["any (cheapest first, the next when one has no room)", "nbg1", "nbg1, fsn1 (in that order)", "nbg1, then any"]);
+        assert_eq!(said, ["any (nearest first, the next when one has no room)", "nbg1", "nbg1, fsn1 (in that order)", "nbg1, then any"]);
     }
 
-    /// The walk for `any`, from the recorded `GET /server_types`: every location that sells the
-    /// type now — cheapest, then not low on stock, then not retiring, then recommended, then
-    /// the API's order — after the listed ones. Retired and unlisted locations never join; a
+    /// The walk for `any`, from the recorded `GET /server_types`, with nothing timed (so by
+    /// price): every location that sells the type now — cheapest, then not low on stock, then
+    /// not retiring, then recommended, then the API's order — after the listed ones. Retired and unlisted locations never join; a
     /// type Hetzner doesn't have, or sells nowhere now, is said instead. Pure.
     #[test]
     fn the_location_walk_takes_every_location_that_sells_the_type() {
         let types: Vec<Value> = serde_json::from_str::<Value>(SERVER_TYPES).unwrap()["server_types"].as_array().unwrap().clone();
         let now = 1_792_000_000; // 2026-10: cpx41 retired in the EU DCs, cpx22's retirement in nbg1 only announced.
-        let walk = |ty: &str, raw: Option<&str>| location_walk(&types, ty, &Locations::parse(raw), now);
+        let walk = |ty: &str, raw: Option<&str>| location_walk(&types, ty, &Locations::parse(raw), now, &HashMap::new());
         // cx23: one price; nbg1 isn't low on stock, fsn1 and hel1 are (API order between them).
         assert_eq!(walk("cx23", None).unwrap(), ["nbg1", "fsn1", "hel1"]);
         assert_eq!(walk("114", None).unwrap(), ["nbg1", "fsn1", "hel1"], "by id too");
@@ -1447,7 +1561,7 @@ mod tests {
         let e = walk("cpx99", None).unwrap_err();
         assert!(e.contains("Hetzner has no server type `cpx99`"), "{e}");
         let after = 4_100_000_000; // 2099: cpx22 retired in nbg1, its only location.
-        let e = location_walk(&types, "cpx22", &Locations::ANY, after).unwrap_err();
+        let e = location_walk(&types, "cpx22", &Locations::ANY, after, &HashMap::new()).unwrap_err();
         assert!(e.contains("server type `cpx22` can't be ordered in any Hetzner location right now"), "{e}");
 
         // Price first (a cheaper location wins over stock and API order); a location with no
@@ -1460,8 +1574,88 @@ mod tests {
             {"name": "old", "deprecation": null,
              "prices": [{"location": "hel1", "price_hourly": {"gross": "0.0300"}}, {"location": "fsn1", "price_hourly": {"gross": "0.0100"}}]}]);
         let types = priced.as_array().unwrap();
-        assert_eq!(location_walk(types, "t1", &Locations::ANY, now).unwrap(), ["sin", "hel1", "fsn1", "nbg1"]);
-        assert_eq!(location_walk(types, "old", &Locations::ANY, now).unwrap(), ["fsn1", "hel1"]);
+        assert_eq!(location_walk(types, "t1", &Locations::ANY, now, &HashMap::new()).unwrap(), ["sin", "hel1", "fsn1", "nbg1"]);
+        assert_eq!(location_walk(types, "old", &Locations::ANY, now, &HashMap::new()).unwrap(), ["fsn1", "hel1"]);
+    }
+
+    /// With distances, `any` walks nearest first: price only between equally near locations, the
+    /// unmeasured ones last (by price among themselves), and listed ones still first. Pure.
+    #[test]
+    fn the_nearest_location_goes_first_and_price_only_breaks_ties() {
+        let ms = |d: &[(&str, u64)]| d.iter().map(|&(l, ms)| (l.to_string(), Duration::from_millis(ms))).collect::<HashMap<_, _>>();
+        let types: Vec<Value> = serde_json::from_str::<Value>(SERVER_TYPES).unwrap()["server_types"].as_array().unwrap().clone();
+        let now = 1_792_000_000;
+        // cx23 by price alone is nbg1, fsn1, hel1 (nbg1 isn't low on stock): from Helsinki, hel1.
+        let walk = location_walk(&types, "cx23", &Locations::ANY, now, &ms(&[("hel1", 1), ("nbg1", 24), ("fsn1", 26)]));
+        assert_eq!(walk.unwrap(), ["hel1", "nbg1", "fsn1"]);
+        let walk = location_walk(&types, "cx23", &Locations::ANY, now, &ms(&[("fsn1", 1), ("hel1", 24)]));
+        assert_eq!(walk.unwrap(), ["fsn1", "hel1", "nbg1"], "nbg1 wasn't timed: last");
+
+        // t1: sin is cheapest but furthest; fsn1 and nbg1 are as near, and fsn1 has a price.
+        let priced = json!([{"name": "t1",
+            "prices": [{"location": "fsn1", "price_hourly": {"gross": "0.0200"}}, {"location": "sin", "price_hourly": {"gross": "0.0100"}},
+                       {"location": "hel1", "price_hourly": {"net": "0.0150"}}],
+            "locations": [{"name": "nbg1", "deprecation": null, "available": true}, {"name": "sin", "deprecation": null, "available": true},
+                          {"name": "fsn1", "deprecation": null, "available": true}, {"name": "hel1", "deprecation": null, "available": true}]}]);
+        let types = priced.as_array().unwrap();
+        let near = ms(&[("fsn1", 3), ("nbg1", 3), ("hel1", 24), ("sin", 159)]);
+        assert_eq!(location_walk(types, "t1", &Locations::ANY, now, &near).unwrap(), ["fsn1", "nbg1", "hel1", "sin"]);
+        assert_eq!(location_walk(types, "t1", &Locations::parse(Some("sin,any")), now, &near).unwrap(), ["sin", "fsn1", "nbg1", "hel1"]);
+        assert_eq!(location_walk(types, "t1", &Locations::parse(Some("sin,hel1")), now, &near).unwrap(), ["sin", "hel1"], "a list isn't reordered");
+    }
+
+    /// Over the real request path: the walk follows the distances, not the catalog's order.
+    #[tokio::test]
+    async fn a_create_tries_the_nearest_location_first() {
+        use crate::http::test_server::{canned, serve};
+        let full = r#"{"error":{"code":"resource_unavailable","message":"error during placement","details":{}}}"#;
+        let srv = serve(vec![
+            canned(200, "application/json", SERVER_TYPES),
+            canned(412, "application/json", full),
+            canned(201, "application/json", &server_created("devtest-a", "fsn1")),
+        ]);
+        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\n"));
+        let mut p = provider(&srv.base, opts);
+        p.distances = Distances::known(&[("hel1", 1), ("fsn1", 24), ("nbg1", 26)]);
+        p.create_pod(&spec("devtest-a", None)).await.unwrap();
+        assert_eq!(sent_locations(&srv), [Some("hel1".into()), Some("fsn1".into())]);
+    }
+
+    /// Timing: each location once per process, all at once; one that doesn't answer is
+    /// unmeasured (and not timed again while others answered); a round where nothing answered
+    /// is forgotten, so the next walk tries again. Loopback ports stand in for the speed hosts.
+    #[tokio::test]
+    async fn locations_are_timed_once_and_one_that_doesnt_answer_walks_unmeasured() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let open = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let open_port = open.local_addr().unwrap().port();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let timing = |answers: bool| {
+            let asked = asked.clone();
+            Distances {
+                host: Some(Box::new(move |l: &str| {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    format!("127.0.0.1:{}", if answers && l == "near" { open_port } else { closed })
+                })),
+                timed: Default::default(),
+            }
+        };
+        let d = timing(true);
+        let got = d.to(&["near", "gone"]).await;
+        assert_eq!(got.keys().collect::<Vec<_>>(), ["near"]);
+        assert!(got["near"] < PROBE_WAIT, "{got:?}");
+        assert_eq!(asked.load(Ordering::SeqCst), 2, "both timed, once each");
+        assert_eq!(d.to(&["gone", "near"]).await.len(), 1);
+        assert_eq!(asked.load(Ordering::SeqCst), 2, "neither timed again");
+
+        asked.store(0, Ordering::SeqCst);
+        let silent = timing(false);
+        assert!(silent.to(&["near", "gone"]).await.is_empty());
+        assert!(silent.to(&["near"]).await.is_empty());
+        assert_eq!(asked.load(Ordering::SeqCst), 3, "a round where nothing answered isn't kept");
+        drop(open);
     }
 
     fn server_created(name: &str, location: &str) -> String {
@@ -1597,7 +1791,7 @@ mod tests {
         let p = |text: &str| HetznerProvider::new("k", HetznerOpts::from_config(&crate::config::Config::parse(text)));
         let s = spec("devtest-a", None);
         assert_eq!(p("HETZNER_LOCATION=nbg1\n").describe(&s), "cx23 CPU VM, image ubuntu-24.04, location nbg1");
-        assert_eq!(p("").describe(&s), "cx23 CPU VM, image ubuntu-24.04, location any (cheapest first, the next when one has no room)");
+        assert_eq!(p("").describe(&s), "cx23 CPU VM, image ubuntu-24.04, location any (nearest first, the next when one has no room)");
         assert_eq!(p("").preview_create_body(&s).unwrap().get("location"), None);
         assert_eq!(p("HETZNER_LOCATION=hel1,any\n").preview_create_body(&s).unwrap()["location"], "hel1");
     }

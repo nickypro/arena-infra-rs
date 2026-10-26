@@ -310,10 +310,15 @@ config (`create`/`up --server-type` over `HETZNER_SERVER_TYPE`; `--gpu`/`--gpus`
 `--server-type` everywhere else).
 
 **Location:** `HETZNER_LOCATION` unset (or `any`) means any location. A create reads the
-server types (`GET /server_types`) and tries every location that sells the type now: cheapest
-first, then those not marked low on stock, then Hetzner's recommended ones. When a location has
-no room (`resource_unavailable` / "error during placement"), it tries the next one with the same
-name.
+server types (`GET /server_types`) and tries every location that sells the type now, nearest
+first. When a location has no room (`resource_unavailable` / "error during placement"), it tries
+the next one with the same name.
+- Nearest means the quickest TCP connect from the machine running arena to the location's
+  speed-test host (`nbg1-speed.hetzner.com:443`): timed once per process, about a second at
+  most. On prod that machine is the proxy box, which carries every student's SSH. From nbg1:
+  nbg1 0.4 ms, fsn1 3, hel1 24, ash 95, sin 159, hil 167.
+- Equally near locations go cheapest first, then those not marked low on stock, then Hetzner's
+  recommended ones. A location that can't be timed goes after the timed ones, by price.
 - No room anywhere is a capacity error that names each location tried, so `--keep-trying` waits.
 - Any other refusal (token, quota, throttle, SSH key) stops at once.
 - One location (`nbg1`) pins creates there, with no lookup. A list (`nbg1,fsn1`) is tried in its
