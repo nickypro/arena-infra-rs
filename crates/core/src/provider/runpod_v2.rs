@@ -10,7 +10,11 @@
 //! - **Real lifecycle status** (`PROVISIONING`/`STARTING`/`RUNNING`/`EXITED`/`ERROR`/
 //!   `TERMINATED`) instead of v1's `desiredStatus`, plus `gpu`, `cost` and `cloud` on every
 //!   pod — so GPU type and cloud tier are now recoverable for `replace` (v1's were not).
-//! - **SSH comes from `ssh.direct` only.** `ssh.proxy` (RunPod's SSH gateway) carries an
+//! - **SSH comes from `ssh.direct`, or the TCP 22 runtime mapping.** The list API can
+//!   omit both, so RUNNING pods without endpoints are filled from the detail API (8 at
+//!   a time, 5 seconds per request). A failed fill fails the listing, preserving proxy
+//!   forwards and preventing a backup from silently skipping its entire fleet.
+//!   `ssh.proxy` (RunPod's SSH gateway) carries an
 //!   interactive shell only — no scp/rsync/port-forwarding, which setup/backup/pull and the
 //!   nginx stream proxy all need — so it is never reported as the pod's endpoint.
 //! - **No public-IP request.** v1's create takes `supportPublicIp: true`; v2's
@@ -399,9 +403,22 @@ fn parse_pod(v: &Value) -> Pod {
         .and_then(Value::as_u64)
         .and_then(|p| u16::try_from(p).ok())
         .filter(|p| *p > 0);
+    let fallback = v.pointer("/runtime/ports").and_then(Value::as_array).and_then(|ports| {
+        ports.iter().find_map(|p| {
+            if p.get("private").and_then(Value::as_u64) != Some(22)
+                || p.get("type").and_then(Value::as_str) != Some("tcp")
+                || p.get("isIpPublic").and_then(Value::as_bool) == Some(false)
+            {
+                return None;
+            }
+            let ip = p.get("ip")?.as_str()?.trim();
+            let port = u16::try_from(p.get("public")?.as_u64()?).ok().filter(|p| *p > 0)?;
+            (!ip.is_empty()).then(|| (Some(ip.to_string()), Some(port)))
+        })
+    });
     let (ssh_ip, ssh_port) = match (host, port) {
         (Some(h), Some(p)) => (Some(h), Some(p)),
-        _ => (None, None),
+        _ => fallback.unwrap_or((None, None)),
     };
     // Up (RUNNING, a live `runtime`) but no direct endpoint: only RunPod's SSH proxy — a
     // host without a public IP (live: 15+ minutes like this; `dataCenterId` null too).
@@ -434,9 +451,49 @@ fn parse_pod(v: &Value) -> Pod {
         delete_protected: None,
         // `createdAt` (`2026-10-08T09:33:33.607Z`).
         created_at: s("createdAt").as_deref().and_then(crate::reap::parse_rfc3339).and_then(|t| u64::try_from(t).ok()),
+        started_at: s("startedAt").as_deref().and_then(crate::reap::parse_rfc3339).and_then(|t| u64::try_from(t).ok())
+            .or_else(|| v.pointer("/runtime/uptime").and_then(Value::as_u64)
+                .and_then(|uptime| crate::status::now_secs().checked_sub(uptime))),
         identity: None,
         status_detail: None,
     }
+}
+
+/// Fill the fields the list API omits, before any SSH consumer sees the listing. Keep
+/// order and every pod; neither a failed GET nor a malformed detail is an empty fleet.
+async fn fill_endpoints<F, Fut>(mut pods: Vec<Pod>, fetch: F) -> Result<Vec<Pod>>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<Value>> + Send + 'static,
+{
+    let pending: Vec<usize> = pods.iter().enumerate()
+        .filter(|(_, p)| p.status.eq_ignore_ascii_case("RUNNING") && (p.ssh_ip.is_none() || p.ssh_port.is_none()))
+        .map(|(i, _)| i).collect();
+    for batch in pending.chunks(8) {
+        let mut tasks = tokio::task::JoinSet::new();
+        for &i in batch {
+            let id = pods[i].id.clone();
+            let future = fetch(id.clone());
+            tasks.spawn(async move {
+                let body = tokio::time::timeout(std::time::Duration::from_secs(5), future).await
+                    .map_err(|_| Error::provider(format!("list pods: endpoint lookup for {id} timed out after 5s")))??;
+                let detail = parse_pod(&body);
+                if detail.id != id || detail.status == "UNKNOWN" {
+                    return Err(Error::provider(format!("list pods: invalid detail for {id}: {}", shape_of(&body))));
+                }
+                Ok((i, detail))
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            let (i, detail) = result.map_err(|e| Error::provider(format!("list pods: endpoint lookup task failed: {e}")))??;
+            pods[i].ssh_ip = detail.ssh_ip;
+            pods[i].ssh_port = detail.ssh_port;
+            pods[i].proxy_only = detail.proxy_only;
+            pods[i].started_at = detail.started_at.or(pods[i].started_at);
+            pods[i].status = detail.status;
+        }
+    }
+    Ok(pods)
 }
 
 /// What a failed v2 [`Provider::enrich`] reports: only the maintenance windows are missing
@@ -892,14 +949,19 @@ impl Provider for RunpodV2Provider {
     }
 
     async fn list_pods(&self) -> Result<Vec<Pod>> {
-        collect_pages(
+        let pods = collect_pages(
             |cursor| {
                 let rb = list_request(&self.client, &self.api_key, cursor.as_deref());
                 async move { send(rb, "list pods").await }
             },
             MAX_PAGES,
         )
-        .await
+        .await?;
+        fill_endpoints(pods, |id| {
+            let client = self.client.clone();
+            let key = self.api_key.clone();
+            async move { send(api_request(&client, &key, Method::GET, pod_url(&id, None)?), "pod endpoint").await }
+        }).await
     }
 
     async fn enrich(&self, pods: &mut [Pod]) -> Result<()> {
@@ -1091,6 +1153,7 @@ mod tests {
         let mut v = running_pod();
         v["ssh"]["direct"] = Value::Null;
         v["dataCenterId"] = Value::Null;
+        v["runtime"]["ports"] = json!([]);
         let p = parse_pod(&v);
         assert!(p.proxy_only && p.ssh_ip.is_none(), "{p:?}");
         assert!(!parse_pod(&running_pod()).proxy_only);
@@ -1125,6 +1188,7 @@ mod tests {
                 volume_gb: Some(20.0),
                 delete_protected: None,
                 created_at: Some(1_780_315_200),
+                started_at: Some(1_780_315_320),
                 identity: None,
                 status_detail: None,
             }
@@ -1154,6 +1218,7 @@ mod tests {
     fn parse_pod_degrades_odd_fields_to_none() {
         // Half an endpoint is no endpoint; an out-of-range port is no port.
         let mut v = running_pod();
+        v["runtime"] = Value::Null;
         v["ssh"]["direct"]["port"] = json!(70000);
         let p = parse_pod(&v);
         assert_eq!((p.ssh_ip, p.ssh_port), (None, None));

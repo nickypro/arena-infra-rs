@@ -796,6 +796,7 @@ fn parse_instance(v: &Value) -> Pod {
         volume_gb: None,
         delete_protected: None,
         created_at: None,
+        started_at: None,
         identity: None,
         status_detail: None,
     }
@@ -898,6 +899,7 @@ impl Provider for VastProvider {
                 volume_gb: None,
                 delete_protected: None,
                 created_at: None,
+                started_at: None,
                 identity: None,
                 status_detail: None,
             });

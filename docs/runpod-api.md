@@ -4,6 +4,11 @@
 
 > **REST v1 only.** Since 2026-10-19 the default backend is REST **v2** (`api.runpod.io/v2`,
 > `provider/runpod_v2.rs` — its module doc is the v2 reference, GraphQL inventory included).
+> The v2 list can omit `ssh.direct` and `runtime` even for running pods. `list_pods`
+> fills missing endpoints with bounded detail requests (8 concurrent, 5 s each), using the
+> TCP 22 runtime mapping as a fallback. A failed detail lookup fails the listing. Running
+> pods still missing SSH after 10 min show `no-ssh` and count as failed backup/run/pull work;
+> the age is from `startedAt` or runtime uptime, never creation time.
 > What follows describes REST v1, used only with an explicit `RUNPOD_API=v1` until RunPod
 > retires it on 2026-11-15.
 
