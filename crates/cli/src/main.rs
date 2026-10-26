@@ -3087,7 +3087,27 @@ fn launch_tui(provider: &str, config: &std::path::Path) -> Result<()> {
 /// can push + run it: system deps, docker + compose, a uv venv with the ARENA packages
 /// (CPU substitutions), and a zsh rc that activates the venv. GPU pods come from a
 /// prebuilt image and take the lighter post-image config path instead.
-const HETZNER_SETUP: &str = include_str!("hetzner_setup.sh");
+const HETZNER_SETUP: &str = concat!(
+    include_str!("../../../docker/scripts/arena_provision.sh"),
+    "\n",
+    "# Bare-VM entry point. The CLI embeds arena_provision.sh and the same assets the\n# Dockerfile COPYs, so setup needs no runtime clone of the infrastructure repo.\nINFRA_DIR=\"${INFRA_DIR:-$HOME/.arena_infra}\"\nmkdir -p \"$INFRA_DIR/dotfiles\" \"$INFRA_DIR/scripts\" || exit 1\n",
+    "cat > \"$INFRA_DIR/dotfiles/.zshrc.uv\" <<'ARENA_BAKED_ASSET'\n",
+    include_str!("../../../docker/dotfiles/.zshrc.uv"),
+    "\nARENA_BAKED_ASSET\n",
+    "cat > \"$INFRA_DIR/dotfiles/.p10k.zsh\" <<'ARENA_BAKED_ASSET'\n",
+    include_str!("../../../docker/dotfiles/.p10k.zsh"),
+    "\nARENA_BAKED_ASSET\n",
+    "cat > \"$INFRA_DIR/dotfiles/.vimrc\" <<'ARENA_BAKED_ASSET'\n",
+    include_str!("../../../docker/dotfiles/.vimrc"),
+    "\nARENA_BAKED_ASSET\n",
+    "cat > \"$INFRA_DIR/scripts/motd.sh\" <<'ARENA_BAKED_ASSET'\n",
+    include_str!("../../../docker/scripts/motd.sh"),
+    "\nARENA_BAKED_ASSET\n",
+    "cat > \"$INFRA_DIR/scripts/arena_cpu_threads.py\" <<'ARENA_BAKED_ASSET'\n",
+    include_str!("../../../docker/scripts/arena_cpu_threads.py"),
+    "\nARENA_BAKED_ASSET\n",
+    include_str!("hetzner_setup.sh")
+);
 
 /// One pod's provisioning job for [`provision_fleet`].
 struct SetupJob {

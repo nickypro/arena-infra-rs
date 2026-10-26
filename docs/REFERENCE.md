@@ -977,9 +977,15 @@ Connection refusals right after create are still retried for ~150s (sshd booting
 
 #### Hetzner bare VMs
 
-**Hetzner (bare VM):** the embedded `hetzner_setup.sh` builds the ARENA env with uv on **Python
+**Hetzner (bare VM):** the CLI embeds `docker/scripts/arena_provision.sh` and its dotfiles;
+the Docker image runs that same script. Both use `/opt/arena-env`, a repo-local `.venv` symlink,
+the same tools (including fzf, rsync, btop and editors), course subrepos, CPU thread hook,
+Jupyter kernel and VS Code settings. Existing repo-local venvs are kept aside before linking.
+Docker engine is installed only on bare VMs. Git identity is filled only when missing.
+
+The shared installer reads the configured course repo's `requirements.txt` directly, using uv on **Python
 3.13** (the repo's `requires-python` lower bound when newer; `ARENA_PYTHON` overrides) with CPU
-substitutions by pattern, not by exact upstream line (`jax[cuda…]` → `jax[cpu]`, bitsandbytes and
+substitutions on CPU VMs by pattern, not by exact upstream line (`jax[cuda…]` → `jax[cpu]`, bitsandbytes and
 `nvidia-*cuNN` wheels dropped, CUDA indexes and `+cuNNN` pins dropped, `uv pip install
 --torch-backend cpu`).
 
@@ -989,6 +995,10 @@ a VM is never reported set up without a working env. Re-runs skip the install on
 gate already passes. Its installers' scratch (uv's above all) goes to a temp dir of its own, removed
 when it ends, failure or not: uv's 0-byte `uv-setuptools-*.lock` files, left in `/tmp`, kept a fresh
 VM from ever reading as idle to the auto-reaper.
+
+An apt index failure stops setup at the update step, even when apt would ordinarily keep old
+indexes. A TLS error for `mirror.hetzner.com` changes only that mirror to HTTP and retries once;
+apt's archive signature verification stays enabled. Other failures remain fatal.
 
 #### VS Code warm-up
 

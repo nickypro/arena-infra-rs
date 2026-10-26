@@ -75,6 +75,9 @@ fn run(stubs: &Path, home: &Path, repo: &Path, env: &[(&str, &str)]) -> Run {
         .env("PATH", path)
         .env("HOME", home)
         .env("REPO_DIR", repo)
+        .env("VENV", repo.join(".venv"))
+        .env("ARENA_BIN_DIR", home.join("bin"))
+        .env("ARENA_MOTD_DIR", home.join("motd"))
         .env("REPO_URL", "https://example.invalid/never-cloned.git")
         .env("ARENA_GPU", "1")
         .env("ARENA_MACHINE_NAME", "devtest-alpha");
@@ -171,43 +174,12 @@ fn a_failed_gpu_install_fails_with_the_reason_last() {
     assert!(last_line(&r.stderr).starts_with("FAILED: installing the ARENA packages (requirements.gpu.txt)"), "{}", r.stderr);
 }
 
-/// The repo's `install_uv.sh`, stood in for as in `hetzner_setup_tests`: it notes its cwd and
-/// `UV_TORCH_BACKEND` in `install_uv.ran`, then builds the venv with the stub `uv`.
-fn install_uv_sh(repo: &Path) {
-    std::fs::write(
-        repo.join("install_uv.sh"),
-        r#"#!/bin/bash
-set -e
-D="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-echo "cwd=$(pwd) UV_TORCH_BACKEND=${UV_TORCH_BACKEND:-}" >> "$D/install_uv.ran"
-uv venv --clear --python 3.13 --seed "$D/.venv"
-uv pip install --python "$D/.venv/bin/python" -r "$D/requirements.txt"
-"#,
-    )
-    .unwrap();
-}
-
-/// A GPU VM gets the repo's install_uv.sh too (item 4: the same installer as the CPU VM and the
-/// image pods), with torch matched to the host's driver — `UV_TORCH_BACKEND=auto`, or the
-/// backend ARENA_TORCH_BACKEND names — never the CPU wheels; and it must still see the GPU.
+/// A container build has no GPU device, while a GPU VM must still prove CUDA works.
 #[test]
-fn a_gpu_vm_runs_the_repos_install_uv_sh_with_its_torch_backend() {
-    for (tag, named, want) in [("auto", None, "auto"), ("named", Some("cu130"), "cu130")] {
-        let (_t, stubs, home, repo) = setup(&format!("install-uv-{tag}"));
-        install_uv_sh(&repo);
-        let mut env = vec![("UV_INSTALL_MAKES_TORCH", "1"), ("UV_INSTALL_MAKES_CUDA", "1")];
-        env.extend(named.map(|b| ("ARENA_TORCH_BACKEND", b)));
-        let r = run(&stubs, &home, &repo, &env);
-        assert!(r.ok, "{tag}: {}", r.stderr);
-        let ran = std::fs::read_to_string(repo.join("install_uv.ran")).unwrap();
-        assert_eq!(ran, format!("cwd={} UV_TORCH_BACKEND={want}\n", repo.display()), "{tag}");
-        assert!(!repo.join("requirements.gpu.txt").exists() && !r.uv_log.contains("pip install --no-cache-dir"), "{tag}: {}", r.uv_log);
-        assert!(r.stdout.contains(&format!("torch backend {want}")) && !r.stdout.contains("arena-warning"), "{tag}: {}", r.stdout);
-        assert_eq!(std::fs::read_to_string(home.join(".name")).unwrap(), "export MACHINE_NAME=devtest-alpha\n");
-    }
-    let (_t, stubs, home, repo) = setup("install-uv-nocuda");
-    install_uv_sh(&repo);
-    let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]);
-    assert!(!r.ok, "{}", r.stderr);
-    assert!(last_line(&r.stderr).contains("or use the GPU"), "{}", r.stderr);
+fn a_container_build_does_not_require_a_gpu_device() {
+    let (_t, stubs, home, repo) = setup("container");
+    let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1"), ("ARENA_CONTAINER", "1"), ("ARENA_TORCH_BACKEND", "cu130")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(r.uv_log.contains("--torch-backend cu130"));
+    assert!(r.stdout.contains("requirements.txt (shared uv install)"));
 }

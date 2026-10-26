@@ -96,6 +96,9 @@ fn run(stubs: &Path, home: &Path, repo: &Path, env: &[(&str, &str)]) -> Run {
         .env("PATH", path)
         .env("HOME", home)
         .env("REPO_DIR", repo)
+        .env("VENV", repo.join(".venv"))
+        .env("ARENA_BIN_DIR", home.join("bin"))
+        .env("ARENA_MOTD_DIR", home.join("motd"))
         .env("REPO_URL", "https://example.invalid/never-cloned.git");
     for (k, v) in env {
         cmd.env(k, v);
@@ -112,25 +115,6 @@ fn run(stubs: &Path, home: &Path, repo: &Path, env: &[(&str, &str)]) -> Run {
         uv_log: std::fs::read_to_string(stubs.join("uv.log")).unwrap_or_default(),
         git_log: std::fs::read_to_string(stubs.join("git.log")).unwrap_or_default(),
     }
-}
-
-/// The repo's `install_uv.sh`, stood in for (not executable: the script runs it with `bash`).
-/// It notes how it was run — its cwd and `UV_TORCH_BACKEND` — in `install_uv.ran` beside it,
-/// then builds the venv with the stub `uv` the way the real one does (`uv venv --clear --python
-/// 3.13 --seed`, `uv pip install -r requirements.txt`) — or fails with `$INSTALL_UV_EXIT`.
-fn install_uv_sh(repo: &Path) {
-    std::fs::write(
-        repo.join("install_uv.sh"),
-        r#"#!/bin/bash
-set -e
-D="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-echo "cwd=$(pwd) UV_TORCH_BACKEND=${UV_TORCH_BACKEND:-} args=$*" >> "$D/install_uv.ran"
-if [ "${INSTALL_UV_EXIT:-0}" != 0 ]; then echo "install_uv: boom, no solution" >&2; exit "$INSTALL_UV_EXIT"; fi
-uv venv --clear --python 3.13 --seed "$D/.venv"
-uv pip install --python "$D/.venv/bin/python" -r "$D/requirements.txt"
-"#,
-    )
-    .unwrap();
 }
 
 fn setup(tag: &str) -> (Tmp, PathBuf, PathBuf, PathBuf) {
@@ -206,7 +190,7 @@ fn a_good_install_passes_with_python_3_13_and_cpu_substitutions_then_skips_on_re
     let (_t, stubs, home, repo) = setup("ok");
     let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]);
     assert!(r.ok, "{}", r.stderr);
-    assert!(r.uv_log.contains("uv venv --python 3.13 "), "{}", r.uv_log);
+    assert!(r.uv_log.contains("uv venv --python 3.13 --seed "), "{}", r.uv_log);
     assert!(r.uv_log.contains("--torch-backend cpu") && r.uv_log.contains("--override overrides.txt"), "{}", r.uv_log);
     let cpu = std::fs::read_to_string(repo.join("requirements.cpu.txt")).unwrap();
     assert_eq!(cpu, "jax[cpu]==0.11.2\ntorch==2.9.0\ntransformer_lens\nbitsandbytes-foo==1\n");
@@ -223,18 +207,18 @@ fn the_venv_python_follows_a_newer_requires_python_and_the_override() {
     let (_t, stubs, home, repo) = setup("python");
     std::fs::write(repo.join("pyproject.toml"), "[project]\nname = \"x\"\nrequires-python = \">=3.14\"\n").unwrap();
     let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]);
-    assert!(r.ok && r.uv_log.contains("uv venv --python 3.14 "), "{}\n{}", r.stderr, r.uv_log);
+    assert!(r.ok && r.uv_log.contains("uv venv --python 3.14 --seed "), "{}\n{}", r.stderr, r.uv_log);
 
     // An older floor keeps 3.13; ARENA_PYTHON wins over both.
     std::fs::write(repo.join("pyproject.toml"), "requires-python = '>=3.10'\n").unwrap();
     let _ = std::fs::remove_file(stubs.join("torch-ok"));
     std::fs::write(stubs.join("uv.log"), "").unwrap();
     let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]);
-    assert!(r.ok && r.uv_log.contains("uv venv --python 3.13 "), "{}", r.uv_log);
+    assert!(r.ok && r.uv_log.contains("uv venv --python 3.13 --seed "), "{}", r.uv_log);
     let _ = std::fs::remove_file(stubs.join("torch-ok"));
     std::fs::write(stubs.join("uv.log"), "").unwrap();
     let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1"), ("ARENA_PYTHON", "3.12")]);
-    assert!(r.ok && r.uv_log.contains("uv venv --python 3.12 "), "{}", r.uv_log);
+    assert!(r.ok && r.uv_log.contains("uv venv --python 3.12 --seed "), "{}", r.uv_log);
 }
 
 /// The install line the script ran (not its `--help` probe).
@@ -294,73 +278,83 @@ fn w7_b_h0_setup_leaves_no_uv_files_behind() {
     }
 }
 
-/// Item 4 (an evals node, 2026-10-15): the VM got py3.11 and the old CPU requirements, not the
-/// course's env. Now the configured repo's own installer builds it — its `install_uv.sh` (uv,
-/// Python 3.13), as the image RunPod/Vast pods boot from was built — run from the repo with CPU
-/// torch wheels (`UV_TORCH_BACKEND=cpu`) inside the setup's own temp dir; the built-in
-/// requirements install doesn't run, and the output names the installer. Idempotent: an env
-/// that passes the gate isn't rebuilt.
+/// Shared requirements are installed in the canonical venv on both platforms.
 #[test]
-fn the_repos_install_uv_sh_builds_the_env_and_is_named() {
-    let (_t, stubs, home, repo) = setup("install-uv");
-    install_uv_sh(&repo);
-    let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]);
+fn shared_install_uses_the_canonical_venv_and_baked_assets() {
+    let (_t, stubs, home, repo) = setup("shared-paths");
+    let canonical = home.join("opt/arena-env");
+    std::fs::create_dir_all(repo.join(".venv")).unwrap();
+    std::fs::write(repo.join(".venv/kept"), "old environment").unwrap();
+    let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1"), ("VENV", canonical.to_str().unwrap())]);
     assert!(r.ok, "{}", r.stderr);
-    let ran = std::fs::read_to_string(repo.join("install_uv.ran")).unwrap();
-    assert_eq!(ran, format!("cwd={} UV_TORCH_BACKEND=cpu args=\n", repo.display()));
-    assert!(r.uv_log.contains("uv venv --clear --python 3.13 --seed "), "{}", r.uv_log);
-    assert!(!r.uv_log.contains("--override overrides.txt") && !repo.join("requirements.cpu.txt").exists(), "{}", r.uv_log);
-    let ours = format!("{}/.arena-setup.", home.parent().unwrap().join("tmp").display());
-    assert!(r.uv_log.lines().filter_map(|l| l.strip_prefix("TMPDIR ")).all(|d| d.starts_with(&ours)), "{}", r.uv_log);
-    assert!(r.stdout.contains(&format!("installer: {}/install_uv.sh (the repo's own), torch backend cpu", repo.display())), "{}", r.stdout);
-    assert!(last_line(&r.stdout).contains("installer: install_uv.sh,"), "{}", r.stdout);
-    assert_eq!(installers_said(&r.stdout), ["install_uv.sh"], "for the ✓ line (live hz F4): {}", r.stdout);
-    assert!(!r.stdout.contains(arena_core::volume::WARNING_PREFIX), "nothing to warn about: {}", r.stdout);
-
-    std::fs::write(stubs.join("uv.log"), "").unwrap();
-    let again = run(&stubs, &home, &repo, &[]);
+    assert_eq!(std::fs::read_link(repo.join(".venv")).unwrap(), canonical);
+    let saved = std::fs::read_dir(home.join(".cache/arena-setup/old-venvs")).unwrap().next().unwrap().unwrap().path();
+    assert_eq!(std::fs::read_to_string(saved.join("venv/kept")).unwrap(), "old environment");
+    assert!(r.stdout.contains("old repo-local venv kept"));
+    assert_eq!(std::fs::read_link(home.join("ARENA_3.0")).unwrap(), repo);
+    let rc = std::fs::read_to_string(home.join(".zshrc")).unwrap();
+    assert!(rc.contains(canonical.to_str().unwrap()) && !rc.contains("conda activate"));
+    assert!(home.join(".no_auto_tmux").exists());
+    let settings = std::fs::read_to_string(home.join(".vscode/settings.json")).unwrap();
+    assert!(settings.contains(canonical.to_str().unwrap()));
+    assert!(r.git_log.contains("geometry-of-truth") && r.git_log.contains("arena-llm-context"));
+    assert!(!r.git_log.contains("clone --depth 1 https://github.com/nickypro/arena-infra"));
+    assert_eq!(installers_said(&r.stdout), ["requirements.txt (shared uv install)"]);
+    let again = run(&stubs, &home, &repo, &[("VENV", canonical.to_str().unwrap())]);
     assert!(again.ok, "{}", again.stderr);
-    assert_eq!(std::fs::read_to_string(repo.join("install_uv.ran")).unwrap(), ran, "not run again");
-    assert!(!again.uv_log.contains("venv"), "{}", again.uv_log);
-    assert!(last_line(&again.stdout).contains("installer: none (env already present),"), "{}", again.stdout);
     assert_eq!(installers_said(&again.stdout), ["none (env already present)"]);
+    assert_eq!(std::fs::read_to_string(home.join(".bashrc")).unwrap().matches("ARENA_ENV_ACTIVATE").count(), 1);
 }
 
-/// A failing install_uv.sh fails setup: its own error stays visible, the reason is last.
 #[test]
-fn a_failing_install_uv_sh_fails_setup_with_the_reason_last() {
-    let (_t, stubs, home, repo) = setup("install-uv-fails");
-    install_uv_sh(&repo);
-    let r = run(&stubs, &home, &repo, &[("INSTALL_UV_EXIT", "3"), ("UV_INSTALL_MAKES_TORCH", "1")]);
-    assert!(!r.ok, "{}", r.stderr);
-    assert!(r.stderr.contains("install_uv: boom, no solution"), "{}", r.stderr);
-    assert_eq!(last_line(&r.stderr), "FAILED: the repo's install_uv.sh failed (exit 3) — see its output above");
-    assert!(!r.uv_log.contains("pip install --no-cache-dir"), "no fallback after a failed install_uv.sh: {}", r.uv_log);
-}
-
-/// A repo without install_uv.sh (an older checkout) gets the built-in uv install of its
-/// requirements.txt, as before — and says so as an `arena-warning:` line, which `pods setup`
-/// shows on the pod's line. Without a requirements.txt either, nothing can be installed.
-#[test]
-fn without_install_uv_sh_the_requirements_install_runs_and_says_so() {
-    let (_t, stubs, home, repo) = setup("no-install-uv");
-    let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]);
-    assert!(r.ok, "{}", r.stderr);
-    let warn = format!(
-        "{}no install_uv.sh in {} — installed its requirements.txt with the setup script's own uv install instead",
-        arena_core::volume::WARNING_PREFIX,
-        repo.display()
-    );
-    assert!(r.stdout.lines().any(|l| l == warn), "{}", r.stdout);
-    assert!(install_line(&r.uv_log).ends_with("-r requirements.cpu.txt"), "{}", r.uv_log);
-    assert!(last_line(&r.stdout).contains("installer: requirements.txt (built-in uv install),"), "{}", r.stdout);
-    assert_eq!(installers_said(&r.stdout), ["requirements.txt (built-in uv install)"]);
-
-    let (_t, stubs, home, repo) = setup("nothing-to-install");
+fn shared_install_requires_the_repos_requirements() {
+    let (_t, stubs, home, repo) = setup("no-requirements");
     std::fs::remove_file(repo.join("requirements.txt")).unwrap();
     let r = run(&stubs, &home, &repo, &[]);
     assert!(!r.ok);
-    assert_eq!(last_line(&r.stderr), format!("FAILED: no install_uv.sh or requirements.txt in {} to install the ARENA env from", repo.display()));
+    assert!(last_line(&r.stderr).starts_with("FAILED: no requirements.txt"), "{}", r.stderr);
+}
+
+/// Test real source edits in a temporary apt directory, with apt itself stubbed.
+#[test]
+fn hetzner_tls_failure_retries_only_that_mirror_and_keeps_signature_checks() {
+    let (_t, stubs, home, repo) = setup("mirror-tls");
+    let apt = home.join("apt");
+    std::fs::create_dir_all(apt.join("sources.list.d")).unwrap();
+    let src = apt.join("sources.list.d/ubuntu.sources");
+    std::fs::write(&src, "URIs: https://mirror.hetzner.com/ubuntu/packages\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\nOther: https://example.invalid/ubuntu\n").unwrap();
+    arena_core::remote::write_test_script(stubs.join("apt-get"), r#"#!/bin/sh
+case "$*" in *update*)
+  echo update >> "$HOME/apt-calls"
+  if grep -q https://mirror "$ARENA_APT_DIR/sources.list.d/ubuntu.sources"; then
+    echo 'Err: https://mirror.hetzner.com/ubuntu Certificate verification failed: expired certificate'
+    exit 100
+  fi;;
+esac
+exit 0
+"#).unwrap();
+    let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH","1"), ("ARENA_APT_DIR",apt.to_str().unwrap())]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(r.stdout.contains("arena-warning: Hetzner apt mirror TLS failed"));
+    let sources = std::fs::read_to_string(src).unwrap();
+    assert!(sources.contains("http://mirror.hetzner.com/") && sources.contains("Signed-By:") && sources.contains("https://example.invalid/"));
+    assert_eq!(std::fs::read_to_string(home.join("apt-calls")).unwrap().lines().count(), 2);
+}
+
+#[test]
+fn failed_or_ignored_apt_indexes_stop_before_installing_packages() {
+    for (tag, log, exit) in [("network", "Err: unrelated network failure", 100), ("ignored", "W: Some index files failed to download. They have been ignored", 0)] {
+        let (_t, stubs, home, repo) = setup(tag);
+        arena_core::remote::write_test_script(stubs.join("apt-get"), format!(r#"#!/bin/sh
+case "$*" in *update*) echo '{log}'; exit {exit};; esac
+echo installed > "$HOME/apt-installed"
+"#)).unwrap();
+        let r = run(&stubs, &home, &repo, &[]);
+        assert!(!r.ok, "{tag}: {}", r.stdout);
+        assert!(last_line(&r.stderr).starts_with("FAILED: apt-get update failed"), "{}", r.stderr);
+        assert!(!home.join("apt-installed").exists());
+        assert!(!r.stdout.contains("retrying that mirror"));
+    }
 }
 
 /// The configured repo (`REPO_URL`, from ARENA_REPO_OWNER/ARENA_REPO_NAME): cloned when it
