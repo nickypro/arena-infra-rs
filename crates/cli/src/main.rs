@@ -24,6 +24,9 @@ use arena_core::{Config, PodSpec};
 mod archive;
 mod ask;
 #[cfg(test)]
+mod endpoint_tests;
+
+#[cfg(test)]
 mod gpu_vm_setup_tests;
 #[cfg(test)]
 mod hetzner_cli_tests;
@@ -5676,10 +5679,12 @@ async fn handle_backup(
     // The repo every pod's `origin` must be (else WRONG_ORIGIN: nothing committed or pushed).
     let origin = backup::configured_repo(cfg);
 
+    let missing = sel.endpoint_failures();
     // Back up only pods that actually have an SSH endpoint; report the rest.
     let targets = sel.named_targets(cfg)?;
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to back up)");
+        if !missing.is_empty() { return Err(BackupFailed { pods: missing }.into()); }
         return Ok(());
     }
 
@@ -5703,6 +5708,7 @@ async fn handle_backup(
             backup::backup_script_heredoc()
         );
         println!("\nPreview only — run without --dry-run to execute over SSH.");
+        if !missing.is_empty() { return Err(BackupFailed { pods: missing }.into()); }
         return Ok(());
     }
 
@@ -5725,7 +5731,8 @@ async fn handle_backup(
             (name, target, cmd)
         })
         .collect();
-    let t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}"), |name| locks.done(name)).await;
+    let mut t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}"), |name| locks.done(name)).await;
+    t.failed.extend(missing);
     println!(
         "\nDone: {} pushed, {} unchanged, {} skipped (main/master), {} failed.",
         t.pushed,
@@ -8090,7 +8097,9 @@ async fn handle_run(
 ) -> Result<()> {
     // Pods we can't reach yet are reported (not silently dropped), so a "run on every pod"
     // can't quietly skip part of the fleet while reporting success.
+    let missing = sel.endpoint_failures();
     let mut targets = sel.named_targets(cfg)?;
+    if targets.is_empty() && !missing.is_empty() { anyhow::bail!("no SSH endpoint for running pods: {}", missing.join(", ")); }
     targets.sort_by(|a, b| a.0.cmp(&b.0));
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint)");
@@ -8106,6 +8115,7 @@ async fn handle_run(
     let names: Vec<&str> = targets.iter().map(|(n, _)| n.as_str()).collect();
     if dry_run {
         println!("{}", run_preview(true, cmd, &remote_cmd, &names, timeout));
+        if !missing.is_empty() { anyhow::bail!("no SSH endpoint for running pods: {}", missing.join(", ")); }
         return Ok(());
     }
     if confirm_needed && !confirm(yes, &run_preview(false, cmd, &remote_cmd, &names, timeout))? {
@@ -8115,6 +8125,7 @@ async fn handle_run(
 
     let results = run_fleet(&remote, targets, &remote_cmd, timeout).await;
     let (lines, bad) = render_run(&results, compact);
+    let bad = bad + missing.len();
     for line in lines {
         println!("{line}");
     }
@@ -13408,7 +13419,8 @@ impl Selected {
                 Ok(t) => targets.push((pod, t)),
                 // A stopped or proxy-only pod says so, not "yet" (it won't get one by waiting).
                 Err(_) => eprintln!(
-                    "skip {} — {}",
+                    "{} {} — {}",
+                    if arena_core::status::endpoint_overdue(pod, arena_core::status::now_secs()) { "⚠ FAILED" } else { "skip" },
                     pod.name,
                     arena_core::fleet::no_endpoint_reason(pod).unwrap_or_else(|| "no SSH endpoint yet".into())
                 ),
@@ -13421,6 +13433,14 @@ impl Selected {
             anyhow::bail!("none of the selected pods ({}) has an SSH endpoint yet — check `arena pods list`", self.names());
         }
         Ok(targets)
+    }
+
+    /// Count running pods missing SSH beyond the boot grace as failed work, while still
+    /// allowing the rest of a fleet to be backed up, copied or run on.
+    fn endpoint_failures(&self) -> Vec<String> {
+        let now = arena_core::status::now_secs();
+        self.pods.iter().filter(|p| arena_core::status::endpoint_overdue(p, now))
+            .map(|p| p.name.clone()).collect()
     }
 
     /// [`ssh_targets`](Self::ssh_targets) keyed by pod name — what the per-pod runners take.
@@ -13988,7 +14008,7 @@ async fn pull_pods(
         .collect();
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to pull)");
-        return Ok(Pulled { failed: unreachable, ..Pulled::default() });
+        return Ok(Pulled { failures: sel.endpoint_failures().into_iter().map(|n| format!("{n}: no SSH endpoint after 10 minutes running")).collect(), failed: unreachable, ..Pulled::default() });
     }
 
     // Per-pod tiers: (tier name, dest, config). `big` is dropped when --no-big. The snapshot
@@ -14035,7 +14055,7 @@ async fn pull_pods(
             println!("⚠ {why}: where {repo} is a link (setup links it onto the /workspace volume), this pull would hold only the link");
         }
         println!("Preview only — run without --dry-run to copy.");
-        return Ok(Pulled::default());
+        return Ok(Pulled { failures: sel.endpoint_failures().into_iter().map(|n| format!("{n}: no SSH endpoint after 10 minutes running")).collect(), ..Pulled::default() });
     }
     let dest_msg = if no_big {
         format!("the dated snapshot {dir}/{label}/")
@@ -14219,6 +14239,9 @@ async fn pull_pods(
     }
     // A pod none of whose jobs started holds its lock no longer.
     locks.release_idle();
+    let missing = sel.endpoint_failures();
+    failed += missing.len();
+    failures.extend(missing.into_iter().map(|n| format!("{n}: no SSH endpoint after 10 minutes running")));
     let (mut ok, mut done) = (0, 0);
     while let Some(joined) = set.join_next_with_id().await {
         done += 1;

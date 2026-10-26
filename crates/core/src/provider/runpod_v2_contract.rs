@@ -107,6 +107,7 @@ fn sandbox_pod(name: &str) -> Pod {
         volume_gb: Some(0.0),
         delete_protected: None,
         created_at: Some(1_791_452_013),
+        started_at: Some(1_791_452_013),
         identity: None,
         status_detail: None,
     }
@@ -445,4 +446,64 @@ fn network_volumes_read_the_recorded_empty_list() {
     assert_eq!(sent(volumes_request(&client(), "k")), (r.method.clone(), r.path.clone()));
     let body = judge_v2(r.status, &r.text(), "list network volumes").unwrap();
     assert!(parse_network_volumes(&body).unwrap().is_empty());
+}
+
+/// Reproducer of the list/detail discrepancy reported 2026-10-26. This fixture is
+/// derived from the scrubbed recording, with the two omitted list fields set to null.
+#[tokio::test]
+async fn list_without_runtime_recovers_endpoints_from_detail() {
+    let v: Value = serde_json::from_str(include_str!("fixtures/runpod_v2_list_missing_runtime.json")).unwrap();
+    let pods = collect_pages(|_| { let v = v.clone(); async move { Ok(v) } }, 1).await.unwrap();
+    assert!(pods[0].ssh_ip.is_none());
+    let pods = fill_endpoints(pods, |id| async move {
+        assert_eq!(id, POD_ID);
+        Ok(recorded("get_running").body)
+    }).await.unwrap();
+    assert_eq!(pods, vec![sandbox_pod("devtest-alpha")]);
+}
+
+#[tokio::test]
+async fn detail_failure_is_not_a_successful_incomplete_listing() {
+    let p = Pod { id: "p1".into(), status: "RUNNING".into(), ..Pod::default() };
+    let error = fill_endpoints(vec![p.clone()], |_| async { Err(Error::provider("HTTP 401")) }).await.unwrap_err();
+    assert!(error.to_string().contains("401"));
+    assert!(fill_endpoints(vec![p], |_| async { Ok(json!({"id":"wrong", "status":"RUNNING"})) }).await.is_err());
+}
+
+#[tokio::test]
+async fn fills_only_running_missing_endpoints_and_bounds_concurrency() {
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    let active = Arc::new(AtomicUsize::new(0));
+    let max = Arc::new(AtomicUsize::new(0));
+    let mut pods: Vec<Pod> = (0..19).map(|i| Pod { id: format!("p{i}"), status: "RUNNING".into(), ..Pod::default() }).collect();
+    pods.push(Pod { id: "stopped".into(), status: "EXITED".into(), ..Pod::default() });
+    let mut ready = sandbox_pod("ready"); ready.id = "ready".into(); pods.push(ready);
+    let got = fill_endpoints(pods.clone(), |id| {
+        let active = active.clone(); let max = max.clone();
+        async move {
+            assert!(id.starts_with('p'));
+            let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max.fetch_max(n, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(json!({"id":id,"status":"RUNNING", "runtime":{"uptime":1200,"ports":[{"ip":"203.0.113.2","private":22,"public":1234,"type":"tcp"}]}}))
+        }
+    }).await.unwrap();
+    assert!(max.load(Ordering::SeqCst) <= 8);
+    assert!(max.load(Ordering::SeqCst) > 1);
+    assert_eq!(got.iter().map(|p| &p.id).collect::<Vec<_>>(), pods.iter().map(|p| &p.id).collect::<Vec<_>>());
+    assert!(got[..19].iter().all(|p| p.ssh_port == Some(1234) && p.started_at.is_some()));
+    assert_eq!(got[19..], pods[19..]);
+}
+
+#[test]
+fn runtime_ports_are_a_direct_ssh_fallback_never_the_gateway_or_http_port() {
+    let mut body = recorded("get_running").body;
+    body["ssh"]["direct"] = Value::Null;
+    assert_eq!(parse_pod(&body).ssh_port, Some(23924));
+    body["runtime"]["ports"][0]["type"] = json!("http");
+    assert!(parse_pod(&body).ssh_ip.is_none());
+    body["runtime"]["ports"][0]["type"] = json!("tcp");
+    body["runtime"]["ports"][0]["public"] = json!(70000);
+    assert!(parse_pod(&body).ssh_ip.is_none());
 }

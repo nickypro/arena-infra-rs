@@ -468,6 +468,7 @@ fn parse_server(v: &Value) -> Pod {
             .and_then(crate::reap::parse_rfc3339)
             .and_then(|t| u64::try_from(t).ok()),
         // The VM's own id (cloud-init's instance id) is the reaper's identity check.
+        started_at: None,
         identity: None,
         status_detail: None,
     }

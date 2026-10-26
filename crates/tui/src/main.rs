@@ -72,7 +72,7 @@ use arena_core::naming;
 use arena_core::{Config, Pod, PodSpec};
 
 use prefs::Prefs;
-use arena_core::status::display_status;
+use arena_core::status::pod_status;
 use state::{
     action_summary, capture_details, dashboard_snapshot, details_due, display_name, health_cell, mark_key, marked_pods,
     marked_set_token, merge_details, overlay_details, partial_notice, proxy_cell, proxy_detail,
@@ -2735,8 +2735,10 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 None => "-".into(),
             };
             // RUNNING-but-unreachable reads as "init" (still coming up), in yellow.
-            let status_label = display_status(&p.status, m.map(|m| m.error.is_none()));
-            let status_cell = if status_label == "init" {
+            let status_label = pod_status(p, m.map(|m| m.error.is_none()));
+            let status_cell = if status_label == "no-ssh" {
+                Cell::from(status_label).style(Style::default().fg(Color::Red))
+            } else if status_label == "init" {
                 Cell::from(status_label).style(Style::default().fg(Color::Yellow))
             } else {
                 Cell::from(status_label)
@@ -3062,7 +3064,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let facts = format!(
         "status:   {}\ngpu:      {}\nendpoint: {}\nproxy:    {}\ncost:     {}\nmaint:    {}\nhealth:   {}\nreason:   {}\ndisk:     {}\nhost:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\ntokens:   HF {}   Claude-Code {}\nprogress: {}",
         {
-            let status = display_status(&pod.status, m.map(|m| m.error.is_none()));
+            let status = pod_status(pod, m.map(|m| m.error.is_none()));
             if arena_core::lock::is_locked(pod) {
                 // One row (the facts block has a fixed height): `pods unlock` is in the docs.
                 format!("{status} · locked (stop/restart/terminate refused)")
