@@ -81,6 +81,10 @@ pub struct Pod {
     /// outlives its reboots (`crate::reap`, R2-1). `None` = not reported (RunPod v1, Vast).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
+    /// Last start, when reported by the provider. Creation time cannot distinguish an old
+    /// pod restarting now from one that has been running without an endpoint for hours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
     /// A per-create nonce the machine itself can show, where the provider exposes no id the VM
     /// knows (Shadeform: the `arena-nonce-<uuid>` tag arena sets, which its bootstrap also writes
     /// to `/var/lib/arena/shadeform-nonce`). For an identity check against the machine, never for
@@ -342,6 +346,7 @@ mod tests {
                 volume_gb: None,
                 delete_protected: None,
                 created_at: None,
+                started_at: None,
                 identity: None,
                 status_detail: None,
             },
