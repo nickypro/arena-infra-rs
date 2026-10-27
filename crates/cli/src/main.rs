@@ -44,7 +44,7 @@ const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 #[derive(Parser)]
 #[command(
     name = "arena",
-    version = env!("ARENA_VERSION"),
+    version = concat!(env!("ARENA_VERSION"), " (", env!("ARENA_COMMIT"), ")"),
     about = "Streamlined ARENA infra control plane",
     // Cisco-style shorthands: any unambiguous prefix works (`arena po l` == `pods
     // list`). Ambiguous prefixes (e.g. `p` for pods/proxy) error and ask you to
@@ -106,6 +106,79 @@ impl std::error::Error for NoTerminal {}
 /// The exit status for a [`NoTerminal`] refusal: 2, apart from a failed command's 1.
 const NO_TERMINAL_EXIT: u8 = 2;
 
+/// `update --check`'s answer when a newer release exists: exit [`UPDATE_AVAILABLE_EXIT`], so a
+/// cron line or MOTD can tell it from "up to date" (0) and "couldn't check" (1).
+#[derive(Debug)]
+struct UpdateAvailable;
+
+impl std::fmt::Display for UpdateAvailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a newer release is available: `arena update` installs it")
+    }
+}
+
+impl std::error::Error for UpdateAvailable {}
+
+/// The exit status for [`UpdateAvailable`].
+const UPDATE_AVAILABLE_EXIT: u8 = 10;
+
+/// This build's own `CHANGELOG.md`: what `arena update` compares the release's against.
+const CHANGELOG: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../CHANGELOG.md"));
+
+/// `arena update` ([`arena_core::update`]): check, then — unless `--check` — download, check
+/// and swap in the release's binaries where this one is.
+async fn handle_update(check_only: bool, dry_run: bool, yes: bool) -> Result<()> {
+    use arena_core::update as up;
+    let installed = up::Version::parse(env!("ARENA_VERSION")).context("this build's version")?;
+    let client = up::client();
+    let found = up::check(&client, up::REPO_API, installed, CHANGELOG).await.map_err(|e| anyhow::anyhow!("update: {e}"))?;
+    if !found.newer {
+        println!("arena {installed} is up to date (the latest release is {}).", found.release.tag);
+        return Ok(());
+    }
+    println!("Update available: arena {installed} → {} ({})\n", found.release.version, found.release.tag);
+    print!("{}", found.changes);
+    if check_only {
+        return Err(UpdateAvailable.into());
+    }
+    // Where this binary really is (`/usr/local/bin/arena` is a link into ~/.cargo/bin on prod).
+    let exe = std::env::current_exe().and_then(|p| p.canonicalize()).context("finding this binary")?;
+    let dir = exe.parent().context("this binary has no directory")?;
+    if exe.file_name().and_then(|n| n.to_str()) != Some("arena") {
+        anyhow::bail!("this binary is {} — `arena update` replaces one named `arena` (and `arena-tui` beside it)", exe.display());
+    }
+    let target = env!("ARENA_TARGET");
+    println!("\nDownloading {} for {target} …", found.release.tag);
+    let staged = up::fetch(&client, &found.release, target, dir).await.map_err(|e| anyhow::anyhow!("update: {e}"))?;
+    println!("Both binaries match the release's SHA256SUMS, and the new arena runs here.");
+    if dry_run {
+        println!("--dry-run: nothing installed.");
+        return Ok(());
+    }
+    let what = format!(
+        "Install arena {} in {} (the current arena and arena-tui become arena.prev and arena-tui.prev)?",
+        found.release.version,
+        dir.display()
+    );
+    if !confirm(yes, &what)? {
+        println!("Not installed.");
+        return Ok(());
+    }
+    staged.install().map_err(|e| anyhow::anyhow!("update: {e}"))?;
+    println!("Installed arena {} in {}.", found.release.version, dir.display());
+    println!("Roll back: cd {} && mv -f arena.prev arena && mv -f arena-tui.prev arena-tui", dir.display());
+    let stale = up::stale_processes(std::path::Path::new("/proc"), &dir.join("arena-tui"));
+    if !stale.is_empty() {
+        let started = |t: Option<std::time::SystemTime>| {
+            t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or_else(|| "start unknown".into(), |d| format!("started {}", arena_core::snapshot::rfc3339(d.as_secs())))
+        };
+        let list: Vec<String> = stale.iter().map(|(pid, t)| format!("pid {pid} ({})", started(*t))).collect();
+        println!("{} dashboard(s) still run the old build — restart them: {}", stale.len(), list.join(", "));
+    }
+    Ok(())
+}
+
 /// What `main` ends with for `result`: success, [`NO_TERMINAL_EXIT`] for a refused
 /// confirmation, else 1. Pure, so the mapping is tested.
 fn exit_code(result: &Result<()>) -> std::process::ExitCode {
@@ -116,6 +189,7 @@ fn exit_code(result: &Result<()>) -> std::process::ExitCode {
         Err(e) if e.downcast_ref::<reap::ReapExit>().is_some() => {
             std::process::ExitCode::from(e.downcast_ref::<reap::ReapExit>().map_or(1, |r| r.code))
         }
+        Err(e) if e.downcast_ref::<UpdateAvailable>().is_some() => std::process::ExitCode::from(UPDATE_AVAILABLE_EXIT),
         Err(_) => std::process::ExitCode::FAILURE,
     }
 }
@@ -127,6 +201,23 @@ enum Cmd {
     Pods(PodCmd),
     /// Open the interactive dashboard (arena-tui)
     Tui,
+    /// Install the newest release, after saying what changed since this build
+    ///
+    /// Reads the latest GitHub release and shows its changelog entries this build lacks, the
+    /// "action needed" and config lines first. Then it downloads `arena` and `arena-tui` for
+    /// this platform, checks them against the release's SHA256SUMS, checks the new `arena`
+    /// runs here, asks, and swaps both in where this binary is — the old ones kept as
+    /// `arena.prev` / `arena-tui.prev`. Dashboards still on the old build are listed.
+    /// Needs no config.
+    #[command(verbatim_doc_comment)]
+    Update {
+        /// Only say whether a newer release exists and what it changes (exit 10 if one does)
+        #[arg(long)]
+        check: bool,
+        /// Download and check the new binaries, but install nothing
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
     /// SSH proxy forwards: preview (plan) or write + reload (apply)
     #[command(subcommand, infer_subcommands = true)]
     Proxy(ProxyCmd),
@@ -2828,6 +2919,10 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    // Before the config: an update needs none, and must work where it's broken.
+    if let Cmd::Update { check, dry_run } = cli.cmd {
+        return handle_update(check, dry_run, cli.yes).await;
+    }
     let cfg = Config::load(&cli.config)
         .with_context(|| format!("loading config {}", cli.config.display()))?;
 
@@ -2835,7 +2930,7 @@ async fn run() -> Result<()> {
     // for), so build the provider lazily — only for commands that actually talk to one.
     let provider = match cli.cmd {
         // The archive builds its own Hetzner client (its own token), and its cron path none.
-        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Gpus { .. } | Cmd::Offers { .. } | Cmd::Api(_) | Cmd::Archive(_) => None,
+        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Update { .. } | Cmd::Gpus { .. } | Cmd::Offers { .. } | Cmd::Api(_) | Cmd::Archive(_) => None,
         // Fleet-wide: every command spans all configured providers (create still targets
         // --provider). One configured backend behaves like that single provider.
         _ => Some(arena_core::provider::build_fleet(&cli.provider, &cfg, true)?),
@@ -2846,6 +2941,7 @@ async fn run() -> Result<()> {
 
     match cli.cmd {
         Cmd::Tui => launch_tui(&cli.provider, &cli.config),
+        Cmd::Update { .. } => unreachable!("handled before the config is read"),
         Cmd::Plan(c) => handle_plan(c, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &cli.config),
         Cmd::Cron(c) => handle_cron(c, &cfg, &cli.config, cli.yes, CRONTAB, std::env::var("HOME").ok().as_deref()).await,
@@ -18332,6 +18428,22 @@ ASK_AI=gpt
         // Without the backup line selected, only the asked-for lines render.
         let kinds: Vec<super::CronKind> = cron_kinds(false, false, true, Some("/w")).into_iter().map(|(k, _)| k).collect();
         assert_eq!(kinds, [super::CronKind::Proxy, super::CronKind::Snapshot]);
+    }
+
+    /// `update --check` exits 10 when a newer release exists, apart from up to date (0) and
+    /// couldn't check (1); the version it compares is this build's, with its commit after it.
+    #[test]
+    fn update_check_exits_10_for_a_newer_release_and_this_build_has_a_version() {
+        use super::{exit_code, UpdateAvailable, UPDATE_AVAILABLE_EXIT};
+        use std::process::ExitCode;
+        assert_eq!(UPDATE_AVAILABLE_EXIT, 10);
+        assert_eq!(exit_code(&Err(UpdateAvailable.into())), ExitCode::from(10));
+        assert_eq!(exit_code(&Err(anyhow::anyhow!("GET …/releases/latest: HTTP 403"))), ExitCode::FAILURE);
+        assert!(arena_core::update::Version::parse(env!("ARENA_VERSION")).is_some(), "{}", env!("ARENA_VERSION"));
+        assert!(!env!("ARENA_COMMIT").is_empty() && !env!("ARENA_TARGET").is_empty());
+        let log = arena_core::update::entries(super::CHANGELOG);
+        assert!(log.len() >= 3, "the compiled-in changelog has its entries");
+        assert!(log.iter().all(|e| e.heading.len() > 13 && e.heading.as_bytes()[4] == b'-' && e.heading.contains(" · ")), "headings are `YYYY-MM-DD · …`");
     }
 
     /// Finding #25: a refusal for lack of a terminal (no --yes) exits 2 — it exited 0 after
