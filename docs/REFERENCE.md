@@ -225,7 +225,10 @@ which starved RunPod placement — "no capacity" all day once the 13.0 hosts wer
 
 Same provider name and commands. Differences: real lifecycle statuses
 (`PROVISIONING`/`STARTING`/`RUNNING`/`EXITED`/`ERROR`); the SSH endpoint comes from `ssh.direct`
-only; create always sends `cloud` (v2 defaults to SECURE) and merges the account's registered SSH
+(else the TCP 22 runtime mapping, never RunPod's SSH gateway). The list has left both out since
+2026-10-26, so running pods are filled from `GET /v2/pods/{id}`, and the endpoint is remembered
+while the pod keeps its `startedAt` (rechecked every 10 min): a dashboard refresh costs no extra
+request. A failed lookup leaves just that pod without an endpoint. Create always sends `cloud` (v2 defaults to SECURE) and merges the account's registered SSH
 keys into `PUBLIC_KEY` (v2 skips them when it's set); `replace` recovers GPU type + cloud tier.
 
 Rename is `PATCH /v2/pods/{id}` with only `{"name"}` (live-verified restart-free — PID 1, a `/root`

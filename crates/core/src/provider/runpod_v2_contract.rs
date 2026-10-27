@@ -458,16 +458,108 @@ async fn list_without_runtime_recovers_endpoints_from_detail() {
     let pods = fill_endpoints(pods, |id| async move {
         assert_eq!(id, POD_ID);
         Ok(recorded("get_running").body)
-    }).await.unwrap();
+    }, &Mutex::new(HashMap::new()), 1_792_000_000).await;
     assert_eq!(pods, vec![sandbox_pod("devtest-alpha")]);
 }
 
+/// A failed or malformed lookup leaves only that pod without an endpoint, and says why; the
+/// others are filled. (The proxy keeps a listed pod's forward; a backup counts a pod without
+/// SSH as failed work.) Order and every pod are kept.
 #[tokio::test]
-async fn detail_failure_is_not_a_successful_incomplete_listing() {
-    let p = Pod { id: "p1".into(), status: "RUNNING".into(), ..Pod::default() };
-    let error = fill_endpoints(vec![p.clone()], |_| async { Err(Error::provider("HTTP 401")) }).await.unwrap_err();
-    assert!(error.to_string().contains("401"));
-    assert!(fill_endpoints(vec![p], |_| async { Ok(json!({"id":"wrong", "status":"RUNNING"})) }).await.is_err());
+async fn a_failed_lookup_leaves_only_that_pod_without_an_endpoint() {
+    let running = |id: &str| Pod { id: id.into(), status: "RUNNING".into(), started_at: Some(1000), ..Pod::default() };
+    let got = fill_endpoints(vec![running("bad"), running("good"), running("odd")], |id| async move {
+        match id.as_str() {
+            "bad" => Err(Error::provider("HTTP 429 Too Many Requests")),
+            "odd" => Ok(json!({"id": "wrong", "status": "RUNNING"})),
+            _ => Ok(json!({"id": id, "status": "RUNNING", "ssh": {"direct": {"host": "203.0.113.4", "port": 2222}}})),
+        }
+    }, &Mutex::new(HashMap::new()), 5000).await;
+    assert_eq!(got.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["bad", "good", "odd"]);
+    assert_eq!((got[1].ssh_ip.as_deref(), got[1].ssh_port, &got[1].status_detail), (Some("203.0.113.4"), Some(2222), &None));
+    for (p, why) in [(&got[0], "429"), (&got[2], "invalid detail for odd")] {
+        assert_eq!((p.ssh_ip.as_deref(), p.ssh_port, p.status.as_str()), (None, None, "RUNNING"), "{p:?}");
+        let said = p.status_detail.as_deref().unwrap_or_default();
+        assert!(said.starts_with("SSH endpoint lookup failed: ") && said.contains(why), "{said}");
+    }
+}
+
+/// The provider keeps what it looked up between listings — a dashboard is one provider for
+/// its whole run — so its second listing of the same pods sends no detail GET.
+#[tokio::test]
+async fn a_providers_second_listing_reuses_the_endpoints() {
+    use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+    let list: Value = serde_json::from_str(include_str!("fixtures/runpod_v2_list_missing_runtime.json")).unwrap();
+    let details = Arc::new(AtomicUsize::new(0));
+    let p = RunpodV2Provider { api_key: "rpa_TEST".into(), client: Client::new(), account_keys: Mutex::new(None), endpoints: Mutex::new(HashMap::new()) };
+    for _ in 0..3 {
+        let details = details.clone();
+        let pods = p.list_via(|_| { let v = list.clone(); async move { Ok(v) } }, move |_| {
+            details.fetch_add(1, Ordering::SeqCst);
+            async { Ok(recorded("get_running").body) }
+        }).await.unwrap();
+        assert_eq!(pods, vec![sandbox_pod("devtest-alpha")]);
+    }
+    assert_eq!(details.load(Ordering::SeqCst), 1);
+}
+
+/// The endpoint is looked up once per start: refreshes reuse it (no GET), a restart (a new
+/// `startedAt`) or [`ENDPOINT_RECHECK_SECS`] looks it up again, and a failed recheck keeps the
+/// one remembered for that start. Only a found endpoint with a known start is remembered;
+/// a pod no longer listed is forgotten.
+#[tokio::test]
+async fn an_endpoint_is_remembered_while_the_pod_keeps_its_start() {
+    use std::sync::{atomic::{AtomicU16, AtomicUsize, Ordering}, Arc};
+    let gets = Arc::new(AtomicUsize::new(0));
+    let port = Arc::new(AtomicU16::new(2201));
+    let fails = Arc::new(AtomicUsize::new(0));
+    let memo = Mutex::new(HashMap::new());
+    let pod = |started_at: Option<u64>| Pod { id: "p1".into(), status: "RUNNING".into(), started_at, ..Pod::default() };
+    let fill = |pods: Vec<Pod>, now: u64| {
+        let (gets, port, fails) = (gets.clone(), port.clone(), fails.clone());
+        fill_endpoints(pods, move |id| {
+            gets.fetch_add(1, Ordering::SeqCst);
+            let (port, failing) = (port.load(Ordering::SeqCst), fails.load(Ordering::SeqCst) > 0);
+            async move {
+                if failing {
+                    return Err(Error::provider("HTTP 503"));
+                }
+                Ok(json!({"id": id, "status": "RUNNING", "ssh": {"direct": {"host": "203.0.113.7", "port": port}}}))
+            }
+        }, &memo, now)
+    };
+    let endpoint = |p: &Pod| (p.ssh_ip.clone(), p.ssh_port);
+    let up = |port: u16| (Some("203.0.113.7".to_string()), Some(port));
+
+    assert_eq!(endpoint(&fill(vec![pod(Some(1000))], 5000).await[0]), up(2201));
+    assert_eq!(gets.load(Ordering::SeqCst), 1);
+    assert_eq!(endpoint(&fill(vec![pod(Some(1000))], 5000 + ENDPOINT_RECHECK_SECS - 1).await[0]), up(2201));
+    assert_eq!(gets.load(Ordering::SeqCst), 1, "a refresh is no GET");
+
+    port.store(2202, Ordering::SeqCst);
+    assert_eq!(endpoint(&fill(vec![pod(Some(2000))], 5100).await[0]), up(2202), "a restart is a new lookup");
+    assert_eq!(gets.load(Ordering::SeqCst), 2);
+    port.store(2203, Ordering::SeqCst);
+    assert_eq!(endpoint(&fill(vec![pod(Some(2000))], 5100 + ENDPOINT_RECHECK_SECS).await[0]), up(2203), "rechecked");
+    assert_eq!(gets.load(Ordering::SeqCst), 3);
+
+    fails.store(1, Ordering::SeqCst);
+    let kept = fill(vec![pod(Some(2000))], 5100 + 3 * ENDPOINT_RECHECK_SECS).await;
+    assert_eq!(endpoint(&kept[0]), up(2203), "a failed recheck keeps the endpoint of the same start");
+    assert!(kept[0].status_detail.as_deref().is_some_and(|d| d.contains("503")), "{kept:?}");
+    let restarted = fill(vec![pod(Some(3000))], 5100 + 3 * ENDPOINT_RECHECK_SECS).await;
+    assert_eq!(endpoint(&restarted[0]), (None, None), "but never one from an earlier start");
+    fails.store(0, Ordering::SeqCst);
+
+    let before = gets.load(Ordering::SeqCst);
+    fill(vec![pod(None)], 9000).await;
+    fill(vec![pod(None)], 9000).await;
+    assert_eq!(gets.load(Ordering::SeqCst), before + 2, "no start time: looked up every time");
+
+    fill(vec![pod(Some(4000))], 9000).await;
+    assert!(memo.lock().unwrap().contains_key("p1"));
+    fill(vec![Pod { id: "other".into(), status: "EXITED".into(), ..Pod::default() }], 9000).await;
+    assert!(memo.lock().unwrap().is_empty(), "a pod no longer listed is forgotten");
 }
 
 #[tokio::test]
@@ -488,7 +580,7 @@ async fn fills_only_running_missing_endpoints_and_bounds_concurrency() {
             active.fetch_sub(1, Ordering::SeqCst);
             Ok(json!({"id":id,"status":"RUNNING", "runtime":{"uptime":1200,"ports":[{"ip":"203.0.113.2","private":22,"public":1234,"type":"tcp"}]}}))
         }
-    }).await.unwrap();
+    }, &Mutex::new(HashMap::new()), 1_792_000_000).await;
     assert!(max.load(Ordering::SeqCst) <= 8);
     assert!(max.load(Ordering::SeqCst) > 1);
     assert_eq!(got.iter().map(|p| &p.id).collect::<Vec<_>>(), pods.iter().map(|p| &p.id).collect::<Vec<_>>());
