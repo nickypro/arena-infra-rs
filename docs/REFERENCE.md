@@ -11,6 +11,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
 - [Safety model (this is developed against live production)](#safety-model-this-is-developed-against-live-production)
 - [Running arena](#running-arena)
   - [From a checkout](#from-a-checkout)
+  - [`update`: installing a newer release](#update-installing-a-newer-release)
   - [Command shorthands](#command-shorthands)
   - [Targeting & concurrency](#targeting--concurrency)
   - [Overriding config without editing it](#overriding-config-without-editing-it)
@@ -119,6 +120,35 @@ ARENA_CONFIG=./config.env cargo run -p arena-tui
 # point at a different config
 cargo run -p arena-cli -- --config ./config.env pods list
 ```
+
+### `update`: installing a newer release
+
+Every green master commit is published as a GitHub release (`.github/workflows/release.yml`):
+`arena` and `arena-tui` for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, built
+on Ubuntu 22.04 (glibc 2.35 or newer), with `CHANGELOG.md` and `SHA256SUMS`. The tag is the
+version, `v2.0.YYMMDD.HHMM`, from the commit's time in UTC. `arena --version` prints it with the
+commit: `arena 2.0.261027.1500 (5274b7a1c2)`.
+
+```bash
+arena update --check     # newer release? what changed? (exit 10 = yes, 0 = up to date, 1 = couldn't tell)
+arena update --dry-run   # also download and check it, install nothing
+arena update             # … then ask, and swap both binaries in (--yes to skip the question)
+sudo arena update        # where root runs arena from someone else's ~/.cargo/bin (prod)
+```
+
+- **What changed:** the release's `CHANGELOG.md` entries that this build's own copy (compiled
+  in) lacks, with their **Action needed** and **Config** lines first.
+- **Checks before anything changes:** both binaries must match `SHA256SUMS`, and the new
+  `arena --version` must run here and name the release. A wrong-platform or cut-short download
+  never replaces what cron runs.
+- **The swap:** where this `arena` really is (symlinks resolved), the current binaries become
+  `arena.prev` / `arena-tui.prev` (an older `.prev` is replaced). Each new one takes the old
+  one's mode and owner, and lands by rename, so the path always holds a whole binary.
+  Roll back with `mv -f arena.prev arena && mv -f arena-tui.prev arena-tui`.
+- **Afterwards:** it lists the `arena-tui` dashboards still running the replaced build, to
+  restart. Cron picks the new `arena` up on its next run.
+- It needs no config and no GitHub login (the API allows 60 unauthenticated requests an hour).
+  Provenance: `gh attestation verify arena-<target> --repo nickypro/arena-infra-rs`.
 
 ### Command shorthands
 
