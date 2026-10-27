@@ -14,6 +14,20 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-27 · `pods ask` and `?`: pick each AI's model and effort, shorter answers
+- The dashboard's `?` names the AI with its model and effort, in a shorter box; **Tab** switches
+  between claude and codex, and the next `?` opens with the one you last picked.
+- Answers are brief (about 12 lines), so they come back sooner. In the dashboard they're
+  rendered: bold, `arena` commands in cyan, a bullet's wrapped lines under its text, no raw `**`.
+- `pods ask --effort low|medium|high|xhigh|max`, next to `--model`.
+- A small model at low effort answers in seconds: on one pod, codex `gpt-6-luna` at `low` took
+  about 5 s, claude's default 12–19 s.
+
+### Config
+- New, all optional (unset: the CLI's own): `ASK_CLAUDE_MODEL`, `ASK_CLAUDE_EFFORT`,
+  `ASK_CODEX_MODEL`, `ASK_CODEX_EFFORT`. For quick answers from codex:
+  `arena config set ASK_CODEX_MODEL gpt-6-luna` and `arena config set ASK_CODEX_EFFORT low`.
+
 ## 2026-10-27 · `arena update` installs the newest release and says what changed
 - `arena update` reads the latest GitHub release, shows the entries of this file your build
   lacks, downloads `arena` and `arena-tui` for your platform, checks them against the release's

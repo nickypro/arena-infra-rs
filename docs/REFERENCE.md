@@ -227,7 +227,7 @@ Notes / sharp edges to know:
 
 Any key in `config.env` can be overridden by an **environment variable of the same
 name** (env wins; it can't introduce brand-new keys — except a short allowlist such as
-`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API` and `DISCARD_MAX_GB`, e.g. `RUNPOD_API=v1 arena pods
+`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `DISCARD_MAX_GB` and the `ASK_<AI>_MODEL`/`_EFFORT` keys, e.g. `RUNPOD_API=v1 arena pods
 list` to use the retiring RunPod v1 backend for one command, until 2026-11-15; v2 is the default). This is how you point at an SSH
 key the current user can actually read, without editing the shared, read-only prod
 config — e.g. when the dashboard's metrics show `ssh connect failed … key unreadable`
@@ -1275,14 +1275,14 @@ but its passes clear them.
 
 ### `pods ask`
 
-`pods ask [targets] [--all] [--ai claude|codex] [--model M] [--timeout S] [--dry-run] ["question"]`
+`pods ask [targets] [--all] [--ai claude|codex] [--model M] [--effort E] [--timeout S] [--dry-run] ["question"]`
 — ask claude (Claude Code) or codex what state a pod is in, or several pods compared, and whether
 anything is wrong or needs attention: **read-only** on the pods (one SSH call each), every pod in
 one prompt, masked, the AI with no tools; the answer printed and saved with the prompt in the state
-dir. The answer is per pod one line of state, then the problems, each with the `arena` command that
-fixes or investigates it; `unknown` where the data doesn't say. The dashboard's `?` asks the same
-([Asking an AI about pods](#asking-an-ai-about-pods)); [`ASK_AI`](#ask_ai) picks the AI or turns it
-off.
+dir. The answer is brief (at most about 12 lines): per pod one line of state, then a bullet per
+problem, each with the `arena` command that fixes or investigates it; `unknown` where the data
+doesn't say. The dashboard's `?` asks the same ([Asking an AI about pods](#asking-an-ai-about-pods));
+[`ASK_AI`](#ask_ai) picks the AI or turns it off, and sets each one's model and effort.
 
 ```bash
 arena pods ask apple                            # the default question about one pod
@@ -1291,6 +1291,7 @@ arena pods ask apple..delta -q "who is behind on backups?"
 arena pods ask --all                            # a fleet overview: this cohort's pods, one prompt
 arena pods ask --all --include-non-cohort --ai codex   # every pod, asked of codex (default: ASK_AI)
 arena pods ask apple --model opus --timeout 600
+arena pods ask apple --ai codex --model gpt-6-luna --effort low   # a quick answer: ~5 s for the AI
 arena pods ask apple --dry-run                  # print the exact prompt and the AI's command line; send nothing
 ```
 
@@ -1609,6 +1610,16 @@ Which AI [`pods ask`](#pods-ask) and the dashboard's `?` ask: `claude` (the defa
 codex only). `config check` shows it in its "Asking an AI (`pods ask`, the dashboard's `?`)" section
 (and where the binary is, or a ⚠); any other value fails the check and refuses to run.
 
+Each AI's model and effort: `ASK_CLAUDE_MODEL`, `ASK_CLAUDE_EFFORT`, `ASK_CODEX_MODEL`,
+`ASK_CODEX_EFFORT` — unset, its CLI's own. The model is passed as claude's `--model` / codex's `-m`
+(`sonnet`, `gpt-6-luna`: letters, digits and `. _ - : / @ [ ]`); the effort is `low`, `medium`,
+`high`, `xhigh` or `max` (claude's `--effort`, codex's `model_reasoning_effort`). `--model` and
+`--effort` go over them for one run (so does the environment: `ASK_CODEX_MODEL=gpt-6-luna arena tui`);
+the dashboard's Tab switches AI with each one's own. A small
+model at `low` is the quick choice: on one pod's prompt (2026-10-27) codex `gpt-6-luna` at `low` took
+about 5 s, `gpt-6.1-sol` at `low` 7–9 s, claude's default 12–19 s. `config check` shows the ones set;
+a malformed one fails it, and `pods ask`/`?` refuse to use it.
+
 ### `plan check | show`
 
 `plan check | show` — a scheduled provisioning plan (`arena-plan.json`, see
@@ -1732,9 +1743,12 @@ marks (it never quits).
 
 **`?`** asks claude or codex (`ASK_AI`) about the cursor pod — or the marked set, compared in one
 prompt — exactly what [`arena pods ask`](#pods-ask) does: a one-line question, prefilled with the
-default and saying where the data goes (`ctrl-u` clears it); Enter asks **in the background** like
-`d` (the footer says `asking claude about devtest-alpha…`), and the answer opens in its own
-scrollable popup when it lands (Esc closes it; a modal open meanwhile keeps it waiting). Saved like
+default, naming the AI with its model and effort and where the data goes (`ctrl-u` clears it; **Tab**
+switches to the other AI, as [`ASK_<AI>_MODEL`/`_EFFORT`](#ask_ai) set it up, and the next `?` opens
+with the one last picked); Enter asks **in the background** like `d` (the footer says `asking claude
+about devtest-alpha…`), and the answer opens in its own scrollable popup when it lands (Esc closes
+it; a modal open meanwhile keeps it waiting), its Markdown rendered: bold, commands in cyan, a
+bullet's wrapped lines under its text. Saved like
 `pods ask`'s. With `ASK_AI=off` it opens nothing and the footer says how to turn it on. A marked set
 keeps to this cohort's pods, as `pods ask --all` does: a staff box or another cohort's pod marked
 along is left out (the input names it, the footer says how many); to ask about one, put the cursor
