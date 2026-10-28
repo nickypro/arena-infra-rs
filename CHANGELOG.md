@@ -28,6 +28,20 @@ earlier).
   reaches every workspace in an organization; with this set, `arena keys`, `terminate
   --revoke-key`, `pods rename` and the dashboard only see and change keys in that workspace, and new
   keys go there. Unset: the Default workspace, as before.
+## 2026-10-28 · A daily health check on cron; `pods test` checks this cohort's pods
+- `arena cron install --health 07:20` adds a daily `pods test --deep` at that time, in this
+  box's time zone. Its verdicts show in the dashboard's HEALTH column, and its table in
+  `~/.local/state/arena-cron/health.log`. Your other cron lines stay as they are.
+- `cron show` says when it runs (`↳ daily at 07:20, this box's time zone (UTC +0000)`);
+  `cron remove --health` takes it out. A time on the reaper's minutes (:11, :27, :41, :57) gets a
+  warning: a check then looks like use to the reaper.
+- `pods test` and `pods test --deep` with no pod names (or `--all`) now check only this cohort's
+  pods (`<prefix>-…`), not staff boxes or another prefix's pods. One `⊘ skipped N non-cohort pods`
+  line counts the rest; `--include-non-cohort` checks every pod, as before.
+
+### Action needed
+- A script that runs `pods test` to check every pod on the account needs `--include-non-cohort`
+  now.
 ## 2026-10-28 · `ssh <pod>` keeps working: arena can keep your own SSH config current
 - `arena ssh-config --install` writes `~/.ssh/arena.conf` (a `Host` per pod) and makes
   `Include ~/.ssh/arena.conf` the first line of `~/.ssh/config`. It shows the change and asks
@@ -41,7 +55,8 @@ earlier).
 
 ### Config
 - New, optional: `SSH_CONFIG_FILE` (e.g. `~/.ssh/arena.conf`). Unset: nothing is written. Leave
-  it unset on a box that runs arena's cron lines: each tick would rewrite that user's file.
+  it unset on a box that runs arena's cron lines: their syncs would update that user's file
+  whenever a pod changes.
 
 ## 2026-10-27 · `pods ask` and `?`: pick each AI's model and effort, shorter answers
 - The dashboard's `?` names the AI with its model and effort, in a shorter box; **Tab** switches
