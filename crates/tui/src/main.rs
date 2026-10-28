@@ -224,6 +224,8 @@ struct Shared {
     resets: HashMap<String, ContainerReset>,
     /// A `?` question out (`asking claude about …`, for the footer); `None` when none is.
     ask_running: Option<String>,
+    /// When it was asked: the footer's spinner and seconds while it's out.
+    ask_since: Option<Instant>,
     /// Its answer, set by the background task; the loop opens it ([`ask::land`]).
     ask_answer: Option<ask::Answer>,
 }
@@ -289,6 +291,8 @@ struct Ui {
     /// The AI last picked in `?` (Tab, or a question asked): the next `?` opens with it.
     /// `None`: `ASK_AI`'s.
     ask_ai: Option<arena_core::ask::Ai>,
+    /// When `D` was pressed: a second `D` within [`DEEP_ALL_CONFIRM`] starts the deep checks.
+    deep_all_armed: Option<Instant>,
 }
 
 impl Ui {
@@ -396,6 +400,7 @@ async fn main() -> Result<()> {
         result_max: std::cell::Cell::new(0),
         last_table: std::cell::Cell::new((Rect::default(), 0)),
         ask_ai: None,
+        deep_all_armed: None,
     };
 
     dashboard(&shared, &provider, &interval, &nudge, &details_wanted, ui).await
@@ -637,6 +642,12 @@ async fn refresh(
     }
     let partial: Vec<String> = listing.errors().iter().map(|(p, _)| p.to_string()).collect();
     let mut pods = listing.pods();
+    // The first refresh shows the rows as soon as they're listed: the probes, the details
+    // query and the balance/OpenRouter reads below can take their full budgets (seconds,
+    // up to ENRICH_TIMEOUT), and until now the screen said `loading…` for all of it.
+    if shared.lock().unwrap().last_refresh.is_none() {
+        publish_listing(cfg, shared, &pods, &partial, now);
+    }
     let ai_due = details.ai.as_ref().is_some_and(|a| details_due(a.last.map(|t| t.elapsed()), forced));
     let ai_reading = details
         .ai
@@ -691,14 +702,14 @@ async fn refresh(
 
     for pod in &display {
         let m = metrics.get(&pod.name);
-        let mem_pct = m.and_then(|m| m.mem_summary()).map(|(u, t)| {
-            if t > 0 { (u as u64 * 100 / t as u64) as u32 } else { 0 }
-        });
-        s.history.entry(pod.name.clone()).or_default().push(
-            m.and_then(|m| m.mean_util()),
-            m.and_then(|m| m.max_temp()),
-            mem_pct,
-        );
+        let pct = |(u, t): (u32, u32)| if t > 0 { (u as u64 * 100 / t as u64) as u32 } else { 0 };
+        // A CPU-only box's graphs are its CPU and RAM (there's no GPU to draw).
+        let (util, mem_pct) = if cpu_box(m) {
+            (m.and_then(|m| m.cpu_pct), m.and_then(|m| m.host_mem_summary()).map(pct))
+        } else {
+            (m.and_then(|m| m.mean_util()), m.and_then(|m| m.mem_summary()).map(pct))
+        };
+        s.history.entry(pod.name.clone()).or_default().push(util, m.and_then(|m| m.max_temp()), mem_pct);
     }
     s.summary = summarize(&display, &metrics);
     if let Some(a) = &details.ai {
@@ -718,6 +729,30 @@ async fn refresh(
     s.publish(snap);
     s.last_refresh = Some(Instant::now());
     s.refreshing = false;
+}
+
+/// A box with no GPU that reports its CPU (a Hetzner CPU VM): its graphs draw CPU% and RAM%,
+/// in their own colours.
+fn cpu_box(m: Option<&PodMetrics>) -> bool {
+    m.is_some_and(|m| m.gpus.is_empty() && m.cpu_pct.is_some())
+}
+
+/// Show `pods` as listed, before anything about them is read: the rows, their proxy and last
+/// deep check (local files) and the counts — no metrics yet. The first refresh's early paint.
+fn publish_listing(cfg: &Config, shared: &Mutex<Shared>, pods: &[Pod], partial: &[String], now: u64) {
+    let (proxy, _) = snapshot::local_proxy_text(cfg);
+    let (file_health, _) = load_health(cfg);
+    let mut s = shared.lock().unwrap();
+    let health = s.deep.layer(file_health);
+    let snap = dashboard_snapshot(pods, partial, proxy.as_deref(), &health, &Naming::from_config(cfg), now);
+    s.summary = summarize(pods, &HashMap::new());
+    s.status = format!("listed {} — reading them…", count_label(pods.len()));
+    s.publish(snap);
+}
+
+/// `1 pod`, `3 pods`.
+fn count_label(n: usize) -> String {
+    format!("{n} pod{}", if n == 1 { "" } else { "s" })
 }
 
 /// What a restart does to each of `pods`' container disks, by [`mark_key`]: each one's backend's
@@ -1292,6 +1327,31 @@ async fn run(
                         };
                         if !pods.is_empty() {
                             start_deep_check(shared, &ui, pods);
+                        }
+                    }
+                    KeyCode::Char('D') => {
+                        // Every running pod no one is using, after a second `D`: the first
+                        // says how many, and which busy ones it leaves out.
+                        let (pods, busy) = {
+                            let s = shared.lock().unwrap();
+                            deep_all_plan(&s.pods, &s.metrics)
+                        };
+                        let armed = ui.deep_all_armed.take().is_some_and(|t| t.elapsed() < DEEP_ALL_CONFIRM);
+                        let skipped = skipped_words(&busy);
+                        if pods.is_empty() {
+                            shared.lock().unwrap().notify(format!("nothing to deep-check{skipped}"), false);
+                        } else if armed {
+                            start_deep_check(shared, &ui, pods);
+                        } else {
+                            ui.deep_all_armed = Some(Instant::now());
+                            let n = pods.len();
+                            shared.lock().unwrap().notify(
+                                format!(
+                                    "D again to deep-check {n} running pod{} (about a minute of GPU load each){skipped}",
+                                    if n == 1 { "" } else { "s" }
+                                ),
+                                false,
+                            );
                         }
                     }
                     KeyCode::Char('s') => {
@@ -1937,6 +1997,41 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Pro
 /// the dashboard stays live, the rows say `checking`, and the footer says when it's done.
 /// Pods already being checked are skipped. The verdicts are written to the health cache
 /// (where `arena snapshot` and the next refresh read them) and shown at once.
+/// How long `D`'s first press waits for the second.
+const DEEP_ALL_CONFIRM: Duration = Duration::from_secs(5);
+
+/// What `D` deep-checks: every running pod, but not one a participant is using — a GPU with
+/// a compute process on it, or at 10% utilization or more. A deep check loads the GPU for
+/// about a minute, and on a busy one it reads as a failure. The busy ones' names come back
+/// to be said. Pure.
+fn deep_all_plan(pods: &[Pod], metrics: &HashMap<String, PodMetrics>) -> (Vec<Pod>, Vec<String>) {
+    let mut check = Vec::new();
+    let mut busy = Vec::new();
+    for p in pods.iter().filter(|p| p.status.eq_ignore_ascii_case("RUNNING")) {
+        let m = metrics.get(&p.name);
+        if m.is_some_and(|m| !m.gpu_procs.is_empty() || m.mean_util().is_some_and(|u| u >= 10)) {
+            busy.push(p.name.clone());
+        } else {
+            check.push(p.clone());
+        }
+    }
+    (check, busy)
+}
+
+/// ` — skipping 2 busy: apple, bloom` (at most five named), or nothing.
+fn skipped_words(busy: &[String]) -> String {
+    match busy.len() {
+        0 => String::new(),
+        n => {
+            let mut names = busy.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+            if n > 5 {
+                names.push_str(", …");
+            }
+            format!(" — skipping {n} busy: {names}")
+        }
+    }
+}
+
 fn start_deep_check(shared: &Arc<Mutex<Shared>>, ui: &Ui, pods: Vec<Pod>) {
     // Config first: a malformed MIN_DRIVER_VERSION is said before any pod is touched.
     let policy = match HealthPolicy::from_config(&ui.cfg) {
@@ -2685,8 +2780,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     // while they fit (`MID_W`, all of them from 105 columns), so a narrow terminal or the
     // detail view's 55% split drops TEMP, MEM, BRANCH, DISK in turn instead of having
     // ratatui shrink every column (NAME, the one that says which pod a row is, worst of
-    // all). Above that the nice-to-haves (SAVED, PROGRESS, host CPU/RAM, then the GPU%/MEM%
-    // graphs) come in as there's room. Below 73 columns the table is crushed as before.
+    // all). Above that the nice-to-haves (SAVED, AI$, host CPU/RAM, then the UTIL%/MEM%
+    // graphs, then PROGRESS when PROGRESS_CMD is set) come in as there's room. Below 73
+    // columns the table is crushed as before.
     let w = area.width as usize;
     // The fleet columns from the core snapshot — M (maintenance badge), HEALTH (last deep
     // check) and PROXY — are essential and always shown, so every threshold below sits
@@ -2701,7 +2797,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     const AI_W: usize = 9; // "1.23/5", "12.3/50", "0.02/0.02"
     let show_ai = shared.ai.is_some() && w >= 104 + FLEET_W;
     let show_host = w >= 134 + FLEET_W; // host CPU% + RAM (extra, only when there's room)
-    let show_progress = w >= 110 + FLEET_W;
+    // PROGRESS is what PROGRESS_CMD reports, so only with one set — and it comes after the
+    // graphs, which say more at a glance (an SSH error is in STATUS and the detail pane).
+    let want_progress = ui.cfg.get("PROGRESS_CMD").is_some_and(|c| !c.trim().is_empty());
     // When cramped, names compress (arena8-apple→apple) and the GPU drops the "RTX "
     // noise. Names compact a bit earlier (so you see "jack", not a truncated
     // "arena8-ja"); GPU always carries count + VRAM ("2×A4000 16G"), truncated if tight.
@@ -2736,12 +2834,12 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     if show_host {
         fixed.extend([4, 4]);
     }
-    if show_progress {
-        fixed.push(PROGRESS_W);
-    }
     let leftover = w.saturating_sub(table_width(&fixed));
     let show_spark = with_spark && leftover >= 20; // ~2×9 + spacing
-    let spark_w = if show_spark { (leftover.saturating_sub(3) / 2).clamp(9, 30) } else { 0 };
+    // PROGRESS takes its fixed budget only from what the graphs leave at their narrowest.
+    let show_progress = want_progress && leftover >= PROGRESS_W + 1 + if show_spark { 20 } else { 0 };
+    let spark_room = if show_progress { leftover - PROGRESS_W - 1 } else { leftover };
+    let spark_w = if show_spark { (spark_room.saturating_sub(3) / 2).clamp(9, 30) } else { 0 };
 
     let mut header_cells = vec!["", "P", "NAME", "STATUS", "M", "SET", "GPU", "GPU%"];
     for (show, title) in [(show_mem, "MEM"), (show_temp, "TEMP"), (show_disk, "DISK")] {
@@ -2764,10 +2862,11 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         header_cells.push("RAM%");
     }
     if show_progress {
-        header_cells.push("PROGRESS / ERROR");
+        header_cells.push("PROGRESS");
     }
     if show_spark {
-        header_cells.push("GPU%~");
+        // GPU and its memory (green, cyan); a CPU box's CPU and RAM (magenta, blue).
+        header_cells.push("UTIL%~");
         header_cells.push("MEM%~");
     }
     let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
@@ -2924,11 +3023,12 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 let mem_hist = h.map(|h| h.mem_data()).unwrap_or_default();
                 // Grey the sparklines out when the pod isn't reachable — the history is
                 // just zeros then, so colour would imply live data that isn't there.
-                let connected = m.map(|m| m.error.is_none() && !m.gpus.is_empty()).unwrap_or(false);
-                let (gpu_c, mem_c) = if connected {
-                    (Color::Green, Color::Cyan)
-                } else {
-                    (Color::DarkGray, Color::DarkGray)
+                let cpu = cpu_box(m);
+                let connected = m.is_some_and(|m| m.error.is_none() && (!m.gpus.is_empty() || cpu));
+                let (gpu_c, mem_c) = match (connected, cpu) {
+                    (false, _) => (Color::DarkGray, Color::DarkGray),
+                    (true, false) => (Color::Green, Color::Cyan),
+                    (true, true) => (Color::Magenta, Color::Blue),
                 };
                 cells.push(Cell::from(spark(&gpu_hist, spark_w)).style(Style::default().fg(gpu_c)));
                 cells.push(Cell::from(spark(&mem_hist, spark_w)).style(Style::default().fg(mem_c)));
@@ -3296,12 +3396,13 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         let hist = shared.history.get(&pod.name);
         let util_data = hist.map(|h| h.util_data()).unwrap_or_default();
         let temp_data = hist.map(|h| h.temp_data()).unwrap_or_default();
+        let (util_title, util_colour) = if cpu_box(m) { ("CPU % (history)", Color::Magenta) } else { ("util % (history)", Color::Green) };
         f.render_widget(
             Sparkline::default()
-                .block(Block::default().borders(Borders::TOP).title("util % (history)"))
+                .block(Block::default().borders(Borders::TOP).title(util_title))
                 .data(&util_data)
                 .max(100)
-                .style(Style::default().fg(Color::Green)),
+                .style(Style::default().fg(util_colour)),
             rows[idx],
         );
         f.render_widget(
@@ -3328,13 +3429,15 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         0 => String::new(),
         n => format!(" · deep-checking {n}"),
     };
-    let checking = match &shared.ask_running {
-        Some(asking) => format!("{checking} · {asking}"),
-        None => checking,
-    };
+    // A question out leads the footer, moving and counting, so it reads as alive: an answer
+    // can take a minute, and a line that never changed looked like a hang.
+    let asking = shared.ask_running.as_ref().map(|asking| {
+        let secs = shared.ask_since.map(|t| t.elapsed()).unwrap_or_default();
+        Span::styled(format!("{} {asking} {}s · ", spinner(secs), secs.as_secs()), tone_style(Tone::Busy))
+    });
     let keys = match &ui.mode {
-        Mode::List => "[q] quit  [enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [?] ask AI  [n] new  [r] refresh",
-        Mode::Detail => "[esc] back  [q] quit  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [?] ask AI  [n] new  [r] refresh",
+        Mode::List => "[q] quit  [enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d/D] deep check this/all  [?] ask AI  [n] new  [r] refresh",
+        Mode::Detail => "[esc] back  [q] quit  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d/D] deep check this/all  [?] ask AI  [n] new  [r] refresh",
         Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::Confirm(c) if c.action.requires_typed_name() => "type the pod's name  [enter] apply  [esc] cancel",
         Mode::Confirm(c) if c.preview.is_some() => "[y] apply  [v] full command  [n/esc] cancel",
@@ -3349,13 +3452,21 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         Mode::Ask { .. } => "type the question  [enter] ask  [tab] the other AI  [ctrl-u] clear  [esc] cancel",
         Mode::Answer(_) => "[↑↓ PgUp PgDn] scroll  [esc] close",
     };
+    let mut spans: Vec<Span<'static>> = asking.into_iter().collect();
     match shared.notice.as_ref().filter(|n| n.at.elapsed() < NOTICE_FOR) {
         Some(n) => {
             let style = if n.error { tone_style(Tone::Bad) } else { tone_style(Tone::Busy) };
-            Line::from(vec![Span::styled(n.text.clone(), style), Span::raw(format!("{checking} · {keys}"))])
+            spans.extend([Span::styled(n.text.clone(), style), Span::raw(format!("{checking} · {keys}"))]);
         }
-        None => Line::from(format!("{}{}{checking} · {} · every {}s · {}", shared.status, spin, age, secs, keys)),
+        None => spans.push(Span::raw(format!("{}{}{checking} · {} · every {}s · {}", shared.status, spin, age, secs, keys))),
     }
+    Line::from(spans)
+}
+
+/// A braille spinner frame for `elapsed` (a new one every 150 ms, the UI's redraw tick).
+fn spinner(elapsed: Duration) -> char {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    FRAMES[(elapsed.as_millis() / 150) as usize % FRAMES.len()]
 }
 
 /// A centered popup rect `pct_x` × `pct_y` percent of the screen.
@@ -3871,6 +3982,69 @@ deep_check_end=1
         }
     }
 
+    /// `D` checks every running pod but the busy ones (a compute process, or ≥ 10% util),
+    /// naming those; a stopped pod isn't checked or named.
+    #[test]
+    fn deep_all_checks_running_pods_no_one_is_using() {
+        use arena_core::metrics::{GpuProc, GpuStat};
+        let gpu = |util| GpuStat { util_pct: Some(util), ..Default::default() };
+        let m = |gpus: Vec<GpuStat>, procs: usize| PodMetrics {
+            gpus,
+            gpu_procs: (0..procs).map(|i| GpuProc { pid: i as u32, ..Default::default() }).collect(),
+            ..Default::default()
+        };
+        let mut stopped = pod("delta", "runpod", "d", 4, Some(22));
+        stopped.status = "EXITED".into();
+        let pods = [
+            pod("alpha", "runpod", "a", 1, Some(22)),
+            pod("bravo", "runpod", "b", 2, Some(22)),
+            pod("charlie", "runpod", "c", 3, Some(22)),
+            stopped,
+            pod("echo", "hetzner", "e", 5, Some(22)),
+        ];
+        let metrics: HashMap<String, PodMetrics> = [
+            ("devtest-alpha", m(vec![gpu(3)], 0)),
+            ("devtest-bravo", m(vec![gpu(0)], 1)),
+            ("devtest-charlie", m(vec![gpu(40), gpu(0)], 0)),
+        ]
+        .into_iter()
+        .map(|(n, m)| (n.to_string(), m))
+        .collect();
+        let (check, busy) = deep_all_plan(&pods, &metrics);
+        assert_eq!(check.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["devtest-alpha", "devtest-echo"]);
+        assert_eq!(busy, ["devtest-bravo", "devtest-charlie"]);
+        assert_eq!(skipped_words(&busy), " — skipping 2 busy: devtest-bravo, devtest-charlie");
+        assert_eq!(skipped_words(&[]), "");
+        let many: Vec<String> = (0..7).map(|i| format!("p{i}")).collect();
+        assert_eq!(skipped_words(&many), " — skipping 7 busy: p0, p1, p2, p3, p4, …");
+    }
+
+    /// The first refresh's early paint: the listed rows, no metrics yet, and a status that
+    /// says the rest is being read — never "loading…" while the probes run.
+    #[test]
+    fn the_listing_is_shown_before_the_pods_are_read() {
+        let shared = Mutex::new(Shared { status: "loading…".into(), ..Default::default() });
+        let pods = [pod("alpha", "runpod", "a", 1, Some(22)), pod("bravo", "hetzner", "b", 2, None)];
+        publish_listing(&cfg(""), &shared, &pods, &[], 1_000);
+        let s = shared.lock().unwrap();
+        assert_eq!(s.pods.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["devtest-alpha", "devtest-bravo"]);
+        assert_eq!((s.snap.pods.len(), s.summary.pods, s.metrics.len()), (2, 2, 0));
+        assert_eq!(s.status, "listed 2 pods — reading them…");
+        assert!(s.last_refresh.is_none(), "still the first refresh: its full publish comes next");
+    }
+
+    #[test]
+    fn spinner_moves_every_150ms_and_cpu_boxes_are_gpu_less_with_a_cpu_reading() {
+        assert_eq!(spinner(Duration::from_millis(0)), '⠋');
+        assert_eq!(spinner(Duration::from_millis(149)), '⠋');
+        assert_eq!(spinner(Duration::from_millis(150)), '⠙');
+        assert_eq!(spinner(Duration::from_millis(1500)), '⠋', "wraps after ten frames");
+        let cpu = PodMetrics { cpu_pct: Some(12), ..Default::default() };
+        assert!(cpu_box(Some(&cpu)));
+        let gpu = PodMetrics { cpu_pct: Some(12), gpus: vec![Default::default()], ..Default::default() };
+        assert!(!cpu_box(Some(&gpu)) && !cpu_box(Some(&PodMetrics::default())) && !cpu_box(None));
+    }
+
     fn verdict(p: &Pod, status: Status, check: Option<(&str, &str)>) -> PodHealth {
         PodHealth {
             id: p.id.clone(),
@@ -3899,6 +4073,7 @@ deep_check_end=1
             last_table: std::cell::Cell::new((Rect::default(), 0)),
             asker: fake_asker(Arc::default()),
             ask_ai: None,
+        deep_all_armed: None,
         }
     }
 

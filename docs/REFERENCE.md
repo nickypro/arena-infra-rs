@@ -1749,7 +1749,11 @@ last good answer, with a footer warning.
 
 **`d`** deep-checks the cursor pod (or the marked set) **in the background** — no modal; the row
 says `checking`, the footer reports the tally when done, and the verdicts go to the same health
-cache `arena snapshot` reads. **`/`** marks pods with the CLI's selector syntax (`alpha..delta`,
+cache `arena snapshot` reads. **`D`** deep-checks every running pod no one is using: the first
+press says how many and names the busy ones it leaves out (a GPU with a compute process, or at
+10% or more — a deep check loads the GPU for about a minute and on a busy one reads as a
+failure); a second `D` within 5 s starts them. In HEALTH, a pass older than a day is grey: it says
+little about today (the daily `cron install --health` keeps it fresh). **`/`** marks pods with the CLI's selector syntax (`alpha..delta`,
 ids, `-x`/`!name`, `--on`, `--gpus`); a typo marks nothing and leaves the marks as they were, saying
 why in the footer; a valid one replaces the marks. Marks are per `provider:id` (a Vast and a Hetzner
 id can collide). `all` is refused, and since `/first..last` marks a cohort in one line,

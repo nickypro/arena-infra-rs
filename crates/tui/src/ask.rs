@@ -156,7 +156,9 @@ struct Running(Arc<Mutex<Shared>>);
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).ask_running = None;
+        let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        s.ask_running = None;
+        s.ask_since = None;
     }
 }
 
@@ -164,7 +166,11 @@ impl Drop for Running {
 /// marked pods were left out, `left`) until the answer lands in [`Shared::ask_answer`].
 fn start(shared: &Arc<Mutex<Shared>>, ui: &Ui, pods: Vec<Pod>, left: usize, question: String, pick: Pick) {
     let out = if left > 0 { format!(" ({})", left_out(left)) } else { String::new() };
-    shared.lock().unwrap().ask_running = Some(format!("asking {} about {}{out}…", pick.label(), about(&pods)));
+    {
+        let mut s = shared.lock().unwrap();
+        s.ask_running = Some(format!("asking {} about {}{out}…", pick.label(), about(&pods)));
+        s.ask_since = Some(std::time::Instant::now());
+    }
     let (shared, asker) = (shared.clone(), ui.asker.clone());
     tokio::spawn(async move {
         let running = Running(shared.clone());
