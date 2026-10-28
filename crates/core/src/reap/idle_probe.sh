@@ -31,6 +31,7 @@ command -v timeout >/dev/null 2>&1 || exit 3
 command -v cksum >/dev/null 2>&1 || exit 3
 WIN=${ARENA_PROBE_TEST_WINDOW:-10}
 GPU_T=${ARENA_PROBE_TEST_GPU_TIMEOUT:-8}
+GPU_GAP=${ARENA_PROBE_TEST_GPU_GAP:-1}
 OUT=
 o() {
     OUT="${OUT}ARENA_PROBE $1=$2
@@ -105,7 +106,7 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 $lines
 EOF_GPU
         [ "$rc" = 0 ] || break
-        [ "$k" = 5 ] || sleep 1
+        [ "$k" = 5 ] || sleep "$GPU_GAP"
         k=$((k + 1))
     done
     out=$(timeout "$GPU_T" nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)

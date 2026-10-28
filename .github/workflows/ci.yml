@@ -1,5 +1,6 @@
-# CI: the same gate every change passes locally before a push — release build + the full test
-# suite with zero warnings, and clippy with zero warnings. Hermetic: no provider keys, no
+# CI: the same gate every change passes locally before a push — the full test suite in release
+# mode with zero warnings (it builds the release binaries too, for the tests that run them), and
+# clippy with zero warnings, on the tests and on the code as shipped. Hermetic: no provider keys, no
 # network calls (the live smoke test is `#[ignore]` and also guarded by ARENA_LIVE_SMOKE), so
 # it's safe on a public repo and on PRs.
 name: CI
@@ -46,8 +47,6 @@ jobs:
           git config --global user.email "ci@example.invalid"
           git config --global init.defaultBranch main
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Build
-        run: cargo build --release --locked
       - name: Test
         run: cargo test --release --locked
 
@@ -64,3 +63,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+      # The tests turn on core's `test-util` (its test doubles) through the CLI's and the
+      # dashboard's dev-dependencies, so neither the test build nor the run above compiles the
+      # code as shipped: this does, as `cargo build --release` would (a test double used by
+      # shipped code fails here, as does code only the doubles use).
+      - name: Clippy, as shipped
+        run: cargo clippy --locked -- -D warnings

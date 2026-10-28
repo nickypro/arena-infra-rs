@@ -50,6 +50,7 @@ pub mod status;
 pub mod table;
 pub mod teardown;
 pub mod tty;
+pub mod update;
 pub mod volume;
 pub mod vscode;
 

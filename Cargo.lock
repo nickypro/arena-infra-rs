@@ -83,6 +83,7 @@ dependencies = [
  "async-trait",
  "libc",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "thiserror",

@@ -10,7 +10,17 @@
 //! - **Real lifecycle status** (`PROVISIONING`/`STARTING`/`RUNNING`/`EXITED`/`ERROR`/
 //!   `TERMINATED`) instead of v1's `desiredStatus`, plus `gpu`, `cost` and `cloud` on every
 //!   pod — so GPU type and cloud tier are now recoverable for `replace` (v1's were not).
-//! - **SSH comes from `ssh.direct` only.** `ssh.proxy` (RunPod's SSH gateway) carries an
+//! - **SSH comes from `ssh.direct`, or the TCP 22 runtime mapping.** The list API can
+//!   omit both (live since 2026-10-26: `ssh.direct` and `runtime` null on every pod), so
+//!   RUNNING pods without endpoints are filled from the detail API (8 at a time, 5 seconds
+//!   per request) — and the endpoint is remembered while the pod keeps the same `startedAt`
+//!   ([`fill_endpoints`]): a dashboard re-listing every 5 s would otherwise send one detail
+//!   GET per running pod per refresh, past RunPod's 180/min. An endpoint looked up soon after a
+//!   start is checked again until it settles (a restart's detail still showed the old port for
+//!   ~30 s), and this provider's own stop/start/restart forget it. A failed lookup leaves only that
+//!   pod without an endpoint (its `status_detail` says why): the proxy keeps a listed pod's
+//!   forward, and a backup counts a pod without SSH as failed work while the rest still run.
+//!   `ssh.proxy` (RunPod's SSH gateway) carries an
 //!   interactive shell only — no scp/rsync/port-forwarding, which setup/backup/pull and the
 //!   nginx stream proxy all need — so it is never reported as the pod's endpoint.
 //! - **No public-IP request.** v1's create takes `supportPublicIp: true`; v2's
@@ -101,11 +111,33 @@ pub struct RunpodV2Provider {
     /// and kept for the process — a batch create of a whole cohort costs one extra
     /// request, not one per pod.
     account_keys: Mutex<Option<Vec<String>>>,
+    /// Endpoints from pod details, for the listing to reuse ([`fill_endpoints`]).
+    endpoints: Mutex<EndpointMemo>,
 }
 
 impl RunpodV2Provider {
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self { api_key: api_key.into(), client: Client::new(), account_keys: Mutex::new(None) }
+        Self { api_key: api_key.into(), client: Client::new(), account_keys: Mutex::new(None), endpoints: Mutex::new(EndpointMemo::default()) }
+    }
+
+    /// Forget `id`'s remembered endpoint: this provider is about to stop, start, restart,
+    /// reimage or terminate it, and a restart gets a new port.
+    fn forget_endpoint(&self, id: &str) {
+        self.endpoints.lock().unwrap_or_else(std::sync::PoisonError::into_inner).by_id.remove(id);
+    }
+
+    /// The listing from `page` (one list page per cursor) and `detail` (one pod's detail), with
+    /// this provider's remembered endpoints ([`fill_endpoints`]): [`Provider::list_pods`] passes
+    /// the real requests, tests fakes.
+    async fn list_via<P, PF, D, DF>(&self, page: P, detail: D) -> Result<Vec<Pod>>
+    where
+        P: FnMut(Option<String>) -> PF,
+        PF: Future<Output = Result<Value>>,
+        D: Fn(String) -> DF,
+        DF: Future<Output = Result<Value>> + Send + 'static,
+    {
+        let pods = collect_pages(page, MAX_PAGES).await?;
+        Ok(fill_endpoints(pods, detail, &self.endpoints, crate::status::now_secs()).await)
     }
 
     /// The account's registered SSH keys (cached, see the field). A failed fetch fails the
@@ -399,9 +431,22 @@ fn parse_pod(v: &Value) -> Pod {
         .and_then(Value::as_u64)
         .and_then(|p| u16::try_from(p).ok())
         .filter(|p| *p > 0);
+    let fallback = v.pointer("/runtime/ports").and_then(Value::as_array).and_then(|ports| {
+        ports.iter().find_map(|p| {
+            if p.get("private").and_then(Value::as_u64) != Some(22)
+                || p.get("type").and_then(Value::as_str) != Some("tcp")
+                || p.get("isIpPublic").and_then(Value::as_bool) == Some(false)
+            {
+                return None;
+            }
+            let ip = p.get("ip")?.as_str()?.trim();
+            let port = u16::try_from(p.get("public")?.as_u64()?).ok().filter(|p| *p > 0)?;
+            (!ip.is_empty()).then(|| (Some(ip.to_string()), Some(port)))
+        })
+    });
     let (ssh_ip, ssh_port) = match (host, port) {
         (Some(h), Some(p)) => (Some(h), Some(p)),
-        _ => (None, None),
+        _ => fallback.unwrap_or((None, None)),
     };
     // Up (RUNNING, a live `runtime`) but no direct endpoint: only RunPod's SSH proxy — a
     // host without a public IP (live: 15+ minutes like this; `dataCenterId` null too).
@@ -434,9 +479,162 @@ fn parse_pod(v: &Value) -> Pod {
         delete_protected: None,
         // `createdAt` (`2026-10-08T09:33:33.607Z`).
         created_at: s("createdAt").as_deref().and_then(crate::reap::parse_rfc3339).and_then(|t| u64::try_from(t).ok()),
+        started_at: s("startedAt").as_deref().and_then(crate::reap::parse_rfc3339).and_then(|t| u64::try_from(t).ok())
+            .or_else(|| v.pointer("/runtime/uptime").and_then(Value::as_u64)
+                .and_then(|uptime| crate::status::now_secs().checked_sub(uptime))),
         identity: None,
         status_detail: None,
     }
+}
+
+/// A running pod's direct SSH endpoint from its detail, as [`fill_endpoints`] remembers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Remembered {
+    /// The listing's start time for the pod when it was looked up: a restart changes it
+    /// (and the endpoint with it), so a different one is a new lookup.
+    started_at: u64,
+    ip: String,
+    port: u16,
+    /// When it was looked up (unix seconds).
+    at: u64,
+}
+
+impl Remembered {
+    /// Whether to look it up again at `now`: after [`UNSETTLED_RECHECK_SECS`] when it was looked
+    /// up within [`SETTLE_SECS`] of the start, else after [`ENDPOINT_RECHECK_SECS`].
+    fn due(&self, now: u64) -> bool {
+        let settled = self.at.saturating_sub(self.started_at) >= SETTLE_SECS;
+        now.saturating_sub(self.at) >= if settled { ENDPOINT_RECHECK_SECS } else { UNSETTLED_RECHECK_SECS }
+    }
+}
+
+/// What [`fill_endpoints`] keeps between listings: endpoints by pod id, and when its recent
+/// lookups went out ([`RECHECKS_PER_MINUTE`]).
+#[derive(Debug, Default)]
+struct EndpointMemo {
+    by_id: HashMap<String, Remembered>,
+    lookups: std::collections::VecDeque<u64>,
+}
+
+/// An endpoint looked up within this long of the pod's start may not be its new one yet.
+/// Live 2026-10-27, a restart from another process: the listing had the new `startedAt` at
+/// once, the detail kept the old port (23995) for ~30 s more, then showed 23810 — and a
+/// dashboard that remembered the first answer showed the pod unreachable on the old port.
+const SETTLE_SECS: u64 = 180;
+
+/// How soon an endpoint looked up within [`SETTLE_SECS`] of the start is looked up again.
+const UNSETTLED_RECHECK_SECS: u64 = 30;
+
+/// How long a settled endpoint is used before it's looked up again even without a restart —
+/// in case one ever moves under the same `startedAt`. 30 running pods cost 3 detail GETs a
+/// minute per dashboard at this rate, not 360.
+const ENDPOINT_RECHECK_SECS: u64 = 600;
+
+/// Rechecks (pods that have a remembered endpoint) one process sends a minute at most,
+/// counting every lookup: RunPod allows 180 REST requests a minute account-wide, creates
+/// included, and a cohort of new pods all rechecking every 30 s would take most of it. A pod
+/// without any endpoint is always looked up — a backup lists once and needs them all.
+const RECHECKS_PER_MINUTE: usize = 30;
+
+/// Fill the fields the list API omits, before any SSH consumer sees the listing. Keeps order
+/// and every pod. A RUNNING pod without an endpoint takes the one remembered for its id and
+/// start (`memo`); pods with none are looked up, and so are remembered ones that are due
+/// ([`Remembered::due`]) as far as [`RECHECKS_PER_MINUTE`] allows — 8 at a time, 5 s each. A
+/// found endpoint is remembered and a detail without one forgets it. A failed or malformed
+/// lookup leaves that pod as listed — with the endpoint remembered for its start, however old,
+/// if any — and says why in `status_detail`. Pods no longer listed, or not running, are
+/// forgotten. `now`: unix seconds.
+async fn fill_endpoints<F, Fut>(mut pods: Vec<Pod>, fetch: F, memo: &Mutex<EndpointMemo>, now: u64) -> Vec<Pod>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<Value>> + Send + 'static,
+{
+    let lock = || memo.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let running = |p: &Pod| p.status.eq_ignore_ascii_case("RUNNING");
+    // The endpoint remembered for this pod's current start, however old.
+    let remembered = |p: &Pod| lock().by_id.get(&p.id).filter(|r| p.started_at == Some(r.started_at)).cloned();
+    {
+        let up: HashSet<&str> = pods.iter().filter(|p| running(p)).map(|p| p.id.as_str()).collect();
+        let mut m = lock();
+        m.by_id.retain(|id, _| up.contains(id.as_str()));
+        m.lookups.retain(|&t| now.saturating_sub(t) < 60);
+    }
+    let (mut unknown, mut due) = (Vec::new(), Vec::new());
+    for (i, p) in pods.iter_mut().enumerate() {
+        if !running(p) || (p.ssh_ip.is_some() && p.ssh_port.is_some()) {
+            continue;
+        }
+        match remembered(p) {
+            Some(r) => {
+                if r.due(now) {
+                    due.push(i);
+                }
+                (p.ssh_ip, p.ssh_port, p.proxy_only) = (Some(r.ip), Some(r.port), false);
+            }
+            None => unknown.push(i),
+        }
+    }
+    let pending: Vec<usize> = {
+        let mut m = lock();
+        let rechecks = RECHECKS_PER_MINUTE.saturating_sub(m.lookups.len() + unknown.len()).min(due.len());
+        let pending: Vec<usize> = unknown.into_iter().chain(due.into_iter().take(rechecks)).collect();
+        m.lookups.extend(std::iter::repeat_n(now, pending.len()));
+        pending
+    };
+    for batch in pending.chunks(8) {
+        let mut tasks = tokio::task::JoinSet::new();
+        for &i in batch {
+            let id = pods[i].id.clone();
+            let future = fetch(id.clone());
+            tasks.spawn(async move {
+                let looked_up = async {
+                    let body = tokio::time::timeout(std::time::Duration::from_secs(5), future)
+                        .await
+                        .map_err(|_| Error::provider(format!("endpoint lookup for {id} timed out after 5s")))??;
+                    let detail = parse_pod(&body);
+                    if detail.id != id || detail.status == "UNKNOWN" {
+                        return Err(Error::provider(format!("invalid detail for {id}: {}", shape_of(&body))));
+                    }
+                    Ok(detail)
+                };
+                (i, looked_up.await)
+            });
+        }
+        let mut answered = HashSet::new();
+        while let Some(joined) = tasks.join_next().await {
+            let Ok((i, looked_up)) = joined else { continue };
+            answered.insert(i);
+            match looked_up {
+                Ok(detail) => {
+                    let listed_start = pods[i].started_at;
+                    match (listed_start, detail.ssh_ip.clone(), detail.ssh_port) {
+                        (Some(started_at), Some(ip), Some(port)) => {
+                            lock().by_id.insert(pods[i].id.clone(), Remembered { started_at, ip, port, at: now });
+                        }
+                        _ => {
+                            lock().by_id.remove(&pods[i].id);
+                        }
+                    }
+                    pods[i].ssh_ip = detail.ssh_ip;
+                    pods[i].ssh_port = detail.ssh_port;
+                    pods[i].proxy_only = detail.proxy_only;
+                    pods[i].started_at = detail.started_at.or(listed_start);
+                    pods[i].status = detail.status;
+                }
+                Err(e) => lookup_failed(&mut pods[i], &e.to_string()),
+            }
+        }
+        for &i in batch.iter().filter(|i| !answered.contains(i)) {
+            lookup_failed(&mut pods[i], "the lookup task stopped");
+        }
+    }
+    pods
+}
+
+/// A pod whose endpoint lookup failed keeps what it had: a recheck's remembered endpoint (put
+/// in before the lookup went out), else none. `status_detail` says why.
+fn lookup_failed(pod: &mut Pod, why: &str) {
+    pod.status_detail = Some(format!("SSH endpoint lookup failed: {why}"));
 }
 
 /// What a failed v2 [`Provider::enrich`] reports: only the maintenance windows are missing
@@ -892,14 +1090,16 @@ impl Provider for RunpodV2Provider {
     }
 
     async fn list_pods(&self) -> Result<Vec<Pod>> {
-        collect_pages(
-            |cursor| {
-                let rb = list_request(&self.client, &self.api_key, cursor.as_deref());
-                async move { send(rb, "list pods").await }
-            },
-            MAX_PAGES,
-        )
-        .await
+        let page = |cursor: Option<String>| {
+            let rb = list_request(&self.client, &self.api_key, cursor.as_deref());
+            async move { send(rb, "list pods").await }
+        };
+        let detail = |id: String| {
+            let client = self.client.clone();
+            let key = self.api_key.clone();
+            async move { send(api_request(&client, &key, Method::GET, pod_url(&id, None)?), "pod endpoint").await }
+        };
+        self.list_via(page, detail).await
     }
 
     async fn enrich(&self, pods: &mut [Pod]) -> Result<()> {
@@ -939,6 +1139,7 @@ impl Provider for RunpodV2Provider {
     // The mutating calls below don't use their success body, so only the status is
     // judged (`send_ok`): one that worked is never reported as failed over its body.
     async fn stop_pod(&self, id: &str) -> Result<()> {
+        self.forget_endpoint(id);
         send_ok(action_request(&self.client, &self.api_key, id, "stop")?, "stop pod").await
     }
 
@@ -957,17 +1158,20 @@ impl Provider for RunpodV2Provider {
         // unlike stop/start. A pod in any other state answers 409. It resets the container
         // to its image: everything outside a volume is WIPED (live-verified on a sandbox
         // pod — a marker file, ~/.name and setup's git remote were all gone afterwards).
+        self.forget_endpoint(id);
         send_ok(action_request(&self.client, &self.api_key, id, "restart")?, "restart pod").await
     }
 
     async fn start_pod(&self, id: &str) -> Result<()> {
         // The `start` action an EXITED pod lists in its `actions` (restart answers 409 there).
+        self.forget_endpoint(id);
         send_ok(action_request(&self.client, &self.api_key, id, "start")?, "start pod").await
     }
 
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         // `DELETE /v2/pods/{id}` (documented as equivalent to the `terminate` action):
         // 204 with no body; a 200 with a body is fine too.
+        self.forget_endpoint(id);
         let rb = api_request(&self.client, &self.api_key, Method::DELETE, pod_url(id, None)?);
         send_ok(rb, "terminate pod").await
     }
@@ -983,6 +1187,7 @@ impl Provider for RunpodV2Provider {
     }
 
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
+        self.forget_endpoint(id);
         let url = pod_url(id, None)?;
         let keys = self.keys_to_merge(env).await?;
         let rb = api_request(&self.client, &self.api_key, Method::PATCH, url).json(&reimage_payload(image, env, &keys));
@@ -1091,6 +1296,7 @@ mod tests {
         let mut v = running_pod();
         v["ssh"]["direct"] = Value::Null;
         v["dataCenterId"] = Value::Null;
+        v["runtime"]["ports"] = json!([]);
         let p = parse_pod(&v);
         assert!(p.proxy_only && p.ssh_ip.is_none(), "{p:?}");
         assert!(!parse_pod(&running_pod()).proxy_only);
@@ -1125,6 +1331,7 @@ mod tests {
                 volume_gb: Some(20.0),
                 delete_protected: None,
                 created_at: Some(1_780_315_200),
+                started_at: Some(1_780_315_320),
                 identity: None,
                 status_detail: None,
             }
@@ -1154,6 +1361,7 @@ mod tests {
     fn parse_pod_degrades_odd_fields_to_none() {
         // Half an endpoint is no endpoint; an out-of-range port is no port.
         let mut v = running_pod();
+        v["runtime"] = Value::Null;
         v["ssh"]["direct"]["port"] = json!(70000);
         let p = parse_pod(&v);
         assert_eq!((p.ssh_ip, p.ssh_port), (None, None));
@@ -1747,7 +1955,31 @@ mod tests {
     fn offline() -> RunpodV2Provider {
         let proxy = reqwest::Proxy::all("http://127.0.0.1:9").unwrap();
         let client = Client::builder().no_proxy().proxy(proxy).build().unwrap();
-        RunpodV2Provider { api_key: "rpa_TEST".into(), client, account_keys: Mutex::new(None) }
+        RunpodV2Provider { api_key: "rpa_TEST".into(), client, account_keys: Mutex::new(None), endpoints: Mutex::new(EndpointMemo::default()) }
+    }
+
+    /// This provider's own stop, start, restart, reimage and terminate forget the pod's
+    /// remembered endpoint before the request goes out (a restart gets a new port), even when
+    /// the request then fails — here every request does.
+    #[tokio::test]
+    async fn the_providers_own_lifecycle_calls_forget_the_endpoint() {
+        let p = offline();
+        let remember = |id: &str| {
+            p.endpoints.lock().unwrap().by_id.insert(id.into(), Remembered { started_at: 1, ip: "203.0.113.9".into(), port: 2000, at: 2 });
+        };
+        let gone = |id: &str| !p.endpoints.lock().unwrap().by_id.contains_key(id);
+        remember("keep");
+        remember("a");
+        assert!(p.stop_pod("a").await.is_err() && gone("a"));
+        remember("b");
+        assert!(p.start_pod("b").await.is_err() && gone("b"));
+        remember("c");
+        assert!(p.restart_pod("c").await.is_err() && gone("c"));
+        remember("d");
+        assert!(p.terminate_pod("d").await.is_err() && gone("d"));
+        remember("e");
+        assert!(p.reimage_pod("e", "img:1", &[]).await.is_err() && gone("e"));
+        assert!(!gone("keep"), "only the pod acted on");
     }
 
     /// The guards fire before any request: a bad tier (which v2 would turn into SECURE if

@@ -280,6 +280,7 @@ fn parse_pod(v: &Value) -> Pod {
         volume_gb: disk_sum(&[v.get("volumeInGb")]),
         delete_protected: None,
         created_at: None,
+        started_at: None,
         identity: None,
         status_detail: None,
     }
