@@ -3088,10 +3088,15 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let commits_h = if n_commits > 0 { n_commits as u16 + 1 } else { 0 };
     // History graphs are a nice-to-have; show them only if the pane is still tall enough
     // once the facts, per-GPU table, and the extra sections have taken their space.
-    // The OpenRouter key's line, under `cost:`, when a provisioning key is configured.
-    let ai = shared.ai.as_ref().map(|a| match a.keys.get(&pod.name) {
-        Some(k) => k.detail(),
-        None => "- (no OpenRouter key named after this pod — `arena keys gen` makes one)".to_string(),
+    // The OpenRouter key's line, under `cost:`, when a provisioning key is configured. "No
+    // key" only from a listing that worked: before the first read, or after a failed one,
+    // absence isn't known — and numbers kept from an older read say so.
+    let ai = shared.ai.as_ref().map(|a| match (a.keys.get(&pod.name), a.read, a.keys_error.as_deref()) {
+        (None, false, _) => "… (reading OpenRouter's keys)".to_string(),
+        (None, _, Some(e)) => format!("? (OpenRouter's keys couldn't be read: {e})"),
+        (None, _, None) => "- (no OpenRouter key named after this pod — `arena keys gen` makes one)".to_string(),
+        (Some(k), _, None) => k.detail(),
+        (Some(k), _, Some(_)) => format!("{} (as last read; the latest read failed)", k.detail()),
     });
     let fact_lines = FACT_LINES + u16::from(ai.is_some());
     let show_graphs = inner.height >= fact_lines + 3 + procs_h + commits_h + 6;
