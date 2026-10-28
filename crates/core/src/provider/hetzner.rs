@@ -74,6 +74,11 @@ impl Default for HetznerOpts {
 }
 
 impl HetznerOpts {
+    /// The server type a create of `spec` asks for: `--server-type`, else `HETZNER_SERVER_TYPE`.
+    pub fn server_type_for<'a>(&'a self, spec: &'a PodSpec) -> &'a str {
+        server_type(self, spec)
+    }
+
     /// The options from config (`HETZNER_*`), each key's default where it's unset — what
     /// [`super::build`] creates with and `config check` shows. Pure.
     pub fn from_config(cfg: &crate::config::Config) -> Self {
@@ -396,15 +401,101 @@ impl HetznerProvider {
         }
         match self.get_all("server_types").await {
             Ok(types) => {
-                let now = crate::snapshot::unix_now();
-                let near = self.distances.to(&find_type(&types, ty).map(locations_of).unwrap_or_default()).await;
-                let walk = location_walk(&types, ty, locations, now, &near).map_err(|why| Error::Provider { kind: crate::error::ProviderErrorKind::Rejected, message: format!("hetzner create: {why}") })?;
+                let walk = self.walk_in(&types, ty).await.map_err(|why| Error::Provider { kind: crate::error::ProviderErrorKind::Rejected, message: format!("hetzner create: {why}") })?;
                 Ok(walk.into_iter().map(Some).collect())
             }
             Err(_) if !locations.listed.is_empty() => Ok(locations.listed.iter().cloned().map(Some).collect()),
             Err(_) => Ok(vec![None]),
         }
     }
+
+    /// [`location_walk`] for `ty` over the `GET /server_types` items `types`, with `any`'s
+    /// locations timed ([`Distances`]). `Err`: what to say when there'd be nothing to try.
+    async fn walk_in(&self, types: &[Value], ty: &str) -> std::result::Result<Vec<String>, String> {
+        let locations = &self.opts.locations;
+        let near = if locations.any {
+            self.distances.to(&find_type(types, ty).map(locations_of).unwrap_or_default()).await
+        } else {
+            HashMap::new()
+        };
+        location_walk(types, ty, locations, crate::snapshot::unix_now(), &near)
+    }
+
+    /// What a create of `spec` would get, read-only, for `arena offers`: the server type it asks
+    /// for (`--server-type`, else `HETZNER_SERVER_TYPE`), its size, the locations it would try in
+    /// order (the create's own walk, timed the same way) and its gross €/h in the first. One
+    /// `GET /server_types`. `Err`: it couldn't be read, or there'd be nothing to create.
+    pub async fn offer(&self, spec: &PodSpec) -> Result<ServerType> {
+        let ty = server_type(&self.opts, spec);
+        let types = self.get_all("server_types").await?;
+        let walk = self.walk_in(&types, ty).await.map_err(Error::Config)?;
+        server_offer(&types, ty, walk).ok_or_else(|| Error::Config(format!("Hetzner has no server type `{ty}`")))
+    }
+
+    /// Every server type on sale somewhere now, cheapest first, for `arena offers --all`: what
+    /// `--server-type` takes. One `GET /server_types`.
+    pub async fn catalog(&self) -> Result<Vec<ServerType>> {
+        Ok(server_types(&self.get_all("server_types").await?, crate::snapshot::unix_now()))
+    }
+}
+
+/// A Hetzner server type as `arena offers` shows it: what `--server-type` names, its size, and
+/// its gross €/h (Hetzner bills in EUR; arena never converts it) in the first of `locations`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct ServerType {
+    pub name: String,
+    pub cores: Option<u32>,
+    /// `shared` or `dedicated` vCPUs.
+    pub cpu_type: Option<String>,
+    /// `x86` or `arm`.
+    pub architecture: Option<String>,
+    pub memory_gb: Option<f64>,
+    pub disk_gb: Option<u32>,
+    /// Gross €/h in `locations[0]`; `None` when Hetzner lists no price there.
+    pub eur_per_hour: Option<f64>,
+    /// A create's walk, in order ([`HetznerProvider::offer`]); in the catalog, every location
+    /// that sells it now, cheapest first ([`server_types`]).
+    pub locations: Vec<String>,
+}
+
+/// `t` (a `GET /server_types` item) as a [`ServerType`] over `locations`. Pure.
+fn server_type_of(t: &Value, locations: Vec<String>) -> ServerType {
+    let text = |k: &str| t.get(k).and_then(Value::as_str).map(String::from);
+    ServerType {
+        name: text("name").unwrap_or_else(|| "?".into()),
+        cores: t.get("cores").and_then(Value::as_u64).and_then(|c| u32::try_from(c).ok()),
+        cpu_type: text("cpu_type"),
+        architecture: text("architecture"),
+        memory_gb: t.get("memory").and_then(Value::as_f64),
+        disk_gb: t.get("disk").and_then(Value::as_u64).and_then(|d| u32::try_from(d).ok()),
+        eur_per_hour: locations.first().and_then(|l| price_in(t, l)).map(|m| m as f64 / 1_000_000.0),
+        locations,
+    }
+}
+
+/// Server type `ty` as a create walking `walk` gets it; `None` when Hetzner has no such type.
+/// Pure.
+fn server_offer(types: &[Value], ty: &str, walk: Vec<String>) -> Option<ServerType> {
+    find_type(types, ty).map(|t| server_type_of(t, walk))
+}
+
+/// Every type orderable somewhere now ([`orderable_in`]), each over the locations that sell
+/// it, cheapest first (then the API's order); the types cheapest first, then by name. A
+/// location with no price sorts last. Pure.
+fn server_types(types: &[Value], now: u64) -> Vec<ServerType> {
+    let mut out: Vec<ServerType> = types
+        .iter()
+        .filter_map(|t| {
+            let mut sold: Vec<&str> = locations_of(t).into_iter().filter(|l| orderable_in(t, l, now) == Some(true)).collect();
+            sold.sort_by_key(|l| price_in(t, l).unwrap_or(i64::MAX));
+            (!sold.is_empty()).then(|| server_type_of(t, sold.into_iter().map(String::from).collect()))
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        let eur = |s: &ServerType| s.eur_per_hour.unwrap_or(f64::MAX);
+        eur(a).total_cmp(&eur(b)).then_with(|| a.name.cmp(&b.name))
+    });
+    out
 }
 
 /// Whether a refused create means "no room for this type here", so the next location may have
@@ -1828,5 +1919,105 @@ mod tests {
         assert_eq!(server(json!({"location": {"name": "sin"}})), Some(0.0497));
         assert_eq!(server(json!({"datacenter": {"location": {"name": "sin"}}})), Some(0.0497));
         assert_eq!(server(json!({})), Some(0.0368));
+    }
+
+    /// `offers --all`: every type on sale somewhere, over the locations that sell it now
+    /// (cpx41's EU retirement passed, so only ash; cpx22's is announced, so still nbg1), cheapest
+    /// type first, its price from its cheapest location. Pure.
+    #[test]
+    fn the_catalog_lists_what_is_on_sale_cheapest_first() {
+        let types: Vec<Value> = serde_json::from_str::<Value>(SERVER_TYPES).unwrap()["server_types"].as_array().unwrap().clone();
+        let rows = server_types(&types, 1_792_000_000);
+        let got: Vec<(&str, Option<f64>, Vec<&str>)> =
+            rows.iter().map(|r| (r.name.as_str(), r.eur_per_hour, r.locations.iter().map(String::as_str).collect())).collect();
+        let eu = vec!["fsn1", "nbg1", "hel1"];
+        assert_eq!(
+            got,
+            [
+                ("cx23", Some(0.0104), eu.clone()),
+                ("cax11", Some(0.0112), eu.clone()),
+                ("cx33", Some(0.016), eu.clone()),
+                ("cpx22", Some(0.0368), vec!["nbg1"]),
+                ("ccx13", Some(0.0817), vec!["ash"]),
+                ("cpx42", Some(0.1314), eu),
+                ("cpx41", Some(0.2267), vec!["ash"]),
+            ]
+        );
+        let cax11 = &rows[1];
+        assert_eq!(
+            (cax11.cores, cax11.cpu_type.as_deref(), cax11.architecture.as_deref(), cax11.memory_gb, cax11.disk_gb),
+            (Some(2), Some("shared"), Some("arm"), Some(4.0), Some(40))
+        );
+        assert_eq!(rows[4].cpu_type.as_deref(), Some("dedicated"));
+        // A location with no price sorts after the priced ones; a type sold nowhere isn't listed.
+        let t = json!([{"name": "t1", "cores": 2,
+            "prices": [{"location": "hel1", "price_hourly": {"gross": "0.0300"}}, {"location": "fsn1", "price_hourly": {"gross": "0.0200"}}],
+            "locations": [{"name": "nbg1", "deprecation": null}, {"name": "hel1", "deprecation": null}, {"name": "fsn1", "deprecation": null}]},
+            {"name": "gone", "locations": []}]);
+        let rows = server_types(t.as_array().unwrap(), 1_792_000_000);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].locations.clone(), rows[0].eur_per_hour), (vec!["fsn1".into(), "hel1".into(), "nbg1".into()], Some(0.02)));
+    }
+
+    /// `arena offers` on Hetzner, over the real request path: the type create would ask for
+    /// (`--server-type` over config), the walk it would take (nearest first, timed as create
+    /// times it) and the price where that walk starts; a type Hetzner doesn't have is an error.
+    #[tokio::test]
+    async fn an_offer_is_what_a_create_would_get() {
+        use crate::http::test_server::{canned, serve};
+        let srv = serve(vec![canned(200, "application/json", SERVER_TYPES); 3]);
+        let mut p = provider(&srv.base, HetznerOpts::default());
+        p.distances = Distances::known(&[("hel1", 1), ("fsn1", 24), ("nbg1", 26)]);
+        let cx23 = p.offer(&spec("devtest-a", None)).await.unwrap();
+        assert_eq!(
+            cx23,
+            ServerType {
+                name: "cx23".into(),
+                cores: Some(2),
+                cpu_type: Some("shared".into()),
+                architecture: Some("x86".into()),
+                memory_gb: Some(4.0),
+                disk_gb: Some(40),
+                eur_per_hour: Some(0.0104),
+                locations: vec!["hel1".into(), "fsn1".into(), "nbg1".into()],
+            }
+        );
+        let cpx41 = p.offer(&spec("devtest-a", Some("cpx41"))).await.unwrap();
+        assert_eq!((cpx41.locations, cpx41.eur_per_hour, cpx41.disk_gb), (vec!["ash".to_string()], Some(0.2267), Some(240)));
+        let e = p.offer(&spec("devtest-a", Some("cx99"))).await.unwrap_err();
+        assert!(matches!(&e, Error::Config(m) if m.contains("Hetzner has no server type `cx99`")), "a refusal, not a failed read: {e:?}");
+    }
+
+    /// The offer's walk is the create's, location for location: a listed `HETZNER_LOCATION` is
+    /// walked as listed (never reordered by distance, no catalog read on create), and `any` after
+    /// it adds the rest nearest first — over the real request path, with `walk_in` shared.
+    #[tokio::test]
+    async fn an_offer_walks_where_a_create_walks() {
+        use crate::http::test_server::{canned, serve};
+        let near = [("nbg1", 1), ("hel1", 2), ("fsn1", 24)];
+        for (setting, want) in [("fsn1,hel1", vec!["fsn1", "hel1"]), ("fsn1,any", vec!["fsn1", "nbg1", "hel1"])] {
+            let opts = HetznerOpts::from_config(&crate::config::Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nHETZNER_LOCATION={setting}\n")));
+            let full = r#"{"error":{"code":"resource_unavailable","message":"error during placement"}}"#;
+            let mut answers = if opts.locations.any { vec![canned(200, "application/json", SERVER_TYPES)] } else { Vec::new() };
+            answers.extend(want.iter().map(|_| canned(412, "application/json", full)));
+            // The failed create's explanation reads the project's keys and the types again.
+            answers.extend([canned(200, "application/json", r#"{"ssh_keys": [{"id": 1, "name": "devtest"}]}"#), canned(200, "application/json", SERVER_TYPES)]);
+            let srv = serve(answers);
+            let mut p = provider(&srv.base, opts.clone());
+            p.distances = Distances::known(&near);
+            assert!(p.create_pod(&spec("devtest-a", None)).await.is_err(), "{setting}: no room anywhere");
+            let sent: Vec<Option<String>> = want.iter().map(|l| Some(l.to_string())).collect();
+            assert_eq!(sent_locations(&srv), sent, "{setting}: create");
+            let srv = serve(vec![canned(200, "application/json", SERVER_TYPES)]);
+            let mut p = provider(&srv.base, opts);
+            p.distances = Distances::known(&near);
+            assert_eq!(p.offer(&spec("devtest-a", None)).await.unwrap().locations, want, "{setting}: offer");
+        }
+        // A listed location where the type is retired is still where a create goes first (it
+        // doesn't read the catalog): the offer lists it as is, never drops it or refuses.
+        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\nHETZNER_LOCATION=fsn1,ash\n"));
+        let srv = serve(vec![canned(200, "application/json", SERVER_TYPES)]);
+        let cpx41 = provider(&srv.base, opts).offer(&spec("devtest-a", Some("cpx41"))).await.unwrap();
+        assert_eq!(cpx41.locations, ["fsn1", "ash"]);
     }
 }

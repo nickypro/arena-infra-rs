@@ -249,7 +249,7 @@ pub fn check_gpu_flag(raw: &str, catalog: &[GpuType]) -> Result<String> {
     }
     if !problems.is_empty() {
         return Err(Error::Config(format!(
-            "--gpu: {} (`arena gpus` lists the types and their --gpu names)",
+            "--gpu: {} (`arena offers --all` lists the types and their --gpu names)",
             problems.join("; ")
         )));
     }
@@ -574,7 +574,7 @@ H100        80G          -     $2.69  High   NVIDIA H100 80GB HBM3
             ("A400", "`NVIDIA RTX A4000` (RTX A4000)"),
             ("NVIDIA RTX A4000x", "`NVIDIA RTX A4000`"),
             ("unknown", "isn't a RunPod GPU type"),         // the placeholder isn't a GPU
-            ("zzzzzzzz", "`zzzzzzzz` isn't a RunPod GPU type (`arena gpus`"), // nothing close: no hint
+            ("zzzzzzzz", "`zzzzzzzz` isn't a RunPod GPU type (`arena offers --all`"), // nothing close: no hint
             ("4000 ada", ""),                               // alias → exact id: fine (checked below)
         ] {
             if want.is_empty() {
@@ -583,7 +583,7 @@ H100        80G          -     $2.69  High   NVIDIA H100 80GB HBM3
             }
             let e = err(flag);
             assert!(e.contains(want), "{flag}: {e}");
-            assert!(e.contains("arena gpus"), "{flag}: {e}");
+            assert!(e.contains("arena offers --all"), "{flag}: {e}");
         }
         // Every bad token in a list is named, in one error; the good ones aren't.
         let e = err("A4000,3070x,foo99");

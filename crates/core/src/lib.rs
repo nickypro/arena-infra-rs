@@ -25,6 +25,7 @@ pub mod jobs;
 pub mod lock;
 pub mod metrics;
 pub mod naming;
+pub mod offers;
 pub mod openrouter;
 pub mod pipeline;
 pub mod placement;
