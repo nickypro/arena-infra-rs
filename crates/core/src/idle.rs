@@ -394,11 +394,6 @@ pub enum Verdict {
     NotRunning,
 }
 
-/// A CPU-only server: no `nvidia-smi` is expected there.
-fn cpu_only(pod: &Pod) -> bool {
-    pod.provider.eq_ignore_ascii_case("hetzner") || pod.gpu_count == Some(0)
-}
-
 /// `1 SSH session` / `2 SSH sessions`.
 fn plural(n: u32, what: &str) -> String {
     format!("{n} {what}{}", if n == 1 { "" } else { "s" })
@@ -431,7 +426,7 @@ pub fn judge(pod: &Pod, probe: &Probe, threshold: u64) -> Verdict {
     match &r.gpu {
         Gpu::Read { max_util, .. } if *max_util > IDLE_GPU_PCT => busy.push(format!("GPU {max_util}%")),
         Gpu::Read { .. } => {}
-        Gpu::Absent if cpu_only(pod) => {}
+        Gpu::Absent if pod.cpu_only() => {}
         Gpu::Absent => unknown.push("no nvidia-smi on a GPU pod".into()),
         Gpu::Unreadable { why } => unknown.push(format!("GPU: {why}")),
     }

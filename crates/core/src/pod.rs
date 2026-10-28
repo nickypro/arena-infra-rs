@@ -100,6 +100,15 @@ pub struct Pod {
     pub status_detail: Option<String>,
 }
 
+impl Pod {
+    /// A CPU-only server, by what it is rather than by what a read of it found: a Hetzner VM,
+    /// or a listing that says 0 GPUs. No `nvidia-smi` is expected there; a GPU pod whose
+    /// `nvidia-smi` fails is still a GPU pod.
+    pub fn cpu_only(&self) -> bool {
+        self.provider.eq_ignore_ascii_case("hetzner") || self.gpu_count == Some(0)
+    }
+}
+
 /// A provider-reported maintenance window for the host a pod runs on. Times are kept as
 /// the provider's own strings (RunPod sends ISO-8601) — they're displayed, not computed on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

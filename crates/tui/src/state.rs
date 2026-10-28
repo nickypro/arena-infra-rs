@@ -251,8 +251,8 @@ pub fn health_cell(h: Option<&HealthRecord>, checking: bool, now: u64) -> (Strin
     let Some(h) = h else { return ("-".into(), Tone::Dim) };
     let age = now.saturating_sub(h.checked_at);
     let tone = match h.status {
-        // A pass says little about today once it's a day old: grey, so it can't pass for a
-        // fresh one. A warning or a failure keeps its colour (nobody has said otherwise).
+        // A pass says little about today once it's over a day old: grey, so it can't pass for
+        // a fresh one. A warning or a failure keeps its colour (nobody has said otherwise).
         Status::Pass if age > HEALTH_FRESH => Tone::Dim,
         Status::Pass => Tone::Good,
         Status::Warn => Tone::Warn,
@@ -262,9 +262,10 @@ pub fn health_cell(h: Option<&HealthRecord>, checking: bool, now: u64) -> (Strin
     (format!("{} {}", h.status.label(), fmt_age(age)), tone)
 }
 
-/// How long a deep check's pass reads as current in the HEALTH column (then grey): a day,
-/// the health cron's cadence.
-pub const HEALTH_FRESH: u64 = 24 * 3_600;
+/// How long a deep check's pass reads as current in the HEALTH column (then grey): the health
+/// cron's daily cadence plus two hours, as it checks the pods one by one and its run drifts —
+/// a working cron never leaves a pass grey.
+pub const HEALTH_FRESH: u64 = 26 * 3_600;
 
 /// The PROXY cell: [`snapshot::proxy_label`] (`:9500`, `:9500 stale`, `-`, `?`), or with
 /// `compact` (a narrow terminal) just the port — the tone still tells live from stale.
@@ -1481,9 +1482,9 @@ mod tests {
             (Some(rec(Status::Warn, 59)), false, "warn 59s", Tone::Warn),
             (Some(rec(Status::Fail, 7_300)), false, "fail 2h", Tone::Bad),
             (Some(rec(Status::Fail, 3 * 86_400)), false, "fail 3d", Tone::Bad),
-            // A pass fades once it's a day old; a warning doesn't.
-            (Some(rec(Status::Pass, 86_400)), false, "pass 1d", Tone::Good),
-            (Some(rec(Status::Pass, 86_401)), false, "pass 1d", Tone::Dim),
+            // A pass fades past 26h (a daily cron's drift kept); a warning doesn't.
+            (Some(rec(Status::Pass, 26 * 3_600)), false, "pass 1d", Tone::Good),
+            (Some(rec(Status::Pass, 26 * 3_600 + 1)), false, "pass 1d", Tone::Dim),
             (Some(rec(Status::Warn, 2 * 86_400)), false, "warn 2d", Tone::Warn),
             // A re-check in flight says so over the old verdict.
             (Some(rec(Status::Fail, 60)), true, "checking", Tone::Busy),
