@@ -85,6 +85,10 @@ fn the_recorded_release_attestation_proves_its_binaries_together_and_each_alone(
         let s = &proof.signer;
         assert_eq!(s.identity.as_deref(), Some("https://github.com/nickypro/arena-infra-rs/.github/workflows/release.yml@refs/heads/master"));
         assert_eq!((s.trigger.as_deref(), s.commit.as_deref()), (Some("workflow_run"), Some("7917eb2b6cc1652ee05355569e101826649b1359")));
+        assert_eq!(proof.logged_secs, Some(1793215545));
+        assert_eq!(proof.subjects.len(), 4);
+        assert_eq!(proof.digest_of(TUI), Some(TUI_SHA));
+        assert_eq!(proof.digest_of("CHANGELOG.md"), None, "releases before 2026-10-28's change don't name it");
         assert_eq!(
             proof.to_string(),
             "built by https://github.com/nickypro/arena-infra-rs/.github/workflows/release.yml@refs/heads/master, \

@@ -6,12 +6,13 @@
 # v<version>. The version is the commit's time in UTC (crates/cli/build.rs), so one commit is
 # always one version.
 #
-# Build provenance is attested (Sigstore, logged in Rekor), one statement naming every
-# `dist/arena-*` file, and `arena update` refuses binaries that statement doesn't prove
-# (crates/core/src/attest.rs; by hand: docs/REFERENCE.md, `update`). It pins who signed: this
-# file, `.github/workflows/release.yml`, started by `workflow_run`, on `refs/heads/master` of this
-# repository (by GitHub's id for it, 1368824951), on a GitHub-hosted runner; and both binaries
-# named, with their digests, in the one statement. Renaming or moving this file, another
+# Build provenance is attested (Sigstore, logged in Rekor): one statement naming every
+# `dist/arena-*` file and CHANGELOG.md. `arena update` refuses binaries that statement doesn't
+# prove, and a CHANGELOG.md other than the one it names (crates/core/src/attest.rs; by hand:
+# docs/REFERENCE.md, `update`). It pins who signed: this file, `.github/workflows/release.yml`,
+# started by `workflow_run`, on `refs/heads/master` of this repository (by GitHub's id for it,
+# 1368824951), on a GitHub-hosted runner; and both binaries named, with their digests, in the
+# one statement. Renaming or moving this file, another
 # trigger, releasing from another branch, a self-hosted runner, attesting the binaries
 # separately, or a re-created repository makes every existing build refuse the new releases
 # (until `arena update --skip-attestation <sha256>,<sha256>`): change `attest::RELEASE` with it,
@@ -117,7 +118,11 @@ jobs:
           cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: "dist/arena-*"
+          # One statement naming every binary and the changelog: `arena update` requires both
+          # binaries in one statement, and shows the changelog as verified when it's named.
+          subject-path: |
+            dist/arena-*
+            dist/CHANGELOG.md
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}

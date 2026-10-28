@@ -49,6 +49,16 @@ impl Version {
     }
 }
 
+impl Version {
+    /// The build stamp's time (`YYMMDD.HHMM`, UTC: the commit's time, for a release) in Unix
+    /// seconds. Pure.
+    pub fn unix_secs(self) -> i64 {
+        let [_, _, date, time] = self.0;
+        let (y, m, d) = (2000 + i64::from(date / 10000), date / 100 % 100, date % 100);
+        crate::schedule::days_from_civil(y, m, d) * 86400 + i64::from(time / 100) * 3600 + i64::from(time % 100) * 60
+    }
+}
+
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let [a, b, c, d] = self.0;
@@ -336,24 +346,68 @@ pub struct Checked {
     pub release: Release,
     pub newer: bool,
     pub changes: String,
+    /// The SHA-256 of the release's `CHANGELOG.md` the changes come from, when it had one: what
+    /// [`changelog_provenance`] checks against the attestation before they are trusted.
+    pub changelog_sha256: Option<String>,
 }
 
 /// Read the latest release and, if it's newer than `installed`, what changed: its
-/// `CHANGELOG.md` against `embedded` (this build's own). A release without a changelog says
-/// so instead of failing — the binaries are what matter.
+/// `CHANGELOG.md` against `embedded` (this build's own), with control characters taken out
+/// ([`printable`]). A release without a changelog says so instead of failing — the binaries
+/// are what matter. Nothing here is verified yet: the release's provenance is checked by
+/// [`fetch`], and the changelog's by [`changelog_provenance`].
 pub async fn check(client: &Client, api: &str, installed: Version, embedded: &str) -> Result<Checked> {
     let release = latest(client, api).await?;
     if release.version <= installed {
-        return Ok(Checked { release, newer: false, changes: String::new() });
+        return Ok(Checked { release, newer: false, changes: String::new(), changelog_sha256: None });
     }
-    let changes = match release.asset("CHANGELOG.md") {
+    let (changes, changelog_sha256) = match release.asset("CHANGELOG.md") {
         Ok(a) => match download(client, a).await {
-            Ok(bytes) => describe_changes(&new_since(embedded, &String::from_utf8_lossy(&bytes))),
-            Err(e) => format!("(couldn't read the release's changelog: {e})\n"),
+            Ok(bytes) => (printable(&describe_changes(&new_since(embedded, &String::from_utf8_lossy(&bytes)))), Some(sha256_hex(&bytes))),
+            Err(e) => (format!("(couldn't read the release's changelog: {e})\n"), None),
         },
-        Err(_) => "(the release has no CHANGELOG.md)\n".into(),
+        Err(_) => ("(the release has no CHANGELOG.md)\n".into(), None),
     };
-    Ok(Checked { release, newer: true, changes })
+    Ok(Checked { release, newer: true, changes, changelog_sha256 })
+}
+
+/// `text` with every control character but newline and tab shown as `?`: what a release says
+/// is printed to an operator's terminal, so it must not carry escape sequences. Pure.
+pub fn printable(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() && c != '\n' && c != '\t' { '?' } else { c }).collect()
+}
+
+/// What can be said of the release's `CHANGELOG.md` (its SHA-256, when it had one) once the
+/// binaries are proven by `proof` (`None`: pinned by hand instead), or why the update must
+/// stop: an attestation that names another `CHANGELOG.md` means this one was changed after the
+/// release was built. Releases attest it since 2026-10-28; older ones don't name it. Pure.
+pub fn changelog_provenance(proof: Option<&attest::Proof>, sha256: Option<&str>) -> std::result::Result<&'static str, String> {
+    match (proof, sha256) {
+        (_, None) => Ok("no changelog to check"),
+        (None, Some(_)) => Ok("not verified: --skip-attestation"),
+        (Some(p), Some(sha)) => match p.digest_of("CHANGELOG.md") {
+            Some(d) if d.eq_ignore_ascii_case(sha) => Ok("verified: the attestation names this CHANGELOG.md"),
+            Some(d) => Err(format!("the release's CHANGELOG.md (sha256 {sha}) isn't the one its attestation names ({d}) — not installed")),
+            None => Ok("not covered by this release's attestation"),
+        },
+    }
+}
+
+/// How much earlier than its version a release's attestation may be signed: the version is the
+/// commit's time by its author's clock, which may run ahead of Sigstore's.
+pub const CLOCK_SKEW_SECS: i64 = 24 * 3600;
+
+/// That an attestation signed at `signed` (Unix seconds) can be `version`'s: the release
+/// workflow signs after CI passed on the commit, so never (allowing [`CLOCK_SKEW_SECS`]) before
+/// the commit's time, the version. A genuine older pair served under a newer tag fails here,
+/// before either binary is written or run. Pure.
+pub fn check_fresh(version: Version, signed: Option<i64>) -> std::result::Result<(), String> {
+    let at = signed.ok_or("its attestation has no verified time")?;
+    if at + CLOCK_SKEW_SECS < version.unix_secs() {
+        let when = crate::snapshot::rfc3339(u64::try_from(at).unwrap_or(0));
+        return Err(format!("its attestation was signed {when}, before {version} was committed: an older build served as {version}"));
+    }
+    Ok(())
 }
 
 /// The binaries a release installs on `target`: `(name in the install dir, asset name)`.
@@ -397,13 +451,19 @@ pub fn parse_pins(values: &[String]) -> std::result::Result<Vec<String>, String>
     Ok(pins)
 }
 
-/// That `name`'s SHA-256 `sha256` is one of the operator's `pins`, or why not. Pure.
-pub fn check_pinned(pins: &[String], name: &str, sha256: &str) -> std::result::Result<(), String> {
-    if pins.iter().any(|p| p == sha256) {
-        Ok(())
-    } else {
-        Err(format!("{name}: its sha256 {sha256} isn't one given to --skip-attestation ({})", pins.join(", ")))
+/// That the downloaded `files` (`(asset name, sha256)`) are exactly the operator's `pins`: each
+/// one's SHA-256 is a pin, and no pin stands for two of them (one binary served under both
+/// names would otherwise pass). Or the first that isn't. Pure.
+pub fn check_pinned(pins: &[String], files: &[(&str, &str)]) -> std::result::Result<(), String> {
+    for (i, &(name, sha256)) in files.iter().enumerate() {
+        if !pins.iter().any(|p| p == sha256) {
+            return Err(format!("{name}: its sha256 {sha256} isn't one given to --skip-attestation ({})", pins.join(", ")));
+        }
+        if let Some(&(other, _)) = files[..i].iter().find(|f| f.1 == sha256) {
+            return Err(format!("{name} is the same file as {other} (sha256 {sha256}): the release serves one binary as both"));
+        }
     }
+    Ok(())
 }
 
 /// Download `release`'s binaries for `target` and its `SHA256SUMS`, check both against it and
@@ -419,17 +479,17 @@ pub async fn fetch(client: &Client, release: &Release, target: &str, dir: &Path,
         verify(&sums, &asset_name, &bytes)?;
         got.push((name, asset_name, sha256_hex(&bytes), bytes));
     }
+    // `arena` first: the attestation is looked up by its digest (the binary cron runs).
+    let files: Vec<(&str, &str)> = got.iter().rev().map(|(_, a, sha, _)| (a.as_str(), sha.as_str())).collect();
     let proof = match provenance {
         Provenance::Verify { source, expected } => {
-            // Looked up by `arena`'s digest: the binary cron runs.
-            let files: Vec<(&str, &str)> = got.iter().rev().map(|(_, a, sha, _)| (a.as_str(), sha.as_str())).collect();
             let proven = attest::verify(*source, &attest::verifier()?, expected, &files).await;
-            Some(proven.map_err(|e| format!("{e} — not installed"))?)
+            let proof = proven.map_err(|e| format!("{e} — not installed"))?;
+            check_fresh(release.version, proof.logged_secs).map_err(|e| format!("{e} — not installed"))?;
+            Some(proof)
         }
         Provenance::Pinned(pins) => {
-            for (_, asset_name, sha, _) in &got {
-                check_pinned(pins, asset_name, sha).map_err(|e| format!("{e} — not installed"))?;
-            }
+            check_pinned(pins, &files).map_err(|e| format!("{e} — not installed"))?;
             None
         }
     };

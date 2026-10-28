@@ -147,9 +147,10 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<St
         println!("arena {installed} is up to date (the latest release is {}).", found.release.tag);
         return Ok(());
     }
-    println!("Update available: arena {installed} → {} ({})\n", found.release.version, found.release.tag);
-    print!("{}", found.changes);
+    println!("Update available: arena {installed} → {} ({})", found.release.version, found.release.tag);
     if check_only {
+        println!("What changed, from the release's CHANGELOG.md (not verified: `arena update --dry-run` verifies it):\n");
+        print!("{}", found.changes);
         return Err(UpdateAvailable.into());
     }
     // Where this binary really is (`/usr/local/bin/arena` is a link into ~/.cargo/bin on prod).
@@ -170,6 +171,9 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<St
     };
     println!("\nDownloading {} for {target} …", found.release.tag);
     let staged = up::fetch(&client, &found.release, target, dir, &provenance).await.map_err(|e| anyhow::anyhow!("update: {e}"))?;
+    // The changelog is shown only now, with what can be said of it: before, it was the
+    // release's word alone, and its "Action needed" lines are instructions to an operator.
+    let changelog = up::changelog_provenance(staged.proof.as_ref(), found.changelog_sha256.as_deref()).map_err(|e| anyhow::anyhow!("update: {e}"))?;
     match &staged.proof {
         Some(proof) => {
             println!("Both binaries match the release's SHA256SUMS, and one build-provenance attestation names both");
@@ -178,6 +182,9 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<St
         None => println!("Both binaries match the release's SHA256SUMS and the SHA-256s given (provenance NOT checked here)."),
     }
     println!("The new arena runs here.");
+    println!("\nWhat changed, from the release's CHANGELOG.md ({changelog}):\n");
+    print!("{}", found.changes);
+    println!();
     if dry_run {
         println!("--dry-run: nothing installed.");
         return Ok(());

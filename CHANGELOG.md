@@ -26,6 +26,9 @@ earlier).
   check, only binaries with those two SHA-256s, with a loud warning: for a genuine release this
   build can't verify (after Sigstore changes its keys), whose binaries you verified with
   `gh attestation verify` elsewhere (docs/REFERENCE.md says how). `--check` is unchanged.
+- What changed is shown after the binaries are verified, and says whether the attestation also
+  covers the release's changelog (from this release on it does; a changelog other than the
+  attested one stops the update). `--check` labels it unverified.
 - An update makes 2 GitHub API requests instead of 1 (of the 60 an hour allowed without a login).
 - Dependencies with security advisories updated (rustls, rustls-webpki, webpki-roots, tokio,
   anyhow).

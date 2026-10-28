@@ -24,17 +24,23 @@ updates:
     allow:
       - dependency-type: all
     open-pull-requests-limit: 5
+    # A crate matches the first group whose patterns it fits.
     groups:
-      # Their own PR, never lost among other bumps: they decide what `arena update` trusts (the
-      # Sigstore trust root comes with sigstore-trust-root; a test pins its hash, so a changed
-      # root fails CI until it is compared with Sigstore's own and the hash updated).
-      sigstore:
+      # The crates `arena update`'s provenance check rests on (Sigstore's, and the X.509, DER
+      # and crypto ones that verify its certificates and signatures): their own PR, never lost
+      # among other bumps, to be read before merging. The Sigstore trust root comes with
+      # sigstore-trust-root, and a test pins its hash, so a changed root fails CI until it is
+      # compared with Sigstore's own and the hash updated.
+      verification:
         applies-to: version-updates
-        patterns: ["sigstore-*"]
+        patterns: ["sigstore-*", "aws-lc-*", "rustls-webpki", "x509-cert", "der", "der_derive", "spki", "const-oid", "pem", "pem-rfc7468", "tls_codec*", "serde_json_canonicalizer"]
+      verification-security:
+        applies-to: security-updates
+        # The same list as above.
+        patterns: ["sigstore-*", "aws-lc-*", "rustls-webpki", "x509-cert", "der", "der_derive", "spki", "const-oid", "pem", "pem-rfc7468", "tls_codec*", "serde_json_canonicalizer"]
       cargo:
         applies-to: version-updates
         patterns: ["*"]
-        exclude-patterns: ["sigstore-*"]
         update-types: ["minor", "patch"]
       cargo-security:
         applies-to: security-updates

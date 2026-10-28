@@ -175,13 +175,26 @@ impl Signer {
     }
 }
 
-/// Binaries' verified provenance: who signed the statement naming them, and when Rekor logged
-/// it.
+/// Binaries' verified provenance: who signed the statement naming them, when, and every file
+/// the statement names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proof {
     pub signer: Signer,
-    /// Rekor's integrated time, RFC 3339.
+    /// When it was signed, RFC 3339: the earliest authenticated time Sigstore's verification
+    /// used (Rekor's integrated time, or a timestamp authority's).
     pub logged: Option<String>,
+    /// The same, in Unix seconds.
+    pub logged_secs: Option<i64>,
+    /// Each file the verified statement names, with its SHA-256 (lowercase hex): the release's
+    /// other files can be checked against it too ([`Proof::digest_of`]).
+    pub subjects: Vec<(String, String)>,
+}
+
+impl Proof {
+    /// The SHA-256 the verified statement gives `name`, if it names it.
+    pub fn digest_of(&self, name: &str) -> Option<&str> {
+        self.subjects.iter().find(|(n, _)| n == name).map(|(_, d)| d.as_str())
+    }
 }
 
 /// `built by <identity>, run <url>, logged <time>`: what `update` says.
@@ -225,6 +238,15 @@ pub fn check_statement(payload: &[u8], files: &[(&str, &str)]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The `(name, sha256)` of each subject of an in-toto statement that has both. Pure.
+fn subjects(payload: &[u8]) -> Vec<(String, String)> {
+    let v: Value = serde_json::from_slice(payload).unwrap_or_default();
+    let list = v.get("subject").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    list.iter()
+        .filter_map(|s| Some((s.get("name")?.as_str()?.to_string(), s.pointer("/digest/sha256")?.as_str()?.to_ascii_lowercase())))
+        .collect()
 }
 
 /// The bundles in the attestations API's answer (`{"attestations": [{"bundle": …}, …]}`). Pure.
@@ -276,7 +298,13 @@ fn verify_parsed(verifier: &Verifier, bundle: &Bundle, expected: &Expected, file
         return Err(format!("its payload is {}, not {IN_TOTO_PAYLOAD}", envelope.payload_type));
     }
     check_statement(envelope.payload.as_bytes(), files)?;
-    Ok(Proof { signer, logged: r.integrated_time().map(|t| t.to_string()) })
+    let signed = r.verified_timestamps().iter().min();
+    Ok(Proof {
+        signer,
+        logged: signed.map(|t| t.to_string()),
+        logged_secs: signed.map(|t| t.as_second()),
+        subjects: subjects(envelope.payload.as_bytes()),
+    })
 }
 
 /// Where attestations come from: GitHub ([`GitHub`]), or canned ones in tests.

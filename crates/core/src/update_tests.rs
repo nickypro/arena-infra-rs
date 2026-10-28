@@ -146,7 +146,14 @@ async fn check_reads_the_latest_release_and_what_it_brings() {
     let api = serve(vec![canned(200, "application/json", &release_json(&base, &["CHANGELOG.md"]).to_string())]);
     let c = check(&test_client(), &api.base, Version([2, 0, 261026, 1200]), OLD_LOG).await.unwrap();
     assert!(c.newer && c.changes.contains("Action needed:") && c.changes.contains("## 2026-10-27"), "{}", c.changes);
+    assert_eq!(c.changelog_sha256.as_deref(), Some(sha256_hex(NEW_LOG.as_bytes()).as_str()), "kept for the attestation's check");
     assert_eq!(*srv.requests.lock().unwrap(), ["GET /dl/CHANGELOG.md HTTP/1.1"]);
+
+    let escaped = NEW_LOG.replace("restart long-running", "\x1b[2Jrestart long-running");
+    let srv = serve(vec![canned(200, "text/plain", &escaped)]);
+    let api = serve(vec![canned(200, "application/json", &release_json(&srv.base, &["CHANGELOG.md"]).to_string())]);
+    let c = check(&test_client(), &api.base, Version([2, 0, 261026, 1200]), OLD_LOG).await.unwrap();
+    assert!(c.changes.contains("⚠ ?[2Jrestart long-running") && !c.changes.contains('\x1b'), "{}", c.changes);
 
     let api = serve(vec![canned(200, "application/json", &release_json("http://unused", &[]).to_string())]);
     let c = check(&test_client(), &api.base, Version([2, 0, 261026, 1200]), OLD_LOG).await.unwrap();
@@ -293,6 +300,11 @@ async fn an_unproven_download_is_never_written_or_run() {
         assert!(e.starts_with(&said) && e.ends_with("— not installed"), "{said}: {e}");
         assert_eq!(names_in(&dir), ["arena"], "nothing staged, nothing run");
     }
+    // The pinned `arena` served under both names (SHA256SUMS made to match): one pin unused.
+    let (_srv, release) = release_server(&arena, &arena, (&arena, &arena));
+    let e = fetch(&test_client(), &release, T, &dir, &pinned(&["new tui", &arena])).await.unwrap_err();
+    assert!(e.starts_with(&format!("arena-tui-{T} is the same file as arena-{T}")), "{e}");
+    assert_eq!(names_in(&dir), ["arena"], "nothing staged, nothing run");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -315,8 +327,64 @@ fn skip_attestation_takes_both_binaries_sha256s() {
         assert!(e.starts_with("--skip-attestation takes ") && e.contains(said), "{bad:?}: {e}");
     }
     let pins = parse_pins(&v(&[&a, &b])).unwrap();
-    assert_eq!(check_pinned(&pins, "arena-x", &"b".repeat(64)), Ok(()));
-    assert!(check_pinned(&pins, "arena-x", &"c".repeat(64)).unwrap_err().starts_with("arena-x: its sha256 ccc"));
+    let (b, c) = ("b".repeat(64), "c".repeat(64));
+    assert_eq!(check_pinned(&pins, &[("arena-x", &b), ("arena-tui-x", &a)]), Ok(()));
+    assert!(check_pinned(&pins, &[("arena-x", &b), ("arena-tui-x", &c)]).unwrap_err().starts_with("arena-tui-x: its sha256 ccc"));
+    // One binary served under both names: both match a pin, but one pin is left unused.
+    let e = check_pinned(&pins, &[("arena-x", &b), ("arena-tui-x", &b)]).unwrap_err();
+    assert_eq!(e, format!("arena-tui-x is the same file as arena-x (sha256 {b}): the release serves one binary as both"));
+}
+
+#[test]
+fn a_version_is_its_commits_time() {
+    assert_eq!(Version::parse("2.0.000101.0000").unwrap().unix_secs(), 946684800, "years are 20YY: 2000-01-01");
+    assert_eq!(Version([2, 0, 261028, 1916]).unix_secs(), 1793214960, "2026-10-28T19:16:00Z");
+    assert_eq!(Version([2, 0, 240229, 2359]).unix_secs(), 1709251140, "a leap day");
+}
+
+/// The attestation is signed after CI passed on the commit, so not before the version (the
+/// commit's time; a day's slack for an author's clock that runs ahead).
+#[test]
+fn an_attestation_older_than_the_version_is_refused() {
+    let v = Version([2, 0, 261028, 1916]);
+    let t = v.unix_secs();
+    assert_eq!(check_fresh(v, Some(t + 585)), Ok(()), "the real one: signed 9¾ min after the commit");
+    assert_eq!(check_fresh(v, Some(t - CLOCK_SKEW_SECS)), Ok(()), "an author's clock a day fast");
+    let e = check_fresh(v, Some(t - CLOCK_SKEW_SECS - 1)).unwrap_err();
+    assert_eq!(e, "its attestation was signed 2026-10-27T19:15:59Z, before 2.0.261028.1916 was committed: an older build served as 2.0.261028.1916");
+    assert_eq!(check_fresh(v, None), Err("its attestation has no verified time".into()));
+}
+
+fn proof_naming(subjects: &[(&str, &str)]) -> attest::Proof {
+    attest::Proof {
+        signer: attest::Signer::default(),
+        logged: None,
+        logged_secs: None,
+        subjects: subjects.iter().map(|(n, d)| (n.to_string(), d.to_string())).collect(),
+    }
+}
+
+/// The changelog is trusted only as far as the attestation goes: named with its digest
+/// (verified), named with another (forged after the build: stop), or not named (older releases).
+#[test]
+fn the_changelog_is_checked_against_the_attestation_when_it_names_one() {
+    let (sha, other) = ("a".repeat(64), "b".repeat(64));
+    let named = proof_naming(&[("arena-x", "c"), ("CHANGELOG.md", &sha)]);
+    assert_eq!(changelog_provenance(Some(&named), Some(&sha)), Ok("verified: the attestation names this CHANGELOG.md"));
+    assert_eq!(changelog_provenance(Some(&named), Some(&sha.to_ascii_uppercase())), Ok("verified: the attestation names this CHANGELOG.md"));
+    let e = changelog_provenance(Some(&named), Some(&other)).unwrap_err();
+    assert!(e.starts_with(&format!("the release's CHANGELOG.md (sha256 {other}) isn't the one its attestation names")) && e.ends_with("not installed"), "{e}");
+    let older = proof_naming(&[("arena-x", "c")]);
+    assert_eq!(changelog_provenance(Some(&older), Some(&sha)), Ok("not covered by this release's attestation"));
+    assert_eq!(changelog_provenance(None, Some(&sha)), Ok("not verified: --skip-attestation"));
+    assert_eq!(changelog_provenance(Some(&named), None), Ok("no changelog to check"));
+}
+
+#[test]
+fn release_text_loses_its_control_characters() {
+    assert_eq!(printable("## x\n- a\tb\n"), "## x\n- a\tb\n");
+    assert_eq!(printable("\x1b]0;pwned\x07red \x1b[31mtext\r\n"), "?]0;pwned?red ?[31mtext?\n");
+    assert_eq!(printable("é ⚠ ok"), "é ⚠ ok");
 }
 
 /// A directory the update can't write is refused with what to do, before anything changes.
