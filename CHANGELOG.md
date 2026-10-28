@@ -17,12 +17,12 @@ earlier).
 ## 2026-10-28 · Dashboard: rows at once, `D` checks all, graphs before PROGRESS
 - The pods show as soon as they're listed; GPU stats, details and balances fill in after. The
   screen used to say `loading…` until every pod had been read over SSH.
-- **`D`** deep-checks every running pod it has read and found no one using. A second `D`
-  confirms, and checks only the pods the first one counted. Busy pods (any GPU with a process,
-  ≥ 10% utilization or over 1 GiB of memory) are named and left out, as are pods not read yet
-  (or whose read failed) and CPU-only boxes.
-- A question to `?` shows a spinner and its seconds at the front of the footer until it's
-  answered.
+- **`D`** deep-checks every running pod whose GPUs it has read and found no one using. A second
+  `D` confirms, and checks only the pods the first one counted. Busy pods (any GPU with a
+  process, over 5% utilization or over 1 GiB of memory) are named and left out; so are pods not
+  read yet, pods whose GPUs couldn't be read, and CPU-only boxes.
+- A question to `?` shows a spinner and its seconds in the footer until it's answered (after
+  a notice, if one is up).
 - The graphs come before PROGRESS, which only shows when `PROGRESS_CMD` is set. A CPU-only box
   (Hetzner) graphs its CPU and RAM, in magenta and blue.
 - In HEALTH, a pass older than 26 hours is grey (a daily cron's drift kept).

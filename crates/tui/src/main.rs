@@ -1340,9 +1340,7 @@ async fn run(
                         };
                         let armed = ui.deep_all_armed.take().filter(|(t, _)| t.elapsed() < DEEP_ALL_CONFIRM);
                         let skipped = skipped_words(&skipped);
-                        if let Some((_, named)) = &armed {
-                            pods.retain(|p| named.contains(&mark_key(p)));
-                        }
+                        pods = deep_all_confirm(pods, armed.as_ref().map(|(_, named)| named));
                         if pods.is_empty() {
                             shared.lock().unwrap().notify(format!("nothing to deep-check{skipped}"), false);
                         } else if armed.is_some() {
@@ -2006,23 +2004,27 @@ const DEEP_ALL_CONFIRM: Duration = Duration::from_secs(5);
 /// notebook cells sits at 0% utilization. An idle GPU shows a few MiB, a few hundred at most.
 const BUSY_GPU_MEM_MB: u32 = 1024;
 
-/// What `D` deep-checks: every running pod it has read and found no one using. A deep check
-/// loads the GPUs for about a minute, and on a busy one it reads as a failure, so it leaves out:
-/// - **busy** pods: any GPU with a compute process, at 10% utilization or more, or holding more
-///   than [`BUSY_GPU_MEM_MB`] (any GPU, not the mean: one busy GPU of four is a busy pod);
-/// - **unread** ones: no metrics yet (the first refresh's early paint) or the last read failed —
-///   a pod too loaded to answer must not look idle;
+/// What `D` deep-checks: every running pod whose GPUs it has read and found no one using. A deep
+/// check loads the GPUs for about a minute, and on a busy one it reads as a failure, so it leaves
+/// out:
+/// - **busy** pods: any GPU with a compute process, over the reaper's idle line
+///   ([`arena_core::idle::IDLE_GPU_PCT`]) or holding more than [`BUSY_GPU_MEM_MB`] — any GPU, not
+///   the mean: one busy GPU of four is a busy pod;
+/// - **unread** ones: no metrics yet (the first refresh's early paint);
+/// - **unreadable** ones: the read failed, or it found no GPUs or a GPU without its utilization
+///   and memory (a stalled `nvidia-smi`) — a pod too loaded to answer must not look idle. `d`
+///   checks one of those on purpose;
 /// - **CPU-only** boxes ([`Pod::cpu_only`]): a deep check there always fails.
 ///
-/// A GPU pod whose read worked but found no GPU (a broken `nvidia-smi`) is checked: that is what
-/// the check is for. The ones left out come back to be said. Pure.
+/// The ones left out come back to be said. Pure.
 fn deep_all_plan(pods: &[Pod], metrics: &HashMap<String, PodMetrics>) -> (Vec<Pod>, Skipped) {
     let mut check = Vec::new();
     let mut skipped = Skipped::default();
     for p in pods.iter().filter(|p| p.status.eq_ignore_ascii_case("RUNNING")) {
-        match metrics.get(&p.name).filter(|m| m.error.is_none()) {
+        match metrics.get(&p.name) {
             _ if p.cpu_only() => skipped.no_gpu += 1,
             None => skipped.unread += 1,
+            Some(m) if !gpus_read(m) => skipped.unreadable += 1,
             Some(m) if gpu_busy(m) => skipped.busy.push(p.name.clone()),
             Some(_) => check.push(p.clone()),
         }
@@ -2030,23 +2032,44 @@ fn deep_all_plan(pods: &[Pod], metrics: &HashMap<String, PodMetrics>) -> (Vec<Po
     (check, skipped)
 }
 
-/// Whether any of a pod's GPUs is in use: a compute process, ≥ 10% utilization, or more than
-/// [`BUSY_GPU_MEM_MB`] of memory taken.
-fn gpu_busy(m: &PodMetrics) -> bool {
-    !m.gpu_procs.is_empty()
-        || m.gpus.iter().any(|g| g.util_pct.is_some_and(|u| u >= 10) || g.mem_used_mb.is_some_and(|u| u > BUSY_GPU_MEM_MB))
+/// Whether a read of a pod's GPUs worked: no error, at least one GPU, and every GPU's
+/// utilization and memory read.
+fn gpus_read(m: &PodMetrics) -> bool {
+    m.error.is_none() && !m.gpus.is_empty() && m.gpus.iter().all(|g| g.util_pct.is_some() && g.mem_used_mb.is_some())
 }
 
-/// The pods `D` leaves out: the busy ones by name, and how many weren't read or have no GPU.
+/// Whether any of a pod's GPUs is in use: a compute process, utilization over
+/// [`arena_core::idle::IDLE_GPU_PCT`] (the reaper's line), or more than [`BUSY_GPU_MEM_MB`] of
+/// memory taken.
+fn gpu_busy(m: &PodMetrics) -> bool {
+    !m.gpu_procs.is_empty()
+        || m.gpus.iter().any(|g| {
+            g.util_pct.is_some_and(|u| u > arena_core::idle::IDLE_GPU_PCT) || g.mem_used_mb.is_some_and(|u| u > BUSY_GPU_MEM_MB)
+        })
+}
+
+/// What `D`'s second press checks: the pods `plan` still qualifies, kept to those the first press
+/// named (`armed`, by [`mark_key`]) — a pod a refresh made eligible in between was never shown to
+/// the operator. Unarmed (the first press, or the window lapsed): the plan as it is. Pure.
+fn deep_all_confirm(plan: Vec<Pod>, armed: Option<&std::collections::HashSet<String>>) -> Vec<Pod> {
+    match armed {
+        Some(named) => plan.into_iter().filter(|p| named.contains(&mark_key(p))).collect(),
+        None => plan,
+    }
+}
+
+/// The pods `D` leaves out: the busy ones by name, and how many weren't read yet, couldn't be
+/// read or have no GPU.
 #[derive(Debug, Default, PartialEq)]
 struct Skipped {
     busy: Vec<String>,
     unread: usize,
+    unreadable: usize,
     no_gpu: usize,
 }
 
-/// ` — skipping 2 busy: apple, bloom; 3 not read yet; 1 without a GPU` (at most five named),
-/// or nothing.
+/// ` — skipping 2 busy: apple, bloom; 3 not read yet; 1 unreadable; 1 without a GPU` (at most
+/// five named), or nothing.
 fn skipped_words(s: &Skipped) -> String {
     let mut parts = Vec::new();
     if !s.busy.is_empty() {
@@ -2058,6 +2081,9 @@ fn skipped_words(s: &Skipped) -> String {
     }
     if s.unread > 0 {
         parts.push(format!("{} not read yet", s.unread));
+    }
+    if s.unreadable > 0 {
+        parts.push(format!("{} whose GPUs couldn't be read", s.unreadable));
     }
     if s.no_gpu > 0 {
         parts.push(format!("{} without a GPU", s.no_gpu));
@@ -4042,9 +4068,9 @@ deep_check_end=1
         }
     }
 
-    /// `D` checks every running pod it has read and found idle: busy ones (a compute process,
-    /// any GPU at ≥ 10% or holding > 1 GiB) are named, unread and CPU-only ones counted; a
-    /// stopped pod isn't checked or named. A GPU pod whose read found no GPU is checked.
+    /// `D` checks every running pod whose GPUs it has read and found idle: busy ones (a compute
+    /// process, any GPU over 5% or holding > 1 GiB) are named; unread, unreadable and CPU-only
+    /// ones counted; a stopped pod isn't checked or named.
     #[test]
     fn deep_all_checks_running_pods_no_one_is_using() {
         use arena_core::metrics::{GpuProc, GpuStat};
@@ -4081,20 +4107,28 @@ deep_check_end=1
             // A model held between notebook cells: 0% but 9 GB in use.
             ("devtest-hotel", m(vec![gpu(0), held], 0)),
             ("devtest-india", failed),
-            // Read, but `nvidia-smi` found no GPU: what a deep check is for.
+            // Read, but `nvidia-smi` gave nothing (stalled, or a driver mismatch under a running
+            // job): no evidence it's idle.
             ("devtest-juliet", PodMetrics { cpu_pct: Some(5), ..Default::default() }),
+            // A GPU whose utilization didn't come back.
+            ("devtest-kilo", m(vec![GpuStat { util_pct: None, mem_used_mb: Some(3), ..Default::default() }], 0)),
+            // Exactly the reaper's idle line is idle.
+            ("devtest-lima", m(vec![gpu(5)], 0)),
         ]
         .into_iter()
         .map(|(n, m)| (n.to_string(), m))
         .collect();
+        let mut pods = pods.to_vec();
+        pods.extend([pod("kilo", "runpod", "k", 11, Some(22)), pod("lima", "runpod", "l", 12, Some(22))]);
         let (check, skipped) = deep_all_plan(&pods, &metrics);
-        assert_eq!(check.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["devtest-alpha", "devtest-juliet"]);
+        assert_eq!(check.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["devtest-alpha", "devtest-lima"]);
         let busy = ["devtest-bravo", "devtest-charlie", "devtest-hotel"].map(String::from).to_vec();
-        // foxtrot (no metrics yet) and india (its read failed) aren't read; echo and golf have no GPU.
-        assert_eq!(skipped, Skipped { busy, unread: 2, no_gpu: 2 });
+        // foxtrot has no metrics yet; india's read failed, juliet's and kilo's GPUs weren't read;
+        // echo and golf have no GPU.
+        assert_eq!(skipped, Skipped { busy, unread: 1, unreadable: 3, no_gpu: 2 });
         assert_eq!(
             skipped_words(&skipped),
-            " — skipping 3 busy: devtest-bravo, devtest-charlie, devtest-hotel; 2 not read yet; 2 without a GPU"
+            " — skipping 3 busy: devtest-bravo, devtest-charlie, devtest-hotel; 1 not read yet; 3 whose GPUs couldn't be read; 2 without a GPU"
         );
         assert_eq!(skipped_words(&Skipped::default()), "");
         let many = Skipped { busy: (0..7).map(|i| format!("p{i}")).collect(), ..Default::default() };
@@ -4102,7 +4136,36 @@ deep_check_end=1
         // The early paint: listed, nothing read — `D` has nothing to check.
         let (check, skipped) = deep_all_plan(&pods, &HashMap::new());
         assert!(check.is_empty());
-        assert_eq!(skipped_words(&skipped), " — skipping 7 not read yet; 2 without a GPU");
+        assert_eq!(skipped_words(&skipped), " — skipping 9 not read yet; 2 without a GPU");
+    }
+
+    /// `D`'s second press checks what the first named and still qualifies: a pod a refresh made
+    /// eligible in between is left out, one that turned busy (gone from the plan) too.
+    #[test]
+    fn the_second_d_checks_only_what_the_first_named() {
+        let [alpha, bravo, charlie] = [("alpha", "a"), ("bravo", "b"), ("charlie", "c")].map(|(n, id)| pod(n, "runpod", id, 1, Some(22)));
+        let named: std::collections::HashSet<String> = [&alpha, &bravo].map(mark_key).into_iter().collect();
+        // Since the first press: bravo turned busy (out of the plan), charlie became idle.
+        let plan = vec![alpha.clone(), charlie.clone()];
+        let names = |v: Vec<Pod>| v.into_iter().map(|p| p.name).collect::<Vec<_>>();
+        assert_eq!(names(deep_all_confirm(plan.clone(), Some(&named))), ["devtest-alpha"]);
+        assert_eq!(names(deep_all_confirm(plan, None)), ["devtest-alpha", "devtest-charlie"], "unarmed: the plan");
+    }
+
+    /// A notice (`D`'s prompt) leads the footer, before a question's spinner line; one
+    /// separator between each part.
+    #[test]
+    fn a_notice_leads_the_footer_before_the_asking_line() {
+        let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let mut shared = Shared { ask_running: Some("asking claude about devtest-alpha…".into()), ask_since: Some(Instant::now()), ..Default::default() };
+        let text = |s: &Shared| footer_hint(s, &ui, 10).spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let quiet = text(&shared);
+        assert!(quiet.starts_with(&format!("{} asking claude about devtest-alpha… 0s · ", spinner(Duration::ZERO))), "{quiet}");
+        shared.notify("D again to deep-check 2 running pods", false);
+        let t = text(&shared);
+        let rest = t.strip_prefix("D again to deep-check 2 running pods · ").unwrap_or_else(|| panic!("{t}"));
+        assert!(rest.contains("asking claude about devtest-alpha… 0s · [q] quit"), "{t}");
+        assert!(!t.contains("·  ·") && !t.contains("· ·"), "{t}");
     }
 
     /// The first refresh's early paint: the listed rows, no metrics yet, and a status that

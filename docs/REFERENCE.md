@@ -1800,14 +1800,14 @@ last good answer, with a footer warning.
 
 **`d`** deep-checks the cursor pod (or the marked set) **in the background** — no modal; the row
 says `checking`, the footer reports the tally when done, and the verdicts go to the same health
-cache `arena snapshot` reads. **`D`** deep-checks every running pod it has read and found no one using: the first
-press says how many and names the busy ones it leaves out (any GPU with a compute process, at
-10% or more, or holding over 1 GiB — a deep check loads the GPUs for about a minute and on a
-busy one reads as a failure), and counts those it leaves out as not read yet (no metrics so far,
-or the last read failed: a pod too loaded to answer must not look idle) or CPU-only (Hetzner, or
-0 GPUs listed: always a fail). A second `D` within 5 s starts the pods the first press counted
-that still qualify — never one a refresh added in between. A GPU pod whose `nvidia-smi` fails is
-still checked. In HEALTH, a pass older than 26 hours is grey: it says little about today (the
+cache `arena snapshot` reads. **`D`** deep-checks every running pod whose GPUs it has read and found no one using: the
+first press says how many and names the busy ones it leaves out (any GPU with a compute process,
+over 5% — the reaper's idle line — or holding over 1 GiB: a deep check loads the GPUs for about a
+minute and on a busy one reads as a failure), and counts those it leaves out as not read yet (no
+metrics so far), whose GPUs couldn't be read (the read failed, or `nvidia-smi` gave no GPU or no
+utilization: a pod too loaded to answer must not look idle — `d` checks one on purpose) or
+CPU-only (Hetzner, or 0 GPUs listed: always a fail). A second `D` within 5 s starts the pods the
+first press counted that still qualify — never one a refresh added in between. In HEALTH, a pass older than 26 hours is grey: it says little about today (the
 daily `cron install --health` keeps it fresh; the two hours absorb its drift). **`/`** marks pods with the CLI's selector syntax (`alpha..delta`,
 ids, `-x`/`!name`, `--on`, `--gpus`); a typo marks nothing and leaves the marks as they were, saying
 why in the footer; a valid one replaces the marks. Marks are per `provider:id` (a Vast and a Hetzner
