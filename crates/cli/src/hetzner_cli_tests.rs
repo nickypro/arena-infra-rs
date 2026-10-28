@@ -191,7 +191,7 @@ async fn the_server_type_flag_reaches_the_hetzner_create_body() {
         let specs = p.specs.lock().unwrap().clone();
         assert_eq!(specs.iter().map(|s| (s.name.as_str(), s.server_type.as_deref())).collect::<Vec<_>>(), [(name, Some("cpx42"))]);
         assert_eq!(real.preview_create_body(&specs[0]).unwrap()["server_type"], "cpx42");
-        assert_eq!(real.describe(&specs[0]), "cpx42 CPU VM, image ubuntu-24.04, location nbg1");
+        assert_eq!(real.describe(&specs[0]), "cpx42 CPU VM, image ubuntu-24.04, location any (nearest first, the next when one has no room)");
     }
     // Without the flag: the configured type, as before.
     let p = Sizer::new("hetzner");
@@ -230,7 +230,7 @@ fn config_check_shows_the_hetzner_key_name_up_front() {
     let rows = hetzner_rows(&Config::parse("MACHINE_NAME_PREFIX=arena9\nHETZNER_API_KEY=x\n")).join("\n");
     for want in [
         "  · HETZNER_SERVER_TYPE          cx23 (default) — `pods create/up --server-type` overrides it",
-        "  · HETZNER_LOCATION             nbg1 (default)",
+        "  · HETZNER_LOCATION             any (nearest first, the next when one has no room) (default)",
         "  · HETZNER_IMAGE                ubuntu-24.04 (default)",
         "  · HETZNER_SSH_KEY              arena9 (default: MACHINE_NAME_PREFIX)",
         "every new server gets SSH key `arena9`: it must be in the Hetzner project under that name — checked at create \

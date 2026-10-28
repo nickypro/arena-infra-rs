@@ -916,6 +916,7 @@ pub fn parse_instance(v: &Value, now: u64) -> Pod {
         volume_gb: None,
         delete_protected: None,
         created_at: time_of(v, "created_at"),
+        started_at: None,
         identity,
         status_detail: s("status_details").map(str::trim).filter(|d| !d.is_empty()).map(String::from),
     }

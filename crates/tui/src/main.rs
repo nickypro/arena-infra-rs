@@ -72,7 +72,7 @@ use arena_core::naming;
 use arena_core::{Config, Pod, PodSpec};
 
 use prefs::Prefs;
-use arena_core::status::display_status;
+use arena_core::status::pod_status;
 use state::{
     action_summary, capture_details, dashboard_snapshot, details_due, display_name, health_cell, mark_key, marked_pods,
     marked_set_token, merge_details, overlay_details, partial_notice, proxy_cell, proxy_detail,
@@ -151,9 +151,9 @@ enum Mode {
     Working(String),
     /// The outcome of the last action; any key dismisses (then we nudge a refresh).
     Result(String),
-    /// `?`: the question about the cursor pod or the marked set, prefilled; Enter asks `ai` in
-    /// the background (`ask.rs`).
-    Ask { scope: InputScope, value: String, ai: arena_core::ask::Ai },
+    /// `?`: the question about the cursor pod or the marked set, prefilled; Enter asks `pick`'s AI
+    /// in the background, Tab switches to the other (`ask.rs`).
+    Ask { scope: InputScope, value: String, pick: arena_core::ask::Pick },
     /// An answer to a `?` question: scrollable; Esc closes.
     Answer(ask::Answer),
 }
@@ -280,6 +280,9 @@ struct Ui {
     last_table: std::cell::Cell<(Rect, usize)>,
     /// What answers `?` ([`ask::real_asker`]; a fake in tests).
     asker: ask::Asker,
+    /// The AI last picked in `?` (Tab, or a question asked): the next `?` opens with it.
+    /// `None`: `ASK_AI`'s.
+    ask_ai: Option<arena_core::ask::Ai>,
 }
 
 impl Ui {
@@ -384,6 +387,7 @@ async fn main() -> Result<()> {
         result_scroll: 0,
         result_max: std::cell::Cell::new(0),
         last_table: std::cell::Cell::new((Rect::default(), 0)),
+        ask_ai: None,
     };
 
     dashboard(&shared, &provider, &interval, &nudge, &details_wanted, ui).await
@@ -2504,7 +2508,7 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         Mode::Select { value } => render_select(f, value),
         Mode::Working(msg) => render_result(f, msg, 0, &ui.result_max),
         Mode::Result(msg) => render_result(f, msg, ui.result_scroll, &ui.result_max),
-        Mode::Ask { scope, value, ai } => ask::render_input(f, shared, ui, scope, value, *ai),
+        Mode::Ask { scope, value, pick } => ask::render_input(f, shared, ui, scope, value, pick),
         Mode::Answer(answer) => ask::render_answer(f, answer, ui.result_scroll, &ui.result_max),
         _ => {}
     }
@@ -2748,8 +2752,10 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 None => "-".into(),
             };
             // RUNNING-but-unreachable reads as "init" (still coming up), in yellow.
-            let status_label = display_status(&p.status, m.map(|m| m.error.is_none()));
-            let status_cell = if status_label == "init" {
+            let status_label = pod_status(p, m.map(|m| m.error.is_none()));
+            let status_cell = if status_label == "no-ssh" {
+                Cell::from(status_label).style(Style::default().fg(Color::Red))
+            } else if status_label == "init" {
                 Cell::from(status_label).style(Style::default().fg(Color::Yellow))
             } else {
                 Cell::from(status_label)
@@ -3075,7 +3081,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let facts = format!(
         "status:   {}\ngpu:      {}\nendpoint: {}\nproxy:    {}\ncost:     {}\nmaint:    {}\nhealth:   {}\nreason:   {}\ndisk:     {}\nhost:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\ntokens:   HF {}   Claude-Code {}\nprogress: {}",
         {
-            let status = display_status(&pod.status, m.map(|m| m.error.is_none()));
+            let status = pod_status(pod, m.map(|m| m.error.is_none()));
             if arena_core::lock::is_locked(pod) {
                 // One row (the facts block has a fixed height): `pods unlock` is in the docs.
                 format!("{status} · locked (stop/restart/terminate refused)")
@@ -3246,7 +3252,7 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         Mode::Select { .. } => "type a selection  [enter] mark  [esc] cancel",
         Mode::Working(_) => "working… (background) — please wait",
         Mode::Result(_) => "[↑↓] scroll  ·  [any other key] dismiss",
-        Mode::Ask { .. } => "type the question  [enter] ask  [ctrl-u] clear  [esc] cancel",
+        Mode::Ask { .. } => "type the question  [enter] ask  [tab] the other AI  [ctrl-u] clear  [esc] cancel",
         Mode::Answer(_) => "[↑↓ PgUp PgDn] scroll  [esc] close",
     };
     match shared.notice.as_ref().filter(|n| n.at.elapsed() < NOTICE_FOR) {
@@ -3798,20 +3804,22 @@ deep_check_end=1
             result_max: std::cell::Cell::new(0),
             last_table: std::cell::Cell::new((Rect::default(), 0)),
             asker: fake_asker(Arc::default()),
+            ask_ai: None,
         }
     }
 
-    /// Every `?` question a [`fake_asker`] got: the pods' names, the question, the AI.
-    type Asked = Arc<Mutex<Vec<(Vec<String>, String, arena_core::ask::Ai)>>>;
+    /// Every `?` question a [`fake_asker`] got: the pods' names, the question, the AI and how.
+    type Asked = Arc<Mutex<Vec<(Vec<String>, String, arena_core::ask::Pick)>>>;
 
     /// An asker that records each question and answers `ANSWER to <question>` at once — never
     /// a real AI.
     fn fake_asker(log: Asked) -> ask::Asker {
-        Arc::new(move |pods: Vec<Pod>, question: String, ai: arena_core::ask::Ai| {
+        Arc::new(move |pods: Vec<Pod>, question: String, pick: arena_core::ask::Pick| {
             let log = log.clone();
             Box::pin(async move {
-                log.lock().unwrap().push((pods.iter().map(|p| p.name.clone()).collect(), question.clone(), ai));
-                ask::Answer { title: format!("{} · test", ai.name()), text: format!("ANSWER to {question}") }
+                let title = format!("{} · test", pick.label());
+                log.lock().unwrap().push((pods.iter().map(|p| p.name.clone()).collect(), question.clone(), pick));
+                ask::Answer { title, text: format!("ANSWER to {question}") }
             })
         })
     }
@@ -5270,7 +5278,7 @@ deep_check_end=1
     /// lists the key.
     #[tokio::test]
     async fn question_mark_asks_in_the_background_and_shows_the_answer() {
-        use arena_core::ask::Ai;
+        use arena_core::ask::{Ai, Pick};
         let shared = Arc::new(Mutex::new(fixture_shared()));
         let asked: Asked = Arc::default();
         let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
@@ -5297,10 +5305,11 @@ deep_check_end=1
 
         // `?`: the input, prefilled, saying where the data goes.
         assert!(ask::key(&mut ui, &shared, KeyCode::Char('?'), none));
-        let Mode::Ask { value, ai, .. } = &ui.mode else { panic!("{:?}", ui.mode) };
-        assert_eq!((value.as_str(), *ai), ("What is the current state of this pod? Is anything wrong or needing attention?", Ai::Claude));
+        let Mode::Ask { value, pick, .. } = &ui.mode else { panic!("{:?}", ui.mode) };
+        assert_eq!((value.as_str(), pick), ("What is the current state of this pod? Is anything wrong or needing attention?", &Pick::plain(Ai::Claude)));
         let text = screen(&ui, 140, 40).join("\n");
-        assert!(text.contains("ask claude about") && text.contains("goes") && text.contains("to Anthropic with no tools"), "{text}");
+        assert!(text.contains("ask claude about") && text.contains("keys masked, to Anthropic with no tools"), "{text}");
+        assert!(text.contains("[tab] codex instead"), "{text}");
         assert!(screen(&ui, 240, 40).pop().unwrap().contains("[enter] ask"));
         ask::key(&mut ui, &shared, KeyCode::Char('u'), KeyModifiers::CONTROL);
         for c in "is it busy?x".chars() {
@@ -5318,7 +5327,7 @@ deep_check_end=1
         assert!(footer.contains(&status) && footer.contains("[q] quit"), "{footer}");
         answered().await;
         assert!(shared.lock().unwrap().ask_running.is_none());
-        assert_eq!(asked.lock().unwrap().clone(), [(vec![cursor.clone()], "is it busy?".to_string(), Ai::Claude)]);
+        assert_eq!(asked.lock().unwrap().clone(), [(vec![cursor.clone()], "is it busy?".to_string(), Pick::plain(Ai::Claude))]);
 
         // The answer opens; it scrolls; Esc closes it.
         ask::land(&mut ui, &shared);
@@ -5380,7 +5389,7 @@ deep_check_end=1
     /// cursor pod alone is asked about whatever it is.
     #[tokio::test]
     async fn question_mark_keeps_a_marked_set_to_the_cohort() {
-        use arena_core::ask::Ai;
+        use arena_core::ask::{Ai, Pick};
         let c = cfg("");
         let mut pods = fixture_pods();
         let mut staff = pod("x", "runpod", "rp9", 9, Some(22009));
@@ -5413,7 +5422,7 @@ deep_check_end=1
         ask::key(&mut ui, &shared, KeyCode::Enter, none);
         assert_eq!(shared.lock().unwrap().ask_running.as_deref(), Some("asking claude about devtest-alpha (1 non-cohort pod left out)…"));
         answered().await;
-        assert_eq!(asked.lock().unwrap().last().cloned(), Some((vec!["devtest-alpha".to_string()], "What is the current state of this pod? Is anything wrong or needing attention?".to_string(), Ai::Claude)));
+        assert_eq!(asked.lock().unwrap().last().cloned(), Some((vec!["devtest-alpha".to_string()], "What is the current state of this pod? Is anything wrong or needing attention?".to_string(), Pick::plain(Ai::Claude))));
 
         // Only non-cohort pods marked: nothing opens, and the footer says why.
         ui.marked = [key_of("jamesbox")].into_iter().collect();
@@ -5438,7 +5447,7 @@ deep_check_end=1
     async fn a_question_whose_task_panics_frees_question_mark() {
         let shared = Arc::new(Mutex::new(fixture_shared()));
         let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
-        ui.asker = Arc::new(|_pods: Vec<Pod>, _question: String, _ai: arena_core::ask::Ai| -> std::pin::Pin<Box<dyn std::future::Future<Output = ask::Answer> + Send>> {
+        ui.asker = Arc::new(|_pods: Vec<Pod>, _question: String, _pick: arena_core::ask::Pick| -> std::pin::Pin<Box<dyn std::future::Future<Output = ask::Answer> + Send>> {
             Box::pin(async {
                 tokio::task::yield_now().await;
                 let nothing: Option<ask::Answer> = std::hint::black_box(None);
@@ -5459,6 +5468,52 @@ deep_check_end=1
         assert!(shared.lock().unwrap().ask_answer.is_none());
         assert!(ask::key(&mut ui, &shared, KeyCode::Char('?'), none));
         assert!(matches!(ui.mode, Mode::Ask { .. }), "{:?}", ui.mode);
+    }
+
+    /// Tab in the question switches to the other AI as the config sets it up (its model and
+    /// effort shown and asked with), and the next `?` opens with it; a malformed setting for the
+    /// other AI keeps the one there and says why.
+    #[tokio::test]
+    async fn tab_switches_the_ai_and_the_next_question_keeps_it() {
+        use arena_core::ask::{Ai, Effort, Pick};
+        let shared = Arc::new(Mutex::new(fixture_shared()));
+        let asked: Asked = Arc::default();
+        let mut ui = ui(cfg("ASK_CODEX_MODEL=gpt-6-luna\nASK_CODEX_EFFORT=low\n"), Arc::new(FakeRemote::new()));
+        ui.asker = fake_asker(asked.clone());
+        let none = KeyModifiers::NONE;
+        let luna = Pick { ai: Ai::Codex, model: Some("gpt-6-luna".into()), effort: Some(Effort::Low) };
+        ask::key(&mut ui, &shared, KeyCode::Char('?'), none);
+        assert!(matches!(&ui.mode, Mode::Ask { pick, .. } if *pick == Pick::plain(Ai::Claude)), "{:?}", ui.mode);
+        assert!(ask::key(&mut ui, &shared, KeyCode::Tab, none));
+        assert!(matches!(&ui.mode, Mode::Ask { pick, .. } if *pick == luna), "{:?}", ui.mode);
+        let text = draw(140, 40, &shared.lock().unwrap(), &ui).join("\n");
+        assert!(text.contains("ask codex · gpt-6-luna · low effort about") && text.contains("to OpenAI") && text.contains("[tab] claude instead"), "{text}");
+        ask::key(&mut ui, &shared, KeyCode::Enter, none);
+        let cursor = shared.lock().unwrap().pods[ui.selected].name.clone();
+        assert_eq!(shared.lock().unwrap().ask_running.clone(), Some(format!("asking codex · gpt-6-luna · low effort about {cursor}…")));
+        for _ in 0..400 {
+            if shared.lock().unwrap().ask_answer.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(asked.lock().unwrap().last().map(|(_, _, p)| p.clone()), Some(luna.clone()));
+        ask::land(&mut ui, &shared);
+        assert!(draw(140, 40, &shared.lock().unwrap(), &ui).join("\n").contains("codex · gpt-6-luna · low effort · test"));
+        ask::key(&mut ui, &shared, KeyCode::Esc, none);
+
+        // The next `?` opens with codex; BackTab goes back.
+        ask::key(&mut ui, &shared, KeyCode::Char('?'), none);
+        assert!(matches!(&ui.mode, Mode::Ask { pick, .. } if *pick == luna), "{:?}", ui.mode);
+        ask::key(&mut ui, &shared, KeyCode::BackTab, none);
+        assert!(matches!(&ui.mode, Mode::Ask { pick, .. } if *pick == Pick::plain(Ai::Claude)), "{:?}", ui.mode);
+
+        // The other AI's effort malformed: Tab keeps claude and says why.
+        ui.cfg = cfg("ASK_CODEX_EFFORT=fast\n");
+        ask::key(&mut ui, &shared, KeyCode::Tab, none);
+        assert!(matches!(&ui.mode, Mode::Ask { pick, .. } if pick.ai == Ai::Claude), "{:?}", ui.mode);
+        let notice = shared.lock().unwrap().notice.clone().unwrap();
+        assert!(notice.error && notice.text.contains("ASK_CODEX_EFFORT must be low, medium, high, xhigh or max (got fast)"), "{}", notice.text);
     }
 
     /// `run` shows what the command printed — every line, not the last one (live: `nvidia-smi
@@ -5840,7 +5895,7 @@ deep_check_end=1
                 let lone = dir.join("lone");
                 tokio::spawn(async move {
                     let env = arena_core::ask::AiEnv { path: Some(on_path(&dir.join("bin"))), home: None, tmp: dir.clone(), vars: Vec::new() };
-                    let _ = arena_core::ask::ai::ask(arena_core::ask::Ai::Claude, "is it ok?", None, Duration::from_secs(120), &env).await;
+                    let _ = arena_core::ask::ai::ask(&arena_core::ask::Pick::plain(arena_core::ask::Ai::Claude), "is it ok?", Duration::from_secs(120), &env).await;
                 });
                 tokio::spawn(async move { arena_core::remote::run_local(lone.to_str().unwrap(), &[], "the rsync", Some(Duration::from_secs(120))).await });
                 // The loop, on a dead terminal: its thread never comes back.

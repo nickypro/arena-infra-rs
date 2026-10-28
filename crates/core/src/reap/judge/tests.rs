@@ -902,10 +902,22 @@ fn faults() -> Vec<Fault> {
     ]
 }
 
-/// Spec I4, `inv_ticket_iff_all_gates`: over every single fault, every pair, and 10⁶ seeded
+/// Spec I4, `inv_ticket_iff_all_gates`: over every single fault, every pair, and 10⁵ seeded
 /// random combinations of the gate inputs, a ticket is produced ⇔ every gate is favourable.
 #[test]
 fn inv_ticket_iff_all_gates() {
+    ticket_iff_all_gates(100_000);
+}
+
+/// [`inv_ticket_iff_all_gates`] over 10⁶ random combinations, about 100 s:
+/// `cargo test --release -p arena-core --lib -- --ignored inv_ticket_iff_all_gates_deep`.
+#[test]
+#[ignore = "10⁶ combinations, about 100 s"]
+fn inv_ticket_iff_all_gates_deep() {
+    ticket_iff_all_gates(1_000_000);
+}
+
+fn ticket_iff_all_gates(combinations: u32) {
     let base = bundle();
     assert!(try_ticket(&base).is_some(), "the favourable bundle must yield a ticket");
     let fs = faults();
@@ -932,7 +944,7 @@ fn inv_ticket_iff_all_gates() {
         z ^ (z >> 31)
     };
     let (mut with_ticket, mut without) = (0u32, 0u32);
-    for _ in 0..1_000_000 {
+    for _ in 0..combinations {
         let r = next();
         // Each fault on with probability 1/32 (so ~1 in 5 combinations is fault-free).
         let picked: Vec<usize> = (0..fs.len()).filter(|k| (r.rotate_left(*k as u32 * 5) & 31) == 0).collect();
@@ -948,7 +960,7 @@ fn inv_ticket_iff_all_gates() {
             without += 1;
         }
     }
-    assert!(with_ticket > 50_000 && without > 50_000, "{with_ticket} / {without}");
+    assert!(with_ticket > combinations / 20 && without > combinations / 20, "{with_ticket} / {without}");
 }
 
 /// Spec I6, `inv_vetoes_both_triggers`: locked, protected, lock-unknown, pinned, keep-marked,

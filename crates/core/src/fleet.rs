@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::metrics::normalize_gpu_name;
 use crate::pod::{Maintenance, Pod};
-use crate::status::{bills_hourly, short_status};
+use crate::status::bills_hourly;
 use crate::table::{self, Align};
 
 /// The billing currency symbol for a provider. Hetzner bills in EUR; RunPod and Vast in
@@ -90,6 +90,9 @@ pub const PROXY_ONLY: &str = "no public endpoint (RunPod ssh proxy only)";
 /// were still coming up), or it is up with no public endpoint ([`PROXY_ONLY`]). `None` =
 /// the plain case (still coming up) — callers keep their own wording. Pure.
 pub fn no_endpoint_reason(pod: &Pod) -> Option<String> {
+    if crate::status::endpoint_overdue(pod, crate::status::now_secs()) {
+        return Some("RUNNING for at least 10 minutes without a direct SSH endpoint — check the pod's networking".into());
+    }
     if pod.proxy_only {
         return Some(format!("{PROXY_ONLY} — its host has no public IP; terminate it and create it again"));
     }
@@ -305,7 +308,7 @@ pub const POD_ALIGN: [Align; 8] =
 /// reports the pod locked ([`crate::lock`]) — a glance at `pods list` says which pods refuse
 /// stop, restart and terminate. A backend that doesn't report a lock adds nothing.
 pub fn status_label(p: &Pod) -> String {
-    let s = short_status(&p.status);
+    let s = if crate::status::endpoint_overdue(p, crate::status::now_secs()) { "no-ssh".into() } else { crate::status::short_status(&p.status) };
     if crate::lock::is_locked(p) {
         format!("{s} locked")
     } else {
@@ -631,6 +634,7 @@ mod tests {
                 volume_gb: None,
                 delete_protected: None,
                 created_at: None,
+                started_at: None,
                 identity: None,
                 status_detail: None,
             },

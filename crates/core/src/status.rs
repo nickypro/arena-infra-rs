@@ -28,6 +28,25 @@ pub fn display_status(status: &str, reachable: Option<bool>) -> String {
     short_status(status)
 }
 
+/// Unix time for endpoint age checks. The comparison itself is pure for tests.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// A running pod that still has no direct SSH after ten minutes needs attention. An
+/// unknown start time stays unknown; creation time would mislabel a recent restart.
+pub fn endpoint_overdue(pod: &crate::pod::Pod, now: u64) -> bool {
+    pod.status.eq_ignore_ascii_case("RUNNING")
+        && (pod.ssh_ip.as_deref().is_none_or(|s| s.trim().is_empty()) || pod.ssh_port.is_none_or(|p| p == 0))
+        && pod.started_at.is_some_and(|t| now.saturating_sub(t) >= 600)
+}
+
+/// The pod-aware status shared by the list and dashboard.
+pub fn pod_status(pod: &crate::pod::Pod, reachable: Option<bool>) -> String {
+    if endpoint_overdue(pod, now_secs()) { "no-ssh".into() }
+    else { display_status(&pod.status, reachable) }
+}
+
 /// Whether a pod in this state holds — and is billed for — its compute: up, on its way up,
 /// or stuck while still allocated. The one definition behind the fleet cost total, the
 /// `$/H` column and `pods stop --all`'s selection, so they can't disagree.
@@ -161,5 +180,21 @@ mod tests {
         assert_eq!(display_status("RUNNING", None), "init");
         assert_eq!(display_status("EXITED", Some(false)), "exit");
         assert_eq!(display_status("pending", None), "prov");
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    #[test]
+    fn running_without_ssh_expires_from_last_start_not_creation() {
+        let mut p = crate::pod::Pod { status:"RUNNING".into(), created_at:Some(1), started_at:Some(1000), ..Default::default() };
+        assert!(!endpoint_overdue(&p, 1599)); assert!(endpoint_overdue(&p, 1600));
+        p.started_at = None; assert!(!endpoint_overdue(&p, 9999));
+        p.started_at = Some(20000); assert!(!endpoint_overdue(&p, 9999));
+        p.started_at = Some(1000); p.status = "EXITED".into(); assert!(!endpoint_overdue(&p, 9999));
+        p.status = "RUNNING".into(); p.ssh_ip = Some("203.0.113.1".into()); p.ssh_port = Some(22);
+        assert!(!endpoint_overdue(&p, 9999));
+        p.ssh_port = None; assert_eq!(pod_status(&p, None), "no-ssh");
     }
 }

@@ -304,6 +304,15 @@ fn tmux_panes() {
     assert_eq!(parse_probe(&r.render(), "N0NCE", r.since).unwrap().tmux_busy, None);
 }
 
+/// The tests' shorter waits (a 1 s window and GPU timeout, GPU samples back to back) are theirs
+/// only: unset, as `env -i` leaves them on a pod, the probe waits 10 s, 8 s and 1 s.
+#[test]
+fn the_probe_waits_its_real_times_unless_a_test_says() {
+    for line in ["WIN=${ARENA_PROBE_TEST_WINDOW:-10}\n", "GPU_T=${ARENA_PROBE_TEST_GPU_TIMEOUT:-8}\n", "GPU_GAP=${ARENA_PROBE_TEST_GPU_GAP:-1}\n", "sleep \"$GPU_GAP\"\n"] {
+        assert!(PROBE_SCRIPT.contains(line), "{line}");
+    }
+}
+
 /// The real script, run here under `sh` with stand-in commands (no network): framing, the key
 /// set, the checksum and each GPU case. `HOME` is a fresh temp dir; the test window is 1 s.
 #[cfg(target_os = "linux")]
@@ -334,6 +343,7 @@ fn the_script_runs_under_sh() {
             .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
             .arg(format!("HOME={}", home.display()))
             .arg("ARENA_PROBE_TEST_WINDOW=1")
+            .arg("ARENA_PROBE_TEST_GPU_GAP=0")
             .arg("ARENA_PROBE_TEST_GPU_TIMEOUT=1")
             .args(["sh", "-c", PROBE_SCRIPT, "arena-idle-probe", "T3ST", "-900", "", "none", "203.0.113.9 50000 10.0.0.2 22"])
             .output()
@@ -384,6 +394,7 @@ fn review_rs6_a_symlinked_home_is_scanned_not_skipped() {
         .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
         .arg(format!("HOME={}", link.display()))
         .arg("ARENA_PROBE_TEST_WINDOW=1")
+        .arg("ARENA_PROBE_TEST_GPU_GAP=0")
         .arg("ARENA_PROBE_TEST_GPU_TIMEOUT=1")
         .args(["sh", "-c", PROBE_SCRIPT, "arena-idle-probe", "T3ST", &format!("@{since}"), "", "runpod", "203.0.113.9 50000 10.0.0.2 22"])
         .output()
@@ -471,6 +482,7 @@ fn the_script_lists_processes_and_sweep_folders() {
         .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
         .arg(format!("HOME={}", link.display()))
         .arg("ARENA_PROBE_TEST_WINDOW=1")
+        .arg("ARENA_PROBE_TEST_GPU_GAP=0")
         .arg("ARENA_PROBE_TEST_GPU_TIMEOUT=1")
         .args(["sh", "-c", PROBE_SCRIPT, "arena-idle-probe", "T3ST", "-900", "", "runpod", "203.0.113.9 50000 10.0.0.2 22"])
         .output()
@@ -524,6 +536,7 @@ fn review_rr_idle_tmux_pane_is_not_a_who_login() {
         .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
         .arg(format!("HOME={}", home.display()))
         .arg("ARENA_PROBE_TEST_WINDOW=1")
+        .arg("ARENA_PROBE_TEST_GPU_GAP=0")
         .args(["sh", "-c", PROBE_SCRIPT, "arena-idle-probe", "T3ST", "-900", "", "hetzner", "203.0.113.9 50000 10.0.0.2 22"])
         .output()
         .unwrap();
@@ -550,6 +563,7 @@ fn review2_run_probe(bin: &std::path::Path, home: &std::path::Path, since: &str,
         .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
         .arg(format!("HOME={}", home.display()))
         .arg("ARENA_PROBE_TEST_WINDOW=1")
+        .arg("ARENA_PROBE_TEST_GPU_GAP=0")
         .arg("ARENA_PROBE_TEST_GPU_TIMEOUT=1")
         .args(["sh", "-c", PROBE_SCRIPT, "arena-idle-probe", "T3ST", since, "", provider, "203.0.113.9 50000 10.0.0.2 22"])
         .output()
@@ -711,6 +725,7 @@ fn w7_b_h0_empty_files_outside_the_home_hold_nothing_to_lose() {
             .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
             .arg(format!("HOME={}", home.display()))
             .arg("ARENA_PROBE_TEST_WINDOW=1")
+            .arg("ARENA_PROBE_TEST_GPU_GAP=0")
             .arg("ARENA_PROBE_TEST_GPU_TIMEOUT=1")
             .arg(format!("ARENA_PROBE_TEST_ROOTS={}", tmp.display()))
             .args(["sh", "-c", PROBE_SCRIPT, "arena-idle-probe", "T3ST", "-900", "", "hetzner", "203.0.113.9 50000 10.0.0.2 22"])
@@ -774,6 +789,7 @@ fn the_script_sees_outside_the_home_schedules_and_terminals() {
             .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
             .arg(format!("HOME={}", home.display()))
             .arg("ARENA_PROBE_TEST_WINDOW=1")
+            .arg("ARENA_PROBE_TEST_GPU_GAP=0")
             .arg("ARENA_PROBE_TEST_GPU_TIMEOUT=1")
             .arg(format!("ARENA_PROBE_TEST_ROOTS={roots}"))
             .arg(format!("ARENA_PROBE_TEST_SYSROOT={}", sys.display()))
@@ -826,6 +842,7 @@ fn the_script_sees_outside_the_home_schedules_and_terminals() {
             .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
             .arg(format!("HOME={}", home.display()))
             .arg("ARENA_PROBE_TEST_WINDOW=1")
+            .arg("ARENA_PROBE_TEST_GPU_GAP=0")
             .arg("ARENA_PROBE_TEST_GPU_TIMEOUT=1")
             .arg("ARENA_PROBE_TEST_ROOTS=")
             .arg(format!("ARENA_PROBE_TEST_SYSROOT={}", sys.display()))
