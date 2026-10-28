@@ -149,7 +149,9 @@ impl SshTarget {
 
     /// A human-readable rendering of the full command, for dry-run output — shell-quoted
     /// ([`shell_word`]: the remote command always, any other argument that needs it), so what's
-    /// printed pastes into a shell as exactly what would run.
+    /// printed pastes into a shell as exactly what would run. The remote command is shown as
+    /// written, not as [`for_any_login_shell`] sends it: the same where the login shell is a
+    /// POSIX one (not on a fish box).
     pub fn display_command(&self, remote_cmd: &str) -> String {
         let args: Vec<String> = self.ssh_args().iter().map(|a| shell_word(a)).collect();
         format!("ssh {} '{}'", args.join(" "), remote_cmd.replace('\'', "'\\''"))
@@ -203,6 +205,93 @@ pub fn shell_word(s: &str) -> String {
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
     }
+}
+
+/// What sshd is sent for `cmd`, a command written for bash, zsh and sh, so that a box whose user's
+/// login shell is **fish** runs it too, and a POSIX login shell still runs it itself.
+///
+/// sshd hands the command to the login shell (`$SHELL -c '…'`). fish reads POSIX code its own way:
+/// an `if …; then`, a `$?` or a `${x}` doesn't parse (live: the dashboard's probe failed on a fish
+/// box), and in single quotes it reads `\\` and `\'` as escapes, so a command quoted for sh can
+/// arrive changed with no error at all (live: `'a\\b'` came out `a\b`).
+///
+/// It goes as one line both kinds of shell parse, each running only its own part. They disagree on
+/// whether a `\'` inside single quotes ends the quote, so a quoted stretch for one is code for the
+/// other:
+///
+/// ```text
+/// set -- __arena_p '<cmd>'; true '\''; <fish part>; true '; <POSIX part> #'
+/// ```
+/// - **Both** shells run `set`, which puts the command in `$2` (POSIX) or `$__arena_p` (fish). It is
+///   [`printf_format`]-encoded: no `'`, and no backslash but before three octal digits, so both
+///   read it alike.
+/// - **bash, zsh, sh, ksh and ash** run the POSIX part; the fish part is a quoted argument to
+///   `true`. The POSIX part decodes the command with `printf` (a builtin), clears the positional
+///   parameters and `eval`s it in the login shell itself. Its startup runs once, and its dialect,
+///   `$0` and exit status are the bare command's. Through `eval`, three things differ from a bare
+///   command, none of which arena relies on: positional parameters a startup file set are cleared,
+///   an `ERR` trap a startup file set fires once more when the command fails, and the shell forks
+///   for the last command instead of `exec`ing it.
+/// - **fish** runs the fish part; the POSIX part is quoted, and for POSIX the `#` starts a comment.
+///   The fish part `exec`s `/bin/sh` to decode the command and `exec` bash with it, else
+///   `/bin/sh`. arena's commands are tested under bash, and the process, signals and exit status
+///   stay the command's own.
+///
+/// Other login shells (csh, nu) read neither part and fail. Before, they ran a command of plain
+/// words and failed on the rest; arena's hosts run bash, zsh or sh (or fish).
+///
+/// **Too big to encode** (the line would pass Linux's 128 KiB limit for one argument; encoding
+/// grows a script by about a tenth): `true '\''; <refusal>; true '; <cmd>`. POSIX shells run
+/// the bare command after a `true`, exactly as before. fish parses the whole line before running
+/// any of it, so it either fails to parse the bare command or runs the refusal first (exit 126):
+/// it never runs the command misread. Within the refusal's 150 bytes of the limit, that line is
+/// itself too long: spawning `ssh` fails ("argument list too long") and nothing runs anywhere —
+/// never the bare command, which a fish box would misread (review ai-review codex pr18). Pure.
+pub fn for_any_login_shell(cmd: &str) -> String {
+    let line = format!("set -- __arena_p '{}'; true '\\''; {FISH_PART}; true '; {POSIX_PART} #'", printf_format(cmd));
+    if line.len() < MAX_ARG_LEN {
+        return line;
+    }
+    format!("true '\\''; {FISH_TOO_BIG}; true '; {cmd}")
+}
+
+/// What fish runs for a command too big to encode: it says so and exits 126. It sits in POSIX's
+/// single quotes: no `'`.
+const FISH_TOO_BIG: &str =
+    r#"echo "arena: this command is too big to send to a fish login shell (over 128 KiB encoded)" >&2; exit 126"#;
+
+/// Linux's limit on one argument (`MAX_ARG_STRLEN`, 128 KiB with its NUL): sshd passes the
+/// command to the login shell as one.
+const MAX_ARG_LEN: usize = 128 * 1024;
+
+/// The part of [`for_any_login_shell`]'s line that bash, zsh and sh run: decode `$2`, clear the
+/// positional parameters, unset its own variable and `eval` the command (the `printf x` keeps
+/// trailing newlines). It sits in fish's single quotes: no `'`, no backslash.
+const POSIX_PART: &str = r#"__arena_c=$(printf "$2"; printf x); set --; eval "unset __arena_c; ${__arena_c%x}""#;
+
+/// The part fish runs: `/bin/sh` decodes `$__arena_p` and `exec`s bash with it, else `/bin/sh`. It
+/// sits in POSIX's single quotes: no `'`. (fish's double quotes: `\$` and `\"` are `$` and `"`.)
+const FISH_PART: &str = concat!(
+    r#"exec /bin/sh -c "c=\$(printf \"\$1\"; printf x); c=\${c%x}; "#,
+    r#"command -v bash >/dev/null 2>&1 && exec bash -c \"\$c\" bash; exec /bin/sh -c \"\$c\" sh" arena $__arena_p"#,
+);
+
+/// `s` as a `printf` format that prints `s`, readable by every shell inside single quotes: `%` is
+/// `%%`; a backslash, a single quote, `!`, a control character and a leading `-` (which
+/// `printf` would take for an option) are 3-digit octal escapes (`\047`) — `printf` reads at most
+/// three digits, so a digit after one is never taken into it. Pure.
+fn printf_format(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + s.len() / 8);
+    for (i, c) in s.chars().enumerate() {
+        match c {
+            '%' => out.push_str("%%"),
+            '\\' | '\'' | '!' => out.push_str(&format!("\\{:03o}", c as u32)),
+            '-' if i == 0 => out.push_str("\\055"),
+            c if c.is_ascii_control() => out.push_str(&format!("\\{:03o}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Resolve the configured SSH key path to one the current user can actually read.
@@ -420,7 +509,7 @@ pub fn exit_label(code: Option<i32>) -> String {
 pub async fn run(target: &SshTarget, remote_cmd: &str) -> Result<SshOutput> {
     let out = Command::new("ssh")
         .args(target.ssh_args())
-        .arg(remote_cmd)
+        .arg(for_any_login_shell(remote_cmd))
         .stdin(Stdio::null())
         .output()
         .await
@@ -639,5 +728,187 @@ mod tests {
         want.push("echo 'hi' $HOME".into());
         assert_eq!(echo(&t.display_command("echo 'hi' $HOME"), "ssh"), want);
         assert_eq!(echo(&t.display_scp("/tmp/a b", "/root/x"), "scp"), t.scp_args("/tmp/a b", "/root/x"));
+    }
+    /// A command full of what shells read differently: quotes of both kinds, backslashes, `%`, `!`,
+    /// `$(…)`, `${x}`, `$?`, `$#`, `$0`, `if`/`for`, a here-doc, UTF-8, an exit status — and which
+    /// shell ran it.
+    const GNARLY: &str = "printf '%s|' \"a b\" 'it'\\''s' \"back\\\\slash\" '100%' '!bang' \"$((6*7))\" '\\047' \"n=$#\" \"z=${0##*/}\"; echo
+x=$(echo sub); if [ \"${x}\" = sub ]; then echo \"if-ok $?\"; fi
+for i in 1 2; do printf \"$i\"; done; echo; echo ${ZSH_VERSION:+zsh}${BASH_VERSION:+bash}.
+cat <<'EOF'
+here $HOME \\n %d
+EOF
+echo \"été ✓\"
+(exit 3)
+";
+
+    /// The line's parts keep to what the other kind of shell reads them in (fish's single quotes:
+    /// no `'`, no backslash; POSIX's: no `'`); the command is encoded with no quote, newline or `!`,
+    /// and a backslash only before three octal digits. A command too big to encode within one
+    /// argument goes bare behind fish's refusal.
+    #[test]
+    fn the_line_keeps_each_part_inside_the_other_shells_quotes() {
+        assert!(!POSIX_PART.contains('\'') && !POSIX_PART.contains('\\'), "{POSIX_PART}");
+        assert!(!FISH_PART.contains('\''), "{FISH_PART}");
+        let w = for_any_login_shell(GNARLY);
+        let enc = printf_format(GNARLY);
+        assert_eq!(w, format!("set -- __arena_p '{enc}'; true '\\''; {FISH_PART}; true '; {POSIX_PART} #'"));
+        assert!(!enc.contains(['\'', '\n', '!']), "{enc}");
+        let b = enc.as_bytes();
+        for (i, _) in enc.match_indices('\\') {
+            assert!(b.len() > i + 3 && b[i + 1..i + 4].iter().all(|d| (b'0'..=b'7').contains(d)), "{}", &enc[i..]);
+        }
+        assert_eq!(printf_format("-x 5%"), "\\055x 5%%");
+        assert_eq!(printf_format("a\\b'c!\n\t"), "a\\134b\\047c\\041\\012\\011");
+        assert_eq!(printf_format("\\0471"), "\\1340471", "a digit after an escape stays a digit");
+        assert!(!FISH_TOO_BIG.contains('\''), "{FISH_TOO_BIG}");
+        let huge = ":\n".repeat(30_000);
+        assert_eq!(for_any_login_shell(&huge), format!("true '\\''; {FISH_TOO_BIG}; true '; {huge}"), "4× in encoding would pass 128 KiB");
+        // The biggest command arena sends — the resolve, as `pods set-branch` composes it — fits.
+        let resolve = for_any_login_shell(&crate::resolve::resolve_command("/root/ARENA_materials", 3, "k", "p", "w1d1/devtest-x"));
+        assert!(resolve.starts_with("set -- __arena_p") && resolve.len() < 100 * 1024, "{}", resolve.len());
+        // Right at the limit, the refusal passes it: still never bare (the spawn fails instead).
+        let edge = "x".repeat(MAX_ARG_LEN - 100);
+        assert_eq!(for_any_login_shell(&edge), format!("true '\\''; {FISH_TOO_BIG}; true '; {edge}"));
+    }
+
+    /// The paths of the shells installed here, by name; `busybox` as its `sh`. Not installed:
+    /// said, and left out — a failure where `ARENA_TEST_ALL_SHELLS` is set (CI installs them all).
+    #[cfg(target_os = "linux")]
+    fn installed(names: &[&'static str]) -> Vec<(&'static str, Vec<String>)> {
+        let mut out = Vec::new();
+        for &sh in names {
+            let o = std::process::Command::new("sh").arg("-c").arg(format!("command -v {sh}")).output().unwrap();
+            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !o.status.success() || !p.starts_with('/') {
+                assert!(std::env::var_os("ARENA_TEST_ALL_SHELLS").is_none(), "{sh} isn't installed, and ARENA_TEST_ALL_SHELLS is set");
+                eprintln!("{sh} isn't installed here: not tried as the login shell");
+                continue;
+            }
+            out.push((sh, if sh == "busybox" { vec![p, "sh".into()] } else { vec![p] }));
+        }
+        out
+    }
+
+    /// Run `cmd` as sshd runs it: `<login shell> -c <cmd>`, in an empty home, with `env`.
+    #[cfg(target_os = "linux")]
+    fn as_sshd(shell: &[String], home: &std::path::Path, cmd: &str, env: &[(&str, &str)]) -> (String, Option<i32>, String) {
+        let o = std::process::Command::new(&shell[0])
+            .args(&shell[1..])
+            .arg("-c")
+            .arg(cmd)
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", home)
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned())
+    }
+
+    /// Under each login shell installed here, sent as [`for_any_login_shell`] makes it: bash, zsh,
+    /// dash and busybox's sh run the command themselves — what each prints sent bare, its `$0`,
+    /// no positional parameters — and fish (which gets it wrong bare) runs it under bash. Exit 3
+    /// everywhere, nothing on stderr.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn each_login_shell_runs_the_command_as_sent_bare_and_fish_as_bash() {
+        let home = std::env::temp_dir().join(format!("arena-any-shell-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let shells = installed(&["bash", "zsh", "dash", "busybox", "fish"]);
+        assert!(shells.iter().any(|(n, _)| *n == "bash"), "bash is needed");
+        let bash = &shells.iter().find(|(n, _)| *n == "bash").unwrap().1;
+        for (name, shell) in &shells {
+            let bare = if *name == "fish" { as_sshd(bash, &home, GNARLY, &[]) } else { as_sshd(shell, &home, GNARLY, &[]) };
+            assert_eq!(bare.1, Some(3), "{name} bare: {}", bare.2);
+            let ran = match *name {
+                "fish" => "z=bash|".to_string(),
+                "busybox" => "z=sh|".to_string(),
+                n => format!("z={n}|"),
+            };
+            assert!(bare.0.contains(&ran) && bare.0.contains("n=0|") && bare.0.contains("a b|it's|back\\slash|100%|!bang|42|\\047|"), "{name}: {}", bare.0);
+            let sent = as_sshd(shell, &home, &for_any_login_shell(GNARLY), &[]);
+            assert_eq!(sent, (bare.0.clone(), Some(3), String::new()), "{name}");
+            if *name == "fish" {
+                assert_ne!(as_sshd(shell, &home, GNARLY, &[]).0, bare.0, "fish reads the bare command its own way");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A command too big to encode (over 128 KiB as a line): a POSIX login shell runs it bare, as
+    /// before; fish runs none of it — not a line misread — and fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_command_too_big_to_encode_runs_bare_under_posix_and_not_at_all_under_fish() {
+        let home = std::env::temp_dir().join(format!("arena-too-big-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let mark = home.join("ran");
+        // 40,000 backslashes in quotes (fish would halve them), then a mark that it ran.
+        let cmd = format!("printf '%s' '{}' | wc -c; : > {}\n{}", "\\".repeat(40_000), mark.display(), ":\n".repeat(20_000));
+        let sent = for_any_login_shell(&cmd);
+        assert!(sent.starts_with("true '\\'';") && sent.ends_with(&cmd));
+        for (name, shell) in installed(&["bash", "zsh", "dash", "fish"]) {
+            let _ = std::fs::remove_file(&mark);
+            let (out, code, err) = as_sshd(&shell, &home, &sent, &[]);
+            if name == "fish" {
+                assert!(!mark.exists() && out.is_empty() && code.is_some_and(|c| c != 0), "fish: {code:?} {out:?} {err}");
+            } else {
+                assert_eq!((out.trim(), code, mark.exists()), ("40000", Some(0), true), "{name}: {err}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A pod with no zsh yet (before setup) is still said to be one through the transport: the
+    /// `zsh: … not found` that [`login_shell_missing`] reads comes from bash and from dash as from
+    /// a bare command (review ai-review claude pr18 #1), exit 127.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_missing_zsh_still_reads_as_one_through_the_transport() {
+        let home = std::env::temp_dir().join(format!("arena-no-zsh-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let sent = for_any_login_shell(&login_shell_wrap("echo hi", Some("arena-env")));
+        for (name, shell) in installed(&["bash", "dash"]) {
+            let o = std::process::Command::new(&shell[0]).arg("-c").arg(&sent).env_clear().env("PATH", "/nonexistent").env("HOME", &home).output().unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(login_shell_missing(o.status.code(), &err), "{name}: {:?} {err}", o.status.code());
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The login shell's startup runs once, as for a bare command: bash's `~/.bashrc` (sourced over
+    /// ssh) and zsh's `~/.zshenv` each append one line, and a function `~/.bashrc` defines is there
+    /// for the command (review ai-review codex #1: an earlier design ran the shell again, and its
+    /// startup twice).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_login_shells_startup_runs_once() {
+        let home = std::env::temp_dir().join(format!("arena-rc-once-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let log = home.join("rc.log");
+        std::fs::write(home.join(".bashrc"), format!("echo bashrc >> {}\nrcfn() {{ echo fn-ok; }}\n", log.display())).unwrap();
+        std::fs::write(home.join(".zshenv"), format!("echo zshenv >> {}\n", log.display())).unwrap();
+        for (name, shell) in installed(&["bash", "zsh"]) {
+            let _ = std::fs::remove_file(&log);
+            let cmd = if name == "bash" { "rcfn; [ -n \"$BASH_VERSION\" ] && echo in-bash" } else { "echo \"in-${ZSH_NAME}\"" };
+            let (out, code, err) = as_sshd(&shell, &home, &for_any_login_shell(cmd), &[("SSH_CLIENT", "10.0.0.1 50000 22")]);
+            let rc = std::fs::read_to_string(&log).unwrap_or_default();
+            if name == "bash" {
+                // A bash built without SSH_SOURCE_BASHRC reads none (and so has no `rcfn`): once
+                // or not at all, as for a bare command — never twice.
+                let bare = as_sshd(&shell, &home, cmd, &[("SSH_CLIENT", "10.0.0.1 50000 22")]);
+                let _ = std::fs::remove_file(&log);
+                let sent = as_sshd(&shell, &home, &for_any_login_shell(cmd), &[("SSH_CLIENT", "10.0.0.1 50000 22")]);
+                assert_eq!((sent.0.as_str(), sent.1), (bare.0.as_str(), bare.1), "{err}");
+                let once = std::fs::read_to_string(&log).unwrap_or_default();
+                assert!(once == "bashrc\n" || (once.is_empty() && bare.0 == "in-bash\n"), "{once:?}");
+                assert!(rc == once, "{rc:?} then {once:?}");
+            } else {
+                assert_eq!(code, Some(0), "{name}: {err}");
+                assert_eq!((out.as_str(), rc.as_str()), ("in-zsh\n", "zshenv\n"), "{err}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

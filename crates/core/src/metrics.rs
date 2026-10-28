@@ -831,10 +831,12 @@ mod tests {
     /// Review ai-review claude #8: the dashboard's probe runs in the pod user's login shell — zsh
     /// on the pods — which doesn't split an unquoted `$var`. `ro_git`'s filter-emptying `-c` words
     /// went to git as one argument, git refused it, and in any repo with a filter driver configured
-    /// (`git lfs install` puts `filter.lfs.*` in the global config) `dirty` read unknown. Under sh,
-    /// bash and zsh (fish runs none of this probe: its functions are POSIX), with git-lfs's global
-    /// config: `dirty` is the right count, and the filter never ran — though an unchanged lfs file
-    /// is racily clean, so plain plumbing hashes it through the filter (the fixture is armed).
+    /// (`git lfs install` puts `filter.lfs.*` in the global config) `dirty` read unknown. With sh,
+    /// bash, zsh and fish as the login shell — the probe sent as the transport sends it
+    /// ([`crate::ssh::for_any_login_shell`]: fish couldn't read its POSIX functions, so it runs
+    /// under bash there) — with git-lfs's global config: `dirty` is the right count, and the filter
+    /// never ran — though an unchanged lfs file is racily clean, so plain plumbing hashes it
+    /// through the filter (the fixture is armed).
     #[cfg(target_os = "linux")]
     #[test]
     fn dirty_counts_right_under_each_login_shell_with_a_global_lfs_filter() {
@@ -892,10 +894,10 @@ mod tests {
         let fired = || std::fs::read_to_string(marks.join("lfs")).unwrap_or_default();
 
         let opts = ProbeOpts { repo_path: Some(repo.display().to_string()), ..Default::default() };
-        let shells: Vec<&str> = std::iter::once("sh").chain(crate::backup::tests::login_shells().into_iter().filter(|s| *s != "fish")).collect();
+        let shells: Vec<&str> = std::iter::once("sh").chain(crate::backup::tests::login_shells()).collect();
         for shell in shells {
             let mut c = Command::new(shell);
-            c.arg("-c").arg(remote_command(&opts)).current_dir(&home);
+            c.arg("-c").arg(crate::ssh::for_any_login_shell(&remote_command(&opts))).current_dir(&home);
             isolated(&mut c);
             let o = c.output().unwrap();
             let m = parse_probe_output(&String::from_utf8_lossy(&o.stdout));

@@ -1214,7 +1214,21 @@ killed, and the remote command dies at its next write to the closed connection; 
 fails shows what it printed on stdout too, then `exit N: <stderr>` — never `Some(N)`; on a pod with
 no zsh yet — a bare VM before setup — it says so and to run `arena pods setup`) / the read-only
 torch-version health check (90s per pod; with no targets this cohort's pods, as `--deep`). Every dry run's `ssh`/`scp`/`rsync` line is shell-quoted,
-so it pastes as exactly what would run (globs like `'**/.git/**'` don't expand).
+so it pastes as exactly what would run (globs like `'**/.git/**'` don't expand) where the login
+shell is a POSIX one; the remote command is shown as written (see below).
+
+**Login shells: POSIX ones and fish.** sshd hands a remote command to the user's login shell, and
+arena's commands are written for bash, zsh and sh. fish reads them its own way: an `if …; then`,
+`$?` or `${x}` doesn't parse, and a backslash in single quotes can change the command with no error.
+So every command arena runs over ssh (`pods run`, setup, the dashboard's probe, deep checks,
+backups…) goes as one line that both kinds of shell parse, each running only its own part
+(`ssh::for_any_login_shell`). bash, zsh, sh, ksh and ash run the command themselves, through
+`eval`: the same startup (once), dialect, `$0` and exit status as before. fish `exec`s it under
+bash, else `/bin/sh`. Other login shells (csh, nu) aren't supported (before, they ran plain-word
+commands only). A command too big
+to encode within one argument (128 KiB) goes bare: POSIX shells run it as before, and fish
+refuses it rather than misread it. Interactive ssh (`c` in the dashboard) is untouched, and
+`rsync` and `scp` use their own transports.
 
 ### Background jobs: `run --background`, `jobs`, `logs`
 

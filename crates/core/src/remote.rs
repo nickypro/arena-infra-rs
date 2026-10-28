@@ -99,10 +99,12 @@ pub struct SshRemote;
 
 impl SshRemote {
     /// The `ssh … user@host <cmd>` child for [`Remote::exec`] (exposed so the
-    /// construction — argv, stdin, kill-on-drop — is unit-testable without a host).
+    /// construction — argv, stdin, kill-on-drop — is unit-testable without a host). `cmd` goes
+    /// as [`crate::ssh::for_any_login_shell`] makes it, so a pod or server whose user's login
+    /// shell is fish runs it under bash, and a POSIX one runs it as it always did.
     pub fn exec_command(t: &SshTarget, cmd: &str) -> Command {
         let mut c = child("ssh");
-        c.args(t.ssh_args()).arg(cmd);
+        c.args(t.ssh_args()).arg(crate::ssh::for_any_login_shell(cmd));
         c
     }
 
@@ -1123,12 +1125,13 @@ mod tests {
 
     #[test]
     fn ssh_remote_builds_killable_ssh_and_scp_children() {
-        // exec: `ssh <the shared fail-fast args> <cmd>`, killed if the call is abandoned.
+        // exec: `ssh <the shared fail-fast args> <cmd for any login shell>`, killed if the call is
+        // abandoned.
         let t = target();
         let c = SshRemote::exec_command(&t, "echo hi");
         assert_eq!(c.as_std().get_program(), "ssh");
         let mut want = t.ssh_args();
-        want.push("echo hi".into());
+        want.push(crate::ssh::for_any_login_shell("echo hi"));
         assert_eq!(argv(&c), want);
         assert!(c.get_kill_on_drop(), "a timed-out ssh must not be left running");
 

@@ -14,6 +14,13 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-28 · Commands over ssh work on a box whose login shell is fish
+- On a box whose user's login shell is fish, arena's commands over ssh (`pods run`, setup, deep
+  checks, backups, the dashboard's probe) now run under bash. Before, the dashboard's probe failed
+  there (the row read `err`), and a command with a backslash in quotes could run changed.
+- Boxes with bash, zsh or sh as the login shell still run every command themselves, with their
+  startup files read once, as before.
+
 ## 2026-10-28 · Dashboard: rows at once, `D` checks all, graphs before PROGRESS
 - The pods show as soon as they're listed; GPU stats, details and balances fill in after. The
   screen used to say `loading…` until every pod had been read over SSH.
