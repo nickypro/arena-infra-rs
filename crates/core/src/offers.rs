@@ -121,20 +121,23 @@ impl ProviderOffers {
     }
 }
 
-/// A provider `offers` left out, and why: a flag that doesn't apply there (`--gpu` on Hetzner,
-/// `--server-type` anywhere else) — as `create` refuses it, only not an error when no
-/// `--provider` was named.
+/// A provider `offers` doesn't show, and why. Skipped: a flag that doesn't apply there (`--gpu`
+/// on Hetzner, `--server-type` anywhere else — as `create` refuses it, only not an error when
+/// no `--provider` was named), or opt-in Shadeform. Failed: planning it as `create` would
+/// failed (a `--gpu` typo, a server type Hetzner doesn't sell).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Skipped {
     pub provider: String,
     pub why: String,
 }
 
-/// `arena offers` (`--json` prints this): each provider's options, and the providers left out.
+/// `arena offers` (`--json` prints this): each provider's options, the providers left out on
+/// purpose, and the ones that failed (the command then exits non-zero, after showing the rest).
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct Offers {
     pub providers: Vec<ProviderOffers>,
     pub skipped: Vec<Skipped>,
+    pub failed: Vec<Skipped>,
 }
 
 /// `4` for 4.0 GB, `0.5` for half a GB.
@@ -258,6 +261,9 @@ pub fn render(offers: &Offers) -> String {
     }
     for s in &offers.skipped {
         out.push_str(&format!("skipped: {}: {}\n", s.provider, s.why));
+    }
+    for s in &offers.failed {
+        out.push_str(&format!("failed: {}: {}\n", s.provider, s.why));
     }
     out.push_str(
         "\n`pods create`/`up` create on one provider: --provider, default runpod. # is the order they'd try \
@@ -453,6 +459,7 @@ mod tests {
                 ProviderOffers::new(hetzner, &[], Some(cx23())),
             ],
             skipped: vec![Skipped { provider: "shadeform".into(), why: "not configured".into() }],
+            failed: vec![Skipped { provider: "lambda".into(), why: "no such thing".into() }],
         };
         assert_eq!(
             render(&offers),
@@ -467,6 +474,7 @@ mod tests {
              note: runpod: ~ = preset estimate (no live price for that GPU); --max-price is checked against it\n\
              note: hetzner: cx23 is tried in nbg1, fsn1, hel1 in that order; `list` is its gross list price in nbg1, for reference (Hetzner bills in EUR, never converted)\n\
              skipped: shadeform: not configured\n\
+             failed: lambda: no such thing\n\
              \n`pods create`/`up` create on one provider: --provider, default runpod. # is the order they'd try its \
              options in, one create at a time per name; a pool with no capacity is skipped for the rest of that round. \
              STOCK is a hint only — creating is the real test. `offers --all` lists every type.\n"
@@ -478,7 +486,7 @@ mod tests {
     #[test]
     fn a_provider_with_nothing_left_still_shows() {
         let hetzner = plan("hetzner", "A4000", "community", 1, Some(1.0), &PriceBook::unpriced());
-        let offers = Offers { providers: vec![ProviderOffers::new(hetzner, &[], Some(cx23()))], skipped: Vec::new() };
+        let offers = Offers { providers: vec![ProviderOffers::new(hetzner, &[], Some(cx23()))], ..Offers::default() };
         let out = render(&offers);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
@@ -494,7 +502,7 @@ mod tests {
         // A pinned location (HETZNER_LOCATION=nbg1) is one place, not an order.
         let one = plan("hetzner", "A4000", "community", 1, None, &PriceBook::unpriced());
         let pinned = ServerType { locations: vec!["nbg1".into()], ..cx23() };
-        let out = render(&Offers { providers: vec![ProviderOffers::new(one, &[], Some(pinned))], skipped: Vec::new() });
+        let out = render(&Offers { providers: vec![ProviderOffers::new(one, &[], Some(pinned))], ..Offers::default() });
         assert!(out.contains("note: hetzner: cx23 is created in nbg1; `list` is its gross list price in nbg1,"), "{out}");
     }
 
@@ -507,7 +515,7 @@ mod tests {
         let hetzner = plan("hetzner", "A4000", "community", 1, None, &PriceBook::unpriced());
         let offers = Offers {
             providers: vec![ProviderOffers::new(runpod.clone(), &[], None), ProviderOffers::new(hetzner, &[], Some(cx23()))],
-            skipped: vec![],
+            ..Offers::default()
         };
         let v = serde_json::to_value(&offers).unwrap();
         let first = &v["providers"][0];
@@ -523,7 +531,7 @@ mod tests {
         assert_eq!((hz["options"][0]["vram_gb"].clone(), hz["options"][0]["price_per_pod"].clone()), (serde_json::Value::Null, serde_json::Value::Null));
         assert_eq!(hz["server_type"]["eur_per_hour"], 0.0104);
         assert_eq!(hz["server_type"]["locations"][0], "nbg1");
-        assert_eq!(v["skipped"], serde_json::json!([]));
+        assert_eq!((v["skipped"].clone(), v["failed"].clone()), (serde_json::json!([]), serde_json::json!([])));
     }
 
     fn row(id: &str, name: &str, mem: u32, creatable: Option<bool>) -> GpuRow {

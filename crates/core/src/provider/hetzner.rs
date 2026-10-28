@@ -74,6 +74,11 @@ impl Default for HetznerOpts {
 }
 
 impl HetznerOpts {
+    /// The server type a create of `spec` asks for: `--server-type`, else `HETZNER_SERVER_TYPE`.
+    pub fn server_type_for<'a>(&'a self, spec: &'a PodSpec) -> &'a str {
+        server_type(self, spec)
+    }
+
     /// The options from config (`HETZNER_*`), each key's default where it's unset — what
     /// [`super::build`] creates with and `config check` shows. Pure.
     pub fn from_config(cfg: &crate::config::Config) -> Self {
@@ -1979,7 +1984,34 @@ mod tests {
         );
         let cpx41 = p.offer(&spec("devtest-a", Some("cpx41"))).await.unwrap();
         assert_eq!((cpx41.locations, cpx41.eur_per_hour, cpx41.disk_gb), (vec!["ash".to_string()], Some(0.2267), Some(240)));
-        let e = p.offer(&spec("devtest-a", Some("cx99"))).await.unwrap_err().to_string();
-        assert!(e.contains("Hetzner has no server type `cx99`"), "{e}");
+        let e = p.offer(&spec("devtest-a", Some("cx99"))).await.unwrap_err();
+        assert!(matches!(&e, Error::Config(m) if m.contains("Hetzner has no server type `cx99`")), "a refusal, not a failed read: {e:?}");
+    }
+
+    /// The offer's walk is the create's, location for location: a listed `HETZNER_LOCATION` is
+    /// walked as listed (never reordered by distance, no catalog read on create), and `any` after
+    /// it adds the rest nearest first — over the real request path, with `walk_in` shared.
+    #[tokio::test]
+    async fn an_offer_walks_where_a_create_walks() {
+        use crate::http::test_server::{canned, serve};
+        let near = [("nbg1", 1), ("hel1", 2), ("fsn1", 24)];
+        for (setting, want) in [("fsn1,hel1", vec!["fsn1", "hel1"]), ("fsn1,any", vec!["fsn1", "nbg1", "hel1"])] {
+            let opts = HetznerOpts::from_config(&crate::config::Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nHETZNER_LOCATION={setting}\n")));
+            let full = r#"{"error":{"code":"resource_unavailable","message":"error during placement"}}"#;
+            let mut answers = if opts.locations.any { vec![canned(200, "application/json", SERVER_TYPES)] } else { Vec::new() };
+            answers.extend(want.iter().map(|_| canned(412, "application/json", full)));
+            // The failed create's explanation reads the project's keys and the types again.
+            answers.extend([canned(200, "application/json", r#"{"ssh_keys": [{"id": 1, "name": "devtest"}]}"#), canned(200, "application/json", SERVER_TYPES)]);
+            let srv = serve(answers);
+            let mut p = provider(&srv.base, opts.clone());
+            p.distances = Distances::known(&near);
+            assert!(p.create_pod(&spec("devtest-a", None)).await.is_err(), "{setting}: no room anywhere");
+            let sent: Vec<Option<String>> = want.iter().map(|l| Some(l.to_string())).collect();
+            assert_eq!(sent_locations(&srv), sent, "{setting}: create");
+            let srv = serve(vec![canned(200, "application/json", SERVER_TYPES)]);
+            let mut p = provider(&srv.base, opts);
+            p.distances = Distances::known(&near);
+            assert_eq!(p.offer(&spec("devtest-a", None)).await.unwrap().locations, want, "{setting}: offer");
+        }
     }
 }

@@ -23,14 +23,17 @@ earlier).
   `HETZNER_SERVER_TYPE`), priced in € as Hetzner bills it.
 - `arena offers --all` lists everything each provider sells: RunPod's GPU types (what `arena gpus`
   showed) and Hetzner's server types.
+- A provider that can't be planned as `pods up` would (a `--gpu` typo, a server type Hetzner
+  doesn't sell) is listed as `failed:` under the others, and `offers` exits non-zero.
 - `arena gpus` still works and prints what it did, `--json` too, but is no longer listed in
-  `--help`. It now shows RunPod's catalog whatever `--provider` says (it showed the presets).
+  `--help`.
 - `arena --help` and `arena pods --help` list the commands in groups (`pods`: Look, Make, Change,
   Move, Save, Stop) instead of one long list.
 
 ### Action needed
 - A script that reads `arena offers --json`: the plan is now under `providers`, one per provider —
-  read `.providers[0]` (with `--provider X`, it's the only one). `arena gpus --json` is unchanged.
+  read `.providers[] | select(.provider == "runpod")` (with `--provider X`, it's the only one).
+  `arena gpus --json` is unchanged.
 
 ## 2026-10-28 · Commands over ssh work on a box whose login shell is fish
 - On a box whose user's login shell is fish, arena's commands over ssh (`pods run`, setup, deep

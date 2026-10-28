@@ -168,6 +168,7 @@ because it matches both `pods` and `proxy` (use `po`/`pr`); likewise `c` →
 `arena --help` and `arena pods --help` list their commands in groups — `pods`: Look, Make,
 Change, Move, Save, Stop; the top level: Fleet, Money, Access, Automation, Setup. A test keeps
 every visible command in exactly one group. Hidden: `gpus`, the old name for `offers --all`.
+clap's own `help` command isn't listed (`-h`/`--help` are); `arena help pods` still works.
 
 ### Targeting & concurrency
 
@@ -800,20 +801,25 @@ placement shows here unchanged. `create`/`up` use **one** provider per run (`--p
   left unpriced.
 - **Filters** apply per provider exactly as `create` applies them. A flag that doesn't apply to a
   provider (`--gpu`/`--gpus` on Hetzner, `--server-type` elsewhere) leaves it out with a `skipped:`
-  line — or, with that provider named, fails as `create` does. `--cloud` is RunPod's (it collapses
+  line — or, with that provider named, fails as `create` does. A provider whose planning fails (a
+  `--gpu` typo, a server type Hetzner doesn't have or sells nowhere `HETZNER_LOCATION` allows) is
+  listed as `failed:` while the others still show, and the command exits non-zero; named, it just
+  fails. `--cloud` is RunPod's (it collapses
   elsewhere, with a note when several were asked for).
 - **Hetzner's row** is the VM `up --provider hetzner` would create: `--server-type` over
   `HETZNER_SERVER_TYPE` (default `cx23`), its vCPUs and RAM, and its gross €/h where the create's
   location walk starts (one `GET /server_types`, plus the same nearest-first timing a create does;
   the walk is in a note). Placement itself quotes no price for it, so `--max-price` drops it ("no
   known price"), exactly as `create --provider hetzner --max-price …` would. Without
-  `HETZNER_API_KEY`, or if the read fails, the row keeps the type's name, size and price unknown.
-- `--json`: `{"providers": [...], "skipped": [{provider, why}]}`. Each provider is its option plan as
+  `HETZNER_API_KEY`, or if the read fails, the row keeps the type's name, size and price unknown;
+  a type the catalog says create would refuse is a failure, not a row.
+- `--json`: `{"providers": [...], "skipped": [{provider, why}], "failed": [{provider, why}]}`. Each provider is its option plan as
   `create` sees it — `provider, gpu_count, order, max_price, options, dropped, notes`, the fields of
   the old single-provider `offers --json` — with `vram_gb` added to each option, and on Hetzner a
   `server_type` object (`name, cores, cpu_type, architecture, memory_gb, disk_gb, eur_per_hour,
   locations`). **Changed:** `offers --json` used to print one provider's plan as the top-level
-  object; it's now under `providers[]` (`jq '.providers[0]'` for the old shape).
+  object; it's now under `providers[]` (`jq '.providers[] | select(.provider == "runpod")'` for the
+  old shape).
 
 **`--all`**: every type each provider sells instead of what `create` would try (it doesn't take
 the option flags). RunPod: its GPU catalog, exactly as [`gpus`](#gpus) printed it. Hetzner: every
@@ -1757,8 +1763,8 @@ next step.
 ### `gpus`
 
 `gpus` — the old name for RunPod's part of [`offers --all`](#offers), kept for habits and scripts
-(hidden from `--help`): the same table, and `gpus --json` the same array of rows as before. It is
-RunPod's catalog whatever `--provider` says (it used to fall back to the presets off RunPod).
+(hidden from `--help`), unchanged: the same table, `gpus --json` the same array of rows, and with
+another `--provider` the presets, as before.
 
 RunPod's **full live catalog** (via `GET /v2/catalog/gpus` for both tiers, the default — STOCK
 shown as `community/secure`, counted over hosts at or above the CUDA floor, and the best signal the

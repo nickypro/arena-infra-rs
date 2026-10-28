@@ -37,9 +37,9 @@ fn misapplied(provider: &str, f: &Flags) -> bool {
 
 /// `arena offers`: what `create`/`up` would try on each provider ([`offers::providers`]: the
 /// one `--provider` names, else every configured one), or with `all` every type each sells.
-/// `named`: `--provider` when given on the command line (its default can't tell). A flag that
-/// doesn't apply to a provider skips it with a note — or, when that provider was named, fails
-/// as `create` does. `--json` prints [`Offers`] and nothing else on stdout.
+/// `named`: `--provider` when given on the command line (its default can't tell). `--json`
+/// prints [`Offers`] and nothing else on stdout. A provider that failed ([`collect`]) exits
+/// non-zero, after the rest is shown.
 pub(crate) async fn handle_offers(cfg: &Config, named: Option<&str>, flags: Flags, all: bool, json: bool) -> Result<()> {
     let has_key = |k: &str| cfg.get(k).is_some_and(|v| !v.trim().is_empty());
     let scope = offers::providers(named, has_key).map_err(|e| anyhow::anyhow!(e))?;
@@ -47,24 +47,47 @@ pub(crate) async fn handle_offers(cfg: &Config, named: Option<&str>, flags: Flag
     if all {
         return handle_catalogs(cfg, &scope, &left_out, json).await;
     }
-    let mut out = Offers { skipped: left_out, ..Offers::default() };
-    for provider in scope {
-        let server_type = match sizing_flags(provider, flags.gpu.as_deref(), flags.gpus, flags.server_type.clone()) {
-            Ok(t) => t,
-            Err(e) if named.is_none() && misapplied(provider, &flags) => {
-                out.skipped.push(Skipped { provider: provider.into(), why: e.to_string() });
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        out.providers.push(provider_offers(cfg, provider, &flags, server_type).await?);
-    }
+    let mut out = collect(&scope, named, &flags, |p, server_type| provider_offers(cfg, p, &flags, server_type)).await?;
+    out.skipped.extend(left_out);
     if json {
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         print!("{}", offers::render(&out));
     }
+    if !out.failed.is_empty() {
+        let names: Vec<&str> = out.failed.iter().map(|f| f.provider.as_str()).collect();
+        anyhow::bail!("couldn't plan {} as create would (see `failed:`)", names.join(", "));
+    }
     Ok(())
+}
+
+/// Each provider of `scope` planned by `plan` (the server type `--server-type` asks for, as
+/// [`sizing_flags`] checked it): [`provider_offers`], or a fake in tests. A flag that doesn't
+/// apply to a provider ([`misapplied`]) skips it; one whose planning fails — a `--gpu` typo, a
+/// server type Hetzner doesn't sell — is listed as failed, and the others still show. With a
+/// provider named, either fails the command, as `create` would.
+async fn collect<F, Fut>(scope: &[&'static str], named: Option<&str>, flags: &Flags, mut plan: F) -> Result<Offers>
+where
+    F: FnMut(&'static str, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<ProviderOffers>>,
+{
+    let mut out = Offers::default();
+    for &provider in scope {
+        let server_type = match sizing_flags(provider, flags.gpu.as_deref(), flags.gpus, flags.server_type.clone()) {
+            Ok(t) => t,
+            Err(e) if named.is_none() && misapplied(provider, flags) => {
+                out.skipped.push(Skipped { provider: provider.into(), why: e.to_string() });
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        match plan(provider, server_type).await {
+            Ok(p) => out.providers.push(p),
+            Err(e) if named.is_none() => out.failed.push(Skipped { provider: provider.into(), why: format!("{e:#}") }),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
 }
 
 /// One provider's plan, made as `create` makes it, with what the table adds: VRAM, and on
@@ -77,7 +100,7 @@ async fn provider_offers(cfg: &Config, provider: &str, flags: &Flags, server_typ
     // Live catalog/offer prices are remembered for the balance's known-GPU stand-ins.
     money::BalanceCtx::from_config(cfg).remember_gpu_prices(&plan);
     if provider == "hetzner" {
-        let (server, note) = hetzner_offer(cfg, &base).await;
+        let (server, note) = hetzner_offer(cfg, &base).await?;
         let mut offers = ProviderOffers::new(plan, &[], Some(server));
         offers.notes.extend(note);
         return Ok(offers);
@@ -90,19 +113,22 @@ async fn provider_offers(cfg: &Config, provider: &str, flags: &Flags, server_typ
 }
 
 /// The server type `base` would create on Hetzner, read from its catalog
-/// ([`HetznerProvider::offer`], bounded by [`PRICE_TIMEOUT`]) — or just its name, with a note
-/// saying why, when that can't be read: the row still shows what create would ask for.
-async fn hetzner_offer(cfg: &Config, base: &PodSpec) -> (ServerType, Option<String>) {
+/// ([`HetznerProvider::offer`], bounded by [`PRICE_TIMEOUT`]) — or, when that can't be read,
+/// just its name with a note saying why: the row still shows what create would ask for. `Err`:
+/// the catalog says create would refuse it (a type Hetzner doesn't have, or sells nowhere
+/// `HETZNER_LOCATION` allows) — that's no option to offer.
+async fn hetzner_offer(cfg: &Config, base: &PodSpec) -> Result<(ServerType, Option<String>)> {
     let opts = HetznerOpts::from_config(cfg);
-    let name = base.server_type.clone().unwrap_or_else(|| opts.server_type.clone());
+    let name = opts.server_type_for(base).to_string();
     let bare = ServerType { name: name.clone(), ..Default::default() };
     let Some(key) = cfg.get("HETZNER_API_KEY").filter(|k| !k.trim().is_empty()) else {
-        return (bare, Some(format!("no HETZNER_API_KEY — {name}'s size and price are unknown")));
+        return Ok((bare, Some(format!("no HETZNER_API_KEY — {name}'s size and price are unknown"))));
     };
     match tokio::time::timeout(PRICE_TIMEOUT, HetznerProvider::new(key, opts).offer(base)).await {
-        Ok(Ok(t)) => (t, None),
-        Ok(Err(e)) => (bare, Some(format!("couldn't read {name} from Hetzner's server types ({e}) — size and price unknown"))),
-        Err(_) => (bare, Some(format!("Hetzner's server types didn't answer within {}s — size and price unknown", PRICE_TIMEOUT.as_secs()))),
+        Ok(Ok(t)) => Ok((t, None)),
+        Ok(Err(arena_core::Error::Config(why))) => anyhow::bail!("create would refuse {name}: {why}"),
+        Ok(Err(e)) => Ok((bare, Some(format!("couldn't read {name} from Hetzner's server types ({e}) — size and price unknown")))),
+        Err(_) => Ok((bare, Some(format!("Hetzner didn't answer within {}s — {name}'s size and price are unknown", PRICE_TIMEOUT.as_secs())))),
     }
 }
 
@@ -209,12 +235,16 @@ async fn runpod_catalog(cfg: &Config) -> Result<(RunpodCatalog, Option<String>)>
     Ok((RunpodCatalog { rows, live: true, creatable_known: creatable.is_some(), stock }, None))
 }
 
-/// `arena gpus`, kept for old habits: RunPod's section of `offers --all`, whatever `--provider`
-/// says — the table as it always printed, and `--json` the same array of rows
-/// ([`arena_core::gpu::GpuRow`]) as before, so scripts that parse it keep working. The pointer
-/// to `offers --all` goes to stderr, keeping stdout as it was.
-pub(crate) async fn handle_gpus(cfg: &Config, json: bool) -> Result<()> {
-    let (cat, warning) = runpod_catalog(cfg).await?;
+/// `arena gpus`, kept for old habits and scripts, exactly as it was: RunPod's section of `offers
+/// --all` — with another `--provider`, the presets (RunPod's prices) as it always showed them —
+/// and `--json` the same array of rows ([`arena_core::gpu::GpuRow`]). The pointer to `offers
+/// --all` goes to stderr, keeping stdout as it was.
+pub(crate) async fn handle_gpus(cfg: &Config, provider: &str, json: bool) -> Result<()> {
+    let (cat, warning) = if provider == "runpod" {
+        runpod_catalog(cfg).await?
+    } else {
+        (RunpodCatalog { rows: arena_core::gpu::rows_from_presets(), live: false, creatable_known: false, stock: Stock::OneGpu }, None)
+    };
     if let Some(w) = warning {
         eprintln!("{w}");
     }
@@ -276,21 +306,52 @@ mod tests {
         handle_offers(&cfg(), None, Flags::default(), true, true).await.unwrap();
         let (cat, warning) = runpod_catalog(&cfg()).await.unwrap();
         assert!(!cat.live && warning.is_none() && cat.rows.len() == arena_core::gpu::PRESETS.len());
-        handle_gpus(&cfg(), true).await.unwrap();
+        handle_gpus(&cfg(), "runpod", true).await.unwrap();
+        handle_gpus(&cfg(), "vast", false).await.unwrap();
     }
 
-    /// With every key set, no `--provider`: a flag that doesn't apply to a provider skips it
-    /// (said, not fatal) instead of failing the others. Checked before anything is fetched, so
-    /// nothing here reaches a provider.
-    #[test]
-    fn scope_and_skips_follow_the_keys_and_the_flags() {
-        let keyed = Config::parse("RUNPOD_API_KEY=k\nVAST_API_KEY=k\nHETZNER_API_KEY=k\nSHADEFORM_API_KEY=k\n");
-        let has = |k: &str| keyed.get(k).is_some();
-        assert_eq!(offers::providers(None, has).unwrap(), ["runpod", "vast", "hetzner"]);
-        let server = Flags { server_type: Some("cx33".into()), ..Default::default() };
-        let kept: Vec<&str> = ["runpod", "vast", "hetzner"].into_iter().filter(|p| !misapplied(p, &server)).collect();
-        assert_eq!(kept, ["hetzner"]);
-        let e = sizing_flags("runpod", None, None, Some("cx33".into())).unwrap_err().to_string();
-        assert!(e.starts_with("--server-type is for Hetzner VMs only"), "{e}");
+    /// A plan as a fake planner returns it (create's planner over no prices).
+    fn planned(provider: &str) -> ProviderOffers {
+        let base = PodSpec::from_config(&cfg());
+        let req = arena_core::placement::Request::from_flags(None, None, &base, None, Order::Cheapest).unwrap();
+        ProviderOffers::new(arena_core::placement::plan_options(&req, provider, &arena_core::placement::PriceBook::unpriced()), &[], None)
+    }
+
+    /// Over every provider (no `--provider`): a flag that doesn't apply to one skips it before
+    /// it's planned, a planning failure is listed and the others still show; the server type
+    /// `--server-type` names reaches Hetzner's planner. Named, either fails as `create` would.
+    #[tokio::test]
+    async fn collect_skips_what_doesnt_apply_and_lists_what_failed() {
+        let scope = ["runpod", "vast", "hetzner"];
+        let asked = std::sync::Mutex::new(Vec::new());
+        let fake = |p: &'static str, server_type: Option<String>| {
+            asked.lock().unwrap().push((p, server_type));
+            async move {
+                match p {
+                    "vast" => Err(anyhow::anyhow!("--gpu: `3070x` isn't a GPU")),
+                    _ => Ok(planned(p)),
+                }
+            }
+        };
+        let gpu = Flags { gpu: Some("A4000".into()), ..Default::default() };
+        let out = collect(&scope, None, &gpu, fake).await.unwrap();
+        assert_eq!(out.providers.iter().map(|p| p.provider.as_str()).collect::<Vec<_>>(), ["runpod"]);
+        assert_eq!((out.failed[0].provider.as_str(), out.failed[0].why.as_str()), ("vast", "--gpu: `3070x` isn't a GPU"));
+        assert_eq!(out.skipped.len(), 1);
+        assert!(out.skipped[0].provider == "hetzner" && out.skipped[0].why.starts_with("--gpu doesn't apply to hetzner"), "{:?}", out.skipped);
+        assert_eq!(std::mem::take(&mut *asked.lock().unwrap()), [("runpod", None), ("vast", None)], "hetzner never planned");
+
+        let server = Flags { server_type: Some("CX33".into()), ..Default::default() };
+        let out = collect(&scope, None, &server, fake).await.unwrap();
+        assert_eq!(out.skipped.iter().map(|s| s.provider.as_str()).collect::<Vec<_>>(), ["runpod", "vast"]);
+        assert_eq!(std::mem::take(&mut *asked.lock().unwrap()), [("hetzner", Some("cx33".to_string()))], "as create sends it");
+
+        let e = collect(&["vast"], Some("vast"), &Flags::default(), fake).await.unwrap_err().to_string();
+        assert_eq!(e, "--gpu: `3070x` isn't a GPU");
+        let e = collect(&["hetzner"], Some("hetzner"), &gpu, fake).await.unwrap_err().to_string();
+        assert!(e.starts_with("--gpu doesn't apply to hetzner"), "{e}");
+        // A malformed --server-type isn't "doesn't apply": it fails even unnamed.
+        let bad = Flags { server_type: Some("cx 23".into()), ..Default::default() };
+        assert!(collect(&["hetzner"], None, &bad, fake).await.is_err());
     }
 }

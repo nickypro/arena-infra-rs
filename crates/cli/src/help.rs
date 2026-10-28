@@ -6,7 +6,8 @@
 //! groups by what the commands do. clap 4 has no heading per subcommand, so the help template is
 //! clap's default with its command list swapped for these groups, in clap's styles and
 //! alignment; the usage line and the options read as before. Parsing is untouched: prefixes
-//! (`infer_subcommands`), aliases and hidden commands work as they did.
+//! (`infer_subcommands`), aliases and hidden commands work as they did. clap's own `help`
+//! subcommand isn't listed (`-h, --help` is, under Options); `arena help pods` still works.
 
 use clap::{Command, FromArgMatches};
 
@@ -77,9 +78,10 @@ fn command_list(cmd: &Command, groups: Groups) -> String {
     out
 }
 
-/// Parse `args` as `Cli::parse` would, over [`command`]; and whether `--provider` was given on
-/// the command line — its default (`runpod`) reads the same as `--provider runpod`, and
-/// `offers` shows every configured provider unless one is named.
+/// Parse `args` as `Cli::parse` would, over [`command`]; and whether `--provider` was given —
+/// its default (`runpod`) reads the same as `--provider runpod`, and `offers` shows every
+/// configured provider unless one is named. Anything but the default counts (today the
+/// command line is its only other source).
 pub(crate) fn parse_from<I, T>(args: I) -> Result<(super::Cli, bool), clap::Error>
 where
     I: IntoIterator<Item = T>,
@@ -87,7 +89,7 @@ where
 {
     let mut cmd = command();
     let matches = cmd.try_get_matches_from_mut(args)?;
-    let named = matches.value_source("provider") == Some(clap::parser::ValueSource::CommandLine);
+    let named = !matches!(matches.value_source("provider"), None | Some(clap::parser::ValueSource::DefaultValue));
     let cli = super::Cli::from_arg_matches(&matches).map_err(|e| e.format(&mut cmd))?;
     Ok((cli, named))
 }
@@ -140,13 +142,32 @@ mod tests {
         assert!(text.contains("\n  list           List current pods (read-only)\n"), "{text}");
         assert!(text.contains("\n  cp             Copy a local file or dir (-r) to every pod (scp) [aliases: copy]\n"), "{text}");
         assert!(text.contains("\n  init-branches  Create + push each pod's wNdM autocommit branch\n"), "{text}");
-        // The options read as clap's own template prints them.
-        let plain = <crate::Cli as clap::CommandFactory>::command().try_get_matches_from(["arena", "pods", "--help"]).unwrap_err().to_string();
+        // The options read as clap's own template prints them, here and at the top.
         let options = |t: &str| t.split_once("\nOptions:\n").map(|(_, o)| o.trim_end().to_string());
-        assert!(options(&plain).is_some());
-        assert_eq!(options(&text), options(&plain));
-        // A command's own help is clap's as ever (no group list there).
-        assert!(help(&["arena", "pods", "list", "--help"]).contains("\nOptions:\n"));
+        for args in [&["arena", "pods", "--help"][..], &["arena", "--help"], &["arena", "pods", "-h"]] {
+            let plain = plain_help(args);
+            assert!(options(&plain).is_some(), "{args:?}");
+            assert_eq!(options(&help(args)), options(&plain), "{args:?}");
+        }
+    }
+
+    /// The help clap prints without the groups.
+    fn plain_help(args: &[&str]) -> String {
+        <crate::Cli as clap::CommandFactory>::command().try_get_matches_from(args).unwrap_err().to_string()
+    }
+
+    /// Only the two lists change: every other command's help is clap's own, byte for byte.
+    #[test]
+    fn other_commands_help_is_untouched() {
+        for args in [
+            &["arena", "pods", "list", "--help"][..],
+            &["arena", "offers", "--help"],
+            &["arena", "pods", "reap", "--help"],
+            &["arena", "keys", "-h"],
+            &["arena", "pods", "migrate", "--help"],
+        ] {
+            assert_eq!(help(args), plain_help(args), "{args:?}");
+        }
     }
 
     /// `arena --help` is grouped the same way; `gpus` (hidden, `offers --all`'s old name) isn't
@@ -157,14 +178,19 @@ mod tests {
         let headings: Vec<&str> = text.lines().filter(|l| l.ends_with(':') && !l.starts_with(' ')).collect();
         assert_eq!(headings, ["Fleet:", "Money:", "Access:", "Automation:", "Setup:", "Options:"], "{text}");
         assert!(text.contains("\n  offers      ") && !text.contains("gpus"), "{text}");
+        // Each listed line, as `command_list` writes it, is in the help as written: no brace in
+        // an about or alias turned into a template tag.
         let cli = command();
-        for sub in cli.get_subcommands().filter(|s| !s.is_hide_set()) {
-            let about = sub.get_about().map(|s| s.to_string()).unwrap();
-            assert!(text.contains(&about) && !about.contains(['{', '}']), "{}: {about}", sub.get_name());
-        }
-        let pods = cli.find_subcommand("pods").unwrap();
-        for sub in pods.get_subcommands() {
-            assert!(!sub.get_about().map(|s| s.to_string()).unwrap_or_default().contains(['{', '}']), "{}", sub.get_name());
+        let pods_text = help(&["arena", "pods", "--help"]);
+        for (cmd, text, groups) in [(&cli, &text, TOP), (cli.find_subcommand("pods").unwrap(), &pods_text, PODS)] {
+            let w = groups.iter().flat_map(|(_, names)| names.iter()).map(|n| n.len()).max().unwrap();
+            for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
+                let about = sub.get_about().or_else(|| sub.get_long_about()).map(|s| s.to_string()).unwrap_or_default();
+                let aliases: Vec<&str> = sub.get_visible_aliases().collect();
+                let line = format!("  {:<w$}  {about}", sub.get_name());
+                let line = if aliases.is_empty() { line } else { format!("{line} [aliases: {}]", aliases.join(", ")) };
+                assert!(text.contains(&format!("\n{line}\n")), "{}: {line:?}\n{text}", sub.get_name());
+            }
         }
     }
 

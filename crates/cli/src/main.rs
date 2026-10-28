@@ -3033,7 +3033,7 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Gpus { json } => offers::handle_gpus(&cfg, json).await,
+        Cmd::Gpus { json } => offers::handle_gpus(&cfg, &cli.provider, json).await,
         Cmd::Api(c) => handle_api(c, &cfg).await,
         Cmd::Offers { gpu, cloud, max_price, gpus, server_type, order, all, json } => {
             let flags = offers::Flags { gpu, cloud, max_price, gpus, server_type, order };
