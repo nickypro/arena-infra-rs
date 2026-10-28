@@ -11,6 +11,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
 - [Safety model (this is developed against live production)](#safety-model-this-is-developed-against-live-production)
 - [Running arena](#running-arena)
   - [From a checkout](#from-a-checkout)
+  - [`update`: installing a newer release](#update-installing-a-newer-release)
   - [Command shorthands](#command-shorthands)
   - [Targeting & concurrency](#targeting--concurrency)
   - [Overriding config without editing it](#overriding-config-without-editing-it)
@@ -120,6 +121,35 @@ ARENA_CONFIG=./config.env cargo run -p arena-tui
 cargo run -p arena-cli -- --config ./config.env pods list
 ```
 
+### `update`: installing a newer release
+
+Every green master commit is published as a GitHub release (`.github/workflows/release.yml`):
+`arena` and `arena-tui` for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, built
+on Ubuntu 22.04 (glibc 2.35 or newer), with `CHANGELOG.md` and `SHA256SUMS`. The tag is the
+version, `v2.0.YYMMDD.HHMM`, from the commit's time in UTC. `arena --version` prints it with the
+commit: `arena 2.0.261027.1500 (5274b7a1c2)`.
+
+```bash
+arena update --check     # newer release? what changed? (exit 10 = yes, 0 = up to date, 1 = couldn't tell)
+arena update --dry-run   # also download and check it, install nothing
+arena update             # … then ask, and swap both binaries in (--yes to skip the question)
+sudo arena update        # where root runs arena from someone else's ~/.cargo/bin (prod)
+```
+
+- **What changed:** the release's `CHANGELOG.md` entries that this build's own copy (compiled
+  in) lacks, with their **Action needed** and **Config** lines first.
+- **Checks before anything changes:** both binaries must match `SHA256SUMS`, and the new
+  `arena --version` must run here and name the release. A wrong-platform or cut-short download
+  never replaces what cron runs.
+- **The swap:** where this `arena` really is (symlinks resolved), the current binaries become
+  `arena.prev` / `arena-tui.prev` (an older `.prev` is replaced). Each new one takes the old
+  one's mode and owner, and lands by rename, so the path always holds a whole binary.
+  Roll back with `mv -f arena.prev arena && mv -f arena-tui.prev arena-tui`.
+- **Afterwards:** it lists the `arena-tui` dashboards still running the replaced build, to
+  restart. Cron picks the new `arena` up on its next run.
+- It needs no config and no GitHub login (the API allows 60 unauthenticated requests an hour).
+  Provenance: `gh attestation verify arena-<target> --repo nickypro/arena-infra-rs`.
+
 ### Command shorthands
 
 Subcommands accept any **unambiguous prefix** (Cisco-style), at every level:
@@ -197,7 +227,7 @@ Notes / sharp edges to know:
 
 Any key in `config.env` can be overridden by an **environment variable of the same
 name** (env wins; it can't introduce brand-new keys — except a short allowlist such as
-`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API` and `DISCARD_MAX_GB`, e.g. `RUNPOD_API=v1 arena pods
+`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `DISCARD_MAX_GB` and the `ASK_<AI>_MODEL`/`_EFFORT` keys, e.g. `RUNPOD_API=v1 arena pods
 list` to use the retiring RunPod v1 backend for one command, until 2026-11-15; v2 is the default). This is how you point at an SSH
 key the current user can actually read, without editing the shared, read-only prod
 config — e.g. when the dashboard's metrics show `ssh connect failed … key unreadable`
@@ -225,7 +255,13 @@ which starved RunPod placement — "no capacity" all day once the 13.0 hosts wer
 
 Same provider name and commands. Differences: real lifecycle statuses
 (`PROVISIONING`/`STARTING`/`RUNNING`/`EXITED`/`ERROR`); the SSH endpoint comes from `ssh.direct`
-only; create always sends `cloud` (v2 defaults to SECURE) and merges the account's registered SSH
+(else the TCP 22 runtime mapping, never RunPod's SSH gateway). The list has left both out since
+2026-10-26, so running pods are filled from `GET /v2/pods/{id}`, and the endpoint is remembered
+while the pod keeps its `startedAt`: a dashboard refresh costs no extra request. It's rechecked
+every 30 s for the first 3 minutes after a start (live: a restart's detail kept the old port for
+~30 s), then every 10 min, at most 30 rechecks a minute per process; arena's own
+stop/start/restart forget it at once. A failed lookup leaves just that pod without an endpoint.
+Create always sends `cloud` (v2 defaults to SECURE) and merges the account's registered SSH
 keys into `PUBLIC_KEY` (v2 skips them when it's set); `replace` recovers GPU type + cloud tier.
 
 Rename is `PATCH /v2/pods/{id}` with only `{"name"}` (live-verified restart-free — PID 1, a `/root`
@@ -308,6 +344,22 @@ instance. The key attach after a rent is bounded (60s).
 ignores the GPU-centric `PodSpec` fields and takes its sizing/OS/location/SSH-keys from `HETZNER_*`
 config (`create`/`up --server-type` over `HETZNER_SERVER_TYPE`; `--gpu`/`--gpus` are refused there,
 `--server-type` everywhere else).
+
+**Location:** `HETZNER_LOCATION` unset (or `any`) means any location. A create reads the
+server types (`GET /server_types`) and tries every location that sells the type now, nearest
+first. When a location has no room (`resource_unavailable` / "error during placement"), it tries
+the next one with the same name.
+- Nearest means the quickest TCP connect from the machine running arena to the location's
+  speed-test host (`nbg1-speed.hetzner.com:443`): timed once per process, about a second at
+  most. On prod that machine is the proxy box, which carries every student's SSH. From nbg1:
+  nbg1 0.4 ms, fsn1 3, hel1 24, ash 95, sin 159, hil 167.
+- Equally near locations go cheapest first, then those not marked low on stock, then Hetzner's
+  recommended ones. A location that can't be timed goes after the timed ones, by price.
+- No room anywhere is a capacity error that names each location tried, so `--keep-trying` waits.
+- Any other refusal (token, quota, throttle, SSH key) stops at once.
+- One location (`nbg1`) pins creates there, with no lookup. A list (`nbg1,fsn1`) is tried in its
+  order, and `nbg1,any` tries nbg1, then the rest.
+- An `--api-json` `datacenter` is one create where it says.
 
 VMs come up on a real public IP with SSH on `:22`, so they use the same proxy/`pods up` flow as GPU
 providers. A refused create is explained from the project (read-only `GET /ssh_keys` + `GET
@@ -1223,14 +1275,14 @@ but its passes clear them.
 
 ### `pods ask`
 
-`pods ask [targets] [--all] [--ai claude|codex] [--model M] [--timeout S] [--dry-run] ["question"]`
+`pods ask [targets] [--all] [--ai claude|codex] [--model M] [--effort E] [--timeout S] [--dry-run] ["question"]`
 — ask claude (Claude Code) or codex what state a pod is in, or several pods compared, and whether
 anything is wrong or needs attention: **read-only** on the pods (one SSH call each), every pod in
 one prompt, masked, the AI with no tools; the answer printed and saved with the prompt in the state
-dir. The answer is per pod one line of state, then the problems, each with the `arena` command that
-fixes or investigates it; `unknown` where the data doesn't say. The dashboard's `?` asks the same
-([Asking an AI about pods](#asking-an-ai-about-pods)); [`ASK_AI`](#ask_ai) picks the AI or turns it
-off.
+dir. The answer is brief (at most about 12 lines): per pod one line of state, then a bullet per
+problem, each with the `arena` command that fixes or investigates it; `unknown` where the data
+doesn't say. The dashboard's `?` asks the same ([Asking an AI about pods](#asking-an-ai-about-pods));
+[`ASK_AI`](#ask_ai) picks the AI or turns it off, and sets each one's model and effort.
 
 ```bash
 arena pods ask apple                            # the default question about one pod
@@ -1239,6 +1291,7 @@ arena pods ask apple..delta -q "who is behind on backups?"
 arena pods ask --all                            # a fleet overview: this cohort's pods, one prompt
 arena pods ask --all --include-non-cohort --ai codex   # every pod, asked of codex (default: ASK_AI)
 arena pods ask apple --model opus --timeout 600
+arena pods ask apple --ai codex --model gpt-6-luna --effort low   # a quick answer: ~5 s for the AI
 arena pods ask apple --dry-run                  # print the exact prompt and the AI's command line; send nothing
 ```
 
@@ -1557,6 +1610,16 @@ Which AI [`pods ask`](#pods-ask) and the dashboard's `?` ask: `claude` (the defa
 codex only). `config check` shows it in its "Asking an AI (`pods ask`, the dashboard's `?`)" section
 (and where the binary is, or a ⚠); any other value fails the check and refuses to run.
 
+Each AI's model and effort: `ASK_CLAUDE_MODEL`, `ASK_CLAUDE_EFFORT`, `ASK_CODEX_MODEL`,
+`ASK_CODEX_EFFORT` — unset, its CLI's own. The model is passed as claude's `--model` / codex's `-m`
+(`sonnet`, `gpt-6-luna`: letters, digits and `. _ - : / @ [ ]`); the effort is `low`, `medium`,
+`high`, `xhigh` or `max` (claude's `--effort`, codex's `model_reasoning_effort`). `--model` and
+`--effort` go over them for one run (so does the environment: `ASK_CODEX_MODEL=gpt-6-luna arena tui`);
+the dashboard's Tab switches AI with each one's own. A small
+model at `low` is the quick choice: on one pod's prompt (2026-10-27) codex `gpt-6-luna` at `low` took
+about 5 s, `gpt-6.1-sol` at `low` 7–9 s, claude's default 12–19 s. `config check` shows the ones set;
+a malformed one fails it, and `pods ask`/`?` refuse to use it.
+
 ### `plan check | show`
 
 `plan check | show` — a scheduled provisioning plan (`arena-plan.json`, see
@@ -1680,9 +1743,12 @@ marks (it never quits).
 
 **`?`** asks claude or codex (`ASK_AI`) about the cursor pod — or the marked set, compared in one
 prompt — exactly what [`arena pods ask`](#pods-ask) does: a one-line question, prefilled with the
-default and saying where the data goes (`ctrl-u` clears it); Enter asks **in the background** like
-`d` (the footer says `asking claude about devtest-alpha…`), and the answer opens in its own
-scrollable popup when it lands (Esc closes it; a modal open meanwhile keeps it waiting). Saved like
+default, naming the AI with its model and effort and where the data goes (`ctrl-u` clears it; **Tab**
+switches to the other AI, as [`ASK_<AI>_MODEL`/`_EFFORT`](#ask_ai) set it up, and the next `?` opens
+with the one last picked); Enter asks **in the background** like `d` (the footer says `asking claude
+about devtest-alpha…`), and the answer opens in its own scrollable popup when it lands (Esc closes
+it; a modal open meanwhile keeps it waiting), its Markdown rendered: bold, commands in cyan, a
+bullet's wrapped lines under its text. Saved like
 `pods ask`'s. With `ASK_AI=off` it opens nothing and the footer says how to turn it on. A marked set
 keeps to this cohort's pods, as `pods ask --all` does: a staff box or another cohort's pod marked
 along is left out (the input names it, the footer says how many); to ask about one, put the cursor

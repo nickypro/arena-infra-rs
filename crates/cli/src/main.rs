@@ -24,6 +24,9 @@ use arena_core::{Config, PodSpec};
 mod archive;
 mod ask;
 #[cfg(test)]
+mod endpoint_tests;
+
+#[cfg(test)]
 mod gpu_vm_setup_tests;
 #[cfg(test)]
 mod hetzner_cli_tests;
@@ -41,7 +44,7 @@ const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 #[derive(Parser)]
 #[command(
     name = "arena",
-    version = env!("ARENA_VERSION"),
+    version = concat!(env!("ARENA_VERSION"), " (", env!("ARENA_COMMIT"), ")"),
     about = "Streamlined ARENA infra control plane",
     // Cisco-style shorthands: any unambiguous prefix works (`arena po l` == `pods
     // list`). Ambiguous prefixes (e.g. `p` for pods/proxy) error and ask you to
@@ -103,6 +106,79 @@ impl std::error::Error for NoTerminal {}
 /// The exit status for a [`NoTerminal`] refusal: 2, apart from a failed command's 1.
 const NO_TERMINAL_EXIT: u8 = 2;
 
+/// `update --check`'s answer when a newer release exists: exit [`UPDATE_AVAILABLE_EXIT`], so a
+/// cron line or MOTD can tell it from "up to date" (0) and "couldn't check" (1).
+#[derive(Debug)]
+struct UpdateAvailable;
+
+impl std::fmt::Display for UpdateAvailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a newer release is available: `arena update` installs it")
+    }
+}
+
+impl std::error::Error for UpdateAvailable {}
+
+/// The exit status for [`UpdateAvailable`].
+const UPDATE_AVAILABLE_EXIT: u8 = 10;
+
+/// This build's own `CHANGELOG.md`: what `arena update` compares the release's against.
+const CHANGELOG: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../CHANGELOG.md"));
+
+/// `arena update` ([`arena_core::update`]): check, then — unless `--check` — download, check
+/// and swap in the release's binaries where this one is.
+async fn handle_update(check_only: bool, dry_run: bool, yes: bool) -> Result<()> {
+    use arena_core::update as up;
+    let installed = up::Version::parse(env!("ARENA_VERSION")).context("this build's version")?;
+    let client = up::client();
+    let found = up::check(&client, up::REPO_API, installed, CHANGELOG).await.map_err(|e| anyhow::anyhow!("update: {e}"))?;
+    if !found.newer {
+        println!("arena {installed} is up to date (the latest release is {}).", found.release.tag);
+        return Ok(());
+    }
+    println!("Update available: arena {installed} → {} ({})\n", found.release.version, found.release.tag);
+    print!("{}", found.changes);
+    if check_only {
+        return Err(UpdateAvailable.into());
+    }
+    // Where this binary really is (`/usr/local/bin/arena` is a link into ~/.cargo/bin on prod).
+    let exe = std::env::current_exe().and_then(|p| p.canonicalize()).context("finding this binary")?;
+    let dir = exe.parent().context("this binary has no directory")?;
+    if exe.file_name().and_then(|n| n.to_str()) != Some("arena") {
+        anyhow::bail!("this binary is {} — `arena update` replaces one named `arena` (and `arena-tui` beside it)", exe.display());
+    }
+    let target = env!("ARENA_TARGET");
+    println!("\nDownloading {} for {target} …", found.release.tag);
+    let staged = up::fetch(&client, &found.release, target, dir).await.map_err(|e| anyhow::anyhow!("update: {e}"))?;
+    println!("Both binaries match the release's SHA256SUMS, and the new arena runs here.");
+    if dry_run {
+        println!("--dry-run: nothing installed.");
+        return Ok(());
+    }
+    let what = format!(
+        "Install arena {} in {} (the current arena and arena-tui become arena.prev and arena-tui.prev)?",
+        found.release.version,
+        dir.display()
+    );
+    if !confirm(yes, &what)? {
+        println!("Not installed.");
+        return Ok(());
+    }
+    staged.install().map_err(|e| anyhow::anyhow!("update: {e}"))?;
+    println!("Installed arena {} in {}.", found.release.version, dir.display());
+    println!("Roll back: cd {} && mv -f arena.prev arena && mv -f arena-tui.prev arena-tui", dir.display());
+    let stale = up::stale_processes(std::path::Path::new("/proc"), &dir.join("arena-tui"));
+    if !stale.is_empty() {
+        let started = |t: Option<std::time::SystemTime>| {
+            t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or_else(|| "start unknown".into(), |d| format!("started {}", arena_core::snapshot::rfc3339(d.as_secs())))
+        };
+        let list: Vec<String> = stale.iter().map(|(pid, t)| format!("pid {pid} ({})", started(*t))).collect();
+        println!("{} dashboard(s) still run the old build — restart them: {}", stale.len(), list.join(", "));
+    }
+    Ok(())
+}
+
 /// What `main` ends with for `result`: success, [`NO_TERMINAL_EXIT`] for a refused
 /// confirmation, else 1. Pure, so the mapping is tested.
 fn exit_code(result: &Result<()>) -> std::process::ExitCode {
@@ -113,6 +189,7 @@ fn exit_code(result: &Result<()>) -> std::process::ExitCode {
         Err(e) if e.downcast_ref::<reap::ReapExit>().is_some() => {
             std::process::ExitCode::from(e.downcast_ref::<reap::ReapExit>().map_or(1, |r| r.code))
         }
+        Err(e) if e.downcast_ref::<UpdateAvailable>().is_some() => std::process::ExitCode::from(UPDATE_AVAILABLE_EXIT),
         Err(_) => std::process::ExitCode::FAILURE,
     }
 }
@@ -124,6 +201,23 @@ enum Cmd {
     Pods(PodCmd),
     /// Open the interactive dashboard (arena-tui)
     Tui,
+    /// Install the newest release, after saying what changed since this build
+    ///
+    /// Reads the latest GitHub release and shows its changelog entries this build lacks, the
+    /// "action needed" and config lines first. Then it downloads `arena` and `arena-tui` for
+    /// this platform, checks them against the release's SHA256SUMS, checks the new `arena`
+    /// runs here, asks, and swaps both in where this binary is — the old ones kept as
+    /// `arena.prev` / `arena-tui.prev`. Dashboards still on the old build are listed.
+    /// Needs no config.
+    #[command(verbatim_doc_comment)]
+    Update {
+        /// Only say whether a newer release exists and what it changes (exit 10 if one does)
+        #[arg(long)]
+        check: bool,
+        /// Download and check the new binaries, but install nothing
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
     /// SSH proxy forwards: preview (plan) or write + reload (apply)
     #[command(subcommand, infer_subcommands = true)]
     Proxy(ProxyCmd),
@@ -370,6 +464,11 @@ enum BalanceCmd {
 /// `pods ask --ai`: claude or codex.
 fn parse_ai(s: &str) -> std::result::Result<arena_core::ask::Ai, String> {
     arena_core::ask::Ai::parse(s).ok_or_else(|| format!("`{s}` isn't claude or codex"))
+}
+
+/// `pods ask --effort`: low … max.
+fn parse_effort(s: &str) -> std::result::Result<arena_core::ask::Effort, String> {
+    arena_core::ask::Effort::parse(s).ok_or_else(|| format!("`{s}` isn't low, medium, high, xhigh or max"))
 }
 
 /// `balance set`'s account: a prepaid one.
@@ -1384,14 +1483,19 @@ enum PodCmd {
     /// one prompt to claude (ASK_AI, the default) or codex, with no tools. The answer is printed,
     /// and saved with the prompt under the state dir (<state>/<prefix>/ask/). Name pods, or
     /// --all for this cohort's. Quote the question: `arena pods ask apple "why is it slow?"`.
+    /// Each AI's model and effort: ASK_CLAUDE_MODEL/_EFFORT, ASK_CODEX_MODEL/_EFFORT (a small
+    /// model at low effort answers in seconds: `--ai codex --model gpt-6-luna --effort low`).
     #[command(verbatim_doc_comment)]
     Ask {
         /// claude or codex (default: ASK_AI, else claude)
         #[arg(long, value_parser = parse_ai)]
         ai: Option<arena_core::ask::Ai>,
-        /// The AI's model (default: its CLI's own)
+        /// The AI's model (default: ASK_CLAUDE_MODEL / ASK_CODEX_MODEL, else its CLI's own)
         #[arg(long)]
         model: Option<String>,
+        /// low, medium, high, xhigh or max (default: ASK_CLAUDE_EFFORT / ASK_CODEX_EFFORT, else the CLI's)
+        #[arg(long, value_parser = parse_effort)]
+        effort: Option<arena_core::ask::Effort>,
         /// Seconds the AI may take to answer
         #[arg(long, default_value_t = arena_core::ask::DEFAULT_TIMEOUT.as_secs(), value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
@@ -2825,6 +2929,10 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    // Before the config: an update needs none, and must work where it's broken.
+    if let Cmd::Update { check, dry_run } = cli.cmd {
+        return handle_update(check, dry_run, cli.yes).await;
+    }
     let cfg = Config::load(&cli.config)
         .with_context(|| format!("loading config {}", cli.config.display()))?;
 
@@ -2832,7 +2940,7 @@ async fn run() -> Result<()> {
     // for), so build the provider lazily — only for commands that actually talk to one.
     let provider = match cli.cmd {
         // The archive builds its own Hetzner client (its own token), and its cron path none.
-        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Gpus { .. } | Cmd::Offers { .. } | Cmd::Api(_) | Cmd::Archive(_) => None,
+        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Update { .. } | Cmd::Gpus { .. } | Cmd::Offers { .. } | Cmd::Api(_) | Cmd::Archive(_) => None,
         // Fleet-wide: every command spans all configured providers (create still targets
         // --provider). One configured backend behaves like that single provider.
         _ => Some(arena_core::provider::build_fleet(&cli.provider, &cfg, true)?),
@@ -2843,6 +2951,7 @@ async fn run() -> Result<()> {
 
     match cli.cmd {
         Cmd::Tui => launch_tui(&cli.provider, &cli.config),
+        Cmd::Update { .. } => unreachable!("handled before the config is read"),
         Cmd::Plan(c) => handle_plan(c, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &cli.config),
         Cmd::Cron(c) => handle_cron(c, &cfg, &cli.config, cli.yes, CRONTAB, std::env::var("HOME").ok().as_deref()).await,
@@ -5243,7 +5352,7 @@ fn hetzner_rows(cfg: &Config) -> Vec<String> {
     };
     vec![
         row("HETZNER_SERVER_TYPE", &o.server_type, " — `pods create/up --server-type` overrides it"),
-        row("HETZNER_LOCATION", o.location.as_deref().unwrap_or("-"), ""),
+        row("HETZNER_LOCATION", &o.locations.describe(), ""),
         row("HETZNER_IMAGE", &o.image, ""),
         key_row,
         format!(
@@ -5255,14 +5364,15 @@ fn hetzner_rows(cfg: &Config) -> Vec<String> {
 
 /// `config check`'s rows for `ASK_AI`: which AI `pods ask` (and the dashboard's `?`) sends to
 /// — `(default)` when unset — or `off`; where its binary is, or a ⚠ when it isn't installed for
-/// this user (advice: nothing fails until it's used). A value that isn't claude/codex/off is a
-/// ✗ row and the error the check fails on. Pure but for the binary lookup in `env`.
-fn ask_ai_rows(cfg: &Config, env: &arena_core::ask::AiEnv) -> (Vec<String>, Option<String>) {
-    use arena_core::ask::{ai, Setting};
+/// this user (advice: nothing fails until it's used). Then each AI's model and effort that is set
+/// (`ASK_CLAUDE_MODEL` … `ASK_CODEX_EFFORT`). A value its parser refuses is a ✗ row and one of the
+/// errors the check fails on. Pure but for the binary lookup in `env`.
+fn ask_ai_rows(cfg: &Config, env: &arena_core::ask::AiEnv) -> (Vec<String>, Vec<String>) {
+    use arena_core::ask::{ai, Ai, Setting};
     let key = ai::ASK_AI;
-    match Setting::from_config(cfg) {
-        Err(e) => (vec![format!("  ✗ {key:<28} {e}")], Some(e)),
-        Ok(Setting::Off) => (vec![format!("  ✓ {key:<28} off — `pods ask` and the dashboard's `?` refuse: nothing goes to an AI")], None),
+    let (mut rows, mut bad) = match Setting::from_config(cfg) {
+        Err(e) => (vec![format!("  ✗ {key:<28} {e}")], vec![e]),
+        Ok(Setting::Off) => (vec![format!("  ✓ {key:<28} off — `pods ask` and the dashboard's `?` refuse: nothing goes to an AI")], Vec::new()),
         Ok(Setting::Use(a)) => {
             let (mark, default) = if Setting::is_default(cfg) { ("·", " (default)") } else { ("✓", "") };
             let mut rows = vec![format!(
@@ -5274,9 +5384,23 @@ fn ask_ai_rows(cfg: &Config, env: &arena_core::ask::AiEnv) -> (Vec<String>, Opti
                 Some(p) => format!("      └ {}: {}", a.name(), p.display()),
                 None => format!("  ⚠ {:<28} {}", format!("{} binary", a.name()), ai::missing(a)),
             });
-            (rows, None)
+            (rows, Vec::new())
+        }
+    };
+    for a in [Ai::Claude, Ai::Codex] {
+        for (k, what) in [(ai::model_key(a), "model"), (ai::effort_key(a), "effort")] {
+            let Some(v) = cfg.get(k).map(str::trim).filter(|v| !v.is_empty()) else { continue };
+            let checked = if what == "model" { ai::check_model(v, k) } else { ai::check_effort(v, k).map(|e| e.name().to_string()) };
+            match checked {
+                Ok(v) => rows.push(format!("  ✓ {k:<28} {v} — {}'s {what}", a.name())),
+                Err(e) => {
+                    rows.push(format!("  ✗ {k:<28} {e}"));
+                    bad.push(e);
+                }
+            }
         }
     }
+    (rows, bad)
 }
 
 /// Print a config checklist for the selected provider + proxy + backup, never showing
@@ -5540,7 +5664,7 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
     println!("\nAsking an AI (`pods ask`, the dashboard's `?`):");
     let (rows, bad) = ask_ai_rows(cfg, &arena_core::ask::AiEnv::from_process());
     rows.iter().for_each(|l| println!("{l}"));
-    if let Some(e) = bad {
+    for e in bad {
         note_invalid_text(&mut missing, &e);
     }
 
@@ -5676,10 +5800,12 @@ async fn handle_backup(
     // The repo every pod's `origin` must be (else WRONG_ORIGIN: nothing committed or pushed).
     let origin = backup::configured_repo(cfg);
 
+    let missing = sel.endpoint_failures();
     // Back up only pods that actually have an SSH endpoint; report the rest.
     let targets = sel.named_targets(cfg)?;
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to back up)");
+        if !missing.is_empty() { return Err(BackupFailed { pods: missing }.into()); }
         return Ok(());
     }
 
@@ -5703,6 +5829,7 @@ async fn handle_backup(
             backup::backup_script_heredoc()
         );
         println!("\nPreview only — run without --dry-run to execute over SSH.");
+        if !missing.is_empty() { return Err(BackupFailed { pods: missing }.into()); }
         return Ok(());
     }
 
@@ -5725,7 +5852,8 @@ async fn handle_backup(
             (name, target, cmd)
         })
         .collect();
-    let t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}"), |name| locks.done(name)).await;
+    let mut t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}"), |name| locks.done(name)).await;
+    t.failed.extend(missing);
     println!(
         "\nDone: {} pushed, {} unchanged, {} skipped (main/master), {} failed.",
         t.pushed,
@@ -7972,14 +8100,14 @@ async fn handle_pods_bal(
             };
             reap::handle_reap(cmd, &env).await?;
         }
-        PodCmd::Ask { ai, model, timeout, dry_run, question, cohort, sel } => {
+        PodCmd::Ask { ai, model, effort, timeout, dry_run, question, cohort, sel } => {
             // Read-only on the pods, but it sends what it reads off this machine: `ASK_AI=off`
             // (or a malformed value) refuses before anything is listed or read.
             let (targets, question) = ask::split_question(&sel.targets, question).map_err(anyhow::Error::msg)?;
-            let chosen = arena_core::ask::ai::choose(cfg, ai).map_err(anyhow::Error::msg)?;
+            let pick = arena_core::ask::ai::pick(cfg, ai, model.as_deref(), effort).map_err(anyhow::Error::msg)?;
             let sel = select(provider, cfg, &Select { targets, opts: sel.opts }.args(), Unscoped::Refuse("ask about")).await?;
             let sel = cohort_only(cfg, sel, cohort);
-            let run = ask::AskRun { ai: chosen, model, timeout: Duration::from_secs(timeout), dry_run, question };
+            let run = ask::AskRun { pick, timeout: Duration::from_secs(timeout), dry_run, question };
             let env = arena_core::ask::AiEnv::from_process();
             let stop = || ask::stop_signals(interrupt.wait());
             ask::handle_ask(remote, cfg, &sel, run, &env, stop, &mut |l| println!("{l}"), &mut |l| eprintln!("{l}")).await?;
@@ -8090,7 +8218,9 @@ async fn handle_run(
 ) -> Result<()> {
     // Pods we can't reach yet are reported (not silently dropped), so a "run on every pod"
     // can't quietly skip part of the fleet while reporting success.
+    let missing = sel.endpoint_failures();
     let mut targets = sel.named_targets(cfg)?;
+    if targets.is_empty() && !missing.is_empty() { anyhow::bail!("no SSH endpoint for running pods: {}", missing.join(", ")); }
     targets.sort_by(|a, b| a.0.cmp(&b.0));
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint)");
@@ -8106,6 +8236,7 @@ async fn handle_run(
     let names: Vec<&str> = targets.iter().map(|(n, _)| n.as_str()).collect();
     if dry_run {
         println!("{}", run_preview(true, cmd, &remote_cmd, &names, timeout));
+        if !missing.is_empty() { anyhow::bail!("no SSH endpoint for running pods: {}", missing.join(", ")); }
         return Ok(());
     }
     if confirm_needed && !confirm(yes, &run_preview(false, cmd, &remote_cmd, &names, timeout))? {
@@ -8115,6 +8246,7 @@ async fn handle_run(
 
     let results = run_fleet(&remote, targets, &remote_cmd, timeout).await;
     let (lines, bad) = render_run(&results, compact);
+    let bad = bad + missing.len();
     for line in lines {
         println!("{line}");
     }
@@ -13408,7 +13540,8 @@ impl Selected {
                 Ok(t) => targets.push((pod, t)),
                 // A stopped or proxy-only pod says so, not "yet" (it won't get one by waiting).
                 Err(_) => eprintln!(
-                    "skip {} — {}",
+                    "{} {} — {}",
+                    if arena_core::status::endpoint_overdue(pod, arena_core::status::now_secs()) { "⚠ FAILED" } else { "skip" },
                     pod.name,
                     arena_core::fleet::no_endpoint_reason(pod).unwrap_or_else(|| "no SSH endpoint yet".into())
                 ),
@@ -13421,6 +13554,14 @@ impl Selected {
             anyhow::bail!("none of the selected pods ({}) has an SSH endpoint yet — check `arena pods list`", self.names());
         }
         Ok(targets)
+    }
+
+    /// Count running pods missing SSH beyond the boot grace as failed work, while still
+    /// allowing the rest of a fleet to be backed up, copied or run on.
+    fn endpoint_failures(&self) -> Vec<String> {
+        let now = arena_core::status::now_secs();
+        self.pods.iter().filter(|p| arena_core::status::endpoint_overdue(p, now))
+            .map(|p| p.name.clone()).collect()
     }
 
     /// [`ssh_targets`](Self::ssh_targets) keyed by pod name — what the per-pod runners take.
@@ -13988,7 +14129,7 @@ async fn pull_pods(
         .collect();
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to pull)");
-        return Ok(Pulled { failed: unreachable, ..Pulled::default() });
+        return Ok(Pulled { failures: sel.endpoint_failures().into_iter().map(|n| format!("{n}: no SSH endpoint after 10 minutes running")).collect(), failed: unreachable, ..Pulled::default() });
     }
 
     // Per-pod tiers: (tier name, dest, config). `big` is dropped when --no-big. The snapshot
@@ -14035,7 +14176,7 @@ async fn pull_pods(
             println!("⚠ {why}: where {repo} is a link (setup links it onto the /workspace volume), this pull would hold only the link");
         }
         println!("Preview only — run without --dry-run to copy.");
-        return Ok(Pulled::default());
+        return Ok(Pulled { failures: sel.endpoint_failures().into_iter().map(|n| format!("{n}: no SSH endpoint after 10 minutes running")).collect(), ..Pulled::default() });
     }
     let dest_msg = if no_big {
         format!("the dated snapshot {dir}/{label}/")
@@ -14219,6 +14360,9 @@ async fn pull_pods(
     }
     // A pod none of whose jobs started holds its lock no longer.
     locks.release_idle();
+    let missing = sel.endpoint_failures();
+    failed += missing.len();
+    failures.extend(missing.into_iter().map(|n| format!("{n}: no SSH endpoint after 10 minutes running")));
     let (mut ok, mut done) = (0, 0);
     while let Some(joined) = set.join_next_with_id().await {
         done += 1;
@@ -17753,13 +17897,24 @@ mod tests {
                     format!("  · {key} claude (default) — `pods ask` sends pods' state (keys masked) to Anthropic; `off` turns it off"),
                     format!("  ⚠ {:<28} claude not found on PATH or in ~/.local/bin — install it and log in, or use codex instead (`--ai codex`, or ASK_AI=codex)", "claude binary"),
                 ],
-                None
+                vec![]
             )
         );
         assert!(rows("ASK_AI=codex").0[0].starts_with(&format!("  ✓ {key} codex — `pods ask` sends pods' state (keys masked) to OpenAI")));
-        assert_eq!(rows("ASK_AI=off"), (vec![format!("  ✓ {key} off — `pods ask` and the dashboard's `?` refuse: nothing goes to an AI")], None));
+        assert_eq!(rows("ASK_AI=off"), (vec![format!("  ✓ {key} off — `pods ask` and the dashboard's `?` refuse: nothing goes to an AI")], vec![]));
         let (r, e) = rows("ASK_AI=gpt");
-        assert_eq!((r, e.as_deref()), (vec![format!("  ✗ {key} ASK_AI must be claude, codex or off (got gpt)")], Some("ASK_AI must be claude, codex or off (got gpt)")));
+        assert_eq!((r, e), (vec![format!("  ✗ {key} ASK_AI must be claude, codex or off (got gpt)")], vec!["ASK_AI must be claude, codex or off (got gpt)".to_string()]));
+        // Each AI's model and effort, where set: shown, or ✗ and failed on.
+        let (r, e) = rows("ASK_AI=off\nASK_CODEX_MODEL=gpt-6-luna\nASK_CODEX_EFFORT=LOW\nASK_CLAUDE_EFFORT=fast\nASK_CLAUDE_MODEL=\n");
+        assert_eq!(
+            r[1..],
+            [
+                format!("  ✗ {:<28} ASK_CLAUDE_EFFORT must be low, medium, high, xhigh or max (got fast)", "ASK_CLAUDE_EFFORT"),
+                format!("  ✓ {:<28} gpt-6-luna — codex's model", "ASK_CODEX_MODEL"),
+                format!("  ✓ {:<28} low — codex's effort", "ASK_CODEX_EFFORT"),
+            ]
+        );
+        assert_eq!(e, ["ASK_CLAUDE_EFFORT must be low, medium, high, xhigh or max (got fast)"]);
         let (r, _) = rows("ASK_AI=sk-ant-0123456789012345678901234567890");
         assert!(!r[0].contains("sk-ant"), "{r:?}");
         #[cfg(unix)]
@@ -17771,9 +17926,11 @@ mod tests {
         let (report, missing) = config_report(&Config::parse("MACHINE_NAME_PREFIX=devtest
 MACHINE_NAME_LIST=(apple)
 ASK_AI=gpt
+ASK_CODEX_MODEL=-x
 "), "hetzner");
         assert!(report.contains("\nAsking an AI (`pods ask`, the dashboard's `?`):\n  ✗ ASK_AI"), "{report}");
         assert!(missing.iter().any(|m| m == "ASK_AI (must be claude, codex or off)"), "{missing:?}");
+        assert!(missing.iter().any(|m| m.starts_with("ASK_CODEX_MODEL (isn't a model's name")), "{missing:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -17789,9 +17946,10 @@ ASK_AI=gpt
         let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
                     HETZNER_API_KEY=not-a-real-key\nGPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\n";
         // (what's added to the base, the keys the check must fail on)
-        let cases: [(&str, &[&str]); 31] = [
+        let cases: [(&str, &[&str]); 32] = [
             ("", &[]),
             ("ASK_AI=gpt", &["ASK_AI"]),
+            ("ASK_CODEX_EFFORT=fast\nASK_CLAUDE_MODEL=a b", &["ASK_CLAUDE_MODEL", "ASK_CODEX_EFFORT"]),
             ("SHARED_SSH_KEY_PATH=/nonexistent/k\nGIT_SSH_KEY_LOCAL=/nonexistent/d", &[]),
             ("BACKUP_TIMEOUT_SECS=soon", &["BACKUP_TIMEOUT_SECS"]),
             // `set-branch --hard`'s save limit (review ai-review claude #6).
@@ -18309,6 +18467,22 @@ ASK_AI=gpt
         // Without the backup line selected, only the asked-for lines render.
         let kinds: Vec<super::CronKind> = cron_kinds(false, false, true, Some("/w")).into_iter().map(|(k, _)| k).collect();
         assert_eq!(kinds, [super::CronKind::Proxy, super::CronKind::Snapshot]);
+    }
+
+    /// `update --check` exits 10 when a newer release exists, apart from up to date (0) and
+    /// couldn't check (1); the version it compares is this build's, with its commit after it.
+    #[test]
+    fn update_check_exits_10_for_a_newer_release_and_this_build_has_a_version() {
+        use super::{exit_code, UpdateAvailable, UPDATE_AVAILABLE_EXIT};
+        use std::process::ExitCode;
+        assert_eq!(UPDATE_AVAILABLE_EXIT, 10);
+        assert_eq!(exit_code(&Err(UpdateAvailable.into())), ExitCode::from(10));
+        assert_eq!(exit_code(&Err(anyhow::anyhow!("GET …/releases/latest: HTTP 403"))), ExitCode::FAILURE);
+        assert!(arena_core::update::Version::parse(env!("ARENA_VERSION")).is_some(), "{}", env!("ARENA_VERSION"));
+        assert!(!env!("ARENA_COMMIT").is_empty() && !env!("ARENA_TARGET").is_empty());
+        let log = arena_core::update::entries(super::CHANGELOG);
+        assert!(log.len() >= 3, "the compiled-in changelog has its entries");
+        assert!(log.iter().all(|e| e.heading.len() > 13 && e.heading.as_bytes()[4] == b'-' && e.heading.contains(" · ")), "headings are `YYYY-MM-DD · …`");
     }
 
     /// Finding #25: a refusal for lack of a terminal (no --yes) exits 2 — it exited 0 after

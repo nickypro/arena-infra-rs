@@ -136,6 +136,131 @@ pub fn choose(cfg: &Config, flag: Option<Ai>) -> Result<Ai, String> {
     }
 }
 
+/// How hard the AI thinks before it answers — claude's `--effort`, codex's
+/// `model_reasoning_effort` — at the levels both CLIs take. Lower is quicker: a pod's state
+/// rarely needs more than `low`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    pub const ALL: [Effort; 5] = [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Xhigh => "xhigh",
+            Effort::Max => "max",
+        }
+    }
+
+    /// `low` … `max` (any case, surrounding space ignored).
+    pub fn parse(s: &str) -> Option<Effort> {
+        let s = s.trim().to_ascii_lowercase();
+        Effort::ALL.into_iter().find(|e| e.name() == s)
+    }
+}
+
+/// The config key for `ai`'s model (`ASK_CLAUDE_MODEL`, `ASK_CODEX_MODEL`).
+pub fn model_key(ai: Ai) -> &'static str {
+    match ai {
+        Ai::Claude => "ASK_CLAUDE_MODEL",
+        Ai::Codex => "ASK_CODEX_MODEL",
+    }
+}
+
+/// The config key for `ai`'s effort (`ASK_CLAUDE_EFFORT`, `ASK_CODEX_EFFORT`).
+pub fn effort_key(ai: Ai) -> &'static str {
+    match ai {
+        Ai::Claude => "ASK_CLAUDE_EFFORT",
+        Ai::Codex => "ASK_CODEX_EFFORT",
+    }
+}
+
+/// A model's name as given (`--model`, `ASK_<AI>_MODEL`), trimmed: letters, digits and
+/// `. _ - : / @ [ ]` (`gpt-6-luna`, `sonnet`, `claude-opus-5-5[1m]`), at most 80, not starting
+/// with `-` — the CLI would read that as a flag. `what` names it in the error, which never quotes
+/// the value (it might be a pasted key).
+pub fn check_model(raw: &str, what: &str) -> Result<String, String> {
+    let m = raw.trim();
+    let ok = !m.is_empty() && m.len() <= 80 && !m.starts_with('-') && m.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-:/@[]".contains(&b));
+    if ok {
+        Ok(m.to_string())
+    } else {
+        Err(format!("{what} isn't a model's name (letters, digits and . _ - : / @ [ ], not starting with -)"))
+    }
+}
+
+/// An effort level as given (`--effort`, `ASK_<AI>_EFFORT`); the error quotes the value only
+/// when it is short and word-like, as [`Setting::from_config`]'s does.
+pub fn check_effort(raw: &str, what: &str) -> Result<Effort, String> {
+    Effort::parse(raw).ok_or_else(|| {
+        let raw = raw.trim();
+        let levels = "low, medium, high, xhigh or max";
+        if raw.len() <= 12 && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            format!("{what} must be {levels} (got {raw})")
+        } else {
+            format!("{what} must be {levels}")
+        }
+    })
+}
+
+/// What answers, and how: the AI, its model and its effort — `None` each for its CLI's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pick {
+    pub ai: Ai,
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
+}
+
+impl Pick {
+    /// `ai` with its CLI's own model and effort.
+    pub fn plain(ai: Ai) -> Pick {
+        Pick { ai, model: None, effort: None }
+    }
+
+    /// `ai` as the config sets it up: `ASK_<AI>_MODEL` and `ASK_<AI>_EFFORT`, unset or empty
+    /// for the CLI's own. A malformed one is the error ([`check_model`], [`check_effort`]).
+    pub fn from_config(cfg: &Config, ai: Ai) -> Result<Pick, String> {
+        let set = |key: &str| cfg.get(key).map(str::trim).filter(|v| !v.is_empty());
+        let model = set(model_key(ai)).map(|m| check_model(m, model_key(ai))).transpose()?;
+        let effort = set(effort_key(ai)).map(|e| check_effort(e, effort_key(ai))).transpose()?;
+        Ok(Pick { ai, model, effort })
+    }
+
+    /// `codex · gpt-6-luna · low effort`, or `claude` alone when nothing else is set.
+    pub fn label(&self) -> String {
+        let mut l = self.ai.name().to_string();
+        if let Some(m) = &self.model {
+            l.push_str(&format!(" · {m}"));
+        }
+        if let Some(e) = self.effort {
+            l.push_str(&format!(" · {} effort", e.name()));
+        }
+        l
+    }
+}
+
+/// What answers: [`choose`]'s AI as the config sets it up ([`Pick::from_config`]), then `model`
+/// and `effort` (`--model`, `--effort`) over the config's.
+pub fn pick(cfg: &Config, ai: Option<Ai>, model: Option<&str>, effort: Option<Effort>) -> Result<Pick, String> {
+    let mut p = Pick::from_config(cfg, choose(cfg, ai)?)?;
+    if let Some(m) = model {
+        p.model = Some(check_model(m, "--model")?);
+    }
+    if effort.is_some() {
+        p.effort = effort;
+    }
+    Ok(p)
+}
+
 /// claude's MCP configuration for a run: no servers ([`claude_args`]'s `--mcp-config`).
 pub const CLAUDE_NO_MCP: &str = r#"{"mcpServers":{}}"#;
 
@@ -146,8 +271,8 @@ pub const CLAUDE_NO_TOOL_FLAGS: &[&str] = &["--tools", "--safe-mode", "--strict-
 /// claude's argv: print mode, no tools of any kind (`--tools ''`, and `--safe-mode`: no hooks,
 /// MCP servers, CLAUDE.md or skills; `--strict-mcp-config` with an empty `--mcp-config`: no MCP
 /// servers from anywhere), no slash commands, no saved session, plain text out. The flags
-/// `scripts/ai-review` runs it with too.
-pub fn claude_args(model: Option<&str>) -> Vec<String> {
+/// `scripts/ai-review` runs it with too. Then `model` and `effort`, when set.
+pub fn claude_args(model: Option<&str>, effort: Option<Effort>) -> Vec<String> {
     let mut a: Vec<String> = [
         "-p",
         "--safe-mode",
@@ -165,6 +290,9 @@ pub fn claude_args(model: Option<&str>) -> Vec<String> {
     .to_vec();
     if let Some(m) = model {
         a.extend(["--model".to_string(), m.to_string()]);
+    }
+    if let Some(e) = effort {
+        a.extend(["--effort".to_string(), e.name().to_string()]);
     }
     a
 }
@@ -294,8 +422,9 @@ pub fn codex_overrides(disabled: &[String]) -> Vec<String> {
 /// servers, hooks, profiles, notify program) or execpolicy rules, and `mcp_servers` emptied
 /// besides (a system or managed config layer is still read); web search off, `disabled`
 /// ([`codex_disabled`]: every tool feature, always — [`ask`] runs it only once its `features list`
-/// has named each and shown nothing else on) turned off — and the prompt on stdin (`-`).
-pub fn codex_args(workdir: &Path, out: &Path, model: Option<&str>, disabled: &[String]) -> Vec<String> {
+/// has named each and shown nothing else on) turned off; `model` and `effort` when set — and the
+/// prompt on stdin (`-`).
+pub fn codex_args(workdir: &Path, out: &Path, model: Option<&str>, effort: Option<Effort>, disabled: &[String]) -> Vec<String> {
     let mut a: Vec<String> =
         ["exec", "-s", "read-only", "--skip-git-repo-check", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--color", "never", "-C"]
             .map(String::from)
@@ -305,6 +434,9 @@ pub fn codex_args(workdir: &Path, out: &Path, model: Option<&str>, disabled: &[S
     a.extend(codex_overrides(disabled));
     if let Some(m) = model {
         a.extend(["-m".to_string(), m.to_string()]);
+    }
+    if let Some(e) = effort {
+        a.extend(["-c".to_string(), format!("model_reasoning_effort=\"{}\"", e.name())]);
     }
     a.push("-".to_string());
     a
@@ -627,11 +759,12 @@ async fn check_tools_off(ai: Ai, bin: &Path, cwd: &Path, vars: &[(OsString, OsSt
     }
 }
 
-/// Ask `ai` `prompt` (on stdin) with `model` (or the CLI's own default), within `timeout`; the
-/// answer, made printable, or why there is none — a missing binary, a CLI that couldn't confirm
-/// its tools are off (it is then never sent the prompt), a timeout (the AI is stopped: SIGTERM,
-/// then SIGKILL), a failed run, an empty answer.
-pub async fn ask(ai: Ai, prompt: &str, model: Option<&str>, timeout: Duration, env: &AiEnv) -> Result<String, String> {
+/// Ask `pick`'s AI `prompt` (on stdin) with its model and effort (each, unset, the CLI's own),
+/// within `timeout`; the answer, made printable, or why there is none — a missing binary, a CLI
+/// that couldn't confirm its tools are off (it is then never sent the prompt), a timeout (the AI
+/// is stopped: SIGTERM, then SIGKILL), a failed run, an empty answer.
+pub async fn ask(pick: &Pick, prompt: &str, timeout: Duration, env: &AiEnv) -> Result<String, String> {
+    let (ai, model) = (pick.ai, pick.model.as_deref());
     let bin = find_bin(ai.name(), env).ok_or_else(|| missing(ai))?;
     let scratch = Scratch::new(&env.tmp).map_err(|e| format!("can't make a scratch directory in {}: {e}", env.tmp.display()))?;
     let empty = scratch.empty();
@@ -639,8 +772,8 @@ pub async fn ask(ai: Ai, prompt: &str, model: Option<&str>, timeout: Duration, e
     let vars = child_env(ai, env);
     let disabled = check_tools_off(ai, &bin, &empty, &vars, &scratch.codex_home(), timeout.min(DISCOVERY_TIMEOUT)).await?;
     let args = match ai {
-        Ai::Claude => claude_args(model),
-        Ai::Codex => codex_args(&empty, &answer_file, model, &disabled),
+        Ai::Claude => claude_args(model, pick.effort),
+        Ai::Codex => codex_args(&empty, &answer_file, model, pick.effort, &disabled),
     };
     let run = LocalRun { program: &bin, args: &args, cwd: &empty, env: &vars, input: prompt.as_bytes() };
     let out = match run_local_input(&run, ai.name(), Some(timeout)).await {
@@ -819,6 +952,44 @@ pub(crate) mod tests {
         assert!(c("ASK_AI=of", Some(Ai::Claude)).is_err());
     }
 
+    /// Each AI's model and effort come from its own keys, unset or empty for its CLI's own;
+    /// `--model`/`--effort` go over them, for the AI chosen; a bad value is an error that never
+    /// quotes what might be a key, and off still refuses.
+    #[test]
+    fn each_ai_has_its_own_model_and_effort() {
+        let cfg = Config::parse("ASK_CODEX_MODEL=gpt-6-luna\nASK_CODEX_EFFORT=Low\nASK_CLAUDE_EFFORT=\n");
+        let luna = Pick { ai: Ai::Codex, model: Some("gpt-6-luna".into()), effort: Some(Effort::Low) };
+        assert_eq!(Pick::from_config(&cfg, Ai::Codex), Ok(luna.clone()));
+        assert_eq!(Pick::from_config(&cfg, Ai::Claude), Ok(Pick::plain(Ai::Claude)), "codex's keys aren't claude's; empty is unset");
+        assert_eq!(luna.label(), "codex · gpt-6-luna · low effort");
+        assert_eq!(Pick::plain(Ai::Claude).label(), "claude");
+        assert_eq!(pick(&cfg, None, None, None), Ok(Pick::plain(Ai::Claude)), "ASK_AI unset: claude");
+        assert_eq!(pick(&cfg, Some(Ai::Codex), None, None), Ok(luna.clone()));
+        let over = pick(&cfg, Some(Ai::Codex), Some(" gpt-6.1-sol "), Some(Effort::Medium)).unwrap();
+        assert_eq!((over.model.as_deref(), over.effort), (Some("gpt-6.1-sol"), Some(Effort::Medium)), "the flags over the config");
+        assert!(pick(&Config::parse("ASK_AI=off\nASK_CODEX_MODEL=x\n"), Some(Ai::Codex), None, None).unwrap_err().contains("ASK_AI=off"));
+        assert_eq!(pick(&cfg, None, Some("--tools=Bash"), None).unwrap_err(), "--model isn't a model's name (letters, digits and . _ - : / @ [ ], not starting with -)");
+
+        for good in ["sonnet", "claude-opus-5-5[1m]", "gpt-6-luna", "org/model:v2@x"] {
+            assert_eq!(check_model(good, "M").as_deref(), Ok(good));
+        }
+        for bad in ["", " ", "-m", "a b", "x;rm", "x\ny", &"m".repeat(81)] {
+            assert!(check_model(bad, "M").is_err(), "{bad:?}");
+        }
+        let e = |text: &str| Pick::from_config(&Config::parse(text), Ai::Codex).unwrap_err();
+        assert_eq!(e("ASK_CODEX_EFFORT=fast"), "ASK_CODEX_EFFORT must be low, medium, high, xhigh or max (got fast)");
+        assert_eq!(e("ASK_CODEX_EFFORT=sk-0123456789abcdefghij"), "ASK_CODEX_EFFORT must be low, medium, high, xhigh or max");
+        assert!(!e("ASK_CODEX_MODEL=sk-ant 0123456789").contains("sk-ant"), "a bad model isn't quoted");
+        // The environment may bring a model or an effort for one run; never `ASK_AI` (off is the
+        // config owner's).
+        let env = |k: &str| matches!(k, "ASK_CODEX_MODEL" | "ASK_CODEX_EFFORT" | "ASK_AI").then(|| if k == "ASK_AI" { "codex" } else if k == "ASK_CODEX_EFFORT" { "low" } else { "gpt-6-luna" }.to_string());
+        let c = Config::parse_with_env("", env);
+        assert_eq!(Pick::from_config(&c, Ai::Codex), Ok(luna.clone()));
+        assert_eq!(choose(&c, None), Ok(Ai::Claude), "ASK_AI isn't introduced from the environment");
+        assert_eq!(Effort::ALL.map(Effort::name), ["low", "medium", "high", "xhigh", "max"]);
+        assert!(Effort::ALL.iter().all(|e| Effort::parse(&e.name().to_uppercase()) == Some(*e)));
+    }
+
     /// The exact argv: claude with no built-in tools and no MCP server from anywhere (an empty
     /// `--mcp-config` under `--strict-mcp-config`); codex read-only, without the operator's
     /// config.toml and with `mcp_servers` emptied, every tool feature disabled — all of them,
@@ -827,7 +998,7 @@ pub(crate) mod tests {
     fn argv_have_no_tools() {
         let words = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            claude_args(Some("opus")),
+            claude_args(Some("opus"), Some(Effort::High)),
             words(&[
                 "-p",
                 "--safe-mode",
@@ -841,13 +1012,15 @@ pub(crate) mod tests {
                 "--output-format",
                 "text",
                 "--model",
-                "opus"
+                "opus",
+                "--effort",
+                "high"
             ])
         );
-        assert!(!claude_args(None).contains(&"--model".to_string()));
+        assert!(!claude_args(None, None).iter().any(|a| a == "--model" || a == "--effort"), "the CLI's own, unset");
         // Every flag claude's --help must list is one the argv uses.
         for f in CLAUDE_NO_TOOL_FLAGS {
-            assert!(claude_args(None).iter().any(|a| a == f), "{f}");
+            assert!(claude_args(None, None).iter().any(|a| a == f), "{f}");
         }
 
         let mut want = words(&[
@@ -887,10 +1060,10 @@ pub(crate) mod tests {
         ] {
             want.extend(words(&["--disable", f]));
         }
-        want.extend(words(&["--disable", "web_search_request", "-m", "gpt-x", "-"]));
+        want.extend(words(&["--disable", "web_search_request", "-m", "gpt-x", "-c", "model_reasoning_effort=\"low\"", "-"]));
         let disabled: Vec<String> = CODEX_TOOL_FEATURES.iter().chain(&["web_search_request"]).map(|f| f.to_string()).collect();
-        assert_eq!(codex_args(Path::new("/t/empty"), Path::new("/t/a.md"), Some("gpt-x"), &disabled), want);
-        assert_eq!(codex_args(Path::new("/t/empty"), Path::new("/t/a.md"), None, &disabled).last().map(String::as_str), Some("-"), "the prompt on stdin");
+        assert_eq!(codex_args(Path::new("/t/empty"), Path::new("/t/a.md"), Some("gpt-x"), Some(Effort::Low), &disabled), want);
+        assert_eq!(codex_args(Path::new("/t/empty"), Path::new("/t/a.md"), None, None, &disabled).last().map(String::as_str), Some("-"), "the prompt on stdin");
         let rows = |v: &[(&str, bool)]| v.iter().map(|(n, on)| (n.to_string(), *on)).collect::<Vec<_>>();
         assert_eq!(parse_features("shell_tool stable true\n\napps experimental false\nin_app_voice under development  true\n"), Ok(rows(&[("shell_tool", true), ("apps", false), ("in_app_voice", true)])));
     }
@@ -977,9 +1150,9 @@ pub(crate) mod tests {
             w => w.to_string(),
         };
         let printf = |words: &[String]| format!("printf '%s\\0' {}", words.iter().map(sh).collect::<Vec<_>>().join(" "));
-        assert!(text.contains(&printf(&claude_args(None))), "claude's argv");
+        assert!(text.contains(&printf(&claude_args(None, None))), "claude's argv");
         let tools: Vec<String> = CODEX_TOOL_FEATURES.iter().map(|f| f.to_string()).collect();
-        let codex = codex_args(Path::new("$WORK/empty"), Path::new("$DIR/codex.md"), None, &tools);
+        let codex = codex_args(Path::new("$WORK/empty"), Path::new("$DIR/codex.md"), None, None, &tools);
         let first_disable = codex.iter().position(|a| a == "--disable").unwrap();
         assert!(text.contains(&printf(&codex[..first_disable])), "codex's argv up to the features");
         assert!(text.contains(r#"mapfile -t disable <"$WORK/codex.disable""#), "the features its check chose");
@@ -1025,10 +1198,10 @@ pub(crate) mod tests {
     async fn claude_gets_the_prompt_on_stdin_and_no_tools_in_an_empty_dir() {
         let t = Tmp::new("claude");
         let env = recording_stubs(&t.0);
-        let answer = ask(Ai::Claude, "the PROMPT\nline 2\n", Some("sonnet"), Duration::from_secs(20), &env).await.unwrap();
+        let answer = ask(&Pick { ai: Ai::Claude, model: Some("sonnet".into()), effort: Some(Effort::Low) }, "the PROMPT\nline 2\n", Duration::from_secs(20), &env).await.unwrap();
         assert_eq!(answer, "ANSWER from claude");
         let argv: Vec<String> = rec(&t.0, "claude.argv").lines().map(String::from).collect();
-        assert_eq!(argv, claude_args(Some("sonnet")), "exactly the no-tools flags");
+        assert_eq!(argv, claude_args(Some("sonnet"), Some(Effort::Low)), "exactly the no-tools flags, then the model and effort");
         assert_eq!(rec(&t.0, "claude.stdin"), "the PROMPT\nline 2\n", "the prompt on stdin, never argv");
         assert!(rec(&t.0, "claude.cwd").trim().ends_with("/empty"), "{}", rec(&t.0, "claude.cwd"));
         assert_eq!(rec(&t.0, "claude.ls"), "", "nothing to read where it runs");
@@ -1047,14 +1220,14 @@ pub(crate) mod tests {
     async fn codex_runs_read_only_with_its_tools_off_and_answers_through_its_file() {
         let t = Tmp::new("codex");
         let env = recording_stubs(&t.0);
-        let answer = ask(Ai::Codex, "PROMPT", None, Duration::from_secs(20), &env).await.unwrap();
+        let answer = ask(&Pick { ai: Ai::Codex, model: None, effort: Some(Effort::Low) }, "PROMPT", Duration::from_secs(20), &env).await.unwrap();
         assert_eq!(answer, "ANSWER from codex", "the -o file, not its stdout chatter");
         let argv: Vec<String> = rec(&t.0, "codex.argv").lines().map(String::from).collect();
         let at = |flag: &str| argv.iter().position(|a| a == flag).map(|i| argv[i + 1].clone()).unwrap();
         let (cwd, out) = (at("-C"), at("-o"));
         assert_eq!(cwd, rec(&t.0, "codex.cwd").trim(), "-C is where it runs: the empty dir");
         let disabled = codex_disabled(&parse_features(&codex_features(&[])).unwrap());
-        assert_eq!(argv, codex_args(Path::new(&cwd), Path::new(&out), None, &disabled), "exactly the no-tools argv, the MCP override included");
+        assert_eq!(argv, codex_args(Path::new(&cwd), Path::new(&out), None, Some(Effort::Low), &disabled), "exactly the no-tools argv, the MCP override and the effort included");
         assert_eq!(rec(&t.0, "codex.stdin"), "PROMPT");
         assert!(!rec(&t.0, "codex.env").lines().any(|l| l.starts_with("CARGO")), "{}", rec(&t.0, "codex.env"));
     }
@@ -1082,7 +1255,7 @@ pub(crate) mod tests {
             let discovery = discovery_args(ai).join(" ");
             stub(&bin, ai.name(), &format!("case \"$*\" in '{discovery}'*)\n{describe}\nexit $? ;;\nesac\ncat > {}\necho ANSWER", ran.display()));
             let started = std::time::Instant::now();
-            let e = ask(ai, "the PROMPT", None, Duration::from_secs(secs), &env).await.unwrap_err();
+            let e = ask(&Pick::plain(ai), "the PROMPT", Duration::from_secs(secs), &env).await.unwrap_err();
             assert!(e.starts_with(&format!("{}: couldn't confirm its tools are off — not asked (", ai.name())), "{e}");
             assert!(e.contains(why), "{why} in {e}");
             assert!(!ran.exists(), "{}: it was run with the prompt after {why}", ai.name());
@@ -1152,14 +1325,14 @@ pub(crate) mod tests {
         for (one, two, why) in cases {
             std::fs::write(&first, one).unwrap();
             std::fs::write(&second, two).unwrap();
-            let e = ask(Ai::Codex, "the PROMPT", None, Duration::from_secs(20), &env).await.unwrap_err();
+            let e = ask(&Pick::plain(Ai::Codex), "the PROMPT", Duration::from_secs(20), &env).await.unwrap_err();
             assert!(e.starts_with("codex: couldn't confirm its tools are off — not asked (") && e.ends_with(why), "{why}: {e}");
             assert!(!ran.exists(), "{why}: it was sent the prompt");
         }
         // Both read whole, nothing unreviewed on: asked.
         std::fs::write(&first, &good).unwrap();
         std::fs::write(&second, &off).unwrap();
-        assert_eq!(ask(Ai::Codex, "the PROMPT", None, Duration::from_secs(20), &env).await.unwrap(), "ANSWER");
+        assert_eq!(ask(&Pick::plain(Ai::Codex), "the PROMPT", Duration::from_secs(20), &env).await.unwrap(), "ANSWER");
     }
 
     /// Review ai-review claude #1: what may stay on. The features turned off are every tool
@@ -1216,7 +1389,7 @@ pub(crate) mod tests {
         let mut env = recording_stubs(&t.0);
         let operator = t.0.join("operator-codex");
         env.vars.push(("CODEX_HOME".into(), operator.clone().into_os_string()));
-        assert_eq!(ask(Ai::Codex, "PROMPT", None, Duration::from_secs(20), &env).await.unwrap(), "ANSWER from codex");
+        assert_eq!(ask(&Pick::plain(Ai::Codex), "PROMPT", Duration::from_secs(20), &env).await.unwrap(), "ANSWER from codex");
         let argv = rec(&t.0, "codex.argv");
         for f in ["web_search_request", "goals", "sleep_tool", "shell_tool"] {
             assert!(argv.contains(&format!("--disable\n{f}\n")), "{f}: {argv}");
@@ -1233,7 +1406,7 @@ pub(crate) mod tests {
         let ran = t.0.join("ran");
         for (extra, ignored, named) in [(&["zzz_new"][..], &["unified_exec"][..], "zzz_new"), (&[][..], &["unified_exec", "shell_tool"][..], "shell_tool")] {
             stub(&bin, "codex", &format!("if [ \"$1\" = features ]; then\n{}\nexit 0; fi\ncat > {}\necho ANSWER", codex_features_sh(&[], extra, ignored, None), ran.display()));
-            let e = ask(Ai::Codex, "the PROMPT", None, Duration::from_secs(20), &env).await.unwrap_err();
+            let e = ask(&Pick::plain(Ai::Codex), "the PROMPT", Duration::from_secs(20), &env).await.unwrap_err();
             assert!(e.starts_with("codex: couldn't confirm its tools are off — not asked (`codex features list` shows "), "{e}");
             assert!(e.contains(&format!("shows {named} on with the ask's overrides — not known to give it no tool")), "{e}");
             assert!(!ran.exists(), "{named}: it was sent the prompt");
@@ -1244,9 +1417,9 @@ pub(crate) mod tests {
     async fn a_missing_binary_names_the_other_option() {
         let t = Tmp::new("missing");
         let env = AiEnv { path: Some(t.0.clone().into_os_string()), home: None, tmp: t.0.clone(), vars: Vec::new() };
-        let e = ask(Ai::Claude, "p", None, Duration::from_secs(5), &env).await.unwrap_err();
+        let e = ask(&Pick::plain(Ai::Claude), "p", Duration::from_secs(5), &env).await.unwrap_err();
         assert!(e.contains("claude not found") && e.contains("--ai codex") && e.contains("ASK_AI=codex"), "{e}");
-        let e = ask(Ai::Codex, "p", None, Duration::from_secs(5), &env).await.unwrap_err();
+        let e = ask(&Pick::plain(Ai::Codex), "p", Duration::from_secs(5), &env).await.unwrap_err();
         assert!(e.contains("codex not found") && e.contains("--ai claude"), "{e}");
     }
 
@@ -1263,17 +1436,17 @@ pub(crate) mod tests {
         stub(&bin, "claude", &format!("{help}\necho $$ > {}\ncat > /dev/null\nexec sleep 30", pidfile.display()));
         let env = AiEnv { path: Some(on_path(&bin)), home: None, tmp: t.0.clone(), vars: Vec::new() };
         let started = std::time::Instant::now();
-        let e = ask(Ai::Claude, "p", None, Duration::from_secs(1), &env).await.unwrap_err();
+        let e = ask(&Pick::plain(Ai::Claude), "p", Duration::from_secs(1), &env).await.unwrap_err();
         assert!(e.contains("didn't answer within 1s") && e.contains("stopped"), "{e}");
         assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
         let pid = std::fs::read_to_string(&pidfile).unwrap();
         assert!(!Path::new(&format!("/proc/{}", pid.trim())).exists(), "the stub is gone (pid {pid})");
 
         stub(&bin, "claude", &format!("{help}\necho 'partial' ; echo 'Error: not logged in' >&2; exit 3"));
-        let e = ask(Ai::Claude, "p", None, Duration::from_secs(10), &env).await.unwrap_err();
+        let e = ask(&Pick::plain(Ai::Claude), "p", Duration::from_secs(10), &env).await.unwrap_err();
         assert_eq!(e, "claude failed (exit 3): Error: not logged in");
         stub(&bin, "claude", &format!("{help}\ncat > /dev/null; printf '  \\n'"));
-        let e = ask(Ai::Claude, "p", None, Duration::from_secs(10), &env).await.unwrap_err();
+        let e = ask(&Pick::plain(Ai::Claude), "p", Duration::from_secs(10), &env).await.unwrap_err();
         assert!(e.starts_with("claude answered nothing"), "{e}");
     }
 

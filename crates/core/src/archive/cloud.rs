@@ -268,11 +268,9 @@ pub fn volume_body(names: &ArchiveNames, tier: Tier, size_gb: u32, server_id: u6
 }
 
 /// Whether a create-server error means "try the next server type" (and only that: a bad token
-/// or a quota error must stop, not walk the list).
-pub fn is_placement_error(e: &Error) -> bool {
-    let m = e.to_string().to_lowercase();
-    ["resource_unavailable", "placement_error", "server_type_unavailable", "server location disabled"].iter().any(|n| m.contains(n))
-}
+/// or a quota error must stop, not walk the list) — the fleet's test for "try the next
+/// location", one definition for both walks.
+pub use crate::provider::hetzner::is_placement_error;
 
 // ---------------------------------------------------------------------------------------
 // Parsing (pure, fail closed)

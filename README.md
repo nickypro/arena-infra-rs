@@ -129,6 +129,13 @@ cargo build --release      # target/release/arena and target/release/arena-tui
 
 Keep the two binaries side by side on your `PATH`: `arena tui` starts the `arena-tui` next to it.
 
+Or skip the build on Linux (x86_64 or arm64): download `arena-<platform>` and
+`arena-tui-<platform>` from the [latest release](https://github.com/nickypro/arena-infra-rs/releases/latest),
+check them against its `SHA256SUMS`, and make them executable, named `arena` and `arena-tui`.
+
+Later, `arena update` shows what changed since your build (anything you must do first) and
+installs the newest release in place, keeping `arena.prev`. `arena update --check` only says.
+
 ### 2. Get the keys
 
 - a **provider API key**: RunPod (Vast, Hetzner and Shadeform are optional);

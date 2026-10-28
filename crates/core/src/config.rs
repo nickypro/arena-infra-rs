@@ -104,6 +104,13 @@ impl Config {
         // shared config (Live 6 couldn't reach the "too big to save" path: the sandbox's file
         // doesn't set it).
         "DISCARD_MAX_GB",
+        // Each AI's model and effort for `pods ask` and the dashboard's `?` (`ask::ai::Pick`):
+        // `ASK_CODEX_MODEL=gpt-6-luna arena pods ask apple` tries a model for one run without
+        // editing the shared config. Not `ASK_AI` itself: `off` there is the config owner's call.
+        "ASK_CLAUDE_MODEL",
+        "ASK_CLAUDE_EFFORT",
+        "ASK_CODEX_MODEL",
+        "ASK_CODEX_EFFORT",
     ];
 
     /// Keys starting with this are **file-only**: the environment can neither override nor

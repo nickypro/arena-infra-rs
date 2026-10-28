@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use arena_core::ask::{self, ai, Ai, AiEnv};
+use arena_core::ask::{self, ai, AiEnv, Pick};
 use arena_core::remote::Remote;
 use arena_core::Config;
 
@@ -43,8 +43,8 @@ pub(crate) fn split_question(words: &[String], flag: Option<String>) -> Result<(
 
 /// What one `pods ask` was asked to do.
 pub(crate) struct AskRun {
-    pub ai: Ai,
-    pub model: Option<String>,
+    /// The AI, with its model and effort.
+    pub pick: Pick,
     pub timeout: Duration,
     pub dry_run: bool,
     /// `None`: [`ask::default_question`].
@@ -56,18 +56,19 @@ pub(crate) struct AskRun {
 /// knows every switch that takes its tools away — and codex only once that list, with them, shows
 /// nothing else on that isn't known to give it no tool (it then also turns off each web search
 /// feature, and each of `CODEX_OFF_WHEN_LISTED`, it lists).
-fn ai_command_line(ai: Ai, model: Option<&str>) -> String {
+fn ai_command_line(pick: &Pick) -> String {
+    let (ai, model) = (pick.ai, pick.model.as_deref());
     let args = match ai {
-        Ai::Claude => ai::claude_args(model),
-        Ai::Codex => {
+        ai::Ai::Claude => ai::claude_args(model, pick.effort),
+        ai::Ai::Codex => {
             let tools: Vec<String> = ai::CODEX_TOOL_FEATURES.iter().map(|f| f.to_string()).collect();
-            ai::codex_args(std::path::Path::new("<empty temp dir>"), std::path::Path::new("<answer file>"), model, &tools)
+            ai::codex_args(std::path::Path::new("<empty temp dir>"), std::path::Path::new("<answer file>"), model, pick.effort, &tools)
         }
     };
     let words: Vec<String> = args.iter().map(|a| arena_core::ssh::shell_word(a)).collect();
     let more = match ai {
-        Ai::Claude => "",
-        Ai::Codex => {
+        ai::Ai::Claude => "",
+        ai::Ai::Codex => {
             " and, with them, shows nothing else on that isn't known to give it no tool (each web search feature, and each \
              other one arena_core::ask::ai::CODEX_OFF_WHEN_LISTED names, that it lists is disabled too)"
         }
@@ -142,8 +143,8 @@ pub(crate) async fn handle_ask<S: Future<Output = &'static str>>(
         note(&format!(
             "[dry-run] nothing sent: the prompt above ({} bytes) would go to {} on the stdin of `{}",
             prompt.len(),
-            run.ai.vendor(),
-            ai_command_line(run.ai, run.model.as_deref())
+            run.pick.ai.vendor(),
+            ai_command_line(&run.pick)
         ));
         return Ok(());
     }
@@ -153,27 +154,26 @@ pub(crate) async fn handle_ask<S: Future<Output = &'static str>>(
         Err(_) => true,
     };
     if first {
-        note(&ask::privacy_note(run.ai));
+        note(&ask::privacy_note(run.pick.ai));
     }
     let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
     let about = match names.as_slice() {
         [one] => one.to_string(),
         many => format!("{} pods", many.len()),
     };
-    note(&format!("asking {} about {about}…", run.ai.name()));
+    note(&format!("asking {} about {about}…", run.pick.label()));
     let started = Instant::now();
     let stop = stop();
     let outcome = tokio::select! {
-        outcome = ai::ask(run.ai, &prompt, run.model.as_deref(), run.timeout, env) => outcome,
-        why = stop => Err(format!("interrupted ({why}): {} was stopped", run.ai.name())),
+        outcome = ai::ask(&run.pick, &prompt, run.timeout, env) => outcome,
+        why = stop => Err(format!("interrupted ({why}): {} was stopped", run.pick.ai.name())),
     };
     if let Ok(answer) = &outcome {
         out(answer);
     }
     let saved = runs.and_then(|dir| {
         let record = ask::Run {
-            ai: run.ai,
-            model: run.model.as_deref(),
+            pick: &run.pick,
             pods,
             prompt: &prompt,
             outcome: &outcome,
@@ -193,6 +193,7 @@ pub(crate) async fn handle_ask<S: Future<Output = &'static str>>(
 mod tests {
     use super::*;
     use arena_core::ask::ai::fixtures::recording_stubs;
+    use arena_core::ask::{Ai, Effort};
     use arena_core::ask::bundle::fixtures::busy;
     use arena_core::remote::FakeRemote;
     use arena_core::Pod;
@@ -244,7 +245,7 @@ mod tests {
     }
 
     fn run(ai: Ai, dry_run: bool, question: Option<&str>) -> AskRun {
-        AskRun { ai, model: None, timeout: Duration::from_secs(20), dry_run, question: question.map(String::from) }
+        AskRun { pick: Pick::plain(ai), timeout: Duration::from_secs(20), dry_run, question: question.map(String::from) }
     }
 
     #[test]
@@ -313,13 +314,18 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("prompt.txt")).unwrap(), sent);
         assert_eq!(std::fs::read_to_string(dir.join("answer.md")).unwrap(), "ANSWER from codex\n");
 
-        // The second time: no note.
+        // The second time: no note. A model and an effort go to the AI, the notes and the record.
         let (mut out, mut notes) = (Vec::new(), Vec::new());
-        handle_ask(fake_alpha(), &c, &sel, run(Ai::Claude, false, Some("ok?")), &env, never, &mut |l| out.push(l.to_string()), &mut |l| notes.push(l.to_string()))
-            .await
-            .unwrap();
+        let sonnet = AskRun { pick: Pick { ai: Ai::Claude, model: Some("sonnet".into()), effort: Some(Effort::Low) }, ..run(Ai::Claude, false, Some("ok?")) };
+        handle_ask(fake_alpha(), &c, &sel, sonnet, &env, never, &mut |l| out.push(l.to_string()), &mut |l| notes.push(l.to_string())).await.unwrap();
         assert_eq!(out, ["ANSWER from claude"]);
         assert!(!notes.iter().any(|n| n.starts_with("note:")), "{notes:?}");
+        assert!(notes.iter().any(|n| n == "asking claude · sonnet · low effort about devtest-alpha…"), "{notes:?}");
+        let argv = std::fs::read_to_string(t.0.join("rec").join("claude.argv")).unwrap();
+        assert!(argv.ends_with("\n--model\nsonnet\n--effort\nlow\n"), "{argv}");
+        let saved = notes.iter().find_map(|n| n.strip_prefix("saved: ")).expect("saved");
+        let record = std::fs::read_to_string(std::path::Path::new(saved).join("run.txt")).unwrap();
+        assert!(record.starts_with("ai: claude\nmodel: sonnet\neffort: low\n"), "{record}");
     }
 
     /// Ctrl-C while the AI is thinking (review ai-review claude #4): the AI runs in a session of

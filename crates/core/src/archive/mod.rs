@@ -254,7 +254,11 @@ pub struct ArchiveSettings {
 impl ArchiveSettings {
     pub fn from_config(cfg: &Config) -> Result<Self, String> {
         let get = |k: &str| cfg.get(k).map(str::trim).filter(|v| !v.is_empty());
-        let location = get("ARCHIVE_LOCATION").or_else(|| get("HETZNER_LOCATION")).unwrap_or("nbg1").to_string();
+        // One location: the archive's server and its volumes must share it, so it can't walk as a
+        // fleet create does. HETZNER_LOCATION's first named one when it lists any (`any` alone
+        // names none), else nbg1.
+        let fleet = crate::provider::hetzner::Locations::parse(get("HETZNER_LOCATION"));
+        let location = get("ARCHIVE_LOCATION").or_else(|| fleet.first()).unwrap_or("nbg1").to_string();
         if !simple_word(&location) {
             return Err(format!("ARCHIVE_LOCATION `{location}`: a Hetzner location name like nbg1"));
         }
@@ -511,6 +515,11 @@ mod tests {
         // ARCHIVE_LOCATION wins over the fleet's.
         let s = ArchiveSettings::from_config(&Config::parse("HETZNER_LOCATION=fsn1\nARCHIVE_LOCATION=hel1\n")).unwrap();
         assert_eq!(s.location, "hel1");
+        // The fleet's walks; the archive takes one place: its first named location, else nbg1.
+        for (fleet, want) in [("any", "nbg1"), ("\"hel1,any\"", "hel1"), ("\"fsn1, nbg1\"", "fsn1"), ("\"any fsn1\"", "fsn1")] {
+            let s = ArchiveSettings::from_config(&Config::parse(&format!("HETZNER_LOCATION={fleet}\n"))).unwrap();
+            assert_eq!(s.location, want, "{fleet}");
+        }
     }
 
     #[test]

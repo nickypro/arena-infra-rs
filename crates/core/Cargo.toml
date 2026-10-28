@@ -14,6 +14,9 @@ reqwest.workspace = true
 tokio = { workspace = true, features = ["io-util", "net"] }
 async-trait.workspace = true
 thiserror.workspace = true
+# SHA-256 for `arena update`'s checksum check (update.rs). Already in the lock file via
+# reqwest's rustls.
+ring = "0.17"
 
 [target.'cfg(unix)'.dependencies]
 # `kill(pid, SIGTERM)` for a graceful stop of a timed-out ssh/scp child (remote.rs);
