@@ -1139,7 +1139,8 @@ ones included — the listing walks every page).
 organization, every workspace's. Without `OPENROUTER_WORKSPACE`, keys are listed and created in the
 Default workspace, as before. Set `OPENROUTER_WORKSPACE` to a workspace's id or slug and every call is
 scoped to it: the listing asks for that workspace and drops keys that say otherwise, new keys go
-there (a key the answer says landed elsewhere is deleted again and the command fails), and a revoke,
+there (a key that landed elsewhere fails the command, which names its hash to delete by hand —
+nothing is deleted automatically), and a revoke,
 rotate or rename first reads the key and refuses one from another workspace. The workspace is looked
 up once (`GET /workspaces/<id or slug>`) and must come back as itself; one that can't be resolved, or
 a listing whose keys don't say their workspace, fails the command — it never falls back to the

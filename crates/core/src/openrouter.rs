@@ -203,7 +203,19 @@ impl OpenRouter {
         let field = |k: &str| data.and_then(|d| d.get(k)).and_then(|s| s.as_str());
         let hash = field("hash").unwrap_or_default().to_string();
         if let Some(ws) = ws.as_deref() {
-            let landed = field("workspace_id");
+            let mut landed = field("workspace_id").map(String::from);
+            // An answer that doesn't say: ask where the key is (as a revoke would) before
+            // calling it misplaced — otherwise every create would fail if the API stopped
+            // echoing workspace_id (review round 3).
+            if landed.is_none() && valid_hash(&hash).is_ok() {
+                if let Ok(v) = send_json(self.auth(self.client.get(format!("{}/{hash}", self.keys_url()))), "openrouter get key").await {
+                    let d = v.get("data");
+                    if d.and_then(|d| d.get("hash")).and_then(|s| s.as_str()) == Some(hash.as_str()) {
+                        landed = d.and_then(|d| d.get("workspace_id")).and_then(|s| s.as_str()).map(String::from);
+                    }
+                }
+            }
+            let landed = landed.as_deref();
             if !landed.is_some_and(|l| l.eq_ignore_ascii_case(ws)) {
                 return Err(Error::provider(format!(
                     "openrouter create key: the new key `{name}` landed in workspace {}, not OPENROUTER_WORKSPACE ({}) — \
@@ -1157,15 +1169,28 @@ mod tests {
             canned(200, json, &ws),
             canned(200, json, r#"{"key":"sk-or-v1-S1","data":{"hash":"d1","name":"devtest-a","workspace_id":"other"}}"#),
             canned(200, json, r#"{"key":"sk-or-v1-S2","data":{"hash":"d2","name":"devtest-a"}}"#),
+            canned(200, json, r#"{"data":{"hash":"d2"}}"#),
+            canned(200, json, r#"{"key":"sk-or-v1-S3","data":{"hash":"d3","name":"devtest-a"}}"#),
+            canned(200, json, &format!(r#"{{"data":{{"hash":"d3","workspace_id":"{ours}"}}}}"#)),
         ]);
         let or = test_client("K", &srv.base).with_workspace(Some("arena-dev-test"));
         let e = or.create_key("devtest-a", Some(1.0)).await.unwrap_err().to_string();
         assert!(e.contains("landed in workspace other") && e.contains("hash d1") && !e.contains("sk-or"), "{e}");
         let e = or.create_key("devtest-a", Some(1.0)).await.unwrap_err().to_string();
         assert!(e.contains("(not said)") && e.contains("hash d2"), "{e}");
+        // An answer that doesn't say, but the key itself is in the workspace: fine.
+        let k = or.create_key("devtest-a", Some(1.0)).await.unwrap();
+        assert_eq!((k.hash.as_str(), k.secret.as_str()), ("d3", "sk-or-v1-S3"));
         assert_eq!(
             *srv.requests.lock().unwrap(),
-            ["GET /workspaces/arena-dev-test HTTP/1.1", "POST /keys HTTP/1.1", "POST /keys HTTP/1.1"],
+            [
+                "GET /workspaces/arena-dev-test HTTP/1.1",
+                "POST /keys HTTP/1.1",
+                "POST /keys HTTP/1.1",
+                "GET /keys/d2 HTTP/1.1",
+                "POST /keys HTTP/1.1",
+                "GET /keys/d3 HTTP/1.1",
+            ],
             "no DELETE"
         );
     }
