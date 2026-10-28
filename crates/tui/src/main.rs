@@ -641,6 +641,19 @@ async fn refresh(
             a.last = Some(tokio::time::Instant::now());
         }
     }
+    // `SSH_CONFIG_FILE` kept current, as `pods list` keeps it: from a complete listing only (a
+    // provider that failed would drop its pods' blocks), written only when an endpoint moved; a
+    // failure is a status-line warning, never more.
+    let ssh_warning = if partial.is_empty() {
+        // No home under test: a `~/` value can't reach the developer's own ~/.ssh.
+        let home = if cfg!(test) { None } else { std::env::var("HOME").ok() };
+        match arena_core::sshconfig::sync_for(cfg, &pods, home.as_deref()) {
+            Some(Err(e)) => Some(format!("ssh config not rewritten: {e}")),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let observing = async {
         match details.balance.as_ref().filter(|_| balance_due) {
             Some(b) => Some(observe_balance(b, now).await),
@@ -701,7 +714,7 @@ async fn refresh(
         s.ai = Some(view);
     }
     let warnings: Vec<&str> =
-        [&details.warning, &proxy_warning, &health_warning].into_iter().flatten().map(String::as_str).collect();
+        [&details.warning, &proxy_warning, &health_warning, &ssh_warning].into_iter().flatten().map(String::as_str).collect();
     s.status = status_line(&s.summary, &warnings);
     s.metrics = metrics;
     if let Some(v) = balance_views {
@@ -4246,6 +4259,72 @@ deep_check_end=1
         refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, true).await;
         assert_eq!(api.live_calls(), 1, "at most one live read per FRESH");
         assert_eq!(shared.lock().unwrap().balance[0].balance, Some(100.0));
+    }
+
+    /// The dashboard keeps `SSH_CONFIG_FILE` current, as `pods list` does (spec
+    /// ssh-config-include): a complete listing writes it, the same listing again leaves it alone,
+    /// a listing a provider failed never rewrites it (its pods would vanish), and a file that
+    /// isn't arena's stays as it is, with a warning on the status line.
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_keeps_the_ssh_config_file_current() {
+        type Listings = Vec<(&'static str, std::result::Result<Vec<Pod>, &'static str>)>;
+        struct Scripted(Mutex<Listings>);
+        #[async_trait::async_trait]
+        impl Provider for Scripted {
+            fn name(&self) -> &'static str {
+                "fleet"
+            }
+            fn describe(&self, _spec: &PodSpec) -> String {
+                String::new()
+            }
+            async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
+                panic!("the dashboard lists per provider")
+            }
+            async fn list_by_provider(&self) -> Vec<(String, arena_core::Result<Vec<Pod>>)> {
+                self.0.lock().unwrap().iter().map(|(p, r)| (p.to_string(), r.clone().map_err(arena_core::Error::provider))).collect()
+            }
+            async fn create_pod(&self, _spec: &PodSpec) -> arena_core::Result<Pod> {
+                panic!("a refresh must never create a pod")
+            }
+            async fn stop_pod(&self, _id: &str) -> arena_core::Result<()> {
+                panic!("a refresh must never stop a pod")
+            }
+            async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
+                panic!("a refresh must never restart a pod")
+            }
+            async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
+                panic!("a refresh must never terminate a pod")
+            }
+        }
+        use arena_core::sshconfig::{managed_text, render_manual};
+        let dir = tmp("sshconfig");
+        let path = dir.0.join("arena.conf");
+        let cfg = cfg(&format!("SSH_CONFIG_FILE={}\n", path.display()));
+        let want = |p: &Pod| managed_text(&render_manual("devtest", "root", "/nonexistent/devtest_key", std::slice::from_ref(p)));
+        let alpha = pod("alpha", "runpod", "rp1", 1, Some(22001));
+        let provider = Scripted(Mutex::new(vec![("runpod", Ok(vec![alpha.clone()])), ("vast", Ok(vec![]))]));
+        let remote: Arc<dyn Remote> = Arc::new(FakeRemote::new());
+        let shared = Mutex::new(Shared::default());
+        let mut details = DetailsState::default();
+        let opts = ProbeOpts::default();
+        let read = || std::fs::read_to_string(&path).unwrap();
+        refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
+        assert_eq!(read(), want(&alpha));
+        // alpha moved while vast fails to list: not rewritten.
+        let moved = pod("alpha", "runpod", "rp1", 2, Some(22002));
+        *provider.0.lock().unwrap() = vec![("runpod", Ok(vec![moved.clone()])), ("vast", Err("vast list HTTP 429"))];
+        refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
+        assert_eq!(read(), want(&alpha));
+        // Complete again: rewritten.
+        *provider.0.lock().unwrap() = vec![("runpod", Ok(vec![moved.clone()])), ("vast", Ok(vec![]))];
+        refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
+        assert_eq!(read(), want(&moved));
+        // Someone's own file: untouched, said on the status line.
+        std::fs::write(&path, "Host mine\n").unwrap();
+        refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
+        assert_eq!(read(), "Host mine\n");
+        let status = shared.lock().unwrap().status.clone();
+        assert!(status.contains("ssh config not rewritten") && status.contains("isn't arena's"), "{status}");
     }
 
     /// A fleet whose every provider fails to list.

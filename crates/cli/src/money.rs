@@ -1024,6 +1024,33 @@ mod tests {
         Fleet { backends: vec![("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.5, 1)])), ("vast", Ok(vec![]))] }
     }
 
+    /// `pods list` keeps `SSH_CONFIG_FILE` current from its own listing (spec ssh-config-include):
+    /// written when an endpoint moved, untouched (and nothing said) when none did, never from a
+    /// listing a provider failed; the note goes with the warnings (stderr), the table and
+    /// `--json` stay as they were.
+    #[tokio::test]
+    async fn pods_list_keeps_the_ssh_config_file_current() {
+        let path = std::env::temp_dir().join(format!("arena-list-sshconfig-{}.conf", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom)\nSSH_CONFIG_FILE={}\n", path.display()));
+        let fleet = |port| Fleet { backends: vec![("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.5, port)])), ("vast", Ok(vec![]))] };
+        let (out, err) = crate::list_with(&fleet(22001), &no_remote(), &cfg, &no_balance(), false, false).await.unwrap();
+        assert!(out.contains("devtest-apple"), "{out}");
+        assert_eq!(err, [format!("[ssh-config] after pods list: rewrote {}", path.display())]);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Host devtest-apple\n    HostName 203.0.113.7\n    Port 22001\n"));
+        let (json, err) = crate::list_with(&fleet(22001), &no_remote(), &cfg, &no_balance(), true, false).await.unwrap();
+        assert!(err.is_empty(), "nothing moved: {err:?}");
+        assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok(), "stdout stays JSON");
+        let (_, err) = crate::list_with(&fleet(22002), &no_remote(), &cfg, &no_balance(), false, false).await.unwrap();
+        assert_eq!(err.len(), 1, "{err:?}");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Port 22002"));
+        let partial = Fleet { backends: vec![("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.5, 22003)])), ("vast", Err("HTTP 429"))] };
+        let (_, err) = crate::list_with(&partial, &no_remote(), &cfg, &no_balance(), false, false).await.unwrap();
+        assert!(err.iter().all(|w| !w.contains("[ssh-config]")), "{err:?}");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Port 22002"), "a partial listing rewrites nothing");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn pods_list_footer_shows_balance() {
         let dir = StateDir::new("list-footer");

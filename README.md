@@ -60,8 +60,8 @@ they are.
 
 ```bash
 arena pods up -n 2 --no-setup              # create 2 pods; wait until each answers SSH
-arena ssh-config --out ~/.ssh/arena.conf   # a Host per pod (printed too)
-# once: make "Include ~/.ssh/arena.conf" the first line of ~/.ssh/config
+arena ssh-config --install                 # once: ~/.ssh/arena.conf, Included by ~/.ssh/config
+arena config set SSH_CONFIG_FILE '~/.ssh/arena.conf'   # once: keep it current
 ssh arena-apple                            # or VS Code: Remote-SSH: Connect to Host…
 arena pods list                            # GPU, $/h, endpoint; the fleet's cost and balance
 arena pods terminate --all                 # EVERY pod on the account, prefix or not; asks first
@@ -69,8 +69,9 @@ arena pods terminate --all                 # EVERY pod on the account, prefix or
 
 `--no-setup` skips provisioning, the one step that needs a cohort repo and its deploy key
 (without the flag, `up` stops before creating anything while they're unset): each pod is the
-image as it boots. A pod's endpoint moves when it restarts, so run `ssh-config --out` again
-after any change.
+image as it boots. A pod's endpoint moves when it restarts: with `SSH_CONFIG_FILE` set, every
+pod change, `pods list` and the dashboard rewrite `~/.ssh/arena.conf` when one moved, so
+`ssh arena-apple` keeps working. `ssh-config --install` shows what it changes and asks first.
 
 ### Running a cohort, or anything for an org?
 
