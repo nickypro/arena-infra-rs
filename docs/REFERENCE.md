@@ -131,24 +131,41 @@ commit: `arena 2.0.261027.1500 (5274b7a1c2)`.
 
 ```bash
 arena update --check     # newer release? what changed? (exit 10 = yes, 0 = up to date, 1 = couldn't tell)
-arena update --dry-run   # also download and check it, install nothing
+arena update --dry-run   # also download and check it (provenance included), install nothing
 arena update             # … then ask, and swap both binaries in (--yes to skip the question)
 sudo arena update        # where root runs arena from someone else's ~/.cargo/bin (prod)
 ```
 
 - **What changed:** the release's `CHANGELOG.md` entries that this build's own copy (compiled
   in) lacks, with their **Action needed** and **Config** lines first.
-- **Checks before anything changes:** both binaries must match `SHA256SUMS`, and the new
-  `arena --version` must run here and name the release. A wrong-platform or cut-short download
-  never replaces what cron runs.
+- **Checks before anything changes:** both binaries must match `SHA256SUMS`, must be proven
+  built by this repository's release workflow (below), and the new `arena --version` must run
+  here and name the release. A forged, wrong-platform or cut-short download never replaces what
+  cron runs, and a downloaded binary is only run once it is proven.
+- **Build provenance:** `release.yml` attests each binary (Sigstore: a statement naming the
+  file and its SHA-256, signed with a certificate GitHub Actions' OIDC token got for the run,
+  logged in Rekor). `update` reads each binary's attestation from GitHub's API (anonymous) and
+  verifies it here, natively, with no `gh` and no login: the signature; the certificate's chain
+  to Sigstore's public-good root (compiled in) and its certificate-transparency timestamp; the
+  Rekor entry (inclusion proof, checkpoint, signed timestamp); SLSA provenance naming that file
+  with that digest; and who signed: `.github/workflows/release.yml` on `refs/heads/master` of
+  `nickypro/arena-infra-rs` (GitHub's id 1368824951) on a GitHub-hosted runner. It says, per
+  binary, which run built it. `SHA256SUMS` alone comes from the same release, so it can't prove
+  that. No attestation, or one that doesn't verify: nothing is installed, and it says why.
+- **`--skip-attestation`:** installs without the provenance check (`SHA256SUMS` is still
+  checked), with a loud warning. It's for one case: a genuine release this build can't verify,
+  because Sigstore changed its keys or GitHub its attestation format after this build was made.
+  Check the release by hand first (`gh attestation verify arena-<target> --repo
+  nickypro/arena-infra-rs`, gh 2.49 or newer, on any machine), then update once with it; the new
+  build knows the new root. `--check` never reads attestations.
 - **The swap:** where this `arena` really is (symlinks resolved), the current binaries become
   `arena.prev` / `arena-tui.prev` (an older `.prev` is replaced). Each new one takes the old
   one's mode and owner, and lands by rename, so the path always holds a whole binary.
   Roll back with `mv -f arena.prev arena && mv -f arena-tui.prev arena-tui`.
 - **Afterwards:** it lists the `arena-tui` dashboards still running the replaced build, to
   restart. Cron picks the new `arena` up on its next run.
-- It needs no config and no GitHub login (the API allows 60 unauthenticated requests an hour).
-  Provenance: `gh attestation verify arena-<target> --repo nickypro/arena-infra-rs`.
+- It needs no config and no GitHub login (the API allows 60 unauthenticated requests an hour;
+  an update makes 3, with the attestations).
 
 ### Command shorthands
 
@@ -1984,6 +2001,18 @@ answered shows none — so another provider's outage delays the all-clear, never
 after 8 rounds without one it prints the commands to finish by hand. Only Ctrl+C gets past
 it, so after an interrupted run check `teardown --check`. A COMMUNITY pod that never gets a
 public IP fails as `FAILED endpoint` (see [`docs/TODO.md`](TODO.md)); the guard still cleans it up.
+
+### The live attestation check
+
+The offline tests verify a recorded attestation (`crates/core/src/fixtures/attestation_*.json`),
+so they can't notice Sigstore rotating a key or GitHub changing its bundles. This opt-in test
+does: it reads the latest release's `arena-x86_64-unknown-linux-gnu` attestation from GitHub
+(2 anonymous API requests, no account, nothing spent), verifies it as `arena update` does, and
+checks it doesn't verify as another workflow's or another repository's.
+
+```bash
+ARENA_LIVE_ATTEST=1 cargo test --release -p arena-core --lib attest -- --ignored --nocapture
+```
 
 ## AI review before merging
 

@@ -136,10 +136,12 @@ Keep the two binaries side by side on your `PATH`: `arena tui` starts the `arena
 
 Or skip the build on Linux (x86_64 or arm64): download `arena-<platform>` and
 `arena-tui-<platform>` from the [latest release](https://github.com/nickypro/arena-infra-rs/releases/latest),
-check them against its `SHA256SUMS`, and make them executable, named `arena` and `arena-tui`.
+check them against its `SHA256SUMS` and their build provenance (`gh attestation verify <file>
+--repo nickypro/arena-infra-rs`), and make them executable, named `arena` and `arena-tui`.
 
 Later, `arena update` shows what changed since your build (anything you must do first) and
-installs the newest release in place, keeping `arena.prev`. `arena update --check` only says.
+installs the newest release in place, keeping `arena.prev`, once it has verified that this
+repository's release workflow built it. `arena update --check` only says.
 
 ### 2. Get the keys
 

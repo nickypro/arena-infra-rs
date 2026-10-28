@@ -1,0 +1,52 @@
+# Dependabot: weekly update pull requests for the Rust dependencies (Cargo.toml / Cargo.lock)
+# and the workflows' actions (pinned by commit SHA; Dependabot moves the SHA and its version
+# comment together). Grouped, so a week brings one PR per ecosystem; a crate's semver-major bump
+# comes on its own, since it may need code changes (an action's major is mostly a runtime bump,
+# grouped with the rest). Each PR runs CI and Deps like any other.
+#
+# A version is proposed only once it has been out 7 days (`cooldown`): a hijacked crate or action
+# release is usually caught and yanked within days. Security updates (if enabled in the
+# repository's settings) skip the wait, and come grouped too.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+    # Indirect dependencies too (by default only Cargo.toml's are updated): most fixes land
+    # there (rustls, webpki-roots), and so does the Sigstore trust root `arena update` verifies
+    # against (sigstore-trust-root, compiled in).
+    allow:
+      - dependency-type: all
+    open-pull-requests-limit: 5
+    groups:
+      cargo:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        applies-to: version-updates
+        patterns: ["*"]
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]

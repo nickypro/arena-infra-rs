@@ -4,8 +4,17 @@
 # Linux x86_64 and arm64 on Ubuntu 22.04 (glibc 2.35: they run on 22.04 and newer, prod's
 # arm64 24.04 included) and publishes them with CHANGELOG.md and SHA256SUMS under the tag
 # v<version>. The version is the commit's time in UTC (crates/cli/build.rs), so one commit is
-# always one version. Build provenance is attested: `gh attestation verify <file> --repo
-# nickypro/arena-infra-rs`.
+# always one version.
+#
+# Build provenance is attested (Sigstore, logged in Rekor), one statement naming every
+# `dist/arena-*` file, and `arena update` refuses a binary whose attestation doesn't verify
+# (crates/core/src/attest.rs; by hand: `gh attestation verify <file> --repo
+# nickypro/arena-infra-rs`). It pins who signed: this file, `.github/workflows/release.yml`, run
+# on `refs/heads/master` of this repository (by GitHub's id for it, 1368824951) on a
+# GitHub-hosted runner, and each asset's name as a subject. Renaming or moving this file,
+# releasing from another branch, a self-hosted runner, or a re-created repository makes every
+# existing build refuse the new releases (until `arena update --skip-attestation`): change
+# `attest::RELEASE` with it, and expect one manual update.
 #
 # On a pull request that touches this file or build.rs, it builds and checks the binaries and
 # publishes nothing.

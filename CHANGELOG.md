@@ -14,6 +14,20 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-28 · `arena update` checks who built the release
+- `arena update` (and `--dry-run`) now verifies each new binary's build-provenance attestation
+  before installing it: that it was built by this repository's `release.yml` from master, on
+  GitHub's runners, as Sigstore's signature, certificate and transparency log prove. It checks
+  this here, with no `gh` and no GitHub login, and says which workflow run built each binary.
+  Until now it only checked `SHA256SUMS`, which comes from the same release as the binaries.
+- A binary without an attestation, or with one that doesn't verify, is not installed, and the
+  message says why. `arena update --skip-attestation` installs without this check, with a loud
+  warning: only for a genuine release this build can't verify (after Sigstore changes its keys),
+  checked first with `gh attestation verify`. `--check` is unchanged.
+- An update makes 3 GitHub API requests instead of 1 (of the 60 an hour allowed without a login).
+- Dependencies with security advisories updated (rustls, rustls-webpki, webpki-roots, tokio,
+  anyhow).
+
 ## 2026-10-28 · `offers` shows every provider, Hetzner too; `--help` lists commands in groups
 - `arena offers` is one table over every provider with a key in the config (RunPod, Vast,
   Hetzner): each row is an option `pods up` would try there, `#` the order it would try them in,

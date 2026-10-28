@@ -205,7 +205,7 @@ async fn an_update_installs_both_binaries_and_keeps_the_old_ones() {
     std::fs::write(dir.join("arena-tui"), "old tui").unwrap();
     let arena = fake_arena("2.0.261101.0900");
     let (srv, release) = release_server("new tui", &arena, ("new tui", &arena));
-    let staged = fetch(&test_client(), &release, T, &dir).await.unwrap();
+    let staged = fetch(&test_client(), &release, T, &dir, &Provenance::Skip).await.unwrap();
     assert_eq!(std::fs::read_to_string(dir.join("arena")).unwrap(), "old arena", "nothing in place before install");
     staged.install().unwrap();
     assert_eq!(std::fs::read_to_string(dir.join("arena")).unwrap(), arena);
@@ -231,24 +231,57 @@ async fn a_doubtful_download_installs_nothing() {
     };
 
     let (_srv, release) = release_server("tampered", &arena, ("new tui", &arena));
-    let e = fetch(&test_client(), &release, T, &dir).await.unwrap_err();
+    let e = fetch(&test_client(), &release, T, &dir, &Provenance::Skip).await.unwrap_err();
     assert!(e.contains("doesn't match SHA256SUMS"), "{e}");
     untouched(&dir);
 
     let other = fake_arena("2.0.250101.0000");
     let (_srv, release) = release_server("new tui", &other, ("new tui", &other));
-    let e = fetch(&test_client(), &release, T, &dir).await.unwrap_err();
+    let e = fetch(&test_client(), &release, T, &dir, &Provenance::Skip).await.unwrap_err();
     assert!(e.contains("not arena 2.0.261101.0900"), "{e}");
     untouched(&dir);
 
     let (_srv, release) = release_server("new tui", &arena, ("new tui", &arena));
-    let e = fetch(&test_client(), &release, "riscv64gc-unknown-linux-gnu", &dir).await.unwrap_err();
+    let e = fetch(&test_client(), &release, "riscv64gc-unknown-linux-gnu", &dir, &Provenance::Skip).await.unwrap_err();
     assert!(e.contains("has no `arena-tui-riscv64gc-unknown-linux-gnu`"), "{e}");
     untouched(&dir);
 
     let (_srv, release) = release_server("new tui", &arena, ("new tui", &arena));
-    drop(fetch(&test_client(), &release, T, &dir).await.unwrap());
+    drop(fetch(&test_client(), &release, T, &dir, &Provenance::Skip).await.unwrap());
     untouched(&dir);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Attestations from memory, by SHA-256; any other digest has none (GitHub's empty answer).
+struct Attested(HashMap<String, Value>);
+
+#[async_trait::async_trait]
+impl attest::Source for Attested {
+    async fn attestations(&self, sha256: &str) -> Result<Value> {
+        Ok(self.0.get(sha256).cloned().unwrap_or_else(|| json!({"attestations": []})))
+    }
+}
+
+/// A download whose SHA256SUMS matches but whose provenance isn't proven is refused before
+/// it is written, let alone run (the fake `arena` would leave `ran` behind): with no
+/// attestation at all, and with a genuine one (the real release's) that doesn't name it.
+#[tokio::test]
+async fn an_unproven_download_is_never_written_or_run() {
+    let dir = temp_dir("fetch-unproven");
+    std::fs::write(dir.join("arena"), "old arena").unwrap();
+    let arena = format!("#!/bin/sh\ntouch '{}'\necho 'arena 2.0.261101.0900 (0123456789)'\n", dir.join("ran").display());
+    let real = serde_json::from_str::<Value>(include_str!("fixtures/attestation_v2.0.261028.1916.json")).unwrap();
+    let sources = [
+        (Attested(HashMap::new()), "arena-tui-x86_64-unknown-linux-gnu: GitHub has no build-provenance attestation for it"),
+        (Attested(HashMap::from([(sha256_hex(b"new tui"), real)])), "arena-tui-x86_64-unknown-linux-gnu: its attestation doesn't prove it was built by"),
+    ];
+    for (source, said) in sources {
+        let (_srv, release) = release_server("new tui", &arena, ("new tui", &arena));
+        let provenance = Provenance::Verify { source: &source, expected: attest::RELEASE };
+        let e = fetch(&test_client(), &release, T, &dir, &provenance).await.unwrap_err();
+        assert!(e.starts_with(said) && e.ends_with("— not installed"), "{e}");
+        assert_eq!(names_in(&dir), ["arena"], "nothing staged, nothing run");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -266,7 +299,7 @@ async fn an_unwritable_install_dir_says_to_use_the_owner_or_sudo() {
     }
     let arena = fake_arena("2.0.261101.0900");
     let (_srv, release) = release_server("new tui", &arena, ("new tui", &arena));
-    let e = fetch(&test_client(), &release, T, &dir).await.unwrap_err();
+    let e = fetch(&test_client(), &release, T, &dir, &Provenance::Skip).await.unwrap_err();
     assert!(e.contains("can't write") && e.contains("sudo"), "{e}");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();

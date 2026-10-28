@@ -10,16 +10,20 @@
 //! and no entry needs a version number before its release exists. Each entry's
 //! `### Action needed` and `### Config` lines are said first.
 //!
-//! Nothing is replaced until both binaries are downloaded, match `SHA256SUMS`, and the new
-//! `arena --version` runs here and names the release ([`check_runs`]): a wrong-platform or
-//! truncated download never becomes the cron's `arena`. The swap itself is a rename, so the
-//! path always holds a whole binary ([`install`]).
+//! Nothing is replaced until both binaries are downloaded, match `SHA256SUMS`, are proven built
+//! by this repository's release workflow from master ([`crate::attest`]; `SHA256SUMS` comes
+//! from the same release, so it can't prove that), and the new `arena --version` runs here and
+//! names the release ([`check_runs`]): a forged, wrong-platform or truncated download never
+//! becomes the cron's `arena`, and a binary is only run once it is proven. The swap itself is a
+//! rename, so the path always holds a whole binary ([`install`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use reqwest::Client;
 use serde_json::Value;
+
+use crate::attest;
 
 /// An update step's outcome: its failure is a message for the operator, said as is.
 pub type Result<T> = std::result::Result<T, String>;
@@ -364,18 +368,40 @@ pub struct Staged {
     dir: PathBuf,
     /// `(name, staged path)`, `arena-tui` first so `arena` — the one cron runs — goes last.
     files: Vec<(&'static str, PathBuf)>,
+    /// Each binary's proven provenance, by asset name, in the same order (none when skipped).
+    pub proofs: Vec<(String, attest::Proof)>,
 }
 
-/// Download `release`'s binaries for `target` and its `SHA256SUMS`, check each against it,
-/// stage them in `dir` ([`stage`]) and check the new `arena` runs here ([`check_runs`]).
+/// How [`fetch`] checks each binary's build provenance.
+pub enum Provenance<'a> {
+    /// Each binary must be proven built as `expected` says ([`attest::verify`]), from the
+    /// attestations `source` has.
+    Verify { source: &'a dyn attest::Source, expected: attest::Expected },
+    /// Not checked (`update --skip-attestation`): `SHA256SUMS` and the version check only.
+    Skip,
+}
+
+/// Download `release`'s binaries for `target` and its `SHA256SUMS`, check each against it and
+/// its provenance ([`Provenance`]), stage them in `dir` ([`stage`]) and check the new `arena`
+/// runs here ([`check_runs`]). A binary is written, let alone run, only once it is proven.
 /// Nothing in `dir` changes but the staged files, and those go again on any failure.
-pub async fn fetch(client: &Client, release: &Release, target: &str, dir: &Path) -> Result<Staged> {
+pub async fn fetch(client: &Client, release: &Release, target: &str, dir: &Path, provenance: &Provenance<'_>) -> Result<Staged> {
+    let verifier = match provenance {
+        Provenance::Verify { .. } => Some(attest::verifier()?),
+        Provenance::Skip => None,
+    };
     let sums = parse_sums(&String::from_utf8_lossy(&download(client, release.asset("SHA256SUMS")?).await?));
-    let mut staged = Staged { dir: dir.to_path_buf(), files: Vec::new() };
+    let mut staged = Staged { dir: dir.to_path_buf(), files: Vec::new(), proofs: Vec::new() };
     for (name, asset_name) in binaries(target) {
         let asset = release.asset(&asset_name)?;
         let bytes = download(client, asset).await?;
         verify(&sums, &asset_name, &bytes)?;
+        if let (Provenance::Verify { source, expected }, Some(verifier)) = (provenance, &verifier) {
+            let proof = attest::verify(*source, verifier, expected, &asset_name, &sha256_hex(&bytes))
+                .await
+                .map_err(|e| format!("{e} — not installed"))?;
+            staged.proofs.push((asset_name.clone(), proof));
+        }
         let path = stage(dir, name, &bytes)
             .map_err(|e| format!("can't write {} ({e}) — run the update as the binaries' owner, or with sudo", dir.display()))?;
         staged.files.push((name, path));

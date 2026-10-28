@@ -3,6 +3,7 @@ name = "arena-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 serde.workspace = true
@@ -17,6 +18,13 @@ thiserror.workspace = true
 # SHA-256 for `arena update`'s checksum check (update.rs). Already in the lock file via
 # reqwest's rustls.
 ring = "0.17"
+# `arena update`'s build-provenance check (attest.rs): Sigstore's own bundle verifier, from the
+# sigstore org's sigstore-rust (sigstore-rs, the older `sigstore` crate, doesn't check the Rekor
+# inclusion proof or SET, and matches only an attestation's first subject). Without default
+# features: no TUF client or HTTP stack of its own (the public-good trust root it ships is
+# compiled in), and aws-lc-rs as its crypto (a C build like ring's; no OpenSSL). It re-exports
+# the trust root and bundle types (`sigstore_verify::{trust_root, types}`).
+sigstore-verify = { version = "0.15.1", default-features = false, features = ["aws-lc-rs"] }
 
 [target.'cfg(unix)'.dependencies]
 # `kill(pid, SIGTERM)` for a graceful stop of a timed-out ssh/scp child (remote.rs);

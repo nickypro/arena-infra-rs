@@ -1,0 +1,53 @@
+# cargo-deny: what the dependency tree may hold. Run by .github/workflows/deps.yml (on push, on
+# pull requests and daily); locally: `cargo deny check` (https://github.com/EmbarkStudios/cargo-deny).
+#
+# The workflow is not CI on purpose: Release runs on CI's success, and a newly published advisory
+# must not stop releases. A red Deps run is the signal to update or, with a reason, ignore below.
+
+[graph]
+# The platforms the releases are built for: crates only another platform pulls in (Windows,
+# wasm, UEFI) don't ship, so their advisories and licences don't matter here.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+# RustSec advisories (vulnerabilities, unsound, unmaintained) fail the check; so does a yanked
+# version in Cargo.lock (yanking is how a broken or unsafe release is withdrawn).
+yanked = "deny"
+# Advisories to ignore, each with why. Remove an entry once what it names is gone.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, with no fixed version; a proc-macro (compile time only) that ratatui 0.29 uses. ratatui 0.30 drops it: remove this with that bump" },
+]
+
+[licenses]
+# The licences the tree has today (`cargo deny list -l license`), all permissive: a new one fails
+# the check until it is looked at and added. An `OR` needs only one of these; `AND`, all.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    # ring, rustls, aws-lc
+    "ISC",
+    # subtle, aws-lc-sys
+    "BSD-3-Clause",
+    # ICU (url's IDNA)
+    "Unicode-3.0",
+    # foldhash (ratatui's hashbrown)
+    "Zlib",
+    # webpki-roots (the Mozilla CA list reqwest trusts)
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Two versions of a crate are a build-time cost, not a risk: said, not failed.
+multiple-versions = "warn"
+# A `*` version requirement on a crates.io dependency.
+wildcards = "deny"
+# The workspace's own path dependencies have no version, and aren't published.
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only: a git or other-registry dependency fails (none today).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
