@@ -698,7 +698,7 @@ async fn refresh(
         tokio::join!(fetch_metrics(remote, &pods, cfg, opts), observing, time_endpoints(rtt_due))
     };
     if let Some(r) = details.rtt.as_mut() {
-        r.record(timed, &pods, Instant::now());
+        r.record(timed, Instant::now());
     }
     overlay_details(&mut pods, &details.details);
     // The balance's runway is judged against what is billing as listed (not the pending
@@ -821,13 +821,13 @@ fn load_health(cfg: &Config) -> (HealthCache, Option<String>) {
     }
 }
 
-/// Time each endpoint's RTT ([`arena_core::rtt::connect_rtt`]: one TCP connect, within
-/// [`RTT_WAIT`]), all at once. `None` for one that didn't answer in time.
+/// Time each endpoint's RTT ([`arena_core::rtt::connect_once`]: exactly one TCP connect, name
+/// lookup included within [`RTT_WAIT`]), all at once. `None` for one that didn't answer in time.
 async fn time_endpoints(due: Vec<Endpoint>) -> Vec<(Endpoint, Option<Duration>)> {
     let mut set = JoinSet::new();
     for ep in due {
         set.spawn(async move {
-            let d = arena_core::rtt::connect_rtt((ep.0.as_str(), ep.1), 1, RTT_WAIT).await;
+            let d = arena_core::rtt::connect_once((ep.0.as_str(), ep.1), RTT_WAIT).await;
             (ep, d)
         });
     }
@@ -4515,7 +4515,7 @@ deep_check_end=1
         let (alpha, bravo) = (by(&shared, "alpha"), by(&shared, "bravo"));
         let ep = |p: &Pod| (p.ssh_ip.clone().unwrap(), p.ssh_port.unwrap());
         let mut rtts = Rtts::default();
-        rtts.record(vec![(ep(&alpha), Some(Duration::from_millis(23))), (ep(&bravo), Some(Duration::from_millis(131)))], &shared.pods, Instant::now());
+        rtts.record(vec![(ep(&alpha), Some(Duration::from_millis(23))), (ep(&bravo), Some(Duration::from_millis(131)))], Instant::now());
         shared.rtts = rtts;
         let idx = shared.pods.iter().position(|p| p.name == alpha.name).unwrap();
         shared.pods[idx].location = Some("EUR-IS-1".into());

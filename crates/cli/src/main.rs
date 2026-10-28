@@ -2442,7 +2442,7 @@ fn placement_request(
 ) -> Result<(SpecOverrides, Option<(arena_core::placement::Request, PodSpec)>)> {
     let base = spec_with_overrides(cfg, &SpecOverrides { gpu: None, cloud: None, ..ov.clone() });
     let req = arena_core::placement::Request::from_flags(ov.gpu.as_deref(), ov.cloud.as_deref(), &base, max_price, order)?
-        .with_near(arena_core::near::Near::from_config(cfg)?, provider_name, &base);
+        .with_near(arena_core::near::Near::for_provider(cfg, provider_name)?, provider_name, &base);
     // Near the proxy turns one pool into two (there, then anywhere); `--keep-trying` waits on
     // one, so it keeps today's single path — anywhere — and says so.
     let single = arena_core::placement::Request { near: None, ..req.clone() };
@@ -2643,12 +2643,18 @@ async fn fetch_price_book(
         // Built as create builds it (`provider::build`), so the plan quotes only hosts create
         // would rent (verified-only unless VAST_ALLOW_UNVERIFIED).
         let vast = vast::VastProvider::from_config(cfg)?;
-        let quotes = vast.quote(&req.gpus, &spec, PRICE_TIMEOUT).await;
+        // Near the proxy: the same search in the region's countries too, at the same time, for
+        // the near options' prices.
+        let near_spec = req.near.map(|n| PodSpec { region: Some(n.region), ..spec.clone() });
+        let near_quotes = async {
+            match &near_spec {
+                Some(s) => Some(vast.quote(&req.gpus, s, PRICE_TIMEOUT).await),
+                None => None,
+            }
+        };
+        let (quotes, near_quotes) = tokio::join!(vast.quote(&req.gpus, &spec, PRICE_TIMEOUT), near_quotes);
         let (book, mut notes) = vast::price_book(&quotes, req.gpu_count, vast.verified_only());
-        // Near the proxy: the same search in the region's countries, for the near options' prices.
-        let Some(near) = req.near else { return Ok((book, notes)) };
-        let near_spec = PodSpec { region: Some(near.region), ..spec };
-        let near_quotes = vast.quote(&req.gpus, &near_spec, PRICE_TIMEOUT).await;
+        let (Some(near), Some(near_quotes)) = (req.near, near_quotes) else { return Ok((book, notes)) };
         let (book, more) = vast::with_near_prices(book, &near_quotes, req.gpu_count, near.region);
         notes.extend(more);
         return Ok((book, notes));
@@ -2712,13 +2718,15 @@ async fn plan_placement(
 ) -> Result<arena_core::placement::OptionPlan> {
     req.validate_for(provider_name)?;
     // Near the proxy (`NEAR`) here too, so every caller of the shared planner — `offers`
-    // included — shows the order create/up would run. Idempotent for a request that has it.
-    let configured = arena_core::near::Near::from_config(cfg)?;
+    // included — shows the order create/up would run. No caller plans a request that left
+    // NEAR out on purpose: `--keep-trying` without a list takes the single path, which never
+    // comes here (nor does `single_request`'s quote).
+    let configured = arena_core::near::Near::for_provider(cfg, provider_name)?;
     let req = &req.clone().with_near(configured, provider_name, base);
     let (book, mut notes) = fetch_price_book(cfg, provider_name, req, base).await?;
     if let (Some(n), None, "runpod") = (configured, req.near, provider_name) {
-        notes.push(if base.api_extra.as_ref().is_some_and(|x| x.contains_key("dataCenterIds")) {
-            format!("near ({}): off — CREATE_EXTRA_JSON / --api-json pins dataCenterIds itself", n.region.label())
+        notes.push(if base.api_extra.as_ref().is_some_and(arena_core::near::runpod_pins_location) {
+            format!("near ({}): off — CREATE_EXTRA_JSON / --api-json already says where (data centres, a network volume or countries)", n.region.label())
         } else {
             format!(
                 "near ({}): RunPod's COMMUNITY cloud can't be placed by data centre (its hosts have none) — near \
@@ -11489,7 +11497,7 @@ async fn plan_replacement(
         notes.retain(|n| !n.starts_with("tier "));
     }
     let req = Request::from_flags(gpu.as_deref(), ov.cloud.as_deref(), &base, place.max_price, place.order)?
-        .with_near(arena_core::near::Near::from_config(cfg)?, owner.name(), &base);
+        .with_near(arena_core::near::Near::for_provider(cfg, owner.name())?, owner.name(), &base);
     if owner.name() != "hetzner" && req.gpus.iter().any(|g| g.trim().is_empty()) {
         anyhow::bail!(
             "couldn't determine a GPU type for the replacement (the API doesn't report it and \
@@ -22831,7 +22839,7 @@ mod placement_cli_tests {
         let pinned = PodSpec { api_extra: serde_json::json!({"dataCenterIds": ["US-TX-3"]}).as_object().cloned(), ..base.clone() };
         let own = plan_placement(&cfg(), "runpod", &req("secure"), &pinned).await.unwrap();
         assert_eq!(own.options.len(), 1);
-        assert!(own.notes.iter().any(|n| n == "near (Europe): off — CREATE_EXTRA_JSON / --api-json pins dataCenterIds itself"), "{:?}", own.notes);
+        assert!(own.notes.iter().any(|n| n.starts_with("near (Europe): off — CREATE_EXTRA_JSON / --api-json already says where")), "{:?}", own.notes);
     }
 
     #[test]

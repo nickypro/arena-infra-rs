@@ -156,12 +156,13 @@ impl Request {
 
     /// With placement near the proxy (`near`: config's [`Near::from_config`]), where it can
     /// do something for a create of `base` on `provider`: Vast, or RunPod with SECURE among
-    /// the tiers ([`near::reaches`]) — and not when `base` pins RunPod data centres itself
-    /// (`--api-json` / `CREATE_EXTRA_JSON` `dataCenterIds`: the operator's pin wins, and a near
-    /// option would only repeat it). Otherwise near stays off, so a plain community create
-    /// keeps the single-spec path. Pure.
+    /// the tiers ([`near::reaches`]) — and not when `base` already says where on RunPod
+    /// (`--api-json` / `CREATE_EXTRA_JSON` with data centres, a network volume — which lives
+    /// in one — or countries, [`near::runpod_pins_location`]: the operator's pin wins, and a
+    /// near option would only repeat or contradict it). Otherwise near stays off, so a plain
+    /// community create keeps the single-spec path. Pure.
     pub fn with_near(mut self, near: Option<Near>, provider: &str, base: &PodSpec) -> Self {
-        let pinned = provider == "runpod" && base.api_extra.as_ref().is_some_and(|x| x.contains_key("dataCenterIds"));
+        let pinned = provider == "runpod" && base.api_extra.as_ref().is_some_and(near::runpod_pins_location);
         self.near = near.filter(|_| near::reaches(provider, &self.clouds) && !pinned);
         self
     }
@@ -253,18 +254,36 @@ impl PriceBook {
     }
 
     /// RunPod: what the live catalog for `cloud` says about `gpu` in `region` — from REST
-    /// v2's per-data-centre listing ([`GpuType::data_centers`]), the best stock among the
-    /// region's data centres that offer it. Only a catalog for this very tier knows; GraphQL's,
-    /// or none at all, is [`NearStock::Unknown`].
+    /// v2's per-data-centre listing ([`GpuType::data_centers`]): the best stock among the
+    /// data centres a near create pins ([`Region::runpod_dcs`]) that list it with any stock.
+    /// One listed at `None`, or only in a data centre the create doesn't pin, can't be had
+    /// near: [`NearStock::NotOffered`], so no create is spent on it (RunPod's API limits are
+    /// per key). Only a catalog for this very tier knows; GraphQL's, or none at all, is
+    /// [`NearStock::Unknown`].
     fn runpod_near(&self, gpu: &str, cloud: &str, region: Region) -> NearStock {
         let tiered = self.catalogs.iter().filter(|(tag, _)| tag.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(cloud)));
         let Some(row) = tiered.flat_map(|(_, rows)| rows).find(|r| r.id == gpu) else { return NearStock::Unknown };
-        let near: Vec<&str> =
-            row.data_centers.iter().filter(|(dc, _)| region.has_runpod_dc(dc)).map(|(_, stock)| stock.as_str()).collect();
-        match near.iter().min_by_key(|s| stock_rank(Some(s))) {
+        let pinned = |dc: &str| region.runpod_dcs().iter().any(|p| p.eq_ignore_ascii_case(dc.trim()));
+        let near = row.data_centers.iter().filter(|(dc, stock)| pinned(dc) && stock_rank(Some(stock)) < stock_rank(Some("None")));
+        match near.map(|(_, stock)| stock.as_str()).min_by_key(|s| stock_rank(Some(s))) {
             Some(best) => NearStock::Offered(Some(best.to_string())),
             None => NearStock::NotOffered,
         }
+    }
+
+    /// RunPod data centres the live catalogs place in `region` that the region's table
+    /// ([`Region::runpod_dcs`]) doesn't list — so a near create doesn't pin them: one RunPod
+    /// added since. Sorted, once each. For a note that says the table wants updating.
+    fn unpinned_dcs(&self, region: Region) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (dc, _) in self.catalogs.iter().flat_map(|(_, rows)| rows).flat_map(|r| &r.data_centers) {
+            let dc = dc.trim().to_ascii_uppercase();
+            if region.has_runpod_dc(&dc) && !region.runpod_dcs().contains(&dc.as_str()) && !out.contains(&dc) {
+                out.push(dc);
+            }
+        }
+        out.sort();
+        out
     }
 
     /// The live catalog's display name for `gpu` (`B300 MIG 34GB` for `NVIDIA B300 SXM6 AC MIG
@@ -634,6 +653,15 @@ fn near_first(
         };
         let budget = base.map(|b| n.budget(b));
         let twin = PlacementOption { near: Some(n.region), price_per_gpu, price_per_pod, price_source: source, stock, ..o.clone() };
+        // A marketplace's near create rents whatever the region offers then: without a price
+        // to weigh it against (the search anywhere failed) there's no margin to cap it at —
+        // review: it could rent any price. Tried anywhere only (RunPod's price is the
+        // option's own, so there the margin is never in doubt).
+        if provider != "runpod" && budget.is_none() {
+            why_not.push(format!("{}: no price anywhere to weigh it against", twin.describe()));
+            twins.push(None);
+            continue;
+        }
         let over = |limit: f64| price_per_pod.is_some_and(|p| milli(p) > milli(limit));
         if let Some(cap) = req.max_price.filter(|c| over(*c)) {
             why_not.push(format!("{}: {} > cap {}/h per pod", twin.describe(), twin.price_label(), fmt_money("$", cap)));
@@ -668,16 +696,23 @@ fn near_first(
     };
     if planned > 0 {
         let how = match req.order {
-            Order::Cheapest => "first, then every option anywhere",
-            Order::Listed => "each option there first, then anywhere",
+            Order::Cheapest => format!("{region} first, then every option anywhere"),
+            Order::Listed => format!("each option in {region} first, then anywhere"),
         };
-        notes.push(format!("near the proxy (NEAR={}): {region} {how} — {margin} (NEAR_MAX_EXTRA_PCT)", n.region.key()));
+        notes.push(format!("near the proxy (NEAR={}): {how} — {margin} (NEAR_MAX_EXTRA_PCT)", n.region.key()));
     } else {
         notes.push(format!("near the proxy (NEAR={}): no option to try in {region} — every option anywhere", n.region.key()));
     }
     if community {
         notes.push(format!(
             "near: RunPod's COMMUNITY cloud can't be placed by data centre (its hosts have none) — only SECURE options are tried in {region}"
+        ));
+    }
+    let unpinned = if provider == "runpod" { prices.unpinned_dcs(n.region) } else { Vec::new() };
+    if !unpinned.is_empty() {
+        notes.push(format!(
+            "near: RunPod lists {} in {region}, which arena's table doesn't pin yet (crates/core/src/near.rs) — reached only anywhere",
+            unpinned.join(", ")
         ));
     }
     for w in why_not {
@@ -1705,6 +1740,8 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         let pinned = PodSpec { api_extra: serde_json::json!({"dataCenterIds": ["US-TX-3"]}).as_object().cloned(), ..b.clone() };
         assert!(!on(r(&["SECURE"]), "runpod", &pinned), "the operator's own pin wins");
         assert!(on(r(&["COMMUNITY"]), "vast", &pinned), "a RunPod field means nothing to Vast");
+        let volume = PodSpec { api_extra: serde_json::json!({"mounts": {"network": [{"volumeId": "v1", "path": "/d"}]}}).as_object().cloned(), ..b.clone() };
+        assert!(!on(r(&["SECURE"]), "runpod", &volume), "a network volume lives in one data centre");
         assert!(r(&["SECURE"]).with_near(None, "runpod", &b).near.is_none(), "NEAR=any");
         // A near option to try first makes one GPU and one tier a placement, not the single path…
         assert!(!r(&["SECURE"]).with_near(Some(EU), "runpod", &b).is_single());
@@ -1743,7 +1780,7 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         // As listed: each option near, then anywhere — the operator's GPU order first.
         let listed = plan_options(&near_req(&[R3090, A4000], &["SECURE"], None, Order::Listed, EU), "runpod", &v2_book());
         assert_eq!(where_of(&listed), [at("1×RTX 3090", "SECURE", false), at("1×RTX A4000", "SECURE", true), at("1×RTX A4000", "SECURE", false)]);
-        assert!(listed.notes[0].contains("Europe each option there first, then anywhere — each within +25% of the same option anywhere"), "{:?}", listed.notes);
+        assert!(listed.notes[0].contains("(NEAR=europe): each option in Europe first, then anywhere — each within +25% of the same option anywhere"), "{:?}", listed.notes);
     }
 
     /// The margin is over the cheapest acceptable option: with community in the list, a near
@@ -1819,6 +1856,53 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         let order: Vec<(String, bool)> = listed.options.iter().map(|o| (o.label.clone(), o.near.is_some())).collect();
         assert_eq!(order, [("1×RTX 3090".to_string(), false), ("1×RTX A4000".into(), true), ("1×RTX A4000".into(), false)]);
         assert_eq!(listed.options[1].cap.map(milli), Some(136), "$0.109 × 1.25");
+    }
+
+    /// Review (codex, claude): when the search anywhere failed there's no price to weigh a
+    /// near Vast offer against, so no margin to cap its create at — it isn't planned (its
+    /// create could otherwise rent any price there).
+    #[test]
+    fn a_vast_near_option_needs_a_price_anywhere_to_cap_it() {
+        let book = PriceBook::offers(Vec::new(), 1).with_near_offers(vec![(A4000.into(), 0.11)], 1);
+        for order in [Order::Cheapest, Order::Listed] {
+            let plan = plan_options(&near_req(&[A4000], &["COMMUNITY"], None, order, EU), "vast", &book);
+            assert!(plan.options.iter().all(|o| o.near.is_none()), "{order:?}: {:?}", plan.options);
+            assert!(plan.notes.iter().any(|n| n == "near, not tried in Europe: 1×RTX A4000 in Europe: no price anywhere to weigh it against"), "{:?}", plan.notes);
+        }
+        // Every near Vast option that is planned carries a finite cap.
+        let priced = PriceBook::offers(vec![(A4000.into(), 0.10)], 1).with_near_offers(vec![(A4000.into(), 0.11)], 1);
+        let plan = plan_options(&near_req(&[A4000], &["COMMUNITY"], None, Order::Cheapest, EU), "vast", &priced);
+        assert!(plan.options.iter().filter(|o| o.near.is_some()).all(|o| o.cap.is_some_and(f64::is_finite)));
+    }
+
+    /// Review (claude): the catalog's per-data-centre stock decides — a region listed only at
+    /// `None`, or only in a data centre the create doesn't pin (one RunPod added since the
+    /// table), costs a create that can't succeed near; and the plan says the table wants it.
+    #[test]
+    fn a_runpod_region_listed_without_stock_or_unpinned_isnt_tried_near() {
+        let book = |dcs: &[(&str, &str)]| PriceBook::runpod(vec![(Some("SECURE".into()), vec![dc_row(A4000, Some(0.17), Some(0.25), dcs)])]);
+        let near_of = |b: &PriceBook| plan_options(&near_req(&[A4000], &["SECURE"], None, Order::Cheapest, EU), "runpod", b);
+        // (data centres listed, near planned?, its stock)
+        for (dcs, planned, stock) in [
+            (&[("EUR-IS-1", "Low"), ("US-KS-2", "High")][..], true, Some("Low")),
+            (&[("EUR-IS-1", "Low"), ("EU-RO-1", "Medium")], true, Some("Medium")),
+            (&[("EUR-IS-1", "None"), ("US-KS-2", "High")], false, None),
+            (&[("EU-DE-1", "High")], false, None),
+            (&[("US-KS-2", "High")], false, None),
+        ] {
+            let plan = near_of(&book(dcs));
+            assert_eq!(plan.options[0].near.is_some(), planned, "{dcs:?}");
+            if planned {
+                assert_eq!(plan.options[0].stock.as_deref(), stock, "{dcs:?}");
+            }
+        }
+        let unpinned = near_of(&book(&[("EU-DE-1", "High")]));
+        assert!(
+            unpinned.notes.iter().any(|n| n.starts_with("near: RunPod lists EU-DE-1 in Europe, which arena's table doesn't pin yet")),
+            "{:?}",
+            unpinned.notes
+        );
+        assert!(!near_of(&book(&[("EUR-IS-1", "Low")])).notes.iter().any(|n| n.contains("doesn't pin")));
     }
 
     /// Near off (`NEAR=any`): the plan is exactly as before — no twin, no column, no note.

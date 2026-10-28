@@ -245,9 +245,12 @@ pub enum Tone {
 /// (`arena_core::rtt`): once a minute keeps several dashboards on the proxy box far from it.
 pub const RTT_EVERY: Duration = Duration::from_secs(60);
 
-/// How long one timing may take (name lookup, then the connect): far above any real round
-/// trip (Singapore from Nuremberg: ~160 ms); past it the RTT is unknown.
+/// How long one timing may take (name lookup and the connect together): far above any real
+/// round trip (Singapore from Nuremberg: ~160 ms); past it the RTT is unknown.
 pub const RTT_WAIT: Duration = Duration::from_secs(1);
+
+/// A timing this old is forgotten (its endpoint is long gone, or will be timed afresh).
+pub const RTT_FORGET: Duration = Duration::from_secs(600);
 
 /// An SSH endpoint, `(host, port)`.
 pub type Endpoint = (String, u16);
@@ -277,12 +280,13 @@ impl Rtts {
     }
 
     /// Record a round of timings (`None`: no answer within [`RTT_WAIT`]) at `now`, and forget
-    /// the endpoints no pod in `pods` has any more.
-    pub fn record(&mut self, timed: Vec<(Endpoint, Option<Duration>)>, pods: &[Pod], now: std::time::Instant) {
+    /// the ones [`RTT_FORGET`] old — by age, not by absence from this listing: a provider that
+    /// missed one listing mustn't get its pods dialled again on the next refresh.
+    pub fn record(&mut self, timed: Vec<(Endpoint, Option<Duration>)>, now: std::time::Instant) {
         for (ep, d) in timed {
             self.timed.insert(ep, (now, d));
         }
-        self.timed.retain(|(ip, port), _| pods.iter().any(|p| p.ssh_ip.as_deref().map(str::trim) == Some(ip.as_str()) && p.ssh_port == Some(*port)));
+        self.timed.retain(|_, (at, _)| now.saturating_duration_since(*at) < RTT_FORGET);
     }
 
     /// `pod`'s RTT as last timed; `None`: no endpoint, not timed yet, or no answer.
@@ -1090,18 +1094,22 @@ mod tests {
         let mut r = Rtts::default();
         assert_eq!(r.due(&pods, t0), [("1.2.3.4".to_string(), 22001)], "shared endpoint once; none without one");
         assert_eq!(r.of(&pods[0]), None, "not timed yet");
-        r.record(vec![(("1.2.3.4".into(), 22001), Some(Duration::from_millis(23)))], &pods, t0);
+        r.record(vec![(("1.2.3.4".into(), 22001), Some(Duration::from_millis(23)))], t0);
         assert_eq!((r.of(&pods[0]), r.of(&pods[1]), r.of(&pods[2])), (Some(Duration::from_millis(23)), Some(Duration::from_millis(23)), None));
         assert!(r.due(&pods, t0 + Duration::from_secs(59)).is_empty());
         assert_eq!(r.due(&pods, t0 + RTT_EVERY).len(), 1);
         // No answer: unknown, and timed again a minute later like any other.
-        r.record(vec![(("1.2.3.4".into(), 22001), None)], &pods, t0 + RTT_EVERY);
+        r.record(vec![(("1.2.3.4".into(), 22001), None)], t0 + RTT_EVERY);
         assert_eq!(r.of(&pods[0]), None);
-        // `a` restarted onto another port: timed now; its old endpoint is forgotten with `b`'s move too.
+        // `a` restarted onto another port: timed now, never shown its old port's.
         let moved = vec![on("a", Some("1.2.3.4"), Some(23810))];
         assert_eq!(r.due(&moved, t0 + RTT_EVERY), [("1.2.3.4".to_string(), 23810)]);
-        r.record(Vec::new(), &moved, t0 + RTT_EVERY);
-        assert_eq!(r.of(&pods[0]), None);
+        r.record(vec![(("1.2.3.4".into(), 23810), Some(Duration::from_millis(30)))], t0 + RTT_EVERY);
+        assert_eq!(r.of(&moved[0]), Some(Duration::from_millis(30)));
+        // A listing that missed a pod doesn't forget its timing (no re-dial when it's back)…
+        assert!(r.due(&pods, t0 + RTT_EVERY + Duration::from_secs(1)).is_empty());
+        // …only age does.
+        r.record(Vec::new(), t0 + RTT_EVERY + RTT_FORGET);
         assert!(r.timed.is_empty());
     }
 

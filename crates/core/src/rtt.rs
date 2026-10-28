@@ -37,6 +37,21 @@ pub async fn connect_rtt<A: ToSocketAddrs>(addr: A, tries: u32, wait: Duration) 
     Some(best)
 }
 
+/// One TCP connect to `addr`'s first resolved address, timed — name lookup and connect
+/// together within `wait`. Exactly one connect, whatever the name resolves to: what a probe
+/// that must keep to one unauthenticated connect per endpoint uses (the dashboard's RTT).
+/// `None`: it didn't resolve, or didn't answer within `wait`.
+pub async fn connect_once<A: ToSocketAddrs>(addr: A, wait: Duration) -> Option<Duration> {
+    timeout(wait, async {
+        let a = lookup_host(addr).await.ok()?.next()?;
+        let t = Instant::now();
+        TcpStream::connect(a).await.ok().map(|_| t.elapsed())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,5 +65,17 @@ mod tests {
         assert!(connect_rtt(format!("127.0.0.1:{port}"), 1, Duration::from_secs(1)).await.is_some());
         // Not an address at all: unmeasured, not "0 ms".
         assert_eq!(connect_rtt("not an address", 1, Duration::from_secs(1)).await, None);
+        assert!(connect_once(("127.0.0.1", port), Duration::from_secs(1)).await.is_some_and(|d| d < Duration::from_secs(1)));
+        assert_eq!(connect_once("not an address", Duration::from_secs(1)).await, None);
+    }
+
+    /// One connect, one bound: an address that never answers (a blackholed port — TEST-NET-1)
+    /// gives up at `wait`, not later.
+    #[tokio::test(start_paused = true)]
+    async fn connect_once_gives_up_at_its_bound() {
+        let wait = Duration::from_secs(1);
+        let t = Instant::now();
+        assert_eq!(connect_once(("192.0.2.1", 22), wait).await, None);
+        assert!(t.elapsed() <= wait + Duration::from_millis(50), "{:?}", t.elapsed());
     }
 }

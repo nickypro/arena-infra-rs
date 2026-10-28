@@ -7,10 +7,12 @@
 //! takes a European option unless it costs more than 25% over the cheapest acceptable one.
 //!
 //! What "near" means per provider, from the live APIs (2026-10-28):
-//! - **RunPod:** a create takes `dataCenterIds`. Data centres are named by region prefix —
-//!   every `EUROPE` data centre in `GET /v2/catalog/datacenters` is `EU-…` or `EUR-…`. The
-//!   price is per GPU type and tier, not per data centre, so a near option costs exactly
-//!   what the same option anywhere costs. **SECURE only:** COMMUNITY machines have no data
+//! - **RunPod:** a create takes `dataCenterIds`, a filter (live: one pinned to an id RunPod
+//!   doesn't know, `XX-BOGUS-1`, was "no capacity" — so a data centre retired from the table
+//!   below only matches nothing). Data centres are named by region prefix — every `EUROPE`
+//!   data centre in `GET /v2/catalog/datacenters` is `EU-…` or `EUR-…`. The price is per GPU
+//!   type and tier, not per data centre, so a near option costs exactly what the same option
+//!   anywhere costs. **SECURE only:** COMMUNITY machines have no data
 //!   centre (a running community pod's `dataCenterId` is null, the community catalog lists
 //!   no data centres for any GPU, and a community create pinned to *every* data centre found
 //!   no capacity seconds before an unpinned one succeeded) — pinning one only wastes a create.
@@ -161,6 +163,16 @@ impl Near {
         Self::parse(cfg.get(NEAR_KEY), cfg.get(EXTRA_KEY))
     }
 
+    /// [`Self::from_config`] for a create on `provider`: read only where it can apply (RunPod,
+    /// Vast) — so a bad or stray `NEAR` never refuses a Hetzner or Shadeform command, which
+    /// don't use it (`config check` still fails it).
+    pub fn for_provider(cfg: &Config, provider: &str) -> Result<Option<Near>> {
+        match provider {
+            "runpod" | "vast" => Self::from_config(cfg),
+            _ => Ok(None),
+        }
+    }
+
     /// [`Self::from_config`] on the two raw values (`None` = unset). Pure.
     pub fn parse(near: Option<&str>, extra: Option<&str>) -> Result<Option<Near>> {
         let region = match near.map(str::trim) {
@@ -227,6 +239,15 @@ pub fn reaches(provider: &str, clouds: &[String]) -> bool {
     }
 }
 
+/// Whether a RunPod create's extra fields (`--api-json` / `CREATE_EXTRA_JSON`) already say
+/// where it goes: data centres (`dataCenterIds`, `dataCenterId`), a network volume (v1
+/// `networkVolumeId`, v2 `mounts.network` — a volume lives in one data centre) or countries
+/// (v1 `countryCodes`). Then a near option would only repeat or contradict it. Pure.
+pub fn runpod_pins_location(extra: &serde_json::Map<String, serde_json::Value>) -> bool {
+    ["dataCenterIds", "dataCenterId", "networkVolumeId", "countryCodes"].iter().any(|k| extra.contains_key(*k))
+        || extra.get("mounts").and_then(|m| m.get("network")).is_some()
+}
+
 /// Whether a RunPod tier can be pinned to data centres: SECURE, never COMMUNITY. Pure.
 pub fn runpod_tier_placeable(cloud: &str) -> bool {
     cloud.trim().eq_ignore_ascii_case("SECURE")
@@ -283,6 +304,29 @@ mod tests {
         assert_eq!(Near::from_config(&Config::parse_with_env("IMAGE=x", env)).unwrap(), None);
         let env = |k: &str| (k == EXTRA_KEY).then(|| "40".to_string());
         assert_eq!(Near::from_config(&Config::parse_with_env("NEAR=europe\nNEAR_MAX_EXTRA_PCT=10", env)).unwrap(), eu(40.0));
+        // Only read for a provider it applies to: a bad one never refuses Hetzner/Shadeform.
+        let bad = Config::parse("NEAR=mars\n");
+        assert!(Near::for_provider(&bad, "runpod").is_err() && Near::for_provider(&bad, "vast").is_err());
+        assert_eq!(Near::for_provider(&bad, "hetzner").unwrap(), None);
+        assert_eq!(Near::for_provider(&bad, "shadeform").unwrap(), None);
+        assert_eq!(Near::for_provider(&Config::parse(""), "vast").unwrap(), eu(25.0));
+    }
+
+    #[test]
+    fn a_runpod_create_that_already_says_where() {
+        let pins = |v: serde_json::Value| runpod_pins_location(v.as_object().unwrap());
+        for v in [
+            serde_json::json!({"dataCenterIds": ["US-TX-3"]}),
+            serde_json::json!({"dataCenterId": "US-TX-3"}),
+            serde_json::json!({"networkVolumeId": "v1"}),
+            serde_json::json!({"countryCodes": ["US"]}),
+            serde_json::json!({"mounts": {"network": [{"volumeId": "v1", "path": "/data"}]}}),
+        ] {
+            assert!(pins(v.clone()), "{v}");
+        }
+        for v in [serde_json::json!({}), serde_json::json!({"globalNetworking": true}), serde_json::json!({"mounts": {"persistent": {"size": 5}}})] {
+            assert!(!pins(v.clone()), "{v}");
+        }
     }
 
     #[test]
