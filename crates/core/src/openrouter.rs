@@ -169,8 +169,10 @@ impl OpenRouter {
 
     /// Create a runtime key named `name` with an optional USD credit `limit` (in the
     /// configured workspace, if any). With a workspace, the answer must say the key is in it:
-    /// a key the API put elsewhere would be one the scoped listing never shows again (no
-    /// rotate, no revoke), so it is deleted at once and the create fails.
+    /// a key the API put elsewhere is one the scoped listing never shows again (no rotate, no
+    /// revoke), so the create fails, naming the key's full hash to delete by hand. Nothing is
+    /// deleted here: the answer is the only evidence of which key was made, and a key named
+    /// the same could be another workspace's (review round 2, codex #1).
     pub async fn create_key(&self, name: &str, limit: Option<f64>) -> Result<CreatedKey> {
         let ws = self.workspace_id().await?;
         let body = create_body(name, limit, ws.as_deref());
@@ -201,21 +203,26 @@ impl OpenRouter {
         let field = |k: &str| data.and_then(|d| d.get(k)).and_then(|s| s.as_str());
         let hash = field("hash").unwrap_or_default().to_string();
         if let Some(ws) = ws.as_deref() {
-            let landed = field("workspace_id");
-            if !landed.is_some_and(|l| l.eq_ignore_ascii_case(ws)) {
-                // Ours to clean up: the key this call just made (its own hash, its own name).
-                let cleanup = if field("name") == Some(name) && valid_hash(&hash).is_ok() {
-                    match send_ok(self.auth(self.client.delete(format!("{}/{hash}", self.keys_url()))), "openrouter delete key").await {
-                        Ok(()) => "deleted it again".to_string(),
-                        Err(e) => format!("couldn't delete it ({e}): delete key {} on openrouter.ai", short_hash(&hash)),
+            let mut landed = field("workspace_id").map(String::from);
+            // An answer that doesn't say: ask where the key is (as a revoke would) before
+            // calling it misplaced — otherwise every create would fail if the API stopped
+            // echoing workspace_id (review round 3).
+            if landed.is_none() && valid_hash(&hash).is_ok() {
+                if let Ok(v) = send_json(self.auth(self.client.get(format!("{}/{hash}", self.keys_url()))), "openrouter get key").await {
+                    let d = v.get("data");
+                    if d.and_then(|d| d.get("hash")).and_then(|s| s.as_str()) == Some(hash.as_str()) {
+                        landed = d.and_then(|d| d.get("workspace_id")).and_then(|s| s.as_str()).map(String::from);
                     }
-                } else {
-                    format!("delete key {} on openrouter.ai", short_hash(&hash))
-                };
+                }
+            }
+            let landed = landed.as_deref();
+            if !landed.is_some_and(|l| l.eq_ignore_ascii_case(ws)) {
                 return Err(Error::provider(format!(
-                    "openrouter create key: the new key landed in workspace {}, not OPENROUTER_WORKSPACE ({}) — {cleanup}",
+                    "openrouter create key: the new key `{name}` landed in workspace {}, not OPENROUTER_WORKSPACE ({}) — \
+                     not used; delete it on openrouter.ai (hash {})",
                     landed.unwrap_or("(not said)"),
                     self.workspace.as_deref().unwrap_or_default(),
+                    if hash.is_empty() { "not given" } else { hash.as_str() },
                 )));
             }
         }
@@ -249,7 +256,17 @@ impl OpenRouter {
         }
         let v = send_json(self.auth(self.client.get(self.keys_url())).query(&query), "openrouter list keys").await?;
         let arr = page_data(&v)?;
-        Ok(arr.iter().filter_map(|k| serde_json::from_value(k.clone()).ok()).collect())
+        // Scoped, a key that can't be read fails the page: dropped, it would read as "no key"
+        // (unscoped, as before: skipped).
+        let mut keys = Vec::with_capacity(arr.len());
+        for k in arr {
+            match serde_json::from_value(k.clone()) {
+                Ok(info) => keys.push(info),
+                Err(_) if ws.is_none() => {}
+                Err(e) => return Err(Error::provider(format!("openrouter list keys: a key couldn't be read ({e})"))),
+            }
+        }
+        Ok(keys)
     }
 
     /// Refuse to change a key outside the configured workspace: read it (`GET /keys/{hash}`),
@@ -347,7 +364,7 @@ pub fn resolved_workspace(v: &serde_json::Value, asked: &str, wanted: &Workspace
     let slug = d.and_then(|d| d.get("slug")).and_then(|s| s.as_str());
     let ok = match (wanted, &id) {
         (WorkspaceRef::Id(w), Some(id)) => w == id,
-        (WorkspaceRef::Slug, Some(_)) => slug == Some(asked),
+        (WorkspaceRef::Slug, Some(_)) => slug.is_some_and(|s| s.eq_ignore_ascii_case(asked)),
         _ => false,
     };
     match id {
@@ -365,7 +382,9 @@ pub fn resolved_workspace(v: &serde_json::Value, asked: &str, wanted: &Workspace
 /// rotate re-mint beside a leaked key and revoke drop the row of a key that still works.
 pub fn in_workspace(keys: Vec<KeyInfo>, ws: Option<&str>) -> Result<Vec<KeyInfo>> {
     let Some(ws) = ws else { return Ok(keys) };
-    if let Some(k) = keys.iter().find(|k| k.workspace_id.is_none()) {
+    // Only a real workspace id says "another workspace": empty or malformed says nothing.
+    let says = |k: &KeyInfo| k.workspace_id.as_deref().is_some_and(|w| matches!(workspace_ref(w), Ok(WorkspaceRef::Id(_))));
+    if let Some(k) = keys.iter().find(|k| !says(k)) {
         return Err(Error::provider(format!(
             "openrouter list keys: key {} didn't say which workspace it's in — with OPENROUTER_WORKSPACE \
              set, a listing that can't be checked isn't used",
@@ -644,13 +663,15 @@ pub struct UsageView {
     pub keys_error: Option<String>,
     /// Why the last credit read failed, if it did (`credits` is then the last good one).
     pub credits_error: Option<String>,
+    /// A read has landed (before the first, an empty view means "not read yet", not "no keys").
+    pub read: bool,
 }
 
 impl UsageView {
     /// From a listing. A name held by more than one key (an old one disabled, a rotation's
     /// leftover) shows the enabled one, then the newest; the totals count them all.
     pub fn from_keys(keys: &[KeyInfo], credits: Option<Credits>) -> Self {
-        let mut v = UsageView { credits, ..Default::default() };
+        let mut v = UsageView { credits, read: true, ..Default::default() };
         v.set_keys(keys);
         v
     }
@@ -676,6 +697,7 @@ impl UsageView {
     /// Take one round's reads: each answer replaces its own part, each failure keeps that
     /// part's last good answer and says why.
     pub fn apply(&mut self, keys: std::result::Result<Vec<KeyInfo>, String>, credits: std::result::Result<Credits, String>) {
+        self.read = true;
         match keys {
             Ok(k) => {
                 self.set_keys(&k);
@@ -1001,14 +1023,21 @@ mod tests {
     /// (an empty "not ours" would make rotate leave a leaked key live).
     #[test]
     fn in_workspace_drops_other_workspaces_and_refuses_keys_that_dont_say() {
+        const W1: &str = "c9f89f20-08e3-4cff-bad6-70c478e2c2c4";
+        const W2: &str = "a3339b09-7feb-5818-be3e-1b9484142ece";
         let k = |h: &str, ws: Option<&str>| KeyInfo { hash: h.into(), workspace_id: ws.map(String::from), ..Default::default() };
-        let keys = vec![k("a", Some("w1")), k("b", Some("W1")), k("c", Some("w2"))];
+        let keys = vec![k("a", Some(W1)), k("b", Some(&W1.to_uppercase())), k("c", Some(W2))];
         let hashes = |v: Vec<KeyInfo>| v.into_iter().map(|k| k.hash).collect::<Vec<_>>();
-        assert_eq!(hashes(in_workspace(keys.clone(), Some("w1")).unwrap()), ["a", "b"]);
+        assert_eq!(hashes(in_workspace(keys.clone(), Some(W1)).unwrap()), ["a", "b"]);
         let mut silent = keys.clone();
         silent.push(k("d", None));
-        let e = in_workspace(silent.clone(), Some("w1")).unwrap_err().to_string();
+        let e = in_workspace(silent.clone(), Some(W1)).unwrap_err().to_string();
         assert!(e.contains("key d didn't say which workspace"), "{e}");
+        for junk in ["", "w2", "not-a-uuid"] {
+            let mut odd = keys.clone();
+            odd.push(k("e", Some(junk)));
+            assert!(in_workspace(odd, Some(W1)).is_err(), "`{junk}` says nothing about the workspace");
+        }
         assert_eq!(hashes(in_workspace(silent, None).unwrap()), ["a", "b", "c", "d"], "no workspace: as before");
     }
 
@@ -1023,6 +1052,7 @@ mod tests {
         let id = WorkspaceRef::Id(ours.into());
         assert_eq!(resolved_workspace(&ans(ours, "arena-dev-test"), "arena-dev-test", &slug).unwrap(), ours);
         assert_eq!(resolved_workspace(&ans(&ours.to_uppercase(), "x"), ours, &id).unwrap(), ours);
+        assert_eq!(resolved_workspace(&ans(ours, "arena-dev-test"), "Arena-Dev-Test", &slug).unwrap(), ours);
         for (v, asked, wanted) in [
             (ans(theirs, "default"), "arena-dev-test", &slug),
             (ans(theirs, "arena-dev-test"), ours, &id),
@@ -1074,7 +1104,7 @@ mod tests {
         let ours = "c9f89f20-08e3-4cff-bad6-70c478e2c2c4";
         let srv = serve(vec![
             canned(200, json, &format!(r#"{{"data":{{"id":"{ours}","slug":"arena-dev-test"}}}}"#)),
-            canned(200, json, &format!(r#"{{"data":[{{"hash":"a","name":"devtest-apple","workspace_id":"{ours}"}},{{"hash":"x","name":"arena9-apple","workspace_id":"other"}}]}}"#)),
+            canned(200, json, &format!(r#"{{"data":[{{"hash":"a","name":"devtest-apple","workspace_id":"{ours}"}},{{"hash":"x","name":"arena9-apple","workspace_id":"a3339b09-7feb-5818-be3e-1b9484142ece"}}]}}"#)),
             canned(200, json, r#"{"data":[]}"#),
             canned(200, json, &format!(r#"{{"key":"sk-or-v1-S","data":{{"hash":"n","name":"devtest-bloom","workspace_id":"{ours}"}}}}"#)),
             canned(200, json, r#"{"data":{"hash":"x","workspace_id":"other"}}"#),
@@ -1126,10 +1156,11 @@ mod tests {
         assert_eq!(srv.requests.lock().unwrap().len(), 1, "only the lookup; nothing listed or deleted");
     }
 
-    /// A create the API put in another workspace (or didn't say where) fails, and the key it
-    /// just made — its own name, its own hash — is deleted again; the secret isn't returned.
+    /// A create the API put in another workspace (or didn't say where) fails, naming the key
+    /// to delete by hand; nothing is deleted (the answer can't prove which key it made) and
+    /// the secret isn't returned or quoted.
     #[tokio::test]
-    async fn a_key_created_outside_the_workspace_is_deleted_and_the_create_fails() {
+    async fn a_key_created_outside_the_workspace_fails_the_create_and_deletes_nothing() {
         use crate::http::test_server::{canned, serve};
         let json = "application/json";
         let ours = "c9f89f20-08e3-4cff-bad6-70c478e2c2c4";
@@ -1137,29 +1168,51 @@ mod tests {
         let srv = serve(vec![
             canned(200, json, &ws),
             canned(200, json, r#"{"key":"sk-or-v1-S1","data":{"hash":"d1","name":"devtest-a","workspace_id":"other"}}"#),
-            canned(200, json, "{}"),
             canned(200, json, r#"{"key":"sk-or-v1-S2","data":{"hash":"d2","name":"devtest-a"}}"#),
-            canned(500, json, r#"{"error":{"message":"boom"}}"#),
-            canned(200, json, r#"{"key":"sk-or-v1-S3","data":{"hash":"d3","name":"someone-else","workspace_id":"other"}}"#),
+            canned(200, json, r#"{"data":{"hash":"d2"}}"#),
+            canned(200, json, r#"{"key":"sk-or-v1-S3","data":{"hash":"d3","name":"devtest-a"}}"#),
+            canned(200, json, &format!(r#"{{"data":{{"hash":"d3","workspace_id":"{ours}"}}}}"#)),
         ]);
         let or = test_client("K", &srv.base).with_workspace(Some("arena-dev-test"));
         let e = or.create_key("devtest-a", Some(1.0)).await.unwrap_err().to_string();
-        assert!(e.contains("landed in workspace other") && e.contains("deleted it again") && !e.contains("sk-or"), "{e}");
+        assert!(e.contains("landed in workspace other") && e.contains("hash d1") && !e.contains("sk-or"), "{e}");
         let e = or.create_key("devtest-a", Some(1.0)).await.unwrap_err().to_string();
-        assert!(e.contains("(not said)") && e.contains("couldn't delete it") && e.contains("d2"), "{e}");
-        let e = or.create_key("devtest-a", Some(1.0)).await.unwrap_err().to_string();
-        assert!(e.contains("delete key d3 on openrouter.ai"), "not our name: not deleted: {e}");
+        assert!(e.contains("(not said)") && e.contains("hash d2"), "{e}");
+        // An answer that doesn't say, but the key itself is in the workspace: fine.
+        let k = or.create_key("devtest-a", Some(1.0)).await.unwrap();
+        assert_eq!((k.hash.as_str(), k.secret.as_str()), ("d3", "sk-or-v1-S3"));
         assert_eq!(
             *srv.requests.lock().unwrap(),
             [
                 "GET /workspaces/arena-dev-test HTTP/1.1",
                 "POST /keys HTTP/1.1",
-                "DELETE /keys/d1 HTTP/1.1",
                 "POST /keys HTTP/1.1",
-                "DELETE /keys/d2 HTTP/1.1",
+                "GET /keys/d2 HTTP/1.1",
                 "POST /keys HTTP/1.1",
-            ]
+                "GET /keys/d3 HTTP/1.1",
+            ],
+            "no DELETE"
         );
+    }
+
+    /// Scoped, a listed key that can't be read fails the listing (dropped, it would read as
+    /// "no key"); unscoped it's skipped, as before.
+    #[tokio::test]
+    async fn a_scoped_listing_with_an_unreadable_key_fails() {
+        use crate::http::test_server::{canned, serve};
+        let json = "application/json";
+        let ours = "c9f89f20-08e3-4cff-bad6-70c478e2c2c4";
+        let page = format!(r#"{{"data":[{{"hash":"a","workspace_id":"{ours}"}},{{"name":"no-hash"}}]}}"#);
+        let srv = serve(vec![
+            canned(200, json, &format!(r#"{{"data":{{"id":"{ours}","slug":"arena-dev-test"}}}}"#)),
+            canned(200, json, &page),
+            canned(200, json, &page),
+            canned(200, json, r#"{"data":[]}"#),
+        ]);
+        let or = test_client("K", &srv.base).with_workspace(Some(ours));
+        assert!(or.list_keys().await.unwrap_err().to_string().contains("couldn't be read"));
+        let unscoped = test_client("K", &srv.base);
+        assert_eq!(unscoped.list_keys().await.unwrap().len(), 1);
     }
 
     /// A workspace given as an id is looked up too: a mistyped id fails before anything is
@@ -1291,6 +1344,10 @@ mod tests {
     #[test]
     fn usage_view_applies_keys_and_credit_apart() {
         let key = |name: &str, today: f64| KeyInfo { hash: name.into(), name: Some(name.into()), usage_daily: Some(today), ..Default::default() };
+        let mut fresh = UsageView::default();
+        assert!(!fresh.read);
+        fresh.apply(Err("x".into()), Err("y".into()));
+        assert!(fresh.read, "a failed read is still a read: `-`, not `…`");
         let mut v = UsageView::from_keys(&[key("devtest-a", 1.0)], Some(Credits { total: 100.0, used: 0.0 }));
         v.apply(Err("list timed out".into()), Ok(Credits { total: 100.0, used: 100.0 }));
         assert_eq!(v.credits.unwrap().left(), 0.0, "the fresh credit lands though the listing failed");

@@ -270,14 +270,29 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Print the participants' ~/.ssh/config (read-only)
+    /// Print the ~/.ssh/config for pods, or keep yours current (--install)
+    ///
+    /// --install writes PATH (default SSH_CONFIG_FILE, else ~/.ssh/arena.conf) and makes
+    /// `Include PATH` the first line of ~/.ssh/config (shows the change, asks, keeps a copy of
+    /// the old file). With SSH_CONFIG_FILE set, every pod change and `pods list` rewrite PATH
+    /// when an endpoint moved. --uninstall takes the Include line out again.
+    #[command(verbatim_doc_comment, group(clap::ArgGroup::new("setup").args(["install", "uninstall"])))]
     SshConfig {
         /// Use the proxy layout (stable `SSH_PROXY_*` ports) instead of direct pod IPs.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["install", "uninstall"])]
         proxy: bool,
         /// Also write the rendered config to this local path (else just prints it).
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["install", "uninstall"])]
         out: Option<PathBuf>,
+        /// Keep PATH current and Include it from ~/.ssh/config (one-time setup)
+        #[arg(long, value_name = "PATH", num_args = 0..=1, conflicts_with = "uninstall")]
+        install: Option<Option<String>>,
+        /// Take the Include line --install added out of ~/.ssh/config (PATH stays)
+        #[arg(long, value_name = "PATH", num_args = 0..=1)]
+        uninstall: Option<Option<String>>,
+        /// With --install/--uninstall: print what would change, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"], requires = "setup")]
+        dry_run: bool,
     },
     /// End-of-program check that nothing is left billing (read-only)
     ///
@@ -402,8 +417,9 @@ impl SelectOpts {
     }
 }
 
-/// Who a fleet-wide backup command (`backup`, `pull`, `init-branches`, `set-branch --all`)
-/// acts on when it names no pod: this cohort's ([`split_cohort`]), or with the flag every pod.
+/// Who a fleet-wide backup command (`backup`, `pull`, `init-branches`, `set-branch --all`) —
+/// or `ask`/`test`, which reach into pods too — acts on when it names no pod: this cohort's
+/// ([`split_cohort`]), or with the flag every pod.
 #[derive(clap::Args, Debug, Clone, Copy, Default)]
 struct CohortScope {
     /// With no pods named (or --all): every pod, staff boxes and other prefixes too
@@ -566,8 +582,8 @@ enum KeysCmd {
 enum CronCmd {
     /// Add or replace arena cron lines (shows the diff, confirms)
     ///
-    /// Each flag names one line (backup, proxy, snapshot, archive, reap); only those are
-    /// (re)written and the rest are kept. No flag = the backup line. A rewritten backup line
+    /// Each flag names one line (backup, proxy, snapshot, archive, reap, health); only those
+    /// are (re)written and the rest are kept. No flag = the backup line. A rewritten backup line
     /// keeps the installed one's --pull, start date and schedule unless you change them.
     /// Locks live in ~/.local/state/arena-cron/, logs too (backup.log, …) unless the installed
     /// line logs elsewhere already: that path is kept. Old default logs (~/arena-cron.log) move.
@@ -605,6 +621,9 @@ enum CronCmd {
         /// `apply` terminates pods only with REAP_ENABLED=1 in the config file.
         #[arg(long, value_name = "MODE", value_parser = ["observe", "apply"])]
         reap: Option<String>,
+        /// The health line: `pods test --deep` daily at HH:MM, this box's time zone
+        #[arg(long, value_name = "HH:MM")]
+        health: Option<String>,
         /// Preview only: print the diff, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -626,6 +645,9 @@ enum CronCmd {
         /// Remove the auto-reaper line.
         #[arg(long)]
         reap: bool,
+        /// Remove the daily health check line.
+        #[arg(long)]
+        health: bool,
         /// Preview only: print the diff, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -1442,7 +1464,8 @@ enum PodCmd {
     ///
     /// --deep: per-GPU CUDA op, driver vs MIN_DRIVER_VERSION, device count, GPU↔GPU copy + NCCL,
     /// HF download speed, disk, load, maintenance window. One pass/warn/fail row per pod; exits
-    /// non-zero on any FAIL. No targets = every pod with an SSH endpoint.
+    /// non-zero on any FAIL. No targets (or --all) = this cohort's pods with an SSH endpoint
+    /// (not @ staff entries; --include-non-cohort: every pod).
     #[command(verbatim_doc_comment)]
     Test {
         /// Run the deep check instead of the torch-version check.
@@ -1454,6 +1477,8 @@ enum PodCmd {
         /// Print every check of every pod, not just the table.
         #[arg(short, long, requires = "deep")]
         verbose: bool,
+        #[command(flatten)]
+        cohort: CohortScope,
         #[command(flatten)]
         sel: Select,
     },
@@ -2958,8 +2983,15 @@ async fn run() -> Result<()> {
         Cmd::Archive(c) => archive::handle_archive(c, &cfg, remote.as_ref(), cli.yes).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
-        Cmd::SshConfig { proxy, out } => {
-            handle_ssh_config(provider.unwrap().as_ref(), &cfg, proxy, out.as_deref()).await
+        Cmd::SshConfig { proxy, out, install, uninstall, dry_run } => {
+            let home = std::env::var("HOME").ok();
+            match (install, uninstall) {
+                (Some(path), _) => {
+                    handle_ssh_config_install(provider.unwrap().as_ref(), &cfg, path.as_deref(), cli.yes, dry_run, home.as_deref()).await
+                }
+                (None, Some(path)) => handle_ssh_config_uninstall(&cfg, path.as_deref(), cli.yes, dry_run, home.as_deref()),
+                (None, None) => handle_ssh_config(provider.unwrap().as_ref(), &cfg, proxy, out.as_deref()).await,
+            }
         }
         Cmd::Snapshot { json, public, out, no_probe } => {
             // The real probe unless `--no-probe`; tests hand in a scripted one.
@@ -3819,23 +3851,30 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
                 println!("(no arena-managed cron lines)");
             } else {
                 for l in &before {
-                    let kind = CronKind::of(l).map_or("other", CronKind::label);
-                    println!("[{kind}] {l}");
+                    let kind = CronKind::of(l);
+                    println!("[{}] {l}", kind.map_or("other", CronKind::label));
+                    // The health line's time is cron's, this box's zone: said, not left to guess.
+                    if let Some(at) = HealthAt::of_line(l).filter(|_| kind == Some(CronKind::Health)) {
+                        println!("  ↳ {}", health_when(at, box_zone().as_deref(), cron_tz(&current)));
+                    }
                 }
             }
             Ok(())
         }
-        CronCmd::Remove { backup, proxy, snapshot, archive, reap, dry_run } => {
+        CronCmd::Remove { backup, proxy, snapshot, archive, reap, health, dry_run } => {
             cron_home(home, effective_uid()?)?;
             let mut kinds = CronKind::selected(backup, proxy, snapshot, archive);
             if reap {
                 kinds.push(CronKind::Reap);
             }
+            if health {
+                kinds.push(CronKind::Health);
+            }
             // No flag: the whole block, hand edits inside it included (as always).
             let after = if kinds.is_empty() { Vec::new() } else { merge_cron_block(&before, &kinds, &[]) };
             apply_cron_change(&current, &before, &after, &[], dry_run, yes, crontab).await.map(|_| ())
         }
-        CronCmd::Install { backup, schedule, start_date, no_start_date, pull, no_pull, proxy, snapshot, archive, reap, dry_run } => {
+        CronCmd::Install { backup, schedule, start_date, no_start_date, pull, no_pull, proxy, snapshot, archive, reap, health, dry_run } => {
             // Once, before anything is written: the tidy after the write uses it too, so nothing
             // can fail once the crontab is in (review ai-review claude #10).
             let euid = effective_uid()?;
@@ -3854,19 +3893,30 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             if let Some(d) = &start_date {
                 arena_core::schedule::parse_ymd(d).context("--start-date must be YYYY-MM-DD")?;
             }
+            let health = health.as_deref().map(HealthAt::parse).transpose()?;
             let snapshot_dir = snapshot.as_deref().map(snapshot_cron_dir).transpose()?;
-            // `--reap` names its own line: like `--proxy`, it doesn't bring a backup line along.
+            // `--reap` and `--health` name their own lines: like `--proxy`, neither brings a
+            // backup line along.
             let backup = install_backup_line(
                 backup,
                 schedule.is_some(),
                 start_date.is_some() || no_start_date,
                 pull || no_pull,
-                proxy || reap.is_some(),
+                proxy || reap.is_some() || health.is_some(),
                 snapshot_dir.is_some() || archive,
             );
             let reap_line = reap
                 .as_deref()
                 .map(|mode| reap_cron_line(mode == "apply", config_path, &exe.display().to_string(), &cfg_abs.display().to_string(), home, kept_log(CronKind::Reap)))
+                .transpose()?;
+            // Its verdicts go to the health cache this shell resolves, as the archive's lines
+            // carry their state dir (AD10): the one this shell's dashboard and `snapshot` read.
+            let health_line = health
+                .map(|at| -> Result<String> {
+                    let root = archive::cron_state_root(cfg).map_err(|e| anyhow::anyhow!("--health: {e}"))?;
+                    let (exe, cfg_abs) = (exe.display().to_string(), cfg_abs.display().to_string());
+                    Ok(health_cron_line(at, &exe, &cfg_abs, home, &root, kept_log(CronKind::Health)))
+                })
                 .transpose()?;
             let mut notes = Vec::new();
             // The backup line's options: each flag, else the installed line's (so a
@@ -3940,6 +3990,9 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             if let Some(l) = reap_line {
                 lines.push((CronKind::Reap, l));
             }
+            if let Some(l) = health_line {
+                lines.push((CronKind::Health, l));
+            }
             let kinds: Vec<CronKind> = lines.iter().map(|(k, _)| *k).collect();
             let after = merge_cron_block(&before, &kinds, &lines);
             let kept: Vec<String> =
@@ -3969,6 +4022,10 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
                      the rsync file backup too)"
                         .to_string(),
                 );
+            }
+            if let Some(at) = health {
+                notes.push(format!("note: the health check runs {}", health_when(at, box_zone().as_deref(), cron_tz(&current))));
+                notes.extend(health_minute_warning(at));
             }
             if apply_cron_change(&current, &before, &after, &notes, dry_run, yes, crontab).await? {
                 // Only once it's written: until then, the old lines still use their old files.
@@ -4371,6 +4428,8 @@ enum CronKind {
     ArchiveBig,
     /// `pods reap run`, the opt-in auto-reaper.
     Reap,
+    /// `pods test --deep`, the daily health check.
+    Health,
 }
 
 impl CronKind {
@@ -4382,6 +4441,7 @@ impl CronKind {
             CronKind::ArchiveSnap => "archive-snap",
             CronKind::ArchiveBig => "archive-big",
             CronKind::Reap => "reap",
+            CronKind::Health => "health",
         }
     }
 
@@ -4394,6 +4454,7 @@ impl CronKind {
             CronKind::Snapshot => Job::Snapshot,
             CronKind::ArchiveSnap | CronKind::ArchiveBig => Job::Archive,
             CronKind::Reap => Job::Reap,
+            CronKind::Health => Job::Health,
         }
     }
 
@@ -4435,6 +4496,7 @@ impl CronKind {
             (runs("archive", Some("sync")) && runs("--tier", Some("snap")), CronKind::ArchiveSnap),
             (runs("archive", Some("sync")) && runs("--tier", Some("big")), CronKind::ArchiveBig),
             (runs("reap", Some("run")), CronKind::Reap),
+            (runs("pods", Some("test")) && runs("--deep", None), CronKind::Health),
         ]
         .into_iter()
         .filter_map(|(hit, k)| hit.then_some(k))
@@ -4860,6 +4922,129 @@ fn reap_cron_line(apply: bool, config_path: &std::path::Path, exe: &str, cfg_abs
         }
     }
     Ok(arena_core::reap::render::cron_line(apply, exe, cfg_abs, home, log, &env))
+}
+
+/// When the daily health check runs (`cron install --health HH:MM`): cron's time, this box's
+/// zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HealthAt {
+    hour: u32,
+    minute: u32,
+}
+
+impl HealthAt {
+    /// `--health`'s `HH:MM` (or `H:MM`): an hour 0–23 and two-digit minutes 00–59 — `07:05` and
+    /// `7:05`, never `7:5` (07:05 or 07:50?), `25:00` or `07:60`. Pure.
+    fn parse(s: &str) -> Result<HealthAt> {
+        let bad = || anyhow::anyhow!("--health takes HH:MM in this box's time zone, e.g. 07:30 (got {s:?})");
+        let (h, m) = s.trim().split_once(':').ok_or_else(bad)?;
+        let digits = |x: &str, len: std::ops::RangeInclusive<usize>| len.contains(&x.len()) && x.bytes().all(|b| b.is_ascii_digit());
+        if !digits(h, 1..=2) || !digits(m, 2..=2) {
+            return Err(bad());
+        }
+        let (hour, minute): (u32, u32) = (h.parse()?, m.parse()?);
+        if hour > 23 || minute > 59 {
+            return Err(bad());
+        }
+        Ok(HealthAt { hour, minute })
+    }
+
+    /// The time an installed health line runs at, read back from its schedule — `M H * * *`, as
+    /// [`health_cron_line`] writes it; `None` for any other (a hand edit). Pure.
+    fn of_line(line: &str) -> Option<HealthAt> {
+        let (schedule, _) = cron_line_parts(line)?;
+        match schedule.split(' ').collect::<Vec<_>>().as_slice() {
+            [m, h, "*", "*", "*"] => HealthAt::parse(&format!("{h}:{m:0>2}")).ok(),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for HealthAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:02}:{:02}", self.hour, self.minute)
+    }
+}
+
+/// The daily health check's line (`cron install --health HH:MM`): `pods test --deep` once a day
+/// at `at`, in this box's time zone (cron's). Read-only, so no `--yes`; and it never reaches
+/// outside the cohort — a deep check that names no pod takes this cohort's ([`cohort_only`]), so
+/// a staff box running someone's job never gets its CUDA, NCCL and download checks. Under `flock
+/// -n -o` like the backup line: a check still running never gets a second one beside it, and no
+/// ssh it started can hold the lock. `ARENA_STATE_DIR` goes into the line, as the archive's does
+/// (AD10): the verdicts land in the health cache this shell's dashboard and `snapshot` read,
+/// whatever cron's environment lacks. It exits non-zero when a pod FAILs — the log has the table.
+/// `log`: the log the installed health line chose, kept ([`kept_logs`]). Pure.
+fn health_cron_line(at: HealthAt, exe: &str, config: &str, home: &str, state_root: &str, log: Option<&str>) -> String {
+    use arena_core::cron::{self, Job};
+    let log = log.map_or_else(|| cron::log(home, Job::Health), String::from);
+    format!(
+        "{} {} * * * {}ARENA_STATE_DIR={state_root} flock -n -o {} {exe} --config {config} pods test --deep >> {log} 2>&1",
+        at.minute,
+        at.hour,
+        cron::mkdir(home, &log),
+        cron::lock(home, Job::Health)
+    )
+}
+
+/// How a health line's time reads (`cron install`'s note, `cron show`): `daily at 07:20, this
+/// box's time zone (BST +0100)`, the zone as [`box_zone`] read it — and, when the crontab sets a
+/// zone of its own (`set`: [`cron_tz`]), that a cron honouring it runs the line there instead
+/// (cronie reads `CRON_TZ`; Debian's cron doesn't), so the time said is never silently wrong. Pure.
+fn health_when(at: HealthAt, zone: Option<&str>, set: Option<(&str, &str)>) -> String {
+    let mut out = match zone {
+        Some(z) => format!("daily at {at}, this box's time zone ({z})"),
+        None => format!("daily at {at}, this box's time zone"),
+    };
+    if let Some((name, value)) = set {
+        out.push_str(&format!(" — this crontab sets {name}={value}: a cron that reads it runs the line at {at} there instead"));
+    }
+    out
+}
+
+/// The warning for a health line on one of the reaper's minutes
+/// ([`arena_core::reap::render::CRON_SCHEDULE`]): its look then lands during the deep check every
+/// day, and its window checks (CPU, network, GPU) read the check as use — measured live, the check
+/// is otherwise invisible to it (no file in the home changes after a pod's first CUDA use, and its
+/// CPU and download stay under the cumulative thresholds). A pod idle for a day or more would
+/// then never be reaped. `None` on any other minute. Pure.
+fn health_minute_warning(at: HealthAt) -> Option<String> {
+    let reap = arena_core::reap::render::CRON_SCHEDULE.split(' ').next().unwrap_or_default();
+    let minutes: Vec<u32> = reap.split(',').filter_map(|m| m.parse().ok()).collect();
+    minutes.contains(&at.minute).then(|| {
+        let shown = minutes.iter().map(|m| format!(":{m:02}")).collect::<Vec<_>>().join("/");
+        format!(
+            "warning: the reaper looks at {shown}: a deep check at :{:02} reads as use to it every day, so a pod idle for a \
+             day or more is never reaped — pick another minute",
+            at.minute
+        )
+    })
+}
+
+/// The time zone a crontab sets for the health line, if any: a setting on a line of its own
+/// (not a comment, not inside a job's command), quotes dropped, from the lines **before** the
+/// health line (a setting applies to the lines after it; with no health line yet — `install`
+/// appends it — the whole crontab). `CRON_TZ` (cronie's scheduling zone) wins over `TZ` (the
+/// commands' environment), each the last one before the line. Pure.
+fn cron_tz(crontab: &str) -> Option<(&'static str, &str)> {
+    let before: Vec<&str> = crontab.lines().take_while(|l| CronKind::of(l) != Some(CronKind::Health)).collect();
+    let last = |want: &'static str| {
+        before.iter().rev().find_map(|l| {
+            let (name, value) = l.trim_start().split_once('=')?;
+            (name.trim_end() == want).then_some(())?;
+            let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+            (!value.is_empty() && !value.contains(char::is_whitespace)).then_some((want, value))
+        })
+    };
+    last("CRON_TZ").or_else(|| last("TZ"))
+}
+
+/// This box's time zone as cron reads it — the system's, so `date` without this shell's `TZ` —
+/// as `BST +0100`. `None` when `date` can't say.
+fn box_zone() -> Option<String> {
+    let out = std::process::Command::new("date").env_remove("TZ").arg("+%Z %z").stdin(std::process::Stdio::null()).output().ok()?;
+    let zone = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !zone.is_empty()).then_some(zone)
 }
 
 /// Whether this user's crontab has the reap line — `config check` then shows the reaper's
@@ -5547,6 +5732,14 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
             println!("  ✓ {key:<28} (empty) write-only — the config file is written, nginx is never reloaded")
         }
         Some(_) => println!("  ✓ {key:<28} {reload}"),
+    }
+
+    println!("\nYour ~/.ssh/config (`ssh-config --install`):");
+    let home = std::env::var("HOME").ok();
+    let (row, bad) = ssh_config_check_row(cfg, home.as_deref());
+    println!("{row}");
+    if let Some(e) = bad {
+        note_invalid(&mut missing, &arena_core::Error::Config(e));
     }
 
     println!("\nBackup (git `backup` + file `pull`):");
@@ -6680,7 +6873,11 @@ async fn sync_proxy(cfg: &Config, fleet: &dyn Provider, why: &str) -> ProxySync 
         Err(reason) => ProxySync::Skipped(reason),
         Ok(()) => proxy_sync_now(cfg, fleet).await,
     };
-    report_sync(why, outcome)
+    let outcome = report_sync(why, outcome);
+    if let Some(line) = ssh_config_after(cfg, fleet, why).await {
+        println!("{line}");
+    }
+    outcome
 }
 
 /// [`sync_proxy`] with its report line on stderr — for a caller whose stdout is a JSON
@@ -6691,6 +6888,9 @@ async fn sync_proxy_to_stderr(cfg: &Config, fleet: &dyn Provider, why: &str) -> 
         Ok(()) => proxy_sync_now(cfg, fleet).await,
     };
     eprintln!("{}", sync_line(why, &outcome));
+    if let Some(line) = ssh_config_after(cfg, fleet, why).await {
+        eprintln!("{line}");
+    }
     outcome
 }
 
@@ -7336,7 +7536,13 @@ async fn list_with(
         }
     };
     let (listed, fetched) = tokio::join!(listing, observing);
-    let (listing, pods, warnings) = listed?;
+    let (listing, pods, mut warnings) = listed?;
+    // SSH_CONFIG_FILE kept current from this listing — a complete one only (a provider that
+    // failed would drop its pods' blocks); nothing at all when it's unset or nothing moved.
+    if listing.errors().is_empty() {
+        let home = if cfg!(test) { None } else { std::env::var("HOME").ok() };
+        warnings.extend(ssh_config_line("pods list", arena_core::sshconfig::sync_for(cfg, &pods, home.as_deref())));
+    }
     if json {
         return Ok((format!("{}\n", serde_json::to_string_pretty(&pods)?), warnings));
     }
@@ -8128,16 +8334,17 @@ async fn handle_pods_bal(
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
             money::handle_idle(provider, remote, cfg, &sel, hours, json, &mut |l| println!("{l}")).await?;
         }
-        PodCmd::Test { deep: true, sel, json, verbose } => {
+        PodCmd::Test { deep: true, sel, json, verbose, cohort } => {
             // Read-only: no confirm. Config first: a malformed MIN_DRIVER_VERSION fails before
-            // the fleet is even listed.
+            // the fleet is even listed. Fleet-wide = this cohort's pods: the check runs CUDA, NCCL
+            // and a download on each GPU, never on a staff box's (the daily cron line's run).
             arena_core::health::HealthPolicy::from_config(cfg)?;
-            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let sel = cohort_only(cfg, select(provider, cfg, &sel.args(), Unscoped::All).await?, cohort);
             handle_deep_test(provider, remote, cfg, &sel, json, verbose).await?;
         }
-        PodCmd::Test { deep: false, sel, .. } => {
+        PodCmd::Test { deep: false, sel, cohort, .. } => {
             // Read-only: no confirm, compact one-line-per-pod output.
-            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let sel = cohort_only(cfg, select(provider, cfg, &sel.args(), Unscoped::All).await?, cohort);
             handle_run(
                 remote,
                 cfg,
@@ -12249,6 +12456,13 @@ async fn migrate_finish_on(
         .await
         .map_err(|e| anyhow::anyhow!("terminating {old_name}: {}", arena_core::lock::explain(&old_name, &e)))?;
     println!("✓ Terminated {old_name}. Migration of {canonical} complete.");
+    // Without a proxy no sync ran above, and `SSH_CONFIG_FILE` (each pod's own endpoint) would
+    // keep `-old`'s block: rewritten from the listing after the terminate.
+    if !proxied {
+        if let Some(line) = ssh_config_after(cfg, fleet, "migrate finish").await {
+            println!("{line}");
+        }
+    }
     remove_staging_for(&std::env::temp_dir(), &old.id);
     Ok(())
 }
@@ -13495,8 +13709,9 @@ async fn refresh_missing_endpoints(provider: &dyn Provider, sel: &mut Selected, 
 #[derive(Debug, Clone, Copy)]
 enum Unscoped {
     /// The whole fleet: read-only checks, and the commands that always defaulted to it
-    /// (`run`, `test`, `setup`, `copy-keys`, `cp`, `backup`, `pull`, `init-branches` — the
-    /// last three, like `set-branch --all`, then keep only this cohort's pods: [`cohort_only`]).
+    /// (`run`, `test`, `setup`, `copy-keys`, `cp`, `backup`, `pull`, `init-branches` — `test`
+    /// and the last three, like `set-branch --all`, then keep only this cohort's pods:
+    /// [`cohort_only`]).
     All,
     /// Refuse: a command that changes pods (`stop`, `reimage`, `set-branch`, `keys`) must
     /// be told which — names or `--all` (the verb goes in the message).
@@ -15670,37 +15885,53 @@ fn write_openrouter_key(dir: &std::path::Path, host: &str, secret: &str, prefix:
 }
 
 /// Write a file of secrets (the OpenRouter keys CSV) atomically, readable by its owner
-/// only. The text goes into a sibling temp file created 0600, is synced, then renamed over
-/// the target: a failure part-way leaves the old file whole (OpenRouter shows a key's secret
-/// once), and the target ends up 0600 whatever it was — an older file, created 0664 by a
-/// plain `fs::write`, is tightened. A symlink is followed (its target replaced, the link
-/// kept, even before the target exists); the old file's owner is kept where allowed.
+/// only. The text goes into a sibling temp file created 0600, is synced, renamed over the
+/// target, and the folder synced: a failure part-way leaves the old file whole, and a crash
+/// after success can't undo the rename (OpenRouter shows a key's secret once). The target
+/// ends up 0600 whatever it was — an older file, created 0664 by a plain `fs::write`, is
+/// tightened. A symlink is followed as `replace_file` follows one (its target replaced, the
+/// link kept, even before the target exists): arena's own link points inside its folder,
+/// an operator's may point elsewhere, and refusing it would lose keys already minted
+/// (review round 3). Whoever can write the keys folder can read the keys anyway. The owner
+/// is kept: the old file's, or for a new file the folder's (a `sudo arena keys gen` leaves
+/// it the operator's). Needs a writable folder (the temp file lives there).
 fn write_secret_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let folder = |p: &std::path::Path| match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
     let real = std::fs::canonicalize(path).unwrap_or_else(|_| match std::fs::read_link(path) {
-        Ok(t) => path.parent().unwrap_or(std::path::Path::new(".")).join(t),
+        Ok(t) if t.is_absolute() => t,
+        Ok(t) => folder(path).join(t),
         Err(_) => path.to_path_buf(),
     });
-    let (Some(dir), Some(name)) = (real.parent(), real.file_name()) else {
-        return Err(std::io::Error::other(format!("{}: no folder to write in", real.display())));
+    let (dir, Some(name)) = (folder(&real), real.file_name()) else {
+        return Err(std::io::Error::other(format!("{}: no file name", real.display())));
     };
-    let dir = if dir.as_os_str().is_empty() { std::path::Path::new(".") } else { dir };
     let tmp = dir.join(format!(".{}.arena-tmp-{}", name.to_string_lossy(), std::process::id()));
     let _ = std::fs::remove_file(&tmp); // this process's own leftover, if any
     let written = (|| {
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-        if let Ok(meta) = std::fs::metadata(&real) {
+        let owner = std::fs::metadata(&real).or_else(|_| std::fs::metadata(&dir)).ok();
+        if let Some(meta) = owner {
             let _ = std::os::unix::fs::fchown(&f, Some(meta.uid()), Some(meta.gid()));
         }
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
         std::fs::rename(&tmp, &real)
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return written;
     }
-    written
+    // The rename is done (the new text is what's there); a folder that can't be synced is
+    // said, not returned as a failure — a caller would take that for "not written".
+    if let Err(e) = std::fs::File::open(&dir).and_then(|d| d.sync_all()) {
+        eprintln!("warning: wrote {}, but its folder couldn't be synced ({e}): a crash now could undo it", real.display());
+    }
+    Ok(())
 }
 
 /// The first lines of a new cohort keys file.
@@ -16058,6 +16289,384 @@ async fn handle_ssh_config(
         }
     }
     Ok(())
+}
+
+/// The home `ssh-config --install`/`--uninstall` work in: `$HOME`, set and absolute — passed in,
+/// so a test never touches the real `~/.ssh`.
+fn ssh_home(home: Option<&str>) -> Result<PathBuf> {
+    match home.map(str::trim).filter(|h| h.starts_with('/')) {
+        Some(h) => Ok(PathBuf::from(h)),
+        None => anyhow::bail!("HOME isn't set to an absolute path — run this as the user whose ~/.ssh it is"),
+    }
+}
+
+/// The file `--install`/`--uninstall` mean: the PATH given, else `SSH_CONFIG_FILE`, else
+/// `~/.ssh/arena.conf` — a leading `~/` taken as `home`; absolute, or refused.
+fn install_target(cfg: &Config, path: Option<&str>, home: &std::path::Path) -> Result<PathBuf> {
+    let h = home.to_str();
+    let p = match path.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => arena_core::sshconfig::expand_home(p, h).map_err(anyhow::Error::msg)?,
+        None => match arena_core::sshconfig::managed_path(cfg, h) {
+            Some(p) => p.map_err(anyhow::Error::msg)?,
+            None => home.join(".ssh").join("arena.conf"),
+        },
+    };
+    anyhow::ensure!(p.is_absolute(), "{} isn't an absolute path (or one starting with ~/)", p.display());
+    Ok(p)
+}
+
+/// How `path` is spelled in the `Include` line — `~/…` under `home` (ssh expands it), else as
+/// it is — and its absolute spelling: either one already there counts.
+fn include_forms(path: &std::path::Path, home: &std::path::Path) -> (String, String) {
+    let abs = path.display().to_string();
+    let shown = path.strip_prefix(home).map_or_else(|_| abs.clone(), |rest| format!("~/{}", rest.display()));
+    (shown, abs)
+}
+
+/// A file's text, `None` when there is none.
+fn read_opt(path: &std::path::Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("reading {}: {e}", path.display())),
+    }
+}
+
+/// A copy of `path` beside it as `<path>.arena-bak-<stamp>` (`-2`, `-3`, … when that name is
+/// taken: an `--uninstall` in the same second as the `--install` must never overwrite the copy
+/// of the config from before both), owner-only, never over an existing file; its name, shown.
+fn keep_copy(path: &std::path::Path, stamp: &str, shown: &str) -> Result<String> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    for n in 1..100 {
+        let suffix = if n == 1 { format!(".arena-bak-{stamp}") } else { format!(".arena-bak-{stamp}-{n}") };
+        let copy = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        o.mode(0o600);
+        match o.open(&copy) {
+            Ok(mut f) => {
+                f.write_all(&bytes).and_then(|()| f.sync_all()).with_context(|| format!("writing {}", copy.display()))?;
+                return Ok(format!("{shown}{suffix}"));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(anyhow::anyhow!("copying {} to {}: {e}", path.display(), copy.display())),
+        }
+    }
+    anyhow::bail!("no free name for a copy of {} beside it", path.display())
+}
+
+/// Whether this process's effective user owns `meta`'s file ([`arena_core::sshconfig::owned_by_me`]).
+fn mine(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        arena_core::sshconfig::owned_by_me(meta)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        true
+    }
+}
+
+/// Whether `a` and `b` name the same file: the same inode when both exist, else the same name
+/// in the same real folder (a folder reached through a link counts as itself).
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    if let (Ok(x), Ok(y)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+        use std::os::unix::fs::MetadataExt;
+        return (x.dev(), x.ino()) == (y.dev(), y.ino());
+    }
+    let real = |p: &std::path::Path| p.parent().and_then(|d| std::fs::canonicalize(d).ok()).zip(p.file_name()).map(|(d, n)| d.join(n));
+    a == b || real(a).is_some_and(|x| Some(x) == real(b))
+}
+
+/// Why `--install` (`target`: PATH) or `--uninstall` (`None`) won't edit anything, checked before
+/// the first write and again after the prompt. `~/.ssh/config` or PATH a symlink or not a regular
+/// file: the rename that replaces it would cut a dotfiles link without a word. Either one, or
+/// `~/.ssh` (the home when there's none yet), owned by another user: run as someone else (sudo
+/// keeping `HOME`) it would leave files there that their owner's ssh can't read. PATH being
+/// `~/.ssh/config` itself: it would Include itself, and every ssh would fail.
+fn ssh_setup_refusal(home: &std::path::Path, config_path: &std::path::Path, target: Option<(&std::path::Path, &str)>) -> Option<String> {
+    let ssh = home.join(".ssh");
+    let (folder, folder_shown) = if std::fs::symlink_metadata(&ssh).is_ok() { (ssh, "~/.ssh") } else { (home.to_path_buf(), "your home") };
+    match std::fs::metadata(&folder) {
+        Ok(m) if !m.is_dir() => return Some(format!("{folder_shown} isn't a folder")),
+        Ok(m) if !mine(&m) => {
+            return Some(format!("{folder_shown} ({}) isn't owned by this user — run it as the user whose ~/.ssh it is", folder.display()))
+        }
+        Ok(_) => {}
+        Err(e) => return Some(format!("{folder_shown} ({}): {e}", folder.display())),
+    }
+    if let Some((path, shown)) = target {
+        if same_file(path, config_path) {
+            return Some(format!("{shown} is ~/.ssh/config itself, which would then Include itself — choose another PATH (default ~/.ssh/arena.conf)"));
+        }
+    }
+    let files = std::iter::once((config_path, "~/.ssh/config")).chain(target);
+    for (path, shown) in files {
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let to = std::fs::read_link(path).map_or_else(|_| "?".to_string(), |t| t.display().to_string());
+                return Some(format!("{shown} is a symlink (to {to}) — arena never replaces a link; edit the file it points to yourself"));
+            }
+            Ok(m) if !m.is_file() => return Some(format!("{shown} isn't a regular file")),
+            Ok(m) if !mine(&m) => return Some(format!("{shown} isn't owned by this user — run it as the user whose ~/.ssh it is")),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Some(format!("{shown}: {e}")),
+        }
+    }
+    None
+}
+
+/// A file's permission bits, `default` when it doesn't exist.
+fn mode_or(path: &std::path::Path, default: u32) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).map_or(default, |m| m.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        default
+    }
+}
+
+/// `arena ssh-config --install [PATH]`: keep one copy of the participants' config current on
+/// this machine. PATH (`SSH_CONFIG_FILE`, else `~/.ssh/arena.conf`) is written as arena's file
+/// ([`arena_core::sshconfig::MANAGED_HEADER`]) and `Include PATH` made the first line of
+/// `~/.ssh/config` — ssh applies an `Include` only where it stands, so it must come before any
+/// `Host`/`Match` block to count for every host. Says what changes and asks first; keeps a copy
+/// of `~/.ssh/config` (and of a PATH that wasn't arena's) beside it before writing. Idempotent:
+/// a second run changes nothing. The pods' endpoints come from a complete listing only — a
+/// provider that failed to list would drop its pods' blocks. `home`: `$HOME`.
+async fn handle_ssh_config_install(provider: &dyn Provider, cfg: &Config, path: Option<&str>, yes: bool, dry_run: bool, home: Option<&str>) -> Result<()> {
+    use arena_core::sshconfig::{self, FilePlan, IncludeAt};
+    let home = ssh_home(home)?;
+    let target = install_target(cfg, path, &home)?;
+    let (shown, abs) = include_forms(&target, &home);
+    if let Some(why) = sshconfig::include_path_problem(&shown) {
+        anyhow::bail!("not installed: {why}");
+    }
+    let config_path = home.join(".ssh").join("config");
+    if let Some(why) = ssh_setup_refusal(&home, &config_path, Some((&target, &shown))) {
+        anyhow::bail!("not installed: {why}");
+    }
+    let pods = if sshconfig::uses_proxy(cfg) {
+        Vec::new()
+    } else {
+        let listing = fleet_listing(provider).await;
+        let failed: Vec<String> = listing.errors().iter().map(|(p, e)| format!("{p}: {e}")).collect();
+        anyhow::ensure!(failed.is_empty(), "not installed: a provider failed to list ({}) — try again", failed.join("; "));
+        listing.pods()
+    };
+    let want = sshconfig::managed_text(&sshconfig::render_for(cfg, &pods).map_err(anyhow::Error::msg)?);
+    let existing = read_opt(&target)?;
+    let plan = sshconfig::file_plan(existing.as_deref(), &want);
+    let config = read_opt(&config_path)?;
+    let at = sshconfig::include_at(config.as_deref().unwrap_or(""), &[&shown, &abs]);
+    let stamp = arena_core::restore::stamp(arena_core::snapshot::unix_now());
+    let hosts = want.lines().filter(|l| l.starts_with("Host ") && !l.ends_with('*')).count();
+    let mut todo = Vec::new();
+    match plan {
+        FilePlan::Write if existing.is_none() => todo.push(format!("write {shown} ({hosts} host(s), owner-only)")),
+        FilePlan::Write => todo.push(format!("rewrite {shown} ({hosts} host(s)): arena's, and its text changed")),
+        FilePlan::Unchanged => {}
+        FilePlan::NotOurs => todo.push(format!(
+            "replace {shown}: it isn't arena's (no `# managed by arena` first line) — the old one is kept as {shown}.arena-bak-{stamp}"
+        )),
+    }
+    match at {
+        IncludeAt::Absent if config.is_none() => todo.push(format!("create ~/.ssh/config (owner-only) holding `Include {shown}`")),
+        IncludeAt::Absent => todo.push(format!(
+            "add `Include {shown}` as the first line of ~/.ssh/config — the old one is kept as ~/.ssh/config.arena-bak-{stamp}"
+        )),
+        IncludeAt::Global => {}
+        IncludeAt::InBlock(n) => println!(
+            "note: ~/.ssh/config includes {shown} on line {n}, inside a Host/Match block, where it applies to that block only — \
+             left as it is: move it above the first Host/Match line yourself"
+        ),
+    }
+    let hint = match sshconfig::managed_path(cfg, home.to_str()) {
+        Some(Ok(p)) if p == target => None,
+        _ => Some(format!("to keep it current after every pod change: arena config set SSH_CONFIG_FILE '{shown}'")),
+    };
+    if todo.is_empty() {
+        println!("{shown} is current and ~/.ssh/config includes it — nothing to change.");
+        if let Some(h) = &hint {
+            println!("{h}");
+        }
+        return Ok(());
+    }
+    for t in &todo {
+        println!("  · {t}");
+    }
+    if dry_run {
+        println!("\nPreview only — run without --dry-run to make these changes.");
+        return Ok(());
+    }
+    if !confirm(yes, "\nMake these changes?")? {
+        println!("aborted.");
+        return Ok(());
+    }
+    // What was shown is what gets written: checked again after the prompt — a file edited, or
+    // swapped for a link, meanwhile stops it before anything is written.
+    if let Some(why) = ssh_setup_refusal(&home, &config_path, Some((&target, &shown))) {
+        anyhow::bail!("not installed: {why}");
+    }
+    anyhow::ensure!(
+        read_opt(&target)? == existing && read_opt(&config_path)? == config,
+        "not installed: {shown} or ~/.ssh/config changed while asking — nothing written; run it again"
+    );
+    if plan != FilePlan::Unchanged {
+        if plan == FilePlan::NotOurs {
+            println!("kept {}", keep_copy(&target, &stamp, &shown)?);
+        }
+        sshconfig::write_atomic(&target, &want, 0o600).map_err(anyhow::Error::msg)?;
+        println!("wrote {shown}");
+    }
+    if at == IncludeAt::Absent {
+        if config.is_some() {
+            println!("kept {}", keep_copy(&config_path, &stamp, "~/.ssh/config")?);
+        }
+        let text = sshconfig::with_include_first(config.as_deref().unwrap_or(""), &shown);
+        sshconfig::write_atomic(&config_path, &text, mode_or(&config_path, 0o600)).map_err(anyhow::Error::msg)?;
+        println!("~/.ssh/config now starts with `Include {shown}`");
+    }
+    if let Some(h) = hint {
+        println!("{h}");
+    }
+    Ok(())
+}
+
+/// `arena ssh-config --uninstall [PATH]`: take the `Include PATH` line(s) out of
+/// `~/.ssh/config` — exactly those (either spelling), everything else byte for byte, a copy
+/// of the old file kept beside it. PATH itself and earlier copies stay. Says what changes and
+/// asks first. `home`: `$HOME`.
+fn handle_ssh_config_uninstall(cfg: &Config, path: Option<&str>, yes: bool, dry_run: bool, home: Option<&str>) -> Result<()> {
+    use arena_core::sshconfig::{include_at, without_include, IncludeAt};
+    let home = ssh_home(home)?;
+    let target = install_target(cfg, path, &home)?;
+    let (shown, abs) = include_forms(&target, &home);
+    let forms = [shown.as_str(), abs.as_str()];
+    let config_path = home.join(".ssh").join("config");
+    if let Some(why) = ssh_setup_refusal(&home, &config_path, None) {
+        anyhow::bail!("not changed: {why}");
+    }
+    let config = read_opt(&config_path)?;
+    let in_block = |text: &str| match include_at(text, &forms) {
+        IncludeAt::InBlock(n) => Some(n),
+        _ => None,
+    };
+    let Some(new) = config.as_deref().and_then(|c| without_include(c, &forms)) else {
+        match config.as_deref().and_then(in_block) {
+            Some(n) => println!(
+                "~/.ssh/config includes {shown} only inside a Host/Match block (line {n}) — left as it is: --install never puts \
+                 it there, so it's yours"
+            ),
+            None => println!("~/.ssh/config doesn't include {shown} — nothing to take out."),
+        }
+        return Ok(());
+    };
+    let stamp = arena_core::restore::stamp(arena_core::snapshot::unix_now());
+    println!("  · take `Include {shown}` out of ~/.ssh/config — the old one is kept as ~/.ssh/config.arena-bak-{stamp}; {shown} stays");
+    if dry_run {
+        println!("\nPreview only — run without --dry-run to make this change.");
+        return Ok(());
+    }
+    if let Some(n) = in_block(&new) {
+        println!("    (the one inside a Host/Match block, line {n} after this, is left as it is)");
+    }
+    if !confirm(yes, "\nMake this change?")? {
+        println!("aborted.");
+        return Ok(());
+    }
+    if let Some(why) = ssh_setup_refusal(&home, &config_path, None) {
+        anyhow::bail!("not changed: {why}");
+    }
+    anyhow::ensure!(read_opt(&config_path)? == config, "not changed: ~/.ssh/config changed while asking — nothing written; run it again");
+    println!("kept {}", keep_copy(&config_path, &stamp, "~/.ssh/config")?);
+    arena_core::sshconfig::write_atomic(&config_path, &new, mode_or(&config_path, 0o600)).map_err(anyhow::Error::msg)?;
+    println!("took `Include {shown}` out of ~/.ssh/config");
+    if arena_core::sshconfig::managed_path(cfg, home.to_str()).is_some() {
+        println!("note: SSH_CONFIG_FILE is still set, so pod changes keep rewriting it — take that line out of the config to stop");
+    }
+    Ok(())
+}
+
+/// After a pod change (every [`sync_proxy`]): keep `SSH_CONFIG_FILE` current. The proxy layout
+/// needs no listing; the direct one lists the fleet and writes from a complete listing only —
+/// one that failed somewhere would drop that provider's pods. One line when it rewrote the file
+/// or couldn't; nothing when the key is unset or the file is already current.
+async fn ssh_config_after(cfg: &Config, fleet: &dyn Provider, why: &str) -> Option<String> {
+    let home = if cfg!(test) { None } else { std::env::var("HOME").ok() };
+    // Off (unset): no listing, nothing said. A bad value is `sync_for`'s warning below.
+    let _ = arena_core::sshconfig::managed_path(cfg, home.as_deref())?;
+    let pods = if arena_core::sshconfig::uses_proxy(cfg) {
+        Vec::new()
+    } else {
+        let listing = fleet_listing(fleet).await;
+        let failed: Vec<String> = listing.errors().iter().map(|(p, _)| p.to_string()).collect();
+        if !failed.is_empty() {
+            return Some(format!("[ssh-config] after {why}: not rewritten — {} failed to list (the next change rewrites it)", failed.join(", ")));
+        }
+        listing.pods()
+    };
+    ssh_config_line(why, arena_core::sshconfig::sync_for(cfg, &pods, home.as_deref()))
+}
+
+/// The one line a sync of `SSH_CONFIG_FILE` prints (`why`: what it followed): a rewrite, or why
+/// it couldn't (a warning — never a failed command); nothing when it was current or is off. Pure.
+fn ssh_config_line(why: &str, synced: Option<std::result::Result<arena_core::sshconfig::Synced, String>>) -> Option<String> {
+    match synced? {
+        Ok(s) if !s.written => None,
+        Ok(s) => Some(format!("[ssh-config] after {why}: rewrote {}", s.path.display())),
+        Err(e) => Some(format!("warning: [ssh-config] after {why}: not rewritten — {e}")),
+    }
+}
+
+/// `config check`'s `SSH_CONFIG_FILE` row, and the error to count when it's unusable. Reads the
+/// file and `~/.ssh/config` (never writes): arena's or not, and whether ssh is pointed at it.
+fn ssh_config_check_row(cfg: &Config, home: Option<&str>) -> (String, Option<String>) {
+    use arena_core::sshconfig::{self, IncludeAt};
+    const KEY: &str = "SSH_CONFIG_FILE";
+    let path = match sshconfig::managed_path(cfg, home) {
+        None => {
+            return (
+                format!("  · {KEY:<28} (unset) — `arena ssh-config --install` keeps ~/.ssh/arena.conf current after every pod change"),
+                None,
+            )
+        }
+        Some(Err(e)) => return (format!("  ✗ {KEY:<28} {e}"), Some(e)),
+        Some(Ok(p)) => p,
+    };
+    let home_path = home.map(std::path::Path::new);
+    let (shown, abs) = home_path.map_or_else(|| (path.display().to_string(), path.display().to_string()), |h| include_forms(&path, h));
+    let row = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            format!("  ⚠ {KEY:<28} {shown} — not written yet (the next pod change or `pods list` writes it)")
+        }
+        Err(e) => format!("  ⚠ {KEY:<28} {shown} — unreadable: {e}"),
+        Ok(t) if !sshconfig::is_managed(&t) => {
+            format!("  ⚠ {KEY:<28} {shown} isn't arena's — not rewritten (`arena ssh-config --install` replaces it after asking)")
+        }
+        Ok(_) => {
+            let config = home_path.and_then(|h| std::fs::read_to_string(h.join(".ssh").join("config")).ok()).unwrap_or_default();
+            match sshconfig::include_at(&config, &[&shown, &abs]) {
+                IncludeAt::Global => format!("  ✓ {KEY:<28} {shown} (arena's), included by ~/.ssh/config"),
+                IncludeAt::InBlock(n) => {
+                    format!("  ⚠ {KEY:<28} {shown} (arena's), but ~/.ssh/config includes it inside a Host/Match block (line {n})")
+                }
+                IncludeAt::Absent => format!("  ⚠ {KEY:<28} {shown} (arena's), not included by ~/.ssh/config (`arena ssh-config --install`)"),
+            }
+        }
+    };
+    (row, None)
 }
 
 /// `replace`/`migrate`'s replacement spec and the `--gpu` check policy, with a fake
@@ -18263,12 +18872,25 @@ ASK_CODEX_MODEL=-x
         super::write_secret_file(&link, "x\n").unwrap();
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!((std::fs::read_to_string(&file).unwrap().as_str(), mode(&file)), ("x\n", 0o600));
-        // A write that can't finish leaves the old file whole (here: no temp file allowed).
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // A write that can't finish leaves the old file whole (here, as root too: a folder
+        // sits where the temp file would go).
+        let blocker = dir.join(format!(".devtest_openrouter_keys.csv.arena-tmp-{}", std::process::id()));
+        std::fs::create_dir(&blocker).unwrap();
         assert!(super::write_secret_file(&link, "lost\n").is_err());
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "x\n");
+        std::fs::remove_dir(&blocker).unwrap();
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "no temp file left");
+        // A link to another folder (an operator's secrets folder) is followed, as before.
+        let elsewhere = std::env::temp_dir().join(format!("arena-keys-elsewhere-{}", std::process::id()));
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let target = elsewhere.join("keys.csv");
+        std::fs::write(&target, "old\n").unwrap();
+        let away = dir.join("away_link.csv");
+        std::os::unix::fs::symlink(&target, &away).unwrap();
+        super::write_secret_file(&away, "new\n").unwrap();
+        assert!(std::fs::symlink_metadata(&away).unwrap().file_type().is_symlink());
+        assert_eq!((std::fs::read_to_string(&target).unwrap().as_str(), mode(&target)), ("new\n", 0o600));
+        let _ = std::fs::remove_dir_all(&elsewhere);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -18589,6 +19211,95 @@ ASK_CODEX_MODEL=-x
         assert_eq!(kinds, [super::CronKind::Proxy, super::CronKind::Snapshot]);
     }
 
+    /// `cron install --health HH:MM` (spec health-cron): `pods test --deep` once a day at that
+    /// time — cron's, this box's zone — under `flock -n -o` like the backup line, its lock and log
+    /// in the cron folder (or the log the installed line chose, its folder recreated first), the
+    /// state dir carried as the archive's lines carry it, read-only (no `--yes`), recognized as
+    /// the health line, and its time read back for `cron show`.
+    #[test]
+    fn health_cron_line_runs_the_deep_check_daily() {
+        use super::{health_cron_line, health_when, CronKind, HealthAt};
+        let at = HealthAt::parse("07:05").unwrap();
+        let line = health_cron_line(at, "/opt/arena", "/srv/config.env", "/home/u", "/var/lib/arena", None);
+        assert_eq!(
+            line,
+            "5 7 * * * mkdir -p /home/u/.local/state/arena-cron && ARENA_STATE_DIR=/var/lib/arena flock -n -o \
+             /home/u/.local/state/arena-cron/health.lock /opt/arena --config /srv/config.env pods test --deep \
+             >> /home/u/.local/state/arena-cron/health.log 2>&1"
+        );
+        assert_eq!(CronKind::of(&line), Some(CronKind::Health));
+        assert!(!line.contains("--yes"), "read-only: {line}");
+        assert_eq!(HealthAt::of_line(&line), Some(at));
+        assert_eq!(health_when(at, Some("BST +0100"), None), "daily at 07:05, this box's time zone (BST +0100)");
+        assert_eq!(health_when(at, None, None), "daily at 07:05, this box's time zone");
+        // A zone the crontab sets is said beside the box's (review ai-review codex #1, claude #7).
+        assert_eq!(
+            health_when(at, Some("BST +0100"), Some(("CRON_TZ", "UTC"))),
+            "daily at 07:05, this box's time zone (BST +0100) — this crontab sets CRON_TZ=UTC: a cron that reads it runs \
+             the line at 07:05 there instead"
+        );
+        // On one of the reaper's minutes, a warning (review ai-review claude #1, measured live).
+        for minute in [11, 27, 41, 57] {
+            let w = super::health_minute_warning(HealthAt { hour: 7, minute }).unwrap_or_default();
+            assert!(w.starts_with("warning: the reaper looks at :11/:27/:41/:57: a deep check at :") && w.contains(&format!(":{minute:02} reads")), "{w}");
+        }
+        for minute in [0, 5, 20, 30, 59] {
+            assert_eq!(super::health_minute_warning(HealthAt { hour: 7, minute }), None, ":{minute}");
+        }
+        // A kept log stays where it is, its folder recreated first.
+        let kept = health_cron_line(at, "/opt/arena", "/c", "/home/u", "/s", Some("/home/u/logs/health.log"));
+        assert!(kept.starts_with("5 7 * * * mkdir -p /home/u/.local/state/arena-cron /home/u/logs && ARENA_STATE_DIR=/s "), "{kept}");
+        assert!(kept.ends_with(" pods test --deep >> /home/u/logs/health.log 2>&1"), "{kept}");
+        // A schedule that isn't once a day at a fixed time (a hand edit) isn't read as one.
+        for l in ["*/30 7 * * * a pods test --deep", "5 7 * * 1 a pods test --deep", "@daily a pods test --deep", "5 24 * * * a pods test --deep", "5"] {
+            assert_eq!(HealthAt::of_line(l), None, "{l}");
+        }
+        assert_eq!(HealthAt::of_line("05 7 * * * a pods test --deep"), Some(at));
+    }
+
+    /// The zone a crontab sets for the health line (`CRON_TZ=`/`TZ=` on a line of its own,
+    /// before it): `CRON_TZ` over `TZ`, the last of each before the line; comments, a job's
+    /// inline env and a value with a space aren't one (review: a later setting used to win).
+    #[test]
+    fn cron_tz_reads_the_crontabs_own_zone_setting() {
+        use super::cron_tz;
+        let cases: &[(&str, Option<(&str, &str)>)] = &[
+            ("CRON_TZ=Europe/London\n0 3 * * * x\n", Some(("CRON_TZ", "Europe/London"))),
+            ("  TZ = UTC\n", Some(("TZ", "UTC"))),
+            ("CRON_TZ=\"America/New_York\"\nTZ='Asia/Tokyo'\n", Some(("CRON_TZ", "America/New_York"))),
+            ("TZ=Asia/Tokyo\n", Some(("TZ", "Asia/Tokyo"))),
+            // Only what comes before the health line applies to it.
+            (
+                "CRON_TZ=UTC\n20 7 * * * flock -n -o /h/.local/state/arena-cron/health.lock /opt/arena --config /c pods test --deep >> /h/.local/state/arena-cron/health.log 2>&1\nCRON_TZ=Asia/Tokyo\n",
+                Some(("CRON_TZ", "UTC")),
+            ),
+            ("# CRON_TZ=Europe/London\n", None),
+            ("0 3 * * * CRON_TZ=UTC /opt/arena pods backup\n", None),
+            ("MAILTO=ops@example.org\nPATH=/usr/bin\n", None),
+            ("CRON_TZ=\n", None),
+            ("CRON_TZ=Europe/London with words\n", None),
+            ("", None),
+        ];
+        for (tab, want) in cases {
+            assert_eq!(cron_tz(tab), *want, "{tab:?}");
+        }
+    }
+
+    /// `--health` takes `HH:MM` (or `H:MM`) in this box's time zone: an hour 0–23 and two-digit
+    /// minutes — never a guess at `7:5` (07:05 or 07:50?), `25:00` or `07:60`.
+    #[test]
+    fn health_time_must_be_hh_mm() {
+        use super::HealthAt;
+        for (s, hour, minute) in [("07:05", 7, 5), ("7:05", 7, 5), ("00:00", 0, 0), ("23:59", 23, 59), (" 07:30 ", 7, 30)] {
+            assert_eq!(HealthAt::parse(s).unwrap(), HealthAt { hour, minute }, "{s}");
+            assert_eq!(HealthAt::parse(s).unwrap().to_string(), format!("{hour:02}:{minute:02}"));
+        }
+        for s in ["25:00", "24:00", "7:5", "07:60", "07:5", "7", "0730", "07:05:00", "+7:05", "-1:00", "07:+5", "", ":", "007:05", "07h05", "\u{0667}:05"] {
+            let e = HealthAt::parse(s).unwrap_err().to_string();
+            assert_eq!(e, format!("--health takes HH:MM in this box's time zone, e.g. 07:30 (got {s:?})"), "{s}");
+        }
+    }
+
     /// `update --check` exits 10 when a newer release exists, apart from up to date (0) and
     /// couldn't check (1); the version it compares is this build's, with its commit after it.
     #[test]
@@ -18676,6 +19387,7 @@ ASK_CODEX_MODEL=-x
             ("*/2 * * * * mkdir -p /h/.local/state/arena-cron && flock -n /h/.local/state/arena-cron/snapshot.lock /opt/arena --config /c snapshot --public --out '/w/fleet.json' >> /h/.local/state/arena-cron/snapshot.log 2>&1", Some(Snapshot)),
             ("40 * * * * mkdir -p /h/.local/state/arena-cron /h/logs && nice -n 10 /opt/arena --config /c archive sync --tier big >> /h/logs/archive.log 2>&1", Some(ArchiveBig)),
             ("11 * * * * mkdir -p /h/.local/state/arena-cron && PATH=/bin flock -n -o /h/.local/state/arena-cron/reap.lock /opt/arena --config /c pods reap run >> /h/.local/state/arena-cron/reap.log 2>&1", Some(Reap)),
+            ("5 7 * * * mkdir -p /h/.local/state/arena-cron && ARENA_STATE_DIR=/s flock -n -o /h/.local/state/arena-cron/health.lock /opt/arena --config /c pods test --deep >> /h/.local/state/arena-cron/health.log 2>&1", Some(Health)),
             // a663f65's: one folder under the state root.
             ("*/15 * * * * mkdir -p /h/.local/state/arena/cron && ARENA_START_DATE=2026-01-05 flock -n -o /h/.local/state/arena/cron/backup.lock /opt/arena --config /c pods backup --yes >> /h/.local/state/arena/cron/backup.log 2>&1", Some(Backup)),
             ("*/5 * * * * mkdir -p /h/.local/state/arena/cron && PATH=/usr/sbin:/usr/bin flock -n /h/.local/state/arena/cron/proxy.lock /opt/arena --config /c proxy apply --yes >> /h/.local/state/arena/cron/proxy.log 2>&1", Some(Proxy)),
@@ -18696,6 +19408,9 @@ ASK_CODEX_MODEL=-x
             ("0 3 * * * /opt/arena --config /c proxy plan", None),
             ("0 3 * * * /opt/arena --config /c pods list >> /h/.arena-proxy-cron.lock.snapshot", None),
             ("*/15 * * * * arena pods backup --yes && arena proxy apply --yes", None),
+            // The torch check isn't the health line; a deep check chained to another job is two.
+            ("0 3 * * * /opt/arena --config /c pods test >> /h/torch.log 2>&1", None),
+            ("0 7 * * * /opt/arena --config /c pods test --deep && /opt/arena --config /c pods backup --yes", None),
             ("# a note", None),
             // Comments are never a kind: a paused (commented-out) line, a note naming one.
             ("# */15 * * * * flock -n /h/.arena-backup-cron.lock /opt/arena --config /c pods backup --yes", None),
@@ -18788,7 +19503,9 @@ ASK_CODEX_MODEL=-x
         use arena_core::cron::{self, Job};
         let mut old = line.replacen(&format!("mkdir -p {} && ", cron::dir(home)), "", 1);
         for job in Job::ALL {
-            old = old.replace(&format!(" >> {} ", cron::log(home, job)), &format!(" >> {home}/{} ", job.legacy_log()));
+            if let Some(log) = job.legacy_log() {
+                old = old.replace(&format!(" >> {} ", cron::log(home, job)), &format!(" >> {home}/{log} "));
+            }
             if let Some(lock) = job.legacy_lock() {
                 old = old.replace(&format!(" {} ", cron::lock(home, job)), &format!(" {home}/{lock} "));
             }
@@ -19229,7 +19946,9 @@ ASK_CODEX_MODEL=-x
         let state = vec![("ARENA_STATE_DIR".to_string(), h.clone())];
         let reap_log = format!("{h}/logs/reap/reap.log");
         lines.push((CronKind::Reap, arena_core::reap::render::cron_line(false, &exe, "/c", &h, Some(&reap_log), &state)));
-        assert_eq!(lines.len(), 6);
+        let health_log = format!("{h}/logs/health/health.log");
+        lines.push((CronKind::Health, super::health_cron_line(super::HealthAt { hour: 7, minute: 30 }, &exe, "/c", &h, &h, Some(&health_log))));
+        assert_eq!(lines.len(), 7);
         for (kind, line) in &lines {
             let _ = std::fs::remove_dir_all(cron::dir(&h));
             let _ = std::fs::remove_dir_all(home.join("logs"));
@@ -19250,7 +19969,7 @@ ASK_CODEX_MODEL=-x
             let want = match kind {
                 CronKind::Backup => (true, false),
                 CronKind::ArchiveSnap | CronKind::ArchiveBig => (true, true),
-                CronKind::Reap => (false, true),
+                CronKind::Reap | CronKind::Health => (false, true),
                 CronKind::Proxy | CronKind::Snapshot => (false, false),
             };
             assert_eq!((start, state), want, "{}: the env arena saw: {log:?}", kind.label());
@@ -19924,6 +20643,327 @@ ASK_CODEX_MODEL=-x
         assert_eq!(s.tab(), tab, "nothing changed");
     }
 
+    /// `cron install --health` end to end (spec health-cron): its one line, no backup line brought
+    /// along; kept byte for byte by later installs of other lines — each flag names its own line,
+    /// so an install without `--health` keeps it (the spec's "dropped" predates the merge by
+    /// identity); replaced in place by a new time; dropped by `remove --health` alone; a time that
+    /// isn't `HH:MM` refused before anything is written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_health_line_is_a_line_of_its_own() {
+        use super::{health_cron_line, CronKind, HealthAt};
+        let s = CronStub::new("health");
+        let kinds = |s: &CronStub| s.lines().iter().filter_map(|l| CronKind::of(l)).collect::<Vec<_>>();
+        let e = s.run_as(&["install", "--health", "7:5"], true, Some(&s.home)).await.unwrap_err().to_string();
+        assert!(e.starts_with("--health takes HH:MM"), "{e}");
+        assert!(!s.dir.join("tab").exists(), "nothing written");
+        s.run(&["install", "--health", "07:30"]).await;
+        let root = super::archive::cron_state_root(&arena_core::Config::default()).unwrap();
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        let cfg = std::fs::canonicalize(&s.config).unwrap().display().to_string();
+        let at = |hour, minute| health_cron_line(HealthAt { hour, minute }, &exe, &cfg, &s.home, &root, None);
+        assert_eq!(s.lines(), [at(7, 30)]);
+        s.run(&["install", "--proxy"]).await;
+        s.run(&["install", "--backup", "--pull"]).await;
+        assert_eq!(kinds(&s), [CronKind::Health, CronKind::Proxy, CronKind::Backup]);
+        assert_eq!(s.lines()[0], at(7, 30), "kept byte for byte");
+        s.run(&["install", "--health", "6:05"]).await;
+        assert_eq!(kinds(&s), [CronKind::Health, CronKind::Proxy, CronKind::Backup]);
+        assert_eq!(s.lines()[0], at(6, 5));
+        s.run(&["remove", "--health"]).await;
+        assert_eq!(kinds(&s), [CronKind::Proxy, CronKind::Backup]);
+    }
+
+    /// The one line a sync of `SSH_CONFIG_FILE` prints: a rewrite, or why not (a warning);
+    /// nothing when it was current or is off.
+    #[test]
+    fn ssh_config_line_says_a_rewrite_or_why_not_and_nothing_else() {
+        use arena_core::sshconfig::Synced;
+        let path = std::path::PathBuf::from("/home/u/.ssh/arena.conf");
+        assert_eq!(super::ssh_config_line("create", None), None);
+        assert_eq!(super::ssh_config_line("create", Some(Ok(Synced { path: path.clone(), written: false }))), None);
+        assert_eq!(
+            super::ssh_config_line("create", Some(Ok(Synced { path, written: true }))).as_deref(),
+            Some("[ssh-config] after create: rewrote /home/u/.ssh/arena.conf")
+        );
+        assert_eq!(
+            super::ssh_config_line("pods list", Some(Err("x".into()))).as_deref(),
+            Some("warning: [ssh-config] after pods list: not rewritten — x")
+        );
+    }
+
+    /// A provider listing `pods` (or failing to, `fail`) — for the ssh-config install.
+    struct Listed(Vec<arena_core::Pod>, bool);
+
+    #[async_trait::async_trait]
+    impl arena_core::Provider for Listed {
+        fn name(&self) -> &'static str {
+            "runpod"
+        }
+        fn describe(&self, _spec: &arena_core::PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> arena_core::Result<Vec<arena_core::Pod>> {
+            if self.1 {
+                Err(arena_core::Error::provider("HTTP 500"))
+            } else {
+                Ok(self.0.clone())
+            }
+        }
+        async fn create_pod(&self, _spec: &arena_core::PodSpec) -> arena_core::Result<arena_core::Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> arena_core::Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A temp home with a `.ssh` folder; `config` (if any) as `~/.ssh/config`, mode 0644.
+    #[cfg(unix)]
+    fn ssh_home_with(tag: &str, config: Option<&str>) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::temp_dir().join(format!("arena-sshinst-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        if let Some(c) = config {
+            let p = home.join(".ssh/config");
+            std::fs::write(&p, c).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        home
+    }
+
+    /// The names in `~/.ssh` that are copies arena kept (`*.arena-bak-*`), sorted.
+    #[cfg(unix)]
+    fn kept_copies(home: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(home.join(".ssh"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".arena-bak-"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// `ssh-config --install` / `--uninstall` against a temp home (spec ssh-config-include): the
+    /// file written as arena's, 0600; `Include` made ~/.ssh/config's first line, its mode kept,
+    /// a copy of the old config kept first; a second run changes nothing; a dry run writes
+    /// nothing; a partial listing writes nothing; a file that isn't arena's is replaced only with
+    /// a copy kept; an Include inside a Host block is left alone; a missing ~/.ssh/config is
+    /// created 0600; `--uninstall` takes out exactly the line (a copy kept, never over the
+    /// install's), leaves the file, and then has nothing to take out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_config_install_and_uninstall_against_a_temp_home() {
+        use super::{handle_ssh_config_install as install, handle_ssh_config_uninstall as uninstall};
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let pods = vec![arena_core::Pod {
+            id: "id-a".into(),
+            name: "devtest-apple".into(),
+            provider: "runpod".into(),
+            status: "RUNNING".into(),
+            ssh_ip: Some("1.1.1.1".into()),
+            ssh_port: Some(22000),
+            ..Default::default()
+        }];
+        let cfg = arena_core::Config::parse("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nSHARED_SSH_KEY_PATH=~/.ssh/k\n");
+        let want = arena_core::sshconfig::managed_text(&arena_core::sshconfig::render_manual("devtest", "root", "~/.ssh/k", &pods));
+        let mine = "Host box\n    HostName 9.9.9.9\n";
+        let home = ssh_home_with("main", Some(mine));
+        let h = home.to_str().unwrap();
+        let (conf, config) = (home.join(".ssh/arena.conf"), home.join(".ssh/config"));
+        // A provider that failed to list: refused, nothing written.
+        let e = install(&Listed(pods.clone(), true), &cfg, None, true, false, Some(h)).await.unwrap_err().to_string();
+        assert!(e.starts_with("not installed: a provider failed to list"), "{e}");
+        // A dry run: nothing written either.
+        install(&Listed(pods.clone(), false), &cfg, None, true, true, Some(h)).await.unwrap();
+        assert!(!conf.exists() && kept_copies(&home).is_empty());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), mine);
+        // The install.
+        install(&Listed(pods.clone(), false), &cfg, None, true, false, Some(h)).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), want);
+        assert_eq!(mode(&conf), 0o600);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), format!("Include ~/.ssh/arena.conf\n{mine}"));
+        assert_eq!(mode(&config), 0o644, "its own mode kept");
+        let copies = kept_copies(&home);
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert!(copies[0].starts_with("config.arena-bak-"));
+        assert_eq!(std::fs::read_to_string(home.join(".ssh").join(&copies[0])).unwrap(), mine);
+        // Again: nothing changes, no second copy.
+        install(&Listed(pods.clone(), false), &cfg, None, true, false, Some(h)).await.unwrap();
+        assert_eq!(kept_copies(&home).len(), 1);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), format!("Include ~/.ssh/arena.conf\n{mine}"));
+        // A file at the path that isn't arena's: replaced, a copy kept.
+        std::fs::write(&conf, "Host handmade\n").unwrap();
+        install(&Listed(pods.clone(), false), &cfg, None, true, false, Some(h)).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), want);
+        let copy = kept_copies(&home).into_iter().find(|n| n.starts_with("arena.conf.arena-bak-")).unwrap();
+        assert_eq!(std::fs::read_to_string(home.join(".ssh").join(copy)).unwrap(), "Host handmade\n");
+        // Uninstall: exactly the line, a copy kept (never over the install's), the file stays.
+        uninstall(&cfg, None, true, false, Some(h)).unwrap();
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), mine);
+        assert!(conf.exists());
+        let configs: Vec<String> = kept_copies(&home).into_iter().filter(|n| n.starts_with("config.")).collect();
+        assert_eq!(configs.len(), 2, "{configs:?}");
+        assert_eq!(std::fs::read_to_string(home.join(".ssh").join(&configs[0])).unwrap(), mine, "the install's copy intact");
+        // And again: nothing to take out, no new copy.
+        uninstall(&cfg, None, true, false, Some(h)).unwrap();
+        assert_eq!(kept_copies(&home).len(), 3);
+        // An Include inside a Host block is the user's to move: left alone.
+        let in_block = "Host box\n    Include ~/.ssh/arena.conf\n";
+        let home2 = ssh_home_with("inblock", Some(in_block));
+        install(&Listed(pods.clone(), false), &cfg, None, true, false, home2.to_str()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(home2.join(".ssh/config")).unwrap(), in_block);
+        // No ~/.ssh/config yet: created, owner-only, with just the line; a PATH given is used.
+        let home3 = ssh_home_with("fresh", None);
+        install(&Listed(pods.clone(), false), &cfg, Some("~/.ssh/fleet.conf"), true, false, home3.to_str()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(home3.join(".ssh/config")).unwrap(), "Include ~/.ssh/fleet.conf\n");
+        assert_eq!(mode(&home3.join(".ssh/config")), 0o600);
+        assert_eq!(std::fs::read_to_string(home3.join(".ssh/fleet.conf")).unwrap(), want);
+        // No home to work in: refused.
+        assert!(install(&Listed(pods, false), &cfg, None, true, false, None).await.unwrap_err().to_string().contains("HOME"));
+        for d in [home, home2, home3] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// What `--install`/`--uninstall` must never edit, refused before anything is written: a
+    /// symlinked `~/.ssh/config` or PATH (a dotfiles link would be cut), PATH being
+    /// `~/.ssh/config` itself (directly or through a linked folder: it would Include itself), a
+    /// path ssh's `Include` can't take as one argument, a home owned by someone else (sudo
+    /// keeping HOME). An `Include` only inside a Host/Match block is the user's: `--uninstall`
+    /// leaves it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_config_install_refuses_what_it_must_not_edit() {
+        use super::{handle_ssh_config_install as install, handle_ssh_config_uninstall as uninstall};
+        let pods = vec![arena_core::Pod {
+            id: "id-a".into(),
+            name: "devtest-apple".into(),
+            provider: "runpod".into(),
+            status: "RUNNING".into(),
+            ssh_ip: Some("1.1.1.1".into()),
+            ssh_port: Some(22000),
+            ..Default::default()
+        }];
+        let cfg = arena_core::Config::parse("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\n");
+        let fleet = Listed(pods, false);
+        let refused = |r: anyhow::Result<()>, why: &str| {
+            let e = r.unwrap_err().to_string();
+            assert!(e.contains(why), "{why}: {e}");
+        };
+        // A symlinked ~/.ssh/config: refused, the link and its file as they were, nothing written.
+        let home = ssh_home_with("links", None);
+        let h = home.to_str().unwrap();
+        std::fs::write(home.join("dotfiles-config"), "Host box\n").unwrap();
+        std::os::unix::fs::symlink(home.join("dotfiles-config"), home.join(".ssh/config")).unwrap();
+        refused(install(&fleet, &cfg, None, true, false, Some(h)).await, "~/.ssh/config is a symlink");
+        refused(uninstall(&cfg, None, true, false, Some(h)), "~/.ssh/config is a symlink");
+        assert!(std::fs::symlink_metadata(home.join(".ssh/config")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(home.join("dotfiles-config")).unwrap(), "Host box\n");
+        assert!(!home.join(".ssh/arena.conf").exists() && kept_copies(&home).is_empty());
+        // A symlinked PATH: refused too.
+        std::fs::remove_file(home.join(".ssh/config")).unwrap();
+        std::os::unix::fs::symlink(home.join("dotfiles-config"), home.join(".ssh/arena.conf")).unwrap();
+        refused(install(&fleet, &cfg, None, true, false, Some(h)).await, "~/.ssh/arena.conf is a symlink");
+        assert!(!home.join(".ssh/config").exists());
+        // PATH = ~/.ssh/config, by name or through a linked folder.
+        std::fs::write(home.join(".ssh/config"), "Host box\n").unwrap();
+        refused(install(&fleet, &cfg, Some("~/.ssh/config"), true, false, Some(h)).await, "is ~/.ssh/config itself");
+        std::os::unix::fs::symlink(home.join(".ssh"), home.join("alias")).unwrap();
+        refused(install(&fleet, &cfg, Some("~/alias/config"), true, false, Some(h)).await, "is ~/.ssh/config itself");
+        // A path ssh would split or expand.
+        refused(install(&fleet, &cfg, Some("~/.ssh/my arena.conf"), true, false, Some(h)).await, "can't take as one plain path");
+        assert_eq!(std::fs::read_to_string(home.join(".ssh/config")).unwrap(), "Host box\n");
+        assert!(kept_copies(&home).is_empty());
+        // An Include only inside a block: --uninstall leaves it, and keeps no copy.
+        let block = "Host box\n    Include ~/.ssh/arena.conf\n";
+        std::fs::write(home.join(".ssh/config"), block).unwrap();
+        uninstall(&cfg, None, true, false, Some(h)).unwrap();
+        assert_eq!(std::fs::read_to_string(home.join(".ssh/config")).unwrap(), block);
+        assert!(kept_copies(&home).is_empty());
+        // Someone else's home (here `/`, root's): refused — unless this test runs as `/`'s owner.
+        if !arena_core::sshconfig::owned_by_me(&std::fs::metadata("/").unwrap()) {
+            refused(install(&fleet, &cfg, Some("/nonexistent-arena/x.conf"), true, false, Some("/")).await, "isn't owned by this user");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `config check`'s SSH_CONFIG_FILE row: off, a bad value (counted), not written yet, not
+    /// arena's, and arena's — included by ~/.ssh/config before any block, inside one, or not.
+    #[cfg(unix)]
+    #[test]
+    fn ssh_config_check_row_says_what_state_the_file_is_in() {
+        use super::ssh_config_check_row as row;
+        let home = ssh_home_with("check", None);
+        let h = home.to_str().unwrap();
+        let cfg = |v: &str| arena_core::Config::parse(&format!("SSH_CONFIG_FILE={v}\n"));
+        let (r, bad) = row(&arena_core::Config::parse(""), Some(h));
+        assert!(r.starts_with("  · SSH_CONFIG_FILE") && r.contains("(unset)") && bad.is_none(), "{r}");
+        let (r, bad) = row(&cfg("arena.conf"), Some(h));
+        assert!(r.starts_with("  ✗ SSH_CONFIG_FILE") && bad.unwrap().starts_with("SSH_CONFIG_FILE must be"), "{r}");
+        let c = cfg("~/.ssh/arena.conf");
+        let (r, _) = row(&c, Some(h));
+        assert!(r.starts_with("  ⚠ SSH_CONFIG_FILE") && r.contains("~/.ssh/arena.conf — not written yet"), "{r}");
+        std::fs::write(home.join(".ssh/arena.conf"), "Host mine\n").unwrap();
+        assert!(row(&c, Some(h)).0.contains("isn't arena's"));
+        std::fs::write(home.join(".ssh/arena.conf"), arena_core::sshconfig::managed_text("Host a\n")).unwrap();
+        assert!(row(&c, Some(h)).0.contains("(arena's), not included by ~/.ssh/config"));
+        std::fs::write(home.join(".ssh/config"), "Host box\n  Include ~/.ssh/arena.conf\n").unwrap();
+        assert!(row(&c, Some(h)).0.contains("inside a Host/Match block (line 2)"));
+        std::fs::write(home.join(".ssh/config"), format!("Include {h}/.ssh/arena.conf\nHost box\n")).unwrap();
+        let (r, bad) = row(&c, Some(h));
+        assert!(r.starts_with("  ✓ SSH_CONFIG_FILE") && r.ends_with("(arena's), included by ~/.ssh/config") && bad.is_none(), "{r}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The copies `--install`/`--uninstall` keep never land on an earlier one — the same second's
+    /// stamp gets `-2`, `-3` — and each holds the file as it was then, owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn kept_copies_never_overwrite_an_earlier_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = ssh_home_with("copies", Some("v1\n"));
+        let config = home.join(".ssh/config");
+        assert_eq!(super::keep_copy(&config, "20261022T120000Z", "~/.ssh/config").unwrap(), "~/.ssh/config.arena-bak-20261022T120000Z");
+        std::fs::write(&config, "v2\n").unwrap();
+        assert_eq!(super::keep_copy(&config, "20261022T120000Z", "~/.ssh/config").unwrap(), "~/.ssh/config.arena-bak-20261022T120000Z-2");
+        let read = |n: &str| std::fs::read_to_string(home.join(".ssh").join(n)).unwrap();
+        assert_eq!((read("config.arena-bak-20261022T120000Z"), read("config.arena-bak-20261022T120000Z-2")), ("v1\n".into(), "v2\n".into()));
+        let m = std::fs::metadata(home.join(".ssh/config.arena-bak-20261022T120000Z-2")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(m, 0o600);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ssh_config_flags_parse() {
+        use super::{Cli, Cmd};
+        use clap::Parser;
+        let parse = |args: &[&str]| Cli::try_parse_from(["arena", "ssh-config"].iter().chain(args).copied()).map(|c| c.cmd);
+        assert!(matches!(parse(&[]).unwrap(), Cmd::SshConfig { install: None, uninstall: None, proxy: false, .. }));
+        assert!(matches!(parse(&["--install"]).unwrap(), Cmd::SshConfig { install: Some(None), .. }));
+        assert!(matches!(parse(&["--install", "~/x.conf"]).unwrap(), Cmd::SshConfig { install: Some(Some(p)), .. } if p == "~/x.conf"));
+        assert!(matches!(parse(&["--uninstall", "--dry-run"]).unwrap(), Cmd::SshConfig { uninstall: Some(None), dry_run: true, .. }));
+        for bad in [
+            &["--install", "--uninstall"][..],
+            &["--install", "--proxy"],
+            &["--uninstall", "--out", "/x"],
+            // A dry run of what isn't a setup would be ignored, and `--out` write anyway.
+            &["--dry-run"],
+            &["--out", "/x", "--dry-run"],
+            &["--proxy", "--dry-run"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
     #[test]
     fn cron_flags_parse() {
         use super::{Cli, Cmd, CronCmd};
@@ -19949,7 +20989,13 @@ ASK_CODEX_MODEL=-x
         for bad in [&["install", "--pull", "--no-pull"][..], &["install", "--start-date", "2026-01-05", "--no-start-date"]] {
             assert!(Cli::try_parse_from(["arena", "cron"].iter().chain(bad).copied()).is_err(), "{bad:?}");
         }
-        assert!(matches!(cron(&["remove"]), CronCmd::Remove { backup: false, proxy: false, snapshot: false, archive: false, reap: false, dry_run: false }));
+        assert!(matches!(
+            cron(&["remove"]),
+            CronCmd::Remove { backup: false, proxy: false, snapshot: false, archive: false, reap: false, health: false, dry_run: false }
+        ));
+        assert!(matches!(cron(&["remove", "--health"]), CronCmd::Remove { health: true, backup: false, .. }));
+        assert!(matches!(cron(&["install", "--health", "07:30"]), CronCmd::Install { health: Some(t), backup: false, .. } if t == "07:30"));
+        assert!(matches!(cron(&["install"]), CronCmd::Install { health: None, .. }));
         assert!(matches!(cron(&["remove", "--snapshot", "--dry"]), CronCmd::Remove { snapshot: true, dry_run: true, .. }));
         assert_eq!(super::CronKind::selected(true, false, true, false), [super::CronKind::Backup, super::CronKind::Snapshot]);
         assert_eq!(super::CronKind::selected(false, false, false, true), [super::CronKind::ArchiveSnap, super::CronKind::ArchiveBig]);
@@ -20251,7 +21297,7 @@ ASK_CODEX_MODEL=-x
 mod proxy_deploy_tests {
     use super::{
         deploy_proxy, emit_proxy_plan, fleet_listing, handle_pods, prepare_proxy, read_current_proxy,
-        remote_install_script, replace_file, sync_proxy, write_proxy, PodCmd, ProxyChanged, ProxySync, Written,
+        remote_install_script, replace_file, ssh_config_after, sync_proxy, write_proxy, PodCmd, ProxyChanged, ProxySync, Written,
         INSTALL_FAILED, RELOAD_FAILED_NOT_RESTORED, RELOAD_FAILED_RESTORED,
     };
     use arena_core::proxy::{Listing, ProviderListing, ProxyConfig};
@@ -20829,6 +21875,144 @@ mod proxy_deploy_tests {
         let err = handle_pods(cmd, &HalfCreate(Default::default()), remote, &cfg(&path), true).await.unwrap_err();
         assert!(err.to_string().contains("creating arena8-autumn"), "{err}");
         assert!(read(&path).contains("proxy_pass 1.1.1.1:22000;"), "apple (made before the failure) is forwarded");
+    }
+
+    /// The managed file's text for these pods, as a sync writes it (no proxy: their endpoints).
+    fn ssh_want(pods: &[&Pod]) -> String {
+        let pods: Vec<Pod> = pods.iter().map(|p| (*p).clone()).collect();
+        arena_core::sshconfig::managed_text(&arena_core::sshconfig::render_manual("arena8", "root", "~/.ssh/k", &pods))
+    }
+
+    fn ssh_cfg(path: &Path, extra: &str) -> Config {
+        Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=arena8\nMACHINE_NAME_LIST=(apple autumn)\nSHARED_SSH_KEY_PATH=~/.ssh/k\nSSH_CONFIG_FILE={}\n{extra}",
+            path.display()
+        ))
+    }
+
+    /// `SSH_CONFIG_FILE` follows each pod change — every lifecycle command's sync (spec
+    /// ssh-config-include): without a proxy, each pod's own endpoint, rewritten when one moved or
+    /// a pod went, left alone (and nothing said) when nothing did; never from a listing a
+    /// provider failed; never over a file that isn't arena's — a warning line each, and the
+    /// sync itself never fails.
+    #[tokio::test]
+    async fn the_ssh_config_file_follows_each_pod_change() {
+        let path = tmp("arena-ssh.conf");
+        let cfg = ssh_cfg(&path, "");
+        let apple = pod("runpod", "arena8-apple", "1.1.1.1", 22000);
+        let autumn = pod("vast", "arena8-autumn", "2.2.2.2", 31000);
+        let fleet = Fleet::new(vec![("runpod", Ok(vec![apple.clone()])), ("vast", Ok(vec![autumn.clone()]))]);
+        let rewrote = |why: &str| Some(format!("[ssh-config] after {why}: rewrote {}", path.display()));
+        assert_eq!(ssh_config_after(&cfg, &fleet, "create").await, rewrote("create"));
+        assert_eq!(read(&path), ssh_want(&[&apple, &autumn]));
+        assert_eq!(ssh_config_after(&cfg, &fleet, "up").await, None, "nothing moved: nothing written or said");
+        // A restart moved apple's endpoint.
+        let moved = pod("runpod", "arena8-apple", "1.1.1.9", 22100);
+        fleet.set(vec![("runpod", Ok(vec![moved.clone()])), ("vast", Ok(vec![autumn.clone()]))]);
+        assert_eq!(ssh_config_after(&cfg, &fleet, "restart").await, rewrote("restart"));
+        assert_eq!(read(&path), ssh_want(&[&moved, &autumn]));
+        // vast fails to list: autumn's block would go — not rewritten, and said.
+        fleet.set(vec![("runpod", Ok(vec![moved.clone()])), ("vast", Err("vast list HTTP 429"))]);
+        assert_eq!(
+            ssh_config_after(&cfg, &fleet, "terminate").await.as_deref(),
+            Some("[ssh-config] after terminate: not rewritten — vast failed to list (the next change rewrites it)")
+        );
+        assert_eq!(read(&path), ssh_want(&[&moved, &autumn]));
+        // Through the lifecycle hook itself (no proxy here, so its own part skips).
+        fleet.set(vec![("runpod", Ok(vec![moved.clone()])), ("vast", Ok(vec![]))]);
+        assert!(matches!(sync_proxy(&cfg, &fleet, "terminate").await, ProxySync::Skipped(_)));
+        assert_eq!(read(&path), ssh_want(&[&moved]));
+        // Someone's own file: a warning, the file exactly as it was.
+        std::fs::write(&path, "Host mine\n").unwrap();
+        let line = ssh_config_after(&cfg, &fleet, "rename").await.unwrap();
+        assert!(line.starts_with("warning: [ssh-config] after rename: not rewritten — ") && line.contains("isn't arena's"), "{line}");
+        assert_eq!(read(&path), "Host mine\n");
+    }
+
+    /// A fleet whose listing must never be read: a test that passes proves nothing listed it.
+    struct NeverListed;
+
+    #[async_trait]
+    impl Provider for NeverListed {
+        fn name(&self) -> &'static str {
+            "runpod"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            panic!("this sync must not list the fleet")
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// With a proxy the file holds the stable ports, which need no listing; with the key unset,
+    /// nothing happens at all — no listing either.
+    #[tokio::test]
+    async fn the_ssh_config_file_takes_the_proxy_ports_without_listing() {
+        let path = tmp("arena-ssh-proxy.conf");
+        let cfg = ssh_cfg(&path, "SSH_PROXY_HOST=px.example\nSSH_PROXY_STARTING_PORT=9500\n");
+        assert!(ssh_config_after(&cfg, &NeverListed, "create").await.is_some());
+        let text = read(&path);
+        assert!(text.contains("HostName px.example\n") && text.contains("Host arena8-autumn\n    Port 9501\n"), "{text}");
+        assert_eq!(ssh_config_after(&cfg, &NeverListed, "up").await, None);
+        let off = Config::parse("MACHINE_NAME_PREFIX=arena8\nMACHINE_NAME_LIST=(apple)\n");
+        assert_eq!(ssh_config_after(&off, &NeverListed, "up").await, None, "unset: never lists");
+    }
+
+    /// One real lifecycle command: `pods terminate` rewrites the file from the listing AFTER the
+    /// terminate — the pod's block is gone — never from the one before.
+    #[tokio::test]
+    async fn a_terminate_rewrites_the_ssh_config_file_once_the_pod_is_gone() {
+        struct Shrinking(std::sync::Mutex<Vec<Pod>>);
+        #[async_trait]
+        impl Provider for Shrinking {
+            fn name(&self) -> &'static str {
+                "runpod"
+            }
+            fn describe(&self, _spec: &PodSpec) -> String {
+                String::new()
+            }
+            async fn list_pods(&self) -> Result<Vec<Pod>> {
+                Ok(self.0.lock().unwrap().clone())
+            }
+            async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+                unimplemented!("not exercised")
+            }
+            async fn stop_pod(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn restart_pod(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn terminate_pod(&self, id: &str) -> Result<()> {
+                self.0.lock().unwrap().retain(|p| p.id != id);
+                Ok(())
+            }
+        }
+        use clap::Parser;
+        let path = tmp("arena-ssh-term.conf");
+        let cfg = ssh_cfg(&path, "");
+        let apple = pod("runpod", "arena8-apple", "1.1.1.1", 22000);
+        let autumn = pod("runpod", "arena8-autumn", "2.2.2.2", 22001);
+        let fleet = Shrinking(std::sync::Mutex::new(vec![apple.clone(), autumn.clone()]));
+        ssh_config_after(&cfg, &fleet, "create").await;
+        assert_eq!(read(&path), ssh_want(&[&apple, &autumn]));
+        let crate::Cmd::Pods(cmd) = crate::Cli::try_parse_from(["arena", "pods", "terminate", "autumn"]).unwrap().cmd else { unreachable!() };
+        let remote = std::sync::Arc::new(arena_core::remote::FakeRemote::new());
+        handle_pods(cmd, &fleet, remote, &cfg, true).await.unwrap();
+        assert_eq!(read(&path), ssh_want(&[&apple]));
     }
 }
 
@@ -22955,7 +24139,7 @@ mod remote_tests {
         let fake = Arc::new(FakeRemote::new());
         fake.script(&host(22003), [FakeReply::hang()]);
         let start = Instant::now();
-        let plain = PodCmd::Test { deep: false, sel: Select::default(), json: false, verbose: false };
+        let plain = PodCmd::Test { deep: false, sel: Select::default(), json: false, verbose: false, cohort: crate::CohortScope::default() };
         let err = handle_pods(plain, &fleet(), fake.clone(), &cfg(), true).await.unwrap_err();
         assert_eq!(err.to_string(), "1 pod(s) failed");
         assert_eq!(start.elapsed(), TEST_TIMEOUT);
@@ -25186,7 +26370,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
     #[tokio::test(start_paused = true)]
     async fn pods_test_deep_exit_status_follows_failures_not_warnings() {
         use arena_core::health::DEEP_CHECK_TIMEOUT;
-        let deep = |json: bool| PodCmd::Test { deep: true, sel: Select::default(), json, verbose: false };
+        let deep = |json: bool| PodCmd::Test { deep: true, sel: Select::default(), json, verbose: false, cohort: crate::CohortScope::default() };
         // Any FAIL fails the command (table or JSON), at the hung pod's budget.
         for json in [false, true] {
             let fake = Arc::new(FakeRemote::new());
@@ -25406,10 +26590,10 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.cmd);
         assert!(matches!(
             parse(&["arena", "pods", "test"]).unwrap(),
-            Cmd::Pods(PodCmd::Test { deep: false, ref sel, json: false, verbose: false }) if sel.targets.is_empty()
+            Cmd::Pods(PodCmd::Test { deep: false, ref sel, json: false, verbose: false, .. }) if sel.targets.is_empty()
         ));
         match parse(&["arena", "pods", "test", "--deep", "apple", "bloom", "--json", "-v"]).unwrap() {
-            Cmd::Pods(PodCmd::Test { deep, sel, json, verbose }) => {
+            Cmd::Pods(PodCmd::Test { deep, sel, json, verbose, .. }) => {
                 assert!(deep && json && verbose);
                 assert_eq!(sel.targets, ["apple", "bloom"]);
             }
@@ -25518,7 +26702,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         }
 
         /// The human (2026-10-19): fleet-wide = cohort pods only, with a way to take the others
-        /// too. `--include-non-cohort` parses on all four commands, and with it the selection
+        /// too. `--include-non-cohort` parses on all four commands (and `test`), and with it the selection
         /// comes back whole and nothing is said; without it, the cohort's and the one line.
         #[test]
         fn include_non_cohort_takes_every_pod_and_says_nothing() {
@@ -25529,11 +26713,12 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
                     Cmd::Pods(PodCmd::Backup { cohort, .. })
                     | Cmd::Pods(PodCmd::Pull { cohort, .. })
                     | Cmd::Pods(PodCmd::InitBranches { cohort, .. })
-                    | Cmd::Pods(PodCmd::SetBranch { cohort, .. }) => cohort,
-                    _ => panic!("{argv:?}: not a backup command"),
+                    | Cmd::Pods(PodCmd::SetBranch { cohort, .. })
+                    | Cmd::Pods(PodCmd::Test { cohort, .. }) => cohort,
+                    _ => panic!("{argv:?}: not a cohort-scoped command"),
                 }
             };
-            for argv in [&["backup"][..], &["pull"], &["init-branches"], &["set-branch", "main", "--all"]] {
+            for argv in [&["backup"][..], &["pull"], &["init-branches"], &["set-branch", "main", "--all"], &["test"], &["test", "--deep"]] {
                 assert!(!scope(argv).include_non_cohort, "{argv:?}: off by default");
                 let with = [argv, &["--include-non-cohort"]].concat();
                 assert!(scope(&with).include_non_cohort, "{with:?}");
@@ -25549,6 +26734,34 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             // (In fleet order here: `select` orders a real run's by list slot, as LEFT_OUT has it.)
             let out = ["devtest-zebra", "staff-gpu", "quiet_blue_fox", "devtest2-apple"].map(String::from);
             assert_eq!(take_said(), [non_cohort_line("devtest", &out).unwrap()]);
+        }
+
+        /// The health check (spec health-cron) reads only, but runs CUDA, NCCL and a download on
+        /// every GPU it reaches, and its daily cron line names no pod: fleet-wide (bare or `--all`)
+        /// it reaches this cohort's pods only and says who it left out — never a staff box or
+        /// another prefix's pod; the torch check (`pods test`) the same. `--include-non-cohort`
+        /// takes every pod; a named staff box is checked, as named.
+        #[tokio::test(start_paused = true)]
+        async fn pods_test_deep_reaches_only_this_cohorts_pods_unless_told() {
+            let cfg = account_cfg("");
+            let run = |argv: &'static [&'static str]| {
+                let cfg = cfg.clone();
+                async move {
+                    let fake = Arc::new(FakeRemote::new());
+                    for port in 22001..=22007 {
+                        fake.script(&host(port), [FakeReply::stdout(DEEP_HEALTHY)]);
+                    }
+                    let _ = take_said();
+                    handle_pods(pods(argv), &account(), fake.clone(), &cfg, true).await.unwrap();
+                    let reached: Vec<u16> = (22001..=22007).filter(|port| !fake.calls_to(&host(*port)).is_empty()).collect();
+                    (reached, take_said())
+                }
+            };
+            for argv in [&["test", "--deep"][..], &["test", "--deep", "--all"], &["test"]] {
+                assert_eq!(run(argv).await, (COHORT_PORTS.to_vec(), vec![LEFT_OUT.to_string()]), "{argv:?}");
+            }
+            assert_eq!(run(&["test", "--deep", "--include-non-cohort"]).await, ((22001..=22007).collect(), vec![]));
+            assert_eq!(run(&["test", "--deep", "@staff-gpu"]).await, (vec![22005], vec![]));
         }
 
         #[test]
@@ -27324,6 +28537,28 @@ mod lifecycle_tests {
         migrate_finish_on(&FakeRemote::new(), &f, &cfg, &f, "devtest-bravo", &listed, FinishOpts { dry_run: false, yes: true, ..Default::default() }).await.unwrap();
         assert_eq!(f.calls(), ["terminate r-bravo"]);
         assert!(proxy_file(&dir.0).contains("10.0.0.3"));
+    }
+
+    /// Without a proxy, `migrate finish` syncs nothing before its terminate — so `SSH_CONFIG_FILE`
+    /// is rewritten after it, from the listing without `-old`: its block goes.
+    #[tokio::test]
+    async fn finish_without_a_proxy_drops_old_from_the_ssh_config_file() {
+        let dir = tmpdir("finish-sshconfig");
+        let path = dir.0.join("arena.conf");
+        let cfg = Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(alpha bravo)\nSSH_CONFIG_FILE={}\n",
+            path.display()
+        ));
+        let f = Fleet::new(vec![
+            pod("r-bravo-new", "devtest-bravo", "runpod", Some(("10.0.0.3", 22009))),
+            pod("r-bravo", "devtest-bravo-old", "runpod", Some(("10.0.0.1", 22002))),
+        ]);
+        let listed = f.pods.lock().unwrap().clone();
+        std::fs::write(&path, arena_core::sshconfig::managed_text(&arena_core::sshconfig::render_manual("devtest", "root", "~/.ssh/shared_infra_key", &listed))).unwrap();
+        migrate_finish_on(&FakeRemote::new(), &f, &cfg, &f, "devtest-bravo", &listed, FinishOpts { yes: true, ..Default::default() }).await.unwrap();
+        assert_eq!(f.calls(), ["terminate r-bravo"]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("Host devtest-bravo\n    HostName 10.0.0.3\n") && !text.contains("devtest-bravo-old"), "{text}");
     }
 
     /// The cutover's live findings, on a STOPPED original: #16 — the final sync is refused

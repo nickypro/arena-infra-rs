@@ -60,8 +60,8 @@ they are.
 
 ```bash
 arena pods up -n 2 --no-setup              # create 2 pods; wait until each answers SSH
-arena ssh-config --out ~/.ssh/arena.conf   # a Host per pod (printed too)
-# once: make "Include ~/.ssh/arena.conf" the first line of ~/.ssh/config
+arena ssh-config --install                 # once: ~/.ssh/arena.conf, Included by ~/.ssh/config
+arena config set SSH_CONFIG_FILE '~/.ssh/arena.conf'   # once: keep it current
 ssh arena-apple                            # or VS Code: Remote-SSH: Connect to Host…
 arena pods list                            # GPU, $/h, endpoint; the fleet's cost and balance
 arena pods terminate --all                 # EVERY pod on the account, prefix or not; asks first
@@ -69,8 +69,9 @@ arena pods terminate --all                 # EVERY pod on the account, prefix or
 
 `--no-setup` skips provisioning, the one step that needs a cohort repo and its deploy key
 (without the flag, `up` stops before creating anything while they're unset): each pod is the
-image as it boots. A pod's endpoint moves when it restarts, so run `ssh-config --out` again
-after any change.
+image as it boots. A pod's endpoint moves when it restarts: with `SSH_CONFIG_FILE` set, every
+pod change, `pods list` and the dashboard rewrite `~/.ssh/arena.conf` when one moved, so
+`ssh arena-apple` keeps working. `ssh-config --install` shows what it changes and asks first.
 
 ### Running a cohort, or anything for an org?
 
@@ -82,6 +83,7 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 | **Setup** (drop `--no-setup`) | Each pod gets the deploy key, the cohort repo, tokens and the VS Code warm-up | `ARENA_REPO_OWNER`, `ARENA_REPO_NAME`, `GIT_SSH_KEY_LOCAL` |
 | **Day branches** | Each pod's work on its own `autocommit-<prefix>-w1d2-<machine>` branch | `ARENA_START_DATE` |
 | **Backups on cron** | A git push and an rsync copy of every pod, every 15 minutes | `LOCAL_BACKUP_DIR` |
+| **Morning health check on cron** | `pods test --deep` on every cohort pod each morning (`arena cron install --health 07:20`): a pass / warn / fail row per pod, and the dashboard's HEALTH column | |
 
 <details>
 <summary>Every organiser command at a glance</summary>
@@ -102,6 +104,7 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 | `arena proxy apply` | Write the proxy forwards and reload nginx |
 | `arena ssh-config --proxy` | Print the participants' `~/.ssh/config` |
 | `arena cron install --pull --proxy` | Backups every 15 min (git + rsync), proxy re-sync every 5 |
+| `arena cron install --health 07:20` | A deep check of every cohort pod each morning, in this box's time zone |
 | `arena pods restore apple` | Push a backup back onto one pod (never deletes) |
 | `arena pods replace apple` | Move a pod to a fresh host, keeping its name and files |
 | `arena pods run -t apple 'nvidia-smi'` | Run a command on pods (all of them without `-t`) |
@@ -206,7 +209,8 @@ arena cron show
 
 Add `--archive` for the [backup archive](docs/BACKUPS.md#backup-archive-arena-archive) (a second
 copy participants can read; `arena archive up` first), `--snapshot DIR` for the
-[public fleet page](docs/REFERENCE.md#publishing-the-fleet-page).
+[public fleet page](docs/REFERENCE.md#publishing-the-fleet-page), `--health 07:20` for a
+[morning deep check](docs/BACKUPS.md#cron-the-lines-that-run-it-all) of every cohort pod.
 
 ## A cohort day
 
@@ -219,7 +223,8 @@ flowchart LR
 ```
 
 1. **Morning check.** `arena pods list` (cost, balance, maintenance windows), then
-   `arena pods test --deep`: a `FAIL` on the host means `arena pods replace <pod>`.
+   `arena pods test --deep` (or read what `cron install --health 07:20` found in
+   `~/.local/state/arena-cron/health.log`): a `FAIL` on the host means `arena pods replace <pod>`.
 2. **The day's branches.** `arena pods set-branch main --all --init-branches` backs each pod up,
    switches it to `main` and creates today's `autocommit-<prefix>-w1d2-<machine>` branch. Until
    then a pod on `main` isn't backed up, and the run says so.

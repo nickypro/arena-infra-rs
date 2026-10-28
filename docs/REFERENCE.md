@@ -955,6 +955,45 @@ not a hang.
 endpoints by default, or stable proxy ports (`--proxy`) anchored to each machine's
 `MACHINE_NAME_LIST` index. Read-only.
 
+#### Keeping your own `~/.ssh/config` current (`SSH_CONFIG_FILE`)
+
+For one person reaching their own pods: `ssh-config --install [PATH]` (once) and
+`SSH_CONFIG_FILE=~/.ssh/arena.conf` in the config. On a box that runs arena's cron lines for a
+cohort (backups, the reaper), leave the key unset: each tick would rewrite that user's file.
+
+- **`--install`** writes PATH (default `SSH_CONFIG_FILE`, else `~/.ssh/arena.conf`; `~/` is your
+  home) and makes `Include PATH` the **first line** of `~/.ssh/config` — ssh applies an `Include`
+  only where it stands, so it must come before any `Host`/`Match` block to count for every host.
+  It says what it changes and asks (`--yes` to skip, `--dry-run` to preview), keeps a copy of the
+  old `~/.ssh/config` beside it (`config.arena-bak-<UTC time>`, never over an earlier copy), keeps
+  that file's mode (a new one is 0600), and prints the `config set` line when `SSH_CONFIG_FILE`
+  isn't set yet. A second run changes nothing. An `Include` already inside a `Host`/`Match` block
+  is left for you to move. A file at PATH that isn't arena's is replaced only after asking, with a
+  copy kept. It needs a complete listing (a provider that failed to list would drop its pods).
+- **What it won't edit** (checked before writing anything, and again after asking): a
+  `~/.ssh/config` or PATH that is a symlink (edit the file it points to yourself) or isn't a
+  regular file; one owned by another user, or in a `~/.ssh` that is (run it as the user whose
+  `~/.ssh` it is — not under `sudo`); PATH being `~/.ssh/config` itself; a PATH with whitespace,
+  quotes or any of `#$%*?[]\` (ssh's `Include` would read it as something else); a file edited
+  while it asked.
+- **`--uninstall [PATH]`** takes exactly that `Include` line out — the global one(s); one inside a
+  `Host`/`Match` block is yours and stays — with a copy kept; PATH stays.
+- **With `SSH_CONFIG_FILE` set**, PATH is kept current: after every pod change (create, up, start,
+  restart, reimage, replace, migrate, rename, terminate and the reaper — beside their proxy sync,
+  one `[ssh-config] after …: rewrote …` line; `--skip-proxy` skips it too), and on `pods list` and
+  each dashboard refresh when an endpoint moved. `up` writes it once its pods are up; `create`,
+  which doesn't wait, mostly can't yet — the next `pods list` or refresh adds their endpoints. The layout is the proxy's stable ports when `SSH_PROXY_HOST` is set (no
+  listing needed), else each pod's own endpoint (a pod without one is left out, as in
+  `ssh-config`). It is written atomically (a temp file renamed over it), owner-only, and only when
+  the text changed.
+- **Never someone else's file:** arena's file starts with `# managed by arena (`arena
+  ssh-config`) — …`; one without that line (an older `ssh-config --out`, a hand-made file), a
+  symlink or a folder is never rewritten. A listing that failed somewhere doesn't rewrite it
+  either. Each of those, and a failed write, is one warning line — never a failed command.
+- The backup archive's `Host` block isn't in it: that one needs its pinned host-key file, which
+  `ssh-config --out` writes beside the config. `config check` shows the key's state: off, not
+  written yet, not arena's, or arena's and whether `~/.ssh/config` includes it.
+
 ### Publishing the fleet page
 
 `web/fleet.html` is a self-contained status page (no external scripts or fonts, phone- and
@@ -1139,7 +1178,8 @@ ones included — the listing walks every page).
 organization, every workspace's. Without `OPENROUTER_WORKSPACE`, keys are listed and created in the
 Default workspace, as before. Set `OPENROUTER_WORKSPACE` to a workspace's id or slug and every call is
 scoped to it: the listing asks for that workspace and drops keys that say otherwise, new keys go
-there (a key the answer says landed elsewhere is deleted again and the command fails), and a revoke,
+there (a key that landed elsewhere fails the command, which names its hash to delete by hand —
+nothing is deleted automatically), and a revoke,
 rotate or rename first reads the key and refuses one from another workspace. The workspace is looked
 up once (`GET /workspaces/<id or slug>`) and must come back as itself; one that can't be resolved, or
 a listing whose keys don't say their workspace, fails the command — it never falls back to the
@@ -1173,7 +1213,7 @@ quote a command that takes one, `run 'tmux kill-session -t lab'`; on a timeout t
 killed, and the remote command dies at its next write to the closed connection; a pod whose command
 fails shows what it printed on stdout too, then `exit N: <stderr>` — never `Some(N)`; on a pod with
 no zsh yet — a bare VM before setup — it says so and to run `arena pods setup`) / the read-only
-torch-version health check (90s per pod). Every dry run's `ssh`/`scp`/`rsync` line is shell-quoted,
+torch-version health check (90s per pod; with no targets this cohort's pods, as `--deep`). Every dry run's `ssh`/`scp`/`rsync` line is shell-quoted,
 so it pastes as exactly what would run (globs like `'**/.git/**'` don't expand).
 
 ### Background jobs: `run --background`, `jobs`, `logs`
@@ -1279,8 +1319,15 @@ replacement on a failed machine by the same rule).
 
 `--json` prints per-pod `{id, name, provider, status, checks, facts}` (no IPs) — `[]` when no pod
 could be checked; summary/notes go to stderr. Exits non-zero if any pod FAILs; warnings don't.
-Targets scope the run (a named pod with no SSH endpoint is a FAIL; a typo is an error). Two pods
-sharing a name each get their own row (with a warning naming their ids).
+Targets scope the run (a named pod with no SSH endpoint is a FAIL; a typo is an error). With no
+targets (or `--all`) it checks **this cohort's pods**: `<prefix>-…`, never an `@` staff entry or
+another prefix's pod — a staff box may be running someone's job — with one `⊘ skipped N non-cohort
+pods …` line for the rest; `--include-non-cohort` checks every pod, and a named staff box is
+checked. Two pods sharing a name each get their own row (with a warning naming their ids).
+
+Every morning on cron: `arena cron install --health 07:20` (this box's time zone; log
+`~/.local/state/arena-cron/health.log`; see
+[`cron`](BACKUPS.md#cron-the-lines-that-run-it-all)).
 
 #### The health cache
 
