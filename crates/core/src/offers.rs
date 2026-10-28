@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::fleet::fmt_money;
 use crate::gpu::{self, GpuRow};
+use crate::near::{Near, Region};
 use crate::placement::{Dropped, OptionPlan, Order, PlacementOption, PriceSource};
 use crate::provider::hetzner::ServerType;
 use crate::provider::runpod::GpuType;
@@ -87,6 +88,9 @@ pub struct ProviderOffers {
     pub notes: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_type: Option<ServerType>,
+    /// Near the proxy first ([`OptionPlan::near`]); `None`: off, or not this provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub near: Option<Near>,
 }
 
 impl ProviderOffers {
@@ -108,6 +112,7 @@ impl ProviderOffers {
             dropped: plan.dropped,
             notes: plan.notes,
             server_type,
+            near: plan.near,
         }
     }
 
@@ -181,9 +186,12 @@ fn tagged(provider: &str, note: &str) -> String {
 /// options in the order `create`/`up` would try them (`#`); then what `--max-price` dropped,
 /// the notes, the providers left out, and how to read it. Prices carry their currency: a
 /// Hetzner VM's `€` is Hetzner's own, never converted (as `pods list` shows it), and its source
-/// is `list` — read for the table, not a price placement has. Pure.
+/// is `list` — read for the table, not a price placement has. With near the proxy on for any
+/// provider, a WHERE column says which options are tried only in the region (`Europe`) and
+/// which anywhere (`any`; `-` for a provider near doesn't apply to). Pure.
 pub fn render(offers: &Offers) -> String {
     use Align::{Left, Right};
+    let near = offers.providers.iter().any(|p| p.near.is_some());
     let mut rows: Vec<Vec<String>> = Vec::new();
     for p in &offers.providers {
         if p.options.is_empty() {
@@ -205,20 +213,23 @@ pub fn render(offers: &Offers) -> String {
                 (None, _, Some(ServerType { eur_per_hour: Some(eur), .. })) => (format!("{}/h", fmt_money("€", *eur)), "list"),
                 (None, _, _) => ("-".into(), "-"),
             };
-            rows.push(vec![
-                p.provider.clone(),
-                (i + 1).to_string(),
-                p.label(o),
-                o.cloud.clone().unwrap_or_else(|| "-".into()),
-                size,
-                price,
-                source.into(),
-                o.stock.clone().unwrap_or_else(|| "-".into()),
-            ]);
+            let mut row = vec![p.provider.clone(), (i + 1).to_string(), p.label(o), o.cloud.clone().unwrap_or_else(|| "-".into())];
+            if near {
+                let at = if p.near.is_some() { o.near.map_or("any", Region::label) } else { "-" };
+                row.push(at.to_string());
+            }
+            row.extend([size, price, source.into(), o.stock.clone().unwrap_or_else(|| "-".into())]);
+            rows.push(row);
         }
     }
     let mut out = if rows.is_empty() {
         "(no provider to show)\n".to_string()
+    } else if near {
+        table::render(
+            &["PROVIDER", "#", "OPTION", "CLOUD", "WHERE", "SIZE", "PER POD", "SOURCE", "STOCK"],
+            &[Left, Right, Left, Left, Left, Left, Right, Left, Left],
+            &rows,
+        )
     } else {
         table::render(
             &["PROVIDER", "#", "OPTION", "CLOUD", "SIZE", "PER POD", "SOURCE", "STOCK"],
@@ -504,6 +515,47 @@ mod tests {
              options in, one create at a time per name; a pool with no capacity is skipped for the rest of that round. \
              STOCK is a hint only — creating is the real test. `offers --all` lists every type.\n"
         );
+    }
+
+    /// Near the proxy: a WHERE column — `Europe` for an option tried only there, `any` for the
+    /// rest, `-` on a provider near doesn't reach (Hetzner picks its nearest itself) — and
+    /// `--json` carries the plan's `near` and each near option's. Off: the table as before.
+    #[test]
+    fn near_options_say_where() {
+        let eu = Near { region: Region::Europe, max_extra_pct: 25.0 };
+        let base = PodSpec { gpu_type: "NVIDIA RTX A4000".into(), cloud_type: "SECURE".into(), ..PodSpec::from_config(&crate::config::Config::parse("")) };
+        let req = Request::from_flags(Some("A4000"), Some("secure"), &base, None, Order::Cheapest).unwrap().with_near(Some(eu), "runpod", &base);
+        let runpod = plan_options(&req, "runpod", &PriceBook::runpod(Vec::new()));
+        let hetzner = plan("hetzner", "A4000", "community", 1, None, &PriceBook::unpriced());
+        let offers = Offers {
+            providers: vec![ProviderOffers::new(runpod.clone(), &[], None), ProviderOffers::new(hetzner.clone(), &[], Some(cx23()))],
+            ..Offers::default()
+        };
+        let out = render(&offers);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[..4],
+            [
+                "PROVIDER  #  OPTION       CLOUD   WHERE   SIZE               PER POD  SOURCE    STOCK",
+                "runpod    1  1×RTX A4000  SECURE  Europe  16 GB VRAM        ~$0.32/h  estimate  -",
+                "runpod    2  1×RTX A4000  SECURE  any     16 GB VRAM        ~$0.32/h  estimate  -",
+                "hetzner   1  cx23         -       -       2 vCPU, 4 GB RAM  €0.010/h  list      -",
+            ],
+            "{out}"
+        );
+        assert!(out.contains("note: runpod: near the proxy (NEAR=europe): Europe first"), "{out}");
+        let v = serde_json::to_value(&offers).unwrap();
+        assert_eq!(v["providers"][0]["near"], serde_json::json!({"region": "europe", "max_extra_pct": 25.0}));
+        assert_eq!((v["providers"][0]["options"][0]["near"].as_str(), v["providers"][0]["options"][1].get("near")), (Some("europe"), None));
+        assert!(v["providers"][1].get("near").is_none());
+        // Every field of a near plan is carried too.
+        let plan_json = serde_json::to_value(&runpod).unwrap();
+        for (k, val) in plan_json.as_object().unwrap().iter().filter(|(k, _)| *k != "options") {
+            assert_eq!(&v["providers"][0][k], val, "{k}");
+        }
+        // Off: no column.
+        let off = render(&Offers { providers: vec![ProviderOffers::new(hetzner, &[], Some(cx23()))], ..Offers::default() });
+        assert!(!off.contains("WHERE"), "{off}");
     }
 
     /// A provider whose every option the cap dropped still has a row, saying so; Hetzner's VM
