@@ -14,6 +14,19 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-28 · Dashboard: rows at once, `D` checks all, graphs before PROGRESS
+- The pods show as soon as they're listed; GPU stats, details and balances fill in after. The
+  screen used to say `loading…` until every pod had been read over SSH.
+- **`D`** deep-checks every running pod whose GPUs it has read and found no one using. A second
+  `D` confirms, and checks only the pods the first one counted. Busy pods (any GPU with a
+  process, over 5% utilization or over 1 GiB of memory) are named and left out; so are pods not
+  read yet, pods whose GPUs couldn't be read, and CPU-only boxes.
+- A question to `?` shows a spinner and its seconds in the footer until it's answered (after
+  a notice, if one is up).
+- The graphs come before PROGRESS, which only shows when `PROGRESS_CMD` is set. A CPU-only box
+  (Hetzner) graphs its CPU and RAM, in magenta and blue.
+- In HEALTH, a pass older than 26 hours is grey (a daily cron's drift kept).
+
 ## 2026-10-28 · OpenRouter spend in the dashboard, and keys kept to one workspace
 - The dashboard shows each pod's OpenRouter key as `AI$` (spent/cap: yellow from 80%, red at the
   cap), the key's today/week/month in the detail pane, and the account's credit and the cohort's
