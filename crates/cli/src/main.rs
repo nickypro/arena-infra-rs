@@ -9749,9 +9749,9 @@ impl<'a> KeyBook<'a> {
     }
 
     /// Replace the CSV atomically, through the symlink (the per-cohort file it points at is
-    /// rewritten, the link kept), keeping its mode — it holds secrets.
+    /// rewritten, the link kept), owner-only: it holds secrets ([`write_secret_file`]).
     fn write_csv(&self, text: &str) -> std::io::Result<()> {
-        replace_file(&self.csv, text)
+        write_secret_file(&self.csv, text)
     }
 }
 
@@ -11038,14 +11038,8 @@ fn write_csv_move(book: &KeyBook<'_>, prefix: &str, dst: Option<&std::path::Path
     };
     // Resolved before the link moves: afterwards the link leads to the new file.
     let old_real = std::fs::canonicalize(&book.csv).unwrap_or_else(|_| book.csv.clone());
-    let created = !dst.exists();
-    if let Err(e) = replace_file(dst, text) {
+    if let Err(e) = write_secret_file(dst, text) {
         return Some(format!("couldn't write {} ({e}) — key rows NOT moved (still under the old names in {}): {moved}", dst.display(), old_real.display()));
-    }
-    if created {
-        if let Ok(meta) = std::fs::metadata(&old_real) {
-            let _ = std::fs::set_permissions(dst, meta.permissions());
-        }
     }
     let dir = book.csv.parent().unwrap_or(std::path::Path::new("."));
     if let Err(e) = ensure_cohort_keys_file(dir, prefix) {
@@ -11059,7 +11053,7 @@ fn write_csv_move(book: &KeyBook<'_>, prefix: &str, dst: Option<&std::path::Path
     let carried = if plan.carried.is_empty() { String::new() } else { format!(" (carried along: {})", plan.carried.join(", ")) };
     println!("[keys] moved into {} (this cohort's keys file): {moved}{carried}", dst.display());
     if let Some(src) = &plan.src {
-        if let Err(e) = replace_file(&old_real, src) {
+        if let Err(e) = write_secret_file(&old_real, src) {
             return Some(format!(
                 "moved the key rows into {}, but couldn't take them out of {} ({e}) — harmless (copy-keys reads the new file), tidy it by hand",
                 dst.display(),
@@ -15675,15 +15669,38 @@ fn write_openrouter_key(dir: &std::path::Path, host: &str, secret: &str, prefix:
     Ok(())
 }
 
-/// Write a file of secrets, readable by its owner only: created 0600, and an older file
-/// (`std::fs::write` left new ones at 0666 minus the umask: 0664, every key readable to
-/// anyone who can reach the folder) tightened to 0600 on its next write.
+/// Write a file of secrets (the OpenRouter keys CSV) atomically, readable by its owner
+/// only. The text goes into a sibling temp file created 0600, is synced, then renamed over
+/// the target: a failure part-way leaves the old file whole (OpenRouter shows a key's secret
+/// once), and the target ends up 0600 whatever it was — an older file, created 0664 by a
+/// plain `fs::write`, is tightened. A symlink is followed (its target replaced, the link
+/// kept, even before the target exists); the old file's owner is kept where allowed.
 fn write_secret_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    f.write_all(text.as_bytes())
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| match std::fs::read_link(path) {
+        Ok(t) => path.parent().unwrap_or(std::path::Path::new(".")).join(t),
+        Err(_) => path.to_path_buf(),
+    });
+    let (Some(dir), Some(name)) = (real.parent(), real.file_name()) else {
+        return Err(std::io::Error::other(format!("{}: no folder to write in", real.display())));
+    };
+    let dir = if dir.as_os_str().is_empty() { std::path::Path::new(".") } else { dir };
+    let tmp = dir.join(format!(".{}.arena-tmp-{}", name.to_string_lossy(), std::process::id()));
+    let _ = std::fs::remove_file(&tmp); // this process's own leftover, if any
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        if let Ok(meta) = std::fs::metadata(&real) {
+            let _ = std::os::unix::fs::fchown(&f, Some(meta.uid()), Some(meta.gid()));
+        }
+        std::fs::rename(&tmp, &real)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// The first lines of a new cohort keys file.
@@ -18234,6 +18251,7 @@ ASK_CODEX_MODEL=-x
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         super::write_openrouter_key(&dir, "devtest-apple", "sk-or-v1-A", "devtest").unwrap();
         let file = dir.join("devtest_openrouter_keys.csv");
+        let link = dir.join("openrouter_api_keys.csv");
         assert_eq!(mode(&file), 0o600);
         // An older file at 0664 is tightened on its next write.
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o664)).unwrap();
@@ -18241,6 +18259,16 @@ ASK_CODEX_MODEL=-x
         assert_eq!(mode(&file), 0o600);
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(text.contains("devtest-apple,sk-or-v1-A") && text.contains("devtest-bloom,sk-or-v1-B"), "{text}");
+        // Through the link: the file is replaced, the link kept.
+        super::write_secret_file(&link, "x\n").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!((std::fs::read_to_string(&file).unwrap().as_str(), mode(&file)), ("x\n", 0o600));
+        // A write that can't finish leaves the old file whole (here: no temp file allowed).
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(super::write_secret_file(&link, "lost\n").is_err());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "x\n");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "no temp file left");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

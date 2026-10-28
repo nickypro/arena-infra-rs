@@ -31,8 +31,8 @@ earlier).
   spend today in the summary bar. A credit lower than what the keys' caps allow, or a key at its
   cap, leads the bar. Nothing changes without `OPENROUTER_PROVISIONING_KEY`.
 - `arena keys list` adds SPENT (in the cap's period), TODAY, MONTH and ALL columns and a total.
-- `arena keys gen`/`rotate` write the keys file owner-only (0600). It used to be created readable by
-  anyone who could reach the folder; an older file is tightened on its next write.
+- `arena keys` writes the keys file owner-only (0600) and atomically. It used to be created readable
+  by anyone who could reach the folder; an older file is tightened on its next write.
 
 ### Config
 - New, optional: `OPENROUTER_WORKSPACE` (a workspace id or slug). OpenRouter's provisioning key
