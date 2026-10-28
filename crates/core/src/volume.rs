@@ -1609,6 +1609,16 @@ mod tests {
                 .env("GIT_AUTHOR_EMAIL", "t@example.com")
                 .env("GIT_COMMITTER_NAME", "t")
                 .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                // No auto-maintenance. Since git 2.47 `commit` runs it detached: the daemon
+                // removes `objects/maintenance.lock` after `commit` has returned — under load,
+                // after the container mark — and a nested clone's `.git` is in the change scan,
+                // so a pristine checkout read as "changed since the container was created" (a CI
+                // flake: GitHub's runners have a new git; dev-nicky's 2.43 never detaches).
+                .env("GIT_CONFIG_COUNT", "2")
+                .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+                .env("GIT_CONFIG_VALUE_0", "false")
+                .env("GIT_CONFIG_KEY_1", "gc.auto")
+                .env("GIT_CONFIG_VALUE_1", "0")
                 .env_remove("GIT_DIR")
                 .env_remove("GIT_WORK_TREE");
         }

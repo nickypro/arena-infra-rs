@@ -955,6 +955,45 @@ not a hang.
 endpoints by default, or stable proxy ports (`--proxy`) anchored to each machine's
 `MACHINE_NAME_LIST` index. Read-only.
 
+#### Keeping your own `~/.ssh/config` current (`SSH_CONFIG_FILE`)
+
+For one person reaching their own pods: `ssh-config --install [PATH]` (once) and
+`SSH_CONFIG_FILE=~/.ssh/arena.conf` in the config. On a box that runs arena's cron lines for a
+cohort (backups, the reaper), leave the key unset: each tick would rewrite that user's file.
+
+- **`--install`** writes PATH (default `SSH_CONFIG_FILE`, else `~/.ssh/arena.conf`; `~/` is your
+  home) and makes `Include PATH` the **first line** of `~/.ssh/config` — ssh applies an `Include`
+  only where it stands, so it must come before any `Host`/`Match` block to count for every host.
+  It says what it changes and asks (`--yes` to skip, `--dry-run` to preview), keeps a copy of the
+  old `~/.ssh/config` beside it (`config.arena-bak-<UTC time>`, never over an earlier copy), keeps
+  that file's mode (a new one is 0600), and prints the `config set` line when `SSH_CONFIG_FILE`
+  isn't set yet. A second run changes nothing. An `Include` already inside a `Host`/`Match` block
+  is left for you to move. A file at PATH that isn't arena's is replaced only after asking, with a
+  copy kept. It needs a complete listing (a provider that failed to list would drop its pods).
+- **What it won't edit** (checked before writing anything, and again after asking): a
+  `~/.ssh/config` or PATH that is a symlink (edit the file it points to yourself) or isn't a
+  regular file; one owned by another user, or in a `~/.ssh` that is (run it as the user whose
+  `~/.ssh` it is — not under `sudo`); PATH being `~/.ssh/config` itself; a PATH with whitespace,
+  quotes or any of `#$%*?[]\` (ssh's `Include` would read it as something else); a file edited
+  while it asked.
+- **`--uninstall [PATH]`** takes exactly that `Include` line out — the global one(s); one inside a
+  `Host`/`Match` block is yours and stays — with a copy kept; PATH stays.
+- **With `SSH_CONFIG_FILE` set**, PATH is kept current: after every pod change (create, up, start,
+  restart, reimage, replace, migrate, rename, terminate and the reaper — beside their proxy sync,
+  one `[ssh-config] after …: rewrote …` line; `--skip-proxy` skips it too), and on `pods list` and
+  each dashboard refresh when an endpoint moved. `up` writes it once its pods are up; `create`,
+  which doesn't wait, mostly can't yet — the next `pods list` or refresh adds their endpoints. The layout is the proxy's stable ports when `SSH_PROXY_HOST` is set (no
+  listing needed), else each pod's own endpoint (a pod without one is left out, as in
+  `ssh-config`). It is written atomically (a temp file renamed over it), owner-only, and only when
+  the text changed.
+- **Never someone else's file:** arena's file starts with `# managed by arena (`arena
+  ssh-config`) — …`; one without that line (an older `ssh-config --out`, a hand-made file), a
+  symlink or a folder is never rewritten. A listing that failed somewhere doesn't rewrite it
+  either. Each of those, and a failed write, is one warning line — never a failed command.
+- The backup archive's `Host` block isn't in it: that one needs its pinned host-key file, which
+  `ssh-config --out` writes beside the config. `config check` shows the key's state: off, not
+  written yet, not arena's, or arena's and whether `~/.ssh/config` includes it.
+
 ### Publishing the fleet page
 
 `web/fleet.html` is a self-contained status page (no external scripts or fonts, phone- and

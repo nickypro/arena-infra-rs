@@ -28,6 +28,21 @@ earlier).
 ### Action needed
 - A script that runs `pods test` to check every pod on the account needs `--include-non-cohort`
   now.
+## 2026-10-28 · `ssh <pod>` keeps working: arena can keep your own SSH config current
+- `arena ssh-config --install` writes `~/.ssh/arena.conf` (a `Host` per pod) and makes
+  `Include ~/.ssh/arena.conf` the first line of `~/.ssh/config`. It shows the change and asks
+  first, and keeps a copy of the old file. `--uninstall` takes that line out again.
+- With `SSH_CONFIG_FILE` set, the file is kept current: after every pod change (`up`, start,
+  restart, replace, migrate, rename, terminate, the reaper), on `pods list` and on each dashboard
+  refresh. It's rewritten only when something changed.
+- Only a file arena wrote is ever rewritten (its first line says so). A hand-made file, or one
+  from an older `ssh-config --out`, is left alone with one warning line.
+- `config check` says whether the file is written and whether `~/.ssh/config` includes it.
+
+### Config
+- New, optional: `SSH_CONFIG_FILE` (e.g. `~/.ssh/arena.conf`). Unset: nothing is written. Leave
+  it unset on a box that runs arena's cron lines: their syncs would update that user's file
+  whenever a pod changes.
 
 ## 2026-10-27 · `pods ask` and `?`: pick each AI's model and effort, shorter answers
 - The dashboard's `?` names the AI with its model and effort, in a shorter box; **Tab** switches

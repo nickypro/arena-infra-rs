@@ -1416,6 +1416,17 @@ impl Shared<'_, '_> {
         if listing.all_ok() && !self.stopped() {
             self.refresh_fleet_ssh(&names, &pods).await;
         }
+        // `SSH_CONFIG_FILE` from the same listing: the endpoints as the pods ended up — the
+        // pipelines' own syncs are the proxy's only (`proxy_sync_now`, not the lifecycle hook),
+        // and a create rarely has an endpoint yet. Never from a listing a backend didn't answer.
+        if listing.all_ok() {
+            // No home under test: a `~/` value can't reach the developer's own ~/.ssh.
+            let home = if cfg!(test) { None } else { std::env::var("HOME").ok() };
+            let synced = arena_core::sshconfig::sync_for(self.run.cfg, &pods, home.as_deref());
+            if let Some(line) = crate::ssh_config_line("up", synced) {
+                say(if line.starts_with("warning:") { To::Err } else { To::Out }, &line);
+            }
+        }
         // The standing pods' checks, for `arena snapshot` (a pod terminated for its FAIL is
         // gone — the listing prunes any record of it).
         if self.run.check.is_some() {
@@ -1967,6 +1978,29 @@ mod tests {
         let lists = fleet.lists.load(Ordering::SeqCst);
         assert!(lists <= 33, "{lists} list calls for 300s of polling every 10s");
         assert!(conclude(&rows, &|_, _| {}).is_ok());
+    }
+
+    /// `SSH_CONFIG_FILE` after `up`: written from the final listing, with each pod's endpoint as
+    /// it came up — a pod whose endpoint came late included — and said once.
+    #[tokio::test(start_paused = true)]
+    async fn up_writes_the_ssh_config_file_with_the_endpoints_the_pods_came_up_on() {
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)]), ("bloom", &[("10.0.0.2", 22002, 300)])]);
+        let fake = Arc::new(FakeRemote::new());
+        let dir = tmp_dir("sshconfig");
+        let path = dir.0.join("arena.conf");
+        let cfg = Config::parse(&format!("{}SSH_CONFIG_FILE={}\n", cfg_text(None), path.display()));
+        let run = up_run(&fleet, fake.clone(), &cfg, false, None, None).await;
+        let made = make(&fleet, &["apple", "bloom"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert!(rows.iter().all(|r| r.verdict == Verdict::Ready), "{rows:#?}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# managed by arena"), "{text}");
+        for block in ["Host devtest-apple\n    HostName 10.0.0.1\n    Port 22001\n", "Host devtest-bloom\n    HostName 10.0.0.2\n    Port 22002\n"] {
+            assert!(text.contains(block), "{block}: {text}");
+        }
+        let said: Vec<String> = lines.all().into_iter().filter(|l| l.contains("[ssh-config]")).collect();
+        assert_eq!(said, [format!("[ssh-config] after up: rewrote {}", path.display())]);
     }
 
     /// With the VS Code warm-up on (the default outside these tests): it runs after the
