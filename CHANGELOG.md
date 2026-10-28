@@ -18,7 +18,7 @@ earlier).
 - The pods show as soon as they're listed; GPU stats, details and balances fill in after. The
   screen used to say `loading…` until every pod had been read over SSH.
 - **`D`** deep-checks every running pod no one is using (a second `D` confirms; busy pods are
-  named and left out).
+  named and left out, as are CPU-only boxes).
 - A question to `?` shows a spinner and its seconds at the front of the footer until it's
   answered.
 - The graphs come before PROGRESS, which only shows when `PROGRESS_CMD` is set. A CPU-only box

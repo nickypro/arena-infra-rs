@@ -1338,12 +1338,12 @@ async fn run(
                     KeyCode::Char('D') => {
                         // Every running pod no one is using, after a second `D`: the first
                         // says how many, and which busy ones it leaves out.
-                        let (pods, busy) = {
+                        let (pods, skipped) = {
                             let s = shared.lock().unwrap();
                             deep_all_plan(&s.pods, &s.metrics)
                         };
                         let armed = ui.deep_all_armed.take().is_some_and(|t| t.elapsed() < DEEP_ALL_CONFIRM);
-                        let skipped = skipped_words(&busy);
+                        let skipped = skipped_words(&skipped);
                         if pods.is_empty() {
                             shared.lock().unwrap().notify(format!("nothing to deep-check{skipped}"), false);
                         } else if armed {
@@ -2007,35 +2007,46 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Pro
 const DEEP_ALL_CONFIRM: Duration = Duration::from_secs(5);
 
 /// What `D` deep-checks: every running pod, but not one a participant is using — a GPU with
-/// a compute process on it, or at 10% utilization or more. A deep check loads the GPU for
-/// about a minute, and on a busy one it reads as a failure. The busy ones' names come back
-/// to be said. Pure.
-fn deep_all_plan(pods: &[Pod], metrics: &HashMap<String, PodMetrics>) -> (Vec<Pod>, Vec<String>) {
+/// a compute process on it, or at 10% utilization or more — nor a CPU-only box. A deep check
+/// loads the GPU for about a minute, and on a busy one it reads as a failure; on a box with no
+/// GPU it always fails (live: a Hetzner CPU VM). The ones left out come back to be said. Pure.
+fn deep_all_plan(pods: &[Pod], metrics: &HashMap<String, PodMetrics>) -> (Vec<Pod>, Skipped) {
     let mut check = Vec::new();
-    let mut busy = Vec::new();
+    let mut skipped = Skipped::default();
     for p in pods.iter().filter(|p| p.status.eq_ignore_ascii_case("RUNNING")) {
         let m = metrics.get(&p.name);
-        if m.is_some_and(|m| !m.gpu_procs.is_empty() || m.mean_util().is_some_and(|u| u >= 10)) {
-            busy.push(p.name.clone());
+        if cpu_box(m) {
+            skipped.no_gpu += 1;
+        } else if m.is_some_and(|m| !m.gpu_procs.is_empty() || m.mean_util().is_some_and(|u| u >= 10)) {
+            skipped.busy.push(p.name.clone());
         } else {
             check.push(p.clone());
         }
     }
-    (check, busy)
+    (check, skipped)
 }
 
-/// ` — skipping 2 busy: apple, bloom` (at most five named), or nothing.
-fn skipped_words(busy: &[String]) -> String {
-    match busy.len() {
-        0 => String::new(),
-        n => {
-            let mut names = busy.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
-            if n > 5 {
-                names.push_str(", …");
-            }
-            format!(" — skipping {n} busy: {names}")
+/// The pods `D` leaves out: the busy ones by name, and how many have no GPU.
+#[derive(Debug, Default, PartialEq)]
+struct Skipped {
+    busy: Vec<String>,
+    no_gpu: usize,
+}
+
+/// ` — skipping 2 busy: apple, bloom; 1 without a GPU` (at most five named), or nothing.
+fn skipped_words(s: &Skipped) -> String {
+    let mut parts = Vec::new();
+    if !s.busy.is_empty() {
+        let mut names = s.busy.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        if s.busy.len() > 5 {
+            names.push_str(", …");
         }
+        parts.push(format!("{} busy: {names}", s.busy.len()));
     }
+    if s.no_gpu > 0 {
+        parts.push(format!("{} without a GPU", s.no_gpu));
+    }
+    if parts.is_empty() { String::new() } else { format!(" — skipping {}", parts.join("; ")) }
 }
 
 fn start_deep_check(shared: &Arc<Mutex<Shared>>, ui: &Ui, pods: Vec<Pod>) {
@@ -4030,12 +4041,16 @@ deep_check_end=1
         .into_iter()
         .map(|(n, m)| (n.to_string(), m))
         .collect();
-        let (check, busy) = deep_all_plan(&pods, &metrics);
+        let mut metrics = metrics;
+        metrics.insert("devtest-foxtrot".into(), PodMetrics { cpu_pct: Some(3), ..Default::default() });
+        let mut pods = pods.to_vec();
+        pods.push(pod("foxtrot", "hetzner", "f", 6, Some(22)));
+        let (check, skipped) = deep_all_plan(&pods, &metrics);
         assert_eq!(check.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["devtest-alpha", "devtest-echo"]);
-        assert_eq!(busy, ["devtest-bravo", "devtest-charlie"]);
-        assert_eq!(skipped_words(&busy), " — skipping 2 busy: devtest-bravo, devtest-charlie");
-        assert_eq!(skipped_words(&[]), "");
-        let many: Vec<String> = (0..7).map(|i| format!("p{i}")).collect();
+        assert_eq!(skipped, Skipped { busy: vec!["devtest-bravo".into(), "devtest-charlie".into()], no_gpu: 1 });
+        assert_eq!(skipped_words(&skipped), " — skipping 2 busy: devtest-bravo, devtest-charlie; 1 without a GPU");
+        assert_eq!(skipped_words(&Skipped::default()), "");
+        let many = Skipped { busy: (0..7).map(|i| format!("p{i}")).collect(), no_gpu: 0 };
         assert_eq!(skipped_words(&many), " — skipping 7 busy: p0, p1, p2, p3, p4, …");
     }
 
