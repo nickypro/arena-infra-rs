@@ -5021,15 +5021,22 @@ fn health_minute_warning(at: HealthAt) -> Option<String> {
     })
 }
 
-/// The time zone a crontab sets for its lines, if any: its last `CRON_TZ=` or `TZ=` setting (a
-/// line of its own, not a comment, not inside a job's command), quotes dropped. Pure.
+/// The time zone a crontab sets for the health line, if any: a setting on a line of its own
+/// (not a comment, not inside a job's command), quotes dropped, from the lines **before** the
+/// health line (a setting applies to the lines after it; with no health line yet — `install`
+/// appends it — the whole crontab). `CRON_TZ` (cronie's scheduling zone) wins over `TZ` (the
+/// commands' environment), each the last one before the line. Pure.
 fn cron_tz(crontab: &str) -> Option<(&'static str, &str)> {
-    crontab.lines().rev().find_map(|l| {
-        let (name, value) = l.trim_start().split_once('=')?;
-        let name = ["CRON_TZ", "TZ"].into_iter().find(|n| *n == name.trim_end())?;
-        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
-        (!value.is_empty() && !value.contains(char::is_whitespace)).then_some((name, value))
-    })
+    let before: Vec<&str> = crontab.lines().take_while(|l| CronKind::of(l) != Some(CronKind::Health)).collect();
+    let last = |want: &'static str| {
+        before.iter().rev().find_map(|l| {
+            let (name, value) = l.trim_start().split_once('=')?;
+            (name.trim_end() == want).then_some(())?;
+            let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+            (!value.is_empty() && !value.contains(char::is_whitespace)).then_some((want, value))
+        })
+    };
+    last("CRON_TZ").or_else(|| last("TZ"))
 }
 
 /// This box's time zone as cron reads it — the system's, so `date` without this shell's `TZ` —
@@ -19101,16 +19108,22 @@ ASK_CODEX_MODEL=-x
         assert_eq!(HealthAt::of_line("05 7 * * * a pods test --deep"), Some(at));
     }
 
-    /// The zone a crontab sets for its lines (`CRON_TZ=`/`TZ=` on a line of its own), for the
-    /// health line's time: the last one wins; comments, a job's inline env and a value with a
-    /// space aren't one.
+    /// The zone a crontab sets for the health line (`CRON_TZ=`/`TZ=` on a line of its own,
+    /// before it): `CRON_TZ` over `TZ`, the last of each before the line; comments, a job's
+    /// inline env and a value with a space aren't one (review: a later setting used to win).
     #[test]
     fn cron_tz_reads_the_crontabs_own_zone_setting() {
         use super::cron_tz;
         let cases: &[(&str, Option<(&str, &str)>)] = &[
             ("CRON_TZ=Europe/London\n0 3 * * * x\n", Some(("CRON_TZ", "Europe/London"))),
             ("  TZ = UTC\n", Some(("TZ", "UTC"))),
-            ("CRON_TZ=\"America/New_York\"\nTZ='Asia/Tokyo'\n", Some(("TZ", "Asia/Tokyo"))),
+            ("CRON_TZ=\"America/New_York\"\nTZ='Asia/Tokyo'\n", Some(("CRON_TZ", "America/New_York"))),
+            ("TZ=Asia/Tokyo\n", Some(("TZ", "Asia/Tokyo"))),
+            // Only what comes before the health line applies to it.
+            (
+                "CRON_TZ=UTC\n20 7 * * * flock -n -o /h/.local/state/arena-cron/health.lock /opt/arena --config /c pods test --deep >> /h/.local/state/arena-cron/health.log 2>&1\nCRON_TZ=Asia/Tokyo\n",
+                Some(("CRON_TZ", "UTC")),
+            ),
             ("# CRON_TZ=Europe/London\n", None),
             ("0 3 * * * CRON_TZ=UTC /opt/arena pods backup\n", None),
             ("MAILTO=ops@example.org\nPATH=/usr/bin\n", None),
