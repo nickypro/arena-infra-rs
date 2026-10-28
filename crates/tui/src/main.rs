@@ -224,6 +224,8 @@ struct Shared {
     resets: HashMap<String, ContainerReset>,
     /// A `?` question out (`asking claude about …`, for the footer); `None` when none is.
     ask_running: Option<String>,
+    /// When it was asked: the footer's spinner and seconds while it's out.
+    ask_since: Option<Instant>,
     /// Its answer, set by the background task; the loop opens it ([`ask::land`]).
     ask_answer: Option<ask::Answer>,
 }
@@ -289,6 +291,9 @@ struct Ui {
     /// The AI last picked in `?` (Tab, or a question asked): the next `?` opens with it.
     /// `None`: `ASK_AI`'s.
     ask_ai: Option<arena_core::ask::Ai>,
+    /// When `D` was pressed, and the pods it named ([`mark_key`]): a second `D` within
+    /// [`DEEP_ALL_CONFIRM`] deep-checks those of them that still qualify.
+    deep_all_armed: Option<(Instant, std::collections::HashSet<String>)>,
 }
 
 impl Ui {
@@ -396,6 +401,7 @@ async fn main() -> Result<()> {
         result_max: std::cell::Cell::new(0),
         last_table: std::cell::Cell::new((Rect::default(), 0)),
         ask_ai: None,
+        deep_all_armed: None,
     };
 
     dashboard(&shared, &provider, &interval, &nudge, &details_wanted, ui).await
@@ -633,6 +639,12 @@ async fn refresh(
     }
     let partial: Vec<String> = listing.errors().iter().map(|(p, _)| p.to_string()).collect();
     let mut pods = listing.pods();
+    // The first refresh shows the rows as soon as they're listed: the probes, the details
+    // query and the balance reads below can take their full budgets (seconds, up to
+    // ENRICH_TIMEOUT), and until now the screen said `loading…` for all of it.
+    if shared.lock().unwrap().last_refresh.is_none() {
+        publish_listing(cfg, shared, &pods, &partial, now);
+    }
     // OpenRouter on the details cadence, in the background (never two reads at once).
     if let Some(a) = details.ai.as_mut() {
         let idle = a.reading.as_ref().is_none_or(|h| h.is_finished());
@@ -696,14 +708,14 @@ async fn refresh(
 
     for pod in &display {
         let m = metrics.get(&pod.name);
-        let mem_pct = m.and_then(|m| m.mem_summary()).map(|(u, t)| {
-            if t > 0 { (u as u64 * 100 / t as u64) as u32 } else { 0 }
-        });
-        s.history.entry(pod.name.clone()).or_default().push(
-            m.and_then(|m| m.mean_util()),
-            m.and_then(|m| m.max_temp()),
-            mem_pct,
-        );
+        let pct = |(u, t): (u32, u32)| if t > 0 { (u as u64 * 100 / t as u64) as u32 } else { 0 };
+        // A CPU-only box's graphs are its CPU and RAM (there's no GPU to draw).
+        let (util, mem_pct) = if pod.cpu_only() {
+            (m.and_then(|m| m.cpu_pct), m.and_then(|m| m.host_mem_summary()).map(pct))
+        } else {
+            (m.and_then(|m| m.mean_util()), m.and_then(|m| m.mem_summary()).map(pct))
+        };
+        s.history.entry(pod.name.clone()).or_default().push(util, m.and_then(|m| m.max_temp()), mem_pct);
     }
     s.summary = summarize(&display, &metrics);
     if let Some(a) = &details.ai {
@@ -724,6 +736,24 @@ async fn refresh(
     s.publish(snap);
     s.last_refresh = Some(Instant::now());
     s.refreshing = false;
+}
+
+/// Show `pods` as listed, before anything about them is read: the rows, their proxy and last
+/// deep check (local files) and the counts — no metrics yet. The first refresh's early paint.
+fn publish_listing(cfg: &Config, shared: &Mutex<Shared>, pods: &[Pod], partial: &[String], now: u64) {
+    let (proxy, _) = snapshot::local_proxy_text(cfg);
+    let (file_health, _) = load_health(cfg);
+    let mut s = shared.lock().unwrap();
+    let health = s.deep.layer(file_health);
+    let snap = dashboard_snapshot(pods, partial, proxy.as_deref(), &health, &Naming::from_config(cfg), now);
+    s.summary = summarize(pods, &HashMap::new());
+    s.status = format!("listed {} — reading them…", count_label(pods.len()));
+    s.publish(snap);
+}
+
+/// `1 pod`, `3 pods`.
+fn count_label(n: usize) -> String {
+    format!("{n} pod{}", if n == 1 { "" } else { "s" })
 }
 
 /// What a restart does to each of `pods`' container disks, by [`mark_key`]: each one's backend's
@@ -1298,6 +1328,33 @@ async fn run(
                         };
                         if !pods.is_empty() {
                             start_deep_check(shared, &ui, pods);
+                        }
+                    }
+                    KeyCode::Char('D') => {
+                        // Every running pod no one is using, after a second `D`: the first
+                        // says how many, and which it leaves out. The second checks only pods
+                        // the first named that still qualify — never one a refresh added since.
+                        let (mut pods, skipped) = {
+                            let s = shared.lock().unwrap();
+                            deep_all_plan(&s.pods, &s.metrics)
+                        };
+                        let armed = ui.deep_all_armed.take().filter(|(t, _)| t.elapsed() < DEEP_ALL_CONFIRM);
+                        let skipped = skipped_words(&skipped);
+                        pods = deep_all_confirm(pods, armed.as_ref().map(|(_, named)| named));
+                        if pods.is_empty() {
+                            shared.lock().unwrap().notify(format!("nothing to deep-check{skipped}"), false);
+                        } else if armed.is_some() {
+                            start_deep_check(shared, &ui, pods);
+                        } else {
+                            ui.deep_all_armed = Some((Instant::now(), pods.iter().map(mark_key).collect()));
+                            let n = pods.len();
+                            shared.lock().unwrap().notify(
+                                format!(
+                                    "D again to deep-check {n} running pod{} (about a minute of GPU load each){skipped}",
+                                    if n == 1 { "" } else { "s" }
+                                ),
+                                false,
+                            );
                         }
                     }
                     KeyCode::Char('s') => {
@@ -1937,6 +1994,105 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Pro
     start_action(shared, async move {
         execute(provider.as_ref(), remote.as_ref(), &cfg, action, &pod, None).await
     });
+}
+
+/// How long `D`'s first press waits for the second (within [`NOTICE_FOR`], so the prompt is
+/// still on screen).
+const DEEP_ALL_CONFIRM: Duration = Duration::from_secs(5);
+
+/// GPU memory in use, in MiB, above which `D` takes a GPU as someone's: a model held between
+/// notebook cells sits at 0% utilization. An idle GPU shows a few MiB, a few hundred at most.
+const BUSY_GPU_MEM_MB: u32 = 1024;
+
+/// What `D` deep-checks: every running pod whose GPUs it has read and found no one using. A deep
+/// check loads the GPUs for about a minute, and on a busy one it reads as a failure, so it leaves
+/// out:
+/// - **busy** pods: any GPU with a compute process, over the reaper's idle line
+///   ([`arena_core::idle::IDLE_GPU_PCT`]) or holding more than [`BUSY_GPU_MEM_MB`] — any GPU, not
+///   the mean: one busy GPU of four is a busy pod;
+/// - **unread** ones: no metrics yet (the first refresh's early paint);
+/// - **unreadable** ones: the read failed, or it found no GPUs or a GPU without its utilization
+///   and memory (a stalled `nvidia-smi`) — a pod too loaded to answer must not look idle. `d`
+///   checks one of those on purpose;
+/// - **CPU-only** boxes ([`Pod::cpu_only`]): a deep check there always fails.
+///
+/// The ones left out come back to be said. Pure.
+fn deep_all_plan(pods: &[Pod], metrics: &HashMap<String, PodMetrics>) -> (Vec<Pod>, Skipped) {
+    let mut check = Vec::new();
+    let mut skipped = Skipped::default();
+    for p in pods.iter().filter(|p| p.status.eq_ignore_ascii_case("RUNNING")) {
+        match metrics.get(&p.name) {
+            _ if p.cpu_only() => skipped.no_gpu += 1,
+            None => skipped.unread += 1,
+            Some(m) if !gpus_read(p, m) => skipped.unreadable += 1,
+            Some(m) if gpu_busy(m) => skipped.busy.push(p.name.clone()),
+            Some(_) => check.push(p.clone()),
+        }
+    }
+    (check, skipped)
+}
+
+/// Whether a read of a pod's GPUs worked: no error, at least one GPU and no fewer than the
+/// listing says (a lost GPU drops out of `nvidia-smi`'s rows, busy or not), and every GPU's
+/// utilization and memory read.
+fn gpus_read(p: &Pod, m: &PodMetrics) -> bool {
+    m.error.is_none()
+        && !m.gpus.is_empty()
+        && p.gpu_count.is_none_or(|n| m.gpus.len() >= n as usize)
+        && m.gpus.iter().all(|g| g.util_pct.is_some() && g.mem_used_mb.is_some())
+}
+
+/// Whether any of a pod's GPUs is in use: a compute process, utilization over
+/// [`arena_core::idle::IDLE_GPU_PCT`] (the reaper's line), or more than [`BUSY_GPU_MEM_MB`] of
+/// memory taken.
+fn gpu_busy(m: &PodMetrics) -> bool {
+    !m.gpu_procs.is_empty()
+        || m.gpus.iter().any(|g| {
+            g.util_pct.is_some_and(|u| u > arena_core::idle::IDLE_GPU_PCT) || g.mem_used_mb.is_some_and(|u| u > BUSY_GPU_MEM_MB)
+        })
+}
+
+/// What `D`'s second press checks: the pods `plan` still qualifies, kept to those the first press
+/// named (`armed`, by [`mark_key`]) — a pod a refresh made eligible in between was never shown to
+/// the operator. Unarmed (the first press, or the window lapsed): the plan as it is. Pure.
+fn deep_all_confirm(plan: Vec<Pod>, armed: Option<&std::collections::HashSet<String>>) -> Vec<Pod> {
+    match armed {
+        Some(named) => plan.into_iter().filter(|p| named.contains(&mark_key(p))).collect(),
+        None => plan,
+    }
+}
+
+/// The pods `D` leaves out: the busy ones by name, and how many weren't read yet, couldn't be
+/// read or have no GPU.
+#[derive(Debug, Default, PartialEq)]
+struct Skipped {
+    busy: Vec<String>,
+    unread: usize,
+    unreadable: usize,
+    no_gpu: usize,
+}
+
+/// ` — skipping 2 busy: apple, bloom; 3 not read yet; 1 unreadable; 1 without a GPU` (at most
+/// five named), or nothing.
+fn skipped_words(s: &Skipped) -> String {
+    let mut parts = Vec::new();
+    if !s.busy.is_empty() {
+        let mut names = s.busy.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        if s.busy.len() > 5 {
+            names.push_str(", …");
+        }
+        parts.push(format!("{} busy: {names}", s.busy.len()));
+    }
+    if s.unread > 0 {
+        parts.push(format!("{} not read yet", s.unread));
+    }
+    if s.unreadable > 0 {
+        parts.push(format!("{} whose GPUs couldn't be read", s.unreadable));
+    }
+    if s.no_gpu > 0 {
+        parts.push(format!("{} without a GPU", s.no_gpu));
+    }
+    if parts.is_empty() { String::new() } else { format!(" — skipping {}", parts.join("; ")) }
 }
 
 /// Deep-check `pods` (the cursor pod or the marked set) **in the background** — no modal:
@@ -2695,8 +2851,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     // while they fit (`MID_W`, all of them from 105 columns), so a narrow terminal or the
     // detail view's 55% split drops TEMP, MEM, BRANCH, DISK in turn instead of having
     // ratatui shrink every column (NAME, the one that says which pod a row is, worst of
-    // all). Above that the nice-to-haves (SAVED, PROGRESS, host CPU/RAM, then the GPU%/MEM%
-    // graphs) come in as there's room. Below 73 columns the table is crushed as before.
+    // all). Above that the nice-to-haves (SAVED, AI$, host CPU/RAM, then the UTIL%/MEM%
+    // graphs, then PROGRESS when PROGRESS_CMD is set) come in as there's room. Below 73
+    // columns the table is crushed as before.
     let w = area.width as usize;
     // The fleet columns from the core snapshot — M (maintenance badge), HEALTH (last deep
     // check) and PROXY — are essential and always shown, so every threshold below sits
@@ -2711,7 +2868,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     const AI_W: usize = 9; // "1.23/5", "12.3/50", "0.02/0.02"
     let show_ai = shared.ai.is_some() && w >= 104 + FLEET_W;
     let show_host = w >= 134 + FLEET_W; // host CPU% + RAM (extra, only when there's room)
-    let show_progress = w >= 110 + FLEET_W;
+    // PROGRESS is what PROGRESS_CMD reports, so only with one set — and it comes after the
+    // graphs, which say more at a glance (an SSH error is in STATUS and the detail pane).
+    let want_progress = ui.cfg.get("PROGRESS_CMD").is_some_and(|c| !c.trim().is_empty());
     // When cramped, names compress (arena8-apple→apple) and the GPU drops the "RTX "
     // noise. Names compact a bit earlier (so you see "jack", not a truncated
     // "arena8-ja"); GPU always carries count + VRAM ("2×A4000 16G"), truncated if tight.
@@ -2746,12 +2905,12 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     if show_host {
         fixed.extend([4, 4]);
     }
-    if show_progress {
-        fixed.push(PROGRESS_W);
-    }
     let leftover = w.saturating_sub(table_width(&fixed));
     let show_spark = with_spark && leftover >= 20; // ~2×9 + spacing
-    let spark_w = if show_spark { (leftover.saturating_sub(3) / 2).clamp(9, 30) } else { 0 };
+    // PROGRESS takes its fixed budget only from what the graphs leave at their narrowest.
+    let show_progress = want_progress && leftover >= PROGRESS_W + 1 + if show_spark { 20 } else { 0 };
+    let spark_room = if show_progress { leftover - PROGRESS_W - 1 } else { leftover };
+    let spark_w = if show_spark { (spark_room.saturating_sub(3) / 2).clamp(9, 30) } else { 0 };
 
     let mut header_cells = vec!["", "P", "NAME", "STATUS", "M", "SET", "GPU", "GPU%"];
     for (show, title) in [(show_mem, "MEM"), (show_temp, "TEMP"), (show_disk, "DISK")] {
@@ -2774,10 +2933,11 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         header_cells.push("RAM%");
     }
     if show_progress {
-        header_cells.push("PROGRESS / ERROR");
+        header_cells.push("PROGRESS");
     }
     if show_spark {
-        header_cells.push("GPU%~");
+        // GPU and its memory (green, cyan); a CPU box's CPU and RAM (magenta, blue).
+        header_cells.push("UTIL%~");
         header_cells.push("MEM%~");
     }
     let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
@@ -2939,11 +3099,13 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 let mem_hist = h.map(|h| h.mem_data()).unwrap_or_default();
                 // Grey the sparklines out when the pod isn't reachable — the history is
                 // just zeros then, so colour would imply live data that isn't there.
-                let connected = m.map(|m| m.error.is_none() && !m.gpus.is_empty()).unwrap_or(false);
-                let (gpu_c, mem_c) = if connected {
-                    (Color::Green, Color::Cyan)
-                } else {
-                    (Color::DarkGray, Color::DarkGray)
+                let cpu = p.cpu_only();
+                let connected =
+                    m.is_some_and(|m| m.error.is_none() && if cpu { m.cpu_pct.is_some() } else { !m.gpus.is_empty() });
+                let (gpu_c, mem_c) = match (connected, cpu) {
+                    (false, _) => (Color::DarkGray, Color::DarkGray),
+                    (true, false) => (Color::Green, Color::Cyan),
+                    (true, true) => (Color::Magenta, Color::Blue),
                 };
                 cells.push(Cell::from(spark(&gpu_hist, spark_w)).style(Style::default().fg(gpu_c)));
                 cells.push(Cell::from(spark(&mem_hist, spark_w)).style(Style::default().fg(mem_c)));
@@ -3316,12 +3478,13 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         let hist = shared.history.get(&pod.name);
         let util_data = hist.map(|h| h.util_data()).unwrap_or_default();
         let temp_data = hist.map(|h| h.temp_data()).unwrap_or_default();
+        let (util_title, util_colour) = if pod.cpu_only() { ("CPU % (history)", Color::Magenta) } else { ("util % (history)", Color::Green) };
         f.render_widget(
             Sparkline::default()
-                .block(Block::default().borders(Borders::TOP).title("util % (history)"))
+                .block(Block::default().borders(Borders::TOP).title(util_title))
                 .data(&util_data)
                 .max(100)
-                .style(Style::default().fg(Color::Green)),
+                .style(Style::default().fg(util_colour)),
             rows[idx],
         );
         f.render_widget(
@@ -3348,13 +3511,15 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         0 => String::new(),
         n => format!(" · deep-checking {n}"),
     };
-    let checking = match &shared.ask_running {
-        Some(asking) => format!("{checking} · {asking}"),
-        None => checking,
-    };
+    // A question out leads the footer, moving and counting, so it reads as alive: an answer
+    // can take a minute, and a line that never changed looked like a hang.
+    let asking = shared.ask_running.as_ref().map(|asking| {
+        let secs = shared.ask_since.map(|t| t.elapsed()).unwrap_or_default();
+        Span::styled(format!("{} {asking} {}s · ", spinner(secs), secs.as_secs()), tone_style(Tone::Busy))
+    });
     let keys = match &ui.mode {
-        Mode::List => "[q] quit  [enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [?] ask AI  [n] new  [r] refresh",
-        Mode::Detail => "[esc] back  [q] quit  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [?] ask AI  [n] new  [r] refresh",
+        Mode::List => "[q] quit  [enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d/D] deep check this/all  [?] ask AI  [n] new  [r] refresh",
+        Mode::Detail => "[esc] back  [q] quit  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d/D] deep check this/all  [?] ask AI  [n] new  [r] refresh",
         Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::Confirm(c) if c.action.requires_typed_name() => "type the pod's name  [enter] apply  [esc] cancel",
         Mode::Confirm(c) if c.preview.is_some() => "[y] apply  [v] full command  [n/esc] cancel",
@@ -3369,13 +3534,29 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         Mode::Ask { .. } => "type the question  [enter] ask  [tab] the other AI  [ctrl-u] clear  [esc] cancel",
         Mode::Answer(_) => "[↑↓ PgUp PgDn] scroll  [esc] close",
     };
+    // A notice (`D`'s prompt and what it skips, a finished action) comes first: the question's
+    // line can be long, and the notice is what must be read before the next key.
+    let mut spans: Vec<Span<'static>> = Vec::new();
     match shared.notice.as_ref().filter(|n| n.at.elapsed() < NOTICE_FOR) {
         Some(n) => {
             let style = if n.error { tone_style(Tone::Bad) } else { tone_style(Tone::Busy) };
-            Line::from(vec![Span::styled(n.text.clone(), style), Span::raw(format!("{checking} · {keys}"))])
+            spans.extend([Span::styled(n.text.clone(), style), Span::raw(" · ")]);
+            spans.extend(asking);
+            let checking = checking.trim_start_matches(" · ");
+            spans.push(Span::raw(if checking.is_empty() { keys.to_string() } else { format!("{checking} · {keys}") }));
         }
-        None => Line::from(format!("{}{}{checking} · {} · every {}s · {}", shared.status, spin, age, secs, keys)),
+        None => {
+            spans.extend(asking);
+            spans.push(Span::raw(format!("{}{}{checking} · {} · every {}s · {}", shared.status, spin, age, secs, keys)));
+        }
     }
+    Line::from(spans)
+}
+
+/// A braille spinner frame for `elapsed` (a new one every 150 ms, the UI's redraw tick).
+fn spinner(elapsed: Duration) -> char {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    FRAMES[(elapsed.as_millis() / 150) as usize % FRAMES.len()]
 }
 
 /// A centered popup rect `pct_x` × `pct_y` percent of the screen.
@@ -3891,6 +4072,135 @@ deep_check_end=1
         }
     }
 
+    /// `D` checks every running pod whose GPUs it has read and found idle: busy ones (a compute
+    /// process, any GPU over 5% or holding > 1 GiB) are named; unread, unreadable and CPU-only
+    /// ones counted; a stopped pod isn't checked or named.
+    #[test]
+    fn deep_all_checks_running_pods_no_one_is_using() {
+        use arena_core::metrics::{GpuProc, GpuStat};
+        let gpu = |util| GpuStat { util_pct: Some(util), mem_used_mb: Some(3), ..Default::default() };
+        let held = GpuStat { util_pct: Some(0), mem_used_mb: Some(9_000), ..Default::default() };
+        let m = |gpus: Vec<GpuStat>, procs: usize| PodMetrics {
+            gpus,
+            gpu_procs: (0..procs).map(|i| GpuProc { pid: i as u32, ..Default::default() }).collect(),
+            ..Default::default()
+        };
+        let mut stopped = pod("delta", "runpod", "d", 4, Some(22));
+        stopped.status = "EXITED".into();
+        let mut zero = pod("golf", "vast", "g", 7, Some(22));
+        zero.gpu_count = Some(0);
+        let pods = [
+            pod("alpha", "runpod", "a", 1, Some(22)),
+            pod("bravo", "runpod", "b", 2, Some(22)),
+            pod("charlie", "runpod", "c", 3, Some(22)),
+            stopped,
+            pod("echo", "hetzner", "e", 5, Some(22)),
+            pod("foxtrot", "runpod", "f", 6, Some(22)),
+            zero,
+            pod("hotel", "runpod", "h", 8, Some(22)),
+            pod("india", "runpod", "i", 9, Some(22)),
+            pod("juliet", "runpod", "j", 10, Some(22)),
+        ];
+        let failed = PodMetrics { error: Some("ssh: timed out".into()), ..Default::default() };
+        let metrics: HashMap<String, PodMetrics> = [
+            ("devtest-alpha", m(vec![gpu(3), gpu(0)], 0)),
+            ("devtest-bravo", m(vec![gpu(0)], 1)),
+            // One GPU of four at 30%: the mean is 7%, but the pod is busy.
+            ("devtest-charlie", m(vec![gpu(30), gpu(0), gpu(0), gpu(0)], 0)),
+            ("devtest-echo", PodMetrics { cpu_pct: Some(3), ..Default::default() }),
+            // A model held between notebook cells: 0% but 9 GB in use.
+            ("devtest-hotel", m(vec![gpu(0), held], 0)),
+            ("devtest-india", failed),
+            // Read, but `nvidia-smi` gave nothing (stalled, or a driver mismatch under a running
+            // job): no evidence it's idle.
+            ("devtest-juliet", PodMetrics { cpu_pct: Some(5), ..Default::default() }),
+            // A GPU whose utilization didn't come back.
+            ("devtest-kilo", m(vec![GpuStat { util_pct: None, mem_used_mb: Some(3), ..Default::default() }], 0)),
+            // Exactly the reaper's idle line is idle.
+            ("devtest-lima", m(vec![gpu(5)], 0)),
+            // Listed with two GPUs, one row back: the missing one may be the busy one.
+            ("devtest-mike", m(vec![gpu(0)], 0)),
+        ]
+        .into_iter()
+        .map(|(n, m)| (n.to_string(), m))
+        .collect();
+        let mut pods = pods.to_vec();
+        let mut mike = pod("mike", "runpod", "m", 13, Some(22));
+        mike.gpu_count = Some(2);
+        let mut lima = pod("lima", "runpod", "l", 12, Some(22));
+        lima.gpu_count = Some(1);
+        pods.extend([pod("kilo", "runpod", "k", 11, Some(22)), lima, mike]);
+        let (check, skipped) = deep_all_plan(&pods, &metrics);
+        assert_eq!(check.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["devtest-alpha", "devtest-lima"]);
+        let busy = ["devtest-bravo", "devtest-charlie", "devtest-hotel"].map(String::from).to_vec();
+        // foxtrot has no metrics yet; india's read failed, juliet's, kilo's and mike's GPUs weren't
+        // all read; echo and golf have no GPU.
+        assert_eq!(skipped, Skipped { busy, unread: 1, unreadable: 4, no_gpu: 2 });
+        assert_eq!(
+            skipped_words(&skipped),
+            " — skipping 3 busy: devtest-bravo, devtest-charlie, devtest-hotel; 1 not read yet; 4 whose GPUs couldn't be read; 2 without a GPU"
+        );
+        assert_eq!(skipped_words(&Skipped::default()), "");
+        let many = Skipped { busy: (0..7).map(|i| format!("p{i}")).collect(), ..Default::default() };
+        assert_eq!(skipped_words(&many), " — skipping 7 busy: p0, p1, p2, p3, p4, …");
+        // The early paint: listed, nothing read — `D` has nothing to check.
+        let (check, skipped) = deep_all_plan(&pods, &HashMap::new());
+        assert!(check.is_empty());
+        assert_eq!(skipped_words(&skipped), " — skipping 10 not read yet; 2 without a GPU");
+    }
+
+    /// `D`'s second press checks what the first named and still qualifies: a pod a refresh made
+    /// eligible in between is left out, one that turned busy (gone from the plan) too.
+    #[test]
+    fn the_second_d_checks_only_what_the_first_named() {
+        let [alpha, bravo, charlie] = [("alpha", "a"), ("bravo", "b"), ("charlie", "c")].map(|(n, id)| pod(n, "runpod", id, 1, Some(22)));
+        let named: std::collections::HashSet<String> = [&alpha, &bravo].map(mark_key).into_iter().collect();
+        // Since the first press: bravo turned busy (out of the plan), charlie became idle.
+        let plan = vec![alpha.clone(), charlie.clone()];
+        let names = |v: Vec<Pod>| v.into_iter().map(|p| p.name).collect::<Vec<_>>();
+        assert_eq!(names(deep_all_confirm(plan.clone(), Some(&named))), ["devtest-alpha"]);
+        assert_eq!(names(deep_all_confirm(plan, None)), ["devtest-alpha", "devtest-charlie"], "unarmed: the plan");
+    }
+
+    /// A notice (`D`'s prompt) leads the footer, before a question's spinner line; one
+    /// separator between each part.
+    #[test]
+    fn a_notice_leads_the_footer_before_the_asking_line() {
+        let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        // No start time: 0s and the first frame, whatever the clock does.
+        let mut shared = Shared { ask_running: Some("asking claude about devtest-alpha…".into()), ..Default::default() };
+        let text = |s: &Shared| footer_hint(s, &ui, 10).spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let quiet = text(&shared);
+        assert!(quiet.starts_with("⠋ asking claude about devtest-alpha… 0s · "), "{quiet}");
+        shared.notify("D again to deep-check 2 running pods", false);
+        let t = text(&shared);
+        let rest = t.strip_prefix("D again to deep-check 2 running pods · ").unwrap_or_else(|| panic!("{t}"));
+        assert!(rest.contains("asking claude about devtest-alpha… 0s · [q] quit"), "{t}");
+        assert!(!t.contains("·  ·") && !t.contains("· ·"), "{t}");
+    }
+
+    /// The first refresh's early paint: the listed rows, no metrics yet, and a status that
+    /// says the rest is being read — never "loading…" while the probes run.
+    #[test]
+    fn the_listing_is_shown_before_the_pods_are_read() {
+        let shared = Mutex::new(Shared { status: "loading…".into(), ..Default::default() });
+        let pods = [pod("alpha", "runpod", "a", 1, Some(22)), pod("bravo", "hetzner", "b", 2, None)];
+        publish_listing(&cfg(""), &shared, &pods, &[], 1_000);
+        let s = shared.lock().unwrap();
+        assert_eq!(s.pods.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["devtest-alpha", "devtest-bravo"]);
+        assert_eq!((s.snap.pods.len(), s.summary.pods, s.metrics.len()), (2, 2, 0));
+        assert_eq!(s.status, "listed 2 pods — reading them…");
+        assert!(s.last_refresh.is_none(), "still the first refresh: its full publish comes next");
+    }
+
+    #[test]
+    fn spinner_moves_every_150ms() {
+        assert_eq!(spinner(Duration::from_millis(0)), '⠋');
+        assert_eq!(spinner(Duration::from_millis(149)), '⠋');
+        assert_eq!(spinner(Duration::from_millis(150)), '⠙');
+        assert_eq!(spinner(Duration::from_millis(1500)), '⠋', "wraps after ten frames");
+    }
+
     fn verdict(p: &Pod, status: Status, check: Option<(&str, &str)>) -> PodHealth {
         PodHealth {
             id: p.id.clone(),
@@ -3919,6 +4229,7 @@ deep_check_end=1
             last_table: std::cell::Cell::new((Rect::default(), 0)),
             asker: fake_asker(Arc::default()),
             ask_ai: None,
+            deep_all_armed: None,
         }
     }
 

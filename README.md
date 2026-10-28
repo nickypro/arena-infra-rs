@@ -273,7 +273,7 @@ name typed back.
 ```
 
 <sup>A made-up fleet, drawn by the dashboard's own renderer from test fixtures.</sup>
-`a` acts on the selected pod, `A` on the fleet, `d` deep-checks, `n` adds pods, and `?` asks
+`a` acts on the selected pod, `A` on the fleet, `d`/`D` deep-check it/all, `n` adds pods, and `?` asks
 claude or codex about the pod ([`pods ask`](docs/REFERENCE.md#pods-ask)).
 [All the keys and columns](docs/REFERENCE.md#the-dashboard-arena-tui).
 
