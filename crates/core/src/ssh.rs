@@ -237,19 +237,22 @@ pub fn shell_word(s: &str) -> String {
 ///   `/bin/sh`. arena's commands are tested under bash, and the process, signals and exit status
 ///   stay the command's own.
 ///
-/// Other login shells (csh, nu) read neither part and fail, as they did before.
+/// Other login shells (csh, nu) read neither part and fail. Before, they ran a command of plain
+/// words and failed on the rest; arena's hosts run bash, zsh or sh (or fish).
 ///
 /// **Too big to encode** (the line would pass Linux's 128 KiB limit for one argument; encoding
 /// grows a script by about a tenth): `true '\''; <refusal>; true '; <cmd>`. POSIX shells run
 /// the bare command after a `true`, exactly as before. fish parses the whole line before running
 /// any of it, so it either fails to parse the bare command or runs the refusal first (exit 126):
-/// it never runs the command misread. Pure.
+/// it never runs the command misread. Within the refusal's 150 bytes of the limit, the bare
+/// command, as before. Pure.
 pub fn for_any_login_shell(cmd: &str) -> String {
     let line = format!("set -- __arena_p '{}'; true '\\''; {FISH_PART}; true '; {POSIX_PART} #'", printf_format(cmd));
     if line.len() < MAX_ARG_LEN {
         return line;
     }
-    format!("true '\\''; {FISH_TOO_BIG}; true '; {cmd}")
+    let refused = format!("true '\\''; {FISH_TOO_BIG}; true '; {cmd}");
+    if refused.len() < MAX_ARG_LEN { refused } else { cmd.to_string() }
 }
 
 /// What fish runs for a command too big to encode: it says so and exits 126. It sits in POSIX's
@@ -761,9 +764,12 @@ echo \"été ✓\"
         assert!(!FISH_TOO_BIG.contains('\''), "{FISH_TOO_BIG}");
         let huge = ":\n".repeat(30_000);
         assert_eq!(for_any_login_shell(&huge), format!("true '\\''; {FISH_TOO_BIG}; true '; {huge}"), "4× in encoding would pass 128 KiB");
-        // The biggest script arena sends fits, with room.
-        let resolve = for_any_login_shell(include_str!("resolve.sh"));
+        // The biggest command arena sends — the resolve, as `pods set-branch` composes it — fits.
+        let resolve = for_any_login_shell(&crate::resolve::resolve_command("/root/ARENA_materials", 3, "k", "p", "w1d1/devtest-x"));
         assert!(resolve.starts_with("set -- __arena_p") && resolve.len() < 100 * 1024, "{}", resolve.len());
+        // Right at the limit, the refusal would pass it: bare, as before.
+        let edge = "x".repeat(MAX_ARG_LEN - 100);
+        assert_eq!(for_any_login_shell(&edge), edge);
     }
 
     /// The paths of the shells installed here, by name; `busybox` as its `sh`. Not installed:
@@ -850,6 +856,23 @@ echo \"été ✓\"
             } else {
                 assert_eq!((out.trim(), code, mark.exists()), ("40000", Some(0), true), "{name}: {err}");
             }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A pod with no zsh yet (before setup) is still said to be one through the transport: the
+    /// `zsh: … not found` that [`login_shell_missing`] reads comes from bash and from dash as from
+    /// a bare command (review ai-review claude pr18 #1), exit 127.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_missing_zsh_still_reads_as_one_through_the_transport() {
+        let home = std::env::temp_dir().join(format!("arena-no-zsh-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let sent = for_any_login_shell(&login_shell_wrap("echo hi", Some("arena-env")));
+        for (name, shell) in installed(&["bash", "dash"]) {
+            let o = std::process::Command::new(&shell[0]).arg("-c").arg(&sent).env_clear().env("PATH", "/nonexistent").env("HOME", &home).output().unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(login_shell_missing(o.status.code(), &err), "{name}: {:?} {err}", o.status.code());
         }
         let _ = std::fs::remove_dir_all(&home);
     }

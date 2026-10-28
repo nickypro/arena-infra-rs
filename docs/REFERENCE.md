@@ -1224,7 +1224,8 @@ So every command arena runs over ssh (`pods run`, setup, the dashboard's probe, 
 backups…) goes as one line that both kinds of shell parse, each running only its own part
 (`ssh::for_any_login_shell`). bash, zsh, sh, ksh and ash run the command themselves, through
 `eval`: the same startup (once), dialect, `$0` and exit status as before. fish `exec`s it under
-bash, else `/bin/sh`. Other login shells (csh, nu) aren't supported, as before. A command too big
+bash, else `/bin/sh`. Other login shells (csh, nu) aren't supported (before, they ran plain-word
+commands only). A command too big
 to encode within one argument (128 KiB) goes bare: POSIX shells run it as before, and fish
 refuses it rather than misread it. Interactive ssh (`c` in the dashboard) is untouched, and
 `rsync` and `scp` use their own transports.
