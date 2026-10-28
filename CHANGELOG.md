@@ -14,6 +14,21 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-28 · A daily health check on cron; `pods test` checks this cohort's pods
+- `arena cron install --health 07:20` adds a daily `pods test --deep` at that time, in this
+  box's time zone. Its verdicts show in the dashboard's HEALTH column, and its table in
+  `~/.local/state/arena-cron/health.log`. Your other cron lines stay as they are.
+- `cron show` says when it runs (`↳ daily at 07:20, this box's time zone (UTC +0000)`);
+  `cron remove --health` takes it out. A time on the reaper's minutes (:11, :27, :41, :57) gets a
+  warning: a check then looks like use to the reaper.
+- `pods test` and `pods test --deep` with no pod names (or `--all`) now check only this cohort's
+  pods (`<prefix>-…`), not staff boxes or another prefix's pods. One `⊘ skipped N non-cohort pods`
+  line counts the rest; `--include-non-cohort` checks every pod, as before.
+
+### Action needed
+- A script that runs `pods test` to check every pod on the account needs `--include-non-cohort`
+  now.
+
 ## 2026-10-27 · `pods ask` and `?`: pick each AI's model and effort, shorter answers
 - The dashboard's `?` names the AI with its model and effort, in a shorter box; **Tab** switches
   between claude and codex, and the next `?` opens with the one you last picked.
