@@ -39,15 +39,19 @@ jobs:
         run: |
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
           rustc --version
-      # Tests drive real rsync/flock/ssh-keygen/git; git commits need an identity.
+      # Tests drive real rsync/flock/ssh-keygen/git; git commits need an identity. zsh, fish and
+      # busybox are the login shells the ssh transport is tested under (ARENA_TEST_ALL_SHELLS
+      # below makes a missing one a failure, not a skip).
       - name: Tools
         run: |
-          command -v rsync >/dev/null || (sudo apt-get update -q && sudo apt-get install -y -q rsync)
+          sudo apt-get update -q && sudo apt-get install -y -q rsync zsh fish busybox
           git config --global user.name "arena CI"
           git config --global user.email "ci@example.invalid"
           git config --global init.defaultBranch main
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Test
+        env:
+          ARENA_TEST_ALL_SHELLS: "1"
         run: cargo test --release --locked
 
   # Blocking: any clippy warning fails the run. The lint set is the pinned toolchain's
