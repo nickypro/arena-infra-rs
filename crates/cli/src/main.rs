@@ -15671,8 +15671,19 @@ fn write_openrouter_key(dir: &std::path::Path, host: &str, secret: &str, prefix:
         existing = cohort_keys_header(prefix);
     }
     let updated = arena_core::apikeys::upsert_csv(&existing, host, secret);
-    std::fs::write(&target, updated).with_context(|| format!("writing {}", target.display()))?;
+    write_secret_file(&target, &updated).with_context(|| format!("writing {}", target.display()))?;
     Ok(())
+}
+
+/// Write a file of secrets, readable by its owner only: created 0600, and an older file
+/// (`std::fs::write` left new ones at 0666 minus the umask: 0664, every key readable to
+/// anyone who can reach the folder) tightened to 0600 on its next write.
+fn write_secret_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(text.as_bytes())
 }
 
 /// The first lines of a new cohort keys file.
@@ -18212,6 +18223,25 @@ ASK_CODEX_MODEL=-x
         assert!(!ok && line.contains("✗") && line.contains("must be a JSON object") && !line.contains("SECRET"), "{line}");
         let (line, ok) = create_extra_row(&Config::parse("CREATE_EXTRA_JSON=")).unwrap();
         assert!(ok && line.contains("(empty)"), "{line}");
+    }
+
+    #[test]
+    fn minted_keys_are_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("arena-keys-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        super::write_openrouter_key(&dir, "devtest-apple", "sk-or-v1-A", "devtest").unwrap();
+        let file = dir.join("devtest_openrouter_keys.csv");
+        assert_eq!(mode(&file), 0o600);
+        // An older file at 0664 is tightened on its next write.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o664)).unwrap();
+        super::write_openrouter_key(&dir, "devtest-bloom", "sk-or-v1-B", "devtest").unwrap();
+        assert_eq!(mode(&file), 0o600);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("devtest-apple,sk-or-v1-A") && text.contains("devtest-bloom,sk-or-v1-B"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

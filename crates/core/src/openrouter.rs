@@ -474,12 +474,12 @@ fn short_amount(x: f64) -> String {
     }
 }
 
-/// A cap as it was set: `5`, `2.50`.
+/// A cap as it was set, without trailing zeros: `5`, `2.5`, `0.02`.
 fn cap_amount(x: f64) -> String {
     if x.fract() == 0.0 && x.abs() < 1e9 {
         format!("{x:.0}")
     } else {
-        short_amount(x)
+        short_amount(x).trim_end_matches('0').trim_end_matches('.').to_string()
     }
 }
 
@@ -518,7 +518,7 @@ impl KeyUsage {
         }
     }
 
-    /// The `AI$` cell: `1.23/5` against a cap, `$0.42` without one, `off` when disabled,
+    /// The `AI$` cell (at most 9 wide): `1.23/5` against a cap, `$0.42` without one, `off` when disabled,
     /// `?` when the listing gave no spend.
     pub fn cell(&self) -> String {
         if self.disabled {
@@ -1004,7 +1004,8 @@ mod tests {
             (Some(5.0), Some(1.0), None, "4.00/5", Fill::Near),
             (Some(5.0), Some(0.0), None, "5.00/5", Fill::Full),
             (Some(50.0), None, Some(12.34), "12.3/50", Fill::Ok),
-            (Some(2.5), None, Some(2.6), "2.60/2.50", Fill::Full),
+            (Some(2.5), None, Some(2.6), "2.60/2.5", Fill::Full),
+            (Some(0.02), Some(0.0), None, "0.02/0.02", Fill::Full),
             (None, None, Some(123.4), "$123", Fill::Ok),
             (Some(0.0), None, Some(0.0), "0.00/0", Fill::Full),
             (Some(5.0), None, None, "?", Fill::Ok),

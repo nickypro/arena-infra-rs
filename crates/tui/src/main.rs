@@ -2698,7 +2698,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     const FLEET_W: usize = 1 + HEALTH_W + 6 + 3; // + their inter-column spacing
     let show_saved = w >= 96 + FLEET_W;
     // AI$: each pod's OpenRouter key, spent against its cap — only with a provisioning key.
-    const AI_W: usize = 7; // "1.23/5", "12.3/50"
+    const AI_W: usize = 9; // "1.23/5", "12.3/50", "0.02/0.02"
     let show_ai = shared.ai.is_some() && w >= 104 + FLEET_W;
     let show_host = w >= 134 + FLEET_W; // host CPU% + RAM (extra, only when there's room)
     let show_progress = w >= 110 + FLEET_W;
