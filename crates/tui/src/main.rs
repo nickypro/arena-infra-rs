@@ -499,43 +499,39 @@ struct DetailsState {
 }
 
 /// What the `AI$` column and the summary bar's OpenRouter part read with: the provisioning
-/// API (scoped to `OPENROUTER_WORKSPACE`), when it was last read, and the last good answer.
+/// API (scoped to `OPENROUTER_WORKSPACE`), when a read last started, the view the reads
+/// update, and the read in flight. Reads run in the background: a slow listing (a workspace
+/// of many pages) never holds a refresh, and what it read shows from the next one.
 struct AiCtx {
     api: Arc<OpenRouter>,
     last: Option<tokio::time::Instant>,
-    view: UsageView,
+    view: Arc<Mutex<UsageView>>,
+    reading: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AiCtx {
     fn new(api: OpenRouter) -> Self {
-        AiCtx { api: Arc::new(api), last: None, view: UsageView::default() }
+        AiCtx { api: Arc::new(api), last: None, view: Arc::default(), reading: None }
     }
 }
 
-/// How long one read of OpenRouter may take (every page of keys, and the credit) before
-/// the dashboard keeps the last answer: as long as an inline balance read.
-const AI_TIMEOUT: Duration = balance::INLINE_TIMEOUT;
+/// How long the key listing may take (every page, the workspace lookup first) before the
+/// last one is kept.
+const AI_KEYS_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the credit read may take: as long as an inline balance read.
+const AI_CREDITS_TIMEOUT: Duration = balance::INLINE_TIMEOUT;
 
-/// Read OpenRouter's keys and credit, bounded by [`AI_TIMEOUT`]. A failed listing keeps
-/// the last good keys, marked failed; a failed credit read keeps the last credit.
-async fn observe_ai(api: Arc<OpenRouter>, mut last: UsageView) -> UsageView {
-    let read = async { tokio::join!(api.list_keys(), api.credits()) };
-    match tokio::time::timeout(AI_TIMEOUT, read).await {
-        Ok((Ok(keys), credits)) => {
-            let failed = credits.as_ref().err().map(|e| e.to_string());
-            let mut view = UsageView::from_keys(&keys, credits.ok().or(last.credits));
-            view.error = failed;
-            view
-        }
-        Ok((Err(e), _)) => {
-            last.error = Some(e.to_string());
-            last
-        }
-        Err(_) => {
-            last.error = Some(format!("timed out after {}s", AI_TIMEOUT.as_secs()));
-            last
+/// Read OpenRouter's keys and credit, each within its own bound, and apply them to `view`
+/// apart ([`UsageView::apply`]): one failing never holds back the other's fresh answer.
+async fn read_ai(api: Arc<OpenRouter>, view: Arc<Mutex<UsageView>>) {
+    async fn bounded<T>(d: Duration, f: impl std::future::Future<Output = arena_core::Result<T>>) -> std::result::Result<T, String> {
+        match tokio::time::timeout(d, f).await {
+            Ok(r) => r.map_err(|e| e.to_string()),
+            Err(_) => Err(format!("timed out after {}s", d.as_secs())),
         }
     }
+    let (keys, credits) = tokio::join!(bounded(AI_KEYS_TIMEOUT, api.list_keys()), bounded(AI_CREDITS_TIMEOUT, api.credits()));
+    view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).apply(keys, credits);
 }
 
 /// What the summary bar's balance reads with: the reads, the state file the CLI keeps too
@@ -637,12 +633,14 @@ async fn refresh(
     }
     let partial: Vec<String> = listing.errors().iter().map(|(p, _)| p.to_string()).collect();
     let mut pods = listing.pods();
-    let ai_due = details.ai.as_ref().is_some_and(|a| details_due(a.last.map(|t| t.elapsed()), forced));
-    let ai_reading = details
-        .ai
-        .as_ref()
-        .filter(|_| ai_due)
-        .map(|a| tokio::spawn(observe_ai(a.api.clone(), a.view.clone())));
+    // OpenRouter on the details cadence, in the background (never two reads at once).
+    if let Some(a) = details.ai.as_mut() {
+        let idle = a.reading.as_ref().is_none_or(|h| h.is_finished());
+        if idle && details_due(a.last.map(|t| t.elapsed()), forced) {
+            a.reading = Some(tokio::spawn(read_ai(a.api.clone(), a.view.clone())));
+            a.last = Some(tokio::time::Instant::now());
+        }
+    }
     let observing = async {
         match details.balance.as_ref().filter(|_| balance_due) {
             Some(b) => Some(observe_balance(b, now).await),
@@ -663,12 +661,6 @@ async fn refresh(
         tokio::join!(fetch_metrics(remote, &pods, cfg, opts), observing)
     };
     overlay_details(&mut pods, &details.details);
-    if let (Some(reading), Some(a)) = (ai_reading, details.ai.as_mut()) {
-        if let Ok(view) = reading.await {
-            a.view = view;
-        }
-        a.last = Some(tokio::time::Instant::now());
-    }
     // The balance's runway is judged against what is billing as listed (not the pending
     // placeholders, and after the details filled the prices), a provider that failed to
     // list counting as unknown — never as $0/h.
@@ -702,10 +694,11 @@ async fn refresh(
     }
     s.summary = summarize(&display, &metrics);
     if let Some(a) = &details.ai {
+        let view = a.view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
         let names: Vec<String> = display.iter().map(|p| p.name.clone()).collect();
-        s.ai_cohort = Some(a.view.cohort(prefix, &names));
-        s.ai = Some(a.view.clone());
+        s.ai_cohort = Some(view.cohort(prefix, &names));
+        s.ai = Some(view);
     }
     let warnings: Vec<&str> =
         [&details.warning, &proxy_warning, &health_warning].into_iter().flatten().map(String::as_str).collect();
@@ -2668,10 +2661,12 @@ fn columns_that_fit(w: usize, core: &[usize], optional: &[usize]) -> usize {
 }
 
 /// A pod's `AI$` cell: its OpenRouter key's spend against the cap (`-`: no key named after
-/// it), yellow from 80% of the cap, red at the cap or disabled.
-fn ai_cell(k: Option<&KeyUsage>) -> Cell<'static> {
+/// it), yellow from 80% of the cap, red at the cap or disabled — grey when the last listing
+/// failed (`stale`: these are older numbers, the summary bar says `(n/a)`).
+fn ai_cell(k: Option<&KeyUsage>, stale: bool) -> Cell<'static> {
     match k {
-        None => Cell::from("-").style(Style::default().fg(Color::DarkGray)),
+        None => Cell::from("-").style(tone_style(Tone::Dim)),
+        Some(k) if stale => Cell::from(k.cell()).style(tone_style(Tone::Dim)),
         Some(k) => {
             let style = state::fill_tone(k.fill()).map(tone_style).unwrap_or_default();
             Cell::from(k.cell()).style(style)
@@ -2901,7 +2896,8 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 ])));
             }
             if show_ai {
-                cells.push(ai_cell(shared.ai.as_ref().and_then(|a| a.keys.get(&p.name))));
+                let ai = shared.ai.as_ref();
+                cells.push(ai_cell(ai.and_then(|a| a.keys.get(&p.name)), ai.is_some_and(|a| a.keys_error.is_some())));
             }
             if show_host {
                 // Host CPU% and RAM% (both coloured by load); exact RAM GB is in detail.

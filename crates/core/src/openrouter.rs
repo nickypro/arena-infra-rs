@@ -150,35 +150,27 @@ impl OpenRouter {
     }
 
     /// The configured workspace's id: `None` when none is configured (the Default
-    /// workspace); an id as given; a slug looked up once (`GET /workspaces/{slug}`). An
-    /// error, never `None`, when it can't be resolved: an unscoped call is what the setting
-    /// is there to prevent.
+    /// workspace). Otherwise looked up once (`GET /workspaces/{ref}`), and only accepted if the
+    /// answer is the workspace asked for ([`resolved_workspace`]): a mistyped id fails here,
+    /// rather than every create landing in the Default workspace. An error, never `None`,
+    /// when it can't be resolved: an unscoped call is what the setting is there to prevent.
     pub async fn workspace_id(&self) -> Result<Option<String>> {
         let Some(ws) = &self.workspace else { return Ok(None) };
-        match workspace_ref(ws)? {
-            WorkspaceRef::Id(id) => return Ok(Some(id)),
-            WorkspaceRef::Slug => {}
-        }
+        let wanted = workspace_ref(ws)?;
         if let Some(id) = self.resolved.lock().unwrap().clone() {
             return Ok(Some(id));
         }
         let url = format!("{}/workspaces/{ws}", self.root);
         let v = send_json(self.auth(self.client.get(url)), &format!("openrouter workspace `{ws}`")).await?;
-        let id = v
-            .get("data")
-            .and_then(|d| d.get("id"))
-            .and_then(|s| s.as_str())
-            .and_then(|s| match workspace_ref(s) {
-                Ok(WorkspaceRef::Id(id)) => Some(id),
-                _ => None,
-            })
-            .ok_or_else(|| Error::provider(format!("openrouter workspace `{ws}`: the answer had no workspace id")))?;
+        let id = resolved_workspace(&v, ws, &wanted)?;
         *self.resolved.lock().unwrap() = Some(id.clone());
         Ok(Some(id))
     }
 
     /// Create a runtime key named `name` with an optional USD credit `limit` (in the
-    /// configured workspace, if any).
+    /// configured workspace, if any). With a workspace, the answer must say the key is in it:
+    /// a key the API put elsewhere would be one the scoped listing never shows again (no
+    /// rotate, no revoke), so it is deleted at once and the create fails.
     pub async fn create_key(&self, name: &str, limit: Option<f64>) -> Result<CreatedKey> {
         let ws = self.workspace_id().await?;
         let body = create_body(name, limit, ws.as_deref());
@@ -205,12 +197,28 @@ impl OpenRouter {
             .and_then(|s| s.as_str())
             .ok_or_else(|| Error::provider("openrouter create: response had no `key`"))?
             .to_string();
-        let hash = v
-            .get("data")
-            .and_then(|d| d.get("hash"))
-            .and_then(|s| s.as_str())
-            .unwrap_or_default()
-            .to_string();
+        let data = v.get("data");
+        let field = |k: &str| data.and_then(|d| d.get(k)).and_then(|s| s.as_str());
+        let hash = field("hash").unwrap_or_default().to_string();
+        if let Some(ws) = ws.as_deref() {
+            let landed = field("workspace_id");
+            if !landed.is_some_and(|l| l.eq_ignore_ascii_case(ws)) {
+                // Ours to clean up: the key this call just made (its own hash, its own name).
+                let cleanup = if field("name") == Some(name) && valid_hash(&hash).is_ok() {
+                    match send_ok(self.auth(self.client.delete(format!("{}/{hash}", self.keys_url()))), "openrouter delete key").await {
+                        Ok(()) => "deleted it again".to_string(),
+                        Err(e) => format!("couldn't delete it ({e}): delete key {} on openrouter.ai", short_hash(&hash)),
+                    }
+                } else {
+                    format!("delete key {} on openrouter.ai", short_hash(&hash))
+                };
+                return Err(Error::provider(format!(
+                    "openrouter create key: the new key landed in workspace {}, not OPENROUTER_WORKSPACE ({}) — {cleanup}",
+                    landed.unwrap_or("(not said)"),
+                    self.workspace.as_deref().unwrap_or_default(),
+                )));
+            }
+        }
         Ok(CreatedKey { secret, hash, name: name.to_string() })
     }
 
@@ -219,12 +227,12 @@ impl OpenRouter {
     /// per call, so this walks `offset` until a page comes back empty ([`collect_pages`]).
     /// A single page used to be read: on an account holding more keys (several cohorts +
     /// admin keys) a machine's key could sit past it, and "no key" then meant revoke dropped
-    /// the CSV row of a key that still worked. With a workspace, a key that doesn't say it's
-    /// in it is dropped ([`in_workspace`]) whatever the API answered.
+    /// the CSV row of a key that still worked. With a workspace, keys that say they're in
+    /// another one are dropped, and a key that doesn't say fails the listing ([`in_workspace`]).
     pub async fn list_keys(&self) -> Result<Vec<KeyInfo>> {
         let ws = self.workspace_id().await?;
         let all = collect_pages(|offset| self.list_page(offset, ws.as_deref())).await?;
-        Ok(in_workspace(all, ws.as_deref()))
+        in_workspace(all, ws.as_deref())
     }
 
     /// One page of `GET /keys` from `offset` (disabled keys included: a disabled key still
@@ -244,20 +252,23 @@ impl OpenRouter {
         Ok(arr.iter().filter_map(|k| serde_json::from_value(k.clone()).ok()).collect())
     }
 
-    /// Refuse to change a key outside the configured workspace: read it (`GET /keys/{hash}`)
-    /// and compare. Nothing to check without a workspace.
+    /// Refuse to change a key outside the configured workspace: read it (`GET /keys/{hash}`),
+    /// check the answer is that key, and compare its workspace. Nothing to check without a
+    /// workspace.
     async fn ensure_in_workspace(&self, hash: &str, what: &str) -> Result<()> {
         let Some(ws) = self.workspace_id().await? else { return Ok(()) };
         let v = send_json(self.auth(self.client.get(format!("{}/{hash}", self.keys_url()))), &format!("openrouter {what}"))
             .await?;
-        let theirs = v.get("data").and_then(|d| d.get("workspace_id")).and_then(|s| s.as_str());
-        if theirs.is_some_and(|t| t.eq_ignore_ascii_case(&ws)) {
+        let data = v.get("data");
+        let theirs = data.and_then(|d| d.get("workspace_id")).and_then(|s| s.as_str());
+        let same_key = data.and_then(|d| d.get("hash")).and_then(|s| s.as_str()) == Some(hash);
+        if same_key && theirs.is_some_and(|t| t.eq_ignore_ascii_case(&ws)) {
             return Ok(());
         }
         Err(Error::provider(format!(
             "openrouter {what}: refused — key {} is in workspace {}, not OPENROUTER_WORKSPACE ({})",
-            &hash[..hash.len().min(12)],
-            theirs.unwrap_or("(not said)"),
+            short_hash(hash),
+            if same_key { theirs.unwrap_or("(not said)") } else { "(the answer was for another key)" },
             self.workspace.as_deref().unwrap_or_default(),
         )))
     }
@@ -265,6 +276,7 @@ impl OpenRouter {
     /// Delete the key with `hash` (irreversible — the runtime key stops working). With a
     /// workspace, only a key in it.
     pub async fn delete_key(&self, hash: &str) -> Result<()> {
+        valid_hash(hash)?;
         self.ensure_in_workspace(hash, "delete key").await?;
         send_ok(self.auth(self.client.delete(format!("{}/{hash}", self.keys_url()))), "openrouter delete key").await
     }
@@ -279,6 +291,7 @@ impl OpenRouter {
     /// machine's key follows a `pods rename`: rotate/revoke find keys by name. With a
     /// workspace, only a key in it.
     pub async fn rename_key(&self, hash: &str, new_name: &str) -> Result<()> {
+        valid_hash(hash)?;
         self.ensure_in_workspace(hash, "rename key").await?;
         // Status only ([`send_ok`]): a rename that worked is never reported as failed
         // because of its (unused) body.
@@ -321,14 +334,61 @@ pub fn workspace_ref(ws: &str) -> Result<WorkspaceRef> {
     Err(Error::Config(format!("OPENROUTER_WORKSPACE `{ws}` is neither a workspace id nor a slug")))
 }
 
-/// The keys of `keys` in workspace `ws` (all of them without one). A key that doesn't say
-/// which workspace it's in isn't kept: the listing already asked for `ws`, so this only
-/// matters if the API ignored that — and then the safe reading is "not ours".
-pub fn in_workspace(keys: Vec<KeyInfo>, ws: Option<&str>) -> Vec<KeyInfo> {
-    match ws {
-        None => keys,
-        Some(ws) => keys.into_iter().filter(|k| k.workspace_id.as_deref().is_some_and(|w| w.eq_ignore_ascii_case(ws))).collect(),
+/// The id in a `GET /workspaces/{ref}` answer, if it's the workspace asked for: an id must
+/// come back as itself, a slug with that slug. Anything else (an answer for another
+/// workspace, one without an id) is refused — caching it would scope every call to the
+/// wrong workspace. Pure.
+pub fn resolved_workspace(v: &serde_json::Value, asked: &str, wanted: &WorkspaceRef) -> Result<String> {
+    let d = v.get("data");
+    let id = d.and_then(|d| d.get("id")).and_then(|s| s.as_str()).and_then(|s| match workspace_ref(s) {
+        Ok(WorkspaceRef::Id(id)) => Some(id),
+        _ => None,
+    });
+    let slug = d.and_then(|d| d.get("slug")).and_then(|s| s.as_str());
+    let ok = match (wanted, &id) {
+        (WorkspaceRef::Id(w), Some(id)) => w == id,
+        (WorkspaceRef::Slug, Some(_)) => slug == Some(asked),
+        _ => false,
+    };
+    match id {
+        Some(id) if ok => Ok(id),
+        _ => Err(Error::provider(format!(
+            "openrouter workspace `{asked}`: the answer is for another workspace (id {}, slug {}) — refused",
+            id.as_deref().unwrap_or("?"),
+            slug.unwrap_or("?")
+        ))),
     }
+}
+
+/// The keys of `keys` in workspace `ws` (all of them without one). A key that names another
+/// workspace is dropped; one that doesn't say fails the listing — "not ours" would make
+/// rotate re-mint beside a leaked key and revoke drop the row of a key that still works.
+pub fn in_workspace(keys: Vec<KeyInfo>, ws: Option<&str>) -> Result<Vec<KeyInfo>> {
+    let Some(ws) = ws else { return Ok(keys) };
+    if let Some(k) = keys.iter().find(|k| k.workspace_id.is_none()) {
+        return Err(Error::provider(format!(
+            "openrouter list keys: key {} didn't say which workspace it's in — with OPENROUTER_WORKSPACE \
+             set, a listing that can't be checked isn't used",
+            short_hash(&k.hash)
+        )));
+    }
+    Ok(keys.into_iter().filter(|k| k.workspace_id.as_deref().is_some_and(|w| w.eq_ignore_ascii_case(ws))).collect())
+}
+
+/// A key hash goes into a URL path: letters and digits only (OpenRouter's are hex), so one
+/// from a misbehaving answer can't point a delete at another endpoint.
+pub fn valid_hash(hash: &str) -> Result<()> {
+    if !hash.is_empty() && hash.bytes().all(|c| c.is_ascii_alphanumeric()) {
+        Ok(())
+    } else {
+        Err(Error::provider(format!("openrouter: `{}` isn't a key hash — refused", short_hash(hash))))
+    }
+}
+
+/// A hash's first 12 characters, for messages.
+fn short_hash(hash: &str) -> &str {
+    let end = hash.char_indices().nth(12).map(|(i, _)| i).unwrap_or(hash.len());
+    &hash[..end]
 }
 
 /// The `POST /keys` body: the name, the cap if any, the workspace if any. Pure, for testing.
@@ -440,9 +500,10 @@ pub enum Fill {
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyUsage {
     pub disabled: bool,
-    /// Spent in the cap's current period — OpenRouter's own `limit − limit_remaining`, so a
-    /// cap that starts over daily counts today's spend, not the key's life; without both of
-    /// those, the life's `usage`.
+    /// Spent in the cap's current period: OpenRouter's own `limit − limit_remaining`, else
+    /// the period's own usage (today's for a daily cap, …), else — for a cap that never
+    /// starts over — the life's `usage`. Unknown rather than the life's spend for a cap that
+    /// resets: a key that spent $30 in all could have $0.20 of today's $5.
     pub spent: Option<f64>,
     pub limit: Option<f64>,
     pub reset: Option<String>,
@@ -474,26 +535,32 @@ fn short_amount(x: f64) -> String {
     }
 }
 
-/// A cap as it was set, without trailing zeros: `5`, `2.5`, `0.02`.
+/// A cap as it was set, without trailing zeros after a decimal point: `5`, `2.5`, `0.02`,
+/// `150` (for 150.25: three digits are all the cell has room for).
 fn cap_amount(x: f64) -> String {
-    if x.fract() == 0.0 && x.abs() < 1e9 {
-        format!("{x:.0}")
+    let s = if x.fract() == 0.0 && x.abs() < 1e9 { format!("{x:.0}") } else { short_amount(x) };
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
     } else {
-        short_amount(x).trim_end_matches('0').trim_end_matches('.').to_string()
+        s
     }
 }
 
 impl KeyUsage {
     pub fn of(k: &KeyInfo) -> Self {
-        let spent = match (k.limit, k.limit_remaining) {
-            (Some(l), Some(r)) => Some((l - r).max(0.0)),
+        let reset = k.limit_reset.clone().filter(|r| period(Some(r)).is_some());
+        let spent = match (k.limit, k.limit_remaining, reset.as_deref()) {
+            (Some(l), Some(r), _) => Some((l - r).max(0.0)),
+            (_, _, Some("daily")) => k.usage_daily,
+            (_, _, Some("weekly")) => k.usage_weekly,
+            (_, _, Some("monthly")) => k.usage_monthly,
             _ => k.usage,
         };
         KeyUsage {
             disabled: k.disabled,
             spent,
             limit: k.limit,
-            reset: k.limit_reset.clone().filter(|r| period(Some(r)).is_some()),
+            reset,
             today: k.usage_daily,
             week: k.usage_weekly,
             month: k.usage_monthly,
@@ -562,23 +629,38 @@ impl KeyUsage {
     }
 }
 
-/// What the dashboard knows of OpenRouter after its last read: every listed key's usage by
-/// name (a key is named after its pod: [`key_name`]) and the account's credit.
+/// What the dashboard knows of OpenRouter after its last reads: each listed key's usage
+/// (`all`), the one shown for each name (a key is named after its pod: [`key_name`]) and the
+/// account's credit. The keys and the credit are read and kept apart: one failing keeps its
+/// own last answer, never the other's.
 #[derive(Debug, Clone, Default)]
 pub struct UsageView {
+    /// The key shown for each name.
     pub keys: HashMap<String, KeyUsage>,
+    /// Every listed key, by name (a name can be held twice): what the totals add up.
+    pub all: Vec<(String, KeyUsage)>,
     pub credits: Option<Credits>,
-    /// Why the last read failed, if it did; what's kept is then the last good answer.
-    pub error: Option<String>,
+    /// Why the last listing failed, if it did (`keys`/`all` are then the last good ones).
+    pub keys_error: Option<String>,
+    /// Why the last credit read failed, if it did (`credits` is then the last good one).
+    pub credits_error: Option<String>,
 }
 
 impl UsageView {
     /// From a listing. A name held by more than one key (an old one disabled, a rotation's
-    /// leftover) shows the enabled one, then the newest.
+    /// leftover) shows the enabled one, then the newest; the totals count them all.
     pub fn from_keys(keys: &[KeyInfo], credits: Option<Credits>) -> Self {
+        let mut v = UsageView { credits, ..Default::default() };
+        v.set_keys(keys);
+        v
+    }
+
+    fn set_keys(&mut self, keys: &[KeyInfo]) {
         let mut best: HashMap<String, &KeyInfo> = HashMap::new();
+        let mut all = Vec::new();
         for k in keys {
             let Some(name) = k.name.as_deref().filter(|n| !n.is_empty()) else { continue };
+            all.push((name.to_string(), KeyUsage::of(k)));
             let rank = |k: &KeyInfo| (!k.disabled, k.created_at.clone());
             match best.get(name) {
                 Some(b) if rank(b) >= rank(k) => {}
@@ -587,16 +669,40 @@ impl UsageView {
                 }
             }
         }
-        let keys = best.into_iter().map(|(n, k)| (n, KeyUsage::of(k))).collect();
-        UsageView { keys, credits, error: None }
+        self.keys = best.into_iter().map(|(n, k)| (n, KeyUsage::of(k))).collect();
+        self.all = all;
     }
 
-    /// This cohort's share: the keys named `<prefix>-…` or after one of `pods` (an `@name`
-    /// pod's key carries its bare name), summed for the summary bar.
+    /// Take one round's reads: each answer replaces its own part, each failure keeps that
+    /// part's last good answer and says why.
+    pub fn apply(&mut self, keys: std::result::Result<Vec<KeyInfo>, String>, credits: std::result::Result<Credits, String>) {
+        match keys {
+            Ok(k) => {
+                self.set_keys(&k);
+                self.keys_error = None;
+            }
+            Err(e) => self.keys_error = Some(e),
+        }
+        match credits {
+            Ok(c) => {
+                self.credits = Some(c);
+                self.credits_error = None;
+            }
+            Err(e) => self.credits_error = Some(e),
+        }
+    }
+
+    /// This cohort's share: every key named `<prefix>-…` or after one of `pods` (an `@name`
+    /// pod's key carries its bare name), summed for the summary bar — a disabled key's spend
+    /// today counts, its cap doesn't.
     pub fn cohort(&self, prefix: &str, pods: &[String]) -> CohortUsage {
         let needle = format!("{prefix}-");
-        let mut c = CohortUsage { credit_left: self.credits.map(|c| c.left()), failed: self.error.is_some(), ..Default::default() };
-        for (name, k) in &self.keys {
+        let mut c = CohortUsage {
+            credit_left: self.credits.map(|c| c.left()),
+            failed: self.keys_error.is_some() || self.credits_error.is_some(),
+            ..Default::default()
+        };
+        for (name, k) in &self.all {
             if !(name.starts_with(&needle) || pods.iter().any(|p| p == name)) {
                 continue;
             }
@@ -610,8 +716,10 @@ impl UsageView {
             if k.fill() == Fill::Full {
                 c.at_cap += 1;
             }
-            if let Some(left) = k.left() {
-                c.headroom += left;
+            match (k.limit, k.left()) {
+                (None, _) => c.uncapped += 1,
+                (Some(_), Some(left)) => c.headroom += left,
+                (Some(l), None) => c.headroom += l.max(0.0), // spend unknown: the whole cap may go
             }
         }
         c
@@ -628,6 +736,8 @@ pub struct CohortUsage {
     pub at_cap: usize,
     /// What the enabled keys may still spend under their caps.
     pub headroom: f64,
+    /// Enabled keys with no cap: nothing bounds what they spend.
+    pub uncapped: usize,
     pub credit_left: Option<f64>,
     /// The last read failed (the numbers are the last good ones).
     pub failed: bool,
@@ -664,6 +774,9 @@ impl CohortUsage {
         }
         if self.keys > 0 {
             tail.push(format!("AI today {}", self.today.map(money).unwrap_or_else(|| "?".into())));
+        }
+        if self.uncapped > 0 {
+            tail.push(format!("{} uncapped", self.uncapped));
         }
         if tail.is_empty() && self.failed {
             tail.push("openrouter n/a".into());
@@ -884,13 +997,50 @@ mod tests {
         }
     }
 
+    /// Keys naming another workspace are dropped; a key that doesn't say fails the listing
+    /// (an empty "not ours" would make rotate leave a leaked key live).
     #[test]
-    fn in_workspace_keeps_only_keys_that_say_they_are_in_it() {
+    fn in_workspace_drops_other_workspaces_and_refuses_keys_that_dont_say() {
         let k = |h: &str, ws: Option<&str>| KeyInfo { hash: h.into(), workspace_id: ws.map(String::from), ..Default::default() };
-        let keys = vec![k("a", Some("w1")), k("b", Some("W1")), k("c", Some("w2")), k("d", None)];
+        let keys = vec![k("a", Some("w1")), k("b", Some("W1")), k("c", Some("w2"))];
         let hashes = |v: Vec<KeyInfo>| v.into_iter().map(|k| k.hash).collect::<Vec<_>>();
-        assert_eq!(hashes(in_workspace(keys.clone(), Some("w1"))), ["a", "b"]);
-        assert_eq!(hashes(in_workspace(keys, None)), ["a", "b", "c", "d"], "no workspace: as before");
+        assert_eq!(hashes(in_workspace(keys.clone(), Some("w1")).unwrap()), ["a", "b"]);
+        let mut silent = keys.clone();
+        silent.push(k("d", None));
+        let e = in_workspace(silent.clone(), Some("w1")).unwrap_err().to_string();
+        assert!(e.contains("key d didn't say which workspace"), "{e}");
+        assert_eq!(hashes(in_workspace(silent, None).unwrap()), ["a", "b", "c", "d"], "no workspace: as before");
+    }
+
+    /// A workspace lookup is only taken when the answer is the workspace asked for.
+    #[test]
+    fn resolved_workspace_takes_only_the_workspace_asked_for() {
+        use serde_json::json;
+        let ours = "c9f89f20-08e3-4cff-bad6-70c478e2c2c4";
+        let theirs = "a3339b09-7feb-5818-be3e-1b9484142ece";
+        let ans = |id: &str, slug: &str| json!({"data": {"id": id, "slug": slug}});
+        let slug = WorkspaceRef::Slug;
+        let id = WorkspaceRef::Id(ours.into());
+        assert_eq!(resolved_workspace(&ans(ours, "arena-dev-test"), "arena-dev-test", &slug).unwrap(), ours);
+        assert_eq!(resolved_workspace(&ans(&ours.to_uppercase(), "x"), ours, &id).unwrap(), ours);
+        for (v, asked, wanted) in [
+            (ans(theirs, "default"), "arena-dev-test", &slug),
+            (ans(theirs, "arena-dev-test"), ours, &id),
+            (json!({"data": {"slug": "arena-dev-test"}}), "arena-dev-test", &slug),
+            (ans("not-a-uuid", "arena-dev-test"), "arena-dev-test", &slug),
+            (json!(null), ours, &id),
+        ] {
+            let e = resolved_workspace(&v, asked, wanted).unwrap_err().to_string();
+            assert!(e.contains("refused"), "{v}: {e}");
+        }
+    }
+
+    #[test]
+    fn valid_hash_is_letters_and_digits() {
+        assert!(valid_hash("f01d52606dc8f0a8303a7b5cc3fa07109c2e346cec7c0a16b40de462992ce943").is_ok());
+        for bad in ["", "a/../../workspaces/x", "a?x=1", "a b", "a%2F"] {
+            assert!(valid_hash(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -926,7 +1076,7 @@ mod tests {
             canned(200, json, &format!(r#"{{"data":{{"id":"{ours}","slug":"arena-dev-test"}}}}"#)),
             canned(200, json, &format!(r#"{{"data":[{{"hash":"a","name":"devtest-apple","workspace_id":"{ours}"}},{{"hash":"x","name":"arena9-apple","workspace_id":"other"}}]}}"#)),
             canned(200, json, r#"{"data":[]}"#),
-            canned(200, json, r#"{"key":"sk-or-v1-S","data":{"hash":"n"}}"#),
+            canned(200, json, &format!(r#"{{"key":"sk-or-v1-S","data":{{"hash":"n","name":"devtest-bloom","workspace_id":"{ours}"}}}}"#)),
             canned(200, json, r#"{"data":{"hash":"x","workspace_id":"other"}}"#),
             canned(200, json, r#"{"data":{"hash":"y"}}"#),
             canned(200, json, &format!(r#"{{"data":{{"hash":"a","workspace_id":"{ours}"}}}}"#)),
@@ -976,6 +1126,63 @@ mod tests {
         assert_eq!(srv.requests.lock().unwrap().len(), 1, "only the lookup; nothing listed or deleted");
     }
 
+    /// A create the API put in another workspace (or didn't say where) fails, and the key it
+    /// just made — its own name, its own hash — is deleted again; the secret isn't returned.
+    #[tokio::test]
+    async fn a_key_created_outside_the_workspace_is_deleted_and_the_create_fails() {
+        use crate::http::test_server::{canned, serve};
+        let json = "application/json";
+        let ours = "c9f89f20-08e3-4cff-bad6-70c478e2c2c4";
+        let ws = format!(r#"{{"data":{{"id":"{ours}","slug":"arena-dev-test"}}}}"#);
+        let srv = serve(vec![
+            canned(200, json, &ws),
+            canned(200, json, r#"{"key":"sk-or-v1-S1","data":{"hash":"d1","name":"devtest-a","workspace_id":"other"}}"#),
+            canned(200, json, "{}"),
+            canned(200, json, r#"{"key":"sk-or-v1-S2","data":{"hash":"d2","name":"devtest-a"}}"#),
+            canned(500, json, r#"{"error":{"message":"boom"}}"#),
+            canned(200, json, r#"{"key":"sk-or-v1-S3","data":{"hash":"d3","name":"someone-else","workspace_id":"other"}}"#),
+        ]);
+        let or = test_client("K", &srv.base).with_workspace(Some("arena-dev-test"));
+        let e = or.create_key("devtest-a", Some(1.0)).await.unwrap_err().to_string();
+        assert!(e.contains("landed in workspace other") && e.contains("deleted it again") && !e.contains("sk-or"), "{e}");
+        let e = or.create_key("devtest-a", Some(1.0)).await.unwrap_err().to_string();
+        assert!(e.contains("(not said)") && e.contains("couldn't delete it") && e.contains("d2"), "{e}");
+        let e = or.create_key("devtest-a", Some(1.0)).await.unwrap_err().to_string();
+        assert!(e.contains("delete key d3 on openrouter.ai"), "not our name: not deleted: {e}");
+        assert_eq!(
+            *srv.requests.lock().unwrap(),
+            [
+                "GET /workspaces/arena-dev-test HTTP/1.1",
+                "POST /keys HTTP/1.1",
+                "DELETE /keys/d1 HTTP/1.1",
+                "POST /keys HTTP/1.1",
+                "DELETE /keys/d2 HTTP/1.1",
+                "POST /keys HTTP/1.1",
+            ]
+        );
+    }
+
+    /// A workspace given as an id is looked up too: a mistyped id fails before anything is
+    /// listed or created.
+    #[tokio::test]
+    async fn a_workspace_id_is_checked_once_before_use() {
+        use crate::http::test_server::{canned, serve};
+        let json = "application/json";
+        let ours = "c9f89f20-08e3-4cff-bad6-70c478e2c2c4";
+        let srv = serve(vec![
+            canned(404, json, r#"{"error":{"message":"Workspace not found"}}"#),
+            canned(200, json, &format!(r#"{{"data":{{"id":"{ours}","slug":"arena-dev-test"}}}}"#)),
+            canned(200, json, r#"{"data":[{"hash":"a","name":"devtest-a"}]}"#),
+            canned(200, json, r#"{"data":[]}"#),
+        ]);
+        let typo = test_client("K", &srv.base).with_workspace(Some("c9f89f20-08e3-4cff-bad6-70c478e2c2c5"));
+        assert!(typo.list_keys().await.is_err());
+        let or = test_client("K", &srv.base).with_workspace(Some(ours));
+        let e = or.list_keys().await.unwrap_err().to_string();
+        assert!(e.contains("didn't say which workspace"), "a listing without workspace ids isn't used: {e}");
+        assert_eq!(srv.requests.lock().unwrap().len(), 4, "the typo's lookup, ours, two pages");
+    }
+
     fn usage(limit: Option<f64>, remaining: Option<f64>, total: Option<f64>, reset: Option<&str>) -> KeyUsage {
         KeyUsage::of(&KeyInfo {
             hash: "h".into(),
@@ -1013,6 +1220,19 @@ mod tests {
             let k = usage(limit, rem, total, None);
             assert_eq!((k.cell().as_str(), k.fill()), (cell, fill), "{limit:?} {rem:?} {total:?}");
         }
+        // A cap that starts over, without limit_remaining: the period's own spend, not the life's.
+        let daily = usage(Some(5.0), None, Some(30.0), Some("daily"));
+        assert_eq!((daily.cell().as_str(), daily.fill()), ("0.20/5", Fill::Ok));
+        let weekly = usage(Some(5.0), None, Some(30.0), Some("weekly"));
+        assert_eq!(weekly.spent, Some(1.0));
+        let mut no_month = KeyInfo { limit: Some(5.0), limit_reset: Some("monthly".into()), usage: Some(30.0), ..Default::default() };
+        assert_eq!(KeyUsage::of(&no_month).spent, None, "unknown, never the life's $30");
+        no_month.limit_reset = None;
+        assert_eq!(KeyUsage::of(&no_month).spent, Some(30.0), "a cap that never resets: the life's");
+        // Caps keep their integer digits.
+        assert_eq!(usage(Some(150.25), Some(150.25), None, None).cell(), "0.00/150");
+        assert_eq!(usage(Some(100.4), Some(100.4), None, None).cell(), "0.00/100");
+        assert_eq!(usage(Some(10.5), Some(10.5), None, None).cell(), "0.00/10.5");
         let none = usage(None, None, Some(0.5), None);
         assert!(none.detail().starts_with("$0.50 spent, no cap · today $0.20"), "{}", none.detail());
         let mut off = usage(Some(5.0), Some(5.0), Some(0.0), Some("bogus"));
@@ -1047,21 +1267,38 @@ mod tests {
         let v = UsageView::from_keys(&keys, Some(Credits { total: 20.0, used: 10.0 }));
         assert_eq!(v.keys["devtest-apple"].spent, Some(1.0), "the enabled key wins over newer disabled ones");
         let c = v.cohort("devtest", &["james-gpu".to_string()]);
-        assert_eq!((c.keys, c.at_cap), (3, 1));
-        assert!((c.today.unwrap() - 3.5).abs() < 1e-9 && (c.headroom - 14.0).abs() < 1e-9, "{c:?}");
+        // Every key counts in the totals (the disabled ones' spend today too); caps only the enabled.
+        assert_eq!((c.keys, c.at_cap, c.uncapped), (5, 1, 0));
+        assert!((c.today.unwrap() - 21.5).abs() < 1e-9 && (c.headroom - 14.0).abs() < 1e-9, "{c:?}");
         let (lead, tail, fill) = c.tui_parts();
         assert_eq!(lead.as_deref(), Some(" ⚠ openrouter $10.00 left, the keys' caps allow $14.00 more · ⚠ 1 AI key at cap ·"));
-        assert_eq!(tail.as_deref(), Some("openrouter $10.00 left · AI today $3.50"));
+        assert_eq!(tail.as_deref(), Some("openrouter $10.00 left · AI today $21.50"));
         assert_eq!(fill, Fill::Near);
         let gone = CohortUsage { credit_left: Some(0.0), ..c.clone() };
         assert_eq!(gone.tui_parts().2, Fill::Full);
         assert!(gone.tui_parts().0.unwrap().starts_with(" ‼ openrouter $0.00 left — every key's calls fail"));
         let calm = CohortUsage { credit_left: Some(100.0), at_cap: 0, ..c.clone() };
         assert_eq!(calm.tui_parts().0, None);
-        let failed = CohortUsage { failed: true, ..calm };
-        assert_eq!(failed.tui_parts().1.as_deref(), Some("openrouter $100.00 left · AI today $3.50 · (n/a)"));
-        let nothing = UsageView { error: Some("x".into()), ..Default::default() }.cohort("devtest", &[]);
+        let failed = CohortUsage { failed: true, uncapped: 2, ..calm };
+        assert_eq!(failed.tui_parts().1.as_deref(), Some("openrouter $100.00 left · AI today $21.50 · 2 uncapped · (n/a)"));
+        let nothing = UsageView { keys_error: Some("x".into()), ..Default::default() }.cohort("devtest", &[]);
         assert_eq!(nothing.tui_parts(), (None, Some("openrouter n/a".into()), Fill::Ok));
         assert_eq!(UsageView::default().cohort("devtest", &[]).tui_parts(), (None, None, Fill::Ok));
+    }
+
+    /// The keys and the credit are applied apart: a failure keeps its own part's last good
+    /// answer, and the other part's fresh one still lands.
+    #[test]
+    fn usage_view_applies_keys_and_credit_apart() {
+        let key = |name: &str, today: f64| KeyInfo { hash: name.into(), name: Some(name.into()), usage_daily: Some(today), ..Default::default() };
+        let mut v = UsageView::from_keys(&[key("devtest-a", 1.0)], Some(Credits { total: 100.0, used: 0.0 }));
+        v.apply(Err("list timed out".into()), Ok(Credits { total: 100.0, used: 100.0 }));
+        assert_eq!(v.credits.unwrap().left(), 0.0, "the fresh credit lands though the listing failed");
+        assert_eq!((v.keys["devtest-a"].today, v.keys_error.as_deref()), (Some(1.0), Some("list timed out")));
+        let c = v.cohort("devtest", &[]);
+        assert!(c.failed && c.tui_parts().2 == Fill::Full, "{c:?}");
+        v.apply(Ok(vec![key("devtest-a", 2.0)]), Err("credits 500".into()));
+        assert_eq!((v.keys["devtest-a"].today, v.keys_error.as_deref()), (Some(2.0), None));
+        assert_eq!((v.credits.unwrap().left(), v.credits_error.as_deref()), (0.0, Some("credits 500")));
     }
 }

@@ -1139,12 +1139,16 @@ ones included — the listing walks every page).
 organization, every workspace's. Without `OPENROUTER_WORKSPACE`, keys are listed and created in the
 Default workspace, as before. Set `OPENROUTER_WORKSPACE` to a workspace's id or slug and every call is
 scoped to it: the listing asks for that workspace and drops keys that say otherwise, new keys go
-there, and a revoke, rotate or rename first reads the key and refuses one from another workspace. A
-workspace that can't be resolved fails the command; it never falls back to the Default one.
+there (a key the answer says landed elsewhere is deleted again and the command fails), and a revoke,
+rotate or rename first reads the key and refuses one from another workspace. The workspace is looked
+up once (`GET /workspaces/<id or slug>`) and must come back as itself; one that can't be resolved, or
+a listing whose keys don't say their workspace, fails the command — it never falls back to the
+Default one.
 `config check` crosses a value that's neither an id nor a slug.
 
 **In the dashboard.** With a provisioning key set, the TUI reads the keys and the account's credit
-on its details cadence (once a minute, `r` sooner; at most 5 s, the last answer kept if a read fails):
+on its details cadence, in the background (once a minute, `r` sooner; the listing within 20 s and the
+credit within 5 s, each keeping its last answer if its read fails — the `AI$` cells go grey then):
 an `AI$` column (each pod's key: spent/cap, yellow from 80%, red at the cap or disabled, `-` no key —
 shown from 122 columns), an `ai key:` line in the detail pane (the cap, what's left, today, week,
 month, all told), and the summary bar's `openrouter $422.09 left · AI today $3.20`. It leads the bar
