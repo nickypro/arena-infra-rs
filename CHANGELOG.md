@@ -14,6 +14,12 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-28 · Commands over ssh work whatever the remote login shell (fish too)
+- Every command arena runs over ssh now reaches the remote shell as one simple command any
+  shell reads the same way. On a box whose user's login shell is fish (or another shell that
+  isn't POSIX), `pods run`, setup, deep checks, backups and the dashboard's probe now run under
+  bash; they used to fail to parse. Bash, zsh and sh login shells still run them themselves.
+
 ## 2026-10-28 · OpenRouter spend in the dashboard, and keys kept to one workspace
 - The dashboard shows each pod's OpenRouter key as `AI$` (spent/cap: yellow from 80%, red at the
   cap), the key's today/week/month in the detail pane, and the account's credit and the cohort's
