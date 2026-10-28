@@ -84,7 +84,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
 
 - Runs as the unprivileged `dev` user, which **cannot read `/root`**. It only sees
   a read-only copy of config at `/home/dev/prod-ro/config.env`.
-- **Read-only by default.** `pods list`, `offers` and the TUI only ever read: REST GETs plus
+- **Read-only by default.** `pods list`, `offers` and the TUI only ever read from the providers: REST GETs plus
   read-only GraphQL queries (a POST, but a query, never a mutation). The RunPod key is sent
   only as an `Authorization: Bearer` header — never in a URL, which errors would print.
 - **Mutating commands act, but confirm first.** `create`/`stop`/`terminate`/… print
@@ -826,7 +826,7 @@ placement shows here unchanged. `create`/`up` use **one** provider per run (`--p
 **`--all`**: every type each provider sells instead of what `create` would try (it doesn't take
 the option flags). RunPod: its GPU catalog, exactly as [`gpus`](#gpus) printed it. Hetzner: every
 server type on sale somewhere now — vCPUs, RAM, disk, €/h in its cheapest location, where it's sold
-— with `HETZNER_SERVER_TYPE`'s starred. Vast and Shadeform are marketplaces with no fixed list: a
+— with `HETZNER_SERVER_TYPE`'s starred (or a line saying it's on sale nowhere now). Vast and Shadeform are marketplaces with no fixed list: a
 note says to price GPUs with `offers --provider vast --gpu …`. A list that can't be read is a note;
 RunPod's config refusing it (a bad `RUNPOD_API`) fails the command after the rest is shown.
 `--all --json`: `{"runpod": [rows as gpus --json], "hetzner": [server types], "notes": [...]}`.

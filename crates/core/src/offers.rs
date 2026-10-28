@@ -349,7 +349,8 @@ pub fn render_runpod_catalog(c: &RunpodCatalog) -> String {
 }
 
 /// Hetzner's server types for `offers --all`: size, € per hour where it's cheapest, where it's
-/// sold. `configured` (`HETZNER_SERVER_TYPE`, what `create`/`up` use) is starred. Pure.
+/// sold. `configured` (`HETZNER_SERVER_TYPE`, what `create`/`up` use) is starred — or, when
+/// it's on sale nowhere now (create looks it up by this exact name), said. Pure.
 pub fn render_server_types(types: &[ServerType], configured: &str) -> String {
     use Align::{Left, Right};
     let rows: Vec<Vec<String>> = types
@@ -373,6 +374,11 @@ pub fn render_server_types(types: &[ServerType], configured: &str) -> String {
          what create/up use). €/h is gross, in the first (cheapest) location listed; Hetzner bills in EUR.\n",
         types.len()
     ));
+    if !types.iter().any(|t| t.name == configured) {
+        out.push_str(&format!(
+            "HETZNER_SERVER_TYPE `{configured}` isn't on sale anywhere now — `up --provider hetzner` would be refused.\n"
+        ));
+    }
     out
 }
 
@@ -615,5 +621,8 @@ mod tests {
              \n3 Hetzner server types on sale. Pass one to --server-type with --provider hetzner (* = HETZNER_SERVER_TYPE, \
              what create/up use). €/h is gross, in the first (cheapest) location listed; Hetzner bills in EUR.\n"
         );
+        let retired = render_server_types(&[cx23()], "cpx41");
+        assert!(retired.ends_with("HETZNER_SERVER_TYPE `cpx41` isn't on sale anywhere now — `up --provider hetzner` would be refused.\n"), "{retired}");
+        assert!(!retired.contains("cx23*"));
     }
 }
