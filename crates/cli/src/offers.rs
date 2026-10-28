@@ -58,6 +58,10 @@ pub(crate) async fn handle_offers(cfg: &Config, named: Option<&str>, flags: Flag
         let names: Vec<&str> = out.failed.iter().map(|f| f.provider.as_str()).collect();
         anyhow::bail!("couldn't plan {} as create would (see `failed:`)", names.join(", "));
     }
+    if out.providers.is_empty() {
+        // E.g. `--server-type` with no Hetzner key: every provider in scope was skipped.
+        anyhow::bail!("no provider to show: the flags apply to none of {} (see `skipped:`)", scope.join(", "));
+    }
     Ok(())
 }
 
@@ -133,20 +137,30 @@ async fn hetzner_offer(cfg: &Config, base: &PodSpec) -> Result<(ServerType, Opti
 }
 
 /// `offers --all`: each provider's whole list — RunPod's GPU catalog (what `gpus` showed),
-/// Hetzner's server types — and for a marketplace, how to price a GPU on it.
+/// Hetzner's server types — and for a marketplace, how to price a GPU on it. A list that can't
+/// be read is a note (as in the table); RunPod's config refusing (a bad `RUNPOD_API`) is a
+/// failure — the others still show, then the exit is non-zero.
 async fn handle_catalogs(cfg: &Config, scope: &[&str], left_out: &[Skipped], json: bool) -> Result<()> {
     let mut cats = Catalogs::default();
     let mut text: Vec<String> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
     for &provider in scope {
         match provider {
-            "runpod" => {
-                let (cat, warning) = runpod_catalog(cfg).await?;
-                if let Some(w) = warning {
-                    eprintln!("{w}");
+            "runpod" => match runpod_catalog(cfg).await {
+                Ok((cat, warning)) => {
+                    if let Some(w) = warning {
+                        eprintln!("{w}");
+                    }
+                    text.push(format!("runpod — GPU types (--gpu):\n{}", offers::render_runpod_catalog(&cat)));
+                    cats.runpod = Some(cat.rows);
                 }
-                text.push(format!("runpod — GPU types (--gpu):\n{}", offers::render_runpod_catalog(&cat)));
-                cats.runpod = Some(cat.rows);
-            }
+                Err(e) => {
+                    let note = format!("runpod: failed: {e:#}");
+                    text.push(format!("{note}\n"));
+                    cats.notes.push(note);
+                    failed.push(provider);
+                }
+            },
             "hetzner" => {
                 let opts = HetznerOpts::from_config(cfg);
                 let configured = opts.server_type.clone();
@@ -186,6 +200,9 @@ async fn handle_catalogs(cfg: &Config, scope: &[&str], left_out: &[Skipped], jso
     } else {
         print!("{}", text.join("\n"));
     }
+    if !failed.is_empty() {
+        anyhow::bail!("couldn't read {}'s catalog (see above)", failed.join(", "));
+    }
     Ok(())
 }
 
@@ -198,9 +215,8 @@ async fn handle_catalogs(cfg: &Config, scope: &[&str], left_out: &[Skipped], jso
 async fn runpod_catalog(cfg: &Config) -> Result<(RunpodCatalog, Option<String>)> {
     use arena_core::gpu;
     use arena_core::provider::{runpod, RunpodApi};
-    let presets = RunpodCatalog { rows: gpu::rows_from_presets(), live: false, creatable_known: false, stock: Stock::OneGpu };
     let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|s| !s.is_empty()) else {
-        return Ok((presets, None));
+        return Ok((RunpodCatalog::presets(offers::NO_KEY), None));
     };
     let api = RunpodApi::from_config(cfg)?;
     // v2: both tiers (finding #31: STOCK was always the community figure, so a secure-only
@@ -216,8 +232,11 @@ async fn runpod_catalog(cfg: &Config) -> Result<(RunpodCatalog, Option<String>)>
     };
     let types = match fetched {
         Ok(types) if !types.is_empty() => types,
-        Ok(_) => return Ok((presets, None)),
-        Err(e) => return Ok((presets, Some(format!("(couldn't fetch the live GPU list: {e} — showing local presets)\n")))),
+        Ok(_) => return Ok((RunpodCatalog::presets(offers::NOT_READ), None)),
+        Err(e) => {
+            let warning = format!("(couldn't fetch the live GPU list: {e} — showing local presets)\n");
+            return Ok((RunpodCatalog::presets(offers::NOT_READ), Some(warning)));
+        }
     };
     let creatable = match api {
         RunpodApi::V1 => runpod::fetch_creatable_gpu_ids(key).await.ok().filter(|v| !v.is_empty()),
@@ -232,7 +251,7 @@ async fn runpod_catalog(cfg: &Config) -> Result<(RunpodCatalog, Option<String>)>
         (RunpodApi::V2, false) => Stock::CommunityOnly,
         (RunpodApi::V1, _) => Stock::OneGpu,
     };
-    Ok((RunpodCatalog { rows, live: true, creatable_known: creatable.is_some(), stock }, None))
+    Ok((RunpodCatalog { rows, live: true, creatable_known: creatable.is_some(), stock, hint: "" }, None))
 }
 
 /// `arena gpus`, kept for old habits and scripts, exactly as it was: RunPod's section of `offers
@@ -240,11 +259,8 @@ async fn runpod_catalog(cfg: &Config) -> Result<(RunpodCatalog, Option<String>)>
 /// and `--json` the same array of rows ([`arena_core::gpu::GpuRow`]). The pointer to `offers
 /// --all` goes to stderr, keeping stdout as it was.
 pub(crate) async fn handle_gpus(cfg: &Config, provider: &str, json: bool) -> Result<()> {
-    let (cat, warning) = if provider == "runpod" {
-        runpod_catalog(cfg).await?
-    } else {
-        (RunpodCatalog { rows: arena_core::gpu::rows_from_presets(), live: false, creatable_known: false, stock: Stock::OneGpu }, None)
-    };
+    let (mut cat, warning) = if provider == "runpod" { runpod_catalog(cfg).await? } else { (RunpodCatalog::presets(offers::GPUS_HINT), None) };
+    cat.hint = offers::GPUS_HINT;
     if let Some(w) = warning {
         eprintln!("{w}");
     }
@@ -308,6 +324,13 @@ mod tests {
         assert!(!cat.live && warning.is_none() && cat.rows.len() == arena_core::gpu::PRESETS.len());
         handle_gpus(&cfg(), "runpod", true).await.unwrap();
         handle_gpus(&cfg(), "vast", false).await.unwrap();
+        // `--server-type` where no provider in scope takes it: nothing to show is an error.
+        let e = handle_offers(&cfg(), None, Flags { server_type: Some("cx33".into()), ..Default::default() }, false, false).await.unwrap_err();
+        assert_eq!(e.to_string(), "no provider to show: the flags apply to none of runpod (see `skipped:`)");
+        // RunPod's config refusing its catalog fails `--all` — after the rest is shown.
+        let bad = Config::parse("MACHINE_NAME_PREFIX=arena8\nRUNPOD_API_KEY=k\nRUNPOD_API=v9\n");
+        let e = handle_offers(&bad, None, Flags::default(), true, false).await.unwrap_err();
+        assert_eq!(e.to_string(), "couldn't read runpod's catalog (see above)");
     }
 
     /// A plan as a fake planner returns it (create's planner over no prices).

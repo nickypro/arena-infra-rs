@@ -2013,5 +2013,11 @@ mod tests {
             p.distances = Distances::known(&near);
             assert_eq!(p.offer(&spec("devtest-a", None)).await.unwrap().locations, want, "{setting}: offer");
         }
+        // A listed location where the type is retired is still where a create goes first (it
+        // doesn't read the catalog): the offer lists it as is, never drops it or refuses.
+        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\nHETZNER_LOCATION=fsn1,ash\n"));
+        let srv = serve(vec![canned(200, "application/json", SERVER_TYPES)]);
+        let cpx41 = provider(&srv.base, opts).offer(&spec("devtest-a", Some("cpx41"))).await.unwrap();
+        assert_eq!(cpx41.locations, ["fsn1", "ash"]);
     }
 }

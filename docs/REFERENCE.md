@@ -804,7 +804,9 @@ placement shows here unchanged. `create`/`up` use **one** provider per run (`--p
   line — or, with that provider named, fails as `create` does. A provider whose planning fails (a
   `--gpu` typo, a server type Hetzner doesn't have or sells nowhere `HETZNER_LOCATION` allows) is
   listed as `failed:` while the others still show, and the command exits non-zero; named, it just
-  fails. `--cloud` is RunPod's (it collapses
+  fails. A read that doesn't answer (a catalog, a Vast search) is a note, never a failure, as in
+  `create`'s own plan. Flags that apply to no provider in scope (`--server-type` with no Hetzner
+  key) are an error: nothing to show. `--cloud` is RunPod's (it collapses
   elsewhere, with a note when several were asked for).
 - **Hetzner's row** is the VM `up --provider hetzner` would create: `--server-type` over
   `HETZNER_SERVER_TYPE` (default `cx23`), its vCPUs and RAM, and its gross €/h where the create's
@@ -825,8 +827,9 @@ placement shows here unchanged. `create`/`up` use **one** provider per run (`--p
 the option flags). RunPod: its GPU catalog, exactly as [`gpus`](#gpus) printed it. Hetzner: every
 server type on sale somewhere now — vCPUs, RAM, disk, €/h in its cheapest location, where it's sold
 — with `HETZNER_SERVER_TYPE`'s starred. Vast and Shadeform are marketplaces with no fixed list: a
-note says to price GPUs with `offers --provider vast --gpu …`. `--all --json`: `{"runpod": [rows as
-gpus --json], "hetzner": [server types], "notes": [...]}`.
+note says to price GPUs with `offers --provider vast --gpu …`. A list that can't be read is a note;
+RunPod's config refusing it (a bad `RUNPOD_API`) fails the command after the rest is shown.
+`--all --json`: `{"runpod": [rows as gpus --json], "hetzner": [server types], "notes": [...]}`.
 
 ### `pods up`
 

@@ -198,11 +198,12 @@ pub fn render(offers: &Offers) -> String {
             };
             // A Hetzner VM's price is its list price, read for this table: placement prices
             // nothing there (`--max-price` can't use it), so it's `list`, never `live`.
-            let (price, source) = match (o.price_per_pod, &p.server_type) {
-                (Some(usd), _) if o.price_source == Some(PriceSource::Estimate) => (format!("~{}/h", fmt_money("$", usd)), "estimate"),
-                (Some(usd), _) => (format!("{}/h", fmt_money("$", usd)), if o.price_source.is_some() { "live" } else { "-" }),
-                (None, Some(ServerType { eur_per_hour: Some(eur), .. })) => (format!("{}/h", fmt_money("€", *eur)), "list"),
-                (None, _) => ("-".into(), "-"),
+            let (price, source) = match (o.price_per_pod, o.price_source, &p.server_type) {
+                (Some(usd), Some(PriceSource::Estimate), _) => (format!("~{}/h", fmt_money("$", usd)), "estimate"),
+                (Some(usd), Some(PriceSource::Live), _) => (format!("{}/h", fmt_money("$", usd)), "live"),
+                (Some(usd), None, _) => (format!("{}/h", fmt_money("$", usd)), "-"),
+                (None, _, Some(ServerType { eur_per_hour: Some(eur), .. })) => (format!("{}/h", fmt_money("€", *eur)), "list"),
+                (None, _, _) => ("-".into(), "-"),
             };
             rows.push(vec![
                 p.provider.clone(),
@@ -295,6 +296,23 @@ pub struct RunpodCatalog {
     /// may not have been readable).
     pub creatable_known: bool,
     pub stock: Stock,
+    /// The presets only: why, and how to get the live list ([`NO_KEY`], [`NOT_READ`],
+    /// [`GPUS_HINT`]).
+    pub hint: &'static str,
+}
+
+/// Why the presets: there's no `RUNPOD_API_KEY`.
+pub const NO_KEY: &str = "set RUNPOD_API_KEY for RunPod's full live list";
+/// Why the presets: RunPod's catalog didn't answer (the warning says why).
+pub const NOT_READ: &str = "RunPod's live list couldn't be read";
+/// `arena gpus`' own words, whatever the reason, so its output stays as it was.
+pub const GPUS_HINT: &str = "run with --provider runpod + a key for the full live list";
+
+impl RunpodCatalog {
+    /// The local presets (RunPod's prices, estimated), saying `hint`.
+    pub fn presets(hint: &'static str) -> Self {
+        Self { rows: gpu::rows_from_presets(), live: false, creatable_known: false, stock: Stock::OneGpu, hint }
+    }
 }
 
 /// RunPod's catalog the way `arena gpus` printed it: the table (minus what the create API
@@ -302,9 +320,10 @@ pub struct RunpodCatalog {
 pub fn render_runpod_catalog(c: &RunpodCatalog) -> String {
     if !c.live {
         return format!(
-            "{}\n(local presets, ~ = rough estimate — set RUNPOD_API_KEY for RunPod's full live list.)\n\
+            "{}\n(local presets, ~ = rough estimate — {}.)\n\
              Pass the API name, label, or alias (e.g. `A4000`, `3090`, \"A100 SXM\") to --gpu.\n",
-            gpu::render_gpu_table(&c.rows)
+            gpu::render_gpu_table(&c.rows),
+            c.hint
         );
     }
     let (shown, hidden): (Vec<_>, Vec<_>) = c.rows.iter().cloned().partition(|r| r.creatable != Some(false));
@@ -520,8 +539,9 @@ mod tests {
         let v = serde_json::to_value(&offers).unwrap();
         let first = &v["providers"][0];
         let plan_json = serde_json::to_value(&runpod).unwrap();
-        for k in ["provider", "gpu_count", "order", "max_price", "dropped", "notes"] {
-            assert_eq!(first[k], plan_json[k], "{k}");
+        // Every field of the plan is carried (a new one can't silently go missing here).
+        for (k, v) in plan_json.as_object().unwrap().iter().filter(|(k, _)| *k != "options") {
+            assert_eq!(&first[k], v, "{k}");
         }
         let mut option = plan_json["options"][0].clone();
         option["vram_gb"] = 16.into();
@@ -558,6 +578,7 @@ mod tests {
             live: true,
             creatable_known: true,
             stock: Stock::BothTiers,
+            hint: "",
         };
         assert_eq!(
             render_runpod_catalog(&live),
@@ -571,9 +592,14 @@ mod tests {
         let v1 = RunpodCatalog { creatable_known: false, stock: Stock::OneGpu, ..live.clone() };
         let out = render_runpod_catalog(&RunpodCatalog { rows: vec![row("NVIDIA RTX A4000", "RTX A4000", 16, None)], ..v1 });
         assert!(out.contains("1 GPU types (live from RunPod). ") && out.contains("stock hint for a 1-GPU pod (either tier).\n") && !out.contains("hidden"), "{out}");
-        let presets = RunpodCatalog { rows: gpu::rows_from_presets(), live: false, creatable_known: false, stock: Stock::OneGpu };
-        let out = render_runpod_catalog(&presets);
-        assert!(out.starts_with("GPU ") && out.contains("~$0.17") && out.contains("set RUNPOD_API_KEY for RunPod's full live list"), "{out}");
+        let out = render_runpod_catalog(&RunpodCatalog::presets(NO_KEY));
+        assert!(out.starts_with("GPU ") && out.contains("~$0.17") && out.contains("— set RUNPOD_API_KEY for RunPod's full live list.)"), "{out}");
+        // `gpus`' own footer, word for word as it always printed it.
+        let out = render_runpod_catalog(&RunpodCatalog::presets(GPUS_HINT));
+        assert!(out.ends_with(
+            "\n(local presets, ~ = rough estimate — run with --provider runpod + a key for the full live list.)\n\
+             Pass the API name, label, or alias (e.g. `A4000`, `3090`, \"A100 SXM\") to --gpu.\n"
+        ), "{out}");
     }
 
     #[test]
