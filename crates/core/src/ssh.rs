@@ -244,15 +244,15 @@ pub fn shell_word(s: &str) -> String {
 /// grows a script by about a tenth): `true '\''; <refusal>; true '; <cmd>`. POSIX shells run
 /// the bare command after a `true`, exactly as before. fish parses the whole line before running
 /// any of it, so it either fails to parse the bare command or runs the refusal first (exit 126):
-/// it never runs the command misread. Within the refusal's 150 bytes of the limit, the bare
-/// command, as before. Pure.
+/// it never runs the command misread. Within the refusal's 150 bytes of the limit, that line is
+/// itself too long: spawning `ssh` fails ("argument list too long") and nothing runs anywhere —
+/// never the bare command, which a fish box would misread (review ai-review codex pr18). Pure.
 pub fn for_any_login_shell(cmd: &str) -> String {
     let line = format!("set -- __arena_p '{}'; true '\\''; {FISH_PART}; true '; {POSIX_PART} #'", printf_format(cmd));
     if line.len() < MAX_ARG_LEN {
         return line;
     }
-    let refused = format!("true '\\''; {FISH_TOO_BIG}; true '; {cmd}");
-    if refused.len() < MAX_ARG_LEN { refused } else { cmd.to_string() }
+    format!("true '\\''; {FISH_TOO_BIG}; true '; {cmd}")
 }
 
 /// What fish runs for a command too big to encode: it says so and exits 126. It sits in POSIX's
@@ -767,9 +767,9 @@ echo \"été ✓\"
         // The biggest command arena sends — the resolve, as `pods set-branch` composes it — fits.
         let resolve = for_any_login_shell(&crate::resolve::resolve_command("/root/ARENA_materials", 3, "k", "p", "w1d1/devtest-x"));
         assert!(resolve.starts_with("set -- __arena_p") && resolve.len() < 100 * 1024, "{}", resolve.len());
-        // Right at the limit, the refusal would pass it: bare, as before.
+        // Right at the limit, the refusal passes it: still never bare (the spawn fails instead).
         let edge = "x".repeat(MAX_ARG_LEN - 100);
-        assert_eq!(for_any_login_shell(&edge), edge);
+        assert_eq!(for_any_login_shell(&edge), format!("true '\\''; {FISH_TOO_BIG}; true '; {edge}"));
     }
 
     /// The paths of the shells installed here, by name; `busybox` as its `sh`. Not installed:
