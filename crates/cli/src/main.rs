@@ -4993,6 +4993,7 @@ const SETTABLE_KEYS: &[(&str, bool)] = &[
     ("HF_TOKEN", true), // broadcast to pods for gated repos (Llama 3 …)
     ("CLAUDE_CODE_OAUTH_TOKEN", true), // broadcast to pods for Claude Code access
     ("OPENROUTER_PROVISIONING_KEY", true), // mints per-machine OpenRouter keys (`arena keys`)
+    ("OPENROUTER_WORKSPACE", false), // the OpenRouter workspace arena's keys live in (id or slug)
     ("ARENA_START_DATE", false),
     ("MACHINE_NAME_PREFIX", false),
     ("SHARED_SSH_KEY_PATH", false),
@@ -5672,6 +5673,16 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
     cfg_row(&mut out, cfg, &mut missing, "HF_TOKEN", false, true); // broadcast for gated repos (Llama 3 …)
     cfg_row(&mut out, cfg, &mut missing, "CLAUDE_CODE_OAUTH_TOKEN", false, true); // broadcast for Claude Code
     cfg_row(&mut out, cfg, &mut missing, "OPENROUTER_PROVISIONING_KEY", false, true); // mints runtime keys
+    // The workspace every key call is scoped to: a value that's neither an id nor a slug
+    // would fail each call, so it's a ✗ here.
+    match cfg.get("OPENROUTER_WORKSPACE").map(str::trim).filter(|w| !w.is_empty()).map(|w| (w, arena_core::openrouter::workspace_ref(w))) {
+        Some((w, Err(e))) => {
+            use std::fmt::Write as _;
+            let _ = writeln!(out, "  ✗ {:<28} {w} (neither a workspace id nor a slug)", "OPENROUTER_WORKSPACE");
+            note_invalid(&mut missing, &e);
+        }
+        _ => cfg_row(&mut out, cfg, &mut missing, "OPENROUTER_WORKSPACE", false, false),
+    }
     cfg_row(&mut out, cfg, &mut missing, "OPENROUTER_KEY_LIMIT", false, false); // USD cap per generated key
 
     // The balance sources as last seen (the state file only — no request): ⚠ rows are
@@ -9747,7 +9758,7 @@ impl<'a> KeyBook<'a> {
 /// The provisioning-API client, when `OPENROUTER_PROVISIONING_KEY` is set (else `None`:
 /// key names on OpenRouter are left alone, and `--revoke-key` is refused).
 fn openrouter_client(cfg: &Config) -> Option<arena_core::openrouter::OpenRouter> {
-    cfg.get("OPENROUTER_PROVISIONING_KEY").filter(|s| !s.is_empty()).map(arena_core::openrouter::OpenRouter::new)
+    arena_core::openrouter::OpenRouter::from_config(cfg)
 }
 
 /// `pods terminate`'s switches, passed through to [`handle_terminate`] as one value.
@@ -15748,11 +15759,44 @@ async fn handle_keys(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "set OPENROUTER_PROVISIONING_KEY first (openrouter.ai → Settings → \
-                 Provisioning API Keys), e.g. `arena config set OPENROUTER_PROVISIONING_KEY <key>`"
+                 Management Keys), e.g. `arena config set OPENROUTER_PROVISIONING_KEY <key>`"
             )
         })?;
-    let or = OpenRouter::new(prov_key);
+    let or = OpenRouter::new(prov_key).with_workspace(cfg.get("OPENROUTER_WORKSPACE"));
     keys_with(cmd, provider, remote, cfg, &or, std::path::Path::new(KEYS_DIR), yes).await
+}
+
+/// `keys list`'s table: each key's cap, what it spent in the cap's period, today and this
+/// month (UTC) and all told, then a total row. Pure, for testing.
+fn keys_table(keys: &[&arena_core::openrouter::KeyInfo]) -> String {
+    use arena_core::fleet::fmt_money;
+    use std::fmt::Write as _;
+    let money = |x: Option<f64>| x.map(|x| fmt_money("$", x)).unwrap_or_else(|| "-".into());
+    let mut out = format!("{:<28} {:>9} {:>9} {:>9} {:>9} {:>9}  HASH\n", "NAME", "LIMIT", "SPENT", "TODAY", "MONTH", "ALL");
+    let (mut today, mut month, mut all) = (0.0, 0.0, 0.0);
+    for k in keys {
+        let u = arena_core::openrouter::KeyUsage::of(k);
+        let lim = match (k.limit, u.reset.as_deref()) {
+            (Some(l), Some(r)) => format!("{}/{}", fmt_money("$", l), &r[..1]),
+            (l, _) => money(l),
+        };
+        let short = &k.hash[..k.hash.len().min(12)];
+        let dis = if k.disabled { "  (disabled)" } else { "" };
+        let _ = writeln!(
+            out,
+            "{:<28} {lim:>9} {:>9} {:>9} {:>9} {:>9}  {short}{dis}",
+            k.name.clone().unwrap_or_default(),
+            money(u.spent),
+            money(u.today),
+            money(u.month),
+            money(u.total),
+        );
+        today += u.today.unwrap_or(0.0);
+        month += u.month.unwrap_or(0.0);
+        all += u.total.unwrap_or(0.0);
+    }
+    let _ = writeln!(out, "{:<28} {:>9} {:>9} {:>9} {:>9} {:>9}", format!("total ({} keys)", keys.len()), "", "", fmt_money("$", today), fmt_money("$", month), fmt_money("$", all));
+    out
 }
 
 /// What a `keys` dry run says it would do with one machine's key.
@@ -15831,14 +15875,7 @@ async fn keys_with(
                 println!("(no {prefix}-* keys; {excluded} other key(s) hidden — use --all to show all)");
                 return Ok(());
             }
-            println!("{:<28} {:>9} {:>9}  HASH", "NAME", "LIMIT", "USAGE");
-            for k in &shown {
-                let lim = k.limit.map(|l| format!("${l:.2}")).unwrap_or_else(|| "-".into());
-                let used = k.usage.map(|u| format!("${u:.2}")).unwrap_or_else(|| "-".into());
-                let short = &k.hash[..k.hash.len().min(12)];
-                let dis = if k.disabled { "  (disabled)" } else { "" };
-                println!("{:<28} {lim:>9} {used:>9}  {short}{dis}", k.name.clone().unwrap_or_default());
-            }
+            print!("{}", keys_table(&shown));
             if !all && excluded > 0 {
                 println!("\n(excluded {excluded} non-{prefix} key(s) — use --all to show all)");
             }
@@ -17946,8 +17983,10 @@ ASK_CODEX_MODEL=-x
         let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
                     HETZNER_API_KEY=not-a-real-key\nGPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\n";
         // (what's added to the base, the keys the check must fail on)
-        let cases: [(&str, &[&str]); 32] = [
+        let cases: [(&str, &[&str]); 34] = [
             ("", &[]),
+            ("OPENROUTER_WORKSPACE=a/b", &["OPENROUTER_WORKSPACE"]),
+            ("OPENROUTER_WORKSPACE=arena-dev-test", &[]),
             ("ASK_AI=gpt", &["ASK_AI"]),
             ("ASK_CODEX_EFFORT=fast\nASK_CLAUDE_MODEL=a b", &["ASK_CLAUDE_MODEL", "ASK_CODEX_EFFORT"]),
             ("SHARED_SSH_KEY_PATH=/nonexistent/k\nGIT_SSH_KEY_LOCAL=/nonexistent/d", &[]),
@@ -18173,6 +18212,29 @@ ASK_CODEX_MODEL=-x
         assert!(!ok && line.contains("✗") && line.contains("must be a JSON object") && !line.contains("SECRET"), "{line}");
         let (line, ok) = create_extra_row(&Config::parse("CREATE_EXTRA_JSON=")).unwrap();
         assert!(ok && line.contains("(empty)"), "{line}");
+    }
+
+    #[test]
+    fn keys_table_shows_spend_per_period_and_a_total() {
+        use arena_core::openrouter::KeyInfo;
+        let a = KeyInfo {
+            hash: "0123456789abcdef".into(),
+            name: Some("devtest-apple".into()),
+            limit: Some(5.0),
+            limit_remaining: Some(3.77),
+            limit_reset: Some("monthly".into()),
+            usage: Some(4.56),
+            usage_daily: Some(0.2),
+            usage_monthly: Some(1.23),
+            ..Default::default()
+        };
+        let b = KeyInfo { hash: "ff".into(), name: Some("devtest-bloom".into()), disabled: true, usage: Some(0.5), ..Default::default() };
+        let t = super::keys_table(&[&a, &b]);
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(lines[0], "NAME                             LIMIT     SPENT     TODAY     MONTH       ALL  HASH");
+        assert_eq!(lines[1], "devtest-apple                  $5.00/m     $1.23     $0.20     $1.23     $4.56  0123456789ab");
+        assert_eq!(lines[2], "devtest-bloom                        -     $0.50         -         -     $0.50  ff  (disabled)");
+        assert_eq!(lines[3], "total (2 keys)                                       $0.20     $1.23     $5.06");
     }
 
     #[test]
@@ -26184,10 +26246,8 @@ mod lifecycle_tests {
                 .map(|(hash, name)| KeyInfo {
                     hash: hash.to_string(),
                     name: Some(name.to_string()),
-                    label: None,
-                    disabled: false,
                     limit: Some(5.0),
-                    usage: None,
+                    ..Default::default()
                 })
                 .collect();
             Self { keys: Mutex::new(keys), ..Default::default() }
@@ -26210,7 +26270,7 @@ mod lifecycle_tests {
         async fn create_key(&self, name: &str, limit: Option<f64>) -> Result<CreatedKey> {
             self.calls.lock().unwrap().push(format!("create {name}"));
             let hash = format!("h-new-{name}");
-            let info = KeyInfo { hash: hash.clone(), name: Some(name.into()), label: None, disabled: false, limit, usage: None };
+            let info = KeyInfo { hash: hash.clone(), name: Some(name.into()), limit, ..Default::default() };
             self.keys.lock().unwrap().push(info);
             Ok(CreatedKey { secret: format!("sk-new-{name}"), hash, name: name.into() })
         }

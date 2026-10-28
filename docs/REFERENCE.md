@@ -1130,8 +1130,27 @@ budget); `--dry-run` previews.
 MACHINE_NAME_LIST names with no pod yet; `--all` = every current pod).
 
 `rotate <targets|--all>` deletes + re-mints (leak recovery), `revoke` deletes only, `list` shows
-names/limits/usage for **this iteration's** `<prefix>-*` keys (noting how many others were hidden;
-`--all` shows every key on the account, disabled ones included — the listing walks every page).
+**this iteration's** `<prefix>-*` keys — each one's cap (`/d`, `/w`, `/m` when it starts over daily,
+weekly or monthly), what it spent in the cap's period, today, this month (UTC) and all told, and a
+total row — noting how many others were hidden (`--all` shows every key in the workspace, disabled
+ones included — the listing walks every page).
+
+**Workspaces.** OpenRouter's provisioning ("management") key is the whole account's — in an
+organization, every workspace's. Without `OPENROUTER_WORKSPACE`, keys are listed and created in the
+Default workspace, as before. Set `OPENROUTER_WORKSPACE` to a workspace's id or slug and every call is
+scoped to it: the listing asks for that workspace and drops keys that say otherwise, new keys go
+there, and a revoke, rotate or rename first reads the key and refuses one from another workspace. A
+workspace that can't be resolved fails the command; it never falls back to the Default one.
+`config check` crosses a value that's neither an id nor a slug.
+
+**In the dashboard.** With a provisioning key set, the TUI reads the keys and the account's credit
+on its details cadence (once a minute, `r` sooner; at most 5 s, the last answer kept if a read fails):
+an `AI$` column (each pod's key: spent/cap, yellow from 80%, red at the cap or disabled, `-` no key —
+shown from 122 columns), an `ai key:` line in the detail pane (the cap, what's left, today, week,
+month, all told), and the summary bar's `openrouter $422.09 left · AI today $3.20`. It leads the bar
+in yellow when the credit is less than the enabled keys' caps could still spend, or a key is at its
+cap, and in red when the credit is gone. The credit is the account's (an organization's whole),
+whatever the workspace.
 
 Keys are found by name, so no local hash bookkeeping; a machine that left the list but still has a
 key (or a CSV row) can still be targeted by name. Dry-runs show each key name and whether it exists.
