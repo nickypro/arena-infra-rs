@@ -240,6 +240,77 @@ pub enum Tone {
     Dim,
 }
 
+/// How often each endpoint's RTT is timed again. RTT barely moves, and each timing is a TCP
+/// connect closed before any SSH — what OpenSSH ≥ 9.8 counts against the source address
+/// (`arena_core::rtt`): once a minute keeps several dashboards on the proxy box far from it.
+pub const RTT_EVERY: Duration = Duration::from_secs(60);
+
+/// How long one timing may take (name lookup, then the connect): far above any real round
+/// trip (Singapore from Nuremberg: ~160 ms); past it the RTT is unknown.
+pub const RTT_WAIT: Duration = Duration::from_secs(1);
+
+/// An SSH endpoint, `(host, port)`.
+pub type Endpoint = (String, u16);
+
+/// The round-trip times from this box (where the proxy runs) to each pod's SSH endpoint,
+/// timed by the refresh ([`Rtts::due`]) and kept between rounds. By endpoint, not by name: a
+/// pod that moved (restart, replacement) is timed afresh, never shown its old host's RTT.
+#[derive(Debug, Clone, Default)]
+pub struct Rtts {
+    timed: HashMap<Endpoint, (std::time::Instant, Option<Duration>)>,
+}
+
+impl Rtts {
+    /// The endpoints of `pods` to time now: those never timed, or last timed [`RTT_EVERY`] or
+    /// more before `now` — each once, in the pods' order. A pod without an endpoint has none.
+    pub fn due(&self, pods: &[Pod], now: std::time::Instant) -> Vec<Endpoint> {
+        let mut out: Vec<Endpoint> = Vec::new();
+        for p in pods {
+            let (Some(ip), Some(port)) = (p.ssh_ip.as_deref().map(str::trim).filter(|ip| !ip.is_empty()), p.ssh_port) else { continue };
+            let ep = (ip.to_string(), port);
+            let fresh = self.timed.get(&ep).is_some_and(|(at, _)| now.saturating_duration_since(*at) < RTT_EVERY);
+            if !fresh && !out.contains(&ep) {
+                out.push(ep);
+            }
+        }
+        out
+    }
+
+    /// Record a round of timings (`None`: no answer within [`RTT_WAIT`]) at `now`, and forget
+    /// the endpoints no pod in `pods` has any more.
+    pub fn record(&mut self, timed: Vec<(Endpoint, Option<Duration>)>, pods: &[Pod], now: std::time::Instant) {
+        for (ep, d) in timed {
+            self.timed.insert(ep, (now, d));
+        }
+        self.timed.retain(|(ip, port), _| pods.iter().any(|p| p.ssh_ip.as_deref().map(str::trim) == Some(ip.as_str()) && p.ssh_port == Some(*port)));
+    }
+
+    /// `pod`'s RTT as last timed; `None`: no endpoint, not timed yet, or no answer.
+    pub fn of(&self, pod: &Pod) -> Option<Duration> {
+        let ep = (pod.ssh_ip.as_deref()?.trim().to_string(), pod.ssh_port?);
+        self.timed.get(&ep).and_then(|(_, d)| *d)
+    }
+}
+
+/// The RTT cell: `23ms` coloured by what a typist feels — green under 60 ms (Europe from
+/// Nuremberg, Iceland included), yellow under 120 (the US east coast: every keystroke
+/// noticeably late), red beyond (the US west, Asia); `-` dim when unknown. Pure.
+pub fn rtt_cell(rtt: Option<Duration>) -> (String, Tone) {
+    match rtt {
+        None => ("-".into(), Tone::Dim),
+        Some(d) => {
+            let ms = d.as_millis();
+            let tone = match ms {
+                0..60 => Tone::Good,
+                60..120 => Tone::Warn,
+                _ => Tone::Bad,
+            };
+            let label = if ms >= 1000 { ">1s".to_string() } else { format!("{ms}ms") };
+            (label, tone)
+        }
+    }
+}
+
 /// The HEALTH cell: `checking` while a deep check of this pod runs, else the last cached
 /// verdict and its age (`pass 12m`, `fail 2h` — `Status::label` + `snapshot::fmt_age`,
 /// as `arena snapshot` words them; the worst issue is left to the detail pane, it doesn't
@@ -1005,6 +1076,49 @@ impl Confirm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn on(name: &str, ip: Option<&str>, port: Option<u16>) -> Pod {
+        Pod { name: name.into(), ssh_ip: ip.map(String::from), ssh_port: port, ..Default::default() }
+    }
+
+    /// Each endpoint is timed once a round at most, then not again for RTT_EVERY; a pod
+    /// without one is never timed; a pod that moved is timed afresh, never shown its old host's.
+    #[test]
+    fn rtts_time_each_endpoint_once_a_minute_and_follow_a_move() {
+        let t0 = std::time::Instant::now();
+        let pods = vec![on("a", Some("1.2.3.4"), Some(22001)), on("b", Some("1.2.3.4"), Some(22001)), on("c", None, None), on("d", Some(" "), Some(22))];
+        let mut r = Rtts::default();
+        assert_eq!(r.due(&pods, t0), [("1.2.3.4".to_string(), 22001)], "shared endpoint once; none without one");
+        assert_eq!(r.of(&pods[0]), None, "not timed yet");
+        r.record(vec![(("1.2.3.4".into(), 22001), Some(Duration::from_millis(23)))], &pods, t0);
+        assert_eq!((r.of(&pods[0]), r.of(&pods[1]), r.of(&pods[2])), (Some(Duration::from_millis(23)), Some(Duration::from_millis(23)), None));
+        assert!(r.due(&pods, t0 + Duration::from_secs(59)).is_empty());
+        assert_eq!(r.due(&pods, t0 + RTT_EVERY).len(), 1);
+        // No answer: unknown, and timed again a minute later like any other.
+        r.record(vec![(("1.2.3.4".into(), 22001), None)], &pods, t0 + RTT_EVERY);
+        assert_eq!(r.of(&pods[0]), None);
+        // `a` restarted onto another port: timed now; its old endpoint is forgotten with `b`'s move too.
+        let moved = vec![on("a", Some("1.2.3.4"), Some(23810))];
+        assert_eq!(r.due(&moved, t0 + RTT_EVERY), [("1.2.3.4".to_string(), 23810)]);
+        r.record(Vec::new(), &moved, t0 + RTT_EVERY);
+        assert_eq!(r.of(&pods[0]), None);
+        assert!(r.timed.is_empty());
+    }
+
+    #[test]
+    fn rtt_cells_by_threshold() {
+        let ms = |n: u64| rtt_cell(Some(Duration::from_millis(n)));
+        assert_eq!(rtt_cell(None), ("-".to_string(), Tone::Dim));
+        assert_eq!(ms(0), ("0ms".to_string(), Tone::Good));
+        assert_eq!(ms(23), ("23ms".to_string(), Tone::Good));
+        assert_eq!(ms(59), ("59ms".to_string(), Tone::Good));
+        assert_eq!(ms(60), ("60ms".to_string(), Tone::Warn));
+        assert_eq!(ms(95), ("95ms".to_string(), Tone::Warn));
+        assert_eq!(ms(120), ("120ms".to_string(), Tone::Bad));
+        assert_eq!(ms(999), ("999ms".to_string(), Tone::Bad));
+        assert_eq!(ms(1500), (">1s".to_string(), Tone::Bad));
+        assert!(["999ms", ">1s", "23ms"].iter().all(|l| l.chars().count() <= 5), "fits the 5-wide column");
+    }
     use arena_core::metrics::{parse_nvidia_smi, PodMetrics};
 
     fn pod(name: &str, cost: Option<f64>) -> Pod {

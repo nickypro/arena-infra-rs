@@ -2441,8 +2441,16 @@ fn placement_request(
     keep_trying: bool,
 ) -> Result<(SpecOverrides, Option<(arena_core::placement::Request, PodSpec)>)> {
     let base = spec_with_overrides(cfg, &SpecOverrides { gpu: None, cloud: None, ..ov.clone() });
-    let req =
-        arena_core::placement::Request::from_flags(ov.gpu.as_deref(), ov.cloud.as_deref(), &base, max_price, order)?;
+    let req = arena_core::placement::Request::from_flags(ov.gpu.as_deref(), ov.cloud.as_deref(), &base, max_price, order)?
+        .with_near(arena_core::near::Near::from_config(cfg)?, provider_name, &base);
+    // Near the proxy turns one pool into two (there, then anywhere); `--keep-trying` waits on
+    // one, so it keeps today's single path — anywhere — and says so.
+    let single = arena_core::placement::Request { near: None, ..req.clone() };
+    if keep_trying && req.near.is_some() && single.is_single() {
+        let near = req.near.map(|n| n.region.label()).unwrap_or_default();
+        eprintln!("note: --keep-trying waits on one pool, so this run doesn't try {near} first (NEAR) — --retry-mins N keeps that");
+    }
+    let req = if keep_trying && single.is_single() { single } else { req };
     if req.is_single() {
         // Only a flag that was given is replaced (an absent one keeps "what config says",
         // exactly as today); the parsed GPU is already resolved, and resolving is idempotent.
@@ -2636,7 +2644,14 @@ async fn fetch_price_book(
         // would rent (verified-only unless VAST_ALLOW_UNVERIFIED).
         let vast = vast::VastProvider::from_config(cfg)?;
         let quotes = vast.quote(&req.gpus, &spec, PRICE_TIMEOUT).await;
-        return Ok(vast::price_book(&quotes, req.gpu_count, vast.verified_only()));
+        let (book, mut notes) = vast::price_book(&quotes, req.gpu_count, vast.verified_only());
+        // Near the proxy: the same search in the region's countries, for the near options' prices.
+        let Some(near) = req.near else { return Ok((book, notes)) };
+        let near_spec = PodSpec { region: Some(near.region), ..spec };
+        let near_quotes = vast.quote(&req.gpus, &near_spec, PRICE_TIMEOUT).await;
+        let (book, more) = vast::with_near_prices(book, &near_quotes, req.gpu_count, near.region);
+        notes.extend(more);
+        return Ok((book, notes));
     }
     if provider_name == "shadeform" {
         if cfg.get("SHADEFORM_API_KEY").is_none_or(str::is_empty) {
@@ -2696,7 +2711,22 @@ async fn plan_placement(
     base: &PodSpec,
 ) -> Result<arena_core::placement::OptionPlan> {
     req.validate_for(provider_name)?;
-    let (book, notes) = fetch_price_book(cfg, provider_name, req, base).await?;
+    // Near the proxy (`NEAR`) here too, so every caller of the shared planner — `offers`
+    // included — shows the order create/up would run. Idempotent for a request that has it.
+    let configured = arena_core::near::Near::from_config(cfg)?;
+    let req = &req.clone().with_near(configured, provider_name, base);
+    let (book, mut notes) = fetch_price_book(cfg, provider_name, req, base).await?;
+    if let (Some(n), None, "runpod") = (configured, req.near, provider_name) {
+        notes.push(if base.api_extra.as_ref().is_some_and(|x| x.contains_key("dataCenterIds")) {
+            format!("near ({}): off — CREATE_EXTRA_JSON / --api-json pins dataCenterIds itself", n.region.label())
+        } else {
+            format!(
+                "near ({}): RunPod's COMMUNITY cloud can't be placed by data centre (its hosts have none) — near \
+                 applies to SECURE options (--cloud community,secure; NEAR=any turns this note off)",
+                n.region.label()
+            )
+        });
+    }
     let mut plan = arena_core::placement::plan_options(req, provider_name, &book);
     plan.notes.splice(0..0, notes);
     Ok(plan)
@@ -2711,6 +2741,7 @@ fn single_request(spec: &PodSpec) -> arena_core::placement::Request {
         gpu_count: spec.gpu_count,
         max_price: None,
         order: Order::Listed,
+        near: None,
     }
 }
 
@@ -5396,6 +5427,41 @@ fn shadeform_rows(cfg: &Config) -> (Vec<String>, Option<arena_core::Error>) {
     (out, None)
 }
 
+/// `config check`'s rows for placement near the proxy (`NEAR`, `NEAR_MAX_EXTRA_PCT`): where
+/// create/up try first and how much more they may pay for it, defaults marked — and the
+/// refusal when either can't be read (its ✗ row says why). Pure, for testing.
+fn near_rows(cfg: &Config) -> (Vec<String>, Option<arena_core::Error>) {
+    use arena_core::near::{Near, EXTRA_KEY, NEAR_KEY};
+    let set = |k: &str| cfg.get(k).is_some();
+    let mark = |k: &str| if set(k) { ("✓", "") } else { ("·", " (default)") };
+    match Near::from_config(cfg) {
+        Err(e) => {
+            let why = match &e {
+                arena_core::Error::Config(m) => m.clone(),
+                other => other.to_string(),
+            };
+            let key = if why.starts_with(EXTRA_KEY) { EXTRA_KEY } else { NEAR_KEY };
+            (vec![format!("  ✗ {key:<28} {why}")], Some(e))
+        }
+        Ok(None) => (vec![format!("  ✓ {NEAR_KEY:<28} any — off: create/up try every option anywhere, cheapest first")], None),
+        Ok(Some(n)) => {
+            let (m, d) = mark(NEAR_KEY);
+            let (m2, d2) = mark(EXTRA_KEY);
+            let label = n.region.label();
+            (
+                vec![
+                    format!("  {m} {NEAR_KEY:<28} {label}{d} — create/up try {label} first (NEAR=any: anywhere)"),
+                    format!("  {m2} {EXTRA_KEY:<28} {}{d2} — when it costs at most this much more than the cheapest option", n.margin()),
+                    "      └ RunPod: SECURE pods only (COMMUNITY hosts have no data centre); Vast: offers by country — \
+                     `arena offers` shows the order"
+                        .to_string(),
+                ],
+                None,
+            )
+        }
+    }
+}
+
 /// The `HETZNER_*` keys that shape a Hetzner create ([`hetzner_rows`]).
 const HETZNER_OPTION_KEYS: [&str; 4] = ["HETZNER_SERVER_TYPE", "HETZNER_LOCATION", "HETZNER_IMAGE", "HETZNER_SSH_KEY"];
 
@@ -5594,6 +5660,12 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
         if !ok {
             missing.push("CREATE_EXTRA_JSON (must be one JSON object)".into());
         }
+    }
+    // Whatever the selected provider: `--provider runpod|vast` reads the same keys.
+    let (lines, bad) = near_rows(cfg);
+    lines.iter().for_each(|l| println!("{l}"));
+    if let Some(e) = bad {
+        note_invalid(&mut missing, &e);
     }
 
     println!("\nSSH (backup + dashboard metrics):");
@@ -11416,7 +11488,8 @@ async fn plan_replacement(
     if ov.cloud.is_some() {
         notes.retain(|n| !n.starts_with("tier "));
     }
-    let req = Request::from_flags(gpu.as_deref(), ov.cloud.as_deref(), &base, place.max_price, place.order)?;
+    let req = Request::from_flags(gpu.as_deref(), ov.cloud.as_deref(), &base, place.max_price, place.order)?
+        .with_near(arena_core::near::Near::from_config(cfg)?, owner.name(), &base);
     if owner.name() != "hetzner" && req.gpus.iter().any(|g| g.trim().is_empty()) {
         anyhow::bail!(
             "couldn't determine a GPU type for the replacement (the API doesn't report it and \
@@ -16612,6 +16685,7 @@ mod replacement_spec_tests {
             api_extra: None,
             avoid_machines: Vec::new(),
             server_type: None,
+            region: None,
         }
     }
 
@@ -16811,9 +16885,13 @@ mod replacement_spec_tests {
             .await
             .unwrap();
         assert_eq!((one.plan.options.len(), one.is_placement()), (1, false));
-        // A list on the cloud too: gpu × cloud, as `up` expands it.
+        // A list on the cloud too: gpu × cloud, as `up` expands it — with NEAR on (the
+        // default), SECURE tried in Europe just before anywhere (as listed); off, as before.
         let ov = SpecOverrides { gpu: Some("3070".into()), cloud: Some("community,secure".into()), ..Default::default() };
         let rep = plan_replacement(&cfg(""), &owner, &src(), &ov, &place).await.unwrap();
+        let tiers: Vec<(Option<&str>, bool)> = rep.plan.options.iter().map(|o| (o.cloud.as_deref(), o.near.is_some())).collect();
+        assert_eq!(tiers, [(Some("COMMUNITY"), false), (Some("SECURE"), true), (Some("SECURE"), false)]);
+        let rep = plan_replacement(&cfg("NEAR=any\n"), &owner, &src(), &ov, &place).await.unwrap();
         let tiers: Vec<Option<&str>> = rep.plan.options.iter().map(|o| o.cloud.as_deref()).collect();
         assert_eq!(tiers, [Some("COMMUNITY"), Some("SECURE")]);
     }
@@ -18501,8 +18579,13 @@ ASK_CODEX_MODEL=-x
         let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
                     HETZNER_API_KEY=not-a-real-key\nGPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\n";
         // (what's added to the base, the keys the check must fail on)
-        let cases: [(&str, &[&str]); 34] = [
+        let cases: [(&str, &[&str]); 38] = [
             ("", &[]),
+            // Placement near the proxy: off is valid, a region or margin it can't read isn't.
+            ("NEAR=any\nNEAR_MAX_EXTRA_PCT=junk", &[]),
+            ("NEAR=asia", &["NEAR"]),
+            ("NEAR_MAX_EXTRA_PCT=-5", &["NEAR_MAX_EXTRA_PCT"]),
+            ("NEAR=north-america\nNEAR_MAX_EXTRA_PCT=40%", &[]),
             ("OPENROUTER_WORKSPACE=a/b", &["OPENROUTER_WORKSPACE"]),
             ("OPENROUTER_WORKSPACE=arena-dev-test", &[]),
             ("ASK_AI=gpt", &["ASK_AI"]),
@@ -18716,6 +18799,34 @@ ASK_CODEX_MODEL=-x
         // What v1 can't express keeps its own wording.
         let (_, ok) = cuda_rows(&Config::parse("MIN_CUDA_VERSION=13.1"), true);
         assert_eq!(ok, Err("a host CUDA constraint RunPod v1 can express, or remove RUNPOD_API=v1 (v2 is the default)".to_string()));
+    }
+
+    /// `config check` says where create/up try first and how much more they may pay for it —
+    /// defaults marked, since prod's config has neither key — or that it's off.
+    #[test]
+    fn config_check_near_rows() {
+        use super::Config;
+        let rows = |text: &str| super::near_rows(&Config::parse(text));
+        let (lines, bad) = rows("");
+        assert!(bad.is_none());
+        assert_eq!(lines[0], "  · NEAR                         Europe (default) — create/up try Europe first (NEAR=any: anywhere)");
+        assert_eq!(
+            lines[1],
+            "  · NEAR_MAX_EXTRA_PCT           25% (default) — when it costs at most this much more than the cheapest option"
+        );
+        assert!(lines[2].contains("RunPod: SECURE pods only (COMMUNITY hosts have no data centre)"), "{lines:?}");
+        let (lines, _) = rows("NEAR=europe\nNEAR_MAX_EXTRA_PCT=12.5");
+        assert!(lines[0].starts_with("  ✓ NEAR                         Europe —") && lines[1].starts_with("  ✓ NEAR_MAX_EXTRA_PCT           12.5% —"), "{lines:?}");
+        let (lines, bad) = rows("NEAR=");
+        assert_eq!((lines.len(), bad.is_none()), (1, true));
+        assert!(lines[0].contains("any — off"), "{lines:?}");
+        let (lines, bad) = rows("NEAR_MAX_EXTRA_PCT=lots");
+        assert!(lines[0].starts_with("  ✗ NEAR_MAX_EXTRA_PCT ") && bad.is_some(), "{lines:?}");
+        let (lines, _) = rows("NEAR=mars");
+        assert!(lines[0].starts_with("  ✗ NEAR ") && lines[0].contains("expected europe, north-america, or any"), "{lines:?}");
+        // In the report whatever provider is selected.
+        let (report, _) = super::config_report(&Config::parse("NEAR=any"), "hetzner");
+        assert!(report.contains("NEAR                         any — off"), "{report}");
     }
 
     /// `config check` shows CREATE_EXTRA_JSON's keys (never its values) and fails a value
@@ -22107,10 +22218,21 @@ mod placement_cli_tests {
             placement_request(&cfg(), "runpod", o.clone(), cap, Order::Cheapest, kt).map(|(_, placing)| placing)
         };
         // Today's flags (or none) stay on the single-spec path — `--keep-trying` included.
-        for o in [ov(None, None), ov(Some("3090"), None), ov(Some("A4000"), Some("secure"))] {
+        // (Community: near the proxy has nothing to pin there.)
+        for o in [ov(None, None), ov(Some("3090"), None), ov(Some("A4000"), Some("community"))] {
             assert!(route(&o, None, false).unwrap().is_none(), "{o:?}");
             assert!(route(&o, None, true).unwrap().is_none(), "{o:?}");
         }
+        // One SECURE option with NEAR on (the default) is two to try — Europe, then anywhere —
+        // unless `--keep-trying`, which waits on one pool: the single path, anywhere.
+        let secure = ov(Some("A4000"), Some("secure"));
+        let (req, _) = route(&secure, None, false).unwrap().expect("placement");
+        assert_eq!(req.near.map(|n| n.region), Some(arena_core::near::Region::Europe));
+        assert!(route(&secure, None, true).unwrap().is_none());
+        let off = Config::parse("GPU_TYPE=\"NVIDIA RTX A4000\"\nCLOUD_TYPE=COMMUNITY\nNEAR=any\n");
+        assert!(placement_request(&off, "runpod", secure.clone(), None, Order::Cheapest, false).unwrap().1.is_none(), "NEAR=any");
+        let bad = Config::parse("NEAR=mars\n");
+        assert!(placement_request(&bad, "runpod", secure, None, Order::Cheapest, false).is_err(), "refused before anything");
         let (req, base) = route(&ov(Some("A4000,3090"), None), None, false).unwrap().unwrap();
         assert_eq!(req.gpus, ["NVIDIA RTX A4000", "NVIDIA GeForce RTX 3090"]);
         assert_eq!((base.gpu_type.as_str(), base.cloud_type.as_str()), ("NVIDIA RTX A4000", "COMMUNITY"));
@@ -22126,6 +22248,8 @@ mod placement_cli_tests {
     fn a_list_that_collapses_to_one_option_creates_that_option_not_the_raw_string() {
         // Review fix: duplicates / stray commas parse to one option, so the single path runs —
         // and it must create the parsed option, not the raw flag text as a GPU id / tier.
+        // (NEAR=any: near the proxy would make a SECURE option two — Europe, then anywhere.)
+        let cfg = || Config::parse("MACHINE_NAME_PREFIX=arena8\nGPU_TYPE=\"NVIDIA RTX A4000\"\nCLOUD_TYPE=COMMUNITY\nNEAR=any\n");
         let single = |gpu: Option<&str>, cloud: Option<&str>| {
             let o = SpecOverrides { gpu: gpu.map(String::from), cloud: cloud.map(String::from), ..Default::default() };
             let (ov, placing) = placement_request(&cfg(), "runpod", o, None, Order::Cheapest, false).unwrap();
@@ -22683,6 +22807,31 @@ mod placement_cli_tests {
         let vast = plan_placement(&cfg(), "vast", &req, &base).await.unwrap();
         assert!(vast.options.is_empty() && vast.dropped.len() == 2, "{vast:?}");
         assert_eq!(vast.notes[0], "no VAST_API_KEY — vast options are unpriced (--max-price can't check them)");
+    }
+
+    /// The shared planner applies NEAR itself, so `offers` (whatever shape it takes) shows the
+    /// order create/up run: SECURE options in Europe first; a community-only plan says why
+    /// nothing is near; `NEAR=any` plans as before.
+    #[tokio::test]
+    async fn the_shared_planner_puts_near_options_first() {
+        use arena_core::near::Region;
+        let base = spec_with_overrides(&cfg(), &SpecOverrides::default());
+        let req = |cloud: &str| arena_core::placement::Request::from_flags(Some("A4000"), Some(cloud), &base, None, Order::Cheapest).unwrap();
+        let plan = plan_placement(&cfg(), "runpod", &req("secure"), &base).await.unwrap();
+        let near: Vec<Option<Region>> = plan.options.iter().map(|o| o.near).collect();
+        assert_eq!(near, [Some(Region::Europe), None], "{plan:?}");
+        assert!(arena_core::placement::render_plan(&plan).contains("WHERE"));
+        let community = plan_placement(&cfg(), "runpod", &req("community"), &base).await.unwrap();
+        assert_eq!(community.options.len(), 1);
+        assert!(community.notes.iter().any(|n| n.starts_with("near (Europe): RunPod's COMMUNITY cloud can't be placed by data centre")), "{:?}", community.notes);
+        let off = Config::parse("MACHINE_NAME_PREFIX=arena8\nGPU_TYPE=\"NVIDIA RTX A4000\"\nNEAR=any\n");
+        let plain = plan_placement(&off, "runpod", &req("secure"), &base).await.unwrap();
+        assert!(plain.near.is_none() && plain.options.len() == 1 && !plain.notes.iter().any(|n| n.contains("near")), "{plain:?}");
+        // The operator's own data-centre pin: no near option, and a note says so.
+        let pinned = PodSpec { api_extra: serde_json::json!({"dataCenterIds": ["US-TX-3"]}).as_object().cloned(), ..base.clone() };
+        let own = plan_placement(&cfg(), "runpod", &req("secure"), &pinned).await.unwrap();
+        assert_eq!(own.options.len(), 1);
+        assert!(own.notes.iter().any(|n| n == "near (Europe): off — CREATE_EXTRA_JSON / --api-json pins dataCenterIds itself"), "{:?}", own.notes);
     }
 
     #[test]

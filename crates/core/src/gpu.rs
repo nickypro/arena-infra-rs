@@ -423,6 +423,7 @@ mod tests {
             community_price: comm,
             secure_price: sec,
             stock_status: stock.map(String::from),
+            data_centers: Vec::new(),
         }
     }
 

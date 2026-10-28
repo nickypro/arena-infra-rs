@@ -111,6 +111,11 @@ impl Config {
         "ASK_CLAUDE_EFFORT",
         "ASK_CODEX_MODEL",
         "ASK_CODEX_EFFORT",
+        // Placement near the proxy (`near::Near`): prod's config predates them, so `NEAR=any
+        // arena pods up …` (cheapest anywhere for one run) or a different `NEAR_MAX_EXTRA_PCT`
+        // must work without editing the shared config.
+        "NEAR",
+        "NEAR_MAX_EXTRA_PCT",
     ];
 
     /// Keys starting with this are **file-only**: the environment can neither override nor
