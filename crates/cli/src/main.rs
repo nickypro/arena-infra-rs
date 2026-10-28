@@ -129,16 +129,17 @@ const CHANGELOG: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../..
 
 /// What `update --skip-attestation` says before it downloads anything, on stderr.
 const SKIP_ATTESTATION_WARNING: &str = "\
-⚠ --skip-attestation: the new binaries' build provenance will NOT be checked.
-⚠ SHA256SUMS comes from the same release: it catches a corrupt download, not a forged release.
-⚠ Use this only when this build can't verify a genuine release (say, Sigstore rotated its keys
-⚠ after this build), and check the release first: gh attestation verify arena-<target> --repo nickypro/arena-infra-rs";
+⚠ --skip-attestation: the new binaries' build provenance will NOT be checked by this build.
+⚠ It installs only binaries whose SHA-256 is one you gave: they must be ones you verified with
+⚠ `gh attestation verify` (docs/REFERENCE.md), not digests someone sent you.";
 
 /// `arena update` ([`arena_core::update`]): check, then — unless `--check` — download, check
-/// (provenance too, unless `skip_attestation`) and swap in the release's binaries where this
-/// one is.
-async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: bool, yes: bool) -> Result<()> {
+/// (provenance, or the digests `skip_attestation` pins) and swap in the release's binaries
+/// where this one is.
+async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<String>, yes: bool) -> Result<()> {
     use arena_core::{attest, update as up};
+    // A malformed pin fails before anything is read.
+    let pins = (!skip_attestation.is_empty()).then(|| up::parse_pins(&skip_attestation)).transpose().map_err(|e| anyhow::anyhow!("update: {e}"))?;
     let installed = up::Version::parse(env!("ARENA_VERSION")).context("this build's version")?;
     let client = up::client();
     let found = up::check(&client, up::REPO_API, installed, CHANGELOG).await.map_err(|e| anyhow::anyhow!("update: {e}"))?;
@@ -159,21 +160,24 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: bool, 
     }
     let target = env!("ARENA_TARGET");
     let github = attest::GitHub { client: &client, api: up::REPO_API };
-    let provenance = if skip_attestation {
-        eprintln!("\n{SKIP_ATTESTATION_WARNING}");
-        up::Provenance::Skip
-    } else {
-        up::Provenance::Verify { source: &github, expected: attest::RELEASE }
+    let pinned = pins.is_some();
+    let provenance = match pins {
+        Some(pins) => {
+            eprintln!("\n{SKIP_ATTESTATION_WARNING}");
+            up::Provenance::Pinned(pins)
+        }
+        None => up::Provenance::Verify { source: &github, expected: attest::RELEASE },
     };
     println!("\nDownloading {} for {target} …", found.release.tag);
     let staged = up::fetch(&client, &found.release, target, dir, &provenance).await.map_err(|e| anyhow::anyhow!("update: {e}"))?;
-    if skip_attestation {
-        println!("Both binaries match the release's SHA256SUMS (provenance NOT checked), and the new arena runs here.");
-    } else {
-        println!("Both binaries match the release's SHA256SUMS and are attested (Sigstore, verified here):");
-        staged.proofs.iter().for_each(|(name, proof)| println!("  {name}: {proof}"));
-        println!("The new arena runs here.");
+    match &staged.proof {
+        Some(proof) => {
+            println!("Both binaries match the release's SHA256SUMS, and one build-provenance attestation names both");
+            println!("(Sigstore, verified here): {proof}.");
+        }
+        None => println!("Both binaries match the release's SHA256SUMS and the SHA-256s given (provenance NOT checked here)."),
     }
+    println!("The new arena runs here.");
     if dry_run {
         println!("--dry-run: nothing installed.");
         return Ok(());
@@ -181,7 +185,7 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: bool, 
     let what = format!(
         "Install arena {}{} in {} (the current arena and arena-tui become arena.prev and arena-tui.prev)?",
         found.release.version,
-        if skip_attestation { " (provenance NOT checked)" } else { "" },
+        if pinned { " (provenance NOT checked here)" } else { "" },
         dir.display()
     );
     if !confirm(yes, &what)? {
@@ -242,12 +246,13 @@ enum Cmd {
         /// Download and check the new binaries, attestations included, but install nothing
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
-        /// Do NOT check build provenance (SHA256SUMS still is): only for a release this build cannot verify
+        /// Do NOT check build provenance: install only binaries with these SHA-256s, checked by hand
         ///
-        /// Say, after Sigstore rotated its keys: check the release with `gh attestation verify`
-        /// first. See docs/REFERENCE.md.
-        #[arg(long)]
-        skip_attestation: bool,
+        /// arena's and arena-tui's, for this platform, as `gh attestation verify` checked them
+        /// elsewhere: only for a release this build can't verify (say, after Sigstore rotated
+        /// its keys). How: docs/REFERENCE.md.
+        #[arg(long, value_name = "SHA256,SHA256", value_delimiter = ',')]
+        skip_attestation: Vec<String>,
     },
     /// SSH proxy forwards: preview (plan) or write + reload (apply)
     #[command(subcommand, infer_subcommands = true)]

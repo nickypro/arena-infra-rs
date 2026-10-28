@@ -1,35 +1,41 @@
-//! Build provenance for `arena update`: that a release binary was built by this repository's
-//! release workflow from master, as its Sigstore attestation proves. `SHA256SUMS` alone can't
-//! say that: it comes from the same release, so whoever could forge a release could forge it
-//! too. It still catches a corrupt download, and `update` keeps checking it.
+//! Build provenance for `arena update`: that a release's binaries were built together by this
+//! repository's release workflow from master, as their Sigstore attestation proves.
+//! `SHA256SUMS` alone can't say that: it comes from the same release, so whoever could forge a
+//! release could forge it too. It still catches a corrupt download, and `update` keeps checking
+//! it.
 //!
 //! `.github/workflows/release.yml` attests the binaries it publishes
-//! (actions/attest-build-provenance): an in-toto statement naming each file and its SHA-256,
+//! (actions/attest-build-provenance): one in-toto statement naming every file and its SHA-256,
 //! with SLSA provenance as its predicate, in a DSSE envelope signed with a short-lived Fulcio
 //! certificate issued to the workflow run, and logged in Rekor. GitHub keeps the bundle, and
 //! anyone can read it without a login: `GET {REPO_API}/attestations/sha256:<hex>` ([`GitHub`]).
 //!
-//! [`verify`] accepts a binary only when one of its bundles passes all of:
+//! [`verify`] accepts an update's binaries only when one bundle passes all of:
 //! - Sigstore's own verification (the sigstore-verify crate, against the public-good trust
 //!   root compiled in): the certificate chains to Fulcio and carries a CT log's signed
 //!   timestamp, the envelope is signed by the certificate's key, the Rekor entry is in the log
-//!   (inclusion proof, signed checkpoint, signed entry timestamp) and was made while the
-//!   certificate was valid, and the certificate is the release workflow's
+//!   (inclusion proof, signed checkpoint, signed entry timestamp), describes this envelope and
+//!   was made while the certificate was valid, and the certificate is the release workflow's
 //!   ([`Expected::identity`]) from GitHub Actions' OIDC issuer;
 //! - the certificate's other claims ([`Expected::check_signer`]): this repository by GitHub's
-//!   id for it, a run on master, on a GitHub-hosted runner;
-//! - the statement ([`check_statement`]): in-toto, SLSA provenance, and naming this file with
-//!   this digest.
+//!   id for it, a `workflow_run` run on master, on a GitHub-hosted runner;
+//! - the statement ([`check_statement`]): in-toto, SLSA provenance, naming *each* binary with
+//!   its digest. One statement for both binaries binds them to one run: a genuine new `arena`
+//!   can't be paired with an older, also genuine, `arena-tui`.
+//!
+//! What the certificate can't say is which commit was built. A `workflow_run` run always runs
+//! master's `release.yml`, on `refs/heads/master`, whichever CI run started it, and records
+//! master's tip when it ran; it builds the commit that CI run tested. Which CI runs may start a
+//! release is the workflow's own gate (a CI run of a push to master: release.yml's `branches`
+//! and `if`), which only a change to master can widen. The new `arena --version` naming the
+//! release checks the rest.
 //!
 //! The trust root is compiled in, not fetched (TUF): no second HTTP stack, nothing written
-//! under root's home on prod, and it can be tested offline. The price: when Sigstore rotates
-//! a key, a build older than the rotation can't verify releases signed with the new key, and
-//! refuses them. `arena update --skip-attestation` is the way past that, once; the new build
-//! has the new root (Dependabot keeps sigstore-trust-root, where it comes from, current).
-//!
-//! What it doesn't prove: which commit was built. A `workflow_run` release runs on master and
-//! builds the commit CI passed, but its certificate records master's tip when it ran, which can
-//! be a later commit. The new `arena --version` naming the release is the check for that.
+//! under root's home on prod, and it can be tested offline. A test pins its hash, so a
+//! dependency bump can't change it unreviewed. The price: when Sigstore rotates a key, a build
+//! older than the rotation can't verify releases signed with the new key, and refuses them;
+//! `arena update --skip-attestation <sha256>,<sha256>` (digests checked by hand) is the way past
+//! that, once.
 
 use async_trait::async_trait;
 use reqwest::Client;
@@ -53,11 +59,13 @@ pub const SLSA_PROVENANCE: &str = "https://slsa.dev/provenance/v1";
 /// The DSSE payload type of an in-toto statement.
 const IN_TOTO_PAYLOAD: &str = "application/vnd.in-toto+json";
 
-/// At most this many of a digest's attestations are tried: a release attests a binary once,
-/// a rebuild of the same commit once more.
+/// At most this many bundles signed by the release workflow are verified: a release attests
+/// its binaries once (a re-run, once more). Bundles signed by anyone else are skipped unread,
+/// so a flood of them (from any workflow with `attestations: write`) can't push the genuine
+/// one out of reach, as long as it is on the API's first page ([`GitHub`] asks for 100).
 const MAX_BUNDLES: usize = 10;
 
-/// Who must have built a binary: a workflow file of a repository, run on a ref.
+/// Who must have built a binary: a workflow file of a repository, run on a ref by an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Expected {
     /// `owner/name`.
@@ -70,14 +78,20 @@ pub struct Expected {
     pub workflow: &'static str,
     /// The ref it ran on (a `workflow_run` run is always on the default branch).
     pub git_ref: &'static str,
+    /// The event that started the run. Pinned so that giving the workflow another trigger
+    /// (`workflow_dispatch`, `push`) is a deliberate change here too, not a silent widening of
+    /// what `update` accepts.
+    pub trigger: &'static str,
 }
 
-/// This repository's release workflow, on master: what `arena update` installs from.
+/// This repository's release workflow, on master, started by CI's success: what `arena update`
+/// installs from.
 pub const RELEASE: Expected = Expected {
     repo: "nickypro/arena-infra-rs",
     repo_id: "1368824951",
     workflow: ".github/workflows/release.yml",
     git_ref: "refs/heads/master",
+    trigger: "workflow_run",
 };
 
 impl Expected {
@@ -95,17 +109,17 @@ impl Expected {
     /// That a verified certificate's claims are this workflow's, or the first that isn't.
     /// Sigstore's verification already matched the identity and issuer; they are checked again
     /// here so this one function says everything that is pinned. Not pinned: the commit (see
-    /// the module doc) and the trigger (the ref check already keeps pull requests out, and the
-    /// workflow decides what may run it). Pure.
+    /// the module doc). Pure.
     pub fn check_signer(&self, s: &Signer) -> Result<()> {
         let runner = "github-hosted";
-        let checks: [(&str, &Option<String>, String); 7] = [
+        let checks: [(&str, &Option<String>, String); 8] = [
             ("identity", &s.identity, self.identity()),
             ("OIDC issuer", &s.issuer, ISSUER.to_string()),
             ("source repository", &s.repo_uri, self.repo_uri()),
             ("repository id", &s.repo_id, self.repo_id.to_string()),
             ("ref", &s.git_ref, self.git_ref.to_string()),
             ("workflow", &s.build_config, self.identity()),
+            ("trigger", &s.trigger, self.trigger.to_string()),
             ("runner", &s.runner, runner.to_string()),
         ];
         for (what, got, want) in checks {
@@ -130,12 +144,12 @@ pub struct Signer {
     /// The workflow that ran (`<repo>/<workflow>@<ref>`); the identity, unless that was a
     /// reusable workflow it called.
     pub build_config: Option<String>,
+    /// The event that started the run (`workflow_run`).
+    pub trigger: Option<String>,
     /// `github-hosted` or `self-hosted`.
     pub runner: Option<String>,
     /// Shown, not pinned: the commit master was at when the run started.
     pub commit: Option<String>,
-    /// Shown, not pinned: the event that started the run (`workflow_run`).
-    pub trigger: Option<String>,
     /// Shown, not pinned: the run's URL.
     pub run: Option<String>,
 }
@@ -153,15 +167,16 @@ impl Signer {
             repo_id: ci.source_repository_identifier.clone(),
             git_ref: ci.source_repository_ref.clone(),
             build_config: ci.build_config_uri.clone(),
+            trigger: ci.build_trigger.clone(),
             runner: ci.runner_environment.clone(),
             commit: ci.source_repository_digest.clone(),
-            trigger: ci.build_trigger.clone(),
             run: ci.run_invocation_uri.clone(),
         }
     }
 }
 
-/// A binary's verified provenance: who signed, and when Rekor logged it.
+/// Binaries' verified provenance: who signed the statement naming them, and when Rekor logged
+/// it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proof {
     pub signer: Signer,
@@ -169,7 +184,7 @@ pub struct Proof {
     pub logged: Option<String>,
 }
 
-/// `built by <identity>, run <url>, logged <time>`: what `update` says per binary.
+/// `built by <identity>, run <url>, logged <time>`: what `update` says.
 impl std::fmt::Display for Proof {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = &self.signer;
@@ -184,11 +199,11 @@ impl std::fmt::Display for Proof {
     }
 }
 
-/// That an in-toto statement (a DSSE payload) is SLSA provenance naming `name` with this
-/// SHA-256 (lowercase hex). The signature covers the statement, so a subject edited to match
-/// another file fails verification before this runs; this says what the signed statement is
-/// about. Pure.
-pub fn check_statement(payload: &[u8], name: &str, sha256: &str) -> Result<()> {
+/// That an in-toto statement (a DSSE payload) is SLSA provenance naming each of `files`
+/// (`(name, SHA-256 in hex)`) with that digest. The signature covers the statement, so a
+/// subject edited to match another file fails verification before this runs; this says what
+/// the signed statement is about. Pure.
+pub fn check_statement(payload: &[u8], files: &[(&str, &str)]) -> Result<()> {
     let v: Value = serde_json::from_slice(payload).map_err(|e| format!("its statement isn't JSON: {e}"))?;
     let field = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("missing");
     if field("_type") != STATEMENT_TYPE {
@@ -198,23 +213,24 @@ pub fn check_statement(payload: &[u8], name: &str, sha256: &str) -> Result<()> {
         return Err(format!("it attests {}, not SLSA provenance ({SLSA_PROVENANCE})", field("predicateType")));
     }
     let subjects = v.get("subject").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
-    let named = subjects.iter().find(|s| s.get("name").and_then(Value::as_str) == Some(name));
-    let Some(subject) = named else {
-        let names: Vec<&str> = subjects.iter().filter_map(|s| s.get("name").and_then(Value::as_str)).collect();
-        return Err(format!("it doesn't name {name} (it names: {})", if names.is_empty() { "nothing".into() } else { names.join(", ") }));
-    };
-    let digest = subject.pointer("/digest/sha256").and_then(Value::as_str).unwrap_or("missing");
-    if !digest.eq_ignore_ascii_case(sha256) {
-        return Err(format!("it names {name} with sha256 {digest}, not this file's {sha256}"));
+    for &(name, sha256) in files {
+        let named = subjects.iter().find(|s| s.get("name").and_then(Value::as_str) == Some(name));
+        let Some(subject) = named else {
+            let names: Vec<&str> = subjects.iter().filter_map(|s| s.get("name").and_then(Value::as_str)).collect();
+            return Err(format!("it doesn't name {name} (it names: {})", if names.is_empty() { "nothing".into() } else { names.join(", ") }));
+        };
+        let digest = subject.pointer("/digest/sha256").and_then(Value::as_str).unwrap_or("missing");
+        if !digest.eq_ignore_ascii_case(sha256) {
+            return Err(format!("it names {name} with sha256 {digest}, not this file's {sha256}"));
+        }
     }
     Ok(())
 }
 
-/// The bundles in the attestations API's answer (`{"attestations": [{"bundle": …}, …]}`),
-/// at most [`MAX_BUNDLES`]. Pure.
+/// The bundles in the attestations API's answer (`{"attestations": [{"bundle": …}, …]}`). Pure.
 pub fn bundles(v: &Value) -> Vec<&Value> {
     let list = v.get("attestations").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
-    list.iter().filter_map(|a| a.get("bundle").filter(|b| b.is_object())).take(MAX_BUNDLES).collect()
+    list.iter().filter_map(|a| a.get("bundle").filter(|b| b.is_object())).collect()
 }
 
 /// The verifier for Sigstore's public-good instance, from the trust root compiled in.
@@ -223,13 +239,29 @@ pub fn verifier() -> Result<Verifier> {
     Verifier::new(&root).map_err(|e| format!("the Sigstore trust root compiled in doesn't load: {e}"))
 }
 
-/// One bundle against `name` (sha256 `sha256`), all three checks of the module doc. Pure (no
-/// I/O: the trust root is the verifier's, the times are the bundle's).
-pub fn verify_bundle(verifier: &Verifier, bundle: &Value, expected: &Expected, name: &str, sha256: &str) -> Result<Proof> {
-    let bundle: Bundle = serde_json::from_value(bundle.clone()).map_err(|e| format!("it isn't a Sigstore bundle: {e}"))?;
-    let digest = Sha256Hash::from_hex(sha256).map_err(|e| format!("{sha256} isn't a SHA-256: {e}"))?;
+fn parse_bundle(v: &Value) -> Result<Bundle> {
+    serde_json::from_value(v.clone()).map_err(|e| format!("it isn't a Sigstore bundle: {e}"))
+}
+
+/// The SAN of a bundle's signing certificate, read without verifying anything: only to set
+/// aside, unverified, bundles that don't even claim to be the release workflow's.
+fn claimed_identity(bundle: &Bundle) -> Option<String> {
+    let cert = bundle.signing_certificate()?;
+    let info = sigstore_verify::crypto::parse_certificate_info(cert).ok()?;
+    info.identity.map(|i| i.as_str().to_string())
+}
+
+/// One bundle against `files` (`(name, SHA-256 in hex)`, at least one), all three checks of the
+/// module doc. Pure (no I/O: the trust root is the verifier's, the times are the bundle's).
+pub fn verify_bundle(verifier: &Verifier, bundle: &Value, expected: &Expected, files: &[(&str, &str)]) -> Result<Proof> {
+    verify_parsed(verifier, &parse_bundle(bundle)?, expected, files)
+}
+
+fn verify_parsed(verifier: &Verifier, bundle: &Bundle, expected: &Expected, files: &[(&str, &str)]) -> Result<Proof> {
+    let &(_, first) = files.first().ok_or("no file to verify")?;
+    let digest = Sha256Hash::from_hex(first).map_err(|e| format!("{first} isn't a SHA-256: {e}"))?;
     let policy = VerificationPolicy::new(IdentityMatcher::Uri(expected.identity()), ISSUER);
-    let r = verifier.verify(digest, &bundle, &policy).map_err(|e| format!("Sigstore verification failed: {e}"))?;
+    let r = verifier.verify(digest, bundle, &policy).map_err(|e| format!("Sigstore verification failed: {e}"))?;
     // The policy above skips nothing; this keeps it so should a default ever change.
     if !(r.certificate_verified() && r.sct_verified() && r.tlog_verified() && r.identity_policy_checked()) {
         return Err("Sigstore verification skipped a step (certificate, SCT, log or identity)".into());
@@ -243,7 +275,7 @@ pub fn verify_bundle(verifier: &Verifier, bundle: &Value, expected: &Expected, n
     if envelope.payload_type != IN_TOTO_PAYLOAD {
         return Err(format!("its payload is {}, not {IN_TOTO_PAYLOAD}", envelope.payload_type));
     }
-    check_statement(envelope.payload.as_bytes(), name, sha256)?;
+    check_statement(envelope.payload.as_bytes(), files)?;
     Ok(Proof { signer, logged: r.integrated_time().map(|t| t.to_string()) })
 }
 
@@ -256,7 +288,7 @@ pub trait Source: Send + Sync {
 }
 
 /// The repository's attestations on GitHub: `GET {api}/attestations/sha256:<hex>`, anonymous
-/// (public repository; the 60-an-hour limit `update` already lives within).
+/// (public repository; one request of the 60 an hour allowed without a login).
 pub struct GitHub<'a> {
     pub client: &'a Client,
     /// `https://api.github.com/repos/<owner>/<name>` (`update::REPO_API`).
@@ -266,7 +298,7 @@ pub struct GitHub<'a> {
 #[async_trait]
 impl Source for GitHub<'_> {
     async fn attestations(&self, sha256: &str) -> Result<Value> {
-        let url = format!("{}/attestations/sha256:{sha256}?predicate_type=provenance", self.api);
+        let url = format!("{}/attestations/sha256:{sha256}?predicate_type=provenance&per_page=100", self.api);
         let resp = self.client.get(&url).header("Accept", "application/vnd.github+json").send().await.map_err(|e| format!("GET {url}: {e}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -281,29 +313,49 @@ impl Source for GitHub<'_> {
     }
 }
 
-/// That the binary `name`, whose SHA-256 is `sha256`, was built as `expected` says: one of its
-/// attestations from `source` passes [`verify_bundle`]. Otherwise why not, each bundle's reason
-/// said; no attestation at all is a refusal too.
-pub async fn verify(source: &dyn Source, verifier: &Verifier, expected: &Expected, name: &str, sha256: &str) -> Result<Proof> {
-    let answer = source.attestations(sha256).await.map_err(|e| format!("{name}: couldn't read its build-provenance attestation ({e})"))?;
+/// That the binaries `files` (`(asset name, SHA-256 in hex)`, at least one) were built
+/// together as `expected` says: one attestation from `source` (looked up by the first file's
+/// digest) passes [`verify_bundle`] for all of them. Otherwise why not: each candidate's
+/// reason; no attestation at all, or none from the workflow, is a refusal too.
+pub async fn verify(source: &dyn Source, verifier: &Verifier, expected: &Expected, files: &[(&str, &str)]) -> Result<Proof> {
+    let &(first, sha256) = files.first().ok_or("no file to verify")?;
+    let names = files.iter().map(|f| f.0).collect::<Vec<_>>().join(" and ");
+    let answer = source.attestations(sha256).await.map_err(|e| format!("{first}: couldn't read its build-provenance attestation ({e})"))?;
     let found = bundles(&answer);
     if found.is_empty() {
         let listed = answer.get("attestations").and_then(Value::as_array).map_or(0, Vec::len);
         return Err(if listed == 0 {
-            format!("{name}: GitHub has no build-provenance attestation for it (sha256 {sha256})")
+            format!("{first}: GitHub has no build-provenance attestation for it (sha256 {sha256})")
         } else {
             // GitHub may one day send only `bundle_url` (snappy-compressed, as `gh` reads it).
-            format!("{name}: GitHub lists {listed} attestation(s) for it, none with its bundle inline (this build can't read `bundle_url`)")
+            format!("{first}: GitHub lists {listed} attestation(s) for it, none with its bundle inline (this build can't read `bundle_url`)")
         });
     }
+    let identity = expected.identity();
     let mut why = Vec::new();
-    for b in found {
-        match verify_bundle(verifier, b, expected, name, sha256) {
+    let mut others = Vec::new();
+    let mut candidates = Vec::new();
+    for v in found {
+        match parse_bundle(v) {
+            Err(e) => why.push(e),
+            Ok(b) => match claimed_identity(&b) {
+                Some(id) if id == identity => candidates.push(b),
+                id => others.push(id.unwrap_or_else(|| "no identity".into())),
+            },
+        }
+    }
+    for b in candidates.iter().take(MAX_BUNDLES) {
+        match verify_parsed(verifier, b, expected, files) {
             Ok(proof) => return Ok(proof),
             Err(e) => why.push(e),
         }
     }
-    Err(format!("{name}: its attestation doesn't prove it was built by {}: {}", expected.identity(), why.join("; ")))
+    if candidates.is_empty() {
+        others.sort();
+        others.dedup();
+        why.push(format!("none is signed by it (signed by: {})", others.join(", ")));
+    }
+    Err(format!("{names}: no attestation proves they were built by {identity}: {}", why.join("; ")))
 }
 
 #[cfg(test)]

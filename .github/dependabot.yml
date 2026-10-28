@@ -25,9 +25,16 @@ updates:
       - dependency-type: all
     open-pull-requests-limit: 5
     groups:
+      # Their own PR, never lost among other bumps: they decide what `arena update` trusts (the
+      # Sigstore trust root comes with sigstore-trust-root; a test pins its hash, so a changed
+      # root fails CI until it is compared with Sigstore's own and the hash updated).
+      sigstore:
+        applies-to: version-updates
+        patterns: ["sigstore-*"]
       cargo:
         applies-to: version-updates
         patterns: ["*"]
+        exclude-patterns: ["sigstore-*"]
         update-types: ["minor", "patch"]
       cargo-security:
         applies-to: security-updates

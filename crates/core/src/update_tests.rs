@@ -196,6 +196,12 @@ fn names_in(dir: &Path) -> Vec<String> {
     v
 }
 
+/// `--skip-attestation`'s pins for these bodies: the fake binaries can't be attested, so the
+/// tests of the rest of `fetch` pin their digests, as the escape hatch does.
+fn pinned(bodies: &[&str]) -> Provenance<'static> {
+    Provenance::Pinned(bodies.iter().map(|b| sha256_hex(b.as_bytes())).collect())
+}
+
 /// Download, check against SHA256SUMS, stage, run the new `arena --version`, then install:
 /// both in place, the old ones as `.prev`.
 #[tokio::test]
@@ -205,7 +211,8 @@ async fn an_update_installs_both_binaries_and_keeps_the_old_ones() {
     std::fs::write(dir.join("arena-tui"), "old tui").unwrap();
     let arena = fake_arena("2.0.261101.0900");
     let (srv, release) = release_server("new tui", &arena, ("new tui", &arena));
-    let staged = fetch(&test_client(), &release, T, &dir, &Provenance::Skip).await.unwrap();
+    let staged = fetch(&test_client(), &release, T, &dir, &pinned(&["new tui", &arena])).await.unwrap();
+    assert_eq!(staged.proof, None);
     assert_eq!(std::fs::read_to_string(dir.join("arena")).unwrap(), "old arena", "nothing in place before install");
     staged.install().unwrap();
     assert_eq!(std::fs::read_to_string(dir.join("arena")).unwrap(), arena);
@@ -231,23 +238,23 @@ async fn a_doubtful_download_installs_nothing() {
     };
 
     let (_srv, release) = release_server("tampered", &arena, ("new tui", &arena));
-    let e = fetch(&test_client(), &release, T, &dir, &Provenance::Skip).await.unwrap_err();
+    let e = fetch(&test_client(), &release, T, &dir, &pinned(&["tampered", &arena])).await.unwrap_err();
     assert!(e.contains("doesn't match SHA256SUMS"), "{e}");
     untouched(&dir);
 
     let other = fake_arena("2.0.250101.0000");
     let (_srv, release) = release_server("new tui", &other, ("new tui", &other));
-    let e = fetch(&test_client(), &release, T, &dir, &Provenance::Skip).await.unwrap_err();
+    let e = fetch(&test_client(), &release, T, &dir, &pinned(&["new tui", &other])).await.unwrap_err();
     assert!(e.contains("not arena 2.0.261101.0900"), "{e}");
     untouched(&dir);
 
     let (_srv, release) = release_server("new tui", &arena, ("new tui", &arena));
-    let e = fetch(&test_client(), &release, "riscv64gc-unknown-linux-gnu", &dir, &Provenance::Skip).await.unwrap_err();
+    let e = fetch(&test_client(), &release, "riscv64gc-unknown-linux-gnu", &dir, &pinned(&["new tui", &arena])).await.unwrap_err();
     assert!(e.contains("has no `arena-tui-riscv64gc-unknown-linux-gnu`"), "{e}");
     untouched(&dir);
 
     let (_srv, release) = release_server("new tui", &arena, ("new tui", &arena));
-    drop(fetch(&test_client(), &release, T, &dir, &Provenance::Skip).await.unwrap());
+    drop(fetch(&test_client(), &release, T, &dir, &pinned(&["new tui", &arena])).await.unwrap());
     untouched(&dir);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -263,26 +270,53 @@ impl attest::Source for Attested {
 }
 
 /// A download whose SHA256SUMS matches but whose provenance isn't proven is refused before
-/// it is written, let alone run (the fake `arena` would leave `ran` behind): with no
-/// attestation at all, and with a genuine one (the real release's) that doesn't name it.
+/// either binary is written, let alone run (the fake `arena` would leave `ran` behind): with
+/// no attestation at all, with a genuine one (the real release's) that doesn't name these
+/// bytes, and with digests pinned by `--skip-attestation` that aren't these.
 #[tokio::test]
 async fn an_unproven_download_is_never_written_or_run() {
     let dir = temp_dir("fetch-unproven");
     std::fs::write(dir.join("arena"), "old arena").unwrap();
     let arena = format!("#!/bin/sh\ntouch '{}'\necho 'arena 2.0.261101.0900 (0123456789)'\n", dir.join("ran").display());
     let real = serde_json::from_str::<Value>(include_str!("fixtures/attestation_v2.0.261028.1916.json")).unwrap();
-    let sources = [
-        (Attested(HashMap::new()), "arena-tui-x86_64-unknown-linux-gnu: GitHub has no build-provenance attestation for it"),
-        (Attested(HashMap::from([(sha256_hex(b"new tui"), real)])), "arena-tui-x86_64-unknown-linux-gnu: its attestation doesn't prove it was built by"),
+    let none = Attested(HashMap::new());
+    let genuine_elsewhere = Attested(HashMap::from([(sha256_hex(arena.as_bytes()), real)]));
+    let cases = [
+        (Provenance::Verify { source: &none, expected: attest::RELEASE }, format!("arena-{T}: GitHub has no build-provenance attestation for it")),
+        (Provenance::Verify { source: &genuine_elsewhere, expected: attest::RELEASE }, format!("arena-{T} and arena-tui-{T}: no attestation proves they were built by")),
+        (pinned(&["new tui", "another arena"]), format!("arena-{T}: its sha256 {} isn't one given to --skip-attestation", sha256_hex(arena.as_bytes()))),
+        (pinned(&["another tui", &arena]), format!("arena-tui-{T}: its sha256 {} isn't one given", sha256_hex(b"new tui"))),
     ];
-    for (source, said) in sources {
+    for (provenance, said) in cases {
         let (_srv, release) = release_server("new tui", &arena, ("new tui", &arena));
-        let provenance = Provenance::Verify { source: &source, expected: attest::RELEASE };
         let e = fetch(&test_client(), &release, T, &dir, &provenance).await.unwrap_err();
-        assert!(e.starts_with(said) && e.ends_with("— not installed"), "{e}");
+        assert!(e.starts_with(&said) && e.ends_with("— not installed"), "{said}: {e}");
         assert_eq!(names_in(&dir), ["arena"], "nothing staged, nothing run");
     }
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `--skip-attestation` takes exactly the two binaries' SHA-256s, in either order, any case.
+#[test]
+fn skip_attestation_takes_both_binaries_sha256s() {
+    let (a, b) = ("a".repeat(64), "B".repeat(64));
+    let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    assert_eq!(parse_pins(&v(&[&a, &b])), Ok(vec![a.clone(), "b".repeat(64)]));
+    assert_eq!(parse_pins(&v(&[&format!(" {b} "), &a])), Ok(vec!["b".repeat(64), a.clone()]));
+    for (bad, said) in [
+        (v(&[&a]), "both binaries"),
+        (v(&[&a, &a]), "both binaries"),
+        (v(&[&a, &b, &"c".repeat(64)]), "got 3"),
+        (v(&[&a, "yes"]), "not \"yes\""),
+        (v(&[&a, &"g".repeat(64)]), "64 hex digits"),
+        (v(&[&a, &"a".repeat(63)]), "64 hex digits"),
+    ] {
+        let e = parse_pins(&bad).unwrap_err();
+        assert!(e.starts_with("--skip-attestation takes ") && e.contains(said), "{bad:?}: {e}");
+    }
+    let pins = parse_pins(&v(&[&a, &b])).unwrap();
+    assert_eq!(check_pinned(&pins, "arena-x", &"b".repeat(64)), Ok(()));
+    assert!(check_pinned(&pins, "arena-x", &"c".repeat(64)).unwrap_err().starts_with("arena-x: its sha256 ccc"));
 }
 
 /// A directory the update can't write is refused with what to do, before anything changes.
@@ -299,7 +333,7 @@ async fn an_unwritable_install_dir_says_to_use_the_owner_or_sudo() {
     }
     let arena = fake_arena("2.0.261101.0900");
     let (_srv, release) = release_server("new tui", &arena, ("new tui", &arena));
-    let e = fetch(&test_client(), &release, T, &dir, &Provenance::Skip).await.unwrap_err();
+    let e = fetch(&test_client(), &release, T, &dir, &pinned(&["new tui", &arena])).await.unwrap_err();
     assert!(e.contains("can't write") && e.contains("sudo"), "{e}");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();

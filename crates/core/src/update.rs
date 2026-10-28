@@ -368,41 +368,74 @@ pub struct Staged {
     dir: PathBuf,
     /// `(name, staged path)`, `arena-tui` first so `arena` — the one cron runs — goes last.
     files: Vec<(&'static str, PathBuf)>,
-    /// Each binary's proven provenance, by asset name, in the same order (none when skipped).
-    pub proofs: Vec<(String, attest::Proof)>,
+    /// Both binaries' proven provenance (one statement names both); `None` when pinned instead.
+    pub proof: Option<attest::Proof>,
 }
 
-/// How [`fetch`] checks each binary's build provenance.
+/// How [`fetch`] checks the binaries' build provenance.
 pub enum Provenance<'a> {
-    /// Each binary must be proven built as `expected` says ([`attest::verify`]), from the
+    /// Both must be proven built together as `expected` says ([`attest::verify`]), from the
     /// attestations `source` has.
     Verify { source: &'a dyn attest::Source, expected: attest::Expected },
-    /// Not checked (`update --skip-attestation`): `SHA256SUMS` and the version check only.
-    Skip,
+    /// Not checked (`update --skip-attestation <sha256>,<sha256>`): each binary's SHA-256 must
+    /// be one of these instead ([`check_pinned`]), digests the operator verified by hand. So the
+    /// escape hatch installs, and runs, only the bytes someone checked, never whatever the
+    /// release serves at that moment.
+    Pinned(Vec<String>),
 }
 
-/// Download `release`'s binaries for `target` and its `SHA256SUMS`, check each against it and
-/// its provenance ([`Provenance`]), stage them in `dir` ([`stage`]) and check the new `arena`
-/// runs here ([`check_runs`]). A binary is written, let alone run, only once it is proven.
+/// `--skip-attestation`'s values: exactly two different SHA-256s (`arena`'s and `arena-tui`'s,
+/// either order), lowercased; or what's wrong with them. Pure.
+pub fn parse_pins(values: &[String]) -> std::result::Result<Vec<String>, String> {
+    let pins: Vec<String> = values.iter().map(|v| v.trim().to_ascii_lowercase()).collect();
+    if let Some(bad) = pins.iter().find(|p| p.len() != 64 || !p.chars().all(|c| c.is_ascii_hexdigit())) {
+        return Err(format!("--skip-attestation takes SHA-256s (64 hex digits), not {bad:?}"));
+    }
+    if pins.len() != 2 || pins[0] == pins[1] {
+        return Err(format!("--skip-attestation takes the SHA-256s of both binaries, arena's and arena-tui's, comma-separated (got {})", pins.len()));
+    }
+    Ok(pins)
+}
+
+/// That `name`'s SHA-256 `sha256` is one of the operator's `pins`, or why not. Pure.
+pub fn check_pinned(pins: &[String], name: &str, sha256: &str) -> std::result::Result<(), String> {
+    if pins.iter().any(|p| p == sha256) {
+        Ok(())
+    } else {
+        Err(format!("{name}: its sha256 {sha256} isn't one given to --skip-attestation ({})", pins.join(", ")))
+    }
+}
+
+/// Download `release`'s binaries for `target` and its `SHA256SUMS`, check both against it and
+/// their provenance ([`Provenance`]), stage them in `dir` ([`stage`]) and check the new `arena`
+/// runs here ([`check_runs`]). Neither is written, let alone run, until both are proven.
 /// Nothing in `dir` changes but the staged files, and those go again on any failure.
 pub async fn fetch(client: &Client, release: &Release, target: &str, dir: &Path, provenance: &Provenance<'_>) -> Result<Staged> {
-    let verifier = match provenance {
-        Provenance::Verify { .. } => Some(attest::verifier()?),
-        Provenance::Skip => None,
-    };
     let sums = parse_sums(&String::from_utf8_lossy(&download(client, release.asset("SHA256SUMS")?).await?));
-    let mut staged = Staged { dir: dir.to_path_buf(), files: Vec::new(), proofs: Vec::new() };
+    // (name, asset name, sha256, bytes), `arena-tui` first.
+    let mut got = Vec::new();
     for (name, asset_name) in binaries(target) {
-        let asset = release.asset(&asset_name)?;
-        let bytes = download(client, asset).await?;
+        let bytes = download(client, release.asset(&asset_name)?).await?;
         verify(&sums, &asset_name, &bytes)?;
-        if let (Provenance::Verify { source, expected }, Some(verifier)) = (provenance, &verifier) {
-            let proof = attest::verify(*source, verifier, expected, &asset_name, &sha256_hex(&bytes))
-                .await
-                .map_err(|e| format!("{e} — not installed"))?;
-            staged.proofs.push((asset_name.clone(), proof));
+        got.push((name, asset_name, sha256_hex(&bytes), bytes));
+    }
+    let proof = match provenance {
+        Provenance::Verify { source, expected } => {
+            // Looked up by `arena`'s digest: the binary cron runs.
+            let files: Vec<(&str, &str)> = got.iter().rev().map(|(_, a, sha, _)| (a.as_str(), sha.as_str())).collect();
+            let proven = attest::verify(*source, &attest::verifier()?, expected, &files).await;
+            Some(proven.map_err(|e| format!("{e} — not installed"))?)
         }
-        let path = stage(dir, name, &bytes)
+        Provenance::Pinned(pins) => {
+            for (_, asset_name, sha, _) in &got {
+                check_pinned(pins, asset_name, sha).map_err(|e| format!("{e} — not installed"))?;
+            }
+            None
+        }
+    };
+    let mut staged = Staged { dir: dir.to_path_buf(), files: Vec::new(), proof };
+    for (name, _, _, bytes) in &got {
+        let path = stage(dir, name, bytes)
             .map_err(|e| format!("can't write {} ({e}) — run the update as the binaries' owner, or with sudo", dir.display()))?;
         staged.files.push((name, path));
     }

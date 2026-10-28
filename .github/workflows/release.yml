@@ -7,14 +7,16 @@
 # always one version.
 #
 # Build provenance is attested (Sigstore, logged in Rekor), one statement naming every
-# `dist/arena-*` file, and `arena update` refuses a binary whose attestation doesn't verify
-# (crates/core/src/attest.rs; by hand: `gh attestation verify <file> --repo
-# nickypro/arena-infra-rs`). It pins who signed: this file, `.github/workflows/release.yml`, run
-# on `refs/heads/master` of this repository (by GitHub's id for it, 1368824951) on a
-# GitHub-hosted runner, and each asset's name as a subject. Renaming or moving this file,
-# releasing from another branch, a self-hosted runner, or a re-created repository makes every
-# existing build refuse the new releases (until `arena update --skip-attestation`): change
-# `attest::RELEASE` with it, and expect one manual update.
+# `dist/arena-*` file, and `arena update` refuses binaries that statement doesn't prove
+# (crates/core/src/attest.rs; by hand: docs/REFERENCE.md, `update`). It pins who signed: this
+# file, `.github/workflows/release.yml`, started by `workflow_run`, on `refs/heads/master` of this
+# repository (by GitHub's id for it, 1368824951), on a GitHub-hosted runner; and both binaries
+# named, with their digests, in the one statement. Renaming or moving this file, another
+# trigger, releasing from another branch, a self-hosted runner, attesting the binaries
+# separately, or a re-created repository makes every existing build refuse the new releases
+# (until `arena update --skip-attestation <sha256>,<sha256>`): change `attest::RELEASE` with it,
+# and expect one manual update. The `if:` below (a CI run of a push to master) is what decides
+# which code a release builds: the certificate can't tell.
 #
 # On a pull request that touches this file or build.rs, it builds and checks the binaries and
 # publishes nothing.

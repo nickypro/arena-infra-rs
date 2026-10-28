@@ -15,16 +15,18 @@ Before this file, see the merged pull requests on GitHub (master `a335316`, 2026
 earlier).
 
 ## 2026-10-28 · `arena update` checks who built the release
-- `arena update` (and `--dry-run`) now verifies each new binary's build-provenance attestation
-  before installing it: that it was built by this repository's `release.yml` from master, on
-  GitHub's runners, as Sigstore's signature, certificate and transparency log prove. It checks
-  this here, with no `gh` and no GitHub login, and says which workflow run built each binary.
-  Until now it only checked `SHA256SUMS`, which comes from the same release as the binaries.
-- A binary without an attestation, or with one that doesn't verify, is not installed, and the
-  message says why. `arena update --skip-attestation` installs without this check, with a loud
-  warning: only for a genuine release this build can't verify (after Sigstore changes its keys),
-  checked first with `gh attestation verify`. `--check` is unchanged.
-- An update makes 3 GitHub API requests instead of 1 (of the 60 an hour allowed without a login).
+- `arena update` (and `--dry-run`) now verifies the new binaries' build-provenance attestation
+  before installing or running them: that both were built together by this repository's
+  `release.yml` from master, on GitHub's runners, as Sigstore's signature, certificate and
+  transparency log prove. It checks this here, with no `gh` and no GitHub login, and says which
+  workflow run built them. Until now it only checked `SHA256SUMS`, which comes from the same
+  release as the binaries.
+- Binaries without an attestation, or with one that doesn't verify, are not installed, and the
+  message says why. `arena update --skip-attestation <sha256>,<sha256>` installs without this
+  check, only binaries with those two SHA-256s, with a loud warning: for a genuine release this
+  build can't verify (after Sigstore changes its keys), whose binaries you verified with
+  `gh attestation verify` elsewhere (docs/REFERENCE.md says how). `--check` is unchanged.
+- An update makes 2 GitHub API requests instead of 1 (of the 60 an hour allowed without a login).
 - Dependencies with security advisories updated (rustls, rustls-webpki, webpki-roots, tokio,
   anyhow).
 
