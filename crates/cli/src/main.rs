@@ -15670,37 +15670,61 @@ fn write_openrouter_key(dir: &std::path::Path, host: &str, secret: &str, prefix:
 }
 
 /// Write a file of secrets (the OpenRouter keys CSV) atomically, readable by its owner
-/// only. The text goes into a sibling temp file created 0600, is synced, then renamed over
-/// the target: a failure part-way leaves the old file whole (OpenRouter shows a key's secret
-/// once), and the target ends up 0600 whatever it was — an older file, created 0664 by a
-/// plain `fs::write`, is tightened. A symlink is followed (its target replaced, the link
-/// kept, even before the target exists); the old file's owner is kept where allowed.
+/// only. The text goes into a sibling temp file created 0600, is synced, renamed over the
+/// target, and the folder synced: a failure part-way leaves the old file whole, and a crash
+/// after success can't undo the rename (OpenRouter shows a key's secret once). The target
+/// ends up 0600 whatever it was — an older file, created 0664 by a plain `fs::write`, is
+/// tightened. A symlink is followed (its target replaced, the link kept, even before the
+/// target exists) only within its own folder: a link pointing elsewhere is refused, so a
+/// swapped link can't make a root run overwrite another file. The owner is kept: the old
+/// file's, or for a new file the folder's (a `sudo arena keys gen` leaves it the operator's).
+/// Needs a writable folder (the temp file lives there).
 fn write_secret_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let real = std::fs::canonicalize(path).unwrap_or_else(|_| match std::fs::read_link(path) {
-        Ok(t) => path.parent().unwrap_or(std::path::Path::new(".")).join(t),
-        Err(_) => path.to_path_buf(),
-    });
-    let (Some(dir), Some(name)) = (real.parent(), real.file_name()) else {
-        return Err(std::io::Error::other(format!("{}: no folder to write in", real.display())));
+    let folder = |p: &std::path::Path| match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
     };
-    let dir = if dir.as_os_str().is_empty() { std::path::Path::new(".") } else { dir };
+    let link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    let real = if link {
+        let t = std::fs::read_link(path)?;
+        let real = if t.is_absolute() { t } else { folder(path).join(t) };
+        let here = std::fs::canonicalize(folder(path))?;
+        let there = std::fs::canonicalize(folder(&real))?;
+        if here != there || real.file_name().is_none() {
+            return Err(std::io::Error::other(format!(
+                "{} links outside its folder ({}) — refused, not written",
+                path.display(),
+                real.display()
+            )));
+        }
+        real
+    } else {
+        path.to_path_buf()
+    };
+    let (dir, Some(name)) = (folder(&real), real.file_name()) else {
+        return Err(std::io::Error::other(format!("{}: no file name", real.display())));
+    };
     let tmp = dir.join(format!(".{}.arena-tmp-{}", name.to_string_lossy(), std::process::id()));
     let _ = std::fs::remove_file(&tmp); // this process's own leftover, if any
     let written = (|| {
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-        if let Ok(meta) = std::fs::metadata(&real) {
+        let owner = std::fs::metadata(&real).or_else(|_| std::fs::metadata(&dir)).ok();
+        if let Some(meta) = owner {
             let _ = std::os::unix::fs::fchown(&f, Some(meta.uid()), Some(meta.gid()));
         }
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
         std::fs::rename(&tmp, &real)
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return written;
     }
-    written
+    // Best effort: the rename is done; a folder that can't be synced doesn't undo it.
+    let _ = std::fs::File::open(&dir).and_then(|d| d.sync_all());
+    Ok(())
 }
 
 /// The first lines of a new cohort keys file.
@@ -18263,12 +18287,23 @@ ASK_CODEX_MODEL=-x
         super::write_secret_file(&link, "x\n").unwrap();
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!((std::fs::read_to_string(&file).unwrap().as_str(), mode(&file)), ("x\n", 0o600));
-        // A write that can't finish leaves the old file whole (here: no temp file allowed).
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // A write that can't finish leaves the old file whole (here, as root too: a folder
+        // sits where the temp file would go).
+        let blocker = dir.join(format!(".devtest_openrouter_keys.csv.arena-tmp-{}", std::process::id()));
+        std::fs::create_dir(&blocker).unwrap();
         assert!(super::write_secret_file(&link, "lost\n").is_err());
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "x\n");
+        std::fs::remove_dir(&blocker).unwrap();
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "no temp file left");
+        // A link out of its folder is refused, and its target untouched.
+        let outside = std::env::temp_dir().join(format!("arena-keys-outside-{}", std::process::id()));
+        std::fs::write(&outside, "keep\n").unwrap();
+        let bad = dir.join("bad_link.csv");
+        std::os::unix::fs::symlink(&outside, &bad).unwrap();
+        let e = super::write_secret_file(&bad, "x\n").unwrap_err().to_string();
+        assert!(e.contains("links outside its folder"), "{e}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep\n");
+        let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

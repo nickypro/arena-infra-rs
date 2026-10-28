@@ -2663,8 +2663,10 @@ fn columns_that_fit(w: usize, core: &[usize], optional: &[usize]) -> usize {
 /// A pod's `AI$` cell: its OpenRouter key's spend against the cap (`-`: no key named after
 /// it), yellow from 80% of the cap, red at the cap or disabled — grey when the last listing
 /// failed (`stale`: these are older numbers, the summary bar says `(n/a)`).
-fn ai_cell(k: Option<&KeyUsage>, stale: bool) -> Cell<'static> {
+fn ai_cell(k: Option<&KeyUsage>, stale: bool, read: bool) -> Cell<'static> {
     match k {
+        // Before the first read lands: not known yet, rather than "no key".
+        None if !read => Cell::from("…").style(tone_style(Tone::Dim)),
         None => Cell::from("-").style(tone_style(Tone::Dim)),
         Some(k) if stale => Cell::from(k.cell()).style(tone_style(Tone::Dim)),
         Some(k) => {
@@ -2897,7 +2899,11 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
             }
             if show_ai {
                 let ai = shared.ai.as_ref();
-                cells.push(ai_cell(ai.and_then(|a| a.keys.get(&p.name)), ai.is_some_and(|a| a.keys_error.is_some())));
+                cells.push(ai_cell(
+                    ai.and_then(|a| a.keys.get(&p.name)),
+                    ai.is_some_and(|a| a.keys_error.is_some()),
+                    ai.is_some_and(|a| a.read),
+                ));
             }
             if show_host {
                 // Host CPU% and RAM% (both coloured by load); exact RAM GB is in detail.
