@@ -896,10 +896,8 @@ mod tests {
         let opts = ProbeOpts { repo_path: Some(repo.display().to_string()), ..Default::default() };
         let shells: Vec<&str> = std::iter::once("sh").chain(crate::backup::tests::login_shells()).collect();
         for shell in shells {
-            let o = Command::new("sh").arg("-c").arg(format!("command -v {shell}")).output().unwrap();
-            let login = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            let mut c = Command::new(&login);
-            c.arg("-c").arg(crate::ssh::for_any_login_shell(&remote_command(&opts))).env("SHELL", &login).current_dir(&home);
+            let mut c = Command::new(shell);
+            c.arg("-c").arg(crate::ssh::for_any_login_shell(&remote_command(&opts))).current_dir(&home);
             isolated(&mut c);
             let o = c.output().unwrap();
             let m = parse_probe_output(&String::from_utf8_lossy(&o.stdout));

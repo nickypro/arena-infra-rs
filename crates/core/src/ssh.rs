@@ -150,8 +150,8 @@ impl SshTarget {
     /// A human-readable rendering of the full command, for dry-run output — shell-quoted
     /// ([`shell_word`]: the remote command always, any other argument that needs it), so what's
     /// printed pastes into a shell as exactly what would run. The remote command is shown as
-    /// written, not as [`for_any_login_shell`] sends it: the same, where the login shell is a
-    /// POSIX one.
+    /// written, not as [`for_any_login_shell`] sends it: the same where the login shell is a
+    /// POSIX one (not on a fish box).
     pub fn display_command(&self, remote_cmd: &str) -> String {
         let args: Vec<String> = self.ssh_args().iter().map(|a| shell_word(a)).collect();
         format!("ssh {} '{}'", args.join(" "), remote_cmd.replace('\'', "'\\''"))
@@ -207,37 +207,70 @@ pub fn shell_word(s: &str) -> String {
     }
 }
 
-/// What sshd is sent for `cmd` (a POSIX shell command), so that **any** login shell runs it:
-/// sshd hands the command to the user's login shell (`$SHELL -c '…'`), and arena's commands are
-/// written for bash, zsh and sh — under fish (live: a GPU box whose user's shell is fish), csh or
-/// nu, an `if …; then`, a `$?` or a `${x}` fails to parse, and `'\\'` reads differently.
+/// What sshd is sent for `cmd`, a command written for bash, zsh and sh, so that a box whose user's
+/// login shell is **fish** runs it too, and every POSIX login shell runs it exactly as before.
 ///
-/// The login shell is given one simple command that every shell reads alike — `exec /bin/sh -c
-/// '<dispatch>' arena '<cmd, encoded>'`: two single-quoted words holding no `'`, no newline, no
-/// `!`, and no backslash but one before three octal digits (fish reads `\\` and `\'` in single
-/// quotes; csh can't hold a newline in them). The dispatch decodes `cmd` with `printf` (a builtin
-/// everywhere: nothing to install) and runs it:
-/// - **under the login shell itself** when that is a POSIX one (bash, zsh, sh/dash, ksh, ash…):
-///   the dialect each command was written and tested for, exactly as before. The shell starts
-///   again for it, so its non-interactive startup (zsh's `~/.zshenv`, bash's `~/.bashrc` over
-///   ssh) runs twice; the environment it sets is the same;
-/// - else under **bash**, where there is one (arena's commands are bash- and zsh-tested), else
-///   `/bin/sh`.
+/// sshd hands the command to the login shell (`$SHELL -c '…'`). fish reads POSIX code its own way:
+/// an `if …; then`, a `$?` or a `${x}` doesn't parse (live: the dashboard's probe failed on a fish
+/// box), and in single quotes it reads `\\` and `\'` as escapes, so a command quoted for sh can
+/// arrive changed with no error at all (live: `'a\\b'` came out `a\b`).
 ///
-/// `exec` all the way: the command keeps the process sshd started, so a timeout's or a hangup's
-/// signal reaches it, and its exit status is the call's. Pure.
+/// A command of plain words (letters, digits, `_./:=,@+-`, spaces; no `=` in the first word) goes
+/// as it is: every shell reads it alike. Any other goes as one line both kinds of shell parse, each
+/// running only its own part. They disagree on whether a `\'` inside single quotes ends the quote,
+/// so a quoted stretch for one is code for the other:
+///
+/// ```text
+/// set -- __arena_p '<cmd>'; true '\''; <fish part>; true '; <POSIX part> #'
+/// ```
+/// - **Both** shells run `set`, which puts the command in `$2` (POSIX) or `$__arena_p` (fish). It is
+///   [`printf_format`]-encoded: no `'`, and no backslash but before three octal digits, so both
+///   read it alike.
+/// - **bash, zsh, sh, ksh and ash** run the POSIX part; the fish part is a quoted argument to
+///   `true`. The POSIX part decodes the command with `printf` (a builtin), clears the positional
+///   parameters and `eval`s it. That is in the login shell itself, which keeps its startup (run
+///   once), its dialect, its `$0`, its process and its exit status: the same as the command sent
+///   bare.
+/// - **fish** runs the fish part; the POSIX part is quoted, and for POSIX the `#` starts a comment.
+///   The fish part `exec`s `/bin/sh` to decode the command and `exec` bash with it, else
+///   `/bin/sh`. arena's commands are tested under bash, and the process, signals and exit status
+///   stay the command's own.
+///
+/// Other login shells (csh, nu) read neither part and fail, as they did before. A command whose
+/// line would pass Linux's 128 KiB limit for one argument goes as it is, as before. Pure.
 pub fn for_any_login_shell(cmd: &str) -> String {
-    format!("exec /bin/sh -c '{ANY_SHELL_DISPATCH}' arena '{}'", printf_format(cmd))
+    if plain_words(cmd) {
+        return cmd.to_string();
+    }
+    let line = format!("set -- __arena_p '{}'; true '\\''; {FISH_PART}; true '; {POSIX_PART} #'", printf_format(cmd));
+    if line.len() >= MAX_ARG_LEN {
+        return cmd.to_string();
+    }
+    line
 }
 
-/// The `sh` that [`for_any_login_shell`] runs: `$1` is the command as a `printf` format. In single
-/// quotes for every login shell, so: no `'`, no backslash, no newline, no `!`.
-const ANY_SHELL_DISPATCH: &str = concat!(
-    r#"c=$(printf "$1") || exit 127; s=${SHELL##*/}; "#,
-    r#"case $s in bash|zsh|sh|dash|ksh|ksh93|mksh|pdksh|ash|yash|posh) "#,
-    r#"[ -x "$SHELL" ] && exec "$SHELL" -c "$c" "$s";; esac; "#,
-    r#"command -v bash >/dev/null 2>&1 && exec bash -c "$c" bash; exec /bin/sh -c "$c" sh"#,
+/// Linux's limit on one argument (`MAX_ARG_STRLEN`, 128 KiB with its NUL): sshd passes the
+/// command to the login shell as one.
+const MAX_ARG_LEN: usize = 128 * 1024;
+
+/// The part of [`for_any_login_shell`]'s line that bash, zsh and sh run: decode `$2`, clear the
+/// positional parameters, unset its own variable and `eval` the command (the `printf x` keeps
+/// trailing newlines). It sits in fish's single quotes: no `'`, no backslash.
+const POSIX_PART: &str = r#"__arena_c=$(printf "$2"; printf x); set --; eval "unset __arena_c; ${__arena_c%x}""#;
+
+/// The part fish runs: `/bin/sh` decodes `$__arena_p` and `exec`s bash with it, else `/bin/sh`. It
+/// sits in POSIX's single quotes: no `'`. (fish's double quotes: `\$` and `\"` are `$` and `"`.)
+const FISH_PART: &str = concat!(
+    r#"exec /bin/sh -c "c=\$(printf \"\$1\"; printf x); c=\${c%x}; "#,
+    r#"command -v bash >/dev/null 2>&1 && exec bash -c \"\$c\" bash; exec /bin/sh -c \"\$c\" sh" arena $__arena_p"#,
 );
+
+/// Whether `cmd` is only plain words, which every shell reads alike: letters, digits,
+/// `_./:=,@+-` and spaces, and no `=` in the first word (`A=b cmd` is fish-3.1-only). Pure.
+fn plain_words(cmd: &str) -> bool {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_./:=,@+- ".contains(c);
+    !cmd.trim().is_empty() && cmd.chars().all(plain) && !cmd.split_whitespace().next().unwrap_or("").contains('=')
+}
 
 /// `s` as a `printf` format that prints `s`, readable by every shell inside single quotes: `%` is
 /// `%%`; a backslash, a single quote, `!`, a control character and a leading `-` (which
@@ -693,66 +726,139 @@ mod tests {
         assert_eq!(echo(&t.display_scp("/tmp/a b", "/root/x"), "scp"), t.scp_args("/tmp/a b", "/root/x"));
     }
     /// A command full of what shells read differently: quotes of both kinds, backslashes, `%`, `!`,
-    /// `$(…)`, `${x}`, `$?`, `if`/`for`, a here-doc, UTF-8, an exit status.
-    const GNARLY: &str = "printf '%s|' \"a b\" 'it'\\''s' \"back\\\\slash\" '100%' '!bang' \"$((6*7))\" '\\047'; echo
+    /// `$(…)`, `${x}`, `$?`, `$#`, `$0`, `if`/`for`, a here-doc, UTF-8, an exit status — and which
+    /// shell ran it.
+    const GNARLY: &str = "printf '%s|' \"a b\" 'it'\\''s' \"back\\\\slash\" '100%' '!bang' \"$((6*7))\" '\\047' \"n=$#\" \"z=${0##*/}\"; echo
 x=$(echo sub); if [ \"${x}\" = sub ]; then echo \"if-ok $?\"; fi
-for i in 1 2; do printf \"$i\"; done; echo
+for i in 1 2; do printf \"$i\"; done; echo; echo ${ZSH_VERSION:+zsh}${BASH_VERSION:+bash}.
 cat <<'EOF'
 here $HOME \\n %d
 EOF
-echo \"été ✓\" | tr -d '\\r'
-(exit 3)";
+echo \"été ✓\"
+(exit 3)
+";
 
-    /// What sshd is sent is one simple command any shell reads alike: two single-quoted words,
-    /// with no quote, newline or `!` inside, and a backslash only before three octal digits.
+    /// The line's parts keep to what the other kind of shell reads them in (fish's single quotes:
+    /// no `'`, no backslash; POSIX's: no `'`); the command is encoded with no quote, newline or `!`,
+    /// and a backslash only before three octal digits. Plain words go as they are, and so does a
+    /// command too big to encode within one argument.
     #[test]
-    fn what_sshd_is_sent_reads_alike_in_every_shell() {
+    fn the_line_keeps_each_part_inside_the_other_shells_quotes() {
+        assert!(!POSIX_PART.contains('\'') && !POSIX_PART.contains('\\'), "{POSIX_PART}");
+        assert!(!FISH_PART.contains('\''), "{FISH_PART}");
         let w = for_any_login_shell(GNARLY);
-        assert!(w.starts_with("exec /bin/sh -c '"), "{w}");
-        assert_eq!(w.matches('\'').count(), 4, "{w}");
-        assert!(!w.contains('\n') && !w.contains('!'), "{w}");
-        let b = w.as_bytes();
-        for (i, _) in w.match_indices('\\') {
-            assert!(b.len() > i + 3 && b[i + 1..i + 4].iter().all(|d| (b'0'..=b'7').contains(d)), "{}", &w[i..]);
+        let enc = printf_format(GNARLY);
+        assert_eq!(w, format!("set -- __arena_p '{enc}'; true '\\''; {FISH_PART}; true '; {POSIX_PART} #'"));
+        assert!(!enc.contains(['\'', '\n', '!']), "{enc}");
+        let b = enc.as_bytes();
+        for (i, _) in enc.match_indices('\\') {
+            assert!(b.len() > i + 3 && b[i + 1..i + 4].iter().all(|d| (b'0'..=b'7').contains(d)), "{}", &enc[i..]);
         }
         assert_eq!(printf_format("-x 5%"), "\\055x 5%%");
         assert_eq!(printf_format("a\\b'c!\n\t"), "a\\134b\\047c\\041\\012\\011");
         assert_eq!(printf_format("\\0471"), "\\1340471", "a digit after an escape stays a digit");
+        for plain in ["hostname", "nvidia-smi --query-gpu=name,memory.used --format=csv,noheader", "cat /root/.name"] {
+            assert_eq!(for_any_login_shell(plain), plain);
+        }
+        for not_plain in ["A=b env", "echo $HOME", "ls ~", "echo a; echo b", "", " "] {
+            assert_ne!(for_any_login_shell(not_plain), not_plain, "{not_plain:?}");
+        }
+        let huge = ":\n".repeat(30_000);
+        assert_eq!(for_any_login_shell(&huge), huge, "4× in encoding would pass 128 KiB: as it is");
+        // The biggest script arena sends fits, with room.
+        let resolve = for_any_login_shell(include_str!("resolve.sh"));
+        assert!(resolve.starts_with("set -- __arena_p") && resolve.len() < 100 * 1024, "{}", resolve.len());
     }
 
-    /// Run as sshd runs a command — `$SHELL -c <what's sent>`, `SHELL` the login shell — under
-    /// each login shell installed here: every one prints what bash prints for the command, and
-    /// exits as it does. A POSIX login shell runs it itself; fish (whose own reading fails) runs it
-    /// under bash. Not installed: said, not tried.
+    /// The paths of the shells installed here, by name; `busybox` as its `sh`. Not installed:
+    /// said, and left out.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn any_login_shell_runs_the_command_as_bash_and_zsh_do() {
-        use std::process::Command;
-        let path = |sh: &str| {
-            let o = Command::new("sh").arg("-c").arg(format!("command -v {sh}")).output().ok()?;
+    fn installed(names: &[&'static str]) -> Vec<(&'static str, Vec<String>)> {
+        let mut out = Vec::new();
+        for &sh in names {
+            let o = std::process::Command::new("sh").arg("-c").arg(format!("command -v {sh}")).output().unwrap();
             let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            (o.status.success() && p.starts_with('/')).then_some(p)
-        };
-        let sshd = |shell: &str, cmd: &str| {
-            let o = Command::new(shell).arg("-c").arg(cmd).env("SHELL", shell).env_remove("ZSH_VERSION").env_remove("BASH_VERSION").output().unwrap();
-            (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned())
-        };
-        let bash = path("bash").expect("bash");
-        let (want, code, err) = sshd(&bash, GNARLY);
-        assert_eq!(code, Some(3), "{err}");
-        assert_eq!(want, "a b|it's|back\\slash|100%|!bang|42|\\047|\nif-ok 0\n12\nhere $HOME \\n %d\nété ✓\n");
-        let which = "echo ${ZSH_VERSION:+zsh}${BASH_VERSION:+bash}.";
-        for (sh, runs_as) in [("bash", "bash."), ("zsh", "zsh."), ("dash", "."), ("fish", "bash.")] {
-            let Some(shell) = path(sh) else {
+            if !o.status.success() || !p.starts_with('/') {
                 eprintln!("{sh} isn't installed here: not tried as the login shell");
                 continue;
+            }
+            out.push((sh, if sh == "busybox" { vec![p, "sh".into()] } else { vec![p] }));
+        }
+        out
+    }
+
+    /// Run `cmd` as sshd runs it: `<login shell> -c <cmd>`, in an empty home, with `env`.
+    #[cfg(target_os = "linux")]
+    fn as_sshd(shell: &[String], home: &std::path::Path, cmd: &str, env: &[(&str, &str)]) -> (String, Option<i32>, String) {
+        let o = std::process::Command::new(&shell[0])
+            .args(&shell[1..])
+            .arg("-c")
+            .arg(cmd)
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", home)
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned())
+    }
+
+    /// Under each login shell installed here, sent as [`for_any_login_shell`] makes it: bash, zsh,
+    /// dash and busybox's sh run the command themselves — what each prints sent bare, its `$0`,
+    /// no positional parameters — and fish (which gets it wrong bare) runs it under bash. Exit 3
+    /// everywhere, nothing on stderr.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn each_login_shell_runs_the_command_as_sent_bare_and_fish_as_bash() {
+        let home = std::env::temp_dir().join(format!("arena-any-shell-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let shells = installed(&["bash", "zsh", "dash", "busybox", "fish"]);
+        assert!(shells.iter().any(|(n, _)| *n == "bash"), "bash is needed");
+        let bash = &shells.iter().find(|(n, _)| *n == "bash").unwrap().1;
+        for (name, shell) in &shells {
+            let bare = if *name == "fish" { as_sshd(bash, &home, GNARLY, &[]) } else { as_sshd(shell, &home, GNARLY, &[]) };
+            assert_eq!(bare.1, Some(3), "{name} bare: {}", bare.2);
+            let ran = match *name {
+                "fish" => "z=bash|".to_string(),
+                "busybox" => "z=sh|".to_string(),
+                n => format!("z={n}|"),
             };
-            let (out, code, err) = sshd(&shell, &for_any_login_shell(GNARLY));
-            assert_eq!((out.as_str(), code), (want.as_str(), Some(3)), "{sh}: {err}");
-            assert_eq!(sshd(&shell, &for_any_login_shell(which)).0, format!("{runs_as}\n"), "{sh}");
-            if sh == "fish" {
-                assert_ne!(sshd(&shell, GNARLY).0, want, "fish reads the command itself differently");
+            assert!(bare.0.contains(&ran) && bare.0.contains("n=0|") && bare.0.contains("a b|it's|back\\slash|100%|!bang|42|\\047|"), "{name}: {}", bare.0);
+            let sent = as_sshd(shell, &home, &for_any_login_shell(GNARLY), &[]);
+            assert_eq!(sent, (bare.0.clone(), Some(3), String::new()), "{name}");
+            if *name == "fish" {
+                assert_ne!(as_sshd(shell, &home, GNARLY, &[]).0, bare.0, "fish reads the bare command its own way");
             }
         }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The login shell's startup runs once, as for a bare command: bash's `~/.bashrc` (sourced over
+    /// ssh) and zsh's `~/.zshenv` each append one line, and a function `~/.bashrc` defines is there
+    /// for the command (review ai-review codex #1: an earlier design ran the shell again, and its
+    /// startup twice).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_login_shells_startup_runs_once() {
+        let home = std::env::temp_dir().join(format!("arena-rc-once-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let log = home.join("rc.log");
+        std::fs::write(home.join(".bashrc"), format!("echo bashrc >> {}\nrcfn() {{ echo fn-ok; }}\n", log.display())).unwrap();
+        std::fs::write(home.join(".zshenv"), format!("echo zshenv >> {}\n", log.display())).unwrap();
+        for (name, shell) in installed(&["bash", "zsh"]) {
+            let _ = std::fs::remove_file(&log);
+            let cmd = if name == "bash" { "rcfn; [ -n \"$BASH_VERSION\" ] && echo in-bash" } else { "echo \"in-${ZSH_NAME}\"" };
+            let (out, code, err) = as_sshd(&shell, &home, &for_any_login_shell(cmd), &[("SSH_CLIENT", "10.0.0.1 50000 22")]);
+            assert_eq!(code, Some(0), "{name}: {err}");
+            let rc = std::fs::read_to_string(&log).unwrap_or_default();
+            if name == "bash" {
+                assert_eq!(out, "fn-ok\nin-bash\n", "{err}");
+                // A bash built without SSH_SOURCE_BASHRC reads none: once or not at all, as bare.
+                assert!(rc == "bashrc\n" || rc.is_empty(), "{rc:?}");
+            } else {
+                assert_eq!((out.as_str(), rc.as_str()), ("in-zsh\n", "zshenv\n"), "{err}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

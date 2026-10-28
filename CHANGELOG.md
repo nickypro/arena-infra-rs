@@ -14,11 +14,11 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
-## 2026-10-28 · Commands over ssh work whatever the remote login shell (fish too)
-- Every command arena runs over ssh now reaches the remote shell as one simple command any
-  shell reads the same way. On a box whose user's login shell is fish (or another shell that
-  isn't POSIX), `pods run`, setup, deep checks, backups and the dashboard's probe now run under
-  bash; they used to fail to parse. Bash, zsh and sh login shells still run them themselves.
+## 2026-10-28 · Commands over ssh work on a box whose login shell is fish
+- On a box whose user's login shell is fish, arena's commands over ssh (`pods run`, setup, deep
+  checks, backups, the dashboard's probe) now run under bash. Before, the dashboard's probe failed
+  there (the row read `err`), and a command with a backslash in quotes could run changed.
+- Boxes with bash, zsh or sh as the login shell run every command exactly as before.
 
 ## 2026-10-28 · OpenRouter spend in the dashboard, and keys kept to one workspace
 - The dashboard shows each pod's OpenRouter key as `AI$` (spent/cap: yellow from 80%, red at the

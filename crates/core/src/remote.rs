@@ -101,7 +101,7 @@ impl SshRemote {
     /// The `ssh … user@host <cmd>` child for [`Remote::exec`] (exposed so the
     /// construction — argv, stdin, kill-on-drop — is unit-testable without a host). `cmd` goes
     /// as [`crate::ssh::for_any_login_shell`] makes it, so a pod or server whose user's login
-    /// shell is fish (or csh, or nu) runs it as bash or zsh would.
+    /// shell is fish runs it under bash, and a POSIX one runs it as it always did.
     pub fn exec_command(t: &SshTarget, cmd: &str) -> Command {
         let mut c = child("ssh");
         c.args(t.ssh_args()).arg(crate::ssh::for_any_login_shell(cmd));

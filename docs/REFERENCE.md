@@ -1214,18 +1214,19 @@ killed, and the remote command dies at its next write to the closed connection; 
 fails shows what it printed on stdout too, then `exit N: <stderr>` — never `Some(N)`; on a pod with
 no zsh yet — a bare VM before setup — it says so and to run `arena pods setup`) / the read-only
 torch-version health check (90s per pod; with no targets this cohort's pods, as `--deep`). Every dry run's `ssh`/`scp`/`rsync` line is shell-quoted,
-so it pastes as exactly what would run (globs like `'**/.git/**'` don't expand).
+so it pastes as exactly what would run (globs like `'**/.git/**'` don't expand) where the login
+shell is a POSIX one; the remote command is shown as written (see below).
 
-**Any login shell.** sshd hands a remote command to the user's login shell, and arena's commands
-are written for bash, zsh and sh. So every command arena runs over ssh (`pods run`, setup, the
-dashboard's probe, deep checks, backups…) goes as one simple command that every shell reads
-alike: `exec /bin/sh -c '<dispatch>' arena '<the command, printf-escaped>'`. Where the login shell
-is a POSIX one (bash, zsh, sh/dash, ksh, ash…) the command runs under it, as before; under fish,
-csh, nu or anything else it runs under bash (else `/bin/sh`). Exit status, signals and timeouts
-are the command's own (`exec` all the way). The one cost: the login shell starts twice, so its
-non-interactive startup (`~/.zshenv`, or `~/.bashrc` over ssh) runs twice. Dry runs show the
-command as written. Interactive ssh (`c` in the dashboard) is untouched: the operator's own
-shell. `rsync` and `scp` aren't affected (their own transports).
+**Login shells: POSIX ones and fish.** sshd hands a remote command to the user's login shell, and
+arena's commands are written for bash, zsh and sh. fish reads them its own way: an `if …; then`,
+`$?` or `${x}` doesn't parse, and a backslash in single quotes can change the command with no error.
+So every command arena runs over ssh (`pods run`, setup, the dashboard's probe, deep checks,
+backups…), unless it's plain words, goes as one line that both kinds of shell parse, each running
+only its own part (`ssh::for_any_login_shell`). bash, zsh, sh, ksh and ash run the command
+themselves: the same startup (once), dialect, `$0`, process and exit status as before. fish
+`exec`s it under bash, else `/bin/sh`. Other login shells (csh, nu) aren't supported, as before. A
+command too big to encode within one argument (128 KiB) goes as it is. Interactive ssh (`c` in
+the dashboard) is untouched, and `rsync` and `scp` use their own transports.
 
 ### Background jobs: `run --background`, `jobs`, `logs`
 
