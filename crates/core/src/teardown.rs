@@ -1309,7 +1309,7 @@ mod tests {
     }
 
     fn key(name: &str, disabled: bool, usage: Option<f64>, limit: Option<f64>) -> KeyInfo {
-        KeyInfo { hash: format!("h-{name}"), name: Some(name.into()), label: None, disabled, limit, usage }
+        KeyInfo { hash: format!("h-{name}"), name: Some(name.into()), disabled, limit, usage, ..Default::default() }
     }
 
     /// An `at -c` script as at 3.2 prints it: the environment (a key in it), the `cd` block,

@@ -5178,6 +5178,7 @@ const SETTABLE_KEYS: &[(&str, bool)] = &[
     ("HF_TOKEN", true), // broadcast to pods for gated repos (Llama 3 …)
     ("CLAUDE_CODE_OAUTH_TOKEN", true), // broadcast to pods for Claude Code access
     ("OPENROUTER_PROVISIONING_KEY", true), // mints per-machine OpenRouter keys (`arena keys`)
+    ("OPENROUTER_WORKSPACE", false), // the OpenRouter workspace arena's keys live in (id or slug)
     ("ARENA_START_DATE", false),
     ("MACHINE_NAME_PREFIX", false),
     ("SHARED_SSH_KEY_PATH", false),
@@ -5865,6 +5866,16 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
     cfg_row(&mut out, cfg, &mut missing, "HF_TOKEN", false, true); // broadcast for gated repos (Llama 3 …)
     cfg_row(&mut out, cfg, &mut missing, "CLAUDE_CODE_OAUTH_TOKEN", false, true); // broadcast for Claude Code
     cfg_row(&mut out, cfg, &mut missing, "OPENROUTER_PROVISIONING_KEY", false, true); // mints runtime keys
+    // The workspace every key call is scoped to: a value that's neither an id nor a slug
+    // would fail each call, so it's a ✗ here.
+    match cfg.get("OPENROUTER_WORKSPACE").map(str::trim).filter(|w| !w.is_empty()).map(|w| (w, arena_core::openrouter::workspace_ref(w))) {
+        Some((w, Err(e))) => {
+            use std::fmt::Write as _;
+            let _ = writeln!(out, "  ✗ {:<28} {w} (neither a workspace id nor a slug)", "OPENROUTER_WORKSPACE");
+            note_invalid(&mut missing, &e);
+        }
+        _ => cfg_row(&mut out, cfg, &mut missing, "OPENROUTER_WORKSPACE", false, false),
+    }
     cfg_row(&mut out, cfg, &mut missing, "OPENROUTER_KEY_LIMIT", false, false); // USD cap per generated key
 
     // The balance sources as last seen (the state file only — no request): ⚠ rows are
@@ -9945,16 +9956,16 @@ impl<'a> KeyBook<'a> {
     }
 
     /// Replace the CSV atomically, through the symlink (the per-cohort file it points at is
-    /// rewritten, the link kept), keeping its mode — it holds secrets.
+    /// rewritten, the link kept), owner-only: it holds secrets ([`write_secret_file`]).
     fn write_csv(&self, text: &str) -> std::io::Result<()> {
-        replace_file(&self.csv, text)
+        write_secret_file(&self.csv, text)
     }
 }
 
 /// The provisioning-API client, when `OPENROUTER_PROVISIONING_KEY` is set (else `None`:
 /// key names on OpenRouter are left alone, and `--revoke-key` is refused).
 fn openrouter_client(cfg: &Config) -> Option<arena_core::openrouter::OpenRouter> {
-    cfg.get("OPENROUTER_PROVISIONING_KEY").filter(|s| !s.is_empty()).map(arena_core::openrouter::OpenRouter::new)
+    arena_core::openrouter::OpenRouter::from_config(cfg)
 }
 
 /// `pods terminate`'s switches, passed through to [`handle_terminate`] as one value.
@@ -11234,14 +11245,8 @@ fn write_csv_move(book: &KeyBook<'_>, prefix: &str, dst: Option<&std::path::Path
     };
     // Resolved before the link moves: afterwards the link leads to the new file.
     let old_real = std::fs::canonicalize(&book.csv).unwrap_or_else(|_| book.csv.clone());
-    let created = !dst.exists();
-    if let Err(e) = replace_file(dst, text) {
+    if let Err(e) = write_secret_file(dst, text) {
         return Some(format!("couldn't write {} ({e}) — key rows NOT moved (still under the old names in {}): {moved}", dst.display(), old_real.display()));
-    }
-    if created {
-        if let Ok(meta) = std::fs::metadata(&old_real) {
-            let _ = std::fs::set_permissions(dst, meta.permissions());
-        }
     }
     let dir = book.csv.parent().unwrap_or(std::path::Path::new("."));
     if let Err(e) = ensure_cohort_keys_file(dir, prefix) {
@@ -11255,7 +11260,7 @@ fn write_csv_move(book: &KeyBook<'_>, prefix: &str, dst: Option<&std::path::Path
     let carried = if plan.carried.is_empty() { String::new() } else { format!(" (carried along: {})", plan.carried.join(", ")) };
     println!("[keys] moved into {} (this cohort's keys file): {moved}{carried}", dst.display());
     if let Some(src) = &plan.src {
-        if let Err(e) = replace_file(&old_real, src) {
+        if let Err(e) = write_secret_file(&old_real, src) {
             return Some(format!(
                 "moved the key rows into {}, but couldn't take them out of {} ({e}) — harmless (copy-keys reads the new file), tidy it by hand",
                 dst.display(),
@@ -15875,7 +15880,57 @@ fn write_openrouter_key(dir: &std::path::Path, host: &str, secret: &str, prefix:
         existing = cohort_keys_header(prefix);
     }
     let updated = arena_core::apikeys::upsert_csv(&existing, host, secret);
-    std::fs::write(&target, updated).with_context(|| format!("writing {}", target.display()))?;
+    write_secret_file(&target, &updated).with_context(|| format!("writing {}", target.display()))?;
+    Ok(())
+}
+
+/// Write a file of secrets (the OpenRouter keys CSV) atomically, readable by its owner
+/// only. The text goes into a sibling temp file created 0600, is synced, renamed over the
+/// target, and the folder synced: a failure part-way leaves the old file whole, and a crash
+/// after success can't undo the rename (OpenRouter shows a key's secret once). The target
+/// ends up 0600 whatever it was — an older file, created 0664 by a plain `fs::write`, is
+/// tightened. A symlink is followed as `replace_file` follows one (its target replaced, the
+/// link kept, even before the target exists): arena's own link points inside its folder,
+/// an operator's may point elsewhere, and refusing it would lose keys already minted
+/// (review round 3). Whoever can write the keys folder can read the keys anyway. The owner
+/// is kept: the old file's, or for a new file the folder's (a `sudo arena keys gen` leaves
+/// it the operator's). Needs a writable folder (the temp file lives there).
+fn write_secret_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let folder = |p: &std::path::Path| match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| match std::fs::read_link(path) {
+        Ok(t) if t.is_absolute() => t,
+        Ok(t) => folder(path).join(t),
+        Err(_) => path.to_path_buf(),
+    });
+    let (dir, Some(name)) = (folder(&real), real.file_name()) else {
+        return Err(std::io::Error::other(format!("{}: no file name", real.display())));
+    };
+    let tmp = dir.join(format!(".{}.arena-tmp-{}", name.to_string_lossy(), std::process::id()));
+    let _ = std::fs::remove_file(&tmp); // this process's own leftover, if any
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        let owner = std::fs::metadata(&real).or_else(|_| std::fs::metadata(&dir)).ok();
+        if let Some(meta) = owner {
+            let _ = std::os::unix::fs::fchown(&f, Some(meta.uid()), Some(meta.gid()));
+        }
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &real)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return written;
+    }
+    // The rename is done (the new text is what's there); a folder that can't be synced is
+    // said, not returned as a failure — a caller would take that for "not written".
+    if let Err(e) = std::fs::File::open(&dir).and_then(|d| d.sync_all()) {
+        eprintln!("warning: wrote {}, but its folder couldn't be synced ({e}): a crash now could undo it", real.display());
+    }
     Ok(())
 }
 
@@ -15963,11 +16018,44 @@ async fn handle_keys(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "set OPENROUTER_PROVISIONING_KEY first (openrouter.ai → Settings → \
-                 Provisioning API Keys), e.g. `arena config set OPENROUTER_PROVISIONING_KEY <key>`"
+                 Management Keys), e.g. `arena config set OPENROUTER_PROVISIONING_KEY <key>`"
             )
         })?;
-    let or = OpenRouter::new(prov_key);
+    let or = OpenRouter::new(prov_key).with_workspace(cfg.get("OPENROUTER_WORKSPACE"));
     keys_with(cmd, provider, remote, cfg, &or, std::path::Path::new(KEYS_DIR), yes).await
+}
+
+/// `keys list`'s table: each key's cap, what it spent in the cap's period, today and this
+/// month (UTC) and all told, then a total row. Pure, for testing.
+fn keys_table(keys: &[&arena_core::openrouter::KeyInfo]) -> String {
+    use arena_core::fleet::fmt_money;
+    use std::fmt::Write as _;
+    let money = |x: Option<f64>| x.map(|x| fmt_money("$", x)).unwrap_or_else(|| "-".into());
+    let mut out = format!("{:<28} {:>9} {:>9} {:>9} {:>9} {:>9}  HASH\n", "NAME", "LIMIT", "SPENT", "TODAY", "MONTH", "ALL");
+    let (mut today, mut month, mut all) = (0.0, 0.0, 0.0);
+    for k in keys {
+        let u = arena_core::openrouter::KeyUsage::of(k);
+        let lim = match (k.limit, u.reset.as_deref()) {
+            (Some(l), Some(r)) => format!("{}/{}", fmt_money("$", l), &r[..1]),
+            (l, _) => money(l),
+        };
+        let short = &k.hash[..k.hash.len().min(12)];
+        let dis = if k.disabled { "  (disabled)" } else { "" };
+        let _ = writeln!(
+            out,
+            "{:<28} {lim:>9} {:>9} {:>9} {:>9} {:>9}  {short}{dis}",
+            k.name.clone().unwrap_or_default(),
+            money(u.spent),
+            money(u.today),
+            money(u.month),
+            money(u.total),
+        );
+        today += u.today.unwrap_or(0.0);
+        month += u.month.unwrap_or(0.0);
+        all += u.total.unwrap_or(0.0);
+    }
+    let _ = writeln!(out, "{:<28} {:>9} {:>9} {:>9} {:>9} {:>9}", format!("total ({} keys)", keys.len()), "", "", fmt_money("$", today), fmt_money("$", month), fmt_money("$", all));
+    out
 }
 
 /// What a `keys` dry run says it would do with one machine's key.
@@ -16046,14 +16134,7 @@ async fn keys_with(
                 println!("(no {prefix}-* keys; {excluded} other key(s) hidden — use --all to show all)");
                 return Ok(());
             }
-            println!("{:<28} {:>9} {:>9}  HASH", "NAME", "LIMIT", "USAGE");
-            for k in &shown {
-                let lim = k.limit.map(|l| format!("${l:.2}")).unwrap_or_else(|| "-".into());
-                let used = k.usage.map(|u| format!("${u:.2}")).unwrap_or_else(|| "-".into());
-                let short = &k.hash[..k.hash.len().min(12)];
-                let dis = if k.disabled { "  (disabled)" } else { "" };
-                println!("{:<28} {lim:>9} {used:>9}  {short}{dis}", k.name.clone().unwrap_or_default());
-            }
+            print!("{}", keys_table(&shown));
             if !all && excluded > 0 {
                 println!("\n(excluded {excluded} non-{prefix} key(s) — use --all to show all)");
             }
@@ -18539,8 +18620,10 @@ ASK_CODEX_MODEL=-x
         let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
                     HETZNER_API_KEY=not-a-real-key\nGPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\n";
         // (what's added to the base, the keys the check must fail on)
-        let cases: [(&str, &[&str]); 32] = [
+        let cases: [(&str, &[&str]); 34] = [
             ("", &[]),
+            ("OPENROUTER_WORKSPACE=a/b", &["OPENROUTER_WORKSPACE"]),
+            ("OPENROUTER_WORKSPACE=arena-dev-test", &[]),
             ("ASK_AI=gpt", &["ASK_AI"]),
             ("ASK_CODEX_EFFORT=fast\nASK_CLAUDE_MODEL=a b", &["ASK_CLAUDE_MODEL", "ASK_CODEX_EFFORT"]),
             ("SHARED_SSH_KEY_PATH=/nonexistent/k\nGIT_SSH_KEY_LOCAL=/nonexistent/d", &[]),
@@ -18766,6 +18849,72 @@ ASK_CODEX_MODEL=-x
         assert!(!ok && line.contains("✗") && line.contains("must be a JSON object") && !line.contains("SECRET"), "{line}");
         let (line, ok) = create_extra_row(&Config::parse("CREATE_EXTRA_JSON=")).unwrap();
         assert!(ok && line.contains("(empty)"), "{line}");
+    }
+
+    #[test]
+    fn minted_keys_are_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("arena-keys-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        super::write_openrouter_key(&dir, "devtest-apple", "sk-or-v1-A", "devtest").unwrap();
+        let file = dir.join("devtest_openrouter_keys.csv");
+        let link = dir.join("openrouter_api_keys.csv");
+        assert_eq!(mode(&file), 0o600);
+        // An older file at 0664 is tightened on its next write.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o664)).unwrap();
+        super::write_openrouter_key(&dir, "devtest-bloom", "sk-or-v1-B", "devtest").unwrap();
+        assert_eq!(mode(&file), 0o600);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("devtest-apple,sk-or-v1-A") && text.contains("devtest-bloom,sk-or-v1-B"), "{text}");
+        // Through the link: the file is replaced, the link kept.
+        super::write_secret_file(&link, "x\n").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!((std::fs::read_to_string(&file).unwrap().as_str(), mode(&file)), ("x\n", 0o600));
+        // A write that can't finish leaves the old file whole (here, as root too: a folder
+        // sits where the temp file would go).
+        let blocker = dir.join(format!(".devtest_openrouter_keys.csv.arena-tmp-{}", std::process::id()));
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(super::write_secret_file(&link, "lost\n").is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "x\n");
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "no temp file left");
+        // A link to another folder (an operator's secrets folder) is followed, as before.
+        let elsewhere = std::env::temp_dir().join(format!("arena-keys-elsewhere-{}", std::process::id()));
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let target = elsewhere.join("keys.csv");
+        std::fs::write(&target, "old\n").unwrap();
+        let away = dir.join("away_link.csv");
+        std::os::unix::fs::symlink(&target, &away).unwrap();
+        super::write_secret_file(&away, "new\n").unwrap();
+        assert!(std::fs::symlink_metadata(&away).unwrap().file_type().is_symlink());
+        assert_eq!((std::fs::read_to_string(&target).unwrap().as_str(), mode(&target)), ("new\n", 0o600));
+        let _ = std::fs::remove_dir_all(&elsewhere);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keys_table_shows_spend_per_period_and_a_total() {
+        use arena_core::openrouter::KeyInfo;
+        let a = KeyInfo {
+            hash: "0123456789abcdef".into(),
+            name: Some("devtest-apple".into()),
+            limit: Some(5.0),
+            limit_remaining: Some(3.77),
+            limit_reset: Some("monthly".into()),
+            usage: Some(4.56),
+            usage_daily: Some(0.2),
+            usage_monthly: Some(1.23),
+            ..Default::default()
+        };
+        let b = KeyInfo { hash: "ff".into(), name: Some("devtest-bloom".into()), disabled: true, usage: Some(0.5), ..Default::default() };
+        let t = super::keys_table(&[&a, &b]);
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(lines[0], "NAME                             LIMIT     SPENT     TODAY     MONTH       ALL  HASH");
+        assert_eq!(lines[1], "devtest-apple                  $5.00/m     $1.23     $0.20     $1.23     $4.56  0123456789ab");
+        assert_eq!(lines[2], "devtest-bloom                        -     $0.50         -         -     $0.50  ff  (disabled)");
+        assert_eq!(lines[3], "total (2 keys)                                       $0.20     $1.23     $5.06");
     }
 
     #[test]
@@ -27368,10 +27517,8 @@ mod lifecycle_tests {
                 .map(|(hash, name)| KeyInfo {
                     hash: hash.to_string(),
                     name: Some(name.to_string()),
-                    label: None,
-                    disabled: false,
                     limit: Some(5.0),
-                    usage: None,
+                    ..Default::default()
                 })
                 .collect();
             Self { keys: Mutex::new(keys), ..Default::default() }
@@ -27394,7 +27541,7 @@ mod lifecycle_tests {
         async fn create_key(&self, name: &str, limit: Option<f64>) -> Result<CreatedKey> {
             self.calls.lock().unwrap().push(format!("create {name}"));
             let hash = format!("h-new-{name}");
-            let info = KeyInfo { hash: hash.clone(), name: Some(name.into()), label: None, disabled: false, limit, usage: None };
+            let info = KeyInfo { hash: hash.clone(), name: Some(name.into()), limit, ..Default::default() };
             self.keys.lock().unwrap().push(info);
             Ok(CreatedKey { secret: format!("sk-new-{name}"), hash, name: name.into() })
         }

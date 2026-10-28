@@ -14,6 +14,20 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-28 · OpenRouter spend in the dashboard, and keys kept to one workspace
+- The dashboard shows each pod's OpenRouter key as `AI$` (spent/cap: yellow from 80%, red at the
+  cap), the key's today/week/month in the detail pane, and the account's credit and the cohort's
+  spend today in the summary bar. A credit lower than what the keys' caps allow, or a key at its
+  cap, leads the bar. Nothing changes without `OPENROUTER_PROVISIONING_KEY`.
+- `arena keys list` adds SPENT (in the cap's period), TODAY, MONTH and ALL columns and a total.
+- `arena keys` writes the keys file owner-only (0600) and atomically. It used to be created readable
+  by anyone who could reach the folder; an older file is tightened on its next write.
+
+### Config
+- New, optional: `OPENROUTER_WORKSPACE` (a workspace id or slug). OpenRouter's provisioning key
+  reaches every workspace in an organization; with this set, `arena keys`, `terminate
+  --revoke-key`, `pods rename` and the dashboard only see and change keys in that workspace, and new
+  keys go there. Unset: the Default workspace, as before.
 ## 2026-10-28 · A daily health check on cron; `pods test` checks this cohort's pods
 - `arena cron install --health 07:20` adds a daily `pods test --deep` at that time, in this
   box's time zone. Its verdicts show in the dashboard's HEALTH column, and its table in

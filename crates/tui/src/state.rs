@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use arena_core::balance::{self, AccountView, Level};
+use arena_core::openrouter::{CohortUsage, Fill};
 use arena_core::fleet::{self, FleetCost};
 use arena_core::health::{render_summary, PodHealth, Status};
 use arena_core::metrics::PodMetrics;
@@ -159,12 +160,22 @@ pub fn balance_tone(balance: &[AccountView]) -> Option<Tone> {
 /// pod/GPU/util counts from the probes, then the fleet's burn exactly as `pods list`'s
 /// footer words it ([`fleet::fleet_footer`]: billing pods only, `$` and Hetzner's `€` kept
 /// apart, unpriced pods called out), the same per day, and last the balances that need
-/// nothing (`balance: runpod $32.54 ≈4.0d · vast ~$118.30 est. ≈49d`).
-pub fn summary_text(s: &FleetSummary, cost: &FleetCost, partial: &[String], balance: &[AccountView]) -> String {
+/// nothing (`balance: runpod $32.54 ≈4.0d · vast ~$118.30 est. ≈49d`). OpenRouter, when its key
+/// is configured, the same way: a warning after the balance's (credit the keys' caps could
+/// spend, keys at their cap), its credit and the cohort's spend today last.
+pub fn summary_text(
+    s: &FleetSummary,
+    cost: &FleetCost,
+    partial: &[String],
+    balance: &[AccountView],
+    ai: Option<&CohortUsage>,
+) -> String {
     let util = s.mean_util.map(|u| format!("{u}%")).unwrap_or_else(|| "-".into());
     let (first, last, _) = balance::tui_parts(balance);
+    let (ai_first, ai_last, _) = ai.map(CohortUsage::tui_parts).unwrap_or((None, None, Fill::Ok));
     let mut out = partial_notice(partial).unwrap_or_default();
     out.push_str(&first.unwrap_or_default());
+    out.push_str(&ai_first.unwrap_or_default());
     out.push_str(&format!(
         " {} · {} · mean util {util} · {}",
         count_of(s.pods, "pod", "pods"),
@@ -187,7 +198,29 @@ pub fn summary_text(s: &FleetSummary, cost: &FleetCost, partial: &[String], bala
     if let Some(rest) = last {
         out.push_str(&format!("  ·  balance: {rest}"));
     }
+    if let Some(rest) = ai_last {
+        out.push_str(&format!("  ·  {rest}"));
+    }
     out
+}
+
+/// The colour of the OpenRouter warning in the summary bar (`None`: there's none).
+pub fn ai_tone(ai: Option<&CohortUsage>) -> Option<Tone> {
+    match ai.map(|a| a.tui_parts())? {
+        (Some(_), _, Fill::Full) => Some(Tone::Bad),
+        (Some(_), _, _) => Some(Tone::Warn),
+        _ => None,
+    }
+}
+
+/// An `AI$` cell's colour: plain under 80% of the cap, warn from there, bad at the cap or
+/// disabled.
+pub fn fill_tone(f: Fill) -> Option<Tone> {
+    match f {
+        Fill::Ok => None,
+        Fill::Near => Some(Tone::Warn),
+        Fill::Full => Some(Tone::Bad),
+    }
 }
 
 /// `1 pod`, `0 pods`, `3 GPUs` — the bar said `1 pods`.
@@ -1043,12 +1076,12 @@ mod tests {
         let s = summarize(&pods, &HashMap::new());
         let cost = fleet::fleet_cost(&pods);
         assert_eq!(
-            summary_text(&s, &cost, &[], &[]),
+            summary_text(&s, &cost, &[], &[], None),
             " 5 pods · 0 GPUs · mean util - · fleet: $0.60/h across 4 billing pod(s) + €0.006/h hetzner (1 unpriced) \
              ≈ $14.40/day + €0.13/day"
         );
         // A provider that failed to list leads the bar (its tail is cut on narrow terminals).
-        let partial = summary_text(&s, &cost, &["vast".to_string(), "hetzner".to_string()], &[]);
+        let partial = summary_text(&s, &cost, &["vast".to_string(), "hetzner".to_string()], &[], None);
         assert!(
             partial.starts_with(" ⚠ vast, hetzner failed to list — its pods (and their cost) are missing · 5 pods · "),
             "{partial}"
@@ -1056,7 +1089,7 @@ mod tests {
         assert!(partial.ends_with(" ≈ $14.40/day + €0.13/day"), "{partial}");
         assert_eq!(partial_notice(&[]), None);
         // Nothing billing: no per-day figure.
-        let idle = summary_text(&FleetSummary::default(), &fleet::fleet_cost(&[]), &[], &[]);
+        let idle = summary_text(&FleetSummary::default(), &fleet::fleet_cost(&[]), &[], &[], None);
         assert_eq!(idle, " 0 pods · 0 GPUs · mean util - · fleet: $0.00/h across 0 billing pod(s)");
     }
 
@@ -1067,10 +1100,10 @@ mod tests {
         let mut metrics = HashMap::new();
         metrics.insert("arena8-apple".to_string(), PodMetrics { gpus: parse_nvidia_smi("RTX 3090, 30, 8000, 16000, 60\n"), ..Default::default() });
         let cost = fleet::fleet_cost(&pods);
-        let one = summary_text(&summarize(&pods, &metrics), &cost, &[], &[]);
+        let one = summary_text(&summarize(&pods, &metrics), &cost, &[], &[], None);
         assert!(one.starts_with(" 1 pod · 1 GPU · mean util 30% · "), "{one}");
         let two = [pod("arena8-apple", Some(0.40)), pod("arena8-bloom", Some(0.40))];
-        let both = summary_text(&summarize(&two, &HashMap::new()), &fleet::fleet_cost(&two), &[], &[]);
+        let both = summary_text(&summarize(&two, &HashMap::new()), &fleet::fleet_cost(&two), &[], &[], None);
         assert!(both.starts_with(" 2 pods · 0 GPUs · "), "{both}");
     }
 
@@ -1097,11 +1130,11 @@ mod tests {
         let s = summarize(&pods, &HashMap::new());
         let cost = fleet::fleet_cost(&pods);
         let ok = balances(&[(Account::Runpod, 500.0, 0.5), (Account::Vast, 90.0, 0.0)]);
-        let text = summary_text(&s, &cost, &[], &ok);
+        let text = summary_text(&s, &cost, &[], &ok, None);
         assert!(text.starts_with(" 2 pods · ") && text.ends_with("  ·  balance: runpod $500.00 ≈41.6d · vast $90.00 no burn"), "{text}");
         assert_eq!(balance_tone(&ok), None);
         // No prepaid account: nothing about a balance.
-        assert!(!summary_text(&s, &cost, &[], &[]).contains("balance"));
+        assert!(!summary_text(&s, &cost, &[], &[], None).contains("balance"));
     }
 
     /// A low or critical balance leads the bar — right after a failed-listing notice, ahead
@@ -1113,7 +1146,7 @@ mod tests {
         let s = summarize(&pods, &HashMap::new());
         let cost = fleet::fleet_cost(&pods);
         let low = balances(&[(Account::Runpod, 30.0, 0.5), (Account::Vast, 90.0, 0.0)]); // 60h
-        let text = summary_text(&s, &cost, &["hetzner".to_string()], &low);
+        let text = summary_text(&s, &cost, &["hetzner".to_string()], &low, None);
         assert!(
             text.starts_with(" ⚠ hetzner failed to list — its pods (and their cost) are missing · ⚠ runpod $30.00 ≈2.5d · 1 pod · 0 GPUs · "),
             "{text}"
@@ -1122,8 +1155,32 @@ mod tests {
         assert_eq!(text.matches("runpod").count(), 1, "said once: {text}");
         assert_eq!(balance_tone(&low), Some(Tone::Warn));
         let critical = balances(&[(Account::Runpod, 3.0, 0.5)]); // 6h
-        assert!(summary_text(&s, &cost, &[], &critical).starts_with(" ‼ runpod $3.00 ≈6.0h · 1 pod · "));
+        assert!(summary_text(&s, &cost, &[], &critical, None).starts_with(" ‼ runpod $3.00 ≈6.0h · 1 pod · "));
         assert_eq!(balance_tone(&critical), Some(Tone::Bad));
+    }
+
+    /// OpenRouter in the bar: its warning right after the balance's (or first), its credit
+    /// and the cohort's spend today at the end; nothing at all without a provisioning key.
+    #[test]
+    fn summary_carries_openrouter_after_the_balance() {
+        let pods = [pod("arena8-apple", Some(0.40))];
+        let s = summarize(&pods, &HashMap::new());
+        let cost = fleet::fleet_cost(&pods);
+        let calm = CohortUsage { keys: 2, today: Some(1.5), credit_left: Some(422.09), headroom: 8.0, ..Default::default() };
+        let text = summary_text(&s, &cost, &[], &[], Some(&calm));
+        assert!(text.starts_with(" 1 pod · "), "{text}");
+        assert!(text.ends_with("  ·  openrouter $422.09 left · AI today $1.50"), "{text}");
+        assert_eq!(ai_tone(Some(&calm)), None);
+        let short = CohortUsage { credit_left: Some(5.0), at_cap: 2, ..calm.clone() };
+        let text = summary_text(&s, &cost, &["vast".to_string()], &[], Some(&short));
+        assert!(
+            text.starts_with(" ⚠ vast failed to list — its pods (and their cost) are missing · ⚠ openrouter $5.00 left, the keys' caps allow $8.00 more · ⚠ 2 AI keys at cap · 1 pod · "),
+            "{text}"
+        );
+        assert_eq!(ai_tone(Some(&short)), Some(Tone::Warn));
+        assert_eq!(ai_tone(Some(&CohortUsage { credit_left: Some(0.0), ..calm })), Some(Tone::Bad));
+        assert_eq!(ai_tone(None), None);
+        assert!(!summary_text(&s, &cost, &[], &[], None).contains("openrouter"));
     }
 
     #[test]

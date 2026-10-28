@@ -59,6 +59,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use arena_core::balance::{self, AccountView, BalanceApi, BalancePolicy, HttpBalanceApi};
+use arena_core::openrouter::{CohortUsage, KeyUsage, OpenRouter, UsageView};
 use arena_core::fleet;
 use arena_core::health::{deep_check_command, judge_deep_call, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT};
 use arena_core::metrics::{self, PodMetrics, ProbeOpts};
@@ -209,6 +210,11 @@ struct Shared {
     /// The prepaid accounts as last observed in a details round (empty before the first,
     /// or with no prepaid key configured).
     balance: Vec<AccountView>,
+    /// OpenRouter's keys and credit as last read (`None`: no provisioning key configured —
+    /// no `AI$` column, nothing in the summary bar).
+    ai: Option<UsageView>,
+    /// The cohort's share of it, for the summary bar.
+    ai_cohort: Option<CohortUsage>,
     /// `n`'s fresh listing, set by its background task ([`start_new_pod_listing`]); the UI
     /// loop turns it into the add-pod form ([`new_pod_mode`]).
     new_pod_listing: Option<std::result::Result<Vec<Pod>, String>>,
@@ -360,6 +366,8 @@ async fn main() -> Result<()> {
     // back to the default (`arena balance` is the place that says so).
     let (policy, _) = BalancePolicy::from_config(&cfg);
     let balance = BalanceCtx::new(Arc::new(HttpBalanceApi::from_config(&cfg)), balance_state_path(&cfg).and_then(Result::ok), policy);
+    // OpenRouter's keys and credit, on the same cadence, when a provisioning key is set.
+    let ai = OpenRouter::from_config(&cfg).map(AiCtx::new);
 
     // Background fetcher: keeps `shared` fresh without blocking the UI.
     tokio::spawn(fetch_loop(
@@ -369,7 +377,7 @@ async fn main() -> Result<()> {
         progress_cmd,
         shared.clone(),
         Cadence { interval: interval.clone(), nudge: nudge.clone(), details_wanted: details_wanted.clone() },
-        Some(balance),
+        DetailsState { balance: Some(balance), ai, ..Default::default() },
     ));
 
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
@@ -440,7 +448,8 @@ struct Cadence {
 }
 
 /// The background refresh loop: one [`refresh`] per cadence tick, waiting for the
-/// cadence to elapse *or* a manual nudge (`r`/`f`/action), whichever comes first.
+/// cadence to elapse *or* a manual nudge (`r`/`f`/action), whichever comes first. `details`
+/// starts with what the slower round reads besides the provider: balances, OpenRouter.
 async fn fetch_loop(
     provider: Arc<dyn Provider>,
     remote: Arc<dyn Remote>,
@@ -448,7 +457,7 @@ async fn fetch_loop(
     progress_cmd: Option<String>,
     shared: Arc<Mutex<Shared>>,
     cadence: Cadence,
-    balance: Option<BalanceCtx>,
+    mut details: DetailsState,
 ) {
     // The per-pod probe gathers GPU stats + branch + setup health in one SSH call.
     let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
@@ -461,7 +470,6 @@ async fn fetch_loop(
         nvidia_smi_timeout: None,
         repo_timeout: None,
     };
-    let mut details = DetailsState { balance, ..Default::default() };
     loop {
         shared.lock().unwrap().refreshing = true;
         let forced = cadence.details_wanted.swap(false, Ordering::Relaxed);
@@ -486,6 +494,44 @@ struct DetailsState {
     warning: Option<String>,
     /// The prepaid balances, observed on the details cadence (`None`: not shown — tests).
     balance: Option<BalanceCtx>,
+    /// OpenRouter's keys and credit, read on the details cadence (`None`: no provisioning key).
+    ai: Option<AiCtx>,
+}
+
+/// What the `AI$` column and the summary bar's OpenRouter part read with: the provisioning
+/// API (scoped to `OPENROUTER_WORKSPACE`), when a read last started, the view the reads
+/// update, and the read in flight. Reads run in the background: a slow listing (a workspace
+/// of many pages) never holds a refresh, and what it read shows from the next one.
+struct AiCtx {
+    api: Arc<OpenRouter>,
+    last: Option<tokio::time::Instant>,
+    view: Arc<Mutex<UsageView>>,
+    reading: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AiCtx {
+    fn new(api: OpenRouter) -> Self {
+        AiCtx { api: Arc::new(api), last: None, view: Arc::default(), reading: None }
+    }
+}
+
+/// How long the key listing may take (every page, the workspace lookup first) before the
+/// last one is kept.
+const AI_KEYS_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the credit read may take: as long as an inline balance read.
+const AI_CREDITS_TIMEOUT: Duration = balance::INLINE_TIMEOUT;
+
+/// Read OpenRouter's keys and credit, each within its own bound, and apply them to `view`
+/// apart ([`UsageView::apply`]): one failing never holds back the other's fresh answer.
+async fn read_ai(api: Arc<OpenRouter>, view: Arc<Mutex<UsageView>>) {
+    async fn bounded<T>(d: Duration, f: impl std::future::Future<Output = arena_core::Result<T>>) -> std::result::Result<T, String> {
+        match tokio::time::timeout(d, f).await {
+            Ok(r) => r.map_err(|e| e.to_string()),
+            Err(_) => Err(format!("timed out after {}s", d.as_secs())),
+        }
+    }
+    let (keys, credits) = tokio::join!(bounded(AI_KEYS_TIMEOUT, api.list_keys()), bounded(AI_CREDITS_TIMEOUT, api.credits()));
+    view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).apply(keys, credits);
 }
 
 /// What the summary bar's balance reads with: the reads, the state file the CLI keeps too
@@ -587,6 +633,14 @@ async fn refresh(
     }
     let partial: Vec<String> = listing.errors().iter().map(|(p, _)| p.to_string()).collect();
     let mut pods = listing.pods();
+    // OpenRouter on the details cadence, in the background (never two reads at once).
+    if let Some(a) = details.ai.as_mut() {
+        let idle = a.reading.as_ref().is_none_or(|h| h.is_finished());
+        if idle && details_due(a.last.map(|t| t.elapsed()), forced) {
+            a.reading = Some(tokio::spawn(read_ai(a.api.clone(), a.view.clone())));
+            a.last = Some(tokio::time::Instant::now());
+        }
+    }
     // `SSH_CONFIG_FILE` kept current, as `pods list` keeps it: from a complete listing only (a
     // provider that failed would drop its pods' blocks), written only when an endpoint moved; a
     // failure is a status-line warning, never more.
@@ -652,6 +706,13 @@ async fn refresh(
         );
     }
     s.summary = summarize(&display, &metrics);
+    if let Some(a) = &details.ai {
+        let view = a.view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+        let names: Vec<String> = display.iter().map(|p| p.name.clone()).collect();
+        s.ai_cohort = Some(view.cohort(prefix, &names));
+        s.ai = Some(view);
+    }
     let warnings: Vec<&str> =
         [&details.warning, &proxy_warning, &health_warning, &ssh_warning].into_iter().flatten().map(String::as_str).collect();
     s.status = status_line(&s.summary, &warnings);
@@ -2563,11 +2624,16 @@ fn render_select(f: &mut Frame, value: &str) {
 /// led, in yellow, by which provider failed to list when one did (the totals after it are
 /// then a floor), and by a low (yellow) or critical (red) balance.
 fn summary_line(s: &Shared) -> Paragraph<'static> {
-    let text = summary_text(&s.summary, &s.snap.cost, &s.snap.partial, &s.balance);
+    let text = summary_text(&s.summary, &s.snap.cost, &s.snap.partial, &s.balance, s.ai_cohort.as_ref());
     let (lead, _, _) = balance::tui_parts(&s.balance);
+    let ai_lead = s.ai_cohort.as_ref().and_then(|a| a.tui_parts().0);
     let mut rest = text.as_str();
     let mut spans = Vec::new();
-    for (notice, tone) in [(partial_notice(&s.snap.partial), Some(Tone::Warn)), (lead, state::balance_tone(&s.balance))] {
+    for (notice, tone) in [
+        (partial_notice(&s.snap.partial), Some(Tone::Warn)),
+        (lead, state::balance_tone(&s.balance)),
+        (ai_lead, state::ai_tone(s.ai_cohort.as_ref())),
+    ] {
         if let (Some(n), Some(tone)) = (notice.filter(|n| rest.starts_with(n.as_str())), tone) {
             rest = &rest[n.len()..];
             spans.push(Span::styled(n, tone_style(tone)));
@@ -2607,6 +2673,22 @@ fn columns_that_fit(w: usize, core: &[usize], optional: &[usize]) -> usize {
         .count()
 }
 
+/// A pod's `AI$` cell: its OpenRouter key's spend against the cap (`-`: no key named after
+/// it), yellow from 80% of the cap, red at the cap or disabled — grey when the last listing
+/// failed (`stale`: these are older numbers, the summary bar says `(n/a)`).
+fn ai_cell(k: Option<&KeyUsage>, stale: bool, read: bool) -> Cell<'static> {
+    match k {
+        // Before the first read lands: not known yet, rather than "no key".
+        None if !read => Cell::from("…").style(tone_style(Tone::Dim)),
+        None => Cell::from("-").style(tone_style(Tone::Dim)),
+        Some(k) if stale => Cell::from(k.cell()).style(tone_style(Tone::Dim)),
+        Some(k) => {
+            let style = state::fill_tone(k.fill()).map(tone_style).unwrap_or_default();
+            Cell::from(k.cell()).style(style)
+        }
+    }
+}
+
 fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: bool) {
     // Responsive. The essential columns — mark, P, NAME, STATUS, M, SET, GPU, GPU%, $/H,
     // HEALTH, PROXY — always show and fit in 73 columns. Next come the mid columns, kept
@@ -2625,6 +2707,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     let proxy_w = if full_proxy { 11 } else { 6 };
     const FLEET_W: usize = 1 + HEALTH_W + 6 + 3; // + their inter-column spacing
     let show_saved = w >= 96 + FLEET_W;
+    // AI$: each pod's OpenRouter key, spent against its cap — only with a provisioning key.
+    const AI_W: usize = 9; // "1.23/5", "12.3/50", "0.02/0.02"
+    let show_ai = shared.ai.is_some() && w >= 104 + FLEET_W;
     let show_host = w >= 134 + FLEET_W; // host CPU% + RAM (extra, only when there's room)
     let show_progress = w >= 110 + FLEET_W;
     // When cramped, names compress (arena8-apple→apple) and the GPU drops the "RTX "
@@ -2655,6 +2740,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     if show_saved {
         fixed.push(6);
     }
+    if show_ai {
+        fixed.push(AI_W);
+    }
     if show_host {
         fixed.extend([4, 4]);
     }
@@ -2677,6 +2765,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     }
     if show_saved {
         header_cells.push("SAVED");
+    }
+    if show_ai {
+        header_cells.push("AI$");
     }
     if show_host {
         header_cells.push("CPU%");
@@ -2819,6 +2910,14 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                     Span::styled(rel_time_short(m), style),
                 ])));
             }
+            if show_ai {
+                let ai = shared.ai.as_ref();
+                cells.push(ai_cell(
+                    ai.and_then(|a| a.keys.get(&p.name)),
+                    ai.is_some_and(|a| a.keys_error.is_some()),
+                    ai.is_some_and(|a| a.read),
+                ));
+            }
             if show_host {
                 // Host CPU% and RAM% (both coloured by load); exact RAM GB is in detail.
                 let cpu = m.and_then(|m| m.cpu_pct);
@@ -2882,6 +2981,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     }
     if show_saved {
         widths.push(Constraint::Length(6)); // SAVED (e.g. "3h", "↑2d")
+    }
+    if show_ai {
+        widths.push(Constraint::Length(AI_W as u16)); // AI$ (e.g. "1.23/5")
     }
     if show_host {
         widths.push(Constraint::Length(4)); // CPU%
@@ -2986,10 +3088,21 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let commits_h = if n_commits > 0 { n_commits as u16 + 1 } else { 0 };
     // History graphs are a nice-to-have; show them only if the pane is still tall enough
     // once the facts, per-GPU table, and the extra sections have taken their space.
-    let show_graphs = inner.height >= FACT_LINES + 3 + procs_h + commits_h + 6;
+    // The OpenRouter key's line, under `cost:`, when a provisioning key is configured. "No
+    // key" only from a listing that worked: before the first read, or after a failed one,
+    // absence isn't known — and numbers kept from an older read say so.
+    let ai = shared.ai.as_ref().map(|a| match (a.keys.get(&pod.name), a.read, a.keys_error.as_deref()) {
+        (None, false, _) => "… (reading OpenRouter's keys)".to_string(),
+        (None, _, Some(e)) => format!("? (OpenRouter's keys couldn't be read: {e})"),
+        (None, _, None) => "- (no OpenRouter key named after this pod — `arena keys gen` makes one)".to_string(),
+        (Some(k), _, None) => k.detail(),
+        (Some(k), _, Some(_)) => format!("{} (as last read; the latest read failed)", k.detail()),
+    });
+    let fact_lines = FACT_LINES + u16::from(ai.is_some());
+    let show_graphs = inner.height >= fact_lines + 3 + procs_h + commits_h + 6;
 
     let mut constraints: Vec<Constraint> = vec![
-        Constraint::Length(FACT_LINES), // header facts
+        Constraint::Length(fact_lines), // header facts
         Constraint::Min(3),             // per-GPU table
     ];
     let mut idx = 2;
@@ -3079,7 +3192,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         format!("{cpu}   {ram}")
     };
     let facts = format!(
-        "status:   {}\ngpu:      {}\nendpoint: {}\nproxy:    {}\ncost:     {}\nmaint:    {}\nhealth:   {}\nreason:   {}\ndisk:     {}\nhost:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\ntokens:   HF {}   Claude-Code {}\nprogress: {}",
+        "status:   {}\ngpu:      {}\nendpoint: {}\nproxy:    {}\ncost:     {}\n{}maint:    {}\nhealth:   {}\nreason:   {}\ndisk:     {}\nhost:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\ntokens:   HF {}   Claude-Code {}\nprogress: {}",
         {
             let status = pod_status(pod, m.map(|m| m.error.is_none()));
             if arena_core::lock::is_locked(pod) {
@@ -3093,6 +3206,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         endpoint,
         proxy,
         cost,
+        ai.map(|a| format!("ai key:   {}\n", fit(a))).unwrap_or_default(),
         maint,
         health,
         why,
@@ -4782,7 +4896,7 @@ deep_check_end=1
             assert_eq!(health_cell(a.health.as_ref(), false, s.snap.generated_at).0, "pass 10m");
             assert!(b.health.is_none());
             assert_eq!(s.snap.partial, ["vast"]);
-            let summary = summary_text(&s.summary, &s.snap.cost, &s.snap.partial, &[]);
+            let summary = summary_text(&s.summary, &s.snap.cost, &s.snap.partial, &[], None);
             assert!(summary.contains("fleet: $0.17/h across 2 billing pod(s) (1 unpriced)"), "{summary}");
             assert!(summary.starts_with(" ⚠ vast failed to list — its pods (and their cost) are missing"), "{summary}");
         }
@@ -4831,7 +4945,7 @@ deep_check_end=1
         assert_eq!(alpha.gpu_type.as_deref(), Some("RTX A4000"));
         assert!(s.status.contains("⚠ pod details incomplete: ") && s.status.contains("some field errored"), "{}", s.status);
         // The fleet total counts the price it got.
-        assert!(summary_text(&s.summary, &s.snap.cost, &s.snap.partial, &[]).contains("$0.17/h"));
+        assert!(summary_text(&s.summary, &s.snap.cost, &s.snap.partial, &[], None).contains("$0.17/h"));
     }
 
     /// The dashboard's deep check is `pods test --deep`'s: the same script in one exec per
