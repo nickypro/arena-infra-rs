@@ -84,7 +84,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
 
 - Runs as the unprivileged `dev` user, which **cannot read `/root`**. It only sees
   a read-only copy of config at `/home/dev/prod-ro/config.env`.
-- **Read-only by default.** `pods list`, `gpus` and the TUI only ever read: REST GETs plus
+- **Read-only by default.** `pods list`, `offers` and the TUI only ever read: REST GETs plus
   read-only GraphQL queries (a POST, but a query, never a mutation). The RunPod key is sent
   only as an `Authorization: Bearer` header — never in a URL, which errors would print.
 - **Mutating commands act, but confirm first.** `create`/`stop`/`terminate`/… print
@@ -155,7 +155,7 @@ sudo arena update        # where root runs arena from someone else's ~/.cargo/bi
 Subcommands accept any **unambiguous prefix** (Cisco-style), at every level:
 
 ```bash
-arena po l          # == arena pods list
+arena po li         # == arena pods list
 arena tui           # launch the dashboard
 arena co c          # == arena config check
 arena po ba          # == arena pods backup (prompts to confirm)
@@ -163,7 +163,11 @@ arena po ba          # == arena pods backup (prompts to confirm)
 
 An ambiguous prefix errors and lists the candidates — e.g. `arena p` is rejected
 because it matches both `pods` and `proxy` (use `po`/`pr`); likewise `c` →
-`config`/`cron` (use `co`/`cr`).
+`config`/`cron` (use `co`/`cr`), and `arena po l` → `list`/`lock`/`logs`.
+
+`arena --help` and `arena pods --help` list their commands in groups — `pods`: Look, Make,
+Change, Move, Save, Stop; the top level: Fleet, Money, Access, Automation, Setup. A test keeps
+every visible command in exactly one group. Hidden: `gpus`, the old name for `offers --all`.
 
 ### Targeting & concurrency
 
@@ -675,7 +679,7 @@ replacing right then.
 #### `--gpu` is checked
 
 **`--gpu` is checked** (`create`/`up`/`offers`/`replace`/`migrate copy`, RunPod only): each token —
-an exact id (any case), the catalog's display name as `arena gpus` prints it (`RTX PRO 6000`, `B300
+an exact id (any case), the catalog's display name as `arena offers --all` prints it (`RTX PRO 6000`, `B300
 MIG 34GB` — checked before the aliases, so `RTX PRO 6000` is the Server Edition, as listed), an
 alias (`3070`, `4080super`, `L4`, `2000ada`, `A4500`, …) or a unique catalog short name (`RTX 3070`,
 `H100 SXM`) — must be in RunPod's live GPU catalog (`GET /v2/catalog/gpus` on v2, the default;
@@ -774,13 +778,49 @@ body".
 
 ### `offers`
 
-`offers [--gpu …] [--cloud …] [--max-price …] [--gpus N] [--order …] [--json]` — read-only: the same
-option table (OPTION, CLOUD, $/H/POD, PRICE source, STOCK, plus what the cap dropped and why), i.e.
-what `create`/`up` would try. `--json` = the plan.
+`offers [--gpu …] [--cloud …] [--max-price …] [--gpus N] [--server-type T] [--order …] [--all]
+[--json]` — read-only: what `create`/`up` would try, on every provider at once. One table over the
+providers with a key in the config, in the fleet's order (RunPod, Vast, Hetzner): PROVIDER, `#` (the
+order `create`/`up` would try that provider's options in), OPTION, CLOUD, SIZE (VRAM per GPU — the
+live catalog's, else the preset's — or vCPU/RAM for a Hetzner VM), PER POD (`$`/h; `~` = preset
+estimate; Hetzner's in `€`, as it bills, never converted), SOURCE (`live`, `estimate`, or `list` for
+Hetzner's list price, which placement doesn't use), STOCK; then what
+the cap dropped and why, each provider's notes and the providers left out. With no key at all,
+RunPod alone (priced from the presets), as before.
 
-`--provider shadeform`: one catalog read prices every option at its cheapest in-stock entry (allowed
-clouds, CUDA floor, `SHADEFORM_MAX_PRICE`); an option with nothing in stock is noted and left
-unpriced.
+Each provider's rows are made by the functions `create`/`up` run — the `--gpu` check, the request
+from the flags and the placement planner — so the order and prices are theirs, and a change to
+placement shows here unchanged. `create`/`up` use **one** provider per run (`--provider`, default
+`runpod`): `#` orders the options within a provider, never across.
+
+- `--provider X` on the command line: that provider alone (its default, `runpod`, doesn't count —
+  clap's value source tells them apart). **Shadeform** shows only this way: it's opt-in overflow,
+  never in `up`'s default (with its key set, a `skipped:` line says so). One catalog read prices every option at its cheapest in-stock entry
+  (allowed clouds, CUDA floor, `SHADEFORM_MAX_PRICE`); an option with nothing in stock is noted and
+  left unpriced.
+- **Filters** apply per provider exactly as `create` applies them. A flag that doesn't apply to a
+  provider (`--gpu`/`--gpus` on Hetzner, `--server-type` elsewhere) leaves it out with a `skipped:`
+  line — or, with that provider named, fails as `create` does. `--cloud` is RunPod's (it collapses
+  elsewhere, with a note when several were asked for).
+- **Hetzner's row** is the VM `up --provider hetzner` would create: `--server-type` over
+  `HETZNER_SERVER_TYPE` (default `cx23`), its vCPUs and RAM, and its gross €/h where the create's
+  location walk starts (one `GET /server_types`, plus the same nearest-first timing a create does;
+  the walk is in a note). Placement itself quotes no price for it, so `--max-price` drops it ("no
+  known price"), exactly as `create --provider hetzner --max-price …` would. Without
+  `HETZNER_API_KEY`, or if the read fails, the row keeps the type's name, size and price unknown.
+- `--json`: `{"providers": [...], "skipped": [{provider, why}]}`. Each provider is its option plan as
+  `create` sees it — `provider, gpu_count, order, max_price, options, dropped, notes`, the fields of
+  the old single-provider `offers --json` — with `vram_gb` added to each option, and on Hetzner a
+  `server_type` object (`name, cores, cpu_type, architecture, memory_gb, disk_gb, eur_per_hour,
+  locations`). **Changed:** `offers --json` used to print one provider's plan as the top-level
+  object; it's now under `providers[]` (`jq '.providers[0]'` for the old shape).
+
+**`--all`**: every type each provider sells instead of what `create` would try (it doesn't take
+the option flags). RunPod: its GPU catalog, exactly as [`gpus`](#gpus) printed it. Hetzner: every
+server type on sale somewhere now — vCPUs, RAM, disk, €/h in its cheapest location, where it's sold
+— with `HETZNER_SERVER_TYPE`'s starred. Vast and Shadeform are marketplaces with no fixed list: a
+note says to price GPUs with `offers --provider vast --gpu …`. `--all --json`: `{"runpod": [rows as
+gpus --json], "hetzner": [server types], "notes": [...]}`.
 
 ### `pods up`
 
@@ -1716,11 +1756,14 @@ next step.
 
 ### `gpus`
 
-`gpus` — list the GPU types for `--gpu`: RunPod's **full live catalog** (via `GET /v2/catalog/gpus`
-for both tiers, the default — STOCK shown as `community/secure`, counted over hosts at or above the
-CUDA floor, and the best signal the answer carries (a data center's level, a CUDA version tagged
-available) — no GraphQL; via GraphQL on `RUNPOD_API=v1`) when on RunPod with a key, else the local
-presets.
+`gpus` — the old name for RunPod's part of [`offers --all`](#offers), kept for habits and scripts
+(hidden from `--help`): the same table, and `gpus --json` the same array of rows as before. It is
+RunPod's catalog whatever `--provider` says (it used to fall back to the presets off RunPod).
+
+RunPod's **full live catalog** (via `GET /v2/catalog/gpus` for both tiers, the default — STOCK
+shown as `community/secure`, counted over hosts at or above the CUDA floor, and the best signal the
+answer carries (a data center's level, a CUDA version tagged available) — no GraphQL; via GraphQL on
+`RUNPOD_API=v1`) when `RUNPOD_API_KEY` is set, else the local presets.
 
 Shows VRAM, **live** community/secure $/hr (a tier that doesn't offer the card shows `-`: v1's
 GraphQL quotes phantom prices for those, dropped by its `secureCloud`/`communityCloud` flags) and

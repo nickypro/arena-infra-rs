@@ -32,8 +32,10 @@ mod gpu_vm_setup_tests;
 mod hetzner_cli_tests;
 #[cfg(test)]
 mod hetzner_setup_tests;
+mod help;
 mod jobs;
 mod money;
+mod offers;
 mod reap;
 mod resolve;
 mod teardown;
@@ -237,18 +239,23 @@ enum Cmd {
     /// Needs OPENROUTER_PROVISIONING_KEY in the config.
     #[command(subcommand, infer_subcommands = true)]
     Keys(KeysCmd),
-    /// List GPU types for --gpu, with VRAM, $/h and stock
+    /// RunPod's GPU types: the old name for `offers --all` (RunPod only)
     ///
-    /// Live from RunPod where available, else the local presets.
+    /// Live from RunPod where available, else the local presets. Hidden: `offers` covers it.
+    #[command(hide = true)]
     Gpus {
         /// JSON instead of a table (also lists the uncreatable entries the table hides)
         #[arg(long)]
         json: bool,
     },
-    /// Preview the GPU options create/up would try, with prices
+    /// What create/up would try on each provider, with prices
     ///
-    /// Read-only. The --gpu × --cloud options with $/h per pod (`~` = preset estimate), price
-    /// source and stock hint, ordered and filtered by --max-price exactly as create does.
+    /// Read-only. One table over the providers with a key (RunPod, Vast, Hetzner; Shadeform
+    /// only with --provider shadeform): each option create/up would try there, # = the order
+    /// they'd try it in. SIZE is VRAM, or vCPU/RAM for Hetzner's CPU VMs; PER POD is $/h (`~` =
+    /// preset estimate; Hetzner in €, as it bills), then the price source and stock hint.
+    /// --gpu, --cloud, --max-price and --server-type filter as create does; a flag that doesn't
+    /// apply to a provider skips it. --all: every type each provider sells (`gpus` = RunPod's).
     #[command(verbatim_doc_comment)]
     Offers {
         /// GPU type(s), comma-separated, e.g. `A4000,3090` (default: config GPU_TYPE)
@@ -263,10 +270,16 @@ enum Cmd {
         /// GPUs per pod (default: config NUM_GPUS) — prices and the cap are per pod.
         #[arg(long)]
         gpus: Option<u32>,
+        /// Hetzner only: server type, e.g. cx23 or cpx42 (overrides HETZNER_SERVER_TYPE)
+        #[arg(long, value_name = "TYPE")]
+        server_type: Option<String>,
         /// `cheapest` or `listed`
         #[arg(long, default_value = "cheapest")]
         order: arena_core::placement::Order,
-        /// Emit the option plan as JSON instead of a table.
+        /// Every GPU/server type each provider sells, not just what create would try
+        #[arg(long, conflicts_with_all = ["gpu", "cloud", "max_price", "gpus", "server_type", "order"])]
+        all: bool,
+        /// JSON instead of a table (with --all: each provider's catalog)
         #[arg(long)]
         json: bool,
     },
@@ -2484,7 +2497,7 @@ async fn v2_catalog(cfg: &Config, key: &str, cloud: &str) -> std::result::Result
 }
 
 /// The tier whose v2 catalog answers questions that aren't about a tier (the `--gpu`
-/// check, `arena gpus`): the configured `CLOUD_TYPE`, or COMMUNITY. Every tier's catalog
+/// check, `arena offers --all`): the configured `CLOUD_TYPE`, or COMMUNITY. Every tier's catalog
 /// lists every GPU, so this only picks which tier's stock a reader sees — and with the
 /// configured tier, a plain `create` reuses the check's fetch for its prices.
 fn v2_default_cloud(cfg: &Config) -> &'static str {
@@ -2590,7 +2603,7 @@ fn v1_creatable_check(ids: &str, catalog: &[arena_core::provider::runpod::GpuTyp
     }
     anyhow::bail!(
         "--gpu {}: in RunPod's catalog, but REST v1's create API rejects it (not in its gpuTypeIds list) — \
-         v2's create takes it: {}, or pick another --gpu (`arena gpus` hides what v1 can't create)",
+         v2's create takes it: {}, or pick another --gpu (`arena offers --all` hides what v1 can't create)",
         bad.join(", "),
         arena_core::provider::RUNPOD_V1_REMEDY
     )
@@ -2953,7 +2966,7 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let (cli, provider_named) = help::parse();
     // Before the config: an update needs none, and must work where it's broken.
     if let Cmd::Update { check, dry_run } = cli.cmd {
         return handle_update(check, dry_run, cli.yes).await;
@@ -3020,10 +3033,11 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Gpus { json } => handle_gpus(&cfg, &cli.provider, json).await,
+        Cmd::Gpus { json } => offers::handle_gpus(&cfg, json).await,
         Cmd::Api(c) => handle_api(c, &cfg).await,
-        Cmd::Offers { gpu, cloud, max_price, gpus, order, json } => {
-            handle_offers(&cfg, &cli.provider, gpu, cloud, max_price, gpus, order, json).await
+        Cmd::Offers { gpu, cloud, max_price, gpus, server_type, order, all, json } => {
+            let flags = offers::Flags { gpu, cloud, max_price, gpus, server_type, order };
+            offers::handle_offers(&cfg, provider_named.then_some(cli.provider.as_str()), flags, all, json).await
         }
     }
 }
@@ -3050,139 +3064,6 @@ async fn handle_api(cmd: ApiCmd, cfg: &Config) -> Result<()> {
             Ok(())
         }
     }
-}
-
-/// `arena gpus`: list the GPU types you can pass to `--gpu`. Fetches RunPod's **full,
-/// live** catalog with live community/secure prices + stock when on RunPod with a key —
-/// via GraphQL on `RUNPOD_API=v1`, via REST `GET /v2/catalog/gpus` (stock for the configured
-/// cloud tier) on `v2`, with no GraphQL fallback there (see `runpod_v2`'s GraphQL
-/// inventory); otherwise, or when that fails, falls back to the local curated presets.
-/// `--json` emits the same rows machine-readably (`arena_core::gpu::GpuRow`). Diagnostics
-/// go to stderr so the JSON on stdout stays parseable.
-async fn handle_gpus(cfg: &Config, provider_name: &str, json: bool) -> Result<()> {
-    use arena_core::gpu;
-    use arena_core::provider::{runpod, RunpodApi};
-
-    // (rows, whether the create-API enum was available to flag `creatable`)
-    let mut live: Option<(Vec<gpu::GpuRow>, bool)> = None;
-    // v2: the other tier's catalog, for its stock (v2's availability is per tier).
-    let mut secure_stock: Option<Vec<arena_core::provider::runpod::GpuType>> = None;
-    let mut v2 = false;
-    if provider_name == "runpod" {
-        if let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|s| !s.is_empty()) {
-            let api = RunpodApi::from_config(cfg)?;
-            let fetched = match api {
-                RunpodApi::V1 => runpod::fetch_gpu_types(key).await.map_err(|e| e.to_string()),
-                RunpodApi::V2 => {
-                    // Both tiers (finding #31: STOCK was always the community figure, so a
-                    // secure-only card read "None"). Rows and prices from COMMUNITY's answer
-                    // (every tier's lists every GPU); SECURE's adds its stock.
-                    v2 = true;
-                    secure_stock = v2_catalog(cfg, key, "SECURE").await.ok();
-                    v2_catalog(cfg, key, "COMMUNITY").await.map_err(|e| format!("v2 catalog (COMMUNITY): {e}"))
-                }
-            };
-            match fetched {
-                Ok(types) if !types.is_empty() => {
-                    // v1: RunPod's v1 create-validation enum can be NARROWER than the gpuTypes
-                    // catalog — listing a GPU that `--gpu` then gets a 400 for. Flag rows
-                    // against it (the table hides rejected ones). If the enum can't be
-                    // fetched, `creatable` stays unknown and everything is shown. v2's create
-                    // validates `gpu.id` against this very catalog: every row is creatable.
-                    let creatable = match api {
-                        RunpodApi::V1 => runpod::fetch_creatable_gpu_ids(key).await.ok().filter(|v| !v.is_empty()),
-                        RunpodApi::V2 => Some(types.iter().map(|t| t.id.clone()).collect()),
-                    };
-                    let mut rows = gpu::rows_from_live(&types, creatable.as_deref());
-                    if let Some(secure) = &secure_stock {
-                        gpu::add_secure_stock(&mut rows, secure);
-                    }
-                    live = Some((rows, creatable.is_some()));
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("(couldn't fetch the live GPU list: {e} — showing local presets)\n"),
-            }
-        }
-    }
-
-    if json {
-        let rows = live.map(|(rows, _)| rows).unwrap_or_else(gpu::rows_from_presets);
-        println!("{}", serde_json::to_string_pretty(&rows)?);
-        return Ok(());
-    }
-
-    match live {
-        Some((rows, creatable_known)) => {
-            let (shown, hidden): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| r.creatable != Some(false));
-            print!("{}", gpu::render_gpu_table(&shown));
-            println!(
-                "\n{} GPU types {}. Pass the GPU name (or the API name, or a short alias like \
-                 A4000 / 3090) to --gpu. Prices are RunPod's live $/hr per GPU (~ = preset \
-                 estimate, - = not offered); STOCK is RunPod's stock hint{}.",
-                shown.len(),
-                if creatable_known { "(live from RunPod, creatable via the create API)" } else { "(live from RunPod)" },
-                match (v2, secure_stock.is_some()) {
-                    (true, true) => " as community/secure (over hosts at or above the CUDA floor, if one is set)",
-                    (true, false) => " on the community cloud (secure's couldn't be read)",
-                    _ => " for a 1-GPU pod (either tier)",
-                }
-            );
-            if !hidden.is_empty() {
-                println!(
-                    "({} more in RunPod's catalog are hidden — listed but rejected by the create API, so --gpu can't use them; see --json.)",
-                    hidden.len()
-                );
-            }
-        }
-        None => {
-            // Fallback: the curated presets (no network / non-RunPod).
-            print!("{}", gpu::render_gpu_table(&gpu::rows_from_presets()));
-            println!(
-                "\n(local presets, ~ = rough estimate — run with --provider runpod + a key for the full live list.)\n\
-                 Pass the API name, label, or alias (e.g. `A4000`, `3090`, \"A100 SXM\") to --gpu."
-            );
-        }
-    }
-    Ok(())
-}
-
-/// `arena offers`: the placement plan for these flags, read-only — the same planner
-/// create/up run, so it previews what they would try (minus the names). Unlike `pods`, it
-/// needs no fleet: only config (defaults) and, on RunPod, the key for live prices. `--json`
-/// prints the plan (`arena_core::placement::OptionPlan`, notes included) and nothing else on
-/// stdout.
-#[allow(clippy::too_many_arguments)]
-async fn handle_offers(
-    cfg: &Config,
-    provider_name: &str,
-    gpu: Option<String>,
-    cloud: Option<String>,
-    max_price: Option<f64>,
-    gpus: Option<u32>,
-    order: arena_core::placement::Order,
-    json: bool,
-) -> Result<()> {
-    if !["runpod", "vast", "hetzner", "shadeform"].contains(&provider_name) {
-        anyhow::bail!("unknown provider `{provider_name}` (known: runpod, vast, hetzner, shadeform)");
-    }
-    let gpu = checked_gpu(cfg, provider_name, gpu).await?;
-    let base = spec_with_overrides(cfg, &SpecOverrides { gpus, ..Default::default() });
-    let req = arena_core::placement::Request::from_flags(gpu.as_deref(), cloud.as_deref(), &base, max_price, order)?;
-    let plan = plan_placement(cfg, provider_name, &req, &base).await?;
-    // Live catalog/offer prices are remembered for the balance's known-GPU stand-ins.
-    money::BalanceCtx::from_config(cfg).remember_gpu_prices(&plan);
-    if json {
-        println!("{}", serde_json::to_string_pretty(&plan)?);
-        return Ok(());
-    }
-    println!("{}", plan_header(&plan));
-    print!("{}", arena_core::placement::render_plan(&plan));
-    println!(
-        "\n`pods create/up` with these flags try the options top to bottom per name, one create at \
-         a time; a pool that reports no capacity is skipped for the rest of that round. STOCK is a \
-         hint only — creating is the real test."
-    );
-    Ok(())
 }
 
 /// Launch the interactive dashboard, handing it the same provider/config the CLI was
@@ -11539,7 +11420,7 @@ async fn plan_replacement(
     if owner.name() != "hetzner" && req.gpus.iter().any(|g| g.trim().is_empty()) {
         anyhow::bail!(
             "couldn't determine a GPU type for the replacement (the API doesn't report it and \
-             no GPU_TYPE is configured) — pass --gpu <type> (see `arena gpus`)"
+             no GPU_TYPE is configured) — pass --gpu <type> (see `arena offers --all`)"
         );
     }
     let plan = if req.is_single() {
@@ -16999,7 +16880,7 @@ mod replacement_spec_tests {
         assert_eq!(super::checked_gpu(&v2, "runpod", Some("3070".into())).await.unwrap().as_deref(), Some("3070"));
     }
 
-    /// The tier whose v2 catalog serves the `--gpu` check and `arena gpus`: the configured
+    /// The tier whose v2 catalog serves the `--gpu` check and `arena offers --all`: the configured
     /// one (any spelling) — so a plain create's price book reuses that fetch — else COMMUNITY.
     #[test]
     fn v2_catalog_tier_follows_the_configured_cloud() {
@@ -22787,13 +22668,8 @@ mod placement_cli_tests {
     }
 
     #[tokio::test]
-    async fn offers_plans_without_a_fleet_or_a_key() {
-        // Off RunPod nothing is priced, so a cap leaves nothing — but it's a view, not an error.
-        handle_offers(&cfg(), "vast", Some("A4000,3090".into()), Some("community,secure".into()), Some(1.0), None, Order::Cheapest, true)
-            .await
-            .unwrap();
-        handle_offers(&cfg(), "runpod", Some("A4000,3090".into()), None, None, Some(2), Order::Cheapest, false).await.unwrap();
-        assert!(handle_offers(&cfg(), "lambda", None, None, None, None, Order::Cheapest, false).await.is_err());
+    async fn placement_plans_without_a_fleet_or_a_key() {
+        // `offers` itself (every provider, `--all`, `gpus`): `offers::tests`.
         let base = spec_with_overrides(&cfg(), &SpecOverrides { gpus: Some(2), ..Default::default() });
         let req = arena_core::placement::Request::from_flags(Some("3090,A4000"), None, &base, Some(0.40), Order::Cheapest).unwrap();
         let plan = plan_placement(&cfg(), "runpod", &req, &base).await.unwrap();
@@ -22814,10 +22690,20 @@ mod placement_cli_tests {
         use clap::Parser;
         let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.cmd);
         match parse(&["arena", "offers", "--gpu", "A4000,3090", "--max-price", "$0.5", "--gpus", "2", "--order", "listed", "--json"]).unwrap() {
-            Cmd::Offers { gpu, max_price, gpus, order, json, .. } => {
-                assert_eq!((gpu.as_deref(), max_price, gpus, order, json), (Some("A4000,3090"), Some(0.5), Some(2), Order::Listed, true));
+            Cmd::Offers { gpu, max_price, gpus, order, all, json, .. } => {
+                assert_eq!((gpu.as_deref(), max_price, gpus, order, all, json), (Some("A4000,3090"), Some(0.5), Some(2), Order::Listed, false, true));
             }
             _ => panic!("not offers"),
+        }
+        match parse(&["arena", "offers", "--provider", "hetzner", "--server-type", "cx33"]).unwrap() {
+            Cmd::Offers { server_type, all, .. } => assert_eq!((server_type.as_deref(), all), (Some("cx33"), false)),
+            _ => panic!("not offers"),
+        }
+        // `--all` is the whole catalog: the flags that pick options don't go with it.
+        assert!(matches!(parse(&["arena", "offers", "--all", "--json"]).unwrap(), Cmd::Offers { all: true, json: true, .. }));
+        for flag in [&["--gpu", "A4000"][..], &["--cloud", "secure"], &["--max-price", "1"], &["--gpus", "2"], &["--server-type", "cx23"], &["--order", "listed"]] {
+            let args: Vec<&str> = ["arena", "offers", "--all"].iter().chain(flag).copied().collect();
+            assert!(parse(&args).is_err(), "{args:?}");
         }
         match parse(&["arena", "pods", "create", "-n", "3", "--gpu", "A4000,3090", "--cloud", "community,secure"]).unwrap() {
             Cmd::Pods(PodCmd::Create { order, max_price, .. }) => assert_eq!((order, max_price), (Order::Cheapest, None)),

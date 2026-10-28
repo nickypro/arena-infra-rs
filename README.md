@@ -91,6 +91,7 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 | Command | What it does |
 | --- | --- |
 | `arena pods list` | Every pod: GPU, $/h, endpoint, maintenance; a fleet cost and balance footer |
+| `arena offers` | What `pods up` would try on each provider (RunPod, Vast, Hetzner) and its $/h; `--all`: every GPU and server type |
 | `arena pods up -n 20 --gpu A4000,3090 --check` | Create pods up to 20, then set each up and deep-check it, one pipeline per pod |
 | `arena pods create apple bloom` | Create just these pods (no setup) |
 | `arena pods setup` | (Re)provision pods: deploy key, repo, tokens, VS Code warm-up, API keys |
@@ -115,7 +116,8 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 </details>
 
 Every mutating command shows what it will do and asks first; `--dry-run` previews it.
-Subcommands take any unambiguous prefix (`arena po l` = `arena pods list`). Pods are named
+`arena --help` and `arena pods --help` list the commands in groups. Subcommands take any
+unambiguous prefix (`arena po li` = `arena pods list`). Pods are named
 `apple`, `arena-apple`, `apple..mayor`, `--all`, … — see
 [targeting](docs/REFERENCE.md#targeting--concurrency).
 

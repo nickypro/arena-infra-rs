@@ -14,6 +14,24 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-28 · `offers` shows every provider, Hetzner too; `--help` lists commands in groups
+- `arena offers` is one table over every provider with a key in the config (RunPod, Vast,
+  Hetzner): each row is an option `pods up` would try there, `#` the order it would try them in,
+  with the size (VRAM, or vCPUs and RAM), the price per pod, where the price came from and the
+  stock hint. `--provider X` shows that one provider, as before; Shadeform shows only that way.
+- Hetzner's row is the VM `up --provider hetzner` would make (`--server-type`, else
+  `HETZNER_SERVER_TYPE`), priced in € as Hetzner bills it.
+- `arena offers --all` lists everything each provider sells: RunPod's GPU types (what `arena gpus`
+  showed) and Hetzner's server types.
+- `arena gpus` still works and prints what it did, `--json` too, but is no longer listed in
+  `--help`. It now shows RunPod's catalog whatever `--provider` says (it showed the presets).
+- `arena --help` and `arena pods --help` list the commands in groups (`pods`: Look, Make, Change,
+  Move, Save, Stop) instead of one long list.
+
+### Action needed
+- A script that reads `arena offers --json`: the plan is now under `providers`, one per provider —
+  read `.providers[0]` (with `--provider X`, it's the only one). `arena gpus --json` is unchanged.
+
 ## 2026-10-28 · Commands over ssh work on a box whose login shell is fish
 - On a box whose user's login shell is fish, arena's commands over ssh (`pods run`, setup, deep
   checks, backups, the dashboard's probe) now run under bash. Before, the dashboard's probe failed
