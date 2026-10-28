@@ -501,7 +501,7 @@ impl Arena {
             .stdin(Stdio::null())
             .stdout(if capture { Stdio::piped() } else { Stdio::inherit() })
             .stderr(Stdio::inherit());
-        let mut child = match cmd.spawn() {
+        let mut child = match spawn_retrying_busy(&mut cmd) {
             Ok(c) => c,
             Err(e) => {
                 return Ran { status: Err(format!("couldn't start {}: {e}", self.bin.display())), stdout: String::new() }
@@ -1433,4 +1433,23 @@ fn balance_assertion_wants_runpod_live_and_no_overstating_check() {
     assert!(balance_ok(&row("live", serde_json::json!({ "verdict": "overstates" })).to_string()).unwrap_err().contains("overstated"));
     assert!(balance_ok(r#"[{"account": "vast", "source": "live"}]"#).unwrap_err().contains("no runpod row"));
     assert!(balance_ok("{}").is_err() && balance_ok("nope").is_err());
+}
+
+/// `cmd.spawn()`, again (a few times, briefly apart) while exec says the file is busy
+/// (ETXTBSY). A test that has just written its stub script races every other test thread that
+/// forks: a child forked while the stub was still open for writing holds that descriptor until
+/// its own exec, and exec'ing the stub meanwhile fails "Text file busy" (CI, 2026-10-28, the
+/// harness test). Nothing to do with arena; any other error is returned at once.
+fn spawn_retrying_busy(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    const ETXTBSY: i32 = 26; // Linux and macOS alike
+    let mut tries = 0;
+    loop {
+        match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && tries < 20 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
 }
