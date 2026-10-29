@@ -80,13 +80,15 @@ const SEARCH_LIMIT: u32 = 64;
 const MARKET_LIMIT: u32 = 1000;
 
 /// A Vast host's class — Vast's `--cloud` vocabulary, as `COMMUNITY`/`SECURE` are RunPod's.
-/// From the offer's own fields (read-only search, 2026-10-29): `hosting_type` 1 is a
-/// datacenter host (the vast CLI's `datacenter` filter), else `verification` says whether Vast
-/// verified it (`verified`; `unverified`/`deverified` otherwise).
+/// From the offer's own fields (read-only search, 2026-10-29): `verification` says whether Vast
+/// verified the host (`verified`; `unverified`/`deverified` otherwise), and a verified host with
+/// `hosting_type` 1 is a datacenter one (the vast CLI's `datacenter` filter). A datacenter host
+/// Vast doesn't call verified is just unverified: verification is what the default rests on
+/// (review: codex — a deverified datacenter host must not pass the verified-only default).
 ///
 /// As a `--cloud` tier it's the least a create accepts — nested, so a wider tier never rents
-/// worse than a narrower one would: `datacenter` rents datacenter hosts only, `verified` any
-/// verified host (datacenter ones count as verified), `unverified` any host at all. The
+/// worse than a narrower one would: `datacenter` rents (verified) datacenter hosts only,
+/// `verified` any verified host, datacenter ones included, `unverified` any host at all. The
 /// default ([`tier`]) is `verified`, or `unverified` with `VAST_ALLOW_UNVERIFIED=1`: what it
 /// was before there were tiers. Ordered narrowest first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -111,14 +113,11 @@ impl Host {
 
     /// An offer's own class (see [`Host`]). An offer that says nothing is unverified.
     fn of(v: &Value) -> Host {
-        if v.get("hosting_type").and_then(Value::as_u64) == Some(1) {
-            return Host::Datacenter;
-        }
         let verified = v.get("verification").and_then(Value::as_str).is_some_and(|s| s.trim().eq_ignore_ascii_case("verified"));
-        if verified {
-            Host::Verified
-        } else {
-            Host::Unverified
+        match (verified, v.get("hosting_type").and_then(Value::as_u64)) {
+            (true, Some(1)) => Host::Datacenter,
+            (true, _) => Host::Verified,
+            (false, _) => Host::Unverified,
         }
     }
 
@@ -130,7 +129,7 @@ impl Host {
     /// The tier's hosts, for a note or an error: `verified hosts (datacenter ones included)`.
     pub fn hosts(self) -> &'static str {
         match self {
-            Host::Datacenter => "datacenter hosts only",
+            Host::Datacenter => "verified datacenter hosts only",
             Host::Verified => "verified hosts only (datacenter ones included)",
             Host::Unverified => "any host, unverified included",
         }
@@ -289,32 +288,42 @@ impl VastProvider {
     }
 
     /// `offers vast`: what the market sells now for a pod like `base` (its GPU count, disk and
-    /// CUDA floor; any GPU) — one search per host class, each bounded by `limit`, the cheapest
-    /// [`MARKET_LIMIT`] offers of that class. Read-only. Each class's offers fit `base` as a
-    /// create would check them ([`fitting_offer`]) and are of that very class, so the caller
-    /// can take the cheapest per card and class ([`market_rows`]); a search that failed is
-    /// that class's `Err`.
-    pub async fn market(&self, base: &PodSpec, limit: Duration) -> Vec<(Host, std::result::Result<Vec<Offer>, String>)> {
+    /// CUDA floor) — one search per host class for any card, or with `gpus` (`--gpu`) per class
+    /// and card; each bounded by `limit`, the cheapest [`MARKET_LIMIT`] offers. Read-only. Each
+    /// read's offers fit `base` as a create would check them ([`fitting_offer`]) and are of
+    /// that very class, so the caller can take the cheapest per card and class
+    /// ([`market_rows`]); a read that filled the limit says so (pricier cards may be missing:
+    /// review, codex), one that failed is its `Err`.
+    pub async fn market(&self, base: &PodSpec, gpus: &[String], limit: Duration) -> Vec<MarketRead> {
+        let cards: Vec<Option<String>> = if gpus.is_empty() { vec![None] } else { gpus.iter().map(|g| Some(vast_gpu_name(g))).collect() };
         let mut out = Vec::new();
         for class in Host::ALL {
-            let got = match crate::ratelimit::bounded(limit, self.market_class(base, class)).await {
-                Ok(r) => r.map_err(|e| e.to_string()),
-                Err(_) => Err(format!("timed out after {}s", limit.as_secs())),
-            };
-            out.push((class, got));
+            for card in &cards {
+                let got = match crate::ratelimit::bounded(limit, self.market_class(base, class, card.as_deref())).await {
+                    Ok(r) => r.map_err(|e| e.to_string()),
+                    Err(_) => Err(format!("timed out after {}s", limit.as_secs())),
+                };
+                let (offers, full) = match got {
+                    Ok((offers, full)) => (Ok(offers), full),
+                    Err(e) => (Err(e), false),
+                };
+                out.push(MarketRead { class, card: card.clone(), offers, full });
+            }
         }
         out
     }
 
-    /// One class's part of [`Self::market`].
-    async fn market_class(&self, base: &PodSpec, class: Host) -> Result<Vec<Offer>> {
+    /// One read of [`Self::market`]: the fitting offers of `class` (of `card`, when named), and
+    /// whether the search returned as many as it asked for.
+    async fn market_class(&self, base: &PodSpec, class: Host, card: Option<&str>) -> Result<(Vec<Offer>, bool)> {
         if let Some(bad) = base.bad_cuda() {
             return Err(crate::pod::bad_cuda_error(bad));
         }
-        let rb = self.client.put(format!("{}/search/asks/", self.base)).json(&market_body(base, class));
+        let rb = self.client.put(format!("{}/search/asks/", self.base)).json(&market_body(base, class, card));
         let body = send_json(self.auth(rb), "vast search").await?;
         let offers = offers_array(&body)?;
-        Ok(offers.iter().filter(|v| Host::of(v) == class).filter_map(|v| market_offer(v, base)).collect())
+        let full = offers.len() >= MARKET_LIMIT as usize;
+        Ok((offers.iter().filter(|v| Host::of(v) == class).filter_map(|v| market_offer(v, base)).collect(), full))
     }
 
     /// The cheapest offer that fits `spec`, or `None` if nothing suitable is rentable right
@@ -508,7 +517,7 @@ fn cuda_floor(spec: &PodSpec) -> Option<f64> {
 ///
 /// - The vast CLI's base filters, spelled out because the q-wrapped body gets no defaults:
 ///   `rentable`, not `rented`, not `external`; and the tier's ([`Host`]): `verified` on the
-///   `verified` tier, `hosting_type` 1 on `datacenter`, none on `unverified`.
+///   `verified` tier, `verified` and `hosting_type` 1 on `datacenter`, none on `unverified`.
 /// - `num_gpus` *equal* to the count: `gte` could rent (and bill) an 8-GPU box for a 1-GPU pod.
 /// - `allocated_storage` = the disk we'll ask for, so `dph_total` should include its storage
 ///   cost ([`offer_price`] doesn't rely on that).
@@ -529,7 +538,10 @@ fn search_body(spec: &PodSpec, tier: Host) -> Value {
         "limit": SEARCH_LIMIT,
     });
     match tier {
-        Host::Datacenter => q["hosting_type"] = json!({"eq": 1}),
+        Host::Datacenter => {
+            q["verified"] = json!({"eq": true});
+            q["hosting_type"] = json!({"eq": 1});
+        }
         Host::Verified => q["verified"] = json!({"eq": true}),
         Host::Unverified => {}
     }
@@ -549,14 +561,19 @@ fn search_body(spec: &PodSpec, tier: Host) -> Value {
 }
 
 /// The `offers vast` search for one host class: [`search_body`]'s filters for a pod like
-/// `base` but any GPU, and the class's own — `hosting_type` 1 for datacenter hosts, verified
-/// consumer hosts (`hosting_type` 0, `verified`), the rest (`verified` false) — so each
-/// class's cheapest offers aren't crowded out by another's. Pure.
-fn market_body(base: &PodSpec, class: Host) -> Value {
+/// `base`, of `card` (Vast's name) or any GPU, and the class's own — verified datacenter hosts
+/// (`verified`, `hosting_type` 1), verified others (`hosting_type` 0), the rest (`verified`
+/// false) — so each class's cheapest offers aren't crowded out by another's. Pure.
+fn market_body(base: &PodSpec, class: Host, card: Option<&str>) -> Value {
     let mut body = search_body(&PodSpec { max_price: None, region: None, ..base.clone() }, class);
     let q = &mut body["q"];
-    if let Some(m) = q.as_object_mut() {
-        m.remove("gpu_name");
+    match card {
+        Some(c) => q["gpu_name"] = json!({"eq": c}),
+        None => {
+            if let Some(m) = q.as_object_mut() {
+                m.remove("gpu_name");
+            }
+        }
     }
     match class {
         Host::Datacenter => {}
@@ -576,6 +593,16 @@ fn market_offer(v: &Value, base: &PodSpec) -> Option<Offer> {
     fitting_offer(v, &spec, Host::Unverified)
 }
 
+/// One search of [`VastProvider::market`]: a host class (and a card, when `--gpu` named one),
+/// its fitting offers or why the search failed, and whether it filled [`MARKET_LIMIT`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarketRead {
+    pub class: Host,
+    pub card: Option<String>,
+    pub offers: std::result::Result<Vec<Offer>, String>,
+    pub full: bool,
+}
+
 /// One row of `offers vast`: the cheapest offer of a card on hosts of one class.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MarketRow {
@@ -587,11 +614,11 @@ pub struct MarketRow {
 
 /// `offers vast`'s rows from [`VastProvider::market`]'s answer: per card, per host class, the
 /// cheapest offer — cards by VRAM then name, classes narrowest first. Pure.
-pub fn market_rows(market: &[(Host, std::result::Result<Vec<Offer>, String>)]) -> Vec<MarketRow> {
+pub fn market_rows(market: &[MarketRead]) -> Vec<MarketRow> {
     let mut best: HashMap<(String, Host), Offer> = HashMap::new();
-    for (class, got) in market {
-        for o in got.iter().flatten().filter(|o| o.host == *class) {
-            let key = (o.gpu_name.clone(), *class);
+    for read in market {
+        for o in read.offers.iter().flatten().filter(|o| o.host == read.class) {
+            let key = (o.gpu_name.clone(), read.class);
             if best.get(&key).is_none_or(|b| o.price < b.price) {
                 best.insert(key, o.clone());
             }
@@ -2126,13 +2153,14 @@ mod tests {
     }
 
     /// Each tier's search asks Vast for its hosts, and the client re-checks the class: a
-    /// datacenter host (`hosting_type` 1) on `datacenter`, `verified` on `verified` (datacenter
-    /// ones too), anything on `unverified`.
+    /// verified datacenter host (`hosting_type` 1) on `datacenter`, `verified` on `verified`
+    /// (datacenter ones too), anything on `unverified` — and a datacenter host Vast doesn't call
+    /// verified is unverified, never rented by the verified-only default.
     #[test]
     fn a_tier_searches_and_rents_its_hosts_only() {
         let s = spec(R3090, 1, 50);
         let q = |t: Host| search_body(&s, t)["q"].clone();
-        assert_eq!((q(Host::Datacenter)["hosting_type"].clone(), q(Host::Datacenter).get("verified").cloned()), (json!({"eq": 1}), None));
+        assert_eq!((q(Host::Datacenter)["hosting_type"].clone(), q(Host::Datacenter)["verified"].clone()), (json!({"eq": 1}), json!({"eq": true})));
         assert_eq!((q(Host::Verified)["verified"].clone(), q(Host::Verified).get("hosting_type").cloned()), (json!({"eq": true}), None));
         assert!(q(Host::Unverified).get("verified").is_none() && q(Host::Unverified).get("hosting_type").is_none());
         let offer = |verification: &str, hosting: u64| {
@@ -2143,7 +2171,8 @@ mod tests {
         // (offer, its class, rented on datacenter / verified / unverified)
         for (v, class, rents) in [
             (offer("verified", 1), Host::Datacenter, [true, true, true]),
-            (offer("unverified", 1), Host::Datacenter, [true, true, true]),
+            (offer("unverified", 1), Host::Unverified, [false, false, true]), // review: codex
+            (offer("deverified", 1), Host::Unverified, [false, false, true]),
             (offer("verified", 0), Host::Verified, [false, true, true]),
             (offer("deverified", 0), Host::Unverified, [false, false, true]),
         ] {
@@ -2159,23 +2188,26 @@ mod tests {
     #[test]
     fn the_market_is_searched_per_class_and_read_per_card() {
         let base = PodSpec { max_price: Some(0.5), ..spec(R3090, 1, 50) };
-        let q = |c: Host| market_body(&base, c)["q"].clone();
+        let q = |c: Host| market_body(&base, c, None)["q"].clone();
         for c in Host::ALL {
             assert!(q(c).get("gpu_name").is_none() && q(c).get("dph_total").is_none(), "{c:?}: any card, any price");
             assert_eq!(q(c)["limit"], json!(MARKET_LIMIT));
             assert_eq!(q(c)["num_gpus"], json!({"eq": 1}));
         }
-        assert_eq!(q(Host::Datacenter)["hosting_type"], json!({"eq": 1}));
+        // `--gpu`: that card's own search, so a pricier card isn't crowded out (review: codex).
+        assert_eq!(market_body(&base, Host::Verified, Some("H100 SXM"))["q"]["gpu_name"], json!({"eq": "H100 SXM"}));
+        assert_eq!((q(Host::Datacenter)["hosting_type"].clone(), q(Host::Datacenter)["verified"].clone()), (json!({"eq": 1}), json!({"eq": true})));
         assert_eq!((q(Host::Verified)["hosting_type"].clone(), q(Host::Verified)["verified"].clone()), (json!({"eq": 0}), json!({"eq": true})));
         assert_eq!(q(Host::Unverified)["verified"], json!({"eq": false}));
         // The recording's three 3090s (unverified/deverified hosts): one row, the cheapest.
         let offers: Vec<Offer> = fixture_offers().iter().filter_map(|v| market_offer(v, &base)).collect();
         assert_eq!(offers.len(), 3);
-        let rows = market_rows(&[(Host::Unverified, Ok(offers.clone())), (Host::Verified, Err("HTTP 500".into()))]);
+        let read = |class: Host, offers: std::result::Result<Vec<Offer>, String>| MarketRead { class, card: None, offers, full: false };
+        let rows = market_rows(&[read(Host::Unverified, Ok(offers.clone())), read(Host::Verified, Err("HTTP 500".into()))]);
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].gpu.as_str(), rows[0].host, rows[0].offer.id), ("RTX 3090", Host::Unverified, fitting_offers(&fixture_offers(), &spec(R3090, 1, 50), Host::Unverified)[0].id));
         let small = Offer { gpu_name: "RTX A4000".into(), vram_gb: Some(16), host: Host::Verified, ..offers[0].clone() };
-        let rows = market_rows(&[(Host::Unverified, Ok(offers)), (Host::Verified, Ok(vec![small]))]);
+        let rows = market_rows(&[read(Host::Unverified, Ok(offers)), read(Host::Verified, Ok(vec![small]))]);
         assert_eq!(rows.iter().map(|r| (r.gpu.as_str(), r.host)).collect::<Vec<_>>(), [("RTX A4000", Host::Verified), ("RTX 3090", Host::Unverified)]);
     }
 

@@ -313,9 +313,11 @@ pub(crate) fn extra_gpu_types(cfg: &Config) -> Vec<String> {
 }
 
 /// Vast's catalogue: the market now ([`arena_core::provider::vast::VastProvider::market`]:
-/// one search per host class, for a pod of `--gpus` GPUs with the config's disk and CUDA
-/// floor), the cheapest offer per card and class, marked with what `up` would rent. Without a
-/// key, nothing to search: said.
+/// one search per host class — per class and card with `--gpu` — for a pod of `--gpus` GPUs
+/// with the config's disk and CUDA floor), the cheapest offer per card and class, marked with
+/// what `up` would rent. Without a key, or with every search failed, there's no list: an error
+/// (review: codex — an empty table read as an empty market); a search that failed beside
+/// others, or one that filled its limit, is a note.
 async fn vast_catalog(cfg: &Config, flags: &Flags, c: &mut Catalog) -> Result<()> {
     use arena_core::provider::vast;
     if cfg.get("VAST_API_KEY").is_none_or(|k| k.trim().is_empty()) {
@@ -325,13 +327,20 @@ async fn vast_catalog(cfg: &Config, flags: &Flags, c: &mut Catalog) -> Result<()
     let default = vast::tier("", provider.verified_only())?;
     let gpu = flags.gpu.clone();
     let (plan, base) = plan_for(cfg, "vast", flags, gpu.as_deref(), None).await?;
-    let market = provider.market(&base, PRICE_TIMEOUT).await;
-    for (class, got) in &market {
-        if let Err(e) = got {
-            c.notes.push(format!("vast: searching {} hosts failed ({e})", class.key().to_ascii_lowercase()));
+    let wanted: Vec<String> = gpu.as_deref().map(|g| arena_core::placement::split_list(g).iter().map(|t| arena_core::gpu::resolve(t)).collect()).unwrap_or_default();
+    let market = provider.market(&base, &wanted, PRICE_TIMEOUT).await;
+    if let Some(first) = market.iter().find_map(|r| r.offers.as_ref().err()).filter(|_| market.iter().all(|r| r.offers.is_err())) {
+        anyhow::bail!("couldn't search Vast's market: {first}");
+    }
+    for r in &market {
+        let what = format!("{} hosts{}", r.class.key().to_ascii_lowercase(), r.card.as_deref().map(|c| format!(" for {c}")).unwrap_or_default());
+        match &r.offers {
+            Err(e) => c.notes.push(format!("vast: searching {what} failed ({e})")),
+            Ok(_) if r.full => c.notes.push(format!("vast: only the cheapest offers on {what} were read — --gpu names a card to search it alone")),
+            Ok(_) => {}
         }
     }
-    let wanted = gpu.as_deref().map(|g| arena_core::placement::split_list(g).iter().map(|t| arena_core::gpu::resolve(t)).collect::<Vec<_>>().join(","));
+    let wanted = (!wanted.is_empty()).then(|| wanted.join(","));
     c.rows = offers::vast_rows(&vast::market_rows(&market), base.gpu_count, default, Some(&plan), &row_filter(cfg, flags, wanted.as_deref()));
     c.notes.push(format!(
         "# = what `up` would rent · each class's cheapest offer now (each create searches again) · up rents {} \

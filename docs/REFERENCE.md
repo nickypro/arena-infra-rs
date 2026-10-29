@@ -425,11 +425,11 @@ names (`NVIDIA GeForce RTX 3090` → `RTX 3090`, `RTX 4000 Ada Generation` → `
 finds nothing).
 
 **Host classes are Vast's `--cloud` tiers**, as `COMMUNITY`/`SECURE` are RunPod's (`vast::Host`, from
-each offer's own fields, read-only 2026-10-29): `datacenter` (`hosting_type` 1 — the vast CLI's
-`datacenter` filter), `verified` (`verification` is `verified`), `unverified` (anything else,
-`deverified` included). A tier is the least a create accepts, nested: `--cloud datacenter` rents
-datacenter hosts only, `verified` any verified host (datacenter ones count as verified),
-`unverified` any host — the same opt-in as `VAST_ALLOW_UNVERIFIED=1`, for one run. No `--cloud`, or a
+each offer's own fields, read-only 2026-10-29): `datacenter` (verified, and `hosting_type` 1 — the
+vast CLI's `datacenter` filter), `verified` (`verification` is `verified`), `unverified` (anything
+else, `deverified` included — a datacenter host Vast doesn't call verified too). A tier is the least
+a create accepts, nested: `--cloud datacenter` rents verified datacenter hosts only, `verified` any
+verified host (datacenter ones count as verified), `unverified` any host — the same opt-in as `VAST_ALLOW_UNVERIFIED=1`, for one run. No `--cloud`, or a
 RunPod tier (config `CLOUD_TYPE` usually holds `COMMUNITY`): the default, verified, or any host with
 `VAST_ALLOW_UNVERIFIED=1` — what Vast rented before there were tiers. A list (`--cloud
 datacenter,verified`) is one option per tier through the same planner as RunPod's, each priced by its
@@ -1017,10 +1017,13 @@ filter the rows; a row whose price is unknown doesn't pass a cap.
   listed, and a note says so: v2's create takes `cpu` *instead of* `gpu`, and arena always sends
   `gpu` (an `--api-json` `cpu` would be refused by RunPod: exactly one of the two).
 - **Vast**: the GPUs on the market now — three searches, one per host class, each for a pod of
-  `--gpus` GPUs with the config's disk and CUDA floor, any card, its 1000 cheapest offers — and per
-  card and class the cheapest offer: $/h per GPU and where it is. A class `up` wouldn't rent as
-  configured says `--cloud unverified`. `#` is on the row each option would rent: the cheapest of
-  the classes its tier admits. Each create searches again.
+  `--gpus` GPUs with the config's disk and CUDA floor, any card, its 1000 cheapest offers (with
+  `--gpu`, one per class and card instead, so a pricier card isn't crowded out; a search that
+  filled its 1000 says so) — and per card and class the cheapest offer: $/h per GPU and where it
+  is. A class `up` wouldn't rent as configured says `--cloud unverified`. `#` is on the row each
+  option tried anywhere would rent: the cheapest of the classes its tier admits (a near option
+  rents in its region, which these rows don't show). Each create searches again. Every search
+  failed (an expired key): the list failed; some: a note.
 - **Hetzner**: every server type on sale somewhere now — vCPUs, RAM, disk, €/h in its cheapest
   location, where it's sold — grouped by family with a line heading each: `cx` (shared x86,
   cost-optimised), `cpx` (shared AMD: the newer `cpx?2` first, then the older, US-only `cpx?1`),

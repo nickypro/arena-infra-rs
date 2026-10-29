@@ -633,7 +633,9 @@ pub fn runpod_rows(cat: &RunpodCatalog, unlisted: &[Unlisted], plan: Option<&Opt
 /// `arena offers vast`'s rows from the market's cheapest offer per card and host class
 /// ([`crate::provider::vast::market_rows`]), prices per GPU. `default`: the tier a create
 /// rents on as configured — a row it wouldn't rent says `--cloud unverified`. `plan` marks
-/// the row each option would rent: the cheapest of the classes its tier admits. Pure.
+/// the row each option would rent: the cheapest of the classes its tier admits. Only options
+/// tried anywhere: a near option rents in its region, which these worldwide rows don't show
+/// (review: codex). Pure.
 pub fn vast_rows(
     market: &[crate::provider::vast::MarketRow],
     gpu_count: u32,
@@ -664,6 +666,9 @@ pub fn vast_rows(
         .collect();
     for (i, o) in plan.map(|p| p.options.as_slice()).unwrap_or_default().iter().enumerate() {
         let Ok(t) = tier(o.cloud.as_deref().unwrap_or(""), default != Host::Unverified) else { continue };
+        if o.near.is_some() {
+            continue;
+        }
         let pick = rows
             .iter_mut()
             .filter(|r| same(&o.gpu, &r.gpu) && Host::ALL.iter().any(|h| Some(h.key()) == r.cloud.as_deref() && t.admits(*h)))
@@ -1189,6 +1194,11 @@ mod tests {
             [("DATACENTER", Some(0.20), Some(1), None), ("VERIFIED", Some(0.15), Some(2), None), ("UNVERIFIED", Some(0.10), None, Some("--cloud unverified"))]
         );
         assert_eq!(rows[1].location.as_deref(), Some("Spain, ES"));
+        // A near option rents in its region, which these rows don't show: it marks none.
+        let mut near = plan.clone();
+        near.options[0].near = Some(Region::Europe);
+        let marked: Vec<Option<usize>> = vast_rows(&market, 2, Host::Verified, Some(&near), &RowFilter { gpu_count: 2, ..RowFilter::default() }).iter().map(|r| r.try_order).collect();
+        assert_eq!(marked, [None, Some(2), None]);
         let out = render_rows(&rows);
         assert_eq!(out.lines().next(), Some("#  GPU        VRAM  CLOUD       PER GPU  WHERE       NOTE"), "{out}");
         // --gpu by RunPod's id or Vast's name; --cloud by class.
