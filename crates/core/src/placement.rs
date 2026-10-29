@@ -177,11 +177,17 @@ impl Request {
 
     /// Checks that need the target provider. On RunPod every tier must be COMMUNITY or
     /// SECURE — prices are quoted per tier, and v2 creates on SECURE when the tier isn't one
-    /// it knows. A GPU provider needs a GPU type (config's may be unset).
+    /// it knows; on Vast one of its host classes, or a RunPod tier (its default,
+    /// [`crate::provider::vast::tier`]). A GPU provider needs a GPU type (config's may be unset).
     pub fn validate_for(&self, provider: &str) -> Result<()> {
         if provider == "runpod" {
             if let Some(bad) = self.clouds.iter().find(|c| !matches!(c.as_str(), "COMMUNITY" | "SECURE")) {
                 return Err(Error::Config(format!("--cloud `{bad}`: RunPod tiers are COMMUNITY and SECURE")));
+            }
+        }
+        if provider == "vast" {
+            for c in &self.clouds {
+                crate::provider::vast::tier(c, true)?;
             }
         }
         if provider != "hetzner" && self.gpus.iter().any(|g| g.trim().is_empty()) {
@@ -211,17 +217,33 @@ pub struct PriceBook {
     /// Back unpriced GPUs with the [`gpu::PRESETS`] estimates. Only for RunPod: the presets
     /// *are* RunPod prices, so on another provider they'd be fiction.
     estimates: bool,
-    /// Marketplace quotes (Vast): `(gpu, $/h per GPU)` from the cheapest matching offer when
-    /// the plan was made. A GPU with no offer then isn't here — unpriced.
-    offers: Vec<(String, f64)>,
+    /// Marketplace quotes (Vast, Shadeform): `(gpu, $/h per GPU)` from the cheapest matching
+    /// offer when the plan was made. A GPU with no offer then isn't here — unpriced.
+    offers: Vec<MarketPrice>,
     /// The same, among offers near the proxy only ([`Self::with_near_offers`]).
-    near_offers: Vec<(String, f64)>,
+    near_offers: Vec<MarketPrice>,
     /// Whether the market was searched near the proxy at all — without it (no key) a GPU
     /// missing from `near_offers` says nothing about the region.
     near_searched: bool,
     /// GPUs whose near search failed ([`Self::with_near_failed`]): no offer for them says
-    /// nothing about the region either.
-    near_failed: Vec<String>,
+    /// nothing about the region either. With the tier searched ([`Self::for_cloud`]).
+    near_failed: Vec<(String, Option<String>)>,
+}
+
+/// A marketplace's quote for one GPU: `$/h` per GPU, and the tier it was searched on (Vast's
+/// host classes, [`crate::provider::vast::Host`]) — `None`: any option's tier.
+#[derive(Debug, Clone, PartialEq)]
+struct MarketPrice {
+    gpu: String,
+    cloud: Option<String>,
+    per_gpu: f64,
+}
+
+impl MarketPrice {
+    /// Whether this quote prices `gpu` on `cloud`.
+    fn prices(&self, gpu: &str, cloud: Option<&str>) -> bool {
+        self.gpu == gpu && self.cloud.as_deref().is_none_or(|t| cloud.is_some_and(|c| c.eq_ignore_ascii_case(t)))
+    }
 }
 
 impl PriceBook {
@@ -243,15 +265,35 @@ impl PriceBook {
     /// prices and caps it the same way. Live, but a snapshot: each create searches again and
     /// rents the cheapest offer *then* — never above `--max-price` ([`PodSpec::max_price`]).
     pub fn offers(per_pod: Vec<(String, f64)>, gpu_count: u32) -> Self {
-        let n = f64::from(gpu_count.max(1));
-        Self { offers: per_pod.into_iter().map(|(gpu, p)| (gpu, p / n)).collect(), ..Self::default() }
+        Self { offers: per_gpu(per_pod, gpu_count), ..Self::default() }
+    }
+
+    /// The book's marketplace quotes as searched on one tier (`cloud`, e.g. Vast's `VERIFIED`):
+    /// they price only options of that tier. Quotes already tagged keep their tier.
+    pub fn for_cloud(mut self, cloud: &str) -> Self {
+        for p in self.offers.iter_mut().chain(self.near_offers.iter_mut()) {
+            p.cloud.get_or_insert_with(|| cloud.to_string());
+        }
+        for (_, c) in self.near_failed.iter_mut() {
+            c.get_or_insert_with(|| cloud.to_string());
+        }
+        self
+    }
+
+    /// Both books' marketplace quotes (one per tier searched, [`Self::for_cloud`]). Catalogs
+    /// and estimates are `self`'s.
+    pub fn merge(mut self, other: PriceBook) -> Self {
+        self.offers.extend(other.offers);
+        self.near_offers.extend(other.near_offers);
+        self.near_searched |= other.near_searched;
+        self.near_failed.extend(other.near_failed);
+        self
     }
 
     /// Vast, near the proxy: each GPU option's cheapest matching offer in the region, $/h per
     /// pod, as [`Self::offers`] takes them. What a near option is priced (and capped) at.
     pub fn with_near_offers(mut self, per_pod: Vec<(String, f64)>, gpu_count: u32) -> Self {
-        let n = f64::from(gpu_count.max(1));
-        self.near_offers = per_pod.into_iter().map(|(gpu, p)| (gpu, p / n)).collect();
+        self.near_offers = per_gpu(per_pod, gpu_count);
         self.near_searched = true;
         self
     }
@@ -260,13 +302,19 @@ impl PriceBook {
     /// tried anywhere only, and the plan says the search failed rather than that the region
     /// has no matching offer (review: codex, claude).
     pub fn with_near_failed(mut self, gpus: Vec<String>) -> Self {
-        self.near_failed = gpus;
+        self.near_failed = gpus.into_iter().map(|g| (g, None)).collect();
         self
     }
 
-    /// Vast: the cheapest near offer's $/h per GPU for `gpu`; `None` = none (or not searched).
-    fn near_offer(&self, gpu: &str) -> Option<f64> {
-        self.near_offers.iter().find(|(g, _)| g == gpu).map(|(_, p)| *p).filter(|p| p.is_finite() && *p > 0.0)
+    /// Vast: the cheapest near offer's $/h per GPU for `gpu` on `cloud`; `None` = none (or not
+    /// searched).
+    fn near_offer(&self, gpu: &str, cloud: Option<&str>) -> Option<f64> {
+        self.near_offers.iter().find(|p| p.prices(gpu, cloud)).map(|p| p.per_gpu).filter(|p| p.is_finite() && *p > 0.0)
+    }
+
+    /// Whether the near search for `gpu` on `cloud` failed.
+    fn near_search_failed(&self, gpu: &str, cloud: Option<&str>) -> bool {
+        self.near_failed.iter().any(|(g, t)| g == gpu && t.as_deref().is_none_or(|t| cloud.is_some_and(|c| c.eq_ignore_ascii_case(t))))
     }
 
     /// RunPod: what the live catalog for `cloud` says about `gpu` in `region` — from REST
@@ -316,8 +364,8 @@ impl PriceBook {
     /// offered there", and is *not* back-filled with a preset (same rule as `arena gpus`).
     /// Only a GPU with no live price at all falls back to the preset estimate.
     pub fn quote(&self, gpu: &str, cloud: Option<&str>) -> Quote {
-        if let Some((_, p)) = self.offers.iter().find(|(g, _)| g == gpu) {
-            let price_per_gpu = Some(*p).filter(|p| p.is_finite() && *p > 0.0);
+        if let Some(p) = self.offers.iter().find(|p| p.prices(gpu, cloud)) {
+            let price_per_gpu = Some(p.per_gpu).filter(|p| p.is_finite() && *p > 0.0);
             return Quote { price_per_gpu, source: price_per_gpu.map(|_| PriceSource::Live), stock: None };
         }
         let secure = cloud.is_some_and(|c| c.eq_ignore_ascii_case("SECURE"));
@@ -345,6 +393,12 @@ impl PriceBook {
         let stock = cloud.and_then(|c| tagged(Some(c))).or_else(|| tagged(None));
         Quote { price_per_gpu, source, stock }
     }
+}
+
+/// `(gpu, $/h per pod)` quotes as [`MarketPrice`]s per GPU, for any tier.
+fn per_gpu(per_pod: Vec<(String, f64)>, gpu_count: u32) -> Vec<MarketPrice> {
+    let n = f64::from(gpu_count.max(1));
+    per_pod.into_iter().map(|(gpu, p)| MarketPrice { gpu, cloud: None, per_gpu: p / n }).collect()
 }
 
 /// What RunPod's catalog says about an option near the proxy ([`PriceBook::runpod_near`]).
@@ -479,7 +533,7 @@ fn gpu_short(api: &str, prices: &PriceBook) -> String {
 /// slice's memory (`NVIDIA B300 SXM6 AC MIG 1g.34gb` → `B300 MIG 34GB`; `NVIDIA RTX PRO 6000
 /// Blackwell Server Edition MIG 2g.48gb` → `PRO 6000 MIG 48GB`). Checked against every MIG
 /// entry of the recorded catalog. `None` for an id it can't read that way. Pure.
-fn mig_label(api: &str) -> Option<String> {
+pub(crate) fn mig_label(api: &str) -> Option<String> {
     let (parent, profile) = api.split_once(" MIG ")?;
     let mem = profile.trim().split_once('.')?.1.to_ascii_lowercase();
     let gb: u32 = mem.strip_suffix("gb")?.parse().ok()?;
@@ -501,8 +555,10 @@ fn mig_label(api: &str) -> Option<String> {
 
 /// Expand, price, filter and order the options for `provider`. Pure.
 ///
-/// Cloud tiers only exist on RunPod: elsewhere the cloud list collapses to one option per
-/// GPU (with a note when more than one tier was asked for). Hetzner creates CPU VMs from
+/// Cloud tiers exist on RunPod (`COMMUNITY`/`SECURE`) and Vast (its host classes, which the
+/// caller has already turned `--cloud` into: [`crate::provider::vast::plan_tiers`]):
+/// elsewhere the cloud list collapses to one option per GPU (with a note when more than one
+/// tier was asked for). Hetzner creates CPU VMs from
 /// `--server-type` / `HETZNER_SERVER_TYPE`, so the GPU list collapses too — one option.
 ///
 /// With a cap, an option is kept only when its per-pod price is known and within it; an
@@ -512,7 +568,7 @@ fn mig_label(api: &str) -> Option<String> {
 /// With [`Request::near`], options near the proxy come first ([`near_first`]).
 pub fn plan_options(req: &Request, provider: &str, prices: &PriceBook) -> OptionPlan {
     let mut notes = Vec::new();
-    let tiered = provider == "runpod";
+    let tiered = matches!(provider, "runpod" | "vast");
     let cpu_only = provider == "hetzner";
     let clouds: Vec<Option<String>> = if tiered {
         req.clouds.iter().cloned().map(Some).collect()
@@ -659,9 +715,9 @@ fn near_first(
                     NearStock::Unknown => (o.price_per_gpu, o.price_source, None),
                 }
             }
-            _ => match prices.near_offer(&o.gpu) {
+            _ => match prices.near_offer(&o.gpu, o.cloud.as_deref()) {
                 Some(p) => (Some(p), Some(PriceSource::Live), None),
-                None if prices.near_failed.iter().any(|g| g == &o.gpu) => {
+                None if prices.near_search_failed(&o.gpu, o.cloud.as_deref()) => {
                     why_not.push(format!("{}: searching {region} failed", o.describe()));
                     twins.push(None);
                     continue;
@@ -1002,8 +1058,10 @@ impl Progress<'_> {
                     Outcome::Created { pod_id } => {
                         format!("[created] {name} id={pod_id} on {on} ({})", option.price_label())
                     }
-                    Outcome::Capacity(_) => format!(
-                        "[no capacity] {name} on {on}{}",
+                    // The provider's own words: "no capacity" for a type it doesn't know at all
+                    // reads differently (RunPod: a 422 "Unknown GPU type", `[rejected]`).
+                    Outcome::Capacity(e) => format!(
+                        "[no capacity] {name} on {on}: {e}{}",
                         if *next { " — trying the next option" } else { " — no option left this round" }
                     ),
                     Outcome::Denied(e) => format!(
@@ -1462,7 +1520,10 @@ mod tests {
     fn validate_rejects_unknown_runpod_tiers_and_missing_gpu() {
         let r = req(&[A4000], &["COMMUNITY", "ALL"], 1, None, Order::Cheapest);
         assert!(r.validate_for("runpod").unwrap_err().to_string().contains("`ALL`"));
-        assert!(r.validate_for("vast").is_ok()); // no tiers there: collapsed, not sent
+        assert!(r.validate_for("shadeform").is_ok()); // no tiers there: collapsed, not sent
+        assert!(r.validate_for("vast").unwrap_err().to_string().contains("Vast's cloud types are datacenter, verified and unverified"));
+        let vast = req(&[A4000], &["COMMUNITY", "DATACENTER", "VERIFIED", "UNVERIFIED"], 1, None, Order::Cheapest);
+        assert!(vast.validate_for("vast").is_ok(), "its classes, and RunPod's tiers (its default)");
         let none = req(&[""], &["COMMUNITY"], 1, None, Order::Cheapest);
         assert!(none.validate_for("runpod").unwrap_err().to_string().contains("GPU_TYPE"));
         assert!(none.validate_for("hetzner").is_ok());
@@ -1655,16 +1716,24 @@ mod tests {
     }
 
     #[test]
-    fn tiers_collapse_off_runpod_and_gpus_collapse_on_hetzner() {
+    fn tiers_collapse_off_runpod_and_vast_and_gpus_collapse_on_hetzner() {
         let r = req(&[A4000, R3090], &["COMMUNITY", "SECURE"], 1, None, Order::Cheapest);
-        let vast = plan_options(&r, "vast", &PriceBook::unpriced());
-        assert_eq!(order_of(&vast), [opt("1×RTX A4000", None), opt("1×RTX 3090", None)]); // unpriced: listed order
-        assert!(vast.notes[0].contains("vast has no cloud tiers"), "{:?}", vast.notes);
+        let sf = plan_options(&r, "shadeform", &PriceBook::unpriced());
+        assert_eq!(order_of(&sf), [opt("1×RTX A4000", None), opt("1×RTX 3090", None)]); // unpriced: listed order
+        assert!(sf.notes[0].contains("shadeform has no cloud tiers"), "{:?}", sf.notes);
+        // Vast's tiers are its host classes (the CLI turned `--cloud` into them): one option each,
+        // priced per tier — a quote searched on one tier prices only that tier's option.
+        let tiers = req(&[A4000], &["DATACENTER", "VERIFIED"], 1, None, Order::Cheapest);
+        let book = PriceBook::offers(vec![(A4000.into(), 0.30)], 1).for_cloud("DATACENTER").merge(PriceBook::offers(vec![(A4000.into(), 0.20)], 1).for_cloud("VERIFIED"));
+        let vast = plan_options(&tiers, "vast", &book);
+        assert_eq!(order_of(&vast), [opt("1×RTX A4000", Some("VERIFIED")), opt("1×RTX A4000", Some("DATACENTER"))]);
+        assert_eq!(vast.options.iter().map(|o| o.price_per_pod.map(milli)).collect::<Vec<_>>(), [Some(200), Some(300)]);
+        assert!(vast.notes.is_empty(), "{:?}", vast.notes);
         let hz = plan_options(&r, "hetzner", &PriceBook::unpriced());
         assert_eq!(order_of(&hz), [opt("CPU VM", None)]);
         assert_eq!(hz.notes.len(), 2, "{:?}", hz.notes);
         // A cap leaves nothing to try on an unpriced provider — reported, not risked.
-        let capped = plan_options(&req(&[A4000], &["COMMUNITY"], 1, Some(1.0), Order::Cheapest), "vast", &PriceBook::unpriced());
+        let capped = plan_options(&req(&[A4000], &["VERIFIED"], 1, Some(1.0), Order::Cheapest), "vast", &PriceBook::unpriced());
         assert!(capped.options.is_empty());
         assert_eq!(capped.dropped.len(), 1);
     }
@@ -1679,7 +1748,7 @@ mod tests {
         };
         let row = |label: &str, m: Option<i64>| (label.to_string(), m);
         let book = PriceBook::offers(vec![(R3090.into(), 0.105_78), (A4000.into(), 0.20)], 1);
-        let plan = plan_options(&req(&[A4000, R3090, ADA], &["COMMUNITY"], 1, None, Order::Cheapest), "vast", &book);
+        let plan = plan_options(&req(&[A4000, R3090, ADA], &["VERIFIED"], 1, None, Order::Cheapest), "vast", &book);
         assert_eq!(
             priced(&plan),
             [row("1×RTX 3090", Some(106)), row("1×RTX A4000", Some(200)), row("1×RTX 4000 Ada", None)],
@@ -1688,12 +1757,12 @@ mod tests {
         assert_eq!(plan.options[0].price_source, Some(PriceSource::Live));
         assert_eq!(plan.options[0].price_label(), "$0.11/h");
         // The cap drops the dearer option and the unpriced one, with reasons.
-        let capped = plan_options(&req(&[A4000, R3090, ADA], &["COMMUNITY"], 1, Some(0.15), Order::Cheapest), "vast", &book);
+        let capped = plan_options(&req(&[A4000, R3090, ADA], &["VERIFIED"], 1, Some(0.15), Order::Cheapest), "vast", &book);
         assert_eq!(priced(&capped), [row("1×RTX 3090", Some(106))]);
         let reasons: Vec<&str> = capped.dropped.iter().map(|d| d.reason.as_str()).collect();
         assert_eq!(reasons, ["$0.20/h > cap $0.15/h per pod", "no known price, so --max-price can't be checked"]);
         // A 2-GPU offer's price is the pod's: kept per GPU, multiplied back.
-        let two = plan_options(&req(&[R3090], &["COMMUNITY"], 2, Some(0.25), Order::Cheapest), "vast", &PriceBook::offers(vec![(R3090.into(), 0.25)], 2));
+        let two = plan_options(&req(&[R3090], &["VERIFIED"], 2, Some(0.25), Order::Cheapest), "vast", &PriceBook::offers(vec![(R3090.into(), 0.25)], 2));
         assert_eq!(priced(&two), [row("2×RTX 3090", Some(250))]);
     }
 
@@ -1776,12 +1845,12 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         assert!(on(r(&["SECURE"]), "runpod", &b));
         assert!(on(r(&["COMMUNITY", "SECURE"]), "runpod", &b));
         assert!(!on(r(&["COMMUNITY"]), "runpod", &b));
-        assert!(on(r(&["COMMUNITY"]), "vast", &b));
+        assert!(on(r(&["VERIFIED"]), "vast", &b));
         assert!(!on(r(&["SECURE"]), "hetzner", &b));
         assert!(!on(r(&["SECURE"]), "shadeform", &b));
         let pinned = PodSpec { api_extra: serde_json::json!({"dataCenterIds": ["US-TX-3"]}).as_object().cloned(), ..b.clone() };
         assert!(!on(r(&["SECURE"]), "runpod", &pinned), "the operator's own pin wins");
-        assert!(on(r(&["COMMUNITY"]), "vast", &pinned), "a RunPod field means nothing to Vast");
+        assert!(on(r(&["VERIFIED"]), "vast", &pinned), "a RunPod field means nothing to Vast");
         let volume = PodSpec { api_extra: serde_json::json!({"mounts": {"network": [{"volumeId": "v1", "path": "/d"}]}}).as_object().cloned(), ..b.clone() };
         assert!(!on(r(&["SECURE"]), "runpod", &volume), "a network volume lives in one data centre");
         assert!(r(&["SECURE"]).with_near(None, "runpod", &b).near.is_none(), "NEAR=any");
@@ -1869,7 +1938,7 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
     fn vast_near_offers_within_the_margin_first_and_capped() {
         let book = PriceBook::offers(vec![(A4000.into(), 0.109), (R3090.into(), 0.10)], 1)
             .with_near_offers(vec![(A4000.into(), 0.1096), (R3090.into(), 0.20)], 1);
-        let plan = plan_options(&near_req(&[A4000, R3090, ADA], &["COMMUNITY"], None, Order::Cheapest, EU), "vast", &book);
+        let plan = plan_options(&near_req(&[A4000, R3090, ADA], &["VERIFIED"], None, Order::Cheapest, EU), "vast", &book);
         let got: Vec<(String, bool, Option<i64>, Option<i64>)> =
             plan.options.iter().map(|o| (o.label.clone(), o.near.is_some(), o.price_per_pod.map(milli), o.cap.map(milli))).collect();
         let row = |l: &str, near: bool, p: Option<i64>, cap: Option<i64>| (l.to_string(), near, p, cap);
@@ -1886,15 +1955,15 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         assert_eq!(
             why,
             [
-                "near, not tried in Europe: 1×RTX 3090 in Europe: $0.20/h is more than +25% over $0.10/h",
-                "near, not tried in Europe: 1×RTX 4000 Ada: no matching offer in Europe right now",
+                "near, not tried in Europe: 1×RTX 3090 VERIFIED in Europe: $0.20/h is more than +25% over $0.10/h",
+                "near, not tried in Europe: 1×RTX 4000 Ada VERIFIED: no matching offer in Europe right now",
             ]
         );
         // Under a tighter --max-price, the cap is that.
-        let capped = plan_options(&near_req(&[A4000], &["COMMUNITY"], Some(0.115), Order::Cheapest, EU), "vast", &book);
+        let capped = plan_options(&near_req(&[A4000], &["VERIFIED"], Some(0.115), Order::Cheapest, EU), "vast", &book);
         assert_eq!(capped.options[0].cap.map(milli), Some(115));
         // As listed, the margin is over the same card anywhere: the 3090's $0.20 is +100%.
-        let listed = plan_options(&near_req(&[R3090, A4000], &["COMMUNITY"], None, Order::Listed, EU), "vast", &book);
+        let listed = plan_options(&near_req(&[R3090, A4000], &["VERIFIED"], None, Order::Listed, EU), "vast", &book);
         let order: Vec<(String, bool)> = listed.options.iter().map(|o| (o.label.clone(), o.near.is_some())).collect();
         assert_eq!(order, [("1×RTX 3090".to_string(), false), ("1×RTX A4000".into(), true), ("1×RTX A4000".into(), false)]);
         assert_eq!(listed.options[1].cap.map(milli), Some(136), "$0.109 × 1.25");
@@ -1907,13 +1976,13 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
     fn a_vast_near_option_needs_a_price_anywhere_to_cap_it() {
         let book = PriceBook::offers(Vec::new(), 1).with_near_offers(vec![(A4000.into(), 0.11)], 1);
         for order in [Order::Cheapest, Order::Listed] {
-            let plan = plan_options(&near_req(&[A4000], &["COMMUNITY"], None, order, EU), "vast", &book);
+            let plan = plan_options(&near_req(&[A4000], &["VERIFIED"], None, order, EU), "vast", &book);
             assert!(plan.options.iter().all(|o| o.near.is_none()), "{order:?}: {:?}", plan.options);
-            assert!(plan.notes.iter().any(|n| n == "near, not tried in Europe: 1×RTX A4000 in Europe: no price anywhere to weigh it against"), "{:?}", plan.notes);
+            assert!(plan.notes.iter().any(|n| n == "near, not tried in Europe: 1×RTX A4000 VERIFIED in Europe: no price anywhere to weigh it against"), "{:?}", plan.notes);
         }
         // Every near Vast option that is planned carries a finite cap.
         let priced = PriceBook::offers(vec![(A4000.into(), 0.10)], 1).with_near_offers(vec![(A4000.into(), 0.11)], 1);
-        let plan = plan_options(&near_req(&[A4000], &["COMMUNITY"], None, Order::Cheapest, EU), "vast", &priced);
+        let plan = plan_options(&near_req(&[A4000], &["VERIFIED"], None, Order::Cheapest, EU), "vast", &priced);
         assert!(plan.options.iter().filter(|o| o.near.is_some()).all(|o| o.cap.is_some_and(f64::is_finite)));
     }
 
@@ -2191,7 +2260,7 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
         assert_eq!(fake.calls(), [call("arena8-apple", A4000, "COMMUNITY"), call("arena8-apple", R3090, "COMMUNITY")]);
         assert_eq!(out.log[0].placed, Some(1));
         assert_eq!(out.created.len(), 1);
-        assert_eq!(lines[0], "[no capacity] arena8-apple on 1×RTX A4000 COMMUNITY — trying the next option");
+        assert_eq!(lines[0], "[no capacity] arena8-apple on 1×RTX A4000 COMMUNITY: provider error: create pod HTTP 500: There are no instances currently available — trying the next option");
         assert_eq!(lines[1], "[created] arena8-apple id=id1 on 1×RTX 3090 COMMUNITY ($0.22/h)");
     }
 
@@ -2326,7 +2395,7 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
         assert_eq!(calls[0], call("devtest-near-0", A4000, NEAR_SECURE));
         assert!(calls[1..].iter().all(|(_, g, c)| g == A4000 && c == "SECURE"), "the rest anywhere: {calls:?}");
         assert_eq!(out.created.len(), 10);
-        assert_eq!(lines[0], "[no capacity] devtest-near-0 on 1×RTX A4000 SECURE in Europe — trying the next option");
+        assert_eq!(lines[0], "[no capacity] devtest-near-0 on 1×RTX A4000 SECURE in Europe: provider error: create pod HTTP 500: There are no instances currently available — trying the next option");
         assert!(render_summary(&plan, &out).contains("created on 1×RTX A4000 SECURE ($0.25/h) (after 1×RTX A4000 SECURE in Europe: capacity)"));
         // Near off: the same run, 10 creates.
         let off = Fake::new(Reply::Ok);
@@ -2355,7 +2424,7 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
                 call("devtest-near-bloom", A4000, "SECURE"),
             ]
         );
-        assert_eq!(lines[1], "[no capacity] devtest-near-apple on 1×RTX A4000 SECURE — no option left this round");
+        assert_eq!(lines[1], "[no capacity] devtest-near-apple on 1×RTX A4000 SECURE: provider error: create pod HTTP 500: There are no instances currently available — no option left this round");
     }
 
     /// Review (claude): a near Vast "no capacity" is one market search's answer — blocked for
@@ -2363,20 +2432,20 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
     #[tokio::test(start_paused = true)]
     async fn a_marketplace_region_is_retried_the_next_round() {
         let book = PriceBook::offers(vec![(A4000.into(), 0.10)], 1).with_near_offers(vec![(A4000.into(), 0.11)], 1);
-        let plan = plan_options(&near_req(&[A4000], &["COMMUNITY"], None, Order::Cheapest, EU), "vast", &book);
-        let fake = Fake::new(Reply::Capacity).script(A4000, "COMMUNITY@europe", &[Reply::Capacity, Reply::Ok]);
+        let plan = plan_options(&near_req(&[A4000], &["VERIFIED"], None, Order::Cheapest, EU), "vast", &book);
+        let fake = Fake::new(Reply::Capacity).script(A4000, "VERIFIED@europe", &[Reply::Capacity, Reply::Ok]);
         let rounds = Rounds { window: Duration::from_secs(600), every: Duration::from_secs(60) };
         let (out, _) = run(&fake, &plan, &["devtest-near-apple"], rounds, None).await;
         assert!(matches!(out.end, End::Filled), "{:?}", out.end);
         let clouds: Vec<String> = fake.calls().into_iter().map(|c| c.2).collect();
-        assert_eq!(clouds, ["COMMUNITY@europe", "COMMUNITY", "COMMUNITY@europe"], "round 2 tries Europe again, and gets it");
+        assert_eq!(clouds, ["VERIFIED@europe", "VERIFIED", "VERIFIED@europe"], "round 2 tries Europe again, and gets it");
     }
 
     /// Without a near search (no Vast key: nothing searched) the plan claims nothing about the
     /// region — review (claude): it said "no matching offer in Europe right now".
     #[test]
     fn an_unsearched_region_is_said_so() {
-        let plan = plan_options(&near_req(&[A4000], &["COMMUNITY"], None, Order::Cheapest, EU), "vast", &PriceBook::offers(vec![(A4000.into(), 0.10)], 1));
+        let plan = plan_options(&near_req(&[A4000], &["VERIFIED"], None, Order::Cheapest, EU), "vast", &PriceBook::offers(vec![(A4000.into(), 0.10)], 1));
         assert!(plan.options.iter().all(|o| o.near.is_none()));
         assert_eq!(plan.notes, ["near the proxy (NEAR=europe): Europe not searched — every option anywhere"]);
     }
@@ -2387,13 +2456,13 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
     #[tokio::test]
     async fn a_near_marketplace_create_is_capped_at_the_margin() {
         let book = PriceBook::offers(vec![(A4000.into(), 0.10)], 1).with_near_offers(vec![(A4000.into(), 0.11)], 1);
-        let plan = plan_options(&near_req(&[A4000], &["COMMUNITY"], Some(0.30), Order::Cheapest, EU), "vast", &book);
+        let plan = plan_options(&near_req(&[A4000], &["VERIFIED"], Some(0.30), Order::Cheapest, EU), "vast", &book);
         let fake = Fake::new(Reply::Capacity);
         let (out, _) = run(&fake, &plan, &["devtest-near-apple"], ONE_ROUND, None).await;
         assert!(matches!(out.end, End::Exhausted), "{:?}", out.end);
         let caps: Vec<Option<i64>> = fake.caps.lock().unwrap().iter().map(|c| c.map(milli)).collect();
         assert_eq!(caps, [Some(125), Some(300)], "near: $0.10 × 1.25; anywhere: --max-price");
-        assert_eq!(fake.calls()[0].2, "COMMUNITY@europe");
+        assert_eq!(fake.calls()[0].2, "VERIFIED@europe");
     }
 
     /// The run ends once nothing is left to try ever again: Europe full (out for the run) and
@@ -2807,9 +2876,13 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
         assert_eq!((s.name.as_str(), s.gpu_type.as_str(), s.cloud_type.as_str(), s.gpu_count), ("arena8-apple", A4000, "SECURE", 1));
         assert_eq!(s.env, [("MACHINE_NAME".to_string(), "arena8-apple".to_string())]);
         assert_eq!((s.image.as_str(), s.disk_gb), ("img:1", 50)); // the rest is the base's
-        // No tier (Vast): the base's tier stays.
-        let vast = plan_options(&req(&[R3090], &["COMMUNITY"], 2, None, Order::Cheapest), "vast", &PriceBook::unpriced());
+        // Vast's tier is its host class, which its create reads from the spec.
+        let vast = plan_options(&req(&[R3090], &["VERIFIED"], 2, None, Order::Cheapest), "vast", &PriceBook::unpriced());
         let s = spec_for(&base(), "arena8-apple", &vast.options[0]);
+        assert_eq!((s.gpu_type.as_str(), s.cloud_type.as_str(), s.gpu_count), (R3090, "VERIFIED", 2));
+        // No tier (Shadeform): the base's tier stays.
+        let sf = plan_options(&req(&[R3090], &["SECURE"], 2, None, Order::Cheapest), "shadeform", &PriceBook::unpriced());
+        let s = spec_for(&base(), "arena8-apple", &sf.options[0]);
         assert_eq!((s.gpu_type.as_str(), s.cloud_type.as_str(), s.gpu_count), (R3090, "COMMUNITY", 2));
     }
 }

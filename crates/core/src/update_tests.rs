@@ -167,6 +167,20 @@ async fn check_reads_the_latest_release_and_what_it_brings() {
     assert!(e.starts_with("no release is published yet"), "{e}");
 }
 
+/// 2.1 (a minor bump: `offers` and the help reshaped) is offered to a 2.0 build whatever the
+/// stamps — a 2.0 build stamped later still updates to it — and never the reverse: a 2.0
+/// release isn't offered to a 2.1 build, however new its stamp.
+#[tokio::test]
+async fn a_minor_bump_is_offered_upward_only() {
+    let release = |tag: &str| json!({"tag_name": tag, "name": format!("arena {tag}"), "assets": []}).to_string();
+    let api = serve(vec![canned(200, "application/json", &release("v2.1.261029.0900"))]);
+    let c = check(&test_client(), &api.base, Version([2, 0, 261231, 2359]), OLD_LOG).await.unwrap();
+    assert!(c.newer && c.release.version == Version([2, 1, 261029, 900]), "{:?}", c.release.version);
+    let api = serve(vec![canned(200, "application/json", &release("v2.0.261231.2359"))]);
+    let c = check(&test_client(), &api.base, Version([2, 1, 261029, 900]), OLD_LOG).await.unwrap();
+    assert!(!c.newer);
+}
+
 /// A fake `arena` for [`check_runs`]: a script that prints `arena <version> (sha)`.
 fn fake_arena(version: &str) -> String {
     format!("#!/bin/sh\necho 'arena {version} (0123456789)'\n")

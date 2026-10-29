@@ -1,7 +1,7 @@
 //! Stamp the binary with its version, commit and platform, exposed to `main.rs` via
 //! `env!(…)`:
-//! - `ARENA_VERSION`: `2.0.<YYMMDD>.<HHMM>`. The `2.0` is the base major.minor; the date/time
-//!   identifies the build, so it's obvious which one is installed. A release build sets
+//! - `ARENA_VERSION`: `2.2.<YYMMDD>.<HHMM>`. The `2.2` is the base major.minor ([`BASE`]); the
+//!   date/time identifies the build, so it's obvious which one is installed. A release build sets
 //!   `ARENA_BUILD_STAMP` (`YYMMDD.HHMM`, the commit's time in UTC) so one commit is always
 //!   one version; any other build takes the time it was built.
 //! - `ARENA_COMMIT`: `ARENA_GIT_SHA` if set, else `git rev-parse --short=10 HEAD`, with
@@ -17,7 +17,9 @@
 
 use std::process::Command;
 
-const BASE: &str = "2.0";
+/// The major.minor (release.yml reads it from this line; the policy for bumping it is in
+/// CHANGELOG.md's header).
+const BASE: &str = "2.2";
 
 /// `cmd`'s trimmed stdout, if it ran and succeeded with some.
 fn output(cmd: &mut Command) -> Option<String> {

@@ -1040,6 +1040,39 @@ pub async fn fetch_gpu_types(api_key: &str, cloud: &str, min_cuda: Option<&str>)
     parse_catalog(&body)
 }
 
+/// The GPU types on the account's pods, each with what a pod of it bills per GPU when one says
+/// (`cost` over its GPU count; `None` while none runs): one walk over `GET /v2/pods`' pages,
+/// no per-pod reads. Read-only. How arena learns a type RunPod's public catalog lacks — the
+/// B300's MIG slice was rented, yet listed nowhere (2026-10-29) — for `offers runpod` and the
+/// `--gpu` check.
+pub async fn fetch_pod_gpu_types(api_key: &str) -> Result<Vec<(String, Option<f64>)>> {
+    let client = Client::new();
+    let page = |cursor: Option<String>| {
+        let rb = list_request(&client, api_key, cursor.as_deref());
+        async move { send(rb, "list pods").await }
+    };
+    Ok(pod_gpu_types(&collect_pages(page, MAX_PAGES).await?))
+}
+
+/// [`fetch_pod_gpu_types`]' answer from pods: each GPU type once, in the order first seen,
+/// with the first positive price per GPU any of its pods bills. Pure.
+pub fn pod_gpu_types(pods: &[Pod]) -> Vec<(String, Option<f64>)> {
+    let mut out: Vec<(String, Option<f64>)> = Vec::new();
+    for p in pods {
+        let Some(gpu) = p.gpu_type.as_deref().map(str::trim).filter(|g| !g.is_empty()) else { continue };
+        let per_gpu = p.cost_per_hr.filter(|c| *c > 0.0).map(|c| c / f64::from(p.gpu_count.unwrap_or(1).max(1)));
+        match out.iter_mut().find(|(g, _)| g == gpu) {
+            Some((_, price)) => {
+                if price.is_none() {
+                    *price = per_gpu;
+                }
+            }
+            None => out.push((gpu.to_string(), per_gpu)),
+        }
+    }
+    out
+}
+
 /// One run's v2 catalog lookups, by tier: each tier is fetched at most once, however many
 /// readers ask (the `--gpu` check, then the placement plan's price book, per tier). Failures
 /// are kept too — a catalog that just timed out is not asked again for the next reader,
@@ -2210,4 +2243,15 @@ mod tests {
         assert!(parse_catalog(&json!({"data": []})).is_err());
         assert!(parse_catalog(&json!({"gpus": []})).unwrap().is_empty());
     }
+
+    /// Each type once, priced per GPU by the first pod billing it; a stopped pod (no cost) or
+    /// a CPU pod (no GPU) adds no price, or nothing.
+    #[test]
+    fn pod_gpu_types_are_each_type_once_with_a_pods_price() {
+        let pod = |gpu: Option<&str>, n: u32, cost: Option<f64>| Pod { gpu_type: gpu.map(String::from), gpu_count: Some(n), cost_per_hr: cost, ..parse_pod(&json!({"id": "x"})) };
+        let mig = "NVIDIA B300 SXM6 AC MIG 1g.34gb";
+        let pods = [pod(Some(mig), 1, Some(0.0)), pod(None, 1, Some(0.1)), pod(Some("NVIDIA RTX A4000"), 2, Some(0.34)), pod(Some(mig), 1, Some(0.5))];
+        assert_eq!(pod_gpu_types(&pods), [(mig.to_string(), Some(0.5)), ("NVIDIA RTX A4000".to_string(), Some(0.17))]);
+    }
+
 }
