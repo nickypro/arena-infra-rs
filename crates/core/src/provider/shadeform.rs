@@ -919,6 +919,12 @@ pub fn parse_instance(v: &Value, now: u64) -> Pod {
         started_at: None,
         identity,
         status_detail: s("status_details").map(str::trim).filter(|d| !d.is_empty()).map(String::from),
+        // `cloud region` (`massedcompute us-central-1`): the region alone doesn't say whose.
+        location: match (s("cloud").map(str::trim).filter(|c| !c.is_empty()), s("region").map(str::trim).filter(|r| !r.is_empty())) {
+            (Some(c), Some(r)) => Some(format!("{c} {r}")),
+            (None, Some(r)) => Some(r.to_string()),
+            _ => None,
+        },
     }
 }
 
@@ -1581,6 +1587,7 @@ impl Provider for ShadeformProvider {
             api_extra: None,
             avoid_machines: Vec::new(),
             server_type: None,
+            region: None,
         })
     }
 }

@@ -256,6 +256,9 @@ fn create_payload(spec: &PodSpec) -> Result<Value> {
     // such pods sat RUNNING with no direct endpoint for 15+ minutes. dstack and SkyPilot send
     // the same flag on every create.
     payload["supportPublicIp"] = json!(true);
+    if let Some(dcs) = near_data_centers(spec) {
+        payload["dataCenterIds"] = dcs;
+    }
     apiextra::apply(&mut payload, spec.api_extra.as_ref(), MANAGED, Some("ports"))?;
     Ok(payload)
 }
@@ -322,6 +325,7 @@ fn parse_pod(v: &Value) -> Pod {
         started_at: None,
         identity: None,
         status_detail: None,
+        location: None,
     }
 }
 
@@ -465,10 +469,19 @@ pub(super) fn describe_spec(spec: &PodSpec) -> String {
         (Some(floor), true) => format!(", CUDA ≥ {floor}"),
         (None, true) => String::new(),
     };
+    let near = spec.region.map(|r| format!(", in {} ({} data centres)", r.label(), r.runpod_dcs().len())).unwrap_or_default();
     format!(
-        "{} x{}, {}, disk {}GB{volume}, image {}{bootstrap}{cuda}",
+        "{} x{}, {}{near}, disk {}GB{volume}, image {}{bootstrap}{cuda}",
         spec.gpu_type, spec.gpu_count, spec.cloud_type, spec.disk_gb, spec.image
     )
+}
+
+/// The `dataCenterIds` a create of `spec` pins, if it's a near create ([`PodSpec::region`]):
+/// the region's data centres ([`crate::near::Region::runpod_dcs`]). Same field on REST v1 and
+/// v2. An `--api-json` / `CREATE_EXTRA_JSON` that names its own is merged over this, and
+/// placement plans no near option beside one (`placement::Request::with_near`). Pure.
+pub(super) fn near_data_centers(spec: &PodSpec) -> Option<Value> {
+    spec.region.map(|r| json!(r.runpod_dcs()))
 }
 
 /// Fill GPU type/count, $/h and the host's maintenance window from one GraphQL query (see
@@ -586,6 +599,7 @@ fn parse_spec(v: &Value) -> PodSpec {
         api_extra: None,
         avoid_machines: Vec::new(),
         server_type: None,
+        region: None,
     }
 }
 
@@ -733,6 +747,12 @@ pub struct GpuType {
     /// RunPod's stock indicator for a 1-GPU pod (`lowestPrice.stockStatus`, e.g. "Low",
     /// "Medium", "High"); `None` when unreported. A hint only — creating is the real test.
     pub stock_status: Option<String>,
+    /// REST v2 only: the data centres that offer it in the asked configuration right now, each
+    /// with its stock (`("EUR-IS-1", "Low")`) — the catalog's `dataCenters`, which it leaves
+    /// out "when the configuration is unavailable everywhere". Empty from GraphQL (it doesn't
+    /// say), and from every COMMUNITY answer (community hosts are in no data centre). What
+    /// placement reads to plan a near option ([`crate::near`]).
+    pub data_centers: Vec<(String, String)>,
 }
 
 /// The catalog with live prices + stock (fields validated against the live API 2026-10-07,
@@ -768,6 +788,7 @@ fn parse_gpu_types(v: &Value) -> Vec<GpuType> {
                 community_price: price(x, "communityPrice"),
                 secure_price: price(x, "securePrice"),
                 stock_status: x.pointer("/lowestPrice/stockStatus").and_then(loose_string),
+                data_centers: Vec::new(),
             })
         })
         .collect()
@@ -1123,6 +1144,7 @@ mod tests {
             api_extra: None,
             avoid_machines: Vec::new(),
             server_type: None,
+            region: None,
         }
     }
 
@@ -1422,6 +1444,7 @@ mod tests {
                 community_price: Some(0.17),
                 secure_price: Some(0.25),
                 stock_status: Some("Low".into()),
+                data_centers: Vec::new(),
             }
         );
         // communityPrice 0 = not offered on community => None, not "$0.00".

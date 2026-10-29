@@ -76,9 +76,9 @@ use prefs::Prefs;
 use arena_core::status::pod_status;
 use state::{
     action_summary, capture_details, carry_over, remember_good, dashboard_snapshot, details_due, display_name, health_cell, listing_note, mark_key, marked_pods,
-    marked_set_token, merge_details, overlay_details, partial_notice, proxy_cell, proxy_detail,
-    provider_title, select_marks, short_branch, spark, summarize, summary_text, Action, Confirm, DeepChecks,
-    FleetSummary, History, NewPodForm, NpField, PodDetails, ProviderOpt, Throttle, Tone,
+    marked_set_token, merge_details, overlay_details, partial_notice, proxy_cell, proxy_detail, rtt_cell,
+    provider_title, select_marks, short_branch, spark, summarize, summary_text, Action, Confirm, DeepChecks, Endpoint,
+    FleetSummary, History, NewPodForm, NpField, PodDetails, ProviderOpt, Rtts, Throttle, Tone, RTT_EVERY, RTT_WAIT,
 };
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
@@ -233,6 +233,8 @@ struct Shared {
     ask_since: Option<Instant>,
     /// Its answer, set by the background task; the loop opens it ([`ask::land`]).
     ask_answer: Option<ask::Answer>,
+    /// The RTT from this box to each pod's SSH endpoint, as last timed (the RTT column).
+    rtts: Rtts,
 }
 
 impl Shared {
@@ -387,7 +389,7 @@ async fn main() -> Result<()> {
         progress_cmd,
         shared.clone(),
         Cadence { interval: interval.clone(), nudge: nudge.clone(), details_wanted: details_wanted.clone() },
-        DetailsState { balance: Some(balance), ai, ..Default::default() },
+        DetailsState { balance: Some(balance), ai, rtt: Some(Rtts::default()), ..Default::default() },
     ));
 
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
@@ -514,6 +516,9 @@ struct DetailsState {
     listed_at: HashMap<String, tokio::time::Instant>,
     /// The footer's note on the rate-limited providers, this refresh.
     throttle_note: Option<String>,
+    /// The RTT timings kept between rounds (`None`: none taken — tests, whose fixture
+    /// endpoints must never be connected to).
+    rtt: Option<Rtts>,
 }
 
 /// What the `AI$` column and the summary bar's OpenRouter part read with: the provisioning
@@ -687,19 +692,31 @@ async fn refresh(
             None => None,
         }
     };
-    let (metrics, observed) = if details_due(details.last.map(|t| t.elapsed()), forced) {
+    // RTT: the endpoints due a timing ([`RTT_EVERY`]), timed alongside the SSH probes, all at
+    // once, the whole timing bounded by [`RTT_WAIT`] — inside the probes' own budget when they
+    // run; at worst a refresh with an endpoint that doesn't answer and nothing else to wait on
+    // takes up to that second longer, once a minute.
+    let rtt_due = details.rtt.as_ref().map(|r| r.due(&pods, Instant::now())).unwrap_or_default();
+    let (metrics, observed, timed) = if details_due(details.last.map(|t| t.elapsed()), forced) {
         let mut enriched = pods.clone();
-        let (metrics, failed, seen) =
-            tokio::join!(fetch_metrics(remote, &pods, cfg, opts), enrich_bounded(provider, &mut enriched), observing);
+        let (metrics, failed, seen, timed) = tokio::join!(
+            fetch_metrics(remote, &pods, cfg, opts),
+            enrich_bounded(provider, &mut enriched),
+            observing,
+            time_endpoints(rtt_due)
+        );
         // A query that failed part-way still shows what it filled (as `pods list` does),
         // over the last good details rather than instead of them (`state::merge_details`).
         merge_details(&mut details.details, capture_details(&enriched), failed.is_none());
         details.warning = failed;
         details.last = Some(tokio::time::Instant::now());
-        (metrics, seen)
+        (metrics, seen, timed)
     } else {
-        tokio::join!(fetch_metrics(remote, &pods, cfg, opts), observing)
+        tokio::join!(fetch_metrics(remote, &pods, cfg, opts), observing, time_endpoints(rtt_due))
     };
+    if let Some(r) = details.rtt.as_mut() {
+        r.record(timed, Instant::now());
+    }
     overlay_details(&mut pods, &details.details);
     // The balance's runway is judged against what is billing as listed (not the pending
     // placeholders, and after the details filled the prices), a provider that failed to
@@ -747,6 +764,9 @@ async fn refresh(
         .collect();
     s.status = status_line(&s.summary, quota_line(&listing).as_deref(), &warnings);
     s.metrics = metrics;
+    if let Some(r) = &details.rtt {
+        s.rtts = r.clone();
+    }
     if let Some(v) = balance_views {
         s.balance = v;
     }
@@ -878,6 +898,23 @@ fn load_health(cfg: &Config) -> (HealthCache, Option<String>) {
         Some(Err(e)) => (HealthCache::new(), Some(format!("no health cache: {e}"))),
         Some(Ok(path)) => HealthCache::load(&path),
     }
+}
+
+/// Time each endpoint's RTT ([`arena_core::rtt::connect_once`]: exactly one TCP connect, name
+/// lookup included within [`RTT_WAIT`]), all at once. `None` for one that didn't answer in time.
+async fn time_endpoints(due: Vec<Endpoint>) -> Vec<(Endpoint, Option<Duration>)> {
+    let mut set = JoinSet::new();
+    for ep in due {
+        set.spawn(async move {
+            let d = arena_core::rtt::connect_once((ep.0.as_str(), ep.1), RTT_WAIT).await;
+            (ep, d)
+        });
+    }
+    let mut out = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        out.extend(joined.ok());
+    }
+    out
 }
 
 /// Fan metric fetches out across the fleet concurrently over `remote` — each probe bounded
@@ -2929,8 +2966,8 @@ fn ai_cell(k: Option<&KeyUsage>, stale: bool, read: bool) -> Cell<'static> {
 fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: bool) {
     // Responsive. The essential columns — mark, P, NAME, STATUS, M, SET, GPU, GPU%, $/H,
     // HEALTH, PROXY — always show and fit in 73 columns. Next come the mid columns, kept
-    // while they fit (`MID_W`, all of them from 105 columns), so a narrow terminal or the
-    // detail view's 55% split drops TEMP, MEM, BRANCH, DISK in turn instead of having
+    // while they fit (`MID_W`, all of them from 111 columns), so a narrow terminal or the
+    // detail view's 55% split drops TEMP, RTT, MEM, BRANCH, DISK in turn instead of having
     // ratatui shrink every column (NAME, the one that says which pod a row is, worst of
     // all). Above that the nice-to-haves (SAVED, AI$, host CPU/RAM, then the UTIL%/MEM%
     // graphs, then PROGRESS when PROGRESS_CMD is set) come in as there's room. Below 73
@@ -2963,12 +3000,13 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
 
     // mark, P, NAME, STATUS, M, SET, GPU, GPU%, $/H, HEALTH, PROXY.
     let core = [1, 1, name_w, 4, 1, 4, gpu_w, 5, 7, HEALTH_W, proxy_w];
-    // DISK, BRANCH, MEM, TEMP — kept in this order: a disk filling up (coloured) breaks a
-    // participant's work, the branch says which iteration they're on, MEM/TEMP are in the
-    // detail pane's per-GPU table anyway.
-    const MID_W: [usize; 4] = [9, 6, 9, 4];
+    // DISK, BRANCH, MEM, RTT, TEMP — kept in this order: a disk filling up (coloured) breaks
+    // a participant's work, the branch says which iteration they're on, MEM/TEMP are in the
+    // detail pane's per-GPU table anyway; RTT (how far the pod is from the proxy every
+    // keystroke goes through) is in the detail pane too.
+    const MID_W: [usize; 5] = [9, 6, 9, 5, 4];
     let mid = columns_that_fit(w, &core, &MID_W);
-    let (show_disk, show_branch, show_mem, show_temp) = (mid > 0, mid > 1, mid > 2, mid > 3);
+    let (show_disk, show_branch, show_mem, show_rtt, show_temp) = (mid > 0, mid > 1, mid > 2, mid > 3, mid > 4);
 
     // Sparklines (GPU%/MEM% history) flex to fill whatever horizontal space is left after
     // the other columns — so they grow on a wide screen and simply vanish when there's no
@@ -3000,6 +3038,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         }
     }
     header_cells.extend(["$/H", "HEALTH", "PROXY"]);
+    if show_rtt {
+        header_cells.push("RTT");
+    }
     if show_branch {
         header_cells.push("BRANCH");
     }
@@ -3126,6 +3167,10 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 Cell::from(health).style(tone_style(health_tone)),
                 Cell::from(proxy).style(tone_style(proxy_tone)),
             ]);
+            if show_rtt {
+                let (rtt, tone) = rtt_cell(shared.rtts.of(p));
+                cells.push(Cell::from(rtt).style(tone_style(tone)));
+            }
             if show_branch {
                 cells.push(Cell::from(branch));
             }
@@ -3209,7 +3254,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         widths.push(Constraint::Length(MID_W[2] as u16)); // MEM (e.g. "120/240G")
     }
     if show_temp {
-        widths.push(Constraint::Length(MID_W[3] as u16)); // TEMP (e.g. "85C")
+        widths.push(Constraint::Length(MID_W[4] as u16)); // TEMP (e.g. "85C")
     }
     if show_disk {
         widths.push(Constraint::Length(MID_W[0] as u16)); // DISK (e.g. "12/100G")
@@ -3219,6 +3264,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         Constraint::Length(HEALTH_W as u16), // HEALTH (e.g. "pass 12m")
         Constraint::Length(proxy_w as u16),  // PROXY (":9500", or ":9500 stale" when wide)
     ]);
+    if show_rtt {
+        widths.push(Constraint::Length(MID_W[3] as u16)); // RTT (e.g. "23ms", "180ms")
+    }
     if show_branch {
         widths.push(Constraint::Length(MID_W[1] as u16)); // BRANCH (e.g. "w1d2")
     }
@@ -3309,7 +3357,7 @@ fn rel_time_short(m: Option<&PodMetrics>) -> String {
 }
 
 /// Lines in the detail pane's facts block (see `detail_pane`'s `facts`).
-const FACT_LINES: u16 = 17;
+const FACT_LINES: u16 = 18;
 
 /// The per-pod detail pane (shown in Detail mode): identity + endpoint, proxy forward,
 /// cost, the host maintenance window + note, the last deep check (and why), a per-GPU
@@ -3370,6 +3418,14 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let endpoint = match (&pod.ssh_ip, pod.ssh_port) {
         (Some(ip), Some(port)) => format!("{ip}:{port}"),
         _ => "(no SSH endpoint yet)".into(),
+    };
+    // Where it runs (the provider's name for the place) and how far that is from here — the
+    // proxy box, on prod — as the RTT column times it.
+    let place = pod.location.clone().unwrap_or_else(|| "-".into());
+    let rtt = match (shared.rtts.of(pod), &pod.ssh_ip) {
+        (Some(d), _) => format!("rtt {}ms from this box", d.as_millis()),
+        (None, Some(_)) => format!("rtt - (a TCP connect to the SSH port, every {}s)", RTT_EVERY.as_secs()),
+        (None, None) => "rtt -".into(),
     };
     let progress = m
         .and_then(|m| m.progress.clone())
@@ -3435,7 +3491,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         format!("{cpu}   {ram}")
     };
     let facts = format!(
-        "status:   {}\ngpu:      {}\nendpoint: {}\nproxy:    {}\ncost:     {}\n{}maint:    {}\nhealth:   {}\nreason:   {}\ndisk:     {}\nhost:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\ntokens:   HF {}   Claude-Code {}\nprogress: {}",
+        "status:   {}\ngpu:      {}\nendpoint: {}\nwhere:    {}\nproxy:    {}\ncost:     {}\n{}maint:    {}\nhealth:   {}\nreason:   {}\ndisk:     {}\nhost:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\ntokens:   HF {}   Claude-Code {}\nprogress: {}",
         {
             let status = pod_status(pod, m.map(|m| m.error.is_none()));
             if arena_core::lock::is_locked(pod) {
@@ -3447,6 +3503,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         },
         gpu,
         endpoint,
+        fit(format!("{place}  ·  {rtt}")),
         proxy,
         cost,
         ai.map(|a| format!("ai key:   {}\n", fit(a))).unwrap_or_default(),
@@ -4489,7 +4546,7 @@ deep_check_end=1
 
     /// A narrow terminal — or the detail view's 55% split — keeps the essential columns
     /// whole (NAME, HEALTH, PROXY as the port coloured by state, $/H) and drops the mid
-    /// columns in turn (TEMP, MEM, BRANCH, DISK) rather than letting every column be
+    /// columns in turn (TEMP, RTT, MEM, BRANCH, DISK) rather than letting every column be
     /// crushed: at 80–100 columns the names still read `alpha`, not `al`/`alph`.
     #[test]
     fn a_narrow_terminal_drops_mid_columns_and_keeps_names_and_health_whole() {
@@ -4497,12 +4554,13 @@ deep_check_end=1
         let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
         // (mode, terminal width, mid columns shown, mid columns dropped)
         let cases: &[(Mode, u16, &[&str], &[&str])] = &[
-            (Mode::List, 80, &[], &["DISK", "BRANCH", "MEM", "TEMP"]),
-            (Mode::List, 92, &["DISK", "BRANCH"], &["MEM", "TEMP"]),
-            (Mode::List, 100, &["DISK", "BRANCH", "MEM"], &["TEMP"]),
-            (Mode::List, 120, &["DISK", "BRANCH", "MEM", "TEMP"], &[]),
+            (Mode::List, 80, &[], &["DISK", "BRANCH", "MEM", "RTT", "TEMP"]),
+            (Mode::List, 92, &["DISK", "BRANCH"], &["MEM", "RTT", "TEMP"]),
+            (Mode::List, 100, &["DISK", "BRANCH", "MEM"], &["RTT", "TEMP"]),
+            (Mode::List, 106, &["DISK", "BRANCH", "MEM", "RTT"], &["TEMP"]),
+            (Mode::List, 120, &["DISK", "BRANCH", "MEM", "RTT", "TEMP"], &[]),
             // Detail: the table gets 55% of 160 = 88 columns.
-            (Mode::Detail, 160, &["DISK"], &["BRANCH", "MEM", "TEMP"]),
+            (Mode::Detail, 160, &["DISK"], &["BRANCH", "MEM", "RTT", "TEMP"]),
         ];
         ui.selected = 3; // delta: the detail pane's title (" delta ") isn't a row we look at
         for (mode, w, shown, dropped) in cases {
@@ -4528,6 +4586,44 @@ deep_check_end=1
             }
             assert!(!row(&lines, "bravo").contains("stale"), "{w}: compact proxy, the colour says stale");
         }
+    }
+
+    /// The RTT column: each pod's round trip from this box as last timed, coloured (green
+    /// near, yellow across the Atlantic, red beyond), `-` when not timed or no answer — and
+    /// the detail pane says it beside where the pod runs.
+    #[test]
+    fn rtt_shows_in_its_column_and_the_detail_pane() {
+        let mut shared = fixture_shared();
+        let by = |shared: &Shared, name: &str| shared.pods.iter().find(|p| p.name.ends_with(name)).unwrap().clone();
+        let (alpha, bravo) = (by(&shared, "alpha"), by(&shared, "bravo"));
+        let ep = |p: &Pod| (p.ssh_ip.clone().unwrap(), p.ssh_port.unwrap());
+        let mut rtts = Rtts::default();
+        rtts.record(vec![(ep(&alpha), Some(Duration::from_millis(23))), (ep(&bravo), Some(Duration::from_millis(131)))], Instant::now());
+        shared.rtts = rtts;
+        let idx = shared.pods.iter().position(|p| p.name == alpha.name).unwrap();
+        shared.pods[idx].location = Some("EUR-IS-1".into());
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let mut t = Terminal::new(TestBackend::new(180, 12)).unwrap();
+        t.draw(|f| view(f, &shared, &ui, 5)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let lines = screen(&buf);
+        let header = lines.iter().find(|l| l.contains("HEALTH")).unwrap();
+        let col = header[..header.find("RTT").unwrap_or_else(|| panic!("{header}"))].chars().count();
+        let cell = |name: &str| {
+            let y = lines.iter().position(|l| l.contains(&format!(" {name} "))).unwrap();
+            let text: String = lines[y].chars().skip(col).take(5).collect();
+            (text.trim().to_string(), buf[(col as u16, y as u16)].fg)
+        };
+        assert_eq!(cell("alpha"), ("23ms".to_string(), Color::Green));
+        assert_eq!(cell("bravo"), ("131ms".to_string(), Color::Red));
+        assert_eq!(cell("charlie"), ("-".to_string(), Color::DarkGray), "not timed");
+        ui.mode = Mode::Detail;
+        ui.selected = idx;
+        let pane = draw(160, 40, &shared, &ui).join("\n");
+        assert!(pane.contains("where:    EUR-IS-1  ·  rtt 23ms from this box"), "{pane}");
+        ui.selected = shared.pods.iter().position(|p| p.name.ends_with("charlie")).unwrap();
+        let pane = draw(160, 40, &shared, &ui).join("\n");
+        assert!(pane.contains("where:    -  ·  rtt -"), "{pane}");
     }
 
     /// The pure column fit: always a prefix of the optional columns, so widening only adds.
@@ -4612,6 +4708,41 @@ deep_check_end=1
         assert_eq!(state::balance_tone(&shared.balance), None);
         shared.balance = live_views(&[(Account::Shadeform, 0.0, 0.57)]);
         assert!(bar(&shared, 80).starts_with(" ‼ shadeform $0.00 <1h · 4 pods"), "{}", bar(&shared, 80));
+    }
+
+    /// A refresh times each pod's SSH endpoint alongside the probes — one TCP connect — and
+    /// the next refreshes leave it alone until RTT_EVERY has passed (OpenSSH counts each such
+    /// connect against the proxy box). A pod without an endpoint isn't timed.
+    #[tokio::test]
+    async fn refresh_times_each_endpoint_once_alongside_the_probes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut alpha = pod("alpha", "runpod", "rp1", 1, Some(port));
+        alpha.ssh_ip = Some("127.0.0.1".into());
+        let provider = FakeFleet {
+            pods: vec![alpha.clone(), pod("bravo", "runpod", "rp2", 2, None)],
+            lists: AtomicUsize::new(0),
+            details: AtomicUsize::new(0),
+            details_error: None,
+        };
+        let remote: Arc<dyn Remote> = Arc::new(FakeRemote::new());
+        let shared = Mutex::new(Shared::default());
+        let mut details = DetailsState { rtt: Some(Rtts::default()), ..Default::default() };
+        refresh(&provider, &remote, &cfg(""), &ProbeOpts::default(), &shared, &mut details, false).await;
+        let got = shared.lock().unwrap().rtts.of(&alpha);
+        assert!(got.is_some_and(|d| d < RTT_WAIT), "{got:?}");
+        // Exactly one connect so far (it waits in the backlog), none from the next refresh.
+        async fn waiting(l: &tokio::net::TcpListener) -> bool {
+            tokio::time::timeout(Duration::from_millis(200), l.accept()).await.is_ok()
+        }
+        assert!(waiting(&listener).await, "timed once");
+        refresh(&provider, &remote, &cfg(""), &ProbeOpts::default(), &shared, &mut details, false).await;
+        assert!(!waiting(&listener).await, "not again within RTT_EVERY");
+        assert_eq!(shared.lock().unwrap().rtts.of(&alpha), got, "kept between rounds");
+        // The dashboard's tests take no timings unless asked: no fixture endpoint is ever dialled.
+        let mut quiet = DetailsState::default();
+        refresh(&provider, &remote, &cfg(""), &ProbeOpts::default(), &Mutex::new(Shared::default()), &mut quiet, false).await;
+        assert!(!waiting(&listener).await);
     }
 
     /// The balance is observed in the details round (every DETAILS_EVERY, or `r` after the

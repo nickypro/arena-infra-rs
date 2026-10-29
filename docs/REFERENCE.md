@@ -277,7 +277,7 @@ Notes / sharp edges to know:
 
 Any key in `config.env` can be overridden by an **environment variable of the same
 name** (env wins; it can't introduce brand-new keys — except a short allowlist such as
-`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `DISCARD_MAX_GB` and the `ASK_<AI>_MODEL`/`_EFFORT` keys, e.g. `RUNPOD_API=v1 arena pods
+`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `DISCARD_MAX_GB`, `NEAR`/`NEAR_MAX_EXTRA_PCT` and the `ASK_<AI>_MODEL`/`_EFFORT` keys, e.g. `RUNPOD_API=v1 arena pods
 list` to use the retiring RunPod v1 backend for one command, until 2026-11-16; v2 is the default). This is how you point at an SSH
 key the current user can actually read, without editing the shared, read-only prod
 config — e.g. when the dashboard's metrics show `ssh connect failed … key unreadable`
@@ -603,7 +603,10 @@ the default, the REST list already has GPU and $; on `RUNPOD_API=v1` that query 
 (best-effort: if it fails you get one warning line and the list still renders); the `nvidia-smi`
 probe over SSH (default for the table, `--probe`/`--no-probe`) overrides the GPU when a pod answers.
 
-`list --json` emits the pods incl. `gpu_count`/`cost_per_hr`/`maintenance`.
+`list --json` emits the pods incl. `gpu_count`/`cost_per_hr`/`maintenance`, and `location` when
+the provider says where a pod runs (RunPod's data centre — a COMMUNITY pod has none —, Vast's
+`geolocation`, Hetzner's location, Shadeform's cloud and region). It times nothing: the RTT is the
+dashboard's.
 
 #### `pods restart` and `pods stop`: the wipe gate
 
@@ -802,7 +805,8 @@ Ends with a per-name table: `created on 1×RTX 3090 COMMUNITY ($0.22/h) (after 1
 capacity)` or `not placed (tried: …)`.
 
 Cloud tiers exist only on RunPod (Vast/Hetzner collapse them, and Hetzner the GPU list too, with a
-note).
+note). On RunPod and Vast, options near the proxy come first ([Near the
+proxy](#near-the-proxy-near-and-near_max_extra_pct)).
 
 Vast options are priced **live**: one marketplace search per GPU (needs `VAST_API_KEY`), the
 cheapest fitting offer's price for the disk asked for — a snapshot, since each create searches again
@@ -816,6 +820,53 @@ text).
 
 `--dry-run` prints the option table and the names it would attempt; the option order is fixed once
 confirmed.
+
+#### Near the proxy: `NEAR` and `NEAR_MAX_EXTRA_PCT`
+
+Every participant's SSH and VS Code traffic goes through the proxy box (on prod: Hetzner nbg1,
+Nuremberg), so a pod far from it adds its round trip to every keystroke — a US pod about 100 ms for a
+European cohort — to save cents. So on RunPod and Vast, `create`/`up` (and `replace`/`migrate`,
+`offers` and the dry-runs, through the same planner) try options **near the proxy first**, unless
+they cost more than a set margin over the cheapest acceptable option:
+
+- `NEAR` — `europe` (the default when unset: prod's config predates the key) or `north-america`;
+  `any`, `off`, `none` or empty turn it off (options anywhere, cheapest first, as before).
+- `NEAR_MAX_EXTRA_PCT` — the margin, default `25` (`25%` reads too). The human's call: latency
+  over small savings (25% of an A4000's $0.17/h is 4 cents).
+
+Both can come from the environment for one run (`NEAR=any arena pods up -n 3`) without editing the
+shared config; `config check` shows them, defaults marked, and fails a value it can't read.
+
+What "near" is, per provider (live, 2026-10-28):
+
+- **RunPod** — `dataCenterIds` on the create: Europe is every `EU-…`/`EUR-…` data centre
+  (`EU-CZ-1`, `EU-FR-1`, `EU-NL-1`, `EU-RO-1`, `EU-SE-1`, `EUR-IS-1`…`5`, `EUR-NO-1`/`2`; `api get
+  runpod catalog/datacenters` lists them with their region). The price is per GPU and tier, so a
+  near option costs what the same option anywhere costs. **SECURE only**: COMMUNITY hosts are in no
+  data centre (a community pod's `dataCenterId` is null, and a community create pinned to every data
+  centre finds no capacity) — a community-only create keeps its single path, and `offers` says why
+  nothing is near. With SECURE in `--cloud`, the near option is weighed against the cheapest
+  (community) one: a SECURE A4000 ($0.25) is +47% over a community one ($0.17), so it's tried near
+  first only with `NEAR_MAX_EXTRA_PCT` ≥ 47. The v2 catalog's per-data-centre listing skips a near
+  option the region doesn't offer right now (one create saved), and its stock is the region's.
+  `CREATE_EXTRA_JSON` / `--api-json` naming its own `dataCenterIds` turns near off (that pin wins).
+- **Vast** — each offer's `geolocation` country (the search filters on it: `"geolocation": {"in":
+  […]}`): Europe is the EU, the EEA, Switzerland, the UK, the Balkans, Ukraine and Moldova (not
+  Russia, Belarus, Turkey or the Caucasus). A near option is priced at the cheapest near offer and
+  capped at the margin — its create searches again and never rents dearer than the plan allowed.
+- **Hetzner** already creates in the nearest location (`HETZNER_LOCATION`); **Shadeform** has its
+  own region list. Neither reads `NEAR`.
+
+The order: cheapest-first — every near option within the margin (cheapest first among them), then
+every option anywhere, as before; `--order listed` — each option near just before it's tried
+anywhere, so the GPU order still comes first. The option table gets a WHERE column (`Europe`/`any`)
+and a note with the margin and what wasn't tried near, and why. A near option with no capacity falls
+through to the next, never a failure — and on RunPod is out **for the rest of the run**: its
+anywhere twin covers the same data centres, so a cohort spends one create on a full region, not one
+per name and round (RunPod limits requests per key, shared by every dashboard and cron on it). A
+10-pod `up` with Europe full: 11 creates; with it off: 10. On Vast it's out for the round, like any
+capacity block: its "no capacity" is one market search's answer, and the next round searches again. `--keep-trying` waits on one pool, so it keeps the single
+path (anywhere) and says so; `--retry-mins` keeps near.
 
 #### `--api-json` and `CREATE_EXTRA_JSON`
 
@@ -868,7 +919,9 @@ providers with a key in the config, in the fleet's order (RunPod, Vast, Hetzner)
 order `create`/`up` would try that provider's options in), OPTION, CLOUD, SIZE (VRAM per GPU — the
 live catalog's, else the preset's — or vCPU/RAM for a Hetzner VM), PER POD (`$`/h; `~` = preset
 estimate; Hetzner's in `€`, as it bills, never converted), SOURCE (`live`, `estimate`, or `list` for
-Hetzner's list price, which placement doesn't use), STOCK; then what
+Hetzner's list price, which placement doesn't use), STOCK, and WHERE when near the proxy is on
+(`Europe` for an option tried only there, `any`: [Near the
+proxy](#near-the-proxy-near-and-near_max_extra_pct)); then what
 the cap dropped and why, each provider's notes and the providers left out. With no key at all,
 RunPod alone (priced from the presets), as before.
 
@@ -1936,9 +1989,15 @@ live (2/5/10/20/60s). Provider via `ARENA_PROVIDER` (default `runpod`), config v
 `arena8-apple` and the choice persists to `~/.config/arena-tui/prefs`), STATUS, a **SET** health
 glyph (`✓/✗/·` for `~/.name`, the deploy key, git origin→GitHub), GPU (live from `nvidia-smi`, e.g.
 `2×RTX A4000` — the provider list API omits this), GPU%/MEM/TEMP, **BRANCH** (autocommit branches
-shortened to their `w1d2` label; `main`/others shown as-is), and progress. Below ~105 columns (or in
-the detail view's split) TEMP, MEM, BRANCH and DISK drop out in that order, so
-NAME/STATUS/GPU/$/H/HEALTH/PROXY stay whole down to 73 columns.
+shortened to their `w1d2` label; `main`/others shown as-is), and progress. **RTT** is the round trip
+from this box — where the proxy runs — to the pod's SSH endpoint: one TCP connect, timed alongside
+the SSH probes (never before the rows are shown), at most once a minute per endpoint (each is a
+connect closed before any SSH, which OpenSSH ≥ 9.8 counts against the box; once a minute keeps even
+several dashboards far from its limit); green under 60 ms, yellow under 120, red beyond, `-` when
+not timed yet or no answer. The detail pane's `where:` line has it beside where the pod runs
+(`EUR-IS-1`, `Czechia, CZ`, `nbg1 (Nuremberg, DE)`). Below ~111 columns (or in the detail view's
+split) TEMP, RTT, MEM, BRANCH and DISK drop out in that order, so NAME/STATUS/GPU/$/H/HEALTH/PROXY
+stay whole down to 73 columns.
 
 ### Fleet columns from the core snapshot
 

@@ -110,6 +110,7 @@ fn sandbox_pod(name: &str) -> Pod {
         started_at: Some(1_791_452_013),
         identity: None,
         status_detail: None,
+        location: None,
     }
 }
 
@@ -359,6 +360,7 @@ async fn unknown_gpu_create_is_a_config_error() {
         api_extra: None,
         avoid_machines: Vec::new(),
         server_type: None,
+        region: None,
     };
     let ours = create_payload(&spec, &[]).unwrap();
     for (k, v) in r.request.as_object().unwrap() {
@@ -408,6 +410,7 @@ fn catalog_parses_prices_stock_and_placeholders() {
             community_price: Some(0.17),
             secure_price: Some(0.25),
             stock_status: Some("Low".into()),
+            data_centers: Vec::new(),
         }
     );
     // Secure-only cards are in the COMMUNITY answer too (so one tier's catalog checks any

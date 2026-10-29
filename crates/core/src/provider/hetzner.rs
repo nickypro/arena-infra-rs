@@ -232,7 +232,7 @@ impl Distances {
             let mut set = tokio::task::JoinSet::new();
             for l in untimed {
                 let addr = host(&l);
-                set.spawn(async move { (l, rtt_to(addr).await) });
+                set.spawn(async move { (l, crate::rtt::connect_rtt(addr, PROBE_TRIES, PROBE_WAIT).await) });
             }
             let mut round = Vec::new();
             while let Some(r) = set.join_next().await {
@@ -245,29 +245,6 @@ impl Distances {
         }
         timed().iter().filter_map(|(l, d)| d.map(|d| (l.clone(), d))).collect()
     }
-}
-
-/// The fastest of [`PROBE_TRIES`] TCP connects to `addr` (`host:port`), to the first of its
-/// addresses that answers; `None`: it didn't resolve, or nothing answered within [`PROBE_WAIT`].
-async fn rtt_to(addr: String) -> Option<Duration> {
-    use tokio::time::{timeout, Instant};
-    let connect = |a: std::net::SocketAddr| async move {
-        let t = Instant::now();
-        matches!(timeout(PROBE_WAIT, tokio::net::TcpStream::connect(a)).await, Ok(Ok(_))).then(|| t.elapsed())
-    };
-    let mut addrs = timeout(PROBE_WAIT, tokio::net::lookup_host(addr)).await.ok()?.ok()?;
-    let (a, mut best) = loop {
-        let a = addrs.next()?;
-        if let Some(d) = connect(a).await {
-            break (a, d);
-        }
-    };
-    for _ in 1..PROBE_TRIES {
-        if let Some(d) = connect(a).await {
-            best = best.min(d);
-        }
-    }
-    Some(best)
 }
 
 pub struct HetznerProvider {
@@ -852,7 +829,22 @@ fn parse_server(v: &Value) -> Pod {
         started_at: None,
         identity: None,
         status_detail: None,
+        // `nbg1 (Nuremberg, DE)`: the location's name, with its city and country when given.
+        location: hetzner_location(v),
     }
+}
+
+/// A server's location for people: its `location` (or an older answer's
+/// `datacenter.location`) as `nbg1 (Nuremberg, DE)`, just `nbg1` without a city. Pure.
+fn hetzner_location(v: &Value) -> Option<String> {
+    let loc = v.get("location").filter(|l| l.is_object()).or_else(|| v.pointer("/datacenter/location"))?;
+    let field = |k: &str| loc.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let name = field("name")?;
+    Some(match (field("city"), field("country")) {
+        (Some(city), Some(cc)) => format!("{name} ({city}, {cc})"),
+        (Some(city), None) => format!("{name} ({city})"),
+        _ => name.to_string(),
+    })
 }
 
 /// Whether a listed server is the backup archive VM (`arena archive`): it carries the
