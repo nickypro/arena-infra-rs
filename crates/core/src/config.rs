@@ -116,6 +116,9 @@ impl Config {
         // must work without editing the shared config.
         "NEAR",
         "NEAR_MAX_EXTRA_PCT",
+        // GPU types RunPod's public catalog lacks (`gpu::UNLISTED`'s kind): `RUNPOD_EXTRA_GPU_TYPES=
+        // "<id>" arena pods create --gpu "<id>"` tries one for one run, no config edit.
+        "RUNPOD_EXTRA_GPU_TYPES",
     ];
 
     /// Keys starting with this are **file-only**: the environment can neither override nor

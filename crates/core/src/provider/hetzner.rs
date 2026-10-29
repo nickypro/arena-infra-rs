@@ -409,7 +409,7 @@ impl HetznerProvider {
         server_offer(&types, ty, walk).ok_or_else(|| Error::Config(format!("Hetzner has no server type `{ty}`")))
     }
 
-    /// Every server type on sale somewhere now, cheapest first, for `arena offers --all`: what
+    /// Every server type on sale somewhere now, cheapest first, for `arena offers hetzner`: what
     /// `--server-type` takes. One `GET /server_types`.
     pub async fn catalog(&self) -> Result<Vec<ServerType>> {
         Ok(server_types(&self.get_all("server_types").await?, crate::snapshot::unix_now()))
@@ -1917,7 +1917,7 @@ mod tests {
         assert_eq!(server(json!({})), Some(0.0368));
     }
 
-    /// `offers --all`: every type on sale somewhere, over the locations that sell it now
+    /// `offers hetzner`: every type on sale somewhere, over the locations that sell it now
     /// (cpx41's EU retirement passed, so only ash; cpx22's is announced, so still nbg1), cheapest
     /// type first, its price from its cheapest location. Pure.
     #[test]
