@@ -110,18 +110,36 @@ pub(crate) async fn repo_requirements(cfg: &Config) -> std::result::Result<(Stri
             let why = String::from_utf8_lossy(&out.stderr);
             return Err(format!("git clone of {owner}/{name} failed: {}", why.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no message").trim()));
         }
-        let show = |what: &'static str| {
-            let mut c = git(&["-C", &repo_s, "show", what]);
+        // Which of the files the commit has (from the tree, which the clone holds), then each one's
+        // bytes (fetched now: the clone is blob-less) — a file there that can't be read is an
+        // error, never "absent", which would make a different hash.
+        let listed = git(&["-C", &repo_s, "ls-tree", "--name-only", "HEAD", "--", "install_uv.sh", "requirements.txt", "pyproject.toml"])
+            .output()
+            .await
+            .map_err(|e| format!("running git: {e}"))?;
+        if !listed.status.success() {
+            return Err("git ls-tree failed on the clone".into());
+        }
+        let present: Vec<String> = String::from_utf8_lossy(&listed.stdout).lines().map(str::to_string).collect();
+        let show = |file: &'static str| {
+            let mut c = git(&["-C", &repo_s, "show", &format!("HEAD:{file}")]);
+            let there = present.iter().any(|p| p == file);
             async move {
+                if !there {
+                    return Ok(None);
+                }
                 let o = c.output().await.map_err(|e| format!("running git: {e}"))?;
-                Ok::<_, String>(o.status.success().then_some(o.stdout))
+                if !o.status.success() {
+                    return Err(format!("couldn't read {file} from the repo: {}", String::from_utf8_lossy(&o.stderr).trim()));
+                }
+                Ok::<_, String>(Some(o.stdout))
             }
         };
         let head = git(&["-C", &repo_s, "rev-parse", "--short=12", "HEAD"]).output().await.map_err(|e| format!("running git: {e}"))?;
         let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
-        let install = show("HEAD:install_uv.sh").await?;
-        let reqs = show("HEAD:requirements.txt").await?;
-        let pyproject = show("HEAD:pyproject.toml").await?;
+        let install = show("install_uv.sh").await?;
+        let reqs = show("requirements.txt").await?;
+        let pyproject = show("pyproject.toml").await?;
         Ok((head, image::req_hash(install.as_deref(), reqs.as_deref(), pyproject.as_deref())))
     };
     let r = match tokio::time::timeout(LOOKUP_TIMEOUT, result).await {
