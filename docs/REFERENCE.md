@@ -222,7 +222,7 @@ Every command's help is compact: its options one per line, no blank line between
 "long" layout for `--help` whenever any text had a second paragraph — every option's help on a line
 of its own and a blank line after each (`offers --help` was 50 lines for 12 options). So arena moves
 the long texts where the short layout prints them: a command's description above its usage, an
-option's extra paragraphs onto the lines under it (wrapped at 64 columns; clap wraps nothing without
+option's extra paragraphs onto the lines under it (wrapped to end by column 100; clap wraps nothing without
 its `wrap_help` feature). `-h`, `--help` and `arena help <cmd>` print the same page, with every word
 they had (a test renders every command's help three ways and checks both).
 
