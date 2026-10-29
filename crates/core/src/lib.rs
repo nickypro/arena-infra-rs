@@ -10,6 +10,7 @@ pub mod archive;
 pub mod apiget;
 pub mod ask;
 pub mod apikeys;
+pub mod attest;
 pub mod backup;
 pub mod balance;
 pub(crate) mod base64;

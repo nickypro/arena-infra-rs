@@ -14,7 +14,7 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
-## 2026-10-28 · Pods near the proxy first, and an RTT column in the dashboard
+## 2026-10-29 · Pods near the proxy first, and an RTT column in the dashboard
 - `pods create`/`up` (and `replace`, `migrate`) on RunPod and Vast now try Europe first — where
   the proxy every participant's SSH goes through runs — unless that costs more than 25% over the
   cheapest option. A far pod adds its round trip to every keystroke: a US pod about 100 ms.
@@ -38,6 +38,26 @@ earlier).
 - New, optional: `NEAR` (`europe` when unset; `north-america`; `any` or empty turns it off) and
   `NEAR_MAX_EXTRA_PCT` (default `25`). Both work from the environment for one run, e.g. `NEAR=any
   arena pods up -n 3` for the old cheapest-anywhere order. `config check` shows both.
+
+## 2026-10-28 · `arena update` checks who built the release
+- `arena update` (and `--dry-run`) now verifies the new binaries' build-provenance attestation
+  before installing or running them: that both were built together by this repository's
+  `release.yml` from master, on GitHub's runners, as Sigstore's signature, certificate and
+  transparency log prove. It checks this here, with no `gh` and no GitHub login, and says which
+  workflow run built them. Until now it only checked `SHA256SUMS`, which comes from the same
+  release as the binaries.
+- Binaries without an attestation, or with one that doesn't verify, are not installed, and the
+  message says why. `arena update --skip-attestation <sha256>,<sha256>` installs without this
+  check, only binaries with those two SHA-256s, with a loud warning: for a genuine release this
+  build can't verify (after Sigstore changes its keys), whose binaries you verified with
+  `gh attestation verify` elsewhere (docs/REFERENCE.md says how). `--check` is unchanged.
+- What changed is shown after the binaries are verified, and says whether the attestation also
+  covers the release's changelog (from this release on it does; a changelog other than the
+  attested one, or a missing one, stops the update). `--check` labels it unverified.
+- An older build served under a newer release's name is refused before it runs.
+- An update makes 2 GitHub API requests instead of 1 (of the 60 an hour allowed without a login).
+- Dependencies with security advisories updated (rustls, rustls-webpki, webpki-roots, tokio,
+  anyhow).
 
 ## 2026-10-28 · `offers` shows every provider, Hetzner too; `--help` lists commands in groups
 - `arena offers` is one table over every provider with a key in the config (RunPod, Vast,

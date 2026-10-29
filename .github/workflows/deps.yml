@@ -1,0 +1,42 @@
+# Deps: what the dependency tree may hold (deny.toml): no RustSec advisory (vulnerable, unsound,
+# unmaintained, yanked) without a written reason, only the allowed licences, crates.io as the only
+# source. Checked by cargo-deny on every push and pull request, and daily: an advisory published
+# today is about yesterday's Cargo.lock.
+#
+# Its own workflow, not a job of CI, on purpose: Release runs when CI succeeds (release.yml,
+# `workflow_run: workflows: [CI]`), and a newly published advisory must not stop releases. A red
+# run means: update the crate (`cargo update -p <crate>`), or ignore the advisory in deny.toml
+# with a reason. Dependabot (.github/dependabot.yml) opens the routine update PRs weekly.
+name: Deps
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    # Daily at 06:17 UTC.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deps-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      # cargo-deny 0.20.2, in the action's container; the advisory database is fetched fresh
+      # each run.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
