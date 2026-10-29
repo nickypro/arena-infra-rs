@@ -514,8 +514,16 @@ pub fn included_file_of(audience: Audience, home: Option<&str>) -> Result<Option
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("reading ~/.ssh/config: {e}")),
     };
-    let files = included_files(&config, Some(home)).map_err(|arg| format!("an Include arena can't follow ({arg})"))?;
-    Ok(files.into_iter().find(|p| std::fs::read_to_string(p).is_ok_and(|t| !t.trim().is_empty() && audience.owns(&t))))
+    // What was resolved counts first: an Include arena can't follow elsewhere in the file doesn't
+    // hide one it could.
+    let inc = included_files(&config, Some(home));
+    if let Some(p) = inc.files.into_iter().find(|p| std::fs::read_to_string(p).is_ok_and(|t| !t.trim().is_empty() && audience.owns(&t))) {
+        return Ok(Some(p));
+    }
+    match inc.unresolved.first() {
+        Some(arg) => Err(format!("an Include arena can't follow ({arg})")),
+        None => Ok(None),
+    }
 }
 
 /// Both files arena keeps current ([`sync_for`], [`sync_admin_for`]) from one COMPLETE listing:
@@ -624,34 +632,46 @@ pub fn config_path_problem(path: &str) -> Option<String> {
 /// `Include` lines: anywhere in the file (a block's too), each argument quoted or not, `~/` taken
 /// as `home`, a relative path under `~/.ssh`, `*` and `?` patterns matched against what exists,
 /// and the included files' own `Include`s followed (to ssh's depth of 16). For telling whether
-/// arena's other file is in use. Reads those files, never writes. `Err(argument)`: one arena
-/// can't resolve ([`include_target`]: a token, an escape, a class, no home to resolve it against)
-/// — the caller can't tell what it includes, and mustn't guess "nothing".
-pub fn included_files(config: &str, home: Option<&str>) -> Result<Vec<PathBuf>, String> {
-    let mut out = Vec::new();
-    follow_includes(config, home, 0, &mut out)?;
-    Ok(out)
+/// arena's other file is in use. Reads those files, never writes. An argument arena can't resolve
+/// ([`include_target`]: a token, an escape, a class, no home to resolve it against) is listed in
+/// [`Includes::unresolved`], and the rest still followed: the caller can't tell everything it
+/// includes, and mustn't guess "nothing", but what was resolved stands.
+pub fn included_files(config: &str, home: Option<&str>) -> Includes {
+    let mut out = Includes::default();
+    follow_includes(config, home, 0, &mut out);
+    out
 }
 
-fn follow_includes(config: &str, home: Option<&str>, depth: usize, out: &mut Vec<PathBuf>) -> Result<(), String> {
+/// What [`included_files`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Includes {
+    /// The files resolved, in the order ssh reads them.
+    pub files: Vec<PathBuf>,
+    /// The arguments arena couldn't resolve, in order.
+    pub unresolved: Vec<String>,
+}
+
+fn follow_includes(config: &str, home: Option<&str>, depth: usize, out: &mut Includes) {
     if depth > 16 {
-        return Ok(());
+        return;
     }
     for args in config.lines().filter_map(include_args) {
         for arg in args {
-            let pattern = include_target(&arg, home).ok_or_else(|| arg.clone())?;
+            let Some(pattern) = include_target(&arg, home) else {
+                out.unresolved.push(arg);
+                continue;
+            };
             for file in glob_files(&pattern) {
-                if out.contains(&file) {
+                if out.files.contains(&file) {
                     continue;
                 }
-                out.push(file.clone());
+                out.files.push(file.clone());
                 if let Ok(text) = std::fs::read_to_string(&file) {
-                    follow_includes(&text, home, depth + 1, out)?;
+                    follow_includes(&text, home, depth + 1, out);
                 }
             }
         }
     }
-    Ok(())
 }
 
 /// One `Include` line's arguments as ssh reads them — the keyword in any case, then whitespace or
@@ -1105,20 +1125,26 @@ mod tests {
             quoted.display()
         );
         let h = home.to_str();
-        let got = included_files(&config, h).unwrap();
+        let got = included_files(&config, h);
+        assert!(got.unresolved.is_empty(), "{got:?}");
+        let got = got.files;
         let want =
             vec![ssh.join("arena.conf"), quoted, ssh.join("b.conf"), ssh.join("arena-admin.conf"), ssh.join("conf.d/x.conf"), ssh.join("nested.conf"), ssh.join("conf.d/y.conf")];
         assert_eq!(got, want);
-        assert_eq!(included_files("Include ${HOME}/.ssh/arena.conf\n", h), Err("${HOME}/.ssh/arena.conf".to_string()));
-        assert_eq!(included_files("Include %d/.ssh/arena.conf\n", h), Err("%d/.ssh/arena.conf".to_string()));
-        assert_eq!(included_files("Include arena.conf\n", None), Err("arena.conf".to_string()));
+        let unresolved = |config: &str, home: Option<&str>| included_files(config, home).unresolved;
+        assert_eq!(unresolved("Include ${HOME}/.ssh/arena.conf\n", h), ["${HOME}/.ssh/arena.conf"]);
+        assert_eq!(unresolved("Include %d/.ssh/arena.conf\n", h), ["%d/.ssh/arena.conf"]);
+        assert_eq!(unresolved("Include arena.conf\n", None), ["arena.conf"]);
+        // One it can't follow doesn't hide one it can: both are said.
+        let both = included_files("Include ~/.ssh/b.conf\nInclude ${X}/y.conf\nInclude ~/.ssh/arena.conf\n", h);
+        assert_eq!((both.files, both.unresolved), (vec![ssh.join("b.conf"), ssh.join("arena.conf")], vec!["${X}/y.conf".to_string()]));
         // A `[…]` class (glob(3)'s `[[:alpha:]]` among them) isn't matched here: can't tell, never "nothing".
-        assert_eq!(included_files("Include ~/.ssh/[[:alpha:]]*.conf\n", h), Err("~/.ssh/[[:alpha:]]*.conf".to_string()));
+        assert_eq!(unresolved("Include ~/.ssh/[[:alpha:]]*.conf\n", h), ["~/.ssh/[[:alpha:]]*.conf"]);
         // A backslash escape (glob(3) reads `arena\.conf` as `arena.conf`), braces, a control char.
         for arg in ["~/.ssh/arena\\.conf", "~/.ssh/{arena,x}.conf", "~/.ssh/a\u{7}b"] {
-            assert_eq!(included_files(&format!("Include {arg}\n"), h), Err(arg.to_string()), "{arg}");
+            assert_eq!(unresolved(&format!("Include {arg}\n"), h), [arg], "{arg}");
         }
-        assert_eq!(included_files("Include /nonexistent-arena/*.conf\nHost x\n", None), Ok(vec![]));
+        assert_eq!(included_files("Include /nonexistent-arena/*.conf\nHost x\n", None), Includes::default());
         for (pat, name, hit) in [
             ("*.conf", "arena.conf", true),
             ("*.conf", ".arena.conf", false),
@@ -1205,8 +1231,16 @@ mod tests {
         assert!(!staff.exists());
         std::fs::remove_file(&theirs).unwrap();
         assert!(sync_admin_for(&admin_only, &pods, h).unwrap().unwrap().written, "no participants' file: nothing to conflict with");
+        // (Here staff's file is resolved by the second Include itself: said as included.)
         let e = sync_for(&theirs_only, &pods, h).unwrap().unwrap_err();
-        assert!(e.contains(&format!("arena can't tell whether it pulls in {}", staff.display())), "{e}");
+        assert!(e.contains(&format!("~/.ssh/config includes {} — arena's other file", staff.display())), "{e}");
+        // Staff's file at a path of its own, included before an Include arena can't follow: what
+        // was resolved still counts — the participants' file isn't kept.
+        std::fs::rename(&staff, home.join(".ssh/team-admin.conf")).unwrap();
+        std::fs::write(home.join(".ssh/config"), "Include ~/.ssh/team-admin.conf\nInclude ${HOME}/.ssh/extra.conf\nInclude ~/.ssh/arena.conf\n").unwrap();
+        let e = sync_for(&theirs_only, &pods, h).unwrap().unwrap_err();
+        assert!(e.contains(&format!("~/.ssh/config includes {}", home.join(".ssh/team-admin.conf").display())), "{e}");
+        assert!(!theirs.exists());
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -16831,7 +16831,10 @@ async fn handle_ssh_config_install(
     // Include comes first, and offers both files' keys — the participants' proxy ports would shadow
     // staff's live endpoints, or the other way round. One of the two per user
     // ([`sshconfig::one_per_user`]); here, an Include arena can't follow refuses rather than guesses.
-    if let Err(arg) = sshconfig::included_files(config.as_deref().unwrap_or(""), home.to_str()) {
+    if let Some(why) = sshconfig::one_per_user(audience, cfg, home.to_str()) {
+        anyhow::bail!("not installed: {why} — or use this one without an Include: `{} --out FILE`, then `ssh -F FILE <name>`", audience.command());
+    }
+    if let Some(arg) = sshconfig::included_files(config.as_deref().unwrap_or(""), home.to_str()).unresolved.first() {
         anyhow::bail!(
             "not installed: ~/.ssh/config has an Include arena can't follow ({arg}), so it can't tell whether arena's other file \
              (`{} --install`) is in use — with the same Host names, ssh would take each host's address from whichever comes first. \
@@ -16839,9 +16842,6 @@ async fn handle_ssh_config_install(
             other.command(),
             audience.command()
         );
-    }
-    if let Some(why) = sshconfig::one_per_user(audience, cfg, home.to_str()) {
-        anyhow::bail!("not installed: {why} — or use this one without an Include: `{} --out FILE`, then `ssh -F FILE <name>`", audience.command());
     }
     let at = sshconfig::include_at(config.as_deref().unwrap_or(""), &[&shown, &abs]);
     let stamp = arena_core::restore::stamp(arena_core::snapshot::unix_now());
