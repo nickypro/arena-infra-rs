@@ -42,14 +42,18 @@ pub async fn connect_rtt<A: ToSocketAddrs>(addr: A, tries: u32, wait: Duration) 
 /// that must keep to one unauthenticated connect per endpoint uses (the dashboard's RTT).
 /// `None`: it didn't resolve, or didn't answer within `wait`.
 pub async fn connect_once<A: ToSocketAddrs>(addr: A, wait: Duration) -> Option<Duration> {
-    timeout(wait, async {
+    within(wait, async {
         let a = lookup_host(addr).await.ok()?.next()?;
         let t = Instant::now();
         TcpStream::connect(a).await.ok().map(|_| t.elapsed())
     })
     .await
-    .ok()
-    .flatten()
+}
+
+/// `timing`'s answer if it comes within `wait`, else `None` — the one bound on everything a
+/// timing does.
+async fn within(wait: Duration, timing: impl std::future::Future<Output = Option<Duration>>) -> Option<Duration> {
+    timeout(wait, timing).await.ok().flatten()
 }
 
 #[cfg(test)]
@@ -69,13 +73,19 @@ mod tests {
         assert_eq!(connect_once("not an address", Duration::from_secs(1)).await, None);
     }
 
-    /// One connect, one bound: an address that never answers (a blackholed port — TEST-NET-1)
-    /// gives up at `wait`, not later.
+    /// One bound on the whole timing (review: a test that dialled TEST-NET-1 could pass on an
+    /// unreachable route without ever reaching the timeout): a timing that never answers gives
+    /// up at exactly `wait`, and one that answers in time is kept.
     #[tokio::test(start_paused = true)]
-    async fn connect_once_gives_up_at_its_bound() {
+    async fn a_timing_gives_up_at_its_bound() {
         let wait = Duration::from_secs(1);
         let t = Instant::now();
-        assert_eq!(connect_once(("192.0.2.1", 22), wait).await, None);
-        assert!(t.elapsed() <= wait + Duration::from_millis(50), "{:?}", t.elapsed());
+        assert_eq!(within(wait, std::future::pending()).await, None);
+        assert_eq!(t.elapsed(), wait);
+        let quick = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Some(Duration::from_millis(30))
+        };
+        assert_eq!(within(wait, quick).await, Some(Duration::from_millis(30)));
     }
 }

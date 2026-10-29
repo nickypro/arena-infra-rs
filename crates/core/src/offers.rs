@@ -553,6 +553,23 @@ mod tests {
         for (k, val) in plan_json.as_object().unwrap().iter().filter(|(k, _)| *k != "options") {
             assert_eq!(&v["providers"][0][k], val, "{k}");
         }
+        // A provider the cap left nothing in keeps its short row under the WHERE header (review:
+        // claude asked — `table::render` takes short rows, nothing shifts).
+        let capped = plan("hetzner", "A4000", "community", 1, Some(1.0), &PriceBook::unpriced());
+        let both = Offers {
+            providers: vec![ProviderOffers::new(runpod.clone(), &[], None), ProviderOffers::new(capped, &[], Some(cx23()))],
+            ..Offers::default()
+        };
+        let out = render(&both);
+        assert!(out.lines().any(|l| l.split_whitespace().collect::<Vec<_>>() == ["hetzner", "-", "(no", "option", "left", "to", "try)"]), "{out}");
+        // Each cell under its header (by characters: `×` is two bytes).
+        let header = out.lines().next().unwrap();
+        let row: Vec<char> = out.lines().nth(1).unwrap().chars().collect();
+        let cell = |col: &str, n: usize| {
+            let at = header[..header.find(col).unwrap()].chars().count();
+            row[at..at + n].iter().collect::<String>()
+        };
+        assert_eq!((cell("WHERE", 6), cell("SIZE", 10)), ("Europe".to_string(), "16 GB VRAM".to_string()), "{out}");
         // Off: no column.
         let off = render(&Offers { providers: vec![ProviderOffers::new(hetzner, &[], Some(cx23()))], ..Offers::default() });
         assert!(!off.contains("WHERE"), "{off}");

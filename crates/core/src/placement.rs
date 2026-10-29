@@ -259,14 +259,16 @@ impl PriceBook {
     /// One listed at `None`, or only in a data centre the create doesn't pin, can't be had
     /// near: [`NearStock::NotOffered`], so no create is spent on it (RunPod's API limits are
     /// per key). Only a catalog for this very tier knows; GraphQL's, or none at all, is
-    /// [`NearStock::Unknown`].
+    /// [`NearStock::Unknown`]. The catalog is read for a 1-GPU pod: a data centre with room
+    /// for more has room for one, so one it doesn't list can't host a bigger pod either; one
+    /// it lists may lack room for more — a create that finds out, once per run.
     fn runpod_near(&self, gpu: &str, cloud: &str, region: Region) -> NearStock {
         let tiered = self.catalogs.iter().filter(|(tag, _)| tag.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(cloud)));
         let Some(row) = tiered.flat_map(|(_, rows)| rows).find(|r| r.id == gpu) else { return NearStock::Unknown };
         let pinned = |dc: &str| region.runpod_dcs().iter().any(|p| p.eq_ignore_ascii_case(dc.trim()));
         let near = row.data_centers.iter().filter(|(dc, stock)| pinned(dc) && stock_rank(Some(stock)) < stock_rank(Some("None")));
         match near.map(|(_, stock)| stock.as_str()).min_by_key(|s| stock_rank(Some(s))) {
-            Some(best) => NearStock::Offered(Some(best.to_string())),
+            Some(best) => NearStock::Offered(Some(best.to_string()).filter(|s| !s.is_empty())),
             None => NearStock::NotOffered,
         }
     }
@@ -653,11 +655,16 @@ fn near_first(
         };
         let budget = base.map(|b| n.budget(b));
         let twin = PlacementOption { near: Some(n.region), price_per_gpu, price_per_pod, price_source: source, stock, ..o.clone() };
-        // A marketplace's near create rents whatever the region offers then: without a price
-        // to weigh it against (the search anywhere failed) there's no margin to cap it at —
-        // review: it could rent any price. Tried anywhere only (RunPod's price is the
-        // option's own, so there the margin is never in doubt).
-        if provider != "runpod" && budget.is_none() {
+        // Only a near option whose price can be weighed goes ahead of others. Cheapest first,
+        // an unpriced one (a GPU no catalog or preset prices) would jump the queue of priced
+        // options, at any price (review: codex). And a marketplace's near create rents what the
+        // region offers then: without a price anywhere there's no margin to cap it at (review:
+        // codex, claude). As listed, a RunPod twin costs exactly its anywhere option: fine.
+        let weighable = match req.order {
+            Order::Cheapest => price_per_pod.is_some() && budget.is_some(),
+            Order::Listed => provider == "runpod" || budget.is_some(),
+        };
+        if !weighable {
             why_not.push(format!("{}: no price anywhere to weigh it against", twin.describe()));
             twins.push(None);
             continue;
@@ -1087,7 +1094,9 @@ where
                         Some(ProviderErrorKind::Denied) => {
                             denied[k] = true;
                             let outcome = Outcome::Denied(e.to_string());
-                            if denied.iter().all(|d| *d) {
+                            // Every option refused access — a near one that was full counts with
+                            // them (its anywhere twin was refused): still the key's problem.
+                            if denied.iter().zip(&near_full).all(|(d, n)| *d || *n) {
                                 let error = Error::Provider {
                                     kind: ProviderErrorKind::Denied,
                                     message: format!(
@@ -1905,6 +1914,30 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         assert!(!near_of(&book(&[("EUR-IS-1", "Low")])).notes.iter().any(|n| n.contains("doesn't pin")));
     }
 
+    /// Review (codex): cheapest first, an unpriced option (a GPU no catalog or preset prices)
+    /// gets no near twin — it would jump the queue of priced options at an unknown price —
+    /// and stays last, anywhere. As listed its twin is just the same option pinned: kept.
+    #[test]
+    fn an_unpriced_option_doesnt_jump_the_queue_near() {
+        const MYSTERY: &str = "NVIDIA Mystery 9";
+        let cheapest = plan_options(&near_req(&[A4000, MYSTERY], &["SECURE"], None, Order::Cheapest, EU), "runpod", &PriceBook::runpod(Vec::new()));
+        let got: Vec<(String, bool)> = cheapest.options.iter().map(|o| (o.label.clone(), o.near.is_some())).collect();
+        assert_eq!(got, [("1×RTX A4000".to_string(), true), ("1×RTX A4000".into(), false), ("1×Mystery 9".into(), false)]);
+        assert!(cheapest.notes.iter().any(|n| n == "near, not tried in Europe: 1×Mystery 9 SECURE in Europe: no price anywhere to weigh it against"), "{:?}", cheapest.notes);
+        let listed = plan_options(&near_req(&[MYSTERY, A4000], &["SECURE"], None, Order::Listed, EU), "runpod", &PriceBook::runpod(Vec::new()));
+        let got: Vec<(String, bool)> = listed.options.iter().map(|o| (o.label.clone(), o.near.is_some())).collect();
+        assert_eq!(got, [("1×Mystery 9".to_string(), true), ("1×Mystery 9".into(), false), ("1×RTX A4000".into(), true), ("1×RTX A4000".into(), false)]);
+    }
+
+    /// A data centre listed without a level is listed (stock unknown) — not "None", which
+    /// would turn near off on a field RunPod left out (review: claude).
+    #[test]
+    fn a_data_centre_without_a_level_still_counts() {
+        let book = PriceBook::runpod(vec![(Some("SECURE".into()), vec![dc_row(A4000, Some(0.17), Some(0.25), &[("EUR-IS-1", "")])])]);
+        let plan = plan_options(&near_req(&[A4000], &["SECURE"], None, Order::Cheapest, EU), "runpod", &book);
+        assert_eq!((plan.options[0].near, plan.options[0].stock.as_deref()), (Some(Region::Europe), None));
+    }
+
     /// Near off (`NEAR=any`): the plan is exactly as before — no twin, no column, no note.
     #[test]
     fn near_off_plans_as_before() {
@@ -2317,6 +2350,19 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
         assert!(matches!(out.end, End::Failed { .. }), "{:?}", out.end);
         assert_eq!(fake.calls().len(), 2);
         assert_eq!(out.rounds, 1);
+    }
+
+    /// Review (claude): Europe full, then the same pool anywhere refused access — that's the
+    /// key's problem, as without near (`End::Aborted`), not a mixed "invalid request" failure.
+    #[tokio::test]
+    async fn a_full_region_then_no_access_aborts_as_an_access_problem() {
+        let fake = Fake::new(Reply::Ok).script(A4000, NEAR_SECURE, &[Reply::Capacity]).script(A4000, "SECURE", &[Reply::Denied]);
+        let (out, _) = run(&fake, &near_two(), &["devtest-near-apple", "devtest-near-bloom"], ONE_ROUND, None).await;
+        match &out.end {
+            End::Aborted { error, .. } => assert!(error.to_string().contains("every option was refused (no access)"), "{error}"),
+            other => panic!("expected an access abort, got {other:?}"),
+        }
+        assert_eq!(fake.calls().len(), 2);
     }
 
     #[tokio::test]

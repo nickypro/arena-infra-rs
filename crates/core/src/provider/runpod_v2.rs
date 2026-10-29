@@ -996,13 +996,13 @@ fn parse_catalog(body: &Value) -> Result<Vec<GpuType>> {
             None => None,
         }
     };
-    // Each data centre that offers it, with its stock — `NONE` kept as `None`: placement reads
-    // which data centres are listed, and the stock only as a hint.
+    // Each data centre that offers it, with its stock — `NONE` kept as `None` (placement
+    // tries no near create there); a level it doesn't say is `""`, unknown, never `None`.
     let data_centers = |g: &Value| -> Vec<(String, String)> {
         let dcs = g.get("dataCenters").and_then(Value::as_array).into_iter().flatten();
         dcs.filter_map(|d| {
             let id = d.get("id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())?;
-            let level = d.get("availability").and_then(Value::as_str).and_then(title).unwrap_or_else(|| "None".into());
+            let level = d.get("availability").and_then(Value::as_str).and_then(title).unwrap_or_default();
             Some((id.to_string(), level))
         })
         .collect()
@@ -2183,7 +2183,7 @@ mod tests {
         // seconds later).
         let v = json!({"gpus": [
             {"id": "a", "name": "A", "memory": 16, "availability": "NONE",
-             "dataCenters": [{"id": "EU-RO-1", "availability": "NONE"}, {"id": "US-KS-2", "availability": "MEDIUM"}]},
+             "dataCenters": [{"id": "EU-RO-1", "availability": "NONE"}, {"id": "US-KS-2", "availability": "MEDIUM"}, {"id": "EUR-IS-1"}]},
             {"id": "b", "name": "B", "memory": 16, "availability": "NONE",
              "cudaVersions": [{"version": "13.0", "available": false}, {"version": "13.1", "available": true}]},
             {"id": "c", "name": "C", "memory": 16, "availability": "NONE",
@@ -2191,7 +2191,11 @@ mod tests {
             {"id": "d", "name": "D", "memory": 16, "cudaVersions": [{"version": "13.2", "available": true}]}
         ]});
         let parsed = parse_catalog(&v).unwrap();
-        assert_eq!(parsed[0].data_centers, [("EU-RO-1".to_string(), "None".to_string()), ("US-KS-2".into(), "Medium".into())]);
+        assert_eq!(
+            parsed[0].data_centers,
+            [("EU-RO-1".to_string(), "None".to_string()), ("US-KS-2".into(), "Medium".into()), ("EUR-IS-1".into(), String::new())],
+            "a level not given is unknown, not None"
+        );
         let stock: Vec<Option<String>> = parsed.into_iter().map(|t| t.stock_status).collect();
         assert_eq!(stock, [Some("Medium".into()), Some("Low".into()), Some("None".into()), Some("Low".into())]);
         assert!(parse_catalog(&json!({"data": []})).is_err());
