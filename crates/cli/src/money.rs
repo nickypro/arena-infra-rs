@@ -168,7 +168,7 @@ pub(crate) async fn balance_report(
         if flags.no_live {
             return None;
         }
-        match tokio::time::timeout(balance::COMMAND_TIMEOUT, bal.api.archive_eur_per_hr()).await {
+        match arena_core::ratelimit::bounded(balance::COMMAND_TIMEOUT, bal.api.archive_eur_per_hr()).await {
             Ok(read) => read,
             Err(_) => Some(Err(format!("timed out after {}s", balance::COMMAND_TIMEOUT.as_secs()))),
         }

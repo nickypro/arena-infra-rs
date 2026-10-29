@@ -31,9 +31,11 @@ pub(crate) fn body_excerpt(body: &serde_json::Value) -> String {
     }
 }
 
-/// The day RunPod retires REST v1 (`rest.runpod.io/v1`, the [`runpod`] backend), per its
-/// v1→v2 migration guide. `config check` warns with it while v1 is still selected.
-pub const RUNPOD_V1_RETIREMENT: &str = "2026-11-15";
+/// The day RunPod sunsets REST v1 (`rest.runpod.io/v1`, the [`runpod`] backend): a Monday,
+/// per its service email of 2026-10-28 (the migration guide had said the 15th). From then
+/// every v1 request answers `410 Gone` (`runpod::v1_error` says to leave v1). `config check`
+/// warns with it while v1 is still selected.
+pub const RUNPOD_V1_RETIREMENT: &str = "2026-11-16";
 
 /// What to tell an operator whose config still says `RUNPOD_API=v1`, wherever v1 is the
 /// reason something can't be done (a CUDA floor above 13.0, a GPU v1's create rejects,
@@ -165,12 +167,14 @@ pub const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60)
 /// Await a backend's list call, failing as that backend's error once `limit` passes — an
 /// [`Error::Timeout`] (`vast list timed out after 60s`): never retried in place (it already
 /// took the whole bound), but told apart from a refusal, so a retry round can wait out a
-/// stalled backend as it does a throttled one ([`crate::placement::relist`]).
+/// stalled backend as it does a throttled one ([`crate::placement::relist`]). Its
+/// rate-limit waits get all but a margin of it ([`crate::ratelimit::bounded`]): a quota held
+/// for longer fails it as rate-limited, saying how long, not as a timeout.
 pub async fn bounded_list<F>(name: &str, list: F, limit: std::time::Duration) -> Result<Vec<Pod>>
 where
     F: std::future::Future<Output = Result<Vec<Pod>>>,
 {
-    match tokio::time::timeout(limit, list).await {
+    match crate::ratelimit::bounded(limit, list).await {
         Ok(res) => res,
         Err(_) => Err(Error::Timeout { what: format!("{name} list"), after: limit }),
     }
@@ -704,7 +708,7 @@ mod tests {
         assert!(nokey.to_string().contains("RUNPOD_API_KEY"), "{nokey}");
     }
 
-    /// REST v2 is the default (RunPod retires v1 on 2026-11-15, and v1 can't ask for a host on
+    /// REST v2 is the default (RunPod retires v1 on 2026-11-16, and v1 can't ask for a host on
     /// CUDA 13.1+): a config without `RUNPOD_API` — or with it empty or blank, as a
     /// commented-out template line leaves it — builds the v2 backend, its creates sending a
     /// real CUDA floor. An explicit `v1` (any case) still builds v1 until the retirement;

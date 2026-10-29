@@ -66,6 +66,7 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::fleet::fmt_money;
+use crate::http::Limits;
 use crate::pod::Pod;
 use crate::provider::runpod::loose_f64;
 use crate::proxy::{Listing, ListingStatus};
@@ -3102,15 +3103,19 @@ impl HttpBalanceApi {
 
     async fn runpod_myself(&self, key: &str, minimal: bool) -> Result<Live, Fail> {
         let rb = crate::provider::runpod::balance_request(&self.client, &self.graphql_url, key, minimal);
-        fetch(rb).await.and_then(|v| parse_runpod_myself(&v))
+        fetch(rb, &Limits::RUNPOD).await.and_then(|v| parse_runpod_myself(&v))
     }
 }
 
-/// Send, then [`classify`]. A transport failure is transient, in our words (reqwest's own
-/// message names the URL — no key there, but no reason to print it either).
-async fn fetch(rb: reqwest::RequestBuilder) -> Result<Value, Fail> {
-    match crate::http::send_text(rb).await {
+/// Send (through the rate-limit-aware path, under `limits`), then [`classify`]. A transport
+/// failure is transient, in our words (reqwest's own message names the URL — no key there,
+/// but no reason to print it either); so is a read not sent because its quota is held.
+async fn fetch(rb: reqwest::RequestBuilder, limits: &Limits) -> Result<Value, Fail> {
+    match crate::http::send_text_with(rb, limits).await {
         Ok((status, text)) => classify(status.as_u16(), &text),
+        Err(e) if e.kind() == Some(crate::error::ProviderErrorKind::RateLimited) => {
+            Err(Fail::transient("not sent: rate-limited (the API's quota is held)"))
+        }
         Err(_) => Err(Fail::transient("no answer (network error)")),
     }
 }
@@ -3148,7 +3153,7 @@ impl BalanceApi for HttpBalanceApi {
             Account::Vast => {
                 let rb = crate::provider::vast::user_request(&self.client, &self.vast_base, key);
                 // Vast's body is never quoted: an error status keeps its kind and code only.
-                fetch(rb)
+                fetch(rb, &Limits::OTHERS)
                     .await
                     .map_err(|f| match f.http {
                         Some(h) if !(200..300).contains(&h) => Fail { detail: None, ..f },
@@ -3190,7 +3195,7 @@ impl BalanceApi for HttpBalanceApi {
             return Err(Fail::new(FailKind::Auth, None, "no API key configured"));
         };
         let rb = crate::provider::runpod_v2::billing_request(&self.client, &self.v2_base, key, from_hour, to);
-        fetch(rb).await.and_then(|v| parse_billing(&v))
+        fetch(rb, &Limits::RUNPOD).await.and_then(|v| parse_billing(&v))
     }
 }
 
@@ -3223,7 +3228,8 @@ fn billing_from(account: Account, st: Option<&AccountState>, mode: Mode, now: u6
 
 /// `fut`, or a transient failure once `deadline` passes.
 async fn within<T>(deadline: tokio::time::Instant, fut: impl std::future::Future<Output = Result<T, Fail>>) -> Result<T, Fail> {
-    match tokio::time::timeout_at(deadline, fut).await {
+    // Its rate-limit waits too: a held quota fails the read as throttled, not as a timeout.
+    match tokio::time::timeout_at(deadline, crate::ratelimit::waits_until(deadline, fut)).await {
         Ok(r) => r,
         Err(_) => Err(Fail::transient("no answer in time")),
     }

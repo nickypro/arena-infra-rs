@@ -2125,7 +2125,10 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
             return Act::Abort(Row::StateUnreadable, format!("the terminate of {name} couldn't be marked sent ({e}) — not sent"));
         }
     };
-    let outcome = tokio::time::timeout(Duration::from_secs(120), ticket.terminate(sent, env.provider)).await;
+    // A provider's rate limit is waited out briefly at most (`REAP_RATE_WAIT`): the terminate
+    // acts on a decision just made, so it goes now or, refused unsent, not this run.
+    let terminate = arena_core::ratelimit::waits_within(REAP_RATE_WAIT, ticket.terminate(sent, env.provider));
+    let outcome = tokio::time::timeout(Duration::from_secs(120), terminate).await;
     // The terminate succeeded: only now is the frozen copy a reap's (W7 B-RS8b) — renamed under
     // the pod's lock still.
     let (snap_final, big_final) = match &outcome {
@@ -2464,6 +2467,12 @@ fn reaped_summary(root: &Path) -> Option<String> {
 
 /// The most entries `reap status` walks under one `reaped/` for its size.
 const REAPED_WALK_CAP: usize = 200_000;
+
+/// The longest the reaper's terminate waits out a provider's rate limit (a held quota, a
+/// 429's `Retry-After`) before it is refused unsent: the terminate acts on an idle decision
+/// just made, and a participant may come back while it waits — past this, the next run
+/// decides again.
+const REAP_RATE_WAIT: Duration = Duration::from_secs(10);
 
 /// The `ENDS` column for `pods list` (spec §3.4): `None` when the reaper has no state here (no
 /// explicit `ARENA_STATE_DIR`, or no state file) — the column isn't shown; a state that can't be

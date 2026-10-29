@@ -742,7 +742,7 @@ pub(crate) async fn archive_status(env: &Env<'_>, cloud: Option<&dyn ArchiveClou
     let names = &env.names;
     let inventory = match cloud {
         None => None,
-        Some(c) => Some(match tokio::time::timeout(arena_core::provider::LIST_TIMEOUT, c.inventory(Some(&names.prefix))).await {
+        Some(c) => Some(match arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, c.inventory(Some(&names.prefix))).await {
             Ok(Ok(inv)) => Ok(inv),
             Ok(Err(e)) => Err(e.to_string()),
             Err(_) => Err(format!("timed out after {}s", arena_core::provider::LIST_TIMEOUT.as_secs())),
