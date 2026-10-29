@@ -127,20 +127,30 @@ const UPDATE_AVAILABLE_EXIT: u8 = 10;
 /// This build's own `CHANGELOG.md`: what `arena update` compares the release's against.
 const CHANGELOG: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../CHANGELOG.md"));
 
+/// What `update --skip-attestation` says before it downloads anything, on stderr.
+const SKIP_ATTESTATION_WARNING: &str = "\
+⚠ --skip-attestation: the new binaries' build provenance will NOT be checked by this build.
+⚠ It installs only binaries whose SHA-256 is one you gave: they must be ones you verified with
+⚠ `gh attestation verify` (docs/REFERENCE.md), not digests someone sent you.";
+
 /// `arena update` ([`arena_core::update`]): check, then — unless `--check` — download, check
-/// and swap in the release's binaries where this one is.
-async fn handle_update(check_only: bool, dry_run: bool, yes: bool) -> Result<()> {
-    use arena_core::update as up;
+/// (provenance, or the digests `skip_attestation` pins) and swap in the release's binaries
+/// where this one is.
+async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<String>, yes: bool) -> Result<()> {
+    use arena_core::{attest, update as up};
+    // A malformed pin fails before anything is read.
+    let pins = (!skip_attestation.is_empty()).then(|| up::parse_pins(&skip_attestation)).transpose().map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
     let installed = up::Version::parse(env!("ARENA_VERSION")).context("this build's version")?;
     let client = up::client();
-    let found = up::check(&client, up::REPO_API, installed, CHANGELOG).await.map_err(|e| anyhow::anyhow!("update: {e}"))?;
+    let found = up::check(&client, up::REPO_API, installed, CHANGELOG).await.map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
     if !found.newer {
         println!("arena {installed} is up to date (the latest release is {}).", found.release.tag);
         return Ok(());
     }
-    println!("Update available: arena {installed} → {} ({})\n", found.release.version, found.release.tag);
-    print!("{}", found.changes);
+    println!("Update available: arena {installed} → {} ({})", found.release.version, found.release.tag);
     if check_only {
+        println!("What changed, from the release's CHANGELOG.md (not verified: `arena update --dry-run` verifies it):\n");
+        print!("{}", found.changes);
         return Err(UpdateAvailable.into());
     }
     // Where this binary really is (`/usr/local/bin/arena` is a link into ~/.cargo/bin on prod).
@@ -150,23 +160,46 @@ async fn handle_update(check_only: bool, dry_run: bool, yes: bool) -> Result<()>
         anyhow::bail!("this binary is {} — `arena update` replaces one named `arena` (and `arena-tui` beside it)", exe.display());
     }
     let target = env!("ARENA_TARGET");
+    let github = attest::GitHub { client: &client, api: up::REPO_API };
+    let pinned = pins.is_some();
+    let provenance = match pins {
+        Some(pins) => {
+            eprintln!("\n{SKIP_ATTESTATION_WARNING}");
+            up::Provenance::Pinned(pins)
+        }
+        None => up::Provenance::Verify { source: &github, expected: attest::RELEASE },
+    };
     println!("\nDownloading {} for {target} …", found.release.tag);
-    let staged = up::fetch(&client, &found.release, target, dir).await.map_err(|e| anyhow::anyhow!("update: {e}"))?;
-    println!("Both binaries match the release's SHA256SUMS, and the new arena runs here.");
+    let staged = up::fetch(&client, &found.release, target, dir, &provenance).await.map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
+    // The changelog is shown only now, with what can be said of it: before, it was the
+    // release's word alone, and its "Action needed" lines are instructions to an operator.
+    let changelog = up::changelog_provenance(staged.proof.as_ref(), found.changelog_sha256.as_deref()).map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
+    match &staged.proof {
+        Some(proof) => {
+            println!("Both binaries match the release's SHA256SUMS, and one build-provenance attestation names both");
+            println!("(Sigstore, verified here): {proof}.");
+        }
+        None => println!("Both binaries match the release's SHA256SUMS and the SHA-256s given (provenance NOT checked here)."),
+    }
+    println!("The new arena runs here.");
+    println!("\nWhat changed, from the release's CHANGELOG.md ({changelog}):\n");
+    print!("{}", found.changes);
+    println!();
     if dry_run {
         println!("--dry-run: nothing installed.");
         return Ok(());
     }
     let what = format!(
-        "Install arena {} in {} (the current arena and arena-tui become arena.prev and arena-tui.prev)?",
+        "Install arena {}{} in {} (the current arena and arena-tui become arena.prev and arena-tui.prev)?",
         found.release.version,
+        if pinned { " (provenance NOT checked here)" } else { "" },
         dir.display()
     );
     if !confirm(yes, &what)? {
         println!("Not installed.");
         return Ok(());
     }
-    staged.install().map_err(|e| anyhow::anyhow!("update: {e}"))?;
+    staged.install().map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
     println!("Installed arena {} in {}.", found.release.version, dir.display());
     println!("Roll back: cd {} && mv -f arena.prev arena && mv -f arena-tui.prev arena-tui", dir.display());
     let stale = up::stale_processes(std::path::Path::new("/proc"), &dir.join("arena-tui"));
@@ -207,18 +240,26 @@ enum Cmd {
     ///
     /// Reads the latest GitHub release and shows its changelog entries this build lacks, the
     /// "action needed" and config lines first. Then it downloads `arena` and `arena-tui` for
-    /// this platform, checks them against the release's SHA256SUMS, checks the new `arena`
-    /// runs here, asks, and swaps both in where this binary is — the old ones kept as
-    /// `arena.prev` / `arena-tui.prev`. Dashboards still on the old build are listed.
-    /// Needs no config.
+    /// this platform, checks them against the release's SHA256SUMS and their build-provenance
+    /// attestations (Sigstore: built by this repository's release.yml from master), checks the
+    /// new `arena` runs here, asks, and swaps both in where this binary is — the old ones kept
+    /// as `arena.prev` / `arena-tui.prev`. Dashboards still on the old build are listed.
+    /// Any check that fails installs nothing. Needs no config and no GitHub login.
     #[command(verbatim_doc_comment)]
     Update {
         /// Only say whether a newer release exists and what it changes (exit 10 if one does)
         #[arg(long)]
         check: bool,
-        /// Download and check the new binaries, but install nothing
+        /// Download and check the new binaries, attestations included, but install nothing
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        /// Do NOT check build provenance: install only binaries with these SHA-256s, checked by hand
+        ///
+        /// arena's and arena-tui's, for this platform, as `gh attestation verify` checked them
+        /// elsewhere: only for a release this build can't verify (say, after Sigstore rotated
+        /// its keys). How: docs/REFERENCE.md.
+        #[arg(long, value_name = "SHA256,SHA256", value_delimiter = ',')]
+        skip_attestation: Vec<String>,
     },
     /// SSH proxy forwards: preview (plan) or write + reload (apply)
     #[command(subcommand, infer_subcommands = true)]
@@ -2968,8 +3009,8 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> Result<()> {
     let (cli, provider_named) = help::parse();
     // Before the config: an update needs none, and must work where it's broken.
-    if let Cmd::Update { check, dry_run } = cli.cmd {
-        return handle_update(check, dry_run, cli.yes).await;
+    if let Cmd::Update { check, dry_run, skip_attestation } = cli.cmd {
+        return handle_update(check, dry_run, skip_attestation, cli.yes).await;
     }
     let cfg = Config::load(&cli.config)
         .with_context(|| format!("loading config {}", cli.config.display()))?;
@@ -17576,6 +17617,7 @@ mod selection_tests {
             (&["archive", "down"], "delete_volumes", "DELETE"),
             (&["archive", "forget"], "delete_archived", "for good"),
             (&["pods", "migrate", "finish"], "discard_stopped", "losing"),
+            (&["update"], "skip_attestation", "NOT check build provenance"),
         ] {
             let arg = find(path).get_arguments().find(|a| a.get_id() == id).unwrap_or_else(|| panic!("{path:?} {id}"));
             let help = text(arg.get_help());

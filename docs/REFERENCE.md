@@ -131,24 +131,68 @@ commit: `arena 2.0.261027.1500 (5274b7a1c2)`.
 
 ```bash
 arena update --check     # newer release? what changed? (exit 10 = yes, 0 = up to date, 1 = couldn't tell)
-arena update --dry-run   # also download and check it, install nothing
+arena update --dry-run   # also download and check it (provenance included), install nothing
 arena update             # … then ask, and swap both binaries in (--yes to skip the question)
 sudo arena update        # where root runs arena from someone else's ~/.cargo/bin (prod)
 ```
 
 - **What changed:** the release's `CHANGELOG.md` entries that this build's own copy (compiled
-  in) lacks, with their **Action needed** and **Config** lines first.
-- **Checks before anything changes:** both binaries must match `SHA256SUMS`, and the new
-  `arena --version` must run here and name the release. A wrong-platform or cut-short download
-  never replaces what cron runs.
+  in) lacks, with their **Action needed** and **Config** lines first. `update` shows them only
+  once the binaries are proven, saying whether the attestation also names this `CHANGELOG.md`
+  (releases from 2026-10-28 on: then it must be that one, and be there, or the update stops);
+  `--check` shows them unverified.
+  Control characters in them are shown as `?`.
+- **Checks before anything changes:** both binaries must match `SHA256SUMS`, must be proven
+  built by this repository's release workflow (below), and the new `arena --version` must run
+  here and name the release. A forged, wrong-platform or cut-short download never replaces what
+  cron runs, and a downloaded binary is only run once it is proven.
+- **Build provenance:** `release.yml` attests its binaries (Sigstore: one statement naming
+  each file and its SHA-256, signed with a certificate GitHub Actions' OIDC token got for the
+  run, logged in Rekor). `update` reads the attestation from GitHub's API (anonymous) and
+  verifies it here, natively, with no `gh` and no login: the signature; the certificate's chain
+  to Sigstore's public-good root (compiled in) and its certificate-transparency timestamp; the
+  Rekor entry (inclusion proof, checkpoint, signed timestamp); SLSA provenance naming *both*
+  downloaded binaries with their digests (so they were built together: a genuine `arena-tui`
+  from an older release can't be slipped in); and who signed: `.github/workflows/release.yml`,
+  started by CI's success (`workflow_run`), on `refs/heads/master` of `nickypro/arena-infra-rs`
+  (GitHub's id 1368824951), on a GitHub-hosted runner. It says which run built them.
+  `SHA256SUMS` alone comes from the same release, so it can't prove that. No attestation, or
+  none that verifies: nothing is installed (nor run), and it says why. The new `arena` must
+  also be the release's version before it runs: the statement names a `VERSION` file holding
+  it (releases from 2026-10-28 on), or, for older ones, the verified bytes carry its
+  `--version` line. An older genuine build served under a newer tag is refused there.
+- **`--skip-attestation <sha256>,<sha256>`:** this build doesn't check provenance; it installs
+  only binaries whose SHA-256s are the two given (`arena`'s and `arena-tui`'s, either order),
+  and says so loudly. `SHA256SUMS` is still checked. It's for one case: a genuine release this
+  build can't verify, because Sigstore changed its keys or GitHub its attestation format after
+  this build was made. Verify this platform's two binaries elsewhere, with a current `gh`
+  (prod's 2.45 has no `gh attestation`), then pass their digests:
+
+  ```bash
+  # any machine with a current gh; the release's binaries for the box's platform (prod: aarch64)
+  t=aarch64-unknown-linux-gnu; tag=v2.0.YYMMDD.HHMM
+  gh release download $tag --repo nickypro/arena-infra-rs -p arena-$t -p arena-tui-$t
+  for f in arena-$t arena-tui-$t; do   # both must print the same run, or don't go on
+    gh attestation verify $f --repo nickypro/arena-infra-rs --deny-self-hosted-runners \
+      --cert-identity https://github.com/nickypro/arena-infra-rs/.github/workflows/release.yml@refs/heads/master \
+      --source-ref refs/heads/master --format json --jq '.[0].verificationResult.signature.certificate.runInvocationURI'
+  done
+  sha256sum arena-$t arena-tui-$t
+  # then, on the box:
+  sudo arena update --skip-attestation <arena's sha256>,<arena-tui's sha256>
+  ```
+
+  It installs, and runs, only those bytes: a release changed in between is refused. The new
+  build has the new root, so the next update verifies again. `--check` never reads
+  attestations.
 - **The swap:** where this `arena` really is (symlinks resolved), the current binaries become
   `arena.prev` / `arena-tui.prev` (an older `.prev` is replaced). Each new one takes the old
   one's mode and owner, and lands by rename, so the path always holds a whole binary.
   Roll back with `mv -f arena.prev arena && mv -f arena-tui.prev arena-tui`.
 - **Afterwards:** it lists the `arena-tui` dashboards still running the replaced build, to
   restart. Cron picks the new `arena` up on its next run.
-- It needs no config and no GitHub login (the API allows 60 unauthenticated requests an hour).
-  Provenance: `gh attestation verify arena-<target> --repo nickypro/arena-infra-rs`.
+- It needs no config and no GitHub login (the API allows 60 unauthenticated requests an hour;
+  an update makes 2: the latest release, and its attestation).
 
 ### Command shorthands
 
@@ -1984,6 +2028,18 @@ answered shows none — so another provider's outage delays the all-clear, never
 after 8 rounds without one it prints the commands to finish by hand. Only Ctrl+C gets past
 it, so after an interrupted run check `teardown --check`. A COMMUNITY pod that never gets a
 public IP fails as `FAILED endpoint` (see [`docs/TODO.md`](TODO.md)); the guard still cleans it up.
+
+### The live attestation check
+
+The offline tests verify recorded attestations (`crates/core/src/fixtures/attestation_*.json`),
+so they can't notice Sigstore rotating a key or GitHub changing its bundles. This opt-in test
+does: it reads the latest release's attestation from GitHub (2 anonymous API requests, no
+account, nothing spent), verifies it for the x86_64 `arena` and `arena-tui` as `arena update`
+does, and checks it doesn't verify as another workflow's or another repository's.
+
+```bash
+ARENA_LIVE_ATTEST=1 cargo test --release -p arena-core --lib attest -- --ignored --nocapture
+```
 
 ## AI review before merging
 
