@@ -90,21 +90,26 @@ setup_swap() {
     fi
     local want=$((SWAP_GB * 1024 * 1024 * 1024)) on have free
     # What's on now, `<file> <bytes>` a line (the kernel's own list: no util-linux version needed).
-    on=$(awk 'NR > 1 { print $1, $3 * 1024 }' "$PROC_SWAPS" 2>/dev/null)
+    # Every number awk hands the shell goes through %.0f: some awks print a big product as 1.8e+10,
+    # which `[ -lt ]` and $(( )) can't read.
+    on=$(awk 'NR > 1 { printf "%s %.0f\n", $1, $3 * 1024 }' "$PROC_SWAPS" 2>/dev/null)
     if printf '%s\n' "$on" | awk -v f="$SWAPFILE" '$1 == f { found = 1 } END { exit !found }'; then
-        have=$(printf '%s\n' "$on" | awk -v f="$SWAPFILE" '$1 == f { print int($2 / 1073741824) }')
+        have=$(printf '%s\n' "$on" | awk -v f="$SWAPFILE" '$1 == f { printf "%.0f\n", int($2 / 1073741824) }')
         [ "$have" = "$SWAP_GB" ] && echo "swap: $SWAPFILE already on ($have GB)" \
             || echo "swap: $SWAPFILE already on ($have GB, not the $SWAP_GB GB asked: resizing a live swap file isn't safe here)"
         swap_in_fstab
         return
     fi
-    have=$(printf '%s\n' "$on" | awk '{ s += $2 } END { print s + 0 }')
+    have=$(printf '%s\n' "$on" | awk '{ s += $2 } END { printf "%.0f\n", s }')
     if [ "$have" -ge "$want" ]; then
         echo "swap: $((have / 1073741824)) GB already on (not arena's) — none added"
         return
     fi
     # A leftover file of ours (not on: a run cut short) is space we can take back.
-    free=$(df -Pk "$(dirname "$SWAPFILE")" 2>/dev/null | awk 'NR == 2 { print $4 * 1024 }')
+    free=$(df -Pk "$(dirname "$SWAPFILE")" 2>/dev/null | awk 'NR == 2 { printf "%.0f\n", $4 * 1024 }')
+    case "$have$free" in
+        *[!0-9]*) echo "WARN: no swap — couldn't measure the swap on or the free disk ('$have', '$free')"; return ;;
+    esac
     [ -f "$SWAPFILE" ] && free=$(( ${free:-0} + $(stat -c %s "$SWAPFILE" 2>/dev/null || echo 0) ))
     if [ -z "$free" ] || [ "$free" -lt $((want + SWAP_ROOM_GB * 1024 * 1024 * 1024)) ]; then
         echo "WARN: no swap — ${SWAP_GB} GB of it would leave under ${SWAP_ROOM_GB} GB free on $(dirname "$SWAPFILE") ($(( ${free:-0} / 1073741824 )) GB free)"
