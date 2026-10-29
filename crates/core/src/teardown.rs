@@ -117,6 +117,11 @@ pub struct Inputs {
     pub archive_prices: crate::archive::Prices,
     /// Today, in days since the epoch (UTC).
     pub today_days: i64,
+    /// The fleet's Hetzner project's snapshots and `arena image build` VMs ([`images_item`]);
+    /// skipped without `HETZNER_API_KEY`.
+    pub images: Probe<crate::image::Inventory>,
+    /// Now (unix): a build VM's age.
+    pub now: u64,
 }
 
 /// One checklist line's outcome.
@@ -159,12 +164,14 @@ pub enum Area {
     At,
     Proxy,
     Archive,
+    Images,
 }
 
 impl Area {
     fn label(self) -> &'static str {
         match self {
             Area::Archive => "backup archive",
+            Area::Images => "images",
             Area::Pods => "pods",
             Area::Volumes => "network volumes",
             Area::Keys => "OpenRouter keys",
@@ -230,6 +237,15 @@ pub enum Entry {
         public_port: u16,
         target: String,
         provider: Option<String>,
+    },
+    /// A Hetzner snapshot or an `arena image build` VM.
+    Image {
+        id: String,
+        name: String,
+        /// `arena image`, `snapshot` (not arena's), `build VM`.
+        resource: String,
+        /// `5.8 GB, ≈ $0.12/month, built 2026-10-29` / `cx23, billing, 4h old`.
+        detail: String,
     },
     /// A backup-archive resource (server, volume or SSH-key object), labelled with its cohort.
     Archive {
@@ -317,6 +333,7 @@ pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
     let configured: Vec<&str> = inputs.listings.iter().map(|(p, _)| p.as_str()).collect();
     items.push(proxy_item(&inputs.proxy, &configured));
     items.push(archive_item(&inputs.archive, naming.prefix, inputs.archive_keep_until, inputs.today_days, &inputs.archive_prices));
+    items.push(images_item(&inputs.images, naming.prefix, inputs.now));
     let count = |v: Verdict| items.iter().filter(|i| i.verdict == v).count();
     let (remaining, unknown) = (count(Verdict::Remaining), count(Verdict::Unknown));
     Report {
@@ -1081,6 +1098,78 @@ pub fn archive_item(probe: &Probe<crate::archive::Inventory>, prefix: &str, keep
     item
 }
 
+/// The fleet's Hetzner project's snapshots and image-build VMs. A build VM bills by the hour:
+/// **remaining** (`image build` deletes its own; one still there is a bake running now, or one
+/// whose delete failed). This cohort's arena images are **kept** (◷, never against the check):
+/// they're what `HETZNER_IMAGE=arena` boots, made on purpose, and cost cents a month — the note
+/// says what they cost and how to delete them when the programme ends. Any other snapshot
+/// (made by hand, another cohort's) is a note with its cost: it bills too, but it isn't arena's
+/// to judge or delete. `now`: for the build VMs' age.
+pub fn images_item(probe: &Probe<crate::image::Inventory>, prefix: &str, now: u64) -> Item {
+    use crate::image::Snapshot;
+    const SCOPE: &str = "hetzner";
+    let inv = match probe {
+        Probe::Skipped(why) => return Item::new(Area::Images, SCOPE, Verdict::Skipped, why.clone()),
+        Probe::Failed(e) => return Item::new(Area::Images, SCOPE, Verdict::Unknown, format!("couldn't list ({e}) — NOT known to be gone")),
+        Probe::Got(inv) => inv,
+    };
+    let money = |s: &Snapshot| match (&inv.price, s.size_gb) {
+        (Some(p), Some(g)) => format!("≈ {}/month", p.money(g * p.per_gb_month)),
+        _ => "≈ ?/month".into(),
+    };
+    let mut item = Item::new(Area::Images, SCOPE, Verdict::Clear, "none");
+    let ours: Vec<&Snapshot> = inv.snapshots.iter().filter(|s| s.arena && s.prefix.as_deref() == Some(prefix)).collect();
+    let others: Vec<&Snapshot> = inv.snapshots.iter().filter(|s| !(s.arena && s.prefix.as_deref() == Some(prefix))).collect();
+    for s in &ours {
+        let built = s.built.map(|b| format!(", built {}", &crate::snapshot::rfc3339(b)[..10])).unwrap_or_default();
+        let size = s.size_gb.map_or("? GB".into(), |g| format!("{g:.1} GB"));
+        item.entries.push(Entry::Image { id: s.id.to_string(), name: s.description.clone(), resource: "arena image".into(), detail: format!("{size}, {}{built}", money(s)) });
+    }
+    for v in &inv.build_vms {
+        let age = v.created_at.map(|c| format!(", {} old", crate::snapshot::fmt_age(now.saturating_sub(c)))).unwrap_or_default();
+        let symbol = inv.price.as_ref().map_or_else(|| currency_symbol("hetzner").to_string(), |p| p.symbol().trim().to_string());
+        let cost = v.cost_per_hr.map(|c| format!(", {}/h", fmt_money(&symbol, c))).unwrap_or_default();
+        item.entries.push(Entry::Image {
+            id: v.id.clone(),
+            name: v.name.clone(),
+            resource: "build VM".into(),
+            detail: format!("{}, {}{cost}{age}", v.gpu_type.as_deref().unwrap_or("?"), v.status.to_lowercase()),
+        });
+    }
+    let total = |list: &[&Snapshot]| -> String {
+        let gb: f64 = list.iter().filter_map(|s| s.size_gb).sum();
+        match &inv.price {
+            Some(p) => format!("{gb:.1} GB, ≈ {}/month", p.money(gb * p.per_gb_month)),
+            None => format!("{gb:.1} GB"),
+        }
+    };
+    if !inv.build_vms.is_empty() {
+        item.verdict = Verdict::Remaining;
+        item.summary = format!("{} image-build VM(s) still there — billing by the hour", inv.build_vms.len());
+        item.notes.push("`arena image build` deletes its VM even on failure or Ctrl+C: one here is a bake running now, or a delete that failed".into());
+        item.fix.push("arena image prune   # deletes build VMs over 3 h old (and old images past --keep)".into());
+    } else if !ours.is_empty() {
+        item.verdict = Verdict::Kept;
+        item.summary = format!("{} arena image(s) kept for HETZNER_IMAGE=arena: {}", ours.len(), total(&ours));
+    }
+    if !ours.is_empty() {
+        item.notes.push("arena images bill storage monthly until deleted: at the programme's end `arena image prune --keep 0`".into());
+    }
+    if !others.is_empty() {
+        let list: Vec<String> = others
+            .iter()
+            .map(|s| format!("{} \"{}\" ({}, {})", s.id, s.description, s.size_gb.map_or("? GB".into(), |g| format!("{g:.1} GB")), money(s)))
+            .collect();
+        let sum = if others.len() > 1 { format!(" — {}", total(&others)) } else { String::new() };
+        item.notes.push(format!(
+            "{} other snapshot(s) in this project, not this cohort's arena images (left alone; they bill too): {}{sum}",
+            others.len(),
+            list.join("; ")
+        ));
+    }
+    item
+}
+
 /// `N remain`, or `1 remains`.
 fn remain(n: usize) -> String {
     if n == 1 {
@@ -1163,7 +1252,7 @@ fn clip(s: &str) -> String {
 /// The lines under an item, one per entry, the name/id column aligned within the item.
 fn entry_lines(entries: &[Entry]) -> Vec<String> {
     let key = |e: &Entry| match e {
-        Entry::Pod { name, .. } | Entry::Key { name, .. } | Entry::Forward { name, .. } | Entry::Archive { name, .. } => name.clone(),
+        Entry::Pod { name, .. } | Entry::Key { name, .. } | Entry::Forward { name, .. } | Entry::Archive { name, .. } | Entry::Image { name, .. } => name.clone(),
         Entry::Volume { id, .. } => id.clone(),
         Entry::AtJob { id, .. } => format!("#{id}"),
         Entry::CronLine { .. } => String::new(),
@@ -1227,6 +1316,7 @@ fn entry_lines(entries: &[Entry]) -> Vec<String> {
                 Entry::Archive { id, resource, prefix, detail, .. } => {
                     format!("{k}  id={id}  {resource}  {detail}  (cohort {prefix})")
                 }
+                Entry::Image { id, resource, detail, .. } => format!("{k}  id={id}  {resource}  {detail}"),
             };
             line.trim_end().to_string()
         })
@@ -1337,6 +1427,8 @@ mod tests {
             archive_keep_until: None,
             archive_prices: crate::archive::Prices::LIST,
             today_days: 20_000,
+            images: Probe::Got(crate::image::Inventory::default()),
+            now: 20_000 * 86_400,
         }
     }
 
@@ -1420,6 +1512,7 @@ mod tests {
                 (Area::At, "dev", Verdict::Skipped),
                 (Area::Proxy, "/srv/proxy.conf", Verdict::Clear),
                 (Area::Archive, "hetzner", Verdict::Clear), // the archive answered: none
+                (Area::Images, "hetzner", Verdict::Clear),
             ]
         );
         let text = r.render();
@@ -1980,6 +2073,55 @@ mod tests {
             assert!(!out.contains("SECRET") && !out.contains("sk-or"), "{out}");
         }
         assert!(text.contains("OPENROUTER_PROVISIONING_KEY=…\t/usr/local/bin/arena keys gen --yes"), "{text}");
+    }
+
+    /// The fleet project's snapshots: this cohort's arena images are kept (◷, never against the
+    /// check) with their cost; a build VM still there bills by the hour (✗, fix `image prune`);
+    /// a hand-made or another cohort's snapshot is a note with its cost, never ours to judge;
+    /// a listing that failed is `?`.
+    #[test]
+    fn arena_images_are_kept_build_vms_remain_and_other_snapshots_are_noted() {
+        use crate::image::{parse_snapshot, ImagePrice, Inventory};
+        let snap = |id: u64, labels: serde_json::Value| {
+            parse_snapshot(&serde_json::json!({"id": id, "description": format!("d{id}"), "status": "available", "image_size": 5.85, "disk_size": 40, "labels": labels, "created": "2026-10-29T12:00:00Z"})).unwrap()
+        };
+        let ours = snap(1, serde_json::json!({"arena-image": "1", "arena-prefix": "devtest"}));
+        let theirs = snap(2, serde_json::json!({"arena-image": "1", "arena-prefix": "arena9"}));
+        let manual = snap(448331072, serde_json::json!({"arena-prefix": "devtest"}));
+        let price = Some(ImagePrice { per_gb_month: 0.0199, currency: "USD".into() });
+        let now = 1_793_300_000;
+        let item = |inv: Inventory| images_item(&Probe::Got(inv), "devtest", now);
+
+        let kept = item(Inventory { snapshots: vec![ours.clone(), manual.clone(), theirs], build_vms: vec![], price: price.clone() });
+        assert_eq!(kept.verdict, Verdict::Kept);
+        assert_eq!(kept.summary, "1 arena image(s) kept for HETZNER_IMAGE=arena: 5.8 GB, ≈ $0.12/month");
+        assert_eq!(kept.entries.len(), 1, "only ours are entries");
+        assert!(kept.fix.is_empty());
+        assert!(kept.notes.iter().any(|n| n.contains("`arena image prune --keep 0`")), "{:?}", kept.notes);
+        assert!(
+            kept.notes.iter().any(|n| n.starts_with("2 other snapshot(s) in this project") && n.contains("448331072 \"d448331072\" (5.8 GB, ≈ $0.12/month)")),
+            "{:?}",
+            kept.notes
+        );
+
+        let vm = Pod { id: "9".into(), name: "devtest-image-261029-1542".into(), status: "RUNNING".into(), gpu_type: Some("cx23".into()), cost_per_hr: Some(0.0104), created_at: Some(now - 600), ..Default::default() };
+        let busy = item(Inventory { snapshots: vec![ours], build_vms: vec![vm], price: price.clone() });
+        assert_eq!(busy.verdict, Verdict::Remaining);
+        assert_eq!(busy.summary, "1 image-build VM(s) still there — billing by the hour");
+        assert!(busy.fix[0].starts_with("arena image prune"));
+        let text = entry_lines(&busy.entries).join("\n");
+        assert!(text.contains("id=9  build VM  cx23, running, $0.010/h, 10m old"), "{text}");
+
+        let only_manual = item(Inventory { snapshots: vec![manual], build_vms: vec![], price });
+        assert_eq!(only_manual.verdict, Verdict::Clear, "a hand-made snapshot is noted, not judged");
+        assert_eq!(only_manual.notes.len(), 1);
+        assert_eq!(images_item(&Probe::Failed("HTTP 503".into()), "devtest", now).verdict, Verdict::Unknown);
+        assert_eq!(images_item(&Probe::Skipped("no key".into()), "devtest", now).verdict, Verdict::Skipped);
+        // Kept never counts against the check.
+        let mut i = inputs();
+        i.images = Probe::Got(Inventory { snapshots: vec![snap(1, serde_json::json!({"arena-image": "1", "arena-prefix": "arena8"}))], ..Default::default() });
+        let names = list();
+        assert!(build(&i, &Naming { prefix: "arena8", list: &names }).clear);
     }
 
     fn archive_inv(prefix: &str, server: bool) -> crate::archive::Inventory {

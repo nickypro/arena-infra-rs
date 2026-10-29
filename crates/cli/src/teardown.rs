@@ -48,7 +48,7 @@ pub(crate) async fn handle_teardown(provider: &dyn Provider, cfg: &Config, check
     let cloud = arena_core::archive::archive_token(cfg).map(|(t, _)| arena_core::archive::HetznerArchiveCloud::new(t));
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
     let archive = read_archive_priced(cloud.as_ref().map(|c| c as &dyn ArchiveCloud), &prefix);
-    teardown_with(provider, cfg, read_volumes(cfg), read_shadeform_volumes(cfg), archive, keys, &SystemSched, json, &bal).await
+    teardown_with(provider, cfg, read_volumes(cfg), read_shadeform_volumes(cfg), archive, read_images(cfg), keys, &SystemSched, json, &bal).await
 }
 
 /// The check against these sources (the real ones, or fakes in tests): print the checklist
@@ -62,12 +62,13 @@ pub(crate) async fn teardown_with(
     volumes: impl Future<Output = Probe<Vec<NetworkVolume>>>,
     sf_volumes: impl Future<Output = Probe<Vec<ShadeformVolume>>>,
     archive: impl Future<Output = (Probe<Inventory>, Prices)>,
+    images: impl Future<Output = Probe<arena_core::image::Inventory>>,
     keys: Option<&dyn KeyApi>,
     sched: &dyn Sched,
     json: bool,
     bal: &BalanceCtx,
 ) -> Result<()> {
-    let report = collect(provider, cfg, volumes, sf_volumes, archive, keys, sched, bal).await;
+    let report = collect(provider, cfg, volumes, sf_volumes, archive, images, keys, sched, bal).await;
     print!("{}", render_output(&report, json)?);
     exit_status(&report)
 }
@@ -105,6 +106,7 @@ async fn collect(
     volumes: impl Future<Output = Probe<Vec<NetworkVolume>>>,
     sf_volumes: impl Future<Output = Probe<Vec<ShadeformVolume>>>,
     archive: impl Future<Output = (Probe<Inventory>, Prices)>,
+    images: impl Future<Output = Probe<arena_core::image::Inventory>>,
     keys: Option<&dyn KeyApi>,
     sched: &dyn Sched,
     bal: &BalanceCtx,
@@ -115,11 +117,12 @@ async fn collect(
     let observing = balance::observe(bal.api.as_ref(), &state, mode, balance::INLINE_TIMEOUT, now);
     // `list_by_provider`, not `list_pods`: the fleet's `list_pods` drops a backend that
     // failed, which here would read as "that provider has no pods".
-    let (listings, volumes, shadeform_volumes, (archive, archive_prices), keys, cron, at, fetched) = tokio::join!(
+    let (listings, volumes, shadeform_volumes, (archive, archive_prices), images, keys, cron, at, fetched) = tokio::join!(
         provider.list_by_provider(),
         volumes,
         sf_volumes,
         archive,
+        images,
         read_keys(keys),
         read_cron(sched),
         read_at(sched),
@@ -150,7 +153,9 @@ async fn collect(
         archive,
         archive_keep_until,
         archive_prices,
-        today_days: arena_core::schedule::days_from_unix(arena_core::snapshot::unix_now()),
+        today_days: arena_core::schedule::days_from_unix(now),
+        images,
+        now,
     };
     let mut report = teardown::build(&inputs, &Naming::from_config(cfg));
     if !fetched.is_empty() {
@@ -236,6 +241,27 @@ pub(crate) async fn read_archive_priced(cloud: Option<&dyn ArchiveCloud>, prefix
         _ => Prices::LIST,
     };
     (probe, prices)
+}
+
+/// The fleet's Hetzner project's snapshots (all of them) and `arena image build` VMs (any
+/// prefix), and the snapshot price — three bounded, read-only GETs; any failure is "couldn't
+/// check". Without HETZNER_API_KEY: not checked.
+async fn read_images(cfg: &Config) -> Probe<arena_core::image::Inventory> {
+    use arena_core::image::cloud::ImageCloud;
+    let Ok(cloud) = super::image::hetzner(cfg) else {
+        return Probe::Skipped("Hetzner isn't configured (no HETZNER_API_KEY) — snapshots not checked".into());
+    };
+    let read = async {
+        let snapshots = cloud.snapshots(None).await?;
+        let build_vms = cloud.servers(arena_core::image::BUILD_LABEL).await?;
+        let price = cloud.image_price().await.ok();
+        Ok::<_, arena_core::Error>(arena_core::image::Inventory { snapshots, build_vms, price })
+    };
+    match tokio::time::timeout(LIST_TIMEOUT, read).await {
+        Ok(Ok(inv)) => Probe::Got(inv),
+        Ok(Err(e)) => Probe::Failed(e.to_string()),
+        Err(_) => Probe::Failed(format!("timed out after {}s", LIST_TIMEOUT.as_secs())),
+    }
 }
 
 /// Every OpenRouter key on the account (all pages); `teardown::keys_item` picks this cohort's.
@@ -500,6 +526,10 @@ mod tests {
         std::future::ready(Probe::Skipped("Shadeform isn't configured".into()))
     }
 
+    fn no_images() -> std::future::Ready<Probe<arena_core::image::Inventory>> {
+        std::future::ready(Probe::Skipped("Hetzner snapshots not read in this test".into()))
+    }
+
     /// S16 / S8: teardown's archive read is one LIST — no mutation, whatever it finds — and a
     /// failed listing is unknown, never "no archive".
     #[tokio::test]
@@ -556,7 +586,7 @@ mod tests {
                 cfg.values.insert("ARCHIVE_KEEP_UNTIL".into(), d.into());
             }
             let ready = |a: &Probe<Inventory>| std::future::ready((a.clone(), Prices::LIST));
-            let report = collect(&fleet, &cfg, std::future::ready(Probe::Got(vec![])), no_sf_volumes(), ready(&archive), None, &sched, &bal).await;
+            let report = collect(&fleet, &cfg, std::future::ready(Probe::Got(vec![])), no_sf_volumes(), ready(&archive), no_images(), None, &sched, &bal).await;
             let item = report.items.iter().find(|i| i.area == Area::Archive).expect("an archive item");
             assert_eq!(item.verdict, verdict, "{}", report.render());
             let pods: Vec<&arena_core::teardown::Item> = report.items.iter().filter(|i| i.area == Area::Pods).collect();
@@ -568,7 +598,7 @@ mod tests {
             let v = serde_json::to_value(&report).unwrap();
             assert_eq!(v["balance"][0]["account"], "runpod");
             assert!(v["items"].as_array().unwrap().iter().any(|i| i["area"] == "archive"), "{v:#}");
-            let exit = teardown_with(&fleet, &cfg, std::future::ready(Probe::Got(vec![])), no_sf_volumes(), ready(&archive), None, &sched, false, &bal).await;
+            let exit = teardown_with(&fleet, &cfg, std::future::ready(Probe::Got(vec![])), no_sf_volumes(), ready(&archive), no_images(), None, &sched, false, &bal).await;
             assert_eq!(exit.is_ok(), clear, "the archive decides the exit; the critical balance never does");
         }
         assert!(fake.mutations().is_empty(), "teardown only lists the archive");
@@ -641,8 +671,8 @@ mod tests {
         bal: &BalanceCtx,
     ) -> (Report, std::result::Result<(), String>) {
         let keys = keys.map(|k| k as &dyn KeyApi);
-        let report = collect(fleet, cfg, std::future::ready(volumes.clone()), no_sf_volumes(), std::future::ready(no_archive()), keys, sched, bal).await;
-        let exit = teardown_with(fleet, cfg, std::future::ready(volumes), no_sf_volumes(), std::future::ready(no_archive()), keys, sched, false, bal)
+        let report = collect(fleet, cfg, std::future::ready(volumes.clone()), no_sf_volumes(), std::future::ready(no_archive()), no_images(), keys, sched, bal).await;
+        let exit = teardown_with(fleet, cfg, std::future::ready(volumes), no_sf_volumes(), std::future::ready(no_archive()), no_images(), keys, sched, false, bal)
             .await
             .map_err(|e| e.to_string());
         (report, exit)
@@ -844,6 +874,7 @@ mod tests {
             std::future::ready(Probe::Got(vec![vol("vol1", 100)])),
             no_sf_volumes(),
             std::future::ready(no_archive()),
+            no_images(),
             Some(&keys),
             &sched,
             true,

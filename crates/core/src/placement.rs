@@ -1457,6 +1457,7 @@ mod tests {
             api_extra: None,
             avoid_machines: Vec::new(),
             server_type: None,
+            vm_image: None,
             region: None,
         }
     }

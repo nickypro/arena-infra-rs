@@ -21,6 +21,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [RunPod REST v1 (retiring)](#runpod-rest-v1-retiring)
   - [Vast.ai](#vastai)
   - [Hetzner Cloud](#hetzner-cloud)
+  - [Hetzner: pre-built images](#hetzner-pre-built-images)
   - [Shadeform](#shadeform)
 - [Library modules (`arena-core`)](#library-modules-arena-core)
 - [Pods: create, list and the lifecycle](#pods-create-list-and-the-lifecycle)
@@ -480,6 +481,92 @@ keys' public halves, as RunPod, Vast and Shadeform pods get them at create; an `
 `user_data` replaces that one (setup still authorizes them). A refused create is explained from the project (read-only `GET /ssh_keys` + `GET
 /server_types`): a missing SSH key names the project's keys and what to set or upload; a type the
 location doesn't sell lists the ones it does.
+
+### Hetzner: pre-built images
+
+A RunPod or Vast pod starts from the cohort's Docker image with the env in it. A Hetzner VM starts as
+bare Ubuntu, and setup builds everything (packages, docker, uv, ~4 GB of CPU wheels): about 10
+minutes a VM. From an **arena image** — a snapshot of a VM that setup built, with everything of that
+machine's scrubbed off — setup takes about a minute.
+
+```bash
+arena image build --dry-run      # the plan: VM type, what's scrubbed, cost
+arena image build                # ~10 min; asks first (-y: doesn't)
+arena image list                 # this cohort's images; which one `arena` picks; are they current?
+arena image prune [--keep 1]     # delete older ones (and any build VM left behind); asks first
+arena image prune --keep 0       # the programme's end: every one of this cohort's images
+```
+
+Then `HETZNER_IMAGE=arena` in the config (or `--image arena` on `pods create` / `pods up`, for one
+run): the newest of this cohort's arena images that fits the server type, else `ubuntu-24.04` with a
+one-line note. `up`/`create` print which (`image arena → snapshot 1234 (devtest-image-261029-1542,
+built 2026-10-29, 2h old, commit 3eed962b9bd8)`). A snapshot id or a system image name works as
+before.
+
+**What `image build` does.** It creates `<prefix>-image-<yymmdd-hhmm>` from Ubuntu — by default the
+smallest-disk type of `HETZNER_SERVER_TYPE`'s architecture with at least 4 GB of memory (a cx23:
+40 GB) — and runs `pods setup`'s steps on it, without any token and without swap (a swap file
+holds pages of the VM's memory; the VMs made from the image make their own). Then it scrubs it: the deploy key,
+every file in `~/.ssh` but `known_hosts` (the authorized keys, the github/fleet/archive blocks — the
+new server's own key is written by cloud-init at its first boot), the token exports in the rc files,
+`~/.claude.json`, `~/.claude`, Codex's `auth.json`, the Hugging Face token, git/gh credentials,
+shell history, `~/.name` and the MOTD's name, `~/.arena`, uv's and pip's caches, the swap file and
+its fstab line, `/etc/machine-id` (emptied: systemd makes a new one), the SSH host keys and
+`cloud-init clean --logs` (so the image boots as a new instance and cloud-init makes new host keys
+and sets the new hostname), `/tmp` and the logs. A swap that's on and can't be turned off and
+deleted stops the bake. Then it **scans** the homes and `/etc` for the
+backup's secret patterns (`SECRET_PATTERNS`: OpenRouter, Anthropic, OpenAI, Hugging Face, GitHub,
+Google, Groq and AWS keys) and private key files (a PEM header on a line of its own), skipping the
+venv (third-party packages) and `.git`. Any hit and it **refuses to snapshot**, naming the files —
+never what matched; a scan that couldn't read something refuses too. Last, it zeroes the disk's
+free space (a file of zeros until the disk is full, then gone, then `fstrim`), so what was deleted
+doesn't stay in free blocks the snapshot copies. (The deploy key and the broadcast tokens are on
+every VM anyway — setup and `copy-keys` put them there — so this is about the bake VM's own
+identity, its history and its logs.) Then it powers the VM off and snapshots it, labelled
+`arena-image=1`, `arena-prefix`, `built` (unix), `repo` (`owner.name`, for people) and `repo-id`
+(a hash of `owner/name`, what `arena` matches on), `commit` (the checkout's), `req` (a hash of the
+repo's `install_uv.sh`, `requirements.txt` and `pyproject.toml`: what the env install read),
+`arch`, `disk` and the bake's own id. The VM is deleted whatever happens — a failed setup, a scan
+hit, a failed snapshot, Ctrl+C. A create or snapshot whose answer never came (a dropped
+connection, Ctrl+C mid-request) is looked for by the bake's id for a minute (never by name: two
+bakes in the same minute share one) and deleted; one that doesn't turn up is said loudly, with the
+label to look for — never "nothing was made". A create Hetzner refused (4xx) made nothing. A delete
+that keeps failing is printed loudly with the VM's id. The zeroing is flushed to the disk before
+its file goes, and anything but a full disk ending it (or too little written) stops the bake, as
+does a `/proc/swaps` it can't read or a swap still on after `swapoff`. A build VM is never part of the fleet
+(no backup, proxy, reap or `pods` command sees it); `teardown --check` lists one still there, and
+`image prune` deletes one over 3 hours old.
+
+**A VM from an image** gets the usual setup, with two differences. Before the setup script, its
+checkout is updated as an image-based pod's is (a clean default branch fast-forwards to origin's;
+anything of the participant's is left alone). Then, on the first setup only, the script compares the
+requirements the image's env was built from with the repo's now: the same, and the env is kept;
+different, and it's rebuilt as on a fresh VM (~10 min). The per-machine steps run as usual — swap,
+`~/.name`, the MOTD, the keys and tokens (`copy-keys`). The ✓ line says which image it came from and
+how old it is: `image: devtest-image-261029-1542, built 2026-10-29 (2 h ago), commit 3eed962b9bd8;
+requirements unchanged, env kept`.
+
+**When to rebuild.** When the course repo's requirements change (`image list`'s REQ says `differ`,
+and `config check` says so): every VM from the old image would reinstall. When the image is over 14
+days old (`config check` notes it): VMs fast-forward further at setup, and the system packages age.
+After a change to the setup script. Build, check `image list`, then `image prune`: it keeps the
+newest `--keep` (default 1), the one `arena` picks now and one `HETZNER_IMAGE` names by id — but
+`--keep 0` deletes them all (it warns when `HETZNER_IMAGE` names one).
+
+**Scope and the rules Hetzner sets** (checked 2026-10-29):
+- An image belongs to the **Hetzner project** it was made in. The sandbox project and prod's don't
+  see each other's: build one in each. Within a project, `arena` only picks images labelled with
+  this cohort's prefix and repo; a snapshot made by hand is never picked, pruned or counted as ours.
+- **Location:** none. An image has no location in the API, and one image made servers in hel1 and
+  nbg1, so the create's location walk is unchanged.
+- **Architecture:** an x86 image boots only x86 types (`cax*` are arm).
+- **Disk:** a server's disk must be at least the image's `disk_size` — the disk of the VM it was
+  taken from. Baked on a cx23 (40 GB), it boots on cx23, cx33 and every larger type.
+- **Cost:** storage only, on the image's size (the data, ~6 GB), not its disk: `GET /pricing`'s
+  `image.price_per_gb_month` — $0.0199 per GB-month on the sandbox account (gross, in the account's
+  currency), so ≈ $0.10 a month an image (5.2 GB). The bake VM: ~5–10 minutes of a cx23, about a cent.
+  `teardown --check` lists the images as **kept** (◷: on purpose, never against the check) with
+  their cost; at the programme's end `arena image prune --keep 0` deletes them.
 
 ### Shadeform
 
@@ -1407,6 +1494,13 @@ that's already on, even at another size (resizing a live one isn't safe under me
 /swapfile && rm /swapfile` and set up again to resize. Shadeform's GPU VMs run the same script, so they get it too;
 container pods (RunPod, Vast) can't swap.
 
+On a VM that already has the checkout — one from an arena image ([Hetzner: pre-built
+images](#hetzner-pre-built-images)), or a re-run — a **repo update** step runs before the script:
+the deploy key is wired to github.com and the checkout updated as an image-based pod's is (a clean
+default branch fast-forwards; `--force` resets it). A fresh VM has no checkout yet: the script
+clones it. A fresh install records what it was built from (`.venv/.arena-req`: the hash of
+`install_uv.sh` and `requirements.txt`).
+
 #### VS Code warm-up
 
 **VS Code warm-up** (last step, on every provider, `up`/`restart`/`replace` included): pre-installs
@@ -1890,7 +1984,12 @@ checklist of what is still billing or scheduled, each with the exact command tha
 - pending **`at` jobs** whose command (from `at -c`, never its environment) mentions arena or a
   legacy fleet script (`destroy_pods`, …) — fix `atrm <ids>` (`at` not installed is said, not
   failed);
-- and forwards left in the **local** proxy file — fix `proxy apply`.
+- forwards left in the **local** proxy file — fix `proxy apply`;
+- and the fleet's **Hetzner project's snapshots**: an `arena image build` VM still there is ✗
+  (it bills by the hour; fix `image prune`); this cohort's arena images are ◷ **kept** (made on
+  purpose for `HETZNER_IMAGE=arena`, cents a month — never against the check), with their size and
+  monthly cost and a note to `image prune --keep 0` at the end; any other snapshot in the project
+  (made by hand, another cohort's) is a note with its cost, never touched.
 
 A source that couldn't be read (a provider's 429, a remote proxy, an unreadable `at` job, a proxy
 `server` block arena can't parse) is `?` — **never "empty"** — and, like anything remaining, makes
@@ -2021,6 +2120,11 @@ on stdin** (`printf %s "$TOK" | arena config set HF_TOKEN`, script-friendly, kee
 `argv`/`ps`), or with no args prompt interactively (the picker shows which keys are already set);
 `config which` shows the active config file (path, readable/**writable**), what parsed, and any keys
 coming from the environment.
+
+`config check` makes no request but one: with `HETZNER_IMAGE=arena` it looks up which snapshot that
+resolves to for `HETZNER_SERVER_TYPE` (read-only, bounded at 30 s), with a ⚠ when it's over 14 days
+old or the repo's requirements changed since it was built ([Hetzner: pre-built
+images](#hetzner-pre-built-images)). Advice only: it never fails the check.
 
 #### `ASK_AI`
 

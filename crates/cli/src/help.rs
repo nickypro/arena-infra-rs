@@ -32,7 +32,7 @@ pub(crate) const TOP: Groups = &[
     ("Access", &["proxy", "ssh-config", "keys"]),
     ("Money", &["offers", "balance", "teardown"]),
     ("Automation", &["cron", "plan", "archive"]),
-    ("Setup", &["config", "update", "api"]),
+    ("Setup", &["config", "image", "update", "api"]),
 ];
 
 /// `arena pods --help`, by what a command does to pods.

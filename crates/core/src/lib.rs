@@ -22,6 +22,7 @@ pub mod gpu;
 pub mod health;
 pub(crate) mod http;
 pub mod idle;
+pub mod image;
 pub mod jobs;
 pub mod lock;
 pub mod metrics;
