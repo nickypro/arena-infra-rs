@@ -1202,10 +1202,13 @@ the proxy box gets in even where the cohort key was revoked; elsewhere it isn't 
 - **`ssh-config --admin --install [PATH]`** keeps staff's own file (default
   `SSH_ADMIN_CONFIG_FILE`, else `~/.ssh/arena-admin.conf`) and its `Include` first in
   `~/.ssh/config`, exactly as `--install` does for the participants' file (same checks, asks, keeps
-  copies). Refused unless this user can read the admin key; never the participants' file (its
-  path, or a file under their first line). Its first line is its own (`# managed by arena (`arena
-  ssh-config --admin`) — …`), so neither sync ever rewrites the other's file. `--admin
-  --uninstall` takes its `Include` out.
+  copies). Refused unless this user can read the admin key, and for a key path an ssh config
+  can't take as one plain argument (whitespace, quotes, `#$%\`); never the participants' file (its
+  path, or a file under their first line), nor beside it in one `~/.ssh/config` (either way round:
+  both name the same hosts, and ssh takes each host's address from whichever `Include` comes first —
+  use the other with `--out FILE` and `ssh -F FILE`). Its first line is its own (`# managed by
+  arena (`arena ssh-config --admin`) — …`), so neither sync ever rewrites the other's file.
+  `--admin --uninstall` takes its `Include` out.
 - **With `SSH_ADMIN_CONFIG_FILE` set**, it's kept current like the participants' file: after every
   pod change, on `pods list`, `up` and each dashboard refresh, from a complete listing only — and
   only for a user who can read the admin key (anyone else has no use for it; nothing is said). The

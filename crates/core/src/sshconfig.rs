@@ -129,10 +129,15 @@ pub fn render_admin(user: &str, identity: &str, naming: &Naming, pods: &[Pod]) -
 
 /// [`render_admin`] from config: `SSH_USER`, and the admin key as this user reaches it
 /// ([`crate::ssh::admin_key`]) — the file is for use on this box. `Err` when `ADMIN_SSH_KEY_PATH`
-/// isn't set: there's no key for the file to name.
+/// isn't set (there's no key for the file to name), or when its path isn't one plain `IdentityFile`
+/// argument ([`config_path_problem`]): ssh would read some other file, or fail to parse the file
+/// and with it every host `~/.ssh/config` includes it for.
 pub fn render_admin_for(cfg: &Config, pods: &[Pod]) -> Result<String, String> {
-    let identity = crate::ssh::admin_key(cfg)
-        .ok_or_else(|| format!("{} isn't set — staff's config names the admin key", crate::ssh::ADMIN_KEY_VAR))?;
+    let var = crate::ssh::ADMIN_KEY_VAR;
+    let identity = crate::ssh::admin_key(cfg).ok_or_else(|| format!("{var} isn't set — staff's config names the admin key"))?;
+    if let Some(why) = config_path_problem(&identity) {
+        return Err(format!("{var}: {why} — move the key to a path without it"));
+    }
     Ok(render_admin(cfg.get("SSH_USER").unwrap_or("root"), &identity, &Naming::from_config(cfg), pods))
 }
 
@@ -551,6 +556,41 @@ pub fn include_path_problem(path: &str) -> Option<String> {
     })
 }
 
+/// Why `path` can't be one plain argument in an ssh config (`IdentityFile`), if it can't:
+/// whitespace splits it (a line with extra arguments fails the whole file), quotes, `#` and
+/// backslashes are read, and `${…}` / `%` tokens expanded. Pure.
+pub fn config_path_problem(path: &str) -> Option<String> {
+    let bad = |c: char| c.is_whitespace() || c.is_control() || "\"'\\#$%".contains(c);
+    path.chars().find(|c| bad(*c)).map(|c| format!("{path} has {c:?} in it, which an ssh config can't take as one plain path"))
+}
+
+/// The files a `~/.ssh/config` text pulls in by plain `Include` lines — anywhere in it, each
+/// argument with a leading `~/` taken as `home`; relative and glob arguments are skipped (no file
+/// arena writes is one). For telling whether the other audience's file is in use. Pure.
+pub fn included_files(config: &str, home: Option<&str>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for line in config.lines() {
+        let l = line.trim();
+        let Some(kw) = l.get(..7).filter(|k| k.eq_ignore_ascii_case("include")) else { continue };
+        let rest = &l[kw.len()..];
+        if !rest.starts_with(|c: char| c.is_whitespace() || c == '=') {
+            continue;
+        }
+        let rest = rest.trim_start().strip_prefix('=').unwrap_or(rest).trim();
+        for arg in rest.split_whitespace().take_while(|a| !a.starts_with('#')) {
+            if arg.contains(['*', '?', '[', '"', '\'']) {
+                continue;
+            }
+            if let Ok(p) = expand_home(arg, home).map(|p| p.to_path_buf()) {
+                if p.is_absolute() && !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Whether `meta`'s owner is this process's effective user — what `ssh-config --install` asks of
 /// `~/.ssh` and every file it edits there: run as someone else (sudo keeping `HOME`), it would
 /// leave them owned by that user, and the files it writes unreadable to their owner's ssh.
@@ -842,6 +882,42 @@ mod tests {
         let text = render_admin_for(&cfg, &pods).unwrap();
         assert!(text.contains("    User ubuntu\n    IdentityFile /nonexistent-arena/arena_admin_key\n"), "{text}");
         assert_eq!(text.matches("\nHost ").count(), 4, "{text}");
+    }
+
+    /// An admin key path ssh would split or expand is refused, never written into the file: one
+    /// `IdentityFile` with extra arguments fails the whole config for every host it's included for.
+    #[test]
+    fn an_admin_key_path_an_ssh_config_cannot_take_is_refused() {
+        for (path, bad) in [
+            ("/root/.ssh/arena admin key", Some(' ')),
+            ("/root/.ssh/arena%u", Some('%')),
+            ("/root/.ssh/a#b", Some('#')),
+            ("/root/.ssh/${HOME}", Some('$')),
+            ("/root/.ssh/arena_admin_key", None),
+            ("/home/dev/sandbox/ssh/devtest_admin_key", None),
+        ] {
+            assert_eq!(config_path_problem(path).is_some(), bad.is_some(), "{path}");
+            let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nADMIN_SSH_KEY_PATH=\"{path}\"\n"));
+            match (render_admin_for(&cfg, &[]), bad) {
+                (Err(e), Some(c)) => assert!(e.starts_with("ADMIN_SSH_KEY_PATH: ") && e.contains(&format!("{c:?}")), "{e}"),
+                (Ok(t), None) => assert!(t.starts_with("# Every machine")),
+                (r, _) => panic!("{path}: {r:?}"),
+            }
+        }
+    }
+
+    /// The files a `~/.ssh/config` includes: plain paths in any Include line (`~/` expanded, `=`
+    /// or spaces, several on a line, inside a block too), never a glob, a relative path or a comment.
+    #[test]
+    fn included_files_are_the_plain_paths_of_every_include_line() {
+        let config = "Include ~/.ssh/arena.conf\ninclude=/etc/ssh/a.conf  ~/.ssh/b.conf # ~/.ssh/c.conf\n\
+                      Host box\n    Include ~/.ssh/arena-admin.conf\nInclude ~/.ssh/conf.d/*.conf rel.conf\nIncluded ~/.ssh/x\n\
+                      IdentityFile ~/.ssh/arena.conf\n";
+        let got = included_files(config, Some("/root"));
+        let want: Vec<PathBuf> =
+            ["/root/.ssh/arena.conf", "/etc/ssh/a.conf", "/root/.ssh/b.conf", "/root/.ssh/arena-admin.conf"].iter().map(PathBuf::from).collect();
+        assert_eq!(got, want);
+        assert_eq!(included_files("Include ~/.ssh/arena.conf\n", None), Vec::<PathBuf>::new(), "no home: no ~/ path");
     }
 
     /// Each audience's file has its own first line: a sync writes its own (or an empty) file and

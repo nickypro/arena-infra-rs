@@ -242,7 +242,8 @@ fn home(tag: &str) -> PathBuf {
 /// staff's file (`~/.ssh/arena-admin.conf`, its own first line, every machine at its endpoint with
 /// the admin key) and its `Include` first in `~/.ssh/config`, the `config set` hint for
 /// SSH_ADMIN_CONFIG_FILE; never the participants' file (by their key's path, or by its first
-/// line); `--uninstall` takes its Include out. `config check` then shows the file's row.
+/// line), and never beside it in one ~/.ssh/config (either way round); `--uninstall` takes its
+/// Include out. `config check` then shows the file's row.
 #[cfg(unix)]
 #[tokio::test]
 async fn ssh_config_admin_install_writes_staff_s_own_file() {
@@ -295,10 +296,16 @@ async fn ssh_config_admin_install_writes_staff_s_own_file() {
         "is arena's other file (`arena ssh-config --admin --install`)",
     );
     assert_eq!(std::fs::read_to_string(h.join(".ssh/arena-admin.conf")).unwrap(), want);
+    // Never both included by one ~/.ssh/config: the same Host names, and ssh takes each host's
+    // address from whichever Include comes first.
+    refused(handle_ssh_config_install(&fleet, &cfg, Audience::Participants, None, true, false, Some(hs)).await, "already includes");
 
     handle_ssh_config_uninstall(&cfg, Audience::Admin, None, true, false, Some(hs)).unwrap();
     assert_eq!(std::fs::read_to_string(h.join(".ssh/config")).unwrap(), "");
     assert!(h.join(".ssh/arena-admin.conf").exists(), "the file stays");
+    handle_ssh_config_install(&fleet, &cfg, Audience::Participants, None, true, false, Some(hs)).await.unwrap();
+    assert_eq!(std::fs::read_to_string(h.join(".ssh/config")).unwrap(), "Include ~/.ssh/arena.conf\n");
+    refused(handle_ssh_config_install(&fleet, &cfg, Audience::Admin, None, true, false, Some(hs)).await, "already includes");
     let _ = std::fs::remove_dir_all(&h);
 }
 

@@ -16661,6 +16661,23 @@ async fn handle_ssh_config_install(
     }
     let plan = audience.plan(existing.as_deref(), &want);
     let config = read_opt(&config_path)?;
+    // Both files name the same hosts: ssh takes each one's address, port and user from whichever
+    // Include comes first, and offers both files' keys — the participants' proxy ports would shadow
+    // staff's live endpoints, or the other way round. One of the two per ~/.ssh/config.
+    for p in sshconfig::included_files(config.as_deref().unwrap_or(""), home.to_str()) {
+        if same_file(&p, &target) || !read_opt(&p).ok().flatten().is_some_and(|t| !t.trim().is_empty() && other.owns(&t)) {
+            continue;
+        }
+        anyhow::bail!(
+            "not installed: ~/.ssh/config already includes {} — arena's other file (`{} --install`), with the same Host names, and \
+             ssh would take each host's address from whichever Include comes first. One of the two per box: `{} --uninstall` \
+             first, or use this one without an Include: `{} --out FILE`, then `ssh -F FILE <name>`",
+            p.display(),
+            other.command(),
+            other.command(),
+            audience.command()
+        );
+    }
     let at = sshconfig::include_at(config.as_deref().unwrap_or(""), &[&shown, &abs]);
     let stamp = arena_core::restore::stamp(arena_core::snapshot::unix_now());
     let hosts = want.lines().filter(|l| l.starts_with("Host ") && !l.ends_with('*')).count();
