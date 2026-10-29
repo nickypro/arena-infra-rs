@@ -41,14 +41,41 @@ pub const PRESETS: &[Gpu] = &[
     Gpu { api: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", label: "RTX PRO 6000 WK", vram_gb: 96, community: 1.69, secure: 2.19 },
 ];
 
+/// GPU types RunPod rents that its public catalog doesn't list, with their VRAM (GB): absent
+/// from the v2 catalog, GraphQL `gpuTypes` and the website, for ARENA's account and the
+/// sandbox's alike (checked 2026-10-29), yet ARENA had a pod of one — so no catalog can teach
+/// arena them. Known here so `--gpu` takes them ([`check_gpu_flag_with`], with a warning) and
+/// `offers runpod` lists them, marked unlisted and unpriced (the pod rented at $0.50/h, but
+/// that's no quote). Whether RunPod creates one is its create's answer. More come from the
+/// account's own pods and config `RUNPOD_EXTRA_GPU_TYPES`.
+pub const UNLISTED: &[(&str, u32)] = &[("NVIDIA B300 SXM6 AC MIG 1g.34gb", 34)];
+
+/// The VRAM of an [`UNLISTED`] type.
+pub fn unlisted_vram(api: &str) -> Option<u32> {
+    UNLISTED.iter().find(|(id, _)| *id == api).map(|(_, gb)| *gb)
+}
+
 /// The known GPU matching a provider type string, if any.
 pub fn find(api: &str) -> Option<&'static Gpu> {
     PRESETS.iter().find(|g| g.api == api)
 }
 
-/// All preset type strings, in preference order — for seeding the picker.
+/// The newest and the sliced cards, for the dashboard's picker beside the presets: no preset
+/// price (they're priced live, or not at all), but a type the picker can't offer can't be
+/// chosen there (the human, 2026-10-29: "should have B300 MIG and stuff in these lists… also in
+/// arena tui"). Secure-only on RunPod, most of them.
+const PICKER_EXTRAS: &[&str] = &[
+    "NVIDIA B200",
+    "NVIDIA B300 SXM6 AC",
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb",
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb",
+    "NVIDIA B300 SXM6 AC MIG 1g.34gb",
+];
+
+/// All preset type strings, in preference order, then [`PICKER_EXTRAS`] — for seeding the
+/// picker.
 pub fn preset_apis() -> Vec<String> {
-    PRESETS.iter().map(|g| g.api.to_string()).collect()
+    PRESETS.iter().map(|g| g.api).chain(PICKER_EXTRAS.iter().copied()).map(String::from).collect()
 }
 
 /// Map a friendly short-name (`A4000`, `3090`, `a100 sxm`, …) to the provider's full
@@ -104,6 +131,8 @@ pub fn resolve(s: &str) -> String {
             "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
         }
         "rtxpro6000maxq" | "pro6000maxq" => "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+        // [`UNLISTED`]: a B300's 1g.34gb MIG slice (the human's own short names, 2026-10-29).
+        "b300mig" | "b300mig34" | "b300mig34gb" | "b300mig1g34gb" | "b300sxm6acmig1g34gb" => "NVIDIA B300 SXM6 AC MIG 1g.34gb",
         _ => return s.to_string(),
     };
     api.to_string()
@@ -202,11 +231,40 @@ fn describe_gpu(g: &GpuType) -> String {
 /// suggestions, and so is a token that names several GPUs. A value with no tokens at all
 /// is returned unchanged for the flag parser to refuse.
 pub fn check_gpu_flag(raw: &str, catalog: &[GpuType]) -> Result<String> {
+    check_gpu_flag_with(raw, catalog, &[]).map(|c| c.ids)
+}
+
+/// A `--gpu` value as [`check_gpu_flag_with`] resolved it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckedGpu {
+    /// Every token as an exact id, comma-joined.
+    pub ids: String,
+    /// The ids among them the catalog doesn't list ([`UNLISTED`], `seen`): to warn about.
+    pub unlisted: Vec<String>,
+}
+
+/// [`check_gpu_flag`], also taking GPU types the public catalog lacks but arena has seen:
+/// [`UNLISTED`] and `seen` (the ids on the account's own pods, config
+/// `RUNPOD_EXTRA_GPU_TYPES`). A token naming one of those exactly — its id, any case, or a
+/// short name [`resolve`] maps to it (`B300 MIG`) — is accepted, and listed in
+/// [`CheckedGpu::unlisted`] for the caller to warn about: RunPod's create decides. Nothing
+/// else is loosened: a typo is still refused, the seen types among its suggestions. Pure.
+pub fn check_gpu_flag_with(raw: &str, catalog: &[GpuType], seen: &[String]) -> Result<CheckedGpu> {
     let tokens = crate::placement::split_list(raw);
     if tokens.is_empty() {
-        return Ok(raw.to_string());
+        return Ok(CheckedGpu { ids: raw.to_string(), unlisted: Vec::new() });
     }
+    // The seen types the catalog lacks, as rows for suggestions.
+    let mut extra: Vec<GpuType> = Vec::new();
+    for id in UNLISTED.iter().map(|(id, _)| id.to_string()).chain(seen.iter().map(|s| s.trim().to_string())) {
+        let known = real_gpus(catalog).any(|g| g.id.eq_ignore_ascii_case(&id)) || extra.iter().any(|g| g.id.eq_ignore_ascii_case(&id));
+        if !id.is_empty() && id != "unknown" && !known {
+            extra.push(GpuType { id, ..Default::default() });
+        }
+    }
+    let pool: Vec<GpuType> = catalog.iter().cloned().chain(extra.iter().cloned()).collect();
     let mut ids = Vec::new();
+    let mut unlisted = Vec::new();
     let mut problems = Vec::new();
     for token in &tokens {
         // The catalog's own names first: an exact id, then an exact display name — unique.
@@ -229,6 +287,15 @@ pub fn check_gpu_flag(raw: &str, catalog: &[GpuType]) -> Result<String> {
             ids.push(g.id.clone());
             continue;
         }
+        // Not in the catalog: a type arena has seen, named exactly (or by its alias).
+        let seen_one = extra.iter().find(|g| g.id.eq_ignore_ascii_case(token.trim()) || g.id.eq_ignore_ascii_case(resolved.trim()));
+        if let Some(g) = seen_one {
+            ids.push(g.id.clone());
+            if !unlisted.contains(&g.id) {
+                unlisted.push(g.id.clone());
+            }
+            continue;
+        }
         let key = core_key(token);
         let mut exact: Vec<&GpuType> = real_gpus(catalog)
             .filter(|g| !key.is_empty() && (core_key(&g.display_name) == key || core_key(&g.id) == key))
@@ -237,7 +304,7 @@ pub fn check_gpu_flag(raw: &str, catalog: &[GpuType]) -> Result<String> {
         match exact.as_slice() {
             [one] => ids.push(one.id.clone()),
             [] => {
-                let hints: Vec<String> = suggest(token, catalog).into_iter().map(describe_gpu).collect();
+                let hints: Vec<String> = suggest(token, &pool).into_iter().map(describe_gpu).collect();
                 let hint = if hints.is_empty() { String::new() } else { format!(" — did you mean {}?", hints.join(", ")) };
                 problems.push(format!("`{token}` isn't a RunPod GPU type{hint}"));
             }
@@ -249,11 +316,11 @@ pub fn check_gpu_flag(raw: &str, catalog: &[GpuType]) -> Result<String> {
     }
     if !problems.is_empty() {
         return Err(Error::Config(format!(
-            "--gpu: {} (`arena offers --all` lists the types and their --gpu names)",
+            "--gpu: {} (`arena offers runpod` lists the types and their --gpu names)",
             problems.join("; ")
         )));
     }
-    Ok(ids.join(","))
+    Ok(CheckedGpu { ids: ids.join(","), unlisted })
 }
 
 /// A picker label including VRAM (`RTX A4000 · 16GB`); falls back to the normalized
@@ -261,7 +328,8 @@ pub fn check_gpu_flag(raw: &str, catalog: &[GpuType]) -> Result<String> {
 pub fn label(api: &str) -> String {
     match find(api) {
         Some(g) => format!("{} · {}GB", g.label, g.vram_gb),
-        None => normalize_gpu_name(api),
+        // A MIG slice by RunPod's own short name (`B300 MIG 34GB`), not its long id.
+        None => crate::placement::mig_label(api).unwrap_or_else(|| normalize_gpu_name(api)),
     }
 }
 
@@ -575,7 +643,7 @@ H100        80G          -     $2.69  High   NVIDIA H100 80GB HBM3
             ("A400", "`NVIDIA RTX A4000` (RTX A4000)"),
             ("NVIDIA RTX A4000x", "`NVIDIA RTX A4000`"),
             ("unknown", "isn't a RunPod GPU type"),         // the placeholder isn't a GPU
-            ("zzzzzzzz", "`zzzzzzzz` isn't a RunPod GPU type (`arena offers --all`"), // nothing close: no hint
+            ("zzzzzzzz", "`zzzzzzzz` isn't a RunPod GPU type (`arena offers runpod`"), // nothing close: no hint
             ("4000 ada", ""),                               // alias → exact id: fine (checked below)
         ] {
             if want.is_empty() {
@@ -584,12 +652,44 @@ H100        80G          -     $2.69  High   NVIDIA H100 80GB HBM3
             }
             let e = err(flag);
             assert!(e.contains(want), "{flag}: {e}");
-            assert!(e.contains("arena offers --all"), "{flag}: {e}");
+            assert!(e.contains("arena offers runpod"), "{flag}: {e}");
         }
         // Every bad token in a list is named, in one error; the good ones aren't.
         let e = err("A4000,3070x,foo99");
         assert!(e.contains("`3070x`") && e.contains("`foo99`") && !e.contains("`A4000`"), "{e}");
         assert!(matches!(check_gpu_flag("3070x", &c), Err(Error::Config(_))));
+    }
+
+    /// GPU types the catalog lacks: the [`UNLISTED`] B300 MIG slice by its id (any case) or a
+    /// short name, and a type seen on the account's pods by its exact id — accepted, and said
+    /// (`unlisted`); a near miss still refused, the seen types among the suggestions; a type
+    /// the catalog does list is never "unlisted".
+    #[test]
+    fn check_gpu_flag_takes_types_arena_has_seen_and_says_so() {
+        let c = catalog();
+        const MIG: &str = "NVIDIA B300 SXM6 AC MIG 1g.34gb";
+        let seen = vec!["NVIDIA H300 Secret".to_string(), "NVIDIA RTX A4000".to_string()];
+        // (flag, ids, unlisted)
+        let cases: [(&str, &str, &[&str]); 7] = [
+            (MIG, MIG, &[MIG]),
+            ("nvidia b300 sxm6 ac mig 1g.34gb", MIG, &[MIG]),
+            ("B300 MIG", MIG, &[MIG]),
+            ("B300-MIG-34", MIG, &[MIG]),
+            ("NVIDIA H300 Secret", "NVIDIA H300 Secret", &["NVIDIA H300 Secret"]),
+            ("A4000,B300 MIG,b300mig34gb", "NVIDIA RTX A4000,NVIDIA B300 SXM6 AC MIG 1g.34gb,NVIDIA B300 SXM6 AC MIG 1g.34gb", &[MIG]),
+            ("NVIDIA RTX A4000", "NVIDIA RTX A4000", &[]),
+        ];
+        for (flag, ids, unlisted) in cases {
+            let got = check_gpu_flag_with(flag, &c, &seen).unwrap_or_else(|e| panic!("{flag}: {e}"));
+            assert_eq!((got.ids.as_str(), got.unlisted.iter().map(String::as_str).collect::<Vec<_>>()), (ids, unlisted.to_vec()), "{flag}");
+        }
+        // Only an exact name counts: a type seen on a pod isn't matched loosely.
+        let e = check_gpu_flag_with("H300 Secrt", &c, &seen).unwrap_err().to_string();
+        assert!(e.contains("did you mean `NVIDIA H300 Secret`"), "{e}");
+        assert!(check_gpu_flag_with("NVIDIA H300 Secret", &c, &[]).is_err(), "not seen: refused");
+        assert!(check_gpu_flag_with("B300 MIG 1g.35gb", &c, &[]).is_err(), "a near miss is a typo");
+        assert_eq!(resolve("b300 mig"), MIG);
+        assert_eq!(unlisted_vram(MIG), Some(34));
     }
 
     /// Finding #36: `--gpu 'RTX PRO 6000'` — the name `arena gpus` prints for the Server
@@ -702,6 +802,11 @@ H100        80G          -     $2.69  High   NVIDIA H100 80GB HBM3
     fn labels_and_prices() {
         assert_eq!(label("NVIDIA RTX A4000"), "RTX A4000 · 16GB");
         assert_eq!(label("NVIDIA Whatever"), "Whatever"); // normalized fallback
+        // The picker offers the new and sliced cards too, a slice by its short name.
+        let picker = preset_apis();
+        assert!(picker.starts_with(&[PRESETS[0].api.to_string()]) && picker.contains(&"NVIDIA B300 SXM6 AC MIG 1g.34gb".to_string()));
+        assert_eq!(label("NVIDIA B300 SXM6 AC MIG 1g.34gb"), "B300 MIG 34GB");
+        assert_eq!(label("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb"), "PRO 6000 MIG 24GB");
         assert_eq!(price_label("NVIDIA RTX A4000", "runpod", Some("SECURE")).as_deref(), Some("~$0.32/hr"));
         assert_eq!(price_label("NVIDIA RTX A4000", "runpod", None).as_deref(), Some("~$0.17/hr"));
         assert!(price_label("NVIDIA RTX A4000", "vast", None).unwrap().contains("varies"));

@@ -280,7 +280,7 @@ enum Cmd {
     /// Needs OPENROUTER_PROVISIONING_KEY in the config.
     #[command(subcommand, infer_subcommands = true)]
     Keys(KeysCmd),
-    /// RunPod's GPU types: the old name for `offers --all` (RunPod only)
+    /// RunPod's GPU types as before (`offers runpod`: per tier)
     ///
     /// Live from RunPod where available, else the local presets. Hidden: `offers` covers it.
     #[command(hide = true)]
@@ -289,20 +289,27 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// What create/up would try on each provider, with prices
+    /// What create/up would try, with prices; or everything a provider sells
     ///
-    /// Read-only. One table over the providers with a key (RunPod, Vast, Hetzner; Shadeform
-    /// only with --provider shadeform): each option create/up would try there, # = the order
-    /// they'd try it in. SIZE is VRAM, or vCPU/RAM for Hetzner's CPU VMs; PER POD is $/h (`~` =
-    /// preset estimate; Hetzner in €, as it bills), then the price source and stock hint.
-    /// --gpu, --cloud, --max-price and --server-type filter as create does; a flag that doesn't
-    /// apply to a provider skips it. --all: every type each provider sells (`gpus` = RunPod's).
+    /// Read-only. `arena offers`: each configured provider's options create/up would try
+    /// (Shadeform only with --provider), # = their order. PER POD is $/h (~ = estimate;
+    /// Hetzner in €); STOCK is a hint. -v adds the notes. --gpu, --cloud, --max-price and
+    /// --server-type preview another setup.
+    ///
+    /// `arena offers runpod|vast|hetzner|shadeform|all`: everything on sale. RunPod: every
+    /// type per tier, MIG slices and `unlisted` types (seen on pods, RUNPOD_EXTRA_GPU_TYPES)
+    /// included. Vast: the cheapest offer per card and host class (datacenter, verified,
+    /// unverified). Hetzner: server types by family. # = what up would try; flags filter.
     #[command(verbatim_doc_comment)]
     Offers {
+        /// runpod, vast, hetzner, shadeform or all: everything on sale there (default: what up
+        /// would try)
+        #[arg(value_name = "PROVIDER", value_parser = clap::builder::PossibleValuesParser::new(offers::VIEWS))]
+        view: Option<String>,
         /// GPU type(s), comma-separated, e.g. `A4000,3090` (default: config GPU_TYPE)
         #[arg(long)]
         gpu: Option<String>,
-        /// Cloud tier(s), e.g. `community,secure`; RunPod only (default: config CLOUD_TYPE)
+        /// Tiers: RunPod community,secure; Vast datacenter,verified,unverified (default: CLOUD_TYPE)
         #[arg(long)]
         cloud: Option<String>,
         /// Max $/h per pod: options above it, or with no known price, are dropped.
@@ -317,10 +324,13 @@ enum Cmd {
         /// `cheapest` or `listed`
         #[arg(long, default_value = "cheapest")]
         order: arena_core::placement::Order,
-        /// Every GPU/server type each provider sells, not just what create would try
-        #[arg(long, conflicts_with_all = ["gpu", "cloud", "max_price", "gpus", "server_type", "order"])]
+        /// `offers all`'s old spelling
+        #[arg(long, hide = true, conflicts_with = "view")]
         all: bool,
-        /// JSON instead of a table (with --all: each provider's catalog)
+        /// The notes under the table too
+        #[arg(long, short = 'v')]
+        verbose: bool,
+        /// JSON instead of a table
         #[arg(long)]
         json: bool,
     },
@@ -2546,7 +2556,7 @@ async fn v2_catalog(cfg: &Config, key: &str, cloud: &str) -> std::result::Result
 }
 
 /// The tier whose v2 catalog answers questions that aren't about a tier (the `--gpu`
-/// check, `arena offers --all`): the configured `CLOUD_TYPE`, or COMMUNITY. Every tier's catalog
+/// check, `arena offers runpod`): the configured `CLOUD_TYPE`, or COMMUNITY. Every tier's catalog
 /// lists every GPU, so this only picks which tier's stock a reader sees — and with the
 /// configured tier, a plain `create` reuses the check's fetch for its prices.
 fn v2_default_cloud(cfg: &Config) -> &'static str {
@@ -2578,18 +2588,29 @@ async fn live_gpu_catalog(cfg: &Config) -> std::result::Result<Vec<arena_core::p
 /// What to do with a `--gpu` value given the catalog fetch's outcome. Pure (the policy is
 /// table-tested): with a catalog, every token must be a RunPod GPU — the value comes back
 /// as exact ids, or the error names the bad tokens with "did you mean"
-/// ([`arena_core::gpu::check_gpu_flag`]); without one, the value passes through unchanged
-/// with a warning to print — being unable to *check* must not block a create.
+/// ([`arena_core::gpu::check_gpu_flag_with`]) — or a type the catalog lacks that arena has
+/// seen (`seen`: the account's pods, `RUNPOD_EXTRA_GPU_TYPES`; and arena's own list), with a
+/// warning each; without a catalog, the value passes through unchanged with a warning —
+/// being unable to *check* must not block a create.
 fn gpu_flag_or_warning(
     raw: String,
     catalog: std::result::Result<Vec<arena_core::provider::runpod::GpuType>, String>,
-) -> Result<(String, Option<String>)> {
+    seen: &[String],
+) -> Result<(String, Vec<String>)> {
     match catalog {
-        Ok(types) => Ok((arena_core::gpu::check_gpu_flag(&raw, &types)?, None)),
+        Ok(types) => {
+            let checked = arena_core::gpu::check_gpu_flag_with(&raw, &types, seen)?;
+            let warnings = checked
+                .unlisted
+                .iter()
+                .map(|id| format!("warning: --gpu `{id}` isn't in RunPod's public catalog — trying it; RunPod's create decides"))
+                .collect();
+            Ok((checked.ids, warnings))
+        }
         Err(why) => {
             let warning =
                 format!("warning: couldn't check --gpu `{raw}` against RunPod's live GPU catalog ({why}) — using it unchecked");
-            Ok((raw, Some(warning)))
+            Ok((raw, vec![warning]))
         }
     }
 }
@@ -2615,8 +2636,20 @@ async fn checked_gpu(cfg: &Config, provider_name: &str, gpu: Option<String>) -> 
     }
     let catalog = live_gpu_catalog(cfg).await;
     let types = catalog.as_ref().ok().cloned();
-    let (gpu, warning) = gpu_flag_or_warning(raw, catalog)?;
-    if let Some(w) = warning {
+    // A type the catalog lacks may be one arena has seen: the config's list first, then — only
+    // when that isn't enough, so a plain `--gpu A4000` costs no extra request — the account's pods.
+    let extra = offers::extra_gpu_types(cfg);
+    let (gpu, warnings) = match gpu_flag_or_warning(raw.clone(), catalog.clone(), &extra) {
+        Ok(ok) => ok,
+        Err(e) => {
+            let pods = pod_gpu_types(cfg).await;
+            if pods.is_empty() {
+                return Err(e);
+            }
+            gpu_flag_or_warning(raw, catalog, &[extra, pods].concat())?
+        }
+    };
+    for w in warnings {
         eprintln!("{w}");
     }
     // REST v1 only: its create validates against an OpenAPI enum that lags the catalog.
@@ -2627,6 +2660,20 @@ async fn checked_gpu(cfg: &Config, provider_name: &str, gpu: Option<String>) -> 
         }
     }
     Ok(Some(gpu))
+}
+
+/// The GPU types on the account's RunPod pods (v2 with a key; read-only, bounded by
+/// [`PRICE_TIMEOUT`]); none when they can't be read.
+async fn pod_gpu_types(cfg: &Config) -> Vec<String> {
+    use arena_core::provider::{runpod_v2, RunpodApi};
+    let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|k| !k.trim().is_empty()) else { return Vec::new() };
+    if !matches!(RunpodApi::from_config(cfg), Ok(RunpodApi::V2)) {
+        return Vec::new();
+    }
+    match tokio::time::timeout(PRICE_TIMEOUT, runpod_v2::fetch_pod_gpu_types(key)).await {
+        Ok(Ok(types)) => types.into_iter().map(|(id, _)| id).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// RunPod REST v1 validates a create's `gpuTypeIds` against its OpenAPI enum, which lags the
@@ -2652,7 +2699,7 @@ fn v1_creatable_check(ids: &str, catalog: &[arena_core::provider::runpod::GpuTyp
     }
     anyhow::bail!(
         "--gpu {}: in RunPod's catalog, but REST v1's create API rejects it (not in its gpuTypeIds list) — \
-         v2's create takes it: {}, or pick another --gpu (`arena offers --all` hides what v1 can't create)",
+         v2's create takes it: {}, or pick another --gpu (`arena offers runpod` marks what v1 can't create)",
         bad.join(", "),
         arena_core::provider::RUNPOD_V1_REMEDY
     )
@@ -2680,24 +2727,34 @@ async fn fetch_price_book(
             let note = "no VAST_API_KEY — vast options are unpriced (--max-price can't check them)";
             return Ok((PriceBook::unpriced(), vec![note.into()]));
         }
-        let spec = PodSpec { gpu_count: req.gpu_count, ..base.clone() };
         // Built as create builds it (`provider::build`), so the plan quotes only hosts create
-        // would rent (verified-only unless VAST_ALLOW_UNVERIFIED).
+        // would rent: per tier (`--cloud datacenter,verified`, already Vast's tiers here —
+        // `plan_placement`), the default verified-only unless VAST_ALLOW_UNVERIFIED.
         let vast = vast::VastProvider::from_config(cfg)?;
-        // Near the proxy: the same search in the region's countries too, at the same time, for
-        // the near options' prices.
-        let near_spec = req.near.map(|n| PodSpec { region: Some(n.region), ..spec.clone() });
-        let near_quotes = async {
-            match &near_spec {
-                Some(s) => Some(vast.quote(&req.gpus, s, PRICE_TIMEOUT).await),
-                None => None,
+        let mut book = PriceBook::unpriced();
+        let mut notes = Vec::new();
+        for cloud in clouds {
+            let spec = PodSpec { gpu_count: req.gpu_count, cloud_type: cloud.clone(), ..base.clone() };
+            let tier = vast.tier_for(&spec)?;
+            // Near the proxy: the same search in the region's countries too, at the same time,
+            // for the near options' prices.
+            let near_spec = req.near.map(|n| PodSpec { region: Some(n.region), ..spec.clone() });
+            let near_quotes = async {
+                match &near_spec {
+                    Some(s) => Some(vast.quote(&req.gpus, s, PRICE_TIMEOUT).await),
+                    None => None,
+                }
+            };
+            let (quotes, near_quotes) = tokio::join!(vast.quote(&req.gpus, &spec, PRICE_TIMEOUT), near_quotes);
+            let (mut tiered, more) = vast::price_book(&quotes, req.gpu_count, tier);
+            notes.extend(more);
+            if let (Some(near), Some(near_quotes)) = (req.near, near_quotes) {
+                let (with_near, more) = vast::with_near_prices(tiered, &near_quotes, req.gpu_count, near.region, tier);
+                tiered = with_near;
+                notes.extend(more);
             }
-        };
-        let (quotes, near_quotes) = tokio::join!(vast.quote(&req.gpus, &spec, PRICE_TIMEOUT), near_quotes);
-        let (book, mut notes) = vast::price_book(&quotes, req.gpu_count, vast.verified_only());
-        let (Some(near), Some(near_quotes)) = (req.near, near_quotes) else { return Ok((book, notes)) };
-        let (book, more) = vast::with_near_prices(book, &near_quotes, req.gpu_count, near.region);
-        notes.extend(more);
+            book = book.merge(tiered);
+        }
         return Ok((book, notes));
     }
     if provider_name == "shadeform" {
@@ -2758,6 +2815,18 @@ async fn plan_placement(
     base: &PodSpec,
 ) -> Result<arena_core::placement::OptionPlan> {
     req.validate_for(provider_name)?;
+    // Vast: `--cloud` (or config's CLOUD_TYPE, a RunPod tier) as Vast's own tiers, so each
+    // option names the hosts its create rents on.
+    let mut tier_note = None;
+    let vast_req;
+    let req = if provider_name == "vast" {
+        let (clouds, note) = arena_core::provider::vast::plan_tiers(&req.clouds, !arena_core::provider::vast::unverified_allowed(cfg)?)?;
+        tier_note = note;
+        vast_req = arena_core::placement::Request { clouds, ..req.clone() };
+        &vast_req
+    } else {
+        req
+    };
     // Near the proxy (`NEAR`) here too, so every caller of the shared planner — `offers`
     // included — shows the order create/up would run. No caller plans a request that left
     // NEAR out on purpose: `--keep-trying` without a list takes the single path, which never
@@ -2777,7 +2846,7 @@ async fn plan_placement(
         });
     }
     let mut plan = arena_core::placement::plan_options(req, provider_name, &book);
-    plan.notes.splice(0..0, notes);
+    plan.notes.splice(0..0, notes.into_iter().chain(tier_note));
     Ok(plan)
 }
 
@@ -3115,9 +3184,10 @@ async fn run() -> Result<()> {
         }
         Cmd::Gpus { json } => offers::handle_gpus(&cfg, &cli.provider, json).await,
         Cmd::Api(c) => handle_api(c, &cfg).await,
-        Cmd::Offers { gpu, cloud, max_price, gpus, server_type, order, all, json } => {
+        Cmd::Offers { view, gpu, cloud, max_price, gpus, server_type, order, all, verbose, json } => {
             let flags = offers::Flags { gpu, cloud, max_price, gpus, server_type, order };
-            offers::handle_offers(&cfg, provider_named.then_some(cli.provider.as_str()), flags, all, json).await
+            let view = if all { Some("all") } else { view.as_deref() };
+            offers::handle_offers(&cfg, provider_named.then_some(cli.provider.as_str()), view, flags, json, verbose).await
         }
     }
 }
@@ -11564,7 +11634,7 @@ async fn plan_replacement(
     if owner.name() != "hetzner" && req.gpus.iter().any(|g| g.trim().is_empty()) {
         anyhow::bail!(
             "couldn't determine a GPU type for the replacement (the API doesn't report it and \
-             no GPU_TYPE is configured) — pass --gpu <type> (see `arena offers --all`)"
+             no GPU_TYPE is configured) — pass --gpu <type> (see `arena offers runpod`)"
         );
     }
     let plan = if req.is_single() {
@@ -16880,12 +16950,13 @@ mod replacement_spec_tests {
             ])
         };
         // (as the listing shows it, the catalog?, the create id)
-        let cases: [(&str, bool, Option<&str>); 6] = [
+        let cases: [(&str, bool, Option<&str>); 7] = [
             ("RTX 3070", true, Some("NVIDIA GeForce RTX 3070")),
             ("B300 MIG 34GB", true, Some("NVIDIA B300 MIG 34GB")),
             ("NVIDIA GeForce RTX 3070", true, Some("NVIDIA GeForce RTX 3070")),
             ("RTX 3070", false, Some("NVIDIA GeForce RTX 3070")), // a known alias, no catalog needed
-            ("B300 MIG 34GB", false, None),                       // no catalog, no alias: no guess
+            ("B300 MIG 34GB", false, Some("NVIDIA B300 SXM6 AC MIG 1g.34gb")), // the unlisted slice's alias
+            ("PRO 6000 MIG 24GB", false, None),                   // no catalog, no alias: no guess
             ("Mystery GPU", true, None),
         ];
         for (shown, with_catalog, want) in cases {
@@ -16999,16 +17070,23 @@ mod replacement_spec_tests {
             ])
         };
         // Catalog reachable: canonical ids, no warning.
-        let (gpu, warn) = gpu_flag_or_warning("3070,a4000".into(), catalog()).unwrap();
-        assert_eq!((gpu.as_str(), warn), ("NVIDIA GeForce RTX 3070,NVIDIA RTX A4000", None));
+        let (gpu, warn) = gpu_flag_or_warning("3070,a4000".into(), catalog(), &[]).unwrap();
+        assert_eq!((gpu.as_str(), warn), ("NVIDIA GeForce RTX 3070,NVIDIA RTX A4000", Vec::<String>::new()));
         // …and a typo fails loudly, with a suggestion.
-        let e = gpu_flag_or_warning("3070x".into(), catalog()).unwrap_err().to_string();
+        let e = gpu_flag_or_warning("3070x".into(), catalog(), &[]).unwrap_err().to_string();
         assert!(e.contains("`3070x` isn't a RunPod GPU type") && e.contains("did you mean `NVIDIA GeForce RTX 3070`"), "{e}");
+        // A type the catalog lacks that arena has seen (its own list, a pod, the config): taken,
+        // with a warning each.
+        let (gpu, warn) = gpu_flag_or_warning("B300 MIG,NVIDIA X9".into(), catalog(), &["NVIDIA X9".into()]).unwrap();
+        assert_eq!(gpu, "NVIDIA B300 SXM6 AC MIG 1g.34gb,NVIDIA X9");
+        assert_eq!(warn, [
+            "warning: --gpu `NVIDIA B300 SXM6 AC MIG 1g.34gb` isn't in RunPod's public catalog — trying it; RunPod's create decides",
+            "warning: --gpu `NVIDIA X9` isn't in RunPod's public catalog — trying it; RunPod's create decides",
+        ]);
         // Unreachable: passed through as typed, with one warning saying why.
-        let (gpu, warn) = gpu_flag_or_warning("3070x".into(), Err("GraphQL catalog: timed out after 30s".into())).unwrap();
+        let (gpu, warn) = gpu_flag_or_warning("3070x".into(), Err("GraphQL catalog: timed out after 30s".into()), &[]).unwrap();
         assert_eq!(gpu, "3070x");
-        let warn = warn.unwrap();
-        assert!(warn.starts_with("warning: couldn't check --gpu `3070x`") && warn.contains("timed out"), "{warn}");
+        assert!(warn.len() == 1 && warn[0].starts_with("warning: couldn't check --gpu `3070x`") && warn[0].contains("timed out"), "{warn:?}");
     }
 
     /// Non-RunPod providers keep pass-through (no catalog fetched at all), and so does a
@@ -17029,7 +17107,7 @@ mod replacement_spec_tests {
         assert_eq!(super::checked_gpu(&v2, "runpod", Some("3070".into())).await.unwrap().as_deref(), Some("3070"));
     }
 
-    /// The tier whose v2 catalog serves the `--gpu` check and `arena offers --all`: the configured
+    /// The tier whose v2 catalog serves the `--gpu` check and `arena offers runpod`: the configured
     /// one (any spelling) — so a plain create's price book reuses that fetch — else COMMUNITY.
     #[test]
     fn v2_catalog_tier_follows_the_configured_cloud() {
@@ -22921,12 +22999,19 @@ mod placement_cli_tests {
             Cmd::Offers { server_type, all, .. } => assert_eq!((server_type.as_deref(), all), (Some("cx33"), false)),
             _ => panic!("not offers"),
         }
-        // `--all` is the whole catalog: the flags that pick options don't go with it.
-        assert!(matches!(parse(&["arena", "offers", "--all", "--json"]).unwrap(), Cmd::Offers { all: true, json: true, .. }));
-        for flag in [&["--gpu", "A4000"][..], &["--cloud", "secure"], &["--max-price", "1"], &["--gpus", "2"], &["--server-type", "cx23"], &["--order", "listed"]] {
-            let args: Vec<&str> = ["arena", "offers", "--all"].iter().chain(flag).copied().collect();
-            assert!(parse(&args).is_err(), "{args:?}");
+        // A view is a provider (or `all`), and takes the filters; `--all` is `all`'s old
+        // spelling, never beside a view; `-v` the notes.
+        for view in offers::VIEWS {
+            match parse(&["arena", "offers", view, "--gpu", "A4000", "--cloud", "secure", "--max-price", "1", "-v"]).unwrap() {
+                Cmd::Offers { view: v, gpu, cloud, max_price, verbose, all, .. } => {
+                    assert_eq!((v.as_deref(), gpu.as_deref(), cloud.as_deref(), max_price, verbose, all), (Some(view), Some("A4000"), Some("secure"), Some(1.0), true, false));
+                }
+                _ => panic!("not offers"),
+            }
         }
+        assert!(matches!(parse(&["arena", "offers", "--all", "--json", "--gpu", "B300 MIG"]).unwrap(), Cmd::Offers { all: true, json: true, view: None, .. }));
+        assert!(parse(&["arena", "offers", "lambda"]).is_err());
+        assert!(parse(&["arena", "offers", "runpod", "--all"]).is_err());
         match parse(&["arena", "pods", "create", "-n", "3", "--gpu", "A4000,3090", "--cloud", "community,secure"]).unwrap() {
             Cmd::Pods(PodCmd::Create { order, max_price, .. }) => assert_eq!((order, max_price), (Order::Cheapest, None)),
             _ => panic!("not create"),
