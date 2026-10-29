@@ -1206,7 +1206,9 @@ the proxy box gets in even where the cohort key was revoked; elsewhere it isn't 
   can't take as one plain argument (whitespace, quotes, `#$%\`); never the participants' file (its
   path, or a file under their first line), nor beside it in one `~/.ssh/config` (either way round:
   both name the same hosts, and ssh takes each host's address from whichever `Include` comes first —
-  use the other with `--out FILE` and `ssh -F FILE`). Its first line is its own (`# managed by
+  use the other with `--out FILE` and `ssh -F FILE`). Includes are read as ssh reads them
+  (relative under `~/.ssh`, quoted, globs, nested); one it can't follow (a `${…}` or `%` token)
+  refuses rather than guesses. Its first line is its own (`# managed by
   arena (`arena ssh-config --admin`) — …`), so neither sync ever rewrites the other's file.
   `--admin --uninstall` takes its `Include` out.
 - **With `SSH_ADMIN_CONFIG_FILE` set**, it's kept current like the participants' file: after every

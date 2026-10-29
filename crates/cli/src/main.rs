@@ -16664,7 +16664,16 @@ async fn handle_ssh_config_install(
     // Both files name the same hosts: ssh takes each one's address, port and user from whichever
     // Include comes first, and offers both files' keys — the participants' proxy ports would shadow
     // staff's live endpoints, or the other way round. One of the two per ~/.ssh/config.
-    for p in sshconfig::included_files(config.as_deref().unwrap_or(""), home.to_str()) {
+    let included = sshconfig::included_files(config.as_deref().unwrap_or(""), home.to_str()).map_err(|arg| {
+        anyhow::anyhow!(
+            "not installed: ~/.ssh/config has an Include arena can't follow ({arg}), so it can't tell whether arena's other file \
+             (`{} --install`) is in use — with the same Host names, ssh would take each host's address from whichever comes first. \
+             Use this one without an Include: `{} --out FILE`, then `ssh -F FILE <name>`",
+            other.command(),
+            audience.command()
+        )
+    })?;
+    for p in included {
         if same_file(&p, &target) || !read_opt(&p).ok().flatten().is_some_and(|t| !t.trim().is_empty() && other.owns(&t)) {
             continue;
         }

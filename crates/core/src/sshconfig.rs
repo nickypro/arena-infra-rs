@@ -564,31 +564,163 @@ pub fn config_path_problem(path: &str) -> Option<String> {
     path.chars().find(|c| bad(*c)).map(|c| format!("{path} has {c:?} in it, which an ssh config can't take as one plain path"))
 }
 
-/// The files a `~/.ssh/config` text pulls in by plain `Include` lines — anywhere in it, each
-/// argument with a leading `~/` taken as `home`; relative and glob arguments are skipped (no file
-/// arena writes is one). For telling whether the other audience's file is in use. Pure.
-pub fn included_files(config: &str, home: Option<&str>) -> Vec<PathBuf> {
+/// Every file a user's `~/.ssh/config` (its text, `config`) pulls in, as ssh resolves its
+/// `Include` lines: anywhere in the file (a block's too), each argument quoted or not, `~/` taken
+/// as `home`, a relative path under `~/.ssh`, glob patterns (`*`, `?`, `[…]`) matched against what
+/// exists, and the included files' own `Include`s followed (to ssh's depth of 16). For telling
+/// whether arena's other file is in use. Reads those files, never writes. `Err(argument)`: one
+/// arena can't resolve (a `${…}` or `%` token, or no home to resolve it against) — the caller
+/// can't tell what it includes.
+pub fn included_files(config: &str, home: Option<&str>) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
-    for line in config.lines() {
-        let l = line.trim();
-        let Some(kw) = l.get(..7).filter(|k| k.eq_ignore_ascii_case("include")) else { continue };
-        let rest = &l[kw.len()..];
-        if !rest.starts_with(|c: char| c.is_whitespace() || c == '=') {
-            continue;
-        }
-        let rest = rest.trim_start().strip_prefix('=').unwrap_or(rest).trim();
-        for arg in rest.split_whitespace().take_while(|a| !a.starts_with('#')) {
-            if arg.contains(['*', '?', '[', '"', '\'']) {
-                continue;
-            }
-            if let Ok(p) = expand_home(arg, home).map(|p| p.to_path_buf()) {
-                if p.is_absolute() && !out.contains(&p) {
-                    out.push(p);
+    follow_includes(config, home, 0, &mut out)?;
+    Ok(out)
+}
+
+fn follow_includes(config: &str, home: Option<&str>, depth: usize, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    if depth > 16 {
+        return Ok(());
+    }
+    for args in config.lines().filter_map(include_args) {
+        for arg in args {
+            let pattern = include_target(&arg, home).ok_or_else(|| arg.clone())?;
+            for file in glob_files(&pattern) {
+                if out.contains(&file) {
+                    continue;
+                }
+                out.push(file.clone());
+                if let Ok(text) = std::fs::read_to_string(&file) {
+                    follow_includes(&text, home, depth + 1, out)?;
                 }
             }
         }
     }
-    out
+    Ok(())
+}
+
+/// One `Include` line's arguments as ssh reads them — the keyword in any case, then whitespace or
+/// one `=`; whitespace-separated words, a `"…"` or `'…'` stretch kept whole without its quotes, a
+/// word starting with `#` ending the line. `None` for any other line. Pure.
+fn include_args(line: &str) -> Option<Vec<String>> {
+    let l = line.trim();
+    let kw = l.get(..7).filter(|k| k.eq_ignore_ascii_case("include"))?;
+    let rest = &l[kw.len()..];
+    if !rest.starts_with(|c: char| c.is_whitespace() || c == '=') {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('=').unwrap_or(rest);
+    let (mut args, mut word, mut quote, mut started) = (Vec::new(), String::new(), None::<char>, false);
+    for c in rest.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if started {
+                    args.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            (None, '#') if !started => break,
+            (None, c) => {
+                started = true;
+                word.push(c);
+            }
+        }
+    }
+    if started {
+        args.push(word);
+    }
+    Some(args)
+}
+
+/// Where one `Include` argument points in a user config: `~/` (or `~`) against `home`, a relative
+/// path under `~/.ssh`, an absolute one as it is. `None` when it holds a `${…}` or `%` token, or
+/// needs a home there's none of. Pure.
+fn include_target(arg: &str, home: Option<&str>) -> Option<PathBuf> {
+    if arg.contains(['$', '%']) {
+        return None;
+    }
+    let home = home.map(str::trim).filter(|h| h.starts_with('/'));
+    if arg.starts_with('~') {
+        return expand_home(arg, home).ok().filter(|p| p.is_absolute());
+    }
+    let p = Path::new(arg);
+    if p.is_absolute() {
+        Some(p.to_path_buf())
+    } else {
+        Some(Path::new(home?).join(".ssh").join(p))
+    }
+}
+
+/// The files `pattern` names, as glob(3) finds them: each component with `*`, `?` or `[…]` matched
+/// against its folder (a leading `.` only by a pattern that starts with one), sorted; a path with
+/// none, if it exists. Only what exists.
+fn glob_files(pattern: &Path) -> Vec<PathBuf> {
+    let magic = |s: &str| s.contains(['*', '?', '[']);
+    let mut found = vec![PathBuf::new()];
+    for comp in pattern.components() {
+        let part = comp.as_os_str().to_string_lossy();
+        if !magic(&part) {
+            found.iter_mut().for_each(|p| p.push(comp.as_os_str()));
+            continue;
+        }
+        let mut next = Vec::new();
+        for dir in &found {
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            let mut names: Vec<String> = entries.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            next.extend(names.iter().filter(|n| wild_match(&part, n)).map(|n| dir.join(n)));
+        }
+        found = next;
+    }
+    found.retain(|p| p.exists());
+    found
+}
+
+/// glob(7) matching of one name: `*`, `?`, `[abc]`, `[a-z]`, `[!…]`/`[^…]`; a leading `.` only
+/// by a literal one. Pure.
+fn wild_match(pat: &str, name: &str) -> bool {
+    if name.starts_with('.') && !pat.starts_with('.') {
+        return false;
+    }
+    fn go(p: &[char], n: &[char]) -> bool {
+        match p.first() {
+            None => n.is_empty(),
+            Some('*') => (0..=n.len()).any(|i| go(&p[1..], &n[i..])),
+            Some('?') => !n.is_empty() && go(&p[1..], &n[1..]),
+            Some('[') => {
+                let Some(close) = p.iter().skip(2).position(|&c| c == ']').map(|i| i + 2) else {
+                    return n.first() == Some(&'[') && go(&p[1..], &n[1..]);
+                };
+                let Some(&c) = n.first() else { return false };
+                let mut set = &p[1..close];
+                let negate = matches!(set.first(), Some('!' | '^'));
+                if negate {
+                    set = &set[1..];
+                }
+                let mut hit = false;
+                let mut i = 0;
+                while i < set.len() {
+                    if i + 2 < set.len() && set[i + 1] == '-' {
+                        hit |= set[i] <= c && c <= set[i + 2];
+                        i += 3;
+                    } else {
+                        hit |= set[i] == c;
+                        i += 1;
+                    }
+                }
+                hit != negate && go(&p[close + 1..], &n[1..])
+            }
+            Some(&c) => n.first() == Some(&c) && go(&p[1..], &n[1..]),
+        }
+    }
+    let (p, n): (Vec<char>, Vec<char>) = (pat.chars().collect(), name.chars().collect());
+    go(&p, &n)
 }
 
 /// Whether `meta`'s owner is this process's effective user — what `ssh-config --install` asks of
@@ -906,18 +1038,61 @@ mod tests {
         }
     }
 
-    /// The files a `~/.ssh/config` includes: plain paths in any Include line (`~/` expanded, `=`
-    /// or spaces, several on a line, inside a block too), never a glob, a relative path or a comment.
+    /// The files a `~/.ssh/config` includes, as ssh resolves them: any Include line (a block's
+    /// too; `=` or spaces; quoted; several per line, a `#` word ending it), `~/` and relative paths
+    /// (under `~/.ssh`), globs against what exists (no dotfile for `*`), nested Includes followed
+    /// (a loop once); only existing files. A `${…}`/`%` token, or a relative path with no home,
+    /// can't be resolved: the argument, as an error.
+    #[cfg(unix)]
     #[test]
-    fn included_files_are_the_plain_paths_of_every_include_line() {
-        let config = "Include ~/.ssh/arena.conf\ninclude=/etc/ssh/a.conf  ~/.ssh/b.conf # ~/.ssh/c.conf\n\
-                      Host box\n    Include ~/.ssh/arena-admin.conf\nInclude ~/.ssh/conf.d/*.conf rel.conf\nIncluded ~/.ssh/x\n\
-                      IdentityFile ~/.ssh/arena.conf\n";
-        let got = included_files(config, Some("/root"));
-        let want: Vec<PathBuf> =
-            ["/root/.ssh/arena.conf", "/etc/ssh/a.conf", "/root/.ssh/b.conf", "/root/.ssh/arena-admin.conf"].iter().map(PathBuf::from).collect();
+    fn included_files_are_resolved_as_ssh_resolves_them() {
+        let base = std::env::temp_dir().join(format!("arena-includes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (home, ssh) = (base.join("home"), base.join("home/.ssh"));
+        std::fs::create_dir_all(ssh.join("conf.d")).unwrap();
+        std::fs::create_dir_all(base.join("abs dir")).unwrap();
+        let quoted = base.join("abs dir/quoted.conf");
+        for (p, text) in [
+            (ssh.join("arena.conf"), ""),
+            (quoted.clone(), ""),
+            (ssh.join("b.conf"), ""),
+            (ssh.join("arena-admin.conf"), ""),
+            (ssh.join("conf.d/x.conf"), "Include nested.conf\n"),
+            (ssh.join("conf.d/y.conf"), "Include conf.d/y.conf\n"), // itself: followed once
+            (ssh.join("conf.d/.hidden.conf"), ""),
+            (ssh.join("nested.conf"), "Host n\n"),
+        ] {
+            std::fs::write(p, text).unwrap();
+        }
+        let config = format!(
+            "Include arena.conf\ninclude=\"{}\"  ~/.ssh/b.conf ~/.ssh/missing.conf # ~/.ssh/c.conf\n\
+             Host box\n    Include ~/.ssh/arena-admin.conf\nInclude conf.d/*.conf\nIncluded ~/.ssh/x\nIdentityFile arena.conf\n",
+            quoted.display()
+        );
+        let h = home.to_str();
+        let got = included_files(&config, h).unwrap();
+        let want =
+            vec![ssh.join("arena.conf"), quoted, ssh.join("b.conf"), ssh.join("arena-admin.conf"), ssh.join("conf.d/x.conf"), ssh.join("nested.conf"), ssh.join("conf.d/y.conf")];
         assert_eq!(got, want);
-        assert_eq!(included_files("Include ~/.ssh/arena.conf\n", None), Vec::<PathBuf>::new(), "no home: no ~/ path");
+        assert_eq!(included_files("Include ${HOME}/.ssh/arena.conf\n", h), Err("${HOME}/.ssh/arena.conf".to_string()));
+        assert_eq!(included_files("Include %d/.ssh/arena.conf\n", h), Err("%d/.ssh/arena.conf".to_string()));
+        assert_eq!(included_files("Include arena.conf\n", None), Err("arena.conf".to_string()));
+        assert_eq!(included_files("Include /nonexistent-arena/*.conf\nHost x\n", None), Ok(vec![]));
+        for (pat, name, hit) in [
+            ("*.conf", "arena.conf", true),
+            ("*.conf", ".arena.conf", false),
+            (".*", ".arena.conf", true),
+            ("arena?.conf", "arena1.conf", true),
+            ("arena[0-9].conf", "arena7.conf", true),
+            ("arena[!0-9].conf", "arena7.conf", false),
+            ("arena[^0-9].conf", "arenax.conf", true),
+            ("a*b*c", "aXXbYYc", true),
+            ("a*b*c", "aXXbYY", false),
+            ("[", "[", true),
+        ] {
+            assert_eq!(wild_match(pat, name), hit, "{pat} {name}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Each audience's file has its own first line: a sync writes its own (or an empty) file and

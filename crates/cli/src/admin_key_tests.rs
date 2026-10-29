@@ -309,6 +309,41 @@ async fn ssh_config_admin_install_writes_staff_s_own_file() {
     let _ = std::fs::remove_dir_all(&h);
 }
 
+/// The one-file-per-config guard reads Includes as ssh does: a relative one (under ~/.ssh), a
+/// glob, a nested one — in both directions; and an Include it can't follow refuses rather than
+/// guesses.
+#[cfg(unix)]
+#[tokio::test]
+async fn either_install_sees_the_other_file_however_it_is_included() {
+    let keys = Keys::new("guard");
+    let cfg = Config::parse(&format!("{NAMES}{}", keys.lines()));
+    let fleet = Listed(machines(), false);
+    let theirs = arena_core::sshconfig::managed_text("Host devtest-*\n");
+    let staff = Audience::Admin.text("Host devtest-apple\n");
+    for (tag, files, config, audience, why) in [
+        ("rel", vec![("arena.conf", theirs.as_str())], "Include arena.conf\n", Audience::Admin, "already includes"),
+        ("glob", vec![("arena-admin.conf", staff.as_str())], "Include ~/.ssh/arena-*.conf\n", Audience::Participants, "already includes"),
+        (
+            "nested",
+            vec![("arena.conf", theirs.as_str()), ("mine.conf", "Include \"arena.conf\"\n")],
+            "Host x\n    Include mine.conf\n",
+            Audience::Admin,
+            "already includes",
+        ),
+        ("env", vec![], "Include ${HOME}/.ssh/arena.conf\n", Audience::Admin, "has an Include arena can't follow (${HOME}/.ssh/arena.conf)"),
+    ] {
+        let h = home(&format!("guard-{tag}"));
+        for (name, text) in files {
+            std::fs::write(h.join(".ssh").join(name), text).unwrap();
+        }
+        std::fs::write(h.join(".ssh/config"), config).unwrap();
+        let e = handle_ssh_config_install(&fleet, &cfg, audience, None, true, false, h.to_str()).await.unwrap_err().to_string();
+        assert!(e.contains(why), "{tag}: {e}");
+        assert_eq!(std::fs::read_to_string(h.join(".ssh/config")).unwrap(), config, "{tag}: untouched");
+        let _ = std::fs::remove_dir_all(&h);
+    }
+}
+
 /// Every pod change keeps staff's file current beside the participants' (one line each), and
 /// lists the fleet for it even when the participants' file takes the proxy's ports.
 #[cfg(unix)]

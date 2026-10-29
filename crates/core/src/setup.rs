@@ -138,10 +138,13 @@ impl SetupConfig {
                 " && (grep -qxF {qpk} \"$HOME/.ssh/authorized_keys\" || echo {qpk} >> \"$HOME/.ssh/authorized_keys\")"
             ));
         }
+        // The key as copied may keep an older file's mode (scp leaves an existing file's): 0600
+        // first, which ssh-keygen wants of a private key (the config step's own chmod is before).
         let key = &self.key_remote;
         ak.push_str(&format!(
-            " && PUB=$(ssh-keygen -y -f {key} 2>/dev/null) && \
-             (grep -qxF \"$PUB\" \"$HOME/.ssh/authorized_keys\" || echo \"$PUB\" >> \"$HOME/.ssh/authorized_keys\")"
+            " && chmod 600 {qkey} && PUB=$(ssh-keygen -y -f {key} 2>/dev/null) && \
+             (grep -qxF \"$PUB\" \"$HOME/.ssh/authorized_keys\" || echo \"$PUB\" >> \"$HOME/.ssh/authorized_keys\")",
+            qkey = q(key)
         ));
         ak
     }
