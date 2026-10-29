@@ -1372,8 +1372,8 @@ mod tests {
     /// key ($0 cap, nothing spent in its period) and a disabled one aren't counted; a $0 cap
     /// that was spent against is; a key outside the cohort never is.
     #[test]
+    #[allow(clippy::type_complexity)]
     fn cohort_names_its_keys_at_cap() {
-        #[allow(clippy::type_complexity)]
         let k = |name: &str, limit: f64, remaining: Option<f64>, today: Option<f64>, total: Option<f64>, reset: Option<&str>, disabled: bool| KeyInfo {
             hash: format!("h-{name}"),
             name: Some(name.into()),

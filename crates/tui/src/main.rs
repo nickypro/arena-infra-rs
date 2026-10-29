@@ -6540,11 +6540,12 @@ deep_check_end=1
         assert!(matches!(ui.mode, Mode::Runs { stop: true, .. }), "{:?}", ui.mode);
         assert!(matches!(runs::key(&mut ui, &shared, KeyCode::Char('y')), runs::Flow::Handled));
         assert!(ended(&shared, id, None).await, "Ctrl+C didn't end it");
-        let s = shared.lock().unwrap();
-        let r = s.runs.iter().find(|r| r.id == id).unwrap();
-        assert_eq!(r.lines.front().map(String::as_str), Some("args: --config /test/config.env --provider runpod pods start devtest-alpha --yes"));
-        assert_eq!((r.end.as_ref().map(|(_, e)| e.clone()), r.tally()), (Some(runs::End::Code(130)), "1 stopped".to_string()));
-        drop(s);
+        {
+            let s = shared.lock().unwrap();
+            let r = s.runs.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(r.lines.front().map(String::as_str), Some("args: --config /test/config.env --provider runpod pods start devtest-alpha --yes"));
+            assert_eq!((r.end.as_ref().map(|(_, e)| e.clone()), r.tally()), (Some(runs::End::Code(130)), "1 stopped".to_string()));
+        }
 
         // Ctrl+C straight after `y` (review ai-review codex #2, round 2 #3: the child was spawned
         // in the background task, so a stop — or a quit leaving it running — could come before
@@ -6569,11 +6570,12 @@ deep_check_end=1
         start_cli_action(&mut ui, &shared, Action::Logs, &alpha, None);
         let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
         assert!(ended(&shared, id, None).await, "the logs run never ended");
-        let s = shared.lock().unwrap();
-        let r = s.runs.iter().find(|r| r.id == id).unwrap();
-        assert_eq!(r.pods, [("devtest-alpha".to_string(), runs::PodState::Failed("FAILED setup: after a long line".into()))], "{:?}", r.lines.iter().map(|l| l.len()).collect::<Vec<_>>());
-        assert!(r.lines.iter().any(|l| l.len() > 1_000 && l.ends_with('…')), "the long line, cut");
-        drop(s);
+        {
+            let s = shared.lock().unwrap();
+            let r = s.runs.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(r.pods, [("devtest-alpha".to_string(), runs::PodState::Failed("FAILED setup: after a long line".into()))], "{:?}", r.lines.iter().map(|l| l.len()).collect::<Vec<_>>());
+            assert!(r.lines.iter().any(|l| l.len() > 1_000 && l.ends_with('…')), "the long line, cut");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
