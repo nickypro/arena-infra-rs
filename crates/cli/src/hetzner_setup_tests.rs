@@ -248,6 +248,63 @@ fn no_swap_is_made_when_asked_for_none_without_room_or_when_mkswap_fails() {
     assert!(!t.0.join("swapfile").exists());
 }
 
+/// The shared dotfiles' .zshrc, as nickypro/arena-infra has it (cut down): the GPU image's, so
+/// it starts conda and activates its env.
+const SHARED_ZSHRC: &str = r#"# export PATH="/opt/conda/bin:$PATH"  # commented out by conda initialize
+export MACHINE_NAME="${MACHINE_NAME:="root"}"
+[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
+
+# >>> conda initialize >>>
+__conda_setup="$('/opt/conda/bin/conda' 'shell.zsh' 'hook' 2> /dev/null)"
+if [ $? -eq 0 ]; then
+    eval "$__conda_setup"
+fi
+unset __conda_setup
+# <<< conda initialize <<<
+
+conda activate arena-env
+"#;
+
+/// The human (2026-10-29): "the .zshrc still has conda activate by default, can we remove
+/// that?" A VM has no conda, so each login said "command not found: conda". The VM's .zshrc
+/// is the shared one without conda, plus the venv; a re-run keeps what `copy-keys` and the
+/// participant added (it used to copy the shared file over them).
+#[test]
+fn the_vms_zshrc_has_no_conda_and_a_rerun_keeps_its_tokens() {
+    let (_t, stubs, home, repo) = setup("zshrc");
+    let dotfiles = home.join(".arena_infra/dotfiles");
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    std::fs::write(dotfiles.join(".zshrc"), SHARED_ZSHRC).unwrap();
+    // A fresh VM: oh-my-zsh's template is there, to be replaced.
+    std::fs::write(home.join(".zshrc"), "ZSH_THEME=robbyrussell\n").unwrap();
+    let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]);
+    assert!(r.ok, "{}", r.stderr);
+    let activate = format!("source \"{}/bin/activate\"", repo.join(".venv").display());
+    let rc = std::fs::read_to_string(home.join(".zshrc")).unwrap();
+    assert!(!rc.contains("conda"), "{rc}");
+    assert!(!rc.contains("robbyrussell"), "the template is replaced: {rc}");
+    assert!(rc.contains("export MACHINE_NAME=") && rc.contains("source ~/.p10k.zsh"), "the rest is kept: {rc}");
+    assert_eq!(rc.matches(&activate).count(), 1, "{rc}");
+
+    // copy-keys and the participant add lines; a re-run keeps them, and adds nothing twice.
+    let added = "export OPENROUTER_API_KEY=\"sk-or-test\"\nalias gs='git status'\n";
+    std::fs::write(home.join(".zshrc"), format!("{rc}{added}")).unwrap();
+    let again = run(&stubs, &home, &repo, &[]);
+    assert!(again.ok, "{}", again.stderr);
+    assert_eq!(std::fs::read_to_string(home.join(".zshrc")).unwrap(), format!("{rc}{added}"));
+
+    // A VM set up before this: the shared rc with conda, the old guarded venv block, a token.
+    // A re-run takes conda out and keeps the rest (the old block's guard is harmless).
+    let old_block = format!("\nif ! command -v conda >/dev/null 2>&1 && [ -f \"{0}/bin/activate\" ]; then\n    source \"{0}/bin/activate\"\nfi\n", repo.join(".venv").display());
+    std::fs::write(home.join(".zshrc"), format!("{SHARED_ZSHRC}{old_block}{added}")).unwrap();
+    let old = run(&stubs, &home, &repo, &[]);
+    assert!(old.ok, "{}", old.stderr);
+    let rc = std::fs::read_to_string(home.join(".zshrc")).unwrap();
+    assert!(!rc.lines().any(|l| l.contains("conda") && !l.contains("command -v conda")), "{rc}");
+    assert!(rc.ends_with(&format!("{old_block}{added}")), "{rc}");
+    assert_eq!(rc.matches(&activate).count(), 1, "{rc}");
+}
+
 #[test]
 fn the_script_parses() {
     let out = Command::new("bash").arg("-n").arg("-c").arg(crate::HETZNER_SETUP).output().expect("bash");

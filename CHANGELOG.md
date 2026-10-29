@@ -14,6 +14,15 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-29 · No more "command not found: conda" on Hetzner VMs
+- A Hetzner VM's `~/.zshrc` no longer has conda's init block or `conda activate arena-env` (it came
+  from the GPU image's shared rc; a VM has no conda, so every login printed an error). The uv env
+  is activated as before.
+- Re-running `arena pods setup` on a VM no longer overwrites `~/.zshrc`: it takes the conda lines
+  out of the VM's own, keeping the API-key exports `copy-keys` put there and anything the
+  participant added. Until now a re-run dropped those keys from zsh until the next `copy-keys`.
+- VMs set up before this get it at their next `arena pods setup`.
+
 ## 2026-10-29 · Pods near the proxy first, and an RTT column in the dashboard
 - `pods create`/`up` (and `replace`, `migrate`) on RunPod and Vast now try Europe first — where
   the proxy every participant's SSH goes through runs — unless that costs more than 25% over the

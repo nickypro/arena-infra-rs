@@ -366,15 +366,31 @@ clone_plugin https://github.com/zsh-users/zsh-syntax-highlighting.git "$ZSH_CUST
 clone_plugin https://github.com/zsh-users/zsh-history-substring-search "$ZSH_CUSTOM/plugins/zsh-history-substring-search"
 clone_plugin https://github.com/zsh-users/zsh-completions             "$ZSH_CUSTOM/plugins/zsh-completions"
 
-# p10k + vimrc symlinked verbatim. The shared .zshrc only knows conda, so we copy it and
-# append a uv-venv activation (guarded by `! command -v conda`, so it's a no-op on GPU pods).
+# p10k + vimrc symlinked verbatim. The shared .zshrc is the GPU image's: it ends in conda's init
+# block and `conda activate arena-env`. A VM has no conda, so every login printed "command not
+# found: conda"; it goes in without those lines, and a uv-venv activation is appended below.
+# Only a fresh VM's ~/.zshrc (no venv line yet: oh-my-zsh's template) is replaced by the shared
+# one. A re-run filters the VM's own in place, since it holds `copy-keys`' token exports and
+# whatever the participant added (a re-run used to overwrite them).
 ln -sf "$HOME/.arena_infra/dotfiles/.vimrc"    "$HOME/.vimrc"
 ln -sf "$HOME/.arena_infra/dotfiles/.p10k.zsh" "$HOME/.p10k.zsh"
-cp -f  "$HOME/.arena_infra/dotfiles/.zshrc"    "$HOME/.zshrc"
+zshrc_src="$HOME/.arena_infra/dotfiles/.zshrc"
+grep -qF "$VENV/bin/activate" "$HOME/.zshrc" 2>/dev/null && zshrc_src="$HOME/.zshrc"
+if [ -f "$zshrc_src" ]; then
+    awk '
+        /^# >>> conda initialize >>>/ { skip = 1; next }
+        /^# <<< conda initialize <<</ { skip = 0; next }
+        skip                          { next }
+        /^[[:space:]]*conda activate/ { next }
+        /^# export PATH="\/opt\/conda/ { next }
+                                      { print }
+    ' "$zshrc_src" > "$HOME/.zshrc.arena-new" \
+        && mv -f "$HOME/.zshrc.arena-new" "$HOME/.zshrc"
+fi
 for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
     touch "$rc"
     grep -qF "$VENV/bin/activate" "$rc" || \
-        printf '\n# ARENA env: no conda on CPU pods — activate the uv venv (no-op on conda GPU pods).\nif ! command -v conda >/dev/null 2>&1 && [ -f "%s/bin/activate" ]; then\n    source "%s/bin/activate"\nfi\n' "$VENV" "$VENV" >> "$rc"
+        printf '\n# ARENA env: the uv venv.\nif [ -f "%s/bin/activate" ]; then\n    source "%s/bin/activate"\nfi\n' "$VENV" "$VENV" >> "$rc"
 done
 
 # Machine name (MOTD + prompt) from the Hetzner hostname, e.g. arena8-flutter (ARENA_MACHINE_NAME
