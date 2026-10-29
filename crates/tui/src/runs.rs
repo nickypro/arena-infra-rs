@@ -38,11 +38,25 @@ use tokio::sync::Notify;
 use crate::offers;
 use crate::{centered_rect, scroll_by, Mode, Shared, Ui};
 
-/// How many runs' output files are kept (the oldest go when a run starts).
+/// How many runs' output files are kept (the oldest go when a run starts) — besides the ones
+/// still being written ([`prune`]).
 pub(crate) const KEEP_LOGS: usize = 30;
+
+/// An output file written to this recently is never pruned: it may be a run still going that
+/// an earlier dashboard started and left running (`up` writes a line at least every endpoint
+/// poll or setup step, minutes apart).
+const WRITTEN_LATELY: Duration = Duration::from_secs(6 * 3600);
 
 /// How many of a run's lines the panel keeps (its file has them all).
 const KEEP_LINES: usize = 2_000;
+
+/// The longest line the panel keeps, in bytes: a longer one is cut there (its file has it
+/// whole). With [`KEEP_LINES`] it bounds a run's share of memory (~2 MB) whatever it prints.
+const LINE_MAX: usize = 1_024;
+
+/// The most of a run's file one look reads: a run that prints faster is read over several
+/// looks, never all at once.
+const READ_MAX: usize = 256 * 1024;
 
 /// How many runs the dashboard remembers.
 const KEEP_RUNS: usize = 20;
@@ -189,6 +203,9 @@ pub(crate) struct Run {
     pub command: String,
     pub log: PathBuf,
     pub pid: Option<u32>,
+    /// Ctrl+C was asked for before the child's pid was known: [`supervise`] sends it the
+    /// moment it has one ([`interrupt`]).
+    pub stop_asked: bool,
     pub started: Instant,
     pub lines: VecDeque<String>,
     /// Lines no longer kept (the file has them).
@@ -264,7 +281,8 @@ pub(crate) fn start(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, kind: Kind, provid
         return Err("the dashboard is ending".into());
     }
     std::fs::create_dir_all(&cli.dir).map_err(|e| format!("making {}: {e}", cli.dir.display()))?;
-    prune(&cli.dir, KEEP_LOGS.saturating_sub(1));
+    let going: Vec<PathBuf> = shared.lock().unwrap().runs.iter().filter(|r| r.running()).map(|r| r.log.clone()).collect();
+    prune(&cli.dir, KEEP_LOGS.saturating_sub(1), &going, std::time::SystemTime::now());
     let id = {
         let mut s = shared.lock().unwrap();
         s.next_run += 1;
@@ -290,6 +308,7 @@ pub(crate) fn start(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, kind: Kind, provid
             command,
             log: log.clone(),
             pid: None,
+            stop_asked: false,
             started: Instant::now(),
             lines: VecDeque::new(),
             dropped: 0,
@@ -308,14 +327,20 @@ pub(crate) fn start(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, kind: Kind, provid
     Ok(id)
 }
 
-/// Remove all but the newest `keep` `*.log` files in `dir` (named by start time, so by name).
-fn prune(dir: &Path, keep: usize) {
+/// Remove all but the newest `keep` `*.log` files in `dir` (named by start time, so by name) —
+/// never one of `going` (this dashboard's runs still going) or one written to in the last
+/// [`WRITTEN_LATELY`] (`now`): unlinked, a run still writing would lose its output, and the
+/// path the quit printed would be gone.
+fn prune(dir: &Path, keep: usize, going: &[PathBuf], now: std::time::SystemTime) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut logs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "log")).collect();
     logs.sort();
     let n = logs.len().saturating_sub(keep);
     for p in logs.into_iter().take(n) {
-        let _ = std::fs::remove_file(p);
+        let lately = std::fs::metadata(&p).and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).unwrap_or_default() < WRITTEN_LATELY);
+        if !going.contains(&p) && !lately {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -343,12 +368,18 @@ async fn supervise(shared: Arc<Mutex<Shared>>, nudge: Arc<Notify>, id: u64, mut 
         Ok(c) => c,
         Err(e) => return finish(&shared, id, End::NotStarted(e.to_string())),
     };
-    with_run(&shared, id, |r| r.pid = child.id());
+    // The pid and a stop asked for before it was known, under one lock: no stop falls between.
+    with_run(&shared, id, |r| {
+        r.pid = child.id();
+        if let (true, Some(pid)) = (r.stop_asked, r.pid) {
+            let _ = sigint_group(pid);
+        }
+    });
     let mut reader = std::fs::File::open(&log).ok();
-    let mut partial: Vec<u8> = Vec::new();
+    let mut split = Lines::default();
     let mut status = None;
     loop {
-        let lines = read_lines(reader.as_mut(), &mut partial);
+        let lines = read_lines(reader.as_mut(), &mut split);
         let got = !lines.is_empty();
         if got {
             take_lines(&shared, &nudge, id, lines);
@@ -364,8 +395,7 @@ async fn supervise(shared: Arc<Mutex<Shared>>, nudge: Arc<Notify>, id: u64, mut 
             _ = tokio::time::sleep(TAIL_EVERY) => {}
         }
     }
-    if !partial.is_empty() {
-        let last = String::from_utf8_lossy(&partial).into_owned();
+    if let Some(last) = split.rest() {
         take_lines(&shared, &nudge, id, vec![last]);
     }
     let end = match status {
@@ -379,18 +409,72 @@ async fn supervise(shared: Arc<Mutex<Shared>>, nudge: Arc<Notify>, id: u64, mut 
     finish(&shared, id, end);
 }
 
-/// The complete lines read from `file` since the last call (an incomplete one waits in `partial`).
-fn read_lines(file: Option<&mut std::fs::File>, partial: &mut Vec<u8>) -> Vec<String> {
+/// A run's output as lines, fed as it's read: a line ends at `\n`, `\r` or `\r\n` (a progress
+/// bar redrawing itself is lines, not one that never ends), and only a line's first
+/// [`LINE_MAX`] bytes are kept (then `…`; its file has it whole) — what waits for its end never
+/// holds more, however long it runs.
+#[derive(Debug, Default)]
+pub(crate) struct Lines {
+    partial: Vec<u8>,
+    /// The line went past [`LINE_MAX`]: the rest of it is dropped.
+    long: bool,
+    /// The last byte was a `\r`: a `\n` right after it ends nothing more.
+    after_cr: bool,
+}
+
+impl Lines {
+    /// The lines `bytes` complete. Pure.
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        for &b in bytes {
+            let after_cr = std::mem::replace(&mut self.after_cr, b == b'\r');
+            match b {
+                b'\n' if after_cr => {}
+                b'\n' | b'\r' => out.push(self.take()),
+                _ if self.partial.len() >= LINE_MAX => self.long = true,
+                _ => self.partial.push(b),
+            }
+        }
+        out
+    }
+
+    /// What's left after the run ended: its last line, if it had no end.
+    pub(crate) fn rest(&mut self) -> Option<String> {
+        (!self.partial.is_empty()).then(|| self.take())
+    }
+
+    fn take(&mut self) -> String {
+        let mut line = cut(&String::from_utf8_lossy(&self.partial));
+        if std::mem::take(&mut self.long) && !line.ends_with('…') {
+            line.push('…');
+        }
+        self.partial.clear();
+        line
+    }
+}
+
+/// The lines read from `file` since the last call — at most [`READ_MAX`] bytes of it a call.
+fn read_lines(file: Option<&mut std::fs::File>, lines: &mut Lines) -> Vec<String> {
     use std::io::Read;
     let Some(f) = file else { return Vec::new() };
-    let mut buf = Vec::new();
-    if f.read_to_end(&mut buf).is_err() || buf.is_empty() {
-        return Vec::new();
+    let mut buf = vec![0u8; READ_MAX];
+    match f.read(&mut buf) {
+        Ok(n) if n > 0 => lines.feed(&buf[..n]),
+        _ => Vec::new(),
     }
-    partial.extend_from_slice(&buf);
-    let Some(last_nl) = partial.iter().rposition(|&b| b == b'\n') else { return Vec::new() };
-    let complete: Vec<u8> = partial.drain(..=last_nl).collect();
-    String::from_utf8_lossy(&complete).lines().map(String::from).collect()
+}
+
+/// `line`, cut at [`LINE_MAX`] bytes (on a character boundary) with `…` when longer — a lossy
+/// decoding can be longer than the bytes it read.
+fn cut(line: &str) -> String {
+    if line.len() <= LINE_MAX {
+        return line.to_string();
+    }
+    let mut end = LINE_MAX;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &line[..end])
 }
 
 fn with_run(shared: &Mutex<Shared>, id: u64, f: impl FnOnce(&mut Run)) {
@@ -473,21 +557,54 @@ pub(crate) async fn capture(mut cmd: tokio::process::Command, timeout: Duration)
     Err(why.unwrap_or_else(|| format!("arena offers: {}", out.status)))
 }
 
+/// What asking a run to stop came to.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Stop {
+    /// Ctrl+C went to its process group.
+    Sent,
+    /// It hasn't a pid yet (it's being started): Ctrl+C goes to it the moment it has.
+    Queued,
+    /// It has ended (or there's no such run).
+    NotRunning,
+    /// `kill` refused or couldn't run: why.
+    Failed(String),
+}
+
 /// Send run `id` Ctrl+C — SIGINT to its process group, as a terminal's Ctrl+C would (`up`: no new
-/// attempts, nothing terminated). Whether it was sent.
-fn interrupt(shared: &Mutex<Shared>, id: u64) -> bool {
+/// attempts, nothing terminated) — or, before it has a pid, ask [`supervise`] to send it the
+/// moment it does (decided under the lock that publishes the pid).
+fn interrupt(shared: &Mutex<Shared>, id: u64) -> Stop {
     let pid = {
-        let s = shared.lock().unwrap();
-        s.runs.iter().find(|r| r.id == id && r.running()).and_then(|r| r.pid)
+        let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(r) = s.runs.iter_mut().find(|r| r.id == id && r.running()) else { return Stop::NotRunning };
+        match r.pid {
+            Some(pid) => pid,
+            None => {
+                r.stop_asked = true;
+                return Stop::Queued;
+            }
+        }
     };
-    let Some(pid) = pid else { return false };
-    std::process::Command::new("kill")
+    match sigint_group(pid) {
+        Ok(()) => Stop::Sent,
+        Err(e) => Stop::Failed(e),
+    }
+}
+
+/// SIGINT to process group `pid` (`kill -INT -- -pid`).
+fn sigint_group(pid: u32) -> Result<(), String> {
+    let out = std::process::Command::new("kill")
         .args(["-INT", "--", &format!("-{pid}")])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("couldn't run kill: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(if why.is_empty() { format!("kill: {}", out.status) } else { why })
 }
 
 /// The runs still going that change pods — what a quit asks about.
@@ -513,15 +630,22 @@ pub(crate) enum Flow {
     Quit(Vec<String>),
 }
 
-/// The lines said after a quit that left `left` running.
-fn left_running(left: &[(u64, String, Option<u32>, PathBuf)], stopped: bool) -> Vec<String> {
+/// The lines said after a quit that left `left` running (`stops`: each one's [`interrupt`],
+/// when the quit sent Ctrl+C) — what really happened to each, never "sent" for one that wasn't.
+fn left_running(left: &[(u64, String, Option<u32>, PathBuf)], stops: Option<&[Stop]>) -> Vec<String> {
     left.iter()
-        .map(|(_, cmd, pid, log)| {
+        .enumerate()
+        .map(|(i, (_, cmd, pid, log))| {
             let pid = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
-            if stopped {
-                format!("arena-tui: sent Ctrl+C to `{cmd}`{pid}: it stops where it is, terminates nothing — its output: {}", log.display())
-            } else {
-                format!("arena-tui: left running: `{cmd}`{pid} — its output: {}", log.display())
+            let log = log.display();
+            match stops.map(|s| s.get(i).cloned().unwrap_or(Stop::NotRunning)) {
+                None => format!("arena-tui: left running: `{cmd}`{pid} — its output: {log}"),
+                Some(Stop::Sent) => format!("arena-tui: sent Ctrl+C to `{cmd}`{pid}: it stops where it is, terminates nothing — its output: {log}"),
+                Some(Stop::Queued) => format!(
+                    "arena-tui: `{cmd}` was still being started: if it started, it got Ctrl+C at once — check `arena pods list`; its output: {log}"
+                ),
+                Some(Stop::NotRunning) => format!("arena-tui: `{cmd}` had already ended — its output: {log}"),
+                Some(Stop::Failed(why)) => format!("arena-tui: ✗ couldn't send Ctrl+C to `{cmd}`{pid} ({why}): it's still running — its output: {log}"),
             }
         })
         .collect()
@@ -546,8 +670,13 @@ pub(crate) fn key(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, code: KeyCode) -> Fl
             let mut next = Mode::Runs { id, scroll, stop: false };
             match code {
                 KeyCode::Char('y') if stop => {
-                    let sent = interrupt(shared, id);
-                    shared.lock().unwrap().notify(if sent { "sent Ctrl+C to the run: it stops where it is, terminates nothing" } else { "✗ the run isn't running" }, !sent);
+                    let (text, bad) = match interrupt(shared, id) {
+                        Stop::Sent => ("sent Ctrl+C to the run: it stops where it is, terminates nothing".to_string(), false),
+                        Stop::Queued => ("the run is still being started: Ctrl+C goes to it the moment it is".to_string(), false),
+                        Stop::NotRunning => ("✗ the run isn't running".to_string(), true),
+                        Stop::Failed(why) => (format!("✗ couldn't send Ctrl+C to the run: {why}"), true),
+                    };
+                    shared.lock().unwrap().notify(text, bad);
                 }
                 KeyCode::Esc | KeyCode::Char('q') => next = Mode::List,
                 KeyCode::Left | KeyCode::Char('h') if at > 0 => next = Mode::Runs { id: ids[at - 1], scroll: None, stop: false },
@@ -575,12 +704,10 @@ pub(crate) fn key(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, code: KeyCode) -> Fl
                     Flow::Handled
                 }
                 KeyCode::Char('s') => {
-                    for (id, ..) in &left {
-                        interrupt(shared, *id);
-                    }
-                    Flow::Quit(left_running(&left, true))
+                    let stops: Vec<Stop> = left.iter().map(|(id, ..)| interrupt(shared, *id)).collect();
+                    Flow::Quit(left_running(&left, Some(&stops)))
                 }
-                KeyCode::Char('k' | 'q') | KeyCode::Enter => Flow::Quit(left_running(&left, false)),
+                KeyCode::Char('k' | 'q') | KeyCode::Enter => Flow::Quit(left_running(&left, None)),
                 _ => Flow::Handled,
             }
         }
@@ -654,8 +781,10 @@ pub(crate) fn render(f: &mut Frame, s: &Shared, id: u64, scroll: Option<u16>, st
     };
     let inner = area.height.saturating_sub(2) as usize;
     let room = inner.saturating_sub(head.len() + 2).max(1);
-    let total = run.lines.len();
-    let max_scroll = total.saturating_sub(room) as u16;
+    // Long lines wrap (an error's point is often at its end); the scroll is in screen rows.
+    let rows = wrap_rows(run.lines.iter().map(String::as_str), area.width.saturating_sub(2) as usize);
+    let total = rows.len();
+    let max_scroll = total.saturating_sub(room).min(u16::MAX as usize) as u16;
     max.set(max_scroll);
     let from = scroll.map_or(max_scroll, |s| s.min(max_scroll)) as usize;
     let mut lines = head;
@@ -663,7 +792,7 @@ pub(crate) fn render(f: &mut Frame, s: &Shared, id: u64, scroll: Option<u16>, st
     if total == 0 {
         lines.push(Line::styled(if run.running() { "(no output yet)" } else { "(no output)" }, dim));
     }
-    lines.extend(run.lines.iter().skip(from).take(room).map(|l| Line::raw(l.clone())));
+    lines.extend(rows.into_iter().skip(from).take(room).map(Line::raw));
     let used = lines.len();
     lines.extend(std::iter::repeat_n(Line::raw(""), inner.saturating_sub(used + 1)));
     lines.push(keys);
@@ -676,6 +805,21 @@ pub(crate) fn render(f: &mut Frame, s: &Shared, id: u64, scroll: Option<u16>, st
         ),
         area,
     );
+}
+
+/// `lines` as screen rows `width` characters wide: each line cut into as many rows as it
+/// needs (an empty line is one row). Pure.
+fn wrap_rows<'a>(lines: impl Iterator<Item = &'a str>, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for line in lines {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            rows.push(String::new());
+        }
+        rows.extend(chars.chunks(width).map(|c| c.iter().collect::<String>()));
+    }
+    rows
 }
 
 /// The quit question: which runs that change pods are still going, and what each key does.
@@ -734,6 +878,7 @@ pub(crate) mod tests {
             command: "arena --provider hetzner pods up --add 1 --yes".into(),
             log: PathBuf::from("/tmp/x.log"),
             pid: None,
+            stop_asked: false,
             started: Instant::now(),
             lines: VecDeque::new(),
             dropped: 0,
@@ -786,20 +931,59 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Only the newest `keep` output files stay.
+    /// The panel wraps a long line into rows (the live 403's "shared core limit" was past the
+    /// edge); an empty line is a row.
     #[test]
-    fn old_run_files_are_pruned() {
+    fn long_output_lines_wrap_into_rows() {
+        let rows = wrap_rows(["abcdefg", "", "hi", "ééé"].into_iter(), 3);
+        assert_eq!(rows, ["abc", "def", "g", "", "hi", "ééé"]);
+        assert_eq!(wrap_rows(["ab"].into_iter(), 0), ["a", "b"], "a zero width is one column");
+    }
+
+    /// Only the newest `keep` output files stay — but never one a run is still writing: this
+    /// dashboard's runs going (review ai-review codex #4: a long `up`'s file went once enough
+    /// jobs/logs runs came after it), or one written to lately (an earlier dashboard's run).
+    #[test]
+    fn old_run_files_are_pruned_but_never_one_being_written() {
         let dir = std::env::temp_dir().join(format!("arena-tui-prune-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        for t in 100..105 {
+        for t in 100..106 {
             std::fs::write(dir.join(format!("{t}-up-1.log")), "").unwrap();
         }
         std::fs::write(dir.join("keep.txt"), "").unwrap();
-        prune(&dir, 2);
-        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-        left.sort();
-        assert_eq!(left, ["103-up-1.log", "104-up-1.log", "keep.txt"]);
+        let left = || {
+            let mut v: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            v.sort();
+            v
+        };
+        let now = std::time::SystemTime::now();
+        prune(&dir, 2, &[], now);
+        assert_eq!(left().len(), 7, "all written just now: kept");
+        let later = now + WRITTEN_LATELY + Duration::from_secs(60);
+        prune(&dir, 2, &[dir.join("101-up-1.log")], later);
+        assert_eq!(left(), ["101-up-1.log", "104-up-1.log", "105-up-1.log", "keep.txt"], "101's run is going");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run's output as the panel keeps it: lines end at `\n`, `\r` or `\r\n`, across reads;
+    /// a line is kept to its first LINE_MAX bytes then `…` — what waits for a line's end never
+    /// grows past that (review ai-review codex #1: a log printed without newlines grew it
+    /// without bound); the last line without an end is the rest.
+    #[test]
+    fn output_splits_into_bounded_lines() {
+        let mut l = Lines::default();
+        assert_eq!(l.feed(b"one\ntwo\r\nthr"), ["one", "two"]);
+        assert_eq!(l.feed(b"ee\r"), ["three"]);
+        assert_eq!(l.feed(b"\n10%\r20%\r"), ["10%", "20%"], "the \\n after a \\r ends nothing; \\r alone ends a line");
+        let long = vec![b'x'; LINE_MAX * 50];
+        assert!(l.feed(&long).is_empty());
+        assert!(l.partial.len() <= LINE_MAX, "bounded while the line goes on");
+        let got = l.feed(b"tail\nnext");
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].len(), got[0].ends_with("x…")), (LINE_MAX + '…'.len_utf8(), true));
+        assert_eq!(l.rest().as_deref(), Some("next"));
+        assert_eq!(l.rest(), None);
+        assert_eq!(cut(&"é".repeat(LINE_MAX)).chars().filter(|c| *c == 'é').count(), LINE_MAX / 2, "cut on a character boundary");
     }
 }

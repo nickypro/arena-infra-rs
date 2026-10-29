@@ -17262,6 +17262,36 @@ mod selection_tests {
         names.iter().map(|n| format!("id-arena8-{n}")).collect()
     }
 
+    /// The command lines the dashboard runs as children (arena-tui's `runs.rs`: its menu's
+    /// start/rename/jobs/logs, the add-pod form's `up` and `offers`), which it builds without
+    /// this parser, parse as it means them: the pod a target and never a JOB (review ai-review
+    /// codex #3), `--yes` global, every flag of the form's there.
+    #[test]
+    fn the_dashboards_command_lines_parse_as_it_means_them() {
+        let full = |argv: &[&str]| {
+            Cli::try_parse_from(["arena", "--config", "/c.env", "--provider", "hetzner"].iter().chain(argv).copied()).unwrap_or_else(|e| panic!("{argv:?}: {e}"))
+        };
+        let pod = vec!["devtest-alpha".to_string()];
+        let Cmd::Pods(PodCmd::Logs { tail, follow, sel }) = full(&["pods", "logs", "devtest-alpha", "--tail", "100"]).cmd else { panic!() };
+        assert_eq!((tail, follow, arena_core::jobs::split_job_arg(&sel.targets).unwrap()), (100, false, (pod.clone(), None)));
+        let Cmd::Pods(PodCmd::Jobs { kill, sel }) = full(&["pods", "jobs", "devtest-alpha"]).cmd else { panic!() };
+        assert_eq!((kill, arena_core::jobs::split_job_arg(&sel.targets).unwrap()), (None, (pod.clone(), None)));
+        let c = full(&["pods", "start", "devtest-alpha", "--yes"]);
+        assert!(c.yes && matches!(&c.cmd, Cmd::Pods(PodCmd::Start { sel, no_setup: false, dry_run: false, .. }) if sel.targets == pod));
+        let c = full(&["pods", "rename", "devtest-alpha", "bravo", "--yes"]);
+        let Cmd::Pods(PodCmd::Rename { target, new_name, dry_run: false, .. }) = c.cmd else { panic!() };
+        assert!(c.yes && target.as_deref() == Some("devtest-alpha") && new_name.as_deref() == Some("bravo"));
+        let c = full(&["pods", "up", "--add", "2", "--server-type", "cx23", "--yes"]);
+        assert!(c.yes && matches!(&c.cmd, Cmd::Pods(PodCmd::Up { add: Some(2), server_type: Some(t), dry_run: false, .. }) if t == "cx23"));
+        let up = ["pods", "up", "--add", "1", "--gpu", "NVIDIA RTX A4000", "--gpus", "2", "--cloud", "COMMUNITY,SECURE", "--disk", "100", "--volume", "0", "--check", "--yes"];
+        let Cmd::Pods(PodCmd::Up { gpu, gpus, cloud, disk, volume, check, .. }) = full(&up).cmd else { panic!() };
+        assert_eq!((gpu.as_deref(), gpus, cloud.as_deref(), disk, volume, check), (Some("NVIDIA RTX A4000"), Some(2), Some("COMMUNITY,SECURE"), Some(100), Some(0), true));
+        let Cmd::Offers { gpu, cloud, gpus, server_type, json: true, .. } = full(&["offers", "--json", "--gpu", "NVIDIA RTX A4000", "--cloud", "SECURE", "--gpus", "1"]).cmd else { panic!() };
+        assert_eq!((gpu.as_deref(), cloud.as_deref(), gpus, server_type), (Some("NVIDIA RTX A4000"), Some("SECURE"), Some(1), None));
+        let Cmd::Offers { server_type, json: true, .. } = full(&["offers", "--json", "--server-type", "cx33"]).cmd else { panic!() };
+        assert_eq!(server_type.as_deref(), Some("cx33"));
+    }
+
     #[tokio::test]
     async fn the_resolver_picks_in_list_order_and_fails_loudly_on_typos() {
         let f = fleet();

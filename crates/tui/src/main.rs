@@ -6552,6 +6552,22 @@ deep_check_end=1
         assert_eq!(r.lines.front().map(String::as_str), Some("args: --config /test/config.env --provider runpod pods start devtest-alpha --yes"));
         assert_eq!((r.end.as_ref().map(|(_, e)| e.clone()), r.tally()), (Some(runs::End::Code(130)), "1 stopped".to_string()));
         drop(s);
+
+        // Ctrl+C asked for before the child has a pid (review ai-review codex #2: it was dropped,
+        // and a quit said "sent"): queued, and sent the moment the pid is known.
+        start_cli_action(&mut ui, &shared, Action::Start, &alpha, None);
+        let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        assert_eq!(shared.lock().unwrap().runs.iter().find(|r| r.id == id).unwrap().pid, None, "not spawned yet");
+        ui.mode = Mode::Runs { id, scroll: None, stop: true };
+        assert!(matches!(runs::key(&mut ui, &shared, KeyCode::Char('y')), runs::Flow::Handled));
+        assert_eq!(
+            shared.lock().unwrap().notice.as_ref().map(|n| n.text.clone()).as_deref(),
+            Some("the run is still being started: Ctrl+C goes to it the moment it is")
+        );
+        assert!(ended(&shared, id, None).await, "the queued Ctrl+C didn't end it");
+        let end = shared.lock().unwrap().runs.iter().find(|r| r.id == id).unwrap().end.clone().map(|(_, e)| e);
+        // SIGINT before the stub set its trap kills it; after, the trap exits 130.
+        assert!(matches!(end, Some(runs::End::Signal(2) | runs::End::Code(130))), "{end:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
