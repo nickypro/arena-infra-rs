@@ -149,16 +149,21 @@ impl Choice {
     }
 }
 
-/// Sort `choices` as the type field lists them: `default` first, then GPUs by VRAM, price and
-/// name; server types keep the catalogue's order (by family, then size: `offers hetzner`'s),
-/// which a sort by vCPUs would interleave (cx23, cpx22 and cax11 all have 2). Pure.
+/// Sort `choices` as the type field lists them: `default` first, then GPUs by VRAM — an unknown
+/// one last (the presets' newest cards, B300 and the MIG slices, have none) — price and name;
+/// server types keep the catalogue's order (by family, then size: `offers hetzner`'s), which a
+/// sort by vCPUs would interleave (cx23, cpx22 and cax11 all have 2). Pure.
 pub(crate) fn sort_choices(choices: &mut [Choice], default: &str) {
     choices.sort_by(|a, b| {
         let first = (b.id == default).cmp(&(a.id == default));
         if a.server.is_some() || b.server.is_some() {
             return first;
         }
-        first.then(a.size.cmp(&b.size)).then(a.sort_price().total_cmp(&b.sort_price())).then(a.label.cmp(&b.label))
+        first
+            .then((a.size == 0).cmp(&(b.size == 0)))
+            .then(a.size.cmp(&b.size))
+            .then(a.sort_price().total_cmp(&b.sort_price()))
+            .then(a.label.cmp(&b.label))
     });
 }
 
@@ -880,6 +885,22 @@ mod tests {
         assert_eq!(f.kind().unwrap().price("runpod", f.cloud()), "- / $8.99 /h");
         // The presets don't say where they're sold: nothing moves.
         assert_eq!(Choice::preset_gpu("NVIDIA RTX A4000").sold_on("SECURE"), None);
+    }
+
+    /// Without a catalogue (Shadeform, or before/without RunPod's) the presets stand in, the
+    /// newest cards and MIG slices among them (offers-cli's picker extras) — after the ones whose
+    /// VRAM is known, not before the 8 GB cards.
+    #[test]
+    fn the_presets_offer_b300_and_mig_slices_last() {
+        let mut f = form();
+        f.set_kinds(preset_kinds("shadeform", &defaults()), Source::Presets("x".into()));
+        let ids: Vec<&str> = f.kinds.iter().map(|k| k.id.as_str()).collect();
+        assert_eq!(ids[0], "NVIDIA RTX A4000", "the default first");
+        for extra in ["NVIDIA B300 SXM6 AC", "NVIDIA B300 SXM6 AC MIG 1g.34gb", "NVIDIA B200"] {
+            assert!(ids.contains(&extra), "{extra}: {ids:?}");
+        }
+        let first_unknown = f.kinds.iter().position(|k| k.size == 0).unwrap();
+        assert!(f.kinds[first_unknown..].iter().all(|k| k.size == 0) && first_unknown > 1, "{ids:?}");
     }
 
     #[test]

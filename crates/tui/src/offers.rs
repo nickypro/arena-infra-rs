@@ -693,6 +693,13 @@ mod tests {
             "server_type":{"name":"cx33","cores":4,"memory_gb":8.0,"eur_per_hour":0.016,"locations":["fsn1","nbg1","hel1"]}}],"skipped":[],"failed":[]}"#;
         assert_eq!(parse_plan(hz).unwrap(), ["1. cx33 · 4 vCPU · 8 GB · €0.0160/h · fsn1 → nbg1 → hel1"]);
         assert_eq!(parse_plan(r#"{"providers":[],"skipped":[],"failed":[{"provider":"runpod","why":"429 Too Many Requests"}]}"#), Err("runpod: 429 Too Many Requests".into()));
+        // Vast's options carry their host class in `cloud` since offers-cli (2.1; it was null):
+        // as `arena offers --provider vast --json --gpu "RTX 3090"` answered live, 2026-10-29.
+        let vast = r#"{"providers":[{"provider":"vast","gpu_count":1,"near":{"region":"europe","max_extra_pct":25.0},"options":[
+            {"label":"1×RTX 3090","cloud":"VERIFIED","price_per_pod":0.18777777777777777,"price_source":"live","stock":null,"near":"europe"},
+            {"label":"1×RTX 3090","cloud":"VERIFIED","price_per_pod":0.21888888888888886,"price_source":"live","stock":null}],
+            "dropped":[],"notes":[]}],"skipped":[],"failed":[]}"#;
+        assert_eq!(parse_plan(vast).unwrap(), ["1. 1×RTX 3090 VERIFIED  $0.19/h  near europe", "2. 1×RTX 3090 VERIFIED  $0.22/h  anywhere"]);
         let none = r#"{"providers":[{"provider":"runpod","options":[],"dropped":[],"notes":["no B300 on COMMUNITY"]}],"skipped":[],"failed":[]}"#;
         assert_eq!(parse_plan(none).unwrap(), ["nothing runpod would try — no B300 on COMMUNITY"]);
     }
