@@ -155,7 +155,7 @@ async fn hetzner_offer(cfg: &Config, base: &PodSpec) -> Result<(ServerType, Opti
     let Some(key) = cfg.get("HETZNER_API_KEY").filter(|k| !k.trim().is_empty()) else {
         return Ok((bare, Some(format!("no HETZNER_API_KEY — {name}'s size and price are unknown"))));
     };
-    match tokio::time::timeout(PRICE_TIMEOUT, HetznerProvider::new(key, opts).offer(base)).await {
+    match arena_core::ratelimit::bounded(PRICE_TIMEOUT, HetznerProvider::new(key, opts).offer(base)).await {
         Ok(Ok(t)) => Ok((t, None)),
         Ok(Err(arena_core::Error::Config(why))) => anyhow::bail!("create would refuse {name}: {why}"),
         Ok(Err(e)) => Ok((bare, Some(format!("couldn't read {name} from Hetzner's server types ({e}) — size and price unknown")))),
@@ -231,7 +231,7 @@ async fn catalog(cfg: &Config, provider: &'static str, flags: &Flags, server_typ
             let Some(key) = cfg.get("HETZNER_API_KEY").filter(|k| !k.trim().is_empty()) else {
                 anyhow::bail!("no HETZNER_API_KEY — Hetzner's server types can't be read");
             };
-            let mut types = match tokio::time::timeout(PRICE_TIMEOUT, HetznerProvider::new(key, opts).catalog()).await {
+            let mut types = match arena_core::ratelimit::bounded(PRICE_TIMEOUT, HetznerProvider::new(key, opts).catalog()).await {
                 Ok(read) => read.map_err(|e| anyhow::anyhow!("couldn't read the server types ({e})"))?,
                 Err(_) => anyhow::bail!("Hetzner didn't answer within {}s", PRICE_TIMEOUT.as_secs()),
             };
@@ -293,7 +293,7 @@ async fn seen_gpu_types(cfg: &Config) -> Vec<(String, Option<f64>)> {
         }
     };
     if let (Some(key), Ok(RunpodApi::V2)) = (cfg.get("RUNPOD_API_KEY").filter(|k| !k.trim().is_empty()), RunpodApi::from_config(cfg)) {
-        if let Ok(Ok(pods)) = tokio::time::timeout(PRICE_TIMEOUT, runpod_v2::fetch_pod_gpu_types(key)).await {
+        if let Ok(Ok(pods)) = arena_core::ratelimit::bounded(PRICE_TIMEOUT, runpod_v2::fetch_pod_gpu_types(key)).await {
             pods.iter().for_each(|(id, price)| add(id, *price));
         }
     }

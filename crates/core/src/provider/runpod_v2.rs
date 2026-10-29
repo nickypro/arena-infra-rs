@@ -1,6 +1,6 @@
 //! RunPod backend on the REST **v2** API (`https://api.runpod.io/v2`) — the default:
 //! `RUNPOD_API` unset, empty or `v2` (see [`super::RunpodApi`]). RunPod retires REST v1
-//! ([`super::runpod`]) on 2026-11-15; this is its replacement, live-tested on sandbox pods
+//! ([`super::runpod`]) on 2026-11-16; this is its replacement, live-tested on sandbox pods
 //! before it became the default.
 //!
 //! What differs from v1, and why the code looks the way it does:
@@ -87,7 +87,7 @@ use super::runpod::{self, loose_f64, loose_string, GpuType};
 use super::{ContainerReset, Provider};
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, ProviderErrorKind, Result};
-use crate::http::{judge, status_error};
+use crate::http::{judge, send_limited, status_error, Limits};
 use crate::pod::{Pod, PodSpec};
 
 pub(crate) const BASE: &str = "https://api.runpod.io/v2";
@@ -232,11 +232,12 @@ fn catalog_request(client: &Client, api_key: &str, cloud: &str, min_cuda: Option
     api_request(client, api_key, Method::GET, base_url("catalog/gpus")).query(&query)
 }
 
-/// Send a request and judge its response by [`crate::http`]'s rule — the status first, then
+/// Send a request through the rate-limit-aware path ([`crate::http::exchange`], RunPod's
+/// [`Limits`]) and judge its response by [`crate::http`]'s rule — the status first, then
 /// the body, and an error status's body read best-effort so the status survives a body that
 /// can't be read — with v2's own reading of error bodies ([`judge_v2`]).
 async fn send(rb: RequestBuilder, ctx: &str) -> Result<Value> {
-    let resp = rb.send().await?;
+    let resp = send_limited(rb, ctx, &Limits::RUNPOD).await?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -248,7 +249,7 @@ async fn send(rb: RequestBuilder, ctx: &str) -> Result<Value> {
 /// [`send`] for calls whose success body we don't use (stop, restart, terminate, reimage):
 /// only the status is judged, so one that worked is never reported as failed over its body.
 async fn send_ok(rb: RequestBuilder, ctx: &str) -> Result<()> {
-    let resp = rb.send().await?;
+    let resp = send_limited(rb, ctx, &Limits::RUNPOD).await?;
     let status = resp.status();
     if status.is_success() {
         return Ok(());
@@ -588,9 +589,13 @@ where
         for &i in batch {
             let id = pods[i].id.clone();
             let future = fetch(id.clone());
-            tasks.spawn(async move {
+            // The caller's rate-limit wait bound goes with the lookup (a spawned task doesn't
+            // inherit it), and the lookup's own 5 s bounds its waits, a margin left for the
+            // request: a held quota fails it as rate-limited, saying so, not as a timeout.
+            tasks.spawn(crate::ratelimit::inherit(async move {
                 let looked_up = async {
-                    let body = tokio::time::timeout(std::time::Duration::from_secs(5), future)
+                    let five = std::time::Duration::from_secs(5);
+                    let body = crate::ratelimit::bounded(five, future)
                         .await
                         .map_err(|_| Error::provider(format!("endpoint lookup for {id} timed out after 5s")))??;
                     let detail = parse_pod(&body);
@@ -600,7 +605,7 @@ where
                     Ok(detail)
                 };
                 (i, looked_up.await)
-            });
+            }));
         }
         let mut answered = HashSet::new();
         while let Some(joined) = tasks.join_next().await {
@@ -1168,7 +1173,9 @@ impl Provider for RunpodV2Provider {
         normalize_cloud(&spec.cloud_type)?;
         let keys = self.keys_to_merge(&spec.env).await?;
         let payload = create_payload(spec, &keys)?;
-        let resp = api_request(&self.client, &self.api_key, Method::POST, base_url("pods")).json(&payload).send().await?;
+        // A 429 is retried (refused before processing: nothing was made); a 5xx or a lost
+        // connection never is here — see `may_exist`.
+        let resp = send_limited(api_request(&self.client, &self.api_key, Method::POST, base_url("pods")).json(&payload), "create pod", &Limits::RUNPOD).await?;
         let status = resp.status();
         // A 2xx we can't read still means a pod (that bills) probably exists: say so, so
         // nobody "retries" into a duplicate. Such errors are `Other`, which isn't retried.
@@ -1233,7 +1240,7 @@ impl Provider for RunpodV2Provider {
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
         // REST v2, not GraphQL's `podEditName` (v1 keeps that): a name-only PATCH, which
         // leaves the running container alone (see `rename_payload`).
-        let resp = rename_request(&self.client, &self.api_key, id, new_name)?.send().await?;
+        let resp = send_limited(rename_request(&self.client, &self.api_key, id, new_name)?, "rename pod", &Limits::RUNPOD).await?;
         let status = resp.status();
         // Read best-effort: a 2xx whose body can't be read is still a rename that worked.
         let text = resp.text().await.unwrap_or_default();
@@ -1258,7 +1265,7 @@ impl Provider for RunpodV2Provider {
     }
 
     async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {
-        let resp = lock_request(&self.client, &self.api_key, id, locked)?.send().await?;
+        let resp = send_limited(lock_request(&self.client, &self.api_key, id, locked)?, "lock pod", &Limits::RUNPOD).await?;
         let status = resp.status();
         // Read best-effort: a 2xx whose body can't be read is still a lock that took.
         let text = resp.text().await.unwrap_or_default();
