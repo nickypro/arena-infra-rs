@@ -372,8 +372,10 @@ clone_plugin https://github.com/zsh-users/zsh-completions             "$ZSH_CUST
 # Which ~/.zshrc is filtered (a re-run used to copy the shared one over whatever was there,
 # dropping `copy-keys`' token exports and the participant's own lines):
 #   - one arena wrote before (its venv block, or the shared rc's MACHINE_NAME line): in place;
-#   - none, or oh-my-zsh's untouched template (a fresh VM): replaced by the shared one;
-#   - anything else: replaced too, but kept first as ~/.zshrc.pre-arena-<time>.
+#   - none, or oh-my-zsh's template byte for byte as its installer wrote it (a fresh VM):
+#     replaced by the shared one;
+#   - anything else: kept as ~/.zshrc.pre-arena-<time> first, then replaced; if it can't be
+#     kept, it's left as it is.
 ln -sf "$HOME/.arena_infra/dotfiles/.vimrc"    "$HOME/.vimrc"
 ln -sf "$HOME/.arena_infra/dotfiles/.p10k.zsh" "$HOME/.p10k.zsh"
 OLD_VENV_GUARD="if ! command -v conda >/dev/null 2>&1 && [ -f \"$VENV/bin/activate\" ]; then"
@@ -381,10 +383,10 @@ OLD_VENV_GUARD="if ! command -v conda >/dev/null 2>&1 && [ -f \"$VENV/bin/activa
 # (two setups at once never share one), renamed only once the filter succeeded. Both modes turn
 # the venv block setup wrote before (it skipped activation whenever a `conda` was on PATH, so
 # such a shell got neither env) into today's, matched by its exact text. MODE `image` also drops
-# the image's conda: an init block naming /opt/conda (which a VM doesn't have) and the shared
-# rc's unindented `conda activate arena-env`. A participant's own conda lines stay: their
-# `conda init` block, an indented activate inside their own `if` (dropping that would leave an
-# empty body, a syntax error that stops the rest of their rc).
+# the image's conda: an init block naming /opt/conda (which a VM doesn't have) and the
+# `conda activate arena-env` right after it (blank lines between). A participant's own conda
+# lines stay: their `conda init` block, an activate anywhere else (inside their own `if`,
+# dropping it would leave an empty body, a syntax error that stops the rest of their rc).
 rc_filter() {
     local tmp
     tmp=$(mktemp "$3.arena-XXXXXX") || return 1
@@ -393,11 +395,13 @@ rc_filter() {
         inblk {
             blk = blk $0 "\n"
             if (index($0, "/opt/conda")) image = 1
-            if ($0 ~ /^# <<< conda initialize <<</) { inblk = 0; if (!image) printf "%s", blk }
+            if ($0 ~ /^# <<< conda initialize <<</) { inblk = 0; if (image) after = 1; else printf "%s", blk }
             next
         }
-        mode == "image" && /^conda activate arena-env[[:space:]]*$/ { next }
-        mode == "image" && /^# export PATH="\/opt\/conda\/bin/      { next }
+        after && /^[[:space:]]*$/                       { print; next }
+        after && /^conda activate arena-env[[:space:]]*$/ { after = 0; next }
+        after                                           { after = 0 }
+        mode == "image" && /^# export PATH="\/opt\/conda\/bin/ { next }
         /^# ARENA env: no conda on CPU pods/ { print "# ARENA env: the uv venv."; next }
         $0 == guard { $0 = "if [ -f \"" venv "/bin/activate\" ]; then" }
         { print }
@@ -412,12 +416,20 @@ SHARED_ZSHRC="$HOME/.arena_infra/dotfiles/.zshrc"
 if grep -qF -e "$VENV/bin/activate" -e 'export MACHINE_NAME="${MACHINE_NAME:="root"}"' "$HOME/.zshrc" 2>/dev/null; then
     rc_filter image "$HOME/.zshrc" "$HOME/.zshrc" || echo "WARN: couldn't take conda out of ~/.zshrc"
 elif [ -f "$SHARED_ZSHRC" ]; then
-    if [ -s "$HOME/.zshrc" ] && ! { head -n 1 "$HOME/.zshrc" | grep -qxF '# If you come from bash you might have to change your $PATH.' \
-            && grep -qxF 'ZSH_THEME="robbyrussell"' "$HOME/.zshrc" && grep -qxF 'source $ZSH/oh-my-zsh.sh' "$HOME/.zshrc"; }; then
+    # oh-my-zsh's installer writes its template with `export ZSH=` pointed at the install.
+    omz_template="$HOME/.oh-my-zsh/templates/zshrc.zsh-template"
+    if [ ! -s "$HOME/.zshrc" ] || { [ -f "$omz_template" ] \
+            && sed 's|^export ZSH=.*$|export ZSH="$HOME/.oh-my-zsh"|' "$omz_template" | cmp -s - "$HOME/.zshrc"; }; then
+        rc_filter image "$SHARED_ZSHRC" "$HOME/.zshrc" || echo "WARN: couldn't write ~/.zshrc from the shared one"
+    else
         kept="$HOME/.zshrc.pre-arena-$(date +%Y%m%d-%H%M%S)"
-        cp -p "$HOME/.zshrc" "$kept" && echo "~/.zshrc wasn't arena's: kept as $kept"
+        if cp -p "$HOME/.zshrc" "$kept"; then
+            echo "~/.zshrc wasn't arena's: kept as $kept"
+            rc_filter image "$SHARED_ZSHRC" "$HOME/.zshrc" || echo "WARN: couldn't write ~/.zshrc from the shared one"
+        else
+            echo "WARN: couldn't keep ~/.zshrc aside, so it's left as it is (not the shared one)"
+        fi
     fi
-    rc_filter image "$SHARED_ZSHRC" "$HOME/.zshrc" || echo "WARN: couldn't write ~/.zshrc from the shared one"
 fi
 # .bashrc is the VM's own (never the shared one): only setup's old venv block to migrate.
 if grep -qxF "$OLD_VENV_GUARD" "$HOME/.bashrc" 2>/dev/null; then
