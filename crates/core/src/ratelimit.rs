@@ -887,10 +887,14 @@ pub(crate) fn budget(max: Duration, now: Instant) -> Duration {
     }
 }
 
-/// Whether the caller's wait bound, if it set one, has passed at `now`.
+/// Whether the caller's wait bound, if it set one, had passed at `now` — by more than a
+/// timer's slack ([`LATE`]): a wait capped at the bound wakes right on it, which is on time.
 pub(crate) fn bound_passed(now: Instant) -> bool {
-    WAIT_UNTIL.try_with(|u| now >= *u).unwrap_or(false)
+    WAIT_UNTIL.try_with(|u| now > *u + LATE).unwrap_or(false)
 }
+
+/// How late past the caller's bound a wake may come and still be on time.
+const LATE: Duration = Duration::from_millis(100);
 
 /// How much of a `limit` on a whole provider call its rate-limit waits may take: all but a
 /// quarter (at most 10 s), left for the request itself — so a wait that doesn't fit ends the
@@ -1317,6 +1321,19 @@ mod tests {
         for (limit, want) in [(s(60), s(50)), (s(20), s(15)), (s(120), s(110)), (s(4), s(3)), (Duration::ZERO, Duration::ZERO)] {
             assert_eq!(wait_budget(limit), want, "{limit:?}");
         }
+    }
+
+    /// A wake right on the bound is on time; one well past it is late.
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_on_the_bound_is_on_time() {
+        assert!(!bound_passed(Instant::now() + Duration::from_secs(9)), "no bound: never passed");
+        waits_within(Duration::from_secs(2), async {
+            let t0 = Instant::now();
+            assert!(!bound_passed(t0 + Duration::from_secs(2)));
+            assert!(!bound_passed(t0 + Duration::from_secs(2) + LATE));
+            assert!(bound_passed(t0 + Duration::from_secs(3)));
+        })
+        .await;
     }
 
     #[tokio::test]

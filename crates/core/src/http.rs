@@ -170,17 +170,19 @@ pub(crate) async fn exchange_with(rb: RequestBuilder, ctx: &str, limits: &Limits
 /// longer than the caller can wait refuses the request, not sent. A hold already waited out
 /// isn't waited twice (a sleep that ended early).
 ///
-/// A retry of a 429 (`again`) is never sent once the caller's wait bound has passed, hold or
-/// none: the caller decided to act within it (the reaper's terminate on an idle check just
-/// made), and past it the decision is the caller's again — refused, not sent.
+/// A request that waited here, or retries a 429 (`again`), is never sent once the caller's
+/// wait bound has passed, hold or none — a wake can come late: the caller decided to act
+/// within it (the reaper's terminate on an idle check just made), and past it the decision
+/// is the caller's again — refused, not sent.
 async fn admit(key: &QuotaKey, ctx: &str, limits: &Limits, sleep: Sleeper<'_>, again: bool) -> Result<Instant> {
     let mut waited: Option<Instant> = None;
     loop {
         let now = Instant::now();
-        if again && ratelimit::bound_passed(now) {
+        if (again || waited.is_some()) && ratelimit::bound_passed(now) {
+            let what = if again { "not sent again" } else { "not sent" };
             return Err(Error::Provider {
                 kind: ProviderErrorKind::RateLimited,
-                message: format!("{ctx}: not sent again — {} rate limit: the 429's wait ran past what this call waits", key.api()),
+                message: format!("{ctx}: {what} — {} rate limit: its wait ran past what this call waits", key.api()),
             });
         }
         let Some((until, why)) = ratelimit::with(key, |q| q.admit(now)) else {
@@ -732,6 +734,22 @@ mod tests {
         let srv = serve(vec![canned(429, "text/plain", "slow down").header("Retry-After", "0.1"), canned(200, "application/json", "{}")]);
         json(client().delete(format!("{}/pods/p1", srv.base)), &EXACT, &late).await.unwrap();
         assert_eq!(srv.requests.lock().unwrap().len(), 2);
+    }
+
+    /// Nor is a first send that waited out a hold and woke past the caller's bound (review
+    /// r3): the hold may be over, the caller's decision isn't fresh any more.
+    #[tokio::test]
+    async fn a_first_send_that_woke_late_is_not_sent() {
+        let srv = serve(vec![canned(200, "application/json", "{}")]);
+        let url = format!("{}/pods/p1", srv.base);
+        let key = QuotaKey::of(&client().delete(&url).build().unwrap());
+        let now = Instant::now();
+        ratelimit::with(&key, |q| q.note_throttled(now, Some(Duration::from_millis(100)), None, &[], Duration::from_secs(1), "an earlier 429".into(), now));
+        let late = |d: Duration| -> Pin<Box<dyn Future<Output = ()> + Send>> { Box::pin(tokio::time::sleep(d + Duration::from_millis(400))) };
+        let e = ratelimit::waits_within(Duration::from_millis(300), json(client().delete(&url), &EXACT, &late)).await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::RateLimited), "{e}");
+        assert!(e.to_string().contains("not sent —"), "{e}");
+        assert_eq!(srv.requests.lock().unwrap().len(), 0, "the terminate never went");
     }
 
     #[test]
