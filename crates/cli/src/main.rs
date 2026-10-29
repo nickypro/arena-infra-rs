@@ -578,6 +578,9 @@ enum ApiCmd {
         /// Don't redact secrets in the body (the API key itself never prints)
         #[arg(long)]
         raw: bool,
+        /// Print the API's rate limits for this request instead of the body
+        #[arg(long, conflicts_with = "raw")]
+        limits: bool,
     },
 }
 
@@ -2533,8 +2536,16 @@ fn placement_request(
     keep_trying: bool,
 ) -> Result<(SpecOverrides, Option<(arena_core::placement::Request, PodSpec)>)> {
     let base = spec_with_overrides(cfg, &SpecOverrides { gpu: None, cloud: None, ..ov.clone() });
-    let req =
-        arena_core::placement::Request::from_flags(ov.gpu.as_deref(), ov.cloud.as_deref(), &base, max_price, order)?;
+    let req = arena_core::placement::Request::from_flags(ov.gpu.as_deref(), ov.cloud.as_deref(), &base, max_price, order)?
+        .with_near(arena_core::near::Near::for_provider(cfg, provider_name)?, provider_name, &base);
+    // Near the proxy turns one pool into two (there, then anywhere); `--keep-trying` waits on
+    // one, so it keeps today's single path — anywhere — and says so.
+    let single = arena_core::placement::Request { near: None, ..req.clone() };
+    if keep_trying && req.near.is_some() && single.is_single() {
+        let near = req.near.map(|n| n.region.label()).unwrap_or_default();
+        eprintln!("note: --keep-trying waits on one pool, so this run doesn't try {near} first (NEAR) — --retry-mins N keeps that");
+    }
+    let req = if keep_trying && single.is_single() { single } else { req };
     if req.is_single() {
         // Only a flag that was given is replaced (an absent one keeps "what config says",
         // exactly as today); the parsed GPU is already resolved, and resolving is idempotent.
@@ -2564,7 +2575,7 @@ async fn bounded_catalog<F>(fetch: F) -> arena_core::Result<Vec<arena_core::prov
 where
     F: std::future::Future<Output = arena_core::Result<Vec<arena_core::provider::runpod::GpuType>>>,
 {
-    match tokio::time::timeout(PRICE_TIMEOUT, fetch).await {
+    match arena_core::ratelimit::bounded(PRICE_TIMEOUT, fetch).await {
         Ok(r) => r,
         Err(_) => Err(arena_core::Error::provider(format!("timed out after {}s", PRICE_TIMEOUT.as_secs()))),
     }
@@ -2665,7 +2676,7 @@ async fn checked_gpu(cfg: &Config, provider_name: &str, gpu: Option<String>) -> 
     // REST v1 only: its create validates against an OpenAPI enum that lags the catalog.
     let v1 = matches!(RunpodApi::from_config(cfg), Ok(RunpodApi::V1));
     if let (true, Some(types), Some(key)) = (v1, types, cfg.get("RUNPOD_API_KEY").filter(|k| !k.is_empty())) {
-        if let Ok(Ok(creatable)) = tokio::time::timeout(PRICE_TIMEOUT, runpod::fetch_creatable_gpu_ids(key)).await {
+        if let Ok(Ok(creatable)) = arena_core::ratelimit::bounded(PRICE_TIMEOUT, runpod::fetch_creatable_gpu_ids(key)).await {
             v1_creatable_check(&gpu, &types, &creatable)?;
         }
     }
@@ -2727,8 +2738,21 @@ async fn fetch_price_book(
         // Built as create builds it (`provider::build`), so the plan quotes only hosts create
         // would rent (verified-only unless VAST_ALLOW_UNVERIFIED).
         let vast = vast::VastProvider::from_config(cfg)?;
-        let quotes = vast.quote(&req.gpus, &spec, PRICE_TIMEOUT).await;
-        return Ok(vast::price_book(&quotes, req.gpu_count, vast.verified_only()));
+        // Near the proxy: the same search in the region's countries too, at the same time, for
+        // the near options' prices.
+        let near_spec = req.near.map(|n| PodSpec { region: Some(n.region), ..spec.clone() });
+        let near_quotes = async {
+            match &near_spec {
+                Some(s) => Some(vast.quote(&req.gpus, s, PRICE_TIMEOUT).await),
+                None => None,
+            }
+        };
+        let (quotes, near_quotes) = tokio::join!(vast.quote(&req.gpus, &spec, PRICE_TIMEOUT), near_quotes);
+        let (book, mut notes) = vast::price_book(&quotes, req.gpu_count, vast.verified_only());
+        let (Some(near), Some(near_quotes)) = (req.near, near_quotes) else { return Ok((book, notes)) };
+        let (book, more) = vast::with_near_prices(book, &near_quotes, req.gpu_count, near.region);
+        notes.extend(more);
+        return Ok((book, notes));
     }
     if provider_name == "shadeform" {
         if cfg.get("SHADEFORM_API_KEY").is_none_or(str::is_empty) {
@@ -2788,7 +2812,24 @@ async fn plan_placement(
     base: &PodSpec,
 ) -> Result<arena_core::placement::OptionPlan> {
     req.validate_for(provider_name)?;
-    let (book, notes) = fetch_price_book(cfg, provider_name, req, base).await?;
+    // Near the proxy (`NEAR`) here too, so every caller of the shared planner — `offers`
+    // included — shows the order create/up would run. No caller plans a request that left
+    // NEAR out on purpose: `--keep-trying` without a list takes the single path, which never
+    // comes here (nor does `single_request`'s quote).
+    let configured = arena_core::near::Near::for_provider(cfg, provider_name)?;
+    let req = &req.clone().with_near(configured, provider_name, base);
+    let (book, mut notes) = fetch_price_book(cfg, provider_name, req, base).await?;
+    if let (Some(n), None, "runpod") = (configured, req.near, provider_name) {
+        notes.push(if base.api_extra.as_ref().is_some_and(arena_core::near::runpod_pins_location) {
+            format!("near ({}): off — CREATE_EXTRA_JSON / --api-json already says where (data centres, a network volume or countries)", n.region.label())
+        } else {
+            format!(
+                "near ({}): RunPod's COMMUNITY cloud can't be placed by data centre (its hosts have none) — near \
+                 applies to SECURE options (--cloud community,secure; NEAR=any turns this note off)",
+                n.region.label()
+            )
+        });
+    }
     let mut plan = arena_core::placement::plan_options(req, provider_name, &book);
     plan.notes.splice(0..0, notes);
     Ok(plan)
@@ -2803,6 +2844,7 @@ fn single_request(spec: &PodSpec) -> arena_core::placement::Request {
         gpu_count: spec.gpu_count,
         max_price: None,
         order: Order::Listed,
+        near: None,
     }
 }
 
@@ -2841,7 +2883,7 @@ fn single_spec_quote<'a>(cfg: &'a Config, provider_name: &'a str, spec: &'a PodS
         }
         let req = single_request(spec);
         let fetch = fetch_price_book(cfg, provider_name, &req, spec);
-        let (book, _) = tokio::time::timeout(arena_core::balance::INLINE_TIMEOUT, fetch).await.ok()?.ok()?;
+        let (book, _) = arena_core::ratelimit::bounded(arena_core::balance::INLINE_TIMEOUT, fetch).await.ok()?.ok()?;
         Some(arena_core::placement::plan_options(&req, provider_name, &book))
     })
 }
@@ -3141,7 +3183,7 @@ async fn run() -> Result<()> {
 async fn handle_api(cmd: ApiCmd, cfg: &Config) -> Result<()> {
     use arena_core::apiget;
     match cmd {
-        ApiCmd::Get { provider, path, raw } => {
+        ApiCmd::Get { provider, path, raw, limits } => {
             let base = apiget::api_base(&provider, cfg)?;
             let url = apiget::resolve_url(base.url, &path)?;
             apiget::refuse_raw(&base, &path, raw)?;
@@ -3150,7 +3192,15 @@ async fn handle_api(cmd: ApiCmd, cfg: &Config) -> Result<()> {
                 .filter(|k| !k.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("{} isn't set (see `arena config check`)", base.key))?;
             eprintln!("GET {url} ({}{})", base.provider, if raw { ", raw" } else { ", secrets redacted" });
-            let (status, body) = apiget::get_for(&base, url, key).await?;
+            let (status, body) = apiget::get_for(&base, url.clone(), key).await?;
+            if limits {
+                // Counts only — the headers carry no secret, and the body isn't printed.
+                println!("GET {} → HTTP {status}", url.path());
+                for line in apiget::limits_report(&url) {
+                    println!("{}", apiget::scrub(&line, key));
+                }
+                return Ok(());
+            }
             let out = apiget::render_for(&base, status, &body, raw, key)?;
             if !out.is_empty() {
                 println!("{out}");
@@ -3230,7 +3280,7 @@ async fn repair_pod_keys(
     // Asked even with no key to send (it then sends nothing): the answer still says whether
     // this provider could repair at all — `NotImplemented` keeps a RunPod pod's report as is.
     let attach = provider.authorize_ssh_keys(pod, &keys);
-    match tokio::time::timeout(KEY_REPAIR_TIMEOUT, attach).await {
+    match arena_core::ratelimit::bounded(KEY_REPAIR_TIMEOUT, attach).await {
         Err(_) => {
             let after = KEY_REPAIR_TIMEOUT.as_secs();
             Err(Some(format!("re-attaching our keys via the {} API timed out after {after}s", pod.provider)))
@@ -5490,6 +5540,41 @@ fn shadeform_rows(cfg: &Config) -> (Vec<String>, Option<arena_core::Error>) {
     (out, None)
 }
 
+/// `config check`'s rows for placement near the proxy (`NEAR`, `NEAR_MAX_EXTRA_PCT`): where
+/// create/up try first and how much more they may pay for it, defaults marked — and the
+/// refusal when either can't be read (its ✗ row says why). Pure, for testing.
+fn near_rows(cfg: &Config) -> (Vec<String>, Option<arena_core::Error>) {
+    use arena_core::near::{Near, EXTRA_KEY, NEAR_KEY};
+    let set = |k: &str| cfg.get(k).is_some();
+    let mark = |k: &str| if set(k) { ("✓", "") } else { ("·", " (default)") };
+    match Near::from_config(cfg) {
+        Err(e) => {
+            let why = match &e {
+                arena_core::Error::Config(m) => m.clone(),
+                other => other.to_string(),
+            };
+            let key = if why.starts_with(EXTRA_KEY) { EXTRA_KEY } else { NEAR_KEY };
+            (vec![format!("  ✗ {key:<28} {why}")], Some(e))
+        }
+        Ok(None) => (vec![format!("  ✓ {NEAR_KEY:<28} any — off: create/up try every option anywhere, cheapest first")], None),
+        Ok(Some(n)) => {
+            let (m, d) = mark(NEAR_KEY);
+            let (m2, d2) = mark(EXTRA_KEY);
+            let label = n.region.label();
+            (
+                vec![
+                    format!("  {m} {NEAR_KEY:<28} {label}{d} — create/up try {label} first (NEAR=any: anywhere)"),
+                    format!("  {m2} {EXTRA_KEY:<28} {}{d2} — when it costs at most this much more than the cheapest option", n.margin()),
+                    "      └ RunPod: SECURE pods only (COMMUNITY hosts have no data centre); Vast: offers by country — \
+                     `arena offers` shows the order"
+                        .to_string(),
+                ],
+                None,
+            )
+        }
+    }
+}
+
 /// The `HETZNER_*` keys that shape a Hetzner create ([`hetzner_rows`]).
 const HETZNER_OPTION_KEYS: [&str; 4] = ["HETZNER_SERVER_TYPE", "HETZNER_LOCATION", "HETZNER_IMAGE", "HETZNER_SSH_KEY"];
 
@@ -5749,6 +5834,12 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
         if !ok {
             missing.push("CREATE_EXTRA_JSON (must be one JSON object)".into());
         }
+    }
+    // Whatever the selected provider: `--provider runpod|vast` reads the same keys.
+    let (lines, bad) = near_rows(cfg);
+    lines.iter().for_each(|l| println!("{l}"));
+    if let Some(e) = bad {
+        note_invalid(&mut missing, &e);
     }
 
     println!("\nSSH (backup + dashboard metrics):");
@@ -7473,7 +7564,7 @@ async fn enrich_best_effort(
     limit: std::time::Duration,
 ) -> Option<String> {
     let what = "warning: pod details incomplete (GPU/$/h/maintenance)";
-    match tokio::time::timeout(limit, provider.enrich(pods)).await {
+    match arena_core::ratelimit::bounded(limit, provider.enrich(pods)).await {
         Ok(Ok(())) => None,
         Ok(Err(e)) => Some(format!("{what}: {e}")),
         Err(_) => Some(format!("{what}: timed out after {limit:?}")),
@@ -10533,7 +10624,7 @@ async fn disk_fate(provider: &dyn Provider, pod: &arena_core::Pod) -> DiskFate {
     if !provider.restart_wipes_container_disk(pod) {
         return DiskFate::Kept;
     }
-    let spec = tokio::time::timeout(arena_core::provider::LIST_TIMEOUT, provider.pod_spec(&pod.id)).await;
+    let spec = arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, provider.pod_spec(&pod.id)).await;
     DiskFate::Wiped { volume_gb: match spec {
         Ok(Ok(s)) => Some(s.volume_gb),
         _ => None,
@@ -10555,7 +10646,7 @@ async fn restart_fate(provider: &dyn Provider, pod: &arena_core::Pod) -> DiskFat
 /// rebuilt), so only a persistent volume survives — whatever `restart_wipes_container_disk`
 /// says about a restart. The volume is read from the pod's spec (bounded; unknown = none).
 async fn reimage_fate(provider: &dyn Provider, pod: &arena_core::Pod) -> DiskFate {
-    let spec = tokio::time::timeout(arena_core::provider::LIST_TIMEOUT, provider.pod_spec(&pod.id)).await;
+    let spec = arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, provider.pod_spec(&pod.id)).await;
     DiskFate::Wiped { volume_gb: match spec {
         Ok(Ok(s)) => Some(s.volume_gb),
         _ => None,
@@ -11508,7 +11599,7 @@ async fn build_replacement_spec(
 async fn source_gpu_from_listing(cfg: &Config, owner: &dyn Provider, src: &arena_core::Pod) -> Option<String> {
     let mut pods = vec![src.clone()];
     if pods[0].gpu_type.is_none() {
-        let _ = tokio::time::timeout(ENRICH_TIMEOUT, owner.enrich(&mut pods)).await;
+        let _ = arena_core::ratelimit::bounded(ENRICH_TIMEOUT, owner.enrich(&mut pods)).await;
     }
     let shown = pods.into_iter().next()?.gpu_type?;
     let catalog = if owner.name() == "runpod" { live_gpu_catalog(cfg).await } else { Err(format!("{} has no catalog", owner.name())) };
@@ -11575,7 +11666,8 @@ async fn plan_replacement(
     if ov.cloud.is_some() {
         notes.retain(|n| !n.starts_with("tier "));
     }
-    let req = Request::from_flags(gpu.as_deref(), ov.cloud.as_deref(), &base, place.max_price, place.order)?;
+    let req = Request::from_flags(gpu.as_deref(), ov.cloud.as_deref(), &base, place.max_price, place.order)?
+        .with_near(arena_core::near::Near::for_provider(cfg, owner.name())?, owner.name(), &base);
     if owner.name() != "hetzner" && req.gpus.iter().any(|g| g.trim().is_empty()) {
         anyhow::bail!(
             "couldn't determine a GPU type for the replacement (the API doesn't report it and \
@@ -11758,12 +11850,12 @@ async fn rekey_promoted(remote: Arc<dyn Remote>, cfg: &Config, owner: &dyn Provi
 /// bounded): a host going into maintenance stops its pods — on RunPod that wipes the
 /// container disk — so a replacement landing on one is no replacement (live finding #28).
 async fn maintenance_window(owner: &dyn Provider, id: &str) -> Option<String> {
-    let pods = tokio::time::timeout(arena_core::provider::LIST_TIMEOUT, owner.list_pods()).await.ok()?.ok()?;
+    let pods = arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, owner.list_pods()).await.ok()?.ok()?;
     let mut mine: Vec<arena_core::Pod> = pods.into_iter().filter(|p| p.id == id).collect();
     if mine.is_empty() {
         return None;
     }
-    let _ = tokio::time::timeout(ENRICH_TIMEOUT, owner.enrich(&mut mine)).await;
+    let _ = arena_core::ratelimit::bounded(ENRICH_TIMEOUT, owner.enrich(&mut mine)).await;
     let label = arena_core::fleet::maintenance_label(mine[0].maintenance.as_ref());
     (label != "-").then_some(label)
 }
@@ -12447,7 +12539,7 @@ async fn migrate_finish_on(
     let proxied = proxied_name(cfg, canonical);
     let locked = arena_core::lock::refusal("terminate", &[old], "");
     let stopped = if arena_core::status::is_stopped(&old.status) && !discard_stopped {
-        let spec = tokio::time::timeout(arena_core::provider::LIST_TIMEOUT, owner.pod_spec(&old.id)).await;
+        let spec = arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, owner.pod_spec(&old.id)).await;
         let volume = match spec {
             Ok(Ok(s)) => Some(s.volume_gb),
             _ => None,
@@ -13733,7 +13825,7 @@ async fn refresh_missing_endpoints(provider: &dyn Provider, sel: &mut Selected, 
     }
     eprintln!("{} listed running without an SSH endpoint — asking again in {}s…", names.join(", "), wait.as_secs());
     tokio::time::sleep(wait).await;
-    let Ok(Ok(fresh)) = tokio::time::timeout(arena_core::provider::LIST_TIMEOUT, provider.list_pods()).await else {
+    let Ok(Ok(fresh)) = arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, provider.list_pods()).await else {
         return;
     };
     for pod in sel.pods.iter_mut().filter(|p| missing(p)) {
@@ -16772,6 +16864,7 @@ mod replacement_spec_tests {
             avoid_machines: Vec::new(),
             server_type: None,
             vm_image: None,
+            region: None,
         }
     }
 
@@ -16971,9 +17064,13 @@ mod replacement_spec_tests {
             .await
             .unwrap();
         assert_eq!((one.plan.options.len(), one.is_placement()), (1, false));
-        // A list on the cloud too: gpu × cloud, as `up` expands it.
+        // A list on the cloud too: gpu × cloud, as `up` expands it — with NEAR on (the
+        // default), SECURE tried in Europe just before anywhere (as listed); off, as before.
         let ov = SpecOverrides { gpu: Some("3070".into()), cloud: Some("community,secure".into()), ..Default::default() };
         let rep = plan_replacement(&cfg(""), &owner, &src(), &ov, &place).await.unwrap();
+        let tiers: Vec<(Option<&str>, bool)> = rep.plan.options.iter().map(|o| (o.cloud.as_deref(), o.near.is_some())).collect();
+        assert_eq!(tiers, [(Some("COMMUNITY"), false), (Some("SECURE"), true), (Some("SECURE"), false)]);
+        let rep = plan_replacement(&cfg("NEAR=any\n"), &owner, &src(), &ov, &place).await.unwrap();
         let tiers: Vec<Option<&str>> = rep.plan.options.iter().map(|o| o.cloud.as_deref()).collect();
         assert_eq!(tiers, [Some("COMMUNITY"), Some("SECURE")]);
     }
@@ -18560,7 +18657,7 @@ mod tests {
         for text in ["RUNPOD_API=v1", "RUNPOD_API=\"V1\""] {
             let row = runpod_api_row(&Config::parse(text));
             let want = format!(
-                "  ⚠ {key} v1 (rest.runpod.io/v1) — RunPod retires REST v1 on 2026-11-15; remove RUNPOD_API=v1 (v2 is the default)"
+                "  ⚠ {key} v1 (rest.runpod.io/v1) — RunPod retires REST v1 on 2026-11-16; remove RUNPOD_API=v1 (v2 is the default)"
             );
             assert_eq!(row, (want, true), "{text:?}: a warning, not a failure");
         }
@@ -18588,7 +18685,7 @@ mod tests {
         let (report, missing) = config_report(&Config::parse(&format!("{base}RUNPOD_API=v1\n")), "runpod");
         assert!(
             row(&report).starts_with("⚠ RUNPOD_API")
-                && row(&report).ends_with(" v1 (rest.runpod.io/v1) — RunPod retires REST v1 on 2026-11-15; remove RUNPOD_API=v1 (v2 is the default)"),
+                && row(&report).ends_with(" v1 (rest.runpod.io/v1) — RunPod retires REST v1 on 2026-11-16; remove RUNPOD_API=v1 (v2 is the default)"),
             "{report}"
         );
         assert!(report.contains("✗ host CUDA") && report.contains("can't ask for it"), "{report}");
@@ -18663,8 +18760,13 @@ ASK_CODEX_MODEL=-x
         let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
                     HETZNER_API_KEY=not-a-real-key\nGPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\n";
         // (what's added to the base, the keys the check must fail on)
-        let cases: [(&str, &[&str]); 34] = [
+        let cases: [(&str, &[&str]); 38] = [
             ("", &[]),
+            // Placement near the proxy: off is valid, a region or margin it can't read isn't.
+            ("NEAR=any\nNEAR_MAX_EXTRA_PCT=junk", &[]),
+            ("NEAR=asia", &["NEAR"]),
+            ("NEAR_MAX_EXTRA_PCT=-5", &["NEAR_MAX_EXTRA_PCT"]),
+            ("NEAR=north-america\nNEAR_MAX_EXTRA_PCT=40%", &[]),
             ("OPENROUTER_WORKSPACE=a/b", &["OPENROUTER_WORKSPACE"]),
             ("OPENROUTER_WORKSPACE=arena-dev-test", &[]),
             ("ASK_AI=gpt", &["ASK_AI"]),
@@ -18878,6 +18980,34 @@ ASK_CODEX_MODEL=-x
         // What v1 can't express keeps its own wording.
         let (_, ok) = cuda_rows(&Config::parse("MIN_CUDA_VERSION=13.1"), true);
         assert_eq!(ok, Err("a host CUDA constraint RunPod v1 can express, or remove RUNPOD_API=v1 (v2 is the default)".to_string()));
+    }
+
+    /// `config check` says where create/up try first and how much more they may pay for it —
+    /// defaults marked, since prod's config has neither key — or that it's off.
+    #[test]
+    fn config_check_near_rows() {
+        use super::Config;
+        let rows = |text: &str| super::near_rows(&Config::parse(text));
+        let (lines, bad) = rows("");
+        assert!(bad.is_none());
+        assert_eq!(lines[0], "  · NEAR                         Europe (default) — create/up try Europe first (NEAR=any: anywhere)");
+        assert_eq!(
+            lines[1],
+            "  · NEAR_MAX_EXTRA_PCT           25% (default) — when it costs at most this much more than the cheapest option"
+        );
+        assert!(lines[2].contains("RunPod: SECURE pods only (COMMUNITY hosts have no data centre)"), "{lines:?}");
+        let (lines, _) = rows("NEAR=europe\nNEAR_MAX_EXTRA_PCT=12.5");
+        assert!(lines[0].starts_with("  ✓ NEAR                         Europe —") && lines[1].starts_with("  ✓ NEAR_MAX_EXTRA_PCT           12.5% —"), "{lines:?}");
+        let (lines, bad) = rows("NEAR=");
+        assert_eq!((lines.len(), bad.is_none()), (1, true));
+        assert!(lines[0].contains("any — off"), "{lines:?}");
+        let (lines, bad) = rows("NEAR_MAX_EXTRA_PCT=lots");
+        assert!(lines[0].starts_with("  ✗ NEAR_MAX_EXTRA_PCT ") && bad.is_some(), "{lines:?}");
+        let (lines, _) = rows("NEAR=mars");
+        assert!(lines[0].starts_with("  ✗ NEAR ") && lines[0].contains("expected europe, north-america, or any"), "{lines:?}");
+        // In the report whatever provider is selected.
+        let (report, _) = super::config_report(&Config::parse("NEAR=any"), "hetzner");
+        assert!(report.contains("NEAR                         any — off"), "{report}");
     }
 
     /// `config check` shows CREATE_EXTRA_JSON's keys (never its values) and fails a value
@@ -22269,10 +22399,21 @@ mod placement_cli_tests {
             placement_request(&cfg(), "runpod", o.clone(), cap, Order::Cheapest, kt).map(|(_, placing)| placing)
         };
         // Today's flags (or none) stay on the single-spec path — `--keep-trying` included.
-        for o in [ov(None, None), ov(Some("3090"), None), ov(Some("A4000"), Some("secure"))] {
+        // (Community: near the proxy has nothing to pin there.)
+        for o in [ov(None, None), ov(Some("3090"), None), ov(Some("A4000"), Some("community"))] {
             assert!(route(&o, None, false).unwrap().is_none(), "{o:?}");
             assert!(route(&o, None, true).unwrap().is_none(), "{o:?}");
         }
+        // One SECURE option with NEAR on (the default) is two to try — Europe, then anywhere —
+        // unless `--keep-trying`, which waits on one pool: the single path, anywhere.
+        let secure = ov(Some("A4000"), Some("secure"));
+        let (req, _) = route(&secure, None, false).unwrap().expect("placement");
+        assert_eq!(req.near.map(|n| n.region), Some(arena_core::near::Region::Europe));
+        assert!(route(&secure, None, true).unwrap().is_none());
+        let off = Config::parse("GPU_TYPE=\"NVIDIA RTX A4000\"\nCLOUD_TYPE=COMMUNITY\nNEAR=any\n");
+        assert!(placement_request(&off, "runpod", secure.clone(), None, Order::Cheapest, false).unwrap().1.is_none(), "NEAR=any");
+        let bad = Config::parse("NEAR=mars\n");
+        assert!(placement_request(&bad, "runpod", secure, None, Order::Cheapest, false).is_err(), "refused before anything");
         let (req, base) = route(&ov(Some("A4000,3090"), None), None, false).unwrap().unwrap();
         assert_eq!(req.gpus, ["NVIDIA RTX A4000", "NVIDIA GeForce RTX 3090"]);
         assert_eq!((base.gpu_type.as_str(), base.cloud_type.as_str()), ("NVIDIA RTX A4000", "COMMUNITY"));
@@ -22288,6 +22429,8 @@ mod placement_cli_tests {
     fn a_list_that_collapses_to_one_option_creates_that_option_not_the_raw_string() {
         // Review fix: duplicates / stray commas parse to one option, so the single path runs —
         // and it must create the parsed option, not the raw flag text as a GPU id / tier.
+        // (NEAR=any: near the proxy would make a SECURE option two — Europe, then anywhere.)
+        let cfg = || Config::parse("MACHINE_NAME_PREFIX=arena8\nGPU_TYPE=\"NVIDIA RTX A4000\"\nCLOUD_TYPE=COMMUNITY\nNEAR=any\n");
         let single = |gpu: Option<&str>, cloud: Option<&str>| {
             let o = SpecOverrides { gpu: gpu.map(String::from), cloud: cloud.map(String::from), ..Default::default() };
             let (ov, placing) = placement_request(&cfg(), "runpod", o, None, Order::Cheapest, false).unwrap();
@@ -22845,6 +22988,31 @@ mod placement_cli_tests {
         let vast = plan_placement(&cfg(), "vast", &req, &base).await.unwrap();
         assert!(vast.options.is_empty() && vast.dropped.len() == 2, "{vast:?}");
         assert_eq!(vast.notes[0], "no VAST_API_KEY — vast options are unpriced (--max-price can't check them)");
+    }
+
+    /// The shared planner applies NEAR itself, so `offers` (whatever shape it takes) shows the
+    /// order create/up run: SECURE options in Europe first; a community-only plan says why
+    /// nothing is near; `NEAR=any` plans as before.
+    #[tokio::test]
+    async fn the_shared_planner_puts_near_options_first() {
+        use arena_core::near::Region;
+        let base = spec_with_overrides(&cfg(), &SpecOverrides::default());
+        let req = |cloud: &str| arena_core::placement::Request::from_flags(Some("A4000"), Some(cloud), &base, None, Order::Cheapest).unwrap();
+        let plan = plan_placement(&cfg(), "runpod", &req("secure"), &base).await.unwrap();
+        let near: Vec<Option<Region>> = plan.options.iter().map(|o| o.near).collect();
+        assert_eq!(near, [Some(Region::Europe), None], "{plan:?}");
+        assert!(arena_core::placement::render_plan(&plan).contains("WHERE"));
+        let community = plan_placement(&cfg(), "runpod", &req("community"), &base).await.unwrap();
+        assert_eq!(community.options.len(), 1);
+        assert!(community.notes.iter().any(|n| n.starts_with("near (Europe): RunPod's COMMUNITY cloud can't be placed by data centre")), "{:?}", community.notes);
+        let off = Config::parse("MACHINE_NAME_PREFIX=arena8\nGPU_TYPE=\"NVIDIA RTX A4000\"\nNEAR=any\n");
+        let plain = plan_placement(&off, "runpod", &req("secure"), &base).await.unwrap();
+        assert!(plain.near.is_none() && plain.options.len() == 1 && !plain.notes.iter().any(|n| n.contains("near")), "{plain:?}");
+        // The operator's own data-centre pin: no near option, and a note says so.
+        let pinned = PodSpec { api_extra: serde_json::json!({"dataCenterIds": ["US-TX-3"]}).as_object().cloned(), ..base.clone() };
+        let own = plan_placement(&cfg(), "runpod", &req("secure"), &pinned).await.unwrap();
+        assert_eq!(own.options.len(), 1);
+        assert!(own.notes.iter().any(|n| n.starts_with("near (Europe): off — CREATE_EXTRA_JSON / --api-json already says where")), "{:?}", own.notes);
     }
 
     #[test]
@@ -28227,7 +28395,7 @@ mod lifecycle_tests {
 
     /// Live R (2026-10-09): a RunPod v1 restart kept the container disk (marker files and
     /// `/.dockerenv` survived), while the output said "the restart reset them to the image".
-    /// v1 stays gated (cheap safety; v1 retires 2026-11-15) and is set up again in case — but
+    /// v1 stays gated (cheap safety; v1 retires 2026-11-16) and is set up again in case — but
     /// nothing says a reset happened. v2's restart, which does reset, still says so.
     #[tokio::test]
     async fn a_restart_not_known_to_reset_is_gated_and_set_up_again_but_never_said_to_reset() {
@@ -30108,7 +30276,7 @@ mod passthrough_tests {
     /// an unknown provider and a missing key are refused, and the flags parse.
     #[tokio::test]
     async fn api_get_refuses_before_any_request() {
-        let get = |provider: &str, path: &str| ApiCmd::Get { provider: provider.into(), path: path.into(), raw: false };
+        let get = |provider: &str, path: &str| ApiCmd::Get { provider: provider.into(), path: path.into(), raw: false, limits: false };
         let no_key = cfg("");
         // (provider, path, the error)
         for (provider, path, want) in [
@@ -30126,9 +30294,16 @@ mod passthrough_tests {
         let e = handle_api(get("runpod", "http://api.runpod.io/v2/pods"), &with_key).await.unwrap_err().to_string();
         assert!(e.contains("absolute URLs are refused") && !e.contains("rpa_"), "{e}");
         match Cli::try_parse_from(["arena", "api", "get", "runpod-v2", "pods?limit=5", "--raw"]).unwrap().cmd {
-            Cmd::Api(ApiCmd::Get { provider, path, raw }) => assert_eq!((provider.as_str(), path.as_str(), raw), ("runpod-v2", "pods?limit=5", true)),
+            Cmd::Api(ApiCmd::Get { provider, path, raw, limits }) => {
+                assert_eq!((provider.as_str(), path.as_str(), raw, limits), ("runpod-v2", "pods?limit=5", true, false))
+            }
             _ => panic!("not api get"),
         }
+        match Cli::try_parse_from(["arena", "api", "get", "runpod", "pods", "--limits"]).unwrap().cmd {
+            Cmd::Api(ApiCmd::Get { raw, limits, .. }) => assert_eq!((raw, limits), (false, true)),
+            _ => panic!("not api get"),
+        }
+        assert!(Cli::try_parse_from(["arena", "api", "get", "runpod", "pods", "--limits", "--raw"]).is_err(), "--limits prints no body");
         // GET is the only verb: there is nothing else to parse.
         assert!(Cli::try_parse_from(["arena", "api", "post", "runpod", "pods"]).is_err());
         assert!(Cli::try_parse_from(["arena", "api", "get", "runpod", "pods", "--method", "DELETE"]).is_err());

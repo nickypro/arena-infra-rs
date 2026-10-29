@@ -324,6 +324,7 @@ impl Root {
         w("root/.ssh/known_hosts", "github.com ssh-ed25519 AAAAGITHUB\n");
         w("root/.bashrc", &format!("alias ll='ls -l'\nexport HF_TOKEN=\"{}\"\nexport PATH=$PATH:/x\n  export OPENROUTER_API_KEY=\"{}\"\n", hf(), or_key()));
         w("root/.zshrc", &format!("source ~/.p10k.zsh\nexport CLAUDE_CODE_OAUTH_TOKEN=\"{}\"\n", cc()));
+        w("root/.zshrc.pre-arena-20261029T1200", &format!("export HF_TOKEN=\"{}\"\nalias x=y\n", hf()));
         w("root/.claude.json", "{\"hasCompletedOnboarding\":true}\n");
         w("root/.codex/auth.json", "{}\n");
         w("root/.codex/config.toml", "model = \"x\"\n");
@@ -488,6 +489,7 @@ fn the_scrub_leaves_nothing_of_the_bake_vm_and_its_scan_is_clean() {
     }
     assert_eq!(r.read("root/.bashrc"), "alias ll='ls -l'\nexport PATH=$PATH:/x\n", "only the token exports go");
     assert_eq!(r.read("root/.zshrc"), "source ~/.p10k.zsh\n");
+    assert_eq!(r.read("root/.zshrc.pre-arena-20261029T1200"), "alias x=y\n", "setup's saved copy too");
     assert_eq!(r.read("etc/fstab"), "UUID=abc / ext4 defaults 0 1\n", "only the swap line goes");
     assert_eq!(r.read("etc/machine-id"), "", "emptied, not deleted");
     assert_eq!(r.read("var/log/syslog"), "", "logs emptied");

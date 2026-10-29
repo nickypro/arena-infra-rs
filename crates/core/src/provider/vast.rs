@@ -56,7 +56,7 @@ use crate::apiextra::{self, managed, Extra, Managed};
 use crate::config::Config;
 use crate::error::{Error, ProviderErrorKind, Result};
 use crate::fleet::fmt_money;
-use crate::http::{send_json, send_json_retrying_429, send_ok, status_error};
+use crate::http::{send_json, send_ok, status_error};
 use crate::placement::{milli, PriceBook};
 use crate::pod::{Pod, PodSpec};
 use crate::retry::{retrying, RetryPolicy};
@@ -103,10 +103,6 @@ const KEY_ATTACH_BUDGET: Duration = Duration::from_secs(60);
 /// harmless) instead of waited on. Never on the rent: there a timeout would leave unknown
 /// whether the offer was rented.
 const ATTACH_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// The longest wait for the one retry of a throttled listing: Vast's `retry_after` above this
-/// isn't waited for (well inside the listing's bound, `provider::LIST_TIMEOUT`).
-const LIST_429_WAIT: Duration = Duration::from_secs(2);
 
 pub struct VastProvider {
     api_key: String,
@@ -198,7 +194,7 @@ impl VastProvider {
             if !cache.contains_key(&key) {
                 // The plan prices what an uncapped search finds; the cap is the plan's to apply.
                 let spec = PodSpec { gpu_type: gpu.clone(), max_price: None, ..base.clone() };
-                let got = match tokio::time::timeout(limit, self.cheapest_offer(&spec)).await {
+                let got = match crate::ratelimit::bounded(limit, self.cheapest_offer(&spec)).await {
                     Ok(Ok(offer)) => Ok(offer),
                     Ok(Err(e)) => Err(e.to_string()),
                     Err(_) => Err(format!("timed out after {}s", limit.as_secs())),
@@ -284,6 +280,9 @@ pub struct Offer {
     /// `--max-price` is checked against.
     pub price: f64,
     pub cuda_max_good: Option<f64>,
+    /// Where the host is, as Vast says it (`Czechia, CZ`): a near create's filter
+    /// ([`PodSpec::region`]) and the new pod's [`Pod::location`].
+    pub geolocation: Option<String>,
 }
 
 /// Vast's display name for a GPU type — what its search's `gpu_name` matches, exactly.
@@ -390,6 +389,12 @@ fn search_body(spec: &PodSpec, verified_only: bool) -> Value {
     if let Some(cap) = spec.max_price {
         q["dph_total"] = json!({ "lte": cap });
     }
+    // Near the proxy: only offers in the region's countries — matched on `geolocation`'s
+    // country code (live 2026-10-28: `{"in": ["ES", "DE"]}` found exactly the Spanish and
+    // German A4000s), so the search's cheapest 64 are all near ones.
+    if let Some(r) = spec.region {
+        q["geolocation"] = json!({ "in": r.countries() });
+    }
     json!({ "q": q })
 }
 
@@ -432,6 +437,7 @@ fn fitting_offer(v: &Value, spec: &PodSpec, verified_only: bool) -> Option<Offer
         disk_space: v.get("disk_space").and_then(Value::as_f64)?,
         price: offer_price(dph_total, money("dph_base")?, money("storage_cost")?, spec.disk_gb),
         cuda_max_good: v.get("cuda_max_good").and_then(Value::as_f64),
+        geolocation: v.get("geolocation").and_then(Value::as_str).map(str::trim).filter(|g| !g.is_empty()).map(String::from),
     };
     let flag = |k: &str| v.get(k).and_then(Value::as_bool);
     let verified = v.get("verification").and_then(Value::as_str).is_some_and(|s| s.trim().eq_ignore_ascii_case("verified"));
@@ -445,7 +451,8 @@ fn fitting_offer(v: &Value, spec: &PodSpec, verified_only: bool) -> Option<Offer
         && v.get("direct_port_count").and_then(Value::as_u64) != Some(0)
         && cuda_floor(spec).is_none_or(|floor| offer.cuda_max_good.is_some_and(|c| c + 1e-9 >= floor))
         && spec.max_price.is_none_or(|cap| milli(offer.price) <= milli(cap))
-        && machine_of(v).is_none_or(|m| !spec.avoid_machines.contains(&m));
+        && machine_of(v).is_none_or(|m| !spec.avoid_machines.contains(&m))
+        && spec.region.is_none_or(|r| offer.geolocation.as_deref().and_then(crate::near::vast_country).is_some_and(|cc| r.has_country(&cc)));
     fits.then_some(offer)
 }
 
@@ -481,6 +488,31 @@ pub fn price_book(quotes: &[(String, OfferQuote)], gpu_count: u32, verified_only
         }
     }
     (PriceBook::offers(prices, gpu_count), notes)
+}
+
+/// Placement's near prices ([`PriceBook::with_near_offers`]): `near` is [`VastProvider::quote`]
+/// over a spec with the region set ([`PodSpec::region`]: the search filters on the region's
+/// countries). A GPU with no near offer just has no near option (the plan says so); a search
+/// that failed is said here. Pure.
+pub fn with_near_prices(book: PriceBook, near: &[(String, OfferQuote)], gpu_count: u32, region: crate::near::Region) -> (PriceBook, Vec<String>) {
+    let mut prices = Vec::new();
+    let mut notes = Vec::new();
+    let mut failed = Vec::new();
+    for (gpu, quote) in near {
+        match quote {
+            Ok(Some(offer)) => prices.push((gpu.clone(), offer.price)),
+            Ok(None) => {}
+            Err(e) => notes.push(format!(
+                "vast: searching {} for {gpu_count}×{} failed ({e}) — tried anywhere only",
+                region.label(),
+                vast_gpu_name(gpu)
+            )),
+        }
+        if quote.is_err() {
+            failed.push(gpu.clone());
+        }
+    }
+    (book.with_near_offers(prices, gpu_count).with_near_failed(failed), notes)
 }
 
 /// The cohort's public keys from the spec: `PUBLIC_KEY` holds them newline-joined (see
@@ -799,6 +831,7 @@ fn parse_instance(v: &Value) -> Pod {
         started_at: None,
         identity: None,
         status_detail: None,
+        location: v.get("geolocation").and_then(Value::as_str).map(str::trim).filter(|g| !g.is_empty()).map(String::from),
     }
 }
 
@@ -834,8 +867,9 @@ impl Provider for VastProvider {
         // `--bootstrap` brings up sshd on an image without one; Vast's launcher does that.
         let bootstrap = if spec.docker_args.is_some() { " (--bootstrap not needed: ignored)" } else { "" };
         let hosts = if self.verified_only { "a verified host" } else { "any host, unverified included" };
+        let near = spec.region.map(|r| format!(" in {}", r.label())).unwrap_or_default();
         format!(
-            "cheapest rentable {}×{} offer on {hosts} (disk ≥ {}GB{cuda}{cap}), image {}; SSH by Vast's launcher \
+            "cheapest rentable {}×{} offer{near} on {hosts} (disk ≥ {}GB{cuda}{cap}), image {}; SSH by Vast's launcher \
              (direct port; it replaces the image's entrypoint{bootstrap}), cohort keys attached to the instance",
             spec.gpu_count,
             vast_gpu_name(&spec.gpu_type),
@@ -844,12 +878,12 @@ impl Provider for VastProvider {
         )
     }
 
-    /// A throttled listing (429) is retried once, after what Vast asks for when that is at
-    /// most [`LIST_429_WAIT`] ([`crate::http::send_json_retrying_429`]) — live, one 429 made
-    /// an idle Vast account read `unknown`.
+    /// A throttled listing (429) is waited out and retried by the shared request path
+    /// ([`crate::http::exchange`]: Vast's own `retry_after`, within the caller's bound — a
+    /// dashboard's is short) — live, one 429 made an idle Vast account read `unknown`.
     async fn list_pods(&self) -> Result<Vec<Pod>> {
         let url = format!("{}/instances/", self.base);
-        let body = send_json_retrying_429(|| self.auth(self.client.get(&url)), "vast list", LIST_429_WAIT).await?;
+        let body = send_json(self.auth(self.client.get(&url)), "vast list").await?;
         Ok(instances_array(&body)?.iter().map(parse_instance).collect())
     }
 
@@ -879,7 +913,7 @@ impl Provider for VastProvider {
                 }
                 Err(e) => return Err(e),
             };
-            let _ = tokio::time::timeout(self.attach_budget, self.attach_keys(&id, &keys)).await;
+            let _ = crate::ratelimit::bounded(self.attach_budget, self.attach_keys(&id, &keys)).await;
             // Vast doesn't echo the instance, so the Pod is synthesized from the offer.
             return Ok(Pod {
                 id,
@@ -902,6 +936,7 @@ impl Provider for VastProvider {
                 started_at: None,
                 identity: None,
                 status_detail: None,
+                location: offer.geolocation.clone(),
             });
         }
         Err(gone.unwrap_or_else(|| {
@@ -912,8 +947,9 @@ impl Provider for VastProvider {
                 0 => String::new(),
                 n => format!("; skipping {n} machine(s) `up --check` remembers as bad"),
             };
+            let near = spec.region.map(|r| format!(", in {}", r.label())).unwrap_or_default();
             Error::capacity(format!(
-                "vast: no rentable offer matching {}×{} (disk ≥ {}GB{cap}{hosts}{avoided})",
+                "vast: no rentable offer matching {}×{} (disk ≥ {}GB{cap}{near}{hosts}{avoided})",
                 spec.gpu_count,
                 vast_gpu_name(&spec.gpu_type),
                 spec.disk_gb
@@ -1016,6 +1052,7 @@ mod tests {
             avoid_machines: Vec::new(),
             server_type: None,
             vm_image: None,
+            region: None,
         }
     }
 
@@ -1040,26 +1077,26 @@ mod tests {
     /// body". Against a loopback server, through the real request path.
     #[tokio::test]
     async fn error_statuses_are_classified_before_decoding() {
-        let srv = serve(vec![
-            canned(401, "text/html", "<html>401 Unauthorized</html>"),
-            canned(429, "text/plain", "Too Many Requests"),
-            canned(403, "text/plain", "Forbidden"),
-        ]);
+        let srv = serve(vec![canned(401, "text/html", "<html>401 Unauthorized</html>"), canned(403, "text/plain", "Forbidden")]);
         let p = provider(&srv.base);
         let e = p.list_pods().await.unwrap_err();
         assert_eq!(e.kind(), Some(K::Auth), "{e}");
         assert!(e.to_string().contains("vast list HTTP 401"), "{e}");
-        let e = p.cheapest_offer(&spec("NVIDIA RTX A4000", 1, 50)).await.unwrap_err();
-        assert_eq!(e.kind(), Some(K::RateLimited), "the offer search: {e}");
         let e = p.terminate_pod("7").await.unwrap_err();
         assert_eq!(e.kind(), Some(K::Auth), "{e}");
+        // A 429 its caller can't wait out (no time to spare here): rate-limited, at once.
+        let srv = serve(vec![canned(429, "text/plain", "Too Many Requests")]);
+        let search = provider(&srv.base);
+        let e = crate::ratelimit::waits_within(Duration::ZERO, search.cheapest_offer(&spec("NVIDIA RTX A4000", 1, 50))).await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::RateLimited), "the offer search: {e}");
     }
 
-    /// Live: one 429 on the listing made an idle Vast account read `unknown`. A 429 that asks
-    /// for at most two seconds (or nothing) is retried once; Vast's own `retry_after: 12` isn't
-    /// waited for.
+    /// Live: one 429 on the listing made an idle Vast account read `unknown`. A 429 is waited
+    /// out — Vast's own `retry_after` — and retried ([`crate::http::exchange`]); one asking for
+    /// longer than the caller can wait (a dashboard's 2 s against Vast's live `retry_after:
+    /// 12`) isn't, and says how long.
     #[tokio::test]
-    async fn a_throttled_listing_is_retried_once() {
+    async fn a_throttled_listing_is_waited_out_within_the_callers_bound() {
         let srv = serve(vec![
             canned(429, "application/json", r#"{"detail": "API requests too frequent", "retry_after": 0}"#),
             canned(200, "application/json", r#"{"instances": [{"id": 7, "label": "devtest-apple", "actual_status": "running"}]}"#),
@@ -1070,8 +1107,9 @@ mod tests {
             canned(429, "application/json", r#"{"detail": "API requests too frequent", "limit": 3.0, "retry_after": 12}"#),
             canned(200, "application/json", r#"{"instances": []}"#),
         ]);
-        let e = provider(&srv.base).list_pods().await.unwrap_err();
+        let e = crate::ratelimit::waits_within(Duration::from_secs(2), provider(&srv.base).list_pods()).await.unwrap_err();
         assert_eq!((e.kind(), srv.requests.lock().unwrap().len()), (Some(K::RateLimited), 1), "{e}");
+        assert!(e.to_string().contains("next request in 12 s"), "{e}");
     }
 
     #[test]
@@ -1512,6 +1550,74 @@ mod tests {
         assert_eq!(notes[1], "vast: no rentable 1×RTX A4000 offer right now — unpriced");
         assert_eq!(notes[2], "vast: searching for 1×RTX 4000Ada failed (vast search HTTP 500) — unpriced");
         assert!(price_book(&quotes, 1, false).1[0].contains("unverified hosts included"));
+    }
+
+    /// Near the proxy: the search asks only for the region's countries (`geolocation in`), and
+    /// every offer is checked against them again — the recording has India, the US and
+    /// Czechia, and only Czechia is in Europe.
+    #[test]
+    fn a_near_search_and_its_offers_stay_in_the_region() {
+        use crate::near::Region;
+        let s = spec(R3090, 1, 50);
+        assert!(search_body(&s, true)["q"].get("geolocation").is_none(), "anywhere: no filter");
+        let eu = PodSpec { region: Some(Region::Europe), ..s.clone() };
+        let q = search_body(&eu, true);
+        let codes: Vec<&str> = q["q"]["geolocation"]["in"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+        assert_eq!(codes, Region::Europe.countries());
+        let ids = |s: &PodSpec| fitting_offers(&fixture_offers(), s, false).iter().map(|o| o.id).collect::<Vec<_>>();
+        assert_eq!(ids(&s), [54036773, 45866034, 19025024]);
+        assert_eq!(ids(&eu), [19025024], "Czechia, CZ");
+        assert_eq!(ids(&PodSpec { region: Some(Region::NorthAmerica), ..s.clone() }), [45866034], "United States, US");
+        let best = fitting_offers(&fixture_offers(), &eu, false).remove(0);
+        assert_eq!(best.geolocation.as_deref(), Some("Czechia, CZ"));
+        // An offer that doesn't say where it is isn't near.
+        let mut nowhere = fixture_offers();
+        for o in &mut nowhere {
+            o.as_object_mut().unwrap().remove("geolocation");
+        }
+        assert!(fitting_offers(&nowhere, &eu, false).is_empty());
+        assert_eq!(fitting_offers(&nowhere, &s, false).len(), 3, "anywhere doesn't care");
+        // The preview says where; the instance listing says where it is.
+        let p = VastProvider::new("k");
+        assert!(p.describe(&eu).starts_with("cheapest rentable 1×RTX 3090 offer in Europe on a verified host"), "{}", p.describe(&eu));
+        assert_eq!(parse_instance(&json!({"id": 1, "geolocation": " Quebec, CA "})).location.as_deref(), Some("Quebec, CA"));
+        assert_eq!(parse_instance(&json!({"id": 1})).location, None);
+    }
+
+    #[test]
+    fn near_prices_join_the_book_and_a_failed_search_is_said() {
+        use crate::near::Region;
+        let best = fitting_offers(&fixture_offers(), &spec(R3090, 1, 50), false).remove(0);
+        let (book, _) = price_book(&[(R3090.to_string(), Ok(Some(best.clone())))], 1, false);
+        let near = vec![
+            (R3090.to_string(), Ok(Some(Offer { price: 0.14, ..best }))),
+            ("NVIDIA RTX A4000".to_string(), Ok(None)),
+            ("NVIDIA RTX 4000 Ada Generation".to_string(), Err("vast search HTTP 500".to_string())),
+        ];
+        let (book, notes) = with_near_prices(book, &near, 1, Region::Europe);
+        assert_eq!(notes, ["vast: searching Europe for 1×RTX 4000Ada failed (vast search HTTP 500) — tried anywhere only"]);
+        // Planned near first: the near offer is within 25% of the cheapest ($0.115).
+        let req = crate::placement::Request {
+            gpus: vec![R3090.into()],
+            clouds: vec!["COMMUNITY".into()],
+            gpu_count: 1,
+            max_price: None,
+            order: crate::placement::Order::Cheapest,
+            near: Some(crate::near::Near { region: Region::Europe, max_extra_pct: 25.0 }),
+        };
+        let plan = crate::placement::plan_options(&req, "vast", &book);
+        let got: Vec<(Option<Region>, i64)> =
+            plan.options.iter().map(|o| (o.near, crate::placement::milli(o.price_per_pod.unwrap()))).collect();
+        assert_eq!(got, [(Some(Region::Europe), 140), (None, 115)]);
+        // The plan says which GPU's search failed, and claims no empty region for it.
+        let req = crate::placement::Request {
+            gpus: vec!["NVIDIA RTX A4000".into(), "NVIDIA RTX 4000 Ada Generation".into()],
+            ..req
+        };
+        let notes = crate::placement::plan_options(&req, "vast", &book).notes.join("\n");
+        assert!(notes.contains("RTX A4000") && notes.contains("no matching offer in Europe right now"), "{notes}");
+        assert!(notes.contains("searching Europe failed"), "{notes}");
+        assert!(!notes.contains("4000 Ada Generation: no matching offer"), "{notes}");
     }
 
     /// One search per Vast GPU name and count: two options that are the same card on Vast

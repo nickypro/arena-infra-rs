@@ -87,6 +87,9 @@ impl BalanceCtx {
             .iter()
             .chain(plan.dropped.iter().map(|d| &d.option))
             .filter(|o| o.price_source == Some(arena_core::placement::PriceSource::Live))
+            // A near twin's price is the region's (on Vast, its cheapest offer there): the GPU's
+            // stand-in is what it costs anywhere — its twin, which is in the plan too.
+            .filter(|o| o.near.is_none())
             .filter_map(|o| {
                 o.price_per_gpu.map(|per_gpu| balance::GpuQuote {
                     provider: plan.provider.clone(),
@@ -165,7 +168,7 @@ pub(crate) async fn balance_report(
         if flags.no_live {
             return None;
         }
-        match tokio::time::timeout(balance::COMMAND_TIMEOUT, bal.api.archive_eur_per_hr()).await {
+        match arena_core::ratelimit::bounded(balance::COMMAND_TIMEOUT, bal.api.archive_eur_per_hr()).await {
             Ok(read) => read,
             Err(_) => Some(Err(format!("timed out after {}s", balance::COMMAND_TIMEOUT.as_secs()))),
         }
@@ -1275,6 +1278,8 @@ mod tests {
             price_per_pod: per_gpu,
             price_source: source,
             stock: None,
+            near: None,
+            cap: None,
         }
     }
 
@@ -1287,6 +1292,7 @@ mod tests {
             options,
             dropped: Vec::new(),
             notes: Vec::new(),
+            near: None,
         }
     }
 

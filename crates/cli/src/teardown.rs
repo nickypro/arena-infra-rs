@@ -185,7 +185,7 @@ async fn read_volumes(cfg: &Config) -> Probe<Vec<NetworkVolume>> {
             },
         }
     };
-    match tokio::time::timeout(LIST_TIMEOUT, fetch).await {
+    match arena_core::ratelimit::bounded(LIST_TIMEOUT, fetch).await {
         Ok(Ok(v)) => Probe::Got(v),
         Ok(Err(e)) => Probe::Failed(e.to_string()),
         Err(_) => Probe::Failed(format!("timed out after {}s", LIST_TIMEOUT.as_secs())),
@@ -203,7 +203,7 @@ async fn read_shadeform_volumes(cfg: &Config) -> Probe<Vec<ShadeformVolume>> {
         Ok(p) => p,
         Err(e) => return Probe::Failed(e.to_string()),
     };
-    match tokio::time::timeout(LIST_TIMEOUT, sf.list_volumes()).await {
+    match arena_core::ratelimit::bounded(LIST_TIMEOUT, sf.list_volumes()).await {
         Ok(Ok(v)) => Probe::Got(v),
         Ok(Err(e)) => Probe::Failed(e.to_string()),
         Err(_) => Probe::Failed(format!("timed out after {}s", LIST_TIMEOUT.as_secs())),
@@ -216,7 +216,7 @@ pub(crate) async fn read_archive(cloud: Option<&dyn ArchiveCloud>) -> Probe<Inve
     let Some(cloud) = cloud else {
         return Probe::Skipped("no ARCHIVE_HETZNER_API_KEY or HETZNER_API_KEY — the backup archive wasn't checked".into());
     };
-    match tokio::time::timeout(LIST_TIMEOUT, cloud.inventory(None)).await {
+    match arena_core::ratelimit::bounded(LIST_TIMEOUT, cloud.inventory(None)).await {
         Ok(Ok(inv)) => Probe::Got(inv),
         Ok(Err(e)) => Probe::Failed(e.to_string()),
         Err(_) => Probe::Failed(format!("timed out after {}s", LIST_TIMEOUT.as_secs())),
@@ -234,7 +234,7 @@ pub(crate) async fn read_archive_priced(cloud: Option<&dyn ArchiveCloud>, prefix
             let names = arena_core::archive::ArchiveNames::new(prefix).ok().filter(|n| !inv.owned_by(n).is_empty());
             let names = names.or_else(|| inv.prefixes().first().and_then(|p| arena_core::archive::ArchiveNames::new(p).ok()));
             match names {
-                Some(n) => tokio::time::timeout(LIST_TIMEOUT, arena_core::archive::cloud::archive_prices(cloud, &inv.owned_by(&n))).await.unwrap_or(Prices::LIST),
+                Some(n) => arena_core::ratelimit::bounded(LIST_TIMEOUT, arena_core::archive::cloud::archive_prices(cloud, &inv.owned_by(&n))).await.unwrap_or(Prices::LIST),
                 None => Prices::LIST,
             }
         }
@@ -269,7 +269,7 @@ async fn read_keys(api: Option<&dyn KeyApi>) -> Probe<Vec<KeyInfo>> {
     let Some(api) = api else {
         return Probe::Skipped("OPENROUTER_PROVISIONING_KEY isn't set — OpenRouter keys not checked".into());
     };
-    match tokio::time::timeout(LIST_TIMEOUT, api.list_keys()).await {
+    match arena_core::ratelimit::bounded(LIST_TIMEOUT, api.list_keys()).await {
         Ok(Ok(keys)) => Probe::Got(keys),
         Ok(Err(e)) => Probe::Failed(e.to_string()),
         Err(_) => Probe::Failed(format!("timed out after {}s", LIST_TIMEOUT.as_secs())),

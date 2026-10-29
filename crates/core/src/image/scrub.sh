@@ -68,7 +68,8 @@ for h in "${homes[@]}"; do
         find "$h/.ssh" -mindepth 1 ! -name known_hosts -exec rm -rf {} + 2>/dev/null
     fi
     # Tokens copy-keys or setup export in the shell rc files.
-    for rc in .bashrc .zshrc .profile .bash_profile .zprofile .zshenv; do
+    # (Setup keeps a replaced ~/.zshrc as ~/.zshrc.pre-arena-<time>: those too.)
+    for rc in .bashrc .zshrc .profile .bash_profile .zprofile .zshenv .zshrc.pre-arena-*; do
         [ -f "$h/$rc" ] && { sed -i -E '/^[[:space:]]*export[[:space:]]+(@TOKEN_VARS@)=/d' "$h/$rc" || die "couldn't edit $h/$rc"; }
     done
     # Credentials the agents and libraries keep: Claude Code, Codex, Hugging Face, git, gh.

@@ -1,6 +1,6 @@
 //! RunPod backend on the REST **v2** API (`https://api.runpod.io/v2`) — the default:
 //! `RUNPOD_API` unset, empty or `v2` (see [`super::RunpodApi`]). RunPod retires REST v1
-//! ([`super::runpod`]) on 2026-11-15; this is its replacement, live-tested on sandbox pods
+//! ([`super::runpod`]) on 2026-11-16; this is its replacement, live-tested on sandbox pods
 //! before it became the default.
 //!
 //! What differs from v1, and why the code looks the way it does:
@@ -87,7 +87,7 @@ use super::runpod::{self, loose_f64, loose_string, GpuType};
 use super::{ContainerReset, Provider};
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, ProviderErrorKind, Result};
-use crate::http::{judge, status_error};
+use crate::http::{judge, send_limited, status_error, Limits};
 use crate::pod::{Pod, PodSpec};
 
 pub(crate) const BASE: &str = "https://api.runpod.io/v2";
@@ -232,11 +232,12 @@ fn catalog_request(client: &Client, api_key: &str, cloud: &str, min_cuda: Option
     api_request(client, api_key, Method::GET, base_url("catalog/gpus")).query(&query)
 }
 
-/// Send a request and judge its response by [`crate::http`]'s rule — the status first, then
+/// Send a request through the rate-limit-aware path ([`crate::http::exchange`], RunPod's
+/// [`Limits`]) and judge its response by [`crate::http`]'s rule — the status first, then
 /// the body, and an error status's body read best-effort so the status survives a body that
 /// can't be read — with v2's own reading of error bodies ([`judge_v2`]).
 async fn send(rb: RequestBuilder, ctx: &str) -> Result<Value> {
-    let resp = rb.send().await?;
+    let resp = send_limited(rb, ctx, &Limits::RUNPOD).await?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -248,7 +249,7 @@ async fn send(rb: RequestBuilder, ctx: &str) -> Result<Value> {
 /// [`send`] for calls whose success body we don't use (stop, restart, terminate, reimage):
 /// only the status is judged, so one that worked is never reported as failed over its body.
 async fn send_ok(rb: RequestBuilder, ctx: &str) -> Result<()> {
-    let resp = rb.send().await?;
+    let resp = send_limited(rb, ctx, &Limits::RUNPOD).await?;
     let status = resp.status();
     if status.is_success() {
         return Ok(());
@@ -484,6 +485,8 @@ fn parse_pod(v: &Value) -> Pod {
                 .and_then(|uptime| crate::status::now_secs().checked_sub(uptime))),
         identity: None,
         status_detail: None,
+        // The data centre (`EU-RO-1`); null on a COMMUNITY pod (its host is in none).
+        location: s("dataCenterId"),
     }
 }
 
@@ -586,9 +589,13 @@ where
         for &i in batch {
             let id = pods[i].id.clone();
             let future = fetch(id.clone());
-            tasks.spawn(async move {
+            // The caller's rate-limit wait bound goes with the lookup (a spawned task doesn't
+            // inherit it), and the lookup's own 5 s bounds its waits, a margin left for the
+            // request: a held quota fails it as rate-limited, saying so, not as a timeout.
+            tasks.spawn(crate::ratelimit::inherit(async move {
                 let looked_up = async {
-                    let body = tokio::time::timeout(std::time::Duration::from_secs(5), future)
+                    let five = std::time::Duration::from_secs(5);
+                    let body = crate::ratelimit::bounded(five, future)
                         .await
                         .map_err(|_| Error::provider(format!("endpoint lookup for {id} timed out after 5s")))??;
                     let detail = parse_pod(&body);
@@ -598,7 +605,7 @@ where
                     Ok(detail)
                 };
                 (i, looked_up.await)
-            });
+            }));
         }
         let mut answered = HashSet::new();
         while let Some(joined) = tasks.join_next().await {
@@ -738,6 +745,7 @@ pub(crate) const MANAGED: &[Managed] = &[
 ///   image's CMD and keeps its ENTRYPOINT. Omitted otherwise, so the image's own CMD runs
 ///   (the arena image starts sshd itself). `entrypoint`/`args` are never sent.
 /// - `volume_gb` > 0 → `mounts.persistent {size, path}`; 0 → no mount at all.
+/// - `region` (placement's near option) → `dataCenterIds`, the region's data centres.
 /// - `startSsh: true`: with our `PUBLIC_KEY` set it injects nothing (the account keys are
 ///   merged into ours instead); without one it injects the account keys — v1's behaviour.
 /// - `spec.api_extra` (`--api-json`) is deep-merged in last, minus the [`MANAGED`] fields —
@@ -773,6 +781,11 @@ fn create_payload(spec: &PodSpec, account_keys: &[String]) -> Result<Value> {
     }
     if spec.volume_gb > 0 {
         payload["mounts"] = json!({ "persistent": { "size": spec.volume_gb, "path": VOLUME_MOUNT_PATH } });
+    }
+    // Near the proxy: only the region's data centres. Nothing free there is a capacity error,
+    // and placement moves on to the same option anywhere.
+    if let Some(dcs) = runpod::near_data_centers(spec) {
+        payload["dataCenterIds"] = dcs;
     }
     apiextra::apply(&mut payload, spec.api_extra.as_ref(), MANAGED, Some("ports"))?;
     Ok(payload)
@@ -943,6 +956,7 @@ fn parse_spec(v: &Value) -> PodSpec {
         avoid_machines: Vec::new(),
         server_type: None,
         vm_image: None,
+        region: None,
     }
 }
 
@@ -988,6 +1002,17 @@ fn parse_catalog(body: &Value) -> Result<Vec<GpuType>> {
             None => None,
         }
     };
+    // Each data centre that offers it, with its stock — `NONE` kept as `None` (placement
+    // tries no near create there); a level it doesn't say is `""`, unknown, never `None`.
+    let data_centers = |g: &Value| -> Vec<(String, String)> {
+        let dcs = g.get("dataCenters").and_then(Value::as_array).into_iter().flatten();
+        dcs.filter_map(|d| {
+            let id = d.get("id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())?;
+            let level = d.get("availability").and_then(Value::as_str).and_then(title).unwrap_or_default();
+            Some((id.to_string(), level))
+        })
+        .collect()
+    };
     Ok(gpus
         .iter()
         .filter_map(|g| {
@@ -998,6 +1023,7 @@ fn parse_catalog(body: &Value) -> Result<Vec<GpuType>> {
                 community_price: price(g, "community"),
                 secure_price: price(g, "secure"),
                 stock_status: stock(g),
+                data_centers: data_centers(g),
             })
         })
         .collect())
@@ -1115,7 +1141,9 @@ impl Provider for RunpodV2Provider {
         normalize_cloud(&spec.cloud_type)?;
         let keys = self.keys_to_merge(&spec.env).await?;
         let payload = create_payload(spec, &keys)?;
-        let resp = api_request(&self.client, &self.api_key, Method::POST, base_url("pods")).json(&payload).send().await?;
+        // A 429 is retried (refused before processing: nothing was made); a 5xx or a lost
+        // connection never is here — see `may_exist`.
+        let resp = send_limited(api_request(&self.client, &self.api_key, Method::POST, base_url("pods")).json(&payload), "create pod", &Limits::RUNPOD).await?;
         let status = resp.status();
         // A 2xx we can't read still means a pod (that bills) probably exists: say so, so
         // nobody "retries" into a duplicate. Such errors are `Other`, which isn't retried.
@@ -1180,7 +1208,7 @@ impl Provider for RunpodV2Provider {
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
         // REST v2, not GraphQL's `podEditName` (v1 keeps that): a name-only PATCH, which
         // leaves the running container alone (see `rename_payload`).
-        let resp = rename_request(&self.client, &self.api_key, id, new_name)?.send().await?;
+        let resp = send_limited(rename_request(&self.client, &self.api_key, id, new_name)?, "rename pod", &Limits::RUNPOD).await?;
         let status = resp.status();
         // Read best-effort: a 2xx whose body can't be read is still a rename that worked.
         let text = resp.text().await.unwrap_or_default();
@@ -1205,7 +1233,7 @@ impl Provider for RunpodV2Provider {
     }
 
     async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {
-        let resp = lock_request(&self.client, &self.api_key, id, locked)?.send().await?;
+        let resp = send_limited(lock_request(&self.client, &self.api_key, id, locked)?, "lock pod", &Limits::RUNPOD).await?;
         let status = resp.status();
         // Read best-effort: a 2xx whose body can't be read is still a lock that took.
         let text = resp.text().await.unwrap_or_default();
@@ -1335,8 +1363,12 @@ mod tests {
                 started_at: Some(1_780_315_320),
                 identity: None,
                 status_detail: None,
+                location: Some("US-KS-2".into()),
             }
         );
+        // A COMMUNITY pod's host is in no data centre: null there, so no location.
+        assert_eq!(parse_pod(&provisioning_pod()).location, None);
+        assert_eq!(parse_pod(&exited_pod()).location.as_deref(), Some("EU-RO-1"));
     }
 
     #[test]
@@ -1668,6 +1700,7 @@ mod tests {
             avoid_machines: Vec::new(),
             server_type: None,
             vm_image: None,
+            region: None,
         }
     }
 
@@ -1763,6 +1796,24 @@ mod tests {
     /// `--api-json` options the tool has no flag for go out merged (objects key by key: our
     /// env and GPU stay); the fields it sets itself are refused, naming what sets them; a
     /// refused extra fails the create before any request (the payload is built first).
+    #[test]
+    fn create_payload_pins_a_near_create_to_the_regions_data_centres() {
+        let anywhere = create_payload(&spec(), &[]).unwrap();
+        assert!(anywhere.get("dataCenterIds").is_none(), "anywhere: the scheduler chooses");
+        let near = PodSpec { region: Some(crate::near::Region::Europe), cloud_type: "SECURE".into(), ..spec() };
+        let p = create_payload(&near, &[]).unwrap();
+        let dcs: Vec<&str> = p["dataCenterIds"].as_array().unwrap().iter().map(|d| d.as_str().unwrap()).collect();
+        assert_eq!(dcs, crate::near::Region::Europe.runpod_dcs());
+        assert!(dcs.contains(&"EU-RO-1") && dcs.contains(&"EUR-IS-1") && !dcs.iter().any(|d| d.starts_with("US-")));
+        // The operator's own pin is merged over it (placement plans no near option beside one).
+        let own = PodSpec { api_extra: Some(json!({"dataCenterIds": ["US-TX-3"]}).as_object().unwrap().clone()), ..near.clone() };
+        assert_eq!(create_payload(&own, &[]).unwrap()["dataCenterIds"], json!(["US-TX-3"]));
+        // The same field on REST v1, and the preview says where.
+        assert_eq!(runpod::near_data_centers(&near), Some(json!(crate::near::Region::Europe.runpod_dcs())));
+        assert!(runpod::describe_spec(&near).contains("SECURE, in Europe (12 data centres)"), "{}", runpod::describe_spec(&near));
+        assert!(!runpod::describe_spec(&spec()).contains(" in "));
+    }
+
     #[test]
     fn create_payload_merges_api_extra_and_refuses_managed_fields() {
         let extra = |v: Value| Some(v.as_object().unwrap().clone());
@@ -2128,8 +2179,10 @@ mod tests {
                 community_price: Some(0.31),
                 secure_price: Some(0.44),
                 stock_status: Some("High".into()),
+                data_centers: vec![("US-KS-2".into(), "High".into())],
             }
         );
+        assert!(t[1].data_centers.is_empty() && t[2].data_centers.is_empty(), "no `dataCenters`: none offers it");
         // `community: false` hides a quoted community price; NONE stock is reported as such.
         assert_eq!((t[1].community_price, t[1].secure_price, t[1].stock_status.as_deref()), (None, Some(2.69), Some("None")));
         // A 0 price is "not offered", and no availability (not requested) is no hint.
@@ -2139,14 +2192,20 @@ mod tests {
         // seconds later).
         let v = json!({"gpus": [
             {"id": "a", "name": "A", "memory": 16, "availability": "NONE",
-             "dataCenters": [{"id": "EU-RO-1", "availability": "NONE"}, {"id": "US-KS-2", "availability": "MEDIUM"}]},
+             "dataCenters": [{"id": "EU-RO-1", "availability": "NONE"}, {"id": "US-KS-2", "availability": "MEDIUM"}, {"id": "EUR-IS-1"}]},
             {"id": "b", "name": "B", "memory": 16, "availability": "NONE",
              "cudaVersions": [{"version": "13.0", "available": false}, {"version": "13.1", "available": true}]},
             {"id": "c", "name": "C", "memory": 16, "availability": "NONE",
              "cudaVersions": [{"version": "13.0", "available": false}]},
             {"id": "d", "name": "D", "memory": 16, "cudaVersions": [{"version": "13.2", "available": true}]}
         ]});
-        let stock: Vec<Option<String>> = parse_catalog(&v).unwrap().into_iter().map(|t| t.stock_status).collect();
+        let parsed = parse_catalog(&v).unwrap();
+        assert_eq!(
+            parsed[0].data_centers,
+            [("EU-RO-1".to_string(), "None".to_string()), ("US-KS-2".into(), "Medium".into()), ("EUR-IS-1".into(), String::new())],
+            "a level not given is unknown, not None"
+        );
+        let stock: Vec<Option<String>> = parsed.into_iter().map(|t| t.stock_status).collect();
         assert_eq!(stock, [Some("Medium".into()), Some("Low".into()), Some("None".into()), Some("Low".into())]);
         assert!(parse_catalog(&json!({"data": []})).is_err());
         assert!(parse_catalog(&json!({"gpus": []})).unwrap().is_empty());

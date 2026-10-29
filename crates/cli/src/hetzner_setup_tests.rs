@@ -33,6 +33,8 @@ fn install_stubs(dir: &Path) {
         stub(quiet, "exit 0");
     }
     stub("docker", "echo 'Docker version 0 (stub)'");
+    // `cp` fails for a path containing `$CP_FAILS` (when set), else is the real one.
+    stub("cp", "if [ -n \"${CP_FAILS:-}\" ]; then for a; do case \"$a\" in *\"$CP_FAILS\"*) exit 1;; esac; done; fi\nexec /bin/cp \"$@\"");
     // The swap step's tools, logged — no test makes a real swap file or turns one on. `df` says
     // DF_FREE_KB free (100 GiB unless a test sets less); MKSWAP_EXIT fails mkswap.
     let logged = |name: &str, rest: &str| stub(name, &format!("echo \"{name} $*\" >> \"$(dirname \"$0\")/swap.log\"\n{rest}"));
@@ -246,6 +248,142 @@ fn no_swap_is_made_when_asked_for_none_without_room_or_when_mkswap_fails() {
     let r = run(&stubs, &home, &repo, &[]);
     assert!(r.stdout.contains("swap: 8 GB already on (not arena's) — none added"), "{}", r.stdout);
     assert!(!t.0.join("swapfile").exists());
+}
+
+/// The shared dotfiles' .zshrc, as nickypro/arena-infra has it (cut down): the GPU image's, so
+/// it starts conda and activates its env.
+const SHARED_ZSHRC: &str = r#"# export PATH="/opt/conda/bin:$PATH"  # commented out by conda initialize
+export MACHINE_NAME="${MACHINE_NAME:="root"}"
+[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
+
+# >>> conda initialize >>>
+__conda_setup="$('/opt/conda/bin/conda' 'shell.zsh' 'hook' 2> /dev/null)"
+if [ $? -eq 0 ]; then
+    eval "$__conda_setup"
+fi
+unset __conda_setup
+# <<< conda initialize <<<
+
+conda activate arena-env
+"#;
+
+/// The human (2026-10-29): "the .zshrc still has conda activate by default, can we remove
+/// that?" A VM has no conda, so each login said "command not found: conda". The VM's .zshrc
+/// is the shared one without the image's conda, plus the venv. A re-run filters the VM's own
+/// (it used to copy the shared file over it, dropping `copy-keys`' tokens and the participant's
+/// lines); only oh-my-zsh's untouched template is replaced, and anything else is kept first.
+#[test]
+fn the_vms_zshrc_has_no_conda_and_a_rerun_keeps_its_tokens() {
+    let (_t, stubs, home, repo) = setup("zshrc");
+    let dotfiles = home.join(".arena_infra/dotfiles");
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    std::fs::write(dotfiles.join(".zshrc"), SHARED_ZSHRC).unwrap();
+    let zshrc = || std::fs::read_to_string(home.join(".zshrc")).unwrap();
+    let kept = || {
+        let mut v: Vec<_> = std::fs::read_dir(&home)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with(".zshrc.pre-arena-"))
+            .collect();
+        v.sort();
+        v
+    };
+    let venv = repo.join(".venv");
+    let activate = format!("source \"{}/bin/activate\"", venv.display());
+    let new_block = format!("\n# ARENA env: the uv venv.\nif [ -f \"{0}/bin/activate\" ]; then\n    {activate}\nfi\n", venv.display());
+
+    // A fresh VM: oh-my-zsh's template as its installer wrote it, replaced (nothing to keep).
+    let template = "# If you come from bash you might have to change your $PATH.\nexport ZSH=\"$HOME/.oh-my-zsh\"\n\
+                    ZSH_THEME=\"robbyrussell\"\nplugins=(git)\nsource $ZSH/oh-my-zsh.sh\n";
+    std::fs::create_dir_all(home.join(".oh-my-zsh/templates")).unwrap();
+    std::fs::write(home.join(".oh-my-zsh/templates/zshrc.zsh-template"), template).unwrap();
+    std::fs::write(home.join(".zshrc"), template).unwrap();
+    let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]);
+    assert!(r.ok, "{}", r.stderr);
+    let rc = zshrc();
+    assert!(!rc.contains("conda"), "{rc}");
+    assert!(!rc.contains("robbyrussell"), "the template is replaced: {rc}");
+    assert!(rc.contains("export MACHINE_NAME=") && rc.contains("source ~/.p10k.zsh"), "the rest is kept: {rc}");
+    assert!(rc.ends_with(&new_block), "{rc}");
+    assert_eq!(kept(), Vec::<String>::new());
+
+    // copy-keys and the participant add lines, a conda of their own among them (its init
+    // block; an activate inside their own `if`, indented or not). A re-run keeps all of it,
+    // adds nothing twice, and the rc still parses.
+    let added = "export OPENROUTER_API_KEY=\"sk-or-test\"\nalias gs='git status'\n\
+                 # >>> conda initialize >>>\n__conda_setup=\"$('/root/miniconda3/bin/conda' 'shell.zsh' 'hook')\"\n# <<< conda initialize <<<\n\
+                 if command -v conda >/dev/null 2>&1; then\n    conda activate arena-env\nfi\n\
+                 if command -v conda >/dev/null 2>&1; then\nconda activate arena-env\nfi\n";
+    let parses = |f: &str| Command::new("bash").arg("-n").arg(home.join(f)).status().unwrap().success();
+    std::fs::write(home.join(".zshrc"), format!("{rc}{added}")).unwrap();
+    let again = run(&stubs, &home, &repo, &[]);
+    assert!(again.ok, "{}", again.stderr);
+    assert_eq!(zshrc(), format!("{rc}{added}"));
+    assert!(parses(".zshrc"));
+
+    // They took the venv block out: still arena's rc (the shared MACHINE_NAME line), so filtered
+    // in place, tokens kept, the block back once.
+    let without = rc.replace(&new_block, "");
+    std::fs::write(home.join(".zshrc"), format!("{without}{added}")).unwrap();
+    let r = run(&stubs, &home, &repo, &[]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(zshrc(), format!("{without}{added}{new_block}"));
+    assert_eq!(kept(), Vec::<String>::new());
+
+    // Not arena's, and not the template as written (theirs, or the template with their lines):
+    // replaced, but kept first, byte for byte. If it can't be kept, it's left as it is.
+    for (i, theirs) in ["export MY_TOKEN=1\nalias ll='ls -l'\n".to_string(), format!("{template}export MY_TOKEN=1\n")].iter().enumerate() {
+        std::fs::write(home.join(".zshrc"), theirs).unwrap();
+        let r = run(&stubs, &home, &repo, &[]);
+        assert!(r.ok, "{}", r.stderr);
+        assert!(zshrc().contains("export MACHINE_NAME="), "{i}: {}", zshrc());
+        let k = kept();
+        assert_eq!(k.len(), 1, "{i}: {k:?}");
+        assert_eq!(&std::fs::read_to_string(home.join(&k[0])).unwrap(), theirs);
+        std::fs::remove_file(home.join(&k[0])).unwrap();
+    }
+    std::fs::write(home.join(".zshrc"), "export MY_TOKEN=1\n").unwrap();
+    let r = run(&stubs, &home, &repo, &[("CP_FAILS", "pre-arena")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(r.stdout.contains("WARN: couldn't keep ~/.zshrc aside, so it's left as it is"), "{}", r.stdout);
+    assert!(zshrc().starts_with("export MY_TOKEN=1\n") && !zshrc().contains("MACHINE_NAME"), "{}", zshrc());
+    assert_eq!(kept(), Vec::<String>::new());
+
+    // A VM set up before this: the shared rc with conda, the venv block setup wrote then (it
+    // skipped activation whenever a conda was on PATH), their lines; .bashrc with that block
+    // and their own conda `if`. A re-run takes the image's conda out and turns the old block
+    // into today's; their lines stay, and .bashrc still parses.
+    let old_block = format!(
+        "\n# ARENA env: no conda on CPU pods — activate the uv venv (no-op on conda GPU pods).\n\
+         if ! command -v conda >/dev/null 2>&1 && [ -f \"{0}/bin/activate\" ]; then\n    {activate}\nfi\n",
+        venv.display()
+    );
+    std::fs::write(home.join(".zshrc"), format!("{SHARED_ZSHRC}{old_block}{added}")).unwrap();
+    let theirs = "if command -v conda >/dev/null 2>&1; then\n    conda activate arena-env\nfi\n";
+    std::fs::write(home.join(".bashrc"), format!("# ubuntu's\n{theirs}{old_block}")).unwrap();
+    let old = run(&stubs, &home, &repo, &[]);
+    assert!(old.ok, "{}", old.stderr);
+    let rc = zshrc();
+    assert!(!rc.contains("/opt/conda") && !rc.contains("! command -v conda"), "{rc}");
+    assert!(rc.ends_with(&format!("{new_block}{added}")), "{rc}");
+    assert_eq!(rc.matches("conda activate arena-env").count(), 2, "only their two: {rc}");
+    assert!(parses(".zshrc"));
+    assert_eq!(rc.matches(&activate).count(), 1, "{rc}");
+    let bashrc = std::fs::read_to_string(home.join(".bashrc")).unwrap();
+    assert_eq!(bashrc, format!("# ubuntu's\n{theirs}{new_block}"));
+    assert!(parses(".bashrc"));
+    assert_eq!(kept(), Vec::<String>::new());
+    // What a shell gets, with a conda on PATH: the venv last (the old block gave it neither).
+    arena_core::remote::write_test_script(stubs.join("conda"), "#!/bin/sh\nexit 0\n").unwrap();
+    let out = Command::new("bash")
+        .args(["-c", "source ~/.bashrc; command -v conda >/dev/null && echo \"$PATH\""])
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
+        .output()
+        .unwrap();
+    let path = String::from_utf8_lossy(&out.stdout);
+    assert!(path.starts_with(&format!("{}/bin:", venv.display())), "{path}");
 }
 
 #[test]

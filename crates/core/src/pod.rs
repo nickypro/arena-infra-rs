@@ -98,6 +98,12 @@ pub struct Pod {
     /// JSON.
     #[serde(default, skip_serializing)]
     pub status_detail: Option<String>,
+    /// Where the pod runs, as its provider names the place: RunPod's data centre (`EU-RO-1`;
+    /// a COMMUNITY pod has none), Vast's `geolocation` (`Czechia, CZ`), Hetzner's location
+    /// (`nbg1`), Shadeform's region. For people (the dashboard's detail pane, `pods list
+    /// --json`), never for routing. Left out of the JSON when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
 }
 
 impl Pod {
@@ -175,6 +181,12 @@ pub struct PodSpec {
     /// snapshot that fits), a snapshot id or a system image name — over `HETZNER_IMAGE`. Not
     /// [`Self::image`], which is a container image (RunPod/Vast). `None` = the configured one.
     pub vm_image: Option<String>,
+    /// Create only in this region: placement's "near the proxy" option ([`crate::near`]).
+    /// RunPod pins its data centres there (`dataCenterIds`, SECURE only), Vast rents only
+    /// offers in its countries; nothing there is "no capacity", and placement moves on to the
+    /// same option anywhere. `None` = anywhere (every create outside placement's near
+    /// options). Other backends never get one.
+    pub region: Option<crate::near::Region>,
 }
 
 impl PodSpec {
@@ -218,6 +230,7 @@ impl PodSpec {
             avoid_machines: Vec::new(),
             server_type: None,
             vm_image: None,
+            region: None,
         }
     }
 
@@ -363,6 +376,7 @@ mod tests {
                 started_at: None,
                 identity: None,
                 status_detail: None,
+                location: None,
             },
             Pod { id: "1".into(), name: "devtest-flutter".into(), provider: "hetzner".into(), ..Default::default() },
         ];
