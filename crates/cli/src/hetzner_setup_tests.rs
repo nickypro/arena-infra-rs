@@ -374,7 +374,7 @@ fn the_vms_zshrc_has_no_conda_and_a_rerun_keeps_its_tokens() {
     assert!(parses(".bashrc"));
     assert_eq!(kept(), Vec::<String>::new());
     // What a shell gets, with a conda on PATH: the venv last (the old block gave it neither).
-    arena_core::remote::write_test_script(&stubs.join("conda"), "#!/bin/sh\nexit 0\n".to_string()).unwrap();
+    arena_core::remote::write_test_script(stubs.join("conda"), "#!/bin/sh\nexit 0\n").unwrap();
     let out = Command::new("bash")
         .args(["-c", "source ~/.bashrc; command -v conda >/dev/null && echo \"$PATH\""])
         .env_clear()
