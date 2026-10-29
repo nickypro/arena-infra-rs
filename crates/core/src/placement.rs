@@ -219,6 +219,9 @@ pub struct PriceBook {
     /// Whether the market was searched near the proxy at all — without it (no key) a GPU
     /// missing from `near_offers` says nothing about the region.
     near_searched: bool,
+    /// GPUs whose near search failed ([`Self::with_near_failed`]): no offer for them says
+    /// nothing about the region either.
+    near_failed: Vec<String>,
 }
 
 impl PriceBook {
@@ -250,6 +253,14 @@ impl PriceBook {
         let n = f64::from(gpu_count.max(1));
         self.near_offers = per_pod.into_iter().map(|(gpu, p)| (gpu, p / n)).collect();
         self.near_searched = true;
+        self
+    }
+
+    /// Vast, near the proxy: the GPUs whose region search failed (an HTTP error, a timeout) —
+    /// tried anywhere only, and the plan says the search failed rather than that the region
+    /// has no matching offer (review: codex, claude).
+    pub fn with_near_failed(mut self, gpus: Vec<String>) -> Self {
+        self.near_failed = gpus;
         self
     }
 
@@ -650,6 +661,11 @@ fn near_first(
             }
             _ => match prices.near_offer(&o.gpu) {
                 Some(p) => (Some(p), Some(PriceSource::Live), None),
+                None if prices.near_failed.iter().any(|g| g == &o.gpu) => {
+                    why_not.push(format!("{}: searching {region} failed", o.describe()));
+                    twins.push(None);
+                    continue;
+                }
                 None => {
                     why_not.push(format!("{}: no matching offer in {region} right now", o.describe()));
                     twins.push(None);

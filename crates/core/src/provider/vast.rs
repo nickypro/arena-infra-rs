@@ -501,6 +501,7 @@ pub fn price_book(quotes: &[(String, OfferQuote)], gpu_count: u32, verified_only
 pub fn with_near_prices(book: PriceBook, near: &[(String, OfferQuote)], gpu_count: u32, region: crate::near::Region) -> (PriceBook, Vec<String>) {
     let mut prices = Vec::new();
     let mut notes = Vec::new();
+    let mut failed = Vec::new();
     for (gpu, quote) in near {
         match quote {
             Ok(Some(offer)) => prices.push((gpu.clone(), offer.price)),
@@ -511,8 +512,11 @@ pub fn with_near_prices(book: PriceBook, near: &[(String, OfferQuote)], gpu_coun
                 vast_gpu_name(gpu)
             )),
         }
+        if quote.is_err() {
+            failed.push(gpu.clone());
+        }
     }
-    (book.with_near_offers(prices, gpu_count), notes)
+    (book.with_near_offers(prices, gpu_count).with_near_failed(failed), notes)
 }
 
 /// The cohort's public keys from the spec: `PUBLIC_KEY` holds them newline-joined (see
@@ -1607,6 +1611,15 @@ mod tests {
         let got: Vec<(Option<Region>, i64)> =
             plan.options.iter().map(|o| (o.near, crate::placement::milli(o.price_per_pod.unwrap()))).collect();
         assert_eq!(got, [(Some(Region::Europe), 140), (None, 115)]);
+        // The plan says which GPU's search failed, and claims no empty region for it.
+        let req = crate::placement::Request {
+            gpus: vec!["NVIDIA RTX A4000".into(), "NVIDIA RTX 4000 Ada Generation".into()],
+            ..req
+        };
+        let notes = crate::placement::plan_options(&req, "vast", &book).notes.join("\n");
+        assert!(notes.contains("RTX A4000") && notes.contains("no matching offer in Europe right now"), "{notes}");
+        assert!(notes.contains("searching Europe failed"), "{notes}");
+        assert!(!notes.contains("4000 Ada Generation: no matching offer"), "{notes}");
     }
 
     /// One search per Vast GPU name and count: two options that are the same card on Vast
