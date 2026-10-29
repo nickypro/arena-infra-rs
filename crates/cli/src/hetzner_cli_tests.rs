@@ -229,7 +229,7 @@ async fn a_flag_the_target_cant_honour_is_refused_before_anything_happens() {
 fn config_check_shows_the_hetzner_key_name_up_front() {
     let rows = hetzner_rows(&Config::parse("MACHINE_NAME_PREFIX=arena9\nHETZNER_API_KEY=x\n")).join("\n");
     for want in [
-        "  · HETZNER_SERVER_TYPE          cx23 (default) — `pods create/up --server-type` overrides it",
+        "  · HETZNER_SERVER_TYPE          cx33 (default) — `pods create/up --server-type` overrides it",
         "  · HETZNER_LOCATION             any (nearest first, the next when one has no room) (default)",
         "  · HETZNER_IMAGE                ubuntu-24.04 (default)",
         "  · HETZNER_SSH_KEY              arena9 (default: MACHINE_NAME_PREFIX)",

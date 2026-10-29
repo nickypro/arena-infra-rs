@@ -91,7 +91,7 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 | Command | What it does |
 | --- | --- |
 | `arena pods list` | Every pod: GPU, $/h, endpoint, maintenance; a fleet cost and balance footer |
-| `arena offers` | What `pods up` would try on each provider (RunPod, Vast, Hetzner) and its $/h; `--all`: every GPU and server type |
+| `arena offers` | What `pods up` would try on each provider (RunPod, Vast, Hetzner) and its $/h; `arena offers runpod` (or `vast`, `hetzner`, `all`): everything on sale there, B300 and MIG slices included |
 | `arena pods up -n 20 --gpu A4000,3090 --check` | Create pods up to 20, then set each up and deep-check it, one pipeline per pod |
 | `arena pods create apple bloom` | Create just these pods (no setup) |
 | `arena pods setup` | (Re)provision pods: deploy key, repo, tokens, VS Code warm-up, API keys |

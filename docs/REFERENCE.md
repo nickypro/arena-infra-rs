@@ -127,8 +127,11 @@ cargo run -p arena-cli -- --config ./config.env pods list
 Every green master commit is published as a GitHub release (`.github/workflows/release.yml`):
 `arena` and `arena-tui` for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, built
 on Ubuntu 22.04 (glibc 2.35 or newer), with `CHANGELOG.md` and `SHA256SUMS`. The tag is the
-version, `v2.0.YYMMDD.HHMM`, from the commit's time in UTC. `arena --version` prints it with the
-commit: `arena 2.0.261027.1500 (5274b7a1c2)`.
+version, `v2.1.YYMMDD.HHMM`: the base (`BASE` in `crates/cli/build.rs`) and the commit's time in
+UTC. `arena --version` prints it with the commit: `arena 2.1.261029.1500 (5274b7a1c2)`. The base
+goes up a minor (2.0 → 2.1) when a command, flag or `--json` shape changes in a way a script or
+habit notices, a major for a config or on-pod layout break that needs action; otherwise the date
+stamp alone tells releases apart. A newer base is always newer: a 2.0 build updates to 2.1.
 
 ```bash
 arena update --check     # newer release? what changed? (exit 10 = yes, 0 = up to date, 1 = couldn't tell)
@@ -171,7 +174,7 @@ sudo arena update        # where root runs arena from someone else's ~/.cargo/bi
 
   ```bash
   # any machine with a current gh; the release's binaries for the box's platform (prod: aarch64)
-  t=aarch64-unknown-linux-gnu; tag=v2.0.YYMMDD.HHMM
+  t=aarch64-unknown-linux-gnu; tag=v2.1.YYMMDD.HHMM
   gh release download $tag --repo nickypro/arena-infra-rs -p arena-$t -p arena-tui-$t
   for f in arena-$t arena-tui-$t; do   # both must print the same run, or don't go on
     gh attestation verify $f --repo nickypro/arena-infra-rs --deny-self-hosted-runners \
@@ -211,9 +214,17 @@ because it matches both `pods` and `proxy` (use `po`/`pr`); likewise `c` →
 `config`/`cron` (use `co`/`cr`), and `arena po l` → `list`/`lock`/`logs`.
 
 `arena --help` and `arena pods --help` list their commands in groups — `pods`: Look, Make,
-Change, Move, Save, Stop; the top level: Fleet, Money, Access, Automation, Setup. A test keeps
-every visible command in exactly one group. Hidden: `gpus`, the old name for `offers --all`.
+Change, Move, Save, Stop; the top level: Fleet, Access, Money, Automation, Setup. A test keeps
+every visible command in exactly one group. Hidden: `gpus`, RunPod's GPU list as it always printed.
 clap's own `help` command isn't listed (`-h`/`--help` are); `arena help pods` still works.
+
+Every command's help is compact: its options one per line, no blank line between them. clap used its
+"long" layout for `--help` whenever any text had a second paragraph — every option's help on a line
+of its own and a blank line after each (`offers --help` was 50 lines for 12 options). So arena moves
+the long texts where the short layout prints them: a command's description above its usage, an
+option's extra paragraphs onto the lines under it (wrapped to end by column 100; clap wraps nothing without
+its `wrap_help` feature). `-h`, `--help` and `arena help <cmd>` print the same page, with every word
+they had (a test renders every command's help three ways and checks both).
 
 ### Targeting & concurrency
 
@@ -412,6 +423,20 @@ name as the instance `label`. An offer's price is what it bills with *our* disk:
 `dph_total` and `dph_base` + `storage_cost` for `DISK_GB`. GPU types map to Vast's spaced display
 names (`NVIDIA GeForce RTX 3090` → `RTX 3090`, `RTX 4000 Ada Generation` → `RTX 4000Ada`; `RTX_3090`
 finds nothing).
+
+**Host classes are Vast's `--cloud` tiers**, as `COMMUNITY`/`SECURE` are RunPod's (`vast::Host`, from
+each offer's own fields, read-only 2026-10-29): `datacenter` (verified, and `hosting_type` 1 — the
+vast CLI's `datacenter` filter), `verified` (`verification` is `verified`), `unverified` (anything
+else, `deverified` included — a datacenter host Vast doesn't call verified too). A tier is the least
+a create accepts, nested: `--cloud datacenter` rents verified datacenter hosts only, `verified` any
+verified host (datacenter ones count as verified), `unverified` any host — the same opt-in as `VAST_ALLOW_UNVERIFIED=1`, for one run. No `--cloud`, or a
+RunPod tier (config `CLOUD_TYPE` usually holds `COMMUNITY`): the default, verified, or any host with
+`VAST_ALLOW_UNVERIFIED=1` — what Vast rented before there were tiers. A list (`--cloud
+datacenter,verified`) is one option per tier through the same planner as RunPod's, each priced by its
+own search (the search filters `hosting_type`/`verified` server-side, and every offer's class is
+checked again before renting), so `up --provider vast --cloud datacenter` rents only datacenter hosts.
+Anything else is refused before a search: ``--cloud `cheap`: Vast's cloud types are datacenter,
+verified and unverified``.
 
 Vast's SSH launcher replaces the image's entrypoint; the cohort keys are attached to **each
 instance** (`POST /instances/{id}/ssh/`, idempotent) and written by its `onstart` (which also turns
@@ -768,7 +793,7 @@ replacing right then.
 #### `--gpu` is checked
 
 **`--gpu` is checked** (`create`/`up`/`offers`/`replace`/`migrate copy`, RunPod only): each token —
-an exact id (any case), the catalog's display name as `arena offers --all` prints it (`RTX PRO 6000`, `B300
+an exact id (any case), the catalog's display name as `arena offers runpod` prints it (`RTX PRO 6000`, `B300
 MIG 34GB` — checked before the aliases, so `RTX PRO 6000` is the Server Edition, as listed), an
 alias (`3070`, `4080super`, `L4`, `2000ada`, `A4500`, …) or a unique catalog short name (`RTX 3070`,
 `H100 SXM`) — must be in RunPod's live GPU catalog (`GET /v2/catalog/gpus` on v2, the default;
@@ -776,6 +801,19 @@ GraphQL on `RUNPOD_API=v1`), else the command stops before anything is created: 
 isn't a RunPod GPU type — did you mean `NVIDIA GeForce RTX 3070` (RTX 3070)?``.
 
 If the catalog can't be fetched it warns and passes the flag through unchecked.
+
+**Types the public catalog doesn't list.** RunPod rents some it lists nowhere: ARENA had a `NVIDIA B300
+SXM6 AC MIG 1g.34gb` pod (rented at $0.50/h) that neither v2's catalog nor GraphQL `gpuTypes` nor the
+website lists, on ARENA's account or the sandbox's (2026-10-29) — so no catalog can teach it. `--gpu`
+takes such a type when arena has *seen* it, by its exact id (any case) or an alias that maps to it:
+arena's own list (`gpu::UNLISTED`: that B300 slice, also `B300 MIG`, `B300-MIG-34`), config
+`RUNPOD_EXTRA_GPU_TYPES` (exact ids, comma-separated; also from the environment for one run), or a
+pod on the account (one `GET /v2/pods` walk, only when the catalog and the config didn't already
+match). It says ``warning: --gpu `…` isn't in RunPod's public catalog — trying it; RunPod's create
+decides`` and goes ahead; v2's create schema has no enum for `gpu.id` (its OpenAPI document,
+2026-10-29), so only a create tells. A typo is still refused, the seen types among the suggestions.
+With no catalog price it's unpriced: `--max-price` drops it ("no known price"), as it drops any
+option it can't check.
 
 On REST v1 an id outside v1's create enum (it lags the catalog — the PRO 6000 MIG slices) is refused
 too, saying v2's create takes it: `remove RUNPOD_API=v1 (v2 is the default)`. Vast/Hetzner: passed
@@ -916,59 +954,98 @@ body".
 
 ### `offers`
 
-`offers [--gpu …] [--cloud …] [--max-price …] [--gpus N] [--server-type T] [--order …] [--all]
-[--json]` — read-only: what `create`/`up` would try, on every provider at once. One table over the
-providers with a key in the config, in the fleet's order (RunPod, Vast, Hetzner): PROVIDER, `#` (the
-order `create`/`up` would try that provider's options in), OPTION, CLOUD, SIZE (VRAM per GPU — the
-live catalog's, else the preset's — or vCPU/RAM for a Hetzner VM), PER POD (`$`/h; `~` = preset
-estimate; Hetzner's in `€`, as it bills, never converted), SOURCE (`live`, `estimate`, or `list` for
-Hetzner's list price, which placement doesn't use), STOCK, and WHERE when near the proxy is on
-(`Europe` for an option tried only there, `any`: [Near the
-proxy](#near-the-proxy-near-and-near_max_extra_pct)); then what
-the cap dropped and why, each provider's notes and the providers left out. With no key at all,
-RunPod alone (priced from the presets), as before.
+`offers [PROVIDER|all] [--gpu …] [--cloud …] [--max-price …] [--gpus N] [--server-type T] [--order …]
+[-v] [--json]` — read-only. Two views: with no provider, what `create`/`up` would try, on every
+provider at once; with one (`runpod`, `vast`, `hetzner`, `shadeform`) or `all`, everything it sells.
+
+**`arena offers`**: one table over the providers with a key in the config, in the fleet's order
+(RunPod, Vast, Hetzner): PROVIDER, `#` (the order `create`/`up` would try that provider's options in),
+OPTION, CLOUD, SIZE (VRAM per GPU — the live catalog's, else the preset's — or vCPU/RAM for a Hetzner
+VM), PER POD (`$`/h; `~` = preset estimate; Hetzner's in `€`, as it bills, never converted), SOURCE
+(`live`, `estimate`, or `list` for Hetzner's list price, which placement doesn't use), STOCK, and
+WHERE when near the proxy is on (`Europe` for an option tried only there, `any`: [Near the
+proxy](#near-the-proxy-near-and-near_max_extra_pct)). Under it, a provider that failed, then one
+line: `# = the order `up` tries · -v: 4 notes, 1 over --max-price, shadeform skipped · everything on
+sale: `arena offers all``. **`-v`** prints instead what the cap dropped and why, each provider's
+notes and the providers left out (the explanations that used to fill four lines under every table
+are in `offers --help`). With no key at all, RunPod alone (priced from the presets), as before.
 
 Each provider's rows are made by the functions `create`/`up` run — the `--gpu` check, the request
 from the flags and the placement planner — so the order and prices are theirs, and a change to
 placement shows here unchanged. `create`/`up` use **one** provider per run (`--provider`, default
-`runpod`): `#` orders the options within a provider, never across.
+`runpod`): `#` orders the options within a provider, never across. `--gpu`, `--cloud`,
+`--max-price` and `--server-type` preview a setup other than the config's.
 
 - `--provider X` on the command line: that provider alone (its default, `runpod`, doesn't count —
   clap's value source tells them apart). **Shadeform** shows only this way: it's opt-in overflow,
-  never in `up`'s default (with its key set, a `skipped:` line says so). One catalog read prices every option at its cheapest in-stock entry
-  (allowed clouds, CUDA floor, `SHADEFORM_MAX_PRICE`); an option with nothing in stock is noted and
-  left unpriced.
+  never in `up`'s default (with its key set, `-v` says it was skipped). One catalog read prices every
+  option at its cheapest in-stock entry (allowed clouds, CUDA floor, `SHADEFORM_MAX_PRICE`); an
+  option with nothing in stock is noted and left unpriced.
 - **Filters** apply per provider exactly as `create` applies them. A flag that doesn't apply to a
-  provider (`--gpu`/`--gpus` on Hetzner, `--server-type` elsewhere) leaves it out with a `skipped:`
-  line — or, with that provider named, fails as `create` does. A provider whose planning fails (a
+  provider (`--gpu`/`--gpus` on Hetzner, `--server-type` elsewhere) leaves it out (`skipped:`, with
+  `-v`) — or, with that provider named, fails as `create` does. A provider whose planning fails (a
   `--gpu` typo, a server type Hetzner doesn't have or sells nowhere `HETZNER_LOCATION` allows) is
   listed as `failed:` while the others still show, and the command exits non-zero; named, it just
   fails. A read that doesn't answer (a catalog, a Vast search) is a note, never a failure, as in
   `create`'s own plan. Flags that apply to no provider in scope (`--server-type` with no Hetzner
-  key) are an error: nothing to show. `--cloud` is RunPod's (it collapses
-  elsewhere, with a note when several were asked for).
+  key) are an error: nothing to show. `--cloud` is RunPod's tiers and Vast's host classes
+  ([Vast.ai](#vastai)); a RunPod tier on Vast means its default, with a note when it was one of
+  several.
 - **Hetzner's row** is the VM `up --provider hetzner` would create: `--server-type` over
-  `HETZNER_SERVER_TYPE` (default `cx23`), its vCPUs and RAM, and its gross €/h where the create's
+  `HETZNER_SERVER_TYPE` (default `cx33`), its vCPUs and RAM, and its gross €/h where the create's
   location walk starts (one `GET /server_types`, plus the same nearest-first timing a create does;
   the walk is in a note). Placement itself quotes no price for it, so `--max-price` drops it ("no
   known price"), exactly as `create --provider hetzner --max-price …` would. Without
   `HETZNER_API_KEY`, or if the read fails, the row keeps the type's name, size and price unknown;
   a type the catalog says create would refuse is a failure, not a row.
-- `--json`: `{"providers": [...], "skipped": [{provider, why}], "failed": [{provider, why}]}`. Each provider is its option plan as
-  `create` sees it — `provider, gpu_count, order, max_price, options, dropped, notes`, the fields of
-  the old single-provider `offers --json` — with `vram_gb` added to each option, and on Hetzner a
-  `server_type` object (`name, cores, cpu_type, architecture, memory_gb, disk_gb, eur_per_hour,
-  locations`). **Changed:** `offers --json` used to print one provider's plan as the top-level
-  object; it's now under `providers[]` (`jq '.providers[] | select(.provider == "runpod")'` for the
-  old shape).
+- `--json` (unchanged, the dashboard's new-pod form reads it): `{"providers": [...], "skipped":
+  [{provider, why}], "failed": [{provider, why}]}`. Each provider is its option plan as `create`
+  sees it — `provider, gpu_count, order, max_price, options, dropped, notes`, `near` when on — with
+  `vram_gb` added to each option, and on Hetzner a `server_type` object (`name, cores, cpu_type,
+  architecture, memory_gb, disk_gb, eur_per_hour, locations`).
 
-**`--all`**: every type each provider sells instead of what `create` would try (it doesn't take
-the option flags). RunPod: its GPU catalog, exactly as [`gpus`](#gpus) printed it. Hetzner: every
-server type on sale somewhere now — vCPUs, RAM, disk, €/h in its cheapest location, where it's sold
-— with `HETZNER_SERVER_TYPE`'s starred (or a line saying it's on sale nowhere now). Vast and Shadeform are marketplaces with no fixed list: a
-note says to price GPUs with `offers --provider vast --gpu …`. A list that can't be read is a note;
-RunPod's config refusing it (a bad `RUNPOD_API`) fails the command after the rest is shown.
-`--all --json`: `{"runpod": [rows as gpus --json], "hetzner": [server types], "notes": [...]}`.
+**`arena offers <provider>`**, and **`all`** for every configured provider's (Shadeform left out
+unless named, as above; `--all` is still taken, hidden). Each is a heading, a table and a line or
+two of notes; `#` marks what `up` with the config (and the flags) would try, in its order — from
+the same plan as the default view (a config `up` can't plan with — a `CLOUD_TYPE` the provider
+doesn't take — leaves the list unmarked, a note saying why). `--gpu`, `--cloud` and `--max-price`
+(per pod of `--gpus`) filter the rows; a row whose price is unknown doesn't pass a cap. Vast
+searches only the classes `--cloud` admits, so a failed search can't hide behind another's.
+
+- **RunPod**: every GPU type in its catalog once per tier that sells it (`COMMUNITY`, `SECURE`),
+  with that tier's $/h per GPU and stock — so B200/B300 and the MIG slices show, the secure-only ones
+  as `SECURE`, whatever `CLOUD_TYPE` says. A type no tier sells now stays as one row, `not sold now`;
+  on `RUNPOD_API=v1` a type its create enum lacks says `v1: not creatable`. Then the types the
+  catalog lacks that arena has seen (above): `unlisted`, priced only by what a pod of it on the
+  account bills (`pod`), else `?`. The last column is the `--gpu` name. RunPod's CPU pods
+  (`/v2/catalog/cpus`: `cpu3c/g/m`, `cpu5c/g/m`, secure only, from $0.03 per vCPU-hour) aren't
+  listed, and a note says so: v2's create takes `cpu` *instead of* `gpu`, and arena always sends
+  `gpu` (an `--api-json` `cpu` would be refused by RunPod: exactly one of the two).
+- **Vast**: the GPUs on the market now — three searches, one per host class, each for a pod of
+  `--gpus` GPUs with the config's disk and CUDA floor, any card, its 1000 cheapest offers (with
+  `--gpu`, one per class and card instead, so a pricier card isn't crowded out; a search that
+  filled its 1000 says so) — and per card and class the cheapest offer: $/h per GPU and where it
+  is. A class `up` wouldn't rent as configured says `--cloud unverified`. `#` is on the row each
+  option tried anywhere would rent: the cheapest of the classes its tier admits (a near option
+  rents in its region, which these rows don't show). Each create searches again. Every search
+  failed (an expired key): the list failed; some: a note.
+- **Hetzner**: every server type on sale somewhere now — vCPUs, RAM, disk, €/h in its cheapest
+  location, where it's sold — grouped by family with a line heading each: `cx` (shared x86,
+  cost-optimised), `cpx` (shared AMD: the newer `cpx?2` first, then the older, US-only `cpx?1`),
+  `cax` (shared Arm), `ccx` (dedicated x86), then any other; by size within a family (vCPUs, then
+  RAM: cx23, cx33, cx43). `HETZNER_SERVER_TYPE` (or `--server-type`) is starred, or a line says it's
+  on sale nowhere now. `--json` keeps the same order.
+- **Shadeform**: a marketplace priced per GPU — a note says to use `offers --provider shadeform
+  --gpu …`.
+
+`--json`: `{"catalogs": [{"provider", "gpu_count", "rows": [...], "server_types": [...] (Hetzner
+only), "notes": [...]}], "skipped": [{provider, why}], "failed": [{provider, why}]}`. A row is
+`{gpu, name, vram_gb, cloud, price_per_gpu, price_source, stock, location?, try_order, note?}`:
+`gpu` the `--gpu` name, `cloud` the tier or host class (`null`: unknown or unsold), `price_source`
+`live`/`estimate`/`pod`, `try_order` the `#` (`null`: `up` wouldn't try it). A list that can't be
+read (no key, an error) is `failed` — the others still show, then the exit is non-zero; named, the
+command just fails. **Changed:** `offers --all --json` was `{"runpod": [rows as gpus --json],
+"hetzner": [...], "notes": [...]}`; `gpus --json` still prints that RunPod array.
 
 ### `pods up`
 
@@ -1446,8 +1523,12 @@ an `AI$` column (each pod's key: spent/cap, yellow from 80%, red at the cap or d
 shown from 122 columns), an `ai key:` line in the detail pane (the cap, what's left, today, week,
 month, all told), and the summary bar's `openrouter $422.09 left · AI today $3.20`. It leads the bar
 in yellow when the credit is less than the enabled keys' caps could still spend, or a key is at its
-cap, and in red when the credit is gone. The credit is the account's (an organization's whole),
-whatever the workspace.
+cap, and in red when the credit is gone. The keys at their cap are named — `⚠ AI key at cap:
+arena9-foo (no pod)`, two at most, then `+N more` — those no listed pod is named after first
+(`(no pod)`: no row shows it, e.g. its machine was terminated or renamed); the detail pane's `ai
+caps:` line lists them all and points at `arena keys list`. A key with a $0 cap that has spent
+nothing in its cap's period is **paused**, not at its cap: its cell says `paused` (grey) and the
+warning leaves it out. The credit is the account's (an organization's whole), whatever the workspace.
 
 Keys are found by name, so no local hash bookkeeping; a machine that left the list but still has a
 key (or a CSV row) can still be targeted by name. Dry-runs show each key name and whether it exists.
@@ -1969,9 +2050,9 @@ next step.
 
 ### `gpus`
 
-`gpus` — the old name for RunPod's part of [`offers --all`](#offers), kept for habits and scripts
-(hidden from `--help`), unchanged: the same table, `gpus --json` the same array of rows, and with
-another `--provider` the presets, as before.
+`gpus` — RunPod's GPU list as it always printed ([`offers runpod`](#offers) shows it per tier),
+kept for habits and scripts (hidden from `--help`), unchanged on stdout: the same table, `gpus
+--json` the same array of rows, and with another `--provider` the presets, as before.
 
 RunPod's **full live catalog** (via `GET /v2/catalog/gpus` for both tiers, the default — STOCK
 shown as `community/secure`, counted over hosts at or above the CUDA floor, and the best signal the
@@ -2148,7 +2229,10 @@ clears the marks).
 set-branch), on the **whole fleet** with `A` (backup / setup / test / run / set-branch; restart,
 stop and terminate only on a **marked** set — a stop there skips, and names, pods not running and
 pods whose provider has no stop (Shadeform), and refuses a set of only those, as `pods stop` does),
-or **add pods** with `n` (it lists the fleet in the background first). `run` and `set-branch` pop a
+or **add pods** with `n` ([Adding pods](#adding-pods)). The cursor pod's menu also runs four CLI
+commands as they are — `start` (a stopped pod, after a confirm), `rename` (type the new name),
+`jobs` and `logs` (read-only: the newest job's last 100 lines) — as `arena pods …` children, their
+output in the runs panel (below). `run` and `set-branch` pop a
 text-input modal to type the command / branch; `run` shows each pod's whole output (its last 40
 lines, stderr too when it fails); `test` is read-only. Every mutation goes through a confirmation
 modal — the *only* place the TUI mutates anything. Lifecycle actions (restart/stop/terminate)
@@ -2161,10 +2245,52 @@ reads stay reads.
 
 ### Adding pods
 
-**Add-pod (`n`)** is an interactive form: `↑↓` moves between fields, `←→` changes the value. Pick
-the provider (unavailable ones — no API key — are greyed out), cloud type (RunPod only), GPU type
-(full option list shown) and count, and how many pods; it previews the names it will allocate, then
-creates on `enter`.
+**Add-pod (`n`)** is a form that opens at once, from the rows already on screen: nothing is listed
+or awaited, so stepping across providers with `←→` is instant (it used to list the whole fleet on
+every provider change, about a second each with the dashboard frozen). `↑↓` moves between fields:
+the provider (those with an API key), RunPod's cloud tier (`COMMUNITY`, `SECURE`, or `COMMUNITY →
+SECURE` to fall back), the type, GPUs per pod, disk, volume, `--check`, and how many pods (the
+free names as of the last refresh — `up` lists the fleet again and picks its own). The type is a
+GPU type, or on Hetzner the **server type** (`HETZNER_SERVER_TYPE`, default `cx33`, first; each with
+its vCPUs, RAM and €/h) — there are no GPU, disk or volume fields there. The choices come from the
+provider's live catalogue, read once in the background by `arena offers` (RunPod: every type it
+sells, B300s and MIG slices included; a type sold only on the other tier moves the tier there and
+says so); the presets stand in until it lands (`…`) or if it can't be read. Under the fields, what
+`up` would try for the choice, in order, with price, stock and near/anywhere: `arena offers
+--json`, asked once the form has rested on a choice for 0.4 s and kept for 3 minutes, so arrowing
+through a list costs one request (`o` turns it off).
+
+`enter` shows the exact command and `y` runs it: `arena --config <the dashboard's> --provider <P>
+pods up --add N … --yes` — so a pod from the dashboard gets everything `up` does (placement and its
+fallbacks, near the proxy, the endpoint wait, proxy, setup, keys, `--check`). It's the `arena`
+installed beside `arena-tui`, never one from `PATH`. It runs in the background:
+
+- **The runs panel (`p`)** shows a run's command, each pod's state from its `[created]`, stage,
+  `READY` and `FAILED` lines, and the whole output (scroll with `↑↓`/PgUp/PgDn, `End` follows,
+  `←→` other runs, `Esc` hides it — the run goes on). The footer says `⟳ pods up 1m12s (1 under
+  way)` while one runs, and the tally when it ends (`✗ pods up: exit 1 — 1 ready, 1 failed`). A
+  created pod shows as a `pending` row at once.
+- **`s`** in the panel sends the run Ctrl+C (SIGINT to its process group): `up` stops where it is
+  and terminates nothing.
+- Its output is also in a file of its own under the state directory (`runs/`, the newest 30
+  kept). It isn't a pipe, and the run is in a process group of its own, so it outlives the
+  dashboard: **quitting while a run that changes pods is going asks first** — leave it running (the
+  default: it finishes what was confirmed, as `nohup arena pods up …` would), send it Ctrl+C, or
+  stay. A hangup or a TERM leaves it running too. Read-only runs (`jobs`, `logs`, `offers`) end
+  with the dashboard.
+
+### Keeping up with the keys
+
+Each pass of the loop takes **every** input event already waiting (up to 256, or 40 ms of them)
+before it draws again; it used to draw after each one, so a held key, a burst of keys or a slow
+terminal over SSH queued events faster than frames went out, and the lag grew with the queue. A
+frame is drawn when something changed — a key, a refresh or a result landing, a notice — or once a
+second for the clock (every 0.2 s while a spinner or a running command's output is on screen); the
+view is rendered under the shared lock and the terminal written after it's released, so a slow
+terminal never holds up the refresh. No network or SSH call is awaited in the key loop: each runs
+in a task of its own and lands through the shared state. The mouse reports clicks, drags and the
+wheel, not every pointer motion. `ARENA_TUI_TRACE=<file>` records each frame (render and write
+times, in µs) and each input event, to measure lag (see [Testing](#testing)).
 
 ## Testing
 
@@ -2221,6 +2347,21 @@ does, and checks it doesn't verify as another workflow's or another repository's
 
 ```bash
 ARENA_LIVE_ATTEST=1 cargo test --release -p arena-core --lib attest -- --ignored --nocapture
+```
+
+### Measuring the dashboard
+
+`ARENA_TUI_TRACE=<file>` makes `arena-tui` write one tab-separated line per frame (`frame <µs since
+start> <render µs> <write µs> <events since the last frame>`) and per input event (`event <µs>
+<key>` — a key by its kind, `Char` for any character, never what was typed). It takes a new file,
+made readable by you alone, and refuses a path that exists. `ARENA_TUI_DEMO=<n>` (1–500, a developer's aid, not in `--help`) shows a made-up fleet of
+`n` pods instead of the real one — nothing is listed, probed or run — so a sandbox with no pods can
+measure the dashboard at a cohort's size. The summary of a trace (frames, render/write times, and
+per burst of keys the time from its first event to the frame that shows its last):
+
+```bash
+ARENA_TUI_TRACE_SUMMARY=/tmp/trace.tsv cargo test -p arena-tui -- --ignored --nocapture trace_summary
+cargo test --release -p arena-tui -- --ignored --nocapture view_cost   # µs per frame over 60 pods
 ```
 
 ## AI review before merging

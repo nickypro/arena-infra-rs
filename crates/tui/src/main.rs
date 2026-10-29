@@ -32,7 +32,12 @@
 //! `ARENA_CONFIG`; initial cadence by `ARENA_REFRESH_SECS` (default 5).
 
 mod ask;
+mod demo;
+mod lag;
+mod newpod;
+mod offers;
 mod prefs;
+mod runs;
 mod state;
 
 use std::collections::HashMap;
@@ -45,7 +50,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        self, DisableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
         MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
@@ -69,17 +74,17 @@ use arena_core::remote::{describe_error, Remote, SshRemote};
 use arena_core::selector::Naming;
 use arena_core::snapshot::{self, FleetSnapshot, HealthCache};
 use arena_core::ssh::SshTarget;
-use arena_core::naming;
-use arena_core::{Config, Pod, PodSpec};
+use arena_core::{Config, Pod};
 
 use prefs::Prefs;
 use arena_core::status::pod_status;
 use state::{
     action_summary, capture_details, carry_over, remember_good, dashboard_snapshot, details_due, display_name, health_cell, listing_note, mark_key, marked_pods,
     marked_set_token, merge_details, overlay_details, partial_notice, proxy_cell, proxy_detail, rtt_cell,
-    provider_title, select_marks, short_branch, spark, summarize, summary_text, Action, Confirm, DeepChecks, Endpoint,
-    FleetSummary, History, NewPodForm, NpField, PodDetails, ProviderOpt, Rtts, Throttle, Tone, RTT_EVERY, RTT_WAIT,
+    provider_title, select_marks, short_branch, spark, summarize, summary_text, count_of, Action, Confirm, DeepChecks, Endpoint,
+    FleetSummary, History, PodDetails, Rtts, Throttle, Tone, RTT_EVERY, RTT_WAIT,
 };
+use newpod::NewPodForm;
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 /// Shorter than backup/setup's 10s: a down pod shouldn't stall a whole metrics sweep.
@@ -144,8 +149,16 @@ enum Mode {
     /// one or one that is every listed pod: [`fleet_confirm_token`]). `note`: what the confirm
     /// says besides (a stop's pods it will skip, and why — [`StopPlan::skip_lines`]).
     FleetConfirm { action: Action, typed: String, scope: Scope, note: String },
-    /// Interactive add-pod form (↑↓ field, ←→ value).
+    /// Interactive add-pod form (↑↓ field, ←→ value) — `newpod.rs`.
     NewPod(NewPodForm),
+    /// The add-pod form's confirm: the `arena pods up` it will run; `y` runs it (`runs.rs`).
+    UpConfirm(NewPodForm),
+    /// The runs panel (`p`): run `id`'s progress and output, following its end unless scrolled
+    /// (`scroll`); `stop`: asking whether to send it Ctrl+C. Esc hides it; the run goes on.
+    Runs { id: u64, scroll: Option<u16>, stop: bool },
+    /// `q` with a run that changes pods still going: leave it running and quit, stop it and
+    /// quit, or stay (`runs.rs`).
+    Quit,
     /// Collect a free-text argument (a command, or a branch) for `Run`/`SetBranch`,
     /// against one pod or a multi-pod scope, then execute on Enter.
     Input { action: Action, scope: InputScope, value: String },
@@ -220,9 +233,13 @@ struct Shared {
     ai: Option<UsageView>,
     /// The cohort's share of it, for the summary bar.
     ai_cohort: Option<CohortUsage>,
-    /// `n`'s fresh listing, set by its background task ([`start_new_pod_listing`]); the UI
-    /// loop turns it into the add-pod form ([`new_pod_mode`]).
-    new_pod_listing: Option<std::result::Result<Vec<Pod>, String>>,
+    /// The CLI commands started from the dashboard (`runs.rs`), oldest first, and the last id
+    /// given out.
+    runs: Vec<runs::Run>,
+    next_run: u64,
+    /// `arena offers` answers for the add-pod form, set by their background tasks; the loop
+    /// hands them to `Ui::offers`.
+    offers_landed: Vec<(offers::Query, std::result::Result<String, String>)>,
     /// What a restart does to each row's container disk, by [`mark_key`]: its backend's answer
     /// (`Provider::restart_resets_container`, pure), set with the rows each refresh — what the
     /// action menus' restart label says ([`Shared::restart_reset`]).
@@ -301,6 +318,18 @@ struct Ui {
     /// When `D` was pressed, and the pods it named ([`mark_key`]): a second `D` within
     /// [`DEEP_ALL_CONFIRM`] deep-checks those of them that still qualify.
     deep_all_armed: Option<(Instant, std::collections::HashSet<String>)>,
+    /// `ARENA_TUI_TRACE`'s frames and events (`lag.rs`); off unless a file is named.
+    trace: lag::Trace,
+    /// How to run the CLI (`runs.rs`): the `arena` beside this executable — or why there's none
+    /// (then the form, start, rename, jobs and logs say so).
+    cli: std::result::Result<runs::Cli, String>,
+    /// Wakes the refresh (a run made or finished a pod).
+    nudge: Arc<Notify>,
+    /// The add-pod form's catalogs and availability, kept for the dashboard's life (`offers.rs`).
+    offers: offers::State,
+    /// `ARENA_TUI_DEMO`: the rows are made up (`demo.rs`) — every key that would act on a pod,
+    /// reach one or create one is refused ([`demo_refuses`]).
+    demo: bool,
 }
 
 impl Ui {
@@ -352,12 +381,16 @@ async fn main() -> Result<()> {
     let cfg = Config::load(&PathBuf::from(&config_path))
         .with_context(|| format!("loading config {config_path}"))?;
     let provider_name = std::env::var("ARENA_PROVIDER").unwrap_or_else(|_| "runpod".to_string());
+    let demo = demo::wanted(std::env::var("ARENA_TUI_DEMO").ok().as_deref());
     // Fleet-spanning provider (like the CLI): the dashboard lists pods across ALL configured
     // backends — runpod + vast + hetzner — not just the primary. `warn_on_partial=false` so a
     // provider hiccup (e.g. Vast 429) doesn't print onto the alternate screen. Creates still
-    // go to the chosen primary (ARENA_PROVIDER).
-    let provider: Arc<dyn Provider> =
-        Arc::from(arena_core::provider::build_fleet(&provider_name, &cfg, false)?);
+    // go to the chosen primary (ARENA_PROVIDER). A demo asks no provider anything.
+    let provider: Arc<dyn Provider> = match demo {
+        Some(_) => Arc::new(demo::NoProvider),
+        None => Arc::from(arena_core::provider::build_fleet(&provider_name, &cfg, false)?),
+    };
+    let trace = lag::Trace::from_env();
     let progress_cmd = cfg.get("PROGRESS_CMD").map(String::from);
     let initial_secs = std::env::var("ARENA_REFRESH_SECS")
         .ok()
@@ -371,7 +404,7 @@ async fn main() -> Result<()> {
     let interval = Arc::new(AtomicU64::new(initial_secs));
     let nudge = Arc::new(Notify::new());
     let details_wanted = Arc::new(AtomicBool::new(false));
-    let remote: Arc<dyn Remote> = Arc::new(SshRemote);
+    let remote: Arc<dyn Remote> = if demo.is_some() { Arc::new(demo::NoRemote) } else { Arc::new(SshRemote) };
 
     // The prepaid balances for the summary bar: observed in the refresh's details round
     // (bounded, quiet), recorded in the CLI's state file. A bad BALANCE_WARN_HOURS falls
@@ -381,18 +414,32 @@ async fn main() -> Result<()> {
     // OpenRouter's keys and credit, on the same cadence, when a provisioning key is set.
     let ai = OpenRouter::from_config(&cfg).map(AiCtx::new);
 
-    // Background fetcher: keeps `shared` fresh without blocking the UI.
-    tokio::spawn(fetch_loop(
-        provider.clone(),
-        remote.clone(),
-        cfg.clone(),
-        progress_cmd,
-        shared.clone(),
-        Cadence { interval: interval.clone(), nudge: nudge.clone(), details_wanted: details_wanted.clone() },
-        DetailsState { balance: Some(balance), ai, rtt: Some(Rtts::default()), ..Default::default() },
-    ));
+    // Background fetcher: keeps `shared` fresh without blocking the UI. A demo's makes its
+    // rows up instead.
+    match demo {
+        Some(n) => {
+            tokio::spawn(demo::refresh_loop(shared.clone(), cfg.clone(), n, interval.clone(), nudge.clone()));
+        }
+        None => {
+            tokio::spawn(fetch_loop(
+                provider.clone(),
+                remote.clone(),
+                cfg.clone(),
+                progress_cmd,
+                shared.clone(),
+                Cadence { interval: interval.clone(), nudge: nudge.clone(), details_wanted: details_wanted.clone() },
+                DetailsState { balance: Some(balance), ai, rtt: Some(Rtts::default()), ..Default::default() },
+            ));
+        }
+    }
 
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
+    // The CLI the form and the menu run: the `arena` installed beside this dashboard — none in a
+    // demo, which acts on nothing.
+    let cli = match demo {
+        Some(_) => Err("demo: the pods are made up — nothing is run".to_string()),
+        None => runs::Cli::locate(std::env::current_exe(), &config_path, snapshot::state_dir_for(&cfg)),
+    };
     let ui = Ui {
         provider_name,
         config_path,
@@ -409,6 +456,11 @@ async fn main() -> Result<()> {
         last_table: std::cell::Cell::new((Rect::default(), 0)),
         ask_ai: None,
         deep_all_armed: None,
+        trace,
+        cli,
+        nudge: nudge.clone(),
+        offers: offers::State::new(true),
+        demo: demo.is_some(),
     };
 
     dashboard(&shared, &provider, &interval, &nudge, &details_wanted, ui).await
@@ -435,12 +487,16 @@ async fn dashboard(
     exit_on_hangup();
     match run(&mut terminal, shared, provider, interval, nudge, details_wanted, ui).await {
         // `q` or Ctrl-C — or the loop finding the terminal put back by an end already under way,
-        // which exits.
-        Ok(()) => {
+        // which exits. A run left going (`runs.rs`) is said once the terminal is back; it isn't
+        // one of the children stopped here.
+        Ok(notes) => {
             if !arena_core::remote::end_children() {
                 return std::future::pending().await;
             }
             let restored = restore_terminal(&mut terminal);
+            for n in notes {
+                eprintln!("{n}");
+            }
             arena_core::remote::stop_all_children().await;
             restored.map(drop)
         }
@@ -982,9 +1038,28 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     *ours = true;
     enable_raw_mode()?;
     let mut out = stdout();
-    // EnableMouseCapture: wheel-scroll the list + click to select/multi-select rows.
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    // Clicks and the wheel: scroll the list, click to select/multi-select rows.
+    execute!(out, EnterAlternateScreen, MouseClicks)?;
     Ok(Terminal::new(CrosstermBackend::new(out))?)
+}
+
+/// Mouse reporting for clicks, drags and the wheel only: crossterm's `EnableMouseCapture` also
+/// asks for every motion (mode 1003), so moving the pointer over the dashboard sent a stream of
+/// events (each one a frame, then) — and over SSH, their bytes. `DisableMouseCapture` turns
+/// every mode off again.
+struct MouseClicks;
+
+impl crossterm::Command for MouseClicks {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        // 1000: presses and releases (the wheel too); 1002: motion only with a button down;
+        // 1006: SGR coordinates (any column).
+        f.write_str("\x1b[?1000h\x1b[?1002h\x1b[?1006h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        crossterm::event::EnableMouseCapture.execute_winapi()
+    }
 }
 
 /// Give the terminal back. `false`: it wasn't the dashboard's — an end from outside the loop has
@@ -1079,7 +1154,8 @@ async fn end_now(code: i32, why: Option<String>) {
 /// Mouse handling: wheel-scroll the pod list (or the result modal), and in the list
 /// left-click a row to select it. Clicking the far-left of a row — or shift-clicking
 /// anywhere on it — toggles that pod's multi-select mark (same `marked` set as `space`).
-fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared>>) {
+/// `false`: nothing changed (a move, a click outside the rows) — no frame for it.
+fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared>>) -> bool {
     let in_list = matches!(ui.mode, Mode::List);
     let in_result = matches!(ui.mode, Mode::Result(_));
     match m.kind {
@@ -1102,7 +1178,7 @@ fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared>>) {
         }
         MouseEventKind::Down(MouseButton::Left) => {
             if !in_list {
-                return;
+                return false;
             }
             let (area, offset) = ui.last_table.get();
             // Data rows sit below the top border (1) + header (1), above the bottom border.
@@ -1111,13 +1187,13 @@ fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared>>) {
             let (mx, my) = (m.column, m.row);
             if my < rows_top || my >= rows_bot || mx < area.x || mx >= area.x.saturating_add(area.width)
             {
-                return; // click outside the table rows
+                return false; // click outside the table rows
             }
             let idx = offset + (my - rows_top) as usize;
             let key = {
                 let s = shared.lock().unwrap();
                 if idx >= s.pods.len() {
-                    return;
+                    return false;
                 }
                 mark_key(&s.pods[idx])
             };
@@ -1129,8 +1205,9 @@ fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared>>) {
                 ui.marked.insert(key);
             }
         }
-        _ => {}
+        _ => return false,
     }
+    true
 }
 
 /// Read the currently selected pod (a clone, so we don't hold the lock).
@@ -1296,27 +1373,6 @@ fn list_key(ui: &mut Ui, code: KeyCode, len: usize) -> ListKey {
     ListKey::Done
 }
 
-/// `n`: list the whole fleet **in the background** — fresh, not the cached snapshot, so the
-/// form never offers a name that already exists — and say so meanwhile; the loop opens the
-/// form when the listing lands ([`new_pod_mode`]). Awaiting it in the key loop froze the
-/// dashboard (no redraw, no keys) for as long as the slowest provider took to answer.
-fn start_new_pod_listing(shared: &Arc<Mutex<Shared>>, provider: &Arc<dyn Provider>, ui: &mut Ui) {
-    ui.mode = Mode::Working("listing the fleet for free names…".into());
-    let (shared, provider) = (shared.clone(), provider.clone());
-    tokio::spawn(async move {
-        let listed = provider.list_pods().await.map_err(|e| e.to_string());
-        shared.lock().unwrap().new_pod_listing = Some(listed);
-    });
-}
-
-/// The add-pod form for `n`'s listing — or why there is none.
-fn new_pod_mode(ui: &Ui, listed: std::result::Result<Vec<Pod>, String>) -> Mode {
-    match listed {
-        Ok(existing) => Mode::NewPod(build_new_pod_form(&ui.cfg, &ui.provider_name, &existing)),
-        Err(e) => Mode::Result(format!("✗ list failed: {e}")),
-    }
-}
-
 /// A hangup or a TERM ends the dashboard at once ([`end_now`], exit status 129 or 143), from a
 /// task of its own: a question still being asked (`?`) stopped with everything it started
 /// (review ai-review claude #2: the AI, in a session of its own, ran on when either signal killed
@@ -1354,6 +1410,41 @@ fn exit_on_hangup() {
     });
 }
 
+/// The dashboard's parts the key handling needs besides `ui`.
+struct Ctx<'a> {
+    shared: &'a Arc<Mutex<Shared>>,
+    provider: &'a Arc<dyn Provider>,
+    interval: &'a AtomicU64,
+    nudge: &'a Notify,
+    details_wanted: &'a AtomicBool,
+}
+
+/// What handling an event came to.
+#[derive(Debug, Clone, PartialEq)]
+enum Flow {
+    /// Nothing on screen changed (a mouse moving, a key with no use here).
+    Same,
+    /// Draw again.
+    Changed,
+    /// Leave the dashboard, saying these lines once the terminal is back (a run left running).
+    Quit(Vec<String>),
+}
+
+/// The key loop. Each pass:
+/// 1. what landed from the background is taken in ([`land`]: an action's result, a `?` answer,
+///    `offers` answers) and the add-pod form's fetches are started (`newpod::tick`) — started,
+///    never awaited: **no network or SSH call is awaited in this loop**; each runs in a task of
+///    its own and lands through `Shared` (the form's provider switch awaited a whole-fleet
+///    listing here: a second per keypress, the dashboard frozen);
+/// 2. a frame is drawn when something changed — a key, a landing, a refresh, a notice — or the
+///    tick is up ([`lag::frame_due`]), not on every pass; the shared lock is released before the
+///    terminal is written ([`draw_frame`]);
+/// 3. it waits for input until the tick, in [`lag::POLL_SLICE`]s, then takes **every** event
+///    already waiting ([`lag::drain`]) before it draws again. It drew after each one: a held key,
+///    a mouse dragged over the table or a slow terminal over SSH queued events faster than frames
+///    went out, and the lag grew with the queue.
+///
+/// `Ok`: the lines to say once the terminal is back (a run left running).
 #[allow(clippy::too_many_arguments)]
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -1363,378 +1454,408 @@ async fn run(
     nudge: &Notify,
     details_wanted: &AtomicBool,
     mut ui: Ui,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let cx = Ctx { shared, provider, interval, nudge, details_wanted };
+    let mut last_frame: Option<Instant> = None;
+    let mut dirty = true;
+    let mut seen = None;
+    let mut events = 0usize;
     loop {
-        // A finished background action surfaces as a Result modal (then nudge a refresh).
-        {
-            let msg = shared.lock().unwrap().action_result.take();
-            if let Some(msg) = msg {
-                ui.result_scroll = 0;
-                ui.mode = Mode::Result(msg);
-                nudge.notify_one();
-            }
-        }
-        // A `?` answer landed: its popup (from the list/detail view; otherwise it waits).
-        ask::land(&mut ui, shared);
-        // `n`'s listing landed: the add-pod form (or why not).
-        {
-            let listed = shared.lock().unwrap().new_pod_listing.take();
-            if let Some(listed) = listed {
-                ui.mode = new_pod_mode(&ui, listed);
-            }
+        let now = Instant::now();
+        dirty |= land(&mut ui, shared, nudge, now);
+        dirty |= newpod::tick(&mut ui, shared, now);
+        let (len, stamp, live) = {
+            let s = shared.lock().unwrap();
+            (s.pods.len(), stamp(&s), live(&s, &ui, now))
+        };
+        // A refresh, a notice, a pending row or a run's output since the last frame.
+        if seen != Some(stamp) {
+            seen = Some(stamp);
+            dirty = true;
         }
         // Clamp the cursor in case the fleet shrank under us.
-        let len = shared.lock().unwrap().pods.len();
         ui.selected = if len == 0 { 0 } else { ui.selected.min(len - 1) };
-
-        let secs = interval.load(Ordering::Relaxed);
-        {
-            let s = shared.lock().unwrap();
+        let tick = if live { lag::TICK_LIVE } else { lag::TICK_IDLE };
+        if lag::frame_due(Instant::now(), last_frame, dirty, tick) {
             // Put back by an end from outside the loop ([`end_now`]): nothing more to draw — the
             // loop ends, and that end exits.
-            if !while_ours(terminal, |t| t.draw(|f| view(f, &s, &ui, secs)).map(drop))? {
-                return Ok(());
+            if !draw_frame(terminal, shared, &mut ui, interval.load(Ordering::Relaxed), events)? {
+                return Ok(Vec::new());
             }
+            last_frame = Some(Instant::now());
+            dirty = false;
+            events = 0;
         }
-
-        // Short poll: the loop keeps redrawing (~7 fps) so live data and the
-        // "updated Ns ago" line stay current without any key press.
-        if !event::poll(Duration::from_millis(150))? {
+        if !event::poll(lag::wait_for(Instant::now(), last_frame, tick))? {
             continue;
         }
-        let ev = event::read()?;
-        if let Event::Mouse(m) = ev {
-            handle_mouse(m, &mut ui, shared);
-            continue; // redraw at the top of the loop
-        }
-        let Event::Key(k) = ev else { continue };
-        if k.kind != KeyEventKind::Press {
-            continue; // ignore key-release/repeat on terminals that emit them
-        }
-        // Ctrl+C always quits, from any mode. Raw mode swallows the usual SIGINT, so
-        // we handle the keystroke ourselves and let `restore_terminal` clean up.
-        if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
-            break;
-        }
-        let code = k.code;
-        // `?` and its two popups (ask.rs).
-        if ask::key(&mut ui, shared, code, k.modifiers) {
-            continue;
-        }
-
-        match ui.mode.clone() {
-            Mode::List | Mode::Detail => match list_key(&mut ui, code, len) {
-                ListKey::Quit => break,
-                ListKey::Done => {}
-                ListKey::Other => match code {
-                    KeyCode::Char('r') => {
-                        // A manual refresh also re-reads the provider's details (maintenance
-                        // windows, $/h) — rate-limited by `state::details_due`.
-                        details_wanted.store(true, Ordering::Relaxed);
-                        nudge.notify_one();
-                    }
-                    KeyCode::Char('d') => {
-                        // Deep-check the marked set if any are marked, else the cursor pod —
-                        // in the background; the rows say `checking` until it lands.
-                        let pods = if ui.marked.is_empty() {
-                            selected_pod(shared, ui.selected).into_iter().collect()
-                        } else {
-                            scope_pods(shared, &ui.marked, Scope::Marked)
-                        };
-                        if !pods.is_empty() {
-                            start_deep_check(shared, &ui, pods);
-                        }
-                    }
-                    KeyCode::Char('D') => {
-                        // Every running pod no one is using, after a second `D`: the first
-                        // says how many, and which it leaves out. The second checks only pods
-                        // the first named that still qualify — never one a refresh added since.
-                        let (mut pods, skipped) = {
-                            let s = shared.lock().unwrap();
-                            deep_all_plan(&s.pods, &s.metrics)
-                        };
-                        let armed = ui.deep_all_armed.take().filter(|(t, _)| t.elapsed() < DEEP_ALL_CONFIRM);
-                        let skipped = skipped_words(&skipped);
-                        pods = deep_all_confirm(pods, armed.as_ref().map(|(_, named)| named));
-                        if pods.is_empty() {
-                            shared.lock().unwrap().notify(format!("nothing to deep-check{skipped}"), false);
-                        } else if armed.is_some() {
-                            start_deep_check(shared, &ui, pods);
-                        } else {
-                            ui.deep_all_armed = Some((Instant::now(), pods.iter().map(mark_key).collect()));
-                            let n = pods.len();
-                            shared.lock().unwrap().notify(
-                                format!(
-                                    "D again to deep-check {n} running pod{} (about a minute of GPU load each){skipped}",
-                                    if n == 1 { "" } else { "s" }
-                                ),
-                                false,
-                            );
-                        }
-                    }
-                    KeyCode::Char('s') => {
-                        // Toggle short/full names and persist the choice.
-                        ui.short_names = !ui.short_names;
-                        Prefs { short_names: ui.short_names }.save();
-                    }
-                    KeyCode::Char('f') => {
-                        cycle_interval(interval);
-                        nudge.notify_one(); // apply a shorter cadence immediately
-                    }
-                    KeyCode::Char(' ') => {
-                        // Toggle multi-select mark on the cursor pod.
-                        if let Some(pod) = selected_pod(shared, ui.selected) {
-                            let key = mark_key(&pod);
-                            if !ui.marked.remove(&key) {
-                                ui.marked.insert(key);
-                            }
-                        }
-                    }
-                    KeyCode::Char('c') => {
-                        connect_ssh(terminal, shared, &mut ui)?;
-                        nudge.notify_one();
-                    }
-                    KeyCode::Char('n') => start_new_pod_listing(shared, provider, &mut ui),
-                    _ => {}
-                },
-            },
-            Mode::Menu { mut sel } => {
-                let n = Action::MENU.len();
-                match code {
-                    KeyCode::Esc => ui.mode = Mode::List,
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        sel = sel.saturating_sub(1);
-                        ui.mode = Mode::Menu { sel };
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        sel = (sel + 1).min(n - 1);
-                        ui.mode = Mode::Menu { sel };
-                    }
-                    KeyCode::Enter => choose_pod_action(shared, &mut ui, provider, Action::MENU[sel.min(n - 1)].1),
-                    KeyCode::Char(ch) => match Action::from_key(ch) {
-                        Some(action) => choose_pod_action(shared, &mut ui, provider, action),
-                        None => ui.mode = Mode::Menu { sel },
-                    },
-                    _ => ui.mode = Mode::Menu { sel },
-                }
+        let next = || -> std::io::Result<Option<Event>> { if event::poll(Duration::ZERO)? { event::read().map(Some) } else { Ok(None) } };
+        let batch = lag::drain(event::read()?, next, Instant::now(), lag::BATCH_BUDGET, Instant::now)?;
+        for ev in batch {
+            events += 1;
+            if ui.trace.on() {
+                ui.trace.event(Instant::now(), &lag::event_label(&ev));
             }
-            Mode::Confirm(mut c) => {
-                let typed = c.action.requires_typed_name();
-                match code {
-                    KeyCode::Esc => ui.mode = Mode::List,
-                    KeyCode::Enter if c.is_satisfied() => apply_action(shared, &mut ui, provider, &c),
-                    KeyCode::Char('y') if !typed => apply_action(shared, &mut ui, provider, &c),
-                    KeyCode::Char('n') if !typed => ui.mode = Mode::List,
-                    KeyCode::Char('v') if !typed && c.preview.is_some() => {
-                        c.full = !c.full;
-                        ui.mode = Mode::Confirm(c);
-                    }
-                    KeyCode::Backspace if typed => {
-                        c.typed.pop();
-                        ui.mode = Mode::Confirm(c);
-                    }
-                    KeyCode::Char(ch) if typed => {
-                        c.typed.push(ch);
-                        ui.mode = Mode::Confirm(c);
-                    }
-                    _ => ui.mode = Mode::Confirm(c),
-                }
-            }
-            Mode::FleetMenu { scope, mut sel } => {
-                let actions = Action::fleet_menu(scope == Scope::Marked);
-                let n = actions.len();
-                match code {
-                    KeyCode::Esc => ui.mode = Mode::List,
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        sel = sel.saturating_sub(1);
-                        ui.mode = Mode::FleetMenu { scope, sel };
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        sel = (sel + 1).min(n - 1);
-                        ui.mode = Mode::FleetMenu { scope, sel };
-                    }
-                    KeyCode::Enter => {
-                        choose_fleet_action(shared, &mut ui, provider, actions[sel.min(n - 1)].1, scope);
-                    }
-                    KeyCode::Char(ch) => match actions.iter().find(|(k, _)| *k == ch) {
-                        Some((_, action)) => choose_fleet_action(shared, &mut ui, provider, *action, scope),
-                        None => ui.mode = Mode::FleetMenu { scope, sel },
-                    },
-                    _ => ui.mode = Mode::FleetMenu { scope, sel },
-                }
-            }
-            Mode::FleetConfirm { action, mut typed, scope, note } => {
-                let token = fleet_confirm_token(shared, &ui.marked, scope, action);
-                match code {
-                    KeyCode::Esc => ui.mode = Mode::List,
-                    KeyCode::Enter if typed == token => {
-                        let pods = scope_pods(shared, &ui.marked, scope);
-                        let (provider, remote, cfg) = (provider.clone(), ui.remote.clone(), ui.cfg.clone());
-                        ui.mode = Mode::Working(format!("running {} on {} pod(s)…", action.label(), pods.len()));
-                        start_action(shared, async move {
-                            execute_fleet(&provider, &remote, &cfg, action, pods, None).await
-                        });
-                    }
-                    KeyCode::Backspace => {
-                        typed.pop();
-                        ui.mode = Mode::FleetConfirm { action, typed, scope, note };
-                    }
-                    KeyCode::Char(c) => {
-                        typed.push(c);
-                        ui.mode = Mode::FleetConfirm { action, typed, scope, note };
-                    }
-                    _ => ui.mode = Mode::FleetConfirm { action, typed, scope, note },
-                }
-            }
-            Mode::NewPod(mut form) => match code {
-                KeyCode::Esc => ui.mode = Mode::List,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    form.move_field(-1);
-                    ui.mode = Mode::NewPod(form);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    form.move_field(1);
-                    ui.mode = Mode::NewPod(form);
-                }
-                KeyCode::Left | KeyCode::Char('h') | KeyCode::Right | KeyCode::Char('l') => {
-                    let delta = if matches!(code, KeyCode::Left | KeyCode::Char('h')) { -1 } else { 1 };
-                    if form.change(delta) {
-                        // Provider changed — re-list its pods for accurate free names.
-                        if let Some(free) = relist_free(&ui.cfg, form.provider_name()).await {
-                            form.count = form.count.min(free.len().max(1));
-                            form.free = free;
-                        }
-                    }
-                    ui.mode = Mode::NewPod(form);
-                }
-                KeyCode::Enter => {
-                    let pname = form.provider_name().to_string();
-                    match build_provider(&ui.cfg, &pname) {
-                        Err(e) => ui.mode = Mode::Result(format!("✗ {pname}: {e}")),
-                        Ok(prov) => match list_whole_fleet(&ui.cfg, &pname).await {
-                            Err(e) => ui.mode = Mode::Result(format!("✗ listing the fleet: {e}")),
-                            Ok(existing) => {
-                                let prefix = ui.cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-                                let free = naming::next_free_names(
-                                    prefix,
-                                    &ui.cfg.machine_names,
-                                    &existing,
-                                    form.count,
-                                );
-                                if free.is_empty() {
-                                    ui.mode = Mode::Result("✗ no free machine names".into());
-                                } else {
-                                    let cloud = form.cloud_type().map(String::from);
-                                    let gpu_type = form.gpu_type().to_string();
-                                    let disk = form.disk_gb;
-                                    let volume = form.volume_gb;
-                                    ui.mode = Mode::Result(format!(
-                                        "creating {} pod(s) on {pname}…",
-                                        free.len()
-                                    ));
-                                    {
-                                        let s = shared.lock().unwrap();
-                                        while_ours(terminal, |t| t.draw(|f| view(f, &s, &ui, secs)).map(drop))?;
-                                    }
-                                    let (msg, created) = create_pods(
-                                        &prov,
-                                        &ui.cfg,
-                                        &free,
-                                        cloud.as_deref(),
-                                        &gpu_type,
-                                        form.gpu_count,
-                                        Some(disk),
-                                        Some(volume),
-                                    )
-                                    .await;
-                                    // Show the new pods immediately as "pending" until
-                                    // the provider's list API reports them.
-                                    {
-                                        let mut s = shared.lock().unwrap();
-                                        for mut p in created {
-                                            p.status = "pending".into();
-                                            p.ssh_ip = None;
-                                            p.ssh_port = None;
-                                            if !s.pending.iter().any(|x| x.name == p.name) {
-                                                s.pending.push(p);
-                                            }
-                                        }
-                                    }
-                                    ui.mode = Mode::Result(msg);
-                                    nudge.notify_one();
-                                }
-                            }
-                        },
-                    }
-                }
-                _ => ui.mode = Mode::NewPod(form),
-            },
-            Mode::Input { action, scope, mut value } => match code {
-                KeyCode::Esc => ui.mode = Mode::List,
-                KeyCode::Enter if !value.trim().is_empty() => {
-                    let (provider, remote, cfg) = (provider.clone(), ui.remote.clone(), ui.cfg.clone());
-                    match scope {
-                        InputScope::Pod { name, id } => {
-                            let pod = {
-                                let s = shared.lock().unwrap();
-                                s.pods.iter().find(|p| p.id == id).cloned()
-                            };
-                            match pod {
-                                None => ui.mode = Mode::Result(format!("{name} is gone — refresh")),
-                                Some(pod) => {
-                                    ui.mode = Mode::Working(format!("{} on {name}…", action.label()));
-                                    start_action(shared, async move {
-                                        execute(provider.as_ref(), remote.as_ref(), &cfg, action, &pod, Some(&value)).await
-                                    });
-                                }
-                            }
-                        }
-                        InputScope::Set(sc) => {
-                            let pods = scope_pods(shared, &ui.marked, sc);
-                            ui.mode = Mode::Working(format!("{} on {} pod(s)…", action.label(), pods.len()));
-                            start_action(shared, async move {
-                                execute_fleet(&provider, &remote, &cfg, action, pods, Some(value)).await
-                            });
-                        }
-                    }
-                }
-                KeyCode::Backspace => {
-                    value.pop();
-                    ui.mode = Mode::Input { action, scope, value };
-                }
-                KeyCode::Char(ch) => {
-                    value.push(ch);
-                    ui.mode = Mode::Input { action, scope, value };
-                }
-                _ => ui.mode = Mode::Input { action, scope, value },
-            },
-            Mode::Select { mut value } => match code {
-                KeyCode::Esc => ui.mode = Mode::List,
-                KeyCode::Enter => apply_select(&mut ui, &mut shared.lock().unwrap(), &value),
-                KeyCode::Backspace => {
-                    value.pop();
-                    ui.mode = Mode::Select { value };
-                }
-                KeyCode::Char(ch) => {
-                    value.push(ch);
-                    ui.mode = Mode::Select { value };
-                }
-                _ => ui.mode = Mode::Select { value },
-            },
-            // A background action is running — ignore keys (Ctrl+C still quits, above).
-            Mode::Working(_) => {}
-            // Handled by `ask::key` above.
-            Mode::Ask { .. } | Mode::Answer(_) => {}
-            Mode::Result(_) => {
-                if !result_key(&mut ui, code) {
-                    ui.result_scroll = 0;
-                    ui.mode = Mode::List;
-                    nudge.notify_one();
-                }
+            match handle_event(terminal, &cx, &mut ui, ev)? {
+                Flow::Same => {}
+                Flow::Changed => dirty = true,
+                Flow::Quit(notes) => return Ok(notes),
             }
         }
     }
-    Ok(())
+}
+
+/// What on screen the background can change without a key: the refresh, the footer's notice,
+/// the pending rows, the deep checks out, the runs' output and ends. Compared pass to pass — a
+/// change draws a frame at once rather than at the next tick.
+fn stamp(s: &Shared) -> (Option<Instant>, Option<Instant>, usize, usize, usize, bool) {
+    let lines = s.runs.iter().map(|r| r.lines.len() + r.dropped + usize::from(r.end.is_some())).sum();
+    (s.last_refresh, s.notice.as_ref().map(|n| n.at), s.pending.len(), s.deep.running(), lines, s.refreshing)
+}
+
+/// Whether something on screen moves by itself (a spinner, a check waiting out its debounce, a
+/// run's output open): frames then come every [`lag::TICK_LIVE`], else every [`lag::TICK_IDLE`].
+fn live(s: &Shared, ui: &Ui, now: Instant) -> bool {
+    s.ask_running.is_some() || ui.offers.busy(now) || matches!(ui.mode, Mode::Working(_)) || (matches!(ui.mode, Mode::Runs { .. }) && s.runs.iter().any(|r| r.running()))
+}
+
+/// What landed from the background since the last pass: an action's result (its modal, and a
+/// refresh), a `?` answer (its popup), `arena offers` answers for the form. `true`: something did.
+fn land(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, nudge: &Notify, now: Instant) -> bool {
+    let (result, offers) = {
+        let mut s = shared.lock().unwrap();
+        (s.action_result.take(), std::mem::take(&mut s.offers_landed))
+    };
+    let mut changed = !offers.is_empty();
+    if let Some(msg) = result {
+        ui.result_scroll = 0;
+        ui.mode = Mode::Result(msg);
+        nudge.notify_one();
+        changed = true;
+    }
+    for (q, out) in offers {
+        ui.offers.landed(q, out, now);
+    }
+    let before = std::mem::discriminant(&ui.mode);
+    ask::land(ui, shared);
+    changed || std::mem::discriminant(&ui.mode) != before
+}
+
+/// Draw a frame: the view rendered under the shared lock, the terminal written once it's
+/// released — a terminal slow to take it (over SSH) never holds the refresh, or any background
+/// task, on the lock (`Terminal::draw` did both under it). `false`: the terminal isn't the
+/// dashboard's any more ([`TERMINAL`]) and nothing was drawn. Traced (`lag.rs`).
+fn draw_frame(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: &Mutex<Shared>, ui: &mut Ui, secs: u64, events: usize) -> Result<bool> {
+    let ours = terminal_ours();
+    if !*ours {
+        return Ok(false);
+    }
+    let start = Instant::now();
+    terminal.autoresize()?;
+    {
+        let s = shared.lock().unwrap();
+        let mut frame = terminal.get_frame();
+        view(&mut frame, &s, ui, secs);
+    }
+    let rendered = Instant::now();
+    terminal.flush()?;
+    terminal.hide_cursor()?;
+    terminal.swap_buffers();
+    ratatui::backend::Backend::flush(terminal.backend_mut())?;
+    drop(ours);
+    let end = Instant::now();
+    ui.trace.frame(end, rendered.duration_since(start), end.duration_since(rendered), events);
+    Ok(true)
+}
+
+/// One input event: a mouse event (a move changes nothing), a resize (draw again), a key press.
+fn handle_event(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &mut Ui, ev: Event) -> Result<Flow> {
+    Ok(match ev {
+        Event::Mouse(m) => {
+            if handle_mouse(m, ui, cx.shared) {
+                Flow::Changed
+            } else {
+                Flow::Same
+            }
+        }
+        Event::Resize(..) => Flow::Changed,
+        // Key releases and repeats on terminals that send them: ignored.
+        Event::Key(k) if k.kind == KeyEventKind::Press => return handle_key(terminal, cx, ui, k.code, k.modifiers),
+        _ => Flow::Same,
+    })
+}
+
+/// One key press, in whatever view or popup is open. Never awaits: a slow action is started
+/// in the background ([`start_action`], `runs::start`, …) and lands through `Shared`.
+fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &mut Ui, code: KeyCode, mods: KeyModifiers) -> Result<Flow> {
+    let Ctx { shared, provider, interval, nudge, details_wanted } = *cx;
+    // Ctrl+C quits from any mode (raw mode swallows the usual SIGINT) — asking first while a run
+    // that changes pods is going; at that question it quits, leaving the run going.
+    if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
+        if matches!(ui.mode, Mode::Quit) {
+            return Ok(match runs::key(ui, shared, KeyCode::Char('k')) {
+                runs::Flow::Quit(notes) => Flow::Quit(notes),
+                _ => Flow::Quit(Vec::new()),
+            });
+        }
+        return Ok(if runs::quit_or_ask(ui, shared) { Flow::Quit(Vec::new()) } else { Flow::Changed });
+    }
+    if let Some(why) = demo_refuses(ui, code) {
+        shared.lock().unwrap().notify(why, true);
+        return Ok(Flow::Changed);
+    }
+    // `?` and its two popups (ask.rs); the add-pod form and its confirm (newpod.rs); the runs
+    // panel, `p`, and the quit question (runs.rs).
+    if ask::key(ui, shared, code, mods) || newpod::key(ui, shared, code) {
+        return Ok(Flow::Changed);
+    }
+    match runs::key(ui, shared, code) {
+        runs::Flow::Handled => return Ok(Flow::Changed),
+        runs::Flow::Quit(notes) => return Ok(Flow::Quit(notes)),
+        runs::Flow::NotOurs => {}
+    }
+    let len = shared.lock().unwrap().pods.len();
+    match ui.mode.clone() {
+        Mode::List | Mode::Detail => match list_key(ui, code, len) {
+            ListKey::Quit => return Ok(if runs::quit_or_ask(ui, shared) { Flow::Quit(Vec::new()) } else { Flow::Changed }),
+            ListKey::Done => {}
+            ListKey::Other => match code {
+                KeyCode::Char('r') => {
+                    // A manual refresh also re-reads the provider's details (maintenance
+                    // windows, $/h) — rate-limited by `state::details_due`.
+                    details_wanted.store(true, Ordering::Relaxed);
+                    nudge.notify_one();
+                }
+                KeyCode::Char('d') => {
+                    // Deep-check the marked set if any are marked, else the cursor pod —
+                    // in the background; the rows say `checking` until it lands.
+                    let pods = if ui.marked.is_empty() {
+                        selected_pod(shared, ui.selected).into_iter().collect()
+                    } else {
+                        scope_pods(shared, &ui.marked, Scope::Marked)
+                    };
+                    if !pods.is_empty() {
+                        start_deep_check(shared, ui, pods);
+                    }
+                }
+                KeyCode::Char('D') => {
+                    // Every running pod no one is using, after a second `D`: the first
+                    // says how many, and which it leaves out. The second checks only pods
+                    // the first named that still qualify — never one a refresh added since.
+                    let (mut pods, skipped) = {
+                        let s = shared.lock().unwrap();
+                        deep_all_plan(&s.pods, &s.metrics)
+                    };
+                    let armed = ui.deep_all_armed.take().filter(|(t, _)| t.elapsed() < DEEP_ALL_CONFIRM);
+                    let skipped = skipped_words(&skipped);
+                    pods = deep_all_confirm(pods, armed.as_ref().map(|(_, named)| named));
+                    if pods.is_empty() {
+                        shared.lock().unwrap().notify(format!("nothing to deep-check{skipped}"), false);
+                    } else if armed.is_some() {
+                        start_deep_check(shared, ui, pods);
+                    } else {
+                        ui.deep_all_armed = Some((Instant::now(), pods.iter().map(mark_key).collect()));
+                        let n = pods.len();
+                        shared.lock().unwrap().notify(
+                            format!(
+                                "D again to deep-check {n} running pod{} (about a minute of GPU load each){skipped}",
+                                if n == 1 { "" } else { "s" }
+                            ),
+                            false,
+                        );
+                    }
+                }
+                KeyCode::Char('s') => {
+                    // Toggle short/full names and persist the choice.
+                    ui.short_names = !ui.short_names;
+                    Prefs { short_names: ui.short_names }.save();
+                }
+                KeyCode::Char('f') => {
+                    cycle_interval(interval);
+                    nudge.notify_one(); // apply a shorter cadence immediately
+                }
+                KeyCode::Char(' ') => {
+                    // Toggle multi-select mark on the cursor pod.
+                    if let Some(pod) = selected_pod(shared, ui.selected) {
+                        let key = mark_key(&pod);
+                        if !ui.marked.remove(&key) {
+                            ui.marked.insert(key);
+                        }
+                    }
+                }
+                KeyCode::Char('c') => {
+                    connect_ssh(terminal, shared, ui)?;
+                    nudge.notify_one();
+                }
+                KeyCode::Char('n') => newpod::open(ui, shared),
+                _ => return Ok(Flow::Same),
+            },
+        },
+        Mode::Menu { mut sel } => {
+            let n = Action::MENU.len();
+            match code {
+                KeyCode::Esc => ui.mode = Mode::List,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    sel = sel.saturating_sub(1);
+                    ui.mode = Mode::Menu { sel };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    sel = (sel + 1).min(n - 1);
+                    ui.mode = Mode::Menu { sel };
+                }
+                KeyCode::Enter => choose_pod_action(shared, ui, provider, Action::MENU[sel.min(n - 1)].1),
+                KeyCode::Char(ch) => match Action::from_key(ch) {
+                    Some(action) => choose_pod_action(shared, ui, provider, action),
+                    None => ui.mode = Mode::Menu { sel },
+                },
+                _ => ui.mode = Mode::Menu { sel },
+            }
+        }
+        Mode::Confirm(mut c) => {
+            let typed = c.action.requires_typed_name();
+            match code {
+                KeyCode::Esc => ui.mode = Mode::List,
+                KeyCode::Enter if c.is_satisfied() => apply_action(shared, ui, provider, &c),
+                KeyCode::Char('y') if !typed => apply_action(shared, ui, provider, &c),
+                KeyCode::Char('n') if !typed => ui.mode = Mode::List,
+                KeyCode::Char('v') if !typed && c.preview.is_some() => {
+                    c.full = !c.full;
+                    ui.mode = Mode::Confirm(c);
+                }
+                KeyCode::Backspace if typed => {
+                    c.typed.pop();
+                    ui.mode = Mode::Confirm(c);
+                }
+                KeyCode::Char(ch) if typed => {
+                    c.typed.push(ch);
+                    ui.mode = Mode::Confirm(c);
+                }
+                _ => ui.mode = Mode::Confirm(c),
+            }
+        }
+        Mode::FleetMenu { scope, mut sel } => {
+            let actions = Action::fleet_menu(scope == Scope::Marked);
+            let n = actions.len();
+            match code {
+                KeyCode::Esc => ui.mode = Mode::List,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    sel = sel.saturating_sub(1);
+                    ui.mode = Mode::FleetMenu { scope, sel };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    sel = (sel + 1).min(n - 1);
+                    ui.mode = Mode::FleetMenu { scope, sel };
+                }
+                KeyCode::Enter => {
+                    choose_fleet_action(shared, ui, provider, actions[sel.min(n - 1)].1, scope);
+                }
+                KeyCode::Char(ch) => match actions.iter().find(|(k, _)| *k == ch) {
+                    Some((_, action)) => choose_fleet_action(shared, ui, provider, *action, scope),
+                    None => ui.mode = Mode::FleetMenu { scope, sel },
+                },
+                _ => ui.mode = Mode::FleetMenu { scope, sel },
+            }
+        }
+        Mode::FleetConfirm { action, mut typed, scope, note } => {
+            let token = fleet_confirm_token(shared, &ui.marked, scope, action);
+            match code {
+                KeyCode::Esc => ui.mode = Mode::List,
+                KeyCode::Enter if typed == token => {
+                    let pods = scope_pods(shared, &ui.marked, scope);
+                    let (provider, remote, cfg) = (provider.clone(), ui.remote.clone(), ui.cfg.clone());
+                    ui.mode = Mode::Working(format!("running {} on {} pod(s)…", action.label(), pods.len()));
+                    start_action(shared, async move {
+                        execute_fleet(&provider, &remote, &cfg, action, pods, None).await
+                    });
+                }
+                KeyCode::Backspace => {
+                    typed.pop();
+                    ui.mode = Mode::FleetConfirm { action, typed, scope, note };
+                }
+                KeyCode::Char(c) => {
+                    typed.push(c);
+                    ui.mode = Mode::FleetConfirm { action, typed, scope, note };
+                }
+                _ => ui.mode = Mode::FleetConfirm { action, typed, scope, note },
+            }
+        }
+        Mode::Input { action, scope, mut value } => match code {
+            KeyCode::Esc => ui.mode = Mode::List,
+            KeyCode::Enter if !value.trim().is_empty() => {
+                let (provider, remote, cfg) = (provider.clone(), ui.remote.clone(), ui.cfg.clone());
+                match scope {
+                    InputScope::Pod { name, id } => {
+                        let pod = {
+                            let s = shared.lock().unwrap();
+                            s.pods.iter().find(|p| p.id == id).cloned()
+                        };
+                        match pod {
+                            None => ui.mode = Mode::Result(format!("{name} is gone — refresh")),
+                            Some(pod) if action.cli() => start_cli_action(ui, shared, action, &pod, Some(&value)),
+                            Some(pod) => {
+                                ui.mode = Mode::Working(format!("{} on {name}…", action.label()));
+                                start_action(shared, async move {
+                                    execute(provider.as_ref(), remote.as_ref(), &cfg, action, &pod, Some(&value)).await
+                                });
+                            }
+                        }
+                    }
+                    InputScope::Set(sc) => {
+                        let pods = scope_pods(shared, &ui.marked, sc);
+                        ui.mode = Mode::Working(format!("{} on {} pod(s)…", action.label(), pods.len()));
+                        start_action(shared, async move {
+                            execute_fleet(&provider, &remote, &cfg, action, pods, Some(value)).await
+                        });
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                value.pop();
+                ui.mode = Mode::Input { action, scope, value };
+            }
+            KeyCode::Char(ch) => {
+                value.push(ch);
+                ui.mode = Mode::Input { action, scope, value };
+            }
+            _ => ui.mode = Mode::Input { action, scope, value },
+        },
+        Mode::Select { mut value } => match code {
+            KeyCode::Esc => ui.mode = Mode::List,
+            KeyCode::Enter => apply_select(ui, &mut shared.lock().unwrap(), &value),
+            KeyCode::Backspace => {
+                value.pop();
+                ui.mode = Mode::Select { value };
+            }
+            KeyCode::Char(ch) => {
+                value.push(ch);
+                ui.mode = Mode::Select { value };
+            }
+            _ => ui.mode = Mode::Select { value },
+        },
+        // A background action is running — ignore keys (Ctrl+C still quits, above).
+        Mode::Working(_) => {}
+        // Handled above: `ask::key`, `newpod::key`, `runs::key`.
+        Mode::Ask { .. } | Mode::Answer(_) | Mode::NewPod(_) | Mode::UpConfirm(_) | Mode::Runs { .. } | Mode::Quit => {}
+        Mode::Result(_) => {
+            if !result_key(ui, code) {
+                ui.result_scroll = 0;
+                ui.mode = Mode::List;
+                nudge.notify_one();
+            }
+        }
+    }
+    Ok(Flow::Changed)
+}
+
+/// In a demo (`ARENA_TUI_DEMO`) the keys that would act on a pod, reach one, ask about one or
+/// create one are refused — with why, for the footer. The view's own keys all work.
+fn demo_refuses(ui: &Ui, code: KeyCode) -> Option<&'static str> {
+    if !ui.demo {
+        return None;
+    }
+    // The add-pod form opens (it reads nothing); what it would run is refused by `runs.rs`.
+    let refused = matches!(ui.mode, Mode::List | Mode::Detail) && matches!(code, KeyCode::Char('a' | 'A' | 'c' | 'd' | 'D' | '?'));
+    refused.then_some("demo: the pods are made up — nothing to act on, reach or create")
 }
 
 /// A popup's scroll offset moved by `delta` lines, kept within `0..=max` (`max`: how far the
@@ -1883,159 +2004,6 @@ impl StopPlan {
     }
 }
 
-/// Build the GPU-type choices for the add-pod form: the config default first (so the
-/// default create matches the CLI), then the shared core presets, de-duplicated.
-fn gpu_type_choices(cfg: &Config) -> Vec<String> {
-    let mut out = Vec::new();
-    let default = PodSpec::from_config(cfg).gpu_type;
-    if !default.is_empty() {
-        out.push(default);
-    }
-    for api in arena_core::gpu::preset_apis() {
-        if !out.contains(&api) {
-            out.push(api);
-        }
-    }
-    if out.is_empty() {
-        out.push("NVIDIA RTX A4000".to_string());
-    }
-    out
-}
-
-/// Build a provider by name into an `Arc` (the TUI shares providers across tasks).
-fn build_provider(cfg: &Config, name: &str) -> Result<Arc<dyn Provider>> {
-    Ok(Arc::from(arena_core::provider::build(name, cfg)?))
-}
-
-/// Every configured provider's pods — the whole fleet, as the CLI's create lists it — or why
-/// not: a name is free only if no provider holds it, and a provider that didn't answer might
-/// ([`arena_core::provider::list_complete`]). Listing just the chosen provider reused a name
-/// a pod on another provider held (finding #9's class of duplicate). `provider_name` is the
-/// fleet's primary, as on the CLI.
-async fn list_whole_fleet(cfg: &Config, provider_name: &str) -> arena_core::Result<Vec<Pod>> {
-    let fleet = arena_core::provider::build_fleet(provider_name, cfg, false)?;
-    arena_core::provider::list_complete(fleet.as_ref()).await
-}
-
-/// The free machine names across the whole fleet ([`list_whole_fleet`]). None on any failure.
-async fn relist_free(cfg: &Config, provider_name: &str) -> Option<Vec<String>> {
-    let existing = list_whole_fleet(cfg, provider_name).await.ok()?;
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    Some(naming::next_free_names(prefix, &cfg.machine_names, &existing, usize::MAX))
-}
-
-/// Seed the add-pod form: provider availability from configured API keys (default to
-/// the launch provider if it has a key), GPU choices, and the free names for `existing`.
-fn build_new_pod_form(cfg: &Config, launch_provider: &str, existing: &[Pod]) -> NewPodForm {
-    let key_for = |p: &str| match p {
-        "runpod" => "RUNPOD_API_KEY",
-        "vast" => "VAST_API_KEY",
-        "hetzner" => "HETZNER_API_KEY",
-        "shadeform" => "SHADEFORM_API_KEY",
-        _ => "",
-    };
-    let providers: Vec<ProviderOpt> = ["runpod", "vast", "hetzner", "shadeform"]
-        .iter()
-        .map(|p| ProviderOpt {
-            name: p.to_string(),
-            available: cfg.get(key_for(p)).map(|v| !v.is_empty()).unwrap_or(false),
-        })
-        .collect();
-    let provider_idx = providers
-        .iter()
-        .position(|o| o.name == launch_provider && o.available)
-        .or_else(|| providers.iter().position(|o| o.available))
-        .unwrap_or(0);
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    let free = naming::next_free_names(prefix, &cfg.machine_names, existing, usize::MAX);
-    let spec = PodSpec::from_config(cfg);
-    NewPodForm {
-        providers,
-        provider_idx,
-        cloud_types: vec!["COMMUNITY".into(), "SECURE".into()],
-        cloud_idx: usize::from(spec.cloud_type.eq_ignore_ascii_case("SECURE")),
-        gpu_types: gpu_type_choices(cfg),
-        gpu_idx: 0,
-        gpu_count: spec.gpu_count.max(1),
-        disk_gb: spec.disk_gb.max(20),
-        volume_gb: spec.volume_gb,
-        count: 1,
-        free,
-        field: 0,
-    }
-}
-
-/// Config `CREATE_EXTRA_JSON` for a create on `provider`, as `arena pods create` takes it:
-/// parsed and checked against that backend's own fields before anything is created.
-fn create_extra(provider: &dyn Provider, cfg: &Config) -> arena_core::Result<Option<arena_core::apiextra::Extra>> {
-    let extra = arena_core::apiextra::combine(cfg.get("CREATE_EXTRA_JSON"), None)?;
-    if let Some(x) = &extra {
-        provider.check_create_extra(x)?;
-    }
-    Ok(extra)
-}
-
-/// Create the named pods (sequentially, no capacity-wait), returning a summary line.
-/// Each create is gated by the add-pod form's Enter, mirroring `arena pods create` —
-/// config `CREATE_EXTRA_JSON` included (a bad one creates nothing and says why), and the
-/// prices the creates answered with remembered for the balance.
-#[allow(clippy::too_many_arguments)] // the add-pod form's fields, one argument each (as `arena pods create`'s flags)
-async fn create_pods(
-    provider: &Arc<dyn Provider>,
-    cfg: &Config,
-    names: &[String],
-    cloud_type: Option<&str>,
-    gpu_type: &str,
-    gpu_count: u32,
-    disk_gb: Option<u32>,
-    volume_gb: Option<u32>,
-) -> (String, Vec<Pod>) {
-    let mut base = PodSpec::from_config(cfg);
-    base.api_extra = match create_extra(provider.as_ref(), cfg) {
-        Ok(extra) => extra,
-        Err(e) => return (format!("created 0/{}\n✗ {e}", names.len()), Vec::new()),
-    };
-    base.gpu_type = gpu_type.to_string();
-    base.gpu_count = gpu_count;
-    if let Some(c) = cloud_type {
-        base.cloud_type = c.to_string();
-    }
-    if let Some(d) = disk_gb {
-        base.disk_gb = d;
-    }
-    if let Some(v) = volume_gb {
-        base.volume_gb = v;
-    }
-    let mut created: Vec<Pod> = Vec::new();
-    let mut fails: Vec<String> = Vec::new();
-    for name in names {
-        let mut spec = base.clone();
-        spec.name = name.clone();
-        spec.env.push(("MACHINE_NAME".into(), name.clone()));
-        match provider.create_pod(&spec).await {
-            Ok(pod) => created.push(pod),
-            Err(e) => fails.push(format!("✗ {name}: {e}")),
-        }
-    }
-    remember_prices(cfg, &created);
-    let mut s = format!("created {}/{}", created.len(), names.len());
-    for f in fails.iter().take(8) {
-        s.push('\n');
-        s.push_str(f);
-    }
-    (s, created)
-}
-
-/// Remember the prices `created` answered with in the balance state the CLI keeps
-/// ([`balance_state_path`]), for the configured prepaid accounts — as every `arena` create
-/// path does — so a later listing with no price (RunPod v1's) still prices these pods. Best
-/// effort and quiet; nothing without a state directory.
-fn remember_prices(cfg: &Config, created: &[Pod]) {
-    if let Some(Ok(path)) = balance_state_path(cfg) {
-        let _ = balance::remember_prices(&path, &balance::configured(cfg), created, snapshot::unix_now());
-    }
-}
-
 /// A menu pick for the cursor pod: run/set-branch collect an argument first; everything
 /// else goes through a confirm modal. Shared by the arrow-Enter and letter-key paths. A stop
 /// of a pod whose backend has no stop (Shadeform) is refused here, before the confirm — as
@@ -2051,6 +2019,15 @@ fn choose_pod_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dy
             ui.mode = Mode::Result(format!("✗ can't stop {} — {}", pod.name, no_stop_why(e)));
             return;
         }
+    }
+    match action {
+        // Read-only: straight to the runs panel.
+        Action::Jobs | Action::Logs => return start_cli_action(ui, shared, action, &pod, None),
+        Action::Start if arena_core::status::is_billing(&pod.status) => {
+            ui.mode = Mode::Result(format!("✗ {} is {} — start is for a stopped pod", pod.name, pod.status));
+            return;
+        }
+        _ => {}
     }
     ui.mode = if action.needs_input() {
         Mode::Input { action, scope: InputScope::Pod { name: shown, id: pod.id }, value: String::new() }
@@ -2104,6 +2081,9 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Pro
         ui.mode = Mode::Result(format!("{} is gone — refresh", c.pod_name));
         return;
     };
+    if c.action.cli() {
+        return start_cli_action(ui, shared, c.action, &pod, None);
+    }
     ui.mode = Mode::Working(format!("{}ing {}…", c.action.label(), pod.name));
     let (provider, remote, cfg, action) = (provider.clone(), ui.remote.clone(), ui.cfg.clone(), c.action);
     start_action(shared, async move {
@@ -2376,7 +2356,37 @@ async fn execute(
             Some(branch) if !branch.trim().is_empty() => run_set_branch(remote, cfg, pod, branch.trim()).await,
             _ => format!("✗ {name}: no branch given"),
         },
+        // Runs of the CLI (`start_cli_action`), never an action of this one.
+        Action::Start | Action::Rename | Action::Jobs | Action::Logs => format!("✗ {} {name}: runs as `arena pods {0}`", action.label()),
     }
+}
+
+/// The `arena` command for one of the CLI's actions on `name` (`arg`: rename's new name): `jobs`
+/// and `logs` read; `start` and `rename` change the pod, after the dashboard's confirm or input
+/// (`--yes`). `None`: not one of them. Pure.
+fn cli_action_args(action: Action, name: &str, arg: Option<&str>) -> Option<(runs::Kind, Vec<String>)> {
+    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    Some(match action {
+        Action::Start => (runs::Kind::Start, v(&["pods", "start", name, "--yes"])),
+        Action::Rename => (runs::Kind::Rename, v(&["pods", "rename", name, arg?.trim(), "--yes"])),
+        Action::Jobs => (runs::Kind::Jobs, v(&["pods", "jobs", name])),
+        Action::Logs => (runs::Kind::Logs, v(&["pods", "logs", name, "--tail", "100"])),
+        _ => return None,
+    })
+}
+
+/// Run one of the CLI's actions on `pod` in the background (`runs.rs`) and open the runs panel
+/// on it — or say why it can't run.
+fn start_cli_action(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, action: Action, pod: &Pod, arg: Option<&str>) {
+    let Some((kind, args)) = cli_action_args(action, &pod.name, arg) else { return };
+    let title = format!("pods {} {}", action.label(), ui.shown_name(&pod.name));
+    // The pod's own provider: the CLI finds a pod fleet-wide whatever `--provider` says, but its
+    // messages then name the right one.
+    let provider = if pod.provider.is_empty() { ui.provider_name.clone() } else { pod.provider.clone() };
+    ui.mode = match runs::start(ui, shared, kind, &provider, args, title) {
+        Ok(id) => Mode::Runs { id, scroll: None, stop: false },
+        Err(e) => Mode::Result(format!("✗ {e}")),
+    };
 }
 
 /// The torch health check (mirrors `arena pods test`).
@@ -2835,7 +2845,10 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         Mode::Confirm(c) => render_confirm(f, c),
         Mode::FleetMenu { scope, sel } => render_fleet_menu(f, shared, ui, *scope, *sel),
         Mode::FleetConfirm { action, typed, scope, note } => render_fleet_confirm(f, shared, ui, *action, typed, *scope, note),
-        Mode::NewPod(form) => render_new_pod(f, form),
+        Mode::NewPod(form) => newpod::render(f, form, &ui.offers),
+        Mode::UpConfirm(form) => newpod::render_confirm(f, form, &ui.offers),
+        Mode::Runs { id, scroll, stop } => runs::render(f, shared, *id, *scroll, *stop, &ui.result_max),
+        Mode::Quit => runs::render_quit(f, shared),
         Mode::Input { action, scope, value } => render_input(f, shared, ui, *action, scope, value),
         Mode::Select { value } => render_select(f, value),
         Mode::Working(msg) => render_result(f, msg, 0, &ui.result_max),
@@ -2945,14 +2958,15 @@ fn columns_that_fit(w: usize, core: &[usize], optional: &[usize]) -> usize {
 }
 
 /// A pod's `AI$` cell: its OpenRouter key's spend against the cap (`-`: no key named after
-/// it), yellow from 80% of the cap, red at the cap or disabled — grey when the last listing
-/// failed (`stale`: these are older numbers, the summary bar says `(n/a)`).
+/// it), yellow from 80% of the cap, red at the cap or disabled, a grey `paused` for a $0 cap
+/// nothing was spent against — grey when the last listing failed (`stale`: these are older
+/// numbers, the summary bar says `(n/a)`).
 fn ai_cell(k: Option<&KeyUsage>, stale: bool, read: bool) -> Cell<'static> {
     match k {
         // Before the first read lands: not known yet, rather than "no key".
         None if !read => Cell::from("…").style(tone_style(Tone::Dim)),
         None => Cell::from("-").style(tone_style(Tone::Dim)),
-        Some(k) if stale => Cell::from(k.cell()).style(tone_style(Tone::Dim)),
+        Some(k) if stale || k.paused() => Cell::from(k.cell()).style(tone_style(Tone::Dim)),
         Some(k) => {
             let style = state::fill_tone(k.fill()).map(tone_style).unwrap_or_default();
             Cell::from(k.cell()).style(style)
@@ -3386,7 +3400,15 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         (Some(k), _, None) => k.detail(),
         (Some(k), _, Some(_)) => format!("{} (as last read; the latest read failed)", k.detail()),
     });
-    let fact_lines = FACT_LINES + u16::from(ai.is_some());
+    // The cohort's keys at their cap, under it, while there are any: every name (the summary
+    // bar has room for two) and where to look — a key can be at its cap with no pod in the
+    // table (its machine terminated or renamed).
+    let caps = shared.ai.as_ref().and(shared.ai_cohort.as_ref()).filter(|c| !c.capped.is_empty()).map(|c| {
+        let names: Vec<String> = c.capped.iter().map(|k| if k.pod { k.name.clone() } else { format!("{} (no pod)", k.name) }).collect();
+        // Where to look first: a long list is cut at the pane's edge.
+        format!("⚠ {} at cap (`arena keys list` has each one's cap and spend): {}", count_of(names.len(), "key", "keys"), names.join(", "))
+    });
+    let fact_lines = FACT_LINES + u16::from(ai.is_some()) + u16::from(caps.is_some());
     let show_graphs = inner.height >= fact_lines + 3 + procs_h + commits_h + 6;
 
     let mut constraints: Vec<Constraint> = vec![
@@ -3503,7 +3525,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         fit(format!("{place}  ·  {rtt}")),
         proxy,
         cost,
-        ai.map(|a| format!("ai key:   {}\n", fit(a))).unwrap_or_default(),
+        ai.map(|a| format!("ai key:   {}\n", fit(a))).unwrap_or_default() + &caps.map(|c| format!("ai caps:  {}\n", fit(c))).unwrap_or_default(),
         maint,
         health,
         why,
@@ -3652,16 +3674,21 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         let secs = shared.ask_since.map(|t| t.elapsed()).unwrap_or_default();
         Span::styled(format!("{} {asking} {}s · ", spinner(secs), secs.as_secs()), tone_style(Tone::Busy))
     });
+    // A run going (`pods up`…) leads too: it bills, and `p` shows it.
+    let asking: Vec<Span<'static>> = runs::footer(shared).map(|r| Span::styled(r, tone_style(Tone::Busy))).into_iter().chain(asking).collect();
     let keys = match &ui.mode {
-        Mode::List => "[q] quit  [enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d/D] deep check this/all  [?] ask AI  [n] new  [r] refresh",
-        Mode::Detail => "[esc] back  [q] quit  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d/D] deep check this/all  [?] ask AI  [n] new  [r] refresh",
+        Mode::List => "[q] quit  [enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d/D] deep check this/all  [?] ask AI  [n] new  [p] runs  [r] refresh",
+        Mode::Detail => "[esc] back  [q] quit  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d/D] deep check this/all  [?] ask AI  [n] new  [p] runs  [r] refresh",
         Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::Confirm(c) if c.action.requires_typed_name() => "type the pod's name  [enter] apply  [esc] cancel",
         Mode::Confirm(c) if c.preview.is_some() => "[y] apply  [v] full command  [n/esc] cancel",
         Mode::Confirm(_) => "[y] apply  [n/esc] cancel",
         Mode::FleetMenu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::FleetConfirm { .. } => "type the token to confirm  [enter] apply  [esc] cancel",
-        Mode::NewPod { .. } => "[↑↓] field  [←→] change  [enter] create  [esc] cancel",
+        Mode::NewPod { .. } => "[↑↓] field  [←→] change  [o] availability  [enter] review  [esc] cancel",
+        Mode::UpConfirm(_) => "[y] create  [n/esc] back to the form",
+        Mode::Runs { .. } => "[esc] hide (a run keeps going)  [←→] other runs  [↑↓ PgUp PgDn] scroll  [end] follow  [s] stop",
+        Mode::Quit => "[k] quit, leave it running  [s] quit, send it Ctrl+C  [esc] stay",
         Mode::Input { .. } => "type the value  [enter] run  [esc] cancel",
         Mode::Select { .. } => "type a selection  [enter] mark  [esc] cancel",
         Mode::Working(_) => "working… (background) — please wait",
@@ -3739,7 +3766,9 @@ fn render_action_menu(f: &mut Frame, title: String, actions: &[(char, Action)], 
         "[↑↓] move   [enter] choose   [letter] pick   [esc] cancel",
         Style::default().fg(Color::DarkGray),
     ));
-    let area = centered_rect(58, 60, f.area());
+    // As tall as its lines (twelve actions), within the screen.
+    let pct_y = ((lines.len() as u16 + 2) * 100 / f.area().height.max(1) + 2).clamp(40, 96);
+    let area = centered_rect(58, pct_y, f.area());
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" action ")),
@@ -3967,132 +3996,6 @@ fn fleet_confirm_token_str(
     }
 }
 
-fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
-    let sel = form.selected();
-    let dim = Style::default().fg(Color::DarkGray);
-    let cur = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-    let label = Style::default().add_modifier(Modifier::BOLD);
-
-    // One line per applicable field: "▶ label  ‹ value ›", selected one highlighted.
-    let mut lines: Vec<Line> = Vec::new();
-    for fld in form.fields() {
-        let selected = fld == sel;
-        let (name, value) = match fld {
-            NpField::Provider => ("provider", form.provider_name().to_string()),
-            NpField::CloudType => ("cloud", form.cloud_type().unwrap_or("-").to_string()),
-            NpField::GpuType => {
-                let price = arena_core::gpu::price_label(form.gpu_type(), form.provider_name(), form.cloud_type())
-                    .map(|p| format!("  {p}"))
-                    .unwrap_or_default();
-                ("gpu type", format!("{}{price}", arena_core::gpu::label(form.gpu_type())))
-            }
-            NpField::GpuCount => ("gpus/pod", form.gpu_count.to_string()),
-            NpField::Disk => ("disk", format!("{}GB", form.disk_gb)),
-            NpField::Volume => (
-                "volume",
-                if form.volume_gb == 0 { "none".to_string() } else { format!("{}GB", form.volume_gb) },
-            ),
-            NpField::Pods => ("pods", format!("{} of {} free", form.count, form.free.len())),
-        };
-        let marker = if selected { "▶ " } else { "  " };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{marker}{name:<9} "), if selected { cur } else { label }),
-            Span::styled(
-                format!("‹ {value} ›"),
-                if selected { cur } else { Style::default() },
-            ),
-        ]));
-    }
-
-    lines.push(Line::from(""));
-    // Options for the currently-selected choice field — so the GPU/provider/cloud
-    // menus are visible, not guessed.
-    match sel {
-        NpField::Provider => {
-            lines.push(Line::styled("providers:", label));
-            for p in &form.providers {
-                let mark = if p.name == form.provider_name() { "●" } else { "○" };
-                let text = if p.available {
-                    format!("  {mark} {}", p.name)
-                } else {
-                    format!("  {mark} {} (no api key)", p.name)
-                };
-                lines.push(Line::styled(
-                    text,
-                    if !p.available {
-                        dim
-                    } else if p.name == form.provider_name() {
-                        cur
-                    } else {
-                        Style::default()
-                    },
-                ));
-            }
-        }
-        NpField::CloudType => {
-            lines.push(Line::styled("cloud types:", label));
-            for (i, c) in form.cloud_types.iter().enumerate() {
-                let mark = if i == form.cloud_idx { "●" } else { "○" };
-                lines.push(Line::styled(
-                    format!("  {mark} {c}"),
-                    if i == form.cloud_idx { cur } else { Style::default() },
-                ));
-            }
-        }
-        NpField::GpuType => {
-            lines.push(Line::styled("gpu types (← → · VRAM · ~price for this provider/cloud):", label));
-            for (i, g) in form.gpu_types.iter().enumerate() {
-                let mark = if i == form.gpu_idx { "●" } else { "○" };
-                let price = arena_core::gpu::price_label(g, form.provider_name(), form.cloud_type())
-                    .map(|p| format!("   {p}"))
-                    .unwrap_or_default();
-                lines.push(Line::styled(
-                    format!("  {mark} {:<16}{price}", arena_core::gpu::label(g)),
-                    if i == form.gpu_idx { cur } else { Style::default() },
-                ));
-            }
-        }
-        NpField::GpuCount => lines.push(Line::styled("GPUs per pod: 1–8", dim)),
-        NpField::Disk => lines.push(Line::styled(
-            "container disk in 50GB steps — the main storage (wiped if the pod is destroyed).",
-            dim,
-        )),
-        NpField::Volume => lines.push(Line::styled(
-            "persistent volume in 100GB steps (0 = none, the default). Survives restarts.",
-            dim,
-        )),
-        NpField::Pods => {
-            let planned = form.planned_names();
-            lines.push(Line::styled("will create:", label));
-            if planned.is_empty() {
-                lines.push(Line::styled("  (no free machine names left)", dim));
-            } else {
-                for n in planned {
-                    lines.push(Line::from(format!("  • {n}")));
-                }
-            }
-        }
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::styled(
-        "[↑↓] field   [←→] change   [enter] CREATE   [esc] cancel",
-        dim,
-    ));
-
-    let area = centered_rect(60, 75, f.area());
-    f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(" add pod "),
-        ),
-        area,
-    );
-}
-
 fn render_result(f: &mut Frame, msg: &str, scroll: u16, max: &std::cell::Cell<u16>) {
     // Grow the box for multi-line results (e.g. a per-pod fleet readout); it scrolls if
     // taller than the screen.
@@ -4139,6 +4042,7 @@ mod tests {
     }
 
     use super::*;
+    use arena_core::PodSpec;
     use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;
 
@@ -4365,6 +4269,11 @@ deep_check_end=1
             asker: fake_asker(Arc::default()),
             ask_ai: None,
             deep_all_armed: None,
+            trace: lag::Trace::off(),
+            cli: Err("no CLI in this test".into()),
+            nudge: Arc::new(Notify::new()),
+            offers: offers::State::new(true),
+            demo: false,
         }
     }
 
@@ -4459,6 +4368,49 @@ deep_check_end=1
             .iter()
             .find(|l| l.contains(&format!(" {name} ")))
             .unwrap_or_else(|| panic!("no {name} row in\n{}", lines.join("\n")))
+    }
+
+    /// Not a test: how long the view takes over the 60-pod demo fleet, whole and in parts (µs per
+    /// frame, the median of 200) — what to cache. `cargo test --release -p arena-tui -- --ignored
+    /// --nocapture view_cost`.
+    #[test]
+    #[ignore = "a measurement"]
+    fn view_cost() {
+        let shared = Mutex::new(Shared::default());
+        let conf = cfg("");
+        for round in 0..60 {
+            demo::publish(&shared, &conf, 60, round);
+        }
+        let shared = shared.into_inner().unwrap();
+        let ui = ui(conf, Arc::new(FakeRemote::new()));
+        let median = |f: &mut dyn FnMut()| {
+            let mut t: Vec<u128> = (0..200)
+                .map(|_| {
+                    let s = Instant::now();
+                    f();
+                    s.elapsed().as_micros()
+                })
+                .collect();
+            t.sort_unstable();
+            t[100]
+        };
+        for (w, h) in [(200u16, 50u16), (120, 40)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let whole = median(&mut || {
+                term.draw(|f| view(f, &shared, &ui, 5)).unwrap();
+            });
+            let table = median(&mut || {
+                term.draw(|f| pods_table(f, &shared, &ui, f.area(), true)).unwrap();
+            });
+            let rest = median(&mut || {
+                term.draw(|f| {
+                    f.render_widget(summary_line(&shared), f.area());
+                    f.render_widget(Paragraph::new(footer_hint(&shared, &ui, 5)), f.area());
+                })
+                .unwrap();
+            });
+            println!("{w}x{h}: view {whole}µs, pods_table {table}µs, summary+footer {rest}µs");
+        }
     }
 
     /// The rows read the core snapshot: $/h in each provider's currency (`-` when not
@@ -4621,6 +4573,47 @@ deep_check_end=1
         ui.selected = shared.pods.iter().position(|p| p.name.ends_with("charlie")).unwrap();
         let pane = draw(160, 40, &shared, &ui).join("\n");
         assert!(pane.contains("where:    -  ·  rtt -"), "{pane}");
+    }
+
+    /// The human (2026-10-29, prod's dashboard): "why does it say 1 ai key at cap?" — every AI$
+    /// cell on screen was under its cap. The bar names the keys at their cap, `(no pod)` for one
+    /// no row shows; the detail pane lists them and says where to look. A $0 key nothing was
+    /// spent against reads `paused` in its row and isn't counted.
+    #[test]
+    fn keys_at_cap_are_named_and_a_paused_key_isnt_one() {
+        use arena_core::openrouter::KeyInfo;
+        let mut shared = fixture_shared();
+        let key = |name: &str, limit: f64, left: f64, today: f64| KeyInfo {
+            hash: name.into(),
+            name: Some(name.into()),
+            limit: Some(limit),
+            limit_remaining: Some(left),
+            usage_daily: Some(today),
+            limit_reset: Some("daily".into()),
+            ..Default::default()
+        };
+        let view = UsageView::from_keys(&[key("devtest-alpha", 0.0, 0.0, 0.0), key("devtest-bravo", 5.0, 3.0, 2.0), key("devtest-gone", 5.0, 0.0, 5.0)], None);
+        let names: Vec<String> = shared.pods.iter().map(|p| p.name.clone()).collect();
+        shared.ai_cohort = Some(view.cohort("devtest", &names));
+        shared.ai = Some(view);
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let lines = draw(220, 40, &shared, &ui);
+        let screen = lines.join("\n");
+        assert!(screen.contains(" ⚠ AI key at cap: devtest-gone (no pod) · 4 pods"), "{screen}");
+        assert!(row(&lines, "alpha").contains(" paused "), "{}", row(&lines, "alpha"));
+        assert!(row(&lines, "bravo").contains(" 2.00/5 "), "{}", row(&lines, "bravo"));
+        ui.mode = Mode::Detail;
+        ui.selected = shared.pods.iter().position(|p| p.name == "devtest-alpha").unwrap();
+        let pane = draw(220, 50, &shared, &ui).join("\n");
+        assert!(pane.contains("ai key:   paused (a $0 cap, nothing spent against it) · $0.00 of $0.00 today"), "{pane}");
+        assert!(pane.contains("ai caps:  ⚠ 1 key at cap (`arena keys list` has each one's cap and spend): devtest-gone (no pod)"), "{pane}");
+        // A pod named after it: no `(no pod)`. None at cap (only the paused one): no line.
+        shared.ai_cohort = Some(shared.ai.as_ref().unwrap().cohort("devtest", &[names, vec!["devtest-gone".into()]].concat()));
+        let pane = draw(220, 50, &shared, &ui).join("\n");
+        assert!(pane.contains("spend): devtest-gone ") && !pane.contains("(no pod)"), "{pane}");
+        shared.ai = Some(UsageView::from_keys(&[key("devtest-alpha", 0.0, 0.0, 0.0)], None));
+        shared.ai_cohort = Some(shared.ai.as_ref().unwrap().cohort("devtest", &[]));
+        assert!(!draw(220, 50, &shared, &ui).join("\n").contains("ai caps:"));
     }
 
     /// The pure column fit: always a prefix of the optional columns, so widening only adds.
@@ -5076,118 +5069,6 @@ deep_check_end=1
         ui.mode = Mode::FleetConfirm { action: Action::Terminate, typed: String::new(), scope: Scope::Marked, note: String::new() };
         let all = draw(180, 30, &shared.lock().unwrap(), &ui).join("\n");
         assert!(all.contains("That is every listed pod: terminate on it takes ALL") && all.contains("Type ALL"), "{all}");
-    }
-
-    /// The add-pod form applies config `CREATE_EXTRA_JSON` as `arena pods create` does: carried
-    /// on each create's spec, or — not one object, or a field arena sets — nothing created and
-    /// the reason shown.
-    #[tokio::test]
-    async fn add_pod_form_creates_with_config_create_extra_json_or_not_at_all() {
-        /// A RunPod v2-shaped backend that records each create's spec (rules: the real v2's).
-        struct Records {
-            rules: arena_core::provider::runpod_v2::RunpodV2Provider,
-            specs: Mutex<Vec<PodSpec>>,
-        }
-        #[async_trait::async_trait]
-        impl Provider for Records {
-            fn name(&self) -> &'static str {
-                "runpod"
-            }
-            fn describe(&self, _spec: &PodSpec) -> String {
-                String::new()
-            }
-            async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
-                Ok(vec![])
-            }
-            async fn create_pod(&self, spec: &PodSpec) -> arena_core::Result<Pod> {
-                self.specs.lock().unwrap().push(spec.clone());
-                Ok(Pod { id: format!("id-{}", spec.name), name: spec.name.clone(), provider: "runpod".into(), ..Default::default() })
-            }
-            async fn stop_pod(&self, _id: &str) -> arena_core::Result<()> {
-                unimplemented!()
-            }
-            async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
-                unimplemented!()
-            }
-            async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
-                unimplemented!()
-            }
-            fn check_create_extra(&self, extra: &arena_core::apiextra::Extra) -> arena_core::Result<()> {
-                self.rules.check_create_extra(extra)
-            }
-        }
-        // (CREATE_EXTRA_JSON line, Ok(the extra the create carries) | Err(why nothing was created))
-        let cases: [(&str, std::result::Result<Option<&str>, &str>); 4] = [
-            ("", Ok(None)),
-            (r#"CREATE_EXTRA_JSON='{"dataCenterIds":["EU-RO-1"]}'"#, Ok(Some(r#"{"dataCenterIds":["EU-RO-1"]}"#))),
-            (r#"CREATE_EXTRA_JSON='{"name":"x"}'"#, Err("`name` is set by arena")),
-            ("CREATE_EXTRA_JSON='[1]'", Err("must be a JSON object")),
-        ];
-        for (line, want) in cases {
-            let rec = Arc::new(Records { rules: arena_core::provider::runpod_v2::RunpodV2Provider::new("k"), specs: Mutex::new(Vec::new()) });
-            let p: Arc<dyn Provider> = rec.clone();
-            let names = ["devtest-alpha".to_string()];
-            let (msg, created) = create_pods(&p, &cfg(line), &names, Some("COMMUNITY"), "NVIDIA RTX A4000", 1, Some(40), Some(0)).await;
-            let specs = rec.specs.lock().unwrap();
-            match want {
-                Ok(extra) => {
-                    assert_eq!((msg.as_str(), created.len()), ("created 1/1", 1), "{line}");
-                    let want = extra.map(|t| arena_core::apiextra::parse(t, "test").unwrap());
-                    assert_eq!(specs[0].api_extra, want, "{line}");
-                }
-                Err(why) => {
-                    assert!(msg.starts_with("created 0/1\n✗ ") && msg.contains(why), "{line}: {msg}");
-                    assert!(created.is_empty() && specs.is_empty(), "{line}: nothing created");
-                }
-            }
-        }
-    }
-
-    /// The add-pod form remembers each created pod's price in the balance state the CLI keeps
-    /// (as `arena pods create` does), under the configured account's key fingerprint; an
-    /// unpriced create remembers nothing.
-    #[tokio::test]
-    async fn add_pod_form_remembers_the_created_pods_prices_for_the_balance() {
-        struct Priced;
-        #[async_trait::async_trait]
-        impl Provider for Priced {
-            fn name(&self) -> &'static str {
-                "runpod"
-            }
-            fn describe(&self, _spec: &PodSpec) -> String {
-                String::new()
-            }
-            async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
-                Ok(vec![])
-            }
-            async fn create_pod(&self, spec: &PodSpec) -> arena_core::Result<Pod> {
-                // bravo's create answers with no price (RunPod v1's REST create).
-                let cost_per_hr = (spec.name != "devtest-bravo").then_some(0.27);
-                Ok(Pod { id: format!("id-{}", spec.name), name: spec.name.clone(), provider: "runpod".into(), cost_per_hr, ..Default::default() })
-            }
-            async fn stop_pod(&self, _id: &str) -> arena_core::Result<()> {
-                unimplemented!()
-            }
-            async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
-                unimplemented!()
-            }
-            async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
-                unimplemented!()
-            }
-        }
-        let dir = tmp("tui-prices");
-        // A dummy key: it only names the account (its fingerprint) — nothing is called.
-        let conf = cfg(&format!("ARENA_STATE_DIR={}\nRUNPOD_API_KEY=not-a-real-key\n", dir.0.display()));
-        let p: Arc<dyn Provider> = Arc::new(Priced);
-        let names = ["devtest-alpha".to_string(), "devtest-bravo".to_string()];
-        let (msg, created) = create_pods(&p, &conf, &names, Some("COMMUNITY"), "NVIDIA RTX A4000", 1, Some(40), Some(0)).await;
-        assert_eq!((msg.as_str(), created.len()), ("created 2/2", 2));
-        let (state, warning) = balance::load(&dir.0.join("devtest").join(snapshot::BALANCE_FILE));
-        assert_eq!(warning, None);
-        let runpod = &state.accounts[&balance::Account::Runpod];
-        assert_eq!(runpod.key_fp, balance::key_fp("not-a-real-key"));
-        let prices: Vec<(&str, f64)> = runpod.prices.iter().map(|(id, (usd, _))| (id.as_str(), *usd)).collect();
-        assert_eq!(prices, [("id-devtest-alpha", 0.27)]);
     }
 
     /// The dashboard refuses restart/stop/terminate on a pod the listing reports locked —
@@ -6398,12 +6279,12 @@ deep_check_end=1
     fn the_new_pod_footer_matches_the_form() {
         let shared = fixture_shared();
         let mut ui = ui(cfg("RUNPOD_API_KEY=x\n"), Arc::new(FakeRemote::new()));
-        ui.mode = Mode::NewPod(build_new_pod_form(&ui.cfg, "runpod", &[]));
+        ui.mode = Mode::NewPod(newpod::build_form(&ui.cfg, "runpod", &[], true));
         let lines = draw(120, 40, &shared, &ui);
         let footer = lines.last().unwrap();
-        assert!(footer.contains("[↑↓] field  [←→] change  [enter] create  [esc] cancel"), "{footer}");
+        assert!(footer.contains("[↑↓] field  [←→] change  [o] availability  [enter] review  [esc] cancel"), "{footer}");
         assert!(!footer.contains("[+-]") && !footer.contains("[↑↓] pods"), "{footer}");
-        assert!(lines.join("\n").contains("[↑↓] field   [←→] change   [enter] CREATE   [esc] cancel"));
+        assert!(lines.join("\n").contains("[↑↓] field   [←→] change   [o] availability   [enter] review   [esc] cancel"));
     }
 
     /// The menus' restart label says what each pod's backend says a restart does to its disk —
@@ -6572,12 +6453,138 @@ deep_check_end=1
         assert_eq!(stopped, ["rp1", "rp2"]);
     }
 
-    /// `n` lists the fleet in the background: `listing…` at once, the dashboard drawing on;
-    /// the form opens when the listing lands, its names past the listed ones. Awaiting it in
-    /// the key loop froze the dashboard for as long as the slowest provider took.
+    /// The form's `y` runs `arena pods up` — the `arena` beside the dashboard (a stub here),
+    /// with the dashboard's config, the form's provider and its flags — in the background: its
+    /// lines reach the runs panel, a created pod shows as a pending row, each pod's verdict and
+    /// the exit are said, its output is in a file of its own (0600). `s`, `y` in the panel sends
+    /// a run Ctrl+C — SIGINT to its process group, which `up` takes as "stop where you are".
+    #[tokio::test]
+    async fn the_form_runs_pods_up_and_the_panel_follows_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("arena-tui-runs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("arena");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n\
+             echo \"args: $*\"\n\
+             case \"$*\" in\n\
+             *'pods start'*)\n\
+               trap 'echo \"[devtest-alpha] STOPPED at setup (Ctrl+C) — left as it is\"; exit 130' INT\n\
+               echo waiting\n\
+               while :; do sleep 0.05; done ;;\n\
+             *'pods logs'*)\n\
+               head -c 800000 /dev/zero | tr '\\0' x\n\
+               printf '\\n[devtest-alpha] FAILED setup: after a long line\\n'\n\
+               exit 1 ;;\n\
+             esac\n\
+             echo '[created] devtest-echo id=9 on cx33 (€0.0160/h)'\n\
+             echo '[devtest-echo] setup ✓ (2m)'\n\
+             echo '[devtest-echo] READY after 3m — proxy :9504'\n\
+             echo '[devtest-foxtrot] FAILED endpoint: no SSH after 600s' >&2\n\
+             exit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shared = Arc::new(Mutex::new(fixture_shared()));
+        let mut ui = ui(cfg("HETZNER_API_KEY=x\n"), Arc::new(FakeRemote::new()));
+        ui.cli = Ok(runs::Cli { exe: stub.clone(), config: "/test/config.env".into(), dir: dir.join("runs") });
+        async fn ended(shared: &Mutex<Shared>, id: u64, line: Option<&str>) -> bool {
+            for _ in 0..200 {
+                {
+                    let s = shared.lock().unwrap();
+                    let r = s.runs.iter().find(|r| r.id == id).unwrap();
+                    if line.map_or(!r.running(), |l| r.lines.iter().any(|x| x == l)) {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            false
+        }
+
+        // The form on Hetzner (the only provider with a key), Enter, then `y`.
+        newpod::open(&mut ui, &shared);
+        assert!(newpod::key(&mut ui, &shared, KeyCode::Enter));
+        assert!(matches!(ui.mode, Mode::UpConfirm(_)), "{:?}", ui.mode);
+        assert!(newpod::key(&mut ui, &shared, KeyCode::Char('y')));
+        let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        assert!(ended(&shared, id, None).await, "the run never ended");
+        {
+            let s = shared.lock().unwrap();
+            let r = s.runs.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(
+                r.lines.front().map(String::as_str),
+                Some("args: --config /test/config.env --provider hetzner pods up --add 1 --server-type cx33 --yes")
+            );
+            assert_eq!(r.end.as_ref().map(|(_, e)| e.clone()), Some(runs::End::Code(1)));
+            assert_eq!(r.tally(), "1 ready, 1 failed");
+            assert_eq!(r.pods[0], ("devtest-echo".to_string(), runs::PodState::Ready("after 3m — proxy :9504".into())));
+            assert!(s.pending.iter().any(|p| p.name == "devtest-echo" && p.provider == "hetzner"), "a pending row at once");
+            assert_eq!(s.notice.as_ref().map(|n| n.text.as_str()), Some("✗ pods up: exit 1 — 1 ready, 1 failed — [p] shows it"));
+            let mode = std::fs::metadata(&r.log).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", r.log.display());
+            assert!(std::fs::read_to_string(&r.log).unwrap().contains("FAILED endpoint"), "stderr too");
+        }
+
+        // A run that waits; `s` asks, `y` sends it Ctrl+C.
+        let alpha = shared.lock().unwrap().pods.iter().find(|p| p.name == "devtest-alpha").cloned().unwrap();
+        start_cli_action(&mut ui, &shared, Action::Start, &alpha, None);
+        let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        assert!(ended(&shared, id, Some("waiting")).await, "it never started");
+        assert!(matches!(runs::key(&mut ui, &shared, KeyCode::Char('s')), runs::Flow::Handled));
+        assert!(matches!(ui.mode, Mode::Runs { stop: true, .. }), "{:?}", ui.mode);
+        assert!(matches!(runs::key(&mut ui, &shared, KeyCode::Char('y')), runs::Flow::Handled));
+        assert!(ended(&shared, id, None).await, "Ctrl+C didn't end it");
+        {
+            let s = shared.lock().unwrap();
+            let r = s.runs.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(r.lines.front().map(String::as_str), Some("args: --config /test/config.env --provider runpod pods start devtest-alpha --yes"));
+            assert_eq!((r.end.as_ref().map(|(_, e)| e.clone()), r.tally()), (Some(runs::End::Code(130)), "1 stopped".to_string()));
+        }
+
+        // Ctrl+C straight after `y` (review ai-review codex #2, round 2 #3: the child was spawned
+        // in the background task, so a stop — or a quit leaving it running — could come before
+        // it existed): `start` spawns it, so it has its pid when it's listed.
+        start_cli_action(&mut ui, &shared, Action::Start, &alpha, None);
+        let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        assert!(shared.lock().unwrap().runs.iter().find(|r| r.id == id).unwrap().pid.is_some(), "spawned before it's listed");
+        ui.mode = Mode::Runs { id, scroll: None, stop: true };
+        assert!(matches!(runs::key(&mut ui, &shared, KeyCode::Char('y')), runs::Flow::Handled));
+        assert_eq!(
+            shared.lock().unwrap().notice.as_ref().map(|n| n.text.clone()).as_deref(),
+            Some("sent Ctrl+C to the run: it stops where it is, terminates nothing")
+        );
+        assert!(ended(&shared, id, None).await, "Ctrl+C didn't end it");
+        let end = shared.lock().unwrap().runs.iter().find(|r| r.id == id).unwrap().end.clone().map(|(_, e)| e);
+        // SIGINT before the stub set its trap kills it; after, the trap exits 130.
+        assert!(matches!(end, Some(runs::End::Signal(2) | runs::End::Code(130))), "{end:?}");
+
+        // A line longer than several reads, then a verdict, then the exit: the verdict is read
+        // (review ai-review codex round 2 #2: the reading stopped at the first read that
+        // completed no line once the child had exited).
+        start_cli_action(&mut ui, &shared, Action::Logs, &alpha, None);
+        let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        assert!(ended(&shared, id, None).await, "the logs run never ended");
+        {
+            let s = shared.lock().unwrap();
+            let r = s.runs.iter().find(|r| r.id == id).unwrap();
+            assert!(r.lines.iter().any(|l| l == "[devtest-alpha] FAILED setup: after a long line"), "{:?}", r.lines.iter().map(|l| l.len()).collect::<Vec<_>>());
+            assert!(r.pods.is_empty(), "a log's lines are output, not progress");
+            assert!(r.lines.iter().any(|l| l.len() > 1_000 && l.ends_with('…')), "the long line, cut");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The human (2026-10-29): "i switch between runpod / vast / hetzner and its laggy". The
+    /// form's provider switch awaited a whole-fleet listing in the key loop. Now `n` opens the
+    /// form from the rows on screen and each switch is drawn at once — over a provider whose
+    /// listing takes ten seconds, never asked: the free names are the snapshot's (`up` lists
+    /// again before it creates), the type field the cached catalog or the presets meanwhile.
     #[tokio::test(start_paused = true)]
-    async fn n_lists_in_the_background_and_opens_the_form_when_it_lands() {
-        struct Slow;
+    async fn switching_provider_in_the_form_is_drawn_at_once_and_lists_nothing() {
+        struct Slow(AtomicUsize);
         #[async_trait::async_trait]
         impl Provider for Slow {
             fn name(&self) -> &'static str {
@@ -6587,8 +6594,9 @@ deep_check_end=1
                 String::new()
             }
             async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                Ok(vec![Pod { id: "rp1".into(), name: "devtest-alpha".into(), provider: "runpod".into(), ..Default::default() }])
+                Ok(Vec::new())
             }
             async fn create_pod(&self, _spec: &PodSpec) -> arena_core::Result<Pod> {
                 unimplemented!()
@@ -6603,17 +6611,33 @@ deep_check_end=1
                 unimplemented!()
             }
         }
-        let shared = Arc::new(Mutex::new(Shared::default()));
-        let mut ui = ui(cfg("RUNPOD_API_KEY=x\n"), Arc::new(FakeRemote::new()));
-        let provider: Arc<dyn Provider> = Arc::new(Slow);
-        start_new_pod_listing(&shared, &provider, &mut ui);
-        assert!(matches!(&ui.mode, Mode::Working(m) if m.starts_with("listing")), "{:?}", ui.mode);
-        assert!(shared.lock().unwrap().new_pod_listing.is_none(), "still listing");
-        tokio::time::sleep(Duration::from_secs(11)).await;
-        let listed = shared.lock().unwrap().new_pod_listing.take().expect("the listing landed");
-        let Mode::NewPod(form) = new_pod_mode(&ui, listed) else { panic!("no form") };
-        assert_eq!(form.free.first().map(String::as_str), Some("devtest-bravo"), "alpha is taken");
-        assert!(matches!(new_pod_mode(&ui, Err("vast 429".into())), Mode::Result(r) if r == "✗ list failed: vast 429"));
+        let slow = Arc::new(Slow(AtomicUsize::new(0)));
+        let _provider: Arc<dyn Provider> = slow.clone();
+        let mut fx = fixture_shared();
+        fx.last_refresh = Some(Instant::now());
+        let shared = Arc::new(Mutex::new(fx));
+        let mut ui = ui(cfg("RUNPOD_API_KEY=x\nVAST_API_KEY=x\nHETZNER_API_KEY=x\n"), Arc::new(FakeRemote::new()));
+        let frame = |ui: &Ui| draw(120, 45, &shared.lock().unwrap(), ui).join("\n");
+        let t = Instant::now();
+        newpod::open(&mut ui, &shared);
+        newpod::tick(&mut ui, &shared, Instant::now());
+        let screen = frame(&ui);
+        assert!(screen.contains("provider  ‹ runpod ›"), "{screen}");
+        // alpha..delta are listed (charlie, bravo, alpha, delta): nothing free in a 4-name list.
+        assert!(screen.contains("pods      ‹ 1 of 0 free ›"), "{screen}");
+        for want in ["vast", "hetzner", "runpod"] {
+            assert!(newpod::key(&mut ui, &shared, KeyCode::Right));
+            newpod::tick(&mut ui, &shared, Instant::now());
+            let screen = frame(&ui);
+            assert!(screen.contains(&format!("provider  ‹ {want} ›")), "{want}: {screen}");
+            if want == "hetzner" {
+                assert!(screen.contains("server    ‹ cx33"), "the server type, cx33 by default: {screen}");
+                assert!(!screen.contains("gpus/pod") && !screen.contains("cloud "), "{screen}");
+            }
+        }
+        assert!(t.elapsed() < Duration::from_secs(2), "open and three switches, each drawn: {:?}", t.elapsed());
+        assert_eq!(slow.0.load(Ordering::SeqCst), 0, "no listing asked for, let alone awaited");
+        assert!(matches!(ui.mode, Mode::NewPod(_)));
     }
 
     /// Live ASK4 3c (lane ASK8 item 4), review ai-review claude #1 (lane ASK9 item 1): a hangup or

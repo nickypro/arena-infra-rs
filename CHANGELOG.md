@@ -11,6 +11,11 @@ How to write an entry:
 - `### Action needed` for anything someone must do after updating. `### Config` for keys that
   were added, renamed or removed, or whose default changed.
 
+Versions are `major.minor.YYMMDD.HHMM` (the base is `BASE` in `crates/cli/build.rs`). Bump the
+minor when a command, flag or `--json` shape changes in a way a script or habit notices; the major
+for a config or on-pod layout break that needs action after updating; otherwise the date stamp
+alone tells releases apart. Say the new version in the entry that bumps it.
+
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
@@ -46,6 +51,58 @@ earlier).
   `~/.ssh/arena-admin.conf`, on the proxy box. One of the two per user: not kept while
   `SSH_CONFIG_FILE` is set too, or while `~/.ssh/config` includes the participants' file (both name
   the same hosts).
+
+## 2026-10-29 · The dashboard keeps up, and its `n` makes pods with `arena pods up`
+- The dashboard handles every key already waiting before it draws again, so holding a key or
+  typing ahead no longer queues up (over SSH it could lag for seconds). Nothing in it waits on the
+  network any more: switching provider in the add-pod form is instant (it used to list the whole
+  fleet each time, about a second with the screen frozen).
+- `n`'s form now runs `arena pods up --add N … --yes` — the `arena` installed beside `arena-tui` —
+  so a pod made from the dashboard gets what `up` does: fallbacks, near the proxy, the endpoint
+  wait, proxy, setup, keys, and `--check` if you tick it. It runs in the background; `p` shows its
+  progress (each pod's READY/FAILED and the whole output), `s` there stops it (Ctrl+C: nothing is
+  terminated), and quitting while it runs asks whether to leave it running (the default) or stop it.
+- The form's type list comes from the provider's live catalogue (RunPod: B300s, MIG slices…; on
+  Hetzner, the server types with their size and price), and a line under it shows what `up` would
+  try for your choice, with prices and stock (`o` hides it).
+- On Hetzner the form picks the server type, `cx33` first.
+- The pod menu (`a`) also has start, rename, jobs and logs, run as the CLI's own commands.
+- The summary bar names the AI keys at their cap (`⚠ AI key at cap: arena9-foo (no pod)`: no pod
+  in the table has that key), and the detail pane lists them all and points at `arena keys list`.
+  A key with a $0 cap that hasn't spent anything is `paused`, not at its cap.
+
+### Config
+- `HETZNER_SERVER_TYPE`'s default is now `cx33` (4 vCPU, 8 GB), was `cx23` (2 vCPU, 4 GB): new
+  Hetzner VMs cost about 1.5× as much. Set `HETZNER_SERVER_TYPE=cx23` to keep the old size.
+
+## 2026-10-29 · arena 2.1: `offers` lists everything on sale, compact help, Vast host classes
+- This is **arena 2.1** (a minor bump: `offers` and its `--json` changed shape; `update` offers it
+  to every 2.0 build).
+- `arena offers` is the same table, without the paragraph under it: one line says what `-v` adds
+  (the notes, what `--max-price` dropped, who was skipped). Its `--json` is unchanged.
+- `arena offers runpod` lists every GPU type on every tier — B200, B300 and the MIG slices included,
+  secure-only ones as `SECURE` — with `#` on what `up` would try. `arena offers vast` shows the cards
+  on Vast's market now, the cheapest offer per host class; `arena offers hetzner` the server types
+  grouped by family (cx, cpx, cax, ccx) and by size; `arena offers all` every provider. `--gpu`,
+  `--cloud` and `--max-price` filter them. `--all` still works; `gpus` prints as before.
+- `--gpu` takes RunPod types its public catalog doesn't list, when arena has seen them: `NVIDIA B300
+  SXM6 AC MIG 1g.34gb` (also `--gpu "B300 MIG"`), types on the account's pods, and
+  `RUNPOD_EXTRA_GPU_TYPES`. It warns, and RunPod's create decides. `offers runpod` lists them as
+  `unlisted`.
+- Vast's hosts have tiers, as RunPod's cloud has: `--cloud datacenter`, `verified` or `unverified`
+  (`up --provider vast --cloud datacenter` rents datacenter hosts only). The default is unchanged:
+  verified hosts, unless `VAST_ALLOW_UNVERIFIED=1`. The option tables show the tier.
+- Every command's `--help` lists its options one per line, without a blank line between each, and
+  keeps all its text.
+- The dashboard's GPU picker offers B200, B300 and the MIG slices too.
+- A create refused for capacity says the provider's own words (`[no capacity] devtest-apple on 1×RTX
+  A4000 SECURE: … There are no instances currently available`), so "full" reads apart from a type
+  the provider doesn't know.
+
+### Config
+- New, optional: `RUNPOD_EXTRA_GPU_TYPES`, exact RunPod GPU type ids its catalog lacks
+  (comma-separated), for `--gpu` to accept and `offers runpod` to list. Works from the environment
+  for one run.
 
 ## 2026-10-29 · No more "command not found: conda" on Hetzner VMs
 - A Hetzner VM's `~/.zshrc` no longer has conda's init block or `conda activate arena-env` (it came
