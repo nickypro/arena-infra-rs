@@ -1,0 +1,805 @@
+//! Runs: the CLI commands the dashboard starts — `pods up` from the add-pod form, `pods start`,
+//! `rename`, `jobs` and `logs` from the action menu, and the form's `offers` reads — as the
+//! `arena` binary beside its own (`arena tui` launched it from there; canonicalised, so a
+//! symlinked `arena-tui` finds the real one), **never one from `PATH`**: on a box with two
+//! installs that could be another version, or another account's.
+//!
+//! Why the CLI as a child, not the same code in-process: the form gets exactly what `arena pods
+//! up` does — placement with its fallbacks across GPU types and tiers, near the proxy, the
+//! endpoint → proxy → setup → check → keys pipelines, `CREATE_EXTRA_JSON`, the reap policy, the
+//! remembered prices — and every later change to `up` with it, with nothing copied here (the
+//! form's old raw creates had fallen behind). The dashboard has asked in its own confirm, so the
+//! child gets `--yes`; it gets the dashboard's `--config` and the form's `--provider`.
+//!
+//! A run writes its output — stdout and stderr together, as at a terminal — to a file of its own
+//! under the state directory (`<state>/<prefix>/runs/`, the newest [`KEEP_LOGS`] kept), which the
+//! dashboard reads as it grows ([`supervise`]) into the runs panel (`p`). Not a pipe: a run that
+//! makes pods must be able to outlive the dashboard — once the reader of a pipe is gone, the next
+//! line `up` prints kills it — and it runs in a process group of its own, so neither the
+//! dashboard's end nor the terminal's hangup signals it. **Quitting while one is going asks
+//! first** ([`Mode::Quit`]), and leaving it running is the default: stopping `up` half way leaves
+//! pods created and billing but not set up, whereas letting it go finishes what was confirmed
+//! (as `nohup arena pods up …` would) — its output stays in its file, which the quit says. A
+//! hangup or a TERM ends the dashboard at once and leaves it too. `s` in the panel (or at the
+//! quit) sends it Ctrl+C instead: `up`'s own — no new attempts, nothing terminated.
+//! Read-only runs (`jobs`, `logs`, `offers`) end with the dashboard.
+
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crossterm::event::KeyCode;
+use ratatui::prelude::*;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use tokio::sync::Notify;
+
+use crate::offers;
+use crate::{centered_rect, scroll_by, Mode, Shared, Ui};
+
+/// How many runs' output files are kept (the oldest go when a run starts).
+pub(crate) const KEEP_LOGS: usize = 30;
+
+/// How many of a run's lines the panel keeps (its file has them all).
+const KEEP_LINES: usize = 2_000;
+
+/// How many runs the dashboard remembers.
+const KEEP_RUNS: usize = 20;
+
+/// How often a run's file is read for new lines.
+const TAIL_EVERY: Duration = Duration::from_millis(150);
+
+/// How to run the CLI: the `arena` beside the dashboard's own executable, its config, and where
+/// runs' output goes.
+#[derive(Debug, Clone)]
+pub(crate) struct Cli {
+    pub exe: PathBuf,
+    pub config: String,
+    pub dir: PathBuf,
+}
+
+impl Cli {
+    /// The `arena` beside `own` (this executable; canonicalised) — or why there's none — with
+    /// the dashboard's `config` and runs' output under `state` (`<state dir>/runs`).
+    pub(crate) fn locate(own: std::io::Result<PathBuf>, config: &str, state: Result<PathBuf, String>) -> Result<Cli, String> {
+        let own = own.and_then(|p| p.canonicalize()).map_err(|e| format!("can't tell where arena-tui is ({e})"))?;
+        let exe = own.parent().map(|d| d.join("arena")).ok_or_else(|| format!("{} has no directory", own.display()))?;
+        if !exe.is_file() {
+            return Err(format!(
+                "no `arena` beside {} — the dashboard runs the CLI installed with it, never one from PATH",
+                own.display()
+            ));
+        }
+        let dir = state.map_err(|e| format!("no state directory for runs' output: {e}"))?.join("runs");
+        Ok(Cli { exe, config: config.to_string(), dir })
+    }
+
+    /// `arena --config <config> --provider <provider> <args…>`, stdin from nowhere (a prompt
+    /// refuses rather than waits).
+    fn command(&self, provider: &str, args: &[String]) -> tokio::process::Command {
+        let mut c = tokio::process::Command::new(&self.exe);
+        c.arg("--config").arg(&self.config).arg("--provider").arg(provider).args(args).stdin(Stdio::null());
+        c
+    }
+}
+
+/// What a run is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Up,
+    Start,
+    Rename,
+    Jobs,
+    Logs,
+}
+
+impl Kind {
+    fn word(&self) -> &'static str {
+        match self {
+            Kind::Up => "up",
+            Kind::Start => "start",
+            Kind::Rename => "rename",
+            Kind::Jobs => "jobs",
+            Kind::Logs => "logs",
+        }
+    }
+
+    /// It changes pods: left running when the dashboard ends (asked first on a quit), never
+    /// killed with it. The rest only read.
+    pub(crate) fn lasting(&self) -> bool {
+        matches!(self, Kind::Up | Kind::Start | Kind::Rename)
+    }
+}
+
+/// How a run ended.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum End {
+    Code(i32),
+    Signal(i32),
+    /// It never started (the spawn failed, the output file couldn't be made).
+    NotStarted(String),
+}
+
+impl End {
+    fn ok(&self) -> bool {
+        *self == End::Code(0)
+    }
+
+    fn label(&self) -> String {
+        match self {
+            End::Code(0) => "done".into(),
+            End::Code(c) => format!("exit {c}"),
+            End::Signal(s) => format!("killed (signal {s})"),
+            End::NotStarted(why) => format!("didn't start: {why}"),
+        }
+    }
+}
+
+/// Where one pod of a run is, from its `[name] …` lines.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PodState {
+    Created,
+    /// A stage line (`setup ✓`, `proxy: port 9500 → …`, `check: pass`).
+    Doing(String),
+    /// `READY after 3m10s — …`
+    Ready(String),
+    /// `FAILED setup: …`
+    Failed(String),
+    /// `STOPPED at endpoint (Ctrl+C)`
+    Stopped(String),
+}
+
+/// A `pods up`/`start` line about one pod — `[created] NAME id=…`, `[NAME] READY after …`,
+/// `[NAME] FAILED stage: why`, `[NAME] STOPPED at …`, any other `[NAME] stage …` — as the pod and
+/// where it is. `None`: not about one pod. Pure.
+pub(crate) fn pod_line(line: &str) -> Option<(String, PodState)> {
+    let line = line.trim_end();
+    if let Some(rest) = line.strip_prefix("[created] ") {
+        let name = rest.split_whitespace().next()?;
+        return Some((name.to_string(), PodState::Created));
+    }
+    let rest = line.strip_prefix('[')?;
+    let (name, what) = rest.split_once("] ")?;
+    if name.is_empty() || name.contains(' ') || name == "dry-run" {
+        return None;
+    }
+    let what = what.trim();
+    let state = if let Some(r) = what.strip_prefix("READY") {
+        PodState::Ready(r.trim().to_string())
+    } else if what.starts_with("FAILED") {
+        PodState::Failed(what.to_string())
+    } else if what.starts_with("STOPPED") {
+        PodState::Stopped(what.to_string())
+    } else {
+        PodState::Doing(what.chars().take(80).collect())
+    };
+    Some((name.to_string(), state))
+}
+
+/// One run, as the panel shows it.
+#[derive(Debug)]
+pub(crate) struct Run {
+    pub id: u64,
+    pub kind: Kind,
+    pub title: String,
+    /// The provider it was started with (`--provider`): a created pod's placeholder row is on it.
+    pub provider: String,
+    /// What runs, for the panel: `arena --provider hetzner pods up …`.
+    pub command: String,
+    pub log: PathBuf,
+    pub pid: Option<u32>,
+    pub started: Instant,
+    pub lines: VecDeque<String>,
+    /// Lines no longer kept (the file has them).
+    pub dropped: usize,
+    /// Each pod's last state, in the order they were first named.
+    pub pods: Vec<(String, PodState)>,
+    pub end: Option<(Instant, End)>,
+}
+
+impl Run {
+    /// Take one line of output; the pod it created, if it says so.
+    pub(crate) fn take(&mut self, line: String) -> Option<String> {
+        let mut created = None;
+        if let Some((name, state)) = pod_line(&line) {
+            if state == PodState::Created {
+                created = Some(name.clone());
+            }
+            match self.pods.iter_mut().find(|(n, _)| *n == name) {
+                // A finished pod's verdict stands against later chatter about it (the summary).
+                Some((_, PodState::Ready(_) | PodState::Failed(_) | PodState::Stopped(_))) if matches!(state, PodState::Doing(_)) => {}
+                Some((_, s)) => *s = state,
+                None => self.pods.push((name, state)),
+            }
+        }
+        self.lines.push_back(line);
+        while self.lines.len() > KEEP_LINES {
+            self.lines.pop_front();
+            self.dropped += 1;
+        }
+        created
+    }
+
+    pub(crate) fn running(&self) -> bool {
+        self.end.is_none()
+    }
+
+    /// `2 ready, 1 failed` — the pods' outcomes, for the notice and the panel.
+    pub(crate) fn tally(&self) -> String {
+        let n = |f: fn(&PodState) -> bool| self.pods.iter().filter(|(_, s)| f(s)).count();
+        let ready = n(|s| matches!(s, PodState::Ready(_)));
+        let failed = n(|s| matches!(s, PodState::Failed(_)));
+        let stopped = n(|s| matches!(s, PodState::Stopped(_)));
+        let other = self.pods.len() - ready - failed - stopped;
+        let mut parts = Vec::new();
+        for (k, w) in [(ready, "ready"), (failed, "failed"), (stopped, "stopped"), (other, if self.running() { "under way" } else { "unfinished" })] {
+            if k > 0 {
+                parts.push(format!("{k} {w}"));
+            }
+        }
+        parts.join(", ")
+    }
+
+    /// The footer's line when it ends: `✓ pods up: 1 ready`, `✗ pods up: exit 1 — 1 failed`.
+    fn notice(&self) -> (String, bool) {
+        let Some((_, end)) = &self.end else { return (String::new(), false) };
+        let tally = self.tally();
+        let what = format!("pods {}", self.kind.word());
+        let text = match (end.ok(), tally.is_empty()) {
+            (true, true) => format!("✓ {what} done"),
+            (true, false) => format!("✓ {what}: {tally}"),
+            (false, true) => format!("✗ {what}: {}", end.label()),
+            (false, false) => format!("✗ {what}: {} — {tally}", end.label()),
+        };
+        (format!("{text} — [p] shows it"), !end.ok())
+    }
+}
+
+/// Start `arena <args…>` on `provider` as a run (`title` in the panel): its output file made,
+/// the child spawned in the background ([`supervise`]). The run's id — or why it can't start.
+pub(crate) fn start(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, kind: Kind, provider: &str, args: Vec<String>, title: String) -> Result<u64, String> {
+    let cli = ui.cli.as_ref().map_err(Clone::clone)?;
+    if arena_core::remote::ending() {
+        return Err("the dashboard is ending".into());
+    }
+    std::fs::create_dir_all(&cli.dir).map_err(|e| format!("making {}: {e}", cli.dir.display()))?;
+    prune(&cli.dir, KEEP_LOGS.saturating_sub(1));
+    let id = {
+        let mut s = shared.lock().unwrap();
+        s.next_run += 1;
+        s.next_run
+    };
+    let log = cli.dir.join(format!("{}-{}-{id}.log", arena_core::snapshot::unix_now(), kind.word()));
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&log).map_err(|e| format!("making {}: {e}", log.display()))?
+    };
+    let mut cmd = cli.command(provider, &args);
+    let err = file.try_clone().map_err(|e| e.to_string())?;
+    cmd.stdout(file).stderr(err).process_group(0).kill_on_drop(!kind.lasting());
+    let quote = |a: &String| if a.contains(' ') || a.contains(',') { format!("'{a}'") } else { a.clone() };
+    let command = format!("arena --provider {provider} {}", args.iter().map(quote).collect::<Vec<_>>().join(" "));
+    {
+        let mut s = shared.lock().unwrap();
+        s.runs.push(Run {
+            id,
+            kind,
+            title,
+            provider: provider.to_string(),
+            command,
+            log: log.clone(),
+            pid: None,
+            started: Instant::now(),
+            lines: VecDeque::new(),
+            dropped: 0,
+            pods: Vec::new(),
+            end: None,
+        });
+        // Forget the oldest finished runs (their files stay).
+        while s.runs.len() > KEEP_RUNS {
+            match s.runs.iter().position(|r| !r.running()) {
+                Some(i) => drop(s.runs.remove(i)),
+                None => break,
+            }
+        }
+    }
+    tokio::spawn(supervise(shared.clone(), ui.nudge.clone(), id, cmd, log));
+    Ok(id)
+}
+
+/// Remove all but the newest `keep` `*.log` files in `dir` (named by start time, so by name).
+fn prune(dir: &Path, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut logs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "log")).collect();
+    logs.sort();
+    let n = logs.len().saturating_sub(keep);
+    for p in logs.into_iter().take(n) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// `cmd.spawn()`, again a few times while exec says the file is busy (ETXTBSY: a test's stub
+/// just written, still open in a child another thread forked — see the CLI's live_smoke).
+async fn spawn_retrying_busy(cmd: &mut tokio::process::Command) -> std::io::Result<tokio::process::Child> {
+    const ETXTBSY: i32 = 26;
+    let mut tries = 0;
+    loop {
+        match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && tries < 20 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Run `cmd` (run `id`), reading its output file `log` as it grows into the run — a created
+/// pod shows at once as a pending row, and a refresh is nudged when a pod is made or finishes —
+/// until it has exited and every line is read; then its end, and the footer says so.
+async fn supervise(shared: Arc<Mutex<Shared>>, nudge: Arc<Notify>, id: u64, mut cmd: tokio::process::Command, log: PathBuf) {
+    let mut child = match spawn_retrying_busy(&mut cmd).await {
+        Ok(c) => c,
+        Err(e) => return finish(&shared, id, End::NotStarted(e.to_string())),
+    };
+    with_run(&shared, id, |r| r.pid = child.id());
+    let mut reader = std::fs::File::open(&log).ok();
+    let mut partial: Vec<u8> = Vec::new();
+    let mut status = None;
+    loop {
+        let lines = read_lines(reader.as_mut(), &mut partial);
+        let got = !lines.is_empty();
+        if got {
+            take_lines(&shared, &nudge, id, lines);
+        }
+        if status.is_some() {
+            if got {
+                continue;
+            }
+            break;
+        }
+        tokio::select! {
+            s = child.wait() => status = Some(s),
+            _ = tokio::time::sleep(TAIL_EVERY) => {}
+        }
+    }
+    if !partial.is_empty() {
+        let last = String::from_utf8_lossy(&partial).into_owned();
+        take_lines(&shared, &nudge, id, vec![last]);
+    }
+    let end = match status {
+        Some(Ok(st)) => {
+            use std::os::unix::process::ExitStatusExt;
+            st.code().map_or_else(|| End::Signal(st.signal().unwrap_or(0)), End::Code)
+        }
+        Some(Err(e)) => End::NotStarted(format!("waiting for it: {e}")),
+        None => End::NotStarted("lost".into()),
+    };
+    finish(&shared, id, end);
+}
+
+/// The complete lines read from `file` since the last call (an incomplete one waits in `partial`).
+fn read_lines(file: Option<&mut std::fs::File>, partial: &mut Vec<u8>) -> Vec<String> {
+    use std::io::Read;
+    let Some(f) = file else { return Vec::new() };
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() || buf.is_empty() {
+        return Vec::new();
+    }
+    partial.extend_from_slice(&buf);
+    let Some(last_nl) = partial.iter().rposition(|&b| b == b'\n') else { return Vec::new() };
+    let complete: Vec<u8> = partial.drain(..=last_nl).collect();
+    String::from_utf8_lossy(&complete).lines().map(String::from).collect()
+}
+
+fn with_run(shared: &Mutex<Shared>, id: u64, f: impl FnOnce(&mut Run)) {
+    let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(r) = s.runs.iter_mut().find(|r| r.id == id) {
+        f(r);
+    }
+}
+
+/// Lines into run `id` ([`apply`]); a refresh nudged when they made or finished a pod.
+fn take_lines(shared: &Mutex<Shared>, nudge: &Notify, id: u64, lines: Vec<String>) {
+    let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if apply(&mut s, id, lines) {
+        nudge.notify_one();
+    }
+}
+
+/// Lines into run `id`: each pod a line says was created shows at once as a `pending` row (the
+/// refresh drops it when the provider lists the real one). `true`: a pod was made or finished —
+/// worth a refresh.
+pub(crate) fn apply(s: &mut Shared, id: u64, lines: Vec<String>) -> bool {
+    let Some(r) = s.runs.iter_mut().find(|r| r.id == id) else { return false };
+    let provider = r.provider.clone();
+    let mut created = Vec::new();
+    let mut refresh = false;
+    for line in lines {
+        refresh |= matches!(pod_line(&line), Some((_, PodState::Ready(_) | PodState::Failed(_))));
+        created.extend(r.take(line));
+    }
+    for name in created {
+        refresh = true;
+        if !s.pods.iter().any(|p| p.name == name) && !s.pending.iter().any(|p| p.name == name) {
+            s.pending.push(arena_core::Pod { id: format!("pending-{name}"), name, provider: provider.clone(), status: "pending".into(), ..Default::default() });
+        }
+    }
+    refresh
+}
+
+fn finish(shared: &Mutex<Shared>, id: u64, end: End) {
+    let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(r) = s.runs.iter_mut().find(|r| r.id == id) else { return };
+    r.end = Some((Instant::now(), end));
+    let (text, bad) = r.notice();
+    s.notify(text, bad);
+}
+
+/// Run `arena offers …` for `q` in the background; its answer lands in `Shared::offers_landed`
+/// (the loop hands it to the form's [`offers::State`]). No CLI to run (a demo, no `arena` beside
+/// the dashboard): the answer is why, at once.
+pub(crate) fn fetch_offers(shared: &Arc<Mutex<Shared>>, cli: &Result<Cli, String>, q: offers::Query, state: &mut offers::State, now: Instant) {
+    let cli = match cli {
+        Ok(c) => c,
+        Err(why) => return state.landed(q, Err(why.clone()), now),
+    };
+    let (provider, args) = offers::args(&q);
+    let cmd = cli.command(&provider, &args);
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        let out = capture(cmd, offers::TIMEOUT).await;
+        shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).offers_landed.push((q, out));
+    });
+}
+
+/// Run a read-only `cmd` to its end (killed after `timeout`): its stdout when that's JSON, else
+/// why not — its last line on stderr (`Error: ` dropped), or its exit.
+pub(crate) async fn capture(mut cmd: tokio::process::Command, timeout: Duration) -> Result<String, String> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let child = spawn_retrying_busy(&mut cmd).await.map_err(|e| format!("couldn't run arena: {e}"))?;
+    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Err(_) => return Err(format!("no answer within {}s", timeout.as_secs())),
+        Ok(Err(e)) => return Err(e.to_string()),
+        Ok(Ok(out)) => out,
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    if stdout.trim_start().starts_with('{') {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let why = stderr.lines().map(str::trim).rfind(|l| !l.is_empty()).map(|l| l.strip_prefix("Error: ").unwrap_or(l).to_string());
+    Err(why.unwrap_or_else(|| format!("arena offers: {}", out.status)))
+}
+
+/// Send run `id` Ctrl+C — SIGINT to its process group, as a terminal's Ctrl+C would (`up`: no new
+/// attempts, nothing terminated). Whether it was sent.
+fn interrupt(shared: &Mutex<Shared>, id: u64) -> bool {
+    let pid = {
+        let s = shared.lock().unwrap();
+        s.runs.iter().find(|r| r.id == id && r.running()).and_then(|r| r.pid)
+    };
+    let Some(pid) = pid else { return false };
+    std::process::Command::new("kill")
+        .args(["-INT", "--", &format!("-{pid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The runs still going that change pods — what a quit asks about.
+pub(crate) fn lasting_running(s: &Shared) -> Vec<(u64, String, Option<u32>, PathBuf)> {
+    s.runs.iter().filter(|r| r.running() && r.kind.lasting()).map(|r| (r.id, r.command.clone(), r.pid, r.log.clone())).collect()
+}
+
+/// `q` (or Ctrl+C): quit now, or — with a run that changes pods still going — the question
+/// ([`Mode::Quit`]). `true`: quit now.
+pub(crate) fn quit_or_ask(ui: &mut Ui, shared: &Mutex<Shared>) -> bool {
+    if lasting_running(&shared.lock().unwrap()).is_empty() {
+        return true;
+    }
+    ui.mode = Mode::Quit;
+    false
+}
+
+/// What a key in the runs panel or the quit question leads to.
+pub(crate) enum Flow {
+    NotOurs,
+    Handled,
+    /// Quit, saying these lines once the terminal is back.
+    Quit(Vec<String>),
+}
+
+/// The lines said after a quit that left `left` running.
+fn left_running(left: &[(u64, String, Option<u32>, PathBuf)], stopped: bool) -> Vec<String> {
+    left.iter()
+        .map(|(_, cmd, pid, log)| {
+            let pid = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
+            if stopped {
+                format!("arena-tui: sent Ctrl+C to `{cmd}`{pid}: it stops where it is, terminates nothing — its output: {}", log.display())
+            } else {
+                format!("arena-tui: left running: `{cmd}`{pid} — its output: {}", log.display())
+            }
+        })
+        .collect()
+}
+
+/// The runs panel's keys (`Mode::Runs`), the quit question's (`Mode::Quit`), and `p` on the
+/// list or detail view, which opens the newest run.
+pub(crate) fn key(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, code: KeyCode) -> Flow {
+    match ui.mode.clone() {
+        Mode::List | Mode::Detail if code == KeyCode::Char('p') => {
+            let newest = shared.lock().unwrap().runs.last().map(|r| r.id);
+            match newest {
+                Some(id) => ui.mode = Mode::Runs { id, scroll: None, stop: false },
+                None => shared.lock().unwrap().notify("no runs yet — [n] makes pods, [a] has start/rename/jobs/logs", false),
+            }
+            Flow::Handled
+        }
+        Mode::Runs { id, scroll, stop } => {
+            let ids: Vec<u64> = shared.lock().unwrap().runs.iter().map(|r| r.id).collect();
+            let at = ids.iter().position(|&i| i == id).unwrap_or(0);
+            let max = ui.result_max.get();
+            let mut next = Mode::Runs { id, scroll, stop: false };
+            match code {
+                KeyCode::Char('y') if stop => {
+                    let sent = interrupt(shared, id);
+                    shared.lock().unwrap().notify(if sent { "sent Ctrl+C to the run: it stops where it is, terminates nothing" } else { "✗ the run isn't running" }, !sent);
+                }
+                KeyCode::Esc | KeyCode::Char('q') => next = Mode::List,
+                KeyCode::Left | KeyCode::Char('h') if at > 0 => next = Mode::Runs { id: ids[at - 1], scroll: None, stop: false },
+                KeyCode::Right | KeyCode::Char('l') if at + 1 < ids.len() => next = Mode::Runs { id: ids[at + 1], scroll: None, stop: false },
+                KeyCode::Up | KeyCode::Char('k') => next = Mode::Runs { id, scroll: Some(scroll_by(scroll.unwrap_or(max), max, -1)), stop: false },
+                KeyCode::Down | KeyCode::Char('j') => next = Mode::Runs { id, scroll: follow(scroll_by(scroll.unwrap_or(max), max, 1), max), stop: false },
+                KeyCode::PageUp => next = Mode::Runs { id, scroll: Some(scroll_by(scroll.unwrap_or(max), max, -10)), stop: false },
+                KeyCode::PageDown => next = Mode::Runs { id, scroll: follow(scroll_by(scroll.unwrap_or(max), max, 10), max), stop: false },
+                KeyCode::End | KeyCode::Char('G') => next = Mode::Runs { id, scroll: None, stop: false },
+                KeyCode::Home | KeyCode::Char('g') => next = Mode::Runs { id, scroll: Some(0), stop: false },
+                KeyCode::Char('s') => {
+                    let can = shared.lock().unwrap().runs.iter().any(|r| r.id == id && r.running() && r.kind.lasting());
+                    next = Mode::Runs { id, scroll, stop: can };
+                }
+                _ => {}
+            }
+            ui.mode = next;
+            Flow::Handled
+        }
+        Mode::Quit => {
+            let left = lasting_running(&shared.lock().unwrap());
+            match code {
+                KeyCode::Esc => {
+                    ui.mode = Mode::List;
+                    Flow::Handled
+                }
+                KeyCode::Char('s') => {
+                    for (id, ..) in &left {
+                        interrupt(shared, *id);
+                    }
+                    Flow::Quit(left_running(&left, true))
+                }
+                KeyCode::Char('k' | 'q') | KeyCode::Enter => Flow::Quit(left_running(&left, false)),
+                _ => Flow::Handled,
+            }
+        }
+        _ => Flow::NotOurs,
+    }
+}
+
+/// A scroll at the end follows the output again.
+fn follow(scroll: u16, max: u16) -> Option<u16> {
+    (scroll < max).then_some(scroll)
+}
+
+/// `1m12s`, `45s`.
+fn elapsed(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 60 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// The footer's lead while runs are going: `⟳ pods up 1m12s (1 under way) · `.
+pub(crate) fn footer(s: &Shared) -> Option<String> {
+    let going: Vec<String> = s
+        .runs
+        .iter()
+        .filter(|r| r.running())
+        .map(|r| {
+            let tally = r.tally();
+            format!("pods {} {}{}", r.kind.word(), elapsed(r.started.elapsed()), if tally.is_empty() { String::new() } else { format!(" ({tally})") })
+        })
+        .collect();
+    (!going.is_empty()).then(|| format!("⟳ {} · [p] progress · ", going.join(", ")))
+}
+
+/// The runs panel: run `id`'s title and state, its command and output file, each pod's state,
+/// then its output — following the end unless scrolled (`scroll`).
+pub(crate) fn render(f: &mut Frame, s: &Shared, id: u64, scroll: Option<u16>, stop: bool, max: &std::cell::Cell<u16>) {
+    let area = centered_rect(90, 85, f.area());
+    f.render_widget(Clear, area);
+    let Some(run) = s.runs.iter().find(|r| r.id == id) else {
+        f.render_widget(Paragraph::new("this run is gone").block(Block::default().borders(Borders::ALL)), area);
+        return;
+    };
+    let at = s.runs.iter().position(|r| r.id == id).unwrap_or(0) + 1;
+    let dim = Style::default().fg(Color::DarkGray);
+    let (state, color) = match &run.end {
+        None => (format!("running {}", elapsed(run.started.elapsed())), Color::Cyan),
+        Some((t, e)) => (format!("{} after {}", e.label(), elapsed(t.duration_since(run.started))), if e.ok() { Color::Green } else { Color::Red }),
+    };
+    let mut head: Vec<Line> = vec![
+        Line::styled(format!("$ {}", run.command), Style::default().fg(Color::Cyan)),
+        Line::styled(format!("output: {}", run.log.display()), dim),
+    ];
+    for (name, st) in &run.pods {
+        let (text, style) = match st {
+            PodState::Created => ("created".to_string(), Style::default()),
+            PodState::Doing(w) => (format!("… {w}"), Style::default()),
+            PodState::Ready(w) => (format!("✓ READY {w}"), Style::default().fg(Color::Green)),
+            PodState::Failed(w) => (format!("✗ {w}"), Style::default().fg(Color::Red)),
+            PodState::Stopped(w) => (format!("⊘ {w}"), Style::default().fg(Color::Yellow)),
+        };
+        head.push(Line::from(vec![Span::styled(format!("  {name:<20} "), Style::default().add_modifier(Modifier::BOLD)), Span::styled(text, style)]));
+    }
+    let keys = if stop {
+        Line::styled("send Ctrl+C to it (no new attempts, nothing terminated)?  [y] yes  [any other key] no", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else {
+        let stop = if run.running() && run.kind.lasting() { "  [s] stop" } else { "" };
+        Line::styled(format!("[esc] hide  [←→] run {at} of {}  [↑↓ PgUp PgDn] scroll  [end] follow{stop}", s.runs.len()), dim)
+    };
+    let inner = area.height.saturating_sub(2) as usize;
+    let room = inner.saturating_sub(head.len() + 2).max(1);
+    let total = run.lines.len();
+    let max_scroll = total.saturating_sub(room) as u16;
+    max.set(max_scroll);
+    let from = scroll.map_or(max_scroll, |s| s.min(max_scroll)) as usize;
+    let mut lines = head;
+    lines.push(Line::styled("─".repeat(area.width.saturating_sub(2) as usize), dim));
+    if total == 0 {
+        lines.push(Line::styled(if run.running() { "(no output yet)" } else { "(no output)" }, dim));
+    }
+    lines.extend(run.lines.iter().skip(from).take(room).map(|l| Line::raw(l.clone())));
+    let used = lines.len();
+    lines.extend(std::iter::repeat_n(Line::raw(""), inner.saturating_sub(used + 1)));
+    lines.push(keys);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color))
+                .title(format!(" {} — {state} ", run.title)),
+        ),
+        area,
+    );
+}
+
+/// The quit question: which runs that change pods are still going, and what each key does.
+pub(crate) fn render_quit(f: &mut Frame, s: &Shared) {
+    let left = lasting_running(s);
+    let mut lines = vec![Line::styled(format!("{} run(s) that change pods still going:", left.len()), Style::default().add_modifier(Modifier::BOLD)), Line::from("")];
+    for (_, cmd, pid, _) in &left {
+        lines.push(Line::from(format!("  {cmd}{}", pid.map(|p| format!("  (pid {p})")).unwrap_or_default())));
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from("[k] quit, and leave it running (default) — it finishes what was confirmed; its output stays in its file"),
+        Line::from("[s] quit, and send it Ctrl+C — it stops where it is (pods made so far are left as they are, billing)"),
+        Line::from("[esc] stay"),
+    ]);
+    let area = centered_rect(80, 40, f.area());
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)).title(" quit? ")),
+        area,
+    );
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// `pods up`'s per-pod lines, as the panel reads them; anything else isn't about a pod.
+    #[test]
+    fn up_lines_say_where_each_pod_is() {
+        let cases: [(&str, Option<(&str, PodState)>); 10] = [
+            ("[created] devtest-alpha id=12345 on cx33 (€0.0160/h)", Some(("devtest-alpha", PodState::Created))),
+            ("[devtest-alpha] proxy: port 9500 → 1.2.3.4:22", Some(("devtest-alpha", PodState::Doing("proxy: port 9500 → 1.2.3.4:22".into())))),
+            ("[devtest-alpha] setup ✓ (3m02s)", Some(("devtest-alpha", PodState::Doing("setup ✓ (3m02s)".into())))),
+            ("[devtest-alpha] READY after 4m10s — proxy :9500", Some(("devtest-alpha", PodState::Ready("after 4m10s — proxy :9500".into())))),
+            ("[devtest-bravo] FAILED setup: timed out", Some(("devtest-bravo", PodState::Failed("FAILED setup: timed out".into())))),
+            ("[devtest-bravo] STOPPED at endpoint (Ctrl+C) — left as it is", Some(("devtest-bravo", PodState::Stopped("STOPPED at endpoint (Ctrl+C) — left as it is".into())))),
+            ("[dry-run] would create devtest-alpha", None),
+            ("Will create 1 pod(s) on hetzner", None),
+            ("[two words] x", None),
+            ("", None),
+        ];
+        for (line, want) in cases {
+            assert_eq!(pod_line(line), want.map(|(n, s)| (n.to_string(), s)), "{line:?}");
+        }
+    }
+
+    pub(crate) fn run(id: u64, kind: Kind) -> Run {
+        Run {
+            id,
+            kind,
+            title: "t".into(),
+            provider: "hetzner".into(),
+            command: "arena --provider hetzner pods up --add 1 --yes".into(),
+            log: PathBuf::from("/tmp/x.log"),
+            pid: None,
+            started: Instant::now(),
+            lines: VecDeque::new(),
+            dropped: 0,
+            pods: Vec::new(),
+            end: None,
+        }
+    }
+
+    /// A created pod shows at once as a pending row on the run's provider (once), and its
+    /// creation and its verdict ask for a refresh; a verdict stands against later chatter; the
+    /// tally and the closing notice count the outcomes.
+    #[test]
+    fn a_runs_lines_make_pending_rows_and_a_tally() {
+        let mut s = Shared::default();
+        s.runs.push(run(1, Kind::Up));
+        let l = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(!apply(&mut s, 1, l(&["Will create 2 pod(s)…"])));
+        assert!(apply(&mut s, 1, l(&["[created] devtest-alpha id=1 on cx33", "[created] devtest-bravo id=2 on cx33", "[created] devtest-alpha id=1"])));
+        assert_eq!(s.pending.iter().map(|p| (p.name.as_str(), p.provider.as_str(), p.status.as_str())).collect::<Vec<_>>(), [("devtest-alpha", "hetzner", "pending"), ("devtest-bravo", "hetzner", "pending")]);
+        assert!(!apply(&mut s, 1, l(&["[devtest-alpha] setup ✓ (3m)"])));
+        assert!(apply(&mut s, 1, l(&["[devtest-alpha] READY after 4m — ok", "[devtest-bravo] FAILED setup: timed out"])));
+        apply(&mut s, 1, l(&["[devtest-alpha] fleet SSH map updated"]));
+        let r = &s.runs[0];
+        assert_eq!(r.pods[0].1, PodState::Ready("after 4m — ok".into()), "the verdict stands");
+        assert_eq!(r.tally(), "1 ready, 1 failed");
+        assert_eq!(r.lines.len(), 8);
+        finish(&Mutex::new(std::mem::take(&mut s)), 1, End::Code(1));
+        assert!(!apply(&mut Shared::default(), 9, l(&["[created] x id=1"])), "no such run");
+    }
+
+    /// The runner never takes `arena` from PATH: only the one beside the dashboard's own
+    /// executable (canonicalised — a symlinked arena-tui finds the real one's sibling).
+    #[test]
+    fn the_cli_is_the_one_beside_the_dashboard() {
+        let dir = std::env::temp_dir().join(format!("arena-tui-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::create_dir_all(dir.join("links")).unwrap();
+        std::fs::write(dir.join("real/arena-tui"), "").unwrap();
+        std::os::unix::fs::symlink(dir.join("real/arena-tui"), dir.join("links/arena-tui")).unwrap();
+        let state = || Ok(dir.join("state"));
+        let missing = Cli::locate(Ok(dir.join("links/arena-tui")), "/c.env", state()).unwrap_err();
+        assert!(missing.contains("no `arena` beside") && missing.contains("never one from PATH"), "{missing}");
+        std::fs::write(dir.join("real/arena"), "").unwrap();
+        let cli = Cli::locate(Ok(dir.join("links/arena-tui")), "/c.env", state()).unwrap();
+        assert_eq!(cli.exe, dir.join("real/arena").canonicalize().unwrap());
+        assert_eq!((cli.config.as_str(), cli.dir.clone()), ("/c.env", dir.join("state/runs")));
+        assert!(Cli::locate(Ok(dir.join("links/arena-tui")), "/c.env", Err("no HOME".into())).unwrap_err().contains("no HOME"));
+        assert!(Cli::locate(Err(std::io::Error::other("x")), "/c.env", state()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only the newest `keep` output files stay.
+    #[test]
+    fn old_run_files_are_pruned() {
+        let dir = std::env::temp_dir().join(format!("arena-tui-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for t in 100..105 {
+            std::fs::write(dir.join(format!("{t}-up-1.log")), "").unwrap();
+        }
+        std::fs::write(dir.join("keep.txt"), "").unwrap();
+        prune(&dir, 2);
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["103-up-1.log", "104-up-1.log", "keep.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
