@@ -745,7 +745,9 @@ impl Shared<'_, '_> {
                     // A bare VM's setup says what built its env (`install_uv.sh`, or `none (env
                     // already present)`): on the ✓ line, the one the operator reads.
                     let installer = outcome.installer().map(|i| format!(", installer: {i}")).unwrap_or_default();
-                    say(To::Out, &format!("[{name}] setup ✓ ({}{installer})", pipeline::fmt_elapsed(t.elapsed())));
+                    // A VM from an arena image: which one, and how old (`HETZNER_IMAGE=arena`).
+                    let image = outcome.image().map(|i| format!(", image: {i}")).unwrap_or_default();
+                    say(To::Out, &format!("[{name}] setup ✓ ({}{installer}{image})", pipeline::fmt_elapsed(t.elapsed())));
                     // A best-effort step (the move onto the volume, the VS Code warm-up) that didn't
                     // work out: said, not fatal.
                     for w in outcome.warnings() {
@@ -2047,6 +2049,12 @@ mod tests {
             ("### 4/6 ARENA repo + Python env\narena-installer: install_uv.sh\n### done — Python 3.13.16\n", "(0s, installer: install_uv.sh)"),
             ("arena-installer: none (env already present)\r\n", "(0s, installer: none (env already present))"),
             ("### done — nothing said\n", "(0s)"),
+            (
+                "arena-image: devtest-image-261029-1556, built 2026-10-29 (0 h ago), commit 3eed962b9bd8; requirements unchanged, env kept\n\
+                 arena-installer: none (env already present)\n",
+                "(0s, installer: none (env already present), image: devtest-image-261029-1556, built 2026-10-29 (0 h ago), commit \
+                 3eed962b9bd8; requirements unchanged, env kept)",
+            ),
         ] {
             let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
             let fake = Arc::new(FakeRemote::new());

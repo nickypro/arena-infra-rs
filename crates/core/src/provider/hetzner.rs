@@ -53,6 +53,8 @@ pub struct HetznerOpts {
     /// The cohort key's public half on this box (`SHARED_SSH_KEY_PATH` + `.pub`): the file to
     /// upload under a missing key's name. `None` = no shared key configured.
     pub pubkey_file: Option<String>,
+    /// Whose arena images `image = arena` picks from ([`crate::image::Scope`]).
+    pub image_scope: crate::image::Scope,
 }
 
 /// The server type a create asks for when neither `--server-type` nor `HETZNER_SERVER_TYPE`
@@ -74,6 +76,7 @@ impl Default for HetznerOpts {
             ssh_keys: Vec::new(),
             ssh_keys_from: "MACHINE_NAME_PREFIX",
             pubkey_file: None,
+            image_scope: crate::image::Scope::new("arena", "", ""),
         }
     }
 }
@@ -82,6 +85,11 @@ impl HetznerOpts {
     /// The server type a create of `spec` asks for: `--server-type`, else `HETZNER_SERVER_TYPE`.
     pub fn server_type_for<'a>(&'a self, spec: &'a PodSpec) -> &'a str {
         server_type(self, spec)
+    }
+
+    /// The image a create of `spec` asks for: `--image` (`spec.vm_image`), else `HETZNER_IMAGE`.
+    pub fn image_for<'a>(&'a self, spec: &'a PodSpec) -> &'a str {
+        spec.vm_image.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(&self.image)
     }
 
     /// The options from config (`HETZNER_*`), each key's default where it's unset — what
@@ -104,6 +112,7 @@ impl HetznerOpts {
             ssh_keys,
             ssh_keys_from,
             pubkey_file: set("SHARED_SSH_KEY_PATH").map(|p| format!("{p}.pub")),
+            image_scope: crate::image::Scope::from_config(cfg),
         }
     }
 }
@@ -306,12 +315,20 @@ impl HetznerProvider {
     /// array of each page, following `meta.pagination.next_page` as [`Provider::list_pods`]
     /// does — bounded by [`MAX_PAGES`], and a page without the array is an error, never "none".
     async fn get_all(&self, key: &str) -> Result<Vec<Value>> {
+        self.get_all_where(key, &[]).await
+    }
+
+    /// [`Self::get_all`] with query parameters (`type=snapshot`, a `label_selector`).
+    async fn get_all_where(&self, key: &str, query: &[(&str, &str)]) -> Result<Vec<Value>> {
         let ctx = format!("hetzner {}", key.replace('_', " "));
         let mut out = Vec::new();
         let mut page: u64 = 1;
         for _ in 0..MAX_PAGES {
-            let url = format!("{}/{key}?page={page}&per_page={PER_PAGE}", self.base);
-            let body = send_json(self.auth(self.client.get(url)), &ctx).await?;
+            let url = format!("{}/{key}", self.base);
+            let mut q: Vec<(&str, String)> = query.iter().map(|(k, v)| (*k, v.to_string())).collect();
+            q.push(("page", page.to_string()));
+            q.push(("per_page", PER_PAGE.to_string()));
+            let body = send_json(self.auth(self.client.get(url).query(&q)), &ctx).await?;
             let (items, next) = items_page(&body, key, &ctx)?;
             out.extend(items.iter().cloned());
             match next {
@@ -418,6 +435,145 @@ impl HetznerProvider {
     /// `--server-type` takes. One `GET /server_types`.
     pub async fn catalog(&self) -> Result<Vec<ServerType>> {
         Ok(server_types(&self.get_all("server_types").await?, crate::snapshot::unix_now()))
+    }
+
+    /// What a create of a `server_type` server from `setting` sends as its image: `arena` reads
+    /// this cohort's arena snapshots and the server type ([`crate::image::resolve`]); an id or a
+    /// name is sent as given, with no request. Fails only when those reads do — a create must
+    /// not quietly fall back to a 10-minute setup because a listing failed.
+    pub async fn resolve_image(&self, setting: &crate::image::Setting, server_type: &str) -> Result<crate::image::Resolved> {
+        use crate::image::{self, Fit, Resolved, Setting};
+        if *setting != Setting::Arena {
+            return Ok(Resolved::Given(setting.clone()));
+        }
+        let scope = &self.opts.image_scope;
+        let snaps = self.list_snapshots(Some(&scope.selector(image::LABEL))).await?;
+        let types = self.get_all("server_types").await?;
+        let fit = find_type(&types, server_type).map(|t| server_type_of(t, Vec::new())).map_or_else(
+            || Fit { server_type: server_type.into(), arch: None, disk_gb: None },
+            |t| Fit { server_type: t.name, arch: t.architecture, disk_gb: t.disk_gb },
+        );
+        Ok(image::resolve(setting, &snaps, scope, &fit))
+    }
+
+    /// The project's snapshots (`GET /images?type=snapshot`), those matching `selector` when given.
+    pub async fn list_snapshots(&self, selector: Option<&str>) -> Result<Vec<crate::image::Snapshot>> {
+        let mut q = vec![("type", "snapshot")];
+        if let Some(sel) = selector {
+            q.push(("label_selector", sel));
+        }
+        let items = self.get_all_where("images", &q).await?;
+        Ok(items.iter().filter_map(crate::image::parse_snapshot).collect())
+    }
+
+    /// `GET {path}` → its JSON, `None` on a 404 (gone).
+    async fn get_one(&self, path: &str, ctx: &str) -> Result<Option<Value>> {
+        match send_json(self.auth(self.client.get(format!("{}/{path}", self.base))), ctx).await {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Whether a provider error is Hetzner's 404 (`not_found`).
+fn is_not_found(e: &Error) -> bool {
+    e.to_string().to_lowercase().contains("http 404")
+}
+
+#[async_trait]
+impl crate::image::cloud::ImageCloud for HetznerProvider {
+    async fn snapshots(&self, selector: Option<&str>) -> Result<Vec<crate::image::Snapshot>> {
+        self.list_snapshots(selector).await
+    }
+
+    async fn server_types(&self) -> Result<Vec<ServerType>> {
+        self.catalog().await
+    }
+
+    async fn image_price(&self) -> Result<crate::image::ImagePrice> {
+        let body = send_json(self.auth(self.client.get(format!("{}/pricing", self.base))), "hetzner pricing").await?;
+        crate::image::parse_image_price(&body)
+            .ok_or_else(|| Error::provider(format!("hetzner pricing: no image price in {}", super::body_excerpt(&body))))
+    }
+
+    /// The fleet's own create — its location walk, its SSH key — from Ubuntu, never from
+    /// HETZNER_IMAGE (a bake starts clean), with `labels`.
+    async fn create_server(&self, name: &str, server_type: &str, labels: serde_json::Map<String, Value>) -> Result<Pod> {
+        let mut extra = serde_json::Map::new();
+        extra.insert("labels".into(), Value::Object(labels));
+        let spec = PodSpec {
+            name: name.into(),
+            server_type: Some(server_type.into()),
+            vm_image: Some(crate::image::FALLBACK.into()),
+            api_extra: Some(extra),
+            ..PodSpec::default()
+        };
+        self.create_pod(&spec).await
+    }
+
+    async fn server(&self, id: &str) -> Result<Option<Pod>> {
+        Ok(self.get_one(&format!("servers/{id}"), "hetzner get server").await?.map(|b| parse_server(b.get("server").unwrap_or(&b))))
+    }
+
+    async fn servers(&self, selector: &str) -> Result<Vec<Pod>> {
+        Ok(self.get_all_where("servers", &[("label_selector", selector)]).await?.iter().map(parse_server).collect())
+    }
+
+    async fn stop(&self, id: &str) -> Result<()> {
+        self.stop_pod_outcome(id).await?;
+        // A power-off is an action too: wait until the API says off (the snapshot needs it).
+        for _ in 0..self.shutdown.polls {
+            if self.server_status(id).await.is_ok_and(|s| s == "off") {
+                return Ok(());
+            }
+            tokio::time::sleep(self.shutdown.every).await;
+        }
+        Err(Error::provider(format!("hetzner: server {id} isn't off after a power-off")))
+    }
+
+    async fn create_image(&self, server: &str, description: &str, labels: &serde_json::Map<String, Value>) -> Result<(u64, Option<u64>)> {
+        let body = json!({"type": "snapshot", "description": description, "labels": labels});
+        let url = format!("{}/servers/{server}/actions/create_image", self.base);
+        let res = send_json(self.auth(self.client.post(url).json(&body)), "hetzner create image").await?;
+        let id = res
+            .pointer("/image/id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error::provider(format!("hetzner create image: no image id in {}", super::body_excerpt(&res))))?;
+        Ok((id, res.pointer("/action/id").and_then(Value::as_u64)))
+    }
+
+    async fn wait_action(&self, action: u64, limit: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let body = send_json(self.auth(self.client.get(format!("{}/actions/{action}", self.base))), "hetzner action").await?;
+            match body.pointer("/action/status").and_then(Value::as_str) {
+                Some("success") => return Ok(()),
+                Some("error") => {
+                    let why = body.pointer("/action/error/message").and_then(Value::as_str).unwrap_or("no message");
+                    let cmd = body.pointer("/action/command").and_then(Value::as_str).unwrap_or("action");
+                    return Err(Error::provider(format!("hetzner {cmd} (action {action}) failed: {why}")));
+                }
+                Some(_) => {}
+                None => return Err(Error::provider(format!("hetzner action {action}: unexpected shape {}", super::body_excerpt(&body)))),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::Timeout { what: format!("hetzner action {action}"), after: limit });
+            }
+            tokio::time::sleep(self.shutdown.every).await;
+        }
+    }
+
+    async fn image(&self, id: u64) -> Result<Option<crate::image::Snapshot>> {
+        Ok(self.get_one(&format!("images/{id}"), "hetzner get image").await?.and_then(|b| crate::image::parse_snapshot(b.get("image").unwrap_or(&b))))
+    }
+
+    async fn delete_server(&self, id: &str) -> Result<()> {
+        send_ok(self.auth(self.client.delete(format!("{}/servers/{id}", self.base))), "hetzner delete server").await
+    }
+
+    async fn delete_image(&self, id: u64) -> Result<()> {
+        send_ok(self.auth(self.client.delete(format!("{}/images/{id}", self.base))), "hetzner delete image").await
     }
 }
 
@@ -721,7 +877,7 @@ fn location_walk(
 const MANAGED: &[Managed] = &[
     managed(&["name"], "the machine name"),
     managed(&["server_type"], "--server-type / HETZNER_SERVER_TYPE"),
-    managed(&["image"], "HETZNER_IMAGE"),
+    managed(&["image"], "--image / HETZNER_IMAGE"),
     managed(&["location"], "HETZNER_LOCATION"),
     managed(&["ssh_keys"], "HETZNER_SSH_KEY (the cohort key)"),
     managed(&["start_after_create"], "always on"),
@@ -734,15 +890,19 @@ fn server_type<'a>(opts: &'a HetznerOpts, spec: &'a PodSpec) -> &'a str {
 }
 
 /// The `POST /servers` body. Pure. Hetzner's `image` is an ID *or* a name: a system image is
-/// a name ("ubuntu-24.04"), but a snapshot has no name — it's referenced by numeric id. Send
-/// all-digits as an int so HETZNER_IMAGE can be a snapshot id. `spec.api_extra` is
-/// deep-merged in last, minus [`MANAGED`]. `location`: this attempt's ([`location_walk`]);
-/// `None` sends none.
-fn create_payload(opts: &HetznerOpts, spec: &PodSpec, location: Option<&str>) -> Result<Value> {
-    let image = match opts.image.parse::<u64>() {
-        Ok(id) => json!(id),
-        Err(_) => json!(opts.image),
-    };
+/// a name ("ubuntu-24.04"), but a snapshot has no name — it's referenced by numeric id, sent as
+/// an int. `image`: what the create resolved `--image` / HETZNER_IMAGE to
+/// ([`HetznerProvider::resolve_image`]; `None`: as given, the keyword `arena` unresolved — the
+/// dry-run's preview). `spec.api_extra` is deep-merged in last, minus [`MANAGED`]. `location`:
+/// this attempt's ([`location_walk`]); `None` sends none.
+fn create_payload(opts: &HetznerOpts, spec: &PodSpec, location: Option<&str>, image: Option<Value>) -> Result<Value> {
+    use crate::image::Setting;
+    let image = image.unwrap_or_else(|| match Setting::parse(opts.image_for(spec)) {
+        Setting::Id(id) => json!(id),
+        Setting::Name(n) => json!(n),
+        // A preview's only: a create resolves it first.
+        Setting::Arena => json!(crate::image::KEYWORD),
+    });
     let mut payload = json!({
         "name": spec.name,
         "server_type": server_type(opts, spec),
@@ -863,6 +1023,14 @@ pub(crate) fn is_archive_server(v: &Value) -> bool {
     v.get("labels").and_then(Value::as_object).is_some_and(|l| l.contains_key(crate::archive::LABEL_KEY))
 }
 
+/// Whether a listed server is a temporary `arena image build` VM (label
+/// [`crate::image::BUILD_LABEL`]): never a fleet pod — no backup, proxy, reap or `pods` command
+/// acts on it while it's being baked; `image build` deletes it, `teardown --check` and `image
+/// prune` list a leftover.
+pub(crate) fn is_image_build_server(v: &Value) -> bool {
+    v.get("labels").and_then(Value::as_object).is_some_and(|l| l.contains_key(crate::image::BUILD_LABEL))
+}
+
 /// Servers per page we ask for (Hetzner's maximum; the default is 25).
 const PER_PAGE: u64 = 50;
 /// Hard stop for the pagination loop (50 × 20 = 1000 servers — far beyond any cohort).
@@ -899,7 +1067,7 @@ impl Provider for HetznerProvider {
     fn describe(&self, spec: &PodSpec) -> String {
         // CPU VM: describe what we actually send (server type/image/location), not the
         // GPU fields the spec carries and we ignore.
-        format!("{} CPU VM, image {}, location {}", server_type(&self.opts, spec), self.opts.image, self.opts.locations.describe())
+        format!("{} CPU VM, image {}, location {}", server_type(&self.opts, spec), self.opts.image_for(spec), self.opts.locations.describe())
     }
 
     async fn list_pods(&self) -> Result<Vec<Pod>> {
@@ -914,7 +1082,7 @@ impl Provider for HetznerProvider {
             let url = format!("{}/servers?page={page}&per_page={PER_PAGE}", self.base);
             let body = send_json(self.auth(self.client.get(url)), "hetzner list").await?;
             let (servers, next) = servers_page(&body)?;
-            out.extend(servers.iter().filter(|v| !is_archive_server(v)).map(parse_server));
+            out.extend(servers.iter().filter(|v| !is_archive_server(v) && !is_image_build_server(v)).map(parse_server));
             match next {
                 None => return Ok(out),
                 Some(n) if n > page => page = n,
@@ -938,11 +1106,16 @@ impl Provider for HetznerProvider {
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
         use crate::error::ProviderErrorKind as K;
         let ty = server_type(&self.opts, spec);
+        // `arena` → the newest arena image that fits this type (a snapshot has no location, so
+        // the walk below needs no filter), else Ubuntu. `up`/`create` resolve it first and say
+        // which; the dashboard's create lands here with the keyword.
+        let setting = crate::image::Setting::parse(self.opts.image_for(spec));
+        let image = self.resolve_image(&setting, ty).await?.image();
         let walk = self.walk_for(ty, spec).await?;
         let url = format!("{}/servers", self.base);
         let mut no_room: Vec<String> = Vec::new();
         for (i, loc) in walk.iter().enumerate() {
-            let payload = create_payload(&self.opts, spec, loc.as_deref())?;
+            let payload = create_payload(&self.opts, spec, loc.as_deref(), Some(image.clone()))?;
             let e = match send_json(self.auth(self.client.post(&url).json(&payload)), "hetzner create").await {
                 // The created server is under `server`; parse what's there (IP may not be
                 // populated until it finishes provisioning — `pods up` polls for that).
@@ -1034,7 +1207,7 @@ impl Provider for HetznerProvider {
     /// The body of the walk's first create when that needs no lookup: the first listed
     /// location (or none, for `any` alone — `describe` says where it would go).
     fn preview_create_body(&self, spec: &PodSpec) -> Result<Value> {
-        create_payload(&self.opts, spec, self.opts.locations.first())
+        create_payload(&self.opts, spec, self.opts.locations.first(), None)
     }
 }
 
@@ -1149,6 +1322,79 @@ mod tests {
         assert_eq!(names, ["arena9-apple", "devtest-archive", "odd", "arena9-bloom"]);
     }
 
+    /// An `arena image build` VM (labelled `arena-image-build`) is never a fleet pod.
+    #[tokio::test]
+    async fn list_pods_omits_image_build_vms() {
+        use crate::http::test_server::{canned, client, serve};
+        let page = json!({"servers": [
+            {"id": 1, "name": "devtest-apple", "status": "running", "labels": {}},
+            {"id": 2, "name": "devtest-image-261029-1542", "status": "running", "labels": {"arena-image-build": "devtest", "arena-prefix": "devtest"}},
+        ]});
+        let srv = serve(vec![canned(200, "application/json", &page.to_string())]);
+        let p = HetznerProvider { api_key: "k".into(), client: client(), base: srv.base.clone(), opts: HetznerOpts::default(), shutdown: SHUTDOWN_WAIT, distances: Distances::known(&[]) };
+        let names: Vec<String> = p.list_pods().await.unwrap().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["devtest-apple"]);
+    }
+
+    /// `image = arena` (HETZNER_IMAGE, or `--image` on the spec): the create reads this cohort's
+    /// arena snapshots and the server type, then sends the newest that fits by id; with none, it
+    /// sends Ubuntu. An id or a name goes as given, with no lookup.
+    #[tokio::test]
+    async fn a_create_from_arena_sends_the_newest_fitting_snapshot() {
+        use crate::http::test_server::{canned, serve};
+        let images = json!({"images": [
+            {"id": 10, "description": "old", "status": "available", "disk_size": 40, "architecture": "x86", "image_size": 6.0,
+             "labels": {"arena-image": "1", "arena-prefix": "devtest", "repo-id": crate::image::repo_id("o", "r"), "built": "1000"}},
+            {"id": 11, "description": "new", "status": "available", "disk_size": 40, "architecture": "x86", "image_size": 6.0,
+             "labels": {"arena-image": "1", "arena-prefix": "devtest", "repo-id": crate::image::repo_id("o", "r"), "built": "2000"}},
+        ]});
+        let types = json!({"server_types": [{"name": "cx33", "architecture": "x86", "disk": 80, "memory": 8.0, "cores": 4, "prices": []}]});
+        let opts = HetznerOpts {
+            image: "arena".into(),
+            locations: Locations::parse(Some("nbg1")),
+            image_scope: crate::image::Scope::new("devtest", "o", "r"),
+            ..HetznerOpts::default()
+        };
+        let srv = serve(vec![
+            canned(200, "application/json", &images.to_string()),
+            canned(200, "application/json", &types.to_string()),
+            canned(201, "application/json", &server_created("devtest-a", "nbg1")),
+        ]);
+        let p = provider(&srv.base, opts.clone());
+        p.create_pod(&spec("devtest-a", Some("cx33"))).await.unwrap();
+        let requests = srv.requests.lock().unwrap().clone();
+        assert!(requests[0].starts_with("GET /images?type=snapshot&label_selector=arena-image%3D1%2Carena-prefix%3Ddevtest&page=1"), "{requests:?}");
+        assert!(requests[1].starts_with("GET /server_types"), "{requests:?}");
+        let body: Value = serde_json::from_str(&srv.bodies.lock().unwrap()[2]).unwrap();
+        assert_eq!(body["image"], json!(11));
+
+        // None fits (no images): Ubuntu.
+        let srv = serve(vec![
+            canned(200, "application/json", r#"{"images": []}"#),
+            canned(200, "application/json", &types.to_string()),
+            canned(201, "application/json", &server_created("devtest-a", "nbg1")),
+        ]);
+        provider(&srv.base, opts.clone()).create_pod(&spec("devtest-a", Some("cx33"))).await.unwrap();
+        let body: Value = serde_json::from_str(&srv.bodies.lock().unwrap()[2]).unwrap();
+        assert_eq!(body["image"], json!("ubuntu-24.04"));
+
+        // `--image 448331072` over HETZNER_IMAGE=arena: sent as given, nothing looked up.
+        let srv = serve(vec![canned(201, "application/json", &server_created("devtest-a", "nbg1"))]);
+        let mut s = spec("devtest-a", Some("cx33"));
+        s.vm_image = Some("448331072".into());
+        provider(&srv.base, opts.clone()).create_pod(&s).await.unwrap();
+        assert_eq!(srv.requests.lock().unwrap().len(), 1);
+        let body: Value = serde_json::from_str(&srv.bodies.lock().unwrap()[0]).unwrap();
+        assert_eq!(body["image"], json!(448331072));
+
+        // A failed lookup fails the create — never a quiet 10-minute Ubuntu setup instead.
+        let srv = serve(vec![canned(503, "application/json", r#"{"error": {"code": "unavailable"}}"#)]);
+        assert!(provider(&srv.base, opts.clone()).create_pod(&spec("devtest-a", Some("cx33"))).await.is_err());
+        assert_eq!(srv.requests.lock().unwrap().len(), 1, "no create after it");
+        // The dry-run's preview shows the keyword, unresolved.
+        assert_eq!(create_payload(&opts, &spec("x", None), None, None).unwrap()["image"], json!("arena"));
+    }
+
     #[test]
     fn servers_page_reads_array_and_next_page() {
         let last = json!({"servers": [{"id": 1}], "meta": {"pagination": {"page": 1, "next_page": null}}});
@@ -1250,12 +1496,12 @@ mod tests {
         let opts = HetznerOpts::from_config(&crate::config::Config::parse("HETZNER_SERVER_TYPE=cx33\n"));
         let p = HetznerProvider::new("k", opts.clone());
         for (flag, want) in [(Some("cpx42"), "cpx42"), (None, "cx33")] {
-            let body = create_payload(&opts, &spec("devtest-a", flag), None).unwrap();
+            let body = create_payload(&opts, &spec("devtest-a", flag), None, None).unwrap();
             assert_eq!(body["server_type"], want, "{flag:?}");
             assert_eq!(p.preview_create_body(&spec("devtest-a", flag)).unwrap()["server_type"], want);
             assert!(p.describe(&spec("devtest-a", flag)).starts_with(&format!("{want} CPU VM")), "{flag:?}");
         }
-        assert_eq!(create_payload(&HetznerOpts::default(), &spec("x", None), None).unwrap()["server_type"], "cx33");
+        assert_eq!(create_payload(&HetznerOpts::default(), &spec("x", None), None, None).unwrap()["server_type"], "cx33");
     }
 
     /// The options as `build` reads them: the default key named after the prefix — and that

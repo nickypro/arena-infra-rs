@@ -22,6 +22,7 @@ use arena_core::volume::RepoSite;
 use arena_core::{Config, PodSpec};
 
 mod archive;
+mod image;
 mod ask;
 #[cfg(test)]
 mod endpoint_tests;
@@ -401,6 +402,14 @@ enum Cmd {
     /// Read-only GET passthrough to a provider's REST API
     #[command(subcommand, infer_subcommands = true)]
     Api(ApiCmd),
+    /// Pre-built Hetzner images: bake, list, prune (HETZNER_IMAGE=arena)
+    ///
+    /// A Hetzner VM from Ubuntu takes ~10 min of setup to build the env; from an arena image,
+    /// about one. `build` bakes one in this project, `list` shows them and which one
+    /// HETZNER_IMAGE=arena (or `--image arena` on pods create/up) picks, `prune` deletes old ones.
+    #[command(verbatim_doc_comment)]
+    #[command(subcommand, infer_subcommands = true)]
+    Image(image::ImageCmd),
     /// The backup archive VM (second copy of cohort backups)
     ///
     /// An always-on Hetzner VM with two volumes (dated snapshots, all files), filled from
@@ -951,7 +960,7 @@ enum PodCmd {
         /// Persistent volume size in GB (overrides config VOLUME_GB; default 0).
         #[arg(long)]
         volume: Option<u32>,
-        /// Docker image (overrides config IMAGE); a non-arena image needs --bootstrap
+        /// Docker image (overrides IMAGE); Hetzner: VM image (arena, a snapshot id, a name)
         #[arg(long)]
         image: Option<String>,
         /// Install + start sshd on boot, for non-arena base images
@@ -1022,7 +1031,7 @@ enum PodCmd {
         /// Persistent volume size in GB (overrides config VOLUME_GB; default 0).
         #[arg(long)]
         volume: Option<u32>,
-        /// Docker image (overrides config IMAGE); a non-arena image needs --bootstrap
+        /// Docker image (overrides IMAGE); Hetzner: VM image (arena, a snapshot id, a name)
         #[arg(long)]
         image: Option<String>,
         /// Install + start sshd on boot, for non-arena base images
@@ -1977,6 +1986,8 @@ struct SpecOverrides {
     avoid_machines: Vec<String>,
     /// `--server-type` (Hetzner), already checked against the create target ([`sizing_flags`]).
     server_type: Option<String>,
+    /// `--image` on Hetzner: the VM's image ([`image_flag`]).
+    vm_image: Option<String>,
 }
 
 /// Where `replace` / `migrate copy` may land the new pod beyond `--gpu` / `--cloud` (live
@@ -2051,6 +2062,46 @@ fn apply_spec_overrides(spec: &mut PodSpec, ov: &SpecOverrides) {
     if let Some(t) = &ov.server_type {
         spec.server_type = Some(t.clone());
     }
+    if let Some(i) = &ov.vm_image {
+        spec.vm_image = Some(i.clone());
+    }
+}
+
+/// `--image` for the create target: a container image (RunPod, Vast — `spec.image`), or on
+/// Hetzner the VM's image (`spec.vm_image`): `arena`, a snapshot id or a system image name, over
+/// HETZNER_IMAGE. Returns `(container image, VM image)`. Pure.
+fn image_flag(provider: &str, image: Option<String>) -> Result<(Option<String>, Option<String>)> {
+    if provider != "hetzner" {
+        return Ok((image, None));
+    }
+    let Some(i) = image.map(|i| i.trim().to_string()) else { return Ok((None, None)) };
+    if i.is_empty() || i.len() > 64 || !i.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')) {
+        anyhow::bail!("--image on Hetzner takes `arena`, a snapshot id or an image name like ubuntu-24.04");
+    }
+    Ok((None, Some(i)))
+}
+
+/// A Hetzner create whose image is `arena`: resolve it now — once for every pod of the run —
+/// say which snapshot (or that none fits, and Ubuntu it is), and pin the spec to it. Anything
+/// else is left as it is. A failed lookup stops the create: falling back to a 10-minute setup
+/// on every VM because a listing failed would be a surprise.
+async fn pin_vm_image(provider: &str, cfg: &Config, spec: &mut PodSpec) -> Result<()> {
+    if provider != "hetzner" {
+        return Ok(());
+    }
+    let opts = arena_core::provider::hetzner::HetznerOpts::from_config(cfg);
+    let setting = arena_core::image::Setting::parse(opts.image_for(spec));
+    if setting != arena_core::image::Setting::Arena {
+        return Ok(());
+    }
+    let cloud = image::hetzner(cfg)?;
+    let ty = opts.server_type_for(spec).to_string();
+    let (resolved, _) = tokio::time::timeout(image::LOOKUP_TIMEOUT, image::resolve(&cloud, cfg, &setting, &ty))
+        .await
+        .map_err(|_| anyhow::anyhow!("looking up the arena image took over {}s", image::LOOKUP_TIMEOUT.as_secs()))??;
+    println!("{}", resolved.describe(arena_core::snapshot::unix_now()));
+    spec.vm_image = Some(resolved.as_setting());
+    Ok(())
 }
 
 /// The sizing flags `create`/`up` were given, checked against the backend the pods would be
@@ -3130,7 +3181,7 @@ async fn run() -> Result<()> {
     // for), so build the provider lazily — only for commands that actually talk to one.
     let provider = match cli.cmd {
         // The archive builds its own Hetzner client (its own token), and its cron path none.
-        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Update { .. } | Cmd::Gpus { .. } | Cmd::Offers { .. } | Cmd::Api(_) | Cmd::Archive(_) => None,
+        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Update { .. } | Cmd::Gpus { .. } | Cmd::Offers { .. } | Cmd::Api(_) | Cmd::Archive(_) | Cmd::Image(_) => None,
         // Fleet-wide: every command spans all configured providers (create still targets
         // --provider). One configured backend behaves like that single provider.
         _ => Some(arena_core::provider::build_fleet(&cli.provider, &cfg, true)?),
@@ -3143,9 +3194,11 @@ async fn run() -> Result<()> {
         Cmd::Tui => launch_tui(&cli.provider, &cli.config),
         Cmd::Update { .. } => unreachable!("handled before the config is read"),
         Cmd::Plan(c) => handle_plan(c, provider.unwrap().as_ref(), &cfg).await,
+        Cmd::Config(ConfigCmd::Check) => config_check(&cfg, &cli.provider, &hetzner_image_rows(&cfg).await),
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &cli.config),
         Cmd::Cron(c) => handle_cron(c, &cfg, &cli.config, cli.yes, CRONTAB, std::env::var("HOME").ok().as_deref()).await,
         Cmd::Archive(c) => archive::handle_archive(c, &cfg, remote.as_ref(), cli.yes).await,
+        Cmd::Image(c) => image::handle_image(c, &cfg, remote, cli.yes, Interrupt::ctrl_c()).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
         Cmd::SshConfig { proxy, out, install, uninstall, dry_run } => {
@@ -5133,7 +5186,7 @@ fn handle_config(
     config_path: &std::path::Path,
 ) -> Result<()> {
     match cmd {
-        ConfigCmd::Check => config_check(cfg, provider_name),
+        ConfigCmd::Check => config_check(cfg, provider_name, &[]),
         ConfigCmd::Which => config_which(cfg, provider_name, config_path),
         ConfigCmd::Set { key, value } => {
             let (key, value) = match (key, value) {
@@ -5616,13 +5669,48 @@ fn hetzner_rows(cfg: &Config) -> Vec<String> {
     vec![
         row("HETZNER_SERVER_TYPE", &o.server_type, " — `pods create/up --server-type` overrides it"),
         row("HETZNER_LOCATION", &o.locations.describe(), ""),
-        row("HETZNER_IMAGE", &o.image, ""),
+        row(
+            "HETZNER_IMAGE",
+            &o.image,
+            if arena_core::image::Setting::parse(&o.image) == arena_core::image::Setting::Arena {
+                " — the newest arena-built snapshot that fits, else ubuntu-24.04 (below; `arena image list`)"
+            } else {
+                ""
+            },
+        ),
         key_row,
         format!(
             "      └ every new server gets SSH key `{key}`: it must be in the Hetzner project under that name — checked at \
              create (`arena api get hetzner ssh_keys` lists the project's keys)"
         ),
     ]
+}
+
+/// `config check`'s look at what `HETZNER_IMAGE=arena` resolves to — the one live lookup the
+/// check makes, and only for that setting (read-only, bounded): the snapshot it picks for
+/// HETZNER_SERVER_TYPE and how old it is, a ⚠ when it's over `image::STALE_DAYS` days old or its
+/// requirements differ from the repo's now, or Ubuntu and why. Advice only: it never fails the
+/// check (a create fails on its own if the lookup does).
+async fn hetzner_image_rows(cfg: &Config) -> Vec<String> {
+    use arena_core::image::Setting;
+    let opts = arena_core::provider::hetzner::HetznerOpts::from_config(cfg);
+    let setting = Setting::parse(&opts.image);
+    if setting != Setting::Arena {
+        return Vec::new();
+    }
+    let mut out = vec![format!("\nHetzner image (HETZNER_IMAGE=arena, for {}):", opts.server_type)];
+    let Ok(cloud) = image::hetzner(cfg) else {
+        out.push("  ⚠ HETZNER_API_KEY isn't set — can't look the image up".into());
+        return out;
+    };
+    let lookup = tokio::time::timeout(image::LOOKUP_TIMEOUT, image::resolve(&cloud, cfg, &setting, &opts.server_type));
+    let (resolved, repo) = tokio::join!(lookup, image::repo_requirements(cfg));
+    match resolved {
+        Ok(Ok((r, _))) => out.extend(image::resolution_lines(&r, arena_core::snapshot::unix_now(), &repo).into_iter().map(|l| format!("  {l}"))),
+        Ok(Err(e)) => out.push(format!("  ? couldn't look it up: {e:#}")),
+        Err(_) => out.push(format!("  ? couldn't look it up in {}s", image::LOOKUP_TIMEOUT.as_secs())),
+    }
+    out
 }
 
 /// `config check`'s `VM_SWAP_GB` row: the swap a bare VM's setup makes, `(default)` when unset,
@@ -5682,9 +5770,13 @@ fn ask_ai_rows(cfg: &Config, env: &arena_core::ask::AiEnv) -> (Vec<String>, Vec<
 
 /// Print a config checklist for the selected provider + proxy + backup, never showing
 /// secret values. Returns an error if a required key is missing.
-fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
+/// `extra`: rows looked up live before the check ([`hetzner_image_rows`]), after the report.
+fn config_check(cfg: &Config, provider_name: &str, extra: &[String]) -> Result<()> {
     let (report, missing) = config_report(cfg, provider_name);
     print!("{report}");
+    for l in extra {
+        println!("{l}");
+    }
     if missing.is_empty() {
         println!("\nOK — required keys for provider `{provider_name}` are present.");
         Ok(())
@@ -7740,9 +7832,10 @@ async fn handle_pods_bal(
             // Sizing flags the create target can't honour fail here too (`--gpu` on Hetzner,
             // `--server-type` elsewhere) — refused, never silently dropped.
             let server_type = sizing_flags(provider.name(), gpu.as_deref(), gpus, server_type)?;
+            let (image, vm_image) = image_flag(provider.name(), image)?;
             // A typo'd --gpu fails here, before anything is listed or created.
             let gpu = checked_gpu(cfg, provider.name(), gpu).await?;
-            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra, server_type, ..Default::default() };
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra, server_type, vm_image, ..Default::default() };
             // Several --gpu/--cloud options or a --max-price → ordered placement; otherwise
             // the single-spec path below, unchanged. Decided before anything is listed.
             let (ov, placing) = placement_request(cfg, provider.name(), ov, max_price, order, keep_trying)?;
@@ -7763,7 +7856,7 @@ async fn handle_pods_bal(
                 eprintln!("nothing to create (target already met or no new names)");
                 return Ok(());
             }
-            let (spec, options) = match placing {
+            let (mut spec, options) = match placing {
                 Some((req, base)) => {
                     let plan = plan_placement(cfg, provider.name(), &req, &base).await?;
                     bal.remember_gpu_prices(&plan);
@@ -7771,6 +7864,7 @@ async fn handle_pods_bal(
                 }
                 None => (spec_with_overrides(cfg, &ov), None),
             };
+            pin_vm_image(provider.name(), cfg, &mut spec).await?;
             check_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]))?;
             if dry_run {
                 match &options {
@@ -7858,6 +7952,7 @@ async fn handle_pods_bal(
                 provider.lock_support(&target).map_err(|e| anyhow::anyhow!("--lock: {}", lock_why(e)))?;
             }
             let server_type = sizing_flags(provider.name(), gpu.as_deref(), gpus, server_type)?;
+            let (image, vm_image) = image_flag(provider.name(), image)?;
             let gpu = checked_gpu(cfg, provider.name(), gpu).await?;
             // The machines earlier `up --check`s found bad: a marketplace (Vast) skips their
             // offers; RunPod can't be told, so a pod it places on one is rejected (`up`).
@@ -7866,7 +7961,7 @@ async fn handle_pods_bal(
             } else {
                 arena_core::snapshot::avoided_machines(&up::remembered_bad_hosts(cfg, arena_core::snapshot::unix_now()).0, "vast")
             };
-            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra, avoid_machines, server_type };
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra, avoid_machines, server_type, vm_image };
             // Several --gpu/--cloud options or a --max-price → ordered placement (as `create`).
             let (ov, placing) = placement_request(cfg, provider.name(), ov, max_price, order, keep_trying)?;
             // Like `create`: explicit names take the direct path; -n/-a top up by count.
@@ -7895,7 +7990,7 @@ async fn handle_pods_bal(
                 arena_core::setup::SetupTimeouts::from_config(cfg, None)?
             };
             let policy = if check { Some(arena_core::health::HealthPolicy::from_config(cfg)?) } else { None };
-            let (spec, options) = match placing {
+            let (mut spec, options) = match placing {
                 Some((req, base)) => {
                     let plan = plan_placement(cfg, provider.name(), &req, &base).await?;
                     bal.remember_gpu_prices(&plan);
@@ -7903,6 +7998,7 @@ async fn handle_pods_bal(
                 }
                 None => (spec_with_overrides(cfg, &ov), None),
             };
+            pin_vm_image(provider.name(), cfg, &mut spec).await?;
             check_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]))?;
             let keys = up_keys_stage(cfg, KEYS_DIR, !no_setup);
             let per_pod = up::pipeline_text(!no_setup, check.then_some(check_attempts), keys.is_some(), lock);
@@ -16837,6 +16933,7 @@ mod replacement_spec_tests {
             api_extra: None,
             avoid_machines: Vec::new(),
             server_type: None,
+            vm_image: None,
             region: None,
         }
     }

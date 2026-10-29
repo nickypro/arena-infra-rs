@@ -360,6 +360,7 @@ async fn unknown_gpu_create_is_a_config_error() {
         api_extra: None,
         avoid_machines: Vec::new(),
         server_type: None,
+        vm_image: None,
         region: None,
     };
     let ours = create_payload(&spec, &[]).unwrap();

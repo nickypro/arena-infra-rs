@@ -922,7 +922,7 @@ mod tests {
     async fn an_invalid_balance_key_fails_config_check_but_never_pods_list() {
         // Everything `config check` requires for hetzner (a dummy key: nothing is called).
         let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nHETZNER_API_KEY=not-a-real-key\n";
-        crate::config_check(&Config::parse(base), "hetzner").unwrap();
+        crate::config_check(&Config::parse(base), "hetzner", &[]).unwrap();
         let mut missing = Vec::new();
         crate::balance_section(&Config::parse(base), &no_balance(), T0, &mut missing);
         assert!(missing.is_empty(), "{missing:?}");
@@ -939,11 +939,11 @@ mod tests {
             let rows = crate::balance_section(&conf, &no_balance(), T0, &mut missing);
             assert!(rows.iter().any(|r| r.starts_with("  ✗ BALANCE_")), "{rows:#?}");
             assert_eq!(missing.len(), 1, "{line}");
-            assert_eq!(crate::config_check(&conf, "hetzner").unwrap_err().to_string(), want);
+            assert_eq!(crate::config_check(&conf, "hetzner", &[]).unwrap_err().to_string(), want);
         }
         // Both wrong: both named, after anything else that's missing.
         let both = Config::parse("BALANCE_WARN_HOURS=-1\nBALANCE_UNPRICED_PER_GPU=0\n");
-        let e = crate::config_check(&both, "hetzner").unwrap_err().to_string();
+        let e = crate::config_check(&both, "hetzner", &[]).unwrap_err().to_string();
         assert!(e.starts_with("missing or invalid keys: HETZNER_API_KEY, MACHINE_NAME_LIST") && e.contains("BALANCE_WARN_HOURS (") && e.ends_with("at most 1000)"), "{e}");
 
         // Runtime: the defaults — `pods list` byte for byte as with the keys unset.
