@@ -9,9 +9,10 @@
 //!   are free fleet-wide, so a provider switch doesn't change them. They're a preview — `up` lists
 //!   the whole fleet again (refusing if a provider doesn't answer) and picks free names from that;
 //! - each provider's type field — RunPod's live GPU catalog (every type it sells: B300, the MIG
-//!   slices…), Hetzner's server types (vCPU, RAM, €/h) — comes from `arena offers` in the
-//!   background (`offers.rs`), once per provider for the dashboard's life: the presets meanwhile
-//!   (marked `…`), and if it can't be read;
+//!   slices, the unlisted types seen on the account…), the GPUs on Vast's market now, Hetzner's
+//!   server types (vCPU, RAM, €/h) — comes from `arena offers <provider>` in the background
+//!   (`offers.rs`), read when first shown and again when old: the presets meanwhile (marked
+//!   `…`), and if it can't be read;
 //! - the availability line — what `up` would try for the choice, in order, with price, stock and
 //!   near/anywhere — likewise, debounced and cached per choice (`o` turns it off).
 //!
@@ -74,6 +75,11 @@ pub(crate) struct Choice {
     pub tiers_known: bool,
     /// A server type's size (`4 vCPU · 8 GB`) and €/h.
     pub server: Option<(String, Option<f64>)>,
+    /// Vast: $/h per GPU of the cheapest offer a create would rent now (it searches again).
+    pub market: Option<f64>,
+    /// A RunPod type its public catalog lacks (`Some`), with what a pod of it bills per GPU
+    /// when one on the account says: `--gpu` takes it, RunPod's create decides where.
+    pub unlisted: Option<Option<f64>>,
 }
 
 impl Choice {
@@ -89,12 +95,14 @@ impl Choice {
             estimate: true,
             tiers_known: false,
             server: None,
+            market: None,
+            unlisted: None,
         }
     }
 
     /// A server type known only by name (the catalog not read yet, or not readable).
     pub(crate) fn server_type(name: &str) -> Choice {
-        Choice { id: name.into(), label: name.into(), size: 0, community: None, secure: None, estimate: false, tiers_known: false, server: None }
+        Choice { id: name.into(), label: name.into(), size: 0, community: None, secure: None, estimate: false, tiers_known: false, server: None, market: None, unlisted: None }
     }
 
     /// Whether it's sold on `tier` — `None` when that isn't known.
@@ -109,6 +117,12 @@ impl Choice {
     pub(crate) fn price(&self, provider: &str, cloud: Option<&str>) -> String {
         if let Some((_, eur)) = &self.server {
             return eur.map_or_else(|| "€ ?".into(), |e| format!("€{e:.4}/h"));
+        }
+        if let Some(pod) = self.unlisted {
+            return pod.map_or_else(|| "unlisted".into(), |p| format!("unlisted · ${p:.2}/h a pod bills"));
+        }
+        if let Some(p) = self.market {
+            return format!("from ${p:.2}/h now");
         }
         let t = if self.estimate { "~" } else { "" };
         let one = |p: Option<f64>| p.map_or_else(|| "-".to_string(), |p| format!("{t}${p:.2}"));
@@ -126,7 +140,7 @@ impl Choice {
 
     /// The cheapest price it's sold at, for the sort.
     fn sort_price(&self) -> f64 {
-        let p = [self.community, self.secure, self.server.as_ref().and_then(|s| s.1)].into_iter().flatten().fold(f64::INFINITY, f64::min);
+        let p = [self.community, self.secure, self.market, self.unlisted.flatten(), self.server.as_ref().and_then(|s| s.1)].into_iter().flatten().fold(f64::INFINITY, f64::min);
         if p.is_finite() {
             p
         } else {
@@ -135,22 +149,23 @@ impl Choice {
     }
 }
 
-/// Sort `choices` as the type field lists them: `default` first, then by size (VRAM, vCPUs),
-/// then by price, then by name. Pure.
+/// Sort `choices` as the type field lists them: `default` first, then GPUs by VRAM, price and
+/// name; server types keep the catalogue's order (by family, then size: `offers hetzner`'s),
+/// which a sort by vCPUs would interleave (cx23, cpx22 and cax11 all have 2). Pure.
 pub(crate) fn sort_choices(choices: &mut [Choice], default: &str) {
     choices.sort_by(|a, b| {
-        (b.id == default)
-            .cmp(&(a.id == default))
-            .then(a.size.cmp(&b.size))
-            .then(a.sort_price().total_cmp(&b.sort_price()))
-            .then(a.label.cmp(&b.label))
+        let first = (b.id == default).cmp(&(a.id == default));
+        if a.server.is_some() || b.server.is_some() {
+            return first;
+        }
+        first.then(a.size.cmp(&b.size)).then(a.sort_price().total_cmp(&b.sort_price())).then(a.label.cmp(&b.label))
     });
 }
 
 /// Where the type field's choices came from.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Source {
-    /// The provider's catalog, as `arena offers --all` reads it.
+    /// The provider's catalogue, as `arena offers <provider>` reads it.
     Live,
     /// The presets, while the catalog is read.
     Loading,
@@ -385,11 +400,11 @@ pub(crate) fn apply_kinds(form: &mut NewPodForm, offers: &offers::State) {
     let p = form.provider_name().to_string();
     let presets = preset_kinds(&p, &form.defaults);
     match offers.catalog(&p) {
-        Some(Fetch::Ready(kinds)) => form.set_kinds(kinds.clone(), Source::Live),
-        Some(Fetch::Failed(why)) => form.set_kinds(presets, Source::Presets(format!("the catalog couldn't be read: {why}"))),
+        Some(Fetch::Ready(kinds)) => form.set_kinds(kinds.to_vec(), Source::Live),
+        Some(Fetch::Failed(why)) => form.set_kinds(presets, Source::Presets(format!("the catalogue couldn't be read: {why}"))),
         Some(Fetch::Out) => form.set_kinds(presets, Source::Loading),
         None if offers::has_catalog(&p) => form.set_kinds(presets, Source::Loading),
-        None => form.set_kinds(presets, Source::Presets(format!("{p} prices a GPU per search: availability shows today's"))),
+        None => form.set_kinds(presets, Source::Presets(format!("{p} has no list to read: availability shows what up would try"))),
     }
 }
 
@@ -453,9 +468,9 @@ pub(crate) fn open(ui: &mut Ui, shared: &Arc<Mutex<Shared>>) {
     ui.mode = Mode::NewPod(form);
 }
 
-/// The form's background work, each pass of the loop: its provider's catalog asked for (once),
-/// put in when it lands, and the availability of its choice (debounced). Starts fetches; never
-/// waits on one. `true`: the form changed.
+/// The form's background work, each pass of the loop: its provider's catalogue asked for when
+/// due ([`offers::State::catalog_due`]), put in when it lands, and the availability of its
+/// choice (debounced). Starts fetches; never waits on one. `true`: the form changed.
 pub(crate) fn tick(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, now: Instant) -> bool {
     let Ui { mode, offers, cli, .. } = ui;
     let Mode::NewPod(form) = mode else {
@@ -463,10 +478,11 @@ pub(crate) fn tick(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, now: Instant) -> bo
         return false;
     };
     let mut changed = false;
-    if let Some(q) = offers.catalog_due(form.provider_name()) {
+    if let Some(q) = offers.catalog_due(form.provider_name(), now) {
         runs::fetch_offers(shared, cli, q, offers, now);
     }
-    if form.source == Source::Loading && !matches!(offers.catalog(form.provider_name()), Some(Fetch::Out) | None) {
+    // Its catalogue landed (the first time, or a refresh): in, on the same choice.
+    if offers.take_new(form.provider_name()) {
         apply_kinds(form, offers);
         changed = true;
     }
@@ -751,12 +767,13 @@ mod tests {
     }
 
     fn live(id: &str, size: u32, community: Option<f64>, secure: Option<f64>) -> Choice {
-        Choice { id: id.into(), label: id.into(), size, community, secure, estimate: false, tiers_known: true, server: None }
+        Choice { id: id.into(), label: id.into(), size, community, secure, estimate: false, tiers_known: true, server: None, market: None, unlisted: None }
     }
 
     fn hetzner_types() -> Vec<Choice> {
         let t = |name: &str, cores: u32, eur: f64| Choice { server: Some((format!("{cores} vCPU"), Some(eur))), size: cores, ..Choice::server_type(name) };
-        vec![t("cx43", 8, 0.0296), t("cx23", 2, 0.0104), t("cx33", 4, 0.016)]
+        // In the catalogue's order (`offers hetzner`: by family, then size).
+        vec![t("cx23", 2, 0.0104), t("cx33", 4, 0.016), t("cx43", 8, 0.0296), t("cpx22", 2, 0.0089)]
     }
 
     #[test]
@@ -771,8 +788,8 @@ mod tests {
     }
 
     /// On Hetzner the type field is the server type: its choices are the server types (the
-    /// configured one first — cx33 by default — then by size), each with vCPU/RAM and €/h; back on
-    /// RunPod, the GPU it was on.
+    /// configured one first — cx33 by default — then in the catalogue's order, by family and
+    /// size), each with vCPU/RAM and €/h; back on RunPod, the GPU it was on.
     #[test]
     fn hetzner_switches_the_type_field_to_server_types() {
         let mut f = form();
@@ -782,7 +799,7 @@ mod tests {
         f.field = 0;
         f.change(1);
         f.set_kinds(hetzner_types(), Source::Live);
-        assert_eq!(f.kinds.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(), ["cx33", "cx23", "cx43"], "the default first, then by size");
+        assert_eq!(f.kinds.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(), ["cx33", "cx23", "cx43", "cpx22"], "the default first, then the catalogue's order");
         assert_eq!(f.kind().unwrap().id, "cx33");
         assert_eq!(f.kind().unwrap().price("hetzner", None), "€0.0160/h");
         f.field = 1;

@@ -5,9 +5,11 @@
 //! here: the same planner `create`/`up` run, near the proxy included.
 //!
 //! Nothing here waits: a fetch runs in the background and lands through `Shared` (the loop hands
-//! it to [`State::landed`]). A catalog is read once per provider for the dashboard's life (`…`
-//! until it lands; the presets if it fails). A choice is checked once the form has rested on it
-//! for [`DEBOUNCE`] — arrowing through twenty GPU types makes one request, not twenty: RunPod
+//! it to [`State::landed`]). A provider's catalogue is read the first time the form shows it
+//! (`…` until it lands; the presets if it fails), again after [`CATALOG_FRESH`] — a dashboard
+//! runs for weeks, prices move — and after a failure once [`CATALOG_RETRY`] has passed; the
+//! last good one is shown meanwhile. A choice is checked once the form has rested on it for
+//! [`DEBOUNCE`] — arrowing through twenty GPU types makes one request, not twenty: RunPod
 //! rate-limits its API — and its answer is kept for [`FRESH`].
 //!
 //! [`args`] is the one place that knows the CLI's shape: when `offers` changes, change it there.
@@ -27,6 +29,12 @@ pub(crate) const FRESH: Duration = Duration::from_secs(180);
 
 /// How long one `arena offers` may take.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How long a catalogue is shown before it's read again (the form shows the old one meanwhile).
+pub(crate) const CATALOG_FRESH: Duration = Duration::from_secs(30 * 60);
+
+/// How long after a failed catalogue read the form asks again (the presets meanwhile).
+pub(crate) const CATALOG_RETRY: Duration = Duration::from_secs(120);
 
 /// What the form asks `offers` for.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -60,10 +68,11 @@ pub(crate) fn key_of(form: &NewPodForm) -> Option<Key> {
 }
 
 /// The provider and `arena` arguments (after the global `--config`/`--provider`) for `q` — the
-/// one place that knows `offers`' command line.
+/// one place that knows `offers`' command line: `offers <provider> --json` for everything a
+/// provider sells, `offers --json` with `up`'s flags for what it would try.
 pub(crate) fn args(q: &Query) -> (String, Vec<String>) {
     match q {
-        Query::Catalog(p) => (p.clone(), vec!["offers".into(), "--all".into(), "--json".into()]),
+        Query::Catalog(p) => (p.clone(), vec!["offers".into(), p.clone(), "--json".into()]),
         Query::Plan(k) => {
             let mut a = vec!["offers".to_string(), "--json".into()];
             if k.provider == "hetzner" {
@@ -82,36 +91,46 @@ pub(crate) fn args(q: &Query) -> (String, Vec<String>) {
     }
 }
 
-/// Which providers have a catalog for the type field to read: the rest (Vast, Shadeform:
-/// marketplaces, priced per search) choose from the presets.
+/// Which providers have a catalogue for the type field to read — RunPod's GPU types, Vast's
+/// market now, Hetzner's server types. The rest (Shadeform) choose from the presets.
 pub(crate) fn has_catalog(provider: &str) -> bool {
-    matches!(provider, "runpod" | "hetzner")
+    matches!(provider, "runpod" | "vast" | "hetzner")
 }
 
-// What `offers --all --json` prints, as far as the form reads it.
+// What `offers <provider> --json` prints, as far as the form reads it.
 #[derive(Deserialize)]
 struct CatalogsJson {
     #[serde(default)]
-    runpod: Option<Vec<GpuRowJson>>,
+    catalogs: Vec<CatalogJson>,
     #[serde(default)]
-    hetzner: Option<Vec<ServerTypeJson>>,
+    skipped: Vec<SkippedJson>,
+    #[serde(default)]
+    failed: Vec<SkippedJson>,
+}
+
+#[derive(Deserialize)]
+struct CatalogJson {
+    provider: String,
+    #[serde(default)]
+    rows: Vec<RowJson>,
+    #[serde(default)]
+    server_types: Option<Vec<ServerTypeJson>>,
     #[serde(default)]
     notes: Vec<String>,
 }
 
+/// A GPU type on one tier (RunPod's `COMMUNITY`/`SECURE`, Vast's host classes).
 #[derive(Deserialize)]
-struct GpuRowJson {
-    id: String,
+struct RowJson {
+    gpu: String,
     #[serde(default)]
-    display_name: String,
-    #[serde(default)]
-    memory_gb: u32,
-    community_price: Option<f64>,
-    secure_price: Option<f64>,
-    #[serde(default)]
-    creatable: Option<bool>,
-    #[serde(default)]
+    name: String,
+    vram_gb: Option<u32>,
+    cloud: Option<String>,
+    price_per_gpu: Option<f64>,
     price_source: Option<String>,
+    /// `unlisted`, `not sold now`, `v1: not creatable`, `--cloud unverified`.
+    note: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -124,56 +143,93 @@ struct ServerTypeJson {
     architecture: Option<String>,
 }
 
-/// `provider`'s catalog from `offers --all --json`: RunPod's GPU types (minus what its create
-/// API rejects), Hetzner's server types. An empty one, or one the JSON doesn't carry (it
-/// couldn't be read: a note says why), is an error — the form keeps the presets.
+/// `{name} · {vram}GB`, or the name alone when the VRAM isn't known.
+fn gpu_label(name: &str, id: &str, vram: Option<u32>) -> String {
+    let name = if name.is_empty() { id } else { name };
+    vram.map_or_else(|| name.to_string(), |v| format!("{name} · {v}GB"))
+}
+
+/// `provider`'s choices from `offers <provider> --json`. RunPod: one per GPU type, both tiers'
+/// prices — a type its create rejects (v1) or that's sold on no tier now left out; a type its
+/// public catalog lacks (`unlisted`: B300 MIG slices seen on the account) kept, priced as a pod
+/// of it bills when one does. Vast: one per card a create would rent as configured, at the
+/// cheapest offer now. Hetzner: each server type with its size and €/h, in the catalogue's
+/// order (by family, then size). A failed or empty catalogue is an error — the form keeps the
+/// presets. Pure.
 pub(crate) fn parse_catalog(provider: &str, json: &str) -> Result<Vec<Choice>, String> {
     let c: CatalogsJson = serde_json::from_str(json).map_err(|e| format!("unreadable offers output: {e}"))?;
-    let why = || c.notes.first().cloned().unwrap_or_else(|| format!("no {provider} catalog in offers' answer"));
-    let out: Vec<Choice> = match provider {
-        "runpod" => c
-            .runpod
-            .as_ref()
-            .ok_or_else(why)?
-            .iter()
-            .filter(|r| r.creatable != Some(false))
-            .map(|r| Choice {
-                id: r.id.clone(),
-                label: format!("{} · {}GB", if r.display_name.is_empty() { &r.id } else { &r.display_name }, r.memory_gb),
-                size: r.memory_gb,
-                community: r.community_price,
-                secure: r.secure_price,
-                estimate: r.price_source.as_deref() != Some("live"),
-                tiers_known: true,
-                server: None,
-            })
-            .collect(),
-        "hetzner" => c
-            .hetzner
-            .as_ref()
-            .ok_or_else(why)?
-            .iter()
-            .map(|t| {
+    let theirs = |v: &[SkippedJson]| v.iter().find(|s| s.provider == provider).map(|s| s.why.clone());
+    let Some(cat) = c.catalogs.iter().find(|k| k.provider == provider) else {
+        return Err(theirs(&c.failed).or_else(|| theirs(&c.skipped)).unwrap_or_else(|| format!("no {provider} catalogue in offers' answer")));
+    };
+    let why = || cat.notes.first().cloned().unwrap_or_else(|| format!("{provider}'s catalogue is empty"));
+    let mut out: Vec<Choice> = Vec::new();
+    match provider {
+        "runpod" => {
+            for r in &cat.rows {
+                if matches!(r.note.as_deref(), Some("v1: not creatable" | "not sold now")) {
+                    continue;
+                }
+                let at = match out.iter().position(|c| c.id == r.gpu) {
+                    Some(i) => i,
+                    None => {
+                        let unlisted = r.note.as_deref() == Some("unlisted");
+                        out.push(Choice {
+                            id: r.gpu.clone(),
+                            label: gpu_label(&r.name, &r.gpu, r.vram_gb),
+                            size: r.vram_gb.unwrap_or(0),
+                            community: None,
+                            secure: None,
+                            estimate: r.price_source.as_deref() == Some("estimate"),
+                            tiers_known: !unlisted,
+                            server: None,
+                            market: None,
+                            unlisted: unlisted.then_some(r.price_per_gpu),
+                        });
+                        out.len() - 1
+                    }
+                };
+                match r.cloud.as_deref() {
+                    Some("COMMUNITY") => out[at].community = r.price_per_gpu,
+                    Some("SECURE") => out[at].secure = r.price_per_gpu,
+                    _ => {}
+                }
+            }
+        }
+        "vast" => {
+            // A card on a host class the configured create wouldn't rent (`--cloud unverified`)
+            // isn't one the form can make: it has no tier field for Vast.
+            for r in cat.rows.iter().filter(|r| r.note.is_none()) {
+                match out.iter_mut().find(|c| c.id == r.gpu) {
+                    Some(c) => c.market = [c.market, r.price_per_gpu].into_iter().flatten().reduce(f64::min),
+                    None => out.push(Choice {
+                        id: r.gpu.clone(),
+                        label: gpu_label(&r.name, &r.gpu, r.vram_gb),
+                        size: r.vram_gb.unwrap_or(0),
+                        community: None,
+                        secure: None,
+                        estimate: false,
+                        tiers_known: false,
+                        server: None,
+                        market: r.price_per_gpu,
+                        unlisted: None,
+                    }),
+                }
+            }
+        }
+        "hetzner" => {
+            for t in cat.server_types.as_deref().unwrap_or_default() {
                 let mut size = Vec::new();
                 size.extend(t.cores.map(|c| format!("{c} vCPU")));
                 size.extend(t.memory_gb.map(|m| format!("{} GB", fmt_gb(m))));
                 if t.architecture.as_deref() == Some("arm") {
                     size.push("arm".into());
                 }
-                Choice {
-                    id: t.name.clone(),
-                    label: t.name.clone(),
-                    size: t.cores.unwrap_or(0),
-                    community: None,
-                    secure: None,
-                    estimate: false,
-                    tiers_known: false,
-                    server: Some((size.join(" · "), t.eur_per_hour)),
-                }
-            })
-            .collect(),
-        other => return Err(format!("{other} has no catalog")),
-    };
+                out.push(Choice { size: t.cores.unwrap_or(0), server: Some((size.join(" · "), t.eur_per_hour)), ..Choice::server_type(&t.name) });
+            }
+        }
+        other => return Err(format!("{other} has no catalogue")),
+    }
     if out.is_empty() {
         return Err(why());
     }
@@ -319,12 +375,24 @@ pub(crate) enum Shown<'a> {
     Failed(&'a str),
 }
 
+/// One provider's catalogue as the form knows it: the last answer (and when it came) and
+/// whether a read is out — a refresh keeps showing the last good list.
+#[derive(Debug, Default)]
+struct Catalogue {
+    got: Option<(Instant, Result<Vec<Choice>, String>)>,
+    /// When a refresh of a good list last failed (asked again [`CATALOG_RETRY`] after).
+    refresh_failed: Option<Instant>,
+    out: bool,
+    /// An answer landed that the form hasn't taken in yet.
+    new: bool,
+}
+
 /// The form's offers, kept for the dashboard's life ([`crate::Ui`] holds it, the UI thread only).
 #[derive(Debug)]
 pub(crate) struct State {
     /// The availability line is shown (and so fetched): `o` toggles it.
     pub show: bool,
-    catalogs: HashMap<String, Fetch<Vec<Choice>>>,
+    catalogs: HashMap<String, Catalogue>,
     plans: HashMap<Key, (Instant, Fetch<Vec<String>>)>,
     /// The choice the form is on, and since when.
     wanted: Option<(Key, Instant)>,
@@ -335,17 +403,43 @@ impl State {
         State { show, catalogs: HashMap::new(), plans: HashMap::new(), wanted: None }
     }
 
-    /// `provider`'s catalog to ask for now — once, if it has one — marked out.
-    pub(crate) fn catalog_due(&mut self, provider: &str) -> Option<Query> {
-        if !has_catalog(provider) || self.catalogs.contains_key(provider) {
+    /// `provider`'s catalogue to ask for now, if it has one — marked out: never read, or read
+    /// [`CATALOG_FRESH`] ago, or failed [`CATALOG_RETRY`] ago; never while a read is out.
+    pub(crate) fn catalog_due(&mut self, provider: &str, now: Instant) -> Option<Query> {
+        if !has_catalog(provider) {
             return None;
         }
-        self.catalogs.insert(provider.to_string(), Fetch::Out);
+        let c = self.catalogs.entry(provider.to_string()).or_default();
+        let due = match &c.got {
+            _ if c.out => false,
+            None => true,
+            Some((at, Ok(_))) => {
+                now.duration_since(*at) >= CATALOG_FRESH && c.refresh_failed.is_none_or(|f| now.duration_since(f) >= CATALOG_RETRY)
+            }
+            Some((at, Err(_))) => now.duration_since(*at) >= CATALOG_RETRY,
+        };
+        if !due {
+            return None;
+        }
+        c.out = true;
         Some(Query::Catalog(provider.to_string()))
     }
 
-    pub(crate) fn catalog(&self, provider: &str) -> Option<&Fetch<Vec<Choice>>> {
-        self.catalogs.get(provider)
+    /// What the form shows for `provider`'s type field: the last good catalogue (even while a
+    /// newer one is read), else the read out, else why it failed. `None`: never asked.
+    pub(crate) fn catalog(&self, provider: &str) -> Option<Fetch<&[Choice]>> {
+        let c = self.catalogs.get(provider)?;
+        Some(match &c.got {
+            Some((_, Ok(kinds))) => Fetch::Ready(kinds.as_slice()),
+            _ if c.out => Fetch::Out,
+            Some((_, Err(why))) => Fetch::Failed(why.clone()),
+            None => return None,
+        })
+    }
+
+    /// Whether `provider`'s catalogue changed since the form last took it in — and it's taken now.
+    pub(crate) fn take_new(&mut self, provider: &str) -> bool {
+        self.catalogs.get_mut(provider).is_some_and(|c| std::mem::take(&mut c.new))
     }
 
     /// The form is on `key` at `now` (`None`: nothing to check). A new choice restarts the
@@ -395,7 +489,17 @@ impl State {
         match q {
             Query::Catalog(p) => {
                 let got = out.and_then(|j| parse_catalog(&p, &j));
-                self.catalogs.insert(p, got.map_or_else(Fetch::Failed, Fetch::Ready));
+                let c = self.catalogs.entry(p).or_default();
+                c.out = false;
+                c.new = true;
+                // A failed refresh keeps the last good list, and is retried after CATALOG_RETRY.
+                match (&c.got, got) {
+                    (Some((_, Ok(_))), Err(_)) => c.refresh_failed = Some(now),
+                    (_, got) => {
+                        c.got = Some((now, got));
+                        c.refresh_failed = None;
+                    }
+                }
             }
             Query::Plan(k) => {
                 let got = out.and_then(|j| parse_plan(&j));
@@ -406,7 +510,7 @@ impl State {
 
     /// Whether anything is out or waiting out its debounce: the loop then looks again soon.
     pub(crate) fn busy(&self, now: Instant) -> bool {
-        let out = self.catalogs.values().any(|f| *f == Fetch::Out) || self.plans.values().any(|(_, f)| *f == Fetch::Out);
+        let out = self.catalogs.values().any(|c| c.out) || self.plans.values().any(|(_, f)| *f == Fetch::Out);
         let resting = self.show && self.wanted.as_ref().is_some_and(|(k, since)| now.duration_since(*since) < DEBOUNCE + Duration::from_millis(50) && !self.plans.contains_key(k));
         out || resting
     }
@@ -420,11 +524,11 @@ mod tests {
         Key { provider: "runpod".into(), kind: kind.into(), cloud: Some("COMMUNITY".into()), gpus: Some(1) }
     }
 
-    /// `args` is the CLI's shape in one place: a catalog is `offers --all --json`; a plan is the
+    /// `args` is the CLI's shape in one place: a catalogue is `offers <provider> --json`; a plan is the
     /// form's choice as `up`'s flags (Hetzner: its server type only).
     #[test]
     fn offers_args_are_ups_flags() {
-        assert_eq!(args(&Query::Catalog("runpod".into())), ("runpod".into(), vec!["offers".into(), "--all".into(), "--json".into()]));
+        assert_eq!(args(&Query::Catalog("runpod".into())), ("runpod".into(), vec!["offers".into(), "runpod".into(), "--json".into()]));
         let (p, a) = args(&Query::Plan(Key { provider: "runpod".into(), kind: "NVIDIA RTX A4000".into(), cloud: Some("COMMUNITY,SECURE".into()), gpus: Some(2) }));
         assert_eq!(p, "runpod");
         assert_eq!(a, ["offers", "--json", "--gpu", "NVIDIA RTX A4000", "--cloud", "COMMUNITY,SECURE", "--gpus", "2"]);
@@ -471,39 +575,98 @@ mod tests {
         assert_eq!(off.shown(Some(&key("c"))), Shown::Off);
     }
 
-    /// A provider's catalog is asked for once, for the providers that have one.
+    /// A provider's catalogue is asked for the first time the form shows it, never twice at
+    /// once, again once it's [`CATALOG_FRESH`] old — the old list shown meanwhile — and after a
+    /// failure once [`CATALOG_RETRY`] has passed (a failed refresh keeps the good list).
+    /// Shadeform has none: the presets.
     #[test]
-    fn a_catalog_is_asked_for_once_per_provider() {
+    fn a_catalogue_is_read_when_shown_refreshed_when_old_retried_after_a_failure() {
+        let t0 = Instant::now();
         let mut s = State::new(true);
-        assert_eq!(s.catalog_due("runpod"), Some(Query::Catalog("runpod".into())));
-        assert_eq!(s.catalog_due("runpod"), None);
-        assert_eq!(s.catalog("runpod"), Some(&Fetch::Out));
-        assert_eq!(s.catalog_due("vast"), None, "a marketplace: the presets");
-        s.landed(Query::Catalog("runpod".into()), Err("timed out".into()), Instant::now());
-        assert_eq!(s.catalog("runpod"), Some(&Fetch::Failed("timed out".into())));
-        assert_eq!(s.catalog_due("runpod"), None, "not again: the presets stand in");
+        let q = || Some(Query::Catalog("runpod".into()));
+        let one = r#"{"catalogs":[{"provider":"runpod","rows":[{"gpu":"A","name":"A","vram_gb":16,"cloud":"COMMUNITY","price_per_gpu":0.2,"price_source":"live"}],"notes":[]}]}"#;
+        let ids = |s: &State| match s.catalog("runpod") {
+            Some(Fetch::Ready(k)) => k.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(s.catalog("runpod"), None);
+        assert_eq!(s.catalog_due("runpod", t0), q());
+        assert_eq!(s.catalog_due("runpod", t0), None, "out already");
+        assert_eq!(s.catalog("runpod"), Some(Fetch::Out));
+        assert!(s.busy(t0));
+        assert!(!s.take_new("runpod"));
+        s.landed(Query::Catalog("runpod".into()), Ok(one.into()), t0);
+        assert!(s.take_new("runpod") && !s.take_new("runpod"), "the form takes it in once");
+        assert_eq!(ids(&s), ["A"]);
+        assert_eq!(s.catalog_due("runpod", t0 + CATALOG_FRESH - Duration::from_secs(1)), None, "fresh");
+        assert_eq!(s.catalog_due("runpod", t0 + CATALOG_FRESH), q(), "old: read again");
+        assert_eq!(ids(&s), ["A"], "the old list while the new one is read");
+        s.landed(Query::Catalog("runpod".into()), Err("429".into()), t0 + CATALOG_FRESH);
+        assert_eq!(ids(&s), ["A"], "a failed refresh keeps the good list");
+        assert_eq!(s.catalog_due("runpod", t0 + CATALOG_FRESH + Duration::from_secs(1)), None);
+        assert_eq!(s.catalog_due("runpod", t0 + CATALOG_FRESH + CATALOG_RETRY), q(), "retried");
+        // Never read well: the failure shows (the presets stand in), retried after CATALOG_RETRY.
+        assert_eq!(s.catalog_due("hetzner", t0), Some(Query::Catalog("hetzner".into())));
+        s.landed(Query::Catalog("hetzner".into()), Err("timed out".into()), t0);
+        assert_eq!(s.catalog("hetzner"), Some(Fetch::Failed("timed out".into())));
+        assert_eq!(s.catalog_due("hetzner", t0 + Duration::from_secs(10)), None);
+        assert_eq!(s.catalog_due("hetzner", t0 + CATALOG_RETRY), Some(Query::Catalog("hetzner".into())));
+        assert_eq!(s.catalog("hetzner"), Some(Fetch::Out), "retrying: nothing good to show");
+        assert_eq!(s.catalog_due("shadeform", t0), None, "no list: the presets");
     }
 
-    /// RunPod's catalog: every type its create takes, B300 and the MIG slices included, with
-    /// both tiers' prices (`None`: not sold there); Hetzner's: each server type's size and €/h.
+    /// `offers <provider> --json`'s catalogue as the type field's choices. RunPod: a type once
+    /// with both tiers' prices (`None`: not sold there), B300 and MIG slices included; a type
+    /// its catalog lacks kept as `unlisted` with a pod's price; one not sold now, or that v1's
+    /// create rejects, left out. Vast: the cards a create would rent as configured, at the
+    /// cheapest class's price. Hetzner: each server type's size and €/h, in order. A failed or
+    /// empty catalogue is an error: the presets stand in.
     #[test]
-    fn catalogs_parse_into_the_type_fields_choices() {
-        let rp = r#"{"runpod":[
-            {"id":"NVIDIA B300 SXM6 AC","display_name":"B300","memory_gb":288,"community_price":6.94,"secure_price":8.99,"creatable":true,"price_source":"live"},
-            {"id":"NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb","display_name":"PRO 6000 MIG 24GB","memory_gb":24,"community_price":null,"secure_price":0.69,"creatable":true,"price_source":"live"},
-            {"id":"NVIDIA Old","display_name":"Old","memory_gb":8,"community_price":0.1,"secure_price":null,"creatable":false,"price_source":"live"}
-        ],"notes":[]}"#;
+    fn catalogues_parse_into_the_type_fields_choices() {
+        let rp = r#"{"catalogs":[{"provider":"runpod","gpu_count":1,"rows":[
+            {"gpu":"NVIDIA RTX A4000","name":"RTX A4000","vram_gb":16,"cloud":"COMMUNITY","price_per_gpu":0.17,"price_source":"live","stock":"High","try_order":1},
+            {"gpu":"NVIDIA RTX A4000","name":"RTX A4000","vram_gb":16,"cloud":"SECURE","price_per_gpu":0.25,"price_source":"live","stock":"Low"},
+            {"gpu":"NVIDIA B300 SXM6 AC","name":"B300","vram_gb":288,"cloud":"SECURE","price_per_gpu":8.99,"price_source":"live"},
+            {"gpu":"NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb","name":"PRO 6000 MIG 1g.24gb","vram_gb":24,"cloud":"SECURE","price_per_gpu":0.69,"price_source":"live"},
+            {"gpu":"NVIDIA Old","name":"Old","vram_gb":8,"cloud":null,"price_per_gpu":null,"price_source":null,"note":"not sold now"},
+            {"gpu":"NVIDIA V1Only","name":"V1Only","vram_gb":8,"cloud":"COMMUNITY","price_per_gpu":0.1,"price_source":"live","note":"v1: not creatable"},
+            {"gpu":"NVIDIA B300 SXM6 AC MIG 1g.34gb","name":"B300 MIG 1g.34gb","vram_gb":34,"cloud":null,"price_per_gpu":1.1,"price_source":"pod","note":"unlisted"}
+        ],"notes":["marked: what up would try"]}],"skipped":[],"failed":[]}"#;
         let c = parse_catalog("runpod", rp).unwrap();
-        assert_eq!(c.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["B300 · 288GB", "PRO 6000 MIG 24GB · 24GB"], "not creatable: left out");
-        assert_eq!((c[1].community, c[1].secure, c[1].estimate), (None, Some(0.69), false));
-        let hz = r#"{"hetzner":[{"name":"cx33","cores":4,"cpu_type":"shared","architecture":"x86","memory_gb":8.0,"disk_gb":80,"eur_per_hour":0.016,"locations":["fsn1"]},
-                                {"name":"cax11","cores":2,"architecture":"arm","memory_gb":4.0,"eur_per_hour":0.0059,"locations":[]}],"notes":[]}"#;
+        assert_eq!(
+            c.iter().map(|c| (c.label.as_str(), c.community, c.secure)).collect::<Vec<_>>(),
+            [
+                ("RTX A4000 · 16GB", Some(0.17), Some(0.25)),
+                ("B300 · 288GB", None, Some(8.99)),
+                ("PRO 6000 MIG 1g.24gb · 24GB", None, Some(0.69)),
+                ("B300 MIG 1g.34gb · 34GB", None, None),
+            ]
+        );
+        assert_eq!((c[1].sold_on("COMMUNITY"), c[1].sold_on("SECURE")), (Some(false), Some(true)), "B300: SECURE only");
+        assert_eq!((c[3].unlisted, c[3].sold_on("COMMUNITY")), (Some(Some(1.1)), None), "unlisted: where is RunPod's to say");
+        assert_eq!(c[3].price("runpod", Some("COMMUNITY")), "unlisted · $1.10/h a pod bills");
+        assert_eq!(c[3].id, "NVIDIA B300 SXM6 AC MIG 1g.34gb", "--gpu takes the full id");
+        let vast = r#"{"catalogs":[{"provider":"vast","gpu_count":1,"rows":[
+            {"gpu":"RTX 3090","name":"RTX 3090","vram_gb":24,"cloud":"DATACENTER","price_per_gpu":0.31,"price_source":"live","location":"Sweden, SE"},
+            {"gpu":"RTX 3090","name":"RTX 3090","vram_gb":24,"cloud":"VERIFIED","price_per_gpu":0.22,"price_source":"live"},
+            {"gpu":"RTX 3090","name":"RTX 3090","vram_gb":24,"cloud":"UNVERIFIED","price_per_gpu":0.12,"price_source":"live","note":"--cloud unverified"},
+            {"gpu":"RTX 2080","name":"RTX 2080","vram_gb":8,"cloud":"UNVERIFIED","price_per_gpu":0.05,"price_source":"live","note":"--cloud unverified"}
+        ],"notes":[]}],"skipped":[],"failed":[]}"#;
+        let c = parse_catalog("vast", vast).unwrap();
+        assert_eq!(c.iter().map(|c| (c.id.as_str(), c.market)).collect::<Vec<_>>(), [("RTX 3090", Some(0.22))], "unverified hosts: not rented as configured");
+        assert_eq!(c[0].price("vast", None), "from $0.22/h now");
+        let hz = r#"{"catalogs":[{"provider":"hetzner","gpu_count":1,"rows":[],"server_types":[
+            {"name":"cx23","cores":2,"cpu_type":"shared","architecture":"x86","memory_gb":4.0,"disk_gb":40,"eur_per_hour":0.0104,"locations":["nbg1"]},
+            {"name":"cax11","cores":2,"architecture":"arm","memory_gb":4.0,"eur_per_hour":0.0059,"locations":[]}],"notes":[]}],"skipped":[],"failed":[]}"#;
         let c = parse_catalog("hetzner", hz).unwrap();
-        assert_eq!(c[0].server, Some(("4 vCPU · 8 GB".to_string(), Some(0.016))));
+        assert_eq!(c.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["cx23", "cax11"]);
+        assert_eq!(c[0].server, Some(("2 vCPU · 4 GB".to_string(), Some(0.0104))));
         assert_eq!(c[1].server, Some(("2 vCPU · 4 GB · arm".to_string(), Some(0.0059))));
-        assert_eq!(parse_catalog("hetzner", r#"{"notes":["hetzner: couldn't read the server types (401)"]}"#), Err("hetzner: couldn't read the server types (401)".into()));
+        let failed = r#"{"catalogs":[],"skipped":[],"failed":[{"provider":"hetzner","why":"couldn't read the server types (401)"}]}"#;
+        assert_eq!(parse_catalog("hetzner", failed), Err("couldn't read the server types (401)".into()));
+        assert_eq!(parse_catalog("vast", r#"{"catalogs":[{"provider":"vast","rows":[],"notes":["vast: searching verified hosts failed (429)"]}]}"#), Err("vast: searching verified hosts failed (429)".into()));
         assert!(parse_catalog("runpod", "not json").unwrap_err().starts_with("unreadable"));
-        assert!(parse_catalog("runpod", r#"{"runpod":[],"notes":[]}"#).is_err(), "empty: the presets stand in");
+        assert_eq!(parse_catalog("runpod", r#"{"catalogs":[]}"#), Err("no runpod catalogue in offers' answer".into()));
     }
 
     /// A plan reads as `up` would try it: in order, priced (`~` an estimate), stock, near the
