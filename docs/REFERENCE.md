@@ -17,6 +17,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [Overriding config without editing it](#overriding-config-without-editing-it)
 - [Providers](#providers)
   - [RunPod (REST v2, the default)](#runpod-rest-v2-the-default)
+  - [RunPod rate limits](#runpod-rate-limits)
   - [RunPod REST v1 (retiring)](#runpod-rest-v1-retiring)
   - [Vast.ai](#vastai)
   - [Hetzner Cloud](#hetzner-cloud)
@@ -233,7 +234,7 @@ Notes / sharp edges to know:
 Any key in `config.env` can be overridden by an **environment variable of the same
 name** (env wins; it can't introduce brand-new keys — except a short allowlist such as
 `ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `DISCARD_MAX_GB` and the `ASK_<AI>_MODEL`/`_EFFORT` keys, e.g. `RUNPOD_API=v1 arena pods
-list` to use the retiring RunPod v1 backend for one command, until 2026-11-15; v2 is the default). This is how you point at an SSH
+list` to use the retiring RunPod v1 backend for one command, until 2026-11-16; v2 is the default). This is how you point at an SSH
 key the current user can actually read, without editing the shared, read-only prod
 config — e.g. when the dashboard's metrics show `ssh connect failed … key unreadable`
 because the configured key lives under `/root`:
@@ -255,7 +256,7 @@ GIT_SSH_KEY_LOCAL=~/.ssh/arena_infra_key arena pods setup
 which quotes the value only if it's short and version-like — never a pasted key; `config check`
 shows which is active, `(default)` when unset).
 
-Why the default: v1 retires on 2026-11-15, and v1 can only ask for hosts on CUDA ≤ 13.0 (below),
+Why the default: v1 retires on 2026-11-16, and v1 can only ask for hosts on CUDA ≤ 13.0 (below),
 which starved RunPod placement — "no capacity" all day once the 13.0 hosts were taken.
 
 Same provider name and commands. Differences: real lifecycle statuses
@@ -311,11 +312,48 @@ a proxy-only host (live: two 4090s did): `up` calls it a host failure after the 
 Neither API reports a pod's CUDA constraint, so `replace`/`migrate copy` re-apply the configured one
 to the replacement (as `create` does).
 
+### RunPod rate limits
+
+Since 2026-10-27 every RunPod public API is rate-limited (RunPod's service email, 2026-10-28). REST
+v1 is capped at 180/min, 3,600/h and 43,200/day, halved on Nov 2 and again on Nov 9, until its sunset.
+The v2 management API gives each user **one quota per window** (minute, hour, day), every request
+counting against all three, and **every process using the key shares it**: prod's dashboards and
+its backup cron draw on one quota. The quotas aren't published; every v2 answer carries them:
+`RateLimit-Policy: "minute";q=…;w=60, "hour";q=…;w=3600, "day";q=…;w=86400` (q requests per w
+seconds) and `RateLimit: "minute";r=…;t=…, …` (r left, t seconds to that window's reset). A refusal
+is `429` with `Retry-After` (seconds) and a problem+json `detail` naming the window. No headers
+means no limit.
+
+Every provider request goes through one path (`http::exchange`, `ratelimit`):
+- Before a request is sent, a quota that is **held** — a 429's wait, or a window with `r` ≤ 1 until
+  its reset (the last request is left to the other processes on the key) — is waited out. If the
+  caller can't wait that long, the request fails at once, rate-limited and not sent:
+  `list pods: not sent — RunPod REST v2 rate limit (the minute window is spent): next request in 12 s`.
+  A dashboard call waits at most 2 s, a listing at most its 60 s bound, and anything else at most
+  65 s (a minute window's reset). An hour or day window that is spent fails at once.
+- A **429** is retried for any method (it is refused before processing, so a create is safe to
+  send again) after `Retry-After` (else Vast's body `retry_after`, else the reset of a window the
+  answer says is spent, else 1, 2, 4… s) plus up to 1 s of jitter, at most 3 times. Then the error
+  says so: `… HTTP 429 …: rate limit exceeded for the minute window — RunPod REST v2 rate limit:
+  still refused after 3 retries; next request in 12 s`.
+- A **5xx or a network error** is resent only for a RunPod **read** (GET), twice, after 1 s and
+  2 s. A POST/PATCH/DELETE that got one may have done something, so it is the caller's (a create
+  says "may have been created", and is never resent). Other providers' requests aren't resent
+  here: their callers have their own rules.
+- RunPod's three APIs (REST v2, REST v1, GraphQL) are separate quotas here, as are two keys.
+  Nothing says the APIs share one. The commands' own retries (`retry` module) still apply on top,
+  each attempt behind the same hold.
+
+`arena api get runpod pods --limits` shows what RunPod reported (below), and the dashboard's footer
+shows the request rate and what the quota has left this minute.
+
 ### RunPod REST v1 (retiring)
 
-`provider::runpod` — RunPod REST **v1** backend: list / create / stop / terminate. RunPod retires
-REST v1 on **2026-11-15**; used only with an explicit `RUNPOD_API=v1` (which `config check` warns
-about, with the date and `remove RUNPOD_API=v1 (v2 is the default)`).
+`provider::runpod` — RunPod REST **v1** backend: list / create / stop / terminate. RunPod sunsets
+REST v1 on **2026-11-16**; used only with an explicit `RUNPOD_API=v1` (which `config check` warns
+about, with the date and `remove RUNPOD_API=v1 (v2 is the default)`). From then every v1 request
+answers `410 Gone`, which arena reports as a config error: `list pods: RunPod REST v1 is gone (HTTP
+410 — RunPod sunset it on 2026-11-16): remove RUNPOD_API=v1 (v2 is the default)`.
 
 ### Vast.ai
 
@@ -771,7 +809,8 @@ Already-created pods are never rolled back.
 
 **Transient** failures (429 / 5xx / connect-timeout) are retried automatically with exponential
 backoff (`retry` module) around create and list calls — so a throttle or blip doesn't fail the
-command.
+command. Underneath, each request already waits out a 429 and a held quota, and RunPod reads are
+resent after a 5xx (see [RunPod rate limits](#runpod-rate-limits)).
 
 Every backend reads a response's **status before its body** (`http` module), so a bad key's `401`
 with an HTML or empty body is `Auth` (`… HTTP 401 Unauthorized: …`), never "error decoding response
@@ -1662,7 +1701,7 @@ healthy account reads ok.
 A running pod with no GPU information, a stopped pod whose (volume) disk size isn't listed, or a
 burn not known at all make the account `unknown` ("burn unknown: …", never "no burn").
 
-A listing that fails (a Vast 429 is retried once first, when it asks for ≤ 2 s) is stood in for by
+A listing that fails (a 429 is waited out and retried first, within the listing's bound) is stood in for by
 the burn observed under 30 min ago, marked stale (`-v` says so) — older, a $0 is unknown and
 anything more a floor.
 
@@ -1786,7 +1825,7 @@ API rejects, `creatable: false`; on v2 every row is creatable).
 
 ### `api get`
 
-`api get <runpod|runpod-v1|runpod-v2|vast|hetzner|shadeform> <path> [--raw]` — **read-only**
+`api get <runpod|runpod-v1|runpod-v2|vast|hetzner|shadeform> <path> [--raw | --limits]` — **read-only**
 passthrough for what no command covers (`pods/<id>`, `catalog/datacenters`, `network-volumes`,
 `billing/pods`; Vast `users/current/`; Hetzner `locations`; Shadeform `instances/types`, its key in
 `X-API-KEY`; `sshkeys` there refuses `--raw`): one GET (there is no other verb) with the configured
@@ -1800,6 +1839,12 @@ version (`v1/…` against v2) is refused, naming `runpod-v1`.
 Secrets are redacted (env values, key/token/password fields, `rpa_`/`sk-`/`hf_` tokens, SSH key
 material) unless `--raw`; the API key itself is never printed, `--raw` included (scrubbed from the
 body as received, before an error message clips it).
+
+`--limits` prints the rate limits the API reported for that GET instead of the body: the
+`RateLimit-Policy` and `RateLimit` headers as received (a partition key `pk` blanked), each window
+as it stands (`minute: 47 of 60 left, resets in 12 s`), any hold, and the requests this process
+sent. Counts only. Without the headers it says `no RateLimit headers in its answer: no limit
+reported`. The GET goes through the same rate-limit path as every command.
 
 ## Backups, branches and the archive
 
@@ -1857,10 +1902,20 @@ didn't answer (first, so a narrow terminal can't cut it off), and ending with th
 balances (`arena balance`'s views, observed in the details round — at most one live read per account
 per 5 min — and recorded in the CLI's state file; a low account moves to the front in yellow, a
 critical one in red, with its amount: `‼ runpod $1.20 ≈1.9d`; an unfunded opt-in account with
-nothing billing there stays at the end, `shadeform $0.00 unfunded`). API calls per refresh are
-unchanged (one list per provider); the details query (GPU/$/maintenance) runs every 60 s or on `r`
-(≥10 s apart); one that fails part-way still shows what it filled (as `pods list` does) over the
-last good answer, with a footer warning.
+nothing billing there stays at the end, `shadeform $0.00 unfunded`). API calls per refresh are at
+most one list per provider; the details query (GPU/$/maintenance) runs every 60 s or on `r` (≥10 s
+apart); one that fails part-way still shows what it filled (as `pods list` does) over the last good
+answer, with a footer warning.
+
+**Rate limits.** The footer shows each provider's API requests in the last minute and what its
+quota has left this minute (`RunPod API 13/min · 47/60 left this minute`). A provider call waits at
+most 2 s for a rate limit. A listing that comes back rate-limited keeps that provider's last rows,
+and the dashboard stops listing for the API's own wait (else 5 s, doubling to 5 min). The SSH
+probes keep the refresh cadence, and the footer says `⚠ RunPod rate limit: listing again in 12 s`.
+`r` doesn't list through that wait, and the details query waits too. When a window's quota is low
+(a quarter or less left, or 10 when the quota isn't reported), listings are spread to half of
+what's left over the time to its reset (`⚠ RunPod quota low (minute window): listing every 10 s`);
+`r` lists anyway.
 
 ### Deep checks and marked sets
 

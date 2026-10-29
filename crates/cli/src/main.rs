@@ -528,6 +528,9 @@ enum ApiCmd {
         /// Don't redact secrets in the body (the API key itself never prints)
         #[arg(long)]
         raw: bool,
+        /// Print the API's rate limits for this request instead of the body
+        #[arg(long, conflicts_with = "raw")]
+        limits: bool,
     },
 }
 
@@ -3047,7 +3050,7 @@ async fn run() -> Result<()> {
 async fn handle_api(cmd: ApiCmd, cfg: &Config) -> Result<()> {
     use arena_core::apiget;
     match cmd {
-        ApiCmd::Get { provider, path, raw } => {
+        ApiCmd::Get { provider, path, raw, limits } => {
             let base = apiget::api_base(&provider, cfg)?;
             let url = apiget::resolve_url(base.url, &path)?;
             apiget::refuse_raw(&base, &path, raw)?;
@@ -3056,7 +3059,15 @@ async fn handle_api(cmd: ApiCmd, cfg: &Config) -> Result<()> {
                 .filter(|k| !k.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("{} isn't set (see `arena config check`)", base.key))?;
             eprintln!("GET {url} ({}{})", base.provider, if raw { ", raw" } else { ", secrets redacted" });
-            let (status, body) = apiget::get_for(&base, url, key).await?;
+            let (status, body) = apiget::get_for(&base, url.clone(), key).await?;
+            if limits {
+                // Counts only — the headers carry no secret, and the body isn't printed.
+                println!("GET {} → HTTP {status}", url.path());
+                for line in apiget::limits_report(&url) {
+                    println!("{}", apiget::scrub(&line, key));
+                }
+                return Ok(());
+            }
             let out = apiget::render_for(&base, status, &body, raw, key)?;
             if !out.is_empty() {
                 println!("{out}");
@@ -18398,7 +18409,7 @@ mod tests {
         for text in ["RUNPOD_API=v1", "RUNPOD_API=\"V1\""] {
             let row = runpod_api_row(&Config::parse(text));
             let want = format!(
-                "  ⚠ {key} v1 (rest.runpod.io/v1) — RunPod retires REST v1 on 2026-11-15; remove RUNPOD_API=v1 (v2 is the default)"
+                "  ⚠ {key} v1 (rest.runpod.io/v1) — RunPod retires REST v1 on 2026-11-16; remove RUNPOD_API=v1 (v2 is the default)"
             );
             assert_eq!(row, (want, true), "{text:?}: a warning, not a failure");
         }
@@ -18426,7 +18437,7 @@ mod tests {
         let (report, missing) = config_report(&Config::parse(&format!("{base}RUNPOD_API=v1\n")), "runpod");
         assert!(
             row(&report).starts_with("⚠ RUNPOD_API")
-                && row(&report).ends_with(" v1 (rest.runpod.io/v1) — RunPod retires REST v1 on 2026-11-15; remove RUNPOD_API=v1 (v2 is the default)"),
+                && row(&report).ends_with(" v1 (rest.runpod.io/v1) — RunPod retires REST v1 on 2026-11-16; remove RUNPOD_API=v1 (v2 is the default)"),
             "{report}"
         );
         assert!(report.contains("✗ host CUDA") && report.contains("can't ask for it"), "{report}");
@@ -28065,7 +28076,7 @@ mod lifecycle_tests {
 
     /// Live R (2026-10-09): a RunPod v1 restart kept the container disk (marker files and
     /// `/.dockerenv` survived), while the output said "the restart reset them to the image".
-    /// v1 stays gated (cheap safety; v1 retires 2026-11-15) and is set up again in case — but
+    /// v1 stays gated (cheap safety; v1 retires 2026-11-16) and is set up again in case — but
     /// nothing says a reset happened. v2's restart, which does reset, still says so.
     #[tokio::test]
     async fn a_restart_not_known_to_reset_is_gated_and_set_up_again_but_never_said_to_reset() {
@@ -29946,7 +29957,7 @@ mod passthrough_tests {
     /// an unknown provider and a missing key are refused, and the flags parse.
     #[tokio::test]
     async fn api_get_refuses_before_any_request() {
-        let get = |provider: &str, path: &str| ApiCmd::Get { provider: provider.into(), path: path.into(), raw: false };
+        let get = |provider: &str, path: &str| ApiCmd::Get { provider: provider.into(), path: path.into(), raw: false, limits: false };
         let no_key = cfg("");
         // (provider, path, the error)
         for (provider, path, want) in [
@@ -29964,9 +29975,16 @@ mod passthrough_tests {
         let e = handle_api(get("runpod", "http://api.runpod.io/v2/pods"), &with_key).await.unwrap_err().to_string();
         assert!(e.contains("absolute URLs are refused") && !e.contains("rpa_"), "{e}");
         match Cli::try_parse_from(["arena", "api", "get", "runpod-v2", "pods?limit=5", "--raw"]).unwrap().cmd {
-            Cmd::Api(ApiCmd::Get { provider, path, raw }) => assert_eq!((provider.as_str(), path.as_str(), raw), ("runpod-v2", "pods?limit=5", true)),
+            Cmd::Api(ApiCmd::Get { provider, path, raw, limits }) => {
+                assert_eq!((provider.as_str(), path.as_str(), raw, limits), ("runpod-v2", "pods?limit=5", true, false))
+            }
             _ => panic!("not api get"),
         }
+        match Cli::try_parse_from(["arena", "api", "get", "runpod", "pods", "--limits"]).unwrap().cmd {
+            Cmd::Api(ApiCmd::Get { raw, limits, .. }) => assert_eq!((raw, limits), (false, true)),
+            _ => panic!("not api get"),
+        }
+        assert!(Cli::try_parse_from(["arena", "api", "get", "runpod", "pods", "--limits", "--raw"]).is_err(), "--limits prints no body");
         // GET is the only verb: there is nothing else to parse.
         assert!(Cli::try_parse_from(["arena", "api", "post", "runpod", "pods"]).is_err());
         assert!(Cli::try_parse_from(["arena", "api", "get", "runpod", "pods", "--method", "DELETE"]).is_err());

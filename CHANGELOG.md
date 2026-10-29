@@ -14,6 +14,28 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-28 · RunPod's rate limits are respected, and REST v1 ends on 2026-11-16
+- RunPod limits every API since 2026-10-27, per key, shared by every dashboard and cron on it.
+  arena now waits out a `429` (what RunPod asks, else 1, 2, 4… s) and retries it up to 3 times,
+  and holds back its own requests while a window has 1 request or none left. A command that
+  can't wait that long fails at once with the wait: `list pods: not sent — RunPod REST v2 rate
+  limit (the minute window is spent): next request in 12 s`.
+- RunPod reads (listing, pod details, catalog, billing) are sent again after a 5xx or a dropped
+  connection. A create, stop or terminate never is.
+- The dashboard's footer shows RunPod's request rate and what's left this minute (`RunPod API
+  13/min · 47/60 left this minute`). When RunPod refuses a listing, the dashboard keeps the last
+  rows, keeps probing the pods over SSH, and lists again after RunPod's wait (`⚠ RunPod rate
+  limit: listing again in 12 s`). When the quota runs low, it lists less often.
+- `arena api get runpod pods --limits` prints RunPod's quota (each window's limit, what's left,
+  when it resets) instead of the body.
+- Vast's throttled listing is waited out the same way (it used to be retried only when Vast asked
+  for 2 s or less).
+- REST v1 (`RUNPOD_API=v1`) ends on **2026-11-16**, a day later than we said. After that a v1
+  request gets an error saying v1 is gone and to remove `RUNPOD_API=v1`.
+
+### Action needed
+- If your config still has `RUNPOD_API=v1`, remove it before 2026-11-16 (v2 is the default).
+
 ## 2026-10-28 · `offers` shows every provider, Hetzner too; `--help` lists commands in groups
 - `arena offers` is one table over every provider with a key in the config (RunPod, Vast,
   Hetzner): each row is an option `pods up` would try there, `#` the order it would try them in,

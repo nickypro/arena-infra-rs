@@ -1441,7 +1441,9 @@ mod tests {
         let opts = || HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=arena9\nHETZNER_LOCATION=nbg1\n"));
         for (status, kind) in [(401, K::Auth), (429, K::RateLimited), (503, K::Transient)] {
             let srv = serve(vec![canned(status, "application/json", r#"{"error":{"code":"x","message":"no"}}"#)]);
-            let e = provider(&srv.base, opts()).create_pod(&spec("arena9-a", None)).await.unwrap_err();
+            // No time to wait out a throttle here: the 429 is the caller's at once.
+            let (p, sp) = (provider(&srv.base, opts()), spec("arena9-a", None));
+            let e = crate::ratelimit::waits_within(std::time::Duration::ZERO, p.create_pod(&sp)).await.unwrap_err();
             assert_eq!(e.kind(), Some(kind), "{e}");
             assert_eq!(srv.requests.lock().unwrap().len(), 1, "{status}: nothing looked up");
         }
@@ -1833,7 +1835,9 @@ mod tests {
         let opts = || HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\n"));
         for (status, kind) in [(401, K::Auth), (429, K::RateLimited), (503, K::Transient)] {
             let srv = serve(vec![canned(200, "application/json", SERVER_TYPES), canned(status, "application/json", r#"{"error":{"code":"x","message":"no"}}"#)]);
-            let e = provider(&srv.base, opts()).create_pod(&spec("devtest-a", None)).await.unwrap_err();
+            // No time to wait out a throttle here: the 429 is the caller's at once.
+            let (p, sp) = (provider(&srv.base, opts()), spec("devtest-a", None));
+            let e = crate::ratelimit::waits_within(std::time::Duration::ZERO, p.create_pod(&sp)).await.unwrap_err();
             assert_eq!(e.kind(), Some(kind), "{e}");
             assert_eq!(sent_locations(&srv), [Some("nbg1".into())], "{status}: one create");
         }

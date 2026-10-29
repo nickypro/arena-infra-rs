@@ -56,7 +56,7 @@ use crate::apiextra::{self, managed, Extra, Managed};
 use crate::config::Config;
 use crate::error::{Error, ProviderErrorKind, Result};
 use crate::fleet::fmt_money;
-use crate::http::{send_json, send_json_retrying_429, send_ok, status_error};
+use crate::http::{send_json, send_ok, status_error};
 use crate::placement::{milli, PriceBook};
 use crate::pod::{Pod, PodSpec};
 use crate::retry::{retrying, RetryPolicy};
@@ -103,10 +103,6 @@ const KEY_ATTACH_BUDGET: Duration = Duration::from_secs(60);
 /// harmless) instead of waited on. Never on the rent: there a timeout would leave unknown
 /// whether the offer was rented.
 const ATTACH_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// The longest wait for the one retry of a throttled listing: Vast's `retry_after` above this
-/// isn't waited for (well inside the listing's bound, `provider::LIST_TIMEOUT`).
-const LIST_429_WAIT: Duration = Duration::from_secs(2);
 
 pub struct VastProvider {
     api_key: String,
@@ -844,12 +840,12 @@ impl Provider for VastProvider {
         )
     }
 
-    /// A throttled listing (429) is retried once, after what Vast asks for when that is at
-    /// most [`LIST_429_WAIT`] ([`crate::http::send_json_retrying_429`]) — live, one 429 made
-    /// an idle Vast account read `unknown`.
+    /// A throttled listing (429) is waited out and retried by the shared request path
+    /// ([`crate::http::exchange`]: Vast's own `retry_after`, within the caller's bound — a
+    /// dashboard's is short) — live, one 429 made an idle Vast account read `unknown`.
     async fn list_pods(&self) -> Result<Vec<Pod>> {
         let url = format!("{}/instances/", self.base);
-        let body = send_json_retrying_429(|| self.auth(self.client.get(&url)), "vast list", LIST_429_WAIT).await?;
+        let body = send_json(self.auth(self.client.get(&url)), "vast list").await?;
         Ok(instances_array(&body)?.iter().map(parse_instance).collect())
     }
 
@@ -1039,26 +1035,26 @@ mod tests {
     /// body". Against a loopback server, through the real request path.
     #[tokio::test]
     async fn error_statuses_are_classified_before_decoding() {
-        let srv = serve(vec![
-            canned(401, "text/html", "<html>401 Unauthorized</html>"),
-            canned(429, "text/plain", "Too Many Requests"),
-            canned(403, "text/plain", "Forbidden"),
-        ]);
+        let srv = serve(vec![canned(401, "text/html", "<html>401 Unauthorized</html>"), canned(403, "text/plain", "Forbidden")]);
         let p = provider(&srv.base);
         let e = p.list_pods().await.unwrap_err();
         assert_eq!(e.kind(), Some(K::Auth), "{e}");
         assert!(e.to_string().contains("vast list HTTP 401"), "{e}");
-        let e = p.cheapest_offer(&spec("NVIDIA RTX A4000", 1, 50)).await.unwrap_err();
-        assert_eq!(e.kind(), Some(K::RateLimited), "the offer search: {e}");
         let e = p.terminate_pod("7").await.unwrap_err();
         assert_eq!(e.kind(), Some(K::Auth), "{e}");
+        // A 429 its caller can't wait out (no time to spare here): rate-limited, at once.
+        let srv = serve(vec![canned(429, "text/plain", "Too Many Requests")]);
+        let search = provider(&srv.base);
+        let e = crate::ratelimit::waits_within(Duration::ZERO, search.cheapest_offer(&spec("NVIDIA RTX A4000", 1, 50))).await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::RateLimited), "the offer search: {e}");
     }
 
-    /// Live: one 429 on the listing made an idle Vast account read `unknown`. A 429 that asks
-    /// for at most two seconds (or nothing) is retried once; Vast's own `retry_after: 12` isn't
-    /// waited for.
+    /// Live: one 429 on the listing made an idle Vast account read `unknown`. A 429 is waited
+    /// out — Vast's own `retry_after` — and retried ([`crate::http::exchange`]); one asking for
+    /// longer than the caller can wait (a dashboard's 2 s against Vast's live `retry_after:
+    /// 12`) isn't, and says how long.
     #[tokio::test]
-    async fn a_throttled_listing_is_retried_once() {
+    async fn a_throttled_listing_is_waited_out_within_the_callers_bound() {
         let srv = serve(vec![
             canned(429, "application/json", r#"{"detail": "API requests too frequent", "retry_after": 0}"#),
             canned(200, "application/json", r#"{"instances": [{"id": 7, "label": "devtest-apple", "actual_status": "running"}]}"#),
@@ -1069,8 +1065,9 @@ mod tests {
             canned(429, "application/json", r#"{"detail": "API requests too frequent", "limit": 3.0, "retry_after": 12}"#),
             canned(200, "application/json", r#"{"instances": []}"#),
         ]);
-        let e = provider(&srv.base).list_pods().await.unwrap_err();
+        let e = crate::ratelimit::waits_within(Duration::from_secs(2), provider(&srv.base).list_pods()).await.unwrap_err();
         assert_eq!((e.kind(), srv.requests.lock().unwrap().len()), (Some(K::RateLimited), 1), "{e}");
+        assert!(e.to_string().contains("next request in 12 s"), "{e}");
     }
 
     #[test]
