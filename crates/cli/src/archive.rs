@@ -3956,7 +3956,8 @@ mod tests {
 
     /// W7 live (A-ckl9): with no key file and no token, copy-keys still writes each pod's archive
     /// access — the block and pin in its one exec (no key exported), the read key by scp — and
-    /// its dry run lists the pod; "no keys to copy" is an error only with no archive either.
+    /// its dry run lists the pod. With no archive either, it writes the fleet's ssh alone (every
+    /// machine's keys, so a key added since — the admin key — reaches machines that exist).
     #[tokio::test]
     async fn copy_keys_without_any_key_still_writes_the_archive_access() {
         let w = world("copykeys-nokeys");
@@ -3964,9 +3965,14 @@ mod tests {
         let sel = crate::Selected { pods: vec![pod("devtest-alpha")], named: true };
         let keys_dir = w.dir.join("keys").display().to_string();
         let fake = Arc::new(FakeRemote::new());
-        let e = crate::handle_copy_keys(fake.clone(), &cfg, &keys_dir, None, None, &sel, false, true).await.unwrap_err();
-        assert!(e.to_string().contains("no keys to copy"), "{e}");
-        assert!(fake.calls().is_empty());
+        crate::handle_copy_keys(fake.clone(), &cfg, &keys_dir, None, None, &sel, false, true).await.unwrap();
+        let calls = fake.calls();
+        assert!(
+            matches!(&calls[..], [RemoteCall::Exec { cmd, .. }]
+                if cmd.contains("# BEGIN arena-infra fleet") && !cmd.contains("arena-archive") && !cmd.contains("export ")),
+            "the fleet's ssh alone: {calls:#?}"
+        );
+        let fake = Arc::new(FakeRemote::new());
         w.up().await.unwrap();
         std::fs::write(w.env().paths.known_hosts(), "203.0.113.102 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHostHostHostHostHostHostHostHostHostHos5\n").unwrap();
         crate::handle_copy_keys(fake.clone(), &cfg, &keys_dir, None, None, &sel, true, true).await.unwrap();

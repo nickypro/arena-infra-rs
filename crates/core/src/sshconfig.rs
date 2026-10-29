@@ -18,11 +18,17 @@
 //! every pod change, behind a first line ([`MANAGED_HEADER`]) that marks it as arena's — a file
 //! without it is never overwritten — and `~/.ssh/config` pulls it in with one `Include` line
 //! ([`include_at`], [`with_include_first`], [`without_include`]).
+//!
+//! Staff get a file of their own on the proxy box ([`Audience::Admin`]: `SSH_ADMIN_CONFIG_FILE`,
+//! `arena ssh-config --admin --install`): every machine at its live endpoint with the admin key
+//! ([`render_admin`]), which only that box holds — kept current the same way, under its own first
+//! line, so neither sync ever rewrites the other's file.
 
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::pod::Pod;
+use crate::selector::Naming;
 
 /// The wildcard `Host <prefix>-*` header shared by every machine: the SSH user, the
 /// shared identity file, and lax host-key checking (pod host keys churn as pods are
@@ -91,6 +97,45 @@ pub fn render_proxy(
     out
 }
 
+/// Staff's ssh config on the proxy box (`ssh-config --admin`): a self-contained `Host` block for
+/// every machine — this cohort's pods and the `@` staff boxes ([`Naming::is_cohort`],
+/// [`Naming::is_staff`]), named as `pods list` names them — at its live endpoint: never a proxy
+/// port (the file is used on the proxy box itself), so a staff box is reached the same way. Each
+/// offers the admin key alone (`identity`; `IdentitiesOnly`, so no agent key or participant key
+/// is tried first and spends sshd's MaxAuthTries). A machine without an endpoint yet (starting,
+/// stopped) is left out, as in [`render_manual`]; another prefix's pod or a pod the provider named
+/// is no machine of this fleet's. Sorted by name; a name listed twice (a pod mid-replace) gets
+/// the first block. Pure.
+pub fn render_admin(user: &str, identity: &str, naming: &Naming, pods: &[Pod]) -> String {
+    let mut rows: Vec<(&str, &str, u16)> = pods
+        .iter()
+        .filter(|p| naming.is_cohort(&p.name) || naming.is_staff(&p.name))
+        .filter_map(|p| match (p.ssh_ip.as_deref().map(str::trim), p.ssh_port) {
+            (Some(ip), Some(port)) if !ip.is_empty() => Some((p.name.as_str(), ip, port)),
+            _ => None,
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+    rows.dedup_by(|b, a| a.0 == b.0);
+    let mut out = String::from("# Every machine at its live endpoint, with the admin key (for staff on the proxy box)\n");
+    for (name, ip, port) in rows {
+        out.push_str(&format!(
+            "\nHost {name}\n    HostName {ip}\n    Port {port}\n    User {user}\n    IdentityFile {identity}\n    \
+             IdentitiesOnly yes\n    UserKnownHostsFile=/dev/null\n    StrictHostKeyChecking=no\n"
+        ));
+    }
+    out
+}
+
+/// [`render_admin`] from config: `SSH_USER`, and the admin key as this user reaches it
+/// ([`crate::ssh::admin_key`]) — the file is for use on this box. `Err` when `ADMIN_SSH_KEY_PATH`
+/// isn't set: there's no key for the file to name.
+pub fn render_admin_for(cfg: &Config, pods: &[Pod]) -> Result<String, String> {
+    let identity = crate::ssh::admin_key(cfg)
+        .ok_or_else(|| format!("{} isn't set — staff's config names the admin key", crate::ssh::ADMIN_KEY_VAR))?;
+    Ok(render_admin(cfg.get("SSH_USER").unwrap_or("root"), &identity, &Naming::from_config(cfg), pods))
+}
+
 /// One `Host` block for the backup archive (`arena archive`): its own alias (`archive-<prefix>`,
 /// which no fleet wildcard matches), the read-only `backups` user, ONE identity
 /// (`IdentitiesOnly`, so an agent's or default key is never offered), and a host-key policy:
@@ -116,16 +161,104 @@ pub fn render_archive_block(alias: &str, host: &str, user: &str, identity: &str,
 /// `—`, so a later wording still counts) is someone's own, and a sync never overwrites it.
 pub const MANAGED_HEADER: &str = "# managed by arena (`arena ssh-config`) — rewritten when pods change; edits here are lost";
 
+/// [`MANAGED_HEADER`] for staff's file (`SSH_ADMIN_CONFIG_FILE`, `ssh-config --admin --install`).
+/// A mark of its own: neither sync ever takes the other's file for its own.
+pub const ADMIN_MANAGED_HEADER: &str =
+    "# managed by arena (`arena ssh-config --admin`) — staff's: the admin key, every machine; rewritten when pods change; edits here are lost";
+
+/// Which file arena keeps current: the participants' config (`SSH_CONFIG_FILE`), or staff's on
+/// the proxy box (`SSH_ADMIN_CONFIG_FILE`: every machine with the admin key, [`render_admin`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Audience {
+    Participants,
+    Admin,
+}
+
+impl Audience {
+    /// The config key naming the file.
+    pub fn key(self) -> &'static str {
+        match self {
+            Audience::Participants => "SSH_CONFIG_FILE",
+            Audience::Admin => "SSH_ADMIN_CONFIG_FILE",
+        }
+    }
+
+    /// Where `--install` writes it when neither a PATH nor [`Self::key`] says.
+    pub fn default_path(self) -> &'static str {
+        match self {
+            Audience::Participants => "~/.ssh/arena.conf",
+            Audience::Admin => "~/.ssh/arena-admin.conf",
+        }
+    }
+
+    /// The file's first line: [`MANAGED_HEADER`] or [`ADMIN_MANAGED_HEADER`].
+    pub fn header(self) -> &'static str {
+        match self {
+            Audience::Participants => MANAGED_HEADER,
+            Audience::Admin => ADMIN_MANAGED_HEADER,
+        }
+    }
+
+    /// The command that writes it: `arena ssh-config`, `arena ssh-config --admin`.
+    pub fn command(self) -> &'static str {
+        match self {
+            Audience::Participants => "arena ssh-config",
+            Audience::Admin => "arena ssh-config --admin",
+        }
+    }
+
+    /// The header up to its first `—`: what marks a file as this audience's.
+    fn mark(self) -> &'static str {
+        let h = self.header();
+        h.split(" — ").next().unwrap_or(h)
+    }
+
+    /// The managed file's whole text for `rendered`: the header first.
+    pub fn text(self, rendered: &str) -> String {
+        format!("{}\n{rendered}", self.header())
+    }
+
+    /// Whether `existing` is this audience's file to rewrite: its first line is the header (any
+    /// wording after its `—`), or it holds nothing but whitespace. The other audience's file is
+    /// not. Pure.
+    pub fn owns(self, existing: &str) -> bool {
+        let mark = self.mark();
+        existing.trim().is_empty() || existing.lines().next().is_some_and(|l| l.trim_end() == mark || l.starts_with(&format!("{mark} ")))
+    }
+
+    /// What a sync does with this audience's file, given what's there (`None`: no file yet). Pure.
+    pub fn plan(self, existing: Option<&str>, want: &str) -> FilePlan {
+        match existing {
+            None => FilePlan::Write,
+            Some(t) if t == want => FilePlan::Unchanged,
+            Some(t) if self.owns(t) => FilePlan::Write,
+            Some(_) => FilePlan::NotOurs,
+        }
+    }
+
+    /// [`Self::key`]'s path, a leading `~/` expanded against `home` ([`managed_path`]).
+    pub fn path(self, cfg: &Config, home: Option<&str>) -> Option<Result<PathBuf, String>> {
+        let key = self.key();
+        let v = cfg.get(key).map(str::trim).filter(|v| !v.is_empty())?;
+        Some(expand_home(v, home).and_then(|p| {
+            if p.is_absolute() {
+                Ok(p)
+            } else {
+                Err(format!("{key} must be an absolute path or start with ~/ (got {v})"))
+            }
+        }))
+    }
+}
+
 /// The managed file's whole text for `rendered` (what `ssh-config` prints): the header first.
 pub fn managed_text(rendered: &str) -> String {
-    format!("{MANAGED_HEADER}\n{rendered}")
+    Audience::Participants.text(rendered)
 }
 
 /// Whether `existing` is a file arena may rewrite: its first line is [`MANAGED_HEADER`] (any
 /// wording after its `—`), or it holds nothing but whitespace — nobody's work is in it. Pure.
 pub fn is_managed(existing: &str) -> bool {
-    let mark = MANAGED_HEADER.split(" — ").next().unwrap_or(MANAGED_HEADER);
-    existing.trim().is_empty() || existing.lines().next().is_some_and(|l| l.trim_end() == mark || l.starts_with(&format!("{mark} ")))
+    Audience::Participants.owns(existing)
 }
 
 /// What a sync does with the managed file, given what's there (`None`: no file yet). Pure.
@@ -140,12 +273,7 @@ pub enum FilePlan {
 }
 
 pub fn file_plan(existing: Option<&str>, want: &str) -> FilePlan {
-    match existing {
-        None => FilePlan::Write,
-        Some(t) if t == want => FilePlan::Unchanged,
-        Some(t) if is_managed(t) => FilePlan::Write,
-        Some(_) => FilePlan::NotOurs,
-    }
+    Audience::Participants.plan(existing, want)
 }
 
 /// The participants' config this fleet's managed file holds: the proxy's stable ports when
@@ -175,14 +303,7 @@ pub fn uses_proxy(cfg: &Config) -> bool {
 /// `Err` for a relative path (a cron job and a shell would resolve it to different files) or a
 /// `~/` with no home to expand it against.
 pub fn managed_path(cfg: &Config, home: Option<&str>) -> Option<Result<PathBuf, String>> {
-    let v = cfg.get("SSH_CONFIG_FILE").map(str::trim).filter(|v| !v.is_empty())?;
-    Some(expand_home(v, home).and_then(|p| {
-        if p.is_absolute() {
-            Ok(p)
-        } else {
-            Err(format!("SSH_CONFIG_FILE must be an absolute path or start with ~/ (got {v})"))
-        }
-    }))
+    Audience::Participants.path(cfg, home)
 }
 
 /// `p` with a leading `~/` (or a lone `~`) taken as `home`.
@@ -200,6 +321,12 @@ pub fn expand_home(p: &str, home: Option<&str>) -> Result<PathBuf, String> {
 /// differs, and never over a file that isn't arena's ([`file_plan`]), a symlink or anything but
 /// a regular file. `Ok(true)` = written.
 pub fn sync_file(path: &Path, want: &str) -> Result<bool, String> {
+    sync_file_as(Audience::Participants, path, want)
+}
+
+/// [`sync_file`] for `audience`'s file: never over a file that isn't that audience's — the other
+/// one's included.
+pub fn sync_file_as(audience: Audience, path: &Path, want: &str) -> Result<bool, String> {
     let shown = path.display();
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => return Err(format!("{shown} is a symlink — left as it is")),
@@ -211,12 +338,12 @@ pub fn sync_file(path: &Path, want: &str) -> Result<bool, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("reading {shown}: {e}")),
     };
-    match file_plan(existing.as_deref(), want) {
+    match audience.plan(existing.as_deref(), want) {
         FilePlan::Unchanged => Ok(false),
         FilePlan::NotOurs => Err(format!(
-            "{shown} isn't arena's (its first line isn't `{}`) — left as it is; `arena ssh-config --install` replaces it after \
-             asking",
-            MANAGED_HEADER.split(" — ").next().unwrap_or(MANAGED_HEADER)
+            "{shown} isn't arena's (its first line isn't `{}`) — left as it is; `{} --install` replaces it after asking",
+            audience.mark(),
+            audience.command()
         )),
         FilePlan::Write => write_atomic(path, want, 0o600).map(|()| true),
     }
@@ -298,6 +425,54 @@ pub fn sync_for(cfg: &Config, pods: &[Pod], home: Option<&str>) -> Option<Result
         Err(e) => return Some(Err(format!("{}: {e}", path.display()))),
     };
     Some(sync_file(&path, &want).map(|written| Synced { path, written }))
+}
+
+/// Keep `SSH_ADMIN_CONFIG_FILE` current from `pods` (a COMPLETE listing, as for [`sync_for`]):
+/// staff's file on the proxy box ([`render_admin`]). `None` when the key is unset — and when this
+/// user can't read the admin key: the file is of use only to someone who can, so for anyone else
+/// there's nothing to keep current (`config check` says the key is unreadable). `Some(Err)`: why
+/// it wasn't written — a bad path, the same file as `SSH_CONFIG_FILE` (each sync would refuse the
+/// other's), `ADMIN_SSH_KEY_PATH` unset, a file that isn't staff's, a failed write.
+pub fn sync_admin_for(cfg: &Config, pods: &[Pod], home: Option<&str>) -> Option<Result<Synced, String>> {
+    let path = match Audience::Admin.path(cfg, home)? {
+        Ok(p) => p,
+        Err(e) => return Some(Err(e)),
+    };
+    if let Some(Ok(theirs)) = managed_path(cfg, home) {
+        if theirs == path {
+            return Some(Err(format!(
+                "{} is SSH_CONFIG_FILE's file too — give SSH_ADMIN_CONFIG_FILE a path of its own",
+                path.display()
+            )));
+        }
+    }
+    match crate::ssh::admin_key(cfg) {
+        Some(k) if std::fs::File::open(&k).is_err() => return None,
+        _ => {}
+    }
+    let want = match render_admin_for(cfg, pods) {
+        Ok(r) => Audience::Admin.text(&r),
+        Err(e) => return Some(Err(format!("{}: {e}", path.display()))),
+    };
+    Some(sync_file_as(Audience::Admin, &path, &want).map(|written| Synced { path, written }))
+}
+
+/// Both files arena keeps current ([`sync_for`], [`sync_admin_for`]) from one COMPLETE listing:
+/// each one that's on, in that order.
+pub fn sync_all(cfg: &Config, pods: &[Pod], home: Option<&str>) -> Vec<Result<Synced, String>> {
+    [sync_for(cfg, pods, home), sync_admin_for(cfg, pods, home)].into_iter().flatten().collect()
+}
+
+/// Whether a sync ([`sync_all`]) has anything to do: a key is set.
+pub fn any_on(cfg: &Config, home: Option<&str>) -> bool {
+    managed_path(cfg, home).is_some() || Audience::Admin.path(cfg, home).is_some()
+}
+
+/// Whether a sync needs the pods listed: the participants' file without a proxy (each pod's own
+/// endpoint), or staff's (always the live endpoints). The participants' proxy layout alone needs
+/// none.
+pub fn needs_listing(cfg: &Config, home: Option<&str>) -> bool {
+    (managed_path(cfg, home).is_some() && !uses_proxy(cfg)) || Audience::Admin.path(cfg, home).is_some()
 }
 
 /// Where a `~/.ssh/config` pulls in arena's file (`Include <path>`, any of `forms` — the `~/`
@@ -621,6 +796,125 @@ mod tests {
         assert_eq!(sync_for(&Config::parse("MACHINE_NAME_PREFIX=devtest\n"), &pods, Some("/home/u")), None);
         let bad = Config::parse("MACHINE_NAME_PREFIX=devtest\nSSH_CONFIG_FILE=arena.conf\n");
         assert!(sync_for(&bad, &pods, Some("/home/u")).unwrap().unwrap_err().contains("absolute path"));
+    }
+
+    /// Staff's config (`ssh-config --admin`): every machine of this fleet — cohort pods (a parked
+    /// `-old` twin too) and `@` staff boxes — at its live endpoint, each block self-contained
+    /// with the admin key alone; nothing else on the account, no machine without an endpoint, a
+    /// name twice once (the first listed); sorted; never a proxy port.
+    #[test]
+    fn the_admin_config_has_every_machine_at_its_endpoint_with_the_admin_key_alone() {
+        let list = ["apple", "bloom", "cloud", "@james-gpu", "@lab"].map(String::from).to_vec();
+        let naming = Naming { prefix: "arena9", list: &list };
+        let pods = vec![
+            pod("arena9-bloom", Some("2.2.2.2"), Some(22002)),
+            pod("james-gpu", Some("5.5.5.5"), Some(22)),
+            pod("arena9-apple", Some("1.1.1.1"), Some(22001)),
+            pod("arena9-apple", Some("9.9.9.9"), Some(22009)), // the same name again: the first wins
+            pod("arena9-cloud", None, None),                    // starting: no endpoint
+            pod("lab", Some(" "), Some(22)),                    // a blank address is none
+            pod("arena9-apple-old", Some("3.3.3.3"), Some(22003)),
+            pod("arena8-zebra", Some("4.4.4.4"), Some(22004)), // another cohort's
+            pod("registered_pink_prawn", Some("6.6.6.6"), Some(22)), // a pod the provider named
+        ];
+        let got = render_admin("root", "/root/.ssh/arena_admin_key", &naming, &pods);
+        let block = |name: &str, ip: &str, port: u16| {
+            format!(
+                "\nHost {name}\n    HostName {ip}\n    Port {port}\n    User root\n    IdentityFile /root/.ssh/arena_admin_key\n    \
+                 IdentitiesOnly yes\n    UserKnownHostsFile=/dev/null\n    StrictHostKeyChecking=no\n"
+            )
+        };
+        let want = format!(
+            "# Every machine at its live endpoint, with the admin key (for staff on the proxy box)\n{}{}{}{}",
+            block("arena9-apple", "1.1.1.1", 22001),
+            block("arena9-apple-old", "3.3.3.3", 22003),
+            block("arena9-bloom", "2.2.2.2", 22002),
+            block("james-gpu", "5.5.5.5", 22),
+        );
+        assert_eq!(got, want);
+        // From config: SSH_USER, and the admin key as this user reaches it; none set = no file.
+        let cfg = Config::parse("MACHINE_NAME_PREFIX=arena9\nMACHINE_NAME_LIST=(apple bloom cloud @james-gpu @lab)\nSSH_USER=ubuntu\n");
+        assert!(render_admin_for(&cfg, &pods).unwrap_err().contains("ADMIN_SSH_KEY_PATH isn't set"));
+        let cfg = Config::parse(
+            "MACHINE_NAME_PREFIX=arena9\nMACHINE_NAME_LIST=(apple bloom cloud @james-gpu @lab)\nSSH_USER=ubuntu\n\
+             ADMIN_SSH_KEY_PATH=/nonexistent-arena/arena_admin_key\n",
+        );
+        let text = render_admin_for(&cfg, &pods).unwrap();
+        assert!(text.contains("    User ubuntu\n    IdentityFile /nonexistent-arena/arena_admin_key\n"), "{text}");
+        assert_eq!(text.matches("\nHost ").count(), 4, "{text}");
+    }
+
+    /// Each audience's file has its own first line: a sync writes its own (or an empty) file and
+    /// refuses the other's, so the two never overwrite each other.
+    #[test]
+    fn the_participants_and_staff_files_never_take_each_other() {
+        let theirs = managed_text("Host arena9-*\n");
+        let staff = Audience::Admin.text("Host arena9-apple\n");
+        assert!(staff.starts_with("# managed by arena (`arena ssh-config --admin`) — "), "{staff}");
+        assert_eq!(Audience::Admin.plan(Some(&theirs), &staff), FilePlan::NotOurs);
+        assert_eq!(Audience::Participants.plan(Some(&staff), &theirs), FilePlan::NotOurs);
+        assert_eq!(file_plan(Some(&staff), &theirs), FilePlan::NotOurs);
+        assert_eq!(Audience::Admin.plan(Some(&Audience::Admin.text("Host old\n")), &staff), FilePlan::Write);
+        assert_eq!(Audience::Admin.plan(Some("  \n"), &staff), FilePlan::Write);
+        assert_eq!(Audience::Admin.plan(Some(&staff), &staff), FilePlan::Unchanged);
+        assert_eq!(Audience::Admin.plan(None, &staff), FilePlan::Write);
+        let path = |v: &str| Audience::Admin.path(&Config::parse(&format!("SSH_ADMIN_CONFIG_FILE={v}\n")), Some("/root"));
+        assert_eq!(path("~/.ssh/arena-admin.conf"), Some(Ok(PathBuf::from("/root/.ssh/arena-admin.conf"))));
+        assert!(path("admin.conf").unwrap().unwrap_err().starts_with("SSH_ADMIN_CONFIG_FILE must be an absolute path"));
+        assert_eq!(path(""), None);
+    }
+
+    /// `SSH_ADMIN_CONFIG_FILE` kept current: off when unset, and for a user who can't read the
+    /// admin key (the file would be of no use to them); a warning when the key is unset or the
+    /// file is `SSH_CONFIG_FILE`'s too; else written under its own header, 0600, only on a change,
+    /// never over the participants' file — and theirs never over it.
+    #[cfg(unix)]
+    #[test]
+    fn the_staff_file_is_kept_current_only_where_the_admin_key_is_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("arena-sshconfig-admin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let key = base.join("arena_admin_key");
+        std::fs::write(&key, "private").unwrap();
+        let file = base.join("ssh").join("arena-admin.conf");
+        let cfg = |extra: &str| {
+            Config::parse(&format!(
+                "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple @staff)\nSSH_ADMIN_CONFIG_FILE={}\n{extra}",
+                file.display()
+            ))
+        };
+        let pods = vec![pod("devtest-apple", Some("1.1.1.1"), Some(22001)), pod("staff", Some("2.2.2.2"), Some(22))];
+        let with_key = format!("ADMIN_SSH_KEY_PATH={}\n", key.display());
+        assert_eq!(sync_admin_for(&Config::parse("MACHINE_NAME_PREFIX=devtest\n"), &pods, Some("/home/u")), None, "unset: off");
+        assert!(sync_admin_for(&cfg(""), &pods, None).unwrap().unwrap_err().contains("ADMIN_SSH_KEY_PATH isn't set"));
+        let unreadable = format!("ADMIN_SSH_KEY_PATH={}\n", base.join("nope").display());
+        assert_eq!(sync_admin_for(&cfg(&unreadable), &pods, None), None, "not this user's key: nothing to keep current");
+        let same = format!("{with_key}SSH_CONFIG_FILE={}\n", file.display());
+        assert!(sync_admin_for(&cfg(&same), &pods, None).unwrap().unwrap_err().contains("SSH_CONFIG_FILE's file too"));
+        assert!(!file.exists());
+        // Written, then current.
+        let c = cfg(&with_key);
+        assert_eq!(sync_admin_for(&c, &pods, None), Some(Ok(Synced { path: file.clone(), written: true })));
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with(ADMIN_MANAGED_HEADER) && text.contains("Host staff\n    HostName 2.2.2.2\n"), "{text}");
+        assert!(text.contains(&format!("    IdentityFile {}\n    IdentitiesOnly yes\n", key.display())), "{text}");
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(sync_admin_for(&c, &pods, None), Some(Ok(Synced { path: file.clone(), written: false })));
+        assert_eq!(sync_all(&c, &pods, None), [Ok(Synced { path: file.clone(), written: false })], "only staff's is on");
+        // The participants' file at that path is never overwritten by it, nor it by theirs.
+        std::fs::write(&file, managed_text("Host devtest-*\n")).unwrap();
+        assert!(sync_admin_for(&c, &pods, None).unwrap().unwrap_err().contains("--admin --install` replaces it"));
+        std::fs::write(&file, &text).unwrap();
+        let theirs = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nSSH_CONFIG_FILE={}\n", file.display()));
+        assert!(sync_for(&theirs, &pods, None).unwrap().unwrap_err().contains("isn't arena's"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        // Which syncs need the pods listed: staff's always, the participants' proxy layout never.
+        assert!(needs_listing(&c, None) && any_on(&c, None));
+        let proxied = Config::parse("SSH_CONFIG_FILE=/x/arena.conf\nSSH_PROXY_HOST=px.example\n");
+        assert!(!needs_listing(&proxied, None) && any_on(&proxied, None));
+        assert!(!any_on(&Config::parse(""), None));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -118,6 +118,34 @@ impl SetupConfig {
         short_name(&self.prefix, machine_name)
     }
 
+    /// Ensure every machine's keys ([`crate::ssh::authorized_pubkeys`]: the shared key, the deploy
+    /// key and the admin key) are in `~/.ssh/authorized_keys`, so arena, participants and staff
+    /// (from the proxy box, with the admin key) get in with whichever they hold. Each is appended
+    /// only if not already present. Then the on-pod deploy key's public half, re-derived there
+    /// (covers a local deploy-key .pub that differs from what's on the pod) — run after the key
+    /// was copied. Only public halves: nothing here reads a private key but the pod's own deploy
+    /// key. (The provider's account key is injected by the provider.) Part of
+    /// [`Self::remote_command`]; a bare VM runs it as a step of its own ([`provisioning_steps`]).
+    pub fn authorized_keys_command(&self) -> String {
+        let q = shell_quote;
+        let mut ak = String::from(
+            "mkdir -p \"$HOME/.ssh\" && chmod 700 \"$HOME/.ssh\" && \
+             touch \"$HOME/.ssh/authorized_keys\" && chmod 600 \"$HOME/.ssh/authorized_keys\"",
+        );
+        for pk in &self.authorized_pubkeys {
+            let qpk = q(pk);
+            ak.push_str(&format!(
+                " && (grep -qxF {qpk} \"$HOME/.ssh/authorized_keys\" || echo {qpk} >> \"$HOME/.ssh/authorized_keys\")"
+            ));
+        }
+        let key = &self.key_remote;
+        ak.push_str(&format!(
+            " && PUB=$(ssh-keygen -y -f {key} 2>/dev/null) && \
+             (grep -qxF \"$PUB\" \"$HOME/.ssh/authorized_keys\" || echo \"$PUB\" >> \"$HOME/.ssh/authorized_keys\")"
+        ));
+        ak
+    }
+
     /// The on-pod provisioning command, run *after* the key has been scp'd. `force`
     /// mirrors `setup_em.sh --force` (hard-reset onto the default branch).
     pub fn remote_command(&self, machine_name: &str, force: bool) -> String {
@@ -133,27 +161,7 @@ impl SetupConfig {
              chmod 600 \"$HOME/.ssh/config\""
         );
 
-        // Ensure the shared key + deploy key are in authorized_keys (so the tool and
-        // participants can SSH in with whichever they hold). Each is appended only if
-        // not already present. (The provider's account key is injected automatically.)
-        let mut ak = String::from(
-            "touch \"$HOME/.ssh/authorized_keys\" && chmod 600 \"$HOME/.ssh/authorized_keys\"",
-        );
-        for pk in &self.authorized_pubkeys {
-            let qpk = q(pk);
-            ak.push_str(&format!(
-                " && (grep -qxF {qpk} \"$HOME/.ssh/authorized_keys\" || echo {qpk} >> \"$HOME/.ssh/authorized_keys\")"
-            ));
-        }
-        // Also re-derive the on-pod deploy key's public half and add it (covers the case
-        // where the local deploy-key .pub differs from what's on the pod).
-        ak.push_str(&format!(
-            " && PUB=$(ssh-keygen -y -f {key} 2>/dev/null) && \
-             (grep -qxF \"$PUB\" \"$HOME/.ssh/authorized_keys\" || echo \"$PUB\" >> \"$HOME/.ssh/authorized_keys\")"
-        ));
-        let authorized_keys = ak;
-
-        let mut steps = vec!["set -e".to_string(), format!("chmod 600 {}", q(key)), ssh_config, authorized_keys];
+        let mut steps = vec!["set -e".to_string(), format!("chmod 600 {}", q(key)), ssh_config, self.authorized_keys_command()];
         // The relocation onto the volume is its own step, before this one; one whose ssh client
         // timed out can still be copying on the pod — wait for it (bounded) before the update.
         steps.push(crate::volume::relocation_wait_command());
@@ -533,9 +541,10 @@ pub fn is_bare_vm(provider: &str) -> bool {
 /// The ordered provisioning steps for a pod, chosen by provider — pure and unit-tested,
 /// so the runner never has to know what a provider *is*. Adding a backend = add its
 /// steps here; the runner and the dry-run preview stay generic.
-///   - bare-VM ([`bare_vm`]): push the deploy key + the full setup script, then run it —
-///     on a CPU VM (hetzner) as it always was; on a GPU VM (shadeform) in its GPU mode, with
-///     the machine name for `~/.name` (a Shadeform VM's hostname isn't the machine name).
+///   - bare-VM ([`bare_vm`]): push the deploy key, authorize every machine's keys
+///     ([`AUTHORIZE_LABEL`]), push the full setup script, then run it — on a CPU VM (hetzner) as
+///     it always was; on a GPU VM (shadeform) in its GPU mode, with the machine name for
+///     `~/.name` (a Shadeform VM's hostname isn't the machine name).
 ///   - image-based (runpod/vast): push the git deploy key, then the post-image config.
 ///
 /// Image-based pods move the repo onto their volume first (unless `REPO_ON_VOLUME=0`, and when
@@ -623,6 +632,17 @@ pub fn provisioning_steps(
             v
         }
     };
+    // A bare VM's script authorizes no key, and its create authorized only what the provider
+    // was given (Hetzner: the project's cohort key, plus cloud-init's — which `--api-json
+    // user_data` replaces): every machine's keys, right after the deploy key is there to derive
+    // its public half from — before the long script, so a script that fails still leaves the
+    // VM reachable with the deploy and admin keys. (Image-based pods do it in their config step.)
+    if bare_vm(provider).is_some() {
+        steps.insert(
+            1,
+            ProvisionStep::Run { label: AUTHORIZE_LABEL, cmd: scfg.authorized_keys_command(), timeout: timeouts.config },
+        );
+    }
     if let Some(vscode) = &scfg.vscode {
         steps.push(ProvisionStep::Optional {
             label: "vscode warm-up",
@@ -636,6 +656,9 @@ pub fn provisioning_steps(
 
 /// The relocation step's label (what its warnings are prefixed with).
 pub const RELOCATE_LABEL: &str = "repo onto volume";
+
+/// A bare VM's step that authorizes every machine's keys ([`SetupConfig::authorized_keys_command`]).
+pub const AUTHORIZE_LABEL: &str = "authorize keys";
 
 /// How [`provision`] rides out the create-vs-sshd-up boot race: a just-created VM can
 /// report an SSH endpoint before sshd answers (hetzner assigns the IP at create), so a
@@ -1326,6 +1349,11 @@ mod tests {
         }
     }
 
+    /// A bare VM's "authorize keys" step for [`steps_cfg`].
+    fn authorize_step() -> ProvisionStep {
+        ProvisionStep::Run { label: AUTHORIZE_LABEL, cmd: steps_cfg().authorized_keys_command(), timeout: secs(300) }
+    }
+
     fn target(port: u16) -> SshTarget {
         SshTarget {
             user: "root".into(),
@@ -1356,6 +1384,7 @@ mod tests {
             steps,
             vec![
                 ProvisionStep::Scp { label: "copy deploy key", local: "/local/key".into(), remote: "/root/.ssh/id_ed25519".into(), timeout: secs(60) },
+                authorize_step(),
                 ProvisionStep::Scp { label: "copy bare-VM setup script", local: "/tmp/h.sh".into(), remote: "/root/hetzner_setup.sh".into(), timeout: secs(60) },
                 ProvisionStep::Run {
                     label: "GPU VM setup script",
@@ -1369,15 +1398,16 @@ mod tests {
         // No relocation onto a volume (a VM has none), and --timeout sizes this step too.
         assert!(!steps.iter().any(|s| s.label() == RELOCATE_LABEL));
         let t = SetupTimeouts::resolve(None, Some(900)).unwrap();
-        assert_eq!(provisioning_steps("shadeform", &steps_cfg(), "devtest-alpha", false, "/tmp/h.sh", &t)[2].timeout(), secs(900));
+        assert_eq!(provisioning_steps("shadeform", &steps_cfg(), "devtest-alpha", false, "/tmp/h.sh", &t)[3].timeout(), secs(900));
     }
 
     #[test]
     fn provisioning_steps_branch_by_provider() {
         let t = SetupTimeouts::default();
         let scfg = steps_cfg();
-        // bare-VM (hetzner): copy the deploy key, push the script, run it with the repo
-        // URL/key passed in (so it clones the PRIVATE repo over SSH) — on the long budget.
+        // bare-VM (hetzner): copy the deploy key, authorize every machine's keys, push the
+        // script, run it with the repo URL/key passed in (so it clones the PRIVATE repo over
+        // SSH) — on the long budget.
         assert_eq!(
             provisioning_steps("hetzner", &scfg, "arena8-flutter", false, "/tmp/h.sh", &t),
             vec![
@@ -1387,6 +1417,7 @@ mod tests {
                     remote: "/root/.ssh/id_ed25519".into(),
                     timeout: secs(60),
                 },
+                authorize_step(),
                 ProvisionStep::Scp {
                     label: "copy hetzner setup script",
                     local: "/tmp/h.sh".into(),
@@ -1440,6 +1471,33 @@ mod tests {
                 })
                 .collect();
             assert!(runs.iter().any(|c| c.contains(want.as_str())), "{provider}: {runs:?}");
+        }
+    }
+
+    /// Every machine authorizes every machine's keys at setup — the shared key, the deploy key
+    /// and the admin key (only the proxy box holds its private half) — on every provider: image
+    /// pods in their config step, bare VMs (whose script authorizes none, and whose Hetzner create
+    /// only the project's key) in a step of their own before the long script. Public halves only.
+    #[test]
+    fn every_provider_authorizes_every_machines_keys() {
+        let keys = ["ssh-ed25519 AAAAC3NzaSHARED cohort", "ssh-ed25519 AAAAC3NzaDEPLOY deploy", "ssh-ed25519 AAAAC3NzaADMIN arena_admin"];
+        let scfg = SetupConfig { authorized_pubkeys: keys.iter().map(|k| k.to_string()).collect(), ..steps_cfg() };
+        let t = SetupTimeouts::default();
+        for provider in ["runpod", "vast", "hetzner", "shadeform"] {
+            let steps = provisioning_steps(provider, &scfg, "devtest-apple", false, "/tmp/h.sh", &t);
+            let authorize = steps
+                .iter()
+                .position(|s| matches!(s, ProvisionStep::Run { cmd, .. } if keys.iter().all(|k| cmd.contains(&format!("grep -qxF '{k}' \"$HOME/.ssh/authorized_keys\"")))))
+                .unwrap_or_else(|| panic!("{provider}: {steps:?}"));
+            // After the deploy key is copied (its public half is derived from it); on a bare VM
+            // before the script, so a script that fails leaves the VM reachable.
+            if is_bare_vm(provider) {
+                assert_eq!((authorize, steps[authorize].label()), (1, AUTHORIZE_LABEL), "{provider}");
+            } else {
+                assert_eq!(steps[authorize].label(), "repo + keys config", "{provider}");
+            }
+            let ProvisionStep::Run { cmd, .. } = &steps[authorize] else { unreachable!() };
+            assert!(cmd.contains("PUB=$(ssh-keygen -y -f /root/.ssh/id_ed25519"), "{provider}: {cmd}");
         }
     }
 
@@ -1589,10 +1647,11 @@ mod tests {
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert_eq!(out, ProvisionOutcome::done());
         let calls = fake.calls();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert!(matches!(&calls[0], RemoteCall::Copy { local, timeout, .. } if local == "/local/key" && *timeout == Some(secs(60))));
-        assert!(matches!(&calls[1], RemoteCall::Copy { remote, .. } if remote == "/root/hetzner_setup.sh"));
-        assert!(matches!(&calls[2], RemoteCall::Exec { cmd, timeout, .. } if cmd.ends_with("bash /root/hetzner_setup.sh") && *timeout == Some(secs(1800))));
+        assert!(matches!(&calls[1], RemoteCall::Exec { cmd, timeout, .. } if cmd.contains("authorized_keys") && *timeout == Some(secs(300))));
+        assert!(matches!(&calls[2], RemoteCall::Copy { remote, .. } if remote == "/root/hetzner_setup.sh"));
+        assert!(matches!(&calls[3], RemoteCall::Exec { cmd, timeout, .. } if cmd.ends_with("bash /root/hetzner_setup.sh") && *timeout == Some(secs(1800))));
 
         let fake = FakeRemote::new();
         assert_eq!(provision(&fake, &target(22), &image_steps(), BootRetry::default()).await, ProvisionOutcome::done());
@@ -1711,14 +1770,14 @@ mod tests {
         let script = "### 4/6 ARENA repo + Python env\ninstaller: /root/r/install_uv.sh (the repo's own), torch backend cpu\n\
                       arena-installer: install_uv.sh\r\n### done — Python 3.13.16, torch 2.14.1+cpu, installer: install_uv.sh\n";
         let fake = FakeRemote::new();
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(script), FakeReply::ok()]);
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(script), FakeReply::ok()]);
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert_eq!(out, ProvisionOutcome::Done { warnings: vec![], installer: Some("install_uv.sh".into()) });
         assert_eq!(progress_line(1, 1, "devtest-hz1", &out), "[1/1] ✓ devtest-hz1 (installer: install_uv.sh)");
         // With a warning (the warm-up failed): both.
         let fake = FakeRemote::new();
         let again = "arena-installer: install_uv.sh\narena-installer: none (env already present)\n";
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(again), FakeReply::exit(3, "warm-up incomplete: x")]);
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(again), FakeReply::exit(3, "warm-up incomplete: x")]);
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert_eq!(
             progress_line(2, 2, "devtest-hz1", &out),
@@ -1726,7 +1785,7 @@ mod tests {
         );
         // A script that failed: its line isn't read.
         let fake = FakeRemote::new();
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::exit(1, "FAILED: no torch").with_stdout(script)]);
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::exit(1, "FAILED: no torch").with_stdout(script)]);
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert!(!out.is_done() && out.installer().is_none(), "{out:?}");
         // Nothing said (an image-based setup): the line as before.
@@ -1886,7 +1945,7 @@ mod tests {
     fn the_vscode_warm_up_is_the_last_step_everywhere_unless_off() {
         let t = SetupTimeouts::default();
         assert_eq!(t.vscode, secs(300));
-        for (provider, before) in [("runpod", 3), ("vast", 3), ("hetzner", 3)] {
+        for (provider, before) in [("runpod", 3), ("vast", 3), ("hetzner", 4)] {
             let steps = provisioning_steps(provider, &vscode_cfg(), "arena8-apple", false, "/tmp/h.sh", &t);
             assert_eq!(steps.len(), before + 1, "{provider}");
             let ProvisionStep::Optional { label, cmd, summary, timeout } = steps.last().unwrap() else {

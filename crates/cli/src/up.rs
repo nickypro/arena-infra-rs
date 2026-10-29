@@ -1416,14 +1416,14 @@ impl Shared<'_, '_> {
         if listing.all_ok() && !self.stopped() {
             self.refresh_fleet_ssh(&names, &pods).await;
         }
-        // `SSH_CONFIG_FILE` from the same listing: the endpoints as the pods ended up — the
+        // `SSH_CONFIG_FILE` (and staff's `SSH_ADMIN_CONFIG_FILE`) from the same listing: the endpoints as the pods ended up — the
         // pipelines' own syncs are the proxy's only (`proxy_sync_now`, not the lifecycle hook),
         // and a create rarely has an endpoint yet. Never from a listing a backend didn't answer.
         if listing.all_ok() {
             // No home under test: a `~/` value can't reach the developer's own ~/.ssh.
             let home = if cfg!(test) { None } else { std::env::var("HOME").ok() };
-            let synced = arena_core::sshconfig::sync_for(self.run.cfg, &pods, home.as_deref());
-            if let Some(line) = crate::ssh_config_line("up", synced) {
+            let synced = arena_core::sshconfig::sync_all(self.run.cfg, &pods, home.as_deref());
+            for line in crate::ssh_config_lines("up", synced) {
                 say(if line.starts_with("warning:") { To::Err } else { To::Out }, &line);
             }
         }

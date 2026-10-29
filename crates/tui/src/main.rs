@@ -672,17 +672,14 @@ async fn refresh(
             a.last = Some(tokio::time::Instant::now());
         }
     }
-    // `SSH_CONFIG_FILE` kept current, as `pods list` keeps it: from a complete listing only (a
-    // provider that failed would drop its pods' blocks — and a rate-limited one's carried rows
-    // aren't a listing), written only when an endpoint moved; a failure is a status-line
-    // warning, never more.
+    // `SSH_CONFIG_FILE` (and staff's `SSH_ADMIN_CONFIG_FILE`) kept current, as `pods list`
+    // keeps them: from a complete listing only (a provider that failed would drop its pods'
+    // blocks — and a rate-limited one's carried rows aren't a listing), written only when an
+    // endpoint moved; a failure is a status-line warning, never more.
     let ssh_warning = if fresh.errors().is_empty() {
         // No home under test: a `~/` value can't reach the developer's own ~/.ssh.
         let home = if cfg!(test) { None } else { std::env::var("HOME").ok() };
-        match arena_core::sshconfig::sync_for(cfg, &pods, home.as_deref()) {
-            Some(Err(e)) => Some(format!("ssh config not rewritten: {e}")),
-            _ => None,
-        }
+        arena_core::sshconfig::sync_all(cfg, &pods, home.as_deref()).into_iter().find_map(Result::err).map(|e| format!("ssh config not rewritten: {e}"))
     } else {
         None
     };

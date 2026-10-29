@@ -104,6 +104,7 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 | `arena tui` | The live dashboard |
 | `arena proxy apply` | Write the proxy forwards and reload nginx |
 | `arena ssh-config --proxy` | Print the participants' `~/.ssh/config` |
+| `arena ssh-config --admin --install` | On the proxy box: staff reach every machine with the admin key |
 | `arena cron install --pull --proxy` | Backups every 15 min (git + rsync), proxy re-sync every 5 |
 | `arena cron install --health 07:20` | A deep check of every cohort pod each morning, in this box's time zone |
 | `arena pods restore apple` | Push a backup back onto one pod (never deletes) |
@@ -156,7 +157,18 @@ repository's release workflow built it. `arena update --check` only says.
 - a **shared SSH key** for the cohort — the pods authorize it, the participants get it:
   `ssh-keygen -t ed25519 -N "" -C "arena-cohort" -f ~/.ssh/arena_cohort_key`
 - a **deploy key** with write access to the cohort's GitHub repo, which the pods push to (setup
-  and backups need it).
+  and backups need it);
+- optionally, an **admin key** that only the proxy box holds:
+  `ssh-keygen -t ed25519 -N "" -C "arena-admin" -f /root/.ssh/arena_admin_key`.
+
+Every machine — the cohort's pods and the `@` staff boxes — lets in all three. Who holds each
+private half:
+
+| Key (config) | Role | Its private half is on |
+| --- | --- | --- |
+| `SHARED_SSH_KEY_PATH` | participants | every participant's laptop, and the box running arena |
+| `GIT_SSH_KEY_LOCAL` | deploy (git push; pods reach each other) | every pod, and the box running arena |
+| `ADMIN_SSH_KEY_PATH` | admin (staff, and arena itself first) | the proxy box only — staff log in there, then reach any machine (`arena ssh-config --admin --install`) |
 
 <details>
 <summary>Why one key shared by every participant?</summary>
@@ -183,6 +195,7 @@ arena --config ./config.env config check                   # a ✓ / ✗ row per
 | `GPU_TYPE`, `NUM_GPUS`, `CLOUD_TYPE`, `IMAGE`, `DISK_GB` | What `create`/`up` make when no flag says otherwise |
 | `ARENA_REPO_OWNER`, `ARENA_REPO_NAME` | The cohort repo the pods push to |
 | `GIT_SSH_KEY_LOCAL`, `GIT_SSH_KEY_REMOTE` | The deploy key here, and where it goes on each pod |
+| `ADMIN_SSH_KEY_PATH` | Optional: the admin key from step 2, on the proxy box |
 | `ARENA_START_DATE` | The program's first Monday: day branches are named `w<week>d<day>` from it |
 | `LOCAL_BACKUP_DIR` | Where the rsync backups go (make it absolute) |
 | `SSH_PROXY_HOST`, `SSH_PROXY_STARTING_PORT` | The proxy's public host, and the first machine's port ([step 4](#4-set-up-the-proxy-recommended-for-a-cohort)) |
