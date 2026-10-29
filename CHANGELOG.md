@@ -17,7 +17,8 @@ earlier).
 ## 2026-10-29 · No more "command not found: conda" on Hetzner VMs
 - A Hetzner VM's `~/.zshrc` no longer has conda's init block or `conda activate arena-env` (it came
   from the GPU image's shared rc; a VM has no conda, so every login printed an error). The uv env
-  is activated as before.
+  is activated as before, now even with a `conda` on PATH (the old block skipped it then). A
+  conda a participant installed themselves (its own `conda init` block) is left alone.
 - Re-running `arena pods setup` on a VM no longer overwrites `~/.zshrc`: it takes the conda lines
   out of the VM's own, keeping the API-key exports `copy-keys` put there and anything the
   participant added. Until now a re-run dropped those keys from zsh until the next `copy-keys`.
