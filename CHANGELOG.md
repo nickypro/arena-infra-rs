@@ -14,6 +14,31 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-29 · Pods near the proxy first, and an RTT column in the dashboard
+- `pods create`/`up` (and `replace`, `migrate`) on RunPod and Vast now try Europe first — where
+  the proxy every participant's SSH goes through runs — unless that costs more than 25% over the
+  cheapest option. A far pod adds its round trip to every keystroke: a US pod about 100 ms.
+- RunPod: SECURE pods only, pinned to the `EU-…`/`EUR-…` data centres. COMMUNITY hosts are in no
+  data centre, so a community create is placed as before; to get a near A4000, add SECURE
+  (`--cloud community,secure`) and raise the margin past 47% (it's $0.25/h there, $0.17 community).
+- Vast: offers in European countries first, priced at the cheapest one there, never rented dearer
+  than the margin allows.
+- `arena offers` and the dry-runs show the order with a WHERE column (`Europe`/`any`) and say why
+  an option isn't tried near. A single SECURE or Vast create now shows that option table before
+  its prompt, as a create with several options does; with `--keep-trying` it stays one pool,
+  anywhere, and says so. If Europe has no room, the same option is tried anywhere, and on RunPod
+  Europe isn't asked again for the rest of the run: a 10-pod `up` with Europe full makes 11
+  creates, not 20.
+- The dashboard has an RTT column: the round trip from this box to each pod's SSH port, green under
+  60 ms, yellow under 120, red beyond. It's timed once a minute, after the rows are shown. The
+  detail pane's new `where:` line shows it beside where the pod runs (`EUR-IS-1`, `Czechia, CZ`,
+  `nbg1 (Nuremberg, DE)`), which `pods list --json` now includes as `location`.
+
+### Config
+- New, optional: `NEAR` (`europe` when unset; `north-america`; `any` or empty turns it off) and
+  `NEAR_MAX_EXTRA_PCT` (default `25`). Both work from the environment for one run, e.g. `NEAR=any
+  arena pods up -n 3` for the old cheapest-anywhere order. `config check` shows both.
+
 ## 2026-10-29 · Hetzner VMs get 8 GB of swap
 - `arena pods setup` (and `up`) on a Hetzner VM now makes an 8 GB swap file first, so a notebook
   that goes past the VM's RAM slows down instead of having its kernel killed. Shadeform's GPU VMs
