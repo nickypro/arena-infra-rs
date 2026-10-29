@@ -22,6 +22,8 @@ earlier).
 - Re-running `arena pods setup` on a VM no longer overwrites `~/.zshrc`: it takes the conda lines
   out of the VM's own, keeping the API-key exports `copy-keys` put there and anything the
   participant added. Until now a re-run dropped those keys from zsh until the next `copy-keys`.
+  Only oh-my-zsh's untouched template is replaced outright; a `~/.zshrc` that isn't arena's is
+  saved as `~/.zshrc.pre-arena-<time>` before it's replaced.
 - VMs set up before this get it at their next `arena pods setup`.
 
 ## 2026-10-29 · Pods near the proxy first, and an RTT column in the dashboard

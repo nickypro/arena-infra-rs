@@ -369,48 +369,59 @@ clone_plugin https://github.com/zsh-users/zsh-completions             "$ZSH_CUST
 # p10k + vimrc symlinked verbatim. The shared .zshrc is the GPU image's: it ends in conda's init
 # block and `conda activate arena-env`. A VM has no conda, so every login printed "command not
 # found: conda"; it goes in without those lines, and a uv-venv activation is appended below.
-# Only a fresh VM's ~/.zshrc (no venv line yet: oh-my-zsh's template) is replaced by the shared
-# one. A re-run filters the VM's own in place, since it holds `copy-keys`' token exports and
-# whatever the participant added (a re-run used to overwrite them). The venv block setup wrote
-# before this skipped activation whenever a `conda` was on PATH; a re-run drops that guard, so
-# the venv is what a shell gets even then.
+# Which ~/.zshrc is filtered (a re-run used to copy the shared one over whatever was there,
+# dropping `copy-keys`' token exports and the participant's own lines):
+#   - one arena wrote before (its venv block, or the shared rc's MACHINE_NAME line): in place;
+#   - none, or oh-my-zsh's untouched template (a fresh VM): replaced by the shared one;
+#   - anything else: replaced too, but kept first as ~/.zshrc.pre-arena-<time>.
 ln -sf "$HOME/.arena_infra/dotfiles/.vimrc"    "$HOME/.vimrc"
 ln -sf "$HOME/.arena_infra/dotfiles/.p10k.zsh" "$HOME/.p10k.zsh"
-# rc_without_conda SRC DEST: SRC filtered into DEST, through a temp file of its own beside DEST
-# (two setups at once never share one), renamed only once the filter succeeded. What goes: the
-# image's conda (an init block naming /opt/conda, which a VM doesn't have, and `conda activate
-# arena-env`). A conda the participant installed (its own `conda init` block) stays.
-rc_without_conda() {
+OLD_VENV_GUARD="if ! command -v conda >/dev/null 2>&1 && [ -f \"$VENV/bin/activate\" ]; then"
+# rc_filter MODE SRC DEST: SRC filtered into DEST, through a temp file of its own beside DEST
+# (two setups at once never share one), renamed only once the filter succeeded. Both modes turn
+# the venv block setup wrote before (it skipped activation whenever a `conda` was on PATH, so
+# such a shell got neither env) into today's, matched by its exact text. MODE `image` also drops
+# the image's conda: an init block naming /opt/conda (which a VM doesn't have) and the shared
+# rc's unindented `conda activate arena-env`. A participant's own conda lines stay: their
+# `conda init` block, an indented activate inside their own `if` (dropping that would leave an
+# empty body, a syntax error that stops the rest of their rc).
+rc_filter() {
     local tmp
-    tmp=$(mktemp "$2.arena-XXXXXX") || return 1
-    if awk -v guard='if ! command -v conda >/dev/null 2>&1 && [' '
-        /^# >>> conda initialize >>>/ { inblk = 1; blk = ""; image = 0 }
+    tmp=$(mktemp "$3.arena-XXXXXX") || return 1
+    if awk -v mode="$1" -v guard="$OLD_VENV_GUARD" -v venv="$VENV" '
+        mode == "image" && /^# >>> conda initialize >>>/ { inblk = 1; blk = ""; image = 0 }
         inblk {
             blk = blk $0 "\n"
             if (index($0, "/opt/conda")) image = 1
             if ($0 ~ /^# <<< conda initialize <<</) { inblk = 0; if (!image) printf "%s", blk }
             next
         }
-        /^[[:space:]]*conda activate arena-env[[:space:]]*$/ { next }
-        /^# export PATH="\/opt\/conda\/bin/                  { next }
-        /^# ARENA env: no conda on CPU pods/                 { print "# ARENA env: the uv venv."; next }
-        index($0, guard) == 1 { $0 = "if [" substr($0, length(guard) + 1) }
+        mode == "image" && /^conda activate arena-env[[:space:]]*$/ { next }
+        mode == "image" && /^# export PATH="\/opt\/conda\/bin/      { next }
+        /^# ARENA env: no conda on CPU pods/ { print "# ARENA env: the uv venv."; next }
+        $0 == guard { $0 = "if [ -f \"" venv "/bin/activate\" ]; then" }
         { print }
         END { if (inblk) printf "%s", blk }
-    ' "$1" > "$tmp" && mv -f "$tmp" "$2"; then
+    ' "$2" > "$tmp" && mv -f "$tmp" "$3"; then
         return 0
     fi
     rm -f "$tmp"
     return 1
 }
-zshrc_src="$HOME/.arena_infra/dotfiles/.zshrc"
-grep -qF "$VENV/bin/activate" "$HOME/.zshrc" 2>/dev/null && zshrc_src="$HOME/.zshrc"
-if [ -f "$zshrc_src" ]; then
-    rc_without_conda "$zshrc_src" "$HOME/.zshrc" || echo "WARN: couldn't rewrite ~/.zshrc without conda"
+SHARED_ZSHRC="$HOME/.arena_infra/dotfiles/.zshrc"
+if grep -qF -e "$VENV/bin/activate" -e 'export MACHINE_NAME="${MACHINE_NAME:="root"}"' "$HOME/.zshrc" 2>/dev/null; then
+    rc_filter image "$HOME/.zshrc" "$HOME/.zshrc" || echo "WARN: couldn't take conda out of ~/.zshrc"
+elif [ -f "$SHARED_ZSHRC" ]; then
+    if [ -s "$HOME/.zshrc" ] && ! { head -n 1 "$HOME/.zshrc" | grep -qxF '# If you come from bash you might have to change your $PATH.' \
+            && grep -qxF 'ZSH_THEME="robbyrussell"' "$HOME/.zshrc" && grep -qxF 'source $ZSH/oh-my-zsh.sh' "$HOME/.zshrc"; }; then
+        kept="$HOME/.zshrc.pre-arena-$(date +%Y%m%d-%H%M%S)"
+        cp -p "$HOME/.zshrc" "$kept" && echo "~/.zshrc wasn't arena's: kept as $kept"
+    fi
+    rc_filter image "$SHARED_ZSHRC" "$HOME/.zshrc" || echo "WARN: couldn't write ~/.zshrc from the shared one"
 fi
-# .bashrc is the VM's own (never the shared one): only an old guarded venv block to migrate.
-if grep -qF 'command -v conda' "$HOME/.bashrc" 2>/dev/null; then
-    rc_without_conda "$HOME/.bashrc" "$HOME/.bashrc" || echo "WARN: couldn't rewrite ~/.bashrc's venv block"
+# .bashrc is the VM's own (never the shared one): only setup's old venv block to migrate.
+if grep -qxF "$OLD_VENV_GUARD" "$HOME/.bashrc" 2>/dev/null; then
+    rc_filter venv "$HOME/.bashrc" "$HOME/.bashrc" || echo "WARN: couldn't update ~/.bashrc's venv block"
 fi
 for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
     touch "$rc"

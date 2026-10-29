@@ -267,54 +267,95 @@ conda activate arena-env
 
 /// The human (2026-10-29): "the .zshrc still has conda activate by default, can we remove
 /// that?" A VM has no conda, so each login said "command not found: conda". The VM's .zshrc
-/// is the shared one without conda, plus the venv; a re-run keeps what `copy-keys` and the
-/// participant added (it used to copy the shared file over them).
+/// is the shared one without the image's conda, plus the venv. A re-run filters the VM's own
+/// (it used to copy the shared file over it, dropping `copy-keys`' tokens and the participant's
+/// lines); only oh-my-zsh's untouched template is replaced, and anything else is kept first.
 #[test]
 fn the_vms_zshrc_has_no_conda_and_a_rerun_keeps_its_tokens() {
     let (_t, stubs, home, repo) = setup("zshrc");
     let dotfiles = home.join(".arena_infra/dotfiles");
     std::fs::create_dir_all(&dotfiles).unwrap();
     std::fs::write(dotfiles.join(".zshrc"), SHARED_ZSHRC).unwrap();
-    // A fresh VM: oh-my-zsh's template is there, to be replaced.
-    std::fs::write(home.join(".zshrc"), "ZSH_THEME=robbyrussell\n").unwrap();
+    let zshrc = || std::fs::read_to_string(home.join(".zshrc")).unwrap();
+    let kept = || {
+        let mut v: Vec<_> = std::fs::read_dir(&home)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with(".zshrc.pre-arena-"))
+            .collect();
+        v.sort();
+        v
+    };
+    let venv = repo.join(".venv");
+    let activate = format!("source \"{}/bin/activate\"", venv.display());
+    let new_block = format!("\n# ARENA env: the uv venv.\nif [ -f \"{0}/bin/activate\" ]; then\n    {activate}\nfi\n", venv.display());
+
+    // A fresh VM: oh-my-zsh's template, replaced (nothing worth keeping).
+    let template = "# If you come from bash you might have to change your $PATH.\nexport ZSH=\"$HOME/.oh-my-zsh\"\n\
+                    ZSH_THEME=\"robbyrussell\"\nplugins=(git)\nsource $ZSH/oh-my-zsh.sh\n";
+    std::fs::write(home.join(".zshrc"), template).unwrap();
     let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]);
     assert!(r.ok, "{}", r.stderr);
-    let activate = format!("source \"{}/bin/activate\"", repo.join(".venv").display());
-    let rc = std::fs::read_to_string(home.join(".zshrc")).unwrap();
+    let rc = zshrc();
     assert!(!rc.contains("conda"), "{rc}");
     assert!(!rc.contains("robbyrussell"), "the template is replaced: {rc}");
     assert!(rc.contains("export MACHINE_NAME=") && rc.contains("source ~/.p10k.zsh"), "the rest is kept: {rc}");
-    assert_eq!(rc.matches(&activate).count(), 1, "{rc}");
+    assert!(rc.ends_with(&new_block), "{rc}");
+    assert_eq!(kept(), Vec::<String>::new());
 
-    // copy-keys and the participant add lines (a conda of their own too); a re-run keeps them,
-    // and adds nothing twice.
+    // copy-keys and the participant add lines, a conda of their own among them (its init
+    // block; an activate inside their own `if`). A re-run keeps all of it, adds nothing twice.
     let added = "export OPENROUTER_API_KEY=\"sk-or-test\"\nalias gs='git status'\n\
-                 # >>> conda initialize >>>\n__conda_setup=\"$('/root/miniconda3/bin/conda' 'shell.zsh' 'hook')\"\n# <<< conda initialize <<<\n";
+                 # >>> conda initialize >>>\n__conda_setup=\"$('/root/miniconda3/bin/conda' 'shell.zsh' 'hook')\"\n# <<< conda initialize <<<\n\
+                 if command -v conda >/dev/null 2>&1; then\n    conda activate arena-env\nfi\n";
     std::fs::write(home.join(".zshrc"), format!("{rc}{added}")).unwrap();
     let again = run(&stubs, &home, &repo, &[]);
     assert!(again.ok, "{}", again.stderr);
-    assert_eq!(std::fs::read_to_string(home.join(".zshrc")).unwrap(), format!("{rc}{added}"));
-    let new_block = format!("\n# ARENA env: the uv venv.\nif [ -f \"{0}/bin/activate\" ]; then\n    source \"{0}/bin/activate\"\nfi\n", repo.join(".venv").display());
-    assert!(rc.ends_with(&new_block), "{rc}");
+    assert_eq!(zshrc(), format!("{rc}{added}"));
+
+    // They took the venv block out: still arena's rc (the shared MACHINE_NAME line), so filtered
+    // in place, tokens kept, the block back once.
+    let without = rc.replace(&new_block, "");
+    std::fs::write(home.join(".zshrc"), format!("{without}{added}")).unwrap();
+    let r = run(&stubs, &home, &repo, &[]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(zshrc(), format!("{without}{added}{new_block}"));
+    assert_eq!(kept(), Vec::<String>::new());
+
+    // Not arena's and not the template: replaced, but kept first, byte for byte.
+    std::fs::write(home.join(".zshrc"), "export MY_TOKEN=1\nalias ll='ls -l'\n").unwrap();
+    let r = run(&stubs, &home, &repo, &[]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(zshrc().contains("export MACHINE_NAME="), "{}", zshrc());
+    let k = kept();
+    assert_eq!(k.len(), 1, "{k:?}");
+    assert_eq!(std::fs::read_to_string(home.join(&k[0])).unwrap(), "export MY_TOKEN=1\nalias ll='ls -l'\n");
+    std::fs::remove_file(home.join(&k[0])).unwrap();
 
     // A VM set up before this: the shared rc with conda, the venv block setup wrote then (it
-    // skipped activation whenever a conda was on PATH), a token; .bashrc with that block too.
-    // A re-run takes the image's conda out and turns the old block into today's.
+    // skipped activation whenever a conda was on PATH), their lines; .bashrc with that block
+    // and their own conda `if`. A re-run takes the image's conda out and turns the old block
+    // into today's; their lines stay, and .bashrc still parses.
     let old_block = format!(
         "\n# ARENA env: no conda on CPU pods — activate the uv venv (no-op on conda GPU pods).\n\
-         if ! command -v conda >/dev/null 2>&1 && [ -f \"{0}/bin/activate\" ]; then\n    source \"{0}/bin/activate\"\nfi\n",
-        repo.join(".venv").display()
+         if ! command -v conda >/dev/null 2>&1 && [ -f \"{0}/bin/activate\" ]; then\n    {activate}\nfi\n",
+        venv.display()
     );
     std::fs::write(home.join(".zshrc"), format!("{SHARED_ZSHRC}{old_block}{added}")).unwrap();
-    std::fs::write(home.join(".bashrc"), format!("# ubuntu's\n{old_block}")).unwrap();
+    let theirs = "if command -v conda >/dev/null 2>&1; then\n    conda activate arena-env\nfi\n";
+    std::fs::write(home.join(".bashrc"), format!("# ubuntu's\n{theirs}{old_block}")).unwrap();
     let old = run(&stubs, &home, &repo, &[]);
     assert!(old.ok, "{}", old.stderr);
-    let rc = std::fs::read_to_string(home.join(".zshrc")).unwrap();
-    assert!(!rc.contains("/opt/conda") && !rc.contains("conda activate") && !rc.contains("command -v conda"), "{rc}");
+    let rc = zshrc();
+    assert!(!rc.contains("/opt/conda") && !rc.contains("\nconda activate") && !rc.contains("! command -v conda"), "{rc}");
     assert!(rc.ends_with(&format!("{new_block}{added}")), "{rc}");
     assert_eq!(rc.matches(&activate).count(), 1, "{rc}");
-    assert_eq!(std::fs::read_to_string(home.join(".bashrc")).unwrap(), format!("# ubuntu's\n{new_block}"));
-    // What a shell gets, with a conda on PATH: the venv (the old block gave it neither).
+    let bashrc = std::fs::read_to_string(home.join(".bashrc")).unwrap();
+    assert_eq!(bashrc, format!("# ubuntu's\n{theirs}{new_block}"));
+    let parses = Command::new("bash").arg("-n").arg(home.join(".bashrc")).status().unwrap();
+    assert!(parses.success());
+    assert_eq!(kept(), Vec::<String>::new());
+    // What a shell gets, with a conda on PATH: the venv last (the old block gave it neither).
     arena_core::remote::write_test_script(&stubs.join("conda"), "#!/bin/sh\nexit 0\n".to_string()).unwrap();
     let out = Command::new("bash")
         .args(["-c", "source ~/.bashrc; command -v conda >/dev/null && echo \"$PATH\""])
@@ -324,7 +365,7 @@ fn the_vms_zshrc_has_no_conda_and_a_rerun_keeps_its_tokens() {
         .output()
         .unwrap();
     let path = String::from_utf8_lossy(&out.stdout);
-    assert!(path.starts_with(&format!("{}/bin:", repo.join(".venv").display())), "{path}");
+    assert!(path.starts_with(&format!("{}/bin:", venv.display())), "{path}");
 }
 
 #[test]
