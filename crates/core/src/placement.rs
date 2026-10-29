@@ -1058,8 +1058,10 @@ impl Progress<'_> {
                     Outcome::Created { pod_id } => {
                         format!("[created] {name} id={pod_id} on {on} ({})", option.price_label())
                     }
-                    Outcome::Capacity(_) => format!(
-                        "[no capacity] {name} on {on}{}",
+                    // The provider's own words: "no capacity" for a type it doesn't know at all
+                    // reads differently (RunPod: a 422 "Unknown GPU type", `[rejected]`).
+                    Outcome::Capacity(e) => format!(
+                        "[no capacity] {name} on {on}: {e}{}",
                         if *next { " — trying the next option" } else { " — no option left this round" }
                     ),
                     Outcome::Denied(e) => format!(
@@ -2257,7 +2259,7 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
         assert_eq!(fake.calls(), [call("arena8-apple", A4000, "COMMUNITY"), call("arena8-apple", R3090, "COMMUNITY")]);
         assert_eq!(out.log[0].placed, Some(1));
         assert_eq!(out.created.len(), 1);
-        assert_eq!(lines[0], "[no capacity] arena8-apple on 1×RTX A4000 COMMUNITY — trying the next option");
+        assert_eq!(lines[0], "[no capacity] arena8-apple on 1×RTX A4000 COMMUNITY: provider error: create pod HTTP 500: There are no instances currently available — trying the next option");
         assert_eq!(lines[1], "[created] arena8-apple id=id1 on 1×RTX 3090 COMMUNITY ($0.22/h)");
     }
 
@@ -2392,7 +2394,7 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
         assert_eq!(calls[0], call("devtest-near-0", A4000, NEAR_SECURE));
         assert!(calls[1..].iter().all(|(_, g, c)| g == A4000 && c == "SECURE"), "the rest anywhere: {calls:?}");
         assert_eq!(out.created.len(), 10);
-        assert_eq!(lines[0], "[no capacity] devtest-near-0 on 1×RTX A4000 SECURE in Europe — trying the next option");
+        assert_eq!(lines[0], "[no capacity] devtest-near-0 on 1×RTX A4000 SECURE in Europe: provider error: create pod HTTP 500: There are no instances currently available — trying the next option");
         assert!(render_summary(&plan, &out).contains("created on 1×RTX A4000 SECURE ($0.25/h) (after 1×RTX A4000 SECURE in Europe: capacity)"));
         // Near off: the same run, 10 creates.
         let off = Fake::new(Reply::Ok);
@@ -2421,7 +2423,7 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
                 call("devtest-near-bloom", A4000, "SECURE"),
             ]
         );
-        assert_eq!(lines[1], "[no capacity] devtest-near-apple on 1×RTX A4000 SECURE — no option left this round");
+        assert_eq!(lines[1], "[no capacity] devtest-near-apple on 1×RTX A4000 SECURE: provider error: create pod HTTP 500: There are no instances currently available — no option left this round");
     }
 
     /// Review (claude): a near Vast "no capacity" is one market search's answer — blocked for

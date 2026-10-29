@@ -264,12 +264,11 @@ async fn runpod_catalog_view(cfg: &Config, flags: &Flags, c: &mut Catalog) -> Re
     let seen = seen_gpu_types(cfg).await;
     let unlisted: Vec<Unlisted> = seen.into_iter().map(|(id, pod_price_per_gpu)| Unlisted { id, pod_price_per_gpu }).collect();
     c.rows = offers::runpod_rows(&cat, &unlisted, Some(&plan), &row_filter(cfg, flags, gpu.as_deref()));
-    let source = if cat.live { "RunPod's live catalog" } else { "arena's presets (~): set RUNPOD_API_KEY for the live list" };
-    c.notes.push(format!(
-        "# = what `up` would try, in order · prices: {source} · unlisted = not in RunPod's public catalog, seen on the \
-         account's pods or configured (RUNPOD_EXTRA_GPU_TYPES): `--gpu` takes it, RunPod's create decides"
-    ));
-    c.notes.push("RunPod's CPU pods (cpu3/cpu5 flavours, secure cloud) aren't listed: arena creates GPU pods only".into());
+    if !cat.live {
+        c.notes.push("~ = arena's preset estimate: RunPod's live list couldn't be read (set RUNPOD_API_KEY)".into());
+    }
+    c.notes.push("# = what `up` would try · unlisted = not in RunPod's public catalog: --gpu takes it, RunPod's create decides".into());
+    c.notes.push("Not listed: RunPod's CPU pods (arena creates GPU pods only)".into());
     Ok(())
 }
 
@@ -343,8 +342,7 @@ async fn vast_catalog(cfg: &Config, flags: &Flags, c: &mut Catalog) -> Result<()
     let wanted = (!wanted.is_empty()).then(|| wanted.join(","));
     c.rows = offers::vast_rows(&vast::market_rows(&market), base.gpu_count, default, Some(&plan), &row_filter(cfg, flags, wanted.as_deref()));
     c.notes.push(format!(
-        "# = what `up` would rent · each class's cheapest offer now (each create searches again) · up rents {} \
-         unless --cloud datacenter|verified|unverified says",
+        "# = what `up` would rent · cheapest offer now per class · up rents {} unless --cloud says",
         default.hosts()
     ));
     Ok(())

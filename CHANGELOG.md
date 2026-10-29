@@ -39,6 +39,9 @@ earlier).
 - Every command's `--help` lists its options one per line, without a blank line between each, and
   keeps all its text.
 - The dashboard's GPU picker offers B200, B300 and the MIG slices too.
+- A create refused for capacity says the provider's own words (`[no capacity] devtest-apple on 1×RTX
+  A4000 SECURE: … There are no instances currently available`), so "full" reads apart from a type
+  the provider doesn't know.
 
 ### Config
 - New, optional: `RUNPOD_EXTRA_GPU_TYPES`, exact RunPod GPU type ids its catalog lacks

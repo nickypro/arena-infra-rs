@@ -304,7 +304,7 @@ enum Cmd {
     Offers {
         /// runpod, vast, hetzner, shadeform or all: everything on sale there (default: what up
         /// would try)
-        #[arg(value_name = "PROVIDER", value_parser = clap::builder::PossibleValuesParser::new(offers::VIEWS))]
+        #[arg(value_name = "PROVIDER", value_parser = clap::builder::PossibleValuesParser::new(offers::VIEWS), hide_possible_values = true)]
         view: Option<String>,
         /// GPU type(s), comma-separated, e.g. `A4000,3090` (default: config GPU_TYPE)
         #[arg(long)]
@@ -936,7 +936,7 @@ enum PodCmd {
         /// Hetzner only: server type, e.g. cx23 or cpx42 (overrides HETZNER_SERVER_TYPE)
         #[arg(long, value_name = "TYPE")]
         server_type: Option<String>,
-        /// RunPod tier COMMUNITY or SECURE (overrides config), or a comma list to fall back
+        /// Tier: RunPod COMMUNITY/SECURE, Vast datacenter/verified/unverified; a list falls back
         #[arg(long)]
         cloud: Option<String>,
         /// Max $/h per pod; options above it or with no known price aren't tried
@@ -1007,7 +1007,7 @@ enum PodCmd {
         /// Hetzner only: server type, e.g. cx23 or cpx42 (overrides HETZNER_SERVER_TYPE)
         #[arg(long, value_name = "TYPE")]
         server_type: Option<String>,
-        /// RunPod tier COMMUNITY or SECURE (overrides config), or a comma list to fall back
+        /// Tier: RunPod COMMUNITY/SECURE, Vast datacenter/verified/unverified; a list falls back
         #[arg(long)]
         cloud: Option<String>,
         /// Max $/h per pod; options above it or with no known price aren't tried
@@ -2439,7 +2439,7 @@ async fn create_pods(
                     }
                     Some(K::Capacity) => {
                         eprintln!(
-                            "[stop] no capacity for this GPU right now (created {}/{}). \
+                            "[stop] no capacity for this GPU right now: {e} (created {}/{}). \
                              Re-run with --retry-mins N (or --keep-trying) to wait for it to free up.",
                             created.len(),
                             names.len()
