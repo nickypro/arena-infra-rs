@@ -21,4 +21,4 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # `unstable-rendered-line-info`: `Paragraph::line_count`, the TUI answer popup's scroll limit.
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
-crossterm = "0.28"
+crossterm = "0.29"
