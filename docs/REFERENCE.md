@@ -1004,8 +1004,10 @@ placement shows here unchanged. `create`/`up` use **one** provider per run (`--p
 **`arena offers <provider>`**, and **`all`** for every configured provider's (Shadeform left out
 unless named, as above; `--all` is still taken, hidden). Each is a heading, a table and a line or
 two of notes; `#` marks what `up` with the config (and the flags) would try, in its order — from
-the same plan as the default view. `--gpu`, `--cloud` and `--max-price` (per pod of `--gpus`)
-filter the rows; a row whose price is unknown doesn't pass a cap.
+the same plan as the default view (a config `up` can't plan with — a `CLOUD_TYPE` the provider
+doesn't take — leaves the list unmarked, a note saying why). `--gpu`, `--cloud` and `--max-price`
+(per pod of `--gpus`) filter the rows; a row whose price is unknown doesn't pass a cap. Vast
+searches only the classes `--cloud` admits, so a failed search can't hide behind another's.
 
 - **RunPod**: every GPU type in its catalog once per tier that sells it (`COMMUNITY`, `SECURE`),
   with that tier's $/h per GPU and stock — so B200/B300 and the MIG slices show, the secure-only ones

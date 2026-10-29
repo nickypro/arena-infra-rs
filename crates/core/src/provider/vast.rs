@@ -158,12 +158,12 @@ pub fn tier(cloud: &str, verified_only: bool) -> Result<Host> {
 /// RunPod's tiers meaning the default ([`tier`]) — as `offers vast` filters its rows by them
 /// (review: codex — `--cloud community` filtered every row out while `up` would rent one).
 /// Pure.
-pub fn admitted_classes(clouds: &[String], verified_only: bool) -> Result<Vec<String>> {
+pub fn admitted_classes(clouds: &[String], verified_only: bool) -> Result<Vec<Host>> {
     let mut tiers = Vec::new();
     for c in clouds {
         tiers.push(tier(c, verified_only)?);
     }
-    Ok(Host::ALL.iter().filter(|h| tiers.iter().any(|t| t.admits(**h))).map(|h| h.key().to_string()).collect())
+    Ok(Host::ALL.into_iter().filter(|h| tiers.iter().any(|t| t.admits(*h))).collect())
 }
 
 /// Placement's `--cloud` list on Vast as tiers ([`tier`]), in order, each once: RunPod's
@@ -300,16 +300,17 @@ impl VastProvider {
     }
 
     /// `offers vast`: what the market sells now for a pod like `base` (its GPU count, disk and
-    /// CUDA floor) — one search per host class for any card, or with `gpus` (`--gpu`) per class
-    /// and card; each bounded by `limit`, the cheapest [`MARKET_LIMIT`] offers. Read-only. Each
+    /// CUDA floor) — one search per host class of `classes` (what `--cloud` admits, so a failed
+    /// search is never hidden by another class's: review, codex) for any card, or with `gpus`
+    /// (`--gpu`) per class and card; each bounded by `limit`, the cheapest [`MARKET_LIMIT`] offers. Read-only. Each
     /// read's offers fit `base` as a create would check them ([`fitting_offer`]) and are of
     /// that very class, so the caller can take the cheapest per card and class
     /// ([`market_rows`]); a read that filled the limit says so (pricier cards may be missing:
     /// review, codex), one that failed is its `Err`.
-    pub async fn market(&self, base: &PodSpec, gpus: &[String], limit: Duration) -> Vec<MarketRead> {
+    pub async fn market(&self, base: &PodSpec, classes: &[Host], gpus: &[String], limit: Duration) -> Vec<MarketRead> {
         let cards: Vec<Option<String>> = if gpus.is_empty() { vec![None] } else { gpus.iter().map(|g| Some(vast_gpu_name(g))).collect() };
         let mut out = Vec::new();
-        for class in Host::ALL {
+        for &class in classes {
             for card in &cards {
                 let got = match crate::ratelimit::bounded(limit, self.market_class(base, class, card.as_deref())).await {
                     Ok(r) => r.map_err(|e| e.to_string()),
@@ -2157,9 +2158,9 @@ mod tests {
         assert_eq!(note.as_deref(), Some("vast: community,secure are RunPod's — on Vast that's verified (verified hosts only (datacenter ones included))"));
         // What `offers vast --cloud …` shows: the classes the tiers rent from.
         let shown = |c: &[&str], strict: bool| admitted_classes(&c.iter().map(|s| s.to_string()).collect::<Vec<_>>(), strict).unwrap();
-        assert_eq!(shown(&["community"], true), ["DATACENTER", "VERIFIED"]);
-        assert_eq!(shown(&["COMMUNITY"], false), ["DATACENTER", "VERIFIED", "UNVERIFIED"]);
-        assert_eq!(shown(&["datacenter"], false), ["DATACENTER"]);
+        assert_eq!(shown(&["community"], true), [Host::Datacenter, Host::Verified]);
+        assert_eq!(shown(&["COMMUNITY"], false), Host::ALL);
+        assert_eq!(shown(&["datacenter"], false), [Host::Datacenter]);
         assert!(admitted_classes(&["cheap".to_string()], true).is_err());
         // Nested: a wider tier admits every narrower class.
         assert!(Host::Verified.admits(Host::Datacenter) && Host::Unverified.admits(Host::Verified) && !Host::Datacenter.admits(Host::Verified));

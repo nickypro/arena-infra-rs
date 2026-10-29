@@ -254,6 +254,18 @@ async fn catalog(cfg: &Config, provider: &'static str, flags: &Flags, server_typ
     Ok(c)
 }
 
+/// The plan whose options a catalogue's `#` marks ([`plan_for`]) — or, when the config alone
+/// can't make one (a `CLOUD_TYPE` this provider doesn't take), none, and a note why: the list is
+/// still the list (review: codex). A plan the flags made impossible (`--cloud`) is the
+/// command's error, as in `create`.
+async fn marks(cfg: &Config, provider: &str, flags: &Flags, gpu: Option<&str>) -> Result<(Option<arena_core::placement::OptionPlan>, Option<String>)> {
+    match plan_for(cfg, provider, flags, gpu, None).await {
+        Ok((plan, _)) => Ok((Some(plan), None)),
+        Err(e) if flags.cloud.is_none() => Ok((None, Some(format!("{provider}: no # — `up` can't plan with the config: {e:#}")))),
+        Err(e) => Err(e),
+    }
+}
+
 /// RunPod's catalogue: [`runpod_catalog`]'s rows once per tier, the GPU types the catalog
 /// lacks that arena has seen ([`seen_gpu_types`], with a pod's own price), marked with what
 /// `up` would try ([`plan_for`]), filtered as asked. Notes: how to read it, and that RunPod's
@@ -265,10 +277,11 @@ async fn runpod_catalog_view(cfg: &Config, flags: &Flags, c: &mut Catalog) -> Re
     if let Some(w) = warning {
         eprint!("{w}");
     }
-    let (plan, _) = plan_for(cfg, "runpod", flags, gpu.as_deref(), None).await?;
+    let (plan, why) = marks(cfg, "runpod", flags, gpu.as_deref()).await?;
     let seen = seen_gpu_types(cfg).await;
     let unlisted: Vec<Unlisted> = seen.into_iter().map(|(id, pod_price_per_gpu)| Unlisted { id, pod_price_per_gpu }).collect();
-    c.rows = offers::runpod_rows(&cat, &unlisted, Some(&plan), &row_filter(cfg, flags, gpu.as_deref()));
+    c.rows = offers::runpod_rows(&cat, &unlisted, plan.as_ref(), &row_filter(cfg, flags, gpu.as_deref()));
+    c.notes.extend(why);
     if !cat.live {
         c.notes.push("~ = arena's preset estimate: RunPod's live list couldn't be read (set RUNPOD_API_KEY)".into());
     }
@@ -330,9 +343,15 @@ async fn vast_catalog(cfg: &Config, flags: &Flags, c: &mut Catalog) -> Result<()
     let provider = vast::VastProvider::from_config(cfg)?;
     let default = vast::tier("", provider.verified_only())?;
     let gpu = flags.gpu.clone();
-    let (plan, base) = plan_for(cfg, "vast", flags, gpu.as_deref(), None).await?;
+    // The classes `--cloud` admits (all, without it): only those are searched.
+    let classes = match &flags.cloud {
+        Some(c) => vast::admitted_classes(&arena_core::placement::split_list(c), provider.verified_only())?,
+        None => vast::Host::ALL.to_vec(),
+    };
+    let (plan, why) = marks(cfg, "vast", flags, gpu.as_deref()).await?;
+    let base = spec_with_overrides(cfg, &SpecOverrides { gpus: flags.gpus, ..Default::default() });
     let wanted: Vec<String> = gpu.as_deref().map(|g| arena_core::placement::split_list(g).iter().map(|t| arena_core::gpu::resolve(t)).collect()).unwrap_or_default();
-    let market = provider.market(&base, &wanted, PRICE_TIMEOUT).await;
+    let market = provider.market(&base, &classes, &wanted, PRICE_TIMEOUT).await;
     if let Some(first) = market.iter().find_map(|r| r.offers.as_ref().err()).filter(|_| market.iter().all(|r| r.offers.is_err())) {
         anyhow::bail!("couldn't search Vast's market: {first}");
     }
@@ -346,10 +365,9 @@ async fn vast_catalog(cfg: &Config, flags: &Flags, c: &mut Catalog) -> Result<()
     }
     let wanted = (!wanted.is_empty()).then(|| wanted.join(","));
     let mut filter = row_filter(cfg, flags, wanted.as_deref());
-    if let Some(clouds) = &filter.clouds {
-        filter.clouds = Some(vast::admitted_classes(clouds, provider.verified_only())?);
-    }
-    c.rows = offers::vast_rows(&vast::market_rows(&market), base.gpu_count, default, Some(&plan), &filter);
+    filter.clouds = flags.cloud.as_ref().map(|_| classes.iter().map(|h| h.key().to_string()).collect());
+    c.rows = offers::vast_rows(&vast::market_rows(&market), base.gpu_count, default, plan.as_ref(), &filter);
+    c.notes.extend(why);
     c.notes.push(format!(
         "# = what `up` would rent · cheapest offer now per class · up rents {} unless --cloud says",
         default.hosts()
@@ -482,6 +500,14 @@ mod tests {
         let e = handle_offers(&cfg(), None, Some("hetzner"), Flags { gpu: Some("A4000".into()), ..Default::default() }, true, false).await.unwrap_err().to_string();
         assert!(e.starts_with("--gpu doesn't apply to hetzner"), "{e}");
         handle_offers(&cfg(), None, Some("shadeform"), Flags::default(), false, false).await.unwrap();
+        // A config `up` can't plan with (a Vast tier as CLOUD_TYPE) still lists RunPod's
+        // catalogue, unmarked, saying why; the same tier asked for on the command line fails.
+        let dc = Config::parse("MACHINE_NAME_PREFIX=arena8\nGPU_TYPE=NVIDIA RTX A4000\nCLOUD_TYPE=DATACENTER\n");
+        let c = catalog(&dc, "runpod", &Flags::default(), None).await.unwrap();
+        assert!(!c.rows.is_empty() && c.rows.iter().all(|r| r.try_order.is_none()));
+        assert!(c.notes.iter().any(|n| n.starts_with("runpod: no # — `up` can't plan with the config: config error: --cloud `DATACENTER`")), "{:?}", c.notes);
+        let e = catalog(&cfg(), "runpod", &Flags { cloud: Some("datacenter".into()), ..Default::default() }, None).await.unwrap_err();
+        assert!(e.to_string().contains("RunPod tiers are COMMUNITY and SECURE"), "{e}");
         // Every provider skipped (`--server-type` with RunPod alone): nothing to show is an error.
         let e = handle_offers(&cfg(), None, Some("all"), Flags { server_type: Some("cx33".into()), ..Default::default() }, true, false).await.unwrap_err();
         assert_eq!(e.to_string(), "no provider to show: the flags apply to none of runpod (see `skipped:`)");
