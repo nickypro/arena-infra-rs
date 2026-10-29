@@ -461,9 +461,13 @@ identity, its history and its logs.) Then it powers the VM off and snapshots it,
 (a hash of `owner/name`, what `arena` matches on), `commit` (the checkout's), `req` (a hash of the
 repo's `install_uv.sh`, `requirements.txt` and `pyproject.toml`: what the env install read),
 `arch`, `disk` and the bake's own id. The VM is deleted whatever happens — a failed setup, a scan
-hit, a failed snapshot, Ctrl+C; a create or snapshot whose answer was lost is found by the bake's
-id (never by name: two bakes in the same minute share one); a delete that keeps failing is printed
-loudly with the VM's id. A build VM is never part of the fleet
+hit, a failed snapshot, Ctrl+C. A create or snapshot whose answer never came (a dropped
+connection, Ctrl+C mid-request) is looked for by the bake's id for a minute (never by name: two
+bakes in the same minute share one) and deleted; one that doesn't turn up is said loudly, with the
+label to look for — never "nothing was made". A create Hetzner refused (4xx) made nothing. A delete
+that keeps failing is printed loudly with the VM's id. The zeroing is flushed to the disk before
+its file goes, and anything but a full disk ending it (or too little written) stops the bake, as
+does a `/proc/swaps` it can't read or a swap still on after `swapoff`. A build VM is never part of the fleet
 (no backup, proxy, reap or `pods` command sees it); `teardown --check` lists one still there, and
 `image prune` deletes one over 3 hours old.
 

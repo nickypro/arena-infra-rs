@@ -91,7 +91,19 @@ mod fake {
         /// Each server's and snapshot's labels, for the label selectors.
         pub server_labels: Mutex<std::collections::HashMap<String, Map<String, Value>>>,
         pub snap_labels: Mutex<std::collections::HashMap<u64, Map<String, Value>>>,
+        /// The next N label-selected listings of servers / snapshots list nothing (Hetzner
+        /// listing what was just made a moment later).
+        pub servers_listed_late: Mutex<u32>,
+        pub snaps_listed_late: Mutex<u32>,
         next_id: Mutex<u64>,
+    }
+
+    /// Whether this listing is one of the late ones (and count it off).
+    fn late(n: &Mutex<u32>) -> bool {
+        let mut n = n.lock().unwrap();
+        let late = *n > 0;
+        *n = n.saturating_sub(1);
+        late
     }
 
     /// Whether `labels` match a Hetzner label selector (`k=v,k2` — the forms arena sends).
@@ -136,6 +148,9 @@ mod fake {
     impl ImageCloud for FakeImageCloud {
         async fn snapshots(&self, selector: Option<&str>) -> Result<Vec<Snapshot>> {
             self.record(ImageCall::Snapshots(selector.map(String::from)));
+            if selector.is_some() && late(&self.snaps_listed_late) {
+                return Ok(Vec::new());
+            }
             let labels = self.snap_labels.lock().unwrap();
             let none = Map::new();
             Ok(self.snaps.lock().unwrap().iter().filter(|s| selector.is_none_or(|sel| selects(sel, labels.get(&s.id).unwrap_or(&none)))).cloned().collect())
@@ -179,6 +194,9 @@ mod fake {
         }
         async fn servers(&self, selector: &str) -> Result<Vec<Pod>> {
             self.record(ImageCall::Servers(selector.into()));
+            if late(&self.servers_listed_late) {
+                return Ok(Vec::new());
+            }
             let labels = self.server_labels.lock().unwrap();
             let none = Map::new();
             Ok(self.servers.lock().unwrap().iter().filter(|p| selects(selector, labels.get(&p.id).unwrap_or(&none))).cloned().collect())

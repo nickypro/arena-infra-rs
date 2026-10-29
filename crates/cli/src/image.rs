@@ -351,14 +351,23 @@ async fn build(
     let report = bake::build(cloud, remote, &plan, &target, interrupt.wait(), &|l| println!("{l}")).await;
     let _ = std::fs::remove_file(&script);
     let took = started.elapsed().as_secs();
-    if let Some((id, why)) = &report.orphan_image {
-        eprintln!("⚠ a half-made image {id} couldn't be deleted ({why}) — `arena image prune` or the Hetzner console");
+    if let Some(why) = &report.orphan_image {
+        eprintln!("⚠ {why}");
     }
     let left = match &report.vm {
         VmFate::Left { id, why } => {
             eprintln!(
                 "\n!!! THE BUILD VM {name} (id {id}) WAS NOT DELETED: {why}\n!!! It bills by the hour until it is. Delete it: \
                  `arena image prune` (a leftover once it's 3 h old), or now in the Hetzner console.\n"
+            );
+            true
+        }
+        VmFate::Unsure { build_id, why } => {
+            eprintln!(
+                "\n!!! THE BUILD VM {name} MAY EXIST: its create was sent and no answer came ({why}).\n!!! If it turns up it bills by \
+                 the hour: `arena teardown --check` lists it, `arena image prune` deletes it once it's 3 h old, or delete the server \
+                 labelled {}={build_id} in the Hetzner console.\n",
+                image::BUILD_ID_LABEL
             );
             true
         }

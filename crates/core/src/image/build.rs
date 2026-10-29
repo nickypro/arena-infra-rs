@@ -27,6 +27,9 @@ pub const IP_WAIT: Duration = Duration::from_secs(180);
 /// (also: how often a bake whose create answer never came looks for what it made).
 pub const DELETE_TRIES: u32 = 4;
 pub const DELETE_PAUSE: Duration = Duration::from_secs(5);
+/// How many times, [`DELETE_PAUSE`] apart, a bake whose create or snapshot request may have been
+/// taken (its answer never came) looks for what it made, before saying it can't tell.
+pub const LOOK_TRIES: u32 = 12;
 
 /// What to build.
 pub struct BuildPlan {
@@ -55,6 +58,9 @@ pub enum VmFate {
     Deleted { id: String },
     /// Still there, billing: every delete failed.
     Left { id: String, why: String },
+    /// A create was sent and its answer never came, and no VM with this bake's id turned up in a
+    /// minute of looking: one may still appear, billing (`teardown --check` lists it).
+    Unsure { build_id: String, why: String },
 }
 
 /// How a build ended: the snapshot, or why not — and the VM's fate either way.
@@ -62,8 +68,9 @@ pub enum VmFate {
 pub struct Report {
     pub result: std::result::Result<Snapshot, String>,
     pub vm: VmFate,
-    /// A snapshot left half-made (its delete failed): its id and why.
-    pub orphan_image: Option<(u64, String)>,
+    /// A snapshot that may be left: half-made and its delete failed, or asked for with no
+    /// answer and not found — what to say about it.
+    pub orphan_image: Option<String>,
     /// How long the setup and the snapshot took.
     pub setup_took: Option<Duration>,
     pub snapshot_took: Option<Duration>,
@@ -80,19 +87,22 @@ pub async fn build(
     emit: &(dyn Fn(&str) + Sync),
 ) -> Report {
     let server: Mutex<Option<String>> = Mutex::new(None);
-    // A create was sent: whatever its answer (an error after Hetzner took it, a Ctrl+C before
-    // it came), a server may exist with its id never seen — looked for by this bake's id.
-    let created = Mutex::new(false);
-    // Likewise the snapshot: `(id, done)` once known; `snapshotting` once asked for.
+    // The create: sent, and how it ended — refused by Hetzner (an HTTP 4xx answer: nothing was
+    // made), or unknown (an error after Hetzner may have taken it, a Ctrl+C before the answer):
+    // then a server may exist with its id never seen, and it's looked for by this bake's id.
+    let create: Mutex<Request> = Mutex::new(Request::NotSent);
+    // Likewise the snapshot: `(id, done)` once known.
     let image: Mutex<Option<(u64, bool)>> = Mutex::new(None);
-    let snapshotting = Mutex::new(false);
+    let snapshot: Mutex<Request> = Mutex::new(Request::NotSent);
     let took: Mutex<(Option<Duration>, Option<Duration>)> = Mutex::new((None, None));
 
     let work = async {
         emit(&format!("creating {} ({}, {})…", plan.name, plan.server_type, super::FALLBACK));
         let labels = super::build_vm_labels(&plan.scope, &plan.build_id);
-        *created.lock().unwrap() = true;
-        let pod = cloud.create_server(&plan.name, &plan.server_type, labels).await.map_err(|e| format!("creating the VM: {e}"))?;
+        *create.lock().unwrap() = Request::Sent;
+        let made = cloud.create_server(&plan.name, &plan.server_type, labels).await;
+        *create.lock().unwrap() = Request::ended(&made);
+        let pod = made.map_err(|e| format!("creating the VM: {e}"))?;
         *server.lock().unwrap() = Some(pod.id.clone());
         let pod = with_ip(cloud, pod).await?;
         let t = target(&pod).map_err(|e| e.to_string())?;
@@ -130,8 +140,10 @@ pub async fn build(
         let labels = super::labels(&plan.scope, &baked);
         emit("snapshotting the disk (a few minutes)…");
         let started = tokio::time::Instant::now();
-        *snapshotting.lock().unwrap() = true;
-        let (id, action) = cloud.create_image(&pod.id, &plan.name, &labels).await.map_err(|e| format!("snapshotting: {e}"))?;
+        *snapshot.lock().unwrap() = Request::Sent;
+        let asked = cloud.create_image(&pod.id, &plan.name, &labels).await;
+        *snapshot.lock().unwrap() = Request::ended(&asked);
+        let (id, action) = asked.map_err(|e| format!("snapshotting: {e}"))?;
         *image.lock().unwrap() = Some((id, false));
         if let Some(a) = action {
             cloud.wait_action(a, SNAPSHOT_TIMEOUT).await.map_err(|e| format!("snapshotting: {e}"))?;
@@ -149,29 +161,33 @@ pub async fn build(
     // Whatever happened: a half-made snapshot goes, and the VM always does.
     let mut orphan_image = None;
     let half_made = *image.lock().unwrap();
-    let asked = *snapshotting.lock().unwrap();
+    let asked = *snapshot.lock().unwrap();
+    let selector = format!("{BUILD_ID_LABEL}={}", super::label_value(&plan.build_id));
     if result.is_err() {
-        let ids: Vec<u64> = match half_made {
-            Some((id, false)) => vec![id],
-            Some((_, true)) => Vec::new(),
-            // Asked for, answer never seen: this bake's own snapshot, if Hetzner made it.
-            None if asked => match cloud.snapshots(Some(&format!("{BUILD_ID_LABEL}={}", super::label_value(&plan.build_id)))).await {
-                Ok(snaps) => snaps.into_iter().map(|s| s.id).collect(),
-                Err(e) => {
-                    orphan_image = Some((0, format!("couldn't look for this bake's snapshot: {e}")));
-                    Vec::new()
+        let ids: Vec<u64> = match (half_made, asked) {
+            (Some((id, false)), _) => vec![id],
+            (Some((_, true)), _) => Vec::new(),
+            // Asked for, answer never seen: this bake's own snapshot, once Hetzner lists it.
+            (None, Request::Sent | Request::Unknown) => {
+                let found = look_for(|| async { cloud.snapshots(Some(&selector)).await.map(|s| s.into_iter().map(|s| s.id).collect::<Vec<_>>()) }).await;
+                match found {
+                    Ok(ids) => ids,
+                    Err(why) => {
+                        orphan_image = Some(format!("a snapshot was asked for and no answer came; {why} — look for label {selector} (`arena image list`)"));
+                        Vec::new()
+                    }
                 }
-            },
-            None => Vec::new(),
+            }
+            _ => Vec::new(),
         };
         for id in ids {
             if let Err(e) = cloud.delete_image(id).await {
-                orphan_image = Some((id, e.to_string()));
+                orphan_image = Some(format!("the half-made image {id} couldn't be deleted ({e}) — `arena image prune --keep 0` or the Hetzner console"));
             }
         }
     }
     let known = server.lock().unwrap().clone();
-    let sent = *created.lock().unwrap();
+    let sent = *create.lock().unwrap();
     let vm = delete_vm(cloud, plan, known, sent, emit).await;
     let (setup_took, snapshot_took) = *took.lock().unwrap();
     Report { result, vm, orphan_image, setup_took, snapshot_took }
@@ -196,36 +212,66 @@ async fn with_ip(cloud: &dyn ImageCloud, pod: Pod) -> std::result::Result<Pod, S
     }
 }
 
-/// Delete the build VM: `known` (its id); else, when a create was sent (`sent`) but its answer
-/// never seen — an error after Hetzner took it, a Ctrl+C before it came — the servers labelled
-/// with this bake's id (never by name: a namesake is another bake's), looked for
-/// [`DELETE_TRIES`] times, [`DELETE_PAUSE`] apart, so a POST still landing is found. Retried.
-async fn delete_vm(cloud: &dyn ImageCloud, plan: &BuildPlan, known: Option<String>, sent: bool, emit: &(dyn Fn(&str) + Sync)) -> VmFate {
-    let ids: Vec<String> = match known {
-        Some(id) => vec![id],
-        None if !sent => return VmFate::NeverMade,
-        None => {
+/// A request to Hetzner that makes something (the VM, the snapshot), as far as the bake knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Request {
+    NotSent,
+    /// Sent, no answer yet (a Ctrl+C now leaves it unknown).
+    Sent,
+    /// Answered with what it made.
+    Made,
+    /// Hetzner answered no (an HTTP 4xx): nothing was made.
+    Refused,
+    /// Failed some other way (the connection, a 5xx): it may have been made.
+    Unknown,
+}
+
+impl Request {
+    fn ended<T>(r: &crate::Result<T>) -> Self {
+        match r {
+            Ok(_) => Request::Made,
+            Err(e) if e.to_string().contains(" HTTP 4") => Request::Refused,
+            Err(_) => Request::Unknown,
+        }
+    }
+}
+
+/// Look for what a request whose answer never came made, [`LOOK_TRIES`] times [`DELETE_PAUSE`]
+/// apart (it may take a moment to be listed): what turned up, or why it can't be told — none
+/// found, or the listing failing.
+async fn look_for<T, F, Fut>(list: F) -> std::result::Result<Vec<T>, String>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = crate::Result<Vec<T>>>,
+{
+    let mut last = String::from("none found in a minute of looking");
+    for i in 0..LOOK_TRIES {
+        if i > 0 {
+            tokio::time::sleep(DELETE_PAUSE).await;
+        }
+        match list().await {
+            Ok(found) if !found.is_empty() => return Ok(found),
+            Ok(_) => last = "none found in a minute of looking".into(),
+            Err(e) => last = format!("couldn't list them: {e}"),
+        }
+    }
+    Err(last)
+}
+
+/// Delete the build VM: `known` (its id); else, when the create's answer never came (`sent`:
+/// [`Request::Sent`] / [`Request::Unknown`] — an error after Hetzner may have taken it, a Ctrl+C
+/// before it came), the servers labelled with this bake's id (never by name: a namesake is another
+/// bake's), looked for over [`LOOK_TRIES`]; none found is [`VmFate::Unsure`], never "never made".
+/// A refused create made nothing. Retried.
+async fn delete_vm(cloud: &dyn ImageCloud, plan: &BuildPlan, known: Option<String>, sent: Request, emit: &(dyn Fn(&str) + Sync)) -> VmFate {
+    let ids: Vec<String> = match (known, sent) {
+        (Some(id), _) => vec![id],
+        (None, Request::NotSent | Request::Refused | Request::Made) => return VmFate::NeverMade,
+        (None, Request::Sent | Request::Unknown) => {
             let selector = format!("{BUILD_ID_LABEL}={}", super::label_value(&plan.build_id));
-            let mut found = None;
-            let mut failed = None;
-            for i in 0..DELETE_TRIES {
-                if i > 0 {
-                    tokio::time::sleep(DELETE_PAUSE).await;
-                }
-                match cloud.servers(&selector).await {
-                    Ok(s) if !s.is_empty() => {
-                        found = Some(s.into_iter().map(|p| p.id).collect());
-                        break;
-                    }
-                    Ok(_) => failed = None,
-                    Err(e) => failed = Some(e.to_string()),
-                }
-            }
-            match (found, failed) {
-                (Some(ids), _) => ids,
-                // Couldn't look: say so — a VM may be there.
-                (None, Some(e)) => return VmFate::Left { id: "?".into(), why: format!("couldn't list the servers to find {}: {e}", plan.name) },
-                (None, None) => return VmFate::NeverMade,
+            match look_for(|| async { cloud.servers(&selector).await.map(|s| s.into_iter().map(|p| p.id).collect::<Vec<_>>()) }).await {
+                Ok(ids) => ids,
+                Err(why) => return VmFate::Unsure { build_id: plan.build_id.clone(), why },
             }
         }
     };

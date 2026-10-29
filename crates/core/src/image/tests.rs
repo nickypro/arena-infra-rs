@@ -369,7 +369,8 @@ impl Root {
         git(&["-c", "user.email=t@t", "-c", "user.name=t", "add", "requirements.txt", "install_uv.sh"]);
         git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
         // The stand-ins for what the script runs as root: swapoff, logged (exit $SWAPOFF_EXIT).
-        w("bin/swapoff", "#!/bin/sh\necho \"swapoff $*\" >> \"$(dirname \"$0\")/../calls.log\"\nexit ${SWAPOFF_EXIT:-0}\n");
+        // (A swapoff that works takes the swap off the stand-in /proc/swaps, as the kernel does.)
+        w("bin/swapoff", "#!/bin/sh\necho \"swapoff $*\" >> \"$(dirname \"$0\")/../calls.log\"\n[ \"${SWAPOFF_EXIT:-0}\" = 0 ] || exit \"$SWAPOFF_EXIT\"\n[ -n \"${SWAPOFF_KEEPS:-}\" ] || sed -i '2,$d' \"$ARENA_PROC_SWAPS\"\n");
         Command::new("chmod").arg("+x").arg(r.path("bin/swapoff")).status().unwrap();
         r
     }
@@ -561,6 +562,20 @@ fn a_swap_that_cant_go_stops_the_scrub() {
     assert!(err.trim_end().ends_with("FAILED: couldn't turn the swap file off (memory pressure?) — its pages may hold secrets"), "{err}");
     assert!(!parse_scrub(&out).done && !r.exists("etc/arena-image"), "stopped before the marker: {out}");
 
+    // swapoff said yes but the swap is still on: stop.
+    let r = Root::new("swap-lingers");
+    r.write("proc-swaps", "Filename\tType\tSize\tUsed\tPriority\n/swapfile file 8388604 0 -2\n");
+    let (code, _, err) = r.scrub_with(&[("SWAPOFF_KEEPS", "1")]);
+    assert_eq!(code, 1);
+    assert!(err.contains("FAILED: a swap is still on after swapoff: /swapfile"), "{err}");
+
+    // /proc/swaps unreadable: whether a swap is on is unknown — stop.
+    let r = Root::new("swap-unknown");
+    let missing = r.path("no-such-proc-swaps").display().to_string();
+    let (code, _, err) = r.scrub_with(&[("ARENA_PROC_SWAPS", &missing)]);
+    assert_eq!(code, 1);
+    assert!(err.contains("whether a swap is on (its pages would go into the image) is unknown"), "{err}");
+
     let r = Root::new("swap-partition");
     r.write("proc-swaps", "Filename\tType\tSize\tUsed\tPriority\n/dev/sda2 partition 2097148 0 -2\n");
     let (code, _, err) = r.scrub();
@@ -579,6 +594,48 @@ fn a_scan_that_fails_is_never_clean() {
     assert_eq!(code, 1, "{out}\n{err}");
     assert!(err.trim_end().ends_with("FAILED: the secret scan failed (grep exit 2: grep: /root/x: Input/output error)"), "{err}");
     assert!(!parse_scrub(&out).done, "{out}");
+}
+
+/// The free space is zeroed: a file of zeros until the disk is full, flushed to the disk while it
+/// still exists, measured, then deleted. A write that ends for any reason but a full disk, or
+/// too little written, stops the bake. (dd, df and sync stood in for: a test can't fill a disk.)
+#[test]
+fn the_free_space_is_zeroed_and_flushed_before_the_file_goes() {
+    let stub = |r: &Root| {
+        r.write("bin/df", "#!/bin/sh\necho 'Filesystem 1024-blocks Used Available Capacity Mounted on'\necho \"/dev/sda1 1 1 ${DF_KB} 1% /\"\n");
+        r.write(
+            "bin/dd",
+            "#!/bin/sh\nfor a; do case $a in of=*) f=${a#of=};; esac; done\nhead -c \"$DD_BYTES\" /dev/zero > \"$f\"\necho \"dd: error writing '$f': ${DD_ERR:-No space left on device}\" >&2\nexit 1\n",
+        );
+        r.write("bin/sync", "#!/bin/sh\nfor f; do [ -e \"$f\" ] && echo \"sync $f (there)\" >> \"$(dirname \"$0\")/../calls.log\"; done\nexit 0\n");
+        r.write("bin/fstrim", "#!/bin/sh\necho fstrim >> \"$(dirname \"$0\")/../calls.log\"\n");
+        for b in ["df", "dd", "sync", "fstrim"] {
+            Command::new("chmod").arg("+x").arg(r.path(&format!("bin/{b}"))).status().unwrap();
+        }
+        std::fs::create_dir_all(r.path("zero")).unwrap();
+        r.path("zero").display().to_string()
+    };
+    // 70000 KB free; at most 64 MB may stay unwritten.
+    let r = Root::new("zero-ok");
+    let dir = stub(&r);
+    let (code, out, err) = r.scrub_with(&[("ARENA_ZERO_DIR", &dir), ("DF_KB", "70000"), ("DD_BYTES", "5000000")]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(r.read("calls.log"), format!("sync {dir}/.arena-zero (there)\nfstrim\n"), "flushed while it was there, then trimmed");
+    assert!(!r.exists("zero/.arena-zero"), "the zeros are gone");
+
+    for (what, env, want) in [
+        ("an I/O error", [("DD_ERR", "Input/output error"), ("DD_BYTES", "5000000")], "didn't end at a full disk: dd: error writing"),
+        ("too little", [("DD_ERR", "No space left on device"), ("DD_BYTES", "1000000")], "zeroing the free space wrote 0 MB of 68 MB free"),
+    ] {
+        let r = Root::new("zero-bad");
+        let dir = stub(&r);
+        let mut e: Vec<(&str, &str)> = vec![("ARENA_ZERO_DIR", &dir), ("DF_KB", "70000")];
+        e.extend(env);
+        let (code, out, err) = r.scrub_with(&e);
+        assert_eq!(code, 1, "{what}: {out}\n{err}");
+        assert!(err.contains(want), "{what}: {err}");
+        assert!(!parse_scrub(&out).done && !r.exists("zero/.arena-zero"), "{what}: {out}");
+    }
 }
 
 #[test]

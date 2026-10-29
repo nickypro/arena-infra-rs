@@ -48,11 +48,14 @@ for h in "$R"/home/*; do [ -d "$h" ] && homes+=("$h"); done
 # bake, as does any other swap that's on (a partition's pages would be in the disk image).
 # (ARENA_PROC_SWAPS: a test's stand-in for /proc/swaps.)
 SWAPS="${ARENA_PROC_SWAPS:-/proc/swaps}"
-on=$(awk 'NR > 1 { print $1 }' "$SWAPS" 2>/dev/null)
+swaps_on() { awk 'NR > 1 { print $1 }' "$SWAPS"; }
+on=$(swaps_on) || die "couldn't read $SWAPS: whether a swap is on (its pages would go into the image) is unknown"
 for dev in $on; do
     [ "$dev" = /swapfile ] || die "a swap ($dev) is on: its pages would go into the image — turn it off first"
     swapoff "$R/swapfile" || die "couldn't turn the swap file off (memory pressure?) — its pages may hold secrets"
 done
+on=$(swaps_on) || die "couldn't read $SWAPS after turning the swap off"
+[ -z "$on" ] || die "a swap is still on after swapoff: $(echo $on)"
 rm -f "$R/swapfile" "$R/etc/sysctl.d/99-arena-swap.conf"
 [ ! -e "$R/swapfile" ] || die "couldn't delete /swapfile"
 [ -f "$R/etc/fstab" ] && { sed -i '\#^/swapfile[[:space:]]#d' "$R/etc/fstab" || die "couldn't edit /etc/fstab"; }
@@ -132,16 +135,28 @@ rm -f "$found" "$errs"
 [ "$hits" -eq 0 ] || { echo "arena-scrub: done ($hits hit(s))"; exit 3; }
 
 # Deleting a file leaves its blocks on the disk until they're reused, and a snapshot copies the
-# disk: zero the free space (a file of zeros until the disk is full, then gone), then let the
-# disk drop the zeroed blocks (fstrim: best effort). Zeroing too little stops the bake.
-if [ -z "$R" ]; then
-    avail_kb=$(df -Pk / | awk 'NR == 2 { printf "%.0f", $4 }')
-    dd if=/dev/zero of=/root/.arena-zero bs=4M status=none 2>/dev/null
-    wrote=$(stat -c %s /root/.arena-zero 2>/dev/null || echo 0)
-    rm -f /root/.arena-zero
+# disk: zero the free space — a file of zeros until the disk is full, flushed to the disk while
+# it still exists (its pages could otherwise be dropped unwritten when it's deleted), measured,
+# then deleted — and let the disk drop the zeroed blocks (fstrim: best effort; the zeros are the
+# guarantee). Anything but a full disk ending the write, or too little written, stops the bake.
+# (ARENA_ZERO_DIR: where a test zeroes, with dd/df/sync stood in for; on a VM, /root on the root
+# filesystem.)
+ZERO_DIR="${ARENA_ZERO_DIR:-/root}"
+if [ -z "$R" ] || [ -n "${ARENA_ZERO_DIR:-}" ]; then
+    zero="$ZERO_DIR/.arena-zero"
+    avail_kb=$(df -Pk "$ZERO_DIR" | awk 'NR == 2 { printf "%.0f", $4 }')
+    case "$avail_kb" in '' | *[!0-9]*) die "couldn't read the free space on $ZERO_DIR ('$avail_kb')" ;; esac
+    dd_err=$(dd if=/dev/zero of="$zero" bs=4M status=none 2>&1)
+    case "$dd_err" in
+        *"No space left on device"*) ;;
+        *) rm -f "$zero"; die "zeroing the free space didn't end at a full disk: ${dd_err:-dd stopped early}" ;;
+    esac
+    sync "$zero" || { rm -f "$zero"; die "couldn't flush the zeroed space to the disk"; }
+    wrote=$(stat -c %s "$zero" 2>/dev/null)
+    rm -f "$zero"
     sync
-    case "$avail_kb$wrote" in *[!0-9]*) die "couldn't measure the free space zeroed ('$avail_kb' KB free, '$wrote' bytes)" ;; esac
-    [ "$wrote" -ge $(( (avail_kb - 262144) * 1024 )) ] \
+    case "$wrote" in '' | *[!0-9]*) die "couldn't measure the zeroed space" ;; esac
+    [ "$wrote" -ge $(( (avail_kb - 65536) * 1024 )) ] \
         || die "zeroing the free space wrote $((wrote / 1048576)) MB of $((avail_kb / 1024)) MB free: deleted files' blocks may remain"
     fstrim -a >/dev/null 2>&1
 fi

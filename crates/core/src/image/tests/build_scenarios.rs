@@ -189,29 +189,44 @@ async fn ctrl_c_during_the_create_finds_the_vm_by_its_build_id() {
     assert_eq!(cloud.servers.lock().unwrap().iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["78"]);
 }
 
-/// A create that failed: whether Hetzner made the server is looked up by this bake's id — a
-/// refusal made none (and a namesake, another bake's, is never touched); an answer lost after
-/// Hetzner took the request did, and that server is deleted.
+/// A create Hetzner refused (an HTTP 4xx answer) made nothing: nothing looked up, nothing
+/// deleted — a namesake, another bake's, is never touched.
 #[tokio::test(start_paused = true)]
-async fn a_failed_create_deletes_only_what_this_bake_made() {
+async fn a_refused_create_deletes_nothing() {
     let cloud = FakeImageCloud::new(vec![]);
-    *cloud.fail_create.lock().unwrap() = Some("hetzner create HTTP 409: uniqueness_error".into());
+    *cloud.fail_create.lock().unwrap() = Some("provider error: hetzner create HTTP 409 Conflict: uniqueness_error".into());
     cloud.add_server(Pod { id: "77".into(), name: "devtest-image-261029-1542".into(), ..Default::default() }, json!({"arena-image-build-id": "b0"}));
     let remote = FakeRemote::new();
     let (r, _) = run(&cloud, &remote, never()).await;
     assert!(r.result.unwrap_err().starts_with("creating the VM: "));
     assert_eq!(r.vm, VmFate::NeverMade);
     assert_eq!(mutations(&cloud), [create_call()]);
-    let looks = cloud.calls().iter().filter(|c| matches!(c, ImageCall::Servers(s) if s == "arena-image-build-id=b1")).count();
-    assert_eq!(looks, crate::image::build::DELETE_TRIES as usize, "looked for a while");
+    assert!(!cloud.calls().iter().any(|c| matches!(c, ImageCall::Servers(_))));
     assert!(remote.calls().is_empty());
+}
 
+/// A create whose answer was lost (after Hetzner took it): what this bake made is looked for by
+/// its id until it's listed — even late — and deleted. Never listed in a minute of looking:
+/// unsure, said as such (it may still turn up, billing) — never "never made".
+#[tokio::test(start_paused = true)]
+async fn a_create_whose_answer_was_lost_is_found_or_reported_unsure() {
     let cloud = FakeImageCloud::new(vec![]);
     *cloud.create_answer_lost.lock().unwrap() = true;
+    *cloud.servers_listed_late.lock().unwrap() = 3;
+    let remote = FakeRemote::new();
     let (r, _) = run(&cloud, &remote, never()).await;
     assert!(r.result.unwrap_err().contains("connection reset"));
     assert_eq!(r.vm, VmFate::Deleted { id: "1001".into() });
     assert!(cloud.servers.lock().unwrap().is_empty());
+    let looks = cloud.calls().iter().filter(|c| matches!(c, ImageCall::Servers(s) if s == "arena-image-build-id=b1")).count();
+    assert_eq!(looks, 4, "listed on the 4th look");
+
+    let cloud = FakeImageCloud::new(vec![]);
+    *cloud.fail_create.lock().unwrap() = Some("provider error: hetzner create: error sending request (timed out)".into());
+    let (r, _) = run(&cloud, &remote, never()).await;
+    assert!(matches!(&r.vm, VmFate::Unsure { build_id, why } if build_id == "b1" && why == "none found in a minute of looking"), "{:?}", r.vm);
+    let looks = cloud.calls().iter().filter(|c| matches!(c, ImageCall::Servers(_))).count();
+    assert_eq!(looks, crate::image::build::LOOK_TRIES as usize);
 }
 
 /// The snapshot's answer lost (or Ctrl+C before it came): this bake's snapshot is found by its
@@ -224,11 +239,21 @@ async fn a_snapshot_whose_answer_was_lost_is_found_and_deleted() {
     cloud.snaps.lock().unwrap().push(other);
     let remote = FakeRemote::new();
     remote.on(HOST, "arena-scrub.sh", FakeReply::stdout(SCRUBBED));
+    *cloud.snaps_listed_late.lock().unwrap() = 2;
     let (r, _) = run(&cloud, &remote, never()).await;
     assert!(r.result.unwrap_err().starts_with("snapshotting: "));
     assert!(cloud.calls().contains(&ImageCall::Snapshots(Some("arena-image-build-id=b1".into()))));
-    assert_eq!(cloud.snaps.lock().unwrap().iter().map(|s| s.id).collect::<Vec<_>>(), [5]);
+    assert_eq!(cloud.snaps.lock().unwrap().iter().map(|s| s.id).collect::<Vec<_>>(), [5], "found on a later look, deleted");
     assert_eq!(r.vm, VmFate::Deleted { id: "1001".into() });
+    assert_eq!(r.orphan_image, None);
+
+    // Never listed: said, with what to look for.
+    let cloud = FakeImageCloud::new(vec![]);
+    *cloud.snapshot_answer_lost.lock().unwrap() = true;
+    *cloud.snaps_listed_late.lock().unwrap() = 100;
+    let (r, _) = run(&cloud, &remote, never()).await;
+    let o = r.orphan_image.expect("said");
+    assert!(o.starts_with("a snapshot was asked for and no answer came; none found in a minute of looking — look for label arena-image-build-id=b1"), "{o}");
 }
 
 /// A delete that keeps failing is retried, then reported as left behind (the caller shouts);
