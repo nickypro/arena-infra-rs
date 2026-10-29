@@ -428,6 +428,7 @@ arena image build --dry-run      # the plan: VM type, what's scrubbed, cost
 arena image build                # ~10 min; asks first (-y: doesn't)
 arena image list                 # this cohort's images; which one `arena` picks; are they current?
 arena image prune [--keep 1]     # delete older ones (and any build VM left behind); asks first
+arena image prune --keep 0       # the programme's end: every one of this cohort's images
 ```
 
 Then `HETZNER_IMAGE=arena` in the config (or `--image arena` on `pods create` / `pods up`, for one
@@ -438,22 +439,31 @@ before.
 
 **What `image build` does.** It creates `<prefix>-image-<yymmdd-hhmm>` from Ubuntu — by default the
 smallest-disk type of `HETZNER_SERVER_TYPE`'s architecture with at least 4 GB of memory (a cx23:
-40 GB) — and runs `pods setup`'s steps on it, without any token. Then it scrubs it: the deploy key,
+40 GB) — and runs `pods setup`'s steps on it, without any token and without swap (a swap file
+holds pages of the VM's memory; the VMs made from the image make their own). Then it scrubs it: the deploy key,
 every file in `~/.ssh` but `known_hosts` (the authorized keys, the github/fleet/archive blocks — the
 new server's own key is written by cloud-init at its first boot), the token exports in the rc files,
 `~/.claude.json`, `~/.claude`, Codex's `auth.json`, the Hugging Face token, git/gh credentials,
 shell history, `~/.name` and the MOTD's name, `~/.arena`, uv's and pip's caches, the swap file and
 its fstab line, `/etc/machine-id` (emptied: systemd makes a new one), the SSH host keys and
 `cloud-init clean --logs` (so the image boots as a new instance and cloud-init makes new host keys
-and sets the new hostname), `/tmp` and the logs. Then it **scans** the homes and `/etc` for the
+and sets the new hostname), `/tmp` and the logs. A swap that's on and can't be turned off and
+deleted stops the bake. Then it **scans** the homes and `/etc` for the
 backup's secret patterns (`SECRET_PATTERNS`: OpenRouter, Anthropic, OpenAI, Hugging Face, GitHub,
 Google, Groq and AWS keys) and private key files (a PEM header on a line of its own), skipping the
 venv (third-party packages) and `.git`. Any hit and it **refuses to snapshot**, naming the files —
-never what matched. Otherwise it powers the VM off and snapshots it, labelled `arena-image=1`,
-`arena-prefix`, `built` (unix), `repo` (`owner.name`), `commit` (the checkout's), `req` (a hash of
-the repo's `install_uv.sh` and `requirements.txt`, what the env install read), `arch` and `disk`.
-The VM is deleted whatever happens — a failed setup, a scan hit, a failed snapshot, Ctrl+C; a
-delete that keeps failing is printed loudly with the VM's id. A build VM is never part of the fleet
+never what matched; a scan that couldn't read something refuses too. Last, it zeroes the disk's
+free space (a file of zeros until the disk is full, then gone, then `fstrim`), so what was deleted
+doesn't stay in free blocks the snapshot copies. (The deploy key and the broadcast tokens are on
+every VM anyway — setup and `copy-keys` put them there — so this is about the bake VM's own
+identity, its history and its logs.) Then it powers the VM off and snapshots it, labelled
+`arena-image=1`, `arena-prefix`, `built` (unix), `repo` (`owner.name`, for people) and `repo-id`
+(a hash of `owner/name`, what `arena` matches on), `commit` (the checkout's), `req` (a hash of the
+repo's `install_uv.sh`, `requirements.txt` and `pyproject.toml`: what the env install read),
+`arch`, `disk` and the bake's own id. The VM is deleted whatever happens — a failed setup, a scan
+hit, a failed snapshot, Ctrl+C; a create or snapshot whose answer was lost is found by the bake's
+id (never by name: two bakes in the same minute share one); a delete that keeps failing is printed
+loudly with the VM's id. A build VM is never part of the fleet
 (no backup, proxy, reap or `pods` command sees it); `teardown --check` lists one still there, and
 `image prune` deletes one over 3 hours old.
 
@@ -469,7 +479,9 @@ requirements unchanged, env kept`.
 **When to rebuild.** When the course repo's requirements change (`image list`'s REQ says `differ`,
 and `config check` says so): every VM from the old image would reinstall. When the image is over 14
 days old (`config check` notes it): VMs fast-forward further at setup, and the system packages age.
-After a change to the setup script. Build, check `image list`, then `image prune`.
+After a change to the setup script. Build, check `image list`, then `image prune`: it keeps the
+newest `--keep` (default 1), the one `arena` picks now and one `HETZNER_IMAGE` names by id — but
+`--keep 0` deletes them all (it warns when `HETZNER_IMAGE` names one).
 
 **Scope and the rules Hetzner sets** (checked 2026-10-29):
 - An image belongs to the **Hetzner project** it was made in. The sandbox project and prod's don't

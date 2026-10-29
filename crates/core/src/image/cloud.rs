@@ -84,7 +84,22 @@ mod fake {
         pub fail_create: Mutex<Option<String>>,
         /// `create_server` takes this long (tokio time).
         pub create_delay: Mutex<Duration>,
+        /// `create_server` / `create_image` make what they're asked for, then answer with an
+        /// error (the answer lost after Hetzner took the request).
+        pub create_answer_lost: Mutex<bool>,
+        pub snapshot_answer_lost: Mutex<bool>,
+        /// Each server's and snapshot's labels, for the label selectors.
+        pub server_labels: Mutex<std::collections::HashMap<String, Map<String, Value>>>,
+        pub snap_labels: Mutex<std::collections::HashMap<u64, Map<String, Value>>>,
         next_id: Mutex<u64>,
+    }
+
+    /// Whether `labels` match a Hetzner label selector (`k=v,k2` — the forms arena sends).
+    fn selects(selector: &str, labels: &Map<String, Value>) -> bool {
+        selector.split(',').all(|term| match term.split_once('=') {
+            Some((k, v)) => labels.get(k).and_then(Value::as_str) == Some(v),
+            None => labels.contains_key(term),
+        })
     }
 
     impl FakeImageCloud {
@@ -93,6 +108,13 @@ mod fake {
             *f.types.lock().unwrap() = types;
             *f.next_id.lock().unwrap() = 1000;
             f
+        }
+
+        /// A server already in the project, with its labels.
+        pub fn add_server(&self, pod: Pod, labels: Value) {
+            let Value::Object(m) = labels else { panic!("labels must be an object") };
+            self.server_labels.lock().unwrap().insert(pod.id.clone(), m);
+            self.servers.lock().unwrap().push(pod);
         }
 
         pub fn calls(&self) -> Vec<ImageCall> {
@@ -114,7 +136,9 @@ mod fake {
     impl ImageCloud for FakeImageCloud {
         async fn snapshots(&self, selector: Option<&str>) -> Result<Vec<Snapshot>> {
             self.record(ImageCall::Snapshots(selector.map(String::from)));
-            Ok(self.snaps.lock().unwrap().clone())
+            let labels = self.snap_labels.lock().unwrap();
+            let none = Map::new();
+            Ok(self.snaps.lock().unwrap().iter().filter(|s| selector.is_none_or(|sel| selects(sel, labels.get(&s.id).unwrap_or(&none)))).cloned().collect())
         }
         async fn server_types(&self) -> Result<Vec<ServerType>> {
             self.record(ImageCall::ServerTypes);
@@ -125,7 +149,7 @@ mod fake {
             Ok(ImagePrice { per_gb_month: 0.0119, currency: "EUR".into() })
         }
         async fn create_server(&self, name: &str, server_type: &str, labels: Map<String, Value>) -> Result<Pod> {
-            self.record(ImageCall::CreateServer { name: name.into(), server_type: server_type.into(), labels });
+            self.record(ImageCall::CreateServer { name: name.into(), server_type: server_type.into(), labels: labels.clone() });
             let delay = *self.create_delay.lock().unwrap();
             tokio::time::sleep(delay).await;
             if let Some(why) = self.fail_create.lock().unwrap().clone() {
@@ -142,7 +166,11 @@ mod fake {
                 gpu_type: Some(server_type.into()),
                 ..Pod::default()
             };
+            self.server_labels.lock().unwrap().insert(pod.id.clone(), labels);
             self.servers.lock().unwrap().push(pod.clone());
+            if *self.create_answer_lost.lock().unwrap() {
+                return Err(Error::provider("hetzner create: error sending request (connection reset)"));
+            }
             Ok(pod)
         }
         async fn server(&self, id: &str) -> Result<Option<Pod>> {
@@ -151,7 +179,9 @@ mod fake {
         }
         async fn servers(&self, selector: &str) -> Result<Vec<Pod>> {
             self.record(ImageCall::Servers(selector.into()));
-            Ok(self.servers.lock().unwrap().clone())
+            let labels = self.server_labels.lock().unwrap();
+            let none = Map::new();
+            Ok(self.servers.lock().unwrap().iter().filter(|p| selects(selector, labels.get(&p.id).unwrap_or(&none))).cloned().collect())
         }
         async fn stop(&self, id: &str) -> Result<()> {
             self.record(ImageCall::Stop(id.into()));
@@ -169,6 +199,10 @@ mod fake {
             }))
             .expect("a snapshot");
             self.snaps.lock().unwrap().push(snap);
+            self.snap_labels.lock().unwrap().insert(id, labels.clone());
+            if *self.snapshot_answer_lost.lock().unwrap() {
+                return Err(Error::provider("hetzner create image: error sending request (connection reset)"));
+            }
             Ok((id, Some(id + 500_000)))
         }
         async fn wait_action(&self, action: u64, _limit: Duration) -> Result<()> {

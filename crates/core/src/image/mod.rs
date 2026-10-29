@@ -47,6 +47,9 @@ pub const LABEL: &str = "arena-image";
 /// temporary build VM.
 pub const PREFIX_LABEL: &str = "arena-prefix";
 
+/// Label on a bake's VM and its snapshot: that bake's own id ([`new_build_id`]).
+pub const BUILD_ID_LABEL: &str = "arena-image-build-id";
+
 /// Label on the temporary build VM (value: the prefix). The fleet never lists a server with it
 /// (`pods *`, the proxy, backups, the reaper): it's no participant's machine, and a backup or
 /// reap mid-bake would only get in the way. `teardown --check` lists it on its own line.
@@ -61,19 +64,20 @@ pub const STALE_DAYS: u64 = 14;
 /// after its first run, so only the first setup on a VM compares the requirements.
 pub const MARKER: &str = "/etc/arena-image";
 
-/// What the env install reads, in hash order: the repo's own installer and its requirements.
-/// A change to either means the image's env isn't the one a fresh VM would get.
-pub const REQ_FILES: [&str; 2] = ["install_uv.sh", "requirements.txt"];
+/// What the env install reads, in hash order: the repo's own installer, its requirements, and
+/// `pyproject.toml` (whose `requires-python` picks the venv's Python when there's no installer).
+/// A change to any means the image's env may not be the one a fresh VM would get.
+pub const REQ_FILES: [&str; 3] = ["install_uv.sh", "requirements.txt", "pyproject.toml"];
 
 /// The shell twin of [`req_hash`], verbatim in `hetzner_setup.sh` and the scrub script (a test
 /// holds all three to the same answer): each of [`REQ_FILES`] that exists in the directory, as
 /// its name, a newline and its bytes, through sha256; the first 12 hex digits.
-pub const REQ_HASH_FN: &str = r#"arena_req_hash() { ( cd "$1" 2>/dev/null || exit 0; for f in install_uv.sh requirements.txt; do if [ -f "$f" ]; then printf '%s\n' "$f"; cat "$f"; fi; done ) | sha256sum | cut -c1-12; }"#;
+pub const REQ_HASH_FN: &str = r#"arena_req_hash() { ( cd "$1" 2>/dev/null || exit 0; for f in install_uv.sh requirements.txt pyproject.toml; do if [ -f "$f" ]; then printf '%s\n' "$f"; cat "$f"; fi; done ) | sha256sum | cut -c1-12; }"#;
 
 /// [`REQ_HASH_FN`] in Rust, over the files' contents (`None`: not in the repo). Pure.
-pub fn req_hash(install_uv: Option<&[u8]>, requirements: Option<&[u8]>) -> String {
+pub fn req_hash(install_uv: Option<&[u8]>, requirements: Option<&[u8]>, pyproject: Option<&[u8]>) -> String {
     let mut bytes = Vec::new();
-    for (name, body) in REQ_FILES.iter().zip([install_uv, requirements]) {
+    for (name, body) in REQ_FILES.iter().zip([install_uv, requirements, pyproject]) {
         if let Some(b) = body {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'\n');
@@ -95,22 +99,37 @@ pub fn label_value(s: &str) -> String {
     out
 }
 
-/// Whose images these are: the cohort prefix and its repo (`owner.name`, as a label value).
+/// Whose images these are: the cohort prefix and its repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scope {
     pub prefix: String,
+    /// `owner.name`, as a label value (for people: clipped to 63 characters).
     pub repo: String,
+    /// The repo's identity ([`repo_id`]): what `arena` matches on — two long names can share
+    /// their first 63 characters.
+    pub repo_id: String,
+}
+
+/// A repo's identity as a label: the first 16 hex digits of the SHA-256 of `owner/name`
+/// (lowercased: GitHub's names aren't case-sensitive). Empty for no repo. Pure.
+pub fn repo_id(owner: &str, name: &str) -> String {
+    if owner.is_empty() || name.is_empty() {
+        return String::new();
+    }
+    crate::update::sha256_hex(format!("{owner}/{name}").to_lowercase().as_bytes())[..16].to_string()
 }
 
 impl Scope {
+    /// `prefix`'s images of `owner/name`.
+    pub fn new(prefix: &str, owner: &str, name: &str) -> Self {
+        let repo = if owner.is_empty() || name.is_empty() { String::new() } else { label_value(&format!("{owner}.{name}")) };
+        Self { prefix: label_value(prefix), repo, repo_id: repo_id(owner, name) }
+    }
+
     /// From `MACHINE_NAME_PREFIX` (default `arena`) and `ARENA_REPO_OWNER`/`ARENA_REPO_NAME`.
     pub fn from_config(cfg: &Config) -> Self {
         let get = |k: &str| cfg.get(k).map(str::trim).filter(|s| !s.is_empty());
-        let repo = match (get("ARENA_REPO_OWNER"), get("ARENA_REPO_NAME")) {
-            (Some(o), Some(n)) => format!("{o}.{n}"),
-            _ => String::new(),
-        };
-        Self { prefix: label_value(get("MACHINE_NAME_PREFIX").unwrap_or("arena")), repo: label_value(&repo) }
+        Self::new(get("MACHINE_NAME_PREFIX").unwrap_or("arena"), get("ARENA_REPO_OWNER").unwrap_or(""), get("ARENA_REPO_NAME").unwrap_or(""))
     }
 
     /// `GET /images` / `GET /servers` label selector for this cohort's `key` resources.
@@ -141,6 +160,8 @@ pub struct Snapshot {
     pub arena: bool,
     pub prefix: Option<String>,
     pub repo: Option<String>,
+    /// [`repo_id`] of the repo it holds.
+    pub repo_id: Option<String>,
     pub commit: Option<String>,
     pub req: Option<String>,
     /// `built=` (unix), else `created`.
@@ -179,6 +200,7 @@ pub fn parse_snapshot(v: &Value) -> Option<Snapshot> {
         arena: label(LABEL).is_some(),
         prefix: label(PREFIX_LABEL),
         repo: label("repo"),
+        repo_id: label("repo-id"),
         commit: label("commit"),
         req: label("req"),
         built: label("built").and_then(|b| b.parse().ok()).or(created),
@@ -272,7 +294,7 @@ pub fn newest_fitting<'a>(snaps: &'a [Snapshot], scope: &Scope, fit: &Fit) -> Re
     if ours.is_empty() {
         return Err("no arena-built snapshot in this Hetzner project".into());
     }
-    let mine: Vec<&Snapshot> = ours.iter().copied().filter(|s| s.repo.as_deref() == Some(scope.repo.as_str())).collect();
+    let mine: Vec<&Snapshot> = ours.iter().copied().filter(|s| !scope.repo_id.is_empty() && s.repo_id.as_deref() == Some(scope.repo_id.as_str())).collect();
     if mine.is_empty() {
         return Err(format!("none of the {} arena-built snapshot(s) here is of {}", ours.len(), scope.repo.replacen('.', "/", 1)));
     }
@@ -448,6 +470,8 @@ pub fn build_name(prefix: &str, now: u64) -> String {
 /// What the bake learnt, for the snapshot's labels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Baked {
+    /// This bake's own id ([`BUILD_ID_LABEL`]).
+    pub build_id: String,
     pub built: u64,
     pub commit: String,
     pub req: String,
@@ -463,6 +487,8 @@ pub fn labels(scope: &Scope, b: &Baked) -> Map<String, Value> {
         (PREFIX_LABEL, scope.prefix.clone()),
         ("built", b.built.to_string()),
         ("repo", scope.repo.clone()),
+        ("repo-id", scope.repo_id.clone()),
+        (BUILD_ID_LABEL, label_value(&b.build_id)),
         ("commit", label_value(&b.commit)),
         ("req", label_value(&b.req)),
         ("arch", label_value(&b.arch)),
@@ -473,12 +499,21 @@ pub fn labels(scope: &Scope, b: &Baked) -> Map<String, Value> {
     m
 }
 
-/// The temporary VM's labels: [`BUILD_LABEL`] and the prefix.
-pub fn build_vm_labels(scope: &Scope) -> Map<String, Value> {
+/// The temporary VM's labels: [`BUILD_LABEL`], the prefix and this bake's id.
+pub fn build_vm_labels(scope: &Scope, build_id: &str) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(BUILD_LABEL.into(), Value::from(scope.prefix.clone()));
     m.insert(PREFIX_LABEL.into(), Value::from(scope.prefix.clone()));
+    m.insert(BUILD_ID_LABEL.into(), Value::from(label_value(build_id)));
     m
+}
+
+/// A bake's own id (unix nanoseconds and the pid): on its VM and its snapshot, so a bake whose
+/// create (or snapshot) answer never came finds what it made — and only that, never another
+/// bake's of the same name. Impure (the clock).
+pub fn new_build_id() -> String {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("{nanos}-{}", std::process::id())
 }
 
 /// The scrub script, rendered: the secret patterns the backup redacts (plus private keys) for its
@@ -561,7 +596,7 @@ pub fn list_table(snaps: &[Snapshot], scope: &Scope, now: u64, price: Option<&Im
             if s.status != "available" {
                 note.push(s.status.clone());
             }
-            if s.repo.as_deref() != Some(scope.repo.as_str()) {
+            if s.repo_id.as_deref() != Some(scope.repo_id.as_str()) {
                 note.push(format!("other repo ({})", s.repo.as_deref().unwrap_or("?")));
             }
             vec![
@@ -589,14 +624,16 @@ pub fn list_table(snaps: &[Snapshot], scope: &Scope, now: u64, price: Option<&Im
 }
 
 /// What `image prune --keep N` deletes: this cohort's arena snapshots past the newest `keep`,
-/// except the one `HETZNER_IMAGE=arena` resolves to now (`protect`): `(kept, deleted)`, newest
-/// first. (Leftover build VMs: [`leftover_build_vms`].) Pure.
-pub fn prune_plan<'a>(snaps: &'a [Snapshot], scope: &Scope, keep: usize, protect: Option<u64>) -> (Vec<&'a Snapshot>, Vec<&'a Snapshot>) {
+/// except (for `keep` ≥ 1) those in `protect` — the one `HETZNER_IMAGE=arena` resolves to now, or
+/// the one HETZNER_IMAGE names by id: `(kept, deleted)`, newest first. `--keep 0` deletes them
+/// all. (Leftover build VMs: [`leftover_build_vms`].) Pure.
+pub fn prune_plan<'a>(snaps: &'a [Snapshot], scope: &Scope, keep: usize, protect: &[u64]) -> (Vec<&'a Snapshot>, Vec<&'a Snapshot>) {
     let mut ours: Vec<&Snapshot> = snaps.iter().filter(|s| s.ours(scope)).collect();
     ours.sort_by_key(|s| std::cmp::Reverse((s.built.unwrap_or(0), s.id)));
     let (mut kept, mut gone) = (Vec::new(), Vec::new());
     for (i, s) in ours.into_iter().enumerate() {
-        if i < keep || Some(s.id) == protect {
+        // `--keep 0` is the programme's end: everything goes, protected or not.
+        if i < keep || (keep > 0 && protect.contains(&s.id)) {
             kept.push(s);
         } else {
             gone.push(s);

@@ -71,7 +71,7 @@ impl Default for HetznerOpts {
             ssh_keys: Vec::new(),
             ssh_keys_from: "MACHINE_NAME_PREFIX",
             pubkey_file: None,
-            image_scope: crate::image::Scope { prefix: "arena".into(), repo: String::new() },
+            image_scope: crate::image::Scope::new("arena", "", ""),
         }
     }
 }
@@ -1347,15 +1347,15 @@ mod tests {
         use crate::http::test_server::{canned, serve};
         let images = json!({"images": [
             {"id": 10, "description": "old", "status": "available", "disk_size": 40, "architecture": "x86", "image_size": 6.0,
-             "labels": {"arena-image": "1", "arena-prefix": "devtest", "repo": "o.r", "built": "1000"}},
+             "labels": {"arena-image": "1", "arena-prefix": "devtest", "repo-id": crate::image::repo_id("o", "r"), "built": "1000"}},
             {"id": 11, "description": "new", "status": "available", "disk_size": 40, "architecture": "x86", "image_size": 6.0,
-             "labels": {"arena-image": "1", "arena-prefix": "devtest", "repo": "o.r", "built": "2000"}},
+             "labels": {"arena-image": "1", "arena-prefix": "devtest", "repo-id": crate::image::repo_id("o", "r"), "built": "2000"}},
         ]});
         let types = json!({"server_types": [{"name": "cx33", "architecture": "x86", "disk": 80, "memory": 8.0, "cores": 4, "prices": []}]});
         let opts = HetznerOpts {
             image: "arena".into(),
             locations: Locations::parse(Some("nbg1")),
-            image_scope: crate::image::Scope { prefix: "devtest".into(), repo: "o.r".into() },
+            image_scope: crate::image::Scope::new("devtest", "o", "r"),
             ..HetznerOpts::default()
         };
         let srv = serve(vec![

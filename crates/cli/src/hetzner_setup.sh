@@ -247,7 +247,7 @@ pick_python() {
 # path); different, and it's rebuilt as on a fresh VM. Later setups on the VM (`adopted=` in the
 # file) leave an env that passes the gate alone, as on any VM: a participant's packages are in it.
 # (ARENA_IMAGE_FILE: a test's stand-in; never set on a pod.)
-arena_req_hash() { ( cd "$1" 2>/dev/null || exit 0; for f in install_uv.sh requirements.txt; do if [ -f "$f" ]; then printf '%s\n' "$f"; cat "$f"; fi; done ) | sha256sum | cut -c1-12; }
+arena_req_hash() { ( cd "$1" 2>/dev/null || exit 0; for f in install_uv.sh requirements.txt pyproject.toml; do if [ -f "$f" ]; then printf '%s\n' "$f"; cat "$f"; fi; done ) | sha256sum | cut -c1-12; }
 IMAGE_FILE="${ARENA_IMAGE_FILE:-/etc/arena-image}"
 FROM_IMAGE=0
 if [ -f "$IMAGE_FILE" ] && ! grep -q '^adopted=' "$IMAGE_FILE" 2>/dev/null; then FROM_IMAGE=1; fi

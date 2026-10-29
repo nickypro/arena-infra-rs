@@ -522,7 +522,7 @@ fn a_vm_from_an_arena_image_keeps_its_env_when_the_requirements_match() {
     assert!(bake.ok, "{}", bake.stderr);
     assert!(image_said(&bake.stdout).is_empty(), "no image file: nothing said: {}", bake.stdout);
     let rd = |f: &str| std::fs::read(repo.join(f)).unwrap();
-    let req = arena_core::image::req_hash(Some(&rd("install_uv.sh")), Some(&rd("requirements.txt")));
+    let req = arena_core::image::req_hash(Some(&rd("install_uv.sh")), Some(&rd("requirements.txt")), None);
     assert_eq!(std::fs::read_to_string(repo.join(".venv/.arena-req")).unwrap(), format!("{req}\n"));
 
     std::fs::remove_file(repo.join("install_uv.ran")).unwrap();
@@ -555,7 +555,7 @@ fn a_vm_from_an_image_built_from_other_requirements_rebuilds_its_env_once() {
     let mut reqs = std::fs::read_to_string(repo.join("requirements.txt")).unwrap();
     reqs.push_str("einops\n");
     std::fs::write(repo.join("requirements.txt"), &reqs).unwrap();
-    let new = arena_core::image::req_hash(Some(&std::fs::read(repo.join("install_uv.sh")).unwrap()), Some(reqs.as_bytes()));
+    let new = arena_core::image::req_hash(Some(&std::fs::read(repo.join("install_uv.sh")).unwrap()), Some(reqs.as_bytes()), None);
     let marker = image_marker(&repo, arena_core::snapshot::unix_now() - 20 * 86_400, &old);
     let m = marker.display().to_string();
     let r = run(&stubs, &home, &repo, &[("ARENA_IMAGE_FILE", &m), ("UV_INSTALL_MAKES_TORCH", "1")]);

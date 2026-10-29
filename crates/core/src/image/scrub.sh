@@ -9,7 +9,8 @@
 # (/etc/machine-id, the SSH host keys — cloud-init's first boot of a new instance makes new
 # ones), /tmp and the logs. Then a scan of the home directories and /etc for the backup's
 # secret patterns and private keys: any hit and the bake refuses to snapshot. The scan prints
-# file names, never what matched.
+# file names, never what matched. Last, the free space is zeroed: what was deleted doesn't stay
+# in the disk's free blocks.
 #
 # Run as root with REPO_DIR, KEY_REMOTE (the deploy key's path), NAME (the image's name) and BUILT
 # (unix). Prints:
@@ -42,9 +43,18 @@ homes=("$R/root")
 for h in "$R"/home/*; do [ -d "$h" ] && homes+=("$h"); done
 
 # Swap: off and gone, and its fstab line and sysctl file (setup makes them again, sized for the
-# new VM). A swap file would also put GBs of the bake VM's memory into the image.
-swapoff "$R/swapfile" 2>/dev/null
+# new VM). The bake sets up without swap, so there should be none; but a swap file holds pages of
+# the bake VM's memory — keys among them — so one that can't be turned off and deleted stops the
+# bake, as does any other swap that's on (a partition's pages would be in the disk image).
+# (ARENA_PROC_SWAPS: a test's stand-in for /proc/swaps.)
+SWAPS="${ARENA_PROC_SWAPS:-/proc/swaps}"
+on=$(awk 'NR > 1 { print $1 }' "$SWAPS" 2>/dev/null)
+for dev in $on; do
+    [ "$dev" = /swapfile ] || die "a swap ($dev) is on: its pages would go into the image — turn it off first"
+    swapoff "$R/swapfile" || die "couldn't turn the swap file off (memory pressure?) — its pages may hold secrets"
+done
 rm -f "$R/swapfile" "$R/etc/sysctl.d/99-arena-swap.conf"
+[ ! -e "$R/swapfile" ] || die "couldn't delete /swapfile"
 [ -f "$R/etc/fstab" ] && { sed -i '\#^/swapfile[[:space:]]#d' "$R/etc/fstab" || die "couldn't edit /etc/fstab"; }
 
 for h in "${homes[@]}"; do
@@ -98,20 +108,42 @@ printf 'name=%s\nbuilt=%s\ncommit=%s\nreq=%s\n' "$NAME" "$BUILT" "$commit" "$req
 # A private key is a PEM header on a line of its own — what a key file (the deploy key, a host
 # key, one pasted into a file) has. Not the header inside a line: third-party code and docs
 # quote it (live 2026-10-29: VS Code server's ssh2 module, oh-my-zsh's dotenv README).
+# A scan that couldn't read something is no clean scan: grep's status is checked (0 found, 1
+# none; anything else — an unreadable file, a bad pattern — stops the bake), as is find's.
 SECRET_RE='@SECRET_RE@'
 KEY_RE=$'^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----\r?$'
+found=$(mktemp) && errs=$(mktemp) || die "couldn't make the scan's temp files"
+LC_ALL=C grep -rlIE -D skip --exclude-dir=.git --exclude-dir=.venv -e "$SECRET_RE" -e "$KEY_RE" "${homes[@]}" "$R/etc" > "$found" 2> "$errs"
+st=$?
+[ "$st" -le 1 ] || { why=$(tail -n1 "$errs"); rm -f "$found" "$errs"; die "the secret scan failed (grep exit $st: $why)"; }
+# Whatever the patterns miss: any key file or authorized_keys left in an .ssh directory.
+for h in "${homes[@]}"; do
+    [ -d "$h/.ssh" ] || continue
+    find "$h/.ssh" -mindepth 1 ! -type d ! -name known_hosts >> "$found" 2> "$errs" \
+        || { why=$(tail -n1 "$errs"); rm -f "$found" "$errs"; die "the scan of $h/.ssh failed: $why"; }
+done
 hits=0
 while IFS= read -r f; do
     [ -n "$f" ] || continue
     echo "arena-scan: ${f#"$R"}"
     hits=$((hits + 1))
-done < <(LC_ALL=C grep -rlIE --exclude-dir=.git --exclude-dir=.venv -e "$SECRET_RE" -e "$KEY_RE" "${homes[@]}" "$R/etc" 2>/dev/null)
-# Whatever the patterns miss: any key file or authorized_keys left in an .ssh directory.
-while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    echo "arena-scan: ${f#"$R"}"
-    hits=$((hits + 1))
-done < <(for h in "${homes[@]}"; do [ -d "$h/.ssh" ] && find "$h/.ssh" -mindepth 1 ! -type d ! -name known_hosts; done 2>/dev/null)
+done < "$found"
+rm -f "$found" "$errs"
+[ "$hits" -eq 0 ] || { echo "arena-scrub: done ($hits hit(s))"; exit 3; }
+
+# Deleting a file leaves its blocks on the disk until they're reused, and a snapshot copies the
+# disk: zero the free space (a file of zeros until the disk is full, then gone), then let the
+# disk drop the zeroed blocks (fstrim: best effort). Zeroing too little stops the bake.
+if [ -z "$R" ]; then
+    avail_kb=$(df -Pk / | awk 'NR == 2 { printf "%.0f", $4 }')
+    dd if=/dev/zero of=/root/.arena-zero bs=4M status=none 2>/dev/null
+    wrote=$(stat -c %s /root/.arena-zero 2>/dev/null || echo 0)
+    rm -f /root/.arena-zero
+    sync
+    case "$avail_kb$wrote" in *[!0-9]*) die "couldn't measure the free space zeroed ('$avail_kb' KB free, '$wrote' bytes)" ;; esac
+    [ "$wrote" -ge $(( (avail_kb - 262144) * 1024 )) ] \
+        || die "zeroing the free space wrote $((wrote / 1048576)) MB of $((avail_kb / 1024)) MB free: deleted files' blocks may remain"
+    fstrim -a >/dev/null 2>&1
+fi
 sync
-echo "arena-scrub: done ($hits hit(s))"
-[ "$hits" -eq 0 ] || exit 3
+echo "arena-scrub: done (0 hit(s))"

@@ -18,7 +18,8 @@ earlier).
 - `arena image build` bakes a Hetzner image: a temporary cx23 set up as `pods setup` does (no
   tokens), scrubbed of everything that belongs to that machine (deploy key, authorized keys,
   tokens, history, name, swap, machine-id, SSH host keys, cloud-init state, logs), scanned for
-  secrets — it refuses to snapshot on any hit, naming the file — then snapshotted. The VM is
+  secrets — it refuses to snapshot on any hit, naming the file — its free space zeroed, then
+  snapshotted. The VM is
   deleted whatever happens, Ctrl+C included. `arena image list` shows the images, their cost and
   whether the repo's requirements still match; `arena image prune` deletes old ones.
 - `HETZNER_IMAGE=arena` (or `--image arena` on `pods create` / `pods up`) creates VMs from the

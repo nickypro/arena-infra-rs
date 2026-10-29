@@ -122,7 +122,8 @@ pub(crate) async fn repo_requirements(cfg: &Config) -> std::result::Result<(Stri
         let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
         let install = show("HEAD:install_uv.sh").await?;
         let reqs = show("HEAD:requirements.txt").await?;
-        Ok((head, image::req_hash(install.as_deref(), reqs.as_deref())))
+        let pyproject = show("HEAD:pyproject.toml").await?;
+        Ok((head, image::req_hash(install.as_deref(), reqs.as_deref(), pyproject.as_deref())))
     };
     let r = match tokio::time::timeout(LOOKUP_TIMEOUT, result).await {
         Ok(r) => r,
@@ -210,11 +211,17 @@ async fn prune(cloud: &HetznerProvider, cfg: &Config, keep: usize, dry_run: bool
     let scope = Scope::from_config(cfg);
     let now = arena_core::snapshot::unix_now();
     let (resolved, snaps) = resolve(cloud, cfg, &Setting::Arena, &opts.server_type).await?;
-    let protect = match &resolved {
-        Resolved::Snapshot(s) => Some(s.id),
+    // Kept whatever --keep says (but 0): what `arena` picks now, and an image HETZNER_IMAGE names.
+    let mut protect = Vec::new();
+    if let Resolved::Snapshot(s) = &resolved {
+        protect.push(s.id);
+    }
+    let configured = match Setting::parse(&opts.image) {
+        Setting::Id(id) => Some(id),
         _ => None,
     };
-    let (kept, gone) = image::prune_plan(&snaps, &scope, keep, protect);
+    protect.extend(configured);
+    let (kept, gone) = image::prune_plan(&snaps, &scope, keep, &protect);
     let servers = cloud.servers(&scope.selector(image::BUILD_LABEL)).await.context("listing build VMs")?;
     let leftovers = image::leftover_build_vms(&servers, now);
     let price = cloud.image_price().await.ok();
@@ -234,6 +241,9 @@ async fn prune(cloud: &HetznerProvider, cfg: &Config, keep: usize, dry_run: bool
     if gone.is_empty() && leftovers.is_empty() {
         println!("Nothing to prune (keeping the newest {keep}).");
         return Ok(());
+    }
+    if let Some(id) = configured.filter(|id| gone.iter().any(|s| s.id == *id)) {
+        println!("⚠ HETZNER_IMAGE={id} is one of these: creates from it fail once it's gone — set HETZNER_IMAGE first");
     }
     if dry_run {
         println!("Dry run — nothing deleted.");
@@ -294,9 +304,12 @@ async fn build(
     let fits: Vec<&str> = types.iter().filter(|t| t.architecture == offer.architecture && t.disk_gb.is_some_and(|d| d >= disk)).map(|t| t.name.as_str()).collect();
     let now = arena_core::snapshot::unix_now();
     let name = image::build_name(&scope.prefix, now);
-    // `pods setup`'s steps for a Hetzner pod — without any token (the image must hold none).
+    // `pods setup`'s steps for a Hetzner pod — without any token (the image must hold none) and
+    // without swap: a swap file would hold pages of this VM's memory, keys among them (the VMs
+    // made from the image make their own).
     let mut scfg = arena_core::setup::SetupConfig::from_config(cfg)?;
     scfg.broadcast_exports.clear();
+    scfg.swap_gb = 0;
     let timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, None)?;
     let script = super::stage_hetzner_script(true)?;
     let steps = arena_core::setup::provisioning_steps("hetzner", &scfg, &name, false, &script, &timeouts);
@@ -324,6 +337,7 @@ async fn build(
 
     let plan = BuildPlan {
         name: name.clone(),
+        build_id: image::new_build_id(),
         server_type: ty.clone(),
         scope: scope.clone(),
         setup: steps,

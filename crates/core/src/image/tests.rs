@@ -7,7 +7,11 @@ use super::*;
 use crate::provider::hetzner::ServerType;
 
 fn scope() -> Scope {
-    Scope { prefix: "devtest".into(), repo: "nickypro.arena-sandbox-materials".into() }
+    Scope::new("devtest", "nickypro", "arena-sandbox-materials")
+}
+
+fn rid() -> String {
+    repo_id("nickypro", "arena-sandbox-materials")
 }
 
 /// A snapshot as `GET /images` lists one, with arena's labels unless `labels` is null.
@@ -27,7 +31,7 @@ fn snap(id: u64, built: u64, labels: serde_json::Value) -> Snapshot {
 }
 
 fn ours(id: u64, built: u64) -> Snapshot {
-    snap(id, built, json!({"arena-image": "1", "arena-prefix": "devtest", "repo": "nickypro.arena-sandbox-materials", "commit": "abc", "req": "r1"}))
+    snap(id, built, json!({"arena-image": "1", "arena-prefix": "devtest", "repo": "nickypro.arena-sandbox-materials", "repo-id": rid(), "commit": "abc", "req": "r1"}))
 }
 
 fn fit(ty: &str, arch: &str, disk: u32) -> Fit {
@@ -42,14 +46,15 @@ const NOW: u64 = 1_793_000_000;
 #[test]
 fn the_requirements_hash_is_the_same_in_rust_and_in_the_scripts() {
     let dir = std::env::temp_dir().join(format!("arena-req-{}", std::process::id()));
-    type Files<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
-    let cases: [Files; 4] = [
-        (Some(b"#!/bin/bash\nuv venv\n"), Some(b"torch==2.14\ntransformer_lens\n")),
-        (None, Some(b"numpy\n")),
-        (Some(b"x"), None),
-        (None, None),
+    type Files<'a> = (Option<&'a [u8]>, Option<&'a [u8]>, Option<&'a [u8]>);
+    let cases: [Files; 5] = [
+        (Some(b"#!/bin/bash\nuv venv\n"), Some(b"torch==2.14\ntransformer_lens\n"), None),
+        (None, Some(b"numpy\n"), Some(b"[project]\nrequires-python = \">=3.14\"\n")),
+        (Some(b"x"), None, None),
+        (None, None, Some(b"y")),
+        (None, None, None),
     ];
-    for (install, reqs) in cases {
+    for (install, reqs, pyproject) in cases {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         if let Some(b) = install {
@@ -58,12 +63,16 @@ fn the_requirements_hash_is_the_same_in_rust_and_in_the_scripts() {
         if let Some(b) = reqs {
             std::fs::write(dir.join("requirements.txt"), b).unwrap();
         }
+        if let Some(b) = pyproject {
+            std::fs::write(dir.join("pyproject.toml"), b).unwrap();
+        }
         let out = Command::new("bash").arg("-c").arg(format!("{REQ_HASH_FN}; arena_req_hash \"$1\"")).arg("x").arg(&dir).output().unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), req_hash(install, reqs), "{install:?} {reqs:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), req_hash(install, reqs, pyproject), "{install:?} {reqs:?} {pyproject:?}");
     }
     let _ = std::fs::remove_dir_all(&dir);
     assert!(scrub_script().contains(REQ_HASH_FN));
-    assert_ne!(req_hash(Some(b"a"), None), req_hash(None, Some(b"a")), "which file it is counts");
+    assert_ne!(req_hash(Some(b"a"), None, None), req_hash(None, Some(b"a"), None), "which file it is counts");
+    assert_ne!(req_hash(None, Some(b"a"), None), req_hash(None, Some(b"a"), Some(b"p")), "a new requires-python counts");
 }
 
 #[test]
@@ -127,7 +136,14 @@ fn arena_resolves_to_the_newest_image_that_fits() {
     arm.arch = Some("arm".into());
     let mut big = ours(7, NOW);
     big.disk_gb = Some(80);
-    let other_repo = snap(8, NOW, json!({"arena-image": "1", "arena-prefix": "devtest", "repo": "o.other"}));
+    let other_repo = snap(8, NOW, json!({"arena-image": "1", "arena-prefix": "devtest", "repo": "o.other", "repo-id": repo_id("o", "other")}));
+    // Two long repos whose readable labels are the same 63 characters: told apart by their ids.
+    let long = |n: &str| Scope::new("devtest", &"o".repeat(40), &format!("{}{n}", "n".repeat(30)));
+    assert_eq!(long("a").repo, long("b").repo);
+    assert_ne!(long("a").repo_id, long("b").repo_id);
+    let twin = snap(12, NOW, json!({"arena-image": "1", "arena-prefix": "devtest", "repo": long("a").repo, "repo-id": long("a").repo_id}));
+    assert!(newest_fitting(std::slice::from_ref(&twin), &long("b"), &fit("cx23", "x86", 40)).is_err());
+    assert_eq!(newest_fitting(std::slice::from_ref(&twin), &long("a"), &fit("cx23", "x86", 40)).map(|s| s.id), Ok(12));
     let hand_made = snap(9, NOW, json!({"arena-prefix": "devtest"}));
     type Case<'a> = (&'a str, Vec<Snapshot>, Fit, Result<u64, &'a str>);
     let cases: Vec<Case> = vec![
@@ -218,18 +234,22 @@ fn the_build_vm_and_snapshot_are_named_and_labelled_as_ours() {
     let t = 1_793_288_520;
     assert_eq!(&crate::snapshot::rfc3339(t)[..16], "2026-10-29T15:42");
     assert_eq!(build_name("devtest", t), "devtest-image-261029-1542");
-    let l = labels(&scope(), &Baked { built: t, commit: "3eed962b9bd8".into(), req: "a40bc7471764".into(), arch: "x86".into(), disk_gb: 40 });
+    let l = labels(&scope(), &Baked { build_id: "1793288520000000000-42".into(), built: t, commit: "3eed962b9bd8".into(), req: "a40bc7471764".into(), arch: "x86".into(), disk_gb: 40 });
     let want = json!({
         "arena-image": "1", "arena-prefix": "devtest", "built": t.to_string(), "repo": "nickypro.arena-sandbox-materials",
+        "repo-id": rid(), "arena-image-build-id": "1793288520000000000-42",
         "commit": "3eed962b9bd8", "req": "a40bc7471764", "arch": "x86", "disk": "40"
     });
+    assert_eq!(rid().len(), 16);
     assert_eq!(Value::Object(l.clone()), want);
     for v in l.values() {
         let v = v.as_str().unwrap();
         assert_eq!(label_value(v), v, "a label value Hetzner refuses: {v}");
     }
-    let vm = build_vm_labels(&scope());
-    assert_eq!(Value::Object(vm), json!({"arena-image-build": "devtest", "arena-prefix": "devtest"}));
+    let vm = build_vm_labels(&scope(), "7-1");
+    assert_eq!(Value::Object(vm), json!({"arena-image-build": "devtest", "arena-prefix": "devtest", "arena-image-build-id": "7-1"}));
+    let (a, b) = (new_build_id(), new_build_id());
+    assert!(a != b && label_value(&a) == a, "{a} {b}");
     assert_eq!(scope().selector(LABEL), "arena-image=1,arena-prefix=devtest");
     assert_eq!(scope().selector(BUILD_LABEL), "arena-image-build=devtest");
 }
@@ -262,11 +282,16 @@ fn list_marks_what_arena_picks_and_prune_keeps_it() {
     assert!(lines[1].starts_with("3 ") && lines[2].starts_with("2 ") && lines[3].starts_with("1 "), "newest first:\n{t}");
     assert!(lines[2].ends_with("differ  ← arena"), "{t}");
     assert!(lines[1].contains("5.8 GB") && lines[1].contains("$0.12") && lines[1].contains("40 GB"), "{t}");
-    // Keep the newest one — and the one arena resolves to, though older.
-    let (kept, gone) = prune_plan(&snaps, &scope(), 1, Some(2));
-    assert_eq!((kept.iter().map(|s| s.id).collect::<Vec<_>>(), gone.iter().map(|s| s.id).collect::<Vec<_>>()), (vec![3, 2], vec![1]));
-    let (kept, gone) = prune_plan(&snaps, &scope(), 0, None);
-    assert_eq!((kept.len(), gone.iter().map(|s| s.id).collect::<Vec<_>>()), (0, vec![3, 2, 1]), "never the hand-made one");
+    // Keep the newest one — and the one arena resolves to (2) and one HETZNER_IMAGE names (1),
+    // though older.
+    let ids = |v: Vec<&Snapshot>| v.iter().map(|s| s.id).collect::<Vec<_>>();
+    let (kept, gone) = prune_plan(&snaps, &scope(), 1, &[2]);
+    assert_eq!((ids(kept), ids(gone)), (vec![3, 2], vec![1]));
+    let (kept, gone) = prune_plan(&snaps, &scope(), 1, &[2, 1]);
+    assert_eq!((ids(kept), ids(gone)), (vec![3, 2, 1], vec![]));
+    // --keep 0: the programme's end — every one of ours goes, protected or not; never the hand-made one.
+    let (kept, gone) = prune_plan(&snaps, &scope(), 0, &[2, 1]);
+    assert_eq!((ids(kept), ids(gone)), (vec![], vec![3, 2, 1]));
 }
 
 #[test]
@@ -343,8 +368,8 @@ impl Root {
         git(&["init", "-q"]);
         git(&["-c", "user.email=t@t", "-c", "user.name=t", "add", "requirements.txt", "install_uv.sh"]);
         git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
-        // The stand-ins for what the script runs as root: swapoff, logged.
-        w("bin/swapoff", "#!/bin/sh\necho \"swapoff $*\" >> \"$(dirname \"$0\")/../calls.log\"\n");
+        // The stand-ins for what the script runs as root: swapoff, logged (exit $SWAPOFF_EXIT).
+        w("bin/swapoff", "#!/bin/sh\necho \"swapoff $*\" >> \"$(dirname \"$0\")/../calls.log\"\nexit ${SWAPOFF_EXIT:-0}\n");
         Command::new("chmod").arg("+x").arg(r.path("bin/swapoff")).status().unwrap();
         r
     }
@@ -369,6 +394,15 @@ impl Root {
 
     /// Run the rendered scrub script on this root: (exit code, stdout, stderr).
     fn scrub(&self) -> (i32, String, String) {
+        self.scrub_with(&[])
+    }
+
+    /// [`Self::scrub`] with `env` extra (`/proc/swaps` stood in for by `proc-swaps` here, no swap
+    /// on unless a test writes one).
+    fn scrub_with(&self, env: &[(&str, &str)]) -> (i32, String, String) {
+        if !self.exists("proc-swaps") {
+            self.write("proc-swaps", "Filename\tType\tSize\tUsed\tPriority\n");
+        }
         let script = self.path("scrub.sh");
         std::fs::write(&script, scrub_script()).unwrap();
         let path = format!("{}:{}", self.path("bin").display(), std::env::var("PATH").unwrap_or_default());
@@ -380,6 +414,8 @@ impl Root {
             .env("KEY_REMOTE", "/root/.ssh/id_ed25519")
             .env("NAME", "devtest-image-261029-1542")
             .env("BUILT", "1793288520")
+            .env("ARENA_PROC_SWAPS", self.path("proc-swaps"))
+            .envs(env.iter().copied())
             .output()
             .unwrap();
         (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
@@ -415,7 +451,7 @@ fn the_scrub_leaves_nothing_of_the_bake_vm_and_its_scan_is_clean() {
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     let rep = parse_scrub(&out);
     let head = String::from_utf8_lossy(&Command::new("git").current_dir(r.path("root/ARENA_materials")).args(["rev-parse", "--short=12", "HEAD"]).output().unwrap().stdout).trim().to_string();
-    assert_eq!(rep, ScrubReport { commit: Some(head.clone()), req: Some(req_hash(Some(b"#!/bin/bash\n"), Some(b"torch\n"))), hits: vec![], done: true }, "{out}");
+    assert_eq!(rep, ScrubReport { commit: Some(head.clone()), req: Some(req_hash(Some(b"#!/bin/bash\n"), Some(b"torch\n"), None)), hits: vec![], done: true }, "{out}");
     for gone in [
         "root/.ssh/id_ed25519",
         "root/.ssh/id_ed25519.pub",
@@ -454,7 +490,7 @@ fn the_scrub_leaves_nothing_of_the_bake_vm_and_its_scan_is_clean() {
     assert_eq!(r.read("etc/fstab"), "UUID=abc / ext4 defaults 0 1\n", "only the swap line goes");
     assert_eq!(r.read("etc/machine-id"), "", "emptied, not deleted");
     assert_eq!(r.read("var/log/syslog"), "", "logs emptied");
-    assert_eq!(r.read("calls.log"), format!("swapoff {}/swapfile\n", r.dir.display()));
+    assert!(!r.exists("calls.log"), "no swap was on: nothing turned off");
     assert_eq!(
         r.read("etc/arena-image"),
         format!("name=devtest-image-261029-1542\nbuilt=1793288520\ncommit={head}\nreq={}\n", rep.req.unwrap())
@@ -505,6 +541,44 @@ fn a_file_left_in_an_ssh_directory_is_a_hit() {
     } else {
         assert_eq!(code, 0, "{out}");
     }
+}
+
+/// A swap file holds pages of the bake VM's memory: one that's on is turned off and deleted, and
+/// one that can't be — or any other swap that's on — stops the bake before anything is written.
+#[test]
+fn a_swap_that_cant_go_stops_the_scrub() {
+    let r = Root::new("swap");
+    r.write("proc-swaps", "Filename\tType\tSize\tUsed\tPriority\n/swapfile file 8388604 0 -2\n");
+    let (code, out, err) = r.scrub();
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(r.read("calls.log"), format!("swapoff {}/swapfile\n", r.dir.display()));
+    assert!(!r.exists("swapfile"));
+
+    let r = Root::new("swap-stuck");
+    r.write("proc-swaps", "Filename\tType\tSize\tUsed\tPriority\n/swapfile file 8388604 0 -2\n");
+    let (code, out, err) = r.scrub_with(&[("SWAPOFF_EXIT", "1")]);
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(err.trim_end().ends_with("FAILED: couldn't turn the swap file off (memory pressure?) — its pages may hold secrets"), "{err}");
+    assert!(!parse_scrub(&out).done && !r.exists("etc/arena-image"), "stopped before the marker: {out}");
+
+    let r = Root::new("swap-partition");
+    r.write("proc-swaps", "Filename\tType\tSize\tUsed\tPriority\n/dev/sda2 partition 2097148 0 -2\n");
+    let (code, _, err) = r.scrub();
+    assert_eq!(code, 1);
+    assert!(err.contains("FAILED: a swap (/dev/sda2) is on: its pages would go into the image"), "{err}");
+}
+
+/// A scan that couldn't read something isn't a clean scan: grep's error (exit 2) stops the bake,
+/// even with nothing found.
+#[test]
+fn a_scan_that_fails_is_never_clean() {
+    let r = Root::new("scanfail");
+    r.write("bin/grep", "#!/bin/sh\necho \"grep: /root/x: Input/output error\" >&2\nexit 2\n");
+    Command::new("chmod").arg("+x").arg(r.path("bin/grep")).status().unwrap();
+    let (code, out, err) = r.scrub();
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(err.trim_end().ends_with("FAILED: the secret scan failed (grep exit 2: grep: /root/x: Input/output error)"), "{err}");
+    assert!(!parse_scrub(&out).done, "{out}");
 }
 
 #[test]
