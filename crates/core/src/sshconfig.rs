@@ -465,8 +465,10 @@ pub fn sync_admin_for(cfg: &Config, pods: &[Pod], home: Option<&str>) -> Option<
 /// (and offers both files' keys) — the participants' proxy ports would shadow staff's live
 /// endpoints, or the other way round. So one per user: staff's isn't kept while `SSH_CONFIG_FILE`
 /// is set too (staff's belongs on the proxy box, which needs no participants' file), and neither
-/// is while `~/.ssh/config` pulls in the other one ([`included_file_of`]; an Include arena can't
-/// follow doesn't stop a sync).
+/// is while `~/.ssh/config` pulls in the other one ([`included_file_of`]). When that can't be told
+/// (an Include arena can't follow), neither is kept while the other file exists where arena keeps
+/// it (its key's path, else its default): never a guess that it isn't included. With no other
+/// file there, there's nothing to conflict with, and the file is kept as before.
 pub fn one_per_user(audience: Audience, cfg: &Config, home: Option<&str>) -> Option<String> {
     if audience == Audience::Admin && managed_path(cfg, home).is_some() {
         return Some(
@@ -479,21 +481,34 @@ pub fn one_per_user(audience: Audience, cfg: &Config, home: Option<&str>) -> Opt
         Audience::Participants => Audience::Admin,
         Audience::Admin => Audience::Participants,
     };
-    let Ok(Some(theirs)) = included_file_of(other, home) else { return None };
-    Some(format!(
-        "~/.ssh/config includes {} — arena's other file (`{} --install`), naming the same hosts: ssh would take each one's \
-         address from whichever is included first; one per user (`{} --uninstall`)",
-        theirs.display(),
-        other.command(),
-        other.command()
-    ))
+    match included_file_of(other, home) {
+        Ok(None) => None,
+        Ok(Some(theirs)) => Some(format!(
+            "~/.ssh/config includes {} — arena's other file (`{} --install`), naming the same hosts: ssh would take each one's \
+             address from whichever is included first; one per user (`{} --uninstall`)",
+            theirs.display(),
+            other.command(),
+            other.command()
+        )),
+        Err(why) => {
+            let known = [other.path(cfg, home).and_then(Result::ok), expand_home(other.default_path(), home).ok()];
+            let theirs = known.into_iter().flatten().find(|p| std::fs::read_to_string(p).is_ok_and(|t| !t.trim().is_empty() && other.owns(&t)))?;
+            Some(format!(
+                "~/.ssh/config has {why}, so arena can't tell whether it pulls in {} — arena's other file (`{} --install`), \
+                 naming the same hosts; one per user: remove that file, or make the Include a plain path",
+                theirs.display(),
+                other.command()
+            ))
+        }
+    }
 }
 
 /// The file of `audience`'s that the user's `~/.ssh/config` (under `home`) pulls in, if one: of
 /// the files [`included_files`] resolves, one that starts with its header. `Ok(None)` without a
-/// `~/.ssh/config`; `Err` when that can't be told (no home, an Include arena can't follow).
+/// home or a `~/.ssh/config`; `Err` when that can't be told (an Include arena can't follow, a
+/// config it can't read).
 pub fn included_file_of(audience: Audience, home: Option<&str>) -> Result<Option<PathBuf>, String> {
-    let home = home.map(str::trim).filter(|h| h.starts_with('/')).ok_or("no home to find ~/.ssh/config in")?;
+    let Some(home) = home.map(str::trim).filter(|h| h.starts_with('/')) else { return Ok(None) };
     let config = match std::fs::read_to_string(Path::new(home).join(".ssh").join("config")) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1174,7 +1189,19 @@ mod tests {
         std::fs::write(home.join(".ssh/config"), "Host x\n").unwrap();
         assert!(sync_for(&theirs_only, &pods, h).unwrap().unwrap().written);
         assert_eq!(included_file_of(Audience::Admin, h), Ok(None));
-        assert!(included_file_of(Audience::Admin, None).is_err());
+        assert_eq!(included_file_of(Audience::Admin, None), Ok(None), "no home: no ~/.ssh/config");
+        // An Include arena can't follow: neither file is kept while the other exists where arena
+        // keeps it — never the guess that it isn't included; with no other file, kept as before.
+        std::fs::write(home.join(".ssh/config"), "Include ${HOME}/.ssh/arena.conf\nInclude ~/.ssh/arena-admin.conf\n").unwrap();
+        assert!(included_file_of(Audience::Participants, h).unwrap_err().contains("an Include arena can't follow (${HOME}/.ssh/arena.conf)"));
+        std::fs::remove_file(&staff).unwrap();
+        let e = sync_admin_for(&admin_only, &pods, h).unwrap().unwrap_err();
+        assert!(e.contains(&format!("arena can't tell whether it pulls in {}", theirs.display())), "{e}");
+        assert!(!staff.exists());
+        std::fs::remove_file(&theirs).unwrap();
+        assert!(sync_admin_for(&admin_only, &pods, h).unwrap().unwrap().written, "no participants' file: nothing to conflict with");
+        let e = sync_for(&theirs_only, &pods, h).unwrap().unwrap_err();
+        assert!(e.contains(&format!("arena can't tell whether it pulls in {}", staff.display())), "{e}");
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -1290,7 +1290,8 @@ the proxy box gets in even where the cohort key was revoked; elsewhere it isn't 
   kept while `SSH_CONFIG_FILE` is set too (the proxy box needs no participants' file), and neither
   file is installed or kept while `~/.ssh/config` pulls in the other — Includes read as ssh reads
   them (relative under `~/.ssh`, quoted, `*`/`?` patterns, nested). One it can't follow (a `${…}` or
-  `%` token, a `[…]` class) refuses an install rather than guesses. To use the other anyway: `--out
+  `%` token, a `[…]` class) refuses an install rather than guesses, and stops a sync while the other
+  file exists where arena keeps it. To use the other anyway: `--out
   FILE` and `ssh -F FILE <name>`.
 - **With `SSH_ADMIN_CONFIG_FILE` set**, it's kept current like the participants' file: after every
   pod change, on `pods list`, `up` and each dashboard refresh, from a complete listing only — and
