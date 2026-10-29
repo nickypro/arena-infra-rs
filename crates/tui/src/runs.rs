@@ -39,13 +39,12 @@ use crate::offers;
 use crate::{centered_rect, scroll_by, Mode, Shared, Ui};
 
 /// How many runs' output files are kept (the oldest go when a run starts) — besides the ones
-/// still being written ([`prune`]).
+/// still being written ([`prune`]). Each is what one command printed: `up`/`start`/`rename`'s
+/// own progress lines, `jobs`' table, `logs --tail 100` (read from at most the last 1 MiB of
+/// each pod's log) — small.
 pub(crate) const KEEP_LOGS: usize = 30;
 
-/// An output file written to this recently is never pruned: it may be a run still going that
-/// an earlier dashboard started and left running (`up` writes a line at least every endpoint
-/// poll or setup step, minutes apart).
-const WRITTEN_LATELY: Duration = Duration::from_secs(6 * 3600);
+
 
 /// How many of a run's lines the panel keeps (its file has them all).
 const KEEP_LINES: usize = 2_000;
@@ -210,9 +209,6 @@ pub(crate) struct Run {
     pub command: String,
     pub log: PathBuf,
     pub pid: Option<u32>,
-    /// Ctrl+C was asked for before the child's pid was known: [`supervise`] sends it the
-    /// moment it has one ([`interrupt`]).
-    pub stop_asked: bool,
     pub started: Instant,
     pub lines: VecDeque<String>,
     /// Lines no longer kept (the file has them).
@@ -288,8 +284,7 @@ pub(crate) fn start(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, kind: Kind, provid
         return Err("the dashboard is ending".into());
     }
     std::fs::create_dir_all(&cli.dir).map_err(|e| format!("making {}: {e}", cli.dir.display()))?;
-    let going: Vec<PathBuf> = shared.lock().unwrap().runs.iter().filter(|r| r.running()).map(|r| r.log.clone()).collect();
-    prune(&cli.dir, KEEP_LOGS.saturating_sub(1), &going, std::time::SystemTime::now());
+    prune(&cli.dir, KEEP_LOGS.saturating_sub(1));
     let id = {
         let mut s = shared.lock().unwrap();
         s.next_run += 1;
@@ -300,9 +295,24 @@ pub(crate) fn start(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, kind: Kind, provid
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&log).map_err(|e| format!("making {}: {e}", log.display()))?
     };
+    // A shared lock on the file, which the child's stdout and stderr share (one open file
+    // description): held while anything of the run still has it open — the dashboard gone or
+    // not — so [`prune`] can tell a file still being written.
+    let _ = file.lock_shared();
     let mut cmd = cli.command(provider, &args);
     let err = file.try_clone().map_err(|e| e.to_string())?;
     cmd.stdout(file).stderr(err).process_group(0).kill_on_drop(!kind.lasting());
+    // Spawned here, not in the background task: the run is listed with its pid, so a stop
+    // reaches it at once, and a quit that leaves it running leaves a process that exists (it
+    // was spawned in the task: a quit straight after `y` could end the dashboard before it was).
+    let child = match spawn_retrying_busy(&mut cmd) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_file(&log);
+            return Err(format!("couldn't run {}: {e}", cli.exe.display()));
+        }
+    };
+    drop(cmd);
     let quote = |a: &String| if a.contains(' ') || a.contains(',') { format!("'{a}'") } else { a.clone() };
     let command = format!("arena --provider {provider} {}", args.iter().map(quote).collect::<Vec<_>>().join(" "));
     {
@@ -314,8 +324,7 @@ pub(crate) fn start(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, kind: Kind, provid
             provider: provider.to_string(),
             command,
             log: log.clone(),
-            pid: None,
-            stop_asked: false,
+            pid: child.id(),
             started: Instant::now(),
             lines: VecDeque::new(),
             dropped: 0,
@@ -330,37 +339,41 @@ pub(crate) fn start(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, kind: Kind, provid
             }
         }
     }
-    tokio::spawn(supervise(shared.clone(), ui.nudge.clone(), id, cmd, log));
+    tokio::spawn(supervise(shared.clone(), ui.nudge.clone(), id, child, log));
     Ok(id)
 }
 
 /// Remove all but the newest `keep` `*.log` files in `dir` (named by start time, so by name) —
-/// never one of `going` (this dashboard's runs still going) or one written to in the last
-/// [`WRITTEN_LATELY`] (`now`): unlinked, a run still writing would lose its output, and the
-/// path the quit printed would be gone.
-fn prune(dir: &Path, keep: usize, going: &[PathBuf], now: std::time::SystemTime) {
+/// never one still being written: a run's child (and what it starts) holds a shared `flock` on
+/// its file for as long as it has it open ([`start`]), this dashboard's or an earlier one's,
+/// so a file whose exclusive lock can't be had is kept. Unlinked, a run still writing would
+/// lose its output, and the path the quit printed would be gone.
+fn prune(dir: &Path, keep: usize) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut logs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "log")).collect();
     logs.sort();
     let n = logs.len().saturating_sub(keep);
     for p in logs.into_iter().take(n) {
-        let lately = std::fs::metadata(&p).and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).unwrap_or_default() < WRITTEN_LATELY);
-        if !going.contains(&p) && !lately {
-            let _ = std::fs::remove_file(p);
+        let Ok(f) = std::fs::File::open(&p) else { continue };
+        if f.try_lock().is_ok() {
+            let _ = std::fs::remove_file(&p);
         }
     }
 }
 
-/// `cmd.spawn()`, again a few times while exec says the file is busy (ETXTBSY: a test's stub
-/// just written, still open in a child another thread forked — see the CLI's live_smoke).
-async fn spawn_retrying_busy(cmd: &mut tokio::process::Command) -> std::io::Result<tokio::process::Child> {
+/// `cmd.spawn()` — a fork and an exec, no waiting on anything — again a few times while exec
+/// says the file is busy (ETXTBSY: a test's stub just written, still open in a child another
+/// thread forked — see the CLI's live_smoke).
+fn spawn_retrying_busy(cmd: &mut tokio::process::Command) -> std::io::Result<tokio::process::Child> {
     const ETXTBSY: i32 = 26;
     let mut tries = 0;
     loop {
         match cmd.spawn() {
             Err(e) if e.raw_os_error() == Some(ETXTBSY) && tries < 20 => {
                 tries += 1;
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                // Only ever a test's stub (an installed `arena` isn't being written): a brief
+                // block, never on a real dashboard.
+                std::thread::sleep(Duration::from_millis(25));
             }
             other => return other,
         }
@@ -370,32 +383,28 @@ async fn spawn_retrying_busy(cmd: &mut tokio::process::Command) -> std::io::Resu
 /// Run `cmd` (run `id`), reading its output file `log` as it grows into the run — a created
 /// pod shows at once as a pending row, and a refresh is nudged when a pod is made or finishes —
 /// until it has exited and every line is read; then its end, and the footer says so.
-async fn supervise(shared: Arc<Mutex<Shared>>, nudge: Arc<Notify>, id: u64, mut cmd: tokio::process::Command, log: PathBuf) {
-    let mut child = match spawn_retrying_busy(&mut cmd).await {
-        Ok(c) => c,
-        Err(e) => return finish(&shared, id, End::NotStarted(e.to_string())),
-    };
-    // The pid and a stop asked for before it was known, under one lock: no stop falls between.
-    with_run(&shared, id, |r| {
-        r.pid = child.id();
-        if let (true, Some(pid)) = (r.stop_asked, r.pid) {
-            let _ = sigint_group(pid);
-        }
-    });
+async fn supervise(shared: Arc<Mutex<Shared>>, nudge: Arc<Notify>, id: u64, mut child: tokio::process::Child, log: PathBuf) {
     let mut reader = std::fs::File::open(&log).ok();
     let mut split = Lines::default();
     let mut status = None;
     loop {
-        let lines = read_lines(reader.as_mut(), &mut split);
-        let got = !lines.is_empty();
-        if got {
+        let (lines, read) = read_lines(reader.as_mut(), &mut split);
+        if !lines.is_empty() {
             take_lines(&shared, &nudge, id, lines);
         }
+        // Once it has exited, read on until the file has nothing more — counted in bytes, not
+        // lines: a read in the middle of a long line completes none (review ai-review codex
+        // round 2 #2: the verdicts after one were lost).
         if status.is_some() {
-            if got {
+            if read > 0 {
                 continue;
             }
             break;
+        }
+        if read == READ_MAX {
+            // More is waiting: on with it, letting the other tasks in.
+            tokio::task::yield_now().await;
+            continue;
         }
         tokio::select! {
             s = child.wait() => status = Some(s),
@@ -460,14 +469,15 @@ impl Lines {
     }
 }
 
-/// The lines read from `file` since the last call — at most [`READ_MAX`] bytes of it a call.
-fn read_lines(file: Option<&mut std::fs::File>, lines: &mut Lines) -> Vec<String> {
+/// The lines read from `file` since the last call — at most [`READ_MAX`] bytes of it a call —
+/// and how many bytes were read (0: nothing more there now).
+fn read_lines(file: Option<&mut std::fs::File>, lines: &mut Lines) -> (Vec<String>, usize) {
     use std::io::Read;
-    let Some(f) = file else { return Vec::new() };
+    let Some(f) = file else { return (Vec::new(), 0) };
     let mut buf = vec![0u8; READ_MAX];
     match f.read(&mut buf) {
-        Ok(n) if n > 0 => lines.feed(&buf[..n]),
-        _ => Vec::new(),
+        Ok(n) if n > 0 => (lines.feed(&buf[..n]), n),
+        _ => (Vec::new(), 0),
     }
 }
 
@@ -482,13 +492,6 @@ fn cut(line: &str) -> String {
         end -= 1;
     }
     format!("{}…", &line[..end])
-}
-
-fn with_run(shared: &Mutex<Shared>, id: u64, f: impl FnOnce(&mut Run)) {
-    let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(r) = s.runs.iter_mut().find(|r| r.id == id) {
-        f(r);
-    }
 }
 
 /// Lines into run `id` ([`apply`]); a refresh nudged when they made or finished a pod.
@@ -549,7 +552,7 @@ pub(crate) fn fetch_offers(shared: &Arc<Mutex<Shared>>, cli: &Result<Cli, String
 /// why not — its last line on stderr (`Error: ` dropped), or its exit.
 pub(crate) async fn capture(mut cmd: tokio::process::Command, timeout: Duration) -> Result<String, String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-    let child = spawn_retrying_busy(&mut cmd).await.map_err(|e| format!("couldn't run arena: {e}"))?;
+    let child = spawn_retrying_busy(&mut cmd).map_err(|e| format!("couldn't run arena: {e}"))?;
     let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Err(_) => return Err(format!("no answer within {}s", timeout.as_secs())),
         Ok(Err(e)) => return Err(e.to_string()),
@@ -569,8 +572,6 @@ pub(crate) async fn capture(mut cmd: tokio::process::Command, timeout: Duration)
 pub(crate) enum Stop {
     /// Ctrl+C went to its process group.
     Sent,
-    /// It hasn't a pid yet (it's being started): Ctrl+C goes to it the moment it has.
-    Queued,
     /// It has ended (or there's no such run).
     NotRunning,
     /// `kill` refused or couldn't run: why.
@@ -578,19 +579,12 @@ pub(crate) enum Stop {
 }
 
 /// Send run `id` Ctrl+C — SIGINT to its process group, as a terminal's Ctrl+C would (`up`: no new
-/// attempts, nothing terminated) — or, before it has a pid, ask [`supervise`] to send it the
-/// moment it does (decided under the lock that publishes the pid).
+/// attempts, nothing terminated). A run is listed with its pid ([`start`] spawns it first).
 fn interrupt(shared: &Mutex<Shared>, id: u64) -> Stop {
     let pid = {
-        let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(r) = s.runs.iter_mut().find(|r| r.id == id && r.running()) else { return Stop::NotRunning };
-        match r.pid {
-            Some(pid) => pid,
-            None => {
-                r.stop_asked = true;
-                return Stop::Queued;
-            }
-        }
+        let s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(pid) = s.runs.iter().find(|r| r.id == id && r.running()).and_then(|r| r.pid) else { return Stop::NotRunning };
+        pid
     };
     match sigint_group(pid) {
         Ok(()) => Stop::Sent,
@@ -648,9 +642,6 @@ fn left_running(left: &[(u64, String, Option<u32>, PathBuf)], stops: Option<&[St
             match stops.map(|s| s.get(i).cloned().unwrap_or(Stop::NotRunning)) {
                 None => format!("arena-tui: left running: `{cmd}`{pid} — its output: {log}"),
                 Some(Stop::Sent) => format!("arena-tui: sent Ctrl+C to `{cmd}`{pid}: it stops where it is, terminates nothing — its output: {log}"),
-                Some(Stop::Queued) => format!(
-                    "arena-tui: `{cmd}` was still being started: if it started, it got Ctrl+C at once — check `arena pods list`; its output: {log}"
-                ),
                 Some(Stop::NotRunning) => format!("arena-tui: `{cmd}` had already ended — its output: {log}"),
                 Some(Stop::Failed(why)) => format!("arena-tui: ✗ couldn't send Ctrl+C to `{cmd}`{pid} ({why}): it's still running — its output: {log}"),
             }
@@ -679,7 +670,6 @@ pub(crate) fn key(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, code: KeyCode) -> Fl
                 KeyCode::Char('y') if stop => {
                     let (text, bad) = match interrupt(shared, id) {
                         Stop::Sent => ("sent Ctrl+C to the run: it stops where it is, terminates nothing".to_string(), false),
-                        Stop::Queued => ("the run is still being started: Ctrl+C goes to it the moment it is".to_string(), false),
                         Stop::NotRunning => ("✗ the run isn't running".to_string(), true),
                         Stop::Failed(why) => (format!("✗ couldn't send Ctrl+C to the run: {why}"), true),
                     };
@@ -888,7 +878,6 @@ pub(crate) mod tests {
             command: "arena --provider hetzner pods up --add 1 --yes".into(),
             log: PathBuf::from("/tmp/x.log"),
             pid: None,
-            stop_asked: false,
             started: Instant::now(),
             lines: VecDeque::new(),
             dropped: 0,
@@ -950,9 +939,10 @@ pub(crate) mod tests {
         assert_eq!(wrap_rows(["ab"].into_iter(), 0), ["a", "b"], "a zero width is one column");
     }
 
-    /// Only the newest `keep` output files stay — but never one a run is still writing: this
-    /// dashboard's runs going (review ai-review codex #4: a long `up`'s file went once enough
-    /// jobs/logs runs came after it), or one written to lately (an earlier dashboard's run).
+    /// Only the newest `keep` output files stay — but never one a run is still writing: its
+    /// child holds a shared lock on it (review ai-review codex #4, round 2 #5: a long `up`'s file
+    /// went once enough jobs/logs runs came after it; by modification time alone, an earlier
+    /// dashboard's quiet run could lose its file).
     #[test]
     fn old_run_files_are_pruned_but_never_one_being_written() {
         let dir = std::env::temp_dir().join(format!("arena-tui-prune-{}", std::process::id()));
@@ -962,17 +952,16 @@ pub(crate) mod tests {
             std::fs::write(dir.join(format!("{t}-up-1.log")), "").unwrap();
         }
         std::fs::write(dir.join("keep.txt"), "").unwrap();
-        let left = || {
-            let mut v: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-            v.sort();
-            v
-        };
-        let now = std::time::SystemTime::now();
-        prune(&dir, 2, &[], now);
-        assert_eq!(left().len(), 7, "all written just now: kept");
-        let later = now + WRITTEN_LATELY + Duration::from_secs(60);
-        prune(&dir, 2, &[dir.join("101-up-1.log")], later);
-        assert_eq!(left(), ["101-up-1.log", "104-up-1.log", "105-up-1.log", "keep.txt"], "101's run is going");
+        // A run still writing 101 (its child's descriptor, locked as `start` locks it).
+        let writing = std::fs::OpenOptions::new().append(true).open(dir.join("101-up-1.log")).unwrap();
+        writing.lock_shared().unwrap();
+        prune(&dir, 2);
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["101-up-1.log", "104-up-1.log", "105-up-1.log", "keep.txt"], "101's run is going");
+        drop(writing);
+        prune(&dir, 2);
+        assert!(!dir.join("101-up-1.log").exists(), "its run ended: it goes too");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

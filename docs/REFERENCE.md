@@ -2218,7 +2218,8 @@ ARENA_LIVE_ATTEST=1 cargo test --release -p arena-core --lib attest -- --ignored
 
 `ARENA_TUI_TRACE=<file>` makes `arena-tui` write one tab-separated line per frame (`frame <µs since
 start> <render µs> <write µs> <events since the last frame>`) and per input event (`event <µs>
-<key>`). `ARENA_TUI_DEMO=<n>` (1–500, a developer's aid, not in `--help`) shows a made-up fleet of
+<key>` — a key by its kind, `Char` for any character, never what was typed). It takes a new file,
+made readable by you alone, and refuses a path that exists. `ARENA_TUI_DEMO=<n>` (1–500, a developer's aid, not in `--help`) shows a made-up fleet of
 `n` pods instead of the real one — nothing is listed, probed or run — so a sandbox with no pods can
 measure the dashboard at a cohort's size. The summary of a trace (frames, render/write times, and
 per burst of keys the time from its first event to the frame that shows its last):

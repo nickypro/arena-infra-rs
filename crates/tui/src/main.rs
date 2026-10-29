@@ -1497,7 +1497,7 @@ async fn run(
         for ev in batch {
             events += 1;
             if ui.trace.on() {
-                ui.trace.event(Instant::now(), &event_label(&ev));
+                ui.trace.event(Instant::now(), &lag::event_label(&ev));
             }
             match handle_event(terminal, &cx, &mut ui, ev)? {
                 Flow::Same => {}
@@ -1848,17 +1848,6 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
         }
     }
     Ok(Flow::Changed)
-}
-
-/// An input event as the trace names it: a key's code (`Char('j')`, `Down`), `mouse <kind>`,
-/// `resize`, …
-fn event_label(ev: &Event) -> String {
-    match ev {
-        Event::Key(k) => format!("{:?}", k.code),
-        Event::Mouse(m) => format!("mouse {:?}", m.kind),
-        Event::Resize(..) => "resize".into(),
-        other => format!("{other:?}").chars().take(20).collect(),
-    }
 }
 
 /// In a demo (`ARENA_TUI_DEMO`) the keys that would act on a pod, reach one, ask about one or
@@ -6488,6 +6477,10 @@ deep_check_end=1
                trap 'echo \"[devtest-alpha] STOPPED at setup (Ctrl+C) — left as it is\"; exit 130' INT\n\
                echo waiting\n\
                while :; do sleep 0.05; done ;;\n\
+             *'pods logs'*)\n\
+               head -c 800000 /dev/zero | tr '\\0' x\n\
+               printf '\\n[devtest-alpha] FAILED setup: after a long line\\n'\n\
+               exit 1 ;;\n\
              esac\n\
              echo '[created] devtest-echo id=9 on cx33 (€0.0160/h)'\n\
              echo '[devtest-echo] setup ✓ (2m)'\n\
@@ -6553,21 +6546,34 @@ deep_check_end=1
         assert_eq!((r.end.as_ref().map(|(_, e)| e.clone()), r.tally()), (Some(runs::End::Code(130)), "1 stopped".to_string()));
         drop(s);
 
-        // Ctrl+C asked for before the child has a pid (review ai-review codex #2: it was dropped,
-        // and a quit said "sent"): queued, and sent the moment the pid is known.
+        // Ctrl+C straight after `y` (review ai-review codex #2, round 2 #3: the child was spawned
+        // in the background task, so a stop — or a quit leaving it running — could come before
+        // it existed): `start` spawns it, so it has its pid when it's listed.
         start_cli_action(&mut ui, &shared, Action::Start, &alpha, None);
         let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
-        assert_eq!(shared.lock().unwrap().runs.iter().find(|r| r.id == id).unwrap().pid, None, "not spawned yet");
+        assert!(shared.lock().unwrap().runs.iter().find(|r| r.id == id).unwrap().pid.is_some(), "spawned before it's listed");
         ui.mode = Mode::Runs { id, scroll: None, stop: true };
         assert!(matches!(runs::key(&mut ui, &shared, KeyCode::Char('y')), runs::Flow::Handled));
         assert_eq!(
             shared.lock().unwrap().notice.as_ref().map(|n| n.text.clone()).as_deref(),
-            Some("the run is still being started: Ctrl+C goes to it the moment it is")
+            Some("sent Ctrl+C to the run: it stops where it is, terminates nothing")
         );
-        assert!(ended(&shared, id, None).await, "the queued Ctrl+C didn't end it");
+        assert!(ended(&shared, id, None).await, "Ctrl+C didn't end it");
         let end = shared.lock().unwrap().runs.iter().find(|r| r.id == id).unwrap().end.clone().map(|(_, e)| e);
         // SIGINT before the stub set its trap kills it; after, the trap exits 130.
         assert!(matches!(end, Some(runs::End::Signal(2) | runs::End::Code(130))), "{end:?}");
+
+        // A line longer than several reads, then a verdict, then the exit: the verdict is read
+        // (review ai-review codex round 2 #2: the reading stopped at the first read that
+        // completed no line once the child had exited).
+        start_cli_action(&mut ui, &shared, Action::Logs, &alpha, None);
+        let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        assert!(ended(&shared, id, None).await, "the logs run never ended");
+        let s = shared.lock().unwrap();
+        let r = s.runs.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(r.pods, [("devtest-alpha".to_string(), runs::PodState::Failed("FAILED setup: after a long line".into()))], "{:?}", r.lines.iter().map(|l| l.len()).collect::<Vec<_>>());
+        assert!(r.lines.iter().any(|l| l.len() > 1_000 && l.ends_with('…')), "the long line, cut");
+        drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

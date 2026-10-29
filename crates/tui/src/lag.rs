@@ -70,24 +70,32 @@ pub(crate) fn wait_for(now: Instant, last: Option<Instant>, tick: Duration) -> D
 /// The opt-in trace (`ARENA_TUI_TRACE`): one tab-separated line per frame and per event, times
 /// in microseconds since the dashboard started.
 /// - `frame <t> <render_us> <flush_us> <events>`: a frame, after `events` events since the last;
-/// - `event <t> <what>`: an event as it was read (a key's code, `mouse`, `resize`).
+/// - `event <t> <what>`: an event as it was read ([`event_label`]: which key — never which
+///   character, as what's typed can be a command with a token in it — `mouse …`, `resize`).
 pub(crate) struct Trace {
     out: Option<std::io::BufWriter<std::fs::File>>,
     start: Instant,
 }
 
 impl Trace {
-    /// The trace `ARENA_TUI_TRACE` names (created, or emptied), or none. A file that can't be
+    /// The trace `ARENA_TUI_TRACE` names — a new file, readable by its owner only (0600) — or
+    /// none. A path that exists already (a file, a link: in `/tmp` someone else's) or can't be
     /// created is said once on stderr — before the screen is taken — and nothing is traced.
     pub(crate) fn from_env() -> Self {
-        let out = std::env::var_os("ARENA_TUI_TRACE").filter(|p| !p.is_empty()).and_then(|p| match std::fs::File::create(&p) {
+        let out = std::env::var_os("ARENA_TUI_TRACE").filter(|p| !p.is_empty()).and_then(|p| match new_private(std::path::Path::new(&p)) {
             Ok(f) => Some(std::io::BufWriter::new(f)),
             Err(e) => {
-                eprintln!("arena-tui: ARENA_TUI_TRACE {}: {e} — not tracing", std::path::Path::new(&p).display());
+                eprintln!("arena-tui: ARENA_TUI_TRACE {}: {e} — not tracing (it takes a new file)", std::path::Path::new(&p).display());
                 None
             }
         });
         Trace { out, start: Instant::now() }
+    }
+
+    /// A trace into `path`, as `from_env` makes it (tests).
+    #[cfg(test)]
+    pub(crate) fn to(path: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Trace { out: Some(std::io::BufWriter::new(new_private(path)?)), start: Instant::now() })
     }
 
     /// A trace that records nothing (tests).
@@ -117,6 +125,31 @@ impl Trace {
         if let Some(o) = self.out.as_mut() {
             let _ = writeln!(o, "event\t{t}\t{what}");
         }
+    }
+}
+
+/// `path` created for writing, mode 0600, refused if anything is there already (`O_EXCL`: never
+/// a link followed, never another file emptied).
+fn new_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
+}
+
+/// An input event as the trace names it: a key by its kind — `Char` for any character, never
+/// which (what's typed into the run or branch box can carry a secret), `Down`, `Enter`, `F(5)` —
+/// `mouse <kind>`, `resize`.
+pub(crate) fn event_label(ev: &crossterm::event::Event) -> String {
+    use crossterm::event::{Event, KeyCode};
+    match ev {
+        Event::Key(k) => match k.code {
+            KeyCode::Char(_) => "Char".into(),
+            code => format!("{code:?}"),
+        },
+        Event::Mouse(m) => format!("mouse {:?}", m.kind),
+        Event::Resize(..) => "resize".into(),
+        Event::Paste(_) => "paste".into(),
+        Event::FocusGained => "focus gained".into(),
+        Event::FocusLost => "focus lost".into(),
     }
 }
 
@@ -269,6 +302,35 @@ mod tests {
         assert_eq!(s.render_us, [3_000, 4_000, 4_000]);
         assert_eq!(s.flush_us, [1_000, 2_000, 2_000]);
         assert_eq!(summarize("", Duration::from_millis(50)), Summary::default());
+    }
+
+    /// The trace file is new and its owner's alone, and refused where something already is (a
+    /// file to empty, a link to follow); keys are recorded by kind, never by the character
+    /// (review ai-review codex round 2 #4: a command typed into the run box, token and all,
+    /// went into a world-readable trace).
+    #[test]
+    fn the_trace_is_a_private_new_file_without_what_was_typed() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("arena-tui-trace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.tsv");
+        let mut t = Trace::to(&path).unwrap();
+        for code in [KeyCode::Char('s'), KeyCode::Char('3'), KeyCode::Enter, KeyCode::Down] {
+            t.event(Instant::now(), &event_label(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE))));
+        }
+        t.frame(Instant::now(), Duration::from_micros(5), Duration::from_micros(7), 4);
+        drop(t);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let kinds: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix("event\t")).map(|l| l.split('\t').nth(1).unwrap()).collect();
+        assert_eq!(kinds, ["Char", "Char", "Enter", "Down"]);
+        assert!(Trace::to(&path).is_err(), "an existing file isn't emptied");
+        std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("link")).unwrap();
+        assert!(Trace::to(&dir.join("link")).is_err(), "a link isn't followed");
+        assert!(!dir.join("elsewhere").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Not a test: prints the summary of the trace `ARENA_TUI_TRACE_SUMMARY` names (bursts: events
