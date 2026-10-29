@@ -75,7 +75,7 @@ use arena_core::{Config, Pod, PodSpec};
 use prefs::Prefs;
 use arena_core::status::pod_status;
 use state::{
-    action_summary, capture_details, carry_over, dashboard_snapshot, details_due, display_name, health_cell, listing_note, mark_key, marked_pods,
+    action_summary, capture_details, carry_over, remember_good, dashboard_snapshot, details_due, display_name, health_cell, listing_note, mark_key, marked_pods,
     marked_set_token, merge_details, overlay_details, partial_notice, proxy_cell, proxy_detail,
     provider_title, select_marks, short_branch, spark, summarize, summary_text, Action, Confirm, DeepChecks,
     FleetSummary, History, NewPodForm, NpField, PodDetails, ProviderOpt, Throttle, Tone,
@@ -507,7 +507,8 @@ struct DetailsState {
     balance: Option<BalanceCtx>,
     /// OpenRouter's keys and credit, read on the details cadence (`None`: no provisioning key).
     ai: Option<AiCtx>,
-    /// The last listing as shown: a rate-limited provider's rows come from it.
+    /// Each provider's last good listing ([`state::remember_good`]): a rate-limited
+    /// provider's rows come from it.
     listed: Option<Listing>,
     /// When each provider last listed (tokio's clock): how old its carried rows are.
     listed_at: HashMap<String, tokio::time::Instant>,
@@ -790,7 +791,7 @@ async fn list_all(provider: &dyn Provider, details: &mut DetailsState) -> (Listi
         })
         .collect();
     details.throttle_note = listing_note(&notes);
-    details.listed = Some(shown.clone());
+    details.listed = Some(remember_good(details.listed.as_ref(), &fresh));
     (fresh, shown)
 }
 

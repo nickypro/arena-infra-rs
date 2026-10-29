@@ -458,6 +458,21 @@ pub fn carry_over(prev: Option<&Listing>, fresh: &mut Listing, throttled: &[Stri
     }
 }
 
+/// Each provider's last good listing, after `fresh`: its own where it listed, else what
+/// `prev` had for it — so a provider that failed (a 502), then was rate-limited, still has
+/// rows to fall back on ([`carry_over`]). A provider no longer listed at all is dropped. Pure.
+pub fn remember_good(prev: Option<&Listing>, fresh: &Listing) -> Listing {
+    let providers = fresh
+        .providers
+        .iter()
+        .map(|pl| match (&pl.pods, prev.and_then(|p| p.providers.iter().find(|q| q.provider == pl.provider))) {
+            (Err(_), Some(old)) if old.pods.is_ok() => old.clone(),
+            _ => pl.clone(),
+        })
+        .collect();
+    Listing { providers }
+}
+
 /// What the details query told us about one pod, kept between queries.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PodDetails {
@@ -1736,6 +1751,41 @@ mod tests {
         let mut fresh = listing(vec![("runpod", Err("429"))]);
         carry_over(Some(&listing(vec![("runpod", Err("429"))])), &mut fresh, &["runpod".into()]);
         assert!(fresh.providers[0].pods.is_err());
+    }
+
+    /// The rows a throttle falls back on are each provider's last good listing, not the last
+    /// refresh's: RunPod lists, fails with a 502, then is rate-limited — its rows come back
+    /// (review r2), while Vast lists as usual throughout.
+    #[test]
+    fn a_throttle_after_another_failure_still_has_the_last_good_rows() {
+        use arena_core::proxy::ProviderListing;
+        let pod = |name: &str| Pod { name: name.into(), ..Default::default() };
+        let listing = |entries: Vec<(&str, std::result::Result<Vec<Pod>, &str>)>| Listing {
+            providers: entries.into_iter().map(|(p, r)| ProviderListing { provider: p.into(), pods: r.map_err(String::from) }).collect(),
+        };
+        fn names(l: &Listing, i: usize) -> std::result::Result<Vec<String>, String> {
+            l.providers[i].pods.clone().map(|p| p.into_iter().map(|p| p.name).collect())
+        }
+        let refreshes = [
+            listing(vec![("runpod", Ok(vec![pod("devtest-apple")])), ("vast", Ok(vec![pod("devtest-bravo")]))]),
+            listing(vec![("runpod", Err("list pods HTTP 502")), ("vast", Ok(vec![pod("devtest-bravo"), pod("devtest-cherry")]))]),
+            listing(vec![("runpod", Err("list pods HTTP 429")), ("vast", Ok(vec![pod("devtest-cherry")]))]),
+        ];
+        let runpod = ["runpod".to_string()];
+        let mut good: Option<Listing> = None;
+        let mut shown = Vec::new();
+        for (i, fresh) in refreshes.iter().enumerate() {
+            let mut s = fresh.clone();
+            carry_over(good.as_ref(), &mut s, if i == 2 { &runpod } else { &[] });
+            good = Some(remember_good(good.as_ref(), fresh));
+            shown.push(s);
+        }
+        assert!(shown[1].providers[0].pods.is_err(), "a 502 is shown as a failure");
+        assert_eq!(names(&shown[2], 0), Ok(vec!["devtest-apple".to_string()]), "the throttle falls back on the last good rows");
+        assert_eq!(names(&shown[2], 1), Ok(vec!["devtest-cherry".to_string()]), "Vast as listed");
+        // A provider gone from the config is forgotten.
+        let only_vast = listing(vec![("vast", Ok(vec![]))]);
+        assert_eq!(remember_good(good.as_ref(), &only_vast).providers.len(), 1);
     }
 
     #[test]

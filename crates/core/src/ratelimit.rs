@@ -372,12 +372,21 @@ fn merge_window(prev: Option<(&StateWindow, Instant)>, new: &StateWindow, now: I
     if let (Some((p, seen)), Some(t_new)) = (prev, new.reset) {
         let reset_prev = p.reset.and_then(|t| seen.checked_add(Duration::from_secs(t)));
         let reset_new = now.checked_add(Duration::from_secs(t_new));
+        // The same window instance: the resets agree — or the previous one hasn't reset yet
+        // (a window's next instance starts only at its reset; an answer that took a while
+        // reads as a later reset, never as a fresh window to count up from).
         let same = match (reset_prev, reset_new) {
-            (Some(a), Some(b)) => a.max(b) - a.min(b) <= SAME_WINDOW,
+            (Some(a), Some(b)) => a.max(b) - a.min(b) <= SAME_WINDOW || a > now + SAME_WINDOW,
             _ => false,
         };
         if let (true, Some(rp), Some(rn)) = (same, p.remaining, new.remaining) {
             out.remaining = Some(rp.min(rn));
+        }
+        // Still that window: it resets when it said, not when a late answer seems to say.
+        if let (true, Some(a), Some(b)) = (same, reset_prev, reset_new) {
+            if a > now && a < b {
+                out.reset = Some((a - now).as_secs_f64().ceil() as u64);
+            }
         }
     }
     out
@@ -878,6 +887,11 @@ pub(crate) fn budget(max: Duration, now: Instant) -> Duration {
     }
 }
 
+/// Whether the caller's wait bound, if it set one, has passed at `now`.
+pub(crate) fn bound_passed(now: Instant) -> bool {
+    WAIT_UNTIL.try_with(|u| now >= *u).unwrap_or(false)
+}
+
 /// How much of a `limit` on a whole provider call its rate-limit waits may take: all but a
 /// quarter (at most 10 s), left for the request itself — so a wait that doesn't fit ends the
 /// call as rate-limited, saying how long, rather than as the caller's timeout. Pure.
@@ -1142,6 +1156,10 @@ mod tests {
         q.record(Some(r#""minute";q=60;w=60"#), Some(r#""minute";r=3;t=30"#), t0);
         q.record(None, Some(r#""minute";r=7;t=29"#), t0 + s(1));
         assert_eq!(q.state, [sw("minute", Some(3), Some(29))], "same reset: the lower count stays");
+        // An older answer read 4 s late (its reset seems 5 s later) while the window still
+        // runs: the same window, the count stays down (review r2).
+        q.record(None, Some(r#""minute";r=19;t=30"#), t0 + s(5));
+        assert_eq!(q.state, [sw("minute", Some(3), Some(25))], "still the window that resets at 30 s");
         q.record(None, Some(r#""minute";r=59;t=60"#), t0 + s(31));
         assert_eq!(q.state, [sw("minute", Some(59), Some(60))], "a new window: the new count");
         assert_eq!(q.policy, [pw("minute", Some(60), Some(60))], "the policy kept when absent");

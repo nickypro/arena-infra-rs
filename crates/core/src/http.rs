@@ -105,8 +105,10 @@ pub(crate) async fn exchange_with(rb: RequestBuilder, ctx: &str, limits: &Limits
     let key = QuotaKey::of(&req);
     let read = matches!(*req.method(), Method::GET | Method::HEAD);
     let (mut retried, mut resent) = (0u32, 0u32);
+    // Whether this send retries a 429.
+    let mut again = false;
     loop {
-        let sent_at = admit(&key, ctx, limits, sleep).await?;
+        let sent_at = admit(&key, ctx, limits, sleep, again).await?;
         let Some(attempt) = rb.try_clone() else {
             return Ok(Answer::Reply(rb.send().await?));
         };
@@ -145,9 +147,12 @@ pub(crate) async fn exchange_with(rb: RequestBuilder, ctx: &str, limits: &Limits
         let wait = ratelimit::with(&key, |q| {
             q.note_throttled(sent_at, retry_after, body_after, &windows, limits.backoff, refusal_words(&text), now)
         });
-        if retried < limits.retries && wait <= ratelimit::budget(limits.max_wait, now) {
+        // The budget as of now, not the answer's arrival: its body may have taken a while.
+        let left = (now + wait).saturating_duration_since(Instant::now());
+        if retried < limits.retries && left <= ratelimit::budget(limits.max_wait, Instant::now()) {
             // The hold just set is waited out by `admit`.
             retried += 1;
+            again = true;
             continue;
         }
         let note = if retried >= limits.retries {
@@ -164,10 +169,20 @@ pub(crate) async fn exchange_with(rb: RequestBuilder, ctx: &str, limits: &Limits
 /// (or a low quota's spacing behind a request let through first) is honoured too. A hold
 /// longer than the caller can wait refuses the request, not sent. A hold already waited out
 /// isn't waited twice (a sleep that ended early).
-async fn admit(key: &QuotaKey, ctx: &str, limits: &Limits, sleep: Sleeper<'_>) -> Result<Instant> {
+///
+/// A retry of a 429 (`again`) is never sent once the caller's wait bound has passed, hold or
+/// none: the caller decided to act within it (the reaper's terminate on an idle check just
+/// made), and past it the decision is the caller's again — refused, not sent.
+async fn admit(key: &QuotaKey, ctx: &str, limits: &Limits, sleep: Sleeper<'_>, again: bool) -> Result<Instant> {
     let mut waited: Option<Instant> = None;
     loop {
         let now = Instant::now();
+        if again && ratelimit::bound_passed(now) {
+            return Err(Error::Provider {
+                kind: ProviderErrorKind::RateLimited,
+                message: format!("{ctx}: not sent again — {} rate limit: the 429's wait ran past what this call waits", key.api()),
+            });
+        }
         let Some((until, why)) = ratelimit::with(key, |q| q.admit(now)) else {
             return Ok(now);
         };
@@ -698,6 +713,25 @@ mod tests {
         let waits = waits.lock().unwrap();
         assert_eq!(waits.len(), 1);
         assert!(waits[0] >= Duration::from_secs(1) && waits[0] <= Duration::from_millis(1_500), "{waits:?}");
+    }
+
+    /// A 429's retry isn't sent once the caller's wait bound has passed, however short the
+    /// hold left (review r2: the reaper's terminate, retried 20 s after its idle check):
+    /// refused, not sent — the next run decides again.
+    #[tokio::test]
+    async fn a_retry_is_not_sent_past_the_callers_bound() {
+        let srv = serve(vec![canned(429, "text/plain", "slow down").header("Retry-After", "0.1"), canned(200, "application/json", "{}")]);
+        // A wake that comes late (a busy runtime, a slow body read): past the 300 ms bound.
+        let late = |d: Duration| -> Pin<Box<dyn Future<Output = ()> + Send>> { Box::pin(tokio::time::sleep(d + Duration::from_millis(400))) };
+        let call = json(client().delete(format!("{}/pods/p1", srv.base)), &EXACT, &late);
+        let e = ratelimit::waits_within(Duration::from_millis(300), call).await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::RateLimited), "{e}");
+        assert!(e.to_string().contains("not sent again"), "{e}");
+        assert_eq!(srv.requests.lock().unwrap().len(), 1, "the terminate went once");
+        // With no bound, the retry goes.
+        let srv = serve(vec![canned(429, "text/plain", "slow down").header("Retry-After", "0.1"), canned(200, "application/json", "{}")]);
+        json(client().delete(format!("{}/pods/p1", srv.base)), &EXACT, &late).await.unwrap();
+        assert_eq!(srv.requests.lock().unwrap().len(), 2);
     }
 
     #[test]
