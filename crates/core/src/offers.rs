@@ -1121,7 +1121,8 @@ mod tests {
         let unlisted = [Unlisted { id: mig.into(), pod_price_per_gpu: Some(0.5) }, Unlisted { id: "NVIDIA RTX A4000".into(), pod_price_per_gpu: None }];
         let all = RowFilter { gpu_count: 1, ..RowFilter::default() };
         let rows = runpod_rows(&live_catalog(), &unlisted, Some(&plan), &all);
-        let brief: Vec<(&str, Option<&str>, Option<f64>, Option<usize>, Option<&str>)> =
+        type Brief<'a> = (&'a str, Option<&'a str>, Option<f64>, Option<usize>, Option<&'a str>);
+        let brief: Vec<Brief> =
             rows.iter().map(|r| (r.name.as_str(), r.cloud.as_deref(), r.price_per_gpu, r.try_order, r.note.as_deref())).collect();
         assert_eq!(
             brief,
@@ -1187,7 +1188,8 @@ mod tests {
         let req = Request::from_flags(None, Some("datacenter,verified"), &base, None, Order::Listed).unwrap();
         let plan = plan_options(&req, "vast", &PriceBook::unpriced());
         let rows = vast_rows(&market, 2, Host::Verified, Some(&plan), &RowFilter { gpu_count: 2, ..RowFilter::default() });
-        let brief: Vec<(&str, Option<f64>, Option<usize>, Option<&str>)> =
+        type Brief<'a> = (&'a str, Option<f64>, Option<usize>, Option<&'a str>);
+        let brief: Vec<Brief> =
             rows.iter().map(|r| (r.cloud.as_deref().unwrap(), r.price_per_gpu, r.try_order, r.note.as_deref())).collect();
         assert_eq!(
             brief,

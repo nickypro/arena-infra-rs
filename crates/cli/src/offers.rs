@@ -186,6 +186,11 @@ async fn handle_catalogs(cfg: &Config, scope: &[&'static str], named: bool, left
             Err(e) => return Err(e),
         }
     }
+    if out.catalogs.is_empty() && out.failed.is_empty() && !scope.is_empty() {
+        // Every provider skipped for a flag that doesn't apply (review: codex): nothing to show
+        // is an error, as in the default view.
+        anyhow::bail!("no provider to show: the flags apply to none of {} (see `skipped:`)", scope.join(", "));
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
@@ -340,7 +345,11 @@ async fn vast_catalog(cfg: &Config, flags: &Flags, c: &mut Catalog) -> Result<()
         }
     }
     let wanted = (!wanted.is_empty()).then(|| wanted.join(","));
-    c.rows = offers::vast_rows(&vast::market_rows(&market), base.gpu_count, default, Some(&plan), &row_filter(cfg, flags, wanted.as_deref()));
+    let mut filter = row_filter(cfg, flags, wanted.as_deref());
+    if let Some(clouds) = &filter.clouds {
+        filter.clouds = Some(vast::admitted_classes(clouds, provider.verified_only())?);
+    }
+    c.rows = offers::vast_rows(&vast::market_rows(&market), base.gpu_count, default, Some(&plan), &filter);
     c.notes.push(format!(
         "# = what `up` would rent · cheapest offer now per class · up rents {} unless --cloud says",
         default.hosts()
@@ -473,6 +482,9 @@ mod tests {
         let e = handle_offers(&cfg(), None, Some("hetzner"), Flags { gpu: Some("A4000".into()), ..Default::default() }, true, false).await.unwrap_err().to_string();
         assert!(e.starts_with("--gpu doesn't apply to hetzner"), "{e}");
         handle_offers(&cfg(), None, Some("shadeform"), Flags::default(), false, false).await.unwrap();
+        // Every provider skipped (`--server-type` with RunPod alone): nothing to show is an error.
+        let e = handle_offers(&cfg(), None, Some("all"), Flags { server_type: Some("cx33".into()), ..Default::default() }, true, false).await.unwrap_err();
+        assert_eq!(e.to_string(), "no provider to show: the flags apply to none of runpod (see `skipped:`)");
         let (cat, warning) = runpod_catalog(&cfg()).await.unwrap();
         assert!(!cat.live && warning.is_none() && cat.rows.len() == arena_core::gpu::PRESETS.len());
         handle_gpus(&cfg(), "runpod", true).await.unwrap();

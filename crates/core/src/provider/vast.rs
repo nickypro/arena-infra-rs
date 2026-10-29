@@ -154,6 +154,18 @@ pub fn tier(cloud: &str, verified_only: bool) -> Result<Host> {
     }
 }
 
+/// The host classes a `--cloud` list on Vast rents from — every class each tier admits, any of
+/// RunPod's tiers meaning the default ([`tier`]) — as `offers vast` filters its rows by them
+/// (review: codex — `--cloud community` filtered every row out while `up` would rent one).
+/// Pure.
+pub fn admitted_classes(clouds: &[String], verified_only: bool) -> Result<Vec<String>> {
+    let mut tiers = Vec::new();
+    for c in clouds {
+        tiers.push(tier(c, verified_only)?);
+    }
+    Ok(Host::ALL.iter().filter(|h| tiers.iter().any(|t| t.admits(**h))).map(|h| h.key().to_string()).collect())
+}
+
 /// Placement's `--cloud` list on Vast as tiers ([`tier`]), in order, each once: RunPod's
 /// tiers collapse to the default, with a note saying so when one was in the list (config's
 /// `CLOUD_TYPE` alone, the usual case, says nothing). Pure.
@@ -2143,6 +2155,12 @@ mod tests {
         let (tiers, note) = list(&["community", "secure", "datacenter"], true);
         assert_eq!(tiers, ["VERIFIED", "DATACENTER"]);
         assert_eq!(note.as_deref(), Some("vast: community,secure are RunPod's — on Vast that's verified (verified hosts only (datacenter ones included))"));
+        // What `offers vast --cloud …` shows: the classes the tiers rent from.
+        let shown = |c: &[&str], strict: bool| admitted_classes(&c.iter().map(|s| s.to_string()).collect::<Vec<_>>(), strict).unwrap();
+        assert_eq!(shown(&["community"], true), ["DATACENTER", "VERIFIED"]);
+        assert_eq!(shown(&["COMMUNITY"], false), ["DATACENTER", "VERIFIED", "UNVERIFIED"]);
+        assert_eq!(shown(&["datacenter"], false), ["DATACENTER"]);
+        assert!(admitted_classes(&["cheap".to_string()], true).is_err());
         // Nested: a wider tier admits every narrower class.
         assert!(Host::Verified.admits(Host::Datacenter) && Host::Unverified.admits(Host::Verified) && !Host::Datacenter.admits(Host::Verified));
         // A create's spec carries its tier.
