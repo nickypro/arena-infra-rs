@@ -164,7 +164,8 @@ if [ -n "${REPO_KEY:-}" ] && [ -f "$REPO_KEY" ]; then
     chmod 600 "$REPO_KEY"
     mkdir -p ~/.ssh && chmod 700 ~/.ssh
     grep -q github.com ~/.ssh/known_hosts 2>/dev/null || ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
-    if ! grep -q "BEGIN arena github" ~/.ssh/config 2>/dev/null; then
+    # (arena's repo update before this script may have written its own block: one is enough.)
+    if ! grep -qE "BEGIN arena(-infra)? github" ~/.ssh/config 2>/dev/null; then
         printf '%s\n' '# BEGIN arena github' 'Host github.com' "  IdentityFile $REPO_KEY" \
             '  IdentitiesOnly yes' '# END arena github' >> ~/.ssh/config
         chmod 600 ~/.ssh/config
@@ -239,7 +240,29 @@ pick_python() {
 # so `arena pods setup` shows which one ran. Not the repo's conda install.sh: it expects
 # RunPod's layout (run from the repo's parent, which must be named ARENA_materials), has no
 # `set -e` (a failed install passes), and its env isn't the venv the gate and shells use.
-if env_ok; then
+# A VM made from an arena image (`arena image build`) has IMAGE_FILE: which image, when, what
+# its env was built from. The first setup on such a VM compares that (the venv's `.arena-req`,
+# written by the install that built it) with what the repo asks for now — arena's repo update
+# fast-forwarded the checkout just before this script: the same, and the env is kept (the ~1 min
+# path); different, and it's rebuilt as on a fresh VM. Later setups on the VM (`adopted=` in the
+# file) leave an env that passes the gate alone, as on any VM: a participant's packages are in it.
+# (ARENA_IMAGE_FILE: a test's stand-in; never set on a pod.)
+arena_req_hash() { ( cd "$1" 2>/dev/null || exit 0; for f in install_uv.sh requirements.txt; do if [ -f "$f" ]; then printf '%s\n' "$f"; cat "$f"; fi; done ) | sha256sum | cut -c1-12; }
+IMAGE_FILE="${ARENA_IMAGE_FILE:-/etc/arena-image}"
+FROM_IMAGE=0
+if [ -f "$IMAGE_FILE" ] && ! grep -q '^adopted=' "$IMAGE_FILE" 2>/dev/null; then FROM_IMAGE=1; fi
+REQ_NOW=$(arena_req_hash "$REPO_DIR")
+REBUILD=0
+if [ "$FROM_IMAGE" = 1 ] && env_ok; then
+    REQ_WAS=$(cat "$VENV/.arena-req" 2>/dev/null)
+    if [ "$REQ_WAS" != "$REQ_NOW" ]; then
+        REBUILD=1
+        echo "the image's env was built from other requirements (${REQ_WAS:-unknown}; the repo's are $REQ_NOW now) — rebuilding it"
+    fi
+fi
+INSTALLED=1
+if [ "$REBUILD" = 0 ] && env_ok; then
+    INSTALLED=0
     INSTALLER="none (env already present)"
     echo "ARENA env already present (torch + transformer_lens import) — skipping the install"
 elif [ -f install_uv.sh ]; then
@@ -311,6 +334,11 @@ if ! env_ok; then
     fi
     why=$("$VENV/bin/python" -c 'import torch, transformer_lens' 2>&1 | tail -n1)
     die "the ARENA env at $VENV can't import torch + transformer_lens (${why:-no python in it}) — not set up"
+fi
+# What this env was built from, for an image made of this VM to compare against (above). Only
+# after an install: an env found here was built from whatever it was built from.
+if [ "$INSTALLED" = 1 ]; then
+    printf '%s\n' "$REQ_NOW" > "$VENV/.arena-req" || echo "WARN: couldn't write $VENV/.arena-req"
 fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
@@ -387,6 +415,27 @@ chsh -s "$(which zsh)" root 2>/dev/null || true
 # Tokens (OPENROUTER_API_KEY, HF_TOKEN, …) are distributed separately by
 # `arena pods copy-keys` (cross-provider), which appends exports to these same rc files.
 
+# Which arena image this VM came from, how old it is and what became of its env — once, on the
+# first setup (then the file is marked adopted, and later setups say nothing about it).
+if [ "$FROM_IMAGE" = 1 ]; then
+    built=$(sed -n 's/^built=//p' "$IMAGE_FILE" | head -n1)
+    name=$(sed -n 's/^name=//p' "$IMAGE_FILE" | head -n1)
+    commit=$(sed -n 's/^commit=//p' "$IMAGE_FILE" | head -n1)
+    when="?"
+    case "$built" in
+        '' | *[!0-9]*) ;;
+        *)
+            age=$(( $(date +%s) - built ))
+            if [ "$age" -lt 172800 ]; then ago="$((age / 3600)) h ago"; else ago="$((age / 86400)) d ago"; fi
+            when="$(date -u -d "@$built" +%F 2>/dev/null) ($ago)"
+            ;;
+    esac
+    if [ "$REBUILD" = 1 ]; then reqs="requirements changed since, env rebuilt"
+    elif [ "$INSTALLED" = 1 ]; then reqs="its env failed the check, rebuilt"
+    else reqs="requirements unchanged, env kept"; fi
+    echo "arena-image: ${name:-?}, built $when, commit ${commit:-?}; $reqs"
+    printf 'adopted=%s\n' "$(date +%s)" >> "$IMAGE_FILE" || echo "WARN: couldn't mark $IMAGE_FILE adopted"
+fi
 # What built the env, for `arena pods setup`/`pods up` to put on the pod's ✓ line (stdout
 # reaches the operator only through these `arena-` lines).
 echo "arena-installer: $INSTALLER"

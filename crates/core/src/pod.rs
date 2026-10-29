@@ -120,7 +120,7 @@ pub struct Maintenance {
 
 /// What we want when creating a machine. Provider implementations translate this
 /// into their own API payloads.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PodSpec {
     pub name: String,
     pub image: String,
@@ -171,6 +171,10 @@ pub struct PodSpec {
     /// `create`/`up` refuse the flag for any other provider rather than drop it. `None` = the
     /// configured type.
     pub server_type: Option<String>,
+    /// `--image` on a Hetzner create: what the VM boots — `arena` (the newest arena-built
+    /// snapshot that fits), a snapshot id or a system image name — over `HETZNER_IMAGE`. Not
+    /// [`Self::image`], which is a container image (RunPod/Vast). `None` = the configured one.
+    pub vm_image: Option<String>,
 }
 
 impl PodSpec {
@@ -213,6 +217,7 @@ impl PodSpec {
             api_extra: None,
             avoid_machines: Vec::new(),
             server_type: None,
+            vm_image: None,
         }
     }
 

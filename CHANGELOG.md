@@ -14,6 +14,29 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-29 · Hetzner VMs from a pre-built image: setup in about a minute
+- `arena image build` bakes a Hetzner image: a temporary cx23 set up as `pods setup` does (no
+  tokens), scrubbed of everything that belongs to that machine (deploy key, authorized keys,
+  tokens, history, name, swap, machine-id, SSH host keys, cloud-init state, logs), scanned for
+  secrets — it refuses to snapshot on any hit, naming the file — then snapshotted. The VM is
+  deleted whatever happens, Ctrl+C included. `arena image list` shows the images, their cost and
+  whether the repo's requirements still match; `arena image prune` deletes old ones.
+- `HETZNER_IMAGE=arena` (or `--image arena` on `pods create` / `pods up`) creates VMs from the
+  newest image that fits the server type, else from Ubuntu with a note. Setup then takes about a
+  minute instead of ~10 (sandbox: 1m22s against 4m48s): it fast-forwards the checkout, keeps the
+  env when the requirements are the same (rebuilds it when not), and says which image the VM came
+  from and how old it is.
+- On every Hetzner VM, `pods setup` now updates an existing checkout before the setup script, as
+  on RunPod/Vast pods (a clean default branch fast-forwards; `--force` resets it).
+- `config check` says which image `arena` resolves to, with a note when it's over 14 days old or
+  the requirements changed. `teardown --check` lists the images as kept (◷, with their monthly
+  cost; never against the check), a build VM still there as remaining, and any other snapshot in
+  the project as a note.
+- Images belong to one Hetzner project: build one in each (`arena image build` on the control box).
+
+### Config
+- `HETZNER_IMAGE` takes `arena` (new): the newest arena-built image in the project that fits.
+
 ## 2026-10-29 · Hetzner VMs get 8 GB of swap
 - `arena pods setup` (and `up`) on a Hetzner VM now makes an 8 GB swap file first, so a notebook
   that goes past the VM's RAM slows down instead of having its kernel killed. Shadeform's GPU VMs

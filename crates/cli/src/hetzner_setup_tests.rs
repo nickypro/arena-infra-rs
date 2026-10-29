@@ -497,3 +497,100 @@ fn the_public_course_repo_becomes_upstream_when_the_checkout_has_none() {
     // On the pod's line: setup shows its `arena-warning:` lines (review fb2 R4).
     assert!(r.stdout.lines().any(|l| l == format!("arena-warning: couldn't add the upstream remote {up}")), "{}", r.stdout);
 }
+
+/// What the bake leaves on an arena image (`arena_core::image::scrub_script`): its name, when it
+/// was built, the commit and the requirements hash — in the test's own dir, never /etc.
+fn image_marker(repo: &Path, built: u64, req: &str) -> PathBuf {
+    let marker = repo.parent().unwrap().join("arena-image");
+    std::fs::write(&marker, format!("name=devtest-image-261029-1542\nbuilt={built}\ncommit=3eed962b9bd8\nreq={req}\n")).unwrap();
+    marker
+}
+
+fn image_said(stdout: &str) -> Vec<&str> {
+    stdout.lines().filter_map(|l| l.strip_prefix(arena_core::setup::IMAGE_PREFIX)).collect()
+}
+
+/// A fresh install records what it was built from (the venv's `.arena-req`, the hash the image's
+/// `req` label carries). The first setup on a VM made from the image keeps that env when the
+/// repo's requirements are the same, says which image it came from and how old it is, and marks
+/// the image file adopted; a later setup says nothing more about the image.
+#[test]
+fn a_vm_from_an_arena_image_keeps_its_env_when_the_requirements_match() {
+    let (_t, stubs, home, repo) = setup("image-same");
+    install_uv_sh(&repo);
+    let bake = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]);
+    assert!(bake.ok, "{}", bake.stderr);
+    assert!(image_said(&bake.stdout).is_empty(), "no image file: nothing said: {}", bake.stdout);
+    let rd = |f: &str| std::fs::read(repo.join(f)).unwrap();
+    let req = arena_core::image::req_hash(Some(&rd("install_uv.sh")), Some(&rd("requirements.txt")));
+    assert_eq!(std::fs::read_to_string(repo.join(".venv/.arena-req")).unwrap(), format!("{req}\n"));
+
+    std::fs::remove_file(repo.join("install_uv.ran")).unwrap();
+    let built = arena_core::snapshot::unix_now() - 30 * 3600 - 60;
+    let marker = image_marker(&repo, built, &req);
+    let m = marker.display().to_string();
+    let r = run(&stubs, &home, &repo, &[("ARENA_IMAGE_FILE", &m)]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(!repo.join("install_uv.ran").exists(), "the env is kept, not rebuilt");
+    assert_eq!(installers_said(&r.stdout), ["none (env already present)"]);
+    let day = &arena_core::snapshot::rfc3339(built)[..10];
+    assert_eq!(image_said(&r.stdout), [format!("devtest-image-261029-1542, built {day} (30 h ago), commit 3eed962b9bd8; requirements unchanged, env kept")]);
+    assert!(std::fs::read_to_string(&marker).unwrap().lines().last().unwrap().starts_with("adopted="));
+
+    let again = run(&stubs, &home, &repo, &[("ARENA_IMAGE_FILE", &m)]);
+    assert!(again.ok && image_said(&again.stdout).is_empty(), "{}", again.stdout);
+}
+
+/// The repo's requirements moved on since the image was baked (the repo update fast-forwarded
+/// the checkout just before the script): the first setup rebuilds the env as on a fresh VM, says
+/// why, and records the new hash. After that first setup the VM is like any other: a later change
+/// leaves an env that passes the gate alone (a participant's packages are in it).
+#[test]
+fn a_vm_from_an_image_built_from_other_requirements_rebuilds_its_env_once() {
+    let (_t, stubs, home, repo) = setup("image-changed");
+    install_uv_sh(&repo);
+    assert!(run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]).ok);
+    let old = std::fs::read_to_string(repo.join(".venv/.arena-req")).unwrap().trim().to_string();
+    std::fs::remove_file(repo.join("install_uv.ran")).unwrap();
+    let mut reqs = std::fs::read_to_string(repo.join("requirements.txt")).unwrap();
+    reqs.push_str("einops\n");
+    std::fs::write(repo.join("requirements.txt"), &reqs).unwrap();
+    let new = arena_core::image::req_hash(Some(&std::fs::read(repo.join("install_uv.sh")).unwrap()), Some(reqs.as_bytes()));
+    let marker = image_marker(&repo, arena_core::snapshot::unix_now() - 20 * 86_400, &old);
+    let m = marker.display().to_string();
+    let r = run(&stubs, &home, &repo, &[("ARENA_IMAGE_FILE", &m), ("UV_INSTALL_MAKES_TORCH", "1")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(r.stdout.contains(&format!("the image's env was built from other requirements ({old}; the repo's are {new} now) — rebuilding it")), "{}", r.stdout);
+    assert!(repo.join("install_uv.ran").exists(), "rebuilt");
+    assert_eq!(installers_said(&r.stdout), ["install_uv.sh"]);
+    let said = image_said(&r.stdout);
+    assert!(said.len() == 1 && said[0].contains("(20 d ago)") && said[0].ends_with("; requirements changed since, env rebuilt"), "{said:?}");
+    assert_eq!(std::fs::read_to_string(repo.join(".venv/.arena-req")).unwrap(), format!("{new}\n"));
+
+    std::fs::remove_file(repo.join("install_uv.ran")).unwrap();
+    reqs.push_str("jaxtyping\n");
+    std::fs::write(repo.join("requirements.txt"), &reqs).unwrap();
+    let later = run(&stubs, &home, &repo, &[("ARENA_IMAGE_FILE", &m)]);
+    assert!(later.ok && !repo.join("install_uv.ran").exists(), "adopted: the gate alone decides: {}", later.stdout);
+    assert_eq!(installers_said(&later.stdout), ["none (env already present)"]);
+}
+
+/// An image whose env no longer passes the gate is rebuilt — and the image line says so, not
+/// "kept".
+#[test]
+fn an_image_vm_whose_env_fails_the_gate_is_rebuilt_and_says_so() {
+    let (_t, stubs, home, repo) = setup("image-broken");
+    install_uv_sh(&repo);
+    let marker = image_marker(&repo, arena_core::snapshot::unix_now(), "whatever");
+    let m = marker.display().to_string();
+    let r = run(&stubs, &home, &repo, &[("ARENA_IMAGE_FILE", &m), ("UV_INSTALL_MAKES_TORCH", "1")]);
+    assert!(r.ok, "{}", r.stderr);
+    let said = image_said(&r.stdout);
+    assert!(said.len() == 1 && said[0].ends_with("(0 h ago), commit 3eed962b9bd8; its env failed the check, rebuilt"), "{said:?}");
+}
+
+/// The hash the script records is the one `arena_core::image` computes (and the scrub labels).
+#[test]
+fn the_script_hashes_the_requirements_as_arena_does() {
+    assert!(crate::HETZNER_SETUP.contains(arena_core::image::REQ_HASH_FN));
+}

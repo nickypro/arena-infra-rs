@@ -124,14 +124,7 @@ impl SetupConfig {
         let q = shell_quote;
         let key = &self.key_remote;
 
-        // Idempotent github.com block in ~/.ssh/config pointing at the deploy key.
-        let ssh_config = format!(
-            "mkdir -p \"$HOME/.ssh\" && chmod 700 \"$HOME/.ssh\" && touch \"$HOME/.ssh/config\" && \
-             sed -i '/^# BEGIN arena-infra github.com/,/^# END arena-infra github.com/d' \"$HOME/.ssh/config\" && \
-             printf '%s\\n' '# BEGIN arena-infra github.com' 'Host github.com' '    AddKeysToAgent yes' \
-             '    IdentityFile {key}' '# END arena-infra github.com' >> \"$HOME/.ssh/config\" && \
-             chmod 600 \"$HOME/.ssh/config\""
-        );
+        let ssh_config = self.github_ssh_config();
 
         // Ensure the shared key + deploy key are in authorized_keys (so the tool and
         // participants can SSH in with whichever they hold). Each is appended only if
@@ -217,6 +210,38 @@ ZSH_BIN=$(command -v zsh); [ -n "$ZSH_BIN" ] && chsh -s "$ZSH_BIN" "$(id -un)" >
             steps.push(block);
         }
         steps.join("; ")
+    }
+
+    /// Idempotent github.com block in ~/.ssh/config pointing at the deploy key.
+    fn github_ssh_config(&self) -> String {
+        let key = &self.key_remote;
+        format!(
+            "mkdir -p \"$HOME/.ssh\" && chmod 700 \"$HOME/.ssh\" && touch \"$HOME/.ssh/config\" && \
+             sed -i '/^# BEGIN arena-infra github.com/,/^# END arena-infra github.com/d' \"$HOME/.ssh/config\" && \
+             printf '%s\\n' '# BEGIN arena-infra github.com' 'Host github.com' '    AddKeysToAgent yes' \
+             '    IdentityFile {key}' '# END arena-infra github.com' >> \"$HOME/.ssh/config\" && \
+             chmod 600 \"$HOME/.ssh/config\""
+        )
+    }
+
+    /// A bare VM's repo update, before its setup script: on a VM that already has the checkout —
+    /// one made from an arena image (`arena image build`), or a re-run — the same update an
+    /// image-based pod gets ([`Self::repo_update_command`]: a clean default branch fast-forwards,
+    /// anything of the participant's is left alone), so the script's env check reads the course's
+    /// current requirements. Wires the deploy key to github.com first (an image carries no key)
+    /// and knows github.com's host key. A fresh VM has no checkout yet: nothing to do (the
+    /// script clones it).
+    pub fn bare_vm_repo_update_command(&self, force: bool) -> String {
+        let q = shell_quote;
+        format!(
+            "if [ -d {repo}/.git ]; then set -e; chmod 600 {key}; {ssh_config}; \
+             (grep -qs '^github.com ' \"$HOME/.ssh/known_hosts\" || ssh-keyscan github.com >> \"$HOME/.ssh/known_hosts\" 2>/dev/null) || true; \
+             {update}; else echo 'no checkout yet: the setup script clones it'; fi",
+            repo = q(&self.repo_path),
+            key = q(&self.key_remote),
+            ssh_config = self.github_ssh_config(),
+            update = self.repo_update_command(force),
+        )
     }
 
     /// The ARENA-repo part of [`Self::remote_command`]: re-point `origin`, fetch, update
@@ -571,6 +596,9 @@ pub fn provisioning_steps(
                 remote: "/root/hetzner_setup.sh".into(),
                 timeout: timeouts.copy,
             },
+            // A VM from an arena image (or a re-run) updates its checkout first, so the script
+            // decides about the env on the course's current requirements.
+            ProvisionStep::Run { label: "repo update", cmd: scfg.bare_vm_repo_update_command(force), timeout: timeouts.config },
             ProvisionStep::Run {
                 label: "hetzner setup script",
                 cmd: format!(
@@ -673,7 +701,9 @@ pub enum ProvisionOutcome {
     /// Every required step succeeded. `warnings`: the best-effort steps that didn't
     /// (`<label>: <why>`) — reported, never a failure. `installer`: what built the ARENA env,
     /// as the bare-VM setup script says it ([`INSTALLER_PREFIX`]; `None` from any other setup).
-    Done { warnings: Vec<String>, installer: Option<String> },
+    /// `image`: the arena image the VM came from and how old it is, as the script says it the
+    /// first time it sets up such a VM ([`IMAGE_PREFIX`]).
+    Done { warnings: Vec<String>, installer: Option<String>, image: Option<String> },
     /// A step failed: non-zero exit (`code`), a failed copy, or the call itself erroring.
     Failed { step: &'static str, code: Option<i32>, detail: String },
     /// A step (or, defensively, the whole pod budget) ran out of time.
@@ -683,12 +713,12 @@ pub enum ProvisionOutcome {
 impl ProvisionOutcome {
     /// Set up, with nothing to report.
     pub fn done() -> Self {
-        ProvisionOutcome::Done { warnings: Vec::new(), installer: None }
+        ProvisionOutcome::Done { warnings: Vec::new(), installer: None, image: None }
     }
 
     /// Set up, with these warnings (and no installer said).
     pub fn warned(warnings: Vec<String>) -> Self {
-        ProvisionOutcome::Done { warnings, installer: None }
+        ProvisionOutcome::Done { warnings, installer: None, image: None }
     }
 
     pub fn is_done(&self) -> bool {
@@ -708,6 +738,14 @@ impl ProvisionOutcome {
     pub fn installer(&self) -> Option<&str> {
         match self {
             ProvisionOutcome::Done { installer, .. } => installer.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The arena image the VM came from, when its setup said ([`IMAGE_PREFIX`]).
+    pub fn image(&self) -> Option<&str> {
+        match self {
+            ProvisionOutcome::Done { image, .. } => image.as_deref(),
             _ => None,
         }
     }
@@ -736,8 +774,9 @@ impl ProvisionOutcome {
 /// `[done/total] ✗ name (failed at <step>, exit N): <stderr>`.
 pub fn progress_line(done: usize, total: usize, name: &str, outcome: &ProvisionOutcome) -> String {
     match outcome {
-        ProvisionOutcome::Done { warnings, installer } => {
+        ProvisionOutcome::Done { warnings, installer, image } => {
             let mut said: Vec<String> = installer.iter().map(|i| format!("installer: {i}")).collect();
+            said.extend(image.iter().map(|i| format!("image: {i}")));
             if !warnings.is_empty() {
                 said.push(format!("warning: {}", warnings.join("; ")));
             }
@@ -908,6 +947,7 @@ async fn provision_once(
 ) -> Pass {
     let mut warnings = Vec::new();
     let mut installer = None;
+    let mut image = None;
     for (i, step) in steps.iter().enumerate() {
         at.store(i, Ordering::Relaxed);
         let step_label = step.label();
@@ -924,6 +964,7 @@ async fn provision_once(
                     if out.success {
                         warnings.extend(step_warnings(&out.stdout).map(|w| format!("{step_label}: {w}")));
                         installer = step_installer(&out.stdout).or(installer);
+                        image = step_said(&out.stdout, IMAGE_PREFIX, IMAGE_MAX_CHARS).or(image);
                     }
                 }
                 call
@@ -973,7 +1014,7 @@ async fn provision_once(
             }
         }
     }
-    Pass::Final(ProvisionOutcome::Done { warnings, installer })
+    Pass::Final(ProvisionOutcome::Done { warnings, installer, image })
 }
 
 /// The line the bare-VM setup script (`hetzner_setup.sh`) prints after building — or finding —
@@ -988,12 +1029,26 @@ const INSTALLER_MAX_CHARS: usize = 80;
 /// What a provisioning command said built the env: its last [`INSTALLER_PREFIX`] line, prefix
 /// stripped, clipped to [`INSTALLER_MAX_CHARS`]; `None` when it says nothing. Pure.
 fn step_installer(stdout: &str) -> Option<String> {
+    step_said(stdout, INSTALLER_PREFIX, INSTALLER_MAX_CHARS)
+}
+
+/// The line the bare-VM setup script prints the first time it sets up a VM made from an arena
+/// image: `arena-image: devtest-image-261029-1200, built 2026-10-29 (2 d ago), commit abc;
+/// requirements unchanged`.
+pub const IMAGE_PREFIX: &str = "arena-image: ";
+
+/// The longest image line shown: its name, date, age, commit and what setup did with the env.
+const IMAGE_MAX_CHARS: usize = 160;
+
+/// A command's last `prefix` line, prefix stripped, clipped to `max` chars; `None` when it has
+/// none. Pure.
+fn step_said(stdout: &str, prefix: &str, max: usize) -> Option<String> {
     stdout
         .lines()
-        .filter_map(|l| l.trim_end_matches('\r').strip_prefix(INSTALLER_PREFIX))
+        .filter_map(|l| l.trim_end_matches('\r').strip_prefix(prefix))
         .map(str::trim)
         .rfind(|i| !i.is_empty())
-        .map(|i| crate::fleet::clip_middle(i, INSTALLER_MAX_CHARS))
+        .map(|i| crate::fleet::clip_middle(i, max))
 }
 
 /// The longest a setup warning gets before its middle is cut ([`crate::fleet::clip_middle`]).
@@ -1393,6 +1448,8 @@ mod tests {
                     remote: "/root/hetzner_setup.sh".into(),
                     timeout: secs(60),
                 },
+                // A checkout already there (an arena image, a re-run) is updated first.
+                ProvisionStep::Run { label: "repo update", cmd: scfg.bare_vm_repo_update_command(false), timeout: secs(300) },
                 ProvisionStep::Run {
                     label: "hetzner setup script",
                     cmd: "ARENA_SWAP_GB=8 REPO_URL='git@github.com:o/r.git' REPO_DIR='/root/ARENA_3.0' REPO_KEY='/root/.ssh/id_ed25519' bash /root/hetzner_setup.sh".into(),
@@ -1400,6 +1457,8 @@ mod tests {
                 },
             ]
         );
+        assert!(matches!(&provisioning_steps("hetzner", &scfg, "arena8-flutter", true, "/tmp/h.sh", &t)[2],
+            ProvisionStep::Run { cmd, .. } if *cmd == scfg.bare_vm_repo_update_command(true)), "--force reaches it");
         // image-based (runpod/vast): scp the deploy key, move the repo onto the volume (best-
         // effort), then a config command that re-points origin — i.e. the post-image flow, not
         // the bare-VM script.
@@ -1589,10 +1648,11 @@ mod tests {
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert_eq!(out, ProvisionOutcome::done());
         let calls = fake.calls();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert!(matches!(&calls[0], RemoteCall::Copy { local, timeout, .. } if local == "/local/key" && *timeout == Some(secs(60))));
         assert!(matches!(&calls[1], RemoteCall::Copy { remote, .. } if remote == "/root/hetzner_setup.sh"));
-        assert!(matches!(&calls[2], RemoteCall::Exec { cmd, timeout, .. } if cmd.ends_with("bash /root/hetzner_setup.sh") && *timeout == Some(secs(1800))));
+        assert!(matches!(&calls[2], RemoteCall::Exec { cmd, timeout, .. } if cmd.contains("git fetch --no-tags origin") && *timeout == Some(secs(300))));
+        assert!(matches!(&calls[3], RemoteCall::Exec { cmd, timeout, .. } if cmd.ends_with("bash /root/hetzner_setup.sh") && *timeout == Some(secs(1800))));
 
         let fake = FakeRemote::new();
         assert_eq!(provision(&fake, &target(22), &image_steps(), BootRetry::default()).await, ProvisionOutcome::done());
@@ -1711,14 +1771,15 @@ mod tests {
         let script = "### 4/6 ARENA repo + Python env\ninstaller: /root/r/install_uv.sh (the repo's own), torch backend cpu\n\
                       arena-installer: install_uv.sh\r\n### done — Python 3.13.16, torch 2.14.1+cpu, installer: install_uv.sh\n";
         let fake = FakeRemote::new();
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(script), FakeReply::ok()]);
+        // Copy the key, copy the script, the repo update, the script, the warm-up.
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(script), FakeReply::ok()]);
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
-        assert_eq!(out, ProvisionOutcome::Done { warnings: vec![], installer: Some("install_uv.sh".into()) });
+        assert_eq!(out, ProvisionOutcome::Done { warnings: vec![], installer: Some("install_uv.sh".into()), image: None });
         assert_eq!(progress_line(1, 1, "devtest-hz1", &out), "[1/1] ✓ devtest-hz1 (installer: install_uv.sh)");
         // With a warning (the warm-up failed): both.
         let fake = FakeRemote::new();
         let again = "arena-installer: install_uv.sh\narena-installer: none (env already present)\n";
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(again), FakeReply::exit(3, "warm-up incomplete: x")]);
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(again), FakeReply::exit(3, "warm-up incomplete: x")]);
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert_eq!(
             progress_line(2, 2, "devtest-hz1", &out),
@@ -1726,9 +1787,19 @@ mod tests {
         );
         // A script that failed: its line isn't read.
         let fake = FakeRemote::new();
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::exit(1, "FAILED: no torch").with_stdout(script)]);
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::exit(1, "FAILED: no torch").with_stdout(script)]);
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert!(!out.is_done() && out.installer().is_none(), "{out:?}");
+        // A VM from an arena image: which image, on the line too (once, from its first setup).
+        let fake = FakeRemote::new();
+        let from_image = format!("{script}arena-image: devtest-image-261029-1542, built 2026-10-29 (2 h ago), commit 3eed962b9bd8; requirements unchanged, env kept\n");
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(&from_image), FakeReply::ok()]);
+        let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
+        assert_eq!(out.image(), Some("devtest-image-261029-1542, built 2026-10-29 (2 h ago), commit 3eed962b9bd8; requirements unchanged, env kept"));
+        assert_eq!(
+            progress_line(1, 1, "devtest-hz1", &out),
+            "[1/1] ✓ devtest-hz1 (installer: install_uv.sh; image: devtest-image-261029-1542, built 2026-10-29 (2 h ago), commit 3eed962b9bd8; requirements unchanged, env kept)"
+        );
         // Nothing said (an image-based setup): the line as before.
         assert_eq!(step_installer("### done\narena-installer:   \n"), None);
         assert_eq!(progress_line(1, 1, "a", &ProvisionOutcome::warned(vec!["w".into()])), "[1/1] ✓ a (warning: w)");
@@ -1886,7 +1957,7 @@ mod tests {
     fn the_vscode_warm_up_is_the_last_step_everywhere_unless_off() {
         let t = SetupTimeouts::default();
         assert_eq!(t.vscode, secs(300));
-        for (provider, before) in [("runpod", 3), ("vast", 3), ("hetzner", 3)] {
+        for (provider, before) in [("runpod", 3), ("vast", 3), ("hetzner", 4)] {
             let steps = provisioning_steps(provider, &vscode_cfg(), "arena8-apple", false, "/tmp/h.sh", &t);
             assert_eq!(steps.len(), before + 1, "{provider}");
             let ProvisionStep::Optional { label, cmd, summary, timeout } = steps.last().unwrap() else {
@@ -2160,6 +2231,44 @@ mod tests {
                 assert!(!refs.contains("autocommit-arena8-w2d1-bloom"), "fetched an unrelated branch:\n{refs}");
                 assert!(!refs.contains("refs/tags/v2"), "fetched tags:\n{refs}");
             }
+        }
+
+        /// A bare VM's repo update (before its setup script): on a VM from an arena image the
+        /// clean default branch fast-forwards to origin's — with the deploy key wired to
+        /// github.com, which the image carries none of — and on a fresh VM (no checkout yet)
+        /// it does nothing but say so. Real git.
+        #[test]
+        fn a_bare_vms_checkout_fast_forwards_before_its_setup_script() {
+            let Some(f) = Fixture::new("bare-vm") else { return };
+            f.clone_pod(&[]);
+            let (main, _) = f.advance_origin();
+            let key = f.root.join("deploy_key");
+            std::fs::write(&key, "k").unwrap();
+            std::fs::create_dir_all(f.root.join(".ssh")).unwrap();
+            std::fs::write(f.root.join(".ssh/known_hosts"), "github.com ssh-ed25519 AAAA\n").unwrap();
+            let mut scfg = steps_cfg();
+            scfg.repo_path = f.pod.to_string_lossy().into_owned();
+            scfg.repo_url = f.origin.to_string_lossy().into_owned();
+            scfg.key_remote = key.to_string_lossy().into_owned();
+            let run = |scfg: &crate::setup::SetupConfig| {
+                let mut c = Command::new("sh");
+                c.arg("-c").arg(scfg.bare_vm_repo_update_command(false));
+                isolated(&mut c, &f.root);
+                c.output().unwrap()
+            };
+            let out = run(&scfg);
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(f.head(), ("main".to_string(), main));
+            let config = std::fs::read_to_string(f.root.join(".ssh/config")).unwrap();
+            assert!(config.contains(&format!("IdentityFile {}", key.display())), "{config}");
+            f.assert_narrow();
+            // A fresh VM: no checkout, nothing done (the script clones it), no ssh config written.
+            std::fs::remove_file(f.root.join(".ssh/config")).unwrap();
+            scfg.repo_path = f.root.join("absent").to_string_lossy().into_owned();
+            let out = run(&scfg);
+            assert!(out.status.success());
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "no checkout yet: the setup script clones it");
+            assert!(!f.root.join(".ssh/config").exists());
         }
 
         /// The human (2026-10-19): with `origin` the cohort's copy, the public course repo as
