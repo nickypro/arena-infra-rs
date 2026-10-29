@@ -106,30 +106,19 @@ pub(crate) async fn exchange_with(rb: RequestBuilder, ctx: &str, limits: &Limits
     let read = matches!(*req.method(), Method::GET | Method::HEAD);
     let (mut retried, mut resent) = (0u32, 0u32);
     loop {
-        let now = Instant::now();
-        if let Some((until, why)) = ratelimit::with(&key, |q| q.block(now)) {
-            let wait = until - now;
-            let budget = ratelimit::budget(limits.max_wait, now);
-            if wait > budget {
-                return Err(Error::Provider {
-                    kind: ProviderErrorKind::RateLimited,
-                    message: format!("{ctx}: not sent — {} rate limit ({why}): next request in {}", key.api(), wait_words(wait)),
-                });
-            }
-            sleep((wait + jitter(limits.jitter)).min(budget)).await;
-        }
+        let sent_at = admit(&key, ctx, limits, sleep).await?;
         let Some(attempt) = rb.try_clone() else {
             return Ok(Answer::Reply(rb.send().await?));
         };
-        ratelimit::with(&key, |q| q.note_sent(Instant::now()));
         let resp = match attempt.send().await {
             Ok(resp) => resp,
             Err(e) => {
-                let wait = limits.step(resent);
-                if read && resent < limits.resends && resendable(&e) && wait <= ratelimit::budget(limits.max_wait, Instant::now()) {
-                    resent += 1;
-                    sleep(wait + jitter(limits.jitter)).await;
-                    continue;
+                if read && resent < limits.resends && resendable(&e) {
+                    if let Some(pause) = backoff(limits, resent) {
+                        resent += 1;
+                        sleep(pause).await;
+                        continue;
+                    }
                 }
                 return Err(e.into());
             }
@@ -139,25 +128,25 @@ pub(crate) async fn exchange_with(rb: RequestBuilder, ctx: &str, limits: &Limits
         let state = header_text(&resp, "ratelimit");
         ratelimit::with(&key, |q| q.record(header_text(&resp, "ratelimit-policy").as_deref(), state.as_deref(), now));
         if status != StatusCode::TOO_MANY_REQUESTS {
-            ratelimit::with(&key, ratelimit::Quota::note_answered);
-            let wait = limits.step(resent);
-            if status.is_server_error() && read && resent < limits.resends && wait <= ratelimit::budget(limits.max_wait, now) {
-                resent += 1;
-                sleep(wait + jitter(limits.jitter)).await;
-                continue;
+            ratelimit::with(&key, |q| q.note_answered(sent_at));
+            if status.is_server_error() && read && resent < limits.resends {
+                if let Some(pause) = backoff(limits, resent) {
+                    resent += 1;
+                    sleep(pause).await;
+                    continue;
+                }
             }
             return Ok(Answer::Reply(resp));
         }
         let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(ratelimit::parse_retry_after);
         let text = resp.text().await.unwrap_or_default();
         let windows = state.as_deref().map(ratelimit::parse_state).unwrap_or_default();
+        let body_after = ratelimit::body_retry_after(&text);
         let wait = ratelimit::with(&key, |q| {
-            let wait = ratelimit::wait_for_429(retry_after, ratelimit::body_retry_after(&text), &windows, q.strikes, limits.backoff);
-            q.note_throttled(wait, refusal_words(&text), now);
-            wait
+            q.note_throttled(sent_at, retry_after, body_after, &windows, limits.backoff, refusal_words(&text), now)
         });
         if retried < limits.retries && wait <= ratelimit::budget(limits.max_wait, now) {
-            // The hold just set is waited out at the top of the loop.
+            // The hold just set is waited out by `admit`.
             retried += 1;
             continue;
         }
@@ -168,6 +157,43 @@ pub(crate) async fn exchange_with(rb: RequestBuilder, ctx: &str, limits: &Limits
         };
         return Ok(Answer::Throttled { status, text, note });
     }
+}
+
+/// Let one request on `key`'s quota through, and say when: at once, or once its hold has
+/// passed — re-checked after every wake, so a hold another request set or extended meanwhile
+/// (or a low quota's spacing behind a request let through first) is honoured too. A hold
+/// longer than the caller can wait refuses the request, not sent. A hold already waited out
+/// isn't waited twice (a sleep that ended early).
+async fn admit(key: &QuotaKey, ctx: &str, limits: &Limits, sleep: Sleeper<'_>) -> Result<Instant> {
+    let mut waited: Option<Instant> = None;
+    loop {
+        let now = Instant::now();
+        let Some((until, why)) = ratelimit::with(key, |q| q.admit(now)) else {
+            return Ok(now);
+        };
+        if waited.is_some_and(|w| until <= w) {
+            ratelimit::with(key, |q| q.note_sent(now));
+            return Ok(now);
+        }
+        let wait = until.saturating_duration_since(now);
+        let budget = ratelimit::budget(limits.max_wait, now);
+        if wait > budget {
+            return Err(Error::Provider {
+                kind: ProviderErrorKind::RateLimited,
+                message: format!("{ctx}: not sent — {} rate limit ({why}): next request in {}", key.api(), wait_words(wait)),
+            });
+        }
+        sleep((wait + jitter(limits.jitter)).min(budget)).await;
+        waited = Some(until);
+    }
+}
+
+/// The pause before the `n`th resend (0-based), jitter included and never past the caller's
+/// bound — `None` when the backoff itself doesn't fit: the answer in hand is the caller's.
+fn backoff(limits: &Limits, n: u32) -> Option<Duration> {
+    let budget = ratelimit::budget(limits.max_wait, Instant::now());
+    let wait = limits.step(n);
+    (wait <= budget).then(|| (wait + jitter(limits.jitter)).min(budget))
 }
 
 /// A header's value(s) as text (several lines joined by `, `, as HTTP combines them).
@@ -385,7 +411,10 @@ pub(crate) mod test_server {
     /// Serve `responses` in order, one per connection, then stop accepting.
     pub fn serve(responses: Vec<Canned>) -> Server {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
-        let base = format!("http://{}", listener.local_addr().unwrap());
+        let addr = listener.local_addr().unwrap();
+        // A port an earlier test's server had: its quota (holds, counts) isn't this server's.
+        crate::ratelimit::forget_api(&format!("127.0.0.1:{}", addr.port()));
+        let base = format!("http://{addr}");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let headers = Arc::new(Mutex::new(Vec::new()));
         let bodies = Arc::new(Mutex::new(Vec::new()));
@@ -455,14 +484,20 @@ mod tests {
     /// RunPod's limits without the jitter, so a test can check each wait.
     const EXACT: Limits = Limits { jitter: Duration::ZERO, ..Limits::RUNPOD };
 
+    /// What a test's sleeper is: [`Sleeper`] owned.
+    type SleepFn = dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Sync;
+
     /// A sleeper that only records what it was asked to wait.
-    fn recorder() -> (Arc<Mutex<Vec<Duration>>>, impl Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Sync) {
+    fn recorder() -> (Arc<Mutex<Vec<Duration>>>, Box<SleepFn>) {
         let waits = Arc::new(Mutex::new(Vec::new()));
         let seen = waits.clone();
-        (waits, move |d| {
-            seen.lock().unwrap().push(d);
-            Box::pin(async {})
-        })
+        (
+            waits,
+            Box::new(move |d| {
+                seen.lock().unwrap().push(d);
+                Box::pin(async {})
+            }),
+        )
     }
 
     /// Each wait is the one wanted, give or take the moments the test itself took.
@@ -614,6 +649,55 @@ mod tests {
         let srv = serve(vec![canned(429, "text/plain", "busy").header("Retry-After", "1800")]);
         let (s, t) = send_text(client().get(format!("{}/x", srv.base))).await.unwrap();
         assert_eq!((s.as_u16(), t.as_str()), (429, "busy"));
+    }
+
+    /// A hold extended while a request waits (another request's 429 meanwhile) is waited out
+    /// too — or, past the caller's bound, refuses the request, not sent.
+    #[tokio::test]
+    async fn a_hold_extended_during_the_wait_is_honoured() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let sleeper = |key: QuotaKey, waits: Arc<Mutex<Vec<Duration>>>| {
+            let extended = AtomicBool::new(false);
+            move |d: Duration| -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                waits.lock().unwrap().push(d);
+                if !extended.swap(true, Ordering::SeqCst) {
+                    let now = Instant::now();
+                    ratelimit::with(&key, |q| q.note_throttled(now, Some(Duration::from_secs(10)), None, &[], Duration::from_secs(1), "another 429".into(), now));
+                }
+                Box::pin(async {})
+            }
+        };
+        let c = client();
+        for bounded in [false, true] {
+            let srv = serve(vec![canned(429, "text/plain", "").header("Retry-After", "2"), canned(200, "application/json", "{}")]);
+            let url = format!("{}/pods", srv.base);
+            let key = QuotaKey::of(&c.get(&url).build().unwrap());
+            let waits = Arc::new(Mutex::new(Vec::new()));
+            let sleep = sleeper(key, waits.clone());
+            let call = json(c.get(&url), &EXACT, &sleep);
+            if bounded {
+                let e = ratelimit::waits_within(Duration::from_secs(5), call).await.unwrap_err();
+                assert!(e.to_string().contains("not sent") && e.to_string().contains("another 429"), "{e}");
+                assert_eq!(srv.requests.lock().unwrap().len(), 1);
+                assert_waits(&waits.lock().unwrap(), &[2]);
+            } else {
+                call.await.unwrap();
+                assert_eq!(srv.requests.lock().unwrap().len(), 2);
+                assert_waits(&waits.lock().unwrap(), &[2, 10]);
+            }
+        }
+    }
+
+    /// A resend's pause, jitter included, never runs past the caller's bound.
+    #[tokio::test]
+    async fn a_resend_pause_stays_inside_the_bound() {
+        let srv = serve(vec![canned(503, "text/plain", "down"), canned(200, "application/json", "{}")]);
+        let (waits, sleep) = recorder();
+        let jittery = Limits { jitter: Duration::from_secs(10), ..Limits::RUNPOD };
+        ratelimit::waits_within(Duration::from_millis(1_500), json(client().get(format!("{}/pods", srv.base)), &jittery, &sleep)).await.unwrap();
+        let waits = waits.lock().unwrap();
+        assert_eq!(waits.len(), 1);
+        assert!(waits[0] >= Duration::from_secs(1) && waits[0] <= Duration::from_millis(1_500), "{waits:?}");
     }
 
     #[test]

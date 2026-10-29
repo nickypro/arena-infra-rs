@@ -75,11 +75,13 @@ impl Bare {
         }
     }
 
-    /// A non-negative number of seconds, rounded up (`t`: never a reset sooner than said).
-    fn count_up(&self) -> Option<u64> {
+    /// A non-negative number of seconds up to a day, rounded up (`t`: never a reset sooner
+    /// than said). Past a day it is no window's reset (an epoch timestamp sent by mistake, a
+    /// garbage value): unreadable, so absent — never a hold for decades, nor an overflow.
+    fn seconds_up(&self) -> Option<u64> {
         match *self {
-            Bare::Int(n) => u64::try_from(n).ok(),
-            Bare::Dec(f) if f.is_finite() && f >= 0.0 => Some(f.ceil() as u64),
+            Bare::Int(n) => u64::try_from(n).ok().filter(|s| *s <= MAX_SECS),
+            Bare::Dec(f) if f.is_finite() && (0.0..=MAX_ASKED).contains(&f) => Some(f.ceil() as u64),
             _ => None,
         }
     }
@@ -100,9 +102,9 @@ impl Member {
         }
     }
 
-    /// The first parameter called `key`.
+    /// The parameter `key`: its last occurrence, as RFC 9651 reads a duplicate.
     fn param(&self, key: &str) -> Option<&Bare> {
-        self.params.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        self.params.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
     }
 }
 
@@ -269,7 +271,7 @@ pub fn parse_policy(header: &str) -> Vec<PolicyWindow> {
             Some(PolicyWindow {
                 name: m.name()?.to_string(),
                 quota: m.param("q").and_then(Bare::count_down),
-                window: m.param("w").and_then(Bare::count_up),
+                window: m.param("w").and_then(Bare::seconds_up),
             })
         })
         .collect()
@@ -285,7 +287,7 @@ pub fn parse_state(header: &str) -> Vec<StateWindow> {
             Some(StateWindow {
                 name: m.name()?.to_string(),
                 remaining: m.param("r").and_then(Bare::count_down),
-                reset: m.param("t").and_then(Bare::count_up),
+                reset: m.param("t").and_then(Bare::seconds_up),
             })
         })
         .collect()
@@ -294,6 +296,7 @@ pub fn parse_state(header: &str) -> Vec<StateWindow> {
 /// The longest wait any header may ask for: a day. Past it a value is garbage, not a wait
 /// (and `Duration::from_secs_f64` would panic on an absurd one).
 const MAX_ASKED: f64 = 86_400.0;
+const MAX_SECS: u64 = 86_400;
 
 /// `Retry-After` in seconds (a decimal too). An HTTP-date, a negative or absurd number:
 /// `None` — the caller falls back to the quota's reset or its own backoff. Pure.
@@ -324,6 +327,14 @@ pub const SPENT_AT: u64 = 1;
 /// whole seconds, and answers take time).
 const SAME_WINDOW: Duration = Duration::from_secs(2);
 
+/// A 429's hold: nothing is sent before `until`; set at `set`, for `why`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldBy429 {
+    pub until: Instant,
+    pub set: Instant,
+    pub why: String,
+}
+
 /// What this process knows about one quota.
 #[derive(Debug, Clone, Default)]
 pub struct Quota {
@@ -334,16 +345,17 @@ pub struct Quota {
     pub policy: Vec<PolicyWindow>,
     /// `RateLimit-Policy` as last received.
     pub raw_policy: Option<String>,
-    /// The windows as of `seen`.
+    /// The windows as of `seen`, less the requests sent since ([`Quota::note_sent`]).
     pub state: Vec<StateWindow>,
     /// `RateLimit` as last received.
     pub raw_state: Option<String>,
     /// When `state` was read.
     pub seen: Option<Instant>,
-    /// A 429's wait: nothing is sent before this, and why.
-    pub hold: Option<(Instant, String)>,
-    /// 429s in a row (the backoff's exponent when the server names no wait).
+    pub hold: Option<HeldBy429>,
+    /// Rounds of 429s in a row (the backoff's exponent when the server names no wait).
     pub strikes: u32,
+    /// When the last request was let through ([`Quota::admit`]): a low quota spaces the next.
+    pub last_sent: Option<Instant>,
     /// When the requests of the last minute were sent.
     pub recent: VecDeque<Instant>,
     /// Requests sent, and 429s received, by this process.
@@ -353,18 +365,43 @@ pub struct Quota {
 
 /// The window reading to keep when a new one arrives: the new one — except that within the
 /// same window instance (resets within [`SAME_WINDOW`]) `r` only goes down, so an answer
-/// that was sent earlier but read later can't raise it again. Pure.
+/// that was sent earlier but read later can't raise it again, nor undo the requests counted
+/// as they were sent. Pure.
 fn merge_window(prev: Option<(&StateWindow, Instant)>, new: &StateWindow, now: Instant) -> StateWindow {
     let mut out = new.clone();
     if let (Some((p, seen)), Some(t_new)) = (prev, new.reset) {
-        let reset_prev = p.reset.map(|t| seen + Duration::from_secs(t));
-        let reset_new = now + Duration::from_secs(t_new);
-        let same = reset_prev.is_some_and(|r| r.max(reset_new) - r.min(reset_new) <= SAME_WINDOW);
+        let reset_prev = p.reset.and_then(|t| seen.checked_add(Duration::from_secs(t)));
+        let reset_new = now.checked_add(Duration::from_secs(t_new));
+        let same = match (reset_prev, reset_new) {
+            (Some(a), Some(b)) => a.max(b) - a.min(b) <= SAME_WINDOW,
+            _ => false,
+        };
         if let (true, Some(rp), Some(rn)) = (same, p.remaining, new.remaining) {
             out.remaining = Some(rp.min(rn));
         }
     }
     out
+}
+
+/// How far apart requests should be so the tightest of `windows` isn't spent before its reset
+/// — half of what's left spread over the time to the reset, the other half left to the other
+/// processes on the key — with why. `None` while no window is tight: more than a quarter of
+/// its quota left (of 10 requests when the policy doesn't say). Pure.
+pub fn pace_gap(windows: &[StateWindow], policy: &[PolicyWindow]) -> Option<(Duration, String)> {
+    windows
+        .iter()
+        .filter_map(|w| {
+            let (r, t) = (w.remaining?, w.reset?);
+            let quota = policy.iter().find(|p| p.name == w.name).and_then(|p| p.quota);
+            let tight = match quota {
+                Some(q) => r.saturating_mul(4) <= q,
+                None => r <= 10,
+            };
+            let of = quota.map(|q| format!(" of {q}")).unwrap_or_default();
+            let why = format!("the {} window is low: {r}{of} left", w.name);
+            tight.then(|| (Duration::from_secs(t) / u32::try_from((r / 2).max(1)).unwrap_or(u32::MAX), why))
+        })
+        .max_by_key(|(gap, _)| *gap)
 }
 
 impl Quota {
@@ -380,7 +417,7 @@ impl Quota {
             let merged = parse_state(s)
                 .iter()
                 .map(|w| {
-                    let prev = prev_seen.and_then(|seen| self.state.iter().find(|p| p.name == w.name).map(|p| (p, seen)));
+                    let prev = self.state.iter().find(|p| p.name == w.name).zip(prev_seen);
                     merge_window(prev, w, now)
                 })
                 .collect();
@@ -390,48 +427,87 @@ impl Quota {
         }
     }
 
-    /// A request was sent at `now`.
-    pub fn note_sent(&mut self, now: Instant) {
-        self.sent += 1;
-        self.recent.push_back(now);
-        self.trim(now);
+    /// Let one request through at `now` — counted, and taken off every window still running
+    /// (so concurrent requests can't all spend the same last few) — unless the quota is held
+    /// ([`Quota::block`]): then when it frees, and why. The check and the count are one step,
+    /// under the quotas' lock. Pure.
+    pub fn admit(&mut self, now: Instant) -> Option<(Instant, String)> {
+        if let Some(held) = self.block(now) {
+            return Some(held);
+        }
+        self.note_sent(now);
+        None
     }
 
-    fn trim(&mut self, now: Instant) {
+    /// A request was sent at `now` (without asking [`Quota::admit`]: one whose hold was waited
+    /// out already).
+    pub fn note_sent(&mut self, now: Instant) {
+        self.sent += 1;
+        self.last_sent = Some(now);
+        self.recent.push_back(now);
         while self.recent.front().is_some_and(|t| now.saturating_duration_since(*t) >= Duration::from_secs(60)) {
             self.recent.pop_front();
         }
-    }
-
-    /// A 429 at `now`: hold every request for `wait`. Returns the strikes before this one.
-    pub fn note_throttled(&mut self, wait: Duration, why: String, now: Instant) -> u32 {
-        let before = self.strikes;
-        self.strikes = self.strikes.saturating_add(1);
-        self.throttled += 1;
-        let until = now + wait;
-        // Never shorten a longer hold another request set.
-        if self.hold.as_ref().is_none_or(|(t, _)| *t <= until) {
-            self.hold = Some((until, why));
+        if let Some(seen) = self.seen {
+            let age = now.saturating_duration_since(seen).as_secs();
+            for w in self.state.iter_mut().filter(|w| w.reset.is_some_and(|t| t > age)) {
+                w.remaining = w.remaining.map(|r| r.saturating_sub(1));
+            }
         }
-        before
     }
 
-    /// An answer that wasn't a 429: the streak is over.
-    pub fn note_answered(&mut self) {
-        self.strikes = 0;
+    /// A 429 answering a request sent at `sent_at`: hold every request for the wait
+    /// ([`wait_for_429`]) and return it. 429s to requests that were already in flight when
+    /// another 429 set the hold are one round: they don't raise the backoff again.
+    #[allow(clippy::too_many_arguments)]
+    pub fn note_throttled(
+        &mut self,
+        sent_at: Instant,
+        retry_after: Option<Duration>,
+        body_after: Option<Duration>,
+        windows: &[StateWindow],
+        backoff: Duration,
+        why: String,
+        now: Instant,
+    ) -> Duration {
+        let same_round = self.hold.as_ref().is_some_and(|h| h.set >= sent_at);
+        let exponent = if same_round { self.strikes.saturating_sub(1) } else { self.strikes };
+        let wait = wait_for_429(retry_after, body_after, windows, exponent, backoff);
+        if !same_round {
+            self.strikes = self.strikes.saturating_add(1);
+        }
+        self.throttled += 1;
+        let until = now.checked_add(wait).unwrap_or(now);
+        // Never shorten a longer hold another request set.
+        if self.hold.as_ref().is_none_or(|h| h.until <= until) {
+            self.hold = Some(HeldBy429 { until, set: now, why });
+        }
+        wait
     }
 
-    /// Whether, and until when, nothing should be sent: the later of a 429's hold and the
-    /// reset of every window with at most [`SPENT_AT`] requests left — with why. `None` once
-    /// those have passed. Pure.
+    /// An answer that wasn't a 429, to a request sent at `sent_at`: the streak is over —
+    /// unless a 429 set a hold after that request went out (an answer from before the hold
+    /// says nothing about it).
+    pub fn note_answered(&mut self, sent_at: Instant) {
+        if self.hold.as_ref().is_none_or(|h| h.set < sent_at) {
+            self.strikes = 0;
+        }
+    }
+
+    /// Whether, and until when, nothing should be sent, and why — the latest of:
+    /// - a 429's hold;
+    /// - the reset of every window with at most [`SPENT_AT`] requests left;
+    /// - while a window is low ([`pace_gap`]), the last request plus the gap.
+    ///
+    /// `None` once those have passed. Pure.
     pub fn block(&self, now: Instant) -> Option<(Instant, String)> {
-        let held = self.hold.clone().filter(|(t, _)| *t > now);
+        let held = self.hold.as_ref().filter(|h| h.until > now).map(|h| (h.until, h.why.clone()));
         let spent = self.seen.and_then(|seen| {
             self.state
                 .iter()
                 .filter(|w| w.remaining.is_some_and(|r| r <= SPENT_AT))
                 .filter_map(|w| {
-                    let until = seen + Duration::from_secs(w.reset?);
+                    let until = seen.checked_add(Duration::from_secs(w.reset?))?;
                     let why = match w.remaining {
                         Some(0) => format!("the {} window is spent", w.name),
                         _ => format!("1 request left in the {} window", w.name),
@@ -441,10 +517,11 @@ impl Quota {
                 .filter(|(t, _)| *t > now)
                 .max_by_key(|(t, _)| *t)
         });
-        match (held, spent) {
-            (Some(a), Some(b)) => Some(if a.0 >= b.0 { a } else { b }),
-            (a, b) => a.or(b),
-        }
+        let paced = self.last_sent.and_then(|last| {
+            let (gap, why) = pace_gap(&self.windows_now(now), &self.policy)?;
+            Some((last.checked_add(gap)?, why)).filter(|(t, _)| *t > now)
+        });
+        [held, spent, paced].into_iter().flatten().max_by_key(|(t, _)| *t)
     }
 
     /// The windows as they stand at `now`: `t` counted down from `seen`, and a window whose
@@ -620,25 +697,6 @@ impl QuotaView {
     fn quota_of(&self, name: &str) -> Option<u64> {
         self.policy.iter().find(|p| p.name == name).and_then(|p| p.quota)
     }
-
-    /// How far apart this API's requests should be so the tightest window isn't spent before
-    /// its reset — spreading half of what's left over the time to the reset, the other half
-    /// left to the other processes on the key — with which window. `None` while no window is
-    /// tight: at most a quarter of its quota left (10 requests when the quota isn't known).
-    /// Pure.
-    pub fn pace_gap(&self) -> Option<(Duration, String)> {
-        self.windows
-            .iter()
-            .filter_map(|w| {
-                let (r, t) = (w.remaining?, w.reset?);
-                let tight = match self.quota_of(&w.name) {
-                    Some(q) => r.saturating_mul(4) <= q,
-                    None => r <= 10,
-                };
-                tight.then(|| (Duration::from_secs(t) / u32::try_from((r / 2).max(1)).unwrap_or(u32::MAX), w.name.clone()))
-            })
-            .max_by_key(|(gap, _)| *gap)
-    }
 }
 
 /// A count of seconds as people say it: `12 s`, `4 min`, `2 h 5 min`. Pure.
@@ -649,7 +707,7 @@ pub fn wait_words(d: Duration) -> String {
         91..=5_399 => format!("{} min", s.div_ceil(60)),
         _ => {
             let m = s.div_ceil(60);
-            if m % 60 == 0 { format!("{} h", m / 60) } else { format!("{} h {} min", m / 60, m % 60) }
+            if m.is_multiple_of(60) { format!("{} h", m / 60) } else { format!("{} h {} min", m / 60, m % 60) }
         }
     }
 }
@@ -820,6 +878,38 @@ pub(crate) fn budget(max: Duration, now: Instant) -> Duration {
     }
 }
 
+/// How much of a `limit` on a whole provider call its rate-limit waits may take: all but a
+/// quarter (at most 10 s), left for the request itself — so a wait that doesn't fit ends the
+/// call as rate-limited, saying how long, rather than as the caller's timeout. Pure.
+pub fn wait_budget(limit: Duration) -> Duration {
+    limit.saturating_sub((limit / 4).min(Duration::from_secs(10)))
+}
+
+/// `f` within `limit` ([`tokio::time::timeout`]), its rate-limit waits within
+/// [`wait_budget`]`(limit)`: for a provider call with a time bound of its own.
+pub async fn bounded<F: Future>(limit: Duration, f: F) -> std::result::Result<F::Output, tokio::time::error::Elapsed> {
+    tokio::time::timeout(limit, waits_within(wait_budget(limit), f)).await
+}
+
+/// Forget what this process knows about `api` — a loopback test server's `127.0.0.1:port`,
+/// when a new server takes a port an earlier test's server had (its holds aren't this one's).
+#[cfg(test)]
+pub(crate) fn forget_api(api: &str) {
+    let mut guard = QUOTAS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(map) = guard.as_mut() {
+        map.retain(|k, _| k.api != api);
+    }
+}
+
+/// Hold `provider`'s `api` for `wait` from now, as a 429 would: for another crate's tests of
+/// what a caller does with a held quota ([`retry_in`]).
+#[cfg(any(test, feature = "test-util"))]
+pub fn hold_for_test(provider: &'static str, api: &str, wait: Duration, why: &str) {
+    let key = QuotaKey { api: api.to_string(), provider, key_fp: 0 };
+    let now = Instant::now();
+    with(&key, |q| q.hold = Some(HeldBy429 { until: now + wait, set: now, why: why.into() }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,6 +945,10 @@ mod tests {
             (r#"?1;q=2, @1700000000, "minute";q=3"#, vec![pw("minute", Some(3), None)]),
             (r#""minute";q=60;w=60 garbage, "hour";q=1"#, vec![pw("minute", Some(60), Some(60)), pw("hour", Some(1), None)]),
             (r#""minute";q=99999999999999999999999"#, vec![pw("minute", None, None)]),
+            // A duplicate parameter: the last one counts.
+            (r#""minute";q=60;q=30;w=60"#, vec![pw("minute", Some(30), Some(60))]),
+            // A window longer than a day isn't one.
+            (r#""minute";q=60;w=86401, "day";q=5;w=86400"#, vec![pw("minute", Some(60), None), pw("day", Some(5), Some(86400))]),
             (r#""minute";;q=1, "hour";q=2"#, vec![pw("minute", None, None), pw("hour", Some(2), None)]),
             ("", vec![]),
             (" , ,", vec![]),
@@ -867,6 +961,7 @@ mod tests {
 
     #[test]
     fn state_header_table() {
+        let long = format!(r#""minute";r=0;t={}.5"#, "9".repeat(400));
         let cases: Vec<(&str, Vec<StateWindow>)> = vec![
             (
                 r#""minute";r=0;t=12, "hour";r=2800;t=1812, "day";r=49500;t=45012"#,
@@ -877,6 +972,11 @@ mod tests {
             // r rounds down (never more left than said), t up (never a reset sooner).
             (r#""minute";r=4.7;t=11.2"#, vec![sw("minute", Some(4), Some(12))]),
             (r#""minute";r=5"#, vec![sw("minute", Some(5), None)]),
+            (r#""minute";r=59;r=0;t=12"#, vec![sw("minute", Some(0), Some(12))]),
+            (r#""minute";r=0;t=1761700000"#, vec![sw("minute", Some(0), None)]),
+            (r#""minute";r=0;t=9223372036854775807"#, vec![sw("minute", Some(0), None)]),
+            (long.as_str(), vec![sw("minute", Some(0), None)]),
+            (r#""minute";r=0;t=86400.5"#, vec![sw("minute", Some(0), None)]),
             (r#""minute";r="5";t=x"#, vec![sw("minute", None, None)]),
             (r#""weird window";r=1;t=2"#, vec![sw("weird window", Some(1), Some(2))]),
             ("nonsense", vec![sw("nonsense", None, None)]),
@@ -951,19 +1051,86 @@ mod tests {
         assert_eq!(q.block(t0 + s(11)).map(|b| b.0), Some(t0 + s(12)));
         assert_eq!(q.block(t0 + s(12)), None, "reset: free again");
         // A 429's hold, longer than the window's.
-        q.note_throttled(s(20), "HTTP 429".into(), t0);
+        let one = s(1);
+        q.note_throttled(t0, Some(s(20)), None, &[], one, "HTTP 429".into(), t0);
         assert_eq!(q.block(t0 + s(13)), Some((t0 + s(20), "HTTP 429".into())));
         // A shorter hold from a later 429 doesn't shorten it.
-        q.note_throttled(s(1), "HTTP 429".into(), t0 + s(1));
+        q.note_throttled(t0 + s(1), Some(s(1)), None, &[], one, "HTTP 429".into(), t0 + s(1));
         assert_eq!(q.block(t0 + s(5)).map(|b| b.0), Some(t0 + s(20)));
         assert_eq!(q.block(t0 + s(20)), None);
         assert_eq!((q.strikes, q.throttled), (2, 2));
-        q.note_answered();
+        q.note_answered(t0 + s(21));
         assert_eq!(q.strikes, 0);
-        // Unreadable windows hold nothing.
+        // Unreadable windows hold nothing — an absurd reset (an epoch timestamp) included.
         let mut q = Quota::default();
-        q.record(None, Some(r#""minute";r=0, "hour";t=5"#), t0);
+        q.record(None, Some(r#""minute";r=0, "hour";t=5, "day";r=0;t=1761700000, "x";r=0;t=9223372036854775807"#), t0);
         assert_eq!(q.block(t0), None, "no reset to wait for, or no count");
+    }
+
+    /// The check and the count are one step: concurrent requests each take one off what's
+    /// left, so the last request stays the other processes' however many ask at once.
+    #[test]
+    fn admit_counts_each_request_off_the_windows() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut q = Quota::default();
+        q.record(Some(r#""minute";q=180;w=60"#), Some(r#""minute";r=50;t=30"#), t0);
+        assert!((0..4).all(|_| q.admit(t0).is_none()), "plenty left: all go");
+        assert_eq!(q.state, [sw("minute", Some(46), Some(30))]);
+        // An answer sent before those four can't raise the count again.
+        q.record(None, Some(r#""minute";r=48;t=29"#), t0 + s(1));
+        assert_eq!(q.state[0].remaining, Some(46));
+        // A window past its reset isn't counted down.
+        assert_eq!(q.admit(t0 + s(31)), None);
+        assert_eq!(q.state[0].remaining, Some(46));
+        assert_eq!(q.sent, 5);
+        // 2 left, asked for at once: the first goes, the last one is kept (the other
+        // processes'), however many ask.
+        let mut q = Quota::default();
+        q.record(Some(r#""minute";q=180;w=60"#), Some(r#""minute";r=2;t=30"#), t0);
+        let admitted: Vec<bool> = (0..4).map(|_| q.admit(t0).is_none()).collect();
+        assert_eq!(admitted, [true, false, false, false]);
+        assert_eq!(q.admit(t0 + s(29)).map(|b| b.0), Some(t0 + s(30)));
+        assert_eq!(q.admit(t0 + s(30)), None, "reset: free again");
+    }
+
+    /// While a window is low, requests are spaced by its gap after the last one let through.
+    #[test]
+    fn a_low_window_spaces_the_requests() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut q = Quota::default();
+        q.record(Some(r#""minute";q=180;w=60, "hour";q=7200;w=3600"#), Some(r#""minute";r=100;t=30, "hour";r=900;t=1800"#), t0);
+        assert_eq!(q.admit(t0), None, "the first goes at once");
+        // 899 of 7200 left in the hour, 30 min to go: one per 1800/449 s.
+        let gap = s(1800) / 449;
+        let (until, why) = q.admit(t0).expect("the next waits its turn");
+        assert_eq!((until, why.as_str()), (t0 + gap, "the hour window is low: 899 of 7200 left"));
+        assert_eq!(q.admit(t0 + gap), None);
+        // Plenty left: no spacing.
+        let mut q = Quota::default();
+        q.record(Some(r#""minute";q=180;w=60"#), Some(r#""minute";r=100;t=30"#), t0);
+        assert_eq!((q.admit(t0), q.admit(t0)), (None, None));
+    }
+
+    /// 429s to requests already in flight when another 429 set the hold are one round: the
+    /// backoff doubles per round, not per concurrent request; an answer from before the hold
+    /// doesn't end the streak.
+    #[test]
+    fn concurrent_429s_are_one_round() {
+        let t0 = Instant::now();
+        let (s, one) = (Duration::from_secs, Duration::from_secs(1));
+        let mut q = Quota::default();
+        let waits: Vec<Duration> = (0..10).map(|i| q.note_throttled(t0, None, None, &[], one, "HTTP 429".into(), t0 + Duration::from_millis(i))).collect();
+        assert!(waits.iter().all(|w| *w == s(1)), "{waits:?}");
+        assert_eq!((q.strikes, q.throttled), (1, 10));
+        q.note_answered(t0);
+        assert_eq!(q.strikes, 1, "sent before the hold: says nothing about it");
+        // The next round, sent after the hold: twice as long.
+        assert_eq!(q.note_throttled(t0 + s(2), None, None, &[], one, "HTTP 429".into(), t0 + s(2)), s(2));
+        assert_eq!(q.strikes, 2);
+        q.note_answered(t0 + s(5));
+        assert_eq!(q.strikes, 0);
     }
 
     /// Within one window instance `r` only goes down: an answer read late can't raise it.
@@ -1020,27 +1187,26 @@ mod tests {
         assert!(!format!("{:?}", QuotaKey::of(&a)).contains("k1"));
     }
 
+    /// Half of what's left over the time to the reset, for the tightest window under a
+    /// quarter of its quota (10 when the policy doesn't say).
     #[test]
-    fn pace_gap_spreads_half_of_what_is_left() {
-        let view = |policy: &str, state: &str| {
-            let mut q = Quota::default();
-            q.record(Some(policy).filter(|p| !p.is_empty()), Some(state), Instant::now());
-            QuotaView::of(&q, Instant::now())
-        };
+    fn pace_gap_table() {
         let s = Duration::from_secs;
-        let cases = [
-            (r#""minute";q=60;w=60"#, r#""minute";r=40;t=30"#, None),
-            (r#""minute";q=60;w=60"#, r#""minute";r=15;t=30"#, Some((s(30) / 7, "minute"))),
-            (r#""minute";q=60;w=60"#, r#""minute";r=1;t=30"#, Some((s(30), "minute"))),
-            (r#""minute";q=60;w=60"#, r#""minute";r=0;t=30"#, Some((s(30), "minute"))),
-            ("", r#""minute";r=11;t=30"#, None),
-            ("", r#""minute";r=10;t=30"#, Some((s(6), "minute"))),
+        let minute = [pw("minute", Some(60), Some(60))];
+        let both = [pw("minute", Some(60), Some(60)), pw("hour", Some(3000), Some(3600))];
+        let cases: Vec<(&[PolicyWindow], Vec<StateWindow>, Option<Duration>)> = vec![
+            (&minute, vec![sw("minute", Some(40), Some(30))], None),
+            (&minute, vec![sw("minute", Some(15), Some(30))], Some(s(30) / 7)),
+            (&minute, vec![sw("minute", Some(1), Some(30))], Some(s(30))),
+            (&minute, vec![sw("minute", Some(0), Some(30))], Some(s(30))),
+            (&[], vec![sw("minute", Some(11), Some(30))], None),
+            (&[], vec![sw("minute", Some(10), Some(30))], Some(s(6))),
+            (&minute, vec![sw("minute", Some(5), None)], None),
             // The tightest window wins: the hour has 700 left of 3000 for 30 min.
-            (r#""minute";q=60;w=60, "hour";q=3000;w=3600"#, r#""minute";r=50;t=30, "hour";r=700;t=1800"#, Some((s(1800) / 350, "hour"))),
+            (&both, vec![sw("minute", Some(50), Some(30)), sw("hour", Some(700), Some(1800))], Some(s(1800) / 350)),
         ];
-        for (policy, state, want) in cases {
-            let got = view(policy, state).pace_gap();
-            assert_eq!(got, want.map(|(d, n)| (d, n.to_string())), "{policy} / {state}");
+        for (policy, windows, want) in cases {
+            assert_eq!(pace_gap(&windows, policy).map(|(g, _)| g), want, "{policy:?} {windows:?}");
         }
     }
 
@@ -1068,12 +1234,12 @@ mod tests {
     fn describe_shows_the_headers_and_windows() {
         let t0 = Instant::now();
         let mut q = Quota { api: "RunPod REST v2".into(), provider: "runpod", ..Default::default() };
+        q.note_sent(t0);
         q.record(
             Some(r#""minute";q=60;w=60;pk=:c2VjcmV0:, "hour";q=3000;w=3600, "day";q=50000;w=86400"#),
             Some(r#""minute";r=47;t=12, "hour";r=2800;t=1812"#),
             t0,
         );
-        q.note_sent(t0);
         let lines = describe(&QuotaView::of(&q, t0));
         assert_eq!(
             lines,
@@ -1092,7 +1258,7 @@ mod tests {
         assert_eq!(describe(&QuotaView::of(&none, t0)), ["Vast:", "  no RateLimit headers in its answer: no limit reported", "  this process: 2 request(s) sent"]);
         // Held: said with the wait.
         let mut held = q.clone();
-        held.note_throttled(Duration::from_secs(12), "rate limit exceeded for the minute window".into(), t0);
+        held.note_throttled(t0, Some(Duration::from_secs(12)), None, &[], Duration::from_secs(1), "rate limit exceeded for the minute window".into(), t0);
         let lines = describe(&QuotaView::of(&held, t0));
         assert!(lines.contains(&"  held: rate limit exceeded for the minute window; next request in 12 s".to_string()), "{lines:?}");
         assert!(lines.last().unwrap().ends_with("1 request(s) sent, 1 answered 429"), "{lines:?}");
@@ -1114,16 +1280,25 @@ mod tests {
     fn footer_table() {
         let t0 = Instant::now();
         let mut v2 = Quota { api: "RunPod REST v2".into(), provider: "runpod", ..Default::default() };
-        v2.record(Some(r#""minute";q=60;w=60"#), Some(r#""minute";r=47;t=12"#), t0);
         for _ in 0..12 {
             v2.note_sent(t0);
         }
+        v2.record(Some(r#""minute";q=60;w=60"#), Some(r#""minute";r=47;t=12"#), t0);
         let mut gql = Quota { api: "RunPod GraphQL".into(), provider: "runpod", ..Default::default() };
         gql.note_sent(t0);
         let views = [QuotaView::of(&v2, t0), QuotaView::of(&gql, t0)];
         assert_eq!(footer(&views, "runpod", "RunPod").as_deref(), Some("RunPod API 13/min · 47/60 left this minute"));
         assert_eq!(footer(&views, "vast", "Vast"), None);
         assert_eq!(footer(&views[1..], "runpod", "RunPod").as_deref(), Some("RunPod API 1/min"));
+    }
+
+    /// A bounded provider call leaves a quarter of its bound (at most 10 s) to the request.
+    #[test]
+    fn wait_budget_table() {
+        let s = Duration::from_secs;
+        for (limit, want) in [(s(60), s(50)), (s(20), s(15)), (s(120), s(110)), (s(4), s(3)), (Duration::ZERO, Duration::ZERO)] {
+            assert_eq!(wait_budget(limit), want, "{limit:?}");
+        }
     }
 
     #[tokio::test]
@@ -1140,5 +1315,29 @@ mod tests {
         assert!(got.0 <= Duration::from_secs(2), "{got:?}");
         assert!(got.1 <= Duration::from_secs(2), "a spawned future inherits it: {got:?}");
         assert_eq!(got.2, max, "unless it isn't passed on");
+    }
+
+    /// A bounded provider call's waits get [`wait_budget`] of its bound — so a hold that
+    /// fits the bound but not the request after it is refused as rate-limited, never left to
+    /// become the caller's timeout (review r1: the 20 s enrich, `bounded_list`).
+    #[tokio::test(start_paused = true)]
+    async fn a_bounded_call_leaves_room_for_the_request() {
+        let max = Duration::from_secs(65);
+        let got = bounded(Duration::from_secs(20), async move { budget(max, Instant::now()) }).await.unwrap();
+        assert_eq!(got, Duration::from_secs(15));
+        let listed = crate::provider::bounded_list(
+            "runpod",
+            async move {
+                // An 18 s hold: inside the 20 s bound, past its wait budget — refused unsent.
+                if Duration::from_secs(18) > budget(max, Instant::now()) {
+                    return Err(crate::Error::Provider { kind: crate::ProviderErrorKind::RateLimited, message: "not sent".into() });
+                }
+                tokio::time::sleep(Duration::from_secs(18)).await;
+                Ok(vec![])
+            },
+            Duration::from_secs(20),
+        )
+        .await;
+        assert_eq!(listed.unwrap_err().kind(), Some(crate::ProviderErrorKind::RateLimited));
     }
 }

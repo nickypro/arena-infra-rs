@@ -2475,7 +2475,7 @@ async fn bounded_catalog<F>(fetch: F) -> arena_core::Result<Vec<arena_core::prov
 where
     F: std::future::Future<Output = arena_core::Result<Vec<arena_core::provider::runpod::GpuType>>>,
 {
-    match tokio::time::timeout(PRICE_TIMEOUT, fetch).await {
+    match arena_core::ratelimit::bounded(PRICE_TIMEOUT, fetch).await {
         Ok(r) => r,
         Err(_) => Err(arena_core::Error::provider(format!("timed out after {}s", PRICE_TIMEOUT.as_secs()))),
     }
@@ -2576,7 +2576,7 @@ async fn checked_gpu(cfg: &Config, provider_name: &str, gpu: Option<String>) -> 
     // REST v1 only: its create validates against an OpenAPI enum that lags the catalog.
     let v1 = matches!(RunpodApi::from_config(cfg), Ok(RunpodApi::V1));
     if let (true, Some(types), Some(key)) = (v1, types, cfg.get("RUNPOD_API_KEY").filter(|k| !k.is_empty())) {
-        if let Ok(Ok(creatable)) = tokio::time::timeout(PRICE_TIMEOUT, runpod::fetch_creatable_gpu_ids(key)).await {
+        if let Ok(Ok(creatable)) = arena_core::ratelimit::bounded(PRICE_TIMEOUT, runpod::fetch_creatable_gpu_ids(key)).await {
             v1_creatable_check(&gpu, &types, &creatable)?;
         }
     }
@@ -2752,7 +2752,7 @@ fn single_spec_quote<'a>(cfg: &'a Config, provider_name: &'a str, spec: &'a PodS
         }
         let req = single_request(spec);
         let fetch = fetch_price_book(cfg, provider_name, &req, spec);
-        let (book, _) = tokio::time::timeout(arena_core::balance::INLINE_TIMEOUT, fetch).await.ok()?.ok()?;
+        let (book, _) = arena_core::ratelimit::bounded(arena_core::balance::INLINE_TIMEOUT, fetch).await.ok()?.ok()?;
         Some(arena_core::placement::plan_options(&req, provider_name, &book))
     })
 }
@@ -3147,7 +3147,7 @@ async fn repair_pod_keys(
     // Asked even with no key to send (it then sends nothing): the answer still says whether
     // this provider could repair at all — `NotImplemented` keeps a RunPod pod's report as is.
     let attach = provider.authorize_ssh_keys(pod, &keys);
-    match tokio::time::timeout(KEY_REPAIR_TIMEOUT, attach).await {
+    match arena_core::ratelimit::bounded(KEY_REPAIR_TIMEOUT, attach).await {
         Err(_) => {
             let after = KEY_REPAIR_TIMEOUT.as_secs();
             Err(Some(format!("re-attaching our keys via the {} API timed out after {after}s", pod.provider)))
@@ -7329,7 +7329,7 @@ async fn enrich_best_effort(
     limit: std::time::Duration,
 ) -> Option<String> {
     let what = "warning: pod details incomplete (GPU/$/h/maintenance)";
-    match tokio::time::timeout(limit, provider.enrich(pods)).await {
+    match arena_core::ratelimit::bounded(limit, provider.enrich(pods)).await {
         Ok(Ok(())) => None,
         Ok(Err(e)) => Some(format!("{what}: {e}")),
         Err(_) => Some(format!("{what}: timed out after {limit:?}")),
@@ -10385,7 +10385,7 @@ async fn disk_fate(provider: &dyn Provider, pod: &arena_core::Pod) -> DiskFate {
     if !provider.restart_wipes_container_disk(pod) {
         return DiskFate::Kept;
     }
-    let spec = tokio::time::timeout(arena_core::provider::LIST_TIMEOUT, provider.pod_spec(&pod.id)).await;
+    let spec = arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, provider.pod_spec(&pod.id)).await;
     DiskFate::Wiped { volume_gb: match spec {
         Ok(Ok(s)) => Some(s.volume_gb),
         _ => None,
@@ -10407,7 +10407,7 @@ async fn restart_fate(provider: &dyn Provider, pod: &arena_core::Pod) -> DiskFat
 /// rebuilt), so only a persistent volume survives — whatever `restart_wipes_container_disk`
 /// says about a restart. The volume is read from the pod's spec (bounded; unknown = none).
 async fn reimage_fate(provider: &dyn Provider, pod: &arena_core::Pod) -> DiskFate {
-    let spec = tokio::time::timeout(arena_core::provider::LIST_TIMEOUT, provider.pod_spec(&pod.id)).await;
+    let spec = arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, provider.pod_spec(&pod.id)).await;
     DiskFate::Wiped { volume_gb: match spec {
         Ok(Ok(s)) => Some(s.volume_gb),
         _ => None,
@@ -11360,7 +11360,7 @@ async fn build_replacement_spec(
 async fn source_gpu_from_listing(cfg: &Config, owner: &dyn Provider, src: &arena_core::Pod) -> Option<String> {
     let mut pods = vec![src.clone()];
     if pods[0].gpu_type.is_none() {
-        let _ = tokio::time::timeout(ENRICH_TIMEOUT, owner.enrich(&mut pods)).await;
+        let _ = arena_core::ratelimit::bounded(ENRICH_TIMEOUT, owner.enrich(&mut pods)).await;
     }
     let shown = pods.into_iter().next()?.gpu_type?;
     let catalog = if owner.name() == "runpod" { live_gpu_catalog(cfg).await } else { Err(format!("{} has no catalog", owner.name())) };
@@ -11610,12 +11610,12 @@ async fn rekey_promoted(remote: Arc<dyn Remote>, cfg: &Config, owner: &dyn Provi
 /// bounded): a host going into maintenance stops its pods — on RunPod that wipes the
 /// container disk — so a replacement landing on one is no replacement (live finding #28).
 async fn maintenance_window(owner: &dyn Provider, id: &str) -> Option<String> {
-    let pods = tokio::time::timeout(arena_core::provider::LIST_TIMEOUT, owner.list_pods()).await.ok()?.ok()?;
+    let pods = arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, owner.list_pods()).await.ok()?.ok()?;
     let mut mine: Vec<arena_core::Pod> = pods.into_iter().filter(|p| p.id == id).collect();
     if mine.is_empty() {
         return None;
     }
-    let _ = tokio::time::timeout(ENRICH_TIMEOUT, owner.enrich(&mut mine)).await;
+    let _ = arena_core::ratelimit::bounded(ENRICH_TIMEOUT, owner.enrich(&mut mine)).await;
     let label = arena_core::fleet::maintenance_label(mine[0].maintenance.as_ref());
     (label != "-").then_some(label)
 }
@@ -12299,7 +12299,7 @@ async fn migrate_finish_on(
     let proxied = proxied_name(cfg, canonical);
     let locked = arena_core::lock::refusal("terminate", &[old], "");
     let stopped = if arena_core::status::is_stopped(&old.status) && !discard_stopped {
-        let spec = tokio::time::timeout(arena_core::provider::LIST_TIMEOUT, owner.pod_spec(&old.id)).await;
+        let spec = arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, owner.pod_spec(&old.id)).await;
         let volume = match spec {
             Ok(Ok(s)) => Some(s.volume_gb),
             _ => None,
@@ -13585,7 +13585,7 @@ async fn refresh_missing_endpoints(provider: &dyn Provider, sel: &mut Selected, 
     }
     eprintln!("{} listed running without an SSH endpoint — asking again in {}s…", names.join(", "), wait.as_secs());
     tokio::time::sleep(wait).await;
-    let Ok(Ok(fresh)) = tokio::time::timeout(arena_core::provider::LIST_TIMEOUT, provider.list_pods()).await else {
+    let Ok(Ok(fresh)) = arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, provider.list_pods()).await else {
         return;
     };
     for pod in sel.pods.iter_mut().filter(|p| missing(p)) {

@@ -1221,7 +1221,7 @@ impl ShadeformProvider {
     /// with that GPU (`Ok(None)` = none). **One** catalog read for every option (in stock,
     /// cheapest first), bounded by `limit`. Read-only; a failure is each option's `Err`.
     pub async fn quote(&self, gpus: &[String], base: &PodSpec, limit: Duration) -> Vec<(String, EntryQuote)> {
-        let catalog = match tokio::time::timeout(limit, self.get_json(AVAILABLE_PATH, "shadeform catalog")).await {
+        let catalog = match crate::ratelimit::bounded(limit, self.get_json(AVAILABLE_PATH, "shadeform catalog")).await {
             Ok(Ok(body)) => instance_types(&body).cloned().map_err(|e| e.to_string()),
             Ok(Err(e)) => Err(e.to_string()),
             Err(_) => Err(format!("timed out after {}s", limit.as_secs())),

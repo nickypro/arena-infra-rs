@@ -75,10 +75,10 @@ use arena_core::{Config, Pod, PodSpec};
 use prefs::Prefs;
 use arena_core::status::pod_status;
 use state::{
-    action_summary, capture_details, carry_over, dashboard_snapshot, details_due, display_name, health_cell, list_due, mark_key, marked_pods,
+    action_summary, capture_details, carry_over, dashboard_snapshot, details_due, display_name, health_cell, listing_note, mark_key, marked_pods,
     marked_set_token, merge_details, overlay_details, partial_notice, proxy_cell, proxy_detail,
-    pace_after, pace_note, provider_title, select_marks, short_branch, spark, summarize, summary_text, Action, Confirm,
-    DeepChecks, FleetSummary, History, NewPodForm, NpField, Pace, PodDetails, ProviderOpt, Tone,
+    provider_title, select_marks, short_branch, spark, summarize, summary_text, Action, Confirm, DeepChecks,
+    FleetSummary, History, NewPodForm, NpField, PodDetails, ProviderOpt, Throttle, Tone,
 };
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
@@ -118,9 +118,8 @@ const _: () = assert!(arena_core::backup::SWITCH_BOUND_SECS + arena_core::backup
 const ENRICH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The longest a dashboard provider call waits out a rate limit (a held quota, a 429's
-/// `Retry-After`) before giving up for this refresh — and backing the listing off
-/// (`state::pace_after`) instead: waiting a minute window's reset would freeze the probes and
-/// the screen with it.
+/// `Retry-After`) before giving up for this refresh — its provider's last rows kept — instead:
+/// waiting a minute window's reset would freeze the probes and the screen with it.
 const PROVIDER_WAIT: Duration = Duration::from_secs(2);
 
 /// How long a footer notice (a selector result, a finished deep check) stays up.
@@ -508,10 +507,12 @@ struct DetailsState {
     balance: Option<BalanceCtx>,
     /// OpenRouter's keys and credit, read on the details cadence (`None`: no provisioning key).
     ai: Option<AiCtx>,
-    /// How the provider listing is paced (held while throttled or spread while a quota is low).
-    pace: Pace,
-    /// The last listing, shown again while the listing is held.
+    /// The last listing as shown: a rate-limited provider's rows come from it.
     listed: Option<Listing>,
+    /// When each provider last listed (tokio's clock): how old its carried rows are.
+    listed_at: HashMap<String, tokio::time::Instant>,
+    /// The footer's note on the rate-limited providers, this refresh.
+    throttle_note: Option<String>,
 }
 
 /// What the `AI$` column and the summary bar's OpenRouter part read with: the provisioning
@@ -541,7 +542,7 @@ const AI_CREDITS_TIMEOUT: Duration = balance::INLINE_TIMEOUT;
 /// apart ([`UsageView::apply`]): one failing never holds back the other's fresh answer.
 async fn read_ai(api: Arc<OpenRouter>, view: Arc<Mutex<UsageView>>) {
     async fn bounded<T>(d: Duration, f: impl std::future::Future<Output = arena_core::Result<T>>) -> std::result::Result<T, String> {
-        match tokio::time::timeout(d, f).await {
+        match arena_core::ratelimit::bounded(d, f).await {
             Ok(r) => r.map_err(|e| e.to_string()),
             Err(_) => Err(format!("timed out after {}s", d.as_secs())),
         }
@@ -608,12 +609,12 @@ fn balance_views(
 /// One refresh: list pods (per provider, so a provider that failed is known — not just
 /// missing), probe them concurrently, build the core snapshot and publish it to `shared`.
 ///
-/// API calls per refresh are at most one list per provider ([`list_paced`]: none while a
-/// provider is throttled or its quota is low). The details query (`Provider::enrich`:
-/// RunPod's GraphQL for GPU, $/h and the host maintenance window) runs alongside the probes
-/// only when `state::details_due` says so (every [`state::DETAILS_EVERY`], or on `r` =
-/// `forced`) and no provider is throttled, and its answer is re-applied to the listings in
-/// between. The proxy config and the health cache are local file reads.
+/// API calls per refresh are at most one list per provider ([`list_all`]: none for a provider
+/// whose quota is held — a 429's wait, a spent or low window). The details query
+/// (`Provider::enrich`: RunPod's GraphQL for GPU, $/h and the host maintenance window) runs
+/// alongside the probes only when `state::details_due` says so (every
+/// [`state::DETAILS_EVERY`], or on `r` = `forced`), and its answer is re-applied to the
+/// listings in between. The proxy config and the health cache are local file reads.
 async fn refresh(
     provider: &dyn Provider,
     remote: &Arc<dyn Remote>,
@@ -623,7 +624,7 @@ async fn refresh(
     details: &mut DetailsState,
     forced: bool,
 ) {
-    let listing = list_paced(provider, details, forced).await;
+    let (fresh, listing) = list_all(provider, details).await;
     let now = snapshot::unix_now();
     // The prepaid balances on the details cadence (every DETAILS_EVERY, or `r` after the
     // minimum gap) — and FRESH keeps live reads to one per account per 5 min however often.
@@ -635,12 +636,12 @@ async fn refresh(
         let views = match details.balance.as_mut().filter(|_| balance_due) {
             Some(b) => {
                 let seen = observe_balance(b, now).await;
-                Some(balance_views(b, seen, &listing, &[], now))
+                Some(balance_views(b, seen, &fresh, &[], now))
             }
             None => None,
         };
         let errs: Vec<String> = listing.errors().iter().map(|(p, e)| format!("{p}: {e}")).collect();
-        let held = pace_note(&details.pace, tokio::time::Instant::now()).map(|n| format!(" · ⚠ {n}")).unwrap_or_default();
+        let held = details.throttle_note.as_ref().map(|n| format!(" · ⚠ {n}")).unwrap_or_default();
         let mut s = shared.lock().unwrap();
         s.status = format!("list error: {}{held}", errs.join("; "));
         if let Some(v) = views {
@@ -666,9 +667,10 @@ async fn refresh(
         }
     }
     // `SSH_CONFIG_FILE` kept current, as `pods list` keeps it: from a complete listing only (a
-    // provider that failed would drop its pods' blocks), written only when an endpoint moved; a
-    // failure is a status-line warning, never more.
-    let ssh_warning = if partial.is_empty() {
+    // provider that failed would drop its pods' blocks — and a rate-limited one's carried rows
+    // aren't a listing), written only when an endpoint moved; a failure is a status-line
+    // warning, never more.
+    let ssh_warning = if fresh.errors().is_empty() {
         // No home under test: a `~/` value can't reach the developer's own ~/.ssh.
         let home = if cfg!(test) { None } else { std::env::var("HOME").ok() };
         match arena_core::sshconfig::sync_for(cfg, &pods, home.as_deref()) {
@@ -684,9 +686,7 @@ async fn refresh(
             None => None,
         }
     };
-    // Not while a provider is throttled: its quota may be the one the details query draws on.
-    let details_now = details_due(details.last.map(|t| t.elapsed()), forced) && !details.pace.throttled_at(tokio::time::Instant::now());
-    let (metrics, observed) = if details_now {
+    let (metrics, observed) = if details_due(details.last.map(|t| t.elapsed()), forced) {
         let mut enriched = pods.clone();
         let (metrics, failed, seen) =
             tokio::join!(fetch_metrics(remote, &pods, cfg, opts), enrich_bounded(provider, &mut enriched), observing);
@@ -702,9 +702,9 @@ async fn refresh(
     overlay_details(&mut pods, &details.details);
     // The balance's runway is judged against what is billing as listed (not the pending
     // placeholders, and after the details filled the prices), a provider that failed to
-    // list counting as unknown — never as $0/h.
+    // list — or was rate-limited, its rows carried — counting as unknown, never as $0/h.
     let balance_views = match (observed, details.balance.as_mut()) {
-        (Some(seen), Some(b)) => Some(balance_views(b, seen, &listing, &pods, now)),
+        (Some(seen), Some(b)) => Some(balance_views(b, seen, &fresh, &pods, now)),
         _ => None,
     };
     let (proxy, proxy_warning) = snapshot::local_proxy_text(cfg);
@@ -739,9 +739,11 @@ async fn refresh(
         s.ai_cohort = Some(view.cohort(prefix, &names));
         s.ai = Some(view);
     }
-    let held = pace_note(&details.pace, tokio::time::Instant::now());
-    let warnings: Vec<&str> =
-        [&held, &details.warning, &proxy_warning, &health_warning, &ssh_warning].into_iter().flatten().map(String::as_str).collect();
+    let warnings: Vec<&str> = [&details.throttle_note, &details.warning, &proxy_warning, &health_warning, &ssh_warning]
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .collect();
     s.status = status_line(&s.summary, quota_line(&listing).as_deref(), &warnings);
     s.metrics = metrics;
     if let Some(v) = balance_views {
@@ -753,36 +755,43 @@ async fn refresh(
     s.refreshing = false;
 }
 
-/// This refresh's listing, paced ([`state::list_due`]): the providers listed — each rate-limit
-/// wait bounded by [`PROVIDER_WAIT`], a throttled provider's last rows kept
-/// ([`state::carry_over`]), and the pace set from what their APIs said ([`state::pace_after`]:
-/// a throttled one's own wait, else the tightest quota's gap) — or, while the listing is
-/// held, the last listing again, without a request.
-async fn list_paced(provider: &dyn Provider, details: &mut DetailsState, forced: bool) -> Listing {
-    let now = tokio::time::Instant::now();
-    if !list_due(&details.pace, now, forced) {
-        if let Some(last) = &details.listed {
-            return last.clone();
-        }
-    }
+/// This refresh's listing, every provider asked — each one's rate-limit waits bounded by
+/// [`PROVIDER_WAIT`], so one whose API quota is held (a 429's wait, a spent window, a low
+/// window's spacing: `arena_core::ratelimit`) is refused at once, **without a request**,
+/// while the others list as usual. Returned as listed (`fresh`: for what records or acts on
+/// it — the balance's burns, the SSH config) and as shown, a rate-limited provider's last
+/// good rows kept ([`state::carry_over`]), with the footer's note on it
+/// ([`state::listing_note`]).
+async fn list_all(provider: &dyn Provider, details: &mut DetailsState) -> (Listing, Listing) {
     let results = arena_core::ratelimit::waits_within(PROVIDER_WAIT, provider.list_by_provider()).await;
     let throttled: Vec<String> = results
         .iter()
         .filter(|(_, r)| matches!(r, Err(e) if e.kind() == Some(arena_core::ProviderErrorKind::RateLimited)))
         .map(|(p, _)| p.clone())
         .collect();
-    let mut listing = Listing::from_results(results);
-    carry_over(details.listed.as_ref(), &mut listing, &throttled);
-    let hold = throttled.iter().map(|p| (p.as_str(), arena_core::ratelimit::retry_in(p).map(|h| h.wait))).max_by_key(|(_, w)| *w);
-    let views = arena_core::ratelimit::observed();
-    let tight = listing
-        .providers
+    let fresh = Listing::from_results(results);
+    let mut shown = fresh.clone();
+    carry_over(details.listed.as_ref(), &mut shown, &throttled);
+    let now = tokio::time::Instant::now();
+    for pl in fresh.providers.iter().filter(|pl| pl.pods.is_ok()) {
+        details.listed_at.insert(pl.provider.clone(), now);
+    }
+    let notes: Vec<Throttle> = throttled
         .iter()
-        .flat_map(|pl| views.iter().filter(move |v| v.provider == pl.provider).filter_map(|v| v.pace_gap().map(|(gap, w)| (v.provider, gap, w))))
-        .max_by_key(|(_, gap, _)| *gap);
-    details.pace = pace_after(&details.pace, now, hold, tight.as_ref().map(|(p, gap, w)| (*p, *gap, w.as_str())));
-    details.listed = Some(listing.clone());
-    listing
+        .map(|p| Throttle {
+            provider: p.clone(),
+            hold: arena_core::ratelimit::retry_in(p),
+            rows_age: shown
+                .providers
+                .iter()
+                .any(|pl| &pl.provider == p && pl.pods.is_ok())
+                .then(|| details.listed_at.get(p).map(|t| now - *t))
+                .flatten(),
+        })
+        .collect();
+    details.throttle_note = listing_note(&notes);
+    details.listed = Some(shown.clone());
+    (fresh, shown)
 }
 
 /// The footer's quota part: per provider listed, its API requests in the last minute and
@@ -5352,11 +5361,11 @@ deep_check_end=1
     }
 
     /// A rate-limited listing: the rows stay (as last listed, not "failed to list"), the
-    /// probes keep running every refresh, the footer says when RunPod is listed again, and
-    /// until then no refresh lists — `r` included — nor runs the details query. A second
-    /// throttle in a row backs off twice as long; a listing that works clears it.
+    /// probes keep running, and the footer says when RunPod is listed again (its API's hold,
+    /// as `arena_core::ratelimit` keeps it), why, and how old the rows are. A listing that
+    /// works clears the note; the details query keeps its own cadence.
     #[tokio::test(start_paused = true)]
-    async fn a_throttled_listing_keeps_the_rows_and_backs_off() {
+    async fn a_throttled_listing_keeps_the_rows_and_says_when_it_lists_again() {
         let cfg = cfg("");
         let provider = Throttled {
             pods: vec![pod("alpha", "runpod", "rp1", 1, Some(22001)), pod("bravo", "runpod", "rp2", 2, Some(22002))],
@@ -5378,33 +5387,44 @@ deep_check_end=1
 
         refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
         assert_eq!(calls(), (1, 1, 2));
-        // Throttled: the rows as last listed, nothing called partial, the wait in the footer.
+        // Throttled, RunPod's quota held for 12 s: the rows as last listed, nothing called
+        // partial, the wait and the rows' age in the footer; the probes ran.
         step(5).await;
+        arena_core::ratelimit::hold_for_test("runpod", "RunPod REST v2", Duration::from_secs(12), "the minute window is spent");
         refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
         let (names, partial, status) = rows(&shared);
         assert_eq!(names, ["devtest-alpha", "devtest-bravo"]);
         assert!(partial.is_empty(), "{partial:?}");
-        assert!(status.contains("⚠ RunPod rate limit: listing again in 5 s"), "{status}");
-        assert_eq!(calls(), (2, 1, 4), "the probes ran");
-        // Within a wait (RunPod's own, here 3 s more), `r` pressed past the details' minimum
-        // gap: no listing, no details query; the probes still run.
-        step(state::DETAILS_MIN_GAP.as_secs() - 5).await;
-        details.pace.hold = Some(tokio::time::Instant::now() + Duration::from_secs(3));
-        refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, true).await;
-        assert_eq!(calls(), (2, 1, 6), "held: probes only");
-        assert!(rows(&shared).2.contains("listing again in 3 s"), "{}", rows(&shared).2);
-        // The wait over: throttled again — twice as long.
-        step(3).await;
+        assert!(
+            status.contains("⚠ RunPod rate limit: listing again in 12 s (the minute window is spent) · its rows are 5 s old"),
+            "{status}"
+        );
+        assert_eq!(calls(), (2, 1, 4));
+        assert!(details.listed_at.contains_key("runpod"));
+        // Still throttled 5 s on: the same rows, older.
+        step(5).await;
         refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
-        assert_eq!(calls(), (3, 1, 8));
-        assert!(rows(&shared).2.contains("⚠ RunPod rate limit: listing again in 10 s"), "{}", rows(&shared).2);
-        // Then a listing that works: no more note, the rows as listed.
-        step(10).await;
+        assert!(rows(&shared).2.contains("its rows are 10 s old"), "{}", rows(&shared).2);
+        assert_eq!(rows(&shared).0, ["devtest-alpha", "devtest-bravo"]);
+        // Then a listing that works: no note.
+        step(5).await;
         refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
         assert_eq!(calls().0, 4);
         assert!(!rows(&shared).2.contains("rate limit"), "{}", rows(&shared).2);
-        assert_eq!(rows(&shared).0, ["devtest-alpha", "devtest-bravo"]);
-        assert_eq!(details.pace, Pace::default());
+        assert_eq!(details.throttle_note, None);
+    }
+
+    /// No rows to keep yet (the very first listing rate-limited): the error, with the note.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_listing_rate_limited_says_so() {
+        let provider = Throttled { pods: vec![pod("alpha", "runpod", "rp1", 1, Some(22001))], on: &[1], lists: AtomicUsize::new(0), details: AtomicUsize::new(0) };
+        let remote: Arc<dyn Remote> = Arc::new(FakeRemote::new());
+        let shared = Mutex::new(Shared::default());
+        let mut details = DetailsState::default();
+        refresh(&provider, &remote, &cfg(""), &ProbeOpts::default(), &shared, &mut details, false).await;
+        let status = shared.lock().unwrap().status.clone();
+        assert!(status.starts_with("list error: runpod: provider error: list pods HTTP 429"), "{status}");
+        assert!(status.contains("⚠ RunPod rate limit: listing again") && status.contains("no rows yet"), "{status}");
     }
 
     /// A details query that errs after filling some pods (GraphQL data + `errors`, one

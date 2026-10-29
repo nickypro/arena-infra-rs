@@ -400,96 +400,38 @@ pub fn details_due(since_last: Option<Duration>, forced: bool) -> bool {
     }
 }
 
-/// The first wait after a throttled listing whose API named none, doubled per throttled
-/// listing in a row, at most [`PACE_MAX`].
-pub const PACE_BASE: Duration = Duration::from_secs(5);
-
-/// The longest the dashboard backs off a provider whose API named no wait.
-pub const PACE_MAX: Duration = Duration::from_secs(300);
-
-/// Why the provider listing is held.
+/// A provider whose listing came back rate-limited this refresh — a 429, or refused before
+/// sending because its API's quota is held (`arena_core::ratelimit`: a 429's wait, a spent
+/// window, a low window's spacing) — for the footer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PaceWhy {
-    /// `provider`'s API refused (429) or its quota is held: listing waits it out.
-    Throttled { provider: String },
-    /// `provider`'s quota is low in `window`: listing is spread to one per `gap`.
-    Tight { provider: String, window: String, gap: Duration },
+pub struct Throttle {
+    pub provider: String,
+    /// Its API's hold, when the quota is held ([`arena_core::ratelimit::retry_in`]).
+    pub hold: Option<arena_core::ratelimit::Hold>,
+    /// How old its rows on screen are (`None`: it has none to show).
+    pub rows_age: Option<Duration>,
 }
 
-/// How the dashboard paces its provider listing — so a throttled or nearly spent quota
-/// (RunPod's, shared by every dashboard and cron on the key) is never hit at the refresh
-/// rate. The SSH probes keep the refresh's cadence either way.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Pace {
-    /// No listing before this (tokio's clock); `None`: list on every refresh.
-    pub hold: Option<tokio::time::Instant>,
-    pub why: Option<PaceWhy>,
-    /// Throttled listings in a row (the backoff's exponent when the API named no wait).
-    pub strikes: u32,
-}
-
-impl Pace {
-    /// Whether the listing is held because a provider is throttled, at `now`.
-    pub fn throttled_at(&self, now: tokio::time::Instant) -> bool {
-        matches!(self.why, Some(PaceWhy::Throttled { .. })) && self.hold.is_some_and(|t| now < t)
-    }
-}
-
-/// The pace after one listing: `throttled` — a provider whose listing was rate-limited, with
-/// the wait its API holds the quota for if known — backs the listing off for that wait, else
-/// exponentially from [`PACE_BASE`]; else `tight` — a provider whose quota is low, the gap
-/// its requests should keep and the window — spreads the listings to one per gap; else no
-/// hold. Pure.
-pub fn pace_after(
-    prev: &Pace,
-    now: tokio::time::Instant,
-    throttled: Option<(&str, Option<Duration>)>,
-    tight: Option<(&str, Duration, &str)>,
-) -> Pace {
-    if let Some((provider, wait)) = throttled {
-        let strikes = prev.strikes.saturating_add(1);
-        let backoff = PACE_BASE.saturating_mul(2u32.saturating_pow(strikes - 1)).min(PACE_MAX);
-        let wait = wait.filter(|w| !w.is_zero()).unwrap_or(backoff);
-        return Pace { hold: Some(now + wait), why: Some(PaceWhy::Throttled { provider: provider.into() }), strikes };
-    }
-    match tight {
-        Some((provider, gap, window)) => Pace {
-            hold: Some(now + gap),
-            why: Some(PaceWhy::Tight { provider: provider.into(), window: window.into(), gap }),
-            strikes: 0,
-        },
-        None => Pace::default(),
-    }
-}
-
-/// Whether this refresh lists the providers: no hold, or it has passed — or `r` asked
-/// (`forced`) while the hold is only a tight quota's spreading. Never while throttled: the
-/// API said to wait. Pure.
-pub fn list_due(pace: &Pace, now: tokio::time::Instant, forced: bool) -> bool {
-    match pace.hold {
-        None => true,
-        Some(t) if now >= t => true,
-        Some(_) => forced && matches!(pace.why, Some(PaceWhy::Tight { .. })),
-    }
-}
-
-/// The footer's words for the pace at `now` (`RunPod rate limit: listing again in 12 s`);
-/// `None` when nothing holds the listing. Pure.
-pub fn pace_note(pace: &Pace, now: tokio::time::Instant) -> Option<String> {
-    let hold = pace.hold?;
-    match pace.why.as_ref()? {
-        PaceWhy::Throttled { provider } if now < hold => Some(format!(
-            "{} rate limit: listing again in {}",
-            provider_title(provider),
-            arena_core::ratelimit::wait_words(hold - now)
-        )),
-        PaceWhy::Throttled { .. } => None,
-        PaceWhy::Tight { provider, window, gap } => Some(format!(
-            "{} quota low ({window} window): listing every {}",
-            provider_title(provider),
-            arena_core::ratelimit::wait_words(*gap)
-        )),
-    }
+/// The footer's words for the rate-limited providers (`RunPod rate limit: listing again in
+/// 12 s (the minute window is spent) · its rows are 40 s old`); `None` when none is. The
+/// dashboard asks every refresh — a held quota refuses it without a request, so nothing is
+/// sent until the hold has passed. Pure.
+pub fn listing_note(throttled: &[Throttle]) -> Option<String> {
+    let parts: Vec<String> = throttled
+        .iter()
+        .map(|t| {
+            let when = match &t.hold {
+                Some(h) => format!("listing again in {} ({})", arena_core::ratelimit::wait_words(h.wait), h.why),
+                None => "listing again next refresh".to_string(),
+            };
+            let rows = match t.rows_age {
+                Some(age) => format!(" · its rows are {} old", arena_core::ratelimit::wait_words(age)),
+                None => " · no rows yet".to_string(),
+            };
+            format!("{} rate limit: {when}{rows}", provider_title(&t.provider))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// A provider's name as people write it (`runpod` → `RunPod`). Pure.
@@ -1746,64 +1688,32 @@ mod tests {
         }
     }
 
-    /// The dashboard's backoff: a throttled listing holds the next one for the API's own
-    /// wait, else 5 s doubling to 5 min; a tight quota spreads listings to its gap; anything
-    /// else clears the hold and the strikes.
+    /// The footer says which provider is rate-limited, when it is listed again and why, and
+    /// how old its rows are.
     #[test]
-    fn pace_after_table() {
+    fn listing_note_table() {
+        use arena_core::ratelimit::Hold;
         let s = Duration::from_secs;
-        let t0 = tokio::time::Instant::now();
-        let throttled = |strikes: u32| Pace { hold: Some(t0), why: Some(PaceWhy::Throttled { provider: "runpod".into() }), strikes };
-        // (previous pace, throttled, tight, hold from t0, strikes)
-        let cases: Vec<(Pace, Option<(&str, Option<Duration>)>, Option<(&str, Duration, &str)>, Option<Duration>, u32)> = vec![
-            (Pace::default(), None, None, None, 0),
-            (Pace::default(), Some(("runpod", Some(s(12)))), None, Some(s(12)), 1),
-            (Pace::default(), Some(("runpod", None)), None, Some(s(5)), 1),
-            (Pace::default(), Some(("runpod", Some(Duration::ZERO))), None, Some(s(5)), 1),
-            (throttled(1), Some(("runpod", None)), None, Some(s(10)), 2),
-            (throttled(3), Some(("runpod", None)), None, Some(s(40)), 4),
-            (throttled(9), Some(("runpod", None)), None, Some(PACE_MAX), 10),
-            (throttled(u32::MAX), Some(("runpod", None)), None, Some(PACE_MAX), u32::MAX),
-            // The API's own wait, however long (an hour window spent), wins over the backoff.
-            (throttled(3), Some(("runpod", Some(s(1800)))), None, Some(s(1800)), 4),
-            // Throttled beats tight; tight alone spreads; a clean listing clears the strikes.
-            (Pace::default(), Some(("runpod", Some(s(12)))), Some(("runpod", s(30), "minute")), Some(s(12)), 1),
-            (throttled(2), None, Some(("runpod", s(30), "minute")), Some(s(30)), 0),
-            (throttled(2), None, None, None, 0),
-        ];
-        for (prev, th, tight, want_hold, want_strikes) in cases {
-            let got = pace_after(&prev, t0, th, tight);
-            assert_eq!((got.hold.map(|h| h - t0), got.strikes), (want_hold, want_strikes), "{prev:?} {th:?} {tight:?}");
-        }
-    }
-
-    /// Never listing while throttled — `r` included; `r` does list through a tight quota's
-    /// spreading; the footer says which, with the time left.
-    #[test]
-    fn list_due_and_the_footer_note() {
-        let s = Duration::from_secs;
-        let t0 = tokio::time::Instant::now();
-        let held = pace_after(&Pace::default(), t0, Some(("runpod", Some(s(12)))), None);
-        let tight = pace_after(&Pace::default(), t0, None, Some(("runpod", s(30), "minute")));
-        // (pace, seconds after t0, `r`, list?)
+        let hold = |secs: u64, why: &str| Some(Hold { api: "RunPod REST v2".into(), wait: s(secs), why: why.into() });
+        let t = |provider: &str, hold: Option<Hold>, age: Option<Duration>| Throttle { provider: provider.into(), hold, rows_age: age };
         let cases = [
-            (&Pace::default(), 0, false, true),
-            (&held, 0, false, false),
-            (&held, 0, true, false),
-            (&held, 11, true, false),
-            (&held, 12, false, true),
-            (&tight, 5, false, false),
-            (&tight, 5, true, true),
-            (&tight, 30, false, true),
+            (vec![], None),
+            (
+                vec![t("runpod", hold(12, "the minute window is spent"), Some(s(40)))],
+                Some("RunPod rate limit: listing again in 12 s (the minute window is spent) · its rows are 40 s old"),
+            ),
+            (
+                vec![t("runpod", hold(1800, "the hour window is spent"), None)],
+                Some("RunPod rate limit: listing again in 30 min (the hour window is spent) · no rows yet"),
+            ),
+            (
+                vec![t("vast", None, Some(s(5))), t("runpod", hold(3, "the day window is low: 900 of 86400 left"), Some(s(5)))],
+                Some("Vast rate limit: listing again next refresh · its rows are 5 s old · RunPod rate limit: listing again in 3 s (the day window is low: 900 of 86400 left) · its rows are 5 s old"),
+            ),
         ];
-        for (pace, after, forced, want) in cases {
-            assert_eq!(list_due(pace, t0 + s(after), forced), want, "{pace:?} +{after}s r={forced}");
+        for (throttled, want) in cases {
+            assert_eq!(listing_note(&throttled).as_deref(), want, "{throttled:?}");
         }
-        assert_eq!(pace_note(&held, t0 + s(5)).as_deref(), Some("RunPod rate limit: listing again in 7 s"));
-        assert_eq!(pace_note(&held, t0 + s(12)), None, "listing again now");
-        assert_eq!(pace_note(&tight, t0).as_deref(), Some("RunPod quota low (minute window): listing every 30 s"));
-        assert_eq!(pace_note(&Pace::default(), t0), None);
-        assert!(held.throttled_at(t0) && !held.throttled_at(t0 + s(12)) && !tight.throttled_at(t0));
     }
 
     /// A rate-limited provider keeps its last good rows; any other failure stays a failure.

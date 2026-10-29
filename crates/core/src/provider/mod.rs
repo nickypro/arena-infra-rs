@@ -168,13 +168,13 @@ pub const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60)
 /// [`Error::Timeout`] (`vast list timed out after 60s`): never retried in place (it already
 /// took the whole bound), but told apart from a refusal, so a retry round can wait out a
 /// stalled backend as it does a throttled one ([`crate::placement::relist`]). Its
-/// rate-limit waits are bounded the same ([`crate::ratelimit::waits_within`]): a quota held
+/// rate-limit waits get all but a margin of it ([`crate::ratelimit::bounded`]): a quota held
 /// for longer fails it as rate-limited, saying how long, not as a timeout.
 pub async fn bounded_list<F>(name: &str, list: F, limit: std::time::Duration) -> Result<Vec<Pod>>
 where
     F: std::future::Future<Output = Result<Vec<Pod>>>,
 {
-    match tokio::time::timeout(limit, crate::ratelimit::waits_within(limit, list)).await {
+    match crate::ratelimit::bounded(limit, list).await {
         Ok(res) => res,
         Err(_) => Err(Error::Timeout { what: format!("{name} list"), after: limit }),
     }

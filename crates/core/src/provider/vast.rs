@@ -194,7 +194,7 @@ impl VastProvider {
             if !cache.contains_key(&key) {
                 // The plan prices what an uncapped search finds; the cap is the plan's to apply.
                 let spec = PodSpec { gpu_type: gpu.clone(), max_price: None, ..base.clone() };
-                let got = match tokio::time::timeout(limit, self.cheapest_offer(&spec)).await {
+                let got = match crate::ratelimit::bounded(limit, self.cheapest_offer(&spec)).await {
                     Ok(Ok(offer)) => Ok(offer),
                     Ok(Err(e)) => Err(e.to_string()),
                     Err(_) => Err(format!("timed out after {}s", limit.as_secs())),
@@ -875,7 +875,7 @@ impl Provider for VastProvider {
                 }
                 Err(e) => return Err(e),
             };
-            let _ = tokio::time::timeout(self.attach_budget, self.attach_keys(&id, &keys)).await;
+            let _ = crate::ratelimit::bounded(self.attach_budget, self.attach_keys(&id, &keys)).await;
             // Vast doesn't echo the instance, so the Pod is synthesized from the offer.
             return Ok(Pod {
                 id,

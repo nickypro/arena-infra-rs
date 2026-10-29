@@ -14,18 +14,22 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
-## 2026-10-28 · RunPod's rate limits are respected, and REST v1 ends on 2026-11-16
+## 2026-10-29 · RunPod's rate limits are respected, and REST v1 ends on 2026-11-16
 - RunPod limits every API since 2026-10-27, per key, shared by every dashboard and cron on it.
   arena now waits out a `429` (what RunPod asks, else 1, 2, 4… s) and retries it up to 3 times,
-  and holds back its own requests while a window has 1 request or none left. A command that
-  can't wait that long fails at once with the wait: `list pods: not sent — RunPod REST v2 rate
-  limit (the minute window is spent): next request in 12 s`.
+  and holds back its own requests while a window has 1 request or none left; when a window runs
+  low (a quarter of it or less), it spaces its requests so half of what's left lasts to the reset.
+  Concurrent requests each count against what's left. A command that can't wait that long fails
+  at once with the wait: `list pods: not sent — RunPod REST v2 rate limit (the minute window is
+  spent): next request in 12 s`.
 - RunPod reads (listing, pod details, catalog, billing) are sent again after a 5xx or a dropped
-  connection. A create, stop or terminate never is.
+  connection. A create, stop or terminate never is. The reaper's terminate waits out a rate limit
+  for 10 s at most; past that it's left to the next run, which decides again.
 - The dashboard's footer shows RunPod's request rate and what's left this minute (`RunPod API
-  13/min · 47/60 left this minute`). When RunPod refuses a listing, the dashboard keeps the last
-  rows, keeps probing the pods over SSH, and lists again after RunPod's wait (`⚠ RunPod rate
-  limit: listing again in 12 s`). When the quota runs low, it lists less often.
+  13/min · 47/60 left this minute`). When RunPod refuses a listing or its quota is held, the
+  dashboard keeps RunPod's last rows, says how old they are (`⚠ RunPod rate limit: listing again
+  in 12 s (the minute window is spent) · its rows are 40 s old`), keeps probing the pods over SSH,
+  and lists the other providers as usual. A held quota is not asked until it frees.
 - `arena api get runpod pods --limits` prints RunPod's quota (each window's limit, what's left,
   when it resets) instead of the body.
 - Vast's throttled listing is waited out the same way (it used to be retried only when Vast asked
