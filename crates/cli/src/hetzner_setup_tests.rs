@@ -33,6 +33,14 @@ fn install_stubs(dir: &Path) {
         stub(quiet, "exit 0");
     }
     stub("docker", "echo 'Docker version 0 (stub)'");
+    // The swap step's tools, logged — no test makes a real swap file or turns one on. `df` says
+    // DF_FREE_KB free (100 GiB unless a test sets less); MKSWAP_EXIT fails mkswap.
+    let logged = |name: &str, rest: &str| stub(name, &format!("echo \"{name} $*\" >> \"$(dirname \"$0\")/swap.log\"\n{rest}"));
+    logged("fallocate", "for f; do :; done; : > \"$f\"");
+    logged("mkswap", "exit ${MKSWAP_EXIT:-0}");
+    logged("swapon", "exit 0");
+    logged("sysctl", "exit 0");
+    stub("df", "echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'; echo \"/dev/sda1 1 1 ${DF_FREE_KB:-104857600} 1% /\"");
     // Nothing is fetched: every download/clone "fails" (the script treats those as best-effort).
     stub("curl", "exit 22");
     stub(
@@ -101,6 +109,16 @@ fn run(stubs: &Path, home: &Path, repo: &Path, env: &[(&str, &str)]) -> Run {
         cmd.env(k, v);
     }
     // /tmp, stood in for: nothing here touches the box's own.
+    // The swap step's files, in the test's own dir: never /swapfile, /etc/fstab or /proc/swaps.
+    let base = home.parent().unwrap();
+    let swaps = base.join("proc-swaps");
+    if !swaps.exists() {
+        std::fs::write(&swaps, "Filename\tType\tSize\tUsed\tPriority\n").unwrap();
+    }
+    cmd.env("ARENA_SWAPFILE", base.join("swapfile"))
+        .env("ARENA_FSTAB", base.join("fstab"))
+        .env("ARENA_SYSCTL_CONF", base.join("sysctl.conf"))
+        .env("ARENA_PROC_SWAPS", &swaps);
     let tmp_root = home.parent().unwrap().join("tmp");
     std::fs::create_dir_all(&tmp_root).unwrap();
     cmd.env("ARENA_SETUP_TMP_ROOT", &tmp_root);
@@ -173,7 +191,61 @@ fn the_step_headers_count_up_to_one_total() {
         .collect();
     let total = steps.len();
     assert_eq!(steps, (1..=total).map(|n| (n, total)).collect::<Vec<_>>());
-    assert_eq!(total, 6);
+    assert_eq!(total, 7);
+}
+
+/// The swap step (VM_SWAP_GB, default 8): a swap file made, turned on, in fstab once, with a
+/// low swappiness; a second run keeps the one that's on. Never fatal, so every way it can't
+/// make one is a WARN line and no file.
+#[test]
+fn swap_is_made_once_and_kept_on_a_rerun() {
+    let (t, stubs, home, repo) = setup("swap");
+    let swapfile = t.0.join("swapfile");
+    let r = run(&stubs, &home, &repo, &[]);
+    assert!(r.stdout.contains(&format!("swap: 8 GB at {}", swapfile.display())), "{}", r.stdout);
+    let log = std::fs::read_to_string(stubs.join("swap.log")).unwrap();
+    let f = swapfile.display();
+    assert_eq!(log, format!("fallocate -l 8589934592 {f}\nmkswap {f}\nswapon {f}\nsysctl -q -p {}\n", t.0.join("sysctl.conf").display()));
+    assert_eq!(std::fs::read_to_string(t.0.join("fstab")).unwrap(), format!("{f} none swap sw 0 0\n"));
+    assert_eq!(std::fs::read_to_string(t.0.join("sysctl.conf")).unwrap(), "vm.swappiness = 10\n");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&swapfile).unwrap().permissions().mode() & 0o777, 0o600);
+
+    // Now the kernel lists it (8 GiB, in KiB as /proc/swaps has it): kept, nothing redone.
+    std::fs::write(t.0.join("proc-swaps"), format!("Filename\tType\tSize\tUsed\tPriority\n{f}\tfile\t8388608\t0\t-2\n")).unwrap();
+    std::fs::remove_file(stubs.join("swap.log")).unwrap();
+    let r = run(&stubs, &home, &repo, &[]);
+    assert!(r.stdout.contains(&format!("swap: {f} already on (8 GB)")), "{}", r.stdout);
+    assert!(!stubs.join("swap.log").exists(), "nothing redone");
+    assert_eq!(std::fs::read_to_string(t.0.join("fstab")).unwrap().lines().count(), 1, "fstab once");
+
+    // Asked for more later: the live one stays as it is, and says so.
+    let r = run(&stubs, &home, &repo, &[("ARENA_SWAP_GB", "16")]);
+    assert!(r.stdout.contains("already on (8 GB, not the 16 GB asked"), "{}", r.stdout);
+}
+
+#[test]
+fn no_swap_is_made_when_asked_for_none_without_room_or_when_mkswap_fails() {
+    for (tag, env, said) in [
+        ("swap-off", vec![("ARENA_SWAP_GB", "0")], "swap: none (VM_SWAP_GB=0)"),
+        ("swap-bad", vec![("ARENA_SWAP_GB", "8G")], "WARN: swap size '8G' isn't a whole number of GB — no swap"),
+        // 8 GiB of swap must leave 10 GiB free: 17 GiB isn't enough.
+        ("swap-room", vec![("DF_FREE_KB", "17825792")], "WARN: no swap — 8 GB of it would leave under 10 GB free"),
+        ("swap-mkswap", vec![("MKSWAP_EXIT", "1")], "WARN: no swap — mkswap/swapon refused"),
+    ] {
+        let (t, stubs, home, repo) = setup(tag);
+        let r = run(&stubs, &home, &repo, &env);
+        assert!(r.stdout.contains(said), "{tag}: {}", r.stdout);
+        assert!(!t.0.join("swapfile").exists(), "{tag}: no swap file left");
+        assert!(!t.0.join("fstab").exists(), "{tag}: fstab untouched");
+        assert!(r.stdout.contains("### 2/7 system packages"), "{tag}: setup goes on: {}", r.stdout);
+    }
+    // Someone else's swap, as big as asked (a provider's partition): none added.
+    let (t, stubs, home, repo) = setup("swap-theirs");
+    std::fs::write(t.0.join("proc-swaps"), "Filename\tType\tSize\tUsed\tPriority\n/dev/sda2\tpartition\t8388608\t0\t-2\n").unwrap();
+    let r = run(&stubs, &home, &repo, &[]);
+    assert!(r.stdout.contains("swap: 8 GB already on (not arena's) — none added"), "{}", r.stdout);
+    assert!(!t.0.join("swapfile").exists());
 }
 
 #[test]
