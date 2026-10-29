@@ -6573,7 +6573,8 @@ deep_check_end=1
         {
             let s = shared.lock().unwrap();
             let r = s.runs.iter().find(|r| r.id == id).unwrap();
-            assert_eq!(r.pods, [("devtest-alpha".to_string(), runs::PodState::Failed("FAILED setup: after a long line".into()))], "{:?}", r.lines.iter().map(|l| l.len()).collect::<Vec<_>>());
+            assert!(r.lines.iter().any(|l| l == "[devtest-alpha] FAILED setup: after a long line"), "{:?}", r.lines.iter().map(|l| l.len()).collect::<Vec<_>>());
+            assert!(r.pods.is_empty(), "a log's lines are output, not progress");
             assert!(r.lines.iter().any(|l| l.len() > 1_000 && l.ends_with('…')), "the long line, cut");
         }
         let _ = std::fs::remove_dir_all(&dir);

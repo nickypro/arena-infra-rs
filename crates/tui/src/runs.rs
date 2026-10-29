@@ -24,7 +24,7 @@
 //! quit) sends it Ctrl+C instead: `up`'s own — no new attempts, nothing terminated.
 //! Read-only runs (`jobs`, `logs`, `offers`) end with the dashboard.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -56,6 +56,9 @@ const LINE_MAX: usize = 1_024;
 /// The most of a run's file one look reads: a run that prints faster is read over several
 /// looks, never all at once.
 const READ_MAX: usize = 256 * 1024;
+
+/// The most pods one run tracks the state of (a cohort is ~60): names past it are output only.
+const MAX_PODS: usize = 500;
 
 /// How many runs the dashboard remembers.
 const KEEP_RUNS: usize = 20;
@@ -213,8 +216,11 @@ pub(crate) struct Run {
     pub lines: VecDeque<String>,
     /// Lines no longer kept (the file has them).
     pub dropped: usize,
-    /// Each pod's last state, in the order they were first named.
+    /// Each pod's last state, in the order they were first named — for a run that changes pods
+    /// only ([`Kind::lasting`]), at most [`MAX_PODS`].
     pub pods: Vec<(String, PodState)>,
+    /// Where each of `pods` is, by name.
+    pub index: HashMap<String, usize>,
     pub end: Option<(Instant, End)>,
 }
 
@@ -222,15 +228,27 @@ impl Run {
     /// Take one line of output; the pod it created, if it says so.
     pub(crate) fn take(&mut self, line: String) -> Option<String> {
         let mut created = None;
-        if let Some((name, state)) = pod_line(&line) {
-            if state == PodState::Created {
+        // Only a command that changes pods reports their progress: `jobs`' and `logs`' lines are
+        // the pods' own output, whatever they look like (review ai-review codex round 3 #1: a
+        // log's `[created] x` made a pending row).
+        if let Some((name, state)) = self.kind.lasting().then(|| pod_line(&line)).flatten() {
+            if state == PodState::Created && self.kind == Kind::Up {
                 created = Some(name.clone());
             }
-            match self.pods.iter_mut().find(|(n, _)| *n == name) {
-                // A finished pod's verdict stands against later chatter about it (the summary).
-                Some((_, PodState::Ready(_) | PodState::Failed(_) | PodState::Stopped(_))) if matches!(state, PodState::Doing(_)) => {}
-                Some((_, s)) => *s = state,
-                None => self.pods.push((name, state)),
+            match self.index.get(&name) {
+                Some(&i) => {
+                    let s = &mut self.pods[i].1;
+                    // A finished pod's verdict stands against later chatter about it (the summary).
+                    let done = matches!(s, PodState::Ready(_) | PodState::Failed(_) | PodState::Stopped(_));
+                    if !(done && matches!(state, PodState::Doing(_))) {
+                        *s = state;
+                    }
+                }
+                None if self.pods.len() < MAX_PODS => {
+                    self.index.insert(name.clone(), self.pods.len());
+                    self.pods.push((name, state));
+                }
+                None => {}
             }
         }
         self.lines.push_back(line);
@@ -329,6 +347,7 @@ pub(crate) fn start(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, kind: Kind, provid
             lines: VecDeque::new(),
             dropped: 0,
             pods: Vec::new(),
+            index: HashMap::new(),
             end: None,
         });
         // Forget the oldest finished runs (their files stay).
@@ -511,7 +530,7 @@ pub(crate) fn apply(s: &mut Shared, id: u64, lines: Vec<String>) -> bool {
     let mut created = Vec::new();
     let mut refresh = false;
     for line in lines {
-        refresh |= matches!(pod_line(&line), Some((_, PodState::Ready(_) | PodState::Failed(_))));
+        refresh |= r.kind.lasting() && matches!(pod_line(&line), Some((_, PodState::Ready(_) | PodState::Failed(_))));
         created.extend(r.take(line));
     }
     for name in created {
@@ -760,7 +779,23 @@ pub(crate) fn render(f: &mut Frame, s: &Shared, id: u64, scroll: Option<u16>, st
         Line::styled(format!("$ {}", run.command), Style::default().fg(Color::Cyan)),
         Line::styled(format!("output: {}", run.log.display()), dim),
     ];
-    for (name, st) in &run.pods {
+    let inner = area.height.saturating_sub(2) as usize;
+    // The pods get at most a third of the panel (review ai-review codex round 3 #2: a cohort's
+    // statuses pushed the output and the stop question off it): the failed, stopped and
+    // unfinished first, then the ready, and a line for the rest.
+    let pod_room = (inner / 3).min(inner.saturating_sub(6));
+    let mut shown: Vec<&(String, PodState)> = run.pods.iter().collect();
+    let more = shown.len().saturating_sub(pod_room);
+    if more > 0 {
+        shown.sort_by_key(|(_, st)| match st {
+            PodState::Failed(_) => 0,
+            PodState::Stopped(_) => 1,
+            PodState::Doing(_) | PodState::Created => 2,
+            PodState::Ready(_) => 3,
+        });
+        shown.truncate(pod_room.saturating_sub(1));
+    }
+    for (name, st) in shown {
         let (text, style) = match st {
             PodState::Created => ("created".to_string(), Style::default()),
             PodState::Doing(w) => (format!("… {w}"), Style::default()),
@@ -770,13 +805,16 @@ pub(crate) fn render(f: &mut Frame, s: &Shared, id: u64, scroll: Option<u16>, st
         };
         head.push(Line::from(vec![Span::styled(format!("  {name:<20} "), Style::default().add_modifier(Modifier::BOLD)), Span::styled(text, style)]));
     }
+    if more > 0 && pod_room > 0 {
+        let hidden = run.pods.len() - (head.len() - 2);
+        head.push(Line::styled(format!("  … and {hidden} more · in all: {}", run.tally()), dim));
+    }
     let keys = if stop {
         Line::styled("send Ctrl+C to it (no new attempts, nothing terminated)?  [y] yes  [any other key] no", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     } else {
         let stop = if run.running() && run.kind.lasting() { "  [s] stop" } else { "" };
         Line::styled(format!("[esc] hide  [←→] run {at} of {}  [↑↓ PgUp PgDn] scroll  [end] follow{stop}", s.runs.len()), dim)
     };
-    let inner = area.height.saturating_sub(2) as usize;
     let room = inner.saturating_sub(head.len() + 2).max(1);
     // Long lines wrap (an error's point is often at its end); the scroll is in screen rows.
     let rows = wrap_rows(run.lines.iter().map(String::as_str), area.width.saturating_sub(2) as usize);
@@ -882,6 +920,7 @@ pub(crate) mod tests {
             lines: VecDeque::new(),
             dropped: 0,
             pods: Vec::new(),
+            index: HashMap::new(),
             end: None,
         }
     }
@@ -928,6 +967,49 @@ pub(crate) mod tests {
         assert!(Cli::locate(Ok(dir.join("links/arena-tui")), "/c.env", Err("no HOME".into())).unwrap_err().contains("no HOME"));
         assert!(Cli::locate(Err(std::io::Error::other("x")), "/c.env", state()).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cohort-sized run keeps its output, its tally and its keys (the stop question too) on
+    /// screen: the pods get a third of the panel, failures first, the rest summed up (review
+    /// ai-review codex round 3 #2). And only a run that changes pods reads its lines as pod
+    /// progress, at most MAX_PODS of them; only `up`'s `[created]` makes a pending row (#1).
+    #[test]
+    fn a_cohort_sized_run_keeps_its_output_and_keys_on_screen() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut s = Shared::default();
+        let mut r = run(1, Kind::Up);
+        for i in 0..30 {
+            r.take(format!("[created] devtest-p{i:02} id={i}"));
+        }
+        for i in 0..25 {
+            r.take(format!("[devtest-p{i:02}] READY after 3m — CPU VM"));
+        }
+        r.take("[devtest-p27] FAILED setup: boom".into());
+        r.take("the last line of output".into());
+        s.runs.push(r);
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let max = std::cell::Cell::new(0);
+        t.draw(|f| render(f, &s, 1, None, true, &max)).unwrap();
+        let buf = t.backend().buffer();
+        let screen: String = (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n").collect();
+        assert!(screen.contains("send Ctrl+C to it"), "{screen}");
+        assert!(screen.contains("the last line of output"), "{screen}");
+        assert!(screen.contains("devtest-p27") && screen.contains("FAILED setup: boom"), "{screen}");
+        assert!(screen.contains("more · in all: 25 ready, 1 failed, 4 under way"), "{screen}");
+        assert!(!screen.contains("devtest-p24 "), "a ready one past the room is summed up: {screen}");
+
+        // jobs/logs: their lines are the pods' output, never progress or pending rows.
+        let mut s = Shared::default();
+        s.runs.push(run(2, Kind::Logs));
+        assert!(!apply(&mut s, 2, vec!["[created] devtest-zz id=1".into(), "[devtest-zz] READY after 1s".into()]));
+        assert!(s.runs[0].pods.is_empty() && s.pending.is_empty());
+        // `start`: progress, but no pending rows; and no more than MAX_PODS names.
+        let mut s = Shared::default();
+        s.runs.push(run(3, Kind::Start));
+        let lines: Vec<String> = (0..MAX_PODS + 50).map(|i| format!("[step-{i}] x")).collect();
+        apply(&mut s, 3, lines);
+        apply(&mut s, 3, vec!["[created] devtest-q id=1".into()]);
+        assert_eq!((s.runs[0].pods.len(), s.pending.len()), (MAX_PODS, 0));
     }
 
     /// The panel wraps a long line into rows (the live 403's "shared core limit" was past the
