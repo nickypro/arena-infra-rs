@@ -17,6 +17,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [Overriding config without editing it](#overriding-config-without-editing-it)
 - [Providers](#providers)
   - [RunPod (REST v2, the default)](#runpod-rest-v2-the-default)
+  - [RunPod rate limits](#runpod-rate-limits)
   - [RunPod REST v1 (retiring)](#runpod-rest-v1-retiring)
   - [Vast.ai](#vastai)
   - [Hetzner Cloud](#hetzner-cloud)
@@ -131,24 +132,68 @@ commit: `arena 2.0.261027.1500 (5274b7a1c2)`.
 
 ```bash
 arena update --check     # newer release? what changed? (exit 10 = yes, 0 = up to date, 1 = couldn't tell)
-arena update --dry-run   # also download and check it, install nothing
+arena update --dry-run   # also download and check it (provenance included), install nothing
 arena update             # … then ask, and swap both binaries in (--yes to skip the question)
 sudo arena update        # where root runs arena from someone else's ~/.cargo/bin (prod)
 ```
 
 - **What changed:** the release's `CHANGELOG.md` entries that this build's own copy (compiled
-  in) lacks, with their **Action needed** and **Config** lines first.
-- **Checks before anything changes:** both binaries must match `SHA256SUMS`, and the new
-  `arena --version` must run here and name the release. A wrong-platform or cut-short download
-  never replaces what cron runs.
+  in) lacks, with their **Action needed** and **Config** lines first. `update` shows them only
+  once the binaries are proven, saying whether the attestation also names this `CHANGELOG.md`
+  (releases from 2026-10-28 on: then it must be that one, and be there, or the update stops);
+  `--check` shows them unverified.
+  Control characters in them are shown as `?`.
+- **Checks before anything changes:** both binaries must match `SHA256SUMS`, must be proven
+  built by this repository's release workflow (below), and the new `arena --version` must run
+  here and name the release. A forged, wrong-platform or cut-short download never replaces what
+  cron runs, and a downloaded binary is only run once it is proven.
+- **Build provenance:** `release.yml` attests its binaries (Sigstore: one statement naming
+  each file and its SHA-256, signed with a certificate GitHub Actions' OIDC token got for the
+  run, logged in Rekor). `update` reads the attestation from GitHub's API (anonymous) and
+  verifies it here, natively, with no `gh` and no login: the signature; the certificate's chain
+  to Sigstore's public-good root (compiled in) and its certificate-transparency timestamp; the
+  Rekor entry (inclusion proof, checkpoint, signed timestamp); SLSA provenance naming *both*
+  downloaded binaries with their digests (so they were built together: a genuine `arena-tui`
+  from an older release can't be slipped in); and who signed: `.github/workflows/release.yml`,
+  started by CI's success (`workflow_run`), on `refs/heads/master` of `nickypro/arena-infra-rs`
+  (GitHub's id 1368824951), on a GitHub-hosted runner. It says which run built them.
+  `SHA256SUMS` alone comes from the same release, so it can't prove that. No attestation, or
+  none that verifies: nothing is installed (nor run), and it says why. The new `arena` must
+  also be the release's version before it runs: the statement names a `VERSION` file holding
+  it (releases from 2026-10-28 on), or, for older ones, the verified bytes carry its
+  `--version` line. An older genuine build served under a newer tag is refused there.
+- **`--skip-attestation <sha256>,<sha256>`:** this build doesn't check provenance; it installs
+  only binaries whose SHA-256s are the two given (`arena`'s and `arena-tui`'s, either order),
+  and says so loudly. `SHA256SUMS` is still checked. It's for one case: a genuine release this
+  build can't verify, because Sigstore changed its keys or GitHub its attestation format after
+  this build was made. Verify this platform's two binaries elsewhere, with a current `gh`
+  (prod's 2.45 has no `gh attestation`), then pass their digests:
+
+  ```bash
+  # any machine with a current gh; the release's binaries for the box's platform (prod: aarch64)
+  t=aarch64-unknown-linux-gnu; tag=v2.0.YYMMDD.HHMM
+  gh release download $tag --repo nickypro/arena-infra-rs -p arena-$t -p arena-tui-$t
+  for f in arena-$t arena-tui-$t; do   # both must print the same run, or don't go on
+    gh attestation verify $f --repo nickypro/arena-infra-rs --deny-self-hosted-runners \
+      --cert-identity https://github.com/nickypro/arena-infra-rs/.github/workflows/release.yml@refs/heads/master \
+      --source-ref refs/heads/master --format json --jq '.[0].verificationResult.signature.certificate.runInvocationURI'
+  done
+  sha256sum arena-$t arena-tui-$t
+  # then, on the box:
+  sudo arena update --skip-attestation <arena's sha256>,<arena-tui's sha256>
+  ```
+
+  It installs, and runs, only those bytes: a release changed in between is refused. The new
+  build has the new root, so the next update verifies again. `--check` never reads
+  attestations.
 - **The swap:** where this `arena` really is (symlinks resolved), the current binaries become
   `arena.prev` / `arena-tui.prev` (an older `.prev` is replaced). Each new one takes the old
   one's mode and owner, and lands by rename, so the path always holds a whole binary.
   Roll back with `mv -f arena.prev arena && mv -f arena-tui.prev arena-tui`.
 - **Afterwards:** it lists the `arena-tui` dashboards still running the replaced build, to
   restart. Cron picks the new `arena` up on its next run.
-- It needs no config and no GitHub login (the API allows 60 unauthenticated requests an hour).
-  Provenance: `gh attestation verify arena-<target> --repo nickypro/arena-infra-rs`.
+- It needs no config and no GitHub login (the API allows 60 unauthenticated requests an hour;
+  an update makes 2: the latest release, and its attestation).
 
 ### Command shorthands
 
@@ -232,8 +277,8 @@ Notes / sharp edges to know:
 
 Any key in `config.env` can be overridden by an **environment variable of the same
 name** (env wins; it can't introduce brand-new keys — except a short allowlist such as
-`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `DISCARD_MAX_GB` and the `ASK_<AI>_MODEL`/`_EFFORT` keys, e.g. `RUNPOD_API=v1 arena pods
-list` to use the retiring RunPod v1 backend for one command, until 2026-11-15; v2 is the default). This is how you point at an SSH
+`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `DISCARD_MAX_GB`, `NEAR`/`NEAR_MAX_EXTRA_PCT` and the `ASK_<AI>_MODEL`/`_EFFORT` keys, e.g. `RUNPOD_API=v1 arena pods
+list` to use the retiring RunPod v1 backend for one command, until 2026-11-16; v2 is the default). This is how you point at an SSH
 key the current user can actually read, without editing the shared, read-only prod
 config — e.g. when the dashboard's metrics show `ssh connect failed … key unreadable`
 because the configured key lives under `/root`:
@@ -255,7 +300,7 @@ GIT_SSH_KEY_LOCAL=~/.ssh/arena_infra_key arena pods setup
 which quotes the value only if it's short and version-like — never a pasted key; `config check`
 shows which is active, `(default)` when unset).
 
-Why the default: v1 retires on 2026-11-15, and v1 can only ask for hosts on CUDA ≤ 13.0 (below),
+Why the default: v1 retires on 2026-11-16, and v1 can only ask for hosts on CUDA ≤ 13.0 (below),
 which starved RunPod placement — "no capacity" all day once the 13.0 hosts were taken.
 
 Same provider name and commands. Differences: real lifecycle statuses
@@ -311,11 +356,48 @@ a proxy-only host (live: two 4090s did): `up` calls it a host failure after the 
 Neither API reports a pod's CUDA constraint, so `replace`/`migrate copy` re-apply the configured one
 to the replacement (as `create` does).
 
+### RunPod rate limits
+
+Since 2026-10-27 every RunPod public API is rate-limited (RunPod's service email, 2026-10-28). REST
+v1 is capped at 180/min, 3,600/h and 43,200/day, halved on Nov 2 and again on Nov 9, until its sunset.
+The v2 management API gives each user **one quota per window** (minute, hour, day), every request
+counting against all three, and **every process using the key shares it**: prod's dashboards and
+its backup cron draw on one quota. The quotas aren't published; every v2 answer carries them:
+`RateLimit-Policy: "minute";q=…;w=60, "hour";q=…;w=3600, "day";q=…;w=86400` (q requests per w
+seconds) and `RateLimit: "minute";r=…;t=…, …` (r left, t seconds to that window's reset). A refusal
+is `429` with `Retry-After` (seconds) and a problem+json `detail` naming the window. No headers
+means no limit.
+
+Every provider request goes through one path (`http::exchange`, `ratelimit`):
+- Before a request is sent, a quota that is **held** — a 429's wait, or a window with `r` ≤ 1 until
+  its reset (the last request is left to the other processes on the key) — is waited out. If the
+  caller can't wait that long, the request fails at once, rate-limited and not sent:
+  `list pods: not sent — RunPod REST v2 rate limit (the minute window is spent): next request in 12 s`.
+  A dashboard call waits at most 2 s, a listing at most its 60 s bound, and anything else at most
+  65 s (a minute window's reset). An hour or day window that is spent fails at once.
+- A **429** is retried for any method (it is refused before processing, so a create is safe to
+  send again) after `Retry-After` (else Vast's body `retry_after`, else the reset of a window the
+  answer says is spent, else 1, 2, 4… s) plus up to 1 s of jitter, at most 3 times. Then the error
+  says so: `… HTTP 429 …: rate limit exceeded for the minute window — RunPod REST v2 rate limit:
+  still refused after 3 retries; next request in 12 s`.
+- A **5xx or a network error** is resent only for a RunPod **read** (GET), twice, after 1 s and
+  2 s. A POST/PATCH/DELETE that got one may have done something, so it is the caller's (a create
+  says "may have been created", and is never resent). Other providers' requests aren't resent
+  here: their callers have their own rules.
+- RunPod's three APIs (REST v2, REST v1, GraphQL) are separate quotas here, as are two keys.
+  Nothing says the APIs share one. The commands' own retries (`retry` module) still apply on top,
+  each attempt behind the same hold.
+
+`arena api get runpod pods --limits` shows what RunPod reported (below), and the dashboard's footer
+shows the request rate and what the quota has left this minute.
+
 ### RunPod REST v1 (retiring)
 
-`provider::runpod` — RunPod REST **v1** backend: list / create / stop / terminate. RunPod retires
-REST v1 on **2026-11-15**; used only with an explicit `RUNPOD_API=v1` (which `config check` warns
-about, with the date and `remove RUNPOD_API=v1 (v2 is the default)`).
+`provider::runpod` — RunPod REST **v1** backend: list / create / stop / terminate. RunPod sunsets
+REST v1 on **2026-11-16**; used only with an explicit `RUNPOD_API=v1` (which `config check` warns
+about, with the date and `remove RUNPOD_API=v1 (v2 is the default)`). From then every v1 request
+answers `410 Gone`, which arena reports as a config error: `list pods: RunPod REST v1 is gone (HTTP
+410 — RunPod sunset it on 2026-11-16): remove RUNPOD_API=v1 (v2 is the default)`.
 
 ### Vast.ai
 
@@ -521,7 +603,10 @@ the default, the REST list already has GPU and $; on `RUNPOD_API=v1` that query 
 (best-effort: if it fails you get one warning line and the list still renders); the `nvidia-smi`
 probe over SSH (default for the table, `--probe`/`--no-probe`) overrides the GPU when a pod answers.
 
-`list --json` emits the pods incl. `gpu_count`/`cost_per_hr`/`maintenance`.
+`list --json` emits the pods incl. `gpu_count`/`cost_per_hr`/`maintenance`, and `location` when
+the provider says where a pod runs (RunPod's data centre — a COMMUNITY pod has none —, Vast's
+`geolocation`, Hetzner's location, Shadeform's cloud and region). It times nothing: the RTT is the
+dashboard's.
 
 #### `pods restart` and `pods stop`: the wipe gate
 
@@ -720,7 +805,8 @@ Ends with a per-name table: `created on 1×RTX 3090 COMMUNITY ($0.22/h) (after 1
 capacity)` or `not placed (tried: …)`.
 
 Cloud tiers exist only on RunPod (Vast/Hetzner collapse them, and Hetzner the GPU list too, with a
-note).
+note). On RunPod and Vast, options near the proxy come first ([Near the
+proxy](#near-the-proxy-near-and-near_max_extra_pct)).
 
 Vast options are priced **live**: one marketplace search per GPU (needs `VAST_API_KEY`), the
 cheapest fitting offer's price for the disk asked for — a snapshot, since each create searches again
@@ -734,6 +820,53 @@ text).
 
 `--dry-run` prints the option table and the names it would attempt; the option order is fixed once
 confirmed.
+
+#### Near the proxy: `NEAR` and `NEAR_MAX_EXTRA_PCT`
+
+Every participant's SSH and VS Code traffic goes through the proxy box (on prod: Hetzner nbg1,
+Nuremberg), so a pod far from it adds its round trip to every keystroke — a US pod about 100 ms for a
+European cohort — to save cents. So on RunPod and Vast, `create`/`up` (and `replace`/`migrate`,
+`offers` and the dry-runs, through the same planner) try options **near the proxy first**, unless
+they cost more than a set margin over the cheapest acceptable option:
+
+- `NEAR` — `europe` (the default when unset: prod's config predates the key) or `north-america`;
+  `any`, `off`, `none` or empty turn it off (options anywhere, cheapest first, as before).
+- `NEAR_MAX_EXTRA_PCT` — the margin, default `25` (`25%` reads too). The human's call: latency
+  over small savings (25% of an A4000's $0.17/h is 4 cents).
+
+Both can come from the environment for one run (`NEAR=any arena pods up -n 3`) without editing the
+shared config; `config check` shows them, defaults marked, and fails a value it can't read.
+
+What "near" is, per provider (live, 2026-10-28):
+
+- **RunPod** — `dataCenterIds` on the create: Europe is every `EU-…`/`EUR-…` data centre
+  (`EU-CZ-1`, `EU-FR-1`, `EU-NL-1`, `EU-RO-1`, `EU-SE-1`, `EUR-IS-1`…`5`, `EUR-NO-1`/`2`; `api get
+  runpod catalog/datacenters` lists them with their region). The price is per GPU and tier, so a
+  near option costs what the same option anywhere costs. **SECURE only**: COMMUNITY hosts are in no
+  data centre (a community pod's `dataCenterId` is null, and a community create pinned to every data
+  centre finds no capacity) — a community-only create keeps its single path, and `offers` says why
+  nothing is near. With SECURE in `--cloud`, the near option is weighed against the cheapest
+  (community) one: a SECURE A4000 ($0.25) is +47% over a community one ($0.17), so it's tried near
+  first only with `NEAR_MAX_EXTRA_PCT` ≥ 47. The v2 catalog's per-data-centre listing skips a near
+  option the region doesn't offer right now (one create saved), and its stock is the region's.
+  `CREATE_EXTRA_JSON` / `--api-json` naming its own `dataCenterIds` turns near off (that pin wins).
+- **Vast** — each offer's `geolocation` country (the search filters on it: `"geolocation": {"in":
+  […]}`): Europe is the EU, the EEA, Switzerland, the UK, the Balkans, Ukraine and Moldova (not
+  Russia, Belarus, Turkey or the Caucasus). A near option is priced at the cheapest near offer and
+  capped at the margin — its create searches again and never rents dearer than the plan allowed.
+- **Hetzner** already creates in the nearest location (`HETZNER_LOCATION`); **Shadeform** has its
+  own region list. Neither reads `NEAR`.
+
+The order: cheapest-first — every near option within the margin (cheapest first among them), then
+every option anywhere, as before; `--order listed` — each option near just before it's tried
+anywhere, so the GPU order still comes first. The option table gets a WHERE column (`Europe`/`any`)
+and a note with the margin and what wasn't tried near, and why. A near option with no capacity falls
+through to the next, never a failure — and on RunPod is out **for the rest of the run**: its
+anywhere twin covers the same data centres, so a cohort spends one create on a full region, not one
+per name and round (RunPod limits requests per key, shared by every dashboard and cron on it). A
+10-pod `up` with Europe full: 11 creates; with it off: 10. On Vast it's out for the round, like any
+capacity block: its "no capacity" is one market search's answer, and the next round searches again. `--keep-trying` waits on one pool, so it keeps the single
+path (anywhere) and says so; `--retry-mins` keeps near.
 
 #### `--api-json` and `CREATE_EXTRA_JSON`
 
@@ -771,7 +904,8 @@ Already-created pods are never rolled back.
 
 **Transient** failures (429 / 5xx / connect-timeout) are retried automatically with exponential
 backoff (`retry` module) around create and list calls — so a throttle or blip doesn't fail the
-command.
+command. Underneath, each request already waits out a 429 and a held quota, and RunPod reads are
+resent after a 5xx (see [RunPod rate limits](#runpod-rate-limits)).
 
 Every backend reads a response's **status before its body** (`http` module), so a bad key's `401`
 with an HTML or empty body is `Auth` (`… HTTP 401 Unauthorized: …`), never "error decoding response
@@ -785,7 +919,9 @@ providers with a key in the config, in the fleet's order (RunPod, Vast, Hetzner)
 order `create`/`up` would try that provider's options in), OPTION, CLOUD, SIZE (VRAM per GPU — the
 live catalog's, else the preset's — or vCPU/RAM for a Hetzner VM), PER POD (`$`/h; `~` = preset
 estimate; Hetzner's in `€`, as it bills, never converted), SOURCE (`live`, `estimate`, or `list` for
-Hetzner's list price, which placement doesn't use), STOCK; then what
+Hetzner's list price, which placement doesn't use), STOCK, and WHERE when near the proxy is on
+(`Europe` for an option tried only there, `any`: [Near the
+proxy](#near-the-proxy-near-and-near_max_extra_pct)); then what
 the cap dropped and why, each provider's notes and the providers left out. With no key at all,
 RunPod alone (priced from the presets), as before.
 
@@ -1129,6 +1265,16 @@ a VM is never reported set up without a working env. Re-runs skip the install on
 gate already passes. Its installers' scratch (uv's above all) goes to a temp dir of its own, removed
 when it ends, failure or not: uv's 0-byte `uv-setuptools-*.lock` files, left in `/tmp`, kept a fresh
 VM from ever reading as idle to the auto-reaper.
+
+Its first step makes **swap**: a `/swapfile` of `VM_SWAP_GB` GB (default 8; `0` = none; at most 64),
+turned on, in `/etc/fstab` and with `vm.swappiness = 10`. Without swap, a notebook that loads a model or two past
+a cx23's 4 GB (or a cx33's 8 GB) gets its kernel killed; with it, the box slows down instead. The file sits at the
+filesystem's top, which the auto-reaper's idle probe doesn't scan, so it never makes a VM look busy. It is never
+fatal: with too little disk (the swap must leave 10 GB free), a swap already on that's at least as big (a
+provider's), or a `mkswap`/`swapon` that refuses, it's a `WARN` line and no file. A re-run keeps a swap file
+that's already on, even at another size (resizing a live one isn't safe under memory pressure); `swapoff
+/swapfile && rm /swapfile` and set up again to resize. Shadeform's GPU VMs run the same script, so they get it too;
+container pods (RunPod, Vast) can't swap.
 
 #### VS Code warm-up
 
@@ -1662,7 +1808,7 @@ healthy account reads ok.
 A running pod with no GPU information, a stopped pod whose (volume) disk size isn't listed, or a
 burn not known at all make the account `unknown` ("burn unknown: …", never "no burn").
 
-A listing that fails (a Vast 429 is retried once first, when it asks for ≤ 2 s) is stood in for by
+A listing that fails (a 429 is waited out and retried first, within the listing's bound) is stood in for by
 the burn observed under 30 min ago, marked stale (`-v` says so) — older, a $0 is unknown and
 anything more a floor.
 
@@ -1786,7 +1932,7 @@ API rejects, `creatable: false`; on v2 every row is creatable).
 
 ### `api get`
 
-`api get <runpod|runpod-v1|runpod-v2|vast|hetzner|shadeform> <path> [--raw]` — **read-only**
+`api get <runpod|runpod-v1|runpod-v2|vast|hetzner|shadeform> <path> [--raw | --limits]` — **read-only**
 passthrough for what no command covers (`pods/<id>`, `catalog/datacenters`, `network-volumes`,
 `billing/pods`; Vast `users/current/`; Hetzner `locations`; Shadeform `instances/types`, its key in
 `X-API-KEY`; `sshkeys` there refuses `--raw`): one GET (there is no other verb) with the configured
@@ -1800,6 +1946,12 @@ version (`v1/…` against v2) is refused, naming `runpod-v1`.
 Secrets are redacted (env values, key/token/password fields, `rpa_`/`sk-`/`hf_` tokens, SSH key
 material) unless `--raw`; the API key itself is never printed, `--raw` included (scrubbed from the
 body as received, before an error message clips it).
+
+`--limits` prints the rate limits the API reported for that GET instead of the body: the
+`RateLimit-Policy` and `RateLimit` headers as received (a partition key `pk` blanked), each window
+as it stands (`minute: 47 of 60 left, resets in 12 s`), any hold, and the requests this process
+sent. Counts only. Without the headers it says `no RateLimit headers in its answer: no limit
+reported`. The GET goes through the same rate-limit path as every command.
 
 ## Backups, branches and the archive
 
@@ -1837,9 +1989,15 @@ live (2/5/10/20/60s). Provider via `ARENA_PROVIDER` (default `runpod`), config v
 `arena8-apple` and the choice persists to `~/.config/arena-tui/prefs`), STATUS, a **SET** health
 glyph (`✓/✗/·` for `~/.name`, the deploy key, git origin→GitHub), GPU (live from `nvidia-smi`, e.g.
 `2×RTX A4000` — the provider list API omits this), GPU%/MEM/TEMP, **BRANCH** (autocommit branches
-shortened to their `w1d2` label; `main`/others shown as-is), and progress. Below ~105 columns (or in
-the detail view's split) TEMP, MEM, BRANCH and DISK drop out in that order, so
-NAME/STATUS/GPU/$/H/HEALTH/PROXY stay whole down to 73 columns.
+shortened to their `w1d2` label; `main`/others shown as-is), and progress. **RTT** is the round trip
+from this box — where the proxy runs — to the pod's SSH endpoint: one TCP connect, timed alongside
+the SSH probes (never before the rows are shown), at most once a minute per endpoint (each is a
+connect closed before any SSH, which OpenSSH ≥ 9.8 counts against the box; once a minute keeps even
+several dashboards far from its limit); green under 60 ms, yellow under 120, red beyond, `-` when
+not timed yet or no answer. The detail pane's `where:` line has it beside where the pod runs
+(`EUR-IS-1`, `Czechia, CZ`, `nbg1 (Nuremberg, DE)`). Below ~111 columns (or in the detail view's
+split) TEMP, RTT, MEM, BRANCH and DISK drop out in that order, so NAME/STATUS/GPU/$/H/HEALTH/PROXY
+stay whole down to 73 columns.
 
 ### Fleet columns from the core snapshot
 
@@ -1857,10 +2015,20 @@ didn't answer (first, so a narrow terminal can't cut it off), and ending with th
 balances (`arena balance`'s views, observed in the details round — at most one live read per account
 per 5 min — and recorded in the CLI's state file; a low account moves to the front in yellow, a
 critical one in red, with its amount: `‼ runpod $1.20 ≈1.9d`; an unfunded opt-in account with
-nothing billing there stays at the end, `shadeform $0.00 unfunded`). API calls per refresh are
-unchanged (one list per provider); the details query (GPU/$/maintenance) runs every 60 s or on `r`
-(≥10 s apart); one that fails part-way still shows what it filled (as `pods list` does) over the
-last good answer, with a footer warning.
+nothing billing there stays at the end, `shadeform $0.00 unfunded`). API calls per refresh are at
+most one list per provider; the details query (GPU/$/maintenance) runs every 60 s or on `r` (≥10 s
+apart); one that fails part-way still shows what it filled (as `pods list` does) over the last good
+answer, with a footer warning.
+
+**Rate limits.** The footer shows each provider's API requests in the last minute and what its
+quota has left this minute (`RunPod API 13/min · 47/60 left this minute`). A provider call waits at
+most 2 s for a rate limit. A listing that comes back rate-limited keeps that provider's last rows,
+and the dashboard stops listing for the API's own wait (else 5 s, doubling to 5 min). The SSH
+probes keep the refresh cadence, and the footer says `⚠ RunPod rate limit: listing again in 12 s`.
+`r` doesn't list through that wait, and the details query waits too. When a window's quota is low
+(a quarter or less left, or 10 when the quota isn't reported), listings are spread to half of
+what's left over the time to its reset (`⚠ RunPod quota low (minute window): listing every 10 s`);
+`r` lists anyway.
 
 ### Deep checks and marked sets
 
@@ -1984,6 +2152,18 @@ answered shows none — so another provider's outage delays the all-clear, never
 after 8 rounds without one it prints the commands to finish by hand. Only Ctrl+C gets past
 it, so after an interrupted run check `teardown --check`. A COMMUNITY pod that never gets a
 public IP fails as `FAILED endpoint` (see [`docs/TODO.md`](TODO.md)); the guard still cleans it up.
+
+### The live attestation check
+
+The offline tests verify recorded attestations (`crates/core/src/fixtures/attestation_*.json`),
+so they can't notice Sigstore rotating a key or GitHub changing its bundles. This opt-in test
+does: it reads the latest release's attestation from GitHub (2 anonymous API requests, no
+account, nothing spent), verifies it for the x86_64 `arena` and `arena-tui` as `arena update`
+does, and checks it doesn't verify as another workflow's or another repository's.
+
+```bash
+ARENA_LIVE_ATTEST=1 cargo test --release -p arena-core --lib attest -- --ignored --nocapture
+```
 
 ## AI review before merging
 

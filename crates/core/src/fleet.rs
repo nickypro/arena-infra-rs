@@ -637,6 +637,7 @@ mod tests {
                 started_at: None,
                 identity: None,
                 status_detail: None,
+                location: None,
             },
             Pod {
                 id: "def456".into(),

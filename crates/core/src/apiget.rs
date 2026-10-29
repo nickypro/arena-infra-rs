@@ -432,10 +432,8 @@ async fn get_for_with(client: &Client, base: &ApiBase, url: Url, api_key: &str) 
     match base.key_header() {
         None => get_with(client, url, api_key).await,
         Some(header) => {
-            let resp = client.get(url).header(header, api_key).header("Accept", "application/json").send().await?;
-            let status = resp.status();
-            let body = if status.is_success() { resp.text().await? } else { resp.text().await.unwrap_or_default() };
-            Ok((status, body))
+            let limits = limits_for(&url);
+            crate::http::send_text_with(client.get(url).header(header, api_key).header("Accept", "application/json"), limits).await
         }
     }
 }
@@ -447,11 +445,33 @@ pub async fn get(url: Url, api_key: &str) -> Result<(StatusCode, String)> {
     get_with(&client_builder().build()?, url, api_key).await
 }
 
+/// Both GETs go through the rate-limit-aware path ([`crate::http::exchange`]) like every
+/// other request: a held quota is waited out (or refused, not sent), a 429 retried, and what
+/// the API said about its quota is kept for [`limits_report`].
 async fn get_with(client: &Client, url: Url, api_key: &str) -> Result<(StatusCode, String)> {
-    let resp = client.get(url).bearer_auth(api_key).send().await?;
-    let status = resp.status();
-    let body = if status.is_success() { resp.text().await? } else { resp.text().await.unwrap_or_default() };
-    Ok((status, body))
+    let limits = limits_for(&url);
+    crate::http::send_text_with(client.get(url).bearer_auth(api_key), limits).await
+}
+
+/// RunPod's limits for a RunPod URL (its reads are resent after a 5xx too), the others' else.
+fn limits_for(url: &Url) -> &'static crate::http::Limits {
+    if crate::ratelimit::api_of(url).0 == "runpod" {
+        &crate::http::Limits::RUNPOD
+    } else {
+        &crate::http::Limits::OTHERS
+    }
+}
+
+/// `api get … --limits`: what the API `url` belongs to said about its quota on this process's
+/// requests to it ([`crate::ratelimit::describe`]) — the `RateLimit-Policy` and `RateLimit`
+/// headers as received, each window now, the requests sent. Counts only: no key, no body.
+pub fn limits_report(url: &Url) -> Vec<String> {
+    let api = crate::ratelimit::api_of(url).1;
+    let views: Vec<_> = crate::ratelimit::observed().into_iter().filter(|v| v.api == api).collect();
+    if views.is_empty() {
+        return vec![format!("{api}: no request was sent")];
+    }
+    views.iter().flat_map(crate::ratelimit::describe).collect()
 }
 
 #[cfg(test)]

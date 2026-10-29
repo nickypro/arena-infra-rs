@@ -14,7 +14,7 @@
 > Running pods still missing SSH after 10 min show `no-ssh` and count as failed backup/run/pull work;
 > the age is from `startedAt` or runtime uptime, never creation time.
 > What follows describes REST v1, used only with an explicit `RUNPOD_API=v1` until RunPod
-> retires it on 2026-11-15.
+> retires it on 2026-11-16.
 
 > Hand-maintained reference — it may drift from RunPod's live API. When in doubt, re-verify
 > against the live OpenAPI spec at `https://rest.runpod.io/v1/openapi.json` and the RunPod web

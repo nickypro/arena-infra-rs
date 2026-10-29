@@ -22,6 +22,7 @@ use arena_core::health::{render_summary, PodHealth, Status};
 use arena_core::metrics::PodMetrics;
 use arena_core::pod::Maintenance;
 use arena_core::provider::ContainerReset;
+use arena_core::proxy::Listing;
 use arena_core::selector::{Naming, SelectArgs, Selector};
 use arena_core::snapshot::{self, cache_key, fmt_age, FleetSnapshot, HealthCache, HealthRecord, ProxyState, SnapshotPod};
 use arena_core::Pod;
@@ -240,6 +241,81 @@ pub enum Tone {
     Dim,
 }
 
+/// How often each endpoint's RTT is timed again. RTT barely moves, and each timing is a TCP
+/// connect closed before any SSH — what OpenSSH ≥ 9.8 counts against the source address
+/// (`arena_core::rtt`): once a minute keeps several dashboards on the proxy box far from it.
+pub const RTT_EVERY: Duration = Duration::from_secs(60);
+
+/// How long one timing may take (name lookup and the connect together): far above any real
+/// round trip (Singapore from Nuremberg: ~160 ms); past it the RTT is unknown.
+pub const RTT_WAIT: Duration = Duration::from_secs(1);
+
+/// A timing this old is forgotten (its endpoint is long gone, or will be timed afresh).
+pub const RTT_FORGET: Duration = Duration::from_secs(600);
+
+/// An SSH endpoint, `(host, port)`.
+pub type Endpoint = (String, u16);
+
+/// The round-trip times from this box (where the proxy runs) to each pod's SSH endpoint,
+/// timed by the refresh ([`Rtts::due`]) and kept between rounds. By endpoint, not by name: a
+/// pod that moved (restart, replacement) is timed afresh, never shown its old host's RTT.
+#[derive(Debug, Clone, Default)]
+pub struct Rtts {
+    timed: HashMap<Endpoint, (std::time::Instant, Option<Duration>)>,
+}
+
+impl Rtts {
+    /// The endpoints of `pods` to time now: those never timed, or last timed [`RTT_EVERY`] or
+    /// more before `now` — each once, in the pods' order. A pod without an endpoint has none.
+    pub fn due(&self, pods: &[Pod], now: std::time::Instant) -> Vec<Endpoint> {
+        let mut out: Vec<Endpoint> = Vec::new();
+        for p in pods {
+            let (Some(ip), Some(port)) = (p.ssh_ip.as_deref().map(str::trim).filter(|ip| !ip.is_empty()), p.ssh_port) else { continue };
+            let ep = (ip.to_string(), port);
+            let fresh = self.timed.get(&ep).is_some_and(|(at, _)| now.saturating_duration_since(*at) < RTT_EVERY);
+            if !fresh && !out.contains(&ep) {
+                out.push(ep);
+            }
+        }
+        out
+    }
+
+    /// Record a round of timings (`None`: no answer within [`RTT_WAIT`]) at `now`, and forget
+    /// the ones [`RTT_FORGET`] old — by age, not by absence from this listing: a provider that
+    /// missed one listing mustn't get its pods dialled again on the next refresh.
+    pub fn record(&mut self, timed: Vec<(Endpoint, Option<Duration>)>, now: std::time::Instant) {
+        for (ep, d) in timed {
+            self.timed.insert(ep, (now, d));
+        }
+        self.timed.retain(|_, (at, _)| now.saturating_duration_since(*at) < RTT_FORGET);
+    }
+
+    /// `pod`'s RTT as last timed; `None`: no endpoint, not timed yet, or no answer.
+    pub fn of(&self, pod: &Pod) -> Option<Duration> {
+        let ep = (pod.ssh_ip.as_deref()?.trim().to_string(), pod.ssh_port?);
+        self.timed.get(&ep).and_then(|(_, d)| *d)
+    }
+}
+
+/// The RTT cell: `23ms` coloured by what a typist feels — green under 60 ms (Europe from
+/// Nuremberg, Iceland included), yellow under 120 (the US east coast: every keystroke
+/// noticeably late), red beyond (the US west, Asia); `-` dim when unknown. Pure.
+pub fn rtt_cell(rtt: Option<Duration>) -> (String, Tone) {
+    match rtt {
+        None => ("-".into(), Tone::Dim),
+        Some(d) => {
+            let ms = d.as_millis();
+            let tone = match ms {
+                0..60 => Tone::Good,
+                60..120 => Tone::Warn,
+                _ => Tone::Bad,
+            };
+            let label = if ms >= 1000 { ">1s".to_string() } else { format!("{ms}ms") };
+            (label, tone)
+        }
+    }
+}
+
 /// The HEALTH cell: `checking` while a deep check of this pod runs, else the last cached
 /// verdict and its age (`pass 12m`, `fail 2h` — `Status::label` + `snapshot::fmt_age`,
 /// as `arena snapshot` words them; the worst issue is left to the detail pane, it doesn't
@@ -397,6 +473,79 @@ pub fn details_due(since_last: Option<Duration>, forced: bool) -> bool {
         None => true,
         Some(d) => d >= DETAILS_EVERY || (forced && d >= DETAILS_MIN_GAP),
     }
+}
+
+/// A provider whose listing came back rate-limited this refresh — a 429, or refused before
+/// sending because its API's quota is held (`arena_core::ratelimit`: a 429's wait, a spent
+/// window, a low window's spacing) — for the footer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Throttle {
+    pub provider: String,
+    /// Its API's hold, when the quota is held ([`arena_core::ratelimit::retry_in`]).
+    pub hold: Option<arena_core::ratelimit::Hold>,
+    /// How old its rows on screen are (`None`: it has none to show).
+    pub rows_age: Option<Duration>,
+}
+
+/// The footer's words for the rate-limited providers (`RunPod rate limit: listing again in
+/// 12 s (the minute window is spent) · its rows are 40 s old`); `None` when none is. The
+/// dashboard asks every refresh — a held quota refuses it without a request, so nothing is
+/// sent until the hold has passed. Pure.
+pub fn listing_note(throttled: &[Throttle]) -> Option<String> {
+    let parts: Vec<String> = throttled
+        .iter()
+        .map(|t| {
+            let when = match &t.hold {
+                Some(h) => format!("listing again in {} ({})", arena_core::ratelimit::wait_words(h.wait), h.why),
+                None => "listing again next refresh".to_string(),
+            };
+            let rows = match t.rows_age {
+                Some(age) => format!(" · its rows are {} old", arena_core::ratelimit::wait_words(age)),
+                None => " · no rows yet".to_string(),
+            };
+            format!("{} rate limit: {when}{rows}", provider_title(&t.provider))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// A provider's name as people write it (`runpod` → `RunPod`). Pure.
+pub fn provider_title(provider: &str) -> String {
+    match provider {
+        "runpod" => "RunPod".into(),
+        "vast" => "Vast".into(),
+        "hetzner" => "Hetzner".into(),
+        "shadeform" => "Shadeform".into(),
+        other => other.into(),
+    }
+}
+
+/// `fresh` with each `throttled` provider's failed listing replaced by its last good one in
+/// `prev`: a rate-limited provider keeps its rows (as last listed) instead of vanishing from
+/// the screen while it is backed off. A provider that failed any other way, or has no good
+/// listing to fall back on, keeps its failure. Pure.
+pub fn carry_over(prev: Option<&Listing>, fresh: &mut Listing, throttled: &[String]) {
+    let Some(prev) = prev else { return };
+    for pl in fresh.providers.iter_mut().filter(|pl| pl.pods.is_err() && throttled.contains(&pl.provider)) {
+        if let Some(Ok(pods)) = prev.providers.iter().find(|p| p.provider == pl.provider).map(|p| &p.pods) {
+            pl.pods = Ok(pods.clone());
+        }
+    }
+}
+
+/// Each provider's last good listing, after `fresh`: its own where it listed, else what
+/// `prev` had for it — so a provider that failed (a 502), then was rate-limited, still has
+/// rows to fall back on ([`carry_over`]). A provider no longer listed at all is dropped. Pure.
+pub fn remember_good(prev: Option<&Listing>, fresh: &Listing) -> Listing {
+    let providers = fresh
+        .providers
+        .iter()
+        .map(|pl| match (&pl.pods, prev.and_then(|p| p.providers.iter().find(|q| q.provider == pl.provider))) {
+            (Err(_), Some(old)) if old.pods.is_ok() => old.clone(),
+            _ => pl.clone(),
+        })
+        .collect();
+    Listing { providers }
 }
 
 /// What the details query told us about one pod, kept between queries.
@@ -888,6 +1037,53 @@ impl Confirm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn on(name: &str, ip: Option<&str>, port: Option<u16>) -> Pod {
+        Pod { name: name.into(), ssh_ip: ip.map(String::from), ssh_port: port, ..Default::default() }
+    }
+
+    /// Each endpoint is timed once a round at most, then not again for RTT_EVERY; a pod
+    /// without one is never timed; a pod that moved is timed afresh, never shown its old host's.
+    #[test]
+    fn rtts_time_each_endpoint_once_a_minute_and_follow_a_move() {
+        let t0 = std::time::Instant::now();
+        let pods = vec![on("a", Some("1.2.3.4"), Some(22001)), on("b", Some("1.2.3.4"), Some(22001)), on("c", None, None), on("d", Some(" "), Some(22))];
+        let mut r = Rtts::default();
+        assert_eq!(r.due(&pods, t0), [("1.2.3.4".to_string(), 22001)], "shared endpoint once; none without one");
+        assert_eq!(r.of(&pods[0]), None, "not timed yet");
+        r.record(vec![(("1.2.3.4".into(), 22001), Some(Duration::from_millis(23)))], t0);
+        assert_eq!((r.of(&pods[0]), r.of(&pods[1]), r.of(&pods[2])), (Some(Duration::from_millis(23)), Some(Duration::from_millis(23)), None));
+        assert!(r.due(&pods, t0 + Duration::from_secs(59)).is_empty());
+        assert_eq!(r.due(&pods, t0 + RTT_EVERY).len(), 1);
+        // No answer: unknown, and timed again a minute later like any other.
+        r.record(vec![(("1.2.3.4".into(), 22001), None)], t0 + RTT_EVERY);
+        assert_eq!(r.of(&pods[0]), None);
+        // `a` restarted onto another port: timed now, never shown its old port's.
+        let moved = vec![on("a", Some("1.2.3.4"), Some(23810))];
+        assert_eq!(r.due(&moved, t0 + RTT_EVERY), [("1.2.3.4".to_string(), 23810)]);
+        r.record(vec![(("1.2.3.4".into(), 23810), Some(Duration::from_millis(30)))], t0 + RTT_EVERY);
+        assert_eq!(r.of(&moved[0]), Some(Duration::from_millis(30)));
+        // A listing that missed a pod doesn't forget its timing (no re-dial when it's back)…
+        assert!(r.due(&pods, t0 + RTT_EVERY + Duration::from_secs(1)).is_empty());
+        // …only age does.
+        r.record(Vec::new(), t0 + RTT_EVERY + RTT_FORGET);
+        assert!(r.timed.is_empty());
+    }
+
+    #[test]
+    fn rtt_cells_by_threshold() {
+        let ms = |n: u64| rtt_cell(Some(Duration::from_millis(n)));
+        assert_eq!(rtt_cell(None), ("-".to_string(), Tone::Dim));
+        assert_eq!(ms(0), ("0ms".to_string(), Tone::Good));
+        assert_eq!(ms(23), ("23ms".to_string(), Tone::Good));
+        assert_eq!(ms(59), ("59ms".to_string(), Tone::Good));
+        assert_eq!(ms(60), ("60ms".to_string(), Tone::Warn));
+        assert_eq!(ms(95), ("95ms".to_string(), Tone::Warn));
+        assert_eq!(ms(120), ("120ms".to_string(), Tone::Bad));
+        assert_eq!(ms(999), ("999ms".to_string(), Tone::Bad));
+        assert_eq!(ms(1500), (">1s".to_string(), Tone::Bad));
+        assert!(["999ms", ">1s", "23ms"].iter().all(|l| l.chars().count() <= 5), "fits the 5-wide column");
+    }
     use arena_core::metrics::{parse_nvidia_smi, PodMetrics};
 
     fn pod(name: &str, cost: Option<f64>) -> Pod {
@@ -1443,6 +1639,91 @@ mod tests {
         for (since, forced, want) in cases {
             assert_eq!(details_due(since, forced), want, "{since:?} forced={forced}");
         }
+    }
+
+    /// The footer says which provider is rate-limited, when it is listed again and why, and
+    /// how old its rows are.
+    #[test]
+    fn listing_note_table() {
+        use arena_core::ratelimit::Hold;
+        let s = Duration::from_secs;
+        let hold = |secs: u64, why: &str| Some(Hold { api: "RunPod REST v2".into(), wait: s(secs), why: why.into() });
+        let t = |provider: &str, hold: Option<Hold>, age: Option<Duration>| Throttle { provider: provider.into(), hold, rows_age: age };
+        let cases = [
+            (vec![], None),
+            (
+                vec![t("runpod", hold(12, "the minute window is spent"), Some(s(40)))],
+                Some("RunPod rate limit: listing again in 12 s (the minute window is spent) · its rows are 40 s old"),
+            ),
+            (
+                vec![t("runpod", hold(1800, "the hour window is spent"), None)],
+                Some("RunPod rate limit: listing again in 30 min (the hour window is spent) · no rows yet"),
+            ),
+            (
+                vec![t("vast", None, Some(s(5))), t("runpod", hold(3, "the day window is low: 900 of 86400 left"), Some(s(5)))],
+                Some("Vast rate limit: listing again next refresh · its rows are 5 s old · RunPod rate limit: listing again in 3 s (the day window is low: 900 of 86400 left) · its rows are 5 s old"),
+            ),
+        ];
+        for (throttled, want) in cases {
+            assert_eq!(listing_note(&throttled).as_deref(), want, "{throttled:?}");
+        }
+    }
+
+    /// A rate-limited provider keeps its last good rows; any other failure stays a failure.
+    #[test]
+    fn carry_over_keeps_a_throttled_providers_rows() {
+        use arena_core::proxy::ProviderListing;
+        let pod = |name: &str| Pod { name: name.into(), ..Default::default() };
+        let listing = |entries: Vec<(&str, std::result::Result<Vec<Pod>, &str>)>| Listing {
+            providers: entries.into_iter().map(|(p, r)| ProviderListing { provider: p.into(), pods: r.map_err(String::from) }).collect(),
+        };
+        let prev = listing(vec![("runpod", Ok(vec![pod("devtest-apple")])), ("vast", Ok(vec![pod("devtest-bravo")]))]);
+        let mut fresh = listing(vec![("runpod", Err("list pods HTTP 429")), ("vast", Err("vast list HTTP 502"))]);
+        carry_over(Some(&prev), &mut fresh, &["runpod".into()]);
+        assert_eq!(fresh.providers[0].pods.as_ref().map(|p| p[0].name.as_str()), Ok("devtest-apple"));
+        assert!(fresh.providers[1].pods.is_err(), "a 502 isn't a throttle");
+        // Nothing to fall back on: the failure stays.
+        let mut fresh = listing(vec![("runpod", Err("429"))]);
+        carry_over(None, &mut fresh, &["runpod".into()]);
+        assert!(fresh.providers[0].pods.is_err());
+        let mut fresh = listing(vec![("runpod", Err("429"))]);
+        carry_over(Some(&listing(vec![("runpod", Err("429"))])), &mut fresh, &["runpod".into()]);
+        assert!(fresh.providers[0].pods.is_err());
+    }
+
+    /// The rows a throttle falls back on are each provider's last good listing, not the last
+    /// refresh's: RunPod lists, fails with a 502, then is rate-limited — its rows come back
+    /// (review r2), while Vast lists as usual throughout.
+    #[test]
+    fn a_throttle_after_another_failure_still_has_the_last_good_rows() {
+        use arena_core::proxy::ProviderListing;
+        let pod = |name: &str| Pod { name: name.into(), ..Default::default() };
+        let listing = |entries: Vec<(&str, std::result::Result<Vec<Pod>, &str>)>| Listing {
+            providers: entries.into_iter().map(|(p, r)| ProviderListing { provider: p.into(), pods: r.map_err(String::from) }).collect(),
+        };
+        fn names(l: &Listing, i: usize) -> std::result::Result<Vec<String>, String> {
+            l.providers[i].pods.clone().map(|p| p.into_iter().map(|p| p.name).collect())
+        }
+        let refreshes = [
+            listing(vec![("runpod", Ok(vec![pod("devtest-apple")])), ("vast", Ok(vec![pod("devtest-bravo")]))]),
+            listing(vec![("runpod", Err("list pods HTTP 502")), ("vast", Ok(vec![pod("devtest-bravo"), pod("devtest-cherry")]))]),
+            listing(vec![("runpod", Err("list pods HTTP 429")), ("vast", Ok(vec![pod("devtest-cherry")]))]),
+        ];
+        let runpod = ["runpod".to_string()];
+        let mut good: Option<Listing> = None;
+        let mut shown = Vec::new();
+        for (i, fresh) in refreshes.iter().enumerate() {
+            let mut s = fresh.clone();
+            carry_over(good.as_ref(), &mut s, if i == 2 { &runpod } else { &[] });
+            good = Some(remember_good(good.as_ref(), fresh));
+            shown.push(s);
+        }
+        assert!(shown[1].providers[0].pods.is_err(), "a 502 is shown as a failure");
+        assert_eq!(names(&shown[2], 0), Ok(vec!["devtest-apple".to_string()]), "the throttle falls back on the last good rows");
+        assert_eq!(names(&shown[2], 1), Ok(vec!["devtest-cherry".to_string()]), "Vast as listed");
+        // A provider gone from the config is forgotten.
+        let only_vast = listing(vec![("vast", Ok(vec![]))]);
+        assert_eq!(remember_good(good.as_ref(), &only_vast).providers.len(), 1);
     }
 
     #[test]

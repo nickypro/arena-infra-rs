@@ -919,6 +919,12 @@ pub fn parse_instance(v: &Value, now: u64) -> Pod {
         started_at: None,
         identity,
         status_detail: s("status_details").map(str::trim).filter(|d| !d.is_empty()).map(String::from),
+        // `cloud region` (`massedcompute us-central-1`): the region alone doesn't say whose.
+        location: match (s("cloud").map(str::trim).filter(|c| !c.is_empty()), s("region").map(str::trim).filter(|r| !r.is_empty())) {
+            (Some(c), Some(r)) => Some(format!("{c} {r}")),
+            (None, Some(r)) => Some(r.to_string()),
+            _ => None,
+        },
     }
 }
 
@@ -1221,7 +1227,7 @@ impl ShadeformProvider {
     /// with that GPU (`Ok(None)` = none). **One** catalog read for every option (in stock,
     /// cheapest first), bounded by `limit`. Read-only; a failure is each option's `Err`.
     pub async fn quote(&self, gpus: &[String], base: &PodSpec, limit: Duration) -> Vec<(String, EntryQuote)> {
-        let catalog = match tokio::time::timeout(limit, self.get_json(AVAILABLE_PATH, "shadeform catalog")).await {
+        let catalog = match crate::ratelimit::bounded(limit, self.get_json(AVAILABLE_PATH, "shadeform catalog")).await {
             Ok(Ok(body)) => instance_types(&body).cloned().map_err(|e| e.to_string()),
             Ok(Err(e)) => Err(e.to_string()),
             Err(_) => Err(format!("timed out after {}s", limit.as_secs())),
@@ -1581,6 +1587,7 @@ impl Provider for ShadeformProvider {
             api_extra: None,
             avoid_machines: Vec::new(),
             server_type: None,
+            region: None,
         })
     }
 }

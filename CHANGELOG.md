@@ -14,6 +14,88 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-29 · RunPod's rate limits are respected, and REST v1 ends on 2026-11-16
+- RunPod limits every API since 2026-10-27, per key, shared by every dashboard and cron on it.
+  arena now waits out a `429` (what RunPod asks, else 1, 2, 4… s) and retries it up to 3 times,
+  and holds back its own requests while a window has 1 request or none left; when a window runs
+  low (a quarter of it or less), it spaces its requests so half of what's left lasts to the reset.
+  Concurrent requests each count against what's left. A command that can't wait that long fails
+  at once with the wait: `list pods: not sent — RunPod REST v2 rate limit (the minute window is
+  spent): next request in 12 s`.
+- RunPod reads (listing, pod details, catalog, billing) are sent again after a 5xx or a dropped
+  connection. A create, stop or terminate never is. The reaper's terminate waits out a rate limit
+  for 10 s at most; past that it's left to the next run, which decides again.
+- The dashboard's footer shows RunPod's request rate and what's left this minute (`RunPod API
+  13/min · 47/60 left this minute`). When RunPod refuses a listing or its quota is held, the
+  dashboard keeps RunPod's last rows, says how old they are (`⚠ RunPod rate limit: listing again
+  in 12 s (the minute window is spent) · its rows are 40 s old`), keeps probing the pods over SSH,
+  and lists the other providers as usual. A held quota is not asked until it frees.
+- `arena api get runpod pods --limits` prints RunPod's quota (each window's limit, what's left,
+  when it resets) instead of the body.
+- Vast's throttled listing is waited out the same way (it used to be retried only when Vast asked
+  for 2 s or less).
+- REST v1 (`RUNPOD_API=v1`) ends on **2026-11-16**, a day later than we said. After that a v1
+  request gets an error saying v1 is gone and to remove `RUNPOD_API=v1`.
+
+### Action needed
+- If your config still has `RUNPOD_API=v1`, remove it before 2026-11-16 (v2 is the default).
+
+## 2026-10-29 · Pods near the proxy first, and an RTT column in the dashboard
+- `pods create`/`up` (and `replace`, `migrate`) on RunPod and Vast now try Europe first — where
+  the proxy every participant's SSH goes through runs — unless that costs more than 25% over the
+  cheapest option. A far pod adds its round trip to every keystroke: a US pod about 100 ms.
+- RunPod: SECURE pods only, pinned to the `EU-…`/`EUR-…` data centres. COMMUNITY hosts are in no
+  data centre, so a community create is placed as before; to get a near A4000, add SECURE
+  (`--cloud community,secure`) and raise the margin past 47% (it's $0.25/h there, $0.17 community).
+- Vast: offers in European countries first, priced at the cheapest one there, never rented dearer
+  than the margin allows.
+- `arena offers` and the dry-runs show the order with a WHERE column (`Europe`/`any`) and say why
+  an option isn't tried near. A single SECURE or Vast create now shows that option table before
+  its prompt, as a create with several options does; with `--keep-trying` it stays one pool,
+  anywhere, and says so. If Europe has no room, the same option is tried anywhere, and on RunPod
+  Europe isn't asked again for the rest of the run: a 10-pod `up` with Europe full makes 11
+  creates, not 20.
+- The dashboard has an RTT column: the round trip from this box to each pod's SSH port, green under
+  60 ms, yellow under 120, red beyond. It's timed once a minute, after the rows are shown. The
+  detail pane's new `where:` line shows it beside where the pod runs (`EUR-IS-1`, `Czechia, CZ`,
+  `nbg1 (Nuremberg, DE)`), which `pods list --json` now includes as `location`.
+
+### Config
+- New, optional: `NEAR` (`europe` when unset; `north-america`; `any` or empty turns it off) and
+  `NEAR_MAX_EXTRA_PCT` (default `25`). Both work from the environment for one run, e.g. `NEAR=any
+  arena pods up -n 3` for the old cheapest-anywhere order. `config check` shows both.
+
+## 2026-10-29 · Hetzner VMs get 8 GB of swap
+- `arena pods setup` (and `up`) on a Hetzner VM now makes an 8 GB swap file first, so a notebook
+  that goes past the VM's RAM slows down instead of having its kernel killed. Shadeform's GPU VMs
+  get it too; RunPod and Vast pods can't swap.
+- It's skipped, with a `WARN` line, when the disk would have under 10 GB left, and a swap that's
+  already on is kept. Setup never fails over it.
+- A VM set up before this gets it at its next `arena pods setup`.
+
+### Config
+- `VM_SWAP_GB` (new, default 8): GB of swap setup makes on a bare VM; `0` = none, at most 64.
+
+## 2026-10-28 · `arena update` checks who built the release
+- `arena update` (and `--dry-run`) now verifies the new binaries' build-provenance attestation
+  before installing or running them: that both were built together by this repository's
+  `release.yml` from master, on GitHub's runners, as Sigstore's signature, certificate and
+  transparency log prove. It checks this here, with no `gh` and no GitHub login, and says which
+  workflow run built them. Until now it only checked `SHA256SUMS`, which comes from the same
+  release as the binaries.
+- Binaries without an attestation, or with one that doesn't verify, are not installed, and the
+  message says why. `arena update --skip-attestation <sha256>,<sha256>` installs without this
+  check, only binaries with those two SHA-256s, with a loud warning: for a genuine release this
+  build can't verify (after Sigstore changes its keys), whose binaries you verified with
+  `gh attestation verify` elsewhere (docs/REFERENCE.md says how). `--check` is unchanged.
+- What changed is shown after the binaries are verified, and says whether the attestation also
+  covers the release's changelog (from this release on it does; a changelog other than the
+  attested one, or a missing one, stops the update). `--check` labels it unverified.
+- An older build served under a newer release's name is refused before it runs.
+- An update makes 2 GitHub API requests instead of 1 (of the 60 an hour allowed without a login).
+- Dependencies with security advisories updated (rustls, rustls-webpki, webpki-roots, tokio,
+  anyhow).
+
 ## 2026-10-28 · `offers` shows every provider, Hetzner too; `--help` lists commands in groups
 - `arena offers` is one table over every provider with a key in the config (RunPod, Vast,
   Hetzner): each row is an option `pods up` would try there, `#` the order it would try them in,

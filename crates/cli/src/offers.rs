@@ -128,7 +128,7 @@ async fn hetzner_offer(cfg: &Config, base: &PodSpec) -> Result<(ServerType, Opti
     let Some(key) = cfg.get("HETZNER_API_KEY").filter(|k| !k.trim().is_empty()) else {
         return Ok((bare, Some(format!("no HETZNER_API_KEY — {name}'s size and price are unknown"))));
     };
-    match tokio::time::timeout(PRICE_TIMEOUT, HetznerProvider::new(key, opts).offer(base)).await {
+    match arena_core::ratelimit::bounded(PRICE_TIMEOUT, HetznerProvider::new(key, opts).offer(base)).await {
         Ok(Ok(t)) => Ok((t, None)),
         Ok(Err(arena_core::Error::Config(why))) => anyhow::bail!("create would refuse {name}: {why}"),
         Ok(Err(e)) => Ok((bare, Some(format!("couldn't read {name} from Hetzner's server types ({e}) — size and price unknown")))),
@@ -166,7 +166,7 @@ async fn handle_catalogs(cfg: &Config, scope: &[&str], left_out: &[Skipped], jso
                 let configured = opts.server_type.clone();
                 let read = match cfg.get("HETZNER_API_KEY").filter(|k| !k.trim().is_empty()) {
                     None => Err("no HETZNER_API_KEY".to_string()),
-                    Some(key) => match tokio::time::timeout(PRICE_TIMEOUT, HetznerProvider::new(key, opts).catalog()).await {
+                    Some(key) => match arena_core::ratelimit::bounded(PRICE_TIMEOUT, HetznerProvider::new(key, opts).catalog()).await {
                         Ok(read) => read.map_err(|e| e.to_string()),
                         Err(_) => Err(format!("no answer within {}s", PRICE_TIMEOUT.as_secs())),
                     },
