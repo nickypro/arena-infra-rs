@@ -7,17 +7,18 @@
 # always one version.
 #
 # Build provenance is attested (Sigstore, logged in Rekor): one statement naming every
-# `dist/arena-*` file and CHANGELOG.md. `arena update` refuses binaries that statement doesn't
-# prove, and a CHANGELOG.md other than the one it names (crates/core/src/attest.rs; by hand:
-# docs/REFERENCE.md, `update`). It pins who signed: this file, `.github/workflows/release.yml`,
-# started by `workflow_run`, on `refs/heads/master` of this repository (by GitHub's id for it,
-# 1368824951), on a GitHub-hosted runner; and both binaries named, with their digests, in the
-# one statement. Renaming or moving this file, another
-# trigger, releasing from another branch, a self-hosted runner, attesting the binaries
+# `dist/arena-*` file, CHANGELOG.md and a VERSION file. `arena update` refuses binaries that
+# statement doesn't prove, another version, and a CHANGELOG.md other than the one it names
+# (crates/core/src/attest.rs; by hand: docs/REFERENCE.md, `update`). It pins who signed: this
+# file, `.github/workflows/release.yml`, started by `workflow_run`, on `refs/heads/master` of
+# this repository (by GitHub's id for it, 1368824951), on a GitHub-hosted runner; and both
+# binaries named, with their digests, in the one statement. Renaming or moving this file,
+# another trigger, releasing from another branch, a self-hosted runner, attesting the binaries
 # separately, or a re-created repository makes every existing build refuse the new releases
-# (until `arena update --skip-attestation <sha256>,<sha256>`): change `attest::RELEASE` with it,
-# and expect one manual update. The `if:` below (a CI run of a push to master) is what decides
-# which code a release builds: the certificate can't tell.
+# (until `arena update --skip-attestation <sha256>,<sha256>`): change `attest::RELEASE` with
+# it, and expect one manual update. The `if:` below (a CI run of a push to master: CI runs on
+# branch pushes, never tags) is what decides which code a release builds: the certificate
+# can't tell.
 #
 # On a pull request that touches this file or build.rs, it builds and checks the binaries and
 # publishes nothing.
@@ -116,13 +117,21 @@ jobs:
         run: |
           cp CHANGELOG.md dist/
           cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - name: Version file
+        # Attested, not published: it binds the statement to this version
+        # (`update::version_subject`), so `arena update` refuses an older build under a newer tag
+        # before running it.
+        run: |
+          mkdir attested && printf '%s\n' "$VERSION" > attested/VERSION
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          # One statement naming every binary and the changelog: `arena update` requires both
-          # binaries in one statement, and shows the changelog as verified when it's named.
+          # One statement naming both binaries of each platform, the changelog and the version:
+          # `arena update` requires its two binaries, and the changelog and version it names, to
+          # be these.
           subject-path: |
             dist/arena-*
             dist/CHANGELOG.md
+            attested/VERSION
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}

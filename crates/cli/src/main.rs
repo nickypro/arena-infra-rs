@@ -139,10 +139,10 @@ const SKIP_ATTESTATION_WARNING: &str = "\
 async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<String>, yes: bool) -> Result<()> {
     use arena_core::{attest, update as up};
     // A malformed pin fails before anything is read.
-    let pins = (!skip_attestation.is_empty()).then(|| up::parse_pins(&skip_attestation)).transpose().map_err(|e| anyhow::anyhow!("update: {e}"))?;
+    let pins = (!skip_attestation.is_empty()).then(|| up::parse_pins(&skip_attestation)).transpose().map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
     let installed = up::Version::parse(env!("ARENA_VERSION")).context("this build's version")?;
     let client = up::client();
-    let found = up::check(&client, up::REPO_API, installed, CHANGELOG).await.map_err(|e| anyhow::anyhow!("update: {e}"))?;
+    let found = up::check(&client, up::REPO_API, installed, CHANGELOG).await.map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
     if !found.newer {
         println!("arena {installed} is up to date (the latest release is {}).", found.release.tag);
         return Ok(());
@@ -170,10 +170,10 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<St
         None => up::Provenance::Verify { source: &github, expected: attest::RELEASE },
     };
     println!("\nDownloading {} for {target} …", found.release.tag);
-    let staged = up::fetch(&client, &found.release, target, dir, &provenance).await.map_err(|e| anyhow::anyhow!("update: {e}"))?;
+    let staged = up::fetch(&client, &found.release, target, dir, &provenance).await.map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
     // The changelog is shown only now, with what can be said of it: before, it was the
     // release's word alone, and its "Action needed" lines are instructions to an operator.
-    let changelog = up::changelog_provenance(staged.proof.as_ref(), found.changelog_sha256.as_deref()).map_err(|e| anyhow::anyhow!("update: {e}"))?;
+    let changelog = up::changelog_provenance(staged.proof.as_ref(), found.changelog_sha256.as_deref()).map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
     match &staged.proof {
         Some(proof) => {
             println!("Both binaries match the release's SHA256SUMS, and one build-provenance attestation names both");
@@ -199,7 +199,7 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<St
         println!("Not installed.");
         return Ok(());
     }
-    staged.install().map_err(|e| anyhow::anyhow!("update: {e}"))?;
+    staged.install().map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
     println!("Installed arena {} in {}.", found.release.version, dir.display());
     println!("Roll back: cd {} && mv -f arena.prev arena && mv -f arena-tui.prev arena-tui", dir.display());
     let stale = up::stale_processes(std::path::Path::new("/proc"), &dir.join("arena-tui"));

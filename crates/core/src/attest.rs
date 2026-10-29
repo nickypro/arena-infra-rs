@@ -59,10 +59,12 @@ pub const SLSA_PROVENANCE: &str = "https://slsa.dev/provenance/v1";
 /// The DSSE payload type of an in-toto statement.
 const IN_TOTO_PAYLOAD: &str = "application/vnd.in-toto+json";
 
-/// At most this many bundles signed by the release workflow are verified: a release attests
-/// its binaries once (a re-run, once more). Bundles signed by anyone else are skipped unread,
-/// so a flood of them (from any workflow with `attestations: write`) can't push the genuine
-/// one out of reach, as long as it is on the API's first page ([`GitHub`] asks for 100).
+/// At most this many bundles claiming the release workflow's identity are verified: a release
+/// attests its binaries once (a re-run, once more). Bundles claiming another identity are set
+/// aside unverified, so a flood of honest other attestations can't push the genuine one out of
+/// reach. Forged ones claiming this identity (any workflow of the repository with
+/// `attestations: write` could post them) still could, past 10 or past the API's first page
+/// of 100 ([`GitHub`]): that refuses the update, it can't install anything.
 const MAX_BUNDLES: usize = 10;
 
 /// Who must have built a binary: a workflow file of a repository, run on a ref by an event.
@@ -183,8 +185,6 @@ pub struct Proof {
     /// When it was signed, RFC 3339: the earliest authenticated time Sigstore's verification
     /// used (Rekor's integrated time, or a timestamp authority's).
     pub logged: Option<String>,
-    /// The same, in Unix seconds.
-    pub logged_secs: Option<i64>,
     /// Each file the verified statement names, with its SHA-256 (lowercase hex): the release's
     /// other files can be checked against it too ([`Proof::digest_of`]).
     pub subjects: Vec<(String, String)>,
@@ -302,7 +302,6 @@ fn verify_parsed(verifier: &Verifier, bundle: &Bundle, expected: &Expected, file
     Ok(Proof {
         signer,
         logged: signed.map(|t| t.to_string()),
-        logged_secs: signed.map(|t| t.as_second()),
         subjects: subjects(envelope.payload.as_bytes()),
     })
 }

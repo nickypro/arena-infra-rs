@@ -49,16 +49,6 @@ impl Version {
     }
 }
 
-impl Version {
-    /// The build stamp's time (`YYMMDD.HHMM`, UTC: the commit's time, for a release) in Unix
-    /// seconds. Pure.
-    pub fn unix_secs(self) -> i64 {
-        let [_, _, date, time] = self.0;
-        let (y, m, d) = (2000 + i64::from(date / 10000), date / 100 % 100, date % 100);
-        crate::schedule::days_from_civil(y, m, d) * 86400 + i64::from(time / 100) * 3600 + i64::from(time % 100) * 60
-    }
-}
-
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let [a, b, c, d] = self.0;
@@ -371,18 +361,25 @@ pub async fn check(client: &Client, api: &str, installed: Version, embedded: &st
     Ok(Checked { release, newer: true, changes, changelog_sha256 })
 }
 
-/// `text` with every control character but newline and tab shown as `?`: what a release says
-/// is printed to an operator's terminal, so it must not carry escape sequences. Pure.
+/// `text` with every control character but newline and tab, and every invisible formatting
+/// one (bidi overrides and isolates, zero-width ones), shown as `?`: what a release (or a
+/// certificate it carries) says is printed to an operator's terminal, so it must carry no
+/// escape sequence, nor text that displays in another order than it reads. Pure.
 pub fn printable(text: &str) -> String {
-    text.chars().map(|c| if c.is_control() && c != '\n' && c != '\t' { '?' } else { c }).collect()
+    let invisible = |c: char| matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}');
+    text.chars().map(|c| if (c.is_control() && c != '\n' && c != '\t') || invisible(c) { '?' } else { c }).collect()
 }
 
 /// What can be said of the release's `CHANGELOG.md` (its SHA-256, when it had one) once the
 /// binaries are proven by `proof` (`None`: pinned by hand instead), or why the update must
 /// stop: an attestation that names another `CHANGELOG.md` means this one was changed after the
-/// release was built. Releases attest it since 2026-10-28; older ones don't name it. Pure.
+/// release was built, and one that names a `CHANGELOG.md` the release doesn't serve hides it.
+/// Releases attest it since 2026-10-28; older ones don't name it. Pure.
 pub fn changelog_provenance(proof: Option<&attest::Proof>, sha256: Option<&str>) -> std::result::Result<&'static str, String> {
     match (proof, sha256) {
+        (Some(p), None) if p.digest_of("CHANGELOG.md").is_some() => {
+            Err("the attestation names a CHANGELOG.md, but the release's couldn't be read (or it has none): its Action needed lines would go unseen — not installed".into())
+        }
         (_, None) => Ok("no changelog to check"),
         (None, Some(_)) => Ok("not verified: --skip-attestation"),
         (Some(p), Some(sha)) => match p.digest_of("CHANGELOG.md") {
@@ -393,21 +390,34 @@ pub fn changelog_provenance(proof: Option<&attest::Proof>, sha256: Option<&str>)
     }
 }
 
-/// How much earlier than its version a release's attestation may be signed: the version is the
-/// commit's time by its author's clock, which may run ahead of Sigstore's.
-pub const CLOCK_SKEW_SECS: i64 = 24 * 3600;
+/// The subject `release.yml` names the release's version by: a file `VERSION` holding
+/// `<version>\n`. Its name and the SHA-256 it must have for `version`. Pure.
+pub fn version_subject(version: Version) -> (&'static str, String) {
+    ("VERSION", sha256_hex(format!("{version}\n").as_bytes()))
+}
 
-/// That an attestation signed at `signed` (Unix seconds) can be `version`'s: the release
-/// workflow signs after CI passed on the commit, so never (allowing [`CLOCK_SKEW_SECS`]) before
-/// the commit's time, the version. A genuine older pair served under a newer tag fails here,
-/// before either binary is written or run. Pure.
-pub fn check_fresh(version: Version, signed: Option<i64>) -> std::result::Result<(), String> {
-    let at = signed.ok_or("its attestation has no verified time")?;
-    if at + CLOCK_SKEW_SECS < version.unix_secs() {
-        let when = crate::snapshot::rfc3339(u64::try_from(at).unwrap_or(0));
-        return Err(format!("its attestation was signed {when}, before {version} was committed: an older build served as {version}"));
+/// That the proven (or pinned) `arena` is the release's `version`, before it is written or
+/// run: a genuine older build served under a newer tag must not get to run, even its
+/// `--version`. When the attestation names `VERSION` (releases from 2026-10-28 on), it must be
+/// this version: that binds it cryptographically. Otherwise (older releases, or binaries pinned
+/// by hand) the bytes must carry `<version> (`, the start of the `--version` line built into
+/// every `arena` (`<version> (<commit>)`): a build only carries its own, and an older build
+/// can't carry a later one (the one other such string in today's binaries is a past example in
+/// the changelog). Pure.
+pub fn check_version(proof: Option<&attest::Proof>, arena: &[u8], version: Version) -> std::result::Result<(), String> {
+    let (name, want) = version_subject(version);
+    match proof.and_then(|p| p.digest_of(name)) {
+        Some(got) if got.eq_ignore_ascii_case(&want) => Ok(()),
+        Some(_) => Err(format!("its attestation is for another version than {version}: an older build served as {version}")),
+        None => {
+            let line = format!("{version} (");
+            if arena.windows(line.len()).any(|w| w == line.as_bytes()) {
+                Ok(())
+            } else {
+                Err(format!("the new arena doesn't carry the version {version}: another build served as {version}"))
+            }
+        }
     }
-    Ok(())
 }
 
 /// The binaries a release installs on `target`: `(name in the install dir, asset name)`.
@@ -467,13 +477,14 @@ pub fn check_pinned(pins: &[String], files: &[(&str, &str)]) -> std::result::Res
 }
 
 /// Download `release`'s binaries for `target` and its `SHA256SUMS`, check both against it and
-/// their provenance ([`Provenance`]), stage them in `dir` ([`stage`]) and check the new `arena`
-/// runs here ([`check_runs`]). Neither is written, let alone run, until both are proven.
+/// their provenance ([`Provenance`]), and that the `arena` is the release's version
+/// ([`check_version`]); then stage them in `dir` ([`stage`]) and check the new `arena` runs
+/// here ([`check_runs`]). Neither is written, let alone run, until all that holds.
 /// Nothing in `dir` changes but the staged files, and those go again on any failure.
 pub async fn fetch(client: &Client, release: &Release, target: &str, dir: &Path, provenance: &Provenance<'_>) -> Result<Staged> {
     let sums = parse_sums(&String::from_utf8_lossy(&download(client, release.asset("SHA256SUMS")?).await?));
     // (name, asset name, sha256, bytes), `arena-tui` first.
-    let mut got = Vec::new();
+    let mut got: Vec<(&str, String, String, Vec<u8>)> = Vec::new();
     for (name, asset_name) in binaries(target) {
         let bytes = download(client, release.asset(&asset_name)?).await?;
         verify(&sums, &asset_name, &bytes)?;
@@ -484,15 +495,16 @@ pub async fn fetch(client: &Client, release: &Release, target: &str, dir: &Path,
     let proof = match provenance {
         Provenance::Verify { source, expected } => {
             let proven = attest::verify(*source, &attest::verifier()?, expected, &files).await;
-            let proof = proven.map_err(|e| format!("{e} — not installed"))?;
-            check_fresh(release.version, proof.logged_secs).map_err(|e| format!("{e} — not installed"))?;
-            Some(proof)
+            Some(proven.map_err(|e| format!("{e} — not installed"))?)
         }
         Provenance::Pinned(pins) => {
             check_pinned(pins, &files).map_err(|e| format!("{e} — not installed"))?;
             None
         }
     };
+    if let Some((_, asset_name, _, bytes)) = got.iter().find(|(n, ..)| *n == "arena") {
+        check_version(proof.as_ref(), bytes, release.version).map_err(|e| format!("{asset_name}: {e} — not installed"))?;
+    }
     let mut staged = Staged { dir: dir.to_path_buf(), files: Vec::new(), proof };
     for (name, _, _, bytes) in &got {
         let path = stage(dir, name, bytes)

@@ -232,7 +232,8 @@ async fn an_update_installs_both_binaries_and_keeps_the_old_ones() {
 }
 
 /// Any doubt stops before the swap and leaves nothing behind: a checksum mismatch, a new
-/// `arena` that doesn't say the release's version (another platform's, a cut-short one), no
+/// `arena` of another version (refused before it runs: it would leave `ran` behind), one that
+/// carries the version but doesn't say it when run (another platform's, a cut-short one), no
 /// binary for this platform; dropping the staged pair (a refused confirm) removes it too.
 #[tokio::test]
 async fn a_doubtful_download_installs_nothing() {
@@ -249,9 +250,15 @@ async fn a_doubtful_download_installs_nothing() {
     assert!(e.contains("doesn't match SHA256SUMS"), "{e}");
     untouched(&dir);
 
-    let other = fake_arena("2.0.250101.0000");
+    let other = format!("#!/bin/sh\ntouch '{}'\necho 'arena 2.0.250101.0000 (0123456789)'\n", dir.join("ran").display());
     let (_srv, release) = release_server("new tui", &other, ("new tui", &other));
     let e = fetch(&test_client(), &release, T, &dir, &pinned(&["new tui", &other])).await.unwrap_err();
+    assert!(e.starts_with(&format!("arena-{T}: the new arena doesn't carry the version 2.0.261101.0900")), "{e}");
+    untouched(&dir);
+
+    let says_other = "#!/bin/sh\n# 2.0.261101.0900 (0123456789)\necho 'arena 2.0.250101.0000 (0123456789)'\n";
+    let (_srv, release) = release_server("new tui", says_other, ("new tui", says_other));
+    let e = fetch(&test_client(), &release, T, &dir, &pinned(&["new tui", says_other])).await.unwrap_err();
     assert!(e.contains("not arena 2.0.261101.0900"), "{e}");
     untouched(&dir);
 
@@ -335,31 +342,32 @@ fn skip_attestation_takes_both_binaries_sha256s() {
     assert_eq!(e, format!("arena-tui-x is the same file as arena-x (sha256 {b}): the release serves one binary as both"));
 }
 
+/// The `arena` must be the release's version before it is written or run: by the attested
+/// `VERSION` when the statement names one, else by the `--version` line its bytes carry.
 #[test]
-fn a_version_is_its_commits_time() {
-    assert_eq!(Version::parse("2.0.000101.0000").unwrap().unix_secs(), 946684800, "years are 20YY: 2000-01-01");
-    assert_eq!(Version([2, 0, 261028, 1916]).unix_secs(), 1793214960, "2026-10-28T19:16:00Z");
-    assert_eq!(Version([2, 0, 240229, 2359]).unix_secs(), 1709251140, "a leap day");
-}
-
-/// The attestation is signed after CI passed on the commit, so not before the version (the
-/// commit's time; a day's slack for an author's clock that runs ahead).
-#[test]
-fn an_attestation_older_than_the_version_is_refused() {
+fn an_arena_of_another_version_is_refused_before_it_runs() {
     let v = Version([2, 0, 261028, 1916]);
-    let t = v.unix_secs();
-    assert_eq!(check_fresh(v, Some(t + 585)), Ok(()), "the real one: signed 9¾ min after the commit");
-    assert_eq!(check_fresh(v, Some(t - CLOCK_SKEW_SECS)), Ok(()), "an author's clock a day fast");
-    let e = check_fresh(v, Some(t - CLOCK_SKEW_SECS - 1)).unwrap_err();
-    assert_eq!(e, "its attestation was signed 2026-10-27T19:15:59Z, before 2.0.261028.1916 was committed: an older build served as 2.0.261028.1916");
-    assert_eq!(check_fresh(v, None), Err("its attestation has no verified time".into()));
+    let (name, sha) = version_subject(v);
+    assert_eq!((name, sha.as_str()), ("VERSION", sha256_hex(b"2.0.261028.1916\n").as_str()));
+    let named = |d: &str| proof_naming(&[("arena-x", "c"), ("VERSION", d)]);
+    let real = b"...Proceed? [y/N] prompt2.0.261028.1916 (7917eb2b6c)Streamlined...";
+    let older = b"...Proceed? [y/N] prompt2.0.261028.1827 (0123456789)Streamlined; see 2.0.261027.1500 (5274b7a1c2)";
+    assert_eq!(check_version(Some(&named(&sha)), older, v), Ok(()), "the attested VERSION decides");
+    let e = check_version(Some(&named(&sha256_hex(b"2.0.261028.1827\n"))), real, v).unwrap_err();
+    assert_eq!(e, "its attestation is for another version than 2.0.261028.1916: an older build served as 2.0.261028.1916");
+    let unnamed = proof_naming(&[("arena-x", "c")]);
+    for proof in [Some(&unnamed), None] {
+        assert_eq!(check_version(proof, real, v), Ok(()));
+        let e = check_version(proof, older, v).unwrap_err();
+        assert_eq!(e, "the new arena doesn't carry the version 2.0.261028.1916: another build served as 2.0.261028.1916");
+    }
+    assert!(check_version(None, b"2.0.261028.19160 (x", Version([2, 0, 261028, 1916])).is_err(), "the whole version, then ` (`");
 }
 
 fn proof_naming(subjects: &[(&str, &str)]) -> attest::Proof {
     attest::Proof {
         signer: attest::Signer::default(),
         logged: None,
-        logged_secs: None,
         subjects: subjects.iter().map(|(n, d)| (n.to_string(), d.to_string())).collect(),
     }
 }
@@ -377,7 +385,10 @@ fn the_changelog_is_checked_against_the_attestation_when_it_names_one() {
     let older = proof_naming(&[("arena-x", "c")]);
     assert_eq!(changelog_provenance(Some(&older), Some(&sha)), Ok("not covered by this release's attestation"));
     assert_eq!(changelog_provenance(None, Some(&sha)), Ok("not verified: --skip-attestation"));
-    assert_eq!(changelog_provenance(Some(&named), None), Ok("no changelog to check"));
+    let e = changelog_provenance(Some(&named), None).unwrap_err();
+    assert!(e.starts_with("the attestation names a CHANGELOG.md, but the release's couldn't be read") && e.ends_with("not installed"), "{e}");
+    assert_eq!(changelog_provenance(Some(&older), None), Ok("no changelog to check"));
+    assert_eq!(changelog_provenance(None, None), Ok("no changelog to check"));
 }
 
 #[test]
@@ -385,6 +396,7 @@ fn release_text_loses_its_control_characters() {
     assert_eq!(printable("## x\n- a\tb\n"), "## x\n- a\tb\n");
     assert_eq!(printable("\x1b]0;pwned\x07red \x1b[31mtext\r\n"), "?]0;pwned?red ?[31mtext?\n");
     assert_eq!(printable("é ⚠ ok"), "é ⚠ ok");
+    assert_eq!(printable("run \u{202E}hs.lacol\u{202C} \u{200B}x\u{2066}y\u{2069}"), "run ?hs.lacol? ?x?y?", "bidi and zero-width");
 }
 
 /// A directory the update can't write is refused with what to do, before anything changes.

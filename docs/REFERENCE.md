@@ -139,7 +139,8 @@ sudo arena update        # where root runs arena from someone else's ~/.cargo/bi
 - **What changed:** the release's `CHANGELOG.md` entries that this build's own copy (compiled
   in) lacks, with their **Action needed** and **Config** lines first. `update` shows them only
   once the binaries are proven, saying whether the attestation also names this `CHANGELOG.md`
-  (releases from 2026-10-28 on: it must, or the update stops); `--check` shows them unverified.
+  (releases from 2026-10-28 on: then it must be that one, and be there, or the update stops);
+  `--check` shows them unverified.
   Control characters in them are shown as `?`.
 - **Checks before anything changes:** both binaries must match `SHA256SUMS`, must be proven
   built by this repository's release workflow (below), and the new `arena --version` must run
@@ -156,9 +157,10 @@ sudo arena update        # where root runs arena from someone else's ~/.cargo/bi
   started by CI's success (`workflow_run`), on `refs/heads/master` of `nickypro/arena-infra-rs`
   (GitHub's id 1368824951), on a GitHub-hosted runner. It says which run built them.
   `SHA256SUMS` alone comes from the same release, so it can't prove that. No attestation, or
-  none that verifies: nothing is installed (nor run), and it says why. An attestation signed
-  more than a day before the release's version (its commit's time) is refused too, before
-  anything runs: that's an older genuine build served under a newer tag.
+  none that verifies: nothing is installed (nor run), and it says why. The new `arena` must
+  also be the release's version before it runs: the statement names a `VERSION` file holding
+  it (releases from 2026-10-28 on), or, for older ones, the verified bytes carry its
+  `--version` line. An older genuine build served under a newer tag is refused there.
 - **`--skip-attestation <sha256>,<sha256>`:** this build doesn't check provenance; it installs
   only binaries whose SHA-256s are the two given (`arena`'s and `arena-tui`'s, either order),
   and says so loudly. `SHA256SUMS` is still checked. It's for one case: a genuine release this
