@@ -6,6 +6,9 @@ members = ["crates/core", "crates/cli", "crates/tui"]
 edition = "2021"
 version = "0.1.0"
 license = "MIT"
+# Released as binaries (release.yml), never to crates.io. Also what lets cargo-deny (deny.toml)
+# accept the crates' versionless path dependencies on each other.
+publish = false
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

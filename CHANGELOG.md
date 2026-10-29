@@ -40,6 +40,37 @@ earlier).
 ### Action needed
 - If your config still has `RUNPOD_API=v1`, remove it before 2026-11-16 (v2 is the default).
 
+## 2026-10-29 · Hetzner VMs get 8 GB of swap
+- `arena pods setup` (and `up`) on a Hetzner VM now makes an 8 GB swap file first, so a notebook
+  that goes past the VM's RAM slows down instead of having its kernel killed. Shadeform's GPU VMs
+  get it too; RunPod and Vast pods can't swap.
+- It's skipped, with a `WARN` line, when the disk would have under 10 GB left, and a swap that's
+  already on is kept. Setup never fails over it.
+- A VM set up before this gets it at its next `arena pods setup`.
+
+### Config
+- `VM_SWAP_GB` (new, default 8): GB of swap setup makes on a bare VM; `0` = none, at most 64.
+
+## 2026-10-28 · `arena update` checks who built the release
+- `arena update` (and `--dry-run`) now verifies the new binaries' build-provenance attestation
+  before installing or running them: that both were built together by this repository's
+  `release.yml` from master, on GitHub's runners, as Sigstore's signature, certificate and
+  transparency log prove. It checks this here, with no `gh` and no GitHub login, and says which
+  workflow run built them. Until now it only checked `SHA256SUMS`, which comes from the same
+  release as the binaries.
+- Binaries without an attestation, or with one that doesn't verify, are not installed, and the
+  message says why. `arena update --skip-attestation <sha256>,<sha256>` installs without this
+  check, only binaries with those two SHA-256s, with a loud warning: for a genuine release this
+  build can't verify (after Sigstore changes its keys), whose binaries you verified with
+  `gh attestation verify` elsewhere (docs/REFERENCE.md says how). `--check` is unchanged.
+- What changed is shown after the binaries are verified, and says whether the attestation also
+  covers the release's changelog (from this release on it does; a changelog other than the
+  attested one, or a missing one, stops the update). `--check` labels it unverified.
+- An older build served under a newer release's name is refused before it runs.
+- An update makes 2 GitHub API requests instead of 1 (of the 60 an hour allowed without a login).
+- Dependencies with security advisories updated (rustls, rustls-webpki, webpki-roots, tokio,
+  anyhow).
+
 ## 2026-10-28 · `offers` shows every provider, Hetzner too; `--help` lists commands in groups
 - `arena offers` is one table over every provider with a key in the config (RunPod, Vast,
   Hetzner): each row is an option `pods up` would try there, `#` the order it would try them in,

@@ -10,16 +10,20 @@
 //! and no entry needs a version number before its release exists. Each entry's
 //! `### Action needed` and `### Config` lines are said first.
 //!
-//! Nothing is replaced until both binaries are downloaded, match `SHA256SUMS`, and the new
-//! `arena --version` runs here and names the release ([`check_runs`]): a wrong-platform or
-//! truncated download never becomes the cron's `arena`. The swap itself is a rename, so the
-//! path always holds a whole binary ([`install`]).
+//! Nothing is replaced until both binaries are downloaded, match `SHA256SUMS`, are proven built
+//! by this repository's release workflow from master ([`crate::attest`]; `SHA256SUMS` comes
+//! from the same release, so it can't prove that), and the new `arena --version` runs here and
+//! names the release ([`check_runs`]): a forged, wrong-platform or truncated download never
+//! becomes the cron's `arena`, and a binary is only run once it is proven. The swap itself is a
+//! rename, so the path always holds a whole binary ([`install`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use reqwest::Client;
 use serde_json::Value;
+
+use crate::attest;
 
 /// An update step's outcome: its failure is a message for the operator, said as is.
 pub type Result<T> = std::result::Result<T, String>;
@@ -332,24 +336,88 @@ pub struct Checked {
     pub release: Release,
     pub newer: bool,
     pub changes: String,
+    /// The SHA-256 of the release's `CHANGELOG.md` the changes come from, when it had one: what
+    /// [`changelog_provenance`] checks against the attestation before they are trusted.
+    pub changelog_sha256: Option<String>,
 }
 
 /// Read the latest release and, if it's newer than `installed`, what changed: its
-/// `CHANGELOG.md` against `embedded` (this build's own). A release without a changelog says
-/// so instead of failing — the binaries are what matter.
+/// `CHANGELOG.md` against `embedded` (this build's own), with control characters taken out
+/// ([`printable`]). A release without a changelog says so instead of failing — the binaries
+/// are what matter. Nothing here is verified yet: the release's provenance is checked by
+/// [`fetch`], and the changelog's by [`changelog_provenance`].
 pub async fn check(client: &Client, api: &str, installed: Version, embedded: &str) -> Result<Checked> {
     let release = latest(client, api).await?;
     if release.version <= installed {
-        return Ok(Checked { release, newer: false, changes: String::new() });
+        return Ok(Checked { release, newer: false, changes: String::new(), changelog_sha256: None });
     }
-    let changes = match release.asset("CHANGELOG.md") {
+    let (changes, changelog_sha256) = match release.asset("CHANGELOG.md") {
         Ok(a) => match download(client, a).await {
-            Ok(bytes) => describe_changes(&new_since(embedded, &String::from_utf8_lossy(&bytes))),
-            Err(e) => format!("(couldn't read the release's changelog: {e})\n"),
+            Ok(bytes) => (printable(&describe_changes(&new_since(embedded, &String::from_utf8_lossy(&bytes)))), Some(sha256_hex(&bytes))),
+            Err(e) => (format!("(couldn't read the release's changelog: {e})\n"), None),
         },
-        Err(_) => "(the release has no CHANGELOG.md)\n".into(),
+        Err(_) => ("(the release has no CHANGELOG.md)\n".into(), None),
     };
-    Ok(Checked { release, newer: true, changes })
+    Ok(Checked { release, newer: true, changes, changelog_sha256 })
+}
+
+/// `text` with every control character but newline and tab, and every invisible formatting
+/// one (bidi overrides and isolates, zero-width ones), shown as `?`: what a release (or a
+/// certificate it carries) says is printed to an operator's terminal, so it must carry no
+/// escape sequence, nor text that displays in another order than it reads. Pure.
+pub fn printable(text: &str) -> String {
+    let invisible = |c: char| matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}');
+    text.chars().map(|c| if (c.is_control() && c != '\n' && c != '\t') || invisible(c) { '?' } else { c }).collect()
+}
+
+/// What can be said of the release's `CHANGELOG.md` (its SHA-256, when it had one) once the
+/// binaries are proven by `proof` (`None`: pinned by hand instead), or why the update must
+/// stop: an attestation that names another `CHANGELOG.md` means this one was changed after the
+/// release was built, and one that names a `CHANGELOG.md` the release doesn't serve hides it.
+/// Releases attest it since 2026-10-28; older ones don't name it. Pure.
+pub fn changelog_provenance(proof: Option<&attest::Proof>, sha256: Option<&str>) -> std::result::Result<&'static str, String> {
+    match (proof, sha256) {
+        (Some(p), None) if p.digest_of("CHANGELOG.md").is_some() => {
+            Err("the attestation names a CHANGELOG.md, but the release's couldn't be read (or it has none): its Action needed lines would go unseen — not installed".into())
+        }
+        (_, None) => Ok("no changelog to check"),
+        (None, Some(_)) => Ok("not verified: --skip-attestation"),
+        (Some(p), Some(sha)) => match p.digest_of("CHANGELOG.md") {
+            Some(d) if d.eq_ignore_ascii_case(sha) => Ok("verified: the attestation names this CHANGELOG.md"),
+            Some(d) => Err(format!("the release's CHANGELOG.md (sha256 {sha}) isn't the one its attestation names ({d}) — not installed")),
+            None => Ok("not covered by this release's attestation"),
+        },
+    }
+}
+
+/// The subject `release.yml` names the release's version by: a file `VERSION` holding
+/// `<version>\n`. Its name and the SHA-256 it must have for `version`. Pure.
+pub fn version_subject(version: Version) -> (&'static str, String) {
+    ("VERSION", sha256_hex(format!("{version}\n").as_bytes()))
+}
+
+/// That the proven (or pinned) `arena` is the release's `version`, before it is written or
+/// run: a genuine older build served under a newer tag must not get to run, even its
+/// `--version`. When the attestation names `VERSION` (releases from 2026-10-28 on), it must be
+/// this version: that binds it cryptographically. Otherwise (older releases, or binaries pinned
+/// by hand) the bytes must carry `<version> (`, the start of the `--version` line built into
+/// every `arena` (`<version> (<commit>)`): a build only carries its own, and an older build
+/// can't carry a later one (the one other such string in today's binaries is a past example in
+/// the changelog). Pure.
+pub fn check_version(proof: Option<&attest::Proof>, arena: &[u8], version: Version) -> std::result::Result<(), String> {
+    let (name, want) = version_subject(version);
+    match proof.and_then(|p| p.digest_of(name)) {
+        Some(got) if got.eq_ignore_ascii_case(&want) => Ok(()),
+        Some(_) => Err(format!("its attestation is for another version than {version}: an older build served as {version}")),
+        None => {
+            let line = format!("{version} (");
+            if arena.windows(line.len()).any(|w| w == line.as_bytes()) {
+                Ok(())
+            } else {
+                Err(format!("the new arena doesn't carry the version {version}: another build served as {version}"))
+            }
+        }
+    }
 }
 
 /// The binaries a release installs on `target`: `(name in the install dir, asset name)`.
@@ -364,19 +432,82 @@ pub struct Staged {
     dir: PathBuf,
     /// `(name, staged path)`, `arena-tui` first so `arena` — the one cron runs — goes last.
     files: Vec<(&'static str, PathBuf)>,
+    /// Both binaries' proven provenance (one statement names both); `None` when pinned instead.
+    pub proof: Option<attest::Proof>,
 }
 
-/// Download `release`'s binaries for `target` and its `SHA256SUMS`, check each against it,
-/// stage them in `dir` ([`stage`]) and check the new `arena` runs here ([`check_runs`]).
+/// How [`fetch`] checks the binaries' build provenance.
+pub enum Provenance<'a> {
+    /// Both must be proven built together as `expected` says ([`attest::verify`]), from the
+    /// attestations `source` has.
+    Verify { source: &'a dyn attest::Source, expected: attest::Expected },
+    /// Not checked (`update --skip-attestation <sha256>,<sha256>`): each binary's SHA-256 must
+    /// be one of these instead ([`check_pinned`]), digests the operator verified by hand. So the
+    /// escape hatch installs, and runs, only the bytes someone checked, never whatever the
+    /// release serves at that moment.
+    Pinned(Vec<String>),
+}
+
+/// `--skip-attestation`'s values: exactly two different SHA-256s (`arena`'s and `arena-tui`'s,
+/// either order), lowercased; or what's wrong with them. Pure.
+pub fn parse_pins(values: &[String]) -> std::result::Result<Vec<String>, String> {
+    let pins: Vec<String> = values.iter().map(|v| v.trim().to_ascii_lowercase()).collect();
+    if let Some(bad) = pins.iter().find(|p| p.len() != 64 || !p.chars().all(|c| c.is_ascii_hexdigit())) {
+        return Err(format!("--skip-attestation takes SHA-256s (64 hex digits), not {bad:?}"));
+    }
+    if pins.len() != 2 || pins[0] == pins[1] {
+        return Err(format!("--skip-attestation takes the SHA-256s of both binaries, arena's and arena-tui's, comma-separated (got {})", pins.len()));
+    }
+    Ok(pins)
+}
+
+/// That the downloaded `files` (`(asset name, sha256)`) are exactly the operator's `pins`: each
+/// one's SHA-256 is a pin, and no pin stands for two of them (one binary served under both
+/// names would otherwise pass). Or the first that isn't. Pure.
+pub fn check_pinned(pins: &[String], files: &[(&str, &str)]) -> std::result::Result<(), String> {
+    for (i, &(name, sha256)) in files.iter().enumerate() {
+        if !pins.iter().any(|p| p == sha256) {
+            return Err(format!("{name}: its sha256 {sha256} isn't one given to --skip-attestation ({})", pins.join(", ")));
+        }
+        if let Some(&(other, _)) = files[..i].iter().find(|f| f.1 == sha256) {
+            return Err(format!("{name} is the same file as {other} (sha256 {sha256}): the release serves one binary as both"));
+        }
+    }
+    Ok(())
+}
+
+/// Download `release`'s binaries for `target` and its `SHA256SUMS`, check both against it and
+/// their provenance ([`Provenance`]), and that the `arena` is the release's version
+/// ([`check_version`]); then stage them in `dir` ([`stage`]) and check the new `arena` runs
+/// here ([`check_runs`]). Neither is written, let alone run, until all that holds.
 /// Nothing in `dir` changes but the staged files, and those go again on any failure.
-pub async fn fetch(client: &Client, release: &Release, target: &str, dir: &Path) -> Result<Staged> {
+pub async fn fetch(client: &Client, release: &Release, target: &str, dir: &Path, provenance: &Provenance<'_>) -> Result<Staged> {
     let sums = parse_sums(&String::from_utf8_lossy(&download(client, release.asset("SHA256SUMS")?).await?));
-    let mut staged = Staged { dir: dir.to_path_buf(), files: Vec::new() };
+    // (name, asset name, sha256, bytes), `arena-tui` first.
+    let mut got: Vec<(&str, String, String, Vec<u8>)> = Vec::new();
     for (name, asset_name) in binaries(target) {
-        let asset = release.asset(&asset_name)?;
-        let bytes = download(client, asset).await?;
+        let bytes = download(client, release.asset(&asset_name)?).await?;
         verify(&sums, &asset_name, &bytes)?;
-        let path = stage(dir, name, &bytes)
+        got.push((name, asset_name, sha256_hex(&bytes), bytes));
+    }
+    // `arena` first: the attestation is looked up by its digest (the binary cron runs).
+    let files: Vec<(&str, &str)> = got.iter().rev().map(|(_, a, sha, _)| (a.as_str(), sha.as_str())).collect();
+    let proof = match provenance {
+        Provenance::Verify { source, expected } => {
+            let proven = attest::verify(*source, &attest::verifier()?, expected, &files).await;
+            Some(proven.map_err(|e| format!("{e} — not installed"))?)
+        }
+        Provenance::Pinned(pins) => {
+            check_pinned(pins, &files).map_err(|e| format!("{e} — not installed"))?;
+            None
+        }
+    };
+    if let Some((_, asset_name, _, bytes)) = got.iter().find(|(n, ..)| *n == "arena") {
+        check_version(proof.as_ref(), bytes, release.version).map_err(|e| format!("{asset_name}: {e} — not installed"))?;
+    }
+    let mut staged = Staged { dir: dir.to_path_buf(), files: Vec::new(), proof };
+    for (name, _, _, bytes) in &got {
+        let path = stage(dir, name, bytes)
             .map_err(|e| format!("can't write {} ({e}) — run the update as the binaries' owner, or with sudo", dir.display()))?;
         staged.files.push((name, path));
     }
