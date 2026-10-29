@@ -14,6 +14,17 @@ How to write an entry:
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-29 · Hetzner VMs get 8 GB of swap
+- `arena pods setup` (and `up`) on a Hetzner VM now makes an 8 GB swap file first, so a notebook
+  that goes past the VM's RAM slows down instead of having its kernel killed. Shadeform's GPU VMs
+  get it too; RunPod and Vast pods can't swap.
+- It's skipped, with a `WARN` line, when the disk would have under 10 GB left, and a swap that's
+  already on is kept. Setup never fails over it.
+- A VM set up before this gets it at its next `arena pods setup`.
+
+### Config
+- `VM_SWAP_GB` (new, default 8): GB of swap setup makes on a bare VM; `0` = none, at most 64.
+
 ## 2026-10-28 · `arena update` checks who built the release
 - `arena update` (and `--dry-run`) now verifies the new binaries' build-provenance attestation
   before installing or running them: that both were built together by this repository's
