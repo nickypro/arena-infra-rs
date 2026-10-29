@@ -164,6 +164,13 @@ pub(crate) enum PodState {
     Stopped(String),
 }
 
+/// The CLI's bracketed tags that aren't a pod's name (`[proxy] after up: …`, `[keys] …`, a
+/// lifecycle verb's `[terminated] NAME …`): never read as a pod (live: `[proxy]` showed as one).
+const NOT_PODS: &[&str] = &[
+    "big", "dry-run", "failed", "keys", "proxy", "reimaged", "rejected", "renamed", "restarted", "ssh-config", "started", "stop",
+    "stopped", "terminated", "unlocked", "waiting",
+];
+
 /// A `pods up`/`start` line about one pod — `[created] NAME id=…`, `[NAME] READY after …`,
 /// `[NAME] FAILED stage: why`, `[NAME] STOPPED at …`, any other `[NAME] stage …` — as the pod and
 /// where it is. `None`: not about one pod. Pure.
@@ -175,7 +182,7 @@ pub(crate) fn pod_line(line: &str) -> Option<(String, PodState)> {
     }
     let rest = line.strip_prefix('[')?;
     let (name, what) = rest.split_once("] ")?;
-    if name.is_empty() || name.contains(' ') || name == "dry-run" {
+    if name.is_empty() || name.contains(' ') || NOT_PODS.contains(&name) {
         return None;
     }
     let what = what.trim();
@@ -852,7 +859,7 @@ pub(crate) mod tests {
     /// `pods up`'s per-pod lines, as the panel reads them; anything else isn't about a pod.
     #[test]
     fn up_lines_say_where_each_pod_is() {
-        let cases: [(&str, Option<(&str, PodState)>); 10] = [
+        let cases: [(&str, Option<(&str, PodState)>); 12] = [
             ("[created] devtest-alpha id=12345 on cx33 (€0.0160/h)", Some(("devtest-alpha", PodState::Created))),
             ("[devtest-alpha] proxy: port 9500 → 1.2.3.4:22", Some(("devtest-alpha", PodState::Doing("proxy: port 9500 → 1.2.3.4:22".into())))),
             ("[devtest-alpha] setup ✓ (3m02s)", Some(("devtest-alpha", PodState::Doing("setup ✓ (3m02s)".into())))),
@@ -860,6 +867,9 @@ pub(crate) mod tests {
             ("[devtest-bravo] FAILED setup: timed out", Some(("devtest-bravo", PodState::Failed("FAILED setup: timed out".into())))),
             ("[devtest-bravo] STOPPED at endpoint (Ctrl+C) — left as it is", Some(("devtest-bravo", PodState::Stopped("STOPPED at endpoint (Ctrl+C) — left as it is".into())))),
             ("[dry-run] would create devtest-alpha", None),
+            // Live: `up`'s closing proxy sync read as a pod named "proxy".
+            ("[proxy] after up: +0 ~0 -0 =0 (unchanged)", None),
+            ("[keys] devtest-alpha: no key in ./keys/", None),
             ("Will create 1 pod(s) on hetzner", None),
             ("[two words] x", None),
             ("", None),
