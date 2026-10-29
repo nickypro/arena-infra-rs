@@ -2394,7 +2394,9 @@ fn cli_action_args(action: Action, name: &str, arg: Option<&str>) -> Option<(run
 fn start_cli_action(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, action: Action, pod: &Pod, arg: Option<&str>) {
     let Some((kind, args)) = cli_action_args(action, &pod.name, arg) else { return };
     let title = format!("pods {} {}", action.label(), ui.shown_name(&pod.name));
-    let provider = ui.provider_name.clone();
+    // The pod's own provider: the CLI finds a pod fleet-wide whatever `--provider` says, but its
+    // messages then name the right one.
+    let provider = if pod.provider.is_empty() { ui.provider_name.clone() } else { pod.provider.clone() };
     ui.mode = match runs::start(ui, shared, kind, &provider, args, title) {
         Ok(id) => Mode::Runs { id, scroll: None, stop: false },
         Err(e) => Mode::Result(format!("✗ {e}")),
@@ -6463,6 +6465,94 @@ deep_check_end=1
         let mut stopped = stops.0.lock().unwrap().clone();
         stopped.sort();
         assert_eq!(stopped, ["rp1", "rp2"]);
+    }
+
+    /// The form's `y` runs `arena pods up` — the `arena` beside the dashboard (a stub here),
+    /// with the dashboard's config, the form's provider and its flags — in the background: its
+    /// lines reach the runs panel, a created pod shows as a pending row, each pod's verdict and
+    /// the exit are said, its output is in a file of its own (0600). `s`, `y` in the panel sends
+    /// a run Ctrl+C — SIGINT to its process group, which `up` takes as "stop where you are".
+    #[tokio::test]
+    async fn the_form_runs_pods_up_and_the_panel_follows_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("arena-tui-runs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("arena");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n\
+             echo \"args: $*\"\n\
+             case \"$*\" in\n\
+             *'pods start'*)\n\
+               trap 'echo \"[devtest-alpha] STOPPED at setup (Ctrl+C) — left as it is\"; exit 130' INT\n\
+               echo waiting\n\
+               while :; do sleep 0.05; done ;;\n\
+             esac\n\
+             echo '[created] devtest-echo id=9 on cx33 (€0.0160/h)'\n\
+             echo '[devtest-echo] setup ✓ (2m)'\n\
+             echo '[devtest-echo] READY after 3m — proxy :9504'\n\
+             echo '[devtest-foxtrot] FAILED endpoint: no SSH after 600s' >&2\n\
+             exit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shared = Arc::new(Mutex::new(fixture_shared()));
+        let mut ui = ui(cfg("HETZNER_API_KEY=x\n"), Arc::new(FakeRemote::new()));
+        ui.cli = Ok(runs::Cli { exe: stub.clone(), config: "/test/config.env".into(), dir: dir.join("runs") });
+        async fn ended(shared: &Mutex<Shared>, id: u64, line: Option<&str>) -> bool {
+            for _ in 0..200 {
+                {
+                    let s = shared.lock().unwrap();
+                    let r = s.runs.iter().find(|r| r.id == id).unwrap();
+                    if line.map_or(!r.running(), |l| r.lines.iter().any(|x| x == l)) {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            false
+        }
+
+        // The form on Hetzner (the only provider with a key), Enter, then `y`.
+        newpod::open(&mut ui, &shared);
+        assert!(newpod::key(&mut ui, &shared, KeyCode::Enter));
+        assert!(matches!(ui.mode, Mode::UpConfirm(_)), "{:?}", ui.mode);
+        assert!(newpod::key(&mut ui, &shared, KeyCode::Char('y')));
+        let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        assert!(ended(&shared, id, None).await, "the run never ended");
+        {
+            let s = shared.lock().unwrap();
+            let r = s.runs.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(
+                r.lines.front().map(String::as_str),
+                Some("args: --config /test/config.env --provider hetzner pods up --add 1 --server-type cx33 --yes")
+            );
+            assert_eq!(r.end.as_ref().map(|(_, e)| e.clone()), Some(runs::End::Code(1)));
+            assert_eq!(r.tally(), "1 ready, 1 failed");
+            assert_eq!(r.pods[0], ("devtest-echo".to_string(), runs::PodState::Ready("after 3m — proxy :9504".into())));
+            assert!(s.pending.iter().any(|p| p.name == "devtest-echo" && p.provider == "hetzner"), "a pending row at once");
+            assert_eq!(s.notice.as_ref().map(|n| n.text.as_str()), Some("✗ pods up: exit 1 — 1 ready, 1 failed — [p] shows it"));
+            let mode = std::fs::metadata(&r.log).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", r.log.display());
+            assert!(std::fs::read_to_string(&r.log).unwrap().contains("FAILED endpoint"), "stderr too");
+        }
+
+        // A run that waits; `s` asks, `y` sends it Ctrl+C.
+        let alpha = shared.lock().unwrap().pods.iter().find(|p| p.name == "devtest-alpha").cloned().unwrap();
+        start_cli_action(&mut ui, &shared, Action::Start, &alpha, None);
+        let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        assert!(ended(&shared, id, Some("waiting")).await, "it never started");
+        assert!(matches!(runs::key(&mut ui, &shared, KeyCode::Char('s')), runs::Flow::Handled));
+        assert!(matches!(ui.mode, Mode::Runs { stop: true, .. }), "{:?}", ui.mode);
+        assert!(matches!(runs::key(&mut ui, &shared, KeyCode::Char('y')), runs::Flow::Handled));
+        assert!(ended(&shared, id, None).await, "Ctrl+C didn't end it");
+        let s = shared.lock().unwrap();
+        let r = s.runs.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(r.lines.front().map(String::as_str), Some("args: --config /test/config.env --provider runpod pods start devtest-alpha --yes"));
+        assert_eq!((r.end.as_ref().map(|(_, e)| e.clone()), r.tally()), (Some(runs::End::Code(130)), "1 stopped".to_string()));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The human (2026-10-29): "i switch between runpod / vast / hetzner and its laggy". The
