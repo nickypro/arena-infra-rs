@@ -37,6 +37,18 @@ earlier).
 - `HETZNER_SERVER_TYPE`'s default is now `cx33` (4 vCPU, 8 GB), was `cx23` (2 vCPU, 4 GB): new
   Hetzner VMs cost about 1.5× as much. Set `HETZNER_SERVER_TYPE=cx23` to keep the old size.
 
+## 2026-10-29 · No more "command not found: conda" on Hetzner VMs
+- A Hetzner VM's `~/.zshrc` no longer has conda's init block or `conda activate arena-env` (it came
+  from the GPU image's shared rc; a VM has no conda, so every login printed an error). The uv env
+  is activated as before, now even with a `conda` on PATH (the old block skipped it then). A
+  conda a participant installed themselves (its own `conda init` block) is left alone.
+- Re-running `arena pods setup` on a VM no longer overwrites `~/.zshrc`: it takes the conda lines
+  out of the VM's own, keeping the API-key exports `copy-keys` put there and anything the
+  participant added. Until now a re-run dropped those keys from zsh until the next `copy-keys`.
+  Only oh-my-zsh's untouched template is replaced outright; a `~/.zshrc` that isn't arena's is
+  saved as `~/.zshrc.pre-arena-<time>` before it's replaced.
+- VMs set up before this get it at their next `arena pods setup`.
+
 ## 2026-10-29 · RunPod's rate limits are respected, and REST v1 ends on 2026-11-16
 - RunPod limits every API since 2026-10-27, per key, shared by every dashboard and cron on it.
   arena now waits out a `429` (what RunPod asks, else 1, 2, 4… s) and retries it up to 3 times,
