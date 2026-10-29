@@ -1,7 +1,7 @@
 //! RunPod backend, talking to the REST API (https://rest.runpod.io/v1), plus GraphQL for
 //! the few things REST can't do (restart-free rename, GPU catalog/prices, host details).
 //!
-//! RunPod retires REST v1 on 2026-11-15; its replacement is [`super::runpod_v2`], the
+//! RunPod retires REST v1 on 2026-11-16; its replacement is [`super::runpod_v2`], the
 //! default — this backend is used only with an explicit `RUNPOD_API=v1` (see
 //! [`super::RunpodApi`]). Of the GraphQL helpers here only the pod details (maintenance
 //! windows) are shared with it, plus the network-volume listing as its fallback — v2 renames
@@ -13,13 +13,13 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use reqwest::{Client, RequestBuilder};
+use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Value};
 
-use super::{ContainerReset, Provider, RUNPOD_V1_REMEDY};
+use super::{ContainerReset, Provider, RUNPOD_V1_REMEDY, RUNPOD_V1_RETIREMENT};
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, ProviderErrorKind, Result};
-use crate::http::{send_json, send_ok};
+use crate::http::{judge, send_json_with, send_limited, status_error, Limits};
 use crate::pod::{Maintenance, Pod, PodSpec};
 
 pub(crate) const BASE: &str = "https://rest.runpod.io/v1";
@@ -58,8 +58,47 @@ pub(crate) fn balance_request(client: &Client, url: &str, api_key: &str, minimal
 /// (first, before decoding — see [`crate::http`]): a GraphQL error still comes back as HTTP
 /// 200, and whether `errors` is fatal depends on the caller (a mutation must fail on any; a
 /// read query can use partial `data`) — see [`graphql_errors`].
+///
+/// Through the rate-limit-aware path ([`crate::http::exchange`]) with RunPod's [`Limits`]: a
+/// 429 is retried (a mutation too — it was refused before running); a 5xx or a lost
+/// connection isn't (a POST, query or not).
 async fn graphql(client: &Client, api_key: &str, body: &Value, ctx: &str) -> Result<Value> {
-    send_json(graphql_request(client, api_key, body), ctx).await
+    send_json_with(graphql_request(client, api_key, body), ctx, &Limits::RUNPOD).await
+}
+
+/// A REST v1 call through the rate-limit-aware path (RunPod's [`Limits`]): its JSON body, or
+/// the classified error ([`v1_error`]). Status first, as [`crate::http::send_json`].
+async fn v1_json(rb: RequestBuilder, ctx: &str) -> Result<Value> {
+    let resp = send_limited(rb, ctx, &Limits::RUNPOD).await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(v1_error(status, &text, ctx));
+    }
+    judge(status, &resp.text().await?, ctx)
+}
+
+/// [`v1_json`] for calls whose success body we don't use: only the status is judged.
+async fn v1_ok(rb: RequestBuilder, ctx: &str) -> Result<()> {
+    let resp = send_limited(rb, ctx, &Limits::RUNPOD).await?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let text = resp.text().await.unwrap_or_default();
+    Err(v1_error(status, &text, ctx))
+}
+
+/// The error for a non-2xx REST v1 answer: [`status_error`]'s — except `410 Gone`, what every
+/// v1 request gets once RunPod has sunset it ([`RUNPOD_V1_RETIREMENT`]): a config error that
+/// says v1 is gone and how to leave it, never a provider failure to retry. Pure.
+pub(crate) fn v1_error(status: StatusCode, text: &str, ctx: &str) -> Error {
+    if status == StatusCode::GONE {
+        return Error::Config(format!(
+            "{ctx}: RunPod REST v1 is gone (HTTP 410 — RunPod sunset it on {RUNPOD_V1_RETIREMENT}): {RUNPOD_V1_REMEDY}"
+        ));
+    }
+    status_error(status, text, ctx)
 }
 
 /// The GraphQL-level errors in a response, as one message (`None` when there are none —
@@ -334,7 +373,7 @@ impl Provider for RunpodProvider {
     async fn list_pods(&self) -> Result<Vec<Pod>> {
         // Status first, then decode (crate::http): a bad key's 401 must read as Auth, not
         // as "error decoding response body".
-        let body = send_json(self.auth(self.client.get(format!("{}/pods", self.base))), "list pods").await?;
+        let body = v1_json(self.auth(self.client.get(format!("{}/pods", self.base))), "list pods").await?;
         Ok(pods_array(&body)?.iter().map(parse_pod).collect())
     }
 
@@ -345,12 +384,12 @@ impl Provider for RunpodProvider {
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
         let payload = create_payload(spec)?;
         let rb = self.auth(self.client.post(format!("{}/pods", self.base)).json(&payload));
-        let body = send_json(rb, "create pod").await?;
+        let body = v1_json(rb, "create pod").await?;
         Ok(parse_pod(&body))
     }
 
     async fn stop_pod(&self, id: &str) -> Result<()> {
-        send_ok(self.auth(self.client.post(format!("{}/pods/{id}/stop", self.base))), "stop pod").await
+        v1_ok(self.auth(self.client.post(format!("{}/pods/{id}/stop", self.base))), "stop pod").await
     }
 
     fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
@@ -361,7 +400,7 @@ impl Provider for RunpodProvider {
         // Live 2026-10-09, twice (with and without a volume): a v1 restart kept the container
         // disk — marker files survived and `/.dockerenv` was unchanged while PID 1 restarted.
         // RunPod still documents the container disk as ephemeral and v2's restart does reset
-        // it, so it stays gated like a wipe (v1 retires 2026-11-15) — but nothing says it was.
+        // it, so it stays gated like a wipe (v1 retires 2026-11-16) — but nothing says it was.
         ContainerReset::Unknown
     }
 
@@ -369,17 +408,17 @@ impl Provider for RunpodProvider {
         // Dedicated restart endpoint: restarts the container on the same pod/machine
         // (same id and GPU), unlike stop/start which deallocates. Whether it keeps the
         // container disk isn't something to rely on (see `restart_resets_container`).
-        send_ok(self.auth(self.client.post(format!("{}/pods/{id}/restart", self.base))), "restart pod").await
+        v1_ok(self.auth(self.client.post(format!("{}/pods/{id}/restart", self.base))), "restart pod").await
     }
 
     async fn start_pod(&self, id: &str) -> Result<()> {
         // "Start or resume a Pod" — the way back from a stop. Not `/restart`: on an EXITED
         // pod that answered 2xx and left it stopped (live 2026-10-08).
-        send_ok(self.auth(self.client.post(format!("{}/pods/{id}/start", self.base))), "start pod").await
+        v1_ok(self.auth(self.client.post(format!("{}/pods/{id}/start", self.base))), "start pod").await
     }
 
     async fn terminate_pod(&self, id: &str) -> Result<()> {
-        send_ok(self.auth(self.client.delete(format!("{}/pods/{id}", self.base))), "terminate pod").await
+        v1_ok(self.auth(self.client.delete(format!("{}/pods/{id}", self.base))), "terminate pod").await
     }
 
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
@@ -390,11 +429,11 @@ impl Provider for RunpodProvider {
         // REST `PATCH /pods/{id}` resets the container (see `rename_pod`): exactly what a
         // reimage wants. `env` replaces the pod's env wholesale, so pass everything to keep.
         let body = reimage_payload(image, env);
-        send_ok(self.auth(self.client.patch(format!("{}/pods/{id}", self.base))).json(&body), "reimage pod").await
+        v1_ok(self.auth(self.client.patch(format!("{}/pods/{id}", self.base))).json(&body), "reimage pod").await
     }
 
     async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
-        let body = send_json(self.auth(self.client.get(format!("{}/pods/{id}", self.base))), "get pod").await?;
+        let body = v1_json(self.auth(self.client.get(format!("{}/pods/{id}", self.base))), "get pod").await?;
         Ok(parse_spec(&body))
     }
 
@@ -829,7 +868,7 @@ pub async fn fetch_gpu_types(api_key: &str) -> Result<Vec<GpuType>> {
 /// one of …"). `arena gpus` intersects with this so it only advertises creatable types.
 pub async fn fetch_creatable_gpu_ids(api_key: &str) -> Result<Vec<String>> {
     let client = Client::new();
-    let spec = send_json(client.get(format!("{BASE}/openapi.json")).bearer_auth(api_key), "fetch openapi").await?;
+    let spec = v1_json(client.get(format!("{BASE}/openapi.json")).bearer_auth(api_key), "fetch openapi").await?;
     Ok(extract_gpu_enum(&spec))
 }
 
@@ -1055,6 +1094,26 @@ mod tests {
         let e = p.start_pod("p1").await.unwrap_err().to_string();
         assert!(e.contains("start pod HTTP 500") && e.contains("not enough free GPUs"), "{e}");
         assert_eq!(*srv.requests.lock().unwrap(), ["POST /pods/p1/start HTTP/1.1", "POST /pods/p1/start HTTP/1.1"]);
+    }
+
+    /// RunPod sunsets REST v1 on 2026-11-16: from then every v1 request answers `410 Gone`.
+    /// That is a config error saying v1 is gone and how to leave it (not a provider failure
+    /// a retry loop would wait out), for a read and a write alike.
+    #[tokio::test]
+    async fn v1_answering_410_says_it_is_gone_and_to_remove_runpod_api() {
+        use crate::http::test_server::{canned, client, serve};
+        let gone = r#"{"error":"REST v1 has been sunset"}"#;
+        let srv = serve(vec![canned(410, "application/json", gone), canned(410, "application/json", gone)]);
+        let p = RunpodProvider::with_base("rpa_K", &srv.base, client());
+        for e in [p.list_pods().await.unwrap_err(), p.stop_pod("p1").await.unwrap_err()] {
+            assert!(matches!(e, Error::Config(_)), "{e:?}");
+            let msg = e.to_string();
+            assert!(msg.contains("RunPod REST v1 is gone") && msg.contains("2026-11-16"), "{msg}");
+            assert!(msg.contains(RUNPOD_V1_REMEDY), "{msg}");
+        }
+        assert_eq!(srv.requests.lock().unwrap().len(), 2, "never retried");
+        // Any other status keeps its classification.
+        assert_eq!(v1_error(StatusCode::NOT_FOUND, "pod not found", "get pod").kind(), Some(ProviderErrorKind::Other));
     }
 
     #[test]
