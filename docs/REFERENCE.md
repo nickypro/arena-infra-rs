@@ -210,7 +210,7 @@ because it matches both `pods` and `proxy` (use `po`/`pr`); likewise `c` →
 `config`/`cron` (use `co`/`cr`), and `arena po l` → `list`/`lock`/`logs`.
 
 `arena --help` and `arena pods --help` list their commands in groups — `pods`: Look, Make,
-Change, Move, Save, Stop; the top level: Fleet, Money, Access, Automation, Setup. A test keeps
+Change, Move, Save, Stop; the top level: Fleet, Access, Money, Automation, Setup. A test keeps
 every visible command in exactly one group. Hidden: `gpus`, the old name for `offers --all`.
 clap's own `help` command isn't listed (`-h`/`--help` are); `arena help pods` still works.
 

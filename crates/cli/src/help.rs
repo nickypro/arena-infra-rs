@@ -17,8 +17,8 @@ type Groups = &'static [(&'static str, &'static [&'static str])];
 /// `arena --help`. Every visible top-level command is in exactly one group (a test checks).
 pub(crate) const TOP: Groups = &[
     ("Fleet", &["pods", "tui", "snapshot"]),
-    ("Money", &["offers", "balance", "teardown"]),
     ("Access", &["proxy", "ssh-config", "keys"]),
+    ("Money", &["offers", "balance", "teardown"]),
     ("Automation", &["cron", "plan", "archive"]),
     ("Setup", &["config", "update", "api"]),
 ];
@@ -176,7 +176,7 @@ mod tests {
     fn top_help_lists_its_commands_in_groups() {
         let text = help(&["arena", "--help"]);
         let headings: Vec<&str> = text.lines().filter(|l| l.ends_with(':') && !l.starts_with(' ')).collect();
-        assert_eq!(headings, ["Fleet:", "Money:", "Access:", "Automation:", "Setup:", "Options:"], "{text}");
+        assert_eq!(headings, ["Fleet:", "Access:", "Money:", "Automation:", "Setup:", "Options:"], "{text}");
         assert!(text.contains("\n  offers      ") && !text.contains("gpus"), "{text}");
         // Each listed line, as `command_list` writes it, is in the help as written: no brace in
         // an about or alias turned into a template tag.
