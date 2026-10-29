@@ -57,15 +57,20 @@ pub struct HetznerOpts {
     pub image_scope: crate::image::Scope,
 }
 
+/// The server type a create asks for when neither `--server-type` nor `HETZNER_SERVER_TYPE`
+/// names one — what the CLI and the dashboard's add-pod form both start from. cx33: the
+/// current-generation Intel **x86** shared vCPU line (the old cx/cax lines had poor
+/// availability) at 4 vCPU / 8 GB. It was cx23 (2 vCPU / 4 GB) until 2026-10-29, when the
+/// human asked for cx33: 4 GB is tight for the course's notebooks next to the editor server.
+pub const DEFAULT_SERVER_TYPE: &str = "cx33";
+
 impl Default for HetznerOpts {
     fn default() -> Self {
         Self {
-            // cx23: newest Intel **x86** shared vCPU (2 vCPU / 4 GB). The old cx/cax lines
-            // had poor availability; cx23 is the current gen. Override via
-            // HETZNER_SERVER_TYPE. Any location that sells it ([`Locations::ANY`]): never
-            // Hetzner's own auto-placement, which could land an EU-only x86 type on a US DC
-            // and fail with "error during placement".
-            server_type: "cx23".into(),
+            // [`DEFAULT_SERVER_TYPE`], in any location that sells it ([`Locations::ANY`]):
+            // never Hetzner's own auto-placement, which could land an EU-only x86 type on a
+            // US DC and fail with "error during placement".
+            server_type: DEFAULT_SERVER_TYPE.into(),
             image: "ubuntu-24.04".into(),
             locations: Locations::ANY,
             ssh_keys: Vec::new(),
@@ -1485,7 +1490,7 @@ mod tests {
     }
 
     /// `--server-type` (`spec.server_type`) is the create body's `server_type` and what the
-    /// dry run describes; without it, `HETZNER_SERVER_TYPE` (else cx23) as before.
+    /// dry run describes; without it, `HETZNER_SERVER_TYPE` (else cx33) as before.
     #[test]
     fn the_server_type_flag_goes_into_the_create_body_over_config() {
         let opts = HetznerOpts::from_config(&crate::config::Config::parse("HETZNER_SERVER_TYPE=cx33\n"));
@@ -1496,7 +1501,7 @@ mod tests {
             assert_eq!(p.preview_create_body(&spec("devtest-a", flag)).unwrap()["server_type"], want);
             assert!(p.describe(&spec("devtest-a", flag)).starts_with(&format!("{want} CPU VM")), "{flag:?}");
         }
-        assert_eq!(create_payload(&HetznerOpts::default(), &spec("x", None), None, None).unwrap()["server_type"], "cx23");
+        assert_eq!(create_payload(&HetznerOpts::default(), &spec("x", None), None, None).unwrap()["server_type"], "cx33");
     }
 
     /// The options as `build` reads them: the default key named after the prefix — and that
@@ -1508,7 +1513,7 @@ mod tests {
         let o = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=arena9\nSHARED_SSH_KEY_PATH=/k/arena9_key\n"));
         assert_eq!((o.ssh_keys.as_slice(), o.ssh_keys_from), (&["arena9".to_string()][..], "MACHINE_NAME_PREFIX"));
         assert_eq!(o.pubkey_file.as_deref(), Some("/k/arena9_key.pub"));
-        assert_eq!((o.server_type.as_str(), o.image.as_str(), &o.locations), ("cx23", "ubuntu-24.04", &Locations::ANY));
+        assert_eq!((o.server_type.as_str(), o.image.as_str(), &o.locations), ("cx33", "ubuntu-24.04", &Locations::ANY));
         let o = HetznerOpts::from_config(&crate::config::Config::parse(
             "MACHINE_NAME_PREFIX=arena9\nHETZNER_SSH_KEY=arena8\nHETZNER_LOCATION=fsn1\nHETZNER_SERVER_TYPE=cpx42\n",
         ));
@@ -2016,7 +2021,7 @@ mod tests {
             canned(412, "application/json", full),
             canned(201, "application/json", &server_created("devtest-a", "fsn1")),
         ]);
-        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\n"));
+        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\nHETZNER_SERVER_TYPE=cx23\n"));
         let pod = provider(&srv.base, opts).create_pod(&spec("devtest-a", None)).await.unwrap();
         assert_eq!((pod.id.as_str(), pod.name.as_str(), pod.ssh_ip.as_deref()), ("77", "devtest-a", Some("203.0.113.9")));
         assert_eq!(
@@ -2045,7 +2050,7 @@ mod tests {
             canned(200, "application/json", keys),
             canned(200, "application/json", SERVER_TYPES),
         ]);
-        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\n"));
+        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\nHETZNER_SERVER_TYPE=cx23\n"));
         let e = provider(&srv.base, opts).create_pod(&spec("devtest-a", None)).await.unwrap_err();
         let m = e.to_string();
         assert_eq!(e.kind(), Some(K::Capacity), "{m}");
@@ -2056,7 +2061,7 @@ mod tests {
         assert_eq!(sent_locations(&srv), [Some("nbg1".into()), Some("fsn1".into()), Some("hel1".into())]);
 
         let srv = serve(vec![canned(412, "application/json", &full("hel1")), canned(200, "application/json", keys), canned(200, "application/json", SERVER_TYPES)]);
-        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\nHETZNER_LOCATION=hel1\n"));
+        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\nHETZNER_LOCATION=hel1\nHETZNER_SERVER_TYPE=cx23\n"));
         let e = provider(&srv.base, opts).create_pod(&spec("devtest-a", None)).await.unwrap_err();
         assert_eq!(e.kind(), Some(K::Capacity), "{e}");
         assert_eq!(sent_locations(&srv), [Some("hel1".into())], "pinned: no catalog read, no other location");
@@ -2070,7 +2075,7 @@ mod tests {
     async fn a_refusal_that_isnt_about_room_stops_the_walk() {
         use crate::error::ProviderErrorKind as K;
         use crate::http::test_server::{canned, serve};
-        let opts = || HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\n"));
+        let opts = || HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\nHETZNER_SERVER_TYPE=cx23\n"));
         for (status, kind) in [(401, K::Auth), (429, K::RateLimited), (503, K::Transient)] {
             let srv = serve(vec![canned(200, "application/json", SERVER_TYPES), canned(status, "application/json", r#"{"error":{"code":"x","message":"no"}}"#)]);
             // No time to wait out a throttle here: the 429 is the caller's at once.
@@ -2124,8 +2129,8 @@ mod tests {
     fn the_preview_says_where_a_create_goes() {
         let p = |text: &str| HetznerProvider::new("k", HetznerOpts::from_config(&crate::config::Config::parse(text)));
         let s = spec("devtest-a", None);
-        assert_eq!(p("HETZNER_LOCATION=nbg1\n").describe(&s), "cx23 CPU VM, image ubuntu-24.04, location nbg1");
-        assert_eq!(p("").describe(&s), "cx23 CPU VM, image ubuntu-24.04, location any (nearest first, the next when one has no room)");
+        assert_eq!(p("HETZNER_LOCATION=nbg1\n").describe(&s), "cx33 CPU VM, image ubuntu-24.04, location nbg1");
+        assert_eq!(p("").describe(&s), "cx33 CPU VM, image ubuntu-24.04, location any (nearest first, the next when one has no room)");
         assert_eq!(p("").preview_create_body(&s).unwrap().get("location"), None);
         assert_eq!(p("HETZNER_LOCATION=hel1,any\n").preview_create_body(&s).unwrap()["location"], "hel1");
     }
@@ -2208,7 +2213,7 @@ mod tests {
     async fn an_offer_is_what_a_create_would_get() {
         use crate::http::test_server::{canned, serve};
         let srv = serve(vec![canned(200, "application/json", SERVER_TYPES); 3]);
-        let mut p = provider(&srv.base, HetznerOpts::default());
+        let mut p = provider(&srv.base, HetznerOpts { server_type: "cx23".into(), ..HetznerOpts::default() });
         p.distances = Distances::known(&[("hel1", 1), ("fsn1", 24), ("nbg1", 26)]);
         let cx23 = p.offer(&spec("devtest-a", None)).await.unwrap();
         assert_eq!(

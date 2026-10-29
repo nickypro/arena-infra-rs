@@ -225,7 +225,7 @@ pub fn fill_tone(f: Fill) -> Option<Tone> {
 }
 
 /// `1 pod`, `0 pods`, `3 GPUs` — the bar said `1 pods`.
-fn count_of(n: usize, one: &str, many: &str) -> String {
+pub fn count_of(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
@@ -774,159 +774,6 @@ pub fn short_branch(branch: &str, prefix: &str) -> String {
     }
 }
 
-/// One provider choice in the add-pod form, with whether its API key is configured.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProviderOpt {
-    pub name: String,
-    pub available: bool,
-}
-
-/// The editable fields of the add-pod form, in display order. Which ones apply depends
-/// on the chosen provider (no cloud type except RunPod; no GPU fields on Hetzner).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NpField {
-    Provider,
-    CloudType,
-    GpuType,
-    GpuCount,
-    Disk,
-    Volume,
-    Pods,
-}
-
-/// State of the interactive add-pod form: `↑↓` moves between [`NpField`]s, `←→` changes
-/// the selected field's value. All pure — `main` owns the provider build / listing.
-#[derive(Debug, Clone)]
-pub struct NewPodForm {
-    pub providers: Vec<ProviderOpt>,
-    pub provider_idx: usize,
-    pub cloud_types: Vec<String>,
-    pub cloud_idx: usize,
-    pub gpu_types: Vec<String>,
-    pub gpu_idx: usize,
-    pub gpu_count: u32,
-    /// Container disk size in GB (adjusted in 50GB steps) — the main storage knob.
-    pub disk_gb: u32,
-    /// Persistent volume size in GB (0 = none, the default); 100GB steps.
-    pub volume_gb: u32,
-    pub count: usize,
-    /// Free machine names available on the selected provider (for the count cap).
-    pub free: Vec<String>,
-    /// Index into [`Self::fields`] of the currently-selected field.
-    pub field: usize,
-}
-
-fn wrap(idx: usize, delta: i32, len: usize) -> usize {
-    if len == 0 {
-        0
-    } else {
-        (idx as i32 + delta).rem_euclid(len as i32) as usize
-    }
-}
-
-impl NewPodForm {
-    pub fn provider_name(&self) -> &str {
-        self.providers.get(self.provider_idx).map(|p| p.name.as_str()).unwrap_or("runpod")
-    }
-
-    fn is_runpod(&self) -> bool {
-        self.provider_name() == "runpod"
-    }
-
-    /// GPU providers take GPU type/count; Hetzner is CPU-only.
-    fn is_gpu(&self) -> bool {
-        self.provider_name() != "hetzner"
-    }
-
-    /// The fields that apply to the current provider, in display order.
-    pub fn fields(&self) -> Vec<NpField> {
-        let mut f = vec![NpField::Provider];
-        if self.is_runpod() {
-            f.push(NpField::CloudType);
-        }
-        if self.is_gpu() {
-            f.push(NpField::GpuType);
-            f.push(NpField::GpuCount);
-            f.push(NpField::Disk);
-            f.push(NpField::Volume);
-        }
-        f.push(NpField::Pods);
-        f
-    }
-
-    pub fn selected(&self) -> NpField {
-        let f = self.fields();
-        f[self.field.min(f.len() - 1)]
-    }
-
-    pub fn move_field(&mut self, delta: i32) {
-        let n = self.fields().len();
-        self.field = wrap(self.field, delta, n);
-    }
-
-    /// Change the selected field's value by `delta` (−1 left / +1 right). Returns true
-    /// if the *provider* changed, since the caller must then re-list free names.
-    pub fn change(&mut self, delta: i32) -> bool {
-        match self.selected() {
-            NpField::Provider => {
-                self.cycle_provider(delta);
-                // The field set may have shrunk (e.g. → Hetzner); keep `field` valid.
-                let n = self.fields().len();
-                self.field = self.field.min(n - 1);
-                return true;
-            }
-            NpField::CloudType => self.cloud_idx = wrap(self.cloud_idx, delta, self.cloud_types.len()),
-            NpField::GpuType => self.gpu_idx = wrap(self.gpu_idx, delta, self.gpu_types.len()),
-            NpField::GpuCount => self.gpu_count = (self.gpu_count as i32 + delta).clamp(1, 8) as u32,
-            // Container disk in 50GB steps, 20–2000GB.
-            NpField::Disk => self.disk_gb = (self.disk_gb as i32 + delta * 50).clamp(20, 2000) as u32,
-            // Volume in 100GB steps, 0 (none) up to 2000GB.
-            NpField::Volume => self.volume_gb = (self.volume_gb as i32 + delta * 100).clamp(0, 2000) as u32,
-            NpField::Pods => {
-                let max = self.free.len().max(1) as i32;
-                self.count = (self.count as i32 + delta).clamp(1, max) as usize;
-            }
-        }
-        false
-    }
-
-    /// Step to the next available provider in `delta`'s direction, skipping any whose
-    /// API key isn't configured (so you can't select an unusable provider).
-    fn cycle_provider(&mut self, delta: i32) {
-        let n = self.providers.len() as i32;
-        if n == 0 {
-            return;
-        }
-        let step = if delta < 0 { -1 } else { 1 };
-        let mut idx = self.provider_idx as i32;
-        for _ in 0..n {
-            idx = (idx + step).rem_euclid(n);
-            if self.providers[idx as usize].available {
-                self.provider_idx = idx as usize;
-                return;
-            }
-        }
-    }
-
-    /// The selected cloud type, only meaningful for RunPod.
-    pub fn cloud_type(&self) -> Option<&str> {
-        if self.is_runpod() {
-            self.cloud_types.get(self.cloud_idx).map(String::as_str)
-        } else {
-            None
-        }
-    }
-
-    pub fn gpu_type(&self) -> &str {
-        self.gpu_types.get(self.gpu_idx).map(String::as_str).unwrap_or("")
-    }
-
-    /// The names that would be created for the current count.
-    pub fn planned_names(&self) -> Vec<String> {
-        self.free.iter().take(self.count).cloned().collect()
-    }
-}
-
 /// The actions a user can trigger against the selected pod from the dashboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -941,6 +788,16 @@ pub enum Action {
     Run,
     /// Gently switch the ARENA checkout to a branch (the operator types it first).
     SetBranch,
+    // The CLI's own commands, run as `arena` in the background (`runs.rs`), their output in the
+    // runs panel — the dashboard's way to them, not a second copy.
+    /// `pods start`: a stopped pod back, set up again.
+    Start,
+    /// `pods rename <pod> <new>` (the operator types the new name first).
+    Rename,
+    /// `pods jobs`: its background jobs (read-only).
+    Jobs,
+    /// `pods logs`: its newest job's log (read-only).
+    Logs,
 }
 
 impl Action {
@@ -948,10 +805,14 @@ impl Action {
     /// so the default-highlighted top option is the read-only `test`), with their keys.
     pub const MENU: &'static [(char, Action)] = &[
         ('e', Action::Test),
+        ('w', Action::Jobs),
+        ('l', Action::Logs),
         ('x', Action::Run),
         ('g', Action::SetBranch),
+        ('m', Action::Rename),
         ('b', Action::Backup),
         ('p', Action::Setup),
+        ('u', Action::Start),
         ('r', Action::Restart),
         ('s', Action::Stop),
         ('t', Action::Terminate),
@@ -965,7 +826,12 @@ impl Action {
     /// (`restart`, `stop`, `terminate`) only for a marked set — never for "the whole fleet" in
     /// one keystroke ([`Self::marked_set_only`]).
     pub fn fleet_menu(has_marked: bool) -> Vec<(char, Action)> {
-        Self::MENU.iter().copied().filter(|(_, a)| !a.marked_set_only() || has_marked).collect()
+        Self::MENU.iter().copied().filter(|(_, a)| !a.cli() && (!a.marked_set_only() || has_marked)).collect()
+    }
+
+    /// One of the CLI's commands, run as `arena` (`runs.rs`) — the cursor pod's menu only.
+    pub fn cli(&self) -> bool {
+        matches!(self, Action::Start | Action::Rename | Action::Jobs | Action::Logs)
     }
 
     /// Whether a multi-pod run is offered only for a marked set, and a big one (or every listed
@@ -996,6 +862,10 @@ impl Action {
             Action::Test => "torch version (read-only)",
             Action::Run => "run a shell command",
             Action::SetBranch => "switch branch",
+            Action::Start => "start a stopped pod (+ setup)",
+            Action::Rename => "rename (no restart)",
+            Action::Jobs => "its background jobs (read-only)",
+            Action::Logs => "its newest job's log (read-only)",
         }
     }
 
@@ -1009,6 +879,10 @@ impl Action {
             Action::Test => "test",
             Action::Run => "run",
             Action::SetBranch => "set-branch",
+            Action::Start => "start",
+            Action::Rename => "rename",
+            Action::Jobs => "jobs",
+            Action::Logs => "logs",
         }
     }
 
@@ -1058,6 +932,7 @@ impl Action {
                 "⚠ a stopped RunPod pod keeps no data: its container disk is discarded and it starts \
                  again as a fresh image (only a /workspace volume survives).",
             ),
+            Action::Start => Some("it bills again once it's up; a RunPod/Vast pod comes back as a fresh image, and is set up again."),
             _ => None,
         }
     }
@@ -1065,7 +940,7 @@ impl Action {
     /// Actions that need a free-text argument typed first (the command / the branch),
     /// collected in an input modal before they run.
     pub fn needs_input(&self) -> bool {
-        matches!(self, Action::Run | Action::SetBranch)
+        matches!(self, Action::Run | Action::SetBranch | Action::Rename)
     }
 
     /// What the action does, in words an operator reads at a glance — the confirm's summary,
@@ -1086,6 +961,13 @@ impl Action {
             Action::Restart => "restart in place (a hard reset)".into(),
             Action::Stop => "stop (it can be started again)".into(),
             Action::Terminate => "terminate (delete)".into(),
+            Action::Start => "start it again (`arena pods start`: waits for it, sets it up, syncs the proxy)".into(),
+            Action::Rename => match arg {
+                Some(n) => format!("rename to {n} (`arena pods rename`: ~/.name, the proxy, its AI key)"),
+                None => "rename (`arena pods rename`)".into(),
+            },
+            Action::Jobs => "list its background jobs (read-only)".into(),
+            Action::Logs => "show its newest job's log (read-only)".into(),
         }
     }
 
@@ -1094,6 +976,7 @@ impl Action {
         match self {
             Action::Run => "shell command to run on the pod(s):",
             Action::SetBranch => "branch to switch to (fetch + checkout + fast-forward):",
+            Action::Rename => "new name — a free MACHINE_NAME_LIST name (bare names get the prefix):",
             _ => "",
         }
     }
@@ -1376,10 +1259,11 @@ mod tests {
         assert!(text.starts_with(" 1 pod · "), "{text}");
         assert!(text.ends_with("  ·  openrouter $422.09 left · AI today $1.50"), "{text}");
         assert_eq!(ai_tone(Some(&calm)), None);
-        let short = CohortUsage { credit_left: Some(5.0), at_cap: 2, ..calm.clone() };
+        let capped = |name: &str, pod: bool| arena_core::openrouter::CappedKey { name: name.into(), pod };
+        let short = CohortUsage { credit_left: Some(5.0), capped: vec![capped("arena8-gone", false), capped("arena8-apple", true)], ..calm.clone() };
         let text = summary_text(&s, &cost, &["vast".to_string()], &[], Some(&short));
         assert!(
-            text.starts_with(" ⚠ vast failed to list — its pods (and their cost) are missing · ⚠ openrouter $5.00 left, the keys' caps allow $8.00 more · ⚠ 2 AI keys at cap · 1 pod · "),
+            text.starts_with(" ⚠ vast failed to list — its pods (and their cost) are missing · ⚠ openrouter $5.00 left, the keys' caps allow $8.00 more · ⚠ 2 AI keys at cap: arena8-gone (no pod), arena8-apple · 1 pod · "),
             "{text}"
         );
         assert_eq!(ai_tone(Some(&short)), Some(Tone::Warn));
@@ -1503,6 +1387,10 @@ mod tests {
             (Action::Restart, None, "tuiprobe: restart in place (a hard reset)"),
             (Action::Stop, None, "tuiprobe: stop (it can be started again)"),
             (Action::Terminate, None, "tuiprobe: terminate (delete)"),
+            (Action::Start, None, "tuiprobe: start it again (`arena pods start`: waits for it, sets it up, syncs the proxy)"),
+            (Action::Rename, Some("bravo"), "tuiprobe: rename to bravo (`arena pods rename`: ~/.name, the proxy, its AI key)"),
+            (Action::Jobs, None, "tuiprobe: list its background jobs (read-only)"),
+            (Action::Logs, None, "tuiprobe: show its newest job's log (read-only)"),
         ];
         for (action, arg, want) in cases {
             assert_eq!(action_summary(action, &one, arg, 10), [want], "{action:?}");
@@ -1531,77 +1419,6 @@ mod tests {
         assert_eq!(display_name("arena8-apple", "arena8", false), "arena8-apple");
         // a name without the prefix is left as-is
         assert_eq!(display_name("apple", "arena8", true), "apple");
-    }
-
-    fn form() -> NewPodForm {
-        NewPodForm {
-            providers: vec![
-                ProviderOpt { name: "runpod".into(), available: true },
-                ProviderOpt { name: "vast".into(), available: false },
-                ProviderOpt { name: "hetzner".into(), available: true },
-            ],
-            provider_idx: 0,
-            cloud_types: vec!["COMMUNITY".into(), "SECURE".into()],
-            cloud_idx: 0,
-            gpu_types: vec!["RTX 3090".into(), "RTX 4090".into()],
-            gpu_idx: 0,
-            gpu_count: 1,
-            disk_gb: 100,
-            volume_gb: 0,
-            count: 1,
-            free: vec!["arena8-apple".into(), "arena8-autumn".into()],
-            field: 0,
-        }
-    }
-
-    #[test]
-    fn fields_depend_on_provider() {
-        let f = form();
-        assert_eq!(
-            f.fields(),
-            vec![
-                NpField::Provider,
-                NpField::CloudType,
-                NpField::GpuType,
-                NpField::GpuCount,
-                NpField::Disk,
-                NpField::Volume,
-                NpField::Pods
-            ]
-        );
-    }
-
-    #[test]
-    fn provider_cycle_skips_unavailable_and_reshapes_fields() {
-        let mut f = form();
-        // runpod -> (skip vast, no key) -> hetzner
-        assert!(f.change(1)); // provider changed
-        assert_eq!(f.provider_name(), "hetzner");
-        // hetzner is CPU-only: no cloud/gpu fields
-        assert_eq!(f.fields(), vec![NpField::Provider, NpField::Pods]);
-        assert_eq!(f.cloud_type(), None);
-    }
-
-    #[test]
-    fn change_clamps_gpu_count_and_pods() {
-        let mut f = form();
-        f.field = 3; // GpuCount
-        for _ in 0..20 {
-            f.change(1);
-        }
-        assert_eq!(f.gpu_count, 8); // capped
-        f.field = 4; // Disk (50GB steps)
-        f.change(1);
-        assert_eq!(f.disk_gb, 150);
-        f.field = 5; // Volume (100GB steps)
-        f.change(1);
-        f.change(1);
-        assert_eq!(f.volume_gb, 200);
-        f.field = 6; // Pods
-        for _ in 0..20 {
-            f.change(1);
-        }
-        assert_eq!(f.count, 2); // capped at free.len()
     }
 
     #[test]
@@ -2043,7 +1860,8 @@ mod tests {
             assert!(!fleet(false).iter().any(|(_, a)| *a == lifecycle), "{lifecycle:?} on the whole fleet: {:?}", fleet(false));
             assert!(lifecycle.marked_set_only());
         }
-        assert_eq!(fleet(true).len(), Action::MENU.len(), "a marked set gets every per-pod action");
+        assert_eq!(fleet(true).len(), Action::MENU.iter().filter(|(_, a)| !a.cli()).count(), "a marked set gets every per-pod action but the CLI's");
+        assert!(fleet(true).iter().all(|(_, a)| !a.cli()), "start/rename/jobs/logs: the cursor pod's menu only");
         assert!(!Action::Backup.marked_set_only() && !Action::Test.marked_set_only());
     }
 

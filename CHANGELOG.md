@@ -44,6 +44,29 @@ earlier).
 ### Config
 - `HETZNER_IMAGE` takes `arena` (new): the newest arena-built image in the project that fits.
 
+## 2026-10-29 · The dashboard keeps up, and its `n` makes pods with `arena pods up`
+- The dashboard handles every key already waiting before it draws again, so holding a key or
+  typing ahead no longer queues up (over SSH it could lag for seconds). Nothing in it waits on the
+  network any more: switching provider in the add-pod form is instant (it used to list the whole
+  fleet each time, about a second with the screen frozen).
+- `n`'s form now runs `arena pods up --add N … --yes` — the `arena` installed beside `arena-tui` —
+  so a pod made from the dashboard gets what `up` does: fallbacks, near the proxy, the endpoint
+  wait, proxy, setup, keys, and `--check` if you tick it. It runs in the background; `p` shows its
+  progress (each pod's READY/FAILED and the whole output), `s` there stops it (Ctrl+C: nothing is
+  terminated), and quitting while it runs asks whether to leave it running (the default) or stop it.
+- The form's type list comes from the provider's live catalogue (RunPod: B300s, MIG slices…; on
+  Hetzner, the server types with their size and price), and a line under it shows what `up` would
+  try for your choice, with prices and stock (`o` hides it).
+- On Hetzner the form picks the server type, `cx33` first.
+- The pod menu (`a`) also has start, rename, jobs and logs, run as the CLI's own commands.
+- The summary bar names the AI keys at their cap (`⚠ AI key at cap: arena9-foo (no pod)`: no pod
+  in the table has that key), and the detail pane lists them all and points at `arena keys list`.
+  A key with a $0 cap that hasn't spent anything is `paused`, not at its cap.
+
+### Config
+- `HETZNER_SERVER_TYPE`'s default is now `cx33` (4 vCPU, 8 GB), was `cx23` (2 vCPU, 4 GB): new
+  Hetzner VMs cost about 1.5× as much. Set `HETZNER_SERVER_TYPE=cx23` to keep the old size.
+
 ## 2026-10-29 · arena 2.1: `offers` lists everything on sale, compact help, Vast host classes
 - This is **arena 2.1** (a minor bump: `offers` and its `--json` changed shape; `update` offers it
   to every 2.0 build).
