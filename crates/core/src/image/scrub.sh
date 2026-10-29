@@ -69,8 +69,8 @@ for h in "${homes[@]}"; do
     fi
     # Tokens copy-keys or setup export in the shell rc files.
     # (Setup keeps a replaced ~/.zshrc as ~/.zshrc.pre-arena-<time>: those too.)
-    for rc in .bashrc .zshrc .profile .bash_profile .zprofile .zshenv .zshrc.pre-arena-*; do
-        [ -f "$h/$rc" ] && { sed -i -E '/^[[:space:]]*export[[:space:]]+(@TOKEN_VARS@)=/d' "$h/$rc" || die "couldn't edit $h/$rc"; }
+    for rc in "$h"/.bashrc "$h"/.zshrc "$h"/.profile "$h"/.bash_profile "$h"/.zprofile "$h"/.zshenv "$h"/.zshrc.pre-arena-*; do
+        [ -f "$rc" ] && { sed -i -E '/^[[:space:]]*export[[:space:]]+(@TOKEN_VARS@)=/d' "$rc" || die "couldn't edit $rc"; }
     done
     # Credentials the agents and libraries keep: Claude Code, Codex, Hugging Face, git, gh.
     rm -rf "$h/.claude.json" "$h/.claude.json.backup" "$h/.claude" "$h/.codex/auth.json" \

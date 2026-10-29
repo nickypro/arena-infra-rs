@@ -86,8 +86,7 @@ pub(crate) async fn repo_requirements(cfg: &Config) -> std::result::Result<(Stri
     let key = cfg.get("GIT_SSH_KEY_LOCAL").filter(|s| !s.is_empty()).ok_or("GIT_SSH_KEY_LOCAL isn't set")?;
     let key = arena_core::ssh::resolve_key_path(key);
     let branch = cfg.get("DEFAULT_BRANCH").unwrap_or("main");
-    let dir = std::env::temp_dir().join(format!("arena-image-req-{}-{}", std::process::id(), arena_core::snapshot::unix_now()));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("making {}: {e}", dir.display()))?;
+    let dir = private_temp_dir("arena-image-req")?;
     let result = async {
         let ssh = format!(
             "ssh -i {} -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={}",
@@ -131,6 +130,17 @@ pub(crate) async fn repo_requirements(cfg: &Config) -> std::result::Result<(Stri
     };
     let _ = std::fs::remove_dir_all(&dir);
     r
+}
+
+/// A new directory of this user's only (0700) in the temp dir, under a name nobody can guess
+/// ahead (the clock's nanoseconds and the pid): made with `mkdir`, never an existing path or a
+/// symlink someone left there — ssh writes its known_hosts into it, and git the repo's objects.
+fn private_temp_dir(tag: &str) -> std::result::Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("{tag}-{}-{nanos}", std::process::id()));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("making {}: {e}", dir.display()))?;
+    Ok(dir)
 }
 
 /// One word for `GIT_SSH_COMMAND` (a shell string).
@@ -407,6 +417,18 @@ fn per_gb(p: &ImagePrice) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The repo read's scratch dir is new, this user's only, and never a path that was there.
+    #[test]
+    fn the_temp_dir_is_private_and_never_reused() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = private_temp_dir("arena-test").unwrap();
+        assert_eq!(std::fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+        let again = private_temp_dir("arena-test").unwrap();
+        assert_ne!(d, again);
+        std::fs::remove_dir(&d).unwrap();
+        std::fs::remove_dir(&again).unwrap();
+    }
 
     /// `--image` is the VM's image on Hetzner (`arena`, an id, a name: one word) and the container
     /// image anywhere else, as before.
