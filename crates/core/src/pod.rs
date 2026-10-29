@@ -195,15 +195,17 @@ impl PodSpec {
     /// have). So a Vast/Hetzner operator can set `GPU_TYPE`/`DISK_GB`/etc. without
     /// touching the RunPod keys, while a pure-RunPod config keeps working unchanged.
     /// `name` is left empty for the caller to fill per machine. `env` is seeded with
-    /// `PUBLIC_KEY` (the shared SSH key's public half) so the created pod authorizes it
-    /// in `~/.ssh/authorized_keys` — without this, pods we create reject the shared key
-    /// and SSH (metrics/backup/setup) fails with "Permission denied".
+    /// `PUBLIC_KEY` (every machine's keys' public halves: shared, deploy and admin —
+    /// [`crate::ssh::authorized_pubkeys`]) so the created pod authorizes them in
+    /// `~/.ssh/authorized_keys` — without this, pods we create reject the shared key and SSH
+    /// (metrics/backup/setup) fails with "Permission denied". Every provider's create takes
+    /// them from here (Hetzner's by cloud-init).
     pub fn from_config(cfg: &Config) -> PodSpec {
         let first = |keys: &[&str]| keys.iter().find_map(|k| cfg.get(k).filter(|v| !v.is_empty()));
         let first_parsed =
             |keys: &[&str], default| keys.iter().find_map(|k| cfg.get_parsed(k)).unwrap_or(default);
         // RunPod adds PUBLIC_KEY (newline-joined) to ~/.ssh/authorized_keys at boot, so
-        // the created pod authorizes the shared key + the deploy key (the account's own
+        // the created pod authorizes the shared, deploy and admin keys (the account's own
         // key, e.g. arena_admin, is added by RunPod itself on REST v1; the v2 backend
         // merges the account's registered keys in, as v2 skips them when PUBLIC_KEY is set).
         let mut env = Vec::new();

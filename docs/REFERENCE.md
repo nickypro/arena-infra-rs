@@ -475,7 +475,10 @@ the next one with the same name.
 - An `--api-json` `datacenter` is one create where it says.
 
 VMs come up on a real public IP with SSH on `:22`, so they use the same proxy/`pods up` flow as GPU
-providers. A refused create is explained from the project (read-only `GET /ssh_keys` + `GET
+providers. Root lets in the project's key (`HETZNER_SSH_KEY`, else the one named after the prefix)
+and, by cloud-init (the create's `user_data`), every machine's keys — the shared, deploy and admin
+keys' public halves, as RunPod, Vast and Shadeform pods get them at create; an `--api-json`
+`user_data` replaces that one (setup still authorizes them). A refused create is explained from the project (read-only `GET /ssh_keys` + `GET
 /server_types`): a missing SSH key names the project's keys and what to set or upload; a type the
 location doesn't sell lists the ones it does.
 
@@ -1302,7 +1305,8 @@ not a hang.
 
 `ssh-config [--proxy] [--out]` — emit the **participant-facing `~/.ssh/config`**: direct pod
 endpoints by default, or stable proxy ports (`--proxy`) anchored to each machine's
-`MACHINE_NAME_LIST` index. Read-only.
+`MACHINE_NAME_LIST` index. Read-only. `--admin`: staff's config with the admin key instead
+([below](#staff-on-the-proxy-box-the-admin-key---admin-ssh_admin_config_file)).
 
 #### Keeping your own `~/.ssh/config` current (`SSH_CONFIG_FILE`)
 
@@ -1343,6 +1347,55 @@ cohort (backups, the reaper), leave the key unset: each tick would rewrite that 
   `ssh-config --out` writes beside the config. `config check` shows the key's state: off, not
   written yet, not arena's, or arena's and whether `~/.ssh/config` includes it.
 
+#### Staff on the proxy box: the admin key (`--admin`, `SSH_ADMIN_CONFIG_FILE`)
+
+`ADMIN_SSH_KEY_PATH` (optional) names a key whose private half **only the proxy / control box
+holds**. Every machine authorizes its public half — the create (each provider's; Hetzner's by
+cloud-init), `pods setup`, `pods copy-keys`, `reimage`, Vast's key re-attach — cohort pods and `@`
+staff boxes alike, and nothing ever copies the private half anywhere (the pods hold the shared and
+deploy keys, never this one). arena offers it **first** wherever this user can read it, so arena on
+the proxy box gets in even where the cohort key was revoked; elsewhere it isn't offered (sshd's
+`MaxAuthTries` counts every key tried).
+
+- **`ssh-config --admin`** prints staff's config: a self-contained `Host` block for every machine
+  — this cohort's pods (a parked `-old` twin too) and the `@` staff boxes, named as `pods list`
+  names them; nothing else on the account — at its **live endpoint** (never a proxy port: it's used
+  on the proxy box itself), `IdentityFile` the admin key, `IdentitiesOnly yes`. A machine without
+  an endpoint yet is left out. `--out FILE` also writes it (0600). Refused without
+  `ADMIN_SSH_KEY_PATH`.
+- **`ssh-config --admin --install [PATH]`** keeps staff's own file (default
+  `SSH_ADMIN_CONFIG_FILE`, else `~/.ssh/arena-admin.conf`) and its `Include` first in
+  `~/.ssh/config`, exactly as `--install` does for the participants' file (same checks, asks, keeps
+  copies). Refused unless this user can read the admin key, and for a key path an ssh config
+  can't take as one plain argument (whitespace, quotes, `#$%\`); never the participants' file (its
+  path, or a file under their first line). Its first line is its own (`# managed by arena (`arena
+  ssh-config --admin`) — …`), so neither sync ever rewrites the other's file. `--admin
+  --uninstall` takes its `Include` out.
+- **One of the two per user.** Both files name the same hosts, and ssh takes each host's address
+  from whichever `Include` comes first (and offers both files' keys): the participants' proxy ports
+  would shadow staff's live endpoints, or the other way round. So staff's file isn't installed or
+  kept while `SSH_CONFIG_FILE` is set too (the proxy box needs no participants' file), and neither
+  file is installed or kept while `~/.ssh/config` pulls in the other — Includes read as ssh reads
+  them (relative under `~/.ssh`, quoted, `*`/`?` patterns, nested). One it can't follow (a `${…}` or
+  `%` token, a backslash escape, a `[…]` class, braces) refuses an install rather than guesses, and
+  stops a sync while the other file exists where arena keeps it. To use the other anyway: `--out
+  FILE` and `ssh -F FILE <name>`.
+- **With `SSH_ADMIN_CONFIG_FILE` set**, it's kept current like the participants' file: after every
+  pod change, on `pods list`, `up` and each dashboard refresh, from a complete listing only — and
+  only for a user who can read the admin key (anyone else has no use for it; nothing is said).
+  `ADMIN_SSH_KEY_PATH` unset, or the other file in use (above), is a warning line.
+- **`config check`**: the admin key's row beside the shared and deploy keys — `·` unset, `✓`
+  readable here with its public half, else `⚠` and why: unreadable by this user (fine anywhere but
+  the proxy box), no `.pub` and `ssh-keygen -y` fails, the same file or key as
+  `SHARED_SSH_KEY_PATH` or `GIT_SSH_KEY_LOCAL` (then participants or every pod hold it), or a mode
+  that lets other users at it. With the key or the file set, the `SSH_ADMIN_CONFIG_FILE` row too
+  (✗ when the key is unset or the other file is in use; `·` for a user who can't read the key).
+- **Rolling it out:** generate it on the proxy box (`ssh-keygen -t ed25519 -N '' -f
+  /root/.ssh/arena_admin_key`), `arena config set ADMIN_SSH_KEY_PATH /root/.ssh/arena_admin_key`,
+  `arena pods copy-keys --all` (machines that already exist), then `arena ssh-config --admin
+  --install` and `arena config set SSH_ADMIN_CONFIG_FILE '~/.ssh/arena-admin.conf'`. New machines
+  get it from their create and setup.
+
 ### Publishing the fleet page
 
 `web/fleet.html` is a self-contained status page (no external scripts or fonts, phone- and
@@ -1370,7 +1423,8 @@ construction, so no auth is needed; health shows `unknown` until a `pods test --
 ### `pods setup`
 
 `pods setup` — provision pods over SSH (ordered steps in `--help`): copy the git deploy key, write
-`~/.ssh/config` + `authorized_keys`, **put the repo on the persistent volume** when the pod has one,
+`~/.ssh/config` + `authorized_keys` (every machine's keys: shared, deploy and the admin key — a
+bare VM in a step of its own, `authorize keys`, before its script), **put the repo on the persistent volume** when the pod has one,
 point the repo at GitHub, update submodules, write `~/.name`, and export any set **broadcast
 tokens** (Hugging Face for gated-repo access, Claude Code; via config or `--hf-token`/`--cc-token`)
 — else those steps are skipped and it says so.
@@ -1506,6 +1560,11 @@ keys from `<keys-dir>/<provider>_api_keys.csv` (openai/anthropic/openrouter) **p
 tokens** — a Hugging Face token (`--hf-token`/`HF_TOKEN`, sets `HF_TOKEN` +
 `HUGGING_FACE_HUB_TOKEN`) for **gated repos** (Llama 3, …) and a **Claude Code token**
 (`--cc-token`/`CLAUDE_CODE_OAUTH_TOKEN`).
+
+Every reachable target also gets the **fleet's ssh**, keys or not: every machine's keys authorized
+(shared, deploy, admin) and the host map in `~/.ssh/config` (pods reach each other with their deploy
+key). So `copy-keys` is how machines that already exist come to let in a key added since — the admin
+key, say — staff boxes included; with no key file, token or archive, that is all it writes.
 
 Targets / `--exclude` scope it to specific pods. Confirms first; `--dry-run` lists what would be set
 (values redacted). Both broadcast tokens are env-introducible (e.g. `CLAUDE_CODE_OAUTH_TOKEN=… arena
@@ -2052,7 +2111,7 @@ under an hour's credit for them, over the spend limit, `underBalance` — never 
 `config check` — validate that the keys the selected provider + proxy + backup need are present
 (never prints secret values; exits non-zero if a required key is missing or any key is set to a
 value it can't use — every such key is a ✗ row and is named in the error; ⚠ rows, e.g. a key file
-this user can't read or no `ARENA_START_DATE`, are advice). Copy `config.env.example` to get
+this user can't read, an admin key that is the shared one, or no `ARENA_START_DATE`, are advice). Copy `config.env.example` to get
 started.
 
 `config check | set | which` — `check` is the read-only doctor (keys + setup readiness); `config set

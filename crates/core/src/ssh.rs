@@ -101,9 +101,10 @@ impl HostKeyPolicy {
 }
 
 impl SshTarget {
-    /// Build from a pod's current SSH endpoint plus config. Offers every configured key
-    /// (`SHARED_SSH_KEY_PATH`, `GIT_SSH_KEY_LOCAL`, and comma-separated `EXTRA_SSH_KEYS`)
-    /// so a pod authorized by any of them is reachable. Errors if no endpoint yet.
+    /// Build from a pod's current SSH endpoint plus config. Offers every configured key this
+    /// user can read ([`config_ssh_keys`]: the admin key first, then `SHARED_SSH_KEY_PATH`,
+    /// `GIT_SSH_KEY_LOCAL` and comma-separated `EXTRA_SSH_KEYS`) so a pod authorized by any of
+    /// them is reachable. Errors if no endpoint yet.
     pub fn from_pod(pod: &Pod, cfg: &Config) -> Result<Self> {
         let host = pod
             .ssh_ip
@@ -327,16 +328,37 @@ pub fn public_key_for(private_path: &str) -> Option<String> {
     (!pubkey.is_empty()).then_some(pubkey)
 }
 
-/// The public keys that should be authorized on every pod (the shared key + the git
-/// deploy key), for `PUBLIC_KEY` injection at create and `setup`'s authorized_keys.
-/// (The provider's own account key — e.g. `arena_admin` — is injected automatically.)
+/// The config key naming the **admin key**: a key whose private half only the proxy / control
+/// box holds (`/root/.ssh/arena_admin_key` on ARENA's). Every machine authorizes its public half
+/// ([`authorized_pubkeys`]) and arena offers it first ([`config_ssh_keys`]), so staff who can log
+/// in to that box reach any machine from there — even one where the cohort key was revoked. Its
+/// private half is never copied anywhere: unlike the shared key (every participant holds it)
+/// and the deploy key (every pod holds it). Optional.
+pub const ADMIN_KEY_VAR: &str = "ADMIN_SSH_KEY_PATH";
+
+/// The admin key ([`ADMIN_KEY_VAR`]) as this user reaches it ([`resolve_key_path`]), when it's
+/// set — readable or not.
+pub fn admin_key(cfg: &Config) -> Option<String> {
+    cfg.get(ADMIN_KEY_VAR).filter(|s| !s.trim().is_empty()).map(resolve_key_path)
+}
+
+/// [`admin_key`], only when this user can read it: the one arena connects with and staff's
+/// ssh config names ([`crate::sshconfig::render_admin`]).
+pub fn readable_admin_key(cfg: &Config) -> Option<String> {
+    admin_key(cfg).filter(|p| std::fs::File::open(p).is_ok())
+}
+
+/// The public keys every machine authorizes — cohort pods and `@` staff boxes alike: the shared
+/// key, the git deploy key and the admin key ([`ADMIN_KEY_VAR`]), each when set and its public
+/// half derivable. For `PUBLIC_KEY` at create (and Hetzner's cloud-init), `setup`'s
+/// authorized_keys, `copy-keys`' fleet keys, `reimage` and Vast's key re-attach. (The provider's
+/// own account key — e.g. RunPod's `arena_admin` — is injected by the provider as well.)
 pub fn authorized_pubkeys(cfg: &Config) -> Vec<String> {
     let mut out = Vec::new();
-    // SHARED_SSH_KEY_PATH = the cohort key (arena8), GIT_SSH_KEY_LOCAL = the persistent
-    // deploy key (arena_infra), ADMIN_SSH_KEY_PATH = the ops/admin key. All three are
-    // authorized for incoming SSH so the control plane, git, AND an admin can reach pods —
-    // and (via the fleet ssh-config) pods can reach each other with the arena_infra key.
-    for key in ["SHARED_SSH_KEY_PATH", "GIT_SSH_KEY_LOCAL", "ADMIN_SSH_KEY_PATH"] {
+    // SHARED_SSH_KEY_PATH = the cohort key (arena8; participants hold it), GIT_SSH_KEY_LOCAL =
+    // the persistent deploy key (arena_infra; every pod holds it, so pods reach each other via
+    // the fleet ssh-config), ADMIN_SSH_KEY_PATH = the admin key (only the proxy box holds it).
+    for key in ["SHARED_SSH_KEY_PATH", "GIT_SSH_KEY_LOCAL", ADMIN_KEY_VAR] {
         if let Some(p) = cfg.get(key).filter(|s| !s.is_empty()) {
             if let Some(pk) = public_key_for(p) {
                 if !out.contains(&pk) {
@@ -348,22 +370,34 @@ pub fn authorized_pubkeys(cfg: &Config) -> Vec<String> {
     out
 }
 
-/// The ordered, de-duplicated list of SSH identity files the tool should offer pods:
-/// `SHARED_SSH_KEY_PATH`, `GIT_SSH_KEY_LOCAL`, then comma-separated `EXTRA_SSH_KEYS`
-/// (e.g. a previous cohort's key like `arena7_key`). Each is resolved to a readable
-/// copy; if none are readable, all are kept so the resulting error names what was tried.
+/// The ordered, de-duplicated list of SSH identity files the tool should offer pods: the
+/// admin key ([`ADMIN_KEY_VAR`]) first when this user can read it — every machine authorizes
+/// it, so arena on the proxy box gets in on the first try even where the cohort key was
+/// revoked — then `SHARED_SSH_KEY_PATH`, `GIT_SSH_KEY_LOCAL` and comma-separated
+/// `EXTRA_SSH_KEYS` (e.g. a previous cohort's key like `arena7_key`). Each is resolved to a
+/// readable copy, and only the readable ones are offered: sshd counts every key offered against
+/// its `MaxAuthTries` (6), so a key that can't be used is never one of them. If none are
+/// readable, all but the admin key are kept so the resulting error names what was tried (an
+/// unreadable admin key is just a box that isn't the proxy).
 pub fn config_ssh_keys(cfg: &Config) -> Vec<String> {
+    let home = std::env::var("HOME").ok();
+    config_ssh_keys_with(cfg, home.as_deref(), |p| std::fs::File::open(p).is_ok())
+}
+
+/// The pure core of [`config_ssh_keys`], with `$HOME` and the readability check injected.
+fn config_ssh_keys_with<R: Fn(&str) -> bool>(cfg: &Config, home: Option<&str>, readable: R) -> Vec<String> {
+    let set = |k: &str| cfg.get(k).filter(|s| !s.trim().is_empty());
     let mut all: Vec<String> = Vec::new();
     let mut add = |raw: &str| {
-        let r = resolve_key_path(raw);
+        let r = resolve_key_with(raw, home, &readable);
         if !all.contains(&r) {
             all.push(r);
         }
     };
-    if let Some(s) = cfg.get("SHARED_SSH_KEY_PATH").filter(|s| !s.is_empty()) {
+    if let Some(s) = set("SHARED_SSH_KEY_PATH") {
         add(s);
     }
-    if let Some(g) = cfg.get("GIT_SSH_KEY_LOCAL").filter(|s| !s.is_empty()) {
+    if let Some(g) = set("GIT_SSH_KEY_LOCAL") {
         add(g);
     }
     if let Some(extra) = cfg.get("EXTRA_SSH_KEYS") {
@@ -371,11 +405,15 @@ pub fn config_ssh_keys(cfg: &Config) -> Vec<String> {
             add(p);
         }
     }
-    let readable: Vec<String> = all.iter().filter(|p| std::fs::File::open(p).is_ok()).cloned().collect();
-    if readable.is_empty() {
+    let mut usable: Vec<String> = all.iter().filter(|p| readable(p)).cloned().collect();
+    if let Some(admin) = set(ADMIN_KEY_VAR).map(|a| resolve_key_with(a, home, &readable)).filter(|a| readable(a)) {
+        usable.retain(|k| *k != admin);
+        usable.insert(0, admin);
+    }
+    if usable.is_empty() {
         all
     } else {
-        readable
+        usable
     }
 }
 
@@ -606,6 +644,47 @@ mod tests {
         assert!(joined.contains("-i /a/key2")); // tries each
         t.key_paths.clear();
         assert!(!t.ssh_args().join(" ").contains("-i "));
+    }
+
+    /// The keys arena offers a pod: the admin key first when this user can read it (arena on the
+    /// proxy then gets in even where the cohort key was revoked), never an unreadable one (each
+    /// counts against sshd's MaxAuthTries), deduplicated; with nothing readable, what was
+    /// configured — minus the admin key, which a box that isn't the proxy just doesn't have.
+    #[test]
+    fn the_admin_key_is_offered_first_and_only_when_readable() {
+        const BASE: &str = "SHARED_SSH_KEY_PATH=/root/.ssh/arena9_key\nGIT_SSH_KEY_LOCAL=/root/.ssh/arena_infra_key\n";
+        const SHARED: &str = "/root/.ssh/arena9_key";
+        const DEPLOY: &str = "/root/.ssh/arena_infra_key";
+        const ADMIN: &str = "/root/.ssh/arena_admin_key";
+        type Row = (&'static str, &'static [&'static str], &'static [&'static str]);
+        let rows: &[Row] = &[
+            ("", &[SHARED, DEPLOY], &[SHARED, DEPLOY]),
+            ("ADMIN_SSH_KEY_PATH=/root/.ssh/arena_admin_key\n", &[SHARED, DEPLOY, ADMIN], &[ADMIN, SHARED, DEPLOY]),
+            // Set but not this user's to read (a laptop, a non-root user on the proxy): not offered.
+            ("ADMIN_SSH_KEY_PATH=/root/.ssh/arena_admin_key\n", &[SHARED, DEPLOY], &[SHARED, DEPLOY]),
+            ("ADMIN_SSH_KEY_PATH=\n", &[SHARED, DEPLOY, ADMIN], &[SHARED, DEPLOY]),
+            // Nothing readable: the configured keys, for the error — never the admin key.
+            ("ADMIN_SSH_KEY_PATH=/root/.ssh/arena_admin_key\n", &[], &[SHARED, DEPLOY]),
+            ("ADMIN_SSH_KEY_PATH=/root/.ssh/arena_admin_key\n", &[ADMIN], &[ADMIN]),
+            // The same file twice is offered once, first.
+            ("ADMIN_SSH_KEY_PATH=/root/.ssh/arena9_key\n", &[SHARED, DEPLOY], &[SHARED, DEPLOY]),
+            (
+                "ADMIN_SSH_KEY_PATH=/root/.ssh/arena_admin_key\nEXTRA_SSH_KEYS=/root/.ssh/arena7_key, /root/.ssh/old_key\n",
+                &[SHARED, DEPLOY, ADMIN, "/root/.ssh/arena7_key", "/root/.ssh/old_key"],
+                &[ADMIN, SHARED, DEPLOY, "/root/.ssh/arena7_key", "/root/.ssh/old_key"],
+            ),
+            // A readable copy under ~/.ssh stands in for an unreadable /root one, as for the others.
+            ("ADMIN_SSH_KEY_PATH=/root/.ssh/arena_admin_key\n", &[SHARED, DEPLOY, "/home/dev/.ssh/arena_admin_key"], &[
+                "/home/dev/.ssh/arena_admin_key",
+                SHARED,
+                DEPLOY,
+            ]),
+        ];
+        for (i, &(extra, readable, want)) in rows.iter().enumerate() {
+            let cfg = Config::parse(&format!("{BASE}{extra}"));
+            let got = config_ssh_keys_with(&cfg, Some("/home/dev"), |p| readable.contains(&p));
+            assert_eq!(got, want, "row {i}: {extra:?}");
+        }
     }
 
     #[test]

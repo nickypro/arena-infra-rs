@@ -19,7 +19,9 @@
 //! doesn't offer lists the types it does — two read-only GETs, only after a create failed.
 //!
 //! `--api-json` merges into the create body ([`create_payload`]) — `labels`, `user_data`
-//! (cloud-init), `firewalls`, `networks`… — minus the fields this module sets ([`MANAGED`]).
+//! (cloud-init), `firewalls`, `networks`… — minus the fields this module sets ([`MANAGED`]). Its
+//! own `user_data` authorizes every machine's keys (the deploy and admin keys beside the project's
+//! cohort key); one given there replaces it.
 //!
 //! Responses are parsed defensively from `serde_json::Value`, as with the others.
 
@@ -915,8 +917,23 @@ fn create_payload(opts: &HetznerOpts, spec: &PodSpec, location: Option<&str>, im
     if !opts.ssh_keys.is_empty() {
         payload["ssh_keys"] = json!(opts.ssh_keys);
     }
+    if let Some(user_data) = authorized_keys_user_data(&super::vast::spec_pubkeys(spec)) {
+        payload["user_data"] = json!(user_data);
+    }
     apiextra::apply(&mut payload, spec.api_extra.as_ref(), MANAGED, None)?;
     Ok(payload)
+}
+
+/// The create's `user_data`: a cloud-config that authorizes every machine's keys for root
+/// (`keys`: the spec's `PUBLIC_KEY` — the shared, deploy and admin keys' public halves), beside
+/// the project's `ssh_keys`. cloud-init adds them with the project's key at first boot (Hetzner's
+/// images let root in: `disable_root: false`), so a VM nobody sets up (`pods create`, `up
+/// --no-setup`) still lets in the deploy key and the admin key — as RunPod, Vast and Shadeform
+/// pods do from their create. `None` without keys. JSON after the `#cloud-config` line: valid
+/// YAML, whatever a key's comment holds. `--api-json` `user_data` replaces it (setup still
+/// authorizes the keys). Pure.
+fn authorized_keys_user_data(keys: &[String]) -> Option<String> {
+    (!keys.is_empty()).then(|| format!("#cloud-config\n{}\n", json!({ "ssh_authorized_keys": keys })))
 }
 
 fn parse_server(v: &Value) -> Pod {
@@ -1502,6 +1519,36 @@ mod tests {
             assert!(p.describe(&spec("devtest-a", flag)).starts_with(&format!("{want} CPU VM")), "{flag:?}");
         }
         assert_eq!(create_payload(&HetznerOpts::default(), &spec("x", None), None, None).unwrap()["server_type"], "cx33");
+    }
+
+    /// A Hetzner create authorizes every machine's keys — the spec's `PUBLIC_KEY`: shared,
+    /// deploy and admin — by cloud-init, beside the project's cohort key, so a VM nobody sets up
+    /// lets the admin key in as RunPod/Vast/Shadeform pods do. The value is a `#cloud-config`
+    /// whose YAML is JSON (a comment with `: ` or `#` stays one string); no keys, no user_data;
+    /// an `--api-json` `user_data` is the operator's and replaces it.
+    #[test]
+    fn the_create_authorizes_every_machines_keys_by_cloud_init() {
+        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=devtest\n"));
+        let keys = "ssh-ed25519 AAAAC3NzaSHARED devtest\nssh-ed25519 AAAAC3NzaDEPLOY deploy: key #1\n\nssh-ed25519 AAAAC3NzaADMIN arena_admin\n";
+        let mut s = spec("devtest-a", None);
+        s.env = vec![("PUBLIC_KEY".into(), keys.into()), ("MACHINE_NAME".into(), "devtest-a".into())];
+        let body = create_payload(&opts, &s, None, None).unwrap();
+        assert_eq!(body["ssh_keys"], json!(["devtest"]), "the project's key as before");
+        let ud = body["user_data"].as_str().unwrap();
+        let (head, doc) = ud.split_once('\n').unwrap();
+        assert_eq!(head, "#cloud-config");
+        let doc: Value = serde_json::from_str(doc).unwrap();
+        assert_eq!(
+            doc,
+            json!({"ssh_authorized_keys": [
+                "ssh-ed25519 AAAAC3NzaSHARED devtest", "ssh-ed25519 AAAAC3NzaDEPLOY deploy: key #1", "ssh-ed25519 AAAAC3NzaADMIN arena_admin"
+            ]})
+        );
+        s.env.retain(|(k, _)| k != "PUBLIC_KEY");
+        assert!(create_payload(&opts, &s, None, None).unwrap().get("user_data").is_none());
+        s.env.push(("PUBLIC_KEY".into(), keys.into()));
+        s.api_extra = Some(serde_json::from_str(r##"{"user_data": "#cloud-config\npackages: [htop]\n"}"##).unwrap());
+        assert_eq!(create_payload(&opts, &s, None, None).unwrap()["user_data"], "#cloud-config\npackages: [htop]\n");
     }
 
     /// The options as `build` reads them: the default key named after the prefix — and that

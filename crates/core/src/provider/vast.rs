@@ -765,8 +765,8 @@ pub fn with_near_prices(book: PriceBook, near: &[(String, OfferQuote)], gpu_coun
 }
 
 /// The cohort's public keys from the spec: `PUBLIC_KEY` holds them newline-joined (see
-/// `PodSpec::from_config`). Trimmed, deduped, in order.
-fn spec_pubkeys(spec: &PodSpec) -> Vec<String> {
+/// `PodSpec::from_config`). Trimmed, deduped, in order. (Hetzner's cloud-init takes them too.)
+pub(crate) fn spec_pubkeys(spec: &PodSpec) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     for (_, v) in spec.env.iter().filter(|(k, _)| k == "PUBLIC_KEY") {
         for k in v.lines().map(str::trim).filter(|k| !k.is_empty()) {

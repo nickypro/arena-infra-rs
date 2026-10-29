@@ -19,6 +19,39 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-29 · An admin key only the proxy holds, which reaches every machine
+- `ADMIN_SSH_KEY_PATH` (optional) is now a key of its own role: its private half stays on the
+  proxy / control box, and every machine — cohort pods and `@` staff boxes, on every provider —
+  lets its public half in. Staff log in to the proxy box and reach any machine from there; arena
+  there offers it first, so it gets in even where the cohort key was revoked. Nothing copies it
+  to a pod.
+- `arena ssh-config --admin` prints staff's config: every machine at its live endpoint with the
+  admin key alone. `--admin --install` keeps it in `~/.ssh/arena-admin.conf` (its own file, next
+  to the participants' one) and includes it from `~/.ssh/config`; with `SSH_ADMIN_CONFIG_FILE`
+  set it is rewritten after every pod change, `pods list` and dashboard refresh.
+- `config check` shows the admin key beside the shared and deploy keys, and warns when it can't
+  be read, has no public half, is the shared or the deploy key under another name, or other
+  users can read it.
+- Hetzner VMs now let in the deploy and admin keys from their create (cloud-init), not only the
+  cohort key; Hetzner and Shadeform VMs' setup authorizes them too, before its long script.
+- `pods copy-keys` now writes the fleet's ssh (every machine's keys and the host map) to every
+  pod, even one with no API key of its own and with no key file or token at all — before, it
+  stopped with "no keys to copy".
+
+### Action needed
+- To use it, on the proxy box: `ssh-keygen -t ed25519 -N '' -f /root/.ssh/arena_admin_key`, then
+  `arena config set ADMIN_SSH_KEY_PATH /root/.ssh/arena_admin_key`. Machines that already exist
+  let it in after `arena pods copy-keys --all` (or `arena pods setup`); new ones from their create.
+  Then `arena ssh-config --admin --install`.
+
+### Config
+- `ADMIN_SSH_KEY_PATH`: now in `config check`, the example and the docs (it was read before, but
+  undocumented). Optional.
+- `SSH_ADMIN_CONFIG_FILE` (new, optional): staff's ssh config file to keep current, e.g.
+  `~/.ssh/arena-admin.conf`, on the proxy box. One of the two per user: not kept while
+  `SSH_CONFIG_FILE` is set too, or while `~/.ssh/config` includes the participants' file (both name
+  the same hosts).
+
 ## 2026-10-29 · arena 2.2: Hetzner VMs from a pre-built image, set up in about a minute
 - This is **arena 2.2** (a minor bump: a new command, `arena image`, and `--image` on a Hetzner
   create; `update` offers it to every 2.1 build).
