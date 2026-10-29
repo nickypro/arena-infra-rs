@@ -425,6 +425,9 @@ pub fn sync_for(cfg: &Config, pods: &[Pod], home: Option<&str>) -> Option<Result
         Ok(p) => p,
         Err(e) => return Some(Err(e)),
     };
+    if let Some(why) = one_per_user(Audience::Participants, cfg, home) {
+        return Some(Err(format!("{}: {why}", path.display())));
+    }
     let want = match render_for(cfg, pods) {
         Ok(r) => managed_text(&r),
         Err(e) => return Some(Err(format!("{}: {e}", path.display()))),
@@ -436,30 +439,68 @@ pub fn sync_for(cfg: &Config, pods: &[Pod], home: Option<&str>) -> Option<Result
 /// staff's file on the proxy box ([`render_admin`]). `None` when the key is unset — and when this
 /// user can't read the admin key: the file is of use only to someone who can, so for anyone else
 /// there's nothing to keep current (`config check` says the key is unreadable). `Some(Err)`: why
-/// it wasn't written — a bad path, the same file as `SSH_CONFIG_FILE` (each sync would refuse the
-/// other's), `ADMIN_SSH_KEY_PATH` unset, a file that isn't staff's, a failed write.
+/// it wasn't written — a bad path, `ADMIN_SSH_KEY_PATH` unset, a file that isn't staff's, a failed
+/// write, or the participants' file in use too ([`one_per_user`]).
 pub fn sync_admin_for(cfg: &Config, pods: &[Pod], home: Option<&str>) -> Option<Result<Synced, String>> {
     let path = match Audience::Admin.path(cfg, home)? {
         Ok(p) => p,
         Err(e) => return Some(Err(e)),
     };
-    if let Some(Ok(theirs)) = managed_path(cfg, home) {
-        if theirs == path {
-            return Some(Err(format!(
-                "{} is SSH_CONFIG_FILE's file too — give SSH_ADMIN_CONFIG_FILE a path of its own",
-                path.display()
-            )));
-        }
-    }
     match crate::ssh::admin_key(cfg) {
         Some(k) if std::fs::File::open(&k).is_err() => return None,
         _ => {}
+    }
+    if let Some(why) = one_per_user(Audience::Admin, cfg, home) {
+        return Some(Err(format!("{}: {why}", path.display())));
     }
     let want = match render_admin_for(cfg, pods) {
         Ok(r) => Audience::Admin.text(&r),
         Err(e) => return Some(Err(format!("{}: {e}", path.display()))),
     };
     Some(sync_file_as(Audience::Admin, &path, &want).map(|written| Synced { path, written }))
+}
+
+/// Why `audience`'s file mustn't be kept by this user, if it mustn't: the two files name the same
+/// hosts, and ssh takes each host's address, port and user from whichever `Include` comes first
+/// (and offers both files' keys) — the participants' proxy ports would shadow staff's live
+/// endpoints, or the other way round. So one per user: staff's isn't kept while `SSH_CONFIG_FILE`
+/// is set too (staff's belongs on the proxy box, which needs no participants' file), and neither
+/// is while `~/.ssh/config` pulls in the other one ([`included_file_of`]; an Include arena can't
+/// follow doesn't stop a sync).
+pub fn one_per_user(audience: Audience, cfg: &Config, home: Option<&str>) -> Option<String> {
+    if audience == Audience::Admin && managed_path(cfg, home).is_some() {
+        return Some(
+            "SSH_CONFIG_FILE is set too — both files name the same hosts, and ssh takes each one's address from whichever is \
+             included first; one per user: on the proxy box, take SSH_CONFIG_FILE out"
+                .into(),
+        );
+    }
+    let other = match audience {
+        Audience::Participants => Audience::Admin,
+        Audience::Admin => Audience::Participants,
+    };
+    let Ok(Some(theirs)) = included_file_of(other, home) else { return None };
+    Some(format!(
+        "~/.ssh/config includes {} — arena's other file (`{} --install`), naming the same hosts: ssh would take each one's \
+         address from whichever is included first; one per user (`{} --uninstall`)",
+        theirs.display(),
+        other.command(),
+        other.command()
+    ))
+}
+
+/// The file of `audience`'s that the user's `~/.ssh/config` (under `home`) pulls in, if one: of
+/// the files [`included_files`] resolves, one that starts with its header. `Ok(None)` without a
+/// `~/.ssh/config`; `Err` when that can't be told (no home, an Include arena can't follow).
+pub fn included_file_of(audience: Audience, home: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let home = home.map(str::trim).filter(|h| h.starts_with('/')).ok_or("no home to find ~/.ssh/config in")?;
+    let config = match std::fs::read_to_string(Path::new(home).join(".ssh").join("config")) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("reading ~/.ssh/config: {e}")),
+    };
+    let files = included_files(&config, Some(home)).map_err(|arg| format!("an Include arena can't follow ({arg})"))?;
+    Ok(files.into_iter().find(|p| std::fs::read_to_string(p).is_ok_and(|t| !t.trim().is_empty() && audience.owns(&t))))
 }
 
 /// Both files arena keeps current ([`sync_for`], [`sync_admin_for`]) from one COMPLETE listing:
@@ -566,11 +607,11 @@ pub fn config_path_problem(path: &str) -> Option<String> {
 
 /// Every file a user's `~/.ssh/config` (its text, `config`) pulls in, as ssh resolves its
 /// `Include` lines: anywhere in the file (a block's too), each argument quoted or not, `~/` taken
-/// as `home`, a relative path under `~/.ssh`, glob patterns (`*`, `?`, `[…]`) matched against what
-/// exists, and the included files' own `Include`s followed (to ssh's depth of 16). For telling
-/// whether arena's other file is in use. Reads those files, never writes. `Err(argument)`: one
-/// arena can't resolve (a `${…}` or `%` token, or no home to resolve it against) — the caller
-/// can't tell what it includes.
+/// as `home`, a relative path under `~/.ssh`, `*` and `?` patterns matched against what exists,
+/// and the included files' own `Include`s followed (to ssh's depth of 16). For telling whether
+/// arena's other file is in use. Reads those files, never writes. `Err(argument)`: one arena
+/// can't resolve (a `${…}` or `%` token, a `[…]` class, or no home to resolve it against) — the
+/// caller can't tell what it includes, and mustn't guess "nothing".
 pub fn included_files(config: &str, home: Option<&str>) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     follow_includes(config, home, 0, &mut out)?;
@@ -639,10 +680,11 @@ fn include_args(line: &str) -> Option<Vec<String>> {
 }
 
 /// Where one `Include` argument points in a user config: `~/` (or `~`) against `home`, a relative
-/// path under `~/.ssh`, an absolute one as it is. `None` when it holds a `${…}` or `%` token, or
-/// needs a home there's none of. Pure.
+/// path under `~/.ssh`, an absolute one as it is. `None` when it holds a `${…}` or `%` token or a
+/// `[…]` class (glob(3)'s classes — `[[:alpha:]]` and the rest — aren't matched here), or needs a
+/// home there's none of. Pure.
 fn include_target(arg: &str, home: Option<&str>) -> Option<PathBuf> {
-    if arg.contains(['$', '%']) {
+    if arg.contains(['$', '%', '[']) {
         return None;
     }
     let home = home.map(str::trim).filter(|h| h.starts_with('/'));
@@ -657,11 +699,11 @@ fn include_target(arg: &str, home: Option<&str>) -> Option<PathBuf> {
     }
 }
 
-/// The files `pattern` names, as glob(3) finds them: each component with `*`, `?` or `[…]` matched
-/// against its folder (a leading `.` only by a pattern that starts with one), sorted; a path with
-/// none, if it exists. Only what exists.
+/// The files `pattern` names, as glob(3) finds them: each component with `*` or `?` matched against
+/// its folder (a leading `.` only by a pattern that starts with one), sorted; a path with neither,
+/// if it exists. Only what exists.
 fn glob_files(pattern: &Path) -> Vec<PathBuf> {
-    let magic = |s: &str| s.contains(['*', '?', '[']);
+    let magic = |s: &str| s.contains(['*', '?']);
     let mut found = vec![PathBuf::new()];
     for comp in pattern.components() {
         let part = comp.as_os_str().to_string_lossy();
@@ -682,8 +724,8 @@ fn glob_files(pattern: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// glob(7) matching of one name: `*`, `?`, `[abc]`, `[a-z]`, `[!…]`/`[^…]`; a leading `.` only
-/// by a literal one. Pure.
+/// glob(7) matching of one name by `*` and `?` (the only wildcards [`include_target`] lets through);
+/// a leading `.` only by a literal one. Pure.
 fn wild_match(pat: &str, name: &str) -> bool {
     if name.starts_with('.') && !pat.starts_with('.') {
         return false;
@@ -693,29 +735,6 @@ fn wild_match(pat: &str, name: &str) -> bool {
             None => n.is_empty(),
             Some('*') => (0..=n.len()).any(|i| go(&p[1..], &n[i..])),
             Some('?') => !n.is_empty() && go(&p[1..], &n[1..]),
-            Some('[') => {
-                let Some(close) = p.iter().skip(2).position(|&c| c == ']').map(|i| i + 2) else {
-                    return n.first() == Some(&'[') && go(&p[1..], &n[1..]);
-                };
-                let Some(&c) = n.first() else { return false };
-                let mut set = &p[1..close];
-                let negate = matches!(set.first(), Some('!' | '^'));
-                if negate {
-                    set = &set[1..];
-                }
-                let mut hit = false;
-                let mut i = 0;
-                while i < set.len() {
-                    if i + 2 < set.len() && set[i + 1] == '-' {
-                        hit |= set[i] <= c && c <= set[i + 2];
-                        i += 3;
-                    } else {
-                        hit |= set[i] == c;
-                        i += 1;
-                    }
-                }
-                hit != negate && go(&p[close + 1..], &n[1..])
-            }
             Some(&c) => n.first() == Some(&c) && go(&p[1..], &n[1..]),
         }
     }
@@ -1077,18 +1096,16 @@ mod tests {
         assert_eq!(included_files("Include ${HOME}/.ssh/arena.conf\n", h), Err("${HOME}/.ssh/arena.conf".to_string()));
         assert_eq!(included_files("Include %d/.ssh/arena.conf\n", h), Err("%d/.ssh/arena.conf".to_string()));
         assert_eq!(included_files("Include arena.conf\n", None), Err("arena.conf".to_string()));
+        // A `[…]` class (glob(3)'s `[[:alpha:]]` among them) isn't matched here: can't tell, never "nothing".
+        assert_eq!(included_files("Include ~/.ssh/[[:alpha:]]*.conf\n", h), Err("~/.ssh/[[:alpha:]]*.conf".to_string()));
         assert_eq!(included_files("Include /nonexistent-arena/*.conf\nHost x\n", None), Ok(vec![]));
         for (pat, name, hit) in [
             ("*.conf", "arena.conf", true),
             ("*.conf", ".arena.conf", false),
             (".*", ".arena.conf", true),
             ("arena?.conf", "arena1.conf", true),
-            ("arena[0-9].conf", "arena7.conf", true),
-            ("arena[!0-9].conf", "arena7.conf", false),
-            ("arena[^0-9].conf", "arenax.conf", true),
             ("a*b*c", "aXXbYYc", true),
             ("a*b*c", "aXXbYY", false),
-            ("[", "[", true),
         ] {
             assert_eq!(wild_match(pat, name), hit, "{pat} {name}");
         }
@@ -1113,6 +1130,52 @@ mod tests {
         assert_eq!(path("~/.ssh/arena-admin.conf"), Some(Ok(PathBuf::from("/root/.ssh/arena-admin.conf"))));
         assert!(path("admin.conf").unwrap().unwrap_err().starts_with("SSH_ADMIN_CONFIG_FILE must be an absolute path"));
         assert_eq!(path(""), None);
+    }
+
+    /// One of the two files per user: staff's isn't kept while SSH_CONFIG_FILE is set too, and
+    /// neither while ~/.ssh/config pulls in the other (however: here a wildcard) — a sync never
+    /// creates the second file a wildcard would then include beside the first.
+    #[cfg(unix)]
+    #[test]
+    fn a_sync_never_keeps_one_file_while_the_other_is_in_use() {
+        let home = std::env::temp_dir().join(format!("arena-sshconfig-one-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let h = home.to_str();
+        let key = home.join("arena_admin_key");
+        std::fs::write(&key, "private").unwrap();
+        let pods = vec![pod("devtest-apple", Some("1.1.1.1"), Some(22001))];
+        let (theirs, staff) = (home.join(".ssh/arena.conf"), home.join(".ssh/arena-admin.conf"));
+        std::fs::write(home.join(".ssh/config"), "Include ~/.ssh/arena*.conf\n").unwrap();
+        let both = Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nADMIN_SSH_KEY_PATH={}\nSSH_CONFIG_FILE=~/.ssh/arena.conf\nSSH_ADMIN_CONFIG_FILE=~/.ssh/arena-admin.conf\n",
+            key.display()
+        ));
+        let got = sync_all(&both, &pods, h);
+        assert!(matches!(&got[..], [Ok(Synced { written: true, .. }), Err(e)] if e.contains("SSH_CONFIG_FILE is set too")), "{got:?}");
+        assert!(theirs.exists() && !staff.exists(), "never the second file");
+        assert_eq!(one_per_user(Audience::Admin, &both, h).map(|w| w.contains("set too")), Some(true));
+        // Staff's key alone, with the participants' file pulled in by the wildcard: still not written.
+        let admin_only = Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nADMIN_SSH_KEY_PATH={}\nSSH_ADMIN_CONFIG_FILE=~/.ssh/arena-admin.conf\n",
+            key.display()
+        ));
+        let e = sync_admin_for(&admin_only, &pods, h).unwrap().unwrap_err();
+        assert!(e.contains(&format!("~/.ssh/config includes {} — arena's other file", theirs.display())), "{e}");
+        assert!(!staff.exists());
+        // The other way round: staff's file in use, the participants' isn't kept.
+        std::fs::remove_file(&theirs).unwrap();
+        assert!(sync_admin_for(&admin_only, &pods, h).unwrap().unwrap().written);
+        let theirs_only = Config::parse("MACHINE_NAME_PREFIX=devtest\nSSH_CONFIG_FILE=~/.ssh/arena.conf\n");
+        let e = sync_for(&theirs_only, &pods, h).unwrap().unwrap_err();
+        assert!(e.contains("arena-admin.conf — arena's other file (`arena ssh-config --admin --install`)"), "{e}");
+        assert!(!theirs.exists());
+        // Nothing included (or no ~/.ssh/config): each as before.
+        std::fs::write(home.join(".ssh/config"), "Host x\n").unwrap();
+        assert!(sync_for(&theirs_only, &pods, h).unwrap().unwrap().written);
+        assert_eq!(included_file_of(Audience::Admin, h), Ok(None));
+        assert!(included_file_of(Audience::Admin, None).is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// `SSH_ADMIN_CONFIG_FILE` kept current: off when unset, and for a user who can't read the
@@ -1142,7 +1205,7 @@ mod tests {
         let unreadable = format!("ADMIN_SSH_KEY_PATH={}\n", base.join("nope").display());
         assert_eq!(sync_admin_for(&cfg(&unreadable), &pods, None), None, "not this user's key: nothing to keep current");
         let same = format!("{with_key}SSH_CONFIG_FILE={}\n", file.display());
-        assert!(sync_admin_for(&cfg(&same), &pods, None).unwrap().unwrap_err().contains("SSH_CONFIG_FILE's file too"));
+        assert!(sync_admin_for(&cfg(&same), &pods, None).unwrap().unwrap_err().contains("SSH_CONFIG_FILE is set too"));
         assert!(!file.exists());
         // Written, then current.
         let c = cfg(&with_key);

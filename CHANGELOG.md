@@ -43,7 +43,9 @@ earlier).
 - `ADMIN_SSH_KEY_PATH`: now in `config check`, the example and the docs (it was read before, but
   undocumented). Optional.
 - `SSH_ADMIN_CONFIG_FILE` (new, optional): staff's ssh config file to keep current, e.g.
-  `~/.ssh/arena-admin.conf`. Never the same file as `SSH_CONFIG_FILE`.
+  `~/.ssh/arena-admin.conf`, on the proxy box. One of the two per user: not kept while
+  `SSH_CONFIG_FILE` is set too, or while `~/.ssh/config` includes the participants' file (both name
+  the same hosts).
 
 ## 2026-10-29 · No more "command not found: conda" on Hetzner VMs
 - A Hetzner VM's `~/.zshrc` no longer has conda's init block or `conda activate arena-env` (it came

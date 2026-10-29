@@ -1204,22 +1204,27 @@ the proxy box gets in even where the cohort key was revoked; elsewhere it isn't 
   `~/.ssh/config`, exactly as `--install` does for the participants' file (same checks, asks, keeps
   copies). Refused unless this user can read the admin key, and for a key path an ssh config
   can't take as one plain argument (whitespace, quotes, `#$%\`); never the participants' file (its
-  path, or a file under their first line), nor beside it in one `~/.ssh/config` (either way round:
-  both name the same hosts, and ssh takes each host's address from whichever `Include` comes first —
-  use the other with `--out FILE` and `ssh -F FILE`). Includes are read as ssh reads them
-  (relative under `~/.ssh`, quoted, globs, nested); one it can't follow (a `${…}` or `%` token)
-  refuses rather than guesses. Its first line is its own (`# managed by
-  arena (`arena ssh-config --admin`) — …`), so neither sync ever rewrites the other's file.
-  `--admin --uninstall` takes its `Include` out.
+  path, or a file under their first line). Its first line is its own (`# managed by arena (`arena
+  ssh-config --admin`) — …`), so neither sync ever rewrites the other's file. `--admin
+  --uninstall` takes its `Include` out.
+- **One of the two per user.** Both files name the same hosts, and ssh takes each host's address
+  from whichever `Include` comes first (and offers both files' keys): the participants' proxy ports
+  would shadow staff's live endpoints, or the other way round. So staff's file isn't installed or
+  kept while `SSH_CONFIG_FILE` is set too (the proxy box needs no participants' file), and neither
+  file is installed or kept while `~/.ssh/config` pulls in the other — Includes read as ssh reads
+  them (relative under `~/.ssh`, quoted, `*`/`?` patterns, nested). One it can't follow (a `${…}` or
+  `%` token, a `[…]` class) refuses an install rather than guesses. To use the other anyway: `--out
+  FILE` and `ssh -F FILE <name>`.
 - **With `SSH_ADMIN_CONFIG_FILE` set**, it's kept current like the participants' file: after every
   pod change, on `pods list`, `up` and each dashboard refresh, from a complete listing only — and
-  only for a user who can read the admin key (anyone else has no use for it; nothing is said). The
-  same path as `SSH_CONFIG_FILE`, or the key unset, is a warning line.
+  only for a user who can read the admin key (anyone else has no use for it; nothing is said).
+  `ADMIN_SSH_KEY_PATH` unset, or the other file in use (above), is a warning line.
 - **`config check`**: the admin key's row beside the shared and deploy keys — `·` unset, `✓`
   readable here with its public half, else `⚠` and why: unreadable by this user (fine anywhere but
   the proxy box), no `.pub` and `ssh-keygen -y` fails, the same file or key as
   `SHARED_SSH_KEY_PATH` or `GIT_SSH_KEY_LOCAL` (then participants or every pod hold it), or a mode
-  that lets other users at it. With the key or the file set, the `SSH_ADMIN_CONFIG_FILE` row too.
+  that lets other users at it. With the key or the file set, the `SSH_ADMIN_CONFIG_FILE` row too
+  (✗ when the key is unset or the other file is in use; `·` for a user who can't read the key).
 - **Rolling it out:** generate it on the proxy box (`ssh-keygen -t ed25519 -N '' -f
   /root/.ssh/arena_admin_key`), `arena config set ADMIN_SSH_KEY_PATH /root/.ssh/arena_admin_key`,
   `arena pods copy-keys --all` (machines that already exist), then `arena ssh-config --admin

@@ -92,7 +92,10 @@ fn sent_nothing_private_but_authorized(calls: &[RemoteCall], keys: &Keys, who: &
         match c {
             RemoteCall::Copy { local, .. } => {
                 assert!(!local.contains("arena_admin_key"), "{who}: copied {local}");
-                let sent = std::fs::read_to_string(local).unwrap_or_default();
+                // What was copied must still be there to look at: a file made, copied and
+                // removed again would otherwise pass unseen.
+                let sent = std::fs::read(local).unwrap_or_else(|e| panic!("{who}: copied {local}, now unreadable: {e}"));
+                let sent = String::from_utf8_lossy(&sent);
                 assert!(!sent.contains(ADMIN_PRIVATE), "{who}: {local} holds the admin key's private half");
             }
             RemoteCall::Exec { cmd, .. } => {
@@ -280,7 +283,7 @@ async fn ssh_config_admin_install_writes_staff_s_own_file() {
         keys.lines()
     ));
     let (row, bad) = ssh_config_check_row_as(Audience::Admin, &clash, Some(hs));
-    assert!(row.starts_with("  ✗ SSH_ADMIN_CONFIG_FILE") && bad.unwrap().contains("SSH_CONFIG_FILE's file too"), "{row}");
+    assert!(row.starts_with("  ✗ SSH_ADMIN_CONFIG_FILE") && bad.unwrap().contains("SSH_CONFIG_FILE is set too"), "{row}");
     let (row, _) = ssh_config_check_row_as(Audience::Admin, &cfg, Some(hs));
     assert!(row.starts_with("  · SSH_ADMIN_CONFIG_FILE        (unset) — on the proxy box"), "{row}");
 
@@ -298,14 +301,14 @@ async fn ssh_config_admin_install_writes_staff_s_own_file() {
     assert_eq!(std::fs::read_to_string(h.join(".ssh/arena-admin.conf")).unwrap(), want);
     // Never both included by one ~/.ssh/config: the same Host names, and ssh takes each host's
     // address from whichever Include comes first.
-    refused(handle_ssh_config_install(&fleet, &cfg, Audience::Participants, None, true, false, Some(hs)).await, "already includes");
+    refused(handle_ssh_config_install(&fleet, &cfg, Audience::Participants, None, true, false, Some(hs)).await, "~/.ssh/config includes");
 
     handle_ssh_config_uninstall(&cfg, Audience::Admin, None, true, false, Some(hs)).unwrap();
     assert_eq!(std::fs::read_to_string(h.join(".ssh/config")).unwrap(), "");
     assert!(h.join(".ssh/arena-admin.conf").exists(), "the file stays");
     handle_ssh_config_install(&fleet, &cfg, Audience::Participants, None, true, false, Some(hs)).await.unwrap();
     assert_eq!(std::fs::read_to_string(h.join(".ssh/config")).unwrap(), "Include ~/.ssh/arena.conf\n");
-    refused(handle_ssh_config_install(&fleet, &cfg, Audience::Admin, None, true, false, Some(hs)).await, "already includes");
+    refused(handle_ssh_config_install(&fleet, &cfg, Audience::Admin, None, true, false, Some(hs)).await, "~/.ssh/config includes");
     let _ = std::fs::remove_dir_all(&h);
 }
 
@@ -321,14 +324,14 @@ async fn either_install_sees_the_other_file_however_it_is_included() {
     let theirs = arena_core::sshconfig::managed_text("Host devtest-*\n");
     let staff = Audience::Admin.text("Host devtest-apple\n");
     for (tag, files, config, audience, why) in [
-        ("rel", vec![("arena.conf", theirs.as_str())], "Include arena.conf\n", Audience::Admin, "already includes"),
-        ("glob", vec![("arena-admin.conf", staff.as_str())], "Include ~/.ssh/arena-*.conf\n", Audience::Participants, "already includes"),
+        ("rel", vec![("arena.conf", theirs.as_str())], "Include arena.conf\n", Audience::Admin, "~/.ssh/config includes"),
+        ("glob", vec![("arena-admin.conf", staff.as_str())], "Include ~/.ssh/arena-*.conf\n", Audience::Participants, "~/.ssh/config includes"),
         (
             "nested",
             vec![("arena.conf", theirs.as_str()), ("mine.conf", "Include \"arena.conf\"\n")],
             "Host x\n    Include mine.conf\n",
             Audience::Admin,
-            "already includes",
+            "~/.ssh/config includes",
         ),
         ("env", vec![], "Include ${HOME}/.ssh/arena.conf\n", Audience::Admin, "has an Include arena can't follow (${HOME}/.ssh/arena.conf)"),
     ] {
@@ -344,29 +347,27 @@ async fn either_install_sees_the_other_file_however_it_is_included() {
     }
 }
 
-/// Every pod change keeps staff's file current beside the participants' (one line each), and
-/// lists the fleet for it even when the participants' file takes the proxy's ports.
+/// Every pod change keeps staff's file current, listing the fleet for it (its endpoints are live,
+/// even with a proxy configured); with SSH_CONFIG_FILE set too, the participants' file is kept as
+/// before and staff's is a warning (one per user).
 #[cfg(unix)]
 #[tokio::test]
 async fn a_pod_change_rewrites_staff_s_file_too() {
     let keys = Keys::new("after");
     let dir = home("after");
     let (theirs, staff) = (dir.join(".ssh/arena.conf"), dir.join(".ssh/arena-admin.conf"));
-    let cfg = Config::parse(&format!(
-        "{NAMES}{}SSH_PROXY_HOST=px.example\nSSH_PROXY_STARTING_PORT=9500\nSSH_CONFIG_FILE={}\nSSH_ADMIN_CONFIG_FILE={}\n",
-        keys.lines(),
-        theirs.display(),
-        staff.display()
-    ));
+    let base = format!("{NAMES}{}SSH_PROXY_HOST=px.example\nSSH_PROXY_STARTING_PORT=9500\n", keys.lines());
+    let cfg = Config::parse(&format!("{base}SSH_ADMIN_CONFIG_FILE={}\n", staff.display()));
     let lines = ssh_config_after(&cfg, &Listed(machines(), false), "create").await;
-    assert_eq!(
-        lines,
-        [format!("[ssh-config] after create: rewrote {}", theirs.display()), format!("[ssh-config] after create: rewrote {}", staff.display())]
-    );
+    assert_eq!(lines, [format!("[ssh-config] after create: rewrote {}", staff.display())]);
     assert!(std::fs::read_to_string(&staff).unwrap().contains("Host devtest-dawn\n    HostName 10.0.0.1\n    Port 22004\n"));
     assert!(ssh_config_after(&cfg, &Listed(machines(), false), "up").await.is_empty(), "nothing moved");
     let failed = ssh_config_after(&cfg, &Listed(machines(), true), "restart").await;
     assert!(failed.len() == 1 && failed[0].contains("not rewritten — runpod failed to list"), "{failed:?}");
+    let both = Config::parse(&format!("{base}SSH_ADMIN_CONFIG_FILE={}\nSSH_CONFIG_FILE={}\n", staff.display(), theirs.display()));
+    let lines = ssh_config_after(&both, &Listed(machines(), false), "create").await;
+    assert_eq!(lines[0], format!("[ssh-config] after create: rewrote {}", theirs.display()));
+    assert!(lines[1].starts_with("warning: [ssh-config] after create: not rewritten — ") && lines[1].contains("SSH_CONFIG_FILE is set too"), "{lines:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

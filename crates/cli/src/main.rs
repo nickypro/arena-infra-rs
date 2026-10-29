@@ -16663,29 +16663,19 @@ async fn handle_ssh_config_install(
     let config = read_opt(&config_path)?;
     // Both files name the same hosts: ssh takes each one's address, port and user from whichever
     // Include comes first, and offers both files' keys — the participants' proxy ports would shadow
-    // staff's live endpoints, or the other way round. One of the two per ~/.ssh/config.
-    let included = sshconfig::included_files(config.as_deref().unwrap_or(""), home.to_str()).map_err(|arg| {
-        anyhow::anyhow!(
+    // staff's live endpoints, or the other way round. One of the two per user
+    // ([`sshconfig::one_per_user`]); here, an Include arena can't follow refuses rather than guesses.
+    if let Err(arg) = sshconfig::included_files(config.as_deref().unwrap_or(""), home.to_str()) {
+        anyhow::bail!(
             "not installed: ~/.ssh/config has an Include arena can't follow ({arg}), so it can't tell whether arena's other file \
              (`{} --install`) is in use — with the same Host names, ssh would take each host's address from whichever comes first. \
              Use this one without an Include: `{} --out FILE`, then `ssh -F FILE <name>`",
             other.command(),
             audience.command()
-        )
-    })?;
-    for p in included {
-        if same_file(&p, &target) || !read_opt(&p).ok().flatten().is_some_and(|t| !t.trim().is_empty() && other.owns(&t)) {
-            continue;
-        }
-        anyhow::bail!(
-            "not installed: ~/.ssh/config already includes {} — arena's other file (`{} --install`), with the same Host names, and \
-             ssh would take each host's address from whichever Include comes first. One of the two per box: `{} --uninstall` \
-             first, or use this one without an Include: `{} --out FILE`, then `ssh -F FILE <name>`",
-            p.display(),
-            other.command(),
-            other.command(),
-            audience.command()
         );
+    }
+    if let Some(why) = sshconfig::one_per_user(audience, cfg, home.to_str()) {
+        anyhow::bail!("not installed: {why} — or use this one without an Include: `{} --out FILE`, then `ssh -F FILE <name>`", audience.command());
     }
     let at = sshconfig::include_at(config.as_deref().unwrap_or(""), &[&shown, &abs]);
     let stamp = arena_core::restore::stamp(arena_core::snapshot::unix_now());
@@ -16888,9 +16878,21 @@ fn ssh_config_check_row_as(audience: Audience, cfg: &Config, home: Option<&str>)
         Some(Err(e)) => return (format!("  ✗ {key:<28} {e}"), Some(e)),
         Some(Ok(p)) => p,
     };
-    if audience == Audience::Admin && sshconfig::managed_path(cfg, home).and_then(|p| p.ok()).is_some_and(|p| p == path) {
-        let e = format!("{key} is SSH_CONFIG_FILE's file too (each would refuse the other's) — give it a path of its own");
-        return (format!("  ✗ {key:<28} {}", path.display()), Some(e));
+    if audience == Audience::Admin {
+        let var = arena_core::ssh::ADMIN_KEY_VAR;
+        match (arena_core::ssh::admin_key(cfg), arena_core::ssh::readable_admin_key(cfg)) {
+            (None, _) => {
+                let e = format!("{key}: {var} isn't set — staff's file names the admin key");
+                return (format!("  ✗ {key:<28} {} — {var} isn't set, nothing to write", path.display()), Some(e));
+            }
+            (Some(_), None) => {
+                return (format!("  · {key:<28} {} — not kept by this user: the admin key isn't readable here", path.display()), None)
+            }
+            _ => {}
+        }
+    }
+    if let Some(why) = sshconfig::one_per_user(audience, cfg, home) {
+        return (format!("  ✗ {key:<28} {} — {why}", path.display()), Some(format!("{key}: {why}")));
     }
     let home_path = home.map(std::path::Path::new);
     let (shown, abs) = home_path.map_or_else(|| (path.display().to_string(), path.display().to_string()), |h| include_forms(&path, h));
