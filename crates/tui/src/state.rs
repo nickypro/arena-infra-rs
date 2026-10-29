@@ -225,7 +225,7 @@ pub fn fill_tone(f: Fill) -> Option<Tone> {
 }
 
 /// `1 pod`, `0 pods`, `3 GPUs` — the bar said `1 pods`.
-fn count_of(n: usize, one: &str, many: &str) -> String {
+pub fn count_of(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
@@ -1259,10 +1259,11 @@ mod tests {
         assert!(text.starts_with(" 1 pod · "), "{text}");
         assert!(text.ends_with("  ·  openrouter $422.09 left · AI today $1.50"), "{text}");
         assert_eq!(ai_tone(Some(&calm)), None);
-        let short = CohortUsage { credit_left: Some(5.0), at_cap: 2, ..calm.clone() };
+        let capped = |name: &str, pod: bool| arena_core::openrouter::CappedKey { name: name.into(), pod };
+        let short = CohortUsage { credit_left: Some(5.0), capped: vec![capped("arena8-gone", false), capped("arena8-apple", true)], ..calm.clone() };
         let text = summary_text(&s, &cost, &["vast".to_string()], &[], Some(&short));
         assert!(
-            text.starts_with(" ⚠ vast failed to list — its pods (and their cost) are missing · ⚠ openrouter $5.00 left, the keys' caps allow $8.00 more · ⚠ 2 AI keys at cap · 1 pod · "),
+            text.starts_with(" ⚠ vast failed to list — its pods (and their cost) are missing · ⚠ openrouter $5.00 left, the keys' caps allow $8.00 more · ⚠ 2 AI keys at cap: arena8-gone (no pod), arena8-apple · 1 pod · "),
             "{text}"
         );
         assert_eq!(ai_tone(Some(&short)), Some(Tone::Warn));

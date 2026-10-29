@@ -592,9 +592,34 @@ impl KeyUsage {
         Some((self.limit? - self.spent?).max(0.0))
     }
 
+    /// What OpenRouter's own counters say it spent in its cap's period — today's for a daily
+    /// cap, …, the life's for a cap that never starts over. Not [`Self::spent`]: `limit −
+    /// limit_remaining` reads $0 for every $0 cap, whatever was spent before the cap went to 0.
+    fn period_usage(&self) -> Option<f64> {
+        match self.reset.as_deref() {
+            Some("daily") => self.today,
+            Some("weekly") => self.week,
+            Some("monthly") => self.month,
+            _ => self.total,
+        }
+    }
+
+    /// Paused rather than at its cap: an enabled key whose cap is $0 and that has spent
+    /// nothing in the cap's period (or nothing it says). Its calls fail as an exhausted key's
+    /// do, but by an operator's choice — a key handed out ahead of use, a participant held
+    /// back — not because someone ran it dry: the summary bar's "at cap" warning leaves it
+    /// out (the human, 2026-10-29: "why does it say 1 ai key at cap?" with every AI$ cell on
+    /// screen under its cap), and its cell says `paused`.
+    pub fn paused(&self) -> bool {
+        !self.disabled && self.limit.is_some_and(|l| l <= 0.0) && self.period_usage().or(self.spent).is_none_or(|s| s < 0.005)
+    }
+
     pub fn fill(&self) -> Fill {
         if self.disabled {
             return Fill::Full;
+        }
+        if self.paused() {
+            return Fill::Ok;
         }
         match (self.spent, self.limit) {
             (_, Some(l)) if l <= 0.0 => Fill::Full,
@@ -605,10 +630,14 @@ impl KeyUsage {
     }
 
     /// The `AI$` cell (at most 9 wide): `1.23/5` against a cap, `$0.42` without one, `off` when disabled,
-    /// `?` when the listing gave no spend.
+    /// `paused` for a $0 cap nothing was spent against ([`Self::paused`]), `?` when the listing
+    /// gave no spend.
     pub fn cell(&self) -> String {
         if self.disabled {
             return "off".into();
+        }
+        if self.paused() {
+            return "paused".into();
         }
         match (self.spent, self.limit) {
             (None, _) => "?".into(),
@@ -624,6 +653,9 @@ impl KeyUsage {
         let mut out = String::new();
         if self.disabled {
             out.push_str("disabled · ");
+        }
+        if self.paused() {
+            out.push_str("paused (a $0 cap, nothing spent against it) · ");
         }
         match self.limit {
             Some(l) => {
@@ -716,7 +748,10 @@ impl UsageView {
 
     /// This cohort's share: every key named `<prefix>-…` or after one of `pods` (an `@name`
     /// pod's key carries its bare name), summed for the summary bar — a disabled key's spend
-    /// today counts, its cap doesn't.
+    /// today counts, its cap doesn't; a paused one ([`KeyUsage::paused`]) isn't at its cap.
+    /// The keys at their cap are named, with whether a pod in `pods` carries each: a key of
+    /// the cohort's can outlive its pod (a terminated machine, a renamed one), and then no
+    /// row shows it.
     pub fn cohort(&self, prefix: &str, pods: &[String]) -> CohortUsage {
         let needle = format!("{prefix}-");
         let mut c = CohortUsage {
@@ -736,7 +771,7 @@ impl UsageView {
                 continue;
             }
             if k.fill() == Fill::Full {
-                c.at_cap += 1;
+                c.capped.push(CappedKey { name: name.clone(), pod: pods.iter().any(|p| p == name) });
             }
             match (k.limit, k.left()) {
                 (None, _) => c.uncapped += 1,
@@ -744,9 +779,22 @@ impl UsageView {
                 (Some(l), None) => c.headroom += l.max(0.0), // spend unknown: the whole cap may go
             }
         }
+        // The ones no row shows first: they're what the bar is for.
+        c.capped.sort_by(|a, b| a.pod.cmp(&b.pod).then_with(|| a.name.cmp(&b.name)));
         c
     }
 }
+
+/// A cohort key at its cap: its name, and whether a listed pod is named after it (else no
+/// row in the dashboard shows it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CappedKey {
+    pub name: String,
+    pub pod: bool,
+}
+
+/// How many keys at their cap the summary bar names; the rest are `+N more`.
+pub const CAPPED_NAMED: usize = 2;
 
 /// The cohort's keys added up, and the account's credit, for the summary bar.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -754,8 +802,9 @@ pub struct CohortUsage {
     pub keys: usize,
     /// Spent today by the cohort's keys (`None`: no key said).
     pub today: Option<f64>,
-    /// Enabled keys at their cap: those participants' AI calls fail.
-    pub at_cap: usize,
+    /// Enabled keys at their cap — those participants' AI calls fail — the ones no listed pod
+    /// carries first, then by name. Not the paused ones ($0 cap, nothing spent).
+    pub capped: Vec<CappedKey>,
     /// What the enabled keys may still spend under their caps.
     pub headroom: f64,
     /// Enabled keys with no cap: nothing bounds what they spend.
@@ -766,6 +815,21 @@ pub struct CohortUsage {
 }
 
 impl CohortUsage {
+    /// The summary bar's warning for keys at their cap, naming them — `⚠ AI key at cap:
+    /// arena9-foo (no pod)`, `⚠ 3 AI keys at cap: arena9-foo (no pod), arena9-bar +1 more` —
+    /// up to [`CAPPED_NAMED`]; `(no pod)`: no row shows it (`arena keys list` lists every key).
+    /// `None`: none at cap.
+    pub fn capped_names(&self) -> Option<String> {
+        let n = self.capped.len();
+        if n == 0 {
+            return None;
+        }
+        let named: Vec<String> = self.capped.iter().take(CAPPED_NAMED).map(|k| if k.pod { k.name.clone() } else { format!("{} (no pod)", k.name) }).collect();
+        let more = if n > CAPPED_NAMED { format!(" +{} more", n - CAPPED_NAMED) } else { String::new() };
+        let head = if n == 1 { "⚠ AI key at cap".to_string() } else { format!("⚠ {n} AI keys at cap") };
+        Some(format!("{head}: {}{more}", named.join(", ")))
+    }
+
     /// The summary bar's parts: a warning to lead it, if any (` ⚠ openrouter $12.00 left,
     /// the keys' caps allow $40.00 more ·`; `‼` when the credit is gone), the tail (`openrouter
     /// $422.09 left · AI today $3.20`), and how bad the warning is.
@@ -784,9 +848,8 @@ impl CohortUsage {
             }
             _ => {}
         }
-        if self.at_cap > 0 {
-            let keys = if self.at_cap == 1 { "key" } else { "keys" };
-            lead.push(format!("⚠ {} AI {keys} at cap", self.at_cap));
+        if let Some(names) = self.capped_names() {
+            lead.push(names);
             worst = worst.max(Fill::Near);
         }
         let lead = (!lead.is_empty()).then(|| format!(" {} ·", lead.join(" · ")));
@@ -1267,7 +1330,10 @@ mod tests {
             (Some(2.5), None, Some(2.6), "2.60/2.5", Fill::Full),
             (Some(0.02), Some(0.0), None, "0.02/0.02", Fill::Full),
             (None, None, Some(123.4), "$123", Fill::Ok),
-            (Some(0.0), None, Some(0.0), "0.00/0", Fill::Full),
+            // A $0 cap: paused while nothing was spent against it, else at its cap.
+            (Some(0.0), None, Some(0.0), "paused", Fill::Ok),
+            (Some(0.0), Some(0.0), None, "paused", Fill::Ok),
+            (Some(0.0), Some(0.0), Some(2.0), "0.00/0", Fill::Full),
             (Some(5.0), None, None, "?", Fill::Ok),
         ] {
             let k = usage(limit, rem, total, None);
@@ -1292,6 +1358,71 @@ mod tests {
         off.disabled = true;
         assert_eq!((off.cell().as_str(), off.fill()), ("off", Fill::Full));
         assert!(off.detail().starts_with("disabled · $0.00 of $5.00 ($5.00 left)"), "an unknown reset says no period: {}", off.detail());
+        off.limit = Some(0.0);
+        assert_eq!((off.cell().as_str(), off.fill(), off.paused()), ("off", Fill::Full, false), "disabled wins over paused");
+        let paused = usage(Some(0.0), Some(0.0), Some(4.0), Some("monthly"));
+        assert_eq!((paused.cell().as_str(), paused.fill()), ("0.00/0", Fill::Full), "$1.23 spent this month against a $0 cap: at it");
+        let paused = KeyUsage { month: Some(0.0), ..paused };
+        assert_eq!((paused.cell().as_str(), paused.fill()), ("paused", Fill::Ok), "nothing this month, though $4 in its life");
+        assert!(paused.detail().starts_with("paused (a $0 cap, nothing spent against it) · $0.00 of $0.00 this month"), "{}", paused.detail());
+    }
+
+    /// The summary bar names the cohort's keys at their cap — the ones no listed pod carries
+    /// first (`(no pod)`: no row shows them), then by name — up to two, then `+N more`. A paused
+    /// key ($0 cap, nothing spent in its period) and a disabled one aren't counted; a $0 cap
+    /// that was spent against is; a key outside the cohort never is.
+    #[test]
+    fn cohort_names_its_keys_at_cap() {
+        #[allow(clippy::type_complexity)]
+        let k = |name: &str, limit: f64, remaining: Option<f64>, today: Option<f64>, total: Option<f64>, reset: Option<&str>, disabled: bool| KeyInfo {
+            hash: format!("h-{name}"),
+            name: Some(name.into()),
+            disabled,
+            limit: Some(limit),
+            limit_remaining: remaining,
+            usage_daily: today,
+            usage: total,
+            limit_reset: reset.map(String::from),
+            ..Default::default()
+        };
+        let full = |n: &str| k(n, 5.0, Some(0.0), Some(5.0), Some(9.0), Some("daily"), false);
+        let under = |n: &str| k(n, 5.0, Some(4.0), Some(1.0), Some(9.0), Some("daily"), false);
+        let off = |n: &str| k(n, 5.0, Some(0.0), Some(5.0), Some(9.0), Some("daily"), true);
+        // $0 daily caps: $3 in its life but nothing today (paused); $0.40 today (at cap).
+        let paused_daily = |n: &str| k(n, 0.0, Some(0.0), Some(0.0), Some(3.0), Some("daily"), false);
+        let spent_daily = |n: &str| k(n, 0.0, Some(0.0), Some(0.4), Some(3.0), Some("daily"), false);
+        // $0 caps that never start over: nothing in its life (paused), nothing said (paused),
+        // $2 in its life (at cap).
+        let paused_new = |n: &str| k(n, 0.0, None, None, Some(0.0), None, false);
+        let paused_unsaid = |n: &str| k(n, 0.0, None, None, None, None, false);
+        let spent_life = |n: &str| k(n, 0.0, None, None, Some(2.0), None, false);
+        let pods = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let cases: Vec<(Vec<KeyInfo>, Vec<String>, Vec<(&str, bool)>, Option<&str>)> = vec![
+            (vec![under("devtest-a")], pods(&["devtest-a"]), vec![], None),
+            (vec![full("devtest-a")], pods(&["devtest-a"]), vec![("devtest-a", true)], Some("⚠ AI key at cap: devtest-a")),
+            (vec![full("devtest-foo")], pods(&["devtest-a"]), vec![("devtest-foo", false)], Some("⚠ AI key at cap: devtest-foo (no pod)")),
+            (vec![paused_daily("devtest-a"), paused_new("devtest-b"), paused_unsaid("devtest-c"), off("devtest-d")], pods(&["devtest-a"]), vec![], None),
+            (
+                vec![spent_daily("devtest-a"), spent_life("devtest-b")],
+                pods(&["devtest-a", "devtest-b"]),
+                vec![("devtest-a", true), ("devtest-b", true)],
+                Some("⚠ 2 AI keys at cap: devtest-a, devtest-b"),
+            ),
+            (
+                vec![full("devtest-z"), full("devtest-y"), full("devtest-x"), full("devtest-w"), full("james-gpu"), off("devtest-v"), full("other-a")],
+                pods(&["devtest-z", "devtest-y", "james-gpu"]),
+                vec![("devtest-w", false), ("devtest-x", false), ("devtest-y", true), ("devtest-z", true), ("james-gpu", true)],
+                Some("⚠ 5 AI keys at cap: devtest-w (no pod), devtest-x (no pod) +3 more"),
+            ),
+        ];
+        for (keys, pods, want, lead) in cases {
+            let c = UsageView::from_keys(&keys, None).cohort("devtest", &pods);
+            let got: Vec<(&str, bool)> = c.capped.iter().map(|k| (k.name.as_str(), k.pod)).collect();
+            assert_eq!(got, want, "{keys:?}");
+            assert_eq!(c.capped_names().as_deref(), lead);
+            assert_eq!(c.tui_parts().0, lead.map(|l| format!(" {l} ·")));
+            assert_eq!(c.tui_parts().2, if lead.is_some() { Fill::Near } else { Fill::Ok });
+        }
     }
 
     /// A name held twice shows the enabled key, then the newest; the cohort is the keys named
@@ -1321,16 +1452,16 @@ mod tests {
         assert_eq!(v.keys["devtest-apple"].spent, Some(1.0), "the enabled key wins over newer disabled ones");
         let c = v.cohort("devtest", &["james-gpu".to_string()]);
         // Every key counts in the totals (the disabled ones' spend today too); caps only the enabled.
-        assert_eq!((c.keys, c.at_cap, c.uncapped), (5, 1, 0));
+        assert_eq!((c.keys, c.capped.len(), c.uncapped), (5, 1, 0));
         assert!((c.today.unwrap() - 21.5).abs() < 1e-9 && (c.headroom - 14.0).abs() < 1e-9, "{c:?}");
         let (lead, tail, fill) = c.tui_parts();
-        assert_eq!(lead.as_deref(), Some(" ⚠ openrouter $10.00 left, the keys' caps allow $14.00 more · ⚠ 1 AI key at cap ·"));
+        assert_eq!(lead.as_deref(), Some(" ⚠ openrouter $10.00 left, the keys' caps allow $14.00 more · ⚠ AI key at cap: devtest-bloom (no pod) ·"));
         assert_eq!(tail.as_deref(), Some("openrouter $10.00 left · AI today $21.50"));
         assert_eq!(fill, Fill::Near);
         let gone = CohortUsage { credit_left: Some(0.0), ..c.clone() };
         assert_eq!(gone.tui_parts().2, Fill::Full);
         assert!(gone.tui_parts().0.unwrap().starts_with(" ‼ openrouter $0.00 left — every key's calls fail"));
-        let calm = CohortUsage { credit_left: Some(100.0), at_cap: 0, ..c.clone() };
+        let calm = CohortUsage { credit_left: Some(100.0), capped: Vec::new(), ..c.clone() };
         assert_eq!(calm.tui_parts().0, None);
         let failed = CohortUsage { failed: true, uncapped: 2, ..calm };
         assert_eq!(failed.tui_parts().1.as_deref(), Some("openrouter $100.00 left · AI today $21.50 · 2 uncapped · (n/a)"));

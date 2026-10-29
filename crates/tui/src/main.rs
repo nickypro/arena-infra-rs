@@ -81,7 +81,7 @@ use arena_core::status::pod_status;
 use state::{
     action_summary, capture_details, carry_over, remember_good, dashboard_snapshot, details_due, display_name, health_cell, listing_note, mark_key, marked_pods,
     marked_set_token, merge_details, overlay_details, partial_notice, proxy_cell, proxy_detail, rtt_cell,
-    provider_title, select_marks, short_branch, spark, summarize, summary_text, Action, Confirm, DeepChecks, Endpoint,
+    provider_title, select_marks, short_branch, spark, summarize, summary_text, count_of, Action, Confirm, DeepChecks, Endpoint,
     FleetSummary, History, PodDetails, Rtts, Throttle, Tone, RTT_EVERY, RTT_WAIT,
 };
 use newpod::NewPodForm;
@@ -2970,14 +2970,15 @@ fn columns_that_fit(w: usize, core: &[usize], optional: &[usize]) -> usize {
 }
 
 /// A pod's `AI$` cell: its OpenRouter key's spend against the cap (`-`: no key named after
-/// it), yellow from 80% of the cap, red at the cap or disabled — grey when the last listing
-/// failed (`stale`: these are older numbers, the summary bar says `(n/a)`).
+/// it), yellow from 80% of the cap, red at the cap or disabled, a grey `paused` for a $0 cap
+/// nothing was spent against — grey when the last listing failed (`stale`: these are older
+/// numbers, the summary bar says `(n/a)`).
 fn ai_cell(k: Option<&KeyUsage>, stale: bool, read: bool) -> Cell<'static> {
     match k {
         // Before the first read lands: not known yet, rather than "no key".
         None if !read => Cell::from("…").style(tone_style(Tone::Dim)),
         None => Cell::from("-").style(tone_style(Tone::Dim)),
-        Some(k) if stale => Cell::from(k.cell()).style(tone_style(Tone::Dim)),
+        Some(k) if stale || k.paused() => Cell::from(k.cell()).style(tone_style(Tone::Dim)),
         Some(k) => {
             let style = state::fill_tone(k.fill()).map(tone_style).unwrap_or_default();
             Cell::from(k.cell()).style(style)
@@ -3411,7 +3412,15 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         (Some(k), _, None) => k.detail(),
         (Some(k), _, Some(_)) => format!("{} (as last read; the latest read failed)", k.detail()),
     });
-    let fact_lines = FACT_LINES + u16::from(ai.is_some());
+    // The cohort's keys at their cap, under it, while there are any: every name (the summary
+    // bar has room for two) and where to look — a key can be at its cap with no pod in the
+    // table (its machine terminated or renamed).
+    let caps = shared.ai.as_ref().and(shared.ai_cohort.as_ref()).filter(|c| !c.capped.is_empty()).map(|c| {
+        let names: Vec<String> = c.capped.iter().map(|k| if k.pod { k.name.clone() } else { format!("{} (no pod)", k.name) }).collect();
+        // Where to look first: a long list is cut at the pane's edge.
+        format!("⚠ {} at cap (`arena keys list` has each one's cap and spend): {}", count_of(names.len(), "key", "keys"), names.join(", "))
+    });
+    let fact_lines = FACT_LINES + u16::from(ai.is_some()) + u16::from(caps.is_some());
     let show_graphs = inner.height >= fact_lines + 3 + procs_h + commits_h + 6;
 
     let mut constraints: Vec<Constraint> = vec![
@@ -3528,7 +3537,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         fit(format!("{place}  ·  {rtt}")),
         proxy,
         cost,
-        ai.map(|a| format!("ai key:   {}\n", fit(a))).unwrap_or_default(),
+        ai.map(|a| format!("ai key:   {}\n", fit(a))).unwrap_or_default() + &caps.map(|c| format!("ai caps:  {}\n", fit(c))).unwrap_or_default(),
         maint,
         health,
         why,
@@ -4576,6 +4585,47 @@ deep_check_end=1
         ui.selected = shared.pods.iter().position(|p| p.name.ends_with("charlie")).unwrap();
         let pane = draw(160, 40, &shared, &ui).join("\n");
         assert!(pane.contains("where:    -  ·  rtt -"), "{pane}");
+    }
+
+    /// The human (2026-10-29, prod's dashboard): "why does it say 1 ai key at cap?" — every AI$
+    /// cell on screen was under its cap. The bar names the keys at their cap, `(no pod)` for one
+    /// no row shows; the detail pane lists them and says where to look. A $0 key nothing was
+    /// spent against reads `paused` in its row and isn't counted.
+    #[test]
+    fn keys_at_cap_are_named_and_a_paused_key_isnt_one() {
+        use arena_core::openrouter::KeyInfo;
+        let mut shared = fixture_shared();
+        let key = |name: &str, limit: f64, left: f64, today: f64| KeyInfo {
+            hash: name.into(),
+            name: Some(name.into()),
+            limit: Some(limit),
+            limit_remaining: Some(left),
+            usage_daily: Some(today),
+            limit_reset: Some("daily".into()),
+            ..Default::default()
+        };
+        let view = UsageView::from_keys(&[key("devtest-alpha", 0.0, 0.0, 0.0), key("devtest-bravo", 5.0, 3.0, 2.0), key("devtest-gone", 5.0, 0.0, 5.0)], None);
+        let names: Vec<String> = shared.pods.iter().map(|p| p.name.clone()).collect();
+        shared.ai_cohort = Some(view.cohort("devtest", &names));
+        shared.ai = Some(view);
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let lines = draw(220, 40, &shared, &ui);
+        let screen = lines.join("\n");
+        assert!(screen.contains(" ⚠ AI key at cap: devtest-gone (no pod) · 4 pods"), "{screen}");
+        assert!(row(&lines, "alpha").contains(" paused "), "{}", row(&lines, "alpha"));
+        assert!(row(&lines, "bravo").contains(" 2.00/5 "), "{}", row(&lines, "bravo"));
+        ui.mode = Mode::Detail;
+        ui.selected = shared.pods.iter().position(|p| p.name == "devtest-alpha").unwrap();
+        let pane = draw(220, 50, &shared, &ui).join("\n");
+        assert!(pane.contains("ai key:   paused (a $0 cap, nothing spent against it) · $0.00 of $0.00 today"), "{pane}");
+        assert!(pane.contains("ai caps:  ⚠ 1 key at cap (`arena keys list` has each one's cap and spend): devtest-gone (no pod)"), "{pane}");
+        // A pod named after it: no `(no pod)`. None at cap (only the paused one): no line.
+        shared.ai_cohort = Some(shared.ai.as_ref().unwrap().cohort("devtest", &[names, vec!["devtest-gone".into()]].concat()));
+        let pane = draw(220, 50, &shared, &ui).join("\n");
+        assert!(pane.contains("spend): devtest-gone ") && !pane.contains("(no pod)"), "{pane}");
+        shared.ai = Some(UsageView::from_keys(&[key("devtest-alpha", 0.0, 0.0, 0.0)], None));
+        shared.ai_cohort = Some(shared.ai.as_ref().unwrap().cohort("devtest", &[]));
+        assert!(!draw(220, 50, &shared, &ui).join("\n").contains("ai caps:"));
     }
 
     /// The pure column fit: always a prefix of the optional columns, so widening only adds.
