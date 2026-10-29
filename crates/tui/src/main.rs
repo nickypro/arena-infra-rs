@@ -677,8 +677,10 @@ async fn refresh(
             None => None,
         }
     };
-    // RTT: the endpoints due a timing ([`RTT_EVERY`]), timed alongside the SSH probes — each
-    // bounded by [`RTT_WAIT`], well inside the probes' own budget, so the round isn't longer.
+    // RTT: the endpoints due a timing ([`RTT_EVERY`]), timed alongside the SSH probes, all at
+    // once, the whole timing bounded by [`RTT_WAIT`] — inside the probes' own budget when they
+    // run; at worst a refresh with an endpoint that doesn't answer and nothing else to wait on
+    // takes up to that second longer, once a minute.
     let rtt_due = details.rtt.as_ref().map(|r| r.due(&pods, Instant::now())).unwrap_or_default();
     let (metrics, observed, timed) = if details_due(details.last.map(|t| t.elapsed()), forced) {
         let mut enriched = pods.clone();

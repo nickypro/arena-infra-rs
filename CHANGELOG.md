@@ -24,8 +24,11 @@ earlier).
 - Vast: offers in European countries first, priced at the cheapest one there, never rented dearer
   than the margin allows.
 - `arena offers` and the dry-runs show the order with a WHERE column (`Europe`/`any`) and say why
-  an option isn't tried near. If Europe has no room, the same option is tried anywhere, and Europe
-  isn't asked again for the rest of the run: a 10-pod `up` with Europe full makes 11 creates, not 20.
+  an option isn't tried near. A single SECURE or Vast create now shows that option table before
+  its prompt, as a create with several options does; with `--keep-trying` it stays one pool,
+  anywhere, and says so. If Europe has no room, the same option is tried anywhere, and on RunPod
+  Europe isn't asked again for the rest of the run: a 10-pod `up` with Europe full makes 11
+  creates, not 20.
 - The dashboard has an RTT column: the round trip from this box to each pod's SSH port, green under
   60 ms, yellow under 120, red beyond. It's timed once a minute, after the rows are shown. The
   detail pane's new `where:` line shows it beside where the pod runs (`EUR-IS-1`, `Czechia, CZ`,

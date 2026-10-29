@@ -779,10 +779,11 @@ The order: cheapest-first — every near option within the margin (cheapest firs
 every option anywhere, as before; `--order listed` — each option near just before it's tried
 anywhere, so the GPU order still comes first. The option table gets a WHERE column (`Europe`/`any`)
 and a note with the margin and what wasn't tried near, and why. A near option with no capacity falls
-through to the next, never a failure — and is out **for the rest of the run**: its anywhere twin
-covers the same places, so a cohort spends one create on a full region, not one per name and round
-(RunPod limits requests per key, shared by every dashboard and cron on it). A 10-pod `up` with
-Europe full: 11 creates; with it off: 10. `--keep-trying` waits on one pool, so it keeps the single
+through to the next, never a failure — and on RunPod is out **for the rest of the run**: its
+anywhere twin covers the same data centres, so a cohort spends one create on a full region, not one
+per name and round (RunPod limits requests per key, shared by every dashboard and cron on it). A
+10-pod `up` with Europe full: 11 creates; with it off: 10. On Vast it's out for the round, like any
+capacity block: its "no capacity" is one market search's answer, and the next round searches again. `--keep-trying` waits on one pool, so it keeps the single
 path (anywhere) and says so; `--retry-mins` keeps near.
 
 #### `--api-json` and `CREATE_EXTRA_JSON`

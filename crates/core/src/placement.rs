@@ -24,9 +24,10 @@
 //! option can also be tried in the proxy's region first. The plan then holds a near twin of
 //! each option it's worth it for — cheapest-first: every near option within the margin over
 //! the cheapest acceptable option, then everything anywhere; as listed: each option near, then
-//! anywhere. A near option that reports no capacity is out for the rest of the run: its
-//! anywhere twin covers the same places, so a cohort spends one create on a full region, not
-//! one per name and round (RunPod's API limits are per key, shared by every dashboard).
+//! anywhere. A near RunPod option that reports no capacity is out for the rest of the run:
+//! its anywhere twin covers the same data centres, so a cohort spends one create on a full
+//! region, not one per name and round (RunPod's API limits are per key, shared by every
+//! dashboard). A near Vast option, a market search's answer, is blocked for the round.
 
 use std::future::Future;
 use std::str::FromStr;
@@ -215,6 +216,9 @@ pub struct PriceBook {
     offers: Vec<(String, f64)>,
     /// The same, among offers near the proxy only ([`Self::with_near_offers`]).
     near_offers: Vec<(String, f64)>,
+    /// Whether the market was searched near the proxy at all — without it (no key) a GPU
+    /// missing from `near_offers` says nothing about the region.
+    near_searched: bool,
 }
 
 impl PriceBook {
@@ -245,6 +249,7 @@ impl PriceBook {
     pub fn with_near_offers(mut self, per_pod: Vec<(String, f64)>, gpu_count: u32) -> Self {
         let n = f64::from(gpu_count.max(1));
         self.near_offers = per_pod.into_iter().map(|(gpu, p)| (gpu, p / n)).collect();
+        self.near_searched = true;
         self
     }
 
@@ -614,6 +619,12 @@ fn near_first(
     notes: &mut Vec<String>,
 ) -> Vec<PlacementOption> {
     let region = n.region.label();
+    // A marketplace not searched near the proxy (no key: nothing was searched at all) can't
+    // say the region lacks anything — no near option, and no claim about the region.
+    if provider != "runpod" && !prices.near_searched {
+        notes.push(format!("near the proxy (NEAR={}): {region} not searched — every option anywhere", n.region.key()));
+        return anywhere;
+    }
     let cheapest = anywhere.iter().filter_map(|o| o.price_per_pod).min_by(f64::total_cmp);
     let mut community = false;
     let mut why_not = Vec::new();
@@ -1025,10 +1036,11 @@ impl Progress<'_> {
 /// ([`PodSpec::max_price`]) — a near option's own cap when lower — which a marketplace
 /// backend enforces on the offer it rents.
 ///
-/// A near option ([`PlacementOption::near`]) that reports no capacity is out for the rest of
-/// the *run*, not just the round: the same option anywhere includes the region's data centres
-/// or countries, so nothing is lost but the preference — and a 60-pod `up` spends one create
-/// on a full region instead of one per name and round (RunPod limits requests per key).
+/// A near RunPod option ([`PlacementOption::near`]) that reports no capacity is out for the
+/// rest of the *run*, not just the round: the same option anywhere includes the region's data
+/// centres, so nothing is lost but the preference — and a 60-pod `up` spends one create on a
+/// full region instead of one per name and round (RunPod limits requests per key). A near Vast
+/// option is blocked for the round only: its "no capacity" is one market search's answer.
 #[allow(clippy::too_many_arguments)] // the run's independent inputs; a one-use struct for them would add nothing
 pub async fn place<W, F>(
     provider: &dyn Provider,
@@ -1055,7 +1067,7 @@ where
     // unlike capacity blocks, never cleared.
     let mut denied = vec![false; plan.options.len()];
     let mut rejected = vec![false; plan.options.len()];
-    // Near options that found no capacity: out for the run (see above).
+    // Near RunPod options that found no capacity: out for the run (see above).
     let mut near_full = vec![false; plan.options.len()];
     let mut round = 0u32;
     let end = 'run: loop {
@@ -1088,7 +1100,11 @@ where
                     Err(e) => match e.kind() {
                         Some(ProviderErrorKind::Capacity) => {
                             blocked[k] = true;
-                            near_full[k] = option.near.is_some();
+                            // RunPod's full region: out for the run (each create is a POST against
+                            // the key's limit). A marketplace's near "no capacity" is a snapshot
+                            // a fresh search can change (an offer raced, prices moved): only
+                            // for the round, like any other (review: claude).
+                            near_full[k] = option.near.is_some() && plan.provider == "runpod";
                             (Outcome::Capacity(e.to_string()), None)
                         }
                         Some(ProviderErrorKind::Denied) => {
@@ -2323,6 +2339,29 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
             ]
         );
         assert_eq!(lines[1], "[no capacity] devtest-near-apple on 1×RTX A4000 SECURE — no option left this round");
+    }
+
+    /// Review (claude): a near Vast "no capacity" is one market search's answer — blocked for
+    /// the round, tried again the next (a RunPod region stays out for the run).
+    #[tokio::test(start_paused = true)]
+    async fn a_marketplace_region_is_retried_the_next_round() {
+        let book = PriceBook::offers(vec![(A4000.into(), 0.10)], 1).with_near_offers(vec![(A4000.into(), 0.11)], 1);
+        let plan = plan_options(&near_req(&[A4000], &["COMMUNITY"], None, Order::Cheapest, EU), "vast", &book);
+        let fake = Fake::new(Reply::Capacity).script(A4000, "COMMUNITY@europe", &[Reply::Capacity, Reply::Ok]);
+        let rounds = Rounds { window: Duration::from_secs(600), every: Duration::from_secs(60) };
+        let (out, _) = run(&fake, &plan, &["devtest-near-apple"], rounds, None).await;
+        assert!(matches!(out.end, End::Filled), "{:?}", out.end);
+        let clouds: Vec<String> = fake.calls().into_iter().map(|c| c.2).collect();
+        assert_eq!(clouds, ["COMMUNITY@europe", "COMMUNITY", "COMMUNITY@europe"], "round 2 tries Europe again, and gets it");
+    }
+
+    /// Without a near search (no Vast key: nothing searched) the plan claims nothing about the
+    /// region — review (claude): it said "no matching offer in Europe right now".
+    #[test]
+    fn an_unsearched_region_is_said_so() {
+        let plan = plan_options(&near_req(&[A4000], &["COMMUNITY"], None, Order::Cheapest, EU), "vast", &PriceBook::offers(vec![(A4000.into(), 0.10)], 1));
+        assert!(plan.options.iter().all(|o| o.near.is_none()));
+        assert_eq!(plan.notes, ["near the proxy (NEAR=europe): Europe not searched — every option anywhere"]);
     }
 
     /// A near Vast option carries its margin as the create's cap (the marketplace picks the
