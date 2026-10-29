@@ -945,7 +945,7 @@ placement shows here unchanged. `create`/`up` use **one** provider per run (`--p
   key) are an error: nothing to show. `--cloud` is RunPod's (it collapses
   elsewhere, with a note when several were asked for).
 - **Hetzner's row** is the VM `up --provider hetzner` would create: `--server-type` over
-  `HETZNER_SERVER_TYPE` (default `cx23`), its vCPUs and RAM, and its gross €/h where the create's
+  `HETZNER_SERVER_TYPE` (default `cx33`), its vCPUs and RAM, and its gross €/h where the create's
   location walk starts (one `GET /server_types`, plus the same nearest-first timing a create does;
   the walk is in a note). Placement itself quotes no price for it, so `--max-price` drops it ("no
   known price"), exactly as `create --provider hetzner --max-price …` would. Without
