@@ -334,6 +334,14 @@ async fn either_install_sees_the_other_file_however_it_is_included() {
             "~/.ssh/config includes",
         ),
         ("env", vec![], "Include ${HOME}/.ssh/arena.conf\n", Audience::Admin, "has an Include arena can't follow (${HOME}/.ssh/arena.conf)"),
+        // ssh's glob reads `arena\.conf` as `arena.conf`: arena can't tell, so it refuses.
+        (
+            "escaped",
+            vec![("arena.conf", theirs.as_str())],
+            "Include ~/.ssh/arena\\.conf\n",
+            Audience::Admin,
+            "has an Include arena can't follow (~/.ssh/arena\\.conf)",
+        ),
     ] {
         let h = home(&format!("guard-{tag}"));
         for (name, text) in files {

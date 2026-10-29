@@ -625,8 +625,8 @@ pub fn config_path_problem(path: &str) -> Option<String> {
 /// as `home`, a relative path under `~/.ssh`, `*` and `?` patterns matched against what exists,
 /// and the included files' own `Include`s followed (to ssh's depth of 16). For telling whether
 /// arena's other file is in use. Reads those files, never writes. `Err(argument)`: one arena
-/// can't resolve (a `${…}` or `%` token, a `[…]` class, or no home to resolve it against) — the
-/// caller can't tell what it includes, and mustn't guess "nothing".
+/// can't resolve ([`include_target`]: a token, an escape, a class, no home to resolve it against)
+/// — the caller can't tell what it includes, and mustn't guess "nothing".
 pub fn included_files(config: &str, home: Option<&str>) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     follow_includes(config, home, 0, &mut out)?;
@@ -695,11 +695,12 @@ fn include_args(line: &str) -> Option<Vec<String>> {
 }
 
 /// Where one `Include` argument points in a user config: `~/` (or `~`) against `home`, a relative
-/// path under `~/.ssh`, an absolute one as it is. `None` when it holds a `${…}` or `%` token or a
-/// `[…]` class (glob(3)'s classes — `[[:alpha:]]` and the rest — aren't matched here), or needs a
-/// home there's none of. Pure.
+/// path under `~/.ssh`, an absolute one as it is. `None` — can't be told — for anything ssh might
+/// read otherwise than as plain characters and `*`/`?`: a `${…}` or `%` token, a backslash escape
+/// (`arena\.conf` is `arena.conf` to glob(3)), a `[…]` class (`[[:alpha:]]` and the rest), braces,
+/// a control character; or for a path that needs a home there's none of. Pure.
 fn include_target(arg: &str, home: Option<&str>) -> Option<PathBuf> {
-    if arg.contains(['$', '%', '[']) {
+    if arg.chars().any(|c| c.is_control() || "\\$%[]{}".contains(c)) {
         return None;
     }
     let home = home.map(str::trim).filter(|h| h.starts_with('/'));
@@ -1113,6 +1114,10 @@ mod tests {
         assert_eq!(included_files("Include arena.conf\n", None), Err("arena.conf".to_string()));
         // A `[…]` class (glob(3)'s `[[:alpha:]]` among them) isn't matched here: can't tell, never "nothing".
         assert_eq!(included_files("Include ~/.ssh/[[:alpha:]]*.conf\n", h), Err("~/.ssh/[[:alpha:]]*.conf".to_string()));
+        // A backslash escape (glob(3) reads `arena\.conf` as `arena.conf`), braces, a control char.
+        for arg in ["~/.ssh/arena\\.conf", "~/.ssh/{arena,x}.conf", "~/.ssh/a\u{7}b"] {
+            assert_eq!(included_files(&format!("Include {arg}\n"), h), Err(arg.to_string()), "{arg}");
+        }
         assert_eq!(included_files("Include /nonexistent-arena/*.conf\nHost x\n", None), Ok(vec![]));
         for (pat, name, hit) in [
             ("*.conf", "arena.conf", true),

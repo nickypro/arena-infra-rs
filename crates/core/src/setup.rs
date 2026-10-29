@@ -1563,6 +1563,46 @@ mod tests {
         }
     }
 
+    /// The authorize command as a machine runs it (`sh`, a temp `$HOME`, a real key from
+    /// `ssh-keygen`): every machine's key once, the copied deploy key's own public half derived on
+    /// the spot even though the copy left it 0644 (it's 0600 after), and a second run adds nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_authorize_command_runs_and_adds_each_key_once() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("ssh-keygen").arg("-?").output().is_err() {
+            return; // no ssh-keygen here
+        }
+        let home = std::env::temp_dir().join(format!("arena-authorize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let key = home.join("deploy_key");
+        let made = std::process::Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-C", "deploy", "-f"]).arg(&key).output().unwrap();
+        assert!(made.status.success(), "{made:?}");
+        std::fs::remove_file(home.join("deploy_key.pub")).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let keys = ["ssh-ed25519 AAAAC3NzaSHARED cohort", "ssh-ed25519 AAAAC3NzaADMIN staff@proxy"];
+        let scfg = SetupConfig {
+            key_remote: key.display().to_string(),
+            authorized_pubkeys: keys.iter().map(|k| k.to_string()).collect(),
+            ..steps_cfg()
+        };
+        let run = || {
+            let o = std::process::Command::new("sh").arg("-c").arg(scfg.authorized_keys_command()).env("HOME", &home).output().unwrap();
+            assert!(o.status.success(), "{o:?}");
+        };
+        run();
+        run();
+        let ak = std::fs::read_to_string(home.join(".ssh/authorized_keys")).unwrap();
+        let lines: Vec<&str> = ak.lines().collect();
+        assert_eq!(lines.len(), 3, "{ak}");
+        assert_eq!(lines[..2], keys);
+        assert!(lines[2].starts_with("ssh-ed25519 ") && lines[2].ends_with(" deploy"), "{ak}");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&key), mode(&home.join(".ssh")), mode(&home.join(".ssh/authorized_keys"))), (0o600, 0o700, 0o600));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn setup_timeouts_resolve_flag_over_config_over_defaults() {
         let d = SetupTimeouts::default();
