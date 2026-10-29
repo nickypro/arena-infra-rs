@@ -70,6 +70,8 @@ pub struct SetupConfig {
     /// Move the repo onto the pod's volume (image-based pods; on by default, `REPO_ON_VOLUME=0`
     /// turns it off).
     pub relocate: bool,
+    /// GB of swap the bare-VM script makes (`VM_SWAP_GB`, [`swap_gb`]); 0 = none.
+    pub swap_gb: u32,
 }
 
 impl SetupConfig {
@@ -90,6 +92,7 @@ impl SetupConfig {
             .unwrap_or_else(|| format!("/root/{name}"));
         let vscode = crate::vscode::VscodeSetup::from_config(cfg, &repo_path)?;
         let relocate = crate::volume::relocation_enabled(cfg.get("REPO_ON_VOLUME"))?;
+        let swap_gb = swap_gb(cfg)?;
         Ok(Self {
             // Resolve to a readable copy (prefer ~/.ssh/<name> if the configured path
             // isn't readable), same as the shared key — so `setup` works when run as a
@@ -106,6 +109,7 @@ impl SetupConfig {
             zsh_install: false,
             vscode,
             relocate,
+            swap_gb,
         })
     }
 
@@ -317,6 +321,27 @@ ZSH_BIN=$(command -v zsh); [ -n "$ZSH_BIN" ] && chsh -s "$ZSH_BIN" "$(id -un)" >
 /// The public course repo the pods' checkout gets as its `upstream` remote, unless
 /// `ARENA_UPSTREAM_REPO` names another (`owner/name`) or `none`.
 pub const DEFAULT_UPSTREAM_REPO: &str = "ARENA-education/ARENA_materials";
+
+/// The swap a bare VM gets when set up when `VM_SWAP_GB` isn't set: a cx23 has 4 GB of RAM and a
+/// cx33 8 GB, and a notebook that loads a model or two passes that — without swap the OOM killer
+/// ends the participant's kernel; with it the box only slows down.
+pub const DEFAULT_SWAP_GB: u32 = 8;
+
+/// The most `VM_SWAP_GB` may ask for: more is a typo (a disk's worth), not a plan.
+pub const MAX_SWAP_GB: u32 = 64;
+
+/// `VM_SWAP_GB`: GB of swap the bare-VM setup script makes (Hetzner and other plain VMs — a
+/// container pod can't swap); [`DEFAULT_SWAP_GB`] when unset or empty, 0 = none. Checked here,
+/// before anything runs on a pod: it goes into the script's command line. Pure.
+pub fn swap_gb(cfg: &Config) -> Result<u32> {
+    let Some(raw) = cfg.get("VM_SWAP_GB").map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_SWAP_GB);
+    };
+    match raw.parse::<u32>() {
+        Ok(gb) if gb <= MAX_SWAP_GB => Ok(gb),
+        _ => Err(Error::Config(format!("VM_SWAP_GB must be a whole number of GB from 0 (no swap) to {MAX_SWAP_GB}, not {raw:?}"))),
+    }
+}
 
 /// The URL of the `upstream` remote setup adds to each pod's checkout: the public course repo
 /// (`ARENA_UPSTREAM_REPO`, default [`DEFAULT_UPSTREAM_REPO`]) over https — public, so no key —
@@ -549,7 +574,8 @@ pub fn provisioning_steps(
             ProvisionStep::Run {
                 label: "hetzner setup script",
                 cmd: format!(
-                    "{upstream}REPO_URL={} REPO_DIR={} REPO_KEY={} bash /root/hetzner_setup.sh",
+                    "ARENA_SWAP_GB={} {upstream}REPO_URL={} REPO_DIR={} REPO_KEY={} bash /root/hetzner_setup.sh",
+                    scfg.swap_gb,
                     shell_quote(&scfg.repo_url),
                     shell_quote(&scfg.repo_path),
                     shell_quote(&scfg.key_remote),
@@ -568,8 +594,9 @@ pub fn provisioning_steps(
             ProvisionStep::Run {
                 label: "GPU VM setup script",
                 cmd: format!(
-                    "ARENA_GPU=1 ARENA_MACHINE_NAME={} {upstream}REPO_URL={} REPO_DIR={} REPO_KEY={} bash /root/hetzner_setup.sh",
+                    "ARENA_GPU=1 ARENA_MACHINE_NAME={} ARENA_SWAP_GB={} {upstream}REPO_URL={} REPO_DIR={} REPO_KEY={} bash /root/hetzner_setup.sh",
                     shell_quote(name),
+                    scfg.swap_gb,
                     shell_quote(&scfg.repo_url),
                     shell_quote(&scfg.repo_path),
                     shell_quote(&scfg.key_remote),
@@ -1023,6 +1050,7 @@ mod tests {
             zsh_install: false,
             vscode: None,
             relocate: true,
+            swap_gb: DEFAULT_SWAP_GB,
         }
     }
 
@@ -1240,8 +1268,40 @@ mod tests {
                 })
                 .unwrap()
         };
-        assert!(script(&with).starts_with(&format!("UPSTREAM_URL='{up}' REPO_URL='git@github.com:o/r.git' ")), "{}", script(&with));
+        assert!(script(&with).starts_with(&format!("ARENA_SWAP_GB=8 UPSTREAM_URL='{up}' REPO_URL='git@github.com:o/r.git' ")), "{}", script(&with));
         assert!(!script(&steps_cfg()).contains("UPSTREAM_URL"));
+    }
+
+    /// `VM_SWAP_GB`: 8 when unset or empty, 0 for none, refused when it isn't a whole number of
+    /// GB up to the cap — it goes into the script's command line — and the VM commands carry it.
+    #[test]
+    fn vm_swap_gb_defaults_to_8_and_is_checked() {
+        let gb = |extra: &str| swap_gb(&Config::parse(extra));
+        assert_eq!(gb("").unwrap(), 8);
+        assert_eq!(gb("VM_SWAP_GB=\n").unwrap(), 8);
+        assert_eq!(gb("VM_SWAP_GB=0\n").unwrap(), 0);
+        assert_eq!(gb("VM_SWAP_GB= 16 \n").unwrap(), 16);
+        assert_eq!(gb("VM_SWAP_GB=64\n").unwrap(), 64);
+        for bad in ["65", "-1", "8G", "8.5", "4 GB", "$(reboot)"] {
+            let e = gb(&format!("VM_SWAP_GB='{bad}'\n")).unwrap_err().to_string();
+            assert!(e.contains("VM_SWAP_GB must be a whole number of GB from 0 (no swap) to 64"), "{bad}: {e}");
+        }
+        let t = SetupTimeouts::default();
+        let cmd = |provider: &str, swap: u32| -> String {
+            let scfg = SetupConfig { swap_gb: swap, ..steps_cfg() };
+            provisioning_steps(provider, &scfg, "devtest-alpha", false, "/tmp/h.sh", &t)
+                .into_iter()
+                .find_map(|s| match s {
+                    ProvisionStep::Run { cmd, .. } if cmd.ends_with("bash /root/hetzner_setup.sh") => Some(cmd),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(cmd("hetzner", 0).starts_with("ARENA_SWAP_GB=0 REPO_URL="), "{}", cmd("hetzner", 0));
+        assert!(cmd("shadeform", 16).contains(" ARENA_SWAP_GB=16 REPO_URL="), "{}", cmd("shadeform", 16));
+        // A container pod can't swap: its steps never pass a size.
+        let pod = provisioning_steps("runpod", &steps_cfg(), "devtest-alpha", false, "/tmp/h.sh", &t);
+        assert!(!format!("{pod:?}").contains("ARENA_SWAP_GB"));
     }
 
     // ---- provisioning steps, timeouts, runner -------------------------------------------
@@ -1262,6 +1322,7 @@ mod tests {
             zsh_install: false,
             vscode: None,
             relocate: true,
+            swap_gb: DEFAULT_SWAP_GB,
         }
     }
 
@@ -1298,7 +1359,7 @@ mod tests {
                 ProvisionStep::Scp { label: "copy bare-VM setup script", local: "/tmp/h.sh".into(), remote: "/root/hetzner_setup.sh".into(), timeout: secs(60) },
                 ProvisionStep::Run {
                     label: "GPU VM setup script",
-                    cmd: "ARENA_GPU=1 ARENA_MACHINE_NAME='devtest-alpha' REPO_URL='git@github.com:o/r.git' REPO_DIR='/root/ARENA_3.0' \
+                    cmd: "ARENA_GPU=1 ARENA_MACHINE_NAME='devtest-alpha' ARENA_SWAP_GB=8 REPO_URL='git@github.com:o/r.git' REPO_DIR='/root/ARENA_3.0' \
                           REPO_KEY='/root/.ssh/id_ed25519' bash /root/hetzner_setup.sh"
                         .into(),
                     timeout: secs(1800),
@@ -1334,7 +1395,7 @@ mod tests {
                 },
                 ProvisionStep::Run {
                     label: "hetzner setup script",
-                    cmd: "REPO_URL='git@github.com:o/r.git' REPO_DIR='/root/ARENA_3.0' REPO_KEY='/root/.ssh/id_ed25519' bash /root/hetzner_setup.sh".into(),
+                    cmd: "ARENA_SWAP_GB=8 REPO_URL='git@github.com:o/r.git' REPO_DIR='/root/ARENA_3.0' REPO_KEY='/root/.ssh/id_ed25519' bash /root/hetzner_setup.sh".into(),
                     timeout: secs(1800),
                 },
             ]

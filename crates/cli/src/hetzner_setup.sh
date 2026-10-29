@@ -58,13 +58,85 @@ REPO_URL="${REPO_URL:-}"
 UPSTREAM_URL="${UPSTREAM_URL:-}"
 VENV="$REPO_DIR/.venv"
 
-echo "### 1/6 system packages"
+# Swap, before anything heavy: a cx23 has 4 GB of RAM and a cx33 8 GB, and the course's notebooks
+# load models — without swap the OOM killer ends a participant's kernel (or the install) at the
+# first peak; with it the box just slows down. ARENA_SWAP_GB (arena passes VM_SWAP_GB, default 8;
+# 0 = none) sizes a swap file at the filesystem's top, where the auto-reaper's idle probe never
+# looks (it scans /tmp, /opt, /home/… for data written outside the home: a file there would make
+# the VM look busy for ever). Never fatal: a VM without swap still works, so every failure is a
+# WARN and the file is removed. Idempotent: one already on is kept — resizing it would need a
+# `swapoff`, which can fail, or stall the box, under memory pressure; the line says so.
+# (ARENA_SWAPFILE, ARENA_FSTAB, ARENA_SYSCTL_CONF, ARENA_PROC_SWAPS: a test's stand-ins; never set on a pod.)
+echo "### 1/7 swap"
+SWAP_GB="${ARENA_SWAP_GB:-8}"
+SWAPFILE="${ARENA_SWAPFILE:-/swapfile}"
+FSTAB="${ARENA_FSTAB:-/etc/fstab}"
+SYSCTL_CONF="${ARENA_SYSCTL_CONF:-/etc/sysctl.d/99-arena-swap.conf}"
+PROC_SWAPS="${ARENA_PROC_SWAPS:-/proc/swaps}"
+# Free space to leave beside the swap: the env (~5 GB) and the participant's work.
+SWAP_ROOM_GB=10
+swap_in_fstab() {
+    grep -qs "^$SWAPFILE[[:space:]]" "$FSTAB" \
+        || printf '%s none swap sw 0 0\n' "$SWAPFILE" >> "$FSTAB" \
+        || echo "WARN: couldn't add $SWAPFILE to $FSTAB — the swap is off again after a reboot"
+}
+setup_swap() {
+    case "$SWAP_GB" in
+        '' | *[!0-9]*) echo "WARN: swap size '$SWAP_GB' isn't a whole number of GB — no swap"; return ;;
+    esac
+    if [ "$SWAP_GB" -eq 0 ]; then
+        echo "swap: none (VM_SWAP_GB=0)"
+        return
+    fi
+    local want=$((SWAP_GB * 1024 * 1024 * 1024)) on have free
+    # What's on now, `<file> <bytes>` a line (the kernel's own list: no util-linux version needed).
+    on=$(awk 'NR > 1 { print $1, $3 * 1024 }' "$PROC_SWAPS" 2>/dev/null)
+    if printf '%s\n' "$on" | awk -v f="$SWAPFILE" '$1 == f { found = 1 } END { exit !found }'; then
+        have=$(printf '%s\n' "$on" | awk -v f="$SWAPFILE" '$1 == f { print int($2 / 1073741824) }')
+        [ "$have" = "$SWAP_GB" ] && echo "swap: $SWAPFILE already on ($have GB)" \
+            || echo "swap: $SWAPFILE already on ($have GB, not the $SWAP_GB GB asked: resizing a live swap file isn't safe here)"
+        swap_in_fstab
+        return
+    fi
+    have=$(printf '%s\n' "$on" | awk '{ s += $2 } END { print s + 0 }')
+    if [ "$have" -ge "$want" ]; then
+        echo "swap: $((have / 1073741824)) GB already on (not arena's) — none added"
+        return
+    fi
+    # A leftover file of ours (not on: a run cut short) is space we can take back.
+    free=$(df -Pk "$(dirname "$SWAPFILE")" 2>/dev/null | awk 'NR == 2 { print $4 * 1024 }')
+    [ -f "$SWAPFILE" ] && free=$(( ${free:-0} + $(stat -c %s "$SWAPFILE" 2>/dev/null || echo 0) ))
+    if [ -z "$free" ] || [ "$free" -lt $((want + SWAP_ROOM_GB * 1024 * 1024 * 1024)) ]; then
+        echo "WARN: no swap — ${SWAP_GB} GB of it would leave under ${SWAP_ROOM_GB} GB free on $(dirname "$SWAPFILE") ($(( ${free:-0} / 1073741824 )) GB free)"
+        return
+    fi
+    rm -f "$SWAPFILE"
+    if ! { fallocate -l "$want" "$SWAPFILE" 2>/dev/null || dd if=/dev/zero of="$SWAPFILE" bs=1M count=$((SWAP_GB * 1024)) status=none; }; then
+        rm -f "$SWAPFILE"
+        echo "WARN: no swap — couldn't write the ${SWAP_GB} GB file $SWAPFILE"
+        return
+    fi
+    chmod 600 "$SWAPFILE"
+    if ! mkswap "$SWAPFILE" >/dev/null || ! swapon "$SWAPFILE"; then
+        rm -f "$SWAPFILE"
+        echo "WARN: no swap — mkswap/swapon refused $SWAPFILE"
+        return
+    fi
+    swap_in_fstab
+    # Swap as a safety net, not a second RAM: the kernel prefers dropping cache to swapping.
+    { printf 'vm.swappiness = 10\n' > "$SYSCTL_CONF" && sysctl -q -p "$SYSCTL_CONF"; } >/dev/null 2>&1 \
+        || echo "WARN: couldn't set vm.swappiness (the swap is on at the kernel's default)"
+    echo "swap: ${SWAP_GB} GB at $SWAPFILE"
+}
+setup_swap
+
+echo "### 2/7 system packages"
 apt-get update -qq || die "apt-get update failed"
 apt-get install -y --no-install-recommends \
     build-essential ffmpeg git curl wget ca-certificates libosmesa6 jq zsh tmux \
     python3-dev pkg-config || die "apt-get install of the system packages failed"
 
-echo "### 2/6 docker + docker compose"
+echo "### 3/7 docker + docker compose"
 if ! command -v docker >/dev/null 2>&1; then
     curl -fsSL https://get.docker.com | sh
 fi
@@ -72,14 +144,14 @@ systemctl enable --now docker 2>/dev/null || true
 docker --version || echo "WARN: docker missing (its installer failed?) — continuing; the ARENA env doesn't need it"
 docker compose version || echo "WARN: docker compose plugin missing"
 
-echo "### 3/6 uv"
+echo "### 4/7 uv"
 if ! command -v uv >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/uv" ]; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
 export PATH="$HOME/.local/bin:$PATH"
 uv --version || die "uv isn't installed (its installer failed?)"
 
-echo "### 4/6 ARENA repo + Python env"
+echo "### 5/7 ARENA repo + Python env"
 # If a git deploy key was provided (REPO_KEY), wire github.com to it so we can clone — and
 # later push backups to — the PRIVATE cohort repo over SSH. Without it the clone is anonymous
 # (a public REPO_URL only).
@@ -241,7 +313,7 @@ source "$VENV/bin/activate"
 # (matches the GPU arena-env). Idempotent + cheap, so it also back-fills snapshot-booted pods.
 python -m pip --version >/dev/null 2>&1 || uv pip install pip >/dev/null 2>&1 || true
 
-echo "### 5/6 coding agents (claude code + codex)"
+echo "### 6/7 coding agents (claude code + codex)"
 # Node-free curl installers drop a binary into ~/.local/bin (already on PATH + in the rc
 # files). Idempotent: skip if already present. Auth is separate — the Claude Code OAuth
 # token + ~/.claude.json onboarding come from `arena pods copy-keys`.
@@ -268,7 +340,7 @@ install_codex
 # /usr/local/bin — on PATH for every shell (login, non-login, bash, zsh, `arena pods run`).
 for b in claude codex; do [ -e "$HOME/.local/bin/$b" ] && ln -sf "$HOME/.local/bin/$b" "/usr/local/bin/$b"; done
 
-echo "### 6/6 zsh + oh-my-zsh + dotfiles + MOTD (match the GPU pods)"
+echo "### 7/7 zsh + oh-my-zsh + dotfiles + MOTD (match the GPU pods)"
 apt-get install -y --no-install-recommends zsh figlet >/dev/null 2>&1 || true
 
 # Same dotfiles repo the GPU pods clone — so the shell is byte-for-byte identical.

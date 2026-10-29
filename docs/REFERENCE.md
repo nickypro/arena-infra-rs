@@ -1130,6 +1130,16 @@ gate already passes. Its installers' scratch (uv's above all) goes to a temp dir
 when it ends, failure or not: uv's 0-byte `uv-setuptools-*.lock` files, left in `/tmp`, kept a fresh
 VM from ever reading as idle to the auto-reaper.
 
+Its first step makes **swap**: a `/swapfile` of `VM_SWAP_GB` GB (default 8; `0` = none; at most 64),
+turned on, in `/etc/fstab` and with `vm.swappiness = 10`. Without swap, a notebook that loads a model or two past
+a cx23's 4 GB (or a cx33's 8 GB) gets its kernel killed; with it, the box slows down instead. The file sits at the
+filesystem's top, which the auto-reaper's idle probe doesn't scan, so it never makes a VM look busy. It is never
+fatal: with too little disk (the swap must leave 10 GB free), a swap already on that's at least as big (a
+provider's), or a `mkswap`/`swapon` that refuses, it's a `WARN` line and no file. A re-run keeps a swap file
+that's already on, even at another size (resizing a live one isn't safe under memory pressure); `swapoff
+/swapfile && rm /swapfile` and set up again to resize. Shadeform's GPU VMs run the same script, so they get it too;
+container pods (RunPod, Vast) can't swap.
+
 #### VS Code warm-up
 
 **VS Code warm-up** (last step, on every provider, `up`/`restart`/`replace` included): pre-installs

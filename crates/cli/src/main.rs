@@ -5429,6 +5429,20 @@ fn hetzner_rows(cfg: &Config) -> Vec<String> {
     ]
 }
 
+/// `config check`'s `VM_SWAP_GB` row: the swap a bare VM's setup makes, `(default)` when unset,
+/// or a ✗ row and the error the check fails on. Pure.
+fn swap_row(cfg: &Config) -> (String, Option<arena_core::Error>) {
+    let set = cfg.get("VM_SWAP_GB").is_some_and(|v| !v.trim().is_empty());
+    match arena_core::setup::swap_gb(cfg) {
+        Ok(gb) => {
+            let what = if gb == 0 { "no swap".to_string() } else { format!("{gb} GB of swap") };
+            let (mark, default) = if set { ("✓", "") } else { ("·", " (default)") };
+            (format!("  {mark} {:<28} {what}{default} — on a bare VM (Hetzner, Shadeform), made by setup", "VM_SWAP_GB"), None)
+        }
+        Err(e) => (format!("  ✗ {:<28} {e}", "VM_SWAP_GB"), Some(e)),
+    }
+}
+
 /// `config check`'s rows for `ASK_AI`: which AI `pods ask` (and the dashboard's `?`) sends to
 /// — `(default)` when unset — or `off`; where its binary is, or a ⚠ when it isn't installed for
 /// this user (advice: nothing fails until it's used). Then each AI's model and effort that is set
@@ -5555,8 +5569,16 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
     let hetzner_in_play = provider_name == "hetzner"
         || cfg.get("HETZNER_API_KEY").is_some_and(|v| !v.is_empty())
         || HETZNER_OPTION_KEYS.iter().any(|k| cfg.get(k).is_some());
-    if hetzner_in_play {
-        hetzner_rows(cfg).iter().for_each(|l| println!("{l}"));
+    // The swap the bare-VM setup makes (Hetzner, and Shadeform's GPU VMs).
+    if hetzner_in_play || shadeform_in_play || cfg.get("VM_SWAP_GB").is_some() {
+        if hetzner_in_play {
+            hetzner_rows(cfg).iter().for_each(|l| println!("{l}"));
+        }
+        let (line, bad) = swap_row(cfg);
+        println!("{line}");
+        if let Some(e) = bad {
+            note_invalid(&mut missing, &e);
+        }
     }
 
     println!("\nMachine naming:");
@@ -17834,6 +17856,7 @@ mod setup_tests {
             vscode: None,
             // The fleet runner is under test here, not the move onto the volume.
             relocate: false,
+            swap_gb: arena_core::setup::DEFAULT_SWAP_GB,
         }
     }
 
@@ -29970,5 +29993,26 @@ mod passthrough_tests {
         // GET is the only verb: there is nothing else to parse.
         assert!(Cli::try_parse_from(["arena", "api", "post", "runpod", "pods"]).is_err());
         assert!(Cli::try_parse_from(["arena", "api", "get", "runpod", "pods", "--method", "DELETE"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod swap_row_tests {
+    use super::*;
+
+    /// `config check`'s `VM_SWAP_GB` row: the default marked, 0 as "no swap", and a bad value a
+    /// ✗ row with the error the check fails on.
+    #[test]
+    fn the_swap_row_says_the_size_or_why_not() {
+        let row = |text: &str| swap_row(&Config::parse(text));
+        let (line, bad) = row("");
+        assert_eq!(line, "  · VM_SWAP_GB                   8 GB of swap (default) — on a bare VM (Hetzner, Shadeform), made by setup");
+        assert!(bad.is_none());
+        assert!(row("VM_SWAP_GB=0\n").0.starts_with("  ✓ VM_SWAP_GB                   no swap — "));
+        let (line, bad) = row("VM_SWAP_GB=8G\n");
+        assert!(line.starts_with("  ✗ VM_SWAP_GB") && line.contains("whole number of GB"), "{line}");
+        let mut missing = Vec::new();
+        note_invalid(&mut missing, &bad.unwrap());
+        assert!(missing.iter().any(|m| m.starts_with("VM_SWAP_GB")), "{missing:?}");
     }
 }
