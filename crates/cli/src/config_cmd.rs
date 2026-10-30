@@ -6,17 +6,12 @@ use arena_core::sshconfig::Audience;
 use arena_core::{Config, PodSpec};
 use clap::Subcommand;
 
-#[cfg(test)]
-use crate::cli::PodCmd;
-#[cfg(test)]
-use crate::cli::Cmd;
-#[cfg(test)]
-use crate::cli::Cli;
 use crate::cron::reap_cron_installed;
+use crate::pods::backup::RSYNC;
+use crate::pods::health::health_cache_path;
 use crate::pods::pull::local_backup_dir;
 use crate::ssh_config::{same_file, ssh_config_check_row, ssh_config_check_row_as};
-use crate::{archive, health_cache_path, image, money, reap};
-use crate::pods::backup::RSYNC;
+use crate::{archive, image, money, reap};
 
 #[derive(Subcommand)]
 pub(crate) enum ConfigCmd {
@@ -1152,6 +1147,7 @@ mod tests;
 #[cfg(test)]
 mod swap_row_tests {
     use super::*;
+    use crate::cli::{Cli, Cmd, PodCmd};
 
     /// `config check`'s `VM_SWAP_GB` row: the default marked, 0 as "no swap", and a bad value a
     /// ✗ row with the error the check fails on.

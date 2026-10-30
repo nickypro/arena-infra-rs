@@ -68,7 +68,8 @@ use pods::setup::unstage_hetzner_script;
 use proxy::handle_proxy;
 use snapshot::handle_snapshot;
 use ssh_config::{handle_ssh_config, handle_ssh_config_admin, handle_ssh_config_install, handle_ssh_config_uninstall};
-// Reached as `super::x`/`crate::x` by the modules that predate the split (new code imports from the module itself).
+// Reached as `super::x` / `crate::x` by the modules that predate the split; new code imports
+// from the module itself.
 use cli::{Cli, Select, SelectOpts};
 use config_cmd::note_invalid_text;
 use cron::{arena_cron_lines, char_named, cron_unsafe_char, reap_cron_installed, resolve_week_day, CRON_PATH_CHARS};

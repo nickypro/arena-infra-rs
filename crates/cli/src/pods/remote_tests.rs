@@ -1572,7 +1572,7 @@ async fn rr3_backup_releases_each_pods_lock_as_its_push_ends() {
     fake.script(&host(22001), [FakeReply::stdout("NO_CHANGES feature-y\n")]);
     fake.script(&host(22002), [FakeReply::hang()]);
     let names: Vec<String> = f.pods.iter().map(|p| p.name.clone()).collect();
-    let mut locks = crate::take_pod_locks(&d, &names, Duration::from_millis(10)).await;
+    let mut locks = crate::pods::pull::take_pod_locks(&d, &names, Duration::from_millis(10)).await;
     assert!(locks.holds("devtest-apple") && locks.holds("devtest-bloom"));
     let held = |n: &str| arena_core::pull::try_lock(arena_core::pull::open_pod_lock(&d, n).unwrap()).unwrap().is_err();
     let free = |n: &str| crate::pods::lock::lock_settles_free(arena_core::pull::open_pod_lock(&d, n).unwrap());
@@ -1869,13 +1869,13 @@ async fn set_branch_and_init_branches_never_switch_a_pod_whose_origin_isnt_the_c
     fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"), FakeReply::ok()]);
     fake.script(&host(22002), [wrong_origin()]);
     fake.script(&host(22003), [FakeReply::stdout("SKIP main\n"), FakeReply::ok()]);
-    let _ = crate::take_said();
+    let _ = crate::pods::selection::take_said();
     let err = handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &stub.path()).await.unwrap_err();
     assert_eq!(
         err.to_string(),
         "1 pod(s) NOT switched — each one's line says why: devtest-bloom"
     );
-    assert!(crate::take_said().contains(&refused), "{refused}");
+    assert!(crate::pods::selection::take_said().contains(&refused), "{refused}");
     assert_eq!(execs(&fake, 22002), [backup("bloom")], "bloom: refused, never copied or switched");
     let hard = checkout_command(REPO, "main", Some(KEY), true);
     for (name, port) in [("apple", 22001), ("cloud", 22003)] {
@@ -1889,7 +1889,7 @@ async fn set_branch_and_init_branches_never_switch_a_pod_whose_origin_isnt_the_c
     fake.script(&host(22003), [FakeReply::stdout("SKIP main\n"), FakeReply::ok()]);
     let err = handle_init_branches(fake.clone(), &cfg, Some(1), Some(2), &everyone(&fleet()), false, true, &stub.path()).await.unwrap_err();
     assert!(err.to_string().contains("NOT switched") && err.to_string().ends_with(": devtest-bloom"), "{err}");
-    assert!(crate::take_said().contains(&refused));
+    assert!(crate::pods::selection::take_said().contains(&refused));
     assert_eq!(execs(&fake, 22002), [backup("bloom")], "bloom never gets the init command");
     let bcfg = BackupConfig::from_config(&cfg, 1, 2);
     for (name, port) in [("apple", 22001), ("cloud", 22003)] {
@@ -1952,11 +1952,11 @@ async fn a_directory_that_became_a_symlink_on_the_pod_is_moved_aside_and_the_pul
     let fake = Arc::new(FakeRemote::new());
     fake.script(&host(22001), [repo_in_place()]);
     let remote: Arc<dyn Remote> = fake.clone();
-    let _ = crate::take_said();
+    let _ = crate::pods::selection::take_said();
     handle_pull(&remote, &cfg, Some("w1d1".into()), &base.display().to_string(), None, None, false, false, &chosen, false, true, &stub.path())
         .await
         .unwrap();
-    let said = crate::take_said();
+    let said = crate::pods::selection::take_said();
     for (tier, dir, old) in [("snapshot", "w1d1", "this morning's work"), ("big", "big", "yesterday's work")] {
         let dest = base.join(dir).join("devtest-apple");
         assert_eq!(std::fs::read_link(dest.join("ARENA_3.0")).unwrap(), std::path::Path::new("volume/ARENA_3.0"), "{tier}");
@@ -1985,7 +1985,7 @@ async fn a_directory_that_became_a_symlink_on_the_pod_is_moved_aside_and_the_pul
     handle_pull(&remote, &cfg, Some("w1d1".into()), &base.display().to_string(), None, None, false, false, &chosen, false, true, &stub.path())
         .await
         .unwrap();
-    let said = crate::take_said();
+    let said = crate::pods::selection::take_said();
     assert!(!said.iter().any(|l| l.contains("moved")), "{said:#?}");
     for (dir, old) in [("w1d1", "this morning's work"), ("big", "yesterday's work")] {
         let held = base.join(dir).join("devtest-apple").join(format!(".arena-olddir-{}/ARENA_3.0/chapter1/old_work.py", arena_core::pull::aside_day(arena_core::snapshot::unix_now())));
@@ -2021,7 +2021,7 @@ async fn a_pull_never_moves_anything_rsync_names_outside_its_destination() {
     let fake = Arc::new(FakeRemote::new());
     fake.script(&host(22001), [repo_in_place()]);
     let remote: Arc<dyn Remote> = fake.clone();
-    let _ = crate::take_said();
+    let _ = crate::pods::selection::take_said();
     let err = handle_pull(&remote, &cfg, Some("w1d1".into()), &base.display().to_string(), None, None, false, false, &chosen, false, true, &stub.path())
         .await
         .unwrap_err();
@@ -2031,7 +2031,7 @@ async fn a_pull_never_moves_anything_rsync_names_outside_its_destination() {
     assert_eq!(names(&outside), ["victim"]);
     assert_eq!(names(&outside.join("victim")), ["keep.txt"]);
     assert!(std::fs::symlink_metadata(base.join("big/devtest-apple/linked")).unwrap().file_type().is_symlink());
-    let said = crate::take_said();
+    let said = crate::pods::selection::take_said();
     let big = said.iter().find(|l| l.contains("devtest-apple [big]")).unwrap();
     assert!(
         big.ends_with(
@@ -2221,12 +2221,12 @@ async fn set_branch_copies_a_pod_mid_merge_first_and_its_line_names_the_merge() 
     let fake = Arc::new(FakeRemote::new());
     fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"), FakeReply::ok()]);
     fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place(), FakeReply::stdout(SAVED_BLOOM)]);
-    let _ = crate::take_said();
+    let _ = crate::pods::selection::take_said();
     handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &stub.path()).await.unwrap();
     let hard = (checkout_command(REPO, "main", Some(KEY), true), Some(BRANCH_TIMEOUT));
     assert_eq!(execs(&fake, 22002), [backup("bloom"), probe.clone(), hard]);
     assert!(stub.take().iter().all(|d| d.ends_with("/devtest-bloom")));
-    let said = unnumbered(&crate::take_said());
+    let said = unnumbered(&crate::pods::selection::take_said());
     assert!(said.contains(&ENDED_BLOOM.to_string()), "{said:#?}");
     let line = said.iter().find(|l| l.starts_with("✓ devtest-bloom (on main)")).unwrap_or_else(|| panic!("{said:#?}"));
     assert!(line.starts_with(&format!("✓ devtest-bloom (on main){copied_first}")), "{line}");
@@ -2261,7 +2261,7 @@ async fn set_branch_copies_a_pod_mid_merge_first_and_its_line_names_the_merge() 
         assert_eq!(err.to_string(), format!("1 pod(s) failed to {verb}"), "{who}: never said to be switched");
         assert_eq!(execs(&fake, 22002).len(), 3, "{who}: backup, copy, switch");
         assert!(stub.take().iter().all(|d| d.ends_with("/devtest-bloom")), "{who}");
-        let said = unnumbered(&crate::take_said());
+        let said = unnumbered(&crate::pods::selection::take_said());
         let line = said.iter().find(|l| l.starts_with("✗ devtest-bloom (exit 6): ")).unwrap_or_else(|| panic!("{who}: {said:#?}"));
         assert!(line.starts_with(&format!("✗ devtest-bloom (exit 6): {}{copied_first}", refusal(who))), "{line}");
         assert!(line.ends_with(&format!(" first, and {stays}")), "{line}");
@@ -2283,7 +2283,7 @@ async fn set_branch_copies_a_pod_mid_merge_first_and_its_line_names_the_merge() 
         .unwrap_err();
     assert_eq!(err.to_string(), "1 pod(s) NOT switched — each one's line says why: devtest-bloom");
     assert_eq!(execs(&fake, 22002), [backup("bloom"), probe], "never switched");
-    let said = crate::take_said();
+    let said = crate::pods::selection::take_said();
     let line = said.iter().find(|l| l.starts_with("✗ devtest-bloom not switched: ")).unwrap_or_else(|| panic!("{said:#?}"));
     assert!(
         line.starts_with(&format!(
@@ -2381,7 +2381,7 @@ async fn hard_init_branches_goes_on_past_a_pod_mid_merge_it_switched() {
     fake.script(&host(22001), [pushed("autocommit-a"), FakeReply::ok(), on_main(), FakeReply::ok()]);
     fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place(), FakeReply::ok(), on_main(), FakeReply::ok()]);
     fake.script(&host(22003), [pushed("autocommit-c"), FakeReply::ok(), on_main(), FakeReply::ok()]);
-    let _ = crate::take_said();
+    let _ = crate::pods::selection::take_said();
     let how = SetBranchRun { branch: "main", hard: true, dry_run: false, yes: true, init_branches: true };
     set_branch_and_init(fake.clone(), &cfg, &everyone(&fleet()), &how, &stub.path()).await.unwrap();
     let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None), Some(BACKUP_TIMEOUT));
@@ -2392,7 +2392,7 @@ async fn hard_init_branches_goes_on_past_a_pod_mid_merge_it_switched() {
     assert_eq!(execs(&fake, 22002), [backup("bloom"), probe, hard.clone(), backup("bloom"), init("bloom")], "bloom: copied, switched, init'd");
     assert_eq!(execs(&fake, 22003), [backup("cloud"), hard, backup("cloud"), init("cloud")]);
     assert!(stub.take().iter().all(|d| d.ends_with("/devtest-bloom")), "only bloom copied");
-    let said = unnumbered(&crate::take_said());
+    let said = unnumbered(&crate::pods::selection::take_said());
     assert!(said.contains(&ENDED_BLOOM.to_string()), "{said:#?}");
     assert!(said.iter().any(|l| l.starts_with("✓ devtest-bloom (on main) — ⚠ NOT COMMITTED FIRST: a merge is in progress on autocommit-b")), "{said:#?}");
     for name in ["apple", "bloom", "cloud"] {
@@ -2436,7 +2436,7 @@ async fn init_branches_leaves_out_a_pod_that_wasnt_switched_and_inits_the_rest()
         let fake = Arc::new(FakeRemote::new());
         fake.script(&host(22001), [pushed(), FakeReply::ok(), FakeReply::stdout("SKIP main\n"), FakeReply::ok()]);
         fake.script(&host(22002), std::iter::once(busy_merge("autocommit-b")).chain(after).collect::<Vec<_>>());
-        let _ = crate::take_said();
+        let _ = crate::pods::selection::take_said();
         let how = SetBranchRun { branch: "main", hard, dry_run: false, yes: true, init_branches: true };
         let err = set_branch_and_init(fake.clone(), &cfg, &everyone(&fleet_of(&[("apple", 22001), ("bloom", 22002)])), &how, &rsync.path())
             .await
@@ -2445,7 +2445,7 @@ async fn init_branches_leaves_out_a_pod_that_wasnt_switched_and_inits_the_rest()
         assert!(!execs(&fake, 22002).iter().any(|(c, _)| c.contains("git checkout -b")), "{case}: bloom init'd");
         let apple = execs(&fake, 22001);
         assert_eq!((apple.len(), apple.last()), (4, Some(&apple_init)), "{case}: apple switched, then init'd");
-        let said = crate::take_said();
+        let said = crate::pods::selection::take_said();
         assert!(said.iter().any(|l| l == left_out), "{case}: {said:#?}");
         assert!(!said.iter().any(|l| l.starts_with("⚠ ") && l.contains("had work no backup had saved")), "{case}");
     }
@@ -2457,7 +2457,7 @@ async fn init_branches_leaves_out_a_pod_that_wasnt_switched_and_inits_the_rest()
     let err = set_branch_and_init(fake.clone(), &cfg, &everyone(&fleet_of(&[("bloom", 22002)])), &how, &failing.path()).await.unwrap_err();
     assert_eq!(err.to_string(), "1 pod(s) NOT switched — each one's line says why: devtest-bloom");
     assert_eq!(execs(&fake, 22002).len(), 2, "its backup and the copy's probe, nothing more");
-    assert!(crate::take_said().iter().any(|l| l == "init-branches NOT run: no pod switched"));
+    assert!(crate::pods::selection::take_said().iter().any(|l| l == "init-branches NOT run: no pod switched"));
 }
 
 /// Review pr4: a pod whose push failed for an ordinary reason — the network, a non-fast-forward,
@@ -2491,7 +2491,7 @@ async fn init_branches_runs_on_every_switched_pod_even_one_copied_after_a_failed
         fake.script(&host(22001), [pushed("autocommit-a"), FakeReply::ok(), on_main(), FakeReply::ok()]);
         fake.script(&host(22002), [failed, repo_in_place(), FakeReply::ok(), on_main(), FakeReply::ok()]);
         fake.script(&host(22003), [pushed("autocommit-c"), FakeReply::ok(), on_main(), FakeReply::ok()]);
-        let _ = crate::take_said();
+        let _ = crate::pods::selection::take_said();
         let how = SetBranchRun { branch: "main", hard: true, dry_run: false, yes: true, init_branches: true };
         let err = set_branch_and_init(fake.clone(), &cfg, &everyone(&fleet()), &how, &stub.path()).await.unwrap_err();
         assert_eq!(err.to_string(), "1 pod(s) switched with their branch copied, not pushed (see each one's line): devtest-bloom", "{case}");
@@ -2500,7 +2500,7 @@ async fn init_branches_runs_on_every_switched_pod_even_one_copied_after_a_failed
             assert_eq!(execs(&fake, port), [backup(name), hard.clone(), backup(name), init(name)], "{case}: {name}");
         }
         assert!(stub.take().iter().all(|d| d.ends_with("/devtest-bloom")), "{case}: only bloom copied");
-        let said = unnumbered(&crate::take_said());
+        let said = unnumbered(&crate::pods::selection::take_said());
         assert!(said.iter().any(|l| l.starts_with("✓ devtest-bloom (on main) — ⚠ NOT PUSHED FIRST: branch autocommit-b (")), "{case}: {said:#?}");
         for name in ["apple", "bloom", "cloud"] {
             let line = format!("✓ devtest-{name} -> {}", bcfg.branch_for(&format!("devtest-{name}")));
@@ -2542,7 +2542,7 @@ async fn hard_copies_a_pod_on_main_with_uncommitted_work_before_resetting_it() {
     };
     let fake = Arc::new(FakeRemote::new());
     script(&fake);
-    let _ = crate::take_said();
+    let _ = crate::pods::selection::take_said();
     handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &stub.path()).await.unwrap();
     let hard = (checkout_command(REPO, "main", Some(KEY), true), Some(BRANCH_TIMEOUT));
     assert_eq!(execs(&fake, 22001), [backup("apple"), probe.clone(), hard.clone()]);
@@ -2550,7 +2550,7 @@ async fn hard_copies_a_pod_on_main_with_uncommitted_work_before_resetting_it() {
     assert_eq!(execs(&fake, 22003), [backup("cloud"), probe.clone(), hard.clone()]);
     let copied = stub.take();
     assert!(!copied.is_empty() && copied.iter().all(|d| d.ends_with("/devtest-apple") || d.ends_with("/devtest-cloud")), "{copied:?}");
-    let said = unnumbered(&crate::take_said());
+    let said = unnumbered(&crate::pods::selection::take_said());
     let line = |pod: &str| said.iter().find(|l| l.starts_with(&format!("✓ {pod} (on main)"))).cloned().unwrap_or_else(|| panic!("{said:#?}"));
     let reflog = "the --hard reset moves main to origin's, and its unpushed commits stay on the pod under refs/arena-discarded/<time>-main";
     let apple = line("devtest-apple");
@@ -2588,7 +2588,7 @@ async fn hard_copies_a_pod_on_main_with_uncommitted_work_before_resetting_it() {
         .unwrap_err();
     assert_eq!(err.to_string(), "1 pod(s) NOT switched — each one's line says why: devtest-apple");
     assert_eq!(execs(&fake, 22001), [backup("apple"), probe], "never reset");
-    let said = crate::take_said();
+    let said = crate::pods::selection::take_said();
     assert!(
         said.iter().any(|l| l.starts_with(
             "✗ devtest-apple not switched: its work couldn't be committed (main has uncommitted changes to tracked files — no \
@@ -2637,7 +2637,7 @@ async fn hard_copies_a_pod_on_main_with_commits_or_untracked_files_first() {
     };
     let fake = Arc::new(FakeRemote::new());
     script(&fake);
-    let _ = crate::take_said();
+    let _ = crate::pods::selection::take_said();
     handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &stub.path()).await.unwrap();
     let hard = (checkout_command(REPO, "main", Some(KEY), true), Some(BRANCH_TIMEOUT));
     assert_eq!(execs(&fake, 22001), [backup("apple"), probe.clone(), hard.clone()]);
@@ -2645,7 +2645,7 @@ async fn hard_copies_a_pod_on_main_with_commits_or_untracked_files_first() {
     assert_eq!(execs(&fake, 22003), [backup("cloud"), probe, hard]);
     let copied = stub.take();
     assert!(!copied.is_empty() && copied.iter().all(|d| d.ends_with("/devtest-apple") || d.ends_with("/devtest-cloud")), "{copied:?}");
-    let said = unnumbered(&crate::take_said());
+    let said = unnumbered(&crate::pods::selection::take_said());
     let line = |pod: &str| said.iter().find(|l| l.starts_with(&format!("✓ {pod} (on main)"))).cloned().unwrap_or_else(|| panic!("{said:#?}"));
     let apple = line("devtest-apple");
     assert!(

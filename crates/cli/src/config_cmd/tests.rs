@@ -274,7 +274,8 @@ fn a_discard_limit_from_the_environment_shows_in_config_which_and_check() {
 fn config_check_reaper_rows_cross_only_what_fails() {
     use super::config_report;
     use arena_core::Config;
-    use crate::{reap, RSYNC};
+    use crate::pods::backup::RSYNC;
+    use crate::reap;
     let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
                 GPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\n";
     let on = Config::parse(&format!("{base}REAP_ENABLED=1\n"));
@@ -301,7 +302,8 @@ fn config_check_reaper_rows_cross_only_what_fails() {
 fn config_check_names_each_reaper_gap_once() {
     use super::config_report;
     use arena_core::Config;
-    use crate::{reap, RSYNC};
+    use crate::pods::backup::RSYNC;
+    use crate::reap;
     let dir = std::env::temp_dir().join(format!("arena-cc-markers-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("snap/big")).unwrap();
