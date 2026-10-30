@@ -425,6 +425,10 @@ impl Provider for RunpodProvider {
         rename_via_graphql(&self.client, &self.api_key, id, new_name).await
     }
 
+    fn rename_support(&self, _pod: &Pod) -> Result<()> {
+        Ok(())
+    }
+
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
         // REST `PATCH /pods/{id}` resets the container (see `rename_pod`): exactly what a
         // reimage wants. `env` replaces the pod's env wholesale, so pass everything to keep.

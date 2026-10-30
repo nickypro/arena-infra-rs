@@ -1539,6 +1539,10 @@ impl Provider for ShadeformProvider {
         self.post_ok(&format!("/instances/{id}/update"), Some(&json!({ "name": new_name })), "shadeform rename").await
     }
 
+    fn rename_support(&self, _pod: &Pod) -> Result<()> {
+        Ok(())
+    }
+
     fn check_create_extra(&self, extra: &Extra) -> Result<()> {
         apiextra::check(extra, MANAGED, None)
     }

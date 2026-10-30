@@ -566,13 +566,67 @@ pub fn is_bare_vm(provider: &str) -> bool {
     bare_vm(provider).is_some()
 }
 
+/// Whether `provider`'s pods are named by their hostname: a Hetzner VM's is its server name,
+/// set by cloud-init at create, and its setup's login banner and `~/.name` fall back to it — so
+/// a rename sets it too ([`hostname_command`]). Not a Shadeform VM's (the cloud it lands on
+/// names it; setup is given the machine name instead), nor a RunPod or Vast container's (its
+/// id). Pure.
+pub fn hostname_is_machine_name(provider: &str) -> bool {
+    provider == "hetzner"
+}
+
+/// Whether `provider`'s pods carry the machine name in their environment: a RunPod or Vast
+/// container's `MACHINE_NAME` env var, set at create, which a rename can't change (only a
+/// reimage, which wipes the disk, does). Bare VMs have none: their create sends no env. Pure.
+pub fn machine_name_in_env(provider: &str) -> bool {
+    !is_bare_vm(provider)
+}
+
+/// Whether `name` is a plain hostname (RFC 1123: letters, digits and hyphens, in dot-separated
+/// parts of 1–63 that don't start or end with a hyphen; 253 at most) — what Hetzner takes as a
+/// server name, and all [`hostname_command`] will write. Pure.
+pub fn is_hostname(name: &str) -> bool {
+    name.len() <= 253
+        && name.split('.').all(|part| {
+            (1..=63).contains(&part.len())
+                && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !part.starts_with('-')
+                && !part.ends_with('-')
+        })
+}
+
+/// The command that makes `name` a VM's hostname, for VMs named by it
+/// ([`hostname_is_machine_name`]): `hostnamectl set-hostname` when it differs (the static
+/// hostname — /etc/hostname, what the VM boots with), and the `127.0.1.1` line cloud-init wrote
+/// into /etc/hosts at create. Idempotent. A reboot keeps both, with nothing more (live,
+/// Hetzner ubuntu-24.04, cloud-init 26.1, 2026-10-30): Hetzner's metadata and vendor-data keep
+/// the name the server was created with after a rename, but `update_hostname` leaves a hostname
+/// changed since cloud-init set it alone ("assuming user maintained hostname"), and
+/// `update_etc_hosts` (vendor-data's `manage_etc_hosts: true`) runs once per instance. No
+/// cloud-init setting is written: vendor-data outranks /etc/cloud/cloud.cfg.d anyway, and one
+/// naming the machine would name a server made from a snapshot of this one wrongly. Exits
+/// non-zero unless the hostname is `name` after it. `None`: `name` isn't a plain hostname
+/// ([`is_hostname`]). Pure.
+pub fn hostname_command(name: &str) -> Option<String> {
+    is_hostname(name).then(|| {
+        format!(
+            "n={n}; [ \"$(hostname)\" = \"$n\" ] || hostnamectl set-hostname \"$n\" || {{ hostname \"$n\" && echo \"$n\" > /etc/hostname; }} || exit 1; \
+             if grep -q '^127\\.0\\.1\\.1[[:space:]]' /etc/hosts 2>/dev/null; then \
+             sed -i \"s/^127\\.0\\.1\\.1[[:space:]].*/127.0.1.1 $n $n/\" /etc/hosts || exit 1; fi; \
+             [ \"$(hostname)\" = \"$n\" ]",
+            n = shell_quote(name)
+        )
+    })
+}
+
 /// The ordered provisioning steps for a pod, chosen by provider — pure and unit-tested,
 /// so the runner never has to know what a provider *is*. Adding a backend = add its
 /// steps here; the runner and the dry-run preview stay generic.
 ///   - bare-VM ([`bare_vm`]): push the deploy key, authorize every machine's keys
 ///     ([`AUTHORIZE_LABEL`]), push the full setup script, then run it — on a CPU VM (hetzner) as
-///     it always was; on a GPU VM (shadeform) in its GPU mode, with the machine name for
-///     `~/.name` (a Shadeform VM's hostname isn't the machine name).
+///     it always was, its hostname made the machine name first (best-effort, [`HOSTNAME_LABEL`]);
+///     on a GPU VM (shadeform) in its GPU mode, with the machine name for `~/.name` (a Shadeform
+///     VM's hostname isn't the machine name).
 ///   - image-based (runpod/vast): push the git deploy key, then the post-image config.
 ///
 /// Image-based pods move the repo onto their volume first (unless `REPO_ON_VOLUME=0`, and when
@@ -674,6 +728,21 @@ pub fn provisioning_steps(
             ProvisionStep::Run { label: AUTHORIZE_LABEL, cmd: scfg.authorized_keys_command(), timeout: timeouts.config },
         );
     }
+    // A VM named by its hostname gets it re-asserted, best-effort, before the script reads it
+    // for the login banner and `~/.name`: a no-op on a fresh VM (cloud-init named it), the
+    // fix for one renamed while it couldn't be reached — what `pods rename` tells the operator
+    // to run then.
+    if let Some(cmd) = hostname_is_machine_name(provider).then(|| hostname_command(name)).flatten() {
+        steps.insert(
+            2,
+            ProvisionStep::Optional {
+                label: HOSTNAME_LABEL,
+                cmd,
+                summary: format!("set the hostname to {name} if it isn't (a Hetzner VM is named by it)"),
+                timeout: timeouts.config,
+            },
+        );
+    }
     if let Some(vscode) = &scfg.vscode {
         steps.push(ProvisionStep::Optional {
             label: "vscode warm-up",
@@ -690,6 +759,9 @@ pub const RELOCATE_LABEL: &str = "repo onto volume";
 
 /// A bare VM's step that authorizes every machine's keys ([`SetupConfig::authorized_keys_command`]).
 pub const AUTHORIZE_LABEL: &str = "authorize keys";
+
+/// The best-effort step that makes the machine name a Hetzner VM's hostname ([`hostname_command`]).
+pub const HOSTNAME_LABEL: &str = "hostname";
 
 /// How [`provision`] rides out the create-vs-sshd-up boot race: a just-created VM can
 /// report an SSH endpoint before sshd answers (hetzner assigns the IP at create), so a
@@ -1463,9 +1535,10 @@ mod tests {
     fn provisioning_steps_branch_by_provider() {
         let t = SetupTimeouts::default();
         let scfg = steps_cfg();
-        // bare-VM (hetzner): copy the deploy key, authorize every machine's keys, push the
-        // script, run it with the repo URL/key passed in (so it clones the PRIVATE repo over
-        // SSH) — on the long budget.
+        // bare-VM (hetzner): copy the deploy key, authorize every machine's keys, make the
+        // machine name its hostname (best-effort: a renamed VM's), push the script, run it with
+        // the repo URL/key passed in (so it clones the PRIVATE repo over SSH) — on the long
+        // budget.
         assert_eq!(
             provisioning_steps("hetzner", &scfg, "arena8-flutter", false, "/tmp/h.sh", &t),
             vec![
@@ -1476,6 +1549,12 @@ mod tests {
                     timeout: secs(60),
                 },
                 authorize_step(),
+                ProvisionStep::Optional {
+                    label: HOSTNAME_LABEL,
+                    cmd: hostname_command("arena8-flutter").unwrap(),
+                    summary: "set the hostname to arena8-flutter if it isn't (a Hetzner VM is named by it)".into(),
+                    timeout: secs(300),
+                },
                 ProvisionStep::Scp {
                     label: "copy hetzner setup script",
                     local: "/tmp/h.sh".into(),
@@ -1491,7 +1570,7 @@ mod tests {
                 },
             ]
         );
-        assert!(matches!(&provisioning_steps("hetzner", &scfg, "arena8-flutter", true, "/tmp/h.sh", &t)[3],
+        assert!(matches!(&provisioning_steps("hetzner", &scfg, "arena8-flutter", true, "/tmp/h.sh", &t)[4],
             ProvisionStep::Run { cmd, .. } if *cmd == scfg.bare_vm_repo_update_command(true)), "--force reaches it");
         // image-based (runpod/vast): scp the deploy key, move the repo onto the volume (best-
         // effort), then a config command that re-points origin — i.e. the post-image flow, not
@@ -1506,6 +1585,87 @@ mod tests {
             assert_eq!(r[2].label(), "repo + keys config");
             assert_eq!(r[2].timeout(), secs(300));
         }
+        // Only a Hetzner VM is named by its hostname: no such step elsewhere, nor for a name
+        // that isn't a hostname (never written into /etc).
+        for (provider, name) in [("shadeform", "arena8-flutter"), ("runpod", "arena8-apple"), ("hetzner", "arena8_bad name")] {
+            let steps = provisioning_steps(provider, &scfg, name, false, "/tmp/h.sh", &t);
+            assert!(steps.iter().all(|s| s.label() != HOSTNAME_LABEL), "{provider} {name}");
+        }
+    }
+
+    /// The hostname a renamed Hetzner VM is given (`pods rename`, and setup's best-effort step):
+    /// set only when it differs, the `127.0.1.1` line cloud-init wrote follows, success only when
+    /// it's the name after — run here against a stand-in `hostname`/`hostnamectl` and hosts file,
+    /// under sh, dash and bash; and nothing for a name that isn't a plain hostname (it goes into
+    /// /etc). Which providers are named by their hostname, and which carry MACHINE_NAME in env.
+    #[test]
+    fn the_hostname_command_sets_it_once_and_the_hosts_line_follows() {
+        use std::process::Command;
+        for bad in ["", "a b", "a;rm -rf /", "-lead", "trail-", "a..b", "x_y", &"a".repeat(64), "'q'"] {
+            assert!(hostname_command(bad).is_none(), "{bad:?}");
+        }
+        assert!(is_hostname("arena9-keepsake") && is_hostname("a.b-c.d9") && is_hostname(&"a".repeat(63)));
+        assert!(hostname_is_machine_name("hetzner"));
+        assert!(["shadeform", "runpod", "vast", ""].iter().all(|p| !hostname_is_machine_name(p)));
+        assert!(machine_name_in_env("runpod") && machine_name_in_env("vast"));
+        assert!(!machine_name_in_env("hetzner") && !machine_name_in_env("shadeform"));
+
+        let dir = std::env::temp_dir().join(format!("arena-hostname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        // Stand-ins: `hostname` prints (or with an arg sets) $DIR/name; `hostnamectl
+        // set-hostname X` sets it and logs the call; /etc/hosts is $DIR/hosts.
+        let d = dir.display();
+        let stub = |name: &str, body: String| {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("bin").join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        stub("hostname", format!("if [ $# -gt 0 ]; then echo \"$1\" > {d}/name; else cat {d}/name; fi"));
+        stub("hostnamectl", format!("echo \"$*\" >> {d}/calls; [ \"$1\" = set-hostname ] && echo \"$2\" > {d}/name"));
+        let cmd = hostname_command("arena9-keepsake").unwrap().replace("/etc/hosts", &format!("{d}/hosts")).replace("/etc/hostname", &format!("{d}/etc-hostname"));
+        let hosts = "# managed by cloud-init\n127.0.1.1 arena9-rainbow arena9-rainbow\n127.0.0.1 localhost\n::1 localhost ip6-localhost\n";
+        for shell in ["sh", "dash", "bash"] {
+            if Command::new(shell).arg("-c").arg("true").status().is_err() {
+                continue;
+            }
+            let run = || {
+                Command::new(shell)
+                    .arg("-c")
+                    .arg(&cmd)
+                    .env("PATH", format!("{d}/bin:{}", std::env::var("PATH").unwrap_or_default()))
+                    .output()
+                    .unwrap()
+            };
+            std::fs::write(dir.join("name"), "arena9-rainbow\n").unwrap();
+            std::fs::write(dir.join("hosts"), hosts).unwrap();
+            let _ = std::fs::remove_file(dir.join("calls"));
+            let out = run();
+            assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(std::fs::read_to_string(dir.join("name")).unwrap(), "arena9-keepsake\n", "{shell}");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("hosts")).unwrap(),
+                hosts.replace("127.0.1.1 arena9-rainbow arena9-rainbow", "127.0.1.1 arena9-keepsake arena9-keepsake"),
+                "{shell}: only the 127.0.1.1 line"
+            );
+            assert_eq!(std::fs::read_to_string(dir.join("calls")).unwrap(), "set-hostname arena9-keepsake\n", "{shell}");
+            // Again: already so — nothing set, still a success.
+            std::fs::remove_file(dir.join("calls")).unwrap();
+            assert!(run().status.success() && !dir.join("calls").exists(), "{shell}: idempotent");
+            // No 127.0.1.1 line: the hosts file is left as it is.
+            std::fs::write(dir.join("hosts"), "127.0.0.1 localhost\n").unwrap();
+            assert!(run().status.success());
+            assert_eq!(std::fs::read_to_string(dir.join("hosts")).unwrap(), "127.0.0.1 localhost\n", "{shell}");
+            // hostnamectl refused and `hostname` can't set it either: a failure.
+            std::fs::write(dir.join("name"), "arena9-rainbow\n").unwrap();
+            stub("hostnamectl", "exit 1".into());
+            stub("hostname", format!("if [ $# -gt 0 ]; then exit 1; else cat {d}/name; fi"));
+            assert!(!run().status.success(), "{shell}: not renamed is a failure");
+            stub("hostname", format!("if [ $# -gt 0 ]; then echo \"$1\" > {d}/name; else cat {d}/name; fi"));
+            stub("hostnamectl", format!("echo \"$*\" >> {d}/calls; [ \"$1\" = set-hostname ] && echo \"$2\" > {d}/name"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Item 4 (an evals node, 2026-10-15): a bare VM must get the course repo the image pods
@@ -1749,12 +1909,13 @@ mod tests {
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert_eq!(out, ProvisionOutcome::done());
         let calls = fake.calls();
-        assert_eq!(calls.len(), 5);
+        assert_eq!(calls.len(), 6);
         assert!(matches!(&calls[0], RemoteCall::Copy { local, timeout, .. } if local == "/local/key" && *timeout == Some(secs(60))));
         assert!(matches!(&calls[1], RemoteCall::Exec { cmd, timeout, .. } if cmd.contains("authorized_keys") && *timeout == Some(secs(300))));
-        assert!(matches!(&calls[2], RemoteCall::Copy { remote, .. } if remote == "/root/hetzner_setup.sh"));
-        assert!(matches!(&calls[3], RemoteCall::Exec { cmd, timeout, .. } if cmd.contains("git fetch --no-tags origin") && *timeout == Some(secs(300))));
-        assert!(matches!(&calls[4], RemoteCall::Exec { cmd, timeout, .. } if cmd.ends_with("bash /root/hetzner_setup.sh") && *timeout == Some(secs(1800))));
+        assert!(matches!(&calls[2], RemoteCall::Exec { cmd, timeout, .. } if *cmd == hostname_command("arena8-flutter").unwrap() && *timeout == Some(secs(300))));
+        assert!(matches!(&calls[3], RemoteCall::Copy { remote, .. } if remote == "/root/hetzner_setup.sh"));
+        assert!(matches!(&calls[4], RemoteCall::Exec { cmd, timeout, .. } if cmd.contains("git fetch --no-tags origin") && *timeout == Some(secs(300))));
+        assert!(matches!(&calls[5], RemoteCall::Exec { cmd, timeout, .. } if cmd.ends_with("bash /root/hetzner_setup.sh") && *timeout == Some(secs(1800))));
 
         let fake = FakeRemote::new();
         assert_eq!(provision(&fake, &target(22), &image_steps(), BootRetry::default()).await, ProvisionOutcome::done());
@@ -1873,15 +2034,16 @@ mod tests {
         let script = "### 4/6 ARENA repo + Python env\ninstaller: /root/r/install_uv.sh (the repo's own), torch backend cpu\n\
                       arena-installer: install_uv.sh\r\n### done — Python 3.13.16, torch 2.14.1+cpu, installer: install_uv.sh\n";
         let fake = FakeRemote::new();
-        // Copy the key, authorize the keys, copy the script, the repo update, the script, the warm-up.
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(script), FakeReply::ok()]);
+        // Copy the key, authorize the keys, the hostname, copy the script, the repo update, the
+        // script, the warm-up.
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(script), FakeReply::ok()]);
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert_eq!(out, ProvisionOutcome::Done { warnings: vec![], installer: Some("install_uv.sh".into()), image: None });
         assert_eq!(progress_line(1, 1, "devtest-hz1", &out), "[1/1] ✓ devtest-hz1 (installer: install_uv.sh)");
         // With a warning (the warm-up failed): both.
         let fake = FakeRemote::new();
         let again = "arena-installer: install_uv.sh\narena-installer: none (env already present)\n";
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(again), FakeReply::exit(3, "warm-up incomplete: x")]);
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(again), FakeReply::exit(3, "warm-up incomplete: x")]);
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert_eq!(
             progress_line(2, 2, "devtest-hz1", &out),
@@ -1889,13 +2051,13 @@ mod tests {
         );
         // A script that failed: its line isn't read.
         let fake = FakeRemote::new();
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::exit(1, "FAILED: no torch").with_stdout(script)]);
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::exit(1, "FAILED: no torch").with_stdout(script)]);
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert!(!out.is_done() && out.installer().is_none(), "{out:?}");
         // A VM from an arena image: which image, on the line too (once, from its first setup).
         let fake = FakeRemote::new();
         let from_image = format!("{script}arena-image: devtest-image-261029-1542, built 2026-10-29 (2 h ago), commit 3eed962b9bd8; requirements unchanged, env kept\n");
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(&from_image), FakeReply::ok()]);
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(&from_image), FakeReply::ok()]);
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert_eq!(out.image(), Some("devtest-image-261029-1542, built 2026-10-29 (2 h ago), commit 3eed962b9bd8; requirements unchanged, env kept"));
         assert_eq!(
@@ -2059,7 +2221,7 @@ mod tests {
     fn the_vscode_warm_up_is_the_last_step_everywhere_unless_off() {
         let t = SetupTimeouts::default();
         assert_eq!(t.vscode, secs(300));
-        for (provider, before) in [("runpod", 3), ("vast", 3), ("hetzner", 5)] {
+        for (provider, before) in [("runpod", 3), ("vast", 3), ("hetzner", 6)] {
             let steps = provisioning_steps(provider, &vscode_cfg(), "arena8-apple", false, "/tmp/h.sh", &t);
             assert_eq!(steps.len(), before + 1, "{provider}");
             let ProvisionStep::Optional { label, cmd, summary, timeout } = steps.last().unwrap() else {

@@ -385,13 +385,20 @@ pub trait Provider: Send + Sync {
     /// parking the old one under `<name>-old`. The pod's identity/disk/endpoint are
     /// untouched — only the name changes.
     ///
-    /// Default: unsupported. A provider whose API can't rename a live pod inherits this,
-    /// and `replace` refuses up front rather than half-running the swap.
+    /// Default: unsupported ([`Self::rename_support`] says so up front). A provider whose
+    /// API can't rename a live pod inherits this, and `replace` refuses up front rather than
+    /// half-running the swap.
     async fn rename_pod(&self, _id: &str, _new_name: &str) -> Result<()> {
-        Err(Error::NotImplemented(format!(
-            "rename not supported on provider `{}`",
-            self.name()
-        )))
+        Err(rename_unsupported(self.name()))
+    }
+
+    /// Whether `pod`'s backend can rename it in place ([`Self::rename_pod`]); `Err` says why
+    /// not, in the operator's words. Pure: `pods rename` refuses such a pod before anything is
+    /// asked, and the dashboard offers rename only where this holds — one answer, from the
+    /// backend, for both. Takes the pod so the fleet provider can route the question to the
+    /// pod's backend. Default: unsupported, with [`Self::rename_pod`]'s own words.
+    fn rename_support(&self, _pod: &Pod) -> Result<()> {
+        Err(rename_unsupported(self.name()))
     }
 
     /// DESTRUCTIVE. Swap a pod's image and replace its env in place (same host, same id).
@@ -462,6 +469,12 @@ pub trait Provider: Send + Sync {
     }
 }
 
+/// Why a backend can't rename a pod (the [`Provider::rename_support`] and
+/// [`Provider::rename_pod`] default).
+pub(crate) fn rename_unsupported(provider: &str) -> Error {
+    Error::NotImplemented(format!("rename not supported on provider `{provider}`"))
+}
+
 /// Why a backend can't lock a pod (the [`Provider::lock_support`] default). RunPod pods can
 /// be locked only through REST v2 (the default); on v1 the RunPod backend says so itself.
 pub(crate) fn lock_unsupported(provider: &str) -> Error {
@@ -518,6 +531,19 @@ mod tests {
                     assert!(e.to_string().contains(why), "{name} {api}: {e}");
                 }
             }
+        }
+    }
+
+    /// Every backend renames in place — Hetzner and Vast since 2026-10-30 (prod: "rename not
+    /// supported on provider `hetzner`") — and says so before any request, as `pods rename` and
+    /// the dashboard ask it.
+    #[test]
+    fn every_backend_can_rename() {
+        let keys = "RUNPOD_API_KEY=k\nVAST_API_KEY=v\nHETZNER_API_KEY=h\nSHADEFORM_API_KEY=s\nMACHINE_NAME_PREFIX=devtest\n";
+        for (name, api) in [("runpod", "v2"), ("runpod", "v1"), ("vast", "v2"), ("hetzner", "v2"), ("shadeform", "v2")] {
+            let p = build(name, &Config::parse(&format!("{keys}RUNPOD_API={api}"))).unwrap();
+            let pod = Pod { provider: name.into(), ..Default::default() };
+            assert!(p.rename_support(&pod).is_ok(), "{name} {api}");
         }
     }
 
