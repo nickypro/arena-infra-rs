@@ -15,7 +15,8 @@ use crate::cli::Cli;
 use crate::cron::reap_cron_installed;
 use crate::pods::pull::local_backup_dir;
 use crate::ssh_config::{same_file, ssh_config_check_row, ssh_config_check_row_as};
-use crate::{archive, health_cache_path, image, money, reap, RSYNC};
+use crate::{archive, health_cache_path, image, money, reap};
+use crate::pods::backup::RSYNC;
 
 #[derive(Subcommand)]
 pub(crate) enum ConfigCmd {

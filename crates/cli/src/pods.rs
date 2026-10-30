@@ -7,6 +7,7 @@ use std::time::Duration;
 use arena_core::remote::{describe_error, Remote};
 use arena_core::ssh::SshTarget;
 
+pub(crate) mod backup;
 pub(crate) mod list;
 pub(crate) mod lock;
 pub(crate) mod pull;
