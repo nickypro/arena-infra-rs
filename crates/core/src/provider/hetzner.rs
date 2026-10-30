@@ -1048,6 +1048,57 @@ pub(crate) fn is_image_build_server(v: &Value) -> bool {
     v.get("labels").and_then(Value::as_object).is_some_and(|l| l.contains_key(crate::image::BUILD_LABEL))
 }
 
+/// The `PUT /servers/{id}` body of a rename: `name` and nothing else. Hetzner's update
+/// REPLACES a server's labels when `labels` is sent, so leaving it out keeps them all. None
+/// carries the machine name, so none needs to follow it: a cohort server's create sets no
+/// label, and the archive's and an image build's (`arena-archive`, `arena-image-build`,
+/// `arena-prefix`) name the cohort — those servers aren't in the fleet to be renamed anyway.
+/// Pure.
+fn rename_payload(new_name: &str) -> Value {
+    json!({ "name": new_name })
+}
+
+/// Judge a rename's answer. Pure. A 2xx is success — unless its body is the server under
+/// another name: then the rename didn't take, and reporting success would move `~/.name`, the
+/// hostname, the keys and the proxy around a server that kept its old one. A 2xx without a
+/// `server.name` is still success (the status is the contract). Hetzner's two refusals of the
+/// name itself are said in words after its own answer, and never retried ([`rename_refusal`]);
+/// any other error reads as everywhere (a 429 waited out, a 5xx retried by the caller).
+fn judge_rename(status: reqwest::StatusCode, text: &str, new_name: &str) -> Result<()> {
+    if !status.is_success() {
+        return Err(rename_refusal(crate::http::status_error(status, text, "hetzner rename"), text, new_name));
+    }
+    let named = serde_json::from_str::<Value>(text).ok().and_then(|v| v.pointer("/server/name").and_then(Value::as_str).map(String::from));
+    match named {
+        Some(got) if got != new_name => Err(Error::provider(format!(
+            "hetzner rename: HTTP {status}, but the server is still named `{got}`, not `{new_name}` — the rename didn't take"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// A refused rename `e`, explained when Hetzner refused the name itself (`text`: its error
+/// body, `{"error": {"code": …, "message": …}}`): `uniqueness_error` (409) — names are unique
+/// per project, and the fleet doesn't list every server in it; `invalid_input` (422 live; 400
+/// in the docs) — a server name must be a valid hostname. Both `Rejected`: the same name again
+/// won't work. Anything else comes back as it was.
+fn rename_refusal(e: Error, text: &str, new_name: &str) -> Error {
+    let code = serde_json::from_str::<Value>(text).ok().and_then(|v| v.pointer("/error/code").and_then(Value::as_str).map(String::from));
+    let why = match code.as_deref() {
+        Some("uniqueness_error") => format!(
+            "another server in this Hetzner project is already named `{new_name}` (names are unique per project, and \
+             the fleet doesn't list them all: not the backup archive VM nor an `arena image build` VM) — pick another \
+             name, or rename or delete that server"
+        ),
+        Some("invalid_input") => format!(
+            "Hetzner takes only a valid hostname as a server name — letters, digits and hyphens, in dot-separated \
+             parts of at most 63 that don't start or end with a hyphen — and `{new_name}` isn't one"
+        ),
+        _ => return e,
+    };
+    Error::Provider { kind: crate::error::ProviderErrorKind::Rejected, message: format!("{} — {why}", message_of(&e)) }
+}
+
 /// Servers per page we ask for (Hetzner's maximum; the default is 25).
 const PER_PAGE: u64 = 50;
 /// Hard stop for the pagination loop (50 × 20 = 1000 servers — far beyond any cohort).
@@ -1215,6 +1266,26 @@ impl Provider for HetznerProvider {
 
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         send_ok(self.auth(self.client.delete(format!("{}/servers/{}", self.base, id))), "hetzner terminate").await
+    }
+
+    /// `PUT /servers/{id}` with the new `name` alone ([`rename_payload`]): in place, no
+    /// restart, its labels untouched. Hetzner's refusals of the name are said in words
+    /// ([`judge_rename`]). The VM's own hostname — cloud-init set it from the name at create —
+    /// isn't the API's to change: `pods rename` sets it over SSH afterwards.
+    async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::Config(format!("hetzner rename: `{id}` isn't a server id")));
+        }
+        if new_name.trim().is_empty() {
+            return Err(Error::Config("hetzner rename: the new name is empty".into()));
+        }
+        let rb = self.auth(self.client.put(format!("{}/servers/{id}", self.base)).json(&rename_payload(new_name)));
+        let (status, text) = crate::http::send_text(rb).await?;
+        judge_rename(status, &text, new_name)
+    }
+
+    fn rename_support(&self, _pod: &Pod) -> Result<()> {
+        Ok(())
     }
 
     fn check_create_extra(&self, extra: &Extra) -> Result<()> {
@@ -2313,5 +2384,81 @@ mod tests {
         let srv = serve(vec![canned(200, "application/json", SERVER_TYPES)]);
         let cpx41 = provider(&srv.base, opts).offer(&spec("devtest-a", Some("cpx41"))).await.unwrap();
         assert_eq!(cpx41.locations, ["fsn1", "ash"]);
+    }
+
+    /// A `PUT /servers/{id}` answer: the server, as the API returns it, under `name`.
+    fn renamed_server(name: &str) -> String {
+        json!({"server": {"id": 173518005, "name": name, "status": "running", "labels": {},
+            "public_net": {"ipv4": {"ip": "78.47.231.209"}}, "server_type": {"name": "cx23"},
+            "protection": {"delete": false, "rebuild": false}, "created": "2026-10-30T10:00:00+00:00"}})
+        .to_string()
+    }
+
+    /// Prod 2026-10-30: `pods rename arena9-rainbow keepsake` on Hetzner failed with "rename not
+    /// supported on provider `hetzner`". It's a `PUT /servers/{id}` with the name and nothing
+    /// else — `labels` there would replace the server's — over the real request path, and a
+    /// success only when the answer names the server as asked.
+    #[tokio::test]
+    async fn a_rename_puts_the_name_alone_and_checks_the_answer() {
+        use crate::http::test_server::{canned, serve};
+        let srv = serve(vec![canned(200, "application/json", &renamed_server("devtest-bravo"))]);
+        let p = provider(&srv.base, HetznerOpts::default());
+        assert!(p.rename_support(&Pod { provider: "hetzner".into(), ..Default::default() }).is_ok());
+        p.rename_pod("173518005", "devtest-bravo").await.unwrap();
+        assert_eq!(*srv.requests.lock().unwrap(), ["PUT /servers/173518005 HTTP/1.1"]);
+        assert_eq!(serde_json::from_str::<Value>(&srv.bodies.lock().unwrap()[0]).unwrap(), json!({"name": "devtest-bravo"}));
+        // The server came back under its old name: the rename didn't take.
+        let srv = serve(vec![canned(200, "application/json", &renamed_server("devtest-alpha"))]);
+        let e = provider(&srv.base, HetznerOpts::default()).rename_pod("173518005", "devtest-bravo").await.unwrap_err().to_string();
+        assert!(e.contains("still named `devtest-alpha`, not `devtest-bravo`") && e.contains("didn't take"), "{e}");
+        assert!(!e.contains("78.47"), "never the server's other fields: {e}");
+        // A 2xx that isn't a named server: the status is the contract.
+        for body in ["", "{}", r#"{"server": {"id": 1}}"#, "<html>ok</html>"] {
+            judge_rename(reqwest::StatusCode::OK, body, "devtest-bravo").unwrap();
+        }
+        // Not a server id, or no name: refused before any request.
+        let srv = serve(vec![]);
+        let p = provider(&srv.base, HetznerOpts::default());
+        for (id, name) in [("", "devtest-bravo"), ("..", "devtest-bravo"), ("1/actions/poweroff", "devtest-bravo"), ("1", " ")] {
+            assert!(matches!(p.rename_pod(id, name).await, Err(Error::Config(_))), "{id:?} {name:?}");
+        }
+        assert!(srv.requests.lock().unwrap().is_empty());
+    }
+
+    /// Hetzner's refusals of the name itself (the body shape it answers with — a create's
+    /// `uniqueness_error` and `invalid_input` were seen live) say what's wrong and are never
+    /// retried; the API's own answer stays first. The rest reads as for every request: auth
+    /// aborts, a 5xx is the retry layer's (a name-only PUT is safe to repeat), a gone server is
+    /// a plain 404.
+    #[tokio::test]
+    async fn a_refused_rename_says_why_in_words() {
+        use crate::error::ProviderErrorKind as K;
+        use crate::http::test_server::{canned, serve};
+        let taken = r#"{"error":{"code":"uniqueness_error","message":"server name is already used","details":{"fields":[{"name":"name"}]}}}"#;
+        let bad = r#"{"error":{"code":"invalid_input","message":"invalid input in field 'name'","details":{"fields":[{"name":"name","messages":["Name must be a valid hostname."]}]}}}"#;
+        for (status, body, kind, words) in [
+            (409, taken, K::Rejected, "another server in this Hetzner project is already named `devtest-bravo`"),
+            (422, bad, K::Rejected, "only a valid hostname as a server name"),
+            (400, bad, K::Rejected, "and `devtest-bravo` isn't one"),
+            (404, r#"{"error":{"code":"not_found","message":"server not found"}}"#, K::Other, "server not found"),
+            (401, r#"{"error":{"code":"unauthorized","message":"unable to authenticate"}}"#, K::Auth, "unable to authenticate"),
+            (503, "<html>Service Unavailable</html>", K::Transient, "Service Unavailable"),
+        ] {
+            let srv = serve(vec![canned(status, "application/json", body)]);
+            let e = provider(&srv.base, HetznerOpts::default()).rename_pod("173518005", "devtest-bravo").await.unwrap_err();
+            let m = e.to_string();
+            assert_eq!(e.kind(), Some(kind), "{status}: {m}");
+            assert!(m.contains(&format!("hetzner rename HTTP {status}")) && m.contains(words), "{status}: {m}");
+            assert_eq!(crate::retry::is_retryable(&e), status == 503, "{status}: {m}");
+            if kind == K::Rejected {
+                assert!(m.find("HTTP").unwrap() < m.find(words).unwrap(), "the API's answer first: {m}");
+            }
+            assert_eq!(srv.requests.lock().unwrap().len(), 1, "{status}");
+        }
+        // A throttle the caller can't wait out is the caller's at once, as such.
+        let srv = serve(vec![canned(429, "application/json", r#"{"error":{"code":"rate_limit_exceeded","message":"limit"}}"#)]);
+        let p = provider(&srv.base, HetznerOpts::default());
+        let e = crate::ratelimit::waits_within(std::time::Duration::ZERO, p.rename_pod("1", "devtest-bravo")).await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::RateLimited), "{e}");
     }
 }

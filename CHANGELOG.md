@@ -19,6 +19,20 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-30 · `pods rename` works on Hetzner and Vast
+- Fix: `pods rename` on a Hetzner VM failed with "rename not supported on provider `hetzner`".
+  It renames the server in place now (no restart, its labels untouched), rewrites `~/.name` as
+  before, and also sets the VM's hostname to the new name (what `hostname`, bash's prompt and
+  VS Code show). The hostname stays after a reboot. A name Hetzner refuses (one another server
+  in the project has, or one that isn't a valid hostname) is explained.
+- Vast pods can be renamed too: their label is the name.
+- The note that the MACHINE_NAME env var keeps the old name is printed only for pods that have
+  that variable (RunPod and Vast), not for Hetzner or Shadeform VMs.
+- `pods setup` on a Hetzner VM sets its hostname to the machine name when it isn't already. This
+  fixes a VM that a rename couldn't reach (the rename says to run it).
+- A pod whose provider can't rename it is refused before anything is asked, and the dashboard
+  refuses it when you pick rename (instead of running the command and failing).
+
 ## 2026-10-29 · An admin key only the proxy holds, which reaches every machine
 - `ADMIN_SSH_KEY_PATH` (optional) is now a key of its own role: its private half stays on the
   proxy / control box, and every machine — cohort pods and `@` staff boxes, on every provider —
