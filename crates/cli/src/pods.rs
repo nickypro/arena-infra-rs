@@ -7,6 +7,8 @@ use std::time::Duration;
 use arena_core::remote::{describe_error, Remote};
 use arena_core::ssh::SshTarget;
 
+pub(crate) mod selection;
+
 // Per-call SSH budgets (PLAN 1.B). Every pod-SSH call is bounded so one wedged pod can
 // never hang a fleet command: it reports `✗ <name>: timed out after Ns`, counts as a
 // failure, and the others carry on. Quick probes share `arena_core::remote::PROBE_TIMEOUT`.
