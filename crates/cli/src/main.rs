@@ -15101,9 +15101,12 @@ async fn pull_pods(
     let (mut ok, mut done) = (0, 0);
     // The floor as a hard line while the copies write (`disk::Watch`): under it, every job still
     // running is stopped, its pod's copy a failure — said, and recorded for the health check.
-    let watch = disk::Watch::new(floor, &[std::path::Path::new(dir), std::path::Path::new(&big_root)]);
+    let watched_dirs: Vec<&std::path::Path> =
+        if no_big { vec![std::path::Path::new(dir)] } else { vec![std::path::Path::new(dir), std::path::Path::new(&big_root)] };
+    let watch = disk::Watch::new(floor, &watched_dirs);
     let mut stopped: Option<arena_core::disk::Skip> = None;
-    let mut stopped_pods: Vec<String> = Vec::new();
+    // The pods stopped, and each stopped job's pod (its lock goes once its rsync has ended).
+    let (mut stopped_pods, mut stopped_jobs): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
     loop {
         let joined = tokio::select! {
             biased;
@@ -15126,17 +15129,17 @@ async fn pull_pods(
                 }
                 r
             }
-            // Stopped by the watch: its rsync with it (`remote::run_local`, on drop).
+            // Stopped by the watch: its rsync with it (`remote::run_local`, on drop). Said once per pod.
             Err(e) if e.is_cancelled() && stopped.is_some() => {
                 let skip = stopped.as_ref().map(ToString::to_string).unwrap_or_default();
                 if let Some(pod) = job_pod.remove(&e.id()) {
-                    locks.done(&pod);
-                    say(&format!("[{done}/{jobs}] ✗ {pod}: {skip}"));
-                    failures.push(format!("{pod} ({})", stopped.as_ref().map(|s| s.reason.as_str()).unwrap_or_default()));
-                    by_pod.push((pod.clone(), skip));
                     if !stopped_pods.contains(&pod) {
-                        stopped_pods.push(pod);
+                        say(&format!("[{done}/{jobs}] ✗ {pod}: {skip}"));
+                        failures.push(format!("{pod} ({})", stopped.as_ref().map(|s| s.reason.as_str()).unwrap_or_default()));
+                        by_pod.push((pod.clone(), skip));
+                        stopped_pods.push(pod.clone());
                     }
+                    stopped_jobs.push(pod);
                 }
                 failed += 1;
                 continue;
@@ -15182,6 +15185,12 @@ async fn pull_pods(
         }
     }
     if let Some(skip) = &stopped {
+        // Nothing of a stopped copy writes on once this run goes on (or ends), nor does its pod's
+        // lock go before.
+        disk::children_stopped().await;
+        for pod in &stopped_jobs {
+            locks.done(pod);
+        }
         disk::note_skips(cfg, "copy", &stopped_pods.iter().map(|p| (p.clone(), skip.to_string())).collect::<Vec<_>>());
     }
     // What the new snapshots really take: hard-linked files are shared with the earlier

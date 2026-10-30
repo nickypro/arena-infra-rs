@@ -149,13 +149,26 @@ pub(crate) async fn breached(watch: Option<&Watch>) -> Skip {
     }
 }
 
-/// `copy` (onto this box) unless `watch` breaches first: then `Err` with why, the copy dropped —
-/// its rsync stopped (`arena_core::remote::run_local`: SIGTERM, then SIGKILL).
+/// `copy` (onto this box) unless `watch` breaches first: then `Err` with why, once the copy is
+/// dropped and its rsync stopped (`arena_core::remote::run_local`: SIGTERM, then SIGKILL) —
+/// [`children_stopped`] — so nothing writes on after this returns.
 pub(crate) async fn watched<T>(watch: Option<&Watch>, copy: impl std::future::Future<Output = T>) -> std::result::Result<T, Skip> {
     tokio::select! {
         biased;
         out = copy => Ok(out),
-        skip = breached(watch) => Err(skip),
+        skip = breached(watch) => {
+            children_stopped().await;
+            Err(skip)
+        }
+    }
+}
+
+/// Wait for the copies a watch stopped to have ended ([`arena_core::remote::children_done`]):
+/// rsync's own stop takes ~0.4 s, a SIGKILL comes after its grace.
+pub(crate) async fn children_stopped() {
+    let wait = arena_core::remote::TERM_GRACE + std::time::Duration::from_secs(1);
+    if !arena_core::remote::children_done(wait).await {
+        eprintln!("warning: a copy stopped for space was still running after {}s", wait.as_secs());
     }
 }
 
@@ -180,7 +193,10 @@ pub(crate) fn tier_size(base: &Path, pod: &str, snapshot: bool, dest: &Path) -> 
     } else {
         std::fs::read_dir(dest).is_ok_and(|mut e| e.next().is_some())
     };
-    if builds_on && core_disk::was_copied(base, pod) {
+    // A backup from before marking (none yet: a dry run, which doesn't start it) is taken as a real
+    // run would take it once it has ([`core_disk::seed_copied`]).
+    let marked = core_disk::was_copied(base, pod) || (builds_on && !base.join(core_disk::COPIED_DIR).exists());
+    if builds_on && marked {
         Size::Later
     } else {
         Size::First
@@ -428,6 +444,25 @@ mod tests {
         assert_eq!(watched(None, async { 7 }).await.unwrap(), 7);
     }
 
+    /// A copy the watch stops has ended by the time `watched` returns: nothing of it writes on while
+    /// its run goes on — or ends, which would SIGKILL an rsync mid-stop and orphan its receiver.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stopped_copy_has_ended_when_the_watch_returns() {
+        let huge = Watch::new(Some(Floor::control(100_000 * core_disk::GB)), &[&std::env::temp_dir()]);
+        let arg = format!("{}.{}", 40 + std::process::id() % 7, std::process::id());
+        let running = || {
+            let want = format!("sleep\0{arg}\0");
+            std::fs::read_dir("/proc").into_iter().flatten().flatten().any(|e| std::fs::read(e.path().join("cmdline")).is_ok_and(|c| c == want.as_bytes()))
+        };
+        let started = std::time::Instant::now();
+        let copy = arena_core::remote::run_local("sleep", std::slice::from_ref(&arg), "a long copy", None);
+        let stopped = watched(huge.as_ref(), copy).await;
+        assert!(stopped.is_err_and(|s| s.stopped));
+        assert!(started.elapsed() < std::time::Duration::from_secs(8), "{:?}", started.elapsed());
+        assert!(!running(), "the stopped copy is gone");
+    }
+
     /// What other runs hold that can't be read skips every copy (never counting free space another
     /// run may count); the notes are box-wide — another cohort's run on this box counts them.
     #[test]
@@ -486,6 +521,8 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("x.py"), "x").unwrap();
         }
+        assert_eq!(sizes("devtest-a", &snap, &big), (Size::Later, Size::Later), "a backup from before marking: as a run takes it");
+        std::fs::create_dir_all(base.join(core_disk::COPIED_DIR)).unwrap();
         assert_eq!(sizes("devtest-a", &snap, &big), (Size::First, Size::First), "files there, but never copied whole");
         core_disk::mark_copied(&base, "devtest-a").unwrap();
         assert_eq!(sizes("devtest-a", &snap, &big), (Size::Later, Size::Later));

@@ -831,11 +831,12 @@ impl Reservations {
         self.held.retain(|r| (r.pid, r.token) != (pid, token));
     }
 
-    /// Save atomically, owner-only.
+    /// Save atomically, readable by all (pids, devices and sizes, nothing secret: another user's
+    /// arena sharing the state root must read it to count these, or it copies nothing).
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let mut json = serde_json::to_string_pretty(self).unwrap_or_default();
         json.push('\n');
-        crate::snapshot::write_atomic(path, json.as_bytes(), 0o600)
+        crate::snapshot::write_atomic(path, json.as_bytes(), 0o644)
     }
 }
 
