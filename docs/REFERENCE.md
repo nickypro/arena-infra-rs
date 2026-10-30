@@ -2165,9 +2165,10 @@ provider that failed to list ends nothing; only this fleet's names (`{prefix}-�
 rows, so another fleet's pods on a shared account stay out. An unreadable or newer-version ledger
 is moved aside (`spend.json.ignored-<time>`), never overwritten, and `arena spend` notes from when
 the new one counts. While a ledger can't be read, `--owner` stops a create (whose keys are whose is
-unknown) unless `--keep-key`; after a restart, so does `--owner` for a name whose key has had no
-owner recorded since (one made before it may be someone's) — `spend assign <key hash> <owner>`,
-`keys rotate <name>`, or `--keep-key`. A listing is recorded as of when it began, so a stop or terminate recorded while it
+unknown) unless `--keep-key`; after a restart, so does `--owner` until the keys are listed again
+(`arena spend` lists them), and then for a name whose key was made before the restart and has had
+no owner recorded since — it may be someone's, so it isn't given to a machine's owner either —
+until `spend assign <key hash> <owner>`, `keys rotate <name>`, or `--keep-key`. A listing is recorded as of when it began, so a stop or terminate recorded while it
 was in flight stands.
 
 **RunPod's own numbers.** RunPod's REST billing splits per pod: `GET /v2/billing/pods`, hourly,

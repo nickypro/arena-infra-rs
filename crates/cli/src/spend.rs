@@ -300,9 +300,9 @@ pub(crate) fn handovers(ctx: &SpendCtx, names: &[String], owner: Option<&str>, k
     if let Some((_, r)) = lost.first() {
         let names: Vec<&str> = lost.iter().map(|(n, _)| n.as_str()).collect();
         anyhow::bail!(
-            "the OpenRouter key of {} has no owner recorded since the spend ledger started afresh ({} UTC; the old one is \
-             {}), so it may be someone else's. `arena spend assign <key hash> <owner>` (`arena keys list` has the hashes), \
-             `arena keys rotate <name>`, or pass --keep-key",
+            "the OpenRouter key of {} may be someone else's: the spend ledger started afresh at {} (the old one is {}) \
+             and whose it is isn't recorded since. `arena spend` (it lists the keys), then `arena spend assign <key hash> \
+             <owner>` (`arena keys list` has the hashes) or `arena keys rotate <name>` — or pass --keep-key",
             names.join(", "),
             arena_core::snapshot::rfc3339(r.at),
             r.aside

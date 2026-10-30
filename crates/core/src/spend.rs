@@ -462,21 +462,14 @@ fn rate_of(p: &Pod, last_running: Option<f64>) -> Option<(f64, bool, RateHow)> {
     })
 }
 
-/// How a rate reached the ledger.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Seen {
-    /// A listing: a silence longer than [`GAP`] before it is an estimate.
-    Listed,
-    /// A lifecycle command arena ran: nothing arena knows of changed the rate since the last
-    /// record (only arena stops and starts a fleet's machines), so the segment runs up to it.
-    Event,
-}
-
-/// Extend `m` with a rate observed at `now`: the last segment grows when the rate holds (and,
-/// for a listing, the silence before was short); otherwise a new segment starts (the stretch
-/// between is charged at the higher end). `min_step`: an unchanged segment isn't moved by
-/// less (the dashboard's refreshes). Returns whether anything changed.
-fn extend(m: &mut Machine, now: u64, (per_hr, running, how): (f64, bool, RateHow), min_step: u64, seen: Seen) -> bool {
+/// Extend `m` with a rate observed at `now` (by a listing, or a lifecycle command arena ran):
+/// the last segment grows when the rate holds and the silence before was short; otherwise a
+/// new segment starts (the stretch between is charged at the higher end — and, longer than
+/// [`GAP`], flagged: a terminate's exact time says nothing about what the machine did since
+/// it was last seen; it may have been stopped from the provider's console). `min_step`: an
+/// unchanged segment isn't moved by less (the dashboard's refreshes). Returns whether anything
+/// changed.
+fn extend(m: &mut Machine, now: u64, (per_hr, running, how): (f64, bool, RateHow), min_step: u64) -> bool {
     if now < m.last_seen {
         return false; // the clock went back: a later observation is already recorded
     }
@@ -485,7 +478,7 @@ fn extend(m: &mut Machine, now: u64, (per_hr, running, how): (f64, bool, RateHow
             if s.running == running
                 && s.how.class() == how.class()
                 && (s.per_hr - per_hr).abs() < SAME_RATE
-                && (seen == Seen::Event || now - s.to <= GAP) =>
+                && now - s.to <= GAP =>
         {
             if now - s.to < min_step {
                 return false;
@@ -571,7 +564,7 @@ pub fn observe(mut state: SpendState, listing: &Listing, pods: &[Pod], naming: &
                 note_listing(m, p);
                 match rate {
                     Some(r) => {
-                        extend(m, now, r, if moved { 0 } else { REFRESH }, Seen::Listed);
+                        extend(m, now, r, if moved { 0 } else { REFRESH });
                     }
                     None => end(m, now, EndHow::Gone),
                 }
@@ -592,7 +585,7 @@ pub fn observe(mut state: SpendState, listing: &Listing, pods: &[Pod], naming: &
                             Some(c) => c + GAP < now,
                             None => last_listed.is_none_or(|t| now.saturating_sub(t) > GAP),
                         };
-                    extend(&mut m, now, r, 0, Seen::Listed);
+                    extend(&mut m, now, r, 0);
                     state.machines.push(m);
                 }
             }
@@ -713,7 +706,7 @@ pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
                 None => {
                     let mut m = new_machine(pod, now, StartHow::Created, now);
                     if let Some(r) = rate_of(pod, None) {
-                        extend(&mut m, now, r, 0, Seen::Event);
+                        extend(&mut m, now, r, 0);
                     }
                     state.machines.push(m);
                     state.machines.len() - 1
@@ -729,7 +722,7 @@ pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
             if let Some(i) = state.open_index(*provider, id) {
                 let m = &mut state.machines[i];
                 if let Some(s) = m.segs.last().copied() {
-                    extend(m, now, (s.per_hr, s.running, s.how), 0, Seen::Event);
+                    extend(m, now, (s.per_hr, s.running, s.how), 0);
                 }
                 m.ended = Some(Ended { at: now.max(m.last_seen), how: EndHow::Terminated });
                 m.event_at = Some(now);
@@ -740,7 +733,7 @@ pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
                 let m = &mut state.machines[i];
                 m.event_at = Some(now);
                 if let Some(s) = m.segs.last().copied() {
-                    extend(m, now, (s.per_hr, s.running, s.how), 0, Seen::Event);
+                    extend(m, now, (s.per_hr, s.running, s.how), 0);
                 }
                 // What it bills stopped, from its disks as last listed.
                 let probe = Pod {
@@ -752,7 +745,7 @@ pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
                 };
                 if !bills_hourly(&m.provider, "EXITED") {
                     if let Some(r) = rate_of(&probe, None) {
-                        extend(m, now, r, 0, Seen::Event);
+                        extend(m, now, r, 0);
                     }
                 }
             }
@@ -766,9 +759,9 @@ pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
                     None => (0.0, true, RateHow::Unpriced),
                 };
                 if let Some(s) = m.segs.last().copied() {
-                    extend(m, now, (s.per_hr, s.running, s.how), 0, Seen::Event);
+                    extend(m, now, (s.per_hr, s.running, s.how), 0);
                 }
-                extend(m, now, rate, 0, Seen::Event);
+                extend(m, now, rate, 0);
             }
         }
     }
@@ -816,8 +809,9 @@ pub fn assign(mut state: SpendState, full_names: &[String], target: &str, owner:
     if let Some(i) = pick {
         let m = &mut state.machines[i];
         let was = std::mem::replace(&mut m.owner, owner.map(String::from));
-        let (name, provider, id) = (m.name.clone(), m.provider.clone(), m.id.clone());
-        if let Some(o) = owner {
+        let (name, provider, id, open) = (m.name.clone(), m.provider.clone(), m.id.clone(), m.is_open());
+        // The name's keys are its current instance's: an ended one's owner doesn't take them.
+        if let Some(o) = owner.filter(|_| open) {
             adopt_keys(&mut state, &name, o);
         }
         return Ok((state, Assigned::Machine { name, provider, id, was }));
@@ -876,7 +870,12 @@ fn key_for(naming: &Naming, key: &str, machine: &str) -> bool {
 /// Keys named for `machine` with no owner (and not gone) adopt `owner`: a key minted before
 /// its machine had one.
 fn adopt_keys(state: &mut SpendState, machine: &str, owner: &str) {
+    let restart = state.restarts.last().cloned();
     for k in state.keys.iter_mut().filter(|k| k.owner.is_none() && k.gone.is_none() && k.name == machine) {
+        // One that may predate a ledger restart may be someone else's: only `spend assign`.
+        if restart.as_ref().is_some_and(|r| predates(k, r)) {
+            continue;
+        }
         k.owner = Some(owner.to_string());
         k.owner_how = Some(KeyOwnerHow::Adopted);
     }
@@ -943,17 +942,23 @@ fn upsert_key(state: &mut SpendState, k: &KeyInfo, naming: &Naming, now: u64) ->
     let i = match state.keys.iter().position(|x| x.hash == k.hash) {
         Some(i) => i,
         None => {
-            let owner = state.machines.iter().rev().find(|m| m.is_open() && key_for(naming, name, &m.name)).and_then(|m| m.owner.clone());
-            state.keys.push(AiKey {
+            let mut key = AiKey {
                 hash: k.hash.clone(),
                 name: name.to_string(),
-                owner_how: owner.as_ref().map(|_| KeyOwnerHow::Adopted),
-                owner,
+                owner: None,
+                owner_how: None,
                 created: k.created_at.as_deref().and_then(crate::snapshot::parse_rfc3339),
                 first_seen: now,
                 usage: Vec::new(),
                 gone: None,
-            });
+            };
+            // The owner of the open machine it's named for — unless it may predate a ledger
+            // restart: then it may be someone else's (`arena spend assign` says whose).
+            if state.restarts.last().is_none_or(|r| !predates(&key, r)) {
+                key.owner = state.machines.iter().rev().find(|m| m.is_open() && key_for(naming, name, &m.name)).and_then(|m| m.owner.clone());
+                key.owner_how = key.owner.as_ref().map(|_| KeyOwnerHow::Adopted);
+            }
+            state.keys.push(key);
             state.keys.len() - 1
         }
     };
@@ -1023,13 +1028,22 @@ pub fn handover_needed<'s>(state: &'s SpendState, machine: &str, new_owner: &str
     key_owner(state, machine).filter(|o| *o != new_owner)
 }
 
-/// The ledger restart that may have lost the owner of `machine`'s current key: one with no
-/// owner, made before the latest restart (or of unknown age) — it may be someone's from the
-/// ledger moved aside, and a create for someone else would adopt it, and what it spent.
+/// The ledger restart that may have lost the owner of `machine`'s current key: the keys
+/// haven't been listed since it (a key the name has may not be tracked yet), or the name's
+/// key has no owner and was made before it (or is of unknown age) — it may be someone's from
+/// the ledger moved aside, and a create for someone else would adopt it, and what it spent.
 pub fn owner_lost<'s>(state: &'s SpendState, machine: &str) -> Option<&'s Restart> {
     let last = state.restarts.last()?;
+    if state.keys_listed.is_none_or(|t| t < last.at) {
+        return Some(last);
+    }
     let k = state.keys.iter().rev().find(|k| k.gone.is_none() && k.name == machine)?;
-    (k.owner.is_none() && k.created.is_none_or(|c| c < last.at)).then_some(last)
+    (k.owner.is_none() && predates(k, last)).then_some(last)
+}
+
+/// Whether key `k` may be older than restart `r` (made before it, or of unknown age).
+fn predates(k: &AiKey, r: &Restart) -> bool {
+    k.created.is_none_or(|c| c < r.at)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1495,7 +1509,9 @@ pub fn report(state: &SpendState, naming: &Naming, since: Option<u64>, now: u64,
         .iter()
         .filter(|k| k.gone.is_none_or(|g| g.at >= from))
         .map(|k| key_row(k, since))
-        .filter(|r| r.usd > 0.0)
+        // Spend, or a doubt about it (a $0 lower bound is still a row: it marks its owner's AI
+        // `~` and is named in the notes).
+        .filter(|r| r.usd > 0.0 || r.base_unknown || r.base_stale || r.gone == Some(KeyEndHow::Vanished))
         .collect();
     let mut by: BTreeMap<Option<String>, OwnerRow> = BTreeMap::new();
     for r in &machines {
@@ -1875,9 +1891,11 @@ pub fn to_json(state: &SpendState) -> String {
 
 /// Record into the state file at `path`: under an exclusive `flock` on the state directory
 /// (the lock balance and the health cache take), reload, apply `f`, and save atomically
-/// (0600) when anything changed. A file that had to be ignored is first moved aside
-/// (`spend.json.ignored-<unix time>`), never silently overwritten: a week's ledger is worth
-/// a look. `Ok` carries the state and, when the old file was ignored, a warning.
+/// (0600) when anything changed. A file that had to be ignored is kept aside
+/// (`spend.json.ignored-<unix time>`: linked there, and replaced only once the new ledger is
+/// saved), never silently overwritten — a week's ledger is worth a look — and the new ledger
+/// remembers it ([`Restart`]). `Ok` carries the state and, when the old file was ignored, a
+/// warning.
 pub fn record(path: &Path, now: u64, f: impl FnOnce(SpendState) -> SpendState) -> std::io::Result<(SpendState, Option<String>)> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     crate::snapshot::create_private_dir(dir)?;
@@ -1887,24 +1905,36 @@ pub fn record(path: &Path, now: u64, f: impl FnOnce(SpendState) -> SpendState) -
     lock.lock()?;
     let (mut state, loaded) = load(path);
     let mut warning = None;
+    let mut aside = None;
     if let Loaded::Ignored(why) = &loaded {
-        // A name no earlier copy has: an ignored ledger is never overwritten.
-        let aside = (0..)
+        // A name no earlier copy has: an ignored ledger is never overwritten. Linked there
+        // first, and only replaced once the new ledger is saved: a failed save leaves both
+        // as they were (a link costs no space on a full disk).
+        let to = (0..)
             .map(|n| path.with_file_name(if n == 0 { format!("{SPEND_FILE}.ignored-{now}") } else { format!("{SPEND_FILE}.ignored-{now}-{n}") }))
             .find(|p| std::fs::symlink_metadata(p).is_err())
             .expect("an unused name");
-        std::fs::rename(path, &aside)?;
-        state.restarts.push(Restart { at: now, aside: aside.display().to_string(), why: why.clone() });
+        match std::fs::hard_link(path, &to) {
+            Ok(()) => aside = Some(to.clone()),
+            // No links here: moved, as the last resort.
+            Err(_) => std::fs::rename(path, &to)?,
+        }
+        state.restarts.push(Restart { at: now, aside: to.display().to_string(), why: why.clone() });
         warning = Some(format!(
             "warning: the spend ledger {} couldn't be used ({why}) — moved to {} and started afresh",
             path.display(),
-            aside.display()
+            to.display()
         ));
     }
     let before = state.clone();
     let next = f(state);
     if next != before || loaded != Loaded::Ok {
-        crate::snapshot::write_atomic(path, to_json(&next).as_bytes(), 0o600)?;
+        if let Err(e) = crate::snapshot::write_atomic(path, to_json(&next).as_bytes(), 0o600) {
+            if let Some(a) = &aside {
+                let _ = std::fs::remove_file(a); // a link: the original is still in place
+            }
+            return Err(e);
+        }
     }
     drop(lock);
     Ok((next, warning))

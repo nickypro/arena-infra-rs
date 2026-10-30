@@ -124,6 +124,20 @@ fn an_owner_is_assigned_and_fixed_later_by_name_or_instance_id() {
 }
 
 #[test]
+fn assigning_an_ended_instance_leaves_the_names_current_key_alone() {
+    let a = running("hetzner", "101", "devtest-alpha", 0.01);
+    let b = running("hetzner", "202", "devtest-alpha", 0.01);
+    let s = created(SpendState::default(), &a, &OwnerRule::None, T0);
+    let s = apply_event(s, &Event::Terminated { provider: Some("hetzner"), id: "101" }, T0 + H);
+    let s = created(s, &b, &OwnerRule::None, T0 + H + M);
+    let s = key_minted(s, "kB", "devtest-alpha", None, None, T0 + H + 2 * M);
+    let (s, _) = assign(s, &[], "101", Some("alice"), T0 + 2 * H).unwrap();
+    assert_eq!((machine(&s, "hetzner", "101").owner.as_deref(), s.keys[0].owner.as_deref()), (Some("alice"), None));
+    let (s, _) = assign(s, &["devtest-alpha".into()], "alpha", Some("bob"), T0 + 2 * H).unwrap();
+    assert_eq!(s.keys[0].owner.as_deref(), Some("bob"), "the current instance's owner takes it");
+}
+
+#[test]
 fn a_name_held_by_two_running_instances_needs_the_id() {
     let mut s = see(
         SpendState::default(),
@@ -240,16 +254,41 @@ fn stop_and_start_bill_the_volume_disk_only_while_stopped() {
     p.volume_gb = Some(20.0);
     let disk = 40.0 * 0.10 / 720.0;
     let vol = 20.0 * 0.20 / 720.0;
+    let mut stopped = p.clone();
+    stopped.status = "EXITED".into();
+    // The snapshot cron lists every 20 minutes between the commands.
     let s = created(SpendState::default(), &p, &given("al"), T0);
+    let s = watch(s, &["runpod"], std::slice::from_ref(&p), T0 + 20 * M, T0 + 40 * M);
     let s = apply_event(s, &Event::Stopped { provider: None, id: "rp1" }, T0 + H);
+    let s = watch(s, &["runpod"], std::slice::from_ref(&stopped), T0 + H + 20 * M, T0 + 3 * H - 20 * M);
     let s = apply_event(s, &Event::Started { provider: Some("runpod"), id: "rp1" }, T0 + 3 * H);
+    let s = watch(s, &["runpod"], std::slice::from_ref(&p), T0 + 3 * H + 20 * M, T0 + 4 * H - 20 * M);
     let s = apply_event(s, &Event::Terminated { provider: Some("runpod"), id: "rp1" }, T0 + 4 * H);
     let m = machine(&s, "runpod", "rp1");
     let want = 2.0 * (0.20 + disk) + 2.0 * vol;
     assert!(close(m.accrued, want), "{} vs {want}: {:?}", m.accrued, m.segs);
-    assert!(!m.estimate, "every change was recorded when made: {:?}", m.segs);
+    assert!(!m.estimate, "watched throughout, every change recorded when made: {:?}", m.segs);
     let row = &rep(&s, None, T0 + 5 * H).machines[0];
     assert!(close(row.hours, 2.0), "running hours only: {}", row.hours);
+    // Nothing listed between the commands: the same charges, but each stretch unwatched.
+    let s = created(SpendState::default(), &p, &given("al"), T0);
+    let s = apply_event(s, &Event::Stopped { provider: None, id: "rp1" }, T0 + H);
+    let s = apply_event(s, &Event::Started { provider: Some("runpod"), id: "rp1" }, T0 + 3 * H);
+    let s = apply_event(s, &Event::Terminated { provider: Some("runpod"), id: "rp1" }, T0 + 4 * H);
+    assert!(close(machine(&s, "runpod", "rp1").accrued, want));
+    assert_eq!(rep(&s, None, T0 + 5 * H).machines[0].estimates, [Est::Gap]);
+}
+
+#[test]
+fn a_terminate_long_after_the_last_sighting_is_exact_at_its_end_only() {
+    // Last seen running at $0.40/h; stopped from Vast's console, say; terminated by arena 6 h on.
+    let p = running("vast", "9", "devtest-c", 0.40);
+    let s = see(tracked(), &["vast"], &[], std::slice::from_ref(&p), T0);
+    let s = apply_event(s, &Event::Terminated { provider: Some("vast"), id: "9" }, T0 + 6 * H);
+    let m = machine(&s, "vast", "9");
+    assert_eq!(m.ended, Some(Ended { at: T0 + 6 * H, how: EndHow::Terminated }));
+    let row = &rep(&s, None, T0 + 7 * H).machines[0];
+    assert!(close(row.amount, 2.40) && row.estimates == [Est::Gap] && close(row.estimated, 2.40), "{row:?}");
 }
 
 #[test]
@@ -503,6 +542,17 @@ fn a_key_not_read_near_the_windows_start_is_flagged_as_erring_high() {
     let r = rep(&s, Some(T0 + day), T0 + 2 * day);
     assert!(!r.keys[0].base_stale && close(r.keys[0].usd, 10.0));
     assert!(!owner_row(&r, None).ai_estimate);
+}
+
+#[test]
+fn a_key_whose_spend_in_the_window_is_unknown_is_shown_even_at_zero() {
+    // First read after the window began, at $12 — its spend since then is $0 to $12.
+    let s = observe_keys(SpendState::default(), &[key("k1", "devtest-a", 12.0)], &naming(), T0 + H);
+    let r = rep(&s, Some(T0), T0 + 2 * H);
+    assert_eq!(r.keys.len(), 1, "{:?}", r.keys);
+    assert!(r.keys[0].base_unknown && r.keys[0].usd == 0.0);
+    assert!(owner_row(&r, None).ai_estimate);
+    assert!(notes(&r).iter().any(|n| n.contains("first seen after the window began")), "{:?}", notes(&r));
 }
 
 #[test]
@@ -930,13 +980,21 @@ fn a_ledger_moved_aside_is_remembered_and_the_report_says_so() {
     assert!(notes(&r).iter().any(|n| n.contains("started afresh") && n.contains("isn't counted here")), "{:?}", notes(&r));
     // A key known only from listings since (made before the restart, no owner) may be
     // someone's; one minted since, or given an owner, isn't in doubt.
+    assert_eq!(owner_lost(&s, "devtest-z").map(|r| r.at), Some(T0), "the keys not listed since: any name's may be");
     let mut old = key("k1", "devtest-a", 2.0);
     old.created_at = Some(crate::snapshot::rfc3339(T0 - H));
-    let s2 = observe_keys(s.clone(), &[old], &naming(), T0 + M);
+    // Listed since, with an open machine of that name with an owner: not adopted (it may
+    // be someone else's), and a create for an owner doesn't adopt it either.
+    let s1 = created(s.clone(), &running("runpod", "rp1", "devtest-a", 0.2), &given("bo"), T0 + M);
+    let s2 = observe_keys(s1, &[old], &naming(), T0 + M);
+    assert_eq!(s2.keys[0].owner, None);
     assert_eq!(owner_lost(&s2, "devtest-a").map(|r| r.at), Some(T0));
+    assert_eq!(owner_lost(&s2, "devtest-z"), None, "listed since, and no key for that name");
+    let s2b = created(s2.clone(), &running("runpod", "rp2", "devtest-a", 0.2), &given("cy"), T0 + 2 * M);
+    assert_eq!(s2b.keys[0].owner, None);
     let (s3, _) = assign(s2, &[], "k1", Some("al"), T0 + 2 * M).unwrap_or_else(|e| panic!("{e}"));
     assert!(owner_lost(&s3, "devtest-a").is_none());
-    let s4 = key_minted(s.clone(), "k2", "devtest-b", None, None, T0 + M);
+    let s4 = key_minted(observe_keys(s.clone(), &[], &naming(), T0 + M), "k2", "devtest-b", None, None, T0 + M);
     assert!(owner_lost(&s4, "devtest-b").is_none(), "minted since");
     assert!(owner_lost(&observe_keys(SpendState::default(), &[key("k9", "devtest-a", 1.0)], &naming(), T0), "devtest-a").is_none(), "never restarted");
 }
