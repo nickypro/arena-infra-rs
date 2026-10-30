@@ -1248,6 +1248,10 @@ impl Provider for RunpodV2Provider {
         judge_rename(status, &text, new_name)
     }
 
+    fn rename_support(&self, _pod: &Pod) -> Result<()> {
+        Ok(())
+    }
+
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
         self.forget_endpoint(id);
         let url = pod_url(id, None)?;

@@ -9795,8 +9795,8 @@ fn set_branch_reminder(naming: &Naming, branch: &str, landed: &[String], fleet_w
     on_protected_line(&on, fleet_wide)
 }
 
-/// Why a pod can't be locked, in the backend's own words (without the `not implemented:`
-/// prefix its error type prints).
+/// Why a pod can't be locked (or renamed), in the backend's own words (without the `not
+/// implemented:` prefix its error type prints).
 fn lock_why(e: arena_core::Error) -> String {
     match e {
         arena_core::Error::NotImplemented(why) => why,
@@ -11140,16 +11140,35 @@ async fn settled_sync(cfg: &Config, provider: &dyn Provider, pods: &[arena_core:
     sync
 }
 
-/// Printed by every rename: the one thing that can't follow a name.
-const MACHINE_NAME_NOTE: &str = "note: each renamed pod's MACHINE_NAME env var keeps the old name — env only \
-     changes with a reimage (which wipes the disk); ~/.name carries the new one.";
+/// The one thing that can't follow a name, for the renamed pods that have it: a RunPod or Vast
+/// container's `MACHINE_NAME` env var ([`arena_core::setup::machine_name_in_env`]) — not a
+/// Hetzner or Shadeform VM's, which has none (prod 2026-10-30: the note was printed for a
+/// Hetzner VM). `None` when no renamed pod has one. A pod missing from `pods` is assumed to
+/// have one: the note is only ever extra. Pure.
+fn machine_name_note(renamed: &[&PlannedRename], pods: &[arena_core::Pod]) -> Option<String> {
+    let with_env: Vec<&str> = renamed
+        .iter()
+        .filter(|r| pods.iter().find(|p| p.id == r.id).is_none_or(|p| arena_core::setup::machine_name_in_env(&p.provider)))
+        .map(|r| r.new.as_str())
+        .collect();
+    let whose = match with_env.len() {
+        0 => return None,
+        n if n == renamed.len() => "each renamed pod's MACHINE_NAME env var keeps".to_string(),
+        _ => format!("the MACHINE_NAME env var of {} keeps", with_env.join(", ")),
+    };
+    Some(format!(
+        "note: {whose} the old name — env only changes with a reimage (which wipes the disk); ~/.name carries the new one."
+    ))
+}
 
 /// `pods rename`: validate every (old → new) pair, confirm, rename via the provider's
 /// metadata-only rename, then bring along everything keyed by the machine name (PLAN 1.D):
-/// `~/.name` on the pod, the OpenRouter key mapping, and the proxy (stable ports follow
-/// names). The pod's `MACHINE_NAME` env var can't follow — env is fixed at create/reimage —
-/// so the summary says so. Nothing after the provider rename is fatal: the pods are renamed
-/// either way, so a pod that can't be reached or a key that can't be moved is reported.
+/// `~/.name` on the pod — and the hostname of a VM named by it (Hetzner) — the OpenRouter key
+/// mapping, and the proxy (stable ports follow names). A container's `MACHINE_NAME` env var
+/// can't follow — env is fixed at create/reimage — so the summary says so where there is one.
+/// A pod whose backend can't rename ([`Provider::rename_support`]) is refused before anything
+/// is asked. Nothing after the provider rename is fatal: the pods are renamed either way, so a
+/// pod that can't be reached or a key that can't be moved is reported.
 #[allow(clippy::too_many_arguments)]
 async fn handle_rename(
     provider: &dyn Provider,
@@ -11170,12 +11189,25 @@ async fn handle_rename(
         println!("nothing to rename.");
         return Ok(());
     }
+    // Before anything is asked: a batch with a pod its backend can't rename would stop there.
+    let unsupported: Vec<String> = plan
+        .iter()
+        .filter_map(|r| {
+            let pod = pods.iter().find(|p| p.id == r.id)?;
+            provider.rename_support(pod).err().map(|e| format!("{}: {}", r.old, lock_why(e)))
+        })
+        .collect();
+    if !unsupported.is_empty() {
+        anyhow::bail!("refusing to rename anything:\n  {}", unsupported.join("\n  "));
+    }
     let summary: Vec<String> = plan.iter().map(|r| format!("  {} → {} (id={})", r.old, r.new, r.id)).collect();
     let steps = rename_followup_steps(prefix, &plan, &pods, book, skip_proxy);
     let what = format!("rename {} pod(s):\n{}\nthen:\n{}", plan.len(), summary.join("\n"), steps.join("\n"));
     if dry_run {
         println!("[dry-run] would {what}");
-        println!("{MACHINE_NAME_NOTE}");
+        if let Some(note) = machine_name_note(&plan.iter().collect::<Vec<_>>(), &pods) {
+            println!("{note}");
+        }
         println!("[dry-run] nothing changed.");
         return Ok(());
     }
@@ -11208,12 +11240,13 @@ async fn handle_rename(
     // a re-run renames only the rest, so these would otherwise keep the old ones for good.
     let missed = rewrite_name_files(remote, cfg, prefix, &done, &pods).await;
     let key_warnings = move_key_mappings(book, &Naming::from_config(cfg), &done, &pods).await;
+    let note = machine_name_note(&done, &pods);
     if let Some(failure) = failure {
         // Deliberately no sync on a partial batch: in a `--from-prefix` rename the pods not
         // renamed yet still carry the old prefix, which has no slot in the current list — a
         // sync would drop their forwards. Left alone, every old forward keeps routing (a
         // renamed pod keeps its port: same list index), until the re-run.
-        for line in rename_report(&missed, &key_warnings) {
+        for line in rename_report(note.as_deref(), &missed, &key_warnings) {
             eprintln!("{line}");
         }
         anyhow::bail!("{failure}");
@@ -11223,7 +11256,7 @@ async fn handle_rename(
     } else {
         sync_proxy(cfg, provider, "rename").await;
     }
-    for line in rename_report(&missed, &key_warnings) {
+    for line in rename_report(note.as_deref(), &missed, &key_warnings) {
         println!("{line}");
     }
     Ok(())
@@ -11244,6 +11277,14 @@ fn rename_followup_steps(
     let mut out = Vec::new();
     let shorts: Vec<String> = plan.iter().map(|r| format!("{} ← '{}'", r.new, short_name(prefix, &r.new))).collect();
     out.push(format!("  1. rewrite ~/.name (export MACHINE_NAME='<short>') over SSH: {}", shorts.join(", ")));
+    let by_hostname: Vec<&str> = plan
+        .iter()
+        .filter(|r| pods.iter().any(|p| p.id == r.id && arena_core::setup::hostname_is_machine_name(&p.provider)))
+        .map(|r| r.new.as_str())
+        .collect();
+    if !by_hostname.is_empty() {
+        out.push(format!("     and set the hostname (a Hetzner VM is named by it; kept across a reboot): {}", by_hostname.join(", ")));
+    }
     let no_endpoint: Vec<&str> = plan
         .iter()
         .filter(|r| !pods.iter().any(|p| p.id == r.id && p.ssh_ip.is_some() && p.ssh_port.is_some()))
@@ -11287,47 +11328,83 @@ fn rename_followup_steps(
     out
 }
 
+/// What a rename's SSH follow-ups couldn't do, each `(new name, why)`.
+#[derive(Debug, Default, PartialEq)]
+struct NameMissed {
+    /// Pods whose `~/.name` still has the old name.
+    name_file: Vec<(String, String)>,
+    /// VMs named by their hostname whose hostname is still the old name.
+    hostname: Vec<(String, String)>,
+}
+
 /// Rewrite `~/.name` on each renamed pod to its new short name — exactly the line setup
-/// writes ([`arena_core::setup::name_file_command`]) — concurrently, each within
-/// `PROBE_TIMEOUT`. The endpoint comes from the pre-rename listing (a metadata rename doesn't
-/// move it). Never fails the rename: the pods it couldn't update come back as
-/// `(name, why)` for the summary.
+/// writes ([`arena_core::setup::name_file_command`]) — and, on a VM named by its hostname
+/// (Hetzner: [`arena_core::setup::hostname_is_machine_name`]), set that to the new name too
+/// ([`arena_core::setup::hostname_command`]): its prompt, login banner and `~/.name` fallback
+/// come from it. Concurrently across pods, each command within `PROBE_TIMEOUT`. The endpoint
+/// comes from the pre-rename listing (a metadata rename doesn't move it). Never fails the
+/// rename: what it couldn't do comes back for the summary.
 async fn rewrite_name_files(
     remote: Arc<dyn Remote>,
     cfg: &Config,
     prefix: &str,
     done: &[&PlannedRename],
     pods: &[arena_core::Pod],
-) -> Vec<(String, String)> {
-    use arena_core::setup::{name_file_command, short_name};
-    let mut missed = Vec::new();
+) -> NameMissed {
+    use arena_core::setup::{hostname_command, hostname_is_machine_name, name_file_command, short_name};
+    /// One command's outcome: `Ok` = it ran and succeeded, else why not.
+    fn outcome(res: arena_core::Result<arena_core::ssh::SshOutput>) -> std::result::Result<(), String> {
+        match res {
+            Ok(o) if o.success => Ok(()),
+            Ok(o) => Err(format!("exit {}: {}", o.code.unwrap_or(-1), o.stderr.trim())),
+            Err(e) => Err(describe_error(&e)),
+        }
+    }
+    fn report(missed: &mut Vec<(String, String)>, what: &str, name: String, res: std::result::Result<(), String>) {
+        match res {
+            Ok(()) => println!("[{what}] ✓ {name}"),
+            Err(why) => {
+                eprintln!("[{what}] ✗ {name}: {why}");
+                missed.push((name, why));
+            }
+        }
+    }
+    let mut missed = NameMissed::default();
     let mut set = tokio::task::JoinSet::new();
     for r in done {
-        let target = pods.iter().find(|p| p.id == r.id).and_then(|p| SshTarget::from_pod(p, cfg).ok());
-        let Some(target) = target else {
-            eprintln!("[~/.name] ✗ {}: no SSH endpoint", r.new);
-            missed.push((r.new.clone(), "no SSH endpoint".to_string()));
+        let pod = pods.iter().find(|p| p.id == r.id);
+        let by_hostname = pod.is_some_and(|p| hostname_is_machine_name(&p.provider));
+        let Some(target) = pod.and_then(|p| SshTarget::from_pod(p, cfg).ok()) else {
+            report(&mut missed.name_file, "~/.name", r.new.clone(), Err("no SSH endpoint".into()));
+            if by_hostname {
+                report(&mut missed.hostname, "hostname", r.new.clone(), Err("no SSH endpoint".into()));
+            }
             continue;
         };
         let cmd = name_file_command(short_name(prefix, &r.new));
+        // `None` when the name isn't one: said, never written into /etc.
+        let host_cmd = by_hostname.then(|| hostname_command(&r.new));
         let (remote, name) = (remote.clone(), r.new.clone());
         set.spawn(async move {
-            let res = remote.exec(&target, &cmd, Some(PROBE_TIMEOUT)).await;
-            (name, res)
+            let name_file = outcome(remote.exec(&target, &cmd, Some(PROBE_TIMEOUT)).await);
+            let hostname = match host_cmd {
+                None => None,
+                Some(None) => Some(Err(format!("`{name}` isn't a plain hostname — left as it was"))),
+                Some(Some(c)) => Some(outcome(remote.exec(&target, &c, Some(PROBE_TIMEOUT)).await)),
+            };
+            (name, name_file, hostname)
         });
     }
     while let Some(joined) = set.join_next().await {
-        let (name, why) = match joined {
-            Ok((name, Ok(o))) if o.success => {
-                println!("[~/.name] ✓ {name}");
-                continue;
+        match joined {
+            Ok((name, name_file, hostname)) => {
+                report(&mut missed.name_file, "~/.name", name.clone(), name_file);
+                if let Some(h) = hostname {
+                    report(&mut missed.hostname, "hostname", name, h);
+                }
             }
-            Ok((name, Ok(o))) => (name, format!("exit {}: {}", o.code.unwrap_or(-1), o.stderr.trim())),
-            Ok((name, Err(e))) => (name, describe_error(&e)),
-            Err(e) => ("?".to_string(), format!("task crashed: {e}")),
-        };
-        eprintln!("[~/.name] ✗ {name}: {why}");
-        missed.push((name, why));
+            Err(e) => report(&mut missed.name_file, "~/.name", "?".into(), Err(format!("task crashed: {e}"))),
+        }
     }
     missed
 }
@@ -11551,16 +11628,19 @@ fn write_csv_move(book: &KeyBook<'_>, prefix: &str, dst: Option<&std::path::Path
     None
 }
 
-/// The closing lines of a rename (pure, so tested): the MACHINE_NAME note, the pods whose
-/// `~/.name` still has the old name (with the command that fixes them), and any key-mapping
-/// warnings.
-fn rename_report(missed: &[(String, String)], key_warnings: &[String]) -> Vec<String> {
-    let mut out = vec![MACHINE_NAME_NOTE.to_string()];
-    if !missed.is_empty() {
+/// The closing lines of a rename (pure, so tested): the MACHINE_NAME note where it applies
+/// ([`machine_name_note`]), the pods whose `~/.name` or hostname still has the old name (with
+/// the command that fixes them), and any key-mapping warnings.
+fn rename_report(note: Option<&str>, missed: &NameMissed, key_warnings: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = note.map(String::from).into_iter().collect();
+    for (what, missed) in [("~/.name still has", &missed.name_file), ("the hostname is still", &missed.hostname)] {
+        if missed.is_empty() {
+            continue;
+        }
         let names: Vec<&str> = missed.iter().map(|(n, _)| n.as_str()).collect();
         let why: Vec<String> = missed.iter().map(|(n, w)| format!("{n}: {w}")).collect();
         out.push(format!(
-            "⚠ ~/.name still has the old name on {} ({}) — re-run `arena pods setup {}` once it answers",
+            "⚠ {what} the old name on {} ({}) — re-run `arena pods setup {}` once it answers",
             names.join(", "),
             why.join("; "),
             names.join(" ")
@@ -27792,7 +27872,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
 mod lifecycle_tests {
     use super::{
         disk_fate, handle_pods, handle_rename, handle_restart, handle_terminate, migrate_cutover_on, migrate_finish_on, FinishOpts,
-        plan_csv_move, rename_followup_steps, rename_report, replace_on, rewrite_name_files, stop_lines,
+        machine_name_note, plan_csv_move, rename_followup_steps, rename_report, NameMissed, replace_on, rewrite_name_files, stop_lines,
         take_would_refuse, wipe_refusal, Cli, Cmd, CsvMove, CutoverOpts, DiskFate, DiskOp, Interrupt, KeyBook, PlaceFlags,
         PlannedRename, PodCmd, RenameRequest, ReplaceJob, ReplaceOpts, RestartOpts, Selected, SettleWait, SpecOverrides,
         TerminateOpts, LOCKED_REPLACEMENT_NOTE,
@@ -27994,6 +28074,13 @@ mod lifecycle_tests {
                 p.name = new_name.to_string();
             }
             Ok(())
+        }
+        /// Every backend here renames; a `lambda` pod stands for one that can't.
+        fn rename_support(&self, pod: &Pod) -> Result<()> {
+            match pod.provider.as_str() {
+                "lambda" => Err(Error::NotImplemented("rename not supported on provider `lambda`".into())),
+                _ => Ok(()),
+            }
         }
         async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
             if self.no_spec.contains(&id) {
@@ -28213,20 +28300,123 @@ mod lifecycle_tests {
         ];
         let done: Vec<&PlannedRename> = plan.iter().collect();
         let mut missed = rewrite_name_files(remote.clone(), &cfg, "devtest", &done, &pods).await;
-        missed.sort();
+        missed.name_file.sort();
         assert_eq!(
-            missed,
+            missed.name_file,
             [
                 ("devtest-echo".to_string(), "exit 255: ssh: connect to host 10.0.0.1 port 22002: Connection refused".to_string()),
                 ("solo-gpu".to_string(), "no SSH endpoint".to_string()),
             ]
         );
+        assert!(missed.hostname.is_empty(), "RunPod pods aren't named by their hostname: {missed:?}");
         // What the operator is told about them.
-        let report = rename_report(&missed, &["devtest-echo already has its own OpenRouter key".into()]);
-        assert!(report[0].contains("MACHINE_NAME env var keeps the old name") && report[0].contains("reimage"), "{report:?}");
+        let note = machine_name_note(&done, &pods);
+        let report = rename_report(note.as_deref(), &missed, &["devtest-echo already has its own OpenRouter key".into()]);
+        assert!(report[0].starts_with("note: each renamed pod's MACHINE_NAME env var keeps the old name") && report[0].contains("reimage"), "{report:?}");
         assert!(report[1].contains("re-run `arena pods setup devtest-echo solo-gpu`") && report[1].contains("no SSH endpoint"), "{report:?}");
         assert_eq!(report[2], "⚠ keys: devtest-echo already has its own OpenRouter key");
-        assert_eq!(rename_report(&[], &[]).len(), 1, "just the MACHINE_NAME note");
+        assert!(rename_report(None, &NameMissed::default(), &[]).is_empty(), "nothing to say");
+    }
+
+    /// Prod 2026-10-30, `pods rename arena9-rainbow keepsake` on a Hetzner VM: its prompt, login
+    /// banner and `~/.name` fallback come from the hostname, so the follow-up sets that too —
+    /// after `~/.name`, on the VM alone, with setup's own command — and a miss is reported like
+    /// `~/.name`'s, with the command that fixes it; never fatal. A RunPod pod's hostname is its
+    /// container id: left alone.
+    #[tokio::test]
+    async fn a_hetzner_rename_sets_the_hostname_too() {
+        use arena_core::setup::hostname_command;
+        let dir = tmpdir("rename-hostname");
+        let cfg = cfg(&dir.0);
+        let csv = keys_csv(&dir.0, "");
+        let (f, remote) = (fleet(), Arc::new(FakeRemote::new()));
+        handle_rename(&f, remote.clone(), &cfg, &no_api(&csv), one("delta", "echo"), true, false, true).await.unwrap();
+        assert_eq!(f.calls(), ["rename h-delta devtest-echo"]);
+        let hostname = RemoteCall::Exec {
+            host: "10.0.0.9:22".into(),
+            cmd: hostname_command("devtest-echo").unwrap(),
+            timeout: Some(PROBE_TIMEOUT),
+        };
+        assert_eq!(remote.calls(), [name_write("10.0.0.9:22", "echo"), hostname]);
+        // The hostname can't be set: renamed anyway, reported with what to run.
+        let (f, remote) = (fleet(), Arc::new(FakeRemote::new()));
+        remote.script("10.0.0.9:22", [FakeReply::ok(), FakeReply::exit(1, "Could not set static hostname: Access denied")]);
+        let pods = f.pods.lock().unwrap().clone();
+        let plan = [
+            PlannedRename { id: "h-delta".into(), old: "devtest-delta".into(), new: "devtest-echo".into() },
+            PlannedRename { id: "r-alpha".into(), old: "devtest-alpha".into(), new: "devtest-bravo".into() },
+        ];
+        let done: Vec<&PlannedRename> = plan.iter().collect();
+        let missed = rewrite_name_files(remote.clone(), &cfg, "devtest", &done, &pods).await;
+        assert!(missed.name_file.is_empty(), "{missed:?}");
+        assert_eq!(missed.hostname, [("devtest-echo".to_string(), "exit 1: Could not set static hostname: Access denied".to_string())]);
+        let report = rename_report(None, &missed, &[]);
+        assert_eq!(
+            report,
+            ["⚠ the hostname is still the old name on devtest-echo (devtest-echo: exit 1: Could not set static hostname: Access \
+              denied) — re-run `arena pods setup devtest-echo` once it answers"]
+        );
+        // No endpoint at all: both are said.
+        let mut gone = pods.clone();
+        gone.iter_mut().filter(|p| p.id == "h-delta").for_each(|p| p.ssh_ip = None);
+        let missed = rewrite_name_files(Arc::new(FakeRemote::new()), &cfg, "devtest", &done[..1], &gone).await;
+        let why = ("devtest-echo".to_string(), "no SSH endpoint".to_string());
+        assert_eq!((missed.name_file, missed.hostname), (vec![why.clone()], vec![why]));
+        // The dry run and prompt say it, for the Hetzner VM only.
+        let steps = rename_followup_steps("devtest", &plan, &pods, &no_api(&csv), true).join("\n");
+        assert!(steps.contains("and set the hostname (a Hetzner VM is named by it; kept across a reboot): devtest-echo\n"), "{steps}");
+    }
+
+    /// The MACHINE_NAME note is about a RunPod or Vast container's env var: said for those, and
+    /// only those, by name in a mixed batch — never for a Hetzner (or Shadeform) VM, which has
+    /// none (prod 2026-10-30 printed it for a Hetzner rename). A pod not listed gets it: extra
+    /// only.
+    #[test]
+    fn the_machine_name_note_is_for_pods_with_that_env_var() {
+        let pods = [
+            pod("r1", "devtest-alpha", "runpod", None),
+            pod("v1", "devtest-bravo", "vast", None),
+            pod("h1", "devtest-charlie", "hetzner", None),
+            pod("s1", "devtest-delta", "shadeform", None),
+        ];
+        let plan: Vec<PlannedRename> =
+            [("r1", "devtest-echo"), ("v1", "devtest-foxtrot"), ("h1", "devtest-golf"), ("s1", "devtest-hotel"), ("x1", "devtest-india")]
+                .iter()
+                .map(|(id, new)| PlannedRename { id: id.to_string(), old: String::new(), new: new.to_string() })
+                .collect();
+        let note = |ids: &[&str]| {
+            let renamed: Vec<&PlannedRename> = plan.iter().filter(|r| ids.contains(&r.id.as_str())).collect();
+            machine_name_note(&renamed, &pods)
+        };
+        assert_eq!(note(&["h1"]), None);
+        assert_eq!(note(&["h1", "s1"]), None);
+        let all = note(&["r1", "v1"]).unwrap();
+        assert!(all.starts_with("note: each renamed pod's MACHINE_NAME env var keeps the old name — env only changes with a reimage"), "{all}");
+        let mixed = note(&["r1", "h1", "x1"]).unwrap();
+        assert!(mixed.starts_with("note: the MACHINE_NAME env var of devtest-echo, devtest-india keeps the old name"), "{mixed}");
+    }
+
+    /// A pod whose backend can't rename ([`Provider::rename_support`]) is refused before
+    /// anything is asked, renamed or reached — the whole batch, as `plan_renames`' problems are.
+    #[tokio::test]
+    async fn a_pod_its_backend_cannot_rename_is_refused_up_front() {
+        let dir = tmpdir("rename-unsupported");
+        let cfg = cfg(&dir.0);
+        let csv = keys_csv(&dir.0, "");
+        let f = Fleet::new(vec![
+            pod("r-alpha", "devtest-alpha", "runpod", Some(("10.0.0.1", 22001))),
+            pod("l-bravo", "devtest-bravo", "lambda", Some(("10.0.0.2", 22))),
+        ]);
+        let remote = Arc::new(FakeRemote::new());
+        let e = handle_rename(&f, remote.clone(), &cfg, &no_api(&csv), one("bravo", "echo"), true, false, true).await.unwrap_err();
+        assert_eq!(e.to_string(), "refusing to rename anything:\n  devtest-bravo: rename not supported on provider `lambda`");
+        // The dry run says so too.
+        let e = handle_rename(&f, remote.clone(), &cfg, &no_api(&csv), one("bravo", "echo"), true, true, true).await.unwrap_err();
+        assert!(e.to_string().contains("rename not supported on provider `lambda`"), "{e}");
+        assert!(f.calls().is_empty() && remote.calls().is_empty());
+        // Another pod in the same fleet is renamed as ever.
+        handle_rename(&f, remote.clone(), &cfg, &no_api(&csv), one("alpha", "echo"), true, false, true).await.unwrap();
+        assert_eq!(f.calls(), ["rename r-alpha devtest-echo"]);
     }
 
     #[tokio::test]

@@ -2022,7 +2022,8 @@ fn stop_plan(provider: &dyn Provider, pods: Vec<Pod>) -> StopPlan {
     plan
 }
 
-/// A [`Provider::stop_support`] refusal in the operator's words (the backend's own sentence).
+/// A [`Provider::stop_support`] (or [`Provider::rename_support`]) refusal in the operator's
+/// words (the backend's own sentence).
 fn no_stop_why(e: arena_core::Error) -> String {
     match e {
         arena_core::Error::NotImplemented(m) => m,
@@ -2071,17 +2072,22 @@ impl StopPlan {
 /// else goes through a confirm modal. Shared by the arrow-Enter and letter-key paths. A stop
 /// of a pod whose backend has no stop (Shadeform) is refused here, before the confirm — as
 /// `pods stop` refuses it alone: the confirm's "keeps no data" warning would only mislead.
+/// So is a rename of a pod whose backend can't rename ([`Provider::rename_support`], the
+/// answer `pods rename` refuses it on), before a new name is asked for.
 fn choose_pod_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Provider>, action: Action) {
     let Some(pod) = selected_pod(shared, ui.selected) else {
         ui.mode = Mode::List;
         return;
     };
     let shown = ui.shown_name(&pod.name);
-    if action == Action::Stop {
-        if let Err(e) = provider.stop_support(&pod) {
-            ui.mode = Mode::Result(format!("✗ can't stop {} — {}", pod.name, no_stop_why(e)));
-            return;
-        }
+    let support = match action {
+        Action::Stop => provider.stop_support(&pod).map_err(|e| ("stop", e)),
+        Action::Rename => provider.rename_support(&pod).map_err(|e| ("rename", e)),
+        _ => Ok(()),
+    };
+    if let Err((verb, e)) = support {
+        ui.mode = Mode::Result(format!("✗ can't {verb} {} — {}", pod.name, no_stop_why(e)));
+        return;
     }
     match action {
         // Read-only: straight to the runs panel.
@@ -6968,6 +6974,36 @@ deep_check_end=1
         assert!(draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("[s] stop"));
         ui.mode = Mode::FleetMenu { scope: Scope::All, sel: 0 };
         assert!(!draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("[s] stop"));
+    }
+
+    /// Rename is offered where the pod's backend can rename it — every backend now, Hetzner and
+    /// Vast included (prod 2026-10-30: the dashboard offered it on a Hetzner VM and the CLI
+    /// refused) — asked of the real fleet, the answer `pods rename` goes by: a pod no configured
+    /// backend owns is refused before a new name is asked for, with the fleet's own words.
+    #[test]
+    fn rename_is_offered_where_the_pods_backend_can_rename() {
+        let fleet: Arc<dyn Provider> = Arc::from(
+            arena_core::provider::build_fleet("runpod", &Config::parse("RUNPOD_API_KEY=r\nHETZNER_API_KEY=h\nVAST_API_KEY=v"), false).unwrap(),
+        );
+        let pods = [pod("alpha", "runpod", "rp1", 1, Some(22001)), pod("delta", "hetzner", "hz1", 4, Some(22)), pod("echo", "vast", "va1", 5, Some(22)), pod("mayor", "shadeform", "sf1", 3, Some(22))];
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let snap = dashboard_snapshot(&pods, &[], None, &HealthCache::new(), &Naming::from_config(&cfg("")), NOW);
+        shared.lock().unwrap().publish(snap);
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let row = |id: &str| shared.lock().unwrap().pods.iter().position(|p| p.id == id).unwrap();
+        for id in ["rp1", "hz1", "va1"] {
+            (ui.selected, ui.mode) = (row(id), Mode::List);
+            choose_pod_action(&shared, &mut ui, &fleet, Action::Rename);
+            assert!(matches!(&ui.mode, Mode::Input { action: Action::Rename, .. }), "{id}: {:?}", ui.mode);
+        }
+        // Shadeform isn't configured here: nothing owns its pod, so nothing can rename it.
+        (ui.selected, ui.mode) = (row("sf1"), Mode::List);
+        choose_pod_action(&shared, &mut ui, &fleet, Action::Rename);
+        assert!(
+            matches!(&ui.mode, Mode::Result(r) if r.starts_with("✗ can't rename devtest-mayor — no configured provider owns pod `devtest-mayor`")),
+            "{:?}",
+            ui.mode
+        );
     }
 
     /// The marked stop as it runs: the stoppable pods stopped (through the stop's outcome), the
