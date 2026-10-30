@@ -31,7 +31,9 @@ earlier).
 - When: a pod up without an endpoint for `--endpoint-timeout` minutes (new, default 5) — on RunPod,
   its container running behind RunPod's SSH proxy only (a host with no public IP; before, only
   `--check` replaced these); it always gets the whole `--endpoint-timeout`, past `--timeout` if
-  need be. And a RunPod pod still listed RUNNING with no container when a `--timeout` of 10
+  need be — even one first seen so by `--timeout`'s last look. Shadeform's 60 s boot grace (its
+  IP held back after it goes active) isn't counted, and there the deadline stays final: a pod
+  not up by it is deleted, as before. And a RunPod pod still listed RUNNING with no container when a `--timeout` of 10
   minutes or more (the default) ends — its image never started (prod's case above). RunPod lists a
   pod RUNNING from the create while its image pulls, so the pull doesn't count: healthy pulls took
   1½–7 minutes live, and a `--timeout` under 10 minutes still leaves such a pod running.

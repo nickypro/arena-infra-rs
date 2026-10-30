@@ -1171,7 +1171,12 @@ options, the ones that haven't failed first; the last one is terminated too, and
   listed running without an IP/port (Hetzner `running`, Vast `running`, Shadeform `active`).
 - It always gets a whole `--endpoint-timeout` without an endpoint before it's judged — past
   `--timeout` if its container came up late (a slow pull onto a host with no public IP is still
-  replaced, not left running at `--timeout`).
+  replaced, not left running at `--timeout`). One that `--timeout`'s own last look is the first to
+  see up without an endpoint (it came up between two listings) gets it too, once: `[lightning] no
+  SSH endpoint after 600s, and only now up without one: giving it its 5m00s (--endpoint-timeout)`.
+- Not counted: the time a backend holds an endpoint back on purpose — Shadeform shows an `active`
+  instance's IP only 60 s after it went active, so there "active, no IP" gets 60 s more
+  (`--endpoint-timeout 1` is two minutes there).
 - Nothing is terminated on an old look: before replacing, `up` asks the pod's own backend again.
   An endpoint after all goes on with the pipeline; a pod that isn't up any more (restarting), or
   can't be read just then, is waited for again, its clock started over by the listings after
@@ -1194,7 +1199,9 @@ the clock; a listing that shows it not up (a restart) does. A pod `up` didn't cr
 never terminated; Ctrl+C terminates nothing. On
 Shadeform a pod listed `error`, or not up within `SHADEFORM_READY_MINS` or `--timeout` (whichever
 comes first), is a failed placement the same way — deleted at once and the name tried on the next
-option.
+option. There that deadline is the end, grace or not (an instance can't be stopped and bills until
+deleted): one up without an endpoint is never waited for past it, and one whose last look can't
+be read, or shows it not up, is deleted all the same — never left running.
 
 Ends with the usual one-line proxy sync and a `NAME GPU $/H PROXY PORT HEALTH STATUS READY AFTER`
 table (READY AFTER = first create → confirmed ready, replacements included: start participants'
