@@ -29,7 +29,8 @@ earlier).
 - Only what isn't set is added (to an exclude list already there, only the patterns it lacks), so
   a participant's or an operator's own values stay. The file is edited as the JSONC VS Code writes:
   comments and trailing commas stay; one it can't read the way VS Code does is left alone, with a
-  warning on the pod's line.
+  warning on the pod's line. When setup changes the file, the old one is kept beside it
+  (`settings.json.arena-<random>`), and a save VS Code makes at that moment is never lost.
 - Setup gives the course checkout a git identity (the backup's, `Arena Autocommit`) when none is
   configured, on every provider: a participant's first `git commit` or `git merge` on a fresh
   machine no longer stops at "Please tell me who you are". A participant's own is never overridden,

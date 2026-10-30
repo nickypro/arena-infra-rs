@@ -965,8 +965,15 @@ done
             ok(&pod.run_low("x86_64", &pod.setup(), LowMemory::BelowGib(LOW_MEMORY_BELOW_GIB), &[]));
             assert_eq!(pod.settings(), after);
             pod.assert_clean();
-            let strays: Vec<_> = std::fs::read_dir(real.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
-            assert_eq!(strays.len(), 1, "no temp file left beside it: {strays:?}");
+            // Beside it: only the file as it was before the merge, kept.
+            let beside: Vec<_> = std::fs::read_dir(real.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| *p != real)
+                .collect();
+            assert_eq!(beside.len(), 1, "{beside:?}");
+            assert_eq!(std::fs::read_to_string(&beside[0]).unwrap(), theirs);
         }
 
         /// Review r1: VS Code ends a `//` comment at a CR too. A setting after a CR-only line
@@ -990,12 +997,13 @@ done
             assert_eq!(v["python.analysis.diagnosticMode"], "openFilesOnly", "{after}");
         }
 
-        /// Review r1, r2: VS Code saving a participant's change while setup merges. What it saved
-        /// is never lost: the merge is swapped into place in one step, whatever comes out that
-        /// isn't what was read goes straight back, and what can't be put back (it saved again
-        /// in between) is kept beside it; a file that appeared meanwhile is never replaced; where
-        /// no such swap can be done nothing is written. Each says so. (The hooks run a command at
-        /// that moment, as VS Code's save.)
+        /// Review r1–r3: VS Code saving a participant's change while setup merges. Nothing of
+        /// theirs is ever deleted or overwritten: the merge is swapped into place in one step and
+        /// the file swapped out is kept beside it, never deleted (an editor may still be writing
+        /// into it); one that isn't what was read goes straight back; a file that appeared
+        /// meanwhile is never replaced; where no such swap or no-replace rename can be done,
+        /// nothing is written. Each says so. (The hooks run a command at that moment, as VS
+        /// Code's save.)
         #[test]
         fn a_save_while_merging_is_never_lost() {
             let Some(pod) = Pod::new("race") else { return };
@@ -1009,60 +1017,99 @@ done
             std::fs::write(pod.root.join("second.json"), second).unwrap();
             let save = |which: &str| format!("cat '{}' > \"$1\"", pod.root.join(which).display());
             let (save1, save2) = (save("first.json"), save("second.json"));
-            let files = || -> Vec<String> {
-                let mut v: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            // The files beside settings.json that a run kept (and clears them for the next case).
+            let kept = || -> Vec<String> {
+                let mut v: Vec<String> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n != "settings.json")
+                    .map(|n| {
+                        let p = dir.join(&n);
+                        let body = std::fs::read_to_string(&p).unwrap();
+                        std::fs::remove_file(&p).unwrap();
+                        assert!(n.starts_with("settings.json.arena-"), "{n}");
+                        body
+                    })
+                    .collect();
                 v.sort();
                 v
             };
             let changed = "changed while arena merged its settings (re-run setup)";
             let fresh = || std::fs::write(&file, "{\"editor.fontSize\": 12}").unwrap();
+            let run = |env: &[(&str, &str)]| pod.run_low("x86_64", &pod.setup(), LowMemory::Always, env);
+            let is_ours = |body: &str| body.contains("\"python.analysis.indexing\": false");
 
-            // A save just before the swap: it goes back.
+            // No race: merged, and the old file kept beside it.
             fresh();
-            let why = warned(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[("ARENA_SETTINGS_RACE", &save1)]));
-            assert!(why.contains(&format!("{changed} - left alone")), "{why}");
+            let out = ok(&run(&[]));
+            assert!(out.contains("; the old file is kept as ") && out.contains("settings.json.arena-"), "{out}");
+            assert!(is_ours(&pod.settings()));
+            assert_eq!(kept(), ["{\"editor.fontSize\": 12}"]);
+
+            // A save just before the swap: it goes back; ours is what's kept.
+            fresh();
+            let why = warned(&run(&[("ARENA_SETTINGS_RACE", &save1)]));
+            assert!(why.contains(&format!("{changed}; the file swapped out is kept as ")), "{why}");
             assert_eq!(pod.settings(), first);
-            assert_eq!(files(), ["settings.json"], "no temp file left");
+            let k = kept();
+            assert!(k.len() == 1 && is_ours(&k[0]), "{k:?}");
 
-            // A second save right after the swap: the first goes back, the second is kept beside it.
+            // A second save right after the swap: the first goes back, the second is kept.
             fresh();
-            let why = warned(&pod.run_low(
-                "x86_64",
-                &pod.setup(),
-                LowMemory::Always,
-                &[("ARENA_SETTINGS_RACE", &save1), ("ARENA_SETTINGS_RACE_AGAIN", &save2)],
-            ));
+            warned(&run(&[("ARENA_SETTINGS_RACE", &save1), ("ARENA_SETTINGS_RACE_AGAIN", &save2)]));
             assert_eq!(pod.settings(), first);
-            let kept: Vec<String> = files().into_iter().filter(|f| f.starts_with("settings.json.arena-kept-")).collect();
-            assert_eq!(kept.len(), 1, "{:?}", files());
-            assert_eq!(std::fs::read_to_string(dir.join(&kept[0])).unwrap(), second);
-            assert!(why.contains(&format!("{changed}; a save arena couldn't put back is in {}", dir.join(&kept[0]).display())), "{why}");
-            std::fs::remove_file(dir.join(&kept[0])).unwrap();
+            assert_eq!(kept(), [second]);
 
-            // What came out of the swap can't be read (a directory in its place): back it goes.
+            // What came out can't be read (a directory in its place): back it goes.
             fresh();
-            let why = warned(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[("ARENA_SETTINGS_RACE", "rm \"$1\" && mkdir \"$1\"")]));
+            let why = warned(&run(&[("ARENA_SETTINGS_RACE", "rm \"$1\" && mkdir \"$1\"")]));
             assert!(why.contains(changed), "{why}");
             assert!(file.is_dir());
             std::fs::remove_dir(&file).unwrap();
-            assert_eq!(files(), Vec::<String>::new());
+            assert!(kept().iter().all(|b| is_ours(b)));
 
-            // A file that appeared meanwhile is never replaced.
-            let why = warned(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[("ARENA_SETTINGS_RACE", &save1)]));
-            assert!(why.contains(changed), "{why}");
-            assert_eq!(pod.settings(), first);
+            // An editor with the (empty) file open, writing after the swap: its save lands in the
+            // file kept, never in a deleted one.
+            std::fs::write(&file, "").unwrap();
+            let late = "(exec 3>\"$1\"; sleep 0.3; printf '{\"late\": true}' >&3) &";
+            let out = ok(&run(&[("ARENA_SETTINGS_RACE", late)]));
+            assert!(out.contains("; the old file is kept as "), "{out}");
+            assert!(is_ours(&pod.settings()));
+            assert_eq!(kept(), ["{\"late\": true}"]);
 
-            // Where the swap can't be done: nothing written.
+            // A file that appeared meanwhile is never replaced — with or without hard links.
+            for env in [&[("ARENA_SETTINGS_RACE", save1.as_str())][..], &[("ARENA_SETTINGS_RACE", &save1), ("ARENA_SETTINGS_NO_LINK", "1")]] {
+                std::fs::remove_file(&file).unwrap();
+                let why = warned(&run(env));
+                assert!(why.contains(changed), "{env:?}: {why}");
+                assert_eq!(pod.settings(), first);
+                assert_eq!(kept(), Vec::<String>::new());
+            }
+            // Without hard links, a new file is published by a no-replace rename.
+            std::fs::remove_file(&file).unwrap();
+            ok(&run(&[("ARENA_SETTINGS_NO_LINK", "1")]));
+            assert!(is_ours(&pod.settings()));
+            assert_eq!(kept(), Vec::<String>::new());
+
+            // Where neither can be done: nothing written, said.
             fresh();
-            let why = warned(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[("ARENA_SETTINGS_NO_SWAP", "1")]));
+            let why = warned(&run(&[("ARENA_SETTINGS_NO_RENAMEAT2", "1")]));
             assert!(why.contains("can't be swapped for the merged one in one step here (renameat2)"), "{why}");
             assert_eq!(pod.settings(), "{\"editor.fontSize\": 12}");
-            assert_eq!(files(), ["settings.json"]);
+            std::fs::remove_file(&file).unwrap();
+            let why = warned(&run(&[("ARENA_SETTINGS_NO_RENAMEAT2", "1"), ("ARENA_SETTINGS_NO_LINK", "1")]));
+            assert!(why.contains("can't be created here without the risk of replacing a save"), "{why}");
+            assert!(!file.exists());
+            assert_eq!(kept(), Vec::<String>::new());
 
-            // The next run merges into what's there.
-            ok(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[]));
-            assert!(pod.settings().starts_with("{\"editor.fontSize\": 12,"), "{}", pod.settings());
-            assert!(pod.settings().contains("\"python.analysis.indexing\": false"));
+            // A file an earlier run kept (or one cut short) is never written over by a later one.
+            fresh();
+            let stale = dir.join("settings.json.arena-stale1");
+            std::fs::write(&stale, first).unwrap();
+            ok(&run(&[]));
+            assert_eq!(std::fs::read_to_string(&stale).unwrap(), first);
+            assert_eq!(kept(), [first, "{\"editor.fontSize\": 12}"]);
         }
 
         #[test]

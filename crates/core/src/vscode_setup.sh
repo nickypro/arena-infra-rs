@@ -160,14 +160,14 @@ doesn't name are added (one set to false stays false). VS Code writes and reads 
 there stays. A file that isn't JSONC VS Code would read the same way, or isn't an object at the
 top, is left alone (exit 4); so is one whose edited text doesn't parse back to exactly the old
 settings plus the additions, and one that changed while this ran. Written through a temp file
-beside it, swapped into place (put(); mode kept; a symlink's target)."""
+beside it, swapped into place, the old one kept (put(); mode kept; a symlink's target)."""
 import copy
 import errno
 import json
 import os
 import re
 import sys
-import time
+import tempfile
 
 INTERPRETER = "python.defaultInterpreterPath"
 # The memory-saving settings (a small machine: Pylance + the kernels ran a cx33 out of RAM).
@@ -389,26 +389,28 @@ def read(target):
         return None
 
 
-def exchange(a, b):
-    """Swap two paths in one step (Linux's renameat2 RENAME_EXCHANGE): True if done, False where
-    the system or filesystem can't, OSError for anything else."""
+RENAME_NOREPLACE, RENAME_EXCHANGE = 1, 2
+
+
+def rename2(a, b, flag):
+    """Linux's renameat2: RENAME_NOREPLACE (a to b, unless b exists: FileExistsError) or
+    RENAME_EXCHANGE (a and b swapped in one step). True if done, False where the system or the
+    filesystem can't; OSError for anything else."""
+    if os.environ.get("ARENA_SETTINGS_NO_RENAMEAT2"):  # a test's stand-in for a system without it
+        return False
     try:
         import ctypes
         fn = ctypes.CDLL(None, use_errno=True).renameat2
     except (ImportError, OSError, AttributeError):
         return False
     fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-    at_fdcwd, rename_exchange = -100, 2
-    if fn(at_fdcwd, os.fsencode(a), at_fdcwd, os.fsencode(b), rename_exchange) == 0:
+    at_fdcwd = -100
+    if fn(at_fdcwd, os.fsencode(a), at_fdcwd, os.fsencode(b), flag) == 0:
         return True
     err = ctypes.get_errno()
     if err in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
         return False
     raise OSError(err, os.strerror(err))
-
-
-# Temp files that may hold what VS Code saved (never deleted at the end).
-KEEP = set()
 
 
 def hook(name, target):
@@ -428,54 +430,59 @@ def peek(p):
         return None
 
 
-def put(path, tmp, target, raw, ours):
-    """tmp (holding `ours`, the merged text) into target's place - unless target no longer holds
-    `raw`, as read: VS Code saved a participant's change since. Theirs is never lost:
-    - a file that wasn't there is created only if it still isn't (a hard link, else O_EXCL);
-    - one that was is swapped with tmp in one step (renameat2 RENAME_EXCHANGE), so what comes
-      out of its place is exactly what was there at that moment. Anything but `raw` is swapped
-      straight back; if what then comes out isn't ours (VS Code saved again meanwhile), it's kept
-      beside it under a name of its own, said, never deleted;
-    - where no such swap can be done, nothing is written (a compare-then-rename has a window in
-      which a save is lost)."""
-    changed = "changed while arena merged its settings (re-run setup)"
+class Left(Exception):
+    """Nothing published: why, and whether tmp now names a file to keep (not ours alone)."""
+
+    def __init__(self, why, keep=False):
+        Exception.__init__(self, why)
+        self.why, self.keep = why, keep
+
+
+CHANGED = "changed while arena merged its settings (re-run setup)"
+
+
+def put(tmp, target, raw):
+    """Publish tmp (the merged text, a file of its own nobody else has seen) as target, unless
+    target no longer holds `raw`, as read: VS Code saved a participant's change since. Nothing of
+    theirs is ever deleted or overwritten:
+    - a file that wasn't there is published only if it still isn't (a hard link, else renameat2
+      RENAME_NOREPLACE; with neither, not at all);
+    - one that was is swapped with tmp in one step (RENAME_EXCHANGE): tmp then names exactly
+      what target held at that moment, and that file is kept under tmp's name, never deleted (an
+      editor holding it open may still be writing into it). Unless it's `raw`, it's swapped
+      straight back, and what comes out again is kept the same way. With no such swap, nothing
+      is written (a compare-then-rename has a window in which a save is lost).
+    Returns the name the old file is kept under (None: there was none); Left when nothing was
+    published."""
     hook("ARENA_SETTINGS_RACE", target)
     if raw is None:
         try:
-            os.link(tmp, target)
-            return
+            if not os.environ.get("ARENA_SETTINGS_NO_LINK"):  # a test's stand-in for no hard links
+                os.link(tmp, target)
+                os.remove(tmp)
+                return None
         except FileExistsError:
-            left_alone(path, changed)
+            raise Left(CHANGED)
         except OSError:
             pass
         try:
-            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            if rename2(tmp, target, RENAME_NOREPLACE):
+                return None
         except FileExistsError:
-            left_alone(path, changed)
-        with os.fdopen(fd, "wb") as f:
-            f.write(ours)
-        return
-    if os.environ.get("ARENA_SETTINGS_NO_SWAP") or not exchange(tmp, target):
-        left_alone(path, "can't be swapped for the merged one in one step here (renameat2), and a "
-                   "save VS Code made meanwhile would be lost")
-    KEEP.add(tmp)
-    hook("ARENA_SETTINGS_RACE_AGAIN", target)
-    if peek(tmp) == raw:
-        KEEP.discard(tmp)
-        return
+            raise Left(CHANGED)
+        raise Left("can't be created here without the risk of replacing a save VS Code makes meanwhile "
+                   "(no hard link or renameat2)")
+    if not rename2(tmp, target, RENAME_EXCHANGE):
+        raise Left("can't be swapped for the merged one in one step here (renameat2), and a save VS Code "
+                   "made meanwhile would be lost")
     try:
-        back = exchange(tmp, target)
+        hook("ARENA_SETTINGS_RACE_AGAIN", target)
+        if peek(tmp) == raw:
+            return tmp
+        rename2(tmp, target, RENAME_EXCHANGE)
     except OSError:
-        back = False
-    if back and peek(tmp) == ours:
-        KEEP.discard(tmp)
-        left_alone(path, changed)
-    kept = "%s.arena-kept-%d-%d" % (target, int(time.time()), os.getpid())
-    try:
-        os.rename(tmp, kept)
-    except OSError:
-        kept = tmp
-    left_alone(path, "%s; a save arena couldn't put back is in %s" % (changed, kept))
+        pass
+    raise Left("%s; the file swapped out is kept as %s" % (CHANGED, tmp), keep=True)
 
 
 def main():
@@ -498,22 +505,26 @@ def main():
         print("kept " + ", ".join(kept))
     if new is None:
         return
-    tmp = "%s.arena-%d" % (target, os.getpid())
     data = ("\ufeff" if bom else "").encode("utf-8") + new.encode("utf-8")
+    tmp, keep = None, False
     try:
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(tmp, "wb") as f:
+        # A name of its own, created afresh (never an older run's file, which may hold a save).
+        fd, tmp = tempfile.mkstemp(prefix=os.path.basename(target) + ".arena-", dir=os.path.dirname(target))
+        with os.fdopen(fd, "wb") as f:
             f.write(data)
-        if raw is not None:
-            os.chmod(tmp, os.stat(target).st_mode & 0o7777)
-        put(path, tmp, target, raw, data)
+        os.chmod(tmp, os.stat(target).st_mode & 0o7777 if raw is not None else 0o644)
+        old = put(tmp, target, raw)
+        keep = old is not None
+    except Left as e:
+        keep = e.keep
+        left_alone(path, e.why)
     except OSError as e:
         left_alone(path, "couldn't be written (%s)" % e.strerror)
     finally:
-        if tmp not in KEEP and os.path.exists(tmp):
+        if tmp and not keep and os.path.exists(tmp):
             os.remove(tmp)
-    print("added " + ", ".join(added))
-
+    print("added " + ", ".join(added) + ("; the old file is kept as " + old if old else ""))
 
 main()
 PYEOF
