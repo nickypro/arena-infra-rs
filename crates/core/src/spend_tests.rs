@@ -403,6 +403,13 @@ fn a_replacement_built_as_name_new_keeps_the_owner_of_the_machine_it_replaces() 
     parked.machines[0].name = "devtest-x-old".into();
     let rebuilt = created(parked, &new, &OwnerRule::Inherit, T0 + H);
     assert_eq!(machine(&rebuilt, "vast", "9").owner.as_deref(), Some("al"));
+    // An unowned `<x>` decides even with an owned `<x>-old` parked beside it: no owner (the
+    // `(no owner)` row shows it), never the older twin's.
+    let mut both = s.clone();
+    both.machines[0].owner = None;
+    let twin = created(both, &running("hetzner", "o", "devtest-x-old", 0.01), &given("cy"), T0);
+    let unowned = created(twin, &new, &OwnerRule::Inherit, T0 + H);
+    assert_eq!(machine(&unowned, "vast", "9").owner, None);
     // Another machine's `-new` doesn't take this one's owner; nothing to replace: no owner.
     let other = created(s.clone(), &running("vast", "8", "devtest-q-new", 0.2), &OwnerRule::Inherit, T0 + H);
     assert_eq!(machine(&other, "vast", "8").owner, None);

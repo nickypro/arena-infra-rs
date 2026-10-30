@@ -706,13 +706,20 @@ pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
             }
             let inherited = match owner {
                 OwnerRule::Given(o) => Some(o.clone()),
-                OwnerRule::Inherit => replaced_names(&pod.name).iter().find_map(|name| {
-                    state
-                        .machines
-                        .iter()
-                        .filter(|m| m.is_open() && m.name == *name && !(m.provider == pod.provider && m.id == pod.id))
-                        .find_map(|m| m.owner.clone())
-                }),
+                // The nearest name that has an open machine decides — its owner, or none: an
+                // unowned source never falls through to an older twin's owner.
+                OwnerRule::Inherit => replaced_names(&pod.name)
+                    .iter()
+                    .find_map(|name| {
+                        let mut sources = state
+                            .machines
+                            .iter()
+                            .filter(|m| m.is_open() && m.name == *name && !(m.provider == pod.provider && m.id == pod.id))
+                            .peekable();
+                        sources.peek()?;
+                        Some(sources.find_map(|m| m.owner.clone()))
+                    })
+                    .flatten(),
                 OwnerRule::None => None,
             };
             let i = match state.open_index(Some(&pod.provider), &pod.id) {
