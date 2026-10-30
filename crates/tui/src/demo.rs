@@ -156,11 +156,11 @@ fn proxy(pods: &[Pod]) -> String {
     render_nginx(&forwards)
 }
 
-/// The demo's prepaid accounts, read "live": RunPod and Vast with about a week and three days
-/// left at the fleet's burn. Pure.
+/// The demo's prepaid accounts, read "live": RunPod with about a week left at its pods' burn,
+/// Vast with under two days — low, so the top line has a provider's warning to show. Pure.
 fn balances(pods: &[Pod], now: u64) -> Vec<AccountView> {
     let burn = |provider: &str| pods.iter().filter(|p| p.provider == provider && p.status == "RUNNING").filter_map(|p| p.cost_per_hr).sum::<f64>();
-    let fetched: Vec<Fetched> = [(Account::Runpod, 190.0), (Account::Vast, 80.0)]
+    let fetched: Vec<Fetched> = [(Account::Runpod, 190.0), (Account::Vast, 40.0)]
         .into_iter()
         .map(|(account, hours)| {
             let rate = burn(if account == Account::Runpod { "runpod" } else { "vast" });
@@ -319,9 +319,10 @@ mod tests {
         assert_eq!(a[0].name, "devtest-demo01");
     }
 
-    /// Published, the demo has something in every column and the summary: a B300 MIG slice (its
+    /// Published, the demo has something in every column and the top line: a B300 MIG slice (its
     /// card as nvidia-smi names it, memory unread), deep checks (one running), live/stale/no
-    /// forwards, balances and OpenRouter keys — one at its cap.
+    /// forwards, balances — Vast's low — and OpenRouter keys — one at its cap; a group per
+    /// provider on the top line, two of them with a warning.
     #[test]
     fn the_published_demo_fills_every_column() {
         let shared = Mutex::new(Shared::default());
@@ -340,8 +341,12 @@ mod tests {
             assert!(s.snap.pods.iter().any(|p| p.health.as_ref().is_some_and(|h| h.status == status)), "{status:?}");
         }
         assert_eq!(s.deep.running(), 1);
-        assert_eq!(s.balance.len(), 2);
+        assert_eq!(s.balance.iter().map(|v| v.level).collect::<Vec<_>>(), [balance::Level::Ok, balance::Level::Low]);
         assert_eq!(s.ai_cohort.as_ref().map(|c| c.capped.len()), Some(1));
+        let top = crate::state::top_parts(&s.summary, &s.pods, &s.snap.partial, &s.balance, s.ai_cohort.as_ref(), None, 400).text();
+        for group in ["unreachable │ 51 RunPod $", "│ ⚠ 6 Vast $", "│ 3 Hetzner €", "│ ⚠ OpenRouter key at cap: devtest-demo05 (a → raise cap) · $"] {
+            assert!(top.contains(group), "{group:?} in {top}");
+        }
         assert_eq!(s.status.short, "demo");
     }
 }
