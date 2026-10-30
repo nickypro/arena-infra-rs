@@ -628,7 +628,26 @@ impl Shared<'_, '_> {
                 None => return self.end(run, Verdict::Stopped { stage: Stage::Endpoint }),
                 Some(EndpointWait::Failed { pod, why }) => return self.dead(run, &pod, option, failed_options, why).await,
                 Some(EndpointWait::TimedOut { .. }) if fail_on_expiry => {
-                    return self.dead(run, &pod, option, failed_options, expired()).await;
+                    // A last look at its own backend first (review of the nits): an endpoint that
+                    // came between the last listing and the deadline goes on; one deleted
+                    // elsewhere is said, nothing left; anything else is a failed placement, as
+                    // this deadline always was — deleted, never left billing.
+                    let Some(listings) = self.or_stop(self.run.provider.list_by_provider()).await else {
+                        return self.end(run, Verdict::Stopped { stage: Stage::Endpoint });
+                    };
+                    match now_listed(&listings, &pod) {
+                        Now::Reachable(found) => break found,
+                        Now::Gone => {
+                            run.pod = None;
+                            let reason = format!(
+                                "{}, and {} no longer lists it (terminated elsewhere?) — nothing left running",
+                                expired(),
+                                pod.provider
+                            );
+                            return self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason });
+                        }
+                        _ => return self.dead(run, &pod, option, failed_options, expired()).await,
+                    }
                 }
                 Some(EndpointWait::TimedOut { last }) => {
                     // The wait never trusts one missing listing (a backend that failed to list
@@ -3527,6 +3546,44 @@ mod tests {
         assert_eq!(fleet.events()[..2], [format!("create devtest-apple {A4000}"), "terminate id1".to_string()]);
         let (_, at) = lines.find("[devtest-apple] not up after 10m00s (--timeout) — before it came up: a failed placement");
         assert_eq!(at, Duration::from_secs(600));
+    }
+
+    /// Shadeform's deadline looks once more before it deletes (review of the nits): an instance
+    /// whose IP came between the last listing (595 s, every 7 s) and the 600 s deadline goes on,
+    /// READY, nothing deleted; one deleted elsewhere meanwhile is said to be gone — not deleted
+    /// again, nothing recreated.
+    #[tokio::test(start_paused = true)]
+    async fn shadeforms_deadline_looks_once_more_before_it_deletes() {
+        let cfg = cfg(None);
+        let mut fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 598)])]);
+        (fleet.tag, fleet.pending, fleet.ready) = (Some("shadeform"), Some("PENDING"), Some(Duration::from_secs(15 * 60)));
+        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, false, None, None).await;
+        run.interval = Duration::from_secs(7);
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(rows[0].verdict, Verdict::Ready, "{:#?}", lines.all());
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "nothing deleted");
+        let (_, at) = lines.find("[devtest-apple] endpoint 10.0.0.1:22001 (after 10m00s)");
+        assert_eq!(at, Duration::from_secs(600));
+
+        let mut fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 100_000)])]);
+        (fleet.tag, fleet.pending, fleet.ready) = (Some("shadeform"), Some("PENDING"), Some(Duration::from_secs(15 * 60)));
+        let run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, false, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let elsewhere = async {
+            tokio::time::sleep(Duration::from_secs(595)).await;
+            fleet.terminate_pod("id1").await.unwrap();
+        };
+        let (rows, ()) = tokio::join!(run_up(&run, made, std::future::pending(), &|_, _| {}), elsewhere);
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}"), "terminate id1".to_string()], "only the one elsewhere");
+        match &rows[0].verdict {
+            Verdict::Failed { stage: Stage::Endpoint, reason } => assert_eq!(
+                reason,
+                "not up after 10m00s (--timeout), and shadeform no longer lists it (terminated elsewhere?) — nothing left running"
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Review of #39, nit B: Shadeform hides an `active` instance's IP for its 60 s boot grace

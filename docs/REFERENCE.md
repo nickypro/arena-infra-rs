@@ -1201,7 +1201,9 @@ Shadeform a pod listed `error`, or not up within `SHADEFORM_READY_MINS` or `--ti
 comes first), is a failed placement the same way — deleted at once and the name tried on the next
 option. There that deadline is the end, grace or not (an instance can't be stopped and bills until
 deleted): one up without an endpoint is never waited for past it, and one whose last look can't
-be read, or shows it not up, is deleted all the same — never left running.
+be read, or shows it not up, is deleted all the same — never left running. That last look comes
+first: an endpoint that came just before the deadline goes on, and one deleted elsewhere is only
+said.
 
 Ends with the usual one-line proxy sync and a `NAME GPU $/H PROXY PORT HEALTH STATUS READY AFTER`
 table (READY AFTER = first create → confirmed ready, replacements included: start participants'
