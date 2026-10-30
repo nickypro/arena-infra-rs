@@ -19,6 +19,20 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-30 · The dashboard's top line, grouped by provider
+- The top line reads by provider now: `51 pods, 48 GPUs 37% │ 42 RunPod $520.30 ≈4.6d · $4.62/h │ ⚠
+  Vast $40.00 ≈40h │ 9 Hetzner €1.23/h │ OpenRouter $12.40 today · $422.09 left`. Each provider with
+  pods has its pod count, its balance and runway, and what its pods burn (Hetzner in €); OpenRouter
+  has the cohort's spend today and the credit left.
+- A provider's name is green while all is well. `⚠` and yellow mark a low balance; red marks a
+  critical one, or a provider that failed to list (`⚠ Vast: list failed`). OpenRouter's warnings
+  (credit under the keys' caps, a key at its cap, credit gone) work the same way. An account with no
+  pods and nothing wrong isn't on the line.
+- The line fits your terminal: on a narrow one the least needed words go first (GPU util, then the
+  GPU count, a runway that's fine, …) and a warning never does. A click on it opens the info panel,
+  which still has every detail.
+- The footer's refresh age has a `↻` in front, cyan while a refresh runs.
+
 ## 2026-10-30 · Raise an AI key's cap, or pause it, from the CLI and the dashboard
 - `arena keys limit apple +5` raises a machine's OpenRouter cap by $5 where the key is: same
   secret, same spend, nothing to copy onto the pod, so the participant's next call works. `10` sets
