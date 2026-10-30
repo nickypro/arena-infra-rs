@@ -303,8 +303,10 @@ pub fn short_burn(c: &FleetCost) -> String {
     out
 }
 
-/// The refresh's status: the footer's short form and its colour (`✓ API 13/min`, `⚠ RunPod
-/// rate limit +1`, `✗ list error`, `reading 3 pods…`) and the whole line, for the info panel.
+/// The refresh's status: the footer's short form and its colour (`ok · API 13/min`, `warn: RunPod
+/// rate limit +1`, `list error`, `reading 3 pods…`) and the whole line, for the info panel. Plain
+/// words, no symbols: some terminals draw `✓`/`⚠` as emoji pictures (the human, 2026-10-30:
+/// "i'd slightly prefer if it was all normal text").
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RefreshStatus {
     pub short: String,
@@ -326,19 +328,19 @@ impl RefreshStatus {
 
     /// No provider listed: the rows are the last ones.
     pub fn list_error(full: String) -> Self {
-        RefreshStatus { short: "✗ list error".into(), tone: Some(Tone::Bad), full }
+        RefreshStatus { short: "list error".into(), tone: Some(Tone::Bad), full }
     }
 
     /// A refresh that listed: `full` (the dashboard's `status_line`) whole; short, the first warning's
-    /// [`warning_label`] and how many more (yellow), else `✓` and the providers' API requests in
+    /// [`warning_label`] and how many more (yellow), else `ok` and the providers' API requests in
     /// the last minute (`rate`, when any were counted).
     pub fn of(full: String, warnings: &[&str], rate: Option<usize>) -> Self {
         match warnings.first() {
             Some(w) => {
                 let more = if warnings.len() > 1 { format!(" +{}", warnings.len() - 1) } else { String::new() };
-                RefreshStatus { short: format!("⚠ {}{more}", warning_label(w)), tone: Some(Tone::Warn), full }
+                RefreshStatus { short: format!("warn: {}{more}", warning_label(w)), tone: Some(Tone::Warn), full }
             }
-            None => RefreshStatus { short: rate.map_or_else(|| "✓".to_string(), |r| format!("✓ API {r}/min")), tone: Some(Tone::Good), full },
+            None => RefreshStatus { short: rate.map_or_else(|| "ok".to_string(), |r| format!("ok · API {r}/min")), tone: Some(Tone::Good), full },
         }
     }
 }
@@ -1482,17 +1484,17 @@ mod tests {
         assert_eq!(short_burn(&fleet::fleet_cost(&[])), "$0.00/h");
     }
 
-    /// The footer's short status: the first warning's words (yellow) and how many more; else ✓
+    /// The footer's short status: the first warning's words (yellow) and how many more; else `ok`
     /// and the API requests of the last minute; a failed listing, red; work under way, cyan.
     /// The whole line stays for the info panel.
     #[test]
     fn the_refresh_status_is_short_in_the_footer_and_whole_in_the_panel() {
         let ok = RefreshStatus::of("3 reporting · RunPod API 13/min · 47/60 left this minute".into(), &[], Some(13));
-        assert_eq!((ok.short.as_str(), ok.tone), ("✓ API 13/min", Some(Tone::Good)));
+        assert_eq!((ok.short.as_str(), ok.tone), ("ok · API 13/min", Some(Tone::Good)));
         assert_eq!(ok.full, "3 reporting · RunPod API 13/min · 47/60 left this minute");
-        assert_eq!(RefreshStatus::of("0 reporting".into(), &[], None).short, "✓");
+        assert_eq!(RefreshStatus::of("0 reporting".into(), &[], None).short, "ok");
         let warned = RefreshStatus::of("x".into(), &["RunPod rate limit: listing again in 12 s", "warning: can't read the proxy config /etc/x (denied)"], Some(2));
-        assert_eq!((warned.short.as_str(), warned.tone), ("⚠ RunPod rate limit +1", Some(Tone::Warn)));
+        assert_eq!((warned.short.as_str(), warned.tone), ("warn: RunPod rate limit +1", Some(Tone::Warn)));
         for (w, want) in [
             ("RunPod rate limit: listing again in 12 s (the minute window is spent)", "RunPod rate limit"),
             ("pod details incomplete: HTTP 500", "pod details incomplete"),
@@ -1504,7 +1506,7 @@ mod tests {
             assert_eq!(warning_label(w), want, "{w}");
         }
         let failed = RefreshStatus::list_error("list error: runpod: HTTP 401".into());
-        assert_eq!((failed.short.as_str(), failed.tone), ("✗ list error", Some(Tone::Bad)));
+        assert_eq!((failed.short.as_str(), failed.tone), ("list error", Some(Tone::Bad)));
         let listed = RefreshStatus::listed("3 pods");
         assert_eq!((listed.short.as_str(), listed.full.as_str()), ("reading 3 pods…", "listed 3 pods — reading them…"));
     }

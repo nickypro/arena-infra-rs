@@ -176,7 +176,7 @@ enum Mode {
     Ask { scope: InputScope, value: String, pick: arena_core::ask::Pick },
     /// An answer to a `?` question: scrollable; Esc closes.
     Answer(ask::Answer),
-    /// `i`, or a click on the footer's `☰`: everything the top line and the footer leave out
+    /// `i`, or a click on the footer's `[i] info`: everything the top line and the footer leave out
     /// (provider, config, the whole status, refresh, deep checks, the fleet's words, balances,
     /// AI, every key, what the glyphs mean), scrollable. `detail`: opened from the detail view
     /// (Esc goes back to it).
@@ -220,7 +220,7 @@ struct Shared {
     /// The refresh's status: the footer's short form, the info panel's whole line.
     status: RefreshStatus,
     last_refresh: Option<Instant>,
-    /// True while a sweep is in flight (drives the footer's ⟳ indicator).
+    /// True while a sweep is in flight (the footer says `refreshing`).
     refreshing: bool,
     /// Optimistic placeholders for pods we just created but the provider's list API
     /// hasn't reported yet — shown as "pending" so a new card appears immediately. The
@@ -253,7 +253,7 @@ struct Shared {
     resets: HashMap<String, ContainerReset>,
     /// A `?` question out (`asking claude about …`, for the footer); `None` when none is.
     ask_running: Option<String>,
-    /// When it was asked: the footer's spinner and seconds while it's out.
+    /// When it was asked: the footer's seconds while it's out.
     ask_since: Option<Instant>,
     /// Its answer, set by the background task; the loop opens it ([`ask::land`]).
     ask_answer: Option<ask::Answer>,
@@ -337,7 +337,7 @@ struct Ui {
     /// `ARENA_TUI_DEMO`: the rows are made up (`demo.rs`) — every key that would act on a pod,
     /// reach one or create one is refused ([`demo_refuses`]).
     demo: bool,
-    /// Where the footer's `☰` was last drawn (its cell), set by `view`: a click on it opens the
+    /// Where the footer's `[i] info` was last drawn (its first cell), set by `view`: a click on it opens the
     /// info panel ([`handle_mouse`]).
     menu_at: std::cell::Cell<Option<(u16, u16)>>,
 }
@@ -890,7 +890,7 @@ async fn list_all(provider: &dyn Provider, details: &mut DetailsState) -> (Listi
 /// The footer's quota part: per provider listed, its API requests in the last minute and
 /// what its quota has left this minute ([`arena_core::ratelimit::footer`]) — from this
 /// process's own requests; nothing for a provider that sent none and reports nothing. With the
-/// requests of the last minute across them (the footer's short status, `✓ API 13/min`).
+/// requests of the last minute across them (the footer's short status, `ok · API 13/min`).
 fn quota_line(listing: &Listing) -> (Option<String>, Option<usize>) {
     let views = arena_core::ratelimit::observed();
     let mut seen: Vec<&str> = Vec::new();
@@ -1177,14 +1177,14 @@ async fn end_now(code: i32, why: Option<String>) {
 /// Mouse handling: wheel-scroll the pod list (or the result modal, or the info panel), and in
 /// the list left-click a row to select it. Clicking the far-left of a row — or shift-clicking
 /// anywhere on it — toggles that pod's multi-select mark (same `marked` set as `space`). A click
-/// on the footer's `☰` opens the info panel from the list or the detail view, and closes it.
+/// on the footer's `[i] info` opens the info panel from the list or the detail view, and closes it.
 /// `false`: nothing changed (a move, a click outside the rows) — no frame for it.
 fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared>>) -> bool {
     let in_list = matches!(ui.mode, Mode::List);
     let in_result = matches!(ui.mode, Mode::Result(_));
-    // The footer's ☰ (its glyph and the space after it): opens the info panel from the list or
+    // The footer's `[i] info` (its cells, [`MENU_LABEL`]): opens the info panel from the list or
     // the detail view, and closes it again.
-    let on_menu = ui.menu_at.get().is_some_and(|(x, y)| m.row == y && (x..x.saturating_add(2)).contains(&m.column));
+    let on_menu = ui.menu_at.get().is_some_and(|(x, y)| m.row == y && (x..x.saturating_add(MENU_LABEL.chars().count() as u16)).contains(&m.column));
     if let (MouseEventKind::Down(MouseButton::Left), true) = (m.kind, on_menu) {
         ui.mode = match ui.mode {
             Mode::List => Mode::Info { scroll: 0, detail: false },
@@ -1560,10 +1560,12 @@ fn stamp(s: &Shared) -> (Option<Instant>, Option<Instant>, usize, usize, usize, 
     (s.last_refresh, s.notice.as_ref().map(|n| n.at), s.pending.len(), s.deep.running(), lines, s.refreshing)
 }
 
-/// Whether something on screen moves by itself (a spinner, a check waiting out its debounce, a
-/// run's output open): frames then come every [`lag::TICK_LIVE`], else every [`lag::TICK_IDLE`].
+/// Whether something on screen moves by itself faster than the clock (a check waiting out its
+/// debounce, a run's output open): frames then come every [`lag::TICK_LIVE`], else every
+/// [`lag::TICK_IDLE`]. A question out counts seconds, so the idle tick is enough for it (the
+/// footer has no spinner any more).
 fn live(s: &Shared, ui: &Ui, now: Instant) -> bool {
-    s.ask_running.is_some() || ui.offers.busy(now) || matches!(ui.mode, Mode::Working(_)) || (matches!(ui.mode, Mode::Runs { .. }) && s.runs.iter().any(|r| r.running()))
+    ui.offers.busy(now) || matches!(ui.mode, Mode::Working(_)) || (matches!(ui.mode, Mode::Runs { .. }) && s.runs.iter().any(|r| r.running()))
 }
 
 /// What landed from the background since the last pass: an action's result (its modal, and a
@@ -2909,7 +2911,7 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         .constraints([
             Constraint::Length(1), // the top line: fleet summary (and a non-default provider/config)
             Constraint::Min(0),    // body
-            Constraint::Length(1), // footer: ☰ status ⟳age · cadence, keys
+            Constraint::Length(1), // footer: [i] info · status · age · cadence, keys
         ])
         .split(f.area());
 
@@ -2928,7 +2930,7 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
     }
 
     f.render_widget(Paragraph::new(footer_hint(shared, ui, secs)), chunks[2]);
-    // Where the footer's ☰ is (its first cell): a click there opens the info panel.
+    // Where the footer's `[i] info` is (its first cell): a click there opens the info panel.
     ui.menu_at.set(Some((chunks[2].x, chunks[2].y)));
 
     match &ui.mode {
@@ -3805,29 +3807,34 @@ fn gpu_detail(p: &Pod, m: Option<&PodMetrics>) -> String {
     }
 }
 
-/// The footer, one line, cut at the terminal's edge: `☰` first, always in the same cell (a click
+/// The footer's first words, always in the same cells: a click on them, or `i`, opens the info
+/// panel. Words, not a `☰`: the human (2026-10-30) would "slightly prefer if it was all normal text"
+/// — some terminals draw those symbols as pictures.
+const MENU_LABEL: &str = "[i] info";
+
+/// The footer, one line, cut at the terminal's edge, in plain words: [`MENU_LABEL`] first (a click
 /// on it, or `i`, opens the info panel with everything that isn't here), then what must be read
-/// before the next key — a live [`Notice`], a run going (`pods up`…), a `?` question out — then
-/// the refresh's short status (`✓ API 13/min`, a warning's first words in yellow), how long ago
-/// it refreshed (`⟳7s`, a spinner while it does) and its cadence (`· 5s`), then the keys for the
-/// current mode: the way out first (`[q] quit`, `[esc] back`), pairs merged (`[a/A] act/all`).
+/// before the next key — a live [`Notice`], a run going (`running: pods up …`), a `?` question out
+/// with its seconds — then the refresh's short status (`ok · API 13/min`, `warn: …` in yellow), how
+/// long ago it refreshed (`7s ago`, `refreshing` while it does) and its cadence (`every 5s`), then
+/// the keys for the current mode: the way out first (`[q] quit`, `[esc] back`), pairs merged.
 fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = vec![Span::styled("☰ ", Style::default().add_modifier(Modifier::BOLD))];
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(MENU_LABEL, Style::default().add_modifier(Modifier::BOLD)), Span::raw(" · ")];
     // A notice (`D`'s prompt and what it skips, a finished action) comes first: the question's
     // line can be long, and the notice is what must be read before the next key.
     if let Some(n) = shared.notice.as_ref().filter(|n| n.at.elapsed() < NOTICE_FOR) {
         let style = if n.error { tone_style(Tone::Bad) } else { tone_style(Tone::Busy) };
-        spans.extend([Span::styled(n.text.clone(), style), Span::raw(" · ")]);
+        spans.extend([Span::styled(without_symbol(&n.text), style), Span::raw(" · ")]);
     }
     // A run going (`pods up`…) leads too: it bills, and `p` shows it.
     if let Some(r) = runs::footer(shared) {
         spans.push(Span::styled(r, tone_style(Tone::Busy)));
     }
-    // A question out, moving and counting, so it reads as alive: an answer can take a minute,
-    // and a line that never changed looked like a hang.
+    // A question out, counting, so it reads as alive: an answer can take a minute, and a line that
+    // never changed looked like a hang.
     if let Some(asking) = shared.ask_running.as_ref() {
         let secs = shared.ask_since.map(|t| t.elapsed()).unwrap_or_default();
-        spans.push(Span::styled(format!("{} {asking} {}s · ", spinner(secs), secs.as_secs()), tone_style(Tone::Busy)));
+        spans.push(Span::styled(format!("{asking} {}s · ", secs.as_secs()), tone_style(Tone::Busy)));
     }
     let st = &shared.status;
     if !st.short.is_empty() {
@@ -3835,25 +3842,34 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
             Some(t) => Span::styled(st.short.clone(), tone_style(t)),
             None => Span::raw(st.short.clone()),
         });
-        spans.push(Span::raw(" "));
+        spans.push(Span::raw(" · "));
     }
-    let age = match shared.last_refresh {
-        Some(t) => format!("{}s", t.elapsed().as_secs()),
-        None => "-".into(),
+    // While a refresh runs it says so and keeps the age: a slow refresh at a short cadence would
+    // otherwise hide it most of the time (pre-merge review of #44).
+    let refreshed = match (shared.last_refresh, shared.refreshing) {
+        (Some(t), true) => format!("refreshing, last {}s ago", t.elapsed().as_secs()),
+        (None, true) => "refreshing".into(),
+        (Some(t), false) => format!("{}s ago", t.elapsed().as_secs()),
+        (None, false) => "-".into(),
     };
-    // While a refresh runs the ⟳ turns: the frame drawn as it starts and as it lands.
-    let turn = if shared.refreshing { spinner(shared.last_refresh.map(|t| t.elapsed()).unwrap_or_default()) } else { '⟳' };
-    spans.push(Span::raw(format!("{turn}{age} · {secs}s  ")));
+    spans.push(Span::raw(format!("{refreshed} · every {secs}s  ")));
     spans.push(Span::styled(mode_keys(&ui.mode).to_string(), Style::default().fg(Color::Gray)));
     Line::from(spans)
+}
+
+/// A notice's text without a leading `✗`/`✓`/`⚠`: its colour already says it, and the footer is
+/// plain words ([`MENU_LABEL`]). Notices are written all over with those marks; the footer drops them.
+fn without_symbol(text: &str) -> String {
+    let t = text.trim_start();
+    ["✗ ", "✓ ", "⚠️ ", "⚠ "].iter().find_map(|m| t.strip_prefix(m)).unwrap_or(t).to_string()
 }
 
 /// The footer's keys for a mode: the few most used, pairs merged — the info panel has them all
 /// ([`ALL_KEYS`]). Modal popups keep their own.
 fn mode_keys(mode: &Mode) -> &'static str {
     match mode {
-        Mode::List => "[q] quit  [i] info  [enter] detail  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?] ask  [n] new  [p] runs",
-        Mode::Detail => "[esc] back  [q] quit  [i] info  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?] ask  [n] new  [p] runs",
+        Mode::List => "[q] quit  [enter] detail  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?] ask  [n] new  [p] runs",
+        Mode::Detail => "[esc] back  [q] quit  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?] ask  [n] new  [p] runs",
         Mode::Info { .. } => "[esc/i] close  [↑↓ PgUp PgDn] scroll",
         Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::Confirm(c) if c.action.requires_typed_name() => "type the pod's name  [enter] apply  [esc] cancel",
@@ -3880,7 +3896,7 @@ const ALL_KEYS: &[(&str, &str)] = &[
     ("esc", "back to the list from the detail view; on the list, clear the marks"),
     ("↑↓ / j k", "move the cursor"),
     ("enter", "the detail view of the cursor pod"),
-    ("i  (or click ☰)", "this panel"),
+    ("i  (or click [i] info)", "this panel"),
     ("space", "mark / unmark the cursor pod"),
     ("x", "clear the marks"),
     ("/", "mark pods by selector (the CLI's syntax)"),
@@ -3895,7 +3911,7 @@ const ALL_KEYS: &[(&str, &str)] = &[
     ("r", "refresh now (and re-read the providers' details)"),
     ("f", "refresh cadence: 2 → 5 → 10 → 20 → 60 s"),
     ("s", "short / full pod names (kept)"),
-    ("mouse", "click a row: cursor · click its far left or shift-click: mark · wheel: move · ☰: this panel"),
+    ("mouse", "click a row: cursor · click its far left or shift-click: mark · wheel: move · [i] info: this panel"),
 ];
 
 /// What the table's glyphs mean, for the info panel: `(column, legend)`.
@@ -3908,7 +3924,7 @@ const LEGEND: &[(&str, &str)] = &[
     ("💾", "when the repo was last committed: ↑ unpushed  ↓ behind  ⇕ diverged · yellow: uncommitted work · grey: quiet a day+"),
     ("AI$", "the pod's OpenRouter key: spent/cap this period · yellow from 80% · red at the cap · paused: a $0 cap"),
     ("RTT", "round trip from this box to the pod's SSH port: green < 60 ms · yellow < 120 ms · red beyond"),
-    ("⟳7s · 5s", "refreshed 7 s ago, every 5 s (a spinner while refreshing)"),
+    ("7s ago · every 5s", "refreshed 7 s ago, every 5 s (`refreshing` while it does)"),
 ];
 
 /// The info panel's text ([`Mode::Info`]): every word the top line and the footer leave out —
@@ -4034,16 +4050,10 @@ fn render_info(f: &mut Frame, shared: &Shared, ui: &Ui, _detail: bool, secs: u64
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title(" ☰ info — [esc/i] close · [↑↓ PgUp PgDn] scroll "),
+                .title(" info — [esc/i] close · [↑↓ PgUp PgDn] scroll "),
         ),
         area,
     );
-}
-
-/// A braille spinner frame for `elapsed` (a new one every 150 ms, the UI's redraw tick).
-fn spinner(elapsed: Duration) -> char {
-    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    FRAMES[(elapsed.as_millis() / 150) as usize % FRAMES.len()]
 }
 
 /// A centered popup rect `pct_x` × `pct_y` percent of the screen.
@@ -4526,9 +4536,9 @@ deep_check_end=1
         assert_eq!(names(deep_all_confirm(plan, None)), ["devtest-alpha", "devtest-charlie"], "unarmed: the plan");
     }
 
-    /// The footer: `☰` in its first cell, then a notice (`D`'s prompt), then a question's
-    /// spinner line, then the short status, the refresh's age and cadence, then the keys; one
-    /// separator between each part.
+    /// The footer, in plain words: `[i] info` in its first cells, then a notice (`D`'s prompt),
+    /// then a question's line with its seconds, then the short status, the refresh's age and
+    /// cadence, then the keys; one separator between each part, and no ☰ ⟳ ✓ ⚠ or spinner.
     #[test]
     fn a_notice_leads_the_footer_before_the_asking_line() {
         let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
@@ -4540,17 +4550,25 @@ deep_check_end=1
         };
         let text = |s: &Shared| footer_hint(s, &ui, 10).spans.iter().map(|s| s.content.to_string()).collect::<String>();
         let quiet = text(&shared);
-        assert!(quiet.starts_with("☰ ⠋ asking claude about devtest-alpha… 0s · ✓ API 13/min ⟳- · 10s  [q] quit  [i] info"), "{quiet}");
+        assert!(quiet.starts_with("[i] info · asking claude about devtest-alpha… 0s · ok · API 13/min · - · every 10s  [q] quit  [enter] detail"), "{quiet}");
         shared.notify("D again to deep-check 2 running pods", false);
         let t = text(&shared);
-        let rest = t.strip_prefix("☰ D again to deep-check 2 running pods · ").unwrap_or_else(|| panic!("{t}"));
-        assert!(rest.starts_with("⠋ asking claude about devtest-alpha… 0s · ✓ API 13/min"), "{t}");
+        let rest = t.strip_prefix("[i] info · D again to deep-check 2 running pods · ").unwrap_or_else(|| panic!("{t}"));
+        assert!(rest.starts_with("asking claude about devtest-alpha… 0s · ok · API 13/min"), "{t}");
         assert!(!t.contains("·  ·") && !t.contains("· ·"), "{t}");
         // A refresh that warned: its first words, yellow, and how many more.
         shared.status = RefreshStatus::of("3 reporting · ⚠ pod details incomplete: x · ⚠ ssh config not rewritten: y".into(), &["pod details incomplete: x", "ssh config not rewritten: y"], None);
         let line = footer_hint(&shared, &ui, 5);
-        let warn = line.spans.iter().find(|s| s.content.starts_with('⚠')).unwrap_or_else(|| panic!("{line:?}"));
-        assert_eq!((warn.content.as_ref(), warn.style.fg), ("⚠ pod details incomplete +1", Some(Color::Yellow)));
+        let warn = line.spans.iter().find(|s| s.content.starts_with("warn:")).unwrap_or_else(|| panic!("{line:?}"));
+        assert_eq!((warn.content.as_ref(), warn.style.fg), ("warn: pod details incomplete +1", Some(Color::Yellow)));
+        // A refresh under way says so, in words.
+        shared.refreshing = true;
+        let t = text(&shared);
+        assert!(t.contains(" · refreshing · every 10s  "), "{t}");
+        shared.last_refresh = Some(Instant::now());
+        assert!(text(&shared).contains(" · refreshing, last 0s ago · every 10s  "), "the age stays while it refreshes");
+        let all = t.chars().filter(|c| !c.is_ascii()).collect::<String>();
+        assert!(!all.chars().any(|c| "☰⟳✓✗⚠⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(c)), "only words: {all:?} in {t}");
     }
 
     /// The first refresh's early paint: the listed rows, no metrics yet, and a status that
@@ -4565,14 +4583,6 @@ deep_check_end=1
         assert_eq!((s.snap.pods.len(), s.summary.pods, s.metrics.len()), (2, 2, 0));
         assert_eq!((s.status.full.as_str(), s.status.short.as_str()), ("listed 2 pods — reading them…", "reading 2 pods…"));
         assert!(s.last_refresh.is_none(), "still the first refresh: its full publish comes next");
-    }
-
-    #[test]
-    fn spinner_moves_every_150ms() {
-        assert_eq!(spinner(Duration::from_millis(0)), '⠋');
-        assert_eq!(spinner(Duration::from_millis(149)), '⠋');
-        assert_eq!(spinner(Duration::from_millis(150)), '⠙');
-        assert_eq!(spinner(Duration::from_millis(1500)), '⠋', "wraps after ten frames");
     }
 
     fn verdict(p: &Pod, status: Status, check: Option<(&str, &str)>) -> PodHealth {
@@ -5030,7 +5040,7 @@ deep_check_end=1
         assert_eq!(draw(120, 12, &shared, &ui)[0].trim_end(), " 4 pods · 0 GPUs · $0.42/h + €0.006/h", "the defaults: nothing");
     }
 
-    /// `i` — or a click on the footer's ☰ — opens the info panel over the list or the detail
+    /// `i` — or a click on the footer's `[i] info` — opens the info panel over the list or the detail
     /// view; it holds every word the bars left out; Esc (or `i`, or another click) goes back to
     /// where it was opened; ↑↓ scroll it, no further than its end.
     #[test]
@@ -5053,7 +5063,7 @@ deep_check_end=1
         ] {
             assert!(all.contains(want), "{want:?} in\n{all}");
         }
-        assert!(all.lines().last().unwrap().starts_with("☰ ") && all.contains("[esc/i] close"), "{all}");
+        assert!(all.lines().last().unwrap().starts_with("[i] info · ") && all.contains("[esc/i] close"), "{all}");
         // Scrolled, it stops at its end.
         let before = draw(160, 20, &shared.lock().unwrap(), &ui);
         for _ in 0..500 {
@@ -5072,15 +5082,15 @@ deep_check_end=1
         assert!(matches!(ui.mode, Mode::Info { detail: true, .. }));
         info_key(&mut ui, KeyCode::Char('i'));
         assert!(matches!(ui.mode, Mode::Detail));
-        // A click on ☰ (bottom-left) opens it and closes it; a click beside it doesn't.
+        // A click on `[i] info` (bottom-left, cells 0–7) opens it and closes it; a click beside it doesn't.
         ui.mode = Mode::List;
         let footer_y = draw(120, 20, &shared.lock().unwrap(), &ui).len() as u16 - 1;
         let click = |column: u16, row: u16| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column, row, modifiers: KeyModifiers::NONE };
-        assert!(!handle_mouse(click(5, footer_y), &mut ui, &shared));
+        assert!(!handle_mouse(click(9, footer_y), &mut ui, &shared));
         assert!(matches!(ui.mode, Mode::List));
         assert!(handle_mouse(click(0, footer_y), &mut ui, &shared));
         assert!(matches!(ui.mode, Mode::Info { detail: false, .. }));
-        assert!(handle_mouse(click(1, footer_y), &mut ui, &shared));
+        assert!(handle_mouse(click(7, footer_y), &mut ui, &shared));
         assert!(matches!(ui.mode, Mode::List));
     }
 
@@ -5514,7 +5524,7 @@ deep_check_end=1
         refresh(&Down, &remote, &cfg(""), &ProbeOpts::default(), &shared, &mut details, false).await;
         let s = shared.lock().unwrap();
         assert!(s.status.full.starts_with("list error"), "{}", s.status.full);
-        assert_eq!(s.status.short, "✗ list error");
+        assert_eq!(s.status.short, "list error");
         assert_eq!((s.balance.len(), s.balance[0].balance), (1, Some(40.0)), "observed afresh, not the old $100");
         // Burns unknown (nothing listed): the provider's own rate is the burn.
         assert_eq!(s.balance[0].burn.map(|b| b.per_hr), Some(0.5));
@@ -5607,7 +5617,7 @@ deep_check_end=1
         ui.mode = Mode::List;
         shared.notify("✗ a target matched no pod — nothing was done: `alpah` …", true);
         let footer = draw(180, 12, &shared, &ui).pop().unwrap();
-        assert!(footer.starts_with("☰ ✗ a target matched no pod"), "{footer}");
+        assert!(footer.starts_with("[i] info · a target matched no pod"), "{footer}");
     }
 
     /// `n` pods `devtest-m00…`, RunPod, published as the dashboard shows them.
@@ -6079,7 +6089,7 @@ deep_check_end=1
         assert_eq!((fleet::price_label(alpha), state::has_maintenance(alpha)), ("$0.17".to_string(), true));
         assert_eq!(alpha.gpu_type.as_deref(), Some("RTX A4000"));
         assert!(s.status.full.contains("⚠ pod details incomplete: ") && s.status.full.contains("some field errored"), "{}", s.status.full);
-        assert_eq!(s.status.short, "⚠ pod details incomplete");
+        assert_eq!(s.status.short, "warn: pod details incomplete");
         // The fleet total counts the price it got.
         assert!(summary_text(&s.summary, &s.snap.cost, &s.snap.partial, &[], None).contains("$0.17/h"));
     }

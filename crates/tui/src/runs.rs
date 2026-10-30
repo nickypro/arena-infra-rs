@@ -318,7 +318,8 @@ impl Run {
         parts.join(", ")
     }
 
-    /// The footer's line when it ends: `✓ pods up: 1 ready`, `✗ pods up: exit 1 — 1 failed`.
+    /// The footer's line when it ends: `pods up: 1 ready`, `pods up: exit 1 — 1 failed` (the
+    /// notice's `✓`/`✗` mark is dropped in the footer; its colour says it).
     fn notice(&self) -> (String, bool) {
         let Some((_, end)) = &self.end else { return (String::new(), false) };
         let tally = self.tally();
@@ -787,7 +788,7 @@ fn elapsed(d: Duration) -> String {
     }
 }
 
-/// The footer's lead while runs are going: `⟳ pods up 1m12s (1 under way) · `.
+/// The footer's lead while runs are going: `running: pods up 1m12s (1 under way) · `.
 pub(crate) fn footer(s: &Shared) -> Option<String> {
     let going: Vec<String> = s
         .runs
@@ -803,7 +804,7 @@ pub(crate) fn footer(s: &Shared) -> Option<String> {
             format!("pods {} {}{notes}", r.kind.word(), elapsed(r.started.elapsed()))
         })
         .collect();
-    (!going.is_empty()).then(|| format!("⟳ {} · [p] progress · ", going.join(", ")))
+    (!going.is_empty()).then(|| format!("running: {} · [p] progress · ", going.join(", ")))
 }
 
 /// The runs panel: run `id`'s title and state, its command and output file, each pod's state,
@@ -1011,7 +1012,7 @@ pub(crate) mod tests {
         assert!(r.waiting.is_some());
         let shared = Shared { runs: vec![r], ..Default::default() };
         let f = footer(&shared).unwrap();
-        assert!(f.starts_with("⟳ pods up 0s (waiting for capacity until ") && f.ends_with(" UTC) · [p] progress · "), "{f}");
+        assert!(f.starts_with("running: pods up 0s (waiting for capacity until ") && f.ends_with(" UTC) · [p] progress · "), "{f}");
         let mut r = shared.runs.into_iter().next().unwrap();
         r.take("[created] devtest-echo id=9 on 1×RTX A4000 SECURE ($0.25/h)".into());
         assert_eq!(r.waiting, None, "made: not waiting any more");
