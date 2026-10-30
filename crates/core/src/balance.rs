@@ -779,19 +779,19 @@ pub fn burns_with(listing: &Listing, pods: &[Pod], state: &BalanceState, policy:
 }
 
 /// Whether a pod is gone for good (no disk left to bill).
-fn gone_for_good(status: &str) -> bool {
+pub(crate) fn gone_for_good(status: &str) -> bool {
     matches!(status.trim().to_ascii_lowercase().as_str(), "terminated" | "destroyed" | "deleted" | "dead")
 }
 
 /// GB at a $/GB-month rate, per hour; `None` when the size isn't listed.
-fn disk_per_hr(gb: Option<f64>, per_gb_month: f64) -> Option<f64> {
+pub(crate) fn disk_per_hr(gb: Option<f64>, per_gb_month: f64) -> Option<f64> {
     gb.filter(|g| g.is_finite() && *g >= 0.0).map(|g| g * per_gb_month / HOURS_PER_MONTH)
 }
 
 /// What a stopped pod's disk still bills, $/h: on RunPod its volume disk alone (the container
 /// disk isn't billed while stopped) at RunPod's idle rate; on Vast the whole disk at a
 /// ceiling. `None` when the listing doesn't give the size.
-fn stopped_disk_per_hr(p: &Pod) -> Option<f64> {
+pub(crate) fn stopped_disk_per_hr(p: &Pod) -> Option<f64> {
     match p.provider.as_str() {
         "runpod" => disk_per_hr(p.volume_gb, RUNPOD_STOPPED_PER_GB_MONTH),
         _ => disk_per_hr(p.disk_gb, VAST_STOPPED_PER_GB_MONTH),

@@ -51,6 +51,7 @@ pub mod selector;
 pub mod setup;
 pub mod shape;
 pub mod snapshot;
+pub mod spend;
 pub mod sshconfig;
 pub mod ssh;
 pub mod status;
