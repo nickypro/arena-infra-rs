@@ -14,6 +14,7 @@ use crate::cli::PlaceFlags;
 use crate::keys::{handle_copy_keys, KeySources, KEYS_DIR};
 use crate::pods::create::{apply_spec_overrides, check_create_body, create_extra, SpecOverrides};
 use crate::pods::home_copy::{copy_pod_files, pod_guard, remove_staging_for, verify_replacement, CopyOpts};
+use crate::pods::lifecycle::proxied_name;
 use crate::pods::list::ENRICH_TIMEOUT;
 use crate::pods::lock::{print_would_refuse, LOCKED_REPLACEMENT_NOTE};
 use crate::pods::placement::{checked_gpu, first_create_spec, live_gpu_catalog, plan_header, plan_placement, single_option_plan};
@@ -21,7 +22,7 @@ use crate::pods::rename::replace_stage_names;
 use crate::pods::selection::{just_these, resolve_target_any};
 use crate::pods::setup::handle_setup;
 use crate::proxy::{sync_proxy, ProxySync};
-use crate::{archive, confirm, disk, money, proxied_name, reap, up, Interrupt};
+use crate::{archive, confirm, disk, money, reap, up, Interrupt};
 
 /// Build the base spec for a replacement pod: snapshot the source's spec, fall back for what
 /// it doesn't report — the GPU type to the source's own (enriched) listing first

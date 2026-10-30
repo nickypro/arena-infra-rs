@@ -14,13 +14,14 @@ use crate::cli::PlaceFlags;
 use crate::keys::KEYS_DIR;
 use crate::pods::create::SpecOverrides;
 use crate::pods::home_copy::{copy_pod_files, remove_staging_for, verify_replacement, CopyOpts};
+use crate::pods::lifecycle::proxied_name;
 use crate::pods::lock::{print_would_refuse, LOCKED_REPLACEMENT_NOTE};
 use crate::pods::replace::{after_swap, clean_marker, copy_scope_line, create_replacement, locked_original_note, maintenance_window, plan_replacement, print_replacement_plan, replace_cleanup_blocker, short_of, stopped_source_refusal, wait_for_endpoint, wait_for_stable_endpoint, write_name_file, write_only_proxy};
 use crate::pods::selection::{just_these, resolve_target_any};
 use crate::pods::setup::handle_setup;
 use crate::proxy::{sync_proxy, ProxySync};
 use crate::ssh_config::ssh_config_after;
-use crate::{confirm, disk, money, proxied_name, reap, Interrupt};
+use crate::{confirm, disk, money, reap, Interrupt};
 
 #[derive(Subcommand)]
 pub(crate) enum MigrateCmd {
