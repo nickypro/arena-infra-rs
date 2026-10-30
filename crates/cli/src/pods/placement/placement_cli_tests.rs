@@ -400,7 +400,7 @@ async fn ctrl_c_during_the_relist_creates_nothing_more() {
 fn a_real_sigint_presses_the_retry_waits_ctrl_c() {
     use std::io::{BufRead, BufReader};
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "placement_cli_tests::interrupt_child", "--ignored", "--nocapture", "--test-threads=1"])
+        .args(["--exact", "pods::placement::placement_cli_tests::interrupt_child", "--ignored", "--nocapture", "--test-threads=1"])
         .env("ARENA_INTERRUPT_CHILD", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
