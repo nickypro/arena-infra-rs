@@ -128,8 +128,8 @@ cargo run -p arena-cli -- --config ./config.env pods list
 Every green master commit is published as a GitHub release (`.github/workflows/release.yml`):
 `arena` and `arena-tui` for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, built
 on Ubuntu 22.04 (glibc 2.35 or newer), with `CHANGELOG.md` and `SHA256SUMS`. The tag is the
-version, `v2.1.YYMMDD.HHMM`: the base (`BASE` in `crates/cli/build.rs`) and the commit's time in
-UTC. `arena --version` prints it with the commit: `arena 2.1.261029.1500 (5274b7a1c2)`. The base
+version, `v<base>.YYMMDD.HHMM`: the base (`BASE` in `crates/cli/build.rs`, e.g. `2.2`) and the
+commit's time in UTC. `arena --version` prints it with the commit: `arena 2.2.261030.1500 (5274b7a1c2)`. The base
 goes up a minor (2.0 → 2.1) when a command, flag or `--json` shape changes in a way a script or
 habit notices, a major for a config or on-pod layout break that needs action; otherwise the date
 stamp alone tells releases apart. A newer base is always newer: a 2.0 build updates to 2.1.
@@ -175,7 +175,7 @@ sudo arena update        # where root runs arena from someone else's ~/.cargo/bi
 
   ```bash
   # any machine with a current gh; the release's binaries for the box's platform (prod: aarch64)
-  t=aarch64-unknown-linux-gnu; tag=v2.1.YYMMDD.HHMM
+  t=aarch64-unknown-linux-gnu; tag=vX.Y.YYMMDD.HHMM   # the release's tag (`arena update --check` names it)
   gh release download $tag --repo nickypro/arena-infra-rs -p arena-$t -p arena-tui-$t
   for f in arena-$t arena-tui-$t; do   # both must print the same run, or don't go on
     gh attestation verify $f --repo nickypro/arena-infra-rs --deny-self-hosted-runners \
@@ -207,12 +207,13 @@ Subcommands accept any **unambiguous prefix** (Cisco-style), at every level:
 arena po li         # == arena pods list
 arena tui           # launch the dashboard
 arena co c          # == arena config check
-arena po ba          # == arena pods backup (prompts to confirm)
+arena po bac         # == arena pods backup (prompts to confirm)
 ```
 
 An ambiguous prefix errors and lists the candidates — e.g. `arena p` is rejected
-because it matches both `pods` and `proxy` (use `po`/`pr`); likewise `c` →
-`config`/`cron` (use `co`/`cr`), and `arena po l` → `list`/`lock`/`logs`.
+because it matches `pods`, `proxy` and `plan` (use `po`/`pr`/`pl`); likewise `c` →
+`config`/`cron` (use `co`/`cr`), `arena po l` → `list`/`lock`/`logs`, and `arena po ba` →
+`backup`/`baseline`.
 
 `arena --help` and `arena pods --help` list their commands in groups — `pods`: Look, Make,
 Change, Move, Save, Stop; the top level: Fleet, Access, Money, Automation, Setup. A test keeps
@@ -240,7 +241,7 @@ Every fleet command picks pods with **one selector syntax** (`arena_core::select
 - **`all`** / `--all` — every pod;
 - filters: `--exclude <targets>` (same syntax, ranges too; repeatable), `--gpus N` (exactly
   N GPUs by the provider's count — an unknown count never matches), `--on
-  runpod|vast|hetzner` (not `--provider`, which picks where `create`/`up` make pods).
+  runpod|vast|hetzner|shadeform` (not `--provider`, which picks where `create`/`up` make pods).
 
 **Typos fail loudly**: a target *or* `--exclude` that matches no pod is an error naming it
 and the closest pod names, and a narrowed selection (names/filters) that ends up empty is an
@@ -252,7 +253,7 @@ old spelling of a target (`stop --all --include X` keeps meaning "only X").
 | Command | Targets | Nothing given | Execution |
 | --- | --- | --- | --- |
 | `run` | `-t <targets>` (the command is positional) | every pod | parallel |
-| `test`, `test --deep` | positional | every pod | parallel |
+| `test`, `test --deep` | positional | this cohort's pods with an SSH endpoint, as `backup` (`--include-non-cohort`: every pod) | parallel |
 | `setup`, `copy-keys` | positional | every pod | parallel |
 | `backup`, `init-branches` | positional | this cohort's pods (`all`/`--all` too; a staff box only when named) | parallel |
 | `cp` | `-t <targets>` (file/dest are positional) | every pod | parallel |
@@ -287,8 +288,8 @@ Notes / sharp edges to know:
 
 ### Overriding config without editing it
 
-Any key in `config.env` can be overridden by an **environment variable of the same
-name** (env wins; it can't introduce brand-new keys — except a short allowlist such as
+Any key in `config.env` but the file-only `REAP_*` ones can be overridden by an **environment
+variable of the same name** (env wins; it can't introduce brand-new keys — except a short allowlist such as
 `ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `DISCARD_MAX_GB`, `CONTROL_MIN_FREE_GB`, `NEAR`/`NEAR_MAX_EXTRA_PCT` and the `ASK_<AI>_MODEL`/`_EFFORT` keys, e.g. `RUNPOD_API=v1 arena pods
 list` to use the retiring RunPod v1 backend for one command, until 2026-11-16; v2 is the default). This is how you point at an SSH
 key the current user can actually read, without editing the shared, read-only prod
@@ -401,8 +402,8 @@ Every provider request goes through one path (`http::exchange`, `ratelimit`):
   Nothing says the APIs share one. The commands' own retries (`retry` module) still apply on top,
   each attempt behind the same hold.
 
-`arena api get runpod pods --limits` shows what RunPod reported (below), and the dashboard's footer
-shows the request rate and what the quota has left this minute.
+`arena api get runpod pods --limits` shows what RunPod reported (below); the dashboard's footer
+shows the request rate (`ok · API 13/min`), its info panel what each quota has left this minute.
 
 ### RunPod REST v1 (retiring)
 
@@ -498,7 +499,7 @@ machine's scrubbed off — setup takes about a minute.
 
 ```bash
 arena image build --dry-run      # the plan: VM type, what's scrubbed, cost
-arena image build                # ~10 min; asks first (-y: doesn't)
+arena image build                # ~20 min; asks first (-y: doesn't); --server-type picks the bake VM
 arena image list                 # this cohort's images; which one `arena` picks; are they current?
 arena image prune [--keep 1]     # delete older ones (and any build VM left behind); asks first
 arena image prune --keep 0       # the programme's end: every one of this cohort's images
@@ -571,7 +572,7 @@ newest `--keep` (default 1), the one `arena` picks now and one `HETZNER_IMAGE` n
   taken from. Baked on a cx23 (40 GB), it boots on cx23, cx33 and every larger type.
 - **Cost:** storage only, on the image's size (the data, ~6 GB), not its disk: `GET /pricing`'s
   `image.price_per_gb_month` — $0.0199 per GB-month on the sandbox account (gross, in the account's
-  currency), so ≈ $0.10 a month an image (5.2 GB). The bake VM: ~5–10 minutes of a cx23, about a cent.
+  currency), so ≈ $0.10 a month an image (5.2 GB). The bake VM: ~20 minutes of a cx23, about a cent.
   `teardown --check` lists the images as **kept** (◷: on purpose, never against the check) with
   their cost; at the programme's end `arena image prune --keep 0` deletes them.
 
@@ -636,11 +637,13 @@ never kept); any failure there is "unknown".
 percent-encoding), and Shadeform output never shows a private key or the account's personal fields,
 `--raw` included. `teardown --check` lists the account's Shadeform volumes too.
 
-Spec and recorded fixtures: `specs/shadeform.md`, `crates/core/src/provider/fixtures/shadeform/`.
+Design and recorded fixtures: `crates/core/src/provider/shadeform.rs`'s module doc,
+`crates/core/src/provider/fixtures/shadeform/`.
 
 ## Library modules (`arena-core`)
 
-`arena-core` — library
+A few of them; every module, with what it does and what is pure, is in
+[ARCHITECTURE.md](../ARCHITECTURE.md#core-modules).
 
 - `config` — tolerant parser for the existing `config.env` (incl. the `MACHINE_NAME_LIST` bash
   array), so this tooling reads the *same* config as the legacy bash/python scripts.
@@ -684,7 +687,7 @@ scripted `FakeRemote` in tests), `metrics` (nvidia-smi parsing + per-pod aggrega
 CLI and TUI).
 
 All four target verticals are now in place: multi-provider spin-up (RunPod/Vast/
-Hetzner), commit/backup, the GPU/progress dashboard, and proxy/port-forwarding.
+Hetzner, Shadeform opt-in), commit/backup, the GPU/progress dashboard, and proxy/port-forwarding.
 
 ## Pods: create, list and the lifecycle
 
@@ -784,9 +787,9 @@ it).
 
 #### `pods reimage`
 
-**`reimage`** gets the same `--wipe-ok` gate as restart/stop (a reimage is a fresh container on
-every backend; the dry run says when it would be refused) and the same come-back: settled endpoint,
-**setup again** (`--no-setup`), proxy sync.
+**`reimage`** (RunPod only: the other backends answer "reimage not supported") gets the same
+`--wipe-ok` gate as restart/stop (a reimage is a fresh container; the dry run says when it would be
+refused) and the same come-back: settled endpoint, **setup again** (`--no-setup`), proxy sync.
 
 #### `pods terminate`
 
@@ -809,17 +812,21 @@ directly.)
 
 ### `pods rename`
 
-`rename <old> <new>` / `rename --from-prefix <p>` renames the pod (metadata only, no restart) and
-then brings along what's keyed by the name: rewrites `~/.name` over SSH (setup's exact `export
+`rename <old> <new>` / `rename --from-prefix <p>` renames the pod on any provider (RunPod's name,
+Vast's label, the Hetzner server's name — its labels untouched —, Shadeform's name, which must keep
+the `<prefix>-`; metadata only, no restart; a name the provider refuses is explained) and then
+brings along what's keyed by the name: rewrites `~/.name` over SSH (setup's exact `export
 MACHINE_NAME='<short>'` line; an unreachable pod is reported with a `pods setup <name>` hint, never
-fatal), moves the machine's row in the keys CSV (the per-cohort file the symlink points at — or,
+fatal), on a Hetzner VM also its hostname (best-effort; kept across a reboot; `pods setup` sets it
+when a rename couldn't), moves the machine's row in the keys CSV (the per-cohort file the symlink points at — or,
 after a prefix change, *into* the current prefix's file, repointing the symlink and carrying the
 other live pods' rows, so the next `keys gen` doesn't strand them) and renames its key on OpenRouter
 in place (`PATCH /keys/{hash}` `name`; skipped quietly with no CSV / no provisioning key; a new name
 that already has its own row or key is left alone and warned about), then syncs the proxy.
 
-The pod's `MACHINE_NAME` env var keeps the old name (env only changes with a reimage) — the output
-says so. `--dry-run` lists every step.
+A RunPod or Vast container's `MACHINE_NAME` env var keeps the old name (env only changes with a
+reimage) — the output says so; bare VMs (Hetzner, Shadeform) have no such variable. `--dry-run`
+lists every step.
 
 ### `pods lock` / `pods unlock`
 
@@ -827,7 +834,7 @@ says so. `--dry-run` lists every step.
 — a **locked** pod is refused stop, restart and terminate by RunPod itself, from **any** client
 (this tool, scripts, RunPod's web console; live-verified 2026-10-08) — the protection for a running
 cohort. Setup, backups, `run` and SSH are unaffected. Already-locked pods are left alone; a pod on a
-backend that can't lock (`RUNPOD_API=v1`, Vast, Hetzner) is reported (`not supported on … — …`; on
+backend that can't lock (`RUNPOD_API=v1`, Vast, Hetzner, Shadeform) is reported (`not supported on … — …`; on
 v1 `remove RUNPOD_API=v1 (v2 is the default) to lock RunPod pods`) and makes the exit non-zero.
 
 `pods up --lock` locks each pod as the pipeline's **last** step (after `--check`, whose replacement
@@ -939,11 +946,12 @@ inside the window; Ctrl+C between rounds keeps what was made.
 Ends with a per-name table: `created on 1×RTX 3090 COMMUNITY ($0.22/h) (after 1×RTX A4000 COMMUNITY:
 capacity)` or `not placed (tried: …)`.
 
-Cloud tiers exist only on RunPod (Vast/Hetzner collapse them, and Hetzner the GPU list too, with a
-note). On RunPod and Vast, options near the proxy come first ([Near the
+Cloud tiers exist on RunPod (`COMMUNITY`/`SECURE`) and Vast (its host classes: `datacenter`,
+`verified`, `unverified` — [Vast.ai](#vastai)); Hetzner and Shadeform collapse them (Hetzner the GPU
+list too), with a note. On RunPod and Vast, options near the proxy come first ([Near the
 proxy](#near-the-proxy-near-and-near_max_extra_pct)).
 
-Vast options are priced **live**: one marketplace search per GPU (needs `VAST_API_KEY`), the
+Vast options are priced **live**: one marketplace search per GPU and host class (needs `VAST_API_KEY`), the
 cheapest fitting offer's price for the disk asked for — a snapshot, since each create searches again
 (never above `--max-price`); a GPU with no offer right now is unpriced, with a note. Hetzner's
 option is unpriced.
@@ -1149,7 +1157,7 @@ other names under `--retry-mins` (placed pods used to sit idle, billing, until t
 wait for *its* SSH endpoint and sshd answering (`--timeout`, default 600s, per pod) → sync the
 proxy (one writer at a time) →
 provision it (`--no-setup` skips) → [`--check`: deep check] → copy its API keys (when
-`keys/*_api_keys.csv` exist) → `[name] READY after 4m10s — …` or `[name] FAILED <stage>: …`, printed
+`keys/*_api_keys.csv` exist) → [`--lock`: lock it] → `[name] READY after 4m10s — …` or `[name] FAILED <stage>: …`, printed
 the moment that pod is done — a slow pod never holds up another.
 
 One fleet listing per `--interval` serves every pod's endpoint wait.
@@ -1211,7 +1219,10 @@ clocks at READY), plus a line per name that failed, warned or was replaced — a
 got no pod is a `FAILED create` row; exits non-zero unless every requested name is READY (and when
 nothing was created at all).
 
-A pod that fails is left running — one is only ever terminated by `--check`.
+A pod that fails is left running, except where `up` replaces or deletes it: a host FAIL under
+`--check`, a pod up without an SSH endpoint for `--endpoint-timeout`, a RunPod pod with no
+container at a `--timeout` of 10 min or more (each terminated and its name recreated, within
+`--check-attempts`), and a Shadeform pod not ready by its deadline (deleted: it bills until then).
 
 Without a proxy layout, a READY pod's `~/.ssh/config` fleet map is rewritten at the end if pods came
 up after it.
@@ -1278,7 +1289,7 @@ also when pressed during the create's retry wait (the pipelines then start stopp
 
 So `pods up -n 28 --gpu A40 --cloud SECURE --disk 200 --retry-mins 60 --check` is a full
 start-of-iteration spin-up. Confirms first (`--dry-run` previews the pipeline); `--no-wait` skips
-everything after the create (not with `--check`).
+everything after the create (not with `--check`, `--check-attempts` or `--lock`).
 
 ## Proxy and SSH config
 
@@ -1328,14 +1339,14 @@ tool touches the proxy host.
 
 ### Auto proxy sync
 
-**Auto proxy sync.** `pods create`, `up`, `rename`, `reimage`, `terminate` (one or `--all`),
-`replace` and `migrate cutover/revert` end by re-syncing the proxy through the same merge, from a
+**Auto proxy sync.** `pods create`, `up`, `start`, `restart`, `rename`, `reimage`, `terminate` (one
+or `--all`), `replace`, `migrate cutover/revert/finish` and the reaper end by re-syncing the proxy through the same merge, from a
 fleet-wide listing, and print one line — e.g. `[proxy] after terminate: +0 ~0 -1 =0 (deployed;
 removed arena8-apple)` or `… (unchanged)`.
 
 It's best-effort: no proxy configured / no nginx to deploy to → a one-line skip note; a listing or
-write error → a warning, never a failed command. `--skip-proxy` (create, terminate, rename, reimage,
-replace, migrate) opts out.
+write error → a warning, never a failed command. `--skip-proxy` (create, start, restart, terminate,
+rename, reimage, replace, migrate) opts out.
 
 A just-terminated pod can still be listed briefly, so its forward may survive that sync; the next
 one removes it. A `create`/`up` that fails part-way still syncs for the pods it made.
@@ -1697,9 +1708,10 @@ on its details cadence, in the background (once a minute, `r` sooner; the listin
 credit within 5 s, each keeping its last answer if its read fails — the `AI$` cells go grey then):
 an `AI$` column (each pod's key: spent/cap, yellow from 80%, red at the cap or disabled, `-` no key —
 shown from 122 columns), an `ai key:` line in the detail pane (the cap, what's left, today, week,
-month, all told), and the summary bar's `openrouter $422.09 left · AI today $3.20`. It leads the bar
-in yellow when the credit is less than the enabled keys' caps could still spend, or a key is at its
-cap, and in red when the credit is gone. The keys at their cap are named — `⚠ AI key at cap:
+month, all told), and the top line's `AI $3.20 today · credit $422.09` (the info panel: `openrouter
+$422.09 left · AI today $3.20`). A warning leads the top line, in yellow when the credit is less than
+the enabled keys' caps could still spend (`⚠ AI credit $5.00 < caps' $8.00`) or a key is at its cap,
+and in red when the credit is gone (`‼ AI credit $0.00 — every key's calls fail`). The keys at their cap are named — `⚠ AI key at cap:
 arena9-foo (no pod)`, two at most, then `+N more` — those no listed pod is named after first
 (`(no pod)`: no row shows it, e.g. its machine was terminated or renamed); the detail pane's `ai
 caps:` line lists them all and points at `arena keys list`. A key with a $0 cap that has spent
@@ -2064,6 +2076,9 @@ checklist of what is still billing or scheduled, each with the exact command tha
   `myself.networkVolumes`; GraphQL field names taken from existing clients, not live-verified) with
   size and an **estimated** ~$/month at $0.07/GB/month — fix a `curl -X DELETE
   …/v2/network-volumes/<id>` (irreversible);
+- with a Shadeform key, the account's **Shadeform volumes** (arena never makes one; any there bills
+  per GB-month), priced at Shadeform's listed rate — fix a `curl -X POST …/v1/volumes/<id>/delete`
+  (irreversible; or the Shadeform console);
 - this cohort's **enabled OpenRouter keys** with usage — fix `keys revoke <names>` (by name: `--all`
   only reaches machines that still have a pod; staff boxes' keys are only named in a note);
 - this user's crontab — arena's block (`cron remove`) and hand-added lines mentioning arena
@@ -2072,6 +2087,10 @@ checklist of what is still billing or scheduled, each with the exact command tha
   legacy fleet script (`destroy_pods`, …) — fix `atrm <ids>` (`at` not installed is said, not
   failed);
 - forwards left in the **local** proxy file — fix `proxy apply`;
+- the **backup archive** ([`arena archive`](BACKUPS.md#backup-archive-arena-archive)) in its Hetzner
+  project: this cohort's is ◷ **kept** until `ARCHIVE_KEEP_UNTIL` (on purpose, never against the
+  check); past that date, with no date, orphan volumes or another cohort's archive it is ✗, with
+  its monthly cost and the typed `archive down --delete-volumes --confirm <prefix>-archive` as the fix;
 - and the fleet's **Hetzner project's snapshots**: an `arena image build` VM still there is ✗
   (it bills by the hour; fix `image prune`); this cohort's arena images are ◷ **kept** (made on
   purpose for `HETZNER_IMAGE=arena`, cents a month — never against the check), with their size and
@@ -2324,17 +2343,18 @@ fleet. See [Backup archive](BACKUPS.md#backup-archive-arena-archive).
 
 ## The dashboard (`arena-tui`)
 
-`arena-tui` (TUI) — interactive dashboard (ratatui): pods from the configured provider plus, per
+`arena-tui` (TUI) — interactive dashboard (ratatui): pods from every configured provider plus, per
 pod, GPU stats via `nvidia-smi`, git branch, a setup-health check, and an optional progress signal
 (`PROGRESS_CMD`) — all over SSH in **one** probe per pod. Fetching runs in a **background task** so
 the UI never freezes; it auto-refreshes (`ARENA_REFRESH_SECS`, default 5) and `f` cycles the cadence
-live (2/5/10/20/60s). Provider via `ARENA_PROVIDER` (default `runpod`), config via `ARENA_CONFIG`.
+live (2/5/10/20/60s). `ARENA_PROVIDER` (default `runpod`) is where the add-pod form starts; config via
+`ARENA_CONFIG`.
 
 ### Columns
 
-**Columns**: a provider badge (`R`/`V`/`H`), NAME (short `apple` by default; `s` toggles full
+**Columns**: a provider badge (`R`/`V`/`H`/`S`), NAME (short `apple` by default; `s` toggles full
 `arena8-apple` and the choice persists to `~/.config/arena-tui/prefs`), STATUS, a **SET** health
-glyph (`✓/✗/·` for `~/.name`, the deploy key, git origin→GitHub), GPU (live from `nvidia-smi`, e.g.
+glyph (`✓/✗/·` for `~/.name`, the deploy key, git origin→GitHub, an API key), GPU (live from `nvidia-smi`, e.g.
 `2×RTX A4000 16G` — the provider list API omits this; a MIG slice by its own name, `1×B300 MIG 34G`,
 not the parent card nvidia-smi names), GPU%/MEM/TEMP, **BRANCH** (autocommit branches
 shortened to their `w1d2` label; `main`/others shown as-is), and progress. **RTT** is the round trip
@@ -2374,17 +2394,17 @@ most one list per provider; the details query (GPU/$/maintenance) runs every 60 
 apart); one that fails part-way still shows what it filled (as `pods list` does) over the last good
 answer, with a footer warning.
 
-**Rate limits.** The footer's status shows the providers' API requests in the last minute (`✓ API
+**Rate limits.** The footer's status shows the providers' API requests in the last minute (`ok · API
 13/min`); the info panel shows each one's and what its quota has left this minute (`RunPod API
 13/min · 47/60 left this minute`). A provider call waits at
 most 2 s for a rate limit. A listing that comes back rate-limited keeps that provider's last rows,
 and the dashboard stops listing for the API's own wait (else 5 s, doubling to 5 min). The SSH
-probes keep the refresh cadence, and the footer says `⚠ RunPod rate limit` (the info panel: `…:
-listing again in 12 s`).
+probes keep the refresh cadence, and the footer says `warn: RunPod rate limit` (the info panel:
+`RunPod rate limit: listing again in 12 s (the minute window is spent) · its rows are 40 s old`).
 `r` doesn't list through that wait, and the details query waits too. When a window's quota is low
-(a quarter or less left, or 10 when the quota isn't reported), listings are spread to half of
-what's left over the time to its reset (`⚠ RunPod quota low (minute window): listing every 10 s`);
-`r` lists anyway.
+(a quarter or less left, or 10 when the quota isn't reported), every request on that key — the
+dashboard's listings, `r` included — is spread to half of what's left over the time to its reset
+(the info panel: `listing again in 10 s (the minute window is low: 15 of 60 left)`).
 
 ### Deep checks and marked sets
 
@@ -2398,7 +2418,8 @@ metrics so far), whose GPUs couldn't be read (the read failed, or `nvidia-smi` g
 utilization: a pod too loaded to answer must not look idle — `d` checks one on purpose) or
 CPU-only (Hetzner, or 0 GPUs listed: always a fail). A second `D` within 5 s starts the pods the
 first press counted that still qualify — never one a refresh added in between. In HLTH, a pass older than 26 hours is grey: it says little about today (the
-daily `cron install --health` keeps it fresh; the two hours absorb its drift). **`/`** marks pods with the CLI's selector syntax (`alpha..delta`,
+daily `cron install --health` keeps it fresh; the two hours absorb its drift). **`space`** marks or unmarks the cursor pod (as does a click at a row's far left, or a shift-click),
+**`x`** clears the marks, and **`/`** marks pods with the CLI's selector syntax (`alpha..delta`,
 ids, `-x`/`!name`, `--on`, `--gpus`); a typo marks nothing and leaves the marks as they were, saying
 why in the footer; a valid one replaces the marks. Marks are per `provider:id` (a Vast and a Hetzner
 id can collide). `all` is refused, and since `/first..last` marks a cohort in one line,
@@ -2424,16 +2445,17 @@ on it with nothing marked.
 
 ### SSH time budgets
 
-Every pod SSH call (metrics, test/run/backup/set-branch/setup, deep check) goes through `Remote`
-with a budget (90 s / 30 min / 5 min / 2 min / setup's per-step / 150 s), so a wedged pod ends an
-action with `timed out after …`; only `c` (your interactive shell) is a plain `ssh`.
+Every pod SSH call goes through `Remote` with a budget (metrics 20 s, test 90 s, run 30 min, backup
+5 min, set-branch 2 min, setup per step, deep check 150 s), so a wedged pod ends an action with
+`timed out after …`; only `c` (your interactive shell) is a plain `ssh`.
 
 ### Navigating
 
 **Navigate** with `↑/↓`/`j/k`; `enter` opens a per-pod detail pane (per-GPU breakdown, full
 branch/origin/health, util/temp **sparklines**; labels dim, each value in the colour the table gives
 its state). The footer is `[i] info · <status> · 7s ago · every 5s` (refreshed 7 s ago, every 5 s;
-`refreshing` while it does), in plain words, and the most-used keys; **`i`**, or a click on
+`refreshing, last 7s ago` while it does; a notice, a run going on or a question out comes before the
+status), in plain words, and the most-used keys; **`i`**, or a click on
 `[i] info`, opens the **info panel**: provider, config, the whole status,
 deep checks running, the fleet's summary word for word, each prepaid account, the OpenRouter credit
 and keys at their cap, every key, and what each column's glyphs mean (Esc or `i` closes it).
@@ -2450,7 +2472,7 @@ clears the marks).
 
 **Act** on the selected pod with `a` (restart / stop / terminate / backup / setup / test / run /
 set-branch), on the **whole fleet** with `A` (backup / setup / test / run / set-branch; restart,
-stop and terminate only on a **marked** set — a stop there skips, and names, pods not running and
+stop and terminate only on a **marked** set, which `a` acts on while pods are marked — a stop there skips, and names, pods not running and
 pods whose provider has no stop (Shadeform), and refuses a set of only those, as `pods stop` does),
 or **add pods** with `n` ([Adding pods](#adding-pods)). The cursor pod's menu also runs four CLI
 commands as they are — `start` (a stopped pod, after a confirm), `rename` (type the new name),
@@ -2460,7 +2482,8 @@ text-input modal to type the command / branch; `run` shows each pod's whole outp
 lines, stderr too when it fails); `test` is read-only. Every mutation goes through a confirmation
 modal — the *only* place the TUI mutates anything. Lifecycle actions (restart/stop/terminate)
 require **typing the pod's exact name**; restart is destructive like terminate (red, and its modal
-says it wipes the container disk on RunPod/Vast; Hetzner: "disk kept"); whole-fleet mutations
+says what it does to the container disk on that pod's backend: WIPES it on RunPod v2, MAY WIPE it on
+RunPod v1 and Vast; Hetzner: "the disk is kept"); whole-fleet mutations
 require typing **ALL** (a marked set: its count, or `ALL` as above); every confirm says what will
 happen in plain words (`alpha: commit + push the current branch`), never the generated `ssh …` line
 — `v` shows that for backup/setup/test — and backup/setup/test take a single `y`. The dashboard's
@@ -2480,7 +2503,7 @@ proxy first, for the confirmed names only, and none starts past the window). `--
 used: it gives up after an hour whatever it says, takes one GPU type and tier only, drops the
 near-the-proxy preference, and its waits don't hear Ctrl+C. The type is a
 GPU type, or on Hetzner the **server type** (`HETZNER_SERVER_TYPE`, default `cx33`, first; each with
-its vCPUs, RAM and €/h) — there are no GPU, disk or volume fields there. The choices come from the
+its vCPUs, RAM and €/h) — there are no GPU, disk, volume or `--check` fields there. The choices come from the
 provider's live catalogue, read once in the background by `arena offers` (RunPod: every type it
 sells, B300s and MIG slices included; a type sold only on the other tier moves the tier there and
 says so); the presets stand in until it lands (`…`) or if it can't be read. Under the fields, what
@@ -2565,7 +2588,8 @@ two names (or that id) on the providers that answer, until a listing where *ever
 answered shows none — so another provider's outage delays the all-clear, never a terminate;
 after 8 rounds without one it prints the commands to finish by hand. Only Ctrl+C gets past
 it, so after an interrupted run check `teardown --check`. A COMMUNITY pod that never gets a
-public IP fails as `FAILED endpoint` (see [`docs/TODO.md`](TODO.md)); the guard still cleans it up.
+public IP is replaced by `up` after `--endpoint-timeout` like any other; one still without an
+endpoint on the last attempt fails as `FAILED endpoint`, and the guard still cleans it up.
 
 ### The live attestation check
 

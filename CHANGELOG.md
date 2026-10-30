@@ -19,6 +19,19 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-30 · Tell us what hurts: pain points on GitHub
+- When arena gets in your way, or you work around it, file a pain point:
+  https://github.com/nickypro/arena-infra-rs/issues/new?template=pain-point.yml (label
+  `pain-point`). The README's "Tell us what hurts" has a paragraph to paste into your agents'
+  CLAUDE.md so they can file them with `gh issue create`. The repo is public, so leave out IPs,
+  hostnames of private machines, keys and tokens, and participants' names and emails.
+- The docs say what arena does today. Vast's create works (it has since 2026-10-08), production
+  updates with `arena update` (not `cargo install`), and `pods rename` works on every provider.
+  `config.env.example` now lists the keys it was missing: `ARENA_REPO_OWNER`, `GIT_SSH_KEY_LOCAL`,
+  `LOCAL_BACKUP_DIR`, `DEFAULT_BRANCH`, `PROXY_LOCAL`, `EXTRA_SSH_KEYS`, `BACKUP_MAX_SIZE`,
+  `BACKUP_REMOTE_PATH` and the three `OPENROUTER_*` keys. It no longer lists `BACKUP_BRANCH_PREFIX`,
+  which nothing read.
+
 ## 2026-10-30 · The dashboard's bottom line is plain words
 - The footer no longer uses `☰`, `⟳`, `✓`, `⚠` or a spinner, which some terminals draw as
   pictures. It reads `[i] info · ok · API 6/min · 7s ago · every 5s` (`warn: …` in yellow, `list
