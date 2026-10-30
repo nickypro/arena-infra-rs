@@ -12,7 +12,8 @@ use clap::{Parser, Subcommand};
 use crate::cron::CronCmd;
 use crate::keys::KeysCmd;
 use crate::pods::RUN_TIMEOUT_SECS;
-use crate::{archive, image, jobs, money, offers, parse_max_price, reap, spend, ConfigCmd, MigrateCmd, PlanCmd, ProxyCmd};
+use crate::proxy::ProxyCmd;
+use crate::{archive, image, jobs, money, offers, parse_max_price, reap, spend, ConfigCmd, MigrateCmd, PlanCmd};
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 
