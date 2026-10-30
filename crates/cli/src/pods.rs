@@ -16,6 +16,7 @@ pub(crate) mod health;
 pub(crate) mod home_copy;
 pub(crate) mod list;
 pub(crate) mod lock;
+pub(crate) mod migrate;
 pub(crate) mod placement;
 pub(crate) mod pull;
 pub(crate) mod replace;

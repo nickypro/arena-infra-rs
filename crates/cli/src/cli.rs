@@ -13,10 +13,11 @@ use crate::config_cmd::ConfigCmd;
 use crate::cron::CronCmd;
 use crate::keys::KeysCmd;
 use crate::plan::PlanCmd;
+use crate::pods::migrate::MigrateCmd;
 use crate::pods::placement::parse_max_price;
 use crate::pods::RUN_TIMEOUT_SECS;
 use crate::proxy::ProxyCmd;
-use crate::{archive, image, jobs, money, offers, reap, spend, MigrateCmd};
+use crate::{archive, image, jobs, money, offers, reap, spend};
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 
