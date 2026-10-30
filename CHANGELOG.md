@@ -41,7 +41,7 @@ earlier).
   (floor 5 GB, …): this copy (~3.9 GB, measured) + the floor = 8.9 GB needed — nothing copied;
   free at least 5.8 GB on / (…)`. A replace/migrate staging refused so also names arena's biggest
   dirs on that disk, and another disk arena writes to with room, for the run's `TMPDIR`
-  (`TMPDIR=/mnt/volume-nbg1-1/arena-tmp arena …`); on a disk already under the floor it's refused
+  (`TMPDIR=/mnt/backups/arena-tmp arena …`); on a disk already under the floor it's refused
   before the pod's home is sized (an rsync dry run over all of it).
 - The daily health check says when a copy was stopped (not skipped) for space and, for the
   backup's and the reaper's copies, that each run tries it again until there's room.

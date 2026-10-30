@@ -804,7 +804,7 @@ findings #5–#7, #13, #16, #17, #19, #20, #26–#30):
   measured) + the floor = 8.9 GB needed`), how much to free on which filesystem with arena's biggest
   dirs there (`free at least 5.8 GB on / (arena's biggest dirs there: /tmp/arena-replace-… 3.5 GB ·
   …)`), and another filesystem arena writes to that has room, for the run's `TMPDIR`
-  (`TMPDIR=/mnt/volume-nbg1-1/arena-tmp arena …`); a disk already under the floor is refused
+  (`TMPDIR=/mnt/backups/arena-tmp arena …`); a disk already under the floor is refused
   without sizing anything. A `CONTROL_MIN_FREE_GB` that isn't a whole number refuses `replace`,
   `migrate copy` and a cutover's final sync before anything is created (their dry runs say so);
   found only at the copy, it left the new pod built and billing. The stage (`$TMPDIR/arena-replace-<id>`, mode 0700,

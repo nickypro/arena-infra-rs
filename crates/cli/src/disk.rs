@@ -452,11 +452,11 @@ mod tests {
         let skip = core_disk::judge(&fs, 0, &Size::Measured(3_900_000_000).into(), Floor::control(5 * g)).unwrap_err();
         let named = skip.clone().naming("/tmp/arena-replace-leh3rc2hdcf31i 3.5 GB · /root/.local/state/arena 0.1 GB");
         assert_eq!(
-            staging_words(&named, Some((Path::new("/mnt/volume-nbg1-1/arena-tmp"), 331 * g))),
+            staging_words(&named, Some((Path::new("/mnt/backups/arena-tmp"), 331 * g))),
             "skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB): this copy (~3.9 GB, measured) + the floor = 8.9 GB \
              needed — nothing copied; free at least 5.8 GB on / (arena's biggest dirs there: /tmp/arena-replace-leh3rc2hdcf31i \
              3.5 GB · /root/.local/state/arena 0.1 GB); or stage it on another filesystem for this run: \
-             `TMPDIR=/mnt/volume-nbg1-1/arena-tmp arena …` (331 GB free there)"
+             `TMPDIR=/mnt/backups/arena-tmp arena …` (331 GB free there)"
         );
         // A path a shell would split or expand comes quoted.
         assert!(
