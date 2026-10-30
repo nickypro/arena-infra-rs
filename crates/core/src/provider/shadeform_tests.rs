@@ -482,7 +482,7 @@ async fn placement_stops_on_an_unsure_create() {
     let srv = serve(replies);
     let p = provider(&srv.base, client());
     let base = spec("NVIDIA RTX A6000", 1);
-    let req = Request { gpus: vec!["NVIDIA RTX A6000".into(), "NVIDIA L40S".into()], clouds: vec!["COMMUNITY".into()], gpu_count: 1, max_price: None, order: Order::Listed, near: None };
+    let req = Request { gpus: vec!["NVIDIA RTX A6000".into(), "NVIDIA L40S".into()], clouds: vec!["COMMUNITY".into()], gpu_count: 1, max_price: None, order: Order::Listed, near: None, server_types: Vec::new() };
     let plan = plan_options(&req, "shadeform", &PriceBook::unpriced());
     let rounds = Rounds { window: Duration::ZERO, every: Duration::from_secs(1) };
     let placed = place(&p, &base, &["devtest-alpha".to_string()], &plan, rounds, None, std::future::pending::<()>, &mut |_| {}).await;
@@ -630,7 +630,7 @@ async fn quotes_price_the_options_from_one_catalog_read() {
     assert!(notes[0].contains("cheapest in-stock VM right now on massedcompute") && notes[0].contains("bills until terminated"), "{notes:?}");
     assert!(notes.iter().any(|n| n.contains("no in-stock 1×L40S on massedcompute right now — unpriced (no stock)")), "{notes:?}");
     assert!(notes.iter().any(|n| n.contains("massedcompute/kansascity-usa-1/A6000 at $0.57")), "{notes:?}");
-    let req = Request { gpus: gpus[..2].to_vec(), clouds: vec!["COMMUNITY".into()], gpu_count: 1, max_price: Some(0.9), order: Order::Cheapest, near: None };
+    let req = Request { gpus: gpus[..2].to_vec(), clouds: vec!["COMMUNITY".into()], gpu_count: 1, max_price: Some(0.9), order: Order::Cheapest, near: None, server_types: Vec::new() };
     let plan = plan_options(&req, "shadeform", &book);
     assert_eq!(plan.options.len(), 1);
     assert_eq!((plan.options[0].label.as_str(), plan.options[0].price_per_pod, plan.options[0].cloud.as_deref()), ("1×RTX A6000", Some(0.57), None));

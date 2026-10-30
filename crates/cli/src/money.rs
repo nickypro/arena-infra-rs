@@ -1285,6 +1285,7 @@ mod tests {
             stock: None,
             near: None,
             cap: None,
+            server_type: None,
         }
     }
 

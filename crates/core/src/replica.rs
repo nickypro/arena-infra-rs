@@ -131,6 +131,37 @@ pub fn identity_condition(environ: &str, pod_id: &str) -> String {
     )
 }
 
+/// Where a Hetzner VM's own server id is readable: cloud-init's instance id (Hetzner's
+/// datasource makes it the server id; rewritten on every boot of a new instance, so a VM made
+/// from a snapshot of another reads its own), else the metadata service's.
+pub const HETZNER_ID_PROBE: &str =
+    "cat /var/lib/cloud/data/instance-id 2>/dev/null || curl -s -m 2 http://169.254.169.254/hetzner/v1/metadata/instance-id 2>/dev/null";
+
+/// The command that prints, on one of `provider`'s machines, that machine's own id as the
+/// provider's API names it — what every "is this endpoint still that pod?" check compares
+/// with: RunPod's `RUNPOD_POD_ID` (PID 1's environment), a Hetzner VM's server id
+/// ([`HETZNER_ID_PROBE`]). `None` where the machine shows none (Vast, Shadeform): those checks
+/// then can't tell, and say so or fall back as each caller documents.
+pub fn id_probe(provider: &str) -> Option<String> {
+    match provider {
+        "runpod" => Some(format!("tr '\\0' '\\n' < {} 2>/dev/null | sed -n 's/^RUNPOD_POD_ID=//p'", sq(POD_ID_ENVIRON))),
+        "hetzner" => Some(HETZNER_ID_PROBE.to_string()),
+        _ => None,
+    }
+}
+
+/// A shell condition that holds only on pod `id` of `provider` ([`id_probe`]) — what the
+/// replica steps, `~/.name` writes and the reaper's backup run behind ([`guarded`],
+/// [`guarded_rsync_path`]). An unreadable or empty id fails it. `None` for a provider whose
+/// machines show no id.
+pub fn pod_identity(provider: &str, id: &str) -> Option<String> {
+    match provider {
+        "runpod" => Some(identity_condition(POD_ID_ENVIRON, id)),
+        "hetzner" => Some(format!("[ \"$({HETZNER_ID_PROBE})\" = {} ]", sq(id))),
+        _ => None,
+    }
+}
+
 /// `script` preceded by `cond` (when there is one): on any other pod it says so on stderr
 /// and exits [`WRONG_POD_EXIT`] having done nothing. Checked in the same session as the
 /// work, so a reassigned endpoint can't slip in between a check and the step.
