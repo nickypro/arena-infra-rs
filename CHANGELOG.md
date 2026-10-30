@@ -37,8 +37,8 @@ earlier).
   stops.
 - The dashboard's action menu greys out what the pod's provider can't do, with the reason: stop
   and start on a Shadeform pod. Picking one says the whole sentence. Its add-pod form sends only
-  what the provider's create takes: Vast no longer gets `--volume`, Shadeform no longer gets
-  `--disk` or `--volume`.
+  what the provider's create takes: Vast, Shadeform and Hetzner get `--volume 0` (no volume)
+  instead of the form's size, and Shadeform no longer gets `--disk`.
 - Creating on Vast without a volume now warns that a restart or a stop may wipe the container
   disk. It used to say "set VOLUME_GB", which Vast doesn't take.
 

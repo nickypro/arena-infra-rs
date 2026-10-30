@@ -308,9 +308,15 @@ const fn no(why: &'static str, instead: &'static str) -> Support {
 /// What to say instead when there's nothing to use instead.
 pub const NOTHING_INSTEAD: &str = "nothing to use instead";
 
-/// The way off a backend for an operation it lacks: a new pod by the same name.
-const REMAKE: &str = "back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then `arena pods up <name>` \
-     and `arena pods restore <name>`";
+/// The way off a backend for an operation it lacks: a new pod by the same name, on the same
+/// provider — `up` creates on `--provider`'s (else the configured one), so the command names it
+/// (review: a bare `pods up` would have made a Hetzner VM's replacement a RunPod pod).
+const REMAKE_VAST: &str = "back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then \
+     `arena --provider vast pods up <name>` (its --gpu) and `arena pods restore <name>`";
+const REMAKE_HETZNER: &str = "back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then \
+     `arena --provider hetzner pods up <name>` (its --server-type) and `arena pods restore <name>`";
+const REMAKE_SHADEFORM: &str = "back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then \
+     `arena --provider shadeform pods up <name>` (its --gpu) and `arena pods restore <name>`";
 
 const SHADEFORM_NO_STOP: &str = "Shadeform has no stop: an instance bills until it's deleted, idle or not";
 
@@ -351,9 +357,9 @@ const fn row(op: Op) -> [Support; 5] {
         Op::Reimage => [
             YES, // RunPod
             YES, // RunPod v1
-            no("Vast can't swap an instance's image in place", REMAKE), // Vast
-            no("arena can't reimage a Hetzner VM yet (Hetzner's rebuild action could)", REMAKE), // Hetzner
-            no("Shadeform can't swap an instance's image in place", REMAKE), // Shadeform
+            no("Vast can't swap an instance's image in place", REMAKE_VAST), // Vast
+            no("arena can't reimage a Hetzner VM yet (Hetzner's rebuild action could)", REMAKE_HETZNER), // Hetzner
+            no("Shadeform can't swap an instance's image in place", REMAKE_SHADEFORM), // Shadeform
         ],
         Op::Lock => [
             YES, // RunPod
@@ -365,15 +371,15 @@ const fn row(op: Op) -> [Support; 5] {
         Op::Replace => [
             YES, // RunPod
             YES, // RunPod v1
-            no("arena can't read a Vast instance's spec back yet", REMAKE), // Vast
-            no("arena can't read a Hetzner VM's spec back yet", REMAKE), // Hetzner
+            no("arena can't read a Vast instance's spec back yet", REMAKE_VAST), // Vast
+            no("arena can't read a Hetzner VM's spec back yet", REMAKE_HETZNER), // Hetzner
             note("not live-tested"), // Shadeform
         ],
         Op::Migrate => [
             YES, // RunPod
             YES, // RunPod v1
-            no("arena can't read a Vast instance's spec back yet", REMAKE), // Vast
-            no("arena can't read a Hetzner VM's spec back yet", REMAKE), // Hetzner
+            no("arena can't read a Vast instance's spec back yet", REMAKE_VAST), // Vast
+            no("arena can't read a Hetzner VM's spec back yet", REMAKE_HETZNER), // Hetzner
             no(
                 "the cutover's proxy check reads RunPod's pod id, so it can't pass on Shadeform (it reverts itself)",
                 "`arena pods replace <name>`",
@@ -383,7 +389,7 @@ const fn row(op: Op) -> [Support; 5] {
             no("RunPod authorizes keys only at create", "`arena pods replace <name>` (a new pod gets today's keys)"), // RunPod
             no("RunPod authorizes keys only at create", "`arena pods replace <name>` (a new pod gets today's keys)"), // RunPod v1
             YES, // Vast: the per-instance key attach, as at create
-            no("Hetzner authorizes keys only at create (cloud-init)", REMAKE), // Hetzner
+            no("Hetzner authorizes keys only at create (cloud-init)", REMAKE_HETZNER), // Hetzner
             no("Shadeform authorizes keys only at create (its bootstrap script)", "`arena pods replace <name>` (a new pod gets today's keys)"), // Shadeform
         ],
         Op::Reap => [
@@ -667,12 +673,20 @@ mod tests {
         Some(spec)
     }
 
+    /// The cells whose flag acts before the create request — it picks the offer (or catalog entry)
+    /// the request then rents — so the dry run's description is where it shows, each with where.
+    const PICKS_THE_OFFER: &[(Backend, Op, &str)] = &[
+        (Backend::Vast, Op::Gpu, "vast::VastProvider::search: gpu_name and num_gpus filter the offers"),
+        (Backend::Vast, Op::Cloud, "vast::tier: the host class filters the offers"),
+        (Backend::Shadeform, Op::Gpu, "shadeform::fitting_entries: the GPU type and count pick the catalog entry"),
+    ];
+
     /// The flags' drift test: a flag a backend is said to ignore leaves its create request as it
-    /// was (or is refused by the backend itself); one it is said to honour changes the request
-    /// or what the dry run says it would create (`describe`: Vast's GPU and tier pick the offer,
-    /// they aren't in the rent request). `--max-price` (placement's: prices are checked before any
-    /// create) and `--api-json` (`provider::tests::every_backend_takes_api_extra…`) are checked
-    /// where they act.
+    /// was (or is refused by the backend itself); one it is said to honour changes the request —
+    /// or, where it picks the offer before the request ([`PICKS_THE_OFFER`]), what the dry run
+    /// says it would create. `--max-price` (placement's: prices are checked before any create)
+    /// and `--api-json` (`provider::tests::every_backend_takes_api_extra…`) are checked where
+    /// they act.
     #[test]
     fn every_flag_cell_matches_the_create_request() {
         let mut bad = Vec::new();
@@ -692,7 +706,8 @@ mod tests {
             for op in Op::ALL.into_iter().filter(|o| o.is_flag()) {
                 let Some(spec) = with_flag(b, op, base_spec()) else { continue };
                 let (body2, said2) = (preview(&spec).map(quiet), p.describe(&spec));
-                let honoured = matches!(&body2, Ok(v) if *v != body) || said2 != said;
+                let picks = PICKS_THE_OFFER.iter().any(|(pb, po, _)| *pb == b && *po == op);
+                let honoured = matches!(&body2, Ok(v) if *v != body) || (picks && said2 != said);
                 let ignored = matches!(&body2, Ok(v) if *v == body);
                 let refused = matches!(&body2, Err(Error::Config(_)));
                 match support(b, op).works() {
@@ -768,8 +783,19 @@ mod tests {
                         assert!(support(b, *needs).works(), "{b:?} {op:?}: instead names {cmd}`, which {b:?} can't do: {instead}");
                     }
                 }
-                // A flag in the alternative is for a create on this backend (not `--provider X`'s).
-                if !instead.contains("--provider") {
+                // A new pod in the alternative goes on this backend's provider: `up` creates on
+                // `--provider`'s, else the configured one (review: a Hetzner VM's "remake" would
+                // have come back a RunPod pod).
+                if instead.contains("pods up") {
+                    assert!(
+                        instead.contains(&format!("`arena --provider {} pods up", b.provider())),
+                        "{b:?} {op:?}: instead creates without --provider {}: {instead}",
+                        b.provider()
+                    );
+                }
+                // A flag in the alternative is for a create on this backend (not another
+                // provider's: `--provider hetzner` named as the way to size by server type).
+                if !instead.contains("pass --provider") {
                     for (flag, needs) in flags {
                         if instead.contains(flag) {
                             assert!(support(b, needs).works(), "{b:?} {op:?}: instead names {flag}, which {b:?} ignores: {instead}");

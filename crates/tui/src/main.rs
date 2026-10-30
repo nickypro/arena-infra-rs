@@ -7354,7 +7354,7 @@ deep_check_end=1
             let r = s.runs.iter().find(|r| r.id == id).unwrap();
             assert_eq!(
                 r.lines.front().map(String::as_str),
-                Some("args: --config /test/config.env --provider hetzner pods up --add 1 --server-type cx33 --yes")
+                Some("args: --config /test/config.env --provider hetzner pods up --add 1 --server-type cx33 --volume 0 --yes")
             );
             assert_eq!(r.end.as_ref().map(|(_, e)| e.clone()), Some(runs::End::Code(1)));
             assert_eq!(r.tally(), "1 ready, 1 failed");
@@ -7624,7 +7624,7 @@ deep_check_end=1
         {
             let s = shared.lock().unwrap();
             let r = s.runs.iter().find(|r| r.id == id).unwrap();
-            assert_eq!(r.lines.front().map(String::as_str), Some("args: --config /test/config.env --provider hetzner pods up --add 1 --server-type cx33 --retry-mins 30 --yes"));
+            assert_eq!(r.lines.front().map(String::as_str), Some("args: --config /test/config.env --provider hetzner pods up --add 1 --server-type cx33 --volume 0 --retry-mins 30 --yes"));
             assert!(r.retry_until.is_some_and(|u| u > snapshot::unix_now() + 29 * 60), "{:?}", r.retry_until);
             assert!(r.title.ends_with(", retrying up to 30 min"), "{}", r.title);
         }
