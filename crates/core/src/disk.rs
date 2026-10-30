@@ -7,11 +7,12 @@
 //!
 //! So every copy onto it goes through one judge ([`judge`], and [`Ledger`] for a run's many):
 //! it starts only when what the filesystem has free, less what this run's earlier copies there
-//! may take and what this one may take, stays at or above the floor (`CONTROL_MIN_FREE_GB`,
-//! default 5 GB). A copy's size is what arena measured where it measures one (replace/migrate's
-//! staging: an rsync dry run); otherwise a pod's first copy counts as [`FIRST_COPY`] and a later
-//! one, which writes only what changed, as [`LATER_COPY`]. A skip happens before anything is
-//! written, and is a failure of its run.
+//! may take, what other arena runs' copies under way hold ([`Reservations`]) and what this one may
+//! take, stays at or above the floor (`CONTROL_MIN_FREE_GB`, default 5 GB). A copy's size is what
+//! arena measured where it measures one (replace/migrate's staging: an rsync dry run); otherwise a
+//! pod's first copy counts as [`FIRST_COPY`] and a later one, which writes only what changed, as
+//! [`LATER_COPY`] — later only once that pod was copied whole there ([`was_copied`]). A skip
+//! happens before anything is written, and is a failure of its run.
 //!
 //! Also here: what arena leaves behind on the box ([`find_leftovers`]: a replace/migrate staging
 //! copy kept after a copy that failed or was stopped, an interrupted baseline capture, rsync temp
@@ -170,7 +171,8 @@ impl Skip {
 }
 
 /// The judge (pure): a copy needing `need` may start on `fs` when what's free, less `already`
-/// (what this run's earlier copies there may take) and `need`, stays at or above `floor`.
+/// (what this run's earlier copies and other runs' copies under way there may take) and `need`,
+/// stays at or above `floor`.
 /// `Err` says how far off it is, for the copy's line.
 pub fn judge(fs: &Fs, already: u64, need: &Need, floor: Floor) -> Result<(), Skip> {
     if fs.free >= floor.bytes.saturating_add(already).saturating_add(need.bytes) {
@@ -180,7 +182,7 @@ pub fn judge(fs: &Fs, already: u64, need: &Need, floor: Floor) -> Result<(), Ski
     let reason = if fs.free < floor.bytes {
         format!("only {} free on {mount} (floor {}, {})", gb(fs.free), gb(floor.bytes), floor.key)
     } else {
-        let others = if already > 0 { format!(" after ~{} for this run's other copies", gb(already)) } else { String::new() };
+        let others = if already > 0 { format!(" after ~{} for other copies under way", gb(already)) } else { String::new() };
         format!(
             "{} free on {mount}, and this copy ({}){others} would leave less than the floor ({}, {})",
             gb(fs.free),
@@ -193,18 +195,31 @@ pub fn judge(fs: &Fs, already: u64, need: &Need, floor: Floor) -> Result<(), Ski
 }
 
 /// One run's copies onto this box, judged together: each filesystem read once, and what every
-/// copy admitted may take held against it, so ten first copies can't each see the same free
-/// space (pure but for the readings handed in).
+/// copy admitted may take held against it — with what other runs' copies under way hold
+/// ([`Reservations`]) — so ten first copies can't each see the same free space (pure but for the
+/// readings handed in).
 #[derive(Debug, Clone)]
 pub struct Ledger {
     floor: Floor,
-    /// Per device: its reading (the first one) and what the copies admitted there may take.
+    /// What other runs' copies under way may still take, per device.
+    others: BTreeMap<u64, u64>,
+    /// Per device: its reading (the first one) and what this run's admitted copies may take.
     held: BTreeMap<u64, (Fs, u64)>,
 }
 
 impl Ledger {
     pub fn new(floor: Floor) -> Ledger {
-        Ledger { floor, held: BTreeMap::new() }
+        Ledger::with_others(floor, BTreeMap::new())
+    }
+
+    /// A ledger that counts what other runs hold per device ([`Reservations::by_dev`]) as taken.
+    pub fn with_others(floor: Floor, others: BTreeMap<u64, u64>) -> Ledger {
+        Ledger { floor, others, held: BTreeMap::new() }
+    }
+
+    /// What this run's admitted copies may take, per device (what it reserves).
+    pub fn taken(&self) -> BTreeMap<u64, u64> {
+        self.held.iter().map(|(dev, (_, b))| (*dev, *b)).filter(|(_, b)| *b > 0).collect()
     }
 
     /// Admit one copy — its parts (`(reading of where it writes, size)`: a pod's tiers) all, or
@@ -217,10 +232,11 @@ impl Ledger {
         }
         let mut take = Vec::new();
         for (dev, (fs, sizes)) in by_dev {
-            let (fs, already) = self.held.get(&dev).cloned().unwrap_or((fs, 0));
+            let (fs, mine) = self.held.get(&dev).cloned().unwrap_or((fs, 0));
+            let others = self.others.get(&dev).copied().unwrap_or(0);
             let need = Need::of(&sizes);
-            judge(&fs, already, &need, self.floor)?;
-            take.push((dev, fs, already.saturating_add(need.bytes)));
+            judge(&fs, mine.saturating_add(others), &need, self.floor)?;
+            take.push((dev, fs, mine.saturating_add(need.bytes)));
         }
         for (dev, fs, held) in take {
             self.held.insert(dev, (fs, held));
@@ -461,8 +477,9 @@ pub fn biggest(_dirs: &[PathBuf], _dev: u64, _limit: usize) -> Vec<(PathBuf, Tre
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LeftoverKind {
     /// replace/migrate's via-local staging of pod `source` (its id): its home, kept after a copy
-    /// that failed (so a re-run continues from it) or was stopped — or by a build from before
-    /// 2026-10-09, which never removed it.
+    /// that failed (so a re-run continues from it) or was stopped, or when a later attempt copied
+    /// directly — or by a master build from before 2026-10-19 (#3: the one prod ran on 10-14),
+    /// which never removed it.
     Staging { source: String },
     /// An interrupted `pods baseline` capture (its partial dir, by process `pid`).
     Baseline { pid: u32 },
@@ -544,7 +561,14 @@ pub fn find_leftovers(tmp: &Path, backup_roots: &[PathBuf], now: u64) -> Found {
         }
         let temps = std::iter::once(root.join(crate::pull::TEMP_DIR)).chain(subdirs(root).into_iter().map(|d| d.join(crate::pull::TEMP_DIR)));
         for path in temps {
-            let holds = std::fs::read_dir(&path).is_ok_and(|mut es| es.next().is_some());
+            let holds = match std::fs::read_dir(&path) {
+                Ok(mut es) => es.next().is_some(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => {
+                    unread.borrow_mut().push(format!("{}: {e}", path.display()));
+                    false
+                }
+            };
             if !holds {
                 continue;
             }
@@ -587,7 +611,8 @@ impl Leftover {
         match &self.kind {
             LeftoverKind::Staging { source } => format!(
                 "pod {source}'s home, staged by `pods replace`/`migrate` and kept after a copy that failed or was \
-                 stopped (or by a build from before 2026-10-09, which never removed it)"
+                 stopped, or by a later attempt that copied directly (or by a release from before 2026-10-19, which \
+                 never removed it)"
             ),
             LeftoverKind::Baseline { pid } => format!("an interrupted `pods baseline` capture (process {pid})"),
             LeftoverKind::RsyncTemp => "rsync temp files a pull stopped hard left behind".into(),
@@ -624,6 +649,176 @@ impl Leftover {
         out.push(format!("  └ look: {look}"));
         out.push(format!("  └ remove: {remove}"));
         out
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Which pods have a whole copy here (what makes a copy a "later" one)
+// ---------------------------------------------------------------------------------------
+
+/// The hidden dir at a backup's snapshot root that marks the pods copied whole into it (every
+/// tier and pass of one run went through): `<root>/.arena-copied/<pod>`. Beside the labels, like
+/// `.arena-locks`: never a label, never inside a pod's tree (so never archived or restored).
+pub const COPIED_DIR: &str = ".arena-copied";
+
+/// Pod `pod`'s marker under the snapshot root `base`.
+pub fn copied_marker(base: &Path, pod: &str) -> PathBuf {
+    base.join(COPIED_DIR).join(pod)
+}
+
+/// Mark `pod` as copied whole into `base` (its marker's mtime: when, last).
+pub fn mark_copied(base: &Path, pod: &str) -> std::io::Result<()> {
+    let marker = copied_marker(base, pod);
+    if let Some(dir) = marker.parent() {
+        crate::snapshot::create_private_dir(dir)?;
+    }
+    std::fs::write(&marker, b"")
+}
+
+/// Whether `pod` was ever copied whole into `base`: only then is a copy onto what's there a later
+/// one (an interrupted first copy leaves files, but most of the pod still to come).
+pub fn was_copied(base: &Path, pod: &str) -> bool {
+    copied_marker(base, pod).is_file()
+}
+
+/// Start marking whole copies in the backup at `base`, once, before a run's copies: a backup from
+/// before arena marked them (no [`COPIED_DIR`] yet) gets every pod with a snapshot there marked —
+/// as arena took them until then (files there: a later copy). Without that, the upgrade would turn
+/// every pod's next copy into a first one (~4 GB a pod over both tiers), and a box with room for
+/// the fleet's changes but not for that would skip them all. Made aside and renamed into place,
+/// so a run stopped halfway marks none; a backup with no pods yet gets an empty one (from then on,
+/// only whole copies mark). `Ok(n)`: how many pods it marked (0: marking had started already, or
+/// there's no backup at `base`).
+pub fn seed_copied(base: &Path) -> std::io::Result<usize> {
+    let dir = base.join(COPIED_DIR);
+    if dir.exists() || !base.is_dir() {
+        return Ok(0);
+    }
+    let mut pods = std::collections::BTreeSet::new();
+    for label in std::fs::read_dir(base)?.flatten() {
+        if label.file_name().to_str().and_then(crate::restore::parse_label).is_none() {
+            continue;
+        }
+        for pod in std::fs::read_dir(label.path()).into_iter().flatten().flatten() {
+            let name = pod.file_name().to_string_lossy().into_owned();
+            if !name.starts_with('.') && pod.file_type().is_ok_and(|t| t.is_dir()) {
+                pods.insert(name);
+            }
+        }
+    }
+    let aside = base.join(format!("{COPIED_DIR}.new-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&aside);
+    crate::snapshot::create_private_dir(&aside)?;
+    let made = pods.iter().try_for_each(|p| std::fs::write(aside.join(p), b"")).and_then(|()| std::fs::rename(&aside, &dir));
+    match made {
+        Ok(()) => Ok(pods.len()),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&aside);
+            // Another run started marking meanwhile: theirs stands.
+            if dir.exists() {
+                Ok(0)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// What other runs' copies may still take (one box, several arena runs at once)
+// ---------------------------------------------------------------------------------------
+
+/// The reservations file in the fleet's state dir: what each arena run's admitted copies onto this
+/// box may still write, per device, until they end — so a cron backup and an operator's pull at
+/// the same time can't each count the same free space.
+pub const RESERVATIONS_FILE: &str = "disk-reservations.json";
+const RESERVATIONS_VERSION: u32 = 1;
+/// A reservation this old is a run's that's long over (a pod's copy may take a day at most).
+pub const RESERVATION_MAX_AGE_SECS: u64 = 26 * 3600;
+
+/// One run's copies on one device: who holds it (`pid`, and `token` for that admission), how
+/// much, since when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reservation {
+    pub pid: u32,
+    pub token: u64,
+    pub dev: u64,
+    pub bytes: u64,
+    pub at: u64,
+}
+
+/// The reservations ([`RESERVATIONS_FILE`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reservations {
+    pub version: u32,
+    pub held: Vec<Reservation>,
+}
+
+impl Default for Reservations {
+    fn default() -> Self {
+        Reservations { version: RESERVATIONS_VERSION, held: Vec::new() }
+    }
+}
+
+impl Reservations {
+    /// Load tolerantly: missing = none; unreadable or another version = none plus a warning (the
+    /// file is then rewritten with this run's alone).
+    pub fn load(path: &Path) -> (Reservations, Option<String>) {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match serde_json::from_str::<Reservations>(&text) {
+                Ok(r) if r.version == RESERVATIONS_VERSION => (r, None),
+                Ok(r) => (Reservations::default(), Some(format!("warning: ignoring {} (version {})", path.display(), r.version))),
+                Err(e) => (Reservations::default(), Some(format!("warning: ignoring {} ({e})", path.display()))),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Reservations::default(), None),
+            Err(e) => (Reservations::default(), Some(format!("warning: can't read {} ({e})", path.display()))),
+        }
+    }
+
+    /// Drop what no run holds any more: its process gone (`alive`), or older than
+    /// [`RESERVATION_MAX_AGE_SECS`] at `now` (pure but for `alive`).
+    pub fn prune(&mut self, now: u64, alive: impl Fn(u32) -> bool) {
+        self.held.retain(|r| now.saturating_sub(r.at) < RESERVATION_MAX_AGE_SECS && alive(r.pid));
+    }
+
+    /// What they hold, per device (pure).
+    pub fn by_dev(&self) -> BTreeMap<u64, u64> {
+        let mut out = BTreeMap::new();
+        for r in &self.held {
+            let b: &mut u64 = out.entry(r.dev).or_default();
+            *b = b.saturating_add(r.bytes);
+        }
+        out
+    }
+
+    /// Hold `taken` (per device) for admission `(pid, token)` from `now` (pure).
+    pub fn hold(&mut self, pid: u32, token: u64, taken: &BTreeMap<u64, u64>, now: u64) {
+        self.held.extend(taken.iter().map(|(dev, bytes)| Reservation { pid, token, dev: *dev, bytes: *bytes, at: now }));
+    }
+
+    /// Let admission `(pid, token)`'s go (pure).
+    pub fn release(&mut self, pid: u32, token: u64) {
+        self.held.retain(|r| (r.pid, r.token) != (pid, token));
+    }
+
+    /// Save atomically, owner-only.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let mut json = serde_json::to_string_pretty(self).unwrap_or_default();
+        json.push('\n');
+        crate::snapshot::write_atomic(path, json.as_bytes(), 0o600)
+    }
+}
+
+/// Whether process `pid` is an arena run still (its command line names arena): a reservation's
+/// holder that isn't — gone, or the pid reused — holds nothing. Where `/proc` can't say (none
+/// here, or not readable): yes, and the reservation goes with its age.
+pub fn arena_alive(pid: u32) -> bool {
+    if !Path::new("/proc/self").exists() {
+        return true;
+    }
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(cmd) => cmd.windows(5).any(|w| w == b"arena"),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
     }
 }
 
@@ -730,13 +925,20 @@ impl SkipEntry {
     }
 }
 
+/// Create the state dir holding `file` (owner-only) and take its lock
+/// ([`crate::snapshot::lock_dir_within`], tried for up to `wait`): what the skip record and the
+/// reservations are rewritten under.
+pub fn lock_state_for(file: &Path, wait: Duration) -> std::io::Result<Option<std::fs::File>> {
+    let dir = file.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    crate::snapshot::create_private_dir(dir)?;
+    crate::snapshot::lock_dir_within(dir, wait)
+}
+
 /// Add `new` skips (`(pod, what, why)`) to the record at `path`, under the state dir's lock
 /// (tried for up to `wait`), saved atomically (owner-only). `Ok` carries the load warning, if
 /// the old file had to be ignored.
 pub fn record_skips(path: &Path, new: &[(String, String, String)], now: u64, wait: Duration) -> std::io::Result<Option<String>> {
-    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    crate::snapshot::create_private_dir(dir)?;
-    let lock = crate::snapshot::lock_dir_within(dir, wait)?;
+    let lock = lock_state_for(path, wait)?;
     let (mut skips, warning) = Skips::load(path);
     skips.add(new, now);
     let mut json = serde_json::to_string_pretty(&skips).unwrap_or_default();

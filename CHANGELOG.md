@@ -23,12 +23,17 @@ earlier).
 - Every copy arena makes onto the box it runs on — `pods pull`, `pods backup`'s pull and its copies
   of pods git didn't back up (a failed push, a wrong origin, a BUSY pod), `set-branch --hard`'s
   copies, `pods baseline`, replace/migrate's local staging and the reaper's — now checks that disk
-  first: it goes ahead only if `CONTROL_MIN_FREE_GB` (default 5 GB) stays free after it and the
-  run's other copies. A pod's first copy counts as 2 GB per tier, a later one as 0.1 GB, the
-  staging as measured. A pod that doesn't fit is skipped whole, before anything of it is written,
-  with one line (`✗ arena9-bloom: skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB)
-  — nothing copied; …`), and the run fails. The git backup itself isn't affected. (Prod's box was at
-  96 %, 3.1 GB free of 75 GB, with the */15 cron copying pods onto it unchecked.)
+  first: it goes ahead only if `CONTROL_MIN_FREE_GB` (default 5 GB) stays free after it, the run's
+  other copies and other arena runs' copies under way (a cron backup and an operator's pull at
+  once: each run notes what its copies may take in the state dir's `disk-reservations.json` until
+  they end). A pod's first copy counts as 2 GB per tier, a later one as 0.1 GB — later only once
+  the pod's whole home was copied into that backup (`<LOCAL_BACKUP_DIR>/.arena-copied/<pod>`; the
+  pods already backed up there are marked once, at the first such run), so an interrupted first
+  copy's retry is still a first one —, the staging as measured. A pod that
+  doesn't fit is skipped whole, before anything of it is written, with one line (`✗ arena9-bloom:
+  skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB) — nothing copied; …`), and the
+  run fails. The git backup itself isn't affected. (Prod's box was at 96 %, 3.1 GB free of 75 GB,
+  with the */15 cron copying pods onto it unchecked.)
 - The daily health check (`cron install --health`) now ends with this box: how full its disk is,
   what arena left on it, and every pod whose copy was skipped for space in the last day, which
   fails the check.
@@ -38,9 +43,12 @@ earlier).
   files — with size, age and the commands to look at and remove each. `teardown --check` lists them
   too (◷ kept, never against its verdict). None of these removes anything: a staging copy can be the
   only copy of a pod's work.
-- replace/migrate's staging copy is now also removed when a later attempt copies directly (it stayed
-  forever), and is locked while a run copies through it: a second replace/migrate of the same pod is
-  refused instead of writing into it.
+- replace/migrate's staging copy is now locked while a run copies through it: a second
+  replace/migrate of the same pod is refused instead of writing into it, and `migrate finish` / a
+  finished `replace` never remove one a run is using. One an earlier attempt left stays when a later
+  attempt copies directly (it may hold what the source has lost since): listed, as above.
+- `pods setup` / `up` on Hetzner or Shadeform no longer leave their setup script
+  (`/tmp/arena-hetzner-setup-<pid>.sh`) behind.
 - The reaper keeps its own `REAP_MIN_FREE_GB` (default 20) free, never less than
   `CONTROL_MIN_FREE_GB`.
 
@@ -49,12 +57,16 @@ earlier).
   there's room — on prod today (3.1 GB free), every one. Make room first, or lower the floor for a
   while (`arena config set CONTROL_MIN_FREE_GB 2`, or `CONTROL_MIN_FREE_GB=2` for one command).
 - Suggestions for prod's control box (yours to decide; check before deleting anything):
-  - `/tmp/arena-replace-leh3rc2hdcf31i` (3.5 GB, 2026-10-14): replace/migrate's staging copy of pod
-    `leh3rc2hdcf31i`'s home. Most likely left by the build prod ran then (from the prod checkout,
-    based on 2026-10-07), which never removed its staging, even after a copy that worked. Check that
-    the pod's work is on the pod that replaced it or in `LOCAL_BACKUP_DIR` (`arena pods list
-    --no-probe | grep leh3rc2hdcf31i`, `ls -la /tmp/arena-replace-leh3rc2hdcf31i`), then
-    `rm -rf /tmp/arena-replace-leh3rc2hdcf31i`.
+  - `/tmp/arena-replace-leh3rc2hdcf31i` (3.5 GB, written 2026-10-14 09:42 UTC): replace/migrate's
+    staging copy of pod `leh3rc2hdcf31i`'s home (`ARENA_3.0`, the chapter dirs, its dotfiles, the
+    copy's `.arena_replace_marker`). Left by the build prod ran then — master from 2026-10-07
+    (`bae0112`), which never removed its staging, even after a copy that worked; removal reached
+    master with #3 on 2026-10-19. Check that the pod's work is on the pod that replaced it or in
+    `LOCAL_BACKUP_DIR` (`arena pods list --no-probe | grep -F leh3rc2hdcf31i`, `ls -la
+    /tmp/arena-replace-leh3rc2hdcf31i`), then `rm -rf /tmp/arena-replace-leh3rc2hdcf31i`.
+  - The rest of `/tmp/arena-*` is small (a few MB): `arena-hetzner-setup-<pid>.sh` setup scripts
+    (fixed above) and dev-owned test dirs from when the tests ran on that box (before 2026-10-21) —
+    safe to remove.
   - journald (3.6 GB): `journalctl --vacuum-size=500M`, and `SystemMaxUse=500M` in
     `/etc/systemd/journald.conf` to keep it there.
   - `/root/archive/old-pod-backups` (14 GB): move it to the attached volume.

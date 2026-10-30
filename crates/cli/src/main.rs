@@ -3169,6 +3169,7 @@ async fn place_names(
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let result = run().await;
+    unstage_hetzner_script(&std::env::temp_dir());
     if let Err(e) = &result {
         match e.downcast_ref::<reap::ReapExit>() {
             // Already said in the reaper's own words.
@@ -3633,9 +3634,25 @@ fn stage_hetzner_script(needed: bool) -> Result<String> {
     if !needed {
         return Ok(String::new());
     }
-    let p = std::env::temp_dir().join(format!("arena-hetzner-setup-{}.sh", std::process::id()));
+    let p = hetzner_script_path();
     std::fs::write(&p, HETZNER_SETUP).context("writing hetzner setup script to a temp file")?;
     Ok(p.to_string_lossy().into_owned())
+}
+
+/// Where [`stage_hetzner_script`] puts this run's copy of the script.
+fn hetzner_script_path() -> PathBuf {
+    hetzner_script_in(&std::env::temp_dir())
+}
+
+/// This run's copy of the script under `dir`.
+fn hetzner_script_in(dir: &std::path::Path) -> PathBuf {
+    dir.join(format!("arena-hetzner-setup-{}.sh", std::process::id()))
+}
+
+/// Remove this run's copy of the script under `dir`, if it staged one — `main` does, for the temp
+/// dir, once the command is done: nothing did before, and prod's /tmp held 63 of them (2026-10-30).
+fn unstage_hetzner_script(dir: &std::path::Path) {
+    let _ = std::fs::remove_file(hetzner_script_in(dir));
 }
 
 /// The dry-run's two lines for one provisioning step: `## <label> (timeout Ns…)`, then
@@ -13427,9 +13444,8 @@ fn staging_dir(root: &std::path::Path, src_id: &str) -> PathBuf {
 }
 
 /// Remove a leftover via-local staging copy of `src_id` (the participant's whole home), once
-/// it can't be needed again: the source pod is gone, or a copy of it landed and was verified.
-/// Under the stage's lock, held through the removal: one another run is copying through is left
-/// alone, said. Says so when there was one.
+/// it can't be needed again: the source pod is gone. Under the stage's lock, held through the
+/// removal: one another run is copying through is left alone, said. Says so when there was one.
 fn remove_staging_for(root: &std::path::Path, src_id: &str) {
     let stage = staging_dir(root, src_id);
     let _held = match arena_core::disk::lock_dir(&stage) {
@@ -13808,18 +13824,22 @@ async fn copy_pod_files(
                 needed += arena_core::replica::transfer_bytes(&out.stdout)
                     .ok_or_else(|| anyhow::anyhow!("sizing the local staging: rsync --dry-run reported no size"))?;
             }
-            if let Some(floor) = floor {
-                let room = arena_core::disk::reading(&opts.stage_root)
-                    .map_err(|e| arena_core::disk::Skip::unknown(&opts.stage_root, &e))
-                    .and_then(|fs| arena_core::disk::judge(&fs, 0, &arena_core::disk::Size::Measured(needed).into(), floor));
-                if let Err(skip) = room {
-                    disk::note_skips(cfg, "replace/migrate staging", &[(dest_pod.name.clone(), skip.to_string())]);
-                    anyhow::bail!(
-                        "not copying via local staging ({}): {skip}, or point TMPDIR at a bigger disk",
-                        opts.stage_root.display()
-                    );
+            // (Held, against other runs' copies, until the staging is done.)
+            let _room = match floor {
+                None => disk::Hold::default(),
+                Some(floor) => {
+                    let copy = [(dest_pod.name.clone(), vec![(opts.stage_root.clone(), arena_core::disk::Size::Measured(needed))])];
+                    let (skipped, hold) = disk::judge_copies(cfg, floor, &copy, true);
+                    if let Some((_, skip)) = skipped.first() {
+                        disk::note_skips(cfg, "replace/migrate staging", &[(dest_pod.name.clone(), skip.to_string())]);
+                        anyhow::bail!(
+                            "not copying via local staging ({}): {skip}, or point TMPDIR at a bigger disk",
+                            opts.stage_root.display()
+                        );
+                    }
+                    hold
                 }
-            }
+            };
             for job in jobs.iter().filter(|j| j.repo) {
                 clear_stale_link(&job.dest).with_context(|| format!("clearing an old link at {}", job.dest))?;
                 std::fs::create_dir_all(&job.dest).with_context(|| format!("creating {}", job.dest))?;
@@ -13863,11 +13883,6 @@ async fn copy_pod_files(
     // re-resolves the endpoint fresh and confirms `RUNPOD_POD_ID` matches, so a push that
     // "succeeded" against a since-reassigned port (a different pod) is caught.
     let landed = transfer.is_ok() && marker_present(provider, remote, dest_id, cfg).await;
-    // A copy that landed leaves no use for an earlier attempt's staging of this source (kept so a
-    // re-run could continue from it): a direct copy never touched it, so it would stay forever.
-    if landed {
-        remove_staging_for(&opts.stage_root, src_id);
-    }
     // Clean the SOURCE marker now (and record a landed sync there, for the next one's reset
     // guard); leave the DEST marker for the caller's persistence re-check.
     let _ = remote.exec(&src_target, &unmark(landed), Some(PROBE_TIMEOUT)).await;
@@ -14740,27 +14755,30 @@ async fn pull_pods(
     };
     let repo = arena_core::backup::repo_path(cfg);
     // Room on this box (CONTROL_MIN_FREE_GB, `arena_core::disk`): each pod's tiers judged
-    // together, against what this run's other copies may take, before anything of it is made or
-    // asked — a pod that doesn't fit is skipped whole, never half copied. A snapshot tier onto
-    // this pod's earlier snapshot (or into a label it already has) and a big tier holding its
-    // files count as later copies, anything else as a first one.
-    let room = |names: &[String]| -> Vec<(String, arena_core::disk::Skip)> {
-        let Some(floor) = floor else { return Vec::new() };
+    // together, against what this run's other copies and other runs' copies under way may take,
+    // before anything of it is made or asked — a pod that doesn't fit is skipped whole, never half
+    // copied. A pod copied whole here before counts as a later copy where it has one to build on
+    // (`disk::tier_size`), anything else as a first one. `reserve`: hold the admitted ones' space
+    // for this run (until the returned hold goes, after the copies).
+    let room = |names: &[String], reserve: bool| -> (Vec<(String, arena_core::disk::Skip)>, disk::Hold) {
+        let Some(floor) = floor else { return (Vec::new(), disk::Hold::default()) };
+        if reserve {
+            disk::seed_copied(base);
+        }
         let copies: Vec<(String, Vec<(PathBuf, arena_core::disk::Size)>)> = names
             .iter()
             .map(|name| {
                 let parts = tiers_for(name)
                     .into_iter()
                     .map(|(tier, dest, _)| {
-                        let at = std::path::Path::new(&dest);
-                        let size = if tier == "snapshot" { disk::snapshot_size(base, name, at) } else { disk::size_into(at) };
+                        let size = disk::tier_size(base, name, tier == "snapshot", std::path::Path::new(&dest));
                         (PathBuf::from(dest), size)
                     })
                     .collect();
                 (name.clone(), parts)
             })
             .collect();
-        disk::judge_copies(floor, &copies)
+        disk::judge_copies(cfg, floor, &copies, reserve)
     };
 
     if dry_run {
@@ -14776,7 +14794,7 @@ async fn pull_pods(
             }
             println!();
         }
-        for (name, skip) in room(&targets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()) {
+        for (name, skip) in room(&targets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), false).0 {
             println!("⚠ {name}, if pulled now: {skip}");
         }
         // What the pods would be asked, judged from the configured paths alone.
@@ -14827,7 +14845,8 @@ async fn pull_pods(
     let targets: Vec<(String, SshTarget)> =
         targets.into_iter().filter(|(n, _)| !not_pulled.iter().any(|f| f.starts_with(&format!("{n} ")))).collect();
     // The pods there's no room for on this box: said, recorded for the health check, failures.
-    let skipped = room(&targets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>());
+    // The others' space is held until this run's copies end (`_room`, dropped on return).
+    let (skipped, _room) = room(&targets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), true);
     for (name, skip) in &skipped {
         say(&format!("✗ {name}: {skip}"));
         not_pulled.push(format!("{name} ({})", skip.reason));
@@ -15061,7 +15080,7 @@ async fn pull_pods(
     let no_room = if skipped.is_empty() { String::new() } else { format!("; {} pod(s) skipped — no room on this box", skipped.len()) };
     println!("\nDone: {ok} rsync job(s) ok, {failed} failed across {total_pods} pod(s){no_room}.");
     failures.splice(0..0, not_pulled.iter().cloned());
-    let whole = if no_big || no_git {
+    let whole: Vec<String> = if no_big || no_git {
         Vec::new()
     } else {
         targets
@@ -15070,6 +15089,14 @@ async fn pull_pods(
             .filter(|n| jobs_of.get(n).is_some_and(|(all, ok)| *all > 0 && ok == all) && !by_pod.iter().any(|(p, _)| p == n))
             .collect()
     };
+    // What makes this pod's next copy here a later one (`disk::tier_size`): its whole home copied
+    // (`~/` as the cron's BACKUP_REMOTE_PATH says, not one dir of it, after which a copy of the
+    // home would still bring most of it). Best effort: without it, the next copy counts as a first one.
+    for (pod, t) in targets.iter().filter(|(n, _)| whole.contains(n)) {
+        if arena_core::volume::whole_home(&remote_path, &t.user) {
+            let _ = arena_core::disk::mark_copied(base, pod);
+        }
+    }
     Ok(Pulled { failures, failed: by_pod, snapshot_root: format!("{dir}/{label}"), big_root: (!no_big).then_some(big_root), whole })
 }
 
@@ -15359,17 +15386,19 @@ async fn handle_baseline(
         println!("aborted.");
         return Ok(());
     }
-    // Room on this box first (a fresh pod's home, not measured: a first copy).
-    if let Some(floor) = floor {
-        let fresh = arena_core::disk::Size::First.into();
-        if let Err(skip) = arena_core::disk::reading(&partial)
-            .map_err(|e| arena_core::disk::Skip::unknown(&partial, &e))
-            .and_then(|fs| arena_core::disk::judge(&fs, 0, &fresh, floor))
-        {
-            disk::note_skips(cfg, "baseline", &[(pod.name.clone(), skip.to_string())]);
-            anyhow::bail!("refusing the baseline from {}: {skip}", pod.name);
+    // Room on this box first (a fresh pod's home, not measured: a first copy), held against
+    // other runs' copies until the capture is done.
+    let _room = match floor {
+        None => disk::Hold::default(),
+        Some(floor) => {
+            let (skipped, hold) = disk::judge_copies(cfg, floor, &[(pod.name.clone(), vec![(partial.clone(), arena_core::disk::Size::First)])], true);
+            if let Some((_, skip)) = skipped.first() {
+                disk::note_skips(cfg, "baseline", &[(pod.name.clone(), skip.to_string())]);
+                anyhow::bail!("refusing the baseline from {}: {skip}", pod.name);
+            }
+            hold
         }
-    }
+    };
     std::fs::create_dir_all(&partial).with_context(|| format!("creating {}", partial.display()))?;
     let started = tokio::time::Instant::now();
     for args in passes {
@@ -19075,6 +19104,25 @@ mod setup_tests {
         assert_eq!(lines[6], "## vscode warm-up (timeout 300s, best-effort: a failure is a warning, never a failed setup)");
         assert!(lines[7].starts_with("latest stable VS Code server") && lines[7].contains("ms-toolsai.jupyter"), "{}", lines[7]);
         assert!(lines[7].contains("/opt/arena-env/bin/python") && !lines[7].contains("base64"), "{}", lines[7]);
+    }
+
+    /// disk-guard: the bare-VM setup script is staged once per run (the pid in its name) and
+    /// removed when the run ends (`main`), never left in the temp dir.
+    #[test]
+    fn the_staged_bare_vm_script_goes_with_the_run() {
+        assert_eq!(super::stage_hetzner_script(false).unwrap(), "", "nothing staged when no pod needs it");
+        let staged = super::stage_hetzner_script(true).unwrap();
+        assert_eq!(std::path::PathBuf::from(&staged), super::hetzner_script_path());
+        assert!(staged.ends_with(&format!("arena-hetzner-setup-{}.sh", std::process::id())), "{staged}");
+        // What `main` does at the end, here in a dir of this test's own.
+        let dir = std::env::temp_dir().join(format!("arena-unstage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(super::hetzner_script_in(&dir), super::HETZNER_SETUP).unwrap();
+        std::fs::write(dir.join("arena-hetzner-setup-0.sh"), "another run's").unwrap();
+        super::unstage_hetzner_script(&dir);
+        assert!(!super::hetzner_script_in(&dir).exists() && dir.join("arena-hetzner-setup-0.sh").exists(), "only this run's");
+        super::unstage_hetzner_script(&dir); // none left: nothing to do
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -24129,11 +24177,13 @@ mod remote_tests {
         assert!(!base.exists() && stub.take().is_empty());
         assert_eq!(arena_core::disk::Skips::load(&record).0.entries.iter().find(|e| e.pod == "devtest-bloom").map(|e| e.count), Some(2));
 
-        // Room: a later copy (bloom already copied here) needs ~0.1 GB per tier, the floor 0.
+        // Room: a later copy (bloom copied whole here before) needs ~0.1 GB per tier, the floor 0;
+        // a copy that went through whole is marked so.
         for tier in ["w1d1/devtest-bloom", "big/devtest-bloom"] {
             std::fs::create_dir_all(base.join(tier)).unwrap();
             std::fs::write(base.join(tier).join("old.py"), "x").unwrap();
         }
+        arena_core::disk::mark_copied(&base, "devtest-bloom").unwrap();
         let fake = Arc::new(FakeRemote::new());
         fake.script(&host(22002), [repo_in_place()]);
         let remote: Arc<dyn Remote> = fake.clone();
@@ -24141,6 +24191,61 @@ mod remote_tests {
             .await
             .unwrap();
         assert_eq!(stub.take(), ["big/devtest-bloom", "w1d1/devtest-bloom", "w1d1/devtest-bloom"]);
+        assert!(!arena_core::disk::was_copied(&base, "devtest-apple"), "apple was never copied");
+        // Its reservation went with the run.
+        let (held, _) = arena_core::disk::Reservations::load(&state.join("devtest").join(arena_core::disk::RESERVATIONS_FILE));
+        assert!(held.held.is_empty(), "{held:?}");
+    }
+
+    /// disk-guard: a pull that copied a pod's whole home marks it, so its next copy here counts as
+    /// a later one; one that didn't (a failed tier, one dir of the home) doesn't. A backup from
+    /// before marking gets its pods marked once, before the first judged run's copies.
+    #[tokio::test]
+    async fn a_pod_copied_whole_is_marked_and_a_failed_one_isnt() {
+        let stub = StubRsync::new("marked");
+        let base = stub.0.join("backups");
+        let text = format!(
+            "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\n\
+             GIT_SSH_KEY_REMOTE={KEY}\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nARENA_START_DATE=2026-01-05\n"
+        );
+        let cfg = Config::parse(&text);
+        let both = picked(&fleet(), &cfg, &["apple", "bloom"]).await;
+        let apple = Selected { pods: vec![both.pods[0].clone()], named: true };
+        // bloom has no endpoint here: never copied, never marked.
+        let both = Selected { pods: vec![both.pods[0].clone(), Pod { ssh_ip: None, ssh_port: None, ..both.pods[1].clone() }], named: true };
+        let pull = |cfg: Config, dir: std::path::PathBuf, sel: Selected, remote_path: Option<&'static str>| {
+            let stub = stub.path();
+            async move {
+                let fake = Arc::new(FakeRemote::new());
+                fake.script(&host(22001), [repo_in_place()]);
+                let remote: Arc<dyn Remote> = fake.clone();
+                let dir = dir.display().to_string();
+                handle_pull(&remote, &cfg, Some("w1d1".into()), &dir, None, remote_path.map(String::from), false, false, &sel, false, true, &stub).await
+            }
+        };
+        let _ = pull(cfg.clone(), base.clone(), both.clone(), None).await;
+        assert!(arena_core::disk::was_copied(&base, "devtest-apple"));
+        assert!(!arena_core::disk::was_copied(&base, "devtest-bloom"));
+        // One dir of the home isn't the home; `~/` (the cron's BACKUP_REMOTE_PATH) is.
+        let part = stub.0.join("part");
+        pull(cfg.clone(), part.clone(), apple.clone(), Some("ARENA_materials/results")).await.unwrap();
+        assert!(!arena_core::disk::was_copied(&part, "devtest-apple"), "one dir of its home");
+        let home = stub.0.join("home");
+        pull(Config::parse(&format!("{text}BACKUP_REMOTE_PATH=~/\n")), home.clone(), apple.clone(), None).await.unwrap();
+        assert!(arena_core::disk::was_copied(&home, "devtest-apple"), "its home");
+
+        // A backup from before marking: bloom backed up there (both tiers), no marks. The first
+        // judged run marks it — its next copy a later one, as before — then copies apple whole.
+        let legacy = stub.0.join("legacy");
+        for tier in ["w1d1/devtest-bloom", "big/devtest-bloom"] {
+            std::fs::create_dir_all(legacy.join(tier)).unwrap();
+            std::fs::write(legacy.join(tier).join("old.py"), "x").unwrap();
+        }
+        let judged = Config::parse(&format!("{text}ARENA_STATE_DIR={}\nCONTROL_MIN_FREE_GB=0\n", stub.0.join("state").display()));
+        pull(judged, legacy.clone(), apple.clone(), None).await.unwrap();
+        assert!(arena_core::disk::was_copied(&legacy, "devtest-bloom"), "marked: backed up before marking");
+        assert!(arena_core::disk::was_copied(&legacy, "devtest-apple"), "copied whole");
+        assert!(!arena_core::disk::was_copied(&legacy, "devtest-cloud"));
     }
 
     /// S17 + AD7: every pull rsync writes its temp files to its tier root's `.rsync-tmp`
@@ -26782,7 +26887,8 @@ mod remote_tests {
         let e = copy_pod_files(&cfg(), &f, &fake, src, dest, &opts(stub("held", "1,000", 0))).await.unwrap_err();
         assert!(format!("{e:#}").contains("another arena run is copying id-devtest-apple through"), "{e:#}");
         assert!(stage.join("theirs.py").exists() && !stage.join("work.py").exists());
-        // An earlier attempt's stage, once a copy lands without it (here a direct one): removed.
+        // An earlier attempt's stage is kept when a later copy lands directly — it may hold what
+        // the source has lost since — and stays visible (`config check`, `teardown --check`).
         drop(held);
         let fake = FakeRemote::new();
         fake.on(&host(22001), "arena-replica-sent", FakeReply::stdout("arena-replica-sent=yes\n"));
@@ -26791,7 +26897,7 @@ mod remote_tests {
         fake.on("10.0.0.2:22002", "MARK=", FakeReply::stdout(&format!("ID={dest}\nMARK=arena-replace-{dest}\n")));
         copy_pod_files(&cfg(), &f, &fake, src, dest, &opts(stub("direct", "1,000", 0))).await.unwrap();
         assert!(execs(&fake, 22001).iter().any(|(c, _)| c.contains("rsync ")), "copied directly");
-        assert!(!stage.exists(), "the leftover of an earlier attempt goes once a copy landed");
+        assert!(stage.join("theirs.py").exists(), "an earlier attempt's stage is never removed by a later copy");
         let _ = std::fs::remove_dir_all(&root);
     }
 

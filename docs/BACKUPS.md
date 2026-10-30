@@ -802,10 +802,11 @@ findings #5–#7, #13, #16, #17, #19, #20, #26–#30):
   when it wouldn't leave `CONTROL_MIN_FREE_GB` free on that disk ([Room on this
   box](#room-on-this-box-control_min_free_gb)); the stage (`$TMPDIR/arena-replace-<id>`, mode 0700,
   locked while a run copies through it — a second replace/migrate of the same pod is refused, its
-  stage untouched) is **removed** once the copy landed — an earlier attempt's too, once a later one
-  lands directly —, and kept — with its path, size and the `rm -rf` — only when it failed (a re-run
-  continues from it) or the run was stopped; `migrate finish` / a finished `replace` remove a
-  leftover.
+  stage untouched) is **removed** once the copy through it landed, and kept — with its path, size
+  and the `rm -rf` — when it failed (a re-run continues from it) or the run was stopped. A later
+  attempt that copies directly leaves an earlier attempt's stage alone: it may hold what the source
+  has lost since (`config check` lists it). `migrate finish` / a finished `replace` remove a
+  leftover once the old pod is gone.
 - The source's **GPU type** comes from its own listing when its spec doesn't say (RunPod v1), before
   config's `GPU_TYPE` (the plan says where it came from). `--gpu`/`--cloud` take **lists** and go
   through the same placement as `up` (`--max-price`, `--order`, `--retry-mins`/`--retry-secs`): one
@@ -837,13 +838,21 @@ and the reaper's last copy. (Live, 2026-10-30: prod's control box sat at 96 %, 3
 while the */15 cron copied pods onto it; a plain `pods backup` of a GPU image home had filled it
 once.)
 
-- A copy goes ahead only if what's free there, less what this run's earlier copies may take and what
-  this one may take, stays at or above `CONTROL_MIN_FREE_GB` (whole GB, default 5; `0` = only the
-  copy itself must fit).
+- A copy goes ahead only if what's free there, less what this run's earlier copies may take, what
+  other arena runs' copies under way may take (a cron backup and an operator's pull at once) and
+  what this one may take, stays at or above `CONTROL_MIN_FREE_GB` (whole GB, default 5; `0` = only
+  the copy itself must fit). Each run notes what its admitted copies may take in the state dir
+  (`disk-reservations.json`) until they end; a note whose arena process is gone, or that is over a
+  day old, counts for nothing.
 - What a copy may take: measured where arena measures it (the staging: an rsync dry run); otherwise
   a pod's first copy into a tier counts as 2 GB (about a fresh GPU image's home) and a later one —
-  onto its earlier copy, where rsync writes only what changed — as 0.1 GB. A pod's tiers are judged
-  together: it is copied whole or not at all.
+  onto its earlier copy, where rsync writes only what changed — as 0.1 GB. A copy is a later one
+  only once that pod's whole home was copied into this backup (every tier went through, of `~/`
+  rather than one dir of it: marked in `<LOCAL_BACKUP_DIR>/.arena-copied/<pod>`): the retry of an
+  interrupted first copy, which left some files but most of the pod to come, still counts as a
+  first one. A backup from before this marking gets every pod with a `wNdM` snapshot there marked
+  once, before the first run that judges its copies (as arena took them until then). A pod's tiers
+  are judged together: it is copied whole or not at all.
 - A skip happens before the pod is asked anything or any of its dirs is made, one line per pod —
   `✗ arena9-bloom: skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB) — nothing copied;
   free space on / (…)` — and it is a failure of the run (the exit; `pods backup`'s `the fallback copy
@@ -865,9 +874,9 @@ replace/migrate remove their own staging copy only once a copy of that pod has l
 and been verified (and `migrate finish` / a finished `replace`, once the old pod is gone):
 
 - `$TMPDIR/arena-replace-<pod id>`: replace/migrate's via-local staging of that pod's home. Removed
-  once a copy of it lands, kept when the copy failed (a re-run continues from it); left too by a run
-  that was stopped (Ctrl+C, a dropped ssh session), and by builds from before 2026-10-09, which never
-  removed it.
+  once the copy through it lands, kept when the copy failed (a re-run continues from it) and when a
+  later attempt copied directly instead; left too by a run that was stopped (Ctrl+C, a dropped ssh
+  session), and by releases from before 2026-10-19, which never removed it.
 - `<LOCAL_BACKUP_DIR>/baseline/w<N>/.fleet.partial-<pid>`: an interrupted `pods baseline`.
 - A tier's `.rsync-tmp/` holding files unchanged for a day: a pull stopped hard (SIGKILL).
 

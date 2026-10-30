@@ -569,6 +569,15 @@ pub fn resolve_remote_path(remote_path: &str, home: &str) -> Option<(String, boo
     Some((abs, contents))
 }
 
+/// Whether a pull of `remote_path` (`--remote-path` / `BACKUP_REMOTE_PATH`; empty = the home)
+/// from a pod whose login user is `user` copies its whole home — `~/`, `.`, its absolute path —
+/// rather than one dir in it (or something that can't be told). Pure. What makes that pod's next
+/// copy a later one onto this one (`disk::mark_copied`).
+pub fn whole_home(remote_path: &str, user: &str) -> bool {
+    let home = default_home(user);
+    resolve_remote_path(remote_path, &home).is_some_and(|(abs, _)| abs == home)
+}
+
 /// Plan the repo job for a home pull of a pod whose login user is `user`, with the configured
 /// `repo`, given the pod's `probe` (`None` = the probe failed): [`repo_pull_from`] with the
 /// empty remote path. Pure.
@@ -984,6 +993,29 @@ mod tests {
         ];
         for (path, home, want) in cases {
             assert_eq!(resolve_remote_path(path, home), want.map(|(a, c)| (a.to_string(), c)), "{path:?}");
+        }
+    }
+
+    /// A pull is of the whole home when its remote path names the home itself, however written.
+    #[test]
+    fn a_pull_of_the_home_however_written_is_of_the_whole_home() {
+        for (path, user, whole) in [
+            ("", "root", true),
+            ("~", "root", true),
+            ("~/", "root", true),
+            (".", "root", true),
+            ("./", "root", true),
+            ("/root/", "root", true),
+            ("/root", "root", true),
+            ("/home/u/", "u", true),
+            ("~/ARENA_materials", "root", false),
+            ("ARENA_materials/results", "root", false),
+            ("/root/", "u", false),
+            ("/", "root", false),
+            ("$HOME/", "root", false),
+            ("x/../", "root", false),
+        ] {
+            assert_eq!(whole_home(path, user), whole, "{path:?} as {user}");
         }
     }
 

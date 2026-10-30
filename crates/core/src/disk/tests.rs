@@ -27,6 +27,19 @@ impl Drop for TmpDir {
     }
 }
 
+/// `dir`'s lock once it's free. A child another test spawns while this process holds a lock (even
+/// a look's momentary one) keeps a copy of it until its exec — `flock` is per open file — so a
+/// lock just let go of can look held for an instant, as `copy_pod_files` waits a look's out.
+fn lock_when_free(dir: &Path) -> std::io::Result<std::fs::File> {
+    for _ in 0..100 {
+        match lock_dir(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(20)),
+            r => return r,
+        }
+    }
+    lock_dir(dir)
+}
+
 #[test]
 fn the_floor_is_whole_gb_from_zero_with_a_default_of_five() {
     let f = |text: &str| floor_bytes(&Config::parse(text));
@@ -51,7 +64,7 @@ fn a_copy_goes_only_when_it_leaves_the_floor_free() {
         (3_100_000_000, 0, Size::Measured(0), 5, Some("only 3.1 GB free on /")),
         // Above the floor, but not with the copy on top.
         (6 * G, 0, Size::First, 5, Some("6 GB free on /, and this copy (~2 GB, a first copy, not measured) would leave less than the floor (5 GB, CONTROL_MIN_FREE_GB)")),
-        (6 * G, G / 2, Size::Measured(G), 5, Some("this copy (~1 GB, measured) after ~0.5 GB for this run's other copies would leave less")),
+        (6 * G, G / 2, Size::Measured(G), 5, Some("this copy (~1 GB, measured) after ~0.5 GB for other copies under way would leave less")),
         // Room: exactly at the floor afterwards is enough.
         (7 * G, 0, Size::First, 5, None),
         (5 * G + G / 10, 0, Size::Later, 5, None),
@@ -108,7 +121,7 @@ fn a_runs_copies_add_up_and_a_pod_goes_whole_or_not_at_all() {
     assert_eq!(l.admit(&[(root.clone(), Size::First), (root.clone(), Size::First)]), Ok(()));
     // The next first copy would leave 10 - 4 - 4 = 2 GB: skipped, saying what the run holds.
     let e = l.admit(&[(root.clone(), Size::First), (root.clone(), Size::First)]).unwrap_err().to_string();
-    assert!(e.contains("this copy (~4 GB, a first copy, not measured) after ~4 GB for this run's other copies"), "{e}");
+    assert!(e.contains("this copy (~4 GB, a first copy, not measured) after ~4 GB for other copies under way"), "{e}");
     // A later copy still fits (4 + 0.2 + 5 ≤ 10), and is held too.
     assert_eq!(l.admit(&[(root.clone(), Size::Later), (root.clone(), Size::Later)]), Ok(()));
     // A filesystem keeps its first reading: a later one saying more is free changes nothing.
@@ -122,6 +135,80 @@ fn a_runs_copies_add_up_and_a_pod_goes_whole_or_not_at_all() {
     assert!(e.contains("6 GB free on /mnt/big"), "{e}");
     assert_eq!(l.admit(&[(snap.clone(), Size::Measured(15 * G))]), Ok(()), "the failed pod held nothing on /");
     assert_eq!(l.admit(&[(big, Size::Measured(G))]), Ok(()), "nor on /mnt/big");
+}
+
+/// Other runs' copies under way count as taken: their reservations, per device, are pruned of
+/// processes gone and of ones too old, and an admission holds (then lets go of) its own.
+#[test]
+fn other_runs_reservations_count_against_the_free_space() {
+    let mut r = Reservations::default();
+    let taken = |pairs: &[(u64, u64)]| pairs.iter().copied().collect::<BTreeMap<u64, u64>>();
+    let now = 1_000_000;
+    r.hold(100, 1, &taken(&[(1, 4 * G), (2, G)]), now);
+    r.hold(200, 7, &taken(&[(1, 2 * G)]), now);
+    r.hold(300, 9, &taken(&[(1, 50 * G)]), now); // its process is gone
+    r.hold(400, 3, &taken(&[(1, 50 * G)]), now - RESERVATION_MAX_AGE_SECS); // too old
+    r.prune(now, |pid| pid != 300);
+    assert_eq!(r.by_dev(), taken(&[(1, 6 * G), (2, G)]));
+    // 15 GB free, floor 5: with 6 GB held elsewhere, one first copy of two tiers (4 GB) fits, a second doesn't.
+    let mut l = Ledger::with_others(floor(5), r.by_dev());
+    let root = fs(1, "/", 15 * G);
+    assert_eq!(l.admit(&[(root.clone(), Size::First), (root.clone(), Size::First)]), Ok(()));
+    let e = l.admit(&[(root.clone(), Size::First)]).unwrap_err().to_string();
+    assert!(e.contains("after ~10 GB for other copies under way"), "{e}");
+    assert_eq!(l.taken(), taken(&[(1, 4 * G)]), "only this run's own");
+    r.hold(500, 2, &l.taken(), now + 10);
+    assert_eq!(r.by_dev()[&1], 10 * G);
+    r.release(500, 2);
+    r.release(100, 999); // another admission's token: nothing
+    assert_eq!(r.by_dev(), taken(&[(1, 6 * G), (2, G)]));
+    // This process is an arena test binary; a pid that isn't running isn't.
+    assert!(arena_alive(std::process::id()));
+    assert!(!arena_alive(u32::MAX - 1));
+}
+
+#[test]
+fn a_whole_copy_is_marked_beside_the_labels() {
+    let d = TmpDir::new("marker");
+    assert!(!was_copied(&d.0, "devtest-a"));
+    mark_copied(&d.0, "devtest-a").unwrap();
+    assert!(was_copied(&d.0, "devtest-a") && !was_copied(&d.0, "devtest-b"));
+    assert_eq!(copied_marker(&d.0, "devtest-a"), d.0.join(".arena-copied/devtest-a"));
+    // Not a label, so nothing that lists snapshots or pods sees it.
+    assert_eq!(crate::restore::parse_label(COPIED_DIR), None);
+}
+
+/// A backup from before marking: once, before a run's copies, every pod with a `wNdM` snapshot
+/// there is marked (as arena took them until then), and nothing else; from then on, only whole
+/// copies mark — a pod's interrupted first copy after that never is.
+#[test]
+fn a_backup_from_before_marking_is_seeded_once() {
+    let d = TmpDir::new("seed");
+    assert_eq!(seed_copied(&d.0.join("none")).unwrap(), 0);
+    assert!(!d.0.join("none").exists(), "no backup: nothing made");
+    let base = d.0.join("backup");
+    for dir in ["w1d1/devtest-a", "w1d1/devtest-b", "w2d3/devtest-a", "mylabel/devtest-c", "big/devtest-d", ".arena-locks", "w1d1/.rsync-tmp"] {
+        std::fs::create_dir_all(base.join(dir)).unwrap();
+    }
+    std::fs::write(base.join("w1d1/notes.txt"), "a file, not a pod").unwrap();
+    assert_eq!(seed_copied(&base).unwrap(), 2);
+    let marked = |pod: &str| was_copied(&base, pod);
+    assert!(marked("devtest-a") && marked("devtest-b"));
+    assert!(!marked("devtest-c") && !marked("devtest-d") && !marked("notes.txt") && !marked(".rsync-tmp"));
+    let names: Vec<String> = std::fs::read_dir(&base).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(!names.iter().any(|n| n.starts_with(&format!("{COPIED_DIR}.new"))), "{names:?}");
+    // Once: a later first copy (interrupted) isn't taken for a whole one.
+    std::fs::create_dir_all(base.join("w2d4/devtest-e")).unwrap();
+    assert_eq!(seed_copied(&base).unwrap(), 0);
+    assert!(!marked("devtest-e"));
+    // A backup with no pods yet starts marking empty: its first copies are first ones, for good.
+    let fresh = d.0.join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    assert_eq!(seed_copied(&fresh).unwrap(), 0);
+    assert!(fresh.join(COPIED_DIR).is_dir());
+    std::fs::create_dir_all(fresh.join("w1d1/devtest-a")).unwrap();
+    assert_eq!(seed_copied(&fresh).unwrap(), 0);
+    assert!(!was_copied(&fresh, "devtest-a"));
 }
 
 #[test]
@@ -234,7 +321,7 @@ fn leftovers_are_found_sized_and_told_apart_from_one_in_use() {
     assert!(later.iter().any(|l| l.kind == LeftoverKind::RsyncTemp && l.path == root.join("w1d1/.rsync-tmp")), "{later:?}");
 
     // A run holding the staging dir's lock: in use, and said so — nothing to remove.
-    let held = lock_dir(&stage).unwrap();
+    let held = lock_when_free(&stage).unwrap();
     assert!(in_use(&stage));
     let e = lock_dir(&stage).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
@@ -245,7 +332,7 @@ fn leftovers_are_found_sized_and_told_apart_from_one_in_use() {
     assert_eq!(lines.len(), 1);
     assert!(lines[0].starts_with(&format!("◷ {} — ", stage.display())) && lines[0].ends_with("in use now by a running arena"), "{lines:?}");
     drop(held);
-    assert!(!in_use(&stage));
+    drop(lock_when_free(&stage).expect("free again"));
     // Nothing found was touched.
     assert!(stage.join("ARENA_materials/notes.py").exists() && partial_ok.exists() && root.join("w1d1/.rsync-tmp/.notes.py.Ab12Cd").exists());
     // Nothing there: nothing found, and nothing it couldn't read. A dir it can't list: said.
@@ -298,8 +385,8 @@ fn a_leftover_says_what_it_is_how_to_look_and_how_to_remove_it() {
     assert_eq!(
         lines[0],
         "⚠ /tmp/arena-replace-leh3rc2hdcf31i — 3.5 GB, last written 16 days ago: pod leh3rc2hdcf31i's home, staged by \
-         `pods replace`/`migrate` and kept after a copy that failed or was stopped (or by a build from before \
-         2026-10-09, which never removed it)"
+         `pods replace`/`migrate` and kept after a copy that failed or was stopped, or by a later attempt that copied \
+         directly (or by a release from before 2026-10-19, which never removed it)"
     );
     assert!(lines[1].contains("it may be the only copy of that pod's work") && lines[1].contains("`arena pods list --no-probe | grep -F -- leh3rc2hdcf31i`"), "{lines:?}");
     assert_eq!(lines[2], "  └ look: du -sh /tmp/arena-replace-leh3rc2hdcf31i; ls -la /tmp/arena-replace-leh3rc2hdcf31i");

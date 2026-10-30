@@ -27,18 +27,48 @@ pub(crate) fn floor(cfg: &Config) -> Result<Option<Floor>> {
 }
 
 /// Judge a run's copies onto this box together ([`core_disk::Ledger`]): each copy (a pod) with
-/// the destinations it writes and their sizes. The ones that don't fit, with why — in order.
-pub(crate) fn judge_copies(floor: Floor, copies: &[(String, Vec<(PathBuf, Size)>)]) -> Vec<(String, Skip)> {
-    judge_copies_with(floor, copies, core_disk::reading)
+/// the destinations it writes and their sizes, against what other arena runs' copies under way
+/// hold ([`core_disk::Reservations`], in the state dir). The ones that don't fit, with why — in
+/// order — and the admitted ones' reservation, held until the returned [`Hold`] is dropped (when
+/// the copies end). `reserve: false` (a dry run) holds nothing.
+pub(crate) fn judge_copies(cfg: &Config, floor: Floor, copies: &[(String, Vec<(PathBuf, Size)>)], reserve: bool) -> (Vec<(String, Skip)>, Hold) {
+    let Some(path) = reservations_path(cfg) else {
+        return (judge_copies_with(core_disk::Ledger::new(floor), copies, core_disk::reading).0, Hold::default());
+    };
+    // Under the state dir's lock: no other run reads or writes the reservations between this
+    // one's reading and its own (a lock that can't be had: this run's copies alone, said).
+    let lock = match core_disk::lock_state_for(&path, core_disk::RECORD_LOCK_WAIT) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("warning: other runs' copies onto this box aren't counted this time ({}: {e})", path.display());
+            return (judge_copies_with(core_disk::Ledger::new(floor), copies, core_disk::reading).0, Hold::default());
+        }
+    };
+    let now = arena_core::snapshot::unix_now();
+    let (mut held, warning) = core_disk::Reservations::load(&path);
+    warning.iter().for_each(|w| eprintln!("{w}"));
+    held.prune(now, core_disk::arena_alive);
+    let (skipped, taken) = judge_copies_with(core_disk::Ledger::with_others(floor, held.by_dev()), copies, core_disk::reading);
+    if !reserve || taken.is_empty() {
+        return (skipped, Hold::default());
+    }
+    let token = now.wrapping_mul(1_000_003) ^ u64::from(std::process::id()) ^ u64::from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()));
+    held.hold(std::process::id(), token, &taken, now);
+    if let Err(e) = held.save(&path) {
+        eprintln!("warning: couldn't note this run's copies in {} ({e}) — other runs won't count them", path.display());
+        return (skipped, Hold::default());
+    }
+    drop(lock);
+    (skipped, Hold { path: Some(path), token })
 }
 
-/// [`judge_copies`] with the filesystem readings from `read` (tests hand in their own).
+/// [`judge_copies`]' judging with `ledger` and the filesystem readings from `read` (tests hand in
+/// their own): the skipped copies, and what the admitted ones take per device.
 fn judge_copies_with(
-    floor: Floor,
+    mut ledger: core_disk::Ledger,
     copies: &[(String, Vec<(PathBuf, Size)>)],
     read: impl Fn(&Path) -> std::result::Result<core_disk::Fs, String>,
-) -> Vec<(String, Skip)> {
-    let mut ledger = core_disk::Ledger::new(floor);
+) -> (Vec<(String, Skip)>, std::collections::BTreeMap<u64, u64>) {
     let mut out = Vec::new();
     for (name, parts) in copies {
         let read: std::result::Result<Vec<_>, Skip> =
@@ -47,26 +77,64 @@ fn judge_copies_with(
             out.push((name.clone(), skip));
         }
     }
-    out
+    (out, ledger.taken())
 }
 
-/// A copy into `dest` adds what changed when `dest` already holds files (this pod's earlier
-/// copy), else it's a first copy.
-pub(crate) fn size_into(dest: &Path) -> Size {
-    if std::fs::read_dir(dest).is_ok_and(|mut e| e.next().is_some()) {
+/// A run's reservation of the space its admitted copies may take ([`judge_copies`]): let go when
+/// dropped — the copies ended — under the state dir's lock. Best effort: one that can't be let go
+/// of goes with its process (or its age).
+#[derive(Debug, Default)]
+pub(crate) struct Hold {
+    path: Option<PathBuf>,
+    token: u64,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else { return };
+        let Ok(lock) = core_disk::lock_state_for(&path, core_disk::RECORD_LOCK_WAIT) else { return };
+        let (mut held, _) = core_disk::Reservations::load(&path);
+        held.release(std::process::id(), self.token);
+        let _ = held.save(&path);
+        drop(lock);
+    }
+}
+
+/// Where the reservations live: the fleet's state dir (as the skip record); `None` in this
+/// crate's unit tests unless the test's config sets `ARENA_STATE_DIR`.
+fn reservations_path(cfg: &Config) -> Option<PathBuf> {
+    if cfg!(test) && cfg.get("ARENA_STATE_DIR").is_none() {
+        return None;
+    }
+    arena_core::snapshot::state_file_path_for(cfg, core_disk::RESERVATIONS_FILE).ok()
+}
+
+/// What a copy of `pod` into `dest` may take, under the snapshot root `base`: a later copy — only
+/// what changed — when the pod was copied whole into this backup before ([`core_disk::was_copied`])
+/// and there's a copy of it to build on (for the snapshot tier, a snapshot of it under any label;
+/// for the big tier, its files in `dest`); else a first one. An interrupted first copy leaves
+/// files but no mark, so its retry still counts as a first copy.
+pub(crate) fn tier_size(base: &Path, pod: &str, snapshot: bool, dest: &Path) -> Size {
+    let builds_on = if snapshot {
+        !arena_core::restore::snapshot_labels(base, pod).is_empty()
+    } else {
+        std::fs::read_dir(dest).is_ok_and(|mut e| e.next().is_some())
+    };
+    if builds_on && core_disk::was_copied(base, pod) {
         Size::Later
     } else {
         Size::First
     }
 }
 
-/// A pod's snapshot-tier copy into `dest` under the snapshot root `base`: a later one when the pod
-/// has an earlier snapshot there (or this label already holds its files), else [`size_into`]'s.
-pub(crate) fn snapshot_size(base: &Path, pod: &str, dest: &Path) -> Size {
-    if arena_core::restore::snapshot_labels(base, pod).is_empty() {
-        size_into(dest)
-    } else {
-        Size::Later
+/// Start marking whole copies in the backup at `base` before a run's copies are judged
+/// ([`core_disk::seed_copied`]: once per backup, its pods from before marking taken as copied
+/// whole) — said when it marked any; a failure is a warning (those pods then count as first copies).
+pub(crate) fn seed_copied(base: &Path) {
+    match core_disk::seed_copied(base) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("note: {n} pod(s) already backed up in {} marked as copied whole (their next copies count as later ones)", base.display()),
+        Err(e) => eprintln!("warning: couldn't start marking whole copies in {} ({e}) — every pod's copy counts as a first one", base.display()),
     }
 }
 
@@ -278,22 +346,27 @@ mod tests {
         assert!(h.lines.iter().any(|l| l.starts_with("  ✗ CONTROL_MIN_FREE_GB must be") && l.ends_with("every copy onto this box fails until it's fixed")));
     }
 
-    /// A pod's copy is a later one onto its own earlier copy (a snapshot under another label,
-    /// files in its big dir), else a first one; its tiers are judged together, a run's copies
-    /// adding up, and a reading that fails is a skip.
+    /// A pod's copy is a later one only onto its own earlier copy here AND once it was copied whole
+    /// here (an interrupted first copy leaves files but no mark); its tiers are judged together,
+    /// a run's copies adding up, and a reading that fails is a skip.
     #[test]
     fn a_pods_copy_is_sized_by_what_is_already_there_and_judged_whole() {
         let d = std::env::temp_dir().join(format!("arena-disk-size-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let base = d.join("backup");
         let (snap, big) = (base.join("w1d2/devtest-a"), base.join("big/devtest-a"));
-        assert_eq!((snapshot_size(&base, "devtest-a", &snap), size_into(&big)), (Size::First, Size::First));
+        let sizes = |pod: &str, snap: &Path, big: &Path| (tier_size(&base, pod, true, snap), tier_size(&base, pod, false, big));
+        assert_eq!(sizes("devtest-a", &snap, &big), (Size::First, Size::First));
         for dir in [base.join("w1d1/devtest-a"), big.clone()] {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("x.py"), "x").unwrap();
         }
-        assert_eq!((snapshot_size(&base, "devtest-a", &snap), size_into(&big)), (Size::Later, Size::Later));
-        assert_eq!(snapshot_size(&base, "devtest-b", &base.join("w1d2/devtest-b")), Size::First, "another pod's snapshot isn't this one's");
+        assert_eq!(sizes("devtest-a", &snap, &big), (Size::First, Size::First), "files there, but never copied whole");
+        core_disk::mark_copied(&base, "devtest-a").unwrap();
+        assert_eq!(sizes("devtest-a", &snap, &big), (Size::Later, Size::Later));
+        core_disk::mark_copied(&base, "devtest-b").unwrap();
+        let (snap_b, big_b) = (base.join("w1d2/devtest-b"), base.join("big/devtest-b"));
+        assert_eq!(sizes("devtest-b", &snap_b, &big_b), (Size::First, Size::First), "marked, but nothing of it here to build on");
         let _ = std::fs::remove_dir_all(&d);
 
         // 8 GB free, floor 5: a first copy of both tiers (~4 GB) doesn't fit, later ones do.
@@ -305,15 +378,48 @@ mod tests {
             Ok(core_disk::Fs { dev: 1, mount: PathBuf::from("/"), free: 8 * g, total: 75 * g })
         };
         let pod = |name: &str, size: Size| (name.to_string(), vec![(PathBuf::from("/b/w1d2"), size), (PathBuf::from("/b/big"), size)]);
-        let skipped = judge_copies_with(
-            Floor::control(5 * g),
-            &[pod("fresh", Size::First), pod("old1", Size::Later), pod("old2", Size::Later), ("lost".into(), vec![(PathBuf::from("/gone/x"), Size::Later)])],
-            read,
-        );
+        let copies = [pod("fresh", Size::First), pod("old1", Size::Later), pod("old2", Size::Later), ("lost".into(), vec![(PathBuf::from("/gone/x"), Size::Later)])];
+        let (skipped, taken) = judge_copies_with(core_disk::Ledger::new(Floor::control(5 * g)), &copies, read);
         let names: Vec<&str> = skipped.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["fresh", "lost"]);
         assert!(skipped[0].1.reason.contains("this copy (~4 GB, a first copy, not measured) would leave less"), "{}", skipped[0].1);
         assert!(skipped[1].1.to_string().starts_with("skipped: free space on /gone/x unknown (No such device)"), "{}", skipped[1].1);
+        assert_eq!(taken.get(&1), Some(&(4 * core_disk::LATER_COPY)), "what the admitted ones reserve");
+    }
+
+    /// Two runs at once count each other's copies: an admission reserves its space in the state
+    /// dir until its hold goes; a dry run reserves nothing.
+    #[test]
+    fn a_runs_admitted_copies_are_held_for_other_runs_until_they_end() {
+        let d = std::env::temp_dir().join(format!("arena-disk-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR={}\nCONTROL_MIN_FREE_GB=0\n", d.display()));
+        let path = d.join("devtest").join(core_disk::RESERVATIONS_FILE);
+        let copy = [("devtest-a".to_string(), vec![(d.clone(), Size::Measured(1_000))])];
+        let floor = Floor::control(0);
+        let (skipped, hold) = judge_copies(&cfg, floor, &copy, false);
+        assert!(skipped.is_empty() && !path.exists(), "a dry run holds nothing");
+        drop(hold);
+        let (skipped, hold) = judge_copies(&cfg, floor, &copy, true);
+        assert!(skipped.is_empty());
+        let (held, _) = core_disk::Reservations::load(&path);
+        assert_eq!(held.held.iter().map(|r| (r.pid, r.bytes)).collect::<Vec<_>>(), [(std::process::id(), 1_000)]);
+        // Another run sees it as taken: here, all but 500 bytes of what's free is held elsewhere
+        // too, and a 1 GB copy doesn't fit (whatever else the disk does meanwhile, short of
+        // freeing a GB).
+        let now_free = core_disk::reading(&d).unwrap();
+        let mut r = held.clone();
+        r.hold(std::process::id(), 42, &[(now_free.dev, now_free.free.saturating_sub(500))].into_iter().collect(), arena_core::snapshot::unix_now());
+        r.save(&path).unwrap();
+        let big = [("devtest-b".to_string(), vec![(d.clone(), Size::Measured(core_disk::GB))])];
+        let (skipped, other) = judge_copies(&cfg, floor, &big, true);
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].1.reason.contains("for other copies under way"), "{}", skipped[0].1);
+        drop(other);
+        drop(hold);
+        let (left, _) = core_disk::Reservations::load(&path);
+        assert_eq!(left.held.iter().map(|r| r.token).collect::<Vec<_>>(), [42], "its own let go of, the other's kept");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// `config check`'s look at this box: one row per filesystem arena writes to, ⚠ under the
