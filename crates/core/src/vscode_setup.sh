@@ -75,8 +75,9 @@ trap 'rm -rf "$tmp"' EXIT
 # `always` (a CPU VM: the kernels' models sit in the same RAM as VS Code), a number N = only one
 # with less than N GiB of RAM (MemTotal, or a container's own cgroup limit when that's lower: a
 # container sees its host's MemTotal), unset or 0 = none.
-# (ARENA_MEMINFO, ARENA_CGROUP, ARENA_PROC_CGROUP, and ARENA_SETTINGS_RACE in the merge: a test's
-# stand-ins for /proc/meminfo, /sys/fs/cgroup, /proc/self/cgroup and VS Code; never set on a pod.)
+# (ARENA_MEMINFO, ARENA_CGROUP, ARENA_PROC_CGROUP, ARENA_MOUNTINFO, and ARENA_SETTINGS_RACE in the
+# merge: a test's stand-ins for /proc/meminfo, /sys/fs/cgroup, /proc/self/cgroup, /proc/self/mountinfo
+# and VS Code; never set on a pod.)
 py=""
 for c in "$@"; do
   case $c in "~/"*) c="$HOME/${c#"~/"}" ;; esac
@@ -86,27 +87,35 @@ for c in "$@"; do
   fi
 done
 # `ram_kb`: this machine's RAM in kB, as above; fails when /proc/meminfo can't be read. The
-# memory limits that apply: this process's cgroup's and every one above it (a limit holds for all
-# below it), v2 (`0::<path>` in /proc/self/cgroup) and v1's memory controller, each looked for
-# under the cgroup mount — where a container with a cgroup namespace of its own sees its own at
-# the top (`/`), and one sharing the host's sees it at its path (`/docker/<id>`, …). The lowest wins.
+# memory limits that apply: this process's cgroup's and every one above it that the mount shows (a
+# limit holds for all below it), v2's and v1's memory controller alike. Each hierarchy is found in
+# /proc/self/mountinfo — its mount point, and the cgroup its top is (a container's own, `/` in a
+# namespace of its own; a bind-mounted `/docker/<id>`; a combined `cpu,memory` mount) — and this
+# process's path in it from /proc/self/cgroup. The top of the usual mounts is read too, in case
+# mountinfo can't be. The lowest limit wins.
 ram_kb() {
-  local kb lim f cg=${ARENA_CGROUP:-/sys/fs/cgroup}
+  local kb lim f v1 v2 pc=${ARENA_PROC_CGROUP:-/proc/self/cgroup} cg=${ARENA_CGROUP:-/sys/fs/cgroup}
   kb=$(awk '$1 == "MemTotal:" { printf "%.0f\n", $2; exit }' "${ARENA_MEMINFO:-/proc/meminfo}" 2>/dev/null)
   case $kb in '' | *[!0-9]*) return 1 ;; esac
+  v2=$(awk '/^0::/ { sub(/^0::/, ""); print; exit }' "$pc" 2>/dev/null)
+  v1=$(awk '/^[0-9]+:([^:]*,)?memory(,[^:]*)?:/ { sub(/^[^:]*:[^:]*:/, ""); print; exit }' "$pc" 2>/dev/null)
   while IFS= read -r f; do
     lim=$(awk 'NR == 1 && $1 ~ /^[0-9]+$/ { printf "%.0f\n", $1 / 1024 }' "$f" 2>/dev/null)
     case $lim in '' | *[!0-9]*) continue ;; esac
     [ "$lim" -lt "$kb" ] && kb=$lim
   done < <(
     printf '%s\n' "$cg/memory.max" "$cg/memory/memory.limit_in_bytes"
-    awk -v cg="$cg" '{
-      path = $0; sub(/^[^:]*:[^:]*:/, "", path)
-      if ($0 ~ /^0::/) { base = cg; file = "memory.max" }
-      else if ($0 ~ /^[0-9]+:([^:]*,)?memory(,[^:]*)?:/) { base = cg "/memory"; file = "memory.limit_in_bytes" }
+    # mountinfo: ID PARENT DEV ROOT MOUNTPOINT OPTS [OPTIONAL…] - FSTYPE SOURCE SUPEROPTS
+    awk -v v1="$v1" -v v2="$v2" '{
+      for (i = 7; i <= NF && $i != "-"; i++) ;
+      if ($(i + 1) == "cgroup2" && v2 != "") { path = v2; file = "memory.max" }
+      else if ($(i + 1) == "cgroup" && v1 != "" && ("," $(i + 3) ",") ~ /,memory,/) { path = v1; file = "memory.limit_in_bytes" }
       else next
-      while (path != "" && path != "/") { print base path "/" file; sub(/\/[^\/]*$/, "", path) }
-    }' "${ARENA_PROC_CGROUP:-/proc/self/cgroup}" 2>/dev/null
+      root = $4; mnt = $5
+      if (root != "/") { if (index(path "/", root "/") != 1) next; path = substr(path, length(root) + 1) }
+      while (path != "" && path != "/") { print mnt path "/" file; sub(/\/[^\/]*$/, "", path) }
+      print mnt "/" file
+    }' "${ARENA_MOUNTINFO:-/proc/self/mountinfo}" 2>/dev/null
   )
   echo "$kb"
 }
@@ -158,6 +167,7 @@ import json
 import os
 import re
 import sys
+import time
 
 INTERPRETER = "python.defaultInterpreterPath"
 # The memory-saving settings (a small machine: Pylance + the kernels ran a cx33 out of RAM).
@@ -397,18 +407,39 @@ def exchange(a, b):
     raise OSError(err, os.strerror(err))
 
 
+# Temp files that may hold what VS Code saved (never deleted at the end).
+KEEP = set()
+
+
+def hook(name, target):
+    """A test's stand-in for VS Code saving at this moment: the shell command in env var `name`
+    ($1 = the file). Never set on a pod."""
+    cmd = os.environ.get(name)
+    if cmd:
+        import subprocess
+        subprocess.run(["sh", "-c", cmd, "sh", target], check=False)
+
+
+def peek(p):
+    """read(), with a file that can't be read as None too (it then matches nothing we have)."""
+    try:
+        return read(p)
+    except OSError:
+        return None
+
+
 def put(path, tmp, target, raw, ours):
-    """tmp (the merged text) into target's place - unless target no longer holds `raw` (VS Code
-    saved a participant's change after it was read): then theirs stays. The swap trades the two
-    in one step, so what comes out of target's place is exactly what was there at that moment;
-    anything but `raw` goes straight back (and if VS Code saved again meanwhile, its newest
-    stays). Where a swap can't be done: compare, then rename (a moment's window). A file that
-    wasn't there is created only if it still isn't (a hard link fails if it is)."""
-    race = os.environ.get("ARENA_SETTINGS_RACE")  # a test's stand-in for VS Code saving just now
-    if race:
-        with open(race, "rb") as f, open(target, "wb") as out:
-            out.write(f.read())
+    """tmp (holding `ours`, the merged text) into target's place - unless target no longer holds
+    `raw`, as read: VS Code saved a participant's change since. Theirs is never lost:
+    - a file that wasn't there is created only if it still isn't (a hard link, else O_EXCL);
+    - one that was is swapped with tmp in one step (renameat2 RENAME_EXCHANGE), so what comes
+      out of its place is exactly what was there at that moment. Anything but `raw` is swapped
+      straight back; if what then comes out isn't ours (VS Code saved again meanwhile), it's kept
+      beside it under a name of its own, said, never deleted;
+    - where no such swap can be done, nothing is written (a compare-then-rename has a window in
+      which a save is lost)."""
     changed = "changed while arena merged its settings (re-run setup)"
+    hook("ARENA_SETTINGS_RACE", target)
     if raw is None:
         try:
             os.link(tmp, target)
@@ -417,19 +448,34 @@ def put(path, tmp, target, raw, ours):
             left_alone(path, changed)
         except OSError:
             pass
-    elif exchange(tmp, target):
-        if read(tmp) == raw:
-            return
         try:
-            back = exchange(tmp, target)
-        except OSError:
-            back = False
-        if not back or read(tmp) != ours:
-            os.replace(tmp, target)
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            left_alone(path, changed)
+        with os.fdopen(fd, "wb") as f:
+            f.write(ours)
+        return
+    if os.environ.get("ARENA_SETTINGS_NO_SWAP") or not exchange(tmp, target):
+        left_alone(path, "can't be swapped for the merged one in one step here (renameat2), and a "
+                   "save VS Code made meanwhile would be lost")
+    KEEP.add(tmp)
+    hook("ARENA_SETTINGS_RACE_AGAIN", target)
+    if peek(tmp) == raw:
+        KEEP.discard(tmp)
+        return
+    try:
+        back = exchange(tmp, target)
+    except OSError:
+        back = False
+    if back and peek(tmp) == ours:
+        KEEP.discard(tmp)
         left_alone(path, changed)
-    if read(target) != raw:
-        left_alone(path, changed)
-    os.replace(tmp, target)
+    kept = "%s.arena-kept-%d-%d" % (target, int(time.time()), os.getpid())
+    try:
+        os.rename(tmp, kept)
+    except OSError:
+        kept = tmp
+    left_alone(path, "%s; a save arena couldn't put back is in %s" % (changed, kept))
 
 
 def main():
@@ -464,7 +510,7 @@ def main():
     except OSError as e:
         left_alone(path, "couldn't be written (%s)" % e.strerror)
     finally:
-        if os.path.exists(tmp):
+        if tmp not in KEEP and os.path.exists(tmp):
             os.remove(tmp)
     print("added " + ", ".join(added))
 

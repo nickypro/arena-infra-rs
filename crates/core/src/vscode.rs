@@ -503,14 +503,23 @@ done
 
             /// The machine's RAM as the script reads it: `MemTotal` (kB) in a stand-in
             /// /proc/meminfo, and a stand-in /sys/fs/cgroup with these files (name, contents),
-            /// the process in the namespace's top cgroup (`0::/`).
+            /// the process in the namespace's top cgroup (`0::/`), cgroup v2 mounted there.
             fn ram(&self, mem_total_kb: u64, cgroup: &[(&str, &str)]) {
-                self.ram_in(mem_total_kb, "0::/\n", cgroup);
+                self.ram_in(mem_total_kb, "0::/\n", &[("/", "", "cgroup2", "rw")], cgroup);
             }
 
-            /// [`Self::ram`] with `proc_cgroup` as /proc/self/cgroup.
-            fn ram_in(&self, mem_total_kb: u64, proc_cgroup: &str, cgroup: &[(&str, &str)]) {
+            /// [`Self::ram`] with `proc_cgroup` as /proc/self/cgroup and these cgroup mounts in
+            /// mountinfo: (the cgroup at the mount's top, the mount point under the stand-in
+            /// /sys/fs/cgroup, fstype, super options).
+            fn ram_in(&self, mem_total_kb: u64, proc_cgroup: &str, mounts: &[(&str, &str, &str, &str)], cgroup: &[(&str, &str)]) {
                 std::fs::write(self.root.join("proc-cgroup"), proc_cgroup).unwrap();
+                let cg = self.root.join("cgroup");
+                let mut mountinfo = String::from("22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n");
+                for (i, (top, at, fstype, opts)) in mounts.iter().enumerate() {
+                    let point = if at.is_empty() { cg.clone() } else { cg.join(at) };
+                    mountinfo.push_str(&format!("{} 22 0:{i} {top} {} rw,nosuid shared:9 - {fstype} {fstype} {opts}\n", 30 + i, point.display()));
+                }
+                std::fs::write(self.root.join("mountinfo"), mountinfo).unwrap();
                 std::fs::write(self.root.join("meminfo"), format!("MemTotal:       {mem_total_kb} kB\nMemFree: 1 kB\n")).unwrap();
                 let _ = std::fs::remove_dir_all(self.root.join("cgroup"));
                 for (name, body) in cgroup {
@@ -539,7 +548,8 @@ done
                     .env("STUB_ARCH", uname_m)
                     .env("ARENA_MEMINFO", self.root.join("meminfo"))
                     .env("ARENA_CGROUP", self.root.join("cgroup"))
-                    .env("ARENA_PROC_CGROUP", self.root.join("proc-cgroup"));
+                    .env("ARENA_PROC_CGROUP", self.root.join("proc-cgroup"))
+                    .env("ARENA_MOUNTINFO", self.root.join("mountinfo"));
                 for (k, v) in env {
                     c.env(k, v);
                 }
@@ -857,20 +867,40 @@ done
                 assert!(out.contains(said), "{label}: {out}");
                 assert_eq!(read(), if *on { with_py.clone() } else { only_py.clone() }, "{label}: {out}");
             }
-            // A container sharing the host's cgroup namespace sees its limit at its own path, and
-            // a limit on any cgroup above it holds too (review r1).
-            type Nested<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)], bool);
+            // Where the limit is: found through mountinfo (review r1, r2). A container sharing the
+            // host's cgroup namespace sees its own at its path; a limit on any cgroup above it
+            // holds too; v1 mounts its memory controller alone, combined with another, or with a
+            // container's own cgroup bind-mounted at the top.
+            const V2: &[(&str, &str, &str, &str)] = &[("/", "", "cgroup2", "rw,nsdelegate")];
+            const V1: &[(&str, &str, &str, &str)] = &[("/", "memory", "cgroup", "rw,memory"), ("/", "pids", "cgroup", "rw,pids")];
+            /// (what, /proc/self/cgroup, mounts, files, whether it gets them)
+            type Nested<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str, &'a str, &'a str)], &'a [(&'a str, &'a str)], bool);
             let nested: &[Nested] = &[
-                ("v2, its own", "0::/docker/abc\n", &[("docker/abc/memory.max", "8589934592\n"), ("docker/memory.max", "max\n")], true),
-                ("v2, a parent's", "0::/kubepods/pod1/ctr\n", &[("kubepods/pod1/ctr/memory.max", "max\n"), ("kubepods/pod1/memory.max", "8589934592\n")], true),
-                ("v1, its own", "12:pids:/docker/abc\n9:memory:/docker/abc\n0::/\n", &[("memory/docker/abc/memory.limit_in_bytes", "8589934592\n")], true),
-                ("v1, combined controllers", "4:cpu,memory:/x\n", &[("memory/x/memory.limit_in_bytes", "8589934592\n")], true),
-                ("a VM's login session", "0::/user.slice/user-0.slice/session-3.scope\n", &[("user.slice/memory.max", "max\n")], false),
-                ("a path with no files", "0::/gone/away\n", &[], false),
+                ("v2, its own", "0::/docker/abc\n", V2, &[("docker/abc/memory.max", "8589934592\n"), ("docker/memory.max", "max\n")], true),
+                ("v2, a parent's", "0::/kubepods/pod1/ctr\n", V2, &[("kubepods/pod1/ctr/memory.max", "max\n"), ("kubepods/pod1/memory.max", "8589934592\n")], true),
+                ("v2 mounted elsewhere (hybrid)", "0::/docker/abc\n", &[("/", "unified", "cgroup2", "rw")], &[("unified/docker/abc/memory.max", "8589934592\n")], true),
+                ("v1, its own", "12:pids:/docker/abc\n9:memory:/docker/abc\n0::/\n", V1, &[("memory/docker/abc/memory.limit_in_bytes", "8589934592\n")], true),
+                (
+                    "v1, combined with cpu",
+                    "4:cpu,memory:/x\n",
+                    &[("/", "cpu,memory", "cgroup", "rw,cpu,memory")],
+                    &[("cpu,memory/x/memory.limit_in_bytes", "8589934592\n")],
+                    true,
+                ),
+                (
+                    "v1, its own bind-mounted at the top",
+                    "9:memory:/docker/abc\n",
+                    &[("/docker/abc", "memory", "cgroup", "rw,memory")],
+                    &[("memory/memory.limit_in_bytes", "8589934592\n")],
+                    true,
+                ),
+                ("v1, another controller's mount", "9:memory:/x\n", &[("/", "cpuset", "cgroup", "rw,cpuset")], &[("cpuset/x/memory.limit_in_bytes", "8589934592\n")], false),
+                ("a VM's login session", "0::/user.slice/user-0.slice/session-3.scope\n", V2, &[("user.slice/memory.max", "max\n")], false),
+                ("a path with no files", "0::/gone/away\n", V2, &[], false),
             ];
-            for (label, proc, cgroup, on) in nested {
+            for (label, proc, mounts, cgroup, on) in nested {
                 let _ = std::fs::remove_file(&file);
-                pod.ram_in(512 * GIB, proc, cgroup);
+                pod.ram_in(512 * GIB, proc, mounts, cgroup);
                 let out = ok(&pod.run_low("x86_64", &pod.setup(), below, &[]));
                 assert_eq!(read(), if *on { with_py.clone() } else { only_py.clone() }, "{label}: {out}");
             }
@@ -960,33 +990,78 @@ done
             assert_eq!(v["python.analysis.diagnosticMode"], "openFilesOnly", "{after}");
         }
 
-        /// Review r1: VS Code saving a participant's change while setup merges. What it saved
-        /// stays — the merge is swapped into place in one step, and whatever came out of it that
-        /// isn't what was read goes straight back — and the run says so.
+        /// Review r1, r2: VS Code saving a participant's change while setup merges. What it saved
+        /// is never lost: the merge is swapped into place in one step, whatever comes out that
+        /// isn't what was read goes straight back, and what can't be put back (it saved again
+        /// in between) is kept beside it; a file that appeared meanwhile is never replaced; where
+        /// no such swap can be done nothing is written. Each says so. (The hooks run a command at
+        /// that moment, as VS Code's save.)
         #[test]
         fn a_save_while_merging_is_never_lost() {
             let Some(pod) = Pod::new("race") else { return };
             pod.publish("x64", |j| j);
-            let file = pod.vs().join("data/Machine/settings.json");
-            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            let saved = pod.root.join("their-save.json");
-            std::fs::write(&saved, "{\n    \"workbench.colorTheme\": \"Solarized Light\"\n}\n").unwrap();
-            let race = [("ARENA_SETTINGS_RACE", saved.to_str().unwrap())];
-            // A file that was there…
-            std::fs::write(&file, "{\"editor.fontSize\": 12}").unwrap();
-            let why = warned(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &race));
-            assert!(why.contains("changed while arena merged its settings (re-run setup) - left alone"), "{why}");
-            assert_eq!(pod.settings(), std::fs::read_to_string(&saved).unwrap());
-            // …and one that appeared meanwhile.
-            std::fs::remove_file(&file).unwrap();
-            let why = warned(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &race));
-            assert!(why.contains("changed while arena merged its settings"), "{why}");
-            assert_eq!(pod.settings(), std::fs::read_to_string(&saved).unwrap());
-            let left: Vec<_> = std::fs::read_dir(file.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
-            assert_eq!(left, ["settings.json"], "no temp file left");
-            // The next run merges into what they saved.
+            let dir = pod.vs().join("data/Machine");
+            let file = dir.join("settings.json");
+            std::fs::create_dir_all(&dir).unwrap();
+            let first = "{\n    \"workbench.colorTheme\": \"Solarized Light\"\n}\n";
+            let second = "{\n    \"workbench.colorTheme\": \"Monokai\"\n}\n";
+            std::fs::write(pod.root.join("first.json"), first).unwrap();
+            std::fs::write(pod.root.join("second.json"), second).unwrap();
+            let save = |which: &str| format!("cat '{}' > \"$1\"", pod.root.join(which).display());
+            let (save1, save2) = (save("first.json"), save("second.json"));
+            let files = || -> Vec<String> {
+                let mut v: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+                v.sort();
+                v
+            };
+            let changed = "changed while arena merged its settings (re-run setup)";
+            let fresh = || std::fs::write(&file, "{\"editor.fontSize\": 12}").unwrap();
+
+            // A save just before the swap: it goes back.
+            fresh();
+            let why = warned(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[("ARENA_SETTINGS_RACE", &save1)]));
+            assert!(why.contains(&format!("{changed} - left alone")), "{why}");
+            assert_eq!(pod.settings(), first);
+            assert_eq!(files(), ["settings.json"], "no temp file left");
+
+            // A second save right after the swap: the first goes back, the second is kept beside it.
+            fresh();
+            let why = warned(&pod.run_low(
+                "x86_64",
+                &pod.setup(),
+                LowMemory::Always,
+                &[("ARENA_SETTINGS_RACE", &save1), ("ARENA_SETTINGS_RACE_AGAIN", &save2)],
+            ));
+            assert_eq!(pod.settings(), first);
+            let kept: Vec<String> = files().into_iter().filter(|f| f.starts_with("settings.json.arena-kept-")).collect();
+            assert_eq!(kept.len(), 1, "{:?}", files());
+            assert_eq!(std::fs::read_to_string(dir.join(&kept[0])).unwrap(), second);
+            assert!(why.contains(&format!("{changed}; a save arena couldn't put back is in {}", dir.join(&kept[0]).display())), "{why}");
+            std::fs::remove_file(dir.join(&kept[0])).unwrap();
+
+            // What came out of the swap can't be read (a directory in its place): back it goes.
+            fresh();
+            let why = warned(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[("ARENA_SETTINGS_RACE", "rm \"$1\" && mkdir \"$1\"")]));
+            assert!(why.contains(changed), "{why}");
+            assert!(file.is_dir());
+            std::fs::remove_dir(&file).unwrap();
+            assert_eq!(files(), Vec::<String>::new());
+
+            // A file that appeared meanwhile is never replaced.
+            let why = warned(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[("ARENA_SETTINGS_RACE", &save1)]));
+            assert!(why.contains(changed), "{why}");
+            assert_eq!(pod.settings(), first);
+
+            // Where the swap can't be done: nothing written.
+            fresh();
+            let why = warned(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[("ARENA_SETTINGS_NO_SWAP", "1")]));
+            assert!(why.contains("can't be swapped for the merged one in one step here (renameat2)"), "{why}");
+            assert_eq!(pod.settings(), "{\"editor.fontSize\": 12}");
+            assert_eq!(files(), ["settings.json"]);
+
+            // The next run merges into what's there.
             ok(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[]));
-            assert!(pod.settings().contains("\"workbench.colorTheme\": \"Solarized Light\""));
+            assert!(pod.settings().starts_with("{\"editor.fontSize\": 12,"), "{}", pod.settings());
             assert!(pod.settings().contains("\"python.analysis.indexing\": false"));
         }
 

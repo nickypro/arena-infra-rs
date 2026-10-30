@@ -1533,7 +1533,10 @@ container's own memory limit counting) — a GPU pod with plenty keeps Pylance's
 there only the patterns it doesn't name (one set to `false` stays `false`). The file is edited as
 JSONC, the way VS Code writes it: comments, trailing commas and every byte already there stay, the
 edit is read back before it's written, and a file it can't parse the way VS Code does is left alone
-with a warning. A window already open picks the change up after **Developer: Reload Window**.
+with a warning. It's swapped into place in one step (`renameat2`), so a save VS Code makes meanwhile
+is never lost: that one stays (a second one, if any, kept beside it as
+`settings.json.arena-kept-<time>-<pid>`), with a warning; where no such swap can be done, nothing is
+written. A window already open picks the change up after **Developer: Reload Window**.
 
 Skips whatever is already there; its
 own 300s budget; **best-effort** — a failure or timeout prints a warning (`✓ name (warning: vscode
