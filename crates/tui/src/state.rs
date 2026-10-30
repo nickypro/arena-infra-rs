@@ -10,7 +10,7 @@
 //! `arena snapshot` print. What lives here is only what is the dashboard's own: which cell
 //! gets which colour, how a background deep check's results fold into what is on screen,
 //! how often the provider's slower details query may run, and what `/` marks. The prepaid
-//! balances in the summary bar are `arena_core::balance`'s views, placed by its `tui_parts`.
+//! balances on the top line are `arena_core::balance`'s views, worded by its `inline_account`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -23,7 +23,7 @@ use arena_core::metrics::PodMetrics;
 use arena_core::pod::Maintenance;
 use arena_core::provider::ContainerReset;
 use arena_core::proxy::Listing;
-use arena_core::selector::{Naming, SelectArgs, Selector};
+use arena_core::selector::{Naming, SelectArgs, Selector, PROVIDERS};
 use arena_core::snapshot::{self, cache_key, fmt_age, FleetSnapshot, HealthCache, HealthRecord, ProxyState, SnapshotPod};
 use arena_core::Pod;
 
@@ -137,15 +137,16 @@ pub fn summarize(pods: &[Pod], metrics: &HashMap<String, PodMetrics>) -> FleetSu
     s
 }
 
-/// The summary bar's warning when a provider failed to list: its pods are missing from the
-/// rows and their cost from the fleet total, so the numbers after it are a floor.
+/// The info panel's warning when a provider failed to list (the top line's `⚠ Vast: list
+/// failed`): its pods are missing from the rows and their cost from the fleet total, so the
+/// numbers after it are a floor.
 pub fn partial_notice(partial: &[String]) -> Option<String> {
     (!partial.is_empty())
         .then(|| format!(" ⚠ {} failed to list — its pods (and their cost) are missing ·", partial.join(", ")))
 }
 
-/// The colour of the balance at the front of the summary bar: bad when an account is
-/// critical, warn when one is low; `None` when none leads the bar.
+/// The colour of the balance warning at the front of the info panel's fleet lines: bad when
+/// an account is critical, warn when one is low; `None` when there is none.
 pub fn balance_tone(balance: &[AccountView]) -> Option<Tone> {
     match balance::tui_parts(balance).2 {
         Level::Critical => Some(Tone::Bad),
@@ -154,16 +155,16 @@ pub fn balance_tone(balance: &[AccountView]) -> Option<Tone> {
     }
 }
 
-/// The summary bar: when a provider failed to list, [`partial_notice`] **first** — the bar
-/// is one unwrapped line and its tail is cut on anything narrower than ~160 columns, so a
-/// warning at the end would be invisible exactly when it matters —, then a low or critical
-/// prepaid balance the same way (` ⚠ runpod $1.20 ≈1.9d ·`, `balance::tui_parts`), then
-/// pod/GPU/util counts from the probes, then the fleet's burn exactly as `pods list`'s
-/// footer words it ([`fleet::fleet_footer`]: billing pods only, `$` and Hetzner's `€` kept
-/// apart, unpriced pods called out), the same per day, and last the balances that need
-/// nothing (`balance: runpod $32.54 ≈4.0d · vast ~$118.30 est. ≈49d`). OpenRouter, when its key
-/// is configured, the same way: a warning after the balance's (credit the keys' caps could
-/// spend, keys at their cap), its credit and the cohort's spend today last.
+/// The summary bar as it used to read, now the info panel's fleet lines: every word the top
+/// line ([`top_parts`]) leaves out at a width. When a provider failed to list,
+/// [`partial_notice`] first, then a low or critical prepaid balance the same way (` ⚠ runpod
+/// $1.20 ≈1.9d ·`, `balance::tui_parts`), then pod/GPU/util counts from the probes, then the
+/// fleet's burn exactly as `pods list`'s footer words it ([`fleet::fleet_footer`]: billing pods
+/// only, `$` and Hetzner's `€` kept apart, unpriced pods called out), the same per day, and
+/// last the balances that need nothing (`balance: runpod $32.54 ≈4.0d · vast ~$118.30 est.
+/// ≈49d`). OpenRouter, when its key is configured, the same way: a warning after the
+/// balance's (credit the keys' caps could spend, keys at their cap), its credit and the
+/// cohort's spend today last.
 pub fn summary_text(
     s: &FleetSummary,
     cost: &FleetCost,
@@ -223,92 +224,402 @@ impl Part {
     }
 }
 
-/// The dashboard's top line — title and fleet summary in one, in short words — as its parts,
-/// warnings first: they keep their colours and, the line being cut at the terminal's edge,
-/// always win the space. A provider that failed to list (`⚠ vast failed to list — pods/cost
-/// missing`: the totals after it are a floor), a low or critical prepaid balance (`⚠ runpod
-/// $20.00 ≈47h`, [`balance::tui_parts`]), OpenRouter's (credit under what the keys' caps allow,
-/// keys at their cap — named, [`CohortUsage::capped_names`]). Then pods, GPUs and their mean
-/// util, unreachable pods (yellow), the burn (`$11.56/h + €0.048/h`), the balances that need
-/// nothing (`runpod $32.54 ≈4.0d · vast ~$118.30 est. ≈49d`), the cohort's AI spend today and
-/// the credit left. Every word left out is the info panel's ([`summary_text`] there). Pure.
-pub fn top_parts(s: &FleetSummary, cost: &FleetCost, partial: &[String], balance: &[AccountView], ai: Option<&CohortUsage>) -> Vec<Part> {
-    let money = |x: f64| fleet::fmt_money("$", x);
-    let mut out = Vec::new();
-    if !partial.is_empty() {
-        out.push(Part::toned(format!("⚠ {} failed to list — pods/cost missing", partial.join(", ")), Some(Tone::Warn)));
+/// The warning mark in front of a top-line group that needs looking at — once per group, never
+/// per piece, so the line keeps few symbols. One cell on every terminal: `⚠` in text
+/// presentation, never `⚠️` with its VS16, which some terminals draw two cells wide and others
+/// one, and the line's width-fitting would be off by it. The human (2026-10-30, of icons): "no i
+/// think i like them :) … its just if you have too many then the text sizing becomes pretty
+/// unreliable".
+pub const WARN_MARK: &str = "⚠";
+
+/// The top line laid out for a width ([`top_parts`]): its parts in order, the dim `│` between
+/// groups among them, each in its colour; and the provider/config tag for its right end
+/// (`main.rs`'s `where_tag`) when it still fits beside them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopLine {
+    pub parts: Vec<Part>,
+    pub tag: Option<String>,
+}
+
+#[cfg(test)]
+impl TopLine {
+    /// Its words as the terminal shows them, the tag apart.
+    pub fn text(&self) -> String {
+        self.parts.iter().map(|p| p.text.as_str()).collect()
     }
-    let (first, last, _) = balance::tui_parts(balance);
-    if let Some(first) = first {
-        out.push(Part::toned(first.trim().trim_end_matches('·').trim(), balance_tone(balance)));
+}
+
+/// A string's width in terminal cells, as ratatui measures it when it draws the line.
+fn cells(s: &str) -> usize {
+    ratatui::text::Span::raw(s).width()
+}
+
+/// The dashboard's top line, one line, in groups: the fleet in short (pods, GPUs and their mean
+/// util, unreachable pods in yellow), then one group per provider — its pod count and name, the
+/// account's balance and runway, the burn of its pods (`3 RunPod $120.30 ≈4.1d · $1.20/h`,
+/// Hetzner's `€/h` with no balance) — then OpenRouter's (`$12.40 today · $422.09 left`), a dim
+/// `│` between groups. The human (2026-10-30): "can u make the top bar of balances maybe more
+/// verbally compact / organised?" — it was one `·`-joined list, balances, burn and counts mixed,
+/// and which provider held which pods, cost what, or had how long left took reading all of it.
+///
+/// A group's name is green while all is well, yellow with [`WARN_MARK`] in front when its
+/// account is low, red when critical or when the provider failed to list (`⚠ Vast: list
+/// failed`: its pods are missing); OpenRouter's the same for credit under what the keys' caps
+/// allow, keys at their cap (named, [`CohortUsage::capped_list`]) and credit gone. A provider
+/// with no pods and nothing wrong isn't here (the info panel has its balance).
+///
+/// Built to fit `width`: the line was cut at the terminal's edge, so warnings had to lead it.
+/// Now the least needed words go first, each kind everywhere at once — the `tag` at the right
+/// end, then ([`Cut`]'s order) GPU util, the GPU count, a fine account's runway, today's AI
+/// spend, keys with no cap, a warning's details (`key at cap`, unnamed), the burns, … — and
+/// never a warning or a group's name. Past every cut the worst groups go first (red, yellow,
+/// then the calm names) and those that still don't fit are counted at the end (`+2 more`, in
+/// the worst colour among them), so a warning is never cut off at the edge unsaid. Every word
+/// left out is the info panel's ([`summary_text`] there). Pure.
+pub fn top_parts(
+    s: &FleetSummary,
+    pods: &[Pod],
+    partial: &[String],
+    balance: &[AccountView],
+    ai: Option<&CohortUsage>,
+    tag: Option<&str>,
+    width: usize,
+) -> TopLine {
+    let mut groups = vec![fleet_group(s)];
+    let shares = by_provider(pods);
+    let mut names: Vec<&str> = shares.iter().map(|p| p.provider.as_str()).chain(partial.iter().map(String::as_str)).chain(balance.iter().map(|v| v.account.as_str())).collect();
+    names.sort_by_key(|n| (provider_rank(n), *n));
+    names.dedup();
+    for name in names {
+        let share = shares.iter().find(|p| p.provider == name);
+        let account = balance.iter().find(|v| v.account == name).and_then(balance::inline_account);
+        groups.extend(provider_group(name, share, partial.iter().any(|p| p == name), account));
     }
-    if let Some(ai) = ai {
-        let mut lead = Vec::new();
-        match ai.credit_left {
-            Some(left) if left <= 0.005 => lead.push(format!("‼ AI credit {} — every key's calls fail", money(left))),
-            Some(left) if left < ai.headroom => lead.push(format!("⚠ AI credit {} < caps' {}", money(left), money(ai.headroom))),
-            _ => {}
-        }
-        // One a row carries can be raised from its menu: `a`, then `ai cap` (`a` again).
-        let raisable = ai.capped.iter().any(|k| k.pod);
-        lead.extend(ai.capped_names().map(|n| if raisable { format!("{n} (a → raise cap)") } else { n }));
-        if !lead.is_empty() {
-            out.push(Part::toned(lead.join(" · "), ai_tone(Some(ai))));
+    groups.extend(ai.and_then(openrouter_group));
+    let width_of = |parts: &[Part]| parts.iter().map(|p| cells(&p.text)).sum::<usize>();
+    // The tag goes first: two cells' gap, and one free at the right edge.
+    if let Some(tag) = tag {
+        let parts = lay_out(&groups, None);
+        if width_of(&parts) + 2 + cells(tag) < width {
+            return TopLine { parts, tag: Some(tag.to_string()) };
         }
     }
-    out.push(Part::plain(count_of(s.pods, "pod", "pods")));
-    out.push(Part::plain(match s.mean_util {
-        Some(u) => format!("{} {u}%", count_of(s.total_gpus, "GPU", "GPUs")),
-        None => count_of(s.total_gpus, "GPU", "GPUs"),
-    }));
-    if s.unreachable > 0 {
-        out.push(Part::toned(format!("{} unreachable", s.unreachable), Some(Tone::Warn)));
+    for cut in std::iter::once(None).chain(CUTS.map(Some)) {
+        let parts = lay_out(&groups, cut);
+        if width_of(&parts) <= width {
+            return TopLine { parts, tag: None };
+        }
     }
-    out.push(Part::plain(short_burn(cost)));
-    if let Some(rest) = last {
-        out.push(Part::plain(rest));
+    // Past every cut: the worst first (red, then yellow, then the calm names), and the groups
+    // that still don't fit counted at the end (`+2 more`, in the worst colour among them: the
+    // info panel has them) — never a warning cut off at the edge unsaid.
+    let last = CUTS.last().copied();
+    let tone_of = |severity: u8| [Tone::Bad, Tone::Warn, Tone::Dim][usize::from(severity)];
+    groups.retain(|g| g.iter().any(|p| p.cut.is_none()));
+    groups.sort_by_key(|g| severity(g));
+    for keep in (1..=groups.len()).rev() {
+        let mut parts = lay_out(&groups[..keep], last);
+        let hidden = &groups[keep..];
+        if let Some(worst) = hidden.iter().map(|g| severity(g)).min() {
+            parts.push(Part::toned(" │ ", Some(Tone::Dim)));
+            parts.push(Part::toned(format!("+{} more", hidden.len()), Some(tone_of(worst))));
+        }
+        if width_of(&parts) <= width {
+            return TopLine { parts, tag: None };
+        }
     }
-    if let Some(ai) = ai {
-        let mut tail = Vec::new();
-        if ai.keys > 0 {
-            tail.push(format!("AI {} today", ai.today.map(money).unwrap_or_else(|| "?".into())));
+    // Not even one group whole: how many warnings there are (`⚠ 4 warnings`), else the calm
+    // names cut at the edge.
+    let warned: Vec<u8> = groups.iter().map(|g| severity(g)).filter(|s| *s < 2).collect();
+    match warned.iter().min() {
+        Some(&worst) => TopLine {
+            parts: vec![Part::plain(" "), Part::toned(format!("{WARN_MARK} {}", count_of(warned.len(), "warning", "warnings")), Some(tone_of(worst)))],
+            tag: None,
+        },
+        None => TopLine { parts: lay_out(&groups, last), tag: None },
+    }
+}
+
+/// How bad a group is, worst first when sorted: 0 red (a critical account, a failed listing,
+/// credit gone), 1 yellow, 2 nothing wrong.
+fn severity(g: &[Piece]) -> u8 {
+    let has = |t: Tone| g.iter().any(|p| p.tone == Some(t));
+    if has(Tone::Bad) {
+        0
+    } else if has(Tone::Warn) {
+        1
+    } else {
+        2
+    }
+}
+
+/// What the top line gives up when the terminal is narrow, in this order, each kind in every
+/// group at once (no group reads as if it had no runway while the next shows one). A warning
+/// and a group's name have none: they stay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Cut {
+    /// The fleet's mean GPU util.
+    Util,
+    /// The fleet's GPU count.
+    Gpus,
+    /// The runway of an account that needs nothing.
+    Runway,
+    /// The cohort's AI spend today.
+    Today,
+    /// How many AI keys have no cap.
+    Uncapped,
+    /// A warning's details: it says it in short (`key at cap`, `$9.00 < min`; the names are the
+    /// info panel's, and the `AI$` column's red cells).
+    Long,
+    /// A provider's burn.
+    Burn,
+    /// The balance of an account that needs nothing; OpenRouter's credit (and its `n/a`).
+    Balance,
+    /// A provider's pod count.
+    Count,
+    /// The fleet's pod count.
+    Pods,
+}
+
+const CUTS: [Cut; 10] = [Cut::Util, Cut::Gpus, Cut::Runway, Cut::Today, Cut::Uncapped, Cut::Long, Cut::Burn, Cut::Balance, Cut::Count, Cut::Pods];
+
+/// How a piece joins the one before it in its group: ` `, `, `, `: `, or ` · ` — but a space
+/// after the group's head (`3 RunPod $120.30 ≈4.1d · $1.20/h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Join {
+    Space,
+    Comma,
+    Colon,
+    Dot,
+}
+
+/// A piece of a top-line group: its words, colour, how it joins the one before, when it goes
+/// ([`Cut`]; `None`: never), whether it is the group's head (mark, count, name), and a warning's
+/// words in short, from [`Cut::Long`] on.
+#[derive(Debug, Clone)]
+struct Piece {
+    text: String,
+    tone: Option<Tone>,
+    join: Join,
+    cut: Option<Cut>,
+    head: bool,
+    short: Option<String>,
+}
+
+impl Piece {
+    fn new(text: impl Into<String>, join: Join, cut: Option<Cut>) -> Self {
+        Piece { text: text.into(), tone: None, join, cut, head: false, short: None }
+    }
+
+    fn head(text: impl Into<String>, tone: Option<Tone>, cut: Option<Cut>) -> Self {
+        Piece { text: text.into(), tone, join: Join::Space, cut, head: true, short: None }
+    }
+
+    /// A warning: never cut, said in short (`short`) from [`Cut::Long`] on.
+    fn warning(text: impl Into<String>, short: impl Into<String>, tone: Option<Tone>) -> Self {
+        Piece { short: Some(short.into()), ..Piece::new(text, Join::Dot, None).toned(tone) }
+    }
+
+    fn toned(mut self, tone: Option<Tone>) -> Self {
+        self.tone = tone;
+        self
+    }
+}
+
+/// The groups as parts, without the pieces `cut` (and every [`Cut`] before it) gives up; a
+/// group left with nothing goes, and with it its `│`.
+fn lay_out(groups: &[Vec<Piece>], cut: Option<Cut>) -> Vec<Part> {
+    let mut out = vec![Part::plain(" ")];
+    let mut first = true;
+    for g in groups {
+        let shown: Vec<&Piece> = g.iter().filter(|p| p.cut.is_none_or(|c| Some(c) > cut)).collect();
+        if shown.is_empty() {
+            continue;
         }
-        if let Some(left) = ai.credit_left {
-            tail.push(format!("credit {}", money(left)));
+        if !first {
+            out.push(Part::toned(" │ ", Some(Tone::Dim)));
         }
-        if ai.uncapped > 0 {
-            tail.push(format!("{} uncapped", ai.uncapped));
-        }
-        match (tail.is_empty(), ai.failed) {
-            (true, true) => tail.push("AI n/a".into()),
-            (false, true) => tail.push("(n/a)".into()),
-            _ => {}
-        }
-        if !tail.is_empty() {
-            out.push(Part::plain(tail.join(" · ")));
+        first = false;
+        for (i, p) in shown.iter().enumerate() {
+            if i > 0 {
+                out.push(Part::plain(match p.join {
+                    Join::Space => " ",
+                    Join::Comma => ", ",
+                    Join::Colon => ": ",
+                    Join::Dot if shown[i - 1].head => " ",
+                    Join::Dot => " · ",
+                }));
+            }
+            let text = p.short.as_ref().filter(|_| cut >= Some(Cut::Long)).unwrap_or(&p.text);
+            out.push(Part::toned(text.clone(), p.tone));
         }
     }
     out
 }
 
-/// The fleet's burn in short: `$11.56/h + €0.048/h` (Hetzner's € apart, only when it has a
-/// priced pod), `(2 unpriced)` when some pods have no price — the total is then a floor. The
-/// billing count and the per-day figures are the info panel's ([`fleet::fleet_footer`]). Pure.
-pub fn short_burn(c: &FleetCost) -> String {
-    let mut out = format!("{}/h", fleet::fmt_money("$", c.usd_per_hr));
-    if c.priced_eur > 0 {
-        out.push_str(&format!(" + {}/h", fleet::fmt_money("€", c.eur_per_hr)));
+/// The fleet's group: `51 pods, 48 GPUs 37%`, and `· 2 unreachable` in yellow when some are.
+fn fleet_group(s: &FleetSummary) -> Vec<Piece> {
+    let mut g = vec![Piece::new(count_of(s.pods, "pod", "pods"), Join::Space, Some(Cut::Pods))];
+    g.push(Piece::new(count_of(s.total_gpus, "GPU", "GPUs"), Join::Comma, Some(Cut::Gpus)));
+    if let Some(u) = s.mean_util {
+        g.push(Piece::new(format!("{u}%"), Join::Space, Some(Cut::Util)));
     }
+    if s.unreachable > 0 {
+        g.push(Piece::new(format!("{} unreachable", s.unreachable), Join::Dot, None).toned(Some(Tone::Warn)));
+    }
+    g
+}
+
+/// A provider's group (see [`top_parts`]), or `None` when it has no pods and nothing wrong.
+/// `account`: its prepaid account's words ([`balance::inline_account`]; none for Hetzner, or
+/// before the first read).
+fn provider_group(provider: &str, share: Option<&ProviderShare>, failed: bool, account: Option<balance::InlineAccount>) -> Option<Vec<Piece>> {
+    let level = account.as_ref().map(|a| a.level);
+    let low = matches!(level, Some(Level::Low | Level::Critical));
+    let pods = share.map_or(0, |p| p.pods);
+    if pods == 0 && !failed && !low {
+        return None;
+    }
+    let tone = match level {
+        _ if failed => Some(Tone::Bad),
+        Some(Level::Critical) => Some(Tone::Bad),
+        Some(Level::Low) => Some(Tone::Warn),
+        // No balance while it burns, or pods nobody priced: not well, not a warning either.
+        Some(Level::Unknown) => None,
+        _ => Some(Tone::Good),
+    };
+    let mut g = Vec::new();
+    if failed || low {
+        g.push(Piece::head(WARN_MARK, tone, None));
+    }
+    if pods > 0 {
+        g.push(Piece::head(pods.to_string(), tone, Some(Cut::Count)));
+    }
+    g.push(Piece::head(provider_title(provider), tone, None));
+    if failed {
+        g.push(Piece::new("list failed", Join::Colon, None).toned(Some(Tone::Bad)));
+    }
+    // The amount and its runway side by side, as one (`$120.30 ≈4.1d`); a low or critical
+    // account's are the warning: they stay, in its colour.
+    let warn = if low { tone } else { None };
+    let unless_low = |c: Cut| (!low).then_some(c);
+    if let Some(a) = account {
+        g.push(Piece::new(a.amount, Join::Dot, unless_low(Cut::Balance)).toned(warn));
+        g.extend(a.runway.map(|r| {
+            let short = (r == balance::UNDER_MINIMUM).then(|| "< min".to_string());
+            Piece { short, ..Piece::new(r, Join::Space, unless_low(Cut::Runway)).toned(warn) }
+        }));
+    }
+    if let Some(cost) = share.map(|p| &p.cost).filter(|c| c.billing > 0) {
+        g.push(Piece::new(provider_burn(provider, cost), Join::Dot, Some(Cut::Burn)));
+    }
+    Some(g)
+}
+
+/// OpenRouter's group (see [`top_parts`]): its warnings, the cohort's spend today, the credit
+/// left, keys with no cap, `n/a` when the last read failed (the numbers are the last good ones).
+/// `None` when there is nothing to say.
+fn openrouter_group(ai: &CohortUsage) -> Option<Vec<Piece>> {
+    let money = |x: f64| fleet::fmt_money("$", x);
+    // (the warning, in short)
+    let mut warnings = Vec::new();
+    let mut tone = if ai.failed { None } else { Some(Tone::Good) };
+    match ai.credit_left {
+        Some(left) if left <= 0.005 => {
+            warnings.push((format!("{} left, calls fail", money(left)), format!("{} left", money(left))));
+            tone = Some(Tone::Bad);
+        }
+        Some(left) if left < ai.headroom => {
+            warnings.push((format!("{} left < caps' {}", money(left), money(ai.headroom)), format!("{} left", money(left))));
+            tone = Some(Tone::Warn);
+        }
+        _ => {}
+    }
+    // The credit, when its warning hasn't said it.
+    let credit = ai.credit_left.filter(|_| warnings.is_empty());
+    if let Some(list) = ai.capped_list() {
+        // One a row carries can be raised from its menu: `a`, then `ai cap` (`a` again).
+        let raise = if ai.capped.iter().any(|k| k.pod) { " (a → raise cap)" } else { "" };
+        let keys = match ai.capped.len() {
+            1 => "key".to_string(),
+            n => format!("{n} keys"),
+        };
+        warnings.push((format!("{keys} at cap: {list}{raise}"), format!("{keys} at cap")));
+        if tone != Some(Tone::Bad) {
+            tone = Some(Tone::Warn);
+        }
+    }
+    let mut g = Vec::new();
+    if !warnings.is_empty() {
+        g.push(Piece::head(WARN_MARK, tone, None));
+    }
+    g.push(Piece::head("OpenRouter", tone, None));
+    let warned = !warnings.is_empty();
+    g.extend(warnings.into_iter().map(|(long, short)| Piece::warning(long, short, tone)));
+    if ai.keys > 0 {
+        g.push(Piece::new(format!("{} today", ai.today.map(money).unwrap_or_else(|| "?".into())), Join::Dot, Some(Cut::Today)));
+    }
+    if let Some(left) = credit {
+        g.push(Piece::new(format!("{} left", money(left)), Join::Dot, Some(Cut::Balance)));
+    }
+    if ai.uncapped > 0 {
+        g.push(Piece::new(format!("{} uncapped", ai.uncapped), Join::Dot, Some(Cut::Uncapped)));
+    }
+    if ai.failed {
+        g.push(Piece::new("n/a", Join::Dot, Some(Cut::Balance)));
+    }
+    let said = ai.keys > 0 || ai.credit_left.is_some() || ai.failed || warned;
+    said.then_some(g)
+}
+
+/// A provider's burn in short, in its currency: `$1.20/h`, `€0.011/h`, and `(2 unpriced)` when
+/// some of its billing pods have no price — the figure is then a floor. Pure.
+fn provider_burn(provider: &str, c: &FleetCost) -> String {
+    let symbol = fleet::currency_symbol(provider);
+    let per_hr = if symbol == "€" { c.eur_per_hr } else { c.usd_per_hr };
+    let mut out = format!("{}/h", fleet::fmt_money(symbol, per_hr));
     if c.unpriced > 0 {
         out.push_str(&format!(" ({} unpriced)", c.unpriced));
     }
     out
 }
 
+/// One provider's share of the fleet: its pods (listed, billing or not) and what they burn —
+/// [`fleet::fleet_cost`] over its pods alone, the same pricing as the fleet's total and `pods
+/// list`'s footer, never a second one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderShare {
+    pub provider: String,
+    pub pods: usize,
+    pub cost: FleetCost,
+}
+
+/// The fleet by provider, those with pods: RunPod, Vast, Hetzner, Shadeform (the selector's
+/// order), any other after them by name — a group never moves as the counts change. Pure.
+pub fn by_provider(pods: &[Pod]) -> Vec<ProviderShare> {
+    let mut names: Vec<&str> = pods.iter().map(|p| p.provider.as_str()).collect();
+    names.sort_by_key(|n| (provider_rank(n), *n));
+    names.dedup();
+    names
+        .into_iter()
+        .map(|name| {
+            let mine = || pods.iter().filter(move |p| p.provider == name);
+            ProviderShare { provider: name.to_string(), pods: mine().count(), cost: fleet::fleet_cost(mine()) }
+        })
+        .collect()
+}
+
+/// Where a provider goes in the top line: [`PROVIDERS`]' order, any other after.
+fn provider_rank(provider: &str) -> usize {
+    PROVIDERS.iter().position(|p| *p == provider).unwrap_or(PROVIDERS.len())
+}
+
 /// The refresh's status: the footer's short form and its colour (`ok · API 13/min`, `warn: RunPod
 /// rate limit +1`, `list error`, `reading 3 pods…`) and the whole line, for the info panel. Plain
 /// words, no symbols: some terminals draw `✓`/`⚠` as emoji pictures (the human, 2026-10-30:
-/// "i'd slightly prefer if it was all normal text").
+/// "i'd slightly prefer if it was all normal text"; later, of icons, "its just if you have too
+/// many then the text sizing becomes pretty unreliable" — the footer keeps one, its refresh
+/// mark).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RefreshStatus {
     pub short: String,
@@ -361,7 +672,7 @@ pub fn warning_label(w: &str) -> String {
     }
 }
 
-/// The colour of the OpenRouter warning in the summary bar (`None`: there's none).
+/// The colour of the OpenRouter warning in the info panel (`None`: there's none).
 pub fn ai_tone(ai: Option<&CohortUsage>) -> Option<Tone> {
     match ai.map(|a| a.tui_parts())? {
         (Some(_), _, Fill::Full) => Some(Tone::Bad),
@@ -1533,45 +1844,218 @@ mod tests {
         assert!(!summary_text(&s, &cost, &[], &[], None).contains("openrouter"));
     }
 
-    /// The top line in short words: warnings first, each in its tone (a failed listing, a low
-    /// balance, OpenRouter's), then pods, GPUs and util, unreachable (yellow), the burn, the
-    /// balances that need nothing, the AI spend and credit. Every word dropped is still in
-    /// [`summary_text`] (the info panel's).
+    fn pod_on(provider: &str, name: &str, cost: Option<f64>) -> Pod {
+        Pod { provider: provider.into(), ..pod(name, cost) }
+    }
+
+    fn fleet_of(pods: usize, total_gpus: usize, mean_util: Option<u32>) -> FleetSummary {
+        FleetSummary { pods, total_gpus, mean_util, ..Default::default() }
+    }
+
+    /// The top line with room for every word, no tag.
+    fn top(s: &FleetSummary, pods: &[Pod], partial: &[&str], balance: &[AccountView], ai: Option<&CohortUsage>) -> TopLine {
+        let partial: Vec<String> = partial.iter().map(|p| p.to_string()).collect();
+        top_parts(s, pods, &partial, balance, ai, None, 400)
+    }
+
+    /// The colours of the parts reading `text`, in order.
+    fn tones(line: &TopLine, text: &str) -> Vec<Option<Tone>> {
+        line.parts.iter().filter(|p| p.text == text).map(|p| p.tone).collect()
+    }
+
+    /// A calm fleet: the fleet in short, then a group per provider with pods — count and name in
+    /// green, balance and runway, burn; Hetzner's € with no balance — then OpenRouter's, a dim `│`
+    /// between groups and no mark anywhere. An account with no pods and nothing wrong (Vast here,
+    /// Shadeform's wallet unfunded on purpose) is the info panel's.
     #[test]
-    fn top_parts_are_short_and_warnings_lead() {
-        let text = |parts: &[Part]| parts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join(" · ");
+    fn the_top_line_groups_a_calm_fleet_by_provider() {
+        use balance::Account;
+        let pods = [pod("arena8-a", Some(0.40)), pod("arena8-b", Some(0.40)), pod("arena8-c", Some(0.40)), pod_on("hetzner", "arena8-cpu", Some(0.0056))];
+        let ok = balances(&[(Account::Runpod, 120.30, 1.20), (Account::Vast, 90.0, 0.0), (Account::Shadeform, 0.0, 0.0)]);
+        let calm = CohortUsage { keys: 2, today: Some(12.4), credit_left: Some(422.09), headroom: 8.0, ..Default::default() };
+        let line = top(&fleet_of(4, 3, Some(37)), &pods, &[], &ok, Some(&calm));
+        assert_eq!(line.text(), " 4 pods, 3 GPUs 37% │ 3 RunPod $120.30 ≈4.1d · $1.20/h │ 1 Hetzner €0.006/h │ OpenRouter $12.40 today · $422.09 left");
+        for name in ["3", "RunPod", "1", "Hetzner", "OpenRouter"] {
+            assert_eq!(tones(&line, name), [Some(Tone::Good)], "{name}");
+        }
+        assert_eq!(tones(&line, " │ "), [Some(Tone::Dim); 3]);
+        assert!(line.parts.iter().all(|p| matches!(p.tone, None | Some(Tone::Good | Tone::Dim))), "{line:?}");
+        assert_eq!(line.tag, None);
+        // No OpenRouter key, no GPU read yet: neither said.
+        assert_eq!(top(&fleet_of(4, 0, None), &pods, &[], &[], None).text(), " 4 pods, 0 GPUs │ 3 RunPod $1.20/h │ 1 Hetzner €0.006/h");
+        assert_eq!(top(&FleetSummary::default(), &[], &[], &ok, None).text(), " 0 pods, 0 GPUs");
+    }
+
+    /// A low account: its group's mark and name in yellow, and its balance and runway (the
+    /// warning: never cut) too, the burn plain; critical in red; an account with no pods there
+    /// shows all the same. No reading while it burns: a `?`, neither green nor a warning.
+    #[test]
+    fn a_low_or_critical_account_marks_its_group() {
+        use balance::Account;
+        let pods = [pod("arena8-a", Some(0.40)), pod("arena8-b", Some(0.40)), pod("arena8-c", Some(0.40))];
+        let s = fleet_of(3, 3, Some(37));
+        let low = balances(&[(Account::Runpod, 30.0, 0.5), (Account::Vast, 3.0, 0.5)]); // 60h, 6h
+        let line = top(&s, &pods, &[], &low, None);
+        assert_eq!(line.text(), " 3 pods, 3 GPUs 37% │ ⚠ 3 RunPod $30.00 ≈2.5d · $1.20/h │ ⚠ Vast $3.00 ≈6.0h");
+        assert_eq!(tones(&line, WARN_MARK), [Some(Tone::Warn), Some(Tone::Bad)]);
+        for (text, tone) in [("3", Tone::Warn), ("RunPod", Tone::Warn), ("$30.00", Tone::Warn), ("≈2.5d", Tone::Warn), ("Vast", Tone::Bad), ("$3.00", Tone::Bad), ("≈6.0h", Tone::Bad)] {
+            assert_eq!(tones(&line, text), [Some(tone)], "{text}");
+        }
+        assert_eq!(tones(&line, "$1.20/h"), [None], "the burn isn't the warning");
+        // RunPod's account under its minimum: said so, beside the amount.
+        let mut under = balances(&[(Account::Runpod, 9.0, 0.01)]);
+        (under[0].under_balance, under[0].level) = (Some(true), Level::Critical);
+        assert_eq!(top(&s, &pods, &[], &under, None).text(), " 3 pods, 3 GPUs 37% │ ⚠ 3 RunPod $9.00 under its minimum · $1.20/h");
+        let policy = balance::BalancePolicy::default();
+        let unread = balance::views(&balance::BalanceState::default(), &[balance::Fetched::nothing(Account::Runpod, "fp")], &balance::Burns::new(), &policy, balance::Mode::Inline, 1_791_460_800);
+        let line = top(&s, &pods, &[], &unread, None);
+        assert_eq!(line.text(), " 3 pods, 3 GPUs 37% │ 3 RunPod ? · $1.20/h");
+        assert_eq!(tones(&line, "RunPod"), [None]);
+    }
+
+    /// A provider that failed to list: its group in red, `⚠ Vast: list failed` — its pods and
+    /// their cost are missing — with its balance as read; with no account, just that.
+    #[test]
+    fn a_failed_listing_marks_its_provider_in_red() {
+        use balance::Account;
+        let pods = [pod("arena8-a", Some(0.40))];
+        let fine = balances(&[(Account::Vast, 90.0, 0.0)]);
+        let line = top(&fleet_of(1, 1, Some(5)), &pods, &["hetzner", "vast"], &fine, None);
+        assert_eq!(line.text(), " 1 pod, 1 GPU 5% │ 1 RunPod $0.40/h │ ⚠ Vast: list failed · $90.00 no burn │ ⚠ Hetzner: list failed");
+        assert_eq!(tones(&line, WARN_MARK), [Some(Tone::Bad); 2]);
+        assert_eq!(tones(&line, "list failed"), [Some(Tone::Bad); 2]);
+        assert_eq!((tones(&line, "Vast"), tones(&line, "Hetzner")), (vec![Some(Tone::Bad)], vec![Some(Tone::Bad)]));
+        assert_eq!(tones(&line, "$90.00"), [None], "a balance that needs nothing stays plain");
+    }
+
+    /// OpenRouter's group: credit under what the keys' caps allow (yellow), keys at their cap
+    /// (named, `(a → raise cap)` when a row carries one), credit gone (red), `n/a` after a failed
+    /// read; nothing to say, or no provisioning key: no group.
+    #[test]
+    fn openrouter_warnings_mark_its_group() {
+        let s = fleet_of(1, 1, None);
         let pods = [pod("arena8-apple", Some(0.40))];
-        let mut s = summarize(&pods, &HashMap::new());
-        let cost = fleet::fleet_cost(&pods);
+        let group = |c: &CohortUsage| {
+            let line = top(&s, &pods, &[], &[], Some(c));
+            (line.text().rsplit(" │ ").next().unwrap().to_string(), tones(&line, "OpenRouter")[0])
+        };
         let calm = CohortUsage { keys: 2, today: Some(1.5), credit_left: Some(422.09), headroom: 8.0, ..Default::default() };
-        let parts = top_parts(&s, &cost, &[], &[], Some(&calm));
-        assert_eq!(text(&parts), "1 pod · 0 GPUs · $0.40/h · AI $1.50 today · credit $422.09");
-        assert!(parts.iter().all(|p| p.tone.is_none()), "{parts:?}");
-        // Warnings: a failed listing, OpenRouter's (credit under the caps, keys at cap), unreachable.
+        assert_eq!(group(&calm), ("OpenRouter $1.50 today · $422.09 left".into(), Some(Tone::Good)));
         let capped = |name: &str, pod: bool| arena_core::openrouter::CappedKey { name: name.into(), pod };
         let short = CohortUsage { credit_left: Some(5.0), capped: vec![capped("arena8-gone", false)], uncapped: 1, failed: true, ..calm.clone() };
-        s.unreachable = 2;
-        s.total_gpus = 3;
-        s.mean_util = Some(41);
-        let parts = top_parts(&s, &cost, &["vast".to_string()], &[], Some(&short));
         assert_eq!(
-            text(&parts),
-            "⚠ vast failed to list — pods/cost missing · ⚠ AI credit $5.00 < caps' $8.00 · ⚠ AI key at cap: arena8-gone (no pod) · 1 pod · 3 GPUs 41% · 2 unreachable · $0.40/h · AI $1.50 today · credit $5.00 · 1 uncapped · (n/a)"
+            group(&short),
+            ("⚠ OpenRouter $5.00 left < caps' $8.00 · key at cap: arena8-gone (no pod) · $1.50 today · 1 uncapped · n/a".into(), Some(Tone::Warn))
         );
-        let tones: Vec<Option<Tone>> = parts.iter().map(|p| p.tone).collect();
-        assert_eq!(tones[..2], [Some(Tone::Warn), Some(Tone::Warn)]);
-        assert_eq!(tones[4], Some(Tone::Warn), "unreachable");
+        let raisable = CohortUsage { capped: vec![capped("arena8-apple", true), capped("arena8-gone", false)], ..calm.clone() };
+        assert_eq!(group(&raisable).0, "⚠ OpenRouter 2 keys at cap: arena8-apple, arena8-gone (no pod) (a → raise cap) · $1.50 today · $422.09 left");
         let gone = CohortUsage { credit_left: Some(0.0), ..calm.clone() };
-        let parts = top_parts(&s, &cost, &[], &[], Some(&gone));
-        assert_eq!((parts[0].text.as_str(), parts[0].tone), ("‼ AI credit $0.00 — every key's calls fail", Some(Tone::Bad)));
-        // No OpenRouter key: nothing about AI.
-        assert!(!text(&top_parts(&s, &cost, &[], &[], None)).contains("AI"));
-        // Hetzner's € apart, the unpriced said.
-        let mut hetzner = pod("arena8-cpu", Some(0.0056));
-        hetzner.provider = "hetzner".into();
-        let both = [pod("arena8-apple", Some(0.40)), hetzner, pod("arena8-new", None)];
-        assert_eq!(short_burn(&fleet::fleet_cost(&both)), "$0.40/h + €0.006/h (1 unpriced)");
-        assert_eq!(short_burn(&fleet::fleet_cost(&[])), "$0.00/h");
+        assert_eq!(group(&gone), ("⚠ OpenRouter $0.00 left, calls fail · $1.50 today".into(), Some(Tone::Bad)));
+        assert_eq!(group(&CohortUsage { failed: true, ..Default::default() }), ("OpenRouter n/a".into(), None));
+        assert!(!top(&s, &pods, &[], &[], Some(&CohortUsage::default())).text().contains("OpenRouter"));
+        assert!(!top(&s, &pods, &[], &[], None).text().contains("OpenRouter"));
+    }
+
+    /// Each provider's burn is `fleet_cost` over its pods alone, in its currency: Hetzner's €
+    /// (a powered-off server still bills), unpriced pods counted — the figure is then a floor —,
+    /// a stopped pod counted but not billing. The shares add up to the fleet's.
+    #[test]
+    fn each_provider_burns_in_its_currency_and_counts_its_unpriced() {
+        let mut off = pod_on("hetzner", "arena8-cpu2", Some(0.0056));
+        off.status = "off".into();
+        let mut exited = pod_on("vast", "arena8-v", Some(0.20));
+        exited.status = "EXITED".into();
+        let pods = [pod_on("shadeform", "arena8-s", Some(1.0)), pod("arena8-a", Some(0.40)), pod_on("hetzner", "arena8-cpu", Some(0.0056)), exited, pod("arena8-new", None), off];
+        let shares = by_provider(&pods);
+        assert_eq!(shares.iter().map(|p| (p.provider.as_str(), p.pods)).collect::<Vec<_>>(), [("runpod", 2), ("vast", 1), ("hetzner", 2), ("shadeform", 1)]);
+        let total = fleet::fleet_cost(&pods);
+        let sum = |f: fn(&FleetCost) -> f64| shares.iter().map(|p| f(&p.cost)).sum::<f64>();
+        assert!((sum(|c| c.usd_per_hr) - total.usd_per_hr).abs() < 1e-9 && (sum(|c| c.eur_per_hr) - total.eur_per_hr).abs() < 1e-9);
+        assert_eq!(shares.iter().map(|p| (p.cost.billing, p.cost.unpriced)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1)), (total.billing, total.unpriced));
+        assert_eq!(
+            top(&fleet_of(6, 2, None), &pods, &[], &[], None).text(),
+            " 6 pods, 2 GPUs │ 2 RunPod $0.40/h (1 unpriced) │ 1 Vast │ 2 Hetzner €0.011/h │ 1 Shadeform $1.00/h"
+        );
+    }
+
+    /// A cohort's fleet at 160, 120, 100 and 80 columns: the least needed words go first, each
+    /// kind in every group at once; the warnings (a low account, a key at its cap) and every
+    /// group's name stay; the tag only while everything fits beside it. With a third warning
+    /// (unreachable pods) it still fits 80 columns; narrower, past every cut, the warnings go
+    /// first and the groups that don't fit are counted.
+    #[test]
+    fn the_top_line_fits_its_width_and_keeps_the_warnings() {
+        use balance::Account;
+        let mut pods: Vec<Pod> = (0..42).map(|i| pod(&format!("devtest-r{i}"), Some(0.11))).collect();
+        pods.extend((0..9).map(|i| pod_on("hetzner", &format!("devtest-h{i}"), Some(0.1367))));
+        let mut s = fleet_of(51, 48, Some(37));
+        let accounts = balances(&[(Account::Runpod, 520.30, 4.62), (Account::Vast, 40.0, 1.0)]); // ≈112h, 40h
+        let capped = arena_core::openrouter::CappedKey { name: "devtest-demo05".into(), pod: true };
+        let ai = CohortUsage { keys: 51, today: Some(12.4), credit_left: Some(422.09), headroom: 200.0, capped: vec![capped], ..Default::default() };
+        let tag = "vast · ~/sandbox/config.env";
+        let at = |s: &FleetSummary, w: usize| top_parts(s, &pods, &[], &accounts, Some(&ai), Some(tag), w);
+        let whole = at(&s, 240);
+        assert_eq!(
+            (whole.text().as_str(), whole.tag.as_deref()),
+            (" 51 pods, 48 GPUs 37% │ 42 RunPod $520.30 ≈4.6d · $4.62/h │ ⚠ Vast $40.00 ≈40h │ 9 Hetzner €1.23/h │ ⚠ OpenRouter key at cap: devtest-demo05 (a → raise cap) · $12.40 today · $422.09 left", Some(tag))
+        );
+        for (w, want) in [
+            (160, " 51 pods │ 42 RunPod $520.30 · $4.62/h │ ⚠ Vast $40.00 ≈40h │ 9 Hetzner €1.23/h │ ⚠ OpenRouter key at cap: devtest-demo05 (a → raise cap) · $422.09 left"),
+            (120, " 51 pods │ 42 RunPod $520.30 · $4.62/h │ ⚠ Vast $40.00 ≈40h │ 9 Hetzner €1.23/h │ ⚠ OpenRouter key at cap · $422.09 left"),
+            (100, " 51 pods │ 42 RunPod │ ⚠ Vast $40.00 ≈40h │ 9 Hetzner │ ⚠ OpenRouter key at cap"),
+            (80, " 51 pods │ 42 RunPod │ ⚠ Vast $40.00 ≈40h │ 9 Hetzner │ ⚠ OpenRouter key at cap"),
+        ] {
+            let line = at(&s, w);
+            assert_eq!(line.text(), want, "{w}");
+            assert!(cells(&line.text()) <= w && line.tag.is_none(), "{w}");
+        }
+        s.unreachable = 2;
+        for w in [80, 100, 120, 160] {
+            let text = at(&s, w).text();
+            for warning in ["2 unreachable", "⚠ Vast $40.00 ≈40h", "⚠ OpenRouter key at cap"] {
+                assert!(text.chars().take(w).collect::<String>().contains(warning), "{w}: {warning:?} in {text}");
+            }
+        }
+        assert_eq!(at(&s, 80).text(), " 2 unreachable │ RunPod │ ⚠ Vast $40.00 ≈40h │ Hetzner │ ⚠ OpenRouter key at cap");
+        // Narrower, past every cut: the warnings first, the rest counted.
+        let line = at(&s, 72);
+        assert_eq!(line.text(), " 2 unreachable │ ⚠ Vast $40.00 ≈40h │ ⚠ OpenRouter key at cap │ +2 more");
+        assert_eq!(tones(&line, "+2 more"), [Some(Tone::Dim)], "only calm names left out");
+        let line = at(&s, 60);
+        assert_eq!(line.text(), " 2 unreachable │ ⚠ Vast $40.00 ≈40h │ +3 more");
+        assert_eq!(tones(&line, "+3 more"), [Some(Tone::Warn)], "a warning among them");
+    }
+
+    /// More warnings than 80 columns hold whole (codex's case): two unreachable pods, RunPod's
+    /// account under its minimum, Vast's critical, Hetzner's listing failed. Past every cut the
+    /// red ones go first, in short (`$9.00 < min`), and what still doesn't fit is counted at the
+    /// end in the worst colour among it — `+1 more` in yellow, `+2 more` in red; narrower than
+    /// a group and its count, `⚠ 4 warnings` alone.
+    #[test]
+    fn many_warnings_go_worst_first_and_the_rest_are_counted() {
+        use balance::Account;
+        let pods = [pod("arena8-a", Some(0.40)), pod("arena8-b", Some(0.40)), pod("arena8-c", Some(0.40))];
+        let s = FleetSummary { unreachable: 2, ..fleet_of(3, 3, Some(37)) };
+        let mut accounts = balances(&[(Account::Runpod, 9.0, 0.01), (Account::Vast, 3.0, 0.5)]);
+        (accounts[0].under_balance, accounts[0].level) = (Some(true), Level::Critical);
+        let partial = ["hetzner".to_string()];
+        let at = |w: usize| top_parts(&s, &pods, &partial, &accounts, None, None, w);
+        assert_eq!(
+            at(400).text(),
+            " 3 pods, 3 GPUs 37% · 2 unreachable │ ⚠ 3 RunPod $9.00 under its minimum · $1.20/h │ ⚠ Vast $3.00 ≈6.0h │ ⚠ Hetzner: list failed"
+        );
+        let line = at(80);
+        assert_eq!(line.text(), " ⚠ RunPod $9.00 < min │ ⚠ Vast $3.00 ≈6.0h │ ⚠ Hetzner: list failed │ +1 more");
+        assert_eq!(tones(&line, "+1 more"), [Some(Tone::Warn)]);
+        let line = at(56);
+        assert_eq!(line.text(), " ⚠ RunPod $9.00 < min │ ⚠ Vast $3.00 ≈6.0h │ +2 more");
+        assert_eq!(tones(&line, "+2 more"), [Some(Tone::Bad)], "a red one among them");
+        assert_eq!(at(40).text(), " ⚠ RunPod $9.00 < min │ +3 more");
+        // Narrower than one group and the count: the count of warnings alone, in the worst colour.
+        let line = at(20);
+        assert_eq!((line.text().as_str(), tones(&line, "⚠ 4 warnings")[0]), (" ⚠ 4 warnings", Some(Tone::Bad)));
+        let calm = top_parts(&fleet_of(3, 3, None), &pods, &[], &[], None, None, 5);
+        assert_eq!(calm.text(), " RunPod", "nothing wrong: the edge cuts the calm names");
     }
 
     /// The footer's short status: the first warning's words (yellow) and how many more; else `ok`
