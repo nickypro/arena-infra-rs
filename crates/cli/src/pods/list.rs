@@ -9,7 +9,8 @@ use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
 use crate::pods::each_pod;
-use crate::{money, reap, spend, ssh_config_lines};
+use crate::ssh_config::ssh_config_lines;
+use crate::{money, reap, spend};
 
 /// How long `pods list` waits for the best-effort pod details before rendering without them.
 pub(crate) const ENRICH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
