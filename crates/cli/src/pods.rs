@@ -8,6 +8,7 @@ use arena_core::remote::{describe_error, Remote};
 use arena_core::ssh::SshTarget;
 
 pub(crate) mod list;
+pub(crate) mod pull;
 pub(crate) mod selection;
 
 // Per-call SSH budgets (PLAN 1.B). Every pod-SSH call is bounded so one wedged pod can
