@@ -454,7 +454,8 @@ fn pods_table(f: &mut Frame, status: &Status, ui: &Ui, view: &View, area: Rect, 
         .collect();
     let header = Row::new(vec!["  POD".to_string(), "GIT".into(), "HOME COPY".into(), "ARCHIVE".into(), format!("WHY  ({}: o)", view.order.words())])
     .style(tone_style(Tone::Dim));
-    let widths = [Constraint::Length(name_w.max(14) as u16 + 2), Constraint::Length(20), Constraint::Length(26), Constraint::Length(22), Constraint::Min(10)];
+    // A cell's longest: `✗ failed 13m (ok 58m)`, `✓ 3.6 GB · w3d5 12m`, `✓ w3d5 + all files 33m`.
+    let widths = [Constraint::Length(name_w.max(14) as u16 + 2), Constraint::Length(23), Constraint::Length(24), Constraint::Length(24), Constraint::Min(10)];
     let table = Table::new(rows, widths)
         .header(header)
         .row_highlight_style(Style::default().bg(Color::Indexed(237)).add_modifier(Modifier::BOLD))
