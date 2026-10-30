@@ -1005,9 +1005,9 @@ enum PodCmd {
     /// Exits non-zero unless every requested name is READY. A pod that fails is left running
     /// (Shadeform: deleted, since it can't be stopped and bills until then).
     ///
-    /// A pod that never gets an SSH endpoint — up without one for --endpoint-timeout (RunPod:
-    /// behind its SSH proxy only), or still listed running without one at --timeout — is
-    /// TERMINATED and its name recreated with the same options, up to --check-attempts.
+    /// A pod up without an SSH endpoint for --endpoint-timeout (RunPod: behind its SSH proxy
+    /// only, a host with no public IP) is TERMINATED and its name recreated with the same
+    /// options, up to --check-attempts. One still coming up at --timeout is left running.
     ///
     /// --check: a pod that FAILs the deep check on its host (driver, CUDA, GPU) is TERMINATED and
     /// its name recreated, up to --check-attempts. A software/setup failure isn't replaced.
@@ -1081,8 +1081,8 @@ enum PodCmd {
         /// Placements per name, the first create included (2 = one retry)
         ///
         /// Bounds replacing a pod that FAILs --check on its host (the last one is left running
-        /// for a look), and — with or without --check — one that never came up or never got an
-        /// SSH endpoint (such a pod is always terminated).
+        /// for a look), and — with or without --check — one that never came up or is up without
+        /// an SSH endpoint (such a pod is always terminated).
         #[arg(long, default_value_t = 2, conflicts_with = "no_wait", value_parser = clap::value_parser!(u32).range(1..=10))]
         check_attempts: u32,
         /// Allow machines that earlier `up --check`s marked bad (remembered 72 h)
@@ -1097,8 +1097,7 @@ enum PodCmd {
         /// Minutes a pod may be up without an SSH endpoint before it's replaced [default: 5]
         ///
         /// RunPod: its container running behind RunPod's SSH proxy only (a host with no public
-        /// IP). Overrides config ENDPOINT_TIMEOUT_MINS. A pod still listed running without an
-        /// endpoint when --timeout ends is replaced too.
+        /// IP) — its image pull doesn't count. Overrides config ENDPOINT_TIMEOUT_MINS.
         // u8: PodCmd stays under clippy's large-variant bound (minutes are 1..=120 anyway).
         #[arg(long, value_name = "MINS", value_parser = clap::value_parser!(u8).range(1..=arena_core::pipeline::MAX_ENDPOINT_TIMEOUT_MINS as i64))]
         endpoint_timeout: Option<u8>,

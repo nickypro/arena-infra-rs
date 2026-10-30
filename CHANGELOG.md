@@ -29,10 +29,10 @@ earlier).
   is left billing. Nothing is terminated on an old look: its provider is asked once more first.
 - When: a pod up without an endpoint for `--endpoint-timeout` minutes (new, default 5) — on RunPod,
   its container running behind RunPod's SSH proxy only (a host with no public IP; before, only
-  `--check` replaced these) — or one still listed running without an endpoint when `--timeout` ends
-  (RunPod: a container that never started). RunPod's image pull doesn't count: it lists a pod
-  RUNNING from the create, and a fresh host pulls for up to ~7 minutes. Pods still coming up
-  elsewhere (Vast `loading`, Hetzner `initializing`, Shadeform `pending`) are waited for as before.
+  `--check` replaced these). RunPod's image pull doesn't count: it lists a pod RUNNING from the
+  create, and a fresh host pulls for up to ~7 minutes. A pod still coming up when `--timeout` ends
+  (RunPod: no container yet; Vast `loading`, …) is left running as before — RunPod can't tell a
+  stuck pull from a slow one — but the reason now says it's billing and how to stop it.
 - A Hetzner create refused over the project's limit (403 `resource_limit_exceeded`, e.g. "shared
   core limit exceeded") said "authentication failed creating …". It now says `Hetzner refused: the
   project's resource limit is reached (…) — use a smaller type, free a server, or ask Hetzner to

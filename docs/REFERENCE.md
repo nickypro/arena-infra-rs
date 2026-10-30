@@ -1154,27 +1154,33 @@ the moment that pod is done — a slow pod never holds up another.
 
 One fleet listing per `--interval` serves every pod's endpoint wait.
 
-**A pod that never gets an SSH endpoint is replaced, not left billing** (ops feedback 2026-10-29: a
+**A pod up without an SSH endpoint is replaced, not left billing** (ops feedback 2026-10-29: a
 RUNNING 4090 with no public IP or ports stayed `FAILED endpoint … left running` until someone
-terminated it and ran `up` again, READY in a minute). With or without `--check`, within
-`--check-attempts` placements per name (default 2), it is a host failure — `up` says where it was
-(the machine and data centre its provider names), terminates it (and waits until it's gone) and
-recreates the name with the same options, the ones that haven't failed first; the last one is
-terminated too, and the name FAILs at `endpoint` saying nothing of it is left billing:
-- **Up without an endpoint for `--endpoint-timeout` minutes** (default 5, config
-  `ENDPOINT_TIMEOUT_MINS`, 1..120). On RunPod "up" means its container is running but reachable
-  through RunPod's SSH proxy only — a host with no public IP (`no public endpoint (RunPod ssh proxy
-  only)` in `pods list`). RunPod lists a pod `RUNNING` from its create, while its image is still
-  being pulled (live: 6½ minutes with no container, `publicIp: ""`, `portMappings: null` on v1), so
+terminated it and ran `up` again, READY in a minute). Up without an endpoint for
+`--endpoint-timeout` minutes (default 5, config `ENDPOINT_TIMEOUT_MINS`, 1..120) is a host
+failure, with or without `--check`, within `--check-attempts` placements per name (default 2;
+the flag works without `--check`): `up` says where it was (the machine and data centre its
+provider names), terminates it (and waits until it's gone) and recreates the name with the same
+options, the ones that haven't failed first; the last one is terminated too, and the name FAILs at
+`endpoint` saying nothing of it is left billing.
+- On RunPod "up" means its container is running but reachable through RunPod's SSH proxy only — a
+  host with no public IP (`no public endpoint (RunPod ssh proxy only)` in `pods list`). RunPod
+  lists a pod `RUNNING` from its create, while its image is still being pulled (live 2026-10-30:
+  6½ minutes with no container — `publicIp: ""`, `portMappings: null` on v1 — then proxy-only), so
   the clock doesn't start at the create: a slow pull is no host failure. Elsewhere "up" is a pod
   listed running without an IP/port (Hetzner `running`, Vast `running`, Shadeform `active`).
-- **Still listed running without an endpoint when `--timeout` ends** — on RunPod a container that
-  never started. A pod still coming up (Vast `loading`, Hetzner `initializing`, Shadeform
-  `pending`) is left running at `--timeout` as before: `FAILED endpoint — no SSH endpoint after
-  600s — left running`.
+- Nothing is terminated on an old look: before replacing, `up` asks the pod's own backend again.
+  An endpoint after all goes on with the pipeline; a pod that isn't up any more (restarting), or
+  can't be read just then, is waited for again, its clock started over, to the same `--timeout`.
+- A pod still coming up when `--timeout` ends (RunPod: no container yet; Vast `loading`, Hetzner
+  `initializing`) is left running as before — RunPod can't tell a stuck pull from a slow one —
+  and the reason says so: `no SSH endpoint after 600s, still listed RUNNING (no container yet —
+  its image may still be pulling) — left running, still billing ($0.69/h): `arena proxy apply`
+  once it has an endpoint, or `arena pods terminate lightning``.
 
 A listing that momentarily lacks the pod, or a RunPod endpoint lookup that failed, doesn't restart
-the clock. A pod `up` didn't create in this run is never terminated; Ctrl+C terminates nothing. On
+the clock; a listing that shows it not up (a restart) does. A pod `up` didn't create in this run is
+never terminated; Ctrl+C terminates nothing. On
 Shadeform a pod listed `error`, or not up within `SHADEFORM_READY_MINS` or `--timeout` (whichever
 comes first), is a failed placement the same way — deleted at once and the name tried on the next
 option.

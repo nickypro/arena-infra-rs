@@ -13,11 +13,10 @@
 //! on a host that already failed is rejected ([`on_failed_host`]: "same IP → same machine,
 //! the rebuild fixed nothing"). Bounded by `--check-attempts` placements per name.
 //!
-//! With or without `--check`, a pod that never gets a usable SSH endpoint is a host failure
-//! too, replaced within the same bound ([`AttemptEnd::NoEndpoint`]): one up without an endpoint
-//! for `--endpoint-timeout` ([`endpoint_timeout_mins`], [`crate::status::up_without_endpoint`]:
-//! on RunPod, its container running behind RunPod's SSH proxy only), or still listed running
-//! without one when `--timeout` ends.
+//! With or without `--check`, a pod up without a usable SSH endpoint for `--endpoint-timeout`
+//! ([`endpoint_timeout_mins`], [`crate::status::up_without_endpoint`]: on RunPod, its container
+//! running behind RunPod's SSH proxy only) is a host failure too, replaced within the same bound
+//! ([`AttemptEnd::NoEndpoint`]).
 //!
 //! The executor is I/O and lives in the CLI (it owns the proxy writer, setup and key
 //! distribution); here are the decisions it takes and the report it ends with — the types
@@ -144,10 +143,9 @@ pub enum AttemptEnd {
     /// earlier run (within `snapshot::BAD_HOST_TTL_SECS`) or this one: rejected before it was
     /// set up or checked, on any attempt. Carries when and why it was found bad.
     KnownBad(String),
-    /// Never got a usable SSH endpoint: up without one for `--endpoint-timeout` — RunPod's
-    /// proxy-only host, with no public IP — or still listed running without one when `--timeout`
-    /// ended. A host failure, like a failed check, replaced with or without `--check`. Carries
-    /// what it was, for the attempt line (`no public SSH endpoint (RunPod ssh proxy only)`).
+    /// Up without a usable SSH endpoint for `--endpoint-timeout` — RunPod's proxy-only host, with
+    /// no public IP. A host failure, like a failed check, replaced with or without `--check`.
+    /// Carries what it was, for the attempt line (`no public SSH endpoint (RunPod ssh proxy only)`).
     NoEndpoint(String),
     /// Never came up: listed `ERROR` (Shadeform: `error: <status details>`), or not up by its
     /// backend's ready deadline — a failed placement, terminated.
