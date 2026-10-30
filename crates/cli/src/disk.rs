@@ -28,25 +28,36 @@ pub(crate) fn floor(cfg: &Config) -> Result<Option<Floor>> {
 
 /// Judge a run's copies onto this box together ([`core_disk::Ledger`]): each copy (a pod) with
 /// the destinations it writes and their sizes, against what other arena runs' copies under way
-/// hold ([`core_disk::Reservations`], in the state dir). The ones that don't fit, with why — in
-/// order — and the admitted ones' reservation, held until the returned [`Hold`] is dropped (when
-/// the copies end). `reserve: false` (a dry run) holds nothing.
+/// hold ([`core_disk::Reservations`], in the state root: every cohort's runs as this user). The
+/// ones that don't fit, with why — in order — and the admitted ones' reservation, held until the
+/// returned [`Hold`] is dropped (when the copies end). `reserve: false` (a dry run) holds nothing.
+/// What other runs hold that can't be known — their notes' lock held for [`core_disk::RECORD_LOCK_WAIT`],
+/// the notes unreadable — or this run's own that can't be noted, skips every copy (review r3: a
+/// warning there let two runs count the same free space); a file it can't parse (arena writes it
+/// atomically: another version's) is replaced, said, as the [`Watch`] stops what overruns anyway.
 pub(crate) fn judge_copies(cfg: &Config, floor: Floor, copies: &[(String, Vec<(PathBuf, Size)>)], reserve: bool) -> (Vec<(String, Skip)>, Hold) {
-    let Some(path) = reservations_path(cfg) else {
-        return (judge_copies_with(core_disk::Ledger::new(floor), copies, core_disk::reading).0, Hold::default());
+    let refuse = |why: String| -> (Vec<(String, Skip)>, Hold) {
+        (copies.iter().map(|(name, _)| (name.clone(), Skip::others_unknown(&why))).collect(), Hold::default())
     };
-    // Under the state dir's lock: no other run reads or writes the reservations between this
-    // one's reading and its own (a lock that can't be had: this run's copies alone, said).
+    let path = match reservations_path(cfg) {
+        None => return (judge_copies_with(core_disk::Ledger::new(floor), copies, core_disk::reading).0, Hold::default()),
+        Some(Err(e)) => return refuse(e),
+        Some(Ok(path)) => path,
+    };
+    // Under the state root's lock: no other run reads or writes the notes between this one's
+    // reading and its own.
     let lock = match core_disk::lock_state_for(&path, core_disk::RECORD_LOCK_WAIT) {
         Ok(lock) => lock,
-        Err(e) => {
-            eprintln!("warning: other runs' copies onto this box aren't counted this time ({}: {e})", path.display());
-            return (judge_copies_with(core_disk::Ledger::new(floor), copies, core_disk::reading).0, Hold::default());
-        }
+        Err(e) => return refuse(format!("{}: {e}", path.display())),
     };
     let now = arena_core::snapshot::unix_now();
-    let (mut held, warning) = core_disk::Reservations::load(&path);
-    warning.iter().for_each(|w| eprintln!("{w}"));
+    let mut held = match core_disk::Reservations::load(&path) {
+        Ok((held, warning)) => {
+            warning.iter().for_each(|w| eprintln!("{w}"));
+            held
+        }
+        Err(e) => return refuse(e),
+    };
     held.prune(now, core_disk::arena_alive);
     let (skipped, taken) = judge_copies_with(core_disk::Ledger::with_others(floor, held.by_dev()), copies, core_disk::reading);
     if !reserve || taken.is_empty() {
@@ -55,8 +66,7 @@ pub(crate) fn judge_copies(cfg: &Config, floor: Floor, copies: &[(String, Vec<(P
     let token = now.wrapping_mul(1_000_003) ^ u64::from(std::process::id()) ^ u64::from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()));
     held.hold(std::process::id(), token, &taken, now);
     if let Err(e) = held.save(&path) {
-        eprintln!("warning: couldn't note this run's copies in {} ({e}) — other runs won't count them", path.display());
-        return (skipped, Hold::default());
+        return refuse(format!("noting this run's copies in {}: {e}", path.display()));
     }
     drop(lock);
     (skipped, Hold { path: Some(path), token })
@@ -93,20 +103,70 @@ impl Drop for Hold {
     fn drop(&mut self) {
         let Some(path) = self.path.take() else { return };
         let Ok(lock) = core_disk::lock_state_for(&path, core_disk::RECORD_LOCK_WAIT) else { return };
-        let (mut held, _) = core_disk::Reservations::load(&path);
+        let Ok((mut held, _)) = core_disk::Reservations::load(&path) else { return };
         held.release(std::process::id(), self.token);
         let _ = held.save(&path);
         drop(lock);
     }
 }
 
-/// Where the reservations live: the fleet's state dir (as the skip record); `None` in this
-/// crate's unit tests unless the test's config sets `ARENA_STATE_DIR`.
-fn reservations_path(cfg: &Config) -> Option<PathBuf> {
+/// How often a run's copies look at the free space under them ([`Watch`]).
+pub(crate) const WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The floor as a hard line while a run's copies write (review r3): a copy is admitted on an
+/// estimate — a pod's later copy counts 0.1 GB a tier, and can bring a 12 GB file —, so its run
+/// looks at the filesystems it writes to every [`WATCH_EVERY`] and stops its copies once one has
+/// less than the floor free, as a copy over its time budget is stopped: what it copied stays, the
+/// pod's copy fails, said and recorded for the health check. A filesystem that can't be read
+/// meanwhile doesn't stop them (it was read to admit them).
+#[derive(Debug, Clone)]
+pub(crate) struct Watch {
+    floor: Floor,
+    dirs: Vec<PathBuf>,
+}
+
+impl Watch {
+    /// A watch over the filesystems of `dirs` — `None` without a floor, or with a zero one (only
+    /// the copy itself must fit).
+    pub(crate) fn new(floor: Option<Floor>, dirs: &[&Path]) -> Option<Watch> {
+        floor.filter(|f| f.bytes > 0).map(|floor| Watch { floor, dirs: dirs.iter().map(|d| d.to_path_buf()).collect() })
+    }
+
+    /// Why the copies must stop now, from the readings `read` gives (pure but for them).
+    fn under(&self, read: impl Fn(&Path) -> std::result::Result<core_disk::Fs, String>) -> Option<Skip> {
+        self.dirs.iter().filter_map(|d| read(d).ok()).find(|fs| fs.free < self.floor.bytes).map(|fs| Skip::under_floor_now(&fs, self.floor))
+    }
+}
+
+/// Resolves once `watch` finds one of its filesystems under the floor (never, for `None`).
+pub(crate) async fn breached(watch: Option<&Watch>) -> Skip {
+    let Some(w) = watch else { return std::future::pending().await };
+    loop {
+        if let Some(skip) = w.under(core_disk::reading) {
+            return skip;
+        }
+        tokio::time::sleep(WATCH_EVERY).await;
+    }
+}
+
+/// `copy` (onto this box) unless `watch` breaches first: then `Err` with why, the copy dropped —
+/// its rsync stopped (`arena_core::remote::run_local`: SIGTERM, then SIGKILL).
+pub(crate) async fn watched<T>(watch: Option<&Watch>, copy: impl std::future::Future<Output = T>) -> std::result::Result<T, Skip> {
+    tokio::select! {
+        biased;
+        out = copy => Ok(out),
+        skip = breached(watch) => Err(skip),
+    }
+}
+
+/// Where the reservations live: the state root (`ARENA_STATE_DIR`, the dir that holds each
+/// cohort's), so two cohorts' runs on one box count each other's copies (review r3); `None` in
+/// this crate's unit tests unless the test's config sets `ARENA_STATE_DIR`.
+fn reservations_path(cfg: &Config) -> Option<std::result::Result<PathBuf, String>> {
     if cfg!(test) && cfg.get("ARENA_STATE_DIR").is_none() {
         return None;
     }
-    arena_core::snapshot::state_file_path_for(cfg, core_disk::RESERVATIONS_FILE).ok()
+    Some(arena_core::snapshot::state_dir_for(cfg).map(|cohort| cohort.parent().unwrap_or(&cohort).join(core_disk::RESERVATIONS_FILE)))
 }
 
 /// What a copy of `pod` into `dest` may take, under the snapshot root `base`: a later copy — only
@@ -166,10 +226,11 @@ pub(crate) fn note_skips(cfg: &Config, what: &str, skipped: &[(String, String)])
     }
 }
 
-/// The reason in a skip's line, without its `skipped: ` and its advice (the record's words).
+/// The reason in a skip's line, without its `skipped: ` / `stopped: ` and its advice (the
+/// record's words).
 fn reason(line: &str) -> String {
-    let r = line.strip_prefix("skipped: ").unwrap_or(line);
-    r.split(" — nothing copied").next().unwrap_or(r).to_string()
+    let r = line.strip_prefix("skipped: ").or_else(|| line.strip_prefix("stopped: ")).unwrap_or(line);
+    r.split(" — nothing copied").next().and_then(|r| r.split(" — what it copied so far stays").next()).unwrap_or(r).to_string()
 }
 
 /// The places arena writes to on this box, `(what, where)`: the backup tiers, the staging dir
@@ -330,7 +391,71 @@ mod tests {
             reason("skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB) — nothing copied; free space on / (…)"),
             "only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB)"
         );
+        assert_eq!(
+            reason("stopped: only 4.9 GB free on / while copying (floor 5 GB, CONTROL_MIN_FREE_GB) — what it copied so far stays; free space on / (…)"),
+            "only 4.9 GB free on / while copying (floor 5 GB, CONTROL_MIN_FREE_GB)"
+        );
         assert_eq!(reason("something else"), "something else");
+    }
+
+    /// The floor as a hard line while copies write: a watch over their filesystems stops them once
+    /// one has less than the floor free (a copy writing more than its estimate); none without a
+    /// floor or with a zero one; a filesystem it can't read doesn't stop them.
+    #[tokio::test]
+    async fn a_copy_is_stopped_once_its_disk_goes_under_the_floor() {
+        let g = core_disk::GB;
+        assert!(Watch::new(None, &[Path::new("/")]).is_none() && Watch::new(Some(Floor::control(0)), &[Path::new("/")]).is_none());
+        let w = Watch::new(Some(Floor::control(5 * g)), &[Path::new("/b"), Path::new("/big")]).unwrap();
+        let read = |free_big: u64| {
+            move |p: &Path| match p.to_str() {
+                Some("/b") => Ok(core_disk::Fs { dev: 1, mount: PathBuf::from("/"), free: 9 * g, total: 75 * g }),
+                Some("/big") if free_big > 0 => Ok(core_disk::Fs { dev: 2, mount: PathBuf::from("/mnt/big"), free: free_big, total: 75 * g }),
+                _ => Err("No such device".to_string()),
+            }
+        };
+        assert_eq!(w.under(read(5 * g)), None, "at the floor: room");
+        assert_eq!(w.under(read(0)), None, "unreadable: not a reason to stop");
+        let skip = w.under(read(4_900_000_000)).expect("under it");
+        assert!(skip.stopped);
+        assert_eq!(skip.reason, "only 4.9 GB free on /mnt/big while copying (floor 5 GB, CONTROL_MIN_FREE_GB)");
+        assert!(skip.to_string().starts_with("stopped: only 4.9 GB free on /mnt/big while copying") && skip.to_string().contains("— what it copied so far stays; free space on /mnt/big"), "{skip}");
+
+        // Live: a copy that would never end is dropped (its rsync stopped) once the disk is under
+        // the floor — here a floor no disk has; with no watch, it runs to its end.
+        let huge = Watch::new(Some(Floor::control(100_000 * g)), &[&std::env::temp_dir()]);
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), watched(huge.as_ref(), std::future::pending::<()>())).await;
+        assert!(stopped.expect("stopped at once").unwrap_err().reason.contains("while copying (floor 100000 GB"));
+        assert_eq!(watched(None, async { 7 }).await.unwrap(), 7);
+    }
+
+    /// What other runs hold that can't be read skips every copy (never counting free space another
+    /// run may count); the notes are box-wide — another cohort's run on this box counts them.
+    #[test]
+    fn copies_are_judged_against_every_cohorts_runs_or_not_at_all() {
+        let d = std::env::temp_dir().join(format!("arena-disk-cohorts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let cfg = |prefix: &str| Config::parse(&format!("MACHINE_NAME_PREFIX={prefix}\nARENA_STATE_DIR={}\nCONTROL_MIN_FREE_GB=0\n", d.display()));
+        let floor = Floor::control(0);
+        let copy = |pod: &str, bytes: u64| [(pod.to_string(), vec![(d.clone(), Size::Measured(bytes))])];
+        std::fs::create_dir_all(&d).unwrap();
+        let free = core_disk::reading(&d).unwrap().free;
+        // arena8's run holds all but 2 GB of what's free; arena9's 3 GB copy doesn't fit (whatever
+        // else the disk does meanwhile, short of a GB written or freed).
+        let g = core_disk::GB;
+        let (skipped, held) = judge_copies(&cfg("arena8"), floor, &copy("arena8-a", free.saturating_sub(2 * g)), true);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let (skipped, _) = judge_copies(&cfg("arena9"), floor, &copy("arena9-b", 3 * g), true);
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].1.reason.contains("for other copies under way"), "{}", skipped[0].1);
+        drop(held);
+        // Notes that can't be read (a dir where the file goes): every copy skipped, said why.
+        let path = d.join(core_disk::RESERVATIONS_FILE);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let (skipped, _) = judge_copies(&cfg("arena9"), floor, &[copy("arena9-b", 1)[0].clone(), copy("arena9-c", 1)[0].clone()], true);
+        assert_eq!(skipped.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["arena9-b", "arena9-c"]);
+        assert!(skipped[0].1.to_string().starts_with("skipped: other arena runs' copies onto this box unknown (can't read "), "{}", skipped[0].1);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -394,7 +519,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("arena-disk-hold-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR={}\nCONTROL_MIN_FREE_GB=0\n", d.display()));
-        let path = d.join("devtest").join(core_disk::RESERVATIONS_FILE);
+        let path = d.join(core_disk::RESERVATIONS_FILE);
         let copy = [("devtest-a".to_string(), vec![(d.clone(), Size::Measured(1_000))])];
         let floor = Floor::control(0);
         let (skipped, hold) = judge_copies(&cfg, floor, &copy, false);
@@ -402,7 +527,7 @@ mod tests {
         drop(hold);
         let (skipped, hold) = judge_copies(&cfg, floor, &copy, true);
         assert!(skipped.is_empty());
-        let (held, _) = core_disk::Reservations::load(&path);
+        let (held, _) = core_disk::Reservations::load(&path).unwrap();
         assert_eq!(held.held.iter().map(|r| (r.pid, r.bytes)).collect::<Vec<_>>(), [(std::process::id(), 1_000)]);
         // Another run sees it as taken: here, all but 500 bytes of what's free is held elsewhere
         // too, and a 1 GB copy doesn't fit (whatever else the disk does meanwhile, short of
@@ -417,7 +542,7 @@ mod tests {
         assert!(skipped[0].1.reason.contains("for other copies under way"), "{}", skipped[0].1);
         drop(other);
         drop(hold);
-        let (left, _) = core_disk::Reservations::load(&path);
+        let (left, _) = core_disk::Reservations::load(&path).unwrap();
         assert_eq!(left.held.iter().map(|r| r.token).collect::<Vec<_>>(), [42], "its own let go of, the other's kept");
         let _ = std::fs::remove_dir_all(&d);
     }

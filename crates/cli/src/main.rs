@@ -13924,13 +13924,23 @@ async fn copy_pod_files(
                 clear_stale_link(&job.dest).with_context(|| format!("clearing an old link at {}", job.dest))?;
                 std::fs::create_dir_all(&job.dest).with_context(|| format!("creating {}", job.dest))?;
             }
-            // Each leg's rsyncs (the home, then a split-out repo) share the leg's one budget.
+            // Each leg's rsyncs (the home, then a split-out repo) share the leg's one budget. The
+            // floor stays a hard line while they write (`disk::Watch`: stopped under it).
             let leg = CopyLeg::start(POD_COPY_TIMEOUT);
-            for job in &jobs {
-                leg.rsync(&opts.rsync, &pull::rsync_args(&src_target, &job.config, &job.dest))
-                    .await
-                    .context("pull source -> staging")?;
+            let watch = disk::Watch::new(floor, &[opts.stage_root.as_path()]);
+            let pulled = disk::watched(watch.as_ref(), async {
+                for job in &jobs {
+                    leg.rsync(&opts.rsync, &pull::rsync_args(&src_target, &job.config, &job.dest))
+                        .await
+                        .context("pull source -> staging")?;
+                }
+                anyhow::Ok(())
+            })
+            .await;
+            if let Err(skip) = &pulled {
+                disk::note_skips(cfg, "replace/migrate staging", &[(dest_pod.name.clone(), skip.to_string())]);
             }
+            pulled.map_err(|skip| anyhow::anyhow!("pull source -> staging ({}): {skip}", opts.stage_root.display()))??;
             let dest_target = fresh_target(provider, dest_id, cfg).await?;
             let staged_repo = rel.as_ref().is_some_and(|r| std::fs::symlink_metadata(stage.join(r)).is_ok_and(|m| m.is_dir()));
             let leg = CopyLeg::start(POD_COPY_TIMEOUT);
@@ -15089,7 +15099,25 @@ async fn pull_pods(
     failed += missing.len();
     failures.extend(missing.into_iter().map(|n| format!("{n}: no SSH endpoint after 10 minutes running")));
     let (mut ok, mut done) = (0, 0);
-    while let Some(joined) = set.join_next_with_id().await {
+    // The floor as a hard line while the copies write (`disk::Watch`): under it, every job still
+    // running is stopped, its pod's copy a failure — said, and recorded for the health check.
+    let watch = disk::Watch::new(floor, &[std::path::Path::new(dir), std::path::Path::new(&big_root)]);
+    let mut stopped: Option<arena_core::disk::Skip> = None;
+    let mut stopped_pods: Vec<String> = Vec::new();
+    loop {
+        let joined = tokio::select! {
+            biased;
+            joined = set.join_next_with_id() => match joined {
+                Some(joined) => joined,
+                None => break,
+            },
+            skip = disk::breached(watch.as_ref()), if stopped.is_none() && !set.is_empty() => {
+                say(&format!("✗ {} — stopping this run's copies", skip.reason));
+                stopped = Some(skip);
+                set.abort_all();
+                continue;
+            }
+        };
         done += 1;
         let (name, tier, made, out) = match joined {
             Ok((id, r)) => {
@@ -15097,6 +15125,21 @@ async fn pull_pods(
                     locks.done(&pod);
                 }
                 r
+            }
+            // Stopped by the watch: its rsync with it (`remote::run_local`, on drop).
+            Err(e) if e.is_cancelled() && stopped.is_some() => {
+                let skip = stopped.as_ref().map(ToString::to_string).unwrap_or_default();
+                if let Some(pod) = job_pod.remove(&e.id()) {
+                    locks.done(&pod);
+                    say(&format!("[{done}/{jobs}] ✗ {pod}: {skip}"));
+                    failures.push(format!("{pod} ({})", stopped.as_ref().map(|s| s.reason.as_str()).unwrap_or_default()));
+                    by_pod.push((pod.clone(), skip));
+                    if !stopped_pods.contains(&pod) {
+                        stopped_pods.push(pod);
+                    }
+                }
+                failed += 1;
+                continue;
             }
             // A crashed task still counts — as a failure, never silently.
             Err(e) => {
@@ -15137,6 +15180,9 @@ async fn pull_pods(
                 by_pod.push((name.clone(), format!("[{tier}{pass}] {}", describe_error(&e))));
             }
         }
+    }
+    if let Some(skip) = &stopped {
+        disk::note_skips(cfg, "copy", &stopped_pods.iter().map(|p| (p.clone(), skip.to_string())).collect::<Vec<_>>());
     }
     // What the new snapshots really take: hard-linked files are shared with the earlier
     // snapshots and the baseline, so `du` of one snapshot alone overstates it.
@@ -15481,13 +15527,19 @@ async fn handle_baseline(
     };
     std::fs::create_dir_all(&partial).with_context(|| format!("creating {}", partial.display()))?;
     let started = tokio::time::Instant::now();
+    // The floor stays a hard line while it writes (`disk::Watch`: stopped under it).
+    let watch = disk::Watch::new(floor, &[partial.as_path()]);
     for args in passes {
         let left = budget.saturating_sub(started.elapsed()).max(Duration::from_secs(1));
         let what = format!("rsync of {} [baseline]", pod.name);
-        let failed = match arena_core::remote::run_local(rsync, &args, &what, Some(left)).await {
-            Ok(o) if o.success => None,
-            Ok(o) => Some(format!("rsync {}: {}", o.exit_label(), o.stderr.trim())),
-            Err(e) => Some(describe_error(&e)),
+        let failed = match disk::watched(watch.as_ref(), arena_core::remote::run_local(rsync, &args, &what, Some(left))).await {
+            Ok(Ok(o)) if o.success => None,
+            Ok(Ok(o)) => Some(format!("rsync {}: {}", o.exit_label(), o.stderr.trim())),
+            Ok(Err(e)) => Some(describe_error(&e)),
+            Err(skip) => {
+                disk::note_skips(cfg, "baseline", &[(pod.name.clone(), skip.to_string())]);
+                Some(skip.to_string())
+            }
         };
         if let Some(why) = failed {
             // Only the partial dir this run made; the week's baseline (if any) is untouched.
@@ -24273,7 +24325,7 @@ mod remote_tests {
         assert_eq!(stub.take(), ["big/devtest-bloom", "w1d1/devtest-bloom", "w1d1/devtest-bloom"]);
         assert!(!arena_core::disk::was_copied(&base, "devtest-apple"), "apple was never copied");
         // Its reservation went with the run.
-        let (held, _) = arena_core::disk::Reservations::load(&state.join("devtest").join(arena_core::disk::RESERVATIONS_FILE));
+        let (held, _) = arena_core::disk::Reservations::load(&state.join(arena_core::disk::RESERVATIONS_FILE)).unwrap();
         assert!(held.held.is_empty(), "{held:?}");
     }
 

@@ -25,8 +25,8 @@ earlier).
   copies, `pods baseline`, replace/migrate's local staging and the reaper's — now checks that disk
   first: it goes ahead only if `CONTROL_MIN_FREE_GB` (default 5 GB) stays free after it, the run's
   other copies and other arena runs' copies under way (a cron backup and an operator's pull at
-  once: each run notes what its copies may take in the state dir's `disk-reservations.json` until
-  they end). A pod's first copy counts as 2 GB per tier, a later one as 0.1 GB — later only once
+  once, any cohort: each run notes what its copies may take in `<ARENA_STATE_DIR>/disk-reservations.json`
+  until they end; notes that can't be read or written skip the run's copies). A pod's first copy counts as 2 GB per tier, a later one as 0.1 GB — later only once
   the pod's whole home was copied into that backup (`<LOCAL_BACKUP_DIR>/.arena-copied/<pod>`; the
   pods already backed up there are marked once, at the first such run), so an interrupted first
   copy's retry is still a first one —, the staging as measured. A pod that
@@ -34,6 +34,10 @@ earlier).
   skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB) — nothing copied; …`), and the
   run fails. The git backup itself isn't affected. (Prod's box was at 96 %, 3.1 GB free of 75 GB,
   with the */15 cron copying pods onto it unchecked.)
+- The floor holds while copies write too: a run looks at the disks its copies write to every 2 s
+  and stops them once one has less than the floor free (`stopped: only 4.9 GB free on / while
+  copying …` — what was copied stays, the run fails, the health check lists it). An estimate is no
+  bound: a later copy, counted 0.1 GB a tier, can bring a new 12 GB file.
 - The daily health check (`cron install --health`) now ends with this box: how full its disk is,
   what arena left on it, and every pod whose copy was skipped for space in the last day, which
   fails the check.

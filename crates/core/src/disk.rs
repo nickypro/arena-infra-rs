@@ -12,7 +12,9 @@
 //! arena measured where it measures one (replace/migrate's staging: an rsync dry run); otherwise a
 //! pod's first copy counts as [`FIRST_COPY`] and a later one, which writes only what changed, as
 //! [`LATER_COPY`] — later only once that pod was copied whole there ([`was_copied`]). A skip
-//! happens before anything is written, and is a failure of its run.
+//! happens before anything is written, and is a failure of its run. An estimate isn't a bound, so
+//! the floor is also a hard line while a copy writes: under it, the copy is stopped
+//! ([`Skip::under_floor_now`]; the watch is the CLI's).
 //!
 //! Also here: what arena leaves behind on the box ([`find_leftovers`]: a replace/migrate staging
 //! copy kept after a copy that failed or was stopped, an interrupted baseline capture, rsync temp
@@ -155,18 +157,45 @@ pub struct Skip {
     pub reason: String,
     /// What to do about it.
     advice: String,
+    /// The copy was stopped while it wrote ([`Skip::under_floor_now`]), not skipped before.
+    pub stopped: bool,
 }
 
 impl std::fmt::Display for Skip {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "skipped: {} — nothing copied; {}", self.reason, self.advice)
+        if self.stopped {
+            write!(f, "stopped: {} — what it copied so far stays; {}", self.reason, self.advice)
+        } else {
+            write!(f, "skipped: {} — nothing copied; {}", self.reason, self.advice)
+        }
     }
 }
 
 impl Skip {
     /// The free space couldn't be read: never copy blind.
     pub fn unknown(path: &Path, why: &str) -> Skip {
-        Skip { reason: format!("free space on {} unknown ({why})", path.display()), advice: "check that disk".into() }
+        Skip { reason: format!("free space on {} unknown ({why})", path.display()), advice: "check that disk".into(), stopped: false }
+    }
+
+    /// What other arena runs' copies under way hold couldn't be read, or this run's couldn't be
+    /// noted for them ([`Reservations`]): never count free space another run may be counting.
+    pub fn others_unknown(why: &str) -> Skip {
+        Skip {
+            reason: format!("other arena runs' copies onto this box unknown ({why})"),
+            advice: "check the state dir (`arena config which`), then re-run".into(),
+            stopped: false,
+        }
+    }
+
+    /// A copy stopped while it wrote: the filesystem went under the floor (a copy writes more
+    /// than its estimate — a new big file — or something else filled the disk meanwhile).
+    pub fn under_floor_now(fs: &Fs, floor: Floor) -> Skip {
+        let mount = fs.mount.display();
+        Skip {
+            reason: format!("only {} free on {mount} while copying (floor {}, {})", gb(fs.free), gb(floor.bytes), floor.key),
+            advice: format!("free space on {mount} (`arena config check` names arena's biggest dirs there)"),
+            stopped: true,
+        }
     }
 }
 
@@ -191,7 +220,7 @@ pub fn judge(fs: &Fs, already: u64, need: &Need, floor: Floor) -> Result<(), Ski
             floor.key
         )
     };
-    Err(Skip { reason, advice: format!("free space on {mount} (`arena config check` names arena's biggest dirs there)") })
+    Err(Skip { reason, advice: format!("free space on {mount} (`arena config check` names arena's biggest dirs there)"), stopped: false })
 }
 
 /// One run's copies onto this box, judged together: each filesystem read once, and what every
@@ -761,17 +790,18 @@ impl Default for Reservations {
 }
 
 impl Reservations {
-    /// Load tolerantly: missing = none; unreadable or another version = none plus a warning (the
-    /// file is then rewritten with this run's alone).
-    pub fn load(path: &Path) -> (Reservations, Option<String>) {
+    /// Load: missing = none; one that can't be parsed, or another version's = none plus a warning
+    /// (arena writes it atomically, so that's another version's: rewritten with this run's alone).
+    /// `Err`: it can't be read at all — what other runs hold is unknown.
+    pub fn load(path: &Path) -> Result<(Reservations, Option<String>), String> {
         match std::fs::read_to_string(path) {
-            Ok(text) => match serde_json::from_str::<Reservations>(&text) {
+            Ok(text) => Ok(match serde_json::from_str::<Reservations>(&text) {
                 Ok(r) if r.version == RESERVATIONS_VERSION => (r, None),
-                Ok(r) => (Reservations::default(), Some(format!("warning: ignoring {} (version {})", path.display(), r.version))),
-                Err(e) => (Reservations::default(), Some(format!("warning: ignoring {} ({e})", path.display()))),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Reservations::default(), None),
-            Err(e) => (Reservations::default(), Some(format!("warning: can't read {} ({e})", path.display()))),
+                Ok(r) => (Reservations::default(), Some(format!("warning: replacing {} (version {})", path.display(), r.version))),
+                Err(e) => (Reservations::default(), Some(format!("warning: replacing {} ({e})", path.display()))),
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Reservations::default(), None)),
+            Err(e) => Err(format!("can't read {} ({e})", path.display())),
         }
     }
 

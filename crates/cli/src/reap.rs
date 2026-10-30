@@ -2379,10 +2379,22 @@ async fn backup(
             ctx.note(format!("{} [{tier}]: {}", pod.name, note.trim_start_matches(" — ")));
         }
     };
+    // The floor stays a hard line while it writes (`disk::Watch`): stopped under it, the step
+    // ends killed — no verified backup, so no terminate — said and recorded.
+    let watch = crate::disk::Watch::new(crate::disk::floor(env.cfg).ok().flatten(), &[Path::new(snapshot_dir), Path::new(big_dir)]);
+    let stopped = |skip: &arena_core::disk::Skip| {
+        ctx.note(format!("{}: its reap backup — {skip}", pod.name));
+        crate::disk::note_skips(env.cfg, "reap backup", &[(pod.name.clone(), skip.to_string())]);
+    };
     for pass in snap.passes() {
         let args = pull::rsync_args(t, &pass, snapshot_dir);
         let what = format!("reap rsync of {} [snapshot]", pod.name);
-        let (out, made) = pull::rsync_making_way(&env.rsync, &args, Path::new(snapshot_dir), &what, left(dest.budget), &day).await;
+        let copied = crate::disk::watched(watch.as_ref(), pull::rsync_making_way(&env.rsync, &args, Path::new(snapshot_dir), &what, left(dest.budget), &day)).await;
+        let Ok((out, made)) = copied.map_err(|skip| stopped(&skip)) else {
+            ev.snapshot.push(StepEnd::Killed);
+            ev.finished = (env.clock)();
+            return ev;
+        };
         said("snapshot", &made);
         let end = step_end(out);
         let ok = matches!(end, StepEnd::Exit { code: 0, .. });
@@ -2395,7 +2407,16 @@ async fn backup(
     // RS2: the reap's own big tier — dot-directories kept, only the documented caches left out.
     let big = PullConfig { rsync_path: guard, ..PullConfig::reap_tier() };
     let what = format!("reap rsync of {} [big]", pod.name);
-    let (out, made) = pull::rsync_making_way(&env.rsync, &pull::rsync_args(t, &big, big_dir), Path::new(big_dir), &what, left(dest.budget), &day).await;
+    let copied = crate::disk::watched(
+        watch.as_ref(),
+        pull::rsync_making_way(&env.rsync, &pull::rsync_args(t, &big, big_dir), Path::new(big_dir), &what, left(dest.budget), &day),
+    )
+    .await;
+    let Ok((out, made)) = copied.map_err(|skip| stopped(&skip)) else {
+        ev.big = StepEnd::Killed;
+        ev.finished = (env.clock)();
+        return ev;
+    };
     said("big", &made);
     ev.big = step_end(out);
     if matches!(ev.big, StepEnd::Exit { code: 0, .. }) {

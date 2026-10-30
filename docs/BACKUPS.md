@@ -841,9 +841,11 @@ once.)
 - A copy goes ahead only if what's free there, less what this run's earlier copies may take, what
   other arena runs' copies under way may take (a cron backup and an operator's pull at once) and
   what this one may take, stays at or above `CONTROL_MIN_FREE_GB` (whole GB, default 5; `0` = only
-  the copy itself must fit). Each run notes what its admitted copies may take in the state dir
-  (`disk-reservations.json`) until they end; a note whose arena process is gone, or that is over a
-  day old, counts for nothing.
+  the copy itself must fit). Each run notes what its admitted copies may take in the state root
+  (`<ARENA_STATE_DIR>/disk-reservations.json`, beside the cohorts' dirs: every cohort's runs as
+  that user count each other's) until they end; a note whose arena process is gone, or that is over
+  a day old, counts for nothing. Notes that can't be read or written (their lock held for 10 s, the
+  file unreadable) skip every copy of that run, said why — never two runs counting the same space.
 - What a copy may take: measured where arena measures it (the staging: an rsync dry run); otherwise
   a pod's first copy into a tier counts as 2 GB (about a fresh GPU image's home) and a later one —
   onto its earlier copy, where rsync writes only what changed — as 0.1 GB. A copy is a later one
@@ -853,6 +855,14 @@ once.)
   first one. A backup from before this marking gets every pod with a `wNdM` snapshot there marked
   once, before the first run that judges its copies (as arena took them until then). A pod's tiers
   are judged together: it is copied whole or not at all.
+- The floor is a hard line while copies write, too: an estimate isn't a bound (a later copy, counted
+  0.1 GB a tier, can bring a new 12 GB file). Each run looks at the filesystems its copies write to
+  every 2 s and stops them once one has less than the floor free — as a copy over its time budget is
+  stopped: what it copied so far stays, the pod isn't marked copied whole, and its line says
+  `stopped: only 4.9 GB free on / while copying (floor 5 GB, …) — what it copied so far stays; …`,
+  a failure of the run recorded for the health check like a skip. A reap backup stopped so isn't
+  verified, so the pod isn't terminated; a stopped staging copy is kept as a failed one is; a
+  stopped baseline leaves nothing.
 - A skip happens before the pod is asked anything or any of its dirs is made, one line per pod —
   `✗ arena9-bloom: skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB) — nothing copied;
   free space on / (…)` — and it is a failure of the run (the exit; `pods backup`'s `the fallback copy
