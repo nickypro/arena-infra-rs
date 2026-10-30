@@ -54,40 +54,50 @@ fn the_floor_is_whole_gb_from_zero_with_a_default_of_five() {
     }
 }
 
-/// The judge, as a table: (free, already held this run, need, floor GB) → go, or the words.
+/// The judge, as a table: (free, already held this run, need, floor GB) → go, or the words and
+/// how much to free.
 #[test]
 fn a_copy_goes_only_when_it_leaves_the_floor_free() {
-    let cases: &[(u64, u64, Size, u64, Option<&str>)] = &[
+    // (words, how much to free)
+    type Said = Option<(&'static str, &'static str)>;
+    let cases: &[(u64, u64, Size, u64, Said)] = &[
         // Prod on 2026-10-30: 3.1 GB free, the default floor.
-        // Under the floor, it says what the copy would take in all: how much to free.
-        (3_100_000_000, 0, Size::First, 5, Some("only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB): this copy (~3 GB, a first copy, not measured) + the floor = 8 GB needed")),
-        (3_100_000_000, 0, Size::Later, 5, Some("only 3.1 GB free on /")),
-        (3_100_000_000, 0, Size::Measured(3_900_000_000), 5, Some("only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB): this copy (~3.9 GB, measured) + the floor = 8.9 GB needed")),
-        (3_100_000_000, 2 * G, Size::Measured(3_900_000_000), 5, Some(": this copy (~3.9 GB, measured) + ~2 GB for other copies under way + the floor = 10.9 GB needed")),
+        // Under the floor, it says what the copy would take in all, and how much to free.
+        (3_100_000_000, 0, Size::First, 5, Some(("only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB): this copy (~3 GB, a first copy, not measured) + the floor = 8 GB needed", "4.9 GB"))),
+        (3_100_000_000, 0, Size::Later, 5, Some(("only 3.1 GB free on /", "2 GB"))),
+        (3_100_000_000, 0, Size::Measured(3_900_000_000), 5, Some(("only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB): this copy (~3.9 GB, measured) + the floor = 8.9 GB needed", "5.8 GB"))),
+        (3_100_000_000, 2 * G, Size::Measured(3_900_000_000), 5, Some((": this copy (~3.9 GB, measured) + ~2 GB for other copies under way + the floor = 10.9 GB needed", "7.8 GB"))),
         // Nothing sized (the staging under the floor already: not sized): how far below the floor.
-        (3_100_000_000, 0, Size::Measured(0), 5, Some("only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB): 1.9 GB short of the floor")),
+        (3_100_000_000, 0, Size::Measured(0), 5, Some(("only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB) — nothing", "1.9 GB"))),
         // Above the floor, but not with the copy on top.
-        (7 * G, 0, Size::First, 5, Some("7 GB free on /, and this copy (~3 GB, a first copy, not measured) would leave less than the floor (5 GB, CONTROL_MIN_FREE_GB)")),
-        (6 * G, G / 2, Size::Measured(G), 5, Some("this copy (~1 GB, measured) after ~0.5 GB for other copies under way would leave less")),
+        (7 * G, 0, Size::First, 5, Some(("7 GB free on /, and this copy (~3 GB, a first copy, not measured) would leave less than the floor (5 GB, CONTROL_MIN_FREE_GB)", "1 GB"))),
+        (6 * G, G / 2, Size::Measured(G), 5, Some(("this copy (~1 GB, measured) after ~0.5 GB for other copies under way would leave less", "0.5 GB"))),
         // Room: exactly at the floor afterwards is enough.
         (8 * G, 0, Size::First, 5, None),
         (5 * G + G / 10, 0, Size::Later, 5, None),
         (40 * G, 10 * G, Size::First, 5, None),
-        // A zero floor: only the copy itself must fit.
+        // A zero floor: only the copy itself must fit — one byte short is said as 1 KB, not 0.
         (G, 0, Size::Measured(G), 0, None),
-        (G, 0, Size::Measured(G + 1), 0, Some("1 GB free on /, and this copy (~1.0 GB, measured) would leave less than the floor (0 GB")),
+        (G, 0, Size::Measured(G + 1), 0, Some(("1 GB free on /, and this copy (~1.0 GB, measured) would leave less than the floor (0 GB", "1 KB"))),
+        // Rounded up, never down: 4.81 GB short is 4.9 GB to free.
+        (190_000_000, 0, Size::Measured(0), 5, Some(("only 0.2 GB free on /", "4.9 GB"))),
         // Counted in the floor (the reaper's): the floor alone.
         (20 * G, 0, Size::InFloor, 20, None),
-        (19 * G, 0, Size::InFloor, 20, Some("only 19 GB free on / (floor 20 GB")),
+        (19 * G, 0, Size::InFloor, 20, Some(("only 19 GB free on / (floor 20 GB", "1 GB"))),
     ];
     for (free, already, size, floor_gb, want) in cases {
-        let got = judge(&fs(1, "/", *free), *already, &Need::from(*size), floor(*floor_gb));
+        let got = judge(&fs(7, "/", *free), *already, &Need::from(*size), floor(*floor_gb));
         match (got, want) {
             (Ok(()), None) => {}
-            (Err(skip), Some(words)) => {
+            (Err(skip), Some((words, to_free))) => {
                 let text = skip.to_string();
                 assert!(text.starts_with("skipped: ") && text.contains(words), "{free} {size:?}: {text}");
-                assert!(text.contains("nothing copied; free space on / (`arena config check` names arena's biggest dirs there)"), "{text}");
+                let tail = format!(" — nothing copied; free at least {to_free} on / (`arena config check` names arena's biggest dirs there)");
+                assert!(text.ends_with(&tail), "{free} {size:?}: {text}");
+                let short = skip.short.as_ref().expect("short of room");
+                assert_eq!((short.dev, short.mount.as_path()), (7, Path::new("/")));
+                let need = floor_gb * G + already + Need::from(*size).bytes;
+                assert_eq!(short.bytes, need - free, "what's needed less what's free");
             }
             (got, want) => panic!("{free} {already} {size:?} {floor_gb}: got {got:?}, want {want:?}"),
         }
@@ -95,16 +105,52 @@ fn a_copy_goes_only_when_it_leaves_the_floor_free() {
     // The line the brief asks for, word for word at its start.
     let skip = judge(&fs(1, "/", 3_100_000_000), 0, &Need::from(Size::First), floor(5)).unwrap_err();
     assert!(skip.to_string().starts_with("skipped: only 3.1 GB free on / (floor 5 GB"), "{skip}");
+    // Naming the dirs to look at in place of the pointer, where a run can afford the look.
+    assert!(
+        skip.clone().naming("/tmp/arena-replace-x 3.5 GB · /srv/backup/w1d1 2.0 GB").to_string().ends_with(
+            " — nothing copied; free at least 4.9 GB on / (arena's biggest dirs there: /tmp/arena-replace-x 3.5 GB · /srv/backup/w1d1 2.0 GB)"
+        ),
+        "{skip}"
+    );
+    assert_eq!(skip.clone().naming(""), skip, "nothing to name: as it was");
     // Another floor names its own key.
     let reap = Floor { bytes: 20 * G, key: "REAP_MIN_FREE_GB" };
     assert_eq!(
-        judge(&fs(1, "/srv", G), 0, &Need::from(Size::InFloor), reap).unwrap_err().reason,
-        "only 1 GB free on /srv (floor 20 GB, REAP_MIN_FREE_GB): 19 GB short of the floor"
+        judge(&fs(1, "/srv", G), 0, &Need::from(Size::InFloor), reap).unwrap_err().to_string(),
+        "skipped: only 1 GB free on /srv (floor 20 GB, REAP_MIN_FREE_GB) — nothing copied; free at least 19 GB on /srv \
+         (`arena config check` names arena's biggest dirs there)"
     );
     assert_eq!(Floor::control(5 * G).max(reap), reap);
     assert_eq!(reap.max(Floor::control(30 * G)), Floor::control(30 * G));
     let unknown = Skip::unknown(Path::new("/x"), "gone");
     assert_eq!(unknown.to_string(), "skipped: free space on /x unknown (gone) — nothing copied; check that disk");
+    assert_eq!((unknown.short.clone(), unknown.clone().naming("/a 1 GB")), (None, unknown), "not a matter of room");
+    // Stopped while copying: at least back to the floor.
+    let stop = Skip::under_floor_now(&fs(3, "/mnt/big", 4_900_000_000), floor(5));
+    assert_eq!(
+        stop.to_string(),
+        "stopped: only 4.9 GB free on /mnt/big while copying (floor 5 GB, CONTROL_MIN_FREE_GB) — what it copied so far \
+         stays; free at least 0.1 GB on /mnt/big (`arena config check` names arena's biggest dirs there)"
+    );
+    assert_eq!(stop.short.map(|s| (s.dev, s.bytes)), Some((3, 100_000_000)));
+}
+
+#[test]
+fn an_amount_to_free_is_rounded_up() {
+    for (b, want) in [
+        (0, "0 GB"),
+        (1, "1 KB"),
+        (999_001, "1 MB"),
+        (1_000_001, "2 MB"),
+        (99_999_999, "0.1 GB"),
+        (100_000_001, "0.2 GB"),
+        (4_810_000_000, "4.9 GB"),
+        (4_900_000_000, "4.9 GB"),
+        (4_999_999_999, "5 GB"),
+        (19 * G, "19 GB"),
+    ] {
+        assert_eq!(gb_up(b), want, "{b}");
+    }
 }
 
 #[test]

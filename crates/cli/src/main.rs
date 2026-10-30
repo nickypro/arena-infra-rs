@@ -6115,7 +6115,8 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
         }
     }
     // What every copy onto this box leaves free on its disk (a bad value fails every pull and
-    // copy up front). How full the disk is now comes after the report (`disk::check_rows`).
+    // copy up front, and refuses replace/migrate before they create anything). How full the disk
+    // is now comes after the report (`disk::check_rows`).
     match arena_core::disk::floor_bytes(cfg) {
         Ok(b) => println!(
             "  · copies leave free here     {}{} (CONTROL_MIN_FREE_GB) — pulls, backup copies, replace/migrate staging, the reaper",
@@ -6127,7 +6128,7 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
             }
         ),
         Err(e) => {
-            println!("  ✗ copies leave free here     {e}");
+            println!("  ✗ copies leave free here     {e} — pulls, backup copies and replace/migrate are refused until it's fixed");
             note_invalid_text(&mut missing, &e);
         }
     }
@@ -13755,6 +13756,10 @@ async fn copy_pod_files(
     use arena_core::volume;
     let remote_key = cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string();
     let user = cfg.get("SSH_USER").unwrap_or("root").to_string();
+    // What the via-local staging must leave free on this box (CONTROL_MIN_FREE_GB): a bad value
+    // fails here, before anything is copied — and replace/migrate refuse it before they create
+    // anything (`disk::floor_refusal`): found only here, it left the new pod billing.
+    let floor = disk::floor(cfg)?;
     // The repo's place in the home, carried as a TREE: on a pod with a volume it is a link
     // onto /workspace (setup put it there), and a plain home copy would carry only the link —
     // leaving the work on the old pod's volume, which goes with it.
@@ -13889,24 +13894,19 @@ async fn copy_pod_files(
             println!("      copied (direct pod-to-pod)");
             return Ok(());
         }
-        // The via-local copy writes onto this box: the free space it must leave there
-        // (CONTROL_MIN_FREE_GB) matters here only — a direct copy writes nothing here.
-        // replace/migrate refuse a bad value before they create anything (`disk::floor_refusal`).
-        let floor = disk::floor(cfg)?;
-        let refuse = |skip: &arena_core::disk::Skip| {
+        // Refused for room: recorded for the health check, said with how much to free where,
+        // arena's biggest dirs there, and another filesystem to stage on (`need`: its size, 0
+        // before it is sized).
+        let refuse = |skip: &arena_core::disk::Skip, floor, need| {
             disk::note_skips(cfg, "replace/migrate staging", &[(dest_pod.name.clone(), skip.to_string())]);
-            anyhow::anyhow!(
-                "not copying via local staging ({}): {skip}, or point TMPDIR at a bigger disk for this run \
-                 (`TMPDIR=/mnt/<volume>/tmp arena …`)",
-                opts.stage_root.display()
-            )
+            anyhow::anyhow!("not copying via local staging ({}): {}", opts.stage_root.display(), disk::staging_advice(cfg, skip, need, floor))
         };
         // Already under the floor: no copy fits, whatever its size — said before it is sized (an
         // rsync dry run over the whole home, for nothing) or anything is made.
         if let Some(floor) = floor {
             if let Some(fs) = arena_core::disk::reading(&opts.stage_root).ok().filter(|fs| fs.free < floor.bytes) {
                 if let Err(skip) = arena_core::disk::judge(&fs, 0, &arena_core::disk::Size::Measured(0).into(), floor) {
-                    return Err(refuse(&skip));
+                    return Err(refuse(&skip, floor, 0));
                 }
             }
         }
@@ -13997,7 +13997,7 @@ async fn copy_pod_files(
                     let copy = [(dest_pod.name.clone(), vec![(opts.stage_root.clone(), arena_core::disk::Size::Measured(needed))])];
                     let (skipped, hold) = disk::judge_copies(cfg, floor, &copy, true);
                     if let Some((_, skip)) = skipped.first() {
-                        return Err(refuse(skip));
+                        return Err(refuse(skip, floor, needed));
                     }
                     hold
                 }
@@ -14022,7 +14022,13 @@ async fn copy_pod_files(
             if let Err(skip) = &pulled {
                 disk::note_skips(cfg, "replace/migrate staging", &[(dest_pod.name.clone(), skip.to_string())]);
             }
-            pulled.map_err(|skip| anyhow::anyhow!("pull source -> staging ({}): {skip}", opts.stage_root.display()))??;
+            pulled.map_err(|skip| {
+                let advice = match floor {
+                    Some(floor) => disk::staging_advice(cfg, &skip, needed, floor),
+                    None => skip.to_string(),
+                };
+                anyhow::anyhow!("pull source -> staging ({}): {advice}", opts.stage_root.display())
+            })??;
             let dest_target = fresh_target(provider, dest_id, cfg).await?;
             let staged_repo = rel.as_ref().is_some_and(|r| std::fs::symlink_metadata(stage.join(r)).is_ok_and(|m| m.is_dir()));
             let leg = CopyLeg::start(POD_COPY_TIMEOUT);
@@ -19606,7 +19612,9 @@ ASK_CODEX_MODEL=-x
             ("CONTROL_MIN_FREE_GB=0\n", format!("  · copies leave free here     0 GB{tail}")),
             (
                 "CONTROL_MIN_FREE_GB=lots\n",
-                "  ✗ copies leave free here     CONTROL_MIN_FREE_GB must be a whole number of GB, 0..=100000 (got `lots`)".to_string(),
+                "  ✗ copies leave free here     CONTROL_MIN_FREE_GB must be a whole number of GB, 0..=100000 (got `lots`) — pulls, \
+                 backup copies and replace/migrate are refused until it's fixed"
+                    .to_string(),
             ),
         ] {
             let (report, missing) = config_report(&Config::parse(&format!("{base}{extra}")), "runpod");
@@ -24480,7 +24488,8 @@ mod remote_tests {
                 assert!(
                     said.iter().any(|l| l.starts_with(&format!("✗ {pod}: skipped: only "))
                         && l.contains("(floor 100000 GB, CONTROL_MIN_FREE_GB): this copy (~6 GB, a first copy, not measured) + the floor = 100006 GB needed")
-                        && l.contains(" — nothing copied; free space on ")),
+                        && l.contains(" — nothing copied; free at least ")
+                        && l.ends_with(" (`arena config check` names arena's biggest dirs there)")),
                     "{pod}: {said:?}"
                 );
             }
@@ -27216,8 +27225,13 @@ mod remote_tests {
         let e = copy_pod_files(&judged, &f, &fake, src, dest, &opts(stub("huge", "999.00P", 0))).await.unwrap_err();
         let msg = format!("{e:#}");
         assert!(msg.contains(&format!("not copying via local staging ({}): skipped: ", root.display())), "{msg}");
-        assert!(msg.contains("GB, measured) would leave less than the floor (0 GB, CONTROL_MIN_FREE_GB)"), "{msg}");
-        assert!(msg.ends_with("names arena's biggest dirs there), or point TMPDIR at a bigger disk for this run (`TMPDIR=/mnt/<volume>/tmp arena …`)"), "{msg}");
+        assert!(msg.contains("GB, measured) would leave less than the floor (0 GB, CONTROL_MIN_FREE_GB) — nothing copied; free at least "), "{msg}");
+        // How much to free and where, what's there (arena's biggest dirs, if any), and another
+        // filesystem to stage on: none has room for ~999 PB.
+        let room = |msg: &str| msg.contains("(arena's biggest dirs there: ") || msg.contains("(`arena config check` names arena's biggest dirs there)");
+        assert!(room(&msg), "{msg}");
+        let anywhere = "; or stage it on another filesystem for this run: `TMPDIR=<a dir on a disk with room> arena …`";
+        assert!(msg.ends_with(anywhere), "{msg}");
         assert!(!stage.exists(), "nothing staged, nothing left behind");
         // A box already under the floor: refused before the home is sized (an rsync dry run over
         // all of it, for nothing) or anything is made — saying how far below the floor it is.
@@ -27228,13 +27242,17 @@ mod remote_tests {
         arena_core::remote::write_test_script(&never, format!("#!/bin/sh\ntouch {}\nexit 1\n", ran.display())).unwrap();
         let e = copy_pod_files(&full, &f, &fake, src, dest, &opts(never.display().to_string())).await.unwrap_err();
         let msg = format!("{e:#}");
-        assert!(msg.contains("skipped: only ") && msg.contains("(floor 100000 GB, CONTROL_MIN_FREE_GB): ") && msg.contains("GB short of the floor — nothing copied; free space on "), "{msg}");
+        assert!(msg.contains("skipped: only ") && msg.contains("(floor 100000 GB, CONTROL_MIN_FREE_GB) — nothing copied; free at least "), "{msg}");
+        assert!(room(&msg) && msg.ends_with(anywhere), "{msg}");
         assert!(!ran.exists(), "no rsync at all: nothing sized");
         assert!(!stage.exists());
-        // A floor that can't be read fails the copy via local staging, which needs it.
+        // A floor that can't be read fails the copy before anything is asked or copied (replace
+        // and migrate refuse it before they create anything: `disk::floor_refusal`).
         let bad = Config::parse(&format!("{}CONTROL_MIN_FREE_GB=2.5\n", cfg_text()));
-        let e = copy_pod_files(&bad, &f, &fake_for("10.0.0.2:22002"), src, dest, &opts(stub("bad", "1,000", 0))).await.unwrap_err();
+        let fake = fake_for("10.0.0.2:22002");
+        let e = copy_pod_files(&bad, &f, &fake, src, dest, &opts(stub("bad", "1,000", 0))).await.unwrap_err();
         assert!(format!("{e:#}").contains("CONTROL_MIN_FREE_GB must be a whole number of GB"), "{e:#}");
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
         // A stage another run holds (a second replace/migrate of the same pod): refused, and that
         // run's stage left exactly as it is.
         std::fs::create_dir_all(&stage).unwrap();
@@ -27252,10 +27270,7 @@ mod remote_tests {
         fake.on(&host(22001), "RUNPOD_POD_ID", FakeReply::stdout(src));
         fake.on("10.0.0.2:22002", "arena-replica-ready", FakeReply::stdout("arena-replica-ready\n"));
         fake.on("10.0.0.2:22002", "MARK=", FakeReply::stdout(&format!("ID={dest}\nMARK=arena-replace-{dest}\n")));
-        // (with a floor the via-local copy couldn't read: a direct copy writes nothing here, so it
-        // never reads it)
-        let bad = Config::parse(&format!("{}CONTROL_MIN_FREE_GB=2.5\n", cfg_text()));
-        copy_pod_files(&bad, &f, &fake, src, dest, &opts(stub("direct", "1,000", 0))).await.unwrap();
+        copy_pod_files(&cfg(), &f, &fake, src, dest, &opts(stub("direct", "1,000", 0))).await.unwrap();
         assert!(execs(&fake, 22001).iter().any(|(c, _)| c.contains("rsync ")), "copied directly");
         assert!(stage.join("theirs.py").exists(), "an earlier attempt's stage is never removed by a later copy");
         let _ = std::fs::remove_dir_all(&root);

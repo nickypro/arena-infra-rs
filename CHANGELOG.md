@@ -19,6 +19,32 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-30 · Hetzner: a limit refusal says which limit and what frees room under it
+- A Hetzner create refused over one of the account's limits (403 `resource_limit_exceeded`) now
+  says what frees room under the limit Hetzner names: a primary IP for `primary_ip_limit` (live:
+  the sandbox refused every create so, though its project held no server and no IP), a smaller type
+  or a server for cores and servers, a floating IP, a volume, a snapshot (`arena image prune`) — and
+  where to ask for more (Hetzner Console: Limits tab → Request change → Limit increase). It said
+  "use a smaller type" whatever the limit, and called it the project's: Hetzner counts a limit over
+  every project of the account.
+- Hetzner's 403 `maintenance` says to try again later instead of "authentication failed"; a
+  `pods rename` refused for a limit or for maintenance reads the same way. Only a 401 or a 403
+  `forbidden` reads as "authentication failed".
+
+## 2026-10-30 · Room on the control box: a bad floor refused before replace creates anything
+- `pods replace`, `migrate copy` and a cutover's final sync refuse a `CONTROL_MIN_FREE_GB` that
+  isn't a whole number before anything is created (their `--dry-run` says they would). Before, the
+  copy found it only after the new pod was created and set up, and left that pod billing.
+  `config check`'s ✗ row says what it refuses.
+- A copy skipped or stopped for room says how much to free, and where: `only 3.1 GB free on /
+  (floor 5 GB, …): this copy (~3.9 GB, measured) + the floor = 8.9 GB needed — nothing copied;
+  free at least 5.8 GB on / (…)`. A replace/migrate staging refused so also names arena's biggest
+  dirs on that disk, and another disk arena writes to with room, for the run's `TMPDIR`
+  (`TMPDIR=/mnt/volume-nbg1-1/arena-tmp arena …`); on a disk already under the floor it's refused
+  before the pod's home is sized (an rsync dry run over all of it).
+- The daily health check says when a copy was stopped (not skipped) for space and, for the
+  backup's and the reaper's copies, that each run tries it again until there's room.
+
 ## 2026-10-30 · The dashboard's bottom line is plain words
 - The footer no longer uses `☰`, `⟳`, `✓`, `⚠` or a spinner, which some terminals draw as
   pictures. It reads `[i] info · ok · API 6/min · 7s ago · every 5s` (`warn: …` in yellow, `list

@@ -801,10 +801,13 @@ findings #5–#7, #13, #16, #17, #19, #20, #26–#30):
   real reason. The **via-local** fallback first sizes the staging (an rsync dry run) and refuses
   when it wouldn't leave `CONTROL_MIN_FREE_GB` free on that disk ([Room on this
   box](#room-on-this-box-control_min_free_gb)), saying what it needs in all (`this copy (~3.9 GB,
-  measured) + the floor = 8.9 GB needed`) and that `TMPDIR` can point at a bigger disk for the run;
-  a disk already under the floor is refused without sizing anything. A `CONTROL_MIN_FREE_GB` that
-  isn't a whole number refuses `replace`, `migrate copy` and a cutover's final sync before anything
-  is created (a direct copy, which writes nothing on this box, doesn't read it); the stage (`$TMPDIR/arena-replace-<id>`, mode 0700,
+  measured) + the floor = 8.9 GB needed`), how much to free on which filesystem with arena's biggest
+  dirs there (`free at least 5.8 GB on / (arena's biggest dirs there: /tmp/arena-replace-… 3.5 GB ·
+  …)`), and another filesystem arena writes to that has room, for the run's `TMPDIR`
+  (`TMPDIR=/mnt/volume-nbg1-1/arena-tmp arena …`); a disk already under the floor is refused
+  without sizing anything. A `CONTROL_MIN_FREE_GB` that isn't a whole number refuses `replace`,
+  `migrate copy` and a cutover's final sync before anything is created (their dry runs say so);
+  found only at the copy, it left the new pod built and billing. The stage (`$TMPDIR/arena-replace-<id>`, mode 0700,
   locked while a run copies through it — a second replace/migrate of the same pod is refused, its
   stage untouched) is **removed** once the copy through it landed, and kept — with its path, size
   and the `rm -rf` — when it failed (a re-run continues from it) or the run was stopped. A later
@@ -872,7 +875,8 @@ once.)
   again`) and fails, and freeing space is the fix either way.
 - A skip happens before the pod is asked anything or any of its dirs is made, one line per pod —
   `✗ arena9-bloom: skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB): this copy (~0.2
-  GB, …) + the floor = 5.2 GB needed — nothing copied; free space on / (…)` — and it is a failure of the run (the exit; `pods backup`'s `the fallback copy
+  GB, …) + the floor = 5.2 GB needed — nothing copied; free at least 2.1 GB on / (…)` — how much
+  to free there is what it needs in all less what's free, rounded up — and it is a failure of the run (the exit; `pods backup`'s `the fallback copy
   failed too: skipped: …`; a `--hard` switch doesn't reset that pod). A `--dry-run` says which pods a
   real run would skip now.
 - The reaper keeps its own, larger `REAP_MIN_FREE_GB` (default 20) on both tier roots, never less

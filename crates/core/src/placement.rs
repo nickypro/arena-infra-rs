@@ -2628,7 +2628,7 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
         assert!(matches!(out.end, End::Filled), "{:?}", out.end);
         assert_eq!(out.created.len(), 2);
         assert_eq!(fake.calls().iter().filter(|(_, g, c)| g == A4000 && c == "COMMUNITY").count(), 1, "out for the run: {:?}", fake.calls());
-        assert!(lines.iter().any(|l| l.starts_with("[over the limit] arena8-apple on ") && l.contains("Hetzner refused: the project's resource limit is reached") && l.ends_with("— skipping this option, trying the next")), "{lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("[over the limit] arena8-apple on ") && l.contains("Hetzner refused: the account's resource limit is reached") && l.ends_with("— skipping this option, trying the next")), "{lines:#?}");
 
         let fake = Fake::new(Reply::Quota);
         let started = tokio::time::Instant::now();
