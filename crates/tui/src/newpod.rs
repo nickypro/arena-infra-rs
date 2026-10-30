@@ -54,6 +54,8 @@ pub(crate) enum NpField {
     Volume,
     /// `up --check`: deep-check each pod, replacing one on a bad host.
     Check,
+    /// `up --retry-mins N`: when there's no capacity, try again for up to N minutes ([`RETRIES`]).
+    Retry,
     Pods,
 }
 
@@ -190,6 +192,21 @@ pub(crate) struct Defaults {
 /// comma list).
 pub(crate) const CLOUDS: [&str; 3] = ["COMMUNITY", "SECURE", "COMMUNITY,SECURE"];
 
+/// The retry field's choices (the human, 2026-10-30: "for create pod on tui, can u have an
+/// auto-retry option?"): how long `up` keeps trying while there's no capacity — `(label,
+/// minutes)`, `--retry-mins` (0: once, `up`'s default). A round every [`RETRY_EVERY_SECS`] (up's
+/// `--retry-secs` default), each round every option of the choice (near the proxy first, then
+/// the fallbacks), the confirmed names only, never past the window; Ctrl+C (`[s]` in the runs
+/// panel) stops it between rounds, keeping what was made. Not `--keep-trying`: that gives up
+/// after an hour whatever it says (120 tries 30 s apart), waits on one GPU type and tier only (a
+/// fallback list is refused) and drops the near-the-proxy preference — and its 30 s waits don't
+/// listen for Ctrl+C. The longest is a day — "until it works", bounded.
+pub(crate) const RETRIES: [(&str, u64); 5] = [("off", 0), ("10 min", 10), ("30 min", 30), ("2 h", 120), ("24 h", 1440)];
+
+/// How often a retrying `up` tries again: its `--retry-secs` default, which the form leaves as it
+/// is.
+pub(crate) const RETRY_EVERY_SECS: u64 = 60;
+
 /// The add-pod form: `↑↓` moves between [`NpField`]s, `←→` changes the field's value. Pure.
 #[derive(Debug, Clone)]
 pub(crate) struct NewPodForm {
@@ -209,6 +226,8 @@ pub(crate) struct NewPodForm {
     /// Persistent volume in GB (0 = none; 100 GB steps).
     pub volume_gb: u32,
     pub check: bool,
+    /// Index into [`RETRIES`] (0: off).
+    pub retry_idx: usize,
     pub count: usize,
     /// The free machine names as of the last refresh (fleet-wide: a name is free only if no
     /// provider holds it).
@@ -252,7 +271,7 @@ impl NewPodForm {
         if !self.is_hetzner() {
             f.extend([NpField::GpuCount, NpField::Disk, NpField::Volume, NpField::Check]);
         }
-        f.push(NpField::Pods);
+        f.extend([NpField::Retry, NpField::Pods]);
         f
     }
 
@@ -299,6 +318,7 @@ impl NewPodForm {
             NpField::Disk => self.disk_gb = (self.disk_gb as i32 + delta * 50).clamp(20, 2000) as u32,
             NpField::Volume => self.volume_gb = (self.volume_gb as i32 + delta * 100).clamp(0, 2000) as u32,
             NpField::Check => self.check = !self.check,
+            NpField::Retry => self.retry_idx = wrap(self.retry_idx, delta, RETRIES.len()),
             NpField::Pods => {
                 let max = self.free.len().max(1) as i32;
                 self.count = (self.count as i32 + delta).clamp(1, max) as usize;
@@ -351,6 +371,11 @@ impl NewPodForm {
         self.source = source;
     }
 
+    /// How long `up` retries while there's no capacity, in minutes (0: it doesn't).
+    pub(crate) fn retry_mins(&self) -> u64 {
+        RETRIES[self.retry_idx.min(RETRIES.len() - 1)].1
+    }
+
     /// The names the create would get as of the last refresh.
     pub(crate) fn planned_names(&self) -> Vec<String> {
         self.free.iter().take(self.count).cloned().collect()
@@ -359,8 +384,8 @@ impl NewPodForm {
     /// `arena pods up`'s arguments for this form (the provider goes in `--provider`, the
     /// runner's): `--add N` — `up` picks the names from its own whole-fleet listing — then the
     /// type, and what the form shows for this provider: on Hetzner the server type alone; on a
-    /// GPU provider the GPU type, GPUs per pod, RunPod's tier(s), disk, volume and `--check`.
-    /// `--yes`: the dashboard's confirm has asked. Pure.
+    /// GPU provider the GPU type, GPUs per pod, RunPod's tier(s), disk, volume and `--check`;
+    /// then `--retry-mins N` when it retries. `--yes`: the dashboard's confirm has asked. Pure.
     pub(crate) fn up_args(&self) -> Vec<String> {
         let mut a: Vec<String> = vec!["pods".into(), "up".into(), "--add".into(), self.count.to_string()];
         let kind = self.kind().map(|k| k.id.clone()).unwrap_or_default();
@@ -375,6 +400,9 @@ impl NewPodForm {
             if self.check {
                 a.push("--check".into());
             }
+        }
+        if self.retry_mins() > 0 {
+            a.extend(["--retry-mins".into(), self.retry_mins().to_string()]);
         }
         a.push("--yes".into());
         a
@@ -451,6 +479,7 @@ pub(crate) fn build_form(cfg: &Config, launch_provider: &str, existing: &[Pod], 
         disk_gb: spec.disk_gb.max(20),
         volume_gb: spec.volume_gb,
         check: false,
+        retry_idx: 0,
         count: 1,
         free,
         listed,
@@ -550,10 +579,25 @@ pub(crate) fn key(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, code: KeyCode) -> bo
     }
 }
 
-/// `pods up: 2 × RTX A4000 · 16GB on runpod` — the run's title.
+/// `pods up: 2 × RTX A4000 · 16GB on runpod` — the run's title (`, retrying up to 30 min`).
 fn up_title(form: &NewPodForm) -> String {
     let kind = form.kind().map_or("?", |k| k.label.as_str());
-    format!("pods up: {} × {kind} on {}", form.count, form.provider_name())
+    let retry = if form.retry_mins() > 0 { format!(", retrying up to {}", retry_span(form.retry_mins())) } else { String::new() };
+    format!("pods up: {} × {kind} on {}{retry}", form.count, form.provider_name())
+}
+
+/// `10 min`, `2 h`, `24 h` — a retry window as the form names it.
+pub(crate) fn retry_span(mins: u64) -> String {
+    RETRIES.iter().find(|(_, m)| *m == mins).map(|(l, _)| l.to_string()).unwrap_or_else(|| format!("{mins} min"))
+}
+
+/// The retry field's value: `off`, or `30 min if there's no capacity`.
+fn retry_words(mins: u64) -> String {
+    if mins == 0 {
+        "off — once; no capacity ends it".into()
+    } else {
+        format!("{} while there's no capacity", retry_span(mins))
+    }
 }
 
 /// The command line the confirm shows: what will run, flags and all.
@@ -613,6 +657,7 @@ pub(crate) fn render(f: &mut Frame, form: &NewPodForm, offers: &offers::State) {
             NpField::Disk => ("disk", format!("{}GB", form.disk_gb)),
             NpField::Volume => ("volume", if form.volume_gb == 0 { "none".to_string() } else { format!("{}GB", form.volume_gb) }),
             NpField::Check => ("check", if form.check { "deep-check, replace a bad host".into() } else { "off".to_string() }),
+            NpField::Retry => ("retry", retry_words(form.retry_mins())),
             NpField::Pods => ("pods", format!("{} of {} free", form.count, form.free.len())),
         };
         let marker = if selected { "▶ " } else { "  " };
@@ -677,6 +722,18 @@ pub(crate) fn render(f: &mut Frame, form: &NewPodForm, offers: &offers::State) {
         NpField::Disk => lines.push(Line::styled("container disk in 50GB steps — the main storage (wiped if the pod is destroyed).", dim)),
         NpField::Volume => lines.push(Line::styled("persistent volume in 100GB steps (0 = none, the default). Survives restarts.", dim)),
         NpField::Check => lines.push(Line::styled("`up --check`: deep-check each pod; one failing on its host is terminated and recreated (2 tries).", dim)),
+        NpField::Retry => {
+            lines.push(Line::styled(
+                format!(
+                    "when nothing is free (no capacity): try again every {RETRY_EVERY_SECS}s — every option, near the proxy first — for up to this long, then stop; nothing bills until a pod is made. [s] in the runs panel stops it early, keeping what was made. (`up --retry-mins N`)"
+                ),
+                dim,
+            ));
+            for (i, (label, _)) in RETRIES.iter().enumerate() {
+                let mark = if i == form.retry_idx { "●" } else { "○" };
+                lines.push(Line::styled(format!("  {mark} {label}"), if i == form.retry_idx { cur } else { Style::default() }));
+            }
+        }
         NpField::Pods => {
             lines.push(Line::styled(if form.listed { "will create (free as of the last refresh — up re-checks):" } else { "will create (the fleet isn't listed yet — up picks free names):" }, label));
             let planned = form.planned_names();
@@ -720,6 +777,18 @@ pub(crate) fn render_confirm(f: &mut Frame, form: &NewPodForm, offers: &offers::
         Line::styled("up lists the whole fleet again first, and refuses if a provider doesn't answer.", dim),
         Line::from(""),
     ];
+    if form.retry_mins() > 0 {
+        let until = arena_core::snapshot::unix_now() + form.retry_mins() * 60;
+        lines.push(Line::styled(
+            format!(
+                "retry: no capacity → tries again every {RETRY_EVERY_SECS}s until {} ({}), then stops; [s] in the runs panel stops it sooner",
+                runs::clock(until),
+                retry_span(form.retry_mins())
+            ),
+            Style::default().fg(Color::Yellow),
+        ));
+        lines.push(Line::from(""));
+    }
     lines.extend(availability(form, offers));
     lines.push(Line::from(""));
     lines.push(Line::styled("it runs in the background: [p] shows its progress, the dashboard stays usable.", dim));
@@ -761,6 +830,7 @@ mod tests {
             disk_gb: 100,
             volume_gb: 0,
             check: false,
+            retry_idx: 0,
             count: 1,
             free: vec!["arena8-apple".into(), "arena8-autumn".into()],
             listed: true,
@@ -785,10 +855,10 @@ mod tests {
     fn fields_depend_on_provider() {
         let mut f = form();
         use NpField::*;
-        assert_eq!(f.fields(), [Provider, CloudType, Kind, GpuCount, Disk, Volume, Check, Pods]);
+        assert_eq!(f.fields(), [Provider, CloudType, Kind, GpuCount, Disk, Volume, Check, Retry, Pods]);
         assert!(f.change(1), "runpod → hetzner (vast has no key)");
         assert_eq!(f.provider_name(), "hetzner");
-        assert_eq!(f.fields(), [Provider, Kind, Pods], "a CPU VM: its server type, no GPU count, cloud, disk or check");
+        assert_eq!(f.fields(), [Provider, Kind, Retry, Pods], "a CPU VM: its server type, no GPU count, cloud, disk or check");
         assert_eq!(f.cloud(), None);
     }
 
@@ -852,6 +922,37 @@ mod tests {
             f.up_args(),
             ["pods", "up", "--add", "2", "--gpu", "NVIDIA RTX A4000", "--gpus", "2", "--disk", "100", "--volume", "100", "--check", "--yes"]
         );
+    }
+
+    /// The human (2026-10-30): "for create pod on tui, can u have an auto-retry option?" The
+    /// retry field — off by default, on every provider — maps to `up --retry-mins N`: off, 10
+    /// min, 30 min, 2 h, a day; the title and the confirm say so.
+    #[test]
+    fn the_retry_field_maps_to_retry_mins() {
+        let mut f = form();
+        assert_eq!(f.retry_mins(), 0);
+        assert!(!f.up_args().contains(&"--retry-mins".to_string()), "off: once, as before");
+        f.field = f.fields().iter().position(|x| *x == NpField::Retry).unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..RETRIES.len() {
+            f.change(1);
+            seen.push(f.retry_mins());
+        }
+        assert_eq!(seen, [10, 30, 120, 1440, 0], "←→ cycles through them");
+        f.change(-1);
+        assert_eq!(f.retry_mins(), 1440, "and back");
+        f.retry_idx = 2;
+        assert_eq!(
+            f.up_args(),
+            ["pods", "up", "--add", "1", "--gpu", "NVIDIA RTX A4000", "--gpus", "1", "--cloud", "COMMUNITY", "--disk", "100", "--volume", "0", "--retry-mins", "30", "--yes"]
+        );
+        assert!(up_title(&f).ends_with(" on runpod, retrying up to 30 min"), "{}", up_title(&f));
+        // Hetzner too: a cx type can be out of stock in a location.
+        f.field = 0;
+        f.change(1);
+        f.set_kinds(hetzner_types(), Source::Live);
+        assert_eq!(f.up_args(), ["pods", "up", "--add", "1", "--server-type", "cx33", "--retry-mins", "30", "--yes"]);
+        assert_eq!(retry_span(1440), "24 h");
     }
 
     /// RunPod's live catalog: sorted with the default first, then by VRAM, then price; a type
@@ -921,7 +1022,7 @@ mod tests {
         f.field = 6; // Check toggles
         f.change(1);
         assert!(f.check);
-        f.field = 7; // Pods
+        f.field = 8; // Pods
         for _ in 0..20 {
             f.change(1);
         }

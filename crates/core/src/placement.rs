@@ -528,30 +528,9 @@ fn gpu_short(api: &str, prices: &PriceBook) -> String {
     gpu::find(api).map(|g| g.label.to_string()).unwrap_or_else(|| normalize_gpu_name(api))
 }
 
-/// RunPod's name for a MIG slice, from its id alone: the parent's model — its name minus the
-/// vendor and `RTX`, up to the first form-factor/edition/memory word — then `MIG` and the
-/// slice's memory (`NVIDIA B300 SXM6 AC MIG 1g.34gb` → `B300 MIG 34GB`; `NVIDIA RTX PRO 6000
-/// Blackwell Server Edition MIG 2g.48gb` → `PRO 6000 MIG 48GB`). Checked against every MIG
-/// entry of the recorded catalog. `None` for an id it can't read that way. Pure.
-pub(crate) fn mig_label(api: &str) -> Option<String> {
-    let (parent, profile) = api.split_once(" MIG ")?;
-    let mem = profile.trim().split_once('.')?.1.to_ascii_lowercase();
-    let gb: u32 = mem.strip_suffix("gb")?.parse().ok()?;
-    let edition = |w: &str| {
-        let w = w.to_ascii_lowercase();
-        ["sxm", "pcie", "hbm", "nvl"].iter().any(|p| w.starts_with(p))
-            || ["ac", "blackwell", "server", "workstation", "edition"].contains(&w.as_str())
-            || w.strip_suffix("gb").is_some_and(|n| n.parse::<u32>().is_ok())
-    };
-    let parent = normalize_gpu_name(parent);
-    let model: Vec<&str> = parent
-        .split_whitespace()
-        .flat_map(|w| w.split('-'))
-        .skip_while(|w| w.eq_ignore_ascii_case("rtx"))
-        .take_while(|w| !edition(w))
-        .collect();
-    (!model.is_empty()).then(|| format!("{} MIG {gb}GB", model.join(" ")))
-}
+/// RunPod's name for a MIG slice, from its id alone (`NVIDIA B300 SXM6 AC MIG 1g.34gb` → `B300
+/// MIG 34GB`): the shared label code's ([`crate::fleet::mig_label`]), so every surface agrees.
+pub(crate) use crate::fleet::mig_label;
 
 /// Expand, price, filter and order the options for `provider`. Pure.
 ///

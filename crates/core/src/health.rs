@@ -318,10 +318,12 @@ impl DeepFacts {
     /// GPUs as the machine sees them — `2×RTX A4000`, `1×A100 80GB PCIe+1×H100` for a
     /// mixed box — else torch's count (`2×GPU`), else `-`. A MIG slice is labelled as the
     /// slice (finding #24): the provider's name for it when known (`1×B300 MIG 34GB`), else
-    /// the parent plus the profile `nvidia-smi -L` shows (`1×B300 SXM6 AC MIG 1g.34gb`) —
-    /// never the bare parent card, which is not what the pod has. Where nvidia-smi names no
-    /// GPU (it can't run, or answers `[N/A]`) the names are torch's; torch's win outright when
-    /// they name a MIG slice (`1×A100-SXM4-40GB MIG 1g.5gb`), nvidia-smi's row being the parent.
+    /// the parent plus the profile `nvidia-smi -L` shows, named the same way (`B300 SXM6 AC` +
+    /// `1g.34gb` → `1×B300 MIG 34GB`: [`crate::fleet::mig_label`]; the two as they are when that
+    /// can't read them) — never the bare parent card, which is not what the pod has. Where
+    /// nvidia-smi names no GPU (it can't run, or answers `[N/A]`) the names are torch's; torch's
+    /// win outright when they name a MIG slice (`NVIDIA A100-SXM4-40GB MIG 1g.5gb` → `1×A100 MIG
+    /// 5GB`), nvidia-smi's row being the parent.
     pub fn gpu_label(&self) -> String {
         let slices = self.mig_devices.filter(|&n| n > 0);
         if let Some(slice) = self.slice.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -329,8 +331,10 @@ impl DeepFacts {
             return format!("{n}×{slice}");
         }
         if let (Some(n), Some(parent)) = (slices, self.gpus.first().and_then(|g| g.name.as_deref())) {
+            // As the provider would name it (`B300 MIG 34GB`) when the profile says its memory.
             let profile = self.mig_profile.as_deref().map(|p| format!(" {p}")).unwrap_or_default();
-            return format!("{n}×{} MIG{profile}", normalize_gpu_name(parent));
+            let named = crate::fleet::mig_label(&format!("{parent} MIG{profile}"));
+            return format!("{n}×{}", named.unwrap_or_else(|| format!("{} MIG{profile}", normalize_gpu_name(parent))));
         }
         let torch_named = self.torch_gpus.iter().any(|g| g.name.is_some());
         let torch_mig = self.torch_gpus.iter().any(|g| g.name.as_deref().is_some_and(names_mig));
@@ -342,7 +346,7 @@ impl DeepFacts {
         };
         let mut groups: Vec<(String, usize)> = Vec::new();
         for name in names {
-            let name = name.map(normalize_gpu_name).unwrap_or_else(|| "GPU".into());
+            let name = name.map(crate::fleet::gpu_name).unwrap_or_else(|| "GPU".into());
             match groups.iter_mut().find(|(n, _)| *n == name) {
                 Some((_, c)) => *c += 1,
                 None => groups.push((name, 1)),
@@ -1367,12 +1371,13 @@ pub struct PodHealth {
     pub host: Option<String>,
 }
 
-/// The provider's name for `pod`'s GPU when it is a MIG slice (`B300 MIG 34GB`, `NVIDIA B300
-/// SXM6 AC MIG 1g.34gb` → `B300 SXM6 AC MIG 1g.34gb`) — the word `MIG` in its GPU type —
-/// else `None`. What labels show instead of the parent card nvidia-smi names. Pure.
+/// The provider's name for `pod`'s GPU when it is a MIG slice, as every surface names it
+/// ([`crate::fleet::gpu_name`]: `B300 MIG 34GB`, and `NVIDIA B300 SXM6 AC MIG 1g.34gb` → `B300
+/// MIG 34GB`) — the word `MIG` in its GPU type — else `None`. What labels show instead of the
+/// parent card nvidia-smi names. Pure.
 pub fn mig_slice_name(pod: &Pod) -> Option<String> {
     let ty = pod.gpu_type.as_deref()?.trim();
-    names_mig(ty).then(|| normalize_gpu_name(ty))
+    names_mig(ty).then(|| crate::fleet::gpu_name(ty))
 }
 
 /// Whether a GPU name names a MIG slice: the word `MIG` in it (`B300 MIG 34GB`, torch's
@@ -1756,9 +1761,9 @@ deep_check_end=1
         );
         let f = parse_deep(&mig);
         assert_eq!((f.mig_devices, f.mig_profile.as_deref()), (Some(1), Some("1g.34gb")));
-        assert_eq!(f.gpu_label(), "1×B300 SXM6 AC MIG 1g.34gb", "no provider name: parent + profile");
+        assert_eq!(f.gpu_label(), "1×B300 MIG 34GB", "no provider name: parent + profile, named as the provider names it");
         // With the provider's name for the slice (v1's display name, or v2's id).
-        for (gpu_type, want) in [("B300 MIG 34GB", "1×B300 MIG 34GB"), ("NVIDIA B300 SXM6 AC MIG 1g.34gb", "1×B300 SXM6 AC MIG 1g.34gb")] {
+        for (gpu_type, want) in [("B300 MIG 34GB", "1×B300 MIG 34GB"), ("NVIDIA B300 SXM6 AC MIG 1g.34gb", "1×B300 MIG 34GB")] {
             let p = Pod { gpu_type: Some(gpu_type.into()), gpu_count: Some(1), ..pod("delta", "1.2.3.4") };
             let h = PodHealth::checked(&p, parse_deep(&mig), &cuda13());
             assert_eq!(h.facts.as_ref().unwrap().gpu_label(), want);
@@ -2694,7 +2699,7 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
                 &mig_nvml,
                 Pass,
                 "nvidia-smi can't read this MIG slice (Failed to initialize NVML: Insufficient Permissions) — torch: \
-                 1×A100-SXM4-40GB MIG 1g.5gb, 4.8 GB",
+                 1×A100 MIG 5GB, 4.8 GB",
                 Pass,
             ),
             ("MIG slice, nvidia-smi lists none", &listed_none, Pass, "can't read this MIG slice (lists no GPUs)", Pass),
@@ -2743,7 +2748,7 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         // slice: MIG by torch's name, and said so.
         let parent_row = edit(&mig_nvml, &[("smi", Some("ok")), ("gpu.0.name", Some("NVIDIA A100-SXM4-40GB")), ("smi_gpus", Some("1"))]);
         let h = PodHealth::checked(&pod("delta", "1.2.3.4"), parse_deep(&parent_row), &cuda124());
-        assert_eq!(check(&h.checks, "nvidia-smi").detail, "1×A100-SXM4-40GB MIG 1g.5gb (MIG slice of A100-SXM4-40GB)");
+        assert_eq!(check(&h.checks, "nvidia-smi").detail, "1×A100 MIG 5GB (MIG slice of A100-SXM4-40GB)");
         assert_eq!(check(&h.checks, "device_count").detail, "1 (matches nvidia-smi)");
 
         // nvidia-smi missing on a pod the provider lists as a MIG slice: PASS, named as the slice.
@@ -3040,7 +3045,7 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
             assert_eq!((c.status, c.detail.as_str()), (*status, *detail), "{label}");
             assert_eq!(overall(&checks), *verdict, "{label}: {checks:#?}");
         }
-        assert_eq!(parse_deep(&two_slices).gpu_label(), "2×A100-SXM4-40GB MIG 1g.5gb");
+        assert_eq!(parse_deep(&two_slices).gpu_label(), "2×A100 MIG 5GB");
         // A WARN replaces no pod and condemns no machine.
         let h = PodHealth::checked(&pod("delta", "1.2.3.4"), parse_deep(&one_seen), &cuda13());
         assert_eq!((h.status, h.failure_kind()), (Warn, None), "{:#?}", h.checks);
@@ -3159,10 +3164,10 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         // nvidia-smi lists the parent card (no `-L` slices), torch names the slice.
         let parent_row = edit(&mig, &[("smi", Some("ok")), ("gpu.0.name", Some("NVIDIA A100-SXM4-40GB")), ("smi_gpus", Some("1"))]);
         let cases: &[(&str, &str, &str)] = &[
-            ("nvidia-smi down, MIG", &mig, "1×A100-SXM4-40GB MIG 1g.5gb"),
+            ("nvidia-smi down, MIG", &mig, "1×A100 MIG 5GB"),
             ("nvidia-smi down, whole card", &a4000, "1×RTX A4000"),
             ("nvidia-smi's [N/A] names", &na_names, "1×RTX A4000+1×RTX A5000"),
-            ("torch's slice over nvidia-smi's parent", &parent_row, "1×A100-SXM4-40GB MIG 1g.5gb"),
+            ("torch's slice over nvidia-smi's parent", &parent_row, "1×A100 MIG 5GB"),
             // nvidia-smi's names, when it has them, as before.
             ("both name it", &both, "2×RTX A4000"),
             ("nothing named", &without(&a4000, &["tgpu."]), "1×GPU"),
@@ -3184,7 +3189,7 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         };
         // NAME, RESULT, then GPUS DRIVER CUDA.
         assert_eq!(row("devtest-apple")[2..5], ["2×RTX A4000", "580.65.06", "13.0"]);
-        assert_eq!(row("devtest-delta")[2..5], ["1×A100-SXM4-40GB MIG 1g.5gb", "570.86.15", "12.8*"]);
+        assert_eq!(row("devtest-delta")[2..5], ["1×A100 MIG 5GB", "570.86.15", "12.8*"]);
         assert_eq!(row("devtest-echo")[2..5], ["1×RTX A4000", "570.86.15", "12.8*"]);
         assert!(table.ends_with("\n* from torch: nvidia-smi unavailable\n"), "{table}");
         assert_eq!(table.matches("* from torch").count(), 1);
@@ -3289,7 +3294,7 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         let _ = std::fs::remove_dir_all(&dir);
         let f = parse_deep(&String::from_utf8_lossy(&out.stdout));
         assert_eq!((f.mig_devices, f.mig_profile.as_deref()), (Some(1), Some("1g.34gb")), "{}", String::from_utf8_lossy(&out.stdout));
-        assert_eq!(f.gpu_label(), "1×B300 SXM6 AC MIG 1g.34gb");
+        assert_eq!(f.gpu_label(), "1×B300 MIG 34GB");
     }
 
     /// The delivered command, run for real against stub `nvidia-smi` / `curl` / `python`
@@ -3591,7 +3596,7 @@ class CDLL:
                 &Check::new(
                     "nvidia-smi",
                     Pass,
-                    format!("nvidia-smi can't read this MIG slice ({msg}) — torch: 1×A100-SXM4-40GB MIG 1g.5gb, 4.8 GB")
+                    format!("nvidia-smi can't read this MIG slice ({msg}) — torch: 1×A100 MIG 5GB, 4.8 GB")
                 ),
                 "{stdout}"
             );

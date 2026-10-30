@@ -143,9 +143,14 @@ struct ServerTypeJson {
     architecture: Option<String>,
 }
 
-/// `{name} · {vram}GB`, or the name alone when the VRAM isn't known.
+/// `{name} · {vram}GB`, or the name alone when the VRAM isn't known — and for a MIG slice, whose
+/// name carries its memory, its name as every surface gives it (`B300 MIG 34GB`, not `B300 MIG
+/// 34GB · 34GB`: `fleet::mig_label`).
 fn gpu_label(name: &str, id: &str, vram: Option<u32>) -> String {
     let name = if name.is_empty() { id } else { name };
+    if let Some(mig) = arena_core::fleet::mig_label(name).or_else(|| arena_core::fleet::mig_label(id)) {
+        return mig;
+    }
     vram.map_or_else(|| name.to_string(), |v| format!("{name} · {v}GB"))
 }
 
@@ -638,8 +643,9 @@ mod tests {
             [
                 ("RTX A4000 · 16GB", Some(0.17), Some(0.25)),
                 ("B300 · 288GB", None, Some(8.99)),
-                ("PRO 6000 MIG 1g.24gb · 24GB", None, Some(0.69)),
-                ("B300 MIG 1g.34gb · 34GB", None, None),
+                // A MIG slice by its short name, its memory once (`fleet::mig_label`).
+                ("PRO 6000 MIG 24GB", None, Some(0.69)),
+                ("B300 MIG 34GB", None, None),
             ]
         );
         assert_eq!((c[1].sold_on("COMMUNITY"), c[1].sold_on("SECURE")), (Some(false), Some(true)), "B300: SECURE only");
