@@ -1522,8 +1522,25 @@ async fn backup_classifies_each_pods_reply_and_a_wedged_pod_fails_at_the_budget(
             ],
             on_protected: on_main,
             uncommitted: vec![],
+            events: tally.events.clone(),
         }
     );
+    // Every pod's outcome, for the run record (`arena backups`).
+    use arena_core::backups::record::Outcome;
+    let mut events = tally.events.clone();
+    events.sort();
+    let e = |p: &str, o, d: &str| (p.to_string(), o, d.to_string());
+    assert_eq!(
+        events,
+        [
+            e("devtest-apple", Outcome::Pushed, "→ autocommit-x"),
+            e("devtest-bloom", Outcome::Failed, "timed out after 300s"),
+            e("devtest-cloud", Outcome::NoChanges, "on feature-y"),
+            e("devtest-delta", Outcome::NotSaved, "on main"),
+            e("devtest-echo", Outcome::Failed, "exit 128: fatal: Could not read from remote repository."),
+        ]
+    );
+    assert_eq!(tally.summary(0), "1 pushed, 1 no changes, 1 on main/master, 2 failed");
     assert_eq!(start.elapsed(), BACKUP_TIMEOUT);
     // The wedged pod reports last, after its budget; the rest as soon as they answered. The
     // pod on main has no line of its own: it's said once, after the run.

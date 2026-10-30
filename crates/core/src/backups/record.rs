@@ -30,7 +30,7 @@ pub const HISTORY_LEN: usize = 20;
 pub const FORGET_POD_AFTER_SECS: u64 = 30 * 86_400;
 
 /// What one backup of one pod came to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Outcome {
     /// Git: committed and pushed.
@@ -241,6 +241,13 @@ impl Record {
         }
         self.runs.insert(job, run);
         self.pods.retain(|_, p| now.saturating_sub(p.last_at()) < FORGET_POD_AFTER_SECS);
+    }
+
+    /// Add events outside a run of their own (a pod a run left out: its lock busy) — pure.
+    pub fn add_events(&mut self, events: Vec<(String, Event)>) {
+        for (pod, e) in events {
+            self.pods.entry(pod).or_default().add(e);
+        }
     }
 
     /// Drop the "running" entries whose process is gone (pure, given `alive`).
