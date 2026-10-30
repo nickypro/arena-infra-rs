@@ -21,15 +21,17 @@ use arena_core::Config;
 /// `keys limit`'s arguments.
 #[derive(clap::Args, Debug)]
 pub(crate) struct LimitArgs {
-    /// The machines (names, ids, ranges, as for `gen`), then the cap: `10` (USD) sets it, `+5`
-    /// raises each key's own cap by $5 (with --no-cap: the machines only)
+    /// The machines (as for `gen`), then the cap: `10` (USD) sets it, `+5` raises it by $5
+    ///
+    /// The amount is always the last one; with --no-cap there is none.
     #[arg(value_name = "TARGET… USD|+USD")]
     args: Vec<String>,
     /// Take the cap away (give no amount): nothing then bounds what the key spends
     #[arg(long)]
     no_cap: bool,
-    /// When the cap starts over: daily, weekly, monthly (00:00 UTC; weeks from Monday) or never
-    /// (`+0 --reset daily` keeps the cap)
+    /// When the cap starts over: daily, weekly, monthly or never (00:00 UTC)
+    ///
+    /// Weeks start on Monday. `+0 --reset daily` keeps the cap and changes only this.
     #[arg(long, value_name = "WHEN", value_parser = ["daily", "weekly", "monthly", "never"], hide_possible_values = true)]
     reset: Option<String>,
     /// Set a cap under what the key has spent in its period anyway (its calls fail at once)
@@ -148,13 +150,41 @@ fn applied(k: &KeyInfo, u: &KeyUpdate) -> KeyInfo {
     out
 }
 
-/// Whether a key read back after the change says what was asked (a cap to the cent).
-fn took(now: &KeyInfo, want: &KeyInfo) -> bool {
+/// Whether two readings of a key say the same cap, reset and on/off — the cap to the float's noise
+/// ([`or::CAP_EPSILON`]), never a cent's slack (review codex r1 #2: a $0.004 change OpenRouter
+/// didn't make went unseen). What a key read back must say after a change ([`run`]), and what it
+/// must still say when the change is made.
+fn same(now: &KeyInfo, want: &KeyInfo) -> bool {
     let cap = match (now.limit, want.limit) {
-        (Some(a), Some(b)) => (a - b).abs() < 0.005,
+        (Some(a), Some(b)) => (a - b).abs() < or::CAP_EPSILON,
         (a, b) => a.is_none() && b.is_none(),
     };
     cap && LimitReset::of(now) == LimitReset::of(want) && now.disabled == want.disabled
+}
+
+/// `cap $25.00 (monthly), on` — a key's state, for a message.
+fn state_words(k: &KeyInfo) -> String {
+    let cap = k.limit.map(|c| format!("cap {}", or::exact_money(c))).unwrap_or_else(|| "no cap".into());
+    let reset = LimitReset::of(k).map(|r| format!(" ({})", r.as_str())).unwrap_or_default();
+    format!("{cap}{reset}, {}", on_off(k.disabled))
+}
+
+/// Why `was` — a key as the plan read it — mustn't be changed now, by the keys read again after
+/// the confirm (`fresh`): it's gone, or its cap, reset or on/off moved meanwhile (another operator,
+/// the dashboard; review codex r1 #1: `+5` confirmed as `$5 → $10` would set $10 over a cap raised
+/// to $25 meanwhile), or — a cap change — its spend now makes it one [`or::plan_cap`] refuses.
+/// `None`: go ahead. Pure.
+fn moved(verb: &Verb, was: &KeyInfo, fresh: &[KeyInfo]) -> Option<String> {
+    let Some(now) = fresh.iter().find(|k| k.hash == was.hash) else {
+        return Some("the key isn't listed any more — nothing done".into());
+    };
+    if !same(now, was) {
+        return Some(format!("it changed while this ran (now {}) — nothing done; run the command again", state_words(now)));
+    }
+    match verb {
+        Verb::Limit { change, reset, force } => or::plan_cap(now, *change, *reset, *force).err().map(|why| format!("{why} — nothing done")),
+        _ => None,
+    }
 }
 
 /// A key at its cap after this, said for a pause/resume row: a resume doesn't lift a cap.
@@ -338,7 +368,11 @@ async fn run(verb: Verb, sel: SelectArgs, dry_run: bool, json_out: bool, provide
     let (names, _) = crate::keys_targets(provider, cfg, &sel, &known).await?;
     let say = |s: &str| if json_out { eprintln!("{s}") } else { println!("{s}") };
     if names.is_empty() {
-        say("(no target machines)");
+        if json_out {
+            println!("{}", serde_json::to_string_pretty(&json(&verb, dry_run, &[], None))?);
+        } else {
+            println!("(no target machines)");
+        }
         return Ok(());
     }
     let rows = plan(&verb, &names, &existing, &naming).map_err(|refused| {
@@ -373,12 +407,18 @@ async fn run(verb: Verb, sel: SelectArgs, dry_run: bool, json_out: bool, provide
         say("aborted.");
         return Ok(());
     }
+    // The keys read again: a change confirmed against a listing that has moved since isn't made
+    // ([`moved`]). OpenRouter has no conditional update, so this narrows the window to the calls.
+    let fresh = api.list_keys().await.context("listing OpenRouter keys again before changing them")?;
     let mut done: Vec<(Row, Outcome, Option<KeyInfo>)> = Vec::new();
     for r in &rows {
         let outcome = match (&r.key, &r.update) {
-            (Some(k), Some(u)) => match api.update_key(&k.hash, u).await {
-                Ok(()) => Outcome::Changed,
-                Err(e) => Outcome::Failed(e.to_string()),
+            (Some(k), Some(u)) => match moved(&verb, k, &fresh) {
+                Some(why) => Outcome::Failed(why),
+                None => match api.update_key(&k.hash, u).await {
+                    Ok(()) => Outcome::Changed,
+                    Err(e) => Outcome::Failed(e.to_string()),
+                },
             },
             _ => skipped(r),
         };
@@ -394,7 +434,7 @@ async fn run(verb: Verb, sel: SelectArgs, dry_run: bool, json_out: bool, provide
             Ok(keys) => keys.iter().find(|n| n.hash == k.hash).cloned(),
             Err(_) => Some(want.clone()),
         };
-        if *outcome == Outcome::Changed && reread.is_ok() && !now.as_ref().is_some_and(|n| took(n, &want)) {
+        if *outcome == Outcome::Changed && reread.is_ok() && !now.as_ref().is_some_and(|n| same(n, &want)) {
             *outcome = Outcome::Failed(match now.as_ref() {
                 Some(n) => format!(
                     "OpenRouter answered OK but now says: {}, {}",
@@ -473,13 +513,15 @@ mod tests {
     }
 
     /// Keys on a fake OpenRouter: listed, changed in place as asked (each call recorded); a key
-    /// named in `broken` fails its update, one in `ignored` "takes" it without changing.
+    /// named in `broken` fails its update, one in `ignored` "takes" it without changing; `meanwhile`
+    /// (a hash and a cap) is another operator's change, made once the first listing is read.
     #[derive(Default)]
     struct Keys {
         keys: Mutex<Vec<KeyInfo>>,
         calls: Mutex<Vec<String>>,
         broken: Vec<&'static str>,
         ignored: Vec<&'static str>,
+        meanwhile: Mutex<Option<(&'static str, f64)>>,
     }
 
     impl Keys {
@@ -497,7 +539,11 @@ mod tests {
     #[async_trait::async_trait]
     impl KeyApi for Keys {
         async fn list_keys(&self) -> arena_core::Result<Vec<KeyInfo>> {
-            Ok(self.keys.lock().unwrap().clone())
+            let listed = self.keys.lock().unwrap().clone();
+            if let Some((hash, cap)) = self.meanwhile.lock().unwrap().take() {
+                self.keys.lock().unwrap().iter_mut().filter(|k| k.hash == hash).for_each(|k| k.limit = Some(cap));
+            }
+            Ok(listed)
         }
         async fn create_key(&self, _name: &str, _limit: Option<f64>) -> arena_core::Result<or::CreatedKey> {
             unreachable!("limit/pause/resume never mint")
@@ -662,6 +708,43 @@ mod tests {
         let api = Keys { ignored: vec!["devtest-bravo"], ..Keys::with(fleet_keys()) };
         let e = keys_cmd(&["pause", "bravo"], &api).await.unwrap_err();
         assert_eq!(e, "1 key(s) failed");
+        // A $0.004 change it didn't make is seen too (review codex r1 #2: a cent's slack hid it).
+        let e = keys_cmd(&["limit", "bravo", "5.004"], &api).await.unwrap_err();
+        assert_eq!(e, "1 key(s) failed");
+    }
+
+    /// A key that moved between the listing the plan was made from and the change (review codex
+    /// r1 #1: `+5` confirmed as `$5 → $10` set $10 over a cap raised to $25 meanwhile) isn't
+    /// changed; the others are.
+    #[tokio::test]
+    async fn a_key_that_moved_since_the_plan_is_left_alone() {
+        let api = Keys { meanwhile: Mutex::new(Some(("hb", 25.0))), ..Keys::with(fleet_keys()) };
+        let e = keys_cmd(&["limit", "alpha", "bravo", "+5"], &api).await.unwrap_err();
+        assert_eq!(e, "1 key(s) failed");
+        assert_eq!(api.calls(), [r#"ha {"limit":5.1}"#], "bravo isn't touched");
+        assert_eq!(api.key("hb").limit, Some(25.0));
+    }
+
+    /// What stops a planned change: the key gone, its cap, reset or on/off moved, or (a cap) a spend
+    /// that has grown past the new cap. Pure.
+    #[test]
+    fn moved_says_why_a_planned_change_waits() {
+        let was = key("hb", "devtest-bravo", Some(5.0), 1.0, false, "2026-10-30T10:00:00Z");
+        let lower = Verb::Limit { change: Some(CapChange::To(2.0)), reset: None, force: false };
+        assert_eq!(moved(&lower, &was, std::slice::from_ref(&was)), None);
+        assert!(moved(&lower, &was, &[]).unwrap().contains("isn't listed any more"));
+        for (now, says) in [
+            (KeyInfo { limit: Some(25.0), ..was.clone() }, "now cap $25.00, on"),
+            (KeyInfo { limit: None, ..was.clone() }, "now no cap, on"),
+            (KeyInfo { limit_reset: Some("daily".into()), ..was.clone() }, "now cap $5.00 (daily), on"),
+            (KeyInfo { disabled: true, ..was.clone() }, "now cap $5.00, off"),
+            (KeyInfo { usage: Some(3.0), ..was.clone() }, "a $2.00 cap is under what it has spent in all ($3.00)"),
+        ] {
+            let why = moved(&lower, &was, std::slice::from_ref(&now)).unwrap_or_else(|| panic!("{now:?}"));
+            assert!(why.contains(says) && why.contains("nothing done"), "{why}");
+        }
+        // The spend that grew doesn't stop a pause.
+        assert_eq!(moved(&Verb::Pause, &was, &[KeyInfo { usage: Some(3.0), ..was.clone() }]), None);
     }
 
     /// The command lines the dashboard's AI key rows run (arena-tui's `aikey::args`), which it

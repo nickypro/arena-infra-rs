@@ -655,9 +655,11 @@ impl CapPlan {
         self.cap_changes() || self.reset_after != self.reset_before
     }
 
-    /// The key's calls still fail after it: the new cap is at or under what was spent against it.
+    /// The key's calls still fail after it: the new cap is at or under what was spent against it
+    /// (to the float's noise, [`CAP_EPSILON`] — never a cent's slack: a cap of $1 over a $0.999
+    /// spend still has room).
     pub fn still_at_cap(&self) -> bool {
-        matches!((self.after, self.spent), (Some(a), Some(s)) if s >= a - 0.005)
+        matches!((self.after, self.spent), (Some(a), Some(s)) if s >= a - CAP_EPSILON)
     }
 
     /// The `PATCH` it takes: the cap and the reset, each only when it changes.
@@ -672,7 +674,7 @@ impl CapPlan {
     /// `cap $0.10 → $0.20 · spent $0.00 in all`, `cap $5.00 → $10.00 (monthly) · spent $0.42 this
     /// month`, `cap $5.00, daily → never · spent $3.00 in all — still at its cap`.
     pub fn words(&self) -> String {
-        let cap = |x: Option<f64>| x.map(|x| crate::fleet::fmt_money("$", x)).unwrap_or_else(|| "no cap".into());
+        let cap = |x: Option<f64>| x.map(exact_money).unwrap_or_else(|| "no cap".into());
         let reset = |r: Option<LimitReset>| r.map_or("never", |r| r.as_str());
         let mut out = if self.cap_changes() { format!("cap {} → {}", cap(self.before), cap(self.after)) } else { format!("cap {}", cap(self.after)) };
         if self.reset_after != self.reset_before {
@@ -697,7 +699,7 @@ impl CapPlan {
 /// a cap. A raise that leaves it under what it spent goes ahead ([`CapPlan::still_at_cap`] says
 /// so). The new cap is rounded to the millionth (no `0.25000000000000006`). Pure.
 pub fn plan_cap(k: &KeyInfo, change: Option<CapChange>, reset: Option<Option<LimitReset>>, force: bool) -> std::result::Result<CapPlan, String> {
-    let money = |x: f64| crate::fleet::fmt_money("$", x);
+    let money = exact_money;
     let before = k.limit;
     let reset_before = LimitReset::of(k);
     let reset_after = reset.unwrap_or(reset_before);
@@ -723,7 +725,7 @@ pub fn plan_cap(k: &KeyInfo, change: Option<CapChange>, reset: Option<Option<Lim
     if let (true, false, Some(a)) = (tighter, force, after) {
         let when = period_words(reset_after);
         match plan.spent {
-            Some(s) if a < s - 0.005 => {
+            Some(s) if a < s - CAP_EPSILON => {
                 return Err(format!(
                     "a {} cap is under what it has spent {when} ({}) — its calls would fail at once; --force sets it \
                      anyway (`arena keys pause` stops a key outright)",
@@ -736,6 +738,28 @@ pub fn plan_cap(k: &KeyInfo, change: Option<CapChange>, reset: Option<Option<Lim
         }
     }
     Ok(plan)
+}
+
+/// How close two amounts must be to count as one (float noise, a millionth at most — the caps
+/// [`plan_cap`] sets are rounded to that): never a cent's slack, which would let a cap set $0.004
+/// under the spend through, or miss a $0.004 change OpenRouter didn't make.
+pub const CAP_EPSILON: f64 = 1e-7;
+
+/// An amount as exactly as it was set: `$1.00`, `$0.050` ([`crate::fleet::fmt_money`]) when it's
+/// whole cents, else every digit up to the millionth (`$1.004`) — a cap or a spend a cent's
+/// rounding would misstate (`a $1.00 cap is under … ($1.00)`).
+pub fn exact_money(x: f64) -> String {
+    if ((x * 100.0).round() / 100.0 - x).abs() < CAP_EPSILON {
+        return crate::fleet::fmt_money("$", x);
+    }
+    let s = format!("{x:.6}");
+    let s = s.trim_end_matches('0');
+    let decimals = s.split_once('.').map_or(0, |(_, d)| d.len());
+    if decimals < 3 {
+        format!("${x:.3}")
+    } else {
+        format!("${s}")
+    }
 }
 
 /// Of the keys that go by one name, the one it shows: the enabled one, then the newest (the
@@ -1939,6 +1963,22 @@ mod tests {
         assert_eq!(ok(&unknown, Some(CapChange::Raise(1.0)), None).words(), "cap $5.00 → $6.00 (monthly) · spent ? this month");
         // The ceiling.
         assert!(plan_cap(&capped(Some(999_999.0), Some(999_999.0), None), Some(CapChange::Raise(5.0)), None, false).unwrap_err().contains("ceiling"));
+        // No cent's slack (review codex r1 #2): $0.004 under the spend is under it, said exactly;
+        // a cap a little over the spend has room.
+        let spent = KeyInfo { usage: Some(1.004), ..capped(Some(5.0), None, None) };
+        let e = plan_cap(&spent, Some(CapChange::To(1.0)), None, false).unwrap_err();
+        assert!(e.starts_with("a $1.00 cap is under what it has spent in all ($1.004)"), "{e}");
+        let p = ok(&spent, Some(CapChange::To(1.005)), None);
+        assert!(!p.still_at_cap() && p.words().starts_with("cap $5.00 → $1.005 · spent $1.00 in all"), "{}", p.words());
+        let exact = ok(&spent, Some(CapChange::To(1.004)), None);
+        assert!(exact.still_at_cap(), "at exactly the spend: at its cap");
+    }
+
+    #[test]
+    fn exact_money_keeps_every_digit_a_cent_would_round_away() {
+        for (x, want) in [(1.0, "$1.00"), (0.05, "$0.050"), (12.5, "$12.50"), (1.004, "$1.004"), (0.123456, "$0.123456"), (2.00000001, "$2.00"), (1.0005, "$1.0005")] {
+            assert_eq!(exact_money(x), want, "{x}");
+        }
     }
 
     /// One key per name: the enabled one, then the newest, the first of equals — as the

@@ -1718,8 +1718,12 @@ calls fail; the `AI$` cell says `off`) and `resume` enables the one the dashboar
 — the newest — never an older, rotated-out key (aliases `disable`, `enable`). The dashboard's
 `paused` is something else: a $0 cap nothing was spent against, which `limit <name> 5` lifts. A key
 already as asked is left alone. Each command: `--dry-run`, a confirm (`--yes`), then one line per key
-— `devtest-alpha: cap $0.10 → $0.20 · spent $0.00 in all`, `on → off` — checked against the keys as
-OpenRouter lists them afterwards (a change it answered OK for but didn't make fails the command);
+— `devtest-alpha: cap $0.10 → $0.20 · spent $0.00 in all`, `on → off`. The keys are read again
+after the confirm: one whose cap, reset or on/off moved since the preview (another operator, the
+dashboard) or whose spend now makes the cap one it would refuse is left alone and fails the command
+— run it again (OpenRouter has no conditional update; this leaves only the calls' own moment).
+Afterwards each is checked against the keys as OpenRouter lists them (a change it answered OK for
+but didn't make fails the command; caps compared exactly, not to the cent);
 `--json` prints `{action, dry_run, keys: [{machine, name, hash, before, after, result, error?,
 note?}], changed, failed}` (`before`/`after`: `{limit, reset, disabled, spent}`; `result`:
 `changed`, `would change`, `unchanged`, `no key`, `failed`). Of several keys under one name (a
