@@ -409,7 +409,7 @@ async fn create_then_setup_commands_reject_a_bad_budget_before_doing_anything() 
     for dry_run in [true, false] {
         let fake = Arc::new(FakeRemote::new());
         let (place, interrupt) = (crate::cli::PlaceFlags::default(), crate::Interrupt::manual());
-        let opts = crate::ReplaceOpts { keep_old: false, skip_proxy: true, dry_run, yes: true };
+        let opts = crate::pods::replace::ReplaceOpts { keep_old: false, skip_proxy: true, dry_run, yes: true };
         let bal = crate::money::BalanceCtx::from_config(&cfg); // no account, no state file: a test
         let err = crate::pods::replace::handle_replace(fake.clone(), &fleet(), &cfg, "apple", &ov, &place, opts, &interrupt, &bal).await.unwrap_err();
         assert!(err.to_string().contains("SETUP_TIMEOUT_SECS"), "replace (dry_run={dry_run}): {err}");

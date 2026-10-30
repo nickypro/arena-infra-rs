@@ -1012,3 +1012,25 @@ async fn handle_pods_bal(
     }
     Ok(())
 }
+
+/// Scenario tests for target selection (PLAN 1.C) at the command layer, driven by a fake
+/// `Provider` that records every mutation (no real API/SSH): the shared selector picks
+/// exactly the pods each command family acts on, typos fail before anything is touched,
+/// commands that change pods demand names or `--all`, and every old spelling still parses.
+#[cfg(test)]
+mod selection_tests;
+
+/// Every pod-SSH path over a scripted `FakeRemote` (PLAN 1.B): each call carries its
+/// budget, partial failures are reported per pod and fail the command, and one wedged pod
+/// never holds up the others — on a paused clock, so budgets elapse instantly and exactly.
+#[cfg(test)]
+pub(crate) mod remote_tests;
+
+/// PLAN 1.D + restart safety, end to end against fakes: `rename` brings `~/.name`, the
+/// OpenRouter key mapping and the proxy along; `terminate --revoke-key` revokes keys and
+/// drops CSV rows without ever blocking a terminate; `restart`/`stop` say what a container
+/// reset destroys, refuse it without `--wipe-ok` when nothing would survive, and a restart
+/// comes back set up and proxied. No network: `FakeRemote` for SSH, a fake provider and key
+/// API, temp dirs for the keys CSV and the (write-only) proxy file.
+#[cfg(test)]
+pub(crate) mod lifecycle_tests;
