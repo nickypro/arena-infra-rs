@@ -24,8 +24,9 @@ earlier).
   prod: a RUNNING 4090 with no public IP or ports, `FAILED endpoint … left running`, then
   terminated and recreated by hand). With or without `--check` it is now a host failure: `up` says
   which machine and data centre it was on, terminates it, and recreates the same name with the same
-  options (others first), up to `--check-attempts` placements (default 2). The last one is
-  terminated too; the name then FAILs saying nothing of it is left billing.
+  options (others first), up to `--check-attempts` placements (default 2; the flag now works
+  without `--check` too). The last one is terminated too; the name then FAILs saying nothing of it
+  is left billing. Nothing is terminated on an old look: its provider is asked once more first.
 - When: a pod up without an endpoint for `--endpoint-timeout` minutes (new, default 5) — on RunPod,
   its container running behind RunPod's SSH proxy only (a host with no public IP; before, only
   `--check` replaced these) — or one still listed running without an endpoint when `--timeout` ends

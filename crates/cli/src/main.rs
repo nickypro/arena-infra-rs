@@ -1078,13 +1078,12 @@ enum PodCmd {
         /// Deep-check each pod; TERMINATE and recreate any that FAIL on a bad host
         #[arg(long)]
         check: bool,
-        /// With --check: placements per name, the first create included (2 = one retry)
+        /// Placements per name, the first create included (2 = one retry)
         ///
-        /// The last attempt's failing pod is left running for a look.
-        ///
-        /// Also caps how often a pod that never came up or never got an SSH endpoint is replaced,
-        /// with or without --check (such a pod is always terminated).
-        #[arg(long, default_value_t = 2, requires = "check", value_parser = clap::value_parser!(u32).range(1..=10))]
+        /// Bounds replacing a pod that FAILs --check on its host (the last one is left running
+        /// for a look), and — with or without --check — one that never came up or never got an
+        /// SSH endpoint (such a pod is always terminated).
+        #[arg(long, default_value_t = 2, conflicts_with = "no_wait", value_parser = clap::value_parser!(u32).range(1..=10))]
         check_attempts: u32,
         /// Allow machines that earlier `up --check`s marked bad (remembered 72 h)
         #[arg(long)]
