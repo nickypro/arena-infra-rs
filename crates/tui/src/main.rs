@@ -3540,10 +3540,10 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         (Some(k), _, None) if k.paused() => (k.detail(), Some(Tone::Dim)),
         // Where to act on it — this pod's menu (`a`), its `ai …` rows — said first: the pane cuts
         // the line's end.
-        (Some(k), _, None) if k.disabled => {
+        (Some(k), _, None) if k.disabled && ui.ai_keys => {
             (k.detail().replacen("disabled · ", "disabled (a → ai resume) · ", 1), state::fill_tone(k.fill()))
         }
-        (Some(k), _, None) if k.fill() == arena_core::openrouter::Fill::Full => {
+        (Some(k), _, None) if k.fill() == arena_core::openrouter::Fill::Full && ui.ai_keys => {
             (format!("at its cap (a → raise cap) · {}", k.detail()), state::fill_tone(k.fill()))
         }
         (Some(k), _, None) => (k.detail(), state::fill_tone(k.fill())),
@@ -5345,7 +5345,8 @@ deep_check_end=1
         ui.selected = shared.pods.iter().position(|p| p.name == "devtest-alpha").unwrap();
         let pane = draw(220, 50, &shared, &ui).join("\n");
         assert!(pane.contains("ai key:   paused (a $0 cap, nothing spent against it) · $0.00 of $0.00 today"), "{pane}");
-        // A key at its cap, or disabled: where to act on it, first.
+        // A key at its cap, or disabled: where to act on it, first (with the rows there to act).
+        ui.ai_keys = true;
         let mut at_cap = shared.ai.clone().unwrap();
         at_cap.keys.insert("devtest-alpha".into(), at_cap.keys["devtest-gone"].clone());
         let mut s2 = Shared { ai: Some(at_cap.clone()), ..fixture_shared() };

@@ -695,7 +695,11 @@ impl CapPlan {
     pub fn words(&self) -> String {
         let cap = |x: Option<f64>| x.map(exact_money).unwrap_or_else(|| "no cap".into());
         let reset = |r: Option<LimitReset>| r.map_or("never", |r| r.as_str());
-        let mut out = if self.cap_changes() { format!("cap {} → {}", cap(self.before), cap(self.after)) } else { format!("cap {}", cap(self.after)) };
+        let mut out = match (self.cap_changes(), self.after) {
+            (true, _) => format!("cap {} → {}", cap(self.before), cap(self.after)),
+            (false, Some(_)) => format!("cap {}", cap(self.after)),
+            (false, None) => "no cap".to_string(),
+        };
         if self.reset_after != self.reset_before {
             out.push_str(&format!(", resets {} → {}", reset(self.reset_before), reset(self.reset_after)));
         } else if let (Some(r), Some(_)) = (self.reset_after, self.after) {
@@ -2035,6 +2039,7 @@ mod tests {
         assert!(p.words().starts_with("cap $5.00 → no cap"), "{}", p.words());
         let open = capped(None, None, None);
         assert!(plan_cap(&open, Some(CapChange::Raise(5.0)), None, false).unwrap_err().contains("no cap to raise"));
+        assert_eq!(ok(&open, Some(CapChange::NoCap), None).words(), "no cap · spent $30.00 in all", "no `cap no cap`");
         // A first cap on an uncapped key is a tightening: under its life's $30 refused.
         assert!(plan_cap(&open, Some(CapChange::To(10.0)), None, false).unwrap_err().contains("spent in all ($30.00)"));
         assert_eq!(ok(&open, Some(CapChange::To(10.0)), Some(Some(LimitReset::Daily))).after, Some(10.0), "today's $0.20 is under it");

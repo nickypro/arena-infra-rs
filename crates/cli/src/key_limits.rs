@@ -907,6 +907,11 @@ mod tests {
         assert_eq!(api.calls(), [r#"ha {"limit_reset":"daily"}"#, r#"ha {"limit":null}"#]);
         // Another cohort's key is never one of ours.
         assert_eq!(api.key("hx").limit, Some(5.0));
+        // The full names the dashboard passes resolve as the short ones do.
+        api.calls.lock().unwrap().clear();
+        keys_cmd(&["limit", "devtest-bravo", "devtest-cloud", "+1"], &api).await.unwrap();
+        keys_cmd(&["pause", "devtest-alpha"], &api).await.unwrap();
+        assert_eq!(api.calls(), [r#"hb {"limit":11.0}"#, r#"hc {"limit":11.0}"#, r#"ha {"disabled":true}"#]);
     }
 
     /// Refusals come before any change: a cap under what a key spent (unless --force), a raise of
