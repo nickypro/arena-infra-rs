@@ -602,8 +602,9 @@ pub fn is_hostname(name: &str) -> bool {
 /// - on the `127.0.1.1` lines of /etc/hosts (cloud-init's `127.0.1.1 <fqdn> <hostname>`), the
 ///   names the VM had (running and static) become `name`, every other alias and comment kept;
 ///   and if no such line names it then (a run before changed the hostname but not the file),
-///   `name` goes first on the first one. No `127.0.1.1` line: the file is left alone. Written
-///   in place (same file) and only when it changes.
+///   `name` goes first on the first one. Lines are found by their first field, so an indented
+///   one counts (review r2). No `127.0.1.1` line, or no /etc/hosts: nothing written. Written in
+///   place (same file) and only when it changes.
 ///
 /// Exits non-zero unless both hostnames are `name` after it. A reboot keeps all of it with
 /// nothing more (live, Hetzner ubuntu-24.04, cloud-init 26.1, 2026-10-30): Hetzner's metadata
@@ -620,10 +621,10 @@ pub fn hostname_command(name: &str) -> Option<String> {
                 r#"n={n}; h=$(hostname); f=$(cat /etc/hostname 2>/dev/null); "#,
                 r#"if [ "$h" != "$n" ] || [ "$f" != "$n" ]; then "#,
                 r#"hostnamectl set-hostname "$n" || {{ hostname "$n" && echo "$n" > /etc/hostname; }} || exit 1; fi; "#,
-                r#"if grep -q '^127\.0\.1\.1[[:space:]]' /etc/hosts 2>/dev/null; then t=$(mktemp) || exit 1; "#,
+                r#"if [ -f /etc/hosts ]; then t=$(mktemp) || exit 1; "#,
                 r#"awk -v n="$n" -v h="$h" -v f="$f" '{{ l[NR] = $0 }} $1 == "127.0.1.1" {{ if (!first) first = NR; "#,
                 r#"for (i = 2; i <= NF && $i !~ /^#/; i++) {{ if ($i == h || $i == f) $i = n; if ($i == n) has = 1 }} l[NR] = $0 }} "#,
-                r#"END {{ if (first && !has) sub(/^127\.0\.1\.1[ \t]+/, "127.0.1.1 " n " ", l[first]); for (i = 1; i <= NR; i++) print l[i] }}' "#,
+                r#"END {{ if (first && !has) sub(/127\.0\.1\.1[ \t]+/, "127.0.1.1 " n " ", l[first]); for (i = 1; i <= NR; i++) print l[i] }}' "#,
                 r#"/etc/hosts > "$t" && {{ cmp -s "$t" /etc/hosts || cat "$t" > /etc/hosts; }}; r=$?; rm -f "$t"; [ "$r" = 0 ] || exit 1; fi; "#,
                 r#"[ "$(hostname)" = "$n" ] && [ "$(cat /etc/hostname 2>/dev/null)" = "$n" ]"#,
             ),
@@ -1682,6 +1683,15 @@ mod tests {
                 "127.0.1.1\tcache.internal\n127.0.1.1 arena9-keepsake arena9-keepsake cache2 # was arena9-rainbow\n10.0.0.1 arena9-rainbow\n",
                 "{shell}"
             );
+            // An indented entry is an entry (review r2): renamed, and found again on a recovery.
+            start("  127.0.1.1 arena9-rainbow arena9-rainbow\n127.0.0.1 localhost\n");
+            assert!(run().status.success(), "{shell}");
+            assert_eq!(file("hosts"), "127.0.1.1 arena9-keepsake arena9-keepsake\n127.0.0.1 localhost\n", "{shell}");
+            start("127.0.0.1 localhost\n\t127.0.1.1  arena9-rainbow\n");
+            put("name", "arena9-keepsake\n");
+            put("etc-hostname", "arena9-keepsake\n");
+            assert!(run().status.success(), "{shell}");
+            assert_eq!(file("hosts"), "127.0.0.1 localhost\n\t127.0.1.1 arena9-keepsake arena9-rainbow\n", "{shell}");
             // No 127.0.1.1 line: the file is left alone.
             start("127.0.0.1 localhost\n");
             assert!(run().status.success() && file("hosts") == "127.0.0.1 localhost\n", "{shell}");
