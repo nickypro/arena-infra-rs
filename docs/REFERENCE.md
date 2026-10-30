@@ -1155,8 +1155,8 @@ the moment that pod is done — a slow pod never holds up another.
 One fleet listing per `--interval` serves every pod's endpoint wait.
 
 **A pod up without an SSH endpoint is replaced, not left billing** (ops feedback 2026-10-29: a
-RUNNING 4090 with no public IP or ports stayed `FAILED endpoint … left running` until someone
-terminated it and ran `up` again, READY in a minute). Up without an endpoint for
+RUNNING 4090 with no public IP or ports stayed `FAILED endpoint: no SSH endpoint after 600s — left
+running` until someone terminated it and ran `up` again, READY in a minute). Up without an endpoint for
 `--endpoint-timeout` minutes (default 5, config `ENDPOINT_TIMEOUT_MINS`, 1..120) is a host
 failure, with or without `--check`, within `--check-attempts` placements per name (default 2;
 the flag works without `--check`): `up` says where it was (the machine and data centre its
@@ -1176,11 +1176,18 @@ options, the ones that haven't failed first; the last one is terminated too, and
   An endpoint after all goes on with the pipeline; a pod that isn't up any more (restarting), or
   can't be read just then, is waited for again, its clock started over by the listings after
   that look, to the same `--timeout`.
-- A pod still coming up when `--timeout` ends (RunPod: no container yet; Vast `loading`, Hetzner
-  `initializing`) is left running as before — RunPod can't tell a stuck pull from a slow one —
-  and the reason says so: `no SSH endpoint after 600s, still listed RUNNING (no container yet —
-  its image may still be pulling) — left running, still billing ($0.69/h): `arena proxy apply`
-  once it has an endpoint, or `arena pods terminate lightning``.
+- **A RunPod pod with no container when `--timeout` ends** (default 600 s), 10 minutes or more
+  after its create, never started its image — prod's case above: a failed placement, terminated
+  and its name recreated the same way (`[lightning] still listed RUNNING with no container 10m00s
+  after its create (its image never started) — before it came up: a failed placement`). RunPod
+  can't tell a pull that will never finish from a slow one; healthy pulls took 1½–7 minutes live.
+  With a `--timeout` under 10 minutes such a pod is left running instead, as below.
+- Anything else still coming up when `--timeout` ends (Vast `loading`, Hetzner `initializing`, a
+  RunPod pod under a short `--timeout`, a pod whose state can't be read just then) is left running
+  as before, and the reason says so: `no SSH endpoint after 300s, still listed RUNNING (no
+  container yet — its image may still be pulling) — left running, still billing ($0.69/h): `arena
+  proxy apply` once it has an endpoint, or `arena pods terminate lightning``. An endpoint that
+  came with the deadline goes on with the pipeline.
 
 A listing that momentarily lacks the pod, or a RunPod endpoint lookup that failed, doesn't restart
 the clock; a listing that shows it not up (a restart) does. A pod `up` didn't create in this run is

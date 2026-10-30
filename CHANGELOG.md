@@ -21,19 +21,23 @@ earlier).
 
 ## 2026-10-30 · `up` replaces a pod that never gets an SSH endpoint; Hetzner's project limit says so
 - `pods up` no longer leaves a pod that never gets an SSH endpoint running and billing (seen on
-  prod: a RUNNING 4090 with no public IP or ports, `FAILED endpoint … left running`, then
-  terminated and recreated by hand). With or without `--check` it is now a host failure: `up` says
-  which machine and data centre it was on, terminates it, and recreates the same name with the same
-  options (others first), up to `--check-attempts` placements (default 2; the flag now works
-  without `--check` too). The last one is terminated too; the name then FAILs saying nothing of it
-  is left billing. Nothing is terminated on an old look: its provider is asked once more first.
-  It always gets the whole `--endpoint-timeout` first, past `--timeout` if need be.
+  prod: a RUNNING 4090 with no public IP or ports, `FAILED endpoint: no SSH endpoint after 600s —
+  left running`, then terminated and recreated by hand). With or without `--check` it is now a
+  failed placement: `up` says which machine and data centre it was on, terminates it, and recreates
+  the same name with the same options (others first), up to `--check-attempts` placements (default
+  2; the flag now works without `--check` too). The last one is terminated too; the name then FAILs
+  saying nothing of it is left billing. Nothing is terminated on an old look: its provider is asked
+  once more first.
 - When: a pod up without an endpoint for `--endpoint-timeout` minutes (new, default 5) — on RunPod,
   its container running behind RunPod's SSH proxy only (a host with no public IP; before, only
-  `--check` replaced these). RunPod's image pull doesn't count: it lists a pod RUNNING from the
-  create, and a fresh host pulls for up to ~7 minutes. A pod still coming up when `--timeout` ends
-  (RunPod: no container yet; Vast `loading`, …) is left running as before — RunPod can't tell a
-  stuck pull from a slow one — but the reason now says it's billing and how to stop it.
+  `--check` replaced these); it always gets the whole `--endpoint-timeout`, past `--timeout` if
+  need be. And a RunPod pod still listed RUNNING with no container when `--timeout` ends, 10
+  minutes or more after its create — its image never started (prod's case above). RunPod lists a
+  pod RUNNING from the create while its image pulls, so the pull doesn't count: healthy pulls took
+  1½–7 minutes live, and a `--timeout` under 10 minutes still leaves such a pod running.
+- A pod still coming up when `--timeout` ends otherwise (Vast `loading`, Hetzner `initializing`, a
+  RunPod pod under a short `--timeout`) is left running as before, but the reason now says it's
+  billing and how to stop it.
 - A Hetzner create refused over the project's limit (403 `resource_limit_exceeded`, e.g. "shared
   core limit exceeded") said "authentication failed creating …". It now says `Hetzner refused: the
   project's resource limit is reached (…) — use a smaller type, free a server, or ask Hetzner to

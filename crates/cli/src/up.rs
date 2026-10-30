@@ -11,7 +11,9 @@
 //! `--endpoint-timeout` (RunPod: its container running behind RunPod's SSH proxy only) is a
 //! host failure, with or without `--check` ([`EndpointWait::NoEndpoint`]): once a fresh look
 //! confirms it, where it was is said, and it is terminated and its name recreated within the
-//! name's placements (`--check-attempts`), never left billing. With `--check` a pod that FAILs the deep
+//! name's placements (`--check-attempts`), never left billing. So is a RunPod pod still listed
+//! RUNNING with no container when `--timeout` ends ([`NO_CONTAINER_LIMIT`]): its image never
+//! started, a failed placement. With `--check` a pod that FAILs the deep
 //! check on its host (`health::FailureKind::Host`: driver, CUDA, GPUs, peer copies, NCCL) is
 //! terminated — and confirmed gone, so a name never has two pods — then its name is
 //! recreated from the confirmed options and the new pod runs the pipeline again; one that
@@ -78,6 +80,14 @@ use super::{
 /// seconds of its container starting.
 pub(crate) const NO_PUBLIC_IP_GRACE: Duration = Duration::from_secs(pipeline::DEFAULT_ENDPOINT_TIMEOUT_MINS * 60);
 
+/// How long after its create a RunPod pod may be listed RUNNING with no container ([`no_container`])
+/// before `up` calls it a failed placement at `--timeout` — terminated and its name recreated, not
+/// left billing. RunPod lists a pod RUNNING from its create while its image is pulled, and can't
+/// tell a pull that will never finish from a slow one; live, healthy pulls took 1½ to 6⅔ minutes
+/// (2026-10-28..30), and prod's arena9-lightning had none after the whole 600 s (2026-10-29). As
+/// `--timeout`'s default, so a shorter `--timeout` leaves such a pod running, as before.
+const NO_CONTAINER_LIMIT: Duration = Duration::from_secs(600);
+
 /// What waiting for a pod's SSH endpoint came to.
 enum EndpointWait {
     /// Listed with an endpoint.
@@ -90,8 +100,9 @@ enum EndpointWait {
     NoEndpoint { pod: Pod, up_for: Duration },
     /// The deadline passed with no endpoint and the pod not up without one: still coming up
     /// (provisioning, loading; on RunPod, RUNNING with no container yet — an image still being
-    /// pulled, or one that never will be: RunPod can't tell them apart). `last`: as the latest
-    /// listing that said anything about it had it.
+    /// pulled, or one that never will be: RunPod can't tell them apart, so past
+    /// [`NO_CONTAINER_LIMIT`] it is a failed placement). `last`: as the latest listing that said
+    /// anything about it had it.
     TimedOut { last: Option<Pod> },
     /// It died before it came up — listed `ERROR` on a backend whose creates can fail after
     /// they succeeded ([`Provider::ready_deadline`]: Shadeform): a failed placement. `why`, for
@@ -206,7 +217,9 @@ pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, lock: b
     let mut steps = vec![
         format!(
             "wait for its SSH endpoint — a pod up without one for {mins} min (RunPod: behind its SSH proxy \
-             only) is TERMINATED and its name recreated (up to {placements} placement(s) per name)"
+             only), or a RunPod pod with no container at --timeout ({} min or more), is TERMINATED and its name \
+             recreated (up to {placements} placement(s) per name)",
+            NO_CONTAINER_LIMIT.as_secs() / 60
         ),
         "sync the proxy (if nginx is set up)".to_string(),
     ];
@@ -614,25 +627,45 @@ impl Shared<'_, '_> {
                     // drops its pods from the aggregate), but the verdict must say how things
                     // stand now: ask the owning backend once — a pod terminated elsewhere
                     // meanwhile is gone, not "left running" (live G: one deleted out of band read
-                    // so for 10 minutes). One still there is left running — RunPod can't tell a
-                    // container that will never start from an image still being pulled — and
-                    // said to bill.
+                    // so for 10 minutes); one whose endpoint came with the deadline goes on.
+                    //
+                    // A RunPod pod still listed RUNNING with no container [`NO_CONTAINER_LIMIT`]
+                    // after its create is a failed placement, with or without --check: its image
+                    // never started (prod 2026-10-29, ops feedback #1: arena9-lightning, `FAILED
+                    // endpoint: no SSH endpoint after 600s — left running`, billing until it was
+                    // terminated by hand; its re-run was READY in a minute). Healthy pulls took
+                    // 1½–7 minutes live. Anything else still coming up — Vast `loading`, Hetzner
+                    // `initializing`, a RunPod pod under a `--timeout` shorter than that limit, one
+                    // that can't be read just now — is left running as before, and said to bill.
                     let secs = self.run.timeout.as_secs();
-                    let gone = match self.or_stop(self.run.provider.list_by_provider()).await {
-                        Some(listings) => gone_from_owner(&listings, &pod),
-                        None => false,
-                    };
-                    let reason = if gone {
-                        run.pod = None;
-                        format!(
-                            "no SSH endpoint after {secs}s, and {} no longer lists it (terminated elsewhere?) — nothing \
-                             left running",
-                            pod.provider
-                        )
-                    } else {
-                        format!("no SSH endpoint after {secs}s{}", left_running(&name, last.as_ref()))
-                    };
-                    return self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason });
+                    let now = self.or_stop(self.run.provider.list_by_provider()).await.map(|l| now_listed(&l, &pod));
+                    match now {
+                        Some(Now::Gone) => {
+                            run.pod = None;
+                            let reason = format!(
+                                "no SSH endpoint after {secs}s, and {} no longer lists it (terminated elsewhere?) — \
+                                 nothing left running",
+                                pod.provider
+                            );
+                            return self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason });
+                        }
+                        Some(Now::Reachable(found)) => break found,
+                        Some(Now::NotUp(p)) if no_container(&p) && started.elapsed() >= NO_CONTAINER_LIMIT => {
+                            let why = format!(
+                                "still listed RUNNING with no container {} after its create (its image never started)",
+                                pipeline::fmt_elapsed(started.elapsed())
+                            );
+                            return self.dead(run, &p, option, failed_options, why).await;
+                        }
+                        now => {
+                            let last = match now {
+                                Some(Now::NotUp(p) | Now::NoEndpoint(p)) => Some(p),
+                                _ => last,
+                            };
+                            let reason = format!("no SSH endpoint after {secs}s{}", left_running(&name, last.as_ref()));
+                            return self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason });
+                        }
+                    }
                 }
                 Some(EndpointWait::NoEndpoint { pod: bare, up_for }) => {
                     match self.no_endpoint(run, bare, up_for, deadline, option, failed_options).await {
@@ -910,9 +943,10 @@ impl Shared<'_, '_> {
         self.end(run, Verdict::Ready)
     }
 
-    /// A pod that never came up ([`EndpointWait::Failed`], or past its backend's ready
-    /// deadline): a failed placement, not a host to inspect — nothing is on it yet, and it may
-    /// bill. It is terminated and the name recreated, options that haven't failed first, within
+    /// A pod that never came up ([`EndpointWait::Failed`], past its backend's ready deadline, or
+    /// on RunPod with no container at `--timeout`): a failed placement, not a host to inspect —
+    /// nothing is on it yet, and it may bill. It is terminated and the name recreated, options
+    /// that haven't failed first, within
     /// the name's placements (`--check-attempts`, with or without `--check`); with none left
     /// it is still terminated, and the name fails at `endpoint`.
     async fn dead(&self, run: &mut NameRun, pod: &Pod, option: usize, failed_options: &mut Vec<usize>, why: String) -> Option<(Pod, usize)> {
@@ -1664,8 +1698,7 @@ fn price_of(pod: &Pod) -> String {
 fn left_running(name: &str, last: Option<&Pod>) -> String {
     let state = match last {
         Some(p) => {
-            let pulling = p.provider == "runpod" && p.status.trim().eq_ignore_ascii_case("RUNNING") && !p.proxy_only;
-            let pulling = if pulling { " (no container yet — its image may still be pulling)" } else { "" };
+            let pulling = if no_container(p) { " (no container yet — its image may still be pulling)" } else { "" };
             format!(", still listed {}{pulling}", p.status.trim())
         }
         None => String::new(),
@@ -1675,6 +1708,18 @@ fn left_running(name: &str, last: Option<&Pod>) -> String {
         _ => String::new(),
     };
     format!("{state} — left running{billing}: `arena proxy apply` once it has an endpoint, or `arena pods terminate {name}`")
+}
+
+/// Whether `pod` is a RunPod pod listed RUNNING with no container yet: no endpoint, not behind
+/// RunPod's SSH proxy (that is a container up), and its endpoint looked up (a failed lookup lists
+/// any pod so). RunPod's RUNNING is the pod's desired status, listed from the create while its
+/// image is pulled — or while one that never starts isn't. Pure.
+fn no_container(pod: &Pod) -> bool {
+    pod.provider == "runpod"
+        && pod.status.trim().eq_ignore_ascii_case("RUNNING")
+        && !pod.proxy_only
+        && (pod.ssh_ip.is_none() || pod.ssh_port.is_none())
+        && !runpod_v2::endpoint_lookup_failed(pod)
 }
 
 /// Where a pod is, as far as its provider says: `machine 4x2k9, data centre EU-RO-1`, either
@@ -3234,27 +3279,97 @@ mod tests {
         lines.find("[devtest-apple] endpoint 10.0.0.1:22001 (after 7m");
     }
 
-    /// …and one still listed RUNNING with no container when `--timeout` ends is left running:
-    /// RunPod can't tell an image that will never start from one still being pulled (review,
-    /// codex r2: replacing it would kill a healthy slow pull, and its replacement would pull
-    /// again). The reason says it bills, and how to stop it.
+    /// …but one still listed RUNNING with no container when `--timeout` ends, 10 minutes after
+    /// its create ([`NO_CONTAINER_LIMIT`]), never started its image: a failed placement, with or
+    /// without --check — prod 2026-10-29 (ops feedback #1): arena9-lightning, `FAILED endpoint: no
+    /// SSH endpoint after 600s — left running`, billing until it was terminated by hand; its
+    /// re-run was READY in a minute. Terminated and recreated, the other option first: READY.
+    /// A replacement that never starts either is terminated with no attempt left, and nothing of
+    /// the name is left billing.
     #[tokio::test(start_paused = true)]
-    async fn a_runpod_pod_with_no_container_by_the_timeout_is_left_running_and_said_to_bill() {
-        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 100_000)])]);
+    async fn a_runpod_pod_with_no_container_by_the_timeout_is_replaced() {
+        const WHY: &str = "still listed RUNNING with no container 10m00s after its create (its image never started)";
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 100_000), ("10.0.0.2", 22002, 60)])]);
         let cfg = cfg(None);
         let run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(
+            fleet.events(),
+            [format!("create devtest-apple {A4000}"), "terminate id1".to_string(), format!("create devtest-apple {R3090}")]
+        );
+        assert_eq!(rows[0].verdict, Verdict::Ready, "{:#?}", lines.all());
+        let (_, at) = lines.find(&format!("[devtest-apple] {WHY} — before it came up: a failed placement"));
+        assert_eq!(at, NO_CONTAINER_LIMIT);
+        lines.find("[devtest-apple] terminating id1 to recreate devtest-apple (attempt 2 of 2)");
+        assert_eq!((rows[0].attempts[0].end.clone(), rows[0].attempts[0].terminated), (AttemptEnd::Dead(WHY.into()), true));
+
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 100_000), ("10.0.0.2", 22002, 100_000)])]);
+        let run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
+        assert_eq!(
+            fleet.events(),
+            [
+                format!("create devtest-apple {A4000}"),
+                "terminate id1".to_string(),
+                format!("create devtest-apple {R3090}"),
+                "terminate id2".to_string(),
+            ]
+        );
+        assert!(fleet.listed().is_empty(), "nothing of apple's left");
+        match &rows[0].verdict {
+            Verdict::Failed { stage: Stage::Endpoint, reason } => assert_eq!(
+                reason,
+                &format!(
+                    "{WHY} — no attempts left (--check-attempts 2); terminated it — devtest-apple has no pod now, nothing of \
+                     it left billing"
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A `--timeout` shorter than [`NO_CONTAINER_LIMIT`] is no verdict on the image: a RunPod pod
+    /// with no container yet then is left running, as before — the reason says it bills, and how
+    /// to stop it (review, codex r2: a healthy slow pull must not be killed by a short wait).
+    #[tokio::test(start_paused = true)]
+    async fn a_runpod_pod_with_no_container_by_a_short_timeout_is_left_running_and_said_to_bill() {
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 100_000)])]);
+        let cfg = cfg(None);
+        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
+        run.timeout = Duration::from_secs(300);
         let made = make(&fleet, &["apple"]).await;
         let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
         assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "nothing terminated");
         match &rows[0].verdict {
             Verdict::Failed { stage: Stage::Endpoint, reason } => assert_eq!(
                 reason,
-                "no SSH endpoint after 600s, still listed RUNNING (no container yet — its image may still be pulling) — left \
+                "no SSH endpoint after 300s, still listed RUNNING (no container yet — its image may still be pulling) — left \
                  running, still billing ($0.17/h): `arena proxy apply` once it has an endpoint, or `arena pods terminate \
                  devtest-apple`"
             ),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// An endpoint that comes between the last listing and the deadline (listings every 7 s: 595,
+    /// 602; the endpoint at 598) is found by the deadline's fresh look: on with the pipeline —
+    /// READY, nothing terminated — not "left running" with an endpoint it has.
+    #[tokio::test(start_paused = true)]
+    async fn an_endpoint_only_the_deadlines_look_sees_goes_on() {
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 598)])]);
+        let cfg = cfg(None);
+        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
+        run.interval = Duration::from_secs(7);
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(rows[0].verdict, Verdict::Ready, "{:#?}", lines.all());
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "nothing terminated");
+        let (_, at) = lines.find("[devtest-apple] endpoint 10.0.0.1:22001 (after 10m00s)");
+        assert_eq!(at, Duration::from_secs(600));
     }
 
     /// Hetzner, Vast and Shadeform pods still coming up (`initializing`, `LOADING`, `PENDING`)
@@ -4667,8 +4782,9 @@ mod tests {
         ));
         let endpoint = |mins: u64, n: u32| {
             format!(
-                "wait for its SSH endpoint — a pod up without one for {mins} min (RunPod: behind its SSH proxy only) is \
-                 TERMINATED and its name recreated (up to {n} placement(s) per name)"
+                "wait for its SSH endpoint — a pod up without one for {mins} min (RunPod: behind its SSH proxy only), or \
+                 a RunPod pod with no container at --timeout (10 min or more), is TERMINATED and its name recreated (up \
+                 to {n} placement(s) per name)"
             )
         };
         assert_eq!(
