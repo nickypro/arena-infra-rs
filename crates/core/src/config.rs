@@ -104,6 +104,10 @@ impl Config {
         // shared config (Live 6 couldn't reach the "too big to save" path: the sandbox's file
         // doesn't set it).
         "DISCARD_MAX_GB",
+        // The free space every copy onto this box leaves (`disk::floor_bytes`): a box nearly full
+        // can be let through for one run — or a test can skip every copy — without editing the
+        // shared config (`CONTROL_MIN_FREE_GB=2 arena pods pull alpha`).
+        "CONTROL_MIN_FREE_GB",
         // Each AI's model and effort for `pods ask` and the dashboard's `?` (`ask::ai::Pick`):
         // `ASK_CODEX_MODEL=gpt-6-luna arena pods ask apple` tries a model for one run without
         // editing the shared config. Not `ASK_AI` itself: `off` there is the config owner's call.
@@ -482,6 +486,18 @@ MACHINE_NAME_LIST=(
         // Without it: the file's, else the default.
         assert_eq!(crate::backup::discard_max_kb(&Config::parse_with_env("IMAGE=base:1", |_| None)), Ok(1024 * 1024));
         assert!(Config::ENV_INTRODUCIBLE.contains(&"DISCARD_MAX_GB") && !Config::is_file_only("DISCARD_MAX_GB"));
+    }
+
+    /// disk-guard: the floor every copy onto this box keeps can be set for one run from the
+    /// environment, over the file's or where it has none, and is read as the file's would be.
+    #[test]
+    fn env_can_introduce_the_control_boxs_floor() {
+        let env = |v: &'static str| move |k: &str| (k == "CONTROL_MIN_FREE_GB").then(|| v.to_string());
+        let floor = |c: &Config| crate::disk::floor_bytes(c);
+        assert_eq!(floor(&Config::parse_with_env("IMAGE=base:1", env("2"))), Ok(2 * crate::disk::GB));
+        assert_eq!(floor(&Config::parse_with_env("CONTROL_MIN_FREE_GB=9\n", env("0"))), Ok(0));
+        assert!(floor(&Config::parse_with_env("IMAGE=base:1", env("lots"))).is_err());
+        assert_eq!(floor(&Config::parse_with_env("IMAGE=base:1", |_| None)), Ok(5 * crate::disk::GB));
     }
 
     /// REVIEW RS3 (fails today): the reaper's whole authority AND every veto (`reap hold`,

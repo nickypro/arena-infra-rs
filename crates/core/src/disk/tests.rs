@@ -217,6 +217,8 @@ fn leftovers_are_found_sized_and_told_apart_from_one_in_use() {
     let now = crate::snapshot::unix_now();
 
     let found = find_leftovers(&tmp, &[root.clone(), root.clone()], now);
+    assert!(found.unread.is_empty(), "{:?}", found.unread);
+    let found = found.leftovers;
     let kinds: Vec<(&Path, &LeftoverKind)> = found.iter().map(|l| (l.path.as_path(), &l.kind)).collect();
     // Fresh rsync temp files may be a running pull's: not listed yet.
     assert_eq!(
@@ -228,7 +230,7 @@ fn leftovers_are_found_sized_and_told_apart_from_one_in_use() {
     assert!(staged.changed.is_some_and(|c| now.saturating_sub(c) < 600), "{staged:?}");
 
     // A day later they are.
-    let later = find_leftovers(&tmp, std::slice::from_ref(&root), now + RSYNC_TEMP_STALE_SECS + 60);
+    let later = find_leftovers(&tmp, std::slice::from_ref(&root), now + RSYNC_TEMP_STALE_SECS + 60).leftovers;
     assert!(later.iter().any(|l| l.kind == LeftoverKind::RsyncTemp && l.path == root.join("w1d1/.rsync-tmp")), "{later:?}");
 
     // A run holding the staging dir's lock: in use, and said so — nothing to remove.
@@ -236,7 +238,7 @@ fn leftovers_are_found_sized_and_told_apart_from_one_in_use() {
     assert!(in_use(&stage));
     let e = lock_dir(&stage).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
-    let busy = find_leftovers(&tmp, &[], now);
+    let busy = find_leftovers(&tmp, &[], now).leftovers;
     let l = busy.iter().find(|l| l.path == stage).unwrap();
     assert!(l.in_use);
     let lines = l.lines(now);
@@ -246,7 +248,39 @@ fn leftovers_are_found_sized_and_told_apart_from_one_in_use() {
     assert!(!in_use(&stage));
     // Nothing found was touched.
     assert!(stage.join("ARENA_materials/notes.py").exists() && partial_ok.exists() && root.join("w1d1/.rsync-tmp/.notes.py.Ab12Cd").exists());
-    assert_eq!(find_leftovers(&d.0.join("nowhere"), &[d.0.join("nowhere")], now), []);
+    // Nothing there: nothing found, and nothing it couldn't read. A dir it can't list: said.
+    assert_eq!(find_leftovers(&d.0.join("nowhere"), &[d.0.join("nowhere")], now), Found::default());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let shut = d.0.join("shut");
+        std::fs::create_dir_all(&shut).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let found = find_leftovers(&shut, &[], now);
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // (root reads anything: then there's nothing to say)
+        if std::fs::read_dir("/root").is_err() {
+            assert!(found.unread.len() == 1 && found.unread[0].starts_with(&format!("{}: ", shut.display())), "{found:?}");
+        }
+    }
+}
+
+/// A cleanup holds the staging dir's lock while it removes it, so a run waits; once it's gone the
+/// run's lock is refused (NotFound: make it again), and a new dir at that path is its own lock.
+#[test]
+fn a_staging_dir_being_removed_is_never_locked_for_a_copy() {
+    let d = TmpDir::new("relock");
+    let stage = staging_dir(&d.0, "abc");
+    std::fs::create_dir_all(&stage).unwrap();
+    let cleanup = lock_dir(&stage).unwrap();
+    assert_eq!(lock_dir(&stage).unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "the run waits");
+    std::fs::remove_dir_all(&stage).unwrap();
+    drop(cleanup);
+    assert_eq!(lock_dir(&stage).unwrap_err().kind(), std::io::ErrorKind::NotFound, "gone");
+    std::fs::create_dir_all(&stage).unwrap();
+    let run = lock_dir(&stage).unwrap();
+    assert!(in_use(&stage));
+    drop(run);
 }
 
 #[test]
@@ -267,7 +301,7 @@ fn a_leftover_says_what_it_is_how_to_look_and_how_to_remove_it() {
          `pods replace`/`migrate` and kept after a copy that failed or was stopped (or by a build from before \
          2026-10-09, which never removed it)"
     );
-    assert!(lines[1].contains("it may be the only copy of that pod's work") && lines[1].contains("`arena pods list --no-probe | grep leh3rc2hdcf31i`"), "{lines:?}");
+    assert!(lines[1].contains("it may be the only copy of that pod's work") && lines[1].contains("`arena pods list --no-probe | grep -F -- leh3rc2hdcf31i`"), "{lines:?}");
     assert_eq!(lines[2], "  └ look: du -sh /tmp/arena-replace-leh3rc2hdcf31i; ls -la /tmp/arena-replace-leh3rc2hdcf31i");
     assert_eq!(lines[3], "  └ remove: rm -rf /tmp/arena-replace-leh3rc2hdcf31i");
     // An odd path is quoted for the shell; a capped size is a lower bound; no caution off staging.
@@ -283,6 +317,11 @@ fn a_leftover_says_what_it_is_how_to_look_and_how_to_remove_it() {
     assert_eq!(odd.facts(now), "over 2 GB");
     assert_eq!(odd.caution(), None);
     assert_eq!(odd.lines(now).len(), 3);
+    // A pod id from a dir's name is quoted in the advice: nothing in it runs when pasted.
+    let named = |source: &str| Leftover { kind: LeftoverKind::Staging { source: source.into() }, ..staging.clone() }.caution().unwrap();
+    assert!(named("$(touch PWNED)").contains("grep -F -- '$(touch PWNED)'`"), "{}", named("$(touch PWNED)"));
+    assert!(named("-rf").contains("grep -F -- '-rf'`"));
+    assert!(named("it's").contains(r"grep -F -- 'it'\''s'`"));
 }
 
 #[test]

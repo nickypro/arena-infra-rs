@@ -6055,7 +6055,11 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
         Ok(b) => println!(
             "  · copies leave free here     {}{} (CONTROL_MIN_FREE_GB) — pulls, backup copies, replace/migrate staging, the reaper",
             arena_core::disk::gb(b),
-            if cfg.get(arena_core::disk::FLOOR_KEY).is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" }
+            match cfg.get(arena_core::disk::FLOOR_KEY).filter(|v| !v.trim().is_empty()) {
+                None => " (default)",
+                Some(v) if cfg.file_value(arena_core::disk::FLOOR_KEY) != Some(v) => " (from the environment)",
+                Some(_) => "",
+            }
         ),
         Err(e) => {
             println!("  ✗ copies leave free here     {e}");
@@ -8921,8 +8925,11 @@ async fn handle_deep_test(
             }
         }
     }
-    let skipped = box_health.map_or(0, |h| h.skipped);
-    let no_room = (skipped > 0).then(|| format!("copies of {skipped} pod(s) onto this box were skipped for space in the last day"));
+    let (skipped, invalid) = box_health.map_or((0, None), |h| (h.skipped, h.invalid));
+    let no_room = match ((skipped > 0).then(|| format!("copies of {skipped} pod(s) onto this box were skipped for space in the last day")), invalid) {
+        (Some(r), Some(e)) => Some(format!("{r}; {e}")),
+        (r, e) => r.or(e),
+    };
     match (failed, no_room) {
         (0, None) => Ok(()),
         (0, Some(r)) => anyhow::bail!("{r}"),
@@ -13410,6 +13417,10 @@ impl CopyOpts {
     }
 }
 
+/// How often a via-local copy tries its staging dir's lock again, 200 ms apart, before it
+/// takes the dir for another run's (a look at the box holds it only for an instant).
+const STAGE_LOCK_TRIES: u32 = 10;
+
 /// The via-local copy's staging dir for source pod `src_id` under `root`.
 fn staging_dir(root: &std::path::Path, src_id: &str) -> PathBuf {
     arena_core::disk::staging_dir(root, src_id)
@@ -13417,19 +13428,22 @@ fn staging_dir(root: &std::path::Path, src_id: &str) -> PathBuf {
 
 /// Remove a leftover via-local staging copy of `src_id` (the participant's whole home), once
 /// it can't be needed again: the source pod is gone, or a copy of it landed and was verified.
-/// Says so when there was one; one another run is copying through is left alone, said.
+/// Under the stage's lock, held through the removal: one another run is copying through is left
+/// alone, said. Says so when there was one.
 fn remove_staging_for(root: &std::path::Path, src_id: &str) {
     let stage = staging_dir(root, src_id);
-    if stage.exists() && arena_core::disk::in_use(&stage) {
-        eprintln!("      the local staging copy {} is in use by another arena run — left as it is", stage.display());
-        return;
-    }
-    if stage.exists() {
-        let size = arena_core::pull::human_bytes(local_size(&stage));
-        match std::fs::remove_dir_all(&stage) {
-            Ok(()) => println!("      removed the leftover local staging copy {} ({size})", stage.display()),
-            Err(e) => eprintln!("      warning: couldn't remove the local staging copy {} ({size}): {e}", stage.display()),
+    let _held = match arena_core::disk::lock_dir(&stage) {
+        Ok(held) => held,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return eprintln!("      the local staging copy {} is in use by another arena run — left as it is", stage.display())
         }
+        Err(e) => return eprintln!("      warning: couldn't lock the local staging copy {} to remove it ({e}) — left as it is", stage.display()),
+    };
+    let size = arena_core::pull::human_bytes(local_size(&stage));
+    match std::fs::remove_dir_all(&stage) {
+        Ok(()) => println!("      removed the leftover local staging copy {} ({size})", stage.display()),
+        Err(e) => eprintln!("      warning: couldn't remove the local staging copy {} ({size}): {e}", stage.display()),
     }
 }
 
@@ -13717,19 +13731,32 @@ async fn copy_pod_files(
         // pull source -> staging (fresh source), then push staging -> dest (FRESH dest, right
         // before the push — this is the endpoint most likely to have gone stale during the pull).
         let stage = staging_dir(&opts.stage_root, src_id);
-        std::fs::create_dir_all(&stage).with_context(|| format!("creating staging dir {}", stage.display()))?;
-        // Held for the whole copy: a second replace/migrate of this pod can't write into the
-        // same stage, nothing removes it under this one, and `config check` / `teardown --check`
-        // can tell it in use from one left behind. Refused here, the other run's stage is
-        // left exactly as it is.
-        let _held = arena_core::disk::lock_dir(&stage).map_err(|e| match e.kind() {
-            std::io::ErrorKind::WouldBlock => anyhow::anyhow!(
-                "another arena run is copying {src_id} through {} right now — nothing copied; let it finish (or stop \
-                 it), then re-run",
-                stage.display()
-            ),
-            _ => anyhow::anyhow!("locking the staging dir {}: {e}", stage.display()),
-        })?;
+        // Its lock, held for the whole copy: a second replace/migrate of this pod can't write
+        // into the same stage, no cleanup removes it under this one (a cleanup holds it while it
+        // removes one), and `config check` / `teardown --check` can tell it in use from one left
+        // behind (their look takes the lock for an instant: tried again for a moment). Refused,
+        // the other run's stage is left exactly as it is.
+        let _held = {
+            let mut tries = 0;
+            loop {
+                std::fs::create_dir_all(&stage).with_context(|| format!("creating staging dir {}", stage.display()))?;
+                match arena_core::disk::lock_dir(&stage) {
+                    Ok(held) => break held,
+                    // Removed by a cleanup between the mkdir and the lock: made again.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && tries < STAGE_LOCK_TRIES => tries += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && tries < STAGE_LOCK_TRIES => {
+                        tries += 1;
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => anyhow::bail!(
+                        "another arena run is copying {src_id} through {} right now — nothing copied; let it finish \
+                         (or stop it), then re-run",
+                        stage.display()
+                    ),
+                    Err(e) => anyhow::bail!("locking the staging dir {}: {e}", stage.display()),
+                }
+            }
+        };
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o700))
@@ -14725,8 +14752,8 @@ async fn pull_pods(
                 let parts = tiers_for(name)
                     .into_iter()
                     .map(|(tier, dest, _)| {
-                        let earlier = tier == "snapshot" && !arena_core::restore::snapshot_labels(base, name).is_empty();
-                        let size = if earlier { arena_core::disk::Size::Later } else { disk::size_into(std::path::Path::new(&dest)) };
+                        let at = std::path::Path::new(&dest);
+                        let size = if tier == "snapshot" { disk::snapshot_size(base, name, at) } else { disk::size_into(at) };
                         (PathBuf::from(dest), size)
                     })
                     .collect();

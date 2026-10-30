@@ -15,9 +15,9 @@
 //!
 //! Also here: what arena leaves behind on the box ([`find_leftovers`]: a replace/migrate staging
 //! copy kept after a copy that failed or was stopped, an interrupted baseline capture, rsync temp
-//! files a killed pull left) — listed, never removed, since a staging copy can be the only copy
-//! of someone's work —, the warning levels ([`level`]), the biggest of arena's dirs on a low
-//! filesystem ([`biggest`]), and the record of skips the daily health check reports
+//! files a killed pull left) — listed, never removed by a look, since a staging copy can be the
+//! only copy of someone's work —, the warning levels ([`level`]), the biggest of arena's dirs on a
+//! low filesystem ([`biggest`]), and the record of skips the daily health check reports
 //! ([`record_skips`]). The rules and words are pure; the I/O (a `statvfs`, a bounded walk, a
 //! small state file) sits beside them, simple enough to test against a temp dir.
 
@@ -332,9 +332,31 @@ pub fn staging_dir(root: &Path, src_id: &str) -> PathBuf {
 }
 
 /// Take `dir`'s lock (an exclusive `flock` on the directory, held while the returned file
-/// lives): replace/migrate hold their staging dir's for the whole copy, so a second run of the
-/// same pod can't write into it, nothing removes it under them, and [`find_leftovers`] can tell
-/// one in use from one left behind. `Err` with `WouldBlock` when another run holds it.
+/// lives): replace/migrate hold their staging dir's for the whole copy, and a cleanup holds it
+/// while it removes one, so a second run of the same pod can't write into it, nothing removes
+/// it under a run, and [`find_leftovers`] can tell one in use from one left behind. `Err` with
+/// `WouldBlock` when another run holds it; with `NotFound` when the dir is gone — or another
+/// one stands at that path — by the time the lock is taken (a cleanup removed it meanwhile): the
+/// lock held must be the dir's at that path, so create it and lock it again.
+#[cfg(unix)]
+pub fn lock_dir(dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::MetadataExt;
+    let f = std::fs::File::open(dir)?;
+    match f.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, format!("{} is in use by another arena run", dir.display())))
+        }
+        Err(std::fs::TryLockError::Error(e)) => return Err(e),
+    }
+    let (held, now) = (f.metadata()?, std::fs::metadata(dir));
+    match now {
+        Ok(m) if (m.dev(), m.ino()) == (held.dev(), held.ino()) => Ok(f),
+        _ => Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{} was removed while being locked", dir.display()))),
+    }
+}
+
+#[cfg(not(unix))]
 pub fn lock_dir(dir: &Path) -> std::io::Result<std::fs::File> {
     let f = std::fs::File::open(dir)?;
     match f.try_lock() {
@@ -467,19 +489,34 @@ pub struct Leftover {
 /// budget is at most a day, and a running one writes to them).
 pub const RSYNC_TEMP_STALE_SECS: u64 = 86_400;
 
+/// What [`find_leftovers`] found, and where it couldn't look (a dir it couldn't list, other than
+/// one that isn't there): with any of those, "nothing found" isn't "nothing there".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Found {
+    pub leftovers: Vec<Leftover>,
+    pub unread: Vec<String>,
+}
+
 /// Look for what arena leaves on this box (read-only; nothing is ever removed here):
 /// `<tmp>/arena-replace-*` (replace/migrate's staging), and in each backup root `<root>/baseline/
 /// w*/.fleet.partial-<pid>` (an interrupted `pods baseline`) and `<root>/.rsync-tmp`,
 /// `<root>/*/.rsync-tmp` holding files unchanged for [`RSYNC_TEMP_STALE_SECS`] (a pull stopped
 /// hard). Sorted by path.
-pub fn find_leftovers(tmp: &Path, backup_roots: &[PathBuf], now: u64) -> Vec<Leftover> {
+pub fn find_leftovers(tmp: &Path, backup_roots: &[PathBuf], now: u64) -> Found {
     let mut budget = WALK_CAP;
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    let unread = std::cell::RefCell::new(Vec::new());
+    // A dir's subdirs; one that isn't there has none, one that can't be listed is said.
     let subdirs = |dir: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(dir)
-            .map(|es| es.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect())
-            .unwrap_or_default()
+        match std::fs::read_dir(dir) {
+            Ok(es) => es.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                unread.borrow_mut().push(format!("{}: {e}", dir.display()));
+                Vec::new()
+            }
+        }
     };
     for path in subdirs(tmp) {
         let Some(source) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix(STAGING_PREFIX)) else { continue };
@@ -518,17 +555,21 @@ pub fn find_leftovers(tmp: &Path, backup_roots: &[PathBuf], now: u64) -> Vec<Lef
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
+    Found { leftovers: out, unread: unread.into_inner() }
 }
 
-/// A path for a shell line: single-quoted unless it's plain.
-fn sh(p: &Path) -> String {
-    let s = p.display().to_string();
-    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+@:,=".contains(c)) {
-        s
+/// A word for a shell line: single-quoted unless it's plain (and not an option).
+fn sh_word(s: &str) -> String {
+    if !s.is_empty() && !s.starts_with('-') && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+@:,=".contains(c)) {
+        s.to_string()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
     }
+}
+
+/// A path for a shell line ([`sh_word`]).
+fn sh(p: &Path) -> String {
+    sh_word(&p.display().to_string())
 }
 
 impl Leftover {
@@ -565,7 +606,8 @@ impl Leftover {
         match &self.kind {
             LeftoverKind::Staging { source } => Some(format!(
                 "it may be the only copy of that pod's work: first check that {source} still exists (`arena pods list \
-                 --no-probe | grep {source}`) or that its work is on the pod that replaced it, or in LOCAL_BACKUP_DIR"
+                 --no-probe | grep -F -- {}`) or that its work is on the pod that replaced it, or in LOCAL_BACKUP_DIR",
+                sh_word(source)
             )),
             _ => None,
         }

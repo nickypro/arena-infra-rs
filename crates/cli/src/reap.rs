@@ -1241,8 +1241,17 @@ fn room(cfg: &Config, settings: &ReapSettings, p: &Path) -> std::result::Result<
     })
 }
 
-async fn dest_check(cfg: &Config, settings: &ReapSettings, rsync: &str) -> std::result::Result<Dest, Vec<String>> {
+/// What's wrong with the backup destination ([`dest_check`]): every reason, and those that are a
+/// tier root without the room (said as such, and recorded as a skipped copy for the health check).
+#[derive(Debug, Default)]
+struct DestBad {
+    reasons: Vec<String>,
+    no_room: Vec<String>,
+}
+
+async fn dest_check(cfg: &Config, settings: &ReapSettings, rsync: &str) -> std::result::Result<Dest, DestBad> {
     let mut bad = Vec::new();
+    let mut no_room = Vec::new();
     let snap_root = cfg.get("LOCAL_BACKUP_DIR").map(str::trim).filter(|d| !d.is_empty()).unwrap_or("./backup").to_string();
     let big_root = arena_core::pull::big_root(&snap_root, cfg.get("LOCAL_BACKUP_BIG_DIR"));
     for (root, tier) in [(&snap_root, arena_core::pull::Tier::Snapshot), (&big_root, arena_core::pull::Tier::Big)] {
@@ -1257,7 +1266,10 @@ async fn dest_check(cfg: &Config, settings: &ReapSettings, rsync: &str) -> std::
         }
         match room(cfg, settings, p) {
             Ok(Ok(())) => {}
-            Ok(Err(why)) => bad.push(format!("{root}: {why}")),
+            Ok(Err(why)) => {
+                bad.push(format!("{root}: {why}"));
+                no_room.push(format!("{root}: {why}"));
+            }
             Err(e) => bad.push(e),
         }
     }
@@ -1286,7 +1298,27 @@ async fn dest_check(cfg: &Config, settings: &ReapSettings, rsync: &str) -> std::
     if bad.is_empty() {
         Ok(Dest { snap_root, big_root, label, threshold, budget })
     } else {
-        Err(bad)
+        Err(DestBad { reasons: bad, no_room })
+    }
+}
+
+/// Whether this box has room for `pod`'s reap copy into `snapshot_dir` and `big_dir` on top of
+/// the roots' own check ([`dest_check`]): the copy judged against `CONTROL_MIN_FREE_GB` as every
+/// copy onto this box is (`arena_core::disk`; a first copy 2 GB per tier, a later one 0.1 GB) —
+/// `REAP_MIN_FREE_GB` alone, free before the copy, could let it eat into that floor. `Err`: why
+/// not, the skip already recorded for the health check.
+fn pod_room(cfg: &Config, dest: &Dest, pod: &str, snapshot_dir: &str, big_dir: &str) -> std::result::Result<(), String> {
+    let Ok(Some(floor)) = crate::disk::floor(cfg) else { return Ok(()) };
+    let parts = vec![
+        (PathBuf::from(snapshot_dir), crate::disk::snapshot_size(Path::new(&dest.snap_root), pod, Path::new(snapshot_dir))),
+        (PathBuf::from(big_dir), crate::disk::size_into(Path::new(big_dir))),
+    ];
+    match crate::disk::judge_copies(floor, &[(pod.to_string(), parts)]).pop() {
+        None => Ok(()),
+        Some((_, skip)) => {
+            crate::disk::note_skips(cfg, "reap backup", &[(pod.to_string(), skip.to_string())]);
+            Err(skip.to_string())
+        }
     }
 }
 
@@ -1577,7 +1609,17 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
         match dest_check(cfg, &settings, &env.rsync).await {
             Ok(d) => dest = Some(d),
             Err(bad) => {
-                let why = bad.join("; ");
+                let why = bad.reasons.join("; ");
+                // The reaps that would copy now (not an observe's), refused for space: skipped
+                // copies, for the health check.
+                if !bad.no_room.is_empty() {
+                    let skipped: Vec<(String, String)> = due
+                        .iter()
+                        .filter(|k| decided.get(*k).is_some_and(|d| d.row == Row::Candidate))
+                        .filter_map(|k| policies.get(k).map(|p| (p.name.clone(), bad.no_room.join("; "))))
+                        .collect();
+                    crate::disk::note_skips(cfg, "reap backup", &skipped);
+                }
                 ctx.note(format!("backup destination unhealthy: {why}"));
                 ctx.queue(None, NotifyKind::DestUnhealthy, None, &arena_core::fleet::clip(&why, 300));
                 ctx.attention();
@@ -2291,8 +2333,19 @@ async fn backup(
         }
     }
     // Space and markers again, right before the first write here (RS9): a volume unmounted
-    // since the run's check (or during the git push) must not take this pod's last copy.
-    if dest_check(env.cfg, &ctx.settings, &env.rsync).await.is_err() {
+    // since the run's check (or during the git push) must not take this pod's last copy. And
+    // room for this pod's own copy (CONTROL_MIN_FREE_GB, as every copy onto this box).
+    let ready = match dest_check(env.cfg, &ctx.settings, &env.rsync).await {
+        Ok(_) => pod_room(env.cfg, dest, &pod.name, snapshot_dir, big_dir),
+        Err(bad) => {
+            if !bad.no_room.is_empty() {
+                crate::disk::note_skips(env.cfg, "reap backup", &[(pod.name.clone(), bad.no_room.join("; "))]);
+            }
+            Err(bad.reasons.join("; "))
+        }
+    };
+    if let Err(why) = ready {
+        ctx.note(format!("{}: its reap backup wasn't started — {why}", pod.name));
         ev.dest_ok = false;
         ev.finished = (env.clock)();
         return ev;

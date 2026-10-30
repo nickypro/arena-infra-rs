@@ -36,7 +36,7 @@ earlier).
   with arena's biggest dirs there), and what arena left on the box: a replace/migrate staging copy
   (`/tmp/arena-replace-<pod id>`), an interrupted `pods baseline`, a hard-stopped pull's rsync temp
   files — with size, age and the commands to look at and remove each. `teardown --check` lists them
-  too (◷ kept, never against its verdict). arena never removes them itself: a staging copy can be the
+  too (◷ kept, never against its verdict). None of these removes anything: a staging copy can be the
   only copy of a pod's work.
 - replace/migrate's staging copy is now also removed when a later attempt copies directly (it stayed
   forever), and is locked while a run copies through it: a second replace/migrate of the same pod is
@@ -47,7 +47,7 @@ earlier).
 ### Action needed
 - On a box with less than the floor free, every copy onto it is skipped (and its run fails) until
   there's room — on prod today (3.1 GB free), every one. Make room first, or lower the floor for a
-  while (`arena config set CONTROL_MIN_FREE_GB 2`).
+  while (`arena config set CONTROL_MIN_FREE_GB 2`, or `CONTROL_MIN_FREE_GB=2` for one command).
 - Suggestions for prod's control box (yours to decide; check before deleting anything):
   - `/tmp/arena-replace-leh3rc2hdcf31i` (3.5 GB, 2026-10-14): replace/migrate's staging copy of pod
     `leh3rc2hdcf31i`'s home. Most likely left by the build prod ran then (from the prod checkout,
@@ -65,6 +65,7 @@ earlier).
 ### Config
 - `CONTROL_MIN_FREE_GB` (new, default 5): whole GB every copy onto this box leaves free on its
   filesystem, 0..100000 (0: only the copy itself must fit). A bad value fails every copy up front.
+  Settable from the environment for one run (`CONTROL_MIN_FREE_GB=2 arena pods pull alpha`).
 - replace/migrate's local staging now keeps `CONTROL_MIN_FREE_GB` free (before: a tenth of the
   disk, at least 5 GB).
 

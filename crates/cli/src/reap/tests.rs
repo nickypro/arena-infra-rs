@@ -1317,6 +1317,11 @@ async fn an_unhealthy_destination_blocks_and_notifies() {
     assert_eq!(exit_code(&r), Some(3));
     assert!(out.contains("(floor 100000 GB, CONTROL_MIN_FREE_GB)"), "{out}");
     assert!(w.terminated().is_empty());
+    // The reap's copy refused for space is a skipped copy, for the daily health check.
+    let (skips, _) = arena_core::disk::Skips::load(&w.dir.join("state/devtest").join(arena_core::disk::SKIPS_FILE));
+    let got: Vec<(&str, &str)> = skips.entries.iter().map(|e| (e.pod.as_str(), e.what.as_str())).collect();
+    assert_eq!(got, [("devtest-alpha", "reap backup")]);
+    assert!(skips.entries[0].why.contains("(floor 100000 GB, CONTROL_MIN_FREE_GB)"), "{:?}", skips.entries[0]);
     let (w, a) = due_world("nostart", "ARENA_START_DATE=").await;
     let (r, out) = w.run("apply").await;
     assert_eq!(exit_code(&r), Some(3));

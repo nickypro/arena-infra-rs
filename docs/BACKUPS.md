@@ -860,7 +860,9 @@ with arena's biggest dirs there.
 
 ### What arena leaves on the box
 
-Never removed automatically — a staging copy can be the only copy of a pod's work:
+Nothing that looks at the box removes them — a staging copy can be the only copy of a pod's work.
+replace/migrate remove their own staging copy only once a copy of that pod has landed on the new pod
+and been verified (and `migrate finish` / a finished `replace`, once the old pod is gone):
 
 - `$TMPDIR/arena-replace-<pod id>`: replace/migrate's via-local staging of that pod's home. Removed
   once a copy of it lands, kept when the copy failed (a re-run continues from it); left too by a run

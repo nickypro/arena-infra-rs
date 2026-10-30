@@ -1998,8 +1998,8 @@ checklist of what is still billing or scheduled, each with the exact command tha
   (made by hand, another cohort's) is a note with its cost, never touched;
 - and what arena **left on this box** (local, read-only): replace/migrate's staging copies
   (`$TMPDIR/arena-replace-<pod id>`), an interrupted `pods baseline` capture, rsync temp files a
-  hard-stopped pull left — ◷ **kept**, never against the check: arena never removes them itself, as
-  a staging copy can be the only copy of a pod's work. Each with its size, age and what made it, a
+  hard-stopped pull left — ◷ **kept**, never against the check, and never removed by it: a staging
+  copy can be the only copy of a pod's work. Each with its size, age and what made it, a
   note with the commands to look at it (and, for a staging copy, what to check first), and its
   `rm -rf` as the fix; one a running arena is using now has no fix. See [Room on this
   box](BACKUPS.md#room-on-this-box-control_min_free_gb).

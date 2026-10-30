@@ -140,7 +140,7 @@ pub enum Verdict {
     /// Doesn't apply here (not configured / not installed): not checked.
     Skipped,
     /// Still there ON PURPOSE (the backup archive before its `ARCHIVE_KEEP_UNTIL`, the arena
-    /// images, a copy arena never removes on its own): shown, never counted against the check.
+    /// images, a copy no check removes): shown, never counted against the check.
     Kept,
 }
 
@@ -364,8 +364,8 @@ pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
 }
 
 /// What arena left on this box ([`crate::disk::find_leftovers`]): ◷ kept — never against the
-/// check, since arena never removes such a copy on its own (a staging copy can be the only copy of
-/// a pod's work) — with how to look at each and the `rm -rf` once checked; one in use now is
+/// check, which never removes one (a staging copy can be the only copy of a pod's work) — with
+/// how to look at each and the `rm -rf` once checked; one in use now is
 /// shown, with no fix. Nothing there: ✓.
 pub fn leftovers_item(probe: &Probe<Vec<crate::disk::Leftover>>, now: u64) -> Item {
     let scope = "copies and temp files";
@@ -380,7 +380,7 @@ pub fn leftovers_item(probe: &Probe<Vec<crate::disk::Leftover>>, now: u64) -> It
         Area::Leftovers,
         scope,
         Verdict::Kept,
-        format!("{} left by arena, {} — never removed by arena: check each, then remove it", left.len(), crate::disk::gb(bytes)),
+        format!("{} left by arena, {} — kept: look at each, then remove it", left.len(), crate::disk::gb(bytes)),
     );
     for l in left {
         item.entries.push(Entry::Leftover { path: l.path.display().to_string(), detail: l.facts(now), what: l.what(), in_use: l.in_use });
@@ -2326,7 +2326,7 @@ mod tests {
         assert!(item.notes.iter().any(|n| n.contains("it may be the only copy of that pod's work")), "{:?}", item.notes);
         assert!(item.notes.iter().any(|n| n == "look: du -sh /tmp/arena-replace-leh3rc2hdcf31i; ls -la /tmp/arena-replace-leh3rc2hdcf31i"));
         let text = r.render();
-        assert!(text.contains("◷ left on this box (copies and temp files): 2 left by arena, 7 GB — never removed by arena"), "{text}");
+        assert!(text.contains("◷ left on this box (copies and temp files): 2 left by arena, 7 GB — kept: look at each, then remove it"), "{text}");
         assert!(text.contains("/tmp/arena-replace-leh3rc2hdcf31i  3.5 GB, last written 16 days ago  pod leh3rc2hdcf31i's home"), "{text}");
         assert!(text.contains(&format!("{:<33}  3.5 GB, last written 16 days ago  in use now by a running arena", "/tmp/arena-replace-abc")), "{text}");
         assert!(r.verdict_line().starts_with("ALL CLEAR") && r.verdict_line().contains("kept"), "{}", r.verdict_line());

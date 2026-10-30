@@ -29,13 +29,20 @@ pub(crate) fn floor(cfg: &Config) -> Result<Option<Floor>> {
 /// Judge a run's copies onto this box together ([`core_disk::Ledger`]): each copy (a pod) with
 /// the destinations it writes and their sizes. The ones that don't fit, with why — in order.
 pub(crate) fn judge_copies(floor: Floor, copies: &[(String, Vec<(PathBuf, Size)>)]) -> Vec<(String, Skip)> {
+    judge_copies_with(floor, copies, core_disk::reading)
+}
+
+/// [`judge_copies`] with the filesystem readings from `read` (tests hand in their own).
+fn judge_copies_with(
+    floor: Floor,
+    copies: &[(String, Vec<(PathBuf, Size)>)],
+    read: impl Fn(&Path) -> std::result::Result<core_disk::Fs, String>,
+) -> Vec<(String, Skip)> {
     let mut ledger = core_disk::Ledger::new(floor);
     let mut out = Vec::new();
     for (name, parts) in copies {
-        let read: std::result::Result<Vec<_>, Skip> = parts
-            .iter()
-            .map(|(dest, size)| core_disk::reading(dest).map(|fs| (fs, *size)).map_err(|e| Skip::unknown(dest, &e)))
-            .collect();
+        let read: std::result::Result<Vec<_>, Skip> =
+            parts.iter().map(|(dest, size)| read(dest).map(|fs| (fs, *size)).map_err(|e| Skip::unknown(dest, &e))).collect();
         if let Err(skip) = read.and_then(|parts| ledger.admit(&parts)) {
             out.push((name.clone(), skip));
         }
@@ -50,6 +57,16 @@ pub(crate) fn size_into(dest: &Path) -> Size {
         Size::Later
     } else {
         Size::First
+    }
+}
+
+/// A pod's snapshot-tier copy into `dest` under the snapshot root `base`: a later one when the pod
+/// has an earlier snapshot there (or this label already holds its files), else [`size_into`]'s.
+pub(crate) fn snapshot_size(base: &Path, pod: &str, dest: &Path) -> Size {
+    if arena_core::restore::snapshot_labels(base, pod).is_empty() {
+        size_into(dest)
+    } else {
+        Size::Later
     }
 }
 
@@ -111,13 +128,14 @@ fn backup_roots(cfg: &Config) -> Vec<PathBuf> {
     [dir, big].iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| PathBuf::from(p))).collect()
 }
 
-/// What arena left on this box ([`core_disk::find_leftovers`]).
-pub(crate) fn leftovers(cfg: &Config, now: u64) -> Vec<Leftover> {
+/// What arena left on this box ([`core_disk::find_leftovers`]), and where it couldn't look.
+pub(crate) fn leftovers(cfg: &Config, now: u64) -> core_disk::Found {
     core_disk::find_leftovers(&std::env::temp_dir(), &backup_roots(cfg), now)
 }
 
 /// Where arena's own dirs are, to name the biggest on a low filesystem: every entry of the backup
-/// roots (labels, `big`, `baseline`, `reaped`), the leftovers, the state dir and the cron logs.
+/// roots (labels, `big`, `baseline`, `reaped`), the leftovers, the state dir and the cron logs —
+/// none inside another (a parent's size already holds it).
 fn arena_dirs(cfg: &Config, left: &[Leftover]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for root in backup_roots(cfg) {
@@ -133,8 +151,13 @@ fn arena_dirs(cfg: &Config, left: &[Leftover]) -> Vec<PathBuf> {
         out.push(PathBuf::from(home).join(".local/state/arena-cron"));
     }
     out.sort();
-    out.dedup();
-    out
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for p in out {
+        if !kept.iter().any(|k| p.starts_with(k)) {
+            kept.push(p);
+        }
+    }
+    kept
 }
 
 /// The rows about this box's disk (`config check`, the health check): one per filesystem arena
@@ -142,7 +165,7 @@ fn arena_dirs(cfg: &Config, left: &[Leftover]) -> Vec<PathBuf> {
 /// floor, ⚠ under it (every copy onto it is skipped), each with arena's biggest dirs there —,
 /// then what arena left on the box. Indented two spaces, as `config check`'s rows.
 pub(crate) fn rows(cfg: &Config, floor: Floor, now: u64) -> Vec<String> {
-    let left = leftovers(cfg, now);
+    let core_disk::Found { leftovers: left, unread } = leftovers(cfg, now);
     let mut by_fs: Vec<(core_disk::Fs, Vec<String>)> = Vec::new();
     let mut out = Vec::new();
     for (what, path) in places(cfg) {
@@ -183,6 +206,7 @@ pub(crate) fn rows(cfg: &Config, floor: Floor, now: u64) -> Vec<String> {
             out.push(if i == 0 { format!("  {line}") } else { format!("    {line}") });
         }
     }
+    out.extend(unread.iter().map(|u| format!("  ? couldn't look for what arena left in {u}")));
     out
 }
 
@@ -202,14 +226,20 @@ pub(crate) struct Health {
     pub lines: Vec<String>,
     /// How many pods had a copy skipped in the last day.
     pub skipped: usize,
+    /// The floor itself is invalid: every copy onto this box fails (a failure of the check too).
+    pub invalid: Option<String>,
 }
 
 pub(crate) fn health(cfg: &Config, now: u64) -> Option<Health> {
     let mut lines = vec!["\nThis box (where the backups and copies land):".to_string()];
+    let mut invalid = None;
     match floor(cfg) {
         Ok(None) => return None,
         Ok(Some(floor)) => lines.extend(rows(cfg, floor, now)),
-        Err(e) => lines.push(format!("  ✗ {e} — every copy onto this box fails until it's fixed")),
+        Err(e) => {
+            lines.push(format!("  ✗ {e} — every copy onto this box fails until it's fixed"));
+            invalid = Some(e.to_string());
+        }
     }
     let mut skipped = 0;
     if let Some(Ok(path)) = skips_path(cfg) {
@@ -219,7 +249,7 @@ pub(crate) fn health(cfg: &Config, now: u64) -> Option<Health> {
         skipped = recent.iter().map(|e| e.pod.as_str()).collect::<std::collections::BTreeSet<_>>().len();
         lines.extend(recent.iter().map(|e| format!("  {}", e.line(now))));
     }
-    Some(Health { lines, skipped })
+    Some(Health { lines, skipped, invalid })
 }
 
 #[cfg(test)]
@@ -242,6 +272,48 @@ mod tests {
         assert_eq!(floor(&Config::parse("CONTROL_MIN_FREE_GB=7\n")).unwrap(), Some(Floor::control(7 * core_disk::GB)));
         assert!(floor(&Config::parse("CONTROL_MIN_FREE_GB=x\n")).is_err());
         assert!(check_rows(&Config::parse("")).is_empty() && health(&Config::parse(""), 0).is_none());
+        // An invalid floor: said, and a failure of the health check (every copy fails up front).
+        let h = health(&Config::parse("CONTROL_MIN_FREE_GB=5GB\n"), 0).unwrap();
+        assert!(h.invalid.as_deref().is_some_and(|e| e.starts_with("CONTROL_MIN_FREE_GB must be")), "{:?}", h.invalid);
+        assert!(h.lines.iter().any(|l| l.starts_with("  ✗ CONTROL_MIN_FREE_GB must be") && l.ends_with("every copy onto this box fails until it's fixed")));
+    }
+
+    /// A pod's copy is a later one onto its own earlier copy (a snapshot under another label,
+    /// files in its big dir), else a first one; its tiers are judged together, a run's copies
+    /// adding up, and a reading that fails is a skip.
+    #[test]
+    fn a_pods_copy_is_sized_by_what_is_already_there_and_judged_whole() {
+        let d = std::env::temp_dir().join(format!("arena-disk-size-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let base = d.join("backup");
+        let (snap, big) = (base.join("w1d2/devtest-a"), base.join("big/devtest-a"));
+        assert_eq!((snapshot_size(&base, "devtest-a", &snap), size_into(&big)), (Size::First, Size::First));
+        for dir in [base.join("w1d1/devtest-a"), big.clone()] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("x.py"), "x").unwrap();
+        }
+        assert_eq!((snapshot_size(&base, "devtest-a", &snap), size_into(&big)), (Size::Later, Size::Later));
+        assert_eq!(snapshot_size(&base, "devtest-b", &base.join("w1d2/devtest-b")), Size::First, "another pod's snapshot isn't this one's");
+        let _ = std::fs::remove_dir_all(&d);
+
+        // 8 GB free, floor 5: a first copy of both tiers (~4 GB) doesn't fit, later ones do.
+        let g = core_disk::GB;
+        let read = |p: &Path| {
+            if p.starts_with("/gone") {
+                return Err("No such device".to_string());
+            }
+            Ok(core_disk::Fs { dev: 1, mount: PathBuf::from("/"), free: 8 * g, total: 75 * g })
+        };
+        let pod = |name: &str, size: Size| (name.to_string(), vec![(PathBuf::from("/b/w1d2"), size), (PathBuf::from("/b/big"), size)]);
+        let skipped = judge_copies_with(
+            Floor::control(5 * g),
+            &[pod("fresh", Size::First), pod("old1", Size::Later), pod("old2", Size::Later), ("lost".into(), vec![(PathBuf::from("/gone/x"), Size::Later)])],
+            read,
+        );
+        let names: Vec<&str> = skipped.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["fresh", "lost"]);
+        assert!(skipped[0].1.reason.contains("this copy (~4 GB, a first copy, not measured) would leave less"), "{}", skipped[0].1);
+        assert!(skipped[1].1.to_string().starts_with("skipped: free space on /gone/x unknown (No such device)"), "{}", skipped[1].1);
     }
 
     /// `config check`'s look at this box: one row per filesystem arena writes to, ⚠ under the
