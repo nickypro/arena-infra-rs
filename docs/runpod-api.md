@@ -75,7 +75,7 @@ parsed defensively from `serde_json::Value`, so a RunPod schema tweak degrades a
    A recycled `ip:port` can belong to a **different** pod. Pod identity must therefore be
    verified out-of-band by reading **`RUNPOD_POD_ID` from `/proc/1/environ`** over SSH (it is
    **not** present as a plain env var in a non-interactive shell — only in PID 1's environ).
-   See `crates/cli/src/main.rs::proxy_reaches_pod` (and the push/cutover paths around it).
+   See `crates/cli/src/pods/migrate.rs::proxy_reaches_pod` (and the push/cutover paths around it).
    **`lastStartedAt` from the REST API is NOT a reliable restart signal** — use the `/proc/1`
    start time via SSH instead.
 

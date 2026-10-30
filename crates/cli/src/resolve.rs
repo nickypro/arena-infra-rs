@@ -5,7 +5,7 @@
 //! `BUSY_AUTO_RESOLVE_HOURS` on and the pod quiet that long with a whole copy holding its state,
 //! the operation finished on the pod and the pod backed up again — in the same run, under its
 //! lock. The decisions are core's (`arena_core::resolve`); this is the I/O, beside
-//! the backup flow in main.rs rather than in it: `pods backup` calls [`Busy::look`] after its git
+//! the backup flow in pods/backup.rs rather than in it: `pods backup` calls [`Busy::look`] after its git
 //! step and [`Busy::settle`] after its copy.
 
 use std::path::PathBuf;
