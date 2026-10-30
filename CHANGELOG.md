@@ -19,6 +19,12 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-30 · Ctrl+C stops a capacity retry at once, even mid-listing
+- `pods up`/`create` with `--retry-mins` (and the dashboard's retry, stopped with `[s]`) now stop
+  the moment Ctrl+C is pressed. Before, a press while arena was re-listing the fleet between rounds
+  (which can take a while when a provider is slow or rate-limiting) still let one more round
+  create pods.
+
 ## 2026-10-30 · A more compact dashboard, an info panel, retry in the add-pod form; `B300 MIG`
 - The dashboard's top is one short line: pods, GPUs and their util, unreachable pods, the burn
   (`$14.80/h + €0.048/h`), balances with their runway, AI spent today and the credit left.
