@@ -31,6 +31,7 @@
 //! Provider is chosen by `ARENA_PROVIDER` (default `runpod`); config path by
 //! `ARENA_CONFIG`; initial cadence by `ARENA_REFRESH_SECS` (default 5).
 
+mod aikey;
 mod ask;
 mod columns;
 mod demo;
@@ -259,6 +260,9 @@ struct Shared {
     ask_answer: Option<ask::Answer>,
     /// The RTT from this box to each pod's SSH endpoint, as last timed (the RTT column).
     rtts: Rtts,
+    /// A run that changed AI keys ended (`runs.rs`): the next refresh reads them at once, not on
+    /// the minute's cadence, so the `AI$` cell and the summary show the change.
+    ai_wanted: bool,
 }
 
 impl Shared {
@@ -340,6 +344,8 @@ struct Ui {
     /// Where the footer's `[i] info` was last drawn (its first cell), set by `view`: a click on it opens the
     /// info panel ([`handle_mouse`]).
     menu_at: std::cell::Cell<Option<(u16, u16)>>,
+    /// A provisioning key is configured: the action menus have the AI key's rows (`aikey.rs`).
+    ai_keys: bool,
 }
 
 impl Ui {
@@ -422,7 +428,8 @@ async fn main() -> Result<()> {
     let (policy, _) = BalancePolicy::from_config(&cfg);
     let balance = BalanceCtx::new(Arc::new(HttpBalanceApi::from_config(&cfg)), balance_state_path(&cfg).and_then(Result::ok), policy);
     // OpenRouter's keys and credit, on the same cadence, when a provisioning key is set.
-    let ai = OpenRouter::from_config(&cfg).map(AiCtx::new);
+    let ai = OpenRouter::from_config(&cfg).map(|api| AiCtx { nudge: Some(nudge.clone()), ..AiCtx::new(api) });
+    let ai_keys = ai.is_some() && demo.is_none();
 
     // Background fetcher: keeps `shared` fresh without blocking the UI. A demo's makes its
     // rows up instead.
@@ -472,6 +479,7 @@ async fn main() -> Result<()> {
         offers: offers::State::new(true),
         demo: demo.is_some(),
         menu_at: std::cell::Cell::new(None),
+        ai_keys,
     };
 
     dashboard(&shared, &provider, &interval, &nudge, &details_wanted, ui).await
@@ -597,11 +605,14 @@ struct AiCtx {
     last: Option<tokio::time::Instant>,
     view: Arc<Mutex<UsageView>>,
     reading: Option<tokio::task::JoinHandle<()>>,
+    /// Woken when a read asked for by a run that changed keys lands ([`Shared::ai_wanted`]): the
+    /// refresh then shows it at once.
+    nudge: Option<Arc<Notify>>,
 }
 
 impl AiCtx {
     fn new(api: OpenRouter) -> Self {
-        AiCtx { api: Arc::new(api), last: None, view: Arc::default(), reading: None }
+        AiCtx { api: Arc::new(api), last: None, view: Arc::default(), reading: None, nudge: None }
     }
 }
 
@@ -612,8 +623,9 @@ const AI_KEYS_TIMEOUT: Duration = Duration::from_secs(20);
 const AI_CREDITS_TIMEOUT: Duration = balance::INLINE_TIMEOUT;
 
 /// Read OpenRouter's keys and credit, each within its own bound, and apply them to `view`
-/// apart ([`UsageView::apply`]): one failing never holds back the other's fresh answer.
-async fn read_ai(api: Arc<OpenRouter>, view: Arc<Mutex<UsageView>>) {
+/// apart ([`UsageView::apply`]): one failing never holds back the other's fresh answer. `done`
+/// is woken once they're applied.
+async fn read_ai(api: Arc<OpenRouter>, view: Arc<Mutex<UsageView>>, done: Option<Arc<Notify>>) {
     async fn bounded<T>(d: Duration, f: impl std::future::Future<Output = arena_core::Result<T>>) -> std::result::Result<T, String> {
         match arena_core::ratelimit::bounded(d, f).await {
             Ok(r) => r.map_err(|e| e.to_string()),
@@ -622,6 +634,9 @@ async fn read_ai(api: Arc<OpenRouter>, view: Arc<Mutex<UsageView>>) {
     }
     let (keys, credits) = tokio::join!(bounded(AI_KEYS_TIMEOUT, api.list_keys()), bounded(AI_CREDITS_TIMEOUT, api.credits()));
     view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).apply(keys, credits);
+    if let Some(n) = done {
+        n.notify_one();
+    }
 }
 
 /// What the summary bar's balance reads with: the reads, the state file the CLI keeps too
@@ -734,11 +749,15 @@ async fn refresh(
     if shared.lock().unwrap().last_refresh.is_none() {
         publish_listing(cfg, shared, &pods, &partial, now);
     }
-    // OpenRouter on the details cadence, in the background (never two reads at once).
+    // OpenRouter on the details cadence, in the background (never two reads at once) — and at
+    // once after a run that changed keys (`Shared::ai_wanted`, taken only when a read can start:
+    // one already going may have begun before the change).
     if let Some(a) = details.ai.as_mut() {
         let idle = a.reading.as_ref().is_none_or(|h| h.is_finished());
-        if idle && details_due(a.last.map(|t| t.elapsed()), forced) {
-            a.reading = Some(tokio::spawn(read_ai(a.api.clone(), a.view.clone())));
+        let wanted = idle && std::mem::take(&mut shared.lock().unwrap().ai_wanted);
+        if idle && (wanted || details_due(a.last.map(|t| t.elapsed()), forced)) {
+            let done = if wanted { a.nudge.clone() } else { None };
+            a.reading = Some(tokio::spawn(read_ai(a.api.clone(), a.view.clone(), done)));
             a.last = Some(tokio::time::Instant::now());
         }
     }
@@ -1261,6 +1280,19 @@ fn selected_pod(shared: &Arc<Mutex<Shared>>, idx: usize) -> Option<Pod> {
     shared.lock().unwrap().pods.get(idx).cloned()
 }
 
+/// The pods an [`Mode::Input`] is for: its pod (by id, if still listed), or its set's.
+fn input_pods(s: &Shared, ui: &Ui, scope: &InputScope) -> Vec<Pod> {
+    match scope {
+        InputScope::Pod { id, .. } => s.pods.iter().filter(|p| &p.id == id).cloned().collect(),
+        InputScope::Set(sc) => scope_pods_of(s, ui, *sc).into_iter().cloned().collect(),
+    }
+}
+
+/// The raise-cap box's `value` won't run for its pods ([`aikey::limit_preview`] says why).
+fn limit_refused(s: &Shared, ui: &Ui, scope: &InputScope, value: &str) -> bool {
+    aikey::limit_preview(s, &input_pods(s, ui, scope), value).is_err()
+}
+
 /// Open an interactive SSH shell to the selected pod: suspend the dashboard (leave the
 /// alternate screen + raw mode), hand the terminal to `ssh`, then restore on exit ([`hand_over`]).
 /// The one SSH call that doesn't go through `Remote`, on purpose: it's the operator's own shell —
@@ -1744,7 +1776,11 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
             },
         },
         Mode::Menu { mut sel } => {
-            let n = Action::MENU.len();
+            let rows = {
+                let s = shared.lock().unwrap();
+                aikey::pod_rows(&s, ui, s.pods.get(ui.selected)).0
+            };
+            let n = rows.len();
             match code {
                 KeyCode::Esc => ui.mode = Mode::List,
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -1755,9 +1791,9 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
                     sel = (sel + 1).min(n - 1);
                     ui.mode = Mode::Menu { sel };
                 }
-                KeyCode::Enter => choose_pod_action(shared, ui, provider, Action::MENU[sel.min(n - 1)].1),
-                KeyCode::Char(ch) => match Action::from_key(ch) {
-                    Some(action) => choose_pod_action(shared, ui, provider, action),
+                KeyCode::Enter => choose_pod_action(shared, ui, provider, rows[sel.min(n - 1)].1),
+                KeyCode::Char(ch) => match rows.iter().find(|(k, _)| *k == ch) {
+                    Some((_, action)) => choose_pod_action(shared, ui, provider, *action),
                     None => ui.mode = Mode::Menu { sel },
                 },
                 _ => ui.mode = Mode::Menu { sel },
@@ -1786,7 +1822,7 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
             }
         }
         Mode::FleetMenu { scope, mut sel } => {
-            let actions = Action::fleet_menu(scope == Scope::Marked);
+            let actions = Action::fleet_menu(scope == Scope::Marked, ui.ai_keys);
             let n = actions.len();
             match code {
                 KeyCode::Esc => ui.mode = Mode::List,
@@ -1812,6 +1848,10 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
             let token = fleet_confirm_token(shared, &ui.marked, scope, action);
             match code {
                 KeyCode::Esc => ui.mode = Mode::List,
+                KeyCode::Enter if typed == token && action.ai_key() => {
+                    let pods = scope_pods(shared, &ui.marked, scope);
+                    aikey::start_set(ui, shared, action, &pods, None);
+                }
                 KeyCode::Enter if typed == token => {
                     let pods = scope_pods(shared, &ui.marked, scope);
                     let (provider, remote, cfg) = (provider.clone(), ui.remote.clone(), ui.cfg.clone());
@@ -1833,34 +1873,7 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
         }
         Mode::Input { action, scope, mut value } => match code {
             KeyCode::Esc => ui.mode = Mode::List,
-            KeyCode::Enter if !value.trim().is_empty() => {
-                let (provider, remote, cfg) = (provider.clone(), ui.remote.clone(), ui.cfg.clone());
-                match scope {
-                    InputScope::Pod { name, id } => {
-                        let pod = {
-                            let s = shared.lock().unwrap();
-                            s.pods.iter().find(|p| p.id == id).cloned()
-                        };
-                        match pod {
-                            None => ui.mode = Mode::Result(format!("{name} is gone — refresh")),
-                            Some(pod) if action.cli() => start_cli_action(ui, shared, action, &pod, Some(&value)),
-                            Some(pod) => {
-                                ui.mode = Mode::Working(format!("{} on {name}…", action.label()));
-                                start_action(shared, async move {
-                                    execute(provider.as_ref(), remote.as_ref(), &cfg, action, &pod, Some(&value)).await
-                                });
-                            }
-                        }
-                    }
-                    InputScope::Set(sc) => {
-                        let pods = scope_pods(shared, &ui.marked, sc);
-                        ui.mode = Mode::Working(format!("{} on {} pod(s)…", action.label(), pods.len()));
-                        start_action(shared, async move {
-                            execute_fleet(&provider, &remote, &cfg, action, pods, Some(value)).await
-                        });
-                    }
-                }
-            }
+            KeyCode::Enter if !value.trim().is_empty() => submit_input(shared, ui, provider, action, scope, value),
             KeyCode::Backspace => {
                 value.pop();
                 ui.mode = Mode::Input { action, scope, value };
@@ -1897,6 +1910,46 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
         }
     }
     Ok(Flow::Changed)
+}
+
+/// Enter in an input box: `action` with `value` on its pod or its set — one of the CLI's commands
+/// as a run (`runs.rs`), the rest in the background. A cap the box shows as refused (an amount
+/// that isn't one, a cap under the spend) stays in the box, which says why.
+fn submit_input(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Provider>, action: Action, scope: InputScope, value: String) {
+    if action == Action::KeyLimit && limit_refused(&shared.lock().unwrap(), ui, &scope, &value) {
+        ui.mode = Mode::Input { action, scope, value };
+        return;
+    }
+    let (provider, remote, cfg) = (provider.clone(), ui.remote.clone(), ui.cfg.clone());
+    match scope {
+        InputScope::Pod { name, id } => {
+            let pod = {
+                let s = shared.lock().unwrap();
+                s.pods.iter().find(|p| p.id == id).cloned()
+            };
+            match pod {
+                None => ui.mode = Mode::Result(format!("{name} is gone — refresh")),
+                Some(pod) if action.cli() => start_cli_action(ui, shared, action, &pod, Some(&value)),
+                Some(pod) => {
+                    ui.mode = Mode::Working(format!("{} on {name}…", action.label()));
+                    start_action(shared, async move {
+                        execute(provider.as_ref(), remote.as_ref(), &cfg, action, &pod, Some(&value)).await
+                    });
+                }
+            }
+        }
+        InputScope::Set(sc) if action.ai_key() => {
+            let pods = scope_pods(shared, &ui.marked, sc);
+            aikey::start_set(ui, shared, action, &pods, Some(&value));
+        }
+        InputScope::Set(sc) => {
+            let pods = scope_pods(shared, &ui.marked, sc);
+            ui.mode = Mode::Working(format!("{} on {} pod(s)…", action.label(), pods.len()));
+            start_action(shared, async move {
+                execute_fleet(&provider, &remote, &cfg, action, pods, Some(value)).await
+            });
+        }
+    }
 }
 
 /// The info panel's keys ([`Mode::Info`]): Esc, `i` or `q` go back to the view it was opened
@@ -2089,6 +2142,9 @@ fn choose_pod_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dy
         return;
     };
     let shown = ui.shown_name(&pod.name);
+    if action.ai_key() {
+        return aikey::choose(shared, ui, pod, shown, action);
+    }
     let support = match action {
         Action::Stop => provider.stop_support(&pod).map_err(|e| ("stop", e)),
         Action::Rename => provider.rename_support(&pod).map_err(|e| ("rename", e)),
@@ -2129,6 +2185,7 @@ fn choose_fleet_action(
     scope: Scope,
 ) {
     match action {
+        _ if action.ai_key() => aikey::choose_set(shared, ui, action, scope),
         Action::Stop => {
             let plan = stop_plan(provider.as_ref(), scope_pods(shared, &ui.marked, scope));
             ui.mode = match plan.refusal() {
@@ -2456,7 +2513,9 @@ async fn execute(
             _ => format!("✗ {name}: no branch given"),
         },
         // Runs of the CLI (`start_cli_action`), never an action of this one.
-        Action::Start | Action::Rename | Action::Jobs | Action::Logs => format!("✗ {} {name}: runs as `arena pods {0}`", action.label()),
+        Action::Start | Action::Rename | Action::Jobs | Action::Logs | Action::KeyLimit | Action::KeyPause | Action::KeyResume | Action::KeyRotate => {
+            format!("✗ {} {name}: runs as `arena {}`", action.label(), action.command())
+        }
     }
 }
 
@@ -2470,6 +2529,7 @@ fn cli_action_args(action: Action, name: &str, arg: Option<&str>) -> Option<(run
         Action::Rename => (runs::Kind::Rename, v(&["pods", "rename", name, arg?.trim(), "--yes"])),
         Action::Jobs => (runs::Kind::Jobs, v(&["pods", "jobs", name])),
         Action::Logs => (runs::Kind::Logs, v(&["pods", "logs", name, "--tail", "100"])),
+        a if a.ai_key() => return aikey::args(a, &[name.to_string()], arg),
         _ => return None,
     })
 }
@@ -2478,7 +2538,7 @@ fn cli_action_args(action: Action, name: &str, arg: Option<&str>) -> Option<(run
 /// on it — or say why it can't run.
 fn start_cli_action(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, action: Action, pod: &Pod, arg: Option<&str>) {
     let Some((kind, args)) = cli_action_args(action, &pod.name, arg) else { return };
-    let title = format!("pods {} {}", action.label(), ui.shown_name(&pod.name));
+    let title = format!("{} {}", action.command(), ui.shown_name(&pod.name));
     // The pod's own provider: the CLI finds a pod fleet-wide whatever `--provider` says, but its
     // messages then name the right one.
     let provider = if pod.provider.is_empty() { ui.provider_name.clone() } else { pod.provider.clone() };
@@ -3015,8 +3075,17 @@ fn render_input(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action, scope: 
         InputScope::Pod { name, .. } => vec![name.clone()],
         InputScope::Set(sc) => scope_names(shared, ui, *sc),
     };
+    // The raise-cap box: what the key spent of its cap and the new cap as typed — or why Enter
+    // won't run it.
+    let preview = match action {
+        Action::KeyLimit => match aikey::limit_preview(shared, &input_pods(shared, ui, scope), value) {
+            Ok(lines) => format!("{}\n\n", lines.join("\n")),
+            Err(why) => format!("✗ {}\n\n", why.join("\n")),
+        },
+        _ => String::new(),
+    };
     let text = format!(
-        "{}\n\n{}\n\n  > {value}\n\n[enter] run  [esc] cancel",
+        "{}\n\n{preview}{}\n\n  > {value}\n\n[enter] run  [esc] cancel",
         action_summary(action, &names, Some(value), CONFIRM_NAMES_MAX).join("\n"),
         action.input_prompt(),
     );
@@ -3465,6 +3534,11 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         (None, _, Some(e)) => (format!("? (OpenRouter's keys couldn't be read: {e})"), Some(Tone::Warn)),
         (None, _, None) => ("- (no OpenRouter key named after this pod — `arena keys gen` makes one)".to_string(), Some(Tone::Dim)),
         (Some(k), _, None) if k.paused() => (k.detail(), Some(Tone::Dim)),
+        // Where to act on it: this pod's menu (`a`), its `ai …` rows.
+        (Some(k), _, None) if k.disabled => (format!("{} — a → ai resume", k.detail()), state::fill_tone(k.fill())),
+        (Some(k), _, None) if k.fill() == arena_core::openrouter::Fill::Full => {
+            (format!("{} — a → raise cap", k.detail()), state::fill_tone(k.fill()))
+        }
         (Some(k), _, None) => (k.detail(), state::fill_tone(k.fill())),
         (Some(k), _, Some(_)) => (format!("{} (as last read; the latest read failed)", k.detail()), Some(Tone::Dim)),
     });
@@ -4079,11 +4153,15 @@ fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 /// Render a navigable action menu: a title, one highlighted row per action (with its
 /// key + description; destructive ones in red), and a key hint. `sel` is the cursor; `restart`
 /// what a restart does to the disk of the pod(s) the menu is for (its label).
-fn render_action_menu(f: &mut Frame, title: String, actions: &[(char, Action)], sel: usize, restart: ContainerReset) {
+/// `ai_off`: why the AI key's rows can't act now (`aikey::pod_rows`) — they're greyed, with it.
+fn render_action_menu(f: &mut Frame, title: String, actions: &[(char, Action)], sel: usize, restart: ContainerReset, ai_off: Option<&str>) {
     let mut lines: Vec<Line> = vec![Line::from(title), Line::from("")];
     for (i, (k, a)) in actions.iter().enumerate() {
         let selected = i == sel;
-        let base = if a.is_risky() {
+        let off = ai_off.filter(|_| a.ai_key());
+        let base = if off.is_some() {
+            Style::default().fg(Color::DarkGray)
+        } else if a.is_risky() {
             Style::default().fg(Color::Red)
         } else {
             Style::default()
@@ -4094,7 +4172,8 @@ fn render_action_menu(f: &mut Frame, title: String, actions: &[(char, Action)], 
             base
         };
         let marker = if selected { "▶ " } else { "  " };
-        lines.push(Line::styled(format!("{marker}[{k}] {:<10} {}", a.label(), a.desc(restart)), style));
+        let desc = off.map_or_else(|| a.desc(restart).to_string(), |why| format!("({})", why.split(" — ").next().unwrap_or(why)));
+        lines.push(Line::styled(format!("{marker}[{k}] {:<10} {desc}", a.label()), style));
     }
     lines.push(Line::from(""));
     lines.push(Line::styled(
@@ -4114,7 +4193,8 @@ fn render_action_menu(f: &mut Frame, title: String, actions: &[(char, Action)], 
 fn render_menu(f: &mut Frame, shared: &Shared, ui: &Ui, sel: usize) {
     let pod = shared.pods.get(ui.selected);
     let name = pod.map(|p| ui.shown_name(&p.name)).unwrap_or_else(|| "?".into());
-    render_action_menu(f, format!("Actions for {name}:"), Action::MENU, sel, shared.restart_reset(pod));
+    let (rows, ai_off) = aikey::pod_rows(shared, ui, pod);
+    render_action_menu(f, format!("Actions for {name}:"), &rows, sel, shared.restart_reset(pod), ai_off.as_deref());
 }
 
 /// The single-pod confirm. What is about to happen — a plain summary of the action on the pod,
@@ -4173,6 +4253,10 @@ fn confirm_body(c: &Confirm, width: usize, rows: usize) -> Vec<String> {
     let width = width.max(2);
     let summary = action_summary(c.action, std::slice::from_ref(&c.pod_name), None, CONFIRM_NAMES_MAX);
     let mut out: Vec<String> = summary.iter().flat_map(|l| wrap_words(l, width)).collect();
+    if let Some(note) = &c.note {
+        out.push(String::new());
+        out.extend(note.lines().flat_map(|l| wrap_words(l, width)));
+    }
     if let Some(w) = c.warning() {
         out.push(String::new());
         out.extend(wrap_words(w, width));
@@ -4262,8 +4346,9 @@ const CONFIRM_NAMES_MAX: usize = 10;
 
 fn render_fleet_menu(f: &mut Frame, shared: &Shared, ui: &Ui, scope: Scope, sel: usize) {
     let (_, who) = scope_label(shared, &ui.marked, scope);
-    let actions = Action::fleet_menu(scope == Scope::Marked);
-    render_action_menu(f, format!("Actions — {who}:"), &actions, sel, shared.restart_reset(scope_pods_of(shared, ui, scope)));
+    let actions = Action::fleet_menu(scope == Scope::Marked, ui.ai_keys);
+    let ai_off = aikey::set_why(shared, &scope_pods_of(shared, ui, scope));
+    render_action_menu(f, format!("Actions — {who}:"), &actions, sel, shared.restart_reset(scope_pods_of(shared, ui, scope)), ai_off.as_deref());
 }
 
 /// The listed pods `scope` covers, render-side (as [`scope_names`]).
@@ -4620,6 +4705,7 @@ deep_check_end=1
             offers: offers::State::new(true),
             demo: false,
             menu_at: std::cell::Cell::new(None),
+            ai_keys: false,
         }
     }
 
@@ -5255,6 +5341,8 @@ deep_check_end=1
         shared.ai_cohort = Some(shared.ai.as_ref().unwrap().cohort("devtest", &[names, vec!["devtest-gone".into()]].concat()));
         let pane = draw(220, 50, &shared, &ui).join("\n");
         assert!(pane.contains("spend): devtest-gone ") && !pane.contains("(no pod)"), "{pane}");
+        // A key at its cap that a row carries: the top line says how to raise it.
+        assert!(pane.contains(" ⚠ AI key at cap: devtest-gone (a → raise cap) · "), "{pane}");
         shared.ai = Some(UsageView::from_keys(&[key("devtest-alpha", 0.0, 0.0, 0.0)], None));
         shared.ai_cohort = Some(shared.ai.as_ref().unwrap().cohort("devtest", &[]));
         assert!(!draw(220, 50, &shared, &ui).join("\n").contains("ai caps:"));
@@ -7236,6 +7324,140 @@ deep_check_end=1
             assert!(r.pods.is_empty(), "a log's lines are output, not progress");
             assert!(r.lines.iter().any(|l| l.len() > 1_000 && l.ends_with('…')), "the long line, cut");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The AI key's rows end to end, against a stub `arena`: with a provisioning key the per-pod
+    /// menu has them — greyed, with why, for a pod without a key, and refused if picked anyway; `a`
+    /// opens the raise-cap box prefilled with one key's worth, saying what the key spent and the new
+    /// cap; a cap under the spend keeps the box open; Enter runs `arena keys limit <pod> <amount>
+    /// --yes`; `o` on a paused key is resume, confirmed with `y`; a marked set's cap is one run for
+    /// its pods with a key. A key run's end asks for the keys to be read again.
+    #[tokio::test]
+    async fn the_ai_key_rows_run_the_clis_keys_commands() {
+        use arena_core::openrouter::KeyInfo;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("arena-tui-aikey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("arena");
+        std::fs::write(&stub, "#!/bin/sh\necho \"args: $*\"\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let key = |name: &str, spent: f64, reset: Option<&str>, off: bool| KeyInfo {
+            hash: format!("h-{name}"),
+            name: Some(name.into()),
+            limit: Some(5.0),
+            limit_remaining: Some(5.0 - spent),
+            limit_reset: reset.map(String::from),
+            usage: Some(spent),
+            usage_monthly: Some(spent),
+            disabled: off,
+            ..Default::default()
+        };
+        let mut fixture = fixture_shared();
+        fixture.ai = Some(UsageView::from_keys(&[key("devtest-alpha", 0.42, Some("monthly"), false), key("devtest-bravo", 1.0, None, true)], None));
+        let shared = Arc::new(Mutex::new(fixture));
+        let provider: Arc<dyn Provider> = Arc::from(arena_core::provider::build_fleet("runpod", &Config::parse("RUNPOD_API_KEY=r\n"), false).unwrap());
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        ui.cli = Ok(runs::Cli { exe: stub.clone(), config: "/test/config.env".into(), dir: dir.join("runs") });
+        let at = |name: &str| shared.lock().unwrap().pods.iter().position(|p| p.name == name).unwrap();
+        async fn first_line_when_ended(shared: &Mutex<Shared>, id: u64) -> Option<String> {
+            for _ in 0..200 {
+                {
+                    let s = shared.lock().unwrap();
+                    let r = s.runs.iter().find(|r| r.id == id).unwrap();
+                    if !r.running() {
+                        return r.lines.front().cloned();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            None
+        }
+
+        // No provisioning key: no rows.
+        ui.selected = at("devtest-alpha");
+        ui.mode = Mode::Menu { sel: 0 };
+        assert!(!draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("ai cap"));
+        ui.ai_keys = true;
+        // A pod with no key: the rows greyed with why; picked anyway, refused.
+        ui.selected = at("devtest-charlie");
+        let menu = draw(120, 40, &shared.lock().unwrap(), &ui);
+        let cap_row = menu.iter().find(|l| l.contains("[a] ai cap")).unwrap_or_else(|| panic!("{}", menu.join("\n")));
+        assert!(cap_row.contains("(no OpenRouter key is named after it)"), "{cap_row}");
+        choose_pod_action(&shared, &mut ui, &provider, Action::KeyLimit);
+        let Mode::Result(msg) = &ui.mode else { panic!("{:?}", ui.mode) };
+        assert!(msg.contains("✗ can't ai cap devtest-charlie — no OpenRouter key is named after it — `arena keys gen devtest-charlie`"), "{msg}");
+
+        // `a` (the menu), `a` (ai cap): the box, prefilled.
+        ui.selected = at("devtest-alpha");
+        ui.mode = Mode::Menu { sel: 0 };
+        let menu = draw(120, 40, &shared.lock().unwrap(), &ui).join("\n");
+        assert!(menu.contains("[a] ai cap     AI key: raise or set its cap") && menu.contains("[o] ai pause"), "{menu}");
+        let i = at("devtest-alpha");
+        let alpha = shared.lock().unwrap().pods[i].clone();
+        let rows = aikey::pod_rows(&shared.lock().unwrap(), &ui, Some(&alpha)).0;
+        let pick = rows.iter().find(|(k, _)| *k == 'a').unwrap().1;
+        choose_pod_action(&shared, &mut ui, &provider, pick);
+        let Mode::Input { action: Action::KeyLimit, scope, value } = ui.mode.clone() else { panic!("{:?}", ui.mode) };
+        assert_eq!(value, "+5");
+        let boxed = draw(120, 40, &shared.lock().unwrap(), &ui).join("\n");
+        assert!(boxed.contains("spent $0.42 of $5.00 this month") && boxed.contains("new cap: $10.00"), "{boxed}");
+        // Under the spend: refused in the box, Enter keeps it.
+        ui.mode = Mode::Input { action: Action::KeyLimit, scope: scope.clone(), value: "0.1".into() };
+        assert!(draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("✗ a $0.10 cap is under what it has spent this month ($0.42)"));
+        submit_input(&shared, &mut ui, &provider, Action::KeyLimit, scope.clone(), "0.1".into());
+        assert!(matches!(&ui.mode, Mode::Input { value, .. } if value == "0.1"), "{:?}", ui.mode);
+        assert!(shared.lock().unwrap().runs.is_empty());
+        // Enter on +5: `arena keys limit devtest-alpha +5 --yes`, then the keys are read again.
+        submit_input(&shared, &mut ui, &provider, Action::KeyLimit, scope, "+5".into());
+        let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        assert_eq!(first_line_when_ended(&shared, id).await.as_deref(), Some("args: --config /test/config.env --provider runpod keys limit devtest-alpha +5 --yes"));
+        {
+            let mut s = shared.lock().unwrap();
+            assert!(std::mem::take(&mut s.ai_wanted), "the AI$ column is read again");
+            assert_eq!(s.notice.as_ref().map(|n| n.text.as_str()), Some("✓ keys limit done — [p] shows it"));
+        }
+
+        // A paused key: its `o` row is resume, a `y` confirm saying the key's state.
+        ui.selected = at("devtest-bravo");
+        ui.mode = Mode::Menu { sel: 0 };
+        assert!(draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("[o] ai resume"));
+        let i = at("devtest-bravo");
+        let bravo = shared.lock().unwrap().pods[i].clone();
+        let rows = aikey::pod_rows(&shared.lock().unwrap(), &ui, Some(&bravo)).0;
+        choose_pod_action(&shared, &mut ui, &provider, rows.iter().find(|(k, _)| *k == 'o').unwrap().1);
+        let Mode::Confirm(c) = ui.mode.clone() else { panic!("{:?}", ui.mode) };
+        assert_eq!(c.action, Action::KeyResume);
+        assert!(c.note.as_deref().unwrap().starts_with("ai key now: disabled · $1.00 of $5.00"), "{:?}", c.note);
+        assert_eq!(c.preview.as_deref(), Some("arena keys resume devtest-bravo --yes"));
+        apply_action(&shared, &mut ui, &provider, &c);
+        let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        assert_eq!(first_line_when_ended(&shared, id).await.as_deref(), Some("args: --config /test/config.env --provider runpod keys resume devtest-bravo --yes"));
+        // Rotate: red, its warning, and `--copy`.
+        ui.selected = at("devtest-alpha");
+        choose_pod_action(&shared, &mut ui, &provider, Action::KeyRotate);
+        let Mode::Confirm(c) = ui.mode.clone() else { panic!("{:?}", ui.mode) };
+        assert!(c.warning().unwrap().contains("the old key stops working at once") && c.note.as_deref().unwrap().contains("the new key: cap $5.00"), "{c:?}");
+        assert_eq!(c.preview.as_deref(), Some("arena keys rotate devtest-alpha --copy --yes"));
+
+        // A marked set: one run for the pods with a key; the one without is left out.
+        let pods = shared.lock().unwrap().pods.clone();
+        ui.marked = pods.iter().filter(|p| ["devtest-alpha", "devtest-bravo", "devtest-charlie"].contains(&p.name.as_str())).map(mark_key).collect();
+        ui.mode = Mode::FleetMenu { scope: Scope::Marked, sel: 0 };
+        let menu = draw(120, 40, &shared.lock().unwrap(), &ui).join("\n");
+        assert!(menu.contains("[a] ai cap") && menu.contains("[O] ai resume") && !menu.contains("ai rotate"), "{menu}");
+        choose_fleet_action(&shared, &mut ui, &provider, Action::KeyPause, Scope::Marked);
+        assert!(matches!(&ui.mode, Mode::FleetConfirm { action: Action::KeyPause, note, .. } if note == "Left out (no AI key that was read): charlie"), "{:?}", ui.mode);
+        choose_fleet_action(&shared, &mut ui, &provider, Action::KeyLimit, Scope::Marked);
+        let Mode::Input { action: Action::KeyLimit, scope, .. } = ui.mode.clone() else { panic!("{:?}", ui.mode) };
+        submit_input(&shared, &mut ui, &provider, Action::KeyLimit, scope, "+1".into());
+        let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        let line = first_line_when_ended(&shared, id).await.unwrap();
+        let mut named: Vec<&str> = line.split(' ').filter(|w| w.starts_with("devtest-")).collect();
+        named.sort();
+        assert_eq!(named, ["devtest-alpha", "devtest-bravo"], "{line}");
+        assert!(line.starts_with("args: --config /test/config.env --provider runpod keys limit ") && line.ends_with(" +1 --yes"), "{line}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -39,6 +39,7 @@ mod hetzner_cli_tests;
 mod hetzner_setup_tests;
 mod help;
 mod jobs;
+mod key_limits;
 mod money;
 mod offers;
 mod reap;
@@ -695,6 +696,14 @@ enum KeysCmd {
         #[command(flatten)]
         sel: Select,
     },
+    /// Set or raise machines' key caps in place: `limit apple 10`, `limit --all +5`
+    Limit(key_limits::LimitArgs),
+    /// Pause machines' keys: their AI calls fail until `resume`
+    #[command(visible_alias = "disable")]
+    Pause(key_limits::PauseArgs),
+    /// Resume paused keys
+    #[command(visible_alias = "enable")]
+    Resume(key_limits::PauseArgs),
 }
 
 #[derive(Subcommand)]
@@ -16927,6 +16936,9 @@ async fn keys_with(
         KeysCmd::Gen { sel, limit, copy, dry_run } => (KeysAction::Gen, sel, limit, copy, dry_run),
         KeysCmd::Rotate { sel, limit, copy, dry_run } => (KeysAction::Rotate, sel, limit, copy, dry_run),
         KeysCmd::Revoke { sel, dry_run } => (KeysAction::Revoke, sel, None, false, dry_run),
+        KeysCmd::Limit(a) => return key_limits::limit(a, provider, cfg, api, dir, yes).await,
+        KeysCmd::Pause(a) => return key_limits::pause(a, false, provider, cfg, api, dir, yes).await,
+        KeysCmd::Resume(a) => return key_limits::pause(a, true, provider, cfg, api, dir, yes).await,
     };
     let limit = limit.unwrap_or(default_limit);
     let listed_at = arena_core::snapshot::unix_now();

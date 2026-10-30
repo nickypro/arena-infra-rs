@@ -249,7 +249,9 @@ pub fn top_parts(s: &FleetSummary, cost: &FleetCost, partial: &[String], balance
             Some(left) if left < ai.headroom => lead.push(format!("⚠ AI credit {} < caps' {}", money(left), money(ai.headroom))),
             _ => {}
         }
-        lead.extend(ai.capped_names());
+        // One a row carries can be raised from its menu: `a`, then `ai cap` (`a` again).
+        let raisable = ai.capped.iter().any(|k| k.pod);
+        lead.extend(ai.capped_names().map(|n| if raisable { format!("{n} (a → raise cap)") } else { n }));
         if !lead.is_empty() {
             out.push(Part::toned(lead.join(" · "), ai_tone(Some(ai))));
         }
@@ -969,6 +971,16 @@ pub enum Action {
     Jobs,
     /// `pods logs`: its newest job's log (read-only).
     Logs,
+    // Its OpenRouter key's, offered when a provisioning key is configured (`keys …`).
+    /// `keys limit <pod> <amount>`: raise or set its cap (the operator types the amount first).
+    KeyLimit,
+    /// `keys pause`: its AI calls fail until it's resumed.
+    KeyPause,
+    /// `keys resume`: a paused key back on. In the per-pod menu it shares pause's row and key:
+    /// the row says whichever the key's state calls for ([`Action::for_key`]).
+    KeyResume,
+    /// `keys rotate --copy`: a new key, copied onto the pod; the old one stops working.
+    KeyRotate,
 }
 
 impl Action {
@@ -989,20 +1001,58 @@ impl Action {
         ('t', Action::Terminate),
     ];
 
-    pub fn from_key(c: char) -> Option<Action> {
-        Self::MENU.iter().find(|(k, _)| *k == c).map(|(_, a)| *a)
+    /// The rows for a pod's OpenRouter key, before `backup` in both menus: `a` (so `a a` from the
+    /// list raises the cursor pod's cap) and `o` (on/off).
+    const AI_ROWS: &'static [(char, Action)] = &[('a', Action::KeyLimit), ('o', Action::KeyPause), ('n', Action::KeyRotate)];
+
+    /// The per-pod menu: [`Self::MENU`], with the AI key's rows when `ai` (a provisioning key is
+    /// configured — fixed for the dashboard's life, so rows never move under the cursor; whether
+    /// this pod has a key is the choice's to check, [`crate`]'s `ai_key_support`). The `o` row is
+    /// pause's here: [`Self::for_key`] makes it resume for a paused key.
+    pub fn pod_menu(ai: bool) -> Vec<(char, Action)> {
+        Self::with_ai_rows(Self::MENU.iter().copied(), if ai { Self::AI_ROWS } else { &[] })
+    }
+
+    /// `rows` with `ai` put in before `backup`.
+    fn with_ai_rows(rows: impl Iterator<Item = (char, Action)>, ai: &[(char, Action)]) -> Vec<(char, Action)> {
+        let mut out = Vec::new();
+        for row in rows {
+            if row.1 == Action::Backup {
+                out.extend_from_slice(ai);
+            }
+            out.push(row);
+        }
+        out
     }
 
     /// The multi-pod menu's actions (and keys): all of the per-pod menu's, the lifecycle ones
     /// (`restart`, `stop`, `terminate`) only for a marked set — never for "the whole fleet" in
-    /// one keystroke ([`Self::marked_set_only`]).
-    pub fn fleet_menu(has_marked: bool) -> Vec<(char, Action)> {
-        Self::MENU.iter().copied().filter(|(_, a)| !a.cli() && (!a.marked_set_only() || has_marked)).collect()
+    /// one keystroke ([`Self::marked_set_only`]). So are the AI key's (`ai`: a provisioning key is
+    /// configured): cap, pause and resume — each a row, as a set can hold both — never rotate.
+    pub fn fleet_menu(has_marked: bool, ai: bool) -> Vec<(char, Action)> {
+        const SET_AI: &[(char, Action)] = &[('a', Action::KeyLimit), ('o', Action::KeyPause), ('O', Action::KeyResume)];
+        let rows = Self::MENU.iter().copied().filter(|(_, a)| !a.cli() && (!a.marked_set_only() || has_marked));
+        Self::with_ai_rows(rows, if ai && has_marked { SET_AI } else { &[] })
     }
 
-    /// One of the CLI's commands, run as `arena` (`runs.rs`) — the cursor pod's menu only.
+    /// One of the CLI's commands, run as `arena` (`runs.rs`).
     pub fn cli(&self) -> bool {
-        matches!(self, Action::Start | Action::Rename | Action::Jobs | Action::Logs)
+        matches!(self, Action::Start | Action::Rename | Action::Jobs | Action::Logs) || self.ai_key()
+    }
+
+    /// One of the AI key's (`arena keys …`).
+    pub fn ai_key(&self) -> bool {
+        matches!(self, Action::KeyLimit | Action::KeyPause | Action::KeyResume | Action::KeyRotate)
+    }
+
+    /// Pause or resume as a key that's off (`disabled`) calls for — the per-pod menu's `o` row;
+    /// any other action as it is.
+    pub fn for_key(self, disabled: bool) -> Action {
+        match self {
+            Action::KeyPause | Action::KeyResume if disabled => Action::KeyResume,
+            Action::KeyPause | Action::KeyResume => Action::KeyPause,
+            a => a,
+        }
     }
 
     /// Whether a multi-pod run is offered only for a marked set, and a big one (or every listed
@@ -1037,6 +1087,10 @@ impl Action {
             Action::Rename => "rename (no restart)",
             Action::Jobs => "its background jobs (read-only)",
             Action::Logs => "its newest job's log (read-only)",
+            Action::KeyLimit => "AI key: raise or set its cap",
+            Action::KeyPause => "AI key: pause (calls fail until resumed)",
+            Action::KeyResume => "AI key: resume",
+            Action::KeyRotate => "AI key: a new one, copied onto it",
         }
     }
 
@@ -1054,6 +1108,21 @@ impl Action {
             Action::Rename => "rename",
             Action::Jobs => "jobs",
             Action::Logs => "logs",
+            Action::KeyLimit => "ai cap",
+            Action::KeyPause => "ai pause",
+            Action::KeyResume => "ai resume",
+            Action::KeyRotate => "ai rotate",
+        }
+    }
+
+    /// The `arena` command words it runs, for the runs panel and its footer notice.
+    pub fn command(&self) -> String {
+        match self {
+            Action::KeyLimit => "keys limit".into(),
+            Action::KeyPause => "keys pause".into(),
+            Action::KeyResume => "keys resume".into(),
+            Action::KeyRotate => "keys rotate".into(),
+            a => format!("pods {}", a.label()),
         }
     }
 
@@ -1069,14 +1138,14 @@ impl Action {
     /// disk (live finding 2026-10-07). Drives the red border and keeps both off the
     /// whole-fleet menu.
     pub fn is_destructive(&self) -> bool {
-        matches!(self, Action::Terminate | Action::Restart)
+        matches!(self, Action::Terminate | Action::Restart | Action::KeyRotate)
     }
 
     /// Whether to render the action in red in the menu — destructive *or* disruptive
     /// (stop takes the pod down). Distinct from [`Self::is_destructive`] so stop is red
     /// without claiming to be irreversible.
     pub fn is_risky(&self) -> bool {
-        matches!(self, Action::Terminate | Action::Restart | Action::Stop)
+        matches!(self, Action::Terminate | Action::Restart | Action::Stop | Action::KeyRotate)
     }
 
     /// The warning in the confirm modal, if any. `wipes_disk`: whether the pod's provider
@@ -1104,6 +1173,12 @@ impl Action {
                  again as a fresh image (only a /workspace volume survives).",
             ),
             Action::Start => Some("it bills again once it's up; a RunPod/Vast pod comes back as a fresh image, and is set up again."),
+            Action::KeyPause => Some("its AI calls fail until the key is resumed (this menu's `o` again, or `arena keys resume`)."),
+            Action::KeyRotate => Some(
+                "⚠ the old key stops working at once. The new one starts at no spend under the default cap, is saved in \
+                 ./keys (where the dashboard was started) and copied onto the pod; shells already open keep the old \
+                 one until they start again.",
+            ),
             _ => None,
         }
     }
@@ -1111,7 +1186,7 @@ impl Action {
     /// Actions that need a free-text argument typed first (the command / the branch),
     /// collected in an input modal before they run.
     pub fn needs_input(&self) -> bool {
-        matches!(self, Action::Run | Action::SetBranch | Action::Rename)
+        matches!(self, Action::Run | Action::SetBranch | Action::Rename | Action::KeyLimit)
     }
 
     /// What the action does, in words an operator reads at a glance — the confirm's summary,
@@ -1139,6 +1214,13 @@ impl Action {
             },
             Action::Jobs => "list its background jobs (read-only)".into(),
             Action::Logs => "show its newest job's log (read-only)".into(),
+            Action::KeyLimit => match arg {
+                Some(a) => format!("set its AI key's cap: {a} (`arena keys limit`)"),
+                None => "raise or set its AI key's cap (`arena keys limit`)".into(),
+            },
+            Action::KeyPause => "pause its AI key: OpenRouter refuses its calls until it's resumed (`arena keys pause`)".into(),
+            Action::KeyResume => "resume its AI key (`arena keys resume`)".into(),
+            Action::KeyRotate => "replace its AI key with a new one and copy that onto the pod (`arena keys rotate --copy`)".into(),
         }
     }
 
@@ -1148,6 +1230,7 @@ impl Action {
             Action::Run => "shell command to run on the pod(s):",
             Action::SetBranch => "branch to switch to (fetch + checkout + fast-forward):",
             Action::Rename => "new name — a free MACHINE_NAME_LIST name (bare names get the prefix):",
+            Action::KeyLimit => "the cap in USD — `10` sets it, `+5` raises it by $5:",
             _ => "",
         }
     }
@@ -1172,6 +1255,8 @@ pub struct Confirm {
     pub reset: ContainerReset,
     /// The full command is shown under the summary (`v` toggles it).
     pub full: bool,
+    /// Said under the summary: an AI key's state now (`ai key now: $0.42 of $5.00 …`).
+    pub note: Option<String>,
 }
 
 impl Confirm {
@@ -1185,6 +1270,7 @@ impl Confirm {
             wipes_disk: true,
             reset: ContainerReset::Unknown,
             full: false,
+            note: None,
         }
     }
 
@@ -1603,7 +1689,7 @@ mod tests {
         assert!(Action::Stop.warning(true, ContainerReset::Unknown).unwrap().contains("keeps no data"));
         assert!(Action::Stop.warning(false, ContainerReset::No).is_none());
         assert!(Action::Restart.desc(ContainerReset::Yes).contains("WIPES"));
-        let fleet = |marked| Action::fleet_menu(marked).into_iter().map(|(_, a)| a).collect::<Vec<_>>();
+        let fleet = |marked| Action::fleet_menu(marked, true).into_iter().map(|(_, a)| a).collect::<Vec<_>>();
         assert!(!fleet(false).contains(&Action::Restart) && !fleet(false).contains(&Action::Terminate));
         assert!(fleet(true).contains(&Action::Restart) && fleet(true).contains(&Action::Terminate));
         assert!(fleet(false).contains(&Action::Setup));
@@ -1630,11 +1716,15 @@ mod tests {
             (Action::Rename, Some("bravo"), "tuiprobe: rename to bravo (`arena pods rename`: ~/.name, the proxy, its AI key)"),
             (Action::Jobs, None, "tuiprobe: list its background jobs (read-only)"),
             (Action::Logs, None, "tuiprobe: show its newest job's log (read-only)"),
+            (Action::KeyLimit, Some("+5"), "tuiprobe: set its AI key's cap: +5 (`arena keys limit`)"),
+            (Action::KeyPause, None, "tuiprobe: pause its AI key: OpenRouter refuses its calls until it's resumed (`arena keys pause`)"),
+            (Action::KeyResume, None, "tuiprobe: resume its AI key (`arena keys resume`)"),
+            (Action::KeyRotate, None, "tuiprobe: replace its AI key with a new one and copy that onto the pod (`arena keys rotate --copy`)"),
         ];
         for (action, arg, want) in cases {
             assert_eq!(action_summary(action, &one, arg, 10), [want], "{action:?}");
         }
-        for (_, action) in Action::MENU {
+        for (_, action) in Action::pod_menu(true).iter().chain(&Action::fleet_menu(true, true)) {
             assert!(cases.iter().any(|(a, ..)| a == action), "{action:?} has no summary case");
             assert!(!action.what(None).contains("ssh"), "{action:?}");
         }
@@ -1646,10 +1736,30 @@ mod tests {
         assert_eq!(action_summary(Action::Test, &[], None, 2), ["print the torch version (read-only)"]);
     }
 
+    /// Each menu's keys are its own, one action each; the AI key's rows sit before `backup` and
+    /// only with a provisioning key configured, so no row moves under the cursor for a pod; the
+    /// per-pod `o` row is pause's or resume's as the key is on or off; rotate is per pod only, red.
     #[test]
-    fn menu_keys_map_to_actions() {
-        assert_eq!(Action::from_key('t'), Some(Action::Terminate));
-        assert_eq!(Action::from_key('z'), None);
+    fn menu_keys_map_to_actions_and_the_ai_rows_come_with_a_provisioning_key() {
+        let keys = |m: &[(char, Action)]| m.iter().map(|(k, _)| *k).collect::<String>();
+        assert_eq!(keys(&Action::pod_menu(false)), "ewlxgmbpurst");
+        assert_eq!(keys(&Action::pod_menu(true)), "ewlxgmaonbpurst");
+        assert_eq!(keys(&Action::fleet_menu(true, false)), "exgbprst");
+        assert_eq!(keys(&Action::fleet_menu(true, true)), "exgaoObprst");
+        assert_eq!(keys(&Action::fleet_menu(false, true)), "exgbp", "the whole fleet (`A`): never the AI key's rows");
+        for menu in [Action::pod_menu(true), Action::fleet_menu(true, true)] {
+            let mut k: Vec<char> = menu.iter().map(|(k, _)| *k).collect();
+            k.sort();
+            k.dedup();
+            assert_eq!(k.len(), menu.len(), "a key twice: {menu:?}");
+        }
+        assert!(!Action::fleet_menu(true, true).iter().any(|(_, a)| *a == Action::KeyRotate));
+        assert_eq!(Action::KeyPause.for_key(true), Action::KeyResume);
+        assert_eq!(Action::KeyResume.for_key(false), Action::KeyPause);
+        assert_eq!(Action::KeyLimit.for_key(true), Action::KeyLimit);
+        assert!(Action::KeyRotate.is_risky() && Action::KeyRotate.is_destructive() && !Action::KeyRotate.requires_typed_name());
+        assert!(Action::KeyLimit.needs_input() && Action::KeyLimit.cli() && Action::KeyPause.ai_key() && !Action::Rename.ai_key());
+        assert_eq!((Action::KeyLimit.command(), Action::Start.command()), ("keys limit".to_string(), "pods start".to_string()));
     }
 
     #[test]
@@ -2092,7 +2202,7 @@ mod tests {
     /// lifecycle actions — and with the same token ([`marked_set_token`]).
     #[test]
     fn stop_is_offered_for_a_marked_set_like_restart() {
-        let fleet = |marked| Action::fleet_menu(marked).into_iter().collect::<Vec<_>>();
+        let fleet = |marked| Action::fleet_menu(marked, false).into_iter().collect::<Vec<_>>();
         assert!(fleet(true).contains(&('s', Action::Stop)), "{:?}", fleet(true));
         for lifecycle in [Action::Stop, Action::Restart, Action::Terminate] {
             assert!(!fleet(false).iter().any(|(_, a)| *a == lifecycle), "{lifecycle:?} on the whole fleet: {:?}", fleet(false));
