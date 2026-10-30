@@ -205,6 +205,158 @@ pub fn summary_text(
     out
 }
 
+/// A piece of the top line or the footer's status: its words and its colour (`None`: the
+/// line's own).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Part {
+    pub text: String,
+    pub tone: Option<Tone>,
+}
+
+impl Part {
+    fn plain(text: impl Into<String>) -> Self {
+        Part { text: text.into(), tone: None }
+    }
+
+    fn toned(text: impl Into<String>, tone: Option<Tone>) -> Self {
+        Part { text: text.into(), tone }
+    }
+}
+
+/// The dashboard's top line — title and fleet summary in one, in short words — as its parts,
+/// warnings first: they keep their colours and, the line being cut at the terminal's edge,
+/// always win the space. A provider that failed to list (`⚠ vast failed to list — pods/cost
+/// missing`: the totals after it are a floor), a low or critical prepaid balance (`⚠ runpod
+/// $20.00 ≈47h`, [`balance::tui_parts`]), OpenRouter's (credit under what the keys' caps allow,
+/// keys at their cap — named, [`CohortUsage::capped_names`]). Then pods, GPUs and their mean
+/// util, unreachable pods (yellow), the burn (`$11.56/h + €0.048/h`), the balances that need
+/// nothing (`runpod $32.54 ≈4.0d · vast ~$118.30 est. ≈49d`), the cohort's AI spend today and
+/// the credit left. Every word left out is the info panel's ([`summary_text`] there). Pure.
+pub fn top_parts(s: &FleetSummary, cost: &FleetCost, partial: &[String], balance: &[AccountView], ai: Option<&CohortUsage>) -> Vec<Part> {
+    let money = |x: f64| fleet::fmt_money("$", x);
+    let mut out = Vec::new();
+    if !partial.is_empty() {
+        out.push(Part::toned(format!("⚠ {} failed to list — pods/cost missing", partial.join(", ")), Some(Tone::Warn)));
+    }
+    let (first, last, _) = balance::tui_parts(balance);
+    if let Some(first) = first {
+        out.push(Part::toned(first.trim().trim_end_matches('·').trim(), balance_tone(balance)));
+    }
+    if let Some(ai) = ai {
+        let mut lead = Vec::new();
+        match ai.credit_left {
+            Some(left) if left <= 0.005 => lead.push(format!("‼ AI credit {} — every key's calls fail", money(left))),
+            Some(left) if left < ai.headroom => lead.push(format!("⚠ AI credit {} < caps' {}", money(left), money(ai.headroom))),
+            _ => {}
+        }
+        lead.extend(ai.capped_names());
+        if !lead.is_empty() {
+            out.push(Part::toned(lead.join(" · "), ai_tone(Some(ai))));
+        }
+    }
+    out.push(Part::plain(count_of(s.pods, "pod", "pods")));
+    out.push(Part::plain(match s.mean_util {
+        Some(u) => format!("{} {u}%", count_of(s.total_gpus, "GPU", "GPUs")),
+        None => count_of(s.total_gpus, "GPU", "GPUs"),
+    }));
+    if s.unreachable > 0 {
+        out.push(Part::toned(format!("{} unreachable", s.unreachable), Some(Tone::Warn)));
+    }
+    out.push(Part::plain(short_burn(cost)));
+    if let Some(rest) = last {
+        out.push(Part::plain(rest));
+    }
+    if let Some(ai) = ai {
+        let mut tail = Vec::new();
+        if ai.keys > 0 {
+            tail.push(format!("AI {} today", ai.today.map(money).unwrap_or_else(|| "?".into())));
+        }
+        if let Some(left) = ai.credit_left {
+            tail.push(format!("credit {}", money(left)));
+        }
+        if ai.uncapped > 0 {
+            tail.push(format!("{} uncapped", ai.uncapped));
+        }
+        match (tail.is_empty(), ai.failed) {
+            (true, true) => tail.push("AI n/a".into()),
+            (false, true) => tail.push("(n/a)".into()),
+            _ => {}
+        }
+        if !tail.is_empty() {
+            out.push(Part::plain(tail.join(" · ")));
+        }
+    }
+    out
+}
+
+/// The fleet's burn in short: `$11.56/h + €0.048/h` (Hetzner's € apart, only when it has a
+/// priced pod), `(2 unpriced)` when some pods have no price — the total is then a floor. The
+/// billing count and the per-day figures are the info panel's ([`fleet::fleet_footer`]). Pure.
+pub fn short_burn(c: &FleetCost) -> String {
+    let mut out = format!("{}/h", fleet::fmt_money("$", c.usd_per_hr));
+    if c.priced_eur > 0 {
+        out.push_str(&format!(" + {}/h", fleet::fmt_money("€", c.eur_per_hr)));
+    }
+    if c.unpriced > 0 {
+        out.push_str(&format!(" ({} unpriced)", c.unpriced));
+    }
+    out
+}
+
+/// The refresh's status: the footer's short form and its colour (`✓ API 13/min`, `⚠ RunPod
+/// rate limit +1`, `✗ list error`, `reading 3 pods…`) and the whole line, for the info panel.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RefreshStatus {
+    pub short: String,
+    pub tone: Option<Tone>,
+    pub full: String,
+}
+
+impl RefreshStatus {
+    /// Work under way (`loading…`): the short form is the line.
+    pub fn busy(text: impl Into<String>) -> Self {
+        let text = text.into();
+        RefreshStatus { short: text.clone(), tone: Some(Tone::Busy), full: text }
+    }
+
+    /// A first listing shown before its pods are read.
+    pub fn listed(pods: &str) -> Self {
+        RefreshStatus { short: format!("reading {pods}…"), tone: Some(Tone::Busy), full: format!("listed {pods} — reading them…") }
+    }
+
+    /// No provider listed: the rows are the last ones.
+    pub fn list_error(full: String) -> Self {
+        RefreshStatus { short: "✗ list error".into(), tone: Some(Tone::Bad), full }
+    }
+
+    /// A refresh that listed: `full` (the dashboard's `status_line`) whole; short, the first warning's
+    /// [`warning_label`] and how many more (yellow), else `✓` and the providers' API requests in
+    /// the last minute (`rate`, when any were counted).
+    pub fn of(full: String, warnings: &[&str], rate: Option<usize>) -> Self {
+        match warnings.first() {
+            Some(w) => {
+                let more = if warnings.len() > 1 { format!(" +{}", warnings.len() - 1) } else { String::new() };
+                RefreshStatus { short: format!("⚠ {}{more}", warning_label(w)), tone: Some(Tone::Warn), full }
+            }
+            None => RefreshStatus { short: rate.map_or_else(|| "✓".to_string(), |r| format!("✓ API {r}/min")), tone: Some(Tone::Good), full },
+        }
+    }
+}
+
+/// A refresh warning's few first words, for the footer (`RunPod rate limit`, `pod details
+/// incomplete`, `ssh config not rewritten`): up to its first `:`, ` (` or ` — `, at most 28
+/// characters. Pure.
+pub fn warning_label(w: &str) -> String {
+    let w = w.strip_prefix("warning: ").unwrap_or(w);
+    let end = [": ", " (", " — "].iter().filter_map(|sep| w.find(sep)).min().unwrap_or(w.len());
+    let head = &w[..end];
+    if head.chars().count() > 28 {
+        format!("{}…", head.chars().take(27).collect::<String>())
+    } else {
+        head.to_string()
+    }
+}
+
 /// The colour of the OpenRouter warning in the summary bar (`None`: there's none).
 pub fn ai_tone(ai: Option<&CohortUsage>) -> Option<Tone> {
     match ai.map(|a| a.tui_parts())? {
@@ -316,26 +468,42 @@ pub fn rtt_cell(rtt: Option<Duration>) -> (String, Tone) {
     }
 }
 
-/// The HEALTH cell: `checking` while a deep check of this pod runs, else the last cached
-/// verdict and its age (`pass 12m`, `fail 2h` — `Status::label` + `snapshot::fmt_age`,
-/// as `arena snapshot` words them; the worst issue is left to the detail pane, it doesn't
-/// fit a column), or `-` for a pod never checked. `now` is the snapshot's clock.
+/// The HEALTH cell (`HLTH`, five cells): a glyph for the last cached verdict and its age —
+/// `✓12m` pass, `!5h` warn, `✗2h` fail, `·3d` skipped ([`health_glyph`] + `snapshot::fmt_age`,
+/// at most `365d`) — `…` while a deep check of this pod runs, `-` for a pod never checked. The
+/// words, and the worst issue, are the detail pane's (`fail 2h GPU error`, as `arena snapshot`
+/// words them). `now` is the snapshot's clock. Pure.
 pub fn health_cell(h: Option<&HealthRecord>, checking: bool, now: u64) -> (String, Tone) {
     if checking {
-        return ("checking".into(), Tone::Busy);
+        return ("…".into(), Tone::Busy);
     }
     let Some(h) = h else { return ("-".into(), Tone::Dim) };
     let age = now.saturating_sub(h.checked_at);
-    let tone = match h.status {
-        // A pass says little about today once it's over a day old: grey, so it can't pass for
-        // a fresh one. A warning or a failure keeps its colour (nobody has said otherwise).
+    (format!("{}{}", health_glyph(h.status), fmt_age(age)), health_tone(h.status, age))
+}
+
+/// A verdict's glyph in the HEALTH cell: `✓` pass, `!` warn, `✗` fail, `·` skipped — each one
+/// cell wide in every terminal (the legend in the info panel says which is which).
+pub fn health_glyph(s: Status) -> &'static str {
+    match s {
+        Status::Pass => "✓",
+        Status::Warn => "!",
+        Status::Fail => "✗",
+        Status::Skip => "·",
+    }
+}
+
+/// A verdict's colour, `age` seconds after it: a pass says little about today once it's over a
+/// day old ([`HEALTH_FRESH`]) — grey, so it can't pass for a fresh one. A warning or a failure
+/// keeps its colour (nobody has said otherwise).
+pub fn health_tone(s: Status, age: u64) -> Tone {
+    match s {
         Status::Pass if age > HEALTH_FRESH => Tone::Dim,
         Status::Pass => Tone::Good,
         Status::Warn => Tone::Warn,
         Status::Fail => Tone::Bad,
         Status::Skip => Tone::Dim,
-    };
-    (format!("{} {}", h.status.label(), fmt_age(age)), tone)
+    }
 }
 
 /// How long a deep check's pass reads as current in the HEALTH column (then grey): the health
@@ -343,20 +511,21 @@ pub fn health_cell(h: Option<&HealthRecord>, checking: bool, now: u64) -> (Strin
 /// a working cron never leaves a pass grey.
 pub const HEALTH_FRESH: u64 = 26 * 3_600;
 
-/// The PROXY cell: [`snapshot::proxy_label`] (`:9500`, `:9500 stale`, `-`, `?`), or with
-/// `compact` (a narrow terminal) just the port — the tone still tells live from stale.
-pub fn proxy_cell(p: &SnapshotPod, compact: bool) -> (String, Tone) {
-    let tone = match p.proxy {
-        ProxyState::Live => Tone::Good,
-        ProxyState::Stale => Tone::Warn,
-        ProxyState::None | ProxyState::Unknown => Tone::Dim,
-    };
-    let text = match (compact, p.proxy_port) {
-        (true, Some(port)) if matches!(p.proxy, ProxyState::Live | ProxyState::Stale) => format!(":{port}"),
-        _ => snapshot::proxy_label(p),
-    };
-    (text, tone)
+/// The PROXY cell: the forward's public port at every width — `9500` live (green), `9500!`
+/// stale (yellow: the forward still points at the pod's old endpoint, `arena proxy apply`
+/// re-points it), `-` no forward, `?` the proxy file couldn't be read. The words are the detail
+/// pane's ([`proxy_detail`]). Pure.
+pub fn proxy_cell(p: &SnapshotPod) -> (String, Tone) {
+    match (p.proxy, p.proxy_port) {
+        (ProxyState::Live, Some(port)) => (port.to_string(), Tone::Good),
+        (ProxyState::Stale, Some(port)) => (format!("{port}{PROXY_STALE}"), Tone::Warn),
+        (ProxyState::Unknown, _) => ("?".into(), Tone::Dim),
+        _ => ("-".into(), Tone::Dim),
+    }
 }
+
+/// The glyph after a stale forward's port in the PROXY cell.
+pub const PROXY_STALE: &str = "!";
 
 /// The detail pane's proxy line, spelling out what the state means for the operator.
 pub fn proxy_detail(p: &SnapshotPod) -> String {
@@ -1272,6 +1441,74 @@ mod tests {
         assert!(!summary_text(&s, &cost, &[], &[], None).contains("openrouter"));
     }
 
+    /// The top line in short words: warnings first, each in its tone (a failed listing, a low
+    /// balance, OpenRouter's), then pods, GPUs and util, unreachable (yellow), the burn, the
+    /// balances that need nothing, the AI spend and credit. Every word dropped is still in
+    /// [`summary_text`] (the info panel's).
+    #[test]
+    fn top_parts_are_short_and_warnings_lead() {
+        let text = |parts: &[Part]| parts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join(" · ");
+        let pods = [pod("arena8-apple", Some(0.40))];
+        let mut s = summarize(&pods, &HashMap::new());
+        let cost = fleet::fleet_cost(&pods);
+        let calm = CohortUsage { keys: 2, today: Some(1.5), credit_left: Some(422.09), headroom: 8.0, ..Default::default() };
+        let parts = top_parts(&s, &cost, &[], &[], Some(&calm));
+        assert_eq!(text(&parts), "1 pod · 0 GPUs · $0.40/h · AI $1.50 today · credit $422.09");
+        assert!(parts.iter().all(|p| p.tone.is_none()), "{parts:?}");
+        // Warnings: a failed listing, OpenRouter's (credit under the caps, keys at cap), unreachable.
+        let capped = |name: &str, pod: bool| arena_core::openrouter::CappedKey { name: name.into(), pod };
+        let short = CohortUsage { credit_left: Some(5.0), capped: vec![capped("arena8-gone", false)], uncapped: 1, failed: true, ..calm.clone() };
+        s.unreachable = 2;
+        s.total_gpus = 3;
+        s.mean_util = Some(41);
+        let parts = top_parts(&s, &cost, &["vast".to_string()], &[], Some(&short));
+        assert_eq!(
+            text(&parts),
+            "⚠ vast failed to list — pods/cost missing · ⚠ AI credit $5.00 < caps' $8.00 · ⚠ AI key at cap: arena8-gone (no pod) · 1 pod · 3 GPUs 41% · 2 unreachable · $0.40/h · AI $1.50 today · credit $5.00 · 1 uncapped · (n/a)"
+        );
+        let tones: Vec<Option<Tone>> = parts.iter().map(|p| p.tone).collect();
+        assert_eq!(tones[..2], [Some(Tone::Warn), Some(Tone::Warn)]);
+        assert_eq!(tones[4], Some(Tone::Warn), "unreachable");
+        let gone = CohortUsage { credit_left: Some(0.0), ..calm.clone() };
+        let parts = top_parts(&s, &cost, &[], &[], Some(&gone));
+        assert_eq!((parts[0].text.as_str(), parts[0].tone), ("‼ AI credit $0.00 — every key's calls fail", Some(Tone::Bad)));
+        // No OpenRouter key: nothing about AI.
+        assert!(!text(&top_parts(&s, &cost, &[], &[], None)).contains("AI"));
+        // Hetzner's € apart, the unpriced said.
+        let mut hetzner = pod("arena8-cpu", Some(0.0056));
+        hetzner.provider = "hetzner".into();
+        let both = [pod("arena8-apple", Some(0.40)), hetzner, pod("arena8-new", None)];
+        assert_eq!(short_burn(&fleet::fleet_cost(&both)), "$0.40/h + €0.006/h (1 unpriced)");
+        assert_eq!(short_burn(&fleet::fleet_cost(&[])), "$0.00/h");
+    }
+
+    /// The footer's short status: the first warning's words (yellow) and how many more; else ✓
+    /// and the API requests of the last minute; a failed listing, red; work under way, cyan.
+    /// The whole line stays for the info panel.
+    #[test]
+    fn the_refresh_status_is_short_in_the_footer_and_whole_in_the_panel() {
+        let ok = RefreshStatus::of("3 reporting · RunPod API 13/min · 47/60 left this minute".into(), &[], Some(13));
+        assert_eq!((ok.short.as_str(), ok.tone), ("✓ API 13/min", Some(Tone::Good)));
+        assert_eq!(ok.full, "3 reporting · RunPod API 13/min · 47/60 left this minute");
+        assert_eq!(RefreshStatus::of("0 reporting".into(), &[], None).short, "✓");
+        let warned = RefreshStatus::of("x".into(), &["RunPod rate limit: listing again in 12 s", "warning: can't read the proxy config /etc/x (denied)"], Some(2));
+        assert_eq!((warned.short.as_str(), warned.tone), ("⚠ RunPod rate limit +1", Some(Tone::Warn)));
+        for (w, want) in [
+            ("RunPod rate limit: listing again in 12 s (the minute window is spent)", "RunPod rate limit"),
+            ("pod details incomplete: HTTP 500", "pod details incomplete"),
+            ("pod details timed out after 20s", "pod details timed out after…"),
+            ("warning: can't read the proxy config /etc/nginx/streams-enabled/arena.conf (denied) — PROXY shows `?`", "can't read the proxy config…"),
+            ("no health cache: no state dir", "no health cache"),
+            ("ssh config not rewritten: permission denied", "ssh config not rewritten"),
+        ] {
+            assert_eq!(warning_label(w), want, "{w}");
+        }
+        let failed = RefreshStatus::list_error("list error: runpod: HTTP 401".into());
+        assert_eq!((failed.short.as_str(), failed.tone), ("✗ list error", Some(Tone::Bad)));
+        let listed = RefreshStatus::listed("3 pods");
+        assert_eq!((listed.short.as_str(), listed.full.as_str()), ("reading 3 pods…", "listed 3 pods — reading them…"));
+    }
+
     #[test]
     fn summary_counts_unreachable() {
         let pods = vec![pod("arena8-apple", None)];
@@ -1487,26 +1724,29 @@ mod tests {
     fn health_cell_table() {
         let p = at("alpha", "runpod", "rp1", None);
         let rec = |status, ago: u64| HealthRecord::from_health(&verdict(&p, status, &[]), NOW - ago);
-        // (cached record, a check running, text, tone)
+        // (cached record, a check running, text, tone): five cells at most, `HLTH` over them.
         let cases = [
             (None, false, "-", Tone::Dim),
-            (None, true, "checking", Tone::Busy),
-            (Some(rec(Status::Pass, 720)), false, "pass 12m", Tone::Good),
-            (Some(rec(Status::Warn, 59)), false, "warn 59s", Tone::Warn),
-            (Some(rec(Status::Fail, 7_300)), false, "fail 2h", Tone::Bad),
-            (Some(rec(Status::Fail, 3 * 86_400)), false, "fail 3d", Tone::Bad),
+            (None, true, "…", Tone::Busy),
+            (Some(rec(Status::Pass, 720)), false, "✓12m", Tone::Good),
+            (Some(rec(Status::Warn, 59)), false, "!59s", Tone::Warn),
+            (Some(rec(Status::Fail, 7_300)), false, "✗2h", Tone::Bad),
+            (Some(rec(Status::Fail, 3 * 86_400)), false, "✗3d", Tone::Bad),
+            (Some(rec(Status::Skip, 3_600)), false, "·1h", Tone::Dim),
+            (Some(rec(Status::Fail, 400 * 86_400)), false, "✗400d", Tone::Bad),
             // A pass fades past 26h (a daily cron's drift kept); a warning doesn't.
-            (Some(rec(Status::Pass, 26 * 3_600)), false, "pass 1d", Tone::Good),
-            (Some(rec(Status::Pass, 26 * 3_600 + 1)), false, "pass 1d", Tone::Dim),
-            (Some(rec(Status::Warn, 2 * 86_400)), false, "warn 2d", Tone::Warn),
+            (Some(rec(Status::Pass, 26 * 3_600)), false, "✓1d", Tone::Good),
+            (Some(rec(Status::Pass, 26 * 3_600 + 1)), false, "✓1d", Tone::Dim),
+            (Some(rec(Status::Warn, 2 * 86_400)), false, "!2d", Tone::Warn),
             // A re-check in flight says so over the old verdict.
-            (Some(rec(Status::Fail, 60)), true, "checking", Tone::Busy),
+            (Some(rec(Status::Fail, 60)), true, "…", Tone::Busy),
         ];
         for (r, checking, text, tone) in cases {
             assert_eq!(health_cell(r.as_ref(), checking, NOW), (text.to_string(), tone), "{r:?} {checking}");
+            assert!(ratatui::text::Span::raw(text).width() <= 5, "{text}");
         }
         // A verdict newer than the snapshot's clock (it landed after the refresh) is 0s old.
-        assert_eq!(health_cell(Some(&rec(Status::Pass, 0)), false, NOW - 5).0, "pass 0s");
+        assert_eq!(health_cell(Some(&rec(Status::Pass, 0)), false, NOW - 5).0, "✓0s");
     }
 
     #[test]
@@ -1521,19 +1761,15 @@ mod tests {
         let text = proxy_file();
         let read = dashboard_snapshot(&pods, &[], Some(&text), &HealthCache::new(), &naming, NOW);
         let unread = dashboard_snapshot(&pods, &[], None, &HealthCache::new(), &naming, NOW);
-        // (row, compact, text, tone)
+        // (row, text, tone): the port at every width, a stale one marked (and yellow).
         let cases = [
-            (&read.pods[0], false, ":9500", Tone::Good),
-            (&read.pods[0], true, ":9500", Tone::Good),
-            (&read.pods[1], false, ":9501 stale", Tone::Warn),
-            (&read.pods[1], true, ":9501", Tone::Warn), // narrow: the colour says stale
-            (&read.pods[2], false, "-", Tone::Dim),
-            (&read.pods[2], true, "-", Tone::Dim),
-            (&unread.pods[0], false, "?", Tone::Dim),
-            (&unread.pods[0], true, "?", Tone::Dim),
+            (&read.pods[0], "9500", Tone::Good),
+            (&read.pods[1], "9501!", Tone::Warn),
+            (&read.pods[2], "-", Tone::Dim),
+            (&unread.pods[0], "?", Tone::Dim),
         ];
-        for (row, compact, text, tone) in cases {
-            assert_eq!(proxy_cell(row, compact), (text.to_string(), tone), "{} compact={compact}", row.pod.name);
+        for (row, text, tone) in cases {
+            assert_eq!(proxy_cell(row), (text.to_string(), tone), "{}", row.pod.name);
         }
         assert_eq!(proxy_detail(&read.pods[0]), ":9500 (live)");
         assert_eq!(proxy_detail(&read.pods[1]), ":9501 stale (`arena proxy apply` re-points it)");
@@ -1609,7 +1845,7 @@ mod tests {
         assert!(!deep.is_running(&alpha) && !deep.is_running(&bravo) && deep.is_running(&charlie));
         let h = snap.pods[0].health.as_ref().unwrap();
         assert_eq!((h.status, h.checked_at, h.issues.as_slice()), (Status::Fail, NOW + 100, &[Issue::GpuError][..]));
-        assert_eq!(health_cell(Some(h), false, NOW + 100).0, "fail 0s");
+        assert_eq!(health_cell(Some(h), false, NOW + 100).0, "✗0s");
         assert!(snap.pods[1].health.is_none());
 
         // The next refresh re-reads the file (still the old pass): the newer verdict stays…

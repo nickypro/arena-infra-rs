@@ -200,6 +200,33 @@ pub(crate) fn pod_line(line: &str) -> Option<(String, PodState)> {
     Some((name.to_string(), state))
 }
 
+/// `up`'s line between two rounds while capacity is short: `round 2: 1 short of target 1
+/// (capacity); retrying in 60s (Ctrl+C to stop)…` (one GPU option), `round 1: 2 name(s) not
+/// placed (no capacity); retrying in 60s (Ctrl+C to stop)…` (several). Pure.
+pub(crate) fn retrying_line(line: &str) -> bool {
+    line.starts_with("round ") && line.contains("; retrying in ") && line.contains("(Ctrl+C to stop)")
+}
+
+/// `up`'s line when its retries are over: interrupted (`interrupted — stopping retries with 0 of
+/// 1`), or the window spent (`retry window (30m) has no room for another round — …`). Pure.
+fn retries_over(line: &str) -> bool {
+    line.starts_with("interrupted — stopping retries") || line.starts_with("retry window (")
+}
+
+/// When an `up` with these arguments stops retrying, `started` (unix seconds) plus its
+/// `--retry-mins`; `None` without one (or 0). Pure.
+pub(crate) fn retry_until(args: &[String], started: u64) -> Option<u64> {
+    let at = args.iter().position(|a| a == "--retry-mins")?;
+    let mins: u64 = args.get(at + 1)?.parse().ok()?;
+    (mins > 0).then_some(started + mins * 60)
+}
+
+/// `14:35 UTC` — a time today, as the dashboard says its times (UTC, the CLI's).
+pub(crate) fn clock(unix: u64) -> String {
+    let t = arena_core::snapshot::rfc3339(unix);
+    format!("{} UTC", t.get(11..16).unwrap_or(&t))
+}
+
 /// One run, as the panel shows it.
 #[derive(Debug)]
 pub(crate) struct Run {
@@ -222,6 +249,11 @@ pub(crate) struct Run {
     /// Where each of `pods` is, by name.
     pub index: HashMap<String, usize>,
     pub end: Option<(Instant, End)>,
+    /// An `up --retry-mins N` run: when its window ends (unix seconds) — from its arguments.
+    pub retry_until: Option<u64>,
+    /// It's waiting for capacity: its last retry line (`round 2: 1 short of target 1 (capacity);
+    /// retrying in 60s (Ctrl+C to stop)…`) — until a pod is made or the retries end.
+    pub waiting: Option<String>,
 }
 
 impl Run {
@@ -231,6 +263,13 @@ impl Run {
         // Only a command that changes pods reports their progress: `jobs`' and `logs`' lines are
         // the pods' own output, whatever they look like (review ai-review codex round 3 #1: a
         // log's `[created] x` made a pending row).
+        if self.kind == Kind::Up {
+            if retrying_line(&line) {
+                self.waiting = Some(line.trim().to_string());
+            } else if line.starts_with("[created] ") || retries_over(&line) {
+                self.waiting = None;
+            }
+        }
         if let Some((name, state)) = self.kind.lasting().then(|| pod_line(&line)).flatten() {
             if state == PodState::Created && self.kind == Kind::Up {
                 created = Some(name.clone());
@@ -349,6 +388,8 @@ pub(crate) fn start(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, kind: Kind, provid
             pods: Vec::new(),
             index: HashMap::new(),
             end: None,
+            retry_until: (kind == Kind::Up).then(|| retry_until(&args, arena_core::snapshot::unix_now())).flatten(),
+            waiting: None,
         });
         // Forget the oldest finished runs (their files stay).
         while s.runs.len() > KEEP_RUNS {
@@ -754,7 +795,12 @@ pub(crate) fn footer(s: &Shared) -> Option<String> {
         .filter(|r| r.running())
         .map(|r| {
             let tally = r.tally();
-            format!("pods {} {}{}", r.kind.word(), elapsed(r.started.elapsed()), if tally.is_empty() { String::new() } else { format!(" ({tally})") })
+            let mut notes: Vec<String> = (!tally.is_empty()).then_some(tally).into_iter().collect();
+            if let (Some(_), Some(until)) = (&r.waiting, r.retry_until) {
+                notes.push(format!("waiting for capacity until {}", clock(until)));
+            }
+            let notes = if notes.is_empty() { String::new() } else { format!(" ({})", notes.join(", ")) };
+            format!("pods {} {}{notes}", r.kind.word(), elapsed(r.started.elapsed()))
         })
         .collect();
     (!going.is_empty()).then(|| format!("⟳ {} · [p] progress · ", going.join(", ")))
@@ -772,6 +818,7 @@ pub(crate) fn render(f: &mut Frame, s: &Shared, id: u64, scroll: Option<u16>, st
     let at = s.runs.iter().position(|r| r.id == id).unwrap_or(0) + 1;
     let dim = Style::default().fg(Color::DarkGray);
     let (state, color) = match &run.end {
+        None if run.waiting.is_some() => (format!("running {} · waiting for capacity", elapsed(run.started.elapsed())), Color::Yellow),
         None => (format!("running {}", elapsed(run.started.elapsed())), Color::Cyan),
         Some((t, e)) => (format!("{} after {}", e.label(), elapsed(t.duration_since(run.started))), if e.ok() { Color::Green } else { Color::Red }),
     };
@@ -779,6 +826,17 @@ pub(crate) fn render(f: &mut Frame, s: &Shared, id: u64, scroll: Option<u16>, st
         Line::styled(format!("$ {}", run.command), Style::default().fg(Color::Cyan)),
         Line::styled(format!("output: {}", run.log.display()), dim),
     ];
+    // A retrying `up`: until when, and how to stop it sooner; while it waits, its last round.
+    if let (true, Some(until)) = (run.running(), run.retry_until) {
+        let left = until.saturating_sub(arena_core::snapshot::unix_now());
+        head.push(Line::styled(
+            format!("retry: no capacity → tries again until {} (in {}) · [s] stops it, keeping what was made", clock(until), elapsed(Duration::from_secs(left))),
+            Style::default().fg(Color::Yellow),
+        ));
+        if let Some(w) = &run.waiting {
+            head.push(Line::styled(format!("  waiting for capacity — {w}"), Style::default().fg(Color::Yellow)));
+        }
+    }
     let inner = area.height.saturating_sub(2) as usize;
     // The pods get at most a third of the panel (review ai-review codex round 3 #2: a cohort's
     // statuses pushed the output and the stop question off it): the failed, stopped and
@@ -795,6 +853,7 @@ pub(crate) fn render(f: &mut Frame, s: &Shared, id: u64, scroll: Option<u16>, st
         });
         shown.truncate(pod_room.saturating_sub(1));
     }
+    let pods_at = head.len();
     for (name, st) in shown {
         let (text, style) = match st {
             PodState::Created => ("created".to_string(), Style::default()),
@@ -806,7 +865,7 @@ pub(crate) fn render(f: &mut Frame, s: &Shared, id: u64, scroll: Option<u16>, st
         head.push(Line::from(vec![Span::styled(format!("  {name:<20} "), Style::default().add_modifier(Modifier::BOLD)), Span::styled(text, style)]));
     }
     if more > 0 && pod_room > 0 {
-        let hidden = run.pods.len() - (head.len() - 2);
+        let hidden = run.pods.len() - (head.len() - pods_at);
         head.push(Line::styled(format!("  … and {hidden} more · in all: {}", run.tally()), dim));
     }
     let keys = if stop {
@@ -922,7 +981,47 @@ pub(crate) mod tests {
             pods: Vec::new(),
             index: HashMap::new(),
             end: None,
+            retry_until: None,
+            waiting: None,
         }
+    }
+
+    /// A retrying `up` (`--retry-mins`): its window's end read off its arguments; its round
+    /// lines — one GPU option's and placement's — say it's waiting for capacity, until a pod is
+    /// made or its retries end (Ctrl+C, the window spent); the footer says until when.
+    #[test]
+    fn a_retrying_up_says_it_waits_for_capacity_and_until_when() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(retry_until(&args(&["pods", "up", "--add", "1", "--retry-mins", "30", "--yes"]), 1_000), Some(1_000 + 1_800));
+        assert_eq!(retry_until(&args(&["pods", "up", "--add", "1", "--yes"]), 1_000), None);
+        assert_eq!(retry_until(&args(&["pods", "up", "--retry-mins", "0"]), 1_000), None);
+        assert_eq!(clock(1_791_460_800 + 35 * 60), "12:35 UTC");
+        for (line, waiting) in [
+            ("round 1: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…", true),
+            ("round 1: 2 name(s) not placed (no capacity); retrying in 60s (Ctrl+C to stop)…", true),
+            ("[devtest-echo] endpoint poll failed (x); retrying in 5s", false),
+            ("round 3: nothing created — vast didn't answer", false),
+        ] {
+            assert_eq!(retrying_line(line), waiting, "{line}");
+        }
+        let mut r = run(1, Kind::Up);
+        r.retry_until = Some(arena_core::snapshot::unix_now() + 1_800);
+        r.take("[stop] no capacity for this GPU right now (created 0/1).".into());
+        r.take("round 1: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…".into());
+        assert!(r.waiting.is_some());
+        let shared = Shared { runs: vec![r], ..Default::default() };
+        let f = footer(&shared).unwrap();
+        assert!(f.starts_with("⟳ pods up 0s (waiting for capacity until ") && f.ends_with(" UTC) · [p] progress · "), "{f}");
+        let mut r = shared.runs.into_iter().next().unwrap();
+        r.take("[created] devtest-echo id=9 on 1×RTX A4000 SECURE ($0.25/h)".into());
+        assert_eq!(r.waiting, None, "made: not waiting any more");
+        r.take("round 2: 1 short of target 2 (capacity); retrying in 60s (Ctrl+C to stop)…".into());
+        r.take("interrupted — stopping retries with 1 of 2".into());
+        assert_eq!(r.waiting, None, "stopped");
+        // Only `up` retries: a start's lines are its own.
+        let mut start = run(2, Kind::Start);
+        start.take("round 1: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…".into());
+        assert_eq!(start.waiting, None);
     }
 
     /// A created pod shows at once as a pending row on the run's provider (once), and its

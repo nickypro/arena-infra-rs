@@ -8,7 +8,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arena_core::metrics::{GpuStat, PodMetrics};
+use arena_core::balance::{self, Account, AccountView, BalancePolicy, BalanceState, Burns, Fetched, Live};
+use arena_core::health::{Check, PodHealth, Status};
+use arena_core::metrics::{normalize_gpu_name, GpuStat, PodMetrics};
+use arena_core::openrouter::{Credits, KeyInfo, UsageView};
+use arena_core::proxy::{render_nginx, Forward};
 use arena_core::provider::Provider;
 use arena_core::remote::Remote;
 use arena_core::selector::Naming;
@@ -16,7 +20,7 @@ use arena_core::snapshot::{self, HealthCache};
 use arena_core::ssh::{SshOutput, SshTarget};
 use arena_core::{Config, Pod, PodSpec};
 
-use crate::state::{dashboard_snapshot, summarize};
+use crate::state::{dashboard_snapshot, summarize, RefreshStatus, Tone};
 use crate::Shared;
 
 /// How many pods `ARENA_TUI_DEMO` asks for (`None`: not a demo). A value that isn't a number of
@@ -44,7 +48,8 @@ impl Rng {
 
 /// `n` pods named `<prefix>-demoNN` and what a refresh would have read from them, round `round`:
 /// mostly running RunPod pods with one or two A4000s, some on Vast, a few Hetzner VMs, two
-/// stopped, one unreachable. Pure.
+/// stopped, one unreachable, and (from 6 pods) a B300 MIG slice and an H100 — the slice read as
+/// nvidia-smi reads one: the parent card's name, its memory unreadable. Pure.
 pub(crate) fn fleet(prefix: &str, n: usize, round: u64) -> (Vec<Pod>, HashMap<String, PodMetrics>) {
     let mut pods = Vec::with_capacity(n);
     let mut metrics = HashMap::new();
@@ -57,7 +62,14 @@ pub(crate) fn fleet(prefix: &str, n: usize, round: u64) -> (Vec<Pod>, HashMap<St
             9 if i % 20 == 9 => "hetzner",
             _ => "runpod",
         };
-        let gpus = if provider == "hetzner" { 0 } else { 1 + (shape.below(4) == 0) as u32 };
+        // (the provider's GPU type, the name nvidia-smi gives, its memory in MB, $/h per GPU)
+        let (card, smi_name, vram, rate) = match i {
+            2 => ("NVIDIA B300 SXM6 AC MIG 1g.34gb", "NVIDIA B300 SXM6 AC", None, 0.89),
+            5 => ("NVIDIA H100 80GB HBM3", "NVIDIA H100 80GB HBM3", Some(81_559), 2.69),
+            _ => ("NVIDIA RTX A4000", "NVIDIA RTX A4000", Some(16_376), 0.17),
+        };
+        let special = matches!(i, 2 | 5);
+        let gpus = if provider == "hetzner" { 0 } else if special { 1 } else { 1 + (shape.below(4) == 0) as u32 };
         let stopped = i % 29 == 28;
         let name = format!("{prefix}-demo{:02}", i + 1);
         let pod = Pod {
@@ -65,9 +77,9 @@ pub(crate) fn fleet(prefix: &str, n: usize, round: u64) -> (Vec<Pod>, HashMap<St
             name: name.clone(),
             provider: provider.into(),
             status: if stopped { "EXITED".into() } else { "RUNNING".into() },
-            gpu_type: Some(if provider == "hetzner" { "cx33".into() } else { "NVIDIA RTX A4000".into() }),
+            gpu_type: Some(if provider == "hetzner" { "cx33".into() } else { card.into() }),
             gpu_count: Some(gpus),
-            cost_per_hr: Some(if provider == "hetzner" { 0.016 } else { 0.17 * gpus as f64 }),
+            cost_per_hr: Some(if provider == "hetzner" { 0.016 } else { rate * gpus as f64 }),
             ssh_ip: (!stopped).then(|| format!("10.9.{}.{}", i / 250, i % 250 + 1)),
             ssh_port: (!stopped).then_some(22_000 + i as u16),
             ..Default::default()
@@ -77,15 +89,15 @@ pub(crate) fn fleet(prefix: &str, n: usize, round: u64) -> (Vec<Pod>, HashMap<St
                 PodMetrics { error: Some("ssh: connect timed out".into()), ..Default::default() }
             } else {
                 let gpu = |r: &mut Rng| GpuStat {
-                    name: Some("NVIDIA RTX A4000".into()),
+                    name: Some(normalize_gpu_name(smi_name)),
                     util_pct: Some(r.below(101) as u32),
-                    mem_used_mb: Some(r.below(16_000) as u32),
-                    mem_total_mb: Some(16_376),
+                    mem_used_mb: vram.map(|v| r.below(v) as u32),
+                    mem_total_mb: vram.map(|v| v as u32),
                     temp_c: Some(35 + r.below(45) as u32),
                 };
                 PodMetrics {
                     gpus: (0..gpus).map(|_| gpu(&mut now)).collect(),
-                    branch: Some(format!("{prefix}-w{}d{}", 1 + shape.below(4), 1 + shape.below(5))),
+                    branch: Some(format!("autocommit-{prefix}-w{}d{}-demo{:02}", 1 + shape.below(4), 1 + shape.below(5), i + 1)),
                     origin: Some("git@github.com:example/ARENA_3.0.git".into()),
                     has_name: Some(true),
                     has_key: Some(true),
@@ -107,14 +119,95 @@ pub(crate) fn fleet(prefix: &str, n: usize, round: u64) -> (Vec<Pod>, HashMap<St
     (pods, metrics)
 }
 
+/// The demo's last deep checks: most pods passed one (minutes to a day and more ago), a few
+/// failed or warned, every seventh never checked. Pure.
+fn health(pods: &[Pod], now: u64) -> HealthCache {
+    let mut cache = HealthCache::new();
+    for (i, p) in pods.iter().enumerate().filter(|(i, p)| i % 7 != 0 && p.status == "RUNNING") {
+        let (status, check, age) = match i {
+            i if i % 11 == 3 => (Status::Fail, Some(("cuda", "RuntimeError: CUDA error: unknown error")), 2 * 3_600),
+            i if i % 13 == 4 => (Status::Warn, Some(("driver", "570.86 < 580 (CUDA 13 wants 580)")), 5 * 3_600),
+            i if i % 17 == 6 => (Status::Pass, None, 30 * 3_600),
+            i => (Status::Pass, None, 60 + i as u64 * 420),
+        };
+        let checks = check.map(|(name, detail)| Check { name: name.into(), status, detail: detail.into() }).into_iter().collect();
+        let h = PodHealth { id: p.id.clone(), name: p.name.clone(), provider: p.provider.clone(), status, checks, facts: None, host: None };
+        cache.merge(&[h], now.saturating_sub(age));
+    }
+    cache
+}
+
+/// The demo's proxy file: a forward for each running pod but every ninth, one in eight pointing
+/// at an old endpoint (stale). Pure.
+fn proxy(pods: &[Pod]) -> String {
+    let forwards: Vec<Forward> = pods
+        .iter()
+        .enumerate()
+        .filter(|(i, p)| i % 9 != 4 && p.ssh_ip.is_some())
+        .map(|(i, p)| Forward {
+            name: p.name.clone(),
+            public_port: 9500 + i as u16,
+            target_ip: p.ssh_ip.clone().unwrap_or_default(),
+            target_port: p.ssh_port.unwrap_or(22) + u16::from(i % 8 == 6),
+            provider: Some(p.provider.clone()),
+            pod_id: Some(p.id.clone()),
+        })
+        .collect();
+    render_nginx(&forwards)
+}
+
+/// The demo's prepaid accounts, read "live": RunPod and Vast with about a week and three days
+/// left at the fleet's burn. Pure.
+fn balances(pods: &[Pod], now: u64) -> Vec<AccountView> {
+    let burn = |provider: &str| pods.iter().filter(|p| p.provider == provider && p.status == "RUNNING").filter_map(|p| p.cost_per_hr).sum::<f64>();
+    let fetched: Vec<Fetched> = [(Account::Runpod, 190.0), (Account::Vast, 80.0)]
+        .into_iter()
+        .map(|(account, hours)| {
+            let rate = burn(if account == Account::Runpod { "runpod" } else { "vast" });
+            let live = Live { usd: (rate * hours * 100.0).round() / 100.0, provider_burn_per_hr: Some(rate), spend_limit_per_hr: None, under_balance: None, reduced: false, owed: None };
+            Fetched { account, key_fp: "demo".into(), live: Some(Ok(live)), billed: None }
+        })
+        .collect();
+    balance::views(&BalanceState::default(), &fetched, &Burns::new(), &BalancePolicy::default(), balance::Mode::Inline, now)
+}
+
+/// The demo's OpenRouter keys, one per pod with a $5 daily cap — the fifth spent to it — and the
+/// account's credit. Pure.
+fn ai(pods: &[Pod], round: u64) -> UsageView {
+    let keys: Vec<KeyInfo> = pods
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let today = if i == 4 { 5.0 } else { ((i as u64 * 37 + round) % 450) as f64 / 100.0 };
+            KeyInfo {
+                hash: format!("demo{i}"),
+                name: Some(p.name.clone()),
+                limit: Some(5.0),
+                limit_remaining: Some(5.0 - today),
+                limit_reset: Some("daily".into()),
+                usage_daily: Some(today),
+                ..Default::default()
+            }
+        })
+        .collect();
+    UsageView::from_keys(&keys, Some(Credits { total: 500.0, used: 77.91 }))
+}
+
 /// Publish round `round` of the demo fleet to `shared`, as a refresh publishes a real one (rows,
-/// history, summary, status).
+/// history, summary, status) — with deep checks (one running), proxy forwards, balances and
+/// OpenRouter keys made up too, so every column and the summary have something to show.
 pub(crate) fn publish(shared: &Mutex<Shared>, cfg: &Config, n: usize, round: u64) {
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let (pods, metrics) = fleet(prefix, n, round);
     let now = snapshot::unix_now();
-    let snap = dashboard_snapshot(&pods, &[], None, &HealthCache::new(), &Naming::from_config(cfg), now);
+    let snap = dashboard_snapshot(&pods, &[], Some(&proxy(&pods)), &health(&pods, now), &Naming::from_config(cfg), now);
     let mut s = shared.lock().unwrap();
+    s.deep.begin(pods.iter().skip(1).take(1).cloned().collect());
+    s.balance = balances(&pods, now);
+    let view = ai(&pods, round);
+    let names: Vec<String> = pods.iter().map(|p| p.name.clone()).collect();
+    s.ai_cohort = Some(view.cohort(prefix, &names));
+    s.ai = Some(view);
     for pod in &pods {
         let m = metrics.get(&pod.name);
         let pct = |(u, t): (u32, u32)| if t > 0 { (u as u64 * 100 / t as u64) as u32 } else { 0 };
@@ -126,7 +219,7 @@ pub(crate) fn publish(shared: &Mutex<Shared>, cfg: &Config, n: usize, round: u64
         s.history.entry(pod.name.clone()).or_default().push(util, m.and_then(|m| m.max_temp()), mem);
     }
     s.summary = summarize(&pods, &metrics);
-    s.status = format!("demo: {n} made-up pods, nothing real");
+    s.status = RefreshStatus { short: "⚠ demo".into(), tone: Some(Tone::Warn), full: format!("demo: {n} made-up pods, nothing real") };
     s.metrics = metrics;
     s.publish(snap);
     s.last_refresh = Some(Instant::now());
@@ -224,5 +317,31 @@ mod tests {
         };
         assert_ne!(utils(&ma), utils(&mb), "the numbers move");
         assert_eq!(a[0].name, "devtest-demo01");
+    }
+
+    /// Published, the demo has something in every column and the summary: a B300 MIG slice (its
+    /// card as nvidia-smi names it, memory unread), deep checks (one running), live/stale/no
+    /// forwards, balances and OpenRouter keys — one at its cap.
+    #[test]
+    fn the_published_demo_fills_every_column() {
+        let shared = Mutex::new(Shared::default());
+        let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\n");
+        publish(&shared, &cfg, 60, 0);
+        let s = shared.lock().unwrap();
+        let mig = &s.pods[2];
+        assert_eq!(mig.gpu_type.as_deref(), Some("NVIDIA B300 SXM6 AC MIG 1g.34gb"));
+        let m = &s.metrics[&mig.name];
+        assert_eq!((m.gpus[0].name.as_deref(), m.vram_gb()), (Some("B300 SXM6 AC"), None));
+        use arena_core::snapshot::ProxyState;
+        for state in [ProxyState::Live, ProxyState::Stale, ProxyState::None] {
+            assert!(s.snap.pods.iter().any(|p| p.proxy == state), "{state:?}");
+        }
+        for status in [Status::Pass, Status::Warn, Status::Fail] {
+            assert!(s.snap.pods.iter().any(|p| p.health.as_ref().is_some_and(|h| h.status == status)), "{status:?}");
+        }
+        assert_eq!(s.deep.running(), 1);
+        assert_eq!(s.balance.len(), 2);
+        assert_eq!(s.ai_cohort.as_ref().map(|c| c.capped.len()), Some(1));
+        assert_eq!(s.status.short, "⚠ demo");
     }
 }

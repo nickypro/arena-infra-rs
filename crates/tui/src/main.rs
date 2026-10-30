@@ -32,6 +32,7 @@
 //! `ARENA_CONFIG`; initial cadence by `ARENA_REFRESH_SECS` (default 5).
 
 mod ask;
+mod columns;
 mod demo;
 mod lag;
 mod newpod;
@@ -80,9 +81,9 @@ use prefs::Prefs;
 use arena_core::status::pod_status;
 use state::{
     action_summary, capture_details, carry_over, remember_good, dashboard_snapshot, details_due, display_name, health_cell, listing_note, mark_key, marked_pods,
-    marked_set_token, merge_details, overlay_details, partial_notice, proxy_cell, proxy_detail, rtt_cell,
-    provider_title, select_marks, short_branch, spark, summarize, summary_text, count_of, Action, Confirm, DeepChecks, Endpoint,
-    FleetSummary, History, PodDetails, Rtts, Throttle, Tone, RTT_EVERY, RTT_WAIT,
+    marked_set_token, merge_details, overlay_details, proxy_cell, proxy_detail, rtt_cell,
+    provider_title, select_marks, short_branch, spark, summarize, summary_text, count_of, top_parts, Action, Confirm, DeepChecks, Endpoint,
+    FleetSummary, History, PodDetails, RefreshStatus, Rtts, Throttle, Tone, RTT_EVERY, RTT_WAIT,
 };
 use newpod::NewPodForm;
 
@@ -175,6 +176,11 @@ enum Mode {
     Ask { scope: InputScope, value: String, pick: arena_core::ask::Pick },
     /// An answer to a `?` question: scrollable; Esc closes.
     Answer(ask::Answer),
+    /// `i`, or a click on the footer's `☰`: everything the top line and the footer leave out
+    /// (provider, config, the whole status, refresh, deep checks, the fleet's words, balances,
+    /// AI, every key, what the glyphs mean), scrollable. `detail`: opened from the detail view
+    /// (Esc goes back to it).
+    Info { scroll: u16, detail: bool },
 }
 
 /// Which pods a multi-pod action targets.
@@ -211,7 +217,8 @@ struct Shared {
     metrics: HashMap<String, PodMetrics>,
     history: HashMap<String, History>,
     summary: FleetSummary,
-    status: String,
+    /// The refresh's status: the footer's short form, the info panel's whole line.
+    status: RefreshStatus,
     last_refresh: Option<Instant>,
     /// True while a sweep is in flight (drives the footer's ⟳ indicator).
     refreshing: bool,
@@ -330,6 +337,9 @@ struct Ui {
     /// `ARENA_TUI_DEMO`: the rows are made up (`demo.rs`) — every key that would act on a pod,
     /// reach one or create one is refused ([`demo_refuses`]).
     demo: bool,
+    /// Where the footer's `☰` was last drawn (its cell), set by `view`: a click on it opens the
+    /// info panel ([`handle_mouse`]).
+    menu_at: std::cell::Cell<Option<(u16, u16)>>,
 }
 
 impl Ui {
@@ -398,7 +408,7 @@ async fn main() -> Result<()> {
         .unwrap_or(5);
 
     let shared = Arc::new(Mutex::new(Shared {
-        status: "loading…".into(),
+        status: RefreshStatus::busy("loading…"),
         ..Default::default()
     }));
     let interval = Arc::new(AtomicU64::new(initial_secs));
@@ -461,6 +471,7 @@ async fn main() -> Result<()> {
         nudge: nudge.clone(),
         offers: offers::State::new(true),
         demo: demo.is_some(),
+        menu_at: std::cell::Cell::new(None),
     };
 
     dashboard(&shared, &provider, &interval, &nudge, &details_wanted, ui).await
@@ -705,7 +716,7 @@ async fn refresh(
         let errs: Vec<String> = listing.errors().iter().map(|(p, e)| format!("{p}: {e}")).collect();
         let held = details.throttle_note.as_ref().map(|n| format!(" · ⚠ {n}")).unwrap_or_default();
         let mut s = shared.lock().unwrap();
-        s.status = format!("list error: {}{held}", errs.join("; "));
+        s.status = RefreshStatus::list_error(format!("list error: {}{held}", errs.join("; ")));
         if let Some(v) = views {
             s.balance = v;
         }
@@ -815,7 +826,8 @@ async fn refresh(
         .flatten()
         .map(String::as_str)
         .collect();
-    s.status = status_line(&s.summary, quota_line(&listing).as_deref(), &warnings);
+    let (quota, rate) = quota_line(&listing);
+    s.status = RefreshStatus::of(status_line(&s.summary, quota.as_deref(), &warnings), &warnings, rate);
     s.metrics = metrics;
     if let Some(r) = &details.rtt {
         s.rtts = r.clone();
@@ -870,21 +882,25 @@ async fn list_all(provider: &dyn Provider, details: &mut DetailsState) -> (Listi
 
 /// The footer's quota part: per provider listed, its API requests in the last minute and
 /// what its quota has left this minute ([`arena_core::ratelimit::footer`]) — from this
-/// process's own requests; nothing for a provider that sent none and reports nothing.
-fn quota_line(listing: &Listing) -> Option<String> {
+/// process's own requests; nothing for a provider that sent none and reports nothing. With the
+/// requests of the last minute across them (the footer's short status, `✓ API 13/min`).
+fn quota_line(listing: &Listing) -> (Option<String>, Option<usize>) {
     let views = arena_core::ratelimit::observed();
     let mut seen: Vec<&str> = Vec::new();
-    let parts: Vec<String> = listing
+    let listed: Vec<&str> = listing
         .providers
         .iter()
-        .filter(|pl| {
-            let new = !seen.contains(&pl.provider.as_str());
-            seen.push(&pl.provider);
+        .map(|pl| pl.provider.as_str())
+        .filter(|p| {
+            let new = !seen.contains(p);
+            seen.push(p);
             new
         })
-        .filter_map(|pl| arena_core::ratelimit::footer(&views, &pl.provider, &provider_title(&pl.provider)))
         .collect();
-    (!parts.is_empty()).then(|| parts.join(" · "))
+    let parts: Vec<String> =
+        listed.iter().filter_map(|p| arena_core::ratelimit::footer(&views, p, &provider_title(p))).collect();
+    let rate: usize = views.iter().filter(|v| listed.contains(&v.provider)).map(|v| v.last_minute).sum();
+    ((!parts.is_empty()).then(|| parts.join(" · ")), (!parts.is_empty()).then_some(rate))
 }
 
 /// Show `pods` as listed, before anything about them is read: the rows, their proxy and last
@@ -896,7 +912,7 @@ fn publish_listing(cfg: &Config, shared: &Mutex<Shared>, pods: &[Pod], partial: 
     let health = s.deep.layer(file_health);
     let snap = dashboard_snapshot(pods, partial, proxy.as_deref(), &health, &Naming::from_config(cfg), now);
     s.summary = summarize(pods, &HashMap::new());
-    s.status = format!("listed {} — reading them…", count_label(pods.len()));
+    s.status = RefreshStatus::listed(&count_label(pods.len()));
     s.publish(snap);
 }
 
@@ -1151,13 +1167,36 @@ async fn end_now(code: i32, why: Option<String>) {
     std::process::exit(code)
 }
 
-/// Mouse handling: wheel-scroll the pod list (or the result modal), and in the list
-/// left-click a row to select it. Clicking the far-left of a row — or shift-clicking
-/// anywhere on it — toggles that pod's multi-select mark (same `marked` set as `space`).
+/// Mouse handling: wheel-scroll the pod list (or the result modal, or the info panel), and in
+/// the list left-click a row to select it. Clicking the far-left of a row — or shift-clicking
+/// anywhere on it — toggles that pod's multi-select mark (same `marked` set as `space`). A click
+/// on the footer's `☰` opens the info panel from the list or the detail view, and closes it.
 /// `false`: nothing changed (a move, a click outside the rows) — no frame for it.
 fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared>>) -> bool {
     let in_list = matches!(ui.mode, Mode::List);
     let in_result = matches!(ui.mode, Mode::Result(_));
+    // The footer's ☰ (its glyph and the space after it): opens the info panel from the list or
+    // the detail view, and closes it again.
+    let on_menu = ui.menu_at.get().is_some_and(|(x, y)| m.row == y && (x..x.saturating_add(2)).contains(&m.column));
+    if let (MouseEventKind::Down(MouseButton::Left), true) = (m.kind, on_menu) {
+        ui.mode = match ui.mode {
+            Mode::List => Mode::Info { scroll: 0, detail: false },
+            Mode::Detail => Mode::Info { scroll: 0, detail: true },
+            Mode::Info { detail: true, .. } => Mode::Detail,
+            Mode::Info { detail: false, .. } => Mode::List,
+            _ => return false,
+        };
+        return true;
+    }
+    if let Mode::Info { scroll, detail } = ui.mode {
+        let delta = match m.kind {
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::ScrollDown => 1,
+            _ => return false,
+        };
+        ui.mode = Mode::Info { scroll: scroll_by(scroll, ui.result_max.get(), delta), detail };
+        return true;
+    }
     match m.kind {
         MouseEventKind::ScrollUp => {
             if in_result {
@@ -1363,6 +1402,7 @@ fn list_key(ui: &mut Ui, code: KeyCode, len: usize) -> ListKey {
             }
         }
         KeyCode::Char('/') => ui.mode = Mode::Select { value: String::new() },
+        KeyCode::Char('i') => ui.mode = Mode::Info { scroll: 0, detail: matches!(ui.mode, Mode::Detail) },
         // Act on the marked set if any are marked, else the cursor pod.
         KeyCode::Char('a') if !ui.marked.is_empty() => ui.mode = Mode::FleetMenu { scope: Scope::Marked, sel: 0 },
         KeyCode::Char('a') if len > 0 => ui.mode = Mode::Menu { sel: 0 },
@@ -1604,6 +1644,9 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
         shared.lock().unwrap().notify(why, true);
         return Ok(Flow::Changed);
     }
+    if let Some(changed) = info_key(ui, code) {
+        return Ok(if changed { Flow::Changed } else { Flow::Same });
+    }
     // `?` and its two popups (ask.rs); the add-pod form and its confirm (newpod.rs); the runs
     // panel, `p`, and the quit question (runs.rs).
     if ask::key(ui, shared, code, mods) || newpod::key(ui, shared, code) {
@@ -1834,8 +1877,8 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
         },
         // A background action is running — ignore keys (Ctrl+C still quits, above).
         Mode::Working(_) => {}
-        // Handled above: `ask::key`, `newpod::key`, `runs::key`.
-        Mode::Ask { .. } | Mode::Answer(_) | Mode::NewPod(_) | Mode::UpConfirm(_) | Mode::Runs { .. } | Mode::Quit => {}
+        // Handled above: `info_key`, `ask::key`, `newpod::key`, `runs::key`.
+        Mode::Info { .. } | Mode::Ask { .. } | Mode::Answer(_) | Mode::NewPod(_) | Mode::UpConfirm(_) | Mode::Runs { .. } | Mode::Quit => {}
         Mode::Result(_) => {
             if !result_key(ui, code) {
                 ui.result_scroll = 0;
@@ -1845,6 +1888,26 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
         }
     }
     Ok(Flow::Changed)
+}
+
+/// The info panel's keys ([`Mode::Info`]): Esc, `i` or `q` go back to the view it was opened
+/// from; ↑↓ (j k), PgUp/PgDn (space), Home/End scroll it. `None`: the panel isn't open;
+/// `Some(false)`: a key it ignores.
+fn info_key(ui: &mut Ui, code: KeyCode) -> Option<bool> {
+    let Mode::Info { scroll, detail } = ui.mode else { return None };
+    let max = ui.result_max.get();
+    let to = |delta: i32| Mode::Info { scroll: scroll_by(scroll, max, delta), detail };
+    ui.mode = match code {
+        KeyCode::Esc | KeyCode::Char('i' | 'q') => if detail { Mode::Detail } else { Mode::List },
+        KeyCode::Up | KeyCode::Char('k') => to(-1),
+        KeyCode::Down | KeyCode::Char('j') => to(1),
+        KeyCode::PageUp => to(-10),
+        KeyCode::PageDown | KeyCode::Char(' ') => to(10),
+        KeyCode::Home => Mode::Info { scroll: 0, detail },
+        KeyCode::End => Mode::Info { scroll: max, detail },
+        _ => return Some(false),
+    };
+    Some(true)
 }
 
 /// In a demo (`ARENA_TUI_DEMO`) the keys that would act on a pod, reach one, ask about one or
@@ -2816,35 +2879,29 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // title
-            Constraint::Length(1), // fleet summary
+            Constraint::Length(1), // the top line: fleet summary (and a non-default provider/config)
             Constraint::Min(0),    // body
-            Constraint::Length(1), // footer / hints
+            Constraint::Length(1), // footer: ☰ status ⟳age · cadence, keys
         ])
         .split(f.area());
 
-    let title = Paragraph::new(format!(
-        "arena-infra-rs dashboard · provider: {} · {}",
-        ui.provider_name, ui.config_path
-    ))
-    .block(Block::default().borders(Borders::ALL));
-    f.render_widget(title, chunks[0]);
+    top_line(f, shared, ui, chunks[0]);
 
-    f.render_widget(summary_line(shared), chunks[1]);
-
-    if matches!(ui.mode, Mode::Detail) {
+    if matches!(ui.mode, Mode::Detail) || matches!(ui.mode, Mode::Info { detail: true, .. }) {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(chunks[2]);
+            .split(chunks[1]);
         // No room for the history sparklines in the split view.
         pods_table(f, shared, ui, cols[0], false);
         detail_pane(f, shared, ui, cols[1]);
     } else {
-        pods_table(f, shared, ui, chunks[2], true);
+        pods_table(f, shared, ui, chunks[1], true);
     }
 
-    f.render_widget(Paragraph::new(footer_hint(shared, ui, secs)), chunks[3]);
+    f.render_widget(Paragraph::new(footer_hint(shared, ui, secs)), chunks[2]);
+    // Where the footer's ☰ is (its first cell): a click there opens the info panel.
+    ui.menu_at.set(Some((chunks[2].x, chunks[2].y)));
 
     match &ui.mode {
         Mode::Menu { sel } => render_menu(f, shared, ui, *sel),
@@ -2861,7 +2918,61 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         Mode::Result(msg) => render_result(f, msg, ui.result_scroll, &ui.result_max),
         Mode::Ask { scope, value, pick } => ask::render_input(f, shared, ui, scope, value, pick),
         Mode::Answer(answer) => ask::render_answer(f, answer, ui.result_scroll, &ui.result_max),
+        Mode::Info { detail, .. } => render_info(f, shared, ui, *detail, secs),
         _ => {}
+    }
+}
+
+/// The top line ([`state::top_parts`]): the fleet in short words, warnings first in their
+/// colours — the line is cut at the terminal's edge. A provider other than RunPod (where the
+/// add-pod form starts) or a config other than the default goes at the right, while there's
+/// room (always in the info panel): a dashboard on a second fleet should say so.
+fn top_line(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
+    let parts = top_parts(&shared.summary, &shared.snap.cost, &shared.snap.partial, &shared.balance, shared.ai_cohort.as_ref());
+    let mut spans = vec![Span::raw(" ")];
+    for (i, p) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" · "));
+        }
+        spans.push(match p.tone {
+            Some(t) => Span::styled(p.text, tone_style(t)),
+            None => Span::raw(p.text),
+        });
+    }
+    let line = Line::from(spans).style(Style::default().add_modifier(Modifier::BOLD));
+    let tag = where_tag(ui);
+    let used = line.width();
+    f.render_widget(Paragraph::new(line), area);
+    if let Some(tag) = tag {
+        let w = Span::raw(&tag).width() as u16 + 1;
+        if used as u16 + 2 + w <= area.width {
+            let at = Rect { x: area.x + area.width - w, width: w, ..area };
+            f.render_widget(Paragraph::new(Span::styled(tag, Style::default().fg(Color::Cyan))), at);
+        }
+    }
+}
+
+/// The provider (when not RunPod) and the config (when not the default), for the top line's
+/// right end: `vast · ~/sandbox/config.env`; `None` when both are the defaults.
+fn where_tag(ui: &Ui) -> Option<String> {
+    let mut out = Vec::new();
+    if ui.provider_name != "runpod" {
+        out.push(ui.provider_name.clone());
+    }
+    if ui.config_path != DEFAULT_CONFIG {
+        out.push(home_short(&ui.config_path));
+    }
+    (!out.is_empty()).then(|| out.join(" · "))
+}
+
+/// A path with the home directory as `~`.
+fn home_short(path: &str) -> String {
+    match std::env::var("HOME").ok().filter(|h| !h.is_empty() && h != "/") {
+        Some(h) => match path.strip_prefix(h.trim_end_matches('/')) {
+            Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+            _ => path.to_string(),
+        },
+        None => path.to_string(),
     }
 }
 
@@ -2909,30 +3020,6 @@ fn render_select(f: &mut Frame, value: &str) {
     );
 }
 
-/// The summary bar (`state::summary_text`): counts, then the fleet's burn from the
-/// snapshot's core `FleetCost`, worded as `pods list`'s footer, then the prepaid balances —
-/// led, in yellow, by which provider failed to list when one did (the totals after it are
-/// then a floor), and by a low (yellow) or critical (red) balance.
-fn summary_line(s: &Shared) -> Paragraph<'static> {
-    let text = summary_text(&s.summary, &s.snap.cost, &s.snap.partial, &s.balance, s.ai_cohort.as_ref());
-    let (lead, _, _) = balance::tui_parts(&s.balance);
-    let ai_lead = s.ai_cohort.as_ref().and_then(|a| a.tui_parts().0);
-    let mut rest = text.as_str();
-    let mut spans = Vec::new();
-    for (notice, tone) in [
-        (partial_notice(&s.snap.partial), Some(Tone::Warn)),
-        (lead, state::balance_tone(&s.balance)),
-        (ai_lead, state::ai_tone(s.ai_cohort.as_ref())),
-    ] {
-        if let (Some(n), Some(tone)) = (notice.filter(|n| rest.starts_with(n.as_str())), tone) {
-            rest = &rest[n.len()..];
-            spans.push(Span::styled(n, tone_style(tone)));
-        }
-    }
-    spans.push(Span::raw(rest.to_string()));
-    Paragraph::new(Line::from(spans)).style(Style::default().add_modifier(Modifier::BOLD))
-}
-
 /// A [`Tone`] as a colour.
 fn tone_style(t: Tone) -> Style {
     match t {
@@ -2942,25 +3029,6 @@ fn tone_style(t: Tone) -> Style {
         Tone::Busy => Style::default().fg(Color::Cyan),
         Tone::Dim => Style::default().fg(Color::DarkGray),
     }
-}
-
-/// The pods table's width for columns of these widths: their sum, one space between each,
-/// and 4 for the block's two borders and the `▶ ` highlight column.
-fn table_width(cols: &[usize]) -> usize {
-    cols.iter().sum::<usize>() + cols.len().saturating_sub(1) + 4
-}
-
-/// How many of `optional` (column widths, most wanted first) fit in a table `w` wide beside
-/// the `core` columns. Always a prefix, so widening the terminal only ever adds columns.
-fn columns_that_fit(w: usize, core: &[usize], optional: &[usize]) -> usize {
-    let mut cols = core.to_vec();
-    optional
-        .iter()
-        .take_while(|&&c| {
-            cols.push(c);
-            table_width(&cols) <= w
-        })
-        .count()
 }
 
 /// A pod's `AI$` cell: its OpenRouter key's spend against the cap (`-`: no key named after
@@ -2980,101 +3048,67 @@ fn ai_cell(k: Option<&KeyUsage>, stale: bool, read: bool) -> Cell<'static> {
     }
 }
 
+/// The GPU column: the probe's count and card (`2×RTX A4000`) — the provider's when it wasn't
+/// read (`fleet::gpu_label`) — with each GPU's VRAM (`16G`); `RTX ` dropped when `narrow`. A MIG
+/// slice is named as every surface names it, `1×B300 MIG 34G`: nvidia-smi names only the parent
+/// card under MIG (`B300 SXM6 AC`, its memory unreadable, one row for two slices of it), so the
+/// slice's name, memory and count come from the provider (`fleet::mig_slice`) — the probe's
+/// rows only when the provider gave no count (review ai-review codex r1 #1). Pure.
+fn gpu_text(p: &Pod, m: Option<&PodMetrics>, narrow: bool) -> String {
+    let probed = m.map(|m| m.gpus.len()).filter(|&n| n > 0);
+    if let Some((model, gb)) = p.gpu_type.as_deref().and_then(fleet::mig_slice) {
+        let n = p.gpu_count.filter(|&n| n > 0).map(|n| n as usize).or(probed).unwrap_or(1);
+        return format!("{n}×{model} MIG {gb}G");
+    }
+    let mut gpu = m.and_then(|m| m.gpu_summary()).unwrap_or_else(|| fleet::gpu_label(p));
+    if narrow {
+        gpu = gpu.replace("RTX ", "");
+    }
+    if gpu != "-" {
+        if let Some(g) = m.and_then(|m| m.vram_gb()) {
+            gpu = format!("{gpu} {g}G");
+        }
+    }
+    gpu
+}
+
 fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: bool) {
-    // Responsive. The essential columns — mark, P, NAME, STATUS, M, SET, GPU, GPU%, $/H,
-    // HEALTH, PROXY — always show and fit in 73 columns. Next come the mid columns, kept
-    // while they fit (`MID_W`, all of them from 111 columns), so a narrow terminal or the
-    // detail view's 55% split drops TEMP, RTT, MEM, BRANCH, DISK in turn instead of having
-    // ratatui shrink every column (NAME, the one that says which pod a row is, worst of
-    // all). Above that the nice-to-haves (SAVED, AI$, host CPU/RAM, then the UTIL%/MEM%
-    // graphs, then PROGRESS when PROGRESS_CMD is set) come in as there's room. Below 73
-    // columns the table is crushed as before.
-    let w = area.width as usize;
-    // The fleet columns from the core snapshot — M (maintenance badge), HEALTH (last deep
-    // check) and PROXY — are essential and always shown, so every threshold below sits
-    // `FLEET_W` further out than it did before they existed. PROXY is just the port
-    // (coloured live/stale) unless there's room for the full `:9500 stale` label.
-    const HEALTH_W: usize = 8; // "fail 23h", "checking"
-    let full_proxy = w >= 160;
-    let proxy_w = if full_proxy { 11 } else { 6 };
-    const FLEET_W: usize = 1 + HEALTH_W + 6 + 3; // + their inter-column spacing
-    let show_saved = w >= 96 + FLEET_W;
+    // Which columns show at this width, and how wide: `columns.rs` (its rules, in order, are
+    // there). PROXY is as wide as its widest cell, never under its header.
+    let proxy_w = shared.snap.pods.iter().map(|sp| Span::raw(proxy_cell(sp).0).width()).max().unwrap_or(0);
     // AI$: each pod's OpenRouter key, spent against its cap — only with a provisioning key.
-    const AI_W: usize = 9; // "1.23/5", "12.3/50", "0.02/0.02"
-    let show_ai = shared.ai.is_some() && w >= 104 + FLEET_W;
-    let show_host = w >= 134 + FLEET_W; // host CPU% + RAM (extra, only when there's room)
-    // PROGRESS is what PROGRESS_CMD reports, so only with one set — and it comes after the
-    // graphs, which say more at a glance (an SSH error is in STATUS and the detail pane).
+    // PROGRESS is what PROGRESS_CMD reports, so only with one set.
     let want_progress = ui.cfg.get("PROGRESS_CMD").is_some_and(|c| !c.trim().is_empty());
-    // When cramped, names compress (arena8-apple→apple) and the GPU drops the "RTX "
-    // noise. Names compact a bit earlier (so you see "jack", not a truncated
-    // "arena8-ja"); GPU always carries count + VRAM ("2×A4000 16G"), truncated if tight.
-    let compact_names = w < 116 + FLEET_W;
-    let narrow = w < 100 + FLEET_W;
-    let name_w = if compact_names { 10 } else { 16 };
-    let gpu_w = if narrow { 12 } else { 16 };
+    let c = columns::columns(area.width as usize, proxy_w, shared.ai.is_some(), want_progress, with_spark);
     let now = shared.snap.generated_at;
 
-    // mark, P, NAME, STATUS, M, SET, GPU, GPU%, $/H, HEALTH, PROXY.
-    let core = [1, 1, name_w, 4, 1, 4, gpu_w, 5, 7, HEALTH_W, proxy_w];
-    // DISK, BRANCH, MEM, RTT, TEMP — kept in this order: a disk filling up (coloured) breaks
-    // a participant's work, the branch says which iteration they're on, MEM/TEMP are in the
-    // detail pane's per-GPU table anyway; RTT (how far the pod is from the proxy every
-    // keystroke goes through) is in the detail pane too.
-    const MID_W: [usize; 5] = [9, 6, 9, 5, 4];
-    let mid = columns_that_fit(w, &core, &MID_W);
-    let (show_disk, show_branch, show_mem, show_rtt, show_temp) = (mid > 0, mid > 1, mid > 2, mid > 3, mid > 4);
-
-    // Sparklines (GPU%/MEM% history) flex to fill whatever horizontal space is left after
-    // the other columns — so they grow on a wide screen and simply vanish when there's no
-    // room, rather than living behind a fixed threshold. PROGRESS gets a fixed budget when
-    // sparks are present so the leftover math is stable.
-    const PROGRESS_W: usize = 16;
-    let mut fixed: Vec<usize> = core.to_vec();
-    fixed.extend(&MID_W[..mid]);
-    if show_saved {
-        fixed.push(6);
-    }
-    if show_ai {
-        fixed.push(AI_W);
-    }
-    if show_host {
-        fixed.extend([4, 4]);
-    }
-    let leftover = w.saturating_sub(table_width(&fixed));
-    let show_spark = with_spark && leftover >= 20; // ~2×9 + spacing
-    // PROGRESS takes its fixed budget only from what the graphs leave at their narrowest.
-    let show_progress = want_progress && leftover >= PROGRESS_W + 1 + if show_spark { 20 } else { 0 };
-    let spark_room = if show_progress { leftover - PROGRESS_W - 1 } else { leftover };
-    let spark_w = if show_spark { (spark_room.saturating_sub(3) / 2).clamp(9, 30) } else { 0 };
-
     let mut header_cells = vec!["", "P", "NAME", "STATUS", "M", "SET", "GPU", "GPU%"];
-    for (show, title) in [(show_mem, "MEM"), (show_temp, "TEMP"), (show_disk, "DISK")] {
+    for (show, title) in [(c.mem, "MEM"), (c.temp, "TEMP"), (c.disk, "DISK")] {
         if show {
             header_cells.push(title);
         }
     }
-    header_cells.extend(["$/H", "HEALTH", "PROXY"]);
-    if show_rtt {
+    header_cells.extend(["$/H", "HLTH", "PROXY"]);
+    if c.rtt {
         header_cells.push("RTT");
     }
-    if show_branch {
+    if c.branch {
         header_cells.push("BRANCH");
     }
-    if show_saved {
-        header_cells.push("SAVED");
+    if c.saved {
+        header_cells.push(columns::SAVED_HEADER);
     }
-    if show_ai {
+    if c.ai {
         header_cells.push("AI$");
     }
-    if show_host {
+    if c.host {
         header_cells.push("CPU%");
         header_cells.push("RAM%");
     }
-    if show_progress {
+    if c.progress {
         header_cells.push("PROGRESS");
     }
-    if show_spark {
+    if c.spark {
         // GPU and its memory (green, cyan); a CPU box's CPU and RAM (magenta, blue).
         header_cells.push("UTIL%~");
         header_cells.push("MEM%~");
@@ -3121,35 +3155,15 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
             };
             let (health, health_tone) =
                 health_cell(sp.and_then(|sp| sp.health.as_ref()), shared.deep.is_running(p), now);
-            let (proxy, proxy_tone) = sp.map(|sp| proxy_cell(sp, !full_proxy)).unwrap_or(("?".into(), Tone::Dim));
-            // GPU now comes from the live nvidia-smi readout (provider list omits it).
-            // Append VRAM when wide; drop the "RTX " noise when the table is cramped.
-            let mut gpu = m
-                .and_then(|m| m.gpu_summary())
-                .or_else(|| p.gpu_type.clone())
-                .unwrap_or_else(|| "-".into());
-            if narrow {
-                gpu = gpu.replace("RTX ", "");
-            }
-            // Always append VRAM; the column truncates the tail if space is tight.
-            if gpu != "-" {
-                if let Some(g) = m.and_then(|m| m.vram_gb()) {
-                    gpu = format!("{gpu} {g}G");
-                }
-            }
+            let (proxy, proxy_tone) = sp.map(proxy_cell).unwrap_or(("?".into(), Tone::Dim));
+            let gpu = gpu_text(p, m, c.narrow_gpu);
             let branch = match m.and_then(|m| m.branch.clone()) {
                 Some(b) => truncate(&short_branch(&b, &ui.prefix), 6),
                 None => "-".into(),
             };
             // RUNNING-but-unreachable reads as "init" (still coming up), in yellow.
             let status_label = pod_status(p, m.map(|m| m.error.is_none()));
-            let status_cell = if status_label == "no-ssh" {
-                Cell::from(status_label).style(Style::default().fg(Color::Red))
-            } else if status_label == "init" {
-                Cell::from(status_label).style(Style::default().fg(Color::Yellow))
-            } else {
-                Cell::from(status_label)
-            };
+            let status_cell = Cell::from(status_label.clone()).style(status_style(&status_label));
             let mark = if ui.marked.contains(&mark_key(p)) {
                 Cell::from("•").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
             } else {
@@ -3159,7 +3173,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 mark,
                 provider_cell(&p.provider),
                 // Force the short name when cramped, regardless of the persisted pref.
-                Cell::from(if compact_names {
+                Cell::from(if c.compact_names {
                     display_name(&p.name, &ui.prefix, true)
                 } else {
                     ui.shown_name(&p.name)
@@ -3170,13 +3184,13 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 Cell::from(gpu),
                 Cell::from(util_str).style(util_style(util, err)),
             ];
-            if show_mem {
+            if c.mem {
                 cells.push(Cell::from(mem));
             }
-            if show_temp {
+            if c.temp {
                 cells.push(Cell::from(temp_str).style(temp_style(temp)));
             }
-            if show_disk {
+            if c.disk {
                 cells.push(Cell::from(disk).style(capacity_style(disk_pct)));
             }
             cells.extend([
@@ -3184,36 +3198,23 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 Cell::from(health).style(tone_style(health_tone)),
                 Cell::from(proxy).style(tone_style(proxy_tone)),
             ]);
-            if show_rtt {
+            if c.rtt {
                 let (rtt, tone) = rtt_cell(shared.rtts.of(p));
                 cells.push(Cell::from(rtt).style(tone_style(tone)));
             }
-            if show_branch {
+            if c.branch {
                 cells.push(Cell::from(branch));
             }
-            if show_saved {
-                // Time style: yellow when there's uncommitted work; grey when unknown OR
-                // when it's a clean tree that's been quiet for a day+ (nothing to do); plain
-                // otherwise.
-                let stale = m
-                    .and_then(|m| m.last_commit)
-                    .map(|ts| now_unix().saturating_sub(ts) > 86_400)
-                    .unwrap_or(false);
-                let style = match m.and_then(|m| m.dirty_files) {
-                    Some(n) if n > 0 => Style::default().fg(Color::Yellow),
-                    Some(0) if stale => Style::default().fg(Color::DarkGray),
-                    None => Style::default().fg(Color::DarkGray),
-                    _ => Style::default(),
-                };
+            if c.saved {
                 // A sync glyph (↑ unpushed / ↓ behind / ⇕ diverged) sits right before the
                 // time, so a blocked/failed push is obvious next to "when it was saved".
                 let (sync, sync_style) = sync_marker(m);
                 cells.push(Cell::from(Line::from(vec![
                     Span::styled(sync, sync_style),
-                    Span::styled(rel_time_short(m), style),
+                    Span::styled(rel_time_short(m), saved_style(m)),
                 ])));
             }
-            if show_ai {
+            if c.ai {
                 let ai = shared.ai.as_ref();
                 cells.push(ai_cell(
                     ai.and_then(|a| a.keys.get(&p.name)),
@@ -3221,7 +3222,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                     ai.is_some_and(|a| a.read),
                 ));
             }
-            if show_host {
+            if c.host {
                 // Host CPU% and RAM% (both coloured by load); exact RAM GB is in detail.
                 let cpu = m.and_then(|m| m.cpu_pct);
                 cells.push(Cell::from(cpu.map(|c| format!("{c}%")).unwrap_or_else(|| "-".into()))
@@ -3232,11 +3233,11 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 cells.push(Cell::from(ram_pct.map(|p| format!("{p}%")).unwrap_or_else(|| "-".into()))
                     .style(capacity_style(ram_pct)));
             }
-            if show_progress {
+            if c.progress {
                 let (detail, detail_style) = detail_cell(m);
                 cells.push(Cell::from(detail).style(detail_style));
             }
-            if show_spark {
+            if c.spark {
                 let h = shared.history.get(&p.name);
                 let gpu_hist = h.map(|h| h.util_data()).unwrap_or_default();
                 let mem_hist = h.map(|h| h.mem_data()).unwrap_or_default();
@@ -3250,8 +3251,8 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                     (true, false) => (Color::Green, Color::Cyan),
                     (true, true) => (Color::Magenta, Color::Blue),
                 };
-                cells.push(Cell::from(spark(&gpu_hist, spark_w)).style(Style::default().fg(gpu_c)));
-                cells.push(Cell::from(spark(&mem_hist, spark_w)).style(Style::default().fg(mem_c)));
+                cells.push(Cell::from(spark(&gpu_hist, c.spark_w)).style(Style::default().fg(gpu_c)));
+                cells.push(Cell::from(spark(&mem_hist, c.spark_w)).style(Style::default().fg(mem_c)));
             }
             Row::new(cells)
         })
@@ -3260,50 +3261,50 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     let mut widths = vec![
         Constraint::Length(1),  // mark (•)
         Constraint::Length(1),  // P (provider glyph)
-        Constraint::Length(name_w as u16), // NAME (auto-short when cramped)
+        Constraint::Length(c.name_w as u16), // NAME (auto-short when cramped)
         Constraint::Length(4),  // STATUS (abbreviated: run/exit/stop…)
         Constraint::Length(1),  // M (host maintenance badge; L = locked)
         Constraint::Length(4),  // SET (.name/key/origin/api)
-        Constraint::Length(gpu_w as u16), // GPU (+VRAM when wide)
-        Constraint::Length(5),  // GPU%
+        Constraint::Length(c.gpu_w as u16), // GPU (count, card, VRAM: `2×A4000 16G`, `1×B300 MIG 34G`)
+        Constraint::Length(4),  // GPU% (`100%`)
     ];
-    if show_mem {
-        widths.push(Constraint::Length(MID_W[2] as u16)); // MEM (e.g. "120/240G")
+    if c.mem {
+        widths.push(Constraint::Length(columns::MID_W[2] as u16)); // MEM (e.g. "120/240G")
     }
-    if show_temp {
-        widths.push(Constraint::Length(MID_W[4] as u16)); // TEMP (e.g. "85C")
+    if c.temp {
+        widths.push(Constraint::Length(columns::MID_W[4] as u16)); // TEMP (e.g. "85C")
     }
-    if show_disk {
-        widths.push(Constraint::Length(MID_W[0] as u16)); // DISK (e.g. "12/100G")
+    if c.disk {
+        widths.push(Constraint::Length(columns::MID_W[0] as u16)); // DISK (e.g. "12/100G")
     }
     widths.extend([
-        Constraint::Length(7),               // $/H (e.g. "$0.17", "€0.006")
-        Constraint::Length(HEALTH_W as u16), // HEALTH (e.g. "pass 12m")
-        Constraint::Length(proxy_w as u16),  // PROXY (":9500", or ":9500 stale" when wide)
+        Constraint::Length(6),                        // $/H (e.g. "$0.17", "€0.006", "$21.52")
+        Constraint::Length(columns::HEALTH_W as u16), // HLTH (e.g. "✓12m", "✗2h", "…")
+        Constraint::Length(c.proxy_w as u16),         // PROXY (e.g. "9500", "9501!" stale)
     ]);
-    if show_rtt {
-        widths.push(Constraint::Length(MID_W[3] as u16)); // RTT (e.g. "23ms", "180ms")
+    if c.rtt {
+        widths.push(Constraint::Length(columns::MID_W[3] as u16)); // RTT (e.g. "23ms", "180ms")
     }
-    if show_branch {
-        widths.push(Constraint::Length(MID_W[1] as u16)); // BRANCH (e.g. "w1d2")
+    if c.branch {
+        widths.push(Constraint::Length(columns::MID_W[1] as u16)); // BRANCH (e.g. "w1d2")
     }
-    if show_saved {
-        widths.push(Constraint::Length(6)); // SAVED (e.g. "3h", "↑2d")
+    if c.saved {
+        widths.push(Constraint::Length(columns::SAVED_W as u16)); // 💾 SAVED (e.g. "3h", "↑2d")
     }
-    if show_ai {
-        widths.push(Constraint::Length(AI_W as u16)); // AI$ (e.g. "1.23/5")
+    if c.ai {
+        widths.push(Constraint::Length(columns::AI_W as u16)); // AI$ (e.g. "1.23/5")
     }
-    if show_host {
+    if c.host {
         widths.push(Constraint::Length(4)); // CPU%
         widths.push(Constraint::Length(4)); // RAM%
     }
-    if show_progress {
+    if c.progress {
         // Fixed budget when sparks are filling the rest; otherwise flex to fill.
-        widths.push(if show_spark { Constraint::Length(PROGRESS_W as u16) } else { Constraint::Min(10) });
+        widths.push(if c.spark { Constraint::Length(columns::PROGRESS_W as u16) } else { Constraint::Min(10) });
     }
-    if show_spark {
-        widths.push(Constraint::Length(spark_w as u16)); // GPU% history
-        widths.push(Constraint::Length(spark_w as u16)); // MEM% history
+    if c.spark {
+        widths.push(Constraint::Length(c.spark_w as u16)); // GPU% history
+        widths.push(Constraint::Length(c.spark_w as u16)); // MEM% history
     }
     let table = Table::new(rows, widths)
         .header(header)
@@ -3319,6 +3320,33 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     // Record where the rows landed (area + the scroll offset ratatui chose) so a mouse
     // click can be mapped back to a pod index.
     ui.last_table.set((area, ts.offset()));
+}
+
+/// STATUS's colour (the table's and the detail pane's): `run` plain (most rows), a pod coming up
+/// — `init` (listed running, not reachable yet), `prov`, `new`, `rstr` — yellow, `no-ssh` red,
+/// a stopped pod grey.
+fn status_style(label: &str) -> Style {
+    match label {
+        "init" | "prov" | "new" | "rstr" => Style::default().fg(Color::Yellow),
+        "no-ssh" => Style::default().fg(Color::Red),
+        "exit" | "stop" | "term" => Style::default().fg(Color::DarkGray),
+        _ => Style::default(),
+    }
+}
+
+/// SAVED's time colour: yellow when there's uncommitted work; grey when unknown OR when it's a
+/// clean tree that's been quiet for a day+ (nothing to do); plain otherwise.
+fn saved_style(m: Option<&PodMetrics>) -> Style {
+    let stale = m
+        .and_then(|m| m.last_commit)
+        .map(|ts| now_unix().saturating_sub(ts) > 86_400)
+        .unwrap_or(false);
+    match m.and_then(|m| m.dirty_files) {
+        Some(n) if n > 0 => Style::default().fg(Color::Yellow),
+        Some(0) if stale => Style::default().fg(Color::DarkGray),
+        None => Style::default().fg(Color::DarkGray),
+        _ => Style::default(),
+    }
 }
 
 /// When the pod's repo was last committed (= last backup, since `pods backup` commits +
@@ -3383,8 +3411,9 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let Some(pod) = shared.pods.get(ui.selected) else { return };
     let m = shared.metrics.get(&pod.name);
 
-    let block =
-        Block::default().borders(Borders::ALL).title(format!(" {} ", ui.shown_name(&pod.name)));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(format!(" {} ", ui.shown_name(&pod.name)), Style::default().add_modifier(Modifier::BOLD)));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -3399,12 +3428,15 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     // The OpenRouter key's line, under `cost:`, when a provisioning key is configured. "No
     // key" only from a listing that worked: before the first read, or after a failed one,
     // absence isn't known — and numbers kept from an older read say so.
+    // In the AI$ cell's colour ([`ai_cell`]): yellow from 80% of the cap, red at it, grey when
+    // paused, unknown or as last read.
     let ai = shared.ai.as_ref().map(|a| match (a.keys.get(&pod.name), a.read, a.keys_error.as_deref()) {
-        (None, false, _) => "… (reading OpenRouter's keys)".to_string(),
-        (None, _, Some(e)) => format!("? (OpenRouter's keys couldn't be read: {e})"),
-        (None, _, None) => "- (no OpenRouter key named after this pod — `arena keys gen` makes one)".to_string(),
-        (Some(k), _, None) => k.detail(),
-        (Some(k), _, Some(_)) => format!("{} (as last read; the latest read failed)", k.detail()),
+        (None, false, _) => ("… (reading OpenRouter's keys)".to_string(), Some(Tone::Dim)),
+        (None, _, Some(e)) => (format!("? (OpenRouter's keys couldn't be read: {e})"), Some(Tone::Warn)),
+        (None, _, None) => ("- (no OpenRouter key named after this pod — `arena keys gen` makes one)".to_string(), Some(Tone::Dim)),
+        (Some(k), _, None) if k.paused() => (k.detail(), Some(Tone::Dim)),
+        (Some(k), _, None) => (k.detail(), state::fill_tone(k.fill())),
+        (Some(k), _, Some(_)) => (format!("{} (as last read; the latest read failed)", k.detail()), Some(Tone::Dim)),
     });
     // The cohort's keys at their cap, under it, while there are any: every name (the summary
     // bar has room for two) and where to look — a key can be at its cap with no pod in the
@@ -3440,26 +3472,46 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     }
     let rows = Layout::default().direction(Direction::Vertical).constraints(constraints).split(inner);
 
+    // Each fact a line: its label dim, its value in the tone the table gives it (the same
+    // helpers), so a glance at the colours says good/warn/bad — the words still say it all.
+    let dim = Style::default().fg(Color::DarkGray);
+    let plain = Style::default();
+    let fact = |label: &str, spans: Vec<Span<'static>>| {
+        let mut l = vec![Span::styled(format!("{label:<10}"), dim)];
+        l.extend(spans);
+        Line::from(l)
+    };
+    let one = |text: String, style: Style| vec![Span::styled(text, style)];
+    // A value that's `-` (nothing to say) is dim.
+    let or_dim = |text: String, style: Style| {
+        let style = if text == "-" { dim } else { style };
+        vec![Span::styled(text, style)]
+    };
+    let glyph = |b: Option<bool>| match b {
+        Some(true) => Span::styled("✓", tone_style(Tone::Good)),
+        Some(false) => Span::styled("✗", tone_style(Tone::Bad)),
+        None => Span::styled("·", dim),
+    };
+
     let endpoint = match (&pod.ssh_ip, pod.ssh_port) {
-        (Some(ip), Some(port)) => format!("{ip}:{port}"),
-        _ => "(no SSH endpoint yet)".into(),
+        (Some(ip), Some(port)) => one(format!("{ip}:{port}"), plain),
+        _ => one("(no SSH endpoint yet)".into(), tone_style(Tone::Warn)),
     };
     // Where it runs (the provider's name for the place) and how far that is from here — the
     // proxy box, on prod — as the RTT column times it.
     let place = pod.location.clone().unwrap_or_else(|| "-".into());
+    let (_, rtt_tone) = rtt_cell(shared.rtts.of(pod));
     let rtt = match (shared.rtts.of(pod), &pod.ssh_ip) {
         (Some(d), _) => format!("rtt {}ms from this box", d.as_millis()),
         (None, Some(_)) => format!("rtt - (a TCP connect to the SSH port, every {}s)", RTT_EVERY.as_secs()),
         (None, None) => "rtt -".into(),
     };
-    let progress = m
-        .and_then(|m| m.progress.clone())
-        .or_else(|| m.and_then(|m| m.error.clone()))
-        .unwrap_or_else(|| "-".into());
-    let gpu = m
-        .and_then(|m| m.gpu_summary())
-        .or_else(|| pod.gpu_type.clone())
-        .unwrap_or_else(|| "-".into());
+    let progress = match m {
+        Some(m) if m.progress.is_some() => one(m.progress.clone().unwrap_or_default(), plain),
+        Some(m) if m.error.is_some() => one(m.error.clone().unwrap_or_default(), tone_style(Tone::Bad)),
+        _ => one("-".into(), dim),
+    };
+    let gpu = gpu_detail(pod, m);
     // `pods list`'s $/H label (the provider's currency; `-` unless billing), plus per day.
     let cost = match fleet::price_label(pod).as_str() {
         "-" => "-".to_string(),
@@ -3472,10 +3524,20 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     // The snapshot lines are clipped to one row each (after the 10-column label), so a long
     // reason or note can't wrap and push the rest of the facts out of their block.
     let fit = |s: String| truncate(&s, (inner.width as usize).saturating_sub(10).max(8));
-    let proxy = fit(sp.map(proxy_detail).unwrap_or_else(|| "?".into()));
+    let proxy = match sp {
+        Some(sp) => one(fit(proxy_detail(sp)), tone_style(proxy_cell(sp).1)),
+        None => one("?".into(), dim),
+    };
     // The last deep check: verdict + age + worst issue as `arena snapshot` words it, and
-    // the first failing/warning check's own words (the operator's view, so the raw text).
-    let health = match sp.and_then(|sp| sp.health.as_ref()) {
+    // the first failing/warning check's own words (the operator's view, so the raw text) —
+    // both in the HLTH cell's colour.
+    let record = sp.and_then(|sp| sp.health.as_ref());
+    let health_style = match record {
+        _ if shared.deep.is_running(pod) => tone_style(Tone::Busy),
+        None => dim,
+        Some(h) => tone_style(state::health_tone(h.status, shared.snap.generated_at.saturating_sub(h.checked_at))),
+    };
+    let health = match record {
         _ if shared.deep.is_running(pod) => "checking… (deep check running in the background)".to_string(),
         None => "- (never deep-checked — d runs one)".to_string(),
         Some(h) => format!(
@@ -3484,72 +3546,104 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
             snapshot::rfc3339(h.checked_at)
         ),
     };
-    let health = fit(health);
-    let why = fit(
-        sp.and_then(|sp| sp.health.as_ref()).and_then(|h| h.reasons.first().cloned()).unwrap_or_else(|| "-".into()),
-    );
+    let why = fit(record.and_then(|h| h.reasons.first().cloned()).unwrap_or_else(|| "-".into()));
     let maint = fit(fleet::maintenance_label(pod.maintenance.as_ref()));
     let disk = match m.and_then(|m| m.disk_summary()) {
         Some((u, t)) => {
             let pct = if t > 0 { u as f64 / t as f64 * 100.0 } else { 0.0 };
-            format!("{:.1}/{:.1}G ({pct:.0}%)", u as f64 / 1024.0, t as f64 / 1024.0)
+            one(format!("{:.1}/{:.1}G ({pct:.0}%)", u as f64 / 1024.0, t as f64 / 1024.0), capacity_style(Some(pct as u32)))
         }
-        None => "-".into(),
-    };
-    let ok = |b: Option<bool>| match b {
-        Some(true) => "✓",
-        Some(false) => "✗",
-        None => "·",
+        None => one("-".into(), dim),
     };
     let origin = m.and_then(|m| m.origin.clone()).unwrap_or_else(|| "-".into());
     let origin_ok = m.and_then(|m| m.origin.as_deref().map(|o| o.contains("github.com")));
-    // Host: CPU% and RAM (exact GB + %).
+    // Host: CPU% and RAM (exact GB + %), coloured as the CPU%/RAM% columns.
     let host = {
-        let cpu = m.and_then(|m| m.cpu_pct).map(|c| format!("CPU {c}%")).unwrap_or_else(|| "CPU -".into());
+        let cpu = m.and_then(|m| m.cpu_pct);
+        let err = m.is_some_and(|m| m.error.is_some());
+        let cpu_text = cpu.map(|c| format!("CPU {c}%")).unwrap_or_else(|| "CPU -".into());
         let ram = match m.and_then(|m| m.host_mem_summary()) {
             Some((u, t)) => {
                 let pct = if t > 0 { u as f64 / t as f64 * 100.0 } else { 0.0 };
-                format!("RAM {:.1}/{:.1}G ({pct:.0}%)", u as f64 / 1024.0, t as f64 / 1024.0)
+                Span::styled(format!("RAM {:.1}/{:.1}G ({pct:.0}%)", u as f64 / 1024.0, t as f64 / 1024.0), capacity_style(Some(pct as u32)))
             }
-            None => "RAM -".into(),
+            None => Span::styled("RAM -", dim),
         };
-        format!("{cpu}   {ram}")
+        vec![Span::styled(cpu_text, if cpu.is_some() { util_style(cpu, err) } else { dim }), Span::raw("   "), ram]
     };
-    let facts = format!(
-        "status:   {}\ngpu:      {}\nendpoint: {}\nwhere:    {}\nproxy:    {}\ncost:     {}\n{}maint:    {}\nhealth:   {}\nreason:   {}\ndisk:     {}\nhost:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\ntokens:   HF {}   Claude-Code {}\nprogress: {}",
-        {
-            let status = pod_status(pod, m.map(|m| m.error.is_none()));
-            if arena_core::lock::is_locked(pod) {
-                // One row (the facts block has a fixed height): `pods unlock` is in the docs.
-                format!("{status} · locked (stop/restart/terminate refused)")
-            } else {
-                status
+    // The sync line in the colour of SAVED's glyph: red unpushed/diverged, cyan behind, green in
+    // sync, dim with no upstream.
+    let sync = {
+        let text = sync_summary(m);
+        let (_, glyph_style) = sync_marker(m);
+        let style = if text.starts_with('✓') {
+            tone_style(Tone::Good)
+        } else if text.starts_with('·') || text == "-" {
+            dim
+        } else {
+            glyph_style
+        };
+        one(text, style)
+    };
+    let status = {
+        let label = pod_status(pod, m.map(|m| m.error.is_none()));
+        let mut v = vec![Span::styled(label.clone(), status_style(&label))];
+        if arena_core::lock::is_locked(pod) {
+            // One row (the facts block has a fixed height): `pods unlock` is in the docs.
+            v.push(Span::raw(" · "));
+            v.push(Span::styled("locked (stop/restart/terminate refused)", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        }
+        v
+    };
+    let mut facts = vec![
+        fact("status:", status),
+        fact("gpu:", or_dim(fit(gpu), plain)),
+        fact("endpoint:", endpoint),
+        // One row, as every fact (the block has a fixed height): the whole value cut to it (a
+        // long place too — review ai-review codex r2), the RTT in its colour.
+        fact("where:", {
+            let line = fit(format!("{place}  ·  {rtt}"));
+            let cut = place.chars().count() + 5;
+            match line.char_indices().nth(cut) {
+                Some((at, _)) => vec![Span::raw(line[..at].to_string()), Span::styled(line[at..].to_string(), tone_style(rtt_tone))],
+                None => vec![Span::raw(line)],
             }
-        },
-        gpu,
-        endpoint,
-        fit(format!("{place}  ·  {rtt}")),
-        proxy,
-        cost,
-        ai.map(|a| format!("ai key:   {}\n", fit(a))).unwrap_or_default() + &caps.map(|c| format!("ai caps:  {}\n", fit(c))).unwrap_or_default(),
-        maint,
-        health,
-        why,
-        disk,
-        host,
-        m.and_then(|m| m.branch.clone()).unwrap_or_else(|| "-".into()),
-        backup_summary(m),
-        sync_summary(m),
-        truncate(&origin, 32),
-        ok(origin_ok),
-        ok(m.and_then(|m| m.has_name)),
-        ok(m.and_then(|m| m.has_key)),
-        ok(origin_ok),
-        ok(m.and_then(|m| m.has_api_key)),
-        ok(m.and_then(|m| m.has_hf_token)),
-        ok(m.and_then(|m| m.has_cc_token)),
-        progress,
-    );
+        }),
+        fact("proxy:", proxy),
+        fact("cost:", or_dim(cost, plain)),
+    ];
+    if let Some((text, tone)) = ai {
+        facts.push(fact("ai key:", one(fit(text), tone.map(tone_style).unwrap_or(plain))));
+    }
+    if let Some(c) = caps {
+        facts.push(fact("ai caps:", one(fit(c), tone_style(Tone::Warn))));
+    }
+    facts.extend([
+        fact("maint:", or_dim(maint, tone_style(Tone::Warn).add_modifier(Modifier::BOLD))),
+        fact("health:", one(fit(health), health_style)),
+        fact("reason:", or_dim(why, health_style)),
+        fact("disk:", disk),
+        fact("host:", host),
+        fact("branch:", or_dim(m.and_then(|m| m.branch.clone()).unwrap_or_else(|| "-".into()), plain)),
+        fact("backup:", or_dim(backup_summary(m), saved_style(m))),
+        fact("sync:", sync),
+        fact("origin:", vec![Span::raw(truncate(&origin, 32)), Span::raw(" "), glyph(origin_ok)]),
+        fact(
+            "setup:",
+            vec![
+                Span::raw(".name "),
+                glyph(m.and_then(|m| m.has_name)),
+                Span::raw("   deploy-key "),
+                glyph(m.and_then(|m| m.has_key)),
+                Span::raw("   origin→gh "),
+                glyph(origin_ok),
+                Span::raw("   api-key "),
+                glyph(m.and_then(|m| m.has_api_key)),
+            ],
+        ),
+        fact("tokens:", vec![Span::raw("HF "), glyph(m.and_then(|m| m.has_hf_token)), Span::raw("   Claude-Code "), glyph(m.and_then(|m| m.has_cc_token))]),
+        fact("progress:", progress),
+    ]);
     f.render_widget(Paragraph::new(facts).wrap(Wrap { trim: true }), rows[0]);
 
     let gpu_rows: Vec<Row> = m
@@ -3588,7 +3682,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     .header(
         Row::new(vec!["GPU", "UTIL", "MEM", "TEMP"]).style(Style::default().add_modifier(Modifier::BOLD)),
     )
-    .block(Block::default().borders(Borders::TOP).title("per-GPU"));
+    .block(Block::default().borders(Borders::TOP).title(section("per-GPU")));
     f.render_widget(gpu_table, rows[1]);
 
     // GPU compute processes (what's actually holding the cards), under the per-GPU table.
@@ -3621,7 +3715,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         .header(
             Row::new(vec!["PID", "VRAM", "PROCESS"]).style(Style::default().add_modifier(Modifier::BOLD)),
         )
-        .block(Block::default().borders(Borders::TOP).title("GPU procs"));
+        .block(Block::default().borders(Borders::TOP).title(section("GPU procs")));
         f.render_widget(proc_table, rows[pi]);
     }
 
@@ -3632,7 +3726,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
             .unwrap_or_default();
         f.render_widget(
             Paragraph::new(text)
-                .block(Block::default().borders(Borders::TOP).title("recent commits (ARENA repo)")),
+                .block(Block::default().borders(Borders::TOP).title(section("recent commits (ARENA repo)"))),
             rows[ci],
         );
     }
@@ -3644,7 +3738,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         let (util_title, util_colour) = if pod.cpu_only() { ("CPU % (history)", Color::Magenta) } else { ("util % (history)", Color::Green) };
         f.render_widget(
             Sparkline::default()
-                .block(Block::default().borders(Borders::TOP).title(util_title))
+                .block(Block::default().borders(Borders::TOP).title(section(util_title)))
                 .data(&util_data)
                 .max(100)
                 .style(Style::default().fg(util_colour)),
@@ -3652,7 +3746,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         );
         f.render_widget(
             Sparkline::default()
-                .block(Block::default().borders(Borders::TOP).title("temp C (history)"))
+                .block(Block::default().borders(Borders::TOP).title(section("temp C (history)")))
                 .data(&temp_data)
                 .max(100)
                 .style(Style::default().fg(Color::Yellow)),
@@ -3661,30 +3755,78 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     }
 }
 
-/// The footer: a live [`Notice`] if there is one (else the refresh status and its age),
-/// how many deep checks are running, then the keys for the current mode — the way out first
-/// (`[q] quit`, `[esc] back`): the line is cut at the terminal's width.
+/// A detail-pane section's title: bold, in the accent colour.
+fn section(title: &str) -> Span<'static> {
+    Span::styled(title.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+}
+
+/// The detail pane's `gpu:` line: the GPU column's words ([`gpu_text`], `RTX ` kept), and for a
+/// MIG slice the provider's name with its memory spelled `GB` and the card it is cut from, as
+/// nvidia-smi names it (`1×B300 MIG 34GB (MIG slice of B300 SXM6 AC)`). Pure.
+fn gpu_detail(p: &Pod, m: Option<&PodMetrics>) -> String {
+    match p.gpu_type.as_deref().and_then(fleet::mig_slice) {
+        Some(_) => {
+            let label = gpu_text(p, m, false);
+            let label = label.strip_suffix('G').map(|l| format!("{l}GB")).unwrap_or(label);
+            match m.and_then(|m| m.gpus.iter().find_map(|g| g.name.clone())) {
+                Some(parent) => format!("{label} (MIG slice of {parent})"),
+                None => label,
+            }
+        }
+        None => gpu_text(p, m, false),
+    }
+}
+
+/// The footer, one line, cut at the terminal's edge: `☰` first, always in the same cell (a click
+/// on it, or `i`, opens the info panel with everything that isn't here), then what must be read
+/// before the next key — a live [`Notice`], a run going (`pods up`…), a `?` question out — then
+/// the refresh's short status (`✓ API 13/min`, a warning's first words in yellow), how long ago
+/// it refreshed (`⟳7s`, a spinner while it does) and its cadence (`· 5s`), then the keys for the
+/// current mode: the way out first (`[q] quit`, `[esc] back`), pairs merged (`[a/A] act/all`).
 fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
-    let age = match shared.last_refresh {
-        Some(t) => format!("updated {}s ago", t.elapsed().as_secs()),
-        None => "never updated".into(),
-    };
-    let spin = if shared.refreshing { " ⟳" } else { "" };
-    let checking = match shared.deep.running() {
-        0 => String::new(),
-        n => format!(" · deep-checking {n}"),
-    };
-    // A question out leads the footer, moving and counting, so it reads as alive: an answer
-    // can take a minute, and a line that never changed looked like a hang.
-    let asking = shared.ask_running.as_ref().map(|asking| {
-        let secs = shared.ask_since.map(|t| t.elapsed()).unwrap_or_default();
-        Span::styled(format!("{} {asking} {}s · ", spinner(secs), secs.as_secs()), tone_style(Tone::Busy))
-    });
+    let mut spans: Vec<Span<'static>> = vec![Span::styled("☰ ", Style::default().add_modifier(Modifier::BOLD))];
+    // A notice (`D`'s prompt and what it skips, a finished action) comes first: the question's
+    // line can be long, and the notice is what must be read before the next key.
+    if let Some(n) = shared.notice.as_ref().filter(|n| n.at.elapsed() < NOTICE_FOR) {
+        let style = if n.error { tone_style(Tone::Bad) } else { tone_style(Tone::Busy) };
+        spans.extend([Span::styled(n.text.clone(), style), Span::raw(" · ")]);
+    }
     // A run going (`pods up`…) leads too: it bills, and `p` shows it.
-    let asking: Vec<Span<'static>> = runs::footer(shared).map(|r| Span::styled(r, tone_style(Tone::Busy))).into_iter().chain(asking).collect();
-    let keys = match &ui.mode {
-        Mode::List => "[q] quit  [enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d/D] deep check this/all  [?] ask AI  [n] new  [p] runs  [r] refresh",
-        Mode::Detail => "[esc] back  [q] quit  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d/D] deep check this/all  [?] ask AI  [n] new  [p] runs  [r] refresh",
+    if let Some(r) = runs::footer(shared) {
+        spans.push(Span::styled(r, tone_style(Tone::Busy)));
+    }
+    // A question out, moving and counting, so it reads as alive: an answer can take a minute,
+    // and a line that never changed looked like a hang.
+    if let Some(asking) = shared.ask_running.as_ref() {
+        let secs = shared.ask_since.map(|t| t.elapsed()).unwrap_or_default();
+        spans.push(Span::styled(format!("{} {asking} {}s · ", spinner(secs), secs.as_secs()), tone_style(Tone::Busy)));
+    }
+    let st = &shared.status;
+    if !st.short.is_empty() {
+        spans.push(match st.tone {
+            Some(t) => Span::styled(st.short.clone(), tone_style(t)),
+            None => Span::raw(st.short.clone()),
+        });
+        spans.push(Span::raw(" "));
+    }
+    let age = match shared.last_refresh {
+        Some(t) => format!("{}s", t.elapsed().as_secs()),
+        None => "-".into(),
+    };
+    // While a refresh runs the ⟳ turns: the frame drawn as it starts and as it lands.
+    let turn = if shared.refreshing { spinner(shared.last_refresh.map(|t| t.elapsed()).unwrap_or_default()) } else { '⟳' };
+    spans.push(Span::raw(format!("{turn}{age} · {secs}s  ")));
+    spans.push(Span::styled(mode_keys(&ui.mode).to_string(), Style::default().fg(Color::Gray)));
+    Line::from(spans)
+}
+
+/// The footer's keys for a mode: the few most used, pairs merged — the info panel has them all
+/// ([`ALL_KEYS`]). Modal popups keep their own.
+fn mode_keys(mode: &Mode) -> &'static str {
+    match mode {
+        Mode::List => "[q] quit  [i] info  [enter] detail  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?] ask  [n] new  [p] runs",
+        Mode::Detail => "[esc] back  [q] quit  [i] info  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?] ask  [n] new  [p] runs",
+        Mode::Info { .. } => "[esc/i] close  [↑↓ PgUp PgDn] scroll",
         Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::Confirm(c) if c.action.requires_typed_name() => "type the pod's name  [enter] apply  [esc] cancel",
         Mode::Confirm(c) if c.preview.is_some() => "[y] apply  [v] full command  [n/esc] cancel",
@@ -3701,24 +3843,173 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         Mode::Result(_) => "[↑↓] scroll  ·  [any other key] dismiss",
         Mode::Ask { .. } => "type the question  [enter] ask  [tab] the other AI  [ctrl-u] clear  [esc] cancel",
         Mode::Answer(_) => "[↑↓ PgUp PgDn] scroll  [esc] close",
+    }
+}
+
+/// Every key of the list and detail views, and the mouse, for the info panel: `(keys, what)`.
+const ALL_KEYS: &[(&str, &str)] = &[
+    ("q / ctrl-c", "quit (asks first while a run that changes pods is going)"),
+    ("esc", "back to the list from the detail view; on the list, clear the marks"),
+    ("↑↓ / j k", "move the cursor"),
+    ("enter", "the detail view of the cursor pod"),
+    ("i  (or click ☰)", "this panel"),
+    ("space", "mark / unmark the cursor pod"),
+    ("x", "clear the marks"),
+    ("/", "mark pods by selector (the CLI's syntax)"),
+    ("a", "act on the marked pods, else the cursor pod (menu)"),
+    ("A", "act on every pod (menu)"),
+    ("d", "deep-check the marked pods, else the cursor pod"),
+    ("D", "deep-check every running pod nobody is using (press twice)"),
+    ("c", "ssh into the cursor pod"),
+    ("?", "ask an AI about the cursor pod or the marked ones (tab: the other AI)"),
+    ("n", "add pods (runs `arena pods up`)"),
+    ("p", "the runs panel (pods up, start, rename, jobs, logs)"),
+    ("r", "refresh now (and re-read the providers' details)"),
+    ("f", "refresh cadence: 2 → 5 → 10 → 20 → 60 s"),
+    ("s", "short / full pod names (kept)"),
+    ("mouse", "click a row: cursor · click its far left or shift-click: mark · wheel: move · ☰: this panel"),
+];
+
+/// What the table's glyphs mean, for the info panel: `(column, legend)`.
+const LEGEND: &[(&str, &str)] = &[
+    ("P", "provider: R runpod · V vast · H hetzner · S shadeform"),
+    ("M", "M host maintenance on record · L locked (stop/restart/terminate refused)"),
+    ("SET", ".name · deploy key · origin→GitHub · API key: ✓ yes  ✗ no  · unknown"),
+    ("HLTH", "last deep check and its age: ✓ pass (grey after 26h)  ! warn  ✗ fail  · skipped  … checking  - never"),
+    ("PROXY", "the forward's port: green live · `!` yellow stale (`arena proxy apply` re-points it) · - none · ? unreadable"),
+    ("💾", "when the repo was last committed: ↑ unpushed  ↓ behind  ⇕ diverged · yellow: uncommitted work · grey: quiet a day+"),
+    ("AI$", "the pod's OpenRouter key: spent/cap this period · yellow from 80% · red at the cap · paused: a $0 cap"),
+    ("RTT", "round trip from this box to the pod's SSH port: green < 60 ms · yellow < 120 ms · red beyond"),
+    ("⟳7s · 5s", "refreshed 7 s ago, every 5 s (a spinner while refreshing)"),
+];
+
+/// The info panel's text ([`Mode::Info`]): every word the top line and the footer leave out —
+/// under `dashboard` the provider, config, whole refresh status, cadence and deep checks; under
+/// `fleet` the summary bar as it used to read ([`summary_text`]); each prepaid account; the
+/// OpenRouter credit and keys; every key of the list and detail views; what the glyphs mean.
+/// `detail`: opened from the detail view (its keys are the same but for `esc`).
+fn info_lines(shared: &Shared, ui: &Ui, secs: u64) -> Vec<Line<'static>> {
+    let head = |t: &str| Line::styled(t.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    let dim = Style::default().fg(Color::DarkGray);
+    let row = |label: &str, value: String, style: Style| Line::from(vec![Span::styled(format!("  {label:<13}"), dim), Span::styled(value, style)]);
+    let toned = |t: Option<Tone>| t.map(tone_style).unwrap_or_default();
+    let mut out = vec![head("dashboard")];
+    out.push(row("provider", format!("{} (where the add-pod form starts; the table lists every configured provider)", ui.provider_name), Style::default()));
+    out.push(row("config", ui.config_path.clone(), Style::default()));
+    out.push(row("status", shared.status.full.clone(), toned(shared.status.tone)));
+    let age = match shared.last_refresh {
+        Some(t) => format!("last {}s ago", t.elapsed().as_secs()),
+        None => "not refreshed yet".into(),
     };
-    // A notice (`D`'s prompt and what it skips, a finished action) comes first: the question's
-    // line can be long, and the notice is what must be read before the next key.
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    match shared.notice.as_ref().filter(|n| n.at.elapsed() < NOTICE_FOR) {
-        Some(n) => {
-            let style = if n.error { tone_style(Tone::Bad) } else { tone_style(Tone::Busy) };
-            spans.extend([Span::styled(n.text.clone(), style), Span::raw(" · ")]);
-            spans.extend(asking);
-            let checking = checking.trim_start_matches(" · ");
-            spans.push(Span::raw(if checking.is_empty() { keys.to_string() } else { format!("{checking} · {keys}") }));
-        }
-        None => {
-            spans.extend(asking);
-            spans.push(Span::raw(format!("{}{}{checking} · {} · every {}s · {}", shared.status, spin, age, secs, keys)));
+    let now = if shared.refreshing { " · refreshing now" } else { "" };
+    out.push(row("refresh", format!("every {secs}s ([f] changes it, [r] refreshes now) · {age}{now}"), Style::default()));
+    let deep = match shared.deep.running() {
+        0 => ("none running ([d] this pod or the marked ones, [D] every idle one)".to_string(), Style::default()),
+        n => (format!("{n} running"), tone_style(Tone::Busy)),
+    };
+    out.push(row("deep checks", deep.0, deep.1));
+    out.push(Line::raw(""));
+
+    out.push(head("fleet"));
+    // The bar as it used to read: its warnings each on a line in their colours, then the rest.
+    let fleet = summary_text(&shared.summary, &shared.snap.cost, &shared.snap.partial, &shared.balance, shared.ai_cohort.as_ref());
+    let mut rest = fleet.as_str();
+    for (lead, tone) in [
+        (state::partial_notice(&shared.snap.partial), Some(Tone::Warn)),
+        (balance::tui_parts(&shared.balance).0, state::balance_tone(&shared.balance)),
+        (shared.ai_cohort.as_ref().and_then(|a| a.tui_parts().0), state::ai_tone(shared.ai_cohort.as_ref())),
+    ] {
+        if let Some(lead) = lead.filter(|l| rest.starts_with(l.as_str())) {
+            rest = &rest[lead.len()..];
+            out.push(Line::styled(format!("  {}", lead.trim().trim_end_matches('·').trim_end()), toned(tone)));
         }
     }
-    Line::from(spans)
+    for part in rest.split("  ·  ").map(str::trim).filter(|p| !p.is_empty()) {
+        out.push(Line::raw(format!("  {part}")));
+    }
+    out.push(Line::raw(""));
+
+    out.push(head("balances (prepaid accounts)"));
+    let stamp = snapshot::unix_now();
+    let views: Vec<&AccountView> = shared.balance.iter().collect();
+    if views.is_empty() {
+        out.push(Line::styled("  none read yet — read every few minutes when a prepaid account's key is configured (`arena balance` has them all)", dim));
+    }
+    for v in views {
+        let style = match v.level {
+            balance::Level::Critical => tone_style(Tone::Bad),
+            balance::Level::Low => tone_style(Tone::Warn),
+            balance::Level::Unknown => tone_style(Tone::Dim),
+            _ => Style::default(),
+        };
+        let symbol = if v.currency == "EUR" { "€" } else { "$" };
+        let burn = v.burn.as_ref().map(|b| format!(" · burn {}/h", fleet::fmt_money(symbol, b.per_hr))).unwrap_or_default();
+        out.push(row(
+            &v.account,
+            format!("{} {} · runway {}{burn}", balance::balance_label(v), balance::source_label(v, stamp), balance::fmt_runway(v)),
+            style,
+        ));
+    }
+    out.push(Line::raw(""));
+
+    if let Some(ai) = shared.ai.as_ref() {
+        out.push(head("AI (OpenRouter)"));
+        let money = |x: f64| fleet::fmt_money("$", x);
+        let c = shared.ai_cohort.as_ref();
+        let credit = match (ai.credits, &ai.credits_error) {
+            (Some(cr), None) => format!("{} left", money(cr.left())),
+            (Some(cr), Some(e)) => format!("{} left as last read (the latest read failed: {e})", money(cr.left())),
+            (None, Some(e)) => format!("? ({e})"),
+            (None, None) => "… (not read yet)".into(),
+        };
+        out.push(row("credit", credit, toned(state::ai_tone(c))));
+        if let Some(c) = c {
+            let today = c.today.map(money).unwrap_or_else(|| "?".into());
+            let uncapped = if c.uncapped > 0 { format!(" · {} with no cap", c.uncapped) } else { String::new() };
+            out.push(row("cohort", format!("{} · {today} today · {} more allowed under their caps{uncapped}", count_of(c.keys, "key", "keys"), money(c.headroom)), Style::default()));
+            if !c.capped.is_empty() {
+                let names: Vec<String> = c.capped.iter().map(|k| if k.pod { k.name.clone() } else { format!("{} (no pod)", k.name) }).collect();
+                out.push(row("at cap", format!("{} — `arena keys list` has each one's cap and spend", names.join(", ")), tone_style(Tone::Warn)));
+            }
+        }
+        if let Some(e) = &ai.keys_error {
+            out.push(row("keys", format!("⚠ the latest read failed: {e} (the numbers are the last good ones)"), tone_style(Tone::Warn)));
+        }
+        out.push(Line::raw(""));
+    }
+
+    out.push(head("keys"));
+    for (k, what) in ALL_KEYS {
+        out.push(Line::from(vec![Span::styled(format!("  {k:<17}"), Style::default().add_modifier(Modifier::BOLD)), Span::raw(*what)]));
+    }
+    out.push(Line::raw(""));
+    out.push(head("columns"));
+    for (col, what) in LEGEND {
+        out.push(Line::from(vec![Span::styled(format!("  {col:<10}"), Style::default().add_modifier(Modifier::BOLD)), Span::raw(*what)]));
+    }
+    out
+}
+
+/// The info panel ([`info_lines`]), scrolled by `ui.mode`'s `scroll` — clamped, and where the end is
+/// told back through `result_max` (`scroll_by`).
+fn render_info(f: &mut Frame, shared: &Shared, ui: &Ui, _detail: bool, secs: u64) {
+    let Mode::Info { scroll, .. } = ui.mode else { return };
+    let area = centered_rect(90, 86, f.area());
+    f.render_widget(Clear, area);
+    let text = Paragraph::new(info_lines(shared, ui, secs)).wrap(Wrap { trim: false });
+    let inner = area.height.saturating_sub(2);
+    let total = u16::try_from(text.line_count(area.width.saturating_sub(2))).unwrap_or(u16::MAX);
+    ui.result_max.set(total.saturating_sub(inner));
+    let scroll = scroll.min(ui.result_max.get());
+    f.render_widget(
+        text.scroll((scroll, 0)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" ☰ info — [esc/i] close · [↑↓ PgUp PgDn] scroll "),
+        ),
+        area,
+    );
 }
 
 /// A braille spinner frame for `elapsed` (a new one every 150 ms, the UI's redraw tick).
@@ -4207,34 +4498,44 @@ deep_check_end=1
         assert_eq!(names(deep_all_confirm(plan, None)), ["devtest-alpha", "devtest-charlie"], "unarmed: the plan");
     }
 
-    /// A notice (`D`'s prompt) leads the footer, before a question's spinner line; one
+    /// The footer: `☰` in its first cell, then a notice (`D`'s prompt), then a question's
+    /// spinner line, then the short status, the refresh's age and cadence, then the keys; one
     /// separator between each part.
     #[test]
     fn a_notice_leads_the_footer_before_the_asking_line() {
         let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
         // No start time: 0s and the first frame, whatever the clock does.
-        let mut shared = Shared { ask_running: Some("asking claude about devtest-alpha…".into()), ..Default::default() };
+        let mut shared = Shared {
+            ask_running: Some("asking claude about devtest-alpha…".into()),
+            status: RefreshStatus::of("3 reporting · RunPod API 13/min".into(), &[], Some(13)),
+            ..Default::default()
+        };
         let text = |s: &Shared| footer_hint(s, &ui, 10).spans.iter().map(|s| s.content.to_string()).collect::<String>();
         let quiet = text(&shared);
-        assert!(quiet.starts_with("⠋ asking claude about devtest-alpha… 0s · "), "{quiet}");
+        assert!(quiet.starts_with("☰ ⠋ asking claude about devtest-alpha… 0s · ✓ API 13/min ⟳- · 10s  [q] quit  [i] info"), "{quiet}");
         shared.notify("D again to deep-check 2 running pods", false);
         let t = text(&shared);
-        let rest = t.strip_prefix("D again to deep-check 2 running pods · ").unwrap_or_else(|| panic!("{t}"));
-        assert!(rest.contains("asking claude about devtest-alpha… 0s · [q] quit"), "{t}");
+        let rest = t.strip_prefix("☰ D again to deep-check 2 running pods · ").unwrap_or_else(|| panic!("{t}"));
+        assert!(rest.starts_with("⠋ asking claude about devtest-alpha… 0s · ✓ API 13/min"), "{t}");
         assert!(!t.contains("·  ·") && !t.contains("· ·"), "{t}");
+        // A refresh that warned: its first words, yellow, and how many more.
+        shared.status = RefreshStatus::of("3 reporting · ⚠ pod details incomplete: x · ⚠ ssh config not rewritten: y".into(), &["pod details incomplete: x", "ssh config not rewritten: y"], None);
+        let line = footer_hint(&shared, &ui, 5);
+        let warn = line.spans.iter().find(|s| s.content.starts_with('⚠')).unwrap_or_else(|| panic!("{line:?}"));
+        assert_eq!((warn.content.as_ref(), warn.style.fg), ("⚠ pod details incomplete +1", Some(Color::Yellow)));
     }
 
     /// The first refresh's early paint: the listed rows, no metrics yet, and a status that
     /// says the rest is being read — never "loading…" while the probes run.
     #[test]
     fn the_listing_is_shown_before_the_pods_are_read() {
-        let shared = Mutex::new(Shared { status: "loading…".into(), ..Default::default() });
+        let shared = Mutex::new(Shared { status: RefreshStatus::busy("loading…"), ..Default::default() });
         let pods = [pod("alpha", "runpod", "a", 1, Some(22)), pod("bravo", "hetzner", "b", 2, None)];
         publish_listing(&cfg(""), &shared, &pods, &[], 1_000);
         let s = shared.lock().unwrap();
         assert_eq!(s.pods.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["devtest-alpha", "devtest-bravo"]);
         assert_eq!((s.snap.pods.len(), s.summary.pods, s.metrics.len()), (2, 2, 0));
-        assert_eq!(s.status, "listed 2 pods — reading them…");
+        assert_eq!((s.status.full.as_str(), s.status.short.as_str()), ("listed 2 pods — reading them…", "reading 2 pods…"));
         assert!(s.last_refresh.is_none(), "still the first refresh: its full publish comes next");
     }
 
@@ -4280,6 +4581,7 @@ deep_check_end=1
             nudge: Arc::new(Notify::new()),
             offers: offers::State::new(true),
             demo: false,
+            menu_at: std::cell::Cell::new(None),
         }
     }
 
@@ -4358,8 +4660,21 @@ deep_check_end=1
         shared
     }
 
+    /// The buffer's rows as a terminal shows them: a wide symbol (`💾`) takes two cells, so the
+    /// cell it hides isn't printed.
     fn screen(buf: &Buffer) -> Vec<String> {
-        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()).collect()
+        (0..buf.area.height)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0;
+                while x < buf.area.width {
+                    let sym = buf[(x, y)].symbol();
+                    row.push_str(sym);
+                    x += (Span::raw(sym).width() as u16).max(1);
+                }
+                row
+            })
+            .collect()
     }
 
     fn draw(width: u16, height: u16, shared: &Shared, ui: &Ui) -> Vec<String> {
@@ -4410,13 +4725,89 @@ deep_check_end=1
             });
             let rest = median(&mut || {
                 term.draw(|f| {
-                    f.render_widget(summary_line(&shared), f.area());
+                    top_line(f, &shared, &ui, f.area());
                     f.render_widget(Paragraph::new(footer_hint(&shared, &ui, 5)), f.area());
                 })
                 .unwrap();
             });
             println!("{w}x{h}: view {whole}µs, pods_table {table}µs, summary+footer {rest}µs");
         }
+    }
+
+    /// Not a test: the README's picture of the dashboard — a made-up fleet of five, drawn by
+    /// the renderer. `cargo test -p arena-tui -- --ignored --nocapture readme_picture`.
+    #[test]
+    #[ignore = "prints the README's picture"]
+    fn readme_picture() {
+        use arena_core::metrics::GpuStat;
+        let gpu = |name: &str, util: u32, used: Option<u32>, total: Option<u32>, temp: u32| GpuStat {
+            name: Some(name.into()),
+            util_pct: Some(util),
+            mem_used_mb: used,
+            mem_total_mb: total,
+            temp_c: Some(temp),
+        };
+        // name, provider, id, GPU type, $/h, nvidia-smi's GPUs, branch, saved (s ago), verdict,
+        // checked (s ago), proxy port.
+        type Row = (&'static str, &'static str, &'static str, &'static str, f64, Vec<GpuStat>, &'static str, i64, Status, u64, u16);
+        let rows: [Row; 5] = [
+            ("apple", "runpod", "rp1", "NVIDIA RTX A4000", 0.17, vec![gpu("RTX A4000", 87, Some(10_240), Some(16_376), 71)], "w1d2", 240, Status::Pass, 720, 22001),
+            ("bloom", "runpod", "rp2", "NVIDIA RTX A4000", 0.17, vec![gpu("RTX A4000", 0, Some(900), Some(16_376), 34)], "w1d2", 780, Status::Pass, 3_000, 22002),
+            ("cedar", "vast", "v3", "RTX 3090", 0.22, vec![gpu("RTX 3090", 0, Some(300), Some(24_576), 30)], "w1d2", 10_800, Status::Fail, 7_300, 22003),
+            ("delta", "runpod", "rp4", "NVIDIA RTX A4000", 0.17, vec![gpu("RTX A4000", 42, Some(7_100), Some(16_376), 63)], "main", 480, Status::Pass, 900, 22004),
+            ("ember", "runpod", "rp5", "NVIDIA B300 SXM6 AC MIG 1g.34gb", 0.89, vec![gpu("B300 SXM6 AC", 98, None, None, 78)], "w1d2", 120, Status::Pass, 600, 22005),
+        ];
+        let mut pods = Vec::new();
+        let mut shared = Shared::default();
+        let mut cache = HealthCache::new();
+        for (i, (name, provider, id, ty, cost, gpus, branch, saved, verdict_status, checked, port)) in rows.into_iter().enumerate() {
+            let mut p = pod(name, provider, id, i as u8 + 1, Some(port));
+            p.gpu_type = Some(ty.into());
+            p.gpu_count = Some(1);
+            p.cost_per_hr = Some(cost);
+            p.locked = Some(name == "delta");
+            let branch = if branch == "main" { "main".to_string() } else { format!("autocommit-devtest-{branch}-{name}") };
+            shared.metrics.insert(
+                p.name.clone(),
+                PodMetrics {
+                    gpus,
+                    branch: Some(branch),
+                    origin: Some("git@github.com:example/ARENA_3.0.git".into()),
+                    has_name: Some(true),
+                    has_key: Some(true),
+                    has_api_key: Some(true),
+                    disk_used_mb: Some(40_960),
+                    disk_total_mb: Some(100_352),
+                    last_commit: Some(now_unix() - saved),
+                    dirty_files: Some(0),
+                    ..Default::default()
+                },
+            );
+            cache.merge(&[verdict(&p, verdict_status, (verdict_status == Status::Fail).then_some(("cuda", "RuntimeError: Error 999")))], NOW - checked);
+            pods.push(p);
+        }
+        use arena_core::proxy::{render_nginx, Forward};
+        let fwd = |i: usize, p: &Pod| Forward {
+            name: p.name.clone(),
+            public_port: 9500 + i as u16,
+            target_ip: p.ssh_ip.clone().unwrap(),
+            target_port: p.ssh_port.unwrap() + u16::from(i == 2),
+            provider: Some(p.provider.clone()),
+            pod_id: None,
+        };
+        let proxy = render_nginx(&pods.iter().enumerate().map(|(i, p)| fwd(i, p)).collect::<Vec<_>>());
+        let snap = dashboard_snapshot(&pods, &[], Some(&proxy), &cache, &Naming::from_config(&cfg("")), NOW);
+        shared.summary = summarize(&pods, &shared.metrics);
+        shared.publish(snap);
+        shared.balance = live_views(&[(balance::Account::Runpod, 214.30, 1.17)]);
+        shared.status = RefreshStatus::of("5 reporting · RunPod API 6/min".into(), &[], Some(6));
+        shared.last_refresh = Some(Instant::now());
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        ui.config_path = "./config.env".into();
+        println!("{}", draw(120, 11, &shared, &ui).join("\n"));
+        ui.mode = Mode::Detail;
+        ui.selected = 4;
+        println!("{}", draw(120, 30, &shared, &ui).join("\n"));
     }
 
     /// The rows read the core snapshot: $/h in each provider's currency (`-` when not
@@ -4467,8 +4858,8 @@ deep_check_end=1
         let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
         let lines = draw(180, 12, &shared, &ui);
         let all = lines.join("\n");
-        let header = lines.iter().find(|l| l.contains("HEALTH")).unwrap_or_else(|| panic!("{all}"));
-        for col in ["$/H", "HEALTH", "PROXY", " M "] {
+        let header = lines.iter().find(|l| l.contains("HLTH")).unwrap_or_else(|| panic!("{all}"));
+        for col in ["$/H", "HLTH", "PROXY", " M "] {
             assert!(header.contains(col), "{col} in {header}");
         }
         // Rows by name, whatever order the providers listed them in.
@@ -4477,10 +4868,10 @@ deep_check_end=1
 
         // (row, must show, must not show)
         let cases: &[(&str, &[&str], &[&str])] = &[
-            ("alpha", &["init M", "$0.17", "pass 12m", ":9500"], &["stale"]),
-            ("bravo", &["init L", "$0.25", "fail 2h", ":9501 stale"], &["init M"]),
-            ("charlie", &["€0.006"], &["$0.0", "init M", "init L", "pass", "fail", ":95"]),
-            ("delta", &["exit", "checking"], &["$0.13", "exit M"]),
+            ("alpha", &["init M", "$0.17", "✓12m", " 9500 "], &["9500!"]),
+            ("bravo", &["init L", "$0.25", "✗2h", " 9501! "], &["init M"]),
+            ("charlie", &["€0.006"], &["$0.0", "init M", "init L", "✓", "✗", "95"]),
+            ("delta", &["exit", " … "], &["$0.13", "exit M"]),
         ];
         for (name, shows, hides) in cases {
             let r = row(&lines, name);
@@ -4491,47 +4882,250 @@ deep_check_end=1
                 assert!(!r.contains(s), "{name} hides {s:?}: {r}");
             }
         }
-        let summary = lines.iter().find(|l| l.contains("fleet:")).unwrap_or_else(|| panic!("{all}"));
-        assert!(
-            summary.contains(" 4 pods · 0 GPUs · mean util - · fleet: $0.42/h across 3 billing pod(s) + €0.006/h hetzner ≈ $10.08/day + €0.13/day"),
-            "{summary}"
-        );
-        assert!(all.contains("deep-checking 1"), "the footer counts running checks: {all}");
+        // The top line, in short: the fleet's burn with € kept apart, nothing else on it.
+        assert!(lines[0].starts_with(" 4 pods · 0 GPUs · $0.42/h + €0.006/h  "), "{all}");
+        // The rest is the info panel's: the old bar's words, and the deep check running.
+        let mut ui = ui;
+        ui.mode = Mode::Info { scroll: 0, detail: false };
+        let info = draw(180, 60, &shared, &ui).join("\n");
+        for want in [
+            "4 pods · 0 GPUs · mean util - · fleet: $0.42/h across 3 billing pod(s) + €0.006/h hetzner ≈ $10.08/day + €0.13/day",
+            "deep checks  1 running",
+        ] {
+            assert!(info.contains(want), "{want:?} in\n{info}");
+        }
+    }
+
+    /// The human (2026-10-30, prod's dashboard): "B300 SXM6 AC -> B300 MIG". Under MIG
+    /// nvidia-smi names the parent card (`NVIDIA B300 SXM6 AC`, its memory unreadable), and the
+    /// GPU column showed that, cut: `1×B300 SXM6 AC`. A slice reads as every surface names it,
+    /// with its memory as every GPU has it — `1×B300 MIG 34G`, whole at any width — whether the
+    /// provider lists its id (v2) or its name (v1), read or not; the detail pane spells it out
+    /// with the card it's cut from. Other GPUs are as before.
+    #[test]
+    fn a_mig_slice_reads_as_the_slice_in_the_table_and_the_detail_pane() {
+        let smi = |out: &str| PodMetrics { gpus: metrics::parse_nvidia_smi(out), ..Default::default() };
+        let slice = smi("NVIDIA B300 SXM6 AC, 7, [Insufficient Permissions], [Insufficient Permissions], 43\n");
+        let mut mig = pod("alpha", "runpod", "rp1", 1, Some(22001));
+        mig.gpu_type = Some("NVIDIA B300 SXM6 AC MIG 1g.34gb".into());
+        mig.gpu_count = Some(1);
+        let mut a4000 = pod("bravo", "runpod", "rp2", 2, Some(22002));
+        a4000.gpu_type = Some("NVIDIA RTX A4000".into());
+        a4000.gpu_count = Some(2);
+        let two = smi("NVIDIA RTX A4000, 3, 100, 16376, 40\nNVIDIA RTX A4000, 0, 100, 16376, 41\n");
+        let mut cx = pod("charlie", "hetzner", "88", 3, Some(22));
+        cx.gpu_type = Some("cx23".into());
+        // (pod, its probe, narrow, the GPU cell)
+        let cases: &[(&Pod, Option<&PodMetrics>, bool, &str)] = &[
+            (&mig, Some(&slice), false, "1×B300 MIG 34G"),
+            (&mig, Some(&slice), true, "1×B300 MIG 34G"),
+            (&mig, None, true, "1×B300 MIG 34G"),
+            (&a4000, Some(&two), false, "2×RTX A4000 16G"),
+            (&a4000, Some(&two), true, "2×A4000 16G"),
+            (&a4000, None, false, "2×RTX A4000"),
+            (&cx, None, true, "cx23"),
+        ];
+        for (p, m, narrow, want) in cases {
+            assert_eq!(gpu_text(p, *m, *narrow), *want, "{} narrow={narrow}", p.name);
+        }
+        let mut v1 = mig.clone();
+        v1.gpu_type = Some("B300 MIG 34GB".into());
+        assert_eq!(gpu_text(&v1, Some(&slice), true), "1×B300 MIG 34G", "v1's name for it");
+        // Two slices of one card: nvidia-smi lists the parent once; the provider's count stands.
+        let mut two_slices = mig.clone();
+        two_slices.gpu_count = Some(2);
+        assert_eq!(gpu_text(&two_slices, Some(&slice), false), "2×B300 MIG 34G");
+        two_slices.gpu_count = None;
+        assert_eq!(gpu_text(&two_slices, Some(&slice), false), "1×B300 MIG 34G", "no count from the provider: the probe's");
+        assert_eq!(gpu_detail(&mig, Some(&slice)), "1×B300 MIG 34GB (MIG slice of B300 SXM6 AC)");
+        assert_eq!(gpu_detail(&mig, None), "1×B300 MIG 34GB");
+        assert_eq!(gpu_detail(&a4000, Some(&two)), "2×RTX A4000 16G");
+
+        // On screen: whole in the narrowest table, and in the detail pane.
+        let pods = vec![mig.clone(), a4000.clone()];
+        let snap = dashboard_snapshot(&pods, &[], None, &HealthCache::new(), &Naming::from_config(&cfg("")), NOW);
+        let mut shared = Shared::default();
+        shared.publish(snap);
+        shared.metrics.insert(mig.name.clone(), slice);
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        for w in [72, 100, 200] {
+            let lines = draw(w, 12, &shared, &ui);
+            assert!(row(&lines, "alpha").contains(" 1×B300 MIG 34G "), "{w}: {}", row(&lines, "alpha"));
+        }
+        ui.mode = Mode::Detail;
+        let pane = draw(160, 40, &shared, &ui).join("\n");
+        assert!(pane.contains("gpu:      1×B300 MIG 34GB (MIG slice of B300 SXM6 AC)"), "{pane}");
+    }
+
+    /// SAVED's header is a floppy disk: two cells wide (as `unicode-width`, tmux and the common
+    /// terminals count it), the cell after it blank, and every column after it starts in the
+    /// header where it starts in the rows. The column is as wide as its cells (`↑23h`).
+    #[test]
+    fn the_saved_header_is_a_floppy_disk_and_the_columns_after_it_line_up() {
+        assert_eq!(Span::raw(columns::SAVED_HEADER).width(), 2);
+        let shared = fixture_shared();
+        let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let mut t = Terminal::new(TestBackend::new(160, 12)).unwrap();
+        t.draw(|f| view(f, &shared, &ui, 5)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let cells = |y: u16| (0..160u16).map(|x| buf[(x, y)].symbol().to_string()).collect::<Vec<_>>();
+        let hy = (0..12).find(|&y| cells(y).concat().contains("HLTH")).unwrap();
+        let header = cells(hy);
+        let disk = header.iter().position(|c| c == columns::SAVED_HEADER).unwrap_or_else(|| panic!("{}", header.concat()));
+        assert_eq!(header[disk + 1], " ", "the second cell of the glyph");
+        // The next column (CPU%: no AI key here) starts where its cells do, in every row.
+        let cpu = (disk..160).find(|&x| header[x] == "C" && header[x + 1] == "P").unwrap();
+        assert_eq!(cpu, disk + columns::SAVED_W + 1, "{}", header.concat());
+        for y in hy + 1..hy + 5 {
+            let row = cells(y);
+            assert_eq!(row[cpu], "-", "row {y}: {}", row.concat());
+            assert_eq!(row[cpu - 1], " ", "row {y}: {}", row.concat());
+        }
+    }
+
+    /// The top line is one line — no title box — with the fleet in short words and, at its right
+    /// while there's room, a provider or config that isn't the default (a second fleet's
+    /// dashboard says so). The table starts right under it.
+    #[test]
+    fn the_top_line_is_one_short_line_and_names_a_second_fleet() {
+        let shared = fixture_shared();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let lines = draw(120, 12, &shared, &ui);
+        assert!(lines[0].starts_with(" 4 pods · 0 GPUs · $0.42/h + €0.006/h "), "{}", lines[0]);
+        assert!(lines[0].trim_end().ends_with(" /test/config.env"), "{}", lines[0]);
+        assert!(lines[1].starts_with("┌Pods"), "{}", lines[1]);
+        ui.provider_name = "vast".into();
+        assert!(draw(120, 12, &shared, &ui)[0].trim_end().ends_with(" vast · /test/config.env"));
+        assert!(!draw(50, 12, &shared, &ui)[0].contains("config"), "no room: left out (the info panel has it)");
+        ui.provider_name = "runpod".into();
+        ui.config_path = DEFAULT_CONFIG.into();
+        assert_eq!(draw(120, 12, &shared, &ui)[0].trim_end(), " 4 pods · 0 GPUs · $0.42/h + €0.006/h", "the defaults: nothing");
+    }
+
+    /// `i` — or a click on the footer's ☰ — opens the info panel over the list or the detail
+    /// view; it holds every word the bars left out; Esc (or `i`, or another click) goes back to
+    /// where it was opened; ↑↓ scroll it, no further than its end.
+    #[test]
+    fn i_or_the_menu_glyph_opens_the_info_panel_and_esc_goes_back() {
+        let shared = Arc::new(Mutex::new(fixture_shared()));
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        assert_eq!(list_key(&mut ui, KeyCode::Char('i'), 4), ListKey::Done);
+        assert!(matches!(ui.mode, Mode::Info { scroll: 0, detail: false }), "{:?}", ui.mode);
+        let all = draw(160, 70, &shared.lock().unwrap(), &ui).join("\n");
+        for want in [
+            "provider     runpod (where the add-pod form starts",
+            "config       /test/config.env",
+            "refresh      every 5s ([f] changes it, [r] refreshes now) · not refreshed yet",
+            "deep checks  1 running",
+            "4 pods · 0 GPUs · mean util - · fleet: $0.42/h across 3 billing pod(s)",
+            "none read yet",
+            "D                deep-check every running pod nobody is using (press twice)",
+            "HLTH      last deep check and its age: ✓ pass",
+            "PROXY     the forward's port",
+        ] {
+            assert!(all.contains(want), "{want:?} in\n{all}");
+        }
+        assert!(all.lines().last().unwrap().starts_with("☰ ") && all.contains("[esc/i] close"), "{all}");
+        // Scrolled, it stops at its end.
+        let before = draw(160, 20, &shared.lock().unwrap(), &ui);
+        for _ in 0..500 {
+            info_key(&mut ui, KeyCode::Down);
+        }
+        let Mode::Info { scroll, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        assert!(scroll > 0 && scroll == ui.result_max.get(), "{scroll} {}", ui.result_max.get());
+        assert_ne!(draw(160, 20, &shared.lock().unwrap(), &ui), before);
+        assert_eq!(info_key(&mut ui, KeyCode::Char('z')), Some(false), "not the panel's: nothing");
+        assert_eq!(info_key(&mut ui, KeyCode::Esc), Some(true));
+        assert!(matches!(ui.mode, Mode::List));
+        assert_eq!(info_key(&mut ui, KeyCode::Esc), None, "closed: not its key any more");
+        // From the detail view, back to it.
+        ui.mode = Mode::Detail;
+        list_key(&mut ui, KeyCode::Char('i'), 4);
+        assert!(matches!(ui.mode, Mode::Info { detail: true, .. }));
+        info_key(&mut ui, KeyCode::Char('i'));
+        assert!(matches!(ui.mode, Mode::Detail));
+        // A click on ☰ (bottom-left) opens it and closes it; a click beside it doesn't.
+        ui.mode = Mode::List;
+        let footer_y = draw(120, 20, &shared.lock().unwrap(), &ui).len() as u16 - 1;
+        let click = |column: u16, row: u16| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column, row, modifiers: KeyModifiers::NONE };
+        assert!(!handle_mouse(click(5, footer_y), &mut ui, &shared));
+        assert!(matches!(ui.mode, Mode::List));
+        assert!(handle_mouse(click(0, footer_y), &mut ui, &shared));
+        assert!(matches!(ui.mode, Mode::Info { detail: false, .. }));
+        assert!(handle_mouse(click(1, footer_y), &mut ui, &shared));
+        assert!(matches!(ui.mode, Mode::List));
+    }
+
+    /// The human (2026-10-30): "the [enter] -> [overview] should have more colours". The detail
+    /// pane's labels are dim, each value with a state in the table's tone for it — the words
+    /// unchanged — and its sections' titles in the accent colour.
+    #[test]
+    fn the_detail_pane_colours_each_value_by_its_state() {
+        let shared = fixture_shared();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        ui.mode = Mode::Detail;
+        let colour_of = |ui: &Ui, text: &str| {
+            let mut t = Terminal::new(TestBackend::new(160, 40)).unwrap();
+            t.draw(|f| view(f, &shared, ui, 5)).unwrap();
+            let buf = t.backend().buffer().clone();
+            let lines = screen(&buf);
+            let (y, line) = lines.iter().enumerate().find(|(_, l)| l.contains(text)).unwrap_or_else(|| panic!("{text:?} in\n{}", lines.join("\n")));
+            let x = line[..line.find(text).unwrap()].chars().count() as u16;
+            buf[(x, y as u16)].fg
+        };
+        ui.selected = 1; // bravo: failed its check, stale forward, locked
+        for (text, colour) in [
+            ("status:", Color::DarkGray),
+            ("fail 2h GPU error", Color::Red),
+            ("cuda: RuntimeError", Color::Red),
+            (":9501 stale (`arena proxy apply`", Color::Yellow),
+            ("locked (stop/restart/terminate refused)", Color::Cyan),
+            ("per-GPU", Color::Cyan),
+        ] {
+            assert_eq!(colour_of(&ui, text), colour, "{text}");
+        }
+        ui.selected = 0; // alpha: passed, live forward, a maintenance window
+        for (text, colour) in [("pass 12m", Color::Green), (":9500 (live)", Color::Green), ("maint 10-09 02:00", Color::Yellow)] {
+            assert_eq!(colour_of(&ui, text), colour, "{text}");
+        }
+        ui.selected = 3; // delta: being checked
+        assert_eq!(colour_of(&ui, "checking… (deep check running"), Color::Cyan);
     }
 
     /// A narrow terminal — or the detail view's 55% split — keeps the essential columns
-    /// whole (NAME, HEALTH, PROXY as the port coloured by state, $/H) and drops the mid
+    /// whole (NAME, HLTH, PROXY as the port, marked when stale, $/H) and drops the mid
     /// columns in turn (TEMP, RTT, MEM, BRANCH, DISK) rather than letting every column be
-    /// crushed: at 80–100 columns the names still read `alpha`, not `al`/`alph`.
+    /// crushed: at 70–100 columns the names still read `alpha`, not `al`/`alph`.
     #[test]
     fn a_narrow_terminal_drops_mid_columns_and_keeps_names_and_health_whole() {
         let shared = fixture_shared();
         let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
         // (mode, terminal width, mid columns shown, mid columns dropped)
         let cases: &[(Mode, u16, &[&str], &[&str])] = &[
-            (Mode::List, 80, &[], &["DISK", "BRANCH", "MEM", "RTT", "TEMP"]),
-            (Mode::List, 92, &["DISK", "BRANCH"], &["MEM", "RTT", "TEMP"]),
+            (Mode::List, 72, &[], &["DISK", "BRANCH", "MEM", "RTT", "TEMP"]),
+            (Mode::List, 80, &["DISK"], &["BRANCH", "MEM", "RTT", "TEMP"]),
+            (Mode::List, 90, &["DISK", "BRANCH"], &["MEM", "RTT", "TEMP"]),
             (Mode::List, 100, &["DISK", "BRANCH", "MEM"], &["RTT", "TEMP"]),
-            (Mode::List, 106, &["DISK", "BRANCH", "MEM", "RTT"], &["TEMP"]),
-            (Mode::List, 120, &["DISK", "BRANCH", "MEM", "RTT", "TEMP"], &[]),
+            (Mode::List, 104, &["DISK", "BRANCH", "MEM", "RTT"], &["TEMP"]),
+            (Mode::List, 110, &["DISK", "BRANCH", "MEM", "RTT", "TEMP"], &[]),
             // Detail: the table gets 55% of 160 = 88 columns.
-            (Mode::Detail, 160, &["DISK"], &["BRANCH", "MEM", "RTT", "TEMP"]),
+            (Mode::Detail, 160, &["DISK", "BRANCH"], &["MEM", "RTT", "TEMP"]),
         ];
         ui.selected = 3; // delta: the detail pane's title (" delta ") isn't a row we look at
         for (mode, w, shown, dropped) in cases {
             ui.mode = mode.clone();
             let lines = draw(*w, 12, &shared, &ui);
             let all = lines.join("\n");
-            let header = lines.iter().find(|l| l.contains("HEALTH")).unwrap_or_else(|| panic!("{w}: {all}"));
-            for col in ["NAME", "STAT", "SET", "GPU%", "$/H", "HEALTH", "PROXY"].iter().chain(shown.iter()) {
+            let header = lines.iter().find(|l| l.contains("HLTH")).unwrap_or_else(|| panic!("{w}: {all}"));
+            for col in ["NAME", "STAT", "SET", "GPU%", "$/H", "HLTH", "PROXY"].iter().chain(shown.iter()) {
                 assert!(header.contains(col), "{mode:?} {w}: {col} in {header}");
             }
             for col in *dropped {
                 assert!(!header.contains(col), "{mode:?} {w}: {col} dropped from {header}");
             }
             for (name, cells) in [
-                ("alpha", &["pass 12m", "$0.17", ":9500"][..]),
-                ("bravo", &["fail 2h", "$0.25", ":9501"]),
+                ("alpha", &["✓12m", "$0.17", " 9500 "][..]),
+                ("bravo", &["✗2h", "$0.25", " 9501! "]),
                 ("charlie", &["€0.006"]),
             ] {
                 let r = row(&lines, name); // ` alpha ` — the whole short name
@@ -4539,7 +5133,6 @@ deep_check_end=1
                     assert!(r.contains(c), "{mode:?} {w}: {name} shows {c:?}: {r}");
                 }
             }
-            assert!(!row(&lines, "bravo").contains("stale"), "{w}: compact proxy, the colour says stale");
         }
     }
 
@@ -4562,7 +5155,7 @@ deep_check_end=1
         t.draw(|f| view(f, &shared, &ui, 5)).unwrap();
         let buf = t.backend().buffer().clone();
         let lines = screen(&buf);
-        let header = lines.iter().find(|l| l.contains("HEALTH")).unwrap();
+        let header = lines.iter().find(|l| l.contains("HLTH")).unwrap();
         let col = header[..header.find("RTT").unwrap_or_else(|| panic!("{header}"))].chars().count();
         let cell = |name: &str| {
             let y = lines.iter().position(|l| l.contains(&format!(" {name} "))).unwrap();
@@ -4579,6 +5172,13 @@ deep_check_end=1
         ui.selected = shared.pods.iter().position(|p| p.name.ends_with("charlie")).unwrap();
         let pane = draw(160, 40, &shared, &ui).join("\n");
         assert!(pane.contains("where:    -  ·  rtt -"), "{pane}");
+        // A place too long for the pane is cut with the rest: one row (review ai-review codex r2).
+        ui.selected = idx;
+        shared.pods[idx].location = Some("United States, California, San Francisco, Mission District".into());
+        let lines = draw(120, 40, &shared, &ui);
+        let at = lines.iter().position(|l| l.contains("where:")).unwrap();
+        assert!(lines[at].contains("United States, California") && lines[at].contains('…'), "{}", lines[at]);
+        assert!(lines[at + 1].contains("proxy:"), "the next fact on the next row:\n{}", lines.join("\n"));
     }
 
     /// The human (2026-10-29, prod's dashboard): "why does it say 1 ai key at cap?" — every AI$
@@ -4622,20 +5222,6 @@ deep_check_end=1
         assert!(!draw(220, 50, &shared, &ui).join("\n").contains("ai caps:"));
     }
 
-    /// The pure column fit: always a prefix of the optional columns, so widening only adds.
-    #[test]
-    fn columns_that_fit_table() {
-        // 3 core columns 10 wide: 30 + 2 gaps + 4 = 36.
-        let core = [10, 10, 10];
-        assert_eq!(table_width(&core), 36);
-        // (width, how many of [5, 3, 9] fit)
-        for (w, want) in [(35, 0), (36, 0), (41, 0), (42, 1), (45, 1), (46, 2), (55, 2), (56, 3), (200, 3)] {
-            assert_eq!(columns_that_fit(w, &core, &[5, 3, 9]), want, "{w}");
-        }
-        // A later, narrower column doesn't jump the queue.
-        assert_eq!(columns_that_fit(45, &core, &[9, 1]), 0);
-    }
-
     /// Prepaid accounts read live now at `rate`/h: `(account, USD, rate)`.
     fn live_views(accounts: &[(balance::Account, f64, f64)]) -> Vec<AccountView> {
         let fetched: Vec<balance::Fetched> = accounts
@@ -4663,7 +5249,7 @@ deep_check_end=1
         assert!(!bar(&shared, 240).contains("balance"));
         shared.balance = live_views(&[(Account::Runpod, 100.0, 0.42)]); // ≈238h
         let wide = bar(&shared, 240);
-        assert!(wide.contains("€0.13/day  ·  balance: runpod $100.00 ≈9.9d"), "{wide}");
+        assert!(wide.contains("$0.42/h + €0.006/h · runpod $100.00 ≈9.9d"), "{wide}");
         // The colour of the lead: yellow when low, red when critical.
         let lead_colour = |shared: &Shared| {
             let mut t = Terminal::new(TestBackend::new(120, 12)).unwrap();
@@ -4699,7 +5285,7 @@ deep_check_end=1
         shared.balance = live_views(&[(Account::Runpod, 100.0, 0.42), (Account::Shadeform, 0.0, 0.0)]);
         let wide = bar(&shared, 240);
         assert!(wide.starts_with(" 4 pods · "), "{wide}");
-        assert!(wide.contains("  ·  balance: runpod $100.00 ≈9.9d · shadeform $0.00 unfunded"), "{wide}");
+        assert!(wide.contains(" · runpod $100.00 ≈9.9d · shadeform $0.00 unfunded"), "{wide}");
         assert!(!wide.contains('‼'), "{wide}");
         assert_eq!(state::balance_tone(&shared.balance), None);
         shared.balance = live_views(&[(Account::Shadeform, 0.0, 0.57)]);
@@ -4847,7 +5433,7 @@ deep_check_end=1
         std::fs::write(&path, "Host mine\n").unwrap();
         refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
         assert_eq!(read(), "Host mine\n");
-        let status = shared.lock().unwrap().status.clone();
+        let status = shared.lock().unwrap().status.full.clone();
         assert!(status.contains("ssh config not rewritten") && status.contains("isn't arena's"), "{status}");
     }
 
@@ -4899,7 +5485,8 @@ deep_check_end=1
         let remote: Arc<dyn Remote> = Arc::new(FakeRemote::new());
         refresh(&Down, &remote, &cfg(""), &ProbeOpts::default(), &shared, &mut details, false).await;
         let s = shared.lock().unwrap();
-        assert!(s.status.starts_with("list error"), "{}", s.status);
+        assert!(s.status.full.starts_with("list error"), "{}", s.status.full);
+        assert_eq!(s.status.short, "✗ list error");
         assert_eq!((s.balance.len(), s.balance[0].balance), (1, Some(40.0)), "observed afresh, not the old $100");
         // Burns unknown (nothing listed): the provider's own rate is the burn.
         assert_eq!(s.balance[0].burn.map(|b| b.per_hr), Some(0.5));
@@ -4939,7 +5526,7 @@ deep_check_end=1
         for w in [80, 100, 120] {
             let lines = draw(w, 12, &shared, &ui);
             let bar = lines.iter().find(|l| l.contains("failed to list")).unwrap_or_else(|| panic!("{w}:\n{}", lines.join("\n")));
-            assert!(bar.starts_with(" ⚠ vast failed to list — its pods (and their cost) are missing · 4 pods"), "{w}: {bar}");
+            assert!(bar.starts_with(" ⚠ vast failed to list — pods/cost missing · 4 pods"), "{w}: {bar}");
         }
     }
 
@@ -4992,7 +5579,7 @@ deep_check_end=1
         ui.mode = Mode::List;
         shared.notify("✗ a target matched no pod — nothing was done: `alpah` …", true);
         let footer = draw(180, 12, &shared, &ui).pop().unwrap();
-        assert!(footer.starts_with("✗ a target matched no pod"), "{footer}");
+        assert!(footer.starts_with("☰ ✗ a target matched no pod"), "{footer}");
     }
 
     /// `n` pods `devtest-m00…`, RunPod, published as the dashboard shows them.
@@ -5300,7 +5887,7 @@ deep_check_end=1
             let (a, b) = (&s.snap.pods[0], &s.snap.pods[1]);
             assert_eq!((a.proxy, a.proxy_port), (snapshot::ProxyState::Live, Some(9500)));
             assert_eq!((b.proxy, b.proxy_port), (snapshot::ProxyState::Stale, Some(9501)));
-            assert_eq!(health_cell(a.health.as_ref(), false, s.snap.generated_at).0, "pass 10m");
+            assert_eq!(health_cell(a.health.as_ref(), false, s.snap.generated_at).0, "✓10m");
             assert!(b.health.is_none());
             assert_eq!(s.snap.partial, ["vast"]);
             let summary = summary_text(&s.summary, &s.snap.cost, &s.snap.partial, &[], None);
@@ -5397,7 +5984,7 @@ deep_check_end=1
         let calls = || (provider.lists.load(Ordering::SeqCst), provider.details.load(Ordering::SeqCst), fake.calls().len());
         let rows = |shared: &Mutex<Shared>| {
             let s = shared.lock().unwrap();
-            (s.pods.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), s.snap.partial.clone(), s.status.clone())
+            (s.pods.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), s.snap.partial.clone(), s.status.full.clone())
         };
         let step = |secs: u64| tokio::time::advance(Duration::from_secs(secs));
 
@@ -5438,7 +6025,7 @@ deep_check_end=1
         let shared = Mutex::new(Shared::default());
         let mut details = DetailsState::default();
         refresh(&provider, &remote, &cfg(""), &ProbeOpts::default(), &shared, &mut details, false).await;
-        let status = shared.lock().unwrap().status.clone();
+        let status = shared.lock().unwrap().status.full.clone();
         assert!(status.starts_with("list error: runpod: provider error: list pods HTTP 429"), "{status}");
         assert!(status.contains("⚠ RunPod rate limit: listing again") && status.contains("no rows yet"), "{status}");
     }
@@ -5463,7 +6050,8 @@ deep_check_end=1
         let alpha = &s.snap.pods.iter().find(|p| p.pod.id == "rp1").unwrap().pod;
         assert_eq!((fleet::price_label(alpha), state::has_maintenance(alpha)), ("$0.17".to_string(), true));
         assert_eq!(alpha.gpu_type.as_deref(), Some("RTX A4000"));
-        assert!(s.status.contains("⚠ pod details incomplete: ") && s.status.contains("some field errored"), "{}", s.status);
+        assert!(s.status.full.contains("⚠ pod details incomplete: ") && s.status.full.contains("some field errored"), "{}", s.status.full);
+        assert_eq!(s.status.short, "⚠ pod details incomplete");
         // The fleet total counts the price it got.
         assert!(summary_text(&s.summary, &s.snap.cost, &s.snap.partial, &[], None).contains("$0.17/h"));
     }
@@ -5534,7 +6122,7 @@ deep_check_end=1
         {
             let s = shared.lock().unwrap();
             assert_eq!(s.deep.running(), 2);
-            assert!(s.pods.iter().all(|p| health_cell(None, s.deep.is_running(p), NOW).0 == "checking"));
+            assert!(s.pods.iter().all(|p| health_cell(None, s.deep.is_running(p), NOW).0 == "…"));
             assert_eq!(s.notice.as_ref().unwrap().text, "deep-checking 2 pods in the background (up to 150s)…");
         }
         start_deep_check(&shared, &ui, vec![pods[0].clone()]);
@@ -5922,7 +6510,7 @@ deep_check_end=1
         for mode in [Mode::List, Mode::Detail] {
             ui.mode = mode;
             let footer = screen(&ui, 240, 12).pop().unwrap();
-            assert!(footer.contains("[?] ask AI"), "{footer}");
+            assert!(footer.contains("[?] ask"), "{footer}");
         }
         ui.mode = Mode::List;
         ui.selected = 2;
@@ -6613,6 +7201,91 @@ deep_check_end=1
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The form's retry field end to end: `up` runs with `--retry-mins 30`, the confirm says until
+    /// when, the panel says it's waiting for capacity (and how to stop it), and `[s]` `[y]` stop it
+    /// cleanly between rounds — Ctrl+C to its process group, which `up` takes as "no more rounds"
+    /// (`interrupted — stopping retries`), the run ending on its own.
+    #[tokio::test]
+    async fn a_retrying_up_from_the_form_says_so_and_s_stops_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("arena-tui-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("arena");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n\
+             echo \"args: $*\"\n\
+             trap 'echo \"interrupted — stopping retries with 0 of 1\"; exit 1' INT\n\
+             echo '[stop] no capacity for this GPU right now (created 0/1).'\n\
+             echo 'round 1: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…'\n\
+             while :; do sleep 0.05; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shared = Arc::new(Mutex::new(fixture_shared()));
+        let mut ui = ui(cfg("HETZNER_API_KEY=x\n"), Arc::new(FakeRemote::new()));
+        ui.cli = Ok(runs::Cli { exe: stub.clone(), config: "/test/config.env".into(), dir: dir.join("runs") });
+        let line_seen = |shared: &Mutex<Shared>, id: u64, f: &dyn Fn(&runs::Run) -> bool| {
+            let s = shared.lock().unwrap();
+            f(s.runs.iter().find(|r| r.id == id).unwrap())
+        };
+
+        // Hetzner's form: provider, server, retry, pods. The retry field → 30 min.
+        newpod::open(&mut ui, &shared);
+        for k in [KeyCode::Down, KeyCode::Down, KeyCode::Right, KeyCode::Right] {
+            assert!(newpod::key(&mut ui, &shared, k));
+        }
+        let Mode::NewPod(form) = &ui.mode else { panic!("{:?}", ui.mode) };
+        assert_eq!(form.retry_mins(), 30);
+        let all = draw(140, 40, &shared.lock().unwrap(), &ui).join("\n");
+        assert!(all.contains("▶ retry     ‹ 30 min while there's no capacity ›") && all.contains("● 30 min") && all.contains("○ 24 h"), "{all}");
+        assert!(newpod::key(&mut ui, &shared, KeyCode::Enter));
+        let all = draw(140, 40, &shared.lock().unwrap(), &ui).join("\n");
+        assert!(all.contains("--retry-mins 30 --yes") && all.contains("retry: no capacity → tries again every 60s until "), "{all}");
+        assert!(newpod::key(&mut ui, &shared, KeyCode::Char('y')));
+        let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        let mut waiting = false;
+        for _ in 0..200 {
+            if line_seen(&shared, id, &|r| r.waiting.is_some()) {
+                waiting = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(waiting, "never said it waits");
+        {
+            let s = shared.lock().unwrap();
+            let r = s.runs.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(r.lines.front().map(String::as_str), Some("args: --config /test/config.env --provider hetzner pods up --add 1 --server-type cx33 --retry-mins 30 --yes"));
+            assert!(r.retry_until.is_some_and(|u| u > snapshot::unix_now() + 29 * 60), "{:?}", r.retry_until);
+            assert!(r.title.ends_with(", retrying up to 30 min"), "{}", r.title);
+        }
+        let panel = draw(160, 40, &shared.lock().unwrap(), &ui).join("\n");
+        assert!(panel.contains("running") && panel.contains("· waiting for capacity"), "{panel}");
+        assert!(panel.contains("retry: no capacity → tries again until ") && panel.contains("[s] stops it, keeping what was made"), "{panel}");
+        assert!(panel.contains("waiting for capacity until "), "the footer too: {panel}");
+        // [s], [y]: Ctrl+C between rounds — it stops retrying and ends by itself.
+        assert!(matches!(runs::key(&mut ui, &shared, KeyCode::Char('s')), runs::Flow::Handled));
+        assert!(matches!(runs::key(&mut ui, &shared, KeyCode::Char('y')), runs::Flow::Handled));
+        let mut ended = false;
+        for _ in 0..200 {
+            if line_seen(&shared, id, &|r| !r.running()) {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ended, "Ctrl+C didn't end it");
+        {
+            let s = shared.lock().unwrap();
+            let r = s.runs.iter().find(|r| r.id == id).unwrap();
+            assert!(r.lines.iter().any(|l| l == "interrupted — stopping retries with 0 of 1"), "{:?}", r.lines);
+            assert_eq!((r.end.as_ref().map(|(_, e)| e.clone()), r.waiting.clone()), (Some(runs::End::Code(1)), None));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The human (2026-10-29): "i switch between runpod / vast / hetzner and its laggy". The
     /// form's provider switch awaited a whole-fleet listing in the key loop. Now `n` opens the
     /// form from the rows on screen and each switch is drawn at once — over a provider whose
@@ -6795,7 +7468,7 @@ deep_check_end=1
             }
             std::fs::write(dir.join("tui.pid.tmp"), std::process::id().to_string()).unwrap();
             std::fs::rename(dir.join("tui.pid.tmp"), dir.join("tui.pid")).unwrap();
-            let shared = Arc::new(Mutex::new(Shared { pods: vec![pod("alpha", "runpod", "rp1", 1, Some(22))], status: "test".into(), ..Default::default() }));
+            let shared = Arc::new(Mutex::new(Shared { pods: vec![pod("alpha", "runpod", "rp1", 1, Some(22))], status: RefreshStatus::busy("test"), ..Default::default() }));
             let provider: Arc<dyn Provider> = Arc::new(Down);
             let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
             let res = dashboard(&shared, &provider, &AtomicU64::new(3600), &Notify::new(), &AtomicBool::new(false), ui).await;
