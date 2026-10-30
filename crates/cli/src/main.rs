@@ -1005,9 +1005,8 @@ enum PodCmd {
     /// Exits non-zero unless every requested name is READY. A pod that fails is left running
     /// (Shadeform: deleted, since it can't be stopped and bills until then).
     ///
-    /// A pod up without an SSH endpoint for --endpoint-timeout (RunPod: behind its SSH proxy
-    /// only, a host with no public IP) is TERMINATED and its name recreated with the same
-    /// options, up to --check-attempts. One still coming up at --timeout is left running.
+    /// A pod up without an SSH endpoint for --endpoint-timeout (RunPod: proxy only) is
+    /// TERMINATED and its name recreated, up to --check-attempts.
     ///
     /// --check: a pod that FAILs the deep check on its host (driver, CUDA, GPU) is TERMINATED and
     /// its name recreated, up to --check-attempts. A software/setup failure isn't replaced.

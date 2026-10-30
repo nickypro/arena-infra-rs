@@ -598,7 +598,7 @@ impl Shared<'_, '_> {
         // What a fresh look saw of a pod it didn't condemn, for the wait it resumes.
         let mut seen: Option<Pod> = None;
         let pod = loop {
-            match self.or_stop(self.wait_endpoint(&pod.id, deadline, fail_on_expiry, seen.take())).await {
+            match self.or_stop(self.wait_endpoint(&pod, deadline, fail_on_expiry, seen.take())).await {
                 None => return self.end(run, Verdict::Stopped { stage: Stage::Endpoint }),
                 Some(EndpointWait::Failed { pod, why }) => return self.dead(run, &pod, option, failed_options, why).await,
                 Some(EndpointWait::TimedOut { .. }) if fail_on_expiry => {
@@ -1123,7 +1123,9 @@ impl Shared<'_, '_> {
         } else {
             say(To::Err, &format!("[{name}] terminating {} to recreate {name} (attempt {} of {max})", pod.id, n + 1));
         }
-        if let Err(e) = self.run.provider.terminate_pod(&pod.id).await {
+        // On the backend that listed it, by name (as the reaper does): never routed by the id
+        // alone, which another backend's pod may share (Vast and Hetzner ids are both numbers).
+        if let Err(e) = self.run.provider.terminate_pod_on(&pod.provider, &pod.id).await {
             let reason = format!(
                 "{why}; terminating it failed: {e} — left running, still billing{} (`arena pods terminate {name}`)",
                 price_of(pod)
@@ -1266,12 +1268,16 @@ impl Shared<'_, '_> {
         }
     }
 
-    /// The pod `id` once the listing shows it with an SSH endpoint — or, once it has been up
+    /// The pod `made` once the listing shows it with an SSH endpoint — or, once it has been up
     /// without one ([`status::up_without_endpoint`]: on RunPod, behind RunPod's SSH proxy only)
     /// for `--endpoint-timeout` — a whole one, past the deadline if need be — that; or at the
     /// deadline [`EndpointWait::TimedOut`] (still coming up — RunPod lists a pod RUNNING from its
     /// create, while its image is pulled). `seen`: a fresh look's view of it, for a wait resumed
     /// after one (the listings before it no longer count).
+    ///
+    /// It is found by its backend and id together, never the id alone: Vast's and Hetzner's ids
+    /// are both numbers, and another backend's pod under the same id — up without an endpoint —
+    /// would otherwise start this one's clock and be the pod condemned (review r4).
     ///
     /// The clock starts over only when a listing shows the pod not up (provisioning, loading,
     /// restarting; on RunPod, RUNNING with no container — a restart pulling its image again). A
@@ -1285,7 +1291,7 @@ impl Shared<'_, '_> {
     /// `dead_on_error`: a pod listed `ERROR` meanwhile is [`EndpointWait::Failed`] (a backend
     /// with a ready deadline — Shadeform; elsewhere ERROR isn't known to be final, and the wait
     /// runs on as before).
-    async fn wait_endpoint(&self, id: &str, deadline: Instant, dead_on_error: bool, seen: Option<Pod>) -> EndpointWait {
+    async fn wait_endpoint(&self, made: &Pod, deadline: Instant, dead_on_error: bool, seen: Option<Pod>) -> EndpointWait {
         let _waiting = Waiting::new(&self.waiters);
         self.waiter_added.notify_one();
         let mut rx = self.listing.subscribe();
@@ -1303,7 +1309,7 @@ impl Shared<'_, '_> {
             None => EndpointWait::TimedOut { last },
         };
         loop {
-            let listed = rx.borrow_and_update().iter().find(|p| p.id == id).cloned();
+            let listed = rx.borrow_and_update().iter().find(|p| p.id == made.id && p.provider == made.provider).cloned();
             let listed = if std::mem::take(&mut skip_current) { None } else { listed };
             match listed {
                 Some(p) if dead_on_error && p.status.trim().eq_ignore_ascii_case("ERROR") => {
@@ -1862,6 +1868,9 @@ mod tests {
         twin_after_terminate: Option<&'static str>,
         /// What the second backend (`hetzner`) lists, when it is listed.
         hetzner: Mutex<Vec<Pod>>,
+        /// Other backends' pods (by their `provider` tag), listed before this one's — in the
+        /// aggregate listing and in their own backend's: ids from two backends may collide.
+        foreign: Mutex<Vec<Pod>>,
         /// Each create's `avoid_machines`, in order.
         avoids: Mutex<Vec<Vec<String>>>,
         /// A Shadeform-like backend: its new pods get this ready deadline
@@ -1972,7 +1981,9 @@ mod tests {
         async fn list_pods(&self) -> CoreResult<Vec<Pod>> {
             self.lists.fetch_add(1, Ordering::SeqCst);
             // The aggregate skips a backend that failed: RunPod down → just the empty other one.
-            Ok(if self.runpod_down() { Vec::new() } else { self.listed() })
+            let mut out = self.foreign.lock().unwrap().clone();
+            out.extend(if self.runpod_down() { Vec::new() } else { self.listed() });
+            Ok(out)
         }
         async fn list_by_provider(&self) -> Vec<(String, CoreResult<Vec<Pod>>)> {
             let now = self.syncing.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1980,7 +1991,15 @@ mod tests {
             tokio::time::sleep(self.sync_delay).await;
             self.syncing.fetch_sub(1, Ordering::SeqCst);
             let runpod = if self.runpod_down() { Err(Error::provider("runpod: HTTP 502 Bad Gateway")) } else { Ok(self.listed()) };
-            let mut out = vec![("runpod".to_string(), runpod)];
+            let mut out = Vec::new();
+            let foreign = self.foreign.lock().unwrap().clone();
+            let mut backends: Vec<String> = foreign.iter().map(|p| p.provider.clone()).collect();
+            backends.dedup();
+            for b in backends {
+                let pods = foreign.iter().filter(|p| p.provider == b).cloned().collect();
+                out.push((b, Ok(pods)));
+            }
+            out.push(("runpod".to_string(), runpod));
             let hetzner = self.hetzner.lock().unwrap().clone();
             if !self.down_after_terminate.is_zero() || !hetzner.is_empty() {
                 out.push(("hetzner".into(), Ok(hetzner)));
@@ -2097,6 +2116,16 @@ mod tests {
             if !self.down_after_terminate.is_zero() {
                 *self.down_until.lock().unwrap() = Some(now + self.down_after_terminate);
             }
+            Ok(())
+        }
+        /// By the backend's name, as the fleet provider routes it: this fake's own pods by their
+        /// tag; one named for a backend that doesn't list that id here never reaches them.
+        async fn terminate_pod_on(&self, provider: &str, id: &str) -> CoreResult<()> {
+            let ours = self.pods.lock().unwrap().iter().any(|s| s.pod.id == id && s.pod.provider == provider);
+            if ours {
+                return self.terminate_pod(id).await;
+            }
+            self.events.lock().unwrap().push(format!("terminate {provider} {id}"));
             Ok(())
         }
     }
@@ -3332,6 +3361,29 @@ mod tests {
         assert_eq!((rows.len(), rows[0].verdict.clone()), (1, Verdict::Ready));
         assert!(!fleet.events().iter().any(|e| e.starts_with("terminate")), "{:?}", fleet.events());
         assert!(fleet.listed().iter().any(|p| p.id == theirs[0].pod.id && p.proxy_only), "still there, untouched");
+    }
+
+    /// Review (codex r4, high): a pod is this run's by its backend and id together. Another
+    /// backend's server under the same id (Vast's and Hetzner's ids are both numbers), running
+    /// with no endpoint and listed first, starts no clock and is never condemned: this run's
+    /// pod, whose endpoint comes after the grace, is READY, and nothing is terminated anywhere.
+    #[tokio::test(start_paused = true)]
+    async fn another_backends_pod_under_the_same_id_is_never_judged_or_terminated() {
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 400)])]);
+        let theirs =
+            Pod { id: "id1".into(), name: "devtest-bloom".into(), provider: "hetzner".into(), status: "running".into(), ..Default::default() };
+        assert!(status::up_without_endpoint(&theirs), "theirs would be condemned if it were ours");
+        fleet.foreign.lock().unwrap().push(theirs);
+        let cfg = cfg(None);
+        let run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, false, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        assert_eq!((made[0].pod.id.as_str(), made[0].pod.provider.as_str()), ("id1", "runpod"), "the same id, another backend");
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(rows[0].verdict, Verdict::Ready, "{:#?}", lines.all());
+        assert!(!fleet.events().iter().any(|e| e.starts_with("terminate")), "{:?}", fleet.events());
+        let (_, at) = lines.find("[devtest-apple] endpoint ");
+        assert_eq!(at, Duration::from_secs(400), "its own endpoint, not judged at 5 minutes on theirs");
     }
 
     /// Review (codex r1, high): nothing is terminated on an old look. The clock ends between two
