@@ -192,24 +192,35 @@ impl Skip {
     pub fn under_floor_now(fs: &Fs, floor: Floor) -> Skip {
         let mount = fs.mount.display();
         Skip {
-            reason: format!("only {} free on {mount} while copying (floor {}, {})", gb(fs.free), gb(floor.bytes), floor.key),
+            reason: format!("only {} free on {mount}{WHILE_COPYING}(floor {}, {})", gb(fs.free), gb(floor.bytes), floor.key),
             advice: format!("free space on {mount} (`arena config check` names arena's biggest dirs there)"),
             stopped: true,
         }
     }
 }
 
+/// What a stopped copy's reason says ([`Skip::under_floor_now`]), as the skip record tells one.
+const WHILE_COPYING: &str = " while copying ";
+
 /// The judge (pure): a copy needing `need` may start on `fs` when what's free, less `already`
 /// (what this run's earlier copies and other runs' copies under way there may take) and `need`,
 /// stays at or above `floor`.
-/// `Err` says how far off it is, for the copy's line.
+/// `Err` says how far off it is, for the copy's line — under the floor, with what it would take
+/// in all (an operator can't tell how much to free from the free space alone: review #42).
 pub fn judge(fs: &Fs, already: u64, need: &Need, floor: Floor) -> Result<(), Skip> {
-    if fs.free >= floor.bytes.saturating_add(already).saturating_add(need.bytes) {
+    let total = floor.bytes.saturating_add(already).saturating_add(need.bytes);
+    if fs.free >= total {
         return Ok(());
     }
     let mount = fs.mount.display();
     let reason = if fs.free < floor.bytes {
-        format!("only {} free on {mount} (floor {}, {})", gb(fs.free), gb(floor.bytes), floor.key)
+        let head = format!("only {} free on {mount} (floor {}, {})", gb(fs.free), gb(floor.bytes), floor.key);
+        if need.bytes == 0 && already == 0 {
+            format!("{head}: {} short of the floor before any copy", gb(floor.bytes - fs.free))
+        } else {
+            let others = if already > 0 { format!(" + ~{} for other copies under way", gb(already)) } else { String::new() };
+            format!("{head}: this copy ({}){others} + the floor = {} needed", need.words, gb(total))
+        }
     } else {
         let others = if already > 0 { format!(" after ~{} for other copies under way", gb(already)) } else { String::new() };
         format!(
@@ -946,12 +957,23 @@ fn when(t: u64, now: u64) -> String {
 
 impl SkipEntry {
     /// `✗ alpha: copy skipped 12× (since 09:00 UTC, last 10:15 UTC) — only 3.1 GB free on / (floor 5 GB, …)`.
+    /// One last stopped while it wrote says so, and that it's tried again: each run starts it anew
+    /// — rsync keeps what it copied, a file it was writing starts over — and the watch stops it
+    /// again at the floor, until there's room (review #42: left so, rather than remembering what
+    /// it needed; this line, failing the health check, is how the operator hears of it).
     pub fn line(&self, now: u64) -> String {
         let times = if self.count == 1 {
             format!("at {}", when(self.last, now))
         } else {
             format!("{}× (since {}, last {})", self.count, when(self.first, now), when(self.last, now))
         };
+        if self.why.contains(WHILE_COPYING) {
+            let verb = if self.count == 1 { "stopped" } else { "skipped or stopped" };
+            return format!(
+                "✗ {}: {} {verb} {times} — {}; each run tries it again (from where it stopped) until there's room",
+                self.pod, self.what, self.why
+            );
+        }
         format!("✗ {}: {} skipped {times} — {}", self.pod, self.what, self.why)
     }
 }

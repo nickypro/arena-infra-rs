@@ -26,6 +26,13 @@ pub(crate) fn floor(cfg: &Config) -> Result<Option<Floor>> {
     core_disk::floor_bytes(cfg).map(|b| Some(Floor::control(b))).map_err(|e| anyhow::anyhow!(e))
 }
 
+/// replace/migrate's look at [`floor`] before they create anything: their copy via local staging
+/// needs it, and a bad value found only there — after the new pod was created and set up — left
+/// that pod billing (review #42). `Some(why)` when it's invalid; nothing to say otherwise.
+pub(crate) fn floor_refusal(cfg: &Config, what: &str) -> Option<String> {
+    floor(cfg).err().map(|e| format!("{e} — not starting the {what}: its copy via local staging needs it (fix it, or unset it for the default)"))
+}
+
 /// Judge a run's copies onto this box together ([`core_disk::Ledger`]): each copy (a pod) with
 /// the destinations it writes and their sizes, against what other arena runs' copies under way
 /// hold ([`core_disk::Reservations`], in the state root: every cohort's runs as this user). The

@@ -59,9 +59,13 @@ fn the_floor_is_whole_gb_from_zero_with_a_default_of_five() {
 fn a_copy_goes_only_when_it_leaves_the_floor_free() {
     let cases: &[(u64, u64, Size, u64, Option<&str>)] = &[
         // Prod on 2026-10-30: 3.1 GB free, the default floor.
-        (3_100_000_000, 0, Size::First, 5, Some("only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB)")),
+        // Under the floor, it says what the copy would take in all: how much to free.
+        (3_100_000_000, 0, Size::First, 5, Some("only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB): this copy (~3 GB, a first copy, not measured) + the floor = 8 GB needed")),
         (3_100_000_000, 0, Size::Later, 5, Some("only 3.1 GB free on /")),
-        (3_100_000_000, 0, Size::Measured(0), 5, Some("only 3.1 GB free on /")),
+        (3_100_000_000, 0, Size::Measured(3_900_000_000), 5, Some("only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB): this copy (~3.9 GB, measured) + the floor = 8.9 GB needed")),
+        (3_100_000_000, 2 * G, Size::Measured(3_900_000_000), 5, Some(": this copy (~3.9 GB, measured) + ~2 GB for other copies under way + the floor = 10.9 GB needed")),
+        // Nothing sized (the staging under the floor already: not sized): how far below the floor.
+        (3_100_000_000, 0, Size::Measured(0), 5, Some("only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB): 1.9 GB short of the floor before any copy")),
         // Above the floor, but not with the copy on top.
         (7 * G, 0, Size::First, 5, Some("7 GB free on /, and this copy (~3 GB, a first copy, not measured) would leave less than the floor (5 GB, CONTROL_MIN_FREE_GB)")),
         (6 * G, G / 2, Size::Measured(G), 5, Some("this copy (~1 GB, measured) after ~0.5 GB for other copies under way would leave less")),
@@ -93,7 +97,10 @@ fn a_copy_goes_only_when_it_leaves_the_floor_free() {
     assert!(skip.to_string().starts_with("skipped: only 3.1 GB free on / (floor 5 GB"), "{skip}");
     // Another floor names its own key.
     let reap = Floor { bytes: 20 * G, key: "REAP_MIN_FREE_GB" };
-    assert!(judge(&fs(1, "/srv", G), 0, &Need::from(Size::InFloor), reap).unwrap_err().reason.ends_with("(floor 20 GB, REAP_MIN_FREE_GB)"));
+    assert_eq!(
+        judge(&fs(1, "/srv", G), 0, &Need::from(Size::InFloor), reap).unwrap_err().reason,
+        "only 1 GB free on /srv (floor 20 GB, REAP_MIN_FREE_GB): 19 GB short of the floor before any copy"
+    );
     assert_eq!(Floor::control(5 * G).max(reap), reap);
     assert_eq!(reap.max(Floor::control(30 * G)), Floor::control(30 * G));
     let unknown = Skip::unknown(Path::new("/x"), "gone");
@@ -427,6 +434,17 @@ fn skips_are_counted_per_pod_and_kind_and_forgotten() {
         "✗ alpha: copy skipped 2× (since 09:00 UTC, last 10:15 UTC) — only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB)"
     );
     assert!(s.entries[1].line(now).starts_with("✗ bravo: staging skipped at 10:15 UTC — "));
+    // A copy stopped while it wrote (the watch): said so, and that the next runs try it again.
+    let stop = Skip::under_floor_now(&fs(1, "/", 4_900_000_000), floor(5));
+    let mut t = Skips::default();
+    t.add(&[("carol".into(), "copy".into(), stop.reason.clone())], t0 + 10 * 3600);
+    assert_eq!(
+        t.entries[0].line(now),
+        "✗ carol: copy stopped at 10:00 UTC — only 4.9 GB free on / while copying (floor 5 GB, CONTROL_MIN_FREE_GB); each run \
+         tries it again (from where it stopped) until there's room"
+    );
+    t.add(&[("carol".into(), "copy".into(), stop.reason)], t0 + 10 * 3600 + 900);
+    assert!(t.entries[0].line(now).starts_with("✗ carol: copy skipped or stopped 2× (since 10:00 UTC, last 10:15 UTC) — only 4.9 GB"), "{}", t.entries[0].line(now));
     assert_eq!(s.recent(now).len(), 2);
     // A day without one: not recent; the next one starts a new count.
     let next_day = t0 + 10 * 3600 + 900 + SKIP_WINDOW_SECS;
