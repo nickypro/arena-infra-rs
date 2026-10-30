@@ -2282,16 +2282,19 @@ live (2/5/10/20/60s). Provider via `ARENA_PROVIDER` (default `runpod`), config v
 **Columns**: a provider badge (`R`/`V`/`H`), NAME (short `apple` by default; `s` toggles full
 `arena8-apple` and the choice persists to `~/.config/arena-tui/prefs`), STATUS, a **SET** health
 glyph (`✓/✗/·` for `~/.name`, the deploy key, git origin→GitHub), GPU (live from `nvidia-smi`, e.g.
-`2×RTX A4000` — the provider list API omits this), GPU%/MEM/TEMP, **BRANCH** (autocommit branches
+`2×RTX A4000 16G` — the provider list API omits this; a MIG slice by its own name, `1×B300 MIG 34G`,
+not the parent card nvidia-smi names), GPU%/MEM/TEMP, **BRANCH** (autocommit branches
 shortened to their `w1d2` label; `main`/others shown as-is), and progress. **RTT** is the round trip
 from this box — where the proxy runs — to the pod's SSH endpoint: one TCP connect, timed alongside
 the SSH probes (never before the rows are shown), at most once a minute per endpoint (each is a
 connect closed before any SSH, which OpenSSH ≥ 9.8 counts against the box; once a minute keeps even
 several dashboards far from its limit); green under 60 ms, yellow under 120, red beyond, `-` when
 not timed yet or no answer. The detail pane's `where:` line has it beside where the pod runs
-(`EUR-IS-1`, `Czechia, CZ`, `nbg1 (Nuremberg, DE)`). Below ~111 columns (or in the detail view's
-split) TEMP, RTT, MEM, BRANCH and DISK drop out in that order, so NAME/STATUS/GPU/$/H/HEALTH/PROXY
-stay whole down to 73 columns.
+(`EUR-IS-1`, `Czechia, CZ`, `nbg1 (Nuremberg, DE)`). Below 107 columns (or in the detail view's
+split) TEMP, RTT, MEM, BRANCH and DISK drop out in that order, so NAME/STATUS/GPU/$/H/HLTH/PROXY
+stay whole down to 69 columns; above it `💾` SAVED (from 112), AI$ (122, with an OpenRouter key), the
+GPU's `RTX ` (124), full names (130) and CPU%/RAM% (140) come in, each whole, then the graphs
+(`crates/tui/src/columns.rs` has the order).
 
 ### Fleet columns from the core snapshot
 
@@ -2300,12 +2303,16 @@ snapshot`'s builder) over the per-provider listing, the local proxy file and the
 these read exactly as the CLI prints them: `$/H` (provider currency, `-` unless billing), an **M**
 badge for a host maintenance window (detail pane: window + note) — else **L** for a locked pod
 (detail pane: `status: … · locked`; restart/stop/terminate on it are refused with the unlock hint,
-and the dashboard never unlocks), **HEALTH** = the last `pods test --deep` verdict + age (`pass
-12m`, `fail 2h`; detail pane: worst issue + the failing check's text), **PROXY** = the stable port,
-green live / yellow stale (`:9501 stale` when wide), `-` no forward, `?` remote proxy. The **summary
-bar** is `pods list`'s footer (`$` and Hetzner `€` kept apart, unpriced pods counted) plus per day,
-**led** by a yellow `⚠ vast failed to list — its pods (and their cost) are missing` when a provider
-didn't answer (first, so a narrow terminal can't cut it off), and ending with the account prepaid
+and the dashboard never unlocks), **HLTH** = the last `pods test --deep` verdict as a glyph + its age
+(`✓12m` pass, `!5h` warn, `✗2h` fail, `·` skipped, `…` checking, `-` never; detail pane: `fail 2h
+GPU error` + the failing check's text), **PROXY** = the stable port, green live, yellow with a `!`
+when stale (`9501!`; detail pane: `:9501 stale (arena proxy apply re-points it)`), `-` no forward,
+`?` remote proxy, **💾** = when the repo was last committed (`↑` unpushed, `↓` behind, `⇕`
+diverged). The **top line** is the fleet in short — pods, GPUs and util, unreachable, the burn
+(`$` and Hetzner `€` kept apart, unpriced pods counted), balances, AI today — **led** by a yellow
+`⚠ vast failed to list — pods/cost missing` when a provider didn't answer (first, so a narrow
+terminal can't cut it off); the provider and config only when not the default, at its right. The
+info panel (`i`) has `pods list`'s footer word for word plus per day. It ends with the account prepaid
 balances (`arena balance`'s views, observed in the details round — at most one live read per account
 per 5 min — and recorded in the CLI's state file; a low account moves to the front in yellow, a
 critical one in red, with its amount: `‼ runpod $1.20 ≈1.9d`; an unfunded opt-in account with
@@ -2314,11 +2321,13 @@ most one list per provider; the details query (GPU/$/maintenance) runs every 60 
 apart); one that fails part-way still shows what it filled (as `pods list` does) over the last good
 answer, with a footer warning.
 
-**Rate limits.** The footer shows each provider's API requests in the last minute and what its
-quota has left this minute (`RunPod API 13/min · 47/60 left this minute`). A provider call waits at
+**Rate limits.** The footer's status shows the providers' API requests in the last minute (`✓ API
+13/min`); the info panel shows each one's and what its quota has left this minute (`RunPod API
+13/min · 47/60 left this minute`). A provider call waits at
 most 2 s for a rate limit. A listing that comes back rate-limited keeps that provider's last rows,
 and the dashboard stops listing for the API's own wait (else 5 s, doubling to 5 min). The SSH
-probes keep the refresh cadence, and the footer says `⚠ RunPod rate limit: listing again in 12 s`.
+probes keep the refresh cadence, and the footer says `⚠ RunPod rate limit` (the info panel: `…:
+listing again in 12 s`).
 `r` doesn't list through that wait, and the details query waits too. When a window's quota is low
 (a quarter or less left, or 10 when the quota isn't reported), listings are spread to half of
 what's left over the time to its reset (`⚠ RunPod quota low (minute window): listing every 10 s`);
@@ -2326,8 +2335,8 @@ what's left over the time to its reset (`⚠ RunPod quota low (minute window): l
 
 ### Deep checks and marked sets
 
-**`d`** deep-checks the cursor pod (or the marked set) **in the background** — no modal; the row
-says `checking`, the footer reports the tally when done, and the verdicts go to the same health
+**`d`** deep-checks the cursor pod (or the marked set) **in the background** — no modal; the row's
+HLTH says `…`, the footer reports the tally when done, and the verdicts go to the same health
 cache `arena snapshot` reads. **`D`** deep-checks every running pod whose GPUs it has read and found no one using: the
 first press says how many and names the busy ones it leaves out (any GPU with a compute process,
 over 5% — the reaper's idle line — or holding over 1 GiB: a deep check loads the GPUs for about a
@@ -2335,7 +2344,7 @@ minute and on a busy one reads as a failure), and counts those it leaves out as 
 metrics so far), whose GPUs couldn't be read (the read failed, or `nvidia-smi` gave no GPU or no
 utilization: a pod too loaded to answer must not look idle — `d` checks one on purpose) or
 CPU-only (Hetzner, or 0 GPUs listed: always a fail). A second `D` within 5 s starts the pods the
-first press counted that still qualify — never one a refresh added in between. In HEALTH, a pass older than 26 hours is grey: it says little about today (the
+first press counted that still qualify — never one a refresh added in between. In HLTH, a pass older than 26 hours is grey: it says little about today (the
 daily `cron install --health` keeps it fresh; the two hours absorb its drift). **`/`** marks pods with the CLI's selector syntax (`alpha..delta`,
 ids, `-x`/`!name`, `--on`, `--gpus`); a typo marks nothing and leaves the marks as they were, saying
 why in the footer; a valid one replaces the marks. Marks are per `provider:id` (a Vast and a Hetzner
@@ -2369,7 +2378,12 @@ action with `timed out after …`; only `c` (your interactive shell) is a plain 
 ### Navigating
 
 **Navigate** with `↑/↓`/`j/k`; `enter` opens a per-pod detail pane (per-GPU breakdown, full
-branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit. A hangup or a TERM ends it at
+branch/origin/health, util/temp **sparklines**; labels dim, each value in the colour the table gives
+its state). The footer is `☰ <status> ⟳7s · 5s` (refreshed 7 s ago, every 5 s) and the most-used
+keys; **`i`**, or a click on the `☰`, opens the **info panel**: provider, config, the whole status,
+deep checks running, the fleet's summary word for word, each prepaid account, the OpenRouter credit
+and keys at their cap, every key, and what each column's glyphs mean (Esc or `i` closes it).
+`Ctrl-C`/`q` quit. A hangup or a TERM ends it at
 once (exit status 129 or 143), and so does its terminal hanging up (a dropped SSH session, a killed
 tmux server: 129) — never waiting on its event loop, which a dead terminal stalls. However it ends,
 nothing new is started from then on, the terminal is put back first (as far as it can be; not while
@@ -2404,8 +2418,13 @@ reads stay reads.
 or awaited, so stepping across providers with `←→` is instant (it used to list the whole fleet on
 every provider change, about a second each with the dashboard frozen). `↑↓` moves between fields:
 the provider (those with an API key), RunPod's cloud tier (`COMMUNITY`, `SECURE`, or `COMMUNITY →
-SECURE` to fall back), the type, GPUs per pod, disk, volume, `--check`, and how many pods (the
-free names as of the last refresh — `up` lists the fleet again and picks its own). The type is a
+SECURE` to fall back), the type, GPUs per pod, disk, volume, `--check`, **retry**, and how many pods
+(the free names as of the last refresh — `up` lists the fleet again and picks its own). Retry is
+what `up` does when nothing is free: `off` (once, the default), or keep trying every minute for up
+to `10 min`, `30 min`, `2 h` or `24 h` (`--retry-mins N`; each round tries every option, near the
+proxy first, for the confirmed names only, and none starts past the window). `--keep-trying` isn't
+used: it gives up after an hour whatever it says, takes one GPU type and tier only, drops the
+near-the-proxy preference, and its waits don't hear Ctrl+C. The type is a
 GPU type, or on Hetzner the **server type** (`HETZNER_SERVER_TYPE`, default `cx33`, first; each with
 its vCPUs, RAM and €/h) — there are no GPU, disk or volume fields there. The choices come from the
 provider's live catalogue, read once in the background by `arena offers` (RunPod: every type it
@@ -2426,7 +2445,9 @@ installed beside `arena-tui`, never one from `PATH`. It runs in the background:
   way)` while one runs, and the tally when it ends (`✗ pods up: exit 1 — 1 ready, 1 failed`). A
   created pod shows as a `pending` row at once.
 - **`s`** in the panel sends the run Ctrl+C (SIGINT to its process group): `up` stops where it is
-  and terminates nothing.
+  and terminates nothing. A retrying run says so in the panel and the footer (`waiting for capacity
+  until 14:35 UTC`); `s` between two rounds ends its retries at once (`interrupted — stopping
+  retries`), keeping what was made.
 - Its output is also in a file of its own under the state directory (`runs/`, the newest 30
   kept). It isn't a pipe, and the run is in a process group of its own, so it outlives the
   dashboard: **quitting while a run that changes pods is going asks first** — leave it running (the

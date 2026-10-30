@@ -280,25 +280,23 @@ every few seconds. Every action on a pod asks first; restart, stop and terminate
 name typed back.
 
 ```text
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│arena-infra-rs dashboard · provider: runpod · ./config.env                                                            │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- 5 pods · 6 GPUs · mean util 54% · fleet: $1.17/h across 5 billing pod(s) ≈ $28.08/day  ·  balance: runpod $214.30 ≈7.6d
+ 5 pods · 5 GPUs 45% · $1.62/h · runpod $214.30 ≈7.6d                                                      ./config.env
 ┌Pods──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│    P NAME       STAT M SET  GPU              GPU%  MEM       TEMP DISK      $/H     HEALTH   PROXY  BRANCH SAVED     │
-│▶   R apple      run    ✓✓✓✓ 1×RTX A4000 16G  87%   10/16G    71C  40/98G    $0.17   pass 12m :9500  w1d2   4m        │
-│    R bloom      run    ✓✓✓✓ 1×RTX A4000 16G  0%    1/16G     34C  40/98G    $0.17   pass 50m :9501  w1d2   13m       │
-│    V cedar      run    ✓✓✓✓ 1×RTX 3090 24G   0%    0/24G     30C  40/98G    $0.22   fail 2h  :9502  w1d2   3h        │
-│    R delta      run  L ✓✓✓✓ 1×RTX A4000 16G  42%   7/16G     63C  40/98G    $0.17   pass 15m :9503  main   8m        │
-│    R ember      run    ✓✓✓✓ 2×RTX 3090 24G   98%   45/48G    78C  40/98G    $0.44   pass 10m :9504  w1d2   2m        │
+│    P NAME             STAT M SET  GPU              GPU% MEM       TEMP DISK      $/H    HLTH  PROXY RTT   BRANCH 💾  │
+│▶   R apple            run    ✓✓✓✓ 1×RTX A4000 16G  87%  10/16G    71C  40/98G    $0.17  ✓12m  9500  -     w1d2   4m  │
+│    R bloom            run    ✓✓✓✓ 1×RTX A4000 16G  0%   1/16G     34C  40/98G    $0.17  ✓50m  9501  -     w1d2   13m │
+│    V cedar            run    ✓✓✓✓ 1×RTX 3090 24G   0%   0/24G     30C  40/98G    $0.22  ✗2h   9502! -     w1d2   3h  │
+│    R delta            run  L ✓✓✓✓ 1×RTX A4000 16G  42%  7/16G     63C  40/98G    $0.17  ✓15m  9503  -     main   8m  │
+│    R ember            run    ✓✓✓✓ 1×B300 MIG 34G   98%  -         78C  40/98G    $0.89  ✓10m  9504  -     w1d2   2m  │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- · updated 0s ago · every 5s · [q] quit  [enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A]
+☰ ✓ API 6/min ⟳0s · 5s  [q] quit  [i] info  [enter] detail  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?
 ```
 
 <sup>A made-up fleet, drawn by the dashboard's own renderer from test fixtures.</sup>
 `a` acts on the selected pod, `A` on the fleet, `d`/`D` deep-check it/all, `n` adds pods, and `?` asks
-claude or codex about the pod ([`pods ask`](docs/REFERENCE.md#pods-ask)).
+claude or codex about the pod ([`pods ask`](docs/REFERENCE.md#pods-ask)). `i` (or a click on `☰`)
+opens the info panel: everything the two bars leave out, every key, and what the glyphs mean.
 [All the keys and columns](docs/REFERENCE.md#the-dashboard-arena-tui).
 
 ## The proxy

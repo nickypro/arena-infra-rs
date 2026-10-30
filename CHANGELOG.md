@@ -91,6 +91,33 @@ earlier).
 - replace/migrate's local staging now keeps `CONTROL_MIN_FREE_GB` free (before: a tenth of the
   disk, at least 5 GB).
 
+## 2026-10-30 · A more compact dashboard, an info panel, retry in the add-pod form; `B300 MIG`
+- The dashboard's top is one short line: pods, GPUs and their util, unreachable pods, the burn
+  (`$14.80/h + €0.048/h`), balances with their runway, AI spent today and the credit left.
+  Warnings still lead it in their colours (a provider that failed to list, a low balance, AI keys
+  at their cap). The provider and config show at its right only when they aren't the default.
+- The footer is `☰ ✓ API 13/min ⟳7s · 5s` (status, refreshed 7 s ago, every 5 s; a spinner
+  while refreshing) and the most-used keys, pairs merged (`[a/A] act/all`, `[d/D] deep`). `i`, or
+  a click on the `☰`, opens an **info panel** with everything else: provider, config, the whole
+  status, deep checks running, the fleet's full summary, each balance, the AI credit and keys at
+  their cap, every key, and what each column's glyphs mean. Notices, a run going and a `?`
+  question still lead the footer.
+- Narrower columns: HEALTH is `HLTH` (`✓12m` pass, `!5h` warn, `✗2h` fail, `…` checking); PROXY
+  is the port, `9501!` when stale; SAVED's header is `💾`. The width they free brings columns in
+  sooner: every mid column from 107 columns (was 111), `💾` from 112 (was 114), CPU%/RAM% from 140
+  (was 152), all of them whole.
+- MIG slices are named `<model> MIG <memory>` everywhere: the dashboard's GPU column said
+  `1×B300 SXM6 AC` (nvidia-smi's name for the parent card) and now says `1×B300 MIG 34G`; a deep
+  check's GPU (`pods test`, HEALTH's detail), `arena snapshot` and a listing read without RunPod's
+  details say `1×B300 MIG 34GB` too, as `pods list` and `up` already did (was `1×B300 SXM6 AC MIG
+  1g.34gb`). Any `… MIG <n>g.<m>gb` slice reads the same way (A100, H100, H200, B200 …).
+- The detail view (Enter) is in colour: labels dim, each value in the tone the table gives it
+  (status, health, proxy, backup/sync, disk, CPU/RAM, maintenance, lock, AI spend, errors).
+- The add-pod form (`n`) has a **retry** field: when nothing is free, `up` tries again every
+  minute for up to 10 min, 30 min, 2 h or 24 h (`--retry-mins`; off by default). The confirm says
+  until when; the runs panel and the footer say it's waiting for capacity; `s` in the panel stops
+  the retries between rounds, keeping what was made.
+
 ## 2026-10-30 · VS Code's memory-saving settings on small machines, and a git identity from setup
 - Setup writes VS Code's memory-saving machine settings (`~/.vscode-server/data/Machine/settings.json`)
   on every Hetzner VM, and on any other machine with under 20 GiB of RAM: Pylance's indexing off,

@@ -45,19 +45,64 @@ fn has_count_prefix(s: &str) -> bool {
     }
 }
 
-/// The GPU column: `{count}×{type}` (e.g. `1×RTX A4000`), falling back to just the type
-/// (Hetzner reuses `gpu_type` for its CPU server type, e.g. `cx23`), `{count}×GPU` when only
-/// the count is known, or `-`. A zero count (CPU pod) is treated as unknown.
+/// The GPU column: `{count}×{type}` (e.g. `1×RTX A4000`, a MIG slice `1×B300 MIG 34GB`:
+/// [`gpu_name`]), falling back to just the type (Hetzner reuses `gpu_type` for its CPU server
+/// type, e.g. `cx23`), `{count}×GPU` when only the count is known, or `-`. A zero count (CPU
+/// pod) is treated as unknown.
 pub fn gpu_label(pod: &Pod) -> String {
     let ty = pod.gpu_type.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let count = pod.gpu_count.filter(|&n| n > 0);
     match (ty, count) {
         (Some(t), _) if has_count_prefix(t) => t.to_string(),
-        (Some(t), Some(n)) => format!("{n}×{}", normalize_gpu_name(t)),
-        (Some(t), None) => normalize_gpu_name(t),
+        (Some(t), Some(n)) => format!("{n}×{}", gpu_name(t)),
+        (Some(t), None) => gpu_name(t),
         (None, Some(n)) => format!("{n}×GPU"),
         (None, None) => "-".to_string(),
     }
+}
+
+/// A GPU type as every surface names it: a MIG slice as [`mig_label`] (`NVIDIA B300 SXM6 AC MIG
+/// 1g.34gb` → `B300 MIG 34GB`), anything else minus its vendor ([`normalize_gpu_name`]). Pure.
+pub fn gpu_name(raw: &str) -> String {
+    mig_label(raw).unwrap_or_else(|| normalize_gpu_name(raw))
+}
+
+/// A MIG slice's short name, `<model> MIG <memory>GB`, as RunPod's catalog names its slices
+/// (`NVIDIA B300 SXM6 AC MIG 1g.34gb` → `B300 MIG 34GB`; `NVIDIA RTX PRO 6000 Blackwell Server
+/// Edition MIG 2g.48gb` → `PRO 6000 MIG 48GB`; any `… MIG <n>g.<m>gb`: A100, H100, H200, B200 …).
+/// `None` unless `raw` names one ([`mig_slice`]). Pure.
+pub fn mig_label(raw: &str) -> Option<String> {
+    mig_slice(raw).map(|(model, gb)| format!("{model} MIG {gb}GB"))
+}
+
+/// A MIG slice read off its name: the parent card's model — its name minus the vendor and `RTX`,
+/// up to the first form-factor/edition/memory word — and the slice's memory in GB. Takes the
+/// provider's id or torch's name (`NVIDIA B300 SXM6 AC MIG 1g.34gb`, `NVIDIA A100-SXM4-40GB MIG
+/// 1g.5gb`) and the catalog's own short name (`B300 MIG 34GB`) alike: `("B300", 34)`,
+/// `("A100", 5)`. `None` for a name that isn't a slice or can't be read that way (`MIG 1g`, no
+/// model). Checked against every MIG entry of the recorded RunPod catalog. Pure.
+pub fn mig_slice(raw: &str) -> Option<(String, u32)> {
+    let words: Vec<&str> = raw.split_whitespace().collect();
+    let at = words.iter().position(|w| w.eq_ignore_ascii_case("mig"))?;
+    // `1g.34gb` (a profile: its memory after the dot) or `34GB` (the catalog's name).
+    let mem = words.get(at + 1)?.to_ascii_lowercase();
+    let mem = mem.rsplit_once('.').map_or(mem.as_str(), |(_, m)| m);
+    let gb: u32 = mem.strip_suffix("gb")?.parse().ok()?;
+    let edition = |w: &str| {
+        let w = w.to_ascii_lowercase();
+        ["sxm", "pcie", "hbm", "nvl"].iter().any(|p| w.starts_with(p))
+            || ["ac", "blackwell", "server", "workstation", "edition"].contains(&w.as_str())
+            || w.strip_suffix("gb").is_some_and(|n| n.parse::<u32>().is_ok())
+    };
+    let parent = normalize_gpu_name(&words[..at].join(" "));
+    let model: Vec<&str> = parent
+        .split_whitespace()
+        .flat_map(|w| w.split('-'))
+        .filter(|w| !w.is_empty())
+        .skip_while(|w| w.eq_ignore_ascii_case("rtx"))
+        .take_while(|w| !edition(w))
+        .collect();
+    (!model.is_empty()).then(|| (model.join(" "), gb))
 }
 
 /// The $/H column: the pod's hourly price in its provider's currency — `-` if unknown, or
@@ -420,10 +465,47 @@ mod tests {
             (None, Some(4), "4×GPU"),
             (Some("  "), None, "-"),
             (None, None, "-"),
+            // A MIG slice by RunPod v2's id (what a listing has) or the catalog's name: the
+            // same short name (the human, 2026-10-30: "B300 SXM6 AC -> B300 MIG").
+            (Some("NVIDIA B300 SXM6 AC MIG 1g.34gb"), Some(1), "1×B300 MIG 34GB"),
+            (Some("B300 MIG 34GB"), Some(1), "1×B300 MIG 34GB"),
+            (Some("NVIDIA H100 80GB HBM3 MIG 3g.40gb"), Some(2), "2×H100 MIG 40GB"),
         ];
         for (ty, n, want) in cases {
             assert_eq!(gpu_label(&mk(*ty, *n)), *want, "{ty:?} {n:?}");
         }
+    }
+
+    /// Every `… MIG <n>g.<m>gb` id, whatever the card — and the catalog's short name, and
+    /// torch's — reads as `<model> MIG <m>GB`; anything else isn't a slice.
+    #[test]
+    fn mig_slices_are_named_by_model_and_memory() {
+        let cases: &[(&str, Option<(&str, u32)>)] = &[
+            ("NVIDIA B300 SXM6 AC MIG 1g.34gb", Some(("B300", 34))),
+            ("NVIDIA B200 MIG 1g.23gb", Some(("B200", 23))),
+            ("NVIDIA H100 80GB HBM3 MIG 3g.40gb", Some(("H100", 40))),
+            ("NVIDIA H100 NVL MIG 1g.12gb", Some(("H100", 12))),
+            ("NVIDIA H200 MIG 1g.18gb", Some(("H200", 18))),
+            ("NVIDIA H200 NVL MIG 2g.35gb", Some(("H200", 35))),
+            ("NVIDIA A100-SXM4-80GB MIG 1g.10gb", Some(("A100", 10))),
+            ("NVIDIA A100 80GB PCIe MIG 7g.80gb", Some(("A100", 80))),
+            ("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb", Some(("PRO 6000", 48))),
+            ("B300 MIG 34GB", Some(("B300", 34))),
+            ("PRO 6000 MIG 24GB", Some(("PRO 6000", 24))),
+            ("NVIDIA b300 sxm6 ac mig 1g.34gb", Some(("b300", 34))),
+            ("NVIDIA B300 SXM6 AC MIG 1g", None),
+            ("NVIDIA B300 SXM6 AC", None),
+            ("MIG 1g.24gb", None),
+            ("NVIDIA Migrator X", None),
+            ("RTX A4000", None),
+        ];
+        for (raw, want) in cases {
+            let got = mig_slice(raw);
+            assert_eq!(got.as_ref().map(|(m, g)| (m.as_str(), *g)), *want, "{raw}");
+            assert_eq!(mig_label(raw), want.map(|(m, g)| format!("{m} MIG {g}GB")), "{raw}");
+        }
+        assert_eq!(gpu_name("NVIDIA B300 SXM6 AC MIG 1g.34gb"), "B300 MIG 34GB");
+        assert_eq!(gpu_name("NVIDIA GeForce RTX 3090"), "RTX 3090", "not a slice: minus the vendor");
     }
 
     /// The ENDS column sits before MAINT, and only when given (one label per pod).
