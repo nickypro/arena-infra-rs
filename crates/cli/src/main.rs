@@ -17674,8 +17674,18 @@ mod selection_tests {
         let c = full(&["pods", "up", "--add", "2", "--server-type", "cx23", "--yes"]);
         assert!(c.yes && matches!(&c.cmd, Cmd::Pods(PodCmd::Up { add: Some(2), server_type: Some(t), dry_run: false, .. }) if t == "cx23"));
         let up = ["pods", "up", "--add", "1", "--gpu", "NVIDIA RTX A4000", "--gpus", "2", "--cloud", "COMMUNITY,SECURE", "--disk", "100", "--volume", "0", "--check", "--yes"];
-        let Cmd::Pods(PodCmd::Up { gpu, gpus, cloud, disk, volume, check, .. }) = full(&up).cmd else { panic!() };
+        let Cmd::Pods(PodCmd::Up { gpu, gpus, cloud, disk, volume, check, retry_mins: 0, keep_trying: false, .. }) = full(&up).cmd else { panic!() };
         assert_eq!((gpu.as_deref(), gpus, cloud.as_deref(), disk, volume, check), (Some("NVIDIA RTX A4000"), Some(2), Some("COMMUNITY,SECURE"), Some(100), Some(0), true));
+        // The form's retry field: `--retry-mins N` before `--yes`, on any provider; rounds a
+        // minute apart (`--retry-secs`' default), never `--keep-trying`.
+        for mins in ["10", "30", "120", "1440"] {
+            let c = full(&["pods", "up", "--add", "1", "--server-type", "cx23", "--retry-mins", mins, "--yes"]);
+            let Cmd::Pods(PodCmd::Up { retry_mins, retry_secs: 60, keep_trying: false, .. }) = c.cmd else { panic!("{mins}") };
+            assert!(c.yes && retry_mins.to_string() == mins, "{mins}");
+            let gpu = ["pods", "up", "--add", "2", "--gpu", "NVIDIA RTX A4000", "--gpus", "1", "--cloud", "COMMUNITY", "--disk", "100", "--volume", "0", "--retry-mins", mins, "--yes"];
+            let Cmd::Pods(PodCmd::Up { retry_mins, add: Some(2), .. }) = full(&gpu).cmd else { panic!("{mins}") };
+            assert_eq!(retry_mins.to_string(), mins);
+        }
         let Cmd::Offers { gpu, cloud, gpus, server_type, json: true, .. } = full(&["offers", "--json", "--gpu", "NVIDIA RTX A4000", "--cloud", "SECURE", "--gpus", "1"]).cmd else { panic!() };
         assert_eq!((gpu.as_deref(), cloud.as_deref(), gpus, server_type), (Some("NVIDIA RTX A4000"), Some("SECURE"), Some(1), None));
         let Cmd::Offers { server_type, json: true, .. } = full(&["offers", "--json", "--server-type", "cx33"]).cmd else { panic!() };
@@ -22852,6 +22862,28 @@ mod placement_cli_tests {
             // It gave up right after the last round — no sleep just to give up.
             assert_eq!(started.elapsed(), std::time::Duration::from_secs(secs * (want as u64 - 1)), "{mins}/{secs}");
         }
+    }
+
+    /// The dashboard's add-pod form retries with `--retry-mins` up to a day (the human,
+    /// 2026-10-30: "an auto-retry option"), and its runs panel's `[s]` sends Ctrl+C: between two
+    /// rounds that stops the retries at once — no round after it, nothing made, the run going on
+    /// to its end with what it has — however long the window had left.
+    #[tokio::test(start_paused = true)]
+    async fn ctrl_c_between_rounds_ends_a_day_long_retry_window_at_once() {
+        let fake = Recorder::dry(&["NVIDIA RTX A4000"]);
+        let (config, ov, ctrl_c) = (cfg(), SpecOverrides::default(), Interrupt::manual());
+        let started = tokio::time::Instant::now();
+        let press = async {
+            tokio::time::sleep(std::time::Duration::from_secs(150)).await;
+            ctrl_c.press();
+        };
+        let (made, ()) = tokio::join!(
+            create_with_retry(&fake, &config, vec!["arena8-apple".into()], 0, &ov, false, 1440, 60, &ctrl_c, NO_STREAM),
+            press
+        );
+        assert!(made.unwrap().is_empty());
+        assert_eq!(fake.calls().len(), 3, "rounds at t = 0, 60, 120; none after the press");
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(150), "stopped at the press, not at the next round");
     }
 
     /// RunPod with every create dry until `wet_at`, next to a Vast that's throttled for the
