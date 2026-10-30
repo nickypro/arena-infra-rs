@@ -201,6 +201,9 @@ impl Skip {
 
 /// What a stopped copy's reason says ([`Skip::under_floor_now`]), as the skip record tells one.
 const WHILE_COPYING: &str = " while copying ";
+/// The skip record's kinds a scheduled run tries again (the backup's copies, the reaper's) — not
+/// replace/migrate's staging or a baseline, which an operator re-runs.
+const RETRIED: [&str; 2] = ["copy", "reap backup"];
 
 /// The judge (pure): a copy needing `need` may start on `fs` when what's free, less `already`
 /// (what this run's earlier copies and other runs' copies under way there may take) and `need`,
@@ -216,7 +219,7 @@ pub fn judge(fs: &Fs, already: u64, need: &Need, floor: Floor) -> Result<(), Ski
     let reason = if fs.free < floor.bytes {
         let head = format!("only {} free on {mount} (floor {}, {})", gb(fs.free), gb(floor.bytes), floor.key);
         if need.bytes == 0 && already == 0 {
-            format!("{head}: {} short of the floor before any copy", gb(floor.bytes - fs.free))
+            format!("{head}: {} short of the floor", gb(floor.bytes - fs.free))
         } else {
             let others = if already > 0 { format!(" + ~{} for other copies under way", gb(already)) } else { String::new() };
             format!("{head}: this copy ({}){others} + the floor = {} needed", need.words, gb(total))
@@ -969,10 +972,9 @@ impl SkipEntry {
         };
         if self.why.contains(WHILE_COPYING) {
             let verb = if self.count == 1 { "stopped" } else { "skipped or stopped" };
-            return format!(
-                "✗ {}: {} {verb} {times} — {}; each run tries it again (from where it stopped) until there's room",
-                self.pod, self.what, self.why
-            );
+            // Only what cron runs again (the backup's copies, the reaper's) is tried again by itself.
+            let again = if RETRIED.contains(&self.what.as_str()) { "; each run tries it again (from where it stopped) until there's room" } else { "" };
+            return format!("✗ {}: {} {verb} {times} — {}{again}", self.pod, self.what, self.why);
         }
         format!("✗ {}: {} skipped {times} — {}", self.pod, self.what, self.why)
     }

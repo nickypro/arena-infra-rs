@@ -27228,7 +27228,7 @@ mod remote_tests {
         arena_core::remote::write_test_script(&never, format!("#!/bin/sh\ntouch {}\nexit 1\n", ran.display())).unwrap();
         let e = copy_pod_files(&full, &f, &fake, src, dest, &opts(never.display().to_string())).await.unwrap_err();
         let msg = format!("{e:#}");
-        assert!(msg.contains("skipped: only ") && msg.contains("(floor 100000 GB, CONTROL_MIN_FREE_GB): ") && msg.contains("GB short of the floor before any copy"), "{msg}");
+        assert!(msg.contains("skipped: only ") && msg.contains("(floor 100000 GB, CONTROL_MIN_FREE_GB): ") && msg.contains("GB short of the floor — nothing copied; free space on "), "{msg}");
         assert!(!ran.exists(), "no rsync at all: nothing sized");
         assert!(!stage.exists());
         // A floor that can't be read fails the copy via local staging, which needs it.
@@ -30686,6 +30686,8 @@ mod lifecycle_tests {
             .unwrap_err()
             .to_string();
         assert_eq!(e, want("cut over"));
+        migrate_cutover_on(Arc::new(FakeRemote::new()), &f, &cfg, &f, "devtest-bravo", &pods, cutover(false, true), "/nonexistent").await.unwrap();
+        assert_eq!(take_would_refuse(), [format!("(without --dry-run: {})", want("cut over"))]);
         migrate_cutover_on(Arc::new(FakeRemote::new()), &f, &cfg, &f, "devtest-bravo", &pods, cutover(true, true), "/nonexistent").await.unwrap();
         assert!(take_would_refuse().is_empty(), "no final sync: no copy, no floor needed");
         assert!(f.calls().is_empty(), "{:?}", f.calls());
