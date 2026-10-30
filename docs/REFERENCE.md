@@ -2432,8 +2432,9 @@ action with `timed out after …`; only `c` (your interactive shell) is a plain 
 
 **Navigate** with `↑/↓`/`j/k`; `enter` opens a per-pod detail pane (per-GPU breakdown, full
 branch/origin/health, util/temp **sparklines**; labels dim, each value in the colour the table gives
-its state). The footer is `☰ <status> ⟳7s · 5s` (refreshed 7 s ago, every 5 s) and the most-used
-keys; **`i`**, or a click on the `☰`, opens the **info panel**: provider, config, the whole status,
+its state). The footer is `[i] info · <status> · 7s ago · every 5s` (refreshed 7 s ago, every 5 s;
+`refreshing` while it does), in plain words, and the most-used keys; **`i`**, or a click on
+`[i] info`, opens the **info panel**: provider, config, the whole status,
 deep checks running, the fleet's summary word for word, each prepaid account, the OpenRouter credit
 and keys at their cap, every key, and what each column's glyphs mean (Esc or `i` closes it).
 `Ctrl-C`/`q` quit. A hangup or a TERM ends it at
@@ -2494,7 +2495,7 @@ installed beside `arena-tui`, never one from `PATH`. It runs in the background:
 
 - **The runs panel (`p`)** shows a run's command, each pod's state from its `[created]`, stage,
   `READY` and `FAILED` lines, and the whole output (scroll with `↑↓`/PgUp/PgDn, `End` follows,
-  `←→` other runs, `Esc` hides it — the run goes on). The footer says `⟳ pods up 1m12s (1 under
+  `←→` other runs, `Esc` hides it — the run goes on). The footer says `running: pods up 1m12s (1 under
   way)` while one runs, and the tally when it ends (`✗ pods up: exit 1 — 1 ready, 1 failed`). A
   created pod shows as a `pending` row at once.
 - **`s`** in the panel sends the run Ctrl+C (SIGINT to its process group): `up` stops where it is

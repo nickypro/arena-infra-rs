@@ -290,12 +290,12 @@ name typed back.
 │    R ember            run    ✓✓✓✓ 1×B300 MIG 34G   98%  -         78C  40/98G    $0.89  ✓10m  9504  -     w1d2   2m  │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-☰ ✓ API 6/min ⟳0s · 5s  [q] quit  [i] info  [enter] detail  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?
+[i] info · ok · API 6/min · 0s ago · every 5s  [q] quit  [enter] detail  [a/A] act/all  [space/x] mark/clear  [d/D] deep
 ```
 
 <sup>A made-up fleet, drawn by the dashboard's own renderer from test fixtures.</sup>
 `a` acts on the selected pod, `A` on the fleet, `d`/`D` deep-check it/all, `n` adds pods, and `?` asks
-claude or codex about the pod ([`pods ask`](docs/REFERENCE.md#pods-ask)). `i` (or a click on `☰`)
+claude or codex about the pod ([`pods ask`](docs/REFERENCE.md#pods-ask)). `i` (or a click on `[i] info`)
 opens the info panel: everything the two bars leave out, every key, and what the glyphs mean.
 [All the keys and columns](docs/REFERENCE.md#the-dashboard-arena-tui).
 
