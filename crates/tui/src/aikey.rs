@@ -59,11 +59,10 @@ pub(crate) fn set_why(shared: &Shared, pods: &[&Pod]) -> Option<String> {
 }
 
 /// What the raise-cap box opens with: `+` the cap a new key gets (`OPENROUTER_KEY_LIMIT`, else 5:
-/// `+5`) — one more key's worth.
+/// `+5`) — one more key's worth, to the digit (`+0.001`, never a rounded `+0`).
 pub(crate) fn prefill(cfg: &Config) -> String {
     let x = cfg.get_parsed::<f64>("OPENROUTER_KEY_LIMIT").filter(|x| x.is_finite() && *x > 0.0).unwrap_or(5.0);
-    let s = format!("{x:.2}");
-    format!("+{}", s.trim_end_matches('0').trim_end_matches('.'))
+    format!("+{x}")
 }
 
 /// The `arena` arguments for the AI key's `action` on `names` (`arg`: the amount for a cap), and
@@ -116,7 +115,9 @@ pub(crate) fn limit_preview(set: &[(String, Option<KeyInfo>)], value: &str) -> R
             Err(why) if set.len() == 1 => refused.push(why),
             Err(why) => refused.push(format!("{name}: {why}")),
             Ok(p) if set.len() == 1 => {
-                let cap = |x: Option<f64>| x.map(money).unwrap_or_else(|| "no cap".into());
+                // Caps to the digit they were set to (`$1.004`): a cent's rounding could show the
+                // same cap before and after a change Enter makes (review codex r5 #3).
+                let cap = |x: Option<f64>| x.map(or::exact_money).unwrap_or_else(|| "no cap".into());
                 let spent = p.spent.map(money).unwrap_or_else(|| "?".into());
                 lines.push(format!("spent {spent} of {} {}", cap(p.before), or::period_words(p.reset_after)));
                 let mut after = format!("new cap: {}", cap(p.after));
@@ -297,6 +298,7 @@ mod tests {
         assert_eq!(prefill(&Config::parse("")), "+5");
         assert_eq!(prefill(&Config::parse("OPENROUTER_KEY_LIMIT=2.5\n")), "+2.5");
         assert_eq!(prefill(&Config::parse("OPENROUTER_KEY_LIMIT=0.10\n")), "+0.1");
+        assert_eq!(prefill(&Config::parse("OPENROUTER_KEY_LIMIT=0.001\n")), "+0.001");
         assert_eq!(prefill(&Config::parse("OPENROUTER_KEY_LIMIT=junk\n")), "+5");
     }
 
@@ -309,6 +311,7 @@ mod tests {
         let alpha = of(&["devtest-alpha"]);
         assert_eq!(limit_preview(&alpha, "+5").unwrap(), ["spent $0.42 of $5.00 this month", "new cap: $10.00"]);
         assert_eq!(limit_preview(&alpha, "5").unwrap()[1], "new cap: $5.00 (unchanged)");
+        assert_eq!(limit_preview(&alpha, "5.004").unwrap()[1], "new cap: $5.004");
         let bravo = of(&["devtest-bravo"]);
         assert_eq!(limit_preview(&bravo, "+0.05").unwrap()[1], "new cap: $5.05 — the key is paused: `o` resumes it");
         assert_eq!(limit_preview(&bravo, "+0.05").unwrap()[0], "spent $4.90 of $5.00 in all");

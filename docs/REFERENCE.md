@@ -1724,7 +1724,8 @@ preview (another operator, the dashboard: a cap, reset or on/off changed, a key 
 renamed away) or whose spend now makes the cap one it would refuse is left alone and fails the
 command — run it again. Each key is also read once more in the request just before its own change
 and refused then if it moved — renamed, raised, paused — or (a cap) has spent past the new cap
-meanwhile (OpenRouter has no conditional update; this leaves only that moment), and one of these commands changes keys at a time on a box: a lock in the state directory
+meanwhile (OpenRouter has no conditional update; this leaves only that moment); a pause whose
+machine turned up with another enabled key meanwhile names it and fails, and one of these commands changes keys at a time on a box: a lock in the state directory
 (`openrouter-keys.lock`), a second waiting up to 60 s.
 Afterwards each is checked against the keys as OpenRouter lists them (a change it answered OK for
 but didn't make fails the command; caps compared exactly, not to the cent);

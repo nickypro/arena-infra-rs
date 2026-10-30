@@ -565,6 +565,24 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
         }
         failed += usize::from(matches!(outcome, Outcome::Failed(_)));
     }
+    // A pause is of a name: a key that turned up enabled under a paused machine's name while this
+    // ran (review codex r5 #1) is said and fails the command — never a success with a key still on.
+    if let (Verb::Pause, Ok(keys)) = (&verb, &reread) {
+        let ours: Vec<&str> = done.iter().filter_map(|(r, _, _)| r.key.as_ref().map(|k| k.hash.as_str())).collect();
+        let mut machines: Vec<&str> = todo.iter().map(|r| r.machine.as_str()).collect();
+        machines.dedup();
+        let mut extra = Vec::new();
+        for m in machines {
+            let names = crate::machine_key_names(&naming, m);
+            for k in keys.iter().filter(|k| !k.disabled && !ours.contains(&k.hash.as_str()) && k.name.as_deref().is_some_and(|n| names.iter().any(|t| t == n))) {
+                let row = Row { machine: m.to_string(), key: Some(k.clone()), update: None, words: "on".into(), skip: None, note: None };
+                let why = format!("another key under its name turned up enabled while this ran — still on; `arena keys pause {m}` again");
+                extra.push((row, Outcome::Failed(why), Some(k.clone())));
+            }
+        }
+        failed += extra.len();
+        done.extend(extra);
+    }
     if json_out {
         println!("{}", serde_json::to_string_pretty(&json(&verb, false, &done, reread.as_ref().err().map(String::as_str)))?);
     } else {
@@ -869,6 +887,12 @@ mod tests {
         let api = Keys { meanwhile_on_update: Mutex::new(Some(("hc", |k| k.name = Some("devtest-delta".into())))), ..Keys::with(fleet_keys()) };
         assert_eq!(keys_cmd(&["pause", "alpha", "cloud"], &api).await.unwrap_err(), "1 key(s) failed");
         assert_eq!(api.calls(), [r#"ha {"disabled":true}"#]);
+        // A second enabled key under a later name, added while the first were paused (r5 #1): said,
+        // and the command fails.
+        let api = Keys { meanwhile_on_update: Mutex::new(Some(("hc-old", |k| k.disabled = false))), ..Keys::with(fleet_keys()) };
+        assert_eq!(keys_cmd(&["pause", "alpha", "cloud"], &api).await.unwrap_err(), "1 key(s) failed");
+        assert_eq!(api.calls(), [r#"ha {"disabled":true}"#, r#"hc {"disabled":true}"#]);
+        assert!(!api.key("hc-old").disabled, "named, not touched: it wasn't in what was confirmed");
         // Spent past the new cap meanwhile (r4 #3): a $2 cap over $3 spent is refused at its change.
         let api = Keys { meanwhile_on_update: Mutex::new(Some(("hc", |k| k.usage = Some(3.0)))), ..Keys::with(fleet_keys()) };
         assert_eq!(keys_cmd(&["limit", "alpha", "cloud", "2"], &api).await.unwrap_err(), "1 key(s) failed");
