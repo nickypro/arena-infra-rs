@@ -26,8 +26,8 @@ pub(crate) const BATCH_BUDGET: Duration = Duration::from_millis(40);
 /// second.
 pub(crate) const TICK_IDLE: Duration = Duration::from_secs(1);
 
-/// … and while something animates (a spinner, a run's output streaming, a check waiting out its
-/// debounce).
+/// … and while something moves faster than the clock (a run's output streaming, a check waiting
+/// out its debounce).
 pub(crate) const TICK_LIVE: Duration = Duration::from_millis(200);
 
 /// The longest the loop waits for input before it looks at the shared state again: how late a

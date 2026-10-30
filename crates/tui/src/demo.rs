@@ -219,7 +219,7 @@ pub(crate) fn publish(shared: &Mutex<Shared>, cfg: &Config, n: usize, round: u64
         s.history.entry(pod.name.clone()).or_default().push(util, m.and_then(|m| m.max_temp()), mem);
     }
     s.summary = summarize(&pods, &metrics);
-    s.status = RefreshStatus { short: "⚠ demo".into(), tone: Some(Tone::Warn), full: format!("demo: {n} made-up pods, nothing real") };
+    s.status = RefreshStatus { short: "demo".into(), tone: Some(Tone::Warn), full: format!("demo: {n} made-up pods, nothing real") };
     s.metrics = metrics;
     s.publish(snap);
     s.last_refresh = Some(Instant::now());
@@ -342,6 +342,6 @@ mod tests {
         assert_eq!(s.deep.running(), 1);
         assert_eq!(s.balance.len(), 2);
         assert_eq!(s.ai_cohort.as_ref().map(|c| c.capped.len()), Some(1));
-        assert_eq!(s.status.short, "⚠ demo");
+        assert_eq!(s.status.short, "demo");
     }
 }
