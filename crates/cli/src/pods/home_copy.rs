@@ -10,10 +10,11 @@ use arena_core::remote::{describe_error, Remote, PROBE_TIMEOUT};
 use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
+use crate::disk;
 use crate::pods::backup::RSYNC;
 use crate::pods::pull::clear_stale_link;
+use crate::pods::replace::{copy_marker_path, copy_marker_token, fresh_target, marker_present, target_is_pod, wait_for_endpoint};
 use crate::pods::{local_size, POD_COPY_TIMEOUT};
-use crate::{copy_marker_path, copy_marker_token, disk, fresh_target, marker_present, target_is_pod, wait_for_endpoint};
 
 /// How [`copy_pod_files`] runs: whether the destination is a pod this command just created
 /// (its replica baseline starts now — [`arena_core::replica::receiver_prepare_command`]) and, so
