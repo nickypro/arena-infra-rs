@@ -2496,7 +2496,7 @@ installed beside `arena-tui`, never one from `PATH`. It runs in the background:
 - **The runs panel (`p`)** shows a run's command, each pod's state from its `[created]`, stage,
   `READY` and `FAILED` lines, and the whole output (scroll with `↑↓`/PgUp/PgDn, `End` follows,
   `←→` other runs, `Esc` hides it — the run goes on). The footer says `running: pods up 1m12s (1 under
-  way)` while one runs, and the tally when it ends (`✗ pods up: exit 1 — 1 ready, 1 failed`). A
+  way)` while one runs, and the tally when it ends (`pods up: exit 1 — 1 ready, 1 failed`, in red). A
   created pod shows as a `pending` row at once.
 - **`s`** in the panel sends the run Ctrl+C (SIGINT to its process group): `up` stops where it is
   and terminates nothing. A retrying run says so in the panel and the footer (`waiting for capacity
@@ -2515,7 +2515,7 @@ Each pass of the loop takes **every** input event already waiting (up to 256, or
 before it draws again; it used to draw after each one, so a held key, a burst of keys or a slow
 terminal over SSH queued events faster than frames went out, and the lag grew with the queue. A
 frame is drawn when something changed — a key, a refresh or a result landing, a notice — or once a
-second for the clock (every 0.2 s while a spinner or a running command's output is on screen); the
+second for the clock (every 0.2 s while a running command's output or a pending availability check is on screen); the
 view is rendered under the shared lock and the terminal written after it's released, so a slow
 terminal never holds up the refresh. No network or SSH call is awaited in the key loop: each runs
 in a task of its own and lands through the shared state. The mouse reports clicks, drags and the

@@ -22,7 +22,7 @@ earlier).
 ## 2026-10-30 · The dashboard's bottom line is plain words
 - The footer no longer uses `☰`, `⟳`, `✓`, `⚠` or a spinner, which some terminals draw as
   pictures. It reads `[i] info · ok · API 6/min · 7s ago · every 5s` (`warn: …` in yellow, `list
-  error` in red, `refreshing` while it does, `running: pods up …` while a run goes on). Click
+  error` in red, `refreshing, last 7s ago` while it does, `running: pods up …` while a run goes on). Click
   `[i] info`, or press `i`, for the info panel as before.
 
 ## 2026-10-30 · Copies onto the control box no longer fill its disk

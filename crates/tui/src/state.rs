@@ -1484,7 +1484,7 @@ mod tests {
         assert_eq!(short_burn(&fleet::fleet_cost(&[])), "$0.00/h");
     }
 
-    /// The footer's short status: the first warning's words (yellow) and how many more; else ✓
+    /// The footer's short status: the first warning's words (yellow) and how many more; else `ok`
     /// and the API requests of the last minute; a failed listing, red; work under way, cyan.
     /// The whole line stays for the info panel.
     #[test]

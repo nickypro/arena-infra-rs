@@ -318,7 +318,8 @@ impl Run {
         parts.join(", ")
     }
 
-    /// The footer's line when it ends: `✓ pods up: 1 ready`, `✗ pods up: exit 1 — 1 failed`.
+    /// The footer's line when it ends: `pods up: 1 ready`, `pods up: exit 1 — 1 failed` (the
+    /// notice's `✓`/`✗` mark is dropped in the footer; its colour says it).
     fn notice(&self) -> (String, bool) {
         let Some((_, end)) = &self.end else { return (String::new(), false) };
         let tally = self.tally();

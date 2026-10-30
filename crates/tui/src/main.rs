@@ -883,7 +883,7 @@ async fn list_all(provider: &dyn Provider, details: &mut DetailsState) -> (Listi
 /// The footer's quota part: per provider listed, its API requests in the last minute and
 /// what its quota has left this minute ([`arena_core::ratelimit::footer`]) — from this
 /// process's own requests; nothing for a provider that sent none and reports nothing. With the
-/// requests of the last minute across them (the footer's short status, `✓ API 13/min`).
+/// requests of the last minute across them (the footer's short status, `ok · API 13/min`).
 fn quota_line(listing: &Listing) -> (Option<String>, Option<usize>) {
     let views = arena_core::ratelimit::observed();
     let mut seen: Vec<&str> = Vec::new();
@@ -1553,10 +1553,12 @@ fn stamp(s: &Shared) -> (Option<Instant>, Option<Instant>, usize, usize, usize, 
     (s.last_refresh, s.notice.as_ref().map(|n| n.at), s.pending.len(), s.deep.running(), lines, s.refreshing)
 }
 
-/// Whether something on screen moves by itself (a spinner, a check waiting out its debounce, a
-/// run's output open): frames then come every [`lag::TICK_LIVE`], else every [`lag::TICK_IDLE`].
+/// Whether something on screen moves by itself faster than the clock (a check waiting out its
+/// debounce, a run's output open): frames then come every [`lag::TICK_LIVE`], else every
+/// [`lag::TICK_IDLE`]. A question out counts seconds, so the idle tick is enough for it (the
+/// footer has no spinner any more).
 fn live(s: &Shared, ui: &Ui, now: Instant) -> bool {
-    s.ask_running.is_some() || ui.offers.busy(now) || matches!(ui.mode, Mode::Working(_)) || (matches!(ui.mode, Mode::Runs { .. }) && s.runs.iter().any(|r| r.running()))
+    ui.offers.busy(now) || matches!(ui.mode, Mode::Working(_)) || (matches!(ui.mode, Mode::Runs { .. }) && s.runs.iter().any(|r| r.running()))
 }
 
 /// What landed from the background since the last pass: an action's result (its modal, and a
@@ -3814,10 +3816,13 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         });
         spans.push(Span::raw(" · "));
     }
-    let refreshed = match shared.last_refresh {
-        _ if shared.refreshing => "refreshing".to_string(),
-        Some(t) => format!("{}s ago", t.elapsed().as_secs()),
-        None => "-".into(),
+    // While a refresh runs it says so and keeps the age: a slow refresh at a short cadence would
+    // otherwise hide it most of the time (pre-merge review of #44).
+    let refreshed = match (shared.last_refresh, shared.refreshing) {
+        (Some(t), true) => format!("refreshing, last {}s ago", t.elapsed().as_secs()),
+        (None, true) => "refreshing".into(),
+        (Some(t), false) => format!("{}s ago", t.elapsed().as_secs()),
+        (None, false) => "-".into(),
     };
     spans.push(Span::raw(format!("{refreshed} · every {secs}s  ")));
     spans.push(Span::styled(mode_keys(&ui.mode).to_string(), Style::default().fg(Color::Gray)));
@@ -4532,6 +4537,8 @@ deep_check_end=1
         shared.refreshing = true;
         let t = text(&shared);
         assert!(t.contains(" · refreshing · every 10s  "), "{t}");
+        shared.last_refresh = Some(Instant::now());
+        assert!(text(&shared).contains(" · refreshing, last 0s ago · every 10s  "), "the age stays while it refreshes");
         let all = t.chars().filter(|c| !c.is_ascii()).collect::<String>();
         assert!(!all.chars().any(|c| "☰⟳✓✗⚠⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(c)), "only words: {all:?} in {t}");
     }
