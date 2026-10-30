@@ -103,6 +103,11 @@ pub(crate) async fn pause(a: PauseArgs, resume: bool, provider: &dyn Provider, c
     run(verb, a.sel.args(), &expect, a.dry_run, a.json, provider, cfg, api, dir, yes).await
 }
 
+/// How old the keys a machine's plan is made again from may be ([`run`]): a listing serves the
+/// machines whose changes start within it, so a fleet-wide run re-reads every few machines, never
+/// once per machine nor once for all.
+const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How long a key change waits for another arena's on this box ([`keys_lock`]).
 const KEYS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -518,31 +523,37 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
         return Ok(());
     }
     // One arena changing keys at a time on this box (another operator's command, the dashboard's
-    // runs), then the keys read again: a change confirmed against a listing that has moved since
-    // isn't made ([`moved`]), and each key is checked once more in the request just before its
-    // change (`update_key`'s `expect`). OpenRouter has no conditional update to close the rest.
+    // runs). Then machine by machine — every one named, a skipped one too (review codex r6 #1:
+    // resumed meanwhile, a pause's "already off" would have stood) — its plan made again from
+    // keys read at most [`FRESH_FOR`] before its changes ([`moved`]: a change confirmed against
+    // keys that have moved since isn't made), and each key checked once more in the request just
+    // before its change ([`just_before`]). OpenRouter has no conditional update to close the rest.
     let _lock = keys_lock(cfg).await?;
-    let fresh = api.list_keys().await.context("listing OpenRouter keys again before changing them")?;
-    let stale: std::collections::HashMap<&str, Option<String>> = todo
-        .iter()
-        .map(|r| {
-            let theirs: Vec<&Row> = rows.iter().filter(|o| o.machine == r.machine).collect();
-            (r.machine.as_str(), moved(&verb, &r.machine, &theirs, &fresh, &naming))
-        })
-        .collect();
+    let mut machines: Vec<&str> = rows.iter().map(|r| r.machine.as_str()).collect();
+    machines.dedup();
+    let mut fresh: Option<(std::time::Instant, Vec<KeyInfo>)> = None;
     let mut done: Vec<(Row, Outcome, Option<KeyInfo>)> = Vec::new();
-    for r in &rows {
-        let outcome = match (&r.key, &r.update) {
-            (Some(k), Some(u)) => match stale.get(r.machine.as_str()).cloned().flatten() {
-                Some(why) => Outcome::Failed(why),
-                None => match api.update_key(&k.hash, u, Some(&just_before(&verb, k))).await {
+    for m in machines {
+        if fresh.as_ref().is_none_or(|(at, _)| at.elapsed() > FRESH_FOR) {
+            let at = std::time::Instant::now();
+            fresh = api.list_keys().await.ok().map(|keys| (at, keys));
+        }
+        let theirs: Vec<&Row> = rows.iter().filter(|r| r.machine == m).collect();
+        let stale = match &fresh {
+            Some((_, keys)) => moved(&verb, m, &theirs, keys, &naming),
+            None => Some("the keys couldn't be read again before changing them — nothing done".into()),
+        };
+        for r in theirs {
+            let outcome = match (&r.key, &r.update, &stale) {
+                (_, _, Some(why)) => Outcome::Failed(why.clone()),
+                (Some(k), Some(u), None) => match api.update_key(&k.hash, u, Some(&just_before(&verb, k))).await {
                     Ok(()) => Outcome::Changed,
                     Err(e) => Outcome::Failed(e.to_string()),
                 },
-            },
-            _ => skipped(r),
-        };
-        done.push((r.clone(), outcome, None));
+                _ => skipped(r),
+            };
+            done.push((r.clone(), outcome, None));
+        }
     }
     // What OpenRouter says now: each changed key read back, and a change it didn't take said.
     let reread = api.list_keys().await.map_err(|e| e.to_string());
@@ -565,19 +576,35 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
         }
         failed += usize::from(matches!(outcome, Outcome::Failed(_)));
     }
-    // A pause is of a name: a key that turned up enabled under a paused machine's name while this
-    // ran (review codex r5 #1) is said and fails the command — never a success with a key still on.
-    if let (Verb::Pause, Ok(keys)) = (&verb, &reread) {
-        let ours: Vec<&str> = done.iter().filter_map(|(r, _, _)| r.key.as_ref().map(|k| k.hash.as_str())).collect();
-        let mut machines: Vec<&str> = todo.iter().map(|r| r.machine.as_str()).collect();
+    // What the keys say afterwards, of a name: after a pause no key under any named machine's name
+    // is on (review codex r5 #1, r6 #1: one added or resumed meanwhile), after a resume the key
+    // turned on is the one its name shows (r6 #2: a newer one turned up meanwhile, the old one is
+    // on again beside it). Anything else is said and fails the command.
+    if let Ok(keys) = &reread {
+        let failed_hashes: Vec<String> = done.iter().filter(|(_, o, _)| matches!(o, Outcome::Failed(_))).filter_map(|(r, _, _)| r.key.as_ref().map(|k| k.hash.clone())).collect();
+        let mut machines: Vec<&str> = rows.iter().map(|r| r.machine.as_str()).collect();
         machines.dedup();
         let mut extra = Vec::new();
         for m in machines {
             let names = crate::machine_key_names(&naming, m);
-            for k in keys.iter().filter(|k| !k.disabled && !ours.contains(&k.hash.as_str()) && k.name.as_deref().is_some_and(|n| names.iter().any(|t| t == n))) {
-                let row = Row { machine: m.to_string(), key: Some(k.clone()), update: None, words: "on".into(), skip: None, note: None };
-                let why = format!("another key under its name turned up enabled while this ran — still on; `arena keys pause {m}` again");
-                extra.push((row, Outcome::Failed(why), Some(k.clone())));
+            let theirs: Vec<&KeyInfo> = keys.iter().filter(|k| k.name.as_deref().is_some_and(|n| names.iter().any(|t| t == n))).collect();
+            let row = |k: &KeyInfo| Row { machine: m.to_string(), key: Some(k.clone()), update: None, words: on_off(k.disabled).into(), skip: None, note: None };
+            match verb {
+                Verb::Pause => {
+                    for k in theirs.iter().filter(|k| !k.disabled && !failed_hashes.contains(&k.hash)) {
+                        let why = format!("a key under its name is still on (added or resumed while this ran) — `arena keys pause {m}` again");
+                        extra.push((row(k), Outcome::Failed(why), Some((*k).clone())));
+                    }
+                }
+                Verb::Resume => {
+                    let resumed = done.iter().filter(|(r, o, _)| r.machine == m && *o == Outcome::Changed).filter_map(|(r, _, _)| r.key.as_ref());
+                    let shown = or::shown_key(theirs.iter().copied());
+                    for k in resumed.filter(|k| shown.is_some_and(|s| s.hash != k.hash)) {
+                        let why = format!("a newer key under its name turned up while this ran; this older one is on again beside it — `arena keys list --all`, then `arena keys pause {m}`");
+                        extra.push((row(k), Outcome::Failed(why), theirs.iter().find(|t| t.hash == k.hash).map(|t| (*t).clone())));
+                    }
+                }
+                Verb::Limit { .. } => {}
             }
         }
         failed += extra.len();
@@ -654,17 +681,21 @@ mod tests {
     type Meanwhile = (&'static str, fn(&mut KeyInfo));
 
     /// Keys on a fake OpenRouter: listed, changed in place as asked (each call recorded); a key
-    /// named in `broken` fails its update, one in `ignored` "takes" it without changing; `meanwhile`
-    /// (a hash and a cap) is another operator's change, made once the first listing is read.
+    /// named in `broken` fails its update, one in `ignored` "takes" it without changing; someone
+    /// else changes keys between the calls as [`Keys::meanwhile`] says.
     #[derive(Default)]
     struct Keys {
         keys: Mutex<Vec<KeyInfo>>,
         calls: Mutex<Vec<String>>,
         broken: Vec<&'static str>,
         ignored: Vec<&'static str>,
-        meanwhile: Mutex<Option<(&'static str, f64)>>,
-        /// Another operator's (or the participant's) change to a later key, made at the first update.
-        meanwhile_on_update: Mutex<Option<Meanwhile>>,
+        /// Someone else's change (another operator's, the participant's spend) to a key, made
+        /// right after the n-th listing is read (`on_list`), or as the n-th update starts
+        /// (`on_update`): `(n, (hash, change))`.
+        on_list: Mutex<Vec<(usize, Meanwhile)>>,
+        on_update: Mutex<Vec<(usize, Meanwhile)>>,
+        lists: Mutex<usize>,
+        updates: Mutex<usize>,
     }
 
     impl Keys {
@@ -677,15 +708,30 @@ mod tests {
         fn key(&self, hash: &str) -> KeyInfo {
             self.keys.lock().unwrap().iter().find(|k| k.hash == hash).cloned().unwrap()
         }
+        /// The `n`-th's changes of `hooks`, made.
+        fn someone_else(&self, hooks: &Mutex<Vec<(usize, Meanwhile)>>, n: usize) {
+            for (at, (hash, change)) in hooks.lock().unwrap().iter() {
+                if *at == n {
+                    self.keys.lock().unwrap().iter_mut().filter(|k| k.hash == *hash).for_each(change);
+                }
+            }
+        }
+        /// With someone else's changes: after listing `n` / as update `n` starts.
+        fn meanwhile(self, on_list: Vec<(usize, Meanwhile)>, on_update: Vec<(usize, Meanwhile)>) -> Self {
+            Keys { on_list: Mutex::new(on_list), on_update: Mutex::new(on_update), ..self }
+        }
     }
 
     #[async_trait::async_trait]
     impl KeyApi for Keys {
         async fn list_keys(&self) -> arena_core::Result<Vec<KeyInfo>> {
             let listed = self.keys.lock().unwrap().clone();
-            if let Some((hash, cap)) = self.meanwhile.lock().unwrap().take() {
-                self.keys.lock().unwrap().iter_mut().filter(|k| k.hash == hash).for_each(|k| k.limit = Some(cap));
-            }
+            let n = {
+                let mut n = self.lists.lock().unwrap();
+                *n += 1;
+                *n
+            };
+            self.someone_else(&self.on_list, n);
             Ok(listed)
         }
         async fn create_key(&self, _name: &str, _limit: Option<f64>) -> arena_core::Result<or::CreatedKey> {
@@ -698,10 +744,13 @@ mod tests {
             unreachable!()
         }
         async fn update_key(&self, hash: &str, u: &KeyUpdate, check: Option<or::KeyCheck<'_>>) -> arena_core::Result<()> {
+            let n = {
+                let mut n = self.updates.lock().unwrap();
+                *n += 1;
+                *n
+            };
+            self.someone_else(&self.on_update, n);
             let mut keys = self.keys.lock().unwrap();
-            if let Some((other, change)) = self.meanwhile_on_update.lock().unwrap().take() {
-                keys.iter_mut().filter(|k| k.hash == other).for_each(change);
-            }
             let k = keys.iter_mut().find(|k| k.hash == hash).expect("a listed key");
             if let Some(Err(why)) = check.map(|c| c(k)) {
                 return Err(arena_core::Error::provider(format!("openrouter update key: refused — {why}")));
@@ -867,7 +916,7 @@ mod tests {
     /// changed; the others are.
     #[tokio::test]
     async fn a_key_that_moved_since_the_plan_is_left_alone() {
-        let api = Keys { meanwhile: Mutex::new(Some(("hb", 25.0))), ..Keys::with(fleet_keys()) };
+        let api = Keys::with(fleet_keys()).meanwhile(vec![(1, ("hb", |k| k.limit = Some(25.0)))], vec![]);
         let e = keys_cmd(&["limit", "alpha", "bravo", "+5"], &api).await.unwrap_err();
         assert_eq!(e, "1 key(s) failed");
         assert_eq!(api.calls(), [r#"ha {"limit":5.1}"#], "bravo isn't touched");
@@ -878,23 +927,43 @@ mod tests {
     /// in the request just before its own change; the earlier ones stand.
     #[tokio::test]
     async fn a_later_key_that_moves_mid_run_is_refused_at_its_own_change() {
-        let api = Keys { meanwhile_on_update: Mutex::new(Some(("hc", |k| k.limit = Some(25.0)))), ..Keys::with(fleet_keys()) };
+        let api = Keys::with(fleet_keys()).meanwhile(vec![], vec![(1, ("hc", |k| k.limit = Some(25.0)))]);
         let e = keys_cmd(&["limit", "alpha..cloud", "+5"], &api).await.unwrap_err();
         assert_eq!(e, "1 key(s) failed");
         assert_eq!(api.calls(), [r#"ha {"limit":5.1}"#, r#"hb {"limit":10.0}"#], "cloud's isn't made");
         assert_eq!(api.key("hc").limit, Some(25.0));
         // Renamed to another machine meanwhile (review codex r4 #1): not this machine's to pause.
-        let api = Keys { meanwhile_on_update: Mutex::new(Some(("hc", |k| k.name = Some("devtest-delta".into())))), ..Keys::with(fleet_keys()) };
+        let api = Keys::with(fleet_keys()).meanwhile(vec![], vec![(1, ("hc", |k| k.name = Some("devtest-delta".into())))]);
         assert_eq!(keys_cmd(&["pause", "alpha", "cloud"], &api).await.unwrap_err(), "1 key(s) failed");
         assert_eq!(api.calls(), [r#"ha {"disabled":true}"#]);
         // A second enabled key under a later name, added while the first were paused (r5 #1): said,
         // and the command fails.
-        let api = Keys { meanwhile_on_update: Mutex::new(Some(("hc-old", |k| k.disabled = false))), ..Keys::with(fleet_keys()) };
+        let api = Keys::with(fleet_keys()).meanwhile(vec![], vec![(1, ("hc-old", |k| k.disabled = false))]);
         assert_eq!(keys_cmd(&["pause", "alpha", "cloud"], &api).await.unwrap_err(), "1 key(s) failed");
         assert_eq!(api.calls(), [r#"ha {"disabled":true}"#, r#"hc {"disabled":true}"#]);
         assert!(!api.key("hc-old").disabled, "named, not touched: it wasn't in what was confirmed");
+        // Resumed meanwhile, between the plan and the change (r6 #1): a pause's "already off" isn't
+        // left standing — its machine is planned again and fails.
+        let mut keys = fleet_keys();
+        keys[1].disabled = true;
+        let api = Keys::with(keys).meanwhile(vec![(1, ("hb", |k| k.disabled = false))], vec![]);
+        assert_eq!(keys_cmd(&["pause", "alpha", "bravo"], &api).await.unwrap_err(), "1 key(s) failed");
+        assert_eq!(api.calls(), [r#"ha {"disabled":true}"#]);
+        // A newer key under a later machine's name, made while the earlier ones were resumed (r6 #2):
+        // the old one turned on is said, and the command fails.
+        let mut keys = fleet_keys();
+        keys[0].disabled = true;
+        keys[3].disabled = true;
+        let newer: Meanwhile = ("hc-old", |k| {
+            k.hash = "hc-new".into();
+            k.disabled = false;
+            k.created_at = Some("2026-10-31T10:00:00Z".into());
+        });
+        let api = Keys::with(keys).meanwhile(vec![], vec![(1, newer)]);
+        assert_eq!(keys_cmd(&["resume", "alpha", "cloud"], &api).await.unwrap_err(), "1 key(s) failed");
+        assert_eq!(api.calls(), [r#"ha {"disabled":false}"#, r#"hc {"disabled":false}"#], "made — and then said");
         // Spent past the new cap meanwhile (r4 #3): a $2 cap over $3 spent is refused at its change.
-        let api = Keys { meanwhile_on_update: Mutex::new(Some(("hc", |k| k.usage = Some(3.0)))), ..Keys::with(fleet_keys()) };
+        let api = Keys::with(fleet_keys()).meanwhile(vec![], vec![(1, ("hc", |k| k.usage = Some(3.0)))]);
         assert_eq!(keys_cmd(&["limit", "alpha", "cloud", "2"], &api).await.unwrap_err(), "1 key(s) failed");
         assert_eq!(api.calls(), [r#"ha {"limit":2.0}"#]);
         assert_eq!(api.key("hc").limit, Some(5.0));
