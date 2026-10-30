@@ -162,8 +162,9 @@ mapping container port → public port, e.g. `{"22": 1118}` (see `parse_pod`).
 `fetch_creatable_gpu_ids` downloads the OpenAPI doc and `extract_gpu_enum` walks it for the
 `gpuTypeIds` items-`enum` (under `PodCreateInput`). **The create-validation enum can LAG the
 live `gpuTypes` catalog** — a GPU can be in stock yet rejected at create with a 400
-("value must be one of …"). On v1, `arena offers runpod` (and the hidden `gpus`) intersect the live
-catalog with this enum so they only advertise *creatable* types.
+("value must be one of …"). On v1 the catalog's rows are flagged against this enum: `arena offers
+runpod` marks the rest `v1: not creatable`, and the hidden `gpus` table leaves them out (`--json`
+keeps them, `creatable: false`).
 
 ---
 

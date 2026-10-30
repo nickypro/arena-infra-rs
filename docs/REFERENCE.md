@@ -1224,10 +1224,11 @@ clocks at READY), plus a line per name that failed, warned or was replaced — a
 got no pod is a `FAILED create` row; exits non-zero unless every requested name is READY (and when
 nothing was created at all).
 
-A pod that fails is left running, except where `up` replaces or deletes it: a host FAIL under
-`--check`, a pod up without an SSH endpoint for `--endpoint-timeout`, a RunPod pod with no
-container at a `--timeout` of 10 min or more (each terminated and its name recreated, within
-`--check-attempts`), and a Shadeform pod not ready by its deadline (deleted: it bills until then).
+A pod that fails is left running, except where `up` replaces or deletes it. A host FAIL under
+`--check` is terminated and its name recreated, within `--check-attempts` — the last attempt's pod
+is left running for a look. A pod up without an SSH endpoint for `--endpoint-timeout`, or a RunPod
+pod with no container at a `--timeout` of 10 min or more, is replaced the same way, and the last
+one is terminated too. A Shadeform pod not ready by its deadline is deleted (it bills until then).
 
 Without a proxy layout, a READY pod's `~/.ssh/config` fleet map is rewritten at the end if pods came
 up after it.
@@ -2095,7 +2096,8 @@ checklist of what is still billing or scheduled, each with the exact command tha
 - the **backup archive** ([`arena archive`](BACKUPS.md#backup-archive-arena-archive)) in its Hetzner
   project: this cohort's is ◷ **kept** until `ARCHIVE_KEEP_UNTIL` (on purpose, never against the
   check); past that date, with no date, orphan volumes or another cohort's archive it is ✗, with
-  its monthly cost and the typed `archive down --delete-volumes --confirm <prefix>-archive` as the fix;
+  its monthly cost and the fix `archive access off`, then the typed `archive down --delete-volumes
+  --confirm <prefix>-archive` (another cohort's: with that cohort's config);
 - and the fleet's **Hetzner project's snapshots**: an `arena image build` VM still there is ✗
   (it bills by the hour; fix `image prune`); this cohort's arena images are ◷ **kept** (made on
   purpose for `HETZNER_IMAGE=arena`, cents a month — never against the check), with their size and

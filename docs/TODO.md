@@ -16,9 +16,10 @@ missing.
   can't be reached through the proxy is reverted. Still missing: a preflight that nginx actually
   reloads (`nginx -t` passes, as the user arena runs as) **before** any rename, so a cutover can't
   rename pods and only then find it can't drive the proxy.
-- #7: `cutover_revert` makes one attempt at each rename and prints `REVERT WARNING: … fix names
-  manually!` when one fails. It should retry, return a status, name the exact pod ids and names to
-  fix, and check the original is reachable again before saying the revert worked.
+- #7: `cutover_revert` makes one attempt at each rename. A failed first rename (the new pod back to
+  `<name>-new`) is ignored; a failed second one (the original back to `<name>`) prints `REVERT
+  WARNING: … fix names manually!`. It should retry, return a status, name the exact pod ids and
+  names to fix, and check the original is reachable again before saying the revert worked.
 
 ## Migrate state machine (lower priority)
 - No lock between runs: two concurrent `migrate`/`replace` runs on the same machine can create
