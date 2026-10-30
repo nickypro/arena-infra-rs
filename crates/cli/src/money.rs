@@ -391,7 +391,7 @@ fn new_pod_price(
 
 /// One pod's probe call, read: the reply, or why there is none. A call that failed outright
 /// (no marker in its output: ssh couldn't connect) reads as its exit code and last stderr line.
-fn read_probe(call: PodCall) -> Probe {
+pub(crate) fn read_probe(call: PodCall) -> Probe {
     let out = match call {
         Ok(out) => out,
         Err(why) => return Probe::Failed(why),

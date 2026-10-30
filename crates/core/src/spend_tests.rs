@@ -1116,3 +1116,34 @@ async fn per_pod_billing_is_one_get_with_the_key_in_the_header_only() {
     assert!(err.contains("401"), "{err}");
     assert!(HttpSpendApi::from_config(&crate::config::Config::parse("")).pod_billing(0, 1, 1).await.is_none(), "no key: not asked");
 }
+
+/// `migrate copy alpha --onto bravo` (or a spare): the machine taken keeps its row — the same
+/// instance — renamed `alpha-new` at once and owned by alpha's owner; taken for an unowned
+/// machine it's no longer its previous owner's. A machine the ledger never saw gets a row from
+/// now, as seen.
+#[test]
+fn a_machine_taken_as_the_new_pod_keeps_its_row_under_the_moved_owner() {
+    let alpha = running("hetzner", "1", "devtest-alpha", 0.01);
+    let bravo = running("hetzner", "2", "devtest-bravo", 0.02);
+    let mut s = created(tracked(), &alpha, &given("alice"), T0);
+    s = created(s, &bravo, &given("bob"), T0);
+    s = see(s, &["hetzner"], &[], &[alpha.clone(), bravo.clone()], T0 + H);
+    let taken = Pod { name: "devtest-alpha-new".into(), ..bravo.clone() };
+    s = apply_event(s, &Event::Adopted { pod: &taken, owner: &OwnerRule::Inherit }, T0 + H + M);
+    assert_eq!(s.machines.len(), 2, "no new row: {:#?}", s.machines);
+    let m = machine(&s, "hetzner", "2");
+    assert_eq!((m.name.as_str(), m.owner.as_deref()), ("devtest-alpha-new", Some("alice")));
+    // For an unowned original: the taken machine's old owner goes.
+    let carol = running("hetzner", "3", "devtest-charlie", 0.01);
+    let delta = running("hetzner", "4", "devtest-delta", 0.01);
+    let mut s = created(tracked(), &carol, &OwnerRule::None, T0);
+    s = created(s, &delta, &given("dan"), T0);
+    let taken = Pod { name: "devtest-charlie-new".into(), ..delta };
+    s = apply_event(s, &Event::Adopted { pod: &taken, owner: &OwnerRule::Inherit }, T0 + M);
+    assert_eq!(machine(&s, "hetzner", "4").owner, None);
+    // Never seen before (a spare): a row from now.
+    let spare = running("hetzner", "5", "devtest-alpha-new", 0.02);
+    let s = apply_event(created(tracked(), &alpha, &given("alice"), T0), &Event::Adopted { pod: &spare, owner: &OwnerRule::Inherit }, T0 + H);
+    let m = machine(&s, "hetzner", "5");
+    assert_eq!((m.owner.as_deref(), m.start, m.start_how), (Some("alice"), T0 + H, StartHow::Seen));
+}

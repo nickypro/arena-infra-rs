@@ -674,6 +674,10 @@ pub enum OwnerRule {
 pub enum Event<'a> {
     /// A create returned this pod.
     Created { pod: &'a Pod, owner: &'a OwnerRule },
+    /// A machine arena already had was taken as a `replace`/`migrate`'s new pod (`--onto`, a
+    /// capacity spare): renamed `pod.name` (`<x>-new`), it gets the owner `owner` gives, as a
+    /// create's pod would — its row (the same instance) goes on, under that owner.
+    Adopted { pod: &'a Pod, owner: &'a OwnerRule },
     /// A terminate succeeded (`provider` when the caller knows it).
     Terminated { provider: Option<&'a str>, id: &'a str },
     /// A stop succeeded: from now it bills its disk only.
@@ -700,10 +704,11 @@ fn replaced_names(name: &str) -> Vec<String> {
 pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
     state.begin(now);
     match ev {
-        Event::Created { pod, owner } => {
+        Event::Created { pod, owner } | Event::Adopted { pod, owner } => {
             if pod.id.is_empty() {
                 return state;
             }
+            let created = matches!(ev, Event::Created { .. });
             let inherited = match owner {
                 OwnerRule::Given(o) => Some(o.clone()),
                 // The nearest name that has an open machine decides — its owner, or none: an
@@ -723,9 +728,14 @@ pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
                 OwnerRule::None => None,
             };
             let i = match state.open_index(Some(&pod.provider), &pod.id) {
-                Some(i) => i,
+                Some(i) => {
+                    // Taken under its new name: the row follows it at once.
+                    state.machines[i].name.clone_from(&pod.name);
+                    i
+                }
                 None => {
-                    let mut m = new_machine(pod, now, StartHow::Created, now);
+                    let how = if created { StartHow::Created } else { StartHow::Seen };
+                    let mut m = new_machine(pod, now, how, now);
                     if let Some(r) = rate_of(pod, None) {
                         extend(&mut m, now, r, 0);
                     }
@@ -734,9 +744,14 @@ pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
                 }
             };
             state.machines[i].event_at = Some(now);
-            if let Some(o) = inherited {
-                state.machines[i].owner = Some(o.clone());
-                adopt_keys(&mut state, &pod.name, &o);
+            match inherited {
+                Some(o) => {
+                    state.machines[i].owner = Some(o.clone());
+                    adopt_keys(&mut state, &pod.name, &o);
+                }
+                // A machine taken for an unowned one is no longer whoever had it before.
+                None if !created => state.machines[i].owner = None,
+                None => {}
             }
         }
         Event::Terminated { provider, id } => {

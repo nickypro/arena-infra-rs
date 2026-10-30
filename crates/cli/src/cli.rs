@@ -2,7 +2,6 @@
 //! (a command family's own subcommands live with the family: `cron::CronCmd`, `keys::KeysCmd`, …).
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::Result;
 use arena_core::selector::SelectArgs;
@@ -808,10 +807,11 @@ pub(crate) enum PodCmd {
     },
     /// Move a pod to a fresh host, keeping its name and files
     ///
-    /// Builds a new pod, copies the files over, then swaps it into the name so its proxy port and
-    /// ssh-config carry over: for when the host is the problem (`restart` stays on it). The old
-    /// pod is parked as `<name>-old`, then terminated unless --keep-old. Same spec as the source
-    /// unless overridden.
+    /// Builds a new pod (or takes --onto / --onto-spare), copies the files over, then swaps it
+    /// into the name so its proxy port and ssh-config carry over: for when the host is the problem
+    /// (`restart` stays on it), or for a bigger Hetzner type (--server-type). The old pod is parked
+    /// as `<name>-old`, then terminated unless --keep-old. Same spec as the source unless
+    /// overridden. Refuses a pod someone is on (SSH, VS Code) unless --force: `migrate` is for those.
     #[command(verbatim_doc_comment)]
     Replace {
         /// Machine name (e.g. arena8-apple) or raw provider id to replace.
@@ -836,6 +836,11 @@ pub(crate) enum PodCmd {
         image: Option<String>,
         #[command(flatten)]
         place: PlaceFlags,
+        #[command(flatten)]
+        onto: OntoFlags,
+        /// Replace it even with someone on it, or take a cohort machine with --onto
+        #[arg(long)]
+        force: bool,
         /// Keep the parked `<name>-old` pod instead of terminating it at the end
         #[arg(long)]
         keep_old: bool,
@@ -1261,12 +1266,18 @@ impl ReapAtCreate {
 /// cheapest first (or as listed), with a retry window while capacity is short.
 #[derive(clap::Args, Debug, Clone, Default)]
 pub(crate) struct PlaceFlags {
+    /// Hetzner only: server type, or a comma list of fallbacks (default: the source's)
+    #[arg(long, value_name = "TYPE")]
+    pub server_type: Option<String>,
     /// Max $/h for the new pod; options above it or unpriced aren't tried
     #[arg(long, value_parser = parse_max_price)]
     pub max_price: Option<f64>,
     /// Order to try several --gpu/--cloud options in: `cheapest` or `listed`.
     #[arg(long, default_value = "cheapest")]
     pub order: arena_core::placement::Order,
+    /// On no capacity, keep trying for up to an hour (as `up`; else use --retry-mins)
+    #[arg(long)]
+    pub keep_trying: bool,
     /// Keep retrying every option for up to this many minutes (0 = once)
     #[arg(long, default_value_t = 0)]
     pub retry_mins: u64,
@@ -1276,11 +1287,44 @@ pub(crate) struct PlaceFlags {
 }
 
 impl PlaceFlags {
-    /// The retry window these flags ask for (zero = one round).
+    /// The retry window these flags ask for (zero = one round): `--retry-mins`, else
+    /// `--keep-trying`'s hour of rounds every 30 s (as `up` waits), else one round.
     pub(crate) fn rounds(&self) -> arena_core::placement::Rounds {
-        arena_core::placement::Rounds {
-            window: Duration::from_secs(self.retry_mins * 60),
-            every: Duration::from_secs(self.retry_secs.max(1)),
+        crate::pods::create::replacement_rounds(self.keep_trying, self.retry_mins, self.retry_secs)
+    }
+
+    /// Whether any of these flags shapes a new pod's create (a re-sync onto an existing `-new`,
+    /// or an `--onto` machine, makes none).
+    pub(crate) fn shapes_a_create(&self) -> bool {
+        self.server_type.is_some() || self.max_price.is_some() || self.keep_trying || self.retry_mins > 0
+    }
+}
+
+/// `--onto` / `--onto-spare` on `replace` and `migrate copy`: the new pod is a machine arena
+/// already has, not one created now.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub(crate) struct OntoFlags {
+    /// Use this existing machine (same provider) as the new pod instead of creating one
+    ///
+    /// A capacity spare, or another machine arena manages; it's renamed `<name>-new`. A cohort
+    /// machine (in MACHINE_NAME_LIST) is someone's: refused unless --force, saying what's on it.
+    #[arg(long, value_name = "POD", conflicts_with = "onto_spare")]
+    pub onto: Option<String>,
+    /// Use the first ready capacity spare (`pods spare up`, Hetzner) as the new pod
+    ///
+    /// With --server-type, a spare of the first type that has one.
+    #[arg(long)]
+    pub onto_spare: bool,
+}
+
+impl OntoFlags {
+    /// Where the new pod comes from.
+    pub(crate) fn target(&self) -> crate::pods::adopt::Source {
+        use crate::pods::adopt::Source;
+        match (&self.onto, self.onto_spare) {
+            (Some(p), _) => Source::Onto(p.clone()),
+            (None, true) => Source::Spare,
+            (None, false) => Source::Create,
         }
     }
 }

@@ -1484,7 +1484,7 @@ async fn cutover_onto_the_copy_of_a_stopped_original() {
     remote.on(new_host, "SSH_OK", FakeReply::stdout("NVIDIA RTX A4000\nSSH_OK\n"));
     remote.on(new_host, "arena-last-sync", FakeReply::stdout("arena-last-sync=1791457323\n"));
     let pods = f.pods.lock().unwrap().clone();
-    let opts = |no_final_sync| CutoverOpts { skip_proxy: false, no_final_sync, dry_run: false, yes: true };
+    let opts = |no_final_sync| CutoverOpts { skip_proxy: false, no_final_sync, dry_run: false, yes: true, force: true };
     let e = migrate_cutover_on(remote.clone(), &f, &cfg, &f, "devtest-alpha", &pods, opts(false), &keys_dir).await.unwrap_err();
     let msg = format!("{e:#}");
     assert!(msg.contains("the source devtest-alpha is stopped (EXITED)") && msg.contains("--no-final-sync"), "{msg}");
@@ -1535,9 +1535,9 @@ async fn replace_onto_a_host_with_maintenance_keeps_the_original() {
     remote.on(new_host, "MARK=", FakeReply::stdout("ID=r-new\nMARK=arena-replace-r-new\n"));
     remote.on(new_host, "SSH_OK", FakeReply::stdout("NVIDIA RTX A4000\nSSH_OK\n"));
     let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
-    let opts = ReplaceOpts { keep_old: false, skip_proxy: false, dry_run: false, yes: true };
+    let opts = ReplaceOpts { keep_old: false, skip_proxy: false, dry_run: false, yes: true, force: true };
     let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
-    let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: &keys_dir, balance: None };
+    let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: &keys_dir, balance: None, source: crate::pods::adopt::Source::Create, spares: None };
     replace_on(remote.clone(), &f, &cfg, &f, "r-alpha".into(), "devtest-alpha".into(), job).await.unwrap();
     assert_eq!(
         f.calls(),
@@ -1594,9 +1594,9 @@ async fn a_finished_replace_removes_the_originals_leftover_staging_copy() {
     std::fs::create_dir_all(stage.0.join("ARENA_materials")).unwrap();
     std::fs::write(stage.0.join("ARENA_materials/work.py"), "an earlier failed copy's stage").unwrap();
     let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
-    let opts = ReplaceOpts { keep_old: false, skip_proxy: false, dry_run: false, yes: true };
+    let opts = ReplaceOpts { keep_old: false, skip_proxy: false, dry_run: false, yes: true, force: true };
     let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
-    let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: &keys_dir, balance: None };
+    let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: &keys_dir, balance: None, source: crate::pods::adopt::Source::Create, spares: None };
     replace_on(remote, &f, &cfg, &f, src_id.into(), "devtest-alpha".into(), job).await.unwrap();
     assert_eq!(
         f.calls(),
@@ -1644,10 +1644,10 @@ async fn replace_remembers_the_new_pods_price_for_the_balance() {
     remote.on(new_host, "SSH_OK", FakeReply::stdout("NVIDIA RTX A4000\nSSH_OK\n"));
     let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
     // --keep-old: the original isn't terminated (no staging clean-up of a shared id).
-    let opts = ReplaceOpts { keep_old: true, skip_proxy: false, dry_run: false, yes: true };
+    let opts = ReplaceOpts { keep_old: true, skip_proxy: false, dry_run: false, yes: true, force: true };
     let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
     let bal = priced_balance(&dir.0);
-    let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: &keys_dir, balance: Some(&bal) };
+    let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: &keys_dir, balance: Some(&bal), source: crate::pods::adopt::Source::Create, spares: None };
     replace_on(remote, &f, &cfg, &f, "r-alpha".into(), "devtest-alpha".into(), job).await.unwrap();
     assert_eq!(f.calls(), ["create devtest-alpha-new NVIDIA RTX A4000", "rename r-alpha devtest-alpha-old", "rename r-new devtest-alpha"]);
     assert_eq!(remembered(&bal, "r-new"), Some(0.29));
@@ -1678,6 +1678,9 @@ async fn migrate_copy_remembers_the_new_pods_price_even_when_the_copy_fails() {
             interrupt: &interrupt,
             keys_dir: "/nonexistent",
             balance: Some(&bal),
+            source: crate::pods::adopt::Source::Create,
+            force: false,
+            spares: None,
         };
         let e = migrate_copy_on(Arc::new(FakeRemote::new()), &cfg, &f, "devtest-alpha", &pods, job).await.unwrap_err();
         assert!(format!("{e:#}").contains("devtest-alpha-new never came up"), "{e:#}");
@@ -1699,8 +1702,8 @@ async fn a_stopped_original_is_refused_before_anything_is_created() {
     let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
     let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
     let replace = |dry_run| {
-        let opts = ReplaceOpts { keep_old: false, skip_proxy: true, dry_run, yes: true };
-        ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None }
+        let opts = ReplaceOpts { keep_old: false, skip_proxy: true, dry_run, yes: true, force: true };
+        ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None, source: crate::pods::adopt::Source::Create, spares: None }
     };
     let e = replace_on(Arc::new(FakeRemote::new()), &f, &cfg, &f, "r-alpha".into(), "devtest-alpha".into(), replace(false))
         .await
@@ -1712,7 +1715,7 @@ async fn a_stopped_original_is_refused_before_anything_is_created() {
     assert!(take_would_refuse().iter().any(|r| r.contains("devtest-alpha is stopped")));
     // migrate copy: the same, whether -new would be created or re-synced.
     let pods = f.pods.lock().unwrap().clone();
-    let copy = |dry_run| MigrateCopyJob { setup_timeouts: timeouts, ov: &ov, place: &place, dry_run, yes: true, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None };
+    let copy = |dry_run| MigrateCopyJob { setup_timeouts: timeouts, ov: &ov, place: &place, dry_run, yes: true, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None, source: crate::pods::adopt::Source::Create, force: false, spares: None };
     let e = migrate_copy_on(Arc::new(FakeRemote::new()), &cfg, &f, "devtest-alpha", &pods, copy(false)).await.unwrap_err().to_string();
     assert!(e.contains("devtest-alpha is stopped (EXITED)"), "{e}");
     migrate_copy_on(Arc::new(FakeRemote::new()), &cfg, &f, "devtest-alpha", &pods, copy(true)).await.unwrap();
@@ -1801,9 +1804,9 @@ async fn a_replacement_behind_the_ssh_proxy_only_is_given_up_on_after_ups_grace(
     *f.to_create.lock().unwrap() = vec![new];
     let remote = Arc::new(FakeRemote::new());
     let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
-    let opts = ReplaceOpts { keep_old: false, skip_proxy: true, dry_run: false, yes: true };
+    let opts = ReplaceOpts { keep_old: false, skip_proxy: true, dry_run: false, yes: true, force: true };
     let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
-    let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None };
+    let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None, source: crate::pods::adopt::Source::Create, spares: None };
     let start = tokio::time::Instant::now();
     let e = replace_on(remote.clone(), &f, &cfg, &f, "r-alpha".into(), "devtest-alpha".into(), job).await.unwrap_err();
     let e = format!("{e:#}");
@@ -1900,7 +1903,7 @@ async fn a_cutover_whose_sync_doesnt_route_the_new_pod_reverts() {
     let remote = Arc::new(FakeRemote::new());
     remote.on("10.0.0.2:22001", "SSH_OK", FakeReply::stdout("NVIDIA RTX A4000\nSSH_OK\n"));
     let pods = owner.pods.lock().unwrap().clone();
-    let opts = CutoverOpts { skip_proxy: false, no_final_sync: true, dry_run: false, yes: true };
+    let opts = CutoverOpts { skip_proxy: false, no_final_sync: true, dry_run: false, yes: true, force: true };
     let e = migrate_cutover_on(remote, &seen, &cfg, &owner, "devtest-alpha", &pods, opts, &dir.0.display().to_string())
         .await
         .unwrap_err()
@@ -2051,10 +2054,10 @@ async fn replace_and_migrate_refuse_a_locked_pod() {
     /// `pods replace <src>` on `f`, `-y`, no proxy.
     async fn replace(f: &Fleet, cfg: &Config, src: &str, keep_old: bool, dry_run: bool) -> anyhow::Result<()> {
         let timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, None).unwrap();
-        let opts = ReplaceOpts { keep_old, skip_proxy: true, dry_run, yes: true };
+        let opts = ReplaceOpts { keep_old, skip_proxy: true, dry_run, yes: true, force: true };
         let id = f.pods.lock().unwrap().iter().find(|p| p.name == src).unwrap().id.clone();
         let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
-        let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None };
+        let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None, source: crate::pods::adopt::Source::Create, spares: None };
         replace_on(Arc::new(FakeRemote::new()), f, cfg, f, id, src.to_string(), job).await
     }
     let want = format!("refusing to replace: {}{LOCKED_REPLACEMENT_NOTE}", hint("devtest-alpha"));
@@ -2079,7 +2082,7 @@ async fn replace_and_migrate_refuse_a_locked_pod() {
     f.pods.lock().unwrap().push(pod("r-alpha-new", "devtest-alpha-new", "runpod", Some(("10.0.0.2", 22001))));
     let pods = f.pods.lock().unwrap().clone();
     let want = format!("refusing to cut over: {}{LOCKED_REPLACEMENT_NOTE}", hint("devtest-alpha"));
-    let opts = |dry_run| CutoverOpts { skip_proxy: true, no_final_sync: false, dry_run, yes: true };
+    let opts = |dry_run| CutoverOpts { skip_proxy: true, no_final_sync: false, dry_run, yes: true, force: true };
     let e = migrate_cutover_on(Arc::new(FakeRemote::new()), &f, &cfg, &f, "devtest-alpha", &pods, opts(false), "/nonexistent")
         .await
         .unwrap_err()
@@ -2133,8 +2136,8 @@ async fn replace_and_migrate_refuse_a_bad_floor_before_creating_anything() {
         // Fleet::create_pod panics: reaching a create fails the test.
         let f = locked_fleet();
         let id = f.pods.lock().unwrap().iter().find(|p| p.name == "devtest-bravo").unwrap().id.clone();
-        let opts = ReplaceOpts { keep_old: false, skip_proxy: true, dry_run, yes: true };
-        let job = ReplaceJob { setup_timeouts: timeouts(), ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None };
+        let opts = ReplaceOpts { keep_old: false, skip_proxy: true, dry_run, yes: true, force: true };
+        let job = ReplaceJob { setup_timeouts: timeouts(), ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None, source: crate::pods::adopt::Source::Create, spares: None };
         take_would_refuse();
         let r = replace_on(Arc::new(FakeRemote::new()), &f, &cfg, &f, id, "devtest-bravo".into(), job).await;
         if dry_run {
@@ -2146,7 +2149,7 @@ async fn replace_and_migrate_refuse_a_bad_floor_before_creating_anything() {
         assert!(f.calls().is_empty(), "dry run {dry_run}: {:?}", f.calls());
 
         let pods = f.pods.lock().unwrap().clone();
-        let job = MigrateCopyJob { setup_timeouts: timeouts(), ov: &ov, place: &place, dry_run, yes: true, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None };
+        let job = MigrateCopyJob { setup_timeouts: timeouts(), ov: &ov, place: &place, dry_run, yes: true, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None, source: crate::pods::adopt::Source::Create, force: false, spares: None };
         let r = migrate_copy_on(Arc::new(FakeRemote::new()), &cfg, &f, "devtest-bravo", &pods, job).await;
         if dry_run {
             r.unwrap();
@@ -2160,7 +2163,7 @@ async fn replace_and_migrate_refuse_a_bad_floor_before_creating_anything() {
     let f = locked_fleet();
     f.pods.lock().unwrap().push(pod("r-bravo-new", "devtest-bravo-new", "runpod", Some(("10.0.0.2", 22001))));
     let pods = f.pods.lock().unwrap().clone();
-    let cutover = |no_final_sync, dry_run| CutoverOpts { skip_proxy: true, no_final_sync, dry_run, yes: true };
+    let cutover = |no_final_sync, dry_run| CutoverOpts { skip_proxy: true, no_final_sync, dry_run, yes: true, force: true };
     let e = migrate_cutover_on(Arc::new(FakeRemote::new()), &f, &cfg, &f, "devtest-bravo", &pods, cutover(false, false), "/nonexistent")
         .await
         .unwrap_err()

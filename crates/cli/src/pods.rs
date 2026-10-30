@@ -22,7 +22,7 @@ use crate::pods::health::handle_deep_test;
 use crate::pods::lifecycle::{disk_fate, handle_reimage, handle_restart, handle_start, handle_terminate, names_of, no_stop_left, no_stop_refusal, repo_sites, split_no_stop, stop_lines, wipe_refusal, DiskOp, RestartOpts, TerminateOpts, RESTART_SETTLE};
 use crate::pods::list::list_with;
 use crate::pods::lock::{handle_lock, lock_why, print_would_refuse};
-use crate::pods::migrate::{handle_migrate_copy, handle_migrate_cutover, handle_migrate_finish, handle_migrate_revert, handle_migrate_status, CutoverOpts, FinishOpts, MigrateCmd};
+use crate::pods::migrate::{handle_migrate_copy, handle_migrate_cutover, handle_migrate_finish, handle_migrate_revert, handle_migrate_status, CopyHow, CutoverOpts, FinishOpts, MigrateCmd};
 use crate::pods::placement::{checked_gpu, describe_create, first_create_spec, place_names, placement_prompt, placement_request, plan_placement, print_balance_preflight, print_placement_preview, single_option_plan};
 use crate::pods::pull::{handle_pull, local_backup_dir, resolve_pull};
 use crate::pods::rename::{handle_rename, RenameRequest};
@@ -34,6 +34,7 @@ use crate::pods::setup::{handle_setup, setup_config, stage_hetzner_script};
 use crate::proxy::{proxy_deployable, sync_proxy};
 use crate::{ask, confirm, jobs, money, reap, spend, up, Interrupt};
 
+pub(crate) mod adopt;
 pub(crate) mod backup;
 pub(crate) mod baseline;
 pub(crate) mod branch;
@@ -813,19 +814,20 @@ async fn handle_pods_bal(
             handle_reimage(provider, remote, cfg, &sel, image, opts, RESTART_SETTLE, KEYS_DIR).await?;
         }
 
-        PodCmd::Replace { target, gpu, gpus, cloud, disk, volume, image, place, keep_old, skip_proxy, dry_run } => {
+        PodCmd::Replace { target, gpu, gpus, cloud, disk, volume, image, place, onto, force, keep_old, skip_proxy, dry_run } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap: false, api_extra: None, ..Default::default() };
-            let opts = ReplaceOpts { keep_old, skip_proxy, dry_run, yes };
-            handle_replace(remote, provider, cfg, &target, &ov, &place, opts, &interrupt, bal).await?;
+            let opts = ReplaceOpts { keep_old, skip_proxy, dry_run, yes, force };
+            handle_replace(remote, provider, cfg, &target, &ov, &place, onto.target(), opts, &interrupt, bal).await?;
         }
 
         PodCmd::Migrate { cmd } => match cmd {
-            MigrateCmd::Copy { target, gpu, gpus, cloud, disk, volume, image, bootstrap, place, dry_run } => {
+            MigrateCmd::Copy { target, gpu, gpus, cloud, disk, volume, image, bootstrap, place, onto, force, dry_run } => {
                 let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra: None, ..Default::default() };
-                handle_migrate_copy(remote, cfg, &target, &ov, &place, dry_run, yes, &interrupt, bal).await?;
+                let how = CopyHow { source: onto.target(), force, dry_run, yes };
+                handle_migrate_copy(remote, cfg, &target, &ov, &place, how, &interrupt, bal).await?;
             }
-            MigrateCmd::Cutover { target, yes: y, skip_proxy, no_final_sync, dry_run } => {
-                let opts = CutoverOpts { skip_proxy, no_final_sync, dry_run, yes: yes || y };
+            MigrateCmd::Cutover { target, yes: y, force, skip_proxy, no_final_sync, dry_run } => {
+                let opts = CutoverOpts { skip_proxy, no_final_sync, dry_run, yes: yes || y, force };
                 handle_migrate_cutover(remote, provider, cfg, &target, opts).await?;
             }
             MigrateCmd::Finish { target, yes: y, discard_stopped, dry_run } => {

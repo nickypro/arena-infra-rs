@@ -108,6 +108,11 @@ up=$(awk -v hz="${{hz:-100}}" 'NR == FNR {{ u = $1; next }} {{ s = $0; sub(/^.*\
 [ -n "$up" ] || up=$(ps -o etimes= -p 1 2>/dev/null | tr -d ' ')
 echo "ARENA_IDLE_UP ${{up:--}}"
 echo "ARENA_IDLE_SELF ${{SSH_CONNECTION:--}}"
+if ps_out=$(ps -eo args= 2>/dev/null); then
+  echo "ARENA_IDLE_EDITORS $(printf '%s\n' "$ps_out" | grep -c -e '[.]vscode-server/' -e '[.]vscode-server-insiders/' -e '[.]cursor-server/' -e '[.]windsurf-server/')"
+else
+  echo "ARENA_IDLE_EDITORS -"
+fi
 for f in /proc/net/tcp /proc/net/tcp6; do
   [ -r "$f" ] && awk 'FNR > 1 && $4 == "01" {{ print "ARENA_IDLE_TCP", $2, $3 }} FNR > 1 && $4 == "0A" {{ print "ARENA_IDLE_LISTEN", $2 }}' "$f"
 done | {tcp_cap}
@@ -201,6 +206,11 @@ pub struct Reading {
     pub files_complete: bool,
     /// Why the file scan is incomplete.
     pub files_note: Option<String>,
+    /// Editor-server processes running (VS Code's, Cursor's, Windsurf's — Remote-SSH's server
+    /// outlives its window by minutes, and a reconnect lands on it): what [`presence`] reads
+    /// beside the sessions. `None` = not read (`ps` failed, or a reply from before it was read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor_servers: Option<u32>,
 }
 
 /// A `/proc/net/tcp{,6}` address (`0100007F:0016`): the IP as the kernel's host-order u32
@@ -305,6 +315,7 @@ fn judge_gpu(none: bool, samples: &[(String, Vec<String>)]) -> Gpu {
 /// Parse the probe's reply. `Err` for a reply that isn't one (no marker, cut short).
 pub fn parse_reply(stdout: &str) -> Result<Reading, String> {
     let (mut now, mut up, mut me, mut end) = (None, None, None, false);
+    let mut editors: Option<u32> = None;
     let (mut est, mut listen) = (Vec::new(), Vec::new());
     let (mut gpu_none, mut samples): (bool, Vec<(String, Vec<String>)>) = (false, Vec::new());
     let (mut files, mut repo_present, mut tcp_truncated) = (None, false, false);
@@ -315,6 +326,7 @@ pub fn parse_reply(stdout: &str) -> Result<Reading, String> {
             "ARENA_IDLE_NOW" => now = rest.trim().parse::<u64>().ok(),
             "ARENA_IDLE_UP" => up = rest.trim().parse::<u64>().ok(),
             "ARENA_IDLE_SELF" => me = parse_self(rest),
+            "ARENA_IDLE_EDITORS" => editors = rest.trim().parse::<u32>().ok(),
             "ARENA_IDLE_TCP" => {
                 if let Some((l, r)) = rest.split_once(' ') {
                     if let (Some(l), Some(r)) = (decode_proc_addr(l.trim()), decode_proc_addr(r.trim())) {
@@ -365,6 +377,7 @@ pub fn parse_reply(stdout: &str) -> Result<Reading, String> {
         repo_present,
         files_complete,
         files_note,
+        editor_servers: editors,
     })
 }
 
@@ -450,6 +463,73 @@ pub fn judge(pod: &Pod, probe: &Probe, threshold: u64) -> Verdict {
     // Both known and ≥ threshold here: idle since the newest file, but never longer than up.
     let up = r.uptime_secs.unwrap_or(0);
     Verdict::Idle { idle_secs: file_age.map_or(up, |a| a.min(up)) }
+}
+
+/// Whether someone is on a machine RIGHT NOW ([`presence`]) — what `pods replace`, `migrate
+/// cutover` and `pods copy-home` ask before they move a person's machine (or home) out from
+/// under them; the operator's swapper script asked the same ("no SSH session, no VS Code
+/// server"). Unlike [`judge`] (abandoned for hours?), only the present counts: a file written a
+/// minute ago by someone who has left is no one on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Presence {
+    /// No SSH session (ours aside), no other inbound connection, no editor server.
+    Away,
+    /// Someone is on it: what says so.
+    Here(Vec<String>),
+    /// Couldn't tell: why.
+    Unknown(Vec<String>),
+}
+
+impl Presence {
+    /// `1 SSH session, a VS Code server running` / why it couldn't tell; empty when away.
+    pub fn reasons(&self) -> String {
+        match self {
+            Presence::Away => String::new(),
+            Presence::Here(r) | Presence::Unknown(r) => r.join(", "),
+        }
+    }
+}
+
+/// Judge [`Presence`] from one probe. Pure. Someone's there when the probe saw an SSH session
+/// besides its own (VS Code Remote-SSH and the proxy's forwards come in over sshd), another
+/// inbound connection from off the machine (a Jupyter tab), or an editor server running (it
+/// outlives its window by minutes, and a reconnect lands on it). A reading that's missing —
+/// our own connection not told apart, a socket list cut short, `ps` unreadable, no probe at
+/// all — is [`Presence::Unknown`], never "away"; "here" wins over "unknown".
+pub fn presence(probe: &Probe) -> Presence {
+    let r = match probe {
+        Probe::Read(r) => r,
+        Probe::NotBilling => return Presence::Unknown(vec!["it isn't running".into()]),
+        Probe::NoEndpoint => return Presence::Unknown(vec!["no SSH endpoint".into()]),
+        Probe::Failed(e) => return Presence::Unknown(vec![format!("the probe failed ({e})")]),
+    };
+    let (mut here, mut unknown) = (Vec::new(), Vec::new());
+    if r.self_found {
+        if r.ssh_sessions > 0 {
+            here.push(plural(r.ssh_sessions, "SSH session"));
+        }
+    } else {
+        unknown.push(format!("couldn't tell this probe's own connection apart ({} on the SSH port)", r.ssh_sessions));
+    }
+    if r.other_inbound > 0 {
+        here.push(plural(r.other_inbound, "other inbound connection"));
+    }
+    if !r.connections_complete {
+        unknown.push(format!("over {TCP_LINE_CAP} sockets — not every connection was read"));
+    }
+    match r.editor_servers {
+        Some(0) => {}
+        Some(1) => here.push("a VS Code (or Cursor) server running".into()),
+        Some(n) => here.push(format!("{n} VS Code (or Cursor) server processes running")),
+        None => unknown.push("couldn't list its processes (is a VS Code server running?)".into()),
+    }
+    if !here.is_empty() {
+        Presence::Here(here)
+    } else if !unknown.is_empty() {
+        Presence::Unknown(unknown)
+    } else {
+        Presence::Away
+    }
 }
 
 /// One pod's row of the report.
@@ -721,6 +801,8 @@ pub mod fixture {
         pub find_rc: &'static str,
         /// The socket list was cut at the cap (`ARENA_IDLE_TCP_TRUNCATED`).
         pub tcp_truncated: bool,
+        /// Editor-server processes (`ARENA_IDLE_EDITORS`); `None` = `ps` unreadable (`-`).
+        pub editors: Option<u32>,
     }
 
     impl Default for Reply {
@@ -735,6 +817,7 @@ pub mod fixture {
                 repo_age: Some(10 * 3600),
                 find_rc: "0",
                 tcp_truncated: false,
+                editors: Some(0),
             }
         }
     }
@@ -744,6 +827,7 @@ pub mod fixture {
             let mut s = format!("Welcome to the pod!\nARENA_IDLE_NOW {}\n", self.now);
             s.push_str(&format!("ARENA_IDLE_UP {}\n", self.up.map_or("-".into(), |u| u.to_string())));
             s.push_str("ARENA_IDLE_SELF 203.0.113.9 50000 172.17.0.2 22\n");
+            s.push_str(&format!("ARENA_IDLE_EDITORS {}\n", self.editors.map_or("-".into(), |n| n.to_string())));
             let me = v4([172, 17, 0, 2], 22);
             s.push_str(&format!("ARENA_IDLE_LISTEN {}\n", v4([0, 0, 0, 0], 22)));
             s.push_str(&format!("ARENA_IDLE_LISTEN {}\n", v4([0, 0, 0, 0], 8888)));
@@ -785,6 +869,65 @@ pub mod fixture {
 
 #[cfg(test)]
 mod tests {
+
+    /// `replace` / `cutover` / `copy-home` ask whether anyone is on the machine NOW: a session
+    /// besides the probe's, a Jupyter tab from outside, or an editor server running (it outlives
+    /// its window); anything unread is "can't tell", never "away" — and "here" wins over it.
+    #[test]
+    fn presence_is_sessions_inbound_and_editor_servers_now() {
+        use fixture::Reply;
+        let read = |r: Reply| Probe::Read(parse_reply(&r.render()).unwrap());
+        assert_eq!(presence(&read(Reply::default())), Presence::Away, "old files and an idle GPU are no one");
+        assert_eq!(presence(&read(Reply { newest_age: Some(30), ..Reply::default() })), Presence::Away, "a file a minute old isn't a person");
+        assert_eq!(presence(&read(Reply { sessions: vec![[10, 0, 0, 7]], ..Reply::default() })), Presence::Here(vec!["1 SSH session".into()]));
+        assert_eq!(
+            presence(&read(Reply { editors: Some(1), jupyter_from: vec![[198, 51, 100, 4]], ..Reply::default() })),
+            Presence::Here(vec!["1 other inbound connection".into(), "a VS Code (or Cursor) server running".into()])
+        );
+        let p = presence(&read(Reply { editors: None, ..Reply::default() }));
+        assert!(matches!(&p, Presence::Unknown(r) if r[0].contains("couldn't list its processes")), "{p:?}");
+        let p = presence(&read(Reply { editors: None, sessions: vec![[10, 0, 0, 7]], ..Reply::default() }));
+        assert_eq!(p, Presence::Here(vec!["1 SSH session".into()]), "here wins over can't tell");
+        assert!(matches!(presence(&read(Reply { tcp_truncated: true, ..Reply::default() })), Presence::Unknown(_)));
+        assert!(matches!(presence(&Probe::Failed("exit 255: refused".into())), Presence::Unknown(r) if r[0].contains("exit 255")));
+        assert!(matches!(presence(&Probe::NoEndpoint), Presence::Unknown(_)));
+        // A reply from a probe that didn't read processes (an older build's) can't say away.
+        let old = Reply::default().render().replace("ARENA_IDLE_EDITORS 0\n", "");
+        assert!(matches!(presence(&Probe::Read(parse_reply(&old).unwrap())), Presence::Unknown(_)));
+        assert_eq!(Presence::Here(vec!["1 SSH session".into(), "x".into()]).reasons(), "1 SSH session, x");
+    }
+
+    /// The probe counts editor-server processes from `ps`, and never itself: its own command
+    /// line holds the patterns, bracketed so they don't match their own text. A `ps` that fails
+    /// is `-` (can't tell), never 0. (A `ps` stub first on PATH: what this box runs is no input.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_probe_counts_editor_servers_but_not_itself() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("arena-idle-ps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = probe_command("/nonexistent-repo");
+        let run = |ps: &str| {
+            let stub = dir.join("ps");
+            std::fs::write(&stub, ps).unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+            let out = std::process::Command::new("sh").args(["-c", &probe]).env("PATH", path).output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            stdout.lines().find_map(|l| l.strip_prefix("ARENA_IDLE_EDITORS ").map(|v| v.trim().to_string())).expect("the editors line")
+        };
+        // Our own `sh -c '<script>'` (its text carries every pattern), plus two editor servers.
+        let listing = format!(
+            "/sbin/init\nsshd: root@pts/0\nsh -c {}\n/root/.vscode-server/cli/servers/Stable-abc/server/node --port 0\n\
+             sh /root/.cursor-server/bin/xyz/bin/cursor-server\njupyter-lab --no-browser\n",
+            probe.replace('\'', "")
+        );
+        let script = format!("#!/bin/sh\ncat <<'PSEOF'\n{listing}PSEOF\n");
+        assert_eq!(run(&script), "2");
+        assert_eq!(run("#!/bin/sh\necho /sbin/init\n"), "0");
+        assert_eq!(run("#!/bin/sh\nexit 1\n"), "-", "ps failed: can't tell");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::fixture::{v4, Reply};
     use super::*;
 

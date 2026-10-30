@@ -102,10 +102,12 @@ pub(crate) fn copy_failure_reason(stderr: &str) -> String {
 }
 
 /// The identity check that every replica step on pod `id` runs first, in the same session
-/// ([`arena_core::replica::identity_condition`]): on RunPod, PID 1's `RUNPOD_POD_ID` must be
-/// `id`. Other providers expose no such id: `None` (as [`target_is_pod`]).
+/// ([`arena_core::replica::pod_identity`]): on RunPod, PID 1's `RUNPOD_POD_ID` must be `id`; on
+/// a Hetzner VM its own server id (cloud-init's instance id) — an address a deleted server held
+/// can be another customer's server by now. Providers whose machines expose no id: `None` (as
+/// [`target_is_pod`]).
 pub(crate) fn pod_guard(provider: &dyn Provider, id: &str) -> Option<String> {
-    (provider.name() == "runpod").then(|| arena_core::replica::identity_condition(arena_core::replica::POD_ID_ENVIRON, id))
+    arena_core::replica::pod_identity(provider.name(), id)
 }
 
 /// Why a replica sync was refused before anything was transferred, for the operator: what
