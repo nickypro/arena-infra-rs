@@ -1431,6 +1431,30 @@ impl Action {
         }
     }
 
+    /// What the busy modal says while it runs, before the pod's name: `backing up alpha…`.
+    /// It was the label plus `ing` — `backuping`, `stoping`, `terminateing`.
+    pub fn doing(&self) -> &'static str {
+        match self {
+            Action::Restart => "restarting",
+            Action::Stop => "stopping",
+            Action::Terminate => "terminating",
+            Action::Backup => "backing up",
+            Action::Setup => "setting up",
+            Action::Test => "testing",
+            Action::Run => "running the command on",
+            Action::SetBranch => "switching the branch on",
+            Action::Start => "starting",
+            Action::Rename => "renaming",
+            Action::Jobs => "reading the jobs on",
+            Action::Logs => "reading the log on",
+            Action::Pull => "copying the home of",
+            Action::KeyLimit => "setting the AI key's cap on",
+            Action::KeyPause => "pausing the AI key on",
+            Action::KeyResume => "resuming the AI key on",
+            Action::KeyRotate => "rotating the AI key on",
+        }
+    }
+
     /// The `arena` command words it runs, for the runs panel and its footer notice.
     pub fn command(&self) -> String {
         match self {
@@ -2739,6 +2763,19 @@ mod tests {
         assert_eq!(names_preview(&names[..10], 10), names[..10].join(", "));
         assert_eq!(names_preview(&names, 10), format!("{}, … and 4 more", names[..10].join(", ")));
         assert_eq!(names_preview(&[], 10), "");
+    }
+
+    /// The busy modal's words are English: `backing up alpha…`, never the label plus `ing`.
+    #[test]
+    fn the_busy_words_are_words() {
+        assert_eq!(Action::Backup.doing(), "backing up");
+        assert_eq!(Action::Stop.doing(), "stopping");
+        assert_eq!(Action::Terminate.doing(), "terminating");
+        let ai = [Action::KeyLimit, Action::KeyPause, Action::KeyResume, Action::KeyRotate];
+        for a in Action::MENU.iter().map(|(_, a)| *a).chain(ai) {
+            let w = a.doing();
+            assert!(!w.contains("eing") && !w.contains("uping") && !w.contains("oping") && !w.contains('-'), "{a:?}: {w}");
+        }
     }
 
     /// A complete details answer replaces what was kept; an incomplete one (an error after
