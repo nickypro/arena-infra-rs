@@ -10,7 +10,7 @@ use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
 use crate::cli::CohortScope;
-use crate::{enrich_best_effort, ENRICH_TIMEOUT};
+use crate::pods::list::{enrich_best_effort, ENRICH_TIMEOUT};
 
 /// Resolve a user-supplied target (machine name, bare short name, `@name` OR raw provider
 /// id) by searching EVERY configured provider, returning the owning provider too — so
