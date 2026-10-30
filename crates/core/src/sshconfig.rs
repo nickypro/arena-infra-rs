@@ -1062,12 +1062,22 @@ mod tests {
         // From config: SSH_USER, and the admin key as this user reaches it; none set = no file.
         let cfg = Config::parse("MACHINE_NAME_PREFIX=arena9\nMACHINE_NAME_LIST=(apple bloom cloud @james-gpu @lab)\nSSH_USER=ubuntu\n");
         assert!(render_admin_for(&cfg, &pods).unwrap_err().contains("ADMIN_SSH_KEY_PATH isn't set"));
-        let cfg = Config::parse(
+        // The key at a path this test made, so it's read where it is: a path nobody can read falls
+        // back to a key of the same file name under `$HOME/.ssh` (`ssh::resolve_key_path`), and a
+        // box that holds a real `~/.ssh/arena_admin_key` (dev-nicky, the proxy box) would get that.
+        let dir = std::env::temp_dir().join(format!("arena-admin-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("arena_admin_key");
+        std::fs::write(&key, "not a real key\n").unwrap();
+        let cfg = Config::parse(&format!(
             "MACHINE_NAME_PREFIX=arena9\nMACHINE_NAME_LIST=(apple bloom cloud @james-gpu @lab)\nSSH_USER=ubuntu\n\
-             ADMIN_SSH_KEY_PATH=/nonexistent-arena/arena_admin_key\n",
-        );
-        let text = render_admin_for(&cfg, &pods).unwrap();
-        assert!(text.contains("    User ubuntu\n    IdentityFile /nonexistent-arena/arena_admin_key\n"), "{text}");
+             ADMIN_SSH_KEY_PATH={}\n",
+            key.display()
+        ));
+        let text = render_admin_for(&cfg, &pods);
+        std::fs::remove_dir_all(&dir).ok();
+        let text = text.unwrap();
+        assert!(text.contains(&format!("    User ubuntu\n    IdentityFile {}\n", key.display())), "{text}");
         assert_eq!(text.matches("\nHost ").count(), 4, "{text}");
     }
 
