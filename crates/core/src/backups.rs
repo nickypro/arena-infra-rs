@@ -1022,7 +1022,10 @@ fn read_labels(base: &Path) -> Result<BTreeMap<String, String>, String> {
         for pod in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
             let pod = pod.map_err(|e| format!("{}: {e}", dir.display()))?;
             let name = pod.file_name().to_string_lossy().into_owned();
-            if !name.starts_with('.') && pod.file_type().is_ok_and(|t| t.is_dir()) {
+            // An entry whose type can't be read fails the listing, like a listing that
+            // fails: skipped, its pod would just look copy-less (review codex r4).
+            let is_dir = pod.file_type().map_err(|e| format!("{}: {e}", pod.path().display()))?.is_dir();
+            if !name.starts_with('.') && is_dir {
                 out.insert(name, l.clone());
             }
         }

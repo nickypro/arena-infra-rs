@@ -2252,7 +2252,7 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Pro
     if c.action.cli() {
         return start_cli_action(ui, shared, c.action, &pod, None);
     }
-    ui.mode = Mode::Working(format!("{}ing {}…", c.action.label(), pod.name));
+    ui.mode = Mode::Working(format!("{} {}…", c.action.doing(), pod.name));
     let (provider, remote, cfg, action) = (provider.clone(), ui.remote.clone(), ui.cfg.clone(), c.action);
     start_action(shared, async move {
         execute(provider.as_ref(), remote.as_ref(), &cfg, action, &pod, None).await

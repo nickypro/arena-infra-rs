@@ -19,6 +19,13 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-30 · The backups screen says when it can't read a copy; "backing up", not "backuping"
+- `arena backups` and the dashboard's backups screen: a snapshot folder entry whose type can't be
+  read now makes the home-copy cell unknown (with the path and the error), instead of quietly
+  leaving that pod out.
+- The dashboard's busy box while an action runs reads `backing up alpha…`, `stopping alpha…`,
+  `terminating alpha…` (it added `ing` to the action's name: `backuping`, `stoping`).
+
 ## 2026-10-30 · Every backup in one place: `arena backups` and the dashboard's `b`
 - `arena backups` shows which backups happen and when, and how they're doing. For the git
   backup, the home copy and the archive's two pushes: whether each is set up (if not, the command
