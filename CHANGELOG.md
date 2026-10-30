@@ -43,6 +43,78 @@ earlier).
   range, and cron lines written by hand — `arena cron install` for a second config would replace
   the first fleet's lines.
 
+## 2026-10-30 · Copies onto the control box no longer fill its disk
+- Every copy arena makes onto the box it runs on — `pods pull`, `pods backup`'s pull and its copies
+  of pods git didn't back up (a failed push, a wrong origin, a BUSY pod), `set-branch --hard`'s
+  copies, `pods baseline`, replace/migrate's local staging and the reaper's — now checks that disk
+  first: it goes ahead only if `CONTROL_MIN_FREE_GB` (default 5 GB) stays free after it, the run's
+  other copies and other arena runs' copies under way (a cron backup and an operator's pull at
+  once, any cohort: each run notes what its copies may take in
+  `<ARENA_STATE_DIR>/disk-reservations.json` until they end; notes that can't be read or written
+  skip the run's copies). A pod's first copy counts as 3 GB per tier, a later one as 0.1 GB — later
+  only once the pod's whole home was copied into that backup (`<LOCAL_BACKUP_DIR>/.arena-copied/<pod>`;
+  the pods already backed up there are marked once, at the first such run), so an interrupted
+  first copy's retry is still a first one —, the staging as measured. A pod that doesn't fit is
+  skipped whole, before anything of it is written, with one line (`✗ arena9-bloom: skipped: only
+  3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB) — nothing copied; …`), and the
+  run fails. The git backup itself isn't affected. (Prod's box was at 96 %, 3.1 GB free of 75 GB,
+  with the */15 cron copying pods onto it unchecked.)
+- The floor holds while copies write too: a run looks at the disks its copies write to every 2 s
+  and stops them once one has less than the floor free (`stopped: only 4.9 GB free on / while
+  copying …` — what was copied stays, the run fails, the health check lists it). An estimate is no
+  bound: a later copy, counted 0.1 GB a tier, can bring a new 12 GB file.
+- The daily health check (`cron install --health`) now ends with this box: how full its disk is,
+  what arena left on it, and every pod whose copy was skipped for space in the last day, which
+  fails the check.
+- `config check` shows how full each disk arena writes to is (⚠ under twice the floor, ⚠ under it,
+  with arena's biggest dirs there), and what arena left on the box: a replace/migrate staging copy
+  (`/tmp/arena-replace-<pod id>`), an interrupted `pods baseline`, a hard-stopped pull's rsync temp
+  files — with size, age and the commands to look at and remove each. `teardown --check` lists them
+  too (◷ kept, never against its verdict). None of these removes anything: a staging copy can be the
+  only copy of a pod's work.
+- replace/migrate's staging copy is now locked while a run copies through it: a second
+  replace/migrate of the same pod is refused instead of writing into it, and `migrate finish` / a
+  finished `replace` never remove one a run is using. One an earlier attempt left stays when a later
+  attempt copies directly (it may hold what the source has lost since): listed, as above.
+- `pods setup` / `up` on Hetzner or Shadeform no longer leave their setup script
+  (`/tmp/arena-hetzner-setup-<pid>.sh`) behind.
+- The reaper keeps its own `REAP_MIN_FREE_GB` (default 20) free, never less than
+  `CONTROL_MIN_FREE_GB`.
+
+### Action needed
+- On a filesystem with less than the floor free, every copy onto it is skipped (and its run fails)
+  until there's room. On prod today the backups (`LOCAL_BACKUP_DIR` on the attached volume, ~330 GB
+  free) are fine, but `/` (3.1 GB free: `/tmp`, where replace/migrate stage a pod's home, and the
+  state dir) is under the 5 GB floor — a via-local replace/migrate would be refused, and `config
+  check` / the health check show `/` with ⚠. Make room first, or lower the floor for a while
+  (`arena config set CONTROL_MIN_FREE_GB 2`, or `CONTROL_MIN_FREE_GB=2` for one command).
+- The first judged run on a backup marks the pods already backed up there as copied whole (one line,
+  `note: N pod(s) already backed up … marked`); nothing to do.
+- Suggestions for prod's control box (yours to decide; check before deleting anything):
+  - `/tmp/arena-replace-leh3rc2hdcf31i` (3.5 GB, written 2026-10-14 09:42 UTC): replace/migrate's
+    staging copy of pod `leh3rc2hdcf31i`'s home (`ARENA_3.0`, the chapter dirs, its dotfiles, the
+    copy's `.arena_replace_marker`). Left by the build prod ran then — master from 2026-10-07
+    (`bae0112`), which never removed its staging, even after a copy that worked; removal reached
+    master with #3 on 2026-10-19. Check that the pod's work is on the pod that replaced it or in
+    `LOCAL_BACKUP_DIR` (`arena pods list --no-probe | grep -F leh3rc2hdcf31i`, `ls -la
+    /tmp/arena-replace-leh3rc2hdcf31i`), then `rm -rf /tmp/arena-replace-leh3rc2hdcf31i`.
+  - The rest of `/tmp/arena-*` is small (a few MB): `arena-hetzner-setup-<pid>.sh` setup scripts
+    (fixed above) and dev-owned test dirs from when the tests ran on that box (before 2026-10-21) —
+    safe to remove.
+  - journald (3.6 GB): `journalctl --vacuum-size=500M`, and `SystemMaxUse=500M` in
+    `/etc/systemd/journald.conf` to keep it there.
+  - `/root/archive/old-pod-backups` (14 GB): move it to the attached volume.
+  - Docker (~6 GB reclaimable): `docker system df`, then `docker image prune` / `docker builder
+    prune` if nothing needs what they remove.
+  - Then `arena config check` shows what's free, and what arena left on the box.
+
+### Config
+- `CONTROL_MIN_FREE_GB` (new, default 5): whole GB every copy onto this box leaves free on its
+  filesystem, 0..100000 (0: only the copy itself must fit). A bad value fails every copy up front.
+  Settable from the environment for one run (`CONTROL_MIN_FREE_GB=2 arena pods pull alpha`).
+- replace/migrate's local staging now keeps `CONTROL_MIN_FREE_GB` free (before: a tenth of the
+  disk, at least 5 GB).
+
 ## 2026-10-30 · Ctrl+C stops a capacity retry at once, even mid-listing
 - `pods up`/`create` with `--retry-mins` (and the dashboard's retry, stopped with `[s]`) now stop
   the moment Ctrl+C is pressed. Before, a press while arena was re-listing the fleet between rounds

@@ -16,6 +16,7 @@ pub mod balance;
 pub(crate) mod base64;
 pub mod config;
 pub mod cron;
+pub mod disk;
 pub mod error;
 pub mod fleet;
 pub mod gpu;

@@ -122,6 +122,9 @@ pub struct Inputs {
     pub images: Probe<crate::image::Inventory>,
     /// Now (unix): a build VM's age.
     pub now: u64,
+    /// What arena left on this box ([`crate::disk::find_leftovers`]): a replace/migrate staging
+    /// copy, an interrupted baseline capture, a hard-stopped pull's rsync temp files.
+    pub leftovers: Probe<Vec<crate::disk::Leftover>>,
 }
 
 /// One checklist line's outcome.
@@ -136,8 +139,8 @@ pub enum Verdict {
     Unknown,
     /// Doesn't apply here (not configured / not installed): not checked.
     Skipped,
-    /// Still there ON PURPOSE until a date the operator set (the backup archive before its
-    /// `ARCHIVE_KEEP_UNTIL`): shown, never counted against the check.
+    /// Still there ON PURPOSE (the backup archive before its `ARCHIVE_KEEP_UNTIL`, the arena
+    /// images, a copy no check removes): shown, never counted against the check.
     Kept,
 }
 
@@ -165,6 +168,7 @@ pub enum Area {
     Proxy,
     Archive,
     Images,
+    Leftovers,
 }
 
 impl Area {
@@ -172,6 +176,7 @@ impl Area {
         match self {
             Area::Archive => "backup archive",
             Area::Images => "images",
+            Area::Leftovers => "left on this box",
             Area::Pods => "pods",
             Area::Volumes => "network volumes",
             Area::Keys => "OpenRouter keys",
@@ -258,6 +263,16 @@ pub enum Entry {
         /// `cx23, nbg1, protected` / `200 GB, detached, protected`.
         detail: String,
     },
+    /// Something arena left on this box ([`crate::disk::Leftover`]).
+    Leftover {
+        path: String,
+        /// `3.5 GB, last written 16 days ago`.
+        detail: String,
+        /// What made it.
+        what: String,
+        /// A run is using it now.
+        in_use: bool,
+    },
 }
 
 /// One checklist line, with what's still there and how to clean it up.
@@ -334,6 +349,7 @@ pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
     items.push(proxy_item(&inputs.proxy, &configured));
     items.push(archive_item(&inputs.archive, naming.prefix, inputs.archive_keep_until, inputs.today_days, &inputs.archive_prices));
     items.push(images_item(&inputs.images, naming.prefix, inputs.now));
+    items.push(leftovers_item(&inputs.leftovers, inputs.now));
     let count = |v: Verdict| items.iter().filter(|i| i.verdict == v).count();
     let (remaining, unknown) = (count(Verdict::Remaining), count(Verdict::Unknown));
     Report {
@@ -345,6 +361,40 @@ pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
         balance: Vec::new(),
         balance_at: 0,
     }
+}
+
+/// What arena left on this box ([`crate::disk::find_leftovers`]): ◷ kept — never against the
+/// check, which never removes one (a staging copy can be the only copy of a pod's work) — with
+/// how to look at each and the `rm -rf` once checked; one in use now is
+/// shown, with no fix. Nothing there: ✓.
+pub fn leftovers_item(probe: &Probe<Vec<crate::disk::Leftover>>, now: u64) -> Item {
+    let scope = "copies and temp files";
+    let left = match probe {
+        Probe::Skipped(why) => return Item::new(Area::Leftovers, scope, Verdict::Skipped, why.clone()),
+        Probe::Failed(e) => return Item::new(Area::Leftovers, scope, Verdict::Unknown, format!("couldn't look ({e})")),
+        Probe::Got(left) if left.is_empty() => return Item::new(Area::Leftovers, scope, Verdict::Clear, "none"),
+        Probe::Got(left) => left,
+    };
+    let bytes: u64 = left.iter().map(|l| l.bytes).sum();
+    let mut item = Item::new(
+        Area::Leftovers,
+        scope,
+        Verdict::Kept,
+        format!("{} left by arena, {} — kept: look at each, then remove it", left.len(), crate::disk::gb(bytes)),
+    );
+    for l in left {
+        item.entries.push(Entry::Leftover { path: l.path.display().to_string(), detail: l.facts(now), what: l.what(), in_use: l.in_use });
+        if l.in_use {
+            continue;
+        }
+        let (look, remove) = l.commands();
+        if let Some(c) = l.caution() {
+            item.notes.push(format!("{}: {c}", l.path.display()));
+        }
+        item.notes.push(format!("look: {look}"));
+        item.fix.push(remove);
+    }
+    item
 }
 
 /// Is `name` a key `keys gen` would have minted for this cohort's machines: its own
@@ -1256,6 +1306,7 @@ fn entry_lines(entries: &[Entry]) -> Vec<String> {
         Entry::Volume { id, .. } => id.clone(),
         Entry::AtJob { id, .. } => format!("#{id}"),
         Entry::CronLine { .. } => String::new(),
+        Entry::Leftover { path, .. } => path.clone(),
     };
     let w = entries.iter().map(|e| key(e).chars().count()).max().unwrap_or(0);
     entries
@@ -1317,6 +1368,9 @@ fn entry_lines(entries: &[Entry]) -> Vec<String> {
                     format!("{k}  id={id}  {resource}  {detail}  (cohort {prefix})")
                 }
                 Entry::Image { id, resource, detail, .. } => format!("{k}  id={id}  {resource}  {detail}"),
+                Entry::Leftover { detail, what, in_use, .. } => {
+                    format!("{k}  {detail}  {}", if *in_use { "in use now by a running arena".to_string() } else { what.clone() })
+                }
             };
             line.trim_end().to_string()
         })
@@ -1428,6 +1482,7 @@ mod tests {
             archive_prices: crate::archive::Prices::LIST,
             today_days: 20_000,
             images: Probe::Got(crate::image::Inventory::default()),
+            leftovers: Probe::Got(Vec::new()),
             now: 20_000 * 86_400,
         }
     }
@@ -1513,6 +1568,7 @@ mod tests {
                 (Area::Proxy, "/srv/proxy.conf", Verdict::Clear),
                 (Area::Archive, "hetzner", Verdict::Clear), // the archive answered: none
                 (Area::Images, "hetzner", Verdict::Clear),
+                (Area::Leftovers, "copies and temp files", Verdict::Clear),
             ]
         );
         let text = r.render();
@@ -2239,5 +2295,50 @@ mod tests {
         let text = r.render();
         assert!(text.contains("✗ pods (runpod): 1 remains") && text.contains("Suggested order"), "{text}");
         assert_eq!(r.verdict_line(), "NOT CLEAR: 1 item(s) still remain, 0 couldn't be checked.");
+    }
+
+    /// What arena left on the box (disk-guard): ◷ kept, never against the check — arena never
+    /// removes such a copy itself — each with how to look at it, the caution a staging copy
+    /// needs, and its `rm -rf`; one in use now has no fix. None: ✓. Couldn't look: ?.
+    #[test]
+    fn leftovers_on_the_box_are_kept_and_shown_with_how_to_remove_them() {
+        use crate::disk::{Leftover, LeftoverKind};
+        let names = list();
+        let naming = Naming { prefix: "arena8", list: &names };
+        let now = 1_793_318_400;
+        let staged = Leftover {
+            path: "/tmp/arena-replace-leh3rc2hdcf31i".into(),
+            kind: LeftoverKind::Staging { source: "leh3rc2hdcf31i".into() },
+            bytes: 3_500_000_000,
+            capped: false,
+            changed: Some(now - 16 * 86_400),
+            in_use: false,
+        };
+        let running = Leftover { path: "/tmp/arena-replace-abc".into(), kind: LeftoverKind::Staging { source: "abc".into() }, in_use: true, ..staged.clone() };
+        let mut i = inputs();
+        i.now = now;
+        i.leftovers = Probe::Got(vec![staged, running]);
+        let r = build(&i, &naming);
+        assert!(r.clear, "kept, not against the check: {}", r.render());
+        let item = r.items.iter().find(|x| x.area == Area::Leftovers).unwrap();
+        assert_eq!(item.verdict, Verdict::Kept);
+        assert_eq!(item.fix, ["rm -rf /tmp/arena-replace-leh3rc2hdcf31i"], "nothing for the one in use");
+        assert!(item.notes.iter().any(|n| n.contains("it may be the only copy of that pod's work")), "{:?}", item.notes);
+        assert!(item.notes.iter().any(|n| n == "look: du -sh /tmp/arena-replace-leh3rc2hdcf31i; ls -la /tmp/arena-replace-leh3rc2hdcf31i"));
+        let text = r.render();
+        assert!(text.contains("◷ left on this box (copies and temp files): 2 left by arena, 7 GB — kept: look at each, then remove it"), "{text}");
+        assert!(text.contains("/tmp/arena-replace-leh3rc2hdcf31i  3.5 GB, last written 16 days ago  pod leh3rc2hdcf31i's home"), "{text}");
+        assert!(text.contains(&format!("{:<33}  3.5 GB, last written 16 days ago  in use now by a running arena", "/tmp/arena-replace-abc")), "{text}");
+        assert!(r.verdict_line().starts_with("ALL CLEAR") && r.verdict_line().contains("kept"), "{}", r.verdict_line());
+        let v = serde_json::to_value(&r).unwrap();
+        let a = v["items"].as_array().unwrap().iter().find(|x| x["area"] == "leftovers").unwrap();
+        assert_eq!((a["verdict"].as_str(), a["entries"][0]["kind"].as_str()), (Some("kept"), Some("leftover")));
+        for (probe, verdict) in [
+            (Probe::Got(vec![]), Verdict::Clear),
+            (Probe::Failed("no /tmp".into()), Verdict::Unknown),
+            (Probe::Skipped("not here".into()), Verdict::Skipped),
+        ] {
+            assert_eq!(leftovers_item(&probe, now).verdict, verdict);
+        }
     }
 }
