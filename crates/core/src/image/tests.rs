@@ -306,6 +306,10 @@ fn a_build_vm_is_left_over_after_three_hours() {
 // The scrub script, run for real under bash on a stand-in root
 // ---------------------------------------------------------------------------------------------
 
+/// VS Code's machine settings as setup leaves them on a Hetzner VM (interpreter + memory-saving).
+const VSCODE_SETTINGS: &str = "{\n    \"python.defaultInterpreterPath\": \"/root/ARENA_materials/.venv/bin/python\",\n    \
+                               \"python.analysis.indexing\": false,\n    \"files.watcherExclude\": {\n        \"**/.venv/**\": true\n    }\n}\n";
+
 /// A fake root as the bake VM has it after setup (and, as a belt, after a copy-keys).
 struct Root {
     dir: std::path::PathBuf,
@@ -369,6 +373,11 @@ impl Root {
         git(&["init", "-q"]);
         git(&["-c", "user.email=t@t", "-c", "user.name=t", "add", "requirements.txt", "install_uv.sh"]);
         git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+        // What setup gives every machine, which VMs from the image keep: the checkout's git
+        // identity and VS Code's memory-saving machine settings.
+        git(&["config", "user.name", crate::setup::GIT_IDENTITY_NAME]);
+        git(&["config", "user.email", crate::setup::GIT_IDENTITY_EMAIL]);
+        w("root/.vscode-server/data/Machine/settings.json", VSCODE_SETTINGS);
         // The stand-ins for what the script runs as root: swapoff, logged (exit $SWAPOFF_EXIT).
         // (A swapoff that works takes the swap off the stand-in /proc/swaps, as the kernel does.)
         w("bin/swapoff", "#!/bin/sh\necho \"swapoff $*\" >> \"$(dirname \"$0\")/../calls.log\"\n[ \"${SWAPOFF_EXIT:-0}\" = 0 ] || exit \"$SWAPOFF_EXIT\"\n[ -n \"${SWAPOFF_KEEPS:-}\" ] || sed -i '2,$d' \"$ARENA_PROC_SWAPS\"\n");
@@ -487,6 +496,16 @@ fn the_scrub_leaves_nothing_of_the_bake_vm_and_its_scan_is_clean() {
     for kept in ["root/.ssh/known_hosts", "root/.codex/config.toml", "etc/ssh/sshd_config", "root/ARENA_materials/.venv/lib/botocore/docs.txt", "var/log/syslog", "root/.oh-my-zsh/plugins/dotenv/README.md"] {
         assert!(r.exists(kept), "{kept} went");
     }
+    assert_eq!(r.read("root/.vscode-server/data/Machine/settings.json"), VSCODE_SETTINGS, "VS Code's settings stay");
+    let ident = |key: &str| {
+        let out = Command::new("git").current_dir(r.path("root/ARENA_materials")).args(["config", "--local", key]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(
+        (ident("user.name"), ident("user.email")),
+        (crate::setup::GIT_IDENTITY_NAME.to_string(), crate::setup::GIT_IDENTITY_EMAIL.to_string()),
+        "the checkout's git identity stays"
+    );
     assert_eq!(r.read("root/.bashrc"), "alias ll='ls -l'\nexport PATH=$PATH:/x\n", "only the token exports go");
     assert_eq!(r.read("root/.zshrc"), "source ~/.p10k.zsh\n");
     assert_eq!(r.read("root/.zshrc.pre-arena-20261029T1200"), "alias x=y\n", "setup's saved copy too");
