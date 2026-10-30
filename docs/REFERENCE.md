@@ -2168,7 +2168,9 @@ is moved aside (`spend.json.ignored-<time>`), never overwritten.
 **RunPod's own numbers.** RunPod's REST billing splits per pod: `GET /v2/billing/pods`, hourly,
 one record per pod (checked live 2026-10-30: the records sum to `/v2/billing`'s total). `arena
 spend` reads it for the window: an hour two hours old is what RunPod billed that pod (`SOURCE`
-billed), a younger one the higher of billing and metering (billing lags about an hour). The last
+billed) — an hour without a record for a pod the answer has is $0 — and a younger one the higher
+of billing and metering (billing lags about an hour). With `--since` mid-hour, that first part-hour
+is metered (a bucket is a whole hour). The last
 note says how much of the account's billing in the window the rows account for — the rest is other
 pods, volumes or serverless.
 
@@ -2176,12 +2178,15 @@ pods, volumes or serverless.
 
 | Note | Charged | Errs |
 | --- | --- | --- |
-| not observed for a while (> 30 min) | its rate throughout | high, if it was stopped meanwhile |
+| not observed for over 30 min | at the higher of the rates either side | either way (it may have been stopped, or started, meanwhile) |
 | vanished between two observations | up to the first listing without it | high, by at most that gap |
 | first seen well after its provider says it was made | back to then, at its first rate | either way |
-| running before tracking began | from the first observation | low |
+| may have run before arena first saw it (made before tracking began, or found after its provider went unlisted for over 30 min) | from the first observation (RunPod: from its creation where billing covers it, then not an estimate) | low |
 | no price known | 0 | low |
 | stopped on Vast | its disk at a storage ceiling | high |
+
+A listing older than what the ledger already has (a slow command, a clock that went back) changes
+nothing: it neither ends a machine seen since nor reopens one ended since.
 
 Hetzner bills a server at most its monthly price in a month (about 26 days of hourly price): not
 modelled, a week never reaches it.
@@ -2192,16 +2197,21 @@ sandbox's USD; arena assumes EUR until it's read). Totals are per currency.
 
 **AI keys** (OpenRouter, by hash). A key's owner is its machine's owner when arena minted it (`keys
 gen`/`rotate`), or the first owner its machine gets (a key minted before the machine), or `spend
-assign <hash> <owner>`. Its spend is its all-time `usage` (`--since`: the usage since that day's
-first reading). Before arena deletes a key — `keys rotate`/`revoke`, `pods terminate
---revoke-key`, a handover — its usage is recorded from the listing just taken, so it stays its
-owner's; a key deleted outside arena keeps its last seen usage, flagged.
+assign <hash> <owner>`. Its spend is its all-time `usage`; with `--since`, the rise from its usage
+at the window's start. The snapshot cron line reads every key's usage hourly, so there is a reading
+near any start: when the last one before it is older (the usage then rose before the next one), the
+rise in between is counted, `~`, erring high; a key first read after the start counts from that
+reading, `~`, erring low. Before arena deletes a key — `keys rotate`/`revoke`, `pods terminate
+--revoke-key`, a handover — its usage as listed just before is recorded with the delete, so it
+stays its owner's; a key deleted outside arena keeps its last seen usage, flagged.
 
 **Key handover.** `pods up/create --owner bob apple`, when `apple`'s key was minted for alice:
 the plan says so, and after the prompt (before the create) `apple`'s key is rotated — alice keeps
 what it spent, bob's machine gets a fresh key (cap `OPENROUTER_KEY_LIMIT`). `--keep-key` keeps the
-old key (and what's spent on it stays alice's). A handover that fails is a `✗` line, never a
-failed create.
+old key (and what's spent on it stays alice's). A handover that fails (OpenRouter down, no
+`OPENROUTER_PROVISIONING_KEY`) stops the command before anything is created — the new machine would
+get alice's key, or one already deleted (whose row then leaves the keys CSV). Re-run once `arena
+keys rotate apple` works, or pass `--keep-key`.
 
 `--csv`: per owner `owner,machines,instances,hours,compute_<cur>…,ai_usd,total_<cur>…,estimate`;
 `--by machine --csv` one row per instance (`name,id,provider,gpu,owner,start,end,end_how,hours,

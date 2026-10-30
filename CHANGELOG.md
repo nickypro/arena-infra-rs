@@ -33,8 +33,8 @@ earlier).
   report says how much of the account's billing it accounts for. Other estimates are marked `~`,
   with which way they err.
 - An AI key's spend stays with the person it was minted for: `--owner bob` for a name whose key
-  was alice's rotates it first (`--keep-key` to skip), and every key arena deletes has its usage
-  recorded first.
+  was alice's rotates it first (`--keep-key` to skip; if the rotation fails, nothing is created),
+  and every key arena deletes has its final usage recorded with the delete.
 - `pods list`, the dashboard, `teardown --check`, `arena balance`, the snapshot cron line and
   every create, stop, start and terminate now record what they see in a local ledger,
   `~/.local/state/arena/<prefix>/spend.json` (0600) — quietly: nothing else they print changes.

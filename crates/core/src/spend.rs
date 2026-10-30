@@ -22,11 +22,13 @@
 //! and metering (billing lags about an hour).
 //!
 //! **Estimates are flagged, with the way they err.** A stretch longer than [`GAP`] with no
-//! observation (charged at its rate throughout: errs high if it was stopped meanwhile); a
-//! machine that vanished between observations (charged to the first listing without it:
-//! errs high by at most that gap); one seen first long after its provider says it was made
-//! (charged at its first seen rate back to then); no price known (0: errs low); a stopped
-//! Vast disk at a storage ceiling (errs high). Hetzner's monthly cap (a server never costs
+//! observation (charged at the higher end: errs either way — it may have been stopped, or
+//! started, meanwhile); a machine that vanished between observations (charged to the first
+//! listing without it: errs high by at most that gap); one seen first long after its provider
+//! says it was made (charged at its first seen rate back to then); one that may have run
+//! before arena first saw it (made before tracking began, or found after its provider went
+//! unlisted for a while: counted from then, errs low — unless RunPod's billing covers it); no
+//! price known (0: errs low); a stopped Vast disk at a storage ceiling (errs high). Hetzner's monthly cap (a server never costs
 //! more than its monthly price in a month, about 26 days of hourly price) isn't modelled: a
 //! week never reaches it.
 //!
@@ -95,8 +97,8 @@ pub const CREATE_GRACE: u64 = 5 * 60;
 /// after that, the terminate didn't take, and it's open again.
 pub const TERMINATE_GRACE: u64 = 10 * 60;
 
-/// A key's usage is sampled at most once per this many seconds (one sample per UTC hour):
-/// `--since DATE` needs the usage at a day's start, not every refresh's.
+/// The snapshot cron lists the AI keys at most this often (seconds): `--since DATE` needs a
+/// reading near the window's start, not one per refresh.
 pub const KEY_SAMPLE_EVERY: u64 = 3_600;
 
 /// Key samples older than this are thinned to one per UTC day (seconds).
@@ -218,6 +220,14 @@ pub struct Machine {
     /// When its billing began (see `start_how`).
     pub start: u64,
     pub start_how: StartHow,
+    /// Its provider's creation time, where it says (Hetzner, RunPod v2): RunPod's billing may
+    /// cover hours before `start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<u64>,
+    /// Seen first by a listing with no way to tell how long it had run (made before tracking
+    /// began, or found after a long silence of its provider): counted from `start` (errs low).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub start_unsure: bool,
     pub first_seen: u64,
     pub last_seen: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -295,15 +305,24 @@ pub struct AiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<u64>,
     pub first_seen: u64,
-    /// `(when, all-time usage USD)`, at most one per UTC hour (per day once old).
-    pub usage: Vec<(u64, f64)>,
+    /// Its all-time usage (USD) over time: each value with when it was first and last read,
+    /// so `--since` knows whether the usage at a window's start was seen or falls in a gap.
+    pub usage: Vec<Usage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gone: Option<KeyGone>,
 }
 
+/// One usage value of a key and the span it was read over.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    pub from: u64,
+    pub to: u64,
+    pub usd: f64,
+}
+
 impl AiKey {
     pub fn last_usage(&self) -> f64 {
-        self.usage.last().map_or(0.0, |u| u.1)
+        self.usage.last().map_or(0.0, |u| u.usd)
     }
 }
 
@@ -321,11 +340,26 @@ pub struct SpendState {
     /// An account's billing currency where read (`hetzner` → `USD`/`EUR`, from `GET /pricing`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub currencies: BTreeMap<String, String>,
+    /// When each provider last listed completely: a machine first seen long after its
+    /// provider's last listing may have run unseen before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub listed: BTreeMap<String, u64>,
+    /// When the AI keys were last listed completely (the snapshot cron lists them hourly).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys_listed: Option<u64>,
 }
 
 impl Default for SpendState {
     fn default() -> Self {
-        SpendState { version: STATE_VERSION, since: None, machines: Vec::new(), keys: Vec::new(), currencies: BTreeMap::new() }
+        SpendState {
+            version: STATE_VERSION,
+            since: None,
+            machines: Vec::new(),
+            keys: Vec::new(),
+            currencies: BTreeMap::new(),
+            listed: BTreeMap::new(),
+            keys_listed: None,
+        }
     }
 }
 
@@ -478,6 +512,20 @@ pub fn observe(mut state: SpendState, listing: &Listing, pods: &[Pod], naming: &
         .flatten()
         .map(|p| (p.provider.as_str(), p.id.as_str()))
         .collect();
+    // When each provider was last listed before this one (for a machine first seen now). It
+    // moves at most every REFRESH, like a machine's last sighting: the dashboard's refreshes
+    // don't rewrite the file (a minute is nothing next to GAP); a clock that went back never
+    // moves it.
+    let before: BTreeMap<String, u64> = state.listed.clone();
+    for p in &ok {
+        match state.listed.get_mut(*p) {
+            Some(t) if now < *t + REFRESH => {}
+            Some(t) => *t = now,
+            None => {
+                state.listed.insert(p.to_string(), now);
+            }
+        }
+    }
     for p in pods.iter().filter(|p| ok.contains(p.provider.as_str()) && !p.id.is_empty()) {
         let found = state.open_index(Some(&p.provider), &p.id).or_else(|| {
             // Ended by a listing that didn't show it (a glitch) — or by a terminate that
@@ -487,6 +535,11 @@ pub fn observe(mut state: SpendState, listing: &Listing, pods: &[Pod], naming: &
         match found {
             Some(i) => {
                 let m = &mut state.machines[i];
+                // An older listing (a slow command, a clock that went back) changes nothing a
+                // newer observation already recorded — not its name, its end, or its rate.
+                if now < m.last_seen || m.ended.is_some_and(|e| now <= e.at) {
+                    continue;
+                }
                 let rate = rate_of(p, m.last_running_rate());
                 let winding_down = m.ended.is_some_and(|e| e.how == EndHow::Terminated && now.saturating_sub(e.at) < TERMINATE_GRACE);
                 if m.ended.is_some() && rate.is_some() && !winding_down {
@@ -512,6 +565,14 @@ pub fn observe(mut state: SpendState, listing: &Listing, pods: &[Pod], naming: &
                         None => (now, StartHow::Seen),
                     };
                     let mut m = new_machine(p, start, start_how, now);
+                    // Counted from now: was it running unseen before? Its provider says it was
+                    // made earlier, or nobody listed that provider just before.
+                    let last_listed = before.get(&p.provider).copied();
+                    m.start_unsure = start_how == StartHow::Seen
+                        && match p.created_at {
+                            Some(c) => c + GAP < now,
+                            None => last_listed.is_none_or(|t| now.saturating_sub(t) > GAP),
+                        };
                     extend(&mut m, now, r, 0, Seen::Listed);
                     state.machines.push(m);
                 }
@@ -520,7 +581,9 @@ pub fn observe(mut state: SpendState, listing: &Listing, pods: &[Pod], naming: &
         }
     }
     for m in state.machines.iter_mut().filter(|m| m.is_open() && ok.contains(m.provider.as_str())) {
-        if listed.contains(&(m.provider.as_str(), m.id.as_str())) {
+        // Not listed — by a listing at least as new as its last sighting (an older one says
+        // nothing about now).
+        if listed.contains(&(m.provider.as_str(), m.id.as_str())) || now <= m.last_seen {
             continue;
         }
         if m.start_how == StartHow::Created && now.saturating_sub(m.first_seen) < CREATE_GRACE {
@@ -541,6 +604,8 @@ fn new_machine(p: &Pod, start: u64, start_how: StartHow, now: u64) -> Machine {
         gpu: None,
         start,
         start_how,
+        created: p.created_at,
+        start_unsure: false,
         first_seen: now,
         last_seen: now,
         ended: None,
@@ -793,27 +858,25 @@ fn adopt_keys(state: &mut SpendState, machine: &str, owner: &str) {
     }
 }
 
-/// Record a usage reading, at most one per UTC hour (a later one in the same hour replaces
-/// it), thinning old samples to one per day. A reading never goes down (a refund or a reset
-/// isn't spend we can place): the higher is kept.
-fn sample(usage: &mut Vec<(u64, f64)>, now: u64, u: f64) {
+/// Record a usage reading: the same value extends its span; a new one starts a span. A
+/// reading never goes down (a refund or a reset isn't spend we can place) — and one taken
+/// on a clock that went back still raises the last value, never lost. Spans older than
+/// [`KEY_THIN_AFTER`] are merged to one per UTC day (each day's last value).
+fn sample(usage: &mut Vec<Usage>, now: u64, u: f64) {
     if !u.is_finite() || u < 0.0 {
         return;
     }
-    let u = usage.last().map_or(u, |l| l.1.max(u));
     match usage.last_mut() {
-        Some(l) if (l.1 - u).abs() < SAME_RATE => {}
-        Some(l) if now / KEY_SAMPLE_EVERY == l.0 / KEY_SAMPLE_EVERY && now >= l.0 => *l = (now, u),
-        Some(l) if now < l.0 => {}
-        _ => usage.push((now, u)),
+        Some(l) if u <= l.usd + SAME_RATE => l.to = l.to.max(now),
+        Some(l) if now <= l.to => l.usd = u,
+        _ => usage.push(Usage { from: now, to: now, usd: u }),
     }
-    // Old samples: the last of each UTC day.
     let cut = now.saturating_sub(KEY_THIN_AFTER);
-    let mut kept: Vec<(u64, f64)> = Vec::with_capacity(usage.len());
+    let mut kept: Vec<Usage> = Vec::with_capacity(usage.len());
     for s in usage.iter().copied() {
         if let Some(prev) = kept.last_mut() {
-            if s.0 < cut && prev.0 / 86_400 == s.0 / 86_400 {
-                *prev = s;
+            if s.to < cut && prev.from / 86_400 == s.from / 86_400 {
+                *prev = Usage { from: prev.from, to: s.to, usd: s.usd };
                 continue;
             }
         }
@@ -830,50 +893,69 @@ pub fn observe_keys(mut state: SpendState, keys: &[KeyInfo], naming: &Naming, no
     state.begin(now);
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for k in keys {
-        let Some(name) = k.name.as_deref().filter(|n| claims(naming, n)) else { continue };
-        if k.hash.is_empty() {
-            continue;
-        }
-        seen.insert(k.hash.as_str());
-        let i = match state.keys.iter().position(|x| x.hash == k.hash) {
-            Some(i) => i,
-            None => {
-                let owner = state.machines.iter().rev().find(|m| m.is_open() && key_for(naming, name, &m.name)).and_then(|m| m.owner.clone());
-                state.keys.push(AiKey {
-                    hash: k.hash.clone(),
-                    name: name.to_string(),
-                    owner_how: owner.as_ref().map(|_| KeyOwnerHow::Adopted),
-                    owner,
-                    created: k.created_at.as_deref().and_then(crate::snapshot::parse_rfc3339),
-                    first_seen: now,
-                    usage: Vec::new(),
-                    gone: None,
-                });
-                state.keys.len() - 1
+        if let Some(i) = upsert_key(&mut state, k, naming, now) {
+            seen.insert(k.hash.as_str());
+            let key = &mut state.keys[i];
+            if key.gone.is_some_and(|g| g.how == KeyEndHow::Vanished && now > g.at) {
+                key.gone = None; // listed again
             }
-        };
-        let key = &mut state.keys[i];
-        key.name = name.to_string();
-        if key.gone.is_some_and(|g| g.how == KeyEndHow::Vanished) {
-            key.gone = None; // listed again
-        }
-        if let Some(u) = k.usage {
-            sample(&mut key.usage, now, u);
         }
     }
     for key in state.keys.iter_mut().filter(|k| k.gone.is_none() && !seen.contains(k.hash.as_str())) {
-        key.gone = Some(KeyGone { at: now, how: KeyEndHow::Vanished });
+        // Gone from a listing at least as new as its last reading.
+        if key.usage.last().is_none_or(|u| now > u.to) {
+            key.gone = Some(KeyGone { at: now, how: KeyEndHow::Vanished });
+        }
+    }
+    state.keys_listed = Some(state.keys_listed.map_or(now, |t| t.max(now)));
+    state
+}
+
+/// Track key `k` if it's this fleet's (a new one gets the owner of the open machine it's named
+/// for) and sample its usage. Its index, or `None` when it isn't the fleet's.
+fn upsert_key(state: &mut SpendState, k: &KeyInfo, naming: &Naming, now: u64) -> Option<usize> {
+    let name = k.name.as_deref().filter(|n| claims(naming, n) && !k.hash.is_empty())?;
+    let i = match state.keys.iter().position(|x| x.hash == k.hash) {
+        Some(i) => i,
+        None => {
+            let owner = state.machines.iter().rev().find(|m| m.is_open() && key_for(naming, name, &m.name)).and_then(|m| m.owner.clone());
+            state.keys.push(AiKey {
+                hash: k.hash.clone(),
+                name: name.to_string(),
+                owner_how: owner.as_ref().map(|_| KeyOwnerHow::Adopted),
+                owner,
+                created: k.created_at.as_deref().and_then(crate::snapshot::parse_rfc3339),
+                first_seen: now,
+                usage: Vec::new(),
+                gone: None,
+            });
+            state.keys.len() - 1
+        }
+    };
+    let key = &mut state.keys[i];
+    key.name = name.to_string();
+    if let Some(u) = k.usage {
+        sample(&mut key.usage, now, u);
+    }
+    Some(i)
+}
+
+/// Keys arena just deleted, as listed just before the delete: their final usage is that
+/// listing's — recorded here with the delete, in one write — and they're gone, by arena.
+pub fn keys_deleted(mut state: SpendState, deleted: &[KeyInfo], naming: &Naming, now: u64) -> SpendState {
+    state.begin(now);
+    for k in deleted {
+        if let Some(i) = upsert_key(&mut state, k, naming, now) {
+            state.keys[i].gone = Some(KeyGone { at: now, how: KeyEndHow::Deleted });
+        }
     }
     state
 }
 
-/// Keys arena just deleted (`hashes`): their usage is the one recorded from the listing taken
-/// before the delete ([`observe_keys`]); they're gone, by arena.
-pub fn keys_deleted(mut state: SpendState, hashes: &[String], now: u64) -> SpendState {
-    for k in state.keys.iter_mut().filter(|k| hashes.contains(&k.hash)) {
-        k.gone = Some(KeyGone { at: now, how: KeyEndHow::Deleted });
-    }
-    state
+/// Whether the AI keys are due a listing (an hour since the last): the snapshot cron lists
+/// them this often, so `--since` finds each key's usage near a day's start.
+pub fn keys_due(state: &SpendState, now: u64) -> bool {
+    state.keys_listed.is_none_or(|t| now.saturating_sub(t) >= KEY_SAMPLE_EVERY || t > now)
 }
 
 /// A key arena just minted for `machine`: its owner is that machine's open instance's owner
@@ -890,7 +972,7 @@ pub fn key_minted(mut state: SpendState, hash: &str, machine: &str, owner: Optio
         owner,
         created: created.or(Some(now)),
         first_seen: now,
-        usage: vec![(now, 0.0)],
+        usage: vec![Usage { from: now, to: now, usd: 0.0 }],
         gone: None,
     };
     match state.keys.iter_mut().find(|k| k.hash == hash) {
@@ -933,15 +1015,16 @@ pub enum Errs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Est {
-    /// Not observed for longer than [`GAP`]: charged at its rate throughout.
+    /// Not observed for longer than [`GAP`]: charged at the rate on either side.
     Gap,
     /// Vanished (or listed terminated) between two observations: charged to the later one.
     Vanished,
     /// Made (its provider says) well before arena first saw it: charged back to then at its
     /// first seen rate.
     BeforeSeen,
-    /// Running before tracking began: counted from its first observation only.
-    PredatesTracking,
+    /// May have run before arena first saw it (made before tracking began, or found after a
+    /// long silence of its provider): counted from its first observation only.
+    StartUnknown,
     /// No price known: counted as 0.
     Unpriced,
     /// A stopped Vast disk at a storage ceiling.
@@ -951,32 +1034,32 @@ pub enum Est {
 impl Est {
     pub fn errs(self) -> Errs {
         match self {
-            Est::Gap | Est::Vanished | Est::Ceiling => Errs::High,
-            Est::Unpriced | Est::PredatesTracking => Errs::Low,
-            Est::BeforeSeen => Errs::Either,
+            Est::Vanished | Est::Ceiling => Errs::High,
+            Est::Unpriced | Est::StartUnknown => Errs::Low,
+            Est::Gap | Est::BeforeSeen => Errs::Either,
         }
     }
 
     fn words(self) -> &'static str {
         match self {
-            Est::Gap => "not observed for a while (charged at its rate throughout: errs high if it was stopped meanwhile)",
+            Est::Gap => "not observed for over 30 min (charged at the rate on either side: errs either way)",
             Est::Vanished => "vanished between two observations (charged to the later one: errs high)",
             Est::BeforeSeen => "first seen well after its provider says it was made (charged back to then at its first rate)",
-            Est::PredatesTracking => "running before tracking began (counted from then: errs low)",
+            Est::StartUnknown => "may have run before arena first saw it (counted from then: errs low)",
             Est::Unpriced => "no price known for a while (counted as 0: errs low)",
             Est::Ceiling => "stopped on Vast (its disk at a storage ceiling: errs high)",
         }
     }
 }
 
-/// One stretch to charge.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// One stretch to charge, and why it's an estimate (if it is).
+#[derive(Clone, Debug, PartialEq)]
 struct Piece {
     from: u64,
     to: u64,
     per_hr: f64,
     running: bool,
-    est: Option<Est>,
+    ests: Vec<Est>,
 }
 
 fn rate_est(how: RateHow) -> Option<Est> {
@@ -988,32 +1071,40 @@ fn rate_est(how: RateHow) -> Option<Est> {
 }
 
 /// A machine's stretches: before its first observation (back to its start), its segments,
-/// the silences between them (at the higher end), and after the last one to its end.
+/// the silences between them (at the higher end), and after the last one to its end. A
+/// stretch can be an estimate for several reasons at once (a long silence next to an
+/// unpriced segment is both).
 fn pieces(m: &Machine) -> Vec<Piece> {
     let mut out = Vec::new();
     let Some(first) = m.segs.first() else { return out };
+    let ests = |e: &[Option<Est>]| -> Vec<Est> {
+        let mut v: Vec<Est> = e.iter().flatten().copied().collect();
+        v.sort();
+        v.dedup();
+        v
+    };
     if m.start < first.from {
-        let est = if first.from - m.start > GAP { Some(Est::BeforeSeen) } else { rate_est(first.how) };
-        out.push(Piece { from: m.start, to: first.from, per_hr: first.per_hr, running: first.running, est });
+        let before = (first.from - m.start > GAP).then_some(Est::BeforeSeen);
+        out.push(Piece { from: m.start, to: first.from, per_hr: first.per_hr, running: first.running, ests: ests(&[before, rate_est(first.how)]) });
     }
     for (i, s) in m.segs.iter().enumerate() {
         if i > 0 {
             let p = &m.segs[i - 1];
             if s.from > p.to {
                 let hi = if p.per_hr >= s.per_hr { p } else { s };
-                let est = if s.from - p.to > GAP { Some(Est::Gap) } else { rate_est(hi.how) };
-                out.push(Piece { from: p.to, to: s.from, per_hr: hi.per_hr, running: hi.running, est });
+                let gap = (s.from - p.to > GAP).then_some(Est::Gap);
+                out.push(Piece { from: p.to, to: s.from, per_hr: hi.per_hr, running: hi.running, ests: ests(&[gap, rate_est(p.how), rate_est(s.how)]) });
             }
         }
-        out.push(Piece { from: s.from, to: s.to, per_hr: s.per_hr, running: s.running, est: rate_est(s.how) });
+        out.push(Piece { from: s.from, to: s.to, per_hr: s.per_hr, running: s.running, ests: ests(&[rate_est(s.how)]) });
     }
     if let (Some(e), Some(last)) = (m.ended, m.segs.last()) {
         if e.at > last.to {
-            let est = match e.how {
-                EndHow::Terminated => (e.at - last.to > GAP).then_some(Est::Gap).or(rate_est(last.how)),
+            let why = match e.how {
+                EndHow::Terminated => (e.at - last.to > GAP).then_some(Est::Gap),
                 EndHow::Gone | EndHow::Vanished => Some(Est::Vanished),
             };
-            out.push(Piece { from: last.to, to: e.at, per_hr: last.per_hr, running: last.running, est });
+            out.push(Piece { from: last.to, to: e.at, per_hr: last.per_hr, running: last.running, ests: ests(&[why, rate_est(last.how)]) });
         }
     }
     out
@@ -1041,9 +1132,9 @@ pub fn metered_by_hour(m: &Machine, from: u64, to: u64) -> BTreeMap<u64, Hour> {
             let h = out.entry(hour).or_default();
             let amount = (stop - t) as f64 / 3_600.0 * p.per_hr.max(0.0);
             h.amount += amount;
-            if let Some(e) = p.est {
+            if !p.ests.is_empty() {
                 h.est += amount;
-                h.kinds.insert(e);
+                h.kinds.extend(p.ests.iter().copied());
             }
             if p.running {
                 h.running_secs += stop - t;
@@ -1170,6 +1261,9 @@ pub struct KeyRow {
     /// Its usage before the window isn't known: the first reading after its start was used
     /// (errs low).
     pub base_unknown: bool,
+    /// Not read near the window's start: what it spent between its last reading before and
+    /// the next is counted in (errs high).
+    pub base_stale: bool,
     pub gone: Option<KeyEndHow>,
 }
 
@@ -1225,6 +1319,7 @@ fn machine_row(state: &SpendState, m: &Machine, from: u64, to: u64, billed: Opti
     let mut kinds: BTreeSet<Est> = BTreeSet::new();
     let mut source = Source::Metered;
     let mut billed_total = None;
+    let mut covered_before = false;
     let mut metering = |h: &Hour, amount: &mut f64| {
         *amount += h.amount;
         estimated += h.est;
@@ -1234,27 +1329,41 @@ fn machine_row(state: &SpendState, m: &Machine, from: u64, to: u64, billed: Opti
         Some(b) => {
             let empty = BTreeMap::new();
             let bill = b.pods.get(&m.id).unwrap_or(&empty);
-            // The machine's own hours in the window: the metered ones, and the billed ones from
-            // its start to its end (a bucket metering missed still counts).
-            let first = floor_hour(m.start.max(from));
+            // RunPod billed this pod from its creation — possibly before arena first saw it —
+            // to its end.
+            let span = m.created.filter(|c| *c <= m.start).unwrap_or(m.start);
             let last = floor_hour(m.until());
+            // An hour a bucket can speak for: whole inside the window (a bucket is the whole
+            // hour), or any hour of a machine that began inside it.
+            let usable = |h: u64| h >= from || span >= from;
+            let in_span = |h: u64| h >= floor_hour(span) && h <= last && h < to && usable(h);
             let mut hours: BTreeSet<u64> = metered.keys().copied().collect();
-            hours.extend(bill.keys().copied().filter(|h| *h >= first && *h < to && *h <= last));
-            billed_total = Some(bill.iter().filter(|(h, _)| **h >= first && **h < to && **h <= last).map(|(_, v)| v).sum());
+            hours.extend(bill.keys().copied().filter(|h| in_span(*h)));
+            billed_total = Some(bill.iter().filter(|(h, _)| in_span(**h)).map(|(_, v)| v).sum());
+            // A complete answer that has this pod: an hour it settled without a bucket billed
+            // nothing (stopped with no volume, say). One without the pod at all says nothing.
+            let known = !bill.is_empty();
             let none = Hour::default();
             for h in hours {
                 let me = metered.get(&h).unwrap_or(&none);
-                match bill.get(&h) {
+                match bill.get(&h).filter(|_| usable(h)) {
                     // Settled: what RunPod billed for this pod in that hour, whatever metering said.
                     Some(v) if b.settled(h) => {
                         amount += v;
                         source = Source::Billed;
                     }
+                    None if known && usable(h) && b.settled(h) => source = Source::Billed,
                     // Still filling in: the higher of the two.
                     Some(v) if *v >= me.amount => amount += v,
-                    // No bucket (or a lower one still filling): metering stands.
+                    // No bucket (or a lower one still filling, or an hour across the window's
+                    // start): metering stands.
                     _ => metering(me, &mut amount),
                 }
+            }
+            // Billing settled every hour from its creation to when arena first saw it: what
+            // ran unseen is counted.
+            if m.start_unsure && known && span < m.start && (floor_hour(span)..=floor_hour(m.start)).step_by(3_600).all(|h| usable(h) && b.settled(h)) {
+                covered_before = true;
             }
         }
         None => {
@@ -1264,10 +1373,10 @@ fn machine_row(state: &SpendState, m: &Machine, from: u64, to: u64, billed: Opti
         }
     }
     let hours = metered.values().map(|h| h.running_secs).sum::<u64>() as f64 / 3_600.0;
-    let mut ests: Vec<Est> = kinds.into_iter().collect();
-    if m.start_how == StartHow::Seen && state.since.is_some_and(|s| m.first_seen <= s + REFRESH) && m.first_seen >= from && m.first_seen < to {
-        ests.push(Est::PredatesTracking);
+    if m.start_unsure && !covered_before && m.start >= from && m.start < to {
+        kinds.insert(Est::StartUnknown);
     }
+    let ests: Vec<Est> = kinds.into_iter().collect();
     MachineRow {
         name: m.name.clone(),
         provider: m.provider.clone(),
@@ -1289,16 +1398,22 @@ fn machine_row(state: &SpendState, m: &Machine, from: u64, to: u64, billed: Opti
     }
 }
 
-/// A key's spend in `[from, ∞)`: its last usage less its usage at `from` — the last reading
-/// at or before then; 0 when it was made after; else its first reading (errs low, flagged).
+/// A key's spend in `[from, ∞)`: its last usage less its usage at `from`. That is exact when
+/// a reading spans `from`; when the last reading before `from` ended earlier and a higher one
+/// followed, the rise in between is counted in (errs high, `base_stale`); a key made after
+/// `from` starts at 0; one first read after `from` starts at that first reading (errs low,
+/// `base_unknown`, unless it read 0).
 fn key_row(k: &AiKey, from: Option<u64>) -> KeyRow {
     let last = k.last_usage();
-    let (base, unknown) = match from {
-        None => (0.0, false),
-        Some(f) => match k.usage.iter().rev().find(|(t, _)| *t <= f) {
-            Some((_, u)) => (*u, false),
-            None if k.created.is_some_and(|c| c >= f) || (k.first_seen >= f && k.usage.first().is_some_and(|u| u.1 == 0.0)) => (0.0, false),
-            None => (k.usage.first().map_or(0.0, |u| u.1), true),
+    let (base, unknown, stale) = match from {
+        None => (0.0, false, false),
+        Some(f) => match k.usage.iter().rposition(|u| u.from <= f) {
+            Some(i) => (k.usage[i].usd, false, k.usage[i].to < f && i + 1 < k.usage.len()),
+            None if k.created.is_some_and(|c| c >= f) => (0.0, false, false),
+            None => {
+                let first = k.usage.first().map_or(0.0, |u| u.usd);
+                (first, first > 0.0, false)
+            }
         },
     };
     KeyRow {
@@ -1307,6 +1422,7 @@ fn key_row(k: &AiKey, from: Option<u64>) -> KeyRow {
         owner: k.owner.clone(),
         usd: (last - base).max(0.0),
         base_unknown: unknown,
+        base_stale: stale,
         gone: k.gone.map(|g| g.how),
     }
 }
@@ -1356,7 +1472,7 @@ pub fn report(state: &SpendState, naming: &Naming, since: Option<u64>, now: u64,
         let o = by.entry(k.owner.clone()).or_insert_with(|| OwnerRow { owner: k.owner.clone(), ..Default::default() });
         o.ai += k.usd;
         add(&mut o.total, "USD", k.usd);
-        o.ai_estimate |= k.base_unknown || k.gone == Some(KeyEndHow::Vanished);
+        o.ai_estimate |= k.base_unknown || k.base_stale || k.gone == Some(KeyEndHow::Vanished);
     }
     // Owners by name; the "(no owner)" row last, so a forgotten --owner stands out.
     let mut owners: Vec<OwnerRow> = by.into_values().collect();
@@ -1383,7 +1499,9 @@ pub fn report(state: &SpendState, naming: &Naming, since: Option<u64>, now: u64,
     let runpod = match (billed, account) {
         (Some(b), Some(a)) => {
             let rows: f64 = machines.iter().filter(|r| r.provider == "runpod").filter_map(|r| r.billed).sum();
-            let start = floor_hour(from.max(b.from).max(a.from));
+            // Whole hours, as the rows take billing: a window starting mid-hour starts here
+            // at the next hour.
+            let start = from.div_ceil(3_600).saturating_mul(3_600).max(b.from).max(a.from);
             let account: f64 = a.buckets.iter().filter(|(h, _)| *h >= start && *h < now).map(|(_, v)| v).sum();
             Some(Accounted { rows, account })
         }
@@ -1547,6 +1665,13 @@ pub fn notes(r: &Report) -> Vec<String> {
     if !unknown.is_empty() {
         out.push(format!("~ AI key(s) first seen after the window began: {} — counted from then (errs low)", unknown.join(", ")));
     }
+    let stale: Vec<&str> = r.keys.iter().filter(|k| k.base_stale).map(|k| k.name.as_str()).collect();
+    if !stale.is_empty() {
+        out.push(format!(
+            "~ AI key(s) not read near the window's start: {} — what they spent just before it is counted in (errs high)",
+            stale.join(", ")
+        ));
+    }
     if let Some(a) = r.runpod {
         out.push(format!(
             "runpod: accounted for {} of {} billed on the account in this window (billing lags ~1 h; the rest is other pods, \
@@ -1698,11 +1823,18 @@ pub fn to_json(state: &SpendState) -> String {
 pub fn record(path: &Path, now: u64, f: impl FnOnce(SpendState) -> SpendState) -> std::io::Result<(SpendState, Option<String>)> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     crate::snapshot::create_private_dir(dir)?;
-    let lock = std::fs::File::open(dir).ok().filter(|f| f.lock().is_ok());
+    // No read-modify-write without the lock: two recorders would each overwrite the other's
+    // change (a create, an owner, a key's final usage).
+    let lock = std::fs::File::open(dir)?;
+    lock.lock()?;
     let (state, loaded) = load(path);
     let mut warning = None;
     if let Loaded::Ignored(why) = &loaded {
-        let aside = path.with_file_name(format!("{SPEND_FILE}.ignored-{now}"));
+        // A name no earlier copy has: an ignored ledger is never overwritten.
+        let aside = (0..)
+            .map(|n| path.with_file_name(if n == 0 { format!("{SPEND_FILE}.ignored-{now}") } else { format!("{SPEND_FILE}.ignored-{now}-{n}") }))
+            .find(|p| std::fs::symlink_metadata(p).is_err())
+            .expect("an unused name");
         std::fs::rename(path, &aside)?;
         warning = Some(format!(
             "warning: the spend ledger {} couldn't be used ({why}) — moved to {} and started afresh",

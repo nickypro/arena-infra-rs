@@ -1855,20 +1855,38 @@ fn owner_plan(tracking: &spend::SpendCtx, owner: &spend::OwnerArgs, names: &[Str
     handing
 }
 
-/// Run the handovers [`owner_plan`] found, after the prompt and before any create. Whether
-/// any key changed (the keys CSV was rewritten).
-async fn hand_keys_over(tracking: &spend::SpendCtx, cfg: &Config, owner: &spend::OwnerArgs, handing: &[spend::Handover]) -> bool {
-    let Some(o) = owner.owner.as_deref().filter(|_| !handing.is_empty()) else { return false };
+/// Run the handovers [`owner_plan`] found, after the prompt and before any create: whether
+/// the keys CSV changed. A handover that failed stops the command before anything is
+/// created — the new machine would get the old owner's key, or none that works.
+async fn hand_keys_over(tracking: &spend::SpendCtx, cfg: &Config, owner: &spend::OwnerArgs, handing: &[spend::Handover]) -> Result<bool> {
+    let Some(o) = owner.owner.as_deref().filter(|_| !handing.is_empty()) else { return Ok(false) };
     let api = openrouter_client(cfg);
-    let lines = spend::hand_over(tracking, cfg, api.as_ref().map(|a| a as &dyn arena_core::openrouter::KeyApi), std::path::Path::new(KEYS_DIR), handing, o).await;
-    for l in &lines {
+    let done = spend::hand_over(tracking, cfg, api.as_ref().map(|a| a as &dyn arena_core::openrouter::KeyApi), std::path::Path::new(KEYS_DIR), handing, o).await;
+    for l in &done.lines {
         if l.starts_with('✗') {
             eprintln!("{l}");
         } else {
             println!("{l}");
         }
     }
-    lines.iter().any(|l| l.starts_with('✓'))
+    if !done.failed.is_empty() {
+        anyhow::bail!(
+            "the OpenRouter key handover failed for {} — nothing was created. Re-run once the key can be rotated \
+             (`arena keys rotate <name>`), or pass --keep-key to create with the name's current key",
+            done.failed.join(", ")
+        );
+    }
+    Ok(done.csv_changed)
+}
+
+/// Drop `host`'s row from the keys CSV in `dir` (its key was deleted, none replaced it):
+/// whether a row went.
+fn drop_key_row(dir: &std::path::Path, host: &str) -> bool {
+    let csv = dir.join(OPENROUTER_KEYS_LINK);
+    let Some(text) = std::fs::read_to_string(&csv).ok().and_then(|t| arena_core::apikeys::remove_csv_host(&t, host)) else {
+        return false;
+    };
+    write_secret_file(&csv, &text).is_ok()
 }
 
 /// Warn (on a GPU provider) when pods would be created with no persistent volume —
@@ -7970,7 +7988,7 @@ async fn handle_pods_bal(
         _ => None,
     };
     let replaces = matches!(cmd, PodCmd::Replace { .. } | PodCmd::Migrate { .. });
-    let tracked = spend::Tracked { inner: provider, spend: &tracking, owner: spend::owner_rule(owner, replaces) };
+    let tracked = spend::Tracked::new(provider, &tracking, spend::owner_rule(owner, replaces));
     let provider: &dyn Provider = &tracked;
     match cmd {
         PodCmd::List { json, probe, no_probe } => {
@@ -8068,7 +8086,7 @@ async fn handle_pods_bal(
                 println!("aborted.");
                 return Ok(());
             }
-            hand_keys_over(&tracking, cfg, &owner, &handing).await;
+            hand_keys_over(&tracking, cfg, &owner, &handing).await?;
             // Retry rounds only retry the confirmed names still missing; -n/-a also stop once
             // the provider-scoped total is met (topup_target == 0 marks the explicit case).
             let outcome = match &options {
@@ -8229,7 +8247,7 @@ async fn handle_pods_bal(
                 return Ok(());
             }
             // The handed-over keys are in the CSV before the pipelines copy any.
-            let keys = if hand_keys_over(&tracking, cfg, &owner, &handing).await { up_keys_stage(cfg, KEYS_DIR, !no_setup) } else { keys };
+            let keys = if hand_keys_over(&tracking, cfg, &owner, &handing).await? { up_keys_stage(cfg, KEYS_DIR, !no_setup) } else { keys };
             // What the operator confirmed: a name of these that gets no pod is in the summary
             // (and the exit status) too, not silently missing from it.
             let confirmed = names.clone();
@@ -9114,8 +9132,16 @@ async fn collect_snapshot(
         warnings.push(w);
     }
     // The one thing a snapshot writes: what it listed, into the spend ledger (quietly) — the
-    // snapshot cron line is what keeps `arena spend` current with nobody at a terminal.
-    spend::SpendCtx::from_config(cfg).listing(&listing, &pods);
+    // snapshot cron line is what keeps `arena spend` current with nobody at a terminal. The AI
+    // keys too, once an hour (bounded, quiet): `--since` then finds each key's usage near a
+    // day's start, and a key deleted outside arena keeps a recent last reading.
+    let tracking = spend::SpendCtx::from_config(cfg);
+    tracking.listing(&listing, &pods);
+    if let Some(or) = openrouter_client(cfg).filter(|_| tracking.keys_due()) {
+        if let Ok(Ok(keys)) = arena_core::ratelimit::bounded(ENRICH_TIMEOUT, arena_core::openrouter::KeyApi::list_keys(&or)).await {
+            tracking.keys(&keys);
+        }
+    }
     let (proxy, w) = snapshot::local_proxy_text(cfg);
     warnings.extend(w);
     let health = match health_cache_path(cfg) {
@@ -10702,7 +10728,7 @@ async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: 
                 Err(e) => errs.push(e.to_string()),
             }
         }
-        tracking.keys_deleted(&mine.iter().filter(|k| deleted.contains(k.hash.as_str())).map(|k| k.hash.clone()).collect::<Vec<_>>());
+        tracking.keys_deleted(&mine, &mine.iter().filter(|k| deleted.contains(k.hash.as_str())).map(|k| k.hash.clone()).collect::<Vec<_>>());
         if !errs.is_empty() {
             eprintln!("[keys] ✗ {m}: revoke failed ({}) — its CSV row is kept", errs.join("; "));
             out.failed.push(m.clone());
@@ -16669,7 +16695,7 @@ async fn keys_with(
                 continue;
             }
             let (deleted, errs) = delete_keys(api, theirs).await;
-            tracking.keys_deleted(&deleted);
+            tracking.keys_deleted(theirs, &deleted);
             if errs.is_empty() {
                 println!("✓ {host}: revoked");
                 ok += 1;
@@ -16681,14 +16707,14 @@ async fn keys_with(
         }
         match rotate_key(api, kn, theirs, limit).await {
             Ok((deleted, ck)) => {
-                tracking.keys_deleted(&deleted);
+                tracking.keys_deleted(theirs, &deleted);
                 tracking.key_minted(&ck.hash, host, None);
                 write_openrouter_key(dir, host, &ck.secret, &prefix)?;
                 println!("✓ {host}: {} {}", if action == KeysAction::Gen { "minted" } else { "rotated" }, &ck.hash[..ck.hash.len().min(12)]);
                 ok += 1;
             }
             Err((deleted, why)) => {
-                tracking.keys_deleted(&deleted);
+                tracking.keys_deleted(theirs, &deleted);
                 eprintln!("✗ {host}: {why}");
                 failed += 1;
             }

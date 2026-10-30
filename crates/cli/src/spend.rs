@@ -78,10 +78,20 @@ impl SpendCtx {
         spend::record_keys(self.path(), keys, &self.naming(), unix_now());
     }
 
-    /// Keys arena just deleted (their usage was recorded from the listing before).
-    pub(crate) fn keys_deleted(&self, hashes: &[String]) {
+    /// Keys arena just deleted (`deleted`: hashes), with their final usage as `listed` just
+    /// before the delete — recorded in the same write that marks them gone.
+    pub(crate) fn keys_deleted(&self, listed: &[&KeyInfo], deleted: &[String]) {
+        let gone: Vec<KeyInfo> = listed.iter().filter(|k| deleted.contains(&k.hash)).map(|k| (*k).clone()).collect();
+        if gone.is_empty() {
+            return;
+        }
         let now = unix_now();
-        spend::record_quietly(self.path(), now, |s| spend::keys_deleted(s, hashes, now));
+        spend::record_quietly(self.path(), now, |s| spend::keys_deleted(s, &gone, &self.naming(), now));
+    }
+
+    /// Whether the AI keys are due an hourly listing (the snapshot cron's).
+    pub(crate) fn keys_due(&self) -> bool {
+        self.path().is_some_and(|p| spend::keys_due(&spend::load(p).0, unix_now()))
     }
 
     /// A key arena just minted for `machine` (`owner`: decided by the caller — a handover).
@@ -133,6 +143,29 @@ pub(crate) struct Tracked<'a> {
     pub inner: &'a dyn Provider,
     pub spend: &'a SpendCtx,
     pub owner: OwnerRule,
+    /// Which provider each id it listed or made is on (`None`: the same id on two), so a stop
+    /// or terminate by id records against the right row.
+    pub seen: std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+}
+
+impl<'a> Tracked<'a> {
+    pub(crate) fn new(inner: &'a dyn Provider, spend: &'a SpendCtx, owner: OwnerRule) -> Self {
+        Tracked { inner, spend, owner, seen: Default::default() }
+    }
+
+    fn remember<'p>(&self, pods: impl IntoIterator<Item = &'p Pod>) {
+        let mut seen = self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for p in pods {
+            let e = seen.entry(p.id.clone()).or_insert_with(|| Some(p.provider.clone()));
+            if e.as_deref() != Some(p.provider.as_str()) {
+                *e = None;
+            }
+        }
+    }
+
+    fn provider_of(&self, id: &str) -> Option<String> {
+        self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id).cloned().flatten()
+    }
 }
 
 #[async_trait::async_trait]
@@ -144,27 +177,32 @@ impl Provider for Tracked<'_> {
         self.inner.describe(spec)
     }
     async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
-        self.inner.list_pods().await
+        let pods = self.inner.list_pods().await?;
+        self.remember(&pods);
+        Ok(pods)
     }
     async fn list_by_provider(&self) -> Vec<(String, arena_core::Result<Vec<Pod>>)> {
-        self.inner.list_by_provider().await
+        let listed = self.inner.list_by_provider().await;
+        self.remember(listed.iter().filter_map(|(_, r)| r.as_ref().ok()).flatten());
+        listed
     }
     async fn enrich(&self, pods: &mut [Pod]) -> arena_core::Result<()> {
         self.inner.enrich(pods).await
     }
     async fn create_pod(&self, spec: &PodSpec) -> arena_core::Result<Pod> {
         let pod = self.inner.create_pod(spec).await?;
+        self.remember([&pod]);
         self.spend.event(&Event::Created { pod: &pod, owner: &self.owner });
         Ok(pod)
     }
     async fn stop_pod(&self, id: &str) -> arena_core::Result<()> {
         self.inner.stop_pod(id).await?;
-        self.spend.event(&Event::Stopped { provider: None, id });
+        self.spend.event(&Event::Stopped { provider: self.provider_of(id).as_deref(), id });
         Ok(())
     }
     async fn stop_pod_outcome(&self, id: &str) -> arena_core::Result<arena_core::provider::StopOutcome> {
         let out = self.inner.stop_pod_outcome(id).await?;
-        self.spend.event(&Event::Stopped { provider: None, id });
+        self.spend.event(&Event::Stopped { provider: self.provider_of(id).as_deref(), id });
         Ok(out)
     }
     async fn restart_pod(&self, id: &str) -> arena_core::Result<()> {
@@ -178,7 +216,7 @@ impl Provider for Tracked<'_> {
     }
     async fn start_pod(&self, id: &str) -> arena_core::Result<()> {
         self.inner.start_pod(id).await?;
-        self.spend.event(&Event::Started { provider: None, id });
+        self.spend.event(&Event::Started { provider: self.provider_of(id).as_deref(), id });
         Ok(())
     }
     fn stop_support(&self, pod: &Pod) -> arena_core::Result<()> {
@@ -189,7 +227,7 @@ impl Provider for Tracked<'_> {
     }
     async fn terminate_pod(&self, id: &str) -> arena_core::Result<()> {
         self.inner.terminate_pod(id).await?;
-        self.spend.event(&Event::Terminated { provider: None, id });
+        self.spend.event(&Event::Terminated { provider: self.provider_of(id).as_deref(), id });
         Ok(())
     }
     async fn terminate_pod_on(&self, provider: &str, id: &str) -> arena_core::Result<()> {
@@ -199,6 +237,9 @@ impl Provider for Tracked<'_> {
     }
     async fn rename_pod(&self, id: &str, new_name: &str) -> arena_core::Result<()> {
         self.inner.rename_pod(id, new_name).await
+    }
+    fn rename_support(&self, pod: &Pod) -> arena_core::Result<()> {
+        self.inner.rename_support(pod)
     }
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> arena_core::Result<()> {
         self.inner.reimage_pod(id, image, env).await
@@ -265,54 +306,83 @@ pub(crate) fn owner_lines(owner: Option<&str>, names: &[String], handovers: &[Ha
     out
 }
 
-/// Rotate each handover's key: one key listing (its usage recorded first), the name's keys
-/// deleted, a fresh key minted for `owner` and written to the keys CSV in `dir`. A failure is
-/// a `✗` line, never an error: a handover only decides whose AI spend is whose.
-pub(crate) async fn hand_over(ctx: &SpendCtx, cfg: &Config, api: Option<&dyn KeyApi>, dir: &Path, handovers: &[Handover], owner: &str) -> Vec<String> {
+/// What [`hand_over`] did.
+#[derive(Debug, Default)]
+pub(crate) struct HandedOver {
+    /// `✓`/`✗` lines, one per name (or one for them all).
+    pub lines: Vec<String>,
+    /// Names whose handover failed: nothing should be created for them.
+    pub failed: Vec<String>,
+    /// Whether the keys CSV changed (a fresh key saved, or a dead one's row dropped).
+    pub csv_changed: bool,
+}
+
+/// Rotate each handover's key: one key listing (every key's usage recorded first), the name's
+/// keys deleted (their final usage recorded with the delete), a fresh key minted for `owner`
+/// and written to the keys CSV in `dir`. A name whose handover failed is in `failed`; if its
+/// old key was deleted but no fresh one saved, its CSV row is dropped, so no new machine gets
+/// a dead key.
+pub(crate) async fn hand_over(ctx: &SpendCtx, cfg: &Config, api: Option<&dyn KeyApi>, dir: &Path, handovers: &[Handover], owner: &str) -> HandedOver {
+    let mut done = HandedOver::default();
     if handovers.is_empty() {
-        return Vec::new();
+        return done;
     }
+    let names = || handovers.iter().map(|h| h.name.clone()).collect::<Vec<_>>();
     let Some(api) = api else {
-        return vec![format!(
-            "✗ key handover: OPENROUTER_PROVISIONING_KEY isn't set — {} keep(s) the previous owner's key (`arena keys rotate` later)",
-            handovers.iter().map(|h| h.name.as_str()).collect::<Vec<_>>().join(", ")
-        )];
+        done.lines.push("✗ key handover: OPENROUTER_PROVISIONING_KEY isn't set — the keys can't be rotated".into());
+        done.failed = names();
+        return done;
     };
     let keys = match api.list_keys().await {
         Ok(k) => k,
-        Err(e) => return vec![format!("✗ key handover: listing OpenRouter keys failed ({e}) — `arena keys rotate` later")],
+        Err(e) => {
+            done.lines.push(format!("✗ key handover: listing OpenRouter keys failed ({e})"));
+            done.failed = names();
+            return done;
+        }
     };
     ctx.keys(&keys);
     let naming = Naming::from_config(cfg);
     let prefix = naming.prefix.to_string();
     let limit = cfg.get_parsed::<f64>("OPENROUTER_KEY_LIMIT").unwrap_or(5.0);
-    let mut out = Vec::new();
     for h in handovers {
         let theirs: Vec<&KeyInfo> = super::machine_key_names(&naming, &h.name)
             .iter()
             .flat_map(|n| keys.iter().filter(move |k| k.name.as_deref() == Some(n.as_str())))
             .collect();
         let kn = arena_core::openrouter::key_name(&prefix, naming.list, &h.name);
-        match super::rotate_key(api, &kn, &theirs, limit).await {
+        let (deleted, saved) = match super::rotate_key(api, &kn, &theirs, limit).await {
             Ok((deleted, ck)) => {
-                ctx.keys_deleted(&deleted);
+                ctx.keys_deleted(&theirs, &deleted);
                 ctx.key_minted(&ck.hash, &h.name, Some(owner));
-                let short = &ck.hash[..ck.hash.len().min(12)];
+                let short = ck.hash[..ck.hash.len().min(12)].to_string();
                 match super::write_openrouter_key(dir, &h.name, &ck.secret, &prefix) {
-                    Ok(()) => out.push(format!("✓ {}: OpenRouter key handed over ({} → {owner}, a fresh key {short})", h.name, h.from)),
-                    Err(e) => out.push(format!(
-                        "✗ {}: a fresh key {short} was minted for {owner} but couldn't be saved ({e:#}) — `arena keys rotate {}`",
-                        h.name, h.name
-                    )),
+                    Ok(()) => {
+                        done.lines.push(format!("✓ {}: OpenRouter key handed over ({} → {owner}, a fresh key {short})", h.name, h.from));
+                        done.csv_changed = true;
+                        (deleted, true)
+                    }
+                    Err(e) => {
+                        done.lines.push(format!("✗ {}: a fresh key {short} was minted for {owner} but couldn't be saved ({e:#})", h.name));
+                        (deleted, false)
+                    }
                 }
             }
             Err((deleted, why)) => {
-                ctx.keys_deleted(&deleted);
-                out.push(format!("✗ {}: key handover failed ({why}) — `arena keys rotate {}` later", h.name, h.name));
+                ctx.keys_deleted(&theirs, &deleted);
+                done.lines.push(format!("✗ {}: key handover failed ({why})", h.name));
+                (deleted, false)
+            }
+        };
+        if !saved {
+            done.failed.push(h.name.clone());
+            // Its old key is gone and no fresh one saved: its CSV row would hand a dead key on.
+            if !deleted.is_empty() && super::drop_key_row(dir, &h.name) {
+                done.csv_changed = true;
             }
         }
     }
-    out
+    done
 }
 
 // ---------------------------------------------------------------------------------------
@@ -386,6 +456,9 @@ pub(crate) async fn spend_report(
     };
     let currency = async { within(ctx.api.hetzner_currency()).await.unwrap_or_else(|()| Some(Err(late()))) };
     let ((listing, pods, enrich_warning), key_list, currency) = tokio::join!(listing, key_list, currency);
+    // Recorded and reported as of when the reads came back (a listing older than what a cron
+    // recorded meanwhile changes nothing anyway).
+    let now = unix_now().max(now);
     stderr.extend(enrich_warning);
     // Billing from where the window (or the ledger) begins.
     let from = arena_core::balance::floor_hour(flags.since.or(before.since).unwrap_or(now).min(now));
@@ -589,6 +662,8 @@ mod tests {
         keys: Mutex<Vec<KeyInfo>>,
         deleted: Mutex<Vec<String>>,
         minted: Mutex<u32>,
+        /// Creates fail (OpenRouter down, the workspace at its key limit).
+        refuse_create: Mutex<bool>,
     }
 
     #[async_trait::async_trait]
@@ -597,6 +672,9 @@ mod tests {
             Ok(self.keys.lock().unwrap().clone())
         }
         async fn create_key(&self, name: &str, _limit: Option<f64>) -> arena_core::Result<CreatedKey> {
+            if *self.refuse_create.lock().unwrap() {
+                return Err(arena_core::Error::provider("HTTP 503"));
+            }
             let mut n = self.minted.lock().unwrap();
             *n += 1;
             let hash = format!("hash{n}aaaaaaaa");
@@ -623,7 +701,7 @@ mod tests {
         let cfg = cfg(&d.0);
         let ctx = SpendCtx::from_config(&cfg);
         let fake = FakeProvider::default();
-        let tracked = Tracked { inner: &fake, spend: &ctx, owner: OwnerRule::Given("alice".into()) };
+        let tracked = Tracked::new(&fake, &ctx, OwnerRule::Given("alice".into()));
         let spec = PodSpec { name: "devtest-alpha".into(), ..PodSpec::default() };
         let pod = tracked.create_pod(&spec).await.unwrap();
         let s = ctx.state();
@@ -635,7 +713,7 @@ mod tests {
         // No ledger (a test config without ARENA_STATE_DIR): nothing written, nothing fails.
         let none = SpendCtx::from_config(&Config::parse("MACHINE_NAME_PREFIX=devtest\n"));
         assert!(none.path().is_none());
-        let t = Tracked { inner: &fake, spend: &none, owner: OwnerRule::None };
+        let t = Tracked::new(&fake, &none, OwnerRule::None);
         t.create_pod(&PodSpec { name: "devtest-b".into(), ..PodSpec::default() }).await.unwrap();
     }
 
@@ -645,9 +723,9 @@ mod tests {
         let cfg = cfg(&d.0);
         let ctx = SpendCtx { api: Arc::new(spend::FakeSpendApi::default()), ..SpendCtx::from_config(&cfg) };
         let fake = FakeProvider::default();
-        let with = Tracked { inner: &fake, spend: &ctx, owner: OwnerRule::Given("alice".into()) };
+        let with = Tracked::new(&fake, &ctx, OwnerRule::Given("alice".into()));
         with.create_pod(&PodSpec { name: "devtest-alpha".into(), ..PodSpec::default() }).await.unwrap();
-        let without = Tracked { inner: &fake, spend: &ctx, owner: OwnerRule::None };
+        let without = Tracked::new(&fake, &ctx, OwnerRule::None);
         without.create_pod(&PodSpec { name: "devtest-bravo".into(), ..PodSpec::default() }).await.unwrap();
         let out = spend_report(&fake, &cfg, &ctx, None, &report_flags(), unix_now()).await.unwrap();
         assert!(out.stdout.lines().nth(1).unwrap().starts_with("alice"), "{}", out.stdout);
@@ -673,7 +751,7 @@ mod tests {
         let fake = FakeProvider::default();
         let api = FakeKeys::default();
         // alice's machine and its key, minted for her; she spends $1.25 on it.
-        let alice = Tracked { inner: &fake, spend: &ctx, owner: OwnerRule::Given("alice".into()) };
+        let alice = Tracked::new(&fake, &ctx, OwnerRule::Given("alice".into()));
         let pod = alice.create_pod(&PodSpec { name: "devtest-alpha".into(), ..PodSpec::default() }).await.unwrap();
         let ck = api.create_key("devtest-alpha", Some(1.0)).await.unwrap();
         ctx.key_minted(&ck.hash, "devtest-alpha", None);
@@ -687,17 +765,96 @@ mod tests {
         let plan = owner_lines(Some("bob"), &names, &h, false, true);
         assert!(plan[1].contains("would rotate devtest-alpha's OpenRouter key first: it was alice's"), "{plan:?}");
         let said = hand_over(&ctx, &cfg, Some(&api as &dyn KeyApi), &keys_dir, &h, "bob").await;
-        assert!(said[0].starts_with("✓ devtest-alpha: OpenRouter key handed over (alice → bob"), "{said:?}");
+        assert!(said.lines[0].starts_with("✓ devtest-alpha: OpenRouter key handed over (alice → bob"), "{said:?}");
         assert_eq!(api.deleted.lock().unwrap().as_slice(), std::slice::from_ref(&ck.hash));
         let csv = std::fs::read_to_string(keys_dir.join("openrouter_api_keys.csv")).unwrap();
         assert!(csv.contains("devtest-alpha,sk-or-v1-2"), "{csv}");
         // bob's machine; the report keeps alice's $1.25 hers.
-        let bob = Tracked { inner: &fake, spend: &ctx, owner: OwnerRule::Given("bob".into()) };
+        let bob = Tracked::new(&fake, &ctx, OwnerRule::Given("bob".into()));
         bob.create_pod(&PodSpec { name: "devtest-alpha".into(), ..PodSpec::default() }).await.unwrap();
         let ctx = SpendCtx { api: Arc::new(spend::FakeSpendApi::default()), ..SpendCtx::from_config(&cfg) };
         let out = spend_report(&fake, &cfg, &ctx, Some(&api as &dyn KeyApi), &SpendFlags { csv: true, ..Default::default() }, unix_now()).await.unwrap();
         let alice_row = out.stdout.lines().find(|l| l.starts_with("alice,")).unwrap_or_else(|| panic!("{}", out.stdout));
         assert!(alice_row.contains(",1.2500,"), "{alice_row}");
         assert!(out.stdout.lines().any(|l| l.starts_with("bob,alpha,1,")), "{}", out.stdout);
+    }
+
+    #[tokio::test]
+    async fn a_failed_handover_is_named_and_leaves_no_dead_key_in_the_csv() {
+        let d = tmp("handfail");
+        let keys_dir = d.0.join("keys");
+        let cfg = cfg(&d.0);
+        let ctx = SpendCtx::from_config(&cfg);
+        let api = FakeKeys::default();
+        let ck = api.create_key("devtest-alpha", Some(1.0)).await.unwrap();
+        crate::write_openrouter_key(&keys_dir, "devtest-alpha", &ck.secret, "devtest").unwrap();
+        ctx.key_minted(&ck.hash, "devtest-alpha", Some("alice"));
+        api.keys.lock().unwrap()[0].usage = Some(0.75);
+        let names = vec!["devtest-alpha".to_string()];
+        let h = handovers(&ctx, &names, Some("bob"), false);
+        // The old key is deleted, the fresh one can't be minted.
+        *api.refuse_create.lock().unwrap() = true;
+        let done = hand_over(&ctx, &cfg, Some(&api as &dyn KeyApi), &keys_dir, &h, "bob").await;
+        assert_eq!(done.failed, names, "{done:?}");
+        assert!(done.lines[0].starts_with("✗ devtest-alpha: key handover failed (create:"), "{done:?}");
+        assert!(done.csv_changed, "the dead key's row went");
+        let csv = std::fs::read_to_string(keys_dir.join("openrouter_api_keys.csv")).unwrap();
+        assert!(!csv.contains(&ck.secret), "{csv}");
+        // alice's key: deleted by arena, its last usage kept hers.
+        let k = &ctx.state().keys[0];
+        assert_eq!((k.owner.as_deref(), k.last_usage(), k.gone.map(|g| g.how)), (Some("alice"), 0.75, Some(spend::KeyEndHow::Deleted)));
+        // No provisioning key, or a listing that fails: every name failed, nothing deleted.
+        let none = hand_over(&ctx, &cfg, None, &keys_dir, &[Handover { name: "devtest-b".into(), from: "al".into() }], "bob").await;
+        assert_eq!((none.failed.as_slice(), none.csv_changed), (["devtest-b".to_string()].as_slice(), false));
+    }
+
+    #[tokio::test]
+    async fn a_stop_by_id_records_against_the_provider_that_listed_it() {
+        let d = tmp("twoids");
+        let cfg = cfg(&d.0);
+        let ctx = SpendCtx::from_config(&cfg);
+        // Instance 77 on Hetzner and on Vast; the command's provider lists only Vast's.
+        let hz = Pod { id: "77".into(), name: "devtest-a".into(), provider: "hetzner".into(), status: "running".into(), cost_per_hr: Some(0.01), ..Pod::default() };
+        let vast = Pod { provider: "vast".into(), name: "devtest-b".into(), status: "running".into(), cost_per_hr: Some(0.2), ..hz.clone() };
+        ctx.event(&Event::Created { pod: &hz, owner: &OwnerRule::None });
+        ctx.event(&Event::Created { pod: &vast, owner: &OwnerRule::None });
+        let fake = FakeProvider::default();
+        fake.pods.lock().unwrap().push(vast.clone());
+        let tracked = Tracked::new(&fake, &ctx, OwnerRule::None);
+        tracked.list_pods().await.unwrap();
+        tracked.stop_pod("77").await.unwrap();
+        tracked.terminate_pod("77").await.unwrap();
+        let s = ctx.state();
+        let row = |p: &str| s.machines.iter().find(|m| m.provider == p).unwrap().clone();
+        assert_eq!(row("vast").ended.map(|e| e.how), Some(spend::EndHow::Terminated));
+        assert!(row("vast").segs.iter().any(|g| !g.running), "the stop: {:?}", row("vast").segs);
+        assert!(row("hetzner").is_open() && row("hetzner").segs.iter().all(|g| g.running));
+    }
+
+    /// Every method of the `Provider` trait is forwarded by [`Tracked`]: one it doesn't
+    /// override would answer with the trait's default (`pods rename` refusing every pod, say)
+    /// instead of the fleet's.
+    #[test]
+    fn the_tracked_provider_forwards_every_provider_method() {
+        let fns = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|l| {
+                    let l = l.trim_start();
+                    let l = l.strip_prefix("async ").unwrap_or(l);
+                    l.strip_prefix("fn ").map(|r| r.split(['(', '<']).next().unwrap_or("").to_string())
+                })
+                .collect()
+        };
+        let core = include_str!("../../core/src/provider/mod.rs");
+        let start = core.find("pub trait Provider").expect("the trait");
+        let end = start + core[start..].find("\n}\n").expect("its end");
+        let mine = include_str!("spend.rs");
+        let s = mine.find("impl Provider for Tracked").expect("the impl");
+        let e = s + mine[s..].find("\n}\n").expect("its end");
+        let forwarded = fns(&mine[s..e]);
+        let required = fns(&core[start..end]);
+        assert!(required.len() > 20 && required.contains(&"rename_support".to_string()), "the trait read: {required:?}");
+        let missing: Vec<String> = required.into_iter().filter(|f| !forwarded.contains(f)).collect();
+        assert!(missing.is_empty(), "Tracked doesn't forward: {missing:?}");
     }
 }

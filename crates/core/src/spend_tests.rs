@@ -52,9 +52,10 @@ fn watch(mut state: SpendState, ok: &[&str], pods: &[Pod], from: u64, to: u64) -
     state
 }
 
-/// Tracking begun an hour before `T0` (so machines first seen at `T0` don't predate it).
+/// Every provider listed (empty) 10 minutes before `T0`: a machine first seen at `T0` didn't
+/// run unseen before.
 fn tracked() -> SpendState {
-    see(SpendState::default(), &["runpod", "vast", "hetzner"], &[], &[], T0 - H)
+    see(SpendState::default(), &["runpod", "vast", "hetzner"], &[], &[], T0 - 10 * M)
 }
 
 fn given(owner: &str) -> OwnerRule {
@@ -138,7 +139,7 @@ fn a_name_held_by_two_running_instances_needs_the_id() {
 }
 
 #[test]
-fn a_long_silence_is_charged_at_its_rate_and_flagged_as_erring_high() {
+fn a_long_silence_is_charged_at_the_higher_end_and_flagged_as_erring_either_way() {
     let p = running("vast", "9", "devtest-c", 0.30);
     let mut s = see(SpendState::default(), &["vast"], &[], std::slice::from_ref(&p), T0);
     s = see(s, &["vast"], &[], std::slice::from_ref(&p), T0 + 10 * M);
@@ -149,7 +150,7 @@ fn a_long_silence_is_charged_at_its_rate_and_flagged_as_erring_high() {
     let r = rep(&s, None, T0 + 3 * H);
     let row = &r.machines[0];
     assert!(row.estimates.contains(&Est::Gap), "{:?}", row.estimates);
-    assert_eq!(Est::Gap.errs(), Errs::High);
+    assert_eq!(Est::Gap.errs(), Errs::Either, "it may have been stopped, or run at another price, meanwhile");
     assert!(close(row.estimated, 0.30 * (3.0 - 10.0 / 60.0)), "{}", row.estimated);
     // Short silences aren't estimates.
     let mut s = see(SpendState::default(), &["vast"], &[], std::slice::from_ref(&p), T0);
@@ -284,7 +285,7 @@ fn a_listing_without_a_price_keeps_the_instances_last_one() {
     // Never priced at all: 0, flagged as erring low.
     let s = watch(SpendState::default(), &["runpod"], &[pod("runpod", "x", "devtest-b", "RUNNING", None)], T0, T0 + H);
     let row = &rep(&s, None, T0 + H).machines[0];
-    assert_eq!((row.amount, row.estimates.as_slice()), (0.0, [Est::Unpriced, Est::PredatesTracking].as_slice()));
+    assert_eq!((row.amount, row.estimates.as_slice()), (0.0, [Est::StartUnknown, Est::Unpriced].as_slice()));
     assert_eq!(Est::Unpriced.errs(), Errs::Low);
 }
 
@@ -334,7 +335,7 @@ fn a_machine_seen_after_tracking_began_starts_at_its_providers_creation_time() {
     let s = see(SpendState::default(), &["hetzner"], &[], &[old], T0);
     let m = machine(&s, "hetzner", "7");
     assert_eq!((m.start, m.start_how), (T0, StartHow::Seen));
-    assert!(rep(&s, None, T0 + H).machines[0].estimates.contains(&Est::PredatesTracking));
+    assert!(rep(&s, None, T0 + H).machines[0].estimates.contains(&Est::StartUnknown));
 }
 
 #[test]
@@ -379,6 +380,64 @@ fn a_provider_listing_a_machine_as_terminated_ends_it() {
     assert_eq!(machine(&s, "vast", "9").ended.map(|e| e.how), Some(EndHow::Gone));
 }
 
+#[test]
+fn an_older_listing_neither_ends_nor_reopens_what_a_newer_observation_recorded() {
+    let p = running("vast", "9", "devtest-c", 0.30);
+    let s = see(tracked(), &["vast"], &[], std::slice::from_ref(&p), T0 + H);
+    // A listing taken before that sighting (a slow command, a clock gone back) without it.
+    let s = see(s, &["vast"], &[], &[], T0 + 30 * M);
+    assert!(machine(&s, "vast", "9").is_open(), "older than its last sighting: says nothing");
+    // Terminated at T0+2H; a listing from just before still shows it running.
+    let s = apply_event(s, &Event::Terminated { provider: Some("vast"), id: "9" }, T0 + 2 * H);
+    let s = see(s, &["vast"], &[], std::slice::from_ref(&p), T0 + 2 * H - M);
+    assert_eq!(machine(&s, "vast", "9").ended, Some(Ended { at: T0 + 2 * H, how: EndHow::Terminated }));
+    // Vanished at T0+3H (a later one), then a listing from before that shows it: still ended.
+    let s = see(s, &["vast"], &[], std::slice::from_ref(&p), T0 + 2 * H + TERMINATE_GRACE);
+    assert!(machine(&s, "vast", "9").is_open(), "the terminate didn't take");
+    let s = see(s, &["vast"], &[], &[], T0 + 3 * H);
+    let s = see(s, &["vast"], &[], &[p], T0 + 3 * H - M);
+    assert_eq!(machine(&s, "vast", "9").ended, Some(Ended { at: T0 + 3 * H, how: EndHow::Vanished }));
+}
+
+#[test]
+fn a_long_unpriced_silence_is_both_a_gap_and_unpriced() {
+    let p = pod("runpod", "x", "devtest-b", "RUNNING", None);
+    let mut s = see(tracked(), &["runpod"], &[], std::slice::from_ref(&p), T0);
+    s = see(s, &["runpod"], &[], &[p], T0 + 3 * H);
+    let row = &rep(&s, None, T0 + 3 * H).machines[0];
+    assert_eq!(row.estimates, [Est::Gap, Est::Unpriced], "the zero is still flagged as erring low");
+}
+
+#[test]
+fn a_machine_first_seen_after_its_provider_went_unlisted_may_have_run_before() {
+    let rp = running("runpod", "rp1", "devtest-a", 0.30);
+    // Tracking began on Hetzner; RunPod failed to list for a day, then shows a pod it doesn't
+    // date (RunPod v1, Vast): it may have run all along.
+    let s = see(SpendState::default(), &["hetzner"], &["runpod"], &[], T0);
+    let s = see(s, &["hetzner", "runpod"], &[], std::slice::from_ref(&rp), T0 + 24 * H);
+    let m = machine(&s, "runpod", "rp1");
+    assert!(m.start_unsure && m.start == T0 + 24 * H, "{m:?}");
+    let row = &rep(&s, None, T0 + 25 * H).machines[0];
+    assert_eq!(row.estimates, [Est::StartUnknown]);
+    assert_eq!(Est::StartUnknown.errs(), Errs::Low);
+    // RunPod listed (empty) ten minutes before it appeared: it's new.
+    let s = see(SpendState::default(), &["runpod"], &[], &[], T0);
+    let s = see(s, &["runpod"], &[], &[], T0 + 24 * H - 10 * M);
+    let s = see(s, &["runpod"], &[], &[rp], T0 + 24 * H);
+    assert!(!machine(&s, "runpod", "rp1").start_unsure);
+    assert!(rep(&s, None, T0 + 25 * H).machines[0].estimates.is_empty());
+}
+
+#[test]
+fn the_last_listing_time_moves_at_most_every_refresh() {
+    let s = see(SpendState::default(), &["runpod"], &[], &[], T0);
+    assert_eq!(s.listed["runpod"], T0);
+    let same = see(s.clone(), &["runpod"], &[], &[], T0 + 5);
+    assert_eq!(same, s, "the dashboard's refreshes don't rewrite the file");
+    assert_eq!(see(s.clone(), &["runpod"], &[], &[], T0 + REFRESH).listed["runpod"], T0 + REFRESH);
+    assert_eq!(see(s, &["runpod"], &[], &[], T0 - H).listed["runpod"], T0, "a clock gone back never moves it");
+}
+
 // ---- the window ----------------------------------------------------------------------
 
 #[test]
@@ -408,6 +467,25 @@ fn since_clips_machines_and_keys_to_the_window() {
 }
 
 #[test]
+fn a_key_not_read_near_the_windows_start_is_flagged_as_erring_high() {
+    let day = 86_400;
+    // Read at $0 on Monday, $10 on Wednesday; a window from Tuesday counts all $10, flagged.
+    let s = observe_keys(SpendState::default(), &[key("k1", "devtest-a", 0.0)], &naming(), T0);
+    let s = observe_keys(s, &[key("k1", "devtest-a", 10.0)], &naming(), T0 + 2 * day);
+    let r = rep(&s, Some(T0 + day), T0 + 2 * day);
+    assert!(r.keys[0].base_stale && close(r.keys[0].usd, 10.0), "{:?}", r.keys);
+    assert!(owner_row(&r, None).ai_estimate);
+    assert!(notes(&r).iter().any(|n| n.contains("not read near the window's start") && n.contains("errs high")), "{:?}", notes(&r));
+    // Read across Tuesday's start at $0 (the hourly cron): exact.
+    let s = observe_keys(SpendState::default(), &[key("k1", "devtest-a", 0.0)], &naming(), T0);
+    let s = observe_keys(s, &[key("k1", "devtest-a", 0.0)], &naming(), T0 + day + H);
+    let s = observe_keys(s, &[key("k1", "devtest-a", 10.0)], &naming(), T0 + 2 * day);
+    let r = rep(&s, Some(T0 + day), T0 + 2 * day);
+    assert!(!r.keys[0].base_stale && close(r.keys[0].usd, 10.0));
+    assert!(!owner_row(&r, None).ai_estimate);
+}
+
+#[test]
 fn parse_since_takes_a_date_or_an_rfc3339_time() {
     assert_eq!(parse_since("2026-11-02"), Ok(1_793_577_600));
     assert_eq!(parse_since("2026-11-02T09:00:00Z"), Ok(1_793_577_600 + 9 * H));
@@ -428,9 +506,9 @@ fn a_rotated_key_keeps_its_final_usage_with_the_old_owner() {
     s = key_minted(s, "kA", "devtest-a", None, None, T0 + M);
     assert_eq!(key_owner(&s, "devtest-a"), Some("alice"));
     s = observe_keys(s, &[key("kA", "devtest-a", 1.25)], &naming(), T0 + H);
-    // Rotate: the listing just before the delete is recorded, then the key is gone.
-    s = observe_keys(s, &[key("kA", "devtest-a", 1.50)], &naming(), T0 + 2 * H);
-    s = keys_deleted(s, &["kA".into()], T0 + 2 * H);
+    // Rotate: the key as listed just before the delete is recorded with it, in one write.
+    s = keys_deleted(s, &[key("kA", "devtest-a", 1.50)], &naming(), T0 + 2 * H);
+    assert_eq!(s.keys[0].gone, Some(KeyGone { at: T0 + 2 * H, how: KeyEndHow::Deleted }));
     s = apply_event(s, &Event::Terminated { provider: Some("hetzner"), id: "7" }, T0 + 2 * H);
     let b = running("hetzner", "8", "devtest-a", 0.01);
     s = created(s, &b, &given("bob"), T0 + 2 * H + M);
@@ -470,15 +548,40 @@ fn a_key_minted_before_its_machine_adopts_the_machines_first_owner() {
 }
 
 #[test]
-fn other_fleets_keys_are_not_tracked_and_usage_samples_are_hourly() {
+fn other_fleets_keys_are_not_tracked_and_each_usage_value_keeps_the_span_it_was_read_over() {
     let s = observe_keys(SpendState::default(), &[key("k1", "devtest-a", 0.1), key("k2", "arena9-a", 9.0)], &naming(), T0);
     assert_eq!(s.keys.len(), 1);
     let s = observe_keys(s, &[key("k1", "devtest-a", 0.2)], &naming(), T0 + 10 * M);
+    let s = observe_keys(s, &[key("k1", "devtest-a", 0.2)], &naming(), T0 + 30 * M);
     let s = observe_keys(s, &[key("k1", "devtest-a", 0.3)], &naming(), T0 + H + M);
-    assert_eq!(s.keys[0].usage, [(T0 + 10 * M, 0.2), (T0 + H + M, 0.3)]);
-    // A lower reading never lowers it.
+    let u = |from, to, usd| Usage { from, to, usd };
+    assert_eq!(s.keys[0].usage, [u(T0, T0, 0.1), u(T0 + 10 * M, T0 + 30 * M, 0.2), u(T0 + H + M, T0 + H + M, 0.3)]);
+    // A lower reading never lowers it (it extends the span of the value it had).
     let s = observe_keys(s, &[key("k1", "devtest-a", 0.1)], &naming(), T0 + 2 * H);
-    assert!(close(s.keys[0].last_usage(), 0.3));
+    assert_eq!(s.keys[0].usage.last(), Some(&u(T0 + H + M, T0 + 2 * H, 0.3)));
+}
+
+#[test]
+fn a_final_reading_on_a_clock_that_went_back_still_counts() {
+    let s = observe_keys(SpendState::default(), &[key("k1", "devtest-a", 1.0)], &naming(), T0 + H);
+    // The delete's listing, stamped five minutes earlier, read $2: never lost.
+    let s = keys_deleted(s, &[key("k1", "devtest-a", 2.0)], &naming(), T0 + 55 * M);
+    assert!(close(s.keys[0].last_usage(), 2.0), "{:?}", s.keys[0].usage);
+    assert_eq!(s.keys[0].gone.map(|g| g.how), Some(KeyEndHow::Deleted));
+    // A listing older than the last reading doesn't call the key gone.
+    let s = observe_keys(SpendState::default(), &[key("k2", "devtest-b", 1.0)], &naming(), T0 + H);
+    let s = observe_keys(s, &[], &naming(), T0);
+    assert_eq!(s.keys[0].gone, None);
+}
+
+#[test]
+fn the_keys_are_due_a_listing_hourly() {
+    let s = SpendState::default();
+    assert!(keys_due(&s, T0), "never listed");
+    let s = observe_keys(s, &[], &naming(), T0);
+    assert!(!keys_due(&s, T0 + 30 * M));
+    assert!(keys_due(&s, T0 + KEY_SAMPLE_EVERY));
+    assert!(keys_due(&s, T0 - H), "a clock gone back");
 }
 
 #[test]
@@ -490,7 +593,7 @@ fn old_key_samples_thin_to_one_a_day() {
     // The last 31 days hourly, the 9 before them one a day.
     assert!(u.len() <= 31 * 24 + 11, "{}", u.len());
     assert!(u.len() >= 31 * 24, "{}", u.len());
-    assert_eq!(u.last().unwrap().1, (40 * 24 - 1) as f64);
+    assert_eq!(u.last().unwrap().usd, (40 * 24 - 1) as f64);
 }
 
 // ---- RunPod billing ----------------------------------------------------------------
@@ -562,6 +665,68 @@ fn billing_corrects_a_runpod_estimate_in_its_settled_hours() {
     let row = &r.machines[0];
     assert!(row.estimates.is_empty(), "billing settled every hour of the gap: {:?}", row.estimates);
     assert!(close(row.amount, 0.30), "{}", row.amount);
+}
+
+#[test]
+fn a_settled_hour_the_answer_has_no_bucket_for_billed_nothing() {
+    // Seen at T0 and again 3 h later (a gap metered at $0.30/h); RunPod billed hour 0 only —
+    // stopped meanwhile with no volume, say.
+    let p = running("runpod", "rp1", "devtest-a", 0.30);
+    let mut s = see(SpendState::default(), &["runpod"], &[], &[], T0 - H);
+    s = created(s, &p, &OwnerRule::None, T0);
+    s = see(s, &["runpod"], &[], std::slice::from_ref(&p), T0 + 3 * H);
+    let now = T0 + 6 * H;
+    let sparse = PodBilled { from: T0 - H, to: now, pods: [("rp1".to_string(), [(T0, 0.3)].into())].into(), at: now };
+    let row = &report(&s, &naming(), None, now, Some(&sparse), None).machines[0];
+    assert!(close(row.amount, 0.30) && row.estimates.is_empty(), "{row:?}");
+    assert_eq!(row.source, Source::Billed);
+    // An answer without the pod at all says nothing about it: metering stands.
+    let none = PodBilled { from: T0 - H, to: now, pods: BTreeMap::new(), at: now };
+    let row = &report(&s, &naming(), None, now, Some(&none), None).machines[0];
+    assert!(close(row.amount, 0.90) && row.estimates == [Est::Gap], "{row:?}");
+}
+
+#[test]
+fn a_window_starting_mid_hour_takes_billing_for_whole_hours_inside_it_only() {
+    let p = running("runpod", "rp1", "devtest-a", 1.0);
+    let mut s = created(SpendState::default(), &p, &given("al"), T0);
+    for i in 1..=12 {
+        s = see(s, &["runpod"], &[], std::slice::from_ref(&p), T0 + i * 20 * M);
+    }
+    let now = T0 + 4 * H;
+    let hours: BTreeMap<u64, f64> = (0..4).map(|i| (T0 + i * H, 1.0)).collect();
+    let billed = PodBilled { from: T0, to: now, pods: [("rp1".to_string(), hours)].into(), at: now };
+    let account = Billed { buckets: (0..4).map(|i| (T0 + i * H, 1.0)).collect(), from: T0, to: now };
+    let r = report(&s, &naming(), Some(T0 + 30 * M), now, Some(&billed), Some(&account));
+    let row = &r.machines[0];
+    // The half hour metered, then three billed hours.
+    assert!(close(row.amount, 3.5), "{row:?}");
+    assert_eq!(row.billed, Some(3.0));
+    let a = r.runpod.unwrap();
+    assert!(close(a.rows, 3.0) && close(a.account, 3.0), "the footer takes the same whole hours: {a:?}");
+}
+
+#[test]
+fn billing_back_to_a_pods_creation_counts_what_ran_before_arena_saw_it() {
+    // Tracking began on Hetzner at T0; RunPod failed to list; its pod, made at T0-2H, is
+    // first seen at T0+3H and watched to T0+6H.
+    let mut p = running("runpod", "rp1", "devtest-a", 0.30);
+    p.created_at = Some(T0 - 2 * H);
+    let s = see(SpendState::default(), &["hetzner"], &["runpod"], &[], T0);
+    let s = watch(s, &["runpod"], std::slice::from_ref(&p), T0 + 3 * H, T0 + 6 * H);
+    let m = machine(&s, "runpod", "rp1");
+    assert_eq!((m.start, m.start_how, m.start_unsure, m.created), (T0 + 3 * H, StartHow::Seen, true, Some(T0 - 2 * H)));
+    let now = T0 + 6 * H;
+    let hours: BTreeMap<u64, f64> = (0..8).map(|i| (T0 - 2 * H + i * H, 0.3)).collect();
+    let since = Some(T0 - 2 * H);
+    let billed = PodBilled { from: T0 - 2 * H, to: now + 2 * H, pods: [("rp1".to_string(), hours)].into(), at: now + 2 * H };
+    let row = &report(&s, &naming(), since, now, Some(&billed), None).machines[0];
+    assert!(row.estimates.is_empty(), "billing covers every hour before it was seen: {row:?}");
+    assert!(close(row.amount, 0.3 * 8.0), "{row:?}");
+    // Without billing: from its first sighting, flagged as erring low.
+    let row = &report(&s, &naming(), since, now, None, None).machines[0];
+    assert_eq!(row.estimates, [Est::StartUnknown]);
+    assert!(close(row.amount, 0.9), "{row:?}");
 }
 
 // ---- renderers ---------------------------------------------------------------------
@@ -669,6 +834,19 @@ fn an_unreadable_or_newer_ledger_is_moved_aside_not_overwritten() {
     assert!(std::fs::read_to_string(aside).unwrap().contains("99"));
     assert_eq!(load(&path).1, Loaded::Ok);
     record_quietly(None, T0, |s| s);
+}
+
+#[test]
+fn a_second_ignored_ledger_in_the_same_second_gets_a_name_of_its_own() {
+    let d = tmp("aside2");
+    let path = d.0.join(SPEND_FILE);
+    std::fs::write(&path, "first").unwrap();
+    record(&path, T0, |s| s).unwrap();
+    std::fs::write(&path, "second").unwrap();
+    let (_, w) = record(&path, T0, |s| s).unwrap();
+    assert!(w.unwrap().contains(&format!("{SPEND_FILE}.ignored-{T0}-1")));
+    assert_eq!(std::fs::read_to_string(d.0.join(format!("{SPEND_FILE}.ignored-{T0}"))).unwrap(), "first");
+    assert_eq!(std::fs::read_to_string(d.0.join(format!("{SPEND_FILE}.ignored-{T0}-1"))).unwrap(), "second");
 }
 
 // ---- the HTTP reads ----------------------------------------------------------------
