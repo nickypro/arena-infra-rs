@@ -1,13 +1,16 @@
-use super::{create_body_text, spec_with_overrides, SpecOverrides};
-use crate::{first_create_spec, handle_api, handle_pods};
-use crate::cli::{ApiCmd, Cli, Cmd, PodCmd};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use arena_core::provider::runpod_v2::RunpodV2Provider;
 use arena_core::remote::FakeRemote;
 use arena_core::{Config, Pod, PodSpec, Provider, Result};
 use async_trait::async_trait;
 use clap::Parser;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+
+use crate::cli::{ApiCmd, Cli, Cmd, PodCmd};
+use crate::pods::placement::first_create_spec;
+use crate::{handle_api, handle_pods};
+use super::{create_body_text, spec_with_overrides, SpecOverrides};
 
 /// A RunPod v2 account with no pods: the create-body rules and preview are the real v2
 /// backend's (pure — no request), lists are counted, creates are recorded (with the body

@@ -8,7 +8,8 @@ use arena_core::provider::{ContainerReset, Provider};
 use arena_core::{Config, PodSpec};
 
 use crate::keys::{openrouter_client, KEYS_DIR};
-use crate::{created_line, image, reap, single_option_plan, spend, Interrupt};
+use crate::pods::placement::{created_line, single_option_plan};
+use crate::{image, reap, spend, Interrupt};
 
 /// The policy `up`/`create` records, in words.
 pub(crate) fn create_policy_line(p: &reap::CreatePolicy) -> String {

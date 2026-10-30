@@ -15,6 +15,7 @@ pub(crate) mod create;
 pub(crate) mod health;
 pub(crate) mod list;
 pub(crate) mod lock;
+pub(crate) mod placement;
 pub(crate) mod pull;
 pub(crate) mod restore;
 pub(crate) mod run;
