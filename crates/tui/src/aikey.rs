@@ -97,24 +97,25 @@ pub(crate) fn args(action: Action, names: &[String], arg: Option<&str>, keys: &[
     Some((kind, out))
 }
 
-/// What the raise-cap box shows for `value` on `pods` (as last read): for one pod `spent $0.42
-/// of $5.00 this month` and `new cap: $10.00`; for several a line each (`alpha: cap $5.00 →
-/// $10.00 · spent …`, a pod without a key left out). `Err`: why Enter won't run it — an amount
-/// that isn't one, or a cap the CLI would refuse ([`or::plan_cap`], never forced from here).
-/// Pure.
-pub(crate) fn limit_preview(shared: &Shared, pods: &[Pod], value: &str) -> Result<Vec<String>, Vec<String>> {
+/// What the raise-cap box shows for `value` on `set` — its pods and their keys as the box was
+/// opened with them ([`snapshot`], `Ui::ai_set`: what Enter runs on, so a refresh never changes
+/// the keys under a preview; review codex r4 #2): for one pod `spent $0.42 of $5.00 this month`
+/// and `new cap: $10.00`; for several a line each (`alpha: cap $5.00 → $10.00 · spent …`, a pod
+/// without a key left out). `Err`: why Enter won't run it — an amount that isn't one, or a cap
+/// the CLI would refuse ([`or::plan_cap`], never forced from here). Pure.
+pub(crate) fn limit_preview(set: &[(String, Option<KeyInfo>)], value: &str) -> Result<Vec<String>, Vec<String>> {
     let money = |x: f64| arena_core::fleet::fmt_money("$", x);
     let change = or::parse_cap(value).map_err(|e| vec![e])?;
     let (mut lines, mut refused) = (Vec::new(), Vec::new());
-    for pod in pods {
-        let Ok((_, info)) = support(shared, pod) else {
-            lines.push(format!("{}: no AI key — left out", pod.name));
+    for (name, key) in set {
+        let Some(info) = key else {
+            lines.push(format!("{name}: no AI key — left out"));
             continue;
         };
-        match or::plan_cap(&info, Some(change), None, false) {
-            Err(why) if pods.len() == 1 => refused.push(why),
-            Err(why) => refused.push(format!("{}: {why}", pod.name)),
-            Ok(p) if pods.len() == 1 => {
+        match or::plan_cap(info, Some(change), None, false) {
+            Err(why) if set.len() == 1 => refused.push(why),
+            Err(why) => refused.push(format!("{name}: {why}")),
+            Ok(p) if set.len() == 1 => {
                 let cap = |x: Option<f64>| x.map(money).unwrap_or_else(|| "no cap".into());
                 let spent = p.spent.map(money).unwrap_or_else(|| "?".into());
                 lines.push(format!("spent {spent} of {} {}", cap(p.before), or::period_words(p.reset_after)));
@@ -129,7 +130,7 @@ pub(crate) fn limit_preview(shared: &Shared, pods: &[Pod], value: &str) -> Resul
                 }
                 lines.push(after);
             }
-            Ok(p) => lines.push(format!("{}: {}", pod.name, p.words())),
+            Ok(p) => lines.push(format!("{name}: {}", p.words())),
         }
     }
     if refused.iter().any(|r| r.contains("--force")) {
@@ -157,6 +158,7 @@ pub(crate) fn choose(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, pod: Pod, shown: 
     };
     let action = action.for_key(usage.disabled);
     if action == Action::KeyLimit {
+        ui.ai_set = vec![(pod.name.clone(), Some(info))];
         ui.mode = Mode::Input { action, scope: InputScope::Pod { name: shown, id: pod.id }, value: prefill(&ui.cfg) };
         return;
     }
@@ -184,7 +186,7 @@ pub(crate) fn choose_set(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, action: Actio
         let owned: Vec<Pod> = pods.iter().map(|p| (*p).clone()).collect();
         (set_why(&s, &pods), out, snapshot(&s, &owned))
     };
-    // What the confirm is opened with is what `ALL`/the count runs (review codex r3 #1).
+    // What the confirm or the box is opened with is what it runs on (review codex r3 #1, r4 #2).
     ui.ai_set = keyed;
     if let Some(why) = why {
         ui.mode = Mode::Result(format!("✗ can't {} — {why}", action.label()));
@@ -197,9 +199,15 @@ pub(crate) fn choose_set(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, action: Actio
     };
 }
 
-/// Those of `pods` with a key, and the key as last read ([`support`]) — what a run is bound to.
-pub(crate) fn snapshot(shared: &Shared, pods: &[Pod]) -> Vec<(String, KeyInfo)> {
-    pods.iter().filter_map(|p| support(shared, p).ok().map(|(_, k)| (p.name.clone(), k))).collect()
+/// `pods`' names and each one's key as last read ([`support`]; `None`: no key to act on) — what a
+/// confirm or the raise-cap box shows, and what it then runs on.
+pub(crate) fn snapshot(shared: &Shared, pods: &[Pod]) -> Vec<(String, Option<KeyInfo>)> {
+    pods.iter().map(|p| (p.name.clone(), support(shared, p).ok().map(|(_, k)| k))).collect()
+}
+
+/// Those of `set` with a key.
+pub(crate) fn keyed(set: &[(String, Option<KeyInfo>)]) -> Vec<(String, KeyInfo)> {
+    set.iter().filter_map(|(n, k)| Some((n.clone(), k.clone()?))).collect()
 }
 
 /// Run the AI key's `action` on `keyed` (pod names and their keys as the operator was shown them,
@@ -297,24 +305,27 @@ mod tests {
     #[test]
     fn limit_preview_shows_spent_and_the_new_cap() {
         let s = shared_with_keys();
-        let alpha = [pod("devtest-alpha")];
-        assert_eq!(limit_preview(&s, &alpha, "+5").unwrap(), ["spent $0.42 of $5.00 this month", "new cap: $10.00"]);
-        assert_eq!(limit_preview(&s, &alpha, "5").unwrap()[1], "new cap: $5.00 (unchanged)");
-        assert_eq!(limit_preview(&s, &[pod("devtest-bravo")], "+0.05").unwrap()[1], "new cap: $5.05 — the key is paused: `o` resumes it");
-        assert_eq!(limit_preview(&s, &[pod("devtest-bravo")], "+0.05").unwrap()[0], "spent $4.90 of $5.00 in all");
-        let e = limit_preview(&s, &[pod("devtest-bravo")], "4").unwrap_err();
+        let of = |names: &[&str]| snapshot(&s, &names.iter().map(|n| pod(n)).collect::<Vec<_>>());
+        let alpha = of(&["devtest-alpha"]);
+        assert_eq!(limit_preview(&alpha, "+5").unwrap(), ["spent $0.42 of $5.00 this month", "new cap: $10.00"]);
+        assert_eq!(limit_preview(&alpha, "5").unwrap()[1], "new cap: $5.00 (unchanged)");
+        let bravo = of(&["devtest-bravo"]);
+        assert_eq!(limit_preview(&bravo, "+0.05").unwrap()[1], "new cap: $5.05 — the key is paused: `o` resumes it");
+        assert_eq!(limit_preview(&bravo, "+0.05").unwrap()[0], "spent $4.90 of $5.00 in all");
+        let e = limit_preview(&bravo, "4").unwrap_err();
         assert!(e[0].starts_with("a $4.00 cap is under what it has spent in all ($4.90)") && e[1].contains("never forces"), "{e:?}");
-        assert!(limit_preview(&s, &alpha, "abc").unwrap_err()[0].contains("isn't an amount"));
-        assert!(limit_preview(&s, &alpha, "none").unwrap_err()[0].contains("--no-cap"));
-        let set = [pod("devtest-alpha"), pod("devtest-bravo"), pod("devtest-cloud")];
+        assert!(limit_preview(&alpha, "abc").unwrap_err()[0].contains("isn't an amount"));
+        assert!(limit_preview(&alpha, "none").unwrap_err()[0].contains("--no-cap"));
+        let set = of(&["devtest-alpha", "devtest-bravo", "devtest-cloud"]);
+        assert_eq!(keyed(&set).iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["devtest-alpha", "devtest-bravo"]);
         assert_eq!(
-            limit_preview(&s, &set, "+1").unwrap(),
+            limit_preview(&set, "+1").unwrap(),
             [
                 "devtest-alpha: cap $5.00 → $6.00 (monthly) · spent $0.42 this month",
                 "devtest-bravo: cap $5.00 → $6.00 · spent $4.90 in all",
                 "devtest-cloud: no AI key — left out",
             ]
         );
-        assert!(limit_preview(&s, &set, "4.5").unwrap_err()[0].starts_with("devtest-bravo: a $4.50 cap"));
+        assert!(limit_preview(&set, "4.5").unwrap_err()[0].starts_with("devtest-bravo: a $4.50 cap"));
     }
 }

@@ -140,6 +140,23 @@ async fn keys_lock(cfg: &Config) -> Result<Option<std::fs::File>> {
     }
 }
 
+/// The test a key must pass in the request just before its change ([`or::KeyCheck`]): still the
+/// key planned for — the same name, cap, reset, on/off (review codex r3 #2, r4 #1: renamed or
+/// raised meanwhile) — and, a cap change, still one [`or::plan_cap`] allows with the spend it has
+/// now (r4 #3: spent past a lowered cap while the earlier keys were changed).
+fn just_before(verb: &Verb, planned: &KeyInfo) -> impl Fn(&KeyInfo) -> std::result::Result<(), String> + Send + Sync {
+    let (was, verb) = (or::Expected::of(planned), verb.clone());
+    move |now: &KeyInfo| {
+        if !was.holds(now) {
+            return Err(format!("changed since it was read (now {}{})", state_words(now), now.name.as_ref().filter(|n| Some(*n) != was.name.as_ref()).map(|n| format!(", named {n}")).unwrap_or_default()));
+        }
+        match &verb {
+            Verb::Limit { change, reset, force } => or::plan_cap(now, *change, *reset, *force).map(drop),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// `--expect`'s values ([`or::Expected::parse`]).
 fn expected(tokens: &[String]) -> Result<Vec<or::Expected>> {
     tokens.iter().map(|t| or::Expected::parse(t).map_err(|e| anyhow::anyhow!("--expect: {e}"))).collect()
@@ -149,7 +166,7 @@ fn expected(tokens: &[String]) -> Result<Vec<or::Expected>> {
 /// still as shown — else the operator confirmed a change to another key, or another cap (review
 /// codex r2 #3). Nothing to check without `--expect` (the CLI's own confirm showed the plan).
 /// The refusals. Pure.
-fn unexpected(rows: &[Row], expect: &[or::Expected]) -> Vec<String> {
+fn unexpected(verb: &Verb, rows: &[Row], expect: &[or::Expected]) -> Vec<String> {
     if expect.is_empty() {
         return Vec::new();
     }
@@ -157,7 +174,15 @@ fn unexpected(rows: &[Row], expect: &[or::Expected]) -> Vec<String> {
         .filter(|r| r.update.is_some())
         .filter_map(|r| {
             let k = r.key.as_ref()?;
+            // Another of this machine's keys was shown: the name has more than one (the dashboard
+            // shows one key a name; a pause acts on every enabled one).
+            let another_shown = rows.iter().any(|o| o.machine == r.machine && o.key.as_ref().is_some_and(|ok| ok.hash != k.hash && expect.iter().any(|e| e.hash == ok.hash)));
             match expect.iter().find(|e| e.hash == k.hash) {
+                None if another_shown => Some(format!(
+                    "{}: it has more than one key and the dashboard showed one — `arena keys list --all`, then `arena keys {} {0}`",
+                    r.machine,
+                    verb.word()
+                )),
                 None => Some(format!("{}: its key isn't the one the dashboard showed (rotated meanwhile?) — look again", r.machine)),
                 Some(e) if !e.holds(k) => Some(format!("{}: its key changed since the dashboard showed it (now {}) — look again", r.machine, state_words(k))),
                 Some(_) => None,
@@ -461,7 +486,7 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
     let rows = plan(&verb, &names, &existing, &naming).map_err(|refused| {
         anyhow::anyhow!("nothing changed — refused:\n  {}", refused.join("\n  "))
     })?;
-    let off = unexpected(&rows, expect);
+    let off = unexpected(&verb, &rows, expect);
     anyhow::ensure!(off.is_empty(), "nothing changed — refused:\n  {}", off.join("\n  "));
     let todo: Vec<&Row> = rows.iter().filter(|r| r.update.is_some()).collect();
     let skipped = |r: &Row| if r.key.is_none() { Outcome::NoKey } else { Outcome::Unchanged };
@@ -510,7 +535,7 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
         let outcome = match (&r.key, &r.update) {
             (Some(k), Some(u)) => match stale.get(r.machine.as_str()).cloned().flatten() {
                 Some(why) => Outcome::Failed(why),
-                None => match api.update_key(&k.hash, u, Some(&or::Expected::of(k))).await {
+                None => match api.update_key(&k.hash, u, Some(&just_before(&verb, k))).await {
                     Ok(()) => Outcome::Changed,
                     Err(e) => Outcome::Failed(e.to_string()),
                 },
@@ -617,8 +642,8 @@ mod tests {
         broken: Vec<&'static str>,
         ignored: Vec<&'static str>,
         meanwhile: Mutex<Option<(&'static str, f64)>>,
-        /// Another operator's change made at the first update (a later key's cap).
-        meanwhile_on_update: Mutex<Option<(&'static str, f64)>>,
+        /// Another operator's (or the participant's) change to a later key, made at the first update.
+        meanwhile_on_update: Mutex<Option<(&'static str, fn(&mut KeyInfo))>>,
     }
 
     impl Keys {
@@ -651,14 +676,14 @@ mod tests {
         async fn rename_key(&self, _hash: &str, _new_name: &str) -> arena_core::Result<()> {
             unreachable!()
         }
-        async fn update_key(&self, hash: &str, u: &KeyUpdate, expect: Option<&or::Expected>) -> arena_core::Result<()> {
+        async fn update_key(&self, hash: &str, u: &KeyUpdate, check: Option<or::KeyCheck<'_>>) -> arena_core::Result<()> {
             let mut keys = self.keys.lock().unwrap();
-            if let Some((other, cap)) = self.meanwhile_on_update.lock().unwrap().take() {
-                keys.iter_mut().filter(|k| k.hash == other).for_each(|k| k.limit = Some(cap));
+            if let Some((other, change)) = self.meanwhile_on_update.lock().unwrap().take() {
+                keys.iter_mut().filter(|k| k.hash == other).for_each(change);
             }
             let k = keys.iter_mut().find(|k| k.hash == hash).expect("a listed key");
-            if expect.is_some_and(|e| !e.holds(k)) {
-                return Err(arena_core::Error::provider("openrouter update key: refused — changed since it was read"));
+            if let Some(Err(why)) = check.map(|c| c(k)) {
+                return Err(arena_core::Error::provider(format!("openrouter update key: refused — {why}")));
             }
             self.calls.lock().unwrap().push(format!("{hash} {}", or::update_body(u)?));
             let name = k.name.clone().unwrap_or_default();
@@ -832,11 +857,20 @@ mod tests {
     /// in the request just before its own change; the earlier ones stand.
     #[tokio::test]
     async fn a_later_key_that_moves_mid_run_is_refused_at_its_own_change() {
-        let api = Keys { meanwhile_on_update: Mutex::new(Some(("hc", 25.0))), ..Keys::with(fleet_keys()) };
+        let api = Keys { meanwhile_on_update: Mutex::new(Some(("hc", |k| k.limit = Some(25.0)))), ..Keys::with(fleet_keys()) };
         let e = keys_cmd(&["limit", "alpha..cloud", "+5"], &api).await.unwrap_err();
         assert_eq!(e, "1 key(s) failed");
         assert_eq!(api.calls(), [r#"ha {"limit":5.1}"#, r#"hb {"limit":10.0}"#], "cloud's isn't made");
         assert_eq!(api.key("hc").limit, Some(25.0));
+        // Renamed to another machine meanwhile (review codex r4 #1): not this machine's to pause.
+        let api = Keys { meanwhile_on_update: Mutex::new(Some(("hc", |k| k.name = Some("devtest-delta".into())))), ..Keys::with(fleet_keys()) };
+        assert_eq!(keys_cmd(&["pause", "alpha", "cloud"], &api).await.unwrap_err(), "1 key(s) failed");
+        assert_eq!(api.calls(), [r#"ha {"disabled":true}"#]);
+        // Spent past the new cap meanwhile (r4 #3): a $2 cap over $3 spent is refused at its change.
+        let api = Keys { meanwhile_on_update: Mutex::new(Some(("hc", |k| k.usage = Some(3.0)))), ..Keys::with(fleet_keys()) };
+        assert_eq!(keys_cmd(&["limit", "alpha", "cloud", "2"], &api).await.unwrap_err(), "1 key(s) failed");
+        assert_eq!(api.calls(), [r#"ha {"limit":2.0}"#]);
+        assert_eq!(api.key("hc").limit, Some(5.0));
     }
 
     /// Two key changes on one box take turns: one waits for the other's lock, then goes ahead.
@@ -903,6 +937,13 @@ mod tests {
         assert!(api.calls().is_empty());
         keys_cmd(&["limit", "bravo", "10", "--expect", "hb=5/never/on"], &api).await.unwrap();
         assert_eq!(api.calls(), [r#"hb {"limit":10.0}"#]);
+        // Two enabled keys under one name: the dashboard showed one, a pause would act on both.
+        let mut keys = fleet_keys();
+        keys.push(key("ha2", "devtest-alpha", Some(5.0), 0.0, false, "2026-10-29T10:00:00Z"));
+        let api = Keys::with(keys);
+        let e = keys_cmd(&["pause", "alpha", "--expect", "ha=0.1/never/on"], &api).await.unwrap_err();
+        assert!(e.contains("devtest-alpha: it has more than one key and the dashboard showed one — `arena keys list --all`, then `arena keys pause devtest-alpha`"), "{e}");
+        assert!(api.calls().is_empty());
     }
 
     /// The command lines the dashboard's AI key rows run (arena-tui's `aikey::args`), which it

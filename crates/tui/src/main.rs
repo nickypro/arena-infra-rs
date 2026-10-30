@@ -348,7 +348,7 @@ struct Ui {
     ai_keys: bool,
     /// The marked set's pods and keys an AI key confirm was opened with — what it runs on
     /// (`aikey::choose_set`).
-    ai_set: Vec<(String, arena_core::openrouter::KeyInfo)>,
+    ai_set: Vec<(String, Option<arena_core::openrouter::KeyInfo>)>,
 }
 
 impl Ui {
@@ -1284,18 +1284,6 @@ fn selected_pod(shared: &Arc<Mutex<Shared>>, idx: usize) -> Option<Pod> {
     shared.lock().unwrap().pods.get(idx).cloned()
 }
 
-/// The pods an [`Mode::Input`] is for: its pod (by id, if still listed), or its set's.
-fn input_pods(s: &Shared, ui: &Ui, scope: &InputScope) -> Vec<Pod> {
-    match scope {
-        InputScope::Pod { id, .. } => s.pods.iter().filter(|p| &p.id == id).cloned().collect(),
-        InputScope::Set(sc) => scope_pods_of(s, ui, *sc).into_iter().cloned().collect(),
-    }
-}
-
-/// The raise-cap box's `value` won't run for its pods ([`aikey::limit_preview`] says why).
-fn limit_refused(s: &Shared, ui: &Ui, scope: &InputScope, value: &str) -> bool {
-    aikey::limit_preview(s, &input_pods(s, ui, scope), value).is_err()
-}
 
 /// Open an interactive SSH shell to the selected pod: suspend the dashboard (leave the
 /// alternate screen + raw mode), hand the terminal to `ssh`, then restore on exit ([`hand_over`]).
@@ -1853,7 +1841,7 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
             match code {
                 KeyCode::Esc => ui.mode = Mode::List,
                 KeyCode::Enter if typed == token && action.ai_key() => {
-                    let keyed = std::mem::take(&mut ui.ai_set);
+                    let keyed = aikey::keyed(&std::mem::take(&mut ui.ai_set));
                     aikey::start(ui, shared, action, &keyed, None, None);
                 }
                 KeyCode::Enter if typed == token => {
@@ -1920,9 +1908,18 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
 /// as a run (`runs.rs`), the rest in the background. A cap the box shows as refused (an amount
 /// that isn't one, a cap under the spend) stays in the box, which says why.
 fn submit_input(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Provider>, action: Action, scope: InputScope, value: String) {
-    if action == Action::KeyLimit && limit_refused(&shared.lock().unwrap(), ui, &scope, &value) {
-        ui.mode = Mode::Input { action, scope, value };
-        return;
+    if action.ai_key() {
+        // The box's own pods and keys (`Ui::ai_set`), as previewed.
+        if aikey::limit_preview(&ui.ai_set, &value).is_err() {
+            ui.mode = Mode::Input { action, scope, value };
+            return;
+        }
+        let keyed = aikey::keyed(&std::mem::take(&mut ui.ai_set));
+        let own = match &scope {
+            InputScope::Pod { id, .. } => shared.lock().unwrap().pods.iter().find(|p| &p.id == id).map(|p| p.provider.clone()),
+            InputScope::Set(_) => None,
+        };
+        return aikey::start(ui, shared, action, &keyed, own.as_deref(), Some(&value));
     }
     let (provider, remote, cfg) = (provider.clone(), ui.remote.clone(), ui.cfg.clone());
     match scope {
@@ -1941,11 +1938,6 @@ fn submit_input(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Pro
                     });
                 }
             }
-        }
-        InputScope::Set(sc) if action.ai_key() => {
-            let pods = scope_pods(shared, &ui.marked, sc);
-            let keyed = aikey::snapshot(&shared.lock().unwrap(), &pods);
-            aikey::start(ui, shared, action, &keyed, None, Some(&value));
         }
         InputScope::Set(sc) => {
             let pods = scope_pods(shared, &ui.marked, sc);
@@ -2546,7 +2538,7 @@ fn cli_action_args(action: Action, name: &str, arg: Option<&str>) -> Option<(run
 /// on it — or say why it can't run.
 fn start_cli_action(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, action: Action, pod: &Pod, arg: Option<&str>) {
     if action.ai_key() {
-        let keyed = aikey::snapshot(&shared.lock().unwrap(), std::slice::from_ref(pod));
+        let keyed = aikey::keyed(&aikey::snapshot(&shared.lock().unwrap(), std::slice::from_ref(pod)));
         return aikey::start(ui, shared, action, &keyed, Some(&pod.provider), arg);
     }
     let Some((kind, args)) = cli_action_args(action, &pod.name, arg) else { return };
@@ -3090,7 +3082,7 @@ fn render_input(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action, scope: 
     // The raise-cap box: what the key spent of its cap and the new cap as typed — or why Enter
     // won't run it.
     let preview = match action {
-        Action::KeyLimit => match aikey::limit_preview(shared, &input_pods(shared, ui, scope), value) {
+        Action::KeyLimit => match aikey::limit_preview(&ui.ai_set, value) {
             Ok(lines) => format!("{}\n\n", lines.join("\n")),
             Err(why) => format!("✗ {}\n\n", why.join("\n")),
         },
@@ -7436,8 +7428,15 @@ deep_check_end=1
         submit_input(&shared, &mut ui, &provider, Action::KeyLimit, scope.clone(), "0.1".into());
         assert!(matches!(&ui.mode, Mode::Input { value, .. } if value == "0.1"), "{:?}", ui.mode);
         assert!(shared.lock().unwrap().runs.is_empty());
+        // A refresh while the box is open (another operator raised the cap to $25) changes neither
+        // the preview nor what Enter runs on (review codex r4 #2): the CLI then refuses the moved key.
+        let before = shared.lock().unwrap().ai.clone();
+        shared.lock().unwrap().ai = Some(UsageView::from_keys(&[KeyInfo { limit: Some(25.0), ..key("devtest-alpha", 0.42, Some("monthly"), false) }], None));
+        ui.mode = Mode::Input { action: Action::KeyLimit, scope: scope.clone(), value: "+5".into() };
+        assert!(draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("spent $0.42 of $5.00 this month"));
         // Enter on +5: `arena keys limit devtest-alpha +5 --yes`, then the keys are read again.
         submit_input(&shared, &mut ui, &provider, Action::KeyLimit, scope, "+5".into());
+        shared.lock().unwrap().ai = before;
         let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
         assert_eq!(first_line_when_ended(&shared, id).await.as_deref(), Some("args: --config /test/config.env --provider runpod keys limit devtest-alpha +5 --expect hdevtestalpha=5/monthly/on --yes"));
         {

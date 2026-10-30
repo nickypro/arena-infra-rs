@@ -277,12 +277,11 @@ impl OpenRouter {
         self.check_key(hash, what, None).await
     }
 
-    /// [`Self::ensure_in_workspace`], and — given `expect` — that the key is still as expected
-    /// ([`Expected::holds`]): one read (`GET /keys/{hash}`) serves both; none when there's
-    /// nothing to check.
-    async fn check_key(&self, hash: &str, what: &str, expect: Option<&Expected>) -> Result<()> {
+    /// [`Self::ensure_in_workspace`], and — given a `check` — that the key as it is now passes
+    /// it: one read (`GET /keys/{hash}`) serves both; none when there's nothing to check.
+    async fn check_key(&self, hash: &str, what: &str, check: Option<KeyCheck<'_>>) -> Result<()> {
         let ws = self.workspace_id().await?;
-        if ws.is_none() && expect.is_none() {
+        if ws.is_none() && check.is_none() {
             return Ok(());
         }
         let v = send_json(self.auth(self.client.get(format!("{}/{hash}", self.keys_url()))), &format!("openrouter {what}"))
@@ -298,15 +297,10 @@ impl OpenRouter {
                 self.workspace.as_deref().unwrap_or_default(),
             )));
         }
-        let Some(e) = expect else { return Ok(()) };
+        let Some(check) = check else { return Ok(()) };
         let now = data.filter(|_| same_key).and_then(|d| serde_json::from_value::<KeyInfo>(d.clone()).ok());
         match now {
-            Some(k) if e.holds(&k) => Ok(()),
-            Some(k) => Err(Error::provider(format!(
-                "openrouter {what}: refused — key {} changed since it was read (now {}) — nothing done",
-                short_hash(hash),
-                Expected::of(&k).words()
-            ))),
+            Some(k) => check(&k).map_err(|why| Error::provider(format!("openrouter {what}: refused — key {}: {why} — nothing done", short_hash(hash)))),
             None => Err(Error::provider(format!("openrouter {what}: refused — key {} couldn't be read back to check it", short_hash(hash)))),
         }
     }
@@ -345,15 +339,16 @@ impl OpenRouter {
     /// name, never `workspace_id`, which on this call *moves* a key). How `keys limit|pause|
     /// resume` and the dashboard raise a cap or pause a key; the secret and the usage are
     /// untouched. The key is read first (`GET /keys/{hash}`) when there's a workspace — only a key
-    /// in it, the guard of rename/delete — or an `expect`ed state: a key that has moved since the
-    /// caller read it (another operator raised it, paused it) is refused, so a change planned
-    /// from an older reading never lands over a newer one. That read is the request just before
-    /// the change: OpenRouter has no conditional update to close the rest. Status only, as a
-    /// rename: the caller reads the keys again to see what they say now.
-    pub async fn update_key(&self, hash: &str, update: &KeyUpdate, expect: Option<&Expected>) -> Result<()> {
+    /// in it, the guard of rename/delete — or a `check`: the caller's test of the key as it is now
+    /// ([`KeyCheck`]) — still the one it planned for, as planned, and still a change its rules
+    /// allow — so a change planned from an older reading never lands over a newer one (another
+    /// operator raised it, renamed it, the participant spent past a lowered cap). That read is
+    /// the request just before the change: OpenRouter has no conditional update to close the
+    /// rest. Status only, as a rename: the caller reads the keys again to see what they say now.
+    pub async fn update_key(&self, hash: &str, update: &KeyUpdate, check: Option<KeyCheck<'_>>) -> Result<()> {
         let body = update_body(update)?;
         valid_hash(hash)?;
-        self.check_key(hash, "update key", expect).await?;
+        self.check_key(hash, "update key", check).await?;
         send_ok(self.auth(self.client.patch(format!("{}/{hash}", self.keys_url()))).json(&body), "openrouter update key").await
     }
 
@@ -786,6 +781,10 @@ pub fn exact_money(x: f64) -> String {
     }
 }
 
+/// What a key read just before its change must pass ([`OpenRouter::update_key`]): the caller's
+/// test of the key as it is now — `Err`: why it isn't to be changed.
+pub type KeyCheck<'a> = &'a (dyn Fn(&KeyInfo) -> std::result::Result<(), String> + Send + Sync);
+
 /// A key as a dashboard showed it — its hash, cap, when the cap starts over, on or off — handed to
 /// the command it runs (`--expect HASH=STATE`), which then refuses a key that isn't that one any
 /// more, or has moved: the operator confirmed a change to the key as shown (review codex r2 #3:
@@ -793,6 +792,9 @@ pub fn exact_money(x: f64) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Expected {
     pub hash: String,
+    /// The name it went by, when known (a plan's own reading; never in a [`Self::token`]): a key
+    /// renamed to another machine meanwhile isn't this machine's to change.
+    pub name: Option<String>,
     pub limit: Option<f64>,
     pub reset: Option<LimitReset>,
     pub disabled: bool,
@@ -800,7 +802,7 @@ pub struct Expected {
 
 impl Expected {
     pub fn of(k: &KeyInfo) -> Self {
-        Expected { hash: k.hash.clone(), limit: k.limit, reset: LimitReset::of(k), disabled: k.disabled }
+        Expected { hash: k.hash.clone(), name: k.name.clone(), limit: k.limit, reset: LimitReset::of(k), disabled: k.disabled }
     }
 
     /// `HASH=CAP/RESET/ON|OFF`: `ab12=5/never/on`, `ab12=none/daily/off` (the cap as Rust prints
@@ -827,7 +829,7 @@ impl Expected {
             "off" => true,
             _ => return Err(bad()),
         };
-        Ok(Expected { hash: hash.to_string(), limit, reset: LimitReset::parse(reset).map_err(|_| bad())?, disabled })
+        Ok(Expected { hash: hash.to_string(), name: None, limit, reset: LimitReset::parse(reset).map_err(|_| bad())?, disabled })
     }
 
     /// `cap $25.00 (monthly), on`, `no cap, off`.
@@ -837,13 +839,15 @@ impl Expected {
         format!("{cap}{reset}, {}", if self.disabled { "off" } else { "on" })
     }
 
-    /// Whether `k` is this key, still as shown (the cap to [`CAP_EPSILON`]).
+    /// Whether `k` is this key, still as shown — under the same name, when known (the cap to
+    /// [`CAP_EPSILON`]).
     pub fn holds(&self, k: &KeyInfo) -> bool {
         let cap = match (self.limit, k.limit) {
             (Some(a), Some(b)) => (a - b).abs() < CAP_EPSILON,
             (a, b) => a.is_none() && b.is_none(),
         };
-        k.hash == self.hash && cap && LimitReset::of(k) == self.reset && k.disabled == self.disabled
+        let name = self.name.as_ref().is_none_or(|n| k.name.as_ref() == Some(n));
+        k.hash == self.hash && name && cap && LimitReset::of(k) == self.reset && k.disabled == self.disabled
     }
 }
 
@@ -872,10 +876,10 @@ pub trait KeyApi: Send + Sync {
     async fn create_key(&self, name: &str, limit: Option<f64>) -> Result<CreatedKey>;
     async fn delete_key(&self, hash: &str) -> Result<()>;
     async fn rename_key(&self, hash: &str, new_name: &str) -> Result<()>;
-    /// Change a key's cap, reset or disabled flag, if it's still as `expect`ed
+    /// Change a key's cap, reset or disabled flag, if it passes `check` as it is just before
     /// ([`OpenRouter::update_key`]). Default: refused — a fake for flows that never change a key in
     /// place need not say what it would do.
-    async fn update_key(&self, hash: &str, _update: &KeyUpdate, _expect: Option<&Expected>) -> Result<()> {
+    async fn update_key(&self, hash: &str, _update: &KeyUpdate, _check: Option<KeyCheck<'_>>) -> Result<()> {
         Err(Error::provider(format!("openrouter update key {}: not supported here", short_hash(hash))))
     }
 }
@@ -894,8 +898,8 @@ impl KeyApi for OpenRouter {
     async fn rename_key(&self, hash: &str, new_name: &str) -> Result<()> {
         OpenRouter::rename_key(self, hash, new_name).await
     }
-    async fn update_key(&self, hash: &str, update: &KeyUpdate, expect: Option<&Expected>) -> Result<()> {
-        OpenRouter::update_key(self, hash, update, expect).await
+    async fn update_key(&self, hash: &str, update: &KeyUpdate, check: Option<KeyCheck<'_>>) -> Result<()> {
+        OpenRouter::update_key(self, hash, update, check).await
     }
 }
 
@@ -2074,6 +2078,11 @@ mod tests {
         let odd = Expected::of(&KeyInfo { hash: "ef".into(), limit: Some(0.1 + 0.2), ..Default::default() });
         assert_eq!(Expected::parse(&odd.token()).unwrap(), odd, "the cap reads back exactly");
         assert!(e.holds(&k));
+        // A plan's own reading knows the name: a key renamed meanwhile isn't the one.
+        let named = Expected::of(&KeyInfo { name: Some("devtest-a".into()), ..k.clone() });
+        assert!(named.holds(&KeyInfo { name: Some("devtest-a".into()), ..k.clone() }));
+        assert!(!named.holds(&KeyInfo { name: Some("devtest-b".into()), ..k.clone() }));
+        assert_eq!(Expected::parse(&named.token()).unwrap().name, None, "never in a token");
         for moved in [
             KeyInfo { limit: Some(0.26), ..k.clone() },
             KeyInfo { limit: None, ..k.clone() },
@@ -2110,11 +2119,12 @@ mod tests {
         ]);
         let or = test_client("K", &srv.base);
         let was = Expected::of(&KeyInfo { hash: "a".into(), limit: Some(5.0), ..Default::default() });
+        let check = |k: &KeyInfo| if was.holds(k) { Ok(()) } else { Err(format!("changed since it was read (now {})", Expected::of(k).words())) };
         let cap = KeyUpdate { limit: Some(Some(10.0)), ..Default::default() };
-        or.update_key("a", &cap, Some(&was)).await.unwrap();
-        let e = or.update_key("a", &cap, Some(&was)).await.unwrap_err().to_string();
-        assert!(e.contains("changed since it was read (now cap $25.00 (monthly), on) — nothing done"), "{e}");
-        let e = or.update_key("a", &cap, Some(&was)).await.unwrap_err().to_string();
+        or.update_key("a", &cap, Some(&check)).await.unwrap();
+        let e = or.update_key("a", &cap, Some(&check)).await.unwrap_err().to_string();
+        assert!(e.contains("refused — key a: changed since it was read (now cap $25.00 (monthly), on) — nothing done"), "{e}");
+        let e = or.update_key("a", &cap, Some(&check)).await.unwrap_err().to_string();
         assert!(e.contains("couldn't be read back"), "an answer for another key: {e}");
         assert_eq!(
             *srv.requests.lock().unwrap(),
