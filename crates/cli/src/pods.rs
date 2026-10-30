@@ -11,6 +11,7 @@ pub(crate) mod backup;
 pub(crate) mod baseline;
 pub(crate) mod branch;
 pub(crate) mod copy;
+pub(crate) mod create;
 pub(crate) mod health;
 pub(crate) mod list;
 pub(crate) mod lock;
