@@ -18,6 +18,7 @@ pub(crate) mod pull;
 pub(crate) mod restore;
 pub(crate) mod run;
 pub(crate) mod selection;
+pub(crate) mod setup;
 
 // Per-call SSH budgets (PLAN 1.B). Every pod-SSH call is bounded so one wedged pod can
 // never hang a fleet command: it reports `✗ <name>: timed out after Ns`, counts as a
