@@ -314,21 +314,30 @@ pub fn top_parts(
     // that still don't fit counted at the end (`+2 more`, in the worst colour among them: the
     // info panel has them) — never a warning cut off at the edge unsaid.
     let last = CUTS.last().copied();
+    let tone_of = |severity: u8| [Tone::Bad, Tone::Warn, Tone::Dim][usize::from(severity)];
     groups.retain(|g| g.iter().any(|p| p.cut.is_none()));
     groups.sort_by_key(|g| severity(g));
     for keep in (1..=groups.len()).rev() {
         let mut parts = lay_out(&groups[..keep], last);
         let hidden = &groups[keep..];
         if let Some(worst) = hidden.iter().map(|g| severity(g)).min() {
-            let tone = [Tone::Bad, Tone::Warn, Tone::Dim][usize::from(worst)];
             parts.push(Part::toned(" │ ", Some(Tone::Dim)));
-            parts.push(Part::toned(format!("+{} more", hidden.len()), Some(tone)));
+            parts.push(Part::toned(format!("+{} more", hidden.len()), Some(tone_of(worst))));
         }
-        if width_of(&parts) <= width || keep == 1 {
+        if width_of(&parts) <= width {
             return TopLine { parts, tag: None };
         }
     }
-    TopLine { parts: lay_out(&groups, last), tag: None }
+    // Not even one group whole: how many warnings there are (`⚠ 4 warnings`), else the calm
+    // names cut at the edge.
+    let warned: Vec<u8> = groups.iter().map(|g| severity(g)).filter(|s| *s < 2).collect();
+    match warned.iter().min() {
+        Some(&worst) => TopLine {
+            parts: vec![Part::plain(" "), Part::toned(format!("{WARN_MARK} {}", count_of(warned.len(), "warning", "warnings")), Some(tone_of(worst)))],
+            tag: None,
+        },
+        None => TopLine { parts: lay_out(&groups, last), tag: None },
+    }
 }
 
 /// How bad a group is, worst first when sorted: 0 red (a critical account, a failed listing,
@@ -2020,7 +2029,8 @@ mod tests {
     /// More warnings than 80 columns hold whole (codex's case): two unreachable pods, RunPod's
     /// account under its minimum, Vast's critical, Hetzner's listing failed. Past every cut the
     /// red ones go first, in short (`$9.00 < min`), and what still doesn't fit is counted at the
-    /// end in the worst colour among it — `+1 more` in yellow, `+2 more` in red.
+    /// end in the worst colour among it — `+1 more` in yellow, `+2 more` in red; narrower than
+    /// a group and its count, `⚠ 4 warnings` alone.
     #[test]
     fn many_warnings_go_worst_first_and_the_rest_are_counted() {
         use balance::Account;
@@ -2041,6 +2051,11 @@ mod tests {
         assert_eq!(line.text(), " ⚠ RunPod $9.00 < min │ ⚠ Vast $3.00 ≈6.0h │ +2 more");
         assert_eq!(tones(&line, "+2 more"), [Some(Tone::Bad)], "a red one among them");
         assert_eq!(at(40).text(), " ⚠ RunPod $9.00 < min │ +3 more");
+        // Narrower than one group and the count: the count of warnings alone, in the worst colour.
+        let line = at(20);
+        assert_eq!((line.text().as_str(), tones(&line, "⚠ 4 warnings")[0]), (" ⚠ 4 warnings", Some(Tone::Bad)));
+        let calm = top_parts(&fleet_of(3, 3, None), &pods, &[], &[], None, None, 5);
+        assert_eq!(calm.text(), " RunPod", "nothing wrong: the edge cuts the calm names");
     }
 
     /// The footer's short status: the first warning's words (yellow) and how many more; else `ok`
