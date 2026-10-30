@@ -19,6 +19,21 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-30 · Every backup in one place: `arena backups` and the dashboard's `b`
+- `arena backups` shows which backups happen and when, and how they're doing. For the git
+  backup, the home copy and the archive's two pushes: whether each is set up (if not, the command
+  that sets it up), how often, its last run and result, when it's next due, and whether it's
+  running now. Then every cohort pod's last git save, home copy and archive copy, failing pods
+  first, then the ones longest since a good backup. Last, where the copies live and how much room
+  is left. `--json` for scripts. It reads this box only, never a pod.
+- In the dashboard, `b` (or a click on the `💾` header) opens the same as a screen. Enter on a pod
+  shows its history and offers "back up now" and "copy home now", each with its confirm.
+- `pods backup`, `pods pull` and the dashboard's backup now record their results in
+  `backups.json` in the state dir. A cron still on an older arena shows "none recorded yet" until
+  it's updated.
+- Anything that can't be read shows as `?` with the reason, never as "ok" or "never".
+- New page section: [What gets backed up, where and when](docs/BACKUPS.md#what-gets-backed-up-where-and-when).
+
 ## 2026-10-30 · Raise an AI key's cap, or pause it, from the CLI and the dashboard
 - `arena keys limit apple +5` raises a machine's OpenRouter cap by $5 where the key is: same
   secret, same spend, nothing to copy onto the pod, so the participant's next call works. `10` sets

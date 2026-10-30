@@ -2571,11 +2571,20 @@ These keep the participants' work, and have their own page, [BACKUPS.md](BACKUPS
 | `cron install / remove / show` | [`cron`: the lines that run it all](BACKUPS.md#cron-the-lines-that-run-it-all) |
 | `pods idle`, `pods reap` | [Idle pods and the auto-reaper](BACKUPS.md#idle-pods-and-the-auto-reaper) |
 | `archive …` | [Backup archive (`arena archive`)](BACKUPS.md#backup-archive-arena-archive) |
+| `backups [--json]` | [What gets backed up, where and when](BACKUPS.md#what-gets-backed-up-where-and-when) |
 
 `archive up|status|sync|resize|access|ssh-config|ssh|forget|unforget|down` — the **backup archive**:
 an always-on Hetzner VM with two volumes (dated snapshots, all files) holding copy #2 of
 `LOCAL_BACKUP_DIR`, pushed by cron, readable by participants once `access on`; never part of the
 fleet. See [Backup archive](BACKUPS.md#backup-archive-arena-archive).
+
+`backups [--json]` — **what gets backed up, where and when**, read-only: each backup job (the git
+backup, the home copy, the archive's two pushes) set up or not and how often, its last run and
+result, when it's next due and whether it's running now; each cohort pod's last git save, home
+copy and archive copy, failing first; where the copies live, with their free space. It reads this
+box only (the crontab, the run record `backups.json`, `LOCAL_BACKUP_DIR`, the archive's state, the
+locks), and says `?` with why for anything it can't read. Exits 0. The dashboard's `b` shows the
+same. See [What gets backed up, where and when](BACKUPS.md#what-gets-backed-up-where-and-when).
 
 ## The dashboard (`arena-tui`)
 
@@ -2695,6 +2704,12 @@ status), in plain words, and the most-used keys; **`i`**, or a click on
 `[i] info`, opens the **info panel**: provider, config, the whole status,
 deep checks running, the fleet's summary word for word, each prepaid account, the OpenRouter credit
 and keys at their cap, every key, and what each column's glyphs mean (Esc or `i` closes it).
+**`b`**, or a click on the `💾` column's header, opens the **backups screen**: each backup job
+(how often, last run, next run, or the command that sets it up), what's running now, and every
+pod's last git save, home copy and archive copy, failing first (`o` reorders), then where the
+copies live. Enter opens a pod's history, from which `b` backs it up now and `h` copies its home
+now (each with its confirm; the screen comes back after). The screen shows what `arena backups`
+prints: [What gets backed up, where and when](BACKUPS.md#what-gets-backed-up-where-and-when).
 `Ctrl-C`/`q` quit. A hangup or a TERM ends it at
 once (exit status 129 or 143), and so does its terminal hanging up (a dropped SSH session, a killed
 tmux server: 129) — never waiting on its event loop, which a dead terminal stalls. However it ends,
