@@ -4,9 +4,12 @@
 # Participants connect with VS Code Remote-SSH. On a fresh pod their first connect downloads
 # the VS Code server and then every extension, on the pod — slow, and repeated on every new,
 # replaced or restarted pod. This does it ahead of time:
-#   1. python.defaultInterpreterPath = the first interpreter given as an argument that exists,
-#      in ~/.vscode-server/data/Machine/settings.json — added only when the key is absent;
-#      every other key is kept, and a file that isn't plain JSON (comments) is left alone.
+#   1. in ~/.vscode-server/data/Machine/settings.json: python.defaultInterpreterPath = the first
+#      interpreter given as an argument that exists, and on a machine short of RAM
+#      (ARENA_VSCODE_LOW_MEMORY) memory-saving settings — Pylance's indexing off, diagnostics for
+#      open files only, the env/caches/data excluded. Each added only where absent; every other
+#      key and byte is kept (JSONC comments too), and a file it can't read the way VS Code does
+#      is left alone.
 #   2. the latest *stable* server for this CPU (x64 / arm64), in the layout Remote-SSH looks
 #      for (exec-server mode, the default since VS Code 1.82):
 #        ~/.vscode-server/code-<commit>                         the `code` CLI it runs first
@@ -21,7 +24,7 @@
 #   * exit 0 = all of it is in place (now or already); exit 3 = something couldn't be done,
 #     and the LAST stderr line says what. Progress goes to stdout.
 #   * idempotent: each part is skipped when already present (server + CLI for the latest
-#     commit, each extension, the settings key). Downloads land in a temp dir on the same
+#     commit, each extension, each settings key). Downloads land in a temp dir on the same
 #     filesystem and are verified (sha256 from the update API) and renamed into place only
 #     when complete, so an interrupted run leaves nothing half-installed.
 #   * bounded: everything shares ARENA_VSCODE_BUDGET seconds (each curl, the install).
@@ -65,7 +68,14 @@ mkdir -p "$VS" || { problems="can't create $VS"; finish; }
 tmp=$(mktemp -d "$VS/.arena-warmup.XXXXXX" 2>/dev/null) || { problems="mktemp failed in $VS"; finish; }
 trap 'rm -rf "$tmp"' EXIT
 
-# ---- 1. default interpreter (local, no network: first, so it lands even offline) ----
+# ---- 1. machine settings (local, no network: first, so they land even offline) ----
+# python.defaultInterpreterPath = the first interpreter argument that exists; and on a machine
+# short of RAM the memory-saving settings (merge_settings.py's LOW_MEMORY): Pylance and the
+# kernels ran a cx33 (8 GB) out of memory. ARENA_VSCODE_LOW_MEMORY says which machines:
+# `always` (a CPU VM: the kernels' models sit in the same RAM as VS Code), a number N = only one
+# with less than N GiB of RAM (MemTotal, or a container's own cgroup limit when that's lower: a
+# container sees its host's MemTotal), unset or 0 = none.
+# (ARENA_MEMINFO, ARENA_CGROUP: a test's stand-ins for /proc/meminfo and /sys/fs/cgroup; never set on a pod.)
 py=""
 for c in "$@"; do
   case $c in "~/"*) c="$HOME/${c#"~/"}" ;; esac
@@ -74,56 +84,335 @@ for c in "$@"; do
     break
   fi
 done
+# `ram_kb`: this machine's RAM in kB, as above; fails when /proc/meminfo can't be read.
+ram_kb() {
+  local kb lim f cg=${ARENA_CGROUP:-/sys/fs/cgroup}
+  kb=$(awk '$1 == "MemTotal:" { printf "%.0f\n", $2; exit }' "${ARENA_MEMINFO:-/proc/meminfo}" 2>/dev/null)
+  case $kb in '' | *[!0-9]*) return 1 ;; esac
+  for f in "$cg/memory.max" "$cg/memory/memory.limit_in_bytes"; do
+    lim=$(awk 'NR == 1 && $1 ~ /^[0-9]+$/ { printf "%.0f\n", $1 / 1024 }' "$f" 2>/dev/null)
+    case $lim in '' | *[!0-9]*) continue ;; esac
+    [ "$lim" -lt "$kb" ] && kb=$lim
+  done
+  echo "$kb"
+}
+gib() { awk -v k="$1" 'BEGIN { printf "%.1f", k / 1048576 }'; }
+lowmem=0
+want=${ARENA_VSCODE_LOW_MEMORY:-0}
+case $want in
+  0) ;;
+  always)
+    lowmem=1
+    note "memory-saving settings: on (every machine of this kind)"
+    ;;
+  '' | *[!0-9]*) problem "ARENA_VSCODE_LOW_MEMORY must be always or a number of GiB, not '$want' - no memory-saving settings" ;;
+  *)
+    if ! kb=$(ram_kb); then
+      problem "couldn't read this machine's RAM - no memory-saving settings"
+    elif [ "$kb" -lt $((want * 1048576)) ]; then
+      lowmem=1
+      note "memory-saving settings: on ($(gib "$kb") GiB of RAM, under $want)"
+    else
+      note "memory-saving settings: not needed ($(gib "$kb") GiB of RAM)"
+    fi
+    ;;
+esac
 settings="$VS/data/Machine/settings.json"
+# The merge runs on the arena python; with none found, the system's for the memory-saving part.
+runner=$py
 if [ -z "$py" ]; then
   problem "no arena python found (looked for: $*)"
-else
+  [ "$lowmem" = 1 ] && runner=$(command -v python3 2>/dev/null)
+fi
+if [ -n "$py" ] || [ "$lowmem" = 1 ]; then
   cat >"$tmp/merge_settings.py" <<'PYEOF'
-"""Add python.defaultInterpreterPath to VS Code's machine settings unless it's already set.
-argv: <settings.json> <interpreter>. Keeps every other key; refuses (exit 4) a file that
-isn't a plain JSON object rather than rewrite something it can't read faithfully."""
+"""Merge arena's keys into VS Code's machine settings.json, never clobbering what's there.
+argv: <settings.json> <interpreter, or ''> <memory-saving: 1|0>
+
+Adds python.defaultInterpreterPath (when an interpreter is given) and, with memory-saving 1,
+LOW_MEMORY below. Each only where absent: a key already set (by the participant, VS Code, an
+operator, an earlier run) is kept as it is; to an exclude map already there only the patterns it
+doesn't name are added (one set to false stays false). VS Code writes and reads the file as JSONC
+(comments, trailing commas): the additions are inserted into the text, so every byte already
+there stays. A file that isn't JSONC VS Code would read the same way, or isn't an object at the
+top, is left alone (exit 4); so is one whose edited text doesn't parse back to exactly the old
+settings plus the additions, and one that changed while this ran. Written through a temp file
+beside it (renamed into place, mode kept; a symlink's target)."""
+import copy
 import json
 import os
+import re
 import sys
 
-KEY = "python.defaultInterpreterPath"
-path, interpreter = sys.argv[1], sys.argv[2]
-try:
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
-except FileNotFoundError:
-    text = ""
-data = {}
-if text.strip():
+INTERPRETER = "python.defaultInterpreterPath"
+# The memory-saving settings (a small machine: Pylance + the kernels ran a cx33 out of RAM).
+# Pylance: no background index of every package in the env (torch, jax, ... - GBs), diagnostics
+# for open files only, and not the env, caches, data or the course's infrastructure copies
+# (`**/.*` is pyright's own default, which a list of our own replaces). The watcher, search and
+# explorer: not the env, caches or data. `.git` stays watched (VS Code's default already skips
+# its objects): the Source Control view follows the backups' commits through it.
+LOW_MEMORY = [
+    ("python.analysis.indexing", False),
+    ("python.analysis.diagnosticMode", "openFilesOnly"),
+    ("python.analysis.exclude", ["**/.venv", "**/.git", "**/.cache", "**/__pycache__", "**/data",
+                                 "**/infrastructure", "**/node_modules", "**/.*"]),
+    ("files.watcherExclude", {"**/.venv/**": True, "**/.cache/**": True, "**/__pycache__/**": True,
+                              "**/data/**": True, "**/infrastructure/**": True}),
+    ("search.exclude", {"**/.venv": True, "**/.cache": True, "**/__pycache__": True, "**/data": True,
+                        "**/infrastructure": True}),
+    ("files.exclude", {"**/__pycache__": True}),
+]
+
+
+class Bad(Exception):
+    pass
+
+
+TOKEN = re.compile(
+    r'[ \t\r\n]+|//[^\n]*|/\*.*?\*/'
+    r'|"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"'
+    r'|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?(?![0-9A-Za-z_.])'
+    r'|(?:true|false|null)(?![0-9A-Za-z_])|[{}\[\],:]',
+    re.S,
+)
+
+
+class Node:
+    """A parsed value and where it is: [start, end) in the text; for an object its members
+    (key, key offset, Node), the offset of its `}` and whether a comma ends its members."""
+
+    def __init__(self, value, start, end, members=None, trailing=False):
+        self.value, self.start, self.end = value, start, end
+        self.members, self.trailing = members, trailing
+
+
+def parse(text):
+    """The top-level Node of JSONC `text` (None: no value at all), or Bad."""
+    toks, i = [], 0
+    while i < len(text):
+        m = TOKEN.match(text, i)
+        if not m:
+            raise Bad("unexpected %r at offset %d" % (text[i:i + 12], i))
+        t = m.group()
+        if not (t[0] in " \t\r\n" or t.startswith("//") or t.startswith("/*")):
+            toks.append((t, m.start(), m.end()))
+        i = m.end()
+    pos = 0
+
+    def tok():
+        if pos >= len(toks):
+            raise Bad("ends early")
+        return toks[pos]
+
+    def value():
+        nonlocal pos
+        t, s, e = tok()
+        pos += 1
+        if t in ("{", "["):
+            obj, close = t == "{", "}" if t == "{" else "]"
+            members, items, d, trailing = [], [], {}, False
+            while tok()[0] != close:
+                if obj:
+                    k, ks, _ = tok()
+                    if k[0] != '"':
+                        raise Bad("a key isn't a string at offset %d" % ks)
+                    pos += 1
+                    if tok()[0] != ":":
+                        raise Bad("no ':' after a key at offset %d" % ks)
+                    pos += 1
+                    v = value()
+                    members.append((json.loads(k), ks, v))
+                    d[json.loads(k)] = v.value
+                else:
+                    items.append(value().value)
+                trailing = False
+                if tok()[0] == ",":
+                    pos += 1
+                    trailing = True
+                elif tok()[0] != close:
+                    raise Bad("expected ',' or '%s' at offset %d" % (close, tok()[1]))
+            _, c, _ = tok()
+            pos += 1
+            if obj:
+                return Node(d, s, c + 1, members, trailing)
+            return Node(items, s, c + 1)
+        if t[0] in '"-0123456789tfn':
+            return Node(json.loads(t), s, e)
+        raise Bad("unexpected %r at offset %d" % (t, s))
+
+    if not toks:
+        return None
+    top = value()
+    if pos != len(toks):
+        raise Bad("more after the settings object, at offset %d" % toks[pos][1])
+    return top
+
+
+def line_indent(text, at):
+    start = text.rfind("\n", 0, at) + 1
+    return re.match(r"[ \t]*", text[start:]).group()
+
+
+def own_line(text, at):
+    """The indent before `at` when nothing else precedes it on its line, else None."""
+    lead = text[text.rfind("\n", 0, at) + 1:at]
+    return lead if lead.strip(" \t") == "" else None
+
+
+def merge(text, interpreter, low):
+    """(new text or None when nothing to add, what was added, what was kept), or Bad."""
+    top = parse(text)
+    if top is not None and not isinstance(top.value, dict):
+        raise Bad("its top level isn't an object")
+    have = top.value if top is not None else {}
+    nl = "\r\n" if "\r\n" in text else "\n"
+    unit = "    "
+    if top is not None and top.members:
+        first = own_line(text, top.members[0][1])
+        if first:
+            unit = first[len(line_indent(text, top.start)):] or first
+
+    def configured(key):
+        # The key, or a part of it written as an object ({"python": {"analysis": ...}}).
+        parts = key.split(".")
+        return any(".".join(parts[:n]) in have for n in range(1, len(parts) + 1))
+
+    wanted = ([(INTERPRETER, interpreter)] if interpreter else []) + (LOW_MEMORY if low else [])
+    add_top, add_in, added, kept = [], [], [], []
+    for key, val in wanted:
+        if not configured(key):
+            add_top.append((key, val))
+            added.append(key)
+        elif isinstance(val, dict) and isinstance(have.get(key), dict):
+            missing = [(k, v) for k, v in val.items() if k not in have[key]]
+            if missing:
+                add_in.append((key, missing))
+                added.append("%s (+%d)" % (key, len(missing)))
+            else:
+                kept.append(key)
+        else:
+            kept.append(key + ("=%s" % json.dumps(have[key]) if key == INTERPRETER and key in have else ""))
+    if not add_top and not add_in:
+        return None, added, kept
+
+    def render(pairs, indent):
+        out = []
+        for k, v in pairs:
+            body = json.dumps(v, indent=unit, ensure_ascii=False).replace("\n", nl + indent)
+            out.append(nl + indent + json.dumps(k, ensure_ascii=False) + ": " + body)
+        return ",".join(out)
+
+    if top is None:
+        lead = text if not text or text.endswith("\n") else text + nl
+        new = lead + "{" + render(add_top, unit) + nl + "}" + nl
+    else:
+        edits = []
+
+        def add_to(obj, pairs):
+            if obj.members:
+                indent = own_line(text, obj.members[0][1])
+                if indent is None:
+                    indent = line_indent(text, obj.start) + unit
+                if not obj.trailing:
+                    edits.append((obj.members[-1][2].end, ","))
+            else:
+                indent = line_indent(text, obj.start) + unit
+            close = obj.end - 1
+            at = close
+            while at > obj.start + 1 and text[at - 1] in " \t\r\n":
+                at -= 1
+            tail = "" if "\n" in text[at:close] else nl + line_indent(text, obj.start)
+            edits.append((at, render(pairs, indent) + tail))
+
+        for key, missing in add_in:
+            node = [m for m in top.members if m[0] == key][-1][2]
+            add_to(node, missing)
+        if add_top:
+            add_to(top, add_top)
+        edits.sort(key=lambda e: e[0])
+        out, last = [], 0
+        for at, piece in edits:
+            out.append(text[last:at])
+            out.append(piece)
+            last = at
+        out.append(text[last:])
+        new = "".join(out)
+
+    want = copy.deepcopy(have)
+    want.update(dict(add_top))
+    for key, missing in add_in:
+        want[key].update(dict(missing))
+    back = parse(new)
+    if back is None or back.value != want:
+        raise Bad("the merged text didn't read back as the settings plus arena's")
+    return new, added, kept
+
+
+def left_alone(path, why):
+    print("%s %s - left alone" % (path, why), file=sys.stderr)
+    sys.exit(4)
+
+
+def read(target):
     try:
-        data = json.loads(text)
-    except ValueError:
-        print(f"{path} is not plain JSON (comments?) - left alone", file=sys.stderr)
-        sys.exit(4)
-    if not isinstance(data, dict):
-        print(f"{path} is not a JSON object - left alone", file=sys.stderr)
-        sys.exit(4)
-if KEY in data:
-    print(f"kept {KEY}={data[KEY]}")
-    sys.exit(0)
-data[KEY] = interpreter
-os.makedirs(os.path.dirname(path), exist_ok=True)
-tmp = path + ".arena-tmp"
-with open(tmp, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=4)
-    f.write("\n")
-os.replace(tmp, path)
-print(f"set {KEY}={interpreter}")
+        with open(target, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def main():
+    path, interpreter, low = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+    target = os.path.realpath(path)
+    try:
+        raw = read(target)
+    except OSError as e:
+        left_alone(path, "can't be read (%s)" % e.strerror)
+    try:
+        text = (raw or b"").decode("utf-8")
+    except UnicodeDecodeError:
+        left_alone(path, "isn't UTF-8")
+    bom = text.startswith("\ufeff")
+    try:
+        new, added, kept = merge(text[1:] if bom else text, interpreter, low)
+    except (Bad, RecursionError, ValueError) as e:
+        left_alone(path, "isn't JSON(C) VS Code would read the same way (%s)" % e)
+    if kept:
+        print("kept " + ", ".join(kept))
+    if new is None:
+        return
+    tmp = "%s.arena-%d" % (target, os.getpid())
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(tmp, "wb") as f:
+            f.write(("\ufeff" if bom else "").encode("utf-8") + new.encode("utf-8"))
+        if raw is not None:
+            os.chmod(tmp, os.stat(target).st_mode & 0o7777)
+        # VS Code (a participant changing a setting) may have written meanwhile: theirs stands.
+        if read(target) != raw:
+            left_alone(path, "changed while arena merged its settings (re-run setup)")
+        os.replace(tmp, target)
+    except OSError as e:
+        left_alone(path, "couldn't be written (%s)" % e.strerror)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    print("added " + ", ".join(added))
+
+
+main()
 PYEOF
-  if t=$(cap 30); then
+  if [ -z "$runner" ]; then
+    problem "settings: no python3 to merge them with"
+  elif t=$(cap 30); then
     if have timeout; then
-      out=$(timeout -k 2 "$t" "$py" -I "$tmp/merge_settings.py" "$settings" "$py" 2>&1)
+      out=$(timeout -k 2 "$t" "$runner" -I "$tmp/merge_settings.py" "$settings" "$py" "$lowmem" 2>&1)
     else
-      out=$("$py" -I "$tmp/merge_settings.py" "$settings" "$py" 2>&1)
+      out=$("$runner" -I "$tmp/merge_settings.py" "$settings" "$py" "$lowmem" 2>&1)
     fi
     rc=$?
     if [ "$rc" -eq 0 ]; then
-      note "$out"
+      [ -z "$out" ] || note "settings: $out"
     else
       problem "settings: ${out:-exit $rc}"
     fi

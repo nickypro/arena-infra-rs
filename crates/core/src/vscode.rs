@@ -45,6 +45,43 @@ pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(300);
 /// script stops itself (and says what it got done) before the caller's timeout kills it.
 const SSH_MARGIN: Duration = Duration::from_secs(30);
 
+/// Which machines get the memory-saving machine settings (Pylance's indexing off, diagnostics for
+/// open files only, the env/caches/data out of its analysis, the file watcher and search): a
+/// cx33 (8 GB) ran out of memory with Pylance and the course's kernels (ops feedback #4). Decided
+/// per provider by [`crate::setup::provisioning_steps`]; the RAM is read on the machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LowMemory {
+    /// Every machine: a CPU VM (Hetzner), whose kernels keep their models in the same RAM as
+    /// VS Code — so even a bigger one fills up — and whose image (`arena image build`) carries the
+    /// settings to every VM made from it.
+    Always,
+    /// Only a machine with less RAM than this many GiB ([`LOW_MEMORY_BELOW_GIB`]; a container's
+    /// own memory limit counts): a GPU pod's models live on the GPU, and one with plenty of RAM
+    /// keeps Pylance's indexing (auto-imports, workspace symbols).
+    BelowGib(u32),
+}
+
+/// A GPU machine under this much RAM (GiB) gets the memory-saving settings: the 16 GB class
+/// and below (a "16 GB" machine reads ~15.6 GiB).
+pub const LOW_MEMORY_BELOW_GIB: u32 = 20;
+
+impl LowMemory {
+    /// The script's `ARENA_VSCODE_LOW_MEMORY`.
+    fn env_value(self) -> String {
+        match self {
+            LowMemory::Always => "always".into(),
+            LowMemory::BelowGib(gib) => gib.to_string(),
+        }
+    }
+
+    fn describe(self) -> String {
+        match self {
+            LowMemory::Always => "always".into(),
+            LowMemory::BelowGib(gib) => format!("if under {gib} GiB of RAM"),
+        }
+    }
+}
+
 /// The warm-up's settings, from config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VscodeSetup {
@@ -71,28 +108,31 @@ impl VscodeSetup {
 
     /// The command for one `Remote::exec`: the script travels base64-encoded inside it (no
     /// scp, no temp file, no quoting to get wrong), the settings as env vars and arguments.
-    /// The script gets `timeout` minus [`SSH_MARGIN`] to work in.
-    pub fn remote_command(&self, timeout: Duration) -> String {
+    /// The script gets `timeout` minus [`SSH_MARGIN`] to work in; `low` says whether the machine
+    /// gets the memory-saving settings.
+    pub fn remote_command(&self, timeout: Duration, low: LowMemory) -> String {
         let budget = timeout.saturating_sub(SSH_MARGIN).max(Duration::from_secs(10)).as_secs();
         let pythons: Vec<String> = self.pythons.iter().map(|p| shell_quote(p)).collect();
         format!(
-            "ARENA_VSCODE_BUDGET={budget} ARENA_VSCODE_EXTENSIONS={exts} \
+            "ARENA_VSCODE_BUDGET={budget} ARENA_VSCODE_EXTENSIONS={exts} ARENA_VSCODE_LOW_MEMORY={low} \
              bash -c \"$(printf %s {script} | base64 -d)\" arena-vscode-warmup {pythons} </dev/null",
             exts = shell_quote(&self.extensions.join(",")),
+            low = low.env_value(),
             script = crate::base64::encode(WARMUP_SCRIPT.as_bytes()),
             pythons = pythons.join(" "),
         )
     }
 
     /// What the dry-run shows in place of [`Self::remote_command`] (a base64 blob).
-    pub fn summary(&self) -> String {
+    pub fn summary(&self, low: LowMemory) -> String {
         let extensions =
             if self.extensions.is_empty() { "no extensions".to_string() } else { self.extensions.join(", ") };
         format!(
             "latest stable VS Code server (x64/arm64) into ~/.vscode-server (Remote-SSH layout); extensions: \
-             {extensions}; python.defaultInterpreterPath (if unset) → first of: {} — each part skipped when \
-             already present",
-            self.pythons.join(", ")
+             {extensions}; python.defaultInterpreterPath (if unset) → first of: {}; memory-saving settings \
+             (Pylance indexing off, excludes; where unset) {} — each part skipped when already present",
+            self.pythons.join(", "),
+            low.describe(),
         )
     }
 }
@@ -262,16 +302,25 @@ mod tests {
 
     #[test]
     fn command_carries_the_script_budget_and_settings() {
-        let cmd = setup().remote_command(WARMUP_TIMEOUT);
-        assert!(cmd.starts_with("ARENA_VSCODE_BUDGET=270 ARENA_VSCODE_EXTENSIONS='ms-python.python,ms-toolsai.jupyter' bash -c "), "{cmd}");
+        let cmd = setup().remote_command(WARMUP_TIMEOUT, LowMemory::BelowGib(20));
+        assert!(
+            cmd.starts_with(
+                "ARENA_VSCODE_BUDGET=270 ARENA_VSCODE_EXTENSIONS='ms-python.python,ms-toolsai.jupyter' \
+                 ARENA_VSCODE_LOW_MEMORY=20 bash -c "
+            ),
+            "{cmd}"
+        );
         assert!(cmd.contains(&crate::base64::encode(WARMUP_SCRIPT.as_bytes())));
         assert!(cmd.ends_with(r#" arena-vscode-warmup '/opt/arena-env/bin/python' '/root/it'\''s/.venv/bin/python' </dev/null"#), "{cmd}");
         // One argv string on the remote side: far below Linux's 128 KiB per-arg cap.
         assert!(cmd.len() < 64 * 1024, "{} bytes", cmd.len());
         // A budget too small to subtract the margin from still leaves the script some time.
-        assert!(setup().remote_command(Duration::from_secs(20)).starts_with("ARENA_VSCODE_BUDGET=10 "));
-        let s = setup().summary();
+        assert!(setup().remote_command(Duration::from_secs(20), LowMemory::Always).starts_with("ARENA_VSCODE_BUDGET=10 "));
+        assert!(setup().remote_command(WARMUP_TIMEOUT, LowMemory::Always).contains(" ARENA_VSCODE_LOW_MEMORY=always bash -c "));
+        let s = setup().summary(LowMemory::BelowGib(20));
         assert!(s.contains("ms-python.python, ms-toolsai.jupyter") && s.contains("/opt/arena-env/bin/python"), "{s}");
+        assert!(s.contains("memory-saving settings (Pylance indexing off, excludes; where unset) if under 20 GiB of RAM"), "{s}");
+        assert!(setup().summary(LowMemory::Always).contains("(Pylance indexing off, excludes; where unset) always —"));
     }
 
     fn have(tool: &str) -> bool {
@@ -452,15 +501,37 @@ done
                 std::fs::write(self.root.join(format!("api/cli-alpine-{arch}.json")), edit(cli_json)).unwrap();
             }
 
+            /// The machine's RAM as the script reads it: `MemTotal` (kB) in a stand-in
+            /// /proc/meminfo, and a stand-in /sys/fs/cgroup with these files (name, contents).
+            fn ram(&self, mem_total_kb: u64, cgroup: &[(&str, &str)]) {
+                std::fs::write(self.root.join("meminfo"), format!("MemTotal:       {mem_total_kb} kB\nMemFree: 1 kB\n")).unwrap();
+                let _ = std::fs::remove_dir_all(self.root.join("cgroup"));
+                for (name, body) in cgroup {
+                    let f = self.root.join("cgroup").join(name);
+                    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                    std::fs::write(f, body).unwrap();
+                }
+            }
+
+            /// One run, without the memory-saving settings (`BelowGib(0)`: no machine).
             fn run_with(&self, uname_m: &str, setup: &VscodeSetup, env: &[(&str, &str)]) -> Output {
+                self.run_low(uname_m, setup, LowMemory::BelowGib(0), env)
+            }
+
+            fn run_low(&self, uname_m: &str, setup: &VscodeSetup, low: LowMemory, env: &[(&str, &str)]) -> Output {
                 let path = format!("{}:{}", self.root.join("stubs").display(), std::env::var("PATH").unwrap_or_default());
+                if !self.root.join("meminfo").exists() {
+                    self.ram(64 << 20, &[]);
+                }
                 let mut c = Command::new("sh");
                 c.arg("-c")
-                    .arg(setup.remote_command(WARMUP_TIMEOUT))
+                    .arg(setup.remote_command(WARMUP_TIMEOUT, low))
                     .env("PATH", path)
                     .env("HOME", self.root.join("home"))
                     .env("STUB", &self.root)
-                    .env("STUB_ARCH", uname_m);
+                    .env("STUB_ARCH", uname_m)
+                    .env("ARENA_MEMINFO", self.root.join("meminfo"))
+                    .env("ARENA_CGROUP", self.root.join("cgroup"));
                 for (k, v) in env {
                     c.env(k, v);
                 }
@@ -659,12 +730,29 @@ done
             std::fs::write(&file, "{\"python.defaultInterpreterPath\": \"/custom/python\"}").unwrap();
             ok(&pod.run("x86_64"));
             assert_eq!(pod.settings(), "{\"python.defaultInterpreterPath\": \"/custom/python\"}");
-            // A file it can't read faithfully (JSON with comments) is left alone — a warning.
-            let jsonc = "// mine\n{\"editor.fontSize\": 12}\n";
+            // JSONC, as VS Code writes and reads it (comments, a trailing comma): merged into the
+            // text, every byte that was there kept.
+            let jsonc = "// mine\n{\n    \"editor.fontSize\": 12, // big\n}\n";
             std::fs::write(&file, jsonc).unwrap();
+            ok(&pod.run("x86_64"));
+            assert_eq!(
+                pod.settings(),
+                format!("// mine\n{{\n    \"editor.fontSize\": 12, // big\n    \"python.defaultInterpreterPath\": \"{}\"\n}}\n", pod.python())
+            );
+            // A file it can't read the way VS Code does is left alone, byte for byte — a warning.
+            for bad in ["{\"editor.fontSize\": 12,, }", "{'editor.fontSize': 12}", "[1]", "{\"a\": 1} {}", "{\"a\": /* open"] {
+                std::fs::write(&file, bad).unwrap();
+                let why = warned(&pod.run("x86_64"));
+                assert!(why.contains("isn't JSON(C) VS Code would read the same way") && why.contains("left alone"), "{bad}: {why}");
+                assert_eq!(pod.settings(), bad);
+            }
+            // One it can't read at all (a directory in its place): the same.
+            std::fs::remove_file(&file).unwrap();
+            std::fs::create_dir(&file).unwrap();
             let why = warned(&pod.run("x86_64"));
-            assert!(why.contains("not plain JSON"), "{why}");
-            assert_eq!(pod.settings(), jsonc);
+            assert!(why.contains("settings.json can't be read (Is a directory) - left alone"), "{why}");
+            std::fs::remove_dir(&file).unwrap();
+            std::fs::write(&file, "{}").unwrap();
 
             // `~/` candidates are the pod user's home; with no candidate at all, it's a warning
             // and the rest still happens.
@@ -679,6 +767,151 @@ done
             let why = warned(&pod.run_with("x86_64", &none, &[]));
             assert!(why.contains("no arena python found"), "{why}");
             assert!(!file.exists());
+        }
+
+        /// The memory-saving settings, as a fresh machine gets them.
+        fn low_memory_settings() -> serde_json::Value {
+            serde_json::json!({
+                "python.analysis.indexing": false,
+                "python.analysis.diagnosticMode": "openFilesOnly",
+                "python.analysis.exclude": [
+                    "**/.venv", "**/.git", "**/.cache", "**/__pycache__", "**/data", "**/infrastructure", "**/node_modules", "**/.*"
+                ],
+                "files.watcherExclude": {
+                    "**/.venv/**": true, "**/.cache/**": true, "**/__pycache__/**": true, "**/data/**": true, "**/infrastructure/**": true
+                },
+                "search.exclude": {
+                    "**/.venv": true, "**/.cache": true, "**/__pycache__": true, "**/data": true, "**/infrastructure": true
+                },
+                "files.exclude": { "**/__pycache__": true },
+            })
+        }
+
+        /// This test's JSONC as JSON: `//` comments and trailing commas out (none of its strings
+        /// holds a `//`).
+        fn jsonc_value(text: &str) -> serde_json::Value {
+            let no_comments: String = text.lines().map(|l| l.split("//").next().unwrap()).collect::<Vec<_>>().join("\n");
+            let mut json = String::new();
+            for (i, c) in no_comments.char_indices() {
+                if c == ',' && no_comments[i + 1..].trim_start().starts_with(['}', ']']) {
+                    continue;
+                }
+                json.push(c);
+            }
+            serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}"))
+        }
+
+        /// `small` in `big`, in order: only insertions were made.
+        fn only_added_to(small: &str, big: &str) -> bool {
+            let mut rest = big.chars();
+            small.chars().all(|c| rest.any(|b| b == c))
+        }
+
+        /// Ops feedback #4: a cx33 (8 GB) ran out of memory with Pylance and the kernels. Every
+        /// CPU VM gets the memory-saving settings; any other machine only under 20 GiB of RAM —
+        /// a container's own limit counting, as it sees its host's MemTotal.
+        #[test]
+        fn memory_saving_settings_go_to_small_machines_only() {
+            let Some(pod) = Pod::new("lowmem") else { return };
+            pod.publish("x64", |j| j);
+            let file = pod.vs().join("data/Machine/settings.json");
+            let mut with_py = low_memory_settings();
+            with_py["python.defaultInterpreterPath"] = pod.python().into();
+            let only_py = serde_json::json!({ "python.defaultInterpreterPath": pod.python() });
+            let read = || serde_json::from_str::<serde_json::Value>(&pod.settings()).unwrap();
+
+            // A CPU VM, whatever its RAM.
+            pod.ram(64 << 20, &[]);
+            let out = ok(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[]));
+            assert!(out.contains("memory-saving settings: on (every machine of this kind)"), "{out}");
+            assert_eq!(read(), with_py);
+
+            const GIB: u64 = 1 << 20; // in kB
+            let below = LowMemory::BelowGib(LOW_MEMORY_BELOW_GIB);
+            /// (what, MemTotal in kB, the cgroup files, whether it gets them)
+            type Case<'a> = (&'a str, u64, &'a [(&'a str, &'a str)], bool);
+            let cases: &[Case] = &[
+                ("an 8 GB machine", 8_000_000, &[], true),
+                ("a 16 GB machine (15.5 GiB)", 16_270_000, &[], true),
+                ("a 64 GiB machine", 64 * GIB, &[], false),
+                ("exactly the limit", 20 * GIB, &[], false),
+                ("a 16 GiB container on a 512 GiB host (cgroup v2)", 512 * GIB, &[("memory.max", "17179869184\n")], true),
+                ("an unlimited container (cgroup v2)", 512 * GIB, &[("memory.max", "max\n")], false),
+                ("an 8 GiB container (cgroup v1)", 512 * GIB, &[("memory/memory.limit_in_bytes", "8589934592\n")], true),
+                ("an unlimited container (cgroup v1)", 64 * GIB, &[("memory/memory.limit_in_bytes", "9223372036854771712\n")], false),
+                ("a limit above the host's RAM", 8 * GIB, &[("memory.max", "68719476736\n")], true),
+            ];
+            for (label, total, cgroup, on) in cases {
+                let _ = std::fs::remove_file(&file);
+                pod.ram(*total, cgroup);
+                let out = ok(&pod.run_low("x86_64", &pod.setup(), below, &[]));
+                let said = if *on { "memory-saving settings: on (" } else { "memory-saving settings: not needed (" };
+                assert!(out.contains(said), "{label}: {out}");
+                assert_eq!(read(), if *on { with_py.clone() } else { only_py.clone() }, "{label}: {out}");
+            }
+            pod.ram(8_000_000, &[]);
+            let out = ok(&pod.run_low("x86_64", &pod.setup(), below, &[]));
+            assert!(out.contains("memory-saving settings: on (7.6 GiB of RAM, under 20)"), "{out}");
+
+            // RAM it can't read: none, said — the interpreter still lands.
+            let _ = std::fs::remove_file(&file);
+            std::fs::write(pod.root.join("meminfo"), "garbled\n").unwrap();
+            let why = warned(&pod.run_low("x86_64", &pod.setup(), below, &[]));
+            assert!(why.contains("couldn't read this machine's RAM - no memory-saving settings"), "{why}");
+            assert_eq!(read(), only_py);
+
+            // No arena python: the system's python3 merges the memory-saving part (and the
+            // missing interpreter is still a warning).
+            let _ = std::fs::remove_file(&file);
+            let none = VscodeSetup { extensions: vec![], pythons: vec!["/nope/bin/python".into()] };
+            let why = warned(&pod.run_low("x86_64", &none, LowMemory::Always, &[]));
+            assert!(why.contains("no arena python found"), "{why}");
+            assert_eq!(read(), low_memory_settings());
+        }
+
+        /// What's there stays: the participant's (or VS Code's) keys and values, comments and
+        /// trailing commas; an exclude map gets only the patterns it doesn't name (theirs set to
+        /// false stays false); a re-run changes nothing; a big machine's run removes nothing.
+        /// Through a symlink, its mode kept.
+        #[test]
+        fn memory_saving_settings_merge_into_what_is_there() {
+            let Some(pod) = Pod::new("lowmem-merge") else { return };
+            pod.publish("x64", |j| j);
+            let file = pod.vs().join("data/Machine/settings.json");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            let theirs = "{\n    // the participant's\n    \"python.analysis.indexing\": true,\n    \"files.exclude\": {\n        \
+                          \"**/data\": false, // I want to see my data\n    },\n    \"workbench.colorTheme\": \"Default Dark+\",\n}\n";
+            // settings.json a link into the participant's dotfiles, mode 600.
+            let real = pod.root.join("home/dotfiles/vscode-machine.json");
+            std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+            std::fs::write(&real, theirs).unwrap();
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::os::unix::fs::symlink(&real, &file).unwrap();
+
+            let out = ok(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[]));
+            assert!(out.contains("kept python.analysis.indexing"), "{out}");
+            assert!(std::fs::symlink_metadata(&file).unwrap().file_type().is_symlink(), "the link stays a link");
+            assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o600);
+            let after = pod.settings();
+            assert!(only_added_to(theirs, &after), "{after}");
+            let mut want = low_memory_settings();
+            want["python.defaultInterpreterPath"] = pod.python().into();
+            want["python.analysis.indexing"] = true.into();
+            want["files.exclude"] = serde_json::json!({ "**/data": false, "**/__pycache__": true });
+            want["workbench.colorTheme"] = "Default Dark+".into();
+            assert_eq!(jsonc_value(&after), want, "{after}");
+
+            // Again: nothing to add, nothing written.
+            let out = ok(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[]));
+            assert!(!out.contains("added"), "{out}");
+            assert_eq!(pod.settings(), after);
+            // A run that doesn't want them (a big machine) takes nothing away.
+            pod.ram(64 << 20, &[]);
+            ok(&pod.run_low("x86_64", &pod.setup(), LowMemory::BelowGib(LOW_MEMORY_BELOW_GIB), &[]));
+            assert_eq!(pod.settings(), after);
+            pod.assert_clean();
+            let strays: Vec<_> = std::fs::read_dir(real.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
+            assert_eq!(strays.len(), 1, "no temp file left beside it: {strays:?}");
         }
 
         #[test]
