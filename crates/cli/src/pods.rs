@@ -9,6 +9,7 @@ use arena_core::ssh::SshTarget;
 
 pub(crate) mod backup;
 pub(crate) mod branch;
+pub(crate) mod health;
 pub(crate) mod list;
 pub(crate) mod lock;
 pub(crate) mod pull;
