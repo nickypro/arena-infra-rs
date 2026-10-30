@@ -58,7 +58,11 @@ pub(crate) fn staging_advice(cfg: &Config, skip: &Skip, need: u64, floor: Floor)
 /// what its filesystem has free) when one is known.
 fn staging_words(skip: &Skip, other: Option<(&Path, u64)>) -> String {
     let elsewhere = match other {
-        Some((dir, free)) => format!("`TMPDIR={} arena …` ({} free there)", dir.display(), core_disk::gb(free)),
+        Some((dir, free)) => format!(
+            "`TMPDIR={} arena …` ({} free there)",
+            arena_core::ssh::shell_word(&dir.to_string_lossy()),
+            core_disk::gb(free)
+        ),
         None => "`TMPDIR=<a dir on a disk with room> arena …`".to_string(),
     };
     format!("{skip}; or stage it on another filesystem for this run: {elsewhere}")
@@ -453,6 +457,13 @@ mod tests {
              needed — nothing copied; free at least 5.8 GB on / (arena's biggest dirs there: /tmp/arena-replace-leh3rc2hdcf31i \
              3.5 GB · /root/.local/state/arena 0.1 GB); or stage it on another filesystem for this run: \
              `TMPDIR=/mnt/volume-nbg1-1/arena-tmp arena …` (331 GB free there)"
+        );
+        // A path a shell would split or expand comes quoted.
+        assert!(
+            staging_words(&skip, Some((Path::new("/mnt/cohort data/arena-tmp"), 40 * g)))
+                .ends_with("`TMPDIR='/mnt/cohort data/arena-tmp' arena …` (40 GB free there)"),
+            "{}",
+            staging_words(&skip, Some((Path::new("/mnt/cohort data/arena-tmp"), 40 * g)))
         );
         assert!(
             staging_words(&skip, None).ends_with(

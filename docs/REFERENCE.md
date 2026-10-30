@@ -476,7 +476,8 @@ the next one with the same name.
   the account's resource limit is reached (…; limit: primary_ip_limit) — delete a primary IP
   nothing needs (…), or ask Hetzner to raise the limit (Hetzner Console: Limits tab → Request
   change → Limit increase)`. What it suggests follows the limit Hetzner names: a smaller type or a
-  server for cores and servers, a primary or floating IP, a volume, a snapshot. A limit counts
+  server for cores, a server for the number of servers, a primary or floating IP, a volume, a
+  snapshot. A limit counts
   every project of the Hetzner account, so a project with no server can still hit it (live
   2026-10-30). `create`/`up` keep what they made and stop there (the names after it would hit the
   same limit); it isn't waited out (`--keep-trying` waits on capacity only); with several

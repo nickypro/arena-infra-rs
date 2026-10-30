@@ -23,7 +23,8 @@ earlier).
 - A Hetzner create refused over one of the account's limits (403 `resource_limit_exceeded`) now
   says what frees room under the limit Hetzner names: a primary IP for `primary_ip_limit` (live:
   the sandbox refused every create so, though its project held no server and no IP), a smaller type
-  or a server for cores and servers, a floating IP, a volume, a snapshot (`arena image prune`) — and
+  or a server for cores, a server for the number of servers, a floating IP, a volume, a snapshot
+  (`arena image prune`) — and
   where to ask for more (Hetzner Console: Limits tab → Request change → Limit increase). It said
   "use a smaller type" whatever the limit, and called it the project's: Hetzner counts a limit over
   every project of the account.

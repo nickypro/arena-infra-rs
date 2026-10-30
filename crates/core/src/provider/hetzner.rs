@@ -771,7 +771,8 @@ fn limit_remedy(name: &str, fleet_create: bool) -> &'static str {
         "delete a volume nothing needs"
     } else if n.contains("snapshot") || n.contains("image") {
         "delete an old snapshot (`arena image prune`)"
-    } else if fleet_create && (n.contains("core") || n.contains("server") || n.is_empty()) {
+    } else if fleet_create && (n.contains("core") || n.is_empty()) {
+        // Cores (or not said which): a smaller type may fit. A count of servers isn't helped by one.
         "use a smaller type (--server-type / HETZNER_SERVER_TYPE) or delete a server"
     } else if n.contains("core") || n.contains("server") {
         "delete a server nothing needs"
@@ -2460,7 +2461,9 @@ mod tests {
             json!({"error": {"code": "resource_limit_exceeded", "message": "limit exceeded", "details": {"limits": limits}}}).to_string()
         };
         for (names, ctx, remedy) in [
-            (&["server_limit"][..], "hetzner create", "use a smaller type (--server-type / HETZNER_SERVER_TYPE) or delete a server"),
+            // A count of servers: a smaller type takes a server all the same.
+            (&["server_limit"][..], "hetzner create", "delete a server nothing needs"),
+            (&["server_dedicated_cores_limit"], "hetzner create", "use a smaller type (--server-type / HETZNER_SERVER_TYPE) or delete a server"),
             (&["server_limit"], "hetzner create server", "delete a server nothing needs"),
             (&["dedicated_core_limit"], "hetzner create server", "delete a server nothing needs"),
             (&["floating_ip_limit"], "hetzner create", "delete a floating IP nothing needs"),
