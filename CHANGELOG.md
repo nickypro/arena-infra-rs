@@ -43,6 +43,12 @@ earlier).
   range, and cron lines written by hand — `arena cron install` for a second config would replace
   the first fleet's lines.
 
+## 2026-10-30 · Ctrl+C stops a capacity retry at once, even mid-listing
+- `pods up`/`create` with `--retry-mins` (and the dashboard's retry, stopped with `[s]`) now stop
+  the moment Ctrl+C is pressed. Before, a press while arena was re-listing the fleet between rounds
+  (which can take a while when a provider is slow or rate-limiting) still let one more round
+  create pods.
+
 ## 2026-10-30 · `up` replaces a pod that never gets an SSH endpoint; Hetzner's project limit says so
 - `pods up` no longer leaves a pod that never gets an SSH endpoint running and billing (seen on
   prod: a RUNNING 4090 with no public IP or ports, `FAILED endpoint: no SSH endpoint after 600s —
