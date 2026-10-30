@@ -258,7 +258,9 @@ risk_rank() {
     crates/core/src/cron.rs | crates/core/src/reap/* | crates/cli/src/reap.rs | crates/cli/src/reap/*) echo 20 ;;
     *.sh | crates/core/src/setup.rs | crates/core/src/archive/* | crates/cli/src/archive.rs | \
       */teardown.rs | crates/core/src/lock.rs | crates/core/src/pull.rs | crates/core/src/restore.rs) echo 30 ;;
-    crates/cli/src/main.rs | crates/tui/src/main.rs) echo 40 ;;
+    crates/cli/src/main.rs | crates/cli/src/pods.rs | crates/cli/src/pods/* | crates/cli/src/cli.rs | \
+      crates/cli/src/cron.rs | crates/cli/src/keys.rs | crates/cli/src/proxy.rs | crates/cli/src/config_cmd.rs | \
+      crates/cli/src/ssh_config.rs | crates/cli/src/plan.rs | crates/cli/src/snapshot.rs | crates/tui/src/main.rs) echo 40 ;;
     crates/*/src/*) echo 50 ;;
     Cargo.toml | */Cargo.toml | */build.rs | .github/* | scripts/* | *.toml) echo 60 ;;
     *) echo 70 ;;
@@ -309,7 +311,7 @@ How to review:
 
 Production-risk focus, most severe first:
 1. `crates/core/src/backup.sh` runs on EVERY participant pod every 15 minutes as root, under plain POSIX sh (dash on the images) with `set -e`, driven by `crates/core/src/backup.rs`. Anything that could stop backups on many pods at once (a `set -e` exit, a hang, a stale lock), commit or push what it shouldn't (keys, huge files, a half-finished merge), lose or overwrite a participant's work, or block the participant's own git (an index.lock left behind, a branch rewritten under them).
-2. The cron lines `arena cron install` writes and reads back (`crates/core/src/cron.rs`, `crates/core/src/reap/render.rs`, `crates/cli/src/main.rs`): quoting, locking, older lines still parsed, anything it moves or deletes in the home directory of the user it runs as (root's, in production), and what a failing tick leaves behind.
+2. The cron lines `arena cron install` writes and reads back (`crates/core/src/cron.rs`, `crates/core/src/reap/render.rs`, `crates/cli/src/cron.rs`): quoting, locking, older lines still parsed, anything it moves or deletes in the home directory of the user it runs as (root's, in production), and what a failing tick leaves behind.
 3. `set-branch` / `init-branches`: switching many pods' branches. Work lost to a reset or a forced checkout, the fleet left on main (where backups skip), a refusal that doesn't refuse.
 4. The reaper (`crates/core/src/reap/`, `crates/cli/src/reap.rs`): stopping or terminating a pod someone is using, or one that isn't this cohort's.
 5. The archive (`arena archive`, `crates/core/src/archive/`, `crates/cli/src/archive.rs`): participants' data copied to the wrong place, exposed, or deleted.
