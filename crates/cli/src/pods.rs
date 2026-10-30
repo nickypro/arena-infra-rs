@@ -12,6 +12,7 @@ pub(crate) mod branch;
 pub(crate) mod list;
 pub(crate) mod lock;
 pub(crate) mod pull;
+pub(crate) mod run;
 pub(crate) mod selection;
 
 // Per-call SSH budgets (PLAN 1.B). Every pod-SSH call is bounded so one wedged pod can
