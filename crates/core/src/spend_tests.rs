@@ -411,6 +411,9 @@ fn a_listing_begun_before_a_stop_doesnt_restore_the_running_rate() {
     let after_stop = s.clone();
     let s = see(s, &["runpod"], &[], std::slice::from_ref(&p), T0 + H);
     assert_eq!(s.machines, after_stop.machines, "older than the stop: changes nothing");
+    // Stamped the very second of the stop: it may have been taken before it too.
+    let s = see(s, &["runpod"], &[], std::slice::from_ref(&p), T0 + H + M);
+    assert_eq!(s.machines, after_stop.machines, "the stop's own second: changes nothing");
     p.status = "EXITED".into();
     let s = see(s, &["runpod"], &[], &[p], T0 + H + 5 * M);
     assert!(close(machine(&s, "runpod", "rp1").accrued, 0.40 * (1.0 + 1.0 / 60.0)), "{:?}", machine(&s, "runpod", "rp1").segs);
@@ -655,9 +658,19 @@ fn the_per_pod_billing_answer_is_parsed_and_a_paged_or_odd_one_refused() {
     let mut daily = v.clone();
     daily["metadata"]["query"]["bucketSize"] = "day".into();
     assert!(parse_pod_billing(&daily, T0).is_err());
-    let mut neg = v;
+    let mut neg = v.clone();
     neg["records"][0]["totalAmount"] = (-1.0).into();
     assert!(parse_pod_billing(&neg, T0).is_err());
+    // Completeness must be shown: a missing, odd or short count is refused (a settled hour
+    // without a record would count as $0).
+    for count in [Value::Null, "1".into(), 0.into()] {
+        let mut odd = v.clone();
+        odd["metadata"]["recordCount"] = count.clone();
+        assert!(parse_pod_billing(&odd, T0).is_err(), "{count}");
+    }
+    let mut none = v;
+    none["metadata"].as_object_mut().unwrap().remove("recordCount");
+    assert!(parse_pod_billing(&none, T0).unwrap_err().contains("recordCount"));
 }
 
 #[test]
@@ -915,6 +928,17 @@ fn a_ledger_moved_aside_is_remembered_and_the_report_says_so() {
     assert_eq!(load(&path).0.restarts, s.restarts, "kept in the new ledger");
     let r = rep(&s, None, T0 + H);
     assert!(notes(&r).iter().any(|n| n.contains("started afresh") && n.contains("isn't counted here")), "{:?}", notes(&r));
+    // A key known only from listings since (made before the restart, no owner) may be
+    // someone's; one minted since, or given an owner, isn't in doubt.
+    let mut old = key("k1", "devtest-a", 2.0);
+    old.created_at = Some(crate::snapshot::rfc3339(T0 - H));
+    let s2 = observe_keys(s.clone(), &[old], &naming(), T0 + M);
+    assert_eq!(owner_lost(&s2, "devtest-a").map(|r| r.at), Some(T0));
+    let (s3, _) = assign(s2, &[], "k1", Some("al"), T0 + 2 * M).unwrap_or_else(|e| panic!("{e}"));
+    assert!(owner_lost(&s3, "devtest-a").is_none());
+    let s4 = key_minted(s.clone(), "k2", "devtest-b", None, None, T0 + M);
+    assert!(owner_lost(&s4, "devtest-b").is_none(), "minted since");
+    assert!(owner_lost(&observe_keys(SpendState::default(), &[key("k9", "devtest-a", 1.0)], &naming(), T0), "devtest-a").is_none(), "never restarted");
 }
 
 // ---- the HTTP reads ----------------------------------------------------------------

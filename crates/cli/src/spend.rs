@@ -294,6 +294,20 @@ pub(crate) fn handovers(ctx: &SpendCtx, names: &[String], owner: Option<&str>, k
             path.display()
         ),
     };
+    // A ledger restarted since a name's key was made: its owner may have been lost with the
+    // old one, and this create would make it the new owner's, with what it spent.
+    let lost: Vec<(&String, &spend::Restart)> = names.iter().filter_map(|n| spend::owner_lost(&state, n).map(|r| (n, r))).collect();
+    if let Some((_, r)) = lost.first() {
+        let names: Vec<&str> = lost.iter().map(|(n, _)| n.as_str()).collect();
+        anyhow::bail!(
+            "the OpenRouter key of {} has no owner recorded since the spend ledger started afresh ({} UTC; the old one is \
+             {}), so it may be someone else's. `arena spend assign <key hash> <owner>` (`arena keys list` has the hashes), \
+             `arena keys rotate <name>`, or pass --keep-key",
+            names.join(", "),
+            arena_core::snapshot::rfc3339(r.at),
+            r.aside
+        );
+    }
     Ok(names
         .iter()
         .filter_map(|n| spend::handover_needed(&state, n, owner).map(|from| Handover { name: n.clone(), from: from.to_string() }))
@@ -399,8 +413,14 @@ pub(crate) async fn hand_over(ctx: &SpendCtx, cfg: &Config, api: Option<&dyn Key
         if !saved {
             done.failed.push(h.name.clone());
             // Its old key is gone and no fresh one saved: its CSV row would hand a dead key on.
-            if !deleted.is_empty() && super::drop_key_row(dir, &h.name) {
-                done.csv_changed = true;
+            if !deleted.is_empty() {
+                match super::drop_key_row(dir, &h.name) {
+                    Ok(dropped) => done.csv_changed |= dropped,
+                    Err(e) => done.lines.push(format!(
+                        "✗ {}: its deleted key's row couldn't be removed from the keys CSV ({e}) — `arena keys revoke {}` drops it",
+                        h.name, h.name
+                    )),
+                }
             }
         }
     }
@@ -851,6 +871,43 @@ mod tests {
         assert!(api.keys.lock().unwrap().is_empty());
         assert!(ctx.state().keys.iter().all(|k| k.gone.is_some()), "{:?}", ctx.state().keys);
         assert!(handovers(&ctx, &names, Some("bob"), false).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dead_keys_row_that_cant_be_removed_is_said() {
+        let d = tmp("deadrow");
+        let keys_dir = d.0.join("keys");
+        let cfg = cfg(&d.0);
+        let ctx = SpendCtx::from_config(&cfg);
+        let api = FakeKeys::default();
+        let ck = api.create_key("devtest-alpha", Some(1.0)).await.unwrap();
+        ctx.key_minted(&ck.hash, "devtest-alpha", Some("alice"));
+        // The keys CSV can't be read (a folder in its place).
+        std::fs::create_dir_all(keys_dir.join("openrouter_api_keys.csv")).unwrap();
+        let h = handovers(&ctx, &["devtest-alpha".to_string()], Some("bob"), false).unwrap();
+        *api.refuse_create.lock().unwrap() = true;
+        let done = hand_over(&ctx, &cfg, Some(&api as &dyn KeyApi), &keys_dir, &h, "bob").await;
+        assert!(done.lines.iter().any(|l| l.contains("couldn't be removed from the keys CSV") && l.contains("arena keys revoke devtest-alpha")), "{done:?}");
+        assert!(!done.csv_changed);
+    }
+
+    #[test]
+    fn a_key_whose_owner_a_restart_may_have_lost_stops_a_create_for_an_owner() {
+        let d = tmp("lostowner");
+        let cfg = cfg(&d.0);
+        let ctx = SpendCtx::from_config(&cfg);
+        let path = ctx.path().unwrap().to_path_buf();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+        // A quiet recorder moves it aside; then the key (made before) is listed with no owner.
+        let now = unix_now();
+        let old = KeyInfo { hash: "kOLD12345".into(), name: Some("devtest-alpha".into()), usage: Some(3.0), created_at: Some("2026-10-01T00:00:00Z".into()), ..KeyInfo::default() };
+        ctx.keys(std::slice::from_ref(&old), now);
+        let names = vec!["devtest-alpha".to_string()];
+        let err = handovers(&ctx, &names, Some("bob"), false).unwrap_err().to_string();
+        assert!(err.contains("devtest-alpha") && err.contains("started afresh") && err.contains("spend assign"), "{err}");
+        assert!(handovers(&ctx, &names, Some("bob"), true).unwrap().is_empty(), "--keep-key");
+        assert!(handovers(&ctx, &["devtest-bravo".to_string()], Some("bob"), false).unwrap().is_empty(), "another name");
     }
 
     #[test]

@@ -232,6 +232,10 @@ pub struct Machine {
     pub last_seen: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<Ended>,
+    /// When arena last changed it (create, stop, start, terminate): a listing stamped no later
+    /// may have been taken before the change, and changes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_at: Option<u64>,
     pub segs: Vec<Seg>,
     /// Its disks as last listed: what a stop leaves billing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -550,8 +554,9 @@ pub fn observe(mut state: SpendState, listing: &Listing, pods: &[Pod], naming: &
             Some(i) => {
                 let m = &mut state.machines[i];
                 // An older listing (a slow command, a clock that went back) changes nothing a
-                // newer observation already recorded — not its name, its end, or its rate.
-                if now < m.last_seen || m.ended.is_some_and(|e| now <= e.at) {
+                // newer observation already recorded — not its name, its end, or its rate; nor
+                // does one stamped the second arena changed it (it may predate the change).
+                if now < m.last_seen || m.ended.is_some_and(|e| now <= e.at) || m.event_at.is_some_and(|e| now <= e) {
                     continue;
                 }
                 let rate = rate_of(p, m.last_running_rate());
@@ -623,6 +628,7 @@ fn new_machine(p: &Pod, start: u64, start_how: StartHow, now: u64) -> Machine {
         first_seen: now,
         last_seen: now,
         ended: None,
+        event_at: None,
         segs: Vec::new(),
         disk_gb: None,
         volume_gb: None,
@@ -713,6 +719,7 @@ pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
                     state.machines.len() - 1
                 }
             };
+            state.machines[i].event_at = Some(now);
             if let Some(o) = inherited {
                 state.machines[i].owner = Some(o.clone());
                 adopt_keys(&mut state, &pod.name, &o);
@@ -725,11 +732,13 @@ pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
                     extend(m, now, (s.per_hr, s.running, s.how), 0, Seen::Event);
                 }
                 m.ended = Some(Ended { at: now.max(m.last_seen), how: EndHow::Terminated });
+                m.event_at = Some(now);
             }
         }
         Event::Stopped { provider, id } => {
             if let Some(i) = state.open_index(*provider, id) {
                 let m = &mut state.machines[i];
+                m.event_at = Some(now);
                 if let Some(s) = m.segs.last().copied() {
                     extend(m, now, (s.per_hr, s.running, s.how), 0, Seen::Event);
                 }
@@ -751,6 +760,7 @@ pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
         Event::Started { provider, id } => {
             if let Some(i) = state.open_index(*provider, id) {
                 let m = &mut state.machines[i];
+                m.event_at = Some(now);
                 let rate = match m.last_running_rate() {
                     Some(r) => (r, true, RateHow::Remembered),
                     None => (0.0, true, RateHow::Unpriced),
@@ -1013,6 +1023,15 @@ pub fn handover_needed<'s>(state: &'s SpendState, machine: &str, new_owner: &str
     key_owner(state, machine).filter(|o| *o != new_owner)
 }
 
+/// The ledger restart that may have lost the owner of `machine`'s current key: one with no
+/// owner, made before the latest restart (or of unknown age) — it may be someone's from the
+/// ledger moved aside, and a create for someone else would adopt it, and what it spent.
+pub fn owner_lost<'s>(state: &'s SpendState, machine: &str) -> Option<&'s Restart> {
+    let last = state.restarts.last()?;
+    let k = state.keys.iter().rev().find(|k| k.gone.is_none() && k.name == machine)?;
+    (k.owner.is_none() && k.created.is_none_or(|c| c < last.at)).then_some(last)
+}
+
 // ---------------------------------------------------------------------------------------
 // Accrual
 // ---------------------------------------------------------------------------------------
@@ -1196,8 +1215,9 @@ impl PodBilled {
 
 /// `GET /v2/billing/pods` (`records[] {podId, startTime, totalAmount, …}`, `metadata.query
 /// {bucketSize, startTime, endTime}`, `metadata.recordCount`). Anything not plainly hourly,
-/// dated, non-negative and complete (fewer records than `recordCount`: paged) is refused —
-/// a misread bill would overwrite good metering.
+/// dated, non-negative and complete — `recordCount` a number equal to the records returned
+/// (fewer: paged; none: can't tell) — is refused: a settled hour without a record counts as
+/// $0, so an incomplete bill would overwrite good metering.
 pub fn parse_pod_billing(v: &Value, at: u64) -> Result<PodBilled, String> {
     let time = |x: Option<&Value>| x.and_then(Value::as_str).and_then(crate::snapshot::parse_rfc3339);
     let q = v.pointer("/metadata/query").filter(|q| q.is_object()).ok_or("no metadata.query")?;
@@ -1210,10 +1230,9 @@ pub fn parse_pod_billing(v: &Value, at: u64) -> Result<PodBilled, String> {
         return Err("the window ends before it starts".into());
     }
     let records = v.get("records").and_then(Value::as_array).ok_or("no records array")?;
-    if let Some(n) = v.pointer("/metadata/recordCount").and_then(Value::as_u64) {
-        if n as usize > records.len() {
-            return Err(format!("{} of {n} records (paged?)", records.len()));
-        }
+    let n = v.pointer("/metadata/recordCount").and_then(Value::as_u64).ok_or("no metadata.recordCount: can't tell it's complete")?;
+    if n as usize != records.len() {
+        return Err(format!("{} of {n} records (paged?)", records.len()));
     }
     let mut pods: BTreeMap<String, BTreeMap<u64, f64>> = BTreeMap::new();
     for r in records {

@@ -1882,13 +1882,18 @@ async fn hand_keys_over(tracking: &spend::SpendCtx, cfg: &Config, owner: &spend:
 }
 
 /// Drop `host`'s row from the keys CSV in `dir` (its key was deleted, none replaced it):
-/// whether a row went.
-fn drop_key_row(dir: &std::path::Path, host: &str) -> bool {
+/// whether a row went (`Ok(false)`: no CSV, or no row for it).
+fn drop_key_row(dir: &std::path::Path, host: &str) -> std::io::Result<bool> {
     let csv = dir.join(OPENROUTER_KEYS_LINK);
-    let Some(text) = std::fs::read_to_string(&csv).ok().and_then(|t| arena_core::apikeys::remove_csv_host(&t, host)) else {
-        return false;
+    let text = match std::fs::read_to_string(&csv) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
     };
-    write_secret_file(&csv, &text).is_ok()
+    match arena_core::apikeys::remove_csv_host(&text, host) {
+        Some(rest) => write_secret_file(&csv, &rest).map(|()| true),
+        None => Ok(false),
+    }
 }
 
 /// Warn (on a GPU provider) when pods would be created with no persistent volume —
