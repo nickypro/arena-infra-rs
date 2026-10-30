@@ -28,19 +28,31 @@ fn write(path: &Path, f: impl FnOnce(&mut record::Record)) {
     }
 }
 
+/// What a run counts for in the record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// No pods named, as the cron's run: the job's run (its last run, when it's next due, late),
+    /// and each pod's result.
+    Fleet,
+    /// Pods named: their results alone — `pods backup apple` by hand never stands in for the cron.
+    Named,
+    /// Not the configured backup (another `--dir`, `--no-big`, `--no-git`, a label or a remote
+    /// path of its own): the pods' histories alone, the words saying how — so it never reads as a
+    /// fresh backup (review r1 #1).
+    Aside(String),
+}
+
 /// A run of a backup job, recorded as it starts (so one killed reads as interrupted) and as it
-/// ends ([`Run::finish`]). Only a fleet-wide run — no pods named, as the cron's always is — is
-/// the job's run (its last run, when it's next due, late); a run over named pods records its pods'
-/// results alone, so `pods backup apple` by hand never stands in for the cron's.
+/// ends ([`Run::finish`]), as its [`Scope`] says.
 pub(crate) struct Run {
     job: Job,
     path: Option<PathBuf>,
-    fleet: bool,
+    scope: Scope,
 }
 
 impl Run {
-    /// Note that a run of `job` over `pods` pods starts now (`named`: the pods were named).
-    pub(crate) fn start(cfg: &Config, job: Job, pods: usize, named: bool) -> Run {
+    /// Note that a run of `job` over `pods` pods starts now.
+    pub(crate) fn start(cfg: &Config, job: Job, pods: usize, scope: Scope) -> Run {
         let path = match record_path(cfg) {
             None => None,
             Some(Ok(p)) => Some(p),
@@ -49,22 +61,28 @@ impl Run {
                 None
             }
         };
-        let fleet = !named;
-        if let (Some(p), true) = (&path, fleet) {
+        if let (Some(p), Scope::Fleet) = (&path, &scope) {
             let now = arena_core::snapshot::unix_now();
             write(p, |r| r.start(job, std::process::id(), pods as u32, now));
         }
-        Run { job, path, fleet }
+        Run { job, path, scope }
     }
 
-    /// The run ended: each pod's event, and the run in a few words.
+    /// The run ended: each pod's event (stamped when that pod's backup ended), and the run in a
+    /// few words.
     pub(crate) fn finish(self, events: Vec<(String, Event)>, summary: String) {
-        if let Some(p) = &self.path {
-            let now = arena_core::snapshot::unix_now();
-            if self.fleet {
-                write(p, |r| r.finish(self.job, std::process::id(), now, events, summary));
-            } else if !events.is_empty() {
-                write(p, |r| r.add_events(events));
+        let Some(p) = &self.path else { return };
+        let now = arena_core::snapshot::unix_now();
+        match self.scope {
+            Scope::Fleet => write(p, |r| r.finish(self.job, std::process::id(), now, events, summary)),
+            _ if events.is_empty() => {}
+            Scope::Named => write(p, |r| r.add_events(events)),
+            Scope::Aside(how) => {
+                let events = events.into_iter().map(|(pod, mut e)| {
+                    e.detail = if e.detail.is_empty() { format!("not the configured backup ({how})") } else { format!("not the configured backup ({how}): {}", e.detail) };
+                    (pod, e)
+                });
+                write(p, |r| r.add_history(events.collect()));
             }
         }
     }
@@ -84,6 +102,15 @@ pub(crate) fn note_pods(cfg: &Config, events: Vec<(String, Event)>) {
 /// An event now.
 pub(crate) fn event(job: Job, outcome: record::Outcome, detail: impl Into<String>) -> Event {
     Event::new(arena_core::snapshot::unix_now(), job, outcome, detail)
+}
+
+/// The run's scope for a selection: fleet-wide unless pods were named.
+pub(crate) fn scope_of(named: bool) -> Scope {
+    if named {
+        Scope::Named
+    } else {
+        Scope::Fleet
+    }
 }
 
 /// `arena backups [--json]`: read what's there (the crontab, the record, the backup dir, the
@@ -195,6 +222,53 @@ mod tests {
         // The command itself, text and JSON.
         super::handle_backups(&cfg, std::path::Path::new("/c"), false, Ok(tab.clone())).unwrap();
         super::handle_backups(&cfg, std::path::Path::new("/c"), true, Ok(tab)).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A pull that isn't the configured backup — another `--dir`, `--no-big` — goes into the pods'
+    /// histories alone, saying how: never a fresh home copy, never the job's run (review r1 #1).
+    /// The configured one, pods named, is the pods' results — not the job's run either.
+    #[tokio::test]
+    async fn a_copy_aside_is_history_only_and_a_named_one_never_the_jobs_run() {
+        let base = std::env::temp_dir().join(format!("arena-cli-backups-aside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("backups")).unwrap();
+        std::fs::create_dir_all(base.join("elsewhere")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        arena_core::remote::write_test_script(base.join("rsync"), "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nmkdir -p \"$last\" && echo w > \"$last/f\"\n").unwrap();
+        let cfg = Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nARENA_START_DATE=2026-01-05\n\
+             LOCAL_BACKUP_DIR={}\nARENA_STATE_DIR={}\n",
+            base.join("backups").display(),
+            base.join("state").display()
+        ));
+        let remote: Arc<dyn arena_core::remote::Remote> = Arc::new(FakeRemote::new());
+        let rsync = base.join("rsync").display().to_string();
+        let all = Selected::all(vec![pod("apple", 22001)]);
+        let load = || Record::load(&base.join("state/devtest/backups.json")).unwrap().unwrap();
+        let elsewhere = base.join("elsewhere").display().to_string();
+        let pull = |dir: String, no_big: bool, sel: Selected| {
+            let (remote, cfg, rsync) = (remote.clone(), cfg.clone(), rsync.clone());
+            async move { crate::pods::pull::handle_pull(&remote, &cfg, None, &dir, None, None, false, no_big, &sel, false, true, &rsync).await.unwrap() }
+        };
+        pull(elsewhere.clone(), false, all.clone()).await;
+        let rec = load();
+        let apple = &rec.pods["devtest-apple"];
+        assert!(rec.runs.is_empty() && apple.copy.is_none() && apple.copy_ok.is_none(), "{rec:?}");
+        assert!(apple.history[0].detail.starts_with(&format!("not the configured backup (into {elsewhere}): w")), "{:?}", apple.history);
+        let backups_dir = base.join("backups").display().to_string();
+        pull(backups_dir.clone(), true, all.clone()).await;
+        let rec = load();
+        assert!(rec.runs.is_empty() && rec.pods["devtest-apple"].copy.is_none());
+        assert!(rec.pods["devtest-apple"].history[0].detail.starts_with("not the configured backup (--no-big)"));
+        // Named: the pod's copy, not the job's run.
+        pull(backups_dir.clone(), false, Selected { pods: all.pods.clone(), named: true }).await;
+        let rec = load();
+        assert!(rec.runs.is_empty());
+        assert_eq!(rec.pods["devtest-apple"].copy.as_ref().map(|e| e.outcome), Some(Outcome::Copied));
+        // The configured backup, fleet-wide: the job's run too.
+        pull(backups_dir, false, all).await;
+        assert_eq!(load().runs[&Job::Copy].summary.split(" (").next(), Some("1 copied, 0 failed"));
         let _ = std::fs::remove_dir_all(&base);
     }
 

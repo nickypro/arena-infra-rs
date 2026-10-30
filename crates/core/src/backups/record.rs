@@ -132,26 +132,40 @@ impl PodRecord {
         self.history.first().map_or(0, |e| e.at).max(self.git.as_ref().map_or(0, |e| e.at)).max(self.copy.as_ref().map_or(0, |e| e.at))
     }
 
-    /// Add `e` (pure): the job's last, its last success, and the history.
+    /// Add `e` (pure): the job's last, its last success, and the history. An event older than
+    /// the job's last (a run that started earlier and ended later than another, both recording)
+    /// never replaces it: it only moves the last success forward, and takes its place in the
+    /// history by time.
     pub fn add(&mut self, e: Event) {
         let (last, ok) = match e.job {
             Job::Git => (&mut self.git, &mut self.git_ok),
             _ => (&mut self.copy, &mut self.copy_ok),
         };
-        if e.outcome.ok() {
+        if e.outcome.ok() && ok.is_none_or(|t| e.at > t) {
             *ok = Some(e.at);
+        }
+        if last.as_ref().is_some_and(|l| e.at < l.at) {
+            return self.add_history(e);
         }
         *last = Some(e.clone());
         // The job's own newest entry: the git backup's and the copy's runs interleave, each
         // folded on its own (`no changes ×12` beside `copied ×12`).
         let e = match self.history.iter().position(|h| h.job == e.job) {
-            Some(i) if self.history[i].folds(&e) => {
+            Some(i) if self.history[i].folds(&e) && self.history[i].at <= e.at => {
                 let h = self.history.remove(i);
                 Event { since: Some(h.since.unwrap_or(h.at)), times: h.times.saturating_add(1), ..e }
             }
             _ => e,
         };
-        self.history.insert(0, e);
+        self.add_history(e);
+    }
+
+    /// Put `e` in the history alone (pure), by time, newest first — what a copy that isn't the
+    /// configured backup (another `--dir`, `--no-big`, a label of its own) is recorded as: the pod's
+    /// history says it happened, and its backup's freshness is left alone.
+    pub fn add_history(&mut self, e: Event) {
+        let at = self.history.iter().position(|h| h.at <= e.at).unwrap_or(self.history.len());
+        self.history.insert(at, e);
         self.history.truncate(HISTORY_LEN);
     }
 }
@@ -249,6 +263,13 @@ impl Record {
     pub fn add_events(&mut self, events: Vec<(String, Event)>) {
         for (pod, e) in events {
             self.pods.entry(pod).or_default().add(e);
+        }
+    }
+
+    /// Add events to the pods' histories alone ([`PodRecord::add_history`]) — pure.
+    pub fn add_history(&mut self, events: Vec<(String, Event)>) {
+        for (pod, e) in events {
+            self.pods.entry(pod).or_default().add_history(e);
         }
     }
 

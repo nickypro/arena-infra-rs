@@ -1527,7 +1527,7 @@ async fn backup_classifies_each_pods_reply_and_a_wedged_pod_fails_at_the_budget(
     );
     // Every pod's outcome, for the run record (`arena backups`).
     use arena_core::backups::record::Outcome;
-    let mut events = tally.events.clone();
+    let mut events: Vec<(String, Outcome, String)> = tally.events.iter().map(|(p, o, d, _)| (p.clone(), *o, d.clone())).collect();
     events.sort();
     let e = |p: &str, o, d: &str| (p.to_string(), o, d.to_string());
     assert_eq!(

@@ -639,11 +639,11 @@ fn git_cell(i: &Inputs, pod: &PodIn, gap: Option<u64>) -> Cell {
         Ok(r) => r.as_ref().and_then(|r| r.pods.get(&pod.name)),
     };
     let Some(p) = rec else {
-        let text = pod.last_commit.map_or_else(|| "?".to_string(), |t| format!("commit {}", render::short_age(i.now.saturating_sub(t))));
+        let text = pod.last_commit.map_or_else(|| "no record".to_string(), |t| format!("commit {}", render::short_age(i.now.saturating_sub(t))));
         return Cell { tried_at: None, ..Cell::new(Health::Unknown, text).why("no git backup recorded for it yet") };
     };
     let Some(e) = &p.git else {
-        return Cell::new(Health::Unknown, "?").why("no git backup recorded for it yet");
+        return Cell::new(Health::Unknown, "no record").why("no git backup recorded for it yet");
     };
     let mut c = Cell { ok_at: p.git_ok, tried_at: Some(e.at), ..Cell::new(Health::Ok, e.outcome.words()) };
     match e.outcome {

@@ -436,18 +436,16 @@ impl Schedule {
         None
     }
 
-    /// The longest wait between two runs, from `t` over the next eight days (so a line that
-    /// skips the weekend counts it) or 400 runs — how late a last run may be before it's
-    /// overdue. `None` for `@reboot` or a schedule that runs less than twice in that time. Pure.
+    /// The longest wait between two runs, from `t` over the next eight days — all of them, so a
+    /// line that skips the weekend counts it, however often it runs on weekdays (at most one run
+    /// a minute: 11,520 steps) — how late a last run may be before it's overdue. `None` for
+    /// `@reboot` or a schedule that runs less than twice in that time. Pure.
     pub fn longest_gap(&self, t: u64, offset: i64) -> Option<u64> {
         let mut at = self.next_after(t, offset)?;
         let until = at + 8 * 86_400;
         let mut gap = None;
-        for _ in 0..400 {
+        while at < until {
             let next = self.next_after(at, offset)?;
-            if next > until && gap.is_some() {
-                break;
-            }
             gap = Some(gap.unwrap_or(0).max(next - at));
             at = next;
         }
@@ -583,8 +581,10 @@ mod tests {
             ("@hourly", Some(at(22, 0)), Some(3600), "hourly at :00"),
             ("@daily", Some(at(24, 0)), Some(86_400), "daily at 00:00"),
             ("* * * * *", Some(at(21, 35)), Some(60), "every minute"),
-            // Weekdays only: Saturday and Sunday are skipped, so the longest gap is the weekend.
+            // Weekdays only: Saturday and Sunday are skipped, so the longest gap is the weekend —
+            // for a line every 15 minutes too (review r1 #3: a 400-run cap stopped short of it).
             ("0 9 * * mon-fri", Some(at(3 * 24 + 9, 0)), Some(3 * 86_400), "`0 9 * * mon-fri`"),
+            ("*/15 * * * 1-5", Some(at(21, 45)), Some(2 * 86_400 + 900), "`*/15 * * * 1-5`"),
             // Both day fields restricted: either one.
             ("0 0 1 * 6", Some(at(24, 0)), None, "`0 0 1 * 6`"),
             ("0 0 * * 7", Some(at(2 * 24, 0)), Some(7 * 86_400), "`0 0 * * 7`"),
@@ -600,6 +600,11 @@ mod tests {
             }
             assert_eq!(s.describe(), *words, "{text}");
         }
+        // On a Saturday, a weekday line's next run is Monday's first, and its gap the weekend.
+        let sat = t + 86_400;
+        let weekdays = Schedule::parse("*/15 * * * mon-fri").unwrap();
+        assert_eq!(weekdays.next_after(sat, 0), Some(at(3 * 24, 0)));
+        assert_eq!(weekdays.longest_gap(sat, 0), Some(2 * 86_400 + 900));
         // In the box's zone: 07:20 at UTC+1 is 06:20 UTC.
         assert_eq!(Schedule::parse("20 7 * * *").unwrap().next_after(t, 3600), Some(at(24 + 6, 20)));
         for bad in ["* * * *", "61 * * * *", "*/0 * * * *", "a * * * *", "@sometimes", "5-1 * * * *"] {

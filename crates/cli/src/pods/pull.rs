@@ -300,6 +300,19 @@ pub(crate) async fn pull_pods(
 ) -> Result<Pulled> {
     use arena_core::pull::{self, PullConfig};
     let PullRun { label, max_size, remote_path, no_git, no_big, dry_run, yes } = args;
+    // Whether this is the configured backup — the cron's: into LOCAL_BACKUP_DIR, both tiers, `.git`,
+    // the day's label, the configured path. Anything else is recorded aside (`arena backups`).
+    let aside = if absolute_path(std::path::Path::new(dir)) != absolute_path(std::path::Path::new(&local_backup_dir(cfg))) {
+        Some(format!("into {dir}"))
+    } else if no_big {
+        Some("--no-big".to_string())
+    } else if no_git {
+        Some("--no-git".to_string())
+    } else if let Some(l) = &label {
+        Some(format!("label {l}"))
+    } else {
+        remote_path.as_ref().map(|r| format!("--remote-path {r}"))
+    };
 
     // Read (and validate) the budget first: a bad value fails before anything is asked or copied.
     let budget = pull::backup_timeout(cfg.get("BACKUP_TIMEOUT_SECS"))?;
@@ -475,8 +488,12 @@ pub(crate) async fn pull_pods(
         println!("aborted.");
         return Ok(Pulled::default());
     }
-    // The run record (`arena backups`): started now, each pod's copy as the run ends.
-    let run = crate::backups::Run::start(cfg, arena_core::backups::Job::Copy, sel.pods.len(), sel.named);
+    // The run record (`arena backups`): started now, each pod's copy as the run ends — stamped when
+    // that pod's last rsync ended (`ended`), or now for a pod that never got that far.
+    let scope = aside.map_or_else(|| crate::backups::scope_of(sel.named), crate::backups::Scope::Aside);
+    let run = crate::backups::Run::start(cfg, arena_core::backups::Job::Copy, sel.pods.len(), scope);
+    let started_at = arena_core::snapshot::unix_now();
+    let mut ended: std::collections::HashMap<String, u64> = Default::default();
     // Each pod's backup lock, unless the caller holds them: a pod another backup holds for
     // the whole wait is skipped — a failure of this run, named (as is one there's no room for).
     let mut not_pulled: Vec<String> = Vec::new();
@@ -690,6 +707,7 @@ pub(crate) async fn pull_pods(
                 if let Some(pod) = job_pod.remove(&id) {
                     locks.done(&pod);
                 }
+                ended.insert(r.0.clone(), arena_core::snapshot::unix_now());
                 r
             }
             // Stopped by the watch: its rsync with it (`remote::run_local`, on drop). Said once per pod.
@@ -797,7 +815,8 @@ pub(crate) async fn pull_pods(
             let _ = arena_core::disk::mark_copied(base, pod);
         }
     }
-    run.finish(copy_events(sel, &targets, &by_pod, &sizes, &label), copy_summary(sel, &by_pod, &label));
+    let at = |pod: &str| ended.get(pod).copied().unwrap_or(started_at);
+    run.finish(copy_events(sel, &targets, &by_pod, &sizes, &label, at), copy_summary(sel, &by_pod, &label));
     Ok(Pulled { failures, failed: by_pod, snapshot_root: format!("{dir}/{label}"), big_root: (!no_big).then_some(big_root), whole })
 }
 
@@ -809,8 +828,11 @@ fn copy_events(
     failed: &[(String, String)],
     sizes: &std::collections::HashMap<String, arena_core::pull::DiskUse>,
     label: &str,
+    // When the pod's copy ended.
+    at: impl Fn(&str) -> u64,
 ) -> Vec<(String, arena_core::backups::record::Event)> {
-    use arena_core::backups::{record::Outcome, Job};
+    use arena_core::backups::record::{Event, Outcome};
+    use arena_core::backups::Job;
     let mut names: Vec<&str> = sel.pods.iter().map(|p| p.name.as_str()).chain(failed.iter().map(|(p, _)| p.as_str())).collect();
     names.sort();
     names.dedup();
@@ -820,14 +842,14 @@ fn copy_events(
             let mut why: Vec<&str> = failed.iter().filter(|(p, _)| p == name).map(|(_, w)| w.as_str()).collect();
             why.dedup();
             let ev = if !why.is_empty() {
-                crate::backups::event(Job::Copy, Outcome::Failed, why.join("; "))
+                Event::new(at(name), Job::Copy, Outcome::Failed, why.join("; "))
             } else if copied.iter().any(|(n, _)| n == name) {
                 let d = sizes.get(name);
                 let detail = d.map_or_else(
                     || label.to_string(),
                     |d| format!("{label}: {} in {} files, {} new", arena_core::pull::human_bytes(d.bytes), d.files, arena_core::pull::human_bytes(d.own_bytes)),
                 );
-                crate::backups::event(Job::Copy, Outcome::Copied, detail).with_bytes(d.map(|d| d.bytes))
+                Event::new(at(name), Job::Copy, Outcome::Copied, detail).with_bytes(d.map(|d| d.bytes))
             } else {
                 return None;
             };

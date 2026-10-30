@@ -96,7 +96,7 @@ pub(crate) async fn handle_backup(
         })
         .collect();
     // The run record (`arena backups`): started now, each pod's outcome as it ended.
-    let run = crate::backups::Run::start(cfg, Job::Git, total + missing.len(), sel.named);
+    let run = crate::backups::Run::start(cfg, Job::Git, total + missing.len(), crate::backups::scope_of(sel.named));
     let mut t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}"), |name| locks.done(name)).await;
     let unreached: Vec<(String, String)> = missing.iter().map(|n| (n.clone(), "no SSH endpoint after 10 minutes running".to_string())).collect();
     run.finish(t.record_events(&unreached), t.summary(missing.len()));
@@ -344,16 +344,18 @@ pub(crate) struct BackupTally {
     /// `set-branch --hard` copies before its reset ([`switch_guarded`]). `pods backup` leaves them
     /// as it always has — skipped, not a failure, and not said: the cron's output is unchanged.
     pub uncommitted: Vec<Unpushed>,
-    /// Every pod's outcome, in finishing order — for the run record (`arena backups`).
-    pub events: Vec<(String, Outcome, String)>,
+    /// Every pod's outcome, in finishing order, with when it ended — for the run record
+    /// (`arena backups`; review r1 #2: not the fleet's end).
+    pub events: Vec<(String, Outcome, String, u64)>,
 }
 
 impl BackupTally {
     /// Its events for the run record, plus `failed` pods it never reached (`(pod, why)`: no
     /// endpoint, its lock busy).
     pub(crate) fn record_events(&self, failed: &[(String, String)]) -> Vec<(String, arena_core::backups::record::Event)> {
-        let ev = |o, d: &str| crate::backups::event(Job::Git, o, d);
-        self.events.iter().map(|(p, o, d)| (p.clone(), ev(*o, d))).chain(failed.iter().map(|(p, why)| (p.clone(), ev(Outcome::Failed, why)))).collect()
+        let at = |o, d: &str, t| arena_core::backups::record::Event::new(t, Job::Git, o, d);
+        let now = arena_core::snapshot::unix_now();
+        self.events.iter().map(|(p, o, d, t)| (p.clone(), at(*o, d, *t))).chain(failed.iter().map(|(p, why)| (p.clone(), at(Outcome::Failed, why, now)))).collect()
     }
 
     /// The run in a few words: `1 pushed, 2 no changes, 41 on main/master, 1 failed`.
@@ -507,17 +509,17 @@ pub(crate) async fn backup_fleet(
             Ok(out) if out.success => match &report.outcome {
                 Some((backup::BACKUP_PUSHED, branch)) => {
                     t.pushed += 1;
-                    t.events.push((name.clone(), Outcome::Pushed, format!("→ {branch}")));
+                    t.events.push((name.clone(), Outcome::Pushed, format!("→ {branch}"), arena_core::snapshot::unix_now()));
                     format!("[{done}/{total}] ✓ {name} -> {branch}{also}")
                 }
                 Some((backup::BACKUP_NO_CHANGES, branch)) => {
                     t.unchanged += 1;
-                    t.events.push((name.clone(), Outcome::NoChanges, format!("on {branch}")));
+                    t.events.push((name.clone(), Outcome::NoChanges, format!("on {branch}"), arena_core::snapshot::unix_now()));
                     format!("[{done}/{total}] = {name} (no changes, on {branch}){also}")
                 }
                 Some((backup::BACKUP_SKIPPED, branch)) => {
                     t.skipped += 1;
-                    t.events.push((name.clone(), Outcome::NotSaved, format!("on {}", if branch == "HEAD" { "a detached HEAD" } else { branch.as_str() })));
+                    t.events.push((name.clone(), Outcome::NotSaved, format!("on {}", if branch == "HEAD" { "a detached HEAD" } else { branch.as_str() }), arena_core::snapshot::unix_now()));
                     // Said once for all of them after the run (`on_protected_lines`).
                     t.on_protected.push((name.to_string(), branch.clone()));
                     if let Some(why) = report.uncommitted_why() {
@@ -528,7 +530,7 @@ pub(crate) async fn backup_fleet(
                 }
                 _ => {
                     t.pushed += 1;
-                    t.events.push((name.clone(), Outcome::Pushed, String::new()));
+                    t.events.push((name.clone(), Outcome::Pushed, String::new(), arena_core::snapshot::unix_now()));
                     format!("[{done}/{total}] ✓ {name} (done){also}")
                 }
             },
@@ -539,14 +541,14 @@ pub(crate) async fn backup_fleet(
                 let why = report.failure_brief(out.code).unwrap_or_else(|| failure_why(&call));
                 let wrong_origin = report.wrong_origin_why(out.code).is_some();
                 let busy = report.in_progress(out.code).map(String::from);
-                t.events.push((name.clone(), Outcome::Failed, why.clone()));
+                t.events.push((name.clone(), Outcome::Failed, why.clone(), arena_core::snapshot::unix_now()));
                 t.unpushed.push(Unpushed { pod: name.clone(), why, branch: report.branch.clone(), at_push: report.failed_at_push(), wrong_origin, busy });
                 format!("[{done}/{total}] ✗ {name}: {}", report.failure(repo, name, out.code).unwrap_or_default())
             }
             _ => {
                 t.failed.push(name.clone());
                 let at_push = report.failed_at_push();
-                t.events.push((name.clone(), Outcome::Failed, failure_why(&call)));
+                t.events.push((name.clone(), Outcome::Failed, failure_why(&call), arena_core::snapshot::unix_now()));
                 t.unpushed.push(Unpushed { pod: name.clone(), why: failure_why(&call), branch: report.branch.clone(), at_push, wrong_origin: false, busy: None });
                 failure_line(done, total, name, &call)
             }

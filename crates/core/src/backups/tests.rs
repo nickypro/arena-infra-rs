@@ -464,6 +464,20 @@ fn the_record_folds_runs_and_reads_back() {
     }
     assert_eq!(p.history.len(), record::HISTORY_LEN);
 
+    // An older result arriving late (a run that started first and ended last) never replaces a
+    // newer one: it moves the last success forward only, and takes its place in the history.
+    let mut late = PodRecord::default();
+    late.add(ev(NOW, Job::Copy, Outcome::Failed, "x"));
+    late.add(ev(NOW - 50, Job::Copy, Outcome::Copied, "older"));
+    assert_eq!((late.copy.as_ref().map(|e| e.outcome), late.copy_ok), (Some(Outcome::Failed), Some(NOW - 50)));
+    assert_eq!(late.history.iter().map(|e| e.at).collect::<Vec<_>>(), [NOW, NOW - 50]);
+    late.add(ev(NOW - 100, Job::Copy, Outcome::Copied, "oldest"));
+    assert_eq!(late.copy_ok, Some(NOW - 50), "never back in time");
+    // A copy aside (another --dir, --no-big): the history alone.
+    late.add_history(ev(NOW - 70, Job::Copy, Outcome::Copied, "aside"));
+    assert_eq!(late.history.iter().map(|e| e.detail.as_str()).collect::<Vec<_>>(), ["x", "older", "aside", "oldest"]);
+    assert_eq!((late.copy.as_ref().map(|e| e.at), late.copy_ok), (Some(NOW), Some(NOW - 50)));
+
     let mut r = Record::default();
     r.start(Job::Copy, 11, 2, NOW - 100);
     assert_eq!(r.running, [Running { job: Job::Copy, pid: 11, started: NOW - 100, pods: 2 }]);
