@@ -389,6 +389,30 @@ fn a_replacement_inherits_the_owner_of_the_machine_it_replaces_only_when_asked()
 }
 
 #[test]
+fn a_replacement_built_as_name_new_keeps_the_owner_of_the_machine_it_replaces() {
+    // `pods replace` / `migrate copy` build `<x>-new` while `<x>` runs, park `<x>` as `<x>-old`
+    // at the swap and rename `<x>-new` onto `<x>`.
+    let old = running("runpod", "a", "devtest-x", 0.2);
+    let s = created(SpendState::default(), &old, &given("al"), T0);
+    let s = created(s, &running("runpod", "z", "devtest-y", 0.2), &given("bo"), T0);
+    let new = running("vast", "9", "devtest-x-new", 0.2);
+    let built = created(s.clone(), &new, &OwnerRule::Inherit, T0 + H);
+    assert_eq!(machine(&built, "vast", "9").owner.as_deref(), Some("al"));
+    // The source already parked as `<x>-old` (a rebuild after a swap was reverted).
+    let mut parked = s.clone();
+    parked.machines[0].name = "devtest-x-old".into();
+    let rebuilt = created(parked, &new, &OwnerRule::Inherit, T0 + H);
+    assert_eq!(machine(&rebuilt, "vast", "9").owner.as_deref(), Some("al"));
+    // Another machine's `-new` doesn't take this one's owner; nothing to replace: no owner.
+    let other = created(s.clone(), &running("vast", "8", "devtest-q-new", 0.2), &OwnerRule::Inherit, T0 + H);
+    assert_eq!(machine(&other, "vast", "8").owner, None);
+    // After the swap the replacement goes by `<x>` and keeps the owner it was built with.
+    let swapped = see(built, &["runpod", "vast"], &[], &[running("vast", "9", "devtest-x", 0.2)], T0 + H + M);
+    let m = machine(&swapped, "vast", "9");
+    assert_eq!((m.name.as_str(), m.owner.as_deref()), ("devtest-x", Some("al")));
+}
+
+#[test]
 fn an_event_for_an_id_on_two_providers_changes_nothing() {
     let s = created(SpendState::default(), &running("vast", "77", "devtest-a", 0.2), &OwnerRule::None, T0);
     let s = created(s, &running("hetzner", "77", "devtest-b", 0.01), &OwnerRule::None, T0);
@@ -997,6 +1021,73 @@ fn a_ledger_moved_aside_is_remembered_and_the_report_says_so() {
     let s4 = key_minted(observe_keys(s.clone(), &[], &naming(), T0 + M), "k2", "devtest-b", None, None, T0 + M);
     assert!(owner_lost(&s4, "devtest-b").is_none(), "minted since");
     assert!(owner_lost(&observe_keys(SpendState::default(), &[key("k9", "devtest-a", 1.0)], &naming(), T0), "devtest-a").is_none(), "never restarted");
+}
+
+#[test]
+fn a_key_made_in_the_same_second_as_a_restart_is_not_adopted() {
+    let d = tmp("samesecond");
+    let path = d.0.join(SPEND_FILE);
+    std::fs::write(&path, "{ not json").unwrap();
+    let (s, _) = record(&path, T0, |s| s).unwrap();
+    let s = created(s, &running("runpod", "rp1", "devtest-a", 0.2), &given("bo"), T0);
+    // Made in the restart's second: it may be from before it (whose, the old ledger knew).
+    let mut same = key("k1", "devtest-a", 1.0);
+    same.created_at = Some(crate::snapshot::rfc3339(T0));
+    let s1 = observe_keys(s.clone(), &[same], &naming(), T0 + M);
+    assert_eq!(s1.keys[0].owner, None, "not adopted");
+    assert_eq!(owner_lost(&s1, "devtest-a").map(|r| r.at), Some(T0), "a create for an owner is stopped");
+    // A second later: made after the restart, adopted as before.
+    let mut after = key("k2", "devtest-a", 1.0);
+    after.created_at = Some(crate::snapshot::rfc3339(T0 + 1));
+    let s2 = observe_keys(s, &[after], &naming(), T0 + M);
+    assert_eq!(s2.keys[0].owner.as_deref(), Some("bo"));
+    assert!(owner_lost(&s2, "devtest-a").is_none());
+}
+
+#[test]
+fn an_ignored_ledger_that_cant_be_linked_aside_is_left_as_it_is() {
+    let d = tmp("nolink");
+    let path = d.0.join(SPEND_FILE);
+    std::fs::write(&path, "{ not json").unwrap();
+    let no_links = |_: &Path, _: &Path| Err(std::io::Error::other("no hard links here"));
+    let err = record_with(&path, T0, RECORD_LOCK_WAIT, no_links, |s| s).unwrap_err().to_string();
+    assert!(err.contains("can't be kept aside") && err.contains("no hard links here"), "{err}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json", "not moved, not replaced");
+    assert_eq!(std::fs::read_dir(&d.0).unwrap().count(), 1, "no aside file");
+}
+
+#[test]
+fn a_ledger_that_cant_be_read_is_refused_not_restarted() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmp("eacces");
+    let path = d.0.join(SPEND_FILE);
+    let (s, _) = record(&path, T0, |_| sample_state()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&path).is_ok() {
+        return; // root reads anything: nothing to check here
+    }
+    assert!(matches!(load(&path).1, Loaded::Unreadable(_)));
+    let err = record(&path, T0 + H, |s| s).unwrap_err().to_string();
+    assert!(err.contains("can't read the spend ledger") && err.contains("left as it is"), "{err}");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(load(&path), (s, Loaded::Ok), "untouched");
+    assert_eq!(std::fs::read_dir(&d.0).unwrap().count(), 1, "no aside file");
+}
+
+#[test]
+fn a_held_lock_is_waited_on_for_a_bounded_time_then_nothing_is_recorded() {
+    let d = tmp("held");
+    let path = d.0.join(SPEND_FILE);
+    let held = std::fs::File::open(&d.0).unwrap();
+    held.lock().unwrap();
+    let started = std::time::Instant::now();
+    let err = record_with(&path, T0, std::time::Duration::from_millis(200), |a: &Path, b: &Path| std::fs::hard_link(a, b), |_| sample_state()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock, "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(!path.exists(), "nothing written");
+    drop(held);
+    record_with(&path, T0, std::time::Duration::from_millis(200), |a: &Path, b: &Path| std::fs::hard_link(a, b), |_| sample_state()).unwrap();
+    assert!(path.exists());
 }
 
 // ---- the HTTP reads ----------------------------------------------------------------

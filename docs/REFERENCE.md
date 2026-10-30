@@ -2301,35 +2301,40 @@ What must differ in the second config (`/root/pw/config.env`, from `config.env.e
 
 | Key | Why |
 | --- | --- |
-| `MACHINE_NAME_PREFIX=pw` (and its own `MACHINE_NAME_LIST`) | names, state dir, ledger, backup branches; avoid `@` entries the other fleet lists |
+| `MACHINE_NAME_PREFIX=pw` (and its own `MACHINE_NAME_LIST`) | names, state dir, ledger, backup branches; avoid `@` entries the other fleet lists. **Not `<other prefix>-…`** (say `arena9-pw`): its machines and keys would be named `arena9-…`, and the main fleet would count them as its own (and the other way round) |
 | `OPENROUTER_WORKSPACE` | its own workspace: its keys, and the AI spend per key |
 | `SSH_PROXY_NGINX_CONFIG_PATH=/etc/nginx/streams-enabled/pw.conf` | a fleet's `proxy apply` owns its file: two fleets in one file drop each other's forwards |
 | `SSH_PROXY_STARTING_PORT=9200` | ports are start + list position: keep well clear of the other range (prod 9000+) |
 | `SSH_ADMIN_CONFIG_FILE=~/.ssh/pw-admin.conf` (or `SSH_CONFIG_FILE`, whichever the other fleet uses) | the default file is the other fleet's |
 | `LOCAL_BACKUP_DIR`, `ARENA_START_DATE` | if it backs up: its own folder and day numbering |
 
-Then, as root on the proxy box:
+Then, as root on the proxy box (`/home/dev/.cargo/bin/arena` is where prod's `arena` is, and
+where `arena update` installs: next to the running binary — `readlink -f "$(command -v arena)"`
+prints it on another box):
 
 ```bash
-mkdir -p /root/pw && cd /root/pw                      # its own folder: keys/ is relative to it
-pw() { (cd /root/pw && arena --config /root/pw/config.env "$@"); }
+mkdir -p /root/pw                                     # its own folder: keys/ is relative to it
+pw() { (cd /root/pw && /home/dev/.cargo/bin/arena --config /root/pw/config.env "$@"); }
 pw config check
 pw proxy plan && pw proxy apply                       # writes pw.conf only
 pw pods up apple --owner alice                        # each person's machines
 pw spend                                              # per person; --by machine --csv for a sheet
-ARENA_CONFIG=/root/pw/config.env arena-tui            # its dashboard (or `pw tui`)
+pw tui                                                # its dashboard
 ```
 
-- `arena` reads `--config`; only `arena-tui` reads `ARENA_CONFIG` (`arena tui` passes `--config`
-  on). Hence `pw()`.
+- `arena` reads `--config` (only `arena-tui` reads `ARENA_CONFIG`; `arena tui` passes `--config`
+  on) — hence `pw()`. Open the second fleet's dashboard with `pw tui` only: its actions run
+  `arena` in the folder it was started from, and only `/root/pw` has the second fleet's `keys/`.
 - **Cron: never `arena cron install` for the second fleet.** A crontab has one arena block, and
   its lines are known by command, not config: the second fleet's install would replace the first
   fleet's lines (`cron remove` would remove them), and both would share the locks in
   `~/.local/state/arena-cron/`. Write its lines by hand where arena never looks, e.g.
-  `/etc/cron.d/arena-pw` — the snapshot line is the one that keeps its ledger current:
+  `/etc/cron.d/arena-pw` — the snapshot line is the one that keeps its ledger current. Name the
+  binary by its full path, as prod's own crontab does (cron's `PATH` is `/usr/bin:/bin`: a bare
+  `arena` fails there, quietly):
 
   ```
-  */2 * * * * root mkdir -p /root/.local/state/arena-cron-pw && cd /root/pw && flock -n /root/.local/state/arena-cron-pw/snapshot.lock arena --config /root/pw/config.env snapshot --public --out /root/pw/fleet.json >> /root/.local/state/arena-cron-pw/snapshot.log 2>&1
+  */2 * * * * root mkdir -p /root/.local/state/arena-cron-pw && cd /root/pw && flock -n /root/.local/state/arena-cron-pw/snapshot.lock /home/dev/.cargo/bin/arena --config /root/pw/config.env snapshot --public --out /root/pw/fleet.json >> /root/.local/state/arena-cron-pw/snapshot.log 2>&1
   ```
 - **Shared provider accounts:** listings are per account, so the second fleet's `pods list` shows
   the first fleet's pods, and `--all` (or a command without targets) acts on them too. Name your

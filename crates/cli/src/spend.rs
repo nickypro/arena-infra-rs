@@ -281,16 +281,30 @@ pub(crate) struct Handover {
 }
 
 /// The handovers creating `names` for `owner` makes (none with `--keep-key`, without an
-/// owner, or with no ledger yet). A ledger that can't be read is an error: whose keys these
-/// names hold is unknown, and creating anyway could hand one person's key to another.
+/// owner, or with no ledger yet). No ledger to be had (no state directory resolves) or one
+/// that can't be read is an error: whose keys these names hold is unknown, and creating
+/// anyway could hand one person's key to another.
 pub(crate) fn handovers(ctx: &SpendCtx, names: &[String], owner: Option<&str>, keep_key: bool) -> Result<Vec<Handover>> {
     let Some(owner) = owner.filter(|_| !keep_key) else { return Ok(Vec::new()) };
-    let Some(path) = ctx.path() else { return Ok(Vec::new()) };
+    let path = match &ctx.path {
+        Some(Ok(p)) => p,
+        Some(Err(e)) => anyhow::bail!(
+            "no spend ledger ({e}), so whose OpenRouter keys these names hold is unknown — set ARENA_STATE_DIR (or HOME), \
+             or pass --keep-key"
+        ),
+        // A unit test that didn't ask for a ledger.
+        None => return Ok(Vec::new()),
+    };
     let state = match spend::load(path) {
         (s, spend::Loaded::Ok | spend::Loaded::Missing) => s,
         (_, spend::Loaded::Ignored(why)) => anyhow::bail!(
-            "the spend ledger {} can't be read ({why}), so whose OpenRouter keys these names hold is unknown. \
+            "the spend ledger {} can't be used ({why}), so whose OpenRouter keys these names hold is unknown. \
              `arena spend` moves it aside and starts afresh (owners recorded so far are lost); or pass --keep-key",
+            path.display()
+        ),
+        (_, spend::Loaded::Unreadable(why)) => anyhow::bail!(
+            "the spend ledger {} can't be read ({why}), so whose OpenRouter keys these names hold is unknown — \
+             fix that, or pass --keep-key",
             path.display()
         ),
     };
@@ -921,9 +935,31 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{ not json").unwrap();
         let err = handovers(&ctx, &names, Some("bob"), false).unwrap_err().to_string();
-        assert!(err.contains("can't be read") && err.contains("--keep-key"), "{err}");
+        assert!(err.contains("can't be used") && err.contains("--keep-key"), "{err}");
         assert!(handovers(&ctx, &names, Some("bob"), true).unwrap().is_empty());
         assert!(handovers(&ctx, &names, None, false).unwrap().is_empty(), "no --owner: no question asked");
+        // One that can't be read at all (permissions): the same, and the file is left alone.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_err() {
+            let err = handovers(&ctx, &names, Some("bob"), false).unwrap_err().to_string();
+            assert!(err.contains("can't be read") && err.contains("--keep-key"), "{err}");
+            assert!(handovers(&ctx, &names, Some("bob"), true).unwrap().is_empty());
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn no_state_directory_stops_a_create_for_an_owner_unless_keep_key() {
+        // A relative ARENA_STATE_DIR resolves to no ledger at all.
+        let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR=relative/state\n");
+        let ctx = SpendCtx::from_config(&cfg);
+        assert!(ctx.path().is_none());
+        let names = vec!["devtest-alpha".to_string()];
+        let err = handovers(&ctx, &names, Some("bob"), false).unwrap_err().to_string();
+        assert!(err.contains("no spend ledger") && err.contains("absolute") && err.contains("--keep-key"), "{err}");
+        assert!(handovers(&ctx, &names, Some("bob"), true).unwrap().is_empty(), "--keep-key");
+        assert!(handovers(&ctx, &names, None, false).unwrap().is_empty(), "no --owner");
     }
 
     #[tokio::test]

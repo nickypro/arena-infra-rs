@@ -682,6 +682,18 @@ pub enum Event<'a> {
     Started { provider: Option<&'a str>, id: &'a str },
 }
 
+/// The names of the machine a `replace`/`migrate` build called `name` replaces, nearest first:
+/// they build `<x>-new` while `<x>` runs (parked as `<x>-old` at the swap), so `<x>-new`
+/// replaces `<x>` (or `<x>-old`); a build under the name itself replaces a twin of that name.
+fn replaced_names(name: &str) -> Vec<String> {
+    let mut out = vec![name.to_string()];
+    if let Some(base) = name.strip_suffix("-new").filter(|b| !b.is_empty()) {
+        out.push(base.to_string());
+        out.push(format!("{base}-old"));
+    }
+    out
+}
+
 /// Record one lifecycle event at `now`. An event for an instance the ledger doesn't have
 /// (or can't tell apart: the same id on two providers) changes nothing — the next listing
 /// sees it.
@@ -694,11 +706,13 @@ pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
             }
             let inherited = match owner {
                 OwnerRule::Given(o) => Some(o.clone()),
-                OwnerRule::Inherit => state
-                    .machines
-                    .iter()
-                    .filter(|m| m.is_open() && m.name == pod.name && !(m.provider == pod.provider && m.id == pod.id))
-                    .find_map(|m| m.owner.clone()),
+                OwnerRule::Inherit => replaced_names(&pod.name).iter().find_map(|name| {
+                    state
+                        .machines
+                        .iter()
+                        .filter(|m| m.is_open() && m.name == *name && !(m.provider == pod.provider && m.id == pod.id))
+                        .find_map(|m| m.owner.clone())
+                }),
                 OwnerRule::None => None,
             };
             let i = match state.open_index(Some(&pod.provider), &pod.id) {
@@ -1041,9 +1055,10 @@ pub fn owner_lost<'s>(state: &'s SpendState, machine: &str) -> Option<&'s Restar
     (k.owner.is_none() && predates(k, last)).then_some(last)
 }
 
-/// Whether key `k` may be older than restart `r` (made before it, or of unknown age).
+/// Whether key `k` may be older than restart `r` (made before it — or in the same second,
+/// which can't be told apart — or of unknown age).
 fn predates(k: &AiKey, r: &Restart) -> bool {
-    k.created.is_none_or(|c| c < r.at)
+    k.created.is_none_or(|c| c <= r.at)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1866,11 +1881,15 @@ pub fn parse_state(text: &str) -> Result<SpendState, String> {
 pub enum Loaded {
     Ok,
     Missing,
-    /// Unreadable, corrupt or another version: ignored (why).
+    /// Corrupt or another version: ignored (why) — [`record`] keeps it aside and starts afresh.
     Ignored(String),
+    /// Couldn't be read (permissions, too many open files, an I/O error): nothing is known,
+    /// and nothing may replace it — [`record`] refuses.
+    Unreadable(String),
 }
 
-/// Load tolerantly: missing → empty; unreadable, corrupt or another version → empty and why.
+/// Load tolerantly: missing → empty; corrupt or another version → empty and why (ignored);
+/// unreadable → empty and why (refused by [`record`]).
 pub fn load(path: &Path) -> (SpendState, Loaded) {
     match std::fs::read_to_string(path) {
         Ok(text) => match parse_state(&text) {
@@ -1878,7 +1897,9 @@ pub fn load(path: &Path) -> (SpendState, Loaded) {
             Err(e) => (SpendState::default(), Loaded::Ignored(e)),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (SpendState::default(), Loaded::Missing),
-        Err(e) => (SpendState::default(), Loaded::Ignored(e.to_string())),
+        // A read that failed says nothing about the file: it may be fine, and must not be
+        // replaced by an empty ledger.
+        Err(e) => (SpendState::default(), Loaded::Unreadable(e.to_string())),
     }
 }
 
@@ -1894,16 +1915,41 @@ pub fn to_json(state: &SpendState) -> String {
 /// (0600) when anything changed. A file that had to be ignored is kept aside
 /// (`spend.json.ignored-<unix time>`: linked there, and replaced only once the new ledger is
 /// saved), never silently overwritten — a week's ledger is worth a look — and the new ledger
-/// remembers it ([`Restart`]). `Ok` carries the state and, when the old file was ignored, a
-/// warning.
+/// remembers it ([`Restart`]). A ledger that can't be read, a lock not had within
+/// [`RECORD_LOCK_WAIT`], or an ignored ledger that can't be linked aside: `Err`, the file left
+/// as it was. `Ok` carries the state and, when the old file was ignored, a warning.
 pub fn record(path: &Path, now: u64, f: impl FnOnce(SpendState) -> SpendState) -> std::io::Result<(SpendState, Option<String>)> {
+    record_with(path, now, RECORD_LOCK_WAIT, |from, to| std::fs::hard_link(from, to), f)
+}
+
+/// How long [`record`] waits for the state directory's lock: its other holders hold it for a
+/// load and an atomic write, so a lock held longer means something is wrong — nothing is
+/// recorded (and an inline surface goes on) rather than hang.
+pub const RECORD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`record`], with the lock's wait and the hard link (a test's seam) handed in.
+fn record_with(
+    path: &Path,
+    now: u64,
+    wait: std::time::Duration,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+    f: impl FnOnce(SpendState) -> SpendState,
+) -> std::io::Result<(SpendState, Option<String>)> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     crate::snapshot::create_private_dir(dir)?;
     // No read-modify-write without the lock: two recorders would each overwrite the other's
-    // change (a create, an owner, a key's final usage).
-    let lock = std::fs::File::open(dir)?;
-    lock.lock()?;
+    // change (a create, an owner, a key's final usage). Tried for `wait`, never waited on
+    // for ever; a filesystem with no lock to take records nothing.
+    let Some(lock) = crate::snapshot::lock_dir_within(dir, wait)? else {
+        return Err(std::io::Error::other(format!(
+            "no lock on {} (it can't be opened, or its filesystem has no flock) — nothing recorded",
+            dir.display()
+        )));
+    };
     let (mut state, loaded) = load(path);
+    if let Loaded::Unreadable(why) = &loaded {
+        return Err(std::io::Error::other(format!("can't read the spend ledger {} ({why}) — left as it is", path.display())));
+    }
     let mut warning = None;
     let mut aside = None;
     if let Loaded::Ignored(why) = &loaded {
@@ -1914,11 +1960,16 @@ pub fn record(path: &Path, now: u64, f: impl FnOnce(SpendState) -> SpendState) -
             .map(|n| path.with_file_name(if n == 0 { format!("{SPEND_FILE}.ignored-{now}") } else { format!("{SPEND_FILE}.ignored-{now}-{n}") }))
             .find(|p| std::fs::symlink_metadata(p).is_err())
             .expect("an unused name");
-        match std::fs::hard_link(path, &to) {
-            Ok(()) => aside = Some(to.clone()),
-            // No links here: moved, as the last resort.
-            Err(_) => std::fs::rename(path, &to)?,
-        }
+        // No link to be had (a filesystem without them): refused, never moved — a save that
+        // then failed would leave no ledger at all.
+        link(path, &to).map_err(|e| {
+            std::io::Error::other(format!(
+                "the spend ledger {} can't be used ({why}) and can't be kept aside as {} ({e}) — left as it is",
+                path.display(),
+                to.display()
+            ))
+        })?;
+        aside = Some(to.clone());
         state.restarts.push(Restart { at: now, aside: to.display().to_string(), why: why.clone() });
         warning = Some(format!(
             "warning: the spend ledger {} couldn't be used ({why}) — moved to {} and started afresh",
