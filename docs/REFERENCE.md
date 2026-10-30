@@ -1723,19 +1723,21 @@ already as asked is left alone. Each command: `--dry-run`, a confirm (`--yes`), 
 **Changes made meanwhile.** One of these commands changes keys at a time on a box (a lock in the
 state directory, `openrouter-keys.lock`; a second waits up to 60 s). After the confirm, machine by
 machine — every one named, a skipped one too — the plan is made again from keys read at most 2 s
-before that machine's changes: a machine whose keys moved since the preview (another operator, the
+before that machine's changes (a resume: right before): a machine whose keys moved since the preview (another operator, the
 dashboard: a cap, reset or on/off changed; a key replaced, added or renamed away), or whose spend now
 makes the cap one it would refuse, is left alone and fails the command — run it again. Each key is
 read once more in the request just before its change and refused if it moved, or (a cap) has spent
 past the new cap; OpenRouter has no conditional update, so that moment is all that's left.
 Afterwards each key is checked against what OpenRouter lists (a change it answered OK for but didn't
 make fails; caps compared exactly, not to the cent), and by name: a key still on under a paused
-machine's name, or a resumed key beside a newer one, is said and fails the command.
+machine's name is said, and a resumed key found beside a newer one under its name is turned off
+again (if it's still as the command left it) — each failing the command. Keys that can't be read
+back leave the changes `unverified`, and the command fails.
 
 `--json` prints `{action, dry_run, keys: [{machine, name, hash, before, after, result, error?,
 note?}], changed, failed}` (`before`/`after`: `{limit, reset, disabled, spent}`, `after` as listed
 afterwards — `null`, with a top-level `reread_error`, when the keys couldn't be read back; `result`:
-`changed`, `would change`, `unchanged`, `no key`, `failed`). Of several keys under one name (a
+`changed`, `would change`, `unverified`, `unchanged`, `no key`, `failed`). Of several keys under one name (a
 rotation's disabled leftover), a cap change and a resume act on the one shown — the enabled one,
 then the newest — and name the others. With a workspace, each key is read first and one from
 another workspace refused, as for a rename. `OPENROUTER_KEY_LIMIT` stays what `gen` and `rotate`
