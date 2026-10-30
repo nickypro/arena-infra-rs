@@ -289,7 +289,7 @@ Notes / sharp edges to know:
 
 Any key in `config.env` can be overridden by an **environment variable of the same
 name** (env wins; it can't introduce brand-new keys — except a short allowlist such as
-`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `DISCARD_MAX_GB`, `NEAR`/`NEAR_MAX_EXTRA_PCT` and the `ASK_<AI>_MODEL`/`_EFFORT` keys, e.g. `RUNPOD_API=v1 arena pods
+`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `DISCARD_MAX_GB`, `CONTROL_MIN_FREE_GB`, `NEAR`/`NEAR_MAX_EXTRA_PCT` and the `ASK_<AI>_MODEL`/`_EFFORT` keys, e.g. `RUNPOD_API=v1 arena pods
 list` to use the retiring RunPod v1 backend for one command, until 2026-11-16; v2 is the default). This is how you point at an SSH
 key the current user can actually read, without editing the shared, read-only prod
 config — e.g. when the dashboard's metrics show `ssh connect failed … key unreadable`
@@ -1849,6 +1849,12 @@ another prefix's pod — a staff box may be running someone's job — with one `
 pods …` line for the rest; `--include-non-cohort` checks every pod, and a named staff box is
 checked. Two pods sharing a name each get their own row (with a warning naming their ids).
 
+With no targets the check ends with **this box** (where the backups and copies land; under `--json`
+on stderr): its disk and what arena left on it, as in `config check`, then every pod whose copy onto
+it was skipped for space in the last day (`✗ arena9-bloom: copy skipped 12× (since 09:00 UTC, last
+10:15 UTC) — only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB)`) — which fails the check like
+a pod's FAIL ([Room on this box](BACKUPS.md#room-on-this-box-control_min_free_gb)).
+
 Every morning on cron: `arena cron install --health 07:20` (this box's time zone; log
 `~/.local/state/arena-cron/health.log`; see
 [`cron`](BACKUPS.md#cron-the-lines-that-run-it-all)).
@@ -2070,7 +2076,14 @@ checklist of what is still billing or scheduled, each with the exact command tha
   (it bills by the hour; fix `image prune`); this cohort's arena images are ◷ **kept** (made on
   purpose for `HETZNER_IMAGE=arena`, cents a month — never against the check), with their size and
   monthly cost and a note to `image prune --keep 0` at the end; any other snapshot in the project
-  (made by hand, another cohort's) is a note with its cost, never touched.
+  (made by hand, another cohort's) is a note with its cost, never touched;
+- and what arena **left on this box** (local, read-only): replace/migrate's staging copies
+  (`$TMPDIR/arena-replace-<pod id>`), an interrupted `pods baseline` capture, rsync temp files a
+  hard-stopped pull left — ◷ **kept**, never against the check, and never removed by it: a staging
+  copy can be the only copy of a pod's work. Each with its size, age and what made it, a
+  note with the commands to look at it (and, for a staging copy, what to check first), and its
+  `rm -rf` as the fix; one a running arena is using now has no fix. See [Room on this
+  box](BACKUPS.md#room-on-this-box-control_min_free_gb).
 
 A source that couldn't be read (a provider's 429, a remote proxy, an unreadable `at` job, a proxy
 `server` block arena can't parse) is `?` — **never "empty"** — and, like anything remaining, makes
@@ -2201,6 +2214,15 @@ on stdin** (`printf %s "$TOK" | arena config set HF_TOKEN`, script-friendly, kee
 `argv`/`ps`), or with no args prompt interactively (the picker shows which keys are already set);
 `config which` shows the active config file (path, readable/**writable**), what parsed, and any keys
 coming from the environment.
+
+After the report, `config check` looks at **this box's disk** (local, read-only; advice, never a
+failure): one row per filesystem arena writes to — `LOCAL_BACKUP_DIR` (and `LOCAL_BACKUP_BIG_DIR`),
+`$TMPDIR` (replace/migrate's staging), the state dir — with what's free of what; ⚠ under twice
+`CONTROL_MIN_FREE_GB` (default 5 GB: what every copy onto this box keeps free), ⚠ under it (every
+copy onto it is then skipped), each with arena's biggest dirs there; then what arena left on the box,
+with size, age, what made it and the commands to look at and remove it ([Room on this
+box](BACKUPS.md#room-on-this-box-control_min_free_gb)). The report's own row shows the floor (`· copies
+leave free here 5 GB (default)`; a bad value is ✗).
 
 `config check` makes no request but one: with `HETZNER_IMAGE=arena` it looks up which snapshot that
 resolves to for `HETZNER_SERVER_TYPE` (read-only, bounded at 30 s), with a ⚠ when it's over 14 days

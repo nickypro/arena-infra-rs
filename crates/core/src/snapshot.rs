@@ -518,6 +518,32 @@ impl HealthCache {
     }
 }
 
+/// An exclusive `flock` on the state directory `dir` — what a record in it is rewritten under,
+/// so two runs (the cron's and an operator's) can't drop each other's changes — tried for up
+/// to `wait` (blocking I/O: an async caller runs this off its runtime). Its other holders hold
+/// it for a load and an atomic write; one held longer means something is wrong: `Err`
+/// (`WouldBlock`), and the caller writes nothing rather than hang. `Ok(None)`: no lock to be had
+/// here (the dir can't be opened, or its filesystem has no `flock`) — the atomic write alone.
+pub fn lock_dir_within(dir: &Path, wait: Duration) -> std::io::Result<Option<std::fs::File>> {
+    let Ok(f) = std::fs::File::open(dir) else { return Ok(None) };
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(Some(f)),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!("{} stayed locked by another arena for {}s", dir.display(), wait.as_secs_f32()),
+                ))
+            }
+            Err(std::fs::TryLockError::Error(_)) => return Ok(None),
+        }
+    }
+}
+
 /// Create `dir` (and its parents) owner-only (0700) if missing.
 #[cfg(unix)]
 pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {

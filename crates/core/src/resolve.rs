@@ -451,27 +451,7 @@ pub fn record_busy_copies(
 ) -> std::io::Result<Option<String>> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     crate::snapshot::create_private_dir(dir)?;
-    let lock = match std::fs::File::open(dir) {
-        Ok(f) => {
-            let deadline = std::time::Instant::now() + wait;
-            loop {
-                match f.try_lock() {
-                    Ok(()) => break Some(f),
-                    Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                    Err(std::fs::TryLockError::WouldBlock) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::WouldBlock,
-                            format!("{} stayed locked by another arena for {}s", dir.display(), wait.as_secs_f32()),
-                        ))
-                    }
-                    Err(std::fs::TryLockError::Error(_)) => break None,
-                }
-            }
-        }
-        Err(_) => None,
-    };
+    let lock = crate::snapshot::lock_dir_within(dir, wait)?;
     let (mut copies, warning) = BusyCopies::load(path);
     copies.pods.retain(|_, c| now.saturating_sub(c.at) < FORGET_AFTER_SECS);
     for (pod, copy) in changes {

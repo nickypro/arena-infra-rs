@@ -156,6 +156,14 @@ async fn collect(
         today_days: arena_core::schedule::days_from_unix(now),
         images,
         now,
+        // Local and read-only: what arena left on this box (none looked for in this crate's
+        // tests unless asked, `disk::live`).
+        leftovers: match crate::disk::live(cfg).then(|| crate::disk::leftovers(cfg, now)) {
+            None => Probe::Got(Vec::new()),
+            // A dir it couldn't list: not known to hold nothing.
+            Some(found) if !found.unread.is_empty() => Probe::Failed(found.unread.join("; ")),
+            Some(found) => Probe::Got(found.leftovers),
+        },
     };
     let mut report = teardown::build(&inputs, &Naming::from_config(cfg));
     if !fetched.is_empty() {

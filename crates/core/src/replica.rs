@@ -490,48 +490,6 @@ pub fn transfer_bytes(stats: &str) -> Option<u64> {
     (v.is_finite() && v >= 0.0).then(|| (v * mult as f64).round() as u64)
 }
 
-/// What the local staging must leave free on its disk: a tenth of it, at least 5 GB — room
-/// for everything else on a machine the live cohort's proxy and backups share.
-pub fn staging_reserve(total: u64) -> u64 {
-    (total / 10).max(5_000_000_000)
-}
-
-/// Whether staging `needed` bytes fits on a disk with `free` of `total` bytes, keeping
-/// [`staging_reserve`] free. `Err` says why not (in GB). Pure.
-pub fn staging_room(needed: u64, free: u64, total: u64) -> Result<(), String> {
-    let reserve = staging_reserve(total);
-    let gb = |b: u64| format!("{:.1} GB", b as f64 / 1e9);
-    if needed.saturating_add(reserve) <= free {
-        return Ok(());
-    }
-    Err(format!(
-        "staging needs ~{} but its disk has {} free and {} must stay free",
-        gb(needed),
-        gb(free),
-        gb(reserve)
-    ))
-}
-
-/// `(free, total)` bytes of the filesystem holding `path` (`statvfs`; free = what an
-/// unprivileged process may use). `None` when it can't be read.
-#[cfg(unix)]
-pub fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c` is a valid NUL-terminated path and `st` a properly sized out-param.
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return None;
-    }
-    let frsize = st.f_frsize as u64;
-    Some((st.f_bavail as u64 * frsize, st.f_blocks as u64 * frsize))
-}
-
-#[cfg(not(unix))]
-pub fn disk_space(_path: &std::path::Path) -> Option<(u64, u64)> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,22 +529,6 @@ mod tests {
             assert_eq!(transfer_bytes(&line(v)), want, "{v}");
         }
         assert_eq!(transfer_bytes("nothing here"), None);
-    }
-
-    #[test]
-    fn staging_keeps_a_reserve_free() {
-        const G: u64 = 1_000_000_000;
-        // (needed, free, total, fits)
-        for (needed, free, total, fits) in [
-            (3 * G, 18 * G, 75 * G, true),   // the shared box: 18 GB free, 7.5 GB reserve
-            (11 * G, 18 * G, 75 * G, false), // would leave < 7.5 GB
-            (G, 5 * G, 20 * G, false),       // small disk: 5 GB floor
-            (0, 5 * G, 20 * G, true),
-        ] {
-            assert_eq!(staging_room(needed, free, total).is_ok(), fits, "{needed} {free} {total}");
-        }
-        let e = staging_room(11 * G, 18 * G, 75 * G).unwrap_err();
-        assert!(e.contains("~11.0 GB") && e.contains("18.0 GB free") && e.contains("7.5 GB must stay free"), "{e}");
     }
 
     #[test]
@@ -1036,13 +978,5 @@ mod tests {
         assert!(!dst.join("a.txt").exists());
         assert!(push("pod-a").status.success());
         assert!(dst.join("a.txt").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn disk_space_reads_the_temp_dir() {
-        let (free, total) = disk_space(&std::env::temp_dir()).unwrap();
-        assert!(total > 0 && free <= total);
-        assert_eq!(disk_space(Path::new("/nonexistent/arena")), None);
     }
 }

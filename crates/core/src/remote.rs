@@ -593,6 +593,31 @@ pub async fn stop_all_children() {
     }
 }
 
+/// Until no child tracked still runs, or `wait` is up — for a caller that stopped its calls by
+/// dropping them ([`Stopper`]'s drop: TERM now, the KILL after [`TERM_GRACE`] in the background)
+/// and must not go on, or end, while they may still write: the free-space watch's stopped copies
+/// (`disk::watched` in the CLI). A stopped rsync exits once its handler has signalled its
+/// transport and receiver (live 2026-10-30: the receiver then removes its temp file, gone a moment
+/// later); ended before that, the process would cancel the background grace and SIGKILL it,
+/// orphaning both still copying. Whether none runs.
+pub async fn children_done(wait: Duration) -> bool {
+    #[cfg(unix)]
+    {
+        tokio::time::timeout(wait, async {
+            while children_running() {
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::time::sleep(wait.min(TERM_GRACE)).await;
+        true
+    }
+}
+
 /// `sig` to every child tracked — a group's leader's whole group — under [`CHILDREN`]'s lock:
 /// whether there was any.
 #[cfg(unix)]
