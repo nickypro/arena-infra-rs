@@ -221,6 +221,16 @@ pub(crate) fn billing_request(client: &Client, base: &str, api_key: &str, from: 
     client.get(url).bearer_auth(api_key).query(&[("bucketSize", "hour"), ("startTime", &start), ("endTime", &end)])
 }
 
+/// Each pod's spend history ([`crate::spend`]): `GET {base}/billing/pods` in hourly buckets
+/// from `from` to `to`, one record per pod and hour carrying its `podId` (read live
+/// 2026-10-30: the records summed to `/billing`'s total for the same window; one page, its
+/// `recordCount` in `metadata`). Read-only, key in the header only.
+pub(crate) fn billing_pods_request(client: &Client, base: &str, api_key: &str, from: u64, to: u64) -> RequestBuilder {
+    let url = format!("{}/billing/pods", base.trim_end_matches('/'));
+    let (start, end) = (crate::snapshot::rfc3339(from), crate::snapshot::rfc3339(to));
+    client.get(url).bearer_auth(api_key).query(&[("bucketSize", "hour"), ("startTime", &start), ("endTime", &end)])
+}
+
 /// The GPU catalog with prices and pod stock for one cloud tier — the stock counted over
 /// hosts at or above `min_cuda` when there is a floor (the hosts a create would accept,
 /// finding #31: a stock hint over hosts we'd never be placed on misleads).

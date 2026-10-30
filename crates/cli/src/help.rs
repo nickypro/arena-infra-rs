@@ -30,7 +30,7 @@ type Groups = &'static [(&'static str, &'static [&'static str])];
 pub(crate) const TOP: Groups = &[
     ("Fleet", &["pods", "tui", "snapshot"]),
     ("Access", &["proxy", "ssh-config", "keys"]),
-    ("Money", &["offers", "balance", "teardown"]),
+    ("Money", &["offers", "balance", "spend", "teardown"]),
     ("Automation", &["cron", "plan", "archive"]),
     ("Setup", &["config", "image", "update", "api"]),
 ];

@@ -378,6 +378,40 @@ plus an all-files `big/` mirror). The optional archive VM keeps a second copy of
 `LOCAL_BACKUP_DIR` that outlives the pods.
 [Everything about backups](docs/BACKUPS.md).
 
+## Tracking spend
+
+Who cost what, compute and AI, per person, for the organisers: give each machine an owner when
+you make it, then ask.
+
+```bash
+arena pods up apple bloom --owner alice     # every new instance records its owner
+arena spend                                  # one row per owner, then "(no owner)", then totals
+arena spend --by machine --csv > spend.csv   # one row per instance, for a spreadsheet
+arena spend assign cedar bob                 # forgot --owner? set or fix it later
+```
+
+```text
+OWNER       MACHINES      HOURS  COMPUTE         AI     TOTAL
+alice       apple, bloom   41.0  $9.84 + €0.43   $3.10  $12.94 + €0.43
+bob         cedar           6.5  ~$1.56          $0.40  ~$1.96
+(no owner)  delta           2.0  $0.48           $0.00  $0.48
+total       4 instance(s)  49.5  ~$11.88 + €0.43 $3.50  ~$15.38 + €0.43
+```
+
+- **Per instance, never per name.** Re-creating `apple` for someone else is a new row; the old
+  one keeps its owner and its cost. Currencies are never added together.
+- **AI keys follow their owner.** `--owner bob` for a name whose OpenRouter key was alice's
+  rotates it first (shown in the plan; `--keep-key` to skip): alice keeps what she spent.
+- **Nothing to run by hand.** `pods list`, the dashboard, `teardown --check`, every create, stop,
+  start and terminate, and the snapshot cron line (`cron install --snapshot DIR`, every 2 min)
+  record what they see in a local ledger. `~` marks an estimate; the notes say which way it errs.
+  RunPod rows are corrected from RunPod's own per-pod billing.
+- **Just to watch:** nothing stops a machine, and nothing is shown to participants.
+
+Running a second fleet (a project week) from the same box:
+[Project week as a second fleet](docs/REFERENCE.md#project-week-as-a-second-fleet).
+[Everything about spend](docs/REFERENCE.md#spend).
+
 ## Safety
 
 `arena` runs against a live cohort, so it is careful with the participants' work:
