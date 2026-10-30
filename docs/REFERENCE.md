@@ -53,7 +53,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [`balance`](#balance)
   - [`balance set`](#balance-set)
   - [`spend`](#spend)
-  - [Project week as a second fleet](#project-week-as-a-second-fleet)
+  - [Running a second fleet from the same control box](#running-a-second-fleet-from-the-same-control-box)
 - [Config, plans and the provider APIs](#config-plans-and-the-provider-apis)
   - [`config check | set | which`](#config-check--set--which)
   - [`plan check | show`](#plan-check--show)
@@ -474,12 +474,18 @@ the next one with the same name.
   recommended ones. A location that can't be timed goes after the timed ones, by price.
 - No room anywhere is a capacity error that names each location tried, so `--keep-trying` waits.
 - Any other refusal (token, quota, throttle, SSH key) stops at once.
-- The project's own limit — Hetzner's 403 `resource_limit_exceeded`, e.g. `shared core limit
-  exceeded` — reads as that, not as a bad token: `Hetzner refused: the project's resource limit is
-  reached (…) — use a smaller type, free a server, or ask Hetzner to raise the limit`. `create`/`up`
-  keep what they made and stop there (the names after it would hit the same limit); it isn't waited
-  out (`--keep-trying` waits on capacity only); with several `--gpu`/`--cloud` options only that
-  option is skipped.
+- The account's limit — Hetzner's 403 `resource_limit_exceeded`, e.g. `shared core limit
+  exceeded` or `Primary IP limit exceeded` — reads as that, not as a bad token: `Hetzner refused:
+  the account's resource limit is reached (…; limit: primary_ip_limit) — delete a primary IP
+  nothing needs (…), or ask Hetzner to raise the limit (Hetzner Console: Limits tab → Request
+  change → Limit increase)`. What it suggests follows the limit Hetzner names: a smaller type or a
+  server for cores, a server for the number of servers, a primary or floating IP, a volume, a
+  snapshot. A limit counts
+  every project of the Hetzner account, so a project with no server can still hit it (live
+  2026-10-30). `create`/`up` keep what they made and stop there (the names after it would hit the
+  same limit); it isn't waited out (`--keep-trying` waits on capacity only); with several
+  `--gpu`/`--cloud` options only that option is skipped. Hetzner's 403 `maintenance` says to try
+  later. Only a 401 or a 403 `forbidden` reads as "authentication failed".
 - One location (`nbg1`) pins creates there, with no lookup. A list (`nbg1,fsn1`) is tried in its
   order, and `nbg1,any` tries nbg1, then the rest.
 - An `--api-json` `datacenter` is one create where it says.
@@ -2231,6 +2237,26 @@ who it was for, compute and AI, for the organisers (read-only towards the provid
 what it read in the local ledger). `spend assign <machine|instance id|key hash> <owner>` (or
 `--clear`) sets or fixes an owner.
 
+**On the fleet you already run** — a project week included: it needs no fleet of its own. Give
+new machines an owner as you make them, existing ones afterwards, then ask:
+
+```bash
+arena pods up apple bloom --owner alice      # new machines: who each is for
+arena spend assign cedar bob                 # machines that already exist (or a forgotten --owner)
+arena spend                                  # one row per owner, then (no owner), then totals
+arena spend --since 2026-11-02               # only from that day (UTC)
+arena spend --by machine --csv > spend.csv   # one row per instance, for a spreadsheet
+```
+
+Nothing else to set up: the snapshot cron line (`cron install --snapshot DIR`, every 2 min) records
+each listing, and so do `pods list`, the dashboard and every create, stop, start and terminate.
+Without that line the ledger moves only when one of those runs (a gap over 30 min is an estimate).
+The ledger is in the state dir (`ARENA_STATE_DIR`, else `~/.local/state/arena`), so run `arena
+spend` as the user the cron line runs as, or set `ARENA_STATE_DIR` in the config for both.
+Tracking starts once a build with `arena spend` (2.3) is installed: a machine terminated before
+then has no row, and one already running counts from when arena first sees it (an estimate,
+erring low — RunPod's from its creation where RunPod's billing covers it).
+
 **Rows are instances, owners are a field.** An instance is provider + provider id: a terminated
 machine keeps its row, and a name created again is a new row (`--by machine` shows both). The
 owner is recorded by `pods up/create --owner NAME` for the instances that run makes (`--dry-run`
@@ -2312,21 +2338,23 @@ currency,cost,source,estimate,estimated`). `--json`: the whole report. A source 
 read (a provider's listing, the keys, RunPod's billing, Hetzner's currency) is one warning line;
 the exit is 0.
 
-### Project week as a second fleet
+### Running a second fleet from the same control box
 
-A project week (say ~25 people, machines set up by organisers) runs best as its **own fleet**:
-its own config file, prefix, OpenRouter workspace and ledger, on the same proxy box. Nothing in
-arena has a "project week mode"; a second config is all it is.
+Optional, and **not needed for a project week**: that runs on the normal fleet, with `--owner`
+and `arena spend` as above. A second fleet is for another program that wants its own machines,
+names, AI keys and ledger on the same control box and proxy: its own config file, prefix,
+OpenRouter workspace and proxy file. Nothing in arena has a second-fleet mode; a second config
+is all it is.
 
-What must differ in the second config (`/root/pw/config.env`, from `config.env.example`):
+What must differ in the second config (`/root/p2/config.env`, from `config.env.example`):
 
 | Key | Why |
 | --- | --- |
-| `MACHINE_NAME_PREFIX=pw` (and its own `MACHINE_NAME_LIST`) | names, state dir, ledger, backup branches; avoid `@` entries the other fleet lists. **Not `<other prefix>-…`** (say `arena9-pw`): its machines and keys would be named `arena9-…`, and the main fleet would count them as its own (and the other way round) |
+| `MACHINE_NAME_PREFIX=p2` (and its own `MACHINE_NAME_LIST`) | names, state dir, ledger, backup branches; avoid `@` entries the other fleet lists. **Not `<other prefix>-…`** (say `arena9-p2`): its machines and keys would be named `arena9-…`, and the main fleet would count them as its own (and the other way round) |
 | `OPENROUTER_WORKSPACE` | its own workspace: its keys, and the AI spend per key |
-| `SSH_PROXY_NGINX_CONFIG_PATH=/etc/nginx/streams-enabled/pw.conf` | a fleet's `proxy apply` owns its file: two fleets in one file drop each other's forwards |
+| `SSH_PROXY_NGINX_CONFIG_PATH=/etc/nginx/streams-enabled/p2.conf` | a fleet's `proxy apply` owns its file: two fleets in one file drop each other's forwards |
 | `SSH_PROXY_STARTING_PORT=9200` | ports are start + list position: keep well clear of the other range (prod 9000+) |
-| `SSH_ADMIN_CONFIG_FILE=~/.ssh/pw-admin.conf` (or `SSH_CONFIG_FILE`, whichever the other fleet uses) | the default file is the other fleet's |
+| `SSH_ADMIN_CONFIG_FILE=~/.ssh/p2-admin.conf` (or `SSH_CONFIG_FILE`, whichever the other fleet uses) | the default file is the other fleet's |
 | `LOCAL_BACKUP_DIR`, `ARENA_START_DATE` | if it backs up: its own folder and day numbering |
 
 Then, as root on the proxy box (`/home/dev/.cargo/bin/arena` is where prod's `arena` is, and
@@ -2334,32 +2362,32 @@ where `arena update` installs: next to the running binary — `readlink -f "$(co
 prints it on another box):
 
 ```bash
-mkdir -p /root/pw                                     # its own folder: keys/ is relative to it
-pw() { (cd /root/pw && /home/dev/.cargo/bin/arena --config /root/pw/config.env "$@"); }
-pw config check
-pw proxy plan && pw proxy apply                       # writes pw.conf only
-pw pods up apple --owner alice                        # each person's machines
-pw spend                                              # per person; --by machine --csv for a sheet
-pw tui                                                # its dashboard
+mkdir -p /root/p2                                     # its own folder: keys/ is relative to it
+p2() { (cd /root/p2 && /home/dev/.cargo/bin/arena --config /root/p2/config.env "$@"); }
+p2 config check
+p2 proxy plan && p2 proxy apply                       # writes p2.conf only
+p2 pods up apple --owner alice                        # each person's machines
+p2 spend                                              # per person; --by machine --csv for a sheet
+p2 tui                                                # its dashboard
 ```
 
 - `arena` reads `--config` (only `arena-tui` reads `ARENA_CONFIG`; `arena tui` passes `--config`
-  on) — hence `pw()`. Open the second fleet's dashboard with `pw tui` only: its actions run
-  `arena` in the folder it was started from, and only `/root/pw` has the second fleet's `keys/`.
+  on) — hence `p2()`. Open the second fleet's dashboard with `p2 tui` only: its actions run
+  `arena` in the folder it was started from, and only `/root/p2` has the second fleet's `keys/`.
 - **Cron: never `arena cron install` for the second fleet.** A crontab has one arena block, and
   its lines are known by command, not config: the second fleet's install would replace the first
   fleet's lines (`cron remove` would remove them), and both would share the locks in
   `~/.local/state/arena-cron/`. Write its lines by hand where arena never looks, e.g.
-  `/etc/cron.d/arena-pw` — the snapshot line is the one that keeps its ledger current. Name the
+  `/etc/cron.d/arena-p2` — the snapshot line is the one that keeps its ledger current. Name the
   binary by its full path, as prod's own crontab does (cron's `PATH` is `/usr/bin:/bin`: a bare
   `arena` fails there, quietly):
 
   ```
-  */2 * * * * root mkdir -p /root/.local/state/arena-cron-pw && cd /root/pw && flock -n /root/.local/state/arena-cron-pw/snapshot.lock /home/dev/.cargo/bin/arena --config /root/pw/config.env snapshot --public --out /root/pw/fleet.json >> /root/.local/state/arena-cron-pw/snapshot.log 2>&1
+  */2 * * * * root mkdir -p /root/.local/state/arena-cron-p2 && cd /root/p2 && flock -n /root/.local/state/arena-cron-p2/snapshot.lock /home/dev/.cargo/bin/arena --config /root/p2/config.env snapshot --public --out /root/p2/fleet.json >> /root/.local/state/arena-cron-p2/snapshot.log 2>&1
   ```
 - **Shared provider accounts:** listings are per account, so the second fleet's `pods list` shows
   the first fleet's pods, and `--all` (or a command without targets) acts on them too. Name your
-  targets with `pw`, or give the project week its own Hetzner project (its own token) and RunPod
+  targets with `p2`, or give the second fleet its own Hetzner project (its own token) and RunPod
   account. `teardown --check` lists every machine on the account.
 
 ## Config, plans and the provider APIs
@@ -2386,7 +2414,8 @@ failure): one row per filesystem arena writes to — `LOCAL_BACKUP_DIR` (and `LO
 copy onto it is then skipped), each with arena's biggest dirs there; then what arena left on the box,
 with size, age, what made it and the commands to look at and remove it ([Room on this
 box](BACKUPS.md#room-on-this-box-control_min_free_gb)). The report's own row shows the floor (`· copies
-leave free here 5 GB (default)`; a bad value is ✗).
+leave free here 5 GB (default)`; a bad value is ✗: pulls, backup copies and replace/migrate are
+refused until it's fixed).
 
 `config check` makes no request but one: with `HETZNER_IMAGE=arena` it looks up which snapshot that
 resolves to for `HETZNER_SERVER_TYPE` (read-only, bounded at 30 s), with a ⚠ when it's over 14 days

@@ -383,14 +383,15 @@ plus an all-files `big/` mirror). The optional archive VM keeps a second copy of
 
 ## Tracking spend
 
-Who cost what, compute and AI, per person, for the organisers: give each machine an owner when
-you make it, then ask.
+Who cost what, compute and AI, per person, for the organisers — on the fleet you already run, a
+project week included: give each machine an owner when you make it (or afterwards), then ask.
 
 ```bash
 arena pods up apple bloom --owner alice     # every new instance records its owner
 arena spend                                  # one row per owner, then "(no owner)", then totals
 arena spend --by machine --csv > spend.csv   # one row per instance, for a spreadsheet
-arena spend assign cedar bob                 # forgot --owner? set or fix it later
+arena spend assign cedar bob                 # a machine that already exists, or a forgotten --owner
+arena spend --since 2026-11-02               # only from that day (UTC)
 ```
 
 ```text
@@ -408,12 +409,13 @@ total       4 instance(s)  49.5  ~$11.88 + €0.43 $3.50  ~$15.38 + €0.43
 - **Nothing to run by hand.** `pods list`, the dashboard, `teardown --check`, every create, stop,
   start and terminate, and the snapshot cron line (`cron install --snapshot DIR`, every 2 min)
   record what they see in a local ledger. `~` marks an estimate; the notes say which way it errs.
-  RunPod rows are corrected from RunPod's own per-pod billing.
+  RunPod rows are corrected from RunPod's own per-pod billing. Tracking starts when this version
+  is installed: earlier history isn't there.
 - **Just to watch:** nothing stops a machine, and nothing is shown to participants.
 
-Running a second fleet (a project week) from the same box:
-[Project week as a second fleet](docs/REFERENCE.md#project-week-as-a-second-fleet).
-[Everything about spend](docs/REFERENCE.md#spend).
+[Everything about spend](docs/REFERENCE.md#spend). Another program wanting a fleet of its own on
+the same box (not needed for a project week):
+[Running a second fleet](docs/REFERENCE.md#running-a-second-fleet-from-the-same-control-box).
 
 ## Safety
 
