@@ -1244,7 +1244,16 @@ where
                 _ = tokio::time::sleep(rounds.every) => {}
                 _ = interrupt() => break 'run End::Interrupted,
             }
-            match relist(provider).await {
+            // The listing is raced against Ctrl+C too, Ctrl+C first (`biased`): it can take many
+            // seconds (retries, a RunPod 429 backoff), and a press then used to let one more
+            // round of creates (bills) through after "stopping". A listing reads only, so
+            // dropping it half-way is safe.
+            let relisted = tokio::select! {
+                biased;
+                _ = interrupt() => break 'run End::Interrupted,
+                r = relist(provider) => r,
+            };
+            match relisted {
                 Relisted::Whole(fleet) => {
                     // The listing (retried with backoff) can outlast the window: no round after it.
                     if tokio::time::Instant::now() > deadline {
@@ -2831,6 +2840,24 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
         assert!(matches!(out.end, End::Interrupted), "{:?}", out.end);
         assert_eq!(out.created.len(), 1);
         assert_eq!(out.rounds, 1);
+    }
+
+    /// A Ctrl+C during the re-list before a round (slow here: a throttled backend's retries)
+    /// ends the run there. It used to be seen only during the sleep, so the round after the
+    /// listing still created (billed) — what the dashboard's `[s]` "stops at once" then wasn't.
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupt_during_the_relist_creates_nothing_more() {
+        let fake = Fake::new(Reply::Ok).script(A4000, "COMMUNITY", &[Reply::Capacity]).script(R3090, "COMMUNITY", &[Reply::Capacity]).script(A4000, "SECURE", &[Reply::Capacity]);
+        // Round 2 may start at t=60; its re-list takes 3s more (two throttled tries). Ctrl+C at t=61.
+        *fake.vast_throttled.lock().unwrap() = 2;
+        let pressed_at = tokio::time::Instant::now() + Duration::from_secs(61);
+        let rounds = Rounds { window: Duration::from_secs(600), every: Duration::from_secs(60) };
+        let mut sink = |_: &Progress| {};
+        let n = names(&["arena8-apple"]);
+        let out = place(&fake, &base(), &n, &three(), rounds, None, move || tokio::time::sleep_until(pressed_at), &mut sink).await;
+        assert!(matches!(out.end, End::Interrupted), "{:?}", out.end);
+        assert_eq!(fake.calls().len(), 3, "round 1's three tries only: no create after the press");
+        assert!(out.created.is_empty());
     }
 
     /// The cap reaches every create: a marketplace backend picks the machine (and price)

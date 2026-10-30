@@ -2409,8 +2409,19 @@ async fn create_with_retry(
             // The whole fleet first (as placement's rounds do): a confirmed name that exists
             // now — made meanwhile, on any backend — is dropped, and a top-up is cut to what
             // the target still lacks. A listing missing a backend that may answer again
-            // skips this round; one that won't ends the run.
-            match relist(provider).await {
+            // skips this round; one that won't ends the run. Raced against Ctrl+C, Ctrl+C
+            // first: a press during a slow listing used to let one more round of creates
+            // through (a listing reads only, so dropping it half-way is safe).
+            let relisted = tokio::select! {
+                biased;
+                _ = interrupt.wait() => None,
+                r = relist(provider) => Some(r),
+            };
+            let Some(relisted) = relisted else {
+                eprintln!("interrupted — stopping retries with {} of {shown}", all.len());
+                break 'rounds;
+            };
+            match relisted {
                 Relisted::Whole(fleet) => {
                     if tokio::time::Instant::now() > deadline {
                         eprintln!("retry window ({retry_mins}m) elapsed while listing — have {} of {shown}", all.len());
@@ -22637,6 +22648,8 @@ mod placement_cli_tests {
         /// Each pod is RUNNING with an SSH endpoint the moment it's made, so `up`'s pipelines
         /// (with `--no-setup`) bring it up at once.
         up_at_once: bool,
+        /// How long each listing takes (a slow backend, a RunPod 429 backoff); none by default.
+        list_takes: std::time::Duration,
     }
 
     impl Recorder {
@@ -22658,6 +22671,9 @@ mod placement_cli_tests {
         }
         async fn list_pods(&self) -> CoreResult<Vec<Pod>> {
             self.lists.fetch_add(1, Ordering::SeqCst);
+            if !self.list_takes.is_zero() {
+                tokio::time::sleep(self.list_takes).await;
+            }
             Ok(self.made.lock().unwrap().clone())
         }
         async fn list_by_provider(&self) -> Vec<(String, CoreResult<Vec<Pod>>)> {
@@ -22964,6 +22980,29 @@ mod placement_cli_tests {
         assert!(made.unwrap().is_empty());
         assert_eq!(fake.calls().len(), 3, "rounds at t = 0, 60, 120; none after the press");
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(150), "stopped at the press, not at the next round");
+    }
+
+    /// A press while the fleet is re-listed before a round (slow: 20 s here) stops there too: it
+    /// was seen only during the sleep, so the round after a slow listing still created (billed)
+    /// after the dashboard's `[s]` said "stopping" (pre-merge review of #38, NIT 1).
+    #[tokio::test(start_paused = true)]
+    async fn ctrl_c_during_the_relist_creates_nothing_more() {
+        let fake = Recorder { list_takes: std::time::Duration::from_secs(20), ..Recorder::dry(&["NVIDIA RTX A4000"]) };
+        let (config, ov, ctrl_c) = (cfg(), SpecOverrides::default(), Interrupt::manual());
+        let started = tokio::time::Instant::now();
+        let press = async {
+            // Round 1 at t=0; the wait ends at t=60, the re-list runs to t=80: pressed at t=70,
+            // during it.
+            tokio::time::sleep(std::time::Duration::from_secs(70)).await;
+            ctrl_c.press();
+        };
+        let (made, ()) = tokio::join!(
+            create_with_retry(&fake, &config, vec!["arena8-apple".into()], 0, &ov, false, 1440, 60, &ctrl_c, NO_STREAM),
+            press
+        );
+        assert!(made.unwrap().is_empty());
+        assert_eq!(fake.calls().len(), 1, "round 1 only: no round after a press during the re-list");
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(70), "stopped at the press, not after the listing");
     }
 
     /// The link the test above stands in for: a real SIGINT — what the dashboard's `[s]` sends
