@@ -19,6 +19,19 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-30 · Tell us what hurts: pain points on GitHub
+- When arena gets in your way, or you work around it, file a pain point:
+  https://github.com/nickypro/arena-infra-rs/issues/new?template=pain-point.yml (label
+  `pain-point`). The README's "Tell us what hurts" has a paragraph to paste into your agents'
+  CLAUDE.md so they can file them with `gh issue create`. The repo is public, so leave out IPs,
+  hostnames of private machines, keys and tokens, and participants' names and emails.
+- The docs say what arena does today. Vast's create works (it has since 2026-10-08), production
+  updates with `arena update` (not `cargo install`), and `pods rename` works on every provider.
+  `config.env.example` now lists the keys it was missing: `ARENA_REPO_OWNER`, `GIT_SSH_KEY_LOCAL`,
+  `LOCAL_BACKUP_DIR`, `DEFAULT_BRANCH`, `PROXY_LOCAL`, `EXTRA_SSH_KEYS`, `BACKUP_MAX_SIZE`,
+  `BACKUP_REMOTE_PATH` and the three `OPENROUTER_*` keys. It no longer lists `BACKUP_BRANCH_PREFIX`,
+  which nothing read.
+
 ## 2026-10-30 · Hetzner: a limit refusal says which limit and what frees room under it
 - A Hetzner create refused over one of the account's limits (403 `resource_limit_exceeded`) now
   says what frees room under the limit Hetzner names: a primary IP for `primary_ip_limit` (live:
@@ -65,10 +78,14 @@ earlier).
 - `pods list`, the dashboard, `teardown --check`, `arena balance`, the snapshot cron line and
   every create, stop, start and terminate now record what they see in a local ledger,
   `~/.local/state/arena/<prefix>/spend.json` (0600) — quietly: nothing else they print changes.
-- Docs: "Tracking spend" in the README, and how to run a project week as a second fleet from the
-  same proxy box (docs/REFERENCE.md): its own config, prefix, workspace, proxy file and port
-  range, and cron lines written by hand — `arena cron install` for a second config would replace
-  the first fleet's lines.
+- A project week runs on the fleet you already have: `--owner` on `pods up` for new machines,
+  `arena spend assign` for ones that exist, then `arena spend --since <its first day>`. The
+  snapshot cron line keeps the ledger current; tracking starts when this version is installed,
+  so earlier history isn't there.
+- Docs: "Tracking spend" in the README, and, optionally, how another program can run a second
+  fleet from the same proxy box (docs/REFERENCE.md): its own config, prefix, workspace, proxy
+  file and port range, and cron lines written by hand — `arena cron install` for a second config
+  would replace the first fleet's lines.
 
 ## 2026-10-30 · The dashboard's bottom line is plain words
 - The footer no longer uses `☰`, `⟳`, `✓`, `⚠` or a spinner, which some terminals draw as

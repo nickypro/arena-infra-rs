@@ -1,44 +1,36 @@
-# TODO / known issues — pod migration & proxy
+# Known issues
 
-_Last updated: 2026-06-25._
+_Last checked against the code: 2026-10-30._ Something else got in your way? File it as a
+[pain point](../README.md#tell-us-what-hurts); the open ones are the repo's
+[`pain-point` issues](https://github.com/nickypro/arena-infra-rs/issues?q=is%3Aissue+is%3Aopen+label%3Apain-point).
 
-## Pods with no public IP (COMMUNITY)
-Some RunPod **COMMUNITY** pods come up with **no public IP** — they're only reachable
-via RunPod's SSH proxy: `ssh <podid>-<hash>@ssh.runpod.io -i ~/.ssh/id_ed25519`. The tool's
-`SshTarget::from_pod` builds `user@publicIp:port`, so for these pods it never gets an endpoint
-("waiting for SSH endpoint" hangs forever) and can't SSH/rsync at all.
+## Copying a pod needs rsync on both pods
+`replace` and `migrate copy` (direct pod-to-pod, and via this box) run `rsync` on the source and
+destination pods. The ARENA image and Ubuntu VMs ship it; a bare image (e.g. `nvidia/cuda:*` via
+`--image`) doesn't, and the copy dies with `rsync: command not found`. Nothing checks first. To do:
+check `command -v rsync` on both ends before copying and install it (`apt-get install -y rsync`) when
+missing.
 
-**SECURE cloud reliably gets a public IP** (directly SSH-able). COMMUNITY is a gamble.
+## Migrate cutover hardening (review findings #6/#7)
+- #6: a write-only proxy (`SSH_PROXY_RELOAD_CMD=""`) is said up front, and a cutover whose new pod
+  can't be reached through the proxy is reverted. Still missing: a preflight that nginx actually
+  reloads (`nginx -t` passes, as the user arena runs as) **before** any rename, so a cutover can't
+  rename pods and only then find it can't drive the proxy.
+- #7: `cutover_revert` makes one attempt at each rename. A failed first rename (the new pod back to
+  `<name>-new`) is ignored; a failed second one (the original back to `<name>`) prints `REVERT
+  WARNING: … fix names manually!`. It should retry, return a status, name the exact pod ids and
+  names to fix, and check the original is reachable again before saying the revert worked.
 
-TODO options:
-- Detect a pod that's RUNNING but never gets a `publicIp`/`portMappings["22"]` within N seconds
-  and either (a) fall back to the `ssh.runpod.io` proxy transport (`<podid>@ssh.runpod.io`), or
-  (b) warn clearly and suggest SECURE, or (c) default `migrate`/`replace`-created pods to SECURE.
-- For now: pass `--cloud SECURE` when creating pods you need to reach directly.
+## Migrate state machine (lower priority)
+- No lock between runs: two concurrent `migrate`/`replace` runs on the same machine can create
+  duplicate `-new` pods or clobber a rename (`migrate copy` does reuse an existing `-new`).
+- A cutover interrupted between its two renames leaves no pod named `<name>`, so `migrate
+  revert/status <name>` can't find it. Make recovery name-tolerant, or keep a small journal.
 
-## Copy requires rsync on BOTH pods — check + install if missing
-The copy (direct pod-to-pod and via-local) runs `rsync` on the source and dest pods. The arena
-image ships it, but a bare base image (e.g. `nvidia/cuda:*`) does NOT, so the copy dies with
-`rsync: command not found`. TODO: before copying, check `command -v rsync` on both ends and
-`apt-get install -y rsync` (or equivalent) if missing, rather than assuming it's present.
-
-## Proxy `deploy_proxy` write-before-reload landmine (review finding #5)
-`deploy_proxy` writes the rendered nginx config to disk **before** `nginx -t && nginx -s reload`.
-If the reload fails (e.g. run as non-root: can't read the letsencrypt cert, `nginx -t` fails),
-the new, unvalidated config is left on disk — a landmine for the next root reload (logrotate,
-certbot, reboot), which can then route a stable port to a wrong/dead endpoint.
-TODO: write to a temp file, validate, and only `mv` into place + reload on success; restore the
-previous file contents on failure (write-validate-swap).
-
-## Migrate cutover hardening (review findings #6/#7) — partially pending
-- #6: preflight that nginx is actually reloadable (root / `nginx -t` passes) **before** any
-  rename, so a cutover can't rename pods and only then discover it can't drive the proxy.
-- #7: `cutover_revert` should retry its renames and return a status; if the revert itself fails
-  it must surface a loud "MANUAL FIX NEEDED" with the exact pod ids/names, and re-verify the
-  original is reachable post-revert before claiming success.
-
-## Migrate state-machine (review findings, lower priority)
-- No locking: two concurrent `migrate`/`replace` runs on the same machine can create duplicate
-  `-new` pods or clobber a rename. (`migrate copy` does reuse an existing `-new` before creating.)
-- A cutover interrupted between the two renames leaves no pod named `<name>`; `resolve_migration`
-  can't then find it to recover — make recovery name-tolerant / add a small journal.
+## Resolved since the last update (2026-06-25)
+- **RunPod COMMUNITY pods with no public IP**: a v1 create asks for one (`supportPublicIp`; v2's
+  create has no such field), `pods list` shows a proxy-only pod as `no public endpoint (RunPod ssh
+  proxy only)`, and `pods up` replaces a pod still without an SSH endpoint after
+  `--endpoint-timeout` (`ENDPOINT_TIMEOUT_MINS`, default 5).
+- **The proxy's write-before-reload**: a failed reload puts the previous config back, locally and
+  on a remote proxy (installed from a temp file in one SSH session), so the next sync retries.
