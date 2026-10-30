@@ -30,6 +30,7 @@ use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Value};
 
 use super::{Provider, StopOutcome};
+use crate::capability::Backend;
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, Result};
 use crate::http::{judge, send_limited, status_error, Limits};
@@ -283,6 +284,14 @@ impl HetznerProvider {
             shutdown: SHUTDOWN_WAIT,
             distances: Distances::timed_from_here(),
         }
+    }
+
+    /// This backend with `client` for every request — under test, [`crate::http::offline_client`]:
+    /// nothing it sends can reach the real API.
+    #[cfg(test)]
+    pub(crate) fn with_client(mut self, client: Client) -> Self {
+        self.client = client;
+        self
     }
 
     pub fn with_base(mut self, base: impl Into<String>) -> Self {
@@ -1281,6 +1290,10 @@ impl Provider for HetznerProvider {
         "hetzner"
     }
 
+    fn backend(&self) -> Option<Backend> {
+        Some(Backend::Hetzner)
+    }
+
     fn describe(&self, spec: &PodSpec) -> String {
         // CPU VM: describe what we actually send (server type/image/location), not the
         // GPU fields the spec carries and we ignore.
@@ -1431,10 +1444,6 @@ impl Provider for HetznerProvider {
         let rb = self.auth(self.client.put(format!("{}/servers/{id}", self.base)).json(&rename_payload(new_name)));
         let (status, text) = crate::http::send_text(rb).await?;
         judge_rename(status, &text, new_name)
-    }
-
-    fn rename_support(&self, _pod: &Pod) -> Result<()> {
-        Ok(())
     }
 
     fn check_create_extra(&self, extra: &Extra) -> Result<()> {
@@ -2690,7 +2699,7 @@ mod tests {
         use crate::http::test_server::{canned, serve};
         let srv = serve(vec![canned(200, "application/json", &renamed_server("devtest-bravo"))]);
         let p = provider(&srv.base, HetznerOpts::default());
-        assert!(p.rename_support(&Pod { provider: "hetzner".into(), ..Default::default() }).is_ok());
+        assert!(p.supports(crate::capability::Op::Rename, Some(&Pod { provider: "hetzner".into(), ..Default::default() })).works());
         p.rename_pod("173518005", "devtest-bravo").await.unwrap();
         assert_eq!(*srv.requests.lock().unwrap(), ["PUT /servers/173518005 HTTP/1.1"]);
         assert_eq!(serde_json::from_str::<Value>(&srv.bodies.lock().unwrap()[0]).unwrap(), json!({"name": "devtest-bravo"}));

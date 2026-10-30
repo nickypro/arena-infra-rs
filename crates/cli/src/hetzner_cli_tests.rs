@@ -161,12 +161,12 @@ fn sizing_flags_fit_the_create_target() {
     }
     let long = "x".repeat(33);
     let refused: &[SizingCase<&str>] = &[
-        ("hetzner", Some("A4000"), None, None, "--gpu doesn't apply to hetzner, which creates CPU VMs sized by server type — pass --server-type"),
+        ("hetzner", Some("A4000"), None, None, "--gpu doesn't apply to hetzner: Hetzner creates CPU VMs sized by server type — pass --server-type"),
         ("hetzner", None, Some(2), Some("cx23"), "--gpus doesn't apply to hetzner"),
         ("hetzner", Some("A4000"), Some(1), None, "--gpu / --gpus doesn't apply to hetzner"),
-        ("runpod", None, None, Some("cx23"), "--server-type is for Hetzner VMs only; these pods would be created on runpod — pass --provider hetzner"),
-        ("vast", Some("3090"), None, Some("cx23"), "--server-type is for Hetzner VMs only; these pods would be created on vast"),
-        ("shadeform", None, None, Some("cx23"), "created on shadeform"),
+        ("runpod", None, None, Some("cx23"), "--server-type doesn't apply to runpod: only Hetzner VMs are sized by server type — pass --provider hetzner"),
+        ("vast", Some("3090"), None, Some("cx23"), "--server-type doesn't apply to vast"),
+        ("shadeform", None, None, Some("cx23"), "--server-type doesn't apply to shadeform"),
         ("hetzner", None, None, Some("cx23; reboot"), "--server-type takes a Hetzner server type name"),
         ("hetzner", None, None, Some(" "), "--server-type takes a Hetzner server type name"),
         ("hetzner", None, None, Some(long.as_str()), "--server-type takes a Hetzner server type name"),
@@ -218,8 +218,8 @@ async fn a_flag_the_target_cant_honour_is_refused_before_anything_happens() {
         ("hetzner", create(Some("A4000"), None, None), "--gpu doesn't apply to hetzner"),
         ("hetzner", create(None, Some(2), None), "--gpus doesn't apply to hetzner"),
         ("hetzner", up(Some("RTX 4090"), Some("cx23")), "--gpu doesn't apply to hetzner"),
-        ("runpod", create(None, None, Some("cx23")), "--server-type is for Hetzner VMs only; these pods would be created on runpod"),
-        ("vast", up(None, Some("cpx42")), "--server-type is for Hetzner VMs only; these pods would be created on vast"),
+        ("runpod", create(None, None, Some("cx23")), "--server-type doesn't apply to runpod"),
+        ("vast", up(None, Some("cpx42")), "--server-type doesn't apply to vast"),
     ];
     for (name, cmd, want) in cases {
         let p = Sizer::new(name);

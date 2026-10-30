@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arena_core::capability::Op;
 use arena_core::provider::Provider;
 use arena_core::remote::{Remote, PROBE_TIMEOUT};
 use arena_core::ssh::SshTarget;
@@ -12,7 +13,8 @@ use arena_core::{Config, PodSpec};
 
 use crate::cli::PlaceFlags;
 use crate::keys::{handle_copy_keys, KeySources, KEYS_DIR};
-use crate::pods::create::{apply_spec_overrides, check_create_body, create_extra, SpecOverrides};
+use crate::pods::capable::CreateFlags;
+use crate::pods::create::{apply_spec_overrides, check_create_body, create_extra, sizing_flags, SpecOverrides};
 use crate::pods::home_copy::{copy_pod_files, pod_guard, remove_staging_for, verify_replacement, CopyOpts};
 use crate::pods::lifecycle::proxied_name;
 use crate::pods::list::ENRICH_TIMEOUT;
@@ -451,6 +453,19 @@ pub(crate) async fn handle_replace(
     replace_on(remote, fleet, cfg, owner.as_ref(), src_id, src_label, job).await
 }
 
+/// The flags of a replace (or `migrate copy`) only some providers honour, as given — checked
+/// against the source's provider, where the new pod is made ([`CreateFlags::check`]).
+pub(crate) fn replacement_flags<'a>(ov: &'a SpecOverrides, place: &PlaceFlags) -> CreateFlags<'a> {
+    CreateFlags {
+        cloud: ov.cloud.as_deref(),
+        disk: ov.disk,
+        volume: ov.volume,
+        image: ov.image.as_deref(),
+        bootstrap: ov.bootstrap,
+        max_price: place.max_price,
+    }
+}
+
 /// `pods replace`'s switches, passed through to [`replace_on`] as one value.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ReplaceOpts {
@@ -500,6 +515,14 @@ pub(crate) async fn replace_on(
         );
     }
     let (new_name, old_name) = replace_stage_names(&canonical);
+    // A provider that can't replace (the capability table: it needs the pod's spec read back and
+    // two renames) is refused before anything is read or created — dry run or not; so is a flag
+    // the new pod's provider would ignore.
+    if let Some(r) = crate::pods::capable::refusal(owner, Op::Replace, "replace", &[&src]) {
+        anyhow::bail!("{r}");
+    }
+    replacement_flags(job.ov, job.place).check(owner, Some(&src))?;
+    sizing_flags(&src.provider, job.ov.gpu.as_deref(), job.ov.gpus, None)?;
     // Replace renames the pod and (unless --keep-old) terminates it: a locked one is refused
     // before anything is read or created — never unlocked here.
     let locked = arena_core::lock::refusal("replace", &[&src], LOCKED_REPLACEMENT_NOTE);

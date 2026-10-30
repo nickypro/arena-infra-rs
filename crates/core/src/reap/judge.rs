@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::probe::{Files, GpuFacts, HomeState, Mounts, ProbeError, ProbeFacts, RepoSite, Since, Workspace};
 use super::render::NotifyKind;
 use super::*;
+use crate::capability::{self, Backend, Op};
 use crate::provider::Provider;
 use crate::selector::Naming;
 
@@ -185,12 +186,15 @@ pub struct GateCtx<'a> {
 /// lock state, no verified identity) or RunPod on v1 — nor Shadeform yet: its identity is a
 /// per-create nonce (`Pod::identity`, the VM's `/var/lib/arena/shadeform-nonce`) that the
 /// probe and the identity guards don't read yet.
+///
+/// The capability table's answer ([`Op::Reap`]), so the docs' matrix and every refusal say what
+/// the reaper does.
 pub fn provider_supported(pod: &Pod, runpod_v2: bool) -> bool {
-    match pod.provider.as_str() {
-        "runpod" => runpod_v2,
-        "hetzner" => true,
-        _ => false,
-    }
+    let backend = match Backend::named(&pod.provider) {
+        Some(Backend::Runpod) if !runpod_v2 => Some(Backend::RunpodV1),
+        b => b,
+    };
+    backend.is_some_and(|b| capability::support(b, Op::Reap).works())
 }
 
 /// Why a policy on `pod` can't act (RR2), for the ENDS column: a provider the reaper doesn't

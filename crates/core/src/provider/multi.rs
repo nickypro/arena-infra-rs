@@ -9,8 +9,9 @@
 //!   pods" — the proxy merge, which only drops a forward on a *successful* listing.
 //! - `create_pod` goes to the chosen primary (the `--provider` / `ARENA_PROVIDER`).
 //! - `stop` (and its outcome)/`restart`/`terminate`/`set_locked` route to whichever backend actually owns the
-//!   pod id, and so do `restart_wipes_container_disk`, `restart_resets_container`,
-//!   `lock_support` and `rename_support` (by the pod's provider tag, then the id cache).
+//!   pod id, and so do `restart_wipes_container_disk`, `restart_resets_container` and
+//!   `supports` — the capability table's answer for a pod (by the pod's provider tag, then the
+//!   id cache); `supports` without a pod is the primary's, like a create.
 //! - `check_create_extra`/`preview_create_body` are the primary's, like `create_pod`.
 //! - `enrich` hands each pod to the backend that listed it; a failing backend is reported
 //!   (as one error naming it) without costing the other backends' pods their details.
@@ -21,6 +22,7 @@
 use async_trait::async_trait;
 
 use crate::apiextra::Extra;
+use crate::capability::{self, Backend, Op, Support};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::pod::{Pod, PodSpec};
@@ -74,6 +76,18 @@ impl Provider for MultiProvider {
     }
     fn describe(&self, spec: &PodSpec) -> String {
         self.backends[self.primary].describe(spec)
+    }
+    /// The create target's (the primary): what a create would be made on.
+    fn backend(&self) -> Option<Backend> {
+        self.backends[self.primary].backend()
+    }
+    /// A pod's: its owner's answer ([`Self::owner_of`]); a pod no configured backend claims
+    /// can't be acted on ([`capability::UNKNOWN_BACKEND`]). A create's (`None`): the primary's.
+    fn supports(&self, op: Op, pod: Option<&Pod>) -> Support {
+        match pod {
+            None => self.backends[self.primary].supports(op, None),
+            Some(p) => self.owner_of(p).map_or(capability::UNKNOWN_BACKEND, |i| self.backends[i].supports(op, Some(p))),
+        }
     }
     async fn list_pods(&self) -> Result<Vec<Pod>> {
         // Built on the per-backend outcomes so there's one listing path (and one place the
@@ -190,18 +204,8 @@ impl Provider for MultiProvider {
         // gated as a wipe but never claimed.
         self.owner_of(pod).map_or(ContainerReset::Unknown, |i| self.backends[i].restart_resets_container(pod))
     }
-    fn stop_support(&self, pod: &Pod) -> Result<()> {
-        // The owner's answer; a pod no backend claims is the stop's own error later.
-        self.owner_of(pod).map_or(Ok(()), |i| self.backends[i].stop_support(pod))
-    }
     fn ready_deadline(&self, pod: &Pod) -> Option<std::time::Duration> {
         self.owner_of(pod).and_then(|i| self.backends[i].ready_deadline(pod))
-    }
-    fn lock_support(&self, pod: &Pod) -> Result<()> {
-        match self.owner_of(pod) {
-            Some(i) => self.backends[i].lock_support(pod),
-            None => Err(Error::NotImplemented(format!("no configured provider owns pod `{}` — can't lock it", pod.name))),
-        }
     }
     async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {
         self.backend_for(id).await?.set_locked(id, locked).await
@@ -225,12 +229,6 @@ impl Provider for MultiProvider {
     }
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
         self.backend_for(id).await?.rename_pod(id, new_name).await
-    }
-    fn rename_support(&self, pod: &Pod) -> Result<()> {
-        match self.owner_of(pod) {
-            Some(i) => self.backends[i].rename_support(pod),
-            None => Err(Error::NotImplemented(format!("no configured provider owns pod `{}` — can't rename it", pod.name))),
-        }
     }
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
         self.backend_for(id).await?.reimage_pod(id, image, env).await
@@ -321,6 +319,10 @@ mod tests {
     impl Provider for Fake {
         fn name(&self) -> &'static str {
             self.name
+        }
+        /// The capability table's column for its name (RunPod: v2).
+        fn backend(&self) -> Option<Backend> {
+            Backend::of(self.name, &Config::parse(""))
         }
         fn describe(&self, _spec: &PodSpec) -> String {
             String::new()
@@ -602,6 +604,9 @@ mod tests {
         fn name(&self) -> &'static str {
             "runpod"
         }
+        fn backend(&self) -> Option<Backend> {
+            Some(Backend::Runpod)
+        }
         fn describe(&self, _spec: &PodSpec) -> String {
             String::new()
         }
@@ -620,9 +625,6 @@ mod tests {
         async fn terminate_pod(&self, _id: &str) -> Result<()> {
             Ok(())
         }
-        fn lock_support(&self, _pod: &Pod) -> Result<()> {
-            Ok(())
-        }
         async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {
             self.seen.lock().unwrap().push((id.to_string(), locked));
             Ok(())
@@ -632,33 +634,34 @@ mod tests {
         }
     }
 
-    /// Lock questions and calls go to the pod's own backend; a backend that can't lock
-    /// (the default) says so, and a pod nobody owns is refused — never sent anywhere. The
-    /// create passthrough is the primary's, as the create is.
+    /// Capability questions about a pod go to its own backend (the table's column for it), and a
+    /// pod nobody owns can't be acted on; without a pod — a create's — the primary answers. Lock
+    /// calls go the same way: a backend without one fails with the table's own sentence, never
+    /// sent anywhere. The create passthrough is the primary's, as the create is.
     #[tokio::test]
-    async fn locks_route_to_the_owning_backend() {
+    async fn capability_and_lock_questions_go_to_the_owning_backend() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut m = multi(vec![Fake { name: "vast", pods: Some(vec![pod("v1", "arena8-bloom")]) }]);
         m.backends.push(Box::new(Locks { seen: seen.clone() }));
-        assert!(m.lock_support(&tagged_pod("r1", "runpod")).is_ok());
-        let e = m.lock_support(&tagged_pod("v1", "vast")).unwrap_err().to_string();
-        assert!(e.contains("not supported on vast") && e.contains("only RunPod pods can be locked (on RunPod REST v2, the default)"), "{e}");
-        assert!(m.lock_support(&tagged_pod("x1", "lambda")).unwrap_err().to_string().contains("no configured provider owns"));
+        assert_eq!(m.supports(Op::Lock, Some(&tagged_pod("r1", "runpod"))), Support::Yes);
+        let vast = capability::support(Backend::Vast, Op::Lock);
+        assert!(!vast.works());
+        assert_eq!(m.supports(Op::Lock, Some(&tagged_pod("v1", "vast"))), vast);
+        assert_eq!(m.supports(Op::Lock, Some(&tagged_pod("x1", "lambda"))), capability::UNKNOWN_BACKEND);
+        assert_eq!(m.supports(Op::Lock, None), vast, "a create's: the primary's");
+        assert_eq!(m.backend(), Some(Backend::Vast));
         m.set_locked("r1", true).await.unwrap();
         m.set_locked("r1", false).await.unwrap();
-        assert!(m.set_locked("v1", true).await.is_err(), "vast can't lock");
+        let e = m.set_locked("v1", true).await.unwrap_err().to_string();
+        assert_eq!(e, format!("not implemented: {}", vast.refusal().unwrap()));
         assert_eq!(*seen.lock().unwrap(), [("r1".to_string(), true), ("r1".to_string(), false)]);
-        // Rename questions go the same way: the owner's answer (a backend without a rename
-        // says so in `rename_pod`'s own words), and a pod nobody owns is refused.
-        let e = m.rename_support(&tagged_pod("v1", "vast")).unwrap_err().to_string();
-        assert_eq!(e, "not implemented: rename not supported on provider `vast`");
-        assert_eq!(m.rename_pod("v1", "arena8-apple").await.unwrap_err().to_string(), e);
-        assert!(m.rename_support(&tagged_pod("x1", "lambda")).unwrap_err().to_string().contains("no configured provider owns"));
         // The primary (vast, the default impl) refuses an extra; it's the primary's call.
         let extra: Extra = serde_json::from_str(r#"{"price": 0.1}"#).unwrap();
         assert!(m.check_create_extra(&extra).unwrap_err().to_string().contains("isn't supported on provider `vast`"));
         m.primary = 1;
         assert!(m.check_create_extra(&extra).is_ok());
+        assert_eq!(m.supports(Op::Lock, None), Support::Yes);
+        assert_eq!(m.backend(), Some(Backend::Runpod));
     }
 
     /// A backend recording which ids it terminated.

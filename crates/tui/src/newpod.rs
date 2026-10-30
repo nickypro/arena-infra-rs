@@ -27,6 +27,7 @@ use crossterm::event::KeyCode;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+use arena_core::capability::{self, Backend, Op};
 use arena_core::provider::hetzner::HetznerOpts;
 use arena_core::{naming, Config, Pod, PodSpec};
 
@@ -38,6 +39,9 @@ use crate::{centered_rect, runs, Mode, Shared, Ui};
 pub(crate) struct ProviderOpt {
     pub name: String,
     pub available: bool,
+    /// Its column of the capability table (RunPod's by `RUNPOD_API`): which of the form's
+    /// fields its create takes ([`NewPodForm::takes`]).
+    pub backend: Option<Backend>,
 }
 
 /// The editable fields of the add-pod form, in display order. Which apply depends on the
@@ -261,15 +265,26 @@ impl NewPodForm {
         self.provider_name() == "hetzner"
     }
 
-    /// The fields that apply to the current provider, in display order.
+    /// Whether the current provider's create takes `op`'s flag — the capability table's answer,
+    /// the one `up` refuses an ignored flag on, so the form never sends one.
+    pub(crate) fn takes(&self, op: Op) -> bool {
+        self.providers.get(self.provider_idx).and_then(|p| p.backend).is_none_or(|b| capability::support(b, op).works())
+    }
+
+    /// The fields that apply to the current provider, in display order: those whose flag its
+    /// create takes ([`Self::takes`]) — the tier where the form has the provider's tiers to offer
+    /// (RunPod's; Vast's host classes are `up --cloud`'s), GPUs per pod and the deep check (of a
+    /// GPU host) where it takes `--gpu`.
     pub(crate) fn fields(&self) -> Vec<NpField> {
         let mut f = vec![NpField::Provider];
-        if self.is_runpod() {
+        if self.cloud().is_some() {
             f.push(NpField::CloudType);
         }
         f.push(NpField::Kind);
-        if !self.is_hetzner() {
-            f.extend([NpField::GpuCount, NpField::Disk, NpField::Volume, NpField::Check]);
+        for (field, op) in [(NpField::GpuCount, Op::Gpu), (NpField::Disk, Op::Disk), (NpField::Volume, Op::Volume), (NpField::Check, Op::Gpu)] {
+            if self.takes(op) {
+                f.push(field);
+            }
         }
         f.extend([NpField::Retry, NpField::Pods]);
         f
@@ -291,7 +306,7 @@ impl NewPodForm {
 
     /// The RunPod tier(s) — `COMMUNITY`, `SECURE` or `COMMUNITY,SECURE`; `None` elsewhere.
     pub(crate) fn cloud(&self) -> Option<&str> {
-        self.is_runpod().then(|| CLOUDS[self.cloud_idx.min(CLOUDS.len() - 1)])
+        (self.is_runpod() && self.takes(Op::Cloud)).then(|| CLOUDS[self.cloud_idx.min(CLOUDS.len() - 1)])
     }
 
     /// Change the selected field's value by `delta` (−1 left / +1 right). `true`: the provider
@@ -383,21 +398,28 @@ impl NewPodForm {
 
     /// `arena pods up`'s arguments for this form (the provider goes in `--provider`, the
     /// runner's): `--add N` — `up` picks the names from its own whole-fleet listing — then the
-    /// type, and what the form shows for this provider: on Hetzner the server type alone; on a
-    /// GPU provider the GPU type, GPUs per pod, RunPod's tier(s), disk, volume and `--check`;
-    /// then `--retry-mins N` when it retries. `--yes`: the dashboard's confirm has asked. Pure.
+    /// type, and the fields the form shows for this provider ([`Self::fields`]: the flags its
+    /// create takes): on Hetzner the server type alone; on a GPU provider the GPU type, GPUs per
+    /// pod, RunPod's tier(s), disk and volume where it takes them, and `--check`; then
+    /// `--retry-mins N` when it retries. `--yes`: the dashboard's confirm has asked. Pure.
     pub(crate) fn up_args(&self) -> Vec<String> {
         let mut a: Vec<String> = vec!["pods".into(), "up".into(), "--add".into(), self.count.to_string()];
         let kind = self.kind().map(|k| k.id.clone()).unwrap_or_default();
-        if self.is_hetzner() {
+        let fields = self.fields();
+        if !fields.contains(&NpField::GpuCount) {
             a.extend(["--server-type".into(), kind]);
         } else {
             a.extend(["--gpu".into(), kind, "--gpus".into(), self.gpu_count.to_string()]);
             if let Some(c) = self.cloud() {
                 a.extend(["--cloud".into(), c.to_string()]);
             }
-            a.extend(["--disk".into(), self.disk_gb.to_string(), "--volume".into(), self.volume_gb.to_string()]);
-            if self.check {
+            if fields.contains(&NpField::Disk) {
+                a.extend(["--disk".into(), self.disk_gb.to_string()]);
+            }
+            if fields.contains(&NpField::Volume) {
+                a.extend(["--volume".into(), self.volume_gb.to_string()]);
+            }
+            if self.check && fields.contains(&NpField::Check) {
                 a.push("--check".into());
             }
         }
@@ -454,7 +476,7 @@ pub(crate) fn build_form(cfg: &Config, launch_provider: &str, existing: &[Pod], 
     };
     let providers: Vec<ProviderOpt> = ["runpod", "vast", "hetzner", "shadeform"]
         .iter()
-        .map(|p| ProviderOpt { name: p.to_string(), available: cfg.get(key_for(p)).is_some_and(|v| !v.is_empty()) })
+        .map(|p| ProviderOpt { name: p.to_string(), available: cfg.get(key_for(p)).is_some_and(|v| !v.is_empty()), backend: Backend::of(p, cfg) })
         .collect();
     let provider_idx = providers
         .iter()
@@ -815,9 +837,10 @@ mod tests {
     fn form() -> NewPodForm {
         let mut f = NewPodForm {
             providers: vec![
-                ProviderOpt { name: "runpod".into(), available: true },
-                ProviderOpt { name: "vast".into(), available: false },
-                ProviderOpt { name: "hetzner".into(), available: true },
+                ProviderOpt { name: "runpod".into(), available: true, backend: Some(Backend::Runpod) },
+                ProviderOpt { name: "vast".into(), available: false, backend: Some(Backend::Vast) },
+                ProviderOpt { name: "hetzner".into(), available: true, backend: Some(Backend::Hetzner) },
+                ProviderOpt { name: "shadeform".into(), available: false, backend: Some(Backend::Shadeform) },
             ],
             provider_idx: 0,
             cloud_idx: 0,
@@ -860,6 +883,43 @@ mod tests {
         assert_eq!(f.provider_name(), "hetzner");
         assert_eq!(f.fields(), [Provider, Kind, Retry, Pods], "a CPU VM: its server type, no GPU count, cloud, disk or check");
         assert_eq!(f.cloud(), None);
+        // From the capability table: Vast takes no volume (and the form offers RunPod's tiers
+        // only); Shadeform neither a tier, a disk nor a volume.
+        f.providers[1].available = true;
+        f.providers[3].available = true;
+        f.change(-1);
+        assert_eq!(f.provider_name(), "vast");
+        assert_eq!(f.fields(), [Provider, Kind, GpuCount, Disk, Check, Retry, Pods]);
+        f.change(1);
+        f.change(1);
+        assert_eq!(f.provider_name(), "shadeform");
+        assert_eq!(f.fields(), [Provider, Kind, GpuCount, Check, Retry, Pods]);
+        // On RunPod v1, as on v2.
+        f.providers[0].backend = Some(Backend::RunpodV1);
+        f.change(1);
+        assert_eq!(f.provider_name(), "runpod");
+        assert_eq!(f.fields(), [Provider, CloudType, Kind, GpuCount, Disk, Volume, Check, Retry, Pods]);
+    }
+
+    /// Whatever the form sends, the create target takes: no flag `up` would refuse as ignored
+    /// (the capability table — the same answer `up` checks it against), on every provider.
+    #[test]
+    fn the_form_never_sends_a_flag_its_provider_ignores() {
+        let flags = [("--cloud", Op::Cloud), ("--disk", Op::Disk), ("--volume", Op::Volume), ("--gpu", Op::Gpu), ("--gpus", Op::Gpu), ("--server-type", Op::ServerType), ("--image", Op::Image), ("--bootstrap", Op::Bootstrap), ("--max-price", Op::MaxPrice)];
+        let mut f = form();
+        for p in f.providers.iter_mut() {
+            p.available = true;
+        }
+        for i in 0..f.providers.len() {
+            f.provider_idx = i;
+            f.check = true;
+            let b = f.providers[i].backend.unwrap();
+            for a in f.up_args() {
+                if let Some((flag, op)) = flags.iter().find(|(flag, _)| *flag == a) {
+                    assert!(capability::support(b, *op).works(), "{b:?}: the form sends {flag}, which it ignores");
+                }
+            }
+        }
     }
 
     /// On Hetzner the type field is the server type: its choices are the server types (the
@@ -892,7 +952,8 @@ mod tests {
     }
 
     /// The form's choices as `up`'s flags — on Hetzner the server type alone; on RunPod every
-    /// GPU field, the tier(s) and `--check` when on; on Vast no tier; always `--add` and `--yes`.
+    /// GPU field, the tier(s) and `--check` when on; on Vast no tier and no volume; always `--add`
+    /// and `--yes`.
     #[test]
     fn the_form_maps_to_ups_flags() {
         let mut f = form();
@@ -918,10 +979,8 @@ mod tests {
         f.change(-1);
         assert_eq!(f.provider_name(), "vast");
         f.set_kinds(preset_kinds("vast", &defaults()), Source::Presets("x".into()));
-        assert_eq!(
-            f.up_args(),
-            ["pods", "up", "--add", "2", "--gpu", "NVIDIA RTX A4000", "--gpus", "2", "--disk", "100", "--volume", "100", "--check", "--yes"]
-        );
+        // No `--volume`: Vast's create takes none (it was sent, and dropped).
+        assert_eq!(f.up_args(), ["pods", "up", "--add", "2", "--gpu", "NVIDIA RTX A4000", "--gpus", "2", "--disk", "100", "--check", "--yes"]);
     }
 
     /// The human (2026-10-30): "for create pod on tui, can u have an auto-retry option?" The

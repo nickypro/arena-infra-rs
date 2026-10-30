@@ -606,7 +606,7 @@ impl Shared<'_, '_> {
         let started = Instant::now();
         let ready = self.run.provider.ready_deadline(&pod);
         let mut deadline = started + ready.map_or(self.run.timeout, |r| r.min(self.run.timeout));
-        let fail_on_expiry = ready.is_some() || self.run.provider.stop_support(&pod).is_err();
+        let fail_on_expiry = ready.is_some() || !self.run.provider.supports(arena_core::capability::Op::Stop, Some(&pod)).works();
         // Why such a backend's pod is a failed placement at its deadline.
         let expired = || {
             let bound = match ready {
@@ -2203,11 +2203,12 @@ mod tests {
         fn ready_deadline(&self, _pod: &Pod) -> Option<Duration> {
             self.ready
         }
-        fn lock_support(&self, _pod: &Pod) -> CoreResult<()> {
-            if self.lockable {
-                Ok(())
-            } else {
-                Err(Error::NotImplemented("no lock".into()))
+        fn supports(&self, op: arena_core::capability::Op, _pod: Option<&Pod>) -> arena_core::capability::Support {
+            match op {
+                arena_core::capability::Op::Lock if !self.lockable => {
+                    arena_core::capability::Support::No { why: "no lock", instead: arena_core::capability::NOTHING_INSTEAD }
+                }
+                _ => arena_core::capability::Support::Yes,
             }
         }
         async fn set_locked(&self, id: &str, locked: bool) -> CoreResult<()> {

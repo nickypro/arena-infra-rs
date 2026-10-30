@@ -41,6 +41,12 @@ impl Provider for RecordingProvider<'_> {
     fn describe(&self, spec: &PodSpec) -> String {
         self.inner.describe(spec)
     }
+    fn backend(&self) -> Option<arena_core::capability::Backend> {
+        self.inner.backend()
+    }
+    fn supports(&self, op: arena_core::capability::Op, pod: Option<&arena_core::Pod>) -> arena_core::capability::Support {
+        self.inner.supports(op, pod)
+    }
     async fn list_pods(&self) -> arena_core::Result<Vec<arena_core::Pod>> {
         self.inner.list_pods().await
     }
@@ -73,9 +79,6 @@ impl Provider for RecordingProvider<'_> {
     async fn start_pod(&self, id: &str) -> arena_core::Result<()> {
         self.inner.start_pod(id).await
     }
-    fn stop_support(&self, pod: &arena_core::Pod) -> arena_core::Result<()> {
-        self.inner.stop_support(pod)
-    }
     fn ready_deadline(&self, pod: &arena_core::Pod) -> Option<Duration> {
         self.inner.ready_deadline(pod)
     }
@@ -93,9 +96,6 @@ impl Provider for RecordingProvider<'_> {
     }
     async fn authorize_ssh_keys(&self, pod: &arena_core::Pod, keys: &[String]) -> arena_core::Result<()> {
         self.inner.authorize_ssh_keys(pod, keys).await
-    }
-    fn lock_support(&self, pod: &arena_core::Pod) -> arena_core::Result<()> {
-        self.inner.lock_support(pod)
     }
     async fn set_locked(&self, id: &str, locked: bool) -> arena_core::Result<()> {
         self.inner.set_locked(id, locked).await
@@ -147,23 +147,43 @@ pub(crate) async fn hand_keys_over(tracking: &spend::SpendCtx, cfg: &Config, own
     Ok(done.csv_changed)
 }
 
-/// Warn (on a GPU provider) when pods would be created with no persistent volume —
-/// container disk is wiped on restart, so uncommitted work would be lost.
+/// Warn when pods would be created with no persistent volume where a restart or a stop may wipe
+/// the container disk — uncommitted work would be lost. Where the provider takes no volume (the
+/// capability table), it says so rather than suggest VOLUME_GB; a VM that keeps its disk
+/// (Hetzner) needs no warning.
 pub(crate) fn warn_no_volume(provider: &dyn Provider, spec: &PodSpec) {
-    if provider.name() == "shadeform" {
-        // No volumes there (VOLUME_GB > 0 is refused at create), and no stop: say both.
+    use arena_core::capability::Op;
+    let target = arena_core::Pod { provider: provider.name().to_string(), ..Default::default() };
+    let volumes = provider.supports(Op::Volume, None).works();
+    if !volumes && !provider.supports(Op::Stop, None).works() {
+        // No volumes there, and no stop (Shadeform): say both.
         eprintln!(
-            "⚠ Shadeform: no persistent volume and no stop — work survives only through backups \
-             (`arena pods backup`), and each VM bills until it's terminated."
+            "⚠ {}: no persistent volume and no stop — work survives only through backups \
+             (`arena pods backup`), and each VM bills until it's terminated.",
+            provider_label(provider)
         );
         return;
     }
-    if spec.volume_gb == 0 && provider.name() != "hetzner" {
+    if !provider.restart_wipes_container_disk(&target) {
+        return;
+    }
+    if !volumes {
+        eprintln!(
+            "⚠ {}: no persistent volume — a restart or a stop may wipe the container disk; work survives \
+             only through backups (`arena pods backup`).",
+            provider_label(provider)
+        );
+    } else if spec.volume_gb == 0 {
         eprintln!(
             "⚠ no persistent volume (VOLUME_GB=0): work is lost when a pod restarts. \
              Set VOLUME_GB to keep it."
         );
     }
+}
+
+/// The create target's name as the capability table writes it (`Shadeform`, `Vast`).
+fn provider_label(provider: &dyn Provider) -> String {
+    provider.backend().map_or_else(|| provider.name().to_string(), |b| b.label().to_string())
 }
 
 /// Compute the next free machine names for `count` pods, warning if fewer are
@@ -429,24 +449,19 @@ pub(crate) async fn pin_vm_image(provider: &str, cfg: &Config, spec: &mut PodSpe
 /// configured type) — the refusal points at `--server-type`; anywhere else `--server-type` would
 /// be. Returns the server type to create with (`None`: the configured one).
 pub(crate) fn sizing_flags(provider: &str, gpu: Option<&str>, gpus: Option<u32>, server_type: Option<String>) -> Result<Option<String>> {
-    let hetzner = provider == "hetzner";
-    if hetzner {
-        let given = [gpu.map(|_| "--gpu"), gpus.map(|_| "--gpus")].into_iter().flatten().collect::<Vec<_>>();
-        if !given.is_empty() {
-            anyhow::bail!(
-                "{} doesn't apply to hetzner, which creates CPU VMs sized by server type — pass --server-type \
-                 (e.g. cx23, cpx42; `arena api get hetzner server_types` lists them) or set HETZNER_SERVER_TYPE",
-                given.join(" / ")
-            );
-        }
-    }
+    use arena_core::capability::{self, Backend, Op, Support};
+    let given: Vec<(&str, Op)> = [
+        gpu.map(|_| ("--gpu", Op::Gpu)),
+        gpus.map(|_| ("--gpus", Op::Gpu)),
+        server_type.as_ref().map(|_| ("--server-type", Op::ServerType)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    // The table's answer for the provider by name (GPU sizing is the same on both RunPod APIs).
+    let support = |op| Backend::named(provider).map_or(Support::Yes, |b| capability::support(b, op));
+    crate::pods::capable::ignored_flags(provider, &given, support)?;
     let Some(t) = server_type else { return Ok(None) };
-    if !hetzner {
-        anyhow::bail!(
-            "--server-type is for Hetzner VMs only; these pods would be created on {provider} — pass --provider hetzner, \
-             or size a GPU pod with --gpu / --gpus"
-        );
-    }
     let t = t.trim();
     if t.is_empty() || t.len() > 32 || !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         anyhow::bail!("--server-type takes a Hetzner server type name like cx23 or cpx42");

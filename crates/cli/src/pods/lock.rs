@@ -4,19 +4,11 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use arena_core::capability::Op;
 use arena_core::provider::Provider;
 
 use crate::confirm;
 use crate::pods::selection::Selected;
-
-/// Why a pod can't be locked (or renamed), in the backend's own words (without the `not
-/// implemented:` prefix its error type prints).
-pub(crate) fn lock_why(e: arena_core::Error) -> String {
-    match e {
-        arena_core::Error::NotImplemented(why) => why,
-        other => other.to_string(),
-    }
-}
 
 /// Appended to a replace/cutover refused over a lock: the replacement isn't locked by itself.
 /// (Worded for all three: `replace --keep-old` and `migrate cutover` leave the terminate to
@@ -88,7 +80,7 @@ pub(crate) fn lock_settles(mut lock: std::fs::File) -> Option<arena_core::pull::
 pub(crate) async fn handle_lock(provider: &dyn Provider, sel: &Selected, lock: bool, dry_run: bool, yes: bool) -> Result<()> {
     use arena_core::lock;
     let (verb, done) = if lock { ("lock", "locked") } else { ("unlock", "unlocked") };
-    let plan = lock::plan(&sel.pods, lock, |p| provider.lock_support(p).map_err(lock_why));
+    let plan = lock::plan(&sel.pods, lock, |p| provider.supports(Op::Lock, Some(p)).check());
     for p in &plan.already {
         println!("= {} already {done}", p.name);
     }

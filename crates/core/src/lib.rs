@@ -14,6 +14,7 @@ pub mod attest;
 pub mod backup;
 pub mod balance;
 pub(crate) mod base64;
+pub mod capability;
 pub mod config;
 pub mod cron;
 pub mod disk;

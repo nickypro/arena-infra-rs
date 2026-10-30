@@ -358,6 +358,14 @@ pub(crate) fn status_error(status: StatusCode, text: &str, ctx: &str) -> Error {
     }
 }
 
+/// A client whose every request — whatever its URL — goes to a closed local port: a test's
+/// backend that can never reach a real API, even if a guard in front of it regresses.
+#[cfg(test)]
+pub(crate) fn offline_client() -> reqwest::Client {
+    let proxy = reqwest::Proxy::all("http://127.0.0.1:9").expect("a valid proxy URL");
+    reqwest::Client::builder().no_proxy().proxy(proxy).build().expect("an offline client")
+}
+
 /// A tiny one-shot HTTP server on 127.0.0.1 for tests: answers each connection with the next
 /// canned response, so a backend's real request/response path (status-first reading) runs
 /// end to end without leaving the machine. std-only (a thread + `TcpListener`) — no extra

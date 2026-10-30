@@ -70,6 +70,7 @@ use arena_core::openrouter::{CohortUsage, KeyUsage, OpenRouter, UsageView};
 use arena_core::fleet;
 use arena_core::health::{deep_check_command, judge_deep_call, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT};
 use arena_core::metrics::{self, PodMetrics, ProbeOpts};
+use arena_core::capability::Op;
 use arena_core::provider::{ContainerReset, Provider};
 use arena_core::proxy::Listing;
 use arena_core::remote::{describe_error, Remote, SshRemote};
@@ -252,6 +253,11 @@ struct Shared {
     /// (`Provider::restart_resets_container`, pure), set with the rows each refresh — what the
     /// action menus' restart label says ([`Shared::restart_reset`]).
     resets: HashMap<String, ContainerReset>,
+    /// What each row's provider can't do of the menus' operations, by [`mark_key`]: why and what
+    /// to do instead — the capability table's answer (`Provider::supports`, pure), set with the
+    /// rows each refresh ([`backend_refusals`]): what the action menus grey out
+    /// ([`Shared::refusal`]).
+    refusals: HashMap<String, Vec<(Op, String)>>,
     /// A `?` question out (`asking claude about …`, for the footer); `None` when none is.
     ask_running: Option<String>,
     /// When it was asked: the footer's seconds while it's out.
@@ -276,6 +282,13 @@ impl Shared {
     /// backends' answers (`state::worst_reset`); a pod not answered for yet is `Unknown`.
     fn restart_reset<'a>(&self, pods: impl IntoIterator<Item = &'a Pod>) -> ContainerReset {
         state::worst_reset(pods.into_iter().map(|p| self.resets.get(&mark_key(p)).copied().unwrap_or(ContainerReset::Unknown)))
+    }
+
+    /// Why `pod`'s provider can't do `op` (and what instead), as of the last refresh; `None`: it
+    /// can, or the pod wasn't answered for yet — the pick then asks the provider itself
+    /// ([`choose_pod_action`]).
+    fn refusal(&self, pod: &Pod, op: Op) -> Option<&str> {
+        self.refusals.get(&mark_key(pod))?.iter().find(|(o, _)| *o == op).map(|(_, why)| why.as_str())
     }
 
     fn notify(&mut self, text: impl Into<String>, error: bool) {
@@ -866,6 +879,7 @@ async fn refresh(
         s.balance = v;
     }
     s.resets = backend_resets(provider, &display);
+    s.refusals = backend_refusals(provider, &display);
     s.publish(snap);
     s.last_refresh = Some(Instant::now());
     s.refreshing = false;
@@ -955,6 +969,16 @@ fn count_label(n: usize) -> String {
 /// answer (`Provider::restart_resets_container` — pure, no request), for the menus' restart label.
 fn backend_resets(provider: &dyn Provider, pods: &[Pod]) -> HashMap<String, ContainerReset> {
     pods.iter().map(|p| (mark_key(p), provider.restart_resets_container(p))).collect()
+}
+
+/// What each of `pods`' providers can't do of the menus' operations ([`Action::op`]), by
+/// [`mark_key`]: the capability table's refusal (`Provider::supports` — pure, no request), for the
+/// menus to grey those rows out with why.
+fn backend_refusals(provider: &dyn Provider, pods: &[Pod]) -> HashMap<String, Vec<(Op, String)>> {
+    let ops: Vec<Op> = Action::MENU.iter().filter_map(|(_, a)| a.op()).collect();
+    pods.iter()
+        .map(|p| (mark_key(p), ops.iter().filter_map(|&op| provider.supports(op, Some(p)).refusal().map(|why| (op, why))).collect()))
+        .collect()
 }
 
 /// The provider's best-effort details query, bounded by [`ENRICH_TIMEOUT`]. `Some(why)`
@@ -2054,7 +2078,7 @@ async fn execute_fleet(
 /// helpers: only a pod that bills ([`arena_core::status::is_billing`]: running or starting —
 /// an allow-list, so a state nobody knows never gets a pod stopped) is stopped; the rest are
 /// said and left alone. A billing pod whose backend has no stop at all
-/// ([`Provider::stop_support`] — Shadeform: it bills until it's deleted) is skipped and named,
+/// ([`Provider::supports`] — Shadeform: it bills until it's deleted) is skipped and named,
 /// and the others still stop (review SF3: one overflow VM must not veto the rest). A locked
 /// pod is refused by [`execute`], as for one pod.
 struct StopPlan {
@@ -2071,23 +2095,13 @@ fn stop_plan(provider: &dyn Provider, pods: Vec<Pod>) -> StopPlan {
     for p in pods {
         if !arena_core::status::is_billing(&p.status) {
             plan.idle.push(p);
-        } else if let Err(e) = provider.stop_support(&p) {
-            let why = no_stop_why(e);
+        } else if let Some(why) = provider.supports(Op::Stop, Some(&p)).refusal() {
             plan.no_stop.push((p, why));
         } else {
             plan.stop.push(p);
         }
     }
     plan
-}
-
-/// A [`Provider::stop_support`] (or [`Provider::rename_support`]) refusal in the operator's
-/// words (the backend's own sentence).
-fn no_stop_why(e: arena_core::Error) -> String {
-    match e {
-        arena_core::Error::NotImplemented(m) => m,
-        other => other.to_string(),
-    }
 }
 
 impl StopPlan {
@@ -2128,11 +2142,11 @@ impl StopPlan {
 }
 
 /// A menu pick for the cursor pod: run/set-branch collect an argument first; everything
-/// else goes through a confirm modal. Shared by the arrow-Enter and letter-key paths. A stop
-/// of a pod whose backend has no stop (Shadeform) is refused here, before the confirm — as
-/// `pods stop` refuses it alone: the confirm's "keeps no data" warning would only mislead.
-/// So is a rename of a pod whose backend can't rename ([`Provider::rename_support`], the
-/// answer `pods rename` refuses it on), before a new name is asked for.
+/// else goes through a confirm modal. Shared by the arrow-Enter and letter-key paths. An action
+/// the pod's provider can't do — the capability table's answer (`Provider::supports`), the one
+/// the CLI refuses on, and why the menu greys the row out — is refused here, before a confirm or
+/// a new name is asked for: a stop of a Shadeform pod (no stop: the confirm's "keeps no data"
+/// warning would only mislead), say.
 fn choose_pod_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Provider>, action: Action) {
     let Some(pod) = selected_pod(shared, ui.selected) else {
         ui.mode = Mode::List;
@@ -2142,13 +2156,8 @@ fn choose_pod_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dy
     if action.ai_key() {
         return aikey::choose(shared, ui, pod, shown, action);
     }
-    let support = match action {
-        Action::Stop => provider.stop_support(&pod).map_err(|e| ("stop", e)),
-        Action::Rename => provider.rename_support(&pod).map_err(|e| ("rename", e)),
-        _ => Ok(()),
-    };
-    if let Err((verb, e)) = support {
-        ui.mode = Mode::Result(format!("✗ can't {verb} {} — {}", pod.name, no_stop_why(e)));
+    if let Some(why) = action.op().and_then(|op| provider.supports(op, Some(&pod)).refusal()) {
+        ui.mode = Mode::Result(format!("✗ can't {} {} — {why}", action.label(), pod.name));
         return;
     }
     match action {
@@ -2201,7 +2210,22 @@ fn choose_fleet_action(
         Action::Run | Action::SetBranch => {
             ui.mode = Mode::Input { action, scope: InputScope::Set(scope), value: String::new() };
         }
-        _ => ui.mode = Mode::FleetConfirm { action, typed: String::new(), scope, note: String::new() },
+        _ => {
+            // A restart or terminate of a set with a pod its provider can't do it for (none can't
+            // today) is refused whole, naming each — as the CLI refuses it.
+            let cant: Vec<String> = match action.op() {
+                Some(op) => scope_pods(shared, &ui.marked, scope)
+                    .iter()
+                    .filter_map(|p| provider.supports(op, Some(p)).refusal().map(|why| format!("{} — {why}", p.name)))
+                    .collect(),
+                None => Vec::new(),
+            };
+            ui.mode = if cant.is_empty() {
+                Mode::FleetConfirm { action, typed: String::new(), scope, note: String::new() }
+            } else {
+                Mode::Result(format!("✗ can't {}:\n{}", action.label(), cant.join("\n")))
+            };
+        }
     }
 }
 
@@ -4162,11 +4186,13 @@ fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 /// key + description; destructive ones in red), and a key hint. `sel` is the cursor; `restart`
 /// what a restart does to the disk of the pod(s) the menu is for (its label).
 /// `ai_off`: why the AI key's rows can't act now (`aikey::pod_rows`) — they're greyed, with it.
-fn render_action_menu(f: &mut Frame, title: String, actions: &[(char, Action)], sel: usize, restart: ContainerReset, ai_off: Option<&str>) {
+/// An action menu: one row per action, `off[i]` (when set) greying row `i` out with why — what
+/// it can't do there (the capability table's answer, [`menu_offs`]; the AI key's).
+fn render_action_menu(f: &mut Frame, title: String, actions: &[(char, Action)], sel: usize, restart: ContainerReset, off: &[Option<String>]) {
     let mut lines: Vec<Line> = vec![Line::from(title), Line::from("")];
     for (i, (k, a)) in actions.iter().enumerate() {
         let selected = i == sel;
-        let off = ai_off.filter(|_| a.ai_key());
+        let off = off.get(i).and_then(|o| o.as_deref());
         let base = if off.is_some() {
             Style::default().fg(Color::DarkGray)
         } else if a.is_risky() {
@@ -4202,7 +4228,29 @@ fn render_menu(f: &mut Frame, shared: &Shared, ui: &Ui, sel: usize) {
     let pod = shared.pods.get(ui.selected);
     let name = pod.map(|p| ui.shown_name(&p.name)).unwrap_or_else(|| "?".into());
     let (rows, ai_off) = aikey::pod_rows(shared, ui, pod);
-    render_action_menu(f, format!("Actions for {name}:"), &rows, sel, shared.restart_reset(pod), ai_off.as_deref());
+    let off = menu_offs(shared, &rows, pod.into_iter().collect(), ai_off);
+    render_action_menu(f, format!("Actions for {name}:"), &rows, sel, shared.restart_reset(pod), &off);
+}
+
+/// Why each of `rows` can't act on `pods` (`None`: it can): an AI key row, `ai_off`; an
+/// operation's ([`Action::op`]), the capability table's refusal when NONE of the pods' providers
+/// can do it (a set of some that can and some that can't is the pick's to sort: a stop skips
+/// and names them, a restart or terminate refuses). Pure.
+fn menu_offs(shared: &Shared, rows: &[(char, Action)], pods: Vec<&Pod>, ai_off: Option<String>) -> Vec<Option<String>> {
+    rows.iter()
+        .map(|(_, a)| {
+            if a.ai_key() {
+                return ai_off.clone();
+            }
+            let op = a.op()?;
+            let whys: Vec<Option<&str>> = pods.iter().map(|p| shared.refusal(p, op)).collect();
+            if whys.is_empty() || whys.iter().any(Option::is_none) {
+                None
+            } else {
+                whys[0].map(String::from)
+            }
+        })
+        .collect()
 }
 
 /// The single-pod confirm. What is about to happen — a plain summary of the action on the pod,
@@ -4355,8 +4403,10 @@ const CONFIRM_NAMES_MAX: usize = 10;
 fn render_fleet_menu(f: &mut Frame, shared: &Shared, ui: &Ui, scope: Scope, sel: usize) {
     let (_, who) = scope_label(shared, &ui.marked, scope);
     let actions = Action::fleet_menu(scope == Scope::Marked, ui.ai_keys);
-    let ai_off = aikey::set_why(shared, &scope_pods_of(shared, ui, scope));
-    render_action_menu(f, format!("Actions — {who}:"), &actions, sel, shared.restart_reset(scope_pods_of(shared, ui, scope)), ai_off.as_deref());
+    let pods = scope_pods_of(shared, ui, scope);
+    let ai_off = aikey::set_why(shared, &pods);
+    let off = menu_offs(shared, &actions, pods.clone(), ai_off);
+    render_action_menu(f, format!("Actions — {who}:"), &actions, sel, shared.restart_reset(pods), &off);
 }
 
 /// The listed pods `scope` covers, render-side (as [`scope_names`]).
@@ -7078,14 +7128,15 @@ deep_check_end=1
     }
 
     /// A multi-pod stop sorts its pods as `pods stop` does, through the core helpers
-    /// (`status::is_billing`, and `Provider::stop_support` — here the real fleet's, where
-    /// Shadeform says it has no stop): a billing pod with no stop is skipped and named, a pod
-    /// not running is left alone, the rest are stopped; a selection of only no-stop pods is
-    /// refused, as `pods stop` refuses it — and one pod's stop of such a pod is refused before
-    /// its confirm. The marked-set menu has stop; the whole fleet's doesn't.
+    /// (`status::is_billing`, and `Provider::supports` — here the real fleet's, where the
+    /// capability table says Shadeform has no stop): a billing pod with no stop is skipped and
+    /// named, a pod not running is left alone, the rest are stopped; a selection of only no-stop
+    /// pods is refused, as `pods stop` refuses it — and one pod's stop of such a pod is refused
+    /// before its confirm, its menu row greyed out with why. The marked-set menu has stop; the
+    /// whole fleet's doesn't.
     #[test]
     fn a_marked_stop_skips_what_it_cannot_stop_and_refuses_it_alone() {
-        use arena_core::provider::shadeform::NO_STOP;
+        let no_stop = arena_core::capability::support(arena_core::capability::Backend::Shadeform, Op::Stop).refusal().unwrap();
         let fleet: Arc<dyn Provider> =
             Arc::from(arena_core::provider::build_fleet("runpod", &Config::parse("RUNPOD_API_KEY=r\nSHADEFORM_API_KEY=k"), false).unwrap());
         let alpha = pod("alpha", "runpod", "rp1", 1, Some(22001));
@@ -7099,12 +7150,12 @@ deep_check_end=1
             plan.skip_lines(),
             [
                 "⊘ devtest-delta — skipped: not running or starting (EXITED)".to_string(),
-                format!("⊘ devtest-mayor — skipped, still billing: {NO_STOP}"),
+                format!("⊘ devtest-mayor — skipped, still billing: {no_stop}"),
             ]
         );
         assert!(plan.still_billing().unwrap().starts_with("✗ 1 pod(s) still billing — their provider has no stop: devtest-mayor"));
         let alone = stop_plan(fleet.as_ref(), vec![mayor.clone(), delta.clone()]);
-        assert_eq!(alone.refusal().unwrap(), format!("✗ can't stop devtest-mayor — {NO_STOP}"));
+        assert_eq!(alone.refusal().unwrap(), format!("✗ can't stop devtest-mayor — {no_stop}"));
         assert!(stop_plan(fleet.as_ref(), vec![delta.clone()]).refusal().unwrap().starts_with("⊘ nothing to stop"));
 
         // Through the menu picks, as the key loop calls them.
@@ -7130,6 +7181,23 @@ deep_check_end=1
         ui.selected = row("rp1");
         choose_pod_action(&shared, &mut ui, &fleet, Action::Stop);
         assert!(matches!(&ui.mode, Mode::Confirm(c) if c.action == Action::Stop), "{:?}", ui.mode);
+        // The Shadeform pod's menu greys out stop and start, saying why; the RunPod pod's doesn't
+        // — from the refresh's answers, the table's.
+        shared.lock().unwrap().refusals = backend_refusals(fleet.as_ref(), &[alpha.clone(), mayor.clone(), delta.clone()]);
+        (ui.selected, ui.mode) = (row("sf1"), Mode::Menu { sel: 0 });
+        let menu = draw(160, 50, &shared.lock().unwrap(), &ui).join("\n");
+        assert!(menu.contains("[s] stop       (Shadeform has no stop: an instance bills") && menu.contains("[u] start      (Shadeform has no stop"), "{menu}");
+        assert!(menu.contains("[t] terminate  terminate — irreversible"), "{menu}");
+        (ui.selected, ui.mode) = (row("rp1"), Mode::Menu { sel: 0 });
+        let menu = draw(160, 50, &shared.lock().unwrap(), &ui).join("\n");
+        assert!(menu.contains("[s] stop       stop the pod") && menu.contains("[u] start      start a stopped pod"), "{menu}");
+        // A marked set with a pod that can stop: offered; only the Shadeform pod: greyed.
+        ui.marked = [&alpha, &mayor].iter().map(|p| mark_key(p)).collect();
+        ui.mode = Mode::FleetMenu { scope: Scope::Marked, sel: 0 };
+        assert!(draw(160, 50, &shared.lock().unwrap(), &ui).join("\n").contains("[s] stop       stop the pod"));
+        ui.marked = [mark_key(&mayor)].into();
+        assert!(draw(160, 50, &shared.lock().unwrap(), &ui).join("\n").contains("[s] stop       (Shadeform has no stop"));
+        ui.marked = [&alpha, &mayor, &delta].iter().map(|p| mark_key(p)).collect();
         // The menus.
         ui.mode = Mode::FleetMenu { scope: Scope::Marked, sel: 0 };
         assert!(draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("[s] stop"));
@@ -7161,7 +7229,7 @@ deep_check_end=1
         (ui.selected, ui.mode) = (row("sf1"), Mode::List);
         choose_pod_action(&shared, &mut ui, &fleet, Action::Rename);
         assert!(
-            matches!(&ui.mode, Mode::Result(r) if r.starts_with("✗ can't rename devtest-mayor — no configured provider owns pod `devtest-mayor`")),
+            matches!(&ui.mode, Mode::Result(r) if r.starts_with("✗ can't rename devtest-mayor — no configured provider owns this pod")),
             "{:?}",
             ui.mode
         );
@@ -7198,10 +7266,10 @@ deep_check_end=1
             async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
                 unimplemented!()
             }
-            fn stop_support(&self, pod: &Pod) -> arena_core::Result<()> {
-                match pod.provider.as_str() {
-                    "shadeform" => Err(arena_core::Error::NotImplemented("Shadeform has no stop (fake)".into())),
-                    _ => Ok(()),
+            fn supports(&self, op: Op, pod: Option<&Pod>) -> arena_core::capability::Support {
+                match (op, pod.map(|p| p.provider.as_str())) {
+                    (Op::Stop, Some("shadeform")) => arena_core::capability::Support::No { why: "Shadeform has no stop (fake)", instead: "terminate it" },
+                    _ => arena_core::capability::Support::Yes,
                 }
             }
         }
@@ -7215,7 +7283,7 @@ deep_check_end=1
         assert_eq!(
             out,
             "stop — 2/2 ok\n✓ stopped devtest-alpha\n✓ stopped devtest-bravo\n⊘ devtest-delta — skipped: not running or starting (EXITED)\n\
-             ⊘ devtest-mayor — skipped, still billing: Shadeform has no stop (fake)\n\
+             ⊘ devtest-mayor — skipped, still billing: Shadeform has no stop (fake) — terminate it\n\
              ✗ 1 pod(s) still billing — their provider has no stop: devtest-mayor (back up, then `arena pods terminate`)"
         );
         let mut stopped = stops.0.lock().unwrap().clone();

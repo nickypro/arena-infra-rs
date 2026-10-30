@@ -78,14 +78,12 @@ impl Provider for FakeProvider {
     fn restart_wipes_container_disk(&self, pod: &Pod) -> bool {
         pod.provider != "hetzner" // as the fleet provider routes it
     }
-    // REVIEW sf SF3: as the fleet routes it — a Shadeform pod has no stop (no pod in the
-    // existing fixtures is on Shadeform, so their tests are unchanged).
-    fn stop_support(&self, pod: &Pod) -> Result<()> {
-        if pod.provider == "shadeform" {
-            Err(arena_core::Error::NotImplemented(arena_core::provider::shadeform::NO_STOP.into()))
-        } else {
-            Ok(())
-        }
+    // REVIEW sf SF3: as the fleet routes it — the capability table's answer for the pod's
+    // provider (a Shadeform pod has no stop; no pod in the existing fixtures is on Shadeform, so
+    // their tests are unchanged).
+    fn supports(&self, op: arena_core::capability::Op, pod: Option<&Pod>) -> arena_core::capability::Support {
+        use arena_core::capability::{support, Backend, Support};
+        pod.and_then(|p| Backend::named(&p.provider)).map_or(Support::Yes, |b| support(b, op))
     }
 }
 
@@ -352,7 +350,7 @@ async fn reimage_reimages_exactly_the_selected_pods() {
     ));
     let cases: &[(&[&str], &[&str])] = &[
         (&["reimage", "bloom", "zebra", "--skip-proxy", "--wipe-ok", "--no-setup"], &["bloom", "zebra"]),
-        (&["reimage", "--all", "--exclude", "apple..cloud", "--skip-proxy", "--wipe-ok", "--no-setup"], &["vm", "zebra"]),
+        (&["reimage", "--all", "--exclude", "apple..cloud,vm", "--skip-proxy", "--wipe-ok", "--no-setup"], &["zebra"]),
         (&["reimage", "apple..bloom", "--dry-run", "--no-setup"], &[]),
     ];
     for (argv, reimaged) in cases {
@@ -367,6 +365,19 @@ async fn reimage_reimages_exactly_the_selected_pods() {
     for argv in [&["reimage"][..], &["reimage", "--gpus", "1"], &["reimage", "appel"]] {
         let f = fleet();
         assert!(handle_pods(pods_cmd(argv), &f, Arc::new(FakeRemote::new()), &cfg, true).await.is_err(), "{argv:?}");
+        assert!(f.calls().is_empty(), "{argv:?}");
+    }
+    // A selection with a pod its provider can't reimage (the Hetzner VM) is refused whole —
+    // dry run or not, before the wipe gate, the confirm or any provider call — naming it, why,
+    // what instead, and how to leave it out.
+    for argv in [
+        &["reimage", "--all", "--exclude", "apple..cloud", "--skip-proxy", "--wipe-ok", "--no-setup"][..],
+        &["reimage", "vm", "zebra", "--dry-run"],
+    ] {
+        let f = fleet();
+        let e = handle_pods(pods_cmd(argv), &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap_err().to_string();
+        assert!(e.starts_with("refusing to reimage anything — 1 of the 2 pod(s) can't be:\n  arena8-vm (hetzner): arena can't reimage a Hetzner VM"), "{argv:?}: {e}");
+        assert!(e.contains("`arena pods up <name>`") && e.ends_with("leave these out: --exclude arena8-vm)"), "{argv:?}: {e}");
         assert!(f.calls().is_empty(), "{argv:?}");
     }
     let _ = std::fs::remove_dir_all(&dir);
