@@ -473,12 +473,18 @@ the next one with the same name.
   recommended ones. A location that can't be timed goes after the timed ones, by price.
 - No room anywhere is a capacity error that names each location tried, so `--keep-trying` waits.
 - Any other refusal (token, quota, throttle, SSH key) stops at once.
-- The project's own limit — Hetzner's 403 `resource_limit_exceeded`, e.g. `shared core limit
-  exceeded` — reads as that, not as a bad token: `Hetzner refused: the project's resource limit is
-  reached (…) — use a smaller type, free a server, or ask Hetzner to raise the limit`. `create`/`up`
-  keep what they made and stop there (the names after it would hit the same limit); it isn't waited
-  out (`--keep-trying` waits on capacity only); with several `--gpu`/`--cloud` options only that
-  option is skipped.
+- The account's limit — Hetzner's 403 `resource_limit_exceeded`, e.g. `shared core limit
+  exceeded` or `Primary IP limit exceeded` — reads as that, not as a bad token: `Hetzner refused:
+  the account's resource limit is reached (…; limit: primary_ip_limit) — delete a primary IP
+  nothing needs (…), or ask Hetzner to raise the limit (Hetzner Console: Limits tab → Request
+  change → Limit increase)`. What it suggests follows the limit Hetzner names: a smaller type or a
+  server for cores, a server for the number of servers, a primary or floating IP, a volume, a
+  snapshot. A limit counts
+  every project of the Hetzner account, so a project with no server can still hit it (live
+  2026-10-30). `create`/`up` keep what they made and stop there (the names after it would hit the
+  same limit); it isn't waited out (`--keep-trying` waits on capacity only); with several
+  `--gpu`/`--cloud` options only that option is skipped. Hetzner's 403 `maintenance` says to try
+  later. Only a 401 or a 403 `forbidden` reads as "authentication failed".
 - One location (`nbg1`) pins creates there, with no lookup. A list (`nbg1,fsn1`) is tried in its
   order, and `nbg1,any` tries nbg1, then the rest.
 - An `--api-json` `datacenter` is one create where it says.
@@ -2365,7 +2371,8 @@ failure): one row per filesystem arena writes to — `LOCAL_BACKUP_DIR` (and `LO
 copy onto it is then skipped), each with arena's biggest dirs there; then what arena left on the box,
 with size, age, what made it and the commands to look at and remove it ([Room on this
 box](BACKUPS.md#room-on-this-box-control_min_free_gb)). The report's own row shows the floor (`· copies
-leave free here 5 GB (default)`; a bad value is ✗).
+leave free here 5 GB (default)`; a bad value is ✗: pulls, backup copies and replace/migrate are
+refused until it's fixed).
 
 `config check` makes no request but one: with `HETZNER_IMAGE=arena` it looks up which snapshot that
 resolves to for `HETZNER_SERVER_TYPE` (read-only, bounded at 30 s), with a ⚠ when it's over 14 days

@@ -6217,7 +6217,8 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
         }
     }
     // What every copy onto this box leaves free on its disk (a bad value fails every pull and
-    // copy up front). How full the disk is now comes after the report (`disk::check_rows`).
+    // copy up front, and refuses replace/migrate before they create anything). How full the disk
+    // is now comes after the report (`disk::check_rows`).
     match arena_core::disk::floor_bytes(cfg) {
         Ok(b) => println!(
             "  · copies leave free here     {}{} (CONTROL_MIN_FREE_GB) — pulls, backup copies, replace/migrate staging, the reaper",
@@ -6229,7 +6230,7 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
             }
         ),
         Err(e) => {
-            println!("  ✗ copies leave free here     {e}");
+            println!("  ✗ copies leave free here     {e} — pulls, backup copies and replace/migrate are refused until it's fixed");
             note_invalid_text(&mut missing, &e);
         }
     }
@@ -12526,9 +12527,14 @@ async fn migrate_copy_on(
     if let (Some(r), false) = (&reaping, dry_run) {
         anyhow::bail!("{r}");
     }
+    // Nor with a floor the copy can't read (it'd fail only after the new pod is made and set up).
+    let bad_floor = disk::floor_refusal(cfg, "migrate");
+    if let (Some(r), false) = (&bad_floor, dry_run) {
+        anyhow::bail!("{r}");
+    }
 
     if dry_run {
-        for r in [&stopped, &reaping].into_iter().flatten() {
+        for r in [&stopped, &reaping, &bad_floor].into_iter().flatten() {
             print_would_refuse(r);
         }
         println!("migrate copy {canonical} (dry-run):");
@@ -12715,6 +12721,11 @@ async fn migrate_cutover_on(
     if let (Some(r), false) = (&reaping, dry_run) {
         anyhow::bail!("{r}");
     }
+    // Nor, with a final sync, with a floor its copy can't read.
+    let bad_floor = if no_final_sync { None } else { disk::floor_refusal(cfg, "cut over") };
+    if let (Some(r), false) = (&bad_floor, dry_run) {
+        anyhow::bail!("{r}");
+    }
     let write_only = if skip_proxy { None } else { write_only_proxy(cfg) };
     let sync_line = if no_final_sync {
         format!(
@@ -12734,7 +12745,7 @@ async fn migrate_cutover_on(
     };
 
     if dry_run {
-        for r in [&locked, &reaping].into_iter().flatten() {
+        for r in [&locked, &reaping, &bad_floor].into_iter().flatten() {
             print_would_refuse(r);
         }
         println!("migrate cutover {canonical} (dry-run):");
@@ -13209,6 +13220,12 @@ async fn replace_on(
     if let (Some(r), false) = (&reaping, dry_run) {
         anyhow::bail!("{r}");
     }
+    // Nor with a floor the copy can't read (it'd fail only after the new pod is made and set up,
+    // leaving it billing).
+    let bad_floor = disk::floor_refusal(cfg, "replace");
+    if let (Some(r), false) = (&bad_floor, dry_run) {
+        anyhow::bail!("{r}");
+    }
 
     let rep = plan_replacement(cfg, owner, &src, job.ov, job.place).await?;
 
@@ -13247,7 +13264,7 @@ async fn replace_on(
     }
 
     if dry_run {
-        for r in [&locked, &stopped, &reaping].into_iter().flatten() {
+        for r in [&locked, &stopped, &reaping, &bad_floor].into_iter().flatten() {
             println!();
             print_would_refuse(r);
         }
@@ -13880,7 +13897,8 @@ async fn copy_pod_files(
     let remote_key = cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string();
     let user = cfg.get("SSH_USER").unwrap_or("root").to_string();
     // What the via-local staging must leave free on this box (CONTROL_MIN_FREE_GB): a bad value
-    // fails here, before anything is created or copied.
+    // fails here, before anything is copied — and replace/migrate refuse it before they create
+    // anything (`disk::floor_refusal`): found only here, it left the new pod billing.
     let floor = disk::floor(cfg)?;
     // The repo's place in the home, carried as a TREE: on a pod with a volume it is a link
     // onto /workspace (setup put it there), and a plain home copy would carry only the link —
@@ -14016,6 +14034,22 @@ async fn copy_pod_files(
             println!("      copied (direct pod-to-pod)");
             return Ok(());
         }
+        // Refused for room: recorded for the health check, said with how much to free where,
+        // arena's biggest dirs there, and another filesystem to stage on (`need`: its size, 0
+        // before it is sized).
+        let refuse = |skip: &arena_core::disk::Skip, floor, need| {
+            disk::note_skips(cfg, "replace/migrate staging", &[(dest_pod.name.clone(), skip.to_string())]);
+            anyhow::anyhow!("not copying via local staging ({}): {}", opts.stage_root.display(), disk::staging_advice(cfg, skip, need, floor))
+        };
+        // Already under the floor: no copy fits, whatever its size — said before it is sized (an
+        // rsync dry run over the whole home, for nothing) or anything is made.
+        if let Some(floor) = floor {
+            if let Some(fs) = arena_core::disk::reading(&opts.stage_root).ok().filter(|fs| fs.free < floor.bytes) {
+                if let Err(skip) = arena_core::disk::judge(&fs, 0, &arena_core::disk::Size::Measured(0).into(), floor) {
+                    return Err(refuse(&skip, floor, 0));
+                }
+            }
+        }
         // pull source -> staging (fresh source), then push staging -> dest (FRESH dest, right
         // before the push — this is the endpoint most likely to have gone stale during the pull).
         let stage = staging_dir(&opts.stage_root, src_id);
@@ -14103,11 +14137,7 @@ async fn copy_pod_files(
                     let copy = [(dest_pod.name.clone(), vec![(opts.stage_root.clone(), arena_core::disk::Size::Measured(needed))])];
                     let (skipped, hold) = disk::judge_copies(cfg, floor, &copy, true);
                     if let Some((_, skip)) = skipped.first() {
-                        disk::note_skips(cfg, "replace/migrate staging", &[(dest_pod.name.clone(), skip.to_string())]);
-                        anyhow::bail!(
-                            "not copying via local staging ({}): {skip}, or point TMPDIR at a bigger disk",
-                            opts.stage_root.display()
-                        );
+                        return Err(refuse(skip, floor, needed));
                     }
                     hold
                 }
@@ -14132,7 +14162,13 @@ async fn copy_pod_files(
             if let Err(skip) = &pulled {
                 disk::note_skips(cfg, "replace/migrate staging", &[(dest_pod.name.clone(), skip.to_string())]);
             }
-            pulled.map_err(|skip| anyhow::anyhow!("pull source -> staging ({}): {skip}", opts.stage_root.display()))??;
+            pulled.map_err(|skip| {
+                let advice = match floor {
+                    Some(floor) => disk::staging_advice(cfg, &skip, needed, floor),
+                    None => skip.to_string(),
+                };
+                anyhow::anyhow!("pull source -> staging ({}): {advice}", opts.stage_root.display())
+            })??;
             let dest_target = fresh_target(provider, dest_id, cfg).await?;
             let staged_repo = rel.as_ref().is_some_and(|r| std::fs::symlink_metadata(stage.join(r)).is_ok_and(|m| m.is_dir()));
             let leg = CopyLeg::start(POD_COPY_TIMEOUT);
@@ -19747,7 +19783,9 @@ ASK_CODEX_MODEL=-x
             ("CONTROL_MIN_FREE_GB=0\n", format!("  · copies leave free here     0 GB{tail}")),
             (
                 "CONTROL_MIN_FREE_GB=lots\n",
-                "  ✗ copies leave free here     CONTROL_MIN_FREE_GB must be a whole number of GB, 0..=100000 (got `lots`)".to_string(),
+                "  ✗ copies leave free here     CONTROL_MIN_FREE_GB must be a whole number of GB, 0..=100000 (got `lots`) — pulls, \
+                 backup copies and replace/migrate are refused until it's fixed"
+                    .to_string(),
             ),
         ] {
             let (report, missing) = config_report(&Config::parse(&format!("{base}{extra}")), "runpod");
@@ -24626,7 +24664,9 @@ mod remote_tests {
             for pod in pods {
                 assert!(
                     said.iter().any(|l| l.starts_with(&format!("✗ {pod}: skipped: only "))
-                        && l.contains("(floor 100000 GB, CONTROL_MIN_FREE_GB) — nothing copied; free space on ")),
+                        && l.contains("(floor 100000 GB, CONTROL_MIN_FREE_GB): this copy (~6 GB, a first copy, not measured) + the floor = 100006 GB needed")
+                        && l.contains(" — nothing copied; free at least ")
+                        && l.ends_with(" (`arena config check` names arena's biggest dirs there)")),
                     "{pod}: {said:?}"
                 );
             }
@@ -27362,9 +27402,34 @@ mod remote_tests {
         let e = copy_pod_files(&judged, &f, &fake, src, dest, &opts(stub("huge", "999.00P", 0))).await.unwrap_err();
         let msg = format!("{e:#}");
         assert!(msg.contains(&format!("not copying via local staging ({}): skipped: ", root.display())), "{msg}");
-        assert!(msg.contains("GB, measured) would leave less than the floor (0 GB, CONTROL_MIN_FREE_GB)"), "{msg}");
-        assert!(msg.ends_with("names arena's biggest dirs there), or point TMPDIR at a bigger disk"), "{msg}");
+        assert!(msg.contains("GB, measured) would leave less than the floor (0 GB, CONTROL_MIN_FREE_GB) — nothing copied; free at least "), "{msg}");
+        // How much to free and where, what's there (arena's biggest dirs, if any), and another
+        // filesystem to stage on: none has room for ~999 PB.
+        let room = |msg: &str| msg.contains("(arena's biggest dirs there: ") || msg.contains("(`arena config check` names arena's biggest dirs there)");
+        assert!(room(&msg), "{msg}");
+        let anywhere = "; or stage it on another filesystem for this run: `TMPDIR=<a dir on a disk with room> arena …`";
+        assert!(msg.ends_with(anywhere), "{msg}");
         assert!(!stage.exists(), "nothing staged, nothing left behind");
+        // A box already under the floor: refused before the home is sized (an rsync dry run over
+        // all of it, for nothing) or anything is made — saying how far below the floor it is.
+        let fake = fake_for("10.0.0.2:22002");
+        let full = Config::parse(&format!("{}CONTROL_MIN_FREE_GB=100000\n", cfg_text()));
+        let ran = root.join("rsync-ran");
+        let never = root.join("never");
+        arena_core::remote::write_test_script(&never, format!("#!/bin/sh\ntouch {}\nexit 1\n", ran.display())).unwrap();
+        let e = copy_pod_files(&full, &f, &fake, src, dest, &opts(never.display().to_string())).await.unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("skipped: only ") && msg.contains("(floor 100000 GB, CONTROL_MIN_FREE_GB) — nothing copied; free at least "), "{msg}");
+        assert!(room(&msg) && msg.ends_with(anywhere), "{msg}");
+        assert!(!ran.exists(), "no rsync at all: nothing sized");
+        assert!(!stage.exists());
+        // A floor that can't be read fails the copy before anything is asked or copied (replace
+        // and migrate refuse it before they create anything: `disk::floor_refusal`).
+        let bad = Config::parse(&format!("{}CONTROL_MIN_FREE_GB=2.5\n", cfg_text()));
+        let fake = fake_for("10.0.0.2:22002");
+        let e = copy_pod_files(&bad, &f, &fake, src, dest, &opts(stub("bad", "1,000", 0))).await.unwrap_err();
+        assert!(format!("{e:#}").contains("CONTROL_MIN_FREE_GB must be a whole number of GB"), "{e:#}");
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
         // A stage another run holds (a second replace/migrate of the same pod): refused, and that
         // run's stage left exactly as it is.
         std::fs::create_dir_all(&stage).unwrap();
@@ -30758,6 +30823,66 @@ mod lifecycle_tests {
         f.server_locked.lock().unwrap().clear();
         migrate_finish_on(&FakeRemote::new(), &f, &cfg, &f, "devtest-bravo", &unlisted, FinishOpts { dry_run: false, yes: true, ..Default::default() }).await.unwrap();
         assert_eq!(f.calls(), ["terminate r-bravo-old"]);
+    }
+
+    /// disk-nits (review #42): a `CONTROL_MIN_FREE_GB` the via-local copy can't read refuses
+    /// replace, migrate copy and a cutover's final sync before anything is created or asked —
+    /// found only at the copy, it left the new pod built, set up and billing. Its dry runs say
+    /// they would be refused; a cutover without a final sync copies nothing, so it doesn't care.
+    #[tokio::test]
+    async fn replace_and_migrate_refuse_a_bad_floor_before_creating_anything() {
+        let dir = tmpdir("bad-floor");
+        let cfg = Config::parse(&format!("{}GPU_TYPE=\"NVIDIA RTX A4000\"\nCONTROL_MIN_FREE_GB=2.5\n", cfg_text(&dir.0)));
+        let timeouts = || arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
+        let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
+        let want = |what: &str| {
+            format!(
+                "CONTROL_MIN_FREE_GB must be a whole number of GB, 0..=100000 (got `2.5`) — not starting the {what}: its copy via \
+                 local staging needs it (fix it, or unset it for the default)"
+            )
+        };
+        for dry_run in [false, true] {
+            // Fleet::create_pod panics: reaching a create fails the test.
+            let f = locked_fleet();
+            let id = f.pods.lock().unwrap().iter().find(|p| p.name == "devtest-bravo").unwrap().id.clone();
+            let opts = ReplaceOpts { keep_old: false, skip_proxy: true, dry_run, yes: true };
+            let job = ReplaceJob { setup_timeouts: timeouts(), ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None };
+            take_would_refuse();
+            let r = replace_on(Arc::new(FakeRemote::new()), &f, &cfg, &f, id, "devtest-bravo".into(), job).await;
+            if dry_run {
+                r.unwrap();
+                assert_eq!(take_would_refuse(), [format!("(without --dry-run: {})", want("replace"))]);
+            } else {
+                assert_eq!(r.unwrap_err().to_string(), want("replace"));
+            }
+            assert!(f.calls().is_empty(), "dry run {dry_run}: {:?}", f.calls());
+
+            let pods = f.pods.lock().unwrap().clone();
+            let job = MigrateCopyJob { setup_timeouts: timeouts(), ov: &ov, place: &place, dry_run, yes: true, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None };
+            let r = migrate_copy_on(Arc::new(FakeRemote::new()), &cfg, &f, "devtest-bravo", &pods, job).await;
+            if dry_run {
+                r.unwrap();
+                assert_eq!(take_would_refuse(), [format!("(without --dry-run: {})", want("migrate"))]);
+            } else {
+                assert_eq!(r.unwrap_err().to_string(), want("migrate"));
+            }
+            assert!(f.calls().is_empty(), "dry run {dry_run}: {:?}", f.calls());
+        }
+        // A cutover's final sync: refused alike; without one, nothing to copy — not refused.
+        let f = locked_fleet();
+        f.pods.lock().unwrap().push(pod("r-bravo-new", "devtest-bravo-new", "runpod", Some(("10.0.0.2", 22001))));
+        let pods = f.pods.lock().unwrap().clone();
+        let cutover = |no_final_sync, dry_run| CutoverOpts { skip_proxy: true, no_final_sync, dry_run, yes: true };
+        let e = migrate_cutover_on(Arc::new(FakeRemote::new()), &f, &cfg, &f, "devtest-bravo", &pods, cutover(false, false), "/nonexistent")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, want("cut over"));
+        migrate_cutover_on(Arc::new(FakeRemote::new()), &f, &cfg, &f, "devtest-bravo", &pods, cutover(false, true), "/nonexistent").await.unwrap();
+        assert_eq!(take_would_refuse(), [format!("(without --dry-run: {})", want("cut over"))]);
+        migrate_cutover_on(Arc::new(FakeRemote::new()), &f, &cfg, &f, "devtest-bravo", &pods, cutover(true, true), "/nonexistent").await.unwrap();
+        assert!(take_would_refuse().is_empty(), "no final sync: no copy, no floor needed");
+        assert!(f.calls().is_empty(), "{:?}", f.calls());
     }
 
     /// A pod locked since it was listed (or on a backend whose listing doesn't say): the
