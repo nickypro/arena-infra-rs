@@ -25,6 +25,35 @@ earlier).
   (which can take a while when a provider is slow or rate-limiting) still let one more round
   create pods.
 
+## 2026-10-30 · `up` replaces a pod that never gets an SSH endpoint; Hetzner's project limit says so
+- `pods up` no longer leaves a pod that never gets an SSH endpoint running and billing (seen on
+  prod: a RUNNING 4090 with no public IP or ports, `FAILED endpoint: no SSH endpoint after 600s —
+  left running`, then terminated and recreated by hand). With or without `--check` it is now a
+  failed placement: `up` says which machine and data centre it was on, terminates it, and recreates
+  the same name with the same options (others first), up to `--check-attempts` placements (default
+  2; the flag now works without `--check` too). The last one is terminated too; the name then FAILs
+  saying nothing of it is left billing. Nothing is terminated on an old look: its provider is asked
+  once more first.
+- When: a pod up without an endpoint for `--endpoint-timeout` minutes (new, default 5) — on RunPod,
+  its container running behind RunPod's SSH proxy only (a host with no public IP; before, only
+  `--check` replaced these); it always gets the whole `--endpoint-timeout`, past `--timeout` if
+  need be. And a RunPod pod still listed RUNNING with no container when a `--timeout` of 10
+  minutes or more (the default) ends — its image never started (prod's case above). RunPod lists a
+  pod RUNNING from the create while its image pulls, so the pull doesn't count: healthy pulls took
+  1½–7 minutes live, and a `--timeout` under 10 minutes still leaves such a pod running.
+- A pod still coming up when `--timeout` ends otherwise (Vast `loading`, Hetzner `initializing`, a
+  RunPod pod under a short `--timeout`) is left running as before, but the reason now says it's
+  billing and how to stop it.
+- A Hetzner create refused over the project's limit (403 `resource_limit_exceeded`, e.g. "shared
+  core limit exceeded") said "authentication failed creating …". It now says `Hetzner refused: the
+  project's resource limit is reached (…) — use a smaller type, free a server, or ask Hetzner to
+  raise the limit`, keeps what was made and stops there; it's never waited out, and with several
+  options only that one is skipped.
+
+### Config
+- `ENDPOINT_TIMEOUT_MINS` (new, optional, default 5): the minutes `pods up --endpoint-timeout`
+  takes when the flag isn't given; whole minutes, 1 to 120. `config check` shows it.
+
 ## 2026-10-30 · A more compact dashboard, an info panel, retry in the add-pod form; `B300 MIG`
 - The dashboard's top is one short line: pods, GPUs and their util, unreachable pods, the burn
   (`$14.80/h + €0.048/h`), balances with their runway, AI spent today and the credit left.
