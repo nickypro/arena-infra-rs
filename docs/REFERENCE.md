@@ -1176,8 +1176,8 @@ options, the ones that haven't failed first; the last one is terminated too, and
   An endpoint after all goes on with the pipeline; a pod that isn't up any more (restarting), or
   can't be read just then, is waited for again, its clock started over by the listings after
   that look, to the same `--timeout`.
-- **A RunPod pod with no container when `--timeout` ends** (default 600 s), 10 minutes or more
-  after its create, never started its image — prod's case above: a failed placement, terminated
+- **A RunPod pod with no container when `--timeout` ends** — a `--timeout` of 10 minutes or more,
+  as the default 600 s — never started its image, prod's case above: a failed placement, terminated
   and its name recreated the same way (`[lightning] still listed RUNNING with no container 10m00s
   after its create (its image never started) — before it came up: a failed placement`). RunPod
   can't tell a pull that will never finish from a slow one; healthy pulls took 1½–7 minutes live.

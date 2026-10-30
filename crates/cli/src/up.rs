@@ -80,10 +80,10 @@ use super::{
 /// seconds of its container starting.
 pub(crate) const NO_PUBLIC_IP_GRACE: Duration = Duration::from_secs(pipeline::DEFAULT_ENDPOINT_TIMEOUT_MINS * 60);
 
-/// How long after its create a RunPod pod may be listed RUNNING with no container ([`no_container`])
-/// before `up` calls it a failed placement at `--timeout` — terminated and its name recreated, not
-/// left billing. RunPod lists a pod RUNNING from its create while its image is pulled, and can't
-/// tell a pull that will never finish from a slow one; live, healthy pulls took 1½ to 6⅔ minutes
+/// The shortest `--timeout` at whose end a RunPod pod still listed RUNNING with no container
+/// ([`no_container`]) is a failed placement — terminated and its name recreated, not left billing.
+/// RunPod lists a pod RUNNING from its create while its image is pulled, and can't tell a pull
+/// that will never finish from a slow one; live, healthy pulls took 1½ to 6⅔ minutes
 /// (2026-10-28..30), and prod's arena9-lightning had none after the whole 600 s (2026-10-29). As
 /// `--timeout`'s default, so a shorter `--timeout` leaves such a pod running, as before.
 const NO_CONTAINER_LIMIT: Duration = Duration::from_secs(600);
@@ -634,7 +634,9 @@ impl Shared<'_, '_> {
                     // never started (prod 2026-10-29, ops feedback #1: arena9-lightning, `FAILED
                     // endpoint: no SSH endpoint after 600s — left running`, billing until it was
                     // terminated by hand; its re-run was READY in a minute). Healthy pulls took
-                    // 1½–7 minutes live. Anything else still coming up — Vast `loading`, Hetzner
+                    // 1½–7 minutes live. Judged on `--timeout` itself, not the time this look took:
+                    // a short one's slow last look never turns into a terminate (review r6).
+                    // Anything else still coming up — Vast `loading`, Hetzner
                     // `initializing`, a RunPod pod under a `--timeout` shorter than that limit, one
                     // that can't be read just now — is left running as before, and said to bill.
                     let secs = self.run.timeout.as_secs();
@@ -650,7 +652,7 @@ impl Shared<'_, '_> {
                             return self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason });
                         }
                         Some(Now::Reachable(found)) => break found,
-                        Some(Now::NotUp(p)) if no_container(&p) && started.elapsed() >= NO_CONTAINER_LIMIT => {
+                        Some(Now::NotUp(p)) if no_container(&p) && self.run.timeout >= NO_CONTAINER_LIMIT => {
                             let why = format!(
                                 "still listed RUNNING with no container {} after its create (its image never started)",
                                 pipeline::fmt_elapsed(started.elapsed())
@@ -3333,24 +3335,33 @@ mod tests {
 
     /// A `--timeout` shorter than [`NO_CONTAINER_LIMIT`] is no verdict on the image: a RunPod pod
     /// with no container yet then is left running, as before — the reason says it bills, and how
-    /// to stop it (review, codex r2: a healthy slow pull must not be killed by a short wait).
+    /// to stop it (review, codex r2: a healthy slow pull must not be killed by a short wait). Even
+    /// when the deadline's look itself takes it past 10 minutes (review r6: `--timeout 590`, a
+    /// 15 s listing).
     #[tokio::test(start_paused = true)]
     async fn a_runpod_pod_with_no_container_by_a_short_timeout_is_left_running_and_said_to_bill() {
-        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 100_000)])]);
         let cfg = cfg(None);
-        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
-        run.timeout = Duration::from_secs(300);
-        let made = make(&fleet, &["apple"]).await;
-        let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
-        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "nothing terminated");
-        match &rows[0].verdict {
-            Verdict::Failed { stage: Stage::Endpoint, reason } => assert_eq!(
-                reason,
-                "no SSH endpoint after 300s, still listed RUNNING (no container yet — its image may still be pulling) — left \
-                 running, still billing ($0.17/h): `arena proxy apply` once it has an endpoint, or `arena pods terminate \
-                 devtest-apple`"
-            ),
-            other => panic!("{other:?}"),
+        for (timeout, look) in [(300, 0), (590, 15)] {
+            let mut fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 100_000)])]);
+            fleet.sync_delay = Duration::from_secs(look);
+            let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
+            run.timeout = Duration::from_secs(timeout);
+            let made = make(&fleet, &["apple"]).await;
+            let started = Instant::now();
+            let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
+            assert!(started.elapsed() >= Duration::from_secs(timeout + look), "{timeout}: {:?}", started.elapsed());
+            assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "{timeout}: nothing terminated");
+            match &rows[0].verdict {
+                Verdict::Failed { stage: Stage::Endpoint, reason } => assert_eq!(
+                    reason,
+                    &format!(
+                        "no SSH endpoint after {timeout}s, still listed RUNNING (no container yet — its image may still be \
+                         pulling) — left running, still billing ($0.17/h): `arena proxy apply` once it has an endpoint, or \
+                         `arena pods terminate devtest-apple`"
+                    )
+                ),
+                other => panic!("{other:?}"),
+            }
         }
     }
 
