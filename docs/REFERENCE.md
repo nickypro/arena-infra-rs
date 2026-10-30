@@ -1730,8 +1730,9 @@ read once more in the request just before its change and refused if it moved, or
 past the new cap; OpenRouter has no conditional update, so that moment is all that's left.
 Afterwards each key is checked against what OpenRouter lists (a change it answered OK for but didn't
 make fails; caps compared exactly, not to the cent), and by name: a key still on under a paused
-machine's name is said, and a resumed key found beside a newer one under its name is turned off
-again (if it's still as the command left it) — each failing the command. Keys that can't be read
+machine's name is said, and a key a resume woke that sits beside a newer one under its name (made
+meanwhile, on or off) is turned off again if it's still as read, then read back to say what it is
+— each failing the command. Keys that can't be read
 back leave the changes `unverified`, and the command fails.
 
 `--json` prints `{action, dry_run, keys: [{machine, name, hash, before, after, result, error?,

@@ -103,6 +103,55 @@ pub(crate) async fn pause(a: PauseArgs, resume: bool, provider: &dyn Provider, c
     run(verb, a.sel.args(), &expect, a.dry_run, a.json, provider, cfg, api, dir, yes).await
 }
 
+/// A resume that woke a key with a newer one under its name — made while this ran: a rotation,
+/// the old key perhaps leaked — turns it off again (review codex r6 #2, r7 #1). Every key a resume
+/// was sent for (`attempted`: an answer that was an error may have landed, r8 #2) that the
+/// read-back (`keys`) shows on beside a newer key under its name — newer by when it was made,
+/// whether that one is on or off (r8 #1) — is turned off if it's still as read, and the keys are
+/// read once more to say what it is now (r8 #3). Its row fails either way.
+async fn reconcile_resumes(api: &dyn KeyApi, naming: &Naming<'_>, attempted: &[String], keys: &[KeyInfo], done: &mut [(Row, Outcome, Option<KeyInfo>)]) {
+    let newer_beside = |k: &KeyInfo, m: &str| {
+        let names = crate::machine_key_names(naming, m);
+        let under = |o: &KeyInfo| o.name.as_deref().is_some_and(|n| names.iter().any(|t| t == n));
+        k.created_at.as_ref().is_some_and(|at| keys.iter().any(|o| o.hash != k.hash && under(o) && o.created_at.as_ref().is_some_and(|oat| oat > at)))
+    };
+    let mut asked = Vec::new();
+    for (i, (r, _, _)) in done.iter().enumerate() {
+        let Some(now) = r.key.as_ref().filter(|k| attempted.contains(&k.hash)).and_then(|k| keys.iter().find(|n| n.hash == k.hash)) else { continue };
+        if now.disabled || !newer_beside(now, &r.machine) {
+            continue;
+        }
+        let was = or::Expected::of(now);
+        let check = move |n: &KeyInfo| if was.holds(n) { Ok(()) } else { Err(format!("changed since (now {})", state_words(n))) };
+        let off = KeyUpdate { disabled: Some(true), ..Default::default() };
+        asked.push((i, api.update_key(&now.hash, &off, Some(&check)).await.map_err(|e| e.to_string())));
+    }
+    if asked.is_empty() {
+        return;
+    }
+    let after = api.list_keys().await.map_err(|e| e.to_string());
+    for (i, answer) in asked {
+        let (r, outcome, now) = &mut done[i];
+        let m = r.machine.clone();
+        let hash = r.key.as_ref().map(|k| k.hash.clone()).unwrap_or_default();
+        let seen = after.as_ref().ok().and_then(|ks| ks.iter().find(|k| k.hash == hash).cloned());
+        let state = match (&answer, &after, &seen) {
+            (Err(e), _, _) => format!("this older one is on beside it, and turning it off again failed ({e}) — `arena keys pause {m}`"),
+            (Ok(()), Err(e), _) => format!("turning this older one off again was asked but not read back ({e}) — `arena keys list --all`"),
+            (Ok(()), Ok(_), Some(k)) if k.disabled => "this older one was turned off again".to_string(),
+            (Ok(()), Ok(_), _) => format!("turning this older one off again didn't take — `arena keys pause {m}`"),
+        };
+        let earlier = match outcome {
+            Outcome::Failed(e) => format!(" (its own change answered: {e})"),
+            _ => String::new(),
+        };
+        *outcome = Outcome::Failed(format!("a newer key under its name turned up while this ran{earlier}; {state}"));
+        if after.is_ok() {
+            *now = seen;
+        }
+    }
+}
+
 /// How old the keys a machine's plan is made again from may be ([`run`]): a listing serves the
 /// machines whose changes start within it, so a fleet-wide run re-reads every few machines, never
 /// once per machine nor once for all.
@@ -537,6 +586,8 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
     machines.dedup();
     let mut fresh: Option<(std::time::Instant, Vec<KeyInfo>)> = None;
     let mut done: Vec<(Row, Outcome, Option<KeyInfo>)> = Vec::new();
+    // The keys a change was sent for — answered OK or not (an error may have landed).
+    let mut attempted: Vec<String> = Vec::new();
     // A resume reads the keys right before each machine's: it can wake a rotated-out key, the one
     // a newer key under the name replaced (review codex r7 #1).
     let fresh_for = if verb == Verb::Resume { std::time::Duration::ZERO } else { FRESH_FOR };
@@ -553,10 +604,13 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
         for r in theirs {
             let outcome = match (&r.key, &r.update, &stale) {
                 (_, _, Some(why)) => Outcome::Failed(why.clone()),
-                (Some(k), Some(u), None) => match api.update_key(&k.hash, u, Some(&just_before(&verb, k))).await {
-                    Ok(()) => Outcome::Changed,
-                    Err(e) => Outcome::Failed(e.to_string()),
-                },
+                (Some(k), Some(u), None) => {
+                    attempted.push(k.hash.clone());
+                    match api.update_key(&k.hash, u, Some(&just_before(&verb, k))).await {
+                        Ok(()) => Outcome::Changed,
+                        Err(e) => Outcome::Failed(e.to_string()),
+                    }
+                }
                 _ => skipped(r),
             };
             done.push((r.clone(), outcome, None));
@@ -585,9 +639,9 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
         }
     }
     // What the keys say afterwards, of a name: after a pause no key under any named machine's name
-    // is on (review codex r5 #1, r6 #1: one added or resumed meanwhile), after a resume the key
-    // turned on is the one its name shows (r6 #2: a newer one turned up meanwhile, the old one is
-    // on again beside it). Anything else is said and fails the command.
+    // is on (review codex r5 #1, r6 #1: one added or resumed meanwhile), after a resume no key it
+    // woke sits beside a newer one ([`reconcile_resumes`]). Anything else is said and fails the
+    // command.
     if let Ok(keys) = &reread {
         let failed_hashes: Vec<String> = done.iter().filter(|(_, o, _)| matches!(o, Outcome::Failed(_))).filter_map(|(r, _, _)| r.key.as_ref().map(|k| k.hash.clone())).collect();
         let mut machines: Vec<&str> = rows.iter().map(|r| r.machine.as_str()).collect();
@@ -604,34 +658,13 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
                         extra.push((row(k), Outcome::Failed(why), Some((*k).clone())));
                     }
                 }
-                Verb::Resume => {
-                    // A key this woke that isn't the one its name shows — a newer one turned up — is
-                    // turned off again, if it's still as this left it (review codex r7 #1): a
-                    // rotated-out key, perhaps a leaked one, never stays on beside its replacement.
-                    let shown = or::shown_key(theirs.iter().copied()).map(|s| s.hash.clone());
-                    for (r, outcome, now) in done.iter_mut().filter(|(r, o, _)| r.machine == m && *o == Outcome::Changed) {
-                        let (Some(k), Some(u)) = (&r.key, &r.update) else { continue };
-                        if shown.as_ref().is_none_or(|s| *s == k.hash) {
-                            continue;
-                        }
-                        let left = applied(k, u);
-                        let off = KeyUpdate { disabled: Some(true), ..Default::default() };
-                        let was = or::Expected::of(&left);
-                        let check = move |n: &KeyInfo| if was.holds(n) { Ok(()) } else { Err(format!("changed since (now {})", state_words(n))) };
-                        let newer = "a newer key under its name turned up while this ran";
-                        *outcome = Outcome::Failed(match api.update_key(&k.hash, &off, Some(&check)).await {
-                            Ok(()) => {
-                                *now = Some(applied(&left, &off));
-                                format!("{newer}; this older one was turned off again")
-                            }
-                            Err(e) => format!("{newer}; this older one is on beside it and turning it off again failed ({e}) — `arena keys pause {m}`"),
-                        });
-                    }
-                }
-                Verb::Limit { .. } => {}
+                Verb::Resume | Verb::Limit { .. } => {}
             }
         }
         done.extend(extra);
+        if verb == Verb::Resume {
+            reconcile_resumes(api, &naming, &attempted, keys, &mut done).await;
+        }
     }
     let count = |f: fn(&Outcome) -> bool| done.iter().filter(|(_, o, _)| f(o)).count();
     let failed = count(|o| matches!(o, Outcome::Failed(_)));
@@ -729,6 +762,10 @@ mod tests {
         updates: Mutex<usize>,
         /// Listings (by number) that fail.
         failing_lists: Vec<usize>,
+        /// Updates (by number) answered OK without being made, and ones made then answered with
+        /// an error (a timeout after it landed).
+        ignored_updates: Vec<usize>,
+        landed_then_failed: Vec<usize>,
     }
 
     impl Keys {
@@ -796,8 +833,11 @@ mod tests {
             if self.broken.contains(&name.as_str()) {
                 return Err(arena_core::Error::provider("openrouter update key HTTP 500"));
             }
-            if !self.ignored.contains(&name.as_str()) {
+            if !self.ignored.contains(&name.as_str()) && !self.ignored_updates.contains(&n) {
                 *k = applied(k, u);
+            }
+            if self.landed_then_failed.contains(&n) {
+                return Err(arena_core::Error::provider("openrouter update key: timed out"));
             }
             Ok(())
         }
@@ -1002,10 +1042,27 @@ mod tests {
         assert_eq!(api.calls(), [r#"ha {"disabled":false}"#]);
         // Made after that read, before the change: the old key is woken, then found beside the newer
         // one and turned off again (r7 #1).
-        let api = Keys::with(keys).meanwhile(vec![(3, newer)], vec![]);
+        let api = Keys::with(keys.clone()).meanwhile(vec![(3, newer)], vec![]);
         assert_eq!(keys_cmd(&["resume", "alpha", "cloud"], &api).await.unwrap_err(), "1 key(s) failed");
         assert_eq!(api.calls(), [r#"ha {"disabled":false}"#, r#"hc {"disabled":false}"#, r#"hc {"disabled":true}"#]);
         assert!(api.key("hc").disabled && !api.key("hc-new").disabled);
+        // The newer key made off (r8 #1): found by when it was made, not by being on.
+        let off_newer: Meanwhile = ("hc-old", |k| {
+            k.hash = "hc-new".into();
+            k.created_at = Some("2026-10-31T10:00:00Z".into());
+        });
+        let api = Keys::with(keys.clone()).meanwhile(vec![(3, off_newer)], vec![]);
+        assert_eq!(keys_cmd(&["resume", "alpha", "cloud"], &api).await.unwrap_err(), "1 key(s) failed");
+        assert!(api.key("hc").disabled, "turned off again");
+        // A resume that landed but was answered with an error (r8 #2) is reconciled too.
+        let api = Keys { landed_then_failed: vec![2], ..Keys::with(keys.clone()).meanwhile(vec![(3, newer)], vec![]) };
+        assert_eq!(keys_cmd(&["resume", "alpha", "cloud"], &api).await.unwrap_err(), "1 key(s) failed");
+        assert!(api.key("hc").disabled, "turned off again");
+        // Turning it off again answered OK but not made (r8 #3): said as it is — still on.
+        let api = Keys { ignored_updates: vec![3], ..Keys::with(keys.clone()).meanwhile(vec![(3, newer)], vec![]) };
+        let e = keys_cmd(&["resume", "alpha", "cloud", "--json"], &api).await.unwrap_err();
+        assert_eq!(e, "1 key(s) failed");
+        assert!(!api.key("hc").disabled, "still on: said so, never 'turned off again'");
         // A machine with no key at the plan that has one by the change fails the command too
         // (r7 #2: a keyless row's failure wasn't counted).
         let api = Keys::with(fleet_keys()).meanwhile(vec![(1, ("hx", |k| k.name = Some("devtest-delta".into())))], vec![]);
@@ -1032,6 +1089,36 @@ mod tests {
         assert!(!waiting.is_finished(), "the second waits while the first holds it");
         drop(held);
         assert!(waiting.await.unwrap().unwrap());
+    }
+
+    /// The resume reconciliation's own words: turned off again, or — answered OK but not made —
+    /// said as still on, with what to run.
+    #[tokio::test]
+    async fn a_woken_key_beside_a_newer_one_is_turned_off_and_said_as_it_is() {
+        let cfg = cfg();
+        let naming = Naming::from_config(&cfg);
+        let old = KeyInfo { disabled: false, ..key("hc", "devtest-cloud", Some(5.0), 1.0, false, "2026-10-30T10:00:00Z") };
+        let newer = key("hn", "devtest-cloud", Some(5.0), 0.0, true, "2026-10-31T10:00:00Z");
+        let row = || Row { machine: "devtest-cloud".into(), key: Some(KeyInfo { disabled: true, ..old.clone() }), update: Some(KeyUpdate { disabled: Some(false), ..Default::default() }), words: "off → on".into(), skip: None, note: None };
+        for (ignored, says, off) in [(vec![], "this older one was turned off again", true), (vec![1], "turning this older one off again didn't take — `arena keys pause devtest-cloud`", false)] {
+            let api = Keys { ignored_updates: ignored, ..Keys::with(vec![old.clone(), newer.clone()]) };
+            let listed = api.list_keys().await.unwrap();
+            let mut done = vec![(row(), Outcome::Changed, None)];
+            reconcile_resumes(&api, &naming, &["hc".to_string()], &listed, &mut done).await;
+            let Outcome::Failed(why) = &done[0].1 else { panic!("{:?}", done[0].1) };
+            assert_eq!(why, &format!("a newer key under its name turned up while this ran; {says}"));
+            assert_eq!(done[0].2.as_ref().map(|k| k.disabled), Some(off), "as read back");
+        }
+        // Not one this tried to turn on, or no newer key beside it: left alone.
+        let api = Keys::with(vec![old.clone(), newer.clone()]);
+        let listed = api.list_keys().await.unwrap();
+        let mut done = vec![(row(), Outcome::Changed, None)];
+        reconcile_resumes(&api, &naming, &[], &listed, &mut done).await;
+        assert_eq!(done[0].1, Outcome::Changed);
+        let mut done = vec![(row(), Outcome::Changed, None)];
+        reconcile_resumes(&api, &naming, &["hc".to_string()], std::slice::from_ref(&old), &mut done).await;
+        assert_eq!(done[0].1, Outcome::Changed);
+        assert!(api.calls().is_empty());
     }
 
     /// What stops a machine's planned change, by the keys read again: a key gone or renamed away,
