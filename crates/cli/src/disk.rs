@@ -26,6 +26,53 @@ pub(crate) fn floor(cfg: &Config) -> Result<Option<Floor>> {
     core_disk::floor_bytes(cfg).map(|b| Some(Floor::control(b))).map_err(|e| anyhow::anyhow!(e))
 }
 
+/// replace/migrate's look at [`floor`] before they create anything: their copy via local staging
+/// needs it, and a bad value found only there — after the new pod was created and set up — left
+/// that pod billing (review #42). `Some(why)` when it's invalid; nothing to say otherwise.
+pub(crate) fn floor_refusal(cfg: &Config, what: &str) -> Option<String> {
+    floor(cfg).err().map(|e| format!("{e} — not starting the {what}: its copy via local staging needs it (fix it, or unset it for the default)"))
+}
+
+/// replace/migrate's via-local copy refused (or stopped) for room: the skip's words with arena's
+/// biggest dirs on that filesystem named — one bounded look, which a run's one refusal can
+/// afford (a backup's line per pod points at `config check` instead) — then another filesystem
+/// arena writes to (the backups' volume, …) with room for `need` above the floor, to point
+/// `TMPDIR` at for the run (`need` 0: not sized yet).
+pub(crate) fn staging_advice(cfg: &Config, skip: &Skip, need: u64, floor: Floor) -> String {
+    let Some(short) = &skip.short else { return staging_words(skip, None) };
+    let left = leftovers(cfg, arena_core::snapshot::unix_now()).leftovers;
+    let named = skip.clone().naming(&dir_sizes(&core_disk::biggest(&arena_dirs(cfg, &left), short.dev, 3)));
+    // Another filesystem with room: a dir on it to suggest, checked to be on it (a `/tmp` on
+    // its own tmpfs isn't `/`).
+    let other = places(cfg)
+        .into_iter()
+        .filter_map(|(_, p)| core_disk::reading(&p).ok())
+        .filter(|fs| fs.dev != short.dev && fs.free >= floor.bytes.saturating_add(need))
+        .max_by_key(|fs| fs.free)
+        .map(|fs| (fs.mount.join("arena-tmp"), fs))
+        .filter(|(dir, fs)| core_disk::reading(dir).is_ok_and(|at| at.dev == fs.dev));
+    staging_words(&named, other.as_ref().map(|(dir, fs)| (dir.as_path(), fs.free)))
+}
+
+/// [`staging_advice`]'s words (pure): the skip, then where else to stage — `other` (a dir, and
+/// what its filesystem has free) when one is known.
+fn staging_words(skip: &Skip, other: Option<(&Path, u64)>) -> String {
+    let elsewhere = match other {
+        Some((dir, free)) => format!(
+            "`TMPDIR={} arena …` ({} free there)",
+            arena_core::ssh::shell_word(&dir.to_string_lossy()),
+            core_disk::gb(free)
+        ),
+        None => "`TMPDIR=<a dir on a disk with room> arena …`".to_string(),
+    };
+    format!("{skip}; or stage it on another filesystem for this run: {elsewhere}")
+}
+
+/// `/tmp/arena-replace-x 3.5 GB · /srv/backup/w1d1 over 2.0 GB`: dirs with their sizes ([`core_disk::biggest`]).
+fn dir_sizes(big: &[(PathBuf, core_disk::TreeUse)]) -> String {
+    big.iter().map(|(p, t)| format!("{} {}{}", p.display(), if t.capped { "over " } else { "" }, core_disk::gb(t.bytes))).collect::<Vec<_>>().join(" · ")
+}
+
 /// Judge a run's copies onto this box together ([`core_disk::Ledger`]): each copy (a pod) with
 /// the destinations it writes and their sizes, against what other arena runs' copies under way
 /// hold ([`core_disk::Reservations`], in the state root: every cohort's runs as this user). The
@@ -335,11 +382,7 @@ pub(crate) fn rows(cfg: &Config, floor: Floor, now: u64) -> Vec<String> {
                 let dirs = dirs.get_or_insert_with(|| arena_dirs(cfg, &left));
                 let big = core_disk::biggest(dirs, fs.dev, 5);
                 if !big.is_empty() {
-                    let list: Vec<String> = big
-                        .iter()
-                        .map(|(p, t)| format!("{} {}{}", p.display(), if t.capped { "over " } else { "" }, core_disk::gb(t.bytes)))
-                        .collect();
-                    out.push(format!("      └ arena's biggest dirs there: {}", list.join(" · ")));
+                    out.push(format!("      └ arena's biggest dirs there: {}", dir_sizes(&big)));
                 }
             }
         }
@@ -399,14 +442,51 @@ pub(crate) fn health(cfg: &Config, now: u64) -> Option<Health> {
 mod tests {
     use super::*;
 
+    /// A replace/migrate staging refused for room: how much to free where (with what's there,
+    /// when named), then another filesystem to stage on — a real one with its free space when
+    /// one has room, else said in general.
+    #[test]
+    fn a_staging_refusal_says_what_to_free_and_where_else_to_stage() {
+        let g = core_disk::GB;
+        let fs = core_disk::Fs { dev: 1, mount: PathBuf::from("/"), free: 3_100_000_000, total: 75 * g };
+        let skip = core_disk::judge(&fs, 0, &Size::Measured(3_900_000_000).into(), Floor::control(5 * g)).unwrap_err();
+        let named = skip.clone().naming("/tmp/arena-replace-leh3rc2hdcf31i 3.5 GB · /root/.local/state/arena 0.1 GB");
+        assert_eq!(
+            staging_words(&named, Some((Path::new("/mnt/backups/arena-tmp"), 331 * g))),
+            "skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB): this copy (~3.9 GB, measured) + the floor = 8.9 GB \
+             needed — nothing copied; free at least 5.8 GB on / (arena's biggest dirs there: /tmp/arena-replace-leh3rc2hdcf31i \
+             3.5 GB · /root/.local/state/arena 0.1 GB); or stage it on another filesystem for this run: \
+             `TMPDIR=/mnt/backups/arena-tmp arena …` (331 GB free there)"
+        );
+        // A path a shell would split or expand comes quoted.
+        assert!(
+            staging_words(&skip, Some((Path::new("/mnt/cohort data/arena-tmp"), 40 * g)))
+                .ends_with("`TMPDIR='/mnt/cohort data/arena-tmp' arena …` (40 GB free there)"),
+            "{}",
+            staging_words(&skip, Some((Path::new("/mnt/cohort data/arena-tmp"), 40 * g)))
+        );
+        assert!(
+            staging_words(&skip, None).ends_with(
+                "free at least 5.8 GB on / (`arena config check` names arena's biggest dirs there); or stage it on another \
+                 filesystem for this run: `TMPDIR=<a dir on a disk with room> arena …`"
+            ),
+            "{}",
+            staging_words(&skip, None)
+        );
+        let big = [(PathBuf::from("/tmp/a"), core_disk::TreeUse { bytes: 3_500_000_000, capped: false, changed: None }),
+                   (PathBuf::from("/b"), core_disk::TreeUse { bytes: 2 * g, capped: true, changed: None })];
+        assert_eq!(dir_sizes(&big), "/tmp/a 3.5 GB · /b over 2 GB");
+        assert_eq!(dir_sizes(&[]), "");
+    }
+
     #[test]
     fn a_skips_reason_is_its_line_without_the_advice() {
         assert_eq!(
-            reason("skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB) — nothing copied; free space on / (…)"),
+            reason("skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB) — nothing copied; free at least 1.9 GB on / (…)"),
             "only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB)"
         );
         assert_eq!(
-            reason("stopped: only 4.9 GB free on / while copying (floor 5 GB, CONTROL_MIN_FREE_GB) — what it copied so far stays; free space on / (…)"),
+            reason("stopped: only 4.9 GB free on / while copying (floor 5 GB, CONTROL_MIN_FREE_GB) — what it copied so far stays; free at least 0.1 GB on / (…)"),
             "only 4.9 GB free on / while copying (floor 5 GB, CONTROL_MIN_FREE_GB)"
         );
         assert_eq!(reason("something else"), "something else");
@@ -432,7 +512,7 @@ mod tests {
         let skip = w.under(read(4_900_000_000)).expect("under it");
         assert!(skip.stopped);
         assert_eq!(skip.reason, "only 4.9 GB free on /mnt/big while copying (floor 5 GB, CONTROL_MIN_FREE_GB)");
-        assert!(skip.to_string().starts_with("stopped: only 4.9 GB free on /mnt/big while copying") && skip.to_string().contains("— what it copied so far stays; free space on /mnt/big"), "{skip}");
+        assert!(skip.to_string().starts_with("stopped: only 4.9 GB free on /mnt/big while copying") && skip.to_string().contains("— what it copied so far stays; free at least 0.1 GB on /mnt/big"), "{skip}");
 
         // Live: a copy that would never end is dropped (its rsync stopped) once the disk is under
         // the floor — here a floor no disk has; with no watch, it runs to its end.

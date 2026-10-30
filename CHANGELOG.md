@@ -19,6 +19,46 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-30 · Tell us what hurts: pain points on GitHub
+- When arena gets in your way, or you work around it, file a pain point:
+  https://github.com/nickypro/arena-infra-rs/issues/new?template=pain-point.yml (label
+  `pain-point`). The README's "Tell us what hurts" has a paragraph to paste into your agents'
+  CLAUDE.md so they can file them with `gh issue create`. The repo is public, so leave out IPs,
+  hostnames of private machines, keys and tokens, and participants' names and emails.
+- The docs say what arena does today. Vast's create works (it has since 2026-10-08), production
+  updates with `arena update` (not `cargo install`), and `pods rename` works on every provider.
+  `config.env.example` now lists the keys it was missing: `ARENA_REPO_OWNER`, `GIT_SSH_KEY_LOCAL`,
+  `LOCAL_BACKUP_DIR`, `DEFAULT_BRANCH`, `PROXY_LOCAL`, `EXTRA_SSH_KEYS`, `BACKUP_MAX_SIZE`,
+  `BACKUP_REMOTE_PATH` and the three `OPENROUTER_*` keys. It no longer lists `BACKUP_BRANCH_PREFIX`,
+  which nothing read.
+
+## 2026-10-30 · Hetzner: a limit refusal says which limit and what frees room under it
+- A Hetzner create refused over one of the account's limits (403 `resource_limit_exceeded`) now
+  says what frees room under the limit Hetzner names: a primary IP for `primary_ip_limit` (live:
+  the sandbox refused every create so, though its project held no server and no IP), a smaller type
+  or a server for cores, a server for the number of servers, a floating IP, a volume, a snapshot
+  (`arena image prune`) — and
+  where to ask for more (Hetzner Console: Limits tab → Request change → Limit increase). It said
+  "use a smaller type" whatever the limit, and called it the project's: Hetzner counts a limit over
+  every project of the account.
+- Hetzner's 403 `maintenance` says to try again later instead of "authentication failed"; a
+  `pods rename` refused for a limit or for maintenance reads the same way. Only a 401 or a 403
+  `forbidden` reads as "authentication failed".
+
+## 2026-10-30 · Room on the control box: a bad floor refused before replace creates anything
+- `pods replace`, `migrate copy` and a cutover's final sync refuse a `CONTROL_MIN_FREE_GB` that
+  isn't a whole number before anything is created (their `--dry-run` says they would). Before, the
+  copy found it only after the new pod was created and set up, and left that pod billing.
+  `config check`'s ✗ row says what it refuses.
+- A copy skipped or stopped for room says how much to free, and where: `only 3.1 GB free on /
+  (floor 5 GB, …): this copy (~3.9 GB, measured) + the floor = 8.9 GB needed — nothing copied;
+  free at least 5.8 GB on / (…)`. A replace/migrate staging refused so also names arena's biggest
+  dirs on that disk, and another disk arena writes to with room, for the run's `TMPDIR`
+  (`TMPDIR=/mnt/backups/arena-tmp arena …`); on a disk already under the floor it's refused
+  before the pod's home is sized (an rsync dry run over all of it).
+- The daily health check says when a copy was stopped (not skipped) for space and, for the
+  backup's and the reaper's copies, that each run tries it again until there's room.
+
 ## 2026-10-30 · arena 2.3: `arena spend` — what each machine cost and who it was for
 - This is **arena 2.3** (a minor bump: a new command, `arena spend`, and `--owner`/`--keep-key`
   on `pods create` and `pods up`).
@@ -38,10 +78,14 @@ earlier).
 - `pods list`, the dashboard, `teardown --check`, `arena balance`, the snapshot cron line and
   every create, stop, start and terminate now record what they see in a local ledger,
   `~/.local/state/arena/<prefix>/spend.json` (0600) — quietly: nothing else they print changes.
-- Docs: "Tracking spend" in the README, and how to run a project week as a second fleet from the
-  same proxy box (docs/REFERENCE.md): its own config, prefix, workspace, proxy file and port
-  range, and cron lines written by hand — `arena cron install` for a second config would replace
-  the first fleet's lines.
+- A project week runs on the fleet you already have: `--owner` on `pods up` for new machines,
+  `arena spend assign` for ones that exist, then `arena spend --since <its first day>`. The
+  snapshot cron line keeps the ledger current; tracking starts when this version is installed,
+  so earlier history isn't there.
+- Docs: "Tracking spend" in the README, and, optionally, how another program can run a second
+  fleet from the same proxy box (docs/REFERENCE.md): its own config, prefix, workspace, proxy
+  file and port range, and cron lines written by hand — `arena cron install` for a second config
+  would replace the first fleet's lines.
 
 ## 2026-10-30 · The dashboard's bottom line is plain words
 - The footer no longer uses `☰`, `⟳`, `✓`, `⚠` or a spinner, which some terminals draw as

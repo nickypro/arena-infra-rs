@@ -282,9 +282,9 @@ async fn a_project_limit_is_said_as_one_and_stops_the_creates_without_reading_as
         assert!(!e.contains("authentication"), "{e}");
         assert!(
             e.contains(
-                "creating devtest-bloom: provider error: hetzner create HTTP 403 Forbidden: Hetzner refused: the project's \
+                "creating devtest-bloom: provider error: hetzner create HTTP 403 Forbidden: Hetzner refused: the account's \
                  resource limit is reached (shared core limit exceeded; limit: server_shared_cores_limit) — use a smaller \
-                 type (--server-type / HETZNER_SERVER_TYPE), free a server, or ask Hetzner to raise the limit"
+                 type (--server-type / HETZNER_SERVER_TYPE) or delete a server, or ask Hetzner to raise the limit"
             ),
             "{e}"
         );

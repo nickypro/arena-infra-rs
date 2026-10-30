@@ -686,44 +686,98 @@ pub(crate) async fn send_ok(rb: RequestBuilder, ctx: &str) -> Result<()> {
 }
 
 /// The error for a non-2xx Hetzner answer: the shared classification ([`status_error`]), then
-/// what Hetzner's `{"error": {"code", "message", "details"}}` says. Its 403
-/// `resource_limit_exceeded` — "exceeding the maximum quantity of a resource for an account",
-/// the only limit code in its API reference (details name the limit, e.g. `project_limit`) — is
-/// the project's quota, not a bad token: [`ProviderErrorKind::Quota`](crate::error::ProviderErrorKind::Quota),
-/// in words that say so and what to do (live 2026-10-29: a cx33 refused for the shared-core
-/// limit read "authentication failed creating …"). Every other answer is classified as before.
-/// Pure.
+/// what Hetzner's `{"error": {"code", "message", "details"}}` says. Its API reference has three
+/// 403s, and only `forbidden` (with the 401 `unauthorized`) is about the token:
+/// - `resource_limit_exceeded` — "exceeding the maximum quantity of a resource for an account",
+///   its only limit code; `details.limits` names the limit (`project_limit` in the docs; live:
+///   `server_shared_cores_limit` 2026-10-29, `primary_ip_limit` 2026-10-30) — is the account's
+///   quota: [`ProviderErrorKind::Quota`](crate::error::ProviderErrorKind::Quota), in words that
+///   say so and what frees room under that limit ([`limit_remedy`]). Live, both read
+///   "authentication failed creating …", the second in a project with no server or IP at all:
+///   Hetzner counts a limit over every project of the account. A 403 of another code that names
+///   limits in its details (or a code `…_limit_exceeded`) is read the same way.
+/// - `maintenance` — "cannot perform operation due to maintenance": said as that, to try later;
+///   not `Auth`, as a dead key isn't the thing to go and fix.
+///
+/// Every other answer is classified as before. Pure.
 pub(crate) fn api_error(status: StatusCode, text: &str, ctx: &str) -> Error {
+    use crate::error::ProviderErrorKind as K;
     let body: Option<Value> = serde_json::from_str(text).ok();
-    let error = body.as_ref().and_then(|b| b.get("error"));
+    let error = body.as_ref().and_then(|b| b.get("error")).filter(|e| e.is_object());
     let code = error.and_then(|e| e.get("code")).and_then(Value::as_str).map(str::trim);
-    if code != Some("resource_limit_exceeded") {
-        return status_error(status, text, ctx);
-    }
     let said = error.and_then(|e| e.get("message")).and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty());
     let limits: Vec<&str> = error
         .and_then(|e| e.pointer("/details/limits"))
         .and_then(Value::as_array)
         .map(|l| l.iter().filter_map(|x| x.get("name").and_then(Value::as_str)).map(str::trim).filter(|n| !n.is_empty()).collect())
         .unwrap_or_default();
+    let forbidden = status == StatusCode::FORBIDDEN;
+    let limit = code == Some("resource_limit_exceeded")
+        || (forbidden
+            && !matches!(code, Some("forbidden" | "unauthorized" | "rate_limit_exceeded"))
+            && (!limits.is_empty() || code.is_some_and(|c| c.ends_with("_limit_exceeded"))));
+    if forbidden && code == Some("maintenance") {
+        let what = said.map(|m| format!(" ({})", crate::error::body_excerpt(m))).unwrap_or_default();
+        return Error::Provider {
+            kind: K::Other,
+            message: format!(
+                "{ctx} HTTP {status}: Hetzner refused: maintenance{what} — try again later (status.hetzner.com) \
+                 (maintenance; the API token is fine)"
+            ),
+        };
+    }
+    if !limit {
+        return status_error(status, text, ctx);
+    }
     let mut what: Vec<String> = said.map(crate::error::body_excerpt).into_iter().collect();
     if !limits.is_empty() {
         what.push(format!("limit: {}", limits.join(", ")));
     }
     let what = if what.is_empty() { String::new() } else { format!(" ({})", what.join("; ")) };
-    // A server create can fit in a smaller type; anything else (a snapshot, an archive volume)
-    // can only free one up.
-    let advice = if ctx == "hetzner create" {
-        "use a smaller type (--server-type / HETZNER_SERVER_TYPE), free a server, or ask Hetzner to raise the limit"
-    } else {
-        "free one up, or ask Hetzner to raise the limit"
-    };
+    // A fleet create can fit in a smaller type; anything else can only free one up.
+    let fleet_create = ctx == "hetzner create";
+    let mut remedies: Vec<&str> = Vec::new();
+    for r in limits.iter().map(|n| limit_remedy(n, fleet_create)) {
+        if !remedies.contains(&r) {
+            remedies.push(r);
+        }
+    }
+    if remedies.is_empty() {
+        // No limit named: what another code than the documented one names, if anything.
+        remedies.push(limit_remedy(code.filter(|c| *c != "resource_limit_exceeded").unwrap_or_default(), fleet_create));
+    }
+    let code = code.unwrap_or("no code");
     Error::Provider {
-        kind: crate::error::ProviderErrorKind::Quota,
+        kind: K::Quota,
         message: format!(
-            "{ctx} HTTP {status}: Hetzner refused: the project's resource limit is reached{what} — {advice} \
-             (resource_limit_exceeded; the API token is fine)"
+            "{ctx} HTTP {status}: Hetzner refused: the account's resource limit is reached{what} — {}, or ask \
+             Hetzner to raise the limit (Hetzner Console: Limits tab → Request change → Limit increase). Limits count \
+             every project of the Hetzner account, not just this one ({code}; the API token is fine)",
+            remedies.join("; ")
         ),
+    }
+}
+
+/// What frees room under the Hetzner limit `name` (`details.limits[].name`, empty when none is
+/// named), by the resource it names; `fleet_create`: refused creating a fleet machine, which a
+/// smaller server type may fit. Pure.
+fn limit_remedy(name: &str, fleet_create: bool) -> &'static str {
+    let n = name.to_ascii_lowercase();
+    if n.contains("primary_ip") {
+        "delete a primary IP nothing needs (every server holds one; an unassigned one counts until deleted)"
+    } else if n.contains("floating_ip") {
+        "delete a floating IP nothing needs"
+    } else if n.contains("volume") {
+        "delete a volume nothing needs"
+    } else if n.contains("snapshot") || n.contains("image") {
+        "delete an old snapshot (`arena image prune`)"
+    } else if fleet_create && (n.contains("core") || n.is_empty()) {
+        // Cores (or not said which): a smaller type may fit. A count of servers isn't helped by one.
+        "use a smaller type (--server-type / HETZNER_SERVER_TYPE) or delete a server"
+    } else if n.contains("core") || n.contains("server") {
+        "delete a server nothing needs"
+    } else {
+        "free one up"
     }
 }
 
@@ -740,6 +794,15 @@ pub mod recorded {
     /// [`LIMIT_BODY`] as this backend reads it under `ctx`: a `Quota` error.
     pub fn limit_refusal(ctx: &str) -> Error {
         api_error(StatusCode::FORBIDDEN, LIMIT_BODY, ctx)
+    }
+
+    /// Every create in the sandbox project refused over the primary IP limit, live 2026-10-30,
+    /// though the project held no server and no IP (`~/.cache/arena-scratch/live-spend/r2/01-create-hz.log`).
+    pub const PRIMARY_IP_LIMIT_BODY: &str = r#"{"error":{"code":"resource_limit_exceeded","details":{"limits":[{"name":"primary_ip_limit"}]},"message":"Primary IP limit exceeded"}}"#;
+
+    /// [`PRIMARY_IP_LIMIT_BODY`] as this backend reads it under `ctx`: a `Quota` error.
+    pub fn primary_ip_refusal(ctx: &str) -> Error {
+        api_error(StatusCode::FORBIDDEN, PRIMARY_IP_LIMIT_BODY, ctx)
     }
 }
 
@@ -1152,7 +1215,7 @@ fn rename_payload(new_name: &str) -> Value {
 /// any other error reads as everywhere (a 429 waited out, a 5xx retried by the caller).
 fn judge_rename(status: reqwest::StatusCode, text: &str, new_name: &str) -> Result<()> {
     if !status.is_success() {
-        return Err(rename_refusal(crate::http::status_error(status, text, "hetzner rename"), text, new_name));
+        return Err(rename_refusal(api_error(status, text, "hetzner rename"), text, new_name));
     }
     let named = serde_json::from_str::<Value>(text).ok().and_then(|v| v.pointer("/server/name").and_then(Value::as_str).map(String::from));
     match named {
@@ -2357,53 +2420,124 @@ mod tests {
         assert_eq!(http(412, r#"{"error":{"code":"resource_unavailable","message":"error during placement"}}"#).kind(), Some(K::Other), "why the walk tags it");
     }
 
-    /// The live refusal (2026-10-29: a cx33 next to another agent's cx23): Hetzner's 403
-    /// `resource_limit_exceeded` is the project's quota — `Quota`, said as such with what to do,
-    /// never "authentication failed" — while its other 403s (`forbidden`: a read-only token;
-    /// `maintenance`; a body that isn't Hetzner's) and its 401 keep the shared reading. Pure.
+    /// The live refusals (2026-10-29: a cx33 next to another agent's cx23; 2026-10-30: every
+    /// create, in a project with no server or IP — the primary IP limit counts the account's
+    /// other projects): Hetzner's 403 `resource_limit_exceeded` is the account's quota — `Quota`,
+    /// said as such with Hetzner's words and what frees room under that limit, never
+    /// "authentication failed" — while a bad token (401 `unauthorized`, 403 `forbidden`, a 403
+    /// that isn't Hetzner's) keeps the shared reading. Pure.
     #[test]
     fn a_resource_limit_is_a_quota_refusal_not_a_bad_token() {
         use crate::error::ProviderErrorKind as K;
+        let tail = ", or ask Hetzner to raise the limit (Hetzner Console: Limits tab → Request change → Limit increase). Limits \
+                    count every project of the Hetzner account, not just this one (resource_limit_exceeded; the API token is fine)";
         let e = recorded::limit_refusal("hetzner create");
         assert_eq!(e.kind(), Some(K::Quota));
         assert_eq!(
             e.to_string(),
-            "provider error: hetzner create HTTP 403 Forbidden: Hetzner refused: the project's resource limit is reached \
-             (shared core limit exceeded; limit: server_shared_cores_limit) — use a smaller type (--server-type / \
-             HETZNER_SERVER_TYPE), free a server, or ask Hetzner to raise the limit (resource_limit_exceeded; the API \
-             token is fine)"
+            format!(
+                "provider error: hetzner create HTTP 403 Forbidden: Hetzner refused: the account's resource limit is reached \
+                 (shared core limit exceeded; limit: server_shared_cores_limit) — use a smaller type (--server-type / \
+                 HETZNER_SERVER_TYPE) or delete a server{tail}"
+            )
         );
-        assert!(!is_placement_error(&e), "a project's limit is the same in every location");
+        assert!(!is_placement_error(&e), "an account's limit is the same in every location");
         assert!(!crate::retry::is_retryable(&e), "no retry frees it");
-        // Not a server create (an image, the archive's volume): freeing one up is all there is.
-        let docs = r#"{"error":{"code":"resource_limit_exceeded","message":"project limit exceeded","details":{"limits":[{"name":"project_limit"}]}}}"#;
-        let e = api_error(StatusCode::FORBIDDEN, docs, "hetzner create image");
+        // The sandbox's, live 2026-10-30: a smaller type doesn't help, a primary IP does.
+        let e = recorded::primary_ip_refusal("hetzner create");
         assert_eq!(e.kind(), Some(K::Quota));
-        assert!(
-            e.to_string().contains(
-                "hetzner create image HTTP 403 Forbidden: Hetzner refused: the project's resource limit is reached (project \
-                 limit exceeded; limit: project_limit) — free one up, or ask Hetzner to raise the limit"
-            ),
-            "{e}"
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "provider error: hetzner create HTTP 403 Forbidden: Hetzner refused: the account's resource limit is reached \
+                 (Primary IP limit exceeded; limit: primary_ip_limit) — delete a primary IP nothing needs (every server \
+                 holds one; an unassigned one counts until deleted){tail}"
+            )
         );
-        // Neither message nor details: the code alone says it.
-        let e = api_error(StatusCode::FORBIDDEN, r#"{"error":{"code":"resource_limit_exceeded"}}"#, "hetzner create");
+        assert!(!is_placement_error(&e) && !crate::retry::is_retryable(&e));
+        // Each limit by what it names; a fleet create may fit in a smaller type, nothing else can.
+        let body = |names: &[&str]| {
+            let limits: Vec<Value> = names.iter().map(|n| json!({ "name": n })).collect();
+            json!({"error": {"code": "resource_limit_exceeded", "message": "limit exceeded", "details": {"limits": limits}}}).to_string()
+        };
+        for (names, ctx, remedy) in [
+            // A count of servers: a smaller type takes a server all the same.
+            (&["server_limit"][..], "hetzner create", "delete a server nothing needs"),
+            (&["server_dedicated_cores_limit"], "hetzner create", "use a smaller type (--server-type / HETZNER_SERVER_TYPE) or delete a server"),
+            (&["server_limit"], "hetzner create server", "delete a server nothing needs"),
+            (&["dedicated_core_limit"], "hetzner create server", "delete a server nothing needs"),
+            (&["floating_ip_limit"], "hetzner create", "delete a floating IP nothing needs"),
+            (&["volume_limit"], "hetzner create volume", "delete a volume nothing needs"),
+            (&["snapshot_limit"], "hetzner create image", "delete an old snapshot (`arena image prune`)"),
+            (&["project_limit"], "hetzner create image", "free one up"),
+            (
+                &["primary_ip_limit", "server_shared_cores_limit", "primary_ip_limit"],
+                "hetzner create",
+                "delete a primary IP nothing needs (every server holds one; an unassigned one counts until deleted); use a \
+                 smaller type (--server-type / HETZNER_SERVER_TYPE) or delete a server",
+            ),
+        ] {
+            let e = api_error(StatusCode::FORBIDDEN, &body(names), ctx);
+            assert_eq!(e.kind(), Some(K::Quota), "{names:?}");
+            assert!(e.to_string().contains(&format!("(limit exceeded; limit: {}) — {remedy}{tail}", names.join(", "))), "{names:?}: {e}");
+        }
+        // Neither message nor details: the code alone says it; a create that isn't the fleet's
+        // (an image, the archive's volume) can only free one up.
+        let bare = r#"{"error":{"code":"resource_limit_exceeded"}}"#;
+        let e = api_error(StatusCode::FORBIDDEN, bare, "hetzner create");
         assert_eq!(e.kind(), Some(K::Quota));
-        assert!(e.to_string().contains("Hetzner refused: the project's resource limit is reached — use a smaller type"), "{e}");
-        // Everything else exactly as the shared reading has it.
+        assert!(e.to_string().contains("Hetzner refused: the account's resource limit is reached — use a smaller type"), "{e}");
+        assert!(api_error(StatusCode::FORBIDDEN, bare, "hetzner create volume").to_string().contains("reached — free one up, or ask"));
+        // A 403 of another code that names its limits (or says `…_limit_exceeded`): a limit too,
+        // with its own code said. Never `forbidden`/`unauthorized`: those are the token.
+        for body in [
+            r#"{"error":{"code":"primary_ip_limit_exceeded","message":"Primary IP limit exceeded"}}"#,
+            r#"{"error":{"code":"limit","message":"x","details":{"limits":[{"name":"primary_ip_limit"}]}}}"#,
+        ] {
+            let e = api_error(StatusCode::FORBIDDEN, body, "hetzner create");
+            assert_eq!(e.kind(), Some(K::Quota), "{body}");
+            assert!(e.to_string().contains(" — delete a primary IP nothing needs"), "{e}");
+            assert!(e.to_string().contains("not just this one (") && e.to_string().ends_with("; the API token is fine)"), "{e}");
+        }
+        // Maintenance is no key problem either: said as that, to try later; not retried, no walk.
+        let e = api_error(StatusCode::FORBIDDEN, r#"{"error":{"code":"maintenance","message":"Cannot perform operation due to maintenance"}}"#, "hetzner create");
+        assert_eq!(e.kind(), Some(K::Other));
+        assert_eq!(
+            e.to_string(),
+            "provider error: hetzner create HTTP 403 Forbidden: Hetzner refused: maintenance (Cannot perform operation due to \
+             maintenance) — try again later (status.hetzner.com) (maintenance; the API token is fine)"
+        );
+        assert!(!is_placement_error(&e));
+        // Everything else exactly as the shared reading has it: a bad token stays one.
         for (status, body, kind) in [
             (403, r#"{"error":{"code":"forbidden","message":"insufficient permissions"}}"#, K::Auth),
-            (403, r#"{"error":{"code":"maintenance","message":"maintenance"}}"#, K::Auth),
+            (403, r#"{"error":{"code":"forbidden","message":"x","details":{"limits":[{"name":"primary_ip_limit"}]}}}"#, K::Auth),
+            (403, r#"{"error":{"code":"unauthorized","message":"unable to authenticate"}}"#, K::Auth),
+            (403, r#"{"error":{"code":"rate_limit_exceeded","message":"limit"}}"#, K::Auth),
             (403, "Forbidden", K::Auth),
+            (403, "", K::Auth),
             (401, r#"{"error":{"code":"unauthorized","message":"unable to authenticate"}}"#, K::Auth),
             (429, r#"{"error":{"code":"rate_limit_exceeded","message":"limit"}}"#, K::RateLimited),
             (412, r#"{"error":{"code":"resource_unavailable","message":"error during placement"}}"#, K::Other),
             (403, r#"{"error":"resource_limit_exceeded"}"#, K::Auth),
+            (401, r#"{"error":{"code":"maintenance","message":"maintenance"}}"#, K::Auth),
         ] {
             let status = StatusCode::from_u16(status).unwrap();
             let (ours, shared) = (api_error(status, body, "hetzner create"), status_error(status, body, "hetzner create"));
             assert_eq!((ours.kind(), ours.to_string()), (Some(kind), shared.to_string()), "{body}");
         }
+    }
+
+    /// A rename's refusals go through the same reading: the account's limit isn't a bad token.
+    #[test]
+    fn a_rename_refused_for_a_limit_or_maintenance_isnt_a_bad_token() {
+        use crate::error::ProviderErrorKind as K;
+        let e = judge_rename(StatusCode::FORBIDDEN, r#"{"error":{"code":"maintenance","message":"m"}}"#, "arena9-b").unwrap_err();
+        assert_eq!(e.kind(), Some(K::Other), "{e}");
+        let e = judge_rename(StatusCode::FORBIDDEN, recorded::LIMIT_BODY, "arena9-b").unwrap_err();
+        assert_eq!(e.kind(), Some(K::Quota), "{e}");
+        let e = judge_rename(StatusCode::FORBIDDEN, r#"{"error":{"code":"forbidden","message":"no"}}"#, "arena9-b").unwrap_err();
+        assert_eq!(e.kind(), Some(K::Auth), "{e}");
     }
 
     /// Over the real request path: a create over the project's limit is one request — no other
@@ -2418,7 +2552,7 @@ mod tests {
         let p = provider(&srv.base, opts);
         let e = p.create_pod(&spec("arena9-a", Some("cx33"))).await.unwrap_err();
         assert_eq!(e.kind(), Some(K::Quota), "{e}");
-        assert!(e.to_string().contains("Hetzner refused: the project's resource limit is reached (shared core limit exceeded"), "{e}");
+        assert!(e.to_string().contains("Hetzner refused: the account's resource limit is reached (shared core limit exceeded"), "{e}");
         assert_eq!(srv.requests.lock().unwrap().len(), 1, "no second location, no lookups: {:?}", srv.requests.lock().unwrap());
         let e = p.power_action("5", "poweron").await.unwrap_err();
         assert_eq!(e.kind(), Some(K::Quota), "{e}");

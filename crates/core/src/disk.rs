@@ -159,7 +159,28 @@ pub struct Skip {
     advice: String,
     /// The copy was stopped while it wrote ([`Skip::under_floor_now`]), not skipped before.
     pub stopped: bool,
+    /// Short of room (not a reading that failed): where, and how much more must be free there.
+    pub short: Option<Short>,
 }
+
+/// How much more a filesystem must have free for a copy ([`Skip::short`]): what it needs —
+/// the floor, the copy, other copies under way — less what's free (review #42: from the free
+/// space alone, an operator can't tell how much to free).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Short {
+    pub dev: u64,
+    pub mount: PathBuf,
+    pub bytes: u64,
+}
+
+impl Short {
+    fn advice(&self, dirs: &str) -> String {
+        format!("free at least {} on {} ({dirs})", gb_up(self.bytes), self.mount.display())
+    }
+}
+
+/// Where a skip's advice points for what to delete, when it doesn't name it ([`Skip::naming`]).
+const NAMES_DIRS: &str = "`arena config check` names arena's biggest dirs there";
 
 impl std::fmt::Display for Skip {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -174,7 +195,7 @@ impl std::fmt::Display for Skip {
 impl Skip {
     /// The free space couldn't be read: never copy blind.
     pub fn unknown(path: &Path, why: &str) -> Skip {
-        Skip { reason: format!("free space on {} unknown ({why})", path.display()), advice: "check that disk".into(), stopped: false }
+        Skip { reason: format!("free space on {} unknown ({why})", path.display()), advice: "check that disk".into(), stopped: false, short: None }
     }
 
     /// What other arena runs' copies under way hold couldn't be read, or this run's couldn't be
@@ -184,32 +205,59 @@ impl Skip {
             reason: format!("other arena runs' copies onto this box unknown ({why})"),
             advice: "check the state dir (`arena config which`), then re-run".into(),
             stopped: false,
+            short: None,
         }
     }
 
     /// A copy stopped while it wrote: the filesystem went under the floor (a copy writes more
-    /// than its estimate — a new big file — or something else filled the disk meanwhile).
+    /// than its estimate — a new big file — or something else filled the disk meanwhile). What
+    /// to free is at least what takes it back to the floor: the rest of the copy is unknown.
     pub fn under_floor_now(fs: &Fs, floor: Floor) -> Skip {
-        let mount = fs.mount.display();
+        let short = Short { dev: fs.dev, mount: fs.mount.clone(), bytes: floor.bytes.saturating_sub(fs.free) };
         Skip {
-            reason: format!("only {} free on {mount} while copying (floor {}, {})", gb(fs.free), gb(floor.bytes), floor.key),
-            advice: format!("free space on {mount} (`arena config check` names arena's biggest dirs there)"),
+            reason: format!("only {} free on {}{WHILE_COPYING}(floor {}, {})", gb(fs.free), fs.mount.display(), gb(floor.bytes), floor.key),
+            advice: short.advice(NAMES_DIRS),
             stopped: true,
+            short: Some(short),
         }
     }
+
+    /// This skip, its advice naming the dirs to look at (`arena's biggest dirs there: /tmp/x 3.5
+    /// GB · …`) rather than pointing at `config check` — where a run can afford the look (a
+    /// replace/migrate's one refusal, not a backup's line per pod). Nothing to name: unchanged.
+    pub fn naming(mut self, dirs: &str) -> Skip {
+        if let (Some(short), false) = (&self.short, dirs.is_empty()) {
+            self.advice = short.advice(&format!("arena's biggest dirs there: {dirs}"));
+        }
+        self
+    }
 }
+
+/// What a stopped copy's reason says ([`Skip::under_floor_now`]), as the skip record tells one.
+const WHILE_COPYING: &str = " while copying ";
+/// The skip record's kinds a scheduled run tries again (the backup's copies, the reaper's) — not
+/// replace/migrate's staging or a baseline, which an operator re-runs.
+const RETRIED: [&str; 2] = ["copy", "reap backup"];
 
 /// The judge (pure): a copy needing `need` may start on `fs` when what's free, less `already`
 /// (what this run's earlier copies and other runs' copies under way there may take) and `need`,
 /// stays at or above `floor`.
-/// `Err` says how far off it is, for the copy's line.
+/// `Err` says how far off it is, for the copy's line: under the floor, what it would take in
+/// all; and how much to free, on which filesystem ([`Short`]).
 pub fn judge(fs: &Fs, already: u64, need: &Need, floor: Floor) -> Result<(), Skip> {
-    if fs.free >= floor.bytes.saturating_add(already).saturating_add(need.bytes) {
+    let total = floor.bytes.saturating_add(already).saturating_add(need.bytes);
+    if fs.free >= total {
         return Ok(());
     }
     let mount = fs.mount.display();
     let reason = if fs.free < floor.bytes {
-        format!("only {} free on {mount} (floor {}, {})", gb(fs.free), gb(floor.bytes), floor.key)
+        let head = format!("only {} free on {mount} (floor {}, {})", gb(fs.free), gb(floor.bytes), floor.key);
+        if need.bytes == 0 && already == 0 {
+            head
+        } else {
+            let others = if already > 0 { format!(" + ~{} for other copies under way", gb(already)) } else { String::new() };
+            format!("{head}: this copy ({}){others} + the floor = {} needed", need.words, gb(total))
+        }
     } else {
         let others = if already > 0 { format!(" after ~{} for other copies under way", gb(already)) } else { String::new() };
         format!(
@@ -220,7 +268,8 @@ pub fn judge(fs: &Fs, already: u64, need: &Need, floor: Floor) -> Result<(), Ski
             floor.key
         )
     };
-    Err(Skip { reason, advice: format!("free space on {mount} (`arena config check` names arena's biggest dirs there)"), stopped: false })
+    let short = Short { dev: fs.dev, mount: fs.mount.clone(), bytes: total - fs.free };
+    Err(Skip { reason, advice: short.advice(NAMES_DIRS), stopped: false, short: Some(short) })
 }
 
 /// One run's copies onto this box, judged together: each filesystem read once, and what every
@@ -306,6 +355,19 @@ pub fn gb(b: u64) -> String {
     } else {
         format!("{} KB", b.div_ceil(1000))
     }
+}
+
+/// [`gb`] rounded up to what it shows (`4.81 GB` → `4.9 GB`): an amount to free, never said
+/// smaller than it is.
+pub fn gb_up(b: u64) -> String {
+    let unit = if b >= GB / 10 {
+        GB / 10
+    } else if b >= 1_000_000 {
+        1_000_000
+    } else {
+        1000
+    };
+    gb(b.div_ceil(unit).saturating_mul(unit))
 }
 
 /// `40 s`, `12 min`, `5 h`, `16 days` — how long ago, in its biggest unit.
@@ -946,12 +1008,22 @@ fn when(t: u64, now: u64) -> String {
 
 impl SkipEntry {
     /// `✗ alpha: copy skipped 12× (since 09:00 UTC, last 10:15 UTC) — only 3.1 GB free on / (floor 5 GB, …)`.
+    /// One last stopped while it wrote says so, and that it's tried again: each run starts it anew
+    /// — rsync keeps what it copied, a file it was writing starts over — and the watch stops it
+    /// again at the floor, until there's room (review #42: left so, rather than remembering what
+    /// it needed; this line, failing the health check, is how the operator hears of it).
     pub fn line(&self, now: u64) -> String {
         let times = if self.count == 1 {
             format!("at {}", when(self.last, now))
         } else {
             format!("{}× (since {}, last {})", self.count, when(self.first, now), when(self.last, now))
         };
+        if self.why.contains(WHILE_COPYING) {
+            let verb = if self.count == 1 { "stopped" } else { "skipped or stopped" };
+            // Only what cron runs again (the backup's copies, the reaper's) is tried again by itself.
+            let again = if RETRIED.contains(&self.what.as_str()) { "; each run tries it again (from where it stopped) until there's room" } else { "" };
+            return format!("✗ {}: {} {verb} {times} — {}{again}", self.pod, self.what, self.why);
+        }
         format!("✗ {}: {} skipped {times} — {}", self.pod, self.what, self.why)
     }
 }

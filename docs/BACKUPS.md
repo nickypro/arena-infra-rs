@@ -132,7 +132,7 @@ never a silent no-op).
 **A pasted key never blocks the push** (live: an OpenRouter key in an exercise made GitHub refuse
 three pods' pushes for ~20 hours, GH013): each new or changed text file is scanned for
 high-confidence key formats (`arena_core::backup::SECRET_PATTERNS`: OpenRouter, Anthropic, OpenAI,
-Hugging Face, GitHub, AWS) and committed with each key replaced by `REDACTED-…` — in git only: the
+Hugging Face, GitHub, Google, Groq, AWS) and committed with each key replaced by `REDACTED-…` — in git only: the
 file on disk keeps the key (the code still runs) and shows as modified; reported per pod (`redacted
 N pasted key(s) in …`).
 
@@ -232,7 +232,7 @@ So a course push that leaves many pods conflicted can't make one cron tick outla
 `flock -n` would skip the healthy pods' backups too).
 
 A copy counts only when it is whole: every rsync of both tiers, the snapshot's uncapped `.git` pass
-among them (a busy lock, no endpoint, a timeout, a failed tier or pass: no copy).
+among them (a busy lock, no endpoint, no room on this box, a timeout, a failed tier or pass: no copy).
 
 The record is `busy-copies.json` in the fleet's state dir (written atomically, owner-only, off the
 async runtime under the state dir's lock, waited for 10 s at most; missing or corrupt = copy again).
@@ -594,7 +594,8 @@ No targets = this cohort's pods, as for `backup`.
 ## `pods pull`: the file backup
 
 `pods pull [targets] [--label <label>]` — the **file** backup (complementing the git `backup`):
-rsyncs each pod's home into `<dir>/<label>/<pod>/`, reporting per pod what was sent and what the
+rsyncs each pod's home into `<dir>/<label>/<pod>/` (files under the size cap) and `<dir>/big/<pod>/`
+(every file; `--no-big` skips it), reporting per pod what was sent and what the
 snapshot holds (`12 files, 3.4M sent of 6754, 1.8G` — sizes parsed in every format rsync prints). No
 targets = this cohort's pods, as for `backup` (a staff box only when named). Targets are positional
 like every command's (the old `-t` still works, and so does `pods pull w1d3` — read as the label,
@@ -605,14 +606,16 @@ with a note — when `w1d3` names no pod).
 **Keeps `.git`, complete** (`--no-git` to skip): the size cap (`--max-size`) applies to the files,
 then a second pass copies every kept `.git` uncapped — a repo's big pack used to be dropped, leaving
 refs to missing objects — and the empty dirs inside a `.git` (`refs/heads/` once refs are packed)
-are kept, so each snapshot (and `big/`) is a repo git reads. Excludes other dotfile dirs +
-`site-packages`.
+are kept, so each snapshot (and `big/`) is a repo git reads. Keeps `.claude/` too (Claude Code's
+transcripts); excludes other dotfile dirs, `site-packages`, `venv`/`node_modules`/`__pycache__`, the
+Hugging Face caches (`hf_cache`, `huggingface`, `models--*`, `datasets--*`), `TEMP_FOLDER_FOR_SWEEPS/`
+and setup's aside copy of the image's checkout.
 
 ### Hard-linked snapshots
 
 **Hard-linked snapshots**: each dated snapshot is still a complete tree (restore/pull layout
-unchanged), but files unchanged since this pod's previous snapshot, or identical to the week's
-**fleet baseline** (`pods baseline`), are hard links (`rsync --link-dest`, absolute paths, same
+unchanged), but files unchanged since this pod's previous snapshot, or identical to the newest
+**fleet baseline** of that week or before (`pods baseline`), are hard links (`rsync --link-dest`, absolute paths, same
 filesystem — all under `<dir>`), not copies: a day's snapshot costs only what changed, a new or
 replaced pod's first one only what isn't the image's.
 
@@ -800,7 +803,14 @@ findings #5–#7, #13, #16, #17, #19, #20, #26–#30):
   neighbour through it) and gives up connecting after 15 s; when it fails the fallback names its
   real reason. The **via-local** fallback first sizes the staging (an rsync dry run) and refuses
   when it wouldn't leave `CONTROL_MIN_FREE_GB` free on that disk ([Room on this
-  box](#room-on-this-box-control_min_free_gb)); the stage (`$TMPDIR/arena-replace-<id>`, mode 0700,
+  box](#room-on-this-box-control_min_free_gb)), saying what it needs in all (`this copy (~3.9 GB,
+  measured) + the floor = 8.9 GB needed`), how much to free on which filesystem with arena's biggest
+  dirs there (`free at least 5.8 GB on / (arena's biggest dirs there: /tmp/arena-replace-… 3.5 GB ·
+  …)`), and another filesystem arena writes to that has room, for the run's `TMPDIR`
+  (`TMPDIR=/mnt/backups/arena-tmp arena …`); a disk already under the floor is refused
+  without sizing anything. A `CONTROL_MIN_FREE_GB` that isn't a whole number refuses `replace`,
+  `migrate copy` and a cutover's final sync before anything is created (their dry runs say so);
+  found only at the copy, it left the new pod built and billing. The stage (`$TMPDIR/arena-replace-<id>`, mode 0700,
   locked while a run copies through it — a second replace/migrate of the same pod is refused, its
   stage untouched) is **removed** once the copy through it landed, and kept — with its path, size
   and the `rm -rf` — when it failed (a re-run continues from it) or the run was stopped. A later
@@ -862,10 +872,14 @@ once.)
   `stopped: only 4.9 GB free on / while copying (floor 5 GB, …) — what it copied so far stays; …`,
   a failure of the run recorded for the health check like a skip. A reap backup stopped so isn't
   verified, so the pod isn't terminated; a stopped staging copy is kept as a failed one is; a
-  stopped baseline leaves nothing.
+  stopped baseline leaves nothing. A stopped copy is tried again at the next run (rsync keeps what
+  it copied; a file it was writing starts over) and stopped again at the floor until there's room
+  — not remembered and held back: the health check names it (`copy stopped … each run tries it
+  again`) and fails, and freeing space is the fix either way.
 - A skip happens before the pod is asked anything or any of its dirs is made, one line per pod —
-  `✗ arena9-bloom: skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB) — nothing copied;
-  free space on / (…)` — and it is a failure of the run (the exit; `pods backup`'s `the fallback copy
+  `✗ arena9-bloom: skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB): this copy (~0.2
+  GB, …) + the floor = 5.2 GB needed — nothing copied; free at least 2.1 GB on / (…)` — how much
+  to free there is what it needs in all less what's free, rounded up — and it is a failure of the run (the exit; `pods backup`'s `the fallback copy
   failed too: skipped: …`; a `--hard` switch doesn't reset that pod). A `--dry-run` says which pods a
   real run would skip now.
 - The reaper keeps its own, larger `REAP_MIN_FREE_GB` (default 20) on both tier roots, never less
@@ -925,7 +939,7 @@ and `install` adds/replaces **only the lines its flags name**, keeping the rest 
   `CRON_TZ=`/`TZ=` the crontab sets, which some crons use instead). Log `health.log`; `flock -n -o`;
   read-only, so no `--yes`. It checks **this cohort's pods only**, never a staff box (a fleet-wide
   deep check's default), and carries `ARENA_STATE_DIR` as the archive's lines do, so its verdicts
-  reach the dashboard's HEALTH column and `snapshot` (re-run `install --health` after changing
+  reach the dashboard's HLTH column and `snapshot` (re-run `install --health` after changing
   `ARENA_STATE_DIR`). It exits non-zero when a pod FAILs; the log has the table, ending `N pass, N
   warn, N fail`.
   - **Pick a minute no other line uses** — off the backup's quarter-hours, the archive's
@@ -1127,7 +1141,7 @@ A terminate error other than "locked" sets an automatic hold.
 Needs an explicit absolute `ARENA_STATE_DIR` **in the config file** (state: `reap.json`, log:
 `reap-log.jsonl`) — a shell exporting a different one is refused (it would put a `hold` where the
 cron never looks); every state change prints the file it wrote — RunPod on REST v2, the default
-(pods on `RUNPOD_API=v1` and Vast are never reaped; since v2 became the default — 70bce78,
+(pods on `RUNPOD_API=v1`, Vast and Shadeform are never reaped; since v2 became the default — 70bce78,
 2026-10-19 — a config with no `RUNPOD_API` line, which ran v1, has its RunPod pods reapable without
 anyone choosing v2, so `reap status` and every plan say `RunPod: REST v2 (…) — RunPod pods with a
 policy can be reaped: terminated, container disk and all, after their backup` whenever one has a
@@ -1163,8 +1177,8 @@ restarted (a VS Code server left running, a `screen`, `mosh-server`, a forgotten
 terminal, a crontab line or timer, data on `/workspace` (where setup puts the repo when the pod has
 a volume) or another writable mount, any file in a `TEMP_FOLDER_FOR_SWEEPS/`, data written outside
 the home since the pod was created (or a link out of the home), a pod whose provider gives no
-creation time, a MIG GPU slice (`[N/A]` utilisation reads as unknown), RunPod on `RUNPOD_API=v1` and
-Vast (no lock state — `up --expire-*` refuses them, ENDS shows `not reapable (…)`), a pod renamed
+creation time, a MIG GPU slice (`[N/A]` utilisation reads as unknown), RunPod on `RUNPOD_API=v1`,
+Vast and Shadeform (no lock state — `up --expire-*` refuses them, ENDS shows `not reapable (…)`), a pod renamed
 outside arena or sharing its name, a home that's a link to another filesystem, `~/.arena/keep`.
 
 A tmux session whose panes run only a shell doesn't count (its utmp entries aren't logins); one
