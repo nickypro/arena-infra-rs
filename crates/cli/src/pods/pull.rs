@@ -13,9 +13,10 @@ use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
 use crate::cli::Select;
+use crate::cron::resolve_week_day;
 use crate::pods::exec_each_pod;
 use crate::pods::selection::{say, select, Selected, Unscoped};
-use crate::{confirm, disk, resolve_week_day};
+use crate::{confirm, disk};
 
 /// `pods pull`: rsync each pod's home directory to `<dir>/<label>/<pod-name>/`. The file
 /// backup (legacy `backup.sh`), complementing the git autocommit `backup`. It spawns
