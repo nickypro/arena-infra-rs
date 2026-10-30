@@ -58,6 +58,20 @@ pub fn up_without_endpoint(pod: &crate::pod::Pod) -> bool {
     pod.proxy_only || (!pod.provider.eq_ignore_ascii_case("runpod") && pod.status.trim().eq_ignore_ascii_case("RUNNING"))
 }
 
+/// How long after a pod is first listed up its backend may still hold its endpoint back on
+/// purpose — time `pods up` doesn't count towards `--endpoint-timeout`, so a healthy pod is never
+/// condemned for it. Shadeform: an `active` instance's IP is hidden for
+/// [`crate::provider::shadeform::BOOT_GRACE`] after its `active_at` (the bootstrap installs root's
+/// keys then), so it lists "active, no IP" by design — and `--endpoint-timeout 1` would otherwise
+/// end exactly when its IP appears (later still on a clock behind Shadeform's). Others: none. Pure.
+pub fn endpoint_held_back(pod: &crate::pod::Pod) -> std::time::Duration {
+    if pod.provider.eq_ignore_ascii_case(crate::provider::shadeform::NAME) {
+        std::time::Duration::from_secs(crate::provider::shadeform::BOOT_GRACE)
+    } else {
+        std::time::Duration::ZERO
+    }
+}
+
 /// The pod-aware status shared by the list and dashboard.
 pub fn pod_status(pod: &crate::pod::Pod, reachable: Option<bool>) -> String {
     if endpoint_overdue(pod, now_secs()) { "no-ssh".into() }
@@ -247,6 +261,19 @@ mod endpoint_tests {
         ];
         for (case, p, want) in cases {
             assert_eq!(up_without_endpoint(&p), want, "{case}");
+        }
+    }
+
+    /// Only Shadeform holds an endpoint back on purpose (its `BOOT_GRACE` after `active_at`):
+    /// that long isn't counted towards `--endpoint-timeout`.
+    #[test]
+    fn only_shadeform_holds_its_endpoint_back() {
+        use std::time::Duration;
+        let pod = |provider: &str| crate::pod::Pod { provider: provider.into(), status: "RUNNING".into(), ..Default::default() };
+        assert_eq!(endpoint_held_back(&pod("shadeform")), Duration::from_secs(crate::provider::shadeform::BOOT_GRACE));
+        assert_eq!(crate::provider::shadeform::BOOT_GRACE, 60);
+        for other in ["runpod", "vast", "hetzner", ""] {
+            assert_eq!(endpoint_held_back(&pod(other)), Duration::ZERO, "{other}");
         }
     }
 }

@@ -94,7 +94,9 @@ enum EndpointWait {
     Ready(Pod),
     /// Up without a usable endpoint ([`status::up_without_endpoint`] — on RunPod, its container
     /// running behind RunPod's SSH proxy only) for `--endpoint-timeout` (past the endpoint
-    /// deadline if need be: a whole one, always): a host failure once a fresh look confirms it
+    /// deadline if need be: a whole one, always — unless that deadline is a failed placement,
+    /// Shadeform's; its boot grace not counted, `Shared::grace_for`): a host failure once a fresh
+    /// look confirms it
     /// (`Shared::no_endpoint`; the pod as last listed so) — by the latest listing that showed it
     /// so, or an older one (the latest lacked it, or couldn't look its endpoint up).
     NoEndpoint { pod: Pod, up_for: Duration },
@@ -603,8 +605,19 @@ impl Shared<'_, '_> {
         // running" — billing.
         let started = Instant::now();
         let ready = self.run.provider.ready_deadline(&pod);
-        let deadline = started + ready.map_or(self.run.timeout, |r| r.min(self.run.timeout));
+        let mut deadline = started + ready.map_or(self.run.timeout, |r| r.min(self.run.timeout));
         let fail_on_expiry = ready.is_some() || self.run.provider.stop_support(&pod).is_err();
+        // Why such a backend's pod is a failed placement at its deadline.
+        let expired = || {
+            let bound = match ready {
+                Some(r) if r <= self.run.timeout => "its provider's ready deadline",
+                _ => "--timeout",
+            };
+            format!("not up after {} ({bound})", pipeline::fmt_elapsed(started.elapsed()))
+        };
+        // Whether the deadline was moved once already, for a pod first seen up without an
+        // endpoint by the deadline's own look (below).
+        let mut regraced = false;
         // A pod judged to have no endpoint is looked at once more first (`no_endpoint`); one that
         // turns out not to be up after all (restarting) or can't be read is waited for again,
         // its clock started over by the listings after that look, to the same deadline.
@@ -615,12 +628,26 @@ impl Shared<'_, '_> {
                 None => return self.end(run, Verdict::Stopped { stage: Stage::Endpoint }),
                 Some(EndpointWait::Failed { pod, why }) => return self.dead(run, &pod, option, failed_options, why).await,
                 Some(EndpointWait::TimedOut { .. }) if fail_on_expiry => {
-                    let bound = match ready {
-                        Some(r) if r <= self.run.timeout => "its provider's ready deadline",
-                        _ => "--timeout",
+                    // A last look at its own backend first (review of the nits): an endpoint that
+                    // came between the last listing and the deadline goes on; one deleted
+                    // elsewhere is said, nothing left; anything else is a failed placement, as
+                    // this deadline always was — deleted, never left billing.
+                    let Some(listings) = self.or_stop(self.run.provider.list_by_provider()).await else {
+                        return self.end(run, Verdict::Stopped { stage: Stage::Endpoint });
                     };
-                    let why = format!("not up after {} ({bound})", pipeline::fmt_elapsed(started.elapsed()));
-                    return self.dead(run, &pod, option, failed_options, why).await;
+                    match now_listed(&listings, &pod) {
+                        Now::Reachable(found) => break found,
+                        Now::Gone => {
+                            run.pod = None;
+                            let reason = format!(
+                                "{}, and {} no longer lists it (terminated elsewhere?) — nothing left running",
+                                expired(),
+                                pod.provider
+                            );
+                            return self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason });
+                        }
+                        _ => return self.dead(run, &pod, option, failed_options, expired()).await,
+                    }
                 }
                 Some(EndpointWait::TimedOut { last }) => {
                     // The wait never trusts one missing listing (a backend that failed to list
@@ -639,7 +666,12 @@ impl Shared<'_, '_> {
                     // Anything else still coming up — Vast `loading`, Hetzner
                     // `initializing`, a RunPod pod under a `--timeout` shorter than that limit, one
                     // that can't be read just now — is left running as before, and said to bill.
-                    let secs = self.run.timeout.as_secs();
+                    //
+                    // One this look is the first to see up without an endpoint (it came up between
+                    // the last listing and the deadline) gets its whole grace too, as every such
+                    // pod does — once: the deadline moves that far, and the wait resumes (review
+                    // of #39, nit C). Seen so again then, it is judged like any other.
+                    let secs = if regraced { started.elapsed().as_secs() } else { self.run.timeout.as_secs() };
                     let now = self.or_stop(self.run.provider.list_by_provider()).await.map(|l| now_listed(&l, &pod));
                     match now {
                         Some(Now::Gone) => {
@@ -652,6 +684,20 @@ impl Shared<'_, '_> {
                             return self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason });
                         }
                         Some(Now::Reachable(found)) => break found,
+                        Some(Now::NoEndpoint(p)) if !regraced => {
+                            regraced = true;
+                            let grace = self.grace_for(&p);
+                            deadline = Instant::now() + grace;
+                            say(
+                                To::Err,
+                                &format!(
+                                    "[{name}] no SSH endpoint after {secs}s, and only now up without one: giving it its {} \
+                                     (--endpoint-timeout)",
+                                    pipeline::fmt_elapsed(grace)
+                                ),
+                            );
+                            seen = Some(p);
+                        }
                         Some(Now::NotUp(p)) if no_container(&p) && self.run.timeout >= NO_CONTAINER_LIMIT => {
                             let why = format!(
                                 "still listed RUNNING with no container {} after its create (its image never started)",
@@ -675,6 +721,16 @@ impl Shared<'_, '_> {
                         Ok(Look::Found(found)) => break found,
                         // Not up after all, or not readable: wait on, from what that look saw.
                         Ok(Look::WaitOn(was)) => seen = Some(was),
+                        // So, past the deadline: where that is a failed placement (Shadeform: it
+                        // bills until deleted), as at the deadline — terminated, never left
+                        // billing (review of #39, nit A); elsewhere left running, said to bill.
+                        Ok(Look::Expired { pod: was, .. }) if fail_on_expiry => {
+                            return self.dead(run, &was, option, failed_options, expired()).await;
+                        }
+                        Ok(Look::Expired { pod: was, reason }) => {
+                            run.pod = Some(was);
+                            return self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason });
+                        }
                         Err(next) => return next,
                     }
                 }
@@ -976,8 +1032,10 @@ impl Shared<'_, '_> {
     /// after all — on with the pipeline. [`Look::WaitOn`]: it isn't up any more (a restart:
     /// RunPod lists RUNNING with no container while it pulls its image again), or it can't be
     /// read just now — wait on, its clock started over by the listings after this look, to the
-    /// same `deadline`; past it, such a pod is left running and said to bill. Nothing is
-    /// terminated on anything but a look that shows it up without an endpoint.
+    /// same `deadline`. [`Look::Expired`]: such a pod past the deadline — the caller fails it as
+    /// at the deadline (a failed placement where the deadline is one, else left running and said
+    /// to bill). Nothing else is terminated on anything but a look that shows it up without an
+    /// endpoint.
     async fn no_endpoint(
         &self,
         run: &mut NameRun,
@@ -1027,8 +1085,7 @@ impl Shared<'_, '_> {
             }
             Now::NotUp(p) => {
                 let reason = format!("{why}; now not up{}", left_running(&name, Some(&p)));
-                run.pod = Some(p);
-                return Err(self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason }));
+                return Ok(Look::Expired { pod: p, reason });
             }
             Now::Unknown(e) if in_time => {
                 (self.say)(
@@ -1042,7 +1099,7 @@ impl Shared<'_, '_> {
                     "{why} as last seen — its state couldn't be read just now ({e}), so it isn't replaced{}",
                     left_running(&name, Some(&pod))
                 );
-                return Err(self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason }));
+                return Ok(Look::Expired { pod, reason });
             }
             Now::NoEndpoint(p) => p,
         };
@@ -1304,6 +1361,15 @@ impl Shared<'_, '_> {
         }
     }
 
+    /// How long `pod` may be up without an SSH endpoint before it's judged: `--endpoint-timeout`,
+    /// plus whatever its backend holds its endpoint back for on purpose
+    /// ([`status::endpoint_held_back`]: Shadeform's 60 s boot grace) — never counted against it
+    /// (review of #39, nit B: `--endpoint-timeout 1` ended just as a healthy instance's IP was
+    /// due).
+    fn grace_for(&self, pod: &Pod) -> Duration {
+        self.run.endpoint_timeout + status::endpoint_held_back(pod)
+    }
+
     /// The pod `made` once the listing shows it with an SSH endpoint — or, once it has been up
     /// without one ([`status::up_without_endpoint`]: on RunPod, behind RunPod's SSH proxy only)
     /// for `--endpoint-timeout` — a whole one, past the deadline if need be — that; or at the
@@ -1324,14 +1390,17 @@ impl Shared<'_, '_> {
     /// listed without its endpoint or proxy-only flag whatever it has). Either way a verdict may
     /// rest on an older listing: `Shared::no_endpoint` looks again before acting on it.
     ///
-    /// `dead_on_error`: a pod listed `ERROR` meanwhile is [`EndpointWait::Failed`] (a backend
-    /// with a ready deadline — Shadeform; elsewhere ERROR isn't known to be final, and the wait
-    /// runs on as before).
+    /// `dead_on_error`: a backend where the deadline is a failed placement (a ready deadline, or
+    /// pods that can't be stopped — Shadeform). A pod listed `ERROR` meanwhile is
+    /// [`EndpointWait::Failed`] (elsewhere ERROR isn't known to be final, and the wait runs on as
+    /// before), and the deadline is the end, grace or not: [`EndpointWait::TimedOut`], as before
+    /// `--endpoint-timeout` existed — such a pod bills until deleted, so its grace never runs past
+    /// it (review of #39, nit A).
     async fn wait_endpoint(&self, made: &Pod, deadline: Instant, dead_on_error: bool, seen: Option<Pod>) -> EndpointWait {
         let _waiting = Waiting::new(&self.waiters);
         self.waiter_added.notify_one();
         let mut rx = self.listing.subscribe();
-        let grace = self.run.endpoint_timeout;
+        let grace = self.grace_for(made);
         // When it was first seen up without an endpoint (this stretch), and as last seen so.
         let mut bare: Option<(Instant, Pod)> = None;
         // A wait resumed after a fresh look starts from what that look saw, and from the
@@ -1341,8 +1410,8 @@ impl Shared<'_, '_> {
         // As the latest listing that said anything about it had it (for `--timeout`'s verdict).
         let mut last: Option<Pod> = seen;
         let at_deadline = |bare: Option<(Instant, Pod)>, last: Option<Pod>| match bare {
-            Some((since, pod)) => EndpointWait::NoEndpoint { pod, up_for: since.elapsed() },
-            None => EndpointWait::TimedOut { last },
+            Some((since, pod)) if !dead_on_error => EndpointWait::NoEndpoint { pod, up_for: since.elapsed() },
+            _ => EndpointWait::TimedOut { last },
         };
         loop {
             let listed = rx.borrow_and_update().iter().find(|p| p.id == made.id && p.provider == made.provider).cloned();
@@ -1375,10 +1444,11 @@ impl Shared<'_, '_> {
             // of it (review r3), and one whose container came up late (a slow pull, then behind
             // the proxy only — live 2026-10-30, 6m39s) is replaced, not left running at the
             // deadline. Wake for the next listing, that end, or the end of a clock still running
-            // (one already over waits for a listing that shows the pod — or the end).
+            // (one already over waits for a listing that shows the pod — or the end). Not past a
+            // deadline that is a failed placement (`dead_on_error`).
             let now = Instant::now();
             let grace_end = bare.as_ref().map(|(t, _)| *t + grace);
-            let end = grace_end.map_or(deadline, |g| deadline.max(g));
+            let end = if dead_on_error { deadline } else { grace_end.map_or(deadline, |g| deadline.max(g)) };
             let wake = grace_end.filter(|g| *g > now).map_or(end, |g| g.min(end));
             // A listing first: at the end, one that arrived with it is looked at before the
             // verdict (it may hold the endpoint).
@@ -1757,6 +1827,9 @@ enum Look {
     Found(Pod),
     /// Wait on (its clock started over), the pod as this look saw it — or, unread, as last seen.
     WaitOn(Pod),
+    /// Past the deadline, not up now or not readable: the pod as this look saw it (or as last
+    /// seen), and the reason it is left running with — where expiry isn't a failed placement.
+    Expired { pod: Pod, reason: String },
 }
 
 /// What a fresh look at a pod up found ([`now_listed`]).
@@ -1937,7 +2010,8 @@ mod tests {
         machines_by_id: Mutex<HashMap<String, String>>,
         /// Per name: what its next create is listed as later, phase by phase — `(ip, port, after)`
         /// from the create, as in the script — so a pod can first be up without an endpoint
-        /// (`proxy`, `bare`), restart (`bare` on RunPod: RUNNING with no container), and get one.
+        /// (`proxy`, `bare`), restart (`bare` on RunPod: RUNNING with no container; `pending`:
+        /// listed PENDING), and get one.
         later: Mutex<Phases>,
         /// Until then RunPod's endpoint lookups fail: a pod without an endpoint is listed with
         /// `status_detail` saying so and no proxy-only flag, as `runpod_v2::fill_endpoints` lists it.
@@ -1998,6 +2072,9 @@ mod tests {
                         } else if ip == "error" {
                             p.status = "ERROR".into();
                             p.status_detail = Some("provider failed to launch".into());
+                        } else if ip == "pending" {
+                            // Not up (again): listed PENDING, no endpoint.
+                            p.status = "PENDING".into();
                         } else if ip != "bare" {
                             (p.ssh_ip, p.ssh_port) = (Some(ip.to_string()), Some(port));
                         }
@@ -3381,6 +3458,170 @@ mod tests {
         assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "nothing terminated");
         let (_, at) = lines.find("[devtest-apple] endpoint 10.0.0.1:22001 (after 10m00s)");
         assert_eq!(at, Duration::from_secs(600));
+    }
+
+    /// Review of #39, nit C: a pod the deadline's own look is the first to see up without an
+    /// endpoint — RunPod: its container came up behind the proxy only between the last listing
+    /// (595 s, listings every 7 s) and the deadline (600 s) — gets its whole grace too, once: the
+    /// wait resumes, and after it the pod is replaced (the replacement READY). One whose endpoint
+    /// comes during that grace is READY, nothing terminated.
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_first_seen_up_without_an_endpoint_at_the_deadline_gets_its_grace() {
+        let cfg = cfg(None);
+        let fleet = Fleet::new(&[("apple", &[("proxy", 0, 598), ("10.0.0.2", 22002, 0)])]);
+        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
+        run.interval = Duration::from_secs(7);
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(
+            fleet.events(),
+            [format!("create devtest-apple {A4000}"), "terminate id1".to_string(), format!("create devtest-apple {R3090}")]
+        );
+        assert_eq!(rows[0].verdict, Verdict::Ready, "{:#?}", lines.all());
+        let (_, at) = lines.find(
+            "[devtest-apple] no SSH endpoint after 600s, and only now up without one: giving it its 5m00s (--endpoint-timeout)",
+        );
+        assert_eq!(at, Duration::from_secs(600));
+        let (_, at) = lines.find("[devtest-apple] no public endpoint (RunPod ssh proxy only) for 5m00s");
+        assert!(at >= Duration::from_secs(900) && at < Duration::from_secs(910), "{at:?}");
+        assert_eq!(rows[0].attempts[0].end, AttemptEnd::NoEndpoint(PROXY_ONLY_END.into()));
+
+        let fleet = Fleet::new(&[("apple", &[("proxy", 0, 598)])]);
+        fleet.later.lock().unwrap().insert("devtest-apple".into(), vec![("10.0.0.1".into(), 22001, Duration::from_secs(700))]);
+        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
+        run.interval = Duration::from_secs(7);
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(rows[0].verdict, Verdict::Ready, "{:#?}", lines.all());
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "nothing terminated");
+        let (_, at) = lines.find("[devtest-apple] endpoint 10.0.0.1:22001");
+        assert!(at >= Duration::from_secs(700) && at < Duration::from_secs(710), "{at:?}");
+    }
+
+    /// Review of #39, nit A: on a backend whose deadline is a failed placement (Shadeform: it
+    /// can't be stopped, and bills until deleted) a pod is never "left running, still billing"
+    /// at it, as before `--endpoint-timeout`. Judged without an endpoint at 590 s (active with no
+    /// IP from 230 s: 5 minutes plus its 60 s boot grace), its fresh look lands past the 600 s
+    /// deadline (a 15 s listing) and can't condemn it — unreadable (a 5xx), or not up — so it is
+    /// a failed placement as at the deadline: deleted. And its grace never runs past the
+    /// deadline: one active with no IP from 500 s is deleted at 600 s, not judged at 860 s.
+    #[tokio::test(start_paused = true)]
+    async fn on_shadeform_the_deadline_still_deletes_a_pod_without_an_endpoint() {
+        let cfg = cfg(None);
+        for case in ["unreadable", "not up"] {
+            let mut fleet = Fleet::new(&[("apple", &[("bare", 0, 230)])]);
+            (fleet.tag, fleet.pending, fleet.ready) = (Some("shadeform"), Some("PENDING"), Some(Duration::from_secs(15 * 60)));
+            fleet.sync_delay = Duration::from_secs(15);
+            if case == "not up" {
+                fleet.later.lock().unwrap().insert("devtest-apple".into(), vec![("pending".into(), 0, Duration::from_secs(595))]);
+            }
+            let run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, false, None, None).await;
+            let made = make(&fleet, &["apple"]).await;
+            let outage = async {
+                if case == "unreadable" {
+                    tokio::time::sleep(Duration::from_secs(595)).await;
+                    *fleet.down_until.lock().unwrap() = Some(Instant::now() + Duration::from_secs(100_000));
+                }
+            };
+            let lines = Lines::new();
+            let say = |to, l: &str| lines.say(to, l);
+            let (rows, ()) = tokio::join!(run_up(&run, made, std::future::pending(), &say), outage);
+            assert_eq!(fleet.events()[..2], [format!("create devtest-apple {A4000}"), "terminate id1".to_string()], "{case}");
+            let (_, at) = lines.find("[devtest-apple] not up after 10m05s (--timeout) — before it came up: a failed placement");
+            assert_eq!(at, Duration::from_secs(605), "{case}");
+            match &rows[0].verdict {
+                Verdict::Failed { stage: Stage::Endpoint, reason } => assert!(!reason.contains("left running"), "{case}: {reason}"),
+                other => panic!("{case}: {other:?}"),
+            }
+        }
+
+        let mut fleet = Fleet::new(&[("apple", &[("bare", 0, 500)])]);
+        (fleet.tag, fleet.pending, fleet.ready) = (Some("shadeform"), Some("PENDING"), Some(Duration::from_secs(15 * 60)));
+        let run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, false, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(fleet.events()[..2], [format!("create devtest-apple {A4000}"), "terminate id1".to_string()]);
+        let (_, at) = lines.find("[devtest-apple] not up after 10m00s (--timeout) — before it came up: a failed placement");
+        assert_eq!(at, Duration::from_secs(600));
+    }
+
+    /// Shadeform's deadline looks once more before it deletes (review of the nits): an instance
+    /// whose IP came between the last listing (595 s, every 7 s) and the 600 s deadline goes on,
+    /// READY, nothing deleted; one deleted elsewhere meanwhile is said to be gone — not deleted
+    /// again, nothing recreated.
+    #[tokio::test(start_paused = true)]
+    async fn shadeforms_deadline_looks_once_more_before_it_deletes() {
+        let cfg = cfg(None);
+        let mut fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 598)])]);
+        (fleet.tag, fleet.pending, fleet.ready) = (Some("shadeform"), Some("PENDING"), Some(Duration::from_secs(15 * 60)));
+        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, false, None, None).await;
+        run.interval = Duration::from_secs(7);
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(rows[0].verdict, Verdict::Ready, "{:#?}", lines.all());
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "nothing deleted");
+        let (_, at) = lines.find("[devtest-apple] endpoint 10.0.0.1:22001 (after 10m00s)");
+        assert_eq!(at, Duration::from_secs(600));
+
+        let mut fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 100_000)])]);
+        (fleet.tag, fleet.pending, fleet.ready) = (Some("shadeform"), Some("PENDING"), Some(Duration::from_secs(15 * 60)));
+        let run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, false, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let elsewhere = async {
+            tokio::time::sleep(Duration::from_secs(595)).await;
+            fleet.terminate_pod("id1").await.unwrap();
+        };
+        let (rows, ()) = tokio::join!(run_up(&run, made, std::future::pending(), &|_, _| {}), elsewhere);
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}"), "terminate id1".to_string()], "only the one elsewhere");
+        match &rows[0].verdict {
+            Verdict::Failed { stage: Stage::Endpoint, reason } => assert_eq!(
+                reason,
+                "not up after 10m00s (--timeout), and shadeform no longer lists it (terminated elsewhere?) — nothing left running"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Review of #39, nit B: Shadeform hides an `active` instance's IP for its 60 s boot grace
+    /// (`shadeform::BOOT_GRACE`), so "active, no IP" is expected then — not counted towards
+    /// `--endpoint-timeout`. With `--endpoint-timeout 1`, an instance active from 30 s whose IP
+    /// shows at 95 s (a clock a few seconds behind Shadeform's) is READY, not terminated at 90 s.
+    /// One that never gets an IP is still replaced, after both: 2 minutes.
+    #[tokio::test(start_paused = true)]
+    async fn shadeforms_boot_grace_is_not_counted_against_the_endpoint_timeout() {
+        let cfg = cfg(None);
+        let shadeform = |script: &[Script<'_>]| {
+            let mut fleet = Fleet::new(script);
+            (fleet.tag, fleet.pending, fleet.ready) = (Some("shadeform"), Some("PENDING"), Some(Duration::from_secs(15 * 60)));
+            fleet
+        };
+        let fleet = shadeform(&[("apple", &[("bare", 0, 30)])]);
+        fleet.later.lock().unwrap().insert("devtest-apple".into(), vec![("10.0.0.1".into(), 22001, Duration::from_secs(95))]);
+        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, false, None, None).await;
+        run.endpoint_timeout = Duration::from_secs(60);
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(rows[0].verdict, Verdict::Ready, "{:#?}", lines.all());
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "nothing terminated");
+
+        let fleet = shadeform(&[("apple", &[("bare", 0, 30), ("10.0.0.2", 22002, 0)])]);
+        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, false, None, None).await;
+        run.endpoint_timeout = Duration::from_secs(60);
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(rows[0].verdict, Verdict::Ready, "{:#?}", lines.all());
+        assert_eq!(
+            fleet.events(),
+            [format!("create devtest-apple {A4000}"), "terminate id1".to_string(), format!("create devtest-apple {R3090}")]
+        );
+        let (_, at) = lines.find("[devtest-apple] listed running for 2m00s with no SSH endpoint");
+        assert_eq!(at, Duration::from_secs(150));
     }
 
     /// Hetzner, Vast and Shadeform pods still coming up (`initializing`, `LOADING`, `PENDING`)
