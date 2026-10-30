@@ -1,5 +1,6 @@
 //! Runs: the CLI commands the dashboard starts — `pods up` from the add-pod form, `pods start`,
-//! `rename`, `jobs` and `logs` from the action menu, and the form's `offers` reads — as the
+//! `rename`, `jobs` and `logs` and the AI key's `keys limit|pause|resume|rotate` from the action
+//! menus, and the form's `offers` reads — as the
 //! `arena` binary beside its own (`arena tui` launched it from there; canonicalised, so a
 //! symlinked `arena-tui` finds the real one), **never one from `PATH`**: on a box with two
 //! installs that could be another version, or another account's.
@@ -108,23 +109,51 @@ pub(crate) enum Kind {
     Rename,
     Jobs,
     Logs,
+    /// `keys limit|pause|resume|rotate`: an AI key changed (rotate also copies onto the pod).
+    KeyLimit,
+    KeyPause,
+    KeyResume,
+    KeyRotate,
 }
 
 impl Kind {
-    fn word(&self) -> &'static str {
+    /// What it runs, in the footer and the notice: `pods up`, `keys limit`.
+    fn what(&self) -> &'static str {
         match self {
-            Kind::Up => "up",
-            Kind::Start => "start",
-            Kind::Rename => "rename",
-            Kind::Jobs => "jobs",
-            Kind::Logs => "logs",
+            Kind::Up => "pods up",
+            Kind::Start => "pods start",
+            Kind::Rename => "pods rename",
+            Kind::Jobs => "pods jobs",
+            Kind::Logs => "pods logs",
+            Kind::KeyLimit => "keys limit",
+            Kind::KeyPause => "keys pause",
+            Kind::KeyResume => "keys resume",
+            Kind::KeyRotate => "keys rotate",
         }
     }
 
-    /// It changes pods: left running when the dashboard ends (asked first on a quit), never
-    /// killed with it. The rest only read.
+    /// The output file's word: `up`, `keys-limit`.
+    fn word(&self) -> String {
+        let what = self.what();
+        what.strip_prefix("pods ").unwrap_or(what).replace(' ', "-")
+    }
+
+    /// It changes something — pods, or an AI key: left running when the dashboard ends (asked
+    /// first on a quit), never killed with it. The rest only read.
     pub(crate) fn lasting(&self) -> bool {
+        !matches!(self, Kind::Jobs | Kind::Logs)
+    }
+
+    /// Its output says how each pod is doing (`[name] …` lines): the commands that make or change
+    /// pods. A key command's lines are about keys.
+    fn tracks_pods(&self) -> bool {
         matches!(self, Kind::Up | Kind::Start | Kind::Rename)
+    }
+
+    /// It changes AI keys (a rename renames the pod's): the `AI$` column is read again once it
+    /// ends ([`finish`]).
+    pub(crate) fn changes_keys(&self) -> bool {
+        matches!(self, Kind::Rename | Kind::KeyLimit | Kind::KeyPause | Kind::KeyResume | Kind::KeyRotate)
     }
 }
 
@@ -270,7 +299,7 @@ impl Run {
                 self.waiting = None;
             }
         }
-        if let Some((name, state)) = self.kind.lasting().then(|| pod_line(&line)).flatten() {
+        if let Some((name, state)) = self.kind.tracks_pods().then(|| pod_line(&line)).flatten() {
             if state == PodState::Created && self.kind == Kind::Up {
                 created = Some(name.clone());
             }
@@ -323,7 +352,7 @@ impl Run {
     fn notice(&self) -> (String, bool) {
         let Some((_, end)) = &self.end else { return (String::new(), false) };
         let tally = self.tally();
-        let what = format!("pods {}", self.kind.word());
+        let what = self.kind.what();
         let text = match (end.ok(), tally.is_empty()) {
             (true, true) => format!("✓ {what} done"),
             (true, false) => format!("✓ {what}: {tally}"),
@@ -483,7 +512,9 @@ async fn supervise(shared: Arc<Mutex<Shared>>, nudge: Arc<Notify>, id: u64, mut 
         Some(Err(e)) => End::NotStarted(format!("waiting for it: {e}")),
         None => End::NotStarted("lost".into()),
     };
-    finish(&shared, id, end);
+    if finish(&shared, id, end) {
+        nudge.notify_one();
+    }
 }
 
 /// A run's output as lines, fed as it's read: a line ends at `\n`, `\r` or `\r\n` (a progress
@@ -572,7 +603,7 @@ pub(crate) fn apply(s: &mut Shared, id: u64, lines: Vec<String>) -> bool {
     let mut created = Vec::new();
     let mut refresh = false;
     for line in lines {
-        refresh |= r.kind.lasting() && matches!(pod_line(&line), Some((_, PodState::Ready(_) | PodState::Failed(_))));
+        refresh |= r.kind.tracks_pods() && matches!(pod_line(&line), Some((_, PodState::Ready(_) | PodState::Failed(_))));
         created.extend(r.take(line));
     }
     for name in created {
@@ -584,12 +615,17 @@ pub(crate) fn apply(s: &mut Shared, id: u64, lines: Vec<String>) -> bool {
     refresh
 }
 
-fn finish(shared: &Mutex<Shared>, id: u64, end: End) {
+/// Run `id` ended: its notice in the footer. One that changed AI keys asks for them to be read
+/// again ([`Shared::ai_wanted`]) — `true`: nudge the refresh, which reads them at once.
+fn finish(shared: &Mutex<Shared>, id: u64, end: End) -> bool {
     let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(r) = s.runs.iter_mut().find(|r| r.id == id) else { return };
+    let Some(r) = s.runs.iter_mut().find(|r| r.id == id) else { return false };
     r.end = Some((Instant::now(), end));
     let (text, bad) = r.notice();
+    let keys = r.kind.changes_keys();
     s.notify(text, bad);
+    s.ai_wanted |= keys;
+    keys
 }
 
 /// Run `arena offers …` for `q` in the background; its answer lands in `Shared::offers_landed`
@@ -801,7 +837,7 @@ pub(crate) fn footer(s: &Shared) -> Option<String> {
                 notes.push(format!("waiting for capacity until {}", clock(until)));
             }
             let notes = if notes.is_empty() { String::new() } else { format!(" ({})", notes.join(", ")) };
-            format!("pods {} {}{notes}", r.kind.word(), elapsed(r.started.elapsed()))
+            format!("{} {}{notes}", r.kind.what(), elapsed(r.started.elapsed()))
         })
         .collect();
     (!going.is_empty()).then(|| format!("running: {} · [p] progress · ", going.join(", ")))

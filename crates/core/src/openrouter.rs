@@ -1,6 +1,7 @@
 //! OpenRouter **provisioning** API: mint / list / delete the runtime API keys we hand
 //! out to the cohort (one per machine), so keys can be generated, rotated, and revoked
-//! programmatically — e.g. to recover from a leak — and read what each has spent.
+//! programmatically — e.g. to recover from a leak — read what each has spent, and raise a
+//! key's cap or pause it in place ([`OpenRouter::update_key`], planned by [`plan_cap`]).
 //!
 //! This needs a *provisioning* key — OpenRouter now calls it a **management** key
 //! (openrouter.ai → Settings → Management Keys) — which is distinct from the runtime keys
@@ -273,21 +274,35 @@ impl OpenRouter {
     /// check the answer is that key, and compare its workspace. Nothing to check without a
     /// workspace.
     async fn ensure_in_workspace(&self, hash: &str, what: &str) -> Result<()> {
-        let Some(ws) = self.workspace_id().await? else { return Ok(()) };
+        self.check_key(hash, what, None).await
+    }
+
+    /// [`Self::ensure_in_workspace`], and — given a `check` — that the key as it is now passes
+    /// it: one read (`GET /keys/{hash}`) serves both; none when there's nothing to check.
+    async fn check_key(&self, hash: &str, what: &str, check: Option<KeyCheck<'_>>) -> Result<()> {
+        let ws = self.workspace_id().await?;
+        if ws.is_none() && check.is_none() {
+            return Ok(());
+        }
         let v = send_json(self.auth(self.client.get(format!("{}/{hash}", self.keys_url()))), &format!("openrouter {what}"))
             .await?;
         let data = v.get("data");
         let theirs = data.and_then(|d| d.get("workspace_id")).and_then(|s| s.as_str());
         let same_key = data.and_then(|d| d.get("hash")).and_then(|s| s.as_str()) == Some(hash);
-        if same_key && theirs.is_some_and(|t| t.eq_ignore_ascii_case(&ws)) {
-            return Ok(());
+        if ws.is_some_and(|ws| !(same_key && theirs.is_some_and(|t| t.eq_ignore_ascii_case(&ws)))) {
+            return Err(Error::provider(format!(
+                "openrouter {what}: refused — key {} is in workspace {}, not OPENROUTER_WORKSPACE ({})",
+                short_hash(hash),
+                if same_key { theirs.unwrap_or("(not said)") } else { "(the answer was for another key)" },
+                self.workspace.as_deref().unwrap_or_default(),
+            )));
         }
-        Err(Error::provider(format!(
-            "openrouter {what}: refused — key {} is in workspace {}, not OPENROUTER_WORKSPACE ({})",
-            short_hash(hash),
-            if same_key { theirs.unwrap_or("(not said)") } else { "(the answer was for another key)" },
-            self.workspace.as_deref().unwrap_or_default(),
-        )))
+        let Some(check) = check else { return Ok(()) };
+        let now = data.filter(|_| same_key).and_then(|d| serde_json::from_value::<KeyInfo>(d.clone()).ok());
+        match now {
+            Some(k) => check(&k).map_err(|why| Error::provider(format!("openrouter {what}: refused — key {}: {why} — nothing done", short_hash(hash)))),
+            None => Err(Error::provider(format!("openrouter {what}: refused — key {} couldn't be read back to check it", short_hash(hash)))),
+        }
     }
 
     /// Delete the key with `hash` (irreversible — the runtime key stops working). With a
@@ -317,6 +332,24 @@ impl OpenRouter {
             "openrouter rename key",
         )
         .await
+    }
+
+    /// Change the key with `hash` in place (`PATCH /keys/{hash}`): its cap, when the cap starts
+    /// over, whether it's disabled — only the fields `update` gives ([`update_body`]; never the
+    /// name, never `workspace_id`, which on this call *moves* a key). How `keys limit|pause|
+    /// resume` and the dashboard raise a cap or pause a key; the secret and the usage are
+    /// untouched. The key is read first (`GET /keys/{hash}`) when there's a workspace — only a key
+    /// in it, the guard of rename/delete — or a `check`: the caller's test of the key as it is now
+    /// ([`KeyCheck`]) — still the one it planned for, as planned, and still a change its rules
+    /// allow — so a change planned from an older reading never lands over a newer one (another
+    /// operator raised it, renamed it, the participant spent past a lowered cap). That read is
+    /// the request just before the change: OpenRouter has no conditional update to close the
+    /// rest. Status only, as a rename: the caller reads the keys again to see what they say now.
+    pub async fn update_key(&self, hash: &str, update: &KeyUpdate, check: Option<KeyCheck<'_>>) -> Result<()> {
+        let body = update_body(update)?;
+        valid_hash(hash)?;
+        self.check_key(hash, "update key", check).await?;
+        send_ok(self.auth(self.client.patch(format!("{}/{hash}", self.keys_url()))).json(&body), "openrouter update key").await
     }
 
     /// The account's credit, bought and used (`GET /credits`).
@@ -473,6 +506,370 @@ pub fn rename_body(new_name: &str) -> serde_json::Value {
     serde_json::json!({ "name": new_name })
 }
 
+// ---------------------------------------------------------------------------------------
+// Caps: what `keys limit|pause|resume` and the dashboard's raise-cap box change (pure)
+// ---------------------------------------------------------------------------------------
+
+/// When a key's cap starts over (`limit_reset`): at 00:00 UTC each day, each week (from Monday)
+/// or each month. A key without one counts everything it ever spent against its cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitReset {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl LimitReset {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LimitReset::Daily => "daily",
+            LimitReset::Weekly => "weekly",
+            LimitReset::Monthly => "monthly",
+        }
+    }
+
+    /// `--reset`'s value: `daily`, `weekly`, `monthly`, or `never` (`None`: no reset). Pure.
+    pub fn parse(s: &str) -> Result<Option<LimitReset>> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "daily" => Ok(Some(LimitReset::Daily)),
+            "weekly" => Ok(Some(LimitReset::Weekly)),
+            "monthly" => Ok(Some(LimitReset::Monthly)),
+            "never" | "none" => Ok(None),
+            other => Err(Error::Config(format!("`{other}` isn't a cap reset — daily, weekly, monthly or never"))),
+        }
+    }
+
+    /// A listed key's: anything but the three is none, as the dashboard reads it.
+    pub fn of(k: &KeyInfo) -> Option<LimitReset> {
+        match k.limit_reset.as_deref() {
+            Some("daily") => Some(LimitReset::Daily),
+            Some("weekly") => Some(LimitReset::Weekly),
+            Some("monthly") => Some(LimitReset::Monthly),
+            _ => None,
+        }
+    }
+}
+
+/// The period a cap that starts over `reset` counts, after an amount: `today`, `this week`,
+/// `this month`, `in all` (no reset).
+pub fn period_words(reset: Option<LimitReset>) -> &'static str {
+    period(reset.map(|r| r.as_str())).unwrap_or("in all")
+}
+
+/// What a `PATCH /keys/{hash}` changes ([`OpenRouter::update_key`]): only the fields given.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KeyUpdate {
+    /// `Some(Some(usd))` caps the key at `usd`; `Some(None)` takes its cap away; `None` leaves it.
+    pub limit: Option<Option<f64>>,
+    /// `Some(Some(r))` starts the cap over each period `r`; `Some(None)` never; `None` leaves it.
+    pub limit_reset: Option<Option<LimitReset>>,
+    /// `Some(true)` pauses the key (its calls fail), `Some(false)` resumes it; `None` leaves it.
+    pub disabled: Option<bool>,
+}
+
+/// OpenRouter's ceiling for a key's cap: under 1 000 000 USD.
+pub const MAX_LIMIT: f64 = 1_000_000.0;
+
+/// The `PATCH /keys/{hash}` body for `u`: `limit` (a number, or `null` = no cap), `limit_reset`
+/// (`daily`/`weekly`/`monthly`, or `null` = never), `disabled` — each only when given, nothing
+/// else (`name` stays; `workspace_id` on this call would *move* the key). A cap outside
+/// OpenRouter's range (0 up to [`MAX_LIMIT`], a number) or an update that changes nothing
+/// (OpenRouter answers 400 "No update fields provided") is refused here, before any call. Pure.
+pub fn update_body(u: &KeyUpdate) -> Result<serde_json::Value> {
+    let mut body = serde_json::Map::new();
+    if let Some(limit) = u.limit {
+        if let Some(x) = limit.filter(|x| !(x.is_finite() && (0.0..MAX_LIMIT).contains(x))) {
+            return Err(Error::Config(format!("a key's cap is USD 0 up to (not including) {MAX_LIMIT:.0} — not {x}")));
+        }
+        body.insert("limit".into(), serde_json::json!(limit));
+    }
+    if let Some(reset) = u.limit_reset {
+        body.insert("limit_reset".into(), serde_json::json!(reset.map(|r| r.as_str())));
+    }
+    if let Some(d) = u.disabled {
+        body.insert("disabled".into(), serde_json::json!(d));
+    }
+    if body.is_empty() {
+        return Err(Error::Config("openrouter update key: nothing to change".into()));
+    }
+    Ok(serde_json::Value::Object(body))
+}
+
+/// What `keys limit` (and the dashboard's raise-cap box) asks of a key's cap.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CapChange {
+    /// Cap it at this many USD (`10`, `2.50`).
+    To(f64),
+    /// Raise the cap it has by this many USD (`+5`).
+    Raise(f64),
+    /// No cap at all: only from `--no-cap`, never from an amount typed.
+    NoCap,
+}
+
+/// An amount as typed: `10` or `2.50` (USD, a `$` allowed) sets the cap, `+5` raises the one the
+/// key has by $5 (`+0` keeps it: with `--reset`, only when it starts over changes). Digits and
+/// one `.` only — no `1e3`, `inf` or `nan` — and under OpenRouter's ceiling. Words for "no cap"
+/// are refused with the flag that does it: a cap is never lifted by an amount. Pure.
+pub fn parse_cap(s: &str) -> std::result::Result<CapChange, String> {
+    let t = s.trim();
+    let (raise, rest) = match t.strip_prefix('+') {
+        Some(r) => (true, r.trim_start()),
+        None => (false, t),
+    };
+    let num = rest.strip_prefix('$').unwrap_or(rest);
+    let plain = num.bytes().any(|c| c.is_ascii_digit())
+        && num.bytes().all(|c| c.is_ascii_digit() || c == b'.')
+        && num.bytes().filter(|&c| c == b'.').count() <= 1;
+    match plain.then(|| num.parse::<f64>().ok()).flatten() {
+        Some(x) if x < MAX_LIMIT => Ok(if raise { CapChange::Raise(x) } else { CapChange::To(x) }),
+        Some(_) => Err(format!("`{t}`: OpenRouter caps a key under ${MAX_LIMIT:.0}")),
+        None if ["none", "no", "off", "unlimited", "nocap", "no-cap", "inf", "infinite", "∞"].contains(&t.to_ascii_lowercase().as_str()) => {
+            Err("no cap is `--no-cap` (the CLI's), never an amount".into())
+        }
+        None if t.starts_with('-') => Err(format!("`{t}`: to lower a cap, give the new cap itself (`2`), not a negative raise")),
+        None => Err(format!("`{t}` isn't an amount — USD as `10` or `2.50` sets the cap, `+5` raises it by $5")),
+    }
+}
+
+/// What `k` has spent against a cap that starts over `reset`: that period's own usage (today's
+/// for a daily cap, …, the life's without a reset) — else, for the reset the key has, OpenRouter's
+/// `limit − limit_remaining`, which stops at the cap (a key over its cap reads as at it). Not
+/// [`KeyUsage::spent`], which prefers the latter: a plan must see a $2.60 spend against a $2.50
+/// cap as more than $2.50. Pure.
+pub fn spent_against(k: &KeyInfo, reset: Option<LimitReset>) -> Option<f64> {
+    let own = match reset {
+        Some(LimitReset::Daily) => k.usage_daily,
+        Some(LimitReset::Weekly) => k.usage_weekly,
+        Some(LimitReset::Monthly) => k.usage_monthly,
+        None => k.usage,
+    };
+    own.or_else(|| match (k.limit, k.limit_remaining) {
+        (Some(l), Some(r)) if reset == LimitReset::of(k) => Some((l - r).max(0.0)),
+        _ => None,
+    })
+}
+
+/// One key's cap change, planned against the cap it has and what it has spent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapPlan {
+    pub before: Option<f64>,
+    pub after: Option<f64>,
+    pub reset_before: Option<LimitReset>,
+    pub reset_after: Option<LimitReset>,
+    /// What it has spent against the new cap ([`spent_against`] for `reset_after`), if known.
+    pub spent: Option<f64>,
+}
+
+impl CapPlan {
+    fn cap_changes(&self) -> bool {
+        match (self.before, self.after) {
+            (Some(b), Some(a)) => (a - b).abs() > 1e-9,
+            (None, None) => false,
+            _ => true,
+        }
+    }
+
+    /// Whether it changes the key at all.
+    pub fn changes(&self) -> bool {
+        self.cap_changes() || self.reset_after != self.reset_before
+    }
+
+    /// The key's calls still fail after it: the new cap is at or under what was spent against it
+    /// (to the float's noise, [`CAP_EPSILON`] — never a cent's slack: a cap of $1 over a $0.999
+    /// spend still has room).
+    pub fn still_at_cap(&self) -> bool {
+        matches!((self.after, self.spent), (Some(a), Some(s)) if s >= a - CAP_EPSILON)
+    }
+
+    /// The `PATCH` it takes: the cap and the reset, each only when it changes.
+    pub fn update(&self) -> KeyUpdate {
+        KeyUpdate {
+            limit: self.cap_changes().then_some(self.after),
+            limit_reset: (self.reset_after != self.reset_before).then_some(self.reset_after),
+            disabled: None,
+        }
+    }
+
+    /// `cap $0.10 → $0.20 · spent $0.00 in all`, `cap $5.00 → $10.00 (monthly) · spent $0.42 this
+    /// month`, `cap $5.00, daily → never · spent $3.00 in all — still at its cap`.
+    pub fn words(&self) -> String {
+        let cap = |x: Option<f64>| x.map(exact_money).unwrap_or_else(|| "no cap".into());
+        let reset = |r: Option<LimitReset>| r.map_or("never", |r| r.as_str());
+        let mut out = match (self.cap_changes(), self.after) {
+            (true, _) => format!("cap {} → {}", cap(self.before), cap(self.after)),
+            (false, Some(_)) => format!("cap {}", cap(self.after)),
+            (false, None) => "no cap".to_string(),
+        };
+        if self.reset_after != self.reset_before {
+            out.push_str(&format!(", resets {} → {}", reset(self.reset_before), reset(self.reset_after)));
+        } else if let (Some(r), Some(_)) = (self.reset_after, self.after) {
+            out.push_str(&format!(" ({})", r.as_str()));
+        }
+        let spent = self.spent.map(|s| crate::fleet::fmt_money("$", s)).unwrap_or_else(|| "?".into());
+        out.push_str(&format!(" · spent {spent} {}", period_words(self.reset_after)));
+        if self.still_at_cap() {
+            out.push_str(" — still at its cap");
+        }
+        out
+    }
+}
+
+/// Plan `change` (none: the cap stays) and `reset` (none: as it is; `Some(None)`: never) for
+/// `k`. Refused — the why, for the caller to put after the key's name — when a raise meets a key
+/// with no cap, the cap would reach OpenRouter's ceiling, or (unless `force`) the change
+/// tightens the cap (lower, a first cap, or another reset period) below what the key has spent
+/// against it, or what it spent isn't known: its calls would fail at once, which is a pause, not
+/// a cap. A raise that leaves it under what it spent goes ahead ([`CapPlan::still_at_cap`] says
+/// so). The new cap is rounded to the millionth (no `0.25000000000000006`). Pure.
+pub fn plan_cap(k: &KeyInfo, change: Option<CapChange>, reset: Option<Option<LimitReset>>, force: bool) -> std::result::Result<CapPlan, String> {
+    let money = exact_money;
+    let before = k.limit;
+    let reset_before = LimitReset::of(k);
+    let reset_after = reset.unwrap_or(reset_before);
+    let after = match change {
+        None => before,
+        Some(CapChange::To(x)) => Some(x),
+        Some(CapChange::Raise(x)) => match before {
+            Some(b) => Some(b + x),
+            None => return Err("it has no cap to raise — give the cap itself (`10`)".into()),
+        },
+        Some(CapChange::NoCap) => None,
+    }
+    .map(|x| (x * 1e6).round() / 1e6);
+    if let Some(a) = after.filter(|a| !(a.is_finite() && *a >= 0.0 && *a < MAX_LIMIT)) {
+        return Err(format!("{} is past OpenRouter's ceiling for a cap (under ${MAX_LIMIT:.0})", money(a)));
+    }
+    let plan = CapPlan { before, after, reset_before, reset_after, spent: spent_against(k, reset_after) };
+    let tighter = match (before, after) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(b), Some(a)) => a < b - 1e-9 || reset_after != reset_before,
+    };
+    if let (true, false, Some(a)) = (tighter, force, after) {
+        let when = period_words(reset_after);
+        match plan.spent {
+            Some(s) if a < s - CAP_EPSILON => {
+                return Err(format!(
+                    "a {} cap is under what it has spent {when} ({}) — its calls would fail at once; --force sets it \
+                     anyway (`arena keys pause` stops a key outright)",
+                    money(a),
+                    money(s)
+                ))
+            }
+            None => return Err(format!("what it has spent {when} isn't known — --force to tighten its cap anyway")),
+            _ => {}
+        }
+    }
+    Ok(plan)
+}
+
+/// How close two amounts must be to count as one (float noise, a millionth at most — the caps
+/// [`plan_cap`] sets are rounded to that): never a cent's slack, which would let a cap set $0.004
+/// under the spend through, or miss a $0.004 change OpenRouter didn't make.
+pub const CAP_EPSILON: f64 = 1e-7;
+
+/// An amount as exactly as it was set: `$1.00`, `$0.050` ([`crate::fleet::fmt_money`]) when it's
+/// whole cents, else every digit up to the millionth (`$1.004`) — a cap or a spend a cent's
+/// rounding would misstate (`a $1.00 cap is under … ($1.00)`).
+pub fn exact_money(x: f64) -> String {
+    if ((x * 100.0).round() / 100.0 - x).abs() < CAP_EPSILON {
+        return crate::fleet::fmt_money("$", x);
+    }
+    let s = format!("{x:.6}");
+    let s = s.trim_end_matches('0');
+    let decimals = s.split_once('.').map_or(0, |(_, d)| d.len());
+    if decimals < 3 {
+        format!("${x:.3}")
+    } else {
+        format!("${s}")
+    }
+}
+
+/// What a key read just before its change must pass ([`OpenRouter::update_key`]): the caller's
+/// test of the key as it is now — `Err`: why it isn't to be changed.
+pub type KeyCheck<'a> = &'a (dyn Fn(&KeyInfo) -> std::result::Result<(), String> + Send + Sync);
+
+/// A key as a dashboard showed it — its hash, cap, when the cap starts over, on or off — handed to
+/// the command it runs (`--expect HASH=STATE`), which then refuses a key that isn't that one any
+/// more, or has moved: the operator confirmed a change to the key as shown (review codex r2 #3:
+/// `10`, previewed as raising a $5 cap, would have lowered one raised to $25 meanwhile).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Expected {
+    pub hash: String,
+    /// The name it went by, when known (a plan's own reading; never in a [`Self::token`]): a key
+    /// renamed to another machine meanwhile isn't this machine's to change.
+    pub name: Option<String>,
+    pub limit: Option<f64>,
+    pub reset: Option<LimitReset>,
+    pub disabled: bool,
+}
+
+impl Expected {
+    pub fn of(k: &KeyInfo) -> Self {
+        Expected { hash: k.hash.clone(), name: k.name.clone(), limit: k.limit, reset: LimitReset::of(k), disabled: k.disabled }
+    }
+
+    /// `HASH=CAP/RESET/ON|OFF`: `ab12=5/never/on`, `ab12=none/daily/off` (the cap as Rust prints
+    /// it, which reads back exactly).
+    pub fn token(&self) -> String {
+        let cap = self.limit.map_or_else(|| "none".to_string(), |l| l.to_string());
+        let reset = self.reset.map_or("never", |r| r.as_str());
+        format!("{}={cap}/{reset}/{}", self.hash, if self.disabled { "off" } else { "on" })
+    }
+
+    /// A [`Self::token`] back. Pure.
+    pub fn parse(s: &str) -> Result<Self> {
+        let bad = || Error::Config(format!("`{s}` isn't HASH=CAP/RESET/ON|OFF"));
+        let (hash, state) = s.split_once('=').ok_or_else(bad)?;
+        valid_hash(hash).map_err(|_| bad())?;
+        let mut parts = state.split('/');
+        let (Some(cap), Some(reset), Some(on), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else { return Err(bad()) };
+        let limit = match cap {
+            "none" => None,
+            c => Some(c.parse::<f64>().ok().filter(|x| x.is_finite() && *x >= 0.0).ok_or_else(bad)?),
+        };
+        let disabled = match on {
+            "on" => false,
+            "off" => true,
+            _ => return Err(bad()),
+        };
+        Ok(Expected { hash: hash.to_string(), name: None, limit, reset: LimitReset::parse(reset).map_err(|_| bad())?, disabled })
+    }
+
+    /// `cap $25.00 (monthly), on`, `no cap, off`.
+    pub fn words(&self) -> String {
+        let cap = self.limit.map(|c| format!("cap {}", exact_money(c))).unwrap_or_else(|| "no cap".into());
+        let reset = self.reset.map(|r| format!(" ({})", r.as_str())).unwrap_or_default();
+        format!("{cap}{reset}, {}", if self.disabled { "off" } else { "on" })
+    }
+
+    /// Whether `k` is this key, still as shown — under the same name, when known (the cap to
+    /// [`CAP_EPSILON`]).
+    pub fn holds(&self, k: &KeyInfo) -> bool {
+        let cap = match (self.limit, k.limit) {
+            (Some(a), Some(b)) => (a - b).abs() < CAP_EPSILON,
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        let name = self.name.as_ref().is_none_or(|n| k.name.as_ref() == Some(n));
+        k.hash == self.hash && name && cap && LimitReset::of(k) == self.reset && k.disabled == self.disabled
+    }
+}
+
+/// Of the keys that go by one name, the one it shows: the enabled one, then the newest (the
+/// first of equals). The one the dashboard's `AI$` cell is about, and the one `keys limit` and
+/// `keys resume` change.
+pub fn shown_key<'a>(keys: impl IntoIterator<Item = &'a KeyInfo>) -> Option<&'a KeyInfo> {
+    keys.into_iter().fold(None, |best, k| match best {
+        Some(b) if shown_rank(b) >= shown_rank(k) => Some(b),
+        _ => Some(k),
+    })
+}
+
+/// How [`shown_key`] ranks keys: enabled first, then by `created_at`.
+fn shown_rank(k: &KeyInfo) -> (bool, Option<&str>) {
+    (!k.disabled, k.created_at.as_deref())
+}
+
 /// The slice of the provisioning API that `arena keys`, `pods rename` and `terminate
 /// --revoke-key` use, as a trait so those flows run against a fake in tests (no network,
 /// no real keys).
@@ -483,6 +880,12 @@ pub trait KeyApi: Send + Sync {
     async fn create_key(&self, name: &str, limit: Option<f64>) -> Result<CreatedKey>;
     async fn delete_key(&self, hash: &str) -> Result<()>;
     async fn rename_key(&self, hash: &str, new_name: &str) -> Result<()>;
+    /// Change a key's cap, reset or disabled flag, if it passes `check` as it is just before
+    /// ([`OpenRouter::update_key`]). Default: refused — a fake for flows that never change a key in
+    /// place need not say what it would do.
+    async fn update_key(&self, hash: &str, _update: &KeyUpdate, _check: Option<KeyCheck<'_>>) -> Result<()> {
+        Err(Error::provider(format!("openrouter update key {}: not supported here", short_hash(hash))))
+    }
 }
 
 #[async_trait]
@@ -498,6 +901,9 @@ impl KeyApi for OpenRouter {
     }
     async fn rename_key(&self, hash: &str, new_name: &str) -> Result<()> {
         OpenRouter::rename_key(self, hash, new_name).await
+    }
+    async fn update_key(&self, hash: &str, update: &KeyUpdate, check: Option<KeyCheck<'_>>) -> Result<()> {
+        OpenRouter::update_key(self, hash, update, check).await
     }
 }
 
@@ -688,6 +1094,8 @@ impl KeyUsage {
 pub struct UsageView {
     /// The key shown for each name.
     pub keys: HashMap<String, KeyUsage>,
+    /// That key as listed, for planning a change to it ([`plan_cap`]: the dashboard's raise-cap box).
+    pub infos: HashMap<String, KeyInfo>,
     /// Every listed key, by name (a name can be held twice): what the totals add up.
     pub all: Vec<(String, KeyUsage)>,
     pub credits: Option<Credits>,
@@ -714,15 +1122,15 @@ impl UsageView {
         for k in keys {
             let Some(name) = k.name.as_deref().filter(|n| !n.is_empty()) else { continue };
             all.push((name.to_string(), KeyUsage::of(k)));
-            let rank = |k: &KeyInfo| (!k.disabled, k.created_at.clone());
             match best.get(name) {
-                Some(b) if rank(b) >= rank(k) => {}
+                Some(b) if shown_rank(b) >= shown_rank(k) => {}
                 _ => {
                     best.insert(name.to_string(), k);
                 }
             }
         }
-        self.keys = best.into_iter().map(|(n, k)| (n, KeyUsage::of(k))).collect();
+        self.keys = best.iter().map(|(n, k)| (n.clone(), KeyUsage::of(k))).collect();
+        self.infos = best.into_iter().map(|(n, k)| (n, k.clone())).collect();
         self.all = all;
     }
 
@@ -1450,6 +1858,7 @@ mod tests {
         ];
         let v = UsageView::from_keys(&keys, Some(Credits { total: 20.0, used: 10.0 }));
         assert_eq!(v.keys["devtest-apple"].spent, Some(1.0), "the enabled key wins over newer disabled ones");
+        assert_eq!(v.infos["devtest-apple"].hash, "new", "and its listing is kept, for planning a change to it");
         let c = v.cohort("devtest", &["james-gpu".to_string()]);
         // Every key counts in the totals (the disabled ones' spend today too); caps only the enabled.
         assert_eq!((c.keys, c.capped.len(), c.uncapped), (5, 1, 0));
@@ -1488,5 +1897,318 @@ mod tests {
         v.apply(Ok(vec![key("devtest-a", 2.0)]), Err("credits 500".into()));
         assert_eq!((v.keys["devtest-a"].today, v.keys_error.as_deref()), (Some(2.0), None));
         assert_eq!((v.credits.unwrap().left(), v.credits_error.as_deref()), (0.0, Some("credits 500")));
+    }
+
+    /// The update body carries exactly the fields given — `null` for "no cap" and "never" —
+    /// never `name` or `workspace_id`; a cap outside OpenRouter's range, or nothing to change, is
+    /// refused before any call.
+    #[test]
+    fn update_body_sends_only_what_is_given() {
+        use serde_json::json;
+        let u = |limit, limit_reset, disabled| KeyUpdate { limit, limit_reset, disabled };
+        for (update, want) in [
+            (u(Some(Some(5.0)), None, None), json!({"limit": 5.0})),
+            (u(Some(None), None, None), json!({"limit": null})),
+            (u(None, Some(Some(LimitReset::Daily)), None), json!({"limit_reset": "daily"})),
+            (u(None, Some(None), None), json!({"limit_reset": null})),
+            (u(None, None, Some(true)), json!({"disabled": true})),
+            (u(None, None, Some(false)), json!({"disabled": false})),
+            (u(Some(Some(0.0)), Some(Some(LimitReset::Monthly)), None), json!({"limit": 0.0, "limit_reset": "monthly"})),
+        ] {
+            assert_eq!(update_body(&update).unwrap(), want, "{update:?}");
+        }
+        for bad in [-0.01, f64::NAN, f64::INFINITY, MAX_LIMIT, 2e6] {
+            let e = update_body(&u(Some(Some(bad)), None, None)).unwrap_err().to_string();
+            assert!(e.contains("a key's cap is USD 0 up to"), "{bad}: {e}");
+        }
+        assert!(update_body(&KeyUpdate::default()).unwrap_err().to_string().contains("nothing to change"));
+    }
+
+    #[test]
+    fn limit_reset_reads_the_flag_and_the_listing() {
+        assert_eq!(LimitReset::parse("Daily").unwrap(), Some(LimitReset::Daily));
+        assert_eq!(LimitReset::parse("weekly").unwrap(), Some(LimitReset::Weekly));
+        assert_eq!(LimitReset::parse(" monthly ").unwrap(), Some(LimitReset::Monthly));
+        assert_eq!(LimitReset::parse("never").unwrap(), None);
+        assert!(LimitReset::parse("hourly").is_err());
+        let k = |r: Option<&str>| KeyInfo { limit_reset: r.map(String::from), ..Default::default() };
+        assert_eq!(LimitReset::of(&k(Some("monthly"))), Some(LimitReset::Monthly));
+        assert_eq!(LimitReset::of(&k(Some("yearly"))), None, "an unknown reset reads as none, as in the dashboard");
+        assert_eq!(LimitReset::of(&k(None)), None);
+    }
+
+    /// `10`, `2.50`, `$3` set the cap, `+5` raises it; words for "no cap", negatives, exponents
+    /// and the ceiling are refused, each saying what to give instead.
+    #[test]
+    fn parse_cap_takes_amounts_and_raises_only() {
+        for (typed, want) in [
+            ("10", CapChange::To(10.0)),
+            (" 2.50 ", CapChange::To(2.5)),
+            ("$3", CapChange::To(3.0)),
+            ("0", CapChange::To(0.0)),
+            (".5", CapChange::To(0.5)),
+            ("+5", CapChange::Raise(5.0)),
+            ("+0.05", CapChange::Raise(0.05)),
+            ("+ 5", CapChange::Raise(5.0)),
+            ("+$2", CapChange::Raise(2.0)),
+            ("+0", CapChange::Raise(0.0)),
+        ] {
+            assert_eq!(parse_cap(typed), Ok(want), "{typed}");
+        }
+        for (typed, says) in [
+            ("none", "--no-cap"),
+            ("unlimited", "--no-cap"),
+            ("-1", "not a negative raise"),
+            ("1e3", "isn't an amount"),
+            ("inf", "--no-cap"),
+            ("nan", "isn't an amount"),
+            ("", "isn't an amount"),
+            ("+", "isn't an amount"),
+            (".", "isn't an amount"),
+            ("1.2.3", "isn't an amount"),
+            ("5usd", "isn't an amount"),
+            ("1000000", "under $1000000"),
+        ] {
+            let e = parse_cap(typed).unwrap_err();
+            assert!(e.contains(says), "{typed}: {e}");
+        }
+    }
+
+    /// A key on a `reset` cap, with the period counters the listing gives.
+    fn capped(limit: Option<f64>, remaining: Option<f64>, reset: Option<&str>) -> KeyInfo {
+        KeyInfo {
+            hash: "h".into(),
+            name: Some("devtest-a".into()),
+            limit,
+            limit_remaining: remaining,
+            limit_reset: reset.map(String::from),
+            usage: Some(30.0),
+            usage_daily: Some(0.2),
+            usage_weekly: Some(1.0),
+            usage_monthly: Some(2.6),
+            ..Default::default()
+        }
+    }
+
+    /// What a key has spent against a cap: the cap's period's own counter, else (same reset only)
+    /// OpenRouter's limit − remaining, which stops at the cap.
+    #[test]
+    fn spent_against_reads_the_new_periods_counter() {
+        let k = capped(Some(2.5), Some(0.0), Some("monthly"));
+        assert_eq!(spent_against(&k, Some(LimitReset::Monthly)), Some(2.6), "the month's own $2.60, not limit − remaining's $2.50");
+        assert_eq!(spent_against(&k, Some(LimitReset::Daily)), Some(0.2));
+        assert_eq!(spent_against(&k, Some(LimitReset::Weekly)), Some(1.0));
+        assert_eq!(spent_against(&k, None), Some(30.0));
+        let bare = KeyInfo { usage_monthly: None, usage: None, ..k.clone() };
+        assert_eq!(spent_against(&bare, Some(LimitReset::Monthly)), Some(2.5), "no counter: limit − remaining, same reset");
+        assert_eq!(spent_against(&bare, None), None, "another reset: unknown, never the old period's");
+    }
+
+    /// Absolute, relative, no cap and a new reset, against what the key spent: a tightening
+    /// below the spend (or past an unknown one) is refused unless forced; a raise that stays under
+    /// it goes ahead and says so; float noise is rounded off.
+    #[test]
+    fn plan_cap_raises_sets_and_refuses_tightening_below_the_spend() {
+        let monthly = capped(Some(5.0), Some(2.4), Some("monthly")); // $2.60 this month
+        let ok = |k: &KeyInfo, c: Option<CapChange>, r: Option<Option<LimitReset>>| plan_cap(k, c, r, false).unwrap();
+        let p = ok(&monthly, Some(CapChange::Raise(5.0)), None);
+        assert_eq!((p.before, p.after, p.spent, p.changes(), p.still_at_cap()), (Some(5.0), Some(10.0), Some(2.6), true, false));
+        assert_eq!(p.words(), "cap $5.00 → $10.00 (monthly) · spent $2.60 this month");
+        assert_eq!(p.update(), KeyUpdate { limit: Some(Some(10.0)), ..Default::default() });
+        // Lower, still above the spend: fine. Below it: refused, forced: done.
+        assert_eq!(ok(&monthly, Some(CapChange::To(3.0)), None).after, Some(3.0));
+        let e = plan_cap(&monthly, Some(CapChange::To(2.0)), None, false).unwrap_err();
+        assert!(e.contains("a $2.00 cap is under what it has spent this month ($2.60)") && e.contains("--force"), "{e}");
+        let forced = plan_cap(&monthly, Some(CapChange::To(2.0)), None, true).unwrap();
+        assert!(forced.still_at_cap() && forced.words().ends_with("— still at its cap"), "{}", forced.words());
+        // The same cap: nothing to do.
+        let same = ok(&monthly, Some(CapChange::To(5.0)), None);
+        assert!(!same.changes());
+        assert_eq!(same.words(), "cap $5.00 (monthly) · spent $2.60 this month");
+        // A raise that stays under the spend isn't refused; it says the key is still at its cap.
+        let over = capped(Some(2.5), Some(0.0), Some("monthly"));
+        let p = ok(&over, Some(CapChange::Raise(0.05)), None);
+        assert_eq!(p.after, Some(2.55));
+        assert!(p.still_at_cap(), "{p:?}");
+        // Float noise: 0.2 + 0.05 is 0.25, not 0.25000000000000006.
+        let tiny = capped(Some(0.2), Some(0.2), None);
+        assert_eq!(ok(&tiny, Some(CapChange::Raise(0.05)), None).after, Some(0.25));
+        // No cap: only by asking; a raise of a key without one is refused.
+        let p = ok(&monthly, Some(CapChange::NoCap), None);
+        assert_eq!((p.after, p.update()), (None, KeyUpdate { limit: Some(None), ..Default::default() }));
+        assert!(p.words().starts_with("cap $5.00 → no cap"), "{}", p.words());
+        let open = capped(None, None, None);
+        assert!(plan_cap(&open, Some(CapChange::Raise(5.0)), None, false).unwrap_err().contains("no cap to raise"));
+        assert_eq!(ok(&open, Some(CapChange::NoCap), None).words(), "no cap · spent $30.00 in all", "no `cap no cap`");
+        // A first cap on an uncapped key is a tightening: under its life's $30 refused.
+        assert!(plan_cap(&open, Some(CapChange::To(10.0)), None, false).unwrap_err().contains("spent in all ($30.00)"));
+        assert_eq!(ok(&open, Some(CapChange::To(10.0)), Some(Some(LimitReset::Daily))).after, Some(10.0), "today's $0.20 is under it");
+        // Another reset, the cap kept (`+0`): the new period's spend decides.
+        let daily = capped(Some(5.0), Some(4.8), Some("daily"));
+        let e = plan_cap(&daily, Some(CapChange::Raise(0.0)), Some(None), false).unwrap_err();
+        assert!(e.contains("spent in all ($30.00)"), "never resetting, its whole life counts: {e}");
+        let p = ok(&daily, Some(CapChange::Raise(0.0)), Some(Some(LimitReset::Weekly)));
+        assert_eq!(p.update(), KeyUpdate { limit_reset: Some(Some(LimitReset::Weekly)), ..Default::default() });
+        assert_eq!(p.words(), "cap $5.00, resets daily → weekly · spent $1.00 this week");
+        assert_eq!(ok(&daily, None, Some(Some(LimitReset::Weekly))), p, "no amount: the cap stays");
+        // Spend unknown: a tightening is refused unless forced; a raise isn't.
+        let unknown = KeyInfo { usage_monthly: None, limit_remaining: None, ..monthly.clone() };
+        assert!(plan_cap(&unknown, Some(CapChange::To(4.0)), None, false).unwrap_err().contains("isn't known"));
+        assert!(plan_cap(&unknown, Some(CapChange::To(4.0)), None, true).is_ok());
+        assert_eq!(ok(&unknown, Some(CapChange::Raise(1.0)), None).words(), "cap $5.00 → $6.00 (monthly) · spent ? this month");
+        // The ceiling.
+        assert!(plan_cap(&capped(Some(999_999.0), Some(999_999.0), None), Some(CapChange::Raise(5.0)), None, false).unwrap_err().contains("ceiling"));
+        // No cent's slack (review codex r1 #2): $0.004 under the spend is under it, said exactly;
+        // a cap a little over the spend has room.
+        let spent = KeyInfo { usage: Some(1.004), ..capped(Some(5.0), None, None) };
+        let e = plan_cap(&spent, Some(CapChange::To(1.0)), None, false).unwrap_err();
+        assert!(e.starts_with("a $1.00 cap is under what it has spent in all ($1.004)"), "{e}");
+        let p = ok(&spent, Some(CapChange::To(1.005)), None);
+        assert!(!p.still_at_cap() && p.words().starts_with("cap $5.00 → $1.005 · spent $1.00 in all"), "{}", p.words());
+        let exact = ok(&spent, Some(CapChange::To(1.004)), None);
+        assert!(exact.still_at_cap(), "at exactly the spend: at its cap");
+    }
+
+    /// What a dashboard showed of a key round-trips through `--expect`, and holds only while the
+    /// key is that one, as shown.
+    #[test]
+    fn expected_round_trips_and_holds_only_while_the_key_is_as_shown() {
+        let k = KeyInfo { hash: "ab12".into(), limit: Some(0.25), limit_reset: Some("daily".into()), ..Default::default() };
+        let e = Expected::of(&k);
+        assert_eq!(e.token(), "ab12=0.25/daily/on");
+        assert_eq!(Expected::parse(&e.token()).unwrap(), e);
+        let open = Expected::of(&KeyInfo { hash: "cd34".into(), disabled: true, ..Default::default() });
+        assert_eq!(open.token(), "cd34=none/never/off");
+        assert_eq!(Expected::parse("cd34=none/never/off").unwrap(), open);
+        let odd = Expected::of(&KeyInfo { hash: "ef".into(), limit: Some(0.1 + 0.2), ..Default::default() });
+        assert_eq!(Expected::parse(&odd.token()).unwrap(), odd, "the cap reads back exactly");
+        assert!(e.holds(&k));
+        // A plan's own reading knows the name: a key renamed meanwhile isn't the one.
+        let named = Expected::of(&KeyInfo { name: Some("devtest-a".into()), ..k.clone() });
+        assert!(named.holds(&KeyInfo { name: Some("devtest-a".into()), ..k.clone() }));
+        assert!(!named.holds(&KeyInfo { name: Some("devtest-b".into()), ..k.clone() }));
+        assert_eq!(Expected::parse(&named.token()).unwrap().name, None, "never in a token");
+        for moved in [
+            KeyInfo { limit: Some(0.26), ..k.clone() },
+            KeyInfo { limit: None, ..k.clone() },
+            KeyInfo { limit_reset: None, ..k.clone() },
+            KeyInfo { disabled: true, ..k.clone() },
+            KeyInfo { hash: "other".into(), ..k.clone() },
+        ] {
+            assert!(!e.holds(&moved), "{moved:?}");
+        }
+        for bad in ["", "ab12", "ab12=5/never", "ab12=5/never/on/x", "ab12=-1/never/on", "ab12=five/never/on", "ab12=5/hourly/on", "ab12=5/never/maybe", "a/b=5/never/on"] {
+            assert!(Expected::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn exact_money_keeps_every_digit_a_cent_would_round_away() {
+        for (x, want) in [(1.0, "$1.00"), (0.05, "$0.050"), (12.5, "$12.50"), (1.004, "$1.004"), (0.123456, "$0.123456"), (2.00000001, "$2.00"), (1.0005, "$1.0005")] {
+            assert_eq!(exact_money(x), want, "{x}");
+        }
+    }
+
+    /// With an expected state the key is read right before the change, workspace or not, and a key
+    /// that has moved since is refused with no PATCH (review codex r3 #2: a fleet-wide change's
+    /// later keys were checked many requests before their PATCH).
+    #[tokio::test]
+    async fn update_key_with_an_expected_state_refuses_a_key_that_moved() {
+        use crate::http::test_server::{canned, serve};
+        let json = "application/json";
+        let srv = serve(vec![
+            canned(200, json, r#"{"data":{"hash":"a","limit":5.0,"limit_reset":null,"disabled":false}}"#),
+            canned(200, json, "{}"),
+            canned(200, json, r#"{"data":{"hash":"a","limit":25.0,"limit_reset":"monthly","disabled":false}}"#),
+            canned(200, json, r#"{"data":{"hash":"zz"}}"#),
+        ]);
+        let or = test_client("K", &srv.base);
+        let was = Expected::of(&KeyInfo { hash: "a".into(), limit: Some(5.0), ..Default::default() });
+        let check = |k: &KeyInfo| if was.holds(k) { Ok(()) } else { Err(format!("changed since it was read (now {})", Expected::of(k).words())) };
+        let cap = KeyUpdate { limit: Some(Some(10.0)), ..Default::default() };
+        or.update_key("a", &cap, Some(&check)).await.unwrap();
+        let e = or.update_key("a", &cap, Some(&check)).await.unwrap_err().to_string();
+        assert!(e.contains("refused — key a: changed since it was read (now cap $25.00 (monthly), on) — nothing done"), "{e}");
+        let e = or.update_key("a", &cap, Some(&check)).await.unwrap_err().to_string();
+        assert!(e.contains("couldn't be read back"), "an answer for another key: {e}");
+        assert_eq!(
+            *srv.requests.lock().unwrap(),
+            ["GET /keys/a HTTP/1.1", "PATCH /keys/a HTTP/1.1", "GET /keys/a HTTP/1.1", "GET /keys/a HTTP/1.1"],
+            "a PATCH only for the key as expected"
+        );
+    }
+
+    /// One key per name: the enabled one, then the newest, the first of equals — as the
+    /// dashboard's cell shows.
+    #[test]
+    fn shown_key_prefers_enabled_then_newest() {
+        let k = |h: &str, disabled: bool, created: Option<&str>| KeyInfo { hash: h.into(), disabled, created_at: created.map(String::from), ..Default::default() };
+        let keys = [k("old-off", true, Some("2026-10-01")), k("on", false, Some("2026-10-02")), k("new-off", true, Some("2026-10-03"))];
+        assert_eq!(shown_key(&keys).unwrap().hash, "on");
+        let off = [k("a", true, Some("2026-10-01")), k("b", true, Some("2026-10-03")), k("c", true, Some("2026-10-02"))];
+        assert_eq!(shown_key(&off).unwrap().hash, "b");
+        let twins = [k("first", false, None), k("second", false, None)];
+        assert_eq!(shown_key(&twins).unwrap().hash, "first");
+        assert!(shown_key(&[] as &[KeyInfo]).is_none());
+    }
+
+    /// An update on the wire: the key read first (the workspace guard), then one `PATCH` with
+    /// only the given fields; a key in another workspace is refused with no `PATCH`; an error
+    /// status is classified; an update that changes nothing, or a bad hash, sends nothing.
+    #[tokio::test]
+    async fn update_key_reads_first_and_patches_only_the_given_fields() {
+        use crate::error::ProviderErrorKind as K;
+        use crate::http::test_server::{canned, serve};
+        let json = "application/json";
+        let ours = "c9f89f20-08e3-4cff-bad6-70c478e2c2c4";
+        let mine = format!(r#"{{"data":{{"hash":"a","workspace_id":"{ours}"}}}}"#);
+        let srv = serve(vec![
+            canned(200, json, &format!(r#"{{"data":{{"id":"{ours}","slug":"arena-dev-test"}}}}"#)),
+            canned(200, json, &mine),
+            canned(200, json, r#"{"data":{"hash":"a","limit":0.2}}"#),
+            canned(200, json, r#"{"data":{"hash":"x","workspace_id":"a3339b09-7feb-5818-be3e-1b9484142ece"}}"#),
+            canned(200, json, &mine),
+            canned(200, "text/plain", "ok (not json)"),
+            canned(200, json, &mine),
+            canned(401, "text/html", "<html>Unauthorized</html>"),
+        ]);
+        let or = test_client("K", &srv.base).with_workspace(Some("arena-dev-test"));
+        let cap = KeyUpdate { limit: Some(Some(0.2)), ..Default::default() };
+        or.update_key("a", &cap, None).await.unwrap();
+        let e = or.update_key("x", &cap, None).await.unwrap_err().to_string();
+        assert!(e.contains("refused") && e.contains("a3339b09"), "{e}");
+        let pause = KeyUpdate { disabled: Some(true), ..Default::default() };
+        or.update_key("a", &pause, None).await.unwrap();
+        let e = or.update_key("a", &KeyUpdate { limit: Some(None), limit_reset: Some(None), ..Default::default() }, None).await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Auth), "{e}");
+        assert!(e.to_string().contains("openrouter update key HTTP 401"), "{e}");
+        assert!(or.update_key("a", &KeyUpdate::default(), None).await.is_err());
+        assert!(or.update_key("a/../credits", &cap, None).await.is_err());
+        assert_eq!(
+            *srv.requests.lock().unwrap(),
+            [
+                "GET /workspaces/arena-dev-test HTTP/1.1",
+                "GET /keys/a HTTP/1.1",
+                "PATCH /keys/a HTTP/1.1",
+                "GET /keys/x HTTP/1.1",
+                "GET /keys/a HTTP/1.1",
+                "PATCH /keys/a HTTP/1.1",
+                "GET /keys/a HTTP/1.1",
+                "PATCH /keys/a HTTP/1.1",
+            ],
+            "no PATCH for x; nothing for the empty update or the bad hash"
+        );
+        let patches: Vec<serde_json::Value> = srv
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| !b.is_empty())
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        assert_eq!(
+            patches,
+            [serde_json::json!({"limit": 0.2}), serde_json::json!({"disabled": true}), serde_json::json!({"limit": null, "limit_reset": null})]
+        );
     }
 }

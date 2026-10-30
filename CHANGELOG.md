@@ -19,6 +19,37 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-30 · Raise an AI key's cap, or pause it, from the CLI and the dashboard
+- `arena keys limit apple +5` raises a machine's OpenRouter cap by $5 where the key is: same
+  secret, same spend, nothing to copy onto the pod, so the participant's next call works. `10` sets
+  the cap, `--all` is every pod, `--reset daily|weekly|monthly|never` changes when it starts over,
+  and `--no-cap` takes the cap away (never an amount). A cap set under what the key already spent
+  (in the cap's period) is refused for all targets before anything changes, unless `--force`.
+- `arena keys pause apple` stops a key (its calls fail, the `AI$` cell says `off`) and `arena keys
+  resume apple` turns it back on. Aliases `disable` and `enable`.
+- Each previews with `--dry-run`, asks first (`--yes`), prints one `before → after` line per key as
+  OpenRouter lists it afterwards, and has `--json`.
+- The dashboard runs these same commands from the action menu, when a provisioning key is set: `a`
+  then `ai cap` (also `a`) opens a box prefilled with `+OPENROUTER_KEY_LIMIT` that shows what the
+  key spent and the new cap. `o` pauses or resumes the key, `n` rotates it and copies the new one
+  onto the pod. A marked set gets cap, pause and resume. The `AI$` column and the top line update
+  within seconds, and the at-cap warning says `(a → raise cap)`.
+- `gen` and `rotate` still mint with `OPENROUTER_KEY_LIMIT`. This stays arena 2.3: today's `arena
+  spend` release opened the 2.3 line.
+
+## 2026-10-30 · Tell us what hurts: pain points on GitHub
+- When arena gets in your way, or you work around it, file a pain point:
+  https://github.com/nickypro/arena-infra-rs/issues/new?template=pain-point.yml (label
+  `pain-point`). The README's "Tell us what hurts" has a paragraph to paste into your agents'
+  CLAUDE.md so they can file them with `gh issue create`. The repo is public, so leave out IPs,
+  hostnames of private machines, keys and tokens, and participants' names and emails.
+- The docs say what arena does today. Vast's create works (it has since 2026-10-08), production
+  updates with `arena update` (not `cargo install`), and `pods rename` works on every provider.
+  `config.env.example` now lists the keys it was missing: `ARENA_REPO_OWNER`, `GIT_SSH_KEY_LOCAL`,
+  `LOCAL_BACKUP_DIR`, `DEFAULT_BRANCH`, `PROXY_LOCAL`, `EXTRA_SSH_KEYS`, `BACKUP_MAX_SIZE`,
+  `BACKUP_REMOTE_PATH` and the three `OPENROUTER_*` keys. It no longer lists `BACKUP_BRANCH_PREFIX`,
+  which nothing read.
+
 ## 2026-10-30 · Hetzner: a limit refusal says which limit and what frees room under it
 - A Hetzner create refused over one of the account's limits (403 `resource_limit_exceeded`) now
   says what frees room under the limit Hetzner names: a primary IP for `primary_ip_limit` (live:
@@ -65,10 +96,14 @@ earlier).
 - `pods list`, the dashboard, `teardown --check`, `arena balance`, the snapshot cron line and
   every create, stop, start and terminate now record what they see in a local ledger,
   `~/.local/state/arena/<prefix>/spend.json` (0600) — quietly: nothing else they print changes.
-- Docs: "Tracking spend" in the README, and how to run a project week as a second fleet from the
-  same proxy box (docs/REFERENCE.md): its own config, prefix, workspace, proxy file and port
-  range, and cron lines written by hand — `arena cron install` for a second config would replace
-  the first fleet's lines.
+- A project week runs on the fleet you already have: `--owner` on `pods up` for new machines,
+  `arena spend assign` for ones that exist, then `arena spend --since <its first day>`. The
+  snapshot cron line keeps the ledger current; tracking starts when this version is installed,
+  so earlier history isn't there.
+- Docs: "Tracking spend" in the README, and, optionally, how another program can run a second
+  fleet from the same proxy box (docs/REFERENCE.md): its own config, prefix, workspace, proxy
+  file and port range, and cron lines written by hand — `arena cron install` for a second config
+  would replace the first fleet's lines.
 
 ## 2026-10-30 · The dashboard's bottom line is plain words
 - The footer no longer uses `☰`, `⟳`, `✓`, `⚠` or a spinner, which some terminals draw as

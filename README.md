@@ -83,10 +83,10 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 | **Setup** (drop `--no-setup`) | Each pod gets the deploy key, the cohort repo, tokens and the VS Code warm-up | `ARENA_REPO_OWNER`, `ARENA_REPO_NAME`, `GIT_SSH_KEY_LOCAL` |
 | **Day branches** | Each pod's work on its own `autocommit-<prefix>-w1d2-<machine>` branch | `ARENA_START_DATE` |
 | **Backups on cron** | A git push and an rsync copy of every pod, every 15 minutes | `LOCAL_BACKUP_DIR` |
-| **Morning health check on cron** | `pods test --deep` on every cohort pod each morning (`arena cron install --health 07:20`): a pass / warn / fail row per pod, and the dashboard's HEALTH column | |
+| **Morning health check on cron** | `pods test --deep` on every cohort pod each morning (`arena cron install --health 07:20`): a pass / warn / fail row per pod, and the dashboard's HLTH column | |
 
 <details>
-<summary>Every organiser command at a glance</summary>
+<summary>The main organiser commands at a glance</summary>
 
 | Command | What it does |
 | --- | --- |
@@ -111,8 +111,12 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 | `arena pods replace apple` | Move a pod to a fresh host, keeping its name and files |
 | `arena pods run -t apple 'nvidia-smi'` | Run a command on pods (all of them without `-t`) |
 | `arena balance` | Money left on each prepaid account, and how long it lasts |
+| `arena keys limit apple +5` | Raise a participant's AI (OpenRouter) cap by $5, in place (`10` sets it; `--all`); `keys pause`/`resume` stop and restart a key |
+| `arena spend` | What each machine cost and who it was for (`--owner` on `pods up`) |
 | `arena config check` | Which config keys are set, missing or unusable (never prints values) |
 | `arena teardown --check` | End of the program: what's still billing, with the command that cleans it up |
+| `arena image build` | Hetzner only: bake a pre-built image, so a new VM's setup takes about a minute, not ten (`HETZNER_IMAGE=arena`) |
+| `arena update` | Install the newest release, after showing what changed (`--check` only says) |
 
 </details>
 
@@ -294,7 +298,7 @@ name typed back.
 ```
 
 <sup>A made-up fleet, drawn by the dashboard's own renderer from test fixtures.</sup>
-`a` acts on the selected pod, `A` on the fleet, `d`/`D` deep-check it/all, `n` adds pods, and `?` asks
+`a` acts on the selected pod (`a a` raises its AI key's cap), `A` on the fleet, `d`/`D` deep-check it/all, `n` adds pods, and `?` asks
 claude or codex about the pod ([`pods ask`](docs/REFERENCE.md#pods-ask)). `i` (or a click on `[i] info`)
 opens the info panel: everything the two bars leave out, every key, and what the glyphs mean.
 [All the keys and columns](docs/REFERENCE.md#the-dashboard-arena-tui).
@@ -380,14 +384,15 @@ plus an all-files `big/` mirror). The optional archive VM keeps a second copy of
 
 ## Tracking spend
 
-Who cost what, compute and AI, per person, for the organisers: give each machine an owner when
-you make it, then ask.
+Who cost what, compute and AI, per person, for the organisers — on the fleet you already run, a
+project week included: give each machine an owner when you make it (or afterwards), then ask.
 
 ```bash
 arena pods up apple bloom --owner alice     # every new instance records its owner
 arena spend                                  # one row per owner, then "(no owner)", then totals
 arena spend --by machine --csv > spend.csv   # one row per instance, for a spreadsheet
-arena spend assign cedar bob                 # forgot --owner? set or fix it later
+arena spend assign cedar bob                 # a machine that already exists, or a forgotten --owner
+arena spend --since 2026-11-02               # only from that day (UTC)
 ```
 
 ```text
@@ -405,12 +410,13 @@ total       4 instance(s)  49.5  ~$11.88 + €0.43 $3.50  ~$15.38 + €0.43
 - **Nothing to run by hand.** `pods list`, the dashboard, `teardown --check`, every create, stop,
   start and terminate, and the snapshot cron line (`cron install --snapshot DIR`, every 2 min)
   record what they see in a local ledger. `~` marks an estimate; the notes say which way it errs.
-  RunPod rows are corrected from RunPod's own per-pod billing.
+  RunPod rows are corrected from RunPod's own per-pod billing. Tracking starts when this version
+  is installed: earlier history isn't there.
 - **Just to watch:** nothing stops a machine, and nothing is shown to participants.
 
-Running a second fleet (a project week) from the same box:
-[Project week as a second fleet](docs/REFERENCE.md#project-week-as-a-second-fleet).
-[Everything about spend](docs/REFERENCE.md#spend).
+[Everything about spend](docs/REFERENCE.md#spend). Another program wanting a fleet of its own on
+the same box (not needed for a project week):
+[Running a second fleet](docs/REFERENCE.md#running-a-second-fleet-from-the-same-control-box).
 
 ## Safety
 
@@ -433,6 +439,42 @@ Running a second fleet (a project week) from the same box:
   verified backup. [The reaper](docs/BACKUPS.md#pods-reap)
 - **Locks**: `arena pods lock --all` makes RunPod refuse stop/restart/terminate from any client.
   [Locks](docs/REFERENCE.md#pods-lock--pods-unlock)
+
+## Tell us what hurts
+
+Had to work around arena, or did it get in your way?
+[File a pain point](https://github.com/nickypro/arena-infra-rs/issues/new?template=pain-point.yml):
+what you were trying to do, what happened, how you got round it, and what you'd want arena to do.
+Agents can file them too (below). **This repo is public**: leave out IPs, hostnames of private
+machines, keys and tokens, and participants' names and emails. Write `<pod>`, `<ip>` or
+`<participant>` instead, and keep the private details in your own notes. The open ones are the
+[`pain-point` issues](https://github.com/nickypro/arena-infra-rs/issues?q=is%3Aissue+is%3Aopen+label%3Apain-point).
+
+<details>
+<summary>For your CLAUDE.md (or AGENTS.md): let your agents file them</summary>
+
+````markdown
+## arena pain points
+When arena gets in your way, file a pain point on its public repo, one per problem. That covers
+working around it, redoing something by hand, reading its source to find out what it did, or
+reaching for a provider's console. Search first and comment on a match instead:
+`gh issue list --repo nickypro/arena-infra-rs --label pain-point --search "<words>"`. To file one:
+
+    gh issue create --repo nickypro/arena-infra-rs --label pain-point \
+      --title "pain: <what got in the way>" --body-file pain.md
+
+Give pain.md these sections: **Trying to do**, **What happened** (the command and its output,
+trimmed), **Workaround**, **What arena should do**, **Version** (`arena --version`) and
+**Provider(s)**. If `--label` is refused (no write access to the repo), drop it: the `pain:` title
+is enough. Say in your reply what you filed.
+
+The repo is public. Leave out IPs, hostnames of private machines, keys and tokens, and
+participants' names and emails; write `<pod>`, `<ip>` or `<participant>` in their place. Private
+details go in a note of your own. For ARENA's operators that's
+`/srv/arena-ops-notes/YYYY-MM-DD-<topic>.md` on the control box, linking the issue if there is one.
+````
+
+</details>
 
 ## Development
 
@@ -465,9 +507,12 @@ What it sends, where the reviews go, and what it costs:
 <details>
 <summary>Release process</summary>
 
-Work on `dev/phase0` → `cargo test --release` + the live smoke in the sandbox → PR to master,
-**running `scripts/ai-review` (or `--pr N`) before merging it** → `cargo install` to prod only
-between cohort sessions, keeping the previous binary as `arena.prev` for an instant rollback.
+A branch off `master` with its `CHANGELOG.md` entry → `cargo test --release` (+ the live smoke in
+a sandbox account when it touches a provider) → PR to master, **running `scripts/ai-review` (or
+`--pr N`) before merging it** → once CI is green on master, the release workflow publishes it
+(tagged with its version: both binaries, `SHA256SUMS`, build provenance attested) → on the
+control box, `arena update` between cohort sessions: it shows what changed, verifies the release,
+and keeps the previous binaries as `arena.prev`/`arena-tui.prev` for an instant rollback.
 
 </details>
 
@@ -498,4 +543,4 @@ docs/     REFERENCE.md (every command), BACKUPS.md (backups and the participants
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Crates, core modules, a request's flow, the safety model, extending |
 | [FEATURE_MAP.md](FEATURE_MAP.md) | The legacy scripts → `arena` commands, config keys, provider status |
 | [docs/runpod-api.md](docs/runpod-api.md) | The RunPod API as `arena` uses it, and its gotchas |
-| [docs/TODO.md](docs/TODO.md) | Known issues |
+| [docs/TODO.md](docs/TODO.md) | Known issues still open; new ones are [pain points](#tell-us-what-hurts) |

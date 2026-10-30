@@ -14,7 +14,7 @@ use clap::Subcommand;
 use crate::cli::Select;
 use crate::pods::list::{enrich_best_effort, ENRICH_TIMEOUT};
 use crate::pods::selection::{all_stopped_error, stopped_skip, Selected};
-use crate::{archive, confirm, shell_quote, spend};
+use crate::{archive, confirm, key_limits, shell_quote, spend};
 
 #[derive(Subcommand)]
 pub(crate) enum KeysCmd {
@@ -74,6 +74,14 @@ pub(crate) enum KeysCmd {
         #[command(flatten)]
         sel: Select,
     },
+    /// Raise or set machines' key caps in place (`limit apple +5`)
+    Limit(key_limits::LimitArgs),
+    /// Pause machines' keys: their AI calls fail until `resume`
+    #[command(visible_alias = "disable")]
+    Pause(key_limits::PauseArgs),
+    /// Resume paused keys
+    #[command(visible_alias = "enable")]
+    Resume(key_limits::PauseArgs),
 }
 
 /// Drop `host`'s row from the keys CSV in `dir` (its key was deleted, none replaced it):
@@ -488,7 +496,7 @@ pub(crate) async fn handle_copy_keys(
 /// Where generated OpenRouter keys are persisted (also where `copy-keys` reads them).
 pub(crate) const OPENROUTER_KEYS_CSV: &str = "./keys/openrouter_api_keys.csv";
 /// [`OPENROUTER_KEYS_CSV`]'s file name, inside whichever keys dir is in use.
-const OPENROUTER_KEYS_LINK: &str = "openrouter_api_keys.csv";
+pub(crate) const OPENROUTER_KEYS_LINK: &str = "openrouter_api_keys.csv";
 
 /// Resolve which machines a `keys` action targets, with the shared selector. A key belongs
 /// to a *machine name*, which can exist before its pod (mint keys, then `up`) or after it
@@ -541,7 +549,7 @@ pub(crate) async fn keys_targets(
 /// — i.e. named under this cohort's prefix (or an absolute list entry), as `keys gen` would
 /// name it; another cohort's `arena7-x` is left out (under this prefix it would be looked
 /// up as `{prefix}-arena7-x`, a key that doesn't exist).
-fn key_holders(naming: &Naming, keys: &[arena_core::openrouter::KeyInfo], csv: Option<&str>) -> Vec<String> {
+pub(crate) fn key_holders(naming: &Naming, keys: &[arena_core::openrouter::KeyInfo], csv: Option<&str>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let rows = csv.map(arena_core::apikeys::parse_csv).unwrap_or_default();
     let named = keys
@@ -840,6 +848,9 @@ pub(crate) async fn keys_with(
         KeysCmd::Gen { sel, limit, copy, dry_run } => (KeysAction::Gen, sel, limit, copy, dry_run),
         KeysCmd::Rotate { sel, limit, copy, dry_run } => (KeysAction::Rotate, sel, limit, copy, dry_run),
         KeysCmd::Revoke { sel, dry_run } => (KeysAction::Revoke, sel, None, false, dry_run),
+        KeysCmd::Limit(a) => return key_limits::limit(a, provider, cfg, api, dir, yes).await,
+        KeysCmd::Pause(a) => return key_limits::pause(a, false, provider, cfg, api, dir, yes).await,
+        KeysCmd::Resume(a) => return key_limits::pause(a, true, provider, cfg, api, dir, yes).await,
     };
     let limit = limit.unwrap_or(default_limit);
     let listed_at = arena_core::snapshot::unix_now();

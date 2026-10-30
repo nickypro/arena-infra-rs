@@ -332,7 +332,7 @@ impl SelectOpts {
     /// The core selection for `targets` (positional or `-t`) plus these flags. The hidden
     /// `--include` joins the targets — and keeps its legacy narrowing of `--all`, so
     /// existing scripts do exactly what they did (any other targets + `--all` is refused).
-    fn args(&self, targets: &[String]) -> SelectArgs {
+    pub(crate) fn args(&self, targets: &[String]) -> SelectArgs {
         let legacy_narrowing = self.all && targets.is_empty() && !self.include.is_empty();
         SelectArgs {
             targets: targets.iter().chain(&self.include).cloned().collect(),

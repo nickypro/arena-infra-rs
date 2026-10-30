@@ -39,6 +39,7 @@ mod hetzner_cli_tests;
 mod hetzner_setup_tests;
 mod help;
 mod jobs;
+mod key_limits;
 mod money;
 mod offers;
 mod reap;
@@ -78,10 +79,10 @@ use proxy::{handle_proxy, proxy_deployable, sync_line, sync_proxy, ProxySync};
 use snapshot::handle_snapshot;
 use ssh_config::{handle_ssh_config, handle_ssh_config_admin, handle_ssh_config_install, handle_ssh_config_uninstall, ssh_config_after};
 // Reached as `super::x`/`crate::x` by the modules that predate the split (new code imports from the module itself).
-use cli::Cli;
+use cli::{Cli, SelectOpts};
 use config_cmd::note_invalid_text;
 use cron::{arena_cron_lines, char_named, cron_unsafe_char, reap_cron_installed, CRON_PATH_CHARS};
-use keys::{copy_keys_command, drop_key_row, fleet_ssh_for, rotate_key, write_openrouter_key, COPY_KEYS_TIMEOUT};
+use keys::{copy_keys_command, drop_key_row, fleet_ssh_for, key_holders, keys_targets, rotate_key, write_openrouter_key, COPY_KEYS_TIMEOUT, OPENROUTER_KEYS_LINK};
 use pods::backup::{failure_why, BackupFailed, Unpushed};
 use pods::health::{health_cache_path, record_health};
 use pods::list::enrich_best_effort;
@@ -98,7 +99,7 @@ use config_cmd::{admin_key_rows, bad_hosts_section, balance_section, config_repo
 #[cfg(test)]
 use cron::{env_assignment, reap_cron_line, CronKind, CRON_BEGIN, CRON_END};
 #[cfg(test)]
-use keys::{keys_preview, keys_targets, keys_with, KeysAction, KeysCmd};
+use keys::{keys_preview, keys_with, KeysAction, KeysCmd};
 #[cfg(test)]
 use pods::backup::{backup_fleet, copy_unpushed, fallback_lines, handle_backup, on_protected_line, on_protected_lines, telling_line, BackupTally};
 #[cfg(test)]
