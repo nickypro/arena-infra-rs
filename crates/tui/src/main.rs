@@ -697,6 +697,9 @@ async fn refresh(
     details: &mut DetailsState,
     forced: bool,
 ) {
+    // The spend ledger records the listing as of when it began (a stop the dashboard made
+    // meanwhile is newer, and stands).
+    let listed_at = snapshot::unix_now();
     let (fresh, listing) = list_all(provider, details).await;
     let now = snapshot::unix_now();
     // The prepaid balances on the details cadence (every DETAILS_EVERY, or `r` after the
@@ -782,6 +785,10 @@ async fn refresh(
         r.record(timed, Instant::now());
     }
     overlay_details(&mut pods, &details.details);
+    // What each machine costs, for `arena spend` — quietly, and an unchanged machine isn't
+    // rewritten more than once a minute. Only the providers that listed this time count
+    // (`fresh`): a rate-limited one's carried rows say nothing new.
+    arena_core::spend::record_listing(spend_path(cfg).as_deref(), &fresh, &pods, &Naming::from_config(cfg), listed_at);
     // The balance's runway is judged against what is billing as listed (not the pending
     // placeholders, and after the details filled the prices), a provider that failed to
     // list — or was rate-limited, its rows carried — counting as unknown, never as $0/h.
@@ -2371,6 +2378,21 @@ async fn finish_deep_check(
     s.notify(line, failed);
 }
 
+/// The fleet's spend ledger (`arena spend`): its state file — none under test unless the
+/// test's config sets `ARENA_STATE_DIR` (a test never touches the developer's own).
+fn spend_path(cfg: &Config) -> Option<std::path::PathBuf> {
+    if cfg!(test) && cfg.get("ARENA_STATE_DIR").is_none() {
+        return None;
+    }
+    snapshot::state_file_path_for(cfg, arena_core::spend::SPEND_FILE).ok()
+}
+
+/// Record a stop or terminate the dashboard just made in the spend ledger (quietly).
+fn record_spend(cfg: &Config, ev: &arena_core::spend::Event) {
+    let now = snapshot::unix_now();
+    arena_core::spend::record_quietly(spend_path(cfg).as_deref(), now, |s| arena_core::spend::apply_event(s, ev, now));
+}
+
 /// Perform one action against a pod, returning a one-line human-readable outcome.
 /// This is the *only* place the dashboard mutates anything. `arg` carries the typed
 /// command (`Run`) or branch (`SetBranch`); it's `None` for the other actions.
@@ -2406,14 +2428,20 @@ async fn execute(
             Err(e) => format!("✗ restart {name} failed: {}", lock::explain(name, &e)),
         },
         Action::Stop => match provider.stop_pod_outcome(&pod.id).await {
-            Ok(outcome) => match outcome.note() {
-                Some(note) => format!("✓ stopped {name} — ⚠ {note}"),
-                None => format!("✓ stopped {name}"),
-            },
+            Ok(outcome) => {
+                record_spend(cfg, &arena_core::spend::Event::Stopped { provider: Some(&pod.provider), id: &pod.id });
+                match outcome.note() {
+                    Some(note) => format!("✓ stopped {name} — ⚠ {note}"),
+                    None => format!("✓ stopped {name}"),
+                }
+            }
             Err(e) => format!("✗ stop {name} failed: {}", lock::explain(name, &e)),
         },
         Action::Terminate => match provider.terminate_pod(&pod.id).await {
-            Ok(()) => format!("✓ terminated {name}"),
+            Ok(()) => {
+                record_spend(cfg, &arena_core::spend::Event::Terminated { provider: Some(&pod.provider), id: &pod.id });
+                format!("✓ terminated {name}")
+            }
             Err(e) => format!("✗ terminate {name} failed: {}", lock::explain(name, &e)),
         },
         Action::Backup => run_backup(remote, cfg, pod).await,

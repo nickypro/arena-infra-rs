@@ -52,6 +52,8 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [`teardown --check`](#teardown---check)
   - [`balance`](#balance)
   - [`balance set`](#balance-set)
+  - [`spend`](#spend)
+  - [Project week as a second fleet](#project-week-as-a-second-fleet)
 - [Config, plans and the provider APIs](#config-plans-and-the-provider-apis)
   - [`config check | set | which`](#config-check--set--which)
   - [`plan check | show`](#plan-check--show)
@@ -128,9 +130,9 @@ cargo run -p arena-cli -- --config ./config.env pods list
 Every green master commit is published as a GitHub release (`.github/workflows/release.yml`):
 `arena` and `arena-tui` for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, built
 on Ubuntu 22.04 (glibc 2.35 or newer), with `CHANGELOG.md` and `SHA256SUMS`. The tag is the
-version, `v<base>.YYMMDD.HHMM`: the base (`BASE` in `crates/cli/build.rs`, e.g. `2.2`) and the
-commit's time in UTC. `arena --version` prints it with the commit: `arena 2.2.261030.1500 (5274b7a1c2)`. The base
-goes up a minor (2.0 → 2.1) when a command, flag or `--json` shape changes in a way a script or
+version, `v<base>.YYMMDD.HHMM`: the base (`BASE` in `crates/cli/build.rs`, e.g. `2.3`) and the
+commit's time in UTC. `arena --version` prints it with the commit: `arena 2.3.261030.1500
+(5274b7a1c2)`. The base goes up a minor (2.0 → 2.1) when a command, flag or `--json` shape changes in a way a script or
 habit notices, a major for a config or on-pod layout break that needs action; otherwise the date
 stamp alone tells releases apart. A newer base is always newer: a 2.0 build updates to 2.1.
 
@@ -655,6 +657,9 @@ A few of them; every module, with what it does and what is pure, is in
   allowlisted `PublicSnapshot` for the web page.
 - `teardown` — the pure judge behind `teardown --check`: listings, volumes, keys, cron/`at` and
   proxy inputs in, a `✓ ✗ ? –` checklist with fix commands out (unknown ≠ empty).
+- `spend` — what each machine instance cost and who it was for: the `spend.json` ledger folded
+  from listings and lifecycle events, $/h segments and flagged estimates, AI keys per owner, the
+  report per owner or instance (RunPod corrected from its per-pod billing), its renderers.
 - `balance` — prepaid account balances and the fallback chain: live (RunPod GraphQL `myself`, Vast
   `users/current`, Shadeform's undocumented `account`), else an estimate from the last reading minus
   max(billed, metered) spend, else `?`; burn, runway, levels, the `balance.json` state and every
@@ -2216,6 +2221,144 @@ replaces it).
 live alongside, within the same 5 s — else the live price `offers`/placement saw for that GPU and
 tier under a day ago, `~` with its age — else a stand-in), and RunPod's refusals ahead of time:
 under an hour's credit for them, over the spend limit, `underBalance` — never blocking.
+
+### `spend`
+
+`spend [--by owner|machine] [--since DATE] [--csv|--json]` — what each machine instance cost and
+who it was for, compute and AI, for the organisers (read-only towards the providers; it records
+what it read in the local ledger). `spend assign <machine|instance id|key hash> <owner>` (or
+`--clear`) sets or fixes an owner.
+
+**Rows are instances, owners are a field.** An instance is provider + provider id: a terminated
+machine keeps its row, and a name created again is a new row (`--by machine` shows both). The
+owner is recorded by `pods up/create --owner NAME` for the instances that run makes (`--dry-run`
+says what it would record), by `spend assign` later (a machine name means its running instance),
+and kept by `replace`/`migrate` for the instance that replaces it. Nothing else in arena knows
+about owners. `--by owner` (default) is one row per owner — machines, running hours, compute per
+currency, AI in USD, total — then `(no owner)` (where a forgotten `--owner` shows up), the totals,
+and the notes.
+
+**Where the numbers come from.** A ledger per fleet, `spend.json` next to `balance.json` (0600,
+`~/.local/state/arena/<prefix>/`), folded from what arena already sees: every complete listing
+(`pods list`, the dashboard, `teardown --check`, `arena balance`, `snapshot` — so the snapshot cron
+line, every 2 min, keeps it current with nobody at a terminal) and every create, stop, start and
+terminate arena makes, recorded the moment it succeeds (a terminate's end time is exact). Each
+instance carries $/h segments: its listed price (a running RunPod pod's disk on top, as the balance
+meters it), a stopped pod's disk only (RunPod: its volume at $0.20/GB-month; Vast: a $0.50
+ceiling), a price change. Between two observations the cost is a step at the higher end. A
+provider that failed to list ends nothing; only this fleet's names (`{prefix}-…`, `@` entries) get
+rows, so another fleet's pods on a shared account stay out. An unreadable or newer-version ledger
+is moved aside (`spend.json.ignored-<time>`), never overwritten, and `arena spend` notes from when
+the new one counts. While a ledger can't be read, `--owner` stops a create (whose keys are whose is
+unknown) unless `--keep-key`; after a restart, so does `--owner` until the keys are listed again
+(`arena spend` lists them), and then for a name whose key was made before the restart and has had
+no owner recorded since — it may be someone's, so it isn't given to a machine's owner either —
+until `spend assign <key hash> <owner>`, `keys rotate <name>`, or `--keep-key`. A listing is recorded as of when it began, so a stop or terminate recorded while it
+was in flight stands.
+
+**RunPod's own numbers.** RunPod's REST billing splits per pod: `GET /v2/billing/pods`, hourly,
+one record per pod (checked live 2026-10-30: the records sum to `/v2/billing`'s total). `arena
+spend` reads it for the window: an hour two hours old is what RunPod billed that pod (`SOURCE`
+billed) — an hour without a record for a pod the answer has is $0 — and a younger one the higher
+of billing and metering (billing lags about an hour). With `--since` mid-hour, that first part-hour
+is metered (a bucket is a whole hour). The last
+note says how much of the account's billing in the window the rows account for — the rest is other
+pods, volumes or serverless.
+
+**Estimates** are marked `~`, and the notes say why and which way they err:
+
+| Note | Charged | Errs |
+| --- | --- | --- |
+| not observed for over 30 min | at the higher of the rates either side | either way (it may have been stopped, or started, meanwhile) |
+| vanished between two observations | up to the first listing without it | high, by at most that gap |
+| first seen well after its provider says it was made | back to then, at its first rate | either way |
+| may have run before arena first saw it (made before tracking began, or found after its provider went unlisted for over 30 min) | from the first observation (RunPod: from its creation where billing covers it, then not an estimate) | low |
+| no price known | 0 | low |
+| stopped on Vast | its disk at a storage ceiling | high |
+
+A listing older than what the ledger already has (a slow command, a clock that went back) changes
+nothing: it neither ends a machine seen since nor reopens one ended since.
+
+Hetzner bills a server at most its monthly price in a month (about 26 days of hourly price): not
+modelled, a week never reaches it.
+
+**Currencies are never added together.** RunPod, Vast and Shadeform bill USD; Hetzner the
+account's currency, read from `GET /pricing` by `arena spend` (prod's project bills EUR, the
+sandbox's USD; arena assumes EUR until it's read). Totals are per currency.
+
+**AI keys** (OpenRouter, by hash). A key's owner is its machine's owner when arena minted it (`keys
+gen`/`rotate`), or the first owner its machine gets (a key minted before the machine), or `spend
+assign <hash> <owner>`. Its spend is its all-time `usage`; with `--since`, the rise from its usage
+at the window's start. The snapshot cron line reads every key's usage hourly, so there is a reading
+near any start: when the last one before it is older (the usage then rose before the next one), the
+rise in between is counted, `~`, erring high; a key first read after the start counts from that
+reading, `~`, erring low. Before arena deletes a key — `keys rotate`/`revoke`, `pods terminate
+--revoke-key`, a handover — its usage as listed just before is recorded with the delete, so it
+stays its owner's; a key deleted outside arena keeps its last seen usage, flagged.
+
+**Key handover.** `pods up/create --owner bob apple`, when `apple`'s key was minted for alice:
+the plan says so, and after the prompt (before the create) `apple`'s key is rotated — alice keeps
+what it spent, bob's machine gets a fresh key (cap `OPENROUTER_KEY_LIMIT`). `--keep-key` keeps the
+old key (and what's spent on it stays alice's). A handover that fails (OpenRouter down, no
+`OPENROUTER_PROVISIONING_KEY`) stops the command before anything is created — the new machine would
+get alice's key, or one already deleted (whose row then leaves the keys CSV). Re-run once `arena
+keys rotate apple` works, or pass `--keep-key`.
+
+`--csv`: per owner `owner,machines,instances,hours,compute_<cur>…,ai_usd,total_<cur>…,estimate`;
+`--by machine --csv` one row per instance (`name,id,provider,gpu,owner,start,end,end_how,hours,
+currency,cost,source,estimate,estimated`). `--json`: the whole report. A source that couldn't be
+read (a provider's listing, the keys, RunPod's billing, Hetzner's currency) is one warning line;
+the exit is 0.
+
+### Project week as a second fleet
+
+A project week (say ~25 people, machines set up by organisers) runs best as its **own fleet**:
+its own config file, prefix, OpenRouter workspace and ledger, on the same proxy box. Nothing in
+arena has a "project week mode"; a second config is all it is.
+
+What must differ in the second config (`/root/pw/config.env`, from `config.env.example`):
+
+| Key | Why |
+| --- | --- |
+| `MACHINE_NAME_PREFIX=pw` (and its own `MACHINE_NAME_LIST`) | names, state dir, ledger, backup branches; avoid `@` entries the other fleet lists. **Not `<other prefix>-…`** (say `arena9-pw`): its machines and keys would be named `arena9-…`, and the main fleet would count them as its own (and the other way round) |
+| `OPENROUTER_WORKSPACE` | its own workspace: its keys, and the AI spend per key |
+| `SSH_PROXY_NGINX_CONFIG_PATH=/etc/nginx/streams-enabled/pw.conf` | a fleet's `proxy apply` owns its file: two fleets in one file drop each other's forwards |
+| `SSH_PROXY_STARTING_PORT=9200` | ports are start + list position: keep well clear of the other range (prod 9000+) |
+| `SSH_ADMIN_CONFIG_FILE=~/.ssh/pw-admin.conf` (or `SSH_CONFIG_FILE`, whichever the other fleet uses) | the default file is the other fleet's |
+| `LOCAL_BACKUP_DIR`, `ARENA_START_DATE` | if it backs up: its own folder and day numbering |
+
+Then, as root on the proxy box (`/home/dev/.cargo/bin/arena` is where prod's `arena` is, and
+where `arena update` installs: next to the running binary — `readlink -f "$(command -v arena)"`
+prints it on another box):
+
+```bash
+mkdir -p /root/pw                                     # its own folder: keys/ is relative to it
+pw() { (cd /root/pw && /home/dev/.cargo/bin/arena --config /root/pw/config.env "$@"); }
+pw config check
+pw proxy plan && pw proxy apply                       # writes pw.conf only
+pw pods up apple --owner alice                        # each person's machines
+pw spend                                              # per person; --by machine --csv for a sheet
+pw tui                                                # its dashboard
+```
+
+- `arena` reads `--config` (only `arena-tui` reads `ARENA_CONFIG`; `arena tui` passes `--config`
+  on) — hence `pw()`. Open the second fleet's dashboard with `pw tui` only: its actions run
+  `arena` in the folder it was started from, and only `/root/pw` has the second fleet's `keys/`.
+- **Cron: never `arena cron install` for the second fleet.** A crontab has one arena block, and
+  its lines are known by command, not config: the second fleet's install would replace the first
+  fleet's lines (`cron remove` would remove them), and both would share the locks in
+  `~/.local/state/arena-cron/`. Write its lines by hand where arena never looks, e.g.
+  `/etc/cron.d/arena-pw` — the snapshot line is the one that keeps its ledger current. Name the
+  binary by its full path, as prod's own crontab does (cron's `PATH` is `/usr/bin:/bin`: a bare
+  `arena` fails there, quietly):
+
+  ```
+  */2 * * * * root mkdir -p /root/.local/state/arena-cron-pw && cd /root/pw && flock -n /root/.local/state/arena-cron-pw/snapshot.lock /home/dev/.cargo/bin/arena --config /root/pw/config.env snapshot --public --out /root/pw/fleet.json >> /root/.local/state/arena-cron-pw/snapshot.log 2>&1
+  ```
+- **Shared provider accounts:** listings are per account, so the second fleet's `pods list` shows
+  the first fleet's pods, and `--all` (or a command without targets) acts on them too. Name your
+  targets with `pw`, or give the project week its own Hetzner project (its own token) and RunPod
+  account. `teardown --check` lists every machine on the account.
 
 ## Config, plans and the provider APIs
 

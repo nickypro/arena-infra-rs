@@ -43,6 +43,7 @@ mod money;
 mod offers;
 mod reap;
 mod resolve;
+mod spend;
 mod teardown;
 mod up;
 
@@ -234,6 +235,9 @@ fn exit_code(result: &Result<()>) -> std::process::ExitCode {
     }
 }
 
+// Parsed once per run: `pods`' many flags make it the largest variant by far, and boxing it
+// would only cost every `Cmd::Pods(PodCmd::…)` match a deref.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Pods: create, set up, run, back up, stop, terminate
@@ -410,6 +414,33 @@ enum Cmd {
         /// Also print the burn's parts, spend limit, billing history and last failures
         #[arg(long, short = 'v')]
         verbose: bool,
+    },
+    /// What each machine instance cost and who it was for (compute + AI)
+    ///
+    /// For organisers. One row per owner (`pods up/create --owner`), then "(no owner)" (a
+    /// forgotten --owner shows there) and the totals; currencies are never summed. --by machine:
+    /// one row per instance — a name created again is a new row. Lists the fleet and the AI
+    /// keys, reads RunPod's per-pod billing, records what it saw in the local ledger
+    /// (spend.json, which pods list, the dashboard and the snapshot cron keep current) and
+    /// reports from it; ~ marks an estimate, the notes say which way it errs. Changes nothing
+    /// else. `spend assign <machine|instance id|key hash> <owner>` sets or fixes an owner.
+    #[command(verbatim_doc_comment)]
+    #[command(args_conflicts_with_subcommands = true)]
+    Spend {
+        #[command(subcommand)]
+        cmd: Option<spend::SpendCmd>,
+        /// One row per `owner` (default) or per `machine` instance
+        #[arg(long, value_name = "WHAT", value_parser = clap::builder::PossibleValuesParser::new(spend::BY), default_value = "owner")]
+        by: String,
+        /// Only what was spent from this UTC date on (YYYY-MM-DD, or an RFC 3339 time)
+        #[arg(long, value_name = "DATE", value_parser = arena_core::spend::parse_since)]
+        since: Option<u64>,
+        /// CSV instead of a table
+        #[arg(long, conflicts_with = "json")]
+        csv: bool,
+        /// The whole report as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Read-only GET passthrough to a provider's REST API
     #[command(subcommand, infer_subcommands = true)]
@@ -983,6 +1014,8 @@ enum PodCmd {
         api_json: Option<String>,
         #[command(flatten)]
         reap: ReapAtCreate,
+        #[command(flatten)]
+        owner: spend::OwnerArgs,
         /// Don't sync the proxy afterwards
         #[arg(long)]
         skip_proxy: bool,
@@ -1057,6 +1090,8 @@ enum PodCmd {
         api_json: Option<String>,
         #[command(flatten)]
         reap: ReapAtCreate,
+        #[command(flatten)]
+        owner: spend::OwnerArgs,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -1818,6 +1853,57 @@ impl Provider for RecordingProvider<'_> {
     }
     async fn pod_spec(&self, id: &str) -> arena_core::Result<PodSpec> {
         self.inner.pod_spec(id).await
+    }
+}
+
+/// `create`/`up --owner`: print what will be recorded and which names' AI keys are handed over
+/// (rotated: the old owner keeps what they spent); returns those handovers. `Err` when the
+/// ledger can't be read (whose keys these are is unknown): before anything is created.
+fn owner_plan(tracking: &spend::SpendCtx, owner: &spend::OwnerArgs, names: &[String], dry_run: bool) -> Result<Vec<spend::Handover>> {
+    let handing = spend::handovers(tracking, names, owner.owner.as_deref(), owner.keep_key)?;
+    for line in spend::owner_lines(owner.owner.as_deref(), names, &handing, owner.keep_key, dry_run) {
+        println!("{line}");
+    }
+    Ok(handing)
+}
+
+/// Run the handovers [`owner_plan`] found, after the prompt and before any create: whether
+/// the keys CSV changed. A handover that failed stops the command before anything is
+/// created — the new machine would get the old owner's key, or none that works.
+async fn hand_keys_over(tracking: &spend::SpendCtx, cfg: &Config, owner: &spend::OwnerArgs, handing: &[spend::Handover]) -> Result<bool> {
+    let Some(o) = owner.owner.as_deref().filter(|_| !handing.is_empty()) else { return Ok(false) };
+    let api = openrouter_client(cfg);
+    let done = spend::hand_over(tracking, cfg, api.as_ref().map(|a| a as &dyn arena_core::openrouter::KeyApi), std::path::Path::new(KEYS_DIR), handing, o).await;
+    for l in &done.lines {
+        if l.starts_with('✗') {
+            eprintln!("{l}");
+        } else {
+            println!("{l}");
+        }
+    }
+    if !done.failed.is_empty() {
+        anyhow::bail!(
+            "the OpenRouter key handover failed for {} — nothing was created. Re-run once `arena keys rotate <name>` \
+             works, or pass --keep-key to create with the name's current key (a name whose old key is already gone \
+             is created without one: `arena keys gen <name>` then mints its new owner's)",
+            done.failed.join(", ")
+        );
+    }
+    Ok(done.csv_changed)
+}
+
+/// Drop `host`'s row from the keys CSV in `dir` (its key was deleted, none replaced it):
+/// whether a row went (`Ok(false)`: no CSV, or no row for it).
+fn drop_key_row(dir: &std::path::Path, host: &str) -> std::io::Result<bool> {
+    let csv = dir.join(OPENROUTER_KEYS_LINK);
+    let text = match std::fs::read_to_string(&csv) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    match arena_core::apikeys::remove_csv_host(&text, host) {
+        Some(rest) => write_secret_file(&csv, &rest).map(|()| true),
+        None => Ok(false),
     }
 }
 
@@ -3273,6 +3359,22 @@ async fn run() -> Result<()> {
                 std::io::stdout().flush()?;
                 std::process::exit(out.code);
             }
+            Ok(())
+        }
+        Cmd::Spend { cmd, by, since, csv, json } => {
+            let ctx = spend::SpendCtx::from_config(&cfg);
+            let now = arena_core::snapshot::unix_now();
+            let fleet = provider.unwrap();
+            if let Some(spend::SpendCmd::Assign { target, owner, clear }) = cmd {
+                let owner = if clear { None } else { owner.as_deref() };
+                print!("{}", spend::spend_assign(fleet.as_ref(), &cfg, &ctx, &target, owner, now).await?);
+                return Ok(());
+            }
+            let keys = openrouter_client(&cfg);
+            let flags = spend::SpendFlags { by_machine: by == "machine", since, csv, json };
+            let out = spend::spend_report(fleet.as_ref(), &cfg, &ctx, keys.as_ref().map(|k| k as &dyn arena_core::openrouter::KeyApi), &flags, now).await?;
+            out.stderr.iter().for_each(|l| eprintln!("{l}"));
+            print!("{}", out.stdout);
             Ok(())
         }
         Cmd::Gpus { json } => offers::handle_gpus(&cfg, &cli.provider, json).await,
@@ -7895,6 +7997,8 @@ async fn list_with(
     };
     let (listed, fetched) = tokio::join!(listing, observing);
     let (listing, pods, mut warnings) = listed?;
+    // What each machine costs, recorded for `arena spend` (quietly), as of when it listed.
+    spend::SpendCtx::from_config(cfg).listing(&listing, &pods, now);
     // SSH_CONFIG_FILE (and staff's SSH_ADMIN_CONFIG_FILE) kept current from this listing — a
     // complete one only (a provider that failed would drop its pods' blocks); nothing at all
     // when they're unset or nothing moved.
@@ -7965,6 +8069,17 @@ async fn handle_pods_bal(
     interrupt: Interrupt,
     bal: &money::BalanceCtx,
 ) -> Result<()> {
+    // Every create, stop, start and terminate below is recorded in the spend ledger as it
+    // succeeds (`arena spend`), with `--owner` for the instances `create`/`up` make; a
+    // `replace`/`migrate` keeps the owner of the machine it replaces.
+    let tracking = spend::SpendCtx::from_config(cfg);
+    let owner = match &cmd {
+        PodCmd::Create { owner, .. } | PodCmd::Up { owner, .. } => owner.owner.as_deref(),
+        _ => None,
+    };
+    let replaces = matches!(cmd, PodCmd::Replace { .. } | PodCmd::Migrate { .. });
+    let tracked = spend::Tracked::new(provider, &tracking, spend::owner_rule(owner, replaces));
+    let provider: &dyn Provider = &tracked;
     match cmd {
         PodCmd::List { json, probe, no_probe } => {
             // Probe GPU by default for the human table; JSON stays fast/scriptable unless
@@ -7974,7 +8089,7 @@ async fn handle_pods_bal(
             print!("{out}");
         }
 
-        PodCmd::Create { names, count, add, gpu, gpus, server_type, cloud, max_price, order, disk, volume, image, bootstrap, api_json, reap, skip_proxy, dry_run, keep_trying, retry_mins, retry_secs } => {
+        PodCmd::Create { names, count, add, gpu, gpus, server_type, cloud, max_price, order, disk, volume, image, bootstrap, api_json, reap, owner, skip_proxy, dry_run, keep_trying, retry_mins, retry_secs } => {
             // A reap policy asked for: resolved (one end time for every pod) and its state
             // checked before anything is created; then every create records it.
             let reaping = reap.resolve(cfg, provider.name())?;
@@ -8041,6 +8156,7 @@ async fn handle_pods_bal(
                 print_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]));
                 warn_no_volume(provider, &spec);
                 print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
+                owner_plan(&tracking, &owner, &names, true)?;
                 println!("\nDry-run only — no pods created (this is a preview).");
                 return Ok(());
             }
@@ -8055,10 +8171,12 @@ async fn handle_pods_bal(
             // The account balance for these pods, next to the prompt: advisory (it never
             // blocks, and `--yes` changes nothing), quiet if the balance can't be read.
             print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
+            let handing = owner_plan(&tracking, &owner, &names, false)?;
             if !confirm(yes, &what)? {
                 println!("aborted.");
                 return Ok(());
             }
+            hand_keys_over(&tracking, cfg, &owner, &handing).await?;
             // Retry rounds only retry the confirmed names still missing; -n/-a also stop once
             // the provider-scoped total is met (topup_target == 0 marks the explicit case).
             let outcome = match &options {
@@ -8092,7 +8210,7 @@ async fn handle_pods_bal(
             }
         }
 
-        PodCmd::Up { names, count, add, gpu, gpus, server_type, cloud, max_price, order, disk, volume, image, bootstrap, api_json, reap, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, check, check_attempts, retry_bad_hosts, lock, timeout, endpoint_timeout, interval } => {
+        PodCmd::Up { names, count, add, gpu, gpus, server_type, cloud, max_price, order, disk, volume, image, bootstrap, api_json, reap, owner, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, check, check_attempts, retry_bad_hosts, lock, timeout, endpoint_timeout, interval } => {
             // As `create`: the reap policy is resolved once, before anything is created, and
             // recorded for each pod (replacements included) the moment its create returns.
             let reaping = reap.resolve(cfg, provider.name())?;
@@ -8180,6 +8298,7 @@ async fn handle_pods_bal(
                 print_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]));
                 warn_no_volume(provider, &spec);
                 print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
+                owner_plan(&tracking, &owner, &names, true)?;
                 let retry = if retry_mins > 0 { format!(" (retrying up to {retry_mins}m for capacity)") } else { String::new() };
                 println!(
                     "\nDry-run only — no pods created (preview){retry}: would create the above, then {per_pod}. \
@@ -8215,10 +8334,13 @@ async fn handle_pods_bal(
             // The account balance for these pods, next to the prompt: advisory (it never
             // blocks, and `--yes` changes nothing), quiet if the balance can't be read.
             print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
+            let handing = owner_plan(&tracking, &owner, &names, false)?;
             if !confirm(yes, &what)? {
                 println!("aborted.");
                 return Ok(());
             }
+            // The handed-over keys are in the CSV before the pipelines copy any.
+            let keys = if hand_keys_over(&tracking, cfg, &owner, &handing).await? { up_keys_stage(cfg, KEYS_DIR, !no_setup) } else { keys };
             // What the operator confirmed: a name of these that gets no pod is in the summary
             // (and the exit status) too, not silently missing from it.
             let confirmed = names.clone();
@@ -9096,8 +9218,10 @@ async fn handle_snapshot(
 /// snapshot partial (and the public one `complete: false`); if none answers it's an error
 /// and nothing is written — a page going stale says more than a page that shows an empty
 /// fleet. The prepaid balances come from the balance state file alone (`bal` only says
-/// which accounts are configured): no balance call, nothing written — a cron's snapshot
-/// never observes. Returns the snapshot and the warning lines to print.
+/// which accounts are configured): no balance call, nothing written there — a cron's snapshot
+/// never observes balances. The listing is recorded in the spend ledger (quietly): with the
+/// snapshot cron line, that's what keeps `arena spend` current. Returns the snapshot and the
+/// warning lines to print.
 async fn collect_snapshot(
     provider: &dyn Provider,
     cfg: &Config,
@@ -9120,6 +9244,18 @@ async fn collect_snapshot(
     let mut pods = listing.pods();
     if let Some(w) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
         warnings.push(w);
+    }
+    // The one thing a snapshot writes: what it listed, into the spend ledger (quietly) — the
+    // snapshot cron line is what keeps `arena spend` current with nobody at a terminal. The AI
+    // keys too, once an hour (bounded, quiet): `--since` then finds each key's usage near a
+    // day's start, and a key deleted outside arena keeps a recent last reading.
+    let tracking = spend::SpendCtx::from_config(cfg);
+    tracking.listing(&listing, &pods, now);
+    if let Some(or) = openrouter_client(cfg).filter(|_| tracking.keys_due()) {
+        let listed_at = arena_core::snapshot::unix_now();
+        if let Ok(Ok(keys)) = arena_core::ratelimit::bounded(ENRICH_TIMEOUT, arena_core::openrouter::KeyApi::list_keys(&or)).await {
+            tracking.keys(&keys, listed_at);
+        }
     }
     let (proxy, w) = snapshot::local_proxy_text(cfg);
     warnings.extend(w);
@@ -10603,7 +10739,7 @@ async fn handle_terminate(
             }
         }
         if !machines.is_empty() {
-            revoked = revoke_machine_keys(book, &naming, &machines).await;
+            revoked = revoke_machine_keys(book, &naming, &machines, &spend::SpendCtx::from_config(cfg)).await;
         }
     }
     let mut problems = Vec::new();
@@ -10670,12 +10806,13 @@ struct KeyRevoke {
 /// the batch; each key deleted at most once. A machine with no key is said, not failed, and
 /// its row (a dead key, if any) is dropped. A row whose key couldn't be deleted stays, as
 /// the record that it still works.
-async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: &[String]) -> KeyRevoke {
+async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: &[String], tracking: &spend::SpendCtx) -> KeyRevoke {
     let mut out = KeyRevoke::default();
     let Some(api) = book.api else {
         out.failed = machines.to_vec(); // the caller checked up front
         return out;
     };
+    let listed_at = arena_core::snapshot::unix_now();
     let keys = match api.list_keys().await {
         Ok(k) => k,
         Err(e) => {
@@ -10686,6 +10823,8 @@ async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: 
             return out;
         }
     };
+    // Each key's usage before any is deleted: a revoked key's spend stays its owner's.
+    tracking.keys(&keys, listed_at);
     let mut csv = book.read_csv();
     let mut dropped = Vec::new();
     let mut deleted: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -10705,6 +10844,7 @@ async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: 
                 Err(e) => errs.push(e.to_string()),
             }
         }
+        tracking.keys_deleted(&mine, &mine.iter().filter(|k| deleted.contains(k.hash.as_str())).map(|k| k.hash.clone()).collect::<Vec<_>>());
         if !errs.is_empty() {
             eprintln!("[keys] ✗ {m}: revoke failed ({}) — its CSV row is kept", errs.join("; "));
             out.failed.push(m.clone());
@@ -16789,6 +16929,7 @@ async fn keys_with(
         KeysCmd::Revoke { sel, dry_run } => (KeysAction::Revoke, sel, None, false, dry_run),
     };
     let limit = limit.unwrap_or(default_limit);
+    let listed_at = arena_core::snapshot::unix_now();
     let existing = api.list_keys().await.context("listing OpenRouter keys")?;
     let known = key_holders(&naming, &existing, std::fs::read_to_string(&csv_path).ok().as_deref());
     let (names, live) = keys_targets(provider, cfg, &sel.args(), &known).await?;
@@ -16826,6 +16967,10 @@ async fn keys_with(
         println!("aborted.");
         return Ok(());
     }
+    // Each key's usage, recorded before anything is deleted: a rotated or revoked key's
+    // spend stays with whoever it was minted for (`arena spend`).
+    let tracking = spend::SpendCtx::from_config(cfg);
+    tracking.keys(&existing, listed_at);
     let (mut ok, mut skipped, mut failed) = (0, 0, 0);
     for (host, kn, theirs) in &plan {
         if action == KeysAction::Gen && !theirs.is_empty() {
@@ -16833,40 +16978,34 @@ async fn keys_with(
             skipped += 1;
             continue;
         }
-        if action != KeysAction::Gen {
-            if theirs.is_empty() && action == KeysAction::Revoke {
+        if action == KeysAction::Revoke {
+            if theirs.is_empty() {
                 println!("= {host}: no key named '{kn}'");
                 skipped += 1;
                 continue;
             }
-            let errs: Vec<String> = {
-                let mut errs = Vec::new();
-                for k in theirs {
-                    if let Err(e) = api.delete_key(&k.hash).await {
-                        errs.push(e.to_string());
-                    }
-                }
-                errs
-            };
-            if !errs.is_empty() {
-                eprintln!("✗ {host}: delete: {}", errs.join("; "));
-                failed += 1;
-                continue;
-            }
-            if action == KeysAction::Revoke {
+            let (deleted, errs) = delete_keys(api, theirs).await;
+            tracking.keys_deleted(theirs, &deleted);
+            if errs.is_empty() {
                 println!("✓ {host}: revoked");
                 ok += 1;
-                continue;
+            } else {
+                eprintln!("✗ {host}: delete: {}", errs.join("; "));
+                failed += 1;
             }
+            continue;
         }
-        match api.create_key(kn, Some(limit)).await {
-            Ok(ck) => {
+        match rotate_key(api, kn, theirs, limit).await {
+            Ok((deleted, ck)) => {
+                tracking.keys_deleted(theirs, &deleted);
+                tracking.key_minted(&ck.hash, host, None);
                 write_openrouter_key(dir, host, &ck.secret, &prefix)?;
                 println!("✓ {host}: {} {}", if action == KeysAction::Gen { "minted" } else { "rotated" }, &ck.hash[..ck.hash.len().min(12)]);
                 ok += 1;
             }
-            Err(e) => {
-                eprintln!("✗ {host}: create: {e}");
+            Err((deleted, why)) => {
+                tracking.keys_deleted(theirs, &deleted);
+                eprintln!("✗ {host}: {why}");
                 failed += 1;
             }
         }
@@ -16883,6 +17022,38 @@ async fn keys_with(
         copy_new_keys(remote.clone(), cfg, dir, &live, yes).await?;
     }
     Ok(())
+}
+
+/// Delete `keys` one by one: the hashes deleted, and the errors.
+async fn delete_keys(api: &dyn arena_core::openrouter::KeyApi, keys: &[&arena_core::openrouter::KeyInfo]) -> (Vec<String>, Vec<String>) {
+    let (mut deleted, mut errs) = (Vec::new(), Vec::new());
+    for k in keys {
+        match api.delete_key(&k.hash).await {
+            Ok(()) => deleted.push(k.hash.clone()),
+            Err(e) => errs.push(e.to_string()),
+        }
+    }
+    (deleted, errs)
+}
+
+/// `keys rotate` (and `gen`, with nothing to delete) for one machine — and a handover's: delete
+/// `theirs` (its existing keys), then mint `kn` with a `limit` cap (the caller saves its
+/// secret). Nothing is minted while an old key is still alive. Either way, the hashes
+/// deleted; `Err` says which step failed.
+async fn rotate_key(
+    api: &dyn arena_core::openrouter::KeyApi,
+    kn: &str,
+    theirs: &[&arena_core::openrouter::KeyInfo],
+    limit: f64,
+) -> std::result::Result<(Vec<String>, arena_core::openrouter::CreatedKey), (Vec<String>, String)> {
+    let (deleted, errs) = delete_keys(api, theirs).await;
+    if !errs.is_empty() {
+        return Err((deleted, format!("delete: {}", errs.join("; "))));
+    }
+    match api.create_key(kn, Some(limit)).await {
+        Ok(ck) => Ok((deleted, ck)),
+        Err(e) => Err((deleted, format!("create: {e}"))),
+    }
 }
 
 /// `arena ssh-config`: print (and optionally write) the participant-facing
@@ -22774,6 +22945,7 @@ mod proxy_deploy_tests {
             bootstrap: false,
             api_json: None,
             reap: crate::ReapAtCreate::default(),
+            owner: crate::spend::OwnerArgs::default(),
             skip_proxy: false,
             dry_run: false,
             keep_trying: false,
@@ -23045,6 +23217,7 @@ mod placement_cli_tests {
             bootstrap: false,
             api_json: None,
             reap: crate::ReapAtCreate::default(),
+            owner: crate::spend::OwnerArgs::default(),
             skip_proxy: true,
             dry_run: false,
             keep_trying: false,
@@ -23080,6 +23253,7 @@ mod placement_cli_tests {
             bootstrap: false,
             api_json: None,
             reap: crate::ReapAtCreate::default(),
+            owner: crate::spend::OwnerArgs::default(),
             dry_run,
             no_wait: false,
             keep_trying: false,
@@ -23552,6 +23726,7 @@ mod placement_cli_tests {
             bootstrap: false,
             api_json: None,
             reap: crate::ReapAtCreate::default(),
+            owner: crate::spend::OwnerArgs::default(),
             dry_run: true,
             no_wait: false,
             keep_trying: false,
@@ -23589,6 +23764,7 @@ mod placement_cli_tests {
             bootstrap: false,
             api_json: None,
             reap: crate::ReapAtCreate::default(),
+            owner: crate::spend::OwnerArgs::default(),
             dry_run: false,
             no_wait: true,
             keep_trying: false,
@@ -23628,6 +23804,7 @@ mod placement_cli_tests {
             bootstrap: false,
             api_json: None,
             reap: crate::ReapAtCreate::default(),
+            owner: crate::spend::OwnerArgs::default(),
             dry_run: false,
             no_wait: true,
             keep_trying: false,

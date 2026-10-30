@@ -44,7 +44,7 @@ body:
     attributes:
       label: arena version
       description: The output of `arena --version`.
-      placeholder: arena 2.2.261030.1500 (b0baa50a1c)
+      placeholder: arena 2.3.261030.1700 (185958b2c1)
     validations:
       required: true
   - type: dropdown
