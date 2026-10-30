@@ -17,11 +17,14 @@ struct Sizer {
     specs: Mutex<Vec<PodSpec>>,
     made: Mutex<Vec<Pod>>,
     lists: AtomicUsize,
+    /// From this many pods on, a create is refused over the project's limit (Hetzner's live
+    /// `resource_limit_exceeded`, as its backend reads it).
+    limit: Option<usize>,
 }
 
 impl Sizer {
     fn new(name: &'static str) -> Self {
-        Sizer { name, specs: Mutex::default(), made: Mutex::default(), lists: AtomicUsize::new(0) }
+        Sizer { name, specs: Mutex::default(), made: Mutex::default(), lists: AtomicUsize::new(0), limit: None }
     }
 }
 
@@ -39,6 +42,9 @@ impl Provider for Sizer {
     }
     async fn create_pod(&self, spec: &PodSpec) -> CoreResult<Pod> {
         self.specs.lock().unwrap().push(spec.clone());
+        if self.limit.is_some_and(|max| self.made.lock().unwrap().len() >= max) {
+            return Err(arena_core::provider::hetzner::recorded::limit_refusal("hetzner create"));
+        }
         let n = self.made.lock().unwrap().len() as u16;
         let pod = Pod {
             id: format!("{}", 100 + n),
@@ -124,6 +130,7 @@ fn up(gpu: Option<&str>, server_type: Option<&str>) -> PodCmd {
         retry_bad_hosts: true,
         lock: false,
         timeout: 5,
+        endpoint_timeout: None,
         interval: 1,
     }
 }
@@ -253,5 +260,36 @@ fn config_check_shows_the_hetzner_key_name_up_front() {
         let (report, missing) = config_report(&Config::parse(text), provider);
         assert_eq!(report.contains("HETZNER_SSH_KEY              arena9"), shown, "{provider} {text:?}\n{report}");
         assert!(!missing.iter().any(|m| m.starts_with("HETZNER_SSH_KEY") || m.starts_with("HETZNER_SERVER_TYPE")), "{missing:?}");
+    }
+}
+
+/// Live 2026-10-29: a create refused over the Hetzner project's shared-core limit read
+/// "authentication failed creating …" — a dead key, the wrong thing to go and fix. Now it says
+/// it's the project's limit and what to do; the run keeps what it made and stops there — no
+/// further create for the names after it (each would hit the same limit) and no wait for one to
+/// free up (`--keep-trying` waits on capacity only).
+#[tokio::test]
+async fn a_project_limit_is_said_as_one_and_stops_the_creates_without_reading_as_a_bad_key() {
+    for keep_trying in [false, true] {
+        let mut cmd = up(None, Some("cx33"));
+        if let PodCmd::Up { names, keep_trying: k, .. } = &mut cmd {
+            *names = vec!["apple".into(), "bloom".into()];
+            *k = keep_trying;
+        }
+        let p = Sizer { limit: Some(1), ..Sizer::new("hetzner") };
+        let e = handle_pods(cmd, &p, remote(), &cfg(), true).await.unwrap_err();
+        let e = format!("{e:#}");
+        assert!(!e.contains("authentication"), "{e}");
+        assert!(
+            e.contains(
+                "creating devtest-bloom: provider error: hetzner create HTTP 403 Forbidden: Hetzner refused: the project's \
+                 resource limit is reached (shared core limit exceeded; limit: server_shared_cores_limit) — use a smaller \
+                 type (--server-type / HETZNER_SERVER_TYPE), free a server, or ask Hetzner to raise the limit"
+            ),
+            "{e}"
+        );
+        let tried: Vec<String> = p.specs.lock().unwrap().iter().map(|s| s.name.clone()).collect();
+        assert_eq!(tried, ["devtest-apple", "devtest-bloom"], "keep_trying {keep_trying}: one refusal, no retry");
+        assert_eq!(p.made.lock().unwrap().len(), 1, "apple kept");
     }
 }

@@ -648,10 +648,21 @@ where
     pods
 }
 
+/// How [`lookup_failed`] starts the `status_detail` it sets.
+const LOOKUP_FAILED: &str = "SSH endpoint lookup failed";
+
 /// A pod whose endpoint lookup failed keeps what it had: a recheck's remembered endpoint (put
 /// in before the lookup went out), else none. `status_detail` says why.
 fn lookup_failed(pod: &mut Pod, why: &str) {
-    pod.status_detail = Some(format!("SSH endpoint lookup failed: {why}"));
+    pod.status_detail = Some(format!("{LOOKUP_FAILED}: {why}"));
+}
+
+/// Whether this listing couldn't tell `pod`'s endpoint: a running RunPod pod whose detail
+/// lookup failed ([`fill_endpoints`]) is listed without one — and without its proxy-only flag —
+/// whatever it has. No news about it, not "still none" (`pods up` doesn't restart or end its
+/// endpoint clock on it). Pure.
+pub fn endpoint_lookup_failed(pod: &Pod) -> bool {
+    pod.provider == "runpod" && pod.status_detail.as_deref().is_some_and(|d| d.starts_with(LOOKUP_FAILED))
 }
 
 /// What a failed v2 [`Provider::enrich`] reports: only the maintenance windows are missing

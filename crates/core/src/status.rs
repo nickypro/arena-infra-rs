@@ -41,6 +41,23 @@ pub fn endpoint_overdue(pod: &crate::pod::Pod, now: u64) -> bool {
         && pod.started_at.is_some_and(|t| now.saturating_sub(t) >= 600)
 }
 
+/// Whether `pod` is up — its machine or container running — with no direct SSH endpoint: what
+/// `pods up` replaces once it stays so for `--endpoint-timeout`. On RunPod only a pod reachable
+/// through RunPod's SSH proxy alone counts ([`crate::pod::Pod::proxy_only`]: a live runtime, no
+/// public IP/port): RunPod lists a pod `RUNNING` from its create, while its image is still
+/// being pulled — live 2026-10-30, a COMMUNITY 3070 was `RUNNING` with `runtime: null` on v2
+/// (`desiredStatus: RUNNING`, `publicIp: ""`, `portMappings: null` on v1) for 6½ minutes before
+/// its container started — so its `RUNNING` alone says nothing about the host. Elsewhere a
+/// running pod is a booted one (Hetzner `running`, Vast's observed `running`, Shadeform's
+/// `active`). Pure.
+pub fn up_without_endpoint(pod: &crate::pod::Pod) -> bool {
+    let reachable = pod.ssh_ip.as_deref().is_some_and(|s| !s.trim().is_empty()) && pod.ssh_port.is_some_and(|p| p != 0);
+    if reachable {
+        return false;
+    }
+    pod.proxy_only || (!pod.provider.eq_ignore_ascii_case("runpod") && pod.status.trim().eq_ignore_ascii_case("RUNNING"))
+}
+
 /// The pod-aware status shared by the list and dashboard.
 pub fn pod_status(pod: &crate::pod::Pod, reachable: Option<bool>) -> String {
     if endpoint_overdue(pod, now_secs()) { "no-ssh".into() }
@@ -196,5 +213,40 @@ mod endpoint_tests {
         p.status = "RUNNING".into(); p.ssh_ip = Some("203.0.113.1".into()); p.ssh_port = Some(22);
         assert!(!endpoint_overdue(&p, 9999));
         p.ssh_port = None; assert_eq!(pod_status(&p, None), "no-ssh");
+    }
+
+    /// `pods up`'s "up without an endpoint" (`--endpoint-timeout`): RunPod's `RUNNING` alone is
+    /// its desired status, the image maybe still pulling, so there only the proxy-only state
+    /// counts; elsewhere a running pod is a booted one. Never one with an endpoint.
+    #[test]
+    fn up_without_an_endpoint_table() {
+        let pod = |provider: &str, status: &str, endpoint: Option<(&str, u16)>, proxy_only: bool| crate::pod::Pod {
+            provider: provider.into(),
+            status: status.into(),
+            ssh_ip: endpoint.map(|(ip, _)| ip.to_string()),
+            ssh_port: endpoint.map(|(_, port)| port),
+            proxy_only,
+            ..Default::default()
+        };
+        let cases = [
+            // (case, pod, up without an endpoint)
+            ("runpod RUNNING, image pulling", pod("runpod", "RUNNING", None, false), false),
+            ("runpod proxy only", pod("runpod", "RUNNING", None, true), true),
+            ("runpod with an endpoint", pod("runpod", "RUNNING", Some(("203.0.113.1", 22)), false), false),
+            ("runpod provisioning", pod("runpod", "PROVISIONING", None, false), false),
+            ("vast running, no endpoint", pod("vast", "RUNNING", None, false), true),
+            ("vast loading", pod("vast", "LOADING", None, false), false),
+            ("vast running, reachable", pod("vast", "RUNNING", Some(("ssh4.vast.ai", 1234)), false), false),
+            ("hetzner running, no IP", pod("hetzner", "running", None, false), true),
+            ("hetzner initializing", pod("hetzner", "initializing", None, false), false),
+            ("shadeform active (RUNNING), no IP yet", pod("shadeform", "RUNNING", None, false), true),
+            ("shadeform pending", pod("shadeform", "PENDING", None, false), false),
+            ("an empty IP is none", pod("vast", "RUNNING", Some(("  ", 22)), false), true),
+            ("port 0 is none", pod("vast", "RUNNING", Some(("203.0.113.1", 0)), false), true),
+            ("stopped", pod("vast", "EXITED", None, false), false),
+        ];
+        for (case, p, want) in cases {
+            assert_eq!(up_without_endpoint(&p), want, "{case}");
+        }
     }
 }

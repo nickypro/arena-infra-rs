@@ -1038,6 +1038,9 @@ enum PodCmd {
     /// Exits non-zero unless every requested name is READY. A pod that fails is left running
     /// (Shadeform: deleted, since it can't be stopped and bills until then).
     ///
+    /// A pod up without an SSH endpoint for --endpoint-timeout, or (RunPod) with no container
+    /// at a --timeout of 10+ min, is TERMINATED and its name recreated, up to --check-attempts.
+    ///
     /// --check: a pod that FAILs the deep check on its host (driver, CUDA, GPU) is TERMINATED and
     /// its name recreated, up to --check-attempts. A software/setup failure isn't replaced.
     /// Ctrl+C: no new attempts, nothing terminated.
@@ -1109,12 +1112,12 @@ enum PodCmd {
         /// Deep-check each pod; TERMINATE and recreate any that FAIL on a bad host
         #[arg(long)]
         check: bool,
-        /// With --check: placements per name, the first create included (2 = one retry)
+        /// Placements per name, the first create included (2 = one retry)
         ///
-        /// The last attempt's failing pod is left running for a look.
-        ///
-        /// Also caps how often a pod that never came up is replaced (Shadeform: always terminated).
-        #[arg(long, default_value_t = 2, requires = "check", value_parser = clap::value_parser!(u32).range(1..=10))]
+        /// Bounds replacing a pod that FAILs --check on its host (the last one is left running
+        /// for a look), and — with or without --check — one that never came up or is up without
+        /// an SSH endpoint (such a pod is always terminated).
+        #[arg(long, default_value_t = 2, conflicts_with = "no_wait", value_parser = clap::value_parser!(u32).range(1..=10))]
         check_attempts: u32,
         /// Allow machines that earlier `up --check`s marked bad (remembered 72 h)
         #[arg(long)]
@@ -1125,6 +1128,13 @@ enum PodCmd {
         /// Seconds each pod may take to get an endpoint and answer SSH (else FAILED)
         #[arg(long, default_value_t = 600)]
         timeout: u64,
+        /// Minutes a pod may be up without an SSH endpoint before it's replaced [default: 5]
+        ///
+        /// RunPod: its container running behind RunPod's SSH proxy only (a host with no public
+        /// IP) — its image pull doesn't count. Overrides config ENDPOINT_TIMEOUT_MINS.
+        // u8: PodCmd stays under clippy's large-variant bound (minutes are 1..=120 anyway).
+        #[arg(long, value_name = "MINS", value_parser = clap::value_parser!(u8).range(1..=arena_core::pipeline::MAX_ENDPOINT_TIMEOUT_MINS as i64))]
+        endpoint_timeout: Option<u8>,
         /// Seconds between endpoint polls
         #[arg(long, default_value_t = 12)]
         interval: u64,
@@ -5727,6 +5737,28 @@ fn shadeform_rows(cfg: &Config) -> (Vec<String>, Option<arena_core::Error>) {
     (out, None)
 }
 
+/// `config check`'s `ENDPOINT_TIMEOUT_MINS` row: how long `pods up` lets a pod be up without an
+/// SSH endpoint before it replaces it, `(default)` when unset — or a ✗ row and the error the
+/// check fails on. Pure.
+fn endpoint_timeout_row(cfg: &Config) -> (String, Option<arena_core::Error>) {
+    use arena_core::pipeline::{endpoint_timeout_mins, ENDPOINT_TIMEOUT_KEY};
+    let set = cfg.get(ENDPOINT_TIMEOUT_KEY).is_some_and(|v| !v.trim().is_empty());
+    match endpoint_timeout_mins(cfg, None) {
+        Ok(m) => {
+            let (mark, default) = if set { ("✓", "") } else { ("·", " (default)") };
+            let what = "`pods up` replaces a pod up that long without an SSH endpoint (--endpoint-timeout)";
+            (format!("  {mark} {ENDPOINT_TIMEOUT_KEY:<28} {m} min{default} — {what}"), None)
+        }
+        Err(e) => {
+            let why = match &e {
+                arena_core::Error::Config(m) => m.clone(),
+                other => other.to_string(),
+            };
+            (format!("  ✗ {ENDPOINT_TIMEOUT_KEY:<28} {why}"), Some(e))
+        }
+    }
+}
+
 /// `config check`'s rows for placement near the proxy (`NEAR`, `NEAR_MAX_EXTRA_PCT`): where
 /// create/up try first and how much more they may pay for it, defaults marked — and the
 /// refusal when either can't be read (its ✗ row says why). Pure, for testing.
@@ -6025,6 +6057,11 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
     // Whatever the selected provider: `--provider runpod|vast` reads the same keys.
     let (lines, bad) = near_rows(cfg);
     lines.iter().for_each(|l| println!("{l}"));
+    if let Some(e) = bad {
+        note_invalid(&mut missing, &e);
+    }
+    let (line, bad) = endpoint_timeout_row(cfg);
+    println!("{line}");
     if let Some(e) = bad {
         note_invalid(&mut missing, &e);
     }
@@ -8127,7 +8164,7 @@ async fn handle_pods_bal(
             }
         }
 
-        PodCmd::Up { names, count, add, gpu, gpus, server_type, cloud, max_price, order, disk, volume, image, bootstrap, api_json, reap, owner, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, check, check_attempts, retry_bad_hosts, lock, timeout, interval } => {
+        PodCmd::Up { names, count, add, gpu, gpus, server_type, cloud, max_price, order, disk, volume, image, bootstrap, api_json, reap, owner, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, check, check_attempts, retry_bad_hosts, lock, timeout, endpoint_timeout, interval } => {
             // As `create`: the reap policy is resolved once, before anything is created, and
             // recorded for each pod (replacements included) the moment its create returns.
             let reaping = reap.resolve(cfg, provider.name())?;
@@ -8187,6 +8224,8 @@ async fn handle_pods_bal(
                 arena_core::setup::SetupTimeouts::from_config(cfg, None)?
             };
             let policy = if check { Some(arena_core::health::HealthPolicy::from_config(cfg)?) } else { None };
+            // --endpoint-timeout / ENDPOINT_TIMEOUT_MINS, checked before anything bills.
+            let endpoint_mins = arena_core::pipeline::endpoint_timeout_mins(cfg, endpoint_timeout.map(u64::from))?;
             let (mut spec, options) = match placing {
                 Some((req, base)) => {
                     let plan = plan_placement(cfg, provider.name(), &req, &base).await?;
@@ -8198,7 +8237,8 @@ async fn handle_pods_bal(
             pin_vm_image(provider.name(), cfg, &mut spec).await?;
             check_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]))?;
             let keys = up_keys_stage(cfg, KEYS_DIR, !no_setup);
-            let per_pod = up::pipeline_text(!no_setup, check.then_some(check_attempts), keys.is_some(), lock);
+            let per_pod =
+                up::pipeline_text(!no_setup, check.then_some(check_attempts), keys.is_some(), lock, (endpoint_mins, check_attempts));
             if dry_run {
                 match &options {
                     Some(plan) => print_placement_preview(provider, plan, &spec, &names),
@@ -8335,10 +8375,11 @@ async fn handle_pods_bal(
                 balance: Some(bal),
                 reap_notice: reaping.is_some(),
                 placements: check_attempts,
+                endpoint_timeout: Duration::from_secs(endpoint_mins * 60),
             };
             println!(
-                "\nEach pod is brought up on its own the moment it's created (endpoint wait ≤{timeout}s per pod; \
-                 Ctrl+C stops — nothing is terminated by it)…"
+                "\nEach pod is brought up on its own the moment it's created (endpoint wait ≤{timeout}s per pod, one up \
+                 without an endpoint for {endpoint_mins} min is replaced; Ctrl+C stops — nothing is terminated by it)…"
             );
             let (made_tx, made_rx) = tokio::sync::mpsc::unbounded_channel::<Made>();
             let creating = async {
@@ -22942,6 +22983,7 @@ mod placement_cli_tests {
             retry_bad_hosts: false,
             lock: false,
             timeout: 60,
+            endpoint_timeout: None,
             interval: 10,
         };
         let mut cmds = Vec::new();
@@ -23391,6 +23433,7 @@ mod placement_cli_tests {
             retry_bad_hosts: false,
             lock: false,
             timeout: 600,
+            endpoint_timeout: None,
             interval: 12,
         };
         handle_pods(up, &fake, fake_remote(), &cfg(), true).await.unwrap();
@@ -23428,6 +23471,7 @@ mod placement_cli_tests {
             retry_bad_hosts: false,
             lock: false,
             timeout: 600,
+            endpoint_timeout: None,
             interval: 12,
         };
         handle_pods(up, &fake, fake_remote(), &cfg(), true).await.unwrap();
@@ -23467,6 +23511,7 @@ mod placement_cli_tests {
             retry_bad_hosts: false,
             lock: false,
             timeout: 600,
+            endpoint_timeout: None,
             interval: 12,
         }
     }
@@ -31115,5 +31160,46 @@ mod swap_row_tests {
         let mut missing = Vec::new();
         note_invalid(&mut missing, &bad.unwrap());
         assert!(missing.iter().any(|m| m.starts_with("VM_SWAP_GB")), "{missing:?}");
+    }
+
+    /// `config check`'s `ENDPOINT_TIMEOUT_MINS` row: the default (5) marked, a set value ✓, and
+    /// a bad one a ✗ row with the error the check fails on.
+    #[test]
+    fn the_endpoint_timeout_row_says_the_minutes_or_why_not() {
+        let row = |text: &str| endpoint_timeout_row(&Config::parse(text));
+        let (line, bad) = row("");
+        assert_eq!(
+            line,
+            "  · ENDPOINT_TIMEOUT_MINS        5 min (default) — `pods up` replaces a pod up that long without an SSH endpoint \
+             (--endpoint-timeout)"
+        );
+        assert!(bad.is_none());
+        assert!(row("ENDPOINT_TIMEOUT_MINS=8\n").0.starts_with("  ✓ ENDPOINT_TIMEOUT_MINS        8 min — "));
+        let (line, bad) = row("ENDPOINT_TIMEOUT_MINS=5m\n");
+        assert_eq!(line, "  ✗ ENDPOINT_TIMEOUT_MINS        ENDPOINT_TIMEOUT_MINS must be whole minutes from 1 to 120, not \"5m\"");
+        let mut missing = Vec::new();
+        note_invalid(&mut missing, &bad.unwrap());
+        assert!(missing.iter().any(|m| m.starts_with("ENDPOINT_TIMEOUT_MINS")), "{missing:?}");
+        // And `up` refuses it before anything is created.
+        let e = arena_core::pipeline::endpoint_timeout_mins(&Config::parse("ENDPOINT_TIMEOUT_MINS=5m\n"), None).unwrap_err();
+        assert!(e.to_string().contains("whole minutes"), "{e}");
+    }
+
+    /// `pods up --endpoint-timeout MINS`: whole minutes 1..=120, refused by clap otherwise.
+    #[test]
+    fn the_endpoint_timeout_flag_parses() {
+        use clap::Parser;
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.cmd);
+        match parse(&["arena", "pods", "up", "-n", "2", "--endpoint-timeout", "8"]).unwrap() {
+            Cmd::Pods(PodCmd::Up { endpoint_timeout, .. }) => assert_eq!(endpoint_timeout, Some(8)),
+            _ => panic!(),
+        }
+        match parse(&["arena", "pods", "up", "-n", "2"]).unwrap() {
+            Cmd::Pods(PodCmd::Up { endpoint_timeout, .. }) => assert_eq!(endpoint_timeout, None),
+            _ => panic!(),
+        }
+        for bad in ["0", "121", "4.5", "-1", "five"] {
+            assert!(parse(&["arena", "pods", "up", "-n", "2", "--endpoint-timeout", bad]).is_err(), "{bad}");
+        }
     }
 }
