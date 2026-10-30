@@ -19,6 +19,30 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-30 · arena 2.3: `arena spend` — what each machine cost and who it was for
+- This is **arena 2.3** (a minor bump: a new command, `arena spend`, and `--owner`/`--keep-key`
+  on `pods create` and `pods up`).
+- `pods up/create --owner alice …` records who the new machines are for. `arena spend` shows one
+  row per owner — machines, hours, compute per currency, AI keys, total — then `(no owner)` (a
+  forgotten `--owner` shows there) and the totals; `--by machine` one row per instance, `--since
+  DATE`, `--csv`, `--json`. `arena spend assign <machine|id|key> <owner>` sets or fixes an owner.
+- Rows are machine instances, never names: a name created again for someone else is a new row,
+  and the old one keeps its owner and cost. Currencies are never added together (Hetzner's is
+  read from its pricing: the sandbox project bills USD).
+- RunPod rows are corrected from RunPod's own billing per pod (`GET /v2/billing/pods`), and the
+  report says how much of the account's billing it accounts for. Other estimates are marked `~`,
+  with which way they err.
+- An AI key's spend stays with the person it was minted for: `--owner bob` for a name whose key
+  was alice's rotates it first (`--keep-key` to skip; if the rotation fails, nothing is created),
+  and every key arena deletes has its final usage recorded with the delete.
+- `pods list`, the dashboard, `teardown --check`, `arena balance`, the snapshot cron line and
+  every create, stop, start and terminate now record what they see in a local ledger,
+  `~/.local/state/arena/<prefix>/spend.json` (0600) — quietly: nothing else they print changes.
+- Docs: "Tracking spend" in the README, and how to run a project week as a second fleet from the
+  same proxy box (docs/REFERENCE.md): its own config, prefix, workspace, proxy file and port
+  range, and cron lines written by hand — `arena cron install` for a second config would replace
+  the first fleet's lines.
+
 ## 2026-10-30 · The dashboard's bottom line is plain words
 - The footer no longer uses `☰`, `⟳`, `✓`, `⚠` or a spinner, which some terminals draw as
   pictures. It reads `[i] info · ok · API 6/min · 7s ago · every 5s` (`warn: …` in yellow, `list
