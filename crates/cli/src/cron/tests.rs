@@ -1631,6 +1631,6 @@ fn cron_flags_parse() {
     assert!(matches!(cron(&["install", "--health", "07:30"]), CronCmd::Install { health: Some(t), backup: false, .. } if t == "07:30"));
     assert!(matches!(cron(&["install"]), CronCmd::Install { health: None, .. }));
     assert!(matches!(cron(&["remove", "--snapshot", "--dry"]), CronCmd::Remove { snapshot: true, dry_run: true, .. }));
-    assert_eq!(super::CronKind::selected(true, false, true, false), [super::CronKind::Backup, super::CronKind::Snapshot]);
-    assert_eq!(super::CronKind::selected(false, false, false, true), [super::CronKind::ArchiveSnap, super::CronKind::ArchiveBig]);
+    assert_eq!(super::selected_kinds(true, false, true, false), [super::CronKind::Backup, super::CronKind::Snapshot]);
+    assert_eq!(super::selected_kinds(false, false, false, true), [super::CronKind::ArchiveSnap, super::CronKind::ArchiveBig]);
 }
