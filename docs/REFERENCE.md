@@ -1450,6 +1450,14 @@ participant's own) is left alone; `checkout.defaultRemote=origin` makes a plain 
 both repos have take origin's. arena's own fetches name origin (init-branches,
 set-branch), so an unreachable upstream never stops them.
 
+**Git identity:** every provider's setup gives the checkout the backup's identity (`Arena
+Autocommit <autocommit@arena.education>`, repo-local) for `user.name` / `user.email` when git finds
+none anywhere (repo, global, system) — before, a fresh machine had none until its first backup on a
+day branch, and a participant's first `git commit` or `git merge` stopped at "Please tell me who you
+are". A participant's own is never overridden; one they set globally later takes over at the next
+setup (ours, while unchanged, is unset again — a repo-local value would shadow theirs). The backup
+sets the same, the same way, so the two never undo each other.
+
 The repo update fetches **only the default branch, without tags** (a bare `git fetch` would pull
 every participant's autocommit branch); a tracked non-default branch pulls just its own upstream;
 the default branch is fast-forwarded only when the checkout has no tracked change and no commit of
@@ -1510,7 +1518,27 @@ checksum-verified) in the layout Remote-SSH looks for (`~/.vscode-server/code-<c
 `cli/servers/Stable-<commit>/server`, plus the legacy `bin/<commit>`), the extensions
 (`VSCODE_EXTENSIONS`, default Python + Pylance + Jupyter; shared by every server version, so they
 help even when a client is another release), and the conda env as `python.defaultInterpreterPath` in
-the machine settings (added only if unset; other keys kept). Skips whatever is already there; its
+the machine settings (added only if unset; other keys kept).
+
+On a machine short of RAM it also adds **memory-saving settings** there (a cx33's 8 GB ran out with
+Pylance and the kernels): `python.analysis.indexing: false`, `python.analysis.diagnosticMode:
+"openFilesOnly"`, `python.analysis.exclude` (the venv, `.git`, caches, `__pycache__`, `data`,
+`infrastructure`, `node_modules`, dot-dirs), and `files.watcherExclude` / `search.exclude` for the
+venv, caches, `__pycache__`, `data` and `infrastructure` (`files.exclude`: `__pycache__` only, so
+the Explorer still shows the rest; `.git` stays watched for the Source Control view). Which machines:
+**every Hetzner VM** (a CPU box: the kernels' models share its RAM with VS Code; images built with
+`arena image build` carry them), and on other providers only one with **under 20 GiB of RAM** (a
+container's own memory limit counting) — a GPU pod with plenty keeps Pylance's indexing
+(auto-imports, workspace symbols). Each key is added only where absent; to an exclude map already
+there only the patterns it doesn't name (one set to `false` stays `false`). The file is edited as
+JSONC, the way VS Code writes it: comments, trailing commas and every byte already there stay, the
+edit is read back before it's written, and a file it can't parse the way VS Code does is left alone
+with a warning. It's swapped into place in one step (`renameat2`) and the file it replaces is kept
+beside it (`settings.json.arena-<random>`), so a save VS Code makes meanwhile is never lost: that
+one stays in place (or, saved twice, in the kept file), with a warning; where no such swap can be
+done, nothing is written. A window already open picks the change up after **Developer: Reload Window**.
+
+Skips whatever is already there; its
 own 300s budget; **best-effort** — a failure or timeout prints a warning (`✓ name (warning: vscode
 warm-up: …)`) and the pod still counts as set up. `--no-vscode` skips it for a run,
 `VSCODE_PREINSTALL=0` everywhere. (`~/.vscode-server` is a dot-dir, so `pods pull` and replace's

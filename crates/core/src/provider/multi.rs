@@ -9,8 +9,8 @@
 //!   pods" — the proxy merge, which only drops a forward on a *successful* listing.
 //! - `create_pod` goes to the chosen primary (the `--provider` / `ARENA_PROVIDER`).
 //! - `stop` (and its outcome)/`restart`/`terminate`/`set_locked` route to whichever backend actually owns the
-//!   pod id, and so do `restart_wipes_container_disk`, `restart_resets_container` and
-//!   `lock_support` (by the pod's provider tag, then the id cache).
+//!   pod id, and so do `restart_wipes_container_disk`, `restart_resets_container`,
+//!   `lock_support` and `rename_support` (by the pod's provider tag, then the id cache).
 //! - `check_create_extra`/`preview_create_body` are the primary's, like `create_pod`.
 //! - `enrich` hands each pod to the backend that listed it; a failing backend is reported
 //!   (as one error naming it) without costing the other backends' pods their details.
@@ -225,6 +225,12 @@ impl Provider for MultiProvider {
     }
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
         self.backend_for(id).await?.rename_pod(id, new_name).await
+    }
+    fn rename_support(&self, pod: &Pod) -> Result<()> {
+        match self.owner_of(pod) {
+            Some(i) => self.backends[i].rename_support(pod),
+            None => Err(Error::NotImplemented(format!("no configured provider owns pod `{}` — can't rename it", pod.name))),
+        }
     }
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
         self.backend_for(id).await?.reimage_pod(id, image, env).await
@@ -642,6 +648,12 @@ mod tests {
         m.set_locked("r1", false).await.unwrap();
         assert!(m.set_locked("v1", true).await.is_err(), "vast can't lock");
         assert_eq!(*seen.lock().unwrap(), [("r1".to_string(), true), ("r1".to_string(), false)]);
+        // Rename questions go the same way: the owner's answer (a backend without a rename
+        // says so in `rename_pod`'s own words), and a pod nobody owns is refused.
+        let e = m.rename_support(&tagged_pod("v1", "vast")).unwrap_err().to_string();
+        assert_eq!(e, "not implemented: rename not supported on provider `vast`");
+        assert_eq!(m.rename_pod("v1", "arena8-apple").await.unwrap_err().to_string(), e);
+        assert!(m.rename_support(&tagged_pod("x1", "lambda")).unwrap_err().to_string().contains("no configured provider owns"));
         // The primary (vast, the default impl) refuses an extra; it's the primary's call.
         let extra: Extra = serde_json::from_str(r#"{"price": 0.1}"#).unwrap();
         assert!(m.check_create_extra(&extra).unwrap_err().to_string().contains("isn't supported on provider `vast`"));

@@ -20,7 +20,8 @@ impl Drop for Tmp {
 /// (and, with `$UV_STRAY` set, one at that path too: a uv that ignores `TMPDIR`), exits
 /// `$UV_INSTALL_EXIT` (default 0) and, when `$UV_INSTALL_MAKES_TORCH` is set, "installs" torch;
 /// its `--help` lists `--torch-backend` unless `$UV_OLD` is set (an older uv). `git` logs its argv
-/// to `$STUBS/git.log`; every clone "fails" (nothing is fetched), `remote get-url origin`
+/// to `$STUBS/git.log`; a `config` is the real git's when `$REAL_GIT` names it (else a
+/// `user.*` one reads as set, so no identity is given); every clone "fails" (nothing is fetched), `remote get-url origin`
 /// answers `$GIT_ORIGIN` (none when unset) and `remote set-url` works; `remote get-url upstream`
 /// answers `$GIT_UPSTREAM` (none when unset) and `remote add upstream` works unless
 /// `$GIT_ADD_FAILS` is set.
@@ -50,6 +51,9 @@ fn install_stubs(dir: &Path) {
         r#"S="$(dirname "$0")"
 echo "git $*" >> "$S/git.log"
 case "$*" in
+  *" config "*)
+    [ -n "${REAL_GIT:-}" ] && exec "$REAL_GIT" "$@"
+    case "$*" in *" config user."*) exit 0;; esac;;
   *"remote get-url origin") [ -n "${GIT_ORIGIN:-}" ] && { echo "$GIT_ORIGIN"; exit 0; }; exit 2;;
   *"remote set-url origin "*) exit 0;;
   *"remote get-url upstream") [ -n "${GIT_UPSTREAM:-}" ] && { echo "$GIT_UPSTREAM"; exit 0; }; exit 2;;
@@ -634,6 +638,109 @@ fn the_public_course_repo_becomes_upstream_when_the_checkout_has_none() {
     assert!(r.ok, "{}", r.stderr);
     // On the pod's line: setup shows its `arena-warning:` lines (review fb2 R4).
     assert!(r.stdout.lines().any(|l| l == format!("arena-warning: couldn't add the upstream remote {up}")), "{}", r.stdout);
+}
+
+/// Live 7/9: a fresh VM had no git identity until its first backup on a day branch set one, so a
+/// participant's first commit or merge stopped at "Please tell me who you are". Setup gives the
+/// checkout the backup's, repo-local, where git finds none; never over a participant's own
+/// (repo-local, global or system), and hands back to one they set globally later. Real git
+/// (`REAL_GIT`), a real checkout; the global and system config in the test's own dir.
+#[test]
+fn the_checkout_gets_a_git_identity_only_where_there_is_none() {
+    use arena_core::setup::{GIT_IDENTITY_EMAIL, GIT_IDENTITY_NAME};
+    let found = Command::new("sh").args(["-c", "command -v git"]).output().unwrap();
+    let real_git = String::from_utf8_lossy(&found.stdout).trim().to_string();
+    if !found.status.success() || real_git.is_empty() {
+        eprintln!("git not installed — skipping");
+        return;
+    }
+    let (_t, stubs, home, repo) = setup("identity");
+    let system = home.parent().unwrap().join("gitconfig-system");
+    std::fs::write(&system, "").unwrap();
+    let git = |args: &[&str]| -> (bool, String) {
+        let out = Command::new(&real_git)
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("GIT_CONFIG_SYSTEM", &system)
+            .output()
+            .unwrap();
+        (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout).trim(), String::from_utf8_lossy(&out.stderr).trim()))
+    };
+    assert!(git(&["init", "-q", "-b", "main"]).0);
+    let url = "git@github.com:o/r.git";
+    let env = [
+        ("REPO_URL", url),
+        ("GIT_ORIGIN", url),
+        ("UV_INSTALL_MAKES_TORCH", "1"),
+        ("REAL_GIT", real_git.as_str()),
+        ("GIT_CONFIG_SYSTEM", system.to_str().unwrap()),
+    ];
+    let setup_run = || {
+        let r = run(&stubs, &home, &repo, &env);
+        assert!(r.ok, "{}", r.stderr);
+        assert!(!r.stdout.contains("git user."), "{}", r.stdout);
+    };
+    let local = |key: &str| git(&["config", "--local", key]).1;
+    let commit = |msg: &str| {
+        let (ok, out) = git(&["commit", "-q", "--allow-empty", "-m", msg]);
+        assert!(ok, "the participant's commit failed: {out}");
+        git(&["log", "-1", "--format=%an <%ae>"]).1
+    };
+    let ours = format!("{GIT_IDENTITY_NAME} <{GIT_IDENTITY_EMAIL}>");
+
+    // A fresh VM, none anywhere: the backup's, repo-local; the participant's first commit works.
+    let (ok, why) = git(&["commit", "-q", "--allow-empty", "-m", "before"]);
+    assert!(!ok && why.contains("Please tell me who you are"), "{why}");
+    setup_run();
+    assert_eq!((local("user.name"), local("user.email")), (GIT_IDENTITY_NAME.to_string(), GIT_IDENTITY_EMAIL.to_string()));
+    assert_eq!(commit("first"), ours);
+    // Again: nothing changes.
+    let config = std::fs::read_to_string(repo.join(".git/config")).unwrap();
+    setup_run();
+    assert_eq!(std::fs::read_to_string(repo.join(".git/config")).unwrap(), config);
+
+    // The participant sets theirs globally since: ours would shadow it (repo-local wins), so the
+    // next setup unsets it, and their commits are theirs. Then it stays that way.
+    std::fs::write(home.join(".gitconfig"), "[user]\n\tname = Ada\n\temail = ada@example.com\n").unwrap();
+    assert_eq!(commit("shadowed"), ours);
+    setup_run();
+    assert_eq!((local("user.name"), local("user.email")), (String::new(), String::new()));
+    assert_eq!(commit("second"), "Ada <ada@example.com>");
+    setup_run();
+    assert_eq!(local("user.name"), "");
+
+    // Their own repo-local one stays, with or without a global one.
+    std::fs::remove_file(home.join(".gitconfig")).unwrap();
+    assert!(git(&["config", "--local", "user.name", "Bea"]).0 && git(&["config", "--local", "user.email", "bea@example.com"]).0);
+    setup_run();
+    assert_eq!(commit("third"), "Bea <bea@example.com>");
+
+    // Only a global name: only the email is given (as the backup would).
+    assert!(git(&["config", "--local", "--unset", "user.name"]).0 && git(&["config", "--local", "--unset", "user.email"]).0);
+    std::fs::write(home.join(".gitconfig"), "[user]\n\tname = Cy\n").unwrap();
+    setup_run();
+    assert_eq!((local("user.name"), local("user.email")), (String::new(), GIT_IDENTITY_EMAIL.to_string()));
+    assert_eq!(commit("fourth"), format!("Cy <{GIT_IDENTITY_EMAIL}>"));
+
+    // A system-wide one (an image's) counts as configured too.
+    assert!(git(&["config", "--local", "--unset", "user.email"]).0);
+    std::fs::remove_file(home.join(".gitconfig")).unwrap();
+    std::fs::write(&system, "[user]\n\tname = Img\n\temail = img@example.com\n").unwrap();
+    setup_run();
+    assert_eq!((local("user.name"), local("user.email")), (String::new(), String::new()));
+    assert_eq!(commit("fifth"), "Img <img@example.com>");
+}
+
+/// Every provider's setup gives the same identity the same way: the script carries core's
+/// function word for word, and runs it on the checkout.
+#[test]
+fn the_script_gives_the_identity_every_setup_gives() {
+    assert!(crate::HETZNER_SETUP.contains(arena_core::setup::GIT_IDENTITY_SH));
+    assert!(crate::HETZNER_SETUP.contains("\narena_git_identity \"$REPO_DIR\"\n"));
 }
 
 /// What the bake leaves on an arena image (`arena_core::image::scrub_script`): its name, when it

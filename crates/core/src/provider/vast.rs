@@ -865,6 +865,23 @@ fn attach_body(key: &str) -> Value {
     json!({ "ssh_key": key })
 }
 
+/// Judge a label update's answer. Pure. An error status reads as everywhere ([`status_error`]).
+/// A 2xx is success unless Vast's body says otherwise (`{"success": false, "msg": …}`, how its
+/// API answers a refusal) — then the label didn't change, and reporting success would move
+/// `~/.name`, the keys and the proxy around a pod listed under its old name. A 2xx body that
+/// isn't JSON, or has no `success`, is still success: the status is the contract.
+fn judge_label(status: StatusCode, text: &str) -> Result<()> {
+    if !status.is_success() {
+        return Err(status_error(status, text, "vast rename"));
+    }
+    let body = serde_json::from_str::<Value>(text).ok();
+    if body.as_ref().and_then(|b| b.get("success")).and_then(Value::as_bool) == Some(false) {
+        let why = body.as_ref().and_then(|b| b.get("msg").or_else(|| b.get("error"))).and_then(Value::as_str).map_or_else(|| excerpt(text), String::from);
+        return Err(Error::provider(format!("vast rename: HTTP {status}, but the label wasn't changed: {why}")));
+    }
+    Ok(())
+}
+
 /// A short, bounded rendering of a response body for an error message (JSON compacted).
 fn excerpt(text: &str) -> String {
     match serde_json::from_str::<Value>(text) {
@@ -1254,6 +1271,25 @@ impl Provider for VastProvider {
 
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         send_ok(self.auth(self.client.delete(format!("{}/instances/{}/", self.base, id))), "vast terminate").await
+    }
+
+    /// `PUT /instances/{id}/` with the `label` alone — the vast CLI's `label instance`. The
+    /// label IS the machine name here (set at rent, listed as the pod's name); nothing else on
+    /// the instance changes, so neither does the `MACHINE_NAME` in its env (fixed at rent).
+    async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::Config(format!("vast rename: `{id}` isn't an instance id")));
+        }
+        if new_name.trim().is_empty() {
+            return Err(Error::Config("vast rename: the new name is empty".into()));
+        }
+        let rb = self.auth(self.client.put(format!("{}/instances/{id}/", self.base)).json(&json!({ "label": new_name })));
+        let (status, text) = crate::http::send_text(rb).await?;
+        judge_label(status, &text)
+    }
+
+    fn rename_support(&self, _pod: &Pod) -> Result<()> {
+        Ok(())
     }
 
     /// The per-instance attach, as at create (idempotent): the repair path for a pod that
@@ -2115,6 +2151,34 @@ mod tests {
         assert_eq!((body(&srv, 0), body(&srv, 1)), (json!({"ssh_key": KEY_A}), json!({"ssh_key": KEY_B})));
         let e = p.authorize_ssh_keys(&Pod::default(), &[KEY_A.into()]).await.unwrap_err();
         assert!(e.to_string().contains("no instance id"), "{e}");
+    }
+
+    /// `pods rename` on Vast: the label is the machine name, so a rename is a `PUT` of the
+    /// label alone (the vast CLI's `label instance`) — success only when Vast doesn't say
+    /// otherwise; a bad id or no name never reaches it.
+    #[tokio::test]
+    async fn a_rename_sets_the_label_alone() {
+        let srv = serve(vec![
+            canned(200, "application/json", r#"{"success": true}"#),
+            canned(200, "application/json", r#"{"success": false, "msg": "instance not found"}"#),
+            canned(400, "application/json", r#"{"success": false, "error": "invalid_args", "msg": "label too long"}"#),
+            canned(200, "text/plain", ""),
+        ]);
+        let p = provider(&srv.base);
+        assert!(p.rename_support(&Pod { provider: "vast".into(), ..Default::default() }).is_ok());
+        p.rename_pod("26001001", "devtest-bravo").await.unwrap();
+        assert_eq!(body(&srv, 0), json!({"label": "devtest-bravo"}));
+        let e = p.rename_pod("26001001", "devtest-bravo").await.unwrap_err().to_string();
+        assert!(e.contains("label wasn't changed: instance not found"), "{e}");
+        let e = p.rename_pod("26001001", "devtest-bravo").await.unwrap_err();
+        assert!(e.to_string().contains("vast rename HTTP 400") && e.to_string().contains("label too long"), "{e}");
+        assert!(!crate::retry::is_retryable(&e), "{e}");
+        p.rename_pod("26001001", "devtest-bravo").await.unwrap();
+        assert_eq!(*srv.requests.lock().unwrap(), ["PUT /instances/26001001/ HTTP/1.1"; 4]);
+        for (id, name) in [("", "devtest-bravo"), ("../x", "devtest-bravo"), ("1", "")] {
+            assert!(matches!(p.rename_pod(id, name).await, Err(Error::Config(_))), "{id:?} {name:?}");
+        }
+        assert_eq!(srv.requests.lock().unwrap().len(), 4, "nothing sent for those");
     }
 
     #[test]

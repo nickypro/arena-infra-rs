@@ -81,6 +81,44 @@ earlier).
 - replace/migrate's local staging now keeps `CONTROL_MIN_FREE_GB` free (before: a tenth of the
   disk, at least 5 GB).
 
+## 2026-10-30 · VS Code's memory-saving settings on small machines, and a git identity from setup
+- Setup writes VS Code's memory-saving machine settings (`~/.vscode-server/data/Machine/settings.json`)
+  on every Hetzner VM, and on any other machine with under 20 GiB of RAM: Pylance's indexing off,
+  diagnostics for open files only, and the venv, caches, `__pycache__`, `data` and `infrastructure`
+  kept out of Pylance's analysis, the file watcher and search. A cx33 (8 GB) ran out of memory with
+  Pylance and the kernels; these are the settings operators added by hand. GPU pods with more RAM
+  keep Pylance's defaults.
+- Only what isn't set is added (to an exclude list already there, only the patterns it lacks), so
+  a participant's or an operator's own values stay. The file is edited as the JSONC VS Code writes:
+  comments and trailing commas stay; one it can't read the way VS Code does is left alone, with a
+  warning on the pod's line. When setup changes the file, the old one is kept beside it
+  (`settings.json.arena-<random>`), and a save VS Code makes at that moment is never lost.
+- Setup gives the course checkout a git identity (the backup's, `Arena Autocommit`) when none is
+  configured, on every provider: a participant's first `git commit` or `git merge` on a fresh
+  machine no longer stops at "Please tell me who you are". A participant's own is never overridden,
+  and one they set globally later takes over at the next setup.
+
+### Action needed
+- Existing machines get both from a setup re-run, e.g. every Hetzner VM:
+  `arena pods setup --all --on hetzner` (`--dry-run` first). The settings.json made by hand on a
+  VM is kept; setup adds only what it lacks. A participant's open VS Code window picks the change
+  up after **Developer: Reload Window**. Images need no rebuild: a VM from one gets them at its
+  first setup.
+
+## 2026-10-30 · `pods rename` works on Hetzner and Vast
+- Fix: `pods rename` on a Hetzner VM failed with "rename not supported on provider `hetzner`".
+  It renames the server in place now (no restart, its labels untouched), rewrites `~/.name` as
+  before, and also sets the VM's hostname to the new name (what `hostname`, bash's prompt and
+  VS Code show). The hostname stays after a reboot. A name Hetzner refuses (one another server
+  in the project has, or one that isn't a valid hostname) is explained.
+- Vast pods can be renamed too: their label is the name.
+- The note that the MACHINE_NAME env var keeps the old name is printed only for pods that have
+  that variable (RunPod and Vast), not for Hetzner or Shadeform VMs.
+- `pods setup` on a Hetzner VM sets its hostname to the machine name when it isn't already. This
+  fixes a VM that a rename couldn't reach (the rename says to run it).
+- A pod whose provider can't rename it is refused before anything is asked, and the dashboard
+  refuses it when you pick rename (instead of running the command and failing).
+
 ## 2026-10-29 · An admin key only the proxy holds, which reaches every machine
 - `ADMIN_SSH_KEY_PATH` (optional) is now a key of its own role: its private half stays on the
   proxy / control box, and every machine — cohort pods and `@` staff boxes, on every provider —
