@@ -27,6 +27,7 @@ earlier).
   options (others first), up to `--check-attempts` placements (default 2; the flag now works
   without `--check` too). The last one is terminated too; the name then FAILs saying nothing of it
   is left billing. Nothing is terminated on an old look: its provider is asked once more first.
+  It always gets the whole `--endpoint-timeout` first, past `--timeout` if need be.
 - When: a pod up without an endpoint for `--endpoint-timeout` minutes (new, default 5) — on RunPod,
   its container running behind RunPod's SSH proxy only (a host with no public IP; before, only
   `--check` replaced these). RunPod's image pull doesn't count: it lists a pod RUNNING from the

@@ -1169,9 +1169,13 @@ options, the ones that haven't failed first; the last one is terminated too, and
   6½ minutes with no container — `publicIp: ""`, `portMappings: null` on v1 — then proxy-only), so
   the clock doesn't start at the create: a slow pull is no host failure. Elsewhere "up" is a pod
   listed running without an IP/port (Hetzner `running`, Vast `running`, Shadeform `active`).
+- It always gets a whole `--endpoint-timeout` without an endpoint before it's judged — past
+  `--timeout` if its container came up late (a slow pull onto a host with no public IP is still
+  replaced, not left running at `--timeout`).
 - Nothing is terminated on an old look: before replacing, `up` asks the pod's own backend again.
   An endpoint after all goes on with the pipeline; a pod that isn't up any more (restarting), or
-  can't be read just then, is waited for again, its clock started over, to the same `--timeout`.
+  can't be read just then, is waited for again, its clock started over by the listings after
+  that look, to the same `--timeout`.
 - A pod still coming up when `--timeout` ends (RunPod: no container yet; Vast `loading`, Hetzner
   `initializing`) is left running as before — RunPod can't tell a stuck pull from a slow one —
   and the reason says so: `no SSH endpoint after 600s, still listed RUNNING (no container yet —

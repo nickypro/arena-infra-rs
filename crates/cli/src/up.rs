@@ -83,8 +83,8 @@ enum EndpointWait {
     /// Listed with an endpoint.
     Ready(Pod),
     /// Up without a usable endpoint ([`status::up_without_endpoint`] — on RunPod, its container
-    /// running behind RunPod's SSH proxy only) for `--endpoint-timeout`, or for `up_for` when the
-    /// endpoint deadline came first: a host failure once a fresh look confirms it
+    /// running behind RunPod's SSH proxy only) for `--endpoint-timeout` (past the endpoint
+    /// deadline if need be: a whole one, always): a host failure once a fresh look confirms it
     /// (`Shared::no_endpoint`; the pod as last listed so) — by the latest listing that showed it
     /// so, or an older one (the latest lacked it, or couldn't look its endpoint up).
     NoEndpoint { pod: Pod, up_for: Duration },
@@ -594,9 +594,11 @@ impl Shared<'_, '_> {
         let fail_on_expiry = ready.is_some() || self.run.provider.stop_support(&pod).is_err();
         // A pod judged to have no endpoint is looked at once more first (`no_endpoint`); one that
         // turns out not to be up after all (restarting) or can't be read is waited for again,
-        // its clock started over, to the same deadline.
+        // its clock started over by the listings after that look, to the same deadline.
+        // What a fresh look saw of a pod it didn't condemn, for the wait it resumes.
+        let mut seen: Option<Pod> = None;
         let pod = loop {
-            match self.or_stop(self.wait_endpoint(&pod.id, deadline, fail_on_expiry)).await {
+            match self.or_stop(self.wait_endpoint(&pod.id, deadline, fail_on_expiry, seen.take())).await {
                 None => return self.end(run, Verdict::Stopped { stage: Stage::Endpoint }),
                 Some(EndpointWait::Failed { pod, why }) => return self.dead(run, &pod, option, failed_options, why).await,
                 Some(EndpointWait::TimedOut { .. }) if fail_on_expiry => {
@@ -635,9 +637,9 @@ impl Shared<'_, '_> {
                 Some(EndpointWait::NoEndpoint { pod: bare, up_for }) => {
                     match self.no_endpoint(run, bare, up_for, deadline, option, failed_options).await {
                         // It has its endpoint after all (a fresh look found it): on with the pipeline.
-                        Ok(Some(found)) => break found,
-                        // Not up after all, or not readable: wait on.
-                        Ok(None) => continue,
+                        Ok(Look::Found(found)) => break found,
+                        // Not up after all, or not readable: wait on, from what that look saw.
+                        Ok(Look::WaitOn(was)) => seen = Some(was),
                         Err(next) => return next,
                     }
                 }
@@ -934,12 +936,12 @@ impl Shared<'_, '_> {
     /// even with none left: kept, it would only bill.
     ///
     /// Only on a fresh look ([`now_listed`]): the wait's verdict may rest on an older listing.
-    /// Gone meanwhile (terminated elsewhere) is only said. `Ok(Some)`: it has an endpoint after
-    /// all — on with the pipeline. `Ok(None)`: it isn't up any more (a restart: RunPod lists
-    /// RUNNING with no container while it pulls its image again), or it can't be read just now —
-    /// wait on, its clock started over, to the same `deadline`; past it, such a pod is left
-    /// running and said to bill. Nothing is terminated on anything but a look that shows it up
-    /// without an endpoint.
+    /// Gone meanwhile (terminated elsewhere) is only said. [`Look::Found`]: it has an endpoint
+    /// after all — on with the pipeline. [`Look::WaitOn`]: it isn't up any more (a restart:
+    /// RunPod lists RUNNING with no container while it pulls its image again), or it can't be
+    /// read just now — wait on, its clock started over by the listings after this look, to the
+    /// same `deadline`; past it, such a pod is left running and said to bill. Nothing is
+    /// terminated on anything but a look that shows it up without an endpoint.
     async fn no_endpoint(
         &self,
         run: &mut NameRun,
@@ -948,7 +950,7 @@ impl Shared<'_, '_> {
         deadline: Instant,
         option: usize,
         failed_options: &mut Vec<usize>,
-    ) -> std::result::Result<Option<Pod>, Option<(Pod, usize)>> {
+    ) -> std::result::Result<Look, Option<(Pod, usize)>> {
         let name = run.name.clone();
         let (what, why) = if pod.proxy_only {
             (
@@ -980,12 +982,12 @@ impl Shared<'_, '_> {
             }
             Now::Reachable(p) => {
                 (self.say)(To::Out, &format!("[{name}] {why} — but it has an endpoint now; going on"));
-                return Ok(Some(p));
+                return Ok(Look::Found(p));
             }
             Now::NotUp(p) if in_time => {
                 let now = p.status.trim();
                 (self.say)(To::Err, &format!("[{name}] {why} — but it's listed {now}, not up, now (restarting?): waiting on"));
-                return Ok(None);
+                return Ok(Look::WaitOn(p));
             }
             Now::NotUp(p) => {
                 let reason = format!("{why}; now not up{}", left_running(&name, Some(&p)));
@@ -997,7 +999,7 @@ impl Shared<'_, '_> {
                     To::Err,
                     &format!("[{name}] {why} — but it can't be looked at again just now ({e}): waiting on, nothing terminated"),
                 );
-                return Ok(None);
+                return Ok(Look::WaitOn(pod));
             }
             Now::Unknown(e) => {
                 let reason = format!(
@@ -1266,9 +1268,10 @@ impl Shared<'_, '_> {
 
     /// The pod `id` once the listing shows it with an SSH endpoint — or, once it has been up
     /// without one ([`status::up_without_endpoint`]: on RunPod, behind RunPod's SSH proxy only)
-    /// for `--endpoint-timeout`, that; or the deadline: still that if it was up without one when
-    /// the deadline came, else [`EndpointWait::TimedOut`] (still coming up — RunPod lists a pod
-    /// RUNNING from its create, while its image is pulled).
+    /// for `--endpoint-timeout` — a whole one, past the deadline if need be — that; or at the
+    /// deadline [`EndpointWait::TimedOut`] (still coming up — RunPod lists a pod RUNNING from its
+    /// create, while its image is pulled). `seen`: a fresh look's view of it, for a wait resumed
+    /// after one (the listings before it no longer count).
     ///
     /// The clock starts over only when a listing shows the pod not up (provisioning, loading,
     /// restarting; on RunPod, RUNNING with no container — a restart pulling its image again). A
@@ -1282,21 +1285,26 @@ impl Shared<'_, '_> {
     /// `dead_on_error`: a pod listed `ERROR` meanwhile is [`EndpointWait::Failed`] (a backend
     /// with a ready deadline — Shadeform; elsewhere ERROR isn't known to be final, and the wait
     /// runs on as before).
-    async fn wait_endpoint(&self, id: &str, deadline: Instant, dead_on_error: bool) -> EndpointWait {
+    async fn wait_endpoint(&self, id: &str, deadline: Instant, dead_on_error: bool, seen: Option<Pod>) -> EndpointWait {
         let _waiting = Waiting::new(&self.waiters);
         self.waiter_added.notify_one();
         let mut rx = self.listing.subscribe();
         let grace = self.run.endpoint_timeout;
         // When it was first seen up without an endpoint (this stretch), and as last seen so.
         let mut bare: Option<(Instant, Pod)> = None;
+        // A wait resumed after a fresh look starts from what that look saw, and from the
+        // listings after it only — the latest one may be older than the look (review r3: a
+        // restart the look saw was read over by the proxy-only listing before it).
+        let mut skip_current = seen.is_some();
         // As the latest listing that said anything about it had it (for `--timeout`'s verdict).
-        let mut last: Option<Pod> = None;
+        let mut last: Option<Pod> = seen;
         let at_deadline = |bare: Option<(Instant, Pod)>, last: Option<Pod>| match bare {
             Some((since, pod)) => EndpointWait::NoEndpoint { pod, up_for: since.elapsed() },
             None => EndpointWait::TimedOut { last },
         };
         loop {
             let listed = rx.borrow_and_update().iter().find(|p| p.id == id).cloned();
+            let listed = if std::mem::take(&mut skip_current) { None } else { listed };
             match listed {
                 Some(p) if dead_on_error && p.status.trim().eq_ignore_ascii_case("ERROR") => {
                     let why = format!("error: {}", p.status_detail.as_deref().unwrap_or("listed ERROR, no details given"));
@@ -1320,17 +1328,23 @@ impl Shared<'_, '_> {
                 // Not in this listing: no news — the clock runs on.
                 None => {}
             }
-            // Wake for the next listing, the deadline, or the end of a clock still running (one
-            // already over waits for a listing that shows the pod — or the deadline).
-            let grace_end = bare.as_ref().map(|(t, _)| *t + grace).filter(|end| *end > Instant::now());
-            let wake = grace_end.map_or(deadline, |end| deadline.min(end));
-            // A listing first: at the deadline, one that arrived with it is looked at before
-            // the verdict (it may hold the endpoint).
+            // When the wait ends: the deadline — or, for a pod up without an endpoint, the end of
+            // its clock when that's later: it is judged only after a whole `--endpoint-timeout`
+            // of it (review r3), and one whose container came up late (a slow pull, then behind
+            // the proxy only — live 2026-10-30, 6m39s) is replaced, not left running at the
+            // deadline. Wake for the next listing, that end, or the end of a clock still running
+            // (one already over waits for a listing that shows the pod — or the end).
+            let now = Instant::now();
+            let grace_end = bare.as_ref().map(|(t, _)| *t + grace);
+            let end = grace_end.map_or(deadline, |g| deadline.max(g));
+            let wake = grace_end.filter(|g| *g > now).map_or(end, |g| g.min(end));
+            // A listing first: at the end, one that arrived with it is looked at before the
+            // verdict (it may hold the endpoint).
             tokio::select! {
                 biased;
                 changed = rx.changed() => if changed.is_err() { return at_deadline(bare, last) },
                 () = tokio::time::sleep_until(wake) => {
-                    if Instant::now() >= deadline {
+                    if Instant::now() >= end {
                         return at_deadline(bare, last);
                     }
                 }
@@ -1682,6 +1696,14 @@ fn one_line(s: &str) -> String {
 /// in a listing RunPod isn't in" must never read as gone. Pure.
 fn gone_from_owner(listings: &[(String, arena_core::Result<Vec<Pod>>)], pod: &Pod) -> bool {
     now_listed(listings, pod) == Now::Gone
+}
+
+/// What `Shared::no_endpoint` makes of a pod it didn't condemn or give up on.
+enum Look {
+    /// It has an endpoint after all: the pipeline goes on with it.
+    Found(Pod),
+    /// Wait on (its clock started over), the pod as this look saw it — or, unread, as last seen.
+    WaitOn(Pod),
 }
 
 /// What a fresh look at a pod up found ([`now_listed`]).
@@ -3312,44 +3334,52 @@ mod tests {
         assert!(fleet.listed().iter().any(|p| p.id == theirs[0].pod.id && p.proxy_only), "still there, untouched");
     }
 
-    /// Review (codex r1, high): nothing is terminated on an old look. A pod behind the proxy only
-    /// whose listings then go missing (RunPod's list failing) — meanwhile getting its endpoint —
-    /// reaches `--timeout` known only as proxy-only: its own backend is asked once more, and it
-    /// has an endpoint, so the pipeline goes on (READY, nothing terminated). One that still
-    /// can't be read then is left running, not replaced, and said so.
+    /// Review (codex r1, high): nothing is terminated on an old look. The clock ends between two
+    /// listings (every 7 s: 301, 308; the clock from 7 s ends at 307): its own backend is asked
+    /// once more, and a pod that has got its endpoint since (at 305) goes on with the pipeline —
+    /// READY, nothing terminated. And one whose listings go missing (RunPod's list failing) is
+    /// judged only on a look that can be read: none can, so after its grace it is left running,
+    /// said to bill, not replaced.
     #[tokio::test(start_paused = true)]
     async fn a_pod_is_judged_on_a_fresh_look_never_on_an_old_one() {
         let cfg = cfg(None);
-        for (down_for, ready) in [(94, true), (100_000, false)] {
-            let fleet = Fleet::new(&[("apple", &[("proxy", 0, 5)])]);
-            fleet.later.lock().unwrap().insert("devtest-apple".into(), vec![("10.0.0.1".into(), 22001, Duration::from_secs(150))]);
-            let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, false, None, None).await;
-            run.timeout = Duration::from_secs(195);
-            let made = make(&fleet, &["apple"]).await;
-            let lines = Lines::new();
-            let outage = async {
-                tokio::time::sleep(Duration::from_secs(100)).await;
-                *fleet.down_until.lock().unwrap() = Some(Instant::now() + Duration::from_secs(down_for));
-            };
-            let say = |to, l: &str| lines.say(to, l);
-            let (rows, ()) = tokio::join!(run_up(&run, made, std::future::pending(), &say), outage);
-            assert!(!fleet.events().iter().any(|e| e.starts_with("terminate")), "{ready}: {:?}", fleet.events());
-            if ready {
-                assert_eq!(rows[0].verdict, Verdict::Ready, "{:#?}", lines.all());
-                lines.find("[devtest-apple] no public endpoint (RunPod ssh proxy only) for 3m05s (its host has no public IP — no scp/rsync/port-forwards) — but it has an endpoint now; going on");
-            } else {
-                match &rows[0].verdict {
-                    Verdict::Failed { stage: Stage::Endpoint, reason } => assert!(
-                        reason.starts_with("no public endpoint (RunPod ssh proxy only) for 3m05s (its host has no public IP — no scp/rsync/port-forwards) as last seen — its state couldn't be read just now (")
-                            && reason.ends_with(
-                                "so it isn't replaced, still listed RUNNING — left running, still billing ($0.17/h): `arena proxy \
-                                 apply` once it has an endpoint, or `arena pods terminate devtest-apple`"
-                            ),
-                        "{reason}"
-                    ),
-                    other => panic!("{other:?}"),
-                }
-            }
+        let fleet = Fleet::new(&[("apple", &[("proxy", 0, 5)])]);
+        fleet.later.lock().unwrap().insert("devtest-apple".into(), vec![("10.0.0.1".into(), 22001, Duration::from_secs(305))]);
+        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, false, None, None).await;
+        run.interval = Duration::from_secs(7);
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(rows[0].verdict, Verdict::Ready, "{:#?}", lines.all());
+        assert_eq!(fleet.events().len(), 1, "nothing terminated");
+        let (_, at) = lines.find(
+            "[devtest-apple] no public endpoint (RunPod ssh proxy only) for 5m00s (its host has no public IP — no \
+             scp/rsync/port-forwards) — but it has an endpoint now; going on",
+        );
+        assert_eq!(at, Duration::from_secs(307));
+
+        let fleet = Fleet::new(&[("apple", &[("proxy", 0, 5)])]);
+        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, false, None, None).await;
+        run.timeout = Duration::from_secs(195);
+        let made = make(&fleet, &["apple"]).await;
+        let outage = async {
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            *fleet.down_until.lock().unwrap() = Some(Instant::now() + Duration::from_secs(100_000));
+        };
+        let (rows, ()) = tokio::join!(run_up(&run, made, std::future::pending(), &|_, _| {}), outage);
+        assert!(!fleet.events().iter().any(|e| e.starts_with("terminate")), "{:?}", fleet.events());
+        match &rows[0].verdict {
+            Verdict::Failed { stage: Stage::Endpoint, reason } => assert!(
+                reason.starts_with(
+                    "no public endpoint (RunPod ssh proxy only) for 5m00s (its host has no public IP — no \
+                     scp/rsync/port-forwards) as last seen — its state couldn't be read just now ("
+                ) && reason.ends_with(
+                    "so it isn't replaced, still listed RUNNING — left running, still billing ($0.17/h): `arena proxy \
+                     apply` once it has an endpoint, or `arena pods terminate devtest-apple`"
+                ),
+                "{reason}"
+            ),
+            other => panic!("{other:?}"),
         }
     }
 
@@ -3431,6 +3461,35 @@ mod tests {
             fleet.events(),
             [format!("create devtest-apple {A4000}"), "terminate id1".to_string(), format!("create devtest-apple {R3090}")]
         );
+        assert_eq!(rows[0].verdict, Verdict::Ready);
+    }
+
+    /// Review (codex r3): a restart that only the fresh look saw isn't read over by the older
+    /// listing before it. The look (307 s) sees RUNNING with no container; RunPod's list then
+    /// fails until 650 s, and the container is up behind the proxy again at 649 s. The clock
+    /// starts at the first listing after the look that shows that (651 s), not from the stale
+    /// proxy-only one: replaced a whole grace later (951 s, past the 900 s --timeout), not at 651.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_only_the_fresh_look_saw_starts_the_clock_over() {
+        let fleet = Fleet::new(&[("apple", &[("proxy", 0, 5), ("10.0.0.2", 22002, 0)])]);
+        fleet.later.lock().unwrap().insert(
+            "devtest-apple".into(),
+            vec![("bare".into(), 0, Duration::from_secs(304)), ("proxy".into(), 0, Duration::from_secs(649))],
+        );
+        let cfg = cfg(None);
+        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, false, None, None).await;
+        (run.interval, run.timeout) = (Duration::from_secs(7), Duration::from_secs(900));
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let outage = async {
+            tokio::time::sleep(Duration::from_millis(307_500)).await;
+            *fleet.down_until.lock().unwrap() = Some(Instant::now() + Duration::from_millis(342_500));
+        };
+        let say = |to, l: &str| lines.say(to, l);
+        let (rows, ()) = tokio::join!(run_up(&run, made, std::future::pending(), &say), outage);
+        lines.find("[devtest-apple] no public endpoint (RunPod ssh proxy only) for 5m00s (its host has no public IP — no scp/rsync/port-forwards) — but it's listed RUNNING, not up, now (restarting?): waiting on");
+        let (_, at) = lines.find("[devtest-apple] terminating id1 to recreate devtest-apple (attempt 2 of 2)");
+        assert_eq!(at, Duration::from_secs(951), "a whole grace from the first listing after the look");
         assert_eq!(rows[0].verdict, Verdict::Ready);
     }
 
@@ -3604,12 +3663,13 @@ mod tests {
         assert_eq!(rows[0].verdict, Verdict::Ready);
     }
 
-    /// Review fix: an endpoint deadline shorter than the grace (`--timeout` < 300s) came while
-    /// the pod was up behind the proxy only — known to be such a host — and FAILED the name with
-    /// the pod left billing, never replaced. It is that host failure: replaced, with or without
-    /// --check.
+    /// An endpoint deadline shorter than the grace (`--timeout` < 300s) came while the pod was up
+    /// behind the proxy only. An earlier review made that a host failure at once (left billing
+    /// otherwise); codex r3: that condemns a pod after seconds without an endpoint. Now the pod
+    /// gets its whole grace, past `--timeout` — then, still behind the proxy, it is the host
+    /// failure, with or without --check; and one whose endpoint comes in that time is READY.
     #[tokio::test(start_paused = true)]
-    async fn a_deadline_inside_the_proxy_only_grace_is_still_a_host_failure() {
+    async fn a_deadline_inside_the_grace_waits_the_whole_grace_out() {
         let cfg = cfg(None);
         for check in [Some(2), None] {
             let fleet = Fleet::new(&[("apple", &[("proxy", 0, 5), ("10.0.0.2", 22002, 0)])]);
@@ -3627,9 +3687,20 @@ mod tests {
             );
             assert_eq!(rows[0].verdict, Verdict::Ready, "{check:?}");
             assert_eq!(rows[0].attempts[0].end, AttemptEnd::NoEndpoint(PROXY_ONLY_END.into()));
-            let (_, at) = lines.find("[devtest-apple] no public endpoint (RunPod ssh proxy only) for 1m50s");
-            assert_eq!(at, Duration::from_secs(120), "{check:?}");
+            let (_, at) = lines.find("[devtest-apple] no public endpoint (RunPod ssh proxy only) for 5m00s");
+            assert_eq!(at, Duration::from_secs(310), "{check:?}: a whole grace, not the 120s --timeout");
         }
+
+        // Behind the proxy from 100s, its endpoint at 200s — past the 120s --timeout, inside the
+        // grace: READY, never replaced.
+        let fleet = Fleet::new(&[("apple", &[("proxy", 0, 100)])]);
+        fleet.later.lock().unwrap().insert("devtest-apple".into(), vec![("10.0.0.1".into(), 22001, Duration::from_secs(200))]);
+        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, false, None, None).await;
+        run.timeout = Duration::from_secs(120);
+        let made = make(&fleet, &["apple"]).await;
+        let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
+        assert_eq!(rows[0].verdict, Verdict::Ready);
+        assert_eq!(fleet.events().len(), 1, "never replaced");
 
         // A plain timeout — a pod still coming up (provisioning), never up without an endpoint —
         // is unchanged: left running.
@@ -3641,6 +3712,28 @@ mod tests {
         let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
         assert!(matches!(&rows[0].verdict, Verdict::Failed { stage: Stage::Endpoint, reason } if reason.starts_with("no SSH endpoint after 120s")), "{:?}", rows[0].verdict);
         assert_eq!(fleet.events().len(), 1, "nothing terminated");
+    }
+
+    /// The live case of 2026-10-30, end to end: RunPod listed the pod RUNNING with no container
+    /// while it pulled its image (6m39s), then its container came up behind the proxy only (no
+    /// public IP). Its clock starts with the container — so the 600s --timeout comes first — and
+    /// it is still replaced after a whole grace, not left billing at the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_pull_onto_a_host_with_no_public_ip_is_still_replaced() {
+        let fleet = Fleet::new(&[("apple", &[("bare", 0, 0), ("10.0.0.2", 22002, 0)])]);
+        fleet.later.lock().unwrap().insert("devtest-apple".into(), vec![("proxy".into(), 0, Duration::from_secs(400))]);
+        let cfg = cfg(None);
+        let run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(
+            fleet.events(),
+            [format!("create devtest-apple {A4000}"), "terminate id1".to_string(), format!("create devtest-apple {R3090}")]
+        );
+        assert_eq!(rows[0].verdict, Verdict::Ready);
+        let (_, at) = lines.find("[devtest-apple] no public endpoint (RunPod ssh proxy only) for 5m00s");
+        assert_eq!(at, Duration::from_secs(700), "from the container's start, past the 600s --timeout");
     }
 
     /// Live G: a pod terminated elsewhere while `up` waited for its endpoint ended `FAILED
