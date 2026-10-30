@@ -9,12 +9,13 @@ use arena_core::selector::SelectArgs;
 use arena_core::Config;
 use clap::{Parser, Subcommand};
 
+use crate::config_cmd::ConfigCmd;
 use crate::cron::CronCmd;
 use crate::keys::KeysCmd;
 use crate::plan::PlanCmd;
 use crate::pods::RUN_TIMEOUT_SECS;
 use crate::proxy::ProxyCmd;
-use crate::{archive, image, jobs, money, offers, parse_max_price, reap, spend, ConfigCmd, MigrateCmd};
+use crate::{archive, image, jobs, money, offers, parse_max_price, reap, spend, MigrateCmd};
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 
