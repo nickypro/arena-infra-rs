@@ -4,8 +4,8 @@ use arena_core::proxy::{Listing, ProviderListing, ProxyConfig};
 use arena_core::{Config, Error, Pod, PodSpec, Provider, Result};
 use async_trait::async_trait;
 
-use crate::handle_pods;
 use crate::cli::PodCmd;
+use crate::pods::handle_pods;
 use super::{deploy_proxy, emit_proxy_plan, fleet_listing, prepare_proxy, read_current_proxy, remote_install_script, replace_file, ssh_config_after, sync_proxy, write_proxy, ProxyChanged, ProxySync, Written, INSTALL_FAILED, RELOAD_FAILED_NOT_RESTORED, RELOAD_FAILED_RESTORED};
 
 fn cfg(path: &Path) -> Config {

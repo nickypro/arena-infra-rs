@@ -1,16 +1,18 @@
-use super::{handle_setup, provision_fleet, SetupJob};
-use crate::handle_pods;
-use crate::cli::{Cli, Cmd};
-use crate::keys::{handle_copy_keys, COPY_KEYS_TIMEOUT};
-use crate::pods::selection::Selected;
+use std::sync::Arc;
+use std::time::Duration;
+
 use arena_core::remote::{FakeRemote, FakeReply, Remote, RemoteCall};
 use arena_core::setup::{provisioning_steps, BootRetry, SetupConfig, SetupTimeouts};
 use arena_core::ssh::{SshOutput, SshTarget};
 use arena_core::{Config, Pod, PodSpec, Provider, Result};
 use async_trait::async_trait;
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::time::Instant;
+
+use crate::cli::{Cli, Cmd};
+use crate::keys::{handle_copy_keys, COPY_KEYS_TIMEOUT};
+use crate::pods::handle_pods;
+use crate::pods::selection::Selected;
+use super::{handle_setup, provision_fleet, SetupJob};
 
 fn target(port: u16) -> SshTarget {
     SshTarget { user: "root".into(), host: "10.0.0.1".into(), port, key_paths: vec![], connect_timeout_secs: 10, host_keys: Default::default() }
@@ -409,9 +411,9 @@ async fn create_then_setup_commands_reject_a_bad_budget_before_doing_anything() 
         let (place, interrupt) = (crate::cli::PlaceFlags::default(), crate::Interrupt::manual());
         let opts = crate::ReplaceOpts { keep_old: false, skip_proxy: true, dry_run, yes: true };
         let bal = crate::money::BalanceCtx::from_config(&cfg); // no account, no state file: a test
-        let err = crate::handle_replace(fake.clone(), &fleet(), &cfg, "apple", &ov, &place, opts, &interrupt, &bal).await.unwrap_err();
+        let err = crate::pods::replace::handle_replace(fake.clone(), &fleet(), &cfg, "apple", &ov, &place, opts, &interrupt, &bal).await.unwrap_err();
         assert!(err.to_string().contains("SETUP_TIMEOUT_SECS"), "replace (dry_run={dry_run}): {err}");
-        let err = crate::handle_migrate_copy(fake.clone(), &cfg, "apple", &ov, &place, dry_run, true, &interrupt, &bal).await.unwrap_err();
+        let err = crate::pods::migrate::handle_migrate_copy(fake.clone(), &cfg, "apple", &ov, &place, dry_run, true, &interrupt, &bal).await.unwrap_err();
         assert!(fake.calls().is_empty(), "nothing reached a pod");
         assert!(err.to_string().contains("SETUP_TIMEOUT_SECS"), "migrate copy (dry_run={dry_run}): {err}");
     }

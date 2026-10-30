@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::cli::{Cli, Cmd, PodCmd};
 use crate::pods::create::{create_with_retry, replacement_rounds, CAPACITY_RETRY_SECS, MAX_CAPACITY_ATTEMPTS, NO_STREAM};
-use crate::{handle_pods, handle_pods_bal};
+use crate::pods::{handle_pods, handle_pods_bal};
 use super::*;
 
 /// Placement never SSHes; an unscripted FakeRemote would fail any call loudly.

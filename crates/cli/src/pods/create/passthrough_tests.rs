@@ -7,9 +7,10 @@ use arena_core::{Config, Pod, PodSpec, Provider, Result};
 use async_trait::async_trait;
 use clap::Parser;
 
+use crate::handle_api;
 use crate::cli::{ApiCmd, Cli, Cmd, PodCmd};
+use crate::pods::handle_pods;
 use crate::pods::placement::first_create_spec;
-use crate::{handle_api, handle_pods};
 use super::{create_body_text, spec_with_overrides, SpecOverrides};
 
 /// A RunPod v2 account with no pods: the create-body rules and preview are the real v2
