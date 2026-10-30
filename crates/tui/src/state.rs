@@ -1257,6 +1257,9 @@ pub struct Confirm {
     pub full: bool,
     /// Said under the summary: an AI key's state now (`ai key now: $0.42 of $5.00 …`).
     pub note: Option<String>,
+    /// The AI key's pick: the pod's name and its key as the confirm shows it — what `y` runs with
+    /// (`aikey::start`), never a later read (review codex r3 #1).
+    pub ai: Vec<(String, arena_core::openrouter::KeyInfo)>,
 }
 
 impl Confirm {
@@ -1271,6 +1274,7 @@ impl Confirm {
             reset: ContainerReset::Unknown,
             full: false,
             note: None,
+            ai: Vec::new(),
         }
     }
 

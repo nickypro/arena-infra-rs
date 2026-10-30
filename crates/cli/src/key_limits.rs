@@ -103,6 +103,43 @@ pub(crate) async fn pause(a: PauseArgs, resume: bool, provider: &dyn Provider, c
     run(verb, a.sel.args(), &expect, a.dry_run, a.json, provider, cfg, api, dir, yes).await
 }
 
+/// How long a key change waits for another arena's on this box ([`keys_lock`]).
+const KEYS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The box's key-change lock (`<state dir>/openrouter-keys.lock`), held until the file is dropped:
+/// `keys limit|pause|resume` from two terminals, or a terminal and the dashboard, take turns — the
+/// second plans from the first's result instead of over it. Waits up to [`KEYS_LOCK_WAIT`]. No
+/// state directory: said, and no lock.
+async fn keys_lock(cfg: &Config) -> Result<Option<std::fs::File>> {
+    let dir = match arena_core::snapshot::state_dir_for(cfg) {
+        Ok(d) => d,
+        Err(why) => {
+            eprintln!("warning: no state directory ({why}) — key changes from other arena commands aren't kept apart");
+            return Ok(None);
+        }
+    };
+    std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
+    let path = dir.join("openrouter-keys.lock");
+    let f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(&path)
+    }
+    .with_context(|| format!("opening {}", path.display()))?;
+    let deadline = std::time::Instant::now() + KEYS_LOCK_WAIT;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(Some(f)),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!("another arena has been changing OpenRouter keys for {}s ({}) — nothing changed", KEYS_LOCK_WAIT.as_secs(), path.display())
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e).with_context(|| format!("locking {}", path.display())),
+        }
+    }
+}
+
 /// `--expect`'s values ([`or::Expected::parse`]).
 fn expected(tokens: &[String]) -> Result<Vec<or::Expected>> {
     tokens.iter().map(|t| or::Expected::parse(t).map_err(|e| anyhow::anyhow!("--expect: {e}"))).collect()
@@ -455,8 +492,11 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
         say("aborted.");
         return Ok(());
     }
-    // The keys read again: a change confirmed against a listing that has moved since isn't made
-    // ([`moved`]). OpenRouter has no conditional update, so this narrows the window to the calls.
+    // One arena changing keys at a time on this box (another operator's command, the dashboard's
+    // runs), then the keys read again: a change confirmed against a listing that has moved since
+    // isn't made ([`moved`]), and each key is checked once more in the request just before its
+    // change (`update_key`'s `expect`). OpenRouter has no conditional update to close the rest.
+    let _lock = keys_lock(cfg).await?;
     let fresh = api.list_keys().await.context("listing OpenRouter keys again before changing them")?;
     let stale: std::collections::HashMap<&str, Option<String>> = todo
         .iter()
@@ -470,7 +510,7 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
         let outcome = match (&r.key, &r.update) {
             (Some(k), Some(u)) => match stale.get(r.machine.as_str()).cloned().flatten() {
                 Some(why) => Outcome::Failed(why),
-                None => match api.update_key(&k.hash, u).await {
+                None => match api.update_key(&k.hash, u, Some(&or::Expected::of(k))).await {
                     Ok(()) => Outcome::Changed,
                     Err(e) => Outcome::Failed(e.to_string()),
                 },
@@ -485,10 +525,9 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
     for (r, outcome, now) in &mut done {
         let Some(k) = &r.key else { continue };
         let want = r.update.as_ref().map_or_else(|| k.clone(), |u| applied(k, u));
-        *now = match &reread {
-            Ok(keys) => keys.iter().find(|n| n.hash == k.hash).cloned(),
-            Err(_) => Some(want.clone()),
-        };
+        // Unknown when the keys couldn't be read back: never what was asked, passed off as done
+        // (review codex r3 #3).
+        *now = reread.as_ref().ok().and_then(|keys| keys.iter().find(|n| n.hash == k.hash).cloned());
         if *outcome == Outcome::Changed && reread.is_ok() && !now.as_ref().is_some_and(|n| same(n, &want)) {
             *outcome = Outcome::Failed(match now.as_ref() {
                 Some(n) => format!(
@@ -564,7 +603,8 @@ mod tests {
     }
 
     fn cfg() -> Config {
-        Config::parse("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(alpha bravo cloud delta)\n")
+        let state = std::env::temp_dir().join(format!("arena-key-limits-state-{}", std::process::id()));
+        Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(alpha bravo cloud delta)\nARENA_STATE_DIR={}\n", state.display()))
     }
 
     /// Keys on a fake OpenRouter: listed, changed in place as asked (each call recorded); a key
@@ -577,6 +617,8 @@ mod tests {
         broken: Vec<&'static str>,
         ignored: Vec<&'static str>,
         meanwhile: Mutex<Option<(&'static str, f64)>>,
+        /// Another operator's change made at the first update (a later key's cap).
+        meanwhile_on_update: Mutex<Option<(&'static str, f64)>>,
     }
 
     impl Keys {
@@ -609,10 +651,16 @@ mod tests {
         async fn rename_key(&self, _hash: &str, _new_name: &str) -> arena_core::Result<()> {
             unreachable!()
         }
-        async fn update_key(&self, hash: &str, u: &KeyUpdate) -> arena_core::Result<()> {
-            self.calls.lock().unwrap().push(format!("{hash} {}", or::update_body(u)?));
+        async fn update_key(&self, hash: &str, u: &KeyUpdate, expect: Option<&or::Expected>) -> arena_core::Result<()> {
             let mut keys = self.keys.lock().unwrap();
+            if let Some((other, cap)) = self.meanwhile_on_update.lock().unwrap().take() {
+                keys.iter_mut().filter(|k| k.hash == other).for_each(|k| k.limit = Some(cap));
+            }
             let k = keys.iter_mut().find(|k| k.hash == hash).expect("a listed key");
+            if expect.is_some_and(|e| !e.holds(k)) {
+                return Err(arena_core::Error::provider("openrouter update key: refused — changed since it was read"));
+            }
+            self.calls.lock().unwrap().push(format!("{hash} {}", or::update_body(u)?));
             let name = k.name.clone().unwrap_or_default();
             if self.broken.contains(&name.as_str()) {
                 return Err(arena_core::Error::provider("openrouter update key HTTP 500"));
@@ -778,6 +826,28 @@ mod tests {
         assert_eq!(e, "1 key(s) failed");
         assert_eq!(api.calls(), [r#"ha {"limit":5.1}"#], "bravo isn't touched");
         assert_eq!(api.key("hb").limit, Some(25.0));
+    }
+
+    /// A later key that moves while earlier ones are being changed (review codex r3 #2) is refused
+    /// in the request just before its own change; the earlier ones stand.
+    #[tokio::test]
+    async fn a_later_key_that_moves_mid_run_is_refused_at_its_own_change() {
+        let api = Keys { meanwhile_on_update: Mutex::new(Some(("hc", 25.0))), ..Keys::with(fleet_keys()) };
+        let e = keys_cmd(&["limit", "alpha..cloud", "+5"], &api).await.unwrap_err();
+        assert_eq!(e, "1 key(s) failed");
+        assert_eq!(api.calls(), [r#"ha {"limit":5.1}"#, r#"hb {"limit":10.0}"#], "cloud's isn't made");
+        assert_eq!(api.key("hc").limit, Some(25.0));
+    }
+
+    /// Two key changes on one box take turns: one waits for the other's lock, then goes ahead.
+    #[tokio::test]
+    async fn key_changes_take_turns_on_the_box() {
+        let held = keys_lock(&cfg()).await.unwrap().expect("a state dir in the test config");
+        let waiting = tokio::spawn(async move { keys_lock(&cfg()).await.map(|f| f.is_some()) });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "the second waits while the first holds it");
+        drop(held);
+        assert!(waiting.await.unwrap().unwrap());
     }
 
     /// What stops a machine's planned change, by the keys read again: a key gone or renamed away,

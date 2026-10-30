@@ -274,21 +274,41 @@ impl OpenRouter {
     /// check the answer is that key, and compare its workspace. Nothing to check without a
     /// workspace.
     async fn ensure_in_workspace(&self, hash: &str, what: &str) -> Result<()> {
-        let Some(ws) = self.workspace_id().await? else { return Ok(()) };
+        self.check_key(hash, what, None).await
+    }
+
+    /// [`Self::ensure_in_workspace`], and — given `expect` — that the key is still as expected
+    /// ([`Expected::holds`]): one read (`GET /keys/{hash}`) serves both; none when there's
+    /// nothing to check.
+    async fn check_key(&self, hash: &str, what: &str, expect: Option<&Expected>) -> Result<()> {
+        let ws = self.workspace_id().await?;
+        if ws.is_none() && expect.is_none() {
+            return Ok(());
+        }
         let v = send_json(self.auth(self.client.get(format!("{}/{hash}", self.keys_url()))), &format!("openrouter {what}"))
             .await?;
         let data = v.get("data");
         let theirs = data.and_then(|d| d.get("workspace_id")).and_then(|s| s.as_str());
         let same_key = data.and_then(|d| d.get("hash")).and_then(|s| s.as_str()) == Some(hash);
-        if same_key && theirs.is_some_and(|t| t.eq_ignore_ascii_case(&ws)) {
-            return Ok(());
+        if ws.is_some_and(|ws| !(same_key && theirs.is_some_and(|t| t.eq_ignore_ascii_case(&ws)))) {
+            return Err(Error::provider(format!(
+                "openrouter {what}: refused — key {} is in workspace {}, not OPENROUTER_WORKSPACE ({})",
+                short_hash(hash),
+                if same_key { theirs.unwrap_or("(not said)") } else { "(the answer was for another key)" },
+                self.workspace.as_deref().unwrap_or_default(),
+            )));
         }
-        Err(Error::provider(format!(
-            "openrouter {what}: refused — key {} is in workspace {}, not OPENROUTER_WORKSPACE ({})",
-            short_hash(hash),
-            if same_key { theirs.unwrap_or("(not said)") } else { "(the answer was for another key)" },
-            self.workspace.as_deref().unwrap_or_default(),
-        )))
+        let Some(e) = expect else { return Ok(()) };
+        let now = data.filter(|_| same_key).and_then(|d| serde_json::from_value::<KeyInfo>(d.clone()).ok());
+        match now {
+            Some(k) if e.holds(&k) => Ok(()),
+            Some(k) => Err(Error::provider(format!(
+                "openrouter {what}: refused — key {} changed since it was read (now {}) — nothing done",
+                short_hash(hash),
+                Expected::of(&k).words()
+            ))),
+            None => Err(Error::provider(format!("openrouter {what}: refused — key {} couldn't be read back to check it", short_hash(hash)))),
+        }
     }
 
     /// Delete the key with `hash` (irreversible — the runtime key stops working). With a
@@ -324,12 +344,16 @@ impl OpenRouter {
     /// over, whether it's disabled — only the fields `update` gives ([`update_body`]; never the
     /// name, never `workspace_id`, which on this call *moves* a key). How `keys limit|pause|
     /// resume` and the dashboard raise a cap or pause a key; the secret and the usage are
-    /// untouched. With a workspace, only a key in it (the read-first guard of rename/delete).
-    /// Status only, as a rename: the caller reads the keys again to see what they say now.
-    pub async fn update_key(&self, hash: &str, update: &KeyUpdate) -> Result<()> {
+    /// untouched. The key is read first (`GET /keys/{hash}`) when there's a workspace — only a key
+    /// in it, the guard of rename/delete — or an `expect`ed state: a key that has moved since the
+    /// caller read it (another operator raised it, paused it) is refused, so a change planned
+    /// from an older reading never lands over a newer one. That read is the request just before
+    /// the change: OpenRouter has no conditional update to close the rest. Status only, as a
+    /// rename: the caller reads the keys again to see what they say now.
+    pub async fn update_key(&self, hash: &str, update: &KeyUpdate, expect: Option<&Expected>) -> Result<()> {
         let body = update_body(update)?;
         valid_hash(hash)?;
-        self.ensure_in_workspace(hash, "update key").await?;
+        self.check_key(hash, "update key", expect).await?;
         send_ok(self.auth(self.client.patch(format!("{}/{hash}", self.keys_url()))).json(&body), "openrouter update key").await
     }
 
@@ -806,6 +830,13 @@ impl Expected {
         Ok(Expected { hash: hash.to_string(), limit, reset: LimitReset::parse(reset).map_err(|_| bad())?, disabled })
     }
 
+    /// `cap $25.00 (monthly), on`, `no cap, off`.
+    pub fn words(&self) -> String {
+        let cap = self.limit.map(|c| format!("cap {}", exact_money(c))).unwrap_or_else(|| "no cap".into());
+        let reset = self.reset.map(|r| format!(" ({})", r.as_str())).unwrap_or_default();
+        format!("{cap}{reset}, {}", if self.disabled { "off" } else { "on" })
+    }
+
     /// Whether `k` is this key, still as shown (the cap to [`CAP_EPSILON`]).
     pub fn holds(&self, k: &KeyInfo) -> bool {
         let cap = match (self.limit, k.limit) {
@@ -841,9 +872,10 @@ pub trait KeyApi: Send + Sync {
     async fn create_key(&self, name: &str, limit: Option<f64>) -> Result<CreatedKey>;
     async fn delete_key(&self, hash: &str) -> Result<()>;
     async fn rename_key(&self, hash: &str, new_name: &str) -> Result<()>;
-    /// Change a key's cap, reset or disabled flag ([`OpenRouter::update_key`]). Default: refused
-    /// — a fake for flows that never change a key in place need not say what it would do.
-    async fn update_key(&self, hash: &str, _update: &KeyUpdate) -> Result<()> {
+    /// Change a key's cap, reset or disabled flag, if it's still as `expect`ed
+    /// ([`OpenRouter::update_key`]). Default: refused — a fake for flows that never change a key in
+    /// place need not say what it would do.
+    async fn update_key(&self, hash: &str, _update: &KeyUpdate, _expect: Option<&Expected>) -> Result<()> {
         Err(Error::provider(format!("openrouter update key {}: not supported here", short_hash(hash))))
     }
 }
@@ -862,8 +894,8 @@ impl KeyApi for OpenRouter {
     async fn rename_key(&self, hash: &str, new_name: &str) -> Result<()> {
         OpenRouter::rename_key(self, hash, new_name).await
     }
-    async fn update_key(&self, hash: &str, update: &KeyUpdate) -> Result<()> {
-        OpenRouter::update_key(self, hash, update).await
+    async fn update_key(&self, hash: &str, update: &KeyUpdate, expect: Option<&Expected>) -> Result<()> {
+        OpenRouter::update_key(self, hash, update, expect).await
     }
 }
 
@@ -2063,6 +2095,34 @@ mod tests {
         }
     }
 
+    /// With an expected state the key is read right before the change, workspace or not, and a key
+    /// that has moved since is refused with no PATCH (review codex r3 #2: a fleet-wide change's
+    /// later keys were checked many requests before their PATCH).
+    #[tokio::test]
+    async fn update_key_with_an_expected_state_refuses_a_key_that_moved() {
+        use crate::http::test_server::{canned, serve};
+        let json = "application/json";
+        let srv = serve(vec![
+            canned(200, json, r#"{"data":{"hash":"a","limit":5.0,"limit_reset":null,"disabled":false}}"#),
+            canned(200, json, "{}"),
+            canned(200, json, r#"{"data":{"hash":"a","limit":25.0,"limit_reset":"monthly","disabled":false}}"#),
+            canned(200, json, r#"{"data":{"hash":"zz"}}"#),
+        ]);
+        let or = test_client("K", &srv.base);
+        let was = Expected::of(&KeyInfo { hash: "a".into(), limit: Some(5.0), ..Default::default() });
+        let cap = KeyUpdate { limit: Some(Some(10.0)), ..Default::default() };
+        or.update_key("a", &cap, Some(&was)).await.unwrap();
+        let e = or.update_key("a", &cap, Some(&was)).await.unwrap_err().to_string();
+        assert!(e.contains("changed since it was read (now cap $25.00 (monthly), on) — nothing done"), "{e}");
+        let e = or.update_key("a", &cap, Some(&was)).await.unwrap_err().to_string();
+        assert!(e.contains("couldn't be read back"), "an answer for another key: {e}");
+        assert_eq!(
+            *srv.requests.lock().unwrap(),
+            ["GET /keys/a HTTP/1.1", "PATCH /keys/a HTTP/1.1", "GET /keys/a HTTP/1.1", "GET /keys/a HTTP/1.1"],
+            "a PATCH only for the key as expected"
+        );
+    }
+
     /// One key per name: the enabled one, then the newest, the first of equals — as the
     /// dashboard's cell shows.
     #[test]
@@ -2099,16 +2159,16 @@ mod tests {
         ]);
         let or = test_client("K", &srv.base).with_workspace(Some("arena-dev-test"));
         let cap = KeyUpdate { limit: Some(Some(0.2)), ..Default::default() };
-        or.update_key("a", &cap).await.unwrap();
-        let e = or.update_key("x", &cap).await.unwrap_err().to_string();
+        or.update_key("a", &cap, None).await.unwrap();
+        let e = or.update_key("x", &cap, None).await.unwrap_err().to_string();
         assert!(e.contains("refused") && e.contains("a3339b09"), "{e}");
         let pause = KeyUpdate { disabled: Some(true), ..Default::default() };
-        or.update_key("a", &pause).await.unwrap();
-        let e = or.update_key("a", &KeyUpdate { limit: Some(None), limit_reset: Some(None), ..Default::default() }).await.unwrap_err();
+        or.update_key("a", &pause, None).await.unwrap();
+        let e = or.update_key("a", &KeyUpdate { limit: Some(None), limit_reset: Some(None), ..Default::default() }, None).await.unwrap_err();
         assert_eq!(e.kind(), Some(K::Auth), "{e}");
         assert!(e.to_string().contains("openrouter update key HTTP 401"), "{e}");
-        assert!(or.update_key("a", &KeyUpdate::default()).await.is_err());
-        assert!(or.update_key("a/../credits", &cap).await.is_err());
+        assert!(or.update_key("a", &KeyUpdate::default(), None).await.is_err());
+        assert!(or.update_key("a/../credits", &cap, None).await.is_err());
         assert_eq!(
             *srv.requests.lock().unwrap(),
             [

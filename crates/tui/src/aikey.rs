@@ -169,6 +169,7 @@ pub(crate) fn choose(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, pod: Pod, shown: 
     }
     let mut c = Confirm::new(action, shown, pod.id, preview);
     c.note = Some(note);
+    c.ai = vec![(pod.name, info)];
     ui.mode = Mode::Confirm(c);
 }
 
@@ -176,12 +177,15 @@ pub(crate) fn choose(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, pod: Pod, shown: 
 /// can be acted on; a cap opens the amount box; pause and resume the set's typed-count confirm,
 /// noting the pods left out.
 pub(crate) fn choose_set(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, action: Action, scope: Scope) {
-    let (why, left_out) = {
+    let (why, left_out, keyed) = {
         let s = shared.lock().unwrap();
         let pods = scope_pods_of(&s, ui, scope);
         let out: Vec<String> = pods.iter().filter(|p| support(&s, p).is_err()).map(|p| ui.shown_name(&p.name)).collect();
-        (set_why(&s, &pods), out)
+        let owned: Vec<Pod> = pods.iter().map(|p| (*p).clone()).collect();
+        (set_why(&s, &pods), out, snapshot(&s, &owned))
     };
+    // What the confirm is opened with is what `ALL`/the count runs (review codex r3 #1).
+    ui.ai_set = keyed;
     if let Some(why) = why {
         ui.mode = Mode::Result(format!("✗ can't {} — {why}", action.label()));
         return;
@@ -193,29 +197,27 @@ pub(crate) fn choose_set(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, action: Actio
     };
 }
 
-/// Run the AI key's `action` on those of `pods` with a key ([`support`]) as one CLI run (`arg`:
-/// a cap's amount), each key bound as the dashboard showed it ([`args`]), and open the runs panel
-/// on it — or say why it can't run.
-pub(crate) fn start(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, action: Action, pods: &[Pod], arg: Option<&str>) {
-    let (names, keys): (Vec<String>, Vec<KeyInfo>) = {
-        let s = shared.lock().unwrap();
-        pods.iter().filter_map(|p| support(&s, p).ok().map(|(_, k)| (p.name.clone(), k))).unzip()
-    };
-    if names.is_empty() {
+/// Those of `pods` with a key, and the key as last read ([`support`]) — what a run is bound to.
+pub(crate) fn snapshot(shared: &Shared, pods: &[Pod]) -> Vec<(String, KeyInfo)> {
+    pods.iter().filter_map(|p| support(shared, p).ok().map(|(_, k)| (p.name.clone(), k))).collect()
+}
+
+/// Run the AI key's `action` on `keyed` (pod names and their keys as the operator was shown them,
+/// [`snapshot`]) as one CLI run (`arg`: a cap's amount), each key bound as shown ([`args`]), and
+/// open the runs panel on it — or say why it can't run. `provider`: one pod's own (the CLI finds
+/// a pod fleet-wide whatever `--provider` says, but its messages then name the right one).
+pub(crate) fn start(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, action: Action, keyed: &[(String, KeyInfo)], provider: Option<&str>, arg: Option<&str>) {
+    if keyed.is_empty() {
         ui.mode = Mode::Result(format!("✗ can't {} — none of these pods has an OpenRouter key that was read", action.label()));
         return;
     }
+    let (names, keys): (Vec<String>, Vec<KeyInfo>) = keyed.iter().cloned().unzip();
     let Some((kind, argv)) = args(action, &names, arg, &keys) else { return };
-    let title = match pods {
-        [one] => format!("{} {}", action.command(), ui.shown_name(&one.name)),
+    let title = match keyed {
+        [(one, _)] => format!("{} {}", action.command(), ui.shown_name(one)),
         _ => format!("{} {}", action.command(), crate::state::count_of(names.len(), "pod", "pods")),
     };
-    // One pod's own provider: the CLI finds a pod fleet-wide whatever `--provider` says, but its
-    // messages then name the right one.
-    let provider = match pods {
-        [one] if !one.provider.is_empty() => one.provider.clone(),
-        _ => ui.provider_name.clone(),
-    };
+    let provider = provider.filter(|p| !p.is_empty()).map_or_else(|| ui.provider_name.clone(), String::from);
     ui.mode = match runs::start(ui, shared, kind, &provider, argv, title) {
         Ok(id) => Mode::Runs { id, scroll: None, stop: false },
         Err(e) => Mode::Result(format!("✗ {e}")),

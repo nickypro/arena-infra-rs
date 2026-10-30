@@ -346,6 +346,9 @@ struct Ui {
     menu_at: std::cell::Cell<Option<(u16, u16)>>,
     /// A provisioning key is configured: the action menus have the AI key's rows (`aikey.rs`).
     ai_keys: bool,
+    /// The marked set's pods and keys an AI key confirm was opened with — what it runs on
+    /// (`aikey::choose_set`).
+    ai_set: Vec<(String, arena_core::openrouter::KeyInfo)>,
 }
 
 impl Ui {
@@ -480,6 +483,7 @@ async fn main() -> Result<()> {
         demo: demo.is_some(),
         menu_at: std::cell::Cell::new(None),
         ai_keys,
+        ai_set: Vec::new(),
     };
 
     dashboard(&shared, &provider, &interval, &nudge, &details_wanted, ui).await
@@ -1849,8 +1853,8 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
             match code {
                 KeyCode::Esc => ui.mode = Mode::List,
                 KeyCode::Enter if typed == token && action.ai_key() => {
-                    let pods = scope_pods(shared, &ui.marked, scope);
-                    aikey::start(ui, shared, action, &pods, None);
+                    let keyed = std::mem::take(&mut ui.ai_set);
+                    aikey::start(ui, shared, action, &keyed, None, None);
                 }
                 KeyCode::Enter if typed == token => {
                     let pods = scope_pods(shared, &ui.marked, scope);
@@ -1940,7 +1944,8 @@ fn submit_input(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Pro
         }
         InputScope::Set(sc) if action.ai_key() => {
             let pods = scope_pods(shared, &ui.marked, sc);
-            aikey::start(ui, shared, action, &pods, Some(&value));
+            let keyed = aikey::snapshot(&shared.lock().unwrap(), &pods);
+            aikey::start(ui, shared, action, &keyed, None, Some(&value));
         }
         InputScope::Set(sc) => {
             let pods = scope_pods(shared, &ui.marked, sc);
@@ -2216,6 +2221,10 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Pro
         ui.mode = Mode::Result(format!("{} is gone — refresh", c.pod_name));
         return;
     };
+    if c.action.ai_key() {
+        // The key as the confirm showed it (review codex r3 #1), not as read since.
+        return aikey::start(ui, shared, c.action, &c.ai, Some(&pod.provider), None);
+    }
     if c.action.cli() {
         return start_cli_action(ui, shared, c.action, &pod, None);
     }
@@ -2537,7 +2546,8 @@ fn cli_action_args(action: Action, name: &str, arg: Option<&str>) -> Option<(run
 /// on it — or say why it can't run.
 fn start_cli_action(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, action: Action, pod: &Pod, arg: Option<&str>) {
     if action.ai_key() {
-        return aikey::start(ui, shared, action, std::slice::from_ref(pod), arg);
+        let keyed = aikey::snapshot(&shared.lock().unwrap(), std::slice::from_ref(pod));
+        return aikey::start(ui, shared, action, &keyed, Some(&pod.provider), arg);
     }
     let Some((kind, args)) = cli_action_args(action, &pod.name, arg) else { return };
     let title = format!("{} {}", action.command(), ui.shown_name(&pod.name));
@@ -4712,6 +4722,7 @@ deep_check_end=1
             demo: false,
             menu_at: std::cell::Cell::new(None),
             ai_keys: false,
+            ai_set: Vec::new(),
         }
     }
 
@@ -7450,6 +7461,18 @@ deep_check_end=1
         apply_action(&shared, &mut ui, &provider, &c);
         let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
         assert_eq!(first_line_when_ended(&shared, id).await.as_deref(), Some("args: --config /test/config.env --provider runpod keys resume devtest-bravo --expect hdevtestbravo=5/never/off --yes"));
+        // A confirm runs on the key it showed, not on one read since (review codex r3 #1): the key
+        // rotated while the pause confirm is open — the run still names the old one, which the CLI
+        // then refuses.
+        ui.selected = at("devtest-alpha");
+        choose_pod_action(&shared, &mut ui, &provider, Action::KeyPause);
+        let Mode::Confirm(c) = ui.mode.clone() else { panic!("{:?}", ui.mode) };
+        shared.lock().unwrap().ai = Some(UsageView::from_keys(&[KeyInfo { hash: "hnew".into(), ..key("devtest-alpha", 0.0, None, false) }], None));
+        apply_action(&shared, &mut ui, &provider, &c);
+        let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        let line = first_line_when_ended(&shared, id).await.unwrap();
+        assert!(line.ends_with("keys pause devtest-alpha --expect hdevtestalpha=5/monthly/on --yes"), "{line}");
+        shared.lock().unwrap().ai = Some(UsageView::from_keys(&[key("devtest-alpha", 0.42, Some("monthly"), false), key("devtest-bravo", 1.0, None, true)], None));
         // Rotate: red, its warning, and `--copy`.
         ui.selected = at("devtest-alpha");
         choose_pod_action(&shared, &mut ui, &provider, Action::KeyRotate);

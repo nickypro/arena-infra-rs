@@ -1722,12 +1722,15 @@ already as asked is left alone. Each command: `--dry-run`, a confirm (`--yes`), 
 after the confirm and each machine's plan made again from them: a machine whose keys moved since the
 preview (another operator, the dashboard: a cap, reset or on/off changed, a key replaced, added or
 renamed away) or whose spend now makes the cap one it would refuse is left alone and fails the
-command — run it again (OpenRouter has no conditional update; this leaves only the calls' own
-moment).
+command — run it again. Each key is also read once more in the request just before its own change,
+and one that moved is refused then (OpenRouter has no conditional update; this leaves only that
+moment), and one of these commands changes keys at a time on a box: a lock in the state directory
+(`openrouter-keys.lock`), a second waiting up to 60 s.
 Afterwards each is checked against the keys as OpenRouter lists them (a change it answered OK for
 but didn't make fails the command; caps compared exactly, not to the cent);
 `--json` prints `{action, dry_run, keys: [{machine, name, hash, before, after, result, error?,
-note?}], changed, failed}` (`before`/`after`: `{limit, reset, disabled, spent}`; `result`:
+note?}], changed, failed}` (`before`/`after`: `{limit, reset, disabled, spent}`, `after` as listed
+afterwards — `null`, with a top-level `reread_error`, when the keys couldn't be read back; `result`:
 `changed`, `would change`, `unchanged`, `no key`, `failed`). Of several keys under one name (a
 rotation's disabled leftover), a cap change and a resume act on the one shown — the enabled one,
 then the newest — and name the others. With a workspace, each key is read first and one from
