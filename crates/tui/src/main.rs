@@ -4747,7 +4747,10 @@ deep_check_end=1
             mem_total_mb: total,
             temp_c: Some(temp),
         };
-        let rows: [(&str, &str, &str, &str, f64, Vec<GpuStat>, &str, i64, Status, u64, u16); 5] = [
+        // name, provider, id, GPU type, $/h, nvidia-smi's GPUs, branch, saved (s ago), verdict,
+        // checked (s ago), proxy port.
+        type Row = (&'static str, &'static str, &'static str, &'static str, f64, Vec<GpuStat>, &'static str, i64, Status, u64, u16);
+        let rows: [Row; 5] = [
             ("apple", "runpod", "rp1", "NVIDIA RTX A4000", 0.17, vec![gpu("RTX A4000", 87, Some(10_240), Some(16_376), 71)], "w1d2", 240, Status::Pass, 720, 22001),
             ("bloom", "runpod", "rp2", "NVIDIA RTX A4000", 0.17, vec![gpu("RTX A4000", 0, Some(900), Some(16_376), 34)], "w1d2", 780, Status::Pass, 3_000, 22002),
             ("cedar", "vast", "v3", "RTX 3090", 0.22, vec![gpu("RTX 3090", 0, Some(300), Some(24_576), 30)], "w1d2", 10_800, Status::Fail, 7_300, 22003),
