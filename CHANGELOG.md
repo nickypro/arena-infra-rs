@@ -19,6 +19,24 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-30 · Raise an AI key's cap, or pause it, from the CLI and the dashboard
+- `arena keys limit apple +5` raises a machine's OpenRouter cap by $5 where the key is: same
+  secret, same spend, nothing to copy onto the pod, so the participant's next call works. `10` sets
+  the cap, `--all` is every pod, `--reset daily|weekly|monthly|never` changes when it starts over,
+  and `--no-cap` takes the cap away (never an amount). A cap set under what the key already spent
+  (in the cap's period) is refused for all targets before anything changes, unless `--force`.
+- `arena keys pause apple` stops a key (its calls fail, the `AI$` cell says `off`) and `arena keys
+  resume apple` turns it back on. Aliases `disable` and `enable`.
+- Each previews with `--dry-run`, asks first (`--yes`), prints one `before → after` line per key as
+  OpenRouter lists it afterwards, and has `--json`.
+- The dashboard runs these same commands from the action menu, when a provisioning key is set: `a`
+  then `ai cap` (also `a`) opens a box prefilled with `+OPENROUTER_KEY_LIMIT` that shows what the
+  key spent and the new cap. `o` pauses or resumes the key, `n` rotates it and copies the new one
+  onto the pod. A marked set gets cap, pause and resume. The `AI$` column and the top line update
+  within seconds, and the at-cap warning says `(a → raise cap)`.
+- `gen` and `rotate` still mint with `OPENROUTER_KEY_LIMIT`. This stays arena 2.3: today's `arena
+  spend` release opened the 2.3 line.
+
 ## 2026-10-30 · Tell us what hurts: pain points on GitHub
 - When arena gets in your way, or you work around it, file a pain point:
   https://github.com/nickypro/arena-infra-rs/issues/new?template=pain-point.yml (label

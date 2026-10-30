@@ -3534,10 +3534,13 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         (None, _, Some(e)) => (format!("? (OpenRouter's keys couldn't be read: {e})"), Some(Tone::Warn)),
         (None, _, None) => ("- (no OpenRouter key named after this pod — `arena keys gen` makes one)".to_string(), Some(Tone::Dim)),
         (Some(k), _, None) if k.paused() => (k.detail(), Some(Tone::Dim)),
-        // Where to act on it: this pod's menu (`a`), its `ai …` rows.
-        (Some(k), _, None) if k.disabled => (format!("{} — a → ai resume", k.detail()), state::fill_tone(k.fill())),
+        // Where to act on it — this pod's menu (`a`), its `ai …` rows — said first: the pane cuts
+        // the line's end.
+        (Some(k), _, None) if k.disabled => {
+            (k.detail().replacen("disabled · ", "disabled (a → ai resume) · ", 1), state::fill_tone(k.fill()))
+        }
         (Some(k), _, None) if k.fill() == arena_core::openrouter::Fill::Full => {
-            (format!("{} — a → raise cap", k.detail()), state::fill_tone(k.fill()))
+            (format!("at its cap (a → raise cap) · {}", k.detail()), state::fill_tone(k.fill()))
         }
         (Some(k), _, None) => (k.detail(), state::fill_tone(k.fill())),
         (Some(k), _, Some(_)) => (format!("{} (as last read; the latest read failed)", k.detail()), Some(Tone::Dim)),
@@ -5336,6 +5339,16 @@ deep_check_end=1
         ui.selected = shared.pods.iter().position(|p| p.name == "devtest-alpha").unwrap();
         let pane = draw(220, 50, &shared, &ui).join("\n");
         assert!(pane.contains("ai key:   paused (a $0 cap, nothing spent against it) · $0.00 of $0.00 today"), "{pane}");
+        // A key at its cap, or disabled: where to act on it, first.
+        let mut at_cap = shared.ai.clone().unwrap();
+        at_cap.keys.insert("devtest-alpha".into(), at_cap.keys["devtest-gone"].clone());
+        let mut s2 = Shared { ai: Some(at_cap.clone()), ..fixture_shared() };
+        let hinted = draw(220, 50, &s2, &ui).join("\n");
+        assert!(hinted.contains("ai key:   at its cap (a → raise cap) · $5.00 of $5.00 today"), "{hinted}");
+        at_cap.keys.get_mut("devtest-alpha").unwrap().disabled = true;
+        s2.ai = Some(at_cap);
+        let hinted = draw(220, 50, &s2, &ui).join("\n");
+        assert!(hinted.contains("ai key:   disabled (a → ai resume) · $5.00 of $5.00"), "{hinted}");
         assert!(pane.contains("ai caps:  ⚠ 1 key at cap (`arena keys list` has each one's cap and spend): devtest-gone (no pod)"), "{pane}");
         // A pod named after it: no `(no pod)`. None at cap (only the paused one): no line.
         shared.ai_cohort = Some(shared.ai.as_ref().unwrap().cohort("devtest", &[names, vec!["devtest-gone".into()]].concat()));

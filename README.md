@@ -111,6 +111,7 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 | `arena pods replace apple` | Move a pod to a fresh host, keeping its name and files |
 | `arena pods run -t apple 'nvidia-smi'` | Run a command on pods (all of them without `-t`) |
 | `arena balance` | Money left on each prepaid account, and how long it lasts |
+| `arena keys limit apple +5` | Raise a participant's AI (OpenRouter) cap by $5, in place (`10` sets it; `--all`); `keys pause`/`resume` stop and restart a key |
 | `arena spend` | What each machine cost and who it was for (`--owner` on `pods up`) |
 | `arena config check` | Which config keys are set, missing or unusable (never prints values) |
 | `arena teardown --check` | End of the program: what's still billing, with the command that cleans it up |
@@ -297,7 +298,7 @@ name typed back.
 ```
 
 <sup>A made-up fleet, drawn by the dashboard's own renderer from test fixtures.</sup>
-`a` acts on the selected pod, `A` on the fleet, `d`/`D` deep-check it/all, `n` adds pods, and `?` asks
+`a` acts on the selected pod (`a a` raises its AI key's cap), `A` on the fleet, `d`/`D` deep-check it/all, `n` adds pods, and `?` asks
 claude or codex about the pod ([`pods ask`](docs/REFERENCE.md#pods-ask)). `i` (or a click on `[i] info`)
 opens the info panel: everything the two bars leave out, every key, and what the glyphs mean.
 [All the keys and columns](docs/REFERENCE.md#the-dashboard-arena-tui).

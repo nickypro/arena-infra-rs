@@ -1691,7 +1691,7 @@ budget); `--dry-run` previews.
 
 ### `keys` (OpenRouter)
 
-`keys gen|list|rotate|revoke` — manage **OpenRouter** runtime keys via the provisioning API (needs
+`keys gen|list|rotate|revoke|limit|pause|resume` — manage **OpenRouter** runtime keys via the provisioning API (needs
 `OPENROUTER_PROVISIONING_KEY`). `gen <targets|--all>` mints one key per machine (named
 `<prefix>-<machine>`) with a USD cap (`--limit`, default `OPENROUTER_KEY_LIMIT` or $5) and writes
 `keys/openrouter_api_keys.csv`; `--copy` also pushes them out via `copy-keys` (targets may be
@@ -1702,6 +1702,31 @@ MACHINE_NAME_LIST names with no pod yet; `--all` = every current pod).
 weekly or monthly), what it spent in the cap's period, today, this month (UTC) and all told, and a
 total row — noting how many others were hidden (`--all` shows every key in the workspace, disabled
 ones included — the listing walks every page).
+
+**Caps, pause, resume — in place.** `limit <targets|--all> <USD|+USD>` changes each machine's key cap
+where it is (`PATCH /keys/{hash}`: the secret, its spend and the pod's copy of the key all stay —
+nothing to copy, the participant's next call works): `10` sets the cap, `+5` raises each key's own
+cap by $5 (`arena keys limit apple +5`, `arena keys limit --all +5`). The amount is always the last
+argument. `--reset daily|weekly|monthly|never` changes when the cap starts over (00:00 UTC, weeks
+from Monday; `+0 --reset daily` keeps the cap); `--no-cap` takes the cap away — never an amount. A
+change that tightens a cap (lower, a first cap, another reset period) under what the key has spent
+in the new cap's period — today's for a daily cap, …, its whole life's without a reset — or when that
+isn't known, is refused for every target before anything changes; `--force` sets it anyway (its
+calls fail at once: `keys pause` is the way to stop a key). A raise that still leaves a key under
+its spend goes ahead and says `still at its cap`. `pause` disables each machine's enabled keys (their
+calls fail; the `AI$` cell says `off`) and `resume` enables the one the dashboard shows for the name
+— the newest — never an older, rotated-out key (aliases `disable`, `enable`). The dashboard's
+`paused` is something else: a $0 cap nothing was spent against, which `limit <name> 5` lifts. A key
+already as asked is left alone. Each command: `--dry-run`, a confirm (`--yes`), then one line per key
+— `devtest-alpha: cap $0.10 → $0.20 · spent $0.00 in all`, `on → off` — checked against the keys as
+OpenRouter lists them afterwards (a change it answered OK for but didn't make fails the command);
+`--json` prints `{action, dry_run, keys: [{machine, name, hash, before, after, result, error?,
+note?}], changed, failed}` (`before`/`after`: `{limit, reset, disabled, spent}`; `result`:
+`changed`, `would change`, `unchanged`, `no key`, `failed`). Of several keys under one name (a
+rotation's disabled leftover), a cap change and a resume act on the one shown — the enabled one,
+then the newest — and name the others. With a workspace, each key is read first and one from
+another workspace refused, as for a rename. `OPENROUTER_KEY_LIMIT` stays what `gen` and `rotate`
+mint with.
 
 **Workspaces.** OpenRouter's provisioning ("management") key is the whole account's — in an
 organization, every workspace's. Without `OPENROUTER_WORKSPACE`, keys are listed and created in the
@@ -1729,6 +1754,23 @@ arena9-foo (no pod)`, two at most, then `+N more` — those no listed pod is nam
 caps:` line lists them all and points at `arena keys list`. A key with a $0 cap that has spent
 nothing in its cap's period is **paused**, not at its cap: its cell says `paused` (grey) and the
 warning leaves it out. The credit is the account's (an organization's whole), whatever the workspace.
+
+**Acting on a key from the dashboard.** With a provisioning key set, the action menu (`a`) has the
+pod's key rows: **`ai cap`** (`a`, so `a a` from the list) opens a box prefilled `+` one new key's
+cap (`OPENROUTER_KEY_LIMIT`, else `+5`) that shows what the key spent of its cap and the new cap as
+you type — a cap the CLI would refuse stays in the box, saying why (the dashboard never forces) —
+and Enter runs `arena keys limit <pod> <amount> --yes`; **`ai pause`** / **`ai resume`** (`o`,
+whichever the key needs) a `y` confirm with the key's state now; **`ai rotate`** (`n`, red) runs
+`arena keys rotate <pod> --copy --yes` — the old key stops at once, the new one (cap
+`OPENROUTER_KEY_LIMIT`) is saved in `./keys` where the dashboard was started and copied onto the
+pod. A **marked set** gets `ai cap`, `ai pause` (`o`) and `ai resume` (`O`), one run for those of its
+pods with a key (the confirm names the ones left out). The rows are there whenever a provisioning key
+is configured, so none moves under the cursor; for a pod without a key, or before the keys are read,
+they're grey with why, and refused if picked. They run as CLI children in the runs panel (`p`), so
+the CLI and the dashboard share one path; when one ends the keys are read again at once, and the
+`AI$` cell and the top line show the change within seconds. The at-cap warning says `(a → raise
+cap)` when a listed pod carries the key, and the detail pane's `ai key:` line starts `at its cap (a
+→ raise cap)` or `disabled (a → ai resume)`.
 
 Keys are found by name, so no local hash bookkeeping; a machine that left the list but still has a
 key (or a CSV row) can still be targeted by name. Dry-runs show each key name and whether it exists.
@@ -2651,7 +2693,9 @@ pods whose provider has no stop (Shadeform), and refuses a set of only those, as
 or **add pods** with `n` ([Adding pods](#adding-pods)). The cursor pod's menu also runs four CLI
 commands as they are — `start` (a stopped pod, after a confirm), `rename` (type the new name),
 `jobs` and `logs` (read-only: the newest job's last 100 lines) — as `arena pods …` children, their
-output in the runs panel (below). `run` and `set-branch` pop a
+output in the runs panel (below); with a provisioning key, also the pod's AI key: `ai cap`, `ai
+pause`/`ai resume`, `ai rotate` ([keys](#keys-openrouter): `arena keys …` children too, a marked set's
+cap/pause/resume as one run). `run` and `set-branch` pop a
 text-input modal to type the command / branch; `run` shows each pod's whole output (its last 40
 lines, stderr too when it fails); `test` is read-only. Every mutation goes through a confirmation
 modal — the *only* place the TUI mutates anything. Lifecycle actions (restart/stop/terminate)
