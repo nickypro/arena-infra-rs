@@ -12,6 +12,8 @@ use arena_core::Config;
 use crate::cron::resolve_week_day;
 use crate::pods::pull::{busy_line, local_backup_dir, pull_pods, pull_roots, take_pod_locks, LockMode, PodLocks, PullRun, Pulled, POD_LOCK_WAIT};
 use crate::pods::selection::{say, Selected};
+use arena_core::backups::record::Outcome;
+use arena_core::backups::Job;
 use crate::pods::{exec_each_pod, failure_line, PodCall, BACKUP_TIMEOUT};
 use crate::{confirm, resolve};
 
@@ -93,7 +95,17 @@ pub(crate) async fn handle_backup(
             (name, target, cmd)
         })
         .collect();
+    // The run record (`arena backups`): started now, each pod's outcome as it ended.
+    let run = crate::backups::Run::start(cfg, Job::Git, total + missing.len(), crate::backups::scope_of(sel.named));
     let mut t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}"), |name| locks.done(name)).await;
+    // Its failures besides the pushes: no endpoint, and (review r2 #3) the pods the caller left out
+    // because another backup held their lock — the run isn't OK without them.
+    let unreached: Vec<(String, String)> = missing
+        .iter()
+        .map(|n| (n.clone(), "no SSH endpoint after 10 minutes running".to_string()))
+        .chain(locks.busy.iter().map(|b| (b.clone(), busy_line(b, POD_LOCK_WAIT))))
+        .collect();
+    run.finish(t.record_events(&unreached), t.summary(unreached.len()));
     t.failed.extend(missing);
     println!(
         "\nDone: {} pushed, {} unchanged, {} skipped (main/master), {} failed.",
@@ -190,6 +202,16 @@ pub(crate) async fn handle_full_backup(
     for b in &locks.busy {
         println!("✗ {b}: {}", busy_line(b, POD_LOCK_WAIT));
     }
+    // Left out of both steps (`arena backups`): the git run records them with its own failures;
+    // the copy run, once it has ended (below). With no pod left to back up there's no git run.
+    let left_out = |job: Job| -> Vec<(String, arena_core::backups::record::Event)> {
+        locks.busy.iter().map(|b| (b.clone(), crate::backups::event(job, Outcome::Failed, busy_line(b, POD_LOCK_WAIT)))).collect()
+    };
+    let (copy_left_out, git_left_out) = (left_out(Job::Copy), left_out(Job::Git));
+    if sel.pods.is_empty() && !dry_run {
+        // Every pod left out: the run happened and failed, and says so (review r3 #2).
+        record_all_left_out(cfg, sel.named, no_pull, git_left_out, copy_left_out.clone());
+    }
     let mut unpushed = Vec::new();
     let git_result = if sel.pods.is_empty() {
         Ok(())
@@ -204,6 +226,9 @@ pub(crate) async fn handle_full_backup(
         println!();
         let args = PullRun { label: None, max_size: None, remote_path: None, no_git: false, no_big: false, dry_run, yes: true };
         let pulled = pull_pods(&remote, cfg, &dir, args, &sel, rsync, LockMode::Take(POD_LOCK_WAIT)).await;
+        if !dry_run {
+            crate::backups::note_left_out(cfg, Job::Copy, copy_left_out, sel.named);
+        }
         let settled = busy.settle(&remote, cfg, &pulled, true, message.as_deref()).await;
         print_fallback_copies(&settled.unsettled(&unpushed), &pulled);
         settled.print();
@@ -221,6 +246,19 @@ pub(crate) async fn handle_full_backup(
     print_fallback_copies(&settled.unsettled(&copying), &pulled);
     settled.print();
     both_failures(settled.git(git_result), pulled.and_then(Pulled::result), &locks.busy)
+}
+
+/// Every pod a `pods backup` run took up was left out — another backup held each one's lock for
+/// the whole wait — so nothing was pushed or copied: the run is recorded as what it was, a failed
+/// git run (and copy run, unless `--no-pull`) naming them (review r3 #2: the job's last run stayed
+/// the previous good one).
+pub(crate) fn record_all_left_out(cfg: &Config, named: bool, no_pull: bool, git: Vec<(String, arena_core::backups::record::Event)>, copy: Vec<(String, arena_core::backups::record::Event)>) {
+    let n = git.len();
+    let words = format!("nothing done: {n} left out (another backup held its lock)");
+    crate::backups::Run::start(cfg, Job::Git, n, crate::backups::scope_of(named)).finish(git, words.clone());
+    if !no_pull {
+        crate::backups::Run::start(cfg, Job::Copy, n, crate::backups::scope_of(named)).finish(copy, words);
+    }
 }
 
 /// A pod whose git push failed must never be left with no copy at all: live, the */15 cron runs
@@ -325,6 +363,30 @@ pub(crate) struct BackupTally {
     /// `set-branch --hard` copies before its reset ([`switch_guarded`]). `pods backup` leaves them
     /// as it always has — skipped, not a failure, and not said: the cron's output is unchanged.
     pub uncommitted: Vec<Unpushed>,
+    /// Every pod's outcome, in finishing order, with when it ended — for the run record
+    /// (`arena backups`; review r1 #2: not the fleet's end).
+    pub events: Vec<(String, Outcome, String, u64)>,
+}
+
+impl BackupTally {
+    /// Its events for the run record, plus `failed` pods it never reached (`(pod, why)`: no
+    /// endpoint, its lock busy).
+    pub(crate) fn record_events(&self, failed: &[(String, String)]) -> Vec<(String, arena_core::backups::record::Event)> {
+        let at = |o, d: &str, t| arena_core::backups::record::Event::new(t, Job::Git, o, d);
+        let now = arena_core::snapshot::unix_now();
+        self.events.iter().map(|(p, o, d, t)| (p.clone(), at(*o, d, *t))).chain(failed.iter().map(|(p, why)| (p.clone(), at(Outcome::Failed, why, now)))).collect()
+    }
+
+    /// The run in a few words: `1 pushed, 2 no changes, 41 on main/master, 1 failed`.
+    pub(crate) fn summary(&self, more_failed: usize) -> String {
+        format!(
+            "{} pushed, {} no changes, {} on main/master, {} failed",
+            self.pushed,
+            self.unchanged,
+            self.skipped,
+            self.failed.len() + more_failed
+        )
+    }
 }
 
 /// A pod whose git backup failed this run: why (a few words), the branch it left unpushed (when
@@ -466,14 +528,17 @@ pub(crate) async fn backup_fleet(
             Ok(out) if out.success => match &report.outcome {
                 Some((backup::BACKUP_PUSHED, branch)) => {
                     t.pushed += 1;
+                    t.events.push((name.clone(), Outcome::Pushed, format!("→ {branch}"), arena_core::snapshot::unix_now()));
                     format!("[{done}/{total}] ✓ {name} -> {branch}{also}")
                 }
                 Some((backup::BACKUP_NO_CHANGES, branch)) => {
                     t.unchanged += 1;
+                    t.events.push((name.clone(), Outcome::NoChanges, format!("on {branch}"), arena_core::snapshot::unix_now()));
                     format!("[{done}/{total}] = {name} (no changes, on {branch}){also}")
                 }
                 Some((backup::BACKUP_SKIPPED, branch)) => {
                     t.skipped += 1;
+                    t.events.push((name.clone(), Outcome::NotSaved, format!("on {}", if branch == "HEAD" { "a detached HEAD" } else { branch.as_str() }), arena_core::snapshot::unix_now()));
                     // Said once for all of them after the run (`on_protected_lines`).
                     t.on_protected.push((name.to_string(), branch.clone()));
                     if let Some(why) = report.uncommitted_why() {
@@ -484,6 +549,7 @@ pub(crate) async fn backup_fleet(
                 }
                 _ => {
                     t.pushed += 1;
+                    t.events.push((name.clone(), Outcome::Pushed, String::new(), arena_core::snapshot::unix_now()));
                     format!("[{done}/{total}] ✓ {name} (done){also}")
                 }
             },
@@ -494,12 +560,14 @@ pub(crate) async fn backup_fleet(
                 let why = report.failure_brief(out.code).unwrap_or_else(|| failure_why(&call));
                 let wrong_origin = report.wrong_origin_why(out.code).is_some();
                 let busy = report.in_progress(out.code).map(String::from);
+                t.events.push((name.clone(), Outcome::Failed, why.clone(), arena_core::snapshot::unix_now()));
                 t.unpushed.push(Unpushed { pod: name.clone(), why, branch: report.branch.clone(), at_push: report.failed_at_push(), wrong_origin, busy });
                 format!("[{done}/{total}] ✗ {name}: {}", report.failure(repo, name, out.code).unwrap_or_default())
             }
             _ => {
                 t.failed.push(name.clone());
                 let at_push = report.failed_at_push();
+                t.events.push((name.clone(), Outcome::Failed, failure_why(&call), arena_core::snapshot::unix_now()));
                 t.unpushed.push(Unpushed { pod: name.clone(), why: failure_why(&call), branch: report.branch.clone(), at_push, wrong_origin: false, busy: None });
                 failure_line(done, total, name, &call)
             }

@@ -257,7 +257,8 @@ flowchart LR
    switches it to `main` and creates today's `autocommit-<prefix>-w1d2-<machine>` branch. Until
    then a pod on `main` isn't backed up, and the run says so.
 3. **Backups run themselves.** Every 15 minutes cron runs `pods backup`; its log is
-   `~/.local/state/arena-cron/backup.log`. Each pod gets one line:
+   `~/.local/state/arena-cron/backup.log`, and `arena backups` (the dashboard's `b`) says
+   whether each run is on time and which pods are failing. Each pod gets one line in the log:
 
    | Line | Meaning |
    | --- | --- |
@@ -381,7 +382,9 @@ flowchart TD
 With `cron install --pull`, two copies every 15 minutes: **git** (each pod's day branch on
 GitHub) and **rsync** (each pod's home in `LOCAL_BACKUP_DIR`: a hard-linked snapshot per day
 plus an all-files `big/` mirror). The optional archive VM keeps a second copy of
-`LOCAL_BACKUP_DIR` that outlives the pods.
+`LOCAL_BACKUP_DIR` that outlives the pods. `arena backups` (or `b` in the dashboard) shows
+which of these are set up, when each last ran and how every pod is doing:
+[what gets backed up, where and when](docs/BACKUPS.md#what-gets-backed-up-where-and-when).
 [Everything about backups](docs/BACKUPS.md).
 
 ## Tracking spend

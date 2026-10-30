@@ -26,6 +26,7 @@ use arena_core::PodSpec;
 #[cfg(all(test, unix))]
 mod admin_key_tests;
 mod archive;
+mod backups;
 mod disk;
 mod image;
 mod ask;
@@ -376,7 +377,7 @@ async fn run() -> Result<()> {
     // for), so build the provider lazily — only for commands that actually talk to one.
     let provider = match cli.cmd {
         // The archive builds its own Hetzner client (its own token), and its cron path none.
-        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Update { .. } | Cmd::Gpus { .. } | Cmd::Offers { .. } | Cmd::Api(_) | Cmd::Archive(_) | Cmd::Image(_) => None,
+        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Update { .. } | Cmd::Gpus { .. } | Cmd::Offers { .. } | Cmd::Api(_) | Cmd::Archive(_) | Cmd::Image(_) | Cmd::Backups { .. } => None,
         // Fleet-wide: every command spans all configured providers (create still targets
         // --provider). One configured backend behaves like that single provider.
         _ => Some(arena_core::provider::build_fleet(&cli.provider, &cfg, true)?),
@@ -393,6 +394,7 @@ async fn run() -> Result<()> {
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &cli.config),
         Cmd::Cron(c) => handle_cron(c, &cfg, &cli.config, cli.yes, CRONTAB, std::env::var("HOME").ok().as_deref()).await,
         Cmd::Archive(c) => archive::handle_archive(c, &cfg, remote.as_ref(), cli.yes).await,
+        Cmd::Backups { json } => backups::handle_backups(&cfg, &cli.config, json, arena_core::backups::read_crontab()),
         Cmd::Image(c) => image::handle_image(c, &cfg, remote, cli.yes, Interrupt::ctrl_c()).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
