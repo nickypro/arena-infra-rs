@@ -717,8 +717,12 @@ fn stale(i: &Inputs, pod: &PodIn, mut c: Cell, gap: Option<u64>) -> Cell {
     c
 }
 
-/// A pod's archive cell.
-fn archive_cell(i: &Inputs, pod: &PodIn) -> Cell {
+/// A pod's archive cell: on each tier the archive pushes on a schedule (`gaps`: its longest gap,
+/// by job), whether the pod is there at all and how fresh — missing is unknown, older than twice
+/// the tier's gap (for a cohort pod that's up) late — then a push failing for it, worst (review r2
+/// #2: an old copy read as fine for ever, and either tier's stood in for both). A staff box isn't
+/// archived: off.
+fn archive_cell(i: &Inputs, pod: &PodIn, gaps: &BTreeMap<Job, u64>) -> Cell {
     let (snap, big) = match &i.archive {
         ArchiveIn::None => return Cell::off(),
         ArchiveIn::Unreadable(why) => return Cell::new(Health::Unknown, "?").why(format!("the archive's state can't be read: {why}")),
@@ -734,6 +738,9 @@ fn archive_cell(i: &Inputs, pod: &PodIn) -> Cell {
     let newest = labels.last();
     let big_at = big.pods_ok_at.get(&pod.name).copied();
     let snap_at = newest.map(|(_, r)| r.ok_finished.max(r.last_tried)).filter(|t| *t > 0);
+    if newest.is_none() && big_at.is_none() && !pod.cohort {
+        return Cell::off();
+    }
     let ok_at = match (snap_at, big_at) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -752,9 +759,28 @@ fn archive_cell(i: &Inputs, pod: &PodIn) -> Cell {
     if !failing.is_empty() {
         c.health = Health::Fail;
         c.why = Some(failing.join("; "));
-    } else if newest.is_none() && big_at.is_none() {
-        c.health = Health::Unknown;
-        c.why = Some("not on the archive yet".into());
+        return c;
+    }
+    // Each scheduled tier: there, and fresh.
+    let judged = pod.cohort && pod.up != Some(false);
+    let mut verdicts: Vec<(Health, String)> = Vec::new();
+    for (job, at, tier) in [(Job::ArchiveSnap, snap_at, "snapshots"), (Job::ArchiveBig, big_at, "all files")] {
+        let Some(gap) = gaps.get(&job) else { continue };
+        match at {
+            None => verdicts.push((Health::Unknown, format!("not on the archive's {tier} yet"))),
+            Some(t) if judged && i.now.saturating_sub(t) > late_after(*gap) => verdicts.push((
+                Health::Warn,
+                format!("{tier}: last pushed {} ago (due every {})", disk::age_words(i.now.saturating_sub(t)), disk::age_words(*gap)),
+            )),
+            Some(_) => {}
+        }
+    }
+    if verdicts.is_empty() && newest.is_none() && big_at.is_none() {
+        verdicts.push((Health::Unknown, "not on the archive yet".into()));
+    }
+    if let Some(worst) = verdicts.iter().map(|(h, _)| *h).min() {
+        c.health = worst;
+        c.why = Some(verdicts.iter().map(|(_, w)| w.as_str()).collect::<Vec<_>>().join("; "));
     }
     c
 }
@@ -829,7 +855,7 @@ pub fn judge(i: &Inputs) -> Status {
         .map(|(p, listed)| {
             let git = git_cell(i, &p, gaps.get(&Job::Git).copied());
             let copy = copy_cell(i, &p, gaps.get(&Job::Copy).copied(), copy_set_up);
-            let archive = archive_cell(i, &p);
+            let archive = archive_cell(i, &p, &gaps);
             let cells = [("git", &git), ("home copy", &copy), ("archive", &archive)];
             let worst = cells.iter().filter(|(_, c)| c.health != Health::Off).min_by_key(|(_, c)| c.health);
             let health = worst.map_or(Health::Off, |(_, c)| c.health);

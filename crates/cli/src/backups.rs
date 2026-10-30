@@ -80,6 +80,7 @@ impl Run {
             Scope::Aside(how) => {
                 let events = events.into_iter().map(|(pod, mut e)| {
                     e.detail = if e.detail.is_empty() { format!("not the configured backup ({how})") } else { format!("not the configured backup ({how}): {}", e.detail) };
+                    e.aside = true;
                     (pod, e)
                 });
                 write(p, |r| r.add_history(events.collect()));
@@ -96,6 +97,21 @@ pub(crate) fn note_pods(cfg: &Config, events: Vec<(String, Event)>) {
     }
     if let Some(Ok(p)) = record_path(cfg) {
         write(&p, |r| r.add_events(events));
+    }
+}
+
+/// Pods a run of `job` left out because another backup held their lock: their results — and, for
+/// a fleet-wide run (`named` false), the run's failures too ([`record::Record::amend`]).
+pub(crate) fn note_left_out(cfg: &Config, job: Job, events: Vec<(String, Event)>, named: bool) {
+    if events.is_empty() {
+        return;
+    }
+    if let Some(Ok(p)) = record_path(cfg) {
+        if named {
+            write(&p, |r| r.add_events(events));
+        } else {
+            write(&p, |r| r.amend(job, std::process::id(), events));
+        }
     }
 }
 
@@ -261,6 +277,12 @@ mod tests {
         let rec = load();
         assert!(rec.runs.is_empty() && rec.pods["devtest-apple"].copy.is_none());
         assert!(rec.pods["devtest-apple"].history[0].detail.starts_with("not the configured backup (--no-big)"));
+        // A size cap other than the configured one keeps other files: aside too (review r2 #1).
+        let (r2, c2, s2) = (remote.clone(), cfg.clone(), rsync.clone());
+        crate::pods::pull::handle_pull(&r2, &c2, None, &backups_dir, Some("1M".into()), None, false, false, &all, false, true, &s2).await.unwrap();
+        let rec = load();
+        assert!(rec.runs.is_empty() && rec.pods["devtest-apple"].copy.is_none());
+        assert!(rec.pods["devtest-apple"].history[0].aside && rec.pods["devtest-apple"].history[0].detail.starts_with("not the configured backup (--max-size 1M)"));
         // Named: the pod's copy, not the job's run.
         pull(backups_dir.clone(), false, Selected { pods: all.pods.clone(), named: true }).await;
         let rec = load();
@@ -269,6 +291,28 @@ mod tests {
         // The configured backup, fleet-wide: the job's run too.
         pull(backups_dir, false, all).await;
         assert_eq!(load().runs[&Job::Copy].summary.split(" (").next(), Some("1 copied, 0 failed"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A pod another backup held the lock of is a failure of the fleet's git run, as the run's
+    /// exit is (review r2 #3): never an OK run beside a pod that wasn't backed up.
+    #[tokio::test]
+    async fn a_pod_left_out_for_its_lock_fails_the_recorded_run() {
+        let base = std::env::temp_dir().join(format!("arena-cli-backups-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom)\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nARENA_STATE_DIR={}\n",
+            base.join("state").display()
+        ));
+        let fake = Arc::new(FakeRemote::new());
+        fake.script("10.0.0.1:22001", [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n")]);
+        let mut locks = crate::PodLocks { busy: vec!["devtest-bloom".into()], ..Default::default() };
+        let sel = Selected::all(vec![pod("apple", 22001)]);
+        crate::handle_backup(fake, &cfg, true, None, &sel, &mut locks, &mut Vec::new()).await.unwrap();
+        let rec = Record::load(&base.join("state/devtest/backups.json")).unwrap().unwrap();
+        let run = &rec.runs[&Job::Git];
+        assert_eq!((run.ok, run.failed.as_slice(), run.summary.as_str()), (false, &["devtest-bloom".to_string()][..], "1 pushed, 0 no changes, 0 on main/master, 1 failed"));
+        assert!(rec.pods["devtest-bloom"].git.as_ref().is_some_and(|e| e.outcome == Outcome::Failed && e.detail.starts_with("busy: another backup of devtest-bloom")));
         let _ = std::fs::remove_dir_all(&base);
     }
 

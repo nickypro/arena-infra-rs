@@ -98,8 +98,14 @@ pub(crate) async fn handle_backup(
     // The run record (`arena backups`): started now, each pod's outcome as it ended.
     let run = crate::backups::Run::start(cfg, Job::Git, total + missing.len(), crate::backups::scope_of(sel.named));
     let mut t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}"), |name| locks.done(name)).await;
-    let unreached: Vec<(String, String)> = missing.iter().map(|n| (n.clone(), "no SSH endpoint after 10 minutes running".to_string())).collect();
-    run.finish(t.record_events(&unreached), t.summary(missing.len()));
+    // Its failures besides the pushes: no endpoint, and (review r2 #3) the pods the caller left out
+    // because another backup held their lock — the run isn't OK without them.
+    let unreached: Vec<(String, String)> = missing
+        .iter()
+        .map(|n| (n.clone(), "no SSH endpoint after 10 minutes running".to_string()))
+        .chain(locks.busy.iter().map(|b| (b.clone(), busy_line(b, POD_LOCK_WAIT))))
+        .collect();
+    run.finish(t.record_events(&unreached), t.summary(unreached.len()));
     t.failed.extend(missing);
     println!(
         "\nDone: {} pushed, {} unchanged, {} skipped (main/master), {} failed.",
@@ -196,19 +202,15 @@ pub(crate) async fn handle_full_backup(
     for b in &locks.busy {
         println!("✗ {b}: {}", busy_line(b, POD_LOCK_WAIT));
     }
-    // Left out of both steps: recorded so for each (`arena backups`).
-    crate::backups::note_pods(
-        cfg,
-        locks
-            .busy
-            .iter()
-            .flat_map(|b| {
-                let why = busy_line(b, POD_LOCK_WAIT);
-                let copy = (!no_pull).then(|| (b.clone(), crate::backups::event(Job::Copy, Outcome::Failed, why.clone())));
-                std::iter::once((b.clone(), crate::backups::event(Job::Git, Outcome::Failed, why))).chain(copy)
-            })
-            .collect(),
-    );
+    // Left out of both steps (`arena backups`): the git run records them with its own failures;
+    // the copy run, once it has ended (below). With no pod left to back up there's no git run.
+    let left_out = |job: Job| -> Vec<(String, arena_core::backups::record::Event)> {
+        locks.busy.iter().map(|b| (b.clone(), crate::backups::event(job, Outcome::Failed, busy_line(b, POD_LOCK_WAIT)))).collect()
+    };
+    let (copy_left_out, git_left_out) = (left_out(Job::Copy), left_out(Job::Git));
+    if sel.pods.is_empty() && !dry_run {
+        crate::backups::note_pods(cfg, git_left_out);
+    }
     let mut unpushed = Vec::new();
     let git_result = if sel.pods.is_empty() {
         Ok(())
@@ -223,6 +225,9 @@ pub(crate) async fn handle_full_backup(
         println!();
         let args = PullRun { label: None, max_size: None, remote_path: None, no_git: false, no_big: false, dry_run, yes: true };
         let pulled = pull_pods(&remote, cfg, &dir, args, &sel, rsync, LockMode::Take(POD_LOCK_WAIT)).await;
+        if !dry_run {
+            crate::backups::note_left_out(cfg, Job::Copy, copy_left_out, sel.named);
+        }
         let settled = busy.settle(&remote, cfg, &pulled, true, message.as_deref()).await;
         print_fallback_copies(&settled.unsettled(&unpushed), &pulled);
         settled.print();

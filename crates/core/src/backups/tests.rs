@@ -270,10 +270,10 @@ fn each_pods_backups_are_judged_failing_first_then_oldest() {
     r.pods.get_mut("devtest-bravo").unwrap().copy_ok = Some(NOW - 24 * HOUR);
     let mut snap = SnapState::default();
     snap.labels.insert("w3d4".into(), LabelRecord { ok_finished: NOW - 20 * HOUR, pods_ok: ["devtest-alpha".to_string(), "devtest-echo".to_string()].into(), ..LabelRecord::default() });
-    snap.labels.insert("w3d5".into(), LabelRecord { last_tried: NOW - HOUR, pods_ok: ["devtest-alpha".to_string()].into(), ..LabelRecord::default() });
+    snap.labels.insert("w3d5".into(), LabelRecord { last_tried: NOW - 10 * MIN, pods_ok: ["devtest-alpha".to_string()].into(), ..LabelRecord::default() });
     snap.pods_failing.insert("devtest-echo".into(), "w3d5: NoSpace: no space left on device".into());
     let mut big = BigState::default();
-    big.pods_ok_at.insert("devtest-alpha".into(), NOW - 2 * HOUR);
+    big.pods_ok_at.insert("devtest-alpha".into(), NOW - 30 * MIN);
     let host = ArchiveHost {
         version: 1,
         prefix: "devtest".into(),
@@ -316,13 +316,31 @@ fn each_pods_backups_are_judged_failing_first_then_oldest() {
         ("echo", Health::Fail, "✓ no changes 10m", "✓ copied 10m", "✗ w3d4 20h", Some("archive: snapshots: w3d5: NoSpace: no space left on device")),
         ("delta", Health::Warn, "⚠ pushed 5h", "⚠ copied 5h", "? - ", Some("git: not backed up for 5 h (due every 15 min)")),
         ("charlie", Health::Unknown, "? commit 2h", "✓ w3d5 15m", "? - ", Some("git: no git backup recorded for it yet")),
-        ("foxtrot", Health::Unknown, "✓ pushed 5h", "✓ copied 5h", "? - ", Some("archive: not on the archive yet")),
-        ("alpha", Health::Ok, "✓ pushed 10m", "✓ 1.8 GB · w3d5 10m", "✓ w3d5 + all files 2h", None),
+        ("foxtrot", Health::Unknown, "✓ pushed 5h", "✓ copied 5h", "? - ", Some("archive: not on the archive's snapshots yet; not on the archive's all files yet")),
+        ("alpha", Health::Ok, "✓ pushed 10m", "✓ 1.8 GB · w3d5 10m", "✓ w3d5 + all files 30m", None),
     ]
     .into_iter()
     .map(|(n, h, g, c, a, w)| (n.to_string(), h, g.to_string(), c.to_string(), a.trim_end().to_string(), w.map(String::from)))
     .collect();
     assert_eq!(rows, want);
+    // The archive judged per tier: echo's snapshot (w3d4, 20 h) is late besides failing, and has no
+    // all-files copy — a failure says the push's reason first.
+    assert_eq!(pod_of(&s, "echo").archive.why.as_deref(), Some("snapshots: w3d5: NoSpace: no space left on device"));
+    // An old copy on the archive is late, not fine for ever (review r2 #2); a staff box isn't
+    // archived at all.
+    let mut i2 = i.clone();
+    if let ArchiveIn::Up { snap, big, .. } = &mut i2.archive {
+        let snap = snap.as_mut().unwrap();
+        snap.pods_failing.clear();
+        big.as_mut().unwrap().pods_ok_at.insert("devtest-echo".into(), NOW - 30 * MIN);
+    }
+    i2.pods.push(PodIn { cohort: false, ..pod("golf") });
+    let s2 = judge(&i2);
+    assert_eq!(
+        (pod_of(&s2, "echo").archive.health, pod_of(&s2, "echo").archive.why.as_deref()),
+        (Health::Warn, Some("snapshots: last pushed 20 h ago (due every 15 min)"))
+    );
+    assert_eq!(pod_of(&s2, "golf").archive.health, Health::Off);
     // A staff box isn't the cron's: never late.
     let mut d = PodRecord::default();
     d.add(ev(NOW - 5 * HOUR, Job::Git, Outcome::Pushed, ""));
@@ -478,6 +496,13 @@ fn the_record_folds_runs_and_reads_back() {
     assert_eq!(late.history.iter().map(|e| e.detail.as_str()).collect::<Vec<_>>(), ["x", "older", "aside", "oldest"]);
     assert_eq!((late.copy.as_ref().map(|e| e.at), late.copy_ok), (Some(NOW), Some(NOW - 50)));
 
+    // A copy aside never folds into the configured backup's runs, nor they into it (review r2 #4).
+    let mut a = PodRecord::default();
+    a.add(ev(NOW - 30, Job::Copy, Outcome::Copied, "w3d5"));
+    a.add_history(Event { aside: true, ..ev(NOW - 20, Job::Copy, Outcome::Copied, "not the configured backup (into /tmp/x)") });
+    a.add(ev(NOW - 10, Job::Copy, Outcome::Copied, "w3d5"));
+    assert_eq!(a.history.iter().map(|e| (e.times, e.aside)).collect::<Vec<_>>(), [(1, false), (1, true), (1, false)]);
+
     let mut r = Record::default();
     r.start(Job::Copy, 11, 2, NOW - 100);
     assert_eq!(r.running, [Running { job: Job::Copy, pid: 11, started: NOW - 100, pods: 2 }]);
@@ -496,6 +521,15 @@ fn the_record_folds_runs_and_reads_back() {
     r.start(Job::Git, 12, 1, NOW);
     r.prune_running(|pid| pid != 12);
     assert!(r.running.is_empty());
+    // Pods the run left out (their lock busy) are its failures too (review r2 #3) — this run's
+    // only (another pid's run is left alone).
+    r.amend(Job::Copy, 11, vec![("devtest-c".into(), ev(NOW, Job::Copy, Outcome::Failed, "busy"))]);
+    let run = &r.runs[&Job::Copy];
+    assert_eq!((run.ok, run.pods, run.failed.clone()), (false, 3, vec!["devtest-b".to_string(), "devtest-c".to_string()]));
+    assert_eq!(run.summary, "1 ok, 1 failed; 1 left out (another backup held its lock)");
+    assert_eq!(r.pods["devtest-c"].copy.as_ref().map(|e| e.outcome), Some(Outcome::Failed));
+    r.amend(Job::Copy, 99, vec![("devtest-d".into(), ev(NOW, Job::Copy, Outcome::Failed, "busy"))]);
+    assert_eq!(r.runs[&Job::Copy].pods, 3);
 
     // Its file: written and read back (job names as keys), and refused when it isn't one.
     let dir = Tmp::new("record");

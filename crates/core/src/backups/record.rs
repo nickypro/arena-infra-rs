@@ -85,6 +85,10 @@ pub struct Event {
     /// Folded: how many (`1` when single).
     #[serde(default = "one")]
     pub times: u32,
+    /// Not the configured backup (a copy into another `--dir`, `--no-big`, …): in the history
+    /// alone ([`PodRecord::add_history`]), and never folded with the configured backup's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub aside: bool,
 }
 
 fn one() -> u32 {
@@ -93,7 +97,7 @@ fn one() -> u32 {
 
 impl Event {
     pub fn new(at: u64, job: Job, outcome: Outcome, detail: impl Into<String>) -> Event {
-        Event { at, job, outcome, detail: detail.into(), bytes: None, since: None, times: 1 }
+        Event { at, job, outcome, detail: detail.into(), bytes: None, since: None, times: 1, aside: false }
     }
 
     pub fn with_bytes(mut self, bytes: Option<u64>) -> Event {
@@ -104,7 +108,10 @@ impl Event {
     /// Whether `next` continues this one's run in the history: the same job and result, and for a
     /// failure the same reason (a new reason is news).
     fn folds(&self, next: &Event) -> bool {
-        self.job == next.job && self.outcome == next.outcome && (next.outcome != Outcome::Failed || self.detail == next.detail)
+        self.job == next.job
+            && self.outcome == next.outcome
+            && self.aside == next.aside
+            && (next.outcome != Outcome::Failed || self.detail == next.detail)
     }
 }
 
@@ -263,6 +270,26 @@ impl Record {
     pub fn add_events(&mut self, events: Vec<(String, Event)>) {
         for (pod, e) in events {
             self.pods.entry(pod).or_default().add(e);
+        }
+    }
+
+    /// Pods a finished fleet run of `job` (pid `pid`'s) left out — another backup held their lock
+    /// for the whole wait: their results, and the run's failures, its count and its words (review
+    /// r2 #3: the run read OK while a pod it skipped failed). Pure.
+    pub fn amend(&mut self, job: Job, pid: u32, events: Vec<(String, Event)>) {
+        let mut left: Vec<String> = events.iter().filter(|(_, e)| e.outcome == Outcome::Failed).map(|(p, _)| p.clone()).collect();
+        left.sort();
+        left.dedup();
+        self.add_events(events);
+        if let Some(run) = self.runs.get_mut(&job).filter(|r| r.pid == pid) {
+            let new: Vec<String> = left.into_iter().filter(|p| !run.failed.contains(p)).collect();
+            if !new.is_empty() {
+                run.pods += new.len() as u32;
+                run.summary = format!("{}; {} left out (another backup held its lock)", run.summary, new.len());
+                run.failed.extend(new);
+                run.failed.sort();
+                run.ok = false;
+            }
         }
     }
 

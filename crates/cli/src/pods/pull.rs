@@ -310,8 +310,13 @@ pub(crate) async fn pull_pods(
         Some("--no-git".to_string())
     } else if let Some(l) = &label {
         Some(format!("label {l}"))
+    } else if let Some(r) = &remote_path {
+        Some(format!("--remote-path {r}"))
     } else {
-        remote_path.as_ref().map(|r| format!("--remote-path {r}"))
+        // A size cap other than the configured one keeps another set of files in the snapshot
+        // (review r2 #1).
+        let configured = cfg.get("BACKUP_MAX_SIZE").filter(|s| !s.is_empty()).unwrap_or("50M");
+        max_size.as_ref().filter(|m| m.as_str() != configured).map(|m| format!("--max-size {m}"))
     };
 
     // Read (and validate) the budget first: a bad value fails before anything is asked or copied.
