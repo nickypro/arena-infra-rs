@@ -19,7 +19,8 @@ use serde_json::{json, Value};
 
 use super::{ArchiveNames, Tier, IMAGE, LABEL_KEY};
 use crate::error::{Error, Result};
-use crate::http::{send_json, send_ok};
+// Hetzner's own reading of its errors (a project limit is a quota, not a bad token).
+use crate::provider::hetzner::{send_json, send_ok};
 
 /// Resource labels (Hetzner's are string → string).
 pub type Labels = BTreeMap<String, String>;

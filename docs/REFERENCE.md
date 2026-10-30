@@ -362,8 +362,9 @@ Vast) is refused and the deep check won't derive a driver floor from it — neve
 v1 creates also send `supportPublicIp: true` (some community hosts have no public IP, leaving only
 RunPod's SSH proxy). **v2 has no such field** (its OpenAPI `CreatePodRequest`, checked 2026-10-11,
 offers no public-IP option, and its schema refuses unknown keys), so a v2 COMMUNITY pod can land on
-a proxy-only host (live: two 4090s did): `up` calls it a host failure after the 5-minute grace —
-`FAILED endpoint`, or replaced under `--check`; SECURE pods have a public IP.
+a proxy-only host (live: two 4090s did, and a 3070 on 2026-10-30): `up` calls it a host failure
+after `--endpoint-timeout` (5 minutes) and replaces it, with or without `--check`; SECURE pods
+usually have a public IP.
 
 Neither API reports a pod's CUDA constraint, so `replace`/`migrate copy` re-apply the configured one
 to the replacement (as `create` does).
@@ -470,6 +471,12 @@ the next one with the same name.
   recommended ones. A location that can't be timed goes after the timed ones, by price.
 - No room anywhere is a capacity error that names each location tried, so `--keep-trying` waits.
 - Any other refusal (token, quota, throttle, SSH key) stops at once.
+- The project's own limit — Hetzner's 403 `resource_limit_exceeded`, e.g. `shared core limit
+  exceeded` — reads as that, not as a bad token: `Hetzner refused: the project's resource limit is
+  reached (…) — use a smaller type, free a server, or ask Hetzner to raise the limit`. `create`/`up`
+  keep what they made and stop there (the names after it would hit the same limit); it isn't waited
+  out (`--keep-trying` waits on capacity only); with several `--gpu`/`--cloud` options only that
+  option is skipped.
 - One location (`nbg1`) pins creates there, with no lookup. A list (`nbg1,fsn1`) is tried in its
   order, and `nbg1,any` tries nbg1, then the rest.
 - An `--api-json` `datacenter` is one create where it says.
@@ -1139,18 +1146,55 @@ command just fails. **Changed:** `offers --all --json` was `{"runpod": [rows as 
 `pods up -n N` — one-command spin-up: create, then **one independent pipeline per pod** (never a
 batch), each started **the moment its create returns** — while placement may still be retrying for
 other names under `--retry-mins` (placed pods used to sit idle, billing, until the window ended):
-wait for *its* SSH endpoint and sshd answering (`--timeout`, default 600s, per pod; a pod up for 5
-minutes with only RunPod's SSH proxy — a host with no public IP — is a host failure: `FAILED
-endpoint`, or replaced under `--check`; so is one still up behind the proxy only when a shorter
-`--timeout` ends, and a listing that momentarily lacks the pod doesn't restart those 5 minutes; on
-Shadeform a pod listed `error`, or not up within `SHADEFORM_READY_MINS` or `--timeout` (whichever
-comes first), is a failed placement — deleted at once and the name tried on the next option, with or
-without `--check`, within `--check-attempts` placements) → sync the proxy (one writer at a time) →
+wait for *its* SSH endpoint and sshd answering (`--timeout`, default 600s, per pod) → sync the
+proxy (one writer at a time) →
 provision it (`--no-setup` skips) → [`--check`: deep check] → copy its API keys (when
 `keys/*_api_keys.csv` exist) → `[name] READY after 4m10s — …` or `[name] FAILED <stage>: …`, printed
 the moment that pod is done — a slow pod never holds up another.
 
 One fleet listing per `--interval` serves every pod's endpoint wait.
+
+**A pod up without an SSH endpoint is replaced, not left billing** (ops feedback 2026-10-29: a
+RUNNING 4090 with no public IP or ports stayed `FAILED endpoint: no SSH endpoint after 600s — left
+running` until someone terminated it and ran `up` again, READY in a minute). Up without an endpoint for
+`--endpoint-timeout` minutes (default 5, config `ENDPOINT_TIMEOUT_MINS`, 1..120) is a host
+failure, with or without `--check`, within `--check-attempts` placements per name (default 2;
+the flag works without `--check`): `up` says where it was (the machine and data centre its
+provider names), terminates it (and waits until it's gone) and recreates the name with the same
+options, the ones that haven't failed first; the last one is terminated too, and the name FAILs at
+`endpoint` saying nothing of it is left billing.
+- On RunPod "up" means its container is running but reachable through RunPod's SSH proxy only — a
+  host with no public IP (`no public endpoint (RunPod ssh proxy only)` in `pods list`). RunPod
+  lists a pod `RUNNING` from its create, while its image is still being pulled (live 2026-10-30:
+  6½ minutes with no container — `publicIp: ""`, `portMappings: null` on v1 — then proxy-only), so
+  the clock doesn't start at the create: a slow pull is no host failure. Elsewhere "up" is a pod
+  listed running without an IP/port (Hetzner `running`, Vast `running`, Shadeform `active`).
+- It always gets a whole `--endpoint-timeout` without an endpoint before it's judged — past
+  `--timeout` if its container came up late (a slow pull onto a host with no public IP is still
+  replaced, not left running at `--timeout`).
+- Nothing is terminated on an old look: before replacing, `up` asks the pod's own backend again.
+  An endpoint after all goes on with the pipeline; a pod that isn't up any more (restarting), or
+  can't be read just then, is waited for again, its clock started over by the listings after
+  that look, to the same `--timeout`.
+- **A RunPod pod with no container when `--timeout` ends** — a `--timeout` of 10 minutes or more,
+  as the default 600 s — never started its image, prod's case above: a failed placement, terminated
+  and its name recreated the same way (`[lightning] still listed RUNNING with no container 10m00s
+  after its create (its image never started) — before it came up: a failed placement`). RunPod
+  can't tell a pull that will never finish from a slow one; healthy pulls took 1½–7 minutes live.
+  With a `--timeout` under 10 minutes such a pod is left running instead, as below.
+- Anything else still coming up when `--timeout` ends (Vast `loading`, Hetzner `initializing`, a
+  RunPod pod under a short `--timeout`, a pod whose state can't be read just then) is left running
+  as before, and the reason says so: `no SSH endpoint after 300s, still listed RUNNING (no
+  container yet — its image may still be pulling) — left running, still billing ($0.69/h): `arena
+  proxy apply` once it has an endpoint, or `arena pods terminate lightning``. An endpoint that
+  came with the deadline goes on with the pipeline.
+
+A listing that momentarily lacks the pod, or a RunPod endpoint lookup that failed, doesn't restart
+the clock; a listing that shows it not up (a restart) does. A pod `up` didn't create in this run is
+never terminated; Ctrl+C terminates nothing. On
+Shadeform a pod listed `error`, or not up within `SHADEFORM_READY_MINS` or `--timeout` (whichever
+comes first), is a failed placement the same way — deleted at once and the name tried on the next
+option.
 
 Ends with the usual one-line proxy sync and a `NAME GPU $/H PROXY PORT HEALTH STATUS READY AFTER`
 table (READY AFTER = first create → confirmed ready, replacements included: start participants'
