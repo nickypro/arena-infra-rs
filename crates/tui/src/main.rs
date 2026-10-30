@@ -3599,10 +3599,15 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         fact("status:", status),
         fact("gpu:", or_dim(fit(gpu), plain)),
         fact("endpoint:", endpoint),
-        // One row, as every fact (the block has a fixed height): the RTT cut, in its colour.
+        // One row, as every fact (the block has a fixed height): the whole value cut to it (a
+        // long place too — review ai-review codex r2), the RTT in its colour.
         fact("where:", {
-            let room = (inner.width as usize).saturating_sub(10).max(8).saturating_sub(place.chars().count() + 5);
-            vec![Span::raw(place.clone()), Span::raw("  ·  "), Span::styled(truncate(&rtt, room.max(1)), tone_style(rtt_tone))]
+            let line = fit(format!("{place}  ·  {rtt}"));
+            let cut = place.chars().count() + 5;
+            match line.char_indices().nth(cut) {
+                Some((at, _)) => vec![Span::raw(line[..at].to_string()), Span::styled(line[at..].to_string(), tone_style(rtt_tone))],
+                None => vec![Span::raw(line)],
+            }
         }),
         fact("proxy:", proxy),
         fact("cost:", or_dim(cost, plain)),
@@ -5164,6 +5169,13 @@ deep_check_end=1
         ui.selected = shared.pods.iter().position(|p| p.name.ends_with("charlie")).unwrap();
         let pane = draw(160, 40, &shared, &ui).join("\n");
         assert!(pane.contains("where:    -  ·  rtt -"), "{pane}");
+        // A place too long for the pane is cut with the rest: one row (review ai-review codex r2).
+        ui.selected = idx;
+        shared.pods[idx].location = Some("United States, California, San Francisco, Mission District".into());
+        let lines = draw(120, 40, &shared, &ui);
+        let at = lines.iter().position(|l| l.contains("where:")).unwrap();
+        assert!(lines[at].contains("United States, California") && lines[at].contains('…'), "{}", lines[at]);
+        assert!(lines[at + 1].contains("proxy:"), "the next fact on the next row:\n{}", lines.join("\n"));
     }
 
     /// The human (2026-10-29, prod's dashboard): "why does it say 1 ai key at cap?" — every AI$

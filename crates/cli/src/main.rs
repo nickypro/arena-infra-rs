@@ -22966,6 +22966,59 @@ mod placement_cli_tests {
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(150), "stopped at the press, not at the next round");
     }
 
+    /// The link the test above stands in for: a real SIGINT — what the dashboard's `[s]` sends
+    /// the run's process group (`kill -INT -- -pgid`) — presses [`Interrupt::ctrl_c`] once a
+    /// retry wait is listening, and the process goes on (it isn't killed by it). In a child
+    /// process (this test binary again, running only [`interrupt_child`]), so no other test's
+    /// latch can see the signal (review ai-review codex r2: Ctrl+C's path unverified).
+    #[test]
+    fn a_real_sigint_presses_the_retry_waits_ctrl_c() {
+        use std::io::{BufRead, BufReader};
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "placement_cli_tests::interrupt_child", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("ARENA_INTERRUPT_CHILD", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut out = BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut seen = Vec::new();
+        for line in out.by_ref() {
+            let line = line.unwrap();
+            seen.push(line.clone());
+            // (libtest's `test … ... ` has no newline: the line may start with it.)
+            if line.ends_with("interrupt-child: listening") {
+                break;
+            }
+        }
+        assert!(seen.last().is_some_and(|l| l.ends_with("interrupt-child: listening")), "{seen:?}");
+        let sent = std::process::Command::new("kill").args(["-INT", &child.id().to_string()]).status().unwrap();
+        assert!(sent.success());
+        seen.extend(out.map_while(Result::ok));
+        let status = child.wait().unwrap();
+        assert!(seen.iter().any(|l| l == "interrupt-child: pressed"), "{seen:?}");
+        assert!(status.success(), "the SIGINT was taken, not left to end the process: {status:?} {seen:?}");
+    }
+
+    /// Not a test on its own: [`a_real_sigint_presses_the_retry_waits_ctrl_c`]'s child. Listens
+    /// as a retry wait does, says so, and reports the press (or gives up after 20 s).
+    #[tokio::test]
+    #[ignore = "a child process of a_real_sigint_presses_the_retry_waits_ctrl_c"]
+    async fn interrupt_child() {
+        if std::env::var("ARENA_INTERRUPT_CHILD").is_err() {
+            return;
+        }
+        let ctrl_c = Interrupt::ctrl_c();
+        let pressed = ctrl_c.wait(); // arms: the SIGINT listener is registered here
+        println!("interrupt-child: listening");
+        match tokio::time::timeout(std::time::Duration::from_secs(20), pressed).await {
+            Ok(()) => println!("interrupt-child: pressed"),
+            Err(_) => println!("interrupt-child: timed out"),
+        }
+        assert!(ctrl_c.is_set());
+    }
+
     /// RunPod with every create dry until `wet_at`, next to a Vast that's throttled for the
     /// next `vast_throttled` listings (a 429, retryable) — or, `vast_refused`, rejects its key.
     struct Flaky {
