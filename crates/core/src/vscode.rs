@@ -502,8 +502,15 @@ done
             }
 
             /// The machine's RAM as the script reads it: `MemTotal` (kB) in a stand-in
-            /// /proc/meminfo, and a stand-in /sys/fs/cgroup with these files (name, contents).
+            /// /proc/meminfo, and a stand-in /sys/fs/cgroup with these files (name, contents),
+            /// the process in the namespace's top cgroup (`0::/`).
             fn ram(&self, mem_total_kb: u64, cgroup: &[(&str, &str)]) {
+                self.ram_in(mem_total_kb, "0::/\n", cgroup);
+            }
+
+            /// [`Self::ram`] with `proc_cgroup` as /proc/self/cgroup.
+            fn ram_in(&self, mem_total_kb: u64, proc_cgroup: &str, cgroup: &[(&str, &str)]) {
+                std::fs::write(self.root.join("proc-cgroup"), proc_cgroup).unwrap();
                 std::fs::write(self.root.join("meminfo"), format!("MemTotal:       {mem_total_kb} kB\nMemFree: 1 kB\n")).unwrap();
                 let _ = std::fs::remove_dir_all(self.root.join("cgroup"));
                 for (name, body) in cgroup {
@@ -531,7 +538,8 @@ done
                     .env("STUB", &self.root)
                     .env("STUB_ARCH", uname_m)
                     .env("ARENA_MEMINFO", self.root.join("meminfo"))
-                    .env("ARENA_CGROUP", self.root.join("cgroup"));
+                    .env("ARENA_CGROUP", self.root.join("cgroup"))
+                    .env("ARENA_PROC_CGROUP", self.root.join("proc-cgroup"));
                 for (k, v) in env {
                     c.env(k, v);
                 }
@@ -849,6 +857,23 @@ done
                 assert!(out.contains(said), "{label}: {out}");
                 assert_eq!(read(), if *on { with_py.clone() } else { only_py.clone() }, "{label}: {out}");
             }
+            // A container sharing the host's cgroup namespace sees its limit at its own path, and
+            // a limit on any cgroup above it holds too (review r1).
+            type Nested<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)], bool);
+            let nested: &[Nested] = &[
+                ("v2, its own", "0::/docker/abc\n", &[("docker/abc/memory.max", "8589934592\n"), ("docker/memory.max", "max\n")], true),
+                ("v2, a parent's", "0::/kubepods/pod1/ctr\n", &[("kubepods/pod1/ctr/memory.max", "max\n"), ("kubepods/pod1/memory.max", "8589934592\n")], true),
+                ("v1, its own", "12:pids:/docker/abc\n9:memory:/docker/abc\n0::/\n", &[("memory/docker/abc/memory.limit_in_bytes", "8589934592\n")], true),
+                ("v1, combined controllers", "4:cpu,memory:/x\n", &[("memory/x/memory.limit_in_bytes", "8589934592\n")], true),
+                ("a VM's login session", "0::/user.slice/user-0.slice/session-3.scope\n", &[("user.slice/memory.max", "max\n")], false),
+                ("a path with no files", "0::/gone/away\n", &[], false),
+            ];
+            for (label, proc, cgroup, on) in nested {
+                let _ = std::fs::remove_file(&file);
+                pod.ram_in(512 * GIB, proc, cgroup);
+                let out = ok(&pod.run_low("x86_64", &pod.setup(), below, &[]));
+                assert_eq!(read(), if *on { with_py.clone() } else { only_py.clone() }, "{label}: {out}");
+            }
             pod.ram(8_000_000, &[]);
             let out = ok(&pod.run_low("x86_64", &pod.setup(), below, &[]));
             assert!(out.contains("memory-saving settings: on (7.6 GiB of RAM, under 20)"), "{out}");
@@ -912,6 +937,57 @@ done
             pod.assert_clean();
             let strays: Vec<_> = std::fs::read_dir(real.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
             assert_eq!(strays.len(), 1, "no temp file left beside it: {strays:?}");
+        }
+
+        /// Review r1: VS Code ends a `//` comment at a CR too. A setting after a CR-only line
+        /// break is the participant's, and stays theirs (it was missed, and ours appended after it,
+        /// which VS Code would have taken).
+        #[test]
+        fn a_comment_ends_at_a_carriage_return_as_in_vs_code() {
+            let Some(pod) = Pod::new("cr-comment") else { return };
+            pod.publish("x64", |j| j);
+            let file = pod.vs().join("data/Machine/settings.json");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            let theirs = "{// mine\r\"python.analysis.indexing\": true,\n\"editor.fontSize\": 12}";
+            std::fs::write(&file, theirs).unwrap();
+            ok(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[]));
+            let after = pod.settings();
+            assert!(only_added_to(theirs, &after), "{after}");
+            assert_eq!(after.matches("python.analysis.indexing").count(), 1, "{after}");
+            let as_json = after.replace("// mine\r", "");
+            let v: serde_json::Value = serde_json::from_str(&as_json).unwrap_or_else(|e| panic!("{e}: {as_json}"));
+            assert_eq!(v["python.analysis.indexing"], true, "{after}");
+            assert_eq!(v["python.analysis.diagnosticMode"], "openFilesOnly", "{after}");
+        }
+
+        /// Review r1: VS Code saving a participant's change while setup merges. What it saved
+        /// stays — the merge is swapped into place in one step, and whatever came out of it that
+        /// isn't what was read goes straight back — and the run says so.
+        #[test]
+        fn a_save_while_merging_is_never_lost() {
+            let Some(pod) = Pod::new("race") else { return };
+            pod.publish("x64", |j| j);
+            let file = pod.vs().join("data/Machine/settings.json");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            let saved = pod.root.join("their-save.json");
+            std::fs::write(&saved, "{\n    \"workbench.colorTheme\": \"Solarized Light\"\n}\n").unwrap();
+            let race = [("ARENA_SETTINGS_RACE", saved.to_str().unwrap())];
+            // A file that was there…
+            std::fs::write(&file, "{\"editor.fontSize\": 12}").unwrap();
+            let why = warned(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &race));
+            assert!(why.contains("changed while arena merged its settings (re-run setup) - left alone"), "{why}");
+            assert_eq!(pod.settings(), std::fs::read_to_string(&saved).unwrap());
+            // …and one that appeared meanwhile.
+            std::fs::remove_file(&file).unwrap();
+            let why = warned(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &race));
+            assert!(why.contains("changed while arena merged its settings"), "{why}");
+            assert_eq!(pod.settings(), std::fs::read_to_string(&saved).unwrap());
+            let left: Vec<_> = std::fs::read_dir(file.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
+            assert_eq!(left, ["settings.json"], "no temp file left");
+            // The next run merges into what they saved.
+            ok(&pod.run_low("x86_64", &pod.setup(), LowMemory::Always, &[]));
+            assert!(pod.settings().contains("\"workbench.colorTheme\": \"Solarized Light\""));
+            assert!(pod.settings().contains("\"python.analysis.indexing\": false"));
         }
 
         #[test]

@@ -75,7 +75,8 @@ trap 'rm -rf "$tmp"' EXIT
 # `always` (a CPU VM: the kernels' models sit in the same RAM as VS Code), a number N = only one
 # with less than N GiB of RAM (MemTotal, or a container's own cgroup limit when that's lower: a
 # container sees its host's MemTotal), unset or 0 = none.
-# (ARENA_MEMINFO, ARENA_CGROUP: a test's stand-ins for /proc/meminfo and /sys/fs/cgroup; never set on a pod.)
+# (ARENA_MEMINFO, ARENA_CGROUP, ARENA_PROC_CGROUP, and ARENA_SETTINGS_RACE in the merge: a test's
+# stand-ins for /proc/meminfo, /sys/fs/cgroup, /proc/self/cgroup and VS Code; never set on a pod.)
 py=""
 for c in "$@"; do
   case $c in "~/"*) c="$HOME/${c#"~/"}" ;; esac
@@ -84,16 +85,29 @@ for c in "$@"; do
     break
   fi
 done
-# `ram_kb`: this machine's RAM in kB, as above; fails when /proc/meminfo can't be read.
+# `ram_kb`: this machine's RAM in kB, as above; fails when /proc/meminfo can't be read. The
+# memory limits that apply: this process's cgroup's and every one above it (a limit holds for all
+# below it), v2 (`0::<path>` in /proc/self/cgroup) and v1's memory controller, each looked for
+# under the cgroup mount — where a container with a cgroup namespace of its own sees its own at
+# the top (`/`), and one sharing the host's sees it at its path (`/docker/<id>`, …). The lowest wins.
 ram_kb() {
   local kb lim f cg=${ARENA_CGROUP:-/sys/fs/cgroup}
   kb=$(awk '$1 == "MemTotal:" { printf "%.0f\n", $2; exit }' "${ARENA_MEMINFO:-/proc/meminfo}" 2>/dev/null)
   case $kb in '' | *[!0-9]*) return 1 ;; esac
-  for f in "$cg/memory.max" "$cg/memory/memory.limit_in_bytes"; do
+  while IFS= read -r f; do
     lim=$(awk 'NR == 1 && $1 ~ /^[0-9]+$/ { printf "%.0f\n", $1 / 1024 }' "$f" 2>/dev/null)
     case $lim in '' | *[!0-9]*) continue ;; esac
     [ "$lim" -lt "$kb" ] && kb=$lim
-  done
+  done < <(
+    printf '%s\n' "$cg/memory.max" "$cg/memory/memory.limit_in_bytes"
+    awk -v cg="$cg" '{
+      path = $0; sub(/^[^:]*:[^:]*:/, "", path)
+      if ($0 ~ /^0::/) { base = cg; file = "memory.max" }
+      else if ($0 ~ /^[0-9]+:([^:]*,)?memory(,[^:]*)?:/) { base = cg "/memory"; file = "memory.limit_in_bytes" }
+      else next
+      while (path != "" && path != "/") { print base path "/" file; sub(/\/[^\/]*$/, "", path) }
+    }' "${ARENA_PROC_CGROUP:-/proc/self/cgroup}" 2>/dev/null
+  )
   echo "$kb"
 }
 gib() { awk -v k="$1" 'BEGIN { printf "%.1f", k / 1048576 }'; }
@@ -137,8 +151,9 @@ doesn't name are added (one set to false stays false). VS Code writes and reads 
 there stays. A file that isn't JSONC VS Code would read the same way, or isn't an object at the
 top, is left alone (exit 4); so is one whose edited text doesn't parse back to exactly the old
 settings plus the additions, and one that changed while this ran. Written through a temp file
-beside it (renamed into place, mode kept; a symlink's target)."""
+beside it, swapped into place (put(); mode kept; a symlink's target)."""
 import copy
+import errno
 import json
 import os
 import re
@@ -168,8 +183,11 @@ class Bad(Exception):
     pass
 
 
+# JSONC as VS Code's own scanner reads it: a `//` comment ends at a CR as well as an LF (a CR-only
+# line break must not hide the setting after it). Anything else it might read differently - other
+# whitespace, a control character in a string - is refused, never guessed.
 TOKEN = re.compile(
-    r'[ \t\r\n]+|//[^\n]*|/\*.*?\*/'
+    r'[ \t\r\n]+|//[^\r\n]*|/\*.*?\*/'
     r'|"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"'
     r'|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?(?![0-9A-Za-z_.])'
     r'|(?:true|false|null)(?![0-9A-Za-z_])|[{}\[\],:]',
@@ -361,6 +379,59 @@ def read(target):
         return None
 
 
+def exchange(a, b):
+    """Swap two paths in one step (Linux's renameat2 RENAME_EXCHANGE): True if done, False where
+    the system or filesystem can't, OSError for anything else."""
+    try:
+        import ctypes
+        fn = ctypes.CDLL(None, use_errno=True).renameat2
+    except (ImportError, OSError, AttributeError):
+        return False
+    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    at_fdcwd, rename_exchange = -100, 2
+    if fn(at_fdcwd, os.fsencode(a), at_fdcwd, os.fsencode(b), rename_exchange) == 0:
+        return True
+    err = ctypes.get_errno()
+    if err in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
+        return False
+    raise OSError(err, os.strerror(err))
+
+
+def put(path, tmp, target, raw, ours):
+    """tmp (the merged text) into target's place - unless target no longer holds `raw` (VS Code
+    saved a participant's change after it was read): then theirs stays. The swap trades the two
+    in one step, so what comes out of target's place is exactly what was there at that moment;
+    anything but `raw` goes straight back (and if VS Code saved again meanwhile, its newest
+    stays). Where a swap can't be done: compare, then rename (a moment's window). A file that
+    wasn't there is created only if it still isn't (a hard link fails if it is)."""
+    race = os.environ.get("ARENA_SETTINGS_RACE")  # a test's stand-in for VS Code saving just now
+    if race:
+        with open(race, "rb") as f, open(target, "wb") as out:
+            out.write(f.read())
+    changed = "changed while arena merged its settings (re-run setup)"
+    if raw is None:
+        try:
+            os.link(tmp, target)
+            return
+        except FileExistsError:
+            left_alone(path, changed)
+        except OSError:
+            pass
+    elif exchange(tmp, target):
+        if read(tmp) == raw:
+            return
+        try:
+            back = exchange(tmp, target)
+        except OSError:
+            back = False
+        if not back or read(tmp) != ours:
+            os.replace(tmp, target)
+        left_alone(path, changed)
+    if read(target) != raw:
+        left_alone(path, changed)
+    os.replace(tmp, target)
+
+
 def main():
     path, interpreter, low = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
     target = os.path.realpath(path)
@@ -382,16 +453,14 @@ def main():
     if new is None:
         return
     tmp = "%s.arena-%d" % (target, os.getpid())
+    data = ("\ufeff" if bom else "").encode("utf-8") + new.encode("utf-8")
     try:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(tmp, "wb") as f:
-            f.write(("\ufeff" if bom else "").encode("utf-8") + new.encode("utf-8"))
+            f.write(data)
         if raw is not None:
             os.chmod(tmp, os.stat(target).st_mode & 0o7777)
-        # VS Code (a participant changing a setting) may have written meanwhile: theirs stands.
-        if read(target) != raw:
-            left_alone(path, "changed while arena merged its settings (re-run setup)")
-        os.replace(tmp, target)
+        put(path, tmp, target, raw, data)
     except OSError as e:
         left_alone(path, "couldn't be written (%s)" % e.strerror)
     finally:
