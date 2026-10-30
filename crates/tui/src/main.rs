@@ -1850,7 +1850,7 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
                 KeyCode::Esc => ui.mode = Mode::List,
                 KeyCode::Enter if typed == token && action.ai_key() => {
                     let pods = scope_pods(shared, &ui.marked, scope);
-                    aikey::start_set(ui, shared, action, &pods, None);
+                    aikey::start(ui, shared, action, &pods, None);
                 }
                 KeyCode::Enter if typed == token => {
                     let pods = scope_pods(shared, &ui.marked, scope);
@@ -1940,7 +1940,7 @@ fn submit_input(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Pro
         }
         InputScope::Set(sc) if action.ai_key() => {
             let pods = scope_pods(shared, &ui.marked, sc);
-            aikey::start_set(ui, shared, action, &pods, Some(&value));
+            aikey::start(ui, shared, action, &pods, Some(&value));
         }
         InputScope::Set(sc) => {
             let pods = scope_pods(shared, &ui.marked, sc);
@@ -2529,7 +2529,6 @@ fn cli_action_args(action: Action, name: &str, arg: Option<&str>) -> Option<(run
         Action::Rename => (runs::Kind::Rename, v(&["pods", "rename", name, arg?.trim(), "--yes"])),
         Action::Jobs => (runs::Kind::Jobs, v(&["pods", "jobs", name])),
         Action::Logs => (runs::Kind::Logs, v(&["pods", "logs", name, "--tail", "100"])),
-        a if a.ai_key() => return aikey::args(a, &[name.to_string()], arg),
         _ => return None,
     })
 }
@@ -2537,6 +2536,9 @@ fn cli_action_args(action: Action, name: &str, arg: Option<&str>) -> Option<(run
 /// Run one of the CLI's actions on `pod` in the background (`runs.rs`) and open the runs panel
 /// on it — or say why it can't run.
 fn start_cli_action(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, action: Action, pod: &Pod, arg: Option<&str>) {
+    if action.ai_key() {
+        return aikey::start(ui, shared, action, std::slice::from_ref(pod), arg);
+    }
     let Some((kind, args)) = cli_action_args(action, &pod.name, arg) else { return };
     let title = format!("{} {}", action.command(), ui.shown_name(&pod.name));
     // The pod's own provider: the CLI finds a pod fleet-wide whatever `--provider` says, but its
@@ -7358,7 +7360,7 @@ deep_check_end=1
         std::fs::write(&stub, "#!/bin/sh\necho \"args: $*\"\n").unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let key = |name: &str, spent: f64, reset: Option<&str>, off: bool| KeyInfo {
-            hash: format!("h-{name}"),
+            hash: format!("h{}", name.replace('-', "")),
             name: Some(name.into()),
             limit: Some(5.0),
             limit_remaining: Some(5.0 - spent),
@@ -7426,7 +7428,7 @@ deep_check_end=1
         // Enter on +5: `arena keys limit devtest-alpha +5 --yes`, then the keys are read again.
         submit_input(&shared, &mut ui, &provider, Action::KeyLimit, scope, "+5".into());
         let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
-        assert_eq!(first_line_when_ended(&shared, id).await.as_deref(), Some("args: --config /test/config.env --provider runpod keys limit devtest-alpha +5 --yes"));
+        assert_eq!(first_line_when_ended(&shared, id).await.as_deref(), Some("args: --config /test/config.env --provider runpod keys limit devtest-alpha +5 --expect hdevtestalpha=5/monthly/on --yes"));
         {
             let mut s = shared.lock().unwrap();
             assert!(std::mem::take(&mut s.ai_wanted), "the AI$ column is read again");
@@ -7444,10 +7446,10 @@ deep_check_end=1
         let Mode::Confirm(c) = ui.mode.clone() else { panic!("{:?}", ui.mode) };
         assert_eq!(c.action, Action::KeyResume);
         assert!(c.note.as_deref().unwrap().starts_with("ai key now: disabled · $1.00 of $5.00"), "{:?}", c.note);
-        assert_eq!(c.preview.as_deref(), Some("arena keys resume devtest-bravo --yes"));
+        assert_eq!(c.preview.as_deref(), Some("arena keys resume devtest-bravo --expect hdevtestbravo=5/never/off --yes"));
         apply_action(&shared, &mut ui, &provider, &c);
         let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
-        assert_eq!(first_line_when_ended(&shared, id).await.as_deref(), Some("args: --config /test/config.env --provider runpod keys resume devtest-bravo --yes"));
+        assert_eq!(first_line_when_ended(&shared, id).await.as_deref(), Some("args: --config /test/config.env --provider runpod keys resume devtest-bravo --expect hdevtestbravo=5/never/off --yes"));
         // Rotate: red, its warning, and `--copy`.
         ui.selected = at("devtest-alpha");
         choose_pod_action(&shared, &mut ui, &provider, Action::KeyRotate);
@@ -7471,7 +7473,7 @@ deep_check_end=1
         let mut named: Vec<&str> = line.split(' ').filter(|w| w.starts_with("devtest-")).collect();
         named.sort();
         assert_eq!(named, ["devtest-alpha", "devtest-bravo"], "{line}");
-        assert!(line.starts_with("args: --config /test/config.env --provider runpod keys limit ") && line.ends_with(" +1 --yes"), "{line}");
+        assert!(line.starts_with("args: --config /test/config.env --provider runpod keys limit ") && line.contains(" +1 --expect ") && line.ends_with(" --yes"), "{line}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

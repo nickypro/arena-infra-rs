@@ -43,6 +43,9 @@ pub(crate) struct LimitArgs {
     /// Print one JSON object: each key before and after
     #[arg(long)]
     json: bool,
+    /// The keys as the dashboard showed them: one that isn't, or moved, is refused
+    #[arg(long, hide = true, value_name = "HASH=CAP/RESET/ON|OFF")]
+    expect: Vec<String>,
     // Last: its help heading ("Target selection") would take the flags after it.
     #[command(flatten)]
     opts: crate::SelectOpts,
@@ -57,6 +60,9 @@ pub(crate) struct PauseArgs {
     /// Print one JSON object: each key before and after
     #[arg(long)]
     json: bool,
+    /// The keys as the dashboard showed them: one that isn't, or moved, is refused
+    #[arg(long, hide = true, value_name = "HASH=CAP/RESET/ON|OFF")]
+    expect: Vec<String>,
     #[command(flatten)]
     sel: crate::Select,
 }
@@ -86,13 +92,41 @@ pub(crate) async fn limit(a: LimitArgs, provider: &dyn Provider, cfg: &Config, a
     let (targets, change) = split_amount(a.args, a.no_cap)?;
     let reset = a.reset.as_deref().map(LimitReset::parse).transpose()?;
     let verb = Verb::Limit { change: Some(change), reset, force: a.force };
-    run(verb, a.opts.args(&targets), a.dry_run, a.json, provider, cfg, api, dir, yes).await
+    let expect = expected(&a.expect)?;
+    run(verb, a.opts.args(&targets), &expect, a.dry_run, a.json, provider, cfg, api, dir, yes).await
 }
 
 /// `arena keys pause` (`resume: false`) or `arena keys resume`.
 pub(crate) async fn pause(a: PauseArgs, resume: bool, provider: &dyn Provider, cfg: &Config, api: &dyn KeyApi, dir: &std::path::Path, yes: bool) -> Result<()> {
     let verb = if resume { Verb::Resume } else { Verb::Pause };
-    run(verb, a.sel.args(), a.dry_run, a.json, provider, cfg, api, dir, yes).await
+    let expect = expected(&a.expect)?;
+    run(verb, a.sel.args(), &expect, a.dry_run, a.json, provider, cfg, api, dir, yes).await
+}
+
+/// `--expect`'s values ([`or::Expected::parse`]).
+fn expected(tokens: &[String]) -> Result<Vec<or::Expected>> {
+    tokens.iter().map(|t| or::Expected::parse(t).map_err(|e| anyhow::anyhow!("--expect: {e}"))).collect()
+}
+
+/// The dashboard's `--expect` against the plan: each key a row would change must be one it showed,
+/// still as shown — else the operator confirmed a change to another key, or another cap (review
+/// codex r2 #3). Nothing to check without `--expect` (the CLI's own confirm showed the plan).
+/// The refusals. Pure.
+fn unexpected(rows: &[Row], expect: &[or::Expected]) -> Vec<String> {
+    if expect.is_empty() {
+        return Vec::new();
+    }
+    rows.iter()
+        .filter(|r| r.update.is_some())
+        .filter_map(|r| {
+            let k = r.key.as_ref()?;
+            match expect.iter().find(|e| e.hash == k.hash) {
+                None => Some(format!("{}: its key isn't the one the dashboard showed (rotated meanwhile?) — look again", r.machine)),
+                Some(e) if !e.holds(k) => Some(format!("{}: its key changed since the dashboard showed it (now {}) — look again", r.machine, state_words(k))),
+                Some(_) => None,
+            }
+        })
+        .collect()
 }
 
 /// `limit`'s positionals: the targets, then the amount — the last one, always, unless `--no-cap`
@@ -169,22 +203,34 @@ fn state_words(k: &KeyInfo) -> String {
     format!("{cap}{reset}, {}", on_off(k.disabled))
 }
 
-/// Why `was` — a key as the plan read it — mustn't be changed now, by the keys read again after
-/// the confirm (`fresh`): it's gone, or its cap, reset or on/off moved meanwhile (another operator,
-/// the dashboard; review codex r1 #1: `+5` confirmed as `$5 → $10` would set $10 over a cap raised
-/// to $25 meanwhile), or — a cap change — its spend now makes it one [`or::plan_cap`] refuses.
-/// `None`: go ahead. Pure.
-fn moved(verb: &Verb, was: &KeyInfo, fresh: &[KeyInfo]) -> Option<String> {
-    let Some(now) = fresh.iter().find(|k| k.hash == was.hash) else {
-        return Some("the key isn't listed any more — nothing done".into());
+/// Why machine `m`'s changes (`was`: its rows as planned from the first listing) mustn't be made
+/// now, by the keys read again after the confirm (`fresh`): the plan made again from them must be
+/// the same — the same keys under its name, the same changes, each key as it was. Otherwise
+/// something moved meanwhile: a cap (review codex r1 #1: `+5` confirmed as `$5 → $10` would set
+/// $10 over a cap raised to $25), a key replaced or added under the name (r2 #1: a resume would
+/// wake a rotated-out key, a pause miss the new one), a key renamed away (r2 #2) — or the spend,
+/// making a cap one [`or::plan_cap`] refuses. `None`: go ahead. Pure.
+fn moved(verb: &Verb, m: &str, was: &[&Row], fresh: &[KeyInfo], naming: &Naming) -> Option<String> {
+    let again = match plan(verb, &[m.to_string()], fresh, naming) {
+        Ok(rows) => rows,
+        Err(why) => {
+            let why = why.join("; ");
+            return Some(format!("{} — nothing done", why.strip_prefix(&format!("{m}: ")).unwrap_or(&why)));
+        }
     };
-    if !same(now, was) {
-        return Some(format!("it changed while this ran (now {}) — nothing done; run the command again", state_words(now)));
+    let changes = |rows: Vec<&Row>| -> Vec<(KeyInfo, KeyUpdate)> {
+        rows.into_iter().filter_map(|r| Some((r.key.clone()?, r.update.clone()?))).collect()
+    };
+    let (was, now) = (changes(was.to_vec()), changes(again.iter().collect()));
+    let alike = was.len() == now.len()
+        && was.iter().zip(&now).all(|((a, ua), (b, ub))| a.hash == b.hash && a.name == b.name && ua == ub && same(a, b));
+    if alike {
+        return None;
     }
-    match verb {
-        Verb::Limit { change, reset, force } => or::plan_cap(now, *change, *reset, *force).err().map(|why| format!("{why} — nothing done")),
-        _ => None,
-    }
+    let names = crate::machine_key_names(naming, m);
+    let theirs: Vec<String> = fresh.iter().filter(|k| k.name.as_deref().is_some_and(|n| names.iter().any(|t| t == n))).map(state_words).collect();
+    let now = if theirs.is_empty() { "no key under its name".to_string() } else { theirs.join("; ") };
+    Some(format!("its key changed while this ran (now {now}) — nothing done; run the command again"))
 }
 
 /// A key at its cap after this, said for a pause/resume row: a resume doesn't lift a cap.
@@ -360,7 +406,7 @@ fn head(verb: &Verb, n: usize) -> String {
 /// refusal stops it before anything changes; a key that fails doesn't stop the others, and fails
 /// the command at the end.
 #[allow(clippy::too_many_arguments)]
-async fn run(verb: Verb, sel: SelectArgs, dry_run: bool, json_out: bool, provider: &dyn Provider, cfg: &Config, api: &dyn KeyApi, dir: &std::path::Path, yes: bool) -> Result<()> {
+async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool, json_out: bool, provider: &dyn Provider, cfg: &Config, api: &dyn KeyApi, dir: &std::path::Path, yes: bool) -> Result<()> {
     let naming = Naming::from_config(cfg);
     let csv = std::fs::read_to_string(dir.join(crate::OPENROUTER_KEYS_LINK)).ok();
     let existing = api.list_keys().await.context("listing OpenRouter keys")?;
@@ -378,6 +424,8 @@ async fn run(verb: Verb, sel: SelectArgs, dry_run: bool, json_out: bool, provide
     let rows = plan(&verb, &names, &existing, &naming).map_err(|refused| {
         anyhow::anyhow!("nothing changed — refused:\n  {}", refused.join("\n  "))
     })?;
+    let off = unexpected(&rows, expect);
+    anyhow::ensure!(off.is_empty(), "nothing changed — refused:\n  {}", off.join("\n  "));
     let todo: Vec<&Row> = rows.iter().filter(|r| r.update.is_some()).collect();
     let skipped = |r: &Row| if r.key.is_none() { Outcome::NoKey } else { Outcome::Unchanged };
     if dry_run || todo.is_empty() {
@@ -410,10 +458,17 @@ async fn run(verb: Verb, sel: SelectArgs, dry_run: bool, json_out: bool, provide
     // The keys read again: a change confirmed against a listing that has moved since isn't made
     // ([`moved`]). OpenRouter has no conditional update, so this narrows the window to the calls.
     let fresh = api.list_keys().await.context("listing OpenRouter keys again before changing them")?;
+    let stale: std::collections::HashMap<&str, Option<String>> = todo
+        .iter()
+        .map(|r| {
+            let theirs: Vec<&Row> = rows.iter().filter(|o| o.machine == r.machine).collect();
+            (r.machine.as_str(), moved(&verb, &r.machine, &theirs, &fresh, &naming))
+        })
+        .collect();
     let mut done: Vec<(Row, Outcome, Option<KeyInfo>)> = Vec::new();
     for r in &rows {
         let outcome = match (&r.key, &r.update) {
-            (Some(k), Some(u)) => match moved(&verb, k, &fresh) {
+            (Some(k), Some(u)) => match stale.get(r.machine.as_str()).cloned().flatten() {
                 Some(why) => Outcome::Failed(why),
                 None => match api.update_key(&k.hash, u).await {
                     Ok(()) => Outcome::Changed,
@@ -725,26 +780,59 @@ mod tests {
         assert_eq!(api.key("hb").limit, Some(25.0));
     }
 
-    /// What stops a planned change: the key gone, its cap, reset or on/off moved, or (a cap) a spend
-    /// that has grown past the new cap. Pure.
+    /// What stops a machine's planned change, by the keys read again: a key gone or renamed away,
+    /// its cap, reset or on/off moved, a key replaced or added under the name, or (a cap) a spend
+    /// grown past the new cap. Pure.
     #[test]
     fn moved_says_why_a_planned_change_waits() {
-        let was = key("hb", "devtest-bravo", Some(5.0), 1.0, false, "2026-10-30T10:00:00Z");
+        let cfg = cfg();
+        let naming = Naming::from_config(&cfg);
+        let at = "2026-10-30T10:00:00Z";
+        let bravo = key("hb", "devtest-bravo", Some(5.0), 1.0, false, at);
+        let check = |verb: &Verb, before: &[KeyInfo], after: &[KeyInfo]| {
+            let rows = plan(verb, &["devtest-bravo".to_string()], before, &naming).unwrap();
+            moved(verb, "devtest-bravo", &rows.iter().collect::<Vec<_>>(), after, &naming)
+        };
         let lower = Verb::Limit { change: Some(CapChange::To(2.0)), reset: None, force: false };
-        assert_eq!(moved(&lower, &was, std::slice::from_ref(&was)), None);
-        assert!(moved(&lower, &was, &[]).unwrap().contains("isn't listed any more"));
+        assert_eq!(check(&lower, std::slice::from_ref(&bravo), std::slice::from_ref(&bravo)), None);
         for (now, says) in [
-            (KeyInfo { limit: Some(25.0), ..was.clone() }, "now cap $25.00, on"),
-            (KeyInfo { limit: None, ..was.clone() }, "now no cap, on"),
-            (KeyInfo { limit_reset: Some("daily".into()), ..was.clone() }, "now cap $5.00 (daily), on"),
-            (KeyInfo { disabled: true, ..was.clone() }, "now cap $5.00, off"),
-            (KeyInfo { usage: Some(3.0), ..was.clone() }, "a $2.00 cap is under what it has spent in all ($3.00)"),
+            (vec![], "now no key under its name"),
+            (vec![KeyInfo { name: Some("devtest-alpha".into()), ..bravo.clone() }], "now no key under its name"),
+            (vec![KeyInfo { limit: Some(25.0), ..bravo.clone() }], "now cap $25.00, on"),
+            (vec![KeyInfo { limit: None, ..bravo.clone() }], "now no cap, on"),
+            (vec![KeyInfo { limit_reset: Some("daily".into()), ..bravo.clone() }], "now cap $5.00 (daily), on"),
+            (vec![KeyInfo { usage: Some(3.0), ..bravo.clone() }], "a $2.00 cap is under what it has spent in all ($3.00)"),
+            // A newer key under the name, the old one disabled (a rotation meanwhile).
+            (vec![KeyInfo { disabled: true, ..bravo.clone() }, key("hb2", "devtest-bravo", Some(5.0), 0.0, false, "2026-10-31T10:00:00Z")], "now cap $5.00, off; cap $5.00, on"),
         ] {
-            let why = moved(&lower, &was, std::slice::from_ref(&now)).unwrap_or_else(|| panic!("{now:?}"));
-            assert!(why.contains(says) && why.contains("nothing done"), "{why}");
+            let why = check(&lower, std::slice::from_ref(&bravo), &now).unwrap_or_else(|| panic!("{now:?}"));
+            assert!(why.contains(says) && why.contains("nothing done"), "{says}: {why}");
         }
+        // A resume confirmed for the newest disabled key doesn't wake an older one when a newer
+        // one arrived meanwhile (review codex r2 #1)…
+        let off = KeyInfo { disabled: true, ..bravo.clone() };
+        let newer = KeyInfo { hash: "hb2".into(), created_at: Some("2026-10-31T10:00:00Z".into()), ..off.clone() };
+        assert!(check(&Verb::Resume, std::slice::from_ref(&off), &[off.clone(), newer]).is_some());
+        // …and a pause confirmed for one enabled key doesn't miss a second one added meanwhile.
+        let second = key("hb3", "devtest-bravo", Some(5.0), 0.0, false, "2026-10-31T10:00:00Z");
+        assert!(check(&Verb::Pause, std::slice::from_ref(&bravo), &[bravo.clone(), second]).is_some());
         // The spend that grew doesn't stop a pause.
-        assert_eq!(moved(&Verb::Pause, &was, &[KeyInfo { usage: Some(3.0), ..was.clone() }]), None);
+        assert_eq!(check(&Verb::Pause, std::slice::from_ref(&bravo), &[KeyInfo { usage: Some(3.0), ..bravo.clone() }]), None);
+    }
+
+    /// The dashboard's `--expect`: a change to a key it didn't show, or one that moved since it
+    /// showed it, is refused before anything changes; as shown, it goes ahead.
+    #[tokio::test]
+    async fn the_dashboards_expectations_bind_the_change_to_the_key_it_showed() {
+        let api = Keys::with(fleet_keys());
+        let e = keys_cmd(&["limit", "bravo", "10", "--expect", "hb=4/never/on", "--yes"], &api).await.unwrap_err();
+        assert!(e.contains("nothing changed") && e.contains("devtest-bravo: its key changed since the dashboard showed it (now cap $5.00, on)"), "{e}");
+        let e = keys_cmd(&["pause", "bravo", "--expect", "hother=5/never/on"], &api).await.unwrap_err();
+        assert!(e.contains("devtest-bravo: its key isn't the one the dashboard showed"), "{e}");
+        assert!(keys_cmd(&["pause", "bravo", "--expect", "hb=5/nope/on"], &api).await.unwrap_err().contains("`hb=5/nope/on` isn't HASH=CAP/RESET/ON|OFF"));
+        assert!(api.calls().is_empty());
+        keys_cmd(&["limit", "bravo", "10", "--expect", "hb=5/never/on"], &api).await.unwrap();
+        assert_eq!(api.calls(), [r#"hb {"limit":10.0}"#]);
     }
 
     /// The command lines the dashboard's AI key rows run (arena-tui's `aikey::args`), which it
@@ -756,19 +844,20 @@ mod tests {
         let full = |argv: &[&str]| {
             crate::Cli::try_parse_from(["arena", "--config", "/c.env", "--provider", "hetzner"].iter().chain(argv).copied()).unwrap_or_else(|e| panic!("{argv:?}: {e}"))
         };
-        let c = full(&["keys", "limit", "devtest-alpha", "devtest-bravo", "+5", "--yes"]);
+        let c = full(&["keys", "limit", "devtest-alpha", "devtest-bravo", "+5", "--expect", "ab12=5/monthly/on", "--expect", "cd34=none/never/off", "--yes"]);
         let crate::Cmd::Keys(crate::KeysCmd::Limit(a)) = c.cmd else { panic!() };
         assert!(c.yes && !a.no_cap && !a.force && !a.dry_run && a.reset.is_none());
+        assert_eq!(expected(&a.expect).unwrap().iter().map(|e| e.token()).collect::<Vec<_>>(), ["ab12=5/monthly/on", "cd34=none/never/off"]);
         let (targets, change) = split_amount(a.args, a.no_cap).unwrap();
         assert_eq!((targets, change), (vec!["devtest-alpha".to_string(), "devtest-bravo".into()], CapChange::Raise(5.0)));
         for (verb, resume) in [("pause", false), ("resume", true)] {
-            let c = full(&["keys", verb, "devtest-alpha", "--yes"]);
+            let c = full(&["keys", verb, "devtest-alpha", "--expect", "ab12=5/never/off", "--yes"]);
             let (a, is_resume) = match c.cmd {
                 crate::Cmd::Keys(crate::KeysCmd::Pause(a)) => (a, false),
                 crate::Cmd::Keys(crate::KeysCmd::Resume(a)) => (a, true),
                 _ => panic!("{verb}"),
             };
-            assert!(c.yes && is_resume == resume && a.sel.targets == ["devtest-alpha"] && !a.dry_run, "{verb}");
+            assert!(c.yes && is_resume == resume && a.sel.targets == ["devtest-alpha"] && !a.dry_run && a.expect == ["ab12=5/never/off"], "{verb}");
         }
         let c = full(&["keys", "rotate", "devtest-alpha", "--copy", "--yes"]);
         let crate::Cmd::Keys(crate::KeysCmd::Rotate { copy, dry_run, sel, limit }) = c.cmd else { panic!() };

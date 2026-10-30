@@ -67,9 +67,11 @@ pub(crate) fn prefill(cfg: &Config) -> String {
 }
 
 /// The `arena` arguments for the AI key's `action` on `names` (`arg`: the amount for a cap), and
-/// the run's kind. The dashboard has confirmed, so `--yes`; rotate copies the new key onto the
-/// pod (`--copy`). `None`: not one of them, or a cap with no amount. Pure.
-pub(crate) fn args(action: Action, names: &[String], arg: Option<&str>) -> Option<(runs::Kind, Vec<String>)> {
+/// the run's kind. The dashboard has confirmed, so `--yes`, and the keys it showed go along as
+/// they were (`--expect HASH=STATE` each, `keys`): the command refuses one that has been replaced
+/// or has moved since (review codex r2 #3). Rotate copies the new key onto the pod (`--copy`).
+/// `None`: not one of them, or a cap with no amount. Pure.
+pub(crate) fn args(action: Action, names: &[String], arg: Option<&str>, keys: &[KeyInfo]) -> Option<(runs::Kind, Vec<String>)> {
     let (kind, verb) = match action {
         Action::KeyLimit => (runs::Kind::KeyLimit, "limit"),
         Action::KeyPause => (runs::Kind::KeyPause, "pause"),
@@ -83,6 +85,13 @@ pub(crate) fn args(action: Action, names: &[String], arg: Option<&str>) -> Optio
         Action::KeyLimit => out.push(arg.map(str::trim).filter(|a| !a.is_empty())?.to_string()),
         Action::KeyRotate => out.push("--copy".into()),
         _ => {}
+    }
+    // Rotate deletes whatever keys the name has: nothing to bind (it has no `--expect`).
+    if action != Action::KeyRotate {
+        for k in keys {
+            out.push("--expect".into());
+            out.push(or::Expected::of(k).token());
+        }
     }
     out.push("--yes".into());
     Some((kind, out))
@@ -139,7 +148,7 @@ pub(crate) fn limit_preview(shared: &Shared, pods: &[Pod], value: &str) -> Resul
 /// and (`v`) the command.
 pub(crate) fn choose(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, pod: Pod, shown: String, action: Action) {
     let found = support(&shared.lock().unwrap(), &pod);
-    let (usage, _) = match found {
+    let (usage, info) = match found {
         Ok(k) => k,
         Err(why) => {
             ui.mode = Mode::Result(format!("✗ can't {} {} — {why}", action.label(), pod.name));
@@ -151,7 +160,7 @@ pub(crate) fn choose(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, pod: Pod, shown: 
         ui.mode = Mode::Input { action, scope: InputScope::Pod { name: shown, id: pod.id }, value: prefill(&ui.cfg) };
         return;
     }
-    let preview = args(action, std::slice::from_ref(&pod.name), None).map(|(_, a)| format!("arena {}", a.join(" ")));
+    let preview = args(action, std::slice::from_ref(&pod.name), None, std::slice::from_ref(&info)).map(|(_, a)| format!("arena {}", a.join(" ")));
     let mut note = format!("ai key now: {}", usage.detail());
     if action == Action::KeyRotate {
         let cap = ui.cfg.get_parsed::<f64>("OPENROUTER_KEY_LIMIT").unwrap_or(5.0);
@@ -185,19 +194,28 @@ pub(crate) fn choose_set(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, action: Actio
 }
 
 /// Run the AI key's `action` on those of `pods` with a key ([`support`]) as one CLI run (`arg`:
-/// a cap's amount), and open the runs panel on it — or say why it can't run.
-pub(crate) fn start_set(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, action: Action, pods: &[Pod], arg: Option<&str>) {
-    let names: Vec<String> = {
+/// a cap's amount), each key bound as the dashboard showed it ([`args`]), and open the runs panel
+/// on it — or say why it can't run.
+pub(crate) fn start(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, action: Action, pods: &[Pod], arg: Option<&str>) {
+    let (names, keys): (Vec<String>, Vec<KeyInfo>) = {
         let s = shared.lock().unwrap();
-        pods.iter().filter(|p| support(&s, p).is_ok()).map(|p| p.name.clone()).collect()
+        pods.iter().filter_map(|p| support(&s, p).ok().map(|(_, k)| (p.name.clone(), k))).unzip()
     };
     if names.is_empty() {
         ui.mode = Mode::Result(format!("✗ can't {} — none of these pods has an OpenRouter key that was read", action.label()));
         return;
     }
-    let Some((kind, argv)) = args(action, &names, arg) else { return };
-    let title = format!("{} {}", action.command(), crate::state::count_of(names.len(), "pod", "pods"));
-    let provider = ui.provider_name.clone();
+    let Some((kind, argv)) = args(action, &names, arg, &keys) else { return };
+    let title = match pods {
+        [one] => format!("{} {}", action.command(), ui.shown_name(&one.name)),
+        _ => format!("{} {}", action.command(), crate::state::count_of(names.len(), "pod", "pods")),
+    };
+    // One pod's own provider: the CLI finds a pod fleet-wide whatever `--provider` says, but its
+    // messages then name the right one.
+    let provider = match pods {
+        [one] if !one.provider.is_empty() => one.provider.clone(),
+        _ => ui.provider_name.clone(),
+    };
     ui.mode = match runs::start(ui, shared, kind, &provider, argv, title) {
         Ok(id) => Mode::Runs { id, scroll: None, stop: false },
         Err(e) => Mode::Result(format!("✗ {e}")),
@@ -249,7 +267,7 @@ mod tests {
     fn args_build_the_clis_own_commands() {
         let one = vec!["devtest-alpha".to_string()];
         let two = vec!["devtest-alpha".to_string(), "devtest-bravo".into()];
-        let line = |a: Action, names: &[String], arg: Option<&str>| args(a, names, arg).map(|(k, v)| (k, v.join(" ")));
+        let line = |a: Action, names: &[String], arg: Option<&str>| args(a, names, arg, &[]).map(|(k, v)| (k, v.join(" ")));
         assert_eq!(line(Action::KeyLimit, &one, Some(" +5 ")), Some((runs::Kind::KeyLimit, "keys limit devtest-alpha +5 --yes".into())));
         assert_eq!(line(Action::KeyLimit, &two, Some("10")), Some((runs::Kind::KeyLimit, "keys limit devtest-alpha devtest-bravo 10 --yes".into())));
         assert_eq!(line(Action::KeyPause, &two, None), Some((runs::Kind::KeyPause, "keys pause devtest-alpha devtest-bravo --yes".into())));
@@ -257,6 +275,11 @@ mod tests {
         assert_eq!(line(Action::KeyRotate, &one, None), Some((runs::Kind::KeyRotate, "keys rotate devtest-alpha --copy --yes".into())));
         assert_eq!(line(Action::KeyLimit, &one, Some("  ")), None, "no amount, no run");
         assert_eq!(line(Action::Backup, &one, None), None);
+        // The keys as shown go along; rotate takes none.
+        let shown = [KeyInfo { hash: "ab12".into(), limit: Some(5.0), ..Default::default() }, KeyInfo { hash: "cd34".into(), disabled: true, ..Default::default() }];
+        let bound = |a: Action, arg: Option<&str>| args(a, &two, arg, &shown).map(|(_, v)| v.join(" "));
+        assert_eq!(bound(Action::KeyLimit, Some("+5")).as_deref(), Some("keys limit devtest-alpha devtest-bravo +5 --expect ab12=5/never/on --expect cd34=none/never/off --yes"));
+        assert_eq!(bound(Action::KeyRotate, None).as_deref(), Some("keys rotate devtest-alpha devtest-bravo --copy --yes"));
     }
 
     #[test]

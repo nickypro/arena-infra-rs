@@ -762,6 +762,60 @@ pub fn exact_money(x: f64) -> String {
     }
 }
 
+/// A key as a dashboard showed it — its hash, cap, when the cap starts over, on or off — handed to
+/// the command it runs (`--expect HASH=STATE`), which then refuses a key that isn't that one any
+/// more, or has moved: the operator confirmed a change to the key as shown (review codex r2 #3:
+/// `10`, previewed as raising a $5 cap, would have lowered one raised to $25 meanwhile).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Expected {
+    pub hash: String,
+    pub limit: Option<f64>,
+    pub reset: Option<LimitReset>,
+    pub disabled: bool,
+}
+
+impl Expected {
+    pub fn of(k: &KeyInfo) -> Self {
+        Expected { hash: k.hash.clone(), limit: k.limit, reset: LimitReset::of(k), disabled: k.disabled }
+    }
+
+    /// `HASH=CAP/RESET/ON|OFF`: `ab12=5/never/on`, `ab12=none/daily/off` (the cap as Rust prints
+    /// it, which reads back exactly).
+    pub fn token(&self) -> String {
+        let cap = self.limit.map_or_else(|| "none".to_string(), |l| l.to_string());
+        let reset = self.reset.map_or("never", |r| r.as_str());
+        format!("{}={cap}/{reset}/{}", self.hash, if self.disabled { "off" } else { "on" })
+    }
+
+    /// A [`Self::token`] back. Pure.
+    pub fn parse(s: &str) -> Result<Self> {
+        let bad = || Error::Config(format!("`{s}` isn't HASH=CAP/RESET/ON|OFF"));
+        let (hash, state) = s.split_once('=').ok_or_else(bad)?;
+        valid_hash(hash).map_err(|_| bad())?;
+        let mut parts = state.split('/');
+        let (Some(cap), Some(reset), Some(on), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else { return Err(bad()) };
+        let limit = match cap {
+            "none" => None,
+            c => Some(c.parse::<f64>().ok().filter(|x| x.is_finite() && *x >= 0.0).ok_or_else(bad)?),
+        };
+        let disabled = match on {
+            "on" => false,
+            "off" => true,
+            _ => return Err(bad()),
+        };
+        Ok(Expected { hash: hash.to_string(), limit, reset: LimitReset::parse(reset).map_err(|_| bad())?, disabled })
+    }
+
+    /// Whether `k` is this key, still as shown (the cap to [`CAP_EPSILON`]).
+    pub fn holds(&self, k: &KeyInfo) -> bool {
+        let cap = match (self.limit, k.limit) {
+            (Some(a), Some(b)) => (a - b).abs() < CAP_EPSILON,
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        k.hash == self.hash && cap && LimitReset::of(k) == self.reset && k.disabled == self.disabled
+    }
+}
+
 /// Of the keys that go by one name, the one it shows: the enabled one, then the newest (the
 /// first of equals). The one the dashboard's `AI$` cell is about, and the one `keys limit` and
 /// `keys resume` change.
@@ -1972,6 +2026,34 @@ mod tests {
         assert!(!p.still_at_cap() && p.words().starts_with("cap $5.00 → $1.005 · spent $1.00 in all"), "{}", p.words());
         let exact = ok(&spent, Some(CapChange::To(1.004)), None);
         assert!(exact.still_at_cap(), "at exactly the spend: at its cap");
+    }
+
+    /// What a dashboard showed of a key round-trips through `--expect`, and holds only while the
+    /// key is that one, as shown.
+    #[test]
+    fn expected_round_trips_and_holds_only_while_the_key_is_as_shown() {
+        let k = KeyInfo { hash: "ab12".into(), limit: Some(0.25), limit_reset: Some("daily".into()), ..Default::default() };
+        let e = Expected::of(&k);
+        assert_eq!(e.token(), "ab12=0.25/daily/on");
+        assert_eq!(Expected::parse(&e.token()).unwrap(), e);
+        let open = Expected::of(&KeyInfo { hash: "cd34".into(), disabled: true, ..Default::default() });
+        assert_eq!(open.token(), "cd34=none/never/off");
+        assert_eq!(Expected::parse("cd34=none/never/off").unwrap(), open);
+        let odd = Expected::of(&KeyInfo { hash: "ef".into(), limit: Some(0.1 + 0.2), ..Default::default() });
+        assert_eq!(Expected::parse(&odd.token()).unwrap(), odd, "the cap reads back exactly");
+        assert!(e.holds(&k));
+        for moved in [
+            KeyInfo { limit: Some(0.26), ..k.clone() },
+            KeyInfo { limit: None, ..k.clone() },
+            KeyInfo { limit_reset: None, ..k.clone() },
+            KeyInfo { disabled: true, ..k.clone() },
+            KeyInfo { hash: "other".into(), ..k.clone() },
+        ] {
+            assert!(!e.holds(&moved), "{moved:?}");
+        }
+        for bad in ["", "ab12", "ab12=5/never", "ab12=5/never/on/x", "ab12=-1/never/on", "ab12=five/never/on", "ab12=5/hourly/on", "ab12=5/never/maybe", "a/b=5/never/on"] {
+            assert!(Expected::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

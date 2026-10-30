@@ -1719,9 +1719,11 @@ calls fail; the `AI$` cell says `off`) and `resume` enables the one the dashboar
 `paused` is something else: a $0 cap nothing was spent against, which `limit <name> 5` lifts. A key
 already as asked is left alone. Each command: `--dry-run`, a confirm (`--yes`), then one line per key
 — `devtest-alpha: cap $0.10 → $0.20 · spent $0.00 in all`, `on → off`. The keys are read again
-after the confirm: one whose cap, reset or on/off moved since the preview (another operator, the
-dashboard) or whose spend now makes the cap one it would refuse is left alone and fails the command
-— run it again (OpenRouter has no conditional update; this leaves only the calls' own moment).
+after the confirm and each machine's plan made again from them: a machine whose keys moved since the
+preview (another operator, the dashboard: a cap, reset or on/off changed, a key replaced, added or
+renamed away) or whose spend now makes the cap one it would refuse is left alone and fails the
+command — run it again (OpenRouter has no conditional update; this leaves only the calls' own
+moment).
 Afterwards each is checked against the keys as OpenRouter lists them (a change it answered OK for
 but didn't make fails the command; caps compared exactly, not to the cent);
 `--json` prints `{action, dry_run, keys: [{machine, name, hash, before, after, result, error?,
@@ -1771,7 +1773,9 @@ pod. A **marked set** gets `ai cap`, `ai pause` (`o`) and `ai resume` (`O`), one
 pods with a key (the confirm names the ones left out). The rows are there whenever a provisioning key
 is configured, so none moves under the cursor; for a pod without a key, or before the keys are read,
 they're grey with why, and refused if picked. They run as CLI children in the runs panel (`p`), so
-the CLI and the dashboard share one path; when one ends the keys are read again at once, and the
+the CLI and the dashboard share one path; each carries the keys as the dashboard showed them
+(`--expect HASH=CAP/RESET/ON|OFF`, hidden), and the command refuses, before changing anything, a
+key replaced or changed since — look again; when one ends the keys are read again at once, and the
 `AI$` cell and the top line show the change within seconds. The at-cap warning says `(a → raise
 cap)` when a listed pod carries the key, and the detail pane's `ai key:` line starts `at its cap (a
 → raise cap)` or `disabled (a → ai resume)`.
