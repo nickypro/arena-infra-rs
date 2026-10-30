@@ -355,6 +355,12 @@ fn each_pods_backups_are_judged_failing_first_then_oldest() {
     // The record unreadable: every git cell unknown, saying why.
     let s = judge(&Inputs { record: Err("can't read /s/backups.json: Permission denied".into()), ..inputs() });
     assert_eq!(pod_of(&s, "alpha").git.why.as_deref(), Some("the run record can't be read: can't read /s/backups.json: Permission denied"));
+    // A copy the record says went through, but the backup dir can't be read now: unknown, why
+    // said, its last success kept (review r3 #1).
+    let r = record_with(5 * MIN, &[], &[("alpha", Outcome::Copied, "", Some(GB))]);
+    let s = judge(&Inputs { record: Ok(Some(r)), labels: Err("/b: Input/output error (os error 5)".into()), ..inputs() });
+    let c = &pod_of(&s, "alpha").copy;
+    assert_eq!((c.health, c.why.as_deref(), c.ok_at), (Health::Unknown, Some("the backup dir can't be read: /b: Input/output error (os error 5)"), Some(NOW - 5 * MIN)));
     // No copy job and nothing on disk: the copy cell is off, not unknown.
     let s = judge(&inputs());
     assert_eq!((pod_of(&s, "alpha").copy.health, pod_of(&s, "alpha").archive.health), (Health::Off, Health::Off));
@@ -560,6 +566,17 @@ fn the_record_folds_runs_and_reads_back() {
     assert_eq!(Record::load(&path), Ok(Some(Record::default())));
 }
 
+/// Root reads every directory: a permission test can't fail there.
+fn is_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid(2) only reads the process's own credentials.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    false
+}
+
 struct Tmp(PathBuf);
 
 impl Tmp {
@@ -654,6 +671,15 @@ fn read_finds_the_record_markers_labels_and_locks() {
     let s = judge(&i);
     assert_eq!(pod_of(&s, "bravo").health, Health::Fail);
     assert_eq!(pod_of(&s, "alpha").copy.text, "w3d5");
+    // A label that can't be listed is an error, never "no snapshot" (review r3 #1).
+    #[cfg(unix)]
+    if !is_root() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(backup.join("w3d4"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let i = read(&cfg, Some("/c"), tab(&[&line]), cohort_pods(&cfg), NOW);
+        std::fs::set_permissions(backup.join("w3d4"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(i.labels.as_ref().is_err_and(|e| e.contains("w3d4") && e.contains("ermission denied")), "{:?}", i.labels);
+    }
     assert_eq!(s.storage[0].what, "snapshots + all files");
 }
 

@@ -670,7 +670,7 @@ fn copy_cell(i: &Inputs, pod: &PodIn, gap: Option<u64>, set_up: bool) -> Cell {
         Ok(r) => r.as_ref().and_then(|r| r.pods.get(&pod.name)).and_then(|p| p.copy.clone().map(|e| (e, p.copy_ok))),
     };
     let marker = i.copied.as_ref().ok().and_then(|m| m.get(&pod.name)).copied();
-    let c = match rec {
+    let mut c = match rec {
         Some((e, ok_at)) => {
             let size = e.bytes.map(disk::gb);
             let text = match (&size, e.outcome) {
@@ -699,6 +699,14 @@ fn copy_cell(i: &Inputs, pod: &PodIn, gap: Option<u64>, set_up: bool) -> Cell {
             }
         },
     };
+    // The record says it went through; the backup dir can't be read now: what's there is unknown
+    // (review r3 #1) — the last success kept.
+    if c.health == Health::Ok {
+        if let Some(e) = i.labels.as_ref().err().or(i.copied.as_ref().err()) {
+            c.health = Health::Unknown;
+            c.why = Some(format!("the backup dir can't be read: {e}"));
+        }
+    }
     stale(i, pod, c, gap)
 }
 
@@ -974,7 +982,8 @@ pub fn big_root(cfg: &Config) -> String {
     crate::pull::big_root(&backup_dir(cfg), big)
 }
 
-/// Each `.arena-copied/<pod>`'s mtime under `base`.
+/// Each `.arena-copied/<pod>`'s mtime under `base`. Missing = none yet; any read that fails —
+/// the folder, an entry, its time — is `Err` (review r3 #1: never a quiet "none").
 fn read_copied(base: &Path) -> Result<BTreeMap<String, u64>, String> {
     let dir = base.join(disk::COPIED_DIR);
     let entries = match std::fs::read_dir(&dir) {
@@ -982,31 +991,36 @@ fn read_copied(base: &Path) -> Result<BTreeMap<String, u64>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => return Err(format!("{}: {e}", dir.display())),
     };
-    Ok(entries
-        .flatten()
-        .filter_map(|e| {
-            let t = e.metadata().ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-            Some((e.file_name().to_string_lossy().into_owned(), t))
-        })
-        .collect())
+    let mut out = BTreeMap::new();
+    for e in entries {
+        let e = e.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let at = e.metadata().and_then(|m| m.modified()).map_err(|err| format!("{}: {err}", e.path().display()))?;
+        out.insert(e.file_name().to_string_lossy().into_owned(), at.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
+    }
+    Ok(out)
 }
 
 /// Each pod's newest `wNdM` snapshot under `base`: one listing of the labels, one of each.
+/// Missing = none yet; a listing that fails is `Err`, as [`read_copied`].
 fn read_labels(base: &Path) -> Result<BTreeMap<String, String>, String> {
     let entries = match std::fs::read_dir(base) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => return Err(format!("{}: {e}", base.display())),
     };
-    let mut labels: Vec<((u32, u32), String)> =
-        entries.flatten().filter_map(|e| {
-            let l = e.file_name().to_string_lossy().into_owned();
-            Some((crate::restore::parse_label(&l)?, l))
-        }).collect();
+    let mut labels: Vec<((u32, u32), String)> = Vec::new();
+    for e in entries {
+        let l = e.map_err(|e| format!("{}: {e}", base.display()))?.file_name().to_string_lossy().into_owned();
+        if let Some(key) = crate::restore::parse_label(&l) {
+            labels.push((key, l));
+        }
+    }
     labels.sort();
     let mut out = BTreeMap::new();
     for (_, l) in labels {
-        for pod in std::fs::read_dir(base.join(&l)).into_iter().flatten().flatten() {
+        let dir = base.join(&l);
+        for pod in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+            let pod = pod.map_err(|e| format!("{}: {e}", dir.display()))?;
             let name = pod.file_name().to_string_lossy().into_owned();
             if !name.starts_with('.') && pod.file_type().is_ok_and(|t| t.is_dir()) {
                 out.insert(name, l.clone());

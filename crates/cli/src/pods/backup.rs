@@ -209,7 +209,8 @@ pub(crate) async fn handle_full_backup(
     };
     let (copy_left_out, git_left_out) = (left_out(Job::Copy), left_out(Job::Git));
     if sel.pods.is_empty() && !dry_run {
-        crate::backups::note_pods(cfg, git_left_out);
+        // Every pod left out: the run happened and failed, and says so (review r3 #2).
+        record_all_left_out(cfg, sel.named, no_pull, git_left_out, copy_left_out.clone());
     }
     let mut unpushed = Vec::new();
     let git_result = if sel.pods.is_empty() {
@@ -245,6 +246,19 @@ pub(crate) async fn handle_full_backup(
     print_fallback_copies(&settled.unsettled(&copying), &pulled);
     settled.print();
     both_failures(settled.git(git_result), pulled.and_then(Pulled::result), &locks.busy)
+}
+
+/// Every pod a `pods backup` run took up was left out — another backup held each one's lock for
+/// the whole wait — so nothing was pushed or copied: the run is recorded as what it was, a failed
+/// git run (and copy run, unless `--no-pull`) naming them (review r3 #2: the job's last run stayed
+/// the previous good one).
+pub(crate) fn record_all_left_out(cfg: &Config, named: bool, no_pull: bool, git: Vec<(String, arena_core::backups::record::Event)>, copy: Vec<(String, arena_core::backups::record::Event)>) {
+    let n = git.len();
+    let words = format!("nothing done: {n} left out (another backup held its lock)");
+    crate::backups::Run::start(cfg, Job::Git, n, crate::backups::scope_of(named)).finish(git, words.clone());
+    if !no_pull {
+        crate::backups::Run::start(cfg, Job::Copy, n, crate::backups::scope_of(named)).finish(copy, words);
+    }
 }
 
 /// A pod whose git push failed must never be left with no copy at all: live, the */15 cron runs

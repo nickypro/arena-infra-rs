@@ -28,7 +28,8 @@ pub fn cell(c: &Cell, now: u64) -> String {
     }
     let age = c.tried_at.map(|t| format!(" {}", short_age(now.saturating_sub(t)))).unwrap_or_default();
     let ok = match (c.health, c.ok_at) {
-        (Health::Fail | Health::Warn, Some(t)) if Some(t) != c.tried_at => format!(" (ok {})", short_age(now.saturating_sub(t))),
+        // The last success, when it's another time than the try's (a minute apart, at least).
+        (Health::Fail | Health::Warn, Some(t)) if c.tried_at.is_none_or(|tr| tr.abs_diff(t) >= 60) => format!(" (ok {})", short_age(now.saturating_sub(t))),
         (Health::Fail, None) if c.tried_at.is_some() => " (never ok)".into(),
         _ => String::new(),
     };

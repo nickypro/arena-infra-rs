@@ -89,17 +89,6 @@ impl Run {
     }
 }
 
-/// Record events for pods outside a run (a pod a run left out because another backup held its
-/// lock).
-pub(crate) fn note_pods(cfg: &Config, events: Vec<(String, Event)>) {
-    if events.is_empty() {
-        return;
-    }
-    if let Some(Ok(p)) = record_path(cfg) {
-        write(&p, |r| r.add_events(events));
-    }
-}
-
 /// Pods a run of `job` left out because another backup held their lock: their results — and, for
 /// a fleet-wide run (`named` false), the run's failures too ([`record::Record::amend`]).
 pub(crate) fn note_left_out(cfg: &Config, job: Job, events: Vec<(String, Event)>, named: bool) {
@@ -313,6 +302,27 @@ mod tests {
         let run = &rec.runs[&Job::Git];
         assert_eq!((run.ok, run.failed.as_slice(), run.summary.as_str()), (false, &["devtest-bloom".to_string()][..], "1 pushed, 0 no changes, 0 on main/master, 1 failed"));
         assert!(rec.pods["devtest-bloom"].git.as_ref().is_some_and(|e| e.outcome == Outcome::Failed && e.detail.starts_with("busy: another backup of devtest-bloom")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Every pod left out for its lock: nothing ran, and the record says the run failed — not the
+    /// previous good run (review r3 #2); under `--no-pull` the copy job is left alone.
+    #[test]
+    fn a_run_with_every_pod_left_out_is_a_failed_run() {
+        let base = std::env::temp_dir().join(format!("arena-cli-backups-allbusy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR={}\n", base.join("state").display()));
+        let busy = |job| vec![("devtest-bloom".to_string(), super::event(job, Outcome::Failed, "busy: another backup of devtest-bloom is running"))];
+        // A good run before.
+        super::Run::start(&cfg, Job::Git, 1, super::Scope::Fleet).finish(vec![("devtest-bloom".into(), super::event(Job::Git, Outcome::Pushed, ""))], "1 pushed".into());
+        crate::pods::backup::record_all_left_out(&cfg, false, true, busy(Job::Git), busy(Job::Copy));
+        let rec = Record::load(&base.join("state/devtest/backups.json")).unwrap().unwrap();
+        let run = &rec.runs[&Job::Git];
+        assert_eq!((run.ok, run.failed.as_slice(), run.summary.as_str()), (false, &["devtest-bloom".to_string()][..], "nothing done: 1 left out (another backup held its lock)"));
+        assert!(!rec.runs.contains_key(&Job::Copy), "--no-pull: no copy run");
+        crate::pods::backup::record_all_left_out(&cfg, false, false, busy(Job::Git), busy(Job::Copy));
+        let rec = Record::load(&base.join("state/devtest/backups.json")).unwrap().unwrap();
+        assert!(!rec.runs[&Job::Copy].ok);
         let _ = std::fs::remove_dir_all(&base);
     }
 
