@@ -5,6 +5,7 @@
 use super::*;
 use arena_core::remote::{FakeRemote, RemoteCall};
 use arena_core::Pod;
+use clap::Parser;
 
 /// A temp dir of fake keys: each `<name>` private file holds a marker, its `<name>.pub` a public
 /// key line. Removed on drop.
