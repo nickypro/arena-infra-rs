@@ -400,6 +400,23 @@ fn an_older_listing_neither_ends_nor_reopens_what_a_newer_observation_recorded()
 }
 
 #[test]
+fn a_listing_begun_before_a_stop_doesnt_restore_the_running_rate() {
+    // `pods list` lists at T0+H (it's running), waits on a balance read; meanwhile a stop is
+    // recorded at T0+H+1m; the listing records afterwards, stamped when it began.
+    let mut p = running("runpod", "rp1", "devtest-a", 0.40);
+    p.volume_gb = Some(0.0);
+    let s = created(SpendState::default(), &p, &given("al"), T0);
+    let s = see(s, &["runpod"], &[], std::slice::from_ref(&p), T0 + 50 * M);
+    let s = apply_event(s, &Event::Stopped { provider: Some("runpod"), id: "rp1" }, T0 + H + M);
+    let after_stop = s.clone();
+    let s = see(s, &["runpod"], &[], std::slice::from_ref(&p), T0 + H);
+    assert_eq!(s.machines, after_stop.machines, "older than the stop: changes nothing");
+    p.status = "EXITED".into();
+    let s = see(s, &["runpod"], &[], &[p], T0 + H + 5 * M);
+    assert!(close(machine(&s, "runpod", "rp1").accrued, 0.40 * (1.0 + 1.0 / 60.0)), "{:?}", machine(&s, "runpod", "rp1").segs);
+}
+
+#[test]
 fn a_long_unpriced_silence_is_both_a_gap_and_unpriced() {
     let p = pod("runpod", "x", "devtest-b", "RUNNING", None);
     let mut s = see(tracked(), &["runpod"], &[], std::slice::from_ref(&p), T0);
@@ -585,6 +602,24 @@ fn the_keys_are_due_a_listing_hourly() {
 }
 
 #[test]
+fn a_window_starting_inside_a_thinned_day_never_takes_a_later_reading_as_its_start() {
+    let day = 86_400;
+    let d0 = T0 - T0 % day; // a UTC midnight
+    let mut u = Vec::new();
+    sample(&mut u, d0 - day + 12 * H, 0.0); // the day before
+    sample(&mut u, d0, 0.0);
+    sample(&mut u, d0 + 12 * H, 5.0);
+    sample(&mut u, d0 + 23 * H, 10.0);
+    sample(&mut u, d0 + 40 * day, 12.0); // weeks on: that day is thinned
+    assert!(u.iter().all(|x| x.from >= d0 - day), "{u:?}");
+    assert!(u.contains(&Usage { from: d0 + 23 * H, to: d0 + 23 * H, usd: 10.0 }), "the day's last reading, as read: {u:?}");
+    let k = AiKey { hash: "k".into(), name: "devtest-a".into(), owner: None, owner_how: None, created: None, first_seen: d0, usage: u, gone: None };
+    // From noon that day: $12 less what it had then ($5) — not less $10 unflagged.
+    let row = key_row(&k, Some(d0 + 12 * H));
+    assert!(row.base_stale && row.usd >= 12.0 - 5.0, "{row:?}");
+}
+
+#[test]
 fn old_key_samples_thin_to_one_a_day() {
     let mut u = Vec::new();
     for i in 0..(40 * 24) {
@@ -707,6 +742,22 @@ fn a_window_starting_mid_hour_takes_billing_for_whole_hours_inside_it_only() {
 }
 
 #[test]
+fn the_footer_counts_the_same_hours_on_both_sides() {
+    // --since 00:30; a pod made at 00:45 and gone at 00:50: its 00:00 bucket is in its own row
+    // (it began inside the window) but in neither side of the footer.
+    let p = running("runpod", "rp1", "devtest-a", 1.0);
+    let s = created(SpendState::default(), &p, &OwnerRule::None, T0 + 45 * M);
+    let s = apply_event(s, &Event::Terminated { provider: Some("runpod"), id: "rp1" }, T0 + 50 * M);
+    let now = T0 + 4 * H;
+    let billed = PodBilled { from: T0, to: now, pods: [("rp1".to_string(), [(T0, 0.10)].into())].into(), at: now };
+    let account = Billed { buckets: vec![(T0, 0.10), (T0 + H, 0.0)], from: T0, to: now };
+    let r = report(&s, &naming(), Some(T0 + 30 * M), now, Some(&billed), Some(&account));
+    assert!(close(r.machines[0].amount, 0.10), "{:?}", r.machines[0]);
+    let a = r.runpod.unwrap();
+    assert!(close(a.rows, 0.0) && close(a.account, 0.0), "{a:?}");
+}
+
+#[test]
 fn billing_back_to_a_pods_creation_counts_what_ran_before_arena_saw_it() {
     // Tracking began on Hetzner at T0; RunPod failed to list; its pod, made at T0-2H, is
     // first seen at T0+3H and watched to T0+6H.
@@ -771,6 +822,10 @@ fn the_machine_table_and_csvs() {
     assert!(owners.lines().any(|l| l.starts_with("(no owner),charlie,1,")), "{owners}");
     assert!(owners.lines().last().unwrap().starts_with("total,"));
     assert_eq!(csv_field("a,b"), "\"a,b\"");
+    // A machine seen once (nothing accrued yet) is 0, never -0.
+    let s = created(SpendState::default(), &running("hetzner", "9", "devtest-new", 0.01), &OwnerRule::None, T0);
+    assert!(s.machines[0].accrued.is_sign_positive());
+    assert!(csv_machines(&rep(&s, None, T0)).contains(",0.0000,metered,"), "{}", csv_machines(&rep(&s, None, T0)));
 }
 
 #[test]
@@ -847,6 +902,19 @@ fn a_second_ignored_ledger_in_the_same_second_gets_a_name_of_its_own() {
     assert!(w.unwrap().contains(&format!("{SPEND_FILE}.ignored-{T0}-1")));
     assert_eq!(std::fs::read_to_string(d.0.join(format!("{SPEND_FILE}.ignored-{T0}"))).unwrap(), "first");
     assert_eq!(std::fs::read_to_string(d.0.join(format!("{SPEND_FILE}.ignored-{T0}-1"))).unwrap(), "second");
+}
+
+#[test]
+fn a_ledger_moved_aside_is_remembered_and_the_report_says_so() {
+    let d = tmp("restart");
+    let path = d.0.join(SPEND_FILE);
+    std::fs::write(&path, "{ not json").unwrap();
+    let (s, _) = record(&path, T0, |s| s).unwrap();
+    assert_eq!(s.restarts.len(), 1);
+    assert!(s.restarts[0].aside.ends_with(&format!("{SPEND_FILE}.ignored-{T0}")) && !s.restarts[0].why.is_empty());
+    assert_eq!(load(&path).0.restarts, s.restarts, "kept in the new ledger");
+    let r = rep(&s, None, T0 + H);
+    assert!(notes(&r).iter().any(|n| n.contains("started afresh") && n.contains("isn't counted here")), "{:?}", notes(&r));
 }
 
 // ---- the HTTP reads ----------------------------------------------------------------

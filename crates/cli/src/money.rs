@@ -183,7 +183,7 @@ pub(crate) async fn balance_report(
     // What each machine costs, for `arena spend` (quietly) — not under `--no-live`, which
     // writes nothing.
     if !flags.no_live {
-        super::spend::SpendCtx::from_config(cfg).listing(&listing, &pods);
+        super::spend::SpendCtx::from_config(cfg).listing(&listing, &pods, now);
     }
     let burns = balance::burns_with(&listing, &pods, &state, &policy);
     let (state, save_warning) = balance::commit(path, state, &fetched, &burns, mode, now);

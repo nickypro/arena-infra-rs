@@ -697,6 +697,9 @@ async fn refresh(
     details: &mut DetailsState,
     forced: bool,
 ) {
+    // The spend ledger records the listing as of when it began (a stop the dashboard made
+    // meanwhile is newer, and stands).
+    let listed_at = snapshot::unix_now();
     let (fresh, listing) = list_all(provider, details).await;
     let now = snapshot::unix_now();
     // The prepaid balances on the details cadence (every DETAILS_EVERY, or `r` after the
@@ -785,7 +788,7 @@ async fn refresh(
     // What each machine costs, for `arena spend` — quietly, and an unchanged machine isn't
     // rewritten more than once a minute. Only the providers that listed this time count
     // (`fresh`): a rate-limited one's carried rows say nothing new.
-    arena_core::spend::record_listing(spend_path(cfg).as_deref(), &fresh, &pods, &Naming::from_config(cfg), now);
+    arena_core::spend::record_listing(spend_path(cfg).as_deref(), &fresh, &pods, &Naming::from_config(cfg), listed_at);
     // The balance's runway is judged against what is billing as listed (not the pending
     // placeholders, and after the details filled the prices), a provider that failed to
     // list — or was rate-limited, its rows carried — counting as unknown, never as $0/h.

@@ -18,7 +18,7 @@ use arena_core::provider::{ContainerReset, Provider};
 use arena_core::proxy::Listing;
 use arena_core::selector::Naming;
 use arena_core::snapshot::unix_now;
-use arena_core::spend::{self, Event, HttpSpendApi, OwnerRule, SpendApi, SpendState};
+use arena_core::spend::{self, Event, HttpSpendApi, OwnerRule, SpendApi};
 use arena_core::{Config, Pod, PodSpec};
 
 use super::money::Printed;
@@ -64,18 +64,22 @@ impl SpendCtx {
     }
 
     /// The ledger as it stands (empty without one).
-    pub(crate) fn state(&self) -> SpendState {
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> spend::SpendState {
         self.path().map(|p| spend::load(p).0).unwrap_or_default()
     }
 
-    /// Record a listing (a surface that listed every provider: `pods list`, teardown, …).
-    pub(crate) fn listing(&self, listing: &Listing, pods: &[Pod]) {
-        spend::record_listing(self.path(), listing, pods, &self.naming(), unix_now());
+    /// Record a listing (a surface that listed every provider: `pods list`, teardown, …)
+    /// begun `at` — when the reads began, not when they came back: a stop or a mint recorded
+    /// meanwhile is newer than what the listing saw, and the fold keeps it.
+    pub(crate) fn listing(&self, listing: &Listing, pods: &[Pod], at: u64) {
+        spend::record_listing(self.path(), listing, pods, &self.naming(), at);
     }
 
-    /// Record a complete key listing: each key's usage, read before anything deletes one.
-    pub(crate) fn keys(&self, keys: &[KeyInfo]) {
-        spend::record_keys(self.path(), keys, &self.naming(), unix_now());
+    /// Record a complete key listing begun `at`: each key's usage, read before anything
+    /// deletes one.
+    pub(crate) fn keys(&self, keys: &[KeyInfo], at: u64) {
+        spend::record_keys(self.path(), keys, &self.naming(), at);
     }
 
     /// Keys arena just deleted (`deleted`: hashes), with their final usage as `listed` just
@@ -277,14 +281,23 @@ pub(crate) struct Handover {
 }
 
 /// The handovers creating `names` for `owner` makes (none with `--keep-key`, without an
-/// owner, or with no ledger).
-pub(crate) fn handovers(ctx: &SpendCtx, names: &[String], owner: Option<&str>, keep_key: bool) -> Vec<Handover> {
-    let Some(owner) = owner.filter(|_| !keep_key) else { return Vec::new() };
-    let state = ctx.state();
-    names
+/// owner, or with no ledger yet). A ledger that can't be read is an error: whose keys these
+/// names hold is unknown, and creating anyway could hand one person's key to another.
+pub(crate) fn handovers(ctx: &SpendCtx, names: &[String], owner: Option<&str>, keep_key: bool) -> Result<Vec<Handover>> {
+    let Some(owner) = owner.filter(|_| !keep_key) else { return Ok(Vec::new()) };
+    let Some(path) = ctx.path() else { return Ok(Vec::new()) };
+    let state = match spend::load(path) {
+        (s, spend::Loaded::Ok | spend::Loaded::Missing) => s,
+        (_, spend::Loaded::Ignored(why)) => anyhow::bail!(
+            "the spend ledger {} can't be read ({why}), so whose OpenRouter keys these names hold is unknown. \
+             `arena spend` moves it aside and starts afresh (owners recorded so far are lost); or pass --keep-key",
+            path.display()
+        ),
+    };
+    Ok(names
         .iter()
         .filter_map(|n| spend::handover_needed(&state, n, owner).map(|from| Handover { name: n.clone(), from: from.to_string() }))
-        .collect()
+        .collect())
 }
 
 /// What a dry run (or the plan before the prompt) says the owner and the handovers will do.
@@ -333,6 +346,7 @@ pub(crate) async fn hand_over(ctx: &SpendCtx, cfg: &Config, api: Option<&dyn Key
         done.failed = names();
         return done;
     };
+    let listed_at = unix_now();
     let keys = match api.list_keys().await {
         Ok(k) => k,
         Err(e) => {
@@ -341,7 +355,7 @@ pub(crate) async fn hand_over(ctx: &SpendCtx, cfg: &Config, api: Option<&dyn Key
             return done;
         }
     };
-    ctx.keys(&keys);
+    ctx.keys(&keys, listed_at);
     let naming = Naming::from_config(cfg);
     let prefix = naming.prefix.to_string();
     let limit = cfg.get_parsed::<f64>("OPENROUTER_KEY_LIMIT").unwrap_or(5.0);
@@ -363,7 +377,15 @@ pub(crate) async fn hand_over(ctx: &SpendCtx, cfg: &Config, api: Option<&dyn Key
                         (deleted, true)
                     }
                     Err(e) => {
-                        done.lines.push(format!("✗ {}: a fresh key {short} was minted for {owner} but couldn't be saved ({e:#})", h.name));
+                        // Its secret is lost (OpenRouter shows it once): revoke it rather than
+                        // leave a live key nobody holds.
+                        let fresh = KeyInfo { hash: ck.hash.clone(), name: Some(kn.clone()), usage: Some(0.0), ..KeyInfo::default() };
+                        let revoked = api.delete_key(&ck.hash).await.is_ok();
+                        if revoked {
+                            ctx.keys_deleted(&[&fresh], std::slice::from_ref(&ck.hash));
+                        }
+                        let then = if revoked { "revoked it".to_string() } else { format!("revoke it: `arena keys revoke {}`", h.name) };
+                        done.lines.push(format!("✗ {}: a fresh key {short} was minted for {owner} but couldn't be saved ({e:#}) — {then}", h.name));
                         (deleted, false)
                     }
                 }
@@ -455,10 +477,9 @@ pub(crate) async fn spend_report(
         }
     };
     let currency = async { within(ctx.api.hetzner_currency()).await.unwrap_or_else(|()| Some(Err(late()))) };
+    // Recorded and reported as of `now`, when the reads began: what a command recorded
+    // meanwhile is newer, and stands.
     let ((listing, pods, enrich_warning), key_list, currency) = tokio::join!(listing, key_list, currency);
-    // Recorded and reported as of when the reads came back (a listing older than what a cron
-    // recorded meanwhile changes nothing anyway).
-    let now = unix_now().max(now);
     stderr.extend(enrich_warning);
     // Billing from where the window (or the ledger) begins.
     let from = arena_core::balance::floor_hour(flags.since.or(before.since).unwrap_or(now).min(now));
@@ -758,10 +779,10 @@ mod tests {
         api.keys.lock().unwrap()[0].usage = Some(1.25);
         alice.terminate_pod(&pod.id).await.unwrap();
         let names = vec!["devtest-alpha".to_string()];
-        let h = handovers(&ctx, &names, Some("bob"), false);
+        let h = handovers(&ctx, &names, Some("bob"), false).unwrap();
         assert_eq!(h, [Handover { name: "devtest-alpha".into(), from: "alice".into() }]);
-        assert!(handovers(&ctx, &names, Some("bob"), true).is_empty(), "--keep-key");
-        assert!(handovers(&ctx, &names, Some("alice"), false).is_empty(), "the same owner");
+        assert!(handovers(&ctx, &names, Some("bob"), true).unwrap().is_empty(), "--keep-key");
+        assert!(handovers(&ctx, &names, Some("alice"), false).unwrap().is_empty(), "the same owner");
         let plan = owner_lines(Some("bob"), &names, &h, false, true);
         assert!(plan[1].contains("would rotate devtest-alpha's OpenRouter key first: it was alice's"), "{plan:?}");
         let said = hand_over(&ctx, &cfg, Some(&api as &dyn KeyApi), &keys_dir, &h, "bob").await;
@@ -791,7 +812,7 @@ mod tests {
         ctx.key_minted(&ck.hash, "devtest-alpha", Some("alice"));
         api.keys.lock().unwrap()[0].usage = Some(0.75);
         let names = vec!["devtest-alpha".to_string()];
-        let h = handovers(&ctx, &names, Some("bob"), false);
+        let h = handovers(&ctx, &names, Some("bob"), false).unwrap();
         // The old key is deleted, the fresh one can't be minted.
         *api.refuse_create.lock().unwrap() = true;
         let done = hand_over(&ctx, &cfg, Some(&api as &dyn KeyApi), &keys_dir, &h, "bob").await;
@@ -803,9 +824,49 @@ mod tests {
         // alice's key: deleted by arena, its last usage kept hers.
         let k = &ctx.state().keys[0];
         assert_eq!((k.owner.as_deref(), k.last_usage(), k.gone.map(|g| g.how)), (Some("alice"), 0.75, Some(spend::KeyEndHow::Deleted)));
+        // A retry: no live key for the name, so nothing to hand over — and none of alice's
+        // left to copy onto bob's machine (its row went).
+        assert!(handovers(&ctx, &names, Some("bob"), false).unwrap().is_empty());
         // No provisioning key, or a listing that fails: every name failed, nothing deleted.
         let none = hand_over(&ctx, &cfg, None, &keys_dir, &[Handover { name: "devtest-b".into(), from: "al".into() }], "bob").await;
         assert_eq!((none.failed.as_slice(), none.csv_changed), (["devtest-b".to_string()].as_slice(), false));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_key_that_cant_be_saved_is_revoked() {
+        let d = tmp("unsaved");
+        let cfg = cfg(&d.0);
+        let ctx = SpendCtx::from_config(&cfg);
+        let api = FakeKeys::default();
+        let ck = api.create_key("devtest-alpha", Some(1.0)).await.unwrap();
+        ctx.key_minted(&ck.hash, "devtest-alpha", Some("alice"));
+        let names = vec!["devtest-alpha".to_string()];
+        let h = handovers(&ctx, &names, Some("bob"), false).unwrap();
+        // The keys folder can't be made (a file is in the way).
+        std::fs::write(d.0.join("file"), "").unwrap();
+        let done = hand_over(&ctx, &cfg, Some(&api as &dyn KeyApi), &d.0.join("file").join("keys"), &h, "bob").await;
+        assert_eq!(done.failed, names);
+        assert!(done.lines[0].contains("couldn't be saved") && done.lines[0].ends_with("revoked it"), "{done:?}");
+        assert_eq!(api.deleted.lock().unwrap().len(), 2, "alice's key, then the unsaved one");
+        assert!(api.keys.lock().unwrap().is_empty());
+        assert!(ctx.state().keys.iter().all(|k| k.gone.is_some()), "{:?}", ctx.state().keys);
+        assert!(handovers(&ctx, &names, Some("bob"), false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_ledger_stops_a_create_for_an_owner_unless_keep_key() {
+        let d = tmp("badledger");
+        let cfg = cfg(&d.0);
+        let ctx = SpendCtx::from_config(&cfg);
+        let names = vec!["devtest-alpha".to_string()];
+        assert!(handovers(&ctx, &names, Some("bob"), false).unwrap().is_empty(), "no ledger yet: nothing to hand over");
+        let path = ctx.path().unwrap().to_path_buf();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+        let err = handovers(&ctx, &names, Some("bob"), false).unwrap_err().to_string();
+        assert!(err.contains("can't be read") && err.contains("--keep-key"), "{err}");
+        assert!(handovers(&ctx, &names, Some("bob"), true).unwrap().is_empty());
+        assert!(handovers(&ctx, &names, None, false).unwrap().is_empty(), "no --owner: no question asked");
     }
 
     #[tokio::test]

@@ -139,9 +139,9 @@ async fn collect(
     // What it listed — machines and AI keys — into the spend ledger (quietly): an end-of-
     // program check is often the last look before the bill.
     let tracking = crate::spend::SpendCtx::from_config(cfg);
-    tracking.listing(&listing, &listing.pods());
+    tracking.listing(&listing, &listing.pods(), now);
     if let Probe::Got(k) = &keys {
-        tracking.keys(k);
+        tracking.keys(k, now);
     }
     // A malformed ARCHIVE_KEEP_UNTIL keeps nothing (the archive then shows as remaining).
     let archive_keep_until = arena_core::archive::keep_until_from_config(cfg).unwrap_or_else(|e| {

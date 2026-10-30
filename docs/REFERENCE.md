@@ -2163,7 +2163,10 @@ meters it), a stopped pod's disk only (RunPod: its volume at $0.20/GB-month; Vas
 ceiling), a price change. Between two observations the cost is a step at the higher end. A
 provider that failed to list ends nothing; only this fleet's names (`{prefix}-…`, `@` entries) get
 rows, so another fleet's pods on a shared account stay out. An unreadable or newer-version ledger
-is moved aside (`spend.json.ignored-<time>`), never overwritten.
+is moved aside (`spend.json.ignored-<time>`), never overwritten, and `arena spend` notes from when
+the new one counts; until then `--owner` stops a create (whose keys are whose is unknown) unless
+`--keep-key`. A listing is recorded as of when it began, so a stop or terminate recorded while it
+was in flight stands.
 
 **RunPod's own numbers.** RunPod's REST billing splits per pod: `GET /v2/billing/pods`, hourly,
 one record per pod (checked live 2026-10-30: the records sum to `/v2/billing`'s total). `arena

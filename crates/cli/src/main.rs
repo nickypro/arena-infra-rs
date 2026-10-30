@@ -1846,13 +1846,14 @@ impl Provider for RecordingProvider<'_> {
 }
 
 /// `create`/`up --owner`: print what will be recorded and which names' AI keys are handed over
-/// (rotated: the old owner keeps what they spent); returns those handovers.
-fn owner_plan(tracking: &spend::SpendCtx, owner: &spend::OwnerArgs, names: &[String], dry_run: bool) -> Vec<spend::Handover> {
-    let handing = spend::handovers(tracking, names, owner.owner.as_deref(), owner.keep_key);
+/// (rotated: the old owner keeps what they spent); returns those handovers. `Err` when the
+/// ledger can't be read (whose keys these are is unknown): before anything is created.
+fn owner_plan(tracking: &spend::SpendCtx, owner: &spend::OwnerArgs, names: &[String], dry_run: bool) -> Result<Vec<spend::Handover>> {
+    let handing = spend::handovers(tracking, names, owner.owner.as_deref(), owner.keep_key)?;
     for line in spend::owner_lines(owner.owner.as_deref(), names, &handing, owner.keep_key, dry_run) {
         println!("{line}");
     }
-    handing
+    Ok(handing)
 }
 
 /// Run the handovers [`owner_plan`] found, after the prompt and before any create: whether
@@ -1871,8 +1872,9 @@ async fn hand_keys_over(tracking: &spend::SpendCtx, cfg: &Config, owner: &spend:
     }
     if !done.failed.is_empty() {
         anyhow::bail!(
-            "the OpenRouter key handover failed for {} — nothing was created. Re-run once the key can be rotated \
-             (`arena keys rotate <name>`), or pass --keep-key to create with the name's current key",
+            "the OpenRouter key handover failed for {} — nothing was created. Re-run once `arena keys rotate <name>` \
+             works, or pass --keep-key to create with the name's current key (a name whose old key is already gone \
+             is created without one: `arena keys gen <name>` then mints its new owner's)",
             done.failed.join(", ")
         );
     }
@@ -7907,8 +7909,8 @@ async fn list_with(
     };
     let (listed, fetched) = tokio::join!(listing, observing);
     let (listing, pods, mut warnings) = listed?;
-    // What each machine costs, recorded for `arena spend` (quietly).
-    spend::SpendCtx::from_config(cfg).listing(&listing, &pods);
+    // What each machine costs, recorded for `arena spend` (quietly), as of when it listed.
+    spend::SpendCtx::from_config(cfg).listing(&listing, &pods, now);
     // SSH_CONFIG_FILE (and staff's SSH_ADMIN_CONFIG_FILE) kept current from this listing — a
     // complete one only (a provider that failed would drop its pods' blocks); nothing at all
     // when they're unset or nothing moved.
@@ -8066,7 +8068,7 @@ async fn handle_pods_bal(
                 print_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]));
                 warn_no_volume(provider, &spec);
                 print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
-                owner_plan(&tracking, &owner, &names, true);
+                owner_plan(&tracking, &owner, &names, true)?;
                 println!("\nDry-run only — no pods created (this is a preview).");
                 return Ok(());
             }
@@ -8081,7 +8083,7 @@ async fn handle_pods_bal(
             // The account balance for these pods, next to the prompt: advisory (it never
             // blocks, and `--yes` changes nothing), quiet if the balance can't be read.
             print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
-            let handing = owner_plan(&tracking, &owner, &names, false);
+            let handing = owner_plan(&tracking, &owner, &names, false)?;
             if !confirm(yes, &what)? {
                 println!("aborted.");
                 return Ok(());
@@ -8205,7 +8207,7 @@ async fn handle_pods_bal(
                 print_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]));
                 warn_no_volume(provider, &spec);
                 print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
-                owner_plan(&tracking, &owner, &names, true);
+                owner_plan(&tracking, &owner, &names, true)?;
                 let retry = if retry_mins > 0 { format!(" (retrying up to {retry_mins}m for capacity)") } else { String::new() };
                 println!(
                     "\nDry-run only — no pods created (preview){retry}: would create the above, then {per_pod}. \
@@ -8241,7 +8243,7 @@ async fn handle_pods_bal(
             // The account balance for these pods, next to the prompt: advisory (it never
             // blocks, and `--yes` changes nothing), quiet if the balance can't be read.
             print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
-            let handing = owner_plan(&tracking, &owner, &names, false);
+            let handing = owner_plan(&tracking, &owner, &names, false)?;
             if !confirm(yes, &what)? {
                 println!("aborted.");
                 return Ok(());
@@ -9136,10 +9138,11 @@ async fn collect_snapshot(
     // keys too, once an hour (bounded, quiet): `--since` then finds each key's usage near a
     // day's start, and a key deleted outside arena keeps a recent last reading.
     let tracking = spend::SpendCtx::from_config(cfg);
-    tracking.listing(&listing, &pods);
+    tracking.listing(&listing, &pods, now);
     if let Some(or) = openrouter_client(cfg).filter(|_| tracking.keys_due()) {
+        let listed_at = arena_core::snapshot::unix_now();
         if let Ok(Ok(keys)) = arena_core::ratelimit::bounded(ENRICH_TIMEOUT, arena_core::openrouter::KeyApi::list_keys(&or)).await {
-            tracking.keys(&keys);
+            tracking.keys(&keys, listed_at);
         }
     }
     let (proxy, w) = snapshot::local_proxy_text(cfg);
@@ -10697,6 +10700,7 @@ async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: 
         out.failed = machines.to_vec(); // the caller checked up front
         return out;
     };
+    let listed_at = arena_core::snapshot::unix_now();
     let keys = match api.list_keys().await {
         Ok(k) => k,
         Err(e) => {
@@ -10708,7 +10712,7 @@ async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: 
         }
     };
     // Each key's usage before any is deleted: a revoked key's spend stays its owner's.
-    tracking.keys(&keys);
+    tracking.keys(&keys, listed_at);
     let mut csv = book.read_csv();
     let mut dropped = Vec::new();
     let mut deleted: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -16640,6 +16644,7 @@ async fn keys_with(
         KeysCmd::Revoke { sel, dry_run } => (KeysAction::Revoke, sel, None, false, dry_run),
     };
     let limit = limit.unwrap_or(default_limit);
+    let listed_at = arena_core::snapshot::unix_now();
     let existing = api.list_keys().await.context("listing OpenRouter keys")?;
     let known = key_holders(&naming, &existing, std::fs::read_to_string(&csv_path).ok().as_deref());
     let (names, live) = keys_targets(provider, cfg, &sel.args(), &known).await?;
@@ -16680,7 +16685,7 @@ async fn keys_with(
     // Each key's usage, recorded before anything is deleted: a rotated or revoked key's
     // spend stays with whoever it was minted for (`arena spend`).
     let tracking = spend::SpendCtx::from_config(cfg);
-    tracking.keys(&existing);
+    tracking.keys(&existing, listed_at);
     let (mut ok, mut skipped, mut failed) = (0, 0, 0);
     for (host, kn, theirs) in &plan {
         if action == KeysAction::Gen && !theirs.is_empty() {

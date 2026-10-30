@@ -347,6 +347,19 @@ pub struct SpendState {
     /// When the AI keys were last listed completely (the snapshot cron lists them hourly).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys_listed: Option<u64>,
+    /// Earlier ledgers that couldn't be read and were moved aside: what they held (owners,
+    /// spend before then) isn't in this one, and `arena spend` says so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restarts: Vec<Restart>,
+}
+
+/// A ledger moved aside ([`record`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Restart {
+    pub at: u64,
+    /// Where the old file went.
+    pub aside: String,
+    pub why: String,
 }
 
 impl Default for SpendState {
@@ -359,6 +372,7 @@ impl Default for SpendState {
             currencies: BTreeMap::new(),
             listed: BTreeMap::new(),
             keys_listed: None,
+            restarts: Vec::new(),
         }
     }
 }
@@ -860,8 +874,9 @@ fn adopt_keys(state: &mut SpendState, machine: &str, owner: &str) {
 
 /// Record a usage reading: the same value extends its span; a new one starts a span. A
 /// reading never goes down (a refund or a reset isn't spend we can place) — and one taken
-/// on a clock that went back still raises the last value, never lost. Spans older than
-/// [`KEY_THIN_AFTER`] are merged to one per UTC day (each day's last value).
+/// on a clock that went back still raises the last value, never lost. Of spans older than
+/// [`KEY_THIN_AFTER`], each UTC day keeps its last, as read: a window starting earlier that
+/// day falls on the day before's (flagged `base_stale`), never on a value read later.
 fn sample(usage: &mut Vec<Usage>, now: u64, u: f64) {
     if !u.is_finite() || u < 0.0 {
         return;
@@ -876,7 +891,7 @@ fn sample(usage: &mut Vec<Usage>, now: u64, u: f64) {
     for s in usage.iter().copied() {
         if let Some(prev) = kept.last_mut() {
             if s.to < cut && prev.from / 86_400 == s.from / 86_400 {
-                *prev = Usage { from: prev.from, to: s.to, usd: s.usd };
+                *prev = s;
                 continue;
             }
         }
@@ -1145,12 +1160,17 @@ pub fn metered_by_hour(m: &Machine, from: u64, to: u64) -> BTreeMap<u64, Hour> {
     out
 }
 
+/// A sum that's `0.0` when empty (`Iterator::sum` gives `-0.0`: `-0.0000` in a CSV).
+fn sum0(values: impl Iterator<Item = f64>) -> f64 {
+    values.fold(0.0, |a, b| a + b)
+}
+
 /// Recompute every machine's `accrued` and `estimate` (from its start to its end or last
 /// observation).
 fn refresh_accrued(state: &mut SpendState) {
     for m in &mut state.machines {
         let hours = metered_by_hour(m, 0, u64::MAX);
-        m.accrued = hours.values().map(|h| h.amount).sum();
+        m.accrued = sum0(hours.values().map(|h| h.amount));
         m.estimate = hours.values().any(|h| !h.kinds.is_empty());
     }
 }
@@ -1309,6 +1329,9 @@ pub struct Report {
     pub keys: Vec<KeyRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runpod: Option<Accounted>,
+    /// Earlier ledgers moved aside (their spend isn't in this report).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub restarts: Vec<Restart>,
 }
 
 /// A machine's cost in `[from, to)`, RunPod hours corrected by `billed` where it has them.
@@ -1339,7 +1362,7 @@ fn machine_row(state: &SpendState, m: &Machine, from: u64, to: u64, billed: Opti
             let in_span = |h: u64| h >= floor_hour(span) && h <= last && h < to && usable(h);
             let mut hours: BTreeSet<u64> = metered.keys().copied().collect();
             hours.extend(bill.keys().copied().filter(|h| in_span(*h)));
-            billed_total = Some(bill.iter().filter(|(h, _)| in_span(**h)).map(|(_, v)| v).sum());
+            billed_total = Some(sum0(bill.iter().filter(|(h, _)| in_span(**h)).map(|(_, v)| *v)));
             // A complete answer that has this pod: an hour it settled without a bucket billed
             // nothing (stopped with no volume, say). One without the pod at all says nothing.
             let known = !bill.is_empty();
@@ -1498,16 +1521,23 @@ pub fn report(state: &SpendState, naming: &Naming, since: Option<u64>, now: u64,
     }
     let runpod = match (billed, account) {
         (Some(b), Some(a)) => {
-            let rows: f64 = machines.iter().filter(|r| r.provider == "runpod").filter_map(|r| r.billed).sum();
-            // Whole hours, as the rows take billing: a window starting mid-hour starts here
-            // at the next hour.
+            // Both sides over the same hours: whole ones inside the window (a window starting
+            // mid-hour starts here at the next hour) — the rows' pods' buckets, and the account's.
             let start = from.div_ceil(3_600).saturating_mul(3_600).max(b.from).max(a.from);
-            let account: f64 = a.buckets.iter().filter(|(h, _)| *h >= start && *h < now).map(|(_, v)| v).sum();
+            let within = |h: u64| h >= start && h < now;
+            let ids: BTreeSet<&str> = machines.iter().filter(|r| r.provider == "runpod").map(|r| r.id.as_str()).collect();
+            let rows = sum0(
+                b.pods
+                    .iter()
+                    .filter(|(id, _)| ids.contains(id.as_str()))
+                    .flat_map(|(_, hours)| hours.iter().filter(|(h, _)| within(**h)).map(|(_, v)| *v)),
+            );
+            let account = sum0(a.buckets.iter().filter(|(h, _)| within(*h)).map(|(_, v)| *v));
             Some(Accounted { rows, account })
         }
         _ => None,
     };
-    Report { since, tracking_since: state.since, now, owners, total, machines, keys, runpod }
+    Report { since, tracking_since: state.since, now, owners, total, machines, keys, runpod, restarts: state.restarts.clone() }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1672,6 +1702,15 @@ pub fn notes(r: &Report) -> Vec<String> {
             stale.join(", ")
         ));
     }
+    for x in &r.restarts {
+        out.push(format!(
+            "! the ledger started afresh at {} UTC: the one before couldn't be read ({}) and is at {} — what it held \
+             (owners, spend before then) isn't counted here",
+            ymd_hm(x.at),
+            x.why,
+            x.aside
+        ));
+    }
     if let Some(a) = r.runpod {
         out.push(format!(
             "runpod: accounted for {} of {} billed on the account in this window (billing lags ~1 h; the rest is other pods, \
@@ -1699,7 +1738,7 @@ fn csv_line(fields: &[String]) -> String {
 }
 
 fn num(v: f64) -> String {
-    format!("{v:.4}")
+    format!("{:.4}", v + 0.0) // never `-0.0000`
 }
 
 /// The currencies a report holds, USD first (AI is USD).
@@ -1827,7 +1866,7 @@ pub fn record(path: &Path, now: u64, f: impl FnOnce(SpendState) -> SpendState) -
     // change (a create, an owner, a key's final usage).
     let lock = std::fs::File::open(dir)?;
     lock.lock()?;
-    let (state, loaded) = load(path);
+    let (mut state, loaded) = load(path);
     let mut warning = None;
     if let Loaded::Ignored(why) = &loaded {
         // A name no earlier copy has: an ignored ledger is never overwritten.
@@ -1836,6 +1875,7 @@ pub fn record(path: &Path, now: u64, f: impl FnOnce(SpendState) -> SpendState) -
             .find(|p| std::fs::symlink_metadata(p).is_err())
             .expect("an unused name");
         std::fs::rename(path, &aside)?;
+        state.restarts.push(Restart { at: now, aside: aside.display().to_string(), why: why.clone() });
         warning = Some(format!(
             "warning: the spend ledger {} couldn't be used ({why}) — moved to {} and started afresh",
             path.display(),
