@@ -41,9 +41,9 @@ const MAX_FLOOR_GB: u64 = 100_000;
 /// A gigabyte as `df -H` and the settings count it (10⁹ bytes).
 pub const GB: u64 = 1_000_000_000;
 /// A pod's first copy into a destination, when nothing measured it: about a fresh GPU image's
-/// home (live 4: a RunPod image home took ~2.1 GB; live: a 1.4 GB pod wrote 2.8 GB over both
-/// tiers, i.e. ~1.4 GB per tier).
-pub const FIRST_COPY: u64 = 2 * GB;
+/// home, at the high end (live 4: a RunPod image home took ~2.1 GB; live: a 1.4 GB pod wrote 2.8 GB
+/// over both tiers; live 2026-10-30: a RunPod A4500 pod's 3.9 GB home, 3.0 GB a tier).
+pub const FIRST_COPY: u64 = 3 * GB;
 /// A later copy onto an earlier one of the same pod, when nothing measured it: rsync writes only
 /// what changed (a snapshot hard-links the rest to the pod's previous one), usually far less.
 pub const LATER_COPY: u64 = GB / 10;
@@ -713,7 +713,7 @@ pub fn was_copied(base: &Path, pod: &str) -> bool {
 /// Start marking whole copies in the backup at `base`, once, before a run's copies: a backup from
 /// before arena marked them (no [`COPIED_DIR`] yet) gets every pod with a snapshot there marked —
 /// as arena took them until then (files there: a later copy). Without that, the upgrade would turn
-/// every pod's next copy into a first one (~4 GB a pod over both tiers), and a box with room for
+/// every pod's next copy into a first one (~6 GB a pod over both tiers), and a box with room for
 /// the fleet's changes but not for that would skip them all. Made aside and renamed into place,
 /// so a run stopped halfway marks none; a backup with no pods yet gets an empty one (from then on,
 /// only whole copies mark). `Ok(n)`: how many pods it marked (0: marking had started already, or

@@ -184,15 +184,13 @@ fn reservations_path(cfg: &Config) -> Option<std::result::Result<PathBuf, String
 
 /// What a copy of `pod` into `dest` may take, under the snapshot root `base`: a later copy — only
 /// what changed — when the pod was copied whole into this backup before ([`core_disk::was_copied`])
-/// and there's a copy of it to build on (for the snapshot tier, a snapshot of it under any label;
-/// for the big tier, its files in `dest`); else a first one. An interrupted first copy leaves
-/// files but no mark, so its retry still counts as a first copy.
+/// and there's a copy of it to build on (its files in `dest` — the big tier's dir, or a snapshot
+/// label it's pulled into again —, or for the snapshot tier a `wNdM` snapshot of it to link
+/// against); else a first one. An interrupted first copy leaves files but no mark, so its retry
+/// still counts as a first copy.
 pub(crate) fn tier_size(base: &Path, pod: &str, snapshot: bool, dest: &Path) -> Size {
-    let builds_on = if snapshot {
-        !arena_core::restore::snapshot_labels(base, pod).is_empty()
-    } else {
-        std::fs::read_dir(dest).is_ok_and(|mut e| e.next().is_some())
-    };
+    let holds = std::fs::read_dir(dest).is_ok_and(|mut e| e.next().is_some());
+    let builds_on = holds || (snapshot && !arena_core::restore::snapshot_labels(base, pod).is_empty());
     // A backup from before marking (none yet: a dry run, which doesn't start it) is taken as a real
     // run would take it once it has ([`core_disk::seed_copied`]).
     let marked = core_disk::was_copied(base, pod) || (builds_on && !base.join(core_disk::COPIED_DIR).exists());
@@ -529,9 +527,14 @@ mod tests {
         core_disk::mark_copied(&base, "devtest-b").unwrap();
         let (snap_b, big_b) = (base.join("w1d2/devtest-b"), base.join("big/devtest-b"));
         assert_eq!(sizes("devtest-b", &snap_b, &big_b), (Size::First, Size::First), "marked, but nothing of it here to build on");
+        // A label of its own (`--label mine`), pulled into again: its files there to build on.
+        let mine = base.join("mine/devtest-b");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(mine.join("x.py"), "x").unwrap();
+        assert_eq!(tier_size(&base, "devtest-b", true, &mine), Size::Later);
         let _ = std::fs::remove_dir_all(&d);
 
-        // 8 GB free, floor 5: a first copy of both tiers (~4 GB) doesn't fit, later ones do.
+        // 8 GB free, floor 5: a first copy of both tiers (~6 GB) doesn't fit, later ones do.
         let g = core_disk::GB;
         let read = |p: &Path| {
             if p.starts_with("/gone") {
@@ -544,7 +547,7 @@ mod tests {
         let (skipped, taken) = judge_copies_with(core_disk::Ledger::new(Floor::control(5 * g)), &copies, read);
         let names: Vec<&str> = skipped.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["fresh", "lost"]);
-        assert!(skipped[0].1.reason.contains("this copy (~4 GB, a first copy, not measured) would leave less"), "{}", skipped[0].1);
+        assert!(skipped[0].1.reason.contains("this copy (~6 GB, a first copy, not measured) would leave less"), "{}", skipped[0].1);
         assert!(skipped[1].1.to_string().starts_with("skipped: free space on /gone/x unknown (No such device)"), "{}", skipped[1].1);
         assert_eq!(taken.get(&1), Some(&(4 * core_disk::LATER_COPY)), "what the admitted ones reserve");
     }

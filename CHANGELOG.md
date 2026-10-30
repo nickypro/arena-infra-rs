@@ -25,13 +25,14 @@ earlier).
   copies, `pods baseline`, replace/migrate's local staging and the reaper's — now checks that disk
   first: it goes ahead only if `CONTROL_MIN_FREE_GB` (default 5 GB) stays free after it, the run's
   other copies and other arena runs' copies under way (a cron backup and an operator's pull at
-  once, any cohort: each run notes what its copies may take in `<ARENA_STATE_DIR>/disk-reservations.json`
-  until they end; notes that can't be read or written skip the run's copies). A pod's first copy counts as 2 GB per tier, a later one as 0.1 GB — later only once
-  the pod's whole home was copied into that backup (`<LOCAL_BACKUP_DIR>/.arena-copied/<pod>`; the
-  pods already backed up there are marked once, at the first such run), so an interrupted first
-  copy's retry is still a first one —, the staging as measured. A pod that
-  doesn't fit is skipped whole, before anything of it is written, with one line (`✗ arena9-bloom:
-  skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB) — nothing copied; …`), and the
+  once, any cohort: each run notes what its copies may take in
+  `<ARENA_STATE_DIR>/disk-reservations.json` until they end; notes that can't be read or written
+  skip the run's copies). A pod's first copy counts as 3 GB per tier, a later one as 0.1 GB — later
+  only once the pod's whole home was copied into that backup (`<LOCAL_BACKUP_DIR>/.arena-copied/<pod>`;
+  the pods already backed up there are marked once, at the first such run), so an interrupted
+  first copy's retry is still a first one —, the staging as measured. A pod that doesn't fit is
+  skipped whole, before anything of it is written, with one line (`✗ arena9-bloom: skipped: only
+  3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB) — nothing copied; …`), and the
   run fails. The git backup itself isn't affected. (Prod's box was at 96 %, 3.1 GB free of 75 GB,
   with the */15 cron copying pods onto it unchecked.)
 - The floor holds while copies write too: a run looks at the disks its copies write to every 2 s
@@ -57,9 +58,14 @@ earlier).
   `CONTROL_MIN_FREE_GB`.
 
 ### Action needed
-- On a box with less than the floor free, every copy onto it is skipped (and its run fails) until
-  there's room — on prod today (3.1 GB free), every one. Make room first, or lower the floor for a
-  while (`arena config set CONTROL_MIN_FREE_GB 2`, or `CONTROL_MIN_FREE_GB=2` for one command).
+- On a filesystem with less than the floor free, every copy onto it is skipped (and its run fails)
+  until there's room. On prod today the backups (`LOCAL_BACKUP_DIR` on the attached volume, ~330 GB
+  free) are fine, but `/` (3.1 GB free: `/tmp`, where replace/migrate stage a pod's home, and the
+  state dir) is under the 5 GB floor — a via-local replace/migrate would be refused, and `config
+  check` / the health check show `/` with ⚠. Make room first, or lower the floor for a while
+  (`arena config set CONTROL_MIN_FREE_GB 2`, or `CONTROL_MIN_FREE_GB=2` for one command).
+- The first judged run on a backup marks the pods already backed up there as copied whole (one line,
+  `note: N pod(s) already backed up … marked`); nothing to do.
 - Suggestions for prod's control box (yours to decide; check before deleting anything):
   - `/tmp/arena-replace-leh3rc2hdcf31i` (3.5 GB, written 2026-10-14 09:42 UTC): replace/migrate's
     staging copy of pod `leh3rc2hdcf31i`'s home (`ARENA_3.0`, the chapter dirs, its dotfiles, the

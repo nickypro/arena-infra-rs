@@ -847,7 +847,7 @@ once.)
   a day old, counts for nothing. Notes that can't be read or written (their lock held for 10 s, the
   file unreadable) skip every copy of that run, said why — never two runs counting the same space.
 - What a copy may take: measured where arena measures it (the staging: an rsync dry run); otherwise
-  a pod's first copy into a tier counts as 2 GB (about a fresh GPU image's home) and a later one —
+  a pod's first copy into a tier counts as 3 GB (a fresh GPU image's home, live: 3.0 GB) and a later one —
   onto its earlier copy, where rsync writes only what changed — as 0.1 GB. A copy is a later one
   only once that pod's whole home was copied into this backup (every tier went through, of `~/`
   rather than one dir of it: marked in `<LOCAL_BACKUP_DIR>/.arena-copied/<pod>`): the retry of an

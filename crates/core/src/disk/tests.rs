@@ -63,10 +63,10 @@ fn a_copy_goes_only_when_it_leaves_the_floor_free() {
         (3_100_000_000, 0, Size::Later, 5, Some("only 3.1 GB free on /")),
         (3_100_000_000, 0, Size::Measured(0), 5, Some("only 3.1 GB free on /")),
         // Above the floor, but not with the copy on top.
-        (6 * G, 0, Size::First, 5, Some("6 GB free on /, and this copy (~2 GB, a first copy, not measured) would leave less than the floor (5 GB, CONTROL_MIN_FREE_GB)")),
+        (7 * G, 0, Size::First, 5, Some("7 GB free on /, and this copy (~3 GB, a first copy, not measured) would leave less than the floor (5 GB, CONTROL_MIN_FREE_GB)")),
         (6 * G, G / 2, Size::Measured(G), 5, Some("this copy (~1 GB, measured) after ~0.5 GB for other copies under way would leave less")),
         // Room: exactly at the floor afterwards is enough.
-        (7 * G, 0, Size::First, 5, None),
+        (8 * G, 0, Size::First, 5, None),
         (5 * G + G / 10, 0, Size::Later, 5, None),
         (40 * G, 10 * G, Size::First, 5, None),
         // A zero floor: only the copy itself must fit.
@@ -103,11 +103,11 @@ fn a_copy_goes_only_when_it_leaves_the_floor_free() {
 #[test]
 fn a_copys_parts_add_up_and_say_what_they_are() {
     let n = Need::of(&[Size::First, Size::First]);
-    assert_eq!((n.bytes, n.words.as_str()), (4 * G, "~4 GB, a first copy, not measured"));
+    assert_eq!((n.bytes, n.words.as_str()), (6 * G, "~6 GB, a first copy, not measured"));
     let n = Need::of(&[Size::Later, Size::Later]);
     assert_eq!((n.bytes, n.words.as_str()), (2 * LATER_COPY, "~0.2 GB, what changed since the last copy, not measured"));
     let n = Need::of(&[Size::First, Size::Later]);
-    assert_eq!((n.bytes, n.words.as_str()), (FIRST_COPY + LATER_COPY, "~2.1 GB, not measured"));
+    assert_eq!((n.bytes, n.words.as_str()), (FIRST_COPY + LATER_COPY, "~3.1 GB, not measured"));
     assert_eq!(Need::of(&[Size::Measured(3_500_000_000)]).words, "~3.5 GB, measured");
     assert_eq!(Need::of(&[Size::Measured(u64::MAX), Size::First]).bytes, u64::MAX, "saturates");
 }
@@ -115,18 +115,18 @@ fn a_copys_parts_add_up_and_say_what_they_are() {
 /// A run's copies are held against the space they share; a pod is admitted whole or not at all.
 #[test]
 fn a_runs_copies_add_up_and_a_pod_goes_whole_or_not_at_all() {
-    let root = fs(1, "/", 10 * G);
+    let root = fs(1, "/", 14 * G);
     let mut l = Ledger::new(floor(5));
-    // One pod's two tiers on one filesystem: ~4 GB together.
+    // One pod's two tiers on one filesystem: ~6 GB together.
     assert_eq!(l.admit(&[(root.clone(), Size::First), (root.clone(), Size::First)]), Ok(()));
-    // The next first copy would leave 10 - 4 - 4 = 2 GB: skipped, saying what the run holds.
+    // The next first copy would leave 14 - 6 - 6 = 2 GB: skipped, saying what the run holds.
     let e = l.admit(&[(root.clone(), Size::First), (root.clone(), Size::First)]).unwrap_err().to_string();
-    assert!(e.contains("this copy (~4 GB, a first copy, not measured) after ~4 GB for other copies under way"), "{e}");
-    // A later copy still fits (4 + 0.2 + 5 ≤ 10), and is held too.
+    assert!(e.contains("this copy (~6 GB, a first copy, not measured) after ~6 GB for other copies under way"), "{e}");
+    // A later copy still fits (6 + 0.2 + 5 ≤ 14), and is held too.
     assert_eq!(l.admit(&[(root.clone(), Size::Later), (root.clone(), Size::Later)]), Ok(()));
     // A filesystem keeps its first reading: a later one saying more is free changes nothing.
     let e = l.admit(&[(fs(1, "/", 100 * G), Size::First)]).unwrap_err().to_string();
-    assert!(e.contains("10 GB free on /") && e.contains("after ~4.2 GB"), "{e}");
+    assert!(e.contains("14 GB free on /") && e.contains("after ~6.2 GB"), "{e}");
 
     // Two filesystems: one fits, the other doesn't — nothing is held for either.
     let (snap, big) = (fs(1, "/", 20 * G), fs(2, "/mnt/big", 6 * G));
@@ -150,15 +150,15 @@ fn other_runs_reservations_count_against_the_free_space() {
     r.hold(400, 3, &taken(&[(1, 50 * G)]), now - RESERVATION_MAX_AGE_SECS); // too old
     r.prune(now, |pid| pid != 300);
     assert_eq!(r.by_dev(), taken(&[(1, 6 * G), (2, G)]));
-    // 15 GB free, floor 5: with 6 GB held elsewhere, one first copy of two tiers (4 GB) fits, a second doesn't.
+    // 17 GB free, floor 5: with 6 GB held elsewhere, one first copy of two tiers (6 GB) fits, a second doesn't.
     let mut l = Ledger::with_others(floor(5), r.by_dev());
-    let root = fs(1, "/", 15 * G);
+    let root = fs(1, "/", 17 * G);
     assert_eq!(l.admit(&[(root.clone(), Size::First), (root.clone(), Size::First)]), Ok(()));
     let e = l.admit(&[(root.clone(), Size::First)]).unwrap_err().to_string();
-    assert!(e.contains("after ~10 GB for other copies under way"), "{e}");
-    assert_eq!(l.taken(), taken(&[(1, 4 * G)]), "only this run's own");
+    assert!(e.contains("after ~12 GB for other copies under way"), "{e}");
+    assert_eq!(l.taken(), taken(&[(1, 6 * G)]), "only this run's own");
     r.hold(500, 2, &l.taken(), now + 10);
-    assert_eq!(r.by_dev()[&1], 10 * G);
+    assert_eq!(r.by_dev()[&1], 12 * G);
     r.release(500, 2);
     r.release(100, 999); // another admission's token: nothing
     assert_eq!(r.by_dev(), taken(&[(1, 6 * G), (2, G)]));

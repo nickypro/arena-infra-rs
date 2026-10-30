@@ -596,9 +596,10 @@ pub async fn stop_all_children() {
 /// Until no child tracked still runs, or `wait` is up — for a caller that stopped its calls by
 /// dropping them ([`Stopper`]'s drop: TERM now, the KILL after [`TERM_GRACE`] in the background)
 /// and must not go on, or end, while they may still write: the free-space watch's stopped copies
-/// (`disk::watched` in the CLI). A stopped rsync exits once its handler has taken its transport
-/// and receiver down; ended before that, the process would cancel the background grace and
-/// SIGKILL it, orphaning both. Whether none runs.
+/// (`disk::watched` in the CLI). A stopped rsync exits once its handler has signalled its
+/// transport and receiver (live 2026-10-30: the receiver then removes its temp file, gone a moment
+/// later); ended before that, the process would cancel the background grace and SIGKILL it,
+/// orphaning both still copying. Whether none runs.
 pub async fn children_done(wait: Duration) -> bool {
     #[cfg(unix)]
     {
