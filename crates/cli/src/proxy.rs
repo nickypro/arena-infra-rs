@@ -8,7 +8,8 @@ use arena_core::provider::Provider;
 use arena_core::Config;
 use clap::Subcommand;
 
-use crate::{confirm, emit_proxy_plan, expand_tilde, shell_quote, ssh_config_after};
+use crate::plan::emit_proxy_plan;
+use crate::{confirm, expand_tilde, shell_quote, ssh_config_after};
 
 #[derive(Subcommand)]
 pub(crate) enum ProxyCmd {
