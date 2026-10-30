@@ -192,6 +192,8 @@ pub struct StoreIn {
 }
 
 /// The archive, as found in the state dir.
+// One per status read: boxing its states would only cost every match a deref.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ArchiveIn {
     /// No `archive.json`: `archive up` never ran for this prefix (as this user).
@@ -510,8 +512,10 @@ fn record_job(i: &Inputs, job: Job, setup: Setup, sched: Option<&Schedule>) -> J
             s.last = Some(LastRun { started: run.started, finished: run.finished, ok: run.ok, summary: run.summary.clone() });
         }
     }
-    // The cron's lock held with no recorded run under way: an arena that keeps no record runs it.
-    if s.running_since.is_none() && matches!(i.held.cron, Some(Ok(true))) && matches!(s.setup, Setup::Cron { .. }) {
+    // The cron's lock held with no recorded run of the line under way (git or copy): an arena
+    // that keeps no record runs it — said on the git backup's row, the line's first step.
+    let recorded = rec.is_some_and(|r| r.running.iter().any(|x| matches!(x.job, Job::Git | Job::Copy) && i.held.alive.contains(&x.pid)));
+    if job == Job::Git && !recorded && matches!(i.held.cron, Some(Ok(true))) && matches!(s.setup, Setup::Cron { .. }) {
         s.running_since = Some(0);
     }
     if s.last.is_none() && s.last_unknown.is_none() {

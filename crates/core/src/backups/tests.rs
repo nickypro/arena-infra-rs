@@ -451,8 +451,16 @@ fn the_record_folds_runs_and_reads_back() {
         ]
     );
     assert_eq!((p.git_ok, p.copy_ok, p.git.as_ref().map(|e| e.detail.as_str())), (Some(NOW - 8 * MIN), Some(NOW - 3 * MIN), Some("exit 128: b")));
+    // Each job folds on its own: a quiet pod's git and copy runs interleave as two entries.
+    let mut q = PodRecord::default();
+    for k in 0..12 {
+        q.add(ev(NOW + k * 900, Job::Git, Outcome::NoChanges, "on b"));
+        q.add(ev(NOW + k * 900 + 30, Job::Copy, Outcome::Copied, "w3d5"));
+    }
+    let h: Vec<(Job, u32, Option<u64>, u64)> = q.history.iter().map(|e| (e.job, e.times, e.since, e.at)).collect();
+    assert_eq!(h, [(Job::Copy, 12, Some(NOW + 30), NOW + 11 * 900 + 30), (Job::Git, 12, Some(NOW), NOW + 11 * 900)]);
     for k in 0..30 {
-        p.add(ev(NOW + k, if k % 2 == 0 { Job::Git } else { Job::Copy }, Outcome::Copied, ""));
+        p.add(ev(NOW + k, if k % 2 == 0 { Job::Git } else { Job::Copy }, Outcome::Failed, &format!("reason {k}")));
     }
     assert_eq!(p.history.len(), record::HISTORY_LEN);
 

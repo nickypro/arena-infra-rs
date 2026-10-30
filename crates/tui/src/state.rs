@@ -971,6 +971,9 @@ pub enum Action {
     Jobs,
     /// `pods logs`: its newest job's log (read-only).
     Logs,
+    /// `pods pull <pod>`: copy its home into `LOCAL_BACKUP_DIR` now — the backups screen's "copy
+    /// home now" (`backups.rs`); in no menu of its own.
+    Pull,
     // Its OpenRouter key's, offered when a provisioning key is configured (`keys …`).
     /// `keys limit <pod> <amount>`: raise or set its cap (the operator types the amount first).
     KeyLimit,
@@ -1037,7 +1040,7 @@ impl Action {
 
     /// One of the CLI's commands, run as `arena` (`runs.rs`).
     pub fn cli(&self) -> bool {
-        matches!(self, Action::Start | Action::Rename | Action::Jobs | Action::Logs) || self.ai_key()
+        matches!(self, Action::Start | Action::Rename | Action::Jobs | Action::Logs | Action::Pull) || self.ai_key()
     }
 
     /// One of the AI key's (`arena keys …`).
@@ -1087,6 +1090,7 @@ impl Action {
             Action::Rename => "rename (no restart)",
             Action::Jobs => "its background jobs (read-only)",
             Action::Logs => "its newest job's log (read-only)",
+            Action::Pull => "copy its home here (rsync)",
             Action::KeyLimit => "AI key: raise or set its cap",
             Action::KeyPause => "AI key: pause (calls fail until resumed)",
             Action::KeyResume => "AI key: resume",
@@ -1108,6 +1112,7 @@ impl Action {
             Action::Rename => "rename",
             Action::Jobs => "jobs",
             Action::Logs => "logs",
+            Action::Pull => "pull",
             Action::KeyLimit => "ai cap",
             Action::KeyPause => "ai pause",
             Action::KeyResume => "ai resume",
@@ -1214,6 +1219,7 @@ impl Action {
             },
             Action::Jobs => "list its background jobs (read-only)".into(),
             Action::Logs => "show its newest job's log (read-only)".into(),
+            Action::Pull => "copy its home into LOCAL_BACKUP_DIR now (`arena pods pull`: today's snapshot and the all-files tier)".into(),
             Action::KeyLimit => match arg {
                 Some(a) => format!("set its AI key's cap: {a} (`arena keys limit`)"),
                 None => "raise or set its AI key's cap (`arena keys limit`)".into(),

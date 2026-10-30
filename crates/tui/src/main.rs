@@ -33,6 +33,7 @@
 
 mod aikey;
 mod ask;
+mod backups;
 mod columns;
 mod demo;
 mod lag;
@@ -177,6 +178,9 @@ enum Mode {
     Ask { scope: InputScope, value: String, pick: arena_core::ask::Pick },
     /// An answer to a `?` question: scrollable; Esc closes.
     Answer(ask::Answer),
+    /// `b`, or a click on the 💾 header: the backups screen — which backups happen, when, how
+    /// they're doing, per pod (`backups.rs`).
+    Backups(backups::View),
     /// `i`, or a click on the footer's `[i] info`: everything the top line and the footer leave out
     /// (provider, config, the whole status, refresh, deep checks, the fleet's words, balances,
     /// AI, every key, what the glyphs mean), scrollable. `detail`: opened from the detail view
@@ -263,6 +267,8 @@ struct Shared {
     /// A run that changed AI keys ended (`runs.rs`): the next refresh reads them at once, not on
     /// the minute's cadence, so the `AI$` cell and the summary show the change.
     ai_wanted: bool,
+    /// The backups' status as the screen last read it (`backups.rs`).
+    backups: backups::Landed,
 }
 
 impl Shared {
@@ -349,6 +355,8 @@ struct Ui {
     /// The marked set's pods and keys an AI key confirm was opened with — what it runs on
     /// (`aikey::choose_set`).
     ai_set: Vec<(String, Option<arena_core::openrouter::KeyInfo>)>,
+    /// The backups screen's state beyond its mode (`backups.rs`).
+    backups: backups::State,
 }
 
 impl Ui {
@@ -484,6 +492,7 @@ async fn main() -> Result<()> {
         menu_at: std::cell::Cell::new(None),
         ai_keys,
         ai_set: Vec::new(),
+        backups: backups::State::default(),
     };
 
     dashboard(&shared, &provider, &interval, &nudge, &details_wanted, ui).await
@@ -1218,6 +1227,15 @@ fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared>>) -> bool
         };
         return true;
     }
+    // The 💾 header: the backups screen.
+    let on_saved = ui.backups.saved_at.get().is_some_and(|(x, y)| m.row == y && (x..x.saturating_add(2)).contains(&m.column));
+    if let (MouseEventKind::Down(MouseButton::Left), true, Mode::List | Mode::Detail) = (m.kind, on_saved, &ui.mode) {
+        backups::open(ui, shared);
+        return true;
+    }
+    if let Mode::Backups(_) = ui.mode {
+        return backups::mouse(m, ui, shared);
+    }
     if let Mode::Info { scroll, detail } = ui.mode {
         let delta = match m.kind {
             MouseEventKind::ScrollUp => -1,
@@ -1535,6 +1553,7 @@ async fn run(
         let now = Instant::now();
         dirty |= land(&mut ui, shared, nudge, now);
         dirty |= newpod::tick(&mut ui, shared, now);
+        dirty |= backups::tick(&mut ui, shared, now);
         let (len, stamp, live) = {
             let s = shared.lock().unwrap();
             (s.pods.len(), stamp(&s), live(&s, &ui, now))
@@ -1661,6 +1680,13 @@ fn handle_event(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui:
 /// One key press, in whatever view or popup is open. Never awaits: a slow action is started
 /// in the background ([`start_action`], `runs::start`, …) and lands through `Shared`.
 fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &mut Ui, code: KeyCode, mods: KeyModifiers) -> Result<Flow> {
+    let flow = handle_key_in(terminal, cx, ui, code, mods);
+    // An action the backups screen started has ended (its result or confirm closed): back to it.
+    backups::come_back(ui, cx.shared);
+    flow
+}
+
+fn handle_key_in(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &mut Ui, code: KeyCode, mods: KeyModifiers) -> Result<Flow> {
     let Ctx { shared, provider, interval, nudge, details_wanted } = *cx;
     // Ctrl+C quits from any mode (raw mode swallows the usual SIGINT) — asking first while a run
     // that changes pods is going; at that question it quits, leaving the run going.
@@ -1682,7 +1708,7 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
     }
     // `?` and its two popups (ask.rs); the add-pod form and its confirm (newpod.rs); the runs
     // panel, `p`, and the quit question (runs.rs).
-    if ask::key(ui, shared, code, mods) || newpod::key(ui, shared, code) {
+    if ask::key(ui, shared, code, mods) || newpod::key(ui, shared, code) || backups::key(ui, shared, provider, code) {
         return Ok(Flow::Changed);
     }
     match runs::key(ui, shared, code) {
@@ -1892,7 +1918,7 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
         // A background action is running — ignore keys (Ctrl+C still quits, above).
         Mode::Working(_) => {}
         // Handled above: `info_key`, `ask::key`, `newpod::key`, `runs::key`.
-        Mode::Info { .. } | Mode::Ask { .. } | Mode::Answer(_) | Mode::NewPod(_) | Mode::UpConfirm(_) | Mode::Runs { .. } | Mode::Quit => {}
+        Mode::Info { .. } | Mode::Ask { .. } | Mode::Answer(_) | Mode::NewPod(_) | Mode::UpConfirm(_) | Mode::Runs { .. } | Mode::Quit | Mode::Backups(_) => {}
         Mode::Result(_) => {
             if !result_key(ui, code) {
                 ui.result_scroll = 0;
@@ -2514,7 +2540,7 @@ async fn execute(
             _ => format!("✗ {name}: no branch given"),
         },
         // Runs of the CLI (`start_cli_action`), never an action of this one.
-        Action::Start | Action::Rename | Action::Jobs | Action::Logs | Action::KeyLimit | Action::KeyPause | Action::KeyResume | Action::KeyRotate => {
+        Action::Start | Action::Rename | Action::Jobs | Action::Logs | Action::Pull | Action::KeyLimit | Action::KeyPause | Action::KeyResume | Action::KeyRotate => {
             format!("✗ {} {name}: runs as `arena {}`", action.label(), action.command())
         }
     }
@@ -2530,6 +2556,7 @@ fn cli_action_args(action: Action, name: &str, arg: Option<&str>) -> Option<(run
         Action::Rename => (runs::Kind::Rename, v(&["pods", "rename", name, arg?.trim(), "--yes"])),
         Action::Jobs => (runs::Kind::Jobs, v(&["pods", "jobs", name])),
         Action::Logs => (runs::Kind::Logs, v(&["pods", "logs", name, "--tail", "100"])),
+        Action::Pull => (runs::Kind::Pull, v(&["pods", "pull", name, "--yes"])),
         _ => return None,
     })
 }
@@ -2725,16 +2752,30 @@ async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (Str
     let repo = backup_repo_path(cfg);
     let origin = backup::configured_repo(cfg);
     let cmd = backup::backup_command(&repo, cfg.get("GIT_SSH_KEY_REMOTE"), &format!("arena-tui backup {}", pod.name), origin.as_deref());
+    use arena_core::backups::record::Outcome;
+    let note = |outcome, detail: String| backups::note_git(cfg, &pod.name, outcome, detail);
     match remote.exec(&target, &cmd, Some(BACKUP_TIMEOUT)).await {
         Ok(out) if out.success => {
             let report = parse_backup_report(&out.stdout);
             let notes = report.notes();
             let also = if notes.is_empty() { String::new() } else { format!(" — {}", notes.join("; ")) };
             let line = match &report.outcome {
-                Some((backup::BACKUP_PUSHED, branch)) => format!("✓ backed up {} → {branch}{also}", pod.name),
-                Some((backup::BACKUP_NO_CHANGES, branch)) => format!("✓ {} — no changes (on {branch}){also}", pod.name),
-                Some((backup::BACKUP_SKIPPED, branch)) => format!("⊘ {} — skipped (on protected branch {branch})", pod.name),
-                _ => format!("✓ backed up {}{also}", pod.name),
+                Some((backup::BACKUP_PUSHED, branch)) => {
+                    note(Outcome::Pushed, format!("→ {branch}"));
+                    format!("✓ backed up {} → {branch}{also}", pod.name)
+                }
+                Some((backup::BACKUP_NO_CHANGES, branch)) => {
+                    note(Outcome::NoChanges, format!("on {branch}"));
+                    format!("✓ {} — no changes (on {branch}){also}", pod.name)
+                }
+                Some((backup::BACKUP_SKIPPED, branch)) => {
+                    note(Outcome::NotSaved, format!("on {branch}"));
+                    format!("⊘ {} — skipped (on protected branch {branch})", pod.name)
+                }
+                _ => {
+                    note(Outcome::Pushed, String::new());
+                    format!("✓ backed up {}{also}", pod.name)
+                }
             };
             (line, None)
         }
@@ -2745,6 +2786,7 @@ async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (Str
                 Some(fix) => format!("✗ backup {}: {fix}", pod.name),
                 None => format!("✗ backup {} ({}): {}", pod.name, out.exit_label(), out.stderr.trim()),
             };
+            note(Outcome::Failed, report.failure_brief(out.code).unwrap_or_else(|| format!("{}: {}", out.exit_label(), out.stderr.trim())));
             let kept = match (report.wrong_origin_why(out.code), report.in_progress(out.code)) {
                 (Some(_), _) => fix.map(Kept::WrongOrigin),
                 (None, Some(what)) => Some(Kept::Busy {
@@ -2756,7 +2798,10 @@ async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (Str
             };
             (line, kept)
         }
-        Err(e) => (format!("✗ backup {} failed: {}", pod.name, describe_error(&e)), None),
+        Err(e) => {
+            note(Outcome::Failed, describe_error(&e));
+            (format!("✗ backup {} failed: {}", pod.name, describe_error(&e)), None)
+        }
     }
 }
 
@@ -2981,7 +3026,9 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
 
     top_line(f, shared, ui, chunks[0]);
 
-    if matches!(ui.mode, Mode::Detail) || matches!(ui.mode, Mode::Info { detail: true, .. }) {
+    if let Mode::Backups(v) = &ui.mode {
+        backups::render(f, shared, ui, v, chunks[1]);
+    } else if matches!(ui.mode, Mode::Detail) || matches!(ui.mode, Mode::Info { detail: true, .. }) {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
@@ -3423,6 +3470,11 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     // Record where the rows landed (area + the scroll offset ratatui chose) so a mouse
     // click can be mapped back to a pod index.
     ui.last_table.set((area, ts.offset()));
+    // And where the 💾 header landed: a click on it opens the backups screen.
+    let header_y = area.y.saturating_add(1);
+    let buf = f.buffer_mut();
+    let saved = (area.x..area.x.saturating_add(area.width)).find(|&x| header_y < buf.area.bottom() && buf[(x, header_y)].symbol() == columns::SAVED_HEADER);
+    ui.backups.saved_at.set(saved.map(|x| (x, header_y)));
 }
 
 /// STATUS's colour (the table's and the detail pane's): `run` plain (most rows), a pod coming up
@@ -3949,8 +4001,8 @@ fn without_symbol(text: &str) -> String {
 /// ([`ALL_KEYS`]). Modal popups keep their own.
 fn mode_keys(mode: &Mode) -> &'static str {
     match mode {
-        Mode::List => "[q] quit  [enter] detail  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?] ask  [n] new  [p] runs",
-        Mode::Detail => "[esc] back  [q] quit  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?] ask  [n] new  [p] runs",
+        Mode::List => "[q] quit  [enter] detail  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?] ask  [n] new  [p] runs  [b] backups",
+        Mode::Detail => "[esc] back  [q] quit  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?] ask  [n] new  [p] runs  [b] backups",
         Mode::Info { .. } => "[esc/i] close  [↑↓ PgUp PgDn] scroll",
         Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::Confirm(c) if c.action.requires_typed_name() => "type the pod's name  [enter] apply  [esc] cancel",
@@ -3968,6 +4020,7 @@ fn mode_keys(mode: &Mode) -> &'static str {
         Mode::Result(_) => "[↑↓] scroll  ·  [any other key] dismiss",
         Mode::Ask { .. } => "type the question  [enter] ask  [tab] the other AI  [ctrl-u] clear  [esc] cancel",
         Mode::Answer(_) => "[↑↓ PgUp PgDn] scroll  [esc] close",
+        Mode::Backups(v) => backups::keys(v),
     }
 }
 
@@ -3989,11 +4042,12 @@ const ALL_KEYS: &[(&str, &str)] = &[
     ("c", "ssh into the cursor pod"),
     ("?", "ask an AI about the cursor pod or the marked ones (tab: the other AI)"),
     ("n", "add pods (runs `arena pods up`)"),
-    ("p", "the runs panel (pods up, start, rename, jobs, logs, the AI key's)"),
+    ("p", "the runs panel (pods up, start, rename, jobs, logs, copy home, the AI key's)"),
+    ("b  (or click 💾)", "the backups screen: each backup job (how often, last run, next), what's running, every pod's last git save, home copy and archive copy (enter: its history, back up now)"),
     ("r", "refresh now (and re-read the providers' details)"),
     ("f", "refresh cadence: 2 → 5 → 10 → 20 → 60 s"),
     ("s", "short / full pod names (kept)"),
-    ("mouse", "click a row: cursor · click its far left or shift-click: mark · wheel: move · [i] info: this panel"),
+    ("mouse", "click a row: cursor · click its far left or shift-click: mark · wheel: move · [i] info: this panel · 💾: backups"),
 ];
 
 /// What the table's glyphs mean, for the info panel: `(column, legend)`.
@@ -4519,7 +4573,7 @@ net.secs=0.712
 deep_check_end=1
 ";
 
-    fn cfg(extra: &str) -> Config {
+    pub(crate) fn cfg(extra: &str) -> Config {
         Config::parse(&format!(
             "MACHINE_NAME_PREFIX=devtest\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nALLOWED_CUDA_VERSIONS=\"13.0\"\n\
              MACHINE_NAME_LIST=(\n \"alpha\"\n \"bravo\"\n \"charlie\"\n \"delta\"\n)\n{extra}"
@@ -4690,7 +4744,7 @@ deep_check_end=1
         }
     }
 
-    fn ui(cfg: Config, remote: Arc<dyn Remote>) -> Ui {
+    pub(crate) fn ui(cfg: Config, remote: Arc<dyn Remote>) -> Ui {
         Ui {
             provider_name: "runpod".into(),
             config_path: "/test/config.env".into(),
@@ -4715,6 +4769,7 @@ deep_check_end=1
             menu_at: std::cell::Cell::new(None),
             ai_keys: false,
             ai_set: Vec::new(),
+            backups: backups::State::default(),
         }
     }
 
@@ -4795,7 +4850,7 @@ deep_check_end=1
 
     /// The buffer's rows as a terminal shows them: a wide symbol (`💾`) takes two cells, so the
     /// cell it hides isn't printed.
-    fn screen(buf: &Buffer) -> Vec<String> {
+    pub(crate) fn screen(buf: &Buffer) -> Vec<String> {
         (0..buf.area.height)
             .map(|y| {
                 let mut row = String::new();
@@ -4810,7 +4865,7 @@ deep_check_end=1
             .collect()
     }
 
-    fn draw(width: u16, height: u16, shared: &Shared, ui: &Ui) -> Vec<String> {
+    pub(crate) fn draw(width: u16, height: u16, shared: &Shared, ui: &Ui) -> Vec<String> {
         let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
         t.draw(|f| view(f, shared, ui, 5)).unwrap();
         screen(t.backend().buffer())

@@ -96,7 +96,7 @@ pub(crate) async fn handle_backup(
         })
         .collect();
     // The run record (`arena backups`): started now, each pod's outcome as it ended.
-    let run = crate::backups::Run::start(cfg, Job::Git, total + missing.len());
+    let run = crate::backups::Run::start(cfg, Job::Git, total + missing.len(), sel.named);
     let mut t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}"), |name| locks.done(name)).await;
     let unreached: Vec<(String, String)> = missing.iter().map(|n| (n.clone(), "no SSH endpoint after 10 minutes running".to_string())).collect();
     run.finish(t.record_events(&unreached), t.summary(missing.len()));

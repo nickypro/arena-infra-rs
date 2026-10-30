@@ -370,7 +370,7 @@ async fn switch_guarded(
         .collect();
     // Each pod's lock stays held through its push: it goes as that pod's switch ends. Recorded as
     // any git backup is (`arena backups`).
-    let record = crate::backups::Run::start(cfg, arena_core::backups::Job::Git, targets.len());
+    let record = crate::backups::Run::start(cfg, arena_core::backups::Job::Git, targets.len(), sel.named);
     let t = backup_fleet(remote, jobs, &repo, |l| println!("{l}"), |_| {}).await;
     record.finish(t.record_events(&[]), t.summary(0));
     // Before a --hard reset, a pod on a branch no backup commits (main, …) with work there — an

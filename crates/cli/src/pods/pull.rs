@@ -476,7 +476,7 @@ pub(crate) async fn pull_pods(
         return Ok(Pulled::default());
     }
     // The run record (`arena backups`): started now, each pod's copy as the run ends.
-    let run = crate::backups::Run::start(cfg, arena_core::backups::Job::Copy, sel.pods.len());
+    let run = crate::backups::Run::start(cfg, arena_core::backups::Job::Copy, sel.pods.len(), sel.named);
     // Each pod's backup lock, unless the caller holds them: a pod another backup holds for
     // the whole wait is skipped — a failure of this run, named (as is one there's no room for).
     let mut not_pulled: Vec<String> = Vec::new();

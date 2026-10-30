@@ -29,15 +29,18 @@ fn write(path: &Path, f: impl FnOnce(&mut record::Record)) {
 }
 
 /// A run of a backup job, recorded as it starts (so one killed reads as interrupted) and as it
-/// ends ([`Run::finish`]).
+/// ends ([`Run::finish`]). Only a fleet-wide run — no pods named, as the cron's always is — is
+/// the job's run (its last run, when it's next due, late); a run over named pods records its pods'
+/// results alone, so `pods backup apple` by hand never stands in for the cron's.
 pub(crate) struct Run {
     job: Job,
     path: Option<PathBuf>,
+    fleet: bool,
 }
 
 impl Run {
-    /// Note that a run of `job` over `pods` pods starts now.
-    pub(crate) fn start(cfg: &Config, job: Job, pods: usize) -> Run {
+    /// Note that a run of `job` over `pods` pods starts now (`named`: the pods were named).
+    pub(crate) fn start(cfg: &Config, job: Job, pods: usize, named: bool) -> Run {
         let path = match record_path(cfg) {
             None => None,
             Some(Ok(p)) => Some(p),
@@ -46,18 +49,23 @@ impl Run {
                 None
             }
         };
-        if let Some(p) = &path {
+        let fleet = !named;
+        if let (Some(p), true) = (&path, fleet) {
             let now = arena_core::snapshot::unix_now();
             write(p, |r| r.start(job, std::process::id(), pods as u32, now));
         }
-        Run { job, path }
+        Run { job, path, fleet }
     }
 
     /// The run ended: each pod's event, and the run in a few words.
     pub(crate) fn finish(self, events: Vec<(String, Event)>, summary: String) {
         if let Some(p) = &self.path {
             let now = arena_core::snapshot::unix_now();
-            write(p, |r| r.finish(self.job, std::process::id(), now, events, summary));
+            if self.fleet {
+                write(p, |r| r.finish(self.job, std::process::id(), now, events, summary));
+            } else if !events.is_empty() {
+                write(p, |r| r.add_events(events));
+            }
         }
     }
 }

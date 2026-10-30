@@ -78,7 +78,8 @@ pub struct Event {
     /// A copy's size on disk (the snapshot's files), when measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
-    /// Folded: the first of the run (`None`: a single one).
+    /// Folded: the first of the run (`None`: a single one). A run is the job's own: a git
+    /// backup's folds over the copies between them ([`PodRecord::add`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<u64>,
     /// Folded: how many (`1` when single).
@@ -141,16 +142,17 @@ impl PodRecord {
             *ok = Some(e.at);
         }
         *last = Some(e.clone());
-        match self.history.first_mut() {
-            Some(h) if h.folds(&e) => {
-                let since = h.since.unwrap_or(h.at);
-                *h = Event { since: Some(since), times: h.times.saturating_add(1), ..e };
+        // The job's own newest entry: the git backup's and the copy's runs interleave, each
+        // folded on its own (`no changes ×12` beside `copied ×12`).
+        let e = match self.history.iter().position(|h| h.job == e.job) {
+            Some(i) if self.history[i].folds(&e) => {
+                let h = self.history.remove(i);
+                Event { since: Some(h.since.unwrap_or(h.at)), times: h.times.saturating_add(1), ..e }
             }
-            _ => {
-                self.history.insert(0, e);
-                self.history.truncate(HISTORY_LEN);
-            }
-        }
+            _ => e,
+        };
+        self.history.insert(0, e);
+        self.history.truncate(HISTORY_LEN);
     }
 }
 
