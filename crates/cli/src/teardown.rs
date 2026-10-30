@@ -156,6 +156,9 @@ async fn collect(
         today_days: arena_core::schedule::days_from_unix(now),
         images,
         now,
+        // Local and read-only: what arena left on this box (none looked for in this crate's
+        // tests unless asked, `disk::live`).
+        leftovers: Probe::Got(if crate::disk::live(cfg) { crate::disk::leftovers(cfg, now) } else { Vec::new() }),
     };
     let mut report = teardown::build(&inputs, &Naming::from_config(cfg));
     if !fetched.is_empty() {

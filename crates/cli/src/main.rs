@@ -25,6 +25,7 @@ use arena_core::{Config, PodSpec};
 #[cfg(all(test, unix))]
 mod admin_key_tests;
 mod archive;
+mod disk;
 mod image;
 mod ask;
 #[cfg(test)]
@@ -3205,7 +3206,7 @@ async fn run() -> Result<()> {
         Cmd::Tui => launch_tui(&cli.provider, &cli.config),
         Cmd::Update { .. } => unreachable!("handled before the config is read"),
         Cmd::Plan(c) => handle_plan(c, provider.unwrap().as_ref(), &cfg).await,
-        Cmd::Config(ConfigCmd::Check) => config_check(&cfg, &cli.provider, &hetzner_image_rows(&cfg).await),
+        Cmd::Config(ConfigCmd::Check) => config_check(&cfg, &cli.provider, &[hetzner_image_rows(&cfg).await, disk::check_rows(&cfg)].concat()),
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &cli.config),
         Cmd::Cron(c) => handle_cron(c, &cfg, &cli.config, cli.yes, CRONTAB, std::env::var("HOME").ok().as_deref()).await,
         Cmd::Archive(c) => archive::handle_archive(c, &cfg, remote.as_ref(), cli.yes).await,
@@ -6045,6 +6046,19 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
         ),
         Err(e) => {
             println!("  ✗ --hard save max per pod    {e}");
+            note_invalid_text(&mut missing, &e);
+        }
+    }
+    // What every copy onto this box leaves free on its disk (a bad value fails every pull and
+    // copy up front). How full the disk is now comes after the report (`disk::check_rows`).
+    match arena_core::disk::floor_bytes(cfg) {
+        Ok(b) => println!(
+            "  · copies leave free here     {}{} (CONTROL_MIN_FREE_GB) — pulls, backup copies, replace/migrate staging, the reaper",
+            arena_core::disk::gb(b),
+            if cfg.get(arena_core::disk::FLOOR_KEY).is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" }
+        ),
+        Err(e) => {
+            println!("  ✗ copies leave free here     {e}");
             note_invalid_text(&mut missing, &e);
         }
     }
@@ -8894,10 +8908,27 @@ async fn handle_deep_test(
         }
     }
     let failed = results.iter().filter(|h| h.status == Status::Fail).count();
-    if failed > 0 {
-        anyhow::bail!("{failed} pod(s) failed the deep check");
+    // Over the cohort (what the daily health line runs, nothing named): this box too — how full
+    // its disk is, what arena left on it, and the copies skipped for space in the last day, each
+    // a failure. After the table (on stderr under --json, whose stdout stays the array).
+    let box_health = if sel.named { None } else { disk::health(cfg, arena_core::snapshot::unix_now()) };
+    if let Some(h) = &box_health {
+        for line in &h.lines {
+            if json {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+        }
     }
-    Ok(())
+    let skipped = box_health.map_or(0, |h| h.skipped);
+    let no_room = (skipped > 0).then(|| format!("copies of {skipped} pod(s) onto this box were skipped for space in the last day"));
+    match (failed, no_room) {
+        (0, None) => Ok(()),
+        (0, Some(r)) => anyhow::bail!("{r}"),
+        (n, None) => anyhow::bail!("{n} pod(s) failed the deep check"),
+        (n, Some(r)) => anyhow::bail!("{n} pod(s) failed the deep check; {r}"),
+    }
 }
 
 /// Where this fleet's health cache lives ([`arena_core::snapshot::health_cache_path`]):
@@ -13381,13 +13412,18 @@ impl CopyOpts {
 
 /// The via-local copy's staging dir for source pod `src_id` under `root`.
 fn staging_dir(root: &std::path::Path, src_id: &str) -> PathBuf {
-    root.join(format!("arena-replace-{src_id}"))
+    arena_core::disk::staging_dir(root, src_id)
 }
 
 /// Remove a leftover via-local staging copy of `src_id` (the participant's whole home), once
-/// it can't be needed again: the source pod is gone. Says so when there was one.
+/// it can't be needed again: the source pod is gone, or a copy of it landed and was verified.
+/// Says so when there was one; one another run is copying through is left alone, said.
 fn remove_staging_for(root: &std::path::Path, src_id: &str) {
     let stage = staging_dir(root, src_id);
+    if stage.exists() && arena_core::disk::in_use(&stage) {
+        eprintln!("      the local staging copy {} is in use by another arena run — left as it is", stage.display());
+        return;
+    }
     if stage.exists() {
         let size = arena_core::pull::human_bytes(local_size(&stage));
         match std::fs::remove_dir_all(&stage) {
@@ -13541,6 +13577,9 @@ async fn copy_pod_files(
     use arena_core::volume;
     let remote_key = cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string();
     let user = cfg.get("SSH_USER").unwrap_or("root").to_string();
+    // What the via-local staging must leave free on this box (CONTROL_MIN_FREE_GB): a bad value
+    // fails here, before anything is created or copied.
+    let floor = disk::floor(cfg)?;
     // The repo's place in the home, carried as a TREE: on a pod with a volume it is a link
     // onto /workspace (setup put it there), and a plain home copy would carry only the link —
     // leaving the work on the old pod's volume, which goes with it.
@@ -13679,6 +13718,18 @@ async fn copy_pod_files(
         // before the push — this is the endpoint most likely to have gone stale during the pull).
         let stage = staging_dir(&opts.stage_root, src_id);
         std::fs::create_dir_all(&stage).with_context(|| format!("creating staging dir {}", stage.display()))?;
+        // Held for the whole copy: a second replace/migrate of this pod can't write into the
+        // same stage, nothing removes it under this one, and `config check` / `teardown --check`
+        // can tell it in use from one left behind. Refused here, the other run's stage is
+        // left exactly as it is.
+        let _held = arena_core::disk::lock_dir(&stage).map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock => anyhow::anyhow!(
+                "another arena run is copying {src_id} through {} right now — nothing copied; let it finish (or stop \
+                 it), then re-run",
+                stage.display()
+            ),
+            _ => anyhow::anyhow!("locking the staging dir {}: {e}", stage.display()),
+        })?;
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o700))
@@ -13716,7 +13767,7 @@ async fn copy_pod_files(
             };
             let jobs = volume::pull_jobs(&staging_pc, &stage_s, volume::repo_pull(&repo, &user, probe.as_ref()).as_ref());
             // Room first: what the pull would add to the stage (an rsync dry run), against the
-            // free space this shared disk must keep.
+            // free space this box keeps (CONTROL_MIN_FREE_GB, `arena_core::disk`).
             let mut needed = 0u64;
             for job in &jobs {
                 let mut args = pull::rsync_args(&src_target, &job.config, &job.dest);
@@ -13730,14 +13781,18 @@ async fn copy_pod_files(
                 needed += arena_core::replica::transfer_bytes(&out.stdout)
                     .ok_or_else(|| anyhow::anyhow!("sizing the local staging: rsync --dry-run reported no size"))?;
             }
-            let (free, total) = arena_core::replica::disk_space(&opts.stage_root)
-                .ok_or_else(|| anyhow::anyhow!("can't read the free space of {}", opts.stage_root.display()))?;
-            arena_core::replica::staging_room(needed, free, total).map_err(|why| {
-                anyhow::anyhow!(
-                    "not copying via local staging: {why} ({}). Free space there, or point TMPDIR at a bigger disk.",
-                    opts.stage_root.display()
-                )
-            })?;
+            if let Some(floor) = floor {
+                let room = arena_core::disk::reading(&opts.stage_root)
+                    .map_err(|e| arena_core::disk::Skip::unknown(&opts.stage_root, &e))
+                    .and_then(|fs| arena_core::disk::judge(&fs, 0, &arena_core::disk::Size::Measured(needed).into(), floor));
+                if let Err(skip) = room {
+                    disk::note_skips(cfg, "replace/migrate staging", &[(dest_pod.name.clone(), skip.to_string())]);
+                    anyhow::bail!(
+                        "not copying via local staging ({}): {skip}, or point TMPDIR at a bigger disk",
+                        opts.stage_root.display()
+                    );
+                }
+            }
             for job in jobs.iter().filter(|j| j.repo) {
                 clear_stale_link(&job.dest).with_context(|| format!("clearing an old link at {}", job.dest))?;
                 std::fs::create_dir_all(&job.dest).with_context(|| format!("creating {}", job.dest))?;
@@ -13781,6 +13836,11 @@ async fn copy_pod_files(
     // re-resolves the endpoint fresh and confirms `RUNPOD_POD_ID` matches, so a push that
     // "succeeded" against a since-reassigned port (a different pod) is caught.
     let landed = transfer.is_ok() && marker_present(provider, remote, dest_id, cfg).await;
+    // A copy that landed leaves no use for an earlier attempt's staging of this source (kept so a
+    // re-run could continue from it): a direct copy never touched it, so it would stay forever.
+    if landed {
+        remove_staging_for(&opts.stage_root, src_id);
+    }
     // Clean the SOURCE marker now (and record a landed sync there, for the next one's reset
     // guard); leave the DEST marker for the caller's persistence re-check.
     let _ = remote.exec(&src_target, &unmark(landed), Some(PROBE_TIMEOUT)).await;
@@ -14550,6 +14610,8 @@ async fn pull_pods(
 
     // Read (and validate) the budget first: a bad value fails before anything is asked or copied.
     let budget = pull::backup_timeout(cfg.get("BACKUP_TIMEOUT_SECS"))?;
+    // So is the free space every copy onto this box keeps (CONTROL_MIN_FREE_GB).
+    let floor = disk::floor(cfg)?;
 
     // Label: explicit, else the computed wNdM iteration. Never one of the backup dir's own
     // folders (the all-files tier, the baselines) or a path.
@@ -14650,6 +14712,29 @@ async fn pull_pods(
         v
     };
     let repo = arena_core::backup::repo_path(cfg);
+    // Room on this box (CONTROL_MIN_FREE_GB, `arena_core::disk`): each pod's tiers judged
+    // together, against what this run's other copies may take, before anything of it is made or
+    // asked — a pod that doesn't fit is skipped whole, never half copied. A snapshot tier onto
+    // this pod's earlier snapshot (or into a label it already has) and a big tier holding its
+    // files count as later copies, anything else as a first one.
+    let room = |names: &[String]| -> Vec<(String, arena_core::disk::Skip)> {
+        let Some(floor) = floor else { return Vec::new() };
+        let copies: Vec<(String, Vec<(PathBuf, arena_core::disk::Size)>)> = names
+            .iter()
+            .map(|name| {
+                let parts = tiers_for(name)
+                    .into_iter()
+                    .map(|(tier, dest, _)| {
+                        let earlier = tier == "snapshot" && !arena_core::restore::snapshot_labels(base, name).is_empty();
+                        let size = if earlier { arena_core::disk::Size::Later } else { disk::size_into(std::path::Path::new(&dest)) };
+                        (PathBuf::from(dest), size)
+                    })
+                    .collect();
+                (name.clone(), parts)
+            })
+            .collect();
+        disk::judge_copies(floor, &copies)
+    };
 
     if dry_run {
         let n = if no_big { 1 } else { 2 };
@@ -14663,6 +14748,9 @@ async fn pull_pods(
                 }
             }
             println!();
+        }
+        for (name, skip) in room(&targets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()) {
+            println!("⚠ {name}, if pulled now: {skip}");
         }
         // What the pods would be asked, judged from the configured paths alone.
         let guessed: Vec<_> =
@@ -14692,8 +14780,8 @@ async fn pull_pods(
         return Ok(Pulled::default());
     }
     // Each pod's backup lock, unless the caller holds them: a pod another backup holds for
-    // the whole wait is skipped — a failure of this run, named.
-    let mut lock_failures: Vec<String> = Vec::new();
+    // the whole wait is skipped — a failure of this run, named (as is one there's no room for).
+    let mut not_pulled: Vec<String> = Vec::new();
     // Every failure by pod too (`Pulled::failed`), for a caller that reports per pod.
     let mut by_pod: Vec<(String, String)> = unreachable;
     let mut locks = match locking {
@@ -14703,15 +14791,23 @@ async fn pull_pods(
             let locks = take_pod_locks(dir, &names, wait).await;
             for b in &locks.busy {
                 println!("✗ {b}: {}", busy_line(b, wait));
-                lock_failures.push(format!("{b} (busy)"));
+                not_pulled.push(format!("{b} (busy)"));
                 by_pod.push((b.clone(), busy_line(b, wait)));
             }
             locks
         }
     };
     let targets: Vec<(String, SshTarget)> =
-        targets.into_iter().filter(|(n, _)| !lock_failures.iter().any(|f| f.starts_with(&format!("{n} ")))).collect();
-
+        targets.into_iter().filter(|(n, _)| !not_pulled.iter().any(|f| f.starts_with(&format!("{n} ")))).collect();
+    // The pods there's no room for on this box: said, recorded for the health check, failures.
+    let skipped = room(&targets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>());
+    for (name, skip) in &skipped {
+        say(&format!("✗ {name}: {skip}"));
+        not_pulled.push(format!("{name} ({})", skip.reason));
+        by_pod.push((name.clone(), skip.to_string()));
+    }
+    disk::note_skips(cfg, "copy", &skipped.iter().map(|(n, s)| (n.clone(), s.to_string())).collect::<Vec<_>>());
+    let targets: Vec<(String, SshTarget)> = targets.into_iter().filter(|(n, _)| !skipped.iter().any(|(s, _)| s == n)).collect();
 
     let total_pods = targets.len();
     // Where each pod's repo really is: rsync -a copies a symlink as a symlink, so a repo setup
@@ -14744,7 +14840,9 @@ async fn pull_pods(
         }
     })
     .await;
-    println!("Pulling {total_pods} pod(s) into {dest_msg}…");
+    if total_pods > 0 {
+        println!("Pulling {total_pods} pod(s) into {dest_msg}…");
+    }
     // Every rsync: per pod, per tier, the home job — plus the repo job when it's split out.
     let mut planned = Vec::new();
     // How many rsync jobs each pod has, and how many succeeded: all of them = copied whole.
@@ -14933,8 +15031,9 @@ async fn pull_pods(
     if !used.is_empty() {
         println!("\nSnapshot {label} on disk (`du` over every snapshot counts a hard-linked file once):\n{}", used.join("\n"));
     }
-    println!("\nDone: {ok} rsync job(s) ok, {failed} failed across {total_pods} pod(s).");
-    failures.splice(0..0, lock_failures.iter().cloned());
+    let no_room = if skipped.is_empty() { String::new() } else { format!("; {} pod(s) skipped — no room on this box", skipped.len()) };
+    println!("\nDone: {ok} rsync job(s) ok, {failed} failed across {total_pods} pod(s){no_room}.");
+    failures.splice(0..0, not_pulled.iter().cloned());
     let whole = if no_big || no_git {
         Vec::new()
     } else {
@@ -15143,6 +15242,7 @@ async fn handle_baseline(
     use arena_core::{pull, volume};
     let (week, _) = resolve_week_day(cfg, week, Some(1))?;
     let budget = pull::backup_timeout(cfg.get("BACKUP_TIMEOUT_SECS"))?;
+    let floor = disk::floor(cfg)?;
     let policy = arena_core::retry::RetryPolicy::default();
     let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
     let pod = pods[arena_core::selector::resolve_one(&Naming::from_config(cfg), &pods, target)?].clone();
@@ -15231,6 +15331,17 @@ async fn handle_baseline(
     if !confirm(yes, &format!("Will {plan}."))? {
         println!("aborted.");
         return Ok(());
+    }
+    // Room on this box first (a fresh pod's home, not measured: a first copy).
+    if let Some(floor) = floor {
+        let fresh = arena_core::disk::Size::First.into();
+        if let Err(skip) = arena_core::disk::reading(&partial)
+            .map_err(|e| arena_core::disk::Skip::unknown(&partial, &e))
+            .and_then(|fs| arena_core::disk::judge(&fs, 0, &fresh, floor))
+        {
+            disk::note_skips(cfg, "baseline", &[(pod.name.clone(), skip.to_string())]);
+            anyhow::bail!("refusing the baseline from {}: {skip}", pod.name);
+        }
     }
     std::fs::create_dir_all(&partial).with_context(|| format!("creating {}", partial.display()))?;
     let started = tokio::time::Instant::now();
@@ -19088,7 +19199,7 @@ ASK_CODEX_MODEL=-x
         let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
                     HETZNER_API_KEY=not-a-real-key\nGPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\n";
         // (what's added to the base, the keys the check must fail on)
-        let cases: [(&str, &[&str]); 38] = [
+        let cases: [(&str, &[&str]); 41] = [
             ("", &[]),
             // Placement near the proxy: off is valid, a region or margin it can't read isn't.
             ("NEAR=any\nNEAR_MAX_EXTRA_PCT=junk", &[]),
@@ -19105,6 +19216,10 @@ ASK_CODEX_MODEL=-x
             ("DISCARD_MAX_GB=lots", &["DISCARD_MAX_GB"]),
             ("DISCARD_MAX_GB=0", &["DISCARD_MAX_GB"]),
             ("DISCARD_MAX_GB=0.5", &[]),
+            // The free space every copy onto this box leaves (disk-guard).
+            ("CONTROL_MIN_FREE_GB=lots", &["CONTROL_MIN_FREE_GB"]),
+            ("CONTROL_MIN_FREE_GB=100001", &["CONTROL_MIN_FREE_GB"]),
+            ("CONTROL_MIN_FREE_GB=0", &[]),
             ("BACKUP_TIMEOUT_SECS=0", &["BACKUP_TIMEOUT_SECS"]),
             ("BUSY_AUTO_RESOLVE_HOURS=3h", &["BUSY_AUTO_RESOLVE_HOURS"]),
             ("BUSY_AUTO_RESOLVE_HOURS=721", &["BUSY_AUTO_RESOLVE_HOURS"]),
@@ -19174,6 +19289,21 @@ ASK_CODEX_MODEL=-x
         ] {
             let (report, _) = config_report(&Config::parse(&format!("{base}{extra}")), "runpod");
             assert!(report.lines().any(|l| l == row), "{extra:?}:\n{report}");
+        }
+        // The floor every copy onto this box keeps: its default said so, a bad value ✗ and named.
+        let tail = " (CONTROL_MIN_FREE_GB) — pulls, backup copies, replace/migrate staging, the reaper";
+        for (extra, row) in [
+            ("", format!("  · copies leave free here     5 GB (default){tail}")),
+            ("CONTROL_MIN_FREE_GB=12\n", format!("  · copies leave free here     12 GB{tail}")),
+            ("CONTROL_MIN_FREE_GB=0\n", format!("  · copies leave free here     0 GB{tail}")),
+            (
+                "CONTROL_MIN_FREE_GB=lots\n",
+                "  ✗ copies leave free here     CONTROL_MIN_FREE_GB must be a whole number of GB, 0..=100000 (got `lots`)".to_string(),
+            ),
+        ] {
+            let (report, missing) = config_report(&Config::parse(&format!("{base}{extra}")), "runpod");
+            assert!(report.lines().any(|l| l == row), "{extra:?}:\n{report}");
+            assert_eq!(missing.iter().any(|m| m.starts_with("CONTROL_MIN_FREE_GB")), extra.contains("lots"), "{missing:?}");
         }
         // Not ready here is ⚠, and named.
         let (report, _) = config_report(&Config::parse(&format!("{base}SHARED_SSH_KEY_PATH=/nonexistent/k\n")), "runpod");
@@ -23471,10 +23601,14 @@ mod remote_tests {
     const KEY: &str = "/root/.ssh/id_ed25519";
 
     fn cfg() -> Config {
-        Config::parse(&format!(
+        Config::parse(&cfg_text())
+    }
+
+    fn cfg_text() -> String {
+        format!(
             "MACHINE_NAME_PREFIX=devtest\nBACKUP_REPO_PATH={REPO}\nGIT_SSH_KEY_REMOTE={KEY}\n\
              SHARED_SSH_KEY_PATH=/nonexistent/devtest_key\n"
-        ))
+        )
     }
 
     fn targets(f: &Fleet) -> Vec<(String, SshTarget)> {
@@ -23901,6 +24035,85 @@ mod remote_tests {
         let unpushed = [Unpushed { pod: "devtest-bloom".into(), why: "x".into(), branch: None, at_push: true, wrong_origin: false, busy: None }];
         assert_eq!(fallback_lines(&unpushed, &Ok(pull(both.clone()).await)), ["✗ devtest-bloom: git push failed (x); the fallback copy failed too: no SSH endpoint to pull from"]);
         let _ = stub.take();
+    }
+
+    /// disk-guard: with too little free on this box (under CONTROL_MIN_FREE_GB), a pod's copy is
+    /// skipped whole — before the pod is asked anything or any of its dirs is made — said on its
+    /// line, recorded for the daily health check, and a failure of the run: `pods pull`, and the
+    /// fallback copy `pods backup --no-pull` makes of a pod whose push failed. A pod with room
+    /// (here: onto its earlier copy, a zero floor) is copied as before.
+    #[tokio::test]
+    async fn a_copy_without_room_on_this_box_is_skipped_whole_and_fails_the_run() {
+        let stub = StubRsync::new("noroom");
+        let (base, state) = (stub.0.join("backups"), stub.0.join("state"));
+        let at_floor = |gb: &str| {
+            Config::parse(&format!(
+                "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\n\
+                 GIT_SSH_KEY_REMOTE={KEY}\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nARENA_START_DATE=2026-01-05\n\
+                 LOCAL_BACKUP_DIR={}\nARENA_STATE_DIR={}\nCONTROL_MIN_FREE_GB={gb}\n",
+                base.display(),
+                state.display()
+            ))
+        };
+        let full = at_floor("100000");
+        let base_s = base.display().to_string();
+        let chosen = picked(&fleet(), &full, &["apple", "bloom"]).await;
+        // Each pod's line: why, and what to do.
+        let noted = |pods: &[&str]| {
+            let said = take_said();
+            for pod in pods {
+                assert!(
+                    said.iter().any(|l| l.starts_with(&format!("✗ {pod}: skipped: only "))
+                        && l.contains("(floor 100000 GB, CONTROL_MIN_FREE_GB) — nothing copied; free space on ")),
+                    "{pod}: {said:?}"
+                );
+            }
+        };
+
+        // `pods pull`: both skipped; nothing asked, made or rsynced; the run fails naming them.
+        let fake = Arc::new(FakeRemote::new());
+        let remote: Arc<dyn Remote> = fake.clone();
+        let _ = take_said();
+        let e = handle_pull(&remote, &full, Some("w1d1".into()), &base_s, None, None, false, false, &chosen, false, true, &stub.path())
+            .await
+            .unwrap_err();
+        noted(&["devtest-apple", "devtest-bloom"]);
+        for pod in ["devtest-apple", "devtest-bloom"] {
+            assert!(format!("{e:#}").contains(&format!("{pod} (only ")), "{e:#}");
+        }
+        assert!(!base.exists(), "nothing written: not even the backup dir");
+        assert!(stub.take().is_empty() && fake.calls().is_empty(), "no rsync, no pod asked");
+        let record = state.join("devtest").join(arena_core::disk::SKIPS_FILE);
+        let (skips, _) = arena_core::disk::Skips::load(&record);
+        let got: Vec<(&str, &str, u64)> = skips.entries.iter().map(|e| (e.pod.as_str(), e.what.as_str(), e.count)).collect();
+        assert_eq!(got, [("devtest-apple", "copy", 1), ("devtest-bloom", "copy", 1)]);
+        assert!(skips.entries[0].why.starts_with("only ") && !skips.entries[0].why.contains("nothing copied"), "{:?}", skips.entries[0]);
+
+        // `pods backup --no-pull`, bloom's push failing: its fallback copy is skipped the same
+        // way, on its line, and the run fails.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [FakeReply::exit(1, "error: failed to push some refs").with_stdout("BRANCH autocommit-b\nPUSH_FAILED\n")]);
+        let bloom = picked(&fleet(), &full, &["bloom"]).await;
+        let _ = take_said();
+        let e = handle_full_backup(fake.clone(), &full, &bloom, true, None, false, true, &stub.path()).await.unwrap_err();
+        noted(&["devtest-bloom"]);
+        assert!(format!("{e:#}").contains("devtest-bloom"), "{e:#}");
+        assert_eq!(execs(&fake, 22002).len(), 1, "its backup only: no probe for a copy that can't happen");
+        assert!(!base.exists() && stub.take().is_empty());
+        assert_eq!(arena_core::disk::Skips::load(&record).0.entries.iter().find(|e| e.pod == "devtest-bloom").map(|e| e.count), Some(2));
+
+        // Room: a later copy (bloom already copied here) needs ~0.1 GB per tier, the floor 0.
+        for tier in ["w1d1/devtest-bloom", "big/devtest-bloom"] {
+            std::fs::create_dir_all(base.join(tier)).unwrap();
+            std::fs::write(base.join(tier).join("old.py"), "x").unwrap();
+        }
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [repo_in_place()]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        handle_pull(&remote, &at_floor("0"), Some("w1d1".into()), &base_s, None, None, false, false, &bloom, false, true, &stub.path())
+            .await
+            .unwrap();
+        assert_eq!(stub.take(), ["big/devtest-bloom", "w1d1/devtest-bloom", "w1d1/devtest-bloom"]);
     }
 
     /// S17 + AD7: every pull rsync writes its temp files to its tier root's `.rsync-tmp`
@@ -26488,11 +26701,6 @@ mod remote_tests {
             .unwrap();
             path.display().to_string()
         };
-        let (free, total) = arena_core::replica::disk_space(&root).unwrap();
-        if arena_core::replica::staging_room(1_000, free, total).is_err() {
-            eprintln!("not enough free disk to stage even 1 KB here — skipping");
-            return;
-        }
         let (src, dest) = ("id-devtest-apple", "id-devtest-apple-new");
         let fake_for = |dest_host: &str| {
             let fake = FakeRemote::new();
@@ -26528,12 +26736,35 @@ mod remote_tests {
         assert_eq!(std::fs::metadata(&stage).unwrap().permissions().mode() & 0o777, 0o700, "a participant's home: private");
         std::fs::remove_dir_all(&stage).unwrap();
 
-        // More than the disk can spare: refused before anything is staged.
+        // More than the disk can spare (the one free-space judge, CONTROL_MIN_FREE_GB — here 0:
+        // only the measured copy must fit): refused before anything is staged.
         let fake = fake_for("10.0.0.2:22002");
-        let e = copy_pod_files(&cfg(), &f, &fake, src, dest, &opts(stub("huge", "999.00P", 0))).await.unwrap_err();
+        let judged = Config::parse(&format!("{}CONTROL_MIN_FREE_GB=0\n", cfg_text()));
+        let e = copy_pod_files(&judged, &f, &fake, src, dest, &opts(stub("huge", "999.00P", 0))).await.unwrap_err();
         let msg = format!("{e:#}");
-        assert!(msg.contains("not copying via local staging") && msg.contains("must stay free"), "{msg}");
+        assert!(msg.contains(&format!("not copying via local staging ({}): skipped: ", root.display())), "{msg}");
+        assert!(msg.contains("GB, measured) would leave less than the floor (0 GB, CONTROL_MIN_FREE_GB)"), "{msg}");
+        assert!(msg.ends_with("names arena's biggest dirs there), or point TMPDIR at a bigger disk"), "{msg}");
         assert!(!stage.exists(), "nothing staged, nothing left behind");
+        // A stage another run holds (a second replace/migrate of the same pod): refused, and that
+        // run's stage left exactly as it is.
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("theirs.py"), "x").unwrap();
+        let held = arena_core::disk::lock_dir(&stage).unwrap();
+        let fake = fake_for("10.0.0.2:22002");
+        let e = copy_pod_files(&cfg(), &f, &fake, src, dest, &opts(stub("held", "1,000", 0))).await.unwrap_err();
+        assert!(format!("{e:#}").contains("another arena run is copying id-devtest-apple through"), "{e:#}");
+        assert!(stage.join("theirs.py").exists() && !stage.join("work.py").exists());
+        // An earlier attempt's stage, once a copy lands without it (here a direct one): removed.
+        drop(held);
+        let fake = FakeRemote::new();
+        fake.on(&host(22001), "arena-replica-sent", FakeReply::stdout("arena-replica-sent=yes\n"));
+        fake.on(&host(22001), "RUNPOD_POD_ID", FakeReply::stdout(src));
+        fake.on("10.0.0.2:22002", "arena-replica-ready", FakeReply::stdout("arena-replica-ready\n"));
+        fake.on("10.0.0.2:22002", "MARK=", FakeReply::stdout(&format!("ID={dest}\nMARK=arena-replace-{dest}\n")));
+        copy_pod_files(&cfg(), &f, &fake, src, dest, &opts(stub("direct", "1,000", 0))).await.unwrap();
+        assert!(execs(&fake, 22001).iter().any(|(c, _)| c.contains("rsync ")), "copied directly");
+        assert!(!stage.exists(), "the leftover of an earlier attempt goes once a copy landed");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -26953,6 +27184,45 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         let err = handle_pods(deep(false), &fleet(), fake.clone(), &bad, true).await.unwrap_err();
         assert!(err.to_string().contains("MIN_DRIVER_VERSION"), "{err}");
         assert!(fake.calls().is_empty());
+    }
+
+    /// disk-guard: the daily health check (`pods test --deep` over the cohort, nothing named)
+    /// ends with this box — its disk, and the copies skipped for space in the last day, which
+    /// fail the check even when every pod passes. A check of named pods says nothing about it.
+    #[tokio::test]
+    async fn the_health_check_counts_copies_skipped_for_space_as_failures() {
+        let dir = std::env::temp_dir().join(format!("arena-deep-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = deep_cfg();
+        cfg.values.insert("ARENA_STATE_DIR".into(), dir.display().to_string());
+        cfg.values.insert("CONTROL_MIN_FREE_GB".into(), "0".into());
+        cfg.values.insert("LOCAL_BACKUP_DIR".into(), dir.join("backup").display().to_string());
+        let healthy = || {
+            let fake = Arc::new(FakeRemote::new());
+            for port in [22001, 22002, 22003] {
+                fake.script(&host(port), [FakeReply::stdout(DEEP_HEALTHY)]);
+            }
+            fake
+        };
+        handle_deep_test(&fleet(), healthy(), &cfg, &everyone(&fleet()), false, false).await.unwrap();
+        // A copy skipped an hour ago: the check fails, and says which and why.
+        let now = arena_core::snapshot::unix_now();
+        let why = "only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB)";
+        let record = dir.join("devtest").join(arena_core::disk::SKIPS_FILE);
+        arena_core::disk::record_skips(&record, &[("devtest-bloom".into(), "copy".into(), why.into())], now - 3600, Duration::from_secs(5)).unwrap();
+        let err = handle_deep_test(&fleet(), healthy(), &cfg, &everyone(&fleet()), false, false).await.unwrap_err();
+        assert_eq!(err.to_string(), "copies of 1 pod(s) onto this box were skipped for space in the last day");
+        let box_health = crate::disk::health(&cfg, now).unwrap();
+        assert_eq!(box_health.skipped, 1);
+        assert!(box_health.lines[0].contains("This box"), "{:?}", box_health.lines);
+        assert!(box_health.lines.iter().any(|l| l.starts_with("  ✗ devtest-bloom: copy skipped at ") && l.ends_with(why)), "{:?}", box_health.lines);
+        assert!(box_health.lines.iter().any(|l| l.starts_with("  ✓ ")), "the disk's own row: {:?}", box_health.lines);
+        // Named pods: about them only.
+        let apple = picked(&fleet(), &cfg, &["apple"]).await;
+        handle_deep_test(&fleet(), healthy(), &cfg, &apple, false, false).await.unwrap();
+        // A day on, no longer this check's.
+        assert_eq!(crate::disk::health(&cfg, now + 86_400).unwrap().skipped, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `pods test --deep` leaves each verdict in the health cache `arena snapshot` reads —

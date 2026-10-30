@@ -1219,6 +1219,28 @@ struct Dest {
     budget: Duration,
 }
 
+/// The floor a reap backup keeps free on a tier root: `REAP_MIN_FREE_GB` (the room for a pod's
+/// last copy, so the copy counts as in it), never under the box's own `CONTROL_MIN_FREE_GB` —
+/// the one free-space judge every copy onto this box goes through (`arena_core::disk`). `Err`: an
+/// invalid `CONTROL_MIN_FREE_GB`, named.
+fn reap_floor(cfg: &Config, settings: &ReapSettings) -> std::result::Result<arena_core::disk::Floor, String> {
+    let reap = arena_core::disk::Floor { bytes: settings.min_free_bytes, key: "REAP_MIN_FREE_GB" };
+    let control = crate::disk::floor(cfg).map_err(|e| e.to_string())?;
+    Ok(control.map_or(reap, |c| reap.max(c)))
+}
+
+/// Whether tier root `p` has the room a reap backup needs ([`reap_floor`]): `Ok(Err(reason))` —
+/// how far off it is (`only 3.1 GB free on / (floor 20 GB, REAP_MIN_FREE_GB)`), or that the free
+/// space couldn't be read; `Err` — the floor itself is invalid.
+fn room(cfg: &Config, settings: &ReapSettings, p: &Path) -> std::result::Result<std::result::Result<(), String>, String> {
+    use arena_core::disk::{judge, reading, Size};
+    let floor = reap_floor(cfg, settings)?;
+    Ok(match reading(p) {
+        Ok(fs) => judge(&fs, 0, &Size::InFloor.into(), floor).map_err(|skip| skip.reason),
+        Err(e) => Err(format!("free space unknown ({e})")),
+    })
+}
+
 async fn dest_check(cfg: &Config, settings: &ReapSettings, rsync: &str) -> std::result::Result<Dest, Vec<String>> {
     let mut bad = Vec::new();
     let snap_root = cfg.get("LOCAL_BACKUP_DIR").map(str::trim).filter(|d| !d.is_empty()).unwrap_or("./backup").to_string();
@@ -1233,14 +1255,10 @@ async fn dest_check(cfg: &Config, settings: &ReapSettings, rsync: &str) -> std::
             bad.push(e);
             continue;
         }
-        match arena_core::pull::free_bytes(p) {
-            Ok(free) if free >= settings.min_free_bytes => {}
-            Ok(free) => bad.push(format!(
-                "{root}: {:.1} GB free, under REAP_MIN_FREE_GB ({} GB)",
-                free as f64 / 1e9,
-                settings.min_free_bytes / 1_000_000_000
-            )),
-            Err(e) => bad.push(format!("{root}: free space unknown ({e})")),
+        match room(cfg, settings, p) {
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => bad.push(format!("{root}: {why}")),
+            Err(e) => bad.push(e),
         }
     }
     let label = match super::resolve_week_day(cfg, None, None) {
@@ -2686,8 +2704,11 @@ pub(crate) fn readiness_rows_for(cfg: &Config, rsync: &str, full: bool) -> (Vec<
         match arena_core::pull::check_tier_marker(p, tier) {
             Err(e) => row(Some(false), &what, e, Gap::Blocks("the backup tier markers")),
             Ok(()) => {
-                let free = arena_core::pull::free_bytes(p).map(|b| format!("{:.1} GB free", b as f64 / 1e9)).unwrap_or_else(|e| format!("free space unknown ({e})"));
-                let low = settings.as_ref().is_some_and(|s| arena_core::pull::free_bytes(p).is_ok_and(|b| b < s.min_free_bytes));
+                let free = match arena_core::disk::reading(p) {
+                    Ok(fs) => format!("{} free", arena_core::disk::gb(fs.free)),
+                    Err(e) => format!("free space unknown ({e})"),
+                };
+                let low = settings.as_ref().and_then(|s| room(cfg, s, p).ok()).is_some_and(|r| r.is_err());
                 row(Some(!low), &what, format!("{root} — marked `{}`, {free}", tier.word()), Gap::Blocks("free space on the backup tiers"));
             }
         }

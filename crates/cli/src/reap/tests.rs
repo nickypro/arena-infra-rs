@@ -1308,7 +1308,14 @@ async fn an_unhealthy_destination_blocks_and_notifies() {
     let (w, _) = due_world("nospace", "REAP_MIN_FREE_GB=100000").await;
     let (r, out) = w.run("apply").await;
     assert_eq!(exit_code(&r), Some(3));
-    assert!(out.contains("under REAP_MIN_FREE_GB"), "{out}");
+    assert!(out.contains("free on ") && out.contains("(floor 100000 GB, REAP_MIN_FREE_GB)"), "{out}");
+    assert!(w.terminated().is_empty());
+    // The box's own floor holds for the reaper too (the one free-space judge): stricter than
+    // REAP_MIN_FREE_GB here, it's the one named.
+    let (w, _) = due_world("nospace-box", "CONTROL_MIN_FREE_GB=100000").await;
+    let (r, out) = w.run("apply").await;
+    assert_eq!(exit_code(&r), Some(3));
+    assert!(out.contains("(floor 100000 GB, CONTROL_MIN_FREE_GB)"), "{out}");
     assert!(w.terminated().is_empty());
     let (w, a) = due_world("nostart", "ARENA_START_DATE=").await;
     let (r, out) = w.run("apply").await;

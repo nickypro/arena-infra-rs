@@ -596,27 +596,6 @@ pub fn check_tier_marker(root: &Path, tier: Tier) -> std::result::Result<(), Str
     }
 }
 
-/// Bytes free for an unprivileged writer on the filesystem holding `path` (`statvfs`:
-/// `f_bavail × f_frsize`) — what the reaper's free-space floor is checked against.
-#[cfg(unix)]
-pub fn free_bytes(path: &Path) -> std::io::Result<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path holds a NUL byte"))?;
-    // SAFETY: statvfs(3) on a NUL-terminated path into a zeroed struct we own.
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
-}
-
-/// No `statvfs` off unix: unknown, which the reaper reads as "not enough".
-#[cfg(not(unix))]
-pub fn free_bytes(_path: &Path) -> std::io::Result<u64> {
-    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "free space unknown on this platform"))
-}
-
 /// The rsync argv that checks a finished tier: [`rsync_args`] plus `--dry-run` — with
 /// `--stats` (always passed) it reports how many files a real run would still send
 /// ([`parse_rsync_stats`]'s `files_sent`): 0 = the destination holds everything the source
@@ -1607,8 +1586,6 @@ mod tests {
         std::fs::write(d.join(TIER_MARKER), "snapshot\n").unwrap();
         assert!(check_tier_marker(&d, Tier::Snapshot).is_ok());
         assert!(check_tier_marker(&d, Tier::Big).unwrap_err().contains("doesn't say `big`"));
-        assert!(free_bytes(&d).unwrap() > 0);
-        assert!(free_bytes(&d.join("missing")).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 

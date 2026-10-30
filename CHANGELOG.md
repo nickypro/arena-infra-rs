@@ -19,6 +19,55 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-30 · Copies onto the control box no longer fill its disk
+- Every copy arena makes onto the box it runs on — `pods pull`, `pods backup`'s pull and its copies
+  of pods git didn't back up (a failed push, a wrong origin, a BUSY pod), `set-branch --hard`'s
+  copies, `pods baseline`, replace/migrate's local staging and the reaper's — now checks that disk
+  first: it goes ahead only if `CONTROL_MIN_FREE_GB` (default 5 GB) stays free after it and the
+  run's other copies. A pod's first copy counts as 2 GB per tier, a later one as 0.1 GB, the
+  staging as measured. A pod that doesn't fit is skipped whole, before anything of it is written,
+  with one line (`✗ arena9-bloom: skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB)
+  — nothing copied; …`), and the run fails. The git backup itself isn't affected. (Prod's box was at
+  96 %, 3.1 GB free of 75 GB, with the */15 cron copying pods onto it unchecked.)
+- The daily health check (`cron install --health`) now ends with this box: how full its disk is,
+  what arena left on it, and every pod whose copy was skipped for space in the last day, which
+  fails the check.
+- `config check` shows how full each disk arena writes to is (⚠ under twice the floor, ⚠ under it,
+  with arena's biggest dirs there), and what arena left on the box: a replace/migrate staging copy
+  (`/tmp/arena-replace-<pod id>`), an interrupted `pods baseline`, a hard-stopped pull's rsync temp
+  files — with size, age and the commands to look at and remove each. `teardown --check` lists them
+  too (◷ kept, never against its verdict). arena never removes them itself: a staging copy can be the
+  only copy of a pod's work.
+- replace/migrate's staging copy is now also removed when a later attempt copies directly (it stayed
+  forever), and is locked while a run copies through it: a second replace/migrate of the same pod is
+  refused instead of writing into it.
+- The reaper keeps its own `REAP_MIN_FREE_GB` (default 20) free, never less than
+  `CONTROL_MIN_FREE_GB`.
+
+### Action needed
+- On a box with less than the floor free, every copy onto it is skipped (and its run fails) until
+  there's room — on prod today (3.1 GB free), every one. Make room first, or lower the floor for a
+  while (`arena config set CONTROL_MIN_FREE_GB 2`).
+- Suggestions for prod's control box (yours to decide; check before deleting anything):
+  - `/tmp/arena-replace-leh3rc2hdcf31i` (3.5 GB, 2026-10-14): replace/migrate's staging copy of pod
+    `leh3rc2hdcf31i`'s home. Most likely left by the build prod ran then (from the prod checkout,
+    based on 2026-10-07), which never removed its staging, even after a copy that worked. Check that
+    the pod's work is on the pod that replaced it or in `LOCAL_BACKUP_DIR` (`arena pods list
+    --no-probe | grep leh3rc2hdcf31i`, `ls -la /tmp/arena-replace-leh3rc2hdcf31i`), then
+    `rm -rf /tmp/arena-replace-leh3rc2hdcf31i`.
+  - journald (3.6 GB): `journalctl --vacuum-size=500M`, and `SystemMaxUse=500M` in
+    `/etc/systemd/journald.conf` to keep it there.
+  - `/root/archive/old-pod-backups` (14 GB): move it to the attached volume.
+  - Docker (~6 GB reclaimable): `docker system df`, then `docker image prune` / `docker builder
+    prune` if nothing needs what they remove.
+  - Then `arena config check` shows what's free, and what arena left on the box.
+
+### Config
+- `CONTROL_MIN_FREE_GB` (new, default 5): whole GB every copy onto this box leaves free on its
+  filesystem, 0..100000 (0: only the copy itself must fit). A bad value fails every copy up front.
+- replace/migrate's local staging now keeps `CONTROL_MIN_FREE_GB` free (before: a tenth of the
+  disk, at least 5 GB).
+
 ## 2026-10-29 · An admin key only the proxy holds, which reaches every machine
 - `ADMIN_SSH_KEY_PATH` (optional) is now a key of its own role: its private half stays on the
   proxy / control box, and every machine — cohort pods and `@` staff boxes, on every provider —

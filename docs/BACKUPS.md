@@ -43,6 +43,8 @@ flowchart LR
 - [`pods baseline`](#pods-baseline)
 - [`pods restore`](#pods-restore)
 - [Moving a pod: `pods replace` / `pods migrate`](#moving-a-pod-pods-replace--pods-migrate)
+- [Room on this box: `CONTROL_MIN_FREE_GB`](#room-on-this-box-control_min_free_gb)
+  - [What arena leaves on the box](#what-arena-leaves-on-the-box)
 - [`cron`: the lines that run it all](#cron-the-lines-that-run-it-all)
   - [Locks and logs](#locks-and-logs)
   - [Upgrading from older versions](#upgrading-from-older-versions)
@@ -797,10 +799,13 @@ findings #5–#7, #13, #16, #17, #19, #20, #26–#30):
 - The **direct** pod-to-pod copy is skipped when both pods share a public IP (a pod can't reach its
   neighbour through it) and gives up connecting after 15 s; when it fails the fallback names its
   real reason. The **via-local** fallback first sizes the staging (an rsync dry run) and refuses
-  when the local disk would keep less than a tenth of itself (≥ 5 GB) free; the stage
-  (`$TMPDIR/arena-replace-<id>`, mode 0700) is **removed** once the copy landed, and kept — with its
-  path, size and the `rm -rf` — only when it failed (a re-run continues from it); `migrate finish` /
-  a finished `replace` remove a leftover.
+  when it wouldn't leave `CONTROL_MIN_FREE_GB` free on that disk ([Room on this
+  box](#room-on-this-box-control_min_free_gb)); the stage (`$TMPDIR/arena-replace-<id>`, mode 0700,
+  locked while a run copies through it — a second replace/migrate of the same pod is refused, its
+  stage untouched) is **removed** once the copy landed — an earlier attempt's too, once a later one
+  lands directly —, and kept — with its path, size and the `rm -rf` — only when it failed (a re-run
+  continues from it) or the run was stopped; `migrate finish` / a finished `replace` remove a
+  leftover.
 - The source's **GPU type** comes from its own listing when its spec doesn't say (RunPod v1), before
   config's `GPU_TYPE` (the plan says where it came from). `--gpu`/`--cloud` take **lists** and go
   through the same placement as `up` (`--max-price`, `--order`, `--retry-mins`/`--retry-secs`): one
@@ -822,6 +827,53 @@ findings #5–#7, #13, #16, #17, #19, #20, #26–#30):
   (volume, last sync) unless `--discard-stopped`. `migrate copy` of a **locked** original is allowed
   (it only reads it) with a note; cutover / replace / finish refuse a locked pod with the unlock
   command — nothing here ever unlocks.
+
+## Room on this box: `CONTROL_MIN_FREE_GB`
+
+Every copy arena makes onto the machine it runs on first checks the filesystem it writes to: `pods
+pull`, `pods backup`'s pull and the copy it makes of a pod git didn't back up (a failed push, a wrong
+`origin`, a BUSY pod), `set-branch --hard`'s copy, `pods baseline`, replace/migrate's local staging
+and the reaper's last copy. (Live, 2026-10-30: prod's control box sat at 96 %, 3.1 GB free of 75 GB,
+while the */15 cron copied pods onto it; a plain `pods backup` of a GPU image home had filled it
+once.)
+
+- A copy goes ahead only if what's free there, less what this run's earlier copies may take and what
+  this one may take, stays at or above `CONTROL_MIN_FREE_GB` (whole GB, default 5; `0` = only the
+  copy itself must fit).
+- What a copy may take: measured where arena measures it (the staging: an rsync dry run); otherwise
+  a pod's first copy into a tier counts as 2 GB (about a fresh GPU image's home) and a later one —
+  onto its earlier copy, where rsync writes only what changed — as 0.1 GB. A pod's tiers are judged
+  together: it is copied whole or not at all.
+- A skip happens before the pod is asked anything or any of its dirs is made, one line per pod —
+  `✗ arena9-bloom: skipped: only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB) — nothing copied;
+  free space on / (…)` — and it is a failure of the run (the exit; `pods backup`'s `the fallback copy
+  failed too: skipped: …`; a `--hard` switch doesn't reset that pod). A `--dry-run` says which pods a
+  real run would skip now.
+- The reaper keeps its own, larger `REAP_MIN_FREE_GB` (default 20) on both tier roots, never less
+  than `CONTROL_MIN_FREE_GB`.
+- Skips are recorded in the state dir (`disk-skips.json`); the daily health check (`cron install
+  --health`) lists the last day's after the pods' table and fails on them.
+
+`config check` (after its report) and the daily health check show each filesystem arena writes to —
+the backups, `$TMPDIR`, the state dir — with what's free: ⚠ under twice the floor, ⚠ under it, each
+with arena's biggest dirs there.
+
+### What arena leaves on the box
+
+Never removed automatically — a staging copy can be the only copy of a pod's work:
+
+- `$TMPDIR/arena-replace-<pod id>`: replace/migrate's via-local staging of that pod's home. Removed
+  once a copy of it lands, kept when the copy failed (a re-run continues from it); left too by a run
+  that was stopped (Ctrl+C, a dropped ssh session), and by builds from before 2026-10-09, which never
+  removed it.
+- `<LOCAL_BACKUP_DIR>/baseline/w<N>/.fleet.partial-<pid>`: an interrupted `pods baseline`.
+- A tier's `.rsync-tmp/` holding files unchanged for a day: a pull stopped hard (SIGKILL).
+
+`config check`, the daily health check and `teardown --check` (◷ kept, never against its verdict)
+list each with its size, age, what made it and the commands to look at it and remove it; one a
+running arena holds is said to be in use. Before removing a staging copy, check that its pod still
+exists (`arena pods list --no-probe | grep <id>`) or that its work is on the pod that replaced it, or
+in `LOCAL_BACKUP_DIR`.
 
 ## `cron`: the lines that run it all
 
@@ -1061,7 +1113,9 @@ policy can be reaped: terminated, container disk and all, after their backup` wh
 policy, and `config check`'s RUNPOD_API row says it too; nothing acts by itself: `--apply` still
 needs `REAP_ENABLED=1` in the file), absolute `LOCAL_BACKUP_DIR`, a `.arena-backup-tier` marker on
 each backup root (`snapshot` / `big`; the big tier's root is `LOCAL_BACKUP_BIG_DIR`, default
-`<LOCAL_BACKUP_DIR>/big`), `ARENA_START_DATE` and no `BACKUP_REMOTE_PATH`; `config check` lists
+`<LOCAL_BACKUP_DIR>/big`) with `REAP_MIN_FREE_GB` (default 20) free on it, never less than
+`CONTROL_MIN_FREE_GB` ([Room on this box](#room-on-this-box-control_min_free_gb)), `ARENA_START_DATE`
+and no `BACKUP_REMOTE_PATH`; `config check` lists
 what's missing once the reaper is on or its cron line is installed (off: one `· reaper off (opt-in)`
 row, a ✗ only for a `REAP_*` value set but invalid).
 

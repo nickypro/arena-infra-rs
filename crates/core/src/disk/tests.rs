@@ -1,0 +1,339 @@
+use super::*;
+
+const G: u64 = GB;
+
+fn fs(dev: u64, mount: &str, free: u64) -> Fs {
+    Fs { dev, mount: PathBuf::from(mount), free, total: 75 * G }
+}
+
+fn floor(gb: u64) -> Floor {
+    Floor::control(gb * G)
+}
+
+struct TmpDir(PathBuf);
+
+impl TmpDir {
+    fn new(tag: &str) -> TmpDir {
+        let d = std::env::temp_dir().join(format!("arena-disk-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        TmpDir(d)
+    }
+}
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn the_floor_is_whole_gb_from_zero_with_a_default_of_five() {
+    let f = |text: &str| floor_bytes(&Config::parse(text));
+    assert_eq!(f(""), Ok(5 * G));
+    assert_eq!(f("CONTROL_MIN_FREE_GB= \n"), Ok(5 * G));
+    for (v, want) in [("0", 0), ("1", G), (" 12 ", 12 * G), ("100000", 100_000 * G)] {
+        assert_eq!(f(&format!("CONTROL_MIN_FREE_GB={v}\n")), Ok(want), "{v}");
+    }
+    for bad in ["100001", "-1", "5.5", "lots", "5GB"] {
+        let e = f(&format!("CONTROL_MIN_FREE_GB={bad}\n")).unwrap_err();
+        assert_eq!(e, format!("CONTROL_MIN_FREE_GB must be a whole number of GB, 0..=100000 (got `{bad}`)"));
+    }
+}
+
+/// The judge, as a table: (free, already held this run, need, floor GB) → go, or the words.
+#[test]
+fn a_copy_goes_only_when_it_leaves_the_floor_free() {
+    let cases: &[(u64, u64, Size, u64, Option<&str>)] = &[
+        // Prod on 2026-10-30: 3.1 GB free, the default floor.
+        (3_100_000_000, 0, Size::First, 5, Some("only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB)")),
+        (3_100_000_000, 0, Size::Later, 5, Some("only 3.1 GB free on /")),
+        (3_100_000_000, 0, Size::Measured(0), 5, Some("only 3.1 GB free on /")),
+        // Above the floor, but not with the copy on top.
+        (6 * G, 0, Size::First, 5, Some("6 GB free on /, and this copy (~2 GB, a first copy, not measured) would leave less than the floor (5 GB, CONTROL_MIN_FREE_GB)")),
+        (6 * G, G / 2, Size::Measured(G), 5, Some("this copy (~1 GB, measured) after ~0.5 GB for this run's other copies would leave less")),
+        // Room: exactly at the floor afterwards is enough.
+        (7 * G, 0, Size::First, 5, None),
+        (5 * G + G / 10, 0, Size::Later, 5, None),
+        (40 * G, 10 * G, Size::First, 5, None),
+        // A zero floor: only the copy itself must fit.
+        (G, 0, Size::Measured(G), 0, None),
+        (G, 0, Size::Measured(G + 1), 0, Some("1 GB free on /, and this copy (~1.0 GB, measured) would leave less than the floor (0 GB")),
+        // Counted in the floor (the reaper's): the floor alone.
+        (20 * G, 0, Size::InFloor, 20, None),
+        (19 * G, 0, Size::InFloor, 20, Some("only 19 GB free on / (floor 20 GB")),
+    ];
+    for (free, already, size, floor_gb, want) in cases {
+        let got = judge(&fs(1, "/", *free), *already, &Need::from(*size), floor(*floor_gb));
+        match (got, want) {
+            (Ok(()), None) => {}
+            (Err(skip), Some(words)) => {
+                let text = skip.to_string();
+                assert!(text.starts_with("skipped: ") && text.contains(words), "{free} {size:?}: {text}");
+                assert!(text.contains("nothing copied; free space on / (`arena config check` names arena's biggest dirs there)"), "{text}");
+            }
+            (got, want) => panic!("{free} {already} {size:?} {floor_gb}: got {got:?}, want {want:?}"),
+        }
+    }
+    // The line the brief asks for, word for word at its start.
+    let skip = judge(&fs(1, "/", 3_100_000_000), 0, &Need::from(Size::First), floor(5)).unwrap_err();
+    assert!(skip.to_string().starts_with("skipped: only 3.1 GB free on / (floor 5 GB"), "{skip}");
+    // Another floor names its own key.
+    let reap = Floor { bytes: 20 * G, key: "REAP_MIN_FREE_GB" };
+    assert!(judge(&fs(1, "/srv", G), 0, &Need::from(Size::InFloor), reap).unwrap_err().reason.ends_with("(floor 20 GB, REAP_MIN_FREE_GB)"));
+    assert_eq!(Floor::control(5 * G).max(reap), reap);
+    assert_eq!(reap.max(Floor::control(30 * G)), Floor::control(30 * G));
+    let unknown = Skip::unknown(Path::new("/x"), "gone");
+    assert_eq!(unknown.to_string(), "skipped: free space on /x unknown (gone) — nothing copied; check that disk");
+}
+
+#[test]
+fn a_copys_parts_add_up_and_say_what_they_are() {
+    let n = Need::of(&[Size::First, Size::First]);
+    assert_eq!((n.bytes, n.words.as_str()), (4 * G, "~4 GB, a first copy, not measured"));
+    let n = Need::of(&[Size::Later, Size::Later]);
+    assert_eq!((n.bytes, n.words.as_str()), (2 * LATER_COPY, "~0.2 GB, what changed since the last copy, not measured"));
+    let n = Need::of(&[Size::First, Size::Later]);
+    assert_eq!((n.bytes, n.words.as_str()), (FIRST_COPY + LATER_COPY, "~2.1 GB, not measured"));
+    assert_eq!(Need::of(&[Size::Measured(3_500_000_000)]).words, "~3.5 GB, measured");
+    assert_eq!(Need::of(&[Size::Measured(u64::MAX), Size::First]).bytes, u64::MAX, "saturates");
+}
+
+/// A run's copies are held against the space they share; a pod is admitted whole or not at all.
+#[test]
+fn a_runs_copies_add_up_and_a_pod_goes_whole_or_not_at_all() {
+    let root = fs(1, "/", 10 * G);
+    let mut l = Ledger::new(floor(5));
+    // One pod's two tiers on one filesystem: ~4 GB together.
+    assert_eq!(l.admit(&[(root.clone(), Size::First), (root.clone(), Size::First)]), Ok(()));
+    // The next first copy would leave 10 - 4 - 4 = 2 GB: skipped, saying what the run holds.
+    let e = l.admit(&[(root.clone(), Size::First), (root.clone(), Size::First)]).unwrap_err().to_string();
+    assert!(e.contains("this copy (~4 GB, a first copy, not measured) after ~4 GB for this run's other copies"), "{e}");
+    // A later copy still fits (4 + 0.2 + 5 ≤ 10), and is held too.
+    assert_eq!(l.admit(&[(root.clone(), Size::Later), (root.clone(), Size::Later)]), Ok(()));
+    // A filesystem keeps its first reading: a later one saying more is free changes nothing.
+    let e = l.admit(&[(fs(1, "/", 100 * G), Size::First)]).unwrap_err().to_string();
+    assert!(e.contains("10 GB free on /") && e.contains("after ~4.2 GB"), "{e}");
+
+    // Two filesystems: one fits, the other doesn't — nothing is held for either.
+    let (snap, big) = (fs(1, "/", 20 * G), fs(2, "/mnt/big", 6 * G));
+    let mut l = Ledger::new(floor(5));
+    let e = l.admit(&[(snap.clone(), Size::First), (big.clone(), Size::First)]).unwrap_err().to_string();
+    assert!(e.contains("6 GB free on /mnt/big"), "{e}");
+    assert_eq!(l.admit(&[(snap.clone(), Size::Measured(15 * G))]), Ok(()), "the failed pod held nothing on /");
+    assert_eq!(l.admit(&[(big, Size::Measured(G))]), Ok(()), "nor on /mnt/big");
+}
+
+#[test]
+fn levels_say_under_the_floor_and_near_it() {
+    for (free, floor_gb, want) in [
+        (3 * G, 5, Level::Below),
+        (5 * G, 5, Level::Near),
+        (9 * G, 5, Level::Near),
+        (10 * G, 5, Level::Ok),
+        (0, 0, Level::Ok),
+    ] {
+        assert_eq!(level(free, floor_gb * G), want, "{free} {floor_gb}");
+    }
+}
+
+#[test]
+fn sizes_and_ages_in_words() {
+    for (b, want) in [
+        (5 * G, "5 GB"),
+        (3_100_000_000, "3.1 GB"),
+        (G / 10, "0.1 GB"),
+        (340_000_000, "0.3 GB"),
+        (12_000_000, "12 MB"),
+        (1, "1 KB"),
+        (0, "0 GB"),
+    ] {
+        assert_eq!(gb(b), want, "{b}");
+    }
+    for (s, want) in [(40, "40 s"), (720, "12 min"), (5 * 3600, "5 h"), (47 * 3600, "47 h"), (16 * 86_400 + 5, "16 days")] {
+        assert_eq!(age_words(s), want, "{s}");
+    }
+}
+
+#[test]
+fn a_reading_is_of_the_nearest_existing_dir_and_names_its_mount() {
+    let d = TmpDir::new("reading");
+    let here = reading(&d.0).unwrap();
+    assert!(here.total > 0 && here.free <= here.total, "{here:?}");
+    assert!(d.0.canonicalize().unwrap().starts_with(&here.mount), "{here:?}");
+    // Not created yet: the filesystem it will be on.
+    let later = reading(&d.0.join("not/yet/there")).unwrap();
+    assert_eq!((later.dev, &later.mount), (here.dev, &here.mount));
+    assert_eq!(reading(Path::new("/")).unwrap().mount, PathBuf::from("/"));
+}
+
+#[test]
+fn a_walk_counts_blocks_hard_links_once_and_stops_at_its_cap() {
+    let d = TmpDir::new("walk");
+    let (a, b) = (d.0.join("a"), d.0.join("b"));
+    std::fs::create_dir_all(a.join("deep")).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(a.join("deep/file"), vec![7u8; 256 * 1024]).unwrap();
+    std::fs::hard_link(a.join("deep/file"), b.join("same")).unwrap();
+    std::fs::write(b.join("own"), vec![1u8; 64 * 1024]).unwrap();
+    let dev = reading(&d.0).unwrap().dev;
+    let big = biggest(&[b.clone(), a.clone(), d.0.join("missing")], dev, 5);
+    // b is walked first and gets the shared file; a's copy of it is not counted again.
+    assert_eq!(big.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), [b.clone(), a.clone()]);
+    assert!(big[0].1.bytes >= 320 * 1024 && big[1].1.bytes < 256 * 1024, "{big:?}");
+    assert!(big[0].1.changed.is_some());
+    // Each alone counts it.
+    let mut seen = HashSet::new();
+    let mut budget = WALK_CAP;
+    assert!(tree_use(&a, &mut budget, &mut seen).bytes >= 256 * 1024);
+    // The cap: a lower bound, said.
+    let mut budget = 1;
+    let t = tree_use(&a, &mut budget, &mut HashSet::new());
+    assert!(t.capped, "{t:?}");
+    assert_eq!(biggest(&[a], dev + 1, 5), [], "another device's dirs are left out");
+}
+
+#[test]
+fn leftovers_are_found_sized_and_told_apart_from_one_in_use() {
+    let d = TmpDir::new("leftovers");
+    let tmp = d.0.join("tmp");
+    let stage = staging_dir(&tmp, "leh3rc2hdcf31i");
+    assert_eq!(stage, tmp.join("arena-replace-leh3rc2hdcf31i"));
+    std::fs::create_dir_all(stage.join("ARENA_materials")).unwrap();
+    std::fs::write(stage.join("ARENA_materials/notes.py"), vec![b'x'; 100_000]).unwrap();
+    std::fs::create_dir_all(tmp.join("arena-replace-")).unwrap(); // no pod id: not ours
+    std::fs::create_dir_all(tmp.join("unrelated")).unwrap();
+    std::fs::write(tmp.join("arena-replace-file"), "a file, not a staging dir").unwrap();
+    let root = d.0.join("backup");
+    let partial = root.join("baseline/w1/.fleet.partial-99999999999");
+    std::fs::create_dir_all(root.join("baseline/w1/fleet")).unwrap(); // a finished baseline: not a leftover
+    // pid 99999999999 is no u32 pid: ignored; this one parses (and no such process runs).
+    let partial_ok = root.join("baseline/w1/.fleet.partial-3999999");
+    std::fs::create_dir_all(&partial).unwrap();
+    std::fs::create_dir_all(&partial_ok).unwrap();
+    std::fs::create_dir_all(root.join("w1d1/.rsync-tmp")).unwrap();
+    std::fs::write(root.join("w1d1/.rsync-tmp/.notes.py.Ab12Cd"), "half").unwrap();
+    std::fs::create_dir_all(root.join("big/.rsync-tmp")).unwrap(); // empty: nothing left
+    let now = crate::snapshot::unix_now();
+
+    let found = find_leftovers(&tmp, &[root.clone(), root.clone()], now);
+    let kinds: Vec<(&Path, &LeftoverKind)> = found.iter().map(|l| (l.path.as_path(), &l.kind)).collect();
+    // Fresh rsync temp files may be a running pull's: not listed yet.
+    assert_eq!(
+        kinds,
+        [(partial_ok.as_path(), &LeftoverKind::Baseline { pid: 3_999_999 }), (stage.as_path(), &LeftoverKind::Staging { source: "leh3rc2hdcf31i".into() })]
+    );
+    let staged = found.iter().find(|l| l.path == stage).unwrap();
+    assert!(staged.bytes >= 100_000 && !staged.capped && !staged.in_use, "{staged:?}");
+    assert!(staged.changed.is_some_and(|c| now.saturating_sub(c) < 600), "{staged:?}");
+
+    // A day later they are.
+    let later = find_leftovers(&tmp, std::slice::from_ref(&root), now + RSYNC_TEMP_STALE_SECS + 60);
+    assert!(later.iter().any(|l| l.kind == LeftoverKind::RsyncTemp && l.path == root.join("w1d1/.rsync-tmp")), "{later:?}");
+
+    // A run holding the staging dir's lock: in use, and said so — nothing to remove.
+    let held = lock_dir(&stage).unwrap();
+    assert!(in_use(&stage));
+    let e = lock_dir(&stage).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+    let busy = find_leftovers(&tmp, &[], now);
+    let l = busy.iter().find(|l| l.path == stage).unwrap();
+    assert!(l.in_use);
+    let lines = l.lines(now);
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].starts_with(&format!("◷ {} — ", stage.display())) && lines[0].ends_with("in use now by a running arena"), "{lines:?}");
+    drop(held);
+    assert!(!in_use(&stage));
+    // Nothing found was touched.
+    assert!(stage.join("ARENA_materials/notes.py").exists() && partial_ok.exists() && root.join("w1d1/.rsync-tmp/.notes.py.Ab12Cd").exists());
+    assert_eq!(find_leftovers(&d.0.join("nowhere"), &[d.0.join("nowhere")], now), []);
+}
+
+#[test]
+fn a_leftover_says_what_it_is_how_to_look_and_how_to_remove_it() {
+    let now = 1_793_318_400; // 2026-10-30
+    let staging = Leftover {
+        path: PathBuf::from("/tmp/arena-replace-leh3rc2hdcf31i"),
+        kind: LeftoverKind::Staging { source: "leh3rc2hdcf31i".into() },
+        bytes: 3_500_000_000,
+        capped: false,
+        changed: Some(now - 16 * 86_400),
+        in_use: false,
+    };
+    let lines = staging.lines(now);
+    assert_eq!(
+        lines[0],
+        "⚠ /tmp/arena-replace-leh3rc2hdcf31i — 3.5 GB, last written 16 days ago: pod leh3rc2hdcf31i's home, staged by \
+         `pods replace`/`migrate` and kept after a copy that failed or was stopped (or by a build from before \
+         2026-10-09, which never removed it)"
+    );
+    assert!(lines[1].contains("it may be the only copy of that pod's work") && lines[1].contains("`arena pods list --no-probe | grep leh3rc2hdcf31i`"), "{lines:?}");
+    assert_eq!(lines[2], "  └ look: du -sh /tmp/arena-replace-leh3rc2hdcf31i; ls -la /tmp/arena-replace-leh3rc2hdcf31i");
+    assert_eq!(lines[3], "  └ remove: rm -rf /tmp/arena-replace-leh3rc2hdcf31i");
+    // An odd path is quoted for the shell; a capped size is a lower bound; no caution off staging.
+    let odd = Leftover {
+        path: PathBuf::from("/srv/back up/w1d1/.rsync-tmp"),
+        kind: LeftoverKind::RsyncTemp,
+        bytes: 2 * G,
+        capped: true,
+        changed: None,
+        in_use: false,
+    };
+    assert_eq!(odd.commands().1, "rm -rf '/srv/back up/w1d1/.rsync-tmp'");
+    assert_eq!(odd.facts(now), "over 2 GB");
+    assert_eq!(odd.caution(), None);
+    assert_eq!(odd.lines(now).len(), 3);
+}
+
+#[test]
+fn skips_are_counted_per_pod_and_kind_and_forgotten() {
+    let t0 = 1_793_318_400; // 2026-10-30 00:00 UTC
+    let mut s = Skips::default();
+    let skip = |pod: &str, what: &str| (pod.to_string(), what.to_string(), "only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB)".to_string());
+    s.add(&[skip("alpha", "copy")], t0 + 9 * 3600);
+    s.add(&[skip("alpha", "copy"), skip("bravo", "staging")], t0 + 10 * 3600 + 15 * 60);
+    assert_eq!(s.entries.len(), 2);
+    let a = &s.entries[0];
+    assert_eq!((a.pod.as_str(), a.count, a.first, a.last), ("alpha", 2, t0 + 9 * 3600, t0 + 10 * 3600 + 900));
+    let now = t0 + 11 * 3600;
+    assert_eq!(
+        a.line(now),
+        "✗ alpha: copy skipped 2× (since 09:00 UTC, last 10:15 UTC) — only 3.1 GB free on / (floor 5 GB, CONTROL_MIN_FREE_GB)"
+    );
+    assert!(s.entries[1].line(now).starts_with("✗ bravo: staging skipped at 10:15 UTC — "));
+    assert_eq!(s.recent(now).len(), 2);
+    // A day without one: not recent; the next one starts a new count.
+    let next_day = t0 + 10 * 3600 + 900 + SKIP_WINDOW_SECS;
+    assert_eq!(s.recent(next_day).len(), 0);
+    s.add(&[skip("alpha", "copy")], next_day);
+    let a = s.entries.iter().find(|e| e.pod == "alpha").unwrap();
+    assert_eq!((a.count, a.first), (1, next_day));
+    assert!(a.line(next_day + 60).contains("skipped at 10:15 UTC"), "{}", a.line(next_day + 60));
+    assert!(a.line(next_day + 86_400).contains("skipped at 2026-10-31 10:15 UTC"), "{}", a.line(next_day + 86_400));
+    // A week later every record that didn't recur is dropped at the next write.
+    s.add(&[], next_day + FORGET_SKIPS_AFTER_SECS);
+    assert_eq!(s.entries, []);
+}
+
+#[test]
+fn the_skip_record_is_saved_privately_and_read_back_tolerantly() {
+    let d = TmpDir::new("skips");
+    let path = d.0.join("state/devtest").join(SKIPS_FILE);
+    let new = [("alpha".to_string(), "copy".to_string(), "only 1 GB free".to_string())];
+    assert_eq!(record_skips(&path, &new, 100, RECORD_LOCK_WAIT).unwrap(), None);
+    assert_eq!(record_skips(&path, &new, 200, RECORD_LOCK_WAIT).unwrap(), None);
+    let (s, warning) = Skips::load(&path);
+    assert_eq!((warning, s.entries.len(), s.entries[0].count), (None, 1, 2));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    std::fs::write(&path, "not json").unwrap();
+    let (s, warning) = Skips::load(&path);
+    assert!(s.entries.is_empty() && warning.is_some_and(|w| w.starts_with("warning: ignoring")));
+    // A corrupt record is replaced by the next write, which then holds only the new skip.
+    assert!(record_skips(&path, &new, 300, RECORD_LOCK_WAIT).unwrap().is_some());
+    assert_eq!(Skips::load(&path).0.entries[0].count, 1);
+    assert_eq!(Skips::load(&d.0.join("missing.json")), (Skips::default(), None));
+}
