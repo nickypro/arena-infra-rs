@@ -1036,3 +1036,8 @@ pub(crate) mod remote_tests;
 /// API, temp dirs for the keys CSV and the (write-only) proxy file.
 #[cfg(test)]
 pub(crate) mod lifecycle_tests;
+
+/// Moving a Hetzner VM (`replace`/`migrate` with `--server-type`, `--onto`, `--onto-spare`, the
+/// "anyone on it?" checks, a VM's own identity) over a fake Hetzner backend and `FakeRemote`.
+#[cfg(test)]
+mod move_tests;
