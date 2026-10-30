@@ -632,6 +632,9 @@ mod tests {
         Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(alpha bravo cloud delta)\nARENA_STATE_DIR={}\n", state.display()))
     }
 
+    /// A change to the key with this hash.
+    type Meanwhile = (&'static str, fn(&mut KeyInfo));
+
     /// Keys on a fake OpenRouter: listed, changed in place as asked (each call recorded); a key
     /// named in `broken` fails its update, one in `ignored` "takes" it without changing; `meanwhile`
     /// (a hash and a cap) is another operator's change, made once the first listing is read.
@@ -643,7 +646,7 @@ mod tests {
         ignored: Vec<&'static str>,
         meanwhile: Mutex<Option<(&'static str, f64)>>,
         /// Another operator's (or the participant's) change to a later key, made at the first update.
-        meanwhile_on_update: Mutex<Option<(&'static str, fn(&mut KeyInfo))>>,
+        meanwhile_on_update: Mutex<Option<Meanwhile>>,
     }
 
     impl Keys {
