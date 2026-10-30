@@ -596,24 +596,37 @@ pub fn is_hostname(name: &str) -> bool {
 }
 
 /// The command that makes `name` a VM's hostname, for VMs named by it
-/// ([`hostname_is_machine_name`]): `hostnamectl set-hostname` when it differs (the static
-/// hostname — /etc/hostname, what the VM boots with), and the `127.0.1.1` line cloud-init wrote
-/// into /etc/hosts at create. Idempotent. A reboot keeps both, with nothing more (live,
-/// Hetzner ubuntu-24.04, cloud-init 26.1, 2026-10-30): Hetzner's metadata and vendor-data keep
-/// the name the server was created with after a rename, but `update_hostname` leaves a hostname
-/// changed since cloud-init set it alone ("assuming user maintained hostname"), and
-/// `update_etc_hosts` (vendor-data's `manage_etc_hosts: true`) runs once per instance. No
-/// cloud-init setting is written: vendor-data outranks /etc/cloud/cloud.cfg.d anyway, and one
-/// naming the machine would name a server made from a snapshot of this one wrongly. Exits
-/// non-zero unless the hostname is `name` after it. `None`: `name` isn't a plain hostname
-/// ([`is_hostname`]). Pure.
+/// ([`hostname_is_machine_name`]). Converges on a state, whatever a run before it got to:
+/// - the running and the static hostname (/etc/hostname, what the VM boots with) are `name` —
+///   `hostnamectl set-hostname` unless both already are (else `hostname` + /etc/hostname);
+/// - on the `127.0.1.1` lines of /etc/hosts (cloud-init's `127.0.1.1 <fqdn> <hostname>`), the
+///   names the VM had (running and static) become `name`, every other alias and comment kept;
+///   and if no such line names it then (a run before changed the hostname but not the file),
+///   `name` goes first on the first one. No `127.0.1.1` line: the file is left alone. Written
+///   in place (same file) and only when it changes.
+///
+/// Exits non-zero unless both hostnames are `name` after it. A reboot keeps all of it with
+/// nothing more (live, Hetzner ubuntu-24.04, cloud-init 26.1, 2026-10-30): Hetzner's metadata
+/// and vendor-data keep the name the server was created with after a rename, but
+/// `update_hostname` leaves a hostname changed since cloud-init set it alone ("assuming user
+/// maintained hostname"), and `update_etc_hosts` (vendor-data's `manage_etc_hosts: true`) runs
+/// once per instance. No cloud-init setting is written: vendor-data outranks
+/// /etc/cloud/cloud.cfg.d anyway, and one naming the machine would misname a server made from a
+/// snapshot of this one. `None`: `name` isn't a plain hostname ([`is_hostname`]). Pure.
 pub fn hostname_command(name: &str) -> Option<String> {
     is_hostname(name).then(|| {
         format!(
-            "n={n}; [ \"$(hostname)\" = \"$n\" ] || hostnamectl set-hostname \"$n\" || {{ hostname \"$n\" && echo \"$n\" > /etc/hostname; }} || exit 1; \
-             if grep -q '^127\\.0\\.1\\.1[[:space:]]' /etc/hosts 2>/dev/null; then \
-             sed -i \"s/^127\\.0\\.1\\.1[[:space:]].*/127.0.1.1 $n $n/\" /etc/hosts || exit 1; fi; \
-             [ \"$(hostname)\" = \"$n\" ]",
+            concat!(
+                r#"n={n}; h=$(hostname); f=$(cat /etc/hostname 2>/dev/null); "#,
+                r#"if [ "$h" != "$n" ] || [ "$f" != "$n" ]; then "#,
+                r#"hostnamectl set-hostname "$n" || {{ hostname "$n" && echo "$n" > /etc/hostname; }} || exit 1; fi; "#,
+                r#"if grep -q '^127\.0\.1\.1[[:space:]]' /etc/hosts 2>/dev/null; then t=$(mktemp) || exit 1; "#,
+                r#"awk -v n="$n" -v h="$h" -v f="$f" '{{ l[NR] = $0 }} $1 == "127.0.1.1" {{ if (!first) first = NR; "#,
+                r#"for (i = 2; i <= NF && $i !~ /^#/; i++) {{ if ($i == h || $i == f) $i = n; if ($i == n) has = 1 }} l[NR] = $0 }} "#,
+                r#"END {{ if (first && !has) sub(/^127\.0\.1\.1[ \t]+/, "127.0.1.1 " n " ", l[first]); for (i = 1; i <= NR; i++) print l[i] }}' "#,
+                r#"/etc/hosts > "$t" && {{ cmp -s "$t" /etc/hosts || cat "$t" > /etc/hosts; }}; r=$?; rm -f "$t"; [ "$r" = 0 ] || exit 1; fi; "#,
+                r#"[ "$(hostname)" = "$n" ] && [ "$(cat /etc/hostname 2>/dev/null)" = "$n" ]"#,
+            ),
             n = shell_quote(name)
         )
     })
@@ -1593,13 +1606,16 @@ mod tests {
         }
     }
 
-    /// The hostname a renamed Hetzner VM is given (`pods rename`, and setup's best-effort step):
-    /// set only when it differs, the `127.0.1.1` line cloud-init wrote follows, success only when
-    /// it's the name after — run here against a stand-in `hostname`/`hostnamectl` and hosts file,
-    /// under sh, dash and bash; and nothing for a name that isn't a plain hostname (it goes into
-    /// /etc). Which providers are named by their hostname, and which carry MACHINE_NAME in env.
+    /// The hostname a renamed Hetzner VM is given (`pods rename`, and setup's best-effort step),
+    /// run against stand-in `hostname`/`hostnamectl` and files, under sh, dash and bash: both
+    /// hostnames become the name, only the old names' tokens on `127.0.1.1` lines change (aliases,
+    /// comments and other lines kept), a second run changes nothing, and it converges from a run
+    /// that stopped half-way (review r1: a retry after a failed /etc/hostname write must not pass
+    /// on the running name alone; a hosts line it never got to gets the name). Nothing for a name
+    /// that isn't a plain hostname (it goes into /etc). And which providers are named by their
+    /// hostname, and which carry MACHINE_NAME in env.
     #[test]
-    fn the_hostname_command_sets_it_once_and_the_hosts_line_follows() {
+    fn the_hostname_command_converges_and_keeps_other_aliases() {
         use std::process::Command;
         for bad in ["", "a b", "a;rm -rf /", "-lead", "trail-", "a..b", "x_y", &"a".repeat(64), "'q'"] {
             assert!(hostname_command(bad).is_none(), "{bad:?}");
@@ -1613,57 +1629,90 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("arena-hostname-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
-        // Stand-ins: `hostname` prints (or with an arg sets) $DIR/name; `hostnamectl
-        // set-hostname X` sets it and logs the call; /etc/hosts is $DIR/hosts.
-        let d = dir.display();
-        let stub = |name: &str, body: String| {
+        let d = dir.display().to_string();
+        let file = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
+        let put = |f: &str, text: &str| std::fs::write(dir.join(f), text).unwrap();
+        let stub = |name: &str, body: &str| {
             use std::os::unix::fs::PermissionsExt;
             let p = dir.join("bin").join(name);
-            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::write(&p, format!("#!/bin/sh\n{}\n", body.replace("$D", &d))).unwrap();
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         };
-        stub("hostname", format!("if [ $# -gt 0 ]; then echo \"$1\" > {d}/name; else cat {d}/name; fi"));
-        stub("hostnamectl", format!("echo \"$*\" >> {d}/calls; [ \"$1\" = set-hostname ] && echo \"$2\" > {d}/name"));
-        let cmd = hostname_command("arena9-keepsake").unwrap().replace("/etc/hosts", &format!("{d}/hosts")).replace("/etc/hostname", &format!("{d}/etc-hostname"));
-        let hosts = "# managed by cloud-init\n127.0.1.1 arena9-rainbow arena9-rainbow\n127.0.0.1 localhost\n::1 localhost ip6-localhost\n";
+        // Stand-ins: `hostname` prints (with an argument: sets) the running name, $D/name;
+        // `hostnamectl set-hostname X` sets it and the static one, $D/etc-hostname, and logs.
+        let hostname_ok = r#"if [ $# -gt 0 ]; then echo "$1" > $D/name; else cat $D/name; fi"#;
+        let hostnamectl_ok = r#"echo "$*" >> $D/calls; [ "$1" = set-hostname ] && echo "$2" > $D/name && echo "$2" > $D/etc-hostname"#;
+        let cmd = hostname_command("arena9-keepsake")
+            .unwrap()
+            .replace("/etc/hostname", &format!("{d}/etc-hostname"))
+            .replace("/etc/hosts", &format!("{d}/hosts"));
+        let cloud = "# managed by cloud-init\n127.0.1.1 arena9-rainbow arena9-rainbow\n127.0.0.1 localhost\n::1 localhost ip6-localhost\n\n";
+        let custom = "127.0.1.1\tcache.internal\n127.0.1.1 arena9-rainbow   arena9-rainbow cache2 # was arena9-rainbow\n10.0.0.1 arena9-rainbow\n";
         for shell in ["sh", "dash", "bash"] {
             if Command::new(shell).arg("-c").arg("true").status().is_err() {
                 continue;
             }
             let run = || {
-                Command::new(shell)
-                    .arg("-c")
-                    .arg(&cmd)
-                    .env("PATH", format!("{d}/bin:{}", std::env::var("PATH").unwrap_or_default()))
-                    .output()
-                    .unwrap()
+                let path = format!("{d}/bin:{}", std::env::var("PATH").unwrap_or_default());
+                Command::new(shell).arg("-c").arg(&cmd).env("PATH", path).output().unwrap()
             };
-            std::fs::write(dir.join("name"), "arena9-rainbow\n").unwrap();
-            std::fs::write(dir.join("hosts"), hosts).unwrap();
-            let _ = std::fs::remove_file(dir.join("calls"));
+            let start = |hosts: &str| {
+                stub("hostname", hostname_ok);
+                stub("hostnamectl", hostnamectl_ok);
+                put("name", "arena9-rainbow\n");
+                put("etc-hostname", "arena9-rainbow\n");
+                put("hosts", hosts);
+                let _ = std::fs::remove_file(dir.join("calls"));
+            };
+            // cloud-init's file: its line follows, the rest is byte for byte as it was.
+            start(cloud);
             let out = run();
             assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
-            assert_eq!(std::fs::read_to_string(dir.join("name")).unwrap(), "arena9-keepsake\n", "{shell}");
-            assert_eq!(
-                std::fs::read_to_string(dir.join("hosts")).unwrap(),
-                hosts.replace("127.0.1.1 arena9-rainbow arena9-rainbow", "127.0.1.1 arena9-keepsake arena9-keepsake"),
-                "{shell}: only the 127.0.1.1 line"
-            );
-            assert_eq!(std::fs::read_to_string(dir.join("calls")).unwrap(), "set-hostname arena9-keepsake\n", "{shell}");
-            // Again: already so — nothing set, still a success.
+            assert_eq!((file("name"), file("etc-hostname")), ("arena9-keepsake\n".into(), "arena9-keepsake\n".into()), "{shell}");
+            assert_eq!(file("hosts"), cloud.replace("127.0.1.1 arena9-rainbow arena9-rainbow", "127.0.1.1 arena9-keepsake arena9-keepsake"), "{shell}");
+            assert_eq!(file("calls"), "set-hostname arena9-keepsake\n", "{shell}");
+            // Again: nothing to do, nothing done, still a success.
             std::fs::remove_file(dir.join("calls")).unwrap();
             assert!(run().status.success() && !dir.join("calls").exists(), "{shell}: idempotent");
-            // No 127.0.1.1 line: the hosts file is left as it is.
-            std::fs::write(dir.join("hosts"), "127.0.0.1 localhost\n").unwrap();
-            assert!(run().status.success());
-            assert_eq!(std::fs::read_to_string(dir.join("hosts")).unwrap(), "127.0.0.1 localhost\n", "{shell}");
-            // hostnamectl refused and `hostname` can't set it either: a failure.
-            std::fs::write(dir.join("name"), "arena9-rainbow\n").unwrap();
-            stub("hostnamectl", "exit 1".into());
-            stub("hostname", format!("if [ $# -gt 0 ]; then exit 1; else cat {d}/name; fi"));
+            // Aliases, a comment and other addresses are kept; only the old names change.
+            start(custom);
+            assert!(run().status.success(), "{shell}");
+            assert_eq!(
+                file("hosts"),
+                "127.0.1.1\tcache.internal\n127.0.1.1 arena9-keepsake arena9-keepsake cache2 # was arena9-rainbow\n10.0.0.1 arena9-rainbow\n",
+                "{shell}"
+            );
+            // No 127.0.1.1 line: the file is left alone.
+            start("127.0.0.1 localhost\n");
+            assert!(run().status.success() && file("hosts") == "127.0.0.1 localhost\n", "{shell}");
+            // hostnamectl refused and the static name can't be written: a failure — and the retry
+            // once that's fixed sees the running name already set but not the static one, and
+            // writes it (never a success on the running name alone).
+            start(cloud);
+            stub("hostnamectl", "exit 1");
+            put("etc-hostname", "arena9-rainbow\n");
+            std::fs::create_dir_all(dir.join("ro")).unwrap();
+            let blocked = cmd.replace(&format!("{d}/etc-hostname"), &format!("{d}/ro/x/etc-hostname"));
+            let path = format!("{d}/bin:{}", std::env::var("PATH").unwrap_or_default());
+            let out = Command::new(shell).arg("-c").arg(&blocked).env("PATH", &path).output().unwrap();
+            assert!(!out.status.success(), "{shell}: the static name wasn't written");
+            assert_eq!(file("name"), "arena9-keepsake\n", "{shell}: the running one was");
+            stub("hostnamectl", hostnamectl_ok);
+            assert!(run().status.success(), "{shell}");
+            assert_eq!((file("name"), file("etc-hostname")), ("arena9-keepsake\n".into(), "arena9-keepsake\n".into()), "{shell}");
+            assert_eq!(file("calls"), "set-hostname arena9-keepsake\n", "{shell}: the retry set it");
+            // A run that changed the hostname but never got to the hosts file: the old name is
+            // gone from its view, so the name goes first on the line (it resolves either way).
+            start(cloud);
+            put("name", "arena9-keepsake\n");
+            put("etc-hostname", "arena9-keepsake\n");
+            assert!(run().status.success(), "{shell}");
+            assert!(file("hosts").contains("\n127.0.1.1 arena9-keepsake arena9-rainbow arena9-rainbow\n"), "{shell}: {}", file("hosts"));
+            // Neither way can set it: a failure.
+            start(cloud);
+            stub("hostnamectl", "exit 1");
+            stub("hostname", "if [ $# -gt 0 ]; then exit 1; else cat $D/name; fi");
             assert!(!run().status.success(), "{shell}: not renamed is a failure");
-            stub("hostname", format!("if [ $# -gt 0 ]; then echo \"$1\" > {d}/name; else cat {d}/name; fi"));
-            stub("hostnamectl", format!("echo \"$*\" >> {d}/calls; [ \"$1\" = set-hostname ] && echo \"$2\" > {d}/name"));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
