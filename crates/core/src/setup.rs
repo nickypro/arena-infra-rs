@@ -12,7 +12,9 @@
 //!      fast-forward a clean main — one with its own changes or commits is left as it is,
 //!      with a warning; `--force`: check out the default branch and `reset --hard`),
 //!      then update submodules,
-//!   5. write `~/.name` as `export MACHINE_NAME='<short>'`.
+//!   5. give the checkout the backup's git identity where none is configured
+//!      ([`GIT_IDENTITY_SH`]; the bare-VM script does the same),
+//!   6. write `~/.name` as `export MACHINE_NAME='<short>'`.
 //!
 //! Before that script, on image-based pods, a best-effort step of its own (its own budget —
 //! a first move copies the whole repo — and never a failed setup): when `/workspace` is a real
@@ -162,6 +164,7 @@ impl SetupConfig {
         // timed out can still be copying on the pod — wait for it (bounded) before the update.
         steps.push(crate::volume::relocation_wait_command());
         steps.push(self.repo_update_command(force));
+        steps.push(git_identity_command(&self.repo_path));
         steps.push(name_file_command(self.short_name(machine_name)));
         // Coding agents (claude code + codex) + tmux. All idempotent; the whole block runs in
         // a `set +e` subshell ending in `|| true`, so a flaky installer never aborts setup.
@@ -352,6 +355,44 @@ ZSH_BIN=$(command -v zsh); [ -n "$ZSH_BIN" ] && chsh -s "$ZSH_BIN" "$(id -un)" >
             )),
         )
     }
+}
+
+/// The git identity setup gives a checkout that has none: the backup's own — `backup.sh` sets the
+/// same, the same way, before its first commit on a day branch.
+pub const GIT_IDENTITY_NAME: &str = "Arena Autocommit";
+/// See [`GIT_IDENTITY_NAME`].
+pub const GIT_IDENTITY_EMAIL: &str = "autocommit@arena.education";
+
+/// `arena_git_identity <repo>`, a shell function (sh, bash and zsh alike) — every provider's setup
+/// runs it on the checkout: the image-based pods' config step ([`git_identity_command`]) and the
+/// bare-VM script (`hetzner_setup.sh` carries this same text; a test holds them together). A fresh
+/// machine had no identity until the first backup on a day branch set one, so a participant's
+/// first `git commit` or `git merge` stopped at "Please tell me who you are" (live 7/9).
+///
+/// For each of `user.name` / `user.email`: set repo-local to [`GIT_IDENTITY_NAME`] /
+/// [`GIT_IDENTITY_EMAIL`] only when no value is configured anywhere git looks (repo, global,
+/// system — as the backup checks), so a participant's own is never overridden. A repo-local value
+/// beats a global one, so one of ours (exactly our value) is unset again once a global or system
+/// one exists — the participant set theirs since — and theirs takes over. No flip-flop with the
+/// backup: it sets ours only when git finds no value at all, and that one is then there. A
+/// failure is a warning (`arena-warning:`), never a failed setup.
+pub const GIT_IDENTITY_SH: &str = r#"arena_git_identity() {
+    [ -e "$1/.git" ] || return 0
+    for arena_k in user.name user.email; do
+        if [ "$arena_k" = user.name ]; then arena_v='Arena Autocommit'; else arena_v='autocommit@arena.education'; fi
+        if ! git -C "$1" config "$arena_k" >/dev/null 2>&1; then
+            git -C "$1" config "$arena_k" "$arena_v" || echo "arena-warning: couldn't give $1 a git $arena_k"
+        elif [ "$(git -C "$1" config --local "$arena_k" 2>/dev/null)" = "$arena_v" ] &&
+            [ -n "$(git -C "$1" config --global --includes "$arena_k" 2>/dev/null || git -C "$1" config --system --includes "$arena_k" 2>/dev/null)" ]; then
+            git -C "$1" config --local --unset "$arena_k" || echo "arena-warning: couldn't hand $1's git $arena_k back to the participant's own"
+        fi
+    done
+}"#;
+
+/// The image-based config step's part that runs [`GIT_IDENTITY_SH`] on the checkout at `repo`
+/// (none there — a non-arena image — and it does nothing).
+pub fn git_identity_command(repo: &str) -> String {
+    format!("{GIT_IDENTITY_SH}\narena_git_identity {}", shell_quote(repo))
 }
 
 /// The public course repo the pods' checkout gets as its `upstream` remote, unless
@@ -566,13 +607,81 @@ pub fn is_bare_vm(provider: &str) -> bool {
     bare_vm(provider).is_some()
 }
 
+/// Whether `provider`'s pods are named by their hostname: a Hetzner VM's is its server name,
+/// set by cloud-init at create, and its setup's login banner and `~/.name` fall back to it — so
+/// a rename sets it too ([`hostname_command`]). Not a Shadeform VM's (the cloud it lands on
+/// names it; setup is given the machine name instead), nor a RunPod or Vast container's (its
+/// id). Pure.
+pub fn hostname_is_machine_name(provider: &str) -> bool {
+    provider == "hetzner"
+}
+
+/// Whether `provider`'s pods carry the machine name in their environment: a RunPod or Vast
+/// container's `MACHINE_NAME` env var, set at create, which a rename can't change (only a
+/// reimage, which wipes the disk, does). Bare VMs have none: their create sends no env. Pure.
+pub fn machine_name_in_env(provider: &str) -> bool {
+    !is_bare_vm(provider)
+}
+
+/// Whether `name` is a plain hostname (RFC 1123: letters, digits and hyphens, in dot-separated
+/// parts of 1–63 that don't start or end with a hyphen; 253 at most) — what Hetzner takes as a
+/// server name, and all [`hostname_command`] will write. Pure.
+pub fn is_hostname(name: &str) -> bool {
+    name.len() <= 253
+        && name.split('.').all(|part| {
+            (1..=63).contains(&part.len())
+                && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !part.starts_with('-')
+                && !part.ends_with('-')
+        })
+}
+
+/// The command that makes `name` a VM's hostname, for VMs named by it
+/// ([`hostname_is_machine_name`]). Converges on a state, whatever a run before it got to:
+/// - the running and the static hostname (/etc/hostname, what the VM boots with) are `name` —
+///   `hostnamectl set-hostname` unless both already are (else `hostname` + /etc/hostname);
+/// - on the `127.0.1.1` lines of /etc/hosts (cloud-init's `127.0.1.1 <fqdn> <hostname>`), the
+///   names the VM had (running and static) become `name`, every other alias and comment kept;
+///   and if no such line names it then (a run before changed the hostname but not the file),
+///   `name` goes first on the first one. Lines are found by their first field, so an indented
+///   one counts (review r2). No `127.0.1.1` line, or no /etc/hosts: nothing written. Written in
+///   place (same file) and only when it changes.
+///
+/// Exits non-zero unless both hostnames are `name` after it. A reboot keeps all of it with
+/// nothing more (live, Hetzner ubuntu-24.04, cloud-init 26.1, 2026-10-30): Hetzner's metadata
+/// and vendor-data keep the name the server was created with after a rename, but
+/// `update_hostname` leaves a hostname changed since cloud-init set it alone ("assuming user
+/// maintained hostname"), and `update_etc_hosts` (vendor-data's `manage_etc_hosts: true`) runs
+/// once per instance. No cloud-init setting is written: vendor-data outranks
+/// /etc/cloud/cloud.cfg.d anyway, and one naming the machine would misname a server made from a
+/// snapshot of this one. `None`: `name` isn't a plain hostname ([`is_hostname`]). Pure.
+pub fn hostname_command(name: &str) -> Option<String> {
+    is_hostname(name).then(|| {
+        format!(
+            concat!(
+                r#"n={n}; h=$(hostname); f=$(cat /etc/hostname 2>/dev/null); "#,
+                r#"if [ "$h" != "$n" ] || [ "$f" != "$n" ]; then "#,
+                r#"hostnamectl set-hostname "$n" || {{ hostname "$n" && echo "$n" > /etc/hostname; }} || exit 1; fi; "#,
+                r#"if [ -f /etc/hosts ]; then t=$(mktemp) || exit 1; "#,
+                r#"awk -v n="$n" -v h="$h" -v f="$f" '{{ l[NR] = $0 }} $1 == "127.0.1.1" {{ if (!first) first = NR; "#,
+                r#"for (i = 2; i <= NF && $i !~ /^#/; i++) {{ if ($i == h || $i == f) $i = n; if ($i == n) has = 1 }} l[NR] = $0 }} "#,
+                r#"END {{ if (first && !has) sub(/127\.0\.1\.1[ \t]+/, "127.0.1.1 " n " ", l[first]); for (i = 1; i <= NR; i++) print l[i] }}' "#,
+                r#"/etc/hosts > "$t" && {{ cmp -s "$t" /etc/hosts || cat "$t" > /etc/hosts; }}; r=$?; rm -f "$t"; [ "$r" = 0 ] || exit 1; fi; "#,
+                r#"[ "$(hostname)" = "$n" ] && [ "$(cat /etc/hostname 2>/dev/null)" = "$n" ]"#,
+            ),
+            n = shell_quote(name)
+        )
+    })
+}
+
 /// The ordered provisioning steps for a pod, chosen by provider — pure and unit-tested,
 /// so the runner never has to know what a provider *is*. Adding a backend = add its
 /// steps here; the runner and the dry-run preview stay generic.
 ///   - bare-VM ([`bare_vm`]): push the deploy key, authorize every machine's keys
 ///     ([`AUTHORIZE_LABEL`]), push the full setup script, then run it — on a CPU VM (hetzner) as
-///     it always was; on a GPU VM (shadeform) in its GPU mode, with the machine name for
-///     `~/.name` (a Shadeform VM's hostname isn't the machine name).
+///     it always was, its hostname made the machine name first (best-effort, [`HOSTNAME_LABEL`]);
+///     on a GPU VM (shadeform) in its GPU mode, with the machine name for `~/.name` (a Shadeform
+///     VM's hostname isn't the machine name).
 ///   - image-based (runpod/vast): push the git deploy key, then the post-image config.
 ///
 /// Image-based pods move the repo onto their volume first (unless `REPO_ON_VOLUME=0`, and when
@@ -674,15 +783,42 @@ pub fn provisioning_steps(
             ProvisionStep::Run { label: AUTHORIZE_LABEL, cmd: scfg.authorized_keys_command(), timeout: timeouts.config },
         );
     }
+    // A VM named by its hostname gets it re-asserted, best-effort, before the script reads it
+    // for the login banner and `~/.name`: a no-op on a fresh VM (cloud-init named it), the
+    // fix for one renamed while it couldn't be reached — what `pods rename` tells the operator
+    // to run then.
+    if let Some(cmd) = hostname_is_machine_name(provider).then(|| hostname_command(name)).flatten() {
+        steps.insert(
+            2,
+            ProvisionStep::Optional {
+                label: HOSTNAME_LABEL,
+                cmd,
+                summary: format!("set the hostname to {name} if it isn't (a Hetzner VM is named by it)"),
+                timeout: timeouts.config,
+            },
+        );
+    }
     if let Some(vscode) = &scfg.vscode {
+        let low = low_memory(provider);
         steps.push(ProvisionStep::Optional {
             label: "vscode warm-up",
-            cmd: vscode.remote_command(timeouts.vscode),
-            summary: vscode.summary(),
+            cmd: vscode.remote_command(timeouts.vscode, low),
+            summary: vscode.summary(low),
             timeout: timeouts.vscode,
         });
     }
     steps
+}
+
+/// Which of `provider`'s machines get VS Code's memory-saving settings
+/// ([`crate::vscode::LowMemory`]): every CPU VM (Hetzner) — the course's kernels keep their models
+/// in the RAM VS Code uses, and a cx33's 8 GB ran out — and any other machine only when it has
+/// little RAM: a big GPU pod keeps Pylance's indexing. Pure.
+pub fn low_memory(provider: &str) -> crate::vscode::LowMemory {
+    match bare_vm(provider) {
+        Some(BareVm::Cpu) => crate::vscode::LowMemory::Always,
+        Some(BareVm::Gpu) | None => crate::vscode::LowMemory::BelowGib(crate::vscode::LOW_MEMORY_BELOW_GIB),
+    }
 }
 
 /// The relocation step's label (what its warnings are prefixed with).
@@ -690,6 +826,9 @@ pub const RELOCATE_LABEL: &str = "repo onto volume";
 
 /// A bare VM's step that authorizes every machine's keys ([`SetupConfig::authorized_keys_command`]).
 pub const AUTHORIZE_LABEL: &str = "authorize keys";
+
+/// The best-effort step that makes the machine name a Hetzner VM's hostname ([`hostname_command`]).
+pub const HOSTNAME_LABEL: &str = "hostname";
 
 /// How [`provision`] rides out the create-vs-sshd-up boot race: a just-created VM can
 /// report an SSH endpoint before sshd answers (hetzner assigns the IP at create), so a
@@ -1175,6 +1314,17 @@ mod tests {
         // non-force stays on current branch
         assert!(c.contains("git rev-parse --abbrev-ref HEAD"));
         assert!(!c.contains("git checkout 'main'"));
+        // The checkout's git identity where it has none: after the update, before the name.
+        let (update, identity, name) = (
+            c.find("git submodule update").unwrap(),
+            c.find(&git_identity_command("/root/ARENA_3.0")).unwrap(),
+            c.find("> \"$HOME/.name\"").unwrap(),
+        );
+        assert!(update < identity && identity < name, "{c}");
+        assert!(c.contains(&format!("{GIT_IDENTITY_SH}\narena_git_identity '/root/ARENA_3.0'; ")));
+        for v in [GIT_IDENTITY_NAME, GIT_IDENTITY_EMAIL] {
+            assert!(GIT_IDENTITY_SH.contains(&format!("'{v}'")), "{v}");
+        }
     }
 
     /// With a volume the repo moves onto it BEFORE the update (so the fetch/reset act on the
@@ -1463,9 +1613,10 @@ mod tests {
     fn provisioning_steps_branch_by_provider() {
         let t = SetupTimeouts::default();
         let scfg = steps_cfg();
-        // bare-VM (hetzner): copy the deploy key, authorize every machine's keys, push the
-        // script, run it with the repo URL/key passed in (so it clones the PRIVATE repo over
-        // SSH) — on the long budget.
+        // bare-VM (hetzner): copy the deploy key, authorize every machine's keys, make the
+        // machine name its hostname (best-effort: a renamed VM's), push the script, run it with
+        // the repo URL/key passed in (so it clones the PRIVATE repo over SSH) — on the long
+        // budget.
         assert_eq!(
             provisioning_steps("hetzner", &scfg, "arena8-flutter", false, "/tmp/h.sh", &t),
             vec![
@@ -1476,6 +1627,12 @@ mod tests {
                     timeout: secs(60),
                 },
                 authorize_step(),
+                ProvisionStep::Optional {
+                    label: HOSTNAME_LABEL,
+                    cmd: hostname_command("arena8-flutter").unwrap(),
+                    summary: "set the hostname to arena8-flutter if it isn't (a Hetzner VM is named by it)".into(),
+                    timeout: secs(300),
+                },
                 ProvisionStep::Scp {
                     label: "copy hetzner setup script",
                     local: "/tmp/h.sh".into(),
@@ -1491,7 +1648,7 @@ mod tests {
                 },
             ]
         );
-        assert!(matches!(&provisioning_steps("hetzner", &scfg, "arena8-flutter", true, "/tmp/h.sh", &t)[3],
+        assert!(matches!(&provisioning_steps("hetzner", &scfg, "arena8-flutter", true, "/tmp/h.sh", &t)[4],
             ProvisionStep::Run { cmd, .. } if *cmd == scfg.bare_vm_repo_update_command(true)), "--force reaches it");
         // image-based (runpod/vast): scp the deploy key, move the repo onto the volume (best-
         // effort), then a config command that re-points origin — i.e. the post-image flow, not
@@ -1506,6 +1663,132 @@ mod tests {
             assert_eq!(r[2].label(), "repo + keys config");
             assert_eq!(r[2].timeout(), secs(300));
         }
+        // Only a Hetzner VM is named by its hostname: no such step elsewhere, nor for a name
+        // that isn't a hostname (never written into /etc).
+        for (provider, name) in [("shadeform", "arena8-flutter"), ("runpod", "arena8-apple"), ("hetzner", "arena8_bad name")] {
+            let steps = provisioning_steps(provider, &scfg, name, false, "/tmp/h.sh", &t);
+            assert!(steps.iter().all(|s| s.label() != HOSTNAME_LABEL), "{provider} {name}");
+        }
+    }
+
+    /// The hostname a renamed Hetzner VM is given (`pods rename`, and setup's best-effort step),
+    /// run against stand-in `hostname`/`hostnamectl` and files, under sh, dash and bash: both
+    /// hostnames become the name, only the old names' tokens on `127.0.1.1` lines change (aliases,
+    /// comments and other lines kept), a second run changes nothing, and it converges from a run
+    /// that stopped half-way (review r1: a retry after a failed /etc/hostname write must not pass
+    /// on the running name alone; a hosts line it never got to gets the name). Nothing for a name
+    /// that isn't a plain hostname (it goes into /etc). And which providers are named by their
+    /// hostname, and which carry MACHINE_NAME in env.
+    #[test]
+    fn the_hostname_command_converges_and_keeps_other_aliases() {
+        use std::process::Command;
+        for bad in ["", "a b", "a;rm -rf /", "-lead", "trail-", "a..b", "x_y", &"a".repeat(64), "'q'"] {
+            assert!(hostname_command(bad).is_none(), "{bad:?}");
+        }
+        assert!(is_hostname("arena9-keepsake") && is_hostname("a.b-c.d9") && is_hostname(&"a".repeat(63)));
+        assert!(hostname_is_machine_name("hetzner"));
+        assert!(["shadeform", "runpod", "vast", ""].iter().all(|p| !hostname_is_machine_name(p)));
+        assert!(machine_name_in_env("runpod") && machine_name_in_env("vast"));
+        assert!(!machine_name_in_env("hetzner") && !machine_name_in_env("shadeform"));
+
+        let dir = std::env::temp_dir().join(format!("arena-hostname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let d = dir.display().to_string();
+        let file = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
+        let put = |f: &str, text: &str| std::fs::write(dir.join(f), text).unwrap();
+        let stub = |name: &str, body: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("bin").join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{}\n", body.replace("$D", &d))).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // Stand-ins: `hostname` prints (with an argument: sets) the running name, $D/name;
+        // `hostnamectl set-hostname X` sets it and the static one, $D/etc-hostname, and logs.
+        let hostname_ok = r#"if [ $# -gt 0 ]; then echo "$1" > $D/name; else cat $D/name; fi"#;
+        let hostnamectl_ok = r#"echo "$*" >> $D/calls; [ "$1" = set-hostname ] && echo "$2" > $D/name && echo "$2" > $D/etc-hostname"#;
+        let cmd = hostname_command("arena9-keepsake")
+            .unwrap()
+            .replace("/etc/hostname", &format!("{d}/etc-hostname"))
+            .replace("/etc/hosts", &format!("{d}/hosts"));
+        let cloud = "# managed by cloud-init\n127.0.1.1 arena9-rainbow arena9-rainbow\n127.0.0.1 localhost\n::1 localhost ip6-localhost\n\n";
+        let custom = "127.0.1.1\tcache.internal\n127.0.1.1 arena9-rainbow   arena9-rainbow cache2 # was arena9-rainbow\n10.0.0.1 arena9-rainbow\n";
+        for shell in ["sh", "dash", "bash"] {
+            if Command::new(shell).arg("-c").arg("true").status().is_err() {
+                continue;
+            }
+            let run = || {
+                let path = format!("{d}/bin:{}", std::env::var("PATH").unwrap_or_default());
+                Command::new(shell).arg("-c").arg(&cmd).env("PATH", path).output().unwrap()
+            };
+            let start = |hosts: &str| {
+                stub("hostname", hostname_ok);
+                stub("hostnamectl", hostnamectl_ok);
+                put("name", "arena9-rainbow\n");
+                put("etc-hostname", "arena9-rainbow\n");
+                put("hosts", hosts);
+                let _ = std::fs::remove_file(dir.join("calls"));
+            };
+            // cloud-init's file: its line follows, the rest is byte for byte as it was.
+            start(cloud);
+            let out = run();
+            assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!((file("name"), file("etc-hostname")), ("arena9-keepsake\n".into(), "arena9-keepsake\n".into()), "{shell}");
+            assert_eq!(file("hosts"), cloud.replace("127.0.1.1 arena9-rainbow arena9-rainbow", "127.0.1.1 arena9-keepsake arena9-keepsake"), "{shell}");
+            assert_eq!(file("calls"), "set-hostname arena9-keepsake\n", "{shell}");
+            // Again: nothing to do, nothing done, still a success.
+            std::fs::remove_file(dir.join("calls")).unwrap();
+            assert!(run().status.success() && !dir.join("calls").exists(), "{shell}: idempotent");
+            // Aliases, a comment and other addresses are kept; only the old names change.
+            start(custom);
+            assert!(run().status.success(), "{shell}");
+            assert_eq!(
+                file("hosts"),
+                "127.0.1.1\tcache.internal\n127.0.1.1 arena9-keepsake arena9-keepsake cache2 # was arena9-rainbow\n10.0.0.1 arena9-rainbow\n",
+                "{shell}"
+            );
+            // An indented entry is an entry (review r2): renamed, and found again on a recovery.
+            start("  127.0.1.1 arena9-rainbow arena9-rainbow\n127.0.0.1 localhost\n");
+            assert!(run().status.success(), "{shell}");
+            assert_eq!(file("hosts"), "127.0.1.1 arena9-keepsake arena9-keepsake\n127.0.0.1 localhost\n", "{shell}");
+            start("127.0.0.1 localhost\n\t127.0.1.1  arena9-rainbow\n");
+            put("name", "arena9-keepsake\n");
+            put("etc-hostname", "arena9-keepsake\n");
+            assert!(run().status.success(), "{shell}");
+            assert_eq!(file("hosts"), "127.0.0.1 localhost\n\t127.0.1.1 arena9-keepsake arena9-rainbow\n", "{shell}");
+            // No 127.0.1.1 line: the file is left alone.
+            start("127.0.0.1 localhost\n");
+            assert!(run().status.success() && file("hosts") == "127.0.0.1 localhost\n", "{shell}");
+            // hostnamectl refused and the static name can't be written: a failure — and the retry
+            // once that's fixed sees the running name already set but not the static one, and
+            // writes it (never a success on the running name alone).
+            start(cloud);
+            stub("hostnamectl", "exit 1");
+            put("etc-hostname", "arena9-rainbow\n");
+            std::fs::create_dir_all(dir.join("ro")).unwrap();
+            let blocked = cmd.replace(&format!("{d}/etc-hostname"), &format!("{d}/ro/x/etc-hostname"));
+            let path = format!("{d}/bin:{}", std::env::var("PATH").unwrap_or_default());
+            let out = Command::new(shell).arg("-c").arg(&blocked).env("PATH", &path).output().unwrap();
+            assert!(!out.status.success(), "{shell}: the static name wasn't written");
+            assert_eq!(file("name"), "arena9-keepsake\n", "{shell}: the running one was");
+            stub("hostnamectl", hostnamectl_ok);
+            assert!(run().status.success(), "{shell}");
+            assert_eq!((file("name"), file("etc-hostname")), ("arena9-keepsake\n".into(), "arena9-keepsake\n".into()), "{shell}");
+            assert_eq!(file("calls"), "set-hostname arena9-keepsake\n", "{shell}: the retry set it");
+            // A run that changed the hostname but never got to the hosts file: the old name is
+            // gone from its view, so the name goes first on the line (it resolves either way).
+            start(cloud);
+            put("name", "arena9-keepsake\n");
+            put("etc-hostname", "arena9-keepsake\n");
+            assert!(run().status.success(), "{shell}");
+            assert!(file("hosts").contains("\n127.0.1.1 arena9-keepsake arena9-rainbow arena9-rainbow\n"), "{shell}: {}", file("hosts"));
+            // Neither way can set it: a failure.
+            start(cloud);
+            stub("hostnamectl", "exit 1");
+            stub("hostname", "if [ $# -gt 0 ]; then exit 1; else cat $D/name; fi");
+            assert!(!run().status.success(), "{shell}: not renamed is a failure");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Item 4 (an evals node, 2026-10-15): a bare VM must get the course repo the image pods
@@ -1749,12 +2032,13 @@ mod tests {
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert_eq!(out, ProvisionOutcome::done());
         let calls = fake.calls();
-        assert_eq!(calls.len(), 5);
+        assert_eq!(calls.len(), 6);
         assert!(matches!(&calls[0], RemoteCall::Copy { local, timeout, .. } if local == "/local/key" && *timeout == Some(secs(60))));
         assert!(matches!(&calls[1], RemoteCall::Exec { cmd, timeout, .. } if cmd.contains("authorized_keys") && *timeout == Some(secs(300))));
-        assert!(matches!(&calls[2], RemoteCall::Copy { remote, .. } if remote == "/root/hetzner_setup.sh"));
-        assert!(matches!(&calls[3], RemoteCall::Exec { cmd, timeout, .. } if cmd.contains("git fetch --no-tags origin") && *timeout == Some(secs(300))));
-        assert!(matches!(&calls[4], RemoteCall::Exec { cmd, timeout, .. } if cmd.ends_with("bash /root/hetzner_setup.sh") && *timeout == Some(secs(1800))));
+        assert!(matches!(&calls[2], RemoteCall::Exec { cmd, timeout, .. } if *cmd == hostname_command("arena8-flutter").unwrap() && *timeout == Some(secs(300))));
+        assert!(matches!(&calls[3], RemoteCall::Copy { remote, .. } if remote == "/root/hetzner_setup.sh"));
+        assert!(matches!(&calls[4], RemoteCall::Exec { cmd, timeout, .. } if cmd.contains("git fetch --no-tags origin") && *timeout == Some(secs(300))));
+        assert!(matches!(&calls[5], RemoteCall::Exec { cmd, timeout, .. } if cmd.ends_with("bash /root/hetzner_setup.sh") && *timeout == Some(secs(1800))));
 
         let fake = FakeRemote::new();
         assert_eq!(provision(&fake, &target(22), &image_steps(), BootRetry::default()).await, ProvisionOutcome::done());
@@ -1873,15 +2157,16 @@ mod tests {
         let script = "### 4/6 ARENA repo + Python env\ninstaller: /root/r/install_uv.sh (the repo's own), torch backend cpu\n\
                       arena-installer: install_uv.sh\r\n### done — Python 3.13.16, torch 2.14.1+cpu, installer: install_uv.sh\n";
         let fake = FakeRemote::new();
-        // Copy the key, authorize the keys, copy the script, the repo update, the script, the warm-up.
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(script), FakeReply::ok()]);
+        // Copy the key, authorize the keys, the hostname, copy the script, the repo update, the
+        // script, the warm-up.
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(script), FakeReply::ok()]);
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert_eq!(out, ProvisionOutcome::Done { warnings: vec![], installer: Some("install_uv.sh".into()), image: None });
         assert_eq!(progress_line(1, 1, "devtest-hz1", &out), "[1/1] ✓ devtest-hz1 (installer: install_uv.sh)");
         // With a warning (the warm-up failed): both.
         let fake = FakeRemote::new();
         let again = "arena-installer: install_uv.sh\narena-installer: none (env already present)\n";
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(again), FakeReply::exit(3, "warm-up incomplete: x")]);
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(again), FakeReply::exit(3, "warm-up incomplete: x")]);
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert_eq!(
             progress_line(2, 2, "devtest-hz1", &out),
@@ -1889,13 +2174,13 @@ mod tests {
         );
         // A script that failed: its line isn't read.
         let fake = FakeRemote::new();
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::exit(1, "FAILED: no torch").with_stdout(script)]);
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::exit(1, "FAILED: no torch").with_stdout(script)]);
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert!(!out.is_done() && out.installer().is_none(), "{out:?}");
         // A VM from an arena image: which image, on the line too (once, from its first setup).
         let fake = FakeRemote::new();
         let from_image = format!("{script}arena-image: devtest-image-261029-1542, built 2026-10-29 (2 h ago), commit 3eed962b9bd8; requirements unchanged, env kept\n");
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(&from_image), FakeReply::ok()]);
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(&from_image), FakeReply::ok()]);
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
         assert_eq!(out.image(), Some("devtest-image-261029-1542, built 2026-10-29 (2 h ago), commit 3eed962b9bd8; requirements unchanged, env kept"));
         assert_eq!(
@@ -2059,7 +2344,13 @@ mod tests {
     fn the_vscode_warm_up_is_the_last_step_everywhere_unless_off() {
         let t = SetupTimeouts::default();
         assert_eq!(t.vscode, secs(300));
-        for (provider, before) in [("runpod", 3), ("vast", 3), ("hetzner", 5)] {
+        // Memory-saving settings: every CPU VM; elsewhere only a machine under 20 GiB of RAM.
+        for (provider, before, low, said) in [
+            ("runpod", 3, "20", "if under 20 GiB of RAM"),
+            ("vast", 3, "20", "if under 20 GiB of RAM"),
+            ("hetzner", 6, "always", "always"),
+            ("shadeform", 4, "20", "if under 20 GiB of RAM"),
+        ] {
             let steps = provisioning_steps(provider, &vscode_cfg(), "arena8-apple", false, "/tmp/h.sh", &t);
             assert_eq!(steps.len(), before + 1, "{provider}");
             let ProvisionStep::Optional { label, cmd, summary, timeout } = steps.last().unwrap() else {
@@ -2067,6 +2358,8 @@ mod tests {
             };
             assert_eq!((*label, *timeout), ("vscode warm-up", secs(300)));
             assert!(cmd.contains("arena-vscode-warmup") && cmd.starts_with("ARENA_VSCODE_BUDGET=270 "), "{cmd}");
+            assert!(cmd.contains(&format!(" ARENA_VSCODE_LOW_MEMORY={low} bash -c ")), "{provider}: {cmd}");
+            assert!(summary.contains(&format!("memory-saving settings (Pylance indexing off, excludes; where unset) {said}")), "{summary}");
             // Hetzner's interpreter is the venv its script builds under the repo.
             assert!(cmd.contains("'/root/ARENA_3.0/.venv/bin/python'"), "{cmd}");
             assert!(summary.contains("ms-python.vscode-pylance"), "{summary}");
@@ -2202,6 +2495,7 @@ mod tests {
     #[cfg(unix)]
     mod real_git {
         use super::steps_cfg;
+        use crate::setup::{git_identity_command, GIT_IDENTITY_EMAIL, GIT_IDENTITY_NAME};
         use std::path::{Path, PathBuf};
         use std::process::{Command, Output};
 
@@ -2402,6 +2696,107 @@ mod tests {
             f.git(&f.pod, &["remote", "remove", "upstream"]);
             f.run_update_with(true, None);
             assert_eq!(f.git(&f.pod, &["remote"]), "origin");
+        }
+
+        /// Live 7/9: a fresh pod had no git identity until its first backup on a day branch, so a
+        /// participant's first commit or merge stopped at "Please tell me who you are". The
+        /// config step's [`git_identity_command`] gives the backup's where git finds none — under
+        /// sh, bash and zsh (pods' login shell), with the step's `set -e` — and the backup's own
+        /// identity lines, run after it, change nothing (no flip-flop); a global one the
+        /// participant sets later takes over at the next setup, and the backup leaves it so.
+        #[test]
+        fn the_checkout_gets_the_backups_identity_only_where_git_finds_none() {
+            let Some(f) = Fixture::new("identity") else { return };
+            f.clone_pod(&[]);
+            let home = f.root.join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let system = f.root.join("gitconfig-system");
+            std::fs::write(&system, "").unwrap();
+            // As on a pod: no identity in the environment, the global config in $HOME.
+            let env = |c: &mut Command| {
+                c.env("HOME", &home)
+                    .env("GIT_CONFIG_SYSTEM", &system)
+                    .env_remove("GIT_CONFIG_GLOBAL")
+                    .env_remove("GIT_CONFIG_NOSYSTEM")
+                    .env_remove("GIT_DIR")
+                    .env_remove("GIT_WORK_TREE");
+                for v in ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"] {
+                    c.env_remove(v);
+                }
+            };
+            let git = |args: &[&str]| -> (bool, String) {
+                let mut c = Command::new("git");
+                c.arg("-C").arg(&f.pod).args(args);
+                env(&mut c);
+                let out = c.output().unwrap();
+                (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout).trim(), String::from_utf8_lossy(&out.stderr).trim()))
+            };
+            let pod = f.pod.to_string_lossy().into_owned();
+            let identity = |shell: &str| {
+                let mut c = Command::new(shell);
+                c.arg("-c").arg(format!("set -e; {}; echo done", git_identity_command(&pod)));
+                env(&mut c);
+                let out = c.output().unwrap();
+                let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+                assert!(out.status.success() && stdout.trim() == "done", "{shell}: {stdout}{}", String::from_utf8_lossy(&out.stderr));
+            };
+            // The backup's identity lines, as backup.sh runs them in the checkout.
+            let backup_lines: String = include_str!("backup.sh").lines().filter(|l| l.starts_with("git config user.")).collect::<Vec<_>>().join("\n");
+            assert_eq!(
+                backup_lines,
+                format!(
+                    "git config user.name >/dev/null 2>&1 || git config user.name '{GIT_IDENTITY_NAME}'\n\
+                     git config user.email >/dev/null 2>&1 || git config user.email '{GIT_IDENTITY_EMAIL}'"
+                ),
+                "the backup's identity is the one setup gives"
+            );
+            let backup = || {
+                let mut c = Command::new("sh");
+                c.arg("-c").arg(format!("set -e; cd '{pod}'; {backup_lines}"));
+                env(&mut c);
+                assert!(c.status().unwrap().success());
+            };
+            let local = |key: &str| git(&["config", "--local", key]).1;
+            let author = || git(&["log", "-1", "--format=%an <%ae>"]).1;
+            let ours = format!("{GIT_IDENTITY_NAME} <{GIT_IDENTITY_EMAIL}>");
+            let shells: Vec<&str> = ["sh", "bash", "zsh"]
+                .into_iter()
+                .filter(|s| Command::new(s).args(["-c", "true"]).status().is_ok_and(|st| st.success()))
+                .collect();
+            for shell in shells {
+                // None anywhere: the commit fails; after setup it's the backup's identity.
+                let _ = std::fs::remove_file(home.join(".gitconfig"));
+                let _ = git(&["config", "--local", "--unset", "user.name"]);
+                let _ = git(&["config", "--local", "--unset", "user.email"]);
+                let (ok, why) = git(&["commit", "-q", "--allow-empty", "-m", "before"]);
+                assert!(!ok && why.contains("Please tell me who you are"), "{shell}: {why}");
+                identity(shell);
+                assert_eq!((local("user.name"), local("user.email")), (GIT_IDENTITY_NAME.into(), GIT_IDENTITY_EMAIL.into()), "{shell}");
+                assert!(git(&["commit", "-q", "--allow-empty", "-m", "first"]).0, "{shell}");
+                assert_eq!(author(), ours, "{shell}");
+                let config = std::fs::read_to_string(f.pod.join(".git/config")).unwrap();
+                backup();
+                identity(shell);
+                assert_eq!(std::fs::read_to_string(f.pod.join(".git/config")).unwrap(), config, "{shell}: no flip-flop");
+                // Their global identity, set since: setup hands over; the backup leaves it so.
+                std::fs::write(home.join(".gitconfig"), "[user]\n\tname = Ada\n\temail = ada@example.com\n").unwrap();
+                identity(shell);
+                backup();
+                identity(shell);
+                assert_eq!((local("user.name"), local("user.email")), (String::new(), String::new()), "{shell}");
+                assert!(git(&["commit", "-q", "--allow-empty", "-m", "theirs"]).0);
+                assert_eq!(author(), "Ada <ada@example.com>", "{shell}");
+                // Their repo-local one, and any other value: never touched.
+                assert!(git(&["config", "--local", "user.name", "Bea"]).0);
+                identity(shell);
+                assert_eq!(local("user.name"), "Bea", "{shell}");
+                let _ = git(&["config", "--local", "--unset", "user.name"]);
+            }
+            // No checkout (a non-arena image): nothing, no failure.
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(format!("set -e; {}; echo done", git_identity_command(&f.root.join("absent").to_string_lossy())));
+            env(&mut c);
+            assert_eq!(String::from_utf8_lossy(&c.output().unwrap().stdout).trim(), "done");
         }
 
         #[test]

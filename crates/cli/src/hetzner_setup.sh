@@ -201,6 +201,25 @@ if [ -n "$UPSTREAM_URL" ] && [ -d "$REPO_DIR/.git" ]; then
     git -C "$REPO_DIR" config --get checkout.defaultRemote >/dev/null 2>&1 \
         || git -C "$REPO_DIR" config checkout.defaultRemote origin || true
 fi
+# A git identity for the checkout when none is configured: the backup's own, which it sets anyway
+# before its first commit on a day branch — until then a participant's first `git commit` or
+# `git merge` stopped at "Please tell me who you are". Repo-local, and only where git finds none
+# (repo, global or system): a participant's own is never overridden, and one they set globally
+# later takes over at the next setup (ours, unchanged, is unset). Never fatal: a warning at most.
+# (The same function as arena_core::setup::GIT_IDENTITY_SH, which says more; a test holds them together.)
+arena_git_identity() {
+    [ -e "$1/.git" ] || return 0
+    for arena_k in user.name user.email; do
+        if [ "$arena_k" = user.name ]; then arena_v='Arena Autocommit'; else arena_v='autocommit@arena.education'; fi
+        if ! git -C "$1" config "$arena_k" >/dev/null 2>&1; then
+            git -C "$1" config "$arena_k" "$arena_v" || echo "arena-warning: couldn't give $1 a git $arena_k"
+        elif [ "$(git -C "$1" config --local "$arena_k" 2>/dev/null)" = "$arena_v" ] &&
+            [ -n "$(git -C "$1" config --global --includes "$arena_k" 2>/dev/null || git -C "$1" config --system --includes "$arena_k" 2>/dev/null)" ]; then
+            git -C "$1" config --local --unset "$arena_k" || echo "arena-warning: couldn't hand $1's git $arena_k back to the participant's own"
+        fi
+    done
+}
+arena_git_identity "$REPO_DIR"
 cd "$REPO_DIR" || die "no repo at $REPO_DIR"
 
 # The gate: the env is usable only if its python imports what the exercises need. It decides
