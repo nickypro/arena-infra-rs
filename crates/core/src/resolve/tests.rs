@@ -577,8 +577,13 @@ struct Repo {
 
 #[cfg(unix)]
 impl Repo {
+    /// A repo of its own: the tag names it, a per-process count keeps it apart. Two tests may pick
+    /// the same tag (`other-side-pick` was in two loops), and a test's `remove_dir_all` of the
+    /// same path then deleted the other's repo mid-run — every time on a 32-thread box.
     fn new(tag: &str) -> Repo {
-        let base = std::env::temp_dir().join(format!("arena-resolve-{tag}-{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("arena-resolve-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         for d in ["home", "bin", "proc", "pts"] {
             std::fs::create_dir_all(base.join(d)).unwrap();
