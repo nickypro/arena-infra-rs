@@ -19,6 +19,7 @@ pub(crate) mod lock;
 pub(crate) mod migrate;
 pub(crate) mod placement;
 pub(crate) mod pull;
+pub(crate) mod rename;
 pub(crate) mod replace;
 pub(crate) mod restore;
 pub(crate) mod run;
