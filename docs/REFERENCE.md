@@ -2639,7 +2639,9 @@ default), GPU util, the GPU count, a fine account's runway, today's AI spend, ke
 warning's details (`key at cap`, the names left to the info panel and the `AI$` column), the burns,
 a fine account's balance and the credit, the providers' pod counts, the fleet's — and never a
 warning or a group's name: at 80 columns the same fleet reads ` 2 unreachable │ RunPod │ ⚠ Vast
-$40.00 ≈40h │ Hetzner │ ⚠ OpenRouter key at cap`. A click on it opens the info panel, which has `pods
+$40.00 ≈40h │ Hetzner │ ⚠ OpenRouter key at cap`. With more warnings than the width holds, the red
+ones go first, then the yellow, then the calm names, and the groups that still don't fit are counted
+at the end (`+2 more`, in the worst colour among them). A click on it opens the info panel, which has `pods
 list`'s footer word for word plus per day, and the prepaid balances (`arena balance`'s views,
 observed in the details round — at most one live read per account per 5 min — and recorded in the
 CLI's state file). API calls per refresh are at

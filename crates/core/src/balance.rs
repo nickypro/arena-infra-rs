@@ -2464,6 +2464,10 @@ pub struct InlineAccount {
     pub runway: Option<String>,
 }
 
+/// A critical account's runway when RunPod says it is under its minimum balance (with money
+/// left): [`inline_account`]'s words for it.
+pub const UNDER_MINIMUM: &str = "under its minimum";
+
 /// [`InlineAccount`] for a prepaid account; `None` for a postpaid one (Hetzner: no balance).
 pub fn inline_account(v: &AccountView) -> Option<InlineAccount> {
     if !v.prepaid() {
@@ -2474,7 +2478,7 @@ pub fn inline_account(v: &AccountView) -> Option<InlineAccount> {
     let runway = match level {
         // Live, `‼ shadeform balance no burn` said neither how much was left nor that it was $0:
         // the amount always, and what is wrong with it.
-        Level::Critical if v.under_balance == Some(true) && v.balance.is_some_and(|b| b > 0.0) => Some("under its minimum".into()),
+        Level::Critical if v.under_balance == Some(true) && v.balance.is_some_and(|b| b > 0.0) => Some(UNDER_MINIMUM.into()),
         Level::Low | Level::Critical => Some(fmt_runway(v)),
         _ if v.source == Source::Unknown => None,
         _ => Some(inline_runway(v)),

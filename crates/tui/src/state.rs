@@ -272,9 +272,10 @@ fn cells(s: &str) -> usize {
 /// Now the least needed words go first, each kind everywhere at once — the `tag` at the right
 /// end, then ([`Cut`]'s order) GPU util, the GPU count, a fine account's runway, today's AI
 /// spend, keys with no cap, a warning's details (`key at cap`, unnamed), the burns, … — and
-/// never a warning or a group's name. Past every cut the groups with a warning move to the
-/// front, so the edge cuts a calm name rather than a warning. Every word left out is the info
-/// panel's ([`summary_text`] there). Pure.
+/// never a warning or a group's name. Past every cut the worst groups go first (red, yellow,
+/// then the calm names) and those that still don't fit are counted at the end (`+2 more`, in
+/// the worst colour among them), so a warning is never cut off at the edge unsaid. Every word
+/// left out is the info panel's ([`summary_text`] there). Pure.
 pub fn top_parts(
     s: &FleetSummary,
     pods: &[Pod],
@@ -309,8 +310,38 @@ pub fn top_parts(
             return TopLine { parts, tag: None };
         }
     }
-    groups.sort_by_key(|g| !g.iter().any(|p| matches!(p.tone, Some(Tone::Warn | Tone::Bad))));
-    TopLine { parts: lay_out(&groups, CUTS.last().copied()), tag: None }
+    // Past every cut: the worst first (red, then yellow, then the calm names), and the groups
+    // that still don't fit counted at the end (`+2 more`, in the worst colour among them: the
+    // info panel has them) — never a warning cut off at the edge unsaid.
+    let last = CUTS.last().copied();
+    groups.retain(|g| g.iter().any(|p| p.cut.is_none()));
+    groups.sort_by_key(|g| severity(g));
+    for keep in (1..=groups.len()).rev() {
+        let mut parts = lay_out(&groups[..keep], last);
+        let hidden = &groups[keep..];
+        if let Some(worst) = hidden.iter().map(|g| severity(g)).min() {
+            let tone = [Tone::Bad, Tone::Warn, Tone::Dim][usize::from(worst)];
+            parts.push(Part::toned(" │ ", Some(Tone::Dim)));
+            parts.push(Part::toned(format!("+{} more", hidden.len()), Some(tone)));
+        }
+        if width_of(&parts) <= width || keep == 1 {
+            return TopLine { parts, tag: None };
+        }
+    }
+    TopLine { parts: lay_out(&groups, last), tag: None }
+}
+
+/// How bad a group is, worst first when sorted: 0 red (a critical account, a failed listing,
+/// credit gone), 1 yellow, 2 nothing wrong.
+fn severity(g: &[Piece]) -> u8 {
+    let has = |t: Tone| g.iter().any(|p| p.tone == Some(t));
+    if has(Tone::Bad) {
+        0
+    } else if has(Tone::Warn) {
+        1
+    } else {
+        2
+    }
 }
 
 /// What the top line gives up when the terminal is narrow, in this order, each kind in every
@@ -328,8 +359,8 @@ enum Cut {
     Today,
     /// How many AI keys have no cap.
     Uncapped,
-    /// A warning's details: it says it in short (`key at cap`; the names are the info panel's,
-    /// and the `AI$` column's red cells).
+    /// A warning's details: it says it in short (`key at cap`, `$9.00 < min`; the names are the
+    /// info panel's, and the `AI$` column's red cells).
     Long,
     /// A provider's burn.
     Burn,
@@ -465,7 +496,10 @@ fn provider_group(provider: &str, share: Option<&ProviderShare>, failed: bool, a
     let unless_low = |c: Cut| (!low).then_some(c);
     if let Some(a) = account {
         g.push(Piece::new(a.amount, Join::Dot, unless_low(Cut::Balance)).toned(warn));
-        g.extend(a.runway.map(|r| Piece::new(r, Join::Space, unless_low(Cut::Runway)).toned(warn)));
+        g.extend(a.runway.map(|r| {
+            let short = (r == balance::UNDER_MINIMUM).then(|| "< min".to_string());
+            Piece { short, ..Piece::new(r, Join::Space, unless_low(Cut::Runway)).toned(warn) }
+        }));
     }
     if let Some(cost) = share.map(|p| &p.cost).filter(|c| c.billing > 0) {
         g.push(Piece::new(provider_burn(provider, cost), Join::Dot, Some(Cut::Burn)));
@@ -1938,8 +1972,8 @@ mod tests {
     /// A cohort's fleet at 160, 120, 100 and 80 columns: the least needed words go first, each
     /// kind in every group at once; the warnings (a low account, a key at its cap) and every
     /// group's name stay; the tag only while everything fits beside it. With a third warning
-    /// (unreachable pods) it still fits 80 columns; at 70, past every cut, the warnings move to
-    /// the front: the terminal's edge cuts a calm name, never a warning.
+    /// (unreachable pods) it still fits 80 columns; narrower, past every cut, the warnings go
+    /// first and the groups that don't fit are counted.
     #[test]
     fn the_top_line_fits_its_width_and_keeps_the_warnings() {
         use balance::Account;
@@ -1967,14 +2001,46 @@ mod tests {
             assert!(cells(&line.text()) <= w && line.tag.is_none(), "{w}");
         }
         s.unreachable = 2;
-        for w in [70, 80, 100, 120, 160] {
+        for w in [80, 100, 120, 160] {
             let text = at(&s, w).text();
             for warning in ["2 unreachable", "⚠ Vast $40.00 ≈40h", "⚠ OpenRouter key at cap"] {
                 assert!(text.chars().take(w).collect::<String>().contains(warning), "{w}: {warning:?} in {text}");
             }
         }
         assert_eq!(at(&s, 80).text(), " 2 unreachable │ RunPod │ ⚠ Vast $40.00 ≈40h │ Hetzner │ ⚠ OpenRouter key at cap");
-        assert_eq!(at(&s, 70).text(), " 2 unreachable │ ⚠ Vast $40.00 ≈40h │ ⚠ OpenRouter key at cap │ RunPod │ Hetzner", "past every cut");
+        // Narrower, past every cut: the warnings first, the rest counted.
+        let line = at(&s, 72);
+        assert_eq!(line.text(), " 2 unreachable │ ⚠ Vast $40.00 ≈40h │ ⚠ OpenRouter key at cap │ +2 more");
+        assert_eq!(tones(&line, "+2 more"), [Some(Tone::Dim)], "only calm names left out");
+        let line = at(&s, 60);
+        assert_eq!(line.text(), " 2 unreachable │ ⚠ Vast $40.00 ≈40h │ +3 more");
+        assert_eq!(tones(&line, "+3 more"), [Some(Tone::Warn)], "a warning among them");
+    }
+
+    /// More warnings than 80 columns hold whole (codex's case): two unreachable pods, RunPod's
+    /// account under its minimum, Vast's critical, Hetzner's listing failed. Past every cut the
+    /// red ones go first, in short (`$9.00 < min`), and what still doesn't fit is counted at the
+    /// end in the worst colour among it — `+1 more` in yellow, `+2 more` in red.
+    #[test]
+    fn many_warnings_go_worst_first_and_the_rest_are_counted() {
+        use balance::Account;
+        let pods = [pod("arena8-a", Some(0.40)), pod("arena8-b", Some(0.40)), pod("arena8-c", Some(0.40))];
+        let s = FleetSummary { unreachable: 2, ..fleet_of(3, 3, Some(37)) };
+        let mut accounts = balances(&[(Account::Runpod, 9.0, 0.01), (Account::Vast, 3.0, 0.5)]);
+        (accounts[0].under_balance, accounts[0].level) = (Some(true), Level::Critical);
+        let partial = ["hetzner".to_string()];
+        let at = |w: usize| top_parts(&s, &pods, &partial, &accounts, None, None, w);
+        assert_eq!(
+            at(400).text(),
+            " 3 pods, 3 GPUs 37% · 2 unreachable │ ⚠ 3 RunPod $9.00 under its minimum · $1.20/h │ ⚠ Vast $3.00 ≈6.0h │ ⚠ Hetzner: list failed"
+        );
+        let line = at(80);
+        assert_eq!(line.text(), " ⚠ RunPod $9.00 < min │ ⚠ Vast $3.00 ≈6.0h │ ⚠ Hetzner: list failed │ +1 more");
+        assert_eq!(tones(&line, "+1 more"), [Some(Tone::Warn)]);
+        let line = at(56);
+        assert_eq!(line.text(), " ⚠ RunPod $9.00 < min │ ⚠ Vast $3.00 ≈6.0h │ +2 more");
+        assert_eq!(tones(&line, "+2 more"), [Some(Tone::Bad)], "a red one among them");
+        assert_eq!(at(40).text(), " ⚠ RunPod $9.00 < min │ +3 more");
     }
 
     /// The footer's short status: the first warning's words (yellow) and how many more; else `ok`

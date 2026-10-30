@@ -29,8 +29,9 @@ earlier).
   (credit under the keys' caps, a key at its cap, credit gone) work the same way. An account with no
   pods and nothing wrong isn't on the line.
 - The line fits your terminal: on a narrow one the least needed words go first (GPU util, then the
-  GPU count, a runway that's fine, …) and a warning never does. A click on it opens the info panel,
-  which still has every detail.
+  GPU count, a runway that's fine, …) and a warning never does. With more warnings than fit, the red
+  ones come first and the rest are counted (`+2 more`). A click on it opens the info panel, which
+  still has every detail.
 - The footer's refresh age has a `↻` in front, cyan while a refresh runs.
 
 ## 2026-10-30 · Raise an AI key's cap, or pause it, from the CLI and the dashboard
