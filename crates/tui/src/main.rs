@@ -3045,12 +3045,13 @@ fn ai_cell(k: Option<&KeyUsage>, stale: bool, read: bool) -> Cell<'static> {
 /// The GPU column: the probe's count and card (`2×RTX A4000`) — the provider's when it wasn't
 /// read (`fleet::gpu_label`) — with each GPU's VRAM (`16G`); `RTX ` dropped when `narrow`. A MIG
 /// slice is named as every surface names it, `1×B300 MIG 34G`: nvidia-smi names only the parent
-/// card under MIG (`B300 SXM6 AC`, its memory unreadable), so the slice's name and memory come
-/// from the provider's type (`fleet::mig_slice`), the count from the probe. Pure.
+/// card under MIG (`B300 SXM6 AC`, its memory unreadable, one row for two slices of it), so the
+/// slice's name, memory and count come from the provider (`fleet::mig_slice`) — the probe's
+/// rows only when the provider gave no count (review ai-review codex r1 #1). Pure.
 fn gpu_text(p: &Pod, m: Option<&PodMetrics>, narrow: bool) -> String {
     let probed = m.map(|m| m.gpus.len()).filter(|&n| n > 0);
     if let Some((model, gb)) = p.gpu_type.as_deref().and_then(fleet::mig_slice) {
-        let n = probed.or(p.gpu_count.filter(|&n| n > 0).map(|n| n as usize)).unwrap_or(1);
+        let n = p.gpu_count.filter(|&n| n > 0).map(|n| n as usize).or(probed).unwrap_or(1);
         return format!("{n}×{model} MIG {gb}G");
     }
     let mut gpu = m.and_then(|m| m.gpu_summary()).unwrap_or_else(|| fleet::gpu_label(p));
@@ -4916,6 +4917,12 @@ deep_check_end=1
         let mut v1 = mig.clone();
         v1.gpu_type = Some("B300 MIG 34GB".into());
         assert_eq!(gpu_text(&v1, Some(&slice), true), "1×B300 MIG 34G", "v1's name for it");
+        // Two slices of one card: nvidia-smi lists the parent once; the provider's count stands.
+        let mut two_slices = mig.clone();
+        two_slices.gpu_count = Some(2);
+        assert_eq!(gpu_text(&two_slices, Some(&slice), false), "2×B300 MIG 34G");
+        two_slices.gpu_count = None;
+        assert_eq!(gpu_text(&two_slices, Some(&slice), false), "1×B300 MIG 34G", "no count from the provider: the probe's");
         assert_eq!(gpu_detail(&mig, Some(&slice)), "1×B300 MIG 34GB (MIG slice of B300 SXM6 AC)");
         assert_eq!(gpu_detail(&mig, None), "1×B300 MIG 34GB");
         assert_eq!(gpu_detail(&a4000, Some(&two)), "2×RTX A4000 16G");

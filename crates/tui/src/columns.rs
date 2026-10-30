@@ -11,7 +11,8 @@
 //!    the full GPU name (16: `RTX ` kept), full NAMEs (16: the persisted short/full choice), the
 //!    host's CPU% and RAM%.
 //! 4. **Graphs** (UTIL%~/MEM%~) take what's left from 20 columns, then PROGRESS (with
-//!    `PROGRESS_CMD`) a fixed 16 from what the graphs leave at their narrowest.
+//!    `PROGRESS_CMD`) a fixed 16 once there's room for both (alone in the detail view's split,
+//!    which has no graphs).
 //!
 //! Always a prefix of each list: widening the terminal only ever adds.
 
@@ -127,7 +128,10 @@ pub(crate) fn columns(w: usize, proxy_w: usize, ai: bool, want_progress: bool, w
     // budget only from what the graphs leave at their narrowest.
     let leftover = w.saturating_sub(used);
     c.spark = with_spark && leftover >= 20; // ~2×9 + spacing
-    c.progress = want_progress && leftover >= PROGRESS_W + 1 + if c.spark { 20 } else { 0 };
+    // Where graphs are wanted, PROGRESS waits until there's room for them too — else widening
+    // the terminal past the graphs' 20 would take PROGRESS away again (review ai-review codex
+    // r1 #2: shown at 157, gone at 160, back at 177).
+    c.progress = want_progress && leftover >= PROGRESS_W + 1 + if with_spark { 20 } else { 0 };
     let spark_room = if c.progress { leftover - PROGRESS_W - 1 } else { leftover };
     c.spark_w = if c.spark { (spark_room.saturating_sub(3) / 2).clamp(9, 30) } else { 0 };
     c
@@ -171,14 +175,17 @@ mod tests {
             ("full NAME", |c| !c.compact_names, 130, 120),
             ("CPU%/RAM%", |c| c.host, 140, 130),
             ("graphs", |c| c.spark, 160, 150),
+            ("PROGRESS", |c| c.progress, 177, 167),
         ];
         for &(name, shown, with_ai, without) in cases {
             for (ai, first) in [(true, with_ai), (false, without)] {
-                let at = (60..=260).find(|&w| shown(&columns(w, 5, ai, false, true)));
+                let at = (60..=260).find(|&w| shown(&columns(w, 5, ai, true, true)));
                 assert_eq!(at.unwrap_or(usize::MAX), first, "{name} ai={ai}");
-                assert!((first.min(261)..=260).all(|w| shown(&columns(w, 5, ai, false, true))), "{name} ai={ai} stays");
+                assert!((first.min(261)..=260).all(|w| shown(&columns(w, 5, ai, true, true))), "{name} ai={ai} stays");
             }
         }
+        // Without graphs (the detail view's split), PROGRESS needs only its own room.
+        assert!(!columns(146, 5, true, true, false).progress && columns(157, 5, true, true, false).progress);
         // Every column the layout picks fits whole: the table is never wider than the terminal.
         for w in 69..=260 {
             for ai in [true, false] {
