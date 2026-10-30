@@ -883,6 +883,10 @@ pub enum Outcome {
     /// its create enum lacks — or v2's 422 "Unknown GPU type"): skipped for the rest of the
     /// run, like `Denied`. Another option may be fine; this one won't become fine by waiting.
     Rejected(String),
+    /// The account is at one of its own limits (Hetzner's `resource_limit_exceeded`: servers,
+    /// cores): skipped for the rest of the run, like `Rejected` — a smaller option may still fit,
+    /// and waiting won't free the limit.
+    Quota(String),
     /// Credentials rejected: the run aborts.
     Auth(String),
     /// Anything else: the run stops, as a single-option create does.
@@ -1072,6 +1076,10 @@ impl Progress<'_> {
                         "[rejected] {name} on {on}: {e}{}",
                         if *next { " — skipping this option, trying the next" } else { " — skipping this option" }
                     ),
+                    Outcome::Quota(e) => format!(
+                        "[over the limit] {name} on {on}: {e}{}",
+                        if *next { " — skipping this option, trying the next" } else { " — skipping this option" }
+                    ),
                     Outcome::Auth(e) => format!("[auth failed] {name} on {on}: {e}"),
                     Outcome::Failed(e) => format!("[failed] {name} on {on}: {e}"),
                 }
@@ -1208,6 +1216,18 @@ where
                         Some(ProviderErrorKind::Auth) => {
                             (Outcome::Auth(e.to_string()), Some(End::Aborted { name: name.clone(), error: e }))
                         }
+                        // The account's own limit: this option (its size) won't fit for the rest
+                        // of the run, a smaller one may — never an abort (the key works) and
+                        // never waited out (no round frees it).
+                        Some(ProviderErrorKind::Quota) => {
+                            rejected[k] = true;
+                            let outcome = Outcome::Quota(e.to_string());
+                            if refused_all(&denied, &rejected, &near_full) {
+                                (outcome, Some(End::Failed { name: Some(name.clone()), error: every_option_refused(&e) }))
+                            } else {
+                                (outcome, None)
+                            }
+                        }
                         // Invalid for this option only (finding #22: one v1 schema 400 on the
                         // first option left four good ones untried). Once nothing usable is
                         // left, the run ends as failed — a request every option refuses is the
@@ -1317,6 +1337,14 @@ fn refused_all(denied: &[bool], rejected: &[bool], near_full: &[bool]) -> bool {
 /// The error a run fails with once [`refused_all`] holds and not every refusal was a `Denied`
 /// (that one is an access problem with the key: `End::Aborted`).
 fn every_option_refused(last: &Error) -> Error {
+    // The account's limit, last: said as that (and kept a `Quota`), not as an invalid request.
+    if last.kind() == Some(ProviderErrorKind::Quota) {
+        let said = match last {
+            Error::Provider { message, .. } => message.clone(),
+            other => other.to_string(),
+        };
+        return Error::Provider { kind: ProviderErrorKind::Quota, message: format!("no option fits the account's limits — last: {said}") };
+    }
     Error::provider(format!("every option was refused as an invalid request (or not accessible) — last: {last}"))
 }
 
@@ -1383,6 +1411,7 @@ pub fn render_summary(plan: &OptionPlan, run: &Placement) -> String {
                 Outcome::Capacity(_) => "capacity",
                 Outcome::Denied(_) => "no access",
                 Outcome::Rejected(_) => "rejected",
+                Outcome::Quota(_) => "over the account's limit",
                 Outcome::Auth(_) => "auth failed",
                 Outcome::Failed(_) => "failed",
             };
@@ -1400,7 +1429,7 @@ pub fn render_summary(plan: &OptionPlan, run: &Placement) -> String {
             .join("; ")
     };
     let any_denied =
-        run.log.iter().flat_map(|l| &l.attempts).any(|a| matches!(a.outcome, Outcome::Denied(_) | Outcome::Rejected(_)));
+        run.log.iter().flat_map(|l| &l.attempts).any(|a| matches!(a.outcome, Outcome::Denied(_) | Outcome::Rejected(_) | Outcome::Quota(_)));
     let rows: Vec<Vec<String>> = run
         .log
         .iter()
@@ -2092,6 +2121,8 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
         Schema,
         /// RunPod v2's 422 "Unknown GPU type" — a config error.
         Unknown,
+        /// Hetzner's 403 `resource_limit_exceeded` (live), as its backend reads it.
+        Quota,
     }
 
     /// A provider whose create answers per (gpu, cloud) from a script (then `fallback`), and
@@ -2216,6 +2247,7 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
                     "create pod",
                 )),
                 Reply::Unknown => Err(Error::Config("create pod HTTP 422: {\"detail\":\"Unknown GPU type: NVIDIA X\"}".into())),
+                Reply::Quota => Err(crate::provider::hetzner::recorded::limit_refusal("hetzner create")),
             }
         }
         async fn stop_pod(&self, _id: &str) -> Result<()> {
@@ -2590,6 +2622,39 @@ note: near, not tried in Europe: 1×RTX 3090 SECURE: RunPod's catalog lists it i
             assert_eq!((out.rounds, fake.calls().len()), (1, 3), "{replies:?}: each option once, then stop");
             assert_eq!(started.elapsed(), Duration::ZERO, "{replies:?}: no wait for a window nothing can use");
         }
+    }
+
+    /// Hetzner's project limit (live 2026-10-29: "shared core limit exceeded", which read as
+    /// "authentication failed"): the key works, so it never aborts the run — the option that hit
+    /// the limit is out for the run and the next is tried (a smaller one may fit); once every
+    /// option has hit it, the run ends at once (no retry round frees a limit), saying it's the
+    /// account's limits, still a `Quota`.
+    #[tokio::test(start_paused = true)]
+    async fn the_accounts_limit_skips_the_option_and_never_aborts_or_waits() {
+        let rounds = Rounds { window: Duration::from_secs(600), every: Duration::from_secs(60) };
+        let fake = Fake::new(Reply::Ok).script(A4000, "COMMUNITY", &[Reply::Quota]);
+        let (out, lines) = run(&fake, &three(), &["arena8-apple", "arena8-bloom"], rounds, None).await;
+        assert!(matches!(out.end, End::Filled), "{:?}", out.end);
+        assert_eq!(out.created.len(), 2);
+        assert_eq!(fake.calls().iter().filter(|(_, g, c)| g == A4000 && c == "COMMUNITY").count(), 1, "out for the run: {:?}", fake.calls());
+        assert!(lines.iter().any(|l| l.starts_with("[over the limit] arena8-apple on ") && l.contains("Hetzner refused: the project's resource limit is reached") && l.ends_with("— skipping this option, trying the next")), "{lines:#?}");
+
+        let fake = Fake::new(Reply::Quota);
+        let started = tokio::time::Instant::now();
+        let (out, _) = run(&fake, &three(), &["arena8-apple", "arena8-bloom"], rounds, None).await;
+        match &out.end {
+            End::Failed { name: Some(n), error } => {
+                assert_eq!(n, "arena8-apple");
+                assert_eq!(error.kind(), Some(ProviderErrorKind::Quota), "{error}");
+                assert!(error.to_string().starts_with("provider error: no option fits the account's limits — last: hetzner create HTTP 403"), "{error}");
+                assert!(!error.to_string().contains("invalid request"), "{error}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!((out.rounds, fake.calls().len()), (1, 3), "each option once, then stop");
+        assert_eq!(started.elapsed(), Duration::ZERO, "no wait for a window nothing can use");
+        let summary = render_summary(&three(), &out);
+        assert!(summary.contains("over the account's limit"), "{summary}");
     }
 
     #[tokio::test]

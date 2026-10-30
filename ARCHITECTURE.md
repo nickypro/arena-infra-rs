@@ -151,7 +151,9 @@ flowchart TD
    the round, `--retry-mins` adds rounds. Each created pod goes straight to step 9 while
    placement goes on for the other names (`up::run_up_streaming`).
 9. `up` runs one independent pipeline per pod: wait for its SSH endpoint (one shared list
-   per `--interval`; 5 minutes up behind RunPod's SSH proxy only is a host failure) → proxy sync (`proxy::plan_forwards` under a mutex and a file lock;
+   per `--interval`; `--endpoint-timeout` up without one — RunPod: behind its SSH proxy only — or
+   still listed running without one at `--timeout`, is a host failure: terminated and the name
+   recreated within `--check-attempts`, with or without `--check`) → proxy sync (`proxy::plan_forwards` under a mutex and a file lock;
    write; `SSH_PROXY_RELOAD_CMD`) → `setup::provision` over `Remote` → the deep check over
    `Remote` (`--check`; a FAIL terminates the pod, confirms it gone and recreates the
    name, rejecting a machine — by provider machine id, else IP — that already failed; a

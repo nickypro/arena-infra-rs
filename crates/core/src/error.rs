@@ -38,6 +38,16 @@ pub enum ProviderErrorKind {
     /// left 4 good options untried). Never retried. [`ProviderErrorKind::classify`] tags RunPod
     /// v1's schema wording; RunPod v2's `422` is an [`Error::Config`], read the same way.
     Rejected,
+    /// The account (a Hetzner project) is at one of its own limits — Hetzner's 403
+    /// `resource_limit_exceeded`: servers, (shared) cores, IPs. The key works and the request
+    /// is well formed; nothing more of that size fits until something is freed or the provider
+    /// raises the limit. Not `Auth` (it read as "authentication failed", live 2026-10-29: a
+    /// dead-key verdict, and another, smaller option may still fit), not `Capacity` (no wait
+    /// frees it — it isn't the provider's pool that is short): placement skips the option for
+    /// the rest of the run, a single create stops there, and it is never retried. Like
+    /// `Denied`, never produced by [`ProviderErrorKind::classify`]; only the backend that
+    /// knows the code tags it.
+    Quota,
     /// Anything else.
     Other,
 }

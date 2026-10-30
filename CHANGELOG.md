@@ -19,6 +19,29 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-30 · `up` replaces a pod that never gets an SSH endpoint; Hetzner's project limit says so
+- `pods up` no longer leaves a pod that never gets an SSH endpoint running and billing (seen on
+  prod: a RUNNING 4090 with no public IP or ports, `FAILED endpoint … left running`, then
+  terminated and recreated by hand). With or without `--check` it is now a host failure: `up` says
+  which machine and data centre it was on, terminates it, and recreates the same name with the same
+  options (others first), up to `--check-attempts` placements (default 2). The last one is
+  terminated too; the name then FAILs saying nothing of it is left billing.
+- When: a pod up without an endpoint for `--endpoint-timeout` minutes (new, default 5) — on RunPod,
+  its container running behind RunPod's SSH proxy only (a host with no public IP; before, only
+  `--check` replaced these) — or one still listed running without an endpoint when `--timeout` ends
+  (RunPod: a container that never started). RunPod's image pull doesn't count: it lists a pod
+  RUNNING from the create, and a fresh host pulls for up to ~7 minutes. Pods still coming up
+  elsewhere (Vast `loading`, Hetzner `initializing`, Shadeform `pending`) are waited for as before.
+- A Hetzner create refused over the project's limit (403 `resource_limit_exceeded`, e.g. "shared
+  core limit exceeded") said "authentication failed creating …". It now says `Hetzner refused: the
+  project's resource limit is reached (…) — use a smaller type, free a server, or ask Hetzner to
+  raise the limit`, keeps what was made and stops there; it's never waited out, and with several
+  options only that one is skipped.
+
+### Config
+- `ENDPOINT_TIMEOUT_MINS` (new, optional, default 5): the minutes `pods up --endpoint-timeout`
+  takes when the flag isn't given; whole minutes, 1 to 120. `config check` shows it.
+
 ## 2026-10-29 · An admin key only the proxy holds, which reaches every machine
 - `ADMIN_SSH_KEY_PATH` (optional) is now a key of its own role: its private half stays on the
   proxy / control box, and every machine — cohort pods and `@` staff boxes, on every provider —

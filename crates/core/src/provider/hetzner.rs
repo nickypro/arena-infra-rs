@@ -32,8 +32,9 @@ use serde_json::{json, Value};
 use super::{Provider, StopOutcome};
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, Result};
-use crate::http::{send_json, send_ok};
+use crate::http::{judge, send_limited, status_error, Limits};
 use crate::pod::{Pod, PodSpec};
+use reqwest::StatusCode;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -647,7 +648,7 @@ fn server_types(types: &[Value], now: u64) -> Vec<ServerType> {
 /// The archive walks its server types on the same test.
 pub fn is_placement_error(e: &Error) -> bool {
     use crate::error::ProviderErrorKind as K;
-    if matches!(e.kind(), Some(K::Auth | K::RateLimited | K::Transient)) {
+    if matches!(e.kind(), Some(K::Auth | K::RateLimited | K::Transient | K::Quota)) {
         return false;
     }
     let m = e.to_string().to_lowercase();
@@ -655,6 +656,91 @@ pub fn is_placement_error(e: &Error) -> bool {
         || ["resource_unavailable", "placement_error", "server_type_unavailable", "server location disabled", "unsupported location"]
             .iter()
             .any(|n| m.contains(n))
+}
+
+/// Send a Hetzner request through the rate-limit-aware path ([`crate::http::exchange`]) and
+/// judge its answer as [`crate::http::send_json`] does — the status first — but with
+/// Hetzner's own reading of an error body ([`api_error`]). Every call to Hetzner's API goes
+/// through this or [`send_ok`] (the fleet's and the archive's).
+pub(crate) async fn send_json(rb: RequestBuilder, ctx: &str) -> Result<Value> {
+    let resp = send_limited(rb, ctx, &Limits::OTHERS).await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(api_error(status, &text, ctx));
+    }
+    let text = resp.text().await?;
+    judge(status, &text, ctx)
+}
+
+/// [`send_json`] for calls whose success body isn't used (power actions, deletes): only the
+/// status is judged.
+pub(crate) async fn send_ok(rb: RequestBuilder, ctx: &str) -> Result<()> {
+    let resp = send_limited(rb, ctx, &Limits::OTHERS).await?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let text = resp.text().await.unwrap_or_default();
+    Err(api_error(status, &text, ctx))
+}
+
+/// The error for a non-2xx Hetzner answer: the shared classification ([`status_error`]), then
+/// what Hetzner's `{"error": {"code", "message", "details"}}` says. Its 403
+/// `resource_limit_exceeded` — "exceeding the maximum quantity of a resource for an account",
+/// the only limit code in its API reference (details name the limit, e.g. `project_limit`) — is
+/// the project's quota, not a bad token: [`ProviderErrorKind::Quota`](crate::error::ProviderErrorKind::Quota),
+/// in words that say so and what to do (live 2026-10-29: a cx33 refused for the shared-core
+/// limit read "authentication failed creating …"). Every other answer is classified as before.
+/// Pure.
+pub(crate) fn api_error(status: StatusCode, text: &str, ctx: &str) -> Error {
+    let body: Option<Value> = serde_json::from_str(text).ok();
+    let error = body.as_ref().and_then(|b| b.get("error"));
+    let code = error.and_then(|e| e.get("code")).and_then(Value::as_str).map(str::trim);
+    if code != Some("resource_limit_exceeded") {
+        return status_error(status, text, ctx);
+    }
+    let said = error.and_then(|e| e.get("message")).and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty());
+    let limits: Vec<&str> = error
+        .and_then(|e| e.pointer("/details/limits"))
+        .and_then(Value::as_array)
+        .map(|l| l.iter().filter_map(|x| x.get("name").and_then(Value::as_str)).map(str::trim).filter(|n| !n.is_empty()).collect())
+        .unwrap_or_default();
+    let mut what: Vec<String> = said.map(crate::error::body_excerpt).into_iter().collect();
+    if !limits.is_empty() {
+        what.push(format!("limit: {}", limits.join(", ")));
+    }
+    let what = if what.is_empty() { String::new() } else { format!(" ({})", what.join("; ")) };
+    // A server create can fit in a smaller type; anything else (a snapshot, an archive volume)
+    // can only free one up.
+    let advice = if ctx == "hetzner create" {
+        "use a smaller type (--server-type / HETZNER_SERVER_TYPE), free a server, or ask Hetzner to raise the limit"
+    } else {
+        "free one up, or ask Hetzner to raise the limit"
+    };
+    Error::Provider {
+        kind: crate::error::ProviderErrorKind::Quota,
+        message: format!(
+            "{ctx} HTTP {status}: Hetzner refused: the project's resource limit is reached{what} — {advice} \
+             (resource_limit_exceeded; the API token is fine)"
+        ),
+    }
+}
+
+/// Recorded live Hetzner answers, for fakes in other crates' tests: so a fake provider returns
+/// exactly the error this backend makes of them. Test-only.
+#[cfg(any(test, feature = "test-util"))]
+pub mod recorded {
+    use super::*;
+
+    /// A cx33 create refused over the project's shared-core limit, live 2026-10-29 (another
+    /// agent's cx23 was up; `~/.cache/arena-scratch/logs/hetzner-image/up1.log`).
+    pub const LIMIT_BODY: &str = r#"{"error":{"code":"resource_limit_exceeded","details":{"limits":[{"name":"server_shared_cores_limit"}]},"message":"shared core limit exceeded"}}"#;
+
+    /// [`LIMIT_BODY`] as this backend reads it under `ctx`: a `Quota` error.
+    pub fn limit_refusal(ctx: &str) -> Error {
+        api_error(StatusCode::FORBIDDEN, LIMIT_BODY, ctx)
+    }
 }
 
 /// A provider error's own words (without `provider error: `), for a message that quotes several.
@@ -2198,6 +2284,73 @@ mod tests {
         assert!(!is_placement_error(&http(403, r#"{"error":{"code":"resource_limit_exceeded","message":"server limit reached"}}"#)));
         assert!(!is_placement_error(&http(404, r#"{"error":{"code":"not_found","message":"SSH key not found"}}"#)));
         assert_eq!(http(412, r#"{"error":{"code":"resource_unavailable","message":"error during placement"}}"#).kind(), Some(K::Other), "why the walk tags it");
+    }
+
+    /// The live refusal (2026-10-29: a cx33 next to another agent's cx23): Hetzner's 403
+    /// `resource_limit_exceeded` is the project's quota — `Quota`, said as such with what to do,
+    /// never "authentication failed" — while its other 403s (`forbidden`: a read-only token;
+    /// `maintenance`; a body that isn't Hetzner's) and its 401 keep the shared reading. Pure.
+    #[test]
+    fn a_resource_limit_is_a_quota_refusal_not_a_bad_token() {
+        use crate::error::ProviderErrorKind as K;
+        let e = recorded::limit_refusal("hetzner create");
+        assert_eq!(e.kind(), Some(K::Quota));
+        assert_eq!(
+            e.to_string(),
+            "provider error: hetzner create HTTP 403 Forbidden: Hetzner refused: the project's resource limit is reached \
+             (shared core limit exceeded; limit: server_shared_cores_limit) — use a smaller type (--server-type / \
+             HETZNER_SERVER_TYPE), free a server, or ask Hetzner to raise the limit (resource_limit_exceeded; the API \
+             token is fine)"
+        );
+        assert!(!is_placement_error(&e), "a project's limit is the same in every location");
+        assert!(!crate::retry::is_retryable(&e), "no retry frees it");
+        // Not a server create (an image, the archive's volume): freeing one up is all there is.
+        let docs = r#"{"error":{"code":"resource_limit_exceeded","message":"project limit exceeded","details":{"limits":[{"name":"project_limit"}]}}}"#;
+        let e = api_error(StatusCode::FORBIDDEN, docs, "hetzner create image");
+        assert_eq!(e.kind(), Some(K::Quota));
+        assert!(
+            e.to_string().contains(
+                "hetzner create image HTTP 403 Forbidden: Hetzner refused: the project's resource limit is reached (project \
+                 limit exceeded; limit: project_limit) — free one up, or ask Hetzner to raise the limit"
+            ),
+            "{e}"
+        );
+        // Neither message nor details: the code alone says it.
+        let e = api_error(StatusCode::FORBIDDEN, r#"{"error":{"code":"resource_limit_exceeded"}}"#, "hetzner create");
+        assert_eq!(e.kind(), Some(K::Quota));
+        assert!(e.to_string().contains("Hetzner refused: the project's resource limit is reached — use a smaller type"), "{e}");
+        // Everything else exactly as the shared reading has it.
+        for (status, body, kind) in [
+            (403, r#"{"error":{"code":"forbidden","message":"insufficient permissions"}}"#, K::Auth),
+            (403, r#"{"error":{"code":"maintenance","message":"maintenance"}}"#, K::Auth),
+            (403, "Forbidden", K::Auth),
+            (401, r#"{"error":{"code":"unauthorized","message":"unable to authenticate"}}"#, K::Auth),
+            (429, r#"{"error":{"code":"rate_limit_exceeded","message":"limit"}}"#, K::RateLimited),
+            (412, r#"{"error":{"code":"resource_unavailable","message":"error during placement"}}"#, K::Other),
+            (403, r#"{"error":"resource_limit_exceeded"}"#, K::Auth),
+        ] {
+            let status = StatusCode::from_u16(status).unwrap();
+            let (ours, shared) = (api_error(status, body, "hetzner create"), status_error(status, body, "hetzner create"));
+            assert_eq!((ours.kind(), ours.to_string()), (Some(kind), shared.to_string()), "{body}");
+        }
+    }
+
+    /// Over the real request path: a create over the project's limit is one request — no other
+    /// location tried, no explaining lookups — and comes back a `Quota` error, on a stop/delete
+    /// (`send_ok`) too.
+    #[tokio::test]
+    async fn a_create_over_the_project_limit_stops_at_once_as_a_quota_refusal() {
+        use crate::error::ProviderErrorKind as K;
+        use crate::http::test_server::{canned, serve};
+        let srv = serve(vec![canned(403, "application/json", recorded::LIMIT_BODY), canned(403, "application/json", recorded::LIMIT_BODY)]);
+        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=arena9\nHETZNER_LOCATION=nbg1,fsn1\n"));
+        let p = provider(&srv.base, opts);
+        let e = p.create_pod(&spec("arena9-a", Some("cx33"))).await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Quota), "{e}");
+        assert!(e.to_string().contains("Hetzner refused: the project's resource limit is reached (shared core limit exceeded"), "{e}");
+        assert_eq!(srv.requests.lock().unwrap().len(), 1, "no second location, no lookups: {:?}", srv.requests.lock().unwrap());
+        let e = p.power_action("5", "poweron").await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Quota), "{e}");
     }
 
     /// The $/h is the price where the server is: its own `location` (today's answers), else an

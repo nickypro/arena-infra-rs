@@ -13,6 +13,12 @@
 //! on a host that already failed is rejected ([`on_failed_host`]: "same IP → same machine,
 //! the rebuild fixed nothing"). Bounded by `--check-attempts` placements per name.
 //!
+//! With or without `--check`, a pod that never gets a usable SSH endpoint is a host failure
+//! too, replaced within the same bound ([`AttemptEnd::NoEndpoint`]): one up without an endpoint
+//! for `--endpoint-timeout` ([`endpoint_timeout_mins`], [`crate::status::up_without_endpoint`]:
+//! on RunPod, its container running behind RunPod's SSH proxy only), or still listed running
+//! without one when `--timeout` ends.
+//!
 //! The executor is I/O and lives in the CLI (it owns the proxy writer, setup and key
 //! distribution); here are the decisions it takes and the report it ends with — the types
 //! ([`Verdict`], [`Attempt`], [`UpRow`]) and [`render_up_summary`] — so they're table-tested
@@ -20,8 +26,47 @@
 
 use std::time::Duration;
 
+use crate::config::Config;
+use crate::error::{Error, Result};
 use crate::health::Status;
 use crate::table::{self, Align};
+
+/// The config key for `pods up --endpoint-timeout`: whole minutes.
+pub const ENDPOINT_TIMEOUT_KEY: &str = "ENDPOINT_TIMEOUT_MINS";
+
+/// `--endpoint-timeout` when neither the flag nor [`ENDPOINT_TIMEOUT_KEY`] says: the grace the
+/// proxy-only check has had since wave 6 (a healthy pod has its endpoint within seconds of its
+/// container starting; one behind the proxy only stayed so 15+ minutes, live).
+pub const DEFAULT_ENDPOINT_TIMEOUT_MINS: u64 = 5;
+
+/// The most `--endpoint-timeout` / [`ENDPOINT_TIMEOUT_KEY`] take: past two hours it's a typo,
+/// and `--timeout` has ended every wait long before.
+pub const MAX_ENDPOINT_TIMEOUT_MINS: u64 = 120;
+
+/// How long `pods up` lets a pod be up without a usable SSH endpoint before it's a host failure
+/// and replaced: `flag` (`--endpoint-timeout`), else [`ENDPOINT_TIMEOUT_KEY`], else
+/// [`DEFAULT_ENDPOINT_TIMEOUT_MINS`]; whole minutes, 1..=[`MAX_ENDPOINT_TIMEOUT_MINS`] (unset or
+/// empty = the default). Read before anything is created, so a bad value fails the run then.
+/// Pure.
+pub fn endpoint_timeout_mins(cfg: &Config, flag: Option<u64>) -> Result<u64> {
+    let range = 1..=MAX_ENDPOINT_TIMEOUT_MINS;
+    if let Some(m) = flag {
+        return if range.contains(&m) {
+            Ok(m)
+        } else {
+            Err(Error::Config(format!("--endpoint-timeout must be whole minutes from 1 to {MAX_ENDPOINT_TIMEOUT_MINS}, not {m}")))
+        };
+    }
+    let Some(raw) = cfg.get(ENDPOINT_TIMEOUT_KEY).map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_ENDPOINT_TIMEOUT_MINS);
+    };
+    match raw.parse::<u64>() {
+        Ok(m) if range.contains(&m) => Ok(m),
+        _ => Err(Error::Config(format!(
+            "{ENDPOINT_TIMEOUT_KEY} must be whole minutes from 1 to {MAX_ENDPOINT_TIMEOUT_MINS}, not {raw:?}"
+        ))),
+    }
+}
 
 /// Where a pod's pipeline is (and so where it can fail or be stopped). The proxy sync isn't
 /// a stage a pod can fail at: a sync never fails a lifecycle command (the pod is fine, and
@@ -99,9 +144,11 @@ pub enum AttemptEnd {
     /// earlier run (within `snapshot::BAD_HOST_TTL_SECS`) or this one: rejected before it was
     /// set up or checked, on any attempt. Carries when and why it was found bad.
     KnownBad(String),
-    /// Up, but reachable only through RunPod's SSH proxy for the grace period — a host with no
-    /// public IP: a host failure, like a failed check.
-    NoPublicIp,
+    /// Never got a usable SSH endpoint: up without one for `--endpoint-timeout` — RunPod's
+    /// proxy-only host, with no public IP — or still listed running without one when `--timeout`
+    /// ended. A host failure, like a failed check, replaced with or without `--check`. Carries
+    /// what it was, for the attempt line (`no public SSH endpoint (RunPod ssh proxy only)`).
+    NoEndpoint(String),
     /// Never came up: listed `ERROR` (Shadeform: `error: <status details>`), or not up by its
     /// backend's ready deadline — a failed placement, terminated.
     Dead(String),
@@ -192,7 +239,7 @@ fn attempt_line(n: usize, a: &Attempt, verdict: &Verdict) -> String {
         AttemptEnd::CheckFailed(notes) => format!("check FAIL — {notes}{fate}"),
         AttemptEnd::SameHost => format!("same host as a failed check — rejected{fate}"),
         AttemptEnd::KnownBad(when) => format!("on a machine that failed a deep check {when} — rejected{fate}"),
-        AttemptEnd::NoPublicIp => format!("no public SSH endpoint (RunPod ssh proxy only){fate}"),
+        AttemptEnd::NoEndpoint(what) => format!("{what}{fate}"),
         AttemptEnd::Dead(why) => format!("never came up — {why}{fate}"),
         AttemptEnd::Kept => match verdict {
             Verdict::Ready => "ready".to_string(),
@@ -333,6 +380,31 @@ mod tests {
             (Duration::from_millis(59_900), "59s"),
         ] {
             assert_eq!(fmt_elapsed(d), want, "{d:?}");
+        }
+    }
+
+    /// `--endpoint-timeout` over `ENDPOINT_TIMEOUT_MINS` over the default (5); whole minutes
+    /// 1..=120 from either, anything else refused before a create.
+    #[test]
+    fn endpoint_timeout_comes_from_the_flag_then_the_config_then_the_default() {
+        let cfg = |text: &str| Config::parse(text);
+        for (text, flag, want) in [
+            ("", None, Ok(5)),
+            ("ENDPOINT_TIMEOUT_MINS=\n", None, Ok(5)),
+            ("ENDPOINT_TIMEOUT_MINS= 8 \n", None, Ok(8)),
+            ("ENDPOINT_TIMEOUT_MINS=120\n", None, Ok(120)),
+            ("ENDPOINT_TIMEOUT_MINS=8\n", Some(3), Ok(3)),
+            ("ENDPOINT_TIMEOUT_MINS=junk\n", Some(3), Ok(3)),
+            ("", Some(1), Ok(1)),
+            ("ENDPOINT_TIMEOUT_MINS=0\n", None, Err("ENDPOINT_TIMEOUT_MINS must be whole minutes from 1 to 120, not \"0\"")),
+            ("ENDPOINT_TIMEOUT_MINS=121\n", None, Err("ENDPOINT_TIMEOUT_MINS must be whole minutes from 1 to 120, not \"121\"")),
+            ("ENDPOINT_TIMEOUT_MINS=4.5\n", None, Err("ENDPOINT_TIMEOUT_MINS must be whole minutes from 1 to 120, not \"4.5\"")),
+            ("ENDPOINT_TIMEOUT_MINS=-1\n", None, Err("ENDPOINT_TIMEOUT_MINS must be whole minutes from 1 to 120, not \"-1\"")),
+            ("", Some(0), Err("--endpoint-timeout must be whole minutes from 1 to 120, not 0")),
+            ("", Some(500), Err("--endpoint-timeout must be whole minutes from 1 to 120, not 500")),
+        ] {
+            let got = endpoint_timeout_mins(&cfg(text), flag).map_err(|e| e.to_string());
+            assert_eq!(got, want.map_err(|e| format!("config error: {e}")), "{text:?} {flag:?}");
         }
     }
 
