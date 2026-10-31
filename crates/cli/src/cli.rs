@@ -867,6 +867,28 @@ pub(crate) enum PodCmd {
     /// Servers made ahead of need, taken later by `migrate copy <name> --onto-spare`.
     #[command(subcommand, verbatim_doc_comment)]
     Spare(SpareCmd),
+    /// Copy one machine's home onto another that keeps its own name
+    ///
+    /// For moving a person to another machine (`copy-home rarity scoot`): the same copy as
+    /// `replace`/`migrate` (direct, `.git` kept, caches and venvs left, verified), nothing
+    /// renamed. Refuses while someone is on either machine (--force), and when `<to>` has files
+    /// of its own the copy would replace (--overwrite: moved aside to ~/arena-sync-kept/).
+    #[command(verbatim_doc_comment)]
+    CopyHome {
+        /// The machine whose home is copied (name or id).
+        from: String,
+        /// The machine it's copied onto (same provider).
+        to: String,
+        /// Copy over `<to>`'s own files (moved aside on it, never deleted)
+        #[arg(long)]
+        overwrite: bool,
+        /// Copy with someone on either machine
+        #[arg(long)]
+        force: bool,
+        /// Preview only: the checks and what would be copied.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
     /// Terminate (delete) a pod, or every pod with --all
     ///
     /// IRREVERSIBLE: the pod and its disk are gone. One pod at a time (no ranges or lists); a

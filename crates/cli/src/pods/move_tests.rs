@@ -495,3 +495,40 @@ async fn spares_are_made_labelled_and_deleted_only_as_spares() {
     let many = SpareCmd::Up { count: 21, server_type: None, image: None, keep_trying: false, retry_mins: 0, retry_secs: 60, no_wait: true, dry_run: false };
     assert!(spare_on(many, &cfg, &f, &f, true, &interrupt).await.unwrap_err().to_string().contains("1 to 20"));
 }
+
+/// "migrating from arena9-rarity → arena9-scoot": `copy-home rarity scoot` copies the home
+/// straight across — nothing renamed, nothing created — after a dry run of that very copy says
+/// what of scoot's own it would replace: refused (named) unless --overwrite, which moves it
+/// aside, never deletes it. Someone on either machine stops it unless --force.
+#[tokio::test(start_paused = true)]
+async fn copy_home_moves_a_person_without_renaming_anything() {
+    use crate::pods::copy_home::{copy_home_on, CopyHomeOpts};
+    let dir = tmpdir("copy-home");
+    let cfg = cfg(&dir.0);
+    let f = Vms::new(vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1"), vm("202", "devtest-bravo", "cx43", "10.0.0.2", "nbg1")], vec![]);
+    let listed = f.pods.lock().unwrap().clone();
+    let (src, dest) = (listed[0].clone(), listed[1].clone());
+    let remote = Arc::new(FakeRemote::new());
+    // (Before `scripted`'s rules: the first rule that matches wins.) The repo (`~/r`) goes as its own
+    // tree after the home, its items named from the repo.
+    remote.on(OLD, "--dry-run", FakeReply::stdout("*deleting   notes/mine.txt\n>f+++++++++ new.py\nARENA_TREE_ITEMS\n>f.st...... day1/x.py\n"));
+    remote.on(NEW, "ARENA_IDLE_NOW", FakeReply::stdout(&Reply { gpu: None, ..Reply::default() }.render()));
+    scripted(&remote, "101", NEW, "202");
+    let opts = |overwrite, force| CopyHomeOpts { overwrite, force, dry_run: false, yes: true };
+    let e = copy_home_on(remote.clone(), &cfg, &f, &src, &dest, opts(false, false)).await.unwrap_err().to_string();
+    assert!(e.contains("devtest-bravo has files of its own") && e.contains("(2 files: notes/mine.txt, r/day1/x.py)"), "{e}");
+    assert!(!execs(&remote, OLD).iter().any(|c| c.contains("\nrsync ") && !c.contains("--dry-run")), "nothing copied");
+    copy_home_on(remote.clone(), &cfg, &f, &src, &dest, opts(true, false)).await.unwrap();
+    assert!(f.calls().is_empty(), "nothing renamed, created or deleted: {:?}", f.calls());
+    let on_old = execs(&remote, OLD);
+    assert!(on_old.iter().any(|c| c.contains("\nrsync ") && !c.contains("--dry-run") && c.contains("--backup-dir=arena-sync-kept/")), "{on_old:?}");
+    let on_new = execs(&remote, NEW);
+    assert!(on_new.iter().any(|c| c.contains("arena-replica-ready") && !c.contains("touch \"$s\" || exit 1")), "not a fresh baseline: {on_new:?}");
+    // Someone on the destination: refused, unless --force.
+    let busy = Arc::new(FakeRemote::new());
+    busy.on(NEW, "ARENA_IDLE_NOW", FakeReply::stdout(&Reply { gpu: None, sessions: vec![[10, 9, 9, 9]], ..Reply::default() }.render()));
+    scripted(&busy, "101", NEW, "202");
+    let e = copy_home_on(busy.clone(), &cfg, &f, &src, &dest, opts(true, false)).await.unwrap_err().to_string();
+    assert!(e.contains("devtest-bravo — someone is on it (1 SSH session)") && e.contains("--force"), "{e}");
+    copy_home_on(busy, &cfg, &f, &src, &dest, opts(true, true)).await.unwrap();
+}

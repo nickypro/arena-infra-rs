@@ -549,6 +549,50 @@ pub(crate) async fn copy_pod_files(
     Ok(())
 }
 
+/// How long [`would_move_aside`]'s dry run may take: it walks both homes but moves nothing.
+pub(crate) const DRY_RUN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// The receiver's OWN files a sync from `src_id` onto `dest_id` would move aside — the ones it
+/// would overwrite or delete there ([`arena_core::replica::moved_aside`]) — by a dry run of the
+/// direct copy [`copy_pod_files`] makes (same filters, same mirror, run on the source behind its
+/// identity check, the remote side behind the destination's). Read-only: nothing is planted,
+/// prepared or transferred. `Err`: why it couldn't tell — a stopped pod, both behind one IP (no
+/// direct path), the dry run failing.
+pub(crate) async fn would_move_aside(
+    cfg: &Config,
+    provider: &dyn Provider,
+    remote: &dyn Remote,
+    src_id: &str,
+    dest_id: &str,
+) -> std::result::Result<Vec<String>, String> {
+    use arena_core::pull::PullConfig;
+    use arena_core::{replica, volume};
+    let remote_key = cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string();
+    let user = cfg.get("SSH_USER").unwrap_or("root").to_string();
+    let repo = arena_core::backup::repo_path(cfg);
+    let rel = volume::repo_pull(&repo, &user, None).map(|p| p.rel);
+    let src = fresh_target(provider, src_id, cfg).await.map_err(|e| format!("the source has no endpoint ({e:#})"))?;
+    let dest = wait_for_endpoint(provider, dest_id, 120).await.map_err(|e| format!("the destination has no endpoint ({e:#})"))?;
+    let dest_ip = dest.ssh_ip.clone().unwrap_or_default();
+    if dest_ip == src.host {
+        return Err(format!("both are behind {dest_ip}, so there is no direct path to dry-run"));
+    }
+    let pc = PullConfig {
+        mirror: replica::home_mirror(&replica::sync_stamp(0)),
+        rsync_path: pod_guard(provider, dest_id).as_deref().map(replica::guarded_rsync_path),
+        dry_run: true,
+        ..PullConfig::replication()
+    };
+    let cmd = volume::pod_to_pod_copy(&dest_ip, dest.ssh_port.unwrap_or(22), &user, &remote_key, &pc, rel.as_deref());
+    let cmd = replica::guarded(pod_guard(provider, src_id).as_deref(), &cmd);
+    match remote.exec(&src, &cmd, Some(DRY_RUN_TIMEOUT)).await {
+        Ok(o) if o.success => Ok(replica::moved_aside(&o.stdout, rel.as_deref())),
+        Ok(o) if o.code == Some(replica::WRONG_POD_EXIT) => Err("an endpoint answered as another machine".into()),
+        Ok(o) => Err(format!("the dry run failed: {}", copy_failure_reason(&o.stderr))),
+        Err(e) => Err(format!("the dry run couldn't run: {}", describe_error(&e))),
+    }
+}
+
 /// One leg of the via-local copy — the pull into staging, or the push out of it — and its
 /// clock. A leg is up to two rsyncs (the home, then a linked repo's tree, split out because a
 /// home copy alone would carry only the link), and they share ONE budget, as the direct

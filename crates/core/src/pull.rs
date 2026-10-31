@@ -93,6 +93,10 @@ pub struct PullConfig {
     /// (worse than its default), so the caller then leaves it `None`. Nothing else changes: the
     /// same files land in the same places with the same links.
     pub temp_dir: Option<String>,
+    /// rsync `--dry-run --itemize-changes`: transfer nothing, say per item what would change —
+    /// how `pods copy-home` finds the receiver's own files a sync would move aside
+    /// ([`crate::replica::moved_aside`]) before it asks. `false` for every real transfer.
+    pub dry_run: bool,
 }
 
 /// What a transfer may do to files on the RECEIVING side that the sender doesn't have (or
@@ -196,6 +200,7 @@ impl Default for PullConfig {
             git_only: false,
             linked_dest: false,
             temp_dir: None,
+            dry_run: false,
         }
     }
 }
@@ -814,6 +819,10 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
     // have — a deleted branch's ref, a stale `rebase-merge/` — in the replica.
     if !pc.mirror.deletes() {
         a.push("--prune-empty-dirs".into());
+    }
+    if pc.dry_run {
+        a.push("--dry-run".into());
+        a.push("--itemize-changes".into());
     }
     if let Some(t) = pc.io_timeout_secs {
         a.push(format!("--timeout={t}"));

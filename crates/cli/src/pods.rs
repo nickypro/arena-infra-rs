@@ -39,6 +39,7 @@ pub(crate) mod backup;
 pub(crate) mod baseline;
 pub(crate) mod branch;
 pub(crate) mod copy;
+pub(crate) mod copy_home;
 pub(crate) mod create;
 pub(crate) mod health;
 pub(crate) mod home_copy;
@@ -845,6 +846,11 @@ async fn handle_pods_bal(
 
         PodCmd::Spare(cmd) => {
             crate::pods::spare::handle_spare(cmd, cfg, yes, &interrupt).await?;
+        }
+
+        PodCmd::CopyHome { from, to, overwrite, force, dry_run } => {
+            let opts = crate::pods::copy_home::CopyHomeOpts { overwrite, force, dry_run, yes };
+            crate::pods::copy_home::handle_copy_home(remote, cfg, &from, &to, opts).await?;
         }
 
         PodCmd::Terminate { target, all, unlock, revoke_key, skip_proxy, dry_run } => {

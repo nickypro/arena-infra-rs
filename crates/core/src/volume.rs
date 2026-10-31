@@ -677,7 +677,9 @@ pub fn pull_jobs(pc: &crate::pull::PullConfig, dest: &str, split: Option<&RepoPu
 /// The trailing slashes make each side resolve a link there (the source's repo on its volume,
 /// the destination's on its own) instead of copying or replacing the link itself: a plain home
 /// copy would carry only the link, and the work would stay behind on the old pod's volume.
-/// `rel = None` (the repo isn't under the home) = the plain home copy.
+/// `rel = None` (the repo isn't under the home) = the plain home copy. A dry run
+/// (`pc.dry_run`) prints [`TREE_ITEMS_MARK`] between the two, as the tree's items are named
+/// relative to the repo ([`crate::replica::moved_aside`] puts `<rel>/` back).
 pub fn pod_to_pod_copy(
     dest_ip: &str,
     dest_port: u16,
@@ -693,13 +695,17 @@ pub fn pod_to_pod_copy(
     let mut home = pc.clone();
     home.excludes.push(format!("/{rel}"));
     let tree = tree_config(pc, rel);
+    let mark = if pc.dry_run { format!("echo {TREE_ITEMS_MARK} && ") } else { String::new() };
     format!(
-        "{} && if [ -d \"$HOME\"/{} ]; then {}; fi",
+        "{} && if [ -d \"$HOME\"/{} ]; then {mark}{}; fi",
         pod_to_pod_command(dest_ip, dest_port, dest_user, remote_key, &home),
         shell_quote(rel),
         pod_to_pod_command_into(dest_ip, dest_port, dest_user, remote_key, &tree, &format!("{rel}/")),
     )
 }
+
+/// The line a dry run of [`pod_to_pod_copy`] prints before the repo tree's items.
+pub const TREE_ITEMS_MARK: &str = "ARENA_TREE_ITEMS";
 
 /// The pushes of a via-local copy's staging dir (`stage`, trailing `/`) onto the destination:
 /// `(local source, config)` per rsync. With the repo at `rel`, the home push ALWAYS leaves

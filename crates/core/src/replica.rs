@@ -162,6 +162,38 @@ pub fn pod_identity(provider: &str, id: &str) -> Option<String> {
     }
 }
 
+/// The receiver's own files a mirroring sync would move aside ([`crate::pull::Mirror::Replica`]),
+/// read from its `--dry-run --itemize-changes` output: each it would delete (`*deleting`) or
+/// overwrite (a received file, `>f`, that exists there — its flags aren't all `+`). Files only
+/// (a deleted directory's files are listed one by one), in the order rsync names them, as paths
+/// in the home: the repo tree's items, after [`crate::volume::TREE_ITEMS_MARK`], are named
+/// relative to the repo at `rel`. Pure.
+pub fn moved_aside(itemized: &str, rel: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut prefix = String::new();
+    for line in itemized.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.trim() == crate::volume::TREE_ITEMS_MARK {
+            prefix = rel.map(|r| format!("{}/", r.trim_end_matches('/'))).unwrap_or_default();
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("*deleting") {
+            let path = path.trim_start();
+            if !path.is_empty() && !path.ends_with('/') {
+                out.push(format!("{prefix}{path}"));
+            }
+            continue;
+        }
+        // `YXcstpoguax path`: Y `>` received, X `f` a file, then 9 change flags (`+` = new).
+        let Some((flags, path)) = line.split_once(' ') else { continue };
+        let b = flags.as_bytes();
+        if b.len() >= 11 && b[0] == b'>' && b[1] == b'f' && !flags[2..].starts_with('+') {
+            out.push(format!("{prefix}{}", path.trim_start()));
+        }
+    }
+    out
+}
+
 /// `script` preceded by `cond` (when there is one): on any other pod it says so on stderr
 /// and exits [`WRONG_POD_EXIT`] having done nothing. Checked in the same session as the
 /// work, so a reassigned endpoint can't slip in between a check and the step.
@@ -526,6 +558,28 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    /// `pods copy-home` asks before it moves a receiver's own files aside: what a dry run says it
+    /// would delete or overwrite there — never what it only adds, a directory, or a time-only
+    /// touch.
+    #[test]
+    fn a_dry_runs_deletions_and_overwrites_are_the_files_moved_aside() {
+        let out = "sending incremental file list\n\
+                   *deleting   notes/old.txt\n\
+                   *deleting   scratch/\n\
+                   >f.st...... ARENA_materials/day1/solution.py\n\
+                   >f+++++++++ ARENA_materials/day1/new.py\n\
+                   cd+++++++++ ARENA_materials/day2/\n\
+                   .f..t...... ARENA_materials/README.md\n\
+                   >f..t...... has spaces in name.txt\n\
+                   \n\
+                   sent 1,234 bytes  received 56 bytes\n";
+        assert_eq!(moved_aside(out, None), ["notes/old.txt", "ARENA_materials/day1/solution.py", "has spaces in name.txt"]);
+        assert!(moved_aside("", None).is_empty());
+        // The repo's tree, copied on its own after the home, names its items from the repo.
+        let split = "*deleting   notes/old.txt\nARENA_TREE_ITEMS\n*deleting   day1/gone.py\n>f.st...... day2/x.py\n";
+        assert_eq!(moved_aside(split, Some("ARENA_materials")), ["notes/old.txt", "ARENA_materials/day1/gone.py", "ARENA_materials/day2/x.py"]);
+    }
 
     #[test]
     fn stamps_are_utc_and_sortable() {
