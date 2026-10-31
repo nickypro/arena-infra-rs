@@ -420,6 +420,8 @@ total       4 instance(s)  49.5  ~$11.88 + €0.43 $3.50  ~$15.38 + €0.43
   is installed: earlier history isn't there.
 - **Just to watch:** nothing stops a machine, and nothing is shown to participants.
 
+Running a project week: [start to end](docs/REFERENCE.md#a-project-week-start-to-end), keys,
+owners, a name for someone else, renames, backups and the end-of-week report, in order.
 [Everything about spend](docs/REFERENCE.md#spend). Another program wanting a fleet of its own on
 the same box (not needed for a project week):
 [Running a second fleet](docs/REFERENCE.md#running-a-second-fleet-from-the-same-control-box).
