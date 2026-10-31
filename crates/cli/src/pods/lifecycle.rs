@@ -43,7 +43,7 @@ pub(crate) async fn handle_reimage(
     image: Option<String>,
     opts: RestartOpts,
     settle: SettleWait,
-    // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    // Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     keys_dir: &str,
 ) -> Result<()> {
     let RestartOpts { wipe_ok, no_setup, skip_proxy, dry_run, yes } = opts;
@@ -204,7 +204,7 @@ pub(crate) async fn handle_start(
     sel: &Selected,
     opts: RestartOpts,
     settle: SettleWait,
-    // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    // Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     keys_dir: &str,
 ) -> Result<()> {
     let RestartOpts { no_setup, skip_proxy, dry_run, yes, .. } = opts;
@@ -896,7 +896,7 @@ pub(crate) async fn handle_restart(
     target: &str,
     opts: RestartOpts,
     settle: SettleWait,
-    // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    // Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     keys_dir: &str,
 ) -> Result<()> {
     // A malformed SETUP_TIMEOUT_SECS fails before anything is touched (as in `up`).

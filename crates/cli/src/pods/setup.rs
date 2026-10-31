@@ -222,7 +222,7 @@ pub(crate) async fn handle_setup(
     // The pods to provision, resolved by the caller: the operator's selection, or the pods
     // `up` / `replace` / `migrate copy` just created.
     sel: &Selected,
-    // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    // Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     keys_dir: &str,
     // The fleet provider, for the one repair setup can make itself: a pod that refuses our
     // key gets it re-attached through its provider's API (Vast), then setup re-runs on it.

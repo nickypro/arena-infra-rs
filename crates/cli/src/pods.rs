@@ -12,7 +12,7 @@ use arena_core::Config;
 
 use crate::cli::{PodCmd, Select};
 use crate::cron::resolve_week_day;
-use crate::keys::{handle_copy_keys, openrouter_client, up_keys_stage, KeyBook, KEYS_DIR, OPENROUTER_KEYS_CSV};
+use crate::keys::{handle_copy_keys, keys_dir, openrouter_client, openrouter_keys_csv, up_keys_stage, KeyBook};
 use crate::pods::backup::{handle_full_backup, RSYNC};
 use crate::pods::baseline::handle_baseline;
 use crate::pods::branch::{handle_init_branches, set_branch_and_init, SetBranchRun};
@@ -453,7 +453,7 @@ async fn handle_pods_bal(
             };
             pin_vm_image(provider.name(), cfg, &mut spec).await?;
             check_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]))?;
-            let keys = up_keys_stage(cfg, KEYS_DIR, !no_setup);
+            let keys = up_keys_stage(cfg, &keys_dir(cfg), !no_setup);
             let per_pod =
                 up::pipeline_text(!no_setup, check.then_some(check_attempts), keys.is_some(), lock, (endpoint_mins, check_attempts));
             if dry_run {
@@ -511,7 +511,7 @@ async fn handle_pods_bal(
                 return Ok(());
             }
             // The handed-over keys are in the CSV before the pipelines copy any.
-            let keys = if hand_keys_over(&tracking, cfg, &owner, &handing).await? { up_keys_stage(cfg, KEYS_DIR, !no_setup) } else { keys };
+            let keys = if hand_keys_over(&tracking, cfg, &owner, &handing).await? { up_keys_stage(cfg, &keys_dir(cfg), !no_setup) } else { keys };
             // What the operator confirmed: a name of these that gets no pod is in the summary
             // (and the exit status) too, not silently missing from it.
             let confirmed = names.clone();
@@ -561,12 +561,14 @@ async fn handle_pods_bal(
             });
             match &keys {
                 Some(k) if k.csv.is_empty() => println!(
-                    "API keys: none generated in {KEYS_DIR}/ — each pod gets the backup archive's access once it's set up"
+                    "API keys: none generated in {}/ — each pod gets the backup archive's access once it's set up",
+                    keys_dir(cfg)
                 ),
                 Some(k) => println!("API keys: {} — copied to each pod once it's set up", k.csv.join(", ")),
                 None if setup.is_some() => println!(
-                    "API keys: none generated in {KEYS_DIR}/ — skipping (run `arena keys gen --all` or drop in \
-                     <provider>_api_keys.csv, then `pods copy-keys`)."
+                    "API keys: none generated in {}/ — skipping (run `arena keys gen --all` or drop in \
+                     <provider>_api_keys.csv, then `pods copy-keys`).",
+                    keys_dir(cfg)
                 ),
                 None => {}
             }
@@ -772,9 +774,10 @@ async fn handle_pods_bal(
             handle_restore(provider, &remote, cfg, &target, opts, RSYNC, now).await?;
         }
 
-        PodCmd::CopyKeys { sel, keys_dir, hf_token, cc_token, dry_run } => {
+        PodCmd::CopyKeys { sel, keys_dir: dir, hf_token, cc_token, dry_run } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
-            handle_copy_keys(remote, cfg, &keys_dir, hf_token, cc_token, &sel, dry_run, yes).await?;
+            let dir = dir.unwrap_or_else(|| keys_dir(cfg));
+            handle_copy_keys(remote, cfg, &dir, hf_token, cc_token, &sel, dry_run, yes).await?;
         }
 
         PodCmd::Cp { file, dest, recursive, sel, timeout, dry_run } => {
@@ -785,18 +788,18 @@ async fn handle_pods_bal(
 
         PodCmd::Restart { target, wipe_ok, no_setup, skip_proxy, dry_run } => {
             let opts = RestartOpts { wipe_ok, no_setup, skip_proxy, dry_run, yes };
-            handle_restart(provider, remote, cfg, &target, opts, RESTART_SETTLE, KEYS_DIR).await?;
+            handle_restart(provider, remote, cfg, &target, opts, RESTART_SETTLE, &keys_dir(cfg)).await?;
         }
 
         PodCmd::Start { no_setup, skip_proxy, dry_run, sel } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("start")).await?;
             let opts = RestartOpts { wipe_ok: false, no_setup, skip_proxy, dry_run, yes };
-            handle_start(provider, remote, cfg, &sel, opts, RESTART_SETTLE, KEYS_DIR).await?;
+            handle_start(provider, remote, cfg, &sel, opts, RESTART_SETTLE, &keys_dir(cfg)).await?;
         }
 
         PodCmd::Rename { target, new_name, from_prefix, skip_proxy, dry_run } => {
             let or = openrouter_client(cfg);
-            let book = KeyBook::new(OPENROUTER_KEYS_CSV, or.as_ref());
+            let book = KeyBook::new(openrouter_keys_csv(cfg), or.as_ref());
             let request = match (from_prefix, target, new_name) {
                 (Some(from), _, _) => RenameRequest::FromPrefix(from),
                 (None, Some(old), Some(new)) => RenameRequest::One { old, new },
@@ -818,7 +821,7 @@ async fn handle_pods_bal(
         PodCmd::Reimage { sel, image, wipe_ok, no_setup, skip_proxy, dry_run } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("reimage")).await?;
             let opts = RestartOpts { wipe_ok, no_setup, skip_proxy, dry_run, yes };
-            handle_reimage(provider, remote, cfg, &sel, image, opts, RESTART_SETTLE, KEYS_DIR).await?;
+            handle_reimage(provider, remote, cfg, &sel, image, opts, RESTART_SETTLE, &keys_dir(cfg)).await?;
         }
 
         PodCmd::Replace { target, gpu, gpus, cloud, disk, volume, image, place, onto, force, keep_old, skip_proxy, dry_run } => {
@@ -860,7 +863,7 @@ async fn handle_pods_bal(
 
         PodCmd::Terminate { target, all, unlock, revoke_key, skip_proxy, dry_run } => {
             let or = openrouter_client(cfg);
-            let book = KeyBook::new(OPENROUTER_KEYS_CSV, or.as_ref());
+            let book = KeyBook::new(openrouter_keys_csv(cfg), or.as_ref());
             let target = match (all, target) {
                 (true, _) => None,
                 (false, Some(t)) => Some(t),
@@ -902,7 +905,7 @@ async fn handle_pods_bal(
                 println!("aborted.");
                 return Ok(());
             }
-            handle_setup(remote, cfg, !dry_run, force, hf_token, cc_token, zsh_install, no_vscode, timeouts, &sel, KEYS_DIR, Some(provider))
+            handle_setup(remote, cfg, !dry_run, force, hf_token, cc_token, zsh_install, no_vscode, timeouts, &sel, &keys_dir(cfg), Some(provider))
                 .await?;
         }
         PodCmd::SetBranch { branch, sel, cohort, hard, dry_run, init_branches } => {

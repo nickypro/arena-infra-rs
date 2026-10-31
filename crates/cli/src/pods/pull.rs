@@ -1012,7 +1012,8 @@ pub(crate) fn clear_stale_link(dest: &str) -> std::io::Result<bool> {
     }
 }
 
-/// The local directory `pods pull` rsyncs into: config `LOCAL_BACKUP_DIR`, else `./backup`.
+/// The local directory `pods pull` rsyncs into: config `LOCAL_BACKUP_DIR`, else the fleet's
+/// `backup/` — next to the config, else `./backup` (warned): [`Config::local_backup_dir`].
 pub(crate) fn local_backup_dir(cfg: &Config) -> String {
-    cfg.get("LOCAL_BACKUP_DIR").filter(|s| !s.is_empty()).unwrap_or("./backup").to_string()
+    crate::fleet_files::backup_dir(cfg)
 }
