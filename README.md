@@ -109,6 +109,7 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 | `arena cron install --health 07:20` | A deep check of every cohort pod each morning, in this box's time zone |
 | `arena pods restore apple` | Push a backup back onto one pod (never deletes) |
 | `arena pods replace apple` | Move a pod to a fresh host, keeping its name and files |
+| `arena pods replace apple --server-type cx43` | Hetzner: move a box to a bigger type (`pods spare up` grabs room ahead; `pods copy-home` moves a person to another machine) |
 | `arena pods run -t apple 'nvidia-smi'` | Run a command on pods (all of them without `-t`) |
 | `arena balance` | Money left on each prepaid account, and how long it lasts |
 | `arena keys limit apple +5` | Raise a participant's AI (OpenRouter) cap by $5, in place (`10` sets it; `--all`); `keys pause`/`resume` stop and restart a key |
@@ -422,6 +423,8 @@ total       4 instance(s)  49.5  ~$11.88 + €0.43 $3.50  ~$15.38 + €0.43
   is installed: earlier history isn't there.
 - **Just to watch:** nothing stops a machine, and nothing is shown to participants.
 
+Running a project week: [start to end](docs/REFERENCE.md#a-project-week-start-to-end), keys,
+owners, a name for someone else, renames, backups and the end-of-week report, in order.
 [Everything about spend](docs/REFERENCE.md#spend). Another program wanting a fleet of its own on
 the same box (not needed for a project week):
 [Running a second fleet](docs/REFERENCE.md#running-a-second-fleet-from-the-same-control-box).

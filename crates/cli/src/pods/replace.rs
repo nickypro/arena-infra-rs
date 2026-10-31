@@ -8,11 +8,13 @@ use anyhow::{Context, Result};
 use arena_core::capability::Op;
 use arena_core::provider::Provider;
 use arena_core::remote::{Remote, PROBE_TIMEOUT};
+use arena_core::spare::SpareCloud;
 use arena_core::ssh::SshTarget;
 use arena_core::{Config, PodSpec};
 
 use crate::cli::PlaceFlags;
 use crate::keys::{handle_copy_keys, keys_dir, KeySources};
+use crate::pods::adopt::{self, Source};
 use crate::pods::capable::CreateFlags;
 use crate::pods::create::{apply_spec_overrides, check_create_body, create_extra, sizing_flags, SpecOverrides};
 use crate::pods::home_copy::{copy_pod_files, pod_guard, remove_staging_for, verify_replacement, CopyOpts};
@@ -54,10 +56,15 @@ async fn build_replacement_spec(
         .with_context(|| format!("snapshotting spec of {src_label}"))?;
     let base = PodSpec::from_config(cfg);
     let mut notes = Vec::new();
+    // A Hetzner VM has no GPU, tier or container image: its spec is its server type (and
+    // labels); what config says about GPUs would only be noise in its plan.
+    let vm = owner.name() == "hetzner";
     if spec.image.is_empty() {
         spec.image = base.image;
     }
-    if spec.gpu_type.is_empty() {
+    if vm {
+        // Nothing GPU-shaped to fill.
+    } else if spec.gpu_type.is_empty() {
         match listed_gpu {
             Some(g) => {
                 notes.push(format!("GPU {g}: the source's, from its listing (its spec snapshot doesn't report one)"));
@@ -74,10 +81,12 @@ async fn build_replacement_spec(
         }
     }
     if spec.cloud_type.is_empty() {
-        notes.push(format!(
-            "tier {}: config CLOUD_TYPE — the API doesn't report the source's (pass --cloud to choose)",
-            base.cloud_type
-        ));
+        if !vm {
+            notes.push(format!(
+                "tier {}: config CLOUD_TYPE — the API doesn't report the source's (pass --cloud to choose)",
+                base.cloud_type
+            ));
+        }
         spec.cloud_type = base.cloud_type;
     }
     if spec.allowed_cuda.is_empty() && spec.min_cuda.is_none() {
@@ -92,12 +101,48 @@ async fn build_replacement_spec(
     apply_spec_overrides(&mut spec, &SpecOverrides { gpu: None, cloud: None, ..ov.clone() });
     // Config CREATE_EXTRA_JSON is the cohort's create default, like GPU_TYPE: the
     // replacement's create carries it too — checked against the owner's own fields now,
-    // before anything is created. (`--api-json` itself is create/up only.)
-    if spec.api_extra.is_none() {
-        spec.api_extra = create_extra(owner, cfg, None)?;
+    // before anything is created. (`--api-json` itself is create/up only.) What the source's
+    // spec carried itself (a Hetzner server's own labels) stays where config doesn't say.
+    let configured = create_extra(owner, cfg, None)?;
+    spec.api_extra = match (spec.api_extra.take(), configured) {
+        (Some(own), Some(cfg_extra)) => {
+            let mut merged = serde_json::Value::Object(own);
+            arena_core::apiextra::deep_merge(&mut merged, &serde_json::Value::Object(cfg_extra));
+            merged.as_object().cloned()
+        }
+        (own, cfg_extra) => cfg_extra.or(own),
+    };
+    if let Some(x) = &spec.api_extra {
+        owner.check_create_extra(x)?;
     }
     check_create_body(owner, &spec)?;
     Ok((spec, notes))
+}
+
+/// `--server-type` on `replace` / `migrate copy` / `spare up`: Hetzner server types, in the
+/// order to try them (`cx43,cx53`: a cx53 only when no location has room for a cx43). Refused
+/// for a pod on a provider the capability table says doesn't take it (every one but Hetzner —
+/// a GPU pod is sized by `--gpu`), and when a name isn't a type name. Pure.
+pub(crate) fn server_types(provider: &str, raw: Option<&str>) -> Result<Vec<String>> {
+    use arena_core::capability::{self, Backend, Op, Support};
+    let Some(raw) = raw else { return Ok(Vec::new()) };
+    let support = |op| Backend::named(provider).map_or(Support::Yes, |b| capability::support(b, op));
+    crate::pods::capable::ignored_flags(provider, &[("--server-type", Op::ServerType)], support)?;
+    let types = arena_core::placement::split_list(raw);
+    if types.is_empty() {
+        anyhow::bail!("--server-type lists no server type");
+    }
+    let mut out: Vec<String> = Vec::new();
+    for t in types {
+        if t.len() > 32 || !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            anyhow::bail!("--server-type takes Hetzner server type names like cx43 or cpx42 (a comma list to fall back), not `{t}`");
+        }
+        let t = t.to_ascii_lowercase();
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    Ok(out)
 }
 
 /// The source pod's GPU type as a create id, from its (enriched) listing — for when its spec
@@ -166,18 +211,41 @@ pub(crate) async fn plan_replacement(
     place: &PlaceFlags,
 ) -> Result<Replacement> {
     use arena_core::placement::Request;
+    let vm = owner.name() == "hetzner";
+    let types = server_types(owner.name(), place.server_type.as_deref())?;
+    let mut ov = ov.clone();
+    // (A flag a VM can't take — `--gpu`, `--disk`, … — was refused before this, by the
+    // capability table: `replace_on` / `migrate_copy_on`.)
+    if vm {
+        // `--image` on a VM is what it boots (`arena`, a snapshot id, an image name).
+        let (_, vm_image) = crate::pods::create::image_flag("hetzner", ov.image.take())?;
+        ov.vm_image = vm_image;
+    }
+    let ov = &ov;
     let gpu = checked_gpu(cfg, owner.name(), ov.gpu.clone()).await?;
-    let listed = if gpu.is_none() { source_gpu_from_listing(cfg, owner, src).await } else { None };
+    let listed = if gpu.is_none() && !vm { source_gpu_from_listing(cfg, owner, src).await } else { None };
     let label = format!("{} (id={})", src.name, src.id);
-    let (base, mut notes) = build_replacement_spec(cfg, owner, &src.id, &label, listed.as_deref(), ov).await?;
+    let (mut base, mut notes) = build_replacement_spec(cfg, owner, &src.id, &label, listed.as_deref(), ov).await?;
     if gpu.is_some() {
         notes.retain(|n| !n.starts_with("GPU "));
     }
     if ov.cloud.is_some() {
         notes.retain(|n| !n.starts_with("tier "));
     }
+    if vm {
+        notes.extend(vm_notes(cfg, src, &base, &types));
+        if let [one] = types.as_slice() {
+            base.server_type = Some(one.clone());
+        }
+        // `arena` → the newest arena image that fits (said now); with several types each create
+        // resolves its own (a snapshot fits a type's architecture and disk).
+        if types.len() <= 1 {
+            crate::pods::create::pin_vm_image("hetzner", cfg, &mut base).await?;
+        }
+    }
     let req = Request::from_flags(gpu.as_deref(), ov.cloud.as_deref(), &base, place.max_price, place.order)?
-        .with_near(arena_core::near::Near::for_provider(cfg, owner.name())?, owner.name(), &base);
+        .with_near(arena_core::near::Near::for_provider(cfg, owner.name())?, owner.name(), &base)
+        .with_server_types(&types);
     if owner.name() != "hetzner" && req.gpus.iter().any(|g| g.trim().is_empty()) {
         anyhow::bail!(
             "couldn't determine a GPU type for the replacement (the API doesn't report it and \
@@ -191,6 +259,28 @@ pub(crate) async fn plan_replacement(
         plan_placement(cfg, owner.name(), &req, &base).await?
     };
     Ok(Replacement { base, plan, notes })
+}
+
+/// What a Hetzner replacement's plan says besides its spec: which server type and where from,
+/// and where it may land — a server can't move, so a new one goes wherever `HETZNER_LOCATION`
+/// allows (any location by default: nearest first, the next when one has no room), which may
+/// not be the source's. Pure.
+fn vm_notes(cfg: &Config, src: &arena_core::Pod, base: &PodSpec, types: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let source_type = src.gpu_type.as_deref().or(base.server_type.as_deref()).unwrap_or("?");
+    out.push(match types {
+        [] => format!("server type {source_type}: the source's (--server-type to change it)"),
+        [one] if one == source_type => format!("server type {one}: the source's"),
+        [one] => format!("server type {one} (--server-type; the source is a {source_type})"),
+        many => format!("server types {} in that order (--server-type; the source is a {source_type})", many.join(", ")),
+    });
+    let opts = arena_core::provider::hetzner::HetznerOpts::from_config(cfg);
+    let at = src.location.as_deref().map(|l| format!("the source is in {l}; ")).unwrap_or_default();
+    out.push(format!(
+        "location: {at}the new VM goes where HETZNER_LOCATION allows — {} — so it may land in another location",
+        opts.locations.describe()
+    ));
+    out
 }
 
 /// The replacement's target in a plan: the spec of a single option, or the option table.
@@ -261,20 +351,26 @@ pub(crate) fn short_of<'a>(cfg: &Config, name: &'a str) -> &'a str {
 
 /// Write `~/.name` on pod `id` for the machine `name`, in setup's own format
 /// ([`arena_core::setup::name_file_command`], trailing newline included — live finding #26:
-/// the swap hand-rolled one without it). Re-resolves the endpoint first (within
+/// the swap hand-rolled one without it) — and on a VM named by its hostname (Hetzner:
+/// [`arena_core::setup::hostname_is_machine_name`]) the hostname too, as `pods rename` and
+/// setup set it ([`arena_core::setup::hostname_command`]; a swap used to leave a promoted VM
+/// called `<name>-new` in its prompt and banner). Re-resolves the endpoint first (within
 /// `wait_secs`). Never on a STOPPED pod — it's listed with the endpoint it had, which may be
 /// another pod's by now — and only on the pod itself ([`pod_guard`], in the same session): a
 /// write that reached another pod would label it as this machine in backups and metrics.
-/// `false` = it couldn't.
+/// `false` = it couldn't (all of it: the hostname is set only after `~/.name`).
 pub(crate) async fn write_name_file(remote: &dyn Remote, cfg: &Config, provider: &dyn Provider, id: &str, name: &str, wait_secs: u64) -> bool {
     let listed = provider.list_pods().await.ok().and_then(|ps| ps.into_iter().find(|p| p.id == id));
     if listed.is_some_and(|p| arena_core::status::is_stopped(&p.status)) {
         return false;
     }
-    let cmd = arena_core::replica::guarded(
-        pod_guard(provider, id).as_deref(),
-        &arena_core::setup::name_file_command(short_of(cfg, name)),
-    );
+    let mut script = arena_core::setup::name_file_command(short_of(cfg, name));
+    if arena_core::setup::hostname_is_machine_name(provider.name()) {
+        if let Some(h) = arena_core::setup::hostname_command(name) {
+            script = format!("{script} && {{ {h}; }}");
+        }
+    }
+    let cmd = arena_core::replica::guarded(pod_guard(provider, id).as_deref(), &script);
     match wait_for_endpoint(provider, id, wait_secs).await {
         Ok(p) => match SshTarget::from_pod(&p, cfg) {
             Ok(t) => remote.exec(&t, &cmd, Some(PROBE_TIMEOUT)).await.is_ok_and(|o| o.success),
@@ -301,10 +397,16 @@ pub(crate) async fn after_swap(
     old_id: &str,
     keys_dir: &str,
 ) {
+    // The reaper's record of each follows its pod's new name, as `pods rename` keeps it.
+    reap::renamed(cfg, owner.name(), old_id, parked);
+    reap::renamed(cfg, owner.name(), new_id, canonical);
+    let vm = arena_core::setup::hostname_is_machine_name(owner.name());
+    let what = if vm { "~/.name and the hostname" } else { "~/.name" };
     if !write_name_file(remote.as_ref(), cfg, owner, new_id, canonical, 60).await {
         eprintln!(
-            "      warning: couldn't update ~/.name on {canonical} — `arena pods setup {canonical}` writes it \
+            "      warning: couldn't update {what} on {canonical} — `arena pods setup {canonical}` writes {} \
              (until then backups/metrics label it {})",
+            if vm { "them" } else { "it" },
             short_of(cfg, staging)
         );
     }
@@ -317,13 +419,15 @@ pub(crate) async fn after_swap(
         .and_then(|ps| ps.into_iter().find(|p| p.id == old_id))
         .is_some_and(|p| !arena_core::status::is_stopped(&p.status) && p.ssh_ip.is_some());
     if old_up && !write_name_file(remote.as_ref(), cfg, owner, old_id, parked, 30).await {
-        eprintln!("      note: {parked}'s ~/.name still says {} (harmless once it's terminated)", short_of(cfg, canonical));
+        eprintln!("      note: {parked}'s {what} still say(s) {} (harmless once it's terminated)", short_of(cfg, canonical));
     }
-    println!(
-        "      note: {canonical}'s MACHINE_NAME env var still says {staging} — env is fixed at create (only a \
-         reimage, which wipes the disk, resets it); ~/.name carries {}.",
-        short_of(cfg, canonical)
-    );
+    if arena_core::setup::machine_name_in_env(owner.name()) {
+        println!(
+            "      note: {canonical}'s MACHINE_NAME env var still says {staging} — env is fixed at create (only a \
+             reimage, which wipes the disk, resets it); ~/.name carries {}.",
+            short_of(cfg, canonical)
+        );
+    }
     rekey_promoted(remote, cfg, owner, new_id, canonical, keys_dir).await;
 }
 
@@ -418,14 +522,18 @@ fn extra_keys_line(spec: &PodSpec) -> Option<String> {
     ))
 }
 
-/// Blue-green pod replacement: build a fresh pod from the source's spec, copy its files
-/// over, then rename-swap it into the canonical machine name (parking the old one as
-/// `<name>-old`). Identity-preserving — the proxy port / ssh-config (which key off the
-/// canonical name) carry straight over. Same spec as the source unless `ov` overrides it.
+/// Blue-green pod replacement: build a fresh pod from the source's spec (or take one arena
+/// already has: `--onto`, `--onto-spare`), copy its files over, then rename-swap it into the
+/// canonical machine name (parking the old one as `<name>-old`). Identity-preserving — the
+/// proxy port / ssh-config (which key off the canonical name) carry straight over. Same spec
+/// as the source unless `ov` / `--server-type` overrides it.
 ///
 /// Ordering is chosen so nothing is destroyed until the replacement is built **and**
 /// verified, and there's a manual gate right before the swap. The swap renames old-first so
-/// two pods never share the canonical name; if the promote fails it rolls back.
+/// two pods never share the canonical name (a rename frees a name at once: no delete-then-wait
+/// for it, as a hand-made swap had); if the promote fails it rolls back. A pod someone is on
+/// (an SSH session, a VS Code server) is refused before anything is made, and again right
+/// before the swap — `migrate` is the move for a pod in use — unless `--force`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_replace(
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
@@ -436,6 +544,7 @@ pub(crate) async fn handle_replace(
     target: &str,
     ov: &SpecOverrides,
     place: &PlaceFlags,
+    source: Source,
     opts: ReplaceOpts,
     interrupt: &Interrupt,
     // Where the new pod's price is remembered for the balance.
@@ -449,9 +558,24 @@ pub(crate) async fn handle_replace(
     // name or a raw id, so read the canonical name back from the fleet rather than trusting
     // the argument (a user may pass an id).
     let (owner, src_id, src_label) = resolve_target_any(cfg, target).await?;
+    // The owner's creates and terminates go into the spend ledger as they happen, the new pod
+    // under the replaced machine's owner (`arena spend`).
+    let tracking = crate::spend::SpendCtx::from_config(cfg);
+    let owner = crate::spend::Tracked::new(owner.as_ref(), &tracking, arena_core::spend::OwnerRule::Inherit);
+    let spares = adopt::spares_for(&owner, cfg);
     let keys = keys_dir(cfg);
-    let job = ReplaceJob { setup_timeouts, ov, place, opts, interrupt, keys_dir: &keys, balance: Some(bal) };
-    replace_on(remote, fleet, cfg, owner.as_ref(), src_id, src_label, job).await
+    let job = ReplaceJob {
+        setup_timeouts,
+        ov,
+        place,
+        opts,
+        interrupt,
+        keys_dir: &keys,
+        balance: Some(bal),
+        source,
+        spares: spares.as_deref(),
+    };
+    replace_on(remote, fleet, cfg, &owner, src_id, src_label, job).await
 }
 
 /// The flags of a replace (or `migrate copy`) only some providers honour, as given — checked
@@ -474,6 +598,8 @@ pub(crate) struct ReplaceOpts {
     pub skip_proxy: bool,
     pub dry_run: bool,
     pub yes: bool,
+    /// Replace it with someone on it; take a cohort machine with `--onto`.
+    pub force: bool,
 }
 
 /// Everything [`replace_on`] needs besides the pods and providers.
@@ -488,6 +614,90 @@ pub(crate) struct ReplaceJob<'a> {
     /// Where the new pod's price is remembered for the balance ([`create_replacement`]);
     /// `None`: not remembered.
     pub balance: Option<&'a money::BalanceCtx>,
+    /// Where the new pod comes from: created, or `--onto` / `--onto-spare`.
+    pub source: Source,
+    /// The owner's capacity spares (Hetzner), for `--onto-spare` / `--onto <spare>`.
+    pub spares: Option<&'a dyn SpareCloud>,
+}
+
+/// How long a new pod's endpoint must hold still before it's set up: a RunPod pod's ip:port
+/// churns while it's placed, and a still-moving pod can reset its disk; a VM's address is its
+/// own for life (Hetzner), so it has nothing to settle.
+pub(crate) fn settle_secs(provider: &str) -> u64 {
+    if provider == "hetzner" {
+        0
+    } else {
+        90
+    }
+}
+
+/// The note when a new VM is somewhere else than the one it replaces (Hetzner: a server can't
+/// move; a create walks every location `HETZNER_LOCATION` allows, and a machine taken with
+/// `--onto`/`--onto-spare` is where it was made). `None`: same place, or not known. Pure.
+pub(crate) fn moved_note(src: &arena_core::Pod, new: &arena_core::Pod, new_name: &str, taken: bool) -> Option<String> {
+    let (from, to) = (src.location.as_deref()?, new.location.as_deref()?);
+    let key = |l: &str| l.split_whitespace().next().unwrap_or("").to_string();
+    let why = if taken { "it was made there" } else { "HETZNER_LOCATION allowed it there" };
+    (key(from) != key(to))
+        .then(|| format!("note: {new_name} is in {to}, not {from} like {} — {why} (latency to it may differ)", src.name))
+}
+
+/// `--onto <pod>` / `--onto-spare` take a machine as it is: a flag that shapes a create is
+/// refused next to them, never dropped (`--server-type` with `--onto-spare` picks the spare's
+/// type, so it's allowed there). Pure.
+pub(crate) fn refuse_shaping_with_onto(source: &Source, ov: &SpecOverrides, place: &PlaceFlags) -> Result<()> {
+    let mut given: Vec<&str> = [
+        ov.gpu.as_ref().map(|_| "--gpu"),
+        ov.gpus.map(|_| "--gpus"),
+        ov.cloud.as_ref().map(|_| "--cloud"),
+        ov.disk.map(|_| "--disk"),
+        ov.volume.map(|_| "--volume"),
+        ov.image.as_ref().map(|_| "--image"),
+        ov.bootstrap.then_some("--bootstrap"),
+        place.max_price.map(|_| "--max-price"),
+        place.keep_trying.then_some("--keep-trying"),
+        (place.retry_mins > 0).then_some("--retry-mins"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if matches!(source, Source::Onto(_)) && place.server_type.is_some() {
+        given.push("--server-type");
+    }
+    if given.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} shape{} a new pod, and {} takes a machine as it is — drop {}",
+        given.join(" / "),
+        if given.len() == 1 { "s" } else { "" },
+        source.flag(),
+        if given.len() == 1 { "it" } else { "them" }
+    )
+}
+
+/// The refusal for moving `pod` with someone on it (or with no telling), naming what to use
+/// instead; `None` when no one is. `verb` / `alternative` are the command's.
+pub(crate) fn presence_refusal(verb: &str, pod: &str, presence: &arena_core::idle::Presence, alternative: &str) -> Option<String> {
+    adopt::presence_words(presence).map(|why| format!("refusing to {verb} {pod}: {why}. {alternative} Or pass --force."))
+}
+
+/// The refusal to swap `src` for `new_name` with someone on it (`--force`: none): what they write
+/// from now would stay behind on the parked pod. `when`: when they came on, for the message.
+async fn swap_presence_refusal(remote: &dyn Remote, cfg: &Config, src: &arena_core::Pod, new_name: &str, force: bool, when: &str) -> Option<String> {
+    if force {
+        return None;
+    }
+    let canonical = &src.name;
+    let presence = arena_core::idle::presence(&adopt::probe(remote, cfg, src).await);
+    adopt::presence_words(&presence).map(|why| {
+        format!(
+            "NOT swapping: {canonical} — {why} (they came on {when}). {new_name} is built and copied, and {canonical} is \
+             untouched. Once they're off, `arena pods migrate cutover {canonical}` syncs what changed and swaps (it checks \
+             again; --force swaps anyway), then `arena pods migrate finish {canonical}`; or drop it with `arena pods \
+             terminate {new_name}`."
+        )
+    })
 }
 
 /// [`handle_replace`] once the source pod (`src_id`) and the backend that owns it are
@@ -501,7 +711,7 @@ pub(crate) async fn replace_on(
     src_label: String,
     job: ReplaceJob<'_>,
 ) -> Result<()> {
-    let ReplaceOpts { keep_old, skip_proxy, dry_run, yes } = job.opts;
+    let ReplaceOpts { keep_old, skip_proxy, dry_run, yes, force } = job.opts;
     let pods = owner.list_pods().await.context("listing pods for replace")?;
     let src = pods
         .iter()
@@ -546,8 +756,47 @@ pub(crate) async fn replace_on(
     if let (Some(r), false) = (&bad_floor, dry_run) {
         anyhow::bail!("{r}");
     }
+    // Nor one someone is on: the copy is taken once, and what they write after it stays behind
+    // on the old pod, which the swap retires. `migrate` copies while they work and cuts over
+    // when they're off (prod's swapper only took idle boxes too).
+    let busy_alternative = format!(
+        "`arena pods migrate copy {canonical}` copies while they work (repeatable), then `arena pods migrate cutover \
+         {canonical}` swaps once they're off."
+    );
+    let busy = if force || stopped.is_some() {
+        None
+    } else {
+        let presence = arena_core::idle::presence(&adopt::probe(remote.as_ref(), cfg, &src).await);
+        presence_refusal("replace", &canonical, &presence, &busy_alternative)
+    };
+    if let (Some(r), false) = (&busy, dry_run) {
+        anyhow::bail!("{r}");
+    }
 
-    let rep = plan_replacement(cfg, owner, &src, job.ov, job.place).await?;
+    // Where the new pod comes from: a create (planned), or a machine arena has (found).
+    let types = server_types(owner.name(), job.place.server_type.as_deref())?;
+    let (rep, onto) = match &job.source {
+        Source::Create => (Some(plan_replacement(cfg, owner, &src, job.ov, job.place).await?), None),
+        other => {
+            refuse_shaping_with_onto(other, job.ov, job.place)?;
+            let onto = adopt::find(owner, job.spares, cfg, &canonical, &pods, other, &types).await?;
+            if let Some(r) = adopt::onto_refusal(&src, &onto) {
+                anyhow::bail!("{r}");
+            }
+            (None, Some(onto))
+        }
+    };
+    // Someone's machine (a cohort one) is refused without --force, saying what's on it.
+    let someones = match (&onto, force) {
+        (Some(o), false) if adopt::listed_machine(cfg, &o.pod.name) && !o.spare => {
+            let probe = adopt::probe(remote.as_ref(), cfg, &o.pod).await;
+            adopt::someones_refusal(cfg, &canonical, o, &probe)
+        }
+        _ => None,
+    };
+    if let (Some(r), false) = (&someones, dry_run) {
+        anyhow::bail!("{r}");
+    }
 
     // Pre-flight: a leftover -new/-old from a prior aborted run is a resume signal, not a
     // fresh start — flag it so the operator cleans up rather than colliding.
@@ -563,14 +812,27 @@ pub(crate) async fn replace_on(
 
     // Print the plan.
     println!("Replace {canonical}  (id={src_id}, {})", owner.name());
-    print_replacement_plan(owner, &rep, &new_name);
+    match (&rep, &onto) {
+        (Some(rep), _) => print_replacement_plan(owner, rep, &new_name),
+        (None, Some(o)) => println!("  target: {}", adopt::take_line(o, &new_name)),
+        (None, None) => {}
+    }
+    let vm = arena_core::setup::hostname_is_machine_name(owner.name());
+    let names = if vm { "~/.name, hostname" } else { "~/.name" };
     println!("  pipeline:");
-    println!("    1. create   {new_name}");
+    match &onto {
+        None => println!("    1. create   {new_name}"),
+        Some(o) => println!("    1. take     {} as {new_name}", o.pod.name),
+    }
     println!("    2. setup    {new_name}   (deploy key, ssh config, repo, ~/.name={} until the swap)", short_of(cfg, &new_name));
     println!("    3. copy     {canonical} -> {new_name}   ({})", copy_scope_line());
-    println!("    4. verify   {new_name}   (the copy read back on the right pod, ssh + GPU health check, maintenance window)");
     println!(
-        "    5. swap     rename {canonical} -> {old_name}, then {new_name} -> {canonical} (+ ~/.name, API keys under {canonical})"
+        "    4. verify   {new_name}   (the copy read back on the right pod, {}, maintenance window)",
+        if vm { "ssh health check" } else { "ssh + GPU health check" }
+    );
+    println!(
+        "    5. swap     {}rename {canonical} -> {old_name}, then {new_name} -> {canonical} (+ {names}, API keys under {canonical})",
+        if force { "" } else { "no one on it? then " }
     );
     if skip_proxy {
         println!("    6. proxy    SKIPPED (--skip-proxy) — run `arena proxy apply` yourself");
@@ -584,7 +846,7 @@ pub(crate) async fn replace_on(
     }
 
     if dry_run {
-        for r in [&locked, &stopped, &reaping, &bad_floor].into_iter().flatten() {
+        for r in [&locked, &stopped, &reaping, &bad_floor, &busy, &someones].into_iter().flatten() {
             println!();
             print_would_refuse(r);
         }
@@ -599,13 +861,17 @@ pub(crate) async fn replace_on(
              before running again (`arena pods terminate <name>`)"
         );
     }
-    if rep.plan.options.is_empty() {
+    if rep.as_ref().is_some_and(|r| r.plan.options.is_empty()) {
         anyhow::bail!("nothing to create: no option left to try (see the table above, or `arena offers`)");
     }
+    let first = match &onto {
+        None => format!("build {new_name}"),
+        Some(o) => format!("take {} as {new_name}", o.pod.name),
+    };
     if !confirm(
         yes,
         &format!(
-            "Will build {new_name}, copy {canonical}'s files onto it, verify, then swap it in as \
+            "Will {first}, copy {canonical}'s files onto it, verify, then swap it in as \
              {canonical} (old parked as {old_name}{}).",
             if keep_old { ", kept" } else { ", then terminated" }
         ),
@@ -617,28 +883,45 @@ pub(crate) async fn replace_on(
     let policy = arena_core::retry::RetryPolicy::default();
 
     // [1/7] create the replacement under the staging name — on the first option with
-    // capacity (several with a --gpu/--cloud list), retried while --retry-mins allows.
-    println!("[1/7] creating {new_name}…");
-    let created = create_replacement(owner, &rep, &new_name, job.place, job.interrupt, job.balance).await?;
-    println!("      created {new_name} id={}", created.id);
+    // capacity (several with a --gpu/--cloud/--server-type list), retried while --retry-mins /
+    // --keep-trying allows — or take the machine named.
+    let (created, fresh) = match (&rep, &onto) {
+        (Some(rep), _) => {
+            println!("[1/7] creating {new_name}…");
+            let created = create_replacement(owner, rep, &new_name, job.place, job.interrupt, job.balance).await?;
+            println!("      created {new_name} id={}", created.id);
+            (created, true)
+        }
+        (None, Some(o)) => {
+            println!("[1/7] taking {} as {new_name}…", o.pod.name);
+            adopt::take(owner, job.spares, cfg, o, &new_name).await?;
+            println!("      {}", adopt::taken_line(o, &new_name));
+            (arena_core::Pod { name: new_name.clone(), ..o.pod.clone() }, o.spare)
+        }
+        (None, None) => anyhow::bail!("nothing to create or take"),
+    };
 
     // [2/7] wait for an SSH endpoint, then for it to STABILIZE. A freshly-created pod's
     // ip:port churns while RunPod places it, and a still-moving pod can migrate and reset its
     // container disk — wiping any setup+copy. Provisioning a *settled* pod avoids most of that.
-    println!("[2/7] waiting for {new_name} to come up and stabilize…");
+    let settle = settle_secs(owner.name());
+    println!("[2/7] waiting for {new_name} to come up{}…", if settle > 0 { " and stabilize" } else { "" });
     // RunPod can be slow to assign a fresh pod's SSH endpoint — 5+ min is not unusual,
     // especially on the secure tier — so give it a generous window before giving up.
-    wait_for_endpoint(owner, &created.id, 900)
+    let up = wait_for_endpoint(owner, &created.id, 900)
         .await
         .with_context(|| format!("{new_name} never came up — left in place for inspection"))?;
-    wait_for_stable_endpoint(owner, &created.id, 90, 600)
+    if let Some(n) = moved_note(&src, &up, &new_name, onto.is_some()) {
+        println!("      {n}");
+    }
+    wait_for_stable_endpoint(owner, &created.id, settle, 600)
         .await
         .with_context(|| format!("{new_name}'s endpoint never stabilized"))?;
 
     // [3-5/7] provision + copy, then confirm the copy SURVIVES a settle window. Even a settled
     // pod can still migrate and reset to image state (losing setup AND the copy), so re-do
     // setup+copy until the delivery marker is still present after a wait — or give up (no swap,
-    // original untouched).
+    // original untouched). A VM's disk doesn't reset under it: no wait there.
     let copy_attempts = 3;
     let mut persisted = false;
     for attempt in 1..=copy_attempts {
@@ -649,18 +932,23 @@ pub(crate) async fn replace_on(
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
         println!("[4/7] copying {canonical} → {new_name} ({})…", copy_scope_line());
-        // A pod made for this replace: its copy baseline starts now.
-        copy_pod_files(cfg, owner, remote.as_ref(), &src_id, &created.id, &CopyOpts::new(true))
+        // A pod made for this replace (or a spare): its copy baseline starts now. A machine
+        // taken with --onto keeps everything the copy replaces on it, moved aside.
+        copy_pod_files(cfg, owner, remote.as_ref(), &src_id, &created.id, &CopyOpts::new(fresh))
             .await
             .with_context(|| replace_copy_failed(&canonical, &new_name))?;
-        println!("[5/7] confirming the copy persists (~90s — pods can reset while still settling)…");
-        tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+        if settle > 0 {
+            println!("[5/7] confirming the copy persists (~90s — pods can reset while still settling)…");
+            tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+        } else {
+            println!("[5/7] confirming the copy is there…");
+        }
         if marker_present(owner, remote.as_ref(), &created.id, cfg).await {
             persisted = true;
             break;
         }
         eprintln!("      {new_name} reset to image state (lost setup+copy) — re-provisioning…");
-        let _ = wait_for_stable_endpoint(owner, &created.id, 90, 600).await;
+        let _ = wait_for_stable_endpoint(owner, &created.id, settle, 600).await;
     }
     if !persisted {
         anyhow::bail!(
@@ -685,6 +973,10 @@ pub(crate) async fn replace_on(
              then, wiping its container disk. {old_name} will be KEPT after the swap."
         );
     }
+    // Someone may have come on while it copied: what they write from now would stay behind.
+    if let Some(r) = swap_presence_refusal(remote.as_ref(), cfg, &src, &new_name, force, "while it copied").await {
+        anyhow::bail!("{r}");
+    }
 
     // Manual gate: nothing destructive has happened yet. A "no" leaves the built+copied
     // replacement in place under its staging name for inspection.
@@ -701,6 +993,25 @@ pub(crate) async fn replace_on(
              re-run or remove it with `arena pods terminate {new_name}`."
         );
         return Ok(());
+    }
+
+    // Asked again after the prompt (review r2: someone may come on while it waits), then what
+    // changed on the original since the copy goes over — the same copy, incremental — right
+    // before the swap, so a write in that gap isn't left behind on the parked pod.
+    if let Some(r) = swap_presence_refusal(remote.as_ref(), cfg, &src, &new_name, force, "while the prompt waited").await {
+        anyhow::bail!("{r}");
+    }
+    println!("      final sync of what changed on {canonical} since the copy…");
+    copy_pod_files(cfg, owner, remote.as_ref(), &src_id, &created.id, &CopyOpts::new(false)).await.with_context(|| {
+        format!(
+            "the final sync {canonical} -> {new_name} — NOT swapping; {canonical} is untouched. `arena pods migrate cutover \
+             {canonical}` syncs again and swaps, or drop {new_name} with `arena pods terminate {new_name}`"
+        )
+    })?;
+    clean_marker(owner, remote.as_ref(), &created.id, cfg).await;
+    // And once more after that transfer, right before the first rename (review r3).
+    if let Some(r) = swap_presence_refusal(remote.as_ref(), cfg, &src, &new_name, force, "during the final sync").await {
+        anyhow::bail!("{r}");
     }
 
     // [6/7] swap. Old-first so the canonical name is never held by two pods at once. If the
@@ -898,17 +1209,18 @@ pub(crate) fn copy_marker_token(dest_id: &str) -> String {
 }
 
 /// Is the copy marker present on pod `dest_id` *with the right token, on the right pod*?
-/// Re-resolves the endpoint fresh, confirms identity via `RUNPOD_POD_ID` (from
-/// `/proc/1/environ` — it's not in the non-interactive ssh env but is in PID 1's), and reads
-/// the marker. Any failure (unreachable, wrong recycled-port pod, marker gone, a probe that
-/// ran out of its `PROBE_TIMEOUT`) → false.
+/// Re-resolves the endpoint fresh, confirms identity — the machine's own id
+/// ([`arena_core::replica::id_probe`]: RunPod's `RUNPOD_POD_ID` from `/proc/1/environ`, which
+/// isn't in the non-interactive ssh env but is in PID 1's; a Hetzner VM's server id) — and
+/// reads the marker. Any failure (unreachable, wrong recycled-port pod, marker gone, a probe
+/// that ran out of its `PROBE_TIMEOUT`) → false.
 pub(crate) async fn marker_present(provider: &dyn Provider, remote: &dyn Remote, dest_id: &str, cfg: &Config) -> bool {
     let token = copy_marker_token(dest_id);
     let Ok(target) = fresh_target(provider, dest_id, cfg).await else { return false };
+    let id_probe = arena_core::replica::id_probe(provider.name());
     let probe = format!(
-        "printf 'ID=%s\\nMARK=%s\\n' \
-         \"$(tr '\\0' '\\n' < /proc/1/environ 2>/dev/null | sed -n 's/^RUNPOD_POD_ID=//p')\" \
-         \"$(cat \"{}\" 2>/dev/null)\"",
+        "printf 'ID=%s\\nMARK=%s\\n' \"$({})\" \"$(cat \"{}\" 2>/dev/null)\"",
+        id_probe.as_deref().unwrap_or("true"),
         copy_marker_path()
     );
     let Ok(o) = remote.exec(&target, &probe, Some(PROBE_TIMEOUT)).await else { return false };
@@ -920,30 +1232,28 @@ pub(crate) async fn marker_present(provider: &dyn Provider, remote: &dyn Remote,
         if let Some(v) = line.strip_prefix("ID=") { pid = v.trim().to_string(); }
         if let Some(v) = line.strip_prefix("MARK=") { mark = v.trim().to_string(); }
     }
-    // Identity: on RunPod, FAIL CLOSED — require a non-empty RUNPOD_POD_ID that matches. An
-    // empty read on a recycled-port pod (or one that can't expose the id) must not be treated
-    // as "right pod"; the marker token alone can ride along a copy that landed on the wrong
-    // pod. Only non-RunPod providers (no such id) fall back to token-only.
-    let identity_ok = if provider.name() == "runpod" { pid == dest_id } else { pid.is_empty() || pid == dest_id };
+    // Identity: where the machine shows its id (RunPod, Hetzner), FAIL CLOSED — require a
+    // non-empty id that matches. An empty read on a recycled endpoint (or one that can't expose
+    // the id) must not be treated as "right pod"; the marker token alone can ride along a copy
+    // that landed on the wrong pod. Only providers with no such id fall back to token-only.
+    let identity_ok = if id_probe.is_some() { pid == dest_id } else { pid.is_empty() || pid == dest_id };
     mark == token && identity_ok
 }
 
-/// Confirm the pod answering at `target` really is `expected_id` (via `RUNPOD_POD_ID` in
-/// PID 1's env). On RunPod, fail closed: a mismatch/empty means a recycled ip:port reached a
-/// DIFFERENT pod, so we must not read from / write to it. Non-RunPod providers (no such id)
-/// pass. Used to identity-check the SOURCE before copying (the dest is checked separately).
-/// A probe that times out (`PROBE_TIMEOUT`) is "couldn't confirm" → false.
+/// Confirm the pod answering at `target` really is `expected_id` (its own id:
+/// [`arena_core::replica::id_probe`] — RunPod's `RUNPOD_POD_ID` in PID 1's env, a Hetzner VM's
+/// server id). Fail closed: a mismatch/empty means a recycled endpoint reached a DIFFERENT
+/// machine, so we must not read from / write to it. Providers whose machines show no id pass.
+/// Used to identity-check the SOURCE before copying (the dest is checked separately). A probe
+/// that times out (`PROBE_TIMEOUT`) is "couldn't confirm" → false.
 pub(crate) async fn target_is_pod(
     remote: &dyn Remote,
     target: &arena_core::ssh::SshTarget,
     expected_id: &str,
     provider: &dyn Provider,
 ) -> bool {
-    if provider.name() != "runpod" {
-        return true;
-    }
-    let probe = "tr '\\0' '\\n' < /proc/1/environ 2>/dev/null | sed -n 's/^RUNPOD_POD_ID=//p'";
-    matches!(remote.exec(target, probe, Some(PROBE_TIMEOUT)).await, Ok(o) if o.success && o.stdout.trim() == expected_id)
+    let Some(probe) = arena_core::replica::id_probe(provider.name()) else { return true };
+    matches!(remote.exec(target, &probe, Some(PROBE_TIMEOUT)).await, Ok(o) if o.success && o.stdout.trim() == expected_id)
 }
 
 /// Best-effort removal of the copy marker from a pod.

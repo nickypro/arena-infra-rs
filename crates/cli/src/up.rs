@@ -2323,6 +2323,7 @@ mod tests {
             max_price: None,
             order: Order::Listed,
             near: None,
+            server_types: Vec::new(),
         };
         plan_options(&req, "runpod", &PriceBook::runpod(Vec::new()))
     }

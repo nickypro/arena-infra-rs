@@ -589,6 +589,52 @@ impl crate::image::cloud::ImageCloud for HetznerProvider {
     }
 }
 
+#[async_trait]
+impl crate::spare::SpareCloud for HetznerProvider {
+    /// `GET /servers?label_selector=arena-spare=<prefix>` — the one listing that sees them.
+    async fn spares(&self) -> Result<Vec<Pod>> {
+        let sel = crate::spare::selector(&self.opts.image_scope.prefix);
+        Ok(self.get_all_where("servers", &[("label_selector", &sel)]).await?.iter().map(parse_server).collect())
+    }
+
+    /// Read the server (it must still be this cohort's spare called `name` — one taken or
+    /// renamed meanwhile is refused, nothing changed), then ONE `PUT /servers/{id}` with the new
+    /// name and its labels minus the spare mark ([`adopt_payload`]); the answer must name it as
+    /// asked ([`judge_rename`]). The caller holds [`crate::spare::claim_lock`] across both.
+    async fn adopt(&self, id: &str, name: &str, new_name: &str, retry: bool) -> Result<()> {
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::Config(format!("hetzner: `{id}` isn't a server id")));
+        }
+        let body = self
+            .get_one(&format!("servers/{id}"), "hetzner get server")
+            .await?
+            .ok_or_else(|| Error::provider(format!("hetzner: spare {id} is gone")))?;
+        let server = body.get("server").unwrap_or(&body);
+        let ours = crate::spare::label_value(&self.opts.image_scope.prefix);
+        let mark = server.pointer(&format!("/labels/{SPARE_LABEL}")).and_then(Value::as_str);
+        let now_named = server.get("name").and_then(Value::as_str).unwrap_or_default();
+        // Already done: this claim's retry, after a PUT that went through with its answer lost
+        // (never a first attempt: another run's claim of the same spare looks the same).
+        if retry && mark.is_none() && now_named == new_name {
+            return Ok(());
+        }
+        if mark != Some(ours.as_str()) || now_named != name {
+            return Err(Error::Provider {
+                kind: crate::error::ProviderErrorKind::Rejected,
+                message: format!(
+                    "hetzner: server {id} isn't this cohort's spare {name} any more (now `{now_named}`, {}) — another run took \
+                     it? Nothing was changed",
+                    mark.map_or_else(|| format!("no `{SPARE_LABEL}` label"), |m| format!("`{SPARE_LABEL}={m}`"))
+                ),
+            });
+        }
+        let payload = adopt_payload(new_name, server.get("labels").and_then(Value::as_object));
+        let rb = self.auth(self.client.put(format!("{}/servers/{id}", self.base)).json(&payload));
+        let (status, text) = crate::http::send_text(rb).await?;
+        judge_rename(status, &text, new_name)
+    }
+}
+
 /// A Hetzner server type as `arena offers` shows it: what `--server-type` names, its size, and
 /// its gross €/h (Hetzner bills in EUR; arena never converts it) in the first of `locations`.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
@@ -1206,6 +1252,54 @@ pub(crate) fn is_image_build_server(v: &Value) -> bool {
     v.get("labels").and_then(Value::as_object).is_some_and(|l| l.contains_key(crate::image::BUILD_LABEL))
 }
 
+/// Label on a capacity spare (`arena pods spare up`; value: the cohort prefix): a server arena
+/// created ahead of need, to be taken into the fleet by `pods migrate copy --onto-spare` /
+/// `replace --onto`. The fleet never lists one ([`Provider::list_pods`] leaves it out, like the
+/// archive and a bake VM): no backup, proxy forward, ssh-config block, key, reap or `--all` ever
+/// reaches it — it's nobody's machine yet. `pods spare list`, `pods list`'s footer, the balance,
+/// `arena spend` and `teardown --check` count it ([`crate::spare`]).
+pub const SPARE_LABEL: &str = "arena-spare";
+
+/// Whether a listed server is a capacity spare ([`SPARE_LABEL`], any cohort's).
+pub(crate) fn is_spare_server(v: &Value) -> bool {
+    v.get("labels").and_then(Value::as_object).is_some_and(|l| l.contains_key(SPARE_LABEL))
+}
+
+/// What a replacement of server `v` (a `GET /servers/{id}` item) is created from — the
+/// "same spec" half of `pods replace`/`migrate` ([`Provider::pod_spec`]): its server type, and
+/// its own labels except arena's (`arena-…`: a spare's mark, an archive's, a bake's — never a
+/// fleet machine's to pass on). Deliberately NOT its image: a VM is often months from the
+/// snapshot it booted, and the replacement boots what a create boots today (`HETZNER_IMAGE`,
+/// `--image`). Nor its location: a server can't move, and the replacement's create walks
+/// `HETZNER_LOCATION` like any other (it may land elsewhere — the plan says so). Pure.
+fn spec_of_server(v: &Value) -> PodSpec {
+    let labels: serde_json::Map<String, Value> = v
+        .get("labels")
+        .and_then(Value::as_object)
+        .map(|l| l.iter().filter(|(k, _)| !k.starts_with("arena-")).map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    let api_extra = (!labels.is_empty()).then(|| {
+        let mut m = serde_json::Map::new();
+        m.insert("labels".into(), Value::Object(labels));
+        m
+    });
+    PodSpec {
+        server_type: v.pointer("/server_type/name").and_then(Value::as_str).map(String::from),
+        api_extra,
+        ..PodSpec::default()
+    }
+}
+
+/// The `PUT /servers/{id}` body that takes a spare into the fleet as `new_name`: the name and
+/// its labels without [`SPARE_LABEL`] — one request, so it's never a spare under a fleet name
+/// nor a fleet machine under a spare's (Hetzner's update REPLACES the labels it's sent: every
+/// other one is sent back as it was). Pure.
+fn adopt_payload(new_name: &str, labels: Option<&serde_json::Map<String, Value>>) -> Value {
+    let kept: serde_json::Map<String, Value> =
+        labels.map(|l| l.iter().filter(|(k, _)| k.as_str() != SPARE_LABEL).map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
+    json!({ "name": new_name, "labels": kept })
+}
+
 /// The `PUT /servers/{id}` body of a rename: `name` and nothing else. Hetzner's update
 /// REPLACES a server's labels when `labels` is sent, so leaving it out keeps them all. None
 /// carries the machine name, so none needs to follow it: a cohort server's create sets no
@@ -1312,7 +1406,9 @@ impl Provider for HetznerProvider {
             let url = format!("{}/servers?page={page}&per_page={PER_PAGE}", self.base);
             let body = send_json(self.auth(self.client.get(url)), "hetzner list").await?;
             let (servers, next) = servers_page(&body)?;
-            out.extend(servers.iter().filter(|v| !is_archive_server(v) && !is_image_build_server(v)).map(parse_server));
+            out.extend(
+                servers.iter().filter(|v| !is_archive_server(v) && !is_image_build_server(v) && !is_spare_server(v)).map(parse_server),
+            );
             match next {
                 None => return Ok(out),
                 Some(n) if n > page => page = n,
@@ -1444,6 +1540,19 @@ impl Provider for HetznerProvider {
         let rb = self.auth(self.client.put(format!("{}/servers/{id}", self.base)).json(&rename_payload(new_name)));
         let (status, text) = crate::http::send_text(rb).await?;
         judge_rename(status, &text, new_name)
+    }
+
+    /// `GET /servers/{id}`: its server type and own labels ([`spec_of_server`]) — what
+    /// `pods replace`/`migrate` build the replacement from, before `--server-type` and config.
+    async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::Config(format!("hetzner: `{id}` isn't a server id")));
+        }
+        let body = self
+            .get_one(&format!("servers/{id}"), "hetzner get server")
+            .await?
+            .ok_or_else(|| Error::provider(format!("hetzner get server: no server {id} in this project (gone?)")))?;
+        Ok(spec_of_server(body.get("server").unwrap_or(&body)))
     }
 
     fn check_create_extra(&self, extra: &Extra) -> Result<()> {
@@ -2756,5 +2865,104 @@ mod tests {
         let p = provider(&srv.base, HetznerOpts::default());
         let e = crate::ratelimit::waits_within(std::time::Duration::ZERO, p.rename_pod("1", "devtest-bravo")).await.unwrap_err();
         assert_eq!(e.kind(), Some(K::RateLimited), "{e}");
+    }
+
+    /// `pods replace`/`migrate` on Hetzner (prod 2026-10-30: "spec snapshot not supported on
+    /// provider `hetzner`"): the replacement's spec is the source's server type and its own
+    /// labels — never arena's (`arena-…`), never its image (a months-old snapshot) — over the
+    /// real request path; a gone server says so, and an id that isn't one makes no request.
+    #[tokio::test]
+    async fn a_servers_spec_is_its_type_and_own_labels() {
+        use crate::http::test_server::{canned, serve};
+        let server = json!({"server": {"id": 42, "name": "arena9-apple", "status": "running",
+            "server_type": {"name": "cx33"}, "image": {"id": 1234, "type": "snapshot"},
+            "location": {"name": "nbg1"},
+            "labels": {"team": "red", "arena-spare": "arena9", "arena-prefix": "arena9"}}});
+        let srv = serve(vec![
+            canned(200, "application/json", &server.to_string()),
+            canned(404, "application/json", r#"{"error":{"code":"not_found","message":"server not found"}}"#),
+        ]);
+        let p = provider(&srv.base, HetznerOpts::default());
+        let spec = p.pod_spec("42").await.unwrap();
+        assert_eq!(spec.server_type.as_deref(), Some("cx33"));
+        assert_eq!(spec.vm_image, None, "the replacement boots what a create boots today, not the source's snapshot");
+        assert_eq!(spec.api_extra.unwrap(), json!({"labels": {"team": "red"}}).as_object().unwrap().clone());
+        let e = p.pod_spec("43").await.unwrap_err().to_string();
+        assert!(e.contains("no server 43"), "{e}");
+        assert_eq!(*srv.requests.lock().unwrap(), ["GET /servers/42 HTTP/1.1", "GET /servers/43 HTTP/1.1"]);
+        assert!(matches!(p.pod_spec("1/actions/poweroff").await, Err(Error::Config(_))));
+        // A server with no label of its own carries none (CREATE_EXTRA_JSON's still apply).
+        let bare = spec_of_server(&json!({"server_type": {"name": "cx23"}, "labels": {"arena-archive": "x"}}));
+        assert!(bare.api_extra.is_none());
+        assert_eq!(bare.server_type.as_deref(), Some("cx23"));
+    }
+
+    /// Spares are no fleet machine: the fleet listing leaves out every `arena-spare` server (any
+    /// cohort's); only the spare listing (by this cohort's label) sees them.
+    #[tokio::test]
+    async fn spares_are_left_out_of_the_fleet_and_listed_by_their_label() {
+        use crate::http::test_server::{canned, serve};
+        use crate::spare::SpareCloud;
+        let servers = json!({"servers": [
+            {"id": 1, "name": "arena9-apple", "status": "running", "labels": {}},
+            {"id": 2, "name": "arena9-spare-1", "status": "running", "labels": {"arena-spare": "arena9"}},
+            {"id": 3, "name": "arena8-spare-1", "status": "running", "labels": {"arena-spare": "arena8"}},
+        ], "meta": {"pagination": {"page": 1, "next_page": null}}});
+        let spares = json!({"servers": [
+            {"id": 2, "name": "arena9-spare-1", "status": "running", "labels": {"arena-spare": "arena9"},
+             "server_type": {"name": "cx43"}, "public_net": {"ipv4": {"ip": "1.2.3.4"}}},
+        ], "meta": {"pagination": {"page": 1, "next_page": null}}});
+        let srv = serve(vec![canned(200, "application/json", &servers.to_string()), canned(200, "application/json", &spares.to_string())]);
+        let opts = HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=arena9\n"));
+        let p = provider(&srv.base, opts);
+        let fleet: Vec<String> = p.list_pods().await.unwrap().into_iter().map(|s| s.name).collect();
+        assert_eq!(fleet, ["arena9-apple"]);
+        let got = p.spares().await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].name.as_str(), got[0].gpu_type.as_deref(), got[0].ssh_ip.as_deref()), ("arena9-spare-1", Some("cx43"), Some("1.2.3.4")));
+        assert_eq!(
+            srv.requests.lock().unwrap()[1],
+            "GET /servers?label_selector=arena-spare%3Darena9&page=1&per_page=50 HTTP/1.1"
+        );
+    }
+
+    /// Taking a spare: one PUT with the new name and every label but the spare mark (Hetzner
+    /// replaces the labels it's sent); a server that isn't a spare (taken meanwhile) is refused
+    /// without a PUT.
+    #[tokio::test]
+    async fn adopting_a_spare_renames_it_and_drops_its_mark_in_one_put() {
+        use crate::http::test_server::{canned, serve};
+        use crate::spare::SpareCloud;
+        let spare = json!({"server": {"id": 7, "name": "arena9-spare-2", "labels": {"arena-spare": "arena9", "team": "red"}}});
+        let srv = serve(vec![canned(200, "application/json", &spare.to_string()), canned(200, "application/json", &renamed_server("arena9-apple-new"))]);
+        let arena9 = || HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=arena9\n"));
+        let p = provider(&srv.base, arena9());
+        p.adopt("7", "arena9-spare-2", "arena9-apple-new", false).await.unwrap();
+        assert_eq!(*srv.requests.lock().unwrap(), ["GET /servers/7 HTTP/1.1", "PUT /servers/7 HTTP/1.1"]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&srv.bodies.lock().unwrap()[1]).unwrap(),
+            json!({"name": "arena9-apple-new", "labels": {"team": "red"}})
+        );
+        // Taken meanwhile (renamed, unmarked), another cohort's, or renamed: refused, no PUT.
+        for server in [
+            json!({"server": {"id": 7, "name": "arena9-pear-new", "labels": {}}}),
+            json!({"server": {"id": 7, "name": "arena9-spare-2", "labels": {"arena-spare": "arena8"}}}),
+            json!({"server": {"id": 7, "name": "arena9-spare-9", "labels": {"arena-spare": "arena9"}}}),
+        ] {
+            let srv = serve(vec![canned(200, "application/json", &server.to_string())]);
+            let e = provider(&srv.base, arena9()).adopt("7", "arena9-spare-2", "arena9-apple-new", false).await.unwrap_err();
+            assert_eq!(e.kind(), Some(crate::error::ProviderErrorKind::Rejected));
+            assert!(e.to_string().contains("isn't this cohort's spare arena9-spare-2 any more"), "{e}");
+            assert_eq!(srv.requests.lock().unwrap().len(), 1, "no PUT");
+        }
+        // A retry after a PUT whose answer was lost: already done, no second PUT. A first
+        // attempt that finds it so is another run's claim: refused.
+        let done = json!({"server": {"id": 7, "name": "arena9-apple-new", "labels": {"team": "red"}}});
+        let srv = serve(vec![canned(200, "application/json", &done.to_string()), canned(200, "application/json", &done.to_string())]);
+        provider(&srv.base, arena9()).adopt("7", "arena9-spare-2", "arena9-apple-new", true).await.unwrap();
+        let e = provider(&srv.base, arena9()).adopt("7", "arena9-spare-2", "arena9-apple-new", false).await.unwrap_err();
+        assert!(e.to_string().contains("another run took"), "{e}");
+        assert_eq!(srv.requests.lock().unwrap().len(), 2, "no PUT");
+        assert_eq!(adopt_payload("x", None), json!({"name": "x", "labels": {}}));
     }
 }

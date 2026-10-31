@@ -48,7 +48,7 @@ pub(crate) async fn handle_teardown(provider: &dyn Provider, cfg: &Config, check
     let cloud = arena_core::archive::archive_token(cfg).map(|(t, _)| arena_core::archive::HetznerArchiveCloud::new(t));
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
     let archive = read_archive_priced(cloud.as_ref().map(|c| c as &dyn ArchiveCloud), &prefix);
-    teardown_with(provider, cfg, read_volumes(cfg), read_shadeform_volumes(cfg), archive, read_images(cfg), keys, &SystemSched, json, &bal).await
+    teardown_with(provider, cfg, read_volumes(cfg), read_shadeform_volumes(cfg), archive, read_hetzner(cfg), keys, &SystemSched, json, &bal).await
 }
 
 /// The check against these sources (the real ones, or fakes in tests): print the checklist
@@ -62,13 +62,13 @@ pub(crate) async fn teardown_with(
     volumes: impl Future<Output = Probe<Vec<NetworkVolume>>>,
     sf_volumes: impl Future<Output = Probe<Vec<ShadeformVolume>>>,
     archive: impl Future<Output = (Probe<Inventory>, Prices)>,
-    images: impl Future<Output = Probe<arena_core::image::Inventory>>,
+    hetzner: impl Future<Output = HetznerReads>,
     keys: Option<&dyn KeyApi>,
     sched: &dyn Sched,
     json: bool,
     bal: &BalanceCtx,
 ) -> Result<()> {
-    let report = collect(provider, cfg, volumes, sf_volumes, archive, images, keys, sched, bal).await;
+    let report = collect(provider, cfg, volumes, sf_volumes, archive, hetzner, keys, sched, bal).await;
     print!("{}", render_output(&report, json)?);
     exit_status(&report)
 }
@@ -106,7 +106,7 @@ async fn collect(
     volumes: impl Future<Output = Probe<Vec<NetworkVolume>>>,
     sf_volumes: impl Future<Output = Probe<Vec<ShadeformVolume>>>,
     archive: impl Future<Output = (Probe<Inventory>, Prices)>,
-    images: impl Future<Output = Probe<arena_core::image::Inventory>>,
+    hetzner: impl Future<Output = HetznerReads>,
     keys: Option<&dyn KeyApi>,
     sched: &dyn Sched,
     bal: &BalanceCtx,
@@ -117,12 +117,12 @@ async fn collect(
     let observing = balance::observe(bal.api.as_ref(), &state, mode, balance::INLINE_TIMEOUT, now);
     // `list_by_provider`, not `list_pods`: the fleet's `list_pods` drops a backend that
     // failed, which here would read as "that provider has no pods".
-    let (listings, volumes, shadeform_volumes, (archive, archive_prices), images, keys, cron, at, fetched) = tokio::join!(
+    let (listings, volumes, shadeform_volumes, (archive, archive_prices), hetzner, keys, cron, at, fetched) = tokio::join!(
         provider.list_by_provider(),
         volumes,
         sf_volumes,
         archive,
-        images,
+        hetzner,
         read_keys(keys),
         read_cron(sched),
         read_at(sched),
@@ -143,6 +143,10 @@ async fn collect(
     if let Probe::Got(k) = &keys {
         tracking.keys(k, now);
     }
+    let HetznerReads { images, spares } = hetzner;
+    if let Probe::Got(sp) = &spares {
+        tracking.spares("hetzner", sp, now);
+    }
     // A malformed ARCHIVE_KEEP_UNTIL keeps nothing (the archive then shows as remaining).
     let archive_keep_until = arena_core::archive::keep_until_from_config(cfg).unwrap_or_else(|e| {
         eprintln!("warning: {e} — the archive is judged as if no retention date were set");
@@ -162,6 +166,7 @@ async fn collect(
         archive_prices,
         today_days: arena_core::schedule::days_from_unix(now),
         images,
+        spares,
         now,
         // Local and read-only: what arena left on this box (none looked for in this crate's
         // tests unless asked, `disk::live`).
@@ -256,6 +261,32 @@ pub(crate) async fn read_archive_priced(cloud: Option<&dyn ArchiveCloud>, prefix
         _ => Prices::LIST,
     };
     (probe, prices)
+}
+
+/// What teardown reads from the fleet's Hetzner project besides its servers: the snapshots and
+/// bake VMs ([`read_images`]) and the capacity spares.
+pub(crate) struct HetznerReads {
+    pub images: Probe<arena_core::image::Inventory>,
+    pub spares: Probe<Vec<arena_core::Pod>>,
+}
+
+/// [`HetznerReads`], each read bounded, all at once.
+async fn read_hetzner(cfg: &Config) -> HetznerReads {
+    let (images, spares) = tokio::join!(read_images(cfg), read_spares(cfg));
+    HetznerReads { images, spares }
+}
+
+/// This cohort's capacity spares (a label-selected server list — in no fleet listing).
+async fn read_spares(cfg: &Config) -> Probe<Vec<arena_core::Pod>> {
+    use arena_core::spare::SpareCloud;
+    let Ok(cloud) = super::image::hetzner(cfg) else {
+        return Probe::Skipped("Hetzner isn't configured (no HETZNER_API_KEY) — spares not checked".into());
+    };
+    match tokio::time::timeout(LIST_TIMEOUT, cloud.spares()).await {
+        Ok(Ok(s)) => Probe::Got(s),
+        Ok(Err(e)) => Probe::Failed(e.to_string()),
+        Err(_) => Probe::Failed(format!("timed out after {}s", LIST_TIMEOUT.as_secs())),
+    }
 }
 
 /// The fleet's Hetzner project's snapshots (all of them) and `arena image build` VMs (any
@@ -541,8 +572,11 @@ mod tests {
         std::future::ready(Probe::Skipped("Shadeform isn't configured".into()))
     }
 
-    fn no_images() -> std::future::Ready<Probe<arena_core::image::Inventory>> {
-        std::future::ready(Probe::Skipped("Hetzner snapshots not read in this test".into()))
+    fn no_images() -> std::future::Ready<HetznerReads> {
+        std::future::ready(HetznerReads {
+            images: Probe::Skipped("Hetzner snapshots not read in this test".into()),
+            spares: Probe::Skipped("Hetzner spares not read in this test".into()),
+        })
     }
 
     /// S16 / S8: teardown's archive read is one LIST — no mutation, whatever it finds — and a

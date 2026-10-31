@@ -136,8 +136,8 @@ pub const INVENTORY: &[(&str, &str, &str, &str)] = &[
         "the pod's line; `refs/arena-discarded/…` on the pod",
     ),
     (
-        "replace/migrate staging",
-        "`pods replace` / `pods migrate` copying a home via this box",
+        "replace/migrate/copy-home staging",
+        "`pods replace` / `pods migrate` / `pods copy-home` copying a home via this box (only when the direct machine-to-machine copy can't run)",
         "`$TMPDIR/arena-replace-<pod id>` (removed once the copy lands)",
         "listed by `config check` and `teardown --check`",
     ),

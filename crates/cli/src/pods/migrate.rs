@@ -7,12 +7,14 @@ use anyhow::{Context, Result};
 use arena_core::capability::Op;
 use arena_core::provider::Provider;
 use arena_core::remote::{Remote, PROBE_TIMEOUT};
+use arena_core::spare::SpareCloud;
 use arena_core::ssh::SshTarget;
 use arena_core::Config;
 use clap::Subcommand;
 
-use crate::cli::PlaceFlags;
+use crate::cli::{OntoFlags, PlaceFlags};
 use crate::keys::keys_dir;
+use crate::pods::adopt::{self, Source};
 use crate::pods::create::{sizing_flags, SpecOverrides};
 use crate::pods::home_copy::{copy_pod_files, remove_staging_for, verify_replacement, CopyOpts};
 use crate::pods::lifecycle::proxied_name;
@@ -28,8 +30,9 @@ use crate::{confirm, disk, money, reap, Interrupt};
 pub(crate) enum MigrateCmd {
     /// Build `<name>-new` and sync the pod's files onto it
     ///
-    /// Repeatable. Never renames or touches the proxy: the participant keeps using `<name>` and
-    /// can SSH the new pod directly to test it.
+    /// Repeatable. Never renames `<name>` or touches the proxy: the participant keeps using
+    /// `<name>` and can SSH the new pod directly to test it. --onto / --onto-spare take a
+    /// machine arena already has as `<name>-new` instead of creating one.
     #[command(verbatim_doc_comment)]
     Copy {
         /// Machine name (or id) to migrate.
@@ -57,6 +60,11 @@ pub(crate) enum MigrateCmd {
         bootstrap: bool,
         #[command(flatten)]
         place: PlaceFlags,
+        #[command(flatten)]
+        onto: OntoFlags,
+        /// With --onto: take a cohort machine (someone's) anyway
+        #[arg(long)]
+        force: bool,
         /// Preview only.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -65,7 +73,8 @@ pub(crate) enum MigrateCmd {
     ///
     /// `<name>` becomes `<name>-old` and `<name>-new` becomes `<name>`. If the new pod isn't
     /// reachable through the proxy, it all reverts automatically. `<name>-old` is kept until
-    /// `migrate finish`.
+    /// `migrate finish`. Refuses while someone is on `<name>` (SSH, VS Code) unless --force:
+    /// what they write after the final sync would stay behind on `<name>-old`.
     #[command(verbatim_doc_comment)]
     Cutover {
         /// Machine name (or id) being migrated.
@@ -73,6 +82,9 @@ pub(crate) enum MigrateCmd {
         /// Skip the confirmation prompt.
         #[arg(short, long)]
         yes: bool,
+        /// Cut over even with someone on the original
+        #[arg(long)]
+        force: bool,
         /// Don't touch the proxy at all (just swap names); you run `arena proxy apply`.
         #[arg(long)]
         skip_proxy: bool,
@@ -167,7 +179,7 @@ async fn migration_pods(owner: &dyn Provider, src_id: &str, src_label: &str) -> 
 /// is the cutover's safety gate — a swap that leaves the proxy pointing at an unreachable or
 /// wrong pod is exactly what broke a participant before. A quick probe (`PROBE_TIMEOUT`):
 /// the caller retries while nginx settles, so a hung attempt must not stall that loop.
-pub(crate) async fn proxy_reaches_pod(remote: &dyn Remote, cfg: &Config, name: &str, expected_id: &str) -> Result<bool> {
+pub(crate) async fn proxy_reaches_pod(remote: &dyn Remote, cfg: &Config, provider: &str, name: &str, expected_id: &str) -> Result<bool> {
     let px = arena_core::proxy::ProxyConfig::from_config(cfg)?;
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let idx = cfg
@@ -186,15 +198,16 @@ pub(crate) async fn proxy_reaches_pod(remote: &dyn Remote, cfg: &Config, name: &
         connect_timeout_secs: 15,
         host_keys: Default::default(),
     };
-    let probe = "tr '\\0' '\\n' < /proc/1/environ 2>/dev/null | sed -n 's/^RUNPOD_POD_ID=//p'";
-    match remote.exec(&target, probe, Some(PROBE_TIMEOUT)).await {
+    // The machine's own id (RunPod: RUNPOD_POD_ID in PID 1's env; a Hetzner VM: its server id,
+    // cloud-init's instance id). A backend whose machines show none can't be confirmed.
+    let Some(probe) = arena_core::replica::id_probe(provider) else { return Ok(false) };
+    match remote.exec(&target, &probe, Some(PROBE_TIMEOUT)).await {
         Ok(o) if o.success => {
             let got = o.stdout.trim();
-            // FAIL CLOSED: require the pod's own RUNPOD_POD_ID to be present AND match. An
-            // empty read (probe failed, or a recycled ip:port landed on a pod that doesn't
-            // expose it) must NOT pass — the entire point of this gate is to catch the proxy
-            // reaching the wrong/foreign pod. RunPod always exposes RUNPOD_POD_ID in PID 1's
-            // env, so empty == "couldn't confirm" == not safe to cut over.
+            // FAIL CLOSED: require the pod's own id to be present AND match. An empty read
+            // (probe failed, or a recycled ip:port landed on a pod that doesn't expose it) must
+            // NOT pass — the entire point of this gate is to catch the proxy reaching the
+            // wrong/foreign pod. Empty == "couldn't confirm" == not safe to cut over.
             Ok(!got.is_empty() && got == expected_id)
         }
         _ => Ok(false),
@@ -215,8 +228,7 @@ pub(crate) async fn handle_migrate_copy(
     target: &str,
     ov: &SpecOverrides,
     place: &PlaceFlags,
-    dry_run: bool,
-    yes: bool,
+    how: CopyHow,
     interrupt: &Interrupt,
     // Where the new pod's price is remembered for the balance.
     bal: &money::BalanceCtx,
@@ -227,9 +239,36 @@ pub(crate) async fn handle_migrate_copy(
     // re-sync that won't run setup (it's a config error either way; fix it once).
     let setup_timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, None)?;
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
+    // `-new` is recorded in the spend ledger as it's made (or taken), under `<name>`'s owner.
+    let tracking = crate::spend::SpendCtx::from_config(cfg);
+    let owner = crate::spend::Tracked::new(owner.as_ref(), &tracking, arena_core::spend::OwnerRule::Inherit);
+    let spares = adopt::spares_for(&owner, cfg);
+    let CopyHow { source, force, dry_run, yes } = how;
     let keys = keys_dir(cfg);
-    let job = MigrateCopyJob { setup_timeouts, ov, place, dry_run, yes, interrupt, keys_dir: &keys, balance: Some(bal) };
-    migrate_copy_on(remote, cfg, owner.as_ref(), &canonical, &pods, job).await
+    let job = MigrateCopyJob {
+        setup_timeouts,
+        ov,
+        place,
+        dry_run,
+        yes,
+        interrupt,
+        keys_dir: &keys,
+        balance: Some(bal),
+        source,
+        force,
+        spares: spares.as_deref(),
+    };
+    migrate_copy_on(remote, cfg, &owner, &canonical, &pods, job).await
+}
+
+/// `migrate copy`'s switches besides the spec: where `-new` comes from, and the confirms.
+#[derive(Debug, Clone)]
+pub(crate) struct CopyHow {
+    pub source: Source,
+    /// With `--onto`: take a cohort machine (someone's) anyway.
+    pub force: bool,
+    pub dry_run: bool,
+    pub yes: bool,
 }
 
 /// Everything [`migrate_copy_on`] needs besides the pods and providers.
@@ -245,6 +284,12 @@ pub(crate) struct MigrateCopyJob<'a> {
     /// Where `-new`'s price is remembered for the balance ([`create_replacement`]); `None`:
     /// not remembered.
     pub balance: Option<&'a money::BalanceCtx>,
+    /// Where `-new` comes from when there's none yet: created, or `--onto` / `--onto-spare`.
+    pub source: Source,
+    /// `--onto` a cohort machine (someone's) anyway.
+    pub force: bool,
+    /// The owner's capacity spares (Hetzner), for `--onto-spare` / `--onto <spare>`.
+    pub spares: Option<&'a dyn SpareCloud>,
 }
 
 /// [`handle_migrate_copy`] once the owner and its listing are known ([`resolve_migration`])
@@ -257,7 +302,7 @@ pub(crate) async fn migrate_copy_on(
     pods: &[arena_core::Pod],
     job: MigrateCopyJob<'_>,
 ) -> Result<()> {
-    let MigrateCopyJob { setup_timeouts, ov, place, dry_run, yes, interrupt, keys_dir, balance } = job;
+    let MigrateCopyJob { setup_timeouts, ov, place, dry_run, yes, interrupt, keys_dir, balance, source, force, spares } = job;
     let canonical = canonical.to_string();
     let src = pods.iter().find(|p| p.name == canonical).expect("the canonical pod is listed").clone();
     let new_name = format!("{canonical}-new");
@@ -284,9 +329,42 @@ pub(crate) async fn migrate_copy_on(
     if let (Some(r), false) = (&bad_floor, dry_run) {
         anyhow::bail!("{r}");
     }
+    // `--onto` / `--onto-spare` pick the machine a migration starts on: with a `-new` there
+    // already, the copy goes onto that one, as ever.
+    if let (Some(np), Source::Onto(_) | Source::Spare) = (&existing_new, &source) {
+        anyhow::bail!(
+            "{new_name} exists already (id={}) — `arena pods migrate copy {canonical}` re-syncs onto it; {} only picks the \
+             machine a migration starts on (terminate {new_name} first to start on another)",
+            np.id,
+            source.flag()
+        );
+    }
+    // The machine to take, found and checked now — before anything is asked or changed.
+    let types = crate::pods::replace::server_types(owner.name(), place.server_type.as_deref())?;
+    let onto = match &source {
+        Source::Create => None,
+        other => {
+            crate::pods::replace::refuse_shaping_with_onto(other, ov, place)?;
+            let onto = adopt::find(owner, spares, cfg, &canonical, pods, other, &types).await?;
+            if let Some(r) = adopt::onto_refusal(&src, &onto) {
+                anyhow::bail!("{r}");
+            }
+            Some(onto)
+        }
+    };
+    let someones = match (&onto, force) {
+        (Some(o), false) if adopt::listed_machine(cfg, &o.pod.name) && !o.spare => {
+            let probe = adopt::probe(remote.as_ref(), cfg, &o.pod).await;
+            adopt::someones_refusal(cfg, &canonical, o, &probe)
+        }
+        _ => None,
+    };
+    if let (Some(r), false) = (&someones, dry_run) {
+        anyhow::bail!("{r}");
+    }
 
     if dry_run {
-        for r in [&stopped, &reaping, &bad_floor].into_iter().flatten() {
+        for r in [&stopped, &reaping, &bad_floor, &someones].into_iter().flatten() {
             print_would_refuse(r);
         }
         println!("migrate copy {canonical} (dry-run):");
@@ -297,24 +375,36 @@ pub(crate) async fn migrate_copy_on(
                  refused if {canonical} was reset since that sync",
                 arena_core::replica::KEPT_DIR
             );
+        } else if let Some(o) = &onto {
+            println!("  - {}", adopt::take_line(o, &new_name));
+            println!("  - set it up (~/.name={} until the cutover)", short_of(cfg, &new_name));
+            println!("  - sync {canonical} → {new_name}: {}", copy_scope_line());
+            if !o.spare {
+                println!(
+                    "    (what the sync replaces or deletes of {}'s own files is moved aside to ~/{}/ there, never deleted)",
+                    o.pod.name,
+                    arena_core::replica::KEPT_DIR
+                );
+            }
         } else {
             let rep = plan_replacement(cfg, owner, &src, ov, place).await?;
             println!("  - create {new_name}:");
             print_replacement_plan(owner, &rep, &new_name);
-            println!("  - wait for it to stabilize, then set it up (~/.name={} until the cutover)", short_of(cfg, &new_name));
+            println!("  - wait for it to come up, then set it up (~/.name={} until the cutover)", short_of(cfg, &new_name));
             println!("  - sync {canonical} → {new_name}: {}", copy_scope_line());
         }
         if let Some(n) = &lock_note {
             println!("  {n}");
         }
-        println!("  (no rename, no proxy change)\n[dry-run] nothing changed.");
+        println!("  (no rename of {canonical}, no proxy change)\n[dry-run] nothing changed.");
         return Ok(());
     }
 
+    let settle = crate::pods::replace::settle_secs(owner.name());
     let (new_id, fresh) = if let Some(np) = existing_new {
         println!("Re-using existing {new_name} (id={}) — incremental re-sync.", np.id);
         let shaping = ov.gpu.is_some() || ov.gpus.is_some() || ov.cloud.is_some() || ov.disk.is_some() || ov.volume.is_some()
-            || ov.image.is_some() || ov.bootstrap || place.max_price.is_some() || place.retry_mins > 0;
+            || ov.image.is_some() || ov.bootstrap || place.shapes_a_create();
         if shaping {
             eprintln!(
                 "note: the spec/placement flags only shape a NEW pod — {new_name} exists and is re-synced as it is \
@@ -323,42 +413,76 @@ pub(crate) async fn migrate_copy_on(
         }
         (np.id, false)
     } else {
-        let rep = plan_replacement(cfg, owner, &src, ov, place).await?;
-        println!("migrate copy {canonical} → {new_name}:");
-        print_replacement_plan(owner, &rep, &new_name);
-        if rep.plan.options.is_empty() {
-            anyhow::bail!("nothing to create: no option left to try (see the table above, or `arena offers`)");
+        let (new_id, fresh) = match &onto {
+            Some(o) => {
+                println!("migrate copy {canonical} → {new_name}:");
+                println!("  {}", adopt::take_line(o, &new_name));
+                if let Some(n) = &lock_note {
+                    println!("  {n}");
+                }
+                if !confirm(
+                    yes,
+                    &format!(
+                        "Will take {} as {new_name}, set it up and sync {canonical}'s files onto it — no rename of {canonical}, \
+                         no proxy change. ({})",
+                        o.pod.name,
+                        copy_scope_line()
+                    ),
+                )? {
+                    println!("aborted.");
+                    return Ok(());
+                }
+                println!("[1/3] taking {} as {new_name}…", o.pod.name);
+                adopt::take(owner, spares, cfg, o, &new_name).await?;
+                println!("      {}", adopt::taken_line(o, &new_name));
+                (o.pod.id.clone(), o.spare)
+            }
+            None => {
+                let rep = plan_replacement(cfg, owner, &src, ov, place).await?;
+                println!("migrate copy {canonical} → {new_name}:");
+                print_replacement_plan(owner, &rep, &new_name);
+                if rep.plan.options.is_empty() {
+                    anyhow::bail!("nothing to create: no option left to try (see the table above, or `arena offers`)");
+                }
+                if let Some(n) = &lock_note {
+                    println!("  {n}");
+                }
+                if !confirm(
+                    yes,
+                    &format!(
+                        "Will create {new_name} and sync {canonical}'s files onto it — no rename, no proxy change. ({})",
+                        copy_scope_line()
+                    ),
+                )? {
+                    println!("aborted.");
+                    return Ok(());
+                }
+                println!("[1/3] creating {new_name}…");
+                let created = create_replacement(owner, &rep, &new_name, place, interrupt, balance).await?;
+                println!("      created id={}", created.id);
+                (created.id, true)
+            }
+        };
+        println!("[2/3] waiting for {new_name} to come up{}…", if settle > 0 { " and stabilize" } else { "" });
+        let up = wait_for_endpoint(owner, &new_id, 900).await.with_context(|| format!("{new_name} never came up"))?;
+        if let Some(n) = crate::pods::replace::moved_note(&src, &up, &new_name, onto.is_some()) {
+            println!("      {n}");
         }
-        if let Some(n) = &lock_note {
-            println!("  {n}");
-        }
-        if !confirm(
-            yes,
-            &format!(
-                "Will create {new_name} and sync {canonical}'s files onto it — no rename, no proxy change. ({})",
-                copy_scope_line()
-            ),
-        )? {
-            println!("aborted.");
-            return Ok(());
-        }
-        println!("[1/3] creating {new_name}…");
-        let created = create_replacement(owner, &rep, &new_name, place, interrupt, balance).await?;
-        println!("      created id={}", created.id);
-        println!("[2/3] waiting for {new_name} to come up and stabilize…");
-        wait_for_endpoint(owner, &created.id, 900)
-            .await
-            .with_context(|| format!("{new_name} never came up"))?;
-        wait_for_stable_endpoint(owner, &created.id, 90, 600)
+        wait_for_stable_endpoint(owner, &new_id, settle, 600)
             .await
             .with_context(|| format!("{new_name} never stabilized"))?;
         println!("      provisioning {new_name} (its per-host API keys follow at the cutover, under {canonical})…");
-        // By id (a fresh listing, for the settled endpoint): the pod we just made.
-        let new = just_these(owner, std::slice::from_ref(&created.id)).await?;
+        // By id (a fresh listing, for the settled endpoint): the pod we just made (or took).
+        let new = just_these(owner, std::slice::from_ref(&new_id)).await?;
         handle_setup(remote.clone(), cfg, true, false, None, None, false, false, setup_timeouts, &new, keys_dir, Some(owner))
             .await
-            .with_context(|| format!("provisioning {new_name}"))?;
-        (created.id, true)
+            .with_context(|| {
+                format!(
+                    "provisioning {new_name} — it's left as it is: `arena pods setup {new_name}` sets it up again, then \
+                     `arena pods migrate copy {canonical}` syncs onto it; or `arena pods terminate {new_name}`"
+                )
+            })?;
+        (new_id, fresh)
     };
 
     println!("[3/3] syncing {canonical} → {new_name}…");
@@ -394,6 +518,8 @@ pub(crate) struct CutoverOpts {
     pub no_final_sync: bool,
     pub dry_run: bool,
     pub yes: bool,
+    /// Cut over with someone on the original.
+    pub force: bool,
 }
 
 /// `migrate cutover`: final delta sync, swap names, re-point + VERIFY the proxy, auto-revert
@@ -409,6 +535,26 @@ pub(crate) async fn handle_migrate_cutover(
 ) -> Result<()> {
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
     migrate_cutover_on(remote, fleet, cfg, owner.as_ref(), &canonical, &pods, opts, &keys_dir(cfg)).await
+}
+
+/// The cutover's check that no one is on the original (`--force` skips it): what they write
+/// after the final sync would stay behind on `<name>-old`. A stopped original has no one on it
+/// (and no final sync); `None` = go on.
+async fn cutover_presence_refusal(remote: &dyn Remote, cfg: &Config, src: &arena_core::Pod, force: bool) -> Option<String> {
+    if force || arena_core::status::is_stopped(&src.status) {
+        return None;
+    }
+    let presence = arena_core::idle::presence(&adopt::probe(remote, cfg, src).await);
+    crate::pods::replace::presence_refusal(
+        "cut over",
+        &src.name,
+        &presence,
+        &format!(
+            "What they write after the final sync would stay behind on {name}-old. Re-run once they're off (`arena pods \
+             migrate copy {name}` meanwhile keeps the copy fresh).",
+            name = src.name
+        ),
+    )
 }
 
 /// When `<name>-new` was last synced, as the plan says it: `2026-10-08 11:02 UTC (3h ago)`,
@@ -449,7 +595,7 @@ pub(crate) async fn migrate_cutover_on(
     // Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     keys_dir: &str,
 ) -> Result<()> {
-    let CutoverOpts { skip_proxy, no_final_sync, dry_run, yes } = opts;
+    let CutoverOpts { skip_proxy, no_final_sync, dry_run, yes, force } = opts;
     let new_name = format!("{canonical}-new");
     let old_name = format!("{canonical}-old");
     let src = pods.iter().find(|p| p.name == canonical).expect("the canonical pod is listed").clone();
@@ -482,6 +628,11 @@ pub(crate) async fn migrate_cutover_on(
     if let (Some(r), false) = (&bad_floor, dry_run) {
         anyhow::bail!("{r}");
     }
+    // Nor while someone is on the original (an SSH session, a VS Code server), unless --force.
+    let busy = cutover_presence_refusal(remote.as_ref(), cfg, &src, force).await;
+    if let (Some(r), false) = (&busy, dry_run) {
+        anyhow::bail!("{r}");
+    }
     let write_only = if skip_proxy { None } else { write_only_proxy(cfg) };
     let sync_line = if no_final_sync {
         format!(
@@ -501,12 +652,13 @@ pub(crate) async fn migrate_cutover_on(
     };
 
     if dry_run {
-        for r in [&locked, &reaping, &bad_floor].into_iter().flatten() {
+        for r in [&locked, &reaping, &bad_floor, &busy].into_iter().flatten() {
             print_would_refuse(r);
         }
         println!("migrate cutover {canonical} (dry-run):");
         println!("  1. {sync_line}");
-        println!("  2. rename {canonical} → {old_name}, then {new_name} → {canonical} (+ ~/.name on both, API keys under {canonical})");
+        let names = if arena_core::setup::hostname_is_machine_name(owner.name()) { "~/.name and hostname" } else { "~/.name" };
+        println!("  2. rename {canonical} → {old_name}, then {new_name} → {canonical} (+ {names} on both, API keys under {canonical})");
         if skip_proxy {
             println!("  3. proxy SKIPPED — run `arena proxy apply` yourself");
         } else {
@@ -542,6 +694,11 @@ pub(crate) async fn migrate_cutover_on(
     }
     println!("[2/4] verifying {new_name} health…");
     verify_replacement(owner, remote.as_ref(), &new_id, cfg).await?;
+    // Asked again right before the swap (review r2): someone who came on during the prompt or
+    // the final sync would leave what they write next behind on the parked original.
+    if let Some(r) = cutover_presence_refusal(remote.as_ref(), cfg, &src, force).await {
+        anyhow::bail!("NOT swapping — {r} (they came on during the final sync; {new_name} has the copy, nothing was renamed)");
+    }
 
     // 3. swap names (old-first so the canonical name is never on two pods).
     println!("[3/4] swapping names…");
@@ -593,7 +750,7 @@ pub(crate) async fn migrate_cutover_on(
             let mut reached = false;
             for attempt in 1..=settle_tries {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                if proxy_reaches_pod(remote.as_ref(), cfg, canonical, &new_id).await.unwrap_or(false) {
+                if proxy_reaches_pod(remote.as_ref(), cfg, owner.name(), canonical, &new_id).await.unwrap_or(false) {
                     reached = true;
                     println!("      ✓ {canonical} reachable through the proxy on the new pod (after ~{}s).", attempt * 3);
                     break;
@@ -639,9 +796,12 @@ pub(crate) async fn cutover_revert(
     let new_name = format!("{canonical}-new");
     // Demote the (failed) new pod, then restore the original to the canonical name. Order
     // matters so the canonical name is never held by two pods.
-    let _ = owner.rename_pod(new_id, &new_name).await;
-    if let Err(e) = owner.rename_pod(old_id, canonical).await {
-        eprintln!("  REVERT WARNING: couldn't restore {canonical} ({e}) — fix names manually!");
+    if owner.rename_pod(new_id, &new_name).await.is_ok() {
+        reap::renamed(cfg, owner.name(), new_id, &new_name);
+    }
+    match owner.rename_pod(old_id, canonical).await {
+        Ok(()) => reap::renamed(cfg, owner.name(), old_id, canonical),
+        Err(e) => eprintln!("  REVERT WARNING: couldn't restore {canonical} ({e}) — fix names manually!"),
     }
     // Best-effort, short: the names are what matter; `pods setup` rewrites either file. A
     // stopped pod isn't written (`write_name_file`): its listed endpoint is stale.
@@ -731,7 +891,10 @@ pub(crate) struct FinishOpts {
 /// participant's port to the live pod ([`migrate_finish_on`]).
 pub(crate) async fn handle_migrate_finish(remote: &dyn Remote, fleet: &dyn Provider, cfg: &Config, target: &str, opts: FinishOpts) -> Result<()> {
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
-    migrate_finish_on(remote, fleet, cfg, owner.as_ref(), &canonical, &pods, opts).await
+    // The terminate goes into the spend ledger as it succeeds (its end is exact).
+    let tracking = crate::spend::SpendCtx::from_config(cfg);
+    let owner = crate::spend::Tracked::new(owner.as_ref(), &tracking, arena_core::spend::OwnerRule::None);
+    migrate_finish_on(remote, fleet, cfg, &owner, &canonical, &pods, opts).await
 }
 
 /// Why `migrate finish` keeps a STOPPED `-old` (pure, tested): nothing was synced from it

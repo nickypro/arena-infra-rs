@@ -131,6 +131,104 @@ pub fn identity_condition(environ: &str, pod_id: &str) -> String {
     )
 }
 
+/// Where a Hetzner VM's own server id is readable: cloud-init's instance id (Hetzner's
+/// datasource makes it the server id; rewritten on every boot of a new instance, so a VM made
+/// from a snapshot of another reads its own), else the metadata service's.
+pub const HETZNER_ID_PROBE: &str =
+    "cat /var/lib/cloud/data/instance-id 2>/dev/null || curl -s -m 2 http://169.254.169.254/hetzner/v1/metadata/instance-id 2>/dev/null";
+
+/// The command that prints, on one of `provider`'s machines, that machine's own id as the
+/// provider's API names it — what every "is this endpoint still that pod?" check compares
+/// with: RunPod's `RUNPOD_POD_ID` (PID 1's environment), a Hetzner VM's server id
+/// ([`HETZNER_ID_PROBE`]). `None` where the machine shows none (Vast, Shadeform): those checks
+/// then can't tell, and say so or fall back as each caller documents.
+pub fn id_probe(provider: &str) -> Option<String> {
+    match provider {
+        "runpod" => Some(format!("tr '\\0' '\\n' < {} 2>/dev/null | sed -n 's/^RUNPOD_POD_ID=//p'", sq(POD_ID_ENVIRON))),
+        "hetzner" => Some(HETZNER_ID_PROBE.to_string()),
+        _ => None,
+    }
+}
+
+/// A shell condition that holds only on pod `id` of `provider` ([`id_probe`]) — what the
+/// replica steps, `~/.name` writes and the reaper's backup run behind ([`guarded`],
+/// [`guarded_rsync_path`]). An unreadable or empty id fails it. `None` for a provider whose
+/// machines show no id.
+pub fn pod_identity(provider: &str, id: &str) -> Option<String> {
+    match provider {
+        "runpod" => Some(identity_condition(POD_ID_ENVIRON, id)),
+        "hetzner" => Some(format!("[ \"$({HETZNER_ID_PROBE})\" = {} ]", sq(id))),
+        _ => None,
+    }
+}
+
+/// The receiver's own files a mirroring sync would move aside ([`crate::pull::Mirror::Replica`]),
+/// read from its dry run (`--dry-run --itemize-changes --info=backup`, [`crate::pull::PullConfig::dry_run`]):
+/// - each `backed up <path> to <backup dir>/<path>` line — rsync's own word for every item it
+///   would move into the backup dir, a type change included (a file where the receiver has a
+///   symlink, a directory where it has a file: itemized as new, review r2);
+/// - and, should a receiver's rsync not say those, each item it would delete (`*deleting`) or
+///   overwrite — a file it sends that exists there (`<f`: the direct copy runs on the source and
+///   pushes, so the sender itemizes; `>f` from a pull's receiver), or a symlink it replaces
+///   (`cL`); either with flags that aren't all `+` (new).
+///
+/// Files only (a deleted directory's files are listed one by one), each once, in the order rsync
+/// names them, as paths in the home: the repo tree's items, after
+/// [`crate::volume::TREE_ITEMS_MARK`], are named relative to the repo at `rel`. Pure.
+pub fn moved_aside(itemized: &str, rel: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut prefix = String::new();
+    let mut add = |path: &str, prefix: &str| {
+        let path = path.trim_end_matches('/');
+        if path.is_empty() || path == "." {
+            return;
+        }
+        let full = format!("{prefix}{path}");
+        if !out.contains(&full) {
+            out.push(full);
+        }
+    };
+    for line in itemized.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.trim() == crate::volume::TREE_ITEMS_MARK {
+            prefix = rel.map(|r| format!("{}/", r.trim_end_matches('/'))).unwrap_or_default();
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("backed up ") {
+            if let Some(path) = backed_up_path(rest) {
+                add(path, &prefix);
+            }
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("*deleting") {
+            let path = path.trim_start();
+            if !path.ends_with('/') {
+                add(path, &prefix);
+            }
+            continue;
+        }
+        // `YXcstpoguax path`: Y `<` sent / `>` received / `c` changed there, X `f` a file or `L`
+        // a symlink, then 9 change flags (`+` = new).
+        let Some((flags, path)) = line.split_once(' ') else { continue };
+        let b = flags.as_bytes();
+        let replaced = matches!((b.first(), b.get(1)), (Some(b'<' | b'>'), Some(b'f')) | (Some(b'<' | b'>' | b'c'), Some(b'L')));
+        if b.len() >= 11 && replaced && !flags[2..].starts_with('+') {
+            // A symlink's line ends ` -> target`.
+            let path = path.trim_start();
+            let path = if b[1] == b'L' { path.split(" -> ").next().unwrap_or(path) } else { path };
+            add(path, &prefix);
+        }
+    }
+    out
+}
+
+/// The `<path>` of rsync's `backed up <path> to <backup dir>/<path>` (what follows `backed up
+/// `): the split on ` to ` whose right side ends with `/<path>` — a name with ` to ` in it
+/// included. `None` when no split fits. Pure.
+fn backed_up_path(rest: &str) -> Option<&str> {
+    rest.match_indices(" to ").map(|(i, _)| (&rest[..i], &rest[i + 4..])).find(|(p, to)| !p.is_empty() && to.ends_with(&format!("/{p}"))).map(|(p, _)| p)
+}
+
 /// `script` preceded by `cond` (when there is one): on any other pod it says so on stderr
 /// and exits [`WRONG_POD_EXIT`] having done nothing. Checked in the same session as the
 /// work, so a reassigned endpoint can't slip in between a check and the step.
@@ -495,6 +593,39 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    /// `pods copy-home` asks before it moves a receiver's own files aside: what a dry run says it
+    /// would delete or overwrite there — never what it only adds, a directory, or a time-only
+    /// touch.
+    #[test]
+    fn a_dry_runs_deletions_and_overwrites_are_the_files_moved_aside() {
+        let out = "sending incremental file list\n\
+                   *deleting   notes/old.txt\n\
+                   *deleting   scratch/\n\
+                   >f.st...... ARENA_materials/day1/solution.py\n\
+                   >f+++++++++ ARENA_materials/day1/new.py\n\
+                   cd+++++++++ ARENA_materials/day2/\n\
+                   .f..t...... ARENA_materials/README.md\n\
+                   >f..t...... has spaces in name.txt\n\
+                   \n\
+                   sent 1,234 bytes  received 56 bytes\n";
+        assert_eq!(moved_aside(out, None), ["notes/old.txt", "ARENA_materials/day1/solution.py", "has spaces in name.txt"]);
+        assert!(moved_aside("", None).is_empty());
+        // What the direct copy prints (it runs on the source and pushes: the sender's view):
+        // a file it would overwrite there, a symlink it would replace — never what's new there.
+        let push = "<f.st...... notes/differs.md\n<f+++++++++ fresh.py\ncLc.t...... link-to-data -> /data\ncL+++++++++ new-link -> x\n";
+        assert_eq!(moved_aside(push, None), ["notes/differs.md", "link-to-data"]);
+        // rsync's own `backed up` lines name every item it moves aside — a type change too
+        // (itemized as new) — each once, a name with ` to ` in it whole.
+        let backed = "(new) backup_dir is arena-sync-kept/S\nbacked up notes.py to arena-sync-kept/S/notes.py\n\
+                      backed up a to b.txt to arena-sync-kept/S/a to b.txt\ncL+++++++++ notes.py -> real.py\n\
+                      backed up dir_over_file to arena-sync-kept/S/dir_over_file\nbacked up dir_over_file to arena-sync-kept/S/dir_over_file\n";
+        assert_eq!(moved_aside(backed, None), ["notes.py", "a to b.txt", "dir_over_file"]);
+        assert_eq!(backed_up_path("x to y"), None, "no backup path that ends with it");
+        // The repo's tree, copied on its own after the home, names its items from the repo.
+        let split = "*deleting   notes/old.txt\nARENA_TREE_ITEMS\n*deleting   day1/gone.py\n>f.st...... day2/x.py\n";
+        assert_eq!(moved_aside(split, Some("ARENA_materials")), ["notes/old.txt", "ARENA_materials/day1/gone.py", "ARENA_materials/day2/x.py"]);
+    }
 
     #[test]
     fn stamps_are_utc_and_sortable() {

@@ -1908,6 +1908,7 @@ mod tests {
             max_price: None,
             order: crate::placement::Order::Cheapest,
             near: Some(crate::near::Near { region: Region::Europe, max_extra_pct: 25.0 }),
+            server_types: Vec::new(),
         };
         let plan = crate::placement::plan_options(&req, "vast", &book);
         let got: Vec<(Option<Region>, i64)> =

@@ -411,6 +411,7 @@ fn single_request(spec: &PodSpec) -> arena_core::placement::Request {
         max_price: None,
         order: Order::Listed,
         near: None,
+        server_types: Vec::new(),
     }
 }
 

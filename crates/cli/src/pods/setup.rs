@@ -12,11 +12,9 @@ use crate::keys::handle_copy_keys;
 use crate::pods::selection::Selected;
 use crate::{archive, reap};
 
-/// Bare-VM provisioning script for hetzner (CPU) pods — embedded so `arena pods setup`
-/// can push + run it: system deps, docker + compose, a uv venv with the ARENA packages
-/// (CPU substitutions), and a zsh rc that activates the venv. GPU pods come from a
-/// prebuilt image and take the lighter post-image config path instead.
-pub(crate) const HETZNER_SETUP: &str = include_str!("../hetzner_setup.sh");
+/// Bare-VM provisioning script ([`arena_core::setup::HETZNER_SETUP`], in core so the
+/// dashboard's setup pushes the same one) — `arena pods setup` stages and runs it.
+pub(crate) const HETZNER_SETUP: &str = arena_core::setup::HETZNER_SETUP;
 
 /// One pod's provisioning job for [`provision_fleet`].
 struct SetupJob {
