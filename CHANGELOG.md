@@ -34,11 +34,15 @@ earlier).
 - **A dead key in the keys CSV isn't copied any more.** Before `up`, `copy-keys`, `setup`,
   `keys gen --copy` or `replace` copies a machine's OpenRouter key, the name's row is checked
   against OpenRouter's listing: a key deleted elsewhere (or rotated from another keys folder) is
-  left out, with a ⚠ line naming `arena keys gen <name> --copy` (or `keys rotate`). When the
+  left out, with a ⚠ line naming `arena keys gen <name> --copy` (or `keys rotate`). A key
+  renamed on OpenRouter is still found (by its redacted label), copied, and not minted again. When the
   listing can't be read, the CSV is copied as before, and the copy says it's unchecked.
 - Keys minted at once (several `pods up` in parallel terminals, `keys gen` beside an `up`) all
   land in the keys CSV: each write holds the keys folder. The second write used to drop the
-  first's row, and that key's secret with it.
+  first's row, and that key's secret with it. `up`, `keys gen|rotate` and a handover also read
+  OpenRouter's keys again under that hold, so a name that got a key meanwhile keeps it (`= …
+  has an OpenRouter key now`), never a second one; `terminate --revoke-key` and `rename` change
+  the CSV under it too.
 - `pods terminate apple bloom ember --revoke-key` terminates several machines in one run. Each
   name is matched exactly, as one is (a typo stops them all, before anything); one confirm lists
   them and wants their count typed back (`ALL` past five, or for every listed pod), as the

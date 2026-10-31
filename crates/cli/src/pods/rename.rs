@@ -472,7 +472,19 @@ async fn move_key_mappings(
         }
         pairs.push((r.old.as_str(), r.new.as_str()));
     }
-    // ...then the CSV.
+    // ...then the CSV, read and written under the keys folder's lock (a parallel mint's row is
+    // kept). One that can't be had is said, and the CSV left as it is.
+    let held = match book.lock() {
+        Ok(h) => h,
+        Err(e) => {
+            warnings.push(format!(
+                "the keys CSV {} stayed locked by another arena ({e}) — its rows and the OpenRouter keys still use the old \
+                 names: re-run the rename's key step by hand (`arena keys rotate <new> --copy`)",
+                book.csv.display()
+            ));
+            return warnings;
+        }
+    };
     let csv_text = book.read_csv();
     let cross = csv_text.as_ref().and_then(|_| cross_cohort_dst(book, naming.prefix));
     let plan = match &csv_text {
@@ -489,6 +501,7 @@ async fn move_key_mappings(
     if let Some(e) = write_csv_move(book, naming.prefix, cross.as_ref().map(|(p, _)| p.as_path()), &plan) {
         warnings.push(e);
     }
+    drop(held);
     if let Some(api) = book.api {
         for (old, new) in pairs.iter().filter(|(_, n)| !plan.taken.iter().any(|t| t == n)) {
             for k in named(&machine_key_names(naming, old)) {

@@ -465,7 +465,7 @@ async fn handle_pods_bal(
                 .map(|h| h.into_iter().map(|h| h.name).collect())
                 .unwrap_or_default();
             let key_limit = cfg.get_parsed::<f64>("OPENROUTER_KEY_LIMIT").unwrap_or(5.0);
-            let mints = plan_mints(&naming, &names, &handed_names, list_for_check(key_api).await, key_limit, dry_run);
+            let mints = plan_mints(&naming, &names, &handed_names, keys.as_ref(), list_for_check(key_api).await, key_limit, dry_run);
             let per_pod = up::pipeline_text(
                 !no_setup,
                 check.then_some(check_attempts),
@@ -545,17 +545,20 @@ async fn handle_pods_bal(
                             println!("{l}");
                         }
                     }
-                    m.names
+                    m
                 }
-                _ => Vec::new(),
+                _ => Default::default(),
             };
-            let mut keys = if handed || !minted.is_empty() { up_keys_stage(cfg, &keys_dir(cfg), !no_setup) } else { keys };
-            // The other names' rows in the keys CSV, checked against the listing: a key deleted
-            // elsewhere isn't copied on (said, with what to run).
+            // A key made by another arena while this one waited at its prompt is in the CSV too.
+            let reread = handed || !minted.names.is_empty() || minted.lines.iter().any(|l| l.starts_with('='));
+            let mut keys = if reread { up_keys_stage(cfg, &keys_dir(cfg), !no_setup) } else { keys };
+            // The other names' rows in the keys CSV, checked against the newest listing: a key
+            // deleted elsewhere isn't copied on (said, with what to run).
             if let Some(k) = keys.as_mut() {
-                let fresh = |n: &String| minted.contains(n) || handing.iter().any(|h| h.name == *n);
+                let fresh = |n: &String| minted.names.contains(n) || handing.iter().any(|h| h.name == *n);
                 let hosts: Vec<String> = names.iter().filter(|n| !fresh(n)).cloned().collect();
-                for line in check_csv_keys(k, &hosts, mints.listed.as_ref(), &naming) {
+                let listed = minted.listed.map(Ok).or(mints.listed);
+                for line in check_csv_keys(k, &hosts, listed.as_ref(), &naming) {
                     eprintln!("{line}");
                 }
             }

@@ -676,8 +676,18 @@ async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: 
             n => println!("[keys] ✓ {m}: revoked {n} OpenRouter key(s){row}"),
         }
     }
-    if let (Some(text), false) = (&csv, dropped.is_empty()) {
-        if let Err(e) = book.write_csv(text) {
+    if csv.is_some() && !dropped.is_empty() {
+        // The rows go from the CSV as it is now, under the keys folder's lock: a key another arena
+        // saved while these were revoked (a parallel `up`'s mint) keeps its row.
+        let written = book.lock().and_then(|_held| {
+            let Some(now) = book.read_csv() else { return Ok(()) };
+            let rest = dropped.iter().fold(now.clone(), |t, m| arena_core::apikeys::remove_csv_host(&t, m).unwrap_or(t));
+            if rest == now {
+                return Ok(());
+            }
+            book.write_csv(&rest)
+        });
+        if let Err(e) = written {
             eprintln!("[keys] ✗ couldn't update {}: {e} — rows kept for {}", book.csv.display(), dropped.join(", "));
             out.stale_rows = Some((dropped, e.to_string()));
         }

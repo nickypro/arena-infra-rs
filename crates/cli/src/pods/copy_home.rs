@@ -203,16 +203,22 @@ pub(crate) async fn copy_home_on(remote: Arc<dyn Remote>, cfg: &Config, owner: &
     let owner_of = arena_core::spend::owner_of(&ledger, &src.provider, &src.id).map(String::from);
     println!("  Next: point the person at {to} (`ssh {to}` via the proxy / ssh-config: its own name, port and keys).");
     if let Some(o) = owner_of {
-        // `spend assign` refuses to move a machine's history from one person to another without
-        // --force: say so up front when `to` has run up spend under someone else.
+        // `spend assign` refuses to move a machine's history from one person to another: when `to`
+        // has run up someone else's spend, say so — and how to keep the two apart — rather than
+        // suggest it.
         let names = [dest.name.clone()];
         let theirs = arena_core::spend::assign_moves(&ledger, &names, &dest.id, arena_core::snapshot::unix_now()).ok().flatten();
         match theirs.filter(|m| m.takes_from(Some(&o))) {
-            Some(m) => println!(
-                "  Their spend follows if you say so: `arena spend assign {to} {o} --force` — {to}'s own history ({}, {}'s) moves to {o} with it.",
-                m.words(),
-                m.from.as_deref().unwrap_or(arena_core::spend::NO_OWNER)
-            ),
+            Some(m) => {
+                let other = m.from.as_deref().unwrap_or(arena_core::spend::NO_OWNER);
+                println!(
+                    "  Their spend: {to} has run up {} as {other}'s, so `arena spend assign {to} {o}` would move that to {o} \
+                     too — it refuses. To keep each person's spend apart, give {o} a machine of their own (`arena pods up \
+                     <name> --owner {o}`, then `arena pods copy-home {from} <name>`); `--force` only if {other} was never \
+                     {to}'s owner.",
+                    m.words()
+                );
+            }
             None => println!("  Their spend follows if you say so: `arena spend assign {to} {o}`."),
         }
     }

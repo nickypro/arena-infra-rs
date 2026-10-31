@@ -67,6 +67,11 @@ pub fn next_run(j: &JobStatus, now: u64) -> String {
     }
 }
 
+/// Names, at most `max` then how many more: `a, b, c (+4 more)`.
+pub fn names_line(v: &[String], max: usize) -> String {
+    names(v, max)
+}
+
 /// `arena backups`' whole text.
 pub fn text(s: &Status) -> String {
     let now = s.generated_at;

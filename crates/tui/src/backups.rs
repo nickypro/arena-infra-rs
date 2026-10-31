@@ -116,8 +116,12 @@ pub(crate) fn tick(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, now: Instant) -> bo
     }
     s.backups.wanted = false;
     let pods = pods_in(&s, &ui.cfg);
+    // The configured names no row has, for the line under the pods (as `arena backups` says it) —
+    // only from a whole listing: a provider that failed would read as names without machines.
+    let without = if s.snap.partial.is_empty() { backups::without_machine(&ui.cfg, &pods) } else { Vec::new() };
     if ui.demo {
-        let status = demo::backups(&ui.cfg, &pods, arena_core::snapshot::unix_now());
+        let mut status = demo::backups(&ui.cfg, &pods, arena_core::snapshot::unix_now());
+        status.without_machine = without;
         put(&mut s, status, now);
         ui.backups.seen = s.backups.generation;
         return true;
@@ -128,7 +132,9 @@ pub(crate) fn tick(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, now: Instant) -> bo
     tokio::spawn(async move {
         let read = tokio::task::spawn_blocking(move || {
             let now = arena_core::snapshot::unix_now();
-            backups::judge(&backups::read(&cfg, Some(&config), backups::read_crontab(), pods, now))
+            let mut status = backups::judge(&backups::read(&cfg, Some(&config), backups::read_crontab(), pods, now));
+            status.without_machine = without;
+            status
         })
         .await;
         let mut s = shared.lock().unwrap();
@@ -383,9 +389,16 @@ fn running_line(status: &Status, now: u64) -> Line<'static> {
     Line::styled(format!("running now: {}", parts.join(" · ")), tone_style(Tone::Busy))
 }
 
-/// Where the copies live, one line each, and what no backup takes.
+/// Where the copies live, one line each, and what no backup takes — after the configured names
+/// with no machine now, on one line (`arena backups` says the same).
 fn storage_lines(status: &Status) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = status
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if !status.without_machine.is_empty() {
+        let n = status.without_machine.len();
+        let names = words::names_line(&status.without_machine, 8);
+        out.push(Line::styled(format!("{n} configured name{} no machine now: {names}", if n == 1 { " has" } else { "s have" }), tone_style(Tone::Dim)));
+    }
+    out.extend(status
         .storage
         .iter()
         .map(|s| {
@@ -395,8 +408,7 @@ fn storage_lines(status: &Status) -> Vec<Line<'static>> {
                 Span::raw(format!("{} — ", s.place)),
                 Span::styled(s.text.clone(), style(s.health)),
             ])
-        })
-        .collect();
+        }));
     out.extend(status.skips.iter().map(|l| Line::styled(l.clone(), style(Health::Fail))));
     out.extend(status.notes.iter().map(|n| Line::styled(format!("note: {n}"), tone_style(Tone::Warn))));
     out.push(Line::styled(format!("not covered: {}", backups::NOT_COVERED[0]), tone_style(Tone::Dim)));
@@ -565,6 +577,8 @@ mod tests {
             "backing up now",
             "all files: /mnt/big/big — 8 GB free of 500 GB on /mnt/big — under twice the floor",
             "git: github.com/example/ARENA_3.0",
+            // The test config's list (alpha..delta) has no demo machine: one line, as `arena backups`.
+            "4 configured names have no machine now: devtest-alpha, devtest-bravo, devtest-charlie, devtest-delta",
             "[esc/b] close  [↑↓] move  [enter] history  [o] order  [r] read again",
         ] {
             assert!(lines.contains(want), "no {want:?} in\n{lines}");

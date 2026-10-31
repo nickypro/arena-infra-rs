@@ -1393,7 +1393,8 @@ the moment that pod is done — a slow pod never holds up another.
 
 **A name with no OpenRouter key gets one.** With `OPENROUTER_PROVISIONING_KEY` set (and setup
 running), `up` lists the keys once before the prompt: each cohort name with no key on OpenRouter
-gets one minted after the prompt and before its create — capped at `OPENROUTER_KEY_LIMIT` (else
+gets one minted after the prompt and before its create (OpenRouter is read again then, with the
+keys folder held, so a key made meanwhile — `keys gen` elsewhere — is kept, never doubled) — capped at `OPENROUTER_KEY_LIMIT` (else
 $5), named as `keys gen` names it, the `--owner`'s in `arena spend` — so its keys stage copies it
 on. The plan says so (`will mint an OpenRouter key (cap $0.10, OPENROUTER_KEY_LIMIT) for …`) and
 each mint gets a `✓`/`✗` line. A name that has a key keeps it (a paused one too); one whose key is
@@ -1906,7 +1907,8 @@ in the keys CSV is checked against OpenRouter's listing first (one listing, with
 whose name has no key on OpenRouter (deleted on openrouter.ai, or from another control box), or
 whose secret is none of that name's keys (each key's redacted label says so: rotated from another
 keys folder), is left out, with `⚠ devtest-apple: the keys CSV's OpenRouter key is gone from
-OpenRouter … arena keys gen apple --copy mints a fresh one` (`keys rotate` for a replaced one). The
+OpenRouter … arena keys gen apple --copy mints a fresh one` (`keys rotate` for a replaced one). A
+key renamed on OpenRouter is still the row's (its label says so), and is copied. The
 machine's other keys are still copied. When the listing can't be read, the CSV is copied as before
 and one line says it's unchecked. The same check runs wherever keys are copied: `up`'s keys stage,
 `setup`, `keys gen|rotate --copy` and `replace`.

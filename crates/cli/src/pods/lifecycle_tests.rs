@@ -305,6 +305,9 @@ pub(crate) struct FakeKeys {
     pub(crate) keys: Mutex<Vec<KeyInfo>>,
     pub(crate) calls: Mutex<Vec<String>>,
     pub(crate) broken: Vec<&'static str>,
+    /// Another arena saving a key while this one deletes: each delete appends this row to that
+    /// file (the per-cohort CSV).
+    pub(crate) row_meanwhile: Option<(PathBuf, String)>,
 }
 
 impl FakeKeys {
@@ -349,6 +352,11 @@ impl KeyApi for FakeKeys {
             return Err(Error::provider("openrouter delete key: HTTP 500"));
         }
         keys.retain(|k| k.hash != hash);
+        if let Some((file, row)) = &self.row_meanwhile {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(file).unwrap();
+            writeln!(f, "{row}").unwrap();
+        }
         Ok(())
     }
     async fn rename_key(&self, hash: &str, new_name: &str) -> Result<()> {
@@ -797,6 +805,23 @@ async fn several_names_terminate_in_one_run_each_matched_exactly() {
     assert!(Cli::try_parse_from(["arena", "pods", "terminate", "alpha", "--all"]).is_err());
     let r = handle_pods(pods_cmd(&["terminate"]), &f, Arc::new(FakeRemote::new()), &cfg, true).await;
     assert!(r.unwrap_err().to_string().contains("specify the pods (names or ids) to terminate, or pass --all"));
+}
+
+/// A key another arena saves while `terminate --revoke-key` deletes (a parallel `up`'s mint) keeps
+/// its row: the revoked rows go from the CSV as it is when it's written, not as it was read.
+#[tokio::test]
+async fn a_row_saved_while_keys_are_revoked_is_kept() {
+    let dir = tmpdir("terminate-meanwhile");
+    let cfg = cfg(&dir.0);
+    let csv = keys_csv(&dir.0, "devtest-alpha,sk-a\ndevtest-bravo,sk-b\n");
+    let file = dir.0.join("devtest_openrouter_keys.csv");
+    let keys = FakeKeys { row_meanwhile: Some((file, "devtest-zulu,sk-z".into())), ..FakeKeys::with(&[("h-a", "devtest-alpha")]) };
+    let book = KeyBook::new(&csv, Some(&keys));
+    let f = fleet();
+    handle_terminate(&f, &cfg, &book, Some(&["alpha"]), topts(true, true, false, true)).await.unwrap();
+    assert_eq!(keys.calls(), ["delete h-a"]);
+    let text = cohort_csv(&dir.0);
+    assert!(!text.contains("devtest-alpha") && text.contains("devtest-bravo,sk-b") && text.contains("devtest-zulu,sk-z"), "{text}");
 }
 
 #[tokio::test]

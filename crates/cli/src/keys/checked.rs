@@ -26,7 +26,7 @@ use std::time::Duration;
 use arena_core::openrouter::{exact_money, key_name, KeyApi, KeyInfo};
 use arena_core::selector::Naming;
 
-use super::{machine_key_names, write_openrouter_key, KeySources};
+use super::{lock_keys_dir, machine_key_names, write_openrouter_key_held, KeySources};
 use crate::spend::SpendCtx;
 
 /// The variable a machine's OpenRouter key is exported as (`apikeys::PROVIDERS`).
@@ -49,7 +49,7 @@ pub(crate) fn label_says(label: Option<&str>, secret: &str) -> Option<bool> {
 /// Why a CSV row's key isn't a live one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Stale {
-    /// No key on OpenRouter goes by the machine's name.
+    /// No key on OpenRouter goes by the machine's name, and none's label is the row's secret.
     Gone,
     /// Keys go by its name, but the row's secret is none of them (each label says so): it was
     /// rotated or re-minted elsewhere.
@@ -58,14 +58,20 @@ pub(crate) enum Stale {
 
 /// Whether the keys CSV's `secret` for machine `host` is a key `listed` (OpenRouter's whole
 /// listing, disabled keys included: a paused key still exists) still has. `None`: it is, or the
-/// labels can't tell. Pure.
+/// labels can't tell. A key renamed on OpenRouter (a name is only a label there) is still found by
+/// its label. Pure.
 pub(crate) fn stale(naming: &Naming, host: &str, secret: &str, listed: &[KeyInfo]) -> Option<Stale> {
     let names = machine_key_names(naming, host);
     let theirs: Vec<&KeyInfo> = listed.iter().filter(|k| k.name.as_deref().is_some_and(|n| names.iter().any(|w| w == n))).collect();
     if theirs.is_empty() {
-        return Some(Stale::Gone);
+        return (!listed_under_another_name(secret, listed)).then_some(Stale::Gone);
     }
     theirs.iter().all(|k| label_says(k.label.as_deref(), secret) == Some(false)).then_some(Stale::Replaced)
+}
+
+/// Whether some listed key's label says it is `secret` — whatever it's named now.
+fn listed_under_another_name(secret: &str, listed: &[KeyInfo]) -> bool {
+    listed.iter().any(|k| label_says(k.label.as_deref(), secret) == Some(true))
 }
 
 /// A machine's name without the fleet prefix, as commands take it (`apple`).
@@ -134,12 +140,15 @@ pub(crate) struct MintPlan {
 }
 
 /// `pods up`'s keys for `names`: each cohort name with no key on OpenRouter gets one minted
-/// (`handing`: names a handover gives a fresh key anyway), a staff box is only told about. No
-/// listing (no provisioning key): nothing. A listing that failed: nothing minted, said. Pure.
+/// (`handing`: names a handover gives a fresh key anyway), a staff box is only told about. A name
+/// whose key in the keys CSV (`csv`) OpenRouter still has under another name (renamed there) has a
+/// key. No listing (no provisioning key): nothing. A listing that failed: nothing minted, said.
+/// Pure.
 pub(crate) fn plan_mints(
     naming: &Naming,
     names: &[String],
     handing: &[String],
+    csv: Option<&KeySources>,
     listed: Option<Result<Vec<KeyInfo>, String>>,
     limit: f64,
     dry_run: bool,
@@ -155,6 +164,7 @@ pub(crate) fn plan_mints(
             let has_key = |n: &str| {
                 let names = machine_key_names(naming, n);
                 keys.iter().any(|k| k.name.as_deref().is_some_and(|kn| names.iter().any(|w| w == kn)))
+                    || csv.and_then(|c| c.openrouter_secret(n)).is_some_and(|secret| listed_under_another_name(secret, keys))
             };
             for n in names.iter().filter(|n| !handing.contains(n) && !has_key(n)) {
                 if naming.is_cohort(n) {
@@ -190,16 +200,55 @@ pub(crate) struct Minted {
     pub lines: Vec<String>,
     /// The names that got a key (in the CSV now).
     pub names: Vec<String>,
+    /// OpenRouter's listing as read under the lock, before the mints: newer than the plan's, for
+    /// the copy's check ([`check_csv_keys`]) of the names not minted.
+    pub listed: Option<Vec<KeyInfo>>,
 }
 
 /// Mint `plan`'s keys: each named after its machine, capped at the plan's limit, saved to the keys
-/// CSV in `dir` and recorded for `arena spend` as `owner`'s. A failure is a `✗` line naming what
-/// to run, never an error: the machine comes up without a key, as it did before.
+/// CSV in `dir` and recorded for `arena spend` as `owner`'s. The keys folder is held from a fresh
+/// listing to the last saved secret ([`lock_keys_dir`]), so a name that got a key while this `up`
+/// waited at its prompt (`keys gen`, another `up`) keeps that one: never two keys for a name. A
+/// failure is a `✗` line naming what to run, never an error: the machine comes up without a key,
+/// as it did before.
 pub(crate) async fn mint_missing(api: &dyn KeyApi, ctx: &SpendCtx, naming: &Naming<'_>, dir: &std::path::Path, plan: &MintPlan, owner: Option<&str>) -> Minted {
     let mut done = Minted::default();
+    if plan.mint.is_empty() {
+        return done;
+    }
+    let none_minted = |done: &mut Minted, why: String| {
+        for host in &plan.mint {
+            done.lines.push(format!("✗ {host}: no OpenRouter key minted ({why}) — `arena keys gen {} --copy` once it's up", short(naming, host)));
+        }
+    };
+    let _ = std::fs::create_dir_all(dir);
+    let _held = match lock_keys_dir(dir) {
+        Ok(h) => h,
+        Err(e) => {
+            none_minted(&mut done, format!("the keys folder {} stayed locked: {e}", dir.display()));
+            return done;
+        }
+    };
+    let listed = match arena_core::ratelimit::bounded(LIST_TIMEOUT, api.list_keys()).await {
+        Ok(Ok(k)) => k,
+        Ok(Err(e)) => {
+            none_minted(&mut done, format!("listing OpenRouter keys again failed: {e}"));
+            return done;
+        }
+        Err(_) => {
+            none_minted(&mut done, format!("OpenRouter's keys didn't list again within {}s", LIST_TIMEOUT.as_secs()));
+            return done;
+        }
+    };
     let whose = owner.map(|o| format!(", {o}'s")).unwrap_or_default();
+    done.listed = Some(listed.clone());
     for host in &plan.mint {
         let s = short(naming, host);
+        let names = machine_key_names(naming, host);
+        if listed.iter().any(|k| k.name.as_deref().is_some_and(|n| names.iter().any(|w| w == n))) {
+            done.lines.push(format!("= {host}: has an OpenRouter key now (made while this waited) — kept, none minted"));
+            continue;
+        }
         let kn = key_name(naming.prefix, naming.list, host);
         let ck = match api.create_key(&kn, Some(plan.limit)).await {
             Ok(ck) => ck,
@@ -210,7 +259,7 @@ pub(crate) async fn mint_missing(api: &dyn KeyApi, ctx: &SpendCtx, naming: &Nami
         };
         ctx.key_minted(&ck.hash, host, owner);
         let short_hash = &ck.hash[..ck.hash.len().min(12)];
-        match write_openrouter_key(dir, host, &ck.secret, naming.prefix) {
+        match write_openrouter_key_held(dir, host, &ck.secret, naming.prefix) {
             Ok(()) => {
                 done.lines.push(format!("✓ {host}: OpenRouter key minted (a fresh key {short_hash}, cap {}{whose})", exact_money(plan.limit)));
                 done.names.push(host.clone());
@@ -266,7 +315,7 @@ mod tests {
         let n = naming();
         let cases: &[(&[KeyInfo], Option<Stale>)] = &[
             (&[], Some(Stale::Gone)),
-            (&[key("devtest-bloom", Some("sk-or-v1-0e6...1c96"))], Some(Stale::Gone)),
+            (&[key("devtest-bloom", Some("sk-or-v1-111...2222"))], Some(Stale::Gone)),
             (&[key("devtest-apple", Some("sk-or-v1-0e6...1c96"))], None),
             (&[key("devtest-apple", Some("sk-or-v1-999...0000"))], Some(Stale::Replaced)),
             (&[key("devtest-apple", None)], None),
@@ -279,6 +328,9 @@ mod tests {
         // A paused (disabled) key still exists.
         let paused = KeyInfo { disabled: true, ..key("devtest-apple", None) };
         assert_eq!(stale(&n, "devtest-apple", SECRET, &[paused]), None);
+        // Renamed on OpenRouter (`apple — alice's`): still the row's key, found by its label.
+        assert_eq!(stale(&n, "devtest-apple", SECRET, &[key("apple — alice's", Some("sk-or-v1-0e6...1c96"))]), None);
+        assert_eq!(stale(&n, "devtest-apple", SECRET, &[key("apple — alice's", Some("sk-or-v1-999...0000"))]), Some(Stale::Gone));
     }
 
     struct Dir(std::path::PathBuf);
@@ -349,30 +401,39 @@ mod tests {
         let n = naming();
         let names: Vec<String> = ["devtest-apple", "devtest-bloom", "devtest-cedar", "staff-gpu"].map(String::from).to_vec();
         let listed = vec![KeyInfo { disabled: true, ..key("devtest-bloom", None) }];
-        let plan = plan_mints(&n, &names, &["devtest-cedar".into()], Some(Ok(listed)), 0.05, false);
+        let plan = plan_mints(&n, &names, &["devtest-cedar".into()], None, Some(Ok(listed)), 0.05, false);
         assert_eq!(plan.mint, ["devtest-apple"]);
         assert_eq!(plan.lines[0], "will mint an OpenRouter key (cap $0.05, OPENROUTER_KEY_LIMIT) for devtest-apple: none on OpenRouter — each is copied on once its machine is set up");
         assert_eq!(plan.lines[1], "staff-gpu: no OpenRouter key, and none is minted for a staff box — `arena keys gen staff-gpu --copy` if it should have one");
         assert!(matches!(plan.listed, Some(Ok(ref k)) if k.len() == 1), "kept for the copy's check");
-        let dry = plan_mints(&n, &names[..1], &[], Some(Ok(vec![])), 5.0, true);
+        let dry = plan_mints(&n, &names[..1], &[], None, Some(Ok(vec![])), 5.0, true);
         assert!(dry.lines[0].starts_with("[dry-run] would mint an OpenRouter key (cap $5.00"), "{:?}", dry.lines);
-        let failed = plan_mints(&n, &names, &[], Some(Err("HTTP 401".into())), 5.0, false);
+        let failed = plan_mints(&n, &names, &[], None, Some(Err("HTTP 401".into())), 5.0, false);
         assert!(failed.mint.is_empty());
         assert_eq!(failed.lines, ["⚠ OpenRouter's keys couldn't be listed (HTTP 401): no key is minted for a name that has none — `arena keys gen <name> --copy` once it answers"]);
-        let none = plan_mints(&n, &names, &[], None, 5.0, false);
+        let none = plan_mints(&n, &names, &[], None, None, 5.0, false);
         assert!(none.mint.is_empty() && none.lines.is_empty());
+        // apple's key in the CSV, renamed on OpenRouter: it has a key — none minted.
+        let d = dir("plan-renamed");
+        let csv = sources(&d, &[("devtest-apple", SECRET)]);
+        let renamed = vec![key("apple — alice's", Some("sk-or-v1-0e6...1c96"))];
+        assert!(plan_mints(&n, &names[..1], &[], Some(&csv), Some(Ok(renamed)), 5.0, false).mint.is_empty());
+        let other = vec![key("apple — alice's", Some("sk-or-v1-999...0000"))];
+        assert_eq!(plan_mints(&n, &names[..1], &[], Some(&csv), Some(Ok(other)), 5.0, false).mint, ["devtest-apple"]);
     }
 
     #[derive(Default)]
     struct FakeKeys {
         created: Mutex<Vec<(String, Option<f64>)>>,
         refuse: Vec<String>,
+        /// What the listing has (besides what this fake created).
+        listed: Vec<KeyInfo>,
     }
 
     #[async_trait::async_trait]
     impl KeyApi for FakeKeys {
         async fn list_keys(&self) -> arena_core::Result<Vec<KeyInfo>> {
-            Ok(Vec::new())
+            Ok(self.listed.clone())
         }
         async fn create_key(&self, name: &str, limit: Option<f64>) -> arena_core::Result<CreatedKey> {
             if self.refuse.iter().any(|r| r == name) {
@@ -409,5 +470,13 @@ mod tests {
         let csv = std::fs::read_to_string(d.0.join("openrouter_api_keys.csv")).unwrap();
         assert!(csv.contains("devtest-apple,sk-or-v1-devtest-apple") && !csv.contains("bloom"), "{csv}");
         assert_eq!(arena_core::spend::key_owner(&ctx.state(), "devtest-apple"), Some("alice"));
+        assert!(done.listed.is_some(), "the listing it read under the lock, for the copy's check");
+        // A key made for a planned name while `up` waited at its prompt (`keys gen` elsewhere):
+        // seen in the listing read under the lock — kept, no second key.
+        let api = FakeKeys { listed: vec![key("devtest-cedar", None)], ..FakeKeys::default() };
+        let plan = MintPlan { mint: vec!["devtest-cedar".into()], limit: 0.1, ..MintPlan::default() };
+        let done = mint_missing(&api, &ctx, &n, &d.0, &plan, Some("alice")).await;
+        assert_eq!(done.lines, ["= devtest-cedar: has an OpenRouter key now (made while this waited) — kept, none minted"]);
+        assert!(done.names.is_empty() && api.created.lock().unwrap().is_empty());
     }
 }

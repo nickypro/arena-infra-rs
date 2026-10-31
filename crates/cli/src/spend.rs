@@ -388,6 +388,17 @@ pub(crate) async fn hand_over(ctx: &SpendCtx, cfg: &Config, api: Option<&dyn Key
         done.failed = names();
         return done;
     };
+    // The keys folder is held from the listing to the last saved secret: another arena minting
+    // for one of these names meanwhile (`keys gen`, another `up`) waits, never mints beside it.
+    let _ = std::fs::create_dir_all(dir);
+    let _held = match super::lock_keys_dir(dir) {
+        Ok(h) => h,
+        Err(e) => {
+            done.lines.push(format!("✗ key handover: the keys folder {} stayed locked ({e})", dir.display()));
+            done.failed = names();
+            return done;
+        }
+    };
     let listed_at = unix_now();
     let keys = match api.list_keys().await {
         Ok(k) => k,
@@ -412,7 +423,7 @@ pub(crate) async fn hand_over(ctx: &SpendCtx, cfg: &Config, api: Option<&dyn Key
                 ctx.keys_deleted(&theirs, &deleted);
                 ctx.key_minted(&ck.hash, &h.name, Some(owner));
                 let short = ck.hash[..ck.hash.len().min(12)].to_string();
-                match super::write_openrouter_key(dir, &h.name, &ck.secret, &prefix) {
+                match super::write_openrouter_key_held(dir, &h.name, &ck.secret, &prefix) {
                     Ok(()) => {
                         done.lines.push(format!(
                             "✓ {}: OpenRouter key handed over ({} → {owner}, a fresh key {short}, cap {})",
@@ -447,7 +458,7 @@ pub(crate) async fn hand_over(ctx: &SpendCtx, cfg: &Config, api: Option<&dyn Key
             done.failed.push(h.name.clone());
             // Its old key is gone and no fresh one saved: its CSV row would hand a dead key on.
             if !deleted.is_empty() {
-                match super::drop_key_row(dir, &h.name) {
+                match super::drop_key_row_held(dir, &h.name) {
                     Ok(dropped) => done.csv_changed |= dropped,
                     Err(e) => done.lines.push(format!(
                         "✗ {}: its deleted key's row couldn't be removed from the keys CSV ({e}) — `arena keys revoke {}` drops it",
