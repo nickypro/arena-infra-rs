@@ -1761,13 +1761,14 @@ on its details cadence, in the background (once a minute, `r` sooner; the listin
 credit within 5 s, each keeping its last answer if its read fails — the `AI$` cells go grey then):
 an `AI$` column (each pod's key: spent/cap, yellow from 80%, red at the cap or disabled, `-` no key —
 shown from 122 columns), an `ai key:` line in the detail pane (the cap, what's left, today, week,
-month, all told), and the top line's `AI $3.20 today · credit $422.09` (the info panel: `openrouter
-$422.09 left · AI today $3.20`). A warning leads the top line, in yellow when the credit is less than
-the enabled keys' caps could still spend (`⚠ AI credit $5.00 < caps' $8.00`) or a key is at its cap,
-and in red when the credit is gone (`‼ AI credit $0.00 — every key's calls fail`). The keys at their cap are named — `⚠ AI key at cap:
-arena9-foo (no pod)`, two at most, then `+N more` — those no listed pod is named after first
-(`(no pod)`: no row shows it, e.g. its machine was terminated or renamed); the detail pane's `ai
-caps:` line lists them all and points at `arena keys list`. A key with a $0 cap that has spent
+month, all told), and the top line's `OpenRouter $3.20 today · $422.09 left` (the info panel:
+`openrouter $422.09 left · AI today $3.20`). Its group turns yellow, `⚠` in front, when the credit
+is less than the enabled keys' caps could still spend (`⚠ OpenRouter $5.00 left < caps' $8.00`) or a
+key is at its cap, and red when the credit is gone (`⚠ OpenRouter $0.00 left, calls fail`). The keys
+at their cap are named — `key at cap: arena9-foo (no pod)`, `3 keys at cap: arena9-foo (no pod),
+arena9-bar +1 more`, two at most (on a narrow terminal just `key at cap`) — those no listed pod is
+named after first (`(no pod)`: no row shows it, e.g. its machine was terminated or renamed); the
+detail pane's `ai caps:` line lists them all and points at `arena keys list`. A key with a $0 cap that has spent
 nothing in its cap's period is **paused**, not at its cap: its cell says `paused` (grey) and the
 warning leaves it out. The credit is the account's (an organization's whole), whatever the workspace.
 
@@ -2571,11 +2572,20 @@ These keep the participants' work, and have their own page, [BACKUPS.md](BACKUPS
 | `cron install / remove / show` | [`cron`: the lines that run it all](BACKUPS.md#cron-the-lines-that-run-it-all) |
 | `pods idle`, `pods reap` | [Idle pods and the auto-reaper](BACKUPS.md#idle-pods-and-the-auto-reaper) |
 | `archive …` | [Backup archive (`arena archive`)](BACKUPS.md#backup-archive-arena-archive) |
+| `backups [--json]` | [What gets backed up, where and when](BACKUPS.md#what-gets-backed-up-where-and-when) |
 
 `archive up|status|sync|resize|access|ssh-config|ssh|forget|unforget|down` — the **backup archive**:
 an always-on Hetzner VM with two volumes (dated snapshots, all files) holding copy #2 of
 `LOCAL_BACKUP_DIR`, pushed by cron, readable by participants once `access on`; never part of the
 fleet. See [Backup archive](BACKUPS.md#backup-archive-arena-archive).
+
+`backups [--json]` — **what gets backed up, where and when**, read-only: each backup job (the git
+backup, the home copy, the archive's two pushes) set up or not and how often, its last run and
+result, when it's next due and whether it's running now; each cohort pod's last git save, home
+copy and archive copy, failing first; where the copies live, with their free space. It reads this
+box only (the crontab, the run record `backups.json`, `LOCAL_BACKUP_DIR`, the archive's state, the
+locks), and says `?` with why for anything it can't read. Exits 0. The dashboard's `b` shows the
+same. See [What gets backed up, where and when](BACKUPS.md#what-gets-backed-up-where-and-when).
 
 ## The dashboard (`arena-tui`)
 
@@ -2617,15 +2627,33 @@ and the dashboard never unlocks), **HLTH** = the last `pods test --deep` verdict
 GPU error` + the failing check's text), **PROXY** = the stable port, green live, yellow with a `!`
 when stale (`9501!`; detail pane: `:9501 stale (arena proxy apply re-points it)`), `-` no forward,
 `?` remote proxy, **💾** = when the repo was last committed (`↑` unpushed, `↓` behind, `⇕`
-diverged). The **top line** is the fleet in short — pods, GPUs and util, unreachable, the burn
-(`$` and Hetzner `€` kept apart, unpriced pods counted), balances, AI today — **led** by a yellow
-`⚠ vast failed to list — pods/cost missing` when a provider didn't answer (first, so a narrow
-terminal can't cut it off); the provider and config only when not the default, at its right. The
-info panel (`i`) has `pods list`'s footer word for word plus per day. It ends with the account prepaid
-balances (`arena balance`'s views, observed in the details round — at most one live read per account
-per 5 min — and recorded in the CLI's state file; a low account moves to the front in yellow, a
-critical one in red, with its amount: `‼ runpod $1.20 ≈1.9d`; an unfunded opt-in account with
-nothing billing there stays at the end, `shadeform $0.00 unfunded`). API calls per refresh are at
+diverged). The **top line** is the fleet in groups, a dim `│` between them:
+
+```text
+ 51 pods, 48 GPUs 37% · 2 unreachable │ 42 RunPod $520.30 ≈4.6d · $4.62/h │ ⚠ Vast $40.00 ≈40h │ 9 Hetzner €1.23/h │ ⚠ OpenRouter key at cap: arena9-apple (a → raise cap) · $12.40 today · $422.09 left
+```
+
+first the fleet (pods, GPUs and their mean util, unreachable pods in yellow); then one group per
+provider with pods — its count and name, the prepaid account's balance (`~$118.30 est.` for an
+estimate) and runway, and the burn of its pods (each provider's own, in its currency: Hetzner's `€`,
+postpaid, has no balance; `(2 unpriced)` when some have no price, so the figure is a floor); then
+OpenRouter's (the cohort's spend today, the credit left). A group's name is green while all is well;
+`⚠` in front and yellow when its account is low, red when critical (`⚠ 3 RunPod $5.00 ≈11h`) or when
+the provider didn't answer (`⚠ Vast: list failed`: its pods and their cost are missing); OpenRouter's
+the same for its own (credit under the keys' caps, keys at their cap, credit gone). A provider with no pods and nothing wrong — an unfunded opt-in
+account with nothing billing there, `shadeform $0.00 unfunded`, included — has no group (the info
+panel has it). The line is built to fit the terminal: the least needed words go first, each kind in
+every group at once — the provider and config tag at the right end (shown only when not the
+default), GPU util, the GPU count, a fine account's runway, today's AI spend, keys with no cap, a
+warning's details (`key at cap`, the names left to the info panel and the `AI$` column), the burns,
+a fine account's balance and the credit, the providers' pod counts, the fleet's — and never a
+warning or a group's name: at 80 columns the same fleet reads ` 2 unreachable │ RunPod │ ⚠ Vast
+$40.00 ≈40h │ Hetzner │ ⚠ OpenRouter key at cap`. With more warnings than the width holds, the red
+ones go first, then the yellow, then the calm names, and the groups that still don't fit are counted
+at the end (`+2 more`, in the worst colour among them). A click on it opens the info panel, which has `pods
+list`'s footer word for word plus per day, and the prepaid balances (`arena balance`'s views,
+observed in the details round — at most one live read per account per 5 min — and recorded in the
+CLI's state file). API calls per refresh are at
 most one list per provider; the details query (GPU/$/maintenance) runs every 60 s or on `r` (≥10 s
 apart); one that fails part-way still shows what it filled (as `pods list` does) over the last good
 answer, with a footer warning.
@@ -2689,12 +2717,18 @@ Every pod SSH call goes through `Remote` with a budget (metrics 20 s, test 90 s,
 
 **Navigate** with `↑/↓`/`j/k`; `enter` opens a per-pod detail pane (per-GPU breakdown, full
 branch/origin/health, util/temp **sparklines**; labels dim, each value in the colour the table gives
-its state). The footer is `[i] info · <status> · 7s ago · every 5s` (refreshed 7 s ago, every 5 s;
-`refreshing, last 7s ago` while it does; a notice, a run going on or a question out comes before the
-status), in plain words, and the most-used keys; **`i`**, or a click on
-`[i] info`, opens the **info panel**: provider, config, the whole status,
+its state). The footer is `[i] info · <status> · ↻ 7s ago · every 5s` (refreshed 7 s ago, every 5 s;
+`refreshing, last 7s ago` while it does, the `↻` in cyan; a notice, a run going on or a question out
+comes before the status), in plain words but for that one mark, and the most-used keys; **`i`**, or a
+click on `[i] info` or on the top line, opens the **info panel**: provider, config, the whole status,
 deep checks running, the fleet's summary word for word, each prepaid account, the OpenRouter credit
 and keys at their cap, every key, and what each column's glyphs mean (Esc or `i` closes it).
+**`b`**, or a click on the `💾` column's header, opens the **backups screen**: each backup job
+(how often, last run, next run, or the command that sets it up), what's running now, and every
+pod's last git save, home copy and archive copy, failing first (`o` reorders), then where the
+copies live. Enter opens a pod's history, from which `b` backs it up now and `h` copies its home
+now (each with its confirm; the screen comes back after). The screen shows what `arena backups`
+prints: [What gets backed up, where and when](BACKUPS.md#what-gets-backed-up-where-and-when).
 `Ctrl-C`/`q` quit. A hangup or a TERM ends it at
 once (exit status 129 or 143), and so does its terminal hanging up (a dropped SSH session, a killed
 tmux server: 129) — never waiting on its event loop, which a dead terminal stalls. However it ends,

@@ -17,6 +17,11 @@ flowchart LR
 
 ## Contents
 
+- [What gets backed up, where and when](#what-gets-backed-up-where-and-when)
+  - [How to check: `arena backups` and the dashboard's `b`](#how-to-check-arena-backups-and-the-dashboards-b)
+  - [The schedule](#the-schedule)
+  - [Getting files back](#getting-files-back)
+  - [What isn't covered](#what-isnt-covered)
 - [`pods backup`: the full save](#pods-backup-the-full-save)
   - [Which pods](#which-pods)
   - [Flags, budgets and dry runs](#flags-budgets-and-dry-runs)
@@ -61,6 +66,108 @@ flowchart LR
   - [A rebuilt archive, and the participants' access](#a-rebuilt-archive-and-the-participants-access)
   - [State](#state)
   - [End of the program](#end-of-the-program)
+
+## What gets backed up, where and when
+
+Every backup arena makes, what starts it, where its copy lands and what it leaves behind to say
+how it went:
+
+| Backup | Started by | Where the copy lands | What it records |
+|---|---|---|---|
+| git backup (`pods backup`) | the cron's backup line, every 15 min (`cron install --backup`); `pods backup`; the dashboard's `a` → backup | the cohort repo on GitHub (`ARENA_REPO_OWNER/NAME`), each pod's current branch (`autocommit-<prefix>-wNdM-<pod>`; never main/master) | `backups.json` (state dir); the cron log; the cron's `backup.lock`; the pod's `.arena-locks/<pod>.lock` |
+| home copy (`pods pull`) | each cron backup without `--no-pull` (`cron install --backup --pull`); `pods pull`; `pods backup` by hand; a pod git couldn't back up (even under `--no-pull`) | `LOCAL_BACKUP_DIR/<wNdM>/<pod>/` (files under `BACKUP_MAX_SIZE`, hard-linked day to day) and `<all-files tier>/<pod>/` (`LOCAL_BACKUP_BIG_DIR`, else `LOCAL_BACKUP_DIR/big`) | `backups.json`; `LOCAL_BACKUP_DIR/.arena-copied/<pod>` (last whole copy); `disk-skips.json` (skipped for room); the pod's lock |
+| archive (`archive sync`) | the cron's two archive lines: snapshots at :07/:22/:37/:52, all files at :40 (`cron install --archive`) | the archive VM's `snap` and `big` volumes (`<prefix>-archive`), read-only for participants over sftp | `archive/sync-snap.json`, `sync-big.json` and their locks (state dir); `archive.log` |
+| fleet baseline (`pods baseline`) | by hand, once a week on a fresh pod | `LOCAL_BACKUP_DIR/baseline/w<N>/fleet/` (what every snapshot hard-links to) | the directory itself |
+| the reaper's last copy (`pods reap`) | the reap cron line, before it terminates an idle pod (`cron install --reap apply`) | `LOCAL_BACKUP_DIR/reaped/<pod>/…` and the all-files tier's `reaped/` | `reap.json` (state dir); `reap.log` |
+| BUSY copy | `pods backup`, for a pod with a merge or rebase in progress (not committed) | the home copy's place, as above | `busy-copies.json` (state dir) |
+| `set-branch --hard`'s save | a hard branch switch, before it discards anything | on the pod: `.git/arena-discarded/<time>/`, and a copy into `LOCAL_BACKUP_DIR` first | the pod's line; `refs/arena-discarded/…` on the pod |
+| replace/migrate staging | `pods replace` / `pods migrate` copying a home via this box | `$TMPDIR/arena-replace-<pod id>` (removed once the copy lands) | listed by `config check` and `teardown --check` |
+| `pods restore` | by hand: a backup back onto a pod | the pod; the files it replaced in `~/.arena-restore/<time>/` (or under `/workspace`) | the pod |
+
+The first three run by themselves once `arena cron install --backup --pull --archive` has put
+their lines in the crontab (`--pull` makes each 15-minute backup copy the homes too; `--archive`
+needs `arena archive up` first). The rest are things you do, or steps inside them.
+
+### How to check: `arena backups` and the dashboard's `b`
+
+`arena backups` (`--json` for scripts) and the dashboard's backups screen — `b`, or a click on
+the `💾` column's header — show the same status, read from this box only: the crontab, the run
+record, `LOCAL_BACKUP_DIR`, the archive's state and the locks. Neither touches a pod or a provider.
+
+- **Each job**: the git backup, the home copy, the archive's snapshot push and its all-files
+  push. For each: set up or not (and the command that sets it up), how often (`every 15 min`,
+  `hourly at :07 :22 :37 :52`), its last run and result, when it's next due, and whether it's
+  running now. A job is **late** when its last run ended more than twice its interval ago, plus
+  ten minutes, and nothing is running. Under a job that isn't fine, a line says why: the pods that
+  failed, `41 on main/master — not saved to git until arena pods init-branches`, the archive's
+  last error.
+- **Running now**: a run under way (from the record, with its start), the cron's backup line
+  holding its `flock`, the pods whose backup lock is held (`backing up now: apple, bloom`), and an
+  archive tier's sync lock. Locks are read from `/proc/locks` and never taken. A cron tick that
+  found its lock taken would skip a whole backup. Where `/proc/locks` can't be read, this is
+  unknown, with why.
+- **Each pod**: its last git save, home copy (size and snapshot label) and archive copy, with how
+  long ago, failing pods first, then the ones longest since a good backup. The screen's `o`
+  switches to oldest first, or by name. A failure names the job and its reason (`home copy:
+  [big] rsync exit 24 …`). A cohort pod that's up and hasn't been backed up for twice the job's
+  interval is late. On the screen, Enter opens a pod's history, newest first. A run of the same
+  result is one line (`no changes ×12 since 09:00`). The history offers **back up now** (`b`:
+  the action menu's git backup, with its confirm) and **copy home now** (`h`: `arena pods pull
+  <pod>` in the runs panel, after a confirm). The screen comes back when either is done.
+- **Where the copies live**: each filesystem the copies land on, with its free space, judged
+  like every copy is ([`CONTROL_MIN_FREE_GB`](#room-on-this-box-control_min_free_gb)): ⚠ under
+  twice the floor, ✗ under it. Then the cohort repo, and the archive VM with its volumes. Copies
+  skipped for room in the last day are listed below them.
+
+**Unknown is never "ok" or "never".** A record, crontab or state that can't be read is `?`, and
+the line says why: the record unreadable, written by another version, or nothing recorded yet.
+
+#### The run record
+
+`pods backup`, `pods pull`, `set-branch`'s backup first and the dashboard's own backup write
+`backups.json` in the state dir (`$ARENA_STATE_DIR/<prefix>/`, else
+`~/.local/state/arena/<prefix>/`). It holds, per pod, its last git backup and home copy, when
+each last went through, and a short history. It also holds each job's last fleet-wide run (the
+cron's, or `pods backup` with no pods named) and the runs under way, by pid. A run killed halfway
+reads as interrupted. A run over named pods (`pods backup apple`, a copy of a pod git couldn't
+back up) records those pods' results but not the job's run, so a backup by hand never stands in
+for the cron's. Writing the record is best effort: a failed write is a warning, never a failed
+backup.
+
+Before this record existed, the only trace was the cron log, which has no times. Until the cron's
+arena has the record, `arena backups` says `none recorded yet` and when the cron log was last
+written. Each pod's home copy is read from `.arena-copied/<pod>` (its last whole copy) and its
+newest snapshot label. If the cron's line runs with another `--config` than yours, the note says
+so: its runs are in its own state dir's record.
+
+### The schedule
+
+| Cron line | Runs | When | Log |
+|---|---|---|---|
+| backup (`--backup`) | `pods backup --yes`: git, then (with `--pull`) the home copy | every 15 min | `~/.local/state/arena-cron/backup.log` |
+| archive (`--archive`) | `archive sync --tier snap`, then `--tier big` | :07 :22 :37 :52, and :40 | `archive.log` |
+| reap (`--reap`) | the reaper's last copy before a terminate | :11 :27 :41 :57 | `reap.log` |
+| health (`--health HH:MM`) | `pods test --deep`, which also lists copies skipped for room | daily | `health.log` |
+
+`arena cron show` prints the installed lines. [`cron`](#cron-the-lines-that-run-it-all) covers
+their locks and logs.
+
+### Getting files back
+
+| From | How |
+|---|---|
+| A day's snapshot on this box | `arena pods restore <pod>` (newest), `--from w3d4`, `--path ARENA_materials/chapter1` |
+| Every file, any size | `arena pods restore <pod> --from big` |
+| Git | the pod's branch on GitHub (`autocommit-<prefix>-wNdM-<pod>`): `git fetch origin && git checkout <branch>` |
+| The archive | participants: `sftp archive-<prefix>`, once `arena archive access on` |
+
+### What isn't covered
+
+- dot-directories other than `.claude/` and `.git` (`.cache`, `.config`, …), venvs, `site-packages`, `node_modules`, Hugging Face caches
+- files over 95 MB stay out of git (the home copy has them); a home copy's snapshot keeps files under `BACKUP_MAX_SIZE` (the all-files tier keeps the rest)
+- pods that are stopped or unreachable when the cron runs, and staff (`@`) boxes unless named
+- pods on main/master: no git backup until `arena pods init-branches` (the home copy still runs)
+- this box's own state (`ARENA_STATE_DIR`: the archive's keys, the records) — back it up yourself
 
 ## `pods backup`: the full save
 

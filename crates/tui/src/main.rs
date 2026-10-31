@@ -17,10 +17,11 @@
 //! deep-checks the cursor pod (or the marked set) in the background and records the
 //! verdicts in that cache; `/` marks pods by the CLI's selector syntax (`apple..delta`).
 //! Every pod SSH call goes through `arena_core::remote::Remote` with a time budget, so a
-//! wedged pod can't hang an action. The summary bar also carries the prepaid accounts'
-//! balance and runway (`arena balance`'s views, observed inline in the refresh's slower
-//! details round — at most one live read per account per 5 min — and recorded in the same
-//! state file the CLI keeps; a low or critical one leads the bar).
+//! wedged pod can't hang an action. The top line groups the fleet by provider, each with its
+//! prepaid account's balance and runway (`arena balance`'s views, observed inline in the
+//! refresh's slower details round — at most one live read per account per 5 min — and
+//! recorded in the same state file the CLI keeps; a low or critical one marked `⚠`), and is
+//! built to fit the terminal's width without leaving out a warning (`state::top_parts`).
 //!
 //! Safety against live prod is built into the *interaction*, not bolted on: a mutating
 //! action always pops a confirmation modal. Lifecycle actions (restart/stop/terminate)
@@ -33,6 +34,7 @@
 
 mod aikey;
 mod ask;
+mod backups;
 mod columns;
 mod demo;
 mod lag;
@@ -177,6 +179,9 @@ enum Mode {
     Ask { scope: InputScope, value: String, pick: arena_core::ask::Pick },
     /// An answer to a `?` question: scrollable; Esc closes.
     Answer(ask::Answer),
+    /// `b`, or a click on the 💾 header: the backups screen — which backups happen, when, how
+    /// they're doing, per pod (`backups.rs`).
+    Backups(backups::View),
     /// `i`, or a click on the footer's `[i] info`: everything the top line and the footer leave out
     /// (provider, config, the whole status, refresh, deep checks, the fleet's words, balances,
     /// AI, every key, what the glyphs mean), scrollable. `detail`: opened from the detail view
@@ -263,6 +268,8 @@ struct Shared {
     /// A run that changed AI keys ended (`runs.rs`): the next refresh reads them at once, not on
     /// the minute's cadence, so the `AI$` cell and the summary show the change.
     ai_wanted: bool,
+    /// The backups' status as the screen last read it (`backups.rs`).
+    backups: backups::Landed,
 }
 
 impl Shared {
@@ -344,11 +351,15 @@ struct Ui {
     /// Where the footer's `[i] info` was last drawn (its first cell), set by `view`: a click on it opens the
     /// info panel ([`handle_mouse`]).
     menu_at: std::cell::Cell<Option<(u16, u16)>>,
+    /// The row the top line was last drawn on, set by `view`: a click on it opens the info panel too.
+    top_at: std::cell::Cell<Option<u16>>,
     /// A provisioning key is configured: the action menus have the AI key's rows (`aikey.rs`).
     ai_keys: bool,
     /// The marked set's pods and keys an AI key confirm was opened with — what it runs on
     /// (`aikey::choose_set`).
     ai_set: Vec<(String, Option<arena_core::openrouter::KeyInfo>)>,
+    /// The backups screen's state beyond its mode (`backups.rs`).
+    backups: backups::State,
 }
 
 impl Ui {
@@ -482,8 +493,10 @@ async fn main() -> Result<()> {
         offers: offers::State::new(true),
         demo: demo.is_some(),
         menu_at: std::cell::Cell::new(None),
+        top_at: std::cell::Cell::new(None),
         ai_keys,
         ai_set: Vec::new(),
+        backups: backups::State::default(),
     };
 
     dashboard(&shared, &provider, &interval, &nudge, &details_wanted, ui).await
@@ -1200,14 +1213,16 @@ async fn end_now(code: i32, why: Option<String>) {
 /// Mouse handling: wheel-scroll the pod list (or the result modal, or the info panel), and in
 /// the list left-click a row to select it. Clicking the far-left of a row — or shift-clicking
 /// anywhere on it — toggles that pod's multi-select mark (same `marked` set as `space`). A click
-/// on the footer's `[i] info` opens the info panel from the list or the detail view, and closes it.
+/// on the footer's `[i] info`, or anywhere on the top line (the info panel has every word it
+/// leaves out), opens the info panel from the list or the detail view, and closes it.
 /// `false`: nothing changed (a move, a click outside the rows) — no frame for it.
 fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared>>) -> bool {
     let in_list = matches!(ui.mode, Mode::List);
     let in_result = matches!(ui.mode, Mode::Result(_));
-    // The footer's `[i] info` (its cells, [`MENU_LABEL`]): opens the info panel from the list or
-    // the detail view, and closes it again.
-    let on_menu = ui.menu_at.get().is_some_and(|(x, y)| m.row == y && (x..x.saturating_add(MENU_LABEL.chars().count() as u16)).contains(&m.column));
+    // The footer's `[i] info` (its cells, [`MENU_LABEL`]) or the top line: opens the info panel
+    // from the list or the detail view, and closes it again.
+    let on_menu = ui.menu_at.get().is_some_and(|(x, y)| m.row == y && (x..x.saturating_add(MENU_LABEL.chars().count() as u16)).contains(&m.column))
+        || ui.top_at.get() == Some(m.row);
     if let (MouseEventKind::Down(MouseButton::Left), true) = (m.kind, on_menu) {
         ui.mode = match ui.mode {
             Mode::List => Mode::Info { scroll: 0, detail: false },
@@ -1217,6 +1232,15 @@ fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared>>) -> bool
             _ => return false,
         };
         return true;
+    }
+    // The 💾 header: the backups screen.
+    let on_saved = ui.backups.saved_at.get().is_some_and(|(x, y)| m.row == y && (x..x.saturating_add(2)).contains(&m.column));
+    if let (MouseEventKind::Down(MouseButton::Left), true, Mode::List | Mode::Detail) = (m.kind, on_saved, &ui.mode) {
+        backups::open(ui, shared);
+        return true;
+    }
+    if let Mode::Backups(_) = ui.mode {
+        return backups::mouse(m, ui, shared);
     }
     if let Mode::Info { scroll, detail } = ui.mode {
         let delta = match m.kind {
@@ -1535,6 +1559,7 @@ async fn run(
         let now = Instant::now();
         dirty |= land(&mut ui, shared, nudge, now);
         dirty |= newpod::tick(&mut ui, shared, now);
+        dirty |= backups::tick(&mut ui, shared, now);
         let (len, stamp, live) = {
             let s = shared.lock().unwrap();
             (s.pods.len(), stamp(&s), live(&s, &ui, now))
@@ -1661,6 +1686,13 @@ fn handle_event(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui:
 /// One key press, in whatever view or popup is open. Never awaits: a slow action is started
 /// in the background ([`start_action`], `runs::start`, …) and lands through `Shared`.
 fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &mut Ui, code: KeyCode, mods: KeyModifiers) -> Result<Flow> {
+    let flow = handle_key_in(terminal, cx, ui, code, mods);
+    // An action the backups screen started has ended (its result or confirm closed): back to it.
+    backups::come_back(ui, cx.shared);
+    flow
+}
+
+fn handle_key_in(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &mut Ui, code: KeyCode, mods: KeyModifiers) -> Result<Flow> {
     let Ctx { shared, provider, interval, nudge, details_wanted } = *cx;
     // Ctrl+C quits from any mode (raw mode swallows the usual SIGINT) — asking first while a run
     // that changes pods is going; at that question it quits, leaving the run going.
@@ -1682,7 +1714,7 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
     }
     // `?` and its two popups (ask.rs); the add-pod form and its confirm (newpod.rs); the runs
     // panel, `p`, and the quit question (runs.rs).
-    if ask::key(ui, shared, code, mods) || newpod::key(ui, shared, code) {
+    if ask::key(ui, shared, code, mods) || newpod::key(ui, shared, code) || backups::key(ui, shared, provider, code) {
         return Ok(Flow::Changed);
     }
     match runs::key(ui, shared, code) {
@@ -1892,7 +1924,7 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui: &
         // A background action is running — ignore keys (Ctrl+C still quits, above).
         Mode::Working(_) => {}
         // Handled above: `info_key`, `ask::key`, `newpod::key`, `runs::key`.
-        Mode::Info { .. } | Mode::Ask { .. } | Mode::Answer(_) | Mode::NewPod(_) | Mode::UpConfirm(_) | Mode::Runs { .. } | Mode::Quit => {}
+        Mode::Info { .. } | Mode::Ask { .. } | Mode::Answer(_) | Mode::NewPod(_) | Mode::UpConfirm(_) | Mode::Runs { .. } | Mode::Quit | Mode::Backups(_) => {}
         Mode::Result(_) => {
             if !result_key(ui, code) {
                 ui.result_scroll = 0;
@@ -2220,7 +2252,7 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Pro
     if c.action.cli() {
         return start_cli_action(ui, shared, c.action, &pod, None);
     }
-    ui.mode = Mode::Working(format!("{}ing {}…", c.action.label(), pod.name));
+    ui.mode = Mode::Working(format!("{} {}…", c.action.doing(), pod.name));
     let (provider, remote, cfg, action) = (provider.clone(), ui.remote.clone(), ui.cfg.clone(), c.action);
     start_action(shared, async move {
         execute(provider.as_ref(), remote.as_ref(), &cfg, action, &pod, None).await
@@ -2514,7 +2546,7 @@ async fn execute(
             _ => format!("✗ {name}: no branch given"),
         },
         // Runs of the CLI (`start_cli_action`), never an action of this one.
-        Action::Start | Action::Rename | Action::Jobs | Action::Logs | Action::KeyLimit | Action::KeyPause | Action::KeyResume | Action::KeyRotate => {
+        Action::Start | Action::Rename | Action::Jobs | Action::Logs | Action::Pull | Action::KeyLimit | Action::KeyPause | Action::KeyResume | Action::KeyRotate => {
             format!("✗ {} {name}: runs as `arena {}`", action.label(), action.command())
         }
     }
@@ -2530,6 +2562,7 @@ fn cli_action_args(action: Action, name: &str, arg: Option<&str>) -> Option<(run
         Action::Rename => (runs::Kind::Rename, v(&["pods", "rename", name, arg?.trim(), "--yes"])),
         Action::Jobs => (runs::Kind::Jobs, v(&["pods", "jobs", name])),
         Action::Logs => (runs::Kind::Logs, v(&["pods", "logs", name, "--tail", "100"])),
+        Action::Pull => (runs::Kind::Pull, v(&["pods", "pull", name, "--yes"])),
         _ => return None,
     })
 }
@@ -2725,16 +2758,30 @@ async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (Str
     let repo = backup_repo_path(cfg);
     let origin = backup::configured_repo(cfg);
     let cmd = backup::backup_command(&repo, cfg.get("GIT_SSH_KEY_REMOTE"), &format!("arena-tui backup {}", pod.name), origin.as_deref());
+    use arena_core::backups::record::Outcome;
+    let note = |outcome, detail: String| backups::note_git(cfg, &pod.name, outcome, detail);
     match remote.exec(&target, &cmd, Some(BACKUP_TIMEOUT)).await {
         Ok(out) if out.success => {
             let report = parse_backup_report(&out.stdout);
             let notes = report.notes();
             let also = if notes.is_empty() { String::new() } else { format!(" — {}", notes.join("; ")) };
             let line = match &report.outcome {
-                Some((backup::BACKUP_PUSHED, branch)) => format!("✓ backed up {} → {branch}{also}", pod.name),
-                Some((backup::BACKUP_NO_CHANGES, branch)) => format!("✓ {} — no changes (on {branch}){also}", pod.name),
-                Some((backup::BACKUP_SKIPPED, branch)) => format!("⊘ {} — skipped (on protected branch {branch})", pod.name),
-                _ => format!("✓ backed up {}{also}", pod.name),
+                Some((backup::BACKUP_PUSHED, branch)) => {
+                    note(Outcome::Pushed, format!("→ {branch}"));
+                    format!("✓ backed up {} → {branch}{also}", pod.name)
+                }
+                Some((backup::BACKUP_NO_CHANGES, branch)) => {
+                    note(Outcome::NoChanges, format!("on {branch}"));
+                    format!("✓ {} — no changes (on {branch}){also}", pod.name)
+                }
+                Some((backup::BACKUP_SKIPPED, branch)) => {
+                    note(Outcome::NotSaved, format!("on {branch}"));
+                    format!("⊘ {} — skipped (on protected branch {branch})", pod.name)
+                }
+                _ => {
+                    note(Outcome::Pushed, String::new());
+                    format!("✓ backed up {}{also}", pod.name)
+                }
             };
             (line, None)
         }
@@ -2745,6 +2792,7 @@ async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (Str
                 Some(fix) => format!("✗ backup {}: {fix}", pod.name),
                 None => format!("✗ backup {} ({}): {}", pod.name, out.exit_label(), out.stderr.trim()),
             };
+            note(Outcome::Failed, report.failure_brief(out.code).unwrap_or_else(|| format!("{}: {}", out.exit_label(), out.stderr.trim())));
             let kept = match (report.wrong_origin_why(out.code), report.in_progress(out.code)) {
                 (Some(_), _) => fix.map(Kept::WrongOrigin),
                 (None, Some(what)) => Some(Kept::Busy {
@@ -2756,7 +2804,10 @@ async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (Str
             };
             (line, kept)
         }
-        Err(e) => (format!("✗ backup {} failed: {}", pod.name, describe_error(&e)), None),
+        Err(e) => {
+            note(Outcome::Failed, describe_error(&e));
+            (format!("✗ backup {} failed: {}", pod.name, describe_error(&e)), None)
+        }
     }
 }
 
@@ -2980,8 +3031,11 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         .split(f.area());
 
     top_line(f, shared, ui, chunks[0]);
+    ui.top_at.set(Some(chunks[0].y));
 
-    if matches!(ui.mode, Mode::Detail) || matches!(ui.mode, Mode::Info { detail: true, .. }) {
+    if let Mode::Backups(v) = &ui.mode {
+        backups::render(f, shared, ui, v, chunks[1]);
+    } else if matches!(ui.mode, Mode::Detail) || matches!(ui.mode, Mode::Info { detail: true, .. }) {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
@@ -3017,32 +3071,27 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
     }
 }
 
-/// The top line ([`state::top_parts`]): the fleet in short words, warnings first in their
-/// colours — the line is cut at the terminal's edge. A provider other than RunPod (where the
-/// add-pod form starts) or a config other than the default goes at the right, while there's
-/// room (always in the info panel): a dashboard on a second fleet should say so.
+/// The top line ([`state::top_parts`]): the fleet in short, a group per provider and
+/// OpenRouter's, laid out for the terminal's width — the least needed words left out, never a
+/// warning. A provider other than RunPod (where the add-pod form starts) or a config other than
+/// the default goes at the right while there's room (always in the info panel): a dashboard on
+/// a second fleet should say so. A click on it opens the info panel ([`handle_mouse`]).
 fn top_line(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
-    let parts = top_parts(&shared.summary, &shared.snap.cost, &shared.snap.partial, &shared.balance, shared.ai_cohort.as_ref());
-    let mut spans = vec![Span::raw(" ")];
-    for (i, p) in parts.into_iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" · "));
-        }
-        spans.push(match p.tone {
+    let tag = where_tag(ui);
+    let top = top_parts(&shared.summary, &shared.pods, &shared.snap.partial, &shared.balance, shared.ai_cohort.as_ref(), tag.as_deref(), area.width as usize);
+    let spans: Vec<Span> = top
+        .parts
+        .into_iter()
+        .map(|p| match p.tone {
             Some(t) => Span::styled(p.text, tone_style(t)),
             None => Span::raw(p.text),
-        });
-    }
-    let line = Line::from(spans).style(Style::default().add_modifier(Modifier::BOLD));
-    let tag = where_tag(ui);
-    let used = line.width();
-    f.render_widget(Paragraph::new(line), area);
-    if let Some(tag) = tag {
+        })
+        .collect();
+    f.render_widget(Paragraph::new(Line::from(spans).style(Style::default().add_modifier(Modifier::BOLD))), area);
+    if let Some(tag) = top.tag {
         let w = Span::raw(&tag).width() as u16 + 1;
-        if used as u16 + 2 + w <= area.width {
-            let at = Rect { x: area.x + area.width - w, width: w, ..area };
-            f.render_widget(Paragraph::new(Span::styled(tag, Style::default().fg(Color::Cyan))), at);
-        }
+        let at = Rect { x: area.x + area.width.saturating_sub(w), width: w.min(area.width), ..area };
+        f.render_widget(Paragraph::new(Span::styled(tag, Style::default().fg(Color::Cyan))), at);
     }
 }
 
@@ -3423,6 +3472,11 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     // Record where the rows landed (area + the scroll offset ratatui chose) so a mouse
     // click can be mapped back to a pod index.
     ui.last_table.set((area, ts.offset()));
+    // And where the 💾 header landed: a click on it opens the backups screen.
+    let header_y = area.y.saturating_add(1);
+    let buf = f.buffer_mut();
+    let saved = (area.x..area.x.saturating_add(area.width)).find(|&x| header_y < buf.area.bottom() && buf[(x, header_y)].symbol() == columns::SAVED_HEADER);
+    ui.backups.saved_at.set(saved.map(|x| (x, header_y)));
 }
 
 /// STATUS's colour (the table's and the detail pane's): `run` plain (most rows), a pod coming up
@@ -3893,12 +3947,20 @@ fn gpu_detail(p: &Pod, m: Option<&PodMetrics>) -> String {
 /// — some terminals draw those symbols as pictures.
 const MENU_LABEL: &str = "[i] info";
 
+/// The footer's one symbol, before the refresh's age and cadence (`↻ 7s ago · every 5s`), cyan
+/// while a refresh runs. The human (2026-10-30), after asking for plain words: "no i think i like
+/// them :) maybe even a small refresh icon or smth at the bottom right is good. its just if you
+/// have too many then the text sizing becomes pretty unreliable" — so one, a single cell on
+/// every terminal (`↻` has no emoji form), and the rest of the footer stays words.
+const REFRESH_MARK: &str = "↻";
+
 /// The footer, one line, cut at the terminal's edge, in plain words: [`MENU_LABEL`] first (a click
 /// on it, or `i`, opens the info panel with everything that isn't here), then what must be read
 /// before the next key — a live [`Notice`], a run going (`running: pods up …`), a `?` question out
 /// with its seconds — then the refresh's short status (`ok · API 13/min`, `warn: …` in yellow), how
-/// long ago it refreshed (`7s ago`, `refreshing` while it does) and its cadence (`every 5s`), then
-/// the keys for the current mode: the way out first (`[q] quit`, `[esc] back`), pairs merged.
+/// long ago it refreshed (`↻ 7s ago`, [`REFRESH_MARK`]; `refreshing` while it does) and its cadence
+/// (`every 5s`), then the keys for the current mode: the way out first (`[q] quit`, `[esc] back`),
+/// pairs merged.
 fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = vec![Span::styled(MENU_LABEL, Style::default().add_modifier(Modifier::BOLD)), Span::raw(" · ")];
     // A notice (`D`'s prompt and what it skips, a finished action) comes first: the question's
@@ -3933,6 +3995,8 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         (Some(t), false) => format!("{}s ago", t.elapsed().as_secs()),
         (None, false) => "-".into(),
     };
+    let mark = if shared.refreshing { tone_style(Tone::Busy) } else { Style::default() };
+    spans.push(Span::styled(format!("{REFRESH_MARK} "), mark));
     spans.push(Span::raw(format!("{refreshed} · every {secs}s  ")));
     spans.push(Span::styled(mode_keys(&ui.mode).to_string(), Style::default().fg(Color::Gray)));
     Line::from(spans)
@@ -3949,8 +4013,8 @@ fn without_symbol(text: &str) -> String {
 /// ([`ALL_KEYS`]). Modal popups keep their own.
 fn mode_keys(mode: &Mode) -> &'static str {
     match mode {
-        Mode::List => "[q] quit  [enter] detail  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?] ask  [n] new  [p] runs",
-        Mode::Detail => "[esc] back  [q] quit  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?] ask  [n] new  [p] runs",
+        Mode::List => "[q] quit  [enter] detail  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?] ask  [n] new  [p] runs  [b] backups",
+        Mode::Detail => "[esc] back  [q] quit  [a/A] act/all  [space/x] mark/clear  [d/D] deep  [c] ssh  [?] ask  [n] new  [p] runs  [b] backups",
         Mode::Info { .. } => "[esc/i] close  [↑↓ PgUp PgDn] scroll",
         Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::Confirm(c) if c.action.requires_typed_name() => "type the pod's name  [enter] apply  [esc] cancel",
@@ -3968,6 +4032,7 @@ fn mode_keys(mode: &Mode) -> &'static str {
         Mode::Result(_) => "[↑↓] scroll  ·  [any other key] dismiss",
         Mode::Ask { .. } => "type the question  [enter] ask  [tab] the other AI  [ctrl-u] clear  [esc] cancel",
         Mode::Answer(_) => "[↑↓ PgUp PgDn] scroll  [esc] close",
+        Mode::Backups(v) => backups::keys(v),
     }
 }
 
@@ -3989,11 +4054,12 @@ const ALL_KEYS: &[(&str, &str)] = &[
     ("c", "ssh into the cursor pod"),
     ("?", "ask an AI about the cursor pod or the marked ones (tab: the other AI)"),
     ("n", "add pods (runs `arena pods up`)"),
-    ("p", "the runs panel (pods up, start, rename, jobs, logs, the AI key's)"),
+    ("p", "the runs panel (pods up, start, rename, jobs, logs, copy home, the AI key's)"),
+    ("b  (or click 💾)", "the backups screen: each backup job (how often, last run, next), what's running, every pod's last git save, home copy and archive copy (enter: its history, back up now)"),
     ("r", "refresh now (and re-read the providers' details)"),
     ("f", "refresh cadence: 2 → 5 → 10 → 20 → 60 s"),
     ("s", "short / full pod names (kept)"),
-    ("mouse", "click a row: cursor · click its far left or shift-click: mark · wheel: move · [i] info: this panel"),
+    ("mouse", "click a row: cursor · click its far left or shift-click: mark · wheel: move · [i] info: this panel · 💾: backups"),
 ];
 
 /// What the table's glyphs mean, for the info panel: `(column, legend)`.
@@ -4006,7 +4072,7 @@ const LEGEND: &[(&str, &str)] = &[
     ("💾", "when the repo was last committed: ↑ unpushed  ↓ behind  ⇕ diverged · yellow: uncommitted work · grey: quiet a day+"),
     ("AI$", "the pod's OpenRouter key: spent/cap this period · yellow from 80% · red at the cap · paused: a $0 cap"),
     ("RTT", "round trip from this box to the pod's SSH port: green < 60 ms · yellow < 120 ms · red beyond"),
-    ("7s ago · every 5s", "refreshed 7 s ago, every 5 s (`refreshing` while it does)"),
+    ("↻ 7s ago · every 5s", "refreshed 7 s ago, every 5 s (`refreshing` while it does, the ↻ in cyan)"),
 ];
 
 /// The info panel's text ([`Mode::Info`]): every word the top line and the footer leave out —
@@ -4519,7 +4585,7 @@ net.secs=0.712
 deep_check_end=1
 ";
 
-    fn cfg(extra: &str) -> Config {
+    pub(crate) fn cfg(extra: &str) -> Config {
         Config::parse(&format!(
             "MACHINE_NAME_PREFIX=devtest\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nALLOWED_CUDA_VERSIONS=\"13.0\"\n\
              MACHINE_NAME_LIST=(\n \"alpha\"\n \"bravo\"\n \"charlie\"\n \"delta\"\n)\n{extra}"
@@ -4631,7 +4697,8 @@ deep_check_end=1
 
     /// The footer, in plain words: `[i] info` in its first cells, then a notice (`D`'s prompt),
     /// then a question's line with its seconds, then the short status, the refresh's age and
-    /// cadence, then the keys; one separator between each part, and no ☰ ⟳ ✓ ⚠ or spinner.
+    /// cadence behind its one symbol (`↻`, cyan while refreshing), then the keys; one separator
+    /// between each part, and no ☰ ✓ ⚠ or spinner.
     #[test]
     fn a_notice_leads_the_footer_before_the_asking_line() {
         let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
@@ -4643,7 +4710,7 @@ deep_check_end=1
         };
         let text = |s: &Shared| footer_hint(s, &ui, 10).spans.iter().map(|s| s.content.to_string()).collect::<String>();
         let quiet = text(&shared);
-        assert!(quiet.starts_with("[i] info · asking claude about devtest-alpha… 0s · ok · API 13/min · - · every 10s  [q] quit  [enter] detail"), "{quiet}");
+        assert!(quiet.starts_with("[i] info · asking claude about devtest-alpha… 0s · ok · API 13/min · ↻ - · every 10s  [q] quit  [enter] detail"), "{quiet}");
         shared.notify("D again to deep-check 2 running pods", false);
         let t = text(&shared);
         let rest = t.strip_prefix("[i] info · D again to deep-check 2 running pods · ").unwrap_or_else(|| panic!("{t}"));
@@ -4657,11 +4724,14 @@ deep_check_end=1
         // A refresh under way says so, in words.
         shared.refreshing = true;
         let t = text(&shared);
-        assert!(t.contains(" · refreshing · every 10s  "), "{t}");
+        assert!(t.contains(" · ↻ refreshing · every 10s  "), "{t}");
+        let mark = footer_hint(&shared, &ui, 10).spans.into_iter().find(|s| s.content.starts_with(REFRESH_MARK)).unwrap();
+        assert_eq!(mark.style.fg, Some(Color::Cyan), "the mark says a refresh runs");
         shared.last_refresh = Some(Instant::now());
-        assert!(text(&shared).contains(" · refreshing, last 0s ago · every 10s  "), "the age stays while it refreshes");
+        assert!(text(&shared).contains(" · ↻ refreshing, last 0s ago · every 10s  "), "the age stays while it refreshes");
         let all = t.chars().filter(|c| !c.is_ascii()).collect::<String>();
         assert!(!all.chars().any(|c| "☰⟳✓✗⚠⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(c)), "only words: {all:?} in {t}");
+        assert_eq!(t.matches(REFRESH_MARK).count(), 1, "one symbol: {t}");
     }
 
     /// The first refresh's early paint: the listed rows, no metrics yet, and a status that
@@ -4690,7 +4760,7 @@ deep_check_end=1
         }
     }
 
-    fn ui(cfg: Config, remote: Arc<dyn Remote>) -> Ui {
+    pub(crate) fn ui(cfg: Config, remote: Arc<dyn Remote>) -> Ui {
         Ui {
             provider_name: "runpod".into(),
             config_path: "/test/config.env".into(),
@@ -4713,8 +4783,10 @@ deep_check_end=1
             offers: offers::State::new(true),
             demo: false,
             menu_at: std::cell::Cell::new(None),
+            top_at: std::cell::Cell::new(None),
             ai_keys: false,
             ai_set: Vec::new(),
+            backups: backups::State::default(),
         }
     }
 
@@ -4795,7 +4867,7 @@ deep_check_end=1
 
     /// The buffer's rows as a terminal shows them: a wide symbol (`💾`) takes two cells, so the
     /// cell it hides isn't printed.
-    fn screen(buf: &Buffer) -> Vec<String> {
+    pub(crate) fn screen(buf: &Buffer) -> Vec<String> {
         (0..buf.area.height)
             .map(|y| {
                 let mut row = String::new();
@@ -4810,7 +4882,7 @@ deep_check_end=1
             .collect()
     }
 
-    fn draw(width: u16, height: u16, shared: &Shared, ui: &Ui) -> Vec<String> {
+    pub(crate) fn draw(width: u16, height: u16, shared: &Shared, ui: &Ui) -> Vec<String> {
         let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
         t.draw(|f| view(f, shared, ui, 5)).unwrap();
         screen(t.backend().buffer())
@@ -5015,8 +5087,8 @@ deep_check_end=1
                 assert!(!r.contains(s), "{name} hides {s:?}: {r}");
             }
         }
-        // The top line, in short: the fleet's burn with € kept apart, nothing else on it.
-        assert!(lines[0].starts_with(" 4 pods · 0 GPUs · $0.42/h + €0.006/h  "), "{all}");
+        // The top line, in short: each provider's pods and burn, in its currency (Hetzner's €).
+        assert!(lines[0].starts_with(" 4 pods, 0 GPUs │ 3 RunPod $0.42/h │ 1 Hetzner €0.006/h  "), "{all}");
         // The rest is the info panel's: the old bar's words, and the deep check running.
         let mut ui = ui;
         ui.mode = Mode::Info { scroll: 0, detail: false };
@@ -5118,21 +5190,33 @@ deep_check_end=1
 
     /// The top line is one line — no title box — with the fleet in short words and, at its right
     /// while there's room, a provider or config that isn't the default (a second fleet's
-    /// dashboard says so). The table starts right under it.
+    /// dashboard says so). The table starts right under it. A click anywhere on it opens the info
+    /// panel (every word it leaves out), and another closes it.
     #[test]
     fn the_top_line_is_one_short_line_and_names_a_second_fleet() {
         let shared = fixture_shared();
         let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
         let lines = draw(120, 12, &shared, &ui);
-        assert!(lines[0].starts_with(" 4 pods · 0 GPUs · $0.42/h + €0.006/h "), "{}", lines[0]);
+        assert!(lines[0].starts_with(" 4 pods, 0 GPUs │ 3 RunPod $0.42/h │ 1 Hetzner €0.006/h "), "{}", lines[0]);
         assert!(lines[0].trim_end().ends_with(" /test/config.env"), "{}", lines[0]);
         assert!(lines[1].starts_with("┌Pods"), "{}", lines[1]);
         ui.provider_name = "vast".into();
         assert!(draw(120, 12, &shared, &ui)[0].trim_end().ends_with(" vast · /test/config.env"));
-        assert!(!draw(50, 12, &shared, &ui)[0].contains("config"), "no room: left out (the info panel has it)");
+        let narrow = &draw(50, 12, &shared, &ui)[0];
+        assert_eq!(narrow.trim_end(), " 4 pods │ 3 RunPod $0.42/h │ 1 Hetzner €0.006/h", "no room: the tag first, then the GPUs (the info panel has them)");
         ui.provider_name = "runpod".into();
         ui.config_path = DEFAULT_CONFIG.into();
-        assert_eq!(draw(120, 12, &shared, &ui)[0].trim_end(), " 4 pods · 0 GPUs · $0.42/h + €0.006/h", "the defaults: nothing");
+        assert_eq!(draw(120, 12, &shared, &ui)[0].trim_end(), " 4 pods, 0 GPUs │ 3 RunPod $0.42/h │ 1 Hetzner €0.006/h", "the defaults: nothing");
+        let shared = Arc::new(Mutex::new(shared));
+        let click = |column: u16, row: u16| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column, row, modifiers: KeyModifiers::NONE };
+        assert!(handle_mouse(click(30, 0), &mut ui, &shared));
+        assert!(matches!(ui.mode, Mode::Info { detail: false, .. }), "{:?}", ui.mode);
+        draw(120, 12, &shared.lock().unwrap(), &ui);
+        assert!(handle_mouse(click(100, 0), &mut ui, &shared));
+        assert!(matches!(ui.mode, Mode::List), "{:?}", ui.mode);
+        ui.mode = Mode::Detail;
+        assert!(handle_mouse(click(3, 0), &mut ui, &shared));
+        assert!(matches!(ui.mode, Mode::Info { detail: true, .. }), "{:?}", ui.mode);
     }
 
     /// `i` — or a click on the footer's `[i] info` — opens the info panel over the list or the detail
@@ -5338,7 +5422,7 @@ deep_check_end=1
         let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
         let lines = draw(220, 40, &shared, &ui);
         let screen = lines.join("\n");
-        assert!(screen.contains(" ⚠ AI key at cap: devtest-gone (no pod) · 4 pods"), "{screen}");
+        assert!(screen.contains(" │ ⚠ OpenRouter key at cap: devtest-gone (no pod) · $7.00 today"), "{screen}");
         assert!(row(&lines, "alpha").contains(" paused "), "{}", row(&lines, "alpha"));
         assert!(row(&lines, "bravo").contains(" 2.00/5 "), "{}", row(&lines, "bravo"));
         ui.mode = Mode::Detail;
@@ -5362,7 +5446,7 @@ deep_check_end=1
         let pane = draw(220, 50, &shared, &ui).join("\n");
         assert!(pane.contains("spend): devtest-gone ") && !pane.contains("(no pod)"), "{pane}");
         // A key at its cap that a row carries: the top line says how to raise it.
-        assert!(pane.contains(" ⚠ AI key at cap: devtest-gone (a → raise cap) · "), "{pane}");
+        assert!(pane.contains(" ⚠ OpenRouter key at cap: devtest-gone (a → raise cap) · "), "{pane}");
         shared.ai = Some(UsageView::from_keys(&[key("devtest-alpha", 0.0, 0.0, 0.0)], None));
         shared.ai_cohort = Some(shared.ai.as_ref().unwrap().cohort("devtest", &[]));
         assert!(!draw(220, 50, &shared, &ui).join("\n").contains("ai caps:"));
@@ -5382,60 +5466,78 @@ deep_check_end=1
         balance::views(&balance::BalanceState::default(), &fetched, &balance::Burns::new(), &BalancePolicy::default(), balance::Mode::Inline, NOW)
     }
 
-    /// The prepaid balance in the summary bar: at its end while it needs nothing; right at
-    /// its front when an account is low (yellow) or critical (red), so a narrow terminal
-    /// still shows it.
+    /// The top line's colour at the first cell of `text` (on its first row), and the line.
+    fn top_colour(shared: &Shared, ui: &Ui, width: u16, text: &str) -> (Color, String) {
+        let mut t = Terminal::new(TestBackend::new(width, 12)).unwrap();
+        t.draw(|f| view(f, shared, ui, 5)).unwrap();
+        let line = screen(t.backend().buffer())[0].clone();
+        let x = line[..line.find(text).unwrap_or_else(|| panic!("{text:?} in {line}"))].chars().count() as u16;
+        (t.backend().buffer()[(x, 0)].fg, line)
+    }
+
+    /// The prepaid balance in its provider's group, beside the burn of its pods there: the name
+    /// green while it needs nothing; `⚠` in front and yellow when low, red when critical — at 80
+    /// columns as at 120, its words never cut.
     #[test]
-    fn the_summary_bar_shows_the_balance_and_leads_with_a_low_one() {
+    fn the_top_line_shows_each_balance_in_its_providers_group() {
         use balance::Account;
         let mut shared = fixture_shared();
         let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
-        let bar = |shared: &Shared, w: u16| draw(w, 12, shared, &ui).into_iter().find(|l| l.contains(" pods · ")).unwrap();
+        let top = |shared: &Shared, w: u16| draw(w, 12, shared, &ui)[0].trim_end().to_string();
         // Nothing observed yet: no balance at all.
-        assert!(!bar(&shared, 240).contains("balance"));
+        assert!(top(&shared, 240).starts_with(" 4 pods, 0 GPUs │ 3 RunPod $0.42/h │ 1 Hetzner €0.006/h "), "{}", top(&shared, 240));
         shared.balance = live_views(&[(Account::Runpod, 100.0, 0.42)]); // ≈238h
-        let wide = bar(&shared, 240);
-        assert!(wide.contains("$0.42/h + €0.006/h · runpod $100.00 ≈9.9d"), "{wide}");
-        // The colour of the lead: yellow when low, red when critical.
-        let lead_colour = |shared: &Shared| {
-            let mut t = Terminal::new(TestBackend::new(120, 12)).unwrap();
-            t.draw(|f| view(f, shared, &ui, 5)).unwrap();
-            let buf = t.backend().buffer().clone();
-            let y = (0..12).find(|&y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>().contains(" pods · ")).unwrap();
-            buf[(3, y)].fg
-        };
+        assert!(top(&shared, 240).starts_with(" 4 pods, 0 GPUs │ 3 RunPod $100.00 ≈9.9d · $0.42/h │ 1 Hetzner "), "{}", top(&shared, 240));
+        assert_eq!(top_colour(&shared, &ui, 120, "RunPod").0, Color::Green);
         shared.balance = live_views(&[(Account::Runpod, 20.0, 0.42)]); // ≈47h, under 72
         for w in [80, 120] {
-            let narrow = bar(&shared, w);
-            assert!(narrow.starts_with(" ⚠ runpod $20.00 ≈47h · 4 pods"), "{w}: {narrow}");
+            let (colour, line) = top_colour(&shared, &ui, w, "⚠ 3 RunPod $20.00 ≈47h");
+            assert_eq!(colour, Color::Yellow, "{w}: {line}");
         }
-        assert_eq!(lead_colour(&shared), Color::Yellow);
         shared.balance = live_views(&[(Account::Runpod, 5.0, 0.42)]); // ≈11h
-        assert!(bar(&shared, 80).starts_with(" ‼ runpod $5.00 ≈11h · 4 pods"));
-        assert_eq!(lead_colour(&shared), Color::Red, "the warning is red");
+        assert_eq!(top_colour(&shared, &ui, 80, "⚠ 3 RunPod $5.00 ≈11h").0, Color::Red, "critical is red");
         // RunPod at $0 with nothing billing is still the alarm (at $0 RunPod stops the pods).
         shared.balance = live_views(&[(Account::Runpod, 0.0, 0.0)]);
-        assert!(bar(&shared, 80).starts_with(" ‼ runpod $0.00 no burn · 4 pods"), "{}", bar(&shared, 80));
-        assert_eq!(lead_colour(&shared), Color::Red);
+        assert_eq!(top_colour(&shared, &ui, 80, "⚠ 3 RunPod $0.00 no burn").0, Color::Red);
+    }
+
+    /// The demo fleet's top line (`ARENA_TUI_DEMO=51`, the default config) at 160 and 80 columns,
+    /// as the terminal shows it: a group per provider and OpenRouter's, its warnings at both.
+    #[test]
+    fn the_demo_top_line_at_160_and_80_columns() {
+        let shared = Mutex::new(Shared::default());
+        demo::publish(&shared, &cfg(""), 51, 0);
+        let shared = shared.into_inner().unwrap();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        ui.config_path = DEFAULT_CONFIG.into();
+        let at = |w: u16| draw(w, 12, &shared, &ui)[0].trim_end().to_string();
+        assert_eq!(
+            at(160),
+            " 51 pods · 2 unreachable │ 43 RunPod $2262.90 · $11.91/h │ ⚠ 5 Vast $47.60 ≈40h · $1.19/h │ 3 Hetzner €0.048/h │ ⚠ OpenRouter key at cap · $422.09 left"
+        );
+        assert_eq!(at(80), " 2 unreachable │ RunPod │ ⚠ Vast $47.60 ≈40h │ Hetzner │ ⚠ OpenRouter key at cap");
     }
 
     /// Live (2026-10-15): with no Shadeform pods the bar led, in red, with `‼ shadeform balance no
-    /// burn` — the opt-in overflow account, unfunded on purpose. It now sits at the end with its
-    /// amount, in the bar's own colour; with a billing pod there it leads again.
+    /// burn` — the opt-in overflow account, unfunded on purpose. With no pods there and nothing
+    /// wrong it has no group on the top line (the info panel has it, `shadeform $0.00
+    /// unfunded`); with a billing pod there it is the alarm again.
     #[test]
-    fn an_unfunded_overflow_account_does_not_lead_the_bar() {
+    fn an_unfunded_overflow_account_stays_off_the_top_line() {
         use balance::Account;
         let mut shared = fixture_shared();
-        let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
-        let bar = |shared: &Shared, w: u16| draw(w, 12, shared, &ui).into_iter().find(|l| l.contains(" pods · ")).unwrap();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
         shared.balance = live_views(&[(Account::Runpod, 100.0, 0.42), (Account::Shadeform, 0.0, 0.0)]);
-        let wide = bar(&shared, 240);
-        assert!(wide.starts_with(" 4 pods · "), "{wide}");
-        assert!(wide.contains(" · runpod $100.00 ≈9.9d · shadeform $0.00 unfunded"), "{wide}");
-        assert!(!wide.contains('‼'), "{wide}");
+        let wide = draw(240, 12, &shared, &ui)[0].clone();
+        assert!(!wide.contains("Shadeform") && !wide.contains('⚠'), "{wide}");
         assert_eq!(state::balance_tone(&shared.balance), None);
+        ui.mode = Mode::Info { scroll: 0, detail: false };
+        let info = draw(200, 60, &shared, &ui).join("\n");
+        assert!(info.contains("balance: runpod $100.00 ≈9.9d · shadeform $0.00 unfunded"), "{info}");
+        ui.mode = Mode::List;
         shared.balance = live_views(&[(Account::Shadeform, 0.0, 0.57)]);
-        assert!(bar(&shared, 80).starts_with(" ‼ shadeform $0.00 <1h · 4 pods"), "{}", bar(&shared, 80));
+        let (colour, line) = top_colour(&shared, &ui, 80, "⚠ Shadeform $0.00 <1h");
+        assert_eq!(colour, Color::Red, "{line}");
     }
 
     /// A refresh times each pod's SSH endpoint alongside the probes — one TCP connect — and
@@ -5662,17 +5764,17 @@ deep_check_end=1
         assert_eq!(shared.lock().unwrap().balance[0].balance, Some(40.0));
     }
 
-    /// A provider that failed to list is said at the front of the summary bar, so it is on
-    /// screen at any common width — the bar is one unwrapped line and its tail gets cut.
+    /// A provider that failed to list has its group on the top line, in red, at any common width
+    /// — the line is built to fit, and a warning is never what it leaves out.
     #[test]
     fn a_failed_listing_is_visible_on_a_narrow_terminal() {
         let mut shared = fixture_shared();
         shared.snap.partial = vec!["vast".into()];
         let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
         for w in [80, 100, 120] {
-            let lines = draw(w, 12, &shared, &ui);
-            let bar = lines.iter().find(|l| l.contains("failed to list")).unwrap_or_else(|| panic!("{w}:\n{}", lines.join("\n")));
-            assert!(bar.starts_with(" ⚠ vast failed to list — pods/cost missing · 4 pods"), "{w}: {bar}");
+            let (colour, line) = top_colour(&shared, &ui, w, "⚠ Vast: list failed");
+            assert_eq!(colour, Color::Red, "{w}: {line}");
+            assert!(line.starts_with(" 4 pods, 0 GPUs │ 3 RunPod $0.42/h │ ⚠ Vast: list failed │ 1 Hetzner €0.006/h"), "{w}: {line}");
         }
     }
 

@@ -2481,37 +2481,61 @@ pub fn verbose_lines(views: &[AccountView], state: &BalanceState, fetched: &[Fet
     out
 }
 
-/// The TUI summary bar's balance: `(first, last, worst)`. A low or critical account goes
-/// **first**, with its amount (` ⚠ runpod $1.20 ≈1.9d ·`, ahead of the counts — the bar is
-/// one unwrapped line and its tail is cut on a narrow terminal); the rest last (`runpod
-/// $32.54 ≈69h · vast ~$118.30 est. ≈49d · shadeform $0.00 unfunded` — an opt-in account
-/// unfunded on purpose is one of them, [`unfunded_overflow`]); `worst` picks the tone
-/// (critical → bad, low → warn).
+/// One prepaid account as the TUI words it, in pieces the top line lays out (and drops to
+/// fit, `arena-tui`'s `state::top_parts`) and [`tui_parts`] joins: the level the inline
+/// surfaces judge it at ([`inline_level`]: an opt-in account unfunded on purpose needs
+/// nothing), the amount (`$32.54`, `~$118.30 est.` — an estimate says so —, `?`) and the
+/// runway. A low or critical account always has one, beside its amount (`≈1.9d`, `no burn`,
+/// `under its minimum`): it is the warning. The rest have [`inline_runway`]'s (`≈69h`,
+/// `unfunded`), none without a reading.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InlineAccount {
+    pub level: Level,
+    pub amount: String,
+    pub runway: Option<String>,
+}
+
+/// A critical account's runway when RunPod says it is under its minimum balance (with money
+/// left): [`inline_account`]'s words for it.
+pub const UNDER_MINIMUM: &str = "under its minimum";
+
+/// [`InlineAccount`] for a prepaid account; `None` for a postpaid one (Hetzner: no balance).
+pub fn inline_account(v: &AccountView) -> Option<InlineAccount> {
+    if !v.prepaid() {
+        return None;
+    }
+    let level = inline_level(v);
+    let src = if v.source == Source::Estimate { " est." } else { "" };
+    let runway = match level {
+        // Live, `‼ shadeform balance no burn` said neither how much was left nor that it was $0:
+        // the amount always, and what is wrong with it.
+        Level::Critical if v.under_balance == Some(true) && v.balance.is_some_and(|b| b > 0.0) => Some(UNDER_MINIMUM.into()),
+        Level::Low | Level::Critical => Some(fmt_runway(v)),
+        _ if v.source == Source::Unknown => None,
+        _ => Some(inline_runway(v)),
+    };
+    Some(InlineAccount { level, amount: format!("{}{src}", balance_label(v)), runway })
+}
+
+/// The info panel's balance (the summary bar as it used to read): `(first, last, worst)`. A
+/// low or critical account goes **first**, with its amount (` ⚠ runpod $1.20 ≈1.9d ·`); the
+/// rest last (`runpod $32.54 ≈69h · vast ~$118.30 est. ≈49d · shadeform $0.00 unfunded` — an
+/// opt-in account unfunded on purpose is one of them, [`unfunded_overflow`]); `worst` picks
+/// the tone (critical → bad, low → warn). Each account's words are [`inline_account`]'s.
 pub fn tui_parts(views: &[AccountView]) -> (Option<String>, Option<String>, Level) {
     let mut first = Vec::new();
     let mut last = Vec::new();
     let mut worst = Level::Ok;
-    for v in views.iter().filter(|v| v.prepaid()) {
-        let level = inline_level(v);
-        let src = if v.source == Source::Estimate { " est." } else { "" };
-        match level {
+    for (v, a) in views.iter().filter_map(|v| inline_account(v).map(|a| (v, a))) {
+        let runway = a.runway.map(|r| format!(" {r}")).unwrap_or_default();
+        match a.level {
             Level::Low | Level::Critical => {
-                // The amount always: live, `‼ shadeform balance no burn` said neither how
-                // much was left nor that it was $0.
-                let what = if v.under_balance == Some(true) && level == Level::Critical && v.balance.is_some_and(|b| b > 0.0) {
-                    "under its minimum".to_string()
-                } else {
-                    fmt_runway(v)
-                };
-                first.push(format!("{}{} {}{src} {what}", glyph(level), v.account, balance_label(v)));
+                first.push(format!("{}{} {}{runway}", glyph(a.level), v.account, a.amount));
                 if worst != Level::Critical {
-                    worst = level;
+                    worst = a.level;
                 }
             }
-            _ => {
-                let runway = if v.source == Source::Unknown { String::new() } else { format!(" {}", inline_runway(v)) };
-                last.push(format!("{} {}{src}{runway}", v.account, balance_label(v)));
-            }
+            _ => last.push(format!("{} {}{runway}", v.account, a.amount)),
         }
     }
     let first = (!first.is_empty()).then(|| format!(" {} ·", first.join(" · ")));
@@ -4511,6 +4535,18 @@ mod tests {
         assert_eq!(tui_parts(&[low, crit]), (Some(" ⚠ runpod $31.20 ≈45h · ‼ vast $3.00 ≈6.0h ·".into()), None, Level::Critical));
         let mut low_est = lv(Account::Runpod, 2.5, 0.0625); // 40h
         low_est.source = Source::Estimate;
+        // The same words in pieces, for the top line to lay out: postpaid has none, no reading no runway.
+        let piece = |level, amount: &str, runway: Option<&str>| Some(InlineAccount { level, amount: amount.into(), runway: runway.map(Into::into) });
+        assert_eq!(inline_account(&low_est), piece(Level::Low, "~$2.50 est.", Some("≈40h")));
+        assert_eq!(inline_account(&ok), piece(Level::Ok, "$48.00", Some("≈4.0d")));
+        let mut under = lv(Account::Runpod, 9.0, 0.01);
+        under.under_balance = Some(true);
+        under.level = Level::Critical;
+        assert_eq!(inline_account(&under), piece(Level::Critical, "$9.00", Some("under its minimum")));
+        let mut unread = AccountView::blank("vast", "USD", Source::Unknown);
+        unread.level = Level::Unknown;
+        assert_eq!(inline_account(&unread), piece(Level::Unknown, "?", None));
+        assert_eq!(inline_account(&AccountView::blank("hetzner", "EUR", Source::Postpaid)), None);
         assert_eq!(tui_parts(&[low_est]).0.as_deref(), Some(" ⚠ runpod ~$2.50 est. ≈40h ·"));
         assert_eq!(tui_parts(&[]), (None, None, Level::Ok));
     }

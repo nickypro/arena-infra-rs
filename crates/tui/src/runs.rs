@@ -109,6 +109,8 @@ pub(crate) enum Kind {
     Rename,
     Jobs,
     Logs,
+    /// `pods pull <pod>`: a copy of its home (the backups screen's "copy home now").
+    Pull,
     /// `keys limit|pause|resume|rotate`: an AI key changed (rotate also copies onto the pod).
     KeyLimit,
     KeyPause,
@@ -125,6 +127,7 @@ impl Kind {
             Kind::Rename => "pods rename",
             Kind::Jobs => "pods jobs",
             Kind::Logs => "pods logs",
+            Kind::Pull => "pods pull",
             Kind::KeyLimit => "keys limit",
             Kind::KeyPause => "keys pause",
             Kind::KeyResume => "keys resume",

@@ -368,8 +368,11 @@ async fn switch_guarded(
         .iter()
         .map(|(n, t)| (n.clone(), t.clone(), arena_core::backup::backup_command(&repo, key, &format!("arena backup {n}"), origin.as_deref())))
         .collect();
-    // Each pod's lock stays held through its push: it goes as that pod's switch ends.
+    // Each pod's lock stays held through its push: it goes as that pod's switch ends. Recorded as
+    // any git backup is (`arena backups`).
+    let record = crate::backups::Run::start(cfg, arena_core::backups::Job::Git, targets.len(), crate::backups::scope_of(sel.named));
     let t = backup_fleet(remote, jobs, &repo, |l| println!("{l}"), |_| {}).await;
+    record.finish(t.record_events(&[]), t.summary(0));
     // Before a --hard reset, a pod on a branch no backup commits (main, …) with work there — an
     // operation in progress, changes to tracked files, commits no remote has, untracked files — is
     // copied first like a failed push, .git and all, and not reset if it can't be (review fb2 F3,

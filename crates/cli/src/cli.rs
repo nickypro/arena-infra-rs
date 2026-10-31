@@ -274,6 +274,21 @@ pub(crate) enum Cmd {
     #[command(verbatim_doc_comment)]
     #[command(subcommand, infer_subcommands = true)]
     Archive(archive::ArchiveCmd),
+    /// What gets backed up, where and when — and how it's doing (read-only)
+    ///
+    /// Each backup job — the git backup, the home copy, the archive's two pushes: set up or not
+    /// (and the command that sets it up), how often, its last run and result, when it's next
+    /// due, whether it's running now. Then each cohort pod's last git save, home copy and archive
+    /// copy, failing ones first, then the longest since a good backup; and where the copies live,
+    /// with their free space. Reads this box only — the crontab, the run record the backups keep,
+    /// LOCAL_BACKUP_DIR, the archive's state, the locks held — never a pod or a provider; what it
+    /// can't read is `?`, with why. Exits 0. The dashboard's backups screen (`b`) is the same.
+    #[command(verbatim_doc_comment)]
+    Backups {
+        /// The whole status as JSON (for scripts)
+        #[arg(long)]
+        json: bool,
+    },
     /// Read-only fleet overview: pods, SSH, proxy, last health check
     ///
     /// `pods list`'s columns plus whether each cohort machine's SSH port answers, its proxy port

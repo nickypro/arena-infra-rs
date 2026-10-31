@@ -257,7 +257,8 @@ flowchart LR
    switches it to `main` and creates today's `autocommit-<prefix>-w1d2-<machine>` branch. Until
    then a pod on `main` isn't backed up, and the run says so.
 3. **Backups run themselves.** Every 15 minutes cron runs `pods backup`; its log is
-   `~/.local/state/arena-cron/backup.log`. Each pod gets one line:
+   `~/.local/state/arena-cron/backup.log`, and `arena backups` (the dashboard's `b`) says
+   whether each run is on time and which pods are failing. Each pod gets one line in the log:
 
    | Line | Meaning |
    | --- | --- |
@@ -284,7 +285,7 @@ every few seconds. Every action on a pod asks first; restart, stop and terminate
 name typed back.
 
 ```text
- 5 pods · 5 GPUs 45% · $1.62/h · runpod $214.30 ≈7.6d                                                      ./config.env
+ 5 pods, 5 GPUs 45% │ 4 RunPod $214.30 ≈7.6d · $1.40/h │ 1 Vast $0.22/h                                    ./config.env
 ┌Pods──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │    P NAME             STAT M SET  GPU              GPU% MEM       TEMP DISK      $/H    HLTH  PROXY RTT   BRANCH 💾  │
 │▶   R apple            run    ✓✓✓✓ 1×RTX A4000 16G  87%  10/16G    71C  40/98G    $0.17  ✓12m  9500  -     w1d2   4m  │
@@ -294,13 +295,15 @@ name typed back.
 │    R ember            run    ✓✓✓✓ 1×B300 MIG 34G   98%  -         78C  40/98G    $0.89  ✓10m  9504  -     w1d2   2m  │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-[i] info · ok · API 6/min · 0s ago · every 5s  [q] quit  [enter] detail  [a/A] act/all  [space/x] mark/clear  [d/D] deep
+[i] info · ok · API 6/min · ↻ 0s ago · every 5s  [q] quit  [enter] detail  [a/A] act/all  [space/x] mark/clear  [d/D] de
 ```
 
 <sup>A made-up fleet, drawn by the dashboard's own renderer from test fixtures.</sup>
 `a` acts on the selected pod (`a a` raises its AI key's cap), `A` on the fleet, `d`/`D` deep-check it/all, `n` adds pods, and `?` asks
-claude or codex about the pod ([`pods ask`](docs/REFERENCE.md#pods-ask)). `i` (or a click on `[i] info`)
-opens the info panel: everything the two bars leave out, every key, and what the glyphs mean.
+claude or codex about the pod ([`pods ask`](docs/REFERENCE.md#pods-ask)). The top line groups the
+fleet by provider, each with its balance, runway and burn, and a `⚠` where something needs you. `i`
+(or a click on `[i] info` or the top line) opens the info panel: everything the two bars leave out,
+every key, and what the glyphs mean.
 [All the keys and columns](docs/REFERENCE.md#the-dashboard-arena-tui).
 
 ## The proxy
@@ -379,7 +382,9 @@ flowchart TD
 With `cron install --pull`, two copies every 15 minutes: **git** (each pod's day branch on
 GitHub) and **rsync** (each pod's home in `LOCAL_BACKUP_DIR`: a hard-linked snapshot per day
 plus an all-files `big/` mirror). The optional archive VM keeps a second copy of
-`LOCAL_BACKUP_DIR` that outlives the pods.
+`LOCAL_BACKUP_DIR` that outlives the pods. `arena backups` (or `b` in the dashboard) shows
+which of these are set up, when each last ran and how every pod is doing:
+[what gets backed up, where and when](docs/BACKUPS.md#what-gets-backed-up-where-and-when).
 [Everything about backups](docs/BACKUPS.md).
 
 ## Tracking spend

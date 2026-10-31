@@ -1223,24 +1223,34 @@ pub struct CohortUsage {
 }
 
 impl CohortUsage {
-    /// The summary bar's warning for keys at their cap, naming them — `⚠ AI key at cap:
-    /// arena9-foo (no pod)`, `⚠ 3 AI keys at cap: arena9-foo (no pod), arena9-bar +1 more` —
-    /// up to [`CAPPED_NAMED`]; `(no pod)`: no row shows it (`arena keys list` lists every key).
-    /// `None`: none at cap.
-    pub fn capped_names(&self) -> Option<String> {
+    /// The keys at their cap, named — `arena9-foo (no pod), arena9-bar +1 more` — up to
+    /// [`CAPPED_NAMED`]; `(no pod)`: no row shows it (`arena keys list` lists every key). `None`:
+    /// none at cap. The TUI's top line says it in OpenRouter's group ([`Self::capped_names`] for
+    /// the info panel).
+    pub fn capped_list(&self) -> Option<String> {
         let n = self.capped.len();
         if n == 0 {
             return None;
         }
         let named: Vec<String> = self.capped.iter().take(CAPPED_NAMED).map(|k| if k.pod { k.name.clone() } else { format!("{} (no pod)", k.name) }).collect();
         let more = if n > CAPPED_NAMED { format!(" +{} more", n - CAPPED_NAMED) } else { String::new() };
-        let head = if n == 1 { "⚠ AI key at cap".to_string() } else { format!("⚠ {n} AI keys at cap") };
-        Some(format!("{head}: {}{more}", named.join(", ")))
+        Some(format!("{}{more}", named.join(", ")))
     }
 
-    /// The summary bar's parts: a warning to lead it, if any (` ⚠ openrouter $12.00 left,
-    /// the keys' caps allow $40.00 more ·`; `‼` when the credit is gone), the tail (`openrouter
-    /// $422.09 left · AI today $3.20`), and how bad the warning is.
+    /// The info panel's warning for keys at their cap, naming them ([`Self::capped_list`]) —
+    /// `⚠ AI key at cap: arena9-foo (no pod)`, `⚠ 3 AI keys at cap: arena9-foo (no pod),
+    /// arena9-bar +1 more`. `None`: none at cap.
+    pub fn capped_names(&self) -> Option<String> {
+        let list = self.capped_list()?;
+        let n = self.capped.len();
+        let head = if n == 1 { "⚠ AI key at cap".to_string() } else { format!("⚠ {n} AI keys at cap") };
+        Some(format!("{head}: {list}"))
+    }
+
+    /// The info panel's parts (the summary bar as it used to read): a warning to lead it, if
+    /// any (` ⚠ openrouter $12.00 left, the keys' caps allow $40.00 more ·`; `‼` when the credit
+    /// is gone), the tail (`openrouter $422.09 left · AI today $3.20`), and how bad the warning
+    /// is.
     pub fn tui_parts(&self) -> (Option<String>, Option<String>, Fill) {
         let money = |x: f64| crate::fleet::fmt_money("$", x);
         let mut lead = Vec::new();
@@ -1828,6 +1838,7 @@ mod tests {
             let got: Vec<(&str, bool)> = c.capped.iter().map(|k| (k.name.as_str(), k.pod)).collect();
             assert_eq!(got, want, "{keys:?}");
             assert_eq!(c.capped_names().as_deref(), lead);
+            assert_eq!(c.capped_list().as_deref(), lead.map(|l| l.split_once(": ").unwrap().1));
             assert_eq!(c.tui_parts().0, lead.map(|l| format!(" {l} ·")));
             assert_eq!(c.tui_parts().2, if lead.is_some() { Fill::Near } else { Fill::Ok });
         }

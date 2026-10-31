@@ -31,7 +31,7 @@ pub(crate) const TOP: Groups = &[
     ("Fleet", &["pods", "tui", "snapshot"]),
     ("Access", &["proxy", "ssh-config", "keys"]),
     ("Money", &["offers", "balance", "spend", "teardown"]),
-    ("Automation", &["cron", "plan", "archive"]),
+    ("Automation", &["cron", "plan", "archive", "backups"]),
     ("Setup", &["config", "image", "update", "api"]),
 ];
 
