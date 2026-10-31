@@ -19,6 +19,15 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-31 · `arena claude push`: safe after a clock change, and never writes through a link
+- A push's order number is now kept per machine on the control box, so pushes made after the
+  box's clock went back (e.g. after it ran an hour ahead) aren't refused as "older" until the clock
+  catches up.
+- On the pod, a `~/.arena-claude.lock` that is a symlink or not a plain file is refused (the push
+  fails and says why) instead of being written through.
+- A push marks the machine as "not known to be current" before it changes anything there, so a push
+  that fails half-way is always picked up by the next `arena claude push`.
+
 ## 2026-10-31 · arena 2.7: Claude Code accounts per machine — `arena claude`
 - This is **arena 2.7** (a minor bump: a new command, `arena claude`, and `--cc-token` replaces a
   pod's Claude Code token instead of adding a line).

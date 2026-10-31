@@ -673,6 +673,54 @@ fn an_older_push_reaching_the_pod_after_a_newer_one_changes_nothing() {
     assert!(next_generation() < next_generation(), "each push is newer than the one before");
 }
 
+/// Review r4: the generation outlives the process — after the control box's clock went back (a
+/// counter kept from a push an hour ahead), the next push is still newer, not refused for an hour.
+#[test]
+fn a_generation_is_newer_than_the_last_even_after_the_clock_went_back() {
+    let d = tmp("gen-for");
+    let state = d.0.join("claude.json");
+    let ahead = next_generation() + 3_600_000_000;
+    let file = lock_path(&state, "hetzner", "42").with_extension("gen");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, format!("{ahead}\n")).unwrap();
+    let g1 = generation_for(&state, "hetzner", "42").unwrap();
+    assert_eq!(g1, ahead + 1, "one more than the last given out, the clock being behind it");
+    let g2 = generation_for(&state, "hetzner", "42").unwrap();
+    assert_eq!(g2, g1 + 1, "kept: the next one, as from another command");
+    // Another machine has its own; a counter that isn't a number starts again from the clock.
+    assert!(generation_for(&state, "hetzner", "43").unwrap() < ahead);
+    std::fs::write(&file, "garbage").unwrap();
+    assert!(generation_for(&state, "hetzner", "42").unwrap() < ahead);
+}
+
+/// Review r4: a `~/.arena-claude.lock` that's a symlink is never written through: `>` would
+/// truncate the file it points at. The push refuses and changes nothing.
+#[cfg(unix)]
+#[test]
+fn a_lock_path_that_is_a_symlink_is_never_written_through() {
+    use std::io::Write;
+    let d = tmp("push-lock-link");
+    let home = &d.0;
+    let victim = home.join("notes.txt");
+    std::fs::write(&victim, "a participant's notes\n").unwrap();
+    std::os::unix::fs::symlink(&victim, home.join(".arena-claude.lock")).unwrap();
+    let mut child = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(push_command(true, next_generation()))
+        .env("HOME", home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(format!("{}\n", tok(1)).as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(7), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a plain file"));
+    assert_eq!(read(home, "notes.txt"), "a participant's notes\n", "the file it points at is untouched");
+    assert!(!home.join(".zshrc").exists(), "nothing else changed");
+}
+
 #[test]
 fn the_push_command_never_carries_a_token() {
     for cmd in [push_command(true, 7), push_command(false, 7)] {
