@@ -125,6 +125,9 @@ pub struct Inputs {
     /// What arena left on this box ([`crate::disk::find_leftovers`]): a replace/migrate staging
     /// copy, an interrupted baseline capture, a hard-stopped pull's rsync temp files.
     pub leftovers: Probe<Vec<crate::disk::Leftover>>,
+    /// This cohort's capacity spares ([`crate::spare`]): Hetzner servers in no fleet listing,
+    /// billing like any; skipped without `HETZNER_API_KEY`.
+    pub spares: Probe<Vec<Pod>>,
 }
 
 /// One checklist line's outcome.
@@ -169,6 +172,7 @@ pub enum Area {
     Archive,
     Images,
     Leftovers,
+    Spares,
 }
 
 impl Area {
@@ -177,6 +181,7 @@ impl Area {
             Area::Archive => "backup archive",
             Area::Images => "images",
             Area::Leftovers => "left on this box",
+            Area::Spares => "capacity spares",
             Area::Pods => "pods",
             Area::Volumes => "network volumes",
             Area::Keys => "OpenRouter keys",
@@ -349,6 +354,7 @@ pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
     items.push(proxy_item(&inputs.proxy, &configured));
     items.push(archive_item(&inputs.archive, naming.prefix, inputs.archive_keep_until, inputs.today_days, &inputs.archive_prices));
     items.push(images_item(&inputs.images, naming.prefix, inputs.now));
+    items.push(spares_item(&inputs.spares));
     items.push(leftovers_item(&inputs.leftovers, inputs.now));
     let count = |v: Verdict| items.iter().filter(|i| i.verdict == v).count();
     let (remaining, unknown) = (count(Verdict::Remaining), count(Verdict::Unknown));
@@ -361,6 +367,44 @@ pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
         balance: Vec::new(),
         balance_at: 0,
     }
+}
+
+/// This cohort's capacity spares (`pods spare up`): servers in no fleet listing that bill by the
+/// hour like any — remaining until `arena pods spare down --all` (nothing of anyone's is on one).
+pub fn spares_item(probe: &Probe<Vec<Pod>>) -> Item {
+    const SCOPE: &str = "hetzner";
+    let spares = match probe {
+        Probe::Skipped(why) => return Item::new(Area::Spares, SCOPE, Verdict::Skipped, why.clone()),
+        Probe::Failed(e) => return Item::new(Area::Spares, SCOPE, Verdict::Unknown, format!("couldn't list ({e}) — NOT known to be gone")),
+        Probe::Got(s) => s,
+    };
+    if spares.is_empty() {
+        return Item::new(Area::Spares, SCOPE, Verdict::Clear, "none");
+    }
+    let (per_hr, unknown) = crate::spare::cost_per_hr(spares);
+    let unpriced = if unknown > 0 { format!(" + {unknown} unpriced") } else { String::new() };
+    let mut item = Item::new(
+        Area::Spares,
+        SCOPE,
+        Verdict::Remaining,
+        format!("{} spare(s) billing, {}/h{unpriced}", spares.len(), fmt_money(currency_symbol("hetzner"), per_hr)),
+    );
+    for p in spares {
+        item.entries.push(Entry::Pod {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            provider: p.provider.clone(),
+            status: p.status.clone(),
+            billing: bills_hourly(&p.provider, &p.status),
+            cost_per_hr: p.cost_per_hr,
+            cohort: true,
+            staff: false,
+            locked: false,
+        });
+    }
+    item.notes.push("made by `arena pods spare up` to take later (`migrate copy <name> --onto-spare`); no one's machine yet".into());
+    item.fix.push("arena pods spare down --all".into());
+    item
 }
 
 /// What arena left on this box ([`crate::disk::find_leftovers`]): ◷ kept — never against the
@@ -1483,8 +1527,36 @@ mod tests {
             today_days: 20_000,
             images: Probe::Got(crate::image::Inventory::default()),
             leftovers: Probe::Got(Vec::new()),
+            spares: Probe::Got(Vec::new()),
             now: 20_000 * 86_400,
         }
+    }
+
+    /// Capacity spares bill by the hour in no fleet listing: teardown names each with its cost
+    /// and the command that deletes them; none is clear; an unread list is unknown.
+    #[test]
+    fn spares_are_remaining_until_spare_down() {
+        let spare = |id: &str, cost: Option<f64>| Pod {
+            id: id.into(),
+            name: format!("arena7-spare-{id}"),
+            provider: "hetzner".into(),
+            status: "RUNNING".into(),
+            cost_per_hr: cost,
+            ..Default::default()
+        };
+        let i = spares_item(&Probe::Got(vec![spare("1", Some(0.0155)), spare("2", None)]));
+        assert_eq!(i.verdict, Verdict::Remaining);
+        assert!(i.summary.contains("2 spare(s) billing") && i.summary.contains("+ 1 unpriced"), "{}", i.summary);
+        assert_eq!(i.fix, ["arena pods spare down --all"]);
+        assert_eq!(i.entries.len(), 2);
+        assert_eq!(spares_item(&Probe::Got(vec![])).verdict, Verdict::Clear);
+        assert_eq!(spares_item(&Probe::Failed("hetzner list HTTP 503".into())).verdict, Verdict::Unknown);
+        assert_eq!(spares_item(&Probe::Skipped("no key".into())).verdict, Verdict::Skipped);
+        // In the whole check: a spare left makes it not clear.
+        let mut with = inputs();
+        with.spares = Probe::Got(vec![spare("1", Some(0.0155))]);
+        let r = build(&with, &Naming { prefix: "arena7", list: &[] });
+        assert!(!r.clear && r.items.iter().any(|i| i.area == Area::Spares && i.verdict == Verdict::Remaining));
     }
 
     /// REVIEW sf SF7: teardown never looks at Shadeform volumes (spec §8.2, §10.4.8, §11:
@@ -1568,6 +1640,7 @@ mod tests {
                 (Area::Proxy, "/srv/proxy.conf", Verdict::Clear),
                 (Area::Archive, "hetzner", Verdict::Clear), // the archive answered: none
                 (Area::Images, "hetzner", Verdict::Clear),
+                (Area::Spares, "hetzner", Verdict::Clear),
                 (Area::Leftovers, "copies and temp files", Verdict::Clear),
             ]
         );

@@ -3585,10 +3585,10 @@ async fn proxy_gate_probes_the_stable_port_within_the_probe_budget() {
     );
     let fake = FakeRemote::new();
     fake.script("proxy.test:9501", [FakeReply::stdout("id-new\n"), FakeReply::stdout("id-old\n"), FakeReply::hang()]);
-    assert!(proxy_reaches_pod(&fake, &cfg, "devtest-bloom", "id-new").await.unwrap());
-    assert!(!proxy_reaches_pod(&fake, &cfg, "devtest-bloom", "id-new").await.unwrap(), "still the old pod");
+    assert!(proxy_reaches_pod(&fake, &cfg, "runpod", "devtest-bloom", "id-new").await.unwrap());
+    assert!(!proxy_reaches_pod(&fake, &cfg, "runpod", "devtest-bloom", "id-new").await.unwrap(), "still the old pod");
     let start = Instant::now();
-    assert!(!proxy_reaches_pod(&fake, &cfg, "devtest-bloom", "id-new").await.unwrap());
+    assert!(!proxy_reaches_pod(&fake, &cfg, "runpod", "devtest-bloom", "id-new").await.unwrap());
     assert_eq!(start.elapsed(), PROBE_TIMEOUT);
     assert!(fake.calls().iter().all(|c| matches!(c, RemoteCall::Exec { timeout, .. } if *timeout == Some(PROBE_TIMEOUT))));
 }

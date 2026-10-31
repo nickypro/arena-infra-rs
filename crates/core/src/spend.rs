@@ -249,6 +249,11 @@ pub struct Machine {
     /// Whether any part of `accrued` is an estimate.
     #[serde(default)]
     pub estimate: bool,
+    /// A capacity spare (`pods spare up`, [`crate::spare`]): left out of every fleet listing by
+    /// design, so one that lacks it doesn't end it — only a spare listing does
+    /// ([`observe_spares`]). Taken into the fleet (`--onto-spare`), it's an ordinary machine.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spare: bool,
 }
 
 impl Machine {
@@ -560,6 +565,8 @@ pub fn observe(mut state: SpendState, listing: &Listing, pods: &[Pod], naming: &
                 if !m.is_open() {
                     continue;
                 }
+                // In a fleet listing: no spare (any more) — taken into the fleet.
+                m.spare = false;
                 let moved = m.name != p.name;
                 note_listing(m, p);
                 match rate {
@@ -594,11 +601,59 @@ pub fn observe(mut state: SpendState, listing: &Listing, pods: &[Pod], naming: &
     }
     for m in state.machines.iter_mut().filter(|m| m.is_open() && ok.contains(m.provider.as_str())) {
         // Not listed — by a listing at least as new as its last sighting (an older one says
-        // nothing about now).
-        if listed.contains(&(m.provider.as_str(), m.id.as_str())) || now <= m.last_seen {
+        // nothing about now). A spare never is: only a spare listing ends one.
+        if m.spare || listed.contains(&(m.provider.as_str(), m.id.as_str())) || now <= m.last_seen {
             continue;
         }
         if m.start_how == StartHow::Created && now.saturating_sub(m.first_seen) < CREATE_GRACE {
+            continue;
+        }
+        end(m, now, EndHow::Vanished);
+    }
+    refresh_accrued(&mut state);
+    state
+}
+
+/// The fold over one complete listing of `provider`'s capacity spares at `now` (`pods spare
+/// list|up|down`, `pods list`, `arena spend`, `teardown --check` read it): each of this fleet's
+/// spares extends its row (or starts one, from its provider's creation time when tracking
+/// covers it, as [`observe`] does) and is marked a spare; an open spare row this listing lacks
+/// ends — unless a fleet listing or an adoption took it out of the spares since. Pure.
+pub fn observe_spares(mut state: SpendState, provider: &str, spares: &[Pod], naming: &Naming, now: u64) -> SpendState {
+    state.begin(now);
+    for p in spares.iter().filter(|p| p.provider == provider && !p.id.is_empty()) {
+        match state.machines.iter().rposition(|m| m.provider == provider && m.id == p.id) {
+            // Ended (deleted by `spare down`, still winding down): left as it ended.
+            Some(i) if !state.machines[i].is_open() => {}
+            Some(i) => {
+                let m = &mut state.machines[i];
+                if now < m.last_seen || m.event_at.is_some_and(|e| now <= e) {
+                    continue;
+                }
+                m.spare = true;
+                note_listing(m, p);
+                if let Some(r) = rate_of(p, m.last_running_rate()) {
+                    extend(m, now, r, REFRESH);
+                }
+            }
+            None if claims(naming, &p.name) => {
+                if let Some(r) = rate_of(p, None) {
+                    let since = state.since.unwrap_or(now);
+                    let (start, how) = match p.created_at.filter(|c| *c <= now && *c >= since) {
+                        Some(c) => (c, StartHow::Provider),
+                        None => (now, StartHow::Seen),
+                    };
+                    let mut m = new_machine(p, start, how, now);
+                    m.spare = true;
+                    extend(&mut m, now, r, 0);
+                    state.machines.push(m);
+                }
+            }
+            None => {}
+        }
+    }
+    for m in state.machines.iter_mut().filter(|m| m.is_open() && m.spare && m.provider == provider) {
+        if now <= m.last_seen || spares.iter().any(|p| p.id == m.id) {
             continue;
         }
         end(m, now, EndHow::Vanished);
@@ -627,6 +682,7 @@ fn new_machine(p: &Pod, start: u64, start_how: StartHow, now: u64) -> Machine {
         volume_gb: None,
         accrued: 0.0,
         estimate: false,
+        spare: false,
     };
     note_listing(&mut m, p);
     m
@@ -674,6 +730,14 @@ pub enum OwnerRule {
 pub enum Event<'a> {
     /// A create returned this pod.
     Created { pod: &'a Pod, owner: &'a OwnerRule },
+    /// A machine arena already had was taken as a `replace`/`migrate`'s new pod (`--onto`, a
+    /// capacity spare): renamed `pod.name` (`<x>-new`), it gets the owner `owner` gives, as a
+    /// create's pod would — its row (the same instance) goes on, under that owner.
+    Adopted { pod: &'a Pod, owner: &'a OwnerRule },
+    /// A create of a capacity spare (`pods spare up`) returned this pod: a row of nobody's, marked
+    /// a spare from the start — so a fleet listing (which never shows a spare) can't end it
+    /// before the spare listing marks it.
+    SpareCreated { pod: &'a Pod },
     /// A terminate succeeded (`provider` when the caller knows it).
     Terminated { provider: Option<&'a str>, id: &'a str },
     /// A stop succeeded: from now it bills its disk only.
@@ -700,10 +764,17 @@ fn replaced_names(name: &str) -> Vec<String> {
 pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
     state.begin(now);
     match ev {
-        Event::Created { pod, owner } => {
+        Event::SpareCreated { pod } => {
+            state = apply_event(state, &Event::Created { pod, owner: &OwnerRule::None }, now);
+            if let Some(i) = state.open_index(Some(&pod.provider), &pod.id) {
+                state.machines[i].spare = true;
+            }
+        }
+        Event::Created { pod, owner } | Event::Adopted { pod, owner } => {
             if pod.id.is_empty() {
                 return state;
             }
+            let created = matches!(ev, Event::Created { .. });
             let inherited = match owner {
                 OwnerRule::Given(o) => Some(o.clone()),
                 // The nearest name that has an open machine decides — its owner, or none: an
@@ -723,9 +794,14 @@ pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
                 OwnerRule::None => None,
             };
             let i = match state.open_index(Some(&pod.provider), &pod.id) {
-                Some(i) => i,
+                Some(i) => {
+                    // Taken under its new name: the row follows it at once.
+                    state.machines[i].name.clone_from(&pod.name);
+                    i
+                }
                 None => {
-                    let mut m = new_machine(pod, now, StartHow::Created, now);
+                    let how = if created { StartHow::Created } else { StartHow::Seen };
+                    let mut m = new_machine(pod, now, how, now);
                     if let Some(r) = rate_of(pod, None) {
                         extend(&mut m, now, r, 0);
                     }
@@ -734,9 +810,17 @@ pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
                 }
             };
             state.machines[i].event_at = Some(now);
-            if let Some(o) = inherited {
-                state.machines[i].owner = Some(o.clone());
-                adopt_keys(&mut state, &pod.name, &o);
+            if !created {
+                state.machines[i].spare = false;
+            }
+            match inherited {
+                Some(o) => {
+                    state.machines[i].owner = Some(o.clone());
+                    adopt_keys(&mut state, &pod.name, &o);
+                }
+                // A machine taken for an unowned one is no longer whoever had it before.
+                None if !created => state.machines[i].owner = None,
+                None => {}
             }
         }
         Event::Terminated { provider, id } => {
@@ -2010,6 +2094,11 @@ pub fn record_quietly(path: Option<&Path>, now: u64, f: impl FnOnce(SpendState) 
 /// balance` and the snapshot cron line do after they listed.
 pub fn record_listing(path: Option<&Path>, listing: &Listing, pods: &[Pod], naming: &Naming, now: u64) {
     record_quietly(path, now, |s| observe(s, listing, pods, naming, now));
+}
+
+/// Record a complete spare listing ([`observe_spares`]) quietly.
+pub fn record_spares(path: Option<&Path>, provider: &str, spares: &[Pod], naming: &Naming, now: u64) {
+    record_quietly(path, now, |s| observe_spares(s, provider, spares, naming, now));
 }
 
 /// Record a complete key listing ([`observe_keys`]) quietly.
