@@ -14,9 +14,9 @@ use crate::{expand_tilde, local_now};
 pub(crate) enum PlanCmd {
     /// Validate the plan file and print its resolved schedule
     Check {
-        /// The plan file
-        #[arg(long, default_value = "arena-plan.json")]
-        file: PathBuf,
+        /// The plan file [default: arena-plan.json beside the config]
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
     /// Preview what the plan would do on a date (read-only)
     ///
@@ -24,9 +24,9 @@ pub(crate) enum PlanCmd {
     /// replace day, what it would tear down.
     #[command(verbatim_doc_comment)]
     Show {
-        /// The plan file
-        #[arg(long, default_value = "arena-plan.json")]
-        file: PathBuf,
+        /// The plan file [default: arena-plan.json beside the config]
+        #[arg(long)]
+        file: Option<PathBuf>,
         /// Date to preview (YYYY-MM-DD). Defaults to today (local).
         #[arg(long)]
         date: Option<String>,
@@ -41,6 +41,7 @@ pub(crate) async fn handle_plan(cmd: PlanCmd, provider: &dyn Provider, cfg: &Con
 
     match cmd {
         PlanCmd::Check { file } => {
+            let file = file.unwrap_or_else(|| crate::fleet_files::plan_file(cfg));
             let plan = Plan::load(&file)?;
             println!("plan file:  {}", file.display());
             println!("local now:  {today_ymd} {:02}:{:02} {tz}", now_min / 60, now_min % 60);
@@ -80,6 +81,7 @@ pub(crate) async fn handle_plan(cmd: PlanCmd, provider: &dyn Provider, cfg: &Con
         }
 
         PlanCmd::Show { file, date } => {
+            let file = file.unwrap_or_else(|| crate::fleet_files::plan_file(cfg));
             let plan = Plan::load(&file)?;
             let target_days = match &date {
                 Some(s) => {

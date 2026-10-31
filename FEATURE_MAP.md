@@ -85,6 +85,7 @@ means this.
 
 | Key | Default | What it does |
 |---|---|---|
+| `PROVIDER` | unset/empty → `runpod` | The fleet's provider: what `create`/`up` make pods on, and whose key every listing needs, when `--provider` doesn't say (`PROVIDER=hetzner` for a Hetzner-only fleet). `--provider` wins; the dashboard's add-pod form starts on it (`ARENA_PROVIDER` wins there). Every other provider with a key is still listed. A name that isn't a provider is a ✗ row in `config check` and fails every command that lists. Settable from the environment like any key the file sets. |
 | `RUNPOD_API` | unset/empty → `v2` | RunPod REST API: `v2` (the default) or `v1` (RunPod retires it 2026-11-16; `config check` warns: `remove RUNPOD_API=v1 (v2 is the default)`); anything else is an error. v1 can only ask for hosts on CUDA ≤ 13.0; v2 sends a real floor — and **v2's restart resets the container disk** (size `VOLUME_GB` for what must survive). Settable from the environment (`RUNPOD_API=v1 arena pods list`). |
 | `SSH_PROXY_RELOAD_CMD` | absent → `nginx -t && nginx -s reload` | Run after a proxy write; **empty = write-only** (never reloads nginx). Settable (empty) from the environment, as the sandbox wrapper does. |
 | `SETUP_TIMEOUT_SECS` | 300 (image pods) / 1800 (Hetzner script) | The main setup step's budget, 1..86400, for `setup`, `up`, `restart`, `replace`, `migrate copy`; `setup --timeout` wins. Checked before `up` creates anything. |

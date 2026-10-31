@@ -306,7 +306,12 @@ impl Pool {
 pub fn load_pool(cfg: &Config) -> Result<Pool, String> {
     let set = |k: &str| cfg.get(k).map(str::trim).filter(|v| !v.is_empty()).map(String::from);
     if let Some(p) = set(TOKENS_FILE_KEY) {
-        let path = expand_home(&p);
+        // A relative path is beside the config, as the fleet's other files are (`keys/`); one
+        // parsed from text (no file) keeps it as given.
+        let path = match (expand_home(&p), cfg.source().and_then(Path::parent)) {
+            (rel, Some(dir)) if rel.is_relative() && !dir.as_os_str().is_empty() => dir.join(rel),
+            (path, _) => path,
+        };
         let parsed = read_tokens_file(&path)?;
         let mut pool = Pool::of(parsed.accounts, Source::File(path));
         pool.notes = parsed.skipped;

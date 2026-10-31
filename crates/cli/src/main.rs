@@ -29,6 +29,7 @@ mod archive;
 mod backups;
 mod claude;
 mod disk;
+mod fleet_files;
 mod image;
 mod ask;
 #[cfg(test)]
@@ -371,8 +372,12 @@ async fn run() -> Result<()> {
     if let Cmd::Update { check, dry_run, skip_attestation } = cli.cmd {
         return handle_update(check, dry_run, skip_attestation, cli.yes).await;
     }
-    let cfg = Config::load(&cli.config)
-        .with_context(|| format!("loading config {}", cli.config.display()))?;
+    // `--config`, else ARENA_CONFIG, else ~/.config/arena/config.env, else the built-in default;
+    // then the fleet's provider: `--provider`, else the config's PROVIDER, else runpod.
+    let (config_path, config_source) = arena_core::config::find_config(cli.config.as_deref());
+    let cfg = Config::load(&config_path).with_context(|| arena_core::config::load_context(&config_path, config_source))?;
+    let (provider_name, provider_source) = arena_core::config::pick_provider(cli.provider.as_deref(), &cfg);
+    let picked = config_cmd::Picked { config: config_path.clone(), config_source, provider: provider_name.clone(), provider_source };
 
     // `config check` must work even when a provider key is missing (that's what it's
     // for), so build the provider lazily — only for commands that actually talk to one.
@@ -381,21 +386,21 @@ async fn run() -> Result<()> {
         Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Update { .. } | Cmd::Gpus { .. } | Cmd::Offers { .. } | Cmd::Api(_) | Cmd::Archive(_) | Cmd::Image(_) | Cmd::Backups { .. } => None,
         // Fleet-wide: every command spans all configured providers (create still targets
         // --provider). One configured backend behaves like that single provider.
-        _ => Some(arena_core::provider::build_fleet(&cli.provider, &cfg, true)?),
+        _ => Some(picked.fleet(&cfg)?),
     };
     // How every pod-SSH path reaches pods — one for the whole run: real ssh/scp here,
     // `FakeRemote` in tests. Each call carries its own budget (see the `*_TIMEOUT`s).
     let remote: Arc<dyn Remote> = Arc::new(arena_core::remote::SshRemote);
 
     match cli.cmd {
-        Cmd::Tui => launch_tui(&cli.provider, &cli.config),
+        Cmd::Tui => launch_tui(&provider_name, &config_path),
         Cmd::Update { .. } => unreachable!("handled before the config is read"),
         Cmd::Plan(c) => handle_plan(c, provider.unwrap().as_ref(), &cfg).await,
-        Cmd::Config(ConfigCmd::Check) => config_check(&cfg, &cli.provider, &[hetzner_image_rows(&cfg).await, disk::check_rows(&cfg)].concat()),
-        Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &cli.config),
-        Cmd::Cron(c) => handle_cron(c, &cfg, &cli.config, cli.yes, CRONTAB, std::env::var("HOME").ok().as_deref()).await,
+        Cmd::Config(ConfigCmd::Check) => config_check(&cfg, &provider_name, &[hetzner_image_rows(&cfg).await, disk::check_rows(&cfg)].concat()),
+        Cmd::Config(c) => handle_config(c, &cfg, &picked),
+        Cmd::Cron(c) => handle_cron(c, &cfg, &config_path, cli.yes, CRONTAB, std::env::var("HOME").ok().as_deref()).await,
         Cmd::Archive(c) => archive::handle_archive(c, &cfg, remote.as_ref(), cli.yes).await,
-        Cmd::Backups { json } => backups::handle_backups(&cfg, &cli.config, json, arena_core::backups::read_crontab()),
+        Cmd::Backups { json } => backups::handle_backups(&cfg, &config_path, json, arena_core::backups::read_crontab()),
         Cmd::Image(c) => image::handle_image(c, &cfg, remote, cli.yes, Interrupt::ctrl_c()).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
@@ -456,12 +461,12 @@ async fn run() -> Result<()> {
             print!("{}", out.stdout);
             Ok(())
         }
-        Cmd::Gpus { json } => offers::handle_gpus(&cfg, &cli.provider, json).await,
+        Cmd::Gpus { json } => offers::handle_gpus(&cfg, &provider_name, json).await,
         Cmd::Api(c) => handle_api(c, &cfg).await,
         Cmd::Offers { view, gpu, cloud, max_price, gpus, server_type, order, all, verbose, json } => {
             let flags = offers::Flags { gpu, cloud, max_price, gpus, server_type, order };
             let view = if all { Some("all") } else { view.as_deref() };
-            offers::handle_offers(&cfg, provider_named.then_some(cli.provider.as_str()), view, flags, json, verbose).await
+            offers::handle_offers(&cfg, provider_named.then_some(provider_name.as_str()), view, flags, json, verbose).await
         }
     }
 }

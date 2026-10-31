@@ -146,6 +146,10 @@ fn the_pool_is_the_tokens_file_or_configs_one_token() {
     // Neither: no pool, not an error.
     assert!(load_pool(&cfg("")).unwrap().is_empty());
 
+    // A relative path is beside the config file.
+    let loaded = Config::parse("CLAUDE_TOKENS_FILE=tokens\n").with_source(&d.0.join("config.env"));
+    assert_eq!(load_pool(&loaded).unwrap().source, Source::File(file.clone()));
+
     // Refusals, none with a token in them.
     write_mode(&file, &format!("a@x -> {}\n", tok(1)), 0o644);
     let e = load_pool(&cfg(&format!("CLAUDE_TOKENS_FILE={}\n", file.display()))).unwrap_err();

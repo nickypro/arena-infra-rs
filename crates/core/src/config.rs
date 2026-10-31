@@ -4,11 +4,16 @@
 //! `# comments`) with one bash array, `MACHINE_NAME_LIST=( "a" "b" ... )`, that
 //! may span many lines. We parse both so the Rust tooling reads the *same* config
 //! the bash/python scripts use — no migration required.
+//!
+//! Which file is read, the fleet's provider and the files kept beside it: `config/find.rs`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+
+mod find;
+pub use find::*;
 
 #[derive(Debug, Clone, Default)]
 pub struct Config {

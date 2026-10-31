@@ -13,7 +13,7 @@ use arena_core::Config;
 use clap::Subcommand;
 
 use crate::cli::{OntoFlags, PlaceFlags};
-use crate::keys::KEYS_DIR;
+use crate::keys::keys_dir;
 use crate::pods::adopt::{self, Source};
 use crate::pods::create::{sizing_flags, SpecOverrides};
 use crate::pods::home_copy::{copy_pod_files, remove_staging_for, verify_replacement, CopyOpts};
@@ -244,6 +244,7 @@ pub(crate) async fn handle_migrate_copy(
     let owner = crate::spend::Tracked::new(owner.as_ref(), &tracking, arena_core::spend::OwnerRule::Inherit);
     let spares = adopt::spares_for(&owner, cfg);
     let CopyHow { source, force, dry_run, yes } = how;
+    let keys = keys_dir(cfg);
     let job = MigrateCopyJob {
         setup_timeouts,
         ov,
@@ -251,7 +252,7 @@ pub(crate) async fn handle_migrate_copy(
         dry_run,
         yes,
         interrupt,
-        keys_dir: KEYS_DIR,
+        keys_dir: &keys,
         balance: Some(bal),
         source,
         force,
@@ -278,7 +279,7 @@ pub(crate) struct MigrateCopyJob<'a> {
     pub dry_run: bool,
     pub yes: bool,
     pub interrupt: &'a Interrupt,
-    /// Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    /// Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     pub keys_dir: &'a str,
     /// Where `-new`'s price is remembered for the balance ([`create_replacement`]); `None`:
     /// not remembered.
@@ -533,7 +534,7 @@ pub(crate) async fn handle_migrate_cutover(
     opts: CutoverOpts,
 ) -> Result<()> {
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
-    migrate_cutover_on(remote, fleet, cfg, owner.as_ref(), &canonical, &pods, opts, KEYS_DIR).await
+    migrate_cutover_on(remote, fleet, cfg, owner.as_ref(), &canonical, &pods, opts, &keys_dir(cfg)).await
 }
 
 /// The cutover's check that no one is on the original (`--force` skips it): what they write
@@ -591,7 +592,7 @@ pub(crate) async fn migrate_cutover_on(
     canonical: &str,
     pods: &[arena_core::Pod],
     opts: CutoverOpts,
-    // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    // Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     keys_dir: &str,
 ) -> Result<()> {
     let CutoverOpts { skip_proxy, no_final_sync, dry_run, yes, force } = opts;

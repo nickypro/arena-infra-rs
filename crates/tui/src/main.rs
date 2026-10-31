@@ -29,8 +29,10 @@
 //! will do in plain words (`v` shows the generated command) and take a single `y`. There is
 //! no way to mutate a pod without going through that modal — the dashboard's reads stay reads.
 //!
-//! Provider is chosen by `ARENA_PROVIDER` (default `runpod`); config path by
-//! `ARENA_CONFIG`; initial cadence by `ARENA_REFRESH_SECS` (default 5).
+//! Config and provider as the CLI picks them (`arena_core::config::find_config`, `pick_provider`):
+//! the config is `ARENA_CONFIG`, else `~/.config/arena/config.env`, else the built-in default; the
+//! provider `ARENA_PROVIDER`, else the config's `PROVIDER`, else `runpod`. `arena tui` sets both.
+//! Initial cadence by `ARENA_REFRESH_SECS` (default 5).
 
 mod aikey;
 mod ask;
@@ -91,7 +93,7 @@ use state::{
 };
 use newpod::NewPodForm;
 
-const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
+use arena_core::config::LEGACY_CONFIG as DEFAULT_CONFIG;
 /// Shorter than backup/setup's 10s: a down pod shouldn't stall a whole metrics sweep.
 const METRICS_CONNECT_TIMEOUT: u32 = 4;
 /// The cadences `f` cycles through (seconds).
@@ -392,8 +394,9 @@ impl Ui {
 /// config and refreshed the prod fleet (live, 2026-10-18).
 fn args_refusal(args: &[String]) -> Option<(i32, String)> {
     let usage = format!(
-        "arena-tui takes no arguments: the config comes from ARENA_CONFIG (default {DEFAULT_CONFIG}), \
-         the provider from ARENA_PROVIDER. Run `arena [--config <file>] [--provider <name>] tui`."
+        "arena-tui takes no arguments: the config comes from ARENA_CONFIG (else ~/.config/arena/config.env, \
+         else {DEFAULT_CONFIG}), the provider from ARENA_PROVIDER (else the config's PROVIDER). \
+         Run `arena [--config <file>] [--provider <name>] tui`."
     );
     match args {
         [] => None,
@@ -422,11 +425,11 @@ async fn main() -> Result<()> {
             std::process::exit(2);
         }
     }
-    let config_path =
-        std::env::var("ARENA_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
-    let cfg = Config::load(&PathBuf::from(&config_path))
-        .with_context(|| format!("loading config {config_path}"))?;
-    let provider_name = std::env::var("ARENA_PROVIDER").unwrap_or_else(|_| "runpod".to_string());
+    // As the CLI picks them (`arena tui` hands its own choice over in ARENA_CONFIG/ARENA_PROVIDER).
+    let (config_file, source) = arena_core::config::find_config(None);
+    let cfg = Config::load(&config_file).with_context(|| arena_core::config::load_context(&config_file, source))?;
+    let config_path = config_file.display().to_string();
+    let (provider_name, provider_source) = arena_core::config::pick_provider(std::env::var("ARENA_PROVIDER").ok().as_deref(), &cfg);
     let demo = demo::wanted(std::env::var("ARENA_TUI_DEMO").ok().as_deref());
     // Fleet-spanning provider (like the CLI): the dashboard lists pods across ALL configured
     // backends — runpod + vast + hetzner — not just the primary. `warn_on_partial=false` so a
@@ -434,7 +437,14 @@ async fn main() -> Result<()> {
     // go to the chosen primary (ARENA_PROVIDER). A demo asks no provider anything.
     let provider: Arc<dyn Provider> = match demo {
         Some(_) => Arc::new(demo::NoProvider),
-        None => Arc::from(arena_core::provider::build_fleet(&provider_name, &cfg, false)?),
+        None => {
+            let fleet = arena_core::provider::build_fleet(&provider_name, &cfg, false);
+            Arc::from(match provider_source {
+                // A bad PROVIDER in the config is named as that, as `arena` names it.
+                arena_core::config::ProviderSource::Config => fleet.with_context(|| format!("the config's PROVIDER=\"{provider_name}\" ({config_path})"))?,
+                _ => fleet?,
+            })
+        }
     };
     let trace = lag::Trace::from_env();
     let progress_cmd = cfg.get("PROGRESS_CMD").map(String::from);
@@ -2822,8 +2832,9 @@ async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (Str
     // The pod's backup lock, like every other writer of its backup (RR10): never alongside a
     // pull, the cron's push or the reaper's own backup of it (whose git step would then fail
     // on `.git/index.lock`). Busy = say so and do nothing.
-    let dir = cfg.get("LOCAL_BACKUP_DIR").map(str::trim).filter(|d| !d.is_empty()).unwrap_or("./backup");
-    let _lock = match arena_core::pull::try_pod_lock_now(dir, &pod.name) {
+    // The CLI's backup dir (`LOCAL_BACKUP_DIR`, else the fleet's `backup/`), so the lock is the same one.
+    let (dir, _) = cfg.local_backup_dir();
+    let _lock = match arena_core::pull::try_pod_lock_now(&dir, &pod.name) {
         Ok(lock) => lock,
         Err(()) => return (format!("⊘ {} — busy: another backup of it (a pull, the cron or the reaper) is running; try again shortly", pod.name), None),
     };

@@ -30,7 +30,7 @@ use crate::provider::{build, ContainerReset, Provider, StopOutcome};
 
 /// The known backends, in the order they're listed/built. `shadeform` is opt-in overflow: it
 /// joins the fleet's listing when `SHADEFORM_API_KEY` is set, and creates only when chosen.
-const KNOWN: [&str; 4] = ["runpod", "vast", "hetzner", "shadeform"];
+pub const KNOWN: [&str; 4] = ["runpod", "vast", "hetzner", "shadeform"];
 
 pub struct MultiProvider {
     backends: Vec<Box<dyn Provider>>,
