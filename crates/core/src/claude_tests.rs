@@ -457,7 +457,7 @@ fn token_lines(text: &str) -> Vec<&str> {
 /// nothing should be.
 fn leftovers(home: &Path, keep: &[&str]) -> Vec<String> {
     if let Ok(lock) = std::fs::read_to_string(home.join(".arena-claude.lock")) {
-        assert!(lock.lines().all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit())), "the lock file holds generations and nothing else: {lock:?}");
+        assert!(lock.trim().chars().all(|c| c.is_ascii_digit()), "the lock file holds a generation and nothing else: {lock:?}");
     }
     let mut v: Vec<String> = std::fs::read_dir(home)
         .unwrap()
@@ -667,7 +667,7 @@ fn an_older_push_reaching_the_pod_after_a_newer_one_changes_nothing() {
     assert_eq!(code, Some(6));
     assert!(err.contains("a newer push has already run on this machine"), "{err}");
     assert!(read(home, ".zshrc").contains(&tok(2)) && !read(home, ".zshrc").contains(&tok(1)), "the newer token stays");
-    assert_eq!(read(home, ".arena-claude.lock").lines().last(), Some("200"), "the last push that ran");
+    assert_eq!(read(home, ".arena-claude.lock").trim(), "200");
     assert_eq!(run(300, &tok(3)).0, Some(0));
     assert!(read(home, ".zshrc").contains(&tok(3)));
     assert!(next_generation() < next_generation(), "each push is newer than the one before");
@@ -722,27 +722,41 @@ fn a_lock_path_that_is_a_symlink_is_never_written_through() {
     assert!(!home.join(".zshrc").exists(), "nothing else changed");
 }
 
-/// Review r4: the lock file is appended to, never truncated — a line per push, the last one counts.
+/// Review r5: the path swapped for a link while the push waited for the lock: the push refuses
+/// once it has the lock, and the file the link points at is never written.
 #[cfg(unix)]
 #[test]
-fn the_lock_file_is_only_appended_to() {
+fn a_lock_path_swapped_for_a_link_while_waiting_is_never_written_through() {
     use std::io::Write;
-    let d = tmp("push-lock-append");
-    let home = &d.0;
-    for gen in [100u64, 200] {
-        let mut child = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(push_command(true, gen))
-            .env("HOME", home)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(format!("{}\n", tok(1)).as_bytes()).unwrap();
-        assert!(child.wait_with_output().unwrap().status.success());
+    if std::process::Command::new("flock").arg("--version").output().is_err() {
+        return; // no util-linux here
     }
-    assert_eq!(read(home, ".arena-claude.lock"), "100\n200\n");
+    let d = tmp("push-lock-swap");
+    let home = &d.0;
+    let lk = home.join(".arena-claude.lock");
+    let victim = home.join("config");
+    std::fs::write(&victim, "[core]\n").unwrap();
+    let held = std::fs::OpenOptions::new().create(true).append(true).open(&lk).unwrap();
+    held.lock().unwrap();
+    let mut child = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(push_command(true, next_generation()))
+        .env("HOME", home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(format!("{}\n", tok(1)).as_bytes()).unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(child.try_wait().unwrap().is_none(), "it waits for the lock");
+    std::fs::remove_file(&lk).unwrap();
+    std::os::unix::fs::symlink(&victim, &lk).unwrap();
+    drop(held);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(7), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(read(home, "config"), "[core]\n", "the file the link points at is untouched");
+    assert!(!home.join(".zshrc").exists(), "nothing else changed");
 }
 
 #[test]

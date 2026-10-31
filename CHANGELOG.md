@@ -24,8 +24,8 @@ earlier).
   box's clock went back (e.g. after it ran an hour ahead) aren't refused as "older" until the clock
   catches up.
 - On the pod, a `~/.arena-claude.lock` that is a symlink or not a plain file is refused (the push
-  fails and says why), and the file is only ever appended to, so nothing it might point at can be
-  emptied.
+  fails and says why), including one swapped in while the push waited for the lock: the push only
+  ever writes the lock file it opened, never through a link.
 - A push marks the machine as "not known to be current" before it changes anything there, so a push
   that fails half-way is always picked up by the next `arena claude push`.
 

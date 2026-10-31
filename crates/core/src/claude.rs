@@ -1027,16 +1027,21 @@ pub fn push_command(token: bool, generation: u64) -> String {
 /// the push's generation ([`next_generation`]) is checked against the last one that ran here (the
 /// file holds that number and nothing else): an older push that only reaches this point after a
 /// newer one ran — stuck in a startup file past its timeout — changes nothing (review r3). The
-/// file is only ever appended to (a line per push, the last one counts), never truncated: a link
-/// put there, even in a race with the check that refuses one up front, can't have the file it
-/// points at emptied (review r4).
+/// path is opened once (descriptor 9) and then only that file is read and written, through
+/// `/dev/fd/9` — never the path again — after checking, with the lock held, that the path is a
+/// plain file and still the one that's open. A link put there, up front or in a race while the
+/// push waited for the lock, refuses the push and is never written through (review r4, r5). The
+/// file holds one number, as before, so a push from the previous version still reads it.
 const POD_LOCK: &str = "lk=\"$HOME/.arena-claude.lock\"; \
-     if [ -L \"$lk\" ] || { [ -e \"$lk\" ] && [ ! -f \"$lk\" ]; }; then echo '~/.arena-claude.lock is not a plain file: not writing through it' >&2; exit 7; fi; \
-     if command -v flock >/dev/null 2>&1; then exec 9>>\"$lk\"; \
+     notplain() { echo '~/.arena-claude.lock is not a plain file: not writing through it' >&2; exit 7; }; \
+     if [ -L \"$lk\" ] || { [ -e \"$lk\" ] && [ ! -f \"$lk\" ]; }; then notplain; fi; \
+     exec 9>>\"$lk\"; \
+     if command -v flock >/dev/null 2>&1; then \
      flock -w 45 9 || { echo 'another push is still running on this machine' >&2; exit 4; }; fi; \
-     last=$(tail -n 1 \"$lk\" 2>/dev/null || true); case \"$last\" in ''|*[!0-9]*) last=0;; esac; \
+     if [ ! -f /dev/fd/9 ] || [ \"$(stat -L -c %d:%i /dev/fd/9)\" != \"$(stat -c %d:%i \"$lk\" 2>/dev/null)\" ]; then notplain; fi; \
+     last=$(cat /dev/fd/9 2>/dev/null || true); case \"$last\" in ''|*[!0-9]*) last=0;; esac; \
      if [ \"$gen\" -le \"$last\" ]; then echo 'a newer push has already run on this machine' >&2; exit 6; fi; \
-     printf '%s\\n' \"$gen\" >> \"$lk\";";
+     printf '%s\\n' \"$gen\" > /dev/fd/9;";
 
 /// The clock's part of a push's generation: microseconds since the epoch, and never less than one
 /// more than the last this process gave out. [`generation_for`] adds what survives the process.
