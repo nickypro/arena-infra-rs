@@ -36,6 +36,10 @@ earlier).
   against OpenRouter's listing: a key deleted elsewhere (or rotated from another keys folder) is
   left out, with a ⚠ line naming `arena keys gen <name> --copy` (or `keys rotate`). When the
   listing can't be read, the CSV is copied as before, and the copy says it's unchecked.
+- `pods terminate apple bloom ember --revoke-key` terminates several machines in one run. Each
+  name is matched exactly, as one is (a typo stops them all, before anything); one confirm lists
+  them and wants their count typed back (`ALL` past five, or for every listed pod), as the
+  dashboard's marked set asks. `--all` now wants `ALL` typed too. `--yes` answers both.
 - `arena backups` shows the fleet's live machines, as the dashboard's `b` does (it lists the
   providers, read-only), and one line counting the configured names with no machine. Those names
   were `?` rows at the top. A provider that doesn't answer brings the old list back, with a note.

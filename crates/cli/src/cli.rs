@@ -902,16 +902,17 @@ pub(crate) enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Terminate (delete) a pod, or every pod with --all
+    /// Terminate (delete) pods by name, or every pod with --all
     ///
-    /// IRREVERSIBLE: the pod and its disk are gone. One pod at a time (no ranges or lists); a
-    /// name two pods share is refused (pass the id).
+    /// IRREVERSIBLE: the pod and its disk are gone. Each name exactly (no ranges); a name two
+    /// pods share is refused (pass the id). Several: one confirm, their count typed back (ALL
+    /// past five); --all asks for ALL.
     #[command(verbatim_doc_comment)]
     Terminate {
-        /// Machine name (e.g. arena8-apple) or raw provider id. Omit with --all.
-        target: Option<String>,
+        /// Machine names (e.g. apple bloom) or raw provider ids. Omit with --all.
+        targets: Vec<String>,
         /// Terminate EVERY pod the provider reports (the whole fleet)
-        #[arg(long, conflicts_with = "target")]
+        #[arg(long, conflicts_with = "targets")]
         all: bool,
         /// Unlock locked pods, then terminate them (else a locked pod is refused)
         ///

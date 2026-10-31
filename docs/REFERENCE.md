@@ -1006,8 +1006,17 @@ refused) and the same come-back: settled endpoint, **setup again** (`--no-setup`
 
 #### `pods terminate`
 
-`terminate --all` tears down the **whole fleet** (confirms first; `--dry-run` lists every pod
-without touching them) — for end-of-program teardown (`terminate <name> --all` is refused).
+`terminate apple` terminates one machine, `terminate apple bloom ember` several. Each name is
+matched exactly as a single target is (no ranges or `all`; a name two pods share is refused —
+pass the id), and every one before anything is asked: a name that matches nothing stops them all.
+One machine confirms with `y`; several list themselves in one confirm that wants their count typed
+back (`3`), or `ALL` past five or for every listed pod, as the dashboard's marked set asks. A
+failure among several is said and the others still go; the exit fails after.
+
+`terminate --all` tears down the **whole fleet** (confirms first, `ALL` typed back; `--dry-run`
+lists every pod without touching them) — for end-of-program teardown (names with `--all` are
+refused). It takes every pod on the account, another fleet's and staff boxes included: name the
+machines instead when the account is shared.
 
 `terminate … --revoke-key` also deletes each terminated machine's OpenRouter key(s) (found by the
 name `keys gen` gave it, over the full paginated key listing; needs `OPENROUTER_PROVISIONING_KEY`)

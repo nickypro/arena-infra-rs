@@ -20,7 +20,7 @@ use crate::pods::replace::wait_for_stable_endpoint_every;
 use crate::pods::selection::{just_these, Selected};
 use crate::pods::setup::handle_setup;
 use crate::proxy::{sync_proxy, ProxySync};
-use crate::{confirm, spend};
+use crate::{confirm, confirm_typed, spend};
 
 /// `pods reimage`: swap image + re-seed keys in place — a fresh container, so its disk is
 /// wiped — then bring the pods back usable like a restart does ([`come_back`]): settled
@@ -298,7 +298,7 @@ pub(crate) struct TerminateOpts {
     pub yes: bool,
 }
 
-/// `pods terminate <target>` / `--all`, optionally `--revoke-key`. Revocation runs only for
+/// `pods terminate <target>…` / `--all`, optionally `--revoke-key`. Revocation runs only for
 /// pods that actually terminated, after the terminates and the proxy sync — a failed revoke
 /// is reported per machine and fails the exit, but never stands in the way of a terminate.
 /// Keys go by machine *name*, so a name still held by a pod that is NOT gone (the twin of a
@@ -311,6 +311,13 @@ pub(crate) struct TerminateOpts {
 /// whose terminate then fails is reported as left UNLOCKED. A pod locked since the listing
 /// (the API refuses its terminate as locked) is, under `--unlock`, unlocked and retried once.
 ///
+/// Several targets (`terminate apple bloom ember`) are each matched as one is — exactly, no ranges,
+/// a shared name refused — all before anything is asked; then one confirm lists them, and the
+/// count must be typed back (`ALL` past five, or for every listed pod —
+/// [`arena_core::selector::set_confirm_token`], as the dashboard's marked set asks), as must `ALL`
+/// for `--all`. One target keeps its `y`. A failure among several is reported and the rest go on,
+/// as with `--all`; the exit fails after.
+///
 /// With `--all`, `--unlock` lifts only this cohort's locks ([`Naming::is_cohort`]): a staff or
 /// personal box on the same account (an `@` list entry, or a pod off the list) is often
 /// locked precisely so that a fleet-wide command can't take it — RunPod's own refusal kept it
@@ -321,8 +328,8 @@ pub(crate) async fn handle_terminate(
     provider: &dyn Provider,
     cfg: &Config,
     book: &KeyBook<'_>,
-    // One pod (the shared single-pod matcher), or `None` = the whole fleet (`--all`).
-    target: Option<&str>,
+    // The pods named (each by the shared single-pod matcher), or `None` = the whole fleet (`--all`).
+    targets: Option<&[&str]>,
     opts: TerminateOpts,
 ) -> Result<()> {
     let TerminateOpts { unlock, revoke_key, skip_proxy, dry_run, yes } = opts;
@@ -337,17 +344,35 @@ pub(crate) async fn handle_terminate(
     let policy = arena_core::retry::RetryPolicy::default();
     // The whole listing is kept: it says which names other pods still hold.
     let listed = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
-    let pods: Vec<arena_core::Pod> = match target {
+    let pods: Vec<arena_core::Pod> = match targets {
         None => {
             let mut all = listed.clone();
             all.sort_by(|a, b| a.name.cmp(&b.name));
             all
         }
-        // One pod, matched like every other command's targets (the shared selector's
+        // Each pod matched like every other command's one target (the shared selector's
         // single-pod rule): a typo names the closest pods, a range/`all` is refused, and a
-        // name two pods share is refused — pass the id.
-        Some(t) => vec![listed[arena_core::selector::resolve_one(&naming, &listed, t)?].clone()],
+        // name two pods share is refused — pass the id. Every target before anything is asked:
+        // one that doesn't match stops them all. A pod named twice is one.
+        Some(ts) => {
+            let (mut picked, mut errs): (Vec<usize>, Vec<String>) = (Vec::new(), Vec::new());
+            for t in ts {
+                match arena_core::selector::resolve_one(&naming, &listed, t) {
+                    Ok(i) if picked.contains(&i) => {}
+                    Ok(i) => picked.push(i),
+                    Err(e) if ts.len() == 1 => return Err(e.into()),
+                    Err(e) => errs.push(format!("{t}: {e}")),
+                }
+            }
+            if !errs.is_empty() {
+                anyhow::bail!("nothing terminated — {}", errs.join("; "));
+            }
+            picked.into_iter().map(|i| listed[i].clone()).collect()
+        }
     };
+    // One pod named: its failure is the command's error, and its confirm a `y`. Several, or
+    // `--all`: each failure is said and the rest go on, and the confirm wants a typed token.
+    let single = targets.is_some_and(|t| t.len() == 1);
     if pods.is_empty() {
         println!("(no pods to terminate)");
         return Ok(());
@@ -356,8 +381,8 @@ pub(crate) async fn handle_terminate(
     if let Some(r) = crate::pods::capable::refusal(provider, Op::Terminate, "terminate", &pods.iter().collect::<Vec<_>>()) {
         anyhow::bail!("{r}");
     }
-    // Whose lock `--unlock` may lift: the one named pod, or (`--all`) a cohort pod's.
-    let may_unlock = |p: &arena_core::Pod| target.is_some() || naming.is_cohort(&p.name);
+    // Whose lock `--unlock` may lift: a pod named, or (`--all`) a cohort pod's.
+    let may_unlock = |p: &arena_core::Pod| targets.is_some() || naming.is_cohort(&p.name);
     let foreign_locked: Vec<String> =
         pods.iter().filter(|p| arena_core::lock::is_locked(p) && !may_unlock(p)).map(|p| p.name.clone()).collect();
     let kept_why = |names: &[String]| {
@@ -446,11 +471,18 @@ pub(crate) async fn handle_terminate(
     } else {
         format!(" KEEPING {} (locked, not this cohort's — not unlocked).", kept_names.join(", "))
     };
-    let what = match target {
-        None => format!("Will {unlocking}TERMINATE ALL {} pod(s) — irreversible{then_keys}{then_sync}.{keeping}", pods.len()),
-        Some(_) => format!("Will {unlocking}TERMINATE {} — irreversible{then_keys}{then_sync}.", label(&pods[0])),
+    let go = if single {
+        confirm(yes, &format!("Will {unlocking}TERMINATE {} — irreversible{then_keys}{then_sync}.", label(&pods[0])))?
+    } else {
+        let what = match targets {
+            None => format!("Will {unlocking}TERMINATE ALL {} pod(s) — irreversible{then_keys}{then_sync}.{keeping}", pods.len()),
+            Some(_) => format!("Will {unlocking}TERMINATE these {} pods — irreversible{then_keys}{then_sync}:", pods.len()),
+        };
+        let list: Vec<String> = pods.iter().map(|p| format!("  {}", label(p))).collect();
+        let token = if targets.is_none() { "ALL".to_string() } else { arena_core::selector::set_confirm_token(pods.len(), listed.len()) };
+        confirm_typed(yes, &format!("{what}\n{}", list.join("\n")), &token)?
     };
-    if !confirm(yes, &what)? {
+    if !go {
         println!("aborted.");
         return Ok(());
     }
@@ -461,7 +493,7 @@ pub(crate) async fn handle_terminate(
         if unlock && arena_core::lock::is_locked(p) {
             if let Err(e) = arena_core::retry::retrying(&policy, || provider.set_locked(&p.id, false)).await {
                 let why = format!("{}: unlocking failed, so it was NOT terminated: {e}", p.name);
-                if target.is_some() {
+                if single {
                     anyhow::bail!("{why}");
                 }
                 eprintln!("[FAILED] {why}");
@@ -492,7 +524,7 @@ pub(crate) async fn handle_terminate(
         };
         match outcome {
             Ok(()) => {
-                println!("[terminated] {}", if target.is_some() { label(p) } else { p.name.clone() });
+                println!("[terminated] {}", if targets.is_some() { label(p) } else { p.name.clone() });
                 gone.push(p);
             }
             Err(mut why) => {
@@ -503,7 +535,7 @@ pub(crate) async fn handle_terminate(
                     ));
                 }
                 // One named pod: its failure is the command's error (nothing else to do).
-                if target.is_some() {
+                if single {
                     anyhow::bail!("{why}");
                 }
                 eprintln!("[FAILED] {why}");
@@ -513,7 +545,7 @@ pub(crate) async fn handle_terminate(
     for p in &kept {
         eprintln!("[KEPT] {} — locked, not this cohort's: not unlocked, not terminated", p.name);
     }
-    if target.is_none() {
+    if !single {
         println!("\nterminated {}/{}", gone.len(), pods.len() + kept.len());
     }
     // Sync whatever did go (the merge only drops what the providers confirm gone).

@@ -412,6 +412,22 @@ impl Selector {
     }
 }
 
+/// The most pods a destructive action on a set (`pods terminate apple bloom …`, the dashboard's
+/// marked set) confirms with their count typed back; a bigger set — or every listed pod, however
+/// few — asks for `ALL`, the whole-fleet bar.
+pub const SET_COUNT_CONFIRM_MAX: usize = 5;
+
+/// What a destructive action on `n` of the `listed` pods asks to be typed to confirm: the count,
+/// or `ALL` past [`SET_COUNT_CONFIRM_MAX`] or for every listed pod. The CLI's several-name
+/// terminate and the dashboard's marked set ask the same. Pure.
+pub fn set_confirm_token(n: usize, listed: usize) -> String {
+    if n > SET_COUNT_CONFIRM_MAX || n >= listed {
+        "ALL".into()
+    } else {
+        n.to_string()
+    }
+}
+
 /// Resolve exactly one pod for a single-target command (`terminate`, `restart`, `rename`,
 /// `replace`, …) with the same matcher: a range or `all` is refused (those commands take
 /// one pod on purpose), no match is the typo error, and a token matching two pods (a double
@@ -839,6 +855,14 @@ mod tests {
         );
         assert_eq!(parse(&SelectArgs { all: true, gpus: Some(1), ..Default::default() }).describe(), "all pods, with 1 GPU");
         assert_eq!(SelectArgs::exact(["a", "b"]).targets, ["a", "b"]);
+    }
+
+    /// A set's typed confirm: its count up to five and short of every listed pod, else `ALL`.
+    #[test]
+    fn a_set_confirms_with_its_count_or_all() {
+        for (n, listed, want) in [(2, 30, "2"), (5, 30, "5"), (6, 30, "ALL"), (3, 3, "ALL"), (2, 3, "2"), (1, 1, "ALL")] {
+            assert_eq!(set_confirm_token(n, listed), want, "{n} of {listed}");
+        }
     }
 
     #[test]

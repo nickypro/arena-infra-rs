@@ -905,16 +905,17 @@ async fn handle_pods_bal(
             crate::pods::copy_home::handle_copy_home(remote, cfg, &from, &to, opts).await?;
         }
 
-        PodCmd::Terminate { target, all, unlock, revoke_key, skip_proxy, dry_run } => {
+        PodCmd::Terminate { targets, all, unlock, revoke_key, skip_proxy, dry_run } => {
             let or = openrouter_client(cfg);
             let book = KeyBook::new(OPENROUTER_KEYS_CSV, or.as_ref());
-            let target = match (all, target) {
+            let named: Vec<&str> = targets.iter().map(String::as_str).collect();
+            let targets = match (all, named.is_empty()) {
                 (true, _) => None,
-                (false, Some(t)) => Some(t),
-                (false, None) => anyhow::bail!("specify a pod (name or id) to terminate, or pass --all"),
+                (false, false) => Some(named.as_slice()),
+                (false, true) => anyhow::bail!("specify the pods (names or ids) to terminate, or pass --all"),
             };
             let opts = TerminateOpts { unlock, revoke_key, skip_proxy, dry_run, yes };
-            handle_terminate(provider, cfg, &book, target.as_deref(), opts).await?;
+            handle_terminate(provider, cfg, &book, targets, opts).await?;
         }
 
         PodCmd::Backup { sel, cohort, no_pull, dry_run, message } => {

@@ -738,21 +738,65 @@ async fn terminate_revoke_key_revokes_and_drops_the_row_with_or_without_a_key() 
     let keys = FakeKeys::with(&[("h-a", "devtest-alpha"), ("h-a2", "devtest-alpha"), ("h-b", "devtest-bravo")]);
     let book = KeyBook::new(&csv, Some(&keys));
     let f = fleet();
-    handle_terminate(&f, &cfg, &book, Some("alpha"), topts(true, true, false, true)).await.unwrap();
+    handle_terminate(&f, &cfg, &book, Some(&["alpha"]), topts(true, true, false, true)).await.unwrap();
     assert_eq!(f.calls(), ["terminate r-alpha"]);
     // Every key named after the machine is revoked; its row dropped, the others kept.
     assert_eq!(keys.calls(), ["delete h-a", "delete h-a2"]);
     assert_eq!(cohort_csv(&dir.0), "# OpenRouter API keys — arena iteration: devtest\ndevtest-bravo,sk-b\n");
     // A machine with no key and no row: terminated, nothing to revoke — not a failure.
-    handle_terminate(&f, &cfg, &book, Some("charlie"), topts(true, true, false, true)).await.unwrap();
+    handle_terminate(&f, &cfg, &book, Some(&["charlie"]), topts(true, true, false, true)).await.unwrap();
     assert_eq!(f.calls(), ["terminate r-alpha", "terminate r-charlie"]);
     assert_eq!(keys.calls().len(), 2);
     // A dry run touches nothing, on either side.
-    handle_terminate(&f, &cfg, &book, Some("bravo"), topts(true, true, true, true)).await.unwrap();
+    handle_terminate(&f, &cfg, &book, Some(&["bravo"]), topts(true, true, true, true)).await.unwrap();
     assert_eq!((f.calls().len(), keys.calls().len()), (2, 2));
     // Without --revoke-key the key and row stay.
-    handle_terminate(&f, &cfg, &book, Some("bravo"), topts(false, true, false, true)).await.unwrap();
+    handle_terminate(&f, &cfg, &book, Some(&["bravo"]), topts(false, true, false, true)).await.unwrap();
     assert!(cohort_csv(&dir.0).contains("devtest-bravo,sk-b") && keys.names() == ["devtest-bravo"]);
+}
+
+/// Several machines in one run (`terminate alpha bravo delta --revoke-key`): each matched as one
+/// target is, all before anything happens — a typo among them stops them all, a pod named twice
+/// is one — then each terminated and its key revoked. One that fails among several is said and
+/// the others still go; the exit fails after. Without `--yes` and no terminal there's no typed
+/// confirm to give: refused, nothing done.
+#[tokio::test]
+async fn several_names_terminate_in_one_run_each_matched_exactly() {
+    let dir = tmpdir("terminate-several");
+    let cfg = cfg(&dir.0);
+    let csv = keys_csv(&dir.0, "devtest-alpha,sk-a\ndevtest-bravo,sk-b\ndevtest-delta,sk-d\n");
+    let keys = FakeKeys::with(&[("h-a", "devtest-alpha"), ("h-b", "devtest-bravo"), ("h-d", "devtest-delta")]);
+    let book = KeyBook::new(&csv, Some(&keys));
+    let f = fleet();
+    // A typo among them: nothing terminated, the miss named.
+    let e = handle_terminate(&f, &cfg, &book, Some(&["alpha", "brvo", "delta"]), topts(true, true, false, true)).await.unwrap_err().to_string();
+    assert!(e.starts_with("nothing terminated — brvo: ") && e.contains("devtest-bravo"), "{e}");
+    // A range isn't a target here either.
+    let e = handle_terminate(&f, &cfg, &book, Some(&["alpha", "bravo..delta"]), topts(true, true, false, true)).await.unwrap_err().to_string();
+    assert!(e.contains("bravo..delta: this command takes one pod"), "{e}");
+    // No terminal and no --yes: the typed confirm can't be given.
+    let e = handle_terminate(&f, &cfg, &book, Some(&["alpha", "bravo"]), topts(true, true, false, false)).await.unwrap_err().to_string();
+    assert!(e.contains("refusing to proceed without a terminal"), "{e}");
+    assert!(f.calls().is_empty() && keys.calls().is_empty());
+    // The dry run names each.
+    handle_terminate(&f, &cfg, &book, Some(&["alpha", "delta"]), topts(true, true, true, true)).await.unwrap();
+    assert!(f.calls().is_empty());
+    // A pod named twice (by name and by id) is terminated once.
+    handle_terminate(&f, &cfg, &book, Some(&["alpha", "r-alpha", "delta"]), topts(true, true, false, true)).await.unwrap();
+    assert_eq!(f.calls(), ["terminate r-alpha", "terminate h-delta"]);
+    assert_eq!(keys.calls(), ["delete h-a", "delete h-d"]);
+    assert_eq!(cohort_csv(&dir.0), "# OpenRouter API keys — arena iteration: devtest\ndevtest-bravo,sk-b\n");
+    // One that fails (locked at the API since it was listed): the rest go on, the exit fails.
+    let f = fleet();
+    f.server_locked.lock().unwrap().push("r-bravo".into());
+    let e = handle_terminate(&f, &cfg, &book, Some(&["bravo", "charlie"]), topts(false, true, false, true)).await.unwrap_err().to_string();
+    assert_eq!(f.calls(), ["terminate r-charlie"], "bravo refused, charlie still went");
+    assert!(e.contains("1 pod(s) failed to terminate"), "{e}");
+    // Through the command line: names, or --all, not both.
+    assert!(matches!(pods_cmd(&["terminate", "alpha", "bravo", "--revoke-key"]), PodCmd::Terminate { ref targets, .. } if targets == &["alpha", "bravo"]));
+    assert!(Cli::try_parse_from(["arena", "pods", "terminate", "alpha", "--all"]).is_err());
+    let r = handle_pods(pods_cmd(&["terminate"]), &f, Arc::new(FakeRemote::new()), &cfg, true).await;
+    assert!(r.unwrap_err().to_string().contains("specify the pods (names or ids) to terminate, or pass --all"));
 }
 
 #[tokio::test]
@@ -783,7 +827,7 @@ async fn a_failed_revoke_never_blocks_terminate_but_fails_the_exit() {
 async fn revoke_key_without_a_provisioning_key_is_refused_before_anything() {
     let dir = tmpdir("terminate-nokey");
     let f = fleet();
-    let e = handle_terminate(&f, &cfg(&dir.0), &no_api(&dir.0.join("k.csv")), Some("alpha"), topts(true, true, false, true))
+    let e = handle_terminate(&f, &cfg(&dir.0), &no_api(&dir.0.join("k.csv")), Some(&["alpha"]), topts(true, true, false, true))
         .await
         .unwrap_err()
         .to_string();
@@ -810,9 +854,9 @@ async fn a_name_another_pod_still_holds_keeps_its_key() {
         f
     };
     let f = twins();
-    handle_terminate(&f, &cfg, &book, Some("r-alpha-dup"), topts(true, true, true, true)).await.unwrap(); // dry run
+    handle_terminate(&f, &cfg, &book, Some(&["r-alpha-dup"]), topts(true, true, true, true)).await.unwrap(); // dry run
     assert!(f.calls().is_empty() && keys.calls().is_empty());
-    handle_terminate(&f, &cfg, &book, Some("r-alpha-dup"), topts(true, true, false, true)).await.unwrap();
+    handle_terminate(&f, &cfg, &book, Some(&["r-alpha-dup"]), topts(true, true, false, true)).await.unwrap();
     assert_eq!(f.calls(), ["terminate r-alpha-dup"]);
     assert!(keys.calls().is_empty(), "the survivor's key is kept: {:?}", keys.calls());
     assert!(cohort_csv(&dir.0).contains("devtest-alpha,sk-a"), "and so is its row");
@@ -834,7 +878,7 @@ async fn revoke_finds_the_key_by_the_name_keys_gen_gave_it() {
     let keys = FakeKeys::with(&[("h-v", "devtest-vast-777"), ("h-b", "devtest-bravo")]);
     let book = KeyBook::new(&csv, Some(&keys));
     let f = Fleet::new(vec![pod("v-777", "vast-777", "vast", None)]);
-    handle_terminate(&f, &cfg, &book, Some("vast-777"), topts(true, true, false, true)).await.unwrap();
+    handle_terminate(&f, &cfg, &book, Some(&["vast-777"]), topts(true, true, false, true)).await.unwrap();
     assert_eq!(keys.calls(), ["delete h-v"]);
     assert_eq!(cohort_csv(&dir.0), "# OpenRouter API keys — arena iteration: devtest\ndevtest-bravo,sk-b\n");
 }
@@ -849,7 +893,7 @@ async fn a_csv_row_whose_key_is_already_gone_is_dropped_quietly() {
     let keys = FakeKeys::with(&[("h-b", "devtest-bravo")]);
     let book = KeyBook::new(&csv, Some(&keys));
     let f = fleet();
-    handle_terminate(&f, &cfg, &book, Some("alpha"), topts(true, true, false, true)).await.unwrap();
+    handle_terminate(&f, &cfg, &book, Some(&["alpha"]), topts(true, true, false, true)).await.unwrap();
     assert!(keys.calls().is_empty());
     assert_eq!(cohort_csv(&dir.0), "# OpenRouter API keys — arena iteration: devtest\ndevtest-bravo,sk-b\n");
 }
@@ -867,7 +911,7 @@ async fn a_csv_that_cant_be_rewritten_is_not_reported_as_a_failed_revoke() {
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
     std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o555)).unwrap();
     let f = fleet();
-    let r = handle_terminate(&f, &cfg, &book, Some("alpha"), topts(true, true, false, true)).await;
+    let r = handle_terminate(&f, &cfg, &book, Some(&["alpha"]), topts(true, true, false, true)).await;
     std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
     let e = r.unwrap_err().to_string();

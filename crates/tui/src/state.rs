@@ -1169,19 +1169,22 @@ pub fn worst_reset(resets: impl IntoIterator<Item = ContainerReset>) -> Containe
     resets.into_iter().max_by_key(|r| rank(*r)).unwrap_or(ContainerReset::Unknown)
 }
 
-/// The most pods a lifecycle action (terminate/restart/stop) on a marked set confirms with
-/// just their count. Marks used to take a keypress per pod; `/` now marks a cohort in one
-/// short range (`/apple..zulu`), so the bar has to follow what is marked, not how: a
-/// bigger set — or every listed pod, however few — asks for `ALL`, the whole-fleet bar.
-pub const SET_COUNT_CONFIRM_MAX: usize = 5;
+// The most pods a lifecycle action (terminate/restart/stop) on a marked set confirms with
+// just their count (`arena_core::selector`, shared with the CLI's several-name terminate). Marks
+// used to take a keypress per pod; `/` now marks a cohort in one short range (`/apple..zulu`),
+// so the bar has to follow what is marked, not how: a bigger set — or every listed pod, however
+// few — asks for `ALL`, the whole-fleet bar.
+#[cfg(test)]
+use arena_core::selector::SET_COUNT_CONFIRM_MAX;
 
 /// The token a marked-set confirm asks to be typed, for `marked` of the `listed` pods: the
 /// count (which the operator chose), or `ALL` for a lifecycle action
-/// ([`Action::marked_set_only`]) on more than [`SET_COUNT_CONFIRM_MAX`] pods or on the whole
+/// ([`Action::marked_set_only`]) on more than [`arena_core::selector::SET_COUNT_CONFIRM_MAX`] pods or on the whole
 /// listed fleet. The others (backup/setup/run/set-branch) keep the count.
 pub fn marked_set_token(action: Action, marked: usize, listed: usize) -> String {
-    if action.marked_set_only() && (marked > SET_COUNT_CONFIRM_MAX || marked >= listed) {
-        "ALL".into()
+    if action.marked_set_only() {
+        // As the CLI's several-name terminate asks.
+        arena_core::selector::set_confirm_token(marked, listed)
     } else {
         marked.to_string()
     }

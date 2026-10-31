@@ -139,6 +139,25 @@ fn confirm(assume_yes: bool, what: &str) -> Result<bool> {
     Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
+/// [`confirm`] for what a `y` is too easy for (terminating several machines, or all of them):
+/// `token` (the count, or `ALL`: [`arena_core::selector::set_confirm_token`]) must be typed back,
+/// as the dashboard's marked-set confirm asks. `--yes` still answers it; no terminal refuses.
+fn confirm_typed(assume_yes: bool, what: &str, token: &str) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    if assume_yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        eprintln!("{what}");
+        return Err(NoTerminal.into());
+    }
+    eprint!("{what}\nType {token} to proceed (anything else aborts): ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim() == token)
+}
+
 /// The refusal [`confirm`] fails with when there's no terminal to ask at and no `--yes`.
 /// `main` exits with [`NO_TERMINAL_EXIT`] for it (after printing it), never 0.
 #[derive(Debug)]
