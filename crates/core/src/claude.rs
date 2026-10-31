@@ -1026,16 +1026,25 @@ pub fn push_command(token: bool, generation: u64) -> String {
 /// pod — finishes before the next one starts, never after it. Without `flock`, no lock. Under it,
 /// the push's generation ([`next_generation`]) is checked against the last one that ran here (the
 /// file holds that number and nothing else): an older push that only reaches this point after a
-/// newer one ran — stuck in a startup file past its timeout — changes nothing (review r3).
-const POD_LOCK: &str = "if command -v flock >/dev/null 2>&1; then exec 9>>\"$HOME/.arena-claude.lock\"; \
+/// newer one ran — stuck in a startup file past its timeout — changes nothing (review r3). The
+/// path is opened once (descriptor 9) and then only that file is read and written, through
+/// `/dev/fd/9` — never the path again — after checking, with the lock held, that the path is a
+/// plain file and still the one that's open. A link put there, up front or in a race while the
+/// push waited for the lock, refuses the push and is never written through (review r4, r5). The
+/// file holds one number, as before, so a push from the previous version still reads it.
+const POD_LOCK: &str = "lk=\"$HOME/.arena-claude.lock\"; \
+     notplain() { echo '~/.arena-claude.lock is not a plain file: not writing through it' >&2; exit 7; }; \
+     if [ -L \"$lk\" ] || { [ -e \"$lk\" ] && [ ! -f \"$lk\" ]; }; then notplain; fi; \
+     exec 9>>\"$lk\"; \
+     if command -v flock >/dev/null 2>&1; then \
      flock -w 45 9 || { echo 'another push is still running on this machine' >&2; exit 4; }; fi; \
-     last=$(cat \"$HOME/.arena-claude.lock\" 2>/dev/null || true); case \"$last\" in ''|*[!0-9]*) last=0;; esac; \
+     if [ ! -f /dev/fd/9 ] || [ \"$(stat -L -c %d:%i /dev/fd/9)\" != \"$(stat -c %d:%i \"$lk\" 2>/dev/null)\" ]; then notplain; fi; \
+     last=$(cat /dev/fd/9 2>/dev/null || true); case \"$last\" in ''|*[!0-9]*) last=0;; esac; \
      if [ \"$gen\" -le \"$last\" ]; then echo 'a newer push has already run on this machine' >&2; exit 6; fi; \
-     printf '%s\\n' \"$gen\" > \"$HOME/.arena-claude.lock\";";
+     printf '%s\\n' \"$gen\" > /dev/fd/9;";
 
-/// A push's generation: microseconds since the epoch, taken under the machine's lock, and never
-/// less than one more than the last this process gave out — so each push to a machine is newer
-/// than the one before it ([`POD_LOCK`]).
+/// The clock's part of a push's generation: microseconds since the epoch, and never less than one
+/// more than the last this process gave out. [`generation_for`] adds what survives the process.
 fn next_generation() -> u64 {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
@@ -1047,6 +1056,26 @@ fn next_generation() -> u64 {
             Err(p) => prev = p,
         }
     }
+}
+
+/// A push's generation for one machine ([`POD_LOCK`]), taken under its lock: one more than the
+/// last given out for it — kept beside the lock (`claude-locks/<provider>-<id>.gen`), so it
+/// outlives this process — and never less than [`next_generation`]. Each push is newer than every
+/// one before it, from any command, even after the control box's clock went back: a clock alone
+/// would make every push for as long as it had been ahead "older" than the last, and the pod
+/// would refuse them (review r4). A counter that can't be read, isn't a number or can't be kept
+/// fails the push.
+fn generation_for(path: &Path, provider: &str, id: &str) -> Result<u64, String> {
+    let file = lock_path(path, provider, id).with_extension("gen");
+    let last = match std::fs::read_to_string(&file) {
+        // Not a number: refused, not read as 0 — that would hand out "older" generations again.
+        Ok(s) => s.trim().parse::<u64>().map_err(|_| format!("{} isn't a number: delete it to start again from the clock", file.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(format!("can't read {}: {e}", file.display())),
+    };
+    let next = next_generation().max(last.saturating_add(1));
+    crate::snapshot::write_atomic(&file, format!("{next}\n").as_bytes(), 0o600).map_err(|e| format!("can't write {}: {e}", file.display()))?;
+    Ok(next)
 }
 
 /// Mark Claude Code's onboarding done in `~/.claude.json` (it ignores `CLAUDE_CODE_OAUTH_TOKEN`
@@ -1073,8 +1102,8 @@ if d.get(\"hasCompletedOnboarding\") is not True:
 /// Push one machine: [`push_command`] with `token` on its stdin — or, with `None`, the command
 /// alone, which takes the token off. Nothing with a token is written anywhere on the way: not a
 /// file here, not one on the pod, not an argument.
-pub async fn push(remote: &dyn Remote, t: &SshTarget, token: Option<&str>, timeout: Duration) -> Result<(), String> {
-    let cmd = push_command(token.is_some(), next_generation());
+pub async fn push(remote: &dyn Remote, t: &SshTarget, token: Option<&str>, generation: u64, timeout: Duration) -> Result<(), String> {
+    let cmd = push_command(token.is_some(), generation);
     let done = match token {
         Some(tok) => remote.exec_input(t, &cmd, format!("{tok}\n").as_bytes(), Some(timeout)).await,
         None => remote.exec(t, &cmd, Some(timeout)).await,
@@ -1248,24 +1277,26 @@ async fn push_one(remote: &dyn Remote, path: &Path, pool: &Pool, pod: &Pod, t: &
     Some((account.label(), finish(remote, path, pod, t, Some(account), now).await))
 }
 
-/// The push itself and its record, under the machine's lock: what went on success; on a failure,
-/// the machine marked as not known to have it (`pushed` cleared) — its box may be anything now, so
-/// the next default `claude push` picks it (review r3).
+/// The push itself and its record, under the machine's lock: the machine marked as not known to
+/// have what it had (`pushed` cleared) before the push — its box may be anything after a failure,
+/// so the next default `claude push` picks it (review r3, r4) — and what went recorded on success.
 async fn finish(remote: &dyn Remote, path: &Path, pod: &Pod, t: &SshTarget, account: Option<&Account>, now: u64) -> Result<(), String> {
-    let result = push(remote, t, account.map(Account::token), PUSH_TIMEOUT).await;
-    let (email, fp) = (account.map(|a| a.email.clone()), account.map(Account::fingerprint));
-    let recorded = record(path, |mut s| {
-        if result.is_ok() {
-            s = record_push(s, &pod.provider, &pod.id, email.as_deref(), fp.as_deref(), now);
-        } else if let Some(a) = s.get_mut(&pod.provider, &pod.id) {
+    // First, before anything changes on the pod: the machine marked as not known to have what it
+    // had. A push that then fails half-way, with the state file unwritable by then too, can't
+    // leave the old record saying it's current — the next default push picks it (review r4).
+    record(path, |mut s| {
+        if let Some(a) = s.get_mut(&pod.provider, &pod.id) {
             a.pushed = None;
         }
         (s, ())
-    });
-    match (result, recorded) {
-        (Ok(()), Err(e)) => Err(format!("pushed, but not recorded: {e}")),
-        (result, _) => result,
-    }
+    })
+    .map_err(|e| format!("not pushed: can't mark it as changing first: {e}"))?;
+    let generation = generation_for(path, &pod.provider, &pod.id).map_err(|e| format!("not pushed: {e}"))?;
+    push(remote, t, account.map(Account::token), generation, PUSH_TIMEOUT).await?;
+    let (email, fp) = (account.map(|a| a.email.clone()), account.map(Account::fingerprint));
+    record(path, |s| (record_push(s, &pod.provider, &pod.id, email.as_deref(), fp.as_deref(), now), ()))
+        .map(|_| ())
+        .map_err(|e| format!("pushed, but not recorded: {e}"))
 }
 
 /// Push each of `pods` what the state says it should have when its turn comes ([`push_one`]), side
