@@ -282,6 +282,9 @@ struct Shared {
     /// spend ledger, read after each refresh records its listing) — the OWNER column and the
     /// detail view's `owner:` line. Rows with no owner aren't in it.
     owners: HashMap<String, String>,
+    /// Which Claude Code account each machine is on (`claude.json`, as each refresh reads it):
+    /// the detail view's `tokens:` line. `None`: no file yet, or one that can't be read.
+    claude: Option<arena_core::claude::State>,
 }
 
 impl Shared {
@@ -854,6 +857,10 @@ async fn refresh(
     arena_core::spend::record_listing(spend_path(cfg).as_deref(), &fresh, &pods, &Naming::from_config(cfg), listed_at);
     // Who each machine is for, from the ledger just written (the OWNER column).
     let owners = spend_path(cfg).map(|p| owners_by_key(&arena_core::spend::load(&p).0, &pods)).unwrap_or_default();
+    // The Claude Code accounts forget the machines this listing shows are gone, then are read for
+    // the detail pane.
+    arena_core::claude::record_listing(claude_path(cfg).as_deref(), &fresh, listed_at);
+    let claude = claude_path(cfg).and_then(|p| arena_core::claude::load(&p).ok());
     // The balance's runway is judged against what is billing as listed (not the pending
     // placeholders, and after the details filled the prices), a provider that failed to
     // list — or was rate-limited, its rows carried — counting as unknown, never as $0/h.
@@ -910,6 +917,7 @@ async fn refresh(
     s.resets = backend_resets(provider, &display);
     s.refusals = backend_refusals(provider, &display);
     s.owners = owners;
+    s.claude = claude;
     s.publish(snap);
     s.last_refresh = Some(Instant::now());
     s.refreshing = false;
@@ -2524,6 +2532,29 @@ fn owners_by_key(state: &arena_core::spend::SpendState, pods: &[Pod]) -> HashMap
     pods.iter().filter_map(|p| arena_core::spend::owner_of(state, &p.provider, &p.id).map(|o| (mark_key(p), o.to_string()))).collect()
 }
 
+/// The fleet's Claude Code accounts (`arena claude`): its state file — none under test unless the
+/// test's config sets `ARENA_STATE_DIR`, as [`spend_path`].
+fn claude_path(cfg: &Config) -> Option<std::path::PathBuf> {
+    if cfg!(test) && cfg.get("ARENA_STATE_DIR").is_none() {
+        return None;
+    }
+    arena_core::claude::state_path(cfg).ok()
+}
+
+/// The detail view's Claude Code account for `pod`: its email (`none` when it's off), and that
+/// its box may not have it yet when the last push was another account's. Nothing when it has no
+/// assignment.
+fn claude_account(state: Option<&arena_core::claude::State>, pod: &Pod) -> Option<(String, Tone)> {
+    let a = state?.of(pod)?;
+    let pushed = a.pushed.as_ref().map(|p| p.account.as_deref());
+    Some(match (&a.account, pushed) {
+        (Some(e), Some(p)) if p == Some(e.as_str()) => (e.clone(), Tone::Good),
+        (Some(e), _) => (format!("{e} (not on it yet: `arena claude push`)"), Tone::Warn),
+        (None, Some(None)) => ("none".into(), Tone::Dim),
+        (None, _) => ("none (a token may still be on it: `arena claude push`)".into(), Tone::Warn),
+    })
+}
+
 /// Record a stop or terminate the dashboard just made in the spend ledger (quietly).
 fn record_spend(cfg: &Config, ev: &arena_core::spend::Event) {
     let now = snapshot::unix_now();
@@ -2577,6 +2608,7 @@ async fn execute(
         Action::Terminate => match provider.terminate_pod(&pod.id).await {
             Ok(()) => {
                 record_spend(cfg, &arena_core::spend::Event::Terminated { provider: Some(&pod.provider), id: &pod.id });
+                arena_core::claude::record_terminated(claude_path(cfg).as_deref(), Some(&pod.provider), &pod.id);
                 format!("✓ terminated {name}")
             }
             Err(e) => format!("✗ terminate {name} failed: {}", lock::explain(name, &e)),
@@ -2593,7 +2625,16 @@ async fn execute(
             _ => format!("✗ {name}: no branch given"),
         },
         // Runs of the CLI (`start_cli_action`), never an action of this one.
-        Action::Start | Action::Rename | Action::Jobs | Action::Logs | Action::Pull | Action::KeyLimit | Action::KeyPause | Action::KeyResume | Action::KeyRotate => {
+        Action::Start
+        | Action::Rename
+        | Action::Claude
+        | Action::Jobs
+        | Action::Logs
+        | Action::Pull
+        | Action::KeyLimit
+        | Action::KeyPause
+        | Action::KeyResume
+        | Action::KeyRotate => {
             format!("✗ {} {name}: runs as `arena {}`", action.label(), action.command())
         }
     }
@@ -2607,6 +2648,13 @@ fn cli_action_args(action: Action, name: &str, arg: Option<&str>) -> Option<(run
     Some(match action {
         Action::Start => (runs::Kind::Start, v(&["pods", "start", name, "--yes"])),
         Action::Rename => (runs::Kind::Rename, v(&["pods", "rename", name, arg?.trim(), "--yes"])),
+        // `spread` (any case) is the flag; anything else the account, as typed (the CLI says what
+        // the pool has when it's none of them).
+        Action::Claude => match arg?.trim() {
+            "" => return None,
+            a if a.eq_ignore_ascii_case("spread") => (runs::Kind::Claude, v(&["claude", "assign", name, "--spread", "--yes"])),
+            a => (runs::Kind::Claude, v(&["claude", "assign", name, a, "--yes"])),
+        },
         Action::Jobs => (runs::Kind::Jobs, v(&["pods", "jobs", name])),
         Action::Logs => (runs::Kind::Logs, v(&["pods", "logs", name, "--tail", "100"])),
         Action::Pull => (runs::Kind::Pull, v(&["pods", "pull", name, "--yes"])),
@@ -2892,10 +2940,20 @@ async fn run_setup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
     };
     // No boot-race retries: the operator presses Setup on a pod that is already up.
     let no_wait = BootRetry { window: Duration::ZERO, every: Duration::ZERO };
-    match provision(remote, &target, &steps, no_wait).await {
+    let done = match provision(remote, &target, &steps, no_wait).await {
         ProvisionOutcome::Done { warnings, .. } if warnings.is_empty() => format!("✓ set up {}", pod.name),
         ProvisionOutcome::Done { warnings, .. } => format!("✓ set up {} (warning: {})", pod.name, warnings.join("; ")),
-        failed => format!("✗ setup {}: {}", pod.name, failed.describe()),
+        failed => return format!("✗ setup {}: {}", pod.name, failed.describe()),
+    };
+    // Its own Claude Code account's token, as `pods setup` puts on (one by spread if it has none).
+    let one = [(pod.clone(), target)];
+    match arena_core::claude::stage(remote, cfg, &one, None, snapshot::unix_now()).await {
+        Ok(None) => done,
+        Ok(Some(outcomes)) => {
+            let said: Vec<String> = outcomes.iter().map(|o| o.line()).collect();
+            format!("{done}\nClaude Code: {}", said.join("; "))
+        }
+        Err(e) => format!("{done}\n✗ Claude Code: not pushed — {e}"),
     }
 }
 
@@ -3921,7 +3979,15 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
                 glyph(m.and_then(|m| m.has_api_key)),
             ],
         ),
-        fact("tokens:", vec![Span::raw("HF "), glyph(m.and_then(|m| m.has_hf_token)), Span::raw("   Claude-Code "), glyph(m.and_then(|m| m.has_cc_token))]),
+        fact("tokens:", {
+            let mut v = vec![Span::raw("HF "), glyph(m.and_then(|m| m.has_hf_token)), Span::raw("   Claude-Code "), glyph(m.and_then(|m| m.has_cc_token))];
+            // Its account (`arena claude`), when it has one; `c` in the menu moves it.
+            if let Some((text, tone)) = claude_account(shared.claude.as_ref(), pod) {
+                v.push(Span::raw("  "));
+                v.push(Span::styled(fit(text), tone_style(tone)));
+            }
+            v
+        }),
         fact("progress:", progress),
     ]);
     f.render_widget(Paragraph::new(facts).wrap(Wrap { trim: true }), rows[0]);
@@ -5301,6 +5367,51 @@ deep_check_end=1
         ui.mode = Mode::Detail;
         let pane = draw(160, 40, &shared, &ui).join("\n");
         assert!(pane.contains("gpu:      1×B300 MIG 34GB (MIG slice of B300 SXM6 AC)"), "{pane}");
+    }
+
+    /// `c` (Claude Code account): runs `arena claude assign` — `spread` as its flag, anything else as
+    /// the account — and the detail pane's `tokens:` line says which account the pod is on, and
+    /// when its box may not have it yet.
+    #[test]
+    fn the_claude_action_runs_claude_assign_and_the_detail_names_the_account() {
+        let args = |a: Option<&str>| cli_action_args(Action::Claude, "devtest-alpha", a).map(|(k, v)| (k, v.join(" ")));
+        assert_eq!(args(Some(" 2 ")), Some((runs::Kind::Claude, "claude assign devtest-alpha 2 --yes".into())));
+        assert_eq!(args(Some("Spread")), Some((runs::Kind::Claude, "claude assign devtest-alpha --spread --yes".into())));
+        assert_eq!(args(Some("none")), Some((runs::Kind::Claude, "claude assign devtest-alpha none --yes".into())));
+        assert_eq!(args(Some("  ")), None);
+        assert!(Action::Claude.cli() && Action::Claude.needs_input() && Action::Claude.op().is_none());
+
+        use arena_core::claude::{Assignment, How, Pushed, State};
+        let alpha = pod("alpha", "runpod", "rp1", 1, Some(22001));
+        let on = |account: Option<&str>, pushed: Option<Option<&str>>| State {
+            machines: vec![Assignment {
+                provider: "runpod".into(),
+                id: "rp1".into(),
+                name: alpha.name.clone(),
+                account: account.map(String::from),
+                how: How::Spread,
+                at: NOW,
+                pushed: pushed.map(|p| Pushed { account: p.map(String::from), fp: None, at: NOW }),
+            }],
+            ..State::default()
+        };
+        for (state, want) in [
+            (on(Some("bob@x"), Some(Some("bob@x"))), Some(("bob@x".to_string(), Tone::Good))),
+            (on(Some("bob@x"), Some(Some("alice@x"))), Some(("bob@x (not on it yet: `arena claude push`)".to_string(), Tone::Warn))),
+            (on(Some("bob@x"), None), Some(("bob@x (not on it yet: `arena claude push`)".to_string(), Tone::Warn))),
+            (on(None, Some(None)), Some(("none".to_string(), Tone::Dim))),
+            (State::default(), None),
+        ] {
+            assert_eq!(claude_account(Some(&state), &alpha), want);
+        }
+        let snap = dashboard_snapshot(std::slice::from_ref(&alpha), &[], None, &HealthCache::new(), &Naming::from_config(&cfg("")), NOW);
+        let mut shared = Shared::default();
+        shared.publish(snap);
+        shared.claude = Some(on(Some("bob@x"), Some(Some("bob@x"))));
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        ui.mode = Mode::Detail;
+        let pane = draw(160, 40, &shared, &ui).join("\n");
+        assert!(pane.contains("tokens:   HF ·   Claude-Code ·  bob@x"), "{pane}");
     }
 
     /// SAVED's header is a floppy disk: two cells wide (as `unicode-width`, tmux and the common

@@ -19,7 +19,7 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
-## 2026-10-31 · arena 2.7: project week fixes — owners in the listing, a key from `up`, several machines per terminate
+## 2026-10-31 · arena 2.8: project week fixes — owners in the listing, a key from `up`, several machines per terminate
 - `pods list` and the dashboard show who each machine is for (`--owner`, `spend assign`): an
   OWNER column after NAME, per instance, empty for a machine with no owner, and no column at all
   while no machine has one. In the dashboard it's a short column that a narrow terminal drops;
@@ -62,7 +62,7 @@ earlier).
 - A key's cap prints as it was set, `$0.05` (it read `$0.050`): `keys list`, `keys limit`, the
   dashboard. A key handed over to a new owner says the new key's cap
   (`… a fresh key 4de6426ea4a4, cap $0.10)`).
-- This is **arena 2.7** (a minor bump): `spend assign` can now refuse, `pods up` mints keys, and
+- This is **arena 2.8** (a minor bump): `spend assign` can now refuse, `pods up` mints keys, and
   `pods terminate` takes several names.
 
 ### Action needed
@@ -71,6 +71,36 @@ earlier).
 - With `OPENROUTER_PROVISIONING_KEY` set, `pods up` now mints a key for each cohort name that has
   none, capped at `OPENROUTER_KEY_LIMIT` (else $5): check that cap is the one you want.
 - Restart running dashboards (`arena-tui`) for the OWNER column and the 💾 fix.
+## 2026-10-31 · arena 2.7: Claude Code accounts per machine — `arena claude`
+- This is **arena 2.7** (a minor bump: a new command, `arena claude`, and `--cc-token` replaces a
+  pod's Claude Code token instead of adding a line).
+- Each machine is on **one Claude Code account** from a pool and gets only that account's token,
+  so one heavy user no longer throttles the whole cohort, a leaked token is one account's, and you
+  can see which machine uses what. The pool is a tokens file (`CLAUDE_TOKENS_FILE`, one
+  `email -> sk-ant-oat01-…` per line, the `clods` format: its `tokens` file works as is); without
+  one, `CLAUDE_CODE_OAUTH_TOKEN` is a pool of one and everything works as before.
+- `arena claude accounts` shows each account's machines and people; `arena claude assign apple 2`
+  moves a pod (`--owner alice 2`: all of a person's machines, and their next ones; `--spread`: the
+  least-loaded account); `arena claude push` puts each pod's own token on it (with no pods named,
+  only the ones out of date: new, moved, or their token rotated in the file); `arena claude off`
+  takes it off. Setup, `up` and `copy-keys` put a new machine on the account with the fewest people.
+- The token goes to the pod on ssh's stdin, never in a command line or a file, and replaces every
+  `export CLAUDE_CODE_OAUTH_TOKEN=` line in `~/.bashrc` and `~/.zshrc` (copy-keys added a line for
+  each new token, leaving the old ones above it); each file is rewritten beside itself and renamed
+  over, so a failure leaves it whole. Setup no longer writes the token in its config step; Hetzner
+  VMs, which got it only from `copy-keys`, now get it with every setup.
+- The dashboard's detail pane shows a pod's account on its `tokens:` line, and `c` in its menu moves
+  it to another (a number, an email, `none` or `spread`).
+- `config check` has a "Claude Code accounts" section: how many accounts the file holds, or why it
+  can't be used (it must be `chmod 600`); never a token.
+- [Claude Code accounts](README.md#claude-code-accounts): setting up the file, spreading, moving a
+  heavy user, rotating a leaked token.
+
+### Config
+- `CLAUDE_TOKENS_FILE` (new, optional): the Claude Code accounts' tokens file, owner-only (a file
+  other users can read is refused). Settable from the environment for one run.
+- `CLAUDE_CODE_OAUTH_TOKEN`: a pool of one when there's no tokens file; beside one it's unused, and
+  `config check` says so.
 
 ## 2026-10-31 · arena 2.6: one config search order, a fleet's own PROVIDER, keys/ beside the config
 - `arena` finds its config as `arena-tui` does: `--config`, else `ARENA_CONFIG`, else

@@ -208,7 +208,8 @@ fn fleet_ssh_command(pubkeys: &[String], rendered_config: &str) -> String {
 
 /// The API keys `copy-keys` (and `up`'s per-pod keys stage) hand out: per-host vars from
 /// the `<provider>_api_keys.csv` files in a keys dir, and the broadcast tokens (`--hf-token`
-/// / `--cc-token` over config) that every targeted pod gets.
+/// over config) that every targeted pod gets. (Claude Code's token is each pod's own: the
+/// Claude Code stage, `crate::claude`.)
 pub(crate) struct KeySources {
     /// host (exact pod name) -> [(ENV_NAME, value), …].
     pub per_host: std::collections::HashMap<String, Vec<(String, String)>>,
@@ -220,7 +221,7 @@ pub(crate) struct KeySources {
 }
 
 impl KeySources {
-    pub(crate) fn load(cfg: &Config, keys_dir: &str, hf_token: Option<String>, cc_token: Option<String>) -> Self {
+    pub(crate) fn load(cfg: &Config, keys_dir: &str, hf_token: Option<String>) -> Self {
         use arena_core::apikeys;
         let mut per_host: std::collections::HashMap<String, Vec<(String, String)>> = Default::default();
         let mut csv = Vec::new();
@@ -239,11 +240,10 @@ impl KeySources {
                 }
             }
         }
-        // Broadcast tokens (HF, Claude Code): a flag overrides the config value.
+        // Broadcast tokens (HF): a flag overrides the config value.
         let token_value = |k: &str| -> Option<String> {
             let flag = match k {
                 "HF_TOKEN" => hf_token.clone(),
-                "CLAUDE_CODE_OAUTH_TOKEN" => cc_token.clone(),
                 _ => None,
             };
             flag.or_else(|| cfg.get(k).filter(|s| !s.is_empty()).map(String::from))
@@ -326,7 +326,7 @@ pub(crate) fn up_keys_stage(cfg: &Config, keys_dir: &str, setup: bool) -> Option
     if !setup {
         return None;
     }
-    let keys = KeySources::load(cfg, keys_dir, None, None);
+    let keys = KeySources::load(cfg, keys_dir, None);
     (!keys.csv.is_empty() || archive::pod_archive(cfg).ready().is_some()).then_some(keys)
 }
 
@@ -338,7 +338,9 @@ pub(crate) fn copy_keys_command(vars: &[(String, String)], fleet_ssh: &str) -> S
 
 /// `pods copy-keys`: distribute API keys to each pod's shell. Per-host keys come from
 /// `<keys_dir>/<provider>_api_keys.csv`; a Hugging Face token (from `--hf-token` or
-/// config `HF_TOKEN`) is broadcast to every pod (for gated repos like Llama 3). With a backup
+/// config `HF_TOKEN`) is broadcast to every pod (for gated repos like Llama 3); each pod gets its
+/// own Claude Code account's token (`crate::claude::stage`: one by spread if it has none; `cc_token`,
+/// `--cc-token`, puts that one token on every pod instead). With a backup
 /// archive this user can render, every reachable pod also gets its access (the ssh block, the
 /// pinned key, the read key) — keys or not: a cohort without key files still reads the archive
 /// from its pods (W7 live A-ckl9). And every reachable pod gets the fleet's ssh, keys or not
@@ -362,7 +364,7 @@ pub(crate) async fn handle_copy_keys(
 ) -> Result<()> {
     use arena_core::ssh::SshTarget;
 
-    let mut keys = KeySources::load(cfg, keys_dir, hf_token, cc_token);
+    let mut keys = KeySources::load(cfg, keys_dir, hf_token);
     // The selected pods' OpenRouter rows, checked against OpenRouter's listing first: a key
     // deleted elsewhere is left out and said, not handed on (`checked`). Listed only when one
     // of them has such a row.
@@ -380,6 +382,15 @@ pub(crate) async fn handle_copy_keys(
     for display in &keys.broadcast_names {
         sources.push(format!("{display} (broadcast to every selected pod)"));
     }
+    // Claude Code: each pod its own account's token. A pool that can't be read is said, and fails
+    // the run once the rest is written.
+    let claude_plan = crate::claude::plan_line(cfg, cc_token.as_deref());
+    match &claude_plan {
+        Ok(Some(line)) => sources.push(line.clone()),
+        Ok(None) => {}
+        Err(e) => eprintln!("⚠ Claude Code: {e} — no Claude Code token goes out"),
+    }
+    let claude_on = matches!(claude_plan, Ok(Some(_)));
 
     // The backup archive's access goes to every pod it reaches, whatever the keys (A-ckl9).
     let pod_archive = archive::pod_archive(cfg);
@@ -388,7 +399,7 @@ pub(crate) async fn handle_copy_keys(
     if no_keys && archive_access.is_none() {
         println!(
             "Key sources: none — writing only the fleet's ssh (API keys: put `<provider>_api_keys.csv` in {keys_dir}/ \
-             (openai/anthropic/openrouter), set HF_TOKEN / CLAUDE_CODE_OAUTH_TOKEN, or pass --hf-token)\n"
+             (openai/anthropic/openrouter), set HF_TOKEN / CLAUDE_TOKENS_FILE, or pass --hf-token)\n"
         );
     } else if no_keys {
         println!("Key sources: none — writing only the fleet's ssh and the backup archive's access\n");
@@ -401,6 +412,8 @@ pub(crate) async fn handle_copy_keys(
     /// One pod's write: its name, how to reach it, and the `(name, value)` vars it gets.
     type KeyJob = (String, SshTarget, Vec<(String, String)>);
     let mut jobs: Vec<KeyJob> = Vec::new();
+    // The same pods, for the Claude Code stage (which needs each pod, not only its name).
+    let mut claude_jobs: Vec<(arena_core::Pod, SshTarget)> = Vec::new();
     // Reachable pods that matched NO per-host key — they'd get broadcast tokens only.
     // Worth flagging loudly: a stale/misnamed CSV (e.g. last cohort's hosts) otherwise
     // hides behind a per-pod ✓, so nobody notices the per-host keys never landed.
@@ -421,6 +434,7 @@ pub(crate) async fn handle_copy_keys(
                 if !matched_per_host && !keys.per_host.is_empty() {
                     broadcast_only.push(pod.name.clone());
                 }
+                claude_jobs.push((pod.clone(), t.clone()));
                 jobs.push((pod.name.clone(), t, vars));
             }
             Err(_) => {
@@ -476,8 +490,13 @@ pub(crate) async fn handle_copy_keys(
 
     if dry_run {
         println!("Dry-run — would set on {} pod(s) (values redacted):\n", jobs.len());
+        let claude_pods: Vec<arena_core::Pod> = claude_jobs.iter().map(|(p, _)| p.clone()).collect();
+        let claude_would = if claude_on { crate::claude::preview(cfg, &claude_pods, cc_token.as_deref()).unwrap_or_default() } else { vec![] };
         for (name, _, vars) in &jobs {
-            let names: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+            let mut names: Vec<String> = vars.iter().map(|(k, _)| k.clone()).collect();
+            if let Some((_, what)) = claude_would.iter().find(|(n, _)| n == name) {
+                names.push(what.clone());
+            }
             let what = match (names.is_empty(), archive_access.is_some()) {
                 (false, _) => names.join(", "),
                 (true, true) => "(no keys — the fleet's ssh and the backup archive's access)".to_string(),
@@ -493,6 +512,9 @@ pub(crate) async fn handle_copy_keys(
         "authorize the fleet keys and write ~/.ssh/config (the fleet map and the backup archive's block)"
     } else if no_keys {
         "authorize the fleet keys and write ~/.ssh/config (the fleet map)"
+    } else if claude_on {
+        "export API keys into ~/.bashrc & ~/.zshrc (each pod its own Claude Code account's token, replacing any there), \
+         authorize the fleet keys, and write ~/.ssh/config"
     } else {
         "export API keys into ~/.bashrc & ~/.zshrc, authorize the fleet keys, and write ~/.ssh/config"
     };
@@ -540,8 +562,15 @@ pub(crate) async fn handle_copy_keys(
         }
     }
     println!("\nDone: {ok} updated, {failed} failed.");
+    // Each pod's own Claude Code account's token (one by spread for a pod with none), on ssh's
+    // stdin — never in the command above.
+    // With no pool too: a pod that's off still gets a pending removal (review r3).
+    let claude_failed = crate::claude::stage(remote.as_ref(), cfg, &claude_jobs, cc_token.as_deref()).await;
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed");
+    }
+    if claude_failed > 0 {
+        anyhow::bail!("{claude_failed} pod(s) didn't get their Claude Code token (`arena claude push` retries)");
     }
     Ok(())
 }

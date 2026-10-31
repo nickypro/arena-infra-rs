@@ -353,7 +353,7 @@ mod tests {
         }
         std::fs::write(d.0.join("openrouter_api_keys.csv"), text).unwrap();
         std::fs::write(d.0.join("openai_api_keys.csv"), "devtest-apple,sk-openai\n").unwrap();
-        KeySources::load(&arena_core::Config::parse(""), &d.0.display().to_string(), None, None)
+        KeySources::load(&arena_core::Config::parse(""), &d.0.display().to_string(), None)
     }
 
     /// The copy leaves a dead row out (and says what to run), keeps a live one and the machine's

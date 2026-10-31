@@ -124,20 +124,19 @@ async fn provision_fleet(
 }
 
 /// The provisioning settings `pods setup` (and `up`'s per-pod setup) run with: config's,
-/// plus the broadcast tokens — `--hf-token`/`--cc-token` over config, so a token can be
-/// supplied without editing the read-only prod config — `--zsh-install` and `--no-vscode`.
-/// Also returns the `Broadcast tokens: …` line saying which will be exported.
+/// plus the broadcast tokens — `--hf-token` over config, so a token can be supplied without
+/// editing the read-only prod config — `--zsh-install` and `--no-vscode`. Also returns the
+/// `Broadcast tokens: …` line saying which will be exported. (Claude Code's token isn't
+/// broadcast: each pod gets its own account's after setup, `crate::claude::stage`.)
 pub(crate) fn setup_config(
     cfg: &Config,
     hf_token: Option<String>,
-    cc_token: Option<String>,
     zsh_install: bool,
     no_vscode: bool,
 ) -> Result<(arena_core::setup::SetupConfig, String)> {
     let token_value = |k: &str| -> Option<String> {
         let flag = match k {
             "HF_TOKEN" => hf_token.clone(),
-            "CLAUDE_CODE_OAUTH_TOKEN" => cc_token.clone(),
             _ => None,
         };
         flag.or_else(|| cfg.get(k).filter(|s| !s.is_empty()).map(String::from))
@@ -232,8 +231,14 @@ pub(crate) async fn handle_setup(
     use arena_core::setup::{provisioning_steps, BootRetry};
     use arena_core::ssh::SshTarget;
 
-    let (scfg, tokens_line) = setup_config(cfg, hf_token, cc_token, zsh_install, no_vscode)?;
+    let (scfg, tokens_line) = setup_config(cfg, hf_token, zsh_install, no_vscode)?;
     println!("{tokens_line}");
+    // Claude Code: each pod its own account's token, once it's set up.
+    match crate::claude::plan_line(cfg, cc_token.as_deref()) {
+        Ok(Some(line)) => println!("{line}"),
+        Ok(None) => println!("Claude Code: no accounts ({} / {} unset) — skipped", arena_core::claude::TOKENS_FILE_KEY, arena_core::claude::TOKEN_KEY),
+        Err(e) => println!("Claude Code: ✗ {e} — no token goes out"),
+    }
     // Carry each pod's provider so we can pick bare-VM vs image-based provisioning. A named
     // pod without an endpoint is reported; if none of the named pods is reachable, it fails.
     let targets: Vec<(String, String, SshTarget)> =
@@ -383,9 +388,22 @@ pub(crate) async fn handle_setup(
             pods: sel.pods.iter().filter(|p| provisioned.contains(&p.name)).cloned().collect(),
             named: true,
         };
-        if let Err(e) = handle_copy_keys(remote.clone(), cfg, keys_dir, None, None, &done, false, true).await {
+        // copy-keys runs the Claude Code stage too (with `--cc-token`, if given).
+        if let Err(e) = handle_copy_keys(remote.clone(), cfg, keys_dir, None, cc_token.clone(), &done, false, true).await {
             eprintln!("  (API-key distribution failed: {e})");
         }
+    }
+    // No copy-keys to do it: the Claude Code stage on its own, for the pods that set up OK.
+    let copied_keys = (!csv_sources.is_empty() || archive_ready) && !provisioned.is_empty();
+    // Even with no pool: a pod that's off still gets a pending removal (review r3).
+    if !copied_keys && !provisioned.is_empty() {
+        let pods: Vec<(arena_core::Pod, SshTarget)> = sel
+            .pods
+            .iter()
+            .filter(|p| provisioned.contains(&p.name))
+            .filter_map(|p| SshTarget::from_pod(p, cfg).ok().map(|t| (p.clone(), t)))
+            .collect();
+        crate::claude::stage(remote.as_ref(), cfg, &pods, cc_token.as_deref()).await;
     }
     // The reap notice on each pod set up that has a policy (RR11): setup has just written its
     // shell rc files (where the banner goes), and a restart that reset the container lost it.

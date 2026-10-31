@@ -466,10 +466,13 @@ async fn handle_pods_bal(
                 .unwrap_or_default();
             let key_limit = cfg.get_parsed::<f64>("OPENROUTER_KEY_LIMIT").unwrap_or(5.0);
             let mints = plan_mints(&naming, &names, &handed_names, keys.as_ref(), list_for_check(key_api).await, key_limit, dry_run);
+            // Each pod's own Claude Code account, after setup — when there's a pool.
+            let claude_line = if no_setup { Ok(None) } else { crate::claude::plan_line(cfg, None) };
             let per_pod = up::pipeline_text(
                 !no_setup,
                 check.then_some(check_attempts),
                 keys.is_some() || !mints.mint.is_empty(),
+                matches!(claude_line, Ok(Some(_))),
                 lock,
                 (endpoint_mins, check_attempts),
             );
@@ -506,7 +509,7 @@ async fn handle_pods_bal(
                 None
             } else {
                 let (scfg, tokens) =
-                    setup_config(cfg, None, None, false, false).context("provisioning settings (or pass --no-setup)")?;
+                    setup_config(cfg, None, false, false).context("provisioning settings (or pass --no-setup)")?;
                 let hetzner_script = stage_hetzner_script(arena_core::setup::is_bare_vm(provider.name()))?;
                 Some((up::SetupStage { scfg, timeouts: setup_timeouts, hetzner_script }, tokens))
             };
@@ -622,6 +625,11 @@ async fn handle_pods_bal(
                 ),
                 None => {}
             }
+            match &claude_line {
+                Ok(Some(line)) => println!("{line}"),
+                Ok(None) => {}
+                Err(e) => println!("Claude Code: ✗ {e} — skipped (fix it, then `arena claude push`)"),
+            }
             let run = up::UpRun {
                 provider,
                 remote: remote.clone(),
@@ -639,6 +647,8 @@ async fn handle_pods_bal(
                     cmd: arena_core::health::deep_check_command(Some(cfg.get("CONDA_ENV").unwrap_or("arena-env"))),
                 }),
                 keys,
+                // With setup, always: with no pool it only delivers a pending removal (review r3).
+                claude: !no_setup,
                 lock,
                 retry_bad_hosts,
                 balance: Some(bal),
