@@ -724,7 +724,7 @@ fn a_lock_path_that_is_a_symlink_is_never_written_through() {
 
 /// Review r5: the path swapped for a link while the push waited for the lock: the push refuses
 /// once it has the lock, and the file the link points at is never written.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn a_lock_path_swapped_for_a_link_while_waiting_is_never_written_through() {
     use std::io::Write;
@@ -748,7 +748,15 @@ fn a_lock_path_swapped_for_a_link_while_waiting_is_never_written_through() {
         .spawn()
         .unwrap();
     child.stdin.take().unwrap().write_all(format!("{}\n", tok(1)).as_bytes()).unwrap();
-    std::thread::sleep(Duration::from_millis(400));
+    // Wait until it has the lock file open as descriptor 9 (so it's past the up-front check and in
+    // flock), then swap the path: the check after the lock is what must refuse it.
+    let fd9 = std::path::PathBuf::from(format!("/proc/{}/fd/9", child.id()));
+    let real = std::fs::canonicalize(&lk).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::fs::read_link(&fd9).ok().as_deref() != Some(real.as_path()) {
+        assert!(std::time::Instant::now() < deadline, "the push never opened its lock");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(child.try_wait().unwrap().is_none(), "it waits for the lock");
     std::fs::remove_file(&lk).unwrap();
     std::os::unix::fs::symlink(&victim, &lk).unwrap();
