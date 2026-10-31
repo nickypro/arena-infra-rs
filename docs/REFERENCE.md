@@ -1960,12 +1960,17 @@ ssh command's stdin**: never in a command line (not in `ps` at either end, nor i
 run) and never in a file, here or on the pod, that a dropped connection could leave behind. Each rc
 file is rewritten beside itself (keeping its mode; a link's file, not the link) and renamed over
 it, so a full disk or a lost connection leaves the old file whole. A re-push changes nothing on a
-box that's already right. Each push has 60 s. Two pushes to one machine take turns (a lock per
-machine), each reading what the machine should have when its turn comes. What went is recorded (the
-account and a fingerprint of its token), so a moved machine or a rotated token shows as out of
-date. Shells already open keep their old token until they start again. A machine terminated by
-arena, or missing from a complete listing (`pods list`, the dashboard, the snapshot cron line,
-`teardown --check`, `balance`), is forgotten, so it stops counting as its account's load.
+box that's already right. Each push has 60 s. Two pushes to one machine take turns — a lock here
+per machine, and one on the pod (`~/.arena-claude.lock`, an empty file; `flock`) so a push whose
+connection timed out can't land after the next — each reading the machine's assignment and the
+tokens file afresh when its turn comes (an old read never puts a rotated token back). Tracing is
+turned off before the token is read, and anything token-like in what a pod says back is masked. What
+went is recorded (the account and a fingerprint of its token), so a moved machine or a rotated
+token shows as out of date. Shells already open keep their old token until they start again. A
+machine terminated by arena, or missing from a complete listing begun after its last change (`pods
+list`, the dashboard, the snapshot cron line, `teardown --check`, `balance`), is forgotten, so it
+stops counting as its account's load. A pod with no python3 whose `~/.claude.json` can't be marked
+onboarded fails its push (Claude Code would ignore the token).
 
 - `arena claude accounts [--json]` — the pool: each account's number, email, machines and people;
   `*` marks a machine whose box may not have its account's current token yet; the machines that are

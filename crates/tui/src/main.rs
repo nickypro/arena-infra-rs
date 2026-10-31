@@ -843,7 +843,7 @@ async fn refresh(
     arena_core::spend::record_listing(spend_path(cfg).as_deref(), &fresh, &pods, &Naming::from_config(cfg), listed_at);
     // The Claude Code accounts forget the machines this listing shows are gone, then are read for
     // the detail pane.
-    arena_core::claude::record_listing(claude_path(cfg).as_deref(), &fresh);
+    arena_core::claude::record_listing(claude_path(cfg).as_deref(), &fresh, listed_at);
     let claude = claude_path(cfg).and_then(|p| arena_core::claude::load(&p).ok());
     // The balance's runway is judged against what is billing as listed (not the pending
     // placeholders, and after the details filled the prices), a provider that failed to

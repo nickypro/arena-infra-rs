@@ -80,7 +80,7 @@ impl SpendCtx {
     /// meanwhile is newer than what the listing saw, and the fold keeps it.
     pub(crate) fn listing(&self, listing: &Listing, pods: &[Pod], at: u64) {
         spend::record_listing(self.path(), listing, pods, &self.naming(), at);
-        arena_core::claude::record_listing(self.claude.as_deref(), listing);
+        arena_core::claude::record_listing(self.claude.as_deref(), listing, at);
     }
 
     /// Record a complete key listing begun `at`: each key's usage, read before anything

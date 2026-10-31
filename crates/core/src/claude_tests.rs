@@ -253,13 +253,36 @@ fn a_name_made_again_is_a_new_machine_and_inherits_nothing() {
     // A complete listing without 111 forgets it; a failed one keeps it.
     let new_pod = Pod { provider: "hetzner".into(), id: "222".into(), name: "apple".into(), ..Pod::default() };
     let failed = Listing::from_results(vec![("hetzner".into(), Err(crate::Error::provider("boom")))]);
-    assert_eq!(prune(s.clone(), &failed).machines.len(), 2);
+    assert_eq!(prune(s.clone(), &failed, T0 + 10).machines.len(), 2);
     let ok = Listing::from_results(vec![("hetzner".into(), Ok(vec![new_pod]))]);
-    let s = prune(s, &ok);
+    // A listing begun before 111 was assigned can't say it's gone (review r2: it may be newer).
+    assert_eq!(prune(s.clone(), &ok, T0).machines.len(), 2);
+    let s = prune(s, &ok, T0 + 10);
     assert_eq!(s.machines.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["222"]);
     // Another provider's listing says nothing about Hetzner's machines.
     let other = Listing::from_results(vec![("runpod".into(), Ok(vec![]))]);
-    assert_eq!(prune(s.clone(), &other), s);
+    assert_eq!(prune(s.clone(), &other, T0 + 10), s);
+    // Nor does one begun before its last push.
+    let s = record_push(s, "hetzner", "222", Some("u1@x"), None, T0 + 20);
+    let none = Listing::from_results(vec![("hetzner".into(), Ok(vec![]))]);
+    assert_eq!(prune(s.clone(), &none, T0 + 15).machines.len(), 1);
+    assert!(prune(s, &none, T0 + 30).machines.is_empty());
+}
+
+/// Review r2: an owner pin takes the owner's machines the listing didn't show too (a provider
+/// that failed), not only the live ones.
+#[test]
+fn an_owner_pin_reaches_their_machines_a_failed_listing_left_out() {
+    let ms = [m("a1", "1", Some("alice")), m("a2", "2", Some("alice")), m("b", "3", Some("bob"))];
+    let o = owners(&ms);
+    let (s, _) = assign(State::default(), &pool(3), &o, &ms, &Want::Ensure, T0);
+    // Only a1 listed now.
+    let theirs = owner_machines(&s, &o, "alice", &ms[..1]);
+    assert_eq!(theirs.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["a1", "a2"]);
+    let (s, changes) = pin_owner(s, &pool(3), &o, "alice", Some(acct("u3@x")), &theirs, T0 + 1);
+    assert_eq!(changes.len(), 2);
+    assert!(on(&s, &ms[..2]).iter().all(|(_, a)| a.as_deref() == Some("u3@x")));
+    assert_eq!(s.get("hetzner", "3").unwrap().account, acct("u2@x"), "bob's isn't touched");
 }
 
 #[test]
@@ -426,12 +449,16 @@ fn token_lines(text: &str) -> Vec<&str> {
     text.lines().filter(|l| l.contains("CLAUDE_CODE_OAUTH_TOKEN")).collect()
 }
 
-/// What's in `home` besides the rc files, `~/.claude.json` and `keep`: nothing should be.
+/// What's in `home` besides the rc files, `~/.claude.json`, the push's (empty) lock and `keep`:
+/// nothing should be.
 fn leftovers(home: &Path, keep: &[&str]) -> Vec<String> {
+    if let Ok(lock) = std::fs::read(home.join(".arena-claude.lock")) {
+        assert!(lock.is_empty(), "the lock file holds nothing");
+    }
     let mut v: Vec<String> = std::fs::read_dir(home)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| ![".bashrc", ".zshrc", ".claude.json"].contains(&n.as_str()) && !keep.contains(&n.as_str()))
+        .filter(|n| ![".bashrc", ".zshrc", ".claude.json", ".arena-claude.lock"].contains(&n.as_str()) && !keep.contains(&n.as_str()))
         .collect();
     v.sort();
     v
@@ -490,7 +517,7 @@ fn off_on_a_machine_with_no_rc_files_makes_none_and_a_missing_token_changes_noth
     let d = tmp("push-none");
     let home = &d.0;
     assert_eq!(run_push(home, None).0, 0);
-    assert!(leftovers(home, &[]).is_empty() && !home.join(".bashrc").exists() && !home.join(".zshrc").exists());
+    assert!(leftovers(home, &[]).is_empty() && !home.join(".bashrc").exists() && !home.join(".zshrc").exists() && !home.join(".claude.json").exists());
     // A token that didn't arrive on stdin: exit 3, nothing written.
     std::fs::write(home.join(".bashrc"), format!("export CLAUDE_CODE_OAUTH_TOKEN=\"{}\"\n", tok(1))).unwrap();
     let out = std::process::Command::new("bash")
@@ -542,6 +569,69 @@ fn the_rewrite_goes_through_links_keeps_the_mode_and_a_failure_leaves_the_old_fi
     std::fs::set_permissions(home.join("dotfiles"), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_ne!(code, 0);
     assert_eq!(read(home, "dotfiles/zshrc"), before);
+}
+
+/// Review r2: a startup file that turns tracing on (`set -x`, zsh's `.zshenv`) never gets the token
+/// printed: tracing goes off before it's read. And what a pod says back is masked anyway.
+#[test]
+fn tracing_never_shows_the_token_and_errors_are_masked() {
+    use std::io::Write;
+    for shell in ["bash", "zsh"] {
+        if std::process::Command::new(shell).arg("-c").arg("true").output().is_err() {
+            continue; // not installed here
+        }
+        let d = tmp(&format!("push-trace-{shell}"));
+        let mut child = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(format!("set -x; {}", push_command(true)))
+            .env("HOME", &d.0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(format!("{}\n", tok(7)).as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{shell}: {err}");
+        assert!(!err.contains("FAKE-0007"), "{shell} traced the token: {err}");
+        assert_eq!(token_lines(&read(&d.0, ".zshrc")).len(), 1, "{shell}");
+    }
+    let said = format!("exit 1: + [ -n {} ]\nTraceback: json error near sk-ant-api03-OTHER_x-1", tok(7));
+    assert_eq!(mask_tokens(&said, Some(&tok(7))), "exit 1: + [ -n <token> ]\nTraceback: json error near <token>");
+    assert_eq!(mask_tokens("no token here", None), "no token here");
+}
+
+/// Review r2: the pod side of the lock — a push started while another holds it waits, then runs.
+#[cfg(unix)]
+#[test]
+fn a_push_on_the_pod_waits_for_one_still_running_there() {
+    use std::io::Write;
+    if std::process::Command::new("flock").arg("--version").output().is_err() {
+        return; // no util-linux here
+    }
+    let d = tmp("push-podlock");
+    let home = &d.0;
+    let held = std::fs::OpenOptions::new().create(true).append(true).open(home.join(".arena-claude.lock")).unwrap();
+    held.lock().unwrap();
+    let mut child = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(push_command(true))
+        .env("HOME", home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(format!("{}\n", tok(1)).as_bytes()).unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(child.try_wait().unwrap().is_none(), "it waits while the other holds the lock");
+    assert!(!home.join(".zshrc").exists());
+    drop(held);
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(token_lines(&read(home, ".zshrc")).len(), 1);
+    assert_eq!(leftovers(home, &[]), Vec::<String>::new());
 }
 
 #[test]
@@ -609,6 +699,29 @@ fn config_in(d: &TmpDir, n: u32) -> Config {
     let text: String = (1..=n).map(|i| format!("u{i}@x -> {}\n", tok(i))).collect();
     write_mode(&file, &text, 0o600);
     Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR={}\nCLAUDE_TOKENS_FILE={}\n", d.0.join("state").display(), file.display()))
+}
+
+/// Review r2: a push reads the tokens file again under its lock — a command that read it before a
+/// rotation (it waited at its confirm) pushes the new token, never the old one; an account gone
+/// from the file is a failure that says so, never a silent skip.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_push_reads_the_tokens_again_so_an_old_read_never_undoes_a_rotation() {
+    let d = tmp("stage-rotate");
+    let cfg = config_in(&d, 2);
+    let path = state_path(&cfg).unwrap();
+    let pods = [pod("apple", "1", "10.0.0.1"), pod("bloom", "2", "10.0.0.2")];
+    stage(&FakeRemote::new(), &cfg, &pods, None, T0).await.unwrap();
+    let old = load_pool(&cfg).unwrap();
+    // u2's token rotated, u1 dropped, after `old` was read.
+    write_mode(&d.0.join("tokens"), &format!("u2@x -> {}\n", tok(22)), 0o600);
+    let r = FakeRemote::new();
+    let out = push_all(&r, &path, &old, &pods, &[], T0 + 1).await;
+    assert_eq!(inputs(&r), [("10.0.0.2:22".to_string(), format!("{}\n", tok(22)))]);
+    assert_eq!(out[0].line(), "✗ apple: u1@x — its account is no longer in the pool: `arena claude push` spreads it");
+    assert_eq!(out[1].line(), "✓ bloom: #1 u2@x");
+    let s = load(&path).unwrap();
+    assert_eq!(s.get("hetzner", "2").unwrap().pushed.as_ref().unwrap().fp, Some(fingerprint(&tok(22))));
 }
 
 /// What each host was sent on stdin.
@@ -730,8 +843,8 @@ async fn cc_token_goes_to_every_pod_and_moves_no_one() {
     assert!(out_of_date(after.get("hetzner", "1").unwrap(), &load_pool(&cfg).unwrap()), "apple has --cc-token's, not #2's");
 }
 
-/// Review r1: a machine terminated — by arena, or seen gone by any complete listing — stops
-/// counting as load (and its push lock goes); a listing that failed forgets nothing.
+/// Review r1: a machine terminated — by arena, or seen gone by any complete listing begun after its
+/// last change — stops counting as load; a listing that failed forgets nothing.
 #[cfg(unix)]
 #[tokio::test]
 async fn listings_and_terminates_forget_gone_machines_and_their_locks() {
@@ -742,14 +855,17 @@ async fn listings_and_terminates_forget_gone_machines_and_their_locks() {
     stage(&FakeRemote::new(), &cfg, &pods, None, T0).await.unwrap();
     assert!(lock_path(&path, "hetzner", "1").exists());
     record_terminated(Some(&path), Some("hetzner"), "1");
-    assert!(load(&path).unwrap().get("hetzner", "1").is_none() && !lock_path(&path, "hetzner", "1").exists());
+    assert!(load(&path).unwrap().get("hetzner", "1").is_none());
+    assert!(lock_path(&path, "hetzner", "1").exists(), "a lock file is kept: one a push holds is never removed");
     let failed = Listing::from_results(vec![("hetzner".into(), Err(crate::Error::provider("boom")))]);
-    record_listing(Some(&path), &failed);
+    record_listing(Some(&path), &failed, T0 + 10);
     assert_eq!(load(&path).unwrap().machines.len(), 2);
     let only_cloud = Listing::from_results(vec![("hetzner".into(), Ok(vec![pods[2].0.clone()]))]);
-    record_listing(Some(&path), &only_cloud);
+    // Begun before bloom's push was recorded: it can't say bloom is gone.
+    record_listing(Some(&path), &only_cloud, T0 - 10);
+    assert_eq!(load(&path).unwrap().machines.len(), 2);
+    record_listing(Some(&path), &only_cloud, T0 + 10);
     assert_eq!(load(&path).unwrap().machines.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["3"]);
-    assert!(!lock_path(&path, "hetzner", "2").exists() && lock_path(&path, "hetzner", "3").exists());
     // A new machine now: the load is cloud's alone (#3 → u1, so it goes to u2).
     let new = [pod("dune", "4", "10.0.0.4")];
     let out = stage(&FakeRemote::new(), &cfg, &new, None, T0 + 60).await.unwrap().unwrap();
@@ -757,6 +873,6 @@ async fn listings_and_terminates_forget_gone_machines_and_their_locks() {
     // No state file yet: a listing makes none.
     let empty = tmp("forget-none");
     let none = empty.0.join("devtest").join(STATE_FILE);
-    record_listing(Some(&none), &only_cloud);
+    record_listing(Some(&none), &only_cloud, T0);
     assert!(!none.exists() && !empty.0.join("devtest").exists());
 }

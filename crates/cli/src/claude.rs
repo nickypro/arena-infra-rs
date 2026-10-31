@@ -171,12 +171,15 @@ fn due(state: &State, pool: &Pool, pod: &Pod) -> bool {
 /// the selection and to forget machines that are gone.
 struct Fleet {
     listing: Listing,
+    /// When the listing began: only what's older can it say is gone ([`claude::prune`]).
+    listed_at: u64,
     pods: Vec<Pod>,
     owners: claude::Owners,
 }
 
 impl Fleet {
     async fn list(provider: &dyn Provider, cfg: &Config) -> Result<Fleet> {
+        let listed_at = unix_now();
         let listing = Listing::from_results(provider.list_by_provider().await);
         for (p, e) in listing.errors() {
             eprintln!("⚠ {p}: listing failed ({e}) — its pods aren't here");
@@ -185,7 +188,7 @@ impl Fleet {
             anyhow::bail!("no provider listed its pods");
         }
         let pods = listing.pods();
-        Ok(Fleet { listing, pods, owners: claude::owners_for(cfg) })
+        Ok(Fleet { listing, listed_at, pods, owners: claude::owners_for(cfg) })
     }
 
     /// Resolve the operator's selection against this listing (as `pods::selection::select` does
@@ -284,7 +287,7 @@ async fn apply(
     let path = claude::state_path(cfg).map_err(|e| anyhow::anyhow!("no state dir for claude.json: {e}"))?;
     let targets = fleet.machines(&sel.pods);
     // The preview, from the state as it is (the record below plans again under the lock).
-    let state = claude::prune(load_state(cfg)?, &fleet.listing);
+    let state = claude::prune(load_state(cfg)?, &fleet.listing, fleet.listed_at);
     let (planned, changes) = claude::assign(state, pool, &fleet.owners, &targets, want, now);
     let to_push = |s: &State| -> Vec<Pod> {
         sel.pods
@@ -333,7 +336,8 @@ async fn apply(
         println!("aborted.");
         return Ok(());
     }
-    let (state, changes) = claude::record(&path, |s| claude::assign(claude::prune(s, &fleet.listing), pool, &fleet.owners, &targets, want, now))
+    let (state, changes) =
+        claude::record(&path, |s| claude::assign(claude::prune(s, &fleet.listing, fleet.listed_at), pool, &fleet.owners, &targets, want, now))
         .map_err(|e| anyhow::anyhow!(e))?;
     let pushing = to_push(&state);
     if pushing.is_empty() {
@@ -412,7 +416,11 @@ async fn assign_owner(
         .filter(|p| fleet.owners.get(&(p.provider.clone(), p.id.clone())) == Some(&owner))
         .cloned()
         .collect();
-    let machines = fleet.machines(&theirs);
+    // Theirs that this listing doesn't show (a provider that failed) are pinned too.
+    let machines = claude::owner_machines(&load_state(cfg)?, &fleet.owners, &owner, &fleet.machines(&theirs));
+    if machines.len() > theirs.len() {
+        println!("  (and {} more of theirs not listed now: pushed when they're next listed, by `arena claude push`)", machines.len() - theirs.len());
+    }
     let path = claude::state_path(cfg).map_err(|e| anyhow::anyhow!("no state dir for claude.json: {e}"))?;
     let shown = match &pin {
         None => "no pin (spread)".to_string(),
@@ -465,7 +473,7 @@ async fn accounts(provider: &dyn Provider, cfg: &Config, json: bool) -> Result<(
     }
     let fleet = Fleet::list(provider, cfg).await?;
     let path = claude::state_path(cfg).map_err(|e| anyhow::anyhow!("no state dir for claude.json: {e}"))?;
-    let (state, ()) = claude::record(&path, |s| (claude::prune(s, &fleet.listing), ())).map_err(|e| anyhow::anyhow!(e))?;
+    let (state, ()) = claude::record(&path, |s| (claude::prune(s, &fleet.listing, fleet.listed_at), ())).map_err(|e| anyhow::anyhow!(e))?;
     let machines = fleet.machines(&fleet.pods);
     let v = claude::view(&state, &pool, &machines);
     if json {

@@ -718,12 +718,30 @@ pub fn pin_owner(
     assign(state, pool, owners, machines, &Want::Spread, now)
 }
 
-/// Forget the machines a listing shows are gone: a provider that listed (completely) without one
-/// had it terminated. A provider that failed, or wasn't asked, leaves its machines as they were.
-/// Pure.
-pub fn prune(mut state: State, listing: &Listing) -> State {
+/// `owner`'s machines for an owner pin: the live ones (`live`, the listing's) and any other
+/// assignment of theirs this state knows — one on a provider that didn't list this time keeps
+/// no old account behind the pin (review r2); it's pushed when it's next listed. Pure.
+pub fn owner_machines(state: &State, owners: &Owners, owner: &str, live: &[Machine]) -> Vec<Machine> {
+    let mut out: Vec<Machine> = live.iter().filter(|m| m.owner.as_deref() == Some(owner)).cloned().collect();
+    for a in &state.machines {
+        let key = (a.provider.clone(), a.id.clone());
+        if owners.get(&key).map(String::as_str) == Some(owner) && !out.iter().any(|m| m.key() == key) {
+            out.push(Machine { provider: a.provider.clone(), id: a.id.clone(), name: a.name.clone(), owner: Some(owner.to_string()) });
+        }
+    }
+    out
+}
+
+/// Forget the machines a listing begun at `listed_at` shows are gone: a provider that listed
+/// (completely) without one had it terminated. A provider that failed, or wasn't asked, leaves its
+/// machines as they were; so does any machine assigned or pushed since the listing began (it may
+/// have been made after: review r2 — an old listing must never undo a newer `up`). Pure.
+pub fn prune(mut state: State, listing: &Listing, listed_at: u64) -> State {
     let live: HashSet<(String, String)> = listing.pods().iter().map(|p| (p.provider.clone(), p.id.clone())).collect();
-    state.machines.retain(|m| listing.status(&m.provider) != ListingStatus::Ok || live.contains(&(m.provider.clone(), m.id.clone())));
+    state.machines.retain(|m| {
+        let since = m.at >= listed_at || m.pushed.as_ref().is_some_and(|p| p.at >= listed_at);
+        since || listing.status(&m.provider) != ListingStatus::Ok || live.contains(&(m.provider.clone(), m.id.clone()))
+    });
     state
 }
 
@@ -930,45 +948,32 @@ pub fn record<T>(path: &Path, f: impl FnOnce(State) -> (State, T)) -> Result<(St
     Ok((next, out))
 }
 
-/// Record a complete listing quietly: the machines it shows are gone are forgotten
-/// ([`prune`]), with their push locks — what `pods list`, the dashboard, teardown, `arena
-/// balance` and the snapshot cron line do after they listed, so a terminated machine stops
-/// counting as load within minutes, whoever terminated it. Nothing is written when nothing
-/// changed; a failure changes nothing else (spend's listings record the same way).
-pub fn record_listing(path: Option<&Path>, listing: &Listing) {
+/// Record a complete listing begun at `listed_at`, quietly: the machines it shows are gone are
+/// forgotten ([`prune`]) — what `pods list`, the dashboard, teardown, `arena balance` and the
+/// snapshot cron line do after they listed, so a terminated machine stops counting as load within
+/// minutes, whoever terminated it. Nothing is written when nothing changed; a failure changes
+/// nothing else (spend's listings record the same way).
+pub fn record_listing(path: Option<&Path>, listing: &Listing, listed_at: u64) {
     let Some(path) = path else { return };
     // Only a fleet that has assignments: no state dir made, no lock taken, for one that doesn't.
     if !path.exists() {
         return;
     }
-    if let Ok((_, gone)) = record(path, |s| {
-        let before: Vec<(String, String)> = s.machines.iter().map(|m| (m.provider.clone(), m.id.clone())).collect();
-        let next = prune(s, listing);
-        let gone: Vec<(String, String)> = before.into_iter().filter(|(p, id)| next.get(p, id).is_none()).collect();
-        (next, gone)
-    }) {
-        forget_locks(path, &gone);
-    }
+    let _ = record(path, |s| (prune(s, listing, listed_at), ()));
 }
 
-/// Forget a machine arena just terminated (`provider`: when known; else the one open record with
-/// that id) — quietly, as spend records the terminate.
+/// Forget a machine arena just terminated (`provider`: when known; else the one record with that
+/// id) — quietly, as spend records the terminate.
 pub fn record_terminated(path: Option<&Path>, provider: Option<&str>, id: &str) {
     let Some(path) = path.filter(|p| p.exists()) else { return };
-    if let Ok((_, gone)) = record(path, |mut s| {
+    let _ = record(path, |mut s| {
         let hits: Vec<usize> =
             s.machines.iter().enumerate().filter(|(_, m)| m.id == id && provider.is_none_or(|p| m.provider == p)).map(|(i, _)| i).collect();
-        let gone = match hits.as_slice() {
-            [i] => {
-                let m = s.machines.remove(*i);
-                vec![(m.provider, m.id)]
-            }
-            _ => vec![],
-        };
-        (s, gone)
-    }) {
-        forget_locks(path, &gone);
-    }
+        if let [i] = hits.as_slice() {
+            s.machines.remove(*i);
+        }
+        (s, ())
+    });
 }
 
 // ---------------------------------------------------------------------------------------
@@ -986,8 +991,11 @@ pub const MACHINE_LOCK_WAIT: Duration = Duration::from_secs(90);
 /// full disk or a dropped connection leaves the old file, never a cut one; a file already so isn't
 /// touched (a re-push changes nothing), and one that doesn't exist isn't made just to say "none".
 /// The token is read with `read` (a builtin) and reaches `awk` through its environment: never an
-/// argument, so never in `ps` on the pod. With a token, Claude Code's onboarding is marked done in
-/// `~/.claude.json` (it ignores the token until it is), as copy-keys did. Pure.
+/// argument, so never in `ps` on the pod; and tracing is off first (`set +x`: a startup file that
+/// turns it on would print it — review r2). The rewrite holds a lock on the pod too
+/// ([`POD_LOCK`]), so a push whose connection timed out while it ran there can't land after the
+/// next one. With a token, Claude Code's onboarding is marked done in `~/.claude.json` (it ignores
+/// the token until it is), as copy-keys did; a push that can't do that fails. Pure.
 pub fn push_command(token: bool) -> String {
     let take = if token {
         "IFS= read -r ARENA_CC || true; [ -n \"$ARENA_CC\" ] || { echo 'no token arrived on stdin' >&2; exit 3; }"
@@ -995,7 +1003,7 @@ pub fn push_command(token: bool) -> String {
         "ARENA_CC="
     };
     format!(
-        "set -e; umask 077; tmp=; trap 'rm -f -- \"$tmp\"' EXIT; {take}; export ARENA_CC; \
+        "{{ set +x; }} 2>/dev/null; set -e; umask 077; tmp=; trap 'rm -f -- \"$tmp\"' EXIT; {take}; export ARENA_CC; {POD_LOCK} \
          for rc in \"$HOME/.bashrc\" \"$HOME/.zshrc\"; do \
          if [ ! -e \"$rc\" ]; then [ -n \"$ARENA_CC\" ] || continue; : > \"$rc\"; fi; \
          f=$(readlink -f -- \"$rc\" 2>/dev/null || printf '%s' \"$rc\"); \
@@ -1008,10 +1016,16 @@ pub fn push_command(token: bool) -> String {
     )
 }
 
+/// The pod's side of a push's lock (`~/.arena-claude.lock`, `flock` from util-linux), held until
+/// the command ends: a push that timed out here — its ssh killed, its command still running on the
+/// pod — finishes before the next one starts, never after it. Without `flock`, no lock.
+const POD_LOCK: &str = "if command -v flock >/dev/null 2>&1; then exec 9>>\"$HOME/.arena-claude.lock\"; \
+     flock -w 45 9 || { echo 'another push is still running on this machine' >&2; exit 4; }; fi;";
+
 /// Mark Claude Code's onboarding done in `~/.claude.json` (it ignores `CLAUDE_CODE_OAUTH_TOKEN`
 /// until it is): with python3, merged into the file and only when it isn't so already, written
-/// beside it and renamed over it (its mode kept); with no python3, the file written when there's
-/// none.
+/// beside it and renamed over it (its mode kept); with no python3, the file written (beside, then
+/// renamed) when there's none, and a failure when there's one it can't merge into.
 const ONBOARDED: &str = "if command -v python3 >/dev/null 2>&1; then python3 -c '
 import json, os
 p = os.path.realpath(os.path.expanduser(\"~/.claude.json\"))
@@ -1024,8 +1038,10 @@ if d.get(\"hasCompletedOnboarding\") is not True:
     if os.path.exists(p):
         os.chmod(t, os.stat(p).st_mode & 0o7777)
     os.replace(t, p)
-'; elif [ ! -s \"$HOME/.claude.json\" ]; then printf '{\"hasCompletedOnboarding\": true}\\n' > \"$HOME/.claude.json\"; \
-     else echo 'no python3 to mark the onboarding done in ~/.claude.json' >&2; fi";
+'; elif [ ! -s \"$HOME/.claude.json\" ]; then tmp=$(mktemp \"$HOME/.claude.json.arena-XXXXXX\"); \
+     printf '{\"hasCompletedOnboarding\": true}\\n' > \"$tmp\"; mv -f -- \"$tmp\" \"$HOME/.claude.json\"; tmp=; \
+     elif ! grep -q '\"hasCompletedOnboarding\": *true' \"$HOME/.claude.json\"; then \
+     echo 'no python3 to mark the onboarding done in ~/.claude.json: Claude Code ignores the token until it is' >&2; exit 5; fi";
 
 /// Push one machine: [`push_command`] with `token` on its stdin — or, with `None`, the command
 /// alone, which takes the token off. Nothing with a token is written anywhere on the way: not a
@@ -1038,9 +1054,24 @@ pub async fn push(remote: &dyn Remote, t: &SshTarget, token: Option<&str>, timeo
     };
     match done {
         Ok(o) if o.success => Ok(()),
-        Ok(o) => Err(format!("{}: {}", o.exit_label(), o.stderr.trim())),
-        Err(e) => Err(describe_error(&e)),
+        // What the pod said, any token in it masked (a startup file's trace, a tool echoing it).
+        Ok(o) => Err(mask_tokens(&format!("{}: {}", o.exit_label(), o.stderr.trim()), token)),
+        Err(e) => Err(mask_tokens(&describe_error(&e), token)),
     }
+}
+
+/// `text` with `token` and anything that looks like a Claude token (`sk-ant-` and the token
+/// characters after it) masked. Pure.
+pub fn mask_tokens(text: &str, token: Option<&str>) -> String {
+    let mut s = match token.filter(|t| !t.is_empty()) {
+        Some(t) => text.replace(t, "<token>"),
+        None => text.to_string(),
+    };
+    while let Some(at) = s.find(TOKEN_PREFIX) {
+        let end = s[at..].find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')).map_or(s.len(), |n| at + n);
+        s.replace_range(at..end, "<token>");
+    }
+    s
 }
 
 /// A file name part from a provider name or an id: what isn't a letter, a digit, `-`, `_` or `.`
@@ -1049,17 +1080,12 @@ fn file_part(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' }).collect()
 }
 
-/// A machine's push lock (`claude-locks/<provider>-<id>.lock` beside the state file).
+/// A machine's push lock (`claude-locks/<provider>-<id>.lock` beside the state file): an empty
+/// file, kept — removing one a push may hold or wait on would let two pushes run at once
+/// (review r2).
 fn lock_path(path: &Path, provider: &str, id: &str) -> PathBuf {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     dir.join("claude-locks").join(format!("{}-{}.lock", file_part(provider), file_part(id)))
-}
-
-/// Remove the push locks of machines that are gone (nothing pushes to them any more).
-fn forget_locks(path: &Path, gone: &[(String, String)]) {
-    for (provider, id) in gone {
-        let _ = std::fs::remove_file(lock_path(path, provider, id));
-    }
 }
 
 /// Take a machine's push lock, waiting up to `wait` for another push to it to end: held across
@@ -1148,18 +1174,28 @@ async fn join_all<F: Future>(futs: Vec<F>) -> Vec<F::Output> {
     out.into_iter().map(|o| o.expect("every future finished")).collect()
 }
 
-/// One machine's push under its lock ([`lock_machine`]): what it should have read afresh from the
-/// state — its account's token (`pool`'s), or none when it's off; with a [`Source::Flag`] pool, that
-/// one token — pushed, and recorded once it went. `None`: nothing to push (no assignment, or an
-/// account no longer in the pool: its next `claude push` spreads it).
+/// One machine's push under its lock ([`lock_machine`]): what it should have read afresh — its
+/// assignment from the state and its account's token from the tokens file (a pool from config
+/// as it is), or none when it's off; with a [`Source::Flag`] pool, that one token — pushed, and
+/// recorded once it went. `None`: nothing to push (no assignment); an account no longer in the
+/// pool is a failed outcome that says so.
 async fn push_one(remote: &dyn Remote, path: &Path, pool: &Pool, pod: &Pod, t: &SshTarget, now: u64) -> Option<(String, Result<(), String>)> {
     let failed = |e: String| Some(("not pushed".to_string(), Err(e)));
     let _lock = match lock_machine(path, &pod.provider, &pod.id, MACHINE_LOCK_WAIT).await {
         Ok(l) => l,
         Err(e) => return failed(e),
     };
-    let account: Option<&Account> = if pool.source == Source::Flag {
-        pool.accounts.first()
+    // The tokens as they are now: a file rotated since this run read it (a command that waited at
+    // its confirm) must never put the old token back (review r2).
+    let fresh = match &pool.source {
+        Source::File(f) => match read_tokens_file(f) {
+            Ok(p) => Pool::of(p.accounts, pool.source.clone()),
+            Err(e) => return failed(e),
+        },
+        _ => pool.clone(),
+    };
+    let account: Option<&Account> = if fresh.source == Source::Flag {
+        fresh.accounts.first()
     } else {
         let state = match load(path) {
             Ok(s) => s,
@@ -1167,7 +1203,10 @@ async fn push_one(remote: &dyn Remote, path: &Path, pool: &Pool, pod: &Pod, t: &
         };
         match &state.of(pod)?.account {
             None => None,
-            Some(e) => Some(pool.get(e)?),
+            Some(e) => match fresh.get(e) {
+                Some(a) => Some(a),
+                None => return Some((e.clone(), Err("its account is no longer in the pool: `arena claude push` spreads it".into()))),
+            },
         }
     };
     let label = account.map_or_else(|| "token taken off".to_string(), Account::label);
