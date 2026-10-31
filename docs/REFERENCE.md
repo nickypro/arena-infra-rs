@@ -2596,13 +2596,15 @@ read), `arena-plan.json` (`plan check`/`show` without `--file`) and `backup/` (w
 | not there | there, but nothing in it is this fleet's | beside the config (made there), with a one-line warning: another fleet's keys or backups are never used |
 | not there | not there | beside the config, made there when first written |
 
-"This fleet's" is judged by `MACHINE_NAME_PREFIX`: a `keys/` holding `<prefix>_openrouter_keys.csv`
-(what `keys gen` writes) or a CSV row for a `<prefix>-…` machine; a `backup/` with a `<prefix>-…`
-pod one level down (`w1d2/<prefix>-apple`, `big/<prefix>-apple`). The plan is anyone's.
+"This fleet's" is judged by `MACHINE_NAME_PREFIX`: a `keys/` whose `openrouter_api_keys.csv` link
+points at `<prefix>_openrouter_keys.csv` (`keys gen` points it at its own fleet's file), or, with no
+link, that file or a CSV row for a `<prefix>-…` machine; a `backup/` with a `<prefix>-…` pod one
+level down (`w1d2/<prefix>-apple`, `big/<prefix>-apple`). The plan is anyone's. The read-only prod
+copy is the one exception, and only that file: another config in its folder follows these rules.
 
-With the read-only prod copy (`/home/dev/prod-ro/config.env`) they stay in the current directory,
-as before and without a warning: that folder holds only the config, and prod's cron runs in
-`/root`. `config which` lists all three with where each was found. An explicit
+With the read-only prod copy (`/home/dev/prod-ro/config.env` itself) they stay in the current
+directory, as before and without a warning: that folder holds only the config, and prod's cron runs
+in `/root`. `config which` lists all three with where each was found. An explicit
 `LOCAL_BACKUP_DIR` is used as written: make it absolute (cron and the reaper need that).
 
 ### `config check | set | which`

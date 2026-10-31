@@ -500,7 +500,7 @@ pub(crate) fn openrouter_keys_csv(cfg: &Config) -> PathBuf {
     PathBuf::from(keys_dir(cfg)).join(OPENROUTER_KEYS_LINK)
 }
 /// The OpenRouter keys CSV's file name, inside whichever keys dir is in use.
-pub(crate) const OPENROUTER_KEYS_LINK: &str = "openrouter_api_keys.csv";
+pub(crate) use arena_core::config::OPENROUTER_KEYS_LINK;
 
 /// Resolve which machines a `keys` action targets, with the shared selector. A key belongs
 /// to a *machine name*, which can exist before its pod (mint keys, then `up`) or after it

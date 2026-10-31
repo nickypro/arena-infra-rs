@@ -165,13 +165,14 @@ pub enum Found {
     /// fleet's files ([`holds_fleet`]): still used, with a warning ([`FleetFile::warning`]) naming
     /// where it belongs (`beside`).
     CurrentDir { beside: PathBuf },
-    /// Not beside the config, and the current directory's (`here`) holds nothing of this fleet's —
-    /// another fleet's, say, run from the same directory: not used (it would hand this fleet the
-    /// other's keys, or mix their backups). This fleet's is made beside the config, with a warning.
+    /// Not beside the config, and the current directory's (`here`) isn't this fleet's — another
+    /// fleet's, say, run from the same directory: not used (it would hand this fleet the other's
+    /// keys file, or mix their backups). This fleet's is made beside the config, with a warning.
     NotOurs { here: PathBuf },
     /// The current directory, as before and without a warning: there's no config file (a parsed
-    /// text), or it's the read-only prod copy ([`LEGACY_CONFIG`]), whose folder holds that one
-    /// file — prod's `keys/` and `./backup` are where its operators and its cron (in `/root`) run.
+    /// text), or it's the read-only prod copy itself ([`LEGACY_CONFIG`]), whose folder holds only
+    /// that file — prod's `keys/` and `./backup` are where its operators and its cron (in `/root`)
+    /// run. Another config in that folder is treated like any other.
     AsBefore,
 }
 
@@ -193,7 +194,7 @@ impl FleetFile {
                 beside.display()
             )),
             Found::NotOurs { here } => Some(format!(
-                "warning: not using {} in the current directory: nothing in it is this fleet's (MACHINE_NAME_PREFIX) — using {}",
+                "warning: not using {} in the current directory: it isn't this fleet's (by MACHINE_NAME_PREFIX) — using {}",
                 here.display(),
                 self.path.display()
             )),
@@ -222,8 +223,7 @@ impl FleetFile {
 /// ([`Found::AsBefore`]): the current directory, as before. Pure but for `exists` and `ours`.
 pub fn fleet_file(config: Option<&Path>, rel: &str, exists: impl Fn(&Path) -> bool, ours: impl Fn(&Path) -> bool) -> FleetFile {
     let here = Path::new(".").join(rel);
-    let legacy = Path::new(LEGACY_CONFIG).parent();
-    let Some(dir) = config.and_then(Path::parent).filter(|d| Some(*d) != legacy) else {
+    let Some(dir) = config.filter(|c| *c != Path::new(LEGACY_CONFIG)).and_then(Path::parent) else {
         return FleetFile { path: here, found: Found::AsBefore };
     };
     let beside = dir.join(rel);
@@ -238,22 +238,35 @@ pub fn fleet_file(config: Option<&Path>, rel: &str, exists: impl Fn(&Path) -> bo
     }
 }
 
-/// Whether `here` (the current directory's fleet file `rel`) holds the files of the fleet named
-/// `prefix` — so falling back to it can't hand one fleet another's keys or mix their backups (two
-/// fleets on one box, run from the same directory). `keys/`: this prefix's OpenRouter keys file
-/// (`<prefix>_openrouter_keys.csv`, what `keys gen` writes), or a CSV with a row for one of its
-/// machines (`<prefix>-…,`). `backup/`: one of its pods one level down (`<label>/<prefix>-…`,
-/// `big/<prefix>-…`). A plan names no fleet: any. Listings and the keys CSVs' host column only.
+/// The OpenRouter keys CSV the keys commands read and write, inside a keys dir: a link to the
+/// current fleet's `<prefix>_openrouter_keys.csv` (`keys gen` points it at its own).
+pub const OPENROUTER_KEYS_LINK: &str = "openrouter_api_keys.csv";
+
+/// Whether `here` (the current directory's fleet file `rel`) is the fleet named `prefix`'s — so
+/// falling back to it can't hand one fleet another's keys file or mix their backups (two fleets on
+/// one box, run from the same directory). `keys/`: its [`OPENROUTER_KEYS_LINK`] — what `keys
+/// which`, `rename`, `terminate --revoke-key` and `copy-keys` read, and `keys gen` re-points —
+/// points at this prefix's `<prefix>_openrouter_keys.csv`; with no link (an older layout), this
+/// prefix's file is there or a CSV has a row for one of its machines (`<prefix>-…,`). `backup/`:
+/// one of its pods one level down (`<label>/<prefix>-…`, `big/<prefix>-…`; pod folders are named
+/// per machine, so fleets don't overwrite each other's). A plan names no fleet: any. Listings, the
+/// link and the keys CSVs' host column only.
 pub fn holds_fleet(rel: &str, here: &Path, prefix: &str) -> bool {
     let mine = format!("{prefix}-");
     let entries = |dir: &Path| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect::<Vec<_>>();
     let named_mine = |p: &Path| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&mine));
     match rel {
         KEYS_DIR => {
-            here.join(format!("{prefix}_openrouter_keys.csv")).is_file()
-                || entries(here).iter().filter(|p| p.extension().is_some_and(|x| x == "csv")).any(|p| {
-                    std::fs::read_to_string(p).is_ok_and(|t| t.lines().any(|l| l.starts_with(&mine) && l.contains(',')))
-                })
+            let own = format!("{prefix}_openrouter_keys.csv");
+            match std::fs::read_link(here.join(OPENROUTER_KEYS_LINK)) {
+                Ok(target) => target.file_name().is_some_and(|n| n == own.as_str()),
+                Err(_) => {
+                    here.join(&own).is_file()
+                        || entries(here).iter().filter(|p| p.extension().is_some_and(|x| x == "csv")).any(|p| {
+                            std::fs::read_to_string(p).is_ok_and(|t| t.lines().any(|l| l.starts_with(&mine) && l.contains(',')))
+                        })
+                }
+            }
         }
         BACKUP_DIR => entries(here).iter().filter(|p| p.is_dir()).any(|d| entries(d).iter().any(|p| named_mine(p))),
         _ => true,
@@ -384,7 +397,8 @@ mod tests {
             (None, false, false, false, &here, Found::AsBefore),
             (prod, true, true, false, &here, Found::AsBefore),
             (prod, false, false, false, &here, Found::AsBefore),
-            (Some(Path::new("/home/dev/prod-ro/other.env")), false, false, false, &here, Found::AsBefore),
+            (Some(Path::new("/home/dev/prod-ro/p2.env")), false, true, false, Path::new("/home/dev/prod-ro/keys"), Found::NotOurs { here: here.clone() }),
+            (Some(Path::new("/home/dev/prod-ro/p2.env")), false, true, true, &here, Found::CurrentDir { beside: "/home/dev/prod-ro/keys".into() }),
             (Some(Path::new("/home/dev/prod-ro-copy/config.env")), false, false, false, Path::new("/home/dev/prod-ro-copy/keys"), Found::New),
         ];
         for (config, there, cwd, ours, want, found) in table {
@@ -393,9 +407,11 @@ mod tests {
         }
     }
 
-    /// The current directory's keys/ is this fleet's with its prefix's keys file, or a CSV row for
-    /// one of its machines; backup/ with one of its pods a level down; never on another prefix's
-    /// alone (`arena9-…` isn't `arena-…`'s). A plan is anyone's.
+    /// The current directory's keys/ is this fleet's when its keys link points at this prefix's
+    /// file — whichever fleet's files sit beside it (both fleets' here: review r2) — or, with no
+    /// link, when this prefix's file or a CSV row for one of its machines is there. backup/ with
+    /// one of its pods a level down. Never another prefix's alone (`arena9-…` isn't `arena-…`'s).
+    /// A plan is anyone's.
     #[test]
     fn whose_files_the_current_directory_holds() {
         let d = std::env::temp_dir().join(format!("arena-holds-fleet-{}", std::process::id()));
@@ -405,16 +421,23 @@ mod tests {
         std::fs::create_dir_all(backup.join("w1d2").join("arena9-apple")).unwrap();
         std::fs::create_dir_all(backup.join("big").join("arena9-apple")).unwrap();
         std::fs::write(keys.join("arena9_openrouter_keys.csv"), "# keys\narena9-apple,sk-or-x\n").unwrap();
-        let before = [holds_fleet(KEYS_DIR, &keys, "arena9"), holds_fleet(KEYS_DIR, &keys, "arena"), holds_fleet(BACKUP_DIR, &backup, "arena9"), holds_fleet(BACKUP_DIR, &backup, "arena")];
-        // A legacy CSV (no per-prefix file) with one of p2's machines; a p2 pod in a day's folder.
-        std::fs::write(keys.join("openrouter_api_keys.csv"), "p2-apple,sk-or-y\n").unwrap();
+        let no_link = [holds_fleet(KEYS_DIR, &keys, "arena9"), holds_fleet(KEYS_DIR, &keys, "arena"), holds_fleet(BACKUP_DIR, &backup, "arena9"), holds_fleet(BACKUP_DIR, &backup, "arena")];
+        // p2's file beside arena9's, the link at p2's (p2's `keys gen` ran last): only p2's now.
+        std::fs::write(keys.join("p2_openrouter_keys.csv"), "p2-apple,sk-or-y\n").unwrap();
+        std::os::unix::fs::symlink("p2_openrouter_keys.csv", keys.join(OPENROUTER_KEYS_LINK)).unwrap();
         std::fs::create_dir_all(backup.join("w1d3").join("p2-apple")).unwrap();
-        let after = [holds_fleet(KEYS_DIR, &keys, "p2"), holds_fleet(BACKUP_DIR, &backup, "p2"), holds_fleet(PLAN_FILE, &d.join(PLAN_FILE), "p2")];
-        let empty = holds_fleet(BACKUP_DIR, &d.join("nothing"), "p2");
+        let linked = [holds_fleet(KEYS_DIR, &keys, "p2"), holds_fleet(KEYS_DIR, &keys, "arena9"), holds_fleet(BACKUP_DIR, &backup, "p2")];
+        // An older layout: the CSV itself, no link, no per-prefix file — its rows say whose.
+        let old = d.join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join(OPENROUTER_KEYS_LINK), "p2-apple,sk-or-y\n").unwrap();
+        let legacy = [holds_fleet(KEYS_DIR, &old, "p2"), holds_fleet(KEYS_DIR, &old, "arena9")];
+        let (plan, empty) = (holds_fleet(PLAN_FILE, &d.join(PLAN_FILE), "p2"), holds_fleet(BACKUP_DIR, &d.join("nothing"), "p2"));
         let _ = std::fs::remove_dir_all(&d);
-        assert_eq!(before, [true, false, true, false]);
-        assert_eq!(after, [true, true, true]);
-        assert!(!empty);
+        assert_eq!(no_link, [true, false, true, false]);
+        assert_eq!(linked, [true, false, true]);
+        assert_eq!(legacy, [true, false]);
+        assert!(plan && !empty);
     }
 
     /// Only the current-directory fallback, and passing another fleet's over, warn: one line naming
@@ -429,7 +452,7 @@ mod tests {
         let f = fleet_file(Some(Path::new("/srv/p2/config.env")), KEYS_DIR, |p| p.starts_with("."), |_| false);
         assert_eq!(
             f.warning().as_deref(),
-            Some("warning: not using ./keys in the current directory: nothing in it is this fleet's (MACHINE_NAME_PREFIX) — using /srv/p2/keys")
+            Some("warning: not using ./keys in the current directory: it isn't this fleet's (by MACHINE_NAME_PREFIX) — using /srv/p2/keys")
         );
         for found in [Found::Beside, Found::New, Found::AsBefore] {
             assert_eq!(FleetFile { path: "x".into(), found }.warning(), None);

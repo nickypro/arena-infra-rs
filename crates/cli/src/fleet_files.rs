@@ -66,4 +66,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, (dir.join("keys").display().to_string(), "/srv/b".to_string(), dir.join("arena-plan.json")));
     }
+
+    /// What `keys gen` leaves in a keys dir (`ensure_cohort_keys_file`) is what the current-directory
+    /// fallback recognises as the fleet's: the link at its prefix's file, and no other prefix's.
+    #[test]
+    fn keys_gen_s_layout_is_what_the_fallback_recognises() {
+        use arena_core::config::holds_fleet;
+        let dir = std::env::temp_dir().join(format!("arena-fleet-files-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = crate::keys::ensure_cohort_keys_file(&dir, "p2").unwrap();
+        std::fs::write(&file, crate::keys::cohort_keys_header("p2")).unwrap();
+        let got = (holds_fleet(KEYS_DIR, &dir, "p2"), holds_fleet(KEYS_DIR, &dir, "arena9"));
+        crate::keys::ensure_cohort_keys_file(&dir, "arena9").unwrap();
+        let after = (holds_fleet(KEYS_DIR, &dir, "p2"), holds_fleet(KEYS_DIR, &dir, "arena9"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!((got, after), ((true, false), (false, true)), "the link says whose the dir is now");
+    }
 }

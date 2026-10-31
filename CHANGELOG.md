@@ -32,7 +32,7 @@ earlier).
   dashboard's add-pod form starts on it too. `config check` has a `PROVIDER` row.
 - `keys/`, `arena-plan.json` and `backup/` (where pods are copied when `LOCAL_BACKUP_DIR` is unset)
   are found next to the config file, whatever directory you run in. One found only in the current
-  directory is still used when it's this fleet's (its prefix's keys file or pods in it), with a
+  directory is still used when it's this fleet's (by prefix: its keys link, or its pods), with a
   one-line warning to move it; another fleet's is never used. `config which` lists all three with
   where each was found. With the prod copy, `/home/dev/prod-ro/config.env`, nothing moves: they stay
   in the current directory, as before.
