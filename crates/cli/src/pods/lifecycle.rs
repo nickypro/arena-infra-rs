@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arena_core::capability::Op;
 use arena_core::provider::{ContainerReset, Provider};
 use arena_core::remote::{Remote, PROBE_TIMEOUT};
 use arena_core::selector::Naming;
@@ -51,10 +52,16 @@ pub(crate) async fn handle_reimage(
         println!("(no pods to reimage)");
         return Ok(());
     }
+    let refs: Vec<&arena_core::Pod> = pods.iter().collect();
+    // A pod whose provider can't reimage (only RunPod can) refuses the whole selection, dry run
+    // or not — before the wipe gate and the confirm, which would only mislead: it used to fail
+    // there, after both, reading the pod's spec.
+    if let Some(r) = crate::pods::capable::refusal(provider, Op::Reimage, "reimage", &refs) {
+        anyhow::bail!("{r}");
+    }
     // A reimage resets the container — exactly what a lock is for ("cannot be stopped or
     // reset"). Refused here, up front, rather than left to an API refusal nobody has
     // verified for the reimage PATCH.
-    let refs: Vec<&arena_core::Pod> = pods.iter().collect();
     let locked = arena_core::lock::refusal("reimage", &refs, "");
     if let (Some(r), false) = (&locked, dry_run) {
         anyhow::bail!("{r}");
@@ -157,26 +164,12 @@ pub(crate) async fn handle_reimage(
 /// synced. A Hetzner VM kept its disk: only the sync. Pods that aren't stopped are said and
 /// left alone. A start the provider refuses (e.g. its host has no free GPU left) is
 /// reported per pod and fails the exit; the others carry on.
-/// The pods among `pods` whose backend has no stop at all ([`Provider::stop_support`] —
-/// Shadeform: an instance bills until it's deleted, so there's nothing to stop or start), each
-/// with why; then the rest. Pure (no request): `pods stop`/`start` skip the first and act on the
-/// second (review SF3).
-pub(crate) fn split_no_stop<'a>(provider: &dyn Provider, pods: Vec<&'a arena_core::Pod>) -> (Vec<(&'a arena_core::Pod, String)>, Vec<&'a arena_core::Pod>) {
-    let mut no_stop = Vec::new();
-    let mut rest = Vec::new();
-    for p in pods {
-        match provider.stop_support(p) {
-            Ok(()) => rest.push(p),
-            Err(e) => no_stop.push((
-                p,
-                match e {
-                    arena_core::Error::NotImplemented(m) => m,
-                    other => other.to_string(),
-                },
-            )),
-        }
-    }
-    (no_stop, rest)
+/// The pods among `pods` whose backend can't do `op` — `Op::Stop` / `Op::Start`: Shadeform has
+/// no stop (an instance bills until it's deleted, so there's nothing to stop or start) — each
+/// with why ([`Provider::supports`]); then the rest. Pure (no request): `pods stop`/`start` skip
+/// the first and act on the second (review SF3).
+pub(crate) fn split_no_stop<'a>(provider: &dyn Provider, op: Op, pods: Vec<&'a arena_core::Pod>) -> (Vec<(&'a arena_core::Pod, String)>, Vec<&'a arena_core::Pod>) {
+    crate::pods::capable::split_by(provider, op, pods)
 }
 
 pub(crate) fn names_of(no_stop: &[(&arena_core::Pod, String)]) -> Vec<String> {
@@ -217,7 +210,7 @@ pub(crate) async fn handle_start(
     let RestartOpts { no_setup, skip_proxy, dry_run, yes, .. } = opts;
     // A pod whose backend has no stop is never stopped, so there's nothing to start: said and
     // skipped — a selection of only such pods is refused (review SF3: never a veto on the rest).
-    let (no_stop, startable) = split_no_stop(provider, sel.pods.iter().collect());
+    let (no_stop, startable) = split_no_stop(provider, Op::Start, sel.pods.iter().collect());
     if startable.is_empty() && !no_stop.is_empty() {
         anyhow::bail!("{}", no_stop_refusal(&no_stop, "start"));
     }
@@ -358,6 +351,10 @@ pub(crate) async fn handle_terminate(
     if pods.is_empty() {
         println!("(no pods to terminate)");
         return Ok(());
+    }
+    // Every provider can terminate today; asked all the same, as every command asks.
+    if let Some(r) = crate::pods::capable::refusal(provider, Op::Terminate, "terminate", &pods.iter().collect::<Vec<_>>()) {
+        anyhow::bail!("{r}");
     }
     // Whose lock `--unlock` may lift: the one named pod, or (`--all`) a cohort pod's.
     let may_unlock = |p: &arena_core::Pod| target.is_some() || naming.is_cohort(&p.name);
@@ -912,6 +909,10 @@ pub(crate) async fn handle_restart(
     let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
     let pod = pods[arena_core::selector::resolve_one(&Naming::from_config(cfg), &pods, target)?].clone();
     let label = format!("{} (id={}, {})", pod.name, pod.id, pod.provider);
+    // Every provider can restart today; asked all the same, as every command asks.
+    if let Some(r) = crate::pods::capable::refusal(provider, Op::Restart, "restart", &[&pod]) {
+        anyhow::bail!("{r}");
+    }
     // A restart needs a running pod: RunPod v2 answers 409 for a stopped one, v1 answered
     // 2xx and left it stopped (then a 10-min endpoint wait) — live finding #15.
     if arena_core::status::is_stopped(&pod.status) {
@@ -1181,17 +1182,19 @@ mod tests {
         let fleet = arena_core::provider::build_fleet("runpod", &Config::parse("RUNPOD_API_KEY=r\nSHADEFORM_API_KEY=k"), false).unwrap();
         let sf = arena_core::Pod { name: "devtest-alpha".into(), provider: "shadeform".into(), ..Default::default() };
         let rp = arena_core::Pod { name: "devtest-bloom".into(), provider: "runpod".into(), ..Default::default() };
-        let (no_stop, rest) = super::split_no_stop(fleet.as_ref(), vec![&rp, &sf]);
-        assert_eq!((super::names_of(&no_stop), rest.iter().map(|p| p.name.as_str()).collect::<Vec<_>>()), (vec!["devtest-alpha".to_string()], vec!["devtest-bloom"]));
-        assert!(no_stop[0].1.starts_with("Shadeform has no stop") && no_stop[0].1.contains("arena pods terminate"), "{}", no_stop[0].1);
-        for what in ["stop", "start"] {
+        for (op, what) in [(super::Op::Stop, "stop"), (super::Op::Start, "start")] {
+            let (no_stop, rest) = super::split_no_stop(fleet.as_ref(), op, vec![&rp, &sf]);
+            assert_eq!((super::names_of(&no_stop), rest.iter().map(|p| p.name.as_str()).collect::<Vec<_>>()), (vec!["devtest-alpha".to_string()], vec!["devtest-bloom"]));
+            assert!(no_stop[0].1.starts_with("Shadeform has no stop"), "{}", no_stop[0].1);
             let r = super::no_stop_refusal(&no_stop, what);
             assert!(r.starts_with(&format!("can't {what} devtest-alpha — Shadeform has no stop")), "{r}");
+            let (none, all) = super::split_no_stop(fleet.as_ref(), op, vec![&rp]);
+            assert!(none.is_empty() && all.len() == 1);
         }
+        let (no_stop, _) = super::split_no_stop(fleet.as_ref(), super::Op::Stop, vec![&rp, &sf]);
+        assert!(no_stop[0].1.contains("arena pods terminate"), "the way out of a pod that bills: {}", no_stop[0].1);
         let left = super::no_stop_left(&no_stop).unwrap();
         assert!(left.starts_with("1 pod(s) still billing") && left.contains("devtest-alpha"), "{left}");
         assert_eq!(super::no_stop_left(&[]), None);
-        let (none, all) = super::split_no_stop(fleet.as_ref(), vec![&rp]);
-        assert!(none.is_empty() && all.len() == 1);
     }
 }

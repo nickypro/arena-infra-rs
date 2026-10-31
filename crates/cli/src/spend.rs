@@ -180,6 +180,12 @@ impl Provider for Tracked<'_> {
     fn describe(&self, spec: &PodSpec) -> String {
         self.inner.describe(spec)
     }
+    fn backend(&self) -> Option<arena_core::capability::Backend> {
+        self.inner.backend()
+    }
+    fn supports(&self, op: arena_core::capability::Op, pod: Option<&Pod>) -> arena_core::capability::Support {
+        self.inner.supports(op, pod)
+    }
     async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
         let pods = self.inner.list_pods().await?;
         self.remember(&pods);
@@ -223,9 +229,6 @@ impl Provider for Tracked<'_> {
         self.spend.event(&Event::Started { provider: self.provider_of(id).as_deref(), id });
         Ok(())
     }
-    fn stop_support(&self, pod: &Pod) -> arena_core::Result<()> {
-        self.inner.stop_support(pod)
-    }
     fn ready_deadline(&self, pod: &Pod) -> Option<std::time::Duration> {
         self.inner.ready_deadline(pod)
     }
@@ -242,17 +245,11 @@ impl Provider for Tracked<'_> {
     async fn rename_pod(&self, id: &str, new_name: &str) -> arena_core::Result<()> {
         self.inner.rename_pod(id, new_name).await
     }
-    fn rename_support(&self, pod: &Pod) -> arena_core::Result<()> {
-        self.inner.rename_support(pod)
-    }
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> arena_core::Result<()> {
         self.inner.reimage_pod(id, image, env).await
     }
     async fn authorize_ssh_keys(&self, pod: &Pod, keys: &[String]) -> arena_core::Result<()> {
         self.inner.authorize_ssh_keys(pod, keys).await
-    }
-    fn lock_support(&self, pod: &Pod) -> arena_core::Result<()> {
-        self.inner.lock_support(pod)
     }
     async fn set_locked(&self, id: &str, locked: bool) -> arena_core::Result<()> {
         self.inner.set_locked(id, locked).await
@@ -985,9 +982,9 @@ mod tests {
         assert!(row("hetzner").is_open() && row("hetzner").segs.iter().all(|g| g.running));
     }
 
-    /// Every method of the `Provider` trait is forwarded by [`Tracked`]: one it doesn't
-    /// override would answer with the trait's default (`pods rename` refusing every pod, say)
-    /// instead of the fleet's.
+    /// Every method of the `Provider` trait is forwarded by [`Tracked`] — and by `create`/`up`'s
+    /// `RecordingProvider`: one it doesn't override would answer with the trait's default
+    /// (`supports` saying yes to everything, say) instead of the fleet's.
     #[test]
     fn the_tracked_provider_forwards_every_provider_method() {
         let fns = |text: &str| -> Vec<String> {
@@ -1002,13 +999,14 @@ mod tests {
         let core = include_str!("../../core/src/provider/mod.rs");
         let start = core.find("pub trait Provider").expect("the trait");
         let end = start + core[start..].find("\n}\n").expect("its end");
-        let mine = include_str!("spend.rs");
-        let s = mine.find("impl Provider for Tracked").expect("the impl");
-        let e = s + mine[s..].find("\n}\n").expect("its end");
-        let forwarded = fns(&mine[s..e]);
         let required = fns(&core[start..end]);
-        assert!(required.len() > 20 && required.contains(&"rename_support".to_string()), "the trait read: {required:?}");
-        let missing: Vec<String> = required.into_iter().filter(|f| !forwarded.contains(f)).collect();
-        assert!(missing.is_empty(), "Tracked doesn't forward: {missing:?}");
+        assert!(required.len() > 20 && required.contains(&"supports".to_string()), "the trait read: {required:?}");
+        for (file, text, wrapper) in [("spend.rs", include_str!("spend.rs"), "Tracked"), ("pods/create.rs", include_str!("pods/create.rs"), "RecordingProvider")] {
+            let s = text.find(&format!("impl Provider for {wrapper}")).expect("the impl");
+            let e = s + text[s..].find("\n}\n").expect("its end");
+            let forwarded = fns(&text[s..e]);
+            let missing: Vec<&String> = required.iter().filter(|f| !forwarded.contains(f)).collect();
+            assert!(missing.is_empty(), "{wrapper} ({file}) doesn't forward: {missing:?}");
+        }
     }
 }

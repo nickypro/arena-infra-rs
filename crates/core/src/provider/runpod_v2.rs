@@ -85,6 +85,7 @@ use serde_json::{json, Map, Value};
 
 use super::runpod::{self, loose_f64, loose_string, GpuType};
 use super::{ContainerReset, Provider};
+use crate::capability::Backend;
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, ProviderErrorKind, Result};
 use crate::http::{judge, send_limited, status_error, Limits};
@@ -118,6 +119,14 @@ pub struct RunpodV2Provider {
 impl RunpodV2Provider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self { api_key: api_key.into(), client: Client::new(), account_keys: Mutex::new(None), endpoints: Mutex::new(EndpointMemo::default()) }
+    }
+
+    /// This backend with `client` for every request — under test, [`crate::http::offline_client`]:
+    /// nothing it sends can reach the real API.
+    #[cfg(test)]
+    pub(crate) fn with_client(mut self, client: Client) -> Self {
+        self.client = client;
+        self
     }
 
     /// Forget `id`'s remembered endpoint: this provider is about to stop, start, restart,
@@ -1166,6 +1175,10 @@ impl Provider for RunpodV2Provider {
         "runpod"
     }
 
+    fn backend(&self) -> Option<Backend> {
+        Some(Backend::Runpod)
+    }
+
     fn describe(&self, spec: &PodSpec) -> String {
         format!("{} [RunPod API v2]", runpod::describe_spec(spec))
     }
@@ -1269,10 +1282,6 @@ impl Provider for RunpodV2Provider {
         judge_rename(status, &text, new_name)
     }
 
-    fn rename_support(&self, _pod: &Pod) -> Result<()> {
-        Ok(())
-    }
-
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
         self.forget_endpoint(id);
         let url = pod_url(id, None)?;
@@ -1284,10 +1293,6 @@ impl Provider for RunpodV2Provider {
     async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
         let body = send(api_request(&self.client, &self.api_key, Method::GET, pod_url(id, None)?), "get pod").await?;
         Ok(parse_spec(&body))
-    }
-
-    fn lock_support(&self, _pod: &Pod) -> Result<()> {
-        Ok(())
     }
 
     async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {

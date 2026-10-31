@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use arena_core::capability::Op;
 use arena_core::provider::Provider;
 use arena_core::remote::{describe_error, Remote, PROBE_TIMEOUT};
 use arena_core::selector::Naming;
@@ -12,7 +13,6 @@ use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
 use crate::keys::{cohort_keys_file, cohort_keys_header, ensure_cohort_keys_file, machine_key_names, write_secret_file, KeyBook};
-use crate::pods::lock::lock_why;
 use crate::proxy::sync_proxy;
 use crate::{confirm, reap};
 
@@ -42,7 +42,7 @@ pub(crate) fn machine_name_note(renamed: &[&PlannedRename], pods: &[arena_core::
 /// `~/.name` on the pod — and the hostname of a VM named by it (Hetzner) — the OpenRouter key
 /// mapping, and the proxy (stable ports follow names). A container's `MACHINE_NAME` env var
 /// can't follow — env is fixed at create/reimage — so the summary says so where there is one.
-/// A pod whose backend can't rename ([`Provider::rename_support`]) is refused before anything
+/// A pod whose backend can't rename ([`Provider::supports`]) is refused before anything
 /// is asked. Nothing after the provider rename is fatal: the pods are renamed either way, so a
 /// pod that can't be reached or a key that can't be moved is reported.
 #[allow(clippy::too_many_arguments)]
@@ -70,7 +70,7 @@ pub(crate) async fn handle_rename(
         .iter()
         .filter_map(|r| {
             let pod = pods.iter().find(|p| p.id == r.id)?;
-            provider.rename_support(pod).err().map(|e| format!("{}: {}", r.old, lock_why(e)))
+            provider.supports(Op::Rename, Some(pod)).refusal().map(|why| format!("{} ({}): {why}", r.old, pod.provider))
         })
         .collect();
     if !unsupported.is_empty() {

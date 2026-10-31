@@ -19,6 +19,35 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-31 · arena 2.4: what works where — refused up front, greyed out in the dashboard
+- One table says which commands and create flags work on which provider (RunPod, RunPod v1, Vast,
+  Hetzner, Shadeform). Every command checks it for each selected pod before it asks anything, the
+  dashboard reads it, and so does the new "What works where" matrix in docs/REFERENCE.md and
+  FEATURE_MAP.md. A refusal names each pod that can't, why, and what to do instead.
+- `pods reimage` on a Hetzner, Vast or Shadeform pod is refused before the wipe gate and the
+  confirm. It used to ask both, then fail reading the pod's spec. A selection that mixes in such a
+  pod is refused whole, with the `--exclude` that leaves it out. `replace` and `migrate` on Vast
+  or Hetzner are also refused before anything is read. `migrate` on Shadeform is refused too: its
+  cutover could never pass there and reverted itself after about 45 s.
+- **A create flag the provider would ignore is refused now, not dropped.** That covers `--disk`,
+  `--cloud`, `--bootstrap` and `--max-price` on Hetzner; `--volume` (above 0) and `--bootstrap` on
+  Vast; `--cloud`, `--disk`, `--volume`, `--image` and `--bootstrap` on Shadeform. It applies to
+  `create`, `up`, `replace` and `migrate copy`. `--volume 0` is still accepted everywhere. This is
+  why the release is **arena 2.4** (a minor bump): a script that passed one of these flags now
+  stops.
+- The dashboard's action menu greys out what the pod's provider can't do, with the reason: stop
+  and start on a Shadeform pod. Picking one says the whole sentence. Its add-pod form sends only
+  what the provider's create takes: Vast, Shadeform and Hetzner get `--volume 0` (no volume)
+  instead of the form's size, and Shadeform no longer gets `--disk`.
+- Creating on Vast without a volume now warns that a restart or a stop may wipe the container
+  disk. It used to say "set VOLUME_GB", which Vast doesn't take.
+
+### Action needed
+- Restart running dashboards (`arena-tui`) after updating. An old dashboard's add-pod form still
+  sends `--volume` to Vast and `--disk` to Shadeform, and the new `arena` refuses those flags.
+- Check scripts and cron lines that pass one of the flags above to a provider that ignores it.
+  They now fail before anything is created; drop the flag.
+
 ## 2026-10-30 · The backups screen says when it can't read a copy; "backing up", not "backuping"
 - `arena backups` and the dashboard's backups screen: a snapshot folder entry whose type can't be
   read now makes the home-copy cell unknown (with the path and the error), instead of quietly

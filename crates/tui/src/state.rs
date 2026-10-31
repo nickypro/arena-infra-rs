@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use arena_core::balance::{self, AccountView, Level};
+use arena_core::capability::Op;
 use arena_core::openrouter::{CohortUsage, Fill};
 use arena_core::fleet::{self, FleetCost};
 use arena_core::health::{render_summary, PodHealth, Status};
@@ -1347,6 +1348,34 @@ impl Action {
         const SET_AI: &[(char, Action)] = &[('a', Action::KeyLimit), ('o', Action::KeyPause), ('O', Action::KeyResume)];
         let rows = Self::MENU.iter().copied().filter(|(_, a)| !a.cli() && (!a.marked_set_only() || has_marked));
         Self::with_ai_rows(rows, if ai && has_marked { SET_AI } else { &[] })
+    }
+
+    /// The operation of the capability table ([`arena_core::capability`]) this action is, where
+    /// its support differs between providers: the menus grey it out (with why) for a pod whose
+    /// provider can't do it, from the same answer the CLI refuses on. `None`: it only reaches the
+    /// pod over SSH (or the AI key), which every provider allows. Every action is listed — no
+    /// catch-all — so a new one can't skip the question (`Pull`, the backups screen's "copy home
+    /// now", is an rsync over SSH, like the dashboard's setup and backup).
+    pub fn op(&self) -> Option<Op> {
+        match self {
+            Action::Start => Some(Op::Start),
+            Action::Stop => Some(Op::Stop),
+            Action::Restart => Some(Op::Restart),
+            Action::Terminate => Some(Op::Terminate),
+            Action::Rename => Some(Op::Rename),
+            Action::Backup
+            | Action::Setup
+            | Action::Test
+            | Action::Run
+            | Action::SetBranch
+            | Action::Jobs
+            | Action::Logs
+            | Action::Pull
+            | Action::KeyLimit
+            | Action::KeyPause
+            | Action::KeyResume
+            | Action::KeyRotate => None,
+        }
     }
 
     /// One of the CLI's commands, run as `arena` (`runs.rs`).
