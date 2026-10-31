@@ -613,6 +613,40 @@ fn proc_locks_are_read_by_device_and_inode() {
     assert_eq!(locks::dev_parts(makedev(259, 3)), (259, 3));
 }
 
+/// `/proc/locks` comes a page at most per `read`, each read a pass of its own over the kernel's
+/// locks: it's read with reads far bigger than a page — one pass while it fits in one, never a
+/// 32-byte first read and a pass every few locks — and to its end however it's cut up.
+#[test]
+fn proc_locks_is_read_in_one_pass_while_it_fits_a_page() {
+    /// Hands `text` out as a seq file does: at most `page` bytes a call. Keeps each call's size.
+    struct SeqFile {
+        text: Vec<u8>,
+        at: usize,
+        page: usize,
+        asked: Vec<usize>,
+    }
+    impl std::io::Read for SeqFile {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.asked.push(buf.len());
+            let n = buf.len().min(self.page).min(self.text.len() - self.at);
+            buf[..n].copy_from_slice(&self.text[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+    let line = "1: FLOCK  ADVISORY  WRITE 2416 08:01:131090 0 EOF\n";
+    assert_eq!(line.len(), 50, "81 lines fit a 4 KiB page");
+    for (held, passes) in [(0, 0), (1, 1), (81, 1), (82, 2), (2000, 25)] {
+        let text = line.repeat(held);
+        let mut f = SeqFile { text: text.clone().into_bytes(), at: 0, page: 4096, asked: Vec::new() };
+        assert_eq!(locks::read_in_big_pieces(&mut f).unwrap(), text);
+        assert!(f.asked.iter().all(|&n| n >= locks::READ_SIZE), "{held}: {:?}", f.asked);
+        assert_eq!(f.asked.len(), passes + 1, "{held} locks: a pass per page, then the end");
+    }
+    let bad = SeqFile { text: vec![0xff], at: 0, page: 4096, asked: Vec::new() };
+    assert_eq!(locks::read_in_big_pieces(bad).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+}
+
 /// A lock held now reads as held — never taken to find out — and free once it's let go of.
 #[cfg(target_os = "linux")]
 #[test]
