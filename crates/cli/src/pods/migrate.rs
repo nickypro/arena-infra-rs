@@ -425,7 +425,7 @@ pub(crate) async fn migrate_copy_on(
                 }
                 println!("[1/3] taking {} as {new_name}…", o.pod.name);
                 adopt::take(owner, spares, cfg, o, &new_name).await?;
-                println!("      {} -> {new_name} (id={})", o.pod.name, o.pod.id);
+                println!("      {}", adopt::taken_line(o, &new_name));
                 (o.pod.id.clone(), o.spare)
             }
             None => {
@@ -541,8 +541,9 @@ async fn cutover_presence_refusal(remote: &dyn Remote, cfg: &Config, src: &arena
         &src.name,
         &presence,
         &format!(
-            "What they write after the final sync would stay behind on {}-old. Re-run once they're off (`arena pods              migrate copy {}` meanwhile keeps the copy fresh).",
-            src.name, src.name
+            "What they write after the final sync would stay behind on {name}-old. Re-run once they're off (`arena pods \
+             migrate copy {name}` meanwhile keeps the copy fresh).",
+            name = src.name
         ),
     )
 }

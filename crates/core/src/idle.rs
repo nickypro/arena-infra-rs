@@ -869,6 +869,8 @@ pub mod fixture {
 
 #[cfg(test)]
 mod tests {
+    use super::fixture::{v4, Reply};
+    use super::*;
 
     /// `replace` / `cutover` / `copy-home` ask whether anyone is on the machine NOW: a session
     /// besides the probe's, a Jupyter tab from outside, or an editor server running (it outlives
@@ -928,8 +930,6 @@ mod tests {
         assert_eq!(run("#!/bin/sh\nexit 1\n"), "-", "ps failed: can't tell");
         let _ = std::fs::remove_dir_all(&dir);
     }
-    use super::fixture::{v4, Reply};
-    use super::*;
 
     fn pod(name: &str, provider: &str, cost: Option<f64>) -> Pod {
         Pod {

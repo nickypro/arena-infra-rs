@@ -880,7 +880,7 @@ pub(crate) async fn replace_on(
         (None, Some(o)) => {
             println!("[1/7] taking {} as {new_name}…", o.pod.name);
             adopt::take(owner, job.spares, cfg, o, &new_name).await?;
-            println!("      {} -> {new_name} (id={})", o.pod.name, o.pod.id);
+            println!("      {}", adopt::taken_line(o, &new_name));
             (arena_core::Pod { name: new_name.clone(), ..o.pod.clone() }, o.spare)
         }
         (None, None) => anyhow::bail!("nothing to create or take"),

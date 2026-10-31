@@ -220,6 +220,20 @@ pub(crate) fn take_line(onto: &Onto, new_name: &str) -> String {
     }
 }
 
+/// The line once `onto` is taken as `new_name`: and for a machine that had a name of its own
+/// (not a spare), how to give it back if the move stops before the swap. Pure.
+pub(crate) fn taken_line(onto: &Onto, new_name: &str) -> String {
+    let p = &onto.pod;
+    if onto.spare {
+        format!("{} -> {new_name} (id={})", p.name, p.id)
+    } else {
+        format!(
+            "{} -> {new_name} (id={}); if this stops before the swap, `arena pods rename {new_name} {}` gives it its name back",
+            p.name, p.id, p.name
+        )
+    }
+}
+
 /// Take `onto` as `new_name`: a spare by [`SpareCloud::adopt`] (renamed + unmarked in one
 /// request), anything else by a rename. The reaper's record and the spend ledger follow
 /// (the row goes on under the canonical machine's owner: [`arena_core::spend::Event::Adopted`]).
@@ -274,6 +288,10 @@ mod tests {
             assert_eq!(someones_refusal(&cfg, "devtest-alpha", &Onto { pod: pod("4", name, "RUNNING"), spare }, &busy), None, "{name}");
         }
         assert!(whats_on(&Probe::Failed("exit 255: refused".into())).contains("couldn't tell"));
+        // Taken: a machine with a name of its own is told how to get it back; a spare isn't.
+        let bravo = Onto { pod: pod("2", "devtest-bravo", "RUNNING"), spare: false };
+        assert!(taken_line(&bravo, "devtest-alpha-new").ends_with("`arena pods rename devtest-alpha-new devtest-bravo` gives it its name back"));
+        assert_eq!(taken_line(&Onto { pod: pod("9", "devtest-spare-1", "RUNNING"), spare: true }, "devtest-alpha-new"), "devtest-spare-1 -> devtest-alpha-new (id=9)");
         let quiet = Probe::Read(idle::parse_reply(&Reply::default().render()).unwrap());
         assert!(whats_on(&quiet).starts_with("no one on it right now; its newest file changed 9h ago"), "{}", whats_on(&quiet));
     }
