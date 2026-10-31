@@ -78,6 +78,19 @@ pub fn fleet_volumes(all: &[CloudVolume]) -> Vec<CloudVolume> {
     all.iter().filter(|v| !is_archive(v)).cloned().collect()
 }
 
+/// The volumes this cohort may act on (grow, detach, delete, count): the ones `pods volume add`
+/// made for it (its label), and any attached to one of its VMs (`fleet_ids`, the Hetzner
+/// servers its listing shows — a volume attached by hand bills it the same). Never the
+/// archive's, never another cohort's or an unlabelled one lying detached in a shared project
+/// (review: its teardown would have printed their deletes). Pure.
+pub fn cohort_volumes(all: &[CloudVolume], prefix: &str, fleet_ids: &[String]) -> Vec<CloudVolume> {
+    all.iter()
+        .filter(|v| !is_archive(v))
+        .filter(|v| is_ours(v, prefix) || v.server.is_some_and(|s| fleet_ids.contains(&s.to_string())))
+        .cloned()
+        .collect()
+}
+
 /// The volumes attached to server `id`. Pure.
 pub fn attached_to<'a>(all: &'a [CloudVolume], server_id: &str) -> Vec<&'a CloudVolume> {
     all.iter().filter(|v| v.server.is_some_and(|s| s.to_string() == server_id)).collect()
@@ -154,11 +167,17 @@ pub fn device(v: &CloudVolume) -> String {
     }
 }
 
-/// The fstab line arena keeps for a volume: by its stable device path, `nofail` (a detached
-/// volume never drops the VM into emergency mode), a device wait bounded at 30 s. Pure.
+/// The fstab line arena keeps for a volume: by its stable device path, its filesystem told by
+/// the kernel (`auto`: ext4 as arena makes them, xfs or another one attached by hand — review),
+/// `nofail` (a detached volume never drops the VM into emergency mode), a device wait bounded at
+/// 30 s. Pure.
 pub fn fstab_line(device: &str, mount: &str) -> String {
-    format!("{device} {mount} ext4 discard,nofail,defaults,x-systemd.device-timeout=30s 0 2")
+    format!("{device} {mount} auto discard,nofail,defaults,x-systemd.device-timeout=30s 0 2")
 }
+
+/// The lock every fstab change on a VM takes (two volume steps at once never lose each other's
+/// line — review): `flock` on a file in `/run`, waited for up to 30 s.
+const FSTAB_LOCK: &str = "exec 9>/run/arena-fstab.lock && flock -w 30 9";
 
 /// Rewrite /etc/fstab without any line for `device`, then (`Some`) with `line` — atomically,
 /// through a temp file beside it. Shell, for the scripts below.
@@ -198,6 +217,7 @@ pub fn mount_script(device: &str, mount: &str) -> String {
     let line = fstab_line(device, mount);
     format!(
         "set -u; dev={dev}; mnt={mnt}\n\
+         {lock} || {{ echo \"ARENA_VOL_FAIL another volume step holds /etc/fstab\"; exit 1; }}\n\
          real=$(readlink -f \"$dev\" 2>/dev/null || true)\n\
          if [ -n \"$real\" ] && [ -e \"$real\" ] && findmnt -rn -S \"$real\" -T \"$mnt\" >/dev/null 2>&1 && [ \"$(findmnt -rn -o TARGET -T \"$mnt\")\" = \"$mnt\" ]; then\n\
          \x20 echo \"ARENA_VOL_MOUNTED $(df -P -B1 \"$mnt\" | awk 'NR==2{{print $2}}')\"; exit 0\n\
@@ -205,6 +225,7 @@ pub fn mount_script(device: &str, mount: &str) -> String {
          if mountpoint -q \"$mnt\" 2>/dev/null; then echo \"ARENA_VOL_FAIL $mnt is a mount point of something else ($(findmnt -rn -o SOURCE -T \"$mnt\"))\"; exit 1; fi\n\
          if [ -d \"$mnt\" ] && [ -n \"$(ls -A \"$mnt\" 2>/dev/null)\" ]; then echo \"ARENA_VOL_FAIL $mnt holds files (mounting over them would hide them)\"; exit 1; fi\n\
          if [ -e \"$mnt\" ] && [ ! -d \"$mnt\" ]; then echo \"ARENA_VOL_FAIL $mnt is a file, not a directory\"; exit 1; fi\n\
+         if awk -v m=\"$mnt\" -v d=\"$dev\" '$2 == m && $1 != d {{ f = 1 }} END {{ exit !f }}' /etc/fstab 2>/dev/null; then echo \"ARENA_VOL_FAIL /etc/fstab mounts another device at $mnt\"; exit 1; fi\n\
          mkdir -p \"$mnt\" || {{ echo \"ARENA_VOL_FAIL couldn't make $mnt\"; exit 1; }}\n\
          {fstab} || {{ echo \"ARENA_VOL_FAIL couldn't rewrite /etc/fstab\"; exit 1; }}\n\
          i=0; while [ ! -e \"$dev\" ] && [ \"$i\" -lt {tries} ]; do sleep 2; i=$((i + 1)); done\n\
@@ -214,6 +235,7 @@ pub fn mount_script(device: &str, mount: &str) -> String {
          echo \"ARENA_VOL_MOUNTED $(df -P -B1 \"$mnt\" | awk 'NR==2{{print $2}}')\"",
         dev = q(device),
         mnt = q(mount),
+        lock = FSTAB_LOCK,
         fstab = fstab_rewrite(device, Some(&line)),
         tries = DEVICE_WAIT_SECS / 2,
     )
@@ -294,6 +316,7 @@ pub fn parse_grow(stdout: &str) -> std::result::Result<Option<u64>, String> {
 pub fn unmount_script(device: &str) -> String {
     format!(
         "set -u; dev={dev}; sync\n\
+         {lock} || {{ echo \"ARENA_VOL_FAIL another volume step holds /etc/fstab\"; exit 1; }}\n\
          real=$(readlink -f \"$dev\" 2>/dev/null || true)\n\
          if [ -n \"$real\" ] && [ -e \"$real\" ]; then\n\
          \x20 for m in $(findmnt -rn -o TARGET -S \"$real\" 2>/dev/null); do\n\
@@ -303,6 +326,7 @@ pub fn unmount_script(device: &str) -> String {
          {fstab} || {{ echo \"ARENA_VOL_FAIL couldn't rewrite /etc/fstab\"; exit 1; }}\n\
          echo ARENA_VOL_UNMOUNTED",
         dev = q(device),
+        lock = FSTAB_LOCK,
         fstab = fstab_rewrite(device, None),
     )
 }
@@ -325,24 +349,81 @@ pub fn parse_unmount(stdout: &str) -> std::result::Result<(), String> {
     Err(format!("no answer from the unmount step ({})", stdout.lines().last().unwrap_or("nothing").trim()))
 }
 
+/// A shell condition that holds when volume `device` is what's mounted at `mount` (and `mount`
+/// is a mount point of its own). Pure.
+pub fn mounted_condition(device: &str, mount: &str) -> String {
+    format!(
+        "[ \"$(findmnt -rn -o TARGET -T {m} 2>/dev/null)\" = {m} ] && [ \"$(findmnt -rn -o SOURCE -T {m} 2>/dev/null)\" = \"$(readlink -f {d} 2>/dev/null)\" ]",
+        m = q(mount.trim_end_matches('/')),
+        d = q(device)
+    )
+}
+
+/// Where a volume copy keeps what it replaces on the receiving volume: a visible folder at its
+/// root, one per sync (`stamp`), never mirrored away.
+pub const COPY_KEPT_DIR: &str = "arena-sync-kept";
+
 /// The direct copy of a volume's files from one VM to another — run on the source, pushing its
-/// `mount` into the destination's `mount` (each VM's own volume mounted there): everything,
-/// mirrored (`--delete`; the destination's volume holds nothing of its own), owners kept. The
-/// destination's rsync runs behind `dest_guard` (its own id). Pure.
-pub fn copy_command(dest_ip: &str, dest_port: u16, dest_user: &str, remote_key: &str, mount: &str, dest_guard: Option<&str>) -> String {
+/// `mount` into the destination's `mount`. Each side runs only with ITS volume mounted there
+/// (`src_device`, `dest_device`: checked on the source before, and by the destination's
+/// `--rsync-path` with its own id `dest_identity`), so it never reads or writes the disk under
+/// an unmounted path. Mirrored (`--delete`), owners kept; whatever it would overwrite or delete
+/// on the destination's volume is moved into `<mount>/arena-sync-kept/<stamp>/` there, never
+/// destroyed (work made on the new VM's volume between syncs — review), and that folder is never
+/// mirrored. Pure.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_command(
+    dest_ip: &str,
+    dest_port: u16,
+    dest_user: &str,
+    remote_key: &str,
+    mount: &str,
+    src_device: &str,
+    dest_device: &str,
+    dest_identity: Option<&str>,
+    stamp: &str,
+) -> String {
     let ssh = format!(
         "ssh -p {dest_port} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
          -o ConnectTimeout={} -o ServerAliveInterval=30 -i {remote_key}",
         crate::pull::POD_TO_POD_CONNECT_TIMEOUT_SECS
     );
-    let rsync_path = dest_guard.map(|g| format!(" --rsync-path={}", q(&crate::replica::guarded_rsync_path(g)))).unwrap_or_default();
     let m = mount.trim_end_matches('/');
+    let dest_cond = match dest_identity {
+        Some(id) => format!("{id} && {}", mounted_condition(dest_device, m)),
+        None => mounted_condition(dest_device, m),
+    };
     format!(
-        "mountpoint -q {mq} || {{ echo '{m} is not mounted here' >&2; exit 1; }}; rsync -aHAX --delete --numeric-ids{rsync_path} -e {} {mq}/ {}",
-        q(&ssh),
-        q(&format!("{dest_user}@{dest_ip}:{m}/")),
+        "{src} || {{ echo '{m} here is not the volume to copy (not mounted?)' >&2; exit 1; }}; rsync -aHAX --delete --numeric-ids \
+         --backup --backup-dir={kept} --exclude=/{COPY_KEPT_DIR}/ --rsync-path={rp} -e {e} {mq}/ {to}",
+        src = mounted_condition(src_device, m),
+        kept = q(&format!("{COPY_KEPT_DIR}/{stamp}")),
+        rp = q(&crate::replica::guarded_rsync_path(&dest_cond)),
+        e = q(&ssh),
         mq = q(m),
+        to = q(&format!("{dest_user}@{dest_ip}:{m}/")),
     )
+}
+
+/// What a migration knows about its volumes between its commands (`migrate copy`, `cutover`,
+/// `revert`, `finish`), kept in the state dir per machine: where they're mounted (read while the
+/// original ran — a cutover from a stopped one can't ask), the copies that finished, and what a
+/// cutover moved (what a revert moves back — and nothing else).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MoveRecord {
+    /// The original's server id the record is about.
+    pub src: String,
+    /// Volume id → where it's mounted on the original.
+    #[serde(default)]
+    pub mounts: std::collections::BTreeMap<u64, String>,
+    /// Original volume id → its copy's id, for every copy whose last sync finished.
+    #[serde(default)]
+    pub copied: std::collections::BTreeMap<u64, u64>,
+    /// The volumes a cutover moved, and the server they moved to.
+    #[serde(default)]
+    pub moved: Vec<u64>,
+    #[serde(default)]
+    pub moved_to: Option<String>,
 }
 
 /// The volume price per GB-month at Hetzner (gross, the account's currency), from `/pricing`,
@@ -486,7 +567,8 @@ mod tests {
         let fstab = dir.join("fstab");
         let dev = "/dev/disk/by-id/scsi-0HC_Volume_42";
         std::fs::write(&fstab, format!("UUID=abc / ext4 defaults 0 1\n{dev} /mnt/old ext4 nofail 0 2\n")).unwrap();
-        let rewrite = |s: String| s.replace("/etc/fstab", &fstab.display().to_string());
+        let lock = dir.join("fstab.lock");
+        let rewrite = |s: String| s.replace("/etc/fstab", &fstab.display().to_string()).replace("/run/arena-fstab.lock", &lock.display().to_string());
         let run = |script: &str| {
             let out = std::process::Command::new("sh").arg("-c").arg(script).output().unwrap();
             assert!(out.status.success(), "{script}\n{}", String::from_utf8_lossy(&out.stderr));
@@ -507,16 +589,52 @@ mod tests {
         let said = parse_mount(&String::from_utf8_lossy(&out.stdout));
         assert!(matches!(&said, Mounted::Failed(w) if w.contains("holds files")), "{said:?}");
         assert_eq!(std::fs::read_to_string(&fstab).unwrap(), "UUID=abc / ext4 defaults 0 1\n", "fstab untouched");
+        // Another device in fstab at that mount point: refused (review: never two at one place).
+        std::fs::remove_file(mnt.join("theirs.txt")).unwrap();
+        std::fs::write(&fstab, format!("UUID=abc / ext4 defaults 0 1\n/dev/sdz {} ext4 nofail 0 2\n", mnt.display())).unwrap();
+        let out = std::process::Command::new("sh").arg("-c").arg(rewrite(mount_script(dev, &mnt.display().to_string()))).output().unwrap();
+        let said = parse_mount(&String::from_utf8_lossy(&out.stdout));
+        assert!(matches!(&said, Mounted::Failed(w) if w.contains("mounts another device")), "{said:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_copy_runs_on_the_source_into_the_destinations_own_mount() {
-        let c = copy_command("10.0.0.2", 22, "root", "/root/.ssh/id_ed25519", "/mnt/data/", Some("[ x = y ]"));
-        assert!(c.starts_with("mountpoint -q '/mnt/data' ||"), "{c}");
-        assert!(c.contains("rsync -aHAX --delete --numeric-ids --rsync-path="), "{c}");
+        let (src, dst) = ("/dev/disk/by-id/scsi-0HC_Volume_1", "/dev/disk/by-id/scsi-0HC_Volume_2");
+        let c = copy_command("10.0.0.2", 22, "root", "/root/.ssh/id_ed25519", "/mnt/data/", src, dst, Some("[ x = y ]"), "S1");
+        assert!(c.starts_with(&mounted_condition(src, "/mnt/data")), "the source's own volume, checked first: {c}");
+        assert!(c.contains("rsync -aHAX --delete --numeric-ids --backup --backup-dir='arena-sync-kept/S1' --exclude=/arena-sync-kept/"), "{c}");
+        assert!(c.contains("[ x = y ] &&") && c.contains("scsi-0HC_Volume_2"), "the destination's id and volume, in its rsync-path: {c}");
         assert!(c.ends_with("'/mnt/data'/ 'root@10.0.0.2:/mnt/data/'"), "{c}");
         assert!(c.contains("-i /root/.ssh/id_ed25519"), "{c}");
+    }
+
+    /// The mounted check, for real: a path that isn't a mount point of its own fails it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_path_that_isnt_the_volume_fails_the_mounted_check() {
+        let dir = std::env::temp_dir().join(format!("arena-datavol-mnt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(mounted_condition("/dev/disk/by-id/scsi-0HC_Volume_1", &dir.display().to_string()))
+            .status()
+            .unwrap()
+            .success();
+        assert!(!ok, "a plain directory is no volume");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cohort_acts_on_its_own_volumes_only() {
+        let ours = vol(1, "devtest-alpha-data", 10, None, &[(LABEL, "devtest")]);
+        let theirs = vol(2, "arena9-apple-data", 10, None, &[(LABEL, "arena9")]);
+        let by_hand_on_ours = vol(3, "scratch", 20, Some(7), &[]);
+        let by_hand_loose = vol(4, "loose", 20, None, &[]);
+        let archive = vol(5, "devtest-archive-snap", 100, Some(7), &[(crate::archive::LABEL_KEY, "devtest")]);
+        let all = [ours, theirs, by_hand_on_ours, by_hand_loose, archive];
+        let got: Vec<u64> = cohort_volumes(&all, "devtest", &["7".into()]).iter().map(|v| v.id).collect();
+        assert_eq!(got, [1, 3]);
     }
 
     #[test]

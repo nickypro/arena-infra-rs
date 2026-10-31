@@ -16,7 +16,6 @@ use arena_core::{Config, Pod};
 use clap::Subcommand;
 
 use crate::confirm;
-use crate::pods::home_copy::pod_guard;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum VolumeCmd {
@@ -111,6 +110,16 @@ pub(crate) async fn handle_volume(cmd: VolumeCmd, remote: Arc<dyn Remote>, fleet
     volume_on(cmd, remote, fleet, &cloud, cfg, yes).await
 }
 
+/// This cohort's volumes ([`datavol::cohort_volumes`]: its label, or on one of its VMs) and the
+/// project's other ones (never acted on here), from one listing of each.
+async fn cohort(cloud: &dyn VolumeCloud, prefix: &str, pods: &[Pod]) -> Result<(Vec<CloudVolume>, Vec<CloudVolume>)> {
+    let all = datavol::fleet_volumes(&cloud.all_volumes().await.context("listing the volumes")?);
+    let ids: Vec<String> = pods.iter().filter(|p| p.provider == "hetzner").map(|p| p.id.clone()).collect();
+    let ours = datavol::cohort_volumes(&all, prefix, &ids);
+    let others = all.into_iter().filter(|v| !ours.iter().any(|o| o.id == v.id)).collect();
+    Ok((ours, others))
+}
+
 /// One VM by the shared single-pod matcher.
 fn one_pod(cfg: &Config, pods: &[Pod], target: &str) -> Result<Pod> {
     let naming = Naming::from_config(cfg);
@@ -129,13 +138,24 @@ fn usable(fleet: &dyn Provider, pod: &Pod, verb: &str) -> Result<u64> {
     pod.id.parse::<u64>().map_err(|_| anyhow::anyhow!("{} (id {}) isn't a Hetzner server", pod.name, pod.id))
 }
 
+/// The identity check for `pod`, by ITS provider (the fleet provider a command holds may be
+/// named after another: `--provider`'s — live, a RunPod check refused a Hetzner VM).
+fn guard(pod: &Pod) -> Option<String> {
+    arena_core::replica::pod_identity(&pod.provider, &pod.id)
+}
+
 /// Run `script` as root on `pod`, behind its own identity check; its stdout.
-async fn on_vm(remote: &dyn Remote, cfg: &Config, provider: &dyn Provider, pod: &Pod, script: &str) -> Result<String> {
+async fn on_vm(remote: &dyn Remote, cfg: &Config, _fleet: &dyn Provider, pod: &Pod, script: &str) -> Result<String> {
     let target = SshTarget::from_pod(pod, cfg)?;
-    let cmd = arena_core::replica::guarded(pod_guard(provider, &pod.id).as_deref(), script);
+    let cmd = arena_core::replica::guarded(guard(pod).as_deref(), script);
     let out = remote.exec(&target, &cmd, Some(STEP_TIMEOUT)).await.with_context(|| format!("reaching {}", pod.name))?;
     if out.code == Some(arena_core::replica::WRONG_POD_EXIT) {
         anyhow::bail!("{}'s address answered as another machine — nothing was done there", pod.name);
+    }
+    // A step that failed without saying how (ssh itself, a shell that never ran it) is no
+    // answer — never read as "nothing there" (a mount point would fall back to the default).
+    if !out.success && !out.stdout.contains("ARENA_VOL_") {
+        anyhow::bail!("{} didn't answer the volume step: {}", pod.name, crate::pods::home_copy::copy_failure_reason(&out.stderr));
     }
     Ok(out.stdout)
 }
@@ -230,19 +250,27 @@ pub(crate) async fn volume_on(cmd: VolumeCmd, remote: Arc<dyn Remote>, fleet: &d
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
     match cmd {
         VolumeCmd::List { json } => {
-            let all = datavol::fleet_volumes(&cloud.all_volumes().await.context("listing the volumes")?);
+            let pods = fleet.list_pods().await.context("listing the fleet")?;
+            let (all, others) = cohort(cloud, &prefix, &pods).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&all)?);
                 return Ok(());
             }
             if all.is_empty() {
                 println!("no volumes (`arena pods volume add <name> <GB>` makes one)");
-                return Ok(());
+            } else {
+                let names = |id: u64| pods.iter().find(|p| p.provider == "hetzner" && p.id == id.to_string()).map(|p| p.name.clone());
+                let price = datavol::price_gb_month(cloud).await;
+                print!("{}", datavol::render(&all, &names, price));
             }
-            let pods = fleet.list_pods().await.unwrap_or_default();
-            let names = |id: u64| pods.iter().find(|p| p.provider == "hetzner" && p.id == id.to_string()).map(|p| p.name.clone());
-            let price = datavol::price_gb_month(cloud).await;
-            print!("{}", datavol::render(&all, &names, price));
+            if !others.is_empty() {
+                println!(
+                    "({} other volume(s) in the project aren't this cohort's — no `{}={prefix}` label, not on its VMs: {})",
+                    others.len(),
+                    datavol::LABEL,
+                    others.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(", ")
+                );
+            }
             Ok(())
         }
         VolumeCmd::Add { name, gb, mount, dry_run } => {
@@ -315,26 +343,35 @@ pub(crate) async fn volume_on(cmd: VolumeCmd, remote: Arc<dyn Remote>, fleet: &d
         }
         VolumeCmd::Grow { name, gb, volume, dry_run } => {
             let pods = fleet.list_pods().await.context("listing the fleet")?;
-            let all = cloud.all_volumes().await.context("listing the volumes")?;
+            let (all, _) = cohort(cloud, &prefix, &pods).await?;
             let v = match one_pod(cfg, &pods, &name) {
                 Ok(pod) => pod_volume(&all, &pod, volume.as_deref())?,
                 Err(_) => find_volume(cfg, &all, &pods, &name, false)?,
             };
             datavol::check_size(gb).map_err(anyhow::Error::msg)?;
-            if gb <= v.size_gb {
-                anyhow::bail!("{} is {} GB already — a Hetzner volume only grows (pass more than {} GB)", v.name, v.size_gb, v.size_gb);
+            if gb < v.size_gb {
+                anyhow::bail!("{} is {} GB — a Hetzner volume only grows (pass more than {} GB)", v.name, v.size_gb, v.size_gb);
             }
+            // The size it has: only the filesystem grows (a retry after a failed filesystem step).
+            let fs_only = gb == v.size_gb;
             let pod = v.server.and_then(|s| pods.iter().find(|p| p.provider == "hetzner" && p.id == s.to_string())).cloned();
             if let Some(p) = &pod {
                 usable(fleet, p, "grow a volume on")?;
             }
             let price = datavol::price_gb_month(cloud).await;
             let plan = format!(
-                "grow {} from {} GB to {gb} GB (≈ {} → {}){}",
-                v.name,
-                v.size_gb,
-                eur_month(f64::from(v.size_gb) * price),
-                eur_month(f64::from(gb) * price),
+                "{}{}",
+                if fs_only {
+                    format!("grow {}'s filesystem to its {gb} GB (Hetzner has that size already)", v.name)
+                } else {
+                    format!(
+                        "grow {} from {} GB to {gb} GB (≈ {} → {})",
+                        v.name,
+                        v.size_gb,
+                        eur_month(f64::from(v.size_gb) * price),
+                        eur_month(f64::from(gb) * price)
+                    )
+                },
                 match &pod {
                     Some(p) => format!(", then its filesystem on {} (online)", p.name),
                     None => " — not attached to a fleet VM: its filesystem grows the next time it's mounted and grown".to_string(),
@@ -348,9 +385,11 @@ pub(crate) async fn volume_on(cmd: VolumeCmd, remote: Arc<dyn Remote>, fleet: &d
                 println!("aborted.");
                 return Ok(());
             }
-            let a = cloud.resize(v.id, gb).await.context("resizing the volume")?;
-            wait_all(cloud, &[a], "resize the volume").await?;
-            println!("[resized] {} to {gb} GB at Hetzner", v.name);
+            if !fs_only {
+                let a = cloud.resize(v.id, gb).await.context("resizing the volume")?;
+                wait_all(cloud, &[a], "resize the volume").await?;
+                println!("[resized] {} to {gb} GB at Hetzner", v.name);
+            }
             let Some(p) = pod else { return Ok(()) };
             match datavol::parse_grow(&on_vm(remote.as_ref(), cfg, fleet, &p, &datavol::grow_script(&datavol::device(&v))).await?) {
                 Ok(bytes) => {
@@ -358,8 +397,8 @@ pub(crate) async fn volume_on(cmd: VolumeCmd, remote: Arc<dyn Remote>, fleet: &d
                     Ok(())
                 }
                 Err(why) => anyhow::bail!(
-                    "{} is {gb} GB at Hetzner, but its filesystem on {} didn't grow: {why} (`arena pods volume grow {} {gb}` again \
-                     retries that step)",
+                    "{} is {gb} GB at Hetzner, but its filesystem on {} didn't grow: {why} (`arena pods volume grow {} {gb}` \
+                     retries that step alone)",
                     v.name,
                     p.name,
                     v.name
@@ -368,7 +407,7 @@ pub(crate) async fn volume_on(cmd: VolumeCmd, remote: Arc<dyn Remote>, fleet: &d
         }
         VolumeCmd::Detach { name, force, dry_run } => {
             let pods = fleet.list_pods().await.context("listing the fleet")?;
-            let all = datavol::fleet_volumes(&cloud.all_volumes().await.context("listing the volumes")?);
+            let (all, _) = cohort(cloud, &prefix, &pods).await?;
             let v = find_volume(cfg, &all, &pods, &name, true)?;
             let Some(server) = v.server else {
                 println!("{} isn't attached to anything — nothing to do.", v.name);
@@ -396,7 +435,7 @@ pub(crate) async fn volume_on(cmd: VolumeCmd, remote: Arc<dyn Remote>, fleet: &d
         }
         VolumeCmd::Delete { name, force, dry_run } => {
             let pods = fleet.list_pods().await.context("listing the fleet")?;
-            let all = datavol::fleet_volumes(&cloud.all_volumes().await.context("listing the volumes")?);
+            let (all, _) = cohort(cloud, &prefix, &pods).await?;
             let v = find_volume(cfg, &all, &pods, &name, false)?;
             if v.delete_protected {
                 anyhow::bail!("{} is delete-protected at Hetzner — lift that in its console first (arena never does)", v.name);
@@ -514,7 +553,7 @@ pub(crate) async fn delete_after_terminate(cloud: &dyn VolumeCloud, volumes: &[C
 // ---------------------------------------------------------------------------------------
 
 /// The label on a volume made to hold a copy of another (a move to another location): the
-/// original's id — how a re-run finds its copy, and a revert knows it isn't the original.
+/// original's id — how a re-run finds its copy.
 pub(crate) const COPY_OF_LABEL: &str = "arena-volume-copy-of";
 
 /// What happens to the source's volumes when a VM is replaced: none to carry, moved (detach
@@ -545,8 +584,8 @@ pub(crate) fn carry(vols: Vec<CloudVolume>, new_location: Option<&str>) -> Carry
     }
 }
 
-/// The source's volumes (`src`: a Hetzner VM), the copies a migration made aside. Empty
-/// without a volume API (not Hetzner, no key).
+/// The source's volumes (`src`: a Hetzner VM): the ones attached to it (the archive's never).
+/// Empty without a volume API (not Hetzner, no key).
 pub(crate) async fn source_volumes(cloud: Option<&dyn VolumeCloud>, src: &Pod) -> Result<Vec<CloudVolume>> {
     let Some(cloud) = cloud.filter(|_| src.provider == "hetzner") else { return Ok(Vec::new()) };
     let all = datavol::fleet_volumes(&cloud.all_volumes().await.context("listing the volumes")?);
@@ -566,8 +605,88 @@ pub(crate) fn plan_line(vols: &[CloudVolume]) -> Option<String> {
     ))
 }
 
-/// Where volume `v` is mounted on `pod` (its fstab line, else the live mount), else the default.
-async fn mount_of(remote: &dyn Remote, cfg: &Config, owner: &dyn Provider, pod: &Pod, v: &CloudVolume) -> Result<String> {
+pub(crate) use arena_core::datavol::MoveRecord;
+
+/// `<state dir>/volume-moves/<machine>.json` — in this crate's tests without ARENA_STATE_DIR, a
+/// temp dir of the process's (never the real state dir).
+fn record_path(cfg: &Config, canonical: &str) -> Option<std::path::PathBuf> {
+    let dir = if cfg!(test) && cfg.get("ARENA_STATE_DIR").is_none() {
+        std::env::temp_dir().join(format!("arena-volume-moves-{}", std::process::id()))
+    } else {
+        arena_core::snapshot::state_dir_for(cfg).ok()?.join("volume-moves")
+    };
+    Some(dir.join(format!("{canonical}.json")))
+}
+
+/// The record for `canonical`'s migration of server `src` (an empty one if none, or if it's
+/// about another server).
+pub(crate) fn load_record(cfg: &Config, canonical: &str, src: &str) -> MoveRecord {
+    let read = record_path(cfg, canonical).and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str::<MoveRecord>(&t).ok());
+    match read {
+        Some(r) if r.src == src => r,
+        _ => MoveRecord { src: src.to_string(), ..Default::default() },
+    }
+}
+
+/// Save it (0600, through a temp file); a failure is said, never fatal.
+pub(crate) fn save_record(cfg: &Config, canonical: &str, r: &MoveRecord) {
+    let Some(path) = record_path(cfg, canonical) else { return };
+    let write = || -> std::io::Result<()> {
+        std::fs::create_dir_all(path.parent().expect("a parent"))?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(r).unwrap_or_default())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, &path)
+    };
+    if let Err(e) = write() {
+        eprintln!("warning: couldn't save {} ({e}) — a later cutover/revert won't know where the volumes are mounted", path.display());
+    }
+}
+
+/// Forget it (the migration is finished).
+pub(crate) fn clear_record(cfg: &Config, canonical: &str) {
+    if let Some(p) = record_path(cfg, canonical) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Where each of `vols` is mounted on `pod`: asked there when it runs (its fstab line, else the
+/// live mount, else the default), else `known` (read while it ran). A stopped VM whose volume
+/// isn't in `known` is refused — never guessed (review: several would all land on /mnt/data).
+async fn mounts_on(
+    remote: &dyn Remote,
+    cfg: &Config,
+    owner: &dyn Provider,
+    pod: &Pod,
+    vols: &[CloudVolume],
+    known: &std::collections::BTreeMap<u64, String>,
+) -> Result<std::collections::BTreeMap<u64, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    let up = !arena_core::status::is_stopped(&pod.status);
+    for v in vols {
+        let at = if up {
+            mount_point(remote, cfg, owner, pod, v).await?
+        } else {
+            known.get(&v.id).cloned().with_context(|| {
+                format!(
+                    "{} is {} and where its volume {} is mounted wasn't recorded (`arena pods migrate copy` records it) — start it \
+                     first, or move the volume by hand (`arena pods volume detach` / `mount`)",
+                    pod.name, pod.status, v.name
+                )
+            })?
+        };
+        out.insert(v.id, at);
+    }
+    Ok(out)
+}
+
+/// Where `v` is mounted on the running `pod`: its fstab line, else the live mount, else the
+/// default.
+pub(crate) async fn mount_point(remote: &dyn Remote, cfg: &Config, owner: &dyn Provider, pod: &Pod, v: &CloudVolume) -> Result<String> {
     let said = on_vm(remote, cfg, owner, pod, &datavol::where_script(&datavol::device(v))).await?;
     Ok(datavol::parse_where(&said).unwrap_or_else(|| datavol::DEFAULT_MOUNT.to_string()))
 }
@@ -580,10 +699,25 @@ async fn mount_on(remote: &dyn Remote, cfg: &Config, owner: &dyn Provider, pod: 
     }
 }
 
-/// Move `vols` from VM `from` to VM `to` (same location): each unmounted on `from`, detached,
-/// attached to `to` and mounted there where it was. A step that fails puts the volumes moved so
-/// far back (attached to `from`, mounted where they were) and says so; nothing is half-moved
-/// silently. The moved ones on success.
+/// Unmount `v` on `pod` (a stopped one has nothing mounted), or why not.
+async fn unmount_on(remote: &dyn Remote, cfg: &Config, owner: &dyn Provider, pod: &Pod, v: &CloudVolume) -> Result<()> {
+    if arena_core::status::is_stopped(&pod.status) {
+        return Ok(());
+    }
+    let said = on_vm(remote, cfg, owner, pod, &datavol::unmount_script(&datavol::device(v))).await?;
+    datavol::parse_unmount(&said).map_err(anyhow::Error::msg).with_context(|| format!("unmounting {} on {}", v.name, pod.name))
+}
+
+fn server_id(p: &Pod) -> Result<u64> {
+    p.id.parse().map_err(|_| anyhow::anyhow!("{} (id {}) isn't a Hetzner server", p.name, p.id))
+}
+
+/// Move `vols` from VM `from` to VM `to` (same location): where each is mounted is read for all
+/// of them first (else `known`, for a stopped `from`), then each is unmounted on `from`,
+/// detached, attached to `to` and mounted there at the same place. Any failure — of any step,
+/// any volume — puts every one moved so far back ([`put_back`]: unmounted on `to` first) and
+/// says how that went. The mount points used, on success.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn move_volumes(
     remote: &dyn Remote,
     cfg: &Config,
@@ -592,72 +726,84 @@ pub(crate) async fn move_volumes(
     from: &Pod,
     to: &Pod,
     vols: &[CloudVolume],
-) -> Result<()> {
-    let to_id: u64 = to.id.parse().map_err(|_| anyhow::anyhow!("{} (id {}) isn't a Hetzner server", to.name, to.id))?;
-    let from_id: u64 = from.id.parse().map_err(|_| anyhow::anyhow!("{} (id {}) isn't a Hetzner server", from.name, from.id))?;
-    let mut done: Vec<(CloudVolume, String)> = Vec::new();
-    // A stopped VM has nothing mounted (and no endpoint to ask where it was).
-    let from_up = !arena_core::status::is_stopped(&from.status);
+    known: &std::collections::BTreeMap<u64, String>,
+) -> Result<std::collections::BTreeMap<u64, String>> {
+    let to_id = server_id(to)?;
+    server_id(from)?;
+    // Every mount point first: a lookup that fails moves nothing (review).
+    let mounts = mounts_on(remote, cfg, owner, from, vols, known).await?;
+    let mut touched: Vec<CloudVolume> = Vec::new();
     for v in vols {
-        let mount = if from_up { mount_of(remote, cfg, owner, from, v).await? } else { datavol::DEFAULT_MOUNT.to_string() };
+        let mount = mounts[&v.id].clone();
+        touched.push(v.clone());
         let step = async {
-            if from_up {
-                let said = on_vm(remote, cfg, owner, from, &datavol::unmount_script(&datavol::device(v))).await?;
-                datavol::parse_unmount(&said).map_err(anyhow::Error::msg).with_context(|| format!("unmounting {} on {}", v.name, from.name))?;
-            }
+            unmount_on(remote, cfg, owner, from, v).await?;
             let a = cloud.detach(v.id).await.with_context(|| format!("detaching {}", v.name))?;
             wait_all(cloud, &[a], "detach the volume").await?;
             let a = cloud.attach(v.id, to_id).await.with_context(|| format!("attaching {} to {}", v.name, to.name))?;
             wait_all(cloud, &[a], "attach the volume").await?;
             mount_on(remote, cfg, owner, to, v, &mount).await
         };
-        match step.await {
-            Ok(()) => {
-                println!("      volume {} moved: {} → {} (mounted at {mount})", v.name, from.name, to.name);
-                done.push((v.clone(), mount));
-            }
-            Err(e) => {
-                done.push((v.clone(), mount));
-                let back = put_back(remote, cfg, owner, cloud, from, from_id, &done).await;
-                anyhow::bail!(
-                    "moving volume {} to {}: {e:#} — {}",
-                    v.name,
-                    to.name,
-                    if back.is_empty() {
-                        format!("the volume(s) are back on {}", from.name)
-                    } else {
-                        format!("putting them back on {} needs a hand: {}", from.name, back.join("; "))
-                    }
-                );
-            }
+        if let Err(e) = step.await {
+            let failed = put_back(remote, cfg, owner, cloud, from, to, &touched, &mounts).await;
+            anyhow::bail!(
+                "moving volume {} to {}: {e:#} — {}",
+                v.name,
+                to.name,
+                if failed.is_empty() {
+                    format!("the volume(s) are back on {}", from.name)
+                } else {
+                    format!("putting them back on {} needs a hand: {}", from.name, failed.join("; "))
+                }
+            );
         }
+        println!("      volume {} moved: {} → {} (mounted at {mount})", v.name, from.name, to.name);
     }
-    Ok(())
+    Ok(mounts)
 }
 
-/// Put `vols` back on `from` (attached, mounted where they were): what didn't go back.
-async fn put_back(remote: &dyn Remote, cfg: &Config, owner: &dyn Provider, cloud: &dyn VolumeCloud, from: &Pod, from_id: u64, vols: &[(CloudVolume, String)]) -> Vec<String> {
+/// Put `vols` back on `from`, mounted where they were (`mounts`): one attached to `to` is
+/// unmounted there first — never detached while mounted (review); one that won't unmount is
+/// left where it is, mounted, and said. What didn't go back.
+#[allow(clippy::too_many_arguments)]
+async fn put_back(
+    remote: &dyn Remote,
+    cfg: &Config,
+    owner: &dyn Provider,
+    cloud: &dyn VolumeCloud,
+    from: &Pod,
+    to: &Pod,
+    vols: &[CloudVolume],
+    mounts: &std::collections::BTreeMap<u64, String>,
+) -> Vec<String> {
     let mut failed = Vec::new();
-    for (v, mount) in vols {
+    let (Ok(from_id), Ok(to_id)) = (server_id(from), server_id(to)) else { return vec!["the servers' ids aren't Hetzner's".into()] };
+    for v in vols {
         let now = cloud.all_volumes().await.ok().and_then(|all| all.into_iter().find(|x| x.id == v.id));
+        let mount = mounts.get(&v.id).cloned().unwrap_or_else(|| datavol::DEFAULT_MOUNT.to_string());
         let r = async {
             match now.as_ref().and_then(|x| x.server) {
                 Some(s) if s == from_id => {}
-                Some(_) => {
+                Some(s) if s == to_id => {
+                    unmount_on(remote, cfg, owner, to, v).await.with_context(|| format!("it stays on {}", to.name))?;
                     let a = cloud.detach(v.id).await?;
                     wait_all(cloud, &[a], "detach the volume").await?;
                     let a = cloud.attach(v.id, from_id).await?;
                     wait_all(cloud, &[a], "attach the volume").await?;
                 }
+                Some(s) => anyhow::bail!("it's attached to server {s} now — left there"),
                 None => {
                     let a = cloud.attach(v.id, from_id).await?;
                     wait_all(cloud, &[a], "attach the volume").await?;
                 }
             }
-            mount_on(remote, cfg, owner, from, v, mount).await
+            if arena_core::status::is_stopped(&from.status) {
+                return Ok(());
+            }
+            mount_on(remote, cfg, owner, from, v, &mount).await
         };
         if let Err(e) = r.await {
-            failed.push(format!("{}: {e:#} (`arena pods volume mount {}` once it's attached there)", v.name, from.name));
+            failed.push(format!("{}: {e:#}", v.name));
         }
     }
     failed
@@ -665,8 +811,10 @@ async fn put_back(remote: &dyn Remote, cfg: &Config, owner: &dyn Provider, cloud
 
 /// Copy `vols` (on VM `from`, another location than `to`) onto volumes of the same sizes on `to`:
 /// each made the first time (named after `base`, labelled as its copy) and found again on a
-/// re-run, mounted where the original is, then synced straight from `from` (mirrored,
-/// incremental). The originals stay where they are.
+/// re-run, mounted where the original is, then synced straight from `from` — each side only with
+/// its own volume mounted there; what the sync replaces on the copy kept in its
+/// `arena-sync-kept/<stamp>/` ([`datavol::copy_command`]). The originals stay where they are.
+/// Original id → copy id, for every one synced.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn copy_volumes(
     remote: &dyn Remote,
@@ -677,11 +825,15 @@ pub(crate) async fn copy_volumes(
     to: &Pod,
     base: &str,
     vols: &[CloudVolume],
-) -> Result<()> {
+    known: &std::collections::BTreeMap<u64, String>,
+) -> Result<std::collections::BTreeMap<u64, u64>> {
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
-    let to_id: u64 = to.id.parse().map_err(|_| anyhow::anyhow!("{} (id {}) isn't a Hetzner server", to.name, to.id))?;
+    let to_id = server_id(to)?;
+    let mounts = mounts_on(remote, cfg, owner, from, vols, known).await?;
+    let stamp = arena_core::replica::sync_stamp(arena_core::snapshot::unix_now());
+    let mut done = std::collections::BTreeMap::new();
     for v in vols {
-        let mount = mount_of(remote, cfg, owner, from, v).await?;
+        let mount = mounts[&v.id].clone();
         let all = cloud.all_volumes().await.context("listing the volumes")?;
         let copy = match all.iter().find(|x| x.labels.get(COPY_OF_LABEL) == Some(&v.id.to_string()) && x.server == Some(to_id)) {
             Some(c) => c.clone(),
@@ -700,9 +852,19 @@ pub(crate) async fn copy_volumes(
         let remote_key = cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string();
         let user = cfg.get("SSH_USER").unwrap_or("root").to_string();
         let ip = to.ssh_ip.clone().with_context(|| format!("{} has no address", to.name))?;
-        let cmd = datavol::copy_command(&ip, to.ssh_port.unwrap_or(22), &user, &remote_key, &mount, pod_guard(owner, &to.id).as_deref());
+        let cmd = datavol::copy_command(
+            &ip,
+            to.ssh_port.unwrap_or(22),
+            &user,
+            &remote_key,
+            &mount,
+            &datavol::device(v),
+            &datavol::device(&copy),
+            guard(to).as_deref(),
+            &stamp,
+        );
         let target = SshTarget::from_pod(from, cfg)?;
-        let guarded = arena_core::replica::guarded(pod_guard(owner, &from.id).as_deref(), &cmd);
+        let guarded = arena_core::replica::guarded(guard(from).as_deref(), &cmd);
         let out = remote.exec(&target, &guarded, Some(crate::pods::POD_COPY_TIMEOUT)).await.with_context(|| format!("copying {}", v.name))?;
         if !out.success {
             anyhow::bail!(
@@ -713,28 +875,64 @@ pub(crate) async fn copy_volumes(
                 crate::pods::home_copy::copy_failure_reason(&out.stderr)
             );
         }
-        println!("      volume {} copied {} → {} ({mount}, onto {})", v.name, from.name, to.name, copy.name);
+        println!(
+            "      volume {} copied {} → {} ({mount}, onto {}; what it replaced there is in {mount}/{}/{stamp}/)",
+            v.name,
+            from.name,
+            to.name,
+            copy.name,
+            datavol::COPY_KEPT_DIR
+        );
+        done.insert(v.id, copy.id);
     }
-    Ok(())
+    Ok(done)
 }
 
-/// A revert's half for the volumes: the ones a cutover moved onto `new` (on it, not copies,
-/// in `old`'s location) go back to `old`. Said; never an error (the names are back already).
-pub(crate) async fn revert_moves(remote: &dyn Remote, cfg: &Config, owner: &dyn Provider, cloud: &dyn VolumeCloud, new: &Pod, old: &Pod) {
+/// Whether every one of `vols` has a finished copy on `to` (the record's, its volume still there
+/// attached to `to`): what a cutover without a final sync needs before it promotes `to`. `Err`:
+/// which haven't.
+pub(crate) async fn copies_ready(cloud: &dyn VolumeCloud, record: &MoveRecord, to: &Pod, vols: &[CloudVolume]) -> Result<()> {
+    let all = cloud.all_volumes().await.context("listing the volumes")?;
+    let missing: Vec<&str> = vols
+        .iter()
+        .filter(|v| {
+            !record
+                .copied
+                .get(&v.id)
+                .is_some_and(|c| all.iter().any(|x| x.id == *c && x.server.is_some_and(|s| s.to_string() == to.id)))
+        })
+        .map(|v| v.name.as_str())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "no finished copy of volume(s) {} on {} — a cutover without a final sync would promote it without their files: run \
+         `arena pods migrate copy` while the original is up, or move them by hand",
+        missing.join(", "),
+        to.name
+    )
+}
+
+/// A revert's half for the volumes: exactly the ones the record says a cutover moved onto `new`
+/// (and still on it) go back to `old`, mounted where they were. Said; never an error (the names
+/// are back already).
+pub(crate) async fn revert_moves(remote: &dyn Remote, cfg: &Config, owner: &dyn Provider, cloud: &dyn VolumeCloud, new: &Pod, old: &Pod, record: &MoveRecord) {
+    if record.moved.is_empty() || record.moved_to.as_deref() != Some(new.id.as_str()) {
+        return;
+    }
     let all = match cloud.all_volumes().await {
-        Ok(all) => datavol::fleet_volumes(&all),
+        Ok(all) => all,
         Err(e) => return eprintln!("  REVERT WARNING: couldn't list the volumes ({e}) — `arena pods volume list` shows where they are"),
     };
-    let moved: Vec<CloudVolume> = datavol::attached_to(&all, &new.id)
+    let moved: Vec<CloudVolume> = all
         .into_iter()
-        .filter(|v| !v.labels.contains_key(COPY_OF_LABEL))
-        .filter(|v| old.location.as_deref().is_some_and(|l| location_key(l) == location_key(&v.location)))
-        .cloned()
+        .filter(|v| record.moved.contains(&v.id) && v.server.is_some_and(|s| s.to_string() == new.id))
         .collect();
     if moved.is_empty() {
         return;
     }
-    if let Err(e) = move_volumes(remote, cfg, owner, cloud, new, old, &moved).await {
+    if let Err(e) = move_volumes(remote, cfg, owner, cloud, new, old, &moved, &record.mounts).await {
         eprintln!("  REVERT WARNING: {e:#}");
     }
 }
@@ -746,7 +944,11 @@ pub(crate) fn after_line(carry: &Carry, old_name: &str, kept_old: bool) -> Optio
         Carry::Copy(vols) => {
             let names: Vec<&str> = vols.iter().map(|v| v.name.as_str()).collect();
             Some(if kept_old {
-                format!("the original volume(s) {} stay on {old_name}; delete them once the copies are checked: `arena pods volume delete {}`", names.join(", "), names[0])
+                format!(
+                    "the original volume(s) {} stay on {old_name}; delete them once the copies are checked: `arena pods volume delete {}`",
+                    names.join(", "),
+                    names[0]
+                )
             } else {
                 format!(
                     "the original volume(s) {} are KEPT, detached, billing — delete them once the copies are checked: `arena pods volume delete {}`",
@@ -803,12 +1005,14 @@ mod tests {
         })
     }
 
+    /// The fleet provider, named after `--provider`'s default (RunPod) as the real one is — a
+    /// VM's steps must still check the VM's own (Hetzner) id.
     struct Fleet(Vec<Pod>);
 
     #[async_trait::async_trait]
     impl Provider for Fleet {
         fn name(&self) -> &'static str {
-            "hetzner"
+            "runpod"
         }
         fn describe(&self, _: &arena_core::PodSpec) -> String {
             String::new()
@@ -853,6 +1057,7 @@ mod tests {
             .filter_map(|c| if let arena_core::remote::RemoteCall::Exec { cmd, .. } = c { Some(cmd) } else { None })
             .collect();
         assert!(execs.iter().any(|c| c.contains("scsi-0HC_Volume_") && c.contains("'/mnt/data'") && c.contains("instance-id")), "{execs:?}");
+        assert!(!execs.iter().any(|c| c.contains("RUNPOD_POD_ID")), "the VM's own id, not the fleet provider's kind: {execs:?}");
         // A second one gets the next name.
         volume_on(add(20, "/mnt/more"), remote.clone(), &fleet, &cloud, &cfg(), true).await.unwrap();
         assert!(cloud.state().volumes.iter().any(|v| v.name == "devtest-alpha-data-2" && v.size_gb == 20));
@@ -891,10 +1096,10 @@ mod tests {
             .unwrap();
         let id = cloud.state().volumes[0].id;
         let grow = |gb: u32| VolumeCmd::Grow { name: "alpha".into(), gb, volume: None, dry_run: false };
-        let e = volume_on(grow(10), remote.clone(), &fleet, &cloud, &c, true).await.unwrap_err().to_string();
-        assert!(e.contains("only grows"), "{e}");
         volume_on(grow(11), remote.clone(), &fleet, &cloud, &c, true).await.unwrap();
         assert!(cloud.calls().contains(&CloudCall::Resize(id, 11)));
+        let e = volume_on(grow(10), remote.clone(), &fleet, &cloud, &c, true).await.unwrap_err().to_string();
+        assert!(e.contains("only grows"), "{e}");
         // Busy: refused, still attached.
         let busy = Arc::new(FakeRemote::new());
         busy.on("10.0.0.11:22", "umount", FakeReply::stdout("ARENA_VOL_BUSY /mnt/data 2 process(es)\n"));
@@ -917,6 +1122,51 @@ mod tests {
         let m = cloud.mutations();
         let (d, del) = (m.iter().position(|x| *x == CloudCall::Detach(id)).unwrap(), m.iter().position(|x| *x == CloudCall::DeleteVolume(id)).unwrap());
         assert!(d < del, "detached before the delete: {m:?}");
+    }
+
+    /// grow to the size it has: the filesystem step alone (a retry — review); another cohort's
+    /// volume, or an unlabelled one lying detached, is never deleted from here (review).
+    #[tokio::test(start_paused = true)]
+    async fn grow_retries_the_filesystem_and_delete_keeps_to_this_cohort() {
+        let alpha = vm("11", "devtest-alpha", "RUNNING");
+        let fleet = Fleet(vec![alpha.clone()]);
+        let cloud = project(&fleet.0);
+        let remote = Arc::new(FakeRemote::new());
+        remote.on("10.0.0.11:22", "resize2fs", FakeReply::stdout("ARENA_VOL_GROWN 10501771264\n"));
+        remote.on("10.0.0.11:22", "ARENA_VOL_MOUNTED", FakeReply::stdout("ARENA_VOL_MOUNTED 10501771264\n"));
+        let c = cfg();
+        volume_on(VolumeCmd::Add { name: "alpha".into(), gb: 10, mount: "/mnt/data".into(), dry_run: false }, remote.clone(), &fleet, &cloud, &c, true)
+            .await
+            .unwrap();
+        cloud.clear_calls();
+        volume_on(VolumeCmd::Grow { name: "alpha".into(), gb: 10, volume: None, dry_run: false }, remote.clone(), &fleet, &cloud, &c, true).await.unwrap();
+        assert!(!cloud.calls().iter().any(|c| matches!(c, CloudCall::Resize(..))), "{:?}", cloud.calls());
+        // Another cohort's (detached) and an unlabelled detached one: not this cohort's.
+        for (name, labels) in [("arena9-x-data", serde_json::json!({"arena-volume": "arena9"})), ("loose", serde_json::json!({}))] {
+            let body = serde_json::json!({"name": name, "size": 10, "location": "nbg1", "labels": labels});
+            cloud.create_volume(&body).await.unwrap();
+            let e = volume_on(VolumeCmd::Delete { name: name.into(), force: false, dry_run: false }, remote.clone(), &fleet, &cloud, &c, true)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(&format!("no volume named {name}")), "{e}");
+        }
+        assert!(!cloud.mutations().iter().any(|c| matches!(c, CloudCall::DeleteVolume(_))));
+    }
+
+    /// A stopped VM's mount points come from what was recorded while it ran — never guessed.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_vms_mount_points_are_recorded_not_guessed() {
+        let off = vm("11", "devtest-alpha", "OFF");
+        let cloud = project(std::slice::from_ref(&off));
+        let (v, _) = cloud.create_volume(&datavol::create_body("devtest-alpha-data", 10, 11, "devtest")).await.unwrap();
+        let fleet = Fleet(vec![off.clone()]);
+        let remote = FakeRemote::new();
+        let e = mounts_on(&remote, &cfg(), &fleet, &off, std::slice::from_ref(&v), &Default::default()).await.unwrap_err().to_string();
+        assert!(e.contains("wasn't recorded") && e.contains("start it"), "{e}");
+        let known = [(v.id, "/srv/models".to_string())].into();
+        assert_eq!(mounts_on(&remote, &cfg(), &fleet, &off, std::slice::from_ref(&v), &known).await.unwrap()[&v.id], "/srv/models");
+        assert!(remote.calls().is_empty(), "a stopped VM isn't asked");
     }
 
     /// A fleet whose terminate deletes the server in the fake project too (which detaches its

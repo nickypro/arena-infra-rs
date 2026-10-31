@@ -224,6 +224,9 @@ pub enum Entry {
         tier: Option<String>,
         /// `size_gb` × [`VOLUME_USD_PER_GB_MONTH`] — an estimate.
         est_usd_per_month: Option<f64>,
+        /// A Hetzner volume's cost a month, in EUR (Hetzner bills in EUR; arena never converts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        eur_per_month: Option<f64>,
     },
     Key {
         name: String,
@@ -347,7 +350,16 @@ pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
         items.push(pods_item(provider, listing.as_ref().map(Vec::as_slice), naming, &all));
     }
     items.push(volumes_item(&inputs.volumes));
-    items.push(hetzner_volumes_item(&inputs.hetzner_volumes, inputs.archive_prices.volume_gb_month));
+    // This cohort's VMs (the Hetzner listing's servers): a volume attached to one is its own.
+    let fleet_ids: Vec<String> = inputs
+        .listings
+        .iter()
+        .filter(|(p, _)| p == "hetzner")
+        .filter_map(|(_, l)| l.as_ref().ok())
+        .flatten()
+        .map(|p| p.id.clone())
+        .collect();
+    items.push(hetzner_volumes_item(&inputs.hetzner_volumes, inputs.archive_prices.volume_gb_month, naming.prefix, &fleet_ids));
     if inputs.listings.iter().any(|(p, _)| p == "shadeform") {
         items.push(shadeform_volumes_item(&inputs.shadeform_volumes));
     }
@@ -652,6 +664,7 @@ pub fn volumes_item(volumes: &Probe<Vec<NetworkVolume>>) -> Item {
             data_center: v.data_center.clone(),
             tier: v.tier.clone(),
             est_usd_per_month: est(v.size_gb),
+            eur_per_month: None,
         });
         item.fix.push(format!(
             "curl -X DELETE -H \"Authorization: Bearer $RUNPOD_API_KEY\" https://api.runpod.io/v2/network-volumes/{}",
@@ -670,18 +683,37 @@ pub fn volumes_item(volumes: &Probe<Vec<NetworkVolume>>) -> Item {
 /// by the GB-month, attached or not, until deleted — a terminate keeps it unless
 /// `--delete-volumes`. Priced at `gb_month` (Hetzner's `/pricing`, the archive's list figure
 /// when that can't be read), in EUR.
-pub fn hetzner_volumes_item(volumes: &Probe<Vec<crate::archive::cloud::CloudVolume>>, gb_month: f64) -> Item {
+pub fn hetzner_volumes_item(volumes: &Probe<Vec<crate::archive::cloud::CloudVolume>>, gb_month: f64, prefix: &str, fleet_ids: &[String]) -> Item {
     const SCOPE: &str = "hetzner";
-    let vols = match volumes {
+    let all = match volumes {
         Probe::Skipped(why) => return Item::new(Area::Volumes, SCOPE, Verdict::Skipped, why.clone()),
         Probe::Failed(e) => {
             let mut item = Item::new(Area::Volumes, SCOPE, Verdict::Unknown, format!("couldn't check ({e}) — NOT known to be empty"));
             item.notes.push("look in the Hetzner console (Volumes) before calling the teardown done".into());
             return item;
         }
-        Probe::Got(v) if v.is_empty() => return Item::new(Area::Volumes, SCOPE, Verdict::Clear, "none"),
         Probe::Got(v) => v,
     };
+    // This cohort's (its label, or on its VMs); the project's others are only named — never
+    // deleted from here (a shared project's other cohorts — review).
+    let vols = crate::datavol::cohort_volumes(all, prefix, fleet_ids);
+    let others: Vec<&crate::archive::cloud::CloudVolume> =
+        all.iter().filter(|v| !crate::datavol::is_archive(v) && !vols.iter().any(|o| o.id == v.id)).collect();
+    let other_note = (!others.is_empty()).then(|| {
+        format!(
+            "{} other volume(s) in the project aren't this cohort's (no `{}={prefix}` label, not on its VMs) — not counted, \
+             look before deleting: {}",
+            others.len(),
+            crate::datavol::LABEL,
+            others.iter().map(|v| format!("{} ({} GB)", v.name, v.size_gb)).collect::<Vec<_>>().join(", ")
+        )
+    });
+    if vols.is_empty() {
+        let mut item = Item::new(Area::Volumes, SCOPE, Verdict::Clear, "none");
+        item.notes.extend(other_note);
+        return item;
+    }
+    let vols = &vols;
     let gb: u32 = vols.iter().map(|v| v.size_gb).sum();
     let monthly = crate::datavol::monthly(vols, gb_month);
     let detached = vols.iter().filter(|v| v.server.is_none()).count();
@@ -700,9 +732,11 @@ pub fn hetzner_volumes_item(volumes: &Probe<Vec<crate::archive::cloud::CloudVolu
             data_center: Some(v.location.clone()),
             tier: None,
             est_usd_per_month: None,
+            eur_per_month: Some(f64::from(v.size_gb) * gb_month),
         });
         item.fix.push(format!("arena pods volume delete {} --yes", sh_word(&v.name)));
     }
+    item.notes.extend(other_note);
     item.notes.push(
         "deleting a volume is irreversible and destroys its files (it's in no backup) — copy off what's wanted first; a VM's \
          terminate never deletes one (`--delete-volumes` does)"
@@ -749,6 +783,7 @@ pub fn shadeform_volumes_item(volumes: &Probe<Vec<ShadeformVolume>>) -> Item {
             data_center: Some(format!("{}/{}", v.cloud, v.region)),
             tier: None,
             est_usd_per_month: v.usd_per_month(),
+            eur_per_month: None,
         });
         item.fix.push(format!(
             "curl -X POST -H \"X-API-KEY: $SHADEFORM_API_KEY\" https://api.shadeform.ai/v1/volumes/{}/delete",
@@ -1421,9 +1456,12 @@ fn entry_lines(entries: &[Entry]) -> Vec<String> {
                     let lock = if *locked { "  locked" } else { "" };
                     format!("{k}  id={id}  {status}{lock}  {cost}{other}")
                 }
-                Entry::Volume { name, size_gb, data_center, tier, est_usd_per_month, .. } => {
+                Entry::Volume { name, size_gb, data_center, tier, est_usd_per_month, eur_per_month, .. } => {
                     let size = size_gb.map_or("? GB".to_string(), |g| format!("{g} GB"));
-                    let est = est_usd_per_month.map_or("~$?/month".to_string(), |m| format!("~${m:.2}/month"));
+                    let est = match eur_per_month {
+                        Some(e) => format!("{}/month", fmt_money("€", *e)),
+                        None => est_usd_per_month.map_or("~$?/month".to_string(), |m| format!("~${m:.2}/month")),
+                    };
                     let place = [data_center.as_deref(), tier.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" ");
                     let mut parts = vec![k, format!("\"{name}\""), size];
                     if !place.is_empty() {

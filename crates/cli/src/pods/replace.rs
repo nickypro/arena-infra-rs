@@ -974,7 +974,7 @@ pub(crate) async fn replace_on(
     match (&carry, job.volumes) {
         (crate::pods::datavol::Carry::Copy(vols), Some(cloud)) => {
             println!("      copying {canonical}'s volume(s) onto new ones on {new_name} (another location: a volume can't move there)…");
-            crate::pods::datavol::copy_volumes(remote.as_ref(), cfg, owner, cloud, &src, &new_pod, &canonical, vols)
+            crate::pods::datavol::copy_volumes(remote.as_ref(), cfg, owner, cloud, &src, &new_pod, &canonical, vols, &std::collections::BTreeMap::new())
                 .await
                 .with_context(|| replace_copy_failed(&canonical, &new_name))?;
         }
@@ -1035,7 +1035,7 @@ pub(crate) async fn replace_on(
     })?;
     clean_marker(owner, remote.as_ref(), &created.id, cfg).await;
     if let (crate::pods::datavol::Carry::Copy(vols), Some(cloud)) = (&carry, job.volumes) {
-        crate::pods::datavol::copy_volumes(remote.as_ref(), cfg, owner, cloud, &src, &new_pod, &canonical, vols).await.with_context(|| {
+        crate::pods::datavol::copy_volumes(remote.as_ref(), cfg, owner, cloud, &src, &new_pod, &canonical, vols, &std::collections::BTreeMap::new()).await.with_context(|| {
             format!("the final sync of {canonical}'s volume(s) — NOT swapping; {canonical} is untouched")
         })?;
     }
@@ -1047,10 +1047,10 @@ pub(crate) async fn replace_on(
     // on the original, and nothing is swapped.
     let moved = match (&carry, job.volumes) {
         (crate::pods::datavol::Carry::Move(vols), Some(cloud)) => {
-            crate::pods::datavol::move_volumes(remote.as_ref(), cfg, owner, cloud, &src, &new_pod, vols)
+            let mounts = crate::pods::datavol::move_volumes(remote.as_ref(), cfg, owner, cloud, &src, &new_pod, vols, &std::collections::BTreeMap::new())
                 .await
                 .with_context(|| format!("NOT swapping — {canonical} is untouched"))?;
-            Some((cloud, vols.clone()))
+            Some((cloud, vols.clone(), mounts))
         }
         _ => None,
     };
@@ -1059,20 +1059,25 @@ pub(crate) async fn replace_on(
     // promote fails after parking the source, roll the source's name back so the canonical
     // name still resolves to the (untouched) original.
     println!("[6/7] swapping…");
-    arena_core::retry::retrying(&policy, || owner.rename_pod(&src_id, &old_name))
-        .await
-        .with_context(|| format!("renaming {canonical} -> {old_name}"))?;
+    // Volumes moved for the swap go back if it doesn't happen.
+    let move_back = || async {
+        if let Some((cloud, vols, mounts)) = &moved {
+            if let Err(me) = crate::pods::datavol::move_volumes(remote.as_ref(), cfg, owner, *cloud, &new_pod, &src, vols, mounts).await {
+                eprintln!("      moving the volume(s) back to {canonical}: {me:#}");
+            }
+        }
+    };
+    if let Err(e) = arena_core::retry::retrying(&policy, || owner.rename_pod(&src_id, &old_name)).await {
+        move_back().await;
+        return Err(e).with_context(|| format!("renaming {canonical} -> {old_name}"));
+    }
     println!("      {canonical} -> {old_name}");
     if let Err(e) =
         arena_core::retry::retrying(&policy, || owner.rename_pod(&created.id, &canonical)).await
     {
         eprintln!("      promote failed ({e}); rolling back {old_name} -> {canonical}");
         let _ = owner.rename_pod(&src_id, &canonical).await;
-        if let Some((cloud, vols)) = &moved {
-            if let Err(me) = crate::pods::datavol::move_volumes(remote.as_ref(), cfg, owner, *cloud, &new_pod, &src, vols).await {
-                eprintln!("      moving the volume(s) back to {canonical}: {me:#}");
-            }
-        }
+        move_back().await;
         return Err(e).with_context(|| {
             format!("promoting {new_name} -> {canonical} (rolled back; original {canonical} intact)")
         });

@@ -2391,7 +2391,7 @@ pub fn notes(views: &[AccountView], policy: &BalancePolicy, now: u64) -> Vec<Str
                 out.push(format!("{name}: the capacity spares couldn't be read ({e}) — not included"));
             }
             if let Some(x) = v.volumes_per_hr {
-                out.push(format!("{name}: includes the VMs' volumes, {}/h (`arena pods volume list`)", money(v, x)));
+                out.push(format!("{name}: includes the VMs' volumes, {}/month (`arena pods volume list`)", money(v, x * 730.0)));
             }
             if let Some(e) = &v.volumes_unread {
                 out.push(format!("{name}: the volumes couldn't be read ({e}) — not included"));
@@ -3116,7 +3116,7 @@ pub trait BalanceApi: Send + Sync {
     async fn spares_eur_per_hr(&self) -> Option<Result<(f64, usize), String>> {
         None
     }
-    /// The fleet VMs' volumes' cost (`pods volume add`: EUR/h, every volume but the archive's)
+    /// The fleet VMs' volumes' cost (`pods volume add`: EUR/h, this cohort's by their label)
     /// — Hetzner spend in no server listing. `None`: no Hetzner key, not asked. Reads only.
     async fn volumes_eur_per_hr(&self) -> Option<Result<f64, String>> {
         None
@@ -3155,8 +3155,9 @@ pub struct HttpBalanceApi {
     archive: Option<(crate::archive::HetznerArchiveCloud, crate::archive::ArchiveNames)>,
     /// The fleet's Hetzner project, for its capacity spares (`HETZNER_API_KEY`).
     spares: Option<crate::provider::hetzner::HetznerProvider>,
-    /// The fleet's Hetzner project, for its volumes (`HETZNER_API_KEY`).
-    volumes: Option<crate::archive::HetznerArchiveCloud>,
+    /// The fleet's Hetzner project, for this cohort's volumes (`HETZNER_API_KEY`; the prefix
+    /// their label names).
+    volumes: Option<(crate::archive::HetznerArchiveCloud, String)>,
 }
 
 impl HttpBalanceApi {
@@ -3178,7 +3179,11 @@ impl HttpBalanceApi {
             spares: cfg.get("HETZNER_API_KEY").map(str::trim).filter(|k| !k.is_empty()).map(|k| {
                 crate::provider::hetzner::HetznerProvider::new(k, crate::provider::hetzner::HetznerOpts::from_config(cfg))
             }),
-            volumes: cfg.get("HETZNER_API_KEY").map(str::trim).filter(|k| !k.is_empty()).map(crate::archive::HetznerArchiveCloud::new),
+            volumes: cfg
+                .get("HETZNER_API_KEY")
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(|k| (crate::archive::HetznerArchiveCloud::new(k), cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string())),
         }
     }
 
@@ -3250,9 +3255,10 @@ impl BalanceApi for HttpBalanceApi {
 
     async fn volumes_eur_per_hr(&self) -> Option<Result<f64, String>> {
         use crate::datavol::VolumeCloud;
-        let cloud = self.volumes.as_ref()?;
+        let (cloud, prefix) = self.volumes.as_ref()?;
         Some(match cloud.all_volumes().await {
-            Ok(all) => Ok(crate::datavol::per_hr(&crate::datavol::fleet_volumes(&all), crate::datavol::price_gb_month(cloud).await)),
+            // This cohort's (by its label): a shared project's other volumes aren't its spend.
+            Ok(all) => Ok(crate::datavol::per_hr(&crate::datavol::cohort_volumes(&all, prefix, &[]), crate::datavol::price_gb_month(cloud).await)),
             Err(e) => Err(e.to_string()),
         })
     }

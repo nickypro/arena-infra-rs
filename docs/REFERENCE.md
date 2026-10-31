@@ -817,6 +817,10 @@ arena pods terminate apple --delete-volumes    # the VM and its volumes; without
   <vm>` + `arena pods start <vm>` mounts it (its fstab line is already in place; `volume mount`
   checks).
 - **grow** only grows (Hetzner never shrinks a volume), and grows the filesystem online after.
+  `grow` to the size it already has retries the filesystem step alone.
+- Every command acts on **this cohort's** volumes only: the ones labelled with its prefix, and
+  any attached to one of its VMs. A shared project's other volumes are listed apart and never
+  touched, and teardown never prints their delete.
 - **detach / delete** unmount it on the VM first. One in use is refused, with `fuser -vm <path>`
   to see who holds it. A VM that can't be reached is refused unless `--force`. Delete wants the
   volume's own name or id, never the VM's, and refuses one with Hetzner's delete protection on.
@@ -829,9 +833,13 @@ arena pods terminate apple --delete-volumes    # the VM and its volumes; without
   fails, it's put back on the original and nothing is swapped. In **another location** a volume
   can't follow, so it's **copied** instead: a volume of the same size is made on the new VM
   (`<name>-data-2`, labelled as the copy), mounted at the same place, and synced straight from
-  the old VM (mirrored, incremental) with the copy and again right before the swap. The original
-  is kept, and the run says so, with the `volume delete` for once the copy is checked. `migrate
-  revert` moves a moved volume back.
+  the old VM (mirrored, incremental) with the copy and again right before the swap. Each side
+  runs only with its own volume mounted there, and whatever a sync would overwrite or delete on
+  the copy is moved into `<mount>/arena-sync-kept/<time>/`. The original is kept, and the run
+  says so, with the `volume delete` for once the copy is checked. A migration remembers in the
+  state dir where each volume is mounted (a cutover from a stopped original can't ask), which
+  copies finished (`--no-final-sync` won't promote onto a copy that didn't), and what it moved:
+  `migrate revert` moves back exactly that.
 - **Money**: `arena balance` adds the volumes to Hetzner's burn, and `teardown --check` lists each
   volume with its cost (the archive's own volumes are the archive's line). `arena spend` counts
   machines, not volumes.
