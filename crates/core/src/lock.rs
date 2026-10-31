@@ -77,7 +77,7 @@ pub struct LockPlan<'a> {
 }
 
 /// Split the selection: `support` says, per pod, whether its backend can (un)lock it
-/// (`Err(why)` = it can't — see `Provider::lock_support`). A pod already in the wanted state
+/// (`Err(why)` = it can't — see `Provider::supports`, [`crate::capability::Op::Lock`]). A pod already in the wanted state
 /// is left alone; one whose state is unknown on a backend that can lock is acted on.
 pub fn plan<'a>(pods: &'a [Pod], lock: bool, support: impl Fn(&Pod) -> Result<(), String>) -> LockPlan<'a> {
     let mut out = LockPlan { act: Vec::new(), already: Vec::new(), unsupported: Vec::new() };

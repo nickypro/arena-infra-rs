@@ -21,7 +21,8 @@ use crate::pods::create::{check_create_body, create_extra, create_policy_line, c
 use crate::pods::health::handle_deep_test;
 use crate::pods::lifecycle::{disk_fate, handle_reimage, handle_restart, handle_start, handle_terminate, names_of, no_stop_left, no_stop_refusal, repo_sites, split_no_stop, stop_lines, wipe_refusal, DiskOp, RestartOpts, TerminateOpts, RESTART_SETTLE};
 use crate::pods::list::list_with;
-use crate::pods::lock::{handle_lock, lock_why, print_would_refuse};
+use crate::pods::capable::CreateFlags;
+use crate::pods::lock::{handle_lock, print_would_refuse};
 use crate::pods::migrate::{handle_migrate_copy, handle_migrate_cutover, handle_migrate_finish, handle_migrate_revert, handle_migrate_status, CutoverOpts, FinishOpts, MigrateCmd};
 use crate::pods::placement::{checked_gpu, describe_create, first_create_spec, place_names, placement_prompt, placement_request, plan_placement, print_balance_preflight, print_placement_preview, single_option_plan};
 use crate::pods::pull::{handle_pull, local_backup_dir, resolve_pull};
@@ -37,6 +38,7 @@ use crate::{ask, confirm, jobs, money, reap, spend, up, Interrupt};
 pub(crate) mod backup;
 pub(crate) mod baseline;
 pub(crate) mod branch;
+pub(crate) mod capable;
 pub(crate) mod copy;
 pub(crate) mod create;
 pub(crate) mod health;
@@ -269,8 +271,10 @@ async fn handle_pods_bal(
             }
             // Bad extra JSON (or a field arena sets itself) fails before any API call.
             let api_extra = create_extra(provider, cfg, api_json.as_deref())?;
-            // Sizing flags the create target can't honour fail here too (`--gpu` on Hetzner,
-            // `--server-type` elsewhere) — refused, never silently dropped.
+            // Flags the create target would ignore fail here too (the capability table: `--disk`
+            // on Hetzner, `--bootstrap` on Vast, `--gpu` on Hetzner, `--server-type` elsewhere)
+            // — refused, never silently dropped.
+            CreateFlags { cloud: cloud.as_deref(), disk, volume, image: image.as_deref(), bootstrap, max_price }.check(provider, None)?;
             let server_type = sizing_flags(provider.name(), gpu.as_deref(), gpus, server_type)?;
             let (image, vm_image) = image_flag(provider.name(), image)?;
             // A typo'd --gpu fails here, before anything is listed or created.
@@ -389,10 +393,11 @@ async fn handle_pods_bal(
                 println!("[dry-run] each pod would get a reap policy: {}", create_policy_line(policy));
             }
             let api_extra = create_extra(provider, cfg, api_json.as_deref())?;
-            // --lock where pods can't be locked fails now, not after pods were made.
+            // Flags the create target would ignore, and --lock where pods can't be locked, fail
+            // now, not after pods were made.
+            CreateFlags { cloud: cloud.as_deref(), disk, volume, image: image.as_deref(), bootstrap, max_price }.check(provider, None)?;
             if lock {
-                let target = arena_core::Pod { provider: provider.name().to_string(), ..Default::default() };
-                provider.lock_support(&target).map_err(|e| anyhow::anyhow!("--lock: {}", lock_why(e)))?;
+                provider.supports(arena_core::capability::Op::Lock, None).check().map_err(|why| anyhow::anyhow!("--lock: {why}"))?;
             }
             let server_type = sizing_flags(provider.name(), gpu.as_deref(), gpus, server_type)?;
             let (image, vm_image) = image_flag(provider.name(), image)?;
@@ -669,7 +674,7 @@ async fn handle_pods_bal(
             // rest are stopped: one overflow VM must not veto `stop --all` (review SF3). Only a
             // selection with nothing else to stop is refused outright. Afterwards the exit is
             // non-zero while a skipped one still bills (see `no_stop_left`).
-            let (no_stop, pods) = split_no_stop(provider, billing_pods);
+            let (no_stop, pods) = split_no_stop(provider, arena_core::capability::Op::Stop, billing_pods);
             if pods.is_empty() && !no_stop.is_empty() {
                 anyhow::bail!("{}", no_stop_refusal(&no_stop, "stop"));
             }

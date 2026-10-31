@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use arena_core::capability::Backend;
 use arena_core::provider::runpod_v2::RunpodV2Provider;
 use arena_core::remote::FakeRemote;
 use arena_core::{Config, Pod, PodSpec, Provider, Result};
@@ -21,11 +22,13 @@ struct V2Shape {
     rules: RunpodV2Provider,
     lists: AtomicUsize,
     bodies: std::sync::Mutex<Vec<serde_json::Value>>,
+    /// The capability table's column it answers for: RunPod (v2), or v1 for a target that can't lock.
+    backend: Backend,
 }
 
 impl V2Shape {
     fn new() -> Self {
-        Self { rules: RunpodV2Provider::new("k"), lists: AtomicUsize::new(0), bodies: Default::default() }
+        Self { rules: RunpodV2Provider::new("k"), lists: AtomicUsize::new(0), bodies: Default::default(), backend: Backend::Runpod }
     }
 }
 
@@ -33,6 +36,9 @@ impl V2Shape {
 impl Provider for V2Shape {
     fn name(&self) -> &'static str {
         "runpod"
+    }
+    fn backend(&self) -> Option<Backend> {
+        Some(self.backend)
     }
     fn describe(&self, spec: &PodSpec) -> String {
         self.rules.describe(spec)
@@ -143,13 +149,13 @@ async fn api_json_is_parsed_and_checked_before_any_api_call() {
         assert_eq!(fleet.lists.load(Ordering::SeqCst), 0, "{argv:?}: refused before any API call");
         assert!(fleet.bodies.lock().unwrap().is_empty(), "{argv:?}: nothing created");
     }
-    // `up --lock` where the create target can't lock: refused before anything, too.
-    let fleet = V2Shape::new();
+    // `up --lock` where the create target can't lock (RunPod on v1): refused before anything, too.
+    let fleet = V2Shape { backend: Backend::RunpodV1, ..V2Shape::new() };
     let e = handle_pods(pods_cmd(&["up", "echo", "--lock"]), &fleet, Arc::new(FakeRemote::new()), &cfg(""), true)
         .await
         .unwrap_err()
         .to_string();
-    assert!(e.starts_with("--lock: not supported on runpod"), "{e}");
+    assert!(e.starts_with("--lock: only RunPod REST v2 can lock a pod — remove RUNPOD_API=v1"), "{e}");
     assert_eq!(fleet.lists.load(Ordering::SeqCst), 0);
     // Accepted: listed, previewed, nothing created (dry run).
     let fleet = V2Shape::new();

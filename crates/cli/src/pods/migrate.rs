@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arena_core::capability::Op;
 use arena_core::provider::Provider;
 use arena_core::remote::{Remote, PROBE_TIMEOUT};
 use arena_core::ssh::SshTarget;
@@ -12,11 +13,11 @@ use clap::Subcommand;
 
 use crate::cli::PlaceFlags;
 use crate::keys::KEYS_DIR;
-use crate::pods::create::SpecOverrides;
+use crate::pods::create::{sizing_flags, SpecOverrides};
 use crate::pods::home_copy::{copy_pod_files, remove_staging_for, verify_replacement, CopyOpts};
 use crate::pods::lifecycle::proxied_name;
 use crate::pods::lock::{print_would_refuse, LOCKED_REPLACEMENT_NOTE};
-use crate::pods::replace::{after_swap, clean_marker, copy_scope_line, create_replacement, locked_original_note, maintenance_window, plan_replacement, print_replacement_plan, replace_cleanup_blocker, short_of, stopped_source_refusal, wait_for_endpoint, wait_for_stable_endpoint, write_name_file, write_only_proxy};
+use crate::pods::replace::{replacement_flags, after_swap, clean_marker, copy_scope_line, create_replacement, locked_original_note, maintenance_window, plan_replacement, print_replacement_plan, replace_cleanup_blocker, short_of, stopped_source_refusal, wait_for_endpoint, wait_for_stable_endpoint, write_name_file, write_only_proxy};
 use crate::pods::selection::{just_these, resolve_target_any};
 use crate::pods::setup::handle_setup;
 use crate::proxy::{sync_proxy, ProxySync};
@@ -260,6 +261,13 @@ pub(crate) async fn migrate_copy_on(
     let src = pods.iter().find(|p| p.name == canonical).expect("the canonical pod is listed").clone();
     let new_name = format!("{canonical}-new");
     let existing_new = pods.iter().find(|p| p.name == new_name).cloned();
+    // A provider the migration can't run on (the capability table) is refused before anything is
+    // read or created — dry run or not; so is a flag the new pod's provider would ignore.
+    if let Some(r) = crate::pods::capable::refusal(owner, Op::Migrate, "migrate", &[&src]) {
+        anyhow::bail!("{r}");
+    }
+    replacement_flags(ov, place).check(owner, Some(&src))?;
+    sizing_flags(&src.provider, ov.gpu.as_deref(), ov.gpus, None)?;
     let lock_note = locked_original_note(&src);
     let stopped = stopped_source_refusal(&src);
     if let (Some(r), false) = (&stopped, dry_run) {
@@ -452,6 +460,10 @@ pub(crate) async fn migrate_cutover_on(
         .ok_or_else(|| anyhow::anyhow!("no {new_name} — run `arena pods migrate copy {canonical}` first"))?;
     if pods.iter().any(|p| p.name == old_name) {
         anyhow::bail!("{old_name} already exists — finish/revert the previous migration first");
+    }
+    // Asked again here: the cutover is the step a provider may not get through (Shadeform's).
+    if let Some(r) = crate::pods::capable::refusal(owner, Op::Migrate, "cut over", &[&src]) {
+        anyhow::bail!("{r}");
     }
     // The cutover moves the participant off the pod (renamed to -old, then `finish`
     // terminates it): a locked original is refused here, at the step that starts that.

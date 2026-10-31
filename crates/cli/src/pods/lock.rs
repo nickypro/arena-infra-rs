@@ -4,19 +4,11 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use arena_core::capability::Op;
 use arena_core::provider::Provider;
 
 use crate::confirm;
 use crate::pods::selection::Selected;
-
-/// Why a pod can't be locked (or renamed), in the backend's own words (without the `not
-/// implemented:` prefix its error type prints).
-pub(crate) fn lock_why(e: arena_core::Error) -> String {
-    match e {
-        arena_core::Error::NotImplemented(why) => why,
-        other => other.to_string(),
-    }
-}
 
 /// Appended to a replace/cutover refused over a lock: the replacement isn't locked by itself.
 /// (Worded for all three: `replace --keep-old` and `migrate cutover` leave the terminate to
@@ -80,15 +72,25 @@ pub(crate) fn lock_settles(mut lock: std::fs::File) -> Option<arena_core::pull::
     }
 }
 
+/// The providers some of whose pods can be locked (a backend of theirs can, in the capability
+/// table — RunPod: on REST v2), for the hint that leaves the others out. Pure.
+fn lockable_providers() -> Vec<&'static str> {
+    use arena_core::capability::{support, Backend};
+    let mut out: Vec<&str> = Backend::ALL.into_iter().filter(|b| support(*b, Op::Lock).works()).map(Backend::provider).collect();
+    out.dedup();
+    out
+}
+
 /// `pods lock` / `pods unlock` (`lock` says which). The selection is sorted first
 /// ([`arena_core::lock::plan`]): pods already in that state are said and left alone; pods
-/// whose backend can't lock (RUNPOD_API=v1, Vast, Hetzner) are reported one by one and make
-/// the exit non-zero — the operator asked for them to be (un)protected and they aren't; the
-/// rest are set one at a time after one confirm, a failure reported and carried on from.
+/// whose backend can't lock (the capability table: RUNPOD_API=v1, Vast, Hetzner, Shadeform)
+/// are reported one by one and make the exit non-zero — the operator asked for them to be
+/// (un)protected and they aren't; the rest are set one at a time after one confirm, a failure
+/// reported and carried on from.
 pub(crate) async fn handle_lock(provider: &dyn Provider, sel: &Selected, lock: bool, dry_run: bool, yes: bool) -> Result<()> {
     use arena_core::lock;
     let (verb, done) = if lock { ("lock", "locked") } else { ("unlock", "unlocked") };
-    let plan = lock::plan(&sel.pods, lock, |p| provider.lock_support(p).map_err(lock_why));
+    let plan = lock::plan(&sel.pods, lock, |p| provider.supports(Op::Lock, Some(p)).check());
     for p in &plan.already {
         println!("= {} already {done}", p.name);
     }
@@ -97,14 +99,17 @@ pub(crate) async fn handle_lock(provider: &dyn Provider, sel: &Selected, lock: b
     }
     let unsupported: Vec<&str> = plan.unsupported.iter().map(|(p, _)| p.name.as_str()).collect();
     // The command fails for these: they were asked to be (un)protected and can't be. Other
-    // providers' pods in a broad selection can be left out with `--on runpod`.
-    let others_only = plan.unsupported.iter().all(|(p, _)| p.provider != "runpod");
+    // providers' pods in a broad selection can be left out with `--on <a provider that locks>`
+    // — which ones, the capability table says ([`lockable_providers`]).
+    let lockable = lockable_providers();
+    let others_only = plan.unsupported.iter().all(|(p, _)| !lockable.contains(&p.provider.as_str()));
+    let on: Vec<String> = lockable.iter().map(|p| format!("--on {p}")).collect();
     let cant = (!unsupported.is_empty()).then(|| {
         format!(
             "{} pod(s) can't be {done}: {}{}",
             unsupported.len(),
             unsupported.join(", "),
-            if others_only { " (leave other providers' pods out with --on runpod)" } else { "" }
+            if others_only && !on.is_empty() { format!(" (leave other providers' pods out with {})", on.join(" or ")) } else { String::new() }
         )
     });
     let names: Vec<&str> = plan.act.iter().map(|p| p.name.as_str()).collect();

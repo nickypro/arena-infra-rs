@@ -40,6 +40,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::Provider;
+use crate::capability::{Backend, Op};
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::config::Config;
 use crate::error::{Error, ProviderErrorKind, Result};
@@ -1137,6 +1138,14 @@ impl ShadeformProvider {
         }
     }
 
+    /// This backend with `client` for every request — under test, [`crate::http::offline_client`]:
+    /// nothing it sends can reach the real API.
+    #[cfg(test)]
+    pub(crate) fn with_client(mut self, client: Client) -> Self {
+        self.client = client;
+        self
+    }
+
     /// `SHADEFORM_API_KEY` plus the validated options.
     pub fn from_config(cfg: &Config) -> Result<Self> {
         let opts = ShadeformOpts::from_config(cfg)?;
@@ -1374,14 +1383,15 @@ impl ShadeformProvider {
     }
 }
 
-/// Why a Shadeform pod can't be stopped (or started): what `pods stop/start` say up front.
-pub const NO_STOP: &str = "Shadeform has no stop — an instance bills until it's deleted, idle or not; back it up \
-    (`arena pods backup <name>`), then `arena pods terminate <name>`";
 
 #[async_trait]
 impl Provider for ShadeformProvider {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    fn backend(&self) -> Option<Backend> {
+        Some(Backend::Shadeform)
     }
 
     fn describe(&self, spec: &PodSpec) -> String {
@@ -1487,16 +1497,14 @@ impl Provider for ShadeformProvider {
         }))
     }
 
+    /// No stop: an instance bills until it's deleted (the capability table's refusal).
     async fn stop_pod(&self, _id: &str) -> Result<()> {
-        Err(Error::NotImplemented(NO_STOP.into()))
+        Err(super::unsupported(self, Op::Stop))
     }
 
+    /// Nothing is ever stopped, so nothing to start: said as the stop's refusal (what to do instead).
     async fn start_pod(&self, _id: &str) -> Result<()> {
-        Err(Error::NotImplemented(NO_STOP.into()))
-    }
-
-    fn stop_support(&self, _pod: &Pod) -> Result<()> {
-        Err(Error::NotImplemented(NO_STOP.into()))
+        Err(super::unsupported(self, Op::Stop))
     }
 
     /// `SHADEFORM_READY_MINS`: a new instance not active (with an endpoint) by then is a
@@ -1537,10 +1545,6 @@ impl Provider for ShadeformProvider {
         }
         self.ours(id, "renamed").await?;
         self.post_ok(&format!("/instances/{id}/update"), Some(&json!({ "name": new_name })), "shadeform rename").await
-    }
-
-    fn rename_support(&self, _pod: &Pod) -> Result<()> {
-        Ok(())
     }
 
     fn check_create_extra(&self, extra: &Extra) -> Result<()> {

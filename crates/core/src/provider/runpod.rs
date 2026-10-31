@@ -17,6 +17,7 @@ use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Value};
 
 use super::{ContainerReset, Provider, RUNPOD_V1_REMEDY, RUNPOD_V1_RETIREMENT};
+use crate::capability::{Backend, Op};
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, ProviderErrorKind, Result};
 use crate::http::{judge, send_json_with, send_limited, status_error, Limits};
@@ -131,6 +132,14 @@ impl RunpodProvider {
             client: Client::new(),
             base: BASE.to_string(),
         }
+    }
+
+    /// This backend with `client` for every request — under test, [`crate::http::offline_client`]:
+    /// nothing it sends can reach the real API.
+    #[cfg(test)]
+    pub(crate) fn with_client(mut self, client: Client) -> Self {
+        self.client = client;
+        self
     }
 
     /// Point the REST calls at `base` with `client` — tests only, so the real
@@ -357,6 +366,10 @@ impl Provider for RunpodProvider {
         "runpod"
     }
 
+    fn backend(&self) -> Option<Backend> {
+        Some(Backend::RunpodV1)
+    }
+
     fn describe(&self, spec: &PodSpec) -> String {
         // v1 can't send a floor: say what its version list leaves out (finding #10).
         let note = match (spec.allowed_cuda.is_empty(), v1_cuda_versions(spec)) {
@@ -425,10 +438,6 @@ impl Provider for RunpodProvider {
         rename_via_graphql(&self.client, &self.api_key, id, new_name).await
     }
 
-    fn rename_support(&self, _pod: &Pod) -> Result<()> {
-        Ok(())
-    }
-
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
         // REST `PATCH /pods/{id}` resets the container (see `rename_pod`): exactly what a
         // reimage wants. `env` replaces the pod's env wholesale, so pass everything to keep.
@@ -441,14 +450,10 @@ impl Provider for RunpodProvider {
         Ok(parse_spec(&body))
     }
 
-    fn lock_support(&self, _pod: &Pod) -> Result<()> {
-        // REST v1's only pod PATCH resets the container (see `reimage_pod`), so it can't be
-        // used to flip a lock; v2's PATCH can.
-        Err(Error::NotImplemented(format!("not supported on RUNPOD_API=v1 — {RUNPOD_V1_REMEDY} to lock RunPod pods")))
-    }
-
-    async fn set_locked(&self, id: &str, _locked: bool) -> Result<()> {
-        self.lock_support(&Pod { id: id.into(), ..Default::default() })
+    /// Not on v1: its only pod PATCH resets the container (see `reimage_pod`), so it can't be
+    /// used to flip a lock; v2's PATCH can (the capability table says how to get there).
+    async fn set_locked(&self, _id: &str, _locked: bool) -> Result<()> {
+        Err(super::unsupported(self, Op::Lock))
     }
 
     fn check_create_extra(&self, extra: &Extra) -> Result<()> {
