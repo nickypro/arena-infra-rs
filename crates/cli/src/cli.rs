@@ -19,8 +19,6 @@ use crate::pods::RUN_TIMEOUT_SECS;
 use crate::proxy::ProxyCmd;
 use crate::{archive, image, jobs, money, offers, reap, spend};
 
-const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
-
 #[derive(Parser)]
 #[command(
     name = "arena",
@@ -33,12 +31,17 @@ const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 )]
 pub(crate) struct Cli {
     /// Path to config.env
-    #[arg(long, default_value = DEFAULT_CONFIG, global = true)]
-    pub config: PathBuf,
+    ///
+    /// Default: $ARENA_CONFIG, else ~/.config/arena/config.env if it exists, else
+    /// /home/dev/prod-ro/config.env. `config which` says which.
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
 
     /// Provider: runpod, vast, hetzner or shadeform
-    #[arg(long, default_value = "runpod", global = true)]
-    pub provider: String,
+    ///
+    /// Default: the config's PROVIDER, else runpod.
+    #[arg(long, global = true)]
+    pub provider: Option<String>,
 
     /// Skip the "Proceed? [y/N]" prompt (required when there's no terminal)
     #[arg(long, short = 'y', global = true)]

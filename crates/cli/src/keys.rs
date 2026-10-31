@@ -104,8 +104,9 @@ pub(crate) fn drop_key_row(dir: &std::path::Path, host: &str) -> std::io::Result
 /// minute means a wedged one, which must not hang the command (see `handle_copy_keys`).
 pub(crate) const COPY_KEYS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Where `keys gen` writes, and `setup` / `copy-keys` read, the per-host API-key CSVs.
-pub(crate) const KEYS_DIR: &str = "./keys";
+/// Where `keys gen` writes, and `setup` / `copy-keys` read, the per-host API-key CSVs: the
+/// fleet's `keys/`, next to the config (else `./keys`, warned: [`crate::fleet_files::keys_dir`]).
+pub(crate) use crate::fleet_files::keys_dir;
 
 /// Where a machine's OpenRouter key lives, for the lifecycle commands that move or drop it
 /// (`rename`, `terminate --revoke-key`): the local CSV `copy-keys` distributes from, and —
@@ -493,9 +494,12 @@ pub(crate) async fn handle_copy_keys(
     Ok(())
 }
 
-/// Where generated OpenRouter keys are persisted (also where `copy-keys` reads them).
-pub(crate) const OPENROUTER_KEYS_CSV: &str = "./keys/openrouter_api_keys.csv";
-/// [`OPENROUTER_KEYS_CSV`]'s file name, inside whichever keys dir is in use.
+/// Where generated OpenRouter keys are persisted (also where `copy-keys` reads them): the
+/// [`OPENROUTER_KEYS_LINK`] in the fleet's [`keys_dir`].
+pub(crate) fn openrouter_keys_csv(cfg: &Config) -> PathBuf {
+    PathBuf::from(keys_dir(cfg)).join(OPENROUTER_KEYS_LINK)
+}
+/// The OpenRouter keys CSV's file name, inside whichever keys dir is in use.
 pub(crate) const OPENROUTER_KEYS_LINK: &str = "openrouter_api_keys.csv";
 
 /// Resolve which machines a `keys` action targets, with the shared selector. A key belongs
@@ -694,14 +698,12 @@ pub(crate) async fn handle_keys(
 
     // `which` just reads the local CSV — no provisioning key / network needed.
     if let KeysCmd::Which = cmd {
-        let abs = std::fs::canonicalize(OPENROUTER_KEYS_CSV)
+        let csv = openrouter_keys_csv(cfg);
+        let abs = std::fs::canonicalize(&csv)
+            .or_else(|_| std::path::absolute(&csv))
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| {
-                std::env::current_dir()
-                    .map(|d| d.join(OPENROUTER_KEYS_CSV.trim_start_matches("./")).display().to_string())
-                    .unwrap_or_else(|_| OPENROUTER_KEYS_CSV.to_string())
-            });
-        match std::fs::read_to_string(OPENROUTER_KEYS_CSV) {
+            .unwrap_or_else(|_| csv.display().to_string());
+        match std::fs::read_to_string(&csv) {
             Ok(text) => {
                 let rows = arena_core::apikeys::parse_csv(&text);
                 println!("OpenRouter keys file: {abs}");
@@ -727,7 +729,7 @@ pub(crate) async fn handle_keys(
             )
         })?;
     let or = OpenRouter::new(prov_key).with_workspace(cfg.get("OPENROUTER_WORKSPACE"));
-    keys_with(cmd, provider, remote, cfg, &or, std::path::Path::new(KEYS_DIR), yes).await
+    keys_with(cmd, provider, remote, cfg, &or, std::path::Path::new(&keys_dir(cfg)), yes).await
 }
 
 /// `keys list`'s table: each key's cap, what it spent in the cap's period, today and this

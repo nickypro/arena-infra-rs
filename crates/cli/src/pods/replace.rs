@@ -12,7 +12,7 @@ use arena_core::ssh::SshTarget;
 use arena_core::{Config, PodSpec};
 
 use crate::cli::PlaceFlags;
-use crate::keys::{handle_copy_keys, KeySources, KEYS_DIR};
+use crate::keys::{handle_copy_keys, keys_dir, KeySources};
 use crate::pods::capable::CreateFlags;
 use crate::pods::create::{apply_spec_overrides, check_create_body, create_extra, sizing_flags, SpecOverrides};
 use crate::pods::home_copy::{copy_pod_files, pod_guard, remove_staging_for, verify_replacement, CopyOpts};
@@ -449,7 +449,8 @@ pub(crate) async fn handle_replace(
     // name or a raw id, so read the canonical name back from the fleet rather than trusting
     // the argument (a user may pass an id).
     let (owner, src_id, src_label) = resolve_target_any(cfg, target).await?;
-    let job = ReplaceJob { setup_timeouts, ov, place, opts, interrupt, keys_dir: KEYS_DIR, balance: Some(bal) };
+    let keys = keys_dir(cfg);
+    let job = ReplaceJob { setup_timeouts, ov, place, opts, interrupt, keys_dir: &keys, balance: Some(bal) };
     replace_on(remote, fleet, cfg, owner.as_ref(), src_id, src_label, job).await
 }
 
@@ -482,7 +483,7 @@ pub(crate) struct ReplaceJob<'a> {
     pub place: &'a PlaceFlags,
     pub opts: ReplaceOpts,
     pub interrupt: &'a Interrupt,
-    /// Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    /// Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     pub keys_dir: &'a str,
     /// Where the new pod's price is remembered for the balance ([`create_replacement`]);
     /// `None`: not remembered.

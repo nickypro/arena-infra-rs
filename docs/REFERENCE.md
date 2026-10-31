@@ -119,10 +119,10 @@ cargo run -p arena-cli -- pods create -n 3 --dry-run
 cargo run -p arena-cli -- pods create -n 3
 
 # interactive dashboard (or `arena tui`, which inherits --provider/--config); arena-tui itself
-# takes no arguments (any is refused) — its config is ARENA_CONFIG, default the prod path
+# takes no arguments (any is refused) — its config is ARENA_CONFIG, else ~/.config/arena/config.env
 ARENA_CONFIG=./config.env cargo run -p arena-tui
 
-# point at a different config
+# point at a different config (or export ARENA_CONFIG, or put it at ~/.config/arena/config.env)
 cargo run -p arena-cli -- --config ./config.env pods list
 ```
 
@@ -2530,8 +2530,8 @@ where `arena update` installs: next to the running binary — `readlink -f "$(co
 prints it on another box):
 
 ```bash
-mkdir -p /root/p2                                     # its own folder: keys/ is relative to it
-p2() { (cd /root/p2 && /home/dev/.cargo/bin/arena --config /root/p2/config.env "$@"); }
+mkdir -p /root/p2                                     # its own folder: keys/, the plan and backup/ live beside its config
+p2() { /home/dev/.cargo/bin/arena --config /root/p2/config.env "$@"; }
 p2 config check
 p2 proxy plan && p2 proxy apply                       # writes p2.conf only
 p2 pods up apple --owner alice                        # each person's machines
@@ -2539,9 +2539,11 @@ p2 spend                                              # per person; --by machine
 p2 tui                                                # its dashboard
 ```
 
-- `arena` reads `--config` (only `arena-tui` reads `ARENA_CONFIG`; `arena tui` passes `--config`
-  on) — hence `p2()`. Open the second fleet's dashboard with `p2 tui` only: its actions run
-  `arena` in the folder it was started from, and only `/root/p2` has the second fleet's `keys/`.
+- `p2()` names the second fleet's config on every command (`export ARENA_CONFIG=/root/p2/config.env`
+  in a shell of its own does the same: [which config](#which-config-which-provider-and-the-files-beside-it)).
+  `keys/`, `arena-plan.json` and `backup/` (when `LOCAL_BACKUP_DIR` is unset) are found beside the
+  config, `/root/p2`, from any directory; `p2 tui` opens its dashboard, whose actions run `arena`
+  with the same config.
 - **Cron: never `arena cron install` for the second fleet.** A crontab has one arena block, and
   its lines are known by command, not config: the second fleet's install would replace the first
   fleet's lines (`cron remove` would remove them), and both would share the locks in
@@ -2551,7 +2553,7 @@ p2 tui                                                # its dashboard
   `arena` fails there, quietly):
 
   ```
-  */2 * * * * root mkdir -p /root/.local/state/arena-cron-p2 && cd /root/p2 && flock -n /root/.local/state/arena-cron-p2/snapshot.lock /home/dev/.cargo/bin/arena --config /root/p2/config.env snapshot --public --out /root/p2/fleet.json >> /root/.local/state/arena-cron-p2/snapshot.log 2>&1
+  */2 * * * * root mkdir -p /root/.local/state/arena-cron-p2 && flock -n /root/.local/state/arena-cron-p2/snapshot.lock /home/dev/.cargo/bin/arena --config /root/p2/config.env snapshot --public --out /root/p2/fleet.json >> /root/.local/state/arena-cron-p2/snapshot.log 2>&1
   ```
 - **Shared provider accounts:** listings are per account, so the second fleet's `pods list` shows
   the first fleet's pods, and `--all` (or a command without targets) acts on them too. Name your
@@ -2559,6 +2561,44 @@ p2 tui                                                # its dashboard
   account. `teardown --check` lists every machine on the account.
 
 ## Config, plans and the provider APIs
+
+### Which config, which provider, and the files beside it
+
+**The config file**, first found wins (`arena` and `arena-tui` alike):
+
+| # | Where | Notes |
+| --- | --- | --- |
+| 1 | `--config <file>` | `arena` only; `arena tui` hands it to the dashboard |
+| 2 | `ARENA_CONFIG=<file>` | empty = unset; a file named here or by `--config` is read even if missing (the error says so) |
+| 3 | `~/.config/arena/config.env` | only if it exists |
+| 4 | `/home/dev/prod-ro/config.env` | the built-in default: ARENA's prod copy on its control box |
+
+`config which` says which one won (`source: …`) and warns about the ones that lost: an
+`ARENA_CONFIG` naming another file than `--config`'s, or a `~/.config/arena/config.env` passed over.
+Cron lines always carry `--config <file>` (`cron install` writes the file it was run with), so what
+cron reads never depends on its environment.
+
+**The provider** `create`/`up` make pods on, and whose key every listing needs: `--provider`, else
+the config's `PROVIDER` (e.g. `PROVIDER=hetzner` for a Hetzner-only fleet), else `runpod`. The
+dashboard's `ARENA_PROVIDER` stands in for `--provider`. Every other provider with a key is still
+listed and acted on as before; `offers` without `--provider` still compares every configured one.
+`config check` has a `PROVIDER` row (✗ for a name that isn't a provider) and `config which` says
+where the provider came from.
+
+**Files beside the config.** `keys/` (the API-key CSVs `keys gen` writes and `setup`/`copy-keys`
+read), `arena-plan.json` (`plan check`/`show` without `--file`) and `backup/` (where `pods pull` and
+`pods backup` copy pods when `LOCAL_BACKUP_DIR` is unset) are found in the config file's folder:
+
+| Beside the config | In the current directory | Used |
+| --- | --- | --- |
+| there | any | beside the config |
+| not there | there | the current directory, with a one-line warning to move it (`config which` and `config check` show ⚠) |
+| not there | not there | beside the config, made there when first written |
+
+With the read-only prod copy (`/home/dev/prod-ro/config.env`) they stay in the current directory,
+as before and without a warning: that folder holds only the config, and prod's cron runs in
+`/root`. `config which` lists all three with where each was found. An explicit
+`LOCAL_BACKUP_DIR` is used as written: make it absolute (cron and the reaper need that).
 
 ### `config check | set | which`
 
@@ -2572,7 +2612,9 @@ started.
 KEY VALUE` writes a key (e.g. an API key) into config.env — or give just `KEY` and **pipe the value
 on stdin** (`printf %s "$TOK" | arena config set HF_TOKEN`, script-friendly, keeps secrets out of
 `argv`/`ps`), or with no args prompt interactively (the picker shows which keys are already set);
-`config which` shows the active config file (path, readable/**writable**), what parsed, and any keys
+`config which` shows the active config file (path, readable/**writable**) and where it came from
+(and what lost: [which config](#which-config-which-provider-and-the-files-beside-it)), the provider
+and where that came from, what parsed, where `keys/`, the plan and the backup dir are, and any keys
 coming from the environment.
 
 After the report, `config check` looks at **this box's disk** (local, read-only; advice, never a
@@ -2698,8 +2740,9 @@ same. See [What gets backed up, where and when](BACKUPS.md#what-gets-backed-up-w
 pod, GPU stats via `nvidia-smi`, git branch, a setup-health check, and an optional progress signal
 (`PROGRESS_CMD`) — all over SSH in **one** probe per pod. Fetching runs in a **background task** so
 the UI never freezes; it auto-refreshes (`ARENA_REFRESH_SECS`, default 5) and `f` cycles the cadence
-live (2/5/10/20/60s). `ARENA_PROVIDER` (default `runpod`) is where the add-pod form starts; config via
-`ARENA_CONFIG`.
+live (2/5/10/20/60s). `ARENA_PROVIDER` (else the config's `PROVIDER`, else `runpod`) is where the add-pod
+form starts; the config is found as `arena` finds it, `ARENA_CONFIG` first ([which
+config](#which-config-which-provider-and-the-files-beside-it)). `arena tui` sets both.
 
 ### Columns
 

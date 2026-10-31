@@ -922,7 +922,7 @@ fn handle_status(env: &ReapEnv<'_>, sel: &Select, json: bool) -> Result<()> {
         ));
     }
     // What's frozen under each root's `reaped/` — kept for good — by kind, and its size (W7 B-RS8b).
-    let snap = env.cfg.get("LOCAL_BACKUP_DIR").map(str::trim).filter(|d| !d.is_empty()).unwrap_or("./backup").to_string();
+    let snap = crate::local_backup_dir(env.cfg);
     let big = arena_core::pull::big_root(&snap, env.cfg.get("LOCAL_BACKUP_BIG_DIR"));
     for root in [snap, big] {
         if let Some(line) = reaped_summary(Path::new(&root)) {
@@ -1003,7 +1003,7 @@ struct RunCtx<'a, 'b> {
     mode: Mode,
     naming: Naming<'a>,
     prefix: String,
-    /// Where the per-pod backup locks live (`LOCAL_BACKUP_DIR`, when absolute).
+    /// Where the per-pod backup locks live (`LOCAL_BACKUP_DIR`, else the fleet's `backup/`, when absolute).
     lock_dir: Option<String>,
     repo: String,
     log: std::sync::Mutex<Vec<String>>,
@@ -1233,7 +1233,7 @@ struct DestBad {
 async fn dest_check(cfg: &Config, settings: &ReapSettings, rsync: &str) -> std::result::Result<Dest, DestBad> {
     let mut bad = Vec::new();
     let mut no_room = Vec::new();
-    let snap_root = cfg.get("LOCAL_BACKUP_DIR").map(str::trim).filter(|d| !d.is_empty()).unwrap_or("./backup").to_string();
+    let snap_root = crate::local_backup_dir(cfg);
     let big_root = arena_core::pull::big_root(&snap_root, cfg.get("LOCAL_BACKUP_BIG_DIR"));
     for (root, tier) in [(&snap_root, arena_core::pull::Tier::Snapshot), (&big_root, arena_core::pull::Tier::Big)] {
         let p = Path::new(root);
@@ -1381,7 +1381,8 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
         _ => None,
     };
     let mode = if demoted.is_some() { Mode::Observe } else { asked };
-    let lock_dir = cfg.get("LOCAL_BACKUP_DIR").map(str::trim).filter(|d| Path::new(d).is_absolute()).map(String::from);
+    // The same backup dir every other copy locks in (`LOCAL_BACKUP_DIR`, else the fleet's `backup/`).
+    let lock_dir = Some(crate::local_backup_dir(cfg)).filter(|d| Path::new(d).is_absolute());
     let ctx = RunCtx {
         env,
         settings: settings.clone(),
@@ -2756,7 +2757,7 @@ pub(crate) fn readiness_rows_for(cfg: &Config, rsync: &str, full: bool) -> (Vec<
         Err(_) => (false, "invalid — no RunPod pod is ever reaped (the reaper needs REST v2, the default)".to_string()),
     };
     row(Some(v2), "RUNPOD_API", detail, Gap::None);
-    let snap = cfg.get("LOCAL_BACKUP_DIR").map(str::trim).filter(|d| !d.is_empty()).unwrap_or("./backup").to_string();
+    let snap = crate::local_backup_dir(cfg);
     let big = arena_core::pull::big_root(&snap, cfg.get("LOCAL_BACKUP_BIG_DIR"));
     for (root, tier) in [(snap.clone(), arena_core::pull::Tier::Snapshot), (big, arena_core::pull::Tier::Big)] {
         let p = Path::new(&root);

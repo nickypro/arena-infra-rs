@@ -12,7 +12,7 @@ use arena_core::Config;
 use clap::Subcommand;
 
 use crate::cli::PlaceFlags;
-use crate::keys::KEYS_DIR;
+use crate::keys::keys_dir;
 use crate::pods::create::{sizing_flags, SpecOverrides};
 use crate::pods::home_copy::{copy_pod_files, remove_staging_for, verify_replacement, CopyOpts};
 use crate::pods::lifecycle::proxied_name;
@@ -227,7 +227,8 @@ pub(crate) async fn handle_migrate_copy(
     // re-sync that won't run setup (it's a config error either way; fix it once).
     let setup_timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, None)?;
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
-    let job = MigrateCopyJob { setup_timeouts, ov, place, dry_run, yes, interrupt, keys_dir: KEYS_DIR, balance: Some(bal) };
+    let keys = keys_dir(cfg);
+    let job = MigrateCopyJob { setup_timeouts, ov, place, dry_run, yes, interrupt, keys_dir: &keys, balance: Some(bal) };
     migrate_copy_on(remote, cfg, owner.as_ref(), &canonical, &pods, job).await
 }
 
@@ -239,7 +240,7 @@ pub(crate) struct MigrateCopyJob<'a> {
     pub dry_run: bool,
     pub yes: bool,
     pub interrupt: &'a Interrupt,
-    /// Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    /// Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     pub keys_dir: &'a str,
     /// Where `-new`'s price is remembered for the balance ([`create_replacement`]); `None`:
     /// not remembered.
@@ -407,7 +408,7 @@ pub(crate) async fn handle_migrate_cutover(
     opts: CutoverOpts,
 ) -> Result<()> {
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
-    migrate_cutover_on(remote, fleet, cfg, owner.as_ref(), &canonical, &pods, opts, KEYS_DIR).await
+    migrate_cutover_on(remote, fleet, cfg, owner.as_ref(), &canonical, &pods, opts, &keys_dir(cfg)).await
 }
 
 /// When `<name>-new` was last synced, as the plan says it: `2026-10-08 11:02 UTC (3h ago)`,
@@ -445,7 +446,7 @@ pub(crate) async fn migrate_cutover_on(
     canonical: &str,
     pods: &[arena_core::Pod],
     opts: CutoverOpts,
-    // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    // Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     keys_dir: &str,
 ) -> Result<()> {
     let CutoverOpts { skip_proxy, no_final_sync, dry_run, yes } = opts;

@@ -196,10 +196,9 @@ fn command_list(cmd: &Command, groups: Groups) -> String {
     out
 }
 
-/// Parse `args` as `Cli::parse` would, over [`command`]; and whether `--provider` was given —
-/// its default (`runpod`) reads the same as `--provider runpod`, and `offers` shows every
-/// configured provider unless one is named. Anything but the default counts (today the
-/// command line is its only other source).
+/// Parse `args` as `Cli::parse` would, over [`command`]; and whether `--provider` was given on
+/// the command line: `offers` shows every configured provider unless one is named there (the
+/// config's `PROVIDER` picks what `create`/`up` make pods on, not what `offers` compares).
 pub(crate) fn parse_from<I, T>(args: I) -> Result<(super::Cli, bool), clap::Error>
 where
     I: IntoIterator<Item = T>,
@@ -387,11 +386,11 @@ mod tests {
         assert!(matches!(parse(&["arena", "gp", "--json"]).0.cmd, Cmd::Gpus { json: true }));
         assert!(matches!(parse(&["arena", "of", "--all"]).0.cmd, Cmd::Offers { all: true, .. }));
         let (cli, named) = parse(&["arena", "offers"]);
-        assert_eq!((cli.provider.as_str(), named), ("runpod", false));
+        assert_eq!((cli.provider.as_deref(), named), (None, false));
         for args in [&["arena", "--provider", "runpod", "offers"][..], &["arena", "offers", "--provider", "vast"]] {
             let (cli, named) = parse(args);
             assert!(named, "{args:?}");
-            assert_eq!(cli.provider, args[if args[1] == "offers" { 3 } else { 2 }]);
+            assert_eq!(cli.provider.as_deref(), Some(args[if args[1] == "offers" { 3 } else { 2 }]));
         }
         assert!(parse_from(["arena", "pods", "frobnicate"]).is_err());
     }
