@@ -57,8 +57,15 @@ impl Provider for Vms {
         let mut pod = queue.remove(0);
         pod.name = spec.name.clone();
         pod.gpu_type = spec.server_type.clone();
-        self.record(format!("create {} {}", spec.name, spec.server_type.as_deref().unwrap_or("-")));
-        self.pods.lock().unwrap().push(pod.clone());
+        // A create labelled a spare lands among the spares (left out of the fleet listing).
+        let spare = spec.api_extra.as_ref().and_then(|x| x.get("labels")).and_then(|l| l.get(arena_core::spare::SPARE_LABEL)).and_then(|v| v.as_str()).map(String::from);
+        let mark = spare.as_ref().map(|v| format!(" [spare={v}]")).unwrap_or_default();
+        self.record(format!("create {} {}{mark}", spec.name, spec.server_type.as_deref().unwrap_or("-")));
+        if spare.is_some() {
+            self.spares.lock().unwrap().push(pod.clone());
+        } else {
+            self.pods.lock().unwrap().push(pod.clone());
+        }
         Ok(pod)
     }
     async fn stop_pod(&self, _id: &str) -> Result<()> {
@@ -70,6 +77,7 @@ impl Provider for Vms {
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         self.record(format!("terminate {id}"));
         self.pods.lock().unwrap().retain(|p| p.id != id);
+        self.spares.lock().unwrap().retain(|p| p.id != id);
         Ok(())
     }
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
@@ -166,6 +174,7 @@ fn execs(remote: &FakeRemote, host: &str) -> Vec<String> {
     remote.calls_to(host).into_iter().filter_map(|c| if let RemoteCall::Exec { cmd, .. } = c { Some(cmd) } else { None }).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replace_job<'a>(
     ov: &'a SpecOverrides,
     place: &'a PlaceFlags,
@@ -447,4 +456,42 @@ async fn the_proxy_check_reads_a_vms_own_server_id() {
     // A backend whose machines show no id can't be confirmed (and isn't asked).
     assert!(!proxy_reaches_pod(&fake, &cfg, "vast", "devtest-alpha", "202").await.unwrap());
     assert_eq!(fake.calls().len(), 3);
+}
+
+/// The swapper's step 1 as a command: `spare up 2 --server-type cx43` names them after the free
+/// spare numbers (taken names skipped, fleet ones too), labels them spares (so the fleet never
+/// lists them), waits for them; `spare down` deletes only spares — a fleet name is refused.
+#[tokio::test(start_paused = true)]
+async fn spares_are_made_labelled_and_deleted_only_as_spares() {
+    use crate::pods::spare::{spare_on, SpareCmd};
+    let dir = tmpdir("spares");
+    let cfg = cfg(&dir.0);
+    let f = Vms::new(vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1")], vec![vm("301", "devtest-spare-1", "cx43", "10.0.0.3", "fsn1")]);
+    *f.to_create.lock().unwrap() = vec![vm("302", "", "", "10.0.0.4", "fsn1"), vm("303", "", "", "10.0.0.5", "hel1")];
+    let interrupt = Interrupt::manual();
+    let up = SpareCmd::Up {
+        count: 2,
+        server_type: Some("cx43".into()),
+        image: None,
+        keep_trying: false,
+        retry_mins: 0,
+        retry_secs: 60,
+        no_wait: false,
+        dry_run: false,
+    };
+    spare_on(up, &cfg, &f, &f, true, &interrupt).await.unwrap();
+    assert_eq!(f.calls(), ["create devtest-spare-2 cx43 [spare=devtest]", "create devtest-spare-3 cx43 [spare=devtest]"]);
+    assert_eq!(f.list_pods().await.unwrap().len(), 1, "never in the fleet listing");
+    // Down: by short name and id; a fleet machine is no spare.
+    let down = |names: &[&str]| SpareCmd::Down { names: names.iter().map(|n| n.to_string()).collect(), all: false, dry_run: false };
+    let e = spare_on(down(&["alpha"]), &cfg, &f, &f, true, &interrupt).await.unwrap_err().to_string();
+    assert!(e.contains("isn't one of this cohort's spares"), "{e}");
+    spare_on(down(&["spare-2", "303"]), &cfg, &f, &f, true, &interrupt).await.unwrap();
+    assert_eq!(&f.calls()[2..], ["terminate 302", "terminate 303"]);
+    spare_on(SpareCmd::Down { names: vec![], all: true, dry_run: false }, &cfg, &f, &f, true, &interrupt).await.unwrap();
+    assert_eq!(f.calls().last().unwrap(), "terminate 301");
+    assert!(f.spares().await.unwrap().is_empty());
+    // At most 20 at a time; a server type off the list is refused before anything.
+    let many = SpareCmd::Up { count: 21, server_type: None, image: None, keep_trying: false, retry_mins: 0, retry_secs: 60, no_wait: true, dry_run: false };
+    assert!(spare_on(many, &cfg, &f, &f, true, &interrupt).await.unwrap_err().to_string().contains("1 to 20"));
 }

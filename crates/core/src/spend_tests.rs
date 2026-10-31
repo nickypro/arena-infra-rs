@@ -1147,3 +1147,34 @@ fn a_machine_taken_as_the_new_pod_keeps_its_row_under_the_moved_owner() {
     let m = machine(&s, "hetzner", "5");
     assert_eq!((m.owner.as_deref(), m.start, m.start_how), (Some("alice"), T0 + H, StartHow::Seen));
 }
+
+/// Capacity spares bill like any machine, but no fleet listing shows one: a spare listing
+/// starts and extends its row, a fleet listing without it doesn't end it, a spare listing
+/// without it does — unless it was taken into the fleet (adopted, then listed there), when its
+/// row goes on as an ordinary machine under its new name and owner.
+#[test]
+fn spares_are_counted_until_deleted_and_go_on_once_taken() {
+    let spare1 = running("hetzner", "7", "devtest-spare-1", 0.02);
+    let spare2 = running("hetzner", "8", "devtest-spare-2", 0.02);
+    let alpha = running("hetzner", "1", "devtest-alpha", 0.01);
+    let mut s = created(tracked(), &alpha, &given("alice"), T0);
+    s = observe_spares(s, "hetzner", &[spare1.clone(), spare2.clone()], &naming(), T0);
+    assert!(machine(&s, "hetzner", "7").spare);
+    // The fleet listings (dashboard, cron) never show them: nothing ends.
+    s = watch(s, &["hetzner"], std::slice::from_ref(&alpha), T0 + 20 * M, T0 + 2 * H);
+    assert!(machine(&s, "hetzner", "7").is_open() && machine(&s, "hetzner", "8").is_open(), "{:#?}", s.machines);
+    // spare-1 taken as alpha-new (adopted, then in the fleet's listings); spare-2 deleted.
+    let taken = Pod { name: "devtest-alpha-new".into(), ..spare1.clone() };
+    s = apply_event(s, &Event::Adopted { pod: &taken, owner: &OwnerRule::Inherit }, T0 + 2 * H + M);
+    s = see(s, &["hetzner"], &[], &[alpha.clone(), taken.clone()], T0 + 2 * H + 2 * M);
+    s = observe_spares(s, "hetzner", &[], &naming(), T0 + 3 * H);
+    let m7 = machine(&s, "hetzner", "7");
+    assert_eq!((m7.spare, m7.is_open(), m7.owner.as_deref(), m7.name.as_str()), (false, true, Some("alice"), "devtest-alpha-new"));
+    let m8 = machine(&s, "hetzner", "8");
+    assert_eq!((m8.spare, m8.ended.map(|e| e.how)), (true, Some(EndHow::Vanished)));
+    assert!(close(m8.accrued, 0.06), "3 h at 0.02 (its last sighting carried to the end): {}", m8.accrued);
+    // Another fleet's spare (another prefix) is never counted.
+    let theirs = running("hetzner", "9", "other-spare-1", 0.02);
+    let s = observe_spares(s, "hetzner", &[theirs], &naming(), T0 + 4 * H);
+    assert!(s.machines.iter().all(|m| m.id != "9"));
+}

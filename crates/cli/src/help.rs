@@ -40,7 +40,7 @@ pub(crate) const PODS: Groups = &[
     ("Look", &["list", "test", "idle", "ask", "jobs", "logs"]),
     ("Make", &["up", "create", "setup", "start", "copy-keys"]),
     ("Change", &["rename", "set-branch", "run", "cp", "lock", "unlock", "reimage"]),
-    ("Move", &["replace", "migrate"]),
+    ("Move", &["replace", "migrate", "spare"]),
     ("Save", &["backup", "pull", "init-branches", "baseline", "restore"]),
     ("Stop", &["stop", "restart", "terminate", "reap"]),
 ];

@@ -173,10 +173,21 @@ pub(crate) async fn balance_report(
             Err(_) => Some(Err(format!("timed out after {}s", balance::COMMAND_TIMEOUT.as_secs()))),
         }
     };
-    let (listed, fetched, archive) = tokio::join!(
+    // The capacity spares (Hetzner) likewise: in no fleet listing, billing all the same.
+    let spares = async {
+        if flags.no_live {
+            return None;
+        }
+        match arena_core::ratelimit::bounded(balance::COMMAND_TIMEOUT, bal.api.spares_eur_per_hr()).await {
+            Ok(read) => read,
+            Err(_) => Some(Err(format!("timed out after {}s", balance::COMMAND_TIMEOUT.as_secs()))),
+        }
+    };
+    let (listed, fetched, archive, spares) = tokio::join!(
         provider.list_by_provider(),
         balance::observe(bal.api.as_ref(), &state, mode, balance::COMMAND_TIMEOUT, now),
-        archive
+        archive,
+        spares
     );
     let listing = Listing::from_results(listed);
     let pods = listing.pods();
@@ -192,6 +203,9 @@ pub(crate) async fn balance_report(
     let mut hetzner = balance::postpaid_view(&listing, &pods);
     if let (Some(v), Some(read)) = (hetzner.as_mut(), archive) {
         balance::add_archive(v, read);
+    }
+    if let (Some(v), Some(read)) = (hetzner.as_mut(), spares) {
+        balance::add_spares(v, read);
     }
     views.extend(hetzner);
     for (p, e) in listing.errors() {

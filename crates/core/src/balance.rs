@@ -1663,6 +1663,13 @@ pub struct AccountView {
     /// Hetzner: why the archive's cost couldn't be read (it then isn't in `burn`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archive_unread: Option<String>,
+    /// Hetzner: the capacity spares' share of `burn` (`pods spare up`: servers in no fleet
+    /// listing, billing like any), when `arena balance` read them and there are some.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spares_per_hr: Option<f64>,
+    /// Hetzner: why the spares couldn't be read (they then aren't in `burn`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spares_unread: Option<String>,
 }
 
 impl AccountView {
@@ -1695,6 +1702,8 @@ impl AccountView {
             owed: None,
             archive_per_hr: None,
             archive_unread: None,
+            spares_per_hr: None,
+            spares_unread: None,
         }
     }
 
@@ -1812,6 +1821,22 @@ pub fn add_archive(v: &mut AccountView, read: Result<Option<f64>, String>) {
         }
         Ok(_) => {}
         Err(e) => v.archive_unread = Some(e),
+    }
+}
+
+/// Add the capacity spares' cost ([`BalanceApi::spares_eur_per_hr`]) to Hetzner's row, as
+/// [`add_archive`] does the archive's: billed by the same account, in no fleet listing. None
+/// (or no cost) changes nothing; a failed read is said and left out.
+pub fn add_spares(v: &mut AccountView, read: Result<f64, String>) {
+    match read {
+        Ok(per_hr) if per_hr.is_finite() && per_hr > 0.0 => {
+            v.spares_per_hr = Some(per_hr);
+            if let Some(b) = v.burn.as_mut() {
+                b.per_hr += per_hr;
+            }
+        }
+        Ok(_) => {}
+        Err(e) => v.spares_unread = Some(e),
     }
 }
 
@@ -2323,6 +2348,12 @@ pub fn notes(views: &[AccountView], policy: &BalancePolicy, now: u64) -> Vec<Str
             }
             if let Some(e) = &v.archive_unread {
                 out.push(format!("{name}: the backup archive's cost couldn't be read ({e}) — not included"));
+            }
+            if let Some(sp) = v.spares_per_hr {
+                out.push(format!("{name}: includes the capacity spares, {}/h (nobody's machines yet; `arena pods spare list`)", money(v, sp)));
+            }
+            if let Some(e) = &v.spares_unread {
+                out.push(format!("{name}: the capacity spares couldn't be read ({e}) — not included"));
             }
         }
     }
@@ -3014,6 +3045,11 @@ pub trait BalanceApi: Send + Sync {
     async fn archive_eur_per_hr(&self) -> Option<Result<Option<f64>, String>> {
         None
     }
+    /// The capacity spares' cost (`pods spare up`: EUR/h, summed over the ones billing) —
+    /// Hetzner spend in no fleet listing. `None`: no Hetzner key, not asked. Reads only.
+    async fn spares_eur_per_hr(&self) -> Option<Result<f64, String>> {
+        None
+    }
 }
 
 /// A reader's memory of its own live attempts.
@@ -3046,6 +3082,8 @@ pub struct HttpBalanceApi {
     /// The backup archive's own Hetzner project (its token, else the fleet's) and this
     /// cohort's names: priced for Hetzner's row only.
     archive: Option<(crate::archive::HetznerArchiveCloud, crate::archive::ArchiveNames)>,
+    /// The fleet's Hetzner project, for its capacity spares (`HETZNER_API_KEY`).
+    spares: Option<crate::provider::hetzner::HetznerProvider>,
 }
 
 impl HttpBalanceApi {
@@ -3064,6 +3102,9 @@ impl HttpBalanceApi {
             archive: crate::archive::archive_token(cfg).zip(crate::archive::ArchiveNames::from_config(cfg).ok()).map(
                 |((token, _), names)| (crate::archive::HetznerArchiveCloud::new(token), names),
             ),
+            spares: cfg.get("HETZNER_API_KEY").map(str::trim).filter(|k| !k.is_empty()).map(|k| {
+                crate::provider::hetzner::HetznerProvider::new(k, crate::provider::hetzner::HetznerOpts::from_config(cfg))
+            }),
         }
     }
 
@@ -3082,6 +3123,7 @@ impl HttpBalanceApi {
             vast_base: vast_base.into(),
             shadeform_base: String::new(),
             archive: None,
+            spares: None,
         }
     }
 
@@ -3129,6 +3171,12 @@ impl BalanceApi for HttpBalanceApi {
     async fn archive_eur_per_hr(&self) -> Option<Result<Option<f64>, String>> {
         let (cloud, names) = self.archive.as_ref()?;
         Some(crate::archive::cloud::eur_per_hr(cloud, names).await.map_err(|e| e.to_string()))
+    }
+
+    async fn spares_eur_per_hr(&self) -> Option<Result<f64, String>> {
+        use crate::spare::SpareCloud;
+        let cloud = self.spares.as_ref()?;
+        Some(cloud.spares().await.map(|s| crate::spare::cost_per_hr(&s).0).map_err(|e| e.to_string()))
     }
 
     fn last_live_attempt(&self, account: Account) -> Option<u64> {
@@ -3492,6 +3540,25 @@ mod tests {
     use super::*;
     use crate::proxy::Listing;
     use serde_json::json;
+
+    /// Capacity spares bill the Hetzner account in no fleet listing: `arena balance` adds their
+    /// €/h to Hetzner's burn as its own named part; none adds nothing; a failed read is said.
+    #[test]
+    fn the_spares_cost_is_in_hetzners_burn_and_said() {
+        let hz = Pod { id: "1".into(), name: "x-apple".into(), provider: "hetzner".into(), status: "RUNNING".into(), cost_per_hr: Some(0.01), ..Default::default() };
+        let listing = Listing::from_results(vec![("hetzner".into(), Ok(vec![hz.clone()]))]);
+        let mut v = postpaid_view(&listing, &[hz]).unwrap();
+        add_spares(&mut v, Ok(0.031));
+        assert!((v.burn.unwrap().per_hr - 0.041).abs() < 1e-9 && v.spares_per_hr == Some(0.031));
+        let lines = notes(&[v.clone()], &BalancePolicy::default(), 0).join("\n");
+        assert!(lines.contains("includes the capacity spares, €0.031/h"), "{lines}");
+        let mut none = v.clone();
+        none.spares_per_hr = None;
+        add_spares(&mut none, Ok(0.0));
+        assert_eq!(none.spares_per_hr, None);
+        add_spares(&mut none, Err("hetzner servers HTTP 503".into()));
+        assert!(notes(&[none], &BalancePolicy::default(), 0).join("\n").contains("the capacity spares couldn't be read (hetzner servers HTTP 503)"));
+    }
 
     const NOW: u64 = 1_791_460_800; // 2026-10-08T12:00:00Z
     const H: u64 = 3_600;

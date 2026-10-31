@@ -54,6 +54,7 @@ pub(crate) mod restore;
 pub(crate) mod run;
 pub(crate) mod selection;
 pub(crate) mod setup;
+pub(crate) mod spare;
 
 // Per-call SSH budgets (PLAN 1.B). Every pod-SSH call is bounded so one wedged pod can
 // never hang a fleet command: it reports `✗ <name>: timed out after Ns`, counts as a
@@ -841,6 +842,10 @@ async fn handle_pods_bal(
                 handle_migrate_status(cfg, &target).await?;
             }
         },
+
+        PodCmd::Spare(cmd) => {
+            crate::pods::spare::handle_spare(cmd, cfg, yes, &interrupt).await?;
+        }
 
         PodCmd::Terminate { target, all, unlock, revoke_key, skip_proxy, dry_run } => {
             let or = openrouter_client(cfg);

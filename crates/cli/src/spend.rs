@@ -63,8 +63,7 @@ impl SpendCtx {
         self.path.as_ref().and_then(|p| p.as_ref().ok()).map(PathBuf::as_path)
     }
 
-    /// The ledger as it stands (empty without one).
-    #[cfg(test)]
+    /// The ledger as it stands (empty without one, or unreadable).
     pub(crate) fn state(&self) -> spend::SpendState {
         self.path().map(|p| spend::load(p).0).unwrap_or_default()
     }
@@ -74,6 +73,12 @@ impl SpendCtx {
     /// meanwhile is newer than what the listing saw, and the fold keeps it.
     pub(crate) fn listing(&self, listing: &Listing, pods: &[Pod], at: u64) {
         spend::record_listing(self.path(), listing, pods, &self.naming(), at);
+    }
+
+    /// Record a complete listing of `provider`'s capacity spares, begun `at` (they're in no
+    /// fleet listing).
+    pub(crate) fn spares(&self, provider: &str, spares: &[Pod], at: u64) {
+        spend::record_spares(self.path(), provider, spares, &self.naming(), at);
     }
 
     /// Record a complete key listing begun `at`: each key's usage, read before anything
@@ -511,10 +516,26 @@ pub(crate) async fn spend_report(
         }
     };
     let currency = async { within(ctx.api.hetzner_currency()).await.unwrap_or_else(|()| Some(Err(late()))) };
+    // The capacity spares (Hetzner) are in no fleet listing: read on their own.
+    let spares = async {
+        let cloud = crate::pods::list::spare_reader(cfg)?;
+        Some(match within(cloud.spares()).await {
+            Ok(r) => r.map_err(|e| e.to_string()),
+            Err(()) => Err(late()),
+        })
+    };
     // Recorded and reported as of `now`, when the reads began: what a command recorded
     // meanwhile is newer, and stands.
-    let ((listing, pods, enrich_warning), key_list, currency) = tokio::join!(listing, key_list, currency);
+    let ((listing, pods, enrich_warning), key_list, currency, spares) = tokio::join!(listing, key_list, currency, spares);
     stderr.extend(enrich_warning);
+    let spares = match spares {
+        Some(Ok(s)) => Some(s),
+        Some(Err(e)) => {
+            stderr.push(format!("warning: the capacity spares not read ({e}) — counted to when they were last seen"));
+            None
+        }
+        None => None,
+    };
     // Billing from where the window (or the ledger) begins.
     let from = arena_core::balance::floor_hour(flags.since.or(before.since).unwrap_or(now).min(now));
     let (pod_bill, account) = tokio::join!(
@@ -545,6 +566,9 @@ pub(crate) async fn spend_report(
     };
     let (state, warning) = spend::record(&path, now, |mut s| {
         s = spend::observe(s, &listing, &pods, &naming, now);
+        if let Some(sp) = &spares {
+            s = spend::observe_spares(s, "hetzner", sp, &naming, now);
+        }
         if let Some(k) = keys_ok {
             s = spend::observe_keys(s, k, &naming, now);
         }

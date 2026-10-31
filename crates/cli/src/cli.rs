@@ -13,6 +13,7 @@ use crate::cron::CronCmd;
 use crate::keys::KeysCmd;
 use crate::plan::PlanCmd;
 use crate::pods::migrate::MigrateCmd;
+use crate::pods::spare::SpareCmd;
 use crate::pods::placement::parse_max_price;
 use crate::pods::RUN_TIMEOUT_SECS;
 use crate::proxy::ProxyCmd;
@@ -861,6 +862,11 @@ pub(crate) enum PodCmd {
         #[command(subcommand)]
         cmd: MigrateCmd,
     },
+    /// Capacity spares (Hetzner): make, list, delete
+    ///
+    /// Servers made ahead of need, taken later by `migrate copy <name> --onto-spare`.
+    #[command(subcommand, verbatim_doc_comment)]
+    Spare(SpareCmd),
     /// Terminate (delete) a pod, or every pod with --all
     ///
     /// IRREVERSIBLE: the pod and its disk are gone. One pod at a time (no ranges or lists); a
