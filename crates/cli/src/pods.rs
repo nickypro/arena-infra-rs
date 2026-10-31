@@ -43,6 +43,7 @@ pub(crate) mod capable;
 pub(crate) mod copy;
 pub(crate) mod copy_home;
 pub(crate) mod create;
+pub(crate) mod datavol;
 pub(crate) mod health;
 pub(crate) mod home_copy;
 pub(crate) mod lifecycle;
@@ -834,7 +835,7 @@ async fn handle_pods_bal(
                 handle_migrate_copy(remote, cfg, &target, &ov, &place, how, &interrupt, bal).await?;
             }
             MigrateCmd::Cutover { target, yes: y, force, skip_proxy, no_final_sync, dry_run } => {
-                let opts = CutoverOpts { skip_proxy, no_final_sync, dry_run, yes: yes || y, force };
+                let opts = CutoverOpts { volumes: None, skip_proxy, no_final_sync, dry_run, yes: yes || y, force };
                 handle_migrate_cutover(remote, provider, cfg, &target, opts).await?;
             }
             MigrateCmd::Finish { target, yes: y, discard_stopped, dry_run } => {
@@ -853,12 +854,16 @@ async fn handle_pods_bal(
             crate::pods::spare::handle_spare(cmd, cfg, yes, &interrupt).await?;
         }
 
+        PodCmd::Volume(cmd) => {
+            crate::pods::datavol::handle_volume(cmd, remote, provider, cfg, yes).await?;
+        }
+
         PodCmd::CopyHome { from, to, overwrite, force, dry_run } => {
             let opts = crate::pods::copy_home::CopyHomeOpts { overwrite, force, dry_run, yes };
             crate::pods::copy_home::handle_copy_home(remote, cfg, &from, &to, opts).await?;
         }
 
-        PodCmd::Terminate { target, all, unlock, revoke_key, skip_proxy, dry_run } => {
+        PodCmd::Terminate { target, all, unlock, revoke_key, delete_volumes, skip_proxy, dry_run } => {
             let or = openrouter_client(cfg);
             let book = KeyBook::new(OPENROUTER_KEYS_CSV, or.as_ref());
             let target = match (all, target) {
@@ -866,7 +871,9 @@ async fn handle_pods_bal(
                 (false, Some(t)) => Some(t),
                 (false, None) => anyhow::bail!("specify a pod (name or id) to terminate, or pass --all"),
             };
-            let opts = TerminateOpts { unlock, revoke_key, skip_proxy, dry_run, yes };
+            let cloud = crate::pods::datavol::cloud_for(cfg);
+            let volumes = cloud.as_ref().map(|c| c as &dyn arena_core::datavol::VolumeCloud);
+            let opts = TerminateOpts { unlock, revoke_key, delete_volumes, volumes, skip_proxy, dry_run, yes };
             handle_terminate(provider, cfg, &book, target.as_deref(), opts).await?;
         }
 

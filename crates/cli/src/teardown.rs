@@ -143,7 +143,7 @@ async fn collect(
     if let Probe::Got(k) = &keys {
         tracking.keys(k, now);
     }
-    let HetznerReads { images, spares } = hetzner;
+    let HetznerReads { images, spares, volumes: hetzner_volumes } = hetzner;
     if let Probe::Got(sp) = &spares {
         tracking.spares("hetzner", sp, now);
     }
@@ -167,6 +167,7 @@ async fn collect(
         today_days: arena_core::schedule::days_from_unix(now),
         images,
         spares,
+        hetzner_volumes,
         now,
         // Local and read-only: what arena left on this box (none looked for in this crate's
         // tests unless asked, `disk::live`).
@@ -264,16 +265,30 @@ pub(crate) async fn read_archive_priced(cloud: Option<&dyn ArchiveCloud>, prefix
 }
 
 /// What teardown reads from the fleet's Hetzner project besides its servers: the snapshots and
-/// bake VMs ([`read_images`]) and the capacity spares.
+/// bake VMs ([`read_images`]), the capacity spares, and the volumes (the archive's aside).
 pub(crate) struct HetznerReads {
     pub images: Probe<arena_core::image::Inventory>,
     pub spares: Probe<Vec<arena_core::Pod>>,
+    pub volumes: Probe<Vec<arena_core::archive::cloud::CloudVolume>>,
 }
 
 /// [`HetznerReads`], each read bounded, all at once.
 async fn read_hetzner(cfg: &Config) -> HetznerReads {
-    let (images, spares) = tokio::join!(read_images(cfg), read_spares(cfg));
-    HetznerReads { images, spares }
+    let (images, spares, volumes) = tokio::join!(read_images(cfg), read_spares(cfg), read_hetzner_volumes(cfg));
+    HetznerReads { images, spares, volumes }
+}
+
+/// The fleet's Hetzner project's volumes but the archive's (one bounded, read-only listing).
+async fn read_hetzner_volumes(cfg: &Config) -> Probe<Vec<arena_core::archive::cloud::CloudVolume>> {
+    use arena_core::datavol::VolumeCloud;
+    let Some(cloud) = crate::pods::datavol::cloud_for(cfg) else {
+        return Probe::Skipped("Hetzner isn't configured (no HETZNER_API_KEY) — volumes not checked".into());
+    };
+    match tokio::time::timeout(LIST_TIMEOUT, cloud.all_volumes()).await {
+        Ok(Ok(v)) => Probe::Got(arena_core::datavol::fleet_volumes(&v)),
+        Ok(Err(e)) => Probe::Failed(e.to_string()),
+        Err(_) => Probe::Failed(format!("timed out after {}s", LIST_TIMEOUT.as_secs())),
+    }
 }
 
 /// This cohort's capacity spares (a label-selected server list — in no fleet listing).
@@ -576,6 +591,7 @@ mod tests {
         std::future::ready(HetznerReads {
             images: Probe::Skipped("Hetzner snapshots not read in this test".into()),
             spares: Probe::Skipped("Hetzner spares not read in this test".into()),
+            volumes: Probe::Skipped("Hetzner volumes not read in this test".into()),
         })
     }
 

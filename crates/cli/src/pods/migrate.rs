@@ -243,6 +243,7 @@ pub(crate) async fn handle_migrate_copy(
     let tracking = crate::spend::SpendCtx::from_config(cfg);
     let owner = crate::spend::Tracked::new(owner.as_ref(), &tracking, arena_core::spend::OwnerRule::Inherit);
     let spares = adopt::spares_for(&owner, cfg);
+    let cloud = crate::pods::datavol::cloud_for(cfg);
     let CopyHow { source, force, dry_run, yes } = how;
     let job = MigrateCopyJob {
         setup_timeouts,
@@ -256,6 +257,7 @@ pub(crate) async fn handle_migrate_copy(
         source,
         force,
         spares: spares.as_deref(),
+        volumes: cloud.as_ref().map(|c| c as &dyn arena_core::datavol::VolumeCloud),
     };
     migrate_copy_on(remote, cfg, &owner, &canonical, &pods, job).await
 }
@@ -289,6 +291,9 @@ pub(crate) struct MigrateCopyJob<'a> {
     pub force: bool,
     /// The owner's capacity spares (Hetzner), for `--onto-spare` / `--onto <spare>`.
     pub spares: Option<&'a dyn SpareCloud>,
+    /// The fleet's Hetzner volumes: the original's are copied onto `-new` now when it's in
+    /// another location (else they move at the cutover).
+    pub volumes: Option<&'a dyn arena_core::datavol::VolumeCloud>,
 }
 
 /// [`handle_migrate_copy`] once the owner and its listing are known ([`resolve_migration`])
@@ -301,11 +306,13 @@ pub(crate) async fn migrate_copy_on(
     pods: &[arena_core::Pod],
     job: MigrateCopyJob<'_>,
 ) -> Result<()> {
-    let MigrateCopyJob { setup_timeouts, ov, place, dry_run, yes, interrupt, keys_dir, balance, source, force, spares } = job;
+    let MigrateCopyJob { setup_timeouts, ov, place, dry_run, yes, interrupt, keys_dir, balance, source, force, spares, volumes } = job;
     let canonical = canonical.to_string();
     let src = pods.iter().find(|p| p.name == canonical).expect("the canonical pod is listed").clone();
     let new_name = format!("{canonical}-new");
     let existing_new = pods.iter().find(|p| p.name == new_name).cloned();
+    // Its volumes (Hetzner), carried along: listed now, so a listing that fails stops here.
+    let src_volumes = crate::pods::datavol::source_volumes(volumes, &src).await?;
     // A provider the migration can't run on (the capability table) is refused before anything is
     // read or created — dry run or not; so is a flag the new pod's provider would ignore.
     if let Some(r) = crate::pods::capable::refusal(owner, Op::Migrate, "migrate", &[&src]) {
@@ -394,6 +401,9 @@ pub(crate) async fn migrate_copy_on(
         }
         if let Some(n) = &lock_note {
             println!("  {n}");
+        }
+        if let Some(l) = crate::pods::datavol::plan_line(&src_volumes) {
+            println!("  - {l}");
         }
         println!("  (no rename of {canonical}, no proxy change)\n[dry-run] nothing changed.");
         return Ok(());
@@ -489,6 +499,24 @@ pub(crate) async fn migrate_copy_on(
         .await
         .with_context(|| format!("syncing {canonical} -> {new_name}"))?;
     clean_marker(owner, remote.as_ref(), &new_id, cfg).await;
+    // The original's volumes: copied now onto volumes of `-new`'s when it's in another location
+    // (a volume can't leave its own); in the same one they move at the cutover.
+    if let (Some(cloud), false) = (volumes, src_volumes.is_empty()) {
+        let new_pod = owner.list_pods().await.context("listing pods")?.into_iter().find(|p| p.id == new_id).context("-new vanished")?;
+        match crate::pods::datavol::carry(src_volumes.clone(), new_pod.location.as_deref()) {
+            crate::pods::datavol::Carry::Copy(vols) => {
+                println!("      copying {canonical}'s volume(s) onto volumes of {new_name}'s (another location)…");
+                crate::pods::datavol::copy_volumes(remote.as_ref(), cfg, owner, cloud, &src, &new_pod, &canonical, &vols)
+                    .await
+                    .with_context(|| format!("syncing {canonical}'s volume(s) -> {new_name}"))?;
+            }
+            crate::pods::datavol::Carry::Move(vols) => println!(
+                "      {canonical}'s volume(s) {} move to {new_name} at the cutover (same location: detached, attached)",
+                vols.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+            crate::pods::datavol::Carry::Nothing => {}
+        }
+    }
 
     println!("\n✓ {new_name} is built and synced (participant still on {canonical}, untouched).");
     if let Some(window) = maintenance_window(owner, &new_id).await {
@@ -510,8 +538,11 @@ pub(crate) async fn migrate_copy_on(
 }
 
 /// `migrate cutover`'s switches, passed through as one value.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct CutoverOpts {
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CutoverOpts<'a> {
+    /// The fleet's Hetzner volumes: the original's move to the new pod at the swap (same
+    /// location), or their copies get a last sync.
+    pub volumes: Option<&'a dyn arena_core::datavol::VolumeCloud>,
     pub skip_proxy: bool,
     /// Cut over to the copy already on `-new` without syncing from the original first.
     pub no_final_sync: bool,
@@ -530,9 +561,11 @@ pub(crate) async fn handle_migrate_cutover(
     fleet: &dyn Provider,
     cfg: &Config,
     target: &str,
-    opts: CutoverOpts,
+    opts: CutoverOpts<'_>,
 ) -> Result<()> {
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
+    let cloud = crate::pods::datavol::cloud_for(cfg);
+    let opts = CutoverOpts { volumes: opts.volumes.or(cloud.as_ref().map(|c| c as &dyn arena_core::datavol::VolumeCloud)), ..opts };
     migrate_cutover_on(remote, fleet, cfg, owner.as_ref(), &canonical, &pods, opts, KEYS_DIR).await
 }
 
@@ -590,11 +623,11 @@ pub(crate) async fn migrate_cutover_on(
     owner: &dyn Provider,
     canonical: &str,
     pods: &[arena_core::Pod],
-    opts: CutoverOpts,
+    opts: CutoverOpts<'_>,
     // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
     keys_dir: &str,
 ) -> Result<()> {
-    let CutoverOpts { skip_proxy, no_final_sync, dry_run, yes, force } = opts;
+    let CutoverOpts { volumes, skip_proxy, no_final_sync, dry_run, yes, force } = opts;
     let new_name = format!("{canonical}-new");
     let old_name = format!("{canonical}-old");
     let src = pods.iter().find(|p| p.name == canonical).expect("the canonical pod is listed").clone();
@@ -607,6 +640,7 @@ pub(crate) async fn migrate_cutover_on(
     if pods.iter().any(|p| p.name == old_name) {
         anyhow::bail!("{old_name} already exists — finish/revert the previous migration first");
     }
+    let src_volumes = crate::pods::datavol::source_volumes(volumes, &src).await?;
     // Asked again here: the cutover is the step a provider may not get through (Shadeform's).
     if let Some(r) = crate::pods::capable::refusal(owner, Op::Migrate, "cut over", &[&src]) {
         anyhow::bail!("{r}");
@@ -663,6 +697,9 @@ pub(crate) async fn migrate_cutover_on(
         } else {
             println!("  3. {verify_line}");
         }
+        if let Some(l) = crate::pods::datavol::plan_line(&src_volumes) {
+            println!("  {l}");
+        }
         println!("  {old_name} kept (delete later with `migrate finish {canonical}`).\n[dry-run] nothing changed.");
         return Ok(());
     }
@@ -698,6 +735,28 @@ pub(crate) async fn migrate_cutover_on(
     if let Some(r) = cutover_presence_refusal(remote.as_ref(), cfg, &src, force).await {
         anyhow::bail!("NOT swapping — {r} (they came on during the final sync; {new_name} has the copy, nothing was renamed)");
     }
+    // The original's volumes: their copies get a last sync (another location), or they move
+    // now, before the names (same location) — one that doesn't is put back, nothing swapped.
+    let new_pod = pods.iter().find(|p| p.id == new_id).cloned().context("-new vanished")?;
+    let moved = match (volumes, crate::pods::datavol::carry(src_volumes, new_pod.location.as_deref())) {
+        (Some(cloud), crate::pods::datavol::Carry::Copy(vols)) => {
+            if no_final_sync {
+                println!("      {canonical}'s volume(s): their copies on {new_name} are as of its last `migrate copy` (--no-final-sync)");
+            } else {
+                crate::pods::datavol::copy_volumes(remote.as_ref(), cfg, owner, cloud, &src, &new_pod, canonical, &vols)
+                    .await
+                    .with_context(|| format!("the final sync of {canonical}'s volume(s) — nothing was swapped"))?;
+            }
+            None
+        }
+        (Some(cloud), crate::pods::datavol::Carry::Move(vols)) => {
+            crate::pods::datavol::move_volumes(remote.as_ref(), cfg, owner, cloud, &src, &new_pod, &vols)
+                .await
+                .context("nothing was swapped")?;
+            Some((cloud, vols))
+        }
+        _ => None,
+    };
 
     // 3. swap names (old-first so the canonical name is never on two pods).
     println!("[3/4] swapping names…");
@@ -710,6 +769,11 @@ pub(crate) async fn migrate_cutover_on(
     {
         eprintln!("      promote failed ({e}); rolling back {old_name} -> {canonical}");
         let _ = owner.rename_pod(&src_id, canonical).await;
+        if let Some((cloud, vols)) = &moved {
+            if let Err(me) = crate::pods::datavol::move_volumes(remote.as_ref(), cfg, owner, *cloud, &new_pod, &src, vols).await {
+                eprintln!("      moving the volume(s) back to {canonical}: {me:#}");
+            }
+        }
         return Err(e).context("promoting new pod (rolled back; original intact)");
     }
     after_swap(remote.clone(), cfg, owner, canonical, &new_id, &new_name, &old_name, &src_id, keys_dir).await;
@@ -730,7 +794,7 @@ pub(crate) async fn migrate_cutover_on(
         if !matches!(sync, ProxySync::Synced { .. }) || not_routed.is_some() {
             let why = not_routed.unwrap_or_else(|| "the proxy wasn't re-pointed".to_string());
             eprintln!("      {why} — auto-reverting.");
-            cutover_revert(remote.as_ref(), cfg, fleet, owner, canonical, &new_id, &src_id, true).await;
+            cutover_revert(remote.as_ref(), cfg, fleet, owner, canonical, &new_id, &src_id, true, volumes).await;
             anyhow::bail!("cutover reverted: {why}. {canonical} is back on the original.");
         }
         if let Some(path) = &write_only {
@@ -760,7 +824,7 @@ pub(crate) async fn migrate_cutover_on(
             }
             if !reached {
                 eprintln!("      ✗ {canonical} NOT reachable through the proxy after ~{}s — auto-reverting.", settle_tries * 3);
-                cutover_revert(remote.as_ref(), cfg, fleet, owner, canonical, &new_id, &src_id, true).await;
+                cutover_revert(remote.as_ref(), cfg, fleet, owner, canonical, &new_id, &src_id, true, volumes).await;
                 anyhow::bail!(
                     "cutover reverted: the new pod wasn't reachable through the proxy (it passed its own SSH \
                      health check, so look at the proxy host first). {canonical} is back on the original \
@@ -791,6 +855,8 @@ pub(crate) async fn cutover_revert(
     new_id: &str,
     old_id: &str,
     apply_px: bool,
+    // The fleet's Hetzner volumes: the ones the cutover moved go back with the names.
+    volumes: Option<&dyn arena_core::datavol::VolumeCloud>,
 ) {
     let new_name = format!("{canonical}-new");
     // Demote the (failed) new pod, then restore the original to the canonical name. Order
@@ -810,6 +876,12 @@ pub(crate) async fn cutover_revert(
             "  note: {canonical}'s ~/.name wasn't rewritten (it isn't running?) — `arena pods setup {canonical}` writes it \
              once it is"
         );
+    }
+    if let Some(cloud) = volumes {
+        let pods = owner.list_pods().await.unwrap_or_default();
+        if let (Some(new), Some(old)) = (pods.iter().find(|p| p.id == new_id), pods.iter().find(|p| p.id == old_id)) {
+            crate::pods::datavol::revert_moves(remote, cfg, owner, cloud, new, old).await;
+        }
     }
     if apply_px && !matches!(sync_proxy(cfg, fleet, "migrate revert").await, ProxySync::Synced { .. }) {
         eprintln!("  REVERT WARNING: the proxy wasn't re-pointed — run `arena proxy apply`.");
@@ -860,7 +932,9 @@ pub(crate) async fn handle_migrate_revert(
         println!("aborted.");
         return Ok(());
     }
-    cutover_revert(remote, cfg, fleet, owner.as_ref(), &canonical, &new_id, &old_id, !skip_proxy).await;
+    let cloud = crate::pods::datavol::cloud_for(cfg);
+    let volumes = cloud.as_ref().map(|c| c as &dyn arena_core::datavol::VolumeCloud);
+    cutover_revert(remote, cfg, fleet, owner.as_ref(), &canonical, &new_id, &old_id, !skip_proxy, volumes).await;
     println!("✓ Reverted: {canonical} is the original again; the new pod is parked as {new_name}.");
     println!("{}", revert_followup(&canonical, &new_name));
     Ok(())
@@ -893,7 +967,24 @@ pub(crate) async fn handle_migrate_finish(remote: &dyn Remote, fleet: &dyn Provi
     // The terminate goes into the spend ledger as it succeeds (its end is exact).
     let tracking = crate::spend::SpendCtx::from_config(cfg);
     let owner = crate::spend::Tracked::new(owner.as_ref(), &tracking, arena_core::spend::OwnerRule::None);
-    migrate_finish_on(remote, fleet, cfg, &owner, &canonical, &pods, opts).await
+    // `-old`'s volumes (Hetzner: the originals a move to another location copied) outlive it.
+    let old = pods.iter().find(|p| p.name == format!("{canonical}-old")).cloned();
+    let cloud = crate::pods::datavol::cloud_for(cfg);
+    let kept = match (&cloud, &old) {
+        (Some(c), Some(o)) => crate::pods::datavol::source_volumes(Some(c), o).await.unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    migrate_finish_on(remote, fleet, cfg, &owner, &canonical, &pods, opts).await?;
+    let gone = match &old {
+        Some(o) => owner.list_pods().await.is_ok_and(|ps| !ps.iter().any(|p| p.id == o.id)),
+        None => false,
+    };
+    if gone {
+        for v in &kept {
+            println!("  kept: volume {} ({} GB), detached — it bills until `arena pods volume delete {}`", v.name, v.size_gb, v.name);
+        }
+    }
+    Ok(())
 }
 
 /// Why `migrate finish` keeps a STOPPED `-old` (pure, tested): nothing was synced from it

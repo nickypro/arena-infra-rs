@@ -13,6 +13,7 @@ use crate::cron::CronCmd;
 use crate::keys::KeysCmd;
 use crate::plan::PlanCmd;
 use crate::pods::migrate::MigrateCmd;
+use crate::pods::datavol::VolumeCmd;
 use crate::pods::spare::SpareCmd;
 use crate::pods::placement::parse_max_price;
 use crate::pods::RUN_TIMEOUT_SECS;
@@ -882,6 +883,12 @@ pub(crate) enum PodCmd {
     /// Servers made ahead of need, taken later by `migrate copy <name> --onto-spare`.
     #[command(subcommand, verbatim_doc_comment)]
     Spare(SpareCmd),
+    /// Extra disk for a Hetzner VM: add, grow, mount, list, detach, delete
+    ///
+    /// A Hetzner volume in the VM's location, mounted at /mnt/data (fstab, nofail). It bills
+    /// until deleted; `terminate` keeps it unless --delete-volumes.
+    #[command(subcommand, verbatim_doc_comment)]
+    Volume(VolumeCmd),
     /// Copy one machine's home onto another that keeps its own name
     ///
     /// For moving a person to another machine (`copy-home rarity scoot`): the same copy as
@@ -923,6 +930,9 @@ pub(crate) enum PodCmd {
         /// Also revoke each terminated machine's OpenRouter key and drop its CSV row
         #[arg(long)]
         revoke_key: bool,
+        /// Hetzner: also DELETE the volumes attached to it (kept and billing otherwise)
+        #[arg(long)]
+        delete_volumes: bool,
         /// Don't sync the proxy afterwards (the forward stays until `proxy apply`)
         #[arg(long)]
         skip_proxy: bool,
