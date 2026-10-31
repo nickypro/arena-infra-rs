@@ -974,21 +974,56 @@ pub(crate) async fn copies_ready(cloud: &dyn VolumeCloud, record: &MoveRecord, t
     )
 }
 
-/// Keep in `record.moved` only the volumes not verifiably back on `src` (attached there): a
-/// failed move-back leaves the rest — on `-new`, detached, elsewhere, gone — to recover, never
-/// forgotten (review r3). A listing that fails keeps them all.
-pub(crate) async fn keep_unresolved(cloud: &dyn VolumeCloud, record: &mut MoveRecord, src: &str) {
-    let Ok(all) = cloud.all_volumes().await else { return };
-    record.moved.retain(|id| !all.iter().any(|v| v.id == *id && v.server.is_some_and(|s| s.to_string() == src)));
+/// Keep in `record.moved` only the volumes not verifiably back on `src` — attached to it AND
+/// mounted where the record says (a running `src`; made sure of here, the mount step being
+/// idempotent): one unmounted but not yet detached when a move stopped counts as unresolved until
+/// it's mounted again (fix-check). The ones still unresolved, by name; a listing that fails keeps
+/// them all.
+pub(crate) async fn keep_unresolved(
+    remote: &dyn Remote,
+    cfg: &Config,
+    owner: &dyn Provider,
+    cloud: &dyn VolumeCloud,
+    record: &mut MoveRecord,
+    src: &Pod,
+) -> Vec<String> {
+    let Ok(all) = cloud.all_volumes().await else {
+        return record.moved.iter().map(|id| format!("id {id} (the volumes couldn't be listed)")).collect();
+    };
+    let up = !arena_core::status::is_stopped(&src.status);
+    let mut unresolved = Vec::new();
+    let mut still = Vec::new();
+    for id in record.moved.clone() {
+        let Some(v) = all.iter().find(|v| v.id == id) else {
+            unresolved.push(format!("id {id} (gone)"));
+            still.push(id);
+            continue;
+        };
+        if v.server.is_none_or(|s| s.to_string() != src.id) {
+            unresolved.push(format!("{} ({})", v.name, v.server.map_or_else(|| "detached".to_string(), |s| format!("on server {s}"))));
+            still.push(id);
+            continue;
+        }
+        if up {
+            let at = record.mounts.get(&id).cloned().unwrap_or_else(|| datavol::DEFAULT_MOUNT.to_string());
+            if let Err(e) = ensure_mounted(remote, cfg, owner, src, v, &at).await {
+                unresolved.push(format!("{} (attached, not mounted at {at}: {e:#})", v.name));
+                still.push(id);
+            }
+        }
+    }
+    record.moved = still;
     if record.moved.is_empty() {
         record.moved_to = None;
     }
+    unresolved
 }
 
 /// A revert's half for the volumes: exactly the ones the record says a cutover moved onto `new`
-/// go back to `old`, mounted where they were. `Ok` only when every recorded one is attached to
-/// `old` again (review r3: one detached, elsewhere or gone is unresolved, never success).
-pub(crate) async fn revert_moves(remote: &dyn Remote, cfg: &Config, owner: &dyn Provider, cloud: &dyn VolumeCloud, new: &Pod, old: &Pod, record: &MoveRecord) -> Result<()> {
+/// go back to `old`; `Ok` only when every recorded one is attached to `old` and mounted where it
+/// was ([`keep_unresolved`] — review r3, fix-check), the record then cleared of them. Else the
+/// unresolved ones stay recorded, and the error names them (with the move-back's own error).
+pub(crate) async fn revert_moves(remote: &dyn Remote, cfg: &Config, owner: &dyn Provider, cloud: &dyn VolumeCloud, new: &Pod, old: &Pod, record: &mut MoveRecord) -> Result<()> {
     if record.moved.is_empty() || record.moved_to.as_deref() != Some(new.id.as_str()) {
         return Ok(());
     }
@@ -999,17 +1034,11 @@ pub(crate) async fn revert_moves(remote: &dyn Remote, cfg: &Config, owner: &dyn 
         .cloned()
         .collect();
     let moved = if on_new.is_empty() { Ok(Default::default()) } else { move_volumes(remote, cfg, owner, cloud, new, old, &on_new, &record.mounts).await };
-    let now = cloud.all_volumes().await.context("listing the volumes again")?;
-    let unresolved: Vec<String> = record
-        .moved
-        .iter()
-        .filter(|id| !now.iter().any(|v| v.id == **id && v.server.is_some_and(|s| s.to_string() == old.id)))
-        .map(|id| now.iter().find(|v| v.id == *id).map_or_else(|| format!("id {id} (gone)"), |v| v.name.clone()))
-        .collect();
+    let unresolved = keep_unresolved(remote, cfg, owner, cloud, record, old).await;
     match (unresolved.is_empty(), moved) {
         (true, _) => Ok(()),
         (false, Err(e)) => Err(e).with_context(|| format!("not back on {}: {}", old.name, unresolved.join(", "))),
-        (false, Ok(_)) => anyhow::bail!("not back on {}: {} (detached or elsewhere — the Hetzner console)", old.name, unresolved.join(", ")),
+        (false, Ok(_)) => anyhow::bail!("not back on {}: {}", old.name, unresolved.join(", ")),
     }
 }
 

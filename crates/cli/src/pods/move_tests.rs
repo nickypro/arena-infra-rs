@@ -844,7 +844,8 @@ async fn revert_moves_back_only_what_the_cutover_moved() {
     assert_eq!(load_record(&cfg, "devtest-alpha", "101"), record);
     assert_eq!(load_record(&cfg, "devtest-alpha", "999").moved, Vec::<u64>::new(), "another server's: none");
     let f = Vms::new(vec![old.clone(), new.clone()], vec![]);
-    revert_moves(remote.as_ref(), &cfg, &f, &cloud, &new, &old, &record).await.unwrap();
+    let mut record = record;
+    revert_moves(remote.as_ref(), &cfg, &f, &cloud, &new, &old, &mut record).await.unwrap();
     let state = cloud.state();
     assert_eq!(state.volumes.iter().find(|v| v.id == 900).unwrap().server, Some(101), "moved back");
     assert_eq!(state.volumes.iter().find(|v| v.name == "devtest-alpha-data-2").unwrap().server, Some(202), "not moved by this cutover");
@@ -902,11 +903,18 @@ async fn an_unresolved_volume_stays_recorded() {
     scripted(&remote, "101", NEW, "202");
     let f = Vms::new(vec![old.clone(), new.clone()], vec![]);
     let mut record = MoveRecord { src: "101".into(), moved: vec![900], moved_to: Some("202".into()), ..Default::default() };
-    let e = format!("{:#}", revert_moves(remote.as_ref(), &cfg, &f, &cloud, &new, &old, &record).await.unwrap_err());
-    assert!(e.contains("not back on devtest-alpha") && e.contains("devtest-alpha-data"), "{e}");
-    keep_unresolved(&cloud, &mut record, "101").await;
-    assert_eq!(record.moved, [900]);
+    let e = format!("{:#}", revert_moves(remote.as_ref(), &cfg, &f, &cloud, &new, &old, &mut record).await.unwrap_err());
+    assert!(e.contains("not back on devtest-alpha") && e.contains("devtest-alpha-data (detached)"), "{e}");
+    assert_eq!(record.moved, [900], "kept");
+    // Attached to the original again but its mount won't come back: still unresolved.
     cloud.attach(900, 101).await.unwrap();
-    keep_unresolved(&cloud, &mut record, "101").await;
-    assert!(record.moved.is_empty() && record.moved_to.is_none());
+    let stuck = Arc::new(FakeRemote::new());
+    stuck.on(OLD, "ARENA_VOL_NO_DEVICE", FakeReply::stdout("ARENA_VOL_FAIL /mnt/data holds files (x)\n"));
+    scripted(&stuck, "101", NEW, "202");
+    let left = keep_unresolved(stuck.as_ref(), &cfg, &f, &cloud, &mut record, &old).await;
+    assert!(left[0].contains("not mounted"), "{left:?}");
+    assert_eq!(record.moved, [900]);
+    // Attached and mounted: resolved.
+    let left = keep_unresolved(remote.as_ref(), &cfg, &f, &cloud, &mut record, &old).await;
+    assert!(left.is_empty() && record.moved.is_empty() && record.moved_to.is_none(), "{left:?}");
 }
