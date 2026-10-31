@@ -318,6 +318,9 @@ fn fleet_file_rows(cfg: &Config) -> Vec<String> {
         .iter()
         .map(|(rel, label)| format!("  {label:<16} {}", cfg.fleet_file(rel).describe()))
         .collect();
+    let keys = cfg.fleet_file(KEYS_DIR).path;
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    rows.extend(arena_core::config::keys_link_note(&keys, prefix).map(|n| format!("  {:<16} ⚠ {n}", "")));
     rows.push(match cfg.local_backup_dir() {
         (dir, None) => format!("  {:<16} {dir} (LOCAL_BACKUP_DIR)", "backup/"),
         (_, Some(f)) => format!("  {:<16} {}", "backup/", f.describe()),

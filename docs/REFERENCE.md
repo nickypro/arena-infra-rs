@@ -2738,6 +2738,10 @@ points it at its own fleet's file); as a plain file (the older layout) it must h
 `<prefix>-…` machine; with neither, `<prefix>_openrouter_keys.csv` or such a row in another CSV says
 so. A `backup/` with a `<prefix>-…` pod one level down (`w1d2/<prefix>-apple`, `big/<prefix>-apple`). The plan is anyone's. The read-only prod
 copy is the one exception, and only that file: another config in its folder follows these rules.
+**One folder per fleet:** two configs in one folder share its `keys/` and `backup/`, and the
+`openrouter_api_keys.csv` link names whichever prefix ran `keys gen` last (that re-pointing is how a
+new cohort's prefix takes the folder over). `config which` and `keys which` say ⚠ when the link is
+another prefix's.
 
 With the read-only prod copy (`/home/dev/prod-ro/config.env` itself) they stay in the current
 directory, as before and without a warning: that folder holds only the config, and prod's cron runs

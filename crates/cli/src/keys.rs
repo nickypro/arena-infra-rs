@@ -703,6 +703,10 @@ pub(crate) async fn handle_keys(
             .or_else(|_| std::path::absolute(&csv))
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| csv.display().to_string());
+        let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+        if let Some(note) = csv.parent().and_then(|dir| arena_core::config::keys_link_note(dir, prefix)) {
+            println!("⚠ {note}");
+        }
         match std::fs::read_to_string(&csv) {
             Ok(text) => {
                 let rows = arena_core::apikeys::parse_csv(&text);

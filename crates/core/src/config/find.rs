@@ -242,6 +242,21 @@ pub fn fleet_file(config: Option<&Path>, rel: &str, exists: impl Fn(&Path) -> bo
 /// current fleet's `<prefix>_openrouter_keys.csv` (`keys gen` points it at its own).
 pub const OPENROUTER_KEYS_LINK: &str = "openrouter_api_keys.csv";
 
+/// What to say when the keys dir `dir`'s [`OPENROUTER_KEYS_LINK`] points at another prefix's file
+/// than `prefix`'s: a new cohort's prefix before its `keys gen` (which re-points it), or a second
+/// fleet sharing the folder — whose keys the keys commands would read. `None` when it's this
+/// prefix's, or not such a link.
+pub fn keys_link_note(dir: &Path, prefix: &str) -> Option<String> {
+    let target = std::fs::read_link(dir.join(OPENROUTER_KEYS_LINK)).ok()?;
+    let theirs = target.file_name()?.to_str()?.strip_suffix("_openrouter_keys.csv")?.to_string();
+    (theirs != prefix).then(|| {
+        format!(
+            "its {OPENROUTER_KEYS_LINK} is `{theirs}`'s keys file, not `{prefix}`'s: `keys which`, `copy-keys`, rename and terminate read \
+             `{theirs}`'s until `keys gen` re-points it (a new cohort's prefix) — two fleets need two folders"
+        )
+    })
+}
+
 /// Whether `here` (the current directory's fleet file `rel`) is the fleet named `prefix`'s — so
 /// falling back to it can't hand one fleet another's keys file or mix their backups (two fleets on
 /// one box, run from the same directory). `keys/` is judged by its [`OPENROUTER_KEYS_LINK`], the
@@ -448,11 +463,15 @@ mod tests {
         std::fs::write(none.join("p2_openrouter_keys.csv"), "").unwrap();
         let other = [holds_fleet(KEYS_DIR, &dangling, "p2"), holds_fleet(KEYS_DIR, &dangling, "arena9"), holds_fleet(KEYS_DIR, &none, "p2"), holds_fleet(KEYS_DIR, &none, "arena9")];
         let (plan, empty) = (holds_fleet(PLAN_FILE, &d.join(PLAN_FILE), "p2"), holds_fleet(BACKUP_DIR, &d.join("nothing"), "p2"));
+        let notes = (keys_link_note(&keys, "p2"), keys_link_note(&old, "p2"), keys_link_note(&keys, "arena9"));
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(no_link, [true, false, true, false]);
         assert_eq!(linked, [true, false, true]);
         assert_eq!(legacy, [true, false]);
         assert_eq!(other, [true, false, true, false]);
+        // A link at another prefix's file is said (review r4: two configs in one folder share it).
+        assert!(notes.0.is_none() && notes.1.is_none());
+        assert!(notes.2.as_deref().is_some_and(|n| n.starts_with("its openrouter_api_keys.csv is `p2`'s keys file, not `arena9`'s")), "{:?}", notes.2);
         assert!(plan && !empty);
     }
 
