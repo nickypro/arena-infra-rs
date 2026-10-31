@@ -81,7 +81,7 @@ how it went:
 | the reaper's last copy (`pods reap`) | the reap cron line, before it terminates an idle pod (`cron install --reap apply`) | `LOCAL_BACKUP_DIR/reaped/<pod>/…` and the all-files tier's `reaped/` | `reap.json` (state dir); `reap.log` |
 | BUSY copy | `pods backup`, for a pod with a merge or rebase in progress (not committed) | the home copy's place, as above | `busy-copies.json` (state dir) |
 | `set-branch --hard`'s save | a hard branch switch, before it discards anything | on the pod: `.git/arena-discarded/<time>/`, and a copy into `LOCAL_BACKUP_DIR` first | the pod's line; `refs/arena-discarded/…` on the pod |
-| replace/migrate staging | `pods replace` / `pods migrate` copying a home via this box | `$TMPDIR/arena-replace-<pod id>` (removed once the copy lands) | listed by `config check` and `teardown --check` |
+| replace/migrate/copy-home staging | `pods replace` / `pods migrate` / `pods copy-home` copying a home via this box (only when the direct machine-to-machine copy can't run) | `$TMPDIR/arena-replace-<pod id>` (removed once the copy lands) | listed by `config check` and `teardown --check` |
 | `pods restore` | by hand: a backup back onto a pod | the pod; the files it replaced in `~/.arena-restore/<time>/` (or under `/workspace`) | the pod |
 
 The first three run by themselves once `arena cron install --backup --pull --archive` has put
@@ -868,7 +868,10 @@ re-run to finish.
 ## Moving a pod: `pods replace` / `pods migrate`
 
 **`pods replace` / `pods migrate`** — what the copy onto `<name>-new` does (live campaign 1,
-findings #5–#7, #13, #16, #17, #19, #20, #26–#30):
+findings #5–#7, #13, #16, #17, #19, #20, #26–#30). `pods copy-home <from> <to>` runs the same copy
+onto a machine that keeps its own name. On Hetzner (a bigger server type, capacity spares,
+`--onto`, the "no one on it" check) see [Hetzner: a bigger type, capacity spares, moving a
+person](REFERENCE.md#hetzner-a-bigger-type-capacity-spares-moving-a-person).
 
 - It's a **replica**: a file deleted on the original is deleted on `-new` too, but the transfer
   destroys nothing on `-new` — whatever it overwrites or deletes there is **moved** into
@@ -889,10 +892,11 @@ findings #5–#7, #13, #16, #17, #19, #20, #26–#30):
   backed up or restored, so it goes with the home on a reset) still there. Otherwise `migrate copy`
   / the cutover's final sync is **refused before anything moves** (mirroring a reset pod's bare
   image would delete the participant's files from `-new`), pointing at `cutover --no-final-sync`.
-- **Every step on a pod runs on that pod**: on RunPod each one — the source's prepare and the direct
-  copy run on it; `-new`'s prepare, the transfer's remote rsync (`--rsync-path`) and the tidy-up —
-  first checks `RUNPOD_POD_ID` in the same SSH session and does nothing on any other pod (a
-  reassigned endpoint). A stopped `-new` is refused like a stopped original; so is a stopped
+- **Every step on a pod runs on that pod**: on RunPod and Hetzner each one — the source's prepare
+  and the direct copy run on it; `-new`'s prepare, the transfer's remote rsync (`--rsync-path`) and
+  the tidy-up — first checks the machine's own id in the same SSH session (RunPod's
+  `RUNPOD_POD_ID`, a Hetzner VM's server id) and does nothing on any other machine (a reassigned
+  endpoint). A stopped `-new` is refused like a stopped original; so is a stopped
   original by `replace` / `migrate copy` *while planning*, before anything is created and billed.
   When the original's repo is missing or a dangling link, the via-local copy leaves `-new`'s repo
   alone, as the direct one does.

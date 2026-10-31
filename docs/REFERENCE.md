@@ -22,6 +22,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [Vast.ai](#vastai)
   - [Hetzner Cloud](#hetzner-cloud)
   - [Hetzner: pre-built images](#hetzner-pre-built-images)
+  - [Hetzner: a bigger type, capacity spares, moving a person](#hetzner-a-bigger-type-capacity-spares-moving-a-person)
   - [Shadeform](#shadeform)
 - [Library modules (`arena-core`)](#library-modules-arena-core)
 - [Pods: create, list and the lifecycle](#pods-create-list-and-the-lifecycle)
@@ -583,6 +584,99 @@ newest `--keep` (default 1), the one `arena` picks now and one `HETZNER_IMAGE` n
   currency), so ≈ $0.10 a month an image (5.2 GB). The bake VM: ~20 minutes of a cx23, about a cent.
   `teardown --check` lists the images as **kept** (◷: on purpose, never against the check) with
   their cost; at the programme's end `arena image prune --keep 0` deletes them.
+
+### Hetzner: a bigger type, capacity spares, moving a person
+
+A Hetzner server can't change location, and an in-place resize needs the new type's room in the
+server's own location: in prod (2026-10-30) 22 of 22 resizes from cx33 to cx43 were refused
+(`resource_unavailable`) while new cx43s could still be made elsewhere now and then. So arena moves
+a box instead: a new server of the bigger type, the files copied straight across, the names
+swapped.
+
+**Move a box to a bigger type** (what replaces the "swapper" script):
+
+```bash
+# 1. Room ahead of need: spares of the new type, anywhere HETZNER_LOCATION allows; waits for room.
+arena pods spare up 4 --server-type cx43 --keep-trying
+arena pods spare list                      # type, location, IP, age, €/h
+
+# 2. A box no one is on: copy, verify, swap the names, delete the old box.
+arena pods replace apple --onto-spare --server-type cx43 --dry-run
+arena pods replace apple --onto-spare --server-type cx43 -y
+
+# Every cx33 of the cohort, one at a time. A box someone is on (or with no ready spare) is
+# refused before anything changes, and comes round again on the next pass.
+for name in $(arena pods list --json | jq -r '.[] | select(.provider=="hetzner" and .gpu_type=="cx33") | .name'); do
+  arena pods replace "$name" --onto-spare --server-type cx43 -y || echo "skipped $name"
+done
+
+# 3. A box someone is on: copy while they work (again later: only what changed), then swap
+#    once they're off.
+arena pods migrate copy apple --onto-spare --server-type cx43
+arena pods migrate cutover apple           # refuses while someone is on apple (--force)
+arena pods migrate finish apple            # deletes apple-old once the proxy reaches the new box
+
+# 4. Spares left over bill until deleted.
+arena pods spare down --all
+```
+
+Without spares, `arena pods replace apple --server-type cx43 --keep-trying` makes the new box
+itself, waiting up to an hour for room (`--retry-mins` for another window).
+
+- **`--server-type`** on `replace` and `migrate copy` (Hetzner only: a GPU pod is sized by `--gpu`,
+  and `--gpu`, `--gpus`, `--cloud`, `--disk`, `--volume`, `--bootstrap` are refused on a VM). A
+  comma list (`cx43,cx53`) falls back in its order. Default: the old box's type and its own labels.
+  The new box boots what a create boots today (`HETZNER_IMAGE`, or `--image`), never the old box's
+  months-old snapshot. It goes wherever `HETZNER_LOCATION` allows, so it may land in another location
+  than the old one: the plan says so, and the run says where it landed.
+- **No one on it.** `replace` first runs the `pods idle` probe on the box: an SSH session besides its
+  own, another inbound connection (a Jupyter tab), a VS Code (or Cursor, Windsurf) server process.
+  Someone there, or no telling, and it refuses before anything is made, pointing at `migrate`. It
+  asks again right before the swap: if someone came on during the copy, the new box stays built
+  and copied as `<name>-new`, and `migrate cutover <name>` finishes later. `migrate cutover` asks
+  the same. `--force` skips the check.
+- **The copy is direct**: rsync runs on the old box and pushes to the new one with the deploy key
+  every VM holds and authorizes, so nothing is staged on the control box. Only when the direct copy
+  can't run does it go through a staging dir here, sized against `CONTROL_MIN_FREE_GB` first. It's
+  the same copy as ever ([what it carries](BACKUPS.md#moving-a-pod-pods-replace--pods-migrate)).
+  Every step on a VM checks first, in the same SSH session, that it is that VM (its server id, from
+  cloud-init's instance id or the metadata service): an address a deleted server held can be
+  another customer's server by now. A VM's address is its own for life, so there is no settle wait.
+- **The swap is two renames**: the old box becomes `<name>-old` (the name is free at once: no
+  delete, no wait for it), then the new one becomes `<name>`; if that fails, it renames back. The
+  new box's `~/.name` and hostname follow, its API keys are the name's, the proxy port and
+  ssh-config follow the name, and the reaper's and `arena spend`'s records follow each box (the new
+  one under the moved machine's owner). Then `proxy apply`, and the old box is deleted (`--keep-old`
+  keeps it).
+
+**`--onto <machine>` / `--onto-spare`** (`replace`, `migrate copy`) use a machine arena already has
+as `<name>-new` instead of creating one. `--onto-spare` takes the lowest-numbered ready spare
+(running, with its IP) of the first `--server-type` that has one. `--onto` takes a spare (by name or
+id) or another machine of the same provider. A machine in `MACHINE_NAME_LIST` is someone's: it's
+refused without `--force`, saying what's on it (who's on it now, how old its newest file is, its
+uptime); taken anyway, whatever the copy replaces of its own files is moved aside to
+`~/arena-sync-kept/<time>/`. The machine is renamed `<name>-new` (a spare loses its spare label in
+the same request), and the run says how to give it its name back if the move stops before the
+swap. The flags that shape a new pod (`--gpu`, `--image`, `--max-price`, `--keep-trying`, …) are
+refused beside them; `--server-type` only picks the spare.
+
+**Capacity spares**: `pods spare up N [--server-type T[,T2]] [--image I] [--keep-trying |
+--retry-mins M] [--no-wait]` (at most 20 at a time), `pods spare list [--json]`, `pods spare down
+<names>|--all`. A spare is a server named `<prefix>-spare-<n>` and labelled `arena-spare=<prefix>`.
+It's nobody's machine: the fleet never lists one, so no proxy forward, ssh-config block, backup, key,
+reap or `--all` reaches it. It bills like any server, so `pods list` counts the spares under its
+table, `arena balance` adds them to Hetzner's burn (and says so), `arena spend` keeps their rows, and
+`teardown --check` lists them as remaining (`arena pods spare down --all`). `spare down` deletes only
+spares.
+
+**Moving a person to another machine under its own name**: `pods copy-home <from> <to>
+[--overwrite] [--force] [--dry-run]`. The same copy as `replace`/`migrate` (direct, `.git` kept,
+caches and venvs left, verified on `<to>`), with nothing renamed: `<to>` keeps its name, port and
+keys, and `<from>` is untouched. Both machines on one provider. Refused while someone is on either
+(`--force`). A dry run of that very copy finds the files of `<to>`'s own it would overwrite or
+delete; if there are any it's refused, naming them, unless `--overwrite` (they're moved aside to
+`~/arena-sync-kept/<time>/` on `<to>`, never deleted). It ends with what's next: point the person at
+`<to>`, `arena spend assign <to> <owner>`, then back up and terminate `<from>`.
 
 ### Shadeform
 
