@@ -6,10 +6,11 @@ use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
 use crate::detail::detail_pane;
+use crate::info::render_info;
 use crate::modals::{render_confirm, render_fleet_confirm, render_fleet_menu, render_input, render_menu, render_result, render_select};
 use crate::state::{top_parts, Tone};
 use crate::table::{pods_table, tone_style};
-use crate::{ask, backups, newpod, render_info, runs, Mode, Shared, Ui, NOTICE_FOR};
+use crate::{ask, backups, newpod, runs, Mode, Shared, Ui, NOTICE_FOR};
 
 pub(crate) fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
     let chunks = Layout::default()
