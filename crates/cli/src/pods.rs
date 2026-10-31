@@ -12,7 +12,7 @@ use arena_core::Config;
 
 use crate::cli::{PodCmd, Select};
 use crate::cron::resolve_week_day;
-use crate::keys::{handle_copy_keys, openrouter_client, up_keys_stage, KeyBook, KEYS_DIR, OPENROUTER_KEYS_CSV};
+use crate::keys::{check_csv_keys, handle_copy_keys, list_for_check, mint_missing, openrouter_client, plan_mints, up_keys_stage, KeyBook, KEYS_DIR, OPENROUTER_KEYS_CSV};
 use crate::pods::backup::{handle_full_backup, RSYNC};
 use crate::pods::baseline::handle_baseline;
 use crate::pods::branch::{handle_init_branches, set_branch_and_init, SetBranchRun};
@@ -454,8 +454,25 @@ async fn handle_pods_bal(
             pin_vm_image(provider.name(), cfg, &mut spec).await?;
             check_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]))?;
             let keys = up_keys_stage(cfg, KEYS_DIR, !no_setup);
-            let per_pod =
-                up::pipeline_text(!no_setup, check.then_some(check_attempts), keys.is_some(), lock, (endpoint_mins, check_attempts));
+            // OpenRouter, when setup runs and a provisioning key is set: one listing says which
+            // names have no key — `up` mints those after the prompt, so its keys stage copies them
+            // on — and, before the copy, which of the keys CSV's rows are dead (`keys::checked`).
+            // A name a handover gives a fresh key (an owner's) isn't minted for twice.
+            let naming = arena_core::selector::Naming::from_config(cfg);
+            let or = if no_setup { None } else { openrouter_client(cfg) };
+            let key_api = or.as_ref().map(|a| a as &dyn arena_core::openrouter::KeyApi);
+            let handed_names: Vec<String> = spend::handovers(&tracking, &names, owner.owner.as_deref(), owner.keep_key)
+                .map(|h| h.into_iter().map(|h| h.name).collect())
+                .unwrap_or_default();
+            let key_limit = cfg.get_parsed::<f64>("OPENROUTER_KEY_LIMIT").unwrap_or(5.0);
+            let mints = plan_mints(&naming, &names, &handed_names, list_for_check(key_api).await, key_limit, dry_run);
+            let per_pod = up::pipeline_text(
+                !no_setup,
+                check.then_some(check_attempts),
+                keys.is_some() || !mints.mint.is_empty(),
+                lock,
+                (endpoint_mins, check_attempts),
+            );
             if dry_run {
                 match &options {
                     Some(plan) => print_placement_preview(provider, plan, &spec, &names),
@@ -470,6 +487,9 @@ async fn handle_pods_bal(
                 warn_no_volume(provider, &spec);
                 print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
                 owner_plan(&tracking, &owner, &names, true)?;
+                for line in &mints.lines {
+                    println!("{line}");
+                }
                 let retry = if retry_mins > 0 { format!(" (retrying up to {retry_mins}m for capacity)") } else { String::new() };
                 println!(
                     "\nDry-run only — no pods created (preview){retry}: would create the above, then {per_pod}. \
@@ -506,12 +526,39 @@ async fn handle_pods_bal(
             // blocks, and `--yes` changes nothing), quiet if the balance can't be read.
             print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
             let handing = owner_plan(&tracking, &owner, &names, false)?;
+            for line in &mints.lines {
+                println!("{line}");
+            }
             if !confirm(yes, &what)? {
                 println!("aborted.");
                 return Ok(());
             }
-            // The handed-over keys are in the CSV before the pipelines copy any.
-            let keys = if hand_keys_over(&tracking, cfg, &owner, &handing).await? { up_keys_stage(cfg, KEYS_DIR, !no_setup) } else { keys };
+            // The handed-over and the minted keys are in the CSV before the pipelines copy any.
+            let handed = hand_keys_over(&tracking, cfg, &owner, &handing).await?;
+            let minted = match key_api {
+                Some(api) if !mints.mint.is_empty() => {
+                    let m = mint_missing(api, &tracking, &naming, std::path::Path::new(KEYS_DIR), &mints, owner.owner.as_deref()).await;
+                    for l in &m.lines {
+                        if l.starts_with('✗') {
+                            eprintln!("{l}");
+                        } else {
+                            println!("{l}");
+                        }
+                    }
+                    m.names
+                }
+                _ => Vec::new(),
+            };
+            let mut keys = if handed || !minted.is_empty() { up_keys_stage(cfg, KEYS_DIR, !no_setup) } else { keys };
+            // The other names' rows in the keys CSV, checked against the listing: a key deleted
+            // elsewhere isn't copied on (said, with what to run).
+            if let Some(k) = keys.as_mut() {
+                let fresh = |n: &String| minted.contains(n) || handing.iter().any(|h| h.name == *n);
+                let hosts: Vec<String> = names.iter().filter(|n| !fresh(n)).cloned().collect();
+                for line in check_csv_keys(k, &hosts, mints.listed.as_ref(), &naming) {
+                    eprintln!("{line}");
+                }
+            }
             // What the operator confirmed: a name of these that gets no pod is in the summary
             // (and the exit status) too, not silently missing from it.
             let confirmed = names.clone();

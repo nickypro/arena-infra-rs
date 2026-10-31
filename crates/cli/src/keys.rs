@@ -13,6 +13,9 @@ use clap::Subcommand;
 
 use crate::cli::Select;
 use crate::pods::list::{enrich_best_effort, ENRICH_TIMEOUT};
+
+mod checked;
+pub(crate) use checked::{check_csv_keys, list_for_check, mint_missing, plan_mints};
 use crate::pods::selection::{all_stopped_error, stopped_skip, Selected};
 use crate::{archive, confirm, key_limits, shell_quote, spend};
 
@@ -248,7 +251,36 @@ impl KeySources {
         let matched = self.per_host.get(name).map(|h| vars.extend(h.iter().cloned())).is_some();
         (vars, matched)
     }
+
+    /// The OpenRouter key the keys CSV holds for `host` (its exact name), if any.
+    pub(crate) fn openrouter_secret(&self, host: &str) -> Option<&str> {
+        self.per_host.get(host)?.iter().find(|(env, _)| env == checked::OPENROUTER_ENV).map(|(_, v)| v.as_str())
+    }
+
+    /// Leave `host`'s OpenRouter key out of what's copied (its CSV row holds a key OpenRouter no
+    /// longer has): its other keys stay, and the sources line counts one host fewer.
+    pub(crate) fn leave_out_openrouter(&mut self, host: &str) {
+        let Some(vars) = self.per_host.get_mut(host) else { return };
+        let before = vars.len();
+        vars.retain(|(env, _)| env != checked::OPENROUTER_ENV);
+        if vars.len() == before {
+            return;
+        }
+        if vars.is_empty() {
+            self.per_host.remove(host);
+        }
+        let left = self.per_host.values().filter(|v| v.iter().any(|(env, _)| env == checked::OPENROUTER_ENV)).count();
+        let label = |n: usize| format!("OpenRouter ({n} host{})", if n == 1 { "" } else { "s" });
+        match self.csv.iter().position(|s| s.starts_with("OpenRouter (")) {
+            Some(i) if left == 0 => {
+                self.csv.remove(i);
+            }
+            Some(i) => self.csv[i] = label(left),
+            None => {}
+        }
+    }
 }
+
 
 /// The fleet-SSH half of a key write, and how many fleet keys it authorizes: authorize the
 /// fleet pubkeys (arena8 + arena_infra + admin) and write the host map into `~/.ssh/config`
@@ -320,7 +352,18 @@ pub(crate) async fn handle_copy_keys(
 ) -> Result<()> {
     use arena_core::ssh::SshTarget;
 
-    let keys = KeySources::load(cfg, keys_dir, hf_token, cc_token);
+    let mut keys = KeySources::load(cfg, keys_dir, hf_token, cc_token);
+    // The selected pods' OpenRouter rows, checked against OpenRouter's listing first: a key
+    // deleted elsewhere is left out and said, not handed on (`checked`). Listed only when one
+    // of them has such a row.
+    let hosts: Vec<String> = sel.pods.iter().map(|p| p.name.clone()).collect();
+    if hosts.iter().any(|h| keys.openrouter_secret(h).is_some()) {
+        let or = openrouter_client(cfg);
+        let listed = list_for_check(or.as_ref().map(|a| a as &dyn arena_core::openrouter::KeyApi)).await;
+        for line in check_csv_keys(&mut keys, &hosts, listed.as_ref(), &Naming::from_config(cfg)) {
+            eprintln!("{line}");
+        }
+    }
     let mut sources = keys.csv.clone();
     // "broadcast" = same value on every *selected* pod (vs per-host CSV keys) — not "all
     // pods", which misleadingly implies the whole fleet when the selection is narrower.

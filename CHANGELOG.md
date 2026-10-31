@@ -24,6 +24,18 @@ earlier).
   OWNER column after NAME, per instance, empty for a machine with no owner, and no column at all
   while no machine has one. In the dashboard it's a short column that a narrow terminal drops;
   the detail view has an `owner:` line.
+- **`pods up` mints an OpenRouter key for a name that has none** (with
+  `OPENROUTER_PROVISIONING_KEY` set): capped at `OPENROUTER_KEY_LIMIT`, after the prompt and
+  before the create, recorded as the `--owner`'s, and copied on with the rest of the keys. The
+  plan says so before the prompt (`will mint an OpenRouter key (cap $0.10, …) for …`), and each
+  mint gets a ✓ line. A name that has a key keeps it; one whose key is someone else's is still
+  handed over (`--keep-key` keeps it); a staff `@` box gets none (told). A mint that fails is a ✗
+  line with the `keys gen` to run, never a failed `up`. `pods create` mints nothing.
+- **A dead key in the keys CSV isn't copied any more.** Before `up`, `copy-keys`, `setup`,
+  `keys gen --copy` or `replace` copies a machine's OpenRouter key, the name's row is checked
+  against OpenRouter's listing: a key deleted elsewhere (or rotated from another keys folder) is
+  left out, with a ⚠ line naming `arena keys gen <name> --copy` (or `keys rotate`). When the
+  listing can't be read, the CSV is copied as before, and the copy says it's unchecked.
 - A key's cap prints as it was set, `$0.05` (it read `$0.050`): `keys list`, `keys limit`, the
   dashboard. A key handed over to a new owner says the new key's cap
   (`… a fresh key 4de6426ea4a4, cap $0.10)`).

@@ -140,7 +140,7 @@ pub(crate) async fn hand_keys_over(tracking: &spend::SpendCtx, cfg: &Config, own
         anyhow::bail!(
             "the OpenRouter key handover failed for {} — nothing was created. Re-run once `arena keys rotate <name>` \
              works, or pass --keep-key to create with the name's current key (a name whose old key is already gone \
-             is created without one: `arena keys gen <name>` then mints its new owner's)",
+             gets a fresh one from `pods up`, or from `arena keys gen <name>` after a `create`)",
             done.failed.join(", ")
         );
     }
