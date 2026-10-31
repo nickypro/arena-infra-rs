@@ -19,7 +19,7 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
-## 2026-10-31 · arena 2.6: extra disk for a Hetzner VM (volumes)
+## 2026-10-31 · arena 2.7: extra disk for a Hetzner VM (volumes)
 - `arena pods volume add apple 50` attaches a 50 GB Hetzner volume to a VM and mounts it at
   `/mnt/data` (`--mount` for another place; never inside a home). `volume grow apple 80` grows it
   online, filesystem included. `volume list` shows each with its VM and cost. `volume detach` and
@@ -33,6 +33,41 @@ earlier).
 - RunPod and Vast are refused up front with what to do instead (`pods replace <name> --volume
   <GB>` on RunPod).
 
+## 2026-10-31 · arena 2.6: one config search order, a fleet's own PROVIDER, keys/ beside the config
+- `arena` finds its config as `arena-tui` does: `--config`, else `ARENA_CONFIG`, else
+  `~/.config/arena/config.env` (when it exists), else the built-in `/home/dev/prod-ro/config.env`.
+  So a forgotten `--config` no longer has to mean ARENA's prod path: keep your fleet's config at
+  `~/.config/arena/config.env`, or export `ARENA_CONFIG`. `config which` says which source won,
+  and warns about one that lost (an `ARENA_CONFIG` that `--config` overrode, or a user file passed
+  over). This is why the release is **arena 2.6** (a minor bump).
+- `PROVIDER=hetzner` (or any provider) in the config is the fleet's provider: what `create`/`up`
+  make pods on, and whose key every listing needs, when `--provider` doesn't say. A Hetzner-only
+  fleet no longer needs `--provider hetzner` on every command. `--provider` still wins; the
+  dashboard's add-pod form starts on it too. `config check` has a `PROVIDER` row.
+- `keys/`, `arena-plan.json` and `backup/` (where pods are copied when `LOCAL_BACKUP_DIR` is unset)
+  are found next to the config file, whatever directory you run in. One found only in the current
+  directory is still used when it's this fleet's (by prefix: its keys link, or its pods), with a
+  one-line warning to move it; another fleet's is never used. `config which` lists all three with
+  where each was found. With the prod copy, `/home/dev/prod-ro/config.env`, nothing moves: they stay
+  in the current directory, as before.
+- `config check`: an optional key that isn't set reads `not set`, not `(missing)`, which now only a
+  required key says.
+
+### Config
+- New key `PROVIDER`: the fleet's provider when `--provider` doesn't say (unset = `runpod`).
+- `ARENA_CONFIG` now applies to `arena` as well as `arena-tui`, and `~/.config/arena/config.env` is
+  read when neither it nor `--config` names a file.
+
+### Action needed
+- Prod: nothing. root's cron passes `--config /home/dev/prod-ro/config.env`, and with that file
+  `keys/`, `arena-plan.json` and `./backup` stay in the current directory (the cron's is `/root`).
+- If you export `ARENA_CONFIG` (say, for the dashboard), or have a `~/.config/arena/config.env`,
+  `arena` without `--config` now reads that file. `arena config which` shows which file a run
+  reads.
+- If your config already has a `PROVIDER=` line (a leftover from another tool), arena now uses it.
+- Another fleet whose `keys/`, plan or `backup/` sit in the directory you run arena from rather
+  than beside its config: they keep working, with a warning on each command that uses them. Move
+  them next to the config (or set `LOCAL_BACKUP_DIR` to an absolute path).
 ## 2026-10-31 · arena 2.5: move a Hetzner box to a bigger type, keeping its files
 - `arena pods replace apple --server-type cx43` and `pods migrate copy apple --server-type cx43`
   now work on Hetzner: a new server of that type (a comma list falls back), wherever
@@ -55,6 +90,18 @@ earlier).
 ### Action needed
 - A script that runs `arena pods replace` on pods people may be on now stops there (nothing
   changed): add `--force`, or move those with `migrate copy` + `migrate cutover`.
+
+## 2026-10-31 · Project week: the dashboard's setup on a Hetzner VM, staff names, renames say the new port
+- The dashboard's **setup** on a Hetzner (or Shadeform) VM now runs what `arena pods setup` runs
+  there: the VM setup script with its swap, the keys authorized and the hostname. It ran the
+  RunPod/Vast steps on every pod before, so a Hetzner VM got no script and no swap.
+- `pods up -n`/`-a` (and the dashboard's add form) never pick a staff `@` name from
+  `MACHINE_NAME_LIST` for a new pod. A staff box is made by name only.
+- `pods rename` says where the machine's proxy port goes (`devtest-echo :9504 → devtest-bravo
+  :9501`): a port belongs to a name, so whoever works on the machine connects as the new name.
+- Docs: [A project week, start to end](docs/REFERENCE.md#a-project-week-start-to-end), the
+  organisers' flow in order: keys before machines, owners, a name for someone else, renames,
+  backups and the end-of-week report.
 
 ## 2026-10-31 · arena 2.4: what works where — refused up front, greyed out in the dashboard
 - One table says which commands and create flags work on which provider (RunPod, RunPod v1, Vast,

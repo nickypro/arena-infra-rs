@@ -13,7 +13,7 @@ use arena_core::ssh::SshTarget;
 use arena_core::{Config, PodSpec};
 
 use crate::cli::PlaceFlags;
-use crate::keys::{handle_copy_keys, KeySources, KEYS_DIR};
+use crate::keys::{handle_copy_keys, keys_dir, KeySources};
 use crate::pods::adopt::{self, Source};
 use crate::pods::capable::CreateFlags;
 use crate::pods::create::{apply_spec_overrides, check_create_body, create_extra, sizing_flags, SpecOverrides};
@@ -564,13 +564,14 @@ pub(crate) async fn handle_replace(
     let owner = crate::spend::Tracked::new(owner.as_ref(), &tracking, arena_core::spend::OwnerRule::Inherit);
     let spares = adopt::spares_for(&owner, cfg);
     let cloud = crate::pods::datavol::cloud_for(cfg);
+    let keys = keys_dir(cfg);
     let job = ReplaceJob {
         setup_timeouts,
         ov,
         place,
         opts,
         interrupt,
-        keys_dir: KEYS_DIR,
+        keys_dir: &keys,
         balance: Some(bal),
         source,
         spares: spares.as_deref(),
@@ -610,7 +611,7 @@ pub(crate) struct ReplaceJob<'a> {
     pub place: &'a PlaceFlags,
     pub opts: ReplaceOpts,
     pub interrupt: &'a Interrupt,
-    /// Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    /// Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     pub keys_dir: &'a str,
     /// Where the new pod's price is remembered for the balance ([`create_replacement`]);
     /// `None`: not remembered.
@@ -730,7 +731,7 @@ pub(crate) async fn replace_on(
         );
     }
     // Its volumes (Hetzner), carried along: listed now, so a listing that fails stops here.
-    let src_volumes = crate::pods::datavol::source_volumes(job.volumes, &src).await?;
+    let src_volumes = crate::pods::datavol::source_volumes(job.volumes, &src, cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena")).await?;
     let (new_name, old_name) = replace_stage_names(&canonical);
     // A provider that can't replace (the capability table: it needs the pod's spec read back and
     // two renames) is refused before anything is read or created — dry run or not; so is a flag

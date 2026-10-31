@@ -195,7 +195,7 @@ arena --config ./config.env config check                   # a ✓ / ✗ row per
 
 | Key | What it is |
 | --- | --- |
-| `RUNPOD_API_KEY` | The provider key (`VAST_API_KEY`, `HETZNER_API_KEY`, `SHADEFORM_API_KEY` for the others) |
+| `RUNPOD_API_KEY` | The provider key (`VAST_API_KEY`, `HETZNER_API_KEY`, `SHADEFORM_API_KEY` for the others; `PROVIDER=hetzner` makes Hetzner the fleet's provider, so no `--provider` each time) |
 | `MACHINE_NAME_PREFIX`, `MACHINE_NAME_LIST` | Pod names: `arena-apple`, `arena-bloom`, …; a name's place in the list is its proxy port |
 | `SHARED_SSH_KEY_PATH` | The shared SSH key from step 2 |
 | `GPU_TYPE`, `NUM_GPUS`, `CLOUD_TYPE`, `IMAGE`, `DISK_GB` | What `create`/`up` make when no flag says otherwise |
@@ -207,10 +207,13 @@ arena --config ./config.env config check                   # a ✓ / ✗ row per
 | `SSH_PROXY_HOST`, `SSH_PROXY_STARTING_PORT` | The proxy's public host, and the first machine's port ([step 4](#4-set-up-the-proxy-recommended-for-a-cohort)) |
 
 Every key, with its default: [`config.env.example`](config.env.example) and the
-[config key table](FEATURE_MAP.md#config-keys-added-in-phases-04). The built-in `--config`
-default is a path on ARENA's own control box, so pass `--config` (an `alias arena='arena
---config ~/arena/config.env'` saves typing). A key in the file can be overridden for one run by
-an environment variable of the same name ([details](docs/REFERENCE.md#overriding-config-without-editing-it)).
+[config key table](FEATURE_MAP.md#config-keys-added-in-phases-04). Without `--config`, arena
+reads `$ARENA_CONFIG`, else `~/.config/arena/config.env`; the built-in default after those is a path
+on ARENA's own control box. So put the file at `~/.config/arena/config.env` (or export
+`ARENA_CONFIG`); `arena config which` says which file a run reads. `keys/`, `arena-plan.json` and
+`backup/` are kept beside the config ([details](docs/REFERENCE.md#which-config-which-provider-and-the-files-beside-it)).
+A key in the file can be overridden for one run by an environment variable of the same name
+([details](docs/REFERENCE.md#overriding-config-without-editing-it)).
 
 ### 4. Set up the proxy (recommended for a cohort)
 
@@ -421,6 +424,8 @@ total       4 instance(s)  49.5  ~$11.88 + €0.43 $3.50  ~$15.38 + €0.43
   is installed: earlier history isn't there.
 - **Just to watch:** nothing stops a machine, and nothing is shown to participants.
 
+Running a project week: [start to end](docs/REFERENCE.md#a-project-week-start-to-end), keys,
+owners, a name for someone else, renames, backups and the end-of-week report, in order.
 [Everything about spend](docs/REFERENCE.md#spend). Another program wanting a fleet of its own on
 the same box (not needed for a project week):
 [Running a second fleet](docs/REFERENCE.md#running-a-second-fleet-from-the-same-control-box).

@@ -43,7 +43,7 @@ pub(crate) async fn handle_reimage(
     image: Option<String>,
     opts: RestartOpts,
     settle: SettleWait,
-    // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    // Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     keys_dir: &str,
 ) -> Result<()> {
     let RestartOpts { wipe_ok, no_setup, skip_proxy, dry_run, yes } = opts;
@@ -204,7 +204,7 @@ pub(crate) async fn handle_start(
     sel: &Selected,
     opts: RestartOpts,
     settle: SettleWait,
-    // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    // Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     keys_dir: &str,
 ) -> Result<()> {
     let RestartOpts { no_setup, skip_proxy, dry_run, yes, .. } = opts;
@@ -575,12 +575,18 @@ pub(crate) async fn handle_terminate(
     let mut volumes_failed = Vec::new();
     let gone_volumes: Vec<arena_core::archive::cloud::CloudVolume> =
         attached.iter().filter(|(id, _)| gone.iter().any(|p| p.id == *id)).map(|(_, v)| v.clone()).collect();
-    if let (Some(cloud), true, false) = (volumes, delete_volumes, gone_volumes.is_empty()) {
-        volumes_failed = crate::pods::datavol::delete_after_terminate(cloud, &gone_volumes).await;
+    // Only the volumes arena made are deleted; one attached by hand is someone else's to delete.
+    let (ours, by_hand): (Vec<_>, Vec<_>) =
+        gone_volumes.into_iter().partition(|v| arena_core::datavol::is_ours(v, naming.prefix) || !delete_volumes);
+    if let (Some(cloud), true, false) = (volumes, delete_volumes, ours.is_empty()) {
+        volumes_failed = crate::pods::datavol::delete_after_terminate(cloud, &ours).await;
     } else {
-        for v in &gone_volumes {
+        for v in &ours {
             println!("[kept] volume {} ({} GB) — detached, billing until `arena pods volume delete {}`", v.name, v.size_gb, v.name);
         }
+    }
+    for v in &by_hand {
+        println!("[kept] volume {} ({} GB) — attached by hand, so not deleted here: delete it in the Hetzner console", v.name, v.size_gb);
     }
     let mut revoked = KeyRevoke::default();
     if revoke_key && !gone.is_empty() {
@@ -961,7 +967,7 @@ pub(crate) async fn handle_restart(
     target: &str,
     opts: RestartOpts,
     settle: SettleWait,
-    // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    // Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     keys_dir: &str,
 ) -> Result<()> {
     // A malformed SETUP_TIMEOUT_SECS fails before anything is touched (as in `up`).

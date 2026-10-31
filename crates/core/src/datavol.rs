@@ -179,18 +179,36 @@ pub fn fstab_line(device: &str, mount: &str) -> String {
 /// line — review): `flock` on a file in `/run`, waited for up to 30 s.
 const FSTAB_LOCK: &str = "exec 9>/run/arena-fstab.lock && flock -w 30 9";
 
-/// Rewrite /etc/fstab without any line for `device`, then (`Some`) with `line` — atomically,
-/// through a temp file beside it. Shell, for the scripts below.
-fn fstab_rewrite(device: &str, line: Option<&str>) -> String {
-    let add = line.map(|l| format!(" && printf '%s\\n' {}  >> \"$t\"", q(l))).unwrap_or_default();
+fn q(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The shell every volume script starts with: `dev` (the device path), `real` (what it resolves
+/// to now; empty when it isn't there) and `same SRC` — whether an fstab source names this volume,
+/// by its path or any alias (`/dev/sdb`, `UUID=…`, `LABEL=…`: review — a literal match missed
+/// those), and `parts` — the device and its partitions (a partitioned one's filesystems are on
+/// those). `set -f`: fstab fields are split, never globbed.
+fn prelude(device: &str) -> String {
     format!(
-        "t=$(mktemp /etc/fstab.arena.XXXXXX) && awk -v d={} '$1 != d' /etc/fstab > \"$t\"{add} && chmod 0644 \"$t\" && mv -f \"$t\" /etc/fstab",
-        q(device)
+        "set -u; set -f; dev={dev}\n\
+         real=$(readlink -f \"$dev\" 2>/dev/null); [ -e \"$real\" ] || real=\n\
+         same() {{ case \"$1\" in UUID=*|LABEL=*|PARTUUID=*|PARTLABEL=*) r=$(findfs \"$1\" 2>/dev/null) ;; *) r=$(readlink -f \"$1\" 2>/dev/null) ;; esac; \
+         [ \"$1\" = \"$dev\" ] || {{ [ -n \"$real\" ] && [ -n \"$r\" ] && {{ [ \"$r\" = \"$real\" ] || lsblk -nrpo NAME \"$real\" 2>/dev/null | grep -qxF \"$r\"; }}; }}; }}\n\
+         parts() {{ [ -n \"$real\" ] && {{ lsblk -nrpo NAME \"$real\" 2>/dev/null || echo \"$real\"; }}; }}",
+        dev = q(device)
     )
 }
 
-fn q(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+/// Rewrite /etc/fstab without any line for this volume (by any of its names: [`prelude`]'s
+/// `same`), then (`Some`) with `line` — atomically, through a temp file beside it. Comments and
+/// every other line kept as they are. Shell, after [`prelude`], under [`FSTAB_LOCK`].
+fn fstab_rewrite(line: Option<&str>) -> String {
+    let add = line.map(|l| format!(" && printf '%s\\n' {} >> \"$t\"", q(l))).unwrap_or_default();
+    format!(
+        "{{ t=$(mktemp /etc/fstab.arena.XXXXXX) && \
+         {{ while IFS= read -r l || [ -n \"$l\" ]; do set -- $l; case \"${{1:-}}\" in ''|\\#*) printf '%s\\n' \"$l\" ;; \
+         *) same \"$1\" || printf '%s\\n' \"$l\" ;; esac; done < /etc/fstab > \"$t\"; }}{add} && chmod 0644 \"$t\" && mv -f \"$t\" /etc/fstab; }}"
+    )
 }
 
 /// What the mount script ([`mount_script`]) said.
@@ -208,24 +226,26 @@ pub enum Mounted {
 /// How long the mount script waits for the device to appear (udev, after an attach).
 pub const DEVICE_WAIT_SECS: u32 = 60;
 
-/// Run as root on the VM: put the fstab line for `device` at `mount` (replacing any earlier one
-/// for that device), wait up to [`DEVICE_WAIT_SECS`] for the device, then mount it there —
-/// refusing a mount point that holds files or another mount (mounting over files would hide
-/// them). Says how it went on its last line ([`parse_mount`]). Idempotent: an already mounted
-/// volume is left as it is. Pure.
+/// Run as root on the VM: under the fstab lock, refuse a mount point that fstab gives another
+/// device (review: never two at one place); then, already mounted there: make sure its fstab line
+/// is arena's (review: a hand mount would vanish at the next boot) and say so. Else refuse a mount
+/// point that holds files or another mount (mounting over files would hide them), put the fstab
+/// line (replacing any other for this volume), wait up to [`DEVICE_WAIT_SECS`] for the device,
+/// and mount it. Says how it went on its last line ([`parse_mount`]). Pure.
 pub fn mount_script(device: &str, mount: &str) -> String {
     let line = fstab_line(device, mount);
     format!(
-        "set -u; dev={dev}; mnt={mnt}\n\
+        "{prelude}\nmnt={mnt}\n\
          {lock} || {{ echo \"ARENA_VOL_FAIL another volume step holds /etc/fstab\"; exit 1; }}\n\
-         real=$(readlink -f \"$dev\" 2>/dev/null || true)\n\
-         if [ -n \"$real\" ] && [ -e \"$real\" ] && findmnt -rn -S \"$real\" -T \"$mnt\" >/dev/null 2>&1 && [ \"$(findmnt -rn -o TARGET -T \"$mnt\")\" = \"$mnt\" ]; then\n\
+         clash=; while IFS= read -r l || [ -n \"$l\" ]; do set -- $l; case \"${{1:-}}\" in ''|\\#*) ;; *) [ \"${{2:-}}\" = \"$mnt\" ] && ! same \"$1\" && clash=\"$1\" ;; esac; done < /etc/fstab\n\
+         [ -z \"$clash\" ] || {{ echo \"ARENA_VOL_FAIL /etc/fstab mounts another device at $mnt ($clash)\"; exit 1; }}\n\
+         if [ -n \"$real\" ] && [ \"$(findmnt -rn -o TARGET -T \"$mnt\" 2>/dev/null)\" = \"$mnt\" ] && same \"$(findmnt -rn -o SOURCE -T \"$mnt\")\"; then\n\
+         \x20 {fstab} || {{ echo \"ARENA_VOL_FAIL couldn't rewrite /etc/fstab\"; exit 1; }}\n\
          \x20 echo \"ARENA_VOL_MOUNTED $(df -P -B1 \"$mnt\" | awk 'NR==2{{print $2}}')\"; exit 0\n\
          fi\n\
          if mountpoint -q \"$mnt\" 2>/dev/null; then echo \"ARENA_VOL_FAIL $mnt is a mount point of something else ($(findmnt -rn -o SOURCE -T \"$mnt\"))\"; exit 1; fi\n\
          if [ -d \"$mnt\" ] && [ -n \"$(ls -A \"$mnt\" 2>/dev/null)\" ]; then echo \"ARENA_VOL_FAIL $mnt holds files (mounting over them would hide them)\"; exit 1; fi\n\
          if [ -e \"$mnt\" ] && [ ! -d \"$mnt\" ]; then echo \"ARENA_VOL_FAIL $mnt is a file, not a directory\"; exit 1; fi\n\
-         if awk -v m=\"$mnt\" -v d=\"$dev\" '$2 == m && $1 != d {{ f = 1 }} END {{ exit !f }}' /etc/fstab 2>/dev/null; then echo \"ARENA_VOL_FAIL /etc/fstab mounts another device at $mnt\"; exit 1; fi\n\
          mkdir -p \"$mnt\" || {{ echo \"ARENA_VOL_FAIL couldn't make $mnt\"; exit 1; }}\n\
          {fstab} || {{ echo \"ARENA_VOL_FAIL couldn't rewrite /etc/fstab\"; exit 1; }}\n\
          i=0; while [ ! -e \"$dev\" ] && [ \"$i\" -lt {tries} ]; do sleep 2; i=$((i + 1)); done\n\
@@ -233,10 +253,10 @@ pub fn mount_script(device: &str, mount: &str) -> String {
          systemctl daemon-reload >/dev/null 2>&1 || true\n\
          out=$(mount \"$mnt\" 2>&1) || {{ echo \"ARENA_VOL_FAIL mount: $out\"; exit 1; }}\n\
          echo \"ARENA_VOL_MOUNTED $(df -P -B1 \"$mnt\" | awk 'NR==2{{print $2}}')\"",
-        dev = q(device),
+        prelude = prelude(device),
         mnt = q(mount),
         lock = FSTAB_LOCK,
-        fstab = fstab_rewrite(device, Some(&line)),
+        fstab = fstab_rewrite(Some(&line)),
         tries = DEVICE_WAIT_SECS / 2,
     )
 }
@@ -259,20 +279,36 @@ pub fn parse_mount(stdout: &str) -> Mounted {
     Mounted::Failed(format!("no answer from the mount step ({})", stdout.lines().last().unwrap_or("nothing").trim()))
 }
 
-/// Where volume `device` is mounted on the VM, from its fstab line or the live mounts — what a
-/// move mounts it at on the new VM. Prints `ARENA_VOL_AT <path>` (or nothing). Pure.
+/// Where volume `device` is mounted on the VM, from its fstab line (by any of its names) or the
+/// live mounts (of it or a partition of it) — what a move mounts it at on the new VM. Prints
+/// `ARENA_VOL_AT <path>` (or nothing). Pure.
 pub fn where_script(device: &str) -> String {
     format!(
-        "dev={dev}; at=$(awk -v d=\"$dev\" '$1 == d {{ print $2; exit }}' /etc/fstab 2>/dev/null); \
-         if [ -z \"$at\" ]; then real=$(readlink -f \"$dev\" 2>/dev/null) && at=$(findmnt -rn -o TARGET -S \"$real\" 2>/dev/null | head -n1); fi; \
+        "{prelude}\nat=; while IFS= read -r l || [ -n \"$l\" ]; do set -- $l; case \"${{1:-}}\" in ''|\\#*) ;; *) [ -z \"$at\" ] && same \"$1\" && at=\"${{2:-}}\" ;; esac; done < /etc/fstab\n\
+         if [ -z \"$at\" ]; then for d in $(parts); do at=$(findmnt -rn -o TARGET -S \"$d\" 2>/dev/null | head -n1); [ -n \"$at\" ] && break; done; fi\n\
          [ -n \"$at\" ] && echo \"ARENA_VOL_AT $at\"; true",
-        dev = q(device)
+        prelude = prelude(device)
     )
 }
 
-/// [`where_script`]'s answer, checked like a `--mount` ([`check_mount`]). Pure.
-pub fn parse_where(stdout: &str) -> Option<String> {
-    stdout.lines().find_map(|l| l.trim().strip_prefix("ARENA_VOL_AT ").map(str::trim).map(String::from)).filter(|p| check_mount(p).is_ok())
+/// What [`where_script`] found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Where {
+    /// Neither in fstab nor mounted.
+    Nowhere,
+    /// At this path (one a `--mount` could be: [`check_mount`]).
+    At(String),
+    /// At a path arena won't carry it to (inside a home, a system directory…).
+    Odd(String),
+}
+
+/// [`where_script`]'s answer. Pure.
+pub fn parse_where(stdout: &str) -> Where {
+    match stdout.lines().find_map(|l| l.trim().strip_prefix("ARENA_VOL_AT ").map(str::trim).map(String::from)) {
+        None => Where::Nowhere,
+        Some(p) if check_mount(&p).is_ok() => Where::At(p.trim_end_matches('/').to_string()),
+        Some(p) => Where::Odd(p),
+    }
 }
 
 /// Run as root on the VM after a resize at Hetzner: make the kernel see the new size, grow the
@@ -315,19 +351,18 @@ pub fn parse_grow(stdout: &str) -> std::result::Result<Option<u64>, String> {
 /// done (also when it wasn't mounted, or isn't there at all). Pure.
 pub fn unmount_script(device: &str) -> String {
     format!(
-        "set -u; dev={dev}; sync\n\
+        "{prelude}\nsync\n\
          {lock} || {{ echo \"ARENA_VOL_FAIL another volume step holds /etc/fstab\"; exit 1; }}\n\
-         real=$(readlink -f \"$dev\" 2>/dev/null || true)\n\
-         if [ -n \"$real\" ] && [ -e \"$real\" ]; then\n\
-         \x20 for m in $(findmnt -rn -o TARGET -S \"$real\" 2>/dev/null); do\n\
+         for d in $(parts); do\n\
+         \x20 for m in $(findmnt -rn -o TARGET -S \"$d\" 2>/dev/null); do\n\
          \x20   umount \"$m\" 2>/dev/null || {{ echo \"ARENA_VOL_BUSY $m $(fuser -m \"$m\" 2>/dev/null | wc -w) process(es)\"; exit 1; }}\n\
          \x20 done\n\
-         fi\n\
+         done\n\
          {fstab} || {{ echo \"ARENA_VOL_FAIL couldn't rewrite /etc/fstab\"; exit 1; }}\n\
          echo ARENA_VOL_UNMOUNTED",
-        dev = q(device),
+        prelude = prelude(device),
         lock = FSTAB_LOCK,
-        fstab = fstab_rewrite(device, None),
+        fstab = fstab_rewrite(None),
     )
 }
 
@@ -556,9 +591,9 @@ mod tests {
         assert!(parse_grow("ARENA_VOL_FAIL not mounted — mount it").unwrap_err().contains("not mounted"));
         assert_eq!(parse_unmount("ARENA_VOL_UNMOUNTED"), Ok(()));
         assert!(parse_unmount("ARENA_VOL_BUSY /mnt/data 2 process(es)").unwrap_err().contains("fuser -vm /mnt/data"));
-        assert_eq!(parse_where("ARENA_VOL_AT /mnt/data\n"), Some("/mnt/data".into()));
-        assert_eq!(parse_where("ARENA_VOL_AT /root/x\n"), None, "never a path a --mount couldn't be");
-        assert_eq!(parse_where(""), None);
+        assert_eq!(parse_where("ARENA_VOL_AT /mnt/data\n"), Where::At("/mnt/data".into()));
+        assert_eq!(parse_where("ARENA_VOL_AT /root/x\n"), Where::Odd("/root/x".into()), "never carried to a path a --mount couldn't be");
+        assert_eq!(parse_where(""), Where::Nowhere);
 
         // The fstab rewrite, for real, on a copy.
         let dir = std::env::temp_dir().join(format!("arena-datavol-{}", std::process::id()));
@@ -566,21 +601,25 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let fstab = dir.join("fstab");
         let dev = "/dev/disk/by-id/scsi-0HC_Volume_42";
-        std::fs::write(&fstab, format!("UUID=abc / ext4 defaults 0 1\n{dev} /mnt/old ext4 nofail 0 2\n")).unwrap();
+        std::fs::write(&fstab, format!("# the root\nUUID=abc / ext4 defaults 0 1\n\n{dev} /mnt/old ext4 nofail 0 2\n")).unwrap();
         let lock = dir.join("fstab.lock");
         let rewrite = |s: String| s.replace("/etc/fstab", &fstab.display().to_string()).replace("/run/arena-fstab.lock", &lock.display().to_string());
         let run = |script: &str| {
             let out = std::process::Command::new("sh").arg("-c").arg(script).output().unwrap();
             assert!(out.status.success(), "{script}\n{}", String::from_utf8_lossy(&out.stderr));
         };
-        run(&rewrite(fstab_rewrite(dev, Some(&fstab_line(dev, "/mnt/data")))));
+        run(&rewrite(format!("{}\n{}", prelude(dev), fstab_rewrite(Some(&fstab_line(dev, "/mnt/data"))))));
         assert_eq!(
             std::fs::read_to_string(&fstab).unwrap(),
-            format!("UUID=abc / ext4 defaults 0 1\n{}\n", fstab_line(dev, "/mnt/data")),
-            "the other lines kept, ours once"
+            format!("# the root\nUUID=abc / ext4 defaults 0 1\n\n{}\n", fstab_line(dev, "/mnt/data")),
+            "the other lines kept (comments, blanks), ours once"
         );
-        run(&rewrite(fstab_rewrite(dev, None)));
-        assert_eq!(std::fs::read_to_string(&fstab).unwrap(), "UUID=abc / ext4 defaults 0 1\n");
+        // Where it's mounted, read back from its fstab line.
+        let out = std::process::Command::new("sh").arg("-c").arg(rewrite(where_script(dev))).output().unwrap();
+        assert_eq!(parse_where(&String::from_utf8_lossy(&out.stdout)), Where::At("/mnt/data".into()));
+        run(&rewrite(format!("{}\n{}", prelude(dev), fstab_rewrite(None))));
+        assert_eq!(std::fs::read_to_string(&fstab).unwrap(), "# the root\nUUID=abc / ext4 defaults 0 1\n\n");
+        std::fs::write(&fstab, "UUID=abc / ext4 defaults 0 1\n").unwrap();
         // The mount step refuses a mount point that holds files, before it touches fstab.
         let mnt = dir.join("mnt");
         std::fs::create_dir_all(&mnt).unwrap();

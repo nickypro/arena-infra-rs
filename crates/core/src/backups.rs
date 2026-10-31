@@ -972,9 +972,9 @@ pub fn read_crontab() -> Result<String, String> {
     }
 }
 
-/// `LOCAL_BACKUP_DIR` (default `./backup`).
+/// `LOCAL_BACKUP_DIR`, else the fleet's `backup/` ([`Config::local_backup_dir`]).
 pub fn backup_dir(cfg: &Config) -> String {
-    cfg.get("LOCAL_BACKUP_DIR").filter(|s| !s.is_empty()).unwrap_or("./backup").to_string()
+    cfg.local_backup_dir().0
 }
 
 /// The all-files tier's root: `LOCAL_BACKUP_BIG_DIR`, else `<LOCAL_BACKUP_DIR>/big`.

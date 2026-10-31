@@ -20,8 +20,6 @@ use crate::pods::RUN_TIMEOUT_SECS;
 use crate::proxy::ProxyCmd;
 use crate::{archive, image, jobs, money, offers, reap, spend};
 
-const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
-
 #[derive(Parser)]
 #[command(
     name = "arena",
@@ -34,12 +32,17 @@ const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 )]
 pub(crate) struct Cli {
     /// Path to config.env
-    #[arg(long, default_value = DEFAULT_CONFIG, global = true)]
-    pub config: PathBuf,
+    ///
+    /// Default: $ARENA_CONFIG, else ~/.config/arena/config.env if it exists, else
+    /// /home/dev/prod-ro/config.env. `config which` says which.
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
 
     /// Provider: runpod, vast, hetzner or shadeform
-    #[arg(long, default_value = "runpod", global = true)]
-    pub provider: String,
+    ///
+    /// Default: the config's PROVIDER, else runpod.
+    #[arg(long, global = true)]
+    pub provider: Option<String>,
 
     /// Skip the "Proceed? [y/N]" prompt (required when there's no terminal)
     #[arg(long, short = 'y', global = true)]
@@ -1240,9 +1243,10 @@ pub(crate) enum PodCmd {
     /// tokens. No targets = every reachable pod.
     #[command(verbatim_doc_comment)]
     CopyKeys {
-        /// Directory holding the per-host `<provider>_api_keys.csv` files.
-        #[arg(long, default_value = "./keys")]
-        keys_dir: String,
+        /// Directory holding the per-host `<provider>_api_keys.csv` files [default: keys/ beside
+        /// the config]
+        #[arg(long)]
+        keys_dir: Option<String>,
         /// Hugging Face token for every pod (overrides config HF_TOKEN)
         #[arg(long)]
         hf_token: Option<String>,

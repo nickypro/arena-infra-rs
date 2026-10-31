@@ -2,6 +2,7 @@
 //! report `config check` prints (every section's rows).
 
 use anyhow::{Context, Result};
+use arena_core::config::{ConfigSource, ProviderSource, PROVIDER_KEY};
 use arena_core::sshconfig::Audience;
 use arena_core::{Config, PodSpec};
 use clap::Subcommand;
@@ -9,7 +10,6 @@ use clap::Subcommand;
 use crate::cron::reap_cron_installed;
 use crate::pods::backup::RSYNC;
 use crate::pods::health::health_cache_path;
-use crate::pods::pull::local_backup_dir;
 use crate::ssh_config::{same_file, ssh_config_check_row, ssh_config_check_row_as};
 use crate::{archive, image, money, reap};
 
@@ -36,15 +36,41 @@ pub(crate) enum ConfigCmd {
     Which,
 }
 
-pub(crate) fn handle_config(
-    cmd: ConfigCmd,
-    cfg: &Config,
-    provider_name: &str,
-    config_path: &std::path::Path,
-) -> Result<()> {
+/// The config file a run reads and the fleet's provider, each with where it came from
+/// ([`arena_core::config::find_config`], [`arena_core::config::pick_provider`]).
+pub(crate) struct Picked {
+    pub config: std::path::PathBuf,
+    pub config_source: ConfigSource,
+    pub provider: String,
+    pub provider_source: ProviderSource,
+}
+
+impl Picked {
+    /// The fleet-wide provider, [`Picked::provider`] its primary. A bad `PROVIDER` in the config
+    /// is named as that (`--provider`'s own error names the flag's value already).
+    pub(crate) fn fleet(&self, cfg: &Config) -> Result<Box<dyn arena_core::provider::Provider>> {
+        let fleet = arena_core::provider::build_fleet(&self.provider, cfg, true);
+        match self.provider_source {
+            ProviderSource::Config => fleet.with_context(|| format!("the config's {PROVIDER_KEY}=\"{}\" ({})", self.provider, self.config.display())),
+            _ => Ok(fleet?),
+        }
+    }
+
+    /// How `config which` says where the provider came from.
+    fn provider_from(&self) -> &'static str {
+        match self.provider_source {
+            ProviderSource::Chosen => "--provider",
+            ProviderSource::Config => "the config's PROVIDER",
+            ProviderSource::Default => "the default: no --provider, no PROVIDER in the config",
+        }
+    }
+}
+
+pub(crate) fn handle_config(cmd: ConfigCmd, cfg: &Config, picked: &Picked) -> Result<()> {
+    let (provider_name, config_path) = (picked.provider.as_str(), picked.config.as_path());
     match cmd {
         ConfigCmd::Check => config_check(cfg, provider_name, &[]),
-        ConfigCmd::Which => config_which(cfg, provider_name, config_path),
+        ConfigCmd::Which => config_which(cfg, picked),
         ConfigCmd::Set { key, value } => {
             let (key, value) = match (key, value) {
                 (Some(k), Some(v)) => (k, v),
@@ -70,12 +96,13 @@ pub(crate) fn handle_config(
 }
 
 /// Report one config key: prints a ✓/✗/· line (never the value if `secret`) and
-/// records it in `missing` when it's required but absent/empty.
+/// records it in `missing` when it's required but absent/empty. An absent optional key reads
+/// "not set": "(missing)" is for a required one, which fails the check (PR #1).
 fn cfg_row(out: &mut String, cfg: &Config, missing: &mut Vec<String>, key: &str, required: bool, secret: bool) {
     let ok = cfg.get(key).map(|v| !v.is_empty()).unwrap_or(false);
     let mark = if ok { "✓" } else if required { "✗" } else { "·" };
     let shown = if !ok {
-        "(missing)".to_string()
+        if required { "(missing)" } else { "not set" }.to_string()
     } else if secret {
         "(set)".to_string()
     } else {
@@ -225,10 +252,13 @@ fn interactive_config_set(cfg: &Config) -> Result<(String, String)> {
     Ok((key, value))
 }
 
-/// `config which`: show the active config file (path, readable/writable), a one-line
-/// summary of what parsed, and any keys currently being supplied by the environment
+/// `config which`: show the active config file (path, readable/writable) and where that path came
+/// from (`--config`, `ARENA_CONFIG`, `~/.config/arena/config.env` or the built-in default — and
+/// any of them that lost), a one-line summary of what parsed with where the provider came from,
+/// where the fleet's own files are, and any keys currently being supplied by the environment
 /// (which silently override the file) so it's clear where values are coming from.
-fn config_which(cfg: &Config, provider_name: &str, config_path: &std::path::Path) -> Result<()> {
+fn config_which(cfg: &Config, picked: &Picked) -> Result<()> {
+    let config_path = picked.config.as_path();
     let abs = std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
     let meta = std::fs::metadata(&abs).ok();
     let readable = std::fs::File::open(&abs).is_ok();
@@ -243,11 +273,26 @@ fn config_which(cfg: &Config, provider_name: &str, config_path: &std::path::Path
         if readable { "✓ readable" } else { "✗ not readable" },
         if writable { "writable" } else { "read-only (config set can't write here)" },
     );
-    if std::env::var("ARENA_CONFIG").is_ok() {
-        println!("  source: ARENA_CONFIG environment variable");
+    println!("  source: {}", picked.config_source.describe());
+    let canonical = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let lost = arena_core::config::passed_over(
+        config_path,
+        picked.config_source,
+        std::env::var_os(arena_core::config::CONFIG_VAR).as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        std::path::Path::is_file,
+        |a, b| canonical(a) == canonical(b),
+    );
+    for l in lost {
+        println!("  ⚠ {l}");
     }
-    println!("\nLoaded: provider {provider_name} · {} key(s) · {} machine name(s)",
-        cfg.values.len(), cfg.machine_names.len());
+    println!("\nLoaded: provider {} ({}) · {} key(s) · {} machine name(s)",
+        picked.provider, picked.provider_from(), cfg.values.len(), cfg.machine_names.len());
+
+    println!("\nFiles kept beside the config (else found in the current directory, as before):");
+    for line in fleet_file_rows(cfg) {
+        println!("{line}");
+    }
 
     let (from_env, ignored) = env_keys(cfg, |k| std::env::var(k).is_ok());
     if !ignored.is_empty() {
@@ -262,6 +307,25 @@ fn config_which(cfg: &Config, provider_name: &str, config_path: &std::path::Path
         }
     }
     Ok(())
+}
+
+/// `config which`'s rows for the files a fleet keeps beside its config: `keys/`, the plan, and
+/// the backup dir (`LOCAL_BACKUP_DIR` when set) — where each is, and how it was found
+/// ([`arena_core::config::FleetFile::describe`]).
+fn fleet_file_rows(cfg: &Config) -> Vec<String> {
+    use arena_core::config::{KEYS_DIR, PLAN_FILE};
+    let mut rows: Vec<String> = [(KEYS_DIR, "keys/"), (PLAN_FILE, PLAN_FILE)]
+        .iter()
+        .map(|(rel, label)| format!("  {label:<16} {}", cfg.fleet_file(rel).describe()))
+        .collect();
+    let keys = cfg.fleet_file(KEYS_DIR).path;
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    rows.extend(arena_core::config::keys_link_note(&keys, prefix).map(|n| format!("  {:<16} ⚠ {n}", "")));
+    rows.push(match cfg.local_backup_dir() {
+        (dir, None) => format!("  {:<16} {dir} (LOCAL_BACKUP_DIR)", "backup/"),
+        (_, Some(f)) => format!("  {:<16} {}", "backup/", f.describe()),
+    });
+    rows
 }
 
 /// What `config which` says of the environment (`is_set`: whether a variable of that name is set):
@@ -300,6 +364,25 @@ fn create_extra_row(cfg: &Config) -> Option<(String, bool)> {
         ),
         Err(e) => (format!("  ✗ {key:<28} {}", e.to_string().trim_start_matches("config error: ")), false),
     })
+}
+
+/// The `config check` row for `PROVIDER` (the fleet's provider when `--provider` doesn't say),
+/// and what the check fails on: a name that isn't a provider. `selected`: the provider this run
+/// uses, to say when `--provider` overrode the key. Pure.
+fn provider_key_row(cfg: &Config, selected: &str) -> (String, Option<String>) {
+    use arena_core::config::{pick_provider, DEFAULT_PROVIDER};
+    use arena_core::provider::multi::KNOWN;
+    let key = PROVIDER_KEY;
+    let (name, source) = pick_provider(None, cfg);
+    if source == ProviderSource::Default {
+        return (format!("  · {key:<24} not set — {DEFAULT_PROVIDER} unless --provider says"), None);
+    }
+    if !KNOWN.contains(&name.as_str()) {
+        let why = format!("`{name}` isn't a provider ({})", KNOWN.join(", "));
+        return (format!("  ✗ {key:<24} {why}"), Some(format!("{key} ({why})")));
+    }
+    let wins = if name == selected { String::new() } else { format!(" (--provider {selected} wins this run)") };
+    (format!("  ✓ {key:<24} {name} — create/up's provider when --provider doesn't say{wins}"), None)
 }
 
 /// The `config check` row for `RUNPOD_API`, and whether it's valid. Pure, for testing.
@@ -706,6 +789,11 @@ pub(crate) fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<S
             missing.push(key.to_string());
         }
     }
+    let (line, bad) = provider_key_row(cfg, provider_name);
+    println!("{line}");
+    if let Some(why) = bad {
+        missing.push(why);
+    }
     // Which RunPod REST generation `runpod` talks to — shown whenever RunPod is in play:
     // v2 by default, and a leftover `RUNPOD_API=v1` (which RunPod retires) is flagged here.
     if provider_name == "runpod" || cfg.get("RUNPOD_API_KEY").is_some_and(|v| !v.is_empty()) || cfg.get("RUNPOD_API").is_some() {
@@ -849,9 +937,10 @@ pub(crate) fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<S
     }
     cfg_row(&mut out, cfg, &mut missing, "GIT_SSH_KEY_REMOTE", false, false);
     cfg_row(&mut out, cfg, &mut missing, "ARENA_START_DATE", false, false); // wNdM label (init-branches / pull)
-    // Where `pods pull` rsyncs pod files to locally (config LOCAL_BACKUP_DIR, else ./backup),
-    // shown as an absolute path so it's obvious where backups land.
-    let backup_dir = local_backup_dir(cfg);
+    // Where `pods pull` rsyncs pod files to locally (config LOCAL_BACKUP_DIR, else the fleet's
+    // backup/: next to the config, else ./backup), shown as an absolute path so it's obvious
+    // where backups land.
+    let (backup_dir, found) = cfg.local_backup_dir();
     let abs = std::fs::canonicalize(&backup_dir)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| {
@@ -862,9 +951,13 @@ pub(crate) fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<S
                 .unwrap_or_else(|_| backup_dir.clone())
         });
     let exists = std::path::Path::new(&backup_dir).is_dir();
+    let moved = match found.map(|f| f.found) {
+        Some(arena_core::config::Found::CurrentDir { beside }) => format!("  (in the current directory only: move it to {})", beside.display()),
+        _ => String::new(),
+    };
     println!(
-        "  {} local rsync backup dir     {abs}{}",
-        if exists { "✓" } else { "·" },
+        "  {} local rsync backup dir     {abs}{}{moved}",
+        if !moved.is_empty() { "⚠" } else if exists { "✓" } else { "·" },
         if exists { "" } else { "  (created on first `pods pull`)" }
     );
     // The `pods pull` knobs (all optional; shown so it's clear what's configurable).
@@ -1017,11 +1110,12 @@ pub(crate) fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<S
         println!("  {} git deploy key .pub       {pubk}", if readable(&pubk) { "✓" } else { "⚠" });
     }
     admin_key_rows(cfg).iter().for_each(|l| println!("{l}"));
-    let plan_present = readable("arena-plan.json");
+    let plan = cfg.fleet_file(arena_core::config::PLAN_FILE);
+    let plan_present = readable(&plan.path.display().to_string());
     println!(
         "  {} provisioning plan          {}",
-        if plan_present { "✓" } else { "·" },
-        if plan_present { "arena-plan.json" } else { "none (optional — `arena plan`)" }
+        if !plan_present { "·" } else if plan.warning().is_some() { "⚠" } else { "✓" },
+        if plan_present { plan.describe() } else { "none (optional — `arena plan`)".to_string() }
     );
     println!(
         "  {} iteration start date       {}",
@@ -1143,6 +1237,8 @@ pub(crate) fn bad_hosts_section(cfg: &Config, now: u64) -> Vec<String> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod which_tests;
 
 #[cfg(test)]
 mod swap_row_tests {

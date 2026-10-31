@@ -769,7 +769,17 @@ async fn a_failed_second_move_puts_both_back_unmounting_first() {
     cloud.clear_calls();
     let remote = Arc::new(FakeRemote::new());
     // The second volume's mount on the new VM fails (its device named in the mount step).
-    remote.on(NEW, &format!("scsi-0HC_Volume_{second}'; mnt="), FakeReply::stdout("ARENA_VOL_FAIL /mnt/data2 holds files (x)\n"));
+    remote.on(
+        NEW,
+        &format!("scsi-0HC_Volume_{second}'"),
+        FakeReply::from_cmd(|cmd| {
+            if cmd.contains("ARENA_VOL_NO_DEVICE") {
+                FakeReply::stdout("ARENA_VOL_FAIL /mnt/data2 holds files (x)\n")
+            } else {
+                FakeReply::stdout("ARENA_VOL_UNMOUNTED\n")
+            }
+        }),
+    );
     volume_steps(&remote, false);
     scripted(&remote, "101", NEW, "202");
     let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
@@ -828,11 +838,11 @@ async fn revert_moves_back_only_what_the_cutover_moved() {
     volume_steps(&remote, false);
     scripted(&remote, "101", NEW, "202");
     let record = MoveRecord { src: "101".into(), mounts: [(900, "/mnt/data".to_string())].into(), moved: vec![900], moved_to: Some("202".into()), ..Default::default() };
-    save_record(&cfg, "devtest-alpha", &record);
+    save_record(&cfg, "devtest-alpha", &record).unwrap();
     assert_eq!(load_record(&cfg, "devtest-alpha", "101"), record);
     assert_eq!(load_record(&cfg, "devtest-alpha", "999").moved, Vec::<u64>::new(), "another server's: none");
     let f = Vms::new(vec![old.clone(), new.clone()], vec![]);
-    revert_moves(remote.as_ref(), &cfg, &f, &cloud, &new, &old, &record).await;
+    revert_moves(remote.as_ref(), &cfg, &f, &cloud, &new, &old, &record).await.unwrap();
     let state = cloud.state();
     assert_eq!(state.volumes.iter().find(|v| v.id == 900).unwrap().server, Some(101), "moved back");
     assert_eq!(state.volumes.iter().find(|v| v.name == "devtest-alpha-data-2").unwrap().server, Some(202), "not moved by this cutover");

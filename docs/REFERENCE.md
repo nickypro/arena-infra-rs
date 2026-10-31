@@ -56,6 +56,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [`balance`](#balance)
   - [`balance set`](#balance-set)
   - [`spend`](#spend)
+  - [A project week, start to end](#a-project-week-start-to-end)
   - [Running a second fleet from the same control box](#running-a-second-fleet-from-the-same-control-box)
 - [Config, plans and the provider APIs](#config-plans-and-the-provider-apis)
   - [`config check | set | which`](#config-check--set--which)
@@ -121,10 +122,10 @@ cargo run -p arena-cli -- pods create -n 3 --dry-run
 cargo run -p arena-cli -- pods create -n 3
 
 # interactive dashboard (or `arena tui`, which inherits --provider/--config); arena-tui itself
-# takes no arguments (any is refused) — its config is ARENA_CONFIG, default the prod path
+# takes no arguments (any is refused) — its config is ARENA_CONFIG, else ~/.config/arena/config.env
 ARENA_CONFIG=./config.env cargo run -p arena-tui
 
-# point at a different config
+# point at a different config (or export ARENA_CONFIG, or put it at ~/.config/arena/config.env)
 cargo run -p arena-cli -- --config ./config.env pods list
 ```
 
@@ -818,9 +819,11 @@ arena pods terminate apple --delete-volumes    # the VM and its volumes; without
   checks).
 - **grow** only grows (Hetzner never shrinks a volume), and grows the filesystem online after.
   `grow` to the size it already has retries the filesystem step alone.
-- Every command acts on **this cohort's** volumes only: the ones labelled with its prefix, and
-  any attached to one of its VMs. A shared project's other volumes are listed apart and never
-  touched, and teardown never prints their delete.
+- Every command acts on **this cohort's** volumes only, and only on the ones arena made (labelled
+  with its prefix). One attached to a cohort VM by hand is listed and counted, but never
+  unmounted, moved, grown or deleted: its layout (partitions, filesystem, fstab line) is someone
+  else's. A VM with one is refused by `replace`/`migrate` until it's detached. A shared project's
+  other volumes are listed apart, and teardown never prints their delete.
 - **detach / delete** unmount it on the VM first. One in use is refused, with `fuser -vm <path>`
   to see who holds it. A VM that can't be reached is refused unless `--force`. Delete wants the
   volume's own name or id, never the VM's, and refuses one with Hetzner's delete protection on.
@@ -838,8 +841,10 @@ arena pods terminate apple --delete-volumes    # the VM and its volumes; without
   the copy is moved into `<mount>/arena-sync-kept/<time>/`. The original is kept, and the run
   says so, with the `volume delete` for once the copy is checked. A migration remembers in the
   state dir where each volume is mounted (a cutover from a stopped original can't ask), which
-  copies finished (`--no-final-sync` won't promote onto a copy that didn't), and what it moved:
-  `migrate revert` moves back exactly that.
+  copies finished (`--no-final-sync` won't promote onto a copy that didn't; a sync under way
+  doesn't count), and what it moves (saved before the first unmount, so an interrupted move is
+  known): `migrate revert` moves back exactly that, and says so, keeping the record, when a
+  volume won't go back.
 - **Money**: `arena balance` adds the volumes to Hetzner's burn, and `teardown --check` lists each
   volume with its cost (the archive's own volumes are the archive's line). `arena spend` counts
   machines, not volumes.
@@ -1099,6 +1104,10 @@ after a prefix change, *into* the current prefix's file, repointing the symlink 
 other live pods' rows, so the next `keys gen` doesn't strand them) and renames its key on OpenRouter
 in place (`PATCH /keys/{hash}` `name`; skipped quietly with no CSV / no provisioning key; a new name
 that already has its own row or key is left alone and warned about), then syncs the proxy.
+A proxy port is its name's place in `MACHINE_NAME_LIST`, so a rename to another name moves the
+machine to that name's port, and whoever works on it connects as the new name from then on (their
+old `Host` reaches nothing): the plan and the output say so, `devtest-echo :9504 → devtest-bravo
+:9501`. A prefix change keeps each short name's port.
 
 A RunPod or Vast container's `MACHINE_NAME` env var keeps the old name (env only changes with a
 reimage) — the output says so; bare VMs (Hetzner, Shadeform) have no such variable. `--dry-run`
@@ -1141,7 +1150,9 @@ provider holds one).
 
 `create` also takes **explicit names** (`pods create apple bloom`) and an **`--image`** override,
 alongside `-n` (target number on `--provider`; pods on other providers don't count) / `-a` (add).
-Bare names get the configured prefix; names already present are skipped.
+Bare names get the configured prefix; names already present are skipped. `-n`/`-a` (and the
+dashboard's add form) take free cohort names in `MACHINE_NAME_LIST` order and never a staff `@`
+entry, which is made only by name (`pods create @box`).
 
 Every name-picking listing — `-n`/`-a`, explicit names, placement's retry rounds, `rename`, the
 TUI's add-pod form — must come from **every** configured provider: if one fails to list, the command
@@ -2666,6 +2677,39 @@ currency,cost,source,estimate,estimated`). `--json`: the whole report. A source 
 read (a provider's listing, the keys, RunPod's billing, Hetzner's currency) is one warning line;
 the exit is 0.
 
+### A project week, start to end
+
+On the normal fleet: an owner per machine, then `arena spend`. Budgets are only to watch: nothing
+stops a machine at a figure, and participants see none of it. In order (rehearsed on the sandbox
+2026-10-31):
+
+1. **Before the first machine.** `arena config check`: `OPENROUTER_KEY_LIMIT` is the cap every new
+   key gets (a handover's too). `arena cron show`: the backup line copies homes (no `--no-pull`) —
+   project work outside the course repo is only in the home copy.
+2. **Keys, then machines.** `arena keys gen apple bloom` mints each name's OpenRouter key (names
+   with no pod yet are fine); then `arena pods up apple --owner alice` (one owner per run;
+   `--provider hetzner` for a VM). `up` copies a name's key on as it sets the machine up, but
+   never mints one: a name without a key gets none until `arena keys gen <name> --copy`. A
+   machine that already exists: `arena spend assign <machine> <owner>` (it says when the machine's
+   key was someone else's; `arena keys rotate <machine> --copy` gives a fresh one).
+3. **Who's on what:** `arena spend --by machine` — `pods list` and the dashboard don't show owners.
+4. **During the week:** `arena keys limit apple +5` (the dashboard: `a a`) raises a cap in place;
+   `arena keys pause apple` / `resume`. `arena spend` any time.
+5. **A machine for someone else:** `arena pods terminate apple --revoke-key`, then `arena pods up
+   apple --owner bob`. The old instance keeps alice's hours and AI spend and bob's starts at 0; a
+   key still alice's is rotated first (`--keep-key` keeps it). `spend assign` on a running machine
+   moves its whole instance, earlier hours included: for a new person, make a new instance.
+6. **A rename** (`arena pods rename apple cedar`) moves the machine to cedar's proxy port: its
+   person connects as `<prefix>-cedar` from then on. Its spend, key and keys-CSV row follow.
+7. **Backups.** A machine's git backup needs its day branch (`arena pods init-branches`, or the
+   morning's `set-branch main --all --init-branches`); the home copy runs on any branch. `arena
+   backups`, or `b` in the dashboard (Enter on a machine: back up now, copy home now).
+8. **End of the week.** There's no `--final`: `arena pods backup <names>` once more (git, then the
+   home copy); `arena spend --since <first day> --csv > spend.csv` (`--by machine --csv` per
+   instance, `--json` the whole report); then `arena pods terminate <name> --revoke-key` per
+   machine — one at a time, since `--all` is every pod on the account — and `arena teardown
+   --check`.
+
 ### Running a second fleet from the same control box
 
 Optional, and **not needed for a project week**: that runs on the normal fleet, with `--owner`
@@ -2690,8 +2734,8 @@ where `arena update` installs: next to the running binary — `readlink -f "$(co
 prints it on another box):
 
 ```bash
-mkdir -p /root/p2                                     # its own folder: keys/ is relative to it
-p2() { (cd /root/p2 && /home/dev/.cargo/bin/arena --config /root/p2/config.env "$@"); }
+mkdir -p /root/p2                                     # its own folder: keys/, the plan and backup/ live beside its config
+p2() { /home/dev/.cargo/bin/arena --config /root/p2/config.env "$@"; }
 p2 config check
 p2 proxy plan && p2 proxy apply                       # writes p2.conf only
 p2 pods up apple --owner alice                        # each person's machines
@@ -2699,9 +2743,11 @@ p2 spend                                              # per person; --by machine
 p2 tui                                                # its dashboard
 ```
 
-- `arena` reads `--config` (only `arena-tui` reads `ARENA_CONFIG`; `arena tui` passes `--config`
-  on) — hence `p2()`. Open the second fleet's dashboard with `p2 tui` only: its actions run
-  `arena` in the folder it was started from, and only `/root/p2` has the second fleet's `keys/`.
+- `p2()` names the second fleet's config on every command (`export ARENA_CONFIG=/root/p2/config.env`
+  in a shell of its own does the same: [which config](#which-config-which-provider-and-the-files-beside-it)).
+  `keys/`, `arena-plan.json` and `backup/` (when `LOCAL_BACKUP_DIR` is unset) are found beside the
+  config, `/root/p2`, from any directory; `p2 tui` opens its dashboard, whose actions run `arena`
+  with the same config.
 - **Cron: never `arena cron install` for the second fleet.** A crontab has one arena block, and
   its lines are known by command, not config: the second fleet's install would replace the first
   fleet's lines (`cron remove` would remove them), and both would share the locks in
@@ -2711,7 +2757,7 @@ p2 tui                                                # its dashboard
   `arena` fails there, quietly):
 
   ```
-  */2 * * * * root mkdir -p /root/.local/state/arena-cron-p2 && cd /root/p2 && flock -n /root/.local/state/arena-cron-p2/snapshot.lock /home/dev/.cargo/bin/arena --config /root/p2/config.env snapshot --public --out /root/p2/fleet.json >> /root/.local/state/arena-cron-p2/snapshot.log 2>&1
+  */2 * * * * root mkdir -p /root/.local/state/arena-cron-p2 && flock -n /root/.local/state/arena-cron-p2/snapshot.lock /home/dev/.cargo/bin/arena --config /root/p2/config.env snapshot --public --out /root/p2/fleet.json >> /root/.local/state/arena-cron-p2/snapshot.log 2>&1
   ```
 - **Shared provider accounts:** listings are per account, so the second fleet's `pods list` shows
   the first fleet's pods, and `--all` (or a command without targets) acts on them too. Name your
@@ -2719,6 +2765,56 @@ p2 tui                                                # its dashboard
   account. `teardown --check` lists every machine on the account.
 
 ## Config, plans and the provider APIs
+
+### Which config, which provider, and the files beside it
+
+**The config file**, first found wins (`arena` and `arena-tui` alike):
+
+| # | Where | Notes |
+| --- | --- | --- |
+| 1 | `--config <file>` | `arena` only; `arena tui` hands it to the dashboard |
+| 2 | `ARENA_CONFIG=<file>` | empty = unset; a file named here or by `--config` is read even if missing (the error says so) |
+| 3 | `~/.config/arena/config.env` | only if it exists |
+| 4 | `/home/dev/prod-ro/config.env` | the built-in default: ARENA's prod copy on its control box |
+
+`config which` says which one won (`source: …`) and warns about the ones that lost: an
+`ARENA_CONFIG` naming another file than `--config`'s, or a `~/.config/arena/config.env` passed over.
+Cron lines always carry `--config <file>` (`cron install` writes the file it was run with), so what
+cron reads never depends on its environment.
+
+**The provider** `create`/`up` make pods on, and whose key every listing needs: `--provider`, else
+the config's `PROVIDER` (e.g. `PROVIDER=hetzner` for a Hetzner-only fleet), else `runpod`. The
+dashboard's `ARENA_PROVIDER` stands in for `--provider`. Every other provider with a key is still
+listed and acted on as before; `offers` without `--provider` still compares every configured one.
+`config check` has a `PROVIDER` row (✗ for a name that isn't a provider) and `config which` says
+where the provider came from.
+
+**Files beside the config.** `keys/` (the API-key CSVs `keys gen` writes and `setup`/`copy-keys`
+read), `arena-plan.json` (`plan check`/`show` without `--file`) and `backup/` (where `pods pull` and
+`pods backup` copy pods when `LOCAL_BACKUP_DIR` is unset) are found in the config file's folder:
+
+| Beside the config | In the current directory | Used |
+| --- | --- | --- |
+| there | any | beside the config |
+| not there | there, and this fleet's | the current directory, with a one-line warning to move it (`config which` and `config check` show ⚠) |
+| not there | there, but nothing in it is this fleet's | beside the config (made there), with a one-line warning: another fleet's keys or backups are never used |
+| not there | not there | beside the config, made there when first written |
+
+"This fleet's" is judged by `MACHINE_NAME_PREFIX`. A `keys/` by its `openrouter_api_keys.csv`, the
+file the keys commands read: as a link it must point at `<prefix>_openrouter_keys.csv` (`keys gen`
+points it at its own fleet's file); as a plain file (the older layout) it must have a row for a
+`<prefix>-…` machine; with neither, `<prefix>_openrouter_keys.csv` or such a row in another CSV says
+so. A `backup/` with a `<prefix>-…` pod one level down (`w1d2/<prefix>-apple`, `big/<prefix>-apple`). The plan is anyone's. The read-only prod
+copy is the one exception, and only that file: another config in its folder follows these rules.
+**One folder per fleet:** two configs in one folder share its `keys/` and `backup/`, and the
+`openrouter_api_keys.csv` link names whichever prefix ran `keys gen` last (that re-pointing is how a
+new cohort's prefix takes the folder over). `config which` and `keys which` say ⚠ when the link is
+another prefix's.
+
+With the read-only prod copy (`/home/dev/prod-ro/config.env` itself) they stay in the current
+directory, as before and without a warning: that folder holds only the config, and prod's cron runs
+in `/root`. `config which` lists all three with where each was found. An explicit
+`LOCAL_BACKUP_DIR` is used as written: make it absolute (cron and the reaper need that).
 
 ### `config check | set | which`
 
@@ -2732,7 +2828,9 @@ started.
 KEY VALUE` writes a key (e.g. an API key) into config.env — or give just `KEY` and **pipe the value
 on stdin** (`printf %s "$TOK" | arena config set HF_TOKEN`, script-friendly, keeps secrets out of
 `argv`/`ps`), or with no args prompt interactively (the picker shows which keys are already set);
-`config which` shows the active config file (path, readable/**writable**), what parsed, and any keys
+`config which` shows the active config file (path, readable/**writable**) and where it came from
+(and what lost: [which config](#which-config-which-provider-and-the-files-beside-it)), the provider
+and where that came from, what parsed, where `keys/`, the plan and the backup dir are, and any keys
 coming from the environment.
 
 After the report, `config check` looks at **this box's disk** (local, read-only; advice, never a
@@ -2858,8 +2956,9 @@ same. See [What gets backed up, where and when](BACKUPS.md#what-gets-backed-up-w
 pod, GPU stats via `nvidia-smi`, git branch, a setup-health check, and an optional progress signal
 (`PROGRESS_CMD`) — all over SSH in **one** probe per pod. Fetching runs in a **background task** so
 the UI never freezes; it auto-refreshes (`ARENA_REFRESH_SECS`, default 5) and `f` cycles the cadence
-live (2/5/10/20/60s). `ARENA_PROVIDER` (default `runpod`) is where the add-pod form starts; config via
-`ARENA_CONFIG`.
+live (2/5/10/20/60s). `ARENA_PROVIDER` (else the config's `PROVIDER`, else `runpod`) is where the add-pod
+form starts; the config is found as `arena` finds it, `ARENA_CONFIG` first ([which
+config](#which-config-which-provider-and-the-files-beside-it)). `arena tui` sets both.
 
 ### Columns
 
@@ -3024,7 +3123,9 @@ RunPod v1 and Vast; Hetzner: "the disk is kept"); whole-fleet mutations
 require typing **ALL** (a marked set: its count, or `ALL` as above); every confirm says what will
 happen in plain words (`alpha: commit + push the current branch`), never the generated `ssh …` line
 — `v` shows that for backup/setup/test — and backup/setup/test take a single `y`. The dashboard's
-reads stay reads.
+reads stay reads. Its `setup` runs the steps `arena pods setup` runs for the pod's provider — on a
+Hetzner or Shadeform VM the VM script (swap included), the keys authorized and (Hetzner) the
+hostname — but neither the VS Code warm-up nor the API keys: those are `arena pods setup`'s.
 
 ### Adding pods
 

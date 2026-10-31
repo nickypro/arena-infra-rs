@@ -581,6 +581,13 @@ impl ProvisionStep {
     }
 }
 
+/// The bare-VM provisioning script (Hetzner CPU VMs, Shadeform GPU VMs with `ARENA_GPU=1`):
+/// system deps, docker + compose, a uv venv with the ARENA packages, swap, and a zsh rc that
+/// activates the venv. Embedded here, in core, so `arena pods setup` and the dashboard's setup
+/// push the same script ([`provisioning_steps`] scps a staged copy to `/root/hetzner_setup.sh`);
+/// image-based pods take the lighter post-image config path instead.
+pub const HETZNER_SETUP: &str = include_str!("hetzner_setup.sh");
+
 /// Which bare-VM setup a provider's pods get: they're plain VMs (not containers from the
 /// cohort image), so the full setup script builds the ARENA env on them ([`provisioning_steps`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
