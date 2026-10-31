@@ -2732,10 +2732,11 @@ read), `arena-plan.json` (`plan check`/`show` without `--file`) and `backup/` (w
 | not there | there, but nothing in it is this fleet's | beside the config (made there), with a one-line warning: another fleet's keys or backups are never used |
 | not there | not there | beside the config, made there when first written |
 
-"This fleet's" is judged by `MACHINE_NAME_PREFIX`: a `keys/` whose `openrouter_api_keys.csv` link
-points at `<prefix>_openrouter_keys.csv` (`keys gen` points it at its own fleet's file), or, with no
-link, that file or a CSV row for a `<prefix>-…` machine; a `backup/` with a `<prefix>-…` pod one
-level down (`w1d2/<prefix>-apple`, `big/<prefix>-apple`). The plan is anyone's. The read-only prod
+"This fleet's" is judged by `MACHINE_NAME_PREFIX`. A `keys/` by its `openrouter_api_keys.csv`, the
+file the keys commands read: as a link it must point at `<prefix>_openrouter_keys.csv` (`keys gen`
+points it at its own fleet's file); as a plain file (the older layout) it must have a row for a
+`<prefix>-…` machine; with neither, `<prefix>_openrouter_keys.csv` or such a row in another CSV says
+so. A `backup/` with a `<prefix>-…` pod one level down (`w1d2/<prefix>-apple`, `big/<prefix>-apple`). The plan is anyone's. The read-only prod
 copy is the one exception, and only that file: another config in its folder follows these rules.
 
 With the read-only prod copy (`/home/dev/prod-ro/config.env` itself) they stay in the current

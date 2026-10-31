@@ -244,28 +244,34 @@ pub const OPENROUTER_KEYS_LINK: &str = "openrouter_api_keys.csv";
 
 /// Whether `here` (the current directory's fleet file `rel`) is the fleet named `prefix`'s — so
 /// falling back to it can't hand one fleet another's keys file or mix their backups (two fleets on
-/// one box, run from the same directory). `keys/`: its [`OPENROUTER_KEYS_LINK`] — what `keys
-/// which`, `rename`, `terminate --revoke-key` and `copy-keys` read, and `keys gen` re-points —
-/// points at this prefix's `<prefix>_openrouter_keys.csv`; with no link (an older layout), this
-/// prefix's file is there or a CSV has a row for one of its machines (`<prefix>-…,`). `backup/`:
-/// one of its pods one level down (`<label>/<prefix>-…`, `big/<prefix>-…`; pod folders are named
-/// per machine, so fleets don't overwrite each other's). A plan names no fleet: any. Listings, the
-/// link and the keys CSVs' host column only.
+/// one box, run from the same directory). `keys/` is judged by its [`OPENROUTER_KEYS_LINK`], the
+/// one file `keys which`, `rename`, `terminate --revoke-key` and `copy-keys` read and `keys gen`
+/// re-points: a link must point at this prefix's `<prefix>_openrouter_keys.csv` (dangling or not);
+/// a plain file (the layout before per-prefix files) must have a row for one of its machines
+/// (`<prefix>-…,`); with neither, this prefix's file, or a row of its in another `*.csv`, says so.
+/// Anything else (unreadable) isn't. `backup/`: one of its pods one level down (`<label>/<prefix>-…`,
+/// `big/<prefix>-…`; pod folders are named per machine, so fleets don't overwrite each other's). A
+/// plan names no fleet: any. Listings, the link and the keys CSVs' host column only.
 pub fn holds_fleet(rel: &str, here: &Path, prefix: &str) -> bool {
     let mine = format!("{prefix}-");
     let entries = |dir: &Path| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect::<Vec<_>>();
     let named_mine = |p: &Path| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&mine));
+    let has_my_row = |p: &Path| std::fs::read_to_string(p).is_ok_and(|t| t.lines().any(|l| l.starts_with(&mine) && l.contains(',')));
     match rel {
         KEYS_DIR => {
             let own = format!("{prefix}_openrouter_keys.csv");
-            match std::fs::read_link(here.join(OPENROUTER_KEYS_LINK)) {
-                Ok(target) => target.file_name().is_some_and(|n| n == own.as_str()),
-                Err(_) => {
-                    here.join(&own).is_file()
-                        || entries(here).iter().filter(|p| p.extension().is_some_and(|x| x == "csv")).any(|p| {
-                            std::fs::read_to_string(p).is_ok_and(|t| t.lines().any(|l| l.starts_with(&mine) && l.contains(',')))
-                        })
+            let active = here.join(OPENROUTER_KEYS_LINK);
+            match std::fs::symlink_metadata(&active) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    std::fs::read_link(&active).is_ok_and(|t| t.file_name().is_some_and(|n| n == own.as_str()))
                 }
+                Ok(m) if m.is_file() => has_my_row(&active),
+                Ok(_) => false,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    here.join(&own).is_file()
+                        || entries(here).iter().filter(|p| p.extension().is_some_and(|x| x == "csv")).any(|p| has_my_row(p))
+                }
+                Err(_) => false,
             }
         }
         BACKUP_DIR => entries(here).iter().filter(|p| p.is_dir()).any(|d| entries(d).iter().any(|p| named_mine(p))),
@@ -427,16 +433,26 @@ mod tests {
         std::os::unix::fs::symlink("p2_openrouter_keys.csv", keys.join(OPENROUTER_KEYS_LINK)).unwrap();
         std::fs::create_dir_all(backup.join("w1d3").join("p2-apple")).unwrap();
         let linked = [holds_fleet(KEYS_DIR, &keys, "p2"), holds_fleet(KEYS_DIR, &keys, "arena9"), holds_fleet(BACKUP_DIR, &backup, "p2")];
-        // An older layout: the CSV itself, no link, no per-prefix file — its rows say whose.
+        // An older layout: the CSV itself, no link — its rows say whose, whatever per-prefix file
+        // sits beside it (review r3: p2's file next to arena9's active CSV isn't p2's dir).
         let old = d.join("old");
         std::fs::create_dir_all(&old).unwrap();
-        std::fs::write(old.join(OPENROUTER_KEYS_LINK), "p2-apple,sk-or-y\n").unwrap();
-        let legacy = [holds_fleet(KEYS_DIR, &old, "p2"), holds_fleet(KEYS_DIR, &old, "arena9")];
+        std::fs::write(old.join(OPENROUTER_KEYS_LINK), "arena9-apple,sk-or-x\n").unwrap();
+        std::fs::write(old.join("p2_openrouter_keys.csv"), "p2-apple,sk-or-y\n").unwrap();
+        let legacy = [holds_fleet(KEYS_DIR, &old, "arena9"), holds_fleet(KEYS_DIR, &old, "p2")];
+        // A dangling link still names whose it is; no active CSV: this prefix's file says so.
+        let (dangling, none) = (d.join("dangling"), d.join("none"));
+        std::fs::create_dir_all(&dangling).unwrap();
+        std::os::unix::fs::symlink("p2_openrouter_keys.csv", dangling.join(OPENROUTER_KEYS_LINK)).unwrap();
+        std::fs::create_dir_all(&none).unwrap();
+        std::fs::write(none.join("p2_openrouter_keys.csv"), "").unwrap();
+        let other = [holds_fleet(KEYS_DIR, &dangling, "p2"), holds_fleet(KEYS_DIR, &dangling, "arena9"), holds_fleet(KEYS_DIR, &none, "p2"), holds_fleet(KEYS_DIR, &none, "arena9")];
         let (plan, empty) = (holds_fleet(PLAN_FILE, &d.join(PLAN_FILE), "p2"), holds_fleet(BACKUP_DIR, &d.join("nothing"), "p2"));
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(no_link, [true, false, true, false]);
         assert_eq!(linked, [true, false, true]);
         assert_eq!(legacy, [true, false]);
+        assert_eq!(other, [true, false, true, false]);
         assert!(plan && !empty);
     }
 
