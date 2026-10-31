@@ -161,9 +161,14 @@ pub enum Found {
     Beside,
     /// Not made yet: it will be, next to the config file.
     New,
-    /// Only in the current directory, where arena looked before 2026-10-31: still used, with a
-    /// warning ([`FleetFile::warning`]) naming where it belongs (`beside`).
+    /// Only in the current directory, where arena looked before 2026-10-31, and it holds this
+    /// fleet's files ([`holds_fleet`]): still used, with a warning ([`FleetFile::warning`]) naming
+    /// where it belongs (`beside`).
     CurrentDir { beside: PathBuf },
+    /// Not beside the config, and the current directory's (`here`) holds nothing of this fleet's —
+    /// another fleet's, say, run from the same directory: not used (it would hand this fleet the
+    /// other's keys, or mix their backups). This fleet's is made beside the config, with a warning.
+    NotOurs { here: PathBuf },
     /// The current directory, as before and without a warning: there's no config file (a parsed
     /// text), or it's the read-only prod copy ([`LEGACY_CONFIG`]), whose folder holds that one
     /// file — prod's `keys/` and `./backup` are where its operators and its cron (in `/root`) run.
@@ -178,14 +183,22 @@ pub struct FleetFile {
 }
 
 impl FleetFile {
-    /// The one line said when the file was found only in the current directory; `None` otherwise.
+    /// The one line said when the file was found only in the current directory, or when the
+    /// current directory's was passed over as another fleet's; `None` otherwise.
     pub fn warning(&self) -> Option<String> {
-        let Found::CurrentDir { beside } = &self.found else { return None };
-        Some(format!(
-            "warning: using {} in the current directory: arena now looks next to the config first — move it to {}",
-            self.path.display(),
-            beside.display()
-        ))
+        match &self.found {
+            Found::CurrentDir { beside } => Some(format!(
+                "warning: using {} in the current directory: arena now looks next to the config first — move it to {}",
+                self.path.display(),
+                beside.display()
+            )),
+            Found::NotOurs { here } => Some(format!(
+                "warning: not using {} in the current directory: nothing in it is this fleet's (MACHINE_NAME_PREFIX) — using {}",
+                here.display(),
+                self.path.display()
+            )),
+            _ => None,
+        }
     }
 
     /// How `config which` says where it is.
@@ -195,6 +208,7 @@ impl FleetFile {
             Found::Beside => format!("{p}"),
             Found::New => format!("{p} (not made yet)"),
             Found::CurrentDir { beside } => format!("{p} — in the current directory only (⚠ move it to {})", beside.display()),
+            Found::NotOurs { here } => format!("{p} (not made yet; ⚠ {} in the current directory is another fleet's)", here.display()),
             Found::AsBefore => format!("{p} (the current directory, as before: the prod copy's folder isn't a fleet's)"),
         }
     }
@@ -202,10 +216,11 @@ impl FleetFile {
 
 /// Where the fleet file `rel` (`keys`, `arena-plan.json`, `backup`) is, for the config file at
 /// `config` (absolute): next to it when it `exists` there; else in the current directory when it's
-/// only there — where arena looked before, kept working, with a warning; else next to the config,
-/// to be made there. Without a config file, or for the read-only prod copy ([`Found::AsBefore`]):
-/// the current directory, as before. Pure but for `exists`.
-pub fn fleet_file(config: Option<&Path>, rel: &str, exists: impl Fn(&Path) -> bool) -> FleetFile {
+/// only there and `ours` (holds this fleet's files, [`holds_fleet`]) — where arena looked before,
+/// kept working, with a warning; else next to the config, to be made there (warned about when the
+/// current directory's was another fleet's). Without a config file, or for the read-only prod copy
+/// ([`Found::AsBefore`]): the current directory, as before. Pure but for `exists` and `ours`.
+pub fn fleet_file(config: Option<&Path>, rel: &str, exists: impl Fn(&Path) -> bool, ours: impl Fn(&Path) -> bool) -> FleetFile {
     let here = Path::new(".").join(rel);
     let legacy = Path::new(LEGACY_CONFIG).parent();
     let Some(dir) = config.and_then(Path::parent).filter(|d| Some(*d) != legacy) else {
@@ -214,10 +229,34 @@ pub fn fleet_file(config: Option<&Path>, rel: &str, exists: impl Fn(&Path) -> bo
     let beside = dir.join(rel);
     if exists(&beside) {
         FleetFile { path: beside, found: Found::Beside }
-    } else if exists(&here) {
+    } else if !exists(&here) {
+        FleetFile { path: beside, found: Found::New }
+    } else if ours(&here) {
         FleetFile { path: here, found: Found::CurrentDir { beside } }
     } else {
-        FleetFile { path: beside, found: Found::New }
+        FleetFile { path: beside, found: Found::NotOurs { here } }
+    }
+}
+
+/// Whether `here` (the current directory's fleet file `rel`) holds the files of the fleet named
+/// `prefix` — so falling back to it can't hand one fleet another's keys or mix their backups (two
+/// fleets on one box, run from the same directory). `keys/`: this prefix's OpenRouter keys file
+/// (`<prefix>_openrouter_keys.csv`, what `keys gen` writes), or a CSV with a row for one of its
+/// machines (`<prefix>-…,`). `backup/`: one of its pods one level down (`<label>/<prefix>-…`,
+/// `big/<prefix>-…`). A plan names no fleet: any. Listings and the keys CSVs' host column only.
+pub fn holds_fleet(rel: &str, here: &Path, prefix: &str) -> bool {
+    let mine = format!("{prefix}-");
+    let entries = |dir: &Path| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect::<Vec<_>>();
+    let named_mine = |p: &Path| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&mine));
+    match rel {
+        KEYS_DIR => {
+            here.join(format!("{prefix}_openrouter_keys.csv")).is_file()
+                || entries(here).iter().filter(|p| p.extension().is_some_and(|x| x == "csv")).any(|p| {
+                    std::fs::read_to_string(p).is_ok_and(|t| t.lines().any(|l| l.starts_with(&mine) && l.contains(',')))
+                })
+        }
+        BACKUP_DIR => entries(here).iter().filter(|p| p.is_dir()).any(|d| entries(d).iter().any(|p| named_mine(p))),
+        _ => true,
     }
 }
 
@@ -226,7 +265,8 @@ impl Config {
     /// `--config config.env` and its full path find the same files).
     pub fn fleet_file(&self, rel: &str) -> FleetFile {
         let config = self.source().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()));
-        fleet_file(config.as_deref(), rel, Path::exists)
+        let prefix = self.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+        fleet_file(config.as_deref(), rel, Path::exists, |here| holds_fleet(rel, here, prefix))
     }
 
     /// Where `pods pull`, `pods backup`, the reaper and the dashboard copy pods to:
@@ -322,39 +362,74 @@ mod tests {
     }
 
     /// keys/, the plan and backup/ are found next to the config; else in the current directory
-    /// (warned); else made next to the config. No config file, or the read-only prod copy: the
-    /// current directory, as before, unwarned.
+    /// when it holds this fleet's (warned); else made next to the config (warned when the current
+    /// directory's is another fleet's). No config file, or the read-only prod copy: the current
+    /// directory, as before, unwarned.
     #[test]
     fn a_fleet_file_is_beside_the_config_else_in_the_current_directory() {
         let cfg = Some(Path::new("/srv/p2/config.env"));
         let beside = PathBuf::from("/srv/p2/keys");
         let here = PathBuf::from("./keys");
-        // (config, exists beside, exists here) → (path, found)
-        let table: &[(Option<&Path>, bool, bool, &Path, Found)] = &[
-            (cfg, true, true, &beside, Found::Beside),
-            (cfg, true, false, &beside, Found::Beside),
-            (cfg, false, true, &here, Found::CurrentDir { beside: beside.clone() }),
-            (cfg, false, false, &beside, Found::New),
-            (None, true, true, &here, Found::AsBefore),
-            (None, false, false, &here, Found::AsBefore),
-            (Some(Path::new(LEGACY_CONFIG)), true, true, &here, Found::AsBefore),
-            (Some(Path::new(LEGACY_CONFIG)), false, false, &here, Found::AsBefore),
-            (Some(Path::new("/home/dev/prod-ro/other.env")), false, false, &here, Found::AsBefore),
-            (Some(Path::new("/home/dev/prod-ro-copy/config.env")), false, false, Path::new("/home/dev/prod-ro-copy/keys"), Found::New),
+        let prod = Some(Path::new(LEGACY_CONFIG));
+        // (config, exists beside, exists here, here is this fleet's) → (path, found)
+        type Case<'a> = (Option<&'a Path>, bool, bool, bool, &'a Path, Found);
+        let table: &[Case] = &[
+            (cfg, true, true, true, &beside, Found::Beside),
+            (cfg, true, true, false, &beside, Found::Beside),
+            (cfg, true, false, false, &beside, Found::Beside),
+            (cfg, false, true, true, &here, Found::CurrentDir { beside: beside.clone() }),
+            (cfg, false, true, false, &beside, Found::NotOurs { here: here.clone() }),
+            (cfg, false, false, false, &beside, Found::New),
+            (None, true, true, false, &here, Found::AsBefore),
+            (None, false, false, false, &here, Found::AsBefore),
+            (prod, true, true, false, &here, Found::AsBefore),
+            (prod, false, false, false, &here, Found::AsBefore),
+            (Some(Path::new("/home/dev/prod-ro/other.env")), false, false, false, &here, Found::AsBefore),
+            (Some(Path::new("/home/dev/prod-ro-copy/config.env")), false, false, false, Path::new("/home/dev/prod-ro-copy/keys"), Found::New),
         ];
-        for (config, there, cwd, want, found) in table {
-            let got = fleet_file(*config, KEYS_DIR, |p| if p.starts_with(".") { *cwd } else { *there });
-            assert_eq!(got, FleetFile { path: want.to_path_buf(), found: found.clone() }, "{config:?} {there} {cwd}");
+        for (config, there, cwd, ours, want, found) in table {
+            let got = fleet_file(*config, KEYS_DIR, |p| if p.starts_with(".") { *cwd } else { *there }, |_| *ours);
+            assert_eq!(got, FleetFile { path: want.to_path_buf(), found: found.clone() }, "{config:?} {there} {cwd} {ours}");
         }
     }
 
-    /// Only the current-directory fallback warns, in one line naming both places.
+    /// The current directory's keys/ is this fleet's with its prefix's keys file, or a CSV row for
+    /// one of its machines; backup/ with one of its pods a level down; never on another prefix's
+    /// alone (`arena9-…` isn't `arena-…`'s). A plan is anyone's.
+    #[test]
+    fn whose_files_the_current_directory_holds() {
+        let d = std::env::temp_dir().join(format!("arena-holds-fleet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (keys, backup) = (d.join("keys"), d.join("backup"));
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::create_dir_all(backup.join("w1d2").join("arena9-apple")).unwrap();
+        std::fs::create_dir_all(backup.join("big").join("arena9-apple")).unwrap();
+        std::fs::write(keys.join("arena9_openrouter_keys.csv"), "# keys\narena9-apple,sk-or-x\n").unwrap();
+        let before = [holds_fleet(KEYS_DIR, &keys, "arena9"), holds_fleet(KEYS_DIR, &keys, "arena"), holds_fleet(BACKUP_DIR, &backup, "arena9"), holds_fleet(BACKUP_DIR, &backup, "arena")];
+        // A legacy CSV (no per-prefix file) with one of p2's machines; a p2 pod in a day's folder.
+        std::fs::write(keys.join("openrouter_api_keys.csv"), "p2-apple,sk-or-y\n").unwrap();
+        std::fs::create_dir_all(backup.join("w1d3").join("p2-apple")).unwrap();
+        let after = [holds_fleet(KEYS_DIR, &keys, "p2"), holds_fleet(BACKUP_DIR, &backup, "p2"), holds_fleet(PLAN_FILE, &d.join(PLAN_FILE), "p2")];
+        let empty = holds_fleet(BACKUP_DIR, &d.join("nothing"), "p2");
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(before, [true, false, true, false]);
+        assert_eq!(after, [true, true, true]);
+        assert!(!empty);
+    }
+
+    /// Only the current-directory fallback, and passing another fleet's over, warn: one line naming
+    /// both places.
     #[test]
     fn only_the_fallback_warns() {
-        let f = fleet_file(Some(Path::new("/srv/p2/config.env")), BACKUP_DIR, |p| p.starts_with("."));
+        let f = fleet_file(Some(Path::new("/srv/p2/config.env")), BACKUP_DIR, |p| p.starts_with("."), |_| true);
         assert_eq!(
             f.warning().as_deref(),
             Some("warning: using ./backup in the current directory: arena now looks next to the config first — move it to /srv/p2/backup")
+        );
+        let f = fleet_file(Some(Path::new("/srv/p2/config.env")), KEYS_DIR, |p| p.starts_with("."), |_| false);
+        assert_eq!(
+            f.warning().as_deref(),
+            Some("warning: not using ./keys in the current directory: nothing in it is this fleet's (MACHINE_NAME_PREFIX) — using /srv/p2/keys")
         );
         for found in [Found::Beside, Found::New, Found::AsBefore] {
             assert_eq!(FleetFile { path: "x".into(), found }.warning(), None);

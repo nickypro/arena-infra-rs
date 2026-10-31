@@ -2592,8 +2592,13 @@ read), `arena-plan.json` (`plan check`/`show` without `--file`) and `backup/` (w
 | Beside the config | In the current directory | Used |
 | --- | --- | --- |
 | there | any | beside the config |
-| not there | there | the current directory, with a one-line warning to move it (`config which` and `config check` show ⚠) |
+| not there | there, and this fleet's | the current directory, with a one-line warning to move it (`config which` and `config check` show ⚠) |
+| not there | there, but nothing in it is this fleet's | beside the config (made there), with a one-line warning: another fleet's keys or backups are never used |
 | not there | not there | beside the config, made there when first written |
+
+"This fleet's" is judged by `MACHINE_NAME_PREFIX`: a `keys/` holding `<prefix>_openrouter_keys.csv`
+(what `keys gen` writes) or a CSV row for a `<prefix>-…` machine; a `backup/` with a `<prefix>-…`
+pod one level down (`w1d2/<prefix>-apple`, `big/<prefix>-apple`). The plan is anyone's.
 
 With the read-only prod copy (`/home/dev/prod-ro/config.env`) they stay in the current directory,
 as before and without a warning: that folder holds only the config, and prod's cron runs in

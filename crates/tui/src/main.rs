@@ -426,7 +426,7 @@ async fn main() -> Result<()> {
     let (config_file, source) = arena_core::config::find_config(None);
     let cfg = Config::load(&config_file).with_context(|| arena_core::config::load_context(&config_file, source))?;
     let config_path = config_file.display().to_string();
-    let (provider_name, _) = arena_core::config::pick_provider(std::env::var("ARENA_PROVIDER").ok().as_deref(), &cfg);
+    let (provider_name, provider_source) = arena_core::config::pick_provider(std::env::var("ARENA_PROVIDER").ok().as_deref(), &cfg);
     let demo = demo::wanted(std::env::var("ARENA_TUI_DEMO").ok().as_deref());
     // Fleet-spanning provider (like the CLI): the dashboard lists pods across ALL configured
     // backends — runpod + vast + hetzner — not just the primary. `warn_on_partial=false` so a
@@ -434,7 +434,14 @@ async fn main() -> Result<()> {
     // go to the chosen primary (ARENA_PROVIDER). A demo asks no provider anything.
     let provider: Arc<dyn Provider> = match demo {
         Some(_) => Arc::new(demo::NoProvider),
-        None => Arc::from(arena_core::provider::build_fleet(&provider_name, &cfg, false)?),
+        None => {
+            let fleet = arena_core::provider::build_fleet(&provider_name, &cfg, false);
+            Arc::from(match provider_source {
+                // A bad PROVIDER in the config is named as that, as `arena` names it.
+                arena_core::config::ProviderSource::Config => fleet.with_context(|| format!("the config's PROVIDER=\"{provider_name}\" ({config_path})"))?,
+                _ => fleet?,
+            })
+        }
     };
     let trace = lag::Trace::from_env();
     let progress_cmd = cfg.get("PROGRESS_CMD").map(String::from);

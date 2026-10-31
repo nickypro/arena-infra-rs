@@ -1200,9 +1200,10 @@ pub(crate) enum PodCmd {
     /// tokens. No targets = every reachable pod.
     #[command(verbatim_doc_comment)]
     CopyKeys {
-        /// Directory holding the per-host `<provider>_api_keys.csv` files.
-        #[arg(long, default_value = "./keys")]
-        keys_dir: String,
+        /// Directory holding the per-host `<provider>_api_keys.csv` files [default: keys/ beside
+        /// the config]
+        #[arg(long)]
+        keys_dir: Option<String>,
         /// Hugging Face token for every pod (overrides config HF_TOKEN)
         #[arg(long)]
         hf_token: Option<String>,

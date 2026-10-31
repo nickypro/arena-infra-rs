@@ -771,9 +771,10 @@ async fn handle_pods_bal(
             handle_restore(provider, &remote, cfg, &target, opts, RSYNC, now).await?;
         }
 
-        PodCmd::CopyKeys { sel, keys_dir, hf_token, cc_token, dry_run } => {
+        PodCmd::CopyKeys { sel, keys_dir: dir, hf_token, cc_token, dry_run } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
-            handle_copy_keys(remote, cfg, &keys_dir, hf_token, cc_token, &sel, dry_run, yes).await?;
+            let dir = dir.unwrap_or_else(|| keys_dir(cfg));
+            handle_copy_keys(remote, cfg, &dir, hf_token, cc_token, &sel, dry_run, yes).await?;
         }
 
         PodCmd::Cp { file, dest, recursive, sel, timeout, dry_run } => {
