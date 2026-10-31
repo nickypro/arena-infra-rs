@@ -218,10 +218,11 @@ mod tests {
     use arena_core::{balance, Pod};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::backend::TestBackend;
+    use crate::demo;
+    use crate::input::handle_mouse;
     use crate::state::{self, dashboard_snapshot, summarize, RefreshStatus};
     use crate::table::now_unix;
     use crate::tests::{cfg, draw, fixture_shared, live_views, pod, screen, ui, verdict, NOW};
-    use crate::{demo, handle_mouse};
 
     /// The footer, in plain words: `[i] info` in its first cells, then a notice (`D`'s prompt),
     /// then a question's line with its seconds, then the short status, the refresh's age and

@@ -205,8 +205,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use arena_core::remote::FakeRemote;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crate::input::{handle_mouse, list_key, ListKey};
     use crate::tests::{cfg, draw, fixture_shared, ui};
-    use crate::{handle_mouse, list_key, ListKey};
 
     /// `i` — or a click on the footer's `[i] info` — opens the info panel over the list or the detail
     /// view; it holds every word the bars left out; Esc (or `i`, or another click) goes back to

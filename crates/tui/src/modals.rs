@@ -446,10 +446,11 @@ mod tests {
     use arena_core::selector::Naming;
     use arena_core::snapshot::HealthCache;
     use crossterm::event::KeyModifiers;
+    use crate::input::apply_select;
     use crate::ssh_actions::build_preview;
     use crate::state::{dashboard_snapshot, mark_key};
     use crate::tests::{cfg, draw, fixture_shared, pod, ui, NOW};
-    use crate::{apply_select, ask, Mode};
+    use crate::{ask, Mode};
 
     /// The rows read the core snapshot: $/h in each provider's currency (`-` when not
     /// billing), the maintenance badge, the last deep check + its age (or `checking`), the

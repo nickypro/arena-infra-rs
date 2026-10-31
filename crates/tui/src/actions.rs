@@ -408,9 +408,9 @@ mod tests {
     use arena_core::selector::Naming;
     use arena_core::snapshot::HealthCache;
     use arena_core::PodSpec;
+    use crate::input::submit_input;
     use crate::refresh::{backend_refusals, backend_resets};
     use crate::state::{dashboard_snapshot, mark_key};
-    use crate::submit_input;
     use crate::tests::{cfg, draw, fixture_shared, pod, ui, FakeFleet, NOW};
 
     /// The dashboard refuses restart/stop/terminate on a pod the listing reports locked —
