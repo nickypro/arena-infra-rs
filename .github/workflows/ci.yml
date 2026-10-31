@@ -34,7 +34,7 @@ jobs:
       # Same rule as the local gate: any compiler warning fails.
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Toolchain
         run: |
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
@@ -48,7 +48,7 @@ jobs:
           git config --global user.name "arena CI"
           git config --global user.email "ci@example.invalid"
           git config --global init.defaultBranch main
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Test
         env:
           ARENA_TEST_ALL_SHELLS: "1"
@@ -61,10 +61,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
       # The tests turn on core's `test-util` (its test doubles) through the CLI's and the
