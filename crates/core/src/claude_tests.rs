@@ -457,7 +457,7 @@ fn token_lines(text: &str) -> Vec<&str> {
 /// nothing should be.
 fn leftovers(home: &Path, keep: &[&str]) -> Vec<String> {
     if let Ok(lock) = std::fs::read_to_string(home.join(".arena-claude.lock")) {
-        assert!(lock.trim().chars().all(|c| c.is_ascii_digit()), "the lock file holds a generation and nothing else: {lock:?}");
+        assert!(lock.lines().all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit())), "the lock file holds generations and nothing else: {lock:?}");
     }
     let mut v: Vec<String> = std::fs::read_dir(home)
         .unwrap()
@@ -667,7 +667,7 @@ fn an_older_push_reaching_the_pod_after_a_newer_one_changes_nothing() {
     assert_eq!(code, Some(6));
     assert!(err.contains("a newer push has already run on this machine"), "{err}");
     assert!(read(home, ".zshrc").contains(&tok(2)) && !read(home, ".zshrc").contains(&tok(1)), "the newer token stays");
-    assert_eq!(read(home, ".arena-claude.lock").trim(), "200");
+    assert_eq!(read(home, ".arena-claude.lock").lines().last(), Some("200"), "the last push that ran");
     assert_eq!(run(300, &tok(3)).0, Some(0));
     assert!(read(home, ".zshrc").contains(&tok(3)));
     assert!(next_generation() < next_generation(), "each push is newer than the one before");
@@ -687,10 +687,11 @@ fn a_generation_is_newer_than_the_last_even_after_the_clock_went_back() {
     assert_eq!(g1, ahead + 1, "one more than the last given out, the clock being behind it");
     let g2 = generation_for(&state, "hetzner", "42").unwrap();
     assert_eq!(g2, g1 + 1, "kept: the next one, as from another command");
-    // Another machine has its own; a counter that isn't a number starts again from the clock.
+    // Another machine has its own; a counter that isn't a number is refused.
     assert!(generation_for(&state, "hetzner", "43").unwrap() < ahead);
     std::fs::write(&file, "garbage").unwrap();
-    assert!(generation_for(&state, "hetzner", "42").unwrap() < ahead);
+    let e = generation_for(&state, "hetzner", "42").unwrap_err();
+    assert!(e.contains("isn't a number"), "refused, not restarted from the clock: {e}");
 }
 
 /// Review r4: a `~/.arena-claude.lock` that's a symlink is never written through: `>` would
@@ -719,6 +720,29 @@ fn a_lock_path_that_is_a_symlink_is_never_written_through() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not a plain file"));
     assert_eq!(read(home, "notes.txt"), "a participant's notes\n", "the file it points at is untouched");
     assert!(!home.join(".zshrc").exists(), "nothing else changed");
+}
+
+/// Review r4: the lock file is appended to, never truncated — a line per push, the last one counts.
+#[cfg(unix)]
+#[test]
+fn the_lock_file_is_only_appended_to() {
+    use std::io::Write;
+    let d = tmp("push-lock-append");
+    let home = &d.0;
+    for gen in [100u64, 200] {
+        let mut child = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(push_command(true, gen))
+            .env("HOME", home)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(format!("{}\n", tok(1)).as_bytes()).unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+    }
+    assert_eq!(read(home, ".arena-claude.lock"), "100\n200\n");
 }
 
 #[test]
