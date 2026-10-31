@@ -276,6 +276,10 @@ struct Shared {
     ai_wanted: bool,
     /// The backups' status as the screen last read it (`backups.rs`).
     backups: backups::Landed,
+    /// Who each row's machine instance is for, by [`mark_key`] (`--owner`, `spend assign`: the
+    /// spend ledger, read after each refresh records its listing) — the OWNER column and the
+    /// detail view's `owner:` line. Rows with no owner aren't in it.
+    owners: HashMap<String, String>,
 }
 
 impl Shared {
@@ -838,6 +842,8 @@ async fn refresh(
     // rewritten more than once a minute. Only the providers that listed this time count
     // (`fresh`): a rate-limited one's carried rows say nothing new.
     arena_core::spend::record_listing(spend_path(cfg).as_deref(), &fresh, &pods, &Naming::from_config(cfg), listed_at);
+    // Who each machine is for, from the ledger just written (the OWNER column).
+    let owners = spend_path(cfg).map(|p| owners_by_key(&arena_core::spend::load(&p).0, &pods)).unwrap_or_default();
     // The balance's runway is judged against what is billing as listed (not the pending
     // placeholders, and after the details filled the prices), a provider that failed to
     // list — or was rate-limited, its rows carried — counting as unknown, never as $0/h.
@@ -893,6 +899,7 @@ async fn refresh(
     }
     s.resets = backend_resets(provider, &display);
     s.refusals = backend_refusals(provider, &display);
+    s.owners = owners;
     s.publish(snap);
     s.last_refresh = Some(Instant::now());
     s.refreshing = false;
@@ -2501,6 +2508,12 @@ fn spend_path(cfg: &Config) -> Option<std::path::PathBuf> {
     snapshot::state_file_path_for(cfg, arena_core::spend::SPEND_FILE).ok()
 }
 
+/// Each owned pod's owner by [`mark_key`] (per instance: provider + id, never the name a reused
+/// name shares with someone else's instance). Pure.
+fn owners_by_key(state: &arena_core::spend::SpendState, pods: &[Pod]) -> HashMap<String, String> {
+    pods.iter().filter_map(|p| arena_core::spend::owner_of(state, &p.provider, &p.id).map(|o| (mark_key(p), o.to_string()))).collect()
+}
+
 /// Record a stop or terminate the dashboard just made in the spend ledger (quietly).
 fn record_spend(cfg: &Config, ev: &arena_core::spend::Event) {
     let now = snapshot::unix_now();
@@ -3297,7 +3310,8 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     // AI$: each pod's OpenRouter key, spent against its cap — only with a provisioning key.
     // PROGRESS is what PROGRESS_CMD reports, so only with one set.
     let want_progress = ui.cfg.get("PROGRESS_CMD").is_some_and(|c| !c.trim().is_empty());
-    let c = columns::columns(area.width as usize, proxy_w, shared.ai.is_some(), want_progress, with_spark);
+    // OWNER: while some pod has an owner (`--owner`, `spend assign`).
+    let c = columns::columns(area.width as usize, proxy_w, shared.ai.is_some(), !shared.owners.is_empty(), want_progress, with_spark);
     let now = shared.snap.generated_at;
 
     let mut header_cells = vec!["", "P", "NAME", "STATUS", "M", "SET", "GPU", "GPU%"];
@@ -3318,6 +3332,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     }
     if c.ai {
         header_cells.push("AI$");
+    }
+    if c.owner {
+        header_cells.push("OWNER");
     }
     if c.host {
         header_cells.push("CPU%");
@@ -3440,6 +3457,10 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                     ai.is_some_and(|a| a.read),
                 ));
             }
+            if c.owner {
+                // Empty for a pod with no owner; a long name is cut (the detail view has it whole).
+                cells.push(Cell::from(shared.owners.get(&mark_key(p)).map(|o| truncate(o, columns::OWNER_W)).unwrap_or_default()));
+            }
             if c.host {
                 // Host CPU% and RAM% (both coloured by load); exact RAM GB is in detail.
                 let cpu = m.and_then(|m| m.cpu_pct);
@@ -3511,6 +3532,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     }
     if c.ai {
         widths.push(Constraint::Length(columns::AI_W as u16)); // AI$ (e.g. "1.23/5")
+    }
+    if c.owner {
+        widths.push(Constraint::Length(columns::OWNER_W as u16)); // OWNER (e.g. "alice")
     }
     if c.host {
         widths.push(Constraint::Length(4)); // CPU%
@@ -3677,7 +3701,9 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         // Where to look first: a long list is cut at the pane's edge.
         format!("⚠ {} at cap (`arena keys list` has each one's cap and spend): {}", count_of(names.len(), "key", "keys"), names.join(", "))
     });
-    let fact_lines = FACT_LINES + u16::from(ai.is_some()) + u16::from(caps.is_some());
+    // Who the machine is for (`--owner`, `spend assign`), when it has an owner.
+    let owner = shared.owners.get(&mark_key(pod));
+    let fact_lines = FACT_LINES + u16::from(ai.is_some()) + u16::from(caps.is_some()) + u16::from(owner.is_some());
     let show_graphs = inner.height >= fact_lines + 3 + procs_h + commits_h + 6;
 
     let mut constraints: Vec<Constraint> = vec![
@@ -3843,6 +3869,9 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         fact("proxy:", proxy),
         fact("cost:", or_dim(cost, plain)),
     ];
+    if let Some(o) = owner {
+        facts.push(fact("owner:", one(fit(format!("{o}  (`arena spend` has what it cost)")), plain)));
+    }
     if let Some((text, tone)) = ai {
         facts.push(fact("ai key:", one(fit(text), tone.map(tone_style).unwrap_or(plain))));
     }
@@ -5488,6 +5517,34 @@ deep_check_end=1
         let at = lines.iter().position(|l| l.contains("where:")).unwrap();
         assert!(lines[at].contains("United States, California") && lines[at].contains('…'), "{}", lines[at]);
         assert!(lines[at + 1].contains("proxy:"), "the next fact on the next row:\n{}", lines.join("\n"));
+    }
+
+    /// OWNER: who each instance is for, from the spend ledger (per provider + id, never the name),
+    /// in a short column that comes in once there's room and only while some pod has an owner —
+    /// empty for a pod with none — and whole on the detail view's `owner:` line.
+    #[test]
+    fn the_owner_shows_in_its_column_and_the_detail_view() {
+        use arena_core::spend::{self, Event, OwnerRule, SpendState};
+        let mut shared = fixture_shared();
+        let alpha = shared.pods.iter().find(|p| p.name.ends_with("alpha")).unwrap().clone();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let header_of = |lines: &[String]| lines.iter().find(|l| l.contains("HLTH")).cloned().unwrap();
+        assert!(!header_of(&draw(200, 12, &shared, &ui)).contains("OWNER"), "no owners, no column");
+        let state = spend::apply_event(SpendState::default(), &Event::Created { pod: &alpha, owner: &OwnerRule::Given("alexandria".into()) }, 1_800_000_000);
+        shared.owners = owners_by_key(&state, &shared.pods);
+        assert_eq!(shared.owners.len(), 1, "only alpha has one: {:?}", shared.owners);
+        let lines = draw(200, 12, &shared, &ui);
+        let header = header_of(&lines);
+        assert!(header.contains(" OWNER "), "{header}");
+        assert!(row(&lines, "alpha").contains(" alexand… "), "cut to the column: {}", row(&lines, "alpha"));
+        assert!(!row(&lines, "bravo").contains("alex"), "no owner: nothing");
+        assert!(!header_of(&draw(100, 12, &shared, &ui)).contains("OWNER"), "a narrow terminal drops it");
+        ui.mode = Mode::Detail;
+        ui.selected = shared.pods.iter().position(|p| p.name == alpha.name).unwrap();
+        let pane = draw(160, 40, &shared, &ui).join("\n");
+        assert!(pane.contains("owner:    alexandria  (`arena spend` has what it cost)"), "{pane}");
+        ui.selected = shared.pods.iter().position(|p| p.name.ends_with("bravo")).unwrap();
+        assert!(!draw(160, 40, &shared, &ui).join("\n").contains("owner:"), "no line without an owner");
     }
 
     /// The human (2026-10-29, prod's dashboard): "why does it say 1 ai key at cap?" — every AI$

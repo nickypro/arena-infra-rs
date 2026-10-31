@@ -1073,6 +1073,27 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// `pods list` shows each instance's owner from the spend ledger (an OWNER column after NAME),
+    /// and no column at all while no pod has one.
+    #[tokio::test]
+    async fn pods_list_shows_the_owner_column_only_with_owners() {
+        let dir = StateDir::new("list-owner");
+        let conf = dir.cfg("");
+        let fleet = Fleet { backends: vec![("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.5, 1), pod("devtest-bloom", "RUNNING", 0.5, 2)])), ("vast", Ok(vec![]))] };
+        let (out, _) = crate::list_with(&fleet, &no_remote(), &conf, &no_balance(), false, false).await.unwrap();
+        assert!(out.starts_with("NAME           PROVIDER"), "no owner yet, no column: {out}");
+        let ctx = crate::spend::SpendCtx::from_config(&conf);
+        let apple = pod("devtest-apple", "RUNNING", 0.5, 1);
+        ctx.event(&arena_core::spend::Event::Created { pod: &apple, owner: &arena_core::spend::OwnerRule::Given("alice".into()) });
+        let (out, _) = crate::list_with(&fleet, &no_remote(), &conf, &no_balance(), false, false).await.unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("NAME           OWNER  PROVIDER"), "{out}");
+        assert!(lines[1].starts_with("devtest-apple  alice  runpod"), "{out}");
+        assert!(lines[2].starts_with("devtest-bloom         runpod"), "no owner: an empty cell: {out}");
+        let (json, _) = crate::list_with(&fleet, &no_remote(), &conf, &no_balance(), true, false).await.unwrap();
+        assert!(!json.contains("alice"), "--json is unchanged: {json}");
+    }
+
     #[tokio::test]
     async fn pods_list_footer_shows_balance() {
         let dir = StateDir::new("list-footer");

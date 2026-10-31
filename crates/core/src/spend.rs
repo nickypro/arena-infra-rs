@@ -1127,6 +1127,21 @@ pub fn key_owner<'s>(state: &'s SpendState, machine: &str) -> Option<&'s str> {
     state.keys.iter().rev().find(|k| k.gone.is_none() && k.name == machine).and_then(|k| k.owner.as_deref())
 }
 
+/// Who a listed machine instance is for: the owner of its row (provider + id — never its name,
+/// which a reused name shares with someone else's instance), the open row first. `None`: no
+/// owner, or not in the ledger yet.
+pub fn owner_of<'s>(state: &'s SpendState, provider: &str, id: &str) -> Option<&'s str> {
+    let mine = || state.machines.iter().rev().filter(|m| m.provider == provider && m.id == id);
+    mine().find(|m| m.is_open()).or_else(|| mine().next()).and_then(|m| m.owner.as_deref())
+}
+
+/// The OWNER cells for `pods` (`pods list`, the dashboard): each instance's owner, `""` for
+/// none — or `None` when no pod has one, so a fleet that doesn't use owners shows no column.
+pub fn owners_column(state: &SpendState, pods: &[Pod]) -> Option<Vec<String>> {
+    let cells: Vec<String> = pods.iter().map(|p| owner_of(state, &p.provider, &p.id).unwrap_or_default().to_string()).collect();
+    cells.iter().any(|c| !c.is_empty()).then_some(cells)
+}
+
 /// Whether creating `machine` for `new_owner` hands its key over: the name's current key
 /// belongs to a different known owner. Returns that owner.
 pub fn handover_needed<'s>(state: &'s SpendState, machine: &str, new_owner: &str) -> Option<&'s str> {

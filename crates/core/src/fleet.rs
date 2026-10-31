@@ -387,20 +387,37 @@ pub fn render_pods_table(pods: &[Pod]) -> String {
 /// `crate::reap::render::ends_label`) before MAINT — `None` = no column (the reaper keeps no
 /// state here), so the table is unchanged for everyone not using it.
 pub fn render_pods_table_with(pods: &[Pod], ends: Option<&[String]>) -> String {
-    let Some(ends) = ends.filter(|e| e.len() == pods.len()) else {
-        let rows: Vec<Vec<String>> = pods.iter().map(pod_cells).collect();
-        return table::render(&POD_HEADERS, &POD_ALIGN, &rows);
-    };
+    render_pods_table_full(pods, None, ends)
+}
+
+/// [`render_pods_table_with`] plus an `OWNER` column after NAME (`owners[i]` for `pods[i]`, from
+/// [`crate::spend::owners_column`]: `""` for none) — `None` = no column (no pod has an owner),
+/// so a fleet that doesn't use owners sees the table it always did. A column whose length
+/// doesn't match the pods is left out.
+pub fn render_pods_table_full(pods: &[Pod], owners: Option<&[String]>, ends: Option<&[String]>) -> String {
+    let owners = owners.filter(|o| o.len() == pods.len());
+    let ends = ends.filter(|e| e.len() == pods.len());
     let mut headers: Vec<&str> = POD_HEADERS.to_vec();
-    headers.insert(headers.len() - 1, "ENDS");
     let mut align: Vec<Align> = POD_ALIGN.to_vec();
-    align.insert(align.len() - 1, Align::Left);
+    if ends.is_some() {
+        headers.insert(headers.len() - 1, "ENDS");
+        align.insert(align.len() - 1, Align::Left);
+    }
+    if owners.is_some() {
+        headers.insert(1, "OWNER");
+        align.insert(1, Align::Left);
+    }
     let rows: Vec<Vec<String>> = pods
         .iter()
-        .zip(ends)
-        .map(|(p, e)| {
+        .enumerate()
+        .map(|(i, p)| {
             let mut c = pod_cells(p);
-            c.insert(c.len() - 1, e.clone());
+            if let Some(e) = ends {
+                c.insert(c.len() - 1, e[i].clone());
+            }
+            if let Some(o) = owners {
+                c.insert(1, o[i].clone());
+            }
             c
         })
         .collect();
@@ -521,6 +538,25 @@ mod tests {
         assert!(header.find("ENDS").unwrap() < header.find("MAINT").unwrap(), "{header}");
         assert!(with.lines().nth(1).unwrap().contains("18:00 (in 5h)"), "{with}");
         assert_eq!(render_pods_table_with(&pods, Some(&ends[..1])), plain, "a mismatched column is left out");
+    }
+
+    /// OWNER comes right after NAME, only when given; a pod with no owner has an empty cell.
+    #[test]
+    fn owner_column_after_name_only_when_given() {
+        let pods = vec![pod("devtest-a", "runpod", "RUNNING"), pod("devtest-b", "hetzner", "RUNNING")];
+        let plain = render_pods_table(&pods);
+        assert!(!plain.contains("OWNER"));
+        assert_eq!(render_pods_table_full(&pods, None, None), plain);
+        let owners = vec!["alice".to_string(), String::new()];
+        let ends = vec!["18:00 (in 5h)".to_string(), "-".to_string()];
+        let with = render_pods_table_full(&pods, Some(&owners), Some(&ends));
+        let mut lines = with.lines();
+        let header = lines.next().unwrap();
+        assert!(header.starts_with("NAME       OWNER  PROVIDER"), "{header}");
+        assert!(header.find("ENDS").unwrap() < header.find("MAINT").unwrap(), "{header}");
+        assert!(lines.next().unwrap().starts_with("devtest-a  alice  runpod"), "{with}");
+        assert!(lines.next().unwrap().starts_with("devtest-b         hetzner"), "{with}");
+        assert_eq!(render_pods_table_full(&pods, Some(&owners[..1]), None), plain, "a mismatched column is left out");
     }
 
     #[test]

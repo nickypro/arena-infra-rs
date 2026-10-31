@@ -19,6 +19,12 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-31 · Project week fixes: owners in the listing, a key from `up`, several machines per terminate
+- `pods list` and the dashboard show who each machine is for (`--owner`, `spend assign`): an
+  OWNER column after NAME, per instance, empty for a machine with no owner, and no column at all
+  while no machine has one. In the dashboard it's a short column that a narrow terminal drops;
+  the detail view has an `owner:` line.
+
 ## 2026-10-31 · arena 2.5: move a Hetzner box to a bigger type, keeping its files
 - `arena pods replace apple --server-type cx43` and `pods migrate copy apple --server-type cx43`
   now work on Hetzner: a new server of that type (a comma list falls back), wherever
