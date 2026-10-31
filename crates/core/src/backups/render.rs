@@ -1,7 +1,7 @@
 //! The backups' status in words: `arena backups`' text, the cells the dashboard's screen shares
 //! with it, and the docs' inventory table. Pure.
 
-use super::{ago, until, Cell, Health, JobStatus, Setup, Status, INVENTORY, NOT_COVERED};
+use super::{ago, names, until, Cell, Health, JobStatus, Setup, Status, INVENTORY, NOT_COVERED};
 use crate::table::{render as table, Align};
 
 /// `2026-10-30 21:40 UTC`.
@@ -95,7 +95,9 @@ pub fn text(s: &Status) -> String {
         }
     }
     out.push('\n');
-    if s.pods.is_empty() {
+    if s.pods.is_empty() && !s.without_machine.is_empty() {
+        out.push_str("Pods: no machine yet\n");
+    } else if s.pods.is_empty() {
         out.push_str("Pods: none (no MACHINE_NAME_LIST, and nothing recorded)\n");
     } else {
         out.push_str("Pods (failing first, then the longest since a good backup):\n");
@@ -116,6 +118,14 @@ pub fn text(s: &Status) -> String {
                 out.push_str(&format!("    └ {why}\n"));
             }
         }
+    }
+    if !s.without_machine.is_empty() {
+        let n = s.without_machine.len();
+        out.push_str(&format!(
+            "{n} configured name{} with no machine (nothing to back up): {}\n",
+            if n == 1 { "" } else { "s" },
+            names(&s.without_machine, 8)
+        ));
     }
     out.push_str("\nWhere the copies live:\n");
     let rows: Vec<Vec<String>> = s.storage.iter().map(|st| vec![st.health.mark().to_string(), st.what.clone(), st.place.clone(), st.text.clone()]).collect();

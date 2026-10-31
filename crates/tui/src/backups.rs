@@ -97,19 +97,8 @@ pub(crate) fn open(ui: &mut Ui, shared: &Arc<Mutex<Shared>>) {
 /// The pods the status is about: the dashboard's rows, with what it knows of each.
 pub(crate) fn pods_in(s: &Shared, cfg: &arena_core::Config) -> Vec<PodIn> {
     let naming = arena_core::selector::Naming::from_config(cfg);
-    s.pods
-        .iter()
-        .map(|p| PodIn {
-            name: p.name.clone(),
-            cohort: naming.is_cohort(&p.name),
-            up: match p.status.as_str() {
-                "RUNNING" => Some(true),
-                "EXITED" | "STOPPED" | "TERMINATED" | "off" => Some(false),
-                _ => None,
-            },
-            last_commit: s.metrics.get(&p.name).and_then(|m| m.last_commit).and_then(|t| u64::try_from(t).ok()),
-        })
-        .collect()
+    // As `arena backups` has them (`listed_pods`), with the repo's last commit each pod reported.
+    backups::listed_pods(&s.pods, &naming, |p| s.metrics.get(&p.name).and_then(|m| m.last_commit).and_then(|t| u64::try_from(t).ok()))
 }
 
 /// Each pass of the loop: read the status again when the screen is open and it's due (or asked

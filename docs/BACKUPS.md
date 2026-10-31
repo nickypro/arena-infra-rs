@@ -91,8 +91,13 @@ needs `arena archive up` first). The rest are things you do, or steps inside the
 ### How to check: `arena backups` and the dashboard's `b`
 
 `arena backups` (`--json` for scripts) and the dashboard's backups screen — `b`, or a click on
-the `💾` column's header — show the same status, read from this box only: the crontab, the run
-record, `LOCAL_BACKUP_DIR`, the archive's state and the locks. Neither touches a pod or a provider.
+the `💾` column's header — show the same status: about the fleet's live machines (`arena backups`
+lists the providers, read-only; the dashboard has its rows), read from this box: the crontab, the
+run record, `LOCAL_BACKUP_DIR`, the archive's state and the locks. Neither touches a pod. A
+configured name with no machine is one line under the pods (`2 configured names with no machine
+(nothing to back up): …`), not a row. When the fleet can't be listed (a provider down, no key),
+`arena backups` shows every configured name instead, `?` for one with no machine, and a note says
+why.
 
 - **Each job**: the git backup, the home copy, the archive's snapshot push and its all-files
   push. For each: set up or not (and the command that sets it up), how often (`every 15 min`,

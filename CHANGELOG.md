@@ -36,6 +36,9 @@ earlier).
   against OpenRouter's listing: a key deleted elsewhere (or rotated from another keys folder) is
   left out, with a ⚠ line naming `arena keys gen <name> --copy` (or `keys rotate`). When the
   listing can't be read, the CSV is copied as before, and the copy says it's unchecked.
+- `arena backups` shows the fleet's live machines, as the dashboard's `b` does (it lists the
+  providers, read-only), and one line counting the configured names with no machine. Those names
+  were `?` rows at the top. A provider that doesn't answer brings the old list back, with a note.
 - A key's cap prints as it was set, `$0.05` (it read `$0.050`): `keys list`, `keys limit`, the
   dashboard. A key handed over to a new owner says the new key's cap
   (`… a fresh key 4de6426ea4a4, cap $0.10)`).

@@ -394,7 +394,13 @@ async fn run() -> Result<()> {
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &cli.config),
         Cmd::Cron(c) => handle_cron(c, &cfg, &cli.config, cli.yes, CRONTAB, std::env::var("HOME").ok().as_deref()).await,
         Cmd::Archive(c) => archive::handle_archive(c, &cfg, remote.as_ref(), cli.yes).await,
-        Cmd::Backups { json } => backups::handle_backups(&cfg, &cli.config, json, arena_core::backups::read_crontab()),
+        Cmd::Backups { json } => {
+            // Its machines from the fleet's listing; without one (no provider configured, a bad
+            // key), the configured names as before — said in a note.
+            let fleet = arena_core::provider::build_fleet(&cli.provider, &cfg, false).map_err(|e| e.to_string());
+            let fleet = fleet.as_ref().map(|f| f.as_ref()).map_err(Clone::clone);
+            backups::handle_backups(&cfg, &cli.config, json, arena_core::backups::read_crontab(), fleet).await
+        }
         Cmd::Image(c) => image::handle_image(c, &cfg, remote, cli.yes, Interrupt::ctrl_c()).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
