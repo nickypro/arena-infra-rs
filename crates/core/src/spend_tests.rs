@@ -643,6 +643,20 @@ fn a_rotated_key_keeps_its_final_usage_with_the_old_owner() {
     assert!(!owner_row(&r, Some("alice")).ai_estimate, "deleted by arena: exact");
 }
 
+/// A tracked key renamed on OpenRouter (a name is only a label there) is still tracked by its hash:
+/// its usage keeps being sampled under the name it had here, it isn't taken for gone, and its
+/// delete is recorded. A key never tracked, named outside the fleet, still isn't.
+#[test]
+fn a_key_renamed_on_openrouter_stays_tracked_by_its_hash() {
+    let mut s = observe_keys(SpendState::default(), &[key("k1", "devtest-a", 0.40)], &naming(), T0);
+    s = observe_keys(s, &[key("k1", "a (alice's)", 0.90), key("kx", "someone-else", 3.0)], &naming(), T0 + H);
+    assert_eq!(s.keys.len(), 1, "{:?}", s.keys);
+    assert_eq!((s.keys[0].name.as_str(), s.keys[0].gone, s.keys[0].last_usage()), ("devtest-a", None, 0.90));
+    s = keys_deleted(s, &[key("k1", "a (alice's)", 1.10)], &naming(), T0 + 2 * H);
+    assert_eq!(s.keys[0].gone.map(|g| g.how), Some(KeyEndHow::Deleted));
+    assert_eq!(s.keys[0].last_usage(), 1.10);
+}
+
 #[test]
 fn a_key_deleted_outside_arena_keeps_its_last_seen_usage_flagged() {
     let mut s = observe_keys(SpendState::default(), &[key("k1", "devtest-a", 0.40)], &naming(), T0);

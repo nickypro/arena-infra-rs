@@ -78,7 +78,7 @@ use config_cmd::note_invalid_text;
 use cron::{arena_cron_lines, char_named, cron_unsafe_char, reap_cron_installed, resolve_week_day, CRON_PATH_CHARS};
 #[cfg(test)]
 use keys::write_openrouter_key;
-use keys::{copy_keys_command, drop_key_row_held, fleet_ssh_for, hold_name, key_holders, keys_targets, machine_key_names, rotate_key, write_openrouter_key_held, KeySources, COPY_KEYS_TIMEOUT, OPENROUTER_KEYS_LINK};
+use keys::{copy_keys_command, drop_key_row_held, fleet_ssh_for, hold_name, key_holders, keys_of, keys_targets, machine_key_names, rotate_key, write_openrouter_key_held, KeySources, COPY_KEYS_TIMEOUT, OPENROUTER_KEYS_LINK};
 use pods::backup::{failure_why, BackupFailed, Unpushed, RSYNC};
 use pods::create::{sizing_flags, spec_with_overrides, Made, SpecOverrides};
 use pods::health::{health_cache_path, record_health};

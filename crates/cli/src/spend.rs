@@ -415,11 +415,9 @@ pub(crate) async fn hand_over(ctx: &SpendCtx, cfg: &Config, api: Option<&dyn Key
         };
         // Every key's usage, recorded before any is deleted: the old owner keeps what it spent.
         ctx.keys(&hold.listed, hold.listed_at);
-        let keys = &hold.listed;
-        let theirs: Vec<&KeyInfo> = super::machine_key_names(&naming, &h.name)
-            .iter()
-            .flat_map(|n| keys.iter().filter(move |k| k.name.as_deref() == Some(n.as_str())))
-            .collect();
+        // Its keys by name, and its CSV row's key renamed on OpenRouter: the old owner's, all
+        // deleted (their spend recorded above), so none stays usable after the handover.
+        let theirs: Vec<&KeyInfo> = super::keys_of(&naming, &h.name, hold.secret.as_deref(), &hold.listed);
         let kn = arena_core::openrouter::key_name(&prefix, naming.list, &h.name);
         let (deleted, saved) = match super::rotate_key(api, &kn, &theirs, limit).await {
             Ok((deleted, ck)) => {
@@ -983,6 +981,34 @@ mod tests {
         let alice_row = out.stdout.lines().find(|l| l.starts_with("alice,")).unwrap_or_else(|| panic!("{}", out.stdout));
         assert!(alice_row.contains(",1.2500,"), "{alice_row}");
         assert!(out.stdout.lines().any(|l| l.starts_with("bob,alpha,1,")), "{}", out.stdout);
+    }
+
+    /// alice's key renamed on OpenRouter (a name is only a label there) is still the name's, found
+    /// by the CSV row's label: a handover to bob deletes it too — its spend recorded first, and kept
+    /// alice's — so it isn't left working beside bob's.
+    #[tokio::test]
+    async fn a_handover_deletes_the_names_key_renamed_on_openrouter() {
+        let d = tmp("handover-renamed");
+        let keys_dir = d.0.join("keys");
+        let cfg = cfg(&d.0);
+        let ctx = SpendCtx::from_config(&cfg);
+        let api = FakeKeys::default();
+        let ck = api.create_key("devtest-alpha", Some(1.0)).await.unwrap();
+        ctx.key_minted(&ck.hash, "devtest-alpha", Some("alice"));
+        crate::write_openrouter_key(&keys_dir, "devtest-alpha", &ck.secret, "devtest").unwrap();
+        {
+            let mut keys = api.keys.lock().unwrap();
+            keys[0].name = Some("alpha (alice's)".into());
+            keys[0].label = Some(format!("{}...{}", &ck.secret, &ck.secret[ck.secret.len() - 1..]));
+            keys[0].usage = Some(0.5);
+        }
+        let h = vec![Handover { name: "devtest-alpha".into(), from: "alice".into() }];
+        let said = hand_over(&ctx, &cfg, Some(&api as &dyn KeyApi), &keys_dir, &h, "bob").await;
+        assert!(said.lines[0].starts_with("✓ devtest-alpha: OpenRouter key handed over (alice → bob"), "{said:?}");
+        assert_eq!(api.deleted.lock().unwrap().as_slice(), std::slice::from_ref(&ck.hash), "the renamed key goes too");
+        let old = ctx.state().keys.iter().find(|k| k.hash == ck.hash).cloned().unwrap();
+        assert_eq!((old.owner.as_deref(), old.last_usage()), (Some("alice"), 0.5));
+        assert!(old.gone.is_some());
     }
 
     #[tokio::test]

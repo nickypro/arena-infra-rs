@@ -1123,12 +1123,18 @@ pub fn observe_keys(mut state: SpendState, keys: &[KeyInfo], naming: &Naming, no
 }
 
 /// Track key `k` if it's this fleet's (a new one gets the owner of the open machine it's named
-/// for) and sample its usage. Its index, or `None` when it isn't the fleet's.
+/// for) and sample its usage. Its index, or `None` when it isn't the fleet's. A key already
+/// tracked stays tracked by its hash when it's renamed on OpenRouter (a name is only a label
+/// there): its usage is still sampled under the name it had here, and it isn't taken for gone.
 fn upsert_key(state: &mut SpendState, k: &KeyInfo, naming: &Naming, now: u64) -> Option<usize> {
-    let name = k.name.as_deref().filter(|n| claims(naming, n) && !k.hash.is_empty())?;
+    if k.hash.is_empty() {
+        return None;
+    }
+    let claimed = k.name.as_deref().filter(|n| claims(naming, n));
     let i = match state.keys.iter().position(|x| x.hash == k.hash) {
         Some(i) => i,
         None => {
+            let name = claimed?;
             let mut key = AiKey {
                 hash: k.hash.clone(),
                 name: name.to_string(),
@@ -1150,7 +1156,9 @@ fn upsert_key(state: &mut SpendState, k: &KeyInfo, naming: &Naming, now: u64) ->
         }
     };
     let key = &mut state.keys[i];
-    key.name = name.to_string();
+    if let Some(name) = claimed {
+        key.name = name.to_string();
+    }
     if let Some(u) = k.usage {
         sample(&mut key.usage, now, u);
     }

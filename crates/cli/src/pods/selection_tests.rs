@@ -508,6 +508,26 @@ async fn keys_gen_rotate_revoke_act_on_exactly_the_resolved_machines() {
     assert!(api.calls().is_empty());
 }
 
+/// A machine's key renamed on OpenRouter (a name is only a label there) is still its key for
+/// `keys`, found by the CSV row's label: `gen` keeps it rather than mint a second, `revoke`
+/// deletes it rather than leave it working.
+#[tokio::test]
+async fn keys_commands_find_a_key_renamed_on_openrouter() {
+    let dir = keys_dir("renamed");
+    std::fs::write(dir.0.join("openrouter_api_keys.csv"), "arena8-apple,sk-or-v1-abcd1234\n").unwrap();
+    let renamed = arena_core::openrouter::KeyInfo {
+        hash: "h-r".into(),
+        name: Some("apple (alice)".into()),
+        label: Some("sk-or-v1-abc...1234".into()),
+        ..Default::default()
+    };
+    let api = FakeKeys { keys: Mutex::new(vec![renamed]), ..Default::default() };
+    keys_cmd(&["gen", "apple"], &api, &dir.0).await.unwrap();
+    assert!(api.calls().is_empty(), "gen keeps it: {:?}", api.calls());
+    keys_cmd(&["revoke", "apple"], &api, &dir.0).await.unwrap();
+    assert_eq!(api.calls(), ["delete h-r"]);
+}
+
 #[test]
 fn keys_dry_run_names_every_resolved_machine_and_what_happens() {
     let rows = vec![("arena8-apple".to_string(), "arena8-apple".to_string(), 0), ("arena8-bloom".into(), "arena8-bloom".into(), 1)];

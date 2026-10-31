@@ -645,9 +645,9 @@ async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: 
     let mut deleted: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for m in machines {
         let names = machine_key_names(naming, m);
-        let mine: Vec<&arena_core::openrouter::KeyInfo> = keys
-            .iter()
-            .filter(|k| k.name.as_deref().is_some_and(|n| names.iter().any(|w| w == n)))
+        // Its keys by name, and its CSV row's key renamed on OpenRouter (`keys::keys_of`).
+        let mine: Vec<&arena_core::openrouter::KeyInfo> = crate::keys::keys_of(naming, m, as_read.get(m).map(String::as_str), &keys)
+            .into_iter()
             .filter(|k| !deleted.contains(k.hash.as_str()))
             .collect();
         let mut errs = Vec::new();

@@ -83,11 +83,24 @@ fn named_for<'k>(naming: &Naming, host: &str, listed: &'k [KeyInfo]) -> Vec<&'k 
     listed.iter().filter(|k| k.name.as_deref().is_some_and(|n| names.iter().any(|w| w == n))).collect()
 }
 
-/// Whether machine `host` has a key on OpenRouter: one that goes by its name, or — renamed there —
-/// the one its keys CSV row (`secret`) holds, by its label. What `up` decides a mint by, before the
-/// prompt and again under the keys folder's lock. Pure.
+/// Machine `host`'s keys on OpenRouter: those that go by its name, and — renamed there (a name is
+/// only a label on OpenRouter) — the one its keys CSV row (`secret`) holds, by its label. What every
+/// command that decides for a name goes by: `up`'s mint and `keys gen` keep one, `keys rotate|revoke`,
+/// a handover and `terminate --revoke-key` delete them all. Pure.
+pub(crate) fn keys_of<'k>(naming: &Naming, host: &str, secret: Option<&str>, listed: &'k [KeyInfo]) -> Vec<&'k KeyInfo> {
+    let names = machine_key_names(naming, host);
+    listed
+        .iter()
+        .filter(|k| {
+            k.name.as_deref().is_some_and(|n| names.iter().any(|w| w == n)) || secret.is_some_and(|s| label_says(k.label.as_deref(), s) == Some(true))
+        })
+        .collect()
+}
+
+/// Whether machine `host` has a key on OpenRouter ([`keys_of`]). What `up` decides a mint by, before
+/// the prompt and again under the keys folder's lock. Pure.
 pub(crate) fn has_key(naming: &Naming, host: &str, secret: Option<&str>, listed: &[KeyInfo]) -> bool {
-    !named_for(naming, host, listed).is_empty() || secret.is_some_and(|s| listed_by_label(s, listed))
+    !keys_of(naming, host, secret, listed).is_empty()
 }
 
 /// A machine's name without the fleet prefix, as commands take it (`apple`).
@@ -342,6 +355,18 @@ mod tests {
     }
 
     const SECRET: &str = "sk-or-v1-0e6aaaaaaaaaaaaaaaaaaaa1c96";
+
+    /// A name's keys: by its name, and the one its CSV secret's label points at under another name
+    /// (renamed on OpenRouter) — never a key whose label only might be it.
+    #[test]
+    fn a_names_keys_include_its_renamed_one() {
+        let n = naming();
+        let listed = [key("devtest-apple", Some("sk-or-v1-999...0000")), key("apple — alice's", Some("sk-or-v1-0e6...1c96")), key("devtest-bloom", None), key("odd", Some("label"))];
+        let names = |v: Vec<&KeyInfo>| v.into_iter().map(|k| k.name.clone().unwrap()).collect::<Vec<_>>();
+        assert_eq!(names(keys_of(&n, "devtest-apple", Some(SECRET), &listed)), ["devtest-apple", "apple — alice's"]);
+        assert_eq!(names(keys_of(&n, "devtest-apple", None, &listed)), ["devtest-apple"]);
+        assert_eq!(names(keys_of(&n, "devtest-cedar", Some("sk-or-v1-aaaa-other"), &listed)), Vec::<String>::new());
+    }
 
     #[test]
     fn a_redacted_label_says_whether_it_is_the_secret_only_when_it_can() {

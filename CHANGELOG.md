@@ -35,7 +35,9 @@ earlier).
   `keys gen --copy` or `replace` copies a machine's OpenRouter key, the name's row is checked
   against OpenRouter's listing: a key deleted elsewhere (or rotated from another keys folder) is
   left out, with a ⚠ line naming `arena keys gen <name> --copy` (or `keys rotate`). A key
-  renamed on OpenRouter is still found (by its redacted label), copied, and not minted again. When the
+  renamed on OpenRouter is still its machine's, found by its redacted label: copied, not minted
+  again, kept by `keys gen`, deleted by `keys rotate|revoke`, a handover and `terminate
+  --revoke-key`, and its spend still counted for its owner. When the
   listing can't be read, the CSV is copied as before, and the copy says it's unchecked.
 - Keys minted at once (several `pods up` in parallel terminals, `keys gen` beside an `up`) all
   land in the keys CSV: each write holds the keys folder. The second write used to drop the

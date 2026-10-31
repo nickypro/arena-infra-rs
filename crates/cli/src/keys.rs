@@ -15,7 +15,7 @@ use crate::cli::Select;
 use crate::pods::list::{enrich_best_effort, ENRICH_TIMEOUT};
 
 mod checked;
-pub(crate) use checked::{check_csv_keys, copy_snapshot, hold_name, list_for_check, mint_missing, plan_mints};
+pub(crate) use checked::{check_csv_keys, copy_snapshot, hold_name, keys_of, list_for_check, mint_missing, plan_mints};
 use crate::pods::selection::{all_stopped_error, stopped_skip, Selected};
 use crate::{archive, confirm, key_limits, shell_quote, spend};
 
@@ -1034,11 +1034,9 @@ pub(crate) async fn keys_with(
         // Each key's usage, recorded before anything is deleted: a rotated or revoked key's
         // spend stays with whoever it was minted for (`arena spend`).
         tracking.keys(&hold.listed, hold.listed_at);
-        let mine = machine_key_names(&naming, host);
-        let theirs: Vec<&arena_core::openrouter::KeyInfo> = hold
-            .listed
-            .iter()
-            .filter(|k| k.name.as_deref().is_some_and(|n| mine.iter().any(|t| t == n)))
+        // Its keys by name, and its CSV row's key renamed on OpenRouter (`checked::keys_of`).
+        let theirs: Vec<&arena_core::openrouter::KeyInfo> = keys_of(&naming, host, hold.secret.as_deref(), &hold.listed)
+            .into_iter()
             .filter(|k| action != KeysAction::Gen || !k.disabled)
             .collect();
         let theirs = &theirs;
