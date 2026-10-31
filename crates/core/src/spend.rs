@@ -892,24 +892,7 @@ pub fn assign(mut state: SpendState, full_names: &[String], target: &str, owner:
     if target.is_empty() {
         return Err("no machine, instance id or key hash given".into());
     }
-    let by_name: Vec<usize> = state
-        .machines
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.is_open() && full_names.contains(&m.name))
-        .map(|(i, _)| i)
-        .collect();
-    let by_id: Vec<usize> = state.machines.iter().enumerate().filter(|(_, m)| m.id == target).map(|(i, _)| i).collect();
-    let pick = match (by_name.as_slice(), by_id.as_slice()) {
-        ([i], _) => Some(*i),
-        ([], [i]) => Some(*i),
-        ([_, _, ..], _) => {
-            let ids: Vec<String> = by_name.iter().map(|i| format!("{} {}", state.machines[*i].provider, state.machines[*i].id)).collect();
-            return Err(format!("{target} names {} running instances ({}) — give the instance id", by_name.len(), ids.join(", ")));
-        }
-        ([], [_, _, ..]) => return Err(format!("instance id {target} is on several providers — rename one apart first")),
-        ([], []) => None,
-    };
+    let pick = pick_machine(&state, full_names, target)?;
     state.begin(now);
     if let Some(i) = pick {
         let m = &mut state.machines[i];
@@ -942,6 +925,105 @@ pub fn assign(mut state: SpendState, full_names: &[String], target: &str, owner:
         )),
         _ => Err(format!("`{target}` is the start of {} key hashes — give more of it", keys.len())),
     }
+}
+
+/// The machine instance `target` names for [`assign`]: the open instance of that name (bare or
+/// full: `full_names`), else the instance with that id; `None` when it's neither (a key hash,
+/// or nothing). Errs when it's ambiguous.
+fn pick_machine(state: &SpendState, full_names: &[String], target: &str) -> Result<Option<usize>, String> {
+    let by_name: Vec<usize> = state
+        .machines
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.is_open() && full_names.contains(&m.name))
+        .map(|(i, _)| i)
+        .collect();
+    let by_id: Vec<usize> = state.machines.iter().enumerate().filter(|(_, m)| m.id == target).map(|(i, _)| i).collect();
+    match (by_name.as_slice(), by_id.as_slice()) {
+        ([i], _) => Ok(Some(*i)),
+        ([], [i]) => Ok(Some(*i)),
+        ([_, _, ..], _) => {
+            let ids: Vec<String> = by_name.iter().map(|i| format!("{} {}", state.machines[*i].provider, state.machines[*i].id)).collect();
+            Err(format!("{target} names {} running instances ({}) — give the instance id", by_name.len(), ids.join(", ")))
+        }
+        ([], [_, _, ..]) => Err(format!("instance id {target} is on several providers — rename one apart first")),
+        ([], []) => Ok(None),
+    }
+}
+
+/// What assigning a machine instance to a new owner moves: everything it has run up so far goes
+/// with the owner field — a row has one owner, for its whole life ([`assign_moves`]).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Moves {
+    pub name: String,
+    pub provider: String,
+    pub id: String,
+    pub open: bool,
+    /// Its owner now (`None`: no owner).
+    pub from: Option<String>,
+    pub start: u64,
+    /// Running hours and cost so far, metered as `arena spend` shows them.
+    pub hours: f64,
+    pub currency: String,
+    pub amount: f64,
+}
+
+impl Moves {
+    /// Whether giving it to `to` moves spend from one person to another: it has an owner, a
+    /// different one, and has run up anything. An unowned instance (a forgotten `--owner`) is
+    /// what `assign` is for, and the same owner moves nothing.
+    pub fn takes_from(&self, to: Option<&str>) -> bool {
+        self.from.is_some() && self.from.as_deref() != to && (self.hours > 0.0 || self.amount > 0.0)
+    }
+
+    /// `12.3 h, €0.12 since 2026-11-02 09:00`.
+    pub fn words(&self) -> String {
+        format!("{} h, {} since {} UTC", hours(self.hours), fmt_money(&symbol(&self.currency), self.amount), ymd_hm(self.start))
+    }
+
+    /// Why `assign` refuses giving it to `to` without `--force` ([`Self::takes_from`]), and what to
+    /// do instead: a machine that goes to someone else is a new instance, so each keeps their own.
+    pub fn refusal(&self, to: Option<&str>, short: &str) -> String {
+        let from = self.from.as_deref().unwrap_or(NO_OWNER);
+        let new = to.unwrap_or(NO_OWNER);
+        let head = format!(
+            "{} ({} {}) is {from}'s and has run up {}: assigning it to {new} would move all of that to {new}",
+            self.name,
+            self.provider,
+            self.id,
+            self.words()
+        );
+        let instead = match (self.open, to) {
+            (true, Some(to)) => format!(
+                "For a machine that now goes to {to}: `arena pods backup {short}`, `arena pods terminate {short} --revoke-key`, \
+                 then `arena pods up {short} --owner {to}` — {from} keeps their hours, {to} starts at 0. If {from} was never \
+                 its owner (a typo, a wrong --owner), pass --force"
+            ),
+            (true, None) => format!("If {from} was never its owner (a wrong --owner), pass --force"),
+            (false, _) => format!("It has ended: if {from} was never its owner, pass --force"),
+        };
+        format!("{head}. {instead}")
+    }
+}
+
+/// What [`assign`] would move for `target` (as it picks it): the instance with its owner and
+/// what it has run up to `now`. `Ok(None)`: `target` isn't a machine (a key hash, or nothing —
+/// `assign` says which). Pure.
+pub fn assign_moves(state: &SpendState, full_names: &[String], target: &str, now: u64) -> Result<Option<Moves>, String> {
+    let Some(i) = pick_machine(state, full_names, target.trim())? else { return Ok(None) };
+    let m = &state.machines[i];
+    let row = machine_row(state, m, m.start, now.max(m.start), None);
+    Ok(Some(Moves {
+        name: m.name.clone(),
+        provider: m.provider.clone(),
+        id: m.id.clone(),
+        open: m.is_open(),
+        from: m.owner.clone(),
+        start: m.start,
+        hours: row.hours,
+        currency: row.currency,
+        amount: row.amount,
+    }))
 }
 
 /// An owner name as typed: trimmed, at most [`OWNER_MAX`] characters, printable, no comma
@@ -1041,12 +1123,18 @@ pub fn observe_keys(mut state: SpendState, keys: &[KeyInfo], naming: &Naming, no
 }
 
 /// Track key `k` if it's this fleet's (a new one gets the owner of the open machine it's named
-/// for) and sample its usage. Its index, or `None` when it isn't the fleet's.
+/// for) and sample its usage. Its index, or `None` when it isn't the fleet's. A key already
+/// tracked stays tracked by its hash when it's renamed on OpenRouter (a name is only a label
+/// there): its usage is still sampled under the name it had here, and it isn't taken for gone.
 fn upsert_key(state: &mut SpendState, k: &KeyInfo, naming: &Naming, now: u64) -> Option<usize> {
-    let name = k.name.as_deref().filter(|n| claims(naming, n) && !k.hash.is_empty())?;
+    if k.hash.is_empty() {
+        return None;
+    }
+    let claimed = k.name.as_deref().filter(|n| claims(naming, n));
     let i = match state.keys.iter().position(|x| x.hash == k.hash) {
         Some(i) => i,
         None => {
+            let name = claimed?;
             let mut key = AiKey {
                 hash: k.hash.clone(),
                 name: name.to_string(),
@@ -1068,7 +1156,9 @@ fn upsert_key(state: &mut SpendState, k: &KeyInfo, naming: &Naming, now: u64) ->
         }
     };
     let key = &mut state.keys[i];
-    key.name = name.to_string();
+    if let Some(name) = claimed {
+        key.name = name.to_string();
+    }
     if let Some(u) = k.usage {
         sample(&mut key.usage, now, u);
     }
@@ -1125,6 +1215,21 @@ pub fn key_minted(mut state: SpendState, hash: &str, machine: &str, owner: Optio
 /// with no owner.
 pub fn key_owner<'s>(state: &'s SpendState, machine: &str) -> Option<&'s str> {
     state.keys.iter().rev().find(|k| k.gone.is_none() && k.name == machine).and_then(|k| k.owner.as_deref())
+}
+
+/// Who a listed machine instance is for: the owner of its row (provider + id — never its name,
+/// which a reused name shares with someone else's instance), the open row first. `None`: no
+/// owner, or not in the ledger yet.
+pub fn owner_of<'s>(state: &'s SpendState, provider: &str, id: &str) -> Option<&'s str> {
+    let mine = || state.machines.iter().rev().filter(|m| m.provider == provider && m.id == id);
+    mine().find(|m| m.is_open()).or_else(|| mine().next()).and_then(|m| m.owner.as_deref())
+}
+
+/// The OWNER cells for `pods` (`pods list`, the dashboard): each instance's owner, `""` for
+/// none — or `None` when no pod has one, so a fleet that doesn't use owners shows no column.
+pub fn owners_column(state: &SpendState, pods: &[Pod]) -> Option<Vec<String>> {
+    let cells: Vec<String> = pods.iter().map(|p| owner_of(state, &p.provider, &p.id).unwrap_or_default().to_string()).collect();
+    cells.iter().any(|c| !c.is_empty()).then_some(cells)
 }
 
 /// Whether creating `machine` for `new_owner` hands its key over: the name's current key
@@ -1852,7 +1957,8 @@ pub fn notes(r: &Report) -> Vec<String> {
             x.aside
         ));
     }
-    if let Some(a) = r.runpod {
+    // Nothing billed and nothing counted (a fleet with no RunPod pods): no line to say it.
+    if let Some(a) = r.runpod.filter(|a| a.rows.abs() >= 0.005 || a.account.abs() >= 0.005) {
         out.push(format!(
             "runpod: accounted for {} of {} billed on the account in this window (billing lags ~1 h; the rest is other pods, \
              volumes or serverless)",

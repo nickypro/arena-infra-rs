@@ -768,12 +768,14 @@ pub fn plan_cap(k: &KeyInfo, change: Option<CapChange>, reset: Option<Option<Lim
 /// under the spend through, or miss a $0.004 change OpenRouter didn't make.
 pub const CAP_EPSILON: f64 = 1e-7;
 
-/// An amount as exactly as it was set: `$1.00`, `$0.050` ([`crate::fleet::fmt_money`]) when it's
-/// whole cents, else every digit up to the millionth (`$1.004`) — a cap or a spend a cent's
-/// rounding would misstate (`a $1.00 cap is under … ($1.00)`).
+/// An amount as exactly as it was set: `$1.00`, `$0.05` when it's whole cents (a cap reads as it
+/// was typed: [`crate::fleet::fmt_money`]'s third decimal under $0.10 is for hourly prices, and
+/// made a $0.05 cap `$0.050`), else every digit up to the millionth (`$1.004`) — a cap or a spend
+/// a cent's rounding would misstate (`a $1.00 cap is under … ($1.00)`).
 pub fn exact_money(x: f64) -> String {
     if ((x * 100.0).round() / 100.0 - x).abs() < CAP_EPSILON {
-        return crate::fleet::fmt_money("$", x);
+        let x = if x.abs() < 0.005 { 0.0 } else { x };
+        return format!("${x:.2}");
     }
     let s = format!("{x:.6}");
     let s = s.trim_end_matches('0');
@@ -1065,7 +1067,7 @@ impl KeyUsage {
         }
         match self.limit {
             Some(l) => {
-                out.push_str(&format!("{} of {}", money(self.spent), crate::fleet::fmt_money("$", l)));
+                out.push_str(&format!("{} of {}", money(self.spent), exact_money(l)));
                 if let Some(p) = period(self.reset.as_deref()) {
                     out.push_str(&format!(" {p}"));
                 }
@@ -2115,7 +2117,7 @@ mod tests {
 
     #[test]
     fn exact_money_keeps_every_digit_a_cent_would_round_away() {
-        for (x, want) in [(1.0, "$1.00"), (0.05, "$0.050"), (12.5, "$12.50"), (1.004, "$1.004"), (0.123456, "$0.123456"), (2.00000001, "$2.00"), (1.0005, "$1.0005")] {
+        for (x, want) in [(1.0, "$1.00"), (0.05, "$0.05"), (0.1, "$0.10"), (0.0, "$0.00"), (-0.0, "$0.00"), (12.5, "$12.50"), (1.004, "$1.004"), (0.123456, "$0.123456"), (2.00000001, "$2.00"), (1.0005, "$1.0005")] {
             assert_eq!(exact_money(x), want, "{x}");
         }
     }

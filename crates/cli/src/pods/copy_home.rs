@@ -199,16 +199,28 @@ pub(crate) async fn copy_home_on(remote: Arc<dyn Remote>, cfg: &Config, owner: &
         .with_context(|| format!("copying {from}'s home onto {to} — nothing was renamed; re-run to continue (rsync picks up where it stopped)"))?;
     clean_marker(owner, remote.as_ref(), &dest.id, cfg).await;
     println!("✓ {to} has {from}'s home (verified on {to} itself). {from} is untouched.");
-    let owner_of = crate::spend::SpendCtx::from_config(cfg)
-        .state()
-        .machines
-        .iter()
-        .rev()
-        .find(|m| m.provider == src.provider && m.id == src.id)
-        .and_then(|m| m.owner.clone());
+    let ledger = crate::spend::SpendCtx::from_config(cfg).state();
+    let owner_of = arena_core::spend::owner_of(&ledger, &src.provider, &src.id).map(String::from);
     println!("  Next: point the person at {to} (`ssh {to}` via the proxy / ssh-config: its own name, port and keys).");
     if let Some(o) = owner_of {
-        println!("  Their spend follows if you say so: `arena spend assign {to} {o}`.");
+        // `spend assign` refuses to move a machine's history from one person to another: when `to`
+        // has run up someone else's spend, say so — and how to keep the two apart — rather than
+        // suggest it.
+        let names = [dest.name.clone()];
+        let theirs = arena_core::spend::assign_moves(&ledger, &names, &dest.id, arena_core::snapshot::unix_now()).ok().flatten();
+        match theirs.filter(|m| m.takes_from(Some(&o))) {
+            Some(m) => {
+                let other = m.from.as_deref().unwrap_or(arena_core::spend::NO_OWNER);
+                println!(
+                    "  Their spend: {to} has run up {} as {other}'s, so `arena spend assign {to} {o}` would move that to {o} \
+                     too — it refuses. To keep each person's spend apart, give {o} a machine of their own (`arena pods up \
+                     <name> --owner {o}`, then `arena pods copy-home {from} <name>`); `--force` only if {other} was never \
+                     {to}'s owner.",
+                    m.words()
+                );
+            }
+            None => println!("  Their spend follows if you say so: `arena spend assign {to} {o}`."),
+        }
     }
     println!("  Once they're settled: `arena pods terminate {from}` (back it up first: `arena pods backup {from}`).");
     Ok(())

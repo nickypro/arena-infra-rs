@@ -13,6 +13,9 @@ use clap::Subcommand;
 
 use crate::cli::Select;
 use crate::pods::list::{enrich_best_effort, ENRICH_TIMEOUT};
+
+mod checked;
+pub(crate) use checked::{check_csv_keys, copy_snapshot, hold_name, keys_of, list_for_check, mint_missing, plan_mints};
 use crate::pods::selection::{all_stopped_error, stopped_skip, Selected};
 use crate::{archive, confirm, key_limits, shell_quote, spend};
 
@@ -85,8 +88,9 @@ pub(crate) enum KeysCmd {
 }
 
 /// Drop `host`'s row from the keys CSV in `dir` (its key was deleted, none replaced it):
-/// whether a row went (`Ok(false)`: no CSV, or no row for it).
-pub(crate) fn drop_key_row(dir: &std::path::Path, host: &str) -> std::io::Result<bool> {
+/// whether a row went (`Ok(false)`: no CSV, or no row for it). The caller holds the keys folder
+/// ([`lock_keys_dir`]).
+pub(crate) fn drop_key_row_held(dir: &std::path::Path, host: &str) -> std::io::Result<bool> {
     let csv = dir.join(OPENROUTER_KEYS_LINK);
     let text = match std::fs::read_to_string(&csv) {
         Ok(t) => t,
@@ -134,6 +138,14 @@ impl<'a> KeyBook<'a> {
     /// rewritten, the link kept), owner-only: it holds secrets ([`write_secret_file`]).
     pub(crate) fn write_csv(&self, text: &str) -> std::io::Result<()> {
         write_secret_file(&self.csv, text)
+    }
+
+    /// Hold the CSV's folder ([`lock_keys_dir`]) for one read-change-write of it.
+    pub(crate) fn lock(&self) -> std::io::Result<Option<std::fs::File>> {
+        match self.csv.parent().filter(|d| !d.as_os_str().is_empty()) {
+            Some(d) => lock_keys_dir(d),
+            None => lock_keys_dir(std::path::Path::new(".")),
+        }
     }
 }
 
@@ -249,7 +261,36 @@ impl KeySources {
         let matched = self.per_host.get(name).map(|h| vars.extend(h.iter().cloned())).is_some();
         (vars, matched)
     }
+
+    /// The OpenRouter key the keys CSV holds for `host` (its exact name), if any.
+    pub(crate) fn openrouter_secret(&self, host: &str) -> Option<&str> {
+        self.per_host.get(host)?.iter().find(|(env, _)| env == checked::OPENROUTER_ENV).map(|(_, v)| v.as_str())
+    }
+
+    /// Leave `host`'s OpenRouter key out of what's copied (its CSV row holds a key OpenRouter no
+    /// longer has): its other keys stay, and the sources line counts one host fewer.
+    pub(crate) fn leave_out_openrouter(&mut self, host: &str) {
+        let Some(vars) = self.per_host.get_mut(host) else { return };
+        let before = vars.len();
+        vars.retain(|(env, _)| env != checked::OPENROUTER_ENV);
+        if vars.len() == before {
+            return;
+        }
+        if vars.is_empty() {
+            self.per_host.remove(host);
+        }
+        let left = self.per_host.values().filter(|v| v.iter().any(|(env, _)| env == checked::OPENROUTER_ENV)).count();
+        let label = |n: usize| format!("OpenRouter ({n} host{})", if n == 1 { "" } else { "s" });
+        match self.csv.iter().position(|s| s.starts_with("OpenRouter (")) {
+            Some(i) if left == 0 => {
+                self.csv.remove(i);
+            }
+            Some(i) => self.csv[i] = label(left),
+            None => {}
+        }
+    }
 }
+
 
 /// The fleet-SSH half of a key write, and how many fleet keys it authorizes: authorize the
 /// fleet pubkeys (arena8 + arena_infra + admin) and write the host map into `~/.ssh/config`
@@ -323,7 +364,18 @@ pub(crate) async fn handle_copy_keys(
 ) -> Result<()> {
     use arena_core::ssh::SshTarget;
 
-    let keys = KeySources::load(cfg, keys_dir, hf_token);
+    let mut keys = KeySources::load(cfg, keys_dir, hf_token);
+    // The selected pods' OpenRouter rows, checked against OpenRouter's listing first: a key
+    // deleted elsewhere is left out and said, not handed on (`checked`). Listed only when one
+    // of them has such a row.
+    let hosts: Vec<String> = sel.pods.iter().map(|p| p.name.clone()).collect();
+    if hosts.iter().any(|h| keys.openrouter_secret(h).is_some()) {
+        let or = openrouter_client(cfg);
+        let listed = list_for_check(or.as_ref().map(|a| a as &dyn arena_core::openrouter::KeyApi)).await;
+        for line in check_csv_keys(&mut keys, &hosts, listed.as_ref(), &Naming::from_config(cfg)) {
+            eprintln!("{line}");
+        }
+    }
     let mut sources = keys.csv.clone();
     // "broadcast" = same value on every *selected* pod (vs per-host CSV keys) — not "all
     // pods", which misleadingly implies the whole fleet when the selection is narrower.
@@ -608,9 +660,21 @@ async fn copy_new_keys(remote: Arc<dyn Remote>, cfg: &Config, dir: &std::path::P
 }
 
 /// Persist one machine's freshly minted OpenRouter key into the per-host CSV in `dir`
-/// (upsert). A new file is seeded with a header naming the arena iteration (`prefix`) so
-/// the CSV is self-documenting about which cohort the keys belong to.
+/// (upsert), holding the keys folder for it. A new file is seeded with a header naming the arena
+/// iteration (`prefix`) so the CSV is self-documenting about which cohort the keys belong to. The
+/// commands hold the folder from their check to their save and write with
+/// [`write_openrouter_key_held`]; this is for tests.
+#[cfg(test)]
 pub(crate) fn write_openrouter_key(dir: &std::path::Path, host: &str, secret: &str, prefix: &str) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let _held = lock_keys_dir(dir).with_context(|| format!("locking {}", dir.display()))?;
+    write_openrouter_key_held(dir, host, secret, prefix)
+}
+
+/// [`write_openrouter_key`], for a caller already holding the keys folder ([`lock_keys_dir`]) —
+/// one that checks what OpenRouter has and mints under it, so two arenas never both mint a key
+/// for one name.
+pub(crate) fn write_openrouter_key_held(dir: &std::path::Path, host: &str, secret: &str, prefix: &str) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let target = ensure_cohort_keys_file(dir, prefix)?;
     let mut existing = std::fs::read_to_string(&target).unwrap_or_default();
@@ -620,6 +684,22 @@ pub(crate) fn write_openrouter_key(dir: &std::path::Path, host: &str, secret: &s
     let updated = arena_core::apikeys::upsert_csv(&existing, host, secret);
     write_secret_file(&target, &updated).with_context(|| format!("writing {}", target.display()))?;
     Ok(())
+}
+
+/// How long a change to the keys CSV waits for another arena's. A write holds it for one read and
+/// one atomic write; a mint (`pods up`, `keys gen|rotate`, a handover) for its listing and its
+/// creates — seconds per key.
+const KEYS_CSV_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// An exclusive lock on the keys folder `dir`: for one read-change-write of its CSV, or for a mint
+/// from its check of OpenRouter's listing to its saved secret. Two `pods up` minting at once (an
+/// organiser's parallel terminals) each read the CSV, added their row and wrote it back — the
+/// second write dropped the first's row, and that key's secret (OpenRouter shows it once) with it;
+/// and an `up` waiting at its prompt while `keys gen` minted the same name minted a second key.
+/// `Ok(None)` where the folder can't be locked (as before: the atomic write alone); `Err` when
+/// another arena held it past [`KEYS_CSV_LOCK_WAIT`].
+pub(crate) fn lock_keys_dir(dir: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+    arena_core::snapshot::lock_dir_within(dir, KEYS_CSV_LOCK_WAIT)
 }
 
 /// Write a file of secrets (the OpenRouter keys CSV) atomically, readable by its owner
@@ -775,9 +855,11 @@ fn keys_table(keys: &[&arena_core::openrouter::KeyInfo]) -> String {
     let (mut today, mut month, mut all) = (0.0, 0.0, 0.0);
     for k in keys {
         let u = arena_core::openrouter::KeyUsage::of(k);
+        // A cap as it was set (`$0.05`, not the hourly prices' `$0.050`).
         let lim = match (k.limit, u.reset.as_deref()) {
-            (Some(l), Some(r)) => format!("{}/{}", fmt_money("$", l), &r[..1]),
-            (l, _) => money(l),
+            (Some(l), Some(r)) => format!("{}/{}", arena_core::openrouter::exact_money(l), &r[..1]),
+            (Some(l), None) => arena_core::openrouter::exact_money(l),
+            (None, _) => "-".into(),
         };
         let short = &k.hash[..k.hash.len().min(12)];
         let dis = if k.disabled { "  (disabled)" } else { "" };
@@ -888,7 +970,6 @@ pub(crate) async fn keys_with(
         KeysCmd::Resume(a) => return key_limits::pause(a, true, provider, cfg, api, dir, yes).await,
     };
     let limit = limit.unwrap_or(default_limit);
-    let listed_at = arena_core::snapshot::unix_now();
     let existing = api.list_keys().await.context("listing OpenRouter keys")?;
     let known = key_holders(&naming, &existing, std::fs::read_to_string(&csv_path).ok().as_deref());
     let (names, live) = keys_targets(provider, cfg, &sel.args(), &known).await?;
@@ -898,18 +979,27 @@ pub(crate) async fn keys_with(
     }
     // Per machine: the name its new key gets, and the existing keys that are its (gen skips
     // only for an enabled one; rotate/revoke delete them all — a leaked duplicate must die).
-    let plan: Vec<(String, String, Vec<&arena_core::openrouter::KeyInfo>)> = names
-        .iter()
-        .map(|host| {
-            let theirs = machine_key_names(&naming, host);
-            let keys = existing
-                .iter()
-                .filter(|k| k.name.as_deref().is_some_and(|n| theirs.iter().any(|t| t == n)))
-                .filter(|k| action != KeysAction::Gen || !k.disabled)
-                .collect();
-            (host.clone(), key_name(&prefix, &cfg.machine_names, host), keys)
-        })
-        .collect();
+    type Plan<'k> = Vec<(String, String, Vec<&'k arena_core::openrouter::KeyInfo>)>;
+    let plan_from = |existing: &[arena_core::openrouter::KeyInfo]| -> Vec<(String, String, Vec<usize>)> {
+        names
+            .iter()
+            .map(|host| {
+                let theirs = machine_key_names(&naming, host);
+                let keys = existing
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, k)| k.name.as_deref().is_some_and(|n| theirs.iter().any(|t| t == n)))
+                    .filter(|(_, k)| action != KeysAction::Gen || !k.disabled)
+                    .map(|(i, _)| i)
+                    .collect();
+                (host.clone(), key_name(&prefix, &cfg.machine_names, host), keys)
+            })
+            .collect()
+    };
+    fn resolve<'k>(existing: &'k [arena_core::openrouter::KeyInfo], rows: Vec<(String, String, Vec<usize>)>) -> Plan<'k> {
+        rows.into_iter().map(|(h, kn, ix)| (h, kn, ix.into_iter().map(|i| &existing[i]).collect())).collect()
+    }
+    let plan = resolve(&existing, plan_from(&existing));
     if dry_run {
         let rows: Vec<(String, String, usize)> = plan.iter().map(|(h, kn, ks)| (h.clone(), kn.clone(), ks.len())).collect();
         for line in keys_preview(action, limit, &rows) {
@@ -926,12 +1016,30 @@ pub(crate) async fn keys_with(
         println!("aborted.");
         return Ok(());
     }
-    // Each key's usage, recorded before anything is deleted: a rotated or revoked key's
-    // spend stays with whoever it was minted for (`arena spend`).
     let tracking = spend::SpendCtx::from_config(cfg);
-    tracking.keys(&existing, listed_at);
     let (mut ok, mut skipped, mut failed) = (0, 0, 0);
-    for (host, kn, theirs) in &plan {
+    for (host, kn, _) in &plan {
+        // One name at a time under a hold (`checked::hold_name`): what OpenRouter has for it is
+        // read again with the keys folder locked, and acted on before it's free — a key another
+        // arena made or deleted since the listing above (`pods up` at its prompt, another `keys
+        // gen`) is seen, and `gen` skips it rather than mint a second one for the name.
+        let hold = match hold_name(api, dir, host).await {
+            Ok(h) => h,
+            Err(why) => {
+                eprintln!("✗ {host}: {why} — nothing done for it");
+                failed += 1;
+                continue;
+            }
+        };
+        // Each key's usage, recorded before anything is deleted: a rotated or revoked key's
+        // spend stays with whoever it was minted for (`arena spend`).
+        tracking.keys(&hold.listed, hold.listed_at);
+        // Its keys by name, and its CSV row's key renamed on OpenRouter (`checked::keys_of`).
+        let theirs: Vec<&arena_core::openrouter::KeyInfo> = keys_of(&naming, host, hold.secret.as_deref(), &hold.listed)
+            .into_iter()
+            .filter(|k| action != KeysAction::Gen || !k.disabled)
+            .collect();
+        let theirs = &theirs;
         if action == KeysAction::Gen && !theirs.is_empty() {
             println!("= {host}: '{kn}' already exists — use `arena keys rotate {host}` to replace");
             skipped += 1;
@@ -958,7 +1066,7 @@ pub(crate) async fn keys_with(
             Ok((deleted, ck)) => {
                 tracking.keys_deleted(theirs, &deleted);
                 tracking.key_minted(&ck.hash, host, None);
-                write_openrouter_key(dir, host, &ck.secret, &prefix)?;
+                write_openrouter_key_held(dir, host, &ck.secret, &prefix)?;
                 println!("✓ {host}: {} {}", if action == KeysAction::Gen { "minted" } else { "rotated" }, &ck.hash[..ck.hash.len().min(12)]);
                 ok += 1;
             }
@@ -1017,6 +1125,27 @@ pub(crate) async fn rotate_key(
 
 #[cfg(test)]
 mod tests {
+    /// Keys minted at once (several `pods up` in parallel terminals) all land in the CSV: each
+    /// read-change-write holds the keys folder, so none drops another's row (and its secret).
+    #[test]
+    fn keys_written_at_once_all_land() {
+        let dir = std::env::temp_dir().join(format!("arena-keys-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hosts: Vec<String> = (0..12).map(|i| format!("devtest-m{i}")).collect();
+        std::thread::scope(|s| {
+            for h in &hosts {
+                let dir = &dir;
+                s.spawn(move || super::write_openrouter_key(dir, h, &format!("sk-or-v1-{h}"), "devtest").unwrap());
+            }
+        });
+        let text = std::fs::read_to_string(dir.join("devtest_openrouter_keys.csv")).unwrap();
+        for h in &hosts {
+            assert!(text.contains(&format!("{h},sk-or-v1-{h}\n")), "{h} lost:\n{text}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn minted_keys_are_written_owner_only() {
         use std::os::unix::fs::PermissionsExt;

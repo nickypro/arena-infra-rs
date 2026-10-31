@@ -140,7 +140,8 @@ pub(crate) async fn list_with(
     let (listed, fetched, spares) = tokio::join!(listing, observing, spares);
     let (listing, pods, mut warnings) = listed?;
     // What each machine costs, recorded for `arena spend` (quietly), as of when it listed.
-    spend::SpendCtx::from_config(cfg).listing(&listing, &pods, now);
+    let tracking = spend::SpendCtx::from_config(cfg);
+    tracking.listing(&listing, &pods, now);
     // SSH_CONFIG_FILE (and staff's SSH_ADMIN_CONFIG_FILE) kept current from this listing — a
     // complete one only (a provider that failed would drop its pods' blocks); nothing at all
     // when they're unset or nothing moved.
@@ -163,7 +164,10 @@ pub(crate) async fn list_with(
         // The reaper's ENDS column, only where it keeps state (ARENA_STATE_DIR set and a state
         // file there): unchanged for everyone not using it. The table only — never `--json`.
         let ends = reap::ends_column(cfg, &pods, now, reap::real::tz());
-        out.push_str(&fleet::render_pods_table_with(&pods, ends.as_deref()));
+        // Who each instance is for (`--owner`, `spend assign`), from the spend ledger just
+        // written: a column only when some pod has an owner.
+        let owners = arena_core::spend::owners_column(&tracking.state(), &pods);
+        out.push_str(&fleet::render_pods_table_full(&pods, owners.as_deref(), ends.as_deref()));
         out.push_str(&format!("{}\n", fleet::listing_footer(&fleet::fleet_cost(&pods), &failed)));
     }
     if let Some(spares) = spares.filter(|_| listing.status("hetzner") == arena_core::proxy::ListingStatus::Ok) {

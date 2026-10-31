@@ -8,8 +8,8 @@
 //! 2. **Mid**, each while it fits: DISK (a disk filling up breaks a participant's work), BRANCH
 //!    (which iteration they're on), MEM, RTT, TEMP (MEM/TEMP/RTT are in the detail pane too).
 //! 3. **Extras**, each while it fits, in this order: 💾 SAVED, AI$ (with a provisioning key),
-//!    the full GPU name (16: `RTX ` kept), full NAMEs (16: the persisted short/full choice), the
-//!    host's CPU% and RAM%.
+//!    OWNER (8, while some pod has an owner), the full GPU name (16: `RTX ` kept), full NAMEs
+//!    (16: the persisted short/full choice), the host's CPU% and RAM%.
 //! 4. **Graphs** (UTIL%~/MEM%~) take what's left from 20 columns, then PROGRESS (with
 //!    `PROGRESS_CMD`) a fixed 16 once there's room for both (alone in the detail view's split,
 //!    which has no graphs).
@@ -29,6 +29,8 @@ pub(crate) const PROXY_W: usize = 5;
 pub(crate) const SAVED_W: usize = 4;
 /// AI$: `1.23/5`, `12.3/50`, `0.02/0.02`, `paused`.
 pub(crate) const AI_W: usize = 9;
+/// OWNER: a first name (`alice`, `christo…`); the detail view has the whole one.
+pub(crate) const OWNER_W: usize = 8;
 /// PROGRESS's fixed budget beside the graphs.
 pub(crate) const PROGRESS_W: usize = 16;
 /// DISK, BRANCH, MEM, RTT, TEMP: `12/100G`, `w1d2`, `120/240G`, `180ms`, `85C`.
@@ -54,6 +56,7 @@ pub(crate) struct Columns {
     pub temp: bool,
     pub saved: bool,
     pub ai: bool,
+    pub owner: bool,
     pub host: bool,
     pub progress: bool,
     pub spark: bool,
@@ -80,10 +83,10 @@ pub(crate) fn columns_that_fit(w: usize, core: &[usize], optional: &[usize]) -> 
 }
 
 /// The columns for a table `w` wide. `proxy_w`: the widest PROXY cell this refresh (never under
-/// [`PROXY_W`]); `ai`: an `AI$` column is wanted (a provisioning key is configured);
-/// `want_progress`: `PROGRESS_CMD` is set; `with_spark`: the graphs are wanted (not in the
-/// detail view's split). Pure.
-pub(crate) fn columns(w: usize, proxy_w: usize, ai: bool, want_progress: bool, with_spark: bool) -> Columns {
+/// [`PROXY_W`]); `ai`: an `AI$` column is wanted (a provisioning key is configured); `owner`:
+/// an OWNER column is wanted (some pod has an owner); `want_progress`: `PROGRESS_CMD` is set;
+/// `with_spark`: the graphs are wanted (not in the detail view's split). Pure.
+pub(crate) fn columns(w: usize, proxy_w: usize, ai: bool, owner: bool, want_progress: bool, with_spark: bool) -> Columns {
     let proxy_w = proxy_w.max(PROXY_W);
     // mark, P, NAME, STAT, M, SET, GPU, GPU%, $/H, HLTH, PROXY.
     let core = [1, 1, NAME_W.0, 4, 1, 4, GPU_W.0, 4, 6, HEALTH_W, proxy_w];
@@ -97,6 +100,7 @@ pub(crate) fn columns(w: usize, proxy_w: usize, ai: bool, want_progress: bool, w
     enum Extra {
         Saved,
         Ai,
+        Owner,
         GpuFull,
         NamesFull,
         Host,
@@ -104,12 +108,18 @@ pub(crate) fn columns(w: usize, proxy_w: usize, ai: bool, want_progress: bool, w
     let extras = [
         (Extra::Saved, SAVED_W + 1),
         (Extra::Ai, AI_W + 1),
+        (Extra::Owner, OWNER_W + 1),
         (Extra::GpuFull, GPU_W.1 - GPU_W.0),
         (Extra::NamesFull, NAME_W.1 - NAME_W.0),
         (Extra::Host, 4 + 1 + 4 + 1),
     ];
     if mid == MID_W.len() {
-        for (extra, cost) in extras.into_iter().filter(|(e, _)| ai || !matches!(e, Extra::Ai)) {
+        let wanted = |e: &Extra| match e {
+            Extra::Ai => ai,
+            Extra::Owner => owner,
+            _ => true,
+        };
+        for (extra, cost) in extras.into_iter().filter(|(e, _)| wanted(e)) {
             if used + cost > w {
                 break;
             }
@@ -117,6 +127,7 @@ pub(crate) fn columns(w: usize, proxy_w: usize, ai: bool, want_progress: bool, w
             match extra {
                 Extra::Saved => c.saved = true,
                 Extra::Ai => c.ai = true,
+                Extra::Owner => c.owner = true,
                 Extra::GpuFull => (c.gpu_w, c.narrow_gpu) = (GPU_W.1, false),
                 Extra::NamesFull => (c.name_w, c.compact_names) = (NAME_W.1, false),
                 Extra::Host => c.host = true,
@@ -179,17 +190,17 @@ mod tests {
         ];
         for &(name, shown, with_ai, without) in cases {
             for (ai, first) in [(true, with_ai), (false, without)] {
-                let at = (60..=260).find(|&w| shown(&columns(w, 5, ai, true, true)));
+                let at = (60..=260).find(|&w| shown(&columns(w, 5, ai, false, true, true)));
                 assert_eq!(at.unwrap_or(usize::MAX), first, "{name} ai={ai}");
-                assert!((first.min(261)..=260).all(|w| shown(&columns(w, 5, ai, true, true))), "{name} ai={ai} stays");
+                assert!((first.min(261)..=260).all(|w| shown(&columns(w, 5, ai, false, true, true))), "{name} ai={ai} stays");
             }
         }
         // Without graphs (the detail view's split), PROGRESS needs only its own room.
-        assert!(!columns(146, 5, true, true, false).progress && columns(157, 5, true, true, false).progress);
+        assert!(!columns(146, 5, true, false, true, false).progress && columns(157, 5, true, false, true, false).progress);
         // Every column the layout picks fits whole: the table is never wider than the terminal.
         for w in 69..=260 {
             for ai in [true, false] {
-                let c = columns(w, 5, ai, true, true);
+                let c = columns(w, 5, ai, false, true, true);
                 let mut cols = vec![1, 1, c.name_w, 4, 1, 4, c.gpu_w, 4, 6, HEALTH_W, c.proxy_w];
                 for (on, width) in [(c.disk, 9), (c.branch, 6), (c.mem, 9), (c.rtt, 5), (c.temp, 4), (c.saved, SAVED_W), (c.ai, AI_W)] {
                     if on {
@@ -209,9 +220,27 @@ mod tests {
             }
         }
         // A wide stale port (`10003!`) widens PROXY rather than losing its mark.
-        assert_eq!(columns(120, 6, false, false, true).proxy_w, 6);
-        assert_eq!(columns(120, 3, false, false, true).proxy_w, 5);
+        assert_eq!(columns(120, 6, false, false, false, true).proxy_w, 6);
+        assert_eq!(columns(120, 3, false, false, false, true).proxy_w, 5);
         // The detail view's split gets no graphs.
-        assert!(!columns(250, 5, true, false, false).spark);
+        assert!(!columns(250, 5, true, false, false, false).spark);
+    }
+
+    /// OWNER (while some pod has an owner) comes after AI$ and before the wider GPU names, and
+    /// is the first extra to go when the terminal narrows: it never pushes a core or mid column
+    /// out, and without owners the layout is what it was.
+    #[test]
+    fn the_owner_column_fits_after_ai_and_drops_first() {
+        for ai in [true, false] {
+            let first = (60..=260).find(|&w| columns(w, 5, ai, true, true, true).owner).unwrap();
+            let after_ai = if ai { 122 } else { 112 } + OWNER_W + 1;
+            assert_eq!(first, after_ai, "ai={ai}");
+            assert!((first..=260).all(|w| columns(w, 5, ai, true, true, true).owner), "stays");
+            for w in 60..=260 {
+                let (with, without) = (columns(w, 5, ai, true, true, true), columns(w, 5, ai, false, true, true));
+                assert!(!without.owner);
+                assert_eq!((with.disk, with.branch, with.mem, with.rtt, with.temp, with.saved, with.ai), (without.disk, without.branch, without.mem, without.rtt, without.temp, without.saved, without.ai), "{w}");
+            }
+        }
     }
 }

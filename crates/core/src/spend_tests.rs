@@ -106,6 +106,27 @@ fn a_name_reused_for_someone_else_is_a_new_row_and_the_old_one_keeps_its_owner()
     assert_eq!(owner_row(&r, Some("alice")).machines, ["alpha"]);
 }
 
+/// The OWNER column (`pods list`, the dashboard) reads the instance's row, never the name's: a
+/// name reused for bob shows bob, an instance the ledger has no owner for shows nothing, and a
+/// fleet with no owner at all shows no column.
+#[test]
+fn the_owner_column_is_per_instance_and_absent_without_owners() {
+    let a1 = running("hetzner", "101", "devtest-alpha", 0.01);
+    let a2 = running("hetzner", "202", "devtest-alpha", 0.01);
+    let b = running("runpod", "rp1", "devtest-bravo", 0.20);
+    let mut s = created(SpendState::default(), &a1, &given("alice"), T0);
+    s = apply_event(s, &Event::Terminated { provider: Some("hetzner"), id: "101" }, T0 + H);
+    s = created(s, &a2, &given("bob"), T0 + H + M);
+    s = see(s, &["hetzner", "runpod"], &[], &[a2.clone(), b.clone()], T0 + 2 * H);
+    assert_eq!(owner_of(&s, "hetzner", "202"), Some("bob"));
+    assert_eq!(owner_of(&s, "hetzner", "101"), Some("alice"), "an ended instance keeps its owner");
+    assert_eq!(owner_of(&s, "runpod", "202"), None, "ids are per provider");
+    assert_eq!(owners_column(&s, &[a2.clone(), b.clone()]), Some(vec!["bob".to_string(), String::new()]));
+    let unowned = see(SpendState::default(), &["runpod"], &[], std::slice::from_ref(&b), T0);
+    assert_eq!(owners_column(&unowned, std::slice::from_ref(&b)), None);
+    assert_eq!(owners_column(&SpendState::default(), &[]), None);
+}
+
 #[test]
 fn an_owner_is_assigned_and_fixed_later_by_name_or_instance_id() {
     let p = running("runpod", "rp1", "devtest-bravo", 0.20);
@@ -622,6 +643,20 @@ fn a_rotated_key_keeps_its_final_usage_with_the_old_owner() {
     assert!(!owner_row(&r, Some("alice")).ai_estimate, "deleted by arena: exact");
 }
 
+/// A tracked key renamed on OpenRouter (a name is only a label there) is still tracked by its hash:
+/// its usage keeps being sampled under the name it had here, it isn't taken for gone, and its
+/// delete is recorded. A key never tracked, named outside the fleet, still isn't.
+#[test]
+fn a_key_renamed_on_openrouter_stays_tracked_by_its_hash() {
+    let mut s = observe_keys(SpendState::default(), &[key("k1", "devtest-a", 0.40)], &naming(), T0);
+    s = observe_keys(s, &[key("k1", "a (alice's)", 0.90), key("kx", "someone-else", 3.0)], &naming(), T0 + H);
+    assert_eq!(s.keys.len(), 1, "{:?}", s.keys);
+    assert_eq!((s.keys[0].name.as_str(), s.keys[0].gone, s.keys[0].last_usage()), ("devtest-a", None, 0.90));
+    s = keys_deleted(s, &[key("k1", "a (alice's)", 1.10)], &naming(), T0 + 2 * H);
+    assert_eq!(s.keys[0].gone.map(|g| g.how), Some(KeyEndHow::Deleted));
+    assert_eq!(s.keys[0].last_usage(), 1.10);
+}
+
 #[test]
 fn a_key_deleted_outside_arena_keeps_its_last_seen_usage_flagged() {
     let mut s = observe_keys(SpendState::default(), &[key("k1", "devtest-a", 0.40)], &naming(), T0);
@@ -778,6 +813,12 @@ fn settled_runpod_hours_are_what_runpod_billed_and_younger_ones_the_higher_readi
     let a = r.runpod.unwrap();
     assert!(close(a.rows, 0.69) && close(a.account, 1.09), "{a:?}");
     assert!(notes(&r).iter().any(|n| n.contains("accounted for $0.69 of $1.09")), "{:?}", notes(&r));
+    // No RunPod spend at all in the window (an all-Hetzner week): no `$0.00 of $0.00` line.
+    let quiet = Billed { buckets: vec![], from: T0, to: now };
+    let none = PodBilled { from: T0, to: now, pods: BTreeMap::new(), at: now - M };
+    let r = report(&SpendState::default(), &naming(), None, now, Some(&none), Some(&quiet));
+    assert!(r.runpod.is_some(), "still in --json");
+    assert!(!notes(&r).iter().any(|n| n.starts_with("runpod:")), "{:?}", notes(&r));
 }
 
 #[test]

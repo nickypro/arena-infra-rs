@@ -179,6 +179,18 @@ fn bounded_sh(script: &str, secs: u64) -> String {
 }
 
 /// Parse `nvidia-smi --format=csv,noheader,nounits` output into one stat per GPU.
+/// The repo's last commit as a save **on this machine** (the dashboard's 💾 and its backups
+/// screen): `None` when it's older than the machine itself (`created_at`, where the provider says)
+/// — a fresh box's checkout carries the course repo's last commit, days old, which isn't a backup
+/// of anything done there (the rehearsal, 2026-10-31). Without a creation time, as reported. Pure.
+pub fn saved_on_machine(last_commit: Option<i64>, created_at: Option<u64>) -> Option<i64> {
+    let t = last_commit?;
+    match created_at.and_then(|c| i64::try_from(c).ok()) {
+        Some(c) if t < c => None,
+        _ => Some(t),
+    }
+}
+
 pub fn parse_nvidia_smi(stdout: &str) -> Vec<GpuStat> {
     stdout
         .lines()
@@ -673,6 +685,11 @@ mod tests {
         assert_eq!(m.branch.as_deref(), Some("autocommit-arena8-w0d1-apple"));
         assert_eq!(m.origin.as_deref(), Some("git@github.com:styme3279/ARENA_3.0.git"));
         assert_eq!(m.last_commit, Some(1717412400));
+        // A commit older than the machine is the image's checkout, not a save on it.
+        assert_eq!(saved_on_machine(m.last_commit, Some(1717412400 + 60)), None);
+        assert_eq!(saved_on_machine(m.last_commit, Some(1717412400 - 60)), Some(1717412400));
+        assert_eq!(saved_on_machine(m.last_commit, None), Some(1717412400), "no creation time: as reported");
+        assert_eq!(saved_on_machine(None, Some(1)), None);
         assert_eq!(m.dirty_files, Some(3));
         assert_eq!(m.has_name, Some(true));
         assert_eq!(m.has_api_key, Some(true));

@@ -118,15 +118,51 @@ pub(crate) fn scope_of(named: bool) -> Scope {
     }
 }
 
-/// `arena backups [--json]`: read what's there (the crontab, the record, the backup dir, the
-/// archive's state, the locks, the filesystems — nothing on a pod or a provider), judge it, print
-/// it. `crontab`: the `crontab -l` output (`arena_core::backups::read_crontab` for real). Exits 0:
-/// it's a look (the text says what's failing).
-pub(crate) fn handle_backups(cfg: &Config, config_path: &Path, json: bool, crontab: Result<String, String>) -> Result<()> {
+/// The machines `arena backups` is about: the fleet's listing (read-only, bounded) — each live
+/// machine, as the dashboard's `b` has them — and this cohort's configured names that have none,
+/// for one line. A fleet that can't be built or a provider that didn't answer: every configured
+/// name instead (a `?` row for one with no machine), and a note saying why.
+pub(crate) async fn backup_pods(cfg: &Config, fleet: std::result::Result<&dyn arena_core::Provider, String>) -> (Vec<backups::PodIn>, Vec<String>, Option<String>) {
+    let configured = |why: String| (backups::cohort_pods(cfg), Vec::new(), Some(why));
+    let provider = match fleet {
+        Ok(p) => p,
+        Err(e) => return configured(format!("the fleet couldn't be listed ({e}): every configured name is shown, `?` for one with no machine")),
+    };
+    let listing = match arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, provider.list_by_provider()).await {
+        Ok(r) => arena_core::proxy::Listing::from_results(r),
+        Err(_) => return configured("the fleet didn't list in time: every configured name is shown, `?` for one with no machine".into()),
+    };
+    let failed: Vec<String> = listing.errors().iter().map(|(p, e)| format!("{p}: {e}")).collect();
+    if !failed.is_empty() {
+        return configured(format!("not every provider listed ({}): every configured name is shown, `?` for one with no machine", failed.join("; ")));
+    }
+    let naming = arena_core::selector::Naming::from_config(cfg);
+    let mut pods = listing.pods();
+    pods.sort_by(|a, b| a.name.cmp(&b.name));
+    let live = backups::listed_pods(&pods, &naming, |_| None);
+    let without = backups::without_machine(cfg, &live);
+    (live, without, None)
+}
+
+/// `arena backups [--json]`: list the fleet (read-only: which machines there are) and read what's
+/// on this box (the crontab, the record, the backup dir, the archive's state, the locks, the
+/// filesystems — nothing on a pod), judge it, print it. `crontab`: the `crontab -l` output
+/// (`arena_core::backups::read_crontab` for real); `fleet`: the providers, or why there are
+/// none ([`backup_pods`]). Exits 0: it's a look (the text says what's failing).
+pub(crate) async fn handle_backups(
+    cfg: &Config,
+    config_path: &Path,
+    json: bool,
+    crontab: Result<String, String>,
+    fleet: std::result::Result<&dyn arena_core::Provider, String>,
+) -> Result<()> {
+    let (pods, without, note) = backup_pods(cfg, fleet).await;
     let now = arena_core::snapshot::unix_now();
     let config = std::path::absolute(config_path).unwrap_or_else(|_| config_path.to_path_buf());
-    let inputs = backups::read(cfg, Some(&config.display().to_string()), crontab, backups::cohort_pods(cfg), now);
-    let status = backups::judge(&inputs);
+    let inputs = backups::read(cfg, Some(&config.display().to_string()), crontab, pods, now);
+    let mut status = backups::judge(&inputs);
+    status.without_machine = without;
+    status.notes.extend(note);
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
@@ -225,8 +261,8 @@ mod tests {
             assert!(text.contains(want), "no {want:?} in\n{text}");
         }
         // The command itself, text and JSON.
-        super::handle_backups(&cfg, std::path::Path::new("/c"), false, Ok(tab.clone())).unwrap();
-        super::handle_backups(&cfg, std::path::Path::new("/c"), true, Ok(tab)).unwrap();
+        super::handle_backups(&cfg, std::path::Path::new("/c"), false, Ok(tab.clone()), Err("no providers".into())).await.unwrap();
+        super::handle_backups(&cfg, std::path::Path::new("/c"), true, Ok(tab), Err("no providers".into())).await.unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -331,5 +367,64 @@ mod tests {
     fn tests_write_no_record_without_a_state_dir() {
         assert!(super::record_path(&Config::parse("MACHINE_NAME_PREFIX=devtest\n")).is_none());
         assert!(super::record_path(&Config::parse("ARENA_STATE_DIR=/tmp/x\n")).is_some());
+    }
+
+    /// The listing `arena backups` reads: each provider's pods, or its error.
+    struct Listed(Vec<(&'static str, Result<Vec<Pod>, &'static str>)>);
+
+    #[async_trait::async_trait]
+    impl arena_core::Provider for Listed {
+        fn name(&self) -> &'static str {
+            "hetzner"
+        }
+        fn describe(&self, _spec: &arena_core::PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
+            unreachable!("backups lists by provider")
+        }
+        async fn list_by_provider(&self) -> Vec<(String, arena_core::Result<Vec<Pod>>)> {
+            self.0.iter().map(|(n, r)| (n.to_string(), r.clone().map_err(arena_core::Error::provider))).collect()
+        }
+        async fn create_pod(&self, _spec: &arena_core::PodSpec) -> arena_core::Result<Pod> {
+            panic!("backups must not create")
+        }
+        async fn stop_pod(&self, _id: &str) -> arena_core::Result<()> {
+            panic!("backups must not stop")
+        }
+        async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
+            panic!("backups must not restart")
+        }
+        async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
+            panic!("backups must not terminate")
+        }
+    }
+
+    /// `arena backups` is about the live machines, as the dashboard's `b`: a configured name with
+    /// no machine is counted on one line, not a `?` row at the top. Without a whole listing (no
+    /// fleet, a provider down) it shows every configured name as before and says why.
+    #[tokio::test]
+    async fn arena_backups_shows_live_machines_and_counts_names_without_one() {
+        let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cedar)\n");
+        let hz = |name: &str| Pod { id: name.into(), name: format!("devtest-{name}"), provider: "hetzner".into(), status: "RUNNING".into(), ..Default::default() };
+        let fleet = Listed(vec![("hetzner", Ok(vec![hz("bloom")])), ("runpod", Ok(vec![]))]);
+        let (pods, without, note) = super::backup_pods(&cfg, Ok(&fleet)).await;
+        assert_eq!(pods.iter().map(|p| (p.name.as_str(), p.up)).collect::<Vec<_>>(), [("devtest-bloom", Some(true))]);
+        assert_eq!(without, ["devtest-apple", "devtest-cedar"]);
+        assert_eq!(note, None);
+        let mut s = backups::judge(&backups::read(&cfg, Some("/c"), Ok(String::new()), pods, arena_core::snapshot::unix_now()));
+        s.without_machine = without;
+        let text = backups::render::text(&s);
+        assert!(text.contains("2 configured names have no machine now: devtest-apple, devtest-cedar"), "{text}");
+        assert!(!text.contains("devtest-apple  ?"), "{text}");
+        // A provider down: the configured names, as before, and why.
+        let down = Listed(vec![("hetzner", Ok(vec![hz("bloom")])), ("runpod", Err("HTTP 503"))]);
+        let (pods, without, note) = super::backup_pods(&cfg, Ok(&down)).await;
+        assert_eq!(pods.len(), 3);
+        assert!(without.is_empty());
+        assert!(note.as_deref().is_some_and(|n| n.starts_with("not every provider listed (runpod: provider error: HTTP 503)")), "{note:?}");
+        let (pods, _, note) = super::backup_pods(&cfg, Err("no provider key set".into())).await;
+        assert_eq!(pods.len(), 3);
+        assert!(note.as_deref().is_some_and(|n| n.contains("no provider key set")), "{note:?}");
     }
 }

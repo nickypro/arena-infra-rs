@@ -76,7 +76,9 @@ use ssh_config::{handle_ssh_config, handle_ssh_config_admin, handle_ssh_config_i
 use cli::{Cli, Select, SelectOpts};
 use config_cmd::note_invalid_text;
 use cron::{arena_cron_lines, char_named, cron_unsafe_char, reap_cron_installed, resolve_week_day, CRON_PATH_CHARS};
-use keys::{copy_keys_command, drop_key_row, fleet_ssh_for, key_holders, keys_targets, machine_key_names, rotate_key, write_openrouter_key, KeySources, COPY_KEYS_TIMEOUT, OPENROUTER_KEYS_LINK};
+#[cfg(test)]
+use keys::write_openrouter_key;
+use keys::{copy_keys_command, drop_key_row_held, fleet_ssh_for, hold_name, key_holders, keys_of, keys_targets, machine_key_names, rotate_key, write_openrouter_key_held, KeySources, COPY_KEYS_TIMEOUT, OPENROUTER_KEYS_LINK};
 use pods::backup::{failure_why, BackupFailed, Unpushed, RSYNC};
 use pods::create::{sizing_flags, spec_with_overrides, Made, SpecOverrides};
 use pods::health::{health_cache_path, record_health};
@@ -139,6 +141,25 @@ fn confirm(assume_yes: bool, what: &str) -> Result<bool> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+/// [`confirm`] for what a `y` is too easy for (terminating several machines, or all of them):
+/// `token` (the count, or `ALL`: [`arena_core::selector::set_confirm_token`]) must be typed back,
+/// as the dashboard's marked-set confirm asks. `--yes` still answers it; no terminal refuses.
+fn confirm_typed(assume_yes: bool, what: &str, token: &str) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    if assume_yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        eprintln!("{what}");
+        return Err(NoTerminal.into());
+    }
+    eprint!("{what}\nType {token} to proceed (anything else aborts): ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim() == token)
 }
 
 /// The refusal [`confirm`] fails with when there's no terminal to ask at and no `--yes`.
@@ -400,7 +421,13 @@ async fn run() -> Result<()> {
         Cmd::Config(c) => handle_config(c, &cfg, &picked),
         Cmd::Cron(c) => handle_cron(c, &cfg, &config_path, cli.yes, CRONTAB, std::env::var("HOME").ok().as_deref()).await,
         Cmd::Archive(c) => archive::handle_archive(c, &cfg, remote.as_ref(), cli.yes).await,
-        Cmd::Backups { json } => backups::handle_backups(&cfg, &config_path, json, arena_core::backups::read_crontab()),
+        Cmd::Backups { json } => {
+            // Its machines from the fleet's listing; without one (no provider configured, a bad
+            // key), the configured names as before — said in a note.
+            let fleet = arena_core::provider::build_fleet(&provider_name, &cfg, false).map_err(|e| e.to_string());
+            let fleet = fleet.as_ref().map(|f| f.as_ref()).map_err(Clone::clone);
+            backups::handle_backups(&cfg, &config_path, json, arena_core::backups::read_crontab(), fleet).await
+        }
         Cmd::Image(c) => image::handle_image(c, &cfg, remote, cli.yes, Interrupt::ctrl_c()).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
@@ -449,9 +476,10 @@ async fn run() -> Result<()> {
             let ctx = spend::SpendCtx::from_config(&cfg);
             let now = arena_core::snapshot::unix_now();
             let fleet = provider.unwrap();
-            if let Some(spend::SpendCmd::Assign { target, owner, clear }) = cmd {
+            if let Some(spend::SpendCmd::Assign { target, owner, clear, dry_run, force }) = cmd {
                 let owner = if clear { None } else { owner.as_deref() };
-                print!("{}", spend::spend_assign(fleet.as_ref(), &cfg, &ctx, &target, owner, now).await?);
+                let opts = spend::AssignOpts { dry_run, force };
+                print!("{}", spend::spend_assign(fleet.as_ref(), &cfg, &ctx, &target, owner, now, opts).await?);
                 return Ok(());
             }
             let keys = openrouter_client(&cfg);

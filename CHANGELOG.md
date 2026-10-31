@@ -19,6 +19,62 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-31 · arena 2.9: project week fixes — owners in the listing, a key from `up`, several machines per terminate
+- `pods list` and the dashboard show who each machine is for (`--owner`, `spend assign`): an
+  OWNER column after NAME, per instance, empty for a machine with no owner, and no column at all
+  while no machine has one. In the dashboard it's a short column that a narrow terminal drops;
+  the detail view has an `owner:` line.
+- **`pods up` mints an OpenRouter key for a name that has none** (with
+  `OPENROUTER_PROVISIONING_KEY` set): capped at `OPENROUTER_KEY_LIMIT`, after the prompt and
+  before the create, recorded as the `--owner`'s, and copied on with the rest of the keys. The
+  plan says so before the prompt (`will mint an OpenRouter key (cap $0.10, …) for …`), and each
+  mint gets a ✓ line. A name that has a key keeps it; one whose key is someone else's is still
+  handed over (`--keep-key` keeps it); a staff `@` box gets none (told). A mint that fails is a ✗
+  line with the `keys gen` to run, never a failed `up`. `pods create` mints nothing.
+- **A dead key in the keys CSV isn't copied any more.** Before `up`, `copy-keys`, `setup`,
+  `keys gen --copy` or `replace` copies a machine's OpenRouter key, the name's row is checked
+  against OpenRouter's listing: a key deleted elsewhere (or rotated from another keys folder) is
+  left out, with a ⚠ line naming `arena keys gen <name> --copy` (or `keys rotate`). A key
+  renamed on OpenRouter is still its machine's, found by its redacted label: copied, not minted
+  again, kept by `keys gen`, deleted by `keys rotate|revoke`, a handover and `terminate
+  --revoke-key`, and its spend still counted for its owner. When the
+  listing can't be read, the CSV is copied as before, and the copy says it's unchecked.
+- Keys minted at once (several `pods up` in parallel terminals, `keys gen` beside an `up`) all
+  land in the keys CSV: each write holds the keys folder. The second write used to drop the
+  first's row, and that key's secret with it. `up`, `keys gen|rotate|revoke` and a handover also
+  read OpenRouter's keys again under that hold, one name at a time, so a name that got a key
+  meanwhile keeps it (`= … has an OpenRouter key now`) — not copied onto this machine if it's
+  another owner's — never a second one. `up` reads the keys CSV again after its prompt. `terminate
+  --revoke-key` drops only a row still holding the revoked key, and `rename` moves rows under the
+  hold.
+- `pods terminate apple bloom ember --revoke-key` terminates several machines in one run. Each
+  name is matched exactly, as one is (a typo stops them all, before anything); one confirm lists
+  them and wants their count typed back (`ALL` past five, or for every listed pod), as the
+  dashboard's marked set asks. `--all` now wants `ALL` typed too. `--yes` answers both.
+- `arena spend assign` has `--dry-run`, and refuses to move a machine's history from one person
+  to another: on a machine that has run up spend under alice, `spend assign apple bob` says what
+  would move (`2.0 h, €0.020 since …`) and what to do instead (back up, terminate, `up --owner
+  bob`). `--force` assigns it anyway (an owner that was wrong from the start). A machine with no
+  owner is assigned as before.
+- `arena backups` shows the fleet's live machines, as the dashboard's `b` does (it lists the
+  providers, read-only), and one line counting the configured names with no machine. Those names
+  were `?` rows at the top. A provider that doesn't answer brings the old list back, with a note.
+- Wording: a fleet that's all Hetzner reads `fleet: €0.030/h hetzner across 3 billing pod(s)`,
+  not `$0.00/h across 3` first; `arena spend` leaves out RunPod's `accounted for $0.00 of $0.00`
+  line when nothing ran there; the dashboard's 💾 (and its backups screen) no longer shows the
+  course repo's age on a fresh box — a commit older than the machine isn't a save on it.
+- A key's cap prints as it was set, `$0.05` (it read `$0.050`): `keys list`, `keys limit`, the
+  dashboard. A key handed over to a new owner says the new key's cap
+  (`… a fresh key 4de6426ea4a4, cap $0.10)`).
+- This is **arena 2.9** (a minor bump): `spend assign` can now refuse, `pods up` mints keys, and
+  `pods terminate` takes several names.
+
+### Action needed
+- A script that runs `arena spend assign` on a machine that already has someone else's spend now
+  stops there (exit 1, nothing changed): add `--force` only where that owner really was wrong.
+- With `OPENROUTER_PROVISIONING_KEY` set, `pods up` now mints a key for each cohort name that has
+  none, capped at `OPENROUTER_KEY_LIMIT` (else $5): check that cap is the one you want.
+- Restart running dashboards (`arena-tui`) for the OWNER column and the 💾 fix.
 ## 2026-10-31 · `arena claude push`: safe after a clock change, and never writes through a link
 - A push's order number is now kept per machine on the control box, so pushes made after the
   box's clock went back (e.g. after it ran an hour ahead) aren't refused as "older" until the clock

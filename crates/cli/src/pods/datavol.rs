@@ -1359,7 +1359,7 @@ mod tests {
             let (v, _) = cloud.create_volume(&datavol::create_body("devtest-alpha-data", 10, 11, "devtest")).await.unwrap();
             let fleet = Gone(std::sync::Mutex::new(pods), &cloud);
             let opts = TerminateOpts { delete_volumes, volumes: Some(&cloud), skip_proxy: true, yes: true, ..Default::default() };
-            handle_terminate(&fleet, &cfg(), &book, Some("alpha"), opts).await.unwrap();
+            handle_terminate(&fleet, &cfg(), &book, Some(&["alpha"]), opts).await.unwrap();
             let left = cloud.state().volumes;
             if delete_volumes {
                 assert!(left.is_empty(), "{left:?}");
@@ -1374,7 +1374,7 @@ mod tests {
         let cloud = project(&pods);
         let fleet = Gone(std::sync::Mutex::new(pods), &cloud);
         let opts = TerminateOpts { delete_volumes: true, volumes: None, skip_proxy: true, yes: true, ..Default::default() };
-        let e = handle_terminate(&fleet, &cfg(), &book, Some("alpha"), opts).await.unwrap_err().to_string();
+        let e = handle_terminate(&fleet, &cfg(), &book, Some(&["alpha"]), opts).await.unwrap_err().to_string();
         assert!(e.contains("HETZNER_API_KEY") && e.contains("nothing was terminated"), "{e}");
         assert_eq!(fleet.0.lock().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);

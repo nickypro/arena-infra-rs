@@ -278,6 +278,10 @@ struct Shared {
     ai_wanted: bool,
     /// The backups' status as the screen last read it (`backups.rs`).
     backups: backups::Landed,
+    /// Who each row's machine instance is for, by [`mark_key`] (`--owner`, `spend assign`: the
+    /// spend ledger, read after each refresh records its listing) — the OWNER column and the
+    /// detail view's `owner:` line. Rows with no owner aren't in it.
+    owners: HashMap<String, String>,
     /// Which Claude Code account each machine is on (`claude.json`, as each refresh reads it):
     /// the detail view's `tokens:` line. `None`: no file yet, or one that can't be read.
     claude: Option<arena_core::claude::State>,
@@ -851,6 +855,8 @@ async fn refresh(
     // rewritten more than once a minute. Only the providers that listed this time count
     // (`fresh`): a rate-limited one's carried rows say nothing new.
     arena_core::spend::record_listing(spend_path(cfg).as_deref(), &fresh, &pods, &Naming::from_config(cfg), listed_at);
+    // Who each machine is for, from the ledger just written (the OWNER column).
+    let owners = spend_path(cfg).map(|p| owners_by_key(&arena_core::spend::load(&p).0, &pods)).unwrap_or_default();
     // The Claude Code accounts forget the machines this listing shows are gone, then are read for
     // the detail pane.
     arena_core::claude::record_listing(claude_path(cfg).as_deref(), &fresh, listed_at);
@@ -910,6 +916,7 @@ async fn refresh(
     }
     s.resets = backend_resets(provider, &display);
     s.refusals = backend_refusals(provider, &display);
+    s.owners = owners;
     s.claude = claude;
     s.publish(snap);
     s.last_refresh = Some(Instant::now());
@@ -2519,6 +2526,12 @@ fn spend_path(cfg: &Config) -> Option<std::path::PathBuf> {
     snapshot::state_file_path_for(cfg, arena_core::spend::SPEND_FILE).ok()
 }
 
+/// Each owned pod's owner by [`mark_key`] (per instance: provider + id, never the name a reused
+/// name shares with someone else's instance). Pure.
+fn owners_by_key(state: &arena_core::spend::SpendState, pods: &[Pod]) -> HashMap<String, String> {
+    pods.iter().filter_map(|p| arena_core::spend::owner_of(state, &p.provider, &p.id).map(|o| (mark_key(p), o.to_string()))).collect()
+}
+
 /// The fleet's Claude Code accounts (`arena claude`): its state file — none under test unless the
 /// test's config sets `ARENA_STATE_DIR`, as [`spend_path`].
 fn claude_path(cfg: &Config) -> Option<std::path::PathBuf> {
@@ -3366,7 +3379,8 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     // AI$: each pod's OpenRouter key, spent against its cap — only with a provisioning key.
     // PROGRESS is what PROGRESS_CMD reports, so only with one set.
     let want_progress = ui.cfg.get("PROGRESS_CMD").is_some_and(|c| !c.trim().is_empty());
-    let c = columns::columns(area.width as usize, proxy_w, shared.ai.is_some(), want_progress, with_spark);
+    // OWNER: while some pod has an owner (`--owner`, `spend assign`).
+    let c = columns::columns(area.width as usize, proxy_w, shared.ai.is_some(), !shared.owners.is_empty(), want_progress, with_spark);
     let now = shared.snap.generated_at;
 
     let mut header_cells = vec!["", "P", "NAME", "STATUS", "M", "SET", "GPU", "GPU%"];
@@ -3387,6 +3401,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     }
     if c.ai {
         header_cells.push("AI$");
+    }
+    if c.owner {
+        header_cells.push("OWNER");
     }
     if c.host {
         header_cells.push("CPU%");
@@ -3498,7 +3515,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 let (sync, sync_style) = sync_marker(m);
                 cells.push(Cell::from(Line::from(vec![
                     Span::styled(sync, sync_style),
-                    Span::styled(rel_time_short(m), saved_style(m)),
+                    Span::styled(rel_time_short(saved_commit(p, m)), saved_style(p, m)),
                 ])));
             }
             if c.ai {
@@ -3508,6 +3525,10 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                     ai.is_some_and(|a| a.keys_error.is_some()),
                     ai.is_some_and(|a| a.read),
                 ));
+            }
+            if c.owner {
+                // Empty for a pod with no owner; a long name is cut (the detail view has it whole).
+                cells.push(Cell::from(shared.owners.get(&mark_key(p)).map(|o| truncate(o, columns::OWNER_W)).unwrap_or_default()));
             }
             if c.host {
                 // Host CPU% and RAM% (both coloured by load); exact RAM GB is in detail.
@@ -3581,6 +3602,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     if c.ai {
         widths.push(Constraint::Length(columns::AI_W as u16)); // AI$ (e.g. "1.23/5")
     }
+    if c.owner {
+        widths.push(Constraint::Length(columns::OWNER_W as u16)); // OWNER (e.g. "alice")
+    }
     if c.host {
         widths.push(Constraint::Length(4)); // CPU%
         widths.push(Constraint::Length(4)); // RAM%
@@ -3626,11 +3650,16 @@ fn status_style(label: &str) -> Style {
     }
 }
 
+/// The repo's last commit as a save on `p` itself: none while it's older than the machine (a
+/// fresh box's course-repo checkout — `metrics::saved_on_machine`).
+fn saved_commit(p: &Pod, m: Option<&PodMetrics>) -> Option<i64> {
+    arena_core::metrics::saved_on_machine(m?.last_commit, p.created_at)
+}
+
 /// SAVED's time colour: yellow when there's uncommitted work; grey when unknown OR when it's a
 /// clean tree that's been quiet for a day+ (nothing to do); plain otherwise.
-fn saved_style(m: Option<&PodMetrics>) -> Style {
-    let stale = m
-        .and_then(|m| m.last_commit)
+fn saved_style(p: &Pod, m: Option<&PodMetrics>) -> Style {
+    let stale = saved_commit(p, m)
         .map(|ts| now_unix().saturating_sub(ts) > 86_400)
         .unwrap_or(false);
     match m.and_then(|m| m.dirty_files) {
@@ -3642,9 +3671,13 @@ fn saved_style(m: Option<&PodMetrics>) -> Style {
 }
 
 /// When the pod's repo was last committed (= last backup, since `pods backup` commits +
-/// pushes), plus whether there's uncommitted work since. `-` if not reported yet.
-fn backup_summary(m: Option<&PodMetrics>) -> String {
+/// pushes), plus whether there's uncommitted work since. `-` if not reported yet, or when the
+/// last commit is older than the machine (nothing saved on it yet).
+fn backup_summary(p: &Pod, m: Option<&PodMetrics>) -> String {
     let Some(m) = m else { return "-".into() };
+    if m.last_commit.is_some() && saved_commit(p, Some(m)).is_none() {
+        return "- (none on this machine yet: its repo's last commit predates it)".into();
+    }
     match m.last_commit {
         Some(ts) => {
             let state = match m.dirty_files {
@@ -3678,8 +3711,8 @@ fn rel_time(unix_secs: i64) -> String {
 }
 
 /// A compact relative time for the table cell: "3h", "2d", "12m", "now", or "-".
-fn rel_time_short(m: Option<&PodMetrics>) -> String {
-    match m.and_then(|m| m.last_commit) {
+fn rel_time_short(saved: Option<i64>) -> String {
+    match saved {
         None => "-".into(),
         Some(ts) => {
             let d = now_unix() - ts;
@@ -3746,7 +3779,9 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         // Where to look first: a long list is cut at the pane's edge.
         format!("⚠ {} at cap (`arena keys list` has each one's cap and spend): {}", count_of(names.len(), "key", "keys"), names.join(", "))
     });
-    let fact_lines = FACT_LINES + u16::from(ai.is_some()) + u16::from(caps.is_some());
+    // Who the machine is for (`--owner`, `spend assign`), when it has an owner.
+    let owner = shared.owners.get(&mark_key(pod));
+    let fact_lines = FACT_LINES + u16::from(ai.is_some()) + u16::from(caps.is_some()) + u16::from(owner.is_some());
     let show_graphs = inner.height >= fact_lines + 3 + procs_h + commits_h + 6;
 
     let mut constraints: Vec<Constraint> = vec![
@@ -3912,6 +3947,9 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         fact("proxy:", proxy),
         fact("cost:", or_dim(cost, plain)),
     ];
+    if let Some(o) = owner {
+        facts.push(fact("owner:", one(fit(format!("{o}  (`arena spend` has what it cost)")), plain)));
+    }
     if let Some((text, tone)) = ai {
         facts.push(fact("ai key:", one(fit(text), tone.map(tone_style).unwrap_or(plain))));
     }
@@ -3925,7 +3963,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         fact("disk:", disk),
         fact("host:", host),
         fact("branch:", or_dim(m.and_then(|m| m.branch.clone()).unwrap_or_else(|| "-".into()), plain)),
-        fact("backup:", or_dim(backup_summary(m), saved_style(m))),
+        fact("backup:", or_dim(fit(backup_summary(pod, m)), saved_style(pod, m))),
         fact("sync:", sync),
         fact("origin:", vec![Span::raw(truncate(&origin, 32)), Span::raw(" "), glyph(origin_ok)]),
         fact(
@@ -5402,6 +5440,34 @@ deep_check_end=1
         }
     }
 
+    /// On a fresh box the repo's last commit is the course repo's (the image's checkout, days old):
+    /// not a save on that machine, so SAVED says `-` and the detail view says why — until a commit
+    /// made after the machine was. Without a creation time, the commit as reported.
+    #[test]
+    fn a_fresh_boxs_course_repo_commit_isnt_its_last_save() {
+        let mut shared = fixture_shared();
+        let idx = shared.pods.iter().position(|p| p.name.ends_with("alpha")).unwrap();
+        let name = shared.pods[idx].name.clone();
+        let made = now_unix() - 3_600;
+        shared.pods[idx].created_at = Some(made as u64);
+        let mut m = PodMetrics { last_commit: Some(made - 3 * 86_400), dirty_files: Some(0), ..Default::default() };
+        shared.metrics.insert(name.clone(), m.clone());
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let saved = |shared: &Shared| rel_time_short(saved_commit(&shared.pods[idx], shared.metrics.get(&name)));
+        assert_eq!(saved(&shared), "-", "the course repo's 3-day-old commit");
+        ui.mode = Mode::Detail;
+        ui.selected = idx;
+        let pane = draw(200, 40, &shared, &ui).join("\n");
+        assert!(pane.contains("backup:   - (none on this machine yet: its repo's last commit predates it)"), "{pane}");
+        m.last_commit = Some(made + 600);
+        shared.metrics.insert(name.clone(), m.clone());
+        assert_eq!(saved(&shared), "50m", "a backup on it");
+        shared.pods[idx].created_at = None;
+        m.last_commit = Some(made - 3 * 86_400);
+        shared.metrics.insert(name.clone(), m);
+        assert_eq!(saved(&shared), "3d", "no creation time: as reported");
+    }
+
     /// The top line is one line — no title box — with the fleet in short words and, at its right
     /// while there's room, a provider or config that isn't the default (a second fleet's
     /// dashboard says so). The table starts right under it. A click anywhere on it opens the info
@@ -5610,6 +5676,34 @@ deep_check_end=1
         let at = lines.iter().position(|l| l.contains("where:")).unwrap();
         assert!(lines[at].contains("United States, California") && lines[at].contains('…'), "{}", lines[at]);
         assert!(lines[at + 1].contains("proxy:"), "the next fact on the next row:\n{}", lines.join("\n"));
+    }
+
+    /// OWNER: who each instance is for, from the spend ledger (per provider + id, never the name),
+    /// in a short column that comes in once there's room and only while some pod has an owner —
+    /// empty for a pod with none — and whole on the detail view's `owner:` line.
+    #[test]
+    fn the_owner_shows_in_its_column_and_the_detail_view() {
+        use arena_core::spend::{self, Event, OwnerRule, SpendState};
+        let mut shared = fixture_shared();
+        let alpha = shared.pods.iter().find(|p| p.name.ends_with("alpha")).unwrap().clone();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let header_of = |lines: &[String]| lines.iter().find(|l| l.contains("HLTH")).cloned().unwrap();
+        assert!(!header_of(&draw(200, 12, &shared, &ui)).contains("OWNER"), "no owners, no column");
+        let state = spend::apply_event(SpendState::default(), &Event::Created { pod: &alpha, owner: &OwnerRule::Given("alexandria".into()) }, 1_800_000_000);
+        shared.owners = owners_by_key(&state, &shared.pods);
+        assert_eq!(shared.owners.len(), 1, "only alpha has one: {:?}", shared.owners);
+        let lines = draw(200, 12, &shared, &ui);
+        let header = header_of(&lines);
+        assert!(header.contains(" OWNER "), "{header}");
+        assert!(row(&lines, "alpha").contains(" alexand… "), "cut to the column: {}", row(&lines, "alpha"));
+        assert!(!row(&lines, "bravo").contains("alex"), "no owner: nothing");
+        assert!(!header_of(&draw(100, 12, &shared, &ui)).contains("OWNER"), "a narrow terminal drops it");
+        ui.mode = Mode::Detail;
+        ui.selected = shared.pods.iter().position(|p| p.name == alpha.name).unwrap();
+        let pane = draw(160, 40, &shared, &ui).join("\n");
+        assert!(pane.contains("owner:    alexandria  (`arena spend` has what it cost)"), "{pane}");
+        ui.selected = shared.pods.iter().position(|p| p.name.ends_with("bravo")).unwrap();
+        assert!(!draw(160, 40, &shared, &ui).join("\n").contains("owner:"), "no line without an owner");
     }
 
     /// The human (2026-10-29, prod's dashboard): "why does it say 1 ai key at cap?" — every AI$

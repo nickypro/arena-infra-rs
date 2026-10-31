@@ -289,13 +289,11 @@ pub(crate) enum Cmd {
     Archive(archive::ArchiveCmd),
     /// What gets backed up, where and when — and how it's doing (read-only)
     ///
-    /// Each backup job — the git backup, the home copy, the archive's two pushes: set up or not
-    /// (and the command that sets it up), how often, its last run and result, when it's next
-    /// due, whether it's running now. Then each cohort pod's last git save, home copy and archive
-    /// copy, failing ones first, then the longest since a good backup; and where the copies live,
-    /// with their free space. Reads this box only — the crontab, the run record the backups keep,
-    /// LOCAL_BACKUP_DIR, the archive's state, the locks held — never a pod or a provider; what it
-    /// can't read is `?`, with why. Exits 0. The dashboard's backups screen (`b`) is the same.
+    /// Each backup job (git, home copy, the archive's pushes): set up or not, how often, its last
+    /// run and result, when it's next due. Then each live machine's last git save, home copy and
+    /// archive copy, failing first (configured names with no machine: one line); and where the
+    /// copies live. Lists the fleet (read-only) and reads this box, never a pod. What it can't
+    /// read is `?`, with why. Exits 0. The dashboard's `b` is the same.
     #[command(verbatim_doc_comment)]
     Backups {
         /// The whole status as JSON (for scripts)
@@ -924,16 +922,17 @@ pub(crate) enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Terminate (delete) a pod, or every pod with --all
+    /// Terminate (delete) pods by name, or every pod with --all
     ///
-    /// IRREVERSIBLE: the pod and its disk are gone. One pod at a time (no ranges or lists); a
-    /// name two pods share is refused (pass the id).
+    /// IRREVERSIBLE: the pod and its disk are gone. Each name exactly (no ranges); a name two
+    /// pods share is refused (pass the id). Several: one confirm, their count typed back (ALL
+    /// past five); --all asks for ALL.
     #[command(verbatim_doc_comment)]
     Terminate {
-        /// Machine name (e.g. arena8-apple) or raw provider id. Omit with --all.
-        target: Option<String>,
+        /// Machine names (e.g. apple bloom) or raw provider ids. Omit with --all.
+        targets: Vec<String>,
         /// Terminate EVERY pod the provider reports (the whole fleet)
-        #[arg(long, conflicts_with = "target")]
+        #[arg(long, conflicts_with = "targets")]
         all: bool,
         /// Unlock locked pods, then terminate them (else a locked pod is refused)
         ///

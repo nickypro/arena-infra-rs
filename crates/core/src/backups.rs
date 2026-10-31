@@ -381,6 +381,10 @@ pub struct Status {
     pub notes: Vec<String>,
     /// The worst of the jobs and pods.
     pub health: Health,
+    /// This cohort's configured names that no listed machine has (`arena backups` from a fleet
+    /// listing, [`without_machine`]): one line under the pods, never a row each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub without_machine: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -485,7 +489,7 @@ fn not_saved_in_last_run(rec: &Record) -> Vec<String> {
 }
 
 /// Names, shortened to `a, b, c (+4 more)`.
-fn names(v: &[String], max: usize) -> String {
+pub(crate) fn names(v: &[String], max: usize) -> String {
     if v.len() <= max {
         v.join(", ")
     } else {
@@ -947,7 +951,7 @@ pub fn judge(i: &Inputs) -> Status {
     };
 
     let health = jobs.iter().map(|j| j.health).chain(pods.iter().map(|p| p.health)).chain(storage.iter().map(|s| s.health)).filter(|h| *h != Health::Off).min().unwrap_or(Health::Off);
-    Status { generated_at: i.now, prefix: i.prefix.clone(), jobs, running, running_unknown, pods, storage, skips, notes, health }
+    Status { generated_at: i.now, prefix: i.prefix.clone(), jobs, running, running_unknown, pods, storage, skips, notes, health, without_machine: Vec::new() }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1142,8 +1146,34 @@ pub fn read(cfg: &Config, config_path: Option<&str>, crontab: Result<String, Str
     }
 }
 
+/// The listed machines the status is about, as the dashboard's `b` and `arena backups` give them:
+/// each one, cohort or not (a staff box is never "late"), up when running, paused when stopped,
+/// with its repo's last commit where the caller read one (`last_commit`). Pure.
+pub fn listed_pods(pods: &[crate::pod::Pod], naming: &crate::selector::Naming, last_commit: impl Fn(&crate::pod::Pod) -> Option<u64>) -> Vec<PodIn> {
+    pods.iter()
+        .map(|p| PodIn {
+            name: p.name.clone(),
+            cohort: naming.is_cohort(&p.name),
+            up: if p.status.eq_ignore_ascii_case("RUNNING") {
+                Some(true)
+            } else if crate::status::is_stopped(&p.status) || p.status.eq_ignore_ascii_case("TERMINATED") {
+                Some(false)
+            } else {
+                None
+            },
+            last_commit: last_commit(p),
+        })
+        .collect()
+}
+
+/// This cohort's configured names (staff `@` entries left out) that none of `pods` is: what
+/// `arena backups` counts on one line instead of a `?` row each. Pure.
+pub fn without_machine(cfg: &Config, pods: &[PodIn]) -> Vec<String> {
+    cohort_pods(cfg).into_iter().map(|p| p.name).filter(|n| !pods.iter().any(|p| p.name == *n)).collect()
+}
+
 /// This cohort's pods by the config's list (`MACHINE_NAME_LIST`, staff `@` entries left out) —
-/// what `arena backups` reports when it isn't given the fleet's listing.
+/// what `arena backups` reports when the fleet couldn't be listed.
 pub fn cohort_pods(cfg: &Config) -> Vec<PodIn> {
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     cfg.machine_names

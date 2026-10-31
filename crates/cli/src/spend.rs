@@ -398,33 +398,40 @@ pub(crate) async fn hand_over(ctx: &SpendCtx, cfg: &Config, api: Option<&dyn Key
         done.failed = names();
         return done;
     };
-    let listed_at = unix_now();
-    let keys = match api.list_keys().await {
-        Ok(k) => k,
-        Err(e) => {
-            done.lines.push(format!("✗ key handover: listing OpenRouter keys failed ({e})"));
-            done.failed = names();
-            return done;
-        }
-    };
-    ctx.keys(&keys, listed_at);
     let naming = Naming::from_config(cfg);
     let prefix = naming.prefix.to_string();
     let limit = cfg.get_parsed::<f64>("OPENROUTER_KEY_LIMIT").unwrap_or(5.0);
     for h in handovers {
-        let theirs: Vec<&KeyInfo> = super::machine_key_names(&naming, &h.name)
-            .iter()
-            .flat_map(|n| keys.iter().filter(move |k| k.name.as_deref() == Some(n.as_str())))
-            .collect();
+        // One name at a time under a hold (`keys::checked::hold_name`): its keys read again with the
+        // keys folder locked and rotated before it's free — another arena minting for this name
+        // meanwhile (`keys gen`, another `up`) waits, never mints beside it.
+        let hold = match super::hold_name(api, dir, &h.name).await {
+            Ok(hold) => hold,
+            Err(why) => {
+                done.lines.push(format!("✗ {}: key handover failed ({why})", h.name));
+                done.failed.push(h.name.clone());
+                continue;
+            }
+        };
+        // Every key's usage, recorded before any is deleted: the old owner keeps what it spent.
+        ctx.keys(&hold.listed, hold.listed_at);
+        // Its keys by name, and its CSV row's key renamed on OpenRouter: the old owner's, all
+        // deleted (their spend recorded above), so none stays usable after the handover.
+        let theirs: Vec<&KeyInfo> = super::keys_of(&naming, &h.name, hold.secret.as_deref(), &hold.listed);
         let kn = arena_core::openrouter::key_name(&prefix, naming.list, &h.name);
         let (deleted, saved) = match super::rotate_key(api, &kn, &theirs, limit).await {
             Ok((deleted, ck)) => {
                 ctx.keys_deleted(&theirs, &deleted);
                 ctx.key_minted(&ck.hash, &h.name, Some(owner));
                 let short = ck.hash[..ck.hash.len().min(12)].to_string();
-                match super::write_openrouter_key(dir, &h.name, &ck.secret, &prefix) {
+                match super::write_openrouter_key_held(dir, &h.name, &ck.secret, &prefix) {
                     Ok(()) => {
-                        done.lines.push(format!("✓ {}: OpenRouter key handed over ({} → {owner}, a fresh key {short})", h.name, h.from));
+                        done.lines.push(format!(
+                            "✓ {}: OpenRouter key handed over ({} → {owner}, a fresh key {short}, cap {})",
+                            h.name,
+                            h.from,
+                            arena_core::openrouter::exact_money(limit)
+                        ));
                         done.csv_changed = true;
                         (deleted, true)
                     }
@@ -452,7 +459,7 @@ pub(crate) async fn hand_over(ctx: &SpendCtx, cfg: &Config, api: Option<&dyn Key
             done.failed.push(h.name.clone());
             // Its old key is gone and no fresh one saved: its CSV row would hand a dead key on.
             if !deleted.is_empty() {
-                match super::drop_key_row(dir, &h.name) {
+                match super::drop_key_row_held(dir, &h.name) {
                     Ok(dropped) => done.csv_changed |= dropped,
                     Err(e) => done.lines.push(format!(
                         "✗ {}: its deleted key's row couldn't be removed from the keys CSV ({e}) — `arena keys revoke {}` drops it",
@@ -482,7 +489,20 @@ pub(crate) enum SpendCmd {
         /// Remove the owner instead (the row goes back to "(no owner)")
         #[arg(long, conflicts_with = "owner")]
         clear: bool,
+        /// Say what would change and what it moves; change nothing
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+        /// Move a machine's history from one owner to another all the same (fixing a wrong owner)
+        #[arg(long)]
+        force: bool,
     },
+}
+
+/// `spend assign`'s switches.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AssignOpts {
+    pub dry_run: bool,
+    pub force: bool,
 }
 
 /// What `arena spend` shows.
@@ -625,6 +645,11 @@ pub(crate) async fn spend_report(
     Ok(Printed { stdout, stderr, code: 0 })
 }
 
+/// A machine's name without the fleet prefix, as commands take it (`apple`).
+fn naming_short(naming: &Naming, name: &str) -> String {
+    name.strip_prefix(naming.prefix).and_then(|s| s.strip_prefix('-')).filter(|s| !s.is_empty()).unwrap_or(name).to_string()
+}
+
 /// `f`, within [`READ_TIMEOUT`] (its rate-limit waits included).
 async fn within<F: std::future::Future>(f: F) -> std::result::Result<F::Output, ()> {
     arena_core::ratelimit::bounded(READ_TIMEOUT, f).await.map_err(|_| ())
@@ -633,7 +658,13 @@ async fn within<F: std::future::Future>(f: F) -> std::result::Result<F::Output, 
 /// `arena spend assign <target> <owner>` / `--clear`: list the fleet first (a machine made a
 /// moment ago is in the ledger then), set the owner, and say what changed — with a hint when
 /// the machine's AI key is someone else's.
-pub(crate) async fn spend_assign(provider: &dyn Provider, cfg: &Config, ctx: &SpendCtx, target: &str, owner: Option<&str>, now: u64) -> Result<String> {
+///
+/// A row has one owner for its whole life, so giving a machine that has run up spend under one
+/// person to another moves all of it ([`spend::Moves`]): refused unless `--force`, saying what
+/// would move and what to do instead (back up, terminate, `up --owner` — a new instance each).
+/// An unowned machine (a forgotten `--owner`) is assigned as before. `--dry-run` says what would
+/// change and move, and writes nothing (the listing isn't recorded either).
+pub(crate) async fn spend_assign(provider: &dyn Provider, cfg: &Config, ctx: &SpendCtx, target: &str, owner: Option<&str>, now: u64, opts: AssignOpts) -> Result<String> {
     let path = match &ctx.path {
         Some(Ok(p)) => p.clone(),
         Some(Err(e)) => anyhow::bail!("no spend ledger: {e}"),
@@ -644,9 +675,45 @@ pub(crate) async fn spend_assign(provider: &dyn Provider, cfg: &Config, ctx: &Sp
     let pods = listing.pods();
     let bare = target.strip_prefix('@').unwrap_or(target);
     let names = vec![target.to_string(), bare.to_string(), arena_core::naming::canonical_name(naming.prefix, naming.list, target)];
+    let short = naming_short(&naming, bare);
+    if opts.dry_run {
+        let state = spend::observe(spend::load(&path).0, &listing, &pods, &naming, now);
+        let moves = spend::assign_moves(&state, &names, target, now).map_err(|e| anyhow::anyhow!(e))?;
+        let (_, what) = spend::assign(state.clone(), &names, target, owner, now).map_err(|e| anyhow::anyhow!(e))?;
+        let new = owner.unwrap_or(spend::NO_OWNER);
+        let mut out = match what {
+            spend::Assigned::Machine { name, provider, id, was } => {
+                format!("[dry-run] would set {name} ({provider} {id}): owner {} → {new}\n", was.as_deref().unwrap_or(spend::NO_OWNER))
+            }
+            spend::Assigned::Key { name, hash, was } => format!(
+                "[dry-run] would set AI key {} ({name}): owner {} → {new}\n",
+                &hash[..hash.len().min(12)],
+                was.as_deref().unwrap_or(spend::NO_OWNER)
+            ),
+        };
+        if let Some(m) = &moves {
+            if m.from.as_deref() != owner {
+                out.push_str(&format!("  its whole history goes with it: {}\n", m.words()));
+            }
+            if m.takes_from(owner) {
+                out.push_str(&format!("  refused without --force: {}\n", m.refusal(owner, &short)));
+            }
+        }
+        out.push_str("Dry-run only — nothing changed.\n");
+        return Ok(out);
+    }
     let mut outcome = None;
     let (state, warning) = spend::record(&path, now, |s| {
         let s = spend::observe(s, &listing, &pods, &naming, now);
+        // Spend under one person moved to another: refused unless --force (the listing is
+        // recorded all the same).
+        match spend::assign_moves(&s, &names, target, now) {
+            Ok(Some(m)) if m.takes_from(owner) && !opts.force => {
+                outcome = Some(Err(m.refusal(owner, &short)));
+                return s;
+            }
+            _ => {}
+        }
         match spend::assign(s.clone(), &names, target, owner, now) {
             Ok((next, what)) => {
                 outcome = Some(Ok(what));
@@ -829,7 +896,7 @@ mod tests {
         assert!(out.stdout.lines().nth(1).unwrap().starts_with("alice"), "{}", out.stdout);
         assert!(out.stdout.lines().nth(2).unwrap().starts_with("(no owner)") && out.stdout.contains("bravo"), "{}", out.stdout);
         assert_eq!(out.code, 0);
-        let said = spend_assign(&fake, &cfg, &ctx, "bravo", Some("bob"), unix_now()).await.unwrap();
+        let said = spend_assign(&fake, &cfg, &ctx, "bravo", Some("bob"), unix_now(), AssignOpts::default()).await.unwrap();
         assert!(said.contains("devtest-bravo") && said.contains("(no owner) → bob"), "{said}");
         let out = spend_report(&fake, &cfg, &ctx, None, &SpendFlags { csv: true, by_machine: true, ..Default::default() }, unix_now()).await.unwrap();
         assert!(out.stdout.starts_with("name,id,provider"), "{}", out.stdout);
@@ -837,7 +904,45 @@ mod tests {
         let json = spend_report(&fake, &cfg, &ctx, None, &SpendFlags { json: true, ..Default::default() }, unix_now()).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
         assert_eq!(v["owners"].as_array().unwrap().len(), 2);
-        assert!(spend_assign(&fake, &cfg, &ctx, "nope", Some("x"), unix_now()).await.is_err());
+        assert!(spend_assign(&fake, &cfg, &ctx, "nope", Some("x"), unix_now(), AssignOpts::default()).await.is_err());
+    }
+
+    /// `spend assign` on a machine that has run up spend under someone else would move its whole
+    /// history: `--dry-run` says so and writes nothing; without `--force` it's refused, saying what
+    /// moves and what to do instead; `--force` does it. An unowned machine, or the same owner, is
+    /// assigned as before.
+    #[tokio::test]
+    async fn assigning_a_machine_with_someone_elses_spend_is_refused_unless_forced() {
+        let d = tmp("assign-moves");
+        let cfg = cfg(&d.0);
+        let ctx = SpendCtx { api: Arc::new(spend::FakeSpendApi::default()), ..SpendCtx::from_config(&cfg) };
+        let fake = FakeProvider::default();
+        Tracked::new(&fake, &ctx, OwnerRule::Given("alice".into())).create_pod(&PodSpec { name: "devtest-alpha".into(), ..PodSpec::default() }).await.unwrap();
+        let later = unix_now() + 2 * 3_600;
+        let dry = AssignOpts { dry_run: true, force: false };
+        let said = spend_assign(&fake, &cfg, &ctx, "alpha", Some("bob"), later, dry).await.unwrap();
+        assert!(said.starts_with("[dry-run] would set devtest-alpha (hetzner 1001): owner alice → bob\n"), "{said}");
+        assert!(said.contains("  its whole history goes with it: 2.0 h, €0.020 since "), "{said}");
+        assert!(said.contains("  refused without --force: devtest-alpha (hetzner 1001) is alice's and has run up 2.0 h"), "{said}");
+        assert!(said.ends_with("Dry-run only — nothing changed.\n"), "{said}");
+        assert_eq!(spend::owner_of(&ctx.state(), "hetzner", "1001"), Some("alice"), "a dry run writes nothing");
+        let e = spend_assign(&fake, &cfg, &ctx, "alpha", Some("bob"), later, AssignOpts::default()).await.unwrap_err().to_string();
+        assert!(e.contains("is alice's and has run up 2.0 h, €0.020 since") && e.contains("would move all of that to bob"), "{e}");
+        assert!(e.contains("`arena pods backup alpha`, `arena pods terminate alpha --revoke-key`, then `arena pods up alpha --owner bob`"), "{e}");
+        assert!(e.contains("pass --force"), "{e}");
+        assert_eq!(spend::owner_of(&ctx.state(), "hetzner", "1001"), Some("alice"));
+        // The same owner moves nothing; --clear is a move too.
+        assert!(spend_assign(&fake, &cfg, &ctx, "alpha", Some("alice"), later, AssignOpts::default()).await.is_ok());
+        let e = spend_assign(&fake, &cfg, &ctx, "alpha", None, later, AssignOpts::default()).await.unwrap_err().to_string();
+        assert!(e.contains("would move all of that to (no owner)"), "{e}");
+        let said = spend_assign(&fake, &cfg, &ctx, "alpha", Some("bob"), later, AssignOpts { force: true, ..AssignOpts::default() }).await.unwrap();
+        assert!(said.contains("owner alice → bob"), "{said}");
+        assert_eq!(spend::owner_of(&ctx.state(), "hetzner", "1001"), Some("bob"));
+        // An unowned machine is what assign is for: no refusal, and the dry run says no moves.
+        Tracked::new(&fake, &ctx, OwnerRule::None).create_pod(&PodSpec { name: "devtest-bravo".into(), ..PodSpec::default() }).await.unwrap();
+        let said = spend_assign(&fake, &cfg, &ctx, "bravo", Some("carol"), later, dry).await.unwrap();
+        assert!(said.contains("owner (no owner) → carol") && !said.contains("refused"), "{said}");
+        assert!(spend_assign(&fake, &cfg, &ctx, "bravo", Some("carol"), later, AssignOpts::default()).await.is_ok());
     }
 
     #[tokio::test]
@@ -864,6 +969,7 @@ mod tests {
         assert!(plan[1].contains("would rotate devtest-alpha's OpenRouter key first: it was alice's"), "{plan:?}");
         let said = hand_over(&ctx, &cfg, Some(&api as &dyn KeyApi), &keys_dir, &h, "bob").await;
         assert!(said.lines[0].starts_with("✓ devtest-alpha: OpenRouter key handed over (alice → bob"), "{said:?}");
+        assert!(said.lines[0].ends_with(", cap $1.00)"), "the new key's cap (OPENROUTER_KEY_LIMIT): {said:?}");
         assert_eq!(api.deleted.lock().unwrap().as_slice(), std::slice::from_ref(&ck.hash));
         let csv = std::fs::read_to_string(keys_dir.join("openrouter_api_keys.csv")).unwrap();
         assert!(csv.contains("devtest-alpha,sk-or-v1-2"), "{csv}");
@@ -875,6 +981,34 @@ mod tests {
         let alice_row = out.stdout.lines().find(|l| l.starts_with("alice,")).unwrap_or_else(|| panic!("{}", out.stdout));
         assert!(alice_row.contains(",1.2500,"), "{alice_row}");
         assert!(out.stdout.lines().any(|l| l.starts_with("bob,alpha,1,")), "{}", out.stdout);
+    }
+
+    /// alice's key renamed on OpenRouter (a name is only a label there) is still the name's, found
+    /// by the CSV row's label: a handover to bob deletes it too — its spend recorded first, and kept
+    /// alice's — so it isn't left working beside bob's.
+    #[tokio::test]
+    async fn a_handover_deletes_the_names_key_renamed_on_openrouter() {
+        let d = tmp("handover-renamed");
+        let keys_dir = d.0.join("keys");
+        let cfg = cfg(&d.0);
+        let ctx = SpendCtx::from_config(&cfg);
+        let api = FakeKeys::default();
+        let ck = api.create_key("devtest-alpha", Some(1.0)).await.unwrap();
+        ctx.key_minted(&ck.hash, "devtest-alpha", Some("alice"));
+        crate::write_openrouter_key(&keys_dir, "devtest-alpha", &ck.secret, "devtest").unwrap();
+        {
+            let mut keys = api.keys.lock().unwrap();
+            keys[0].name = Some("alpha (alice's)".into());
+            keys[0].label = Some(format!("{}...{}", &ck.secret, &ck.secret[ck.secret.len() - 1..]));
+            keys[0].usage = Some(0.5);
+        }
+        let h = vec![Handover { name: "devtest-alpha".into(), from: "alice".into() }];
+        let said = hand_over(&ctx, &cfg, Some(&api as &dyn KeyApi), &keys_dir, &h, "bob").await;
+        assert!(said.lines[0].starts_with("✓ devtest-alpha: OpenRouter key handed over (alice → bob"), "{said:?}");
+        assert_eq!(api.deleted.lock().unwrap().as_slice(), std::slice::from_ref(&ck.hash), "the renamed key goes too");
+        let old = ctx.state().keys.iter().find(|k| k.hash == ck.hash).cloned().unwrap();
+        assert_eq!((old.owner.as_deref(), old.last_usage()), (Some("alice"), 0.5));
+        assert!(old.gone.is_some());
     }
 
     #[tokio::test]

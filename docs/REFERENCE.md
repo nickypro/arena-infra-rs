@@ -982,14 +982,17 @@ selection](#targeting--concurrency).
 
 #### `pods list`
 
-`list` shows NAME PROVIDER ID STATUS (`run locked` for a locked pod) GPU (`count×type`; a MIG slice
+`list` shows NAME, OWNER (who the machine instance is for — `--owner`, `spend assign` — read from
+the spend ledger per instance, empty for one with none; no column while no machine has an owner),
+PROVIDER ID STATUS (`run locked` for a locked pod) GPU (`count×type`; a MIG slice
 as the slice — `1×B300 MIG 34GB`, never the parent card nvidia-smi names, and `up`'s placement,
 READY and summary lines name it the same (the live catalog's name, else read off the id: `NVIDIA
 B300 SXM6 AC MIG 1g.34gb` → `B300 MIG 34GB`); RunPod's GPU is its display name on v1 and v2 alike,
 so `--json`'s `gpu_type` doesn't change with `RUNPOD_API`) $/H ENDPOINT (`no public endpoint (RunPod
 ssh proxy only)` for a pod up without a public IP) MAINT (the host's RunPod maintenance window, e.g.
 `maint 10-09 02:00→06:00 UTC`; the host's free-text note is flattened onto one line) and a footer
-`fleet: $X/h across N billing pod(s)` summing the **billing** pods (Hetzner's € shown separately,
+`fleet: $X/h across N billing pod(s)` summing the **billing** pods (Hetzner's € shown separately —
+first, `fleet: €0.030/h hetzner across 3 billing pod(s)`, when every priced pod is Hetzner —,
 unpriced pods counted; `— PARTIAL: vast didn't answer …` when a provider failed to list, and no "(no
 pods)" claim then). "Billing" is one rule (`status::is_billing`): running or on its way up — RunPod
 v2 `PROVISIONING`/`STARTING`/`ERROR` too, Hetzner `initializing`, Vast `loading` — not
@@ -1075,8 +1078,17 @@ refused) and the same come-back: settled endpoint, **setup again** (`--no-setup`
 
 #### `pods terminate`
 
-`terminate --all` tears down the **whole fleet** (confirms first; `--dry-run` lists every pod
-without touching them) — for end-of-program teardown (`terminate <name> --all` is refused).
+`terminate apple` terminates one machine, `terminate apple bloom ember` several. Each name is
+matched exactly as a single target is (no ranges or `all`; a name two pods share is refused —
+pass the id), and every one before anything is asked: a name that matches nothing stops them all.
+One machine confirms with `y`; several list themselves in one confirm that wants their count typed
+back (`3`), or `ALL` past five or for every listed pod, as the dashboard's marked set asks. A
+failure among several is said and the others still go; the exit fails after.
+
+`terminate --all` tears down the **whole fleet** (confirms first, `ALL` typed back; `--dry-run`
+lists every pod without touching them) — for end-of-program teardown (names with `--all` are
+refused). It takes every pod on the account, another fleet's and staff boxes included: name the
+machines instead when the account is shared.
 
 `terminate … --revoke-key` also deletes each terminated machine's OpenRouter key(s) (found by the
 name `keys gen` gave it, over the full paginated key listing; needs `OPENROUTER_PROVISIONING_KEY`)
@@ -1447,6 +1459,18 @@ proxy (one writer at a time) →
 provision it (`--no-setup` skips) → [`--check`: deep check] → copy its API keys (when
 `keys/*_api_keys.csv` exist) → [`--lock`: lock it] → `[name] READY after 4m10s — …` or `[name] FAILED <stage>: …`, printed
 the moment that pod is done — a slow pod never holds up another.
+
+**A name with no OpenRouter key gets one.** With `OPENROUTER_PROVISIONING_KEY` set (and setup
+running), `up` lists the keys once before the prompt: each cohort name with no key on OpenRouter
+gets one minted after the prompt and before its create (OpenRouter is read again then, with the
+keys folder held, so a key made meanwhile — `keys gen` elsewhere — is kept, never doubled) — capped at `OPENROUTER_KEY_LIMIT` (else
+$5), named as `keys gen` names it, the `--owner`'s in `arena spend` — so its keys stage copies it
+on. The plan says so (`will mint an OpenRouter key (cap $0.10, OPENROUTER_KEY_LIMIT) for …`) and
+each mint gets a `✓`/`✗` line. A name that has a key keeps it (a paused one too); one whose key is
+someone else's is handed over instead (below); a staff `@` box gets none, and is told. A mint that
+fails never fails the `up`: the machine comes up without a key, with the `keys gen` to run.
+`pods create` mints nothing (no keys stage). The same listing checks the keys CSV's rows before
+they're copied ([`copy-keys`](#pods-copy-keys)).
 
 One fleet listing per `--interval` serves every pod's endpoint wait.
 
@@ -1950,6 +1974,17 @@ Every reachable target also gets the **fleet's ssh**, keys or not: every machine
 (shared, deploy, admin) and the host map in `~/.ssh/config` (pods reach each other with their deploy
 key). So `copy-keys` is how machines that already exist come to let in a key added since — the admin
 key, say — staff boxes included; with no key file, token or archive, that is all it writes.
+
+**A dead key isn't copied.** With `OPENROUTER_PROVISIONING_KEY` set, each target's OpenRouter row
+in the keys CSV is checked against OpenRouter's listing first (one listing, within 20 s): a row
+whose name has no key on OpenRouter (deleted on openrouter.ai, or from another control box), or
+whose secret is none of that name's keys (each key's redacted label says so: rotated from another
+keys folder), is left out, with `⚠ devtest-apple: the keys CSV's OpenRouter key is gone from
+OpenRouter … arena keys gen apple --copy mints a fresh one` (`keys rotate` for a replaced one). A
+key renamed on OpenRouter is still the row's (its label says so), and is copied. The
+machine's other keys are still copied. When the listing can't be read, the CSV is copied as before
+and one line says it's unchecked. The same check runs wherever keys are copied: `up`'s keys stage,
+`setup`, `keys gen|rotate --copy` and `replace`.
 
 Targets / `--exclude` scope it to specific pods. Confirms first; `--dry-run` lists what would be set
 (values redacted; each pod's Claude Code account by name). `HF_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` and
@@ -2672,7 +2707,12 @@ under an hour's credit for them, over the spend limit, `underBalance` — never 
 `spend [--by owner|machine] [--since DATE] [--csv|--json]` — what each machine instance cost and
 who it was for, compute and AI, for the organisers (read-only towards the providers; it records
 what it read in the local ledger). `spend assign <machine|instance id|key hash> <owner>` (or
-`--clear`) sets or fixes an owner.
+`--clear`) sets or fixes an owner; `--dry-run` says what it would change and move. A row has one
+owner for its whole life, so assigning a machine that has run up spend under someone else would
+move all of it to the new person: that's refused, saying what would move and what to do instead
+(`pods backup`, `pods terminate --revoke-key`, `pods up --owner <new>`: a new instance, so each
+keeps their own). `--force` does it anyway, for an owner that was wrong from the start. A machine
+with no owner yet (a forgotten `--owner`) is assigned as always.
 
 **On the fleet you already run** — a project week included: it needs no fleet of its own. Give
 new machines an owner as you make them, existing ones afterwards, then ask:
@@ -2784,29 +2824,35 @@ stops a machine at a figure, and participants see none of it. In order (rehearse
 1. **Before the first machine.** `arena config check`: `OPENROUTER_KEY_LIMIT` is the cap every new
    key gets (a handover's too). `arena cron show`: the backup line copies homes (no `--no-pull`) —
    project work outside the course repo is only in the home copy.
-2. **Keys, then machines.** `arena keys gen apple bloom` mints each name's OpenRouter key (names
-   with no pod yet are fine); then `arena pods up apple --owner alice` (one owner per run;
-   `--provider hetzner` for a VM). `up` copies a name's key on as it sets the machine up, but
-   never mints one: a name without a key gets none until `arena keys gen <name> --copy`. A
-   machine that already exists: `arena spend assign <machine> <owner>` (it says when the machine's
-   key was someone else's; `arena keys rotate <machine> --copy` gives a fresh one).
-3. **Who's on what:** `arena spend --by machine` — `pods list` and the dashboard don't show owners.
+2. **Machines, with their keys.** `arena pods up apple --owner alice` (one owner per run;
+   `--provider hetzner` for a VM). With `OPENROUTER_PROVISIONING_KEY` set, `up` mints a key for a
+   name that has none (capped at `OPENROUTER_KEY_LIMIT`, alice's) and copies it on as it sets the
+   machine up; a name that already has a key keeps it. (`arena keys gen apple bloom` ahead still
+   works, names with no pod yet included.) A dead key in the keys CSV (deleted elsewhere) isn't
+   copied: the copy says so and names the `keys gen` to run. A machine that already exists:
+   `arena spend assign <machine> <owner>` (it says when the machine's key was someone else's;
+   `arena keys rotate <machine> --copy` gives a fresh one).
+3. **Who's on what:** `arena pods list` and the dashboard have an OWNER column (the detail view an
+   `owner:` line); `arena spend --by machine` has each instance's cost.
 4. **During the week:** `arena keys limit apple +5` (the dashboard: `a a`) raises a cap in place;
    `arena keys pause apple` / `resume`. `arena spend` any time.
 5. **A machine for someone else:** `arena pods terminate apple --revoke-key`, then `arena pods up
    apple --owner bob`. The old instance keeps alice's hours and AI spend and bob's starts at 0; a
-   key still alice's is rotated first (`--keep-key` keeps it). `spend assign` on a running machine
-   moves its whole instance, earlier hours included: for a new person, make a new instance.
+   key still alice's is rotated first (`--keep-key` keeps it). `spend assign apple bob` on a
+   machine that has run up alice's spend would move its whole history: it refuses, says what would
+   move and points here (`--dry-run` shows it first; `--force` only for an owner that was wrong
+   from the start).
 6. **A rename** (`arena pods rename apple cedar`) moves the machine to cedar's proxy port: its
    person connects as `<prefix>-cedar` from then on. Its spend, key and keys-CSV row follow.
 7. **Backups.** A machine's git backup needs its day branch (`arena pods init-branches`, or the
    morning's `set-branch main --all --init-branches`); the home copy runs on any branch. `arena
-   backups`, or `b` in the dashboard (Enter on a machine: back up now, copy home now).
+   backups`, or `b` in the dashboard (Enter on a machine: back up now, copy home now): the live
+   machines, and one line for the names with no machine.
 8. **End of the week.** There's no `--final`: `arena pods backup <names>` once more (git, then the
    home copy); `arena spend --since <first day> --csv > spend.csv` (`--by machine --csv` per
-   instance, `--json` the whole report); then `arena pods terminate <name> --revoke-key` per
-   machine — one at a time, since `--all` is every pod on the account — and `arena teardown
-   --check`.
+   instance, `--json` the whole report); then `arena pods terminate apple bloom … --revoke-key`
+   (one confirm: type their count, or `ALL` past five; never `--all`, which is every pod on the
+   account) and `arena teardown --check`.
 
 ### Running a second fleet from the same control box
 
@@ -3073,9 +3119,13 @@ several dashboards far from its limit); green under 60 ms, yellow under 120, red
 not timed yet or no answer. The detail pane's `where:` line has it beside where the pod runs
 (`EUR-IS-1`, `Czechia, CZ`, `nbg1 (Nuremberg, DE)`). Below 107 columns (or in the detail view's
 split) TEMP, RTT, MEM, BRANCH and DISK drop out in that order, so NAME/STATUS/GPU/$/H/HLTH/PROXY
-stay whole down to 69 columns; above it `💾` SAVED (from 112), AI$ (122, with an OpenRouter key), the
-GPU's `RTX ` (124), full names (130) and CPU%/RAM% (140) come in, each whole, then the graphs
-(`crates/tui/src/columns.rs` has the order).
+stay whole down to 69 columns; above it `💾` SAVED (from 112), AI$ (122, with an OpenRouter key),
+OWNER (131 with the AI$ column, 121 without — only while some machine has an owner; the detail
+view's `owner:` line has it whole), the GPU's `RTX ` (124), full names (130) and CPU%/RAM% (140)
+come in, each whole (OWNER, when shown, pushes the last three 9 columns on), then the graphs
+(`crates/tui/src/columns.rs` has the order). `💾` is the repo's last commit as a save on that
+machine: on a fresh box, whose checkout carries the course repo's last commit, it's `-` until the
+first backup.
 
 ### Fleet columns from the core snapshot
 
