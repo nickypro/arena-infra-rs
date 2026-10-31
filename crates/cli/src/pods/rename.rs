@@ -13,7 +13,7 @@ use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
 use crate::keys::{cohort_keys_file, cohort_keys_header, ensure_cohort_keys_file, machine_key_names, write_secret_file, KeyBook};
-use crate::proxy::sync_proxy;
+use crate::proxy::{sync_proxy, ProxySync};
 use crate::{confirm, reap};
 
 /// The one thing that can't follow a name, for the renamed pods that have it: a RunPod or Vast
@@ -77,7 +77,9 @@ pub(crate) async fn handle_rename(
         anyhow::bail!("refusing to rename anything:\n  {}", unsupported.join("\n  "));
     }
     let summary: Vec<String> = plan.iter().map(|r| format!("  {} → {} (id={})", r.old, r.new, r.id)).collect();
-    let steps = rename_followup_steps(prefix, &plan, &pods, book, skip_proxy);
+    let mut steps = rename_followup_steps(prefix, &plan, &pods, book, skip_proxy);
+    let ports = port_moves(cfg, &plan);
+    steps.extend(ports.iter().map(|moves| format!("     ports follow names: {moves} (its person connects as the new name once the proxy is synced)")));
     let what = format!("rename {} pod(s):\n{}\nthen:\n{}", plan.len(), summary.join("\n"), steps.join("\n"));
     if dry_run {
         println!("[dry-run] would {what}");
@@ -127,15 +129,56 @@ pub(crate) async fn handle_rename(
         }
         anyhow::bail!("{failure}");
     }
-    if skip_proxy {
+    let synced = if skip_proxy {
         println!("(proxy not synced — run `arena proxy apply`)");
+        false
     } else {
-        sync_proxy(cfg, provider, "rename").await;
+        matches!(sync_proxy(cfg, provider, "rename").await, ProxySync::Synced { .. })
+    };
+    if let Some(moves) = &ports {
+        println!("{}", port_note(moves, synced));
     }
     for line in rename_report(note.as_deref(), &missed, &key_warnings) {
         println!("{line}");
     }
     Ok(())
+}
+
+/// Where each renamed machine's proxy port goes (`devtest-echo :9504 → devtest-bravo :9501`). A
+/// port is its name's place in `MACHINE_NAME_LIST` (from `SSH_PROXY_STARTING_PORT`), so a new
+/// name is a new port, and once the proxy is synced whoever works on the machine connects as the
+/// new name: their old `Host` reaches no one (the 2026-10-31 rehearsal: `echo → bravo` said only
+/// "redeploy the proxy"). `None` without a proxy, or when no port moves — a prefix change keeps
+/// each short name's place, and a name that had no port gets no "from". Pure.
+pub(crate) fn port_moves(cfg: &Config, plan: &[PlannedRename]) -> Option<String> {
+    let proxy = arena_core::proxy::ProxyConfig::from_config(cfg).ok()?;
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    let port = |name: &str| {
+        let at = cfg.machine_names.iter().position(|e| arena_core::naming::qualify(prefix, e) == name)?;
+        u16::try_from(usize::from(proxy.starting_port) + at).ok()
+    };
+    let moves: Vec<String> = plan
+        .iter()
+        .filter_map(|r| match (port(&r.old), port(&r.new)) {
+            (Some(old), Some(new)) if old != new => Some(format!("{} :{old} → {} :{new}", r.old, r.new)),
+            _ => None,
+        })
+        .collect();
+    (!moves.is_empty()).then(|| moves.join(", "))
+}
+
+/// The line after a rename whose ports moved ([`port_moves`]): the person connects as the new name
+/// now — or, when the proxy wasn't synced (`--skip-proxy`, nothing to deploy to, a failed write),
+/// still through the old port until it is. Pure.
+pub(crate) fn port_note(moves: &str, synced: bool) -> String {
+    if synced {
+        format!("note: proxy ports follow names: {moves} — whoever is on it connects as the new name from now on (`arena ssh-config --proxy` has every name)")
+    } else {
+        format!(
+            "note: proxy ports follow names: {moves} — the proxy isn't synced yet, so the old port still forwards until \
+             `arena proxy apply` (or the cron's next sync); then whoever is on it connects as the new name"
+        )
+    }
 }
 
 /// The follow-up steps `rename` takes after the provider renames, for its dry run and
@@ -633,6 +676,35 @@ mod tests {
         // A single rename that failed changed nothing, so `proxy apply` is harmless there.
         let one = rename_failure_hint(&RenameRequest::One { old: "a".into(), new: "b".into() }, 0, 1);
         assert!(one.contains("or `arena proxy apply`"), "{one}");
+    }
+
+    /// A rename to another list name moves the machine's proxy port, and says so; a prefix
+    /// change (same short name, same place) and a config without a proxy say nothing.
+    #[test]
+    fn a_rename_says_where_the_proxy_port_goes() {
+        use super::{port_moves, port_note, PlannedRename};
+        let cfg = |extra: &str| {
+            arena_core::Config::parse(&format!(
+                "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(alpha bravo charlie @staff echo)\nSSH_PROXY_STARTING_PORT=9500\n{extra}"
+            ))
+        };
+        let mv = |old: &str, new: &str| PlannedRename { id: "1".into(), old: old.into(), new: new.into() };
+        let proxied = cfg("SSH_PROXY_HOST=proxy.example.com\n");
+        let moves = port_moves(&proxied, &[mv("devtest-echo", "devtest-bravo")]);
+        assert_eq!(moves.as_deref(), Some("devtest-echo :9504 → devtest-bravo :9501"));
+        // Synced: connect as the new name now. Not synced (--skip-proxy, a failed write): the old
+        // port still forwards until it is.
+        let now = port_note(moves.as_deref().unwrap(), true);
+        assert!(now.ends_with(":9501 — whoever is on it connects as the new name from now on (`arena ssh-config --proxy` has every name)"), "{now}");
+        let later = port_note(moves.as_deref().unwrap(), false);
+        assert!(later.contains("the old port still forwards until `arena proxy apply`") && !later.contains("from now on"), "{later}");
+        // Two at once; one with no port before (off the list) is left out.
+        let both = port_moves(&proxied, &[mv("devtest-alpha", "devtest-charlie"), mv("devtest-zulu", "devtest-bravo"), mv("devtest-bravo", "staff")]);
+        assert_eq!(both.as_deref(), Some("devtest-alpha :9500 → devtest-charlie :9502, devtest-bravo :9501 → staff :9503"));
+        // A prefix change: the old names aren't this prefix's, so nothing moves that the note could name.
+        assert_eq!(port_moves(&proxied, &[mv("arena8-alpha", "devtest-alpha")]), None);
+        // No proxy: no ports.
+        assert_eq!(port_moves(&cfg(""), &[mv("devtest-echo", "devtest-bravo")]), None);
     }
 
     #[test]
