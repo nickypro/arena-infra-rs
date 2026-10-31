@@ -446,8 +446,17 @@ async fn handle_pods_bal(
             pin_vm_image(provider.name(), cfg, &mut spec).await?;
             check_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]))?;
             let keys = up_keys_stage(cfg, KEYS_DIR, !no_setup);
-            let per_pod =
-                up::pipeline_text(!no_setup, check.then_some(check_attempts), keys.is_some(), lock, (endpoint_mins, check_attempts));
+            // Each pod's own Claude Code account, after setup — when there's a pool.
+            let claude_line = if no_setup { Ok(None) } else { crate::claude::plan_line(cfg, None) };
+            let claude = matches!(claude_line, Ok(Some(_)));
+            let per_pod = up::pipeline_text(
+                !no_setup,
+                check.then_some(check_attempts),
+                keys.is_some(),
+                claude,
+                lock,
+                (endpoint_mins, check_attempts),
+            );
             if dry_run {
                 match &options {
                     Some(plan) => print_placement_preview(provider, plan, &spec, &names),
@@ -478,7 +487,7 @@ async fn handle_pods_bal(
                 None
             } else {
                 let (scfg, tokens) =
-                    setup_config(cfg, None, None, false, false).context("provisioning settings (or pass --no-setup)")?;
+                    setup_config(cfg, None, false, false).context("provisioning settings (or pass --no-setup)")?;
                 let hetzner_script = stage_hetzner_script(arena_core::setup::is_bare_vm(provider.name()))?;
                 Some((up::SetupStage { scfg, timeouts: setup_timeouts, hetzner_script }, tokens))
             };
@@ -562,6 +571,11 @@ async fn handle_pods_bal(
                 ),
                 None => {}
             }
+            match &claude_line {
+                Ok(Some(line)) => println!("{line}"),
+                Ok(None) => {}
+                Err(e) => println!("Claude Code: ✗ {e} — skipped (fix it, then `arena claude push`)"),
+            }
             let run = up::UpRun {
                 provider,
                 remote: remote.clone(),
@@ -579,6 +593,7 @@ async fn handle_pods_bal(
                     cmd: arena_core::health::deep_check_command(Some(cfg.get("CONDA_ENV").unwrap_or("arena-env"))),
                 }),
                 keys,
+                claude,
                 lock,
                 retry_bad_hosts,
                 balance: Some(bal),

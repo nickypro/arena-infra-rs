@@ -1278,6 +1278,9 @@ pub enum Action {
     Start,
     /// `pods rename <pod> <new>` (the operator types the new name first).
     Rename,
+    /// `claude assign <pod> <account>`: move it to another Claude Code account — a number or email
+    /// from `arena claude accounts`, `none`, or `spread` (typed first) — and push that token.
+    Claude,
     /// `pods jobs`: its background jobs (read-only).
     Jobs,
     /// `pods logs`: its newest job's log (read-only).
@@ -1307,6 +1310,7 @@ impl Action {
         ('x', Action::Run),
         ('g', Action::SetBranch),
         ('m', Action::Rename),
+        ('c', Action::Claude),
         ('b', Action::Backup),
         ('p', Action::Setup),
         ('u', Action::Start),
@@ -1351,7 +1355,7 @@ impl Action {
 
     /// One of the CLI's commands, run as `arena` (`runs.rs`).
     pub fn cli(&self) -> bool {
-        matches!(self, Action::Start | Action::Rename | Action::Jobs | Action::Logs | Action::Pull) || self.ai_key()
+        matches!(self, Action::Start | Action::Rename | Action::Claude | Action::Jobs | Action::Logs | Action::Pull) || self.ai_key()
     }
 
     /// One of the AI key's (`arena keys …`).
@@ -1399,6 +1403,7 @@ impl Action {
             Action::SetBranch => "switch branch",
             Action::Start => "start a stopped pod (+ setup)",
             Action::Rename => "rename (no restart)",
+            Action::Claude => "Claude Code: move it to another account",
             Action::Jobs => "its background jobs (read-only)",
             Action::Logs => "its newest job's log (read-only)",
             Action::Pull => "copy its home here (rsync)",
@@ -1421,6 +1426,7 @@ impl Action {
             Action::SetBranch => "set-branch",
             Action::Start => "start",
             Action::Rename => "rename",
+            Action::Claude => "claude",
             Action::Jobs => "jobs",
             Action::Logs => "logs",
             Action::Pull => "pull",
@@ -1445,6 +1451,7 @@ impl Action {
             Action::SetBranch => "switching the branch on",
             Action::Start => "starting",
             Action::Rename => "renaming",
+            Action::Claude => "moving the Claude Code account of",
             Action::Jobs => "reading the jobs on",
             Action::Logs => "reading the log on",
             Action::Pull => "copying the home of",
@@ -1462,6 +1469,7 @@ impl Action {
             Action::KeyPause => "keys pause".into(),
             Action::KeyResume => "keys resume".into(),
             Action::KeyRotate => "keys rotate".into(),
+            Action::Claude => "claude assign".into(),
             a => format!("pods {}", a.label()),
         }
     }
@@ -1514,6 +1522,7 @@ impl Action {
             ),
             Action::Start => Some("it bills again once it's up; a RunPod/Vast pod comes back as a fresh image, and is set up again."),
             Action::KeyPause => Some("its AI calls fail until the key is resumed (this menu's `o` again, or `arena keys resume`)."),
+            Action::Claude => Some("shells already open on it keep the old token until they start again."),
             Action::KeyRotate => Some(
                 "⚠ the old key stops working at once. The new one starts at no spend under the default cap, is saved in \
                  ./keys (where the dashboard was started) and copied onto the pod; shells already open keep the old \
@@ -1526,7 +1535,7 @@ impl Action {
     /// Actions that need a free-text argument typed first (the command / the branch),
     /// collected in an input modal before they run.
     pub fn needs_input(&self) -> bool {
-        matches!(self, Action::Run | Action::SetBranch | Action::Rename | Action::KeyLimit)
+        matches!(self, Action::Run | Action::SetBranch | Action::Rename | Action::Claude | Action::KeyLimit)
     }
 
     /// What the action does, in words an operator reads at a glance — the confirm's summary,
@@ -1552,6 +1561,14 @@ impl Action {
                 Some(n) => format!("rename to {n} (`arena pods rename`: ~/.name, the proxy, its AI key)"),
                 None => "rename (`arena pods rename`)".into(),
             },
+            Action::Claude => match arg {
+                Some(a) if a.eq_ignore_ascii_case("spread") => {
+                    "put it on the least-loaded Claude Code account and push that token (`arena claude assign --spread`)".into()
+                }
+                Some(a) if a.eq_ignore_ascii_case("none") => "take its Claude Code token off (`arena claude assign … none`)".into(),
+                Some(a) => format!("put it on Claude Code account {a} and push that token (`arena claude assign`)"),
+                None => "move it to another Claude Code account (`arena claude assign`)".into(),
+            },
             Action::Jobs => "list its background jobs (read-only)".into(),
             Action::Logs => "show its newest job's log (read-only)".into(),
             Action::Pull => "copy its home into LOCAL_BACKUP_DIR now (`arena pods pull`: today's snapshot and the all-files tier)".into(),
@@ -1571,6 +1588,7 @@ impl Action {
             Action::Run => "shell command to run on the pod(s):",
             Action::SetBranch => "branch to switch to (fetch + checkout + fast-forward):",
             Action::Rename => "new name — a free MACHINE_NAME_LIST name (bare names get the prefix):",
+            Action::Claude => "Claude Code account — its number or email (`arena claude accounts`), none, or spread:",
             Action::KeyLimit => "the cap in USD — `10` sets it, `+5` raises it by $5:",
             _ => "",
         }
@@ -2232,6 +2250,7 @@ mod tests {
             (Action::Terminate, None, "tuiprobe: terminate (delete)"),
             (Action::Start, None, "tuiprobe: start it again (`arena pods start`: waits for it, sets it up, syncs the proxy)"),
             (Action::Rename, Some("bravo"), "tuiprobe: rename to bravo (`arena pods rename`: ~/.name, the proxy, its AI key)"),
+            (Action::Claude, Some("2"), "tuiprobe: put it on Claude Code account 2 and push that token (`arena claude assign`)"),
             (Action::Jobs, None, "tuiprobe: list its background jobs (read-only)"),
             (Action::Logs, None, "tuiprobe: show its newest job's log (read-only)"),
             (Action::KeyLimit, Some("+5"), "tuiprobe: set its AI key's cap: +5 (`arena keys limit`)"),
@@ -2260,8 +2279,8 @@ mod tests {
     #[test]
     fn menu_keys_map_to_actions_and_the_ai_rows_come_with_a_provisioning_key() {
         let keys = |m: &[(char, Action)]| m.iter().map(|(k, _)| *k).collect::<String>();
-        assert_eq!(keys(&Action::pod_menu(false)), "ewlxgmbpurst");
-        assert_eq!(keys(&Action::pod_menu(true)), "ewlxgmaonbpurst");
+        assert_eq!(keys(&Action::pod_menu(false)), "ewlxgmcbpurst");
+        assert_eq!(keys(&Action::pod_menu(true)), "ewlxgmcaonbpurst");
         assert_eq!(keys(&Action::fleet_menu(true, false)), "exgbprst");
         assert_eq!(keys(&Action::fleet_menu(true, true)), "exgaoObprst");
         assert_eq!(keys(&Action::fleet_menu(false, true)), "exgbp", "the whole fleet (`A`): never the AI key's rows");

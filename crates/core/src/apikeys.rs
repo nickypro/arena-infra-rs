@@ -30,12 +30,10 @@ pub const PROVIDERS: &[(&str, &str, &[&str])] = &[
 /// Tokens broadcast identically to *every* pod (same value everywhere), as
 /// `(config key, display name, &[env var names to export])`. The value comes from the
 /// config key (or a CLI override); each listed env var is set to it. Hugging Face sets
-/// two names (`transformers`/`hub` read `HF_TOKEN`, older code `HUGGING_FACE_HUB_TOKEN`);
-/// Claude Code reads `CLAUDE_CODE_OAUTH_TOKEN`.
-pub const BROADCAST_TOKENS: &[(&str, &str, &[&str])] = &[
-    ("HF_TOKEN", "Hugging Face", &["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]),
-    ("CLAUDE_CODE_OAUTH_TOKEN", "Claude Code", &["CLAUDE_CODE_OAUTH_TOKEN"]),
-];
+/// two names (`transformers`/`hub` read `HF_TOKEN`, older code `HUGGING_FACE_HUB_TOKEN`).
+/// Claude Code's token isn't one any more: each machine gets its own account's
+/// ([`crate::claude`]), which a broadcast appended after it would override.
+pub const BROADCAST_TOKENS: &[(&str, &str, &[&str])] = &[("HF_TOKEN", "Hugging Face", &["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"])];
 
 /// Build the `(env name, value)` exports for every [`BROADCAST_TOKENS`] entry that
 /// `lookup(config_key)` returns a non-empty value for. `lookup` is where the value comes
@@ -213,19 +211,19 @@ arena8-bloom,sk-ccc,extra-ignored-no
 
     #[test]
     fn broadcast_builds_exports_for_present_tokens_only() {
-        // Only HF set -> both HF env names, no Claude Code.
+        // HF set -> both HF env names.
         let vars = broadcast_env_vars(|k| (k == "HF_TOKEN").then(|| "hf_secret".to_string()));
         assert_eq!(vars.len(), 2);
         assert!(vars.contains(&("HF_TOKEN".into(), "hf_secret".into())));
         assert!(vars.contains(&("HUGGING_FACE_HUB_TOKEN".into(), "hf_secret".into())));
-        // Both set -> includes the Claude Code token too.
+        // A Claude Code token is never broadcast: each machine gets its own account's (`claude`).
         let both = broadcast_env_vars(|k| match k {
             "HF_TOKEN" => Some("h".to_string()),
             "CLAUDE_CODE_OAUTH_TOKEN" => Some("cc".to_string()),
             _ => None,
         });
-        assert!(both.contains(&("CLAUDE_CODE_OAUTH_TOKEN".into(), "cc".into())));
-        assert_eq!(both.len(), 3);
+        assert!(!both.iter().any(|(n, _)| n == "CLAUDE_CODE_OAUTH_TOKEN"));
+        assert_eq!(both.len(), 2);
         // Nothing set -> empty.
         assert!(broadcast_env_vars(|_| None).is_empty());
     }

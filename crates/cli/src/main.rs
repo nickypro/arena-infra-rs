@@ -27,6 +27,7 @@ use arena_core::PodSpec;
 mod admin_key_tests;
 mod archive;
 mod backups;
+mod claude;
 mod disk;
 mod image;
 mod ask;
@@ -419,6 +420,7 @@ async fn run() -> Result<()> {
             handle_snapshot(provider.unwrap().as_ref(), &cfg, json, public, out.as_deref(), reach).await
         }
         Cmd::Keys(k) => handle_keys(k, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
+        Cmd::Claude(c) => claude::handle_claude(c, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Teardown { check, json } => teardown::handle_teardown(provider.unwrap().as_ref(), &cfg, check, json).await,
         Cmd::Balance { cmd, json, check, no_live, verbose } => {
             let bal = money::BalanceCtx::from_config(&cfg);

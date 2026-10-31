@@ -128,7 +128,8 @@ const SETTABLE_KEYS: &[(&str, bool)] = &[
     ("HETZNER_API_KEY", true),
     ("SHADEFORM_API_KEY", true), // opt-in overflow GPU VMs (`--provider shadeform`)
     ("HF_TOKEN", true), // broadcast to pods for gated repos (Llama 3 …)
-    ("CLAUDE_CODE_OAUTH_TOKEN", true), // broadcast to pods for Claude Code access
+    ("CLAUDE_TOKENS_FILE", false), // Claude Code accounts, one per machine (`arena claude`)
+    ("CLAUDE_CODE_OAUTH_TOKEN", true), // one Claude Code account for every pod (without CLAUDE_TOKENS_FILE)
     ("OPENROUTER_PROVISIONING_KEY", true), // mints per-machine OpenRouter keys (`arena keys`)
     ("OPENROUTER_WORKSPACE", false), // the OpenRouter workspace arena's keys live in (id or slug)
     ("ARENA_START_DATE", false),
@@ -971,9 +972,11 @@ pub(crate) fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<S
         note_invalid_text(&mut missing, &e);
     }
 
+    println!("\nClaude Code accounts (optional, `arena claude`):");
+    crate::claude::config_check_rows(cfg, &mut missing).iter().for_each(|l| println!("{l}"));
+
     println!("\nEvals / model access (optional, `pods copy-keys` / `arena keys`):");
     cfg_row(&mut out, cfg, &mut missing, "HF_TOKEN", false, true); // broadcast for gated repos (Llama 3 …)
-    cfg_row(&mut out, cfg, &mut missing, "CLAUDE_CODE_OAUTH_TOKEN", false, true); // broadcast for Claude Code
     cfg_row(&mut out, cfg, &mut missing, "OPENROUTER_PROVISIONING_KEY", false, true); // mints runtime keys
     // The workspace every key call is scoped to: a value that's neither an id nor a slug
     // would fail each call, so it's a ✗ here.
