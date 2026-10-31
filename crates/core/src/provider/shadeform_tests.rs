@@ -318,13 +318,17 @@ fn build_and_build_fleet_validate_shadeform() {
 async fn trait_answers() {
     let p = provider("http://127.0.0.1:9", client());
     let pod = Pod { provider: "shadeform".into(), ..Pod::default() };
-    for e in [p.stop_support(&pod).unwrap_err(), p.stop_pod(ID).await.unwrap_err(), p.start_pod(ID).await.unwrap_err()] {
+    use crate::capability::Op;
+    let up_front = p.supports(Op::Stop, Some(&pod)).refusal().unwrap();
+    assert!(up_front.contains("bills until it's deleted") && up_front.contains("arena pods terminate"), "{up_front}");
+    assert!(!p.supports(Op::Start, Some(&pod)).works());
+    for e in [p.stop_pod(ID).await.unwrap_err(), p.start_pod(ID).await.unwrap_err()] {
         assert!(matches!(e, Error::NotImplemented(_)), "{e}");
         assert!(e.to_string().contains("bills until it's deleted") && e.to_string().contains("arena pods terminate"), "{e}");
     }
     assert_eq!(p.ready_deadline(&pod), Some(Duration::from_secs(15 * 60)));
     assert!(p.restart_wipes_container_disk(&pod));
-    assert!(p.lock_support(&pod).is_err());
+    assert!(!p.supports(Op::Lock, Some(&pod)).works());
     assert!(p.authorize_ssh_keys(&pod, &[]).await.is_err());
     let d = p.describe(&spec("NVIDIA RTX A6000", 1));
     assert!(
@@ -661,7 +665,7 @@ async fn the_fleet_routes_shadeform_pods_to_shadeform() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].0, "shadeform");
     let pod = listed[0].1.as_ref().unwrap()[0].clone();
-    assert!(fleet.stop_support(&pod).is_err());
+    assert!(!fleet.supports(crate::capability::Op::Stop, Some(&pod)).works());
     assert_eq!(fleet.ready_deadline(&pod), Some(Duration::from_secs(900)));
     fleet.terminate_pod_on("shadeform", ID).await.unwrap();
     assert!(fleet.terminate_pod_on("vast", ID).await.is_err());

@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use crate::apiextra::{Extra, SOURCES};
 use crate::config::Config;
 use crate::error::{Error, ProviderErrorKind as ErrorKind, Result};
+use crate::capability::{Backend, Op, Support};
 use crate::pod::{Pod, PodSpec};
 
 pub mod hetzner;
@@ -246,6 +247,25 @@ pub trait Provider: Send + Sync {
     /// GPU fields it ignores), so the dry-run never misrepresents a create.
     fn describe(&self, spec: &PodSpec) -> String;
 
+    /// Which column of the capability table ([`crate::capability`]) this backend is. Each of
+    /// arena's backends says; `None` (the default) is one the table doesn't know — a test's
+    /// fake — for which [`Self::supports`] says yes to everything: it may try anything, and
+    /// what it doesn't implement fails as it always did.
+    fn backend(&self) -> Option<Backend> {
+        None
+    }
+
+    /// Pure, no request. Whether `op` works on `pod` — or, with `None`, on a pod this provider
+    /// would create (a create flag, `up --lock`) — and if not, why and what to do instead: the
+    /// capability table's cell for the backend that owns the pod ([`crate::capability`]). Every
+    /// command asks it about each pod before it asks the operator anything, and the dashboard
+    /// offers only what it allows: one answer, from one table, for both. Backends don't
+    /// override it (the table is theirs); the fleet provider routes the question to the pod's
+    /// backend.
+    fn supports(&self, op: Op, _pod: Option<&Pod>) -> Support {
+        self.backend().map_or(Support::Yes, |b| crate::capability::support(b, op))
+    }
+
     /// Read-only. Safe to call freely.
     async fn list_pods(&self) -> Result<Vec<Pod>>;
 
@@ -331,15 +351,6 @@ pub trait Provider: Send + Sync {
         }
     }
 
-    /// Whether `pod`'s backend can stop it (and start it again) at all; `Err` says why not, in
-    /// the operator's words. Pure: `pods stop`/`start` refuse a selection with such a pod up
-    /// front, before any gate or prompt — a `--wipe-ok` gate would only mislead about a pod
-    /// that can't be stopped. Default: it can (RunPod, Vast, Hetzner). Shadeform has no stop:
-    /// an instance bills until it's deleted.
-    fn stop_support(&self, _pod: &Pod) -> Result<()> {
-        Ok(())
-    }
-
     /// How long a pod this backend just created may take to come up — listed with an SSH
     /// endpoint — before `pods up` counts it as a failed placement: terminated (it bills, and
     /// nothing is on it yet) and the name tried again on the next option. `None` (the default):
@@ -360,7 +371,7 @@ pub trait Provider: Send + Sync {
     /// left it stopped). Default: unsupported, so a backend that can't start is said, never
     /// silently restarted instead.
     async fn start_pod(&self, _id: &str) -> Result<()> {
-        Err(Error::NotImplemented(format!("starting a stopped pod isn't supported on provider `{}`", self.name())))
+        Err(unsupported(self, Op::Start))
     }
 
     /// Mutating and irreversible.
@@ -385,30 +396,18 @@ pub trait Provider: Send + Sync {
     /// parking the old one under `<name>-old`. The pod's identity/disk/endpoint are
     /// untouched — only the name changes.
     ///
-    /// Default: unsupported ([`Self::rename_support`] says so up front). A provider whose
-    /// API can't rename a live pod inherits this, and `replace` refuses up front rather than
-    /// half-running the swap.
+    /// Default: unsupported ([`Self::supports`] says so up front, from the capability table).
+    /// A provider whose API can't rename a live pod inherits this, and `pods rename` and
+    /// `replace` refuse up front rather than half-running the swap.
     async fn rename_pod(&self, _id: &str, _new_name: &str) -> Result<()> {
-        Err(rename_unsupported(self.name()))
-    }
-
-    /// Whether `pod`'s backend can rename it in place ([`Self::rename_pod`]); `Err` says why
-    /// not, in the operator's words. Pure: `pods rename` refuses such a pod before anything is
-    /// asked, and the dashboard offers rename only where this holds — one answer, from the
-    /// backend, for both. Takes the pod so the fleet provider can route the question to the
-    /// pod's backend. Default: unsupported, with [`Self::rename_pod`]'s own words.
-    fn rename_support(&self, _pod: &Pod) -> Result<()> {
-        Err(rename_unsupported(self.name()))
+        Err(unsupported(self, Op::Rename))
     }
 
     /// DESTRUCTIVE. Swap a pod's image and replace its env in place (same host, same id).
     /// The container is reset, so its disk is wiped — callers must confirm first.
     /// Default: unsupported.
     async fn reimage_pod(&self, _id: &str, _image: &str, _env: &[(String, String)]) -> Result<()> {
-        Err(Error::NotImplemented(format!(
-            "reimage not supported on provider `{}`",
-            self.name()
-        )))
+        Err(unsupported(self, Op::Reimage))
     }
 
     /// Mutating, idempotent. Authorize `keys` (OpenSSH public keys, one per entry) for SSH on
@@ -419,26 +418,14 @@ pub trait Provider: Send + Sync {
     /// Default: unsupported. RunPod and Hetzner authorize keys only at create (`PUBLIC_KEY`,
     /// the project key), so for them a refused key stays a setup failure for the operator.
     async fn authorize_ssh_keys(&self, _pod: &Pod, _keys: &[String]) -> Result<()> {
-        Err(Error::NotImplemented(format!(
-            "re-authorizing SSH keys isn't supported on provider `{}`",
-            self.name()
-        )))
-    }
-
-    /// Whether `pod`'s backend can lock and unlock it ([`Self::set_locked`]); `Err` says why
-    /// not, in the operator's words. Pure: `pods lock`/`unlock` sort a selection with it
-    /// before anything is asked, and `up --lock` checks its create target before creating.
-    /// Takes the pod so the fleet provider can route the question to the pod's backend.
-    /// Default: unsupported — RunPod REST v2 is the only API here with a pod lock.
-    fn lock_support(&self, _pod: &Pod) -> Result<()> {
-        Err(lock_unsupported(self.name()))
+        Err(unsupported(self, Op::KeyRepair))
     }
 
     /// Mutating, idempotent. Lock (`true`) or unlock a pod in place. A locked pod refuses
     /// stop, restart and terminate — from any client, the provider's console included (see
     /// [`crate::lock`]); nothing else about it changes. Default: unsupported.
     async fn set_locked(&self, _id: &str, _locked: bool) -> Result<()> {
-        Err(lock_unsupported(self.name()))
+        Err(unsupported(self, Op::Lock))
     }
 
     /// Pure. Check `--api-json` / `CREATE_EXTRA_JSON` against this backend's create request
@@ -462,25 +449,20 @@ pub trait Provider: Send + Sync {
     /// to fill; fields the provider can't recover are left at their spec defaults (the
     /// caller layers config + CLI overrides on top). Default: unsupported.
     async fn pod_spec(&self, _id: &str) -> Result<PodSpec> {
-        Err(Error::NotImplemented(format!(
-            "spec snapshot not supported on provider `{}`",
-            self.name()
-        )))
+        Err(Error::NotImplemented(format!("reading a pod's spec back isn't supported on provider `{}`", self.name())))
     }
 }
 
-/// Why a backend can't rename a pod (the [`Provider::rename_support`] and
-/// [`Provider::rename_pod`] default).
-pub(crate) fn rename_unsupported(provider: &str) -> Error {
-    Error::NotImplemented(format!("rename not supported on provider `{provider}`"))
-}
-
-/// Why a backend can't lock a pod (the [`Provider::lock_support`] default). RunPod pods can
-/// be locked only through REST v2 (the default); on v1 the RunPod backend says so itself.
-pub(crate) fn lock_unsupported(provider: &str) -> Error {
-    Error::NotImplemented(format!(
-        "not supported on {provider} — only RunPod pods can be locked (on RunPod REST v2, the default)"
-    ))
+/// The `NotImplemented` a provider call `op` is made of fails with where the backend has none:
+/// the capability table's refusal for it ([`Provider::supports`]) — the sentence a command would
+/// have refused with up front — else (a backend the table doesn't know) a plain one.
+pub(crate) fn unsupported<P: Provider + ?Sized>(provider: &P, op: Op) -> Error {
+    Error::NotImplemented(
+        provider
+            .supports(op, None)
+            .refusal()
+            .unwrap_or_else(|| format!("{} isn't supported on provider `{}`", op.what(), provider.name())),
+    )
 }
 
 #[cfg(test)]
@@ -511,24 +493,27 @@ mod tests {
     }
 
     /// Locking is RunPod v2's alone (the default: an empty `RUNPOD_API` locks too); every other
-    /// backend says why not, before any request — v1 by saying how to get back to v2.
-    #[test]
-    fn only_runpod_v2_can_lock() {
+    /// backend says why not, before any request — v1 by saying how to get back to v2 — and its
+    /// `set_locked` fails with the same sentence.
+    #[tokio::test]
+    async fn only_runpod_v2_can_lock() {
         let keys = "RUNPOD_API_KEY=k\nVAST_API_KEY=v\nHETZNER_API_KEY=h\n";
         for (name, api, ok, why) in [
             ("runpod", "v2", true, ""),
             ("runpod", "", true, ""),
             ("runpod", "v1", false, RUNPOD_V1_REMEDY),
-            ("vast", "v1", false, "not supported on vast"),
-            ("hetzner", "v2", false, "not supported on hetzner"),
+            ("vast", "v1", false, "Vast can't lock"),
+            ("hetzner", "v2", false, "can't lock a Hetzner VM"),
         ] {
             let p = build(name, &Config::parse(&format!("{keys}RUNPOD_API={api}"))).unwrap();
             let pod = Pod { provider: name.into(), ..Default::default() };
-            match p.lock_support(&pod) {
-                Ok(()) => assert!(ok, "{name} {api}"),
-                Err(e) => {
+            match p.supports(Op::Lock, Some(&pod)).refusal() {
+                None => assert!(ok, "{name} {api}"),
+                Some(e) => {
                     assert!(!ok, "{name} {api}");
-                    assert!(e.to_string().contains(why), "{name} {api}: {e}");
+                    assert!(e.contains(why), "{name} {api}: {e}");
+                    let call = p.set_locked("1", true).await.unwrap_err();
+                    assert_eq!(call.to_string(), format!("not implemented: {e}"), "{name} {api}");
                 }
             }
         }
@@ -543,7 +528,7 @@ mod tests {
         for (name, api) in [("runpod", "v2"), ("runpod", "v1"), ("vast", "v2"), ("hetzner", "v2"), ("shadeform", "v2")] {
             let p = build(name, &Config::parse(&format!("{keys}RUNPOD_API={api}"))).unwrap();
             let pod = Pod { provider: name.into(), ..Default::default() };
-            assert!(p.rename_support(&pod).is_ok(), "{name} {api}");
+            assert!(p.supports(Op::Rename, Some(&pod)).works(), "{name} {api}");
         }
     }
 
@@ -751,7 +736,7 @@ mod tests {
             assert!(p.describe(&spec()).contains("RunPod API v2"), "{text:?}: {}", p.describe(&spec()));
             let body = p.preview_create_body(&floor).unwrap_or_else(|e| panic!("{text:?}: {e}"));
             assert_eq!(body["gpu"]["minCudaVersion"], "13.1", "{text:?}: a real floor");
-            assert!(p.lock_support(&Pod { provider: "runpod".into(), ..Default::default() }).is_ok(), "{text:?}");
+            assert!(p.supports(Op::Lock, Some(&Pod { provider: "runpod".into(), ..Default::default() })).works(), "{text:?}");
             assert!(build_fleet("runpod", &cfg, false).is_ok(), "{text:?}");
         }
         for text in ["RUNPOD_API_KEY=k\nRUNPOD_API=v1", "RUNPOD_API_KEY=k\nRUNPOD_API=\"V1\""] {

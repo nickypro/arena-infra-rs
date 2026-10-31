@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arena_core::capability::Op;
 use arena_core::provider::Provider;
 use arena_core::remote::{Remote, PROBE_TIMEOUT};
 use arena_core::spare::SpareCloud;
@@ -14,7 +15,8 @@ use arena_core::{Config, PodSpec};
 use crate::cli::PlaceFlags;
 use crate::keys::{handle_copy_keys, KeySources, KEYS_DIR};
 use crate::pods::adopt::{self, Source};
-use crate::pods::create::{apply_spec_overrides, check_create_body, create_extra, SpecOverrides};
+use crate::pods::capable::CreateFlags;
+use crate::pods::create::{apply_spec_overrides, check_create_body, create_extra, sizing_flags, SpecOverrides};
 use crate::pods::home_copy::{copy_pod_files, pod_guard, remove_staging_for, verify_replacement, CopyOpts};
 use crate::pods::lifecycle::proxied_name;
 use crate::pods::list::ENRICH_TIMEOUT;
@@ -117,17 +119,15 @@ async fn build_replacement_spec(
     Ok((spec, notes))
 }
 
-/// `--server-type` on `replace` / `migrate copy`: Hetzner server types, in the order to try
-/// them (`cx43,cx53`: a cx53 only when no location has room for a cx43). Refused for a pod on
-/// any other provider — a GPU pod is sized by `--gpu` — and when a name isn't a type name.
-/// Pure.
+/// `--server-type` on `replace` / `migrate copy` / `spare up`: Hetzner server types, in the
+/// order to try them (`cx43,cx53`: a cx53 only when no location has room for a cx43). Refused
+/// for a pod on a provider the capability table says doesn't take it (every one but Hetzner —
+/// a GPU pod is sized by `--gpu`), and when a name isn't a type name. Pure.
 pub(crate) fn server_types(provider: &str, raw: Option<&str>) -> Result<Vec<String>> {
+    use arena_core::capability::{self, Backend, Op, Support};
     let Some(raw) = raw else { return Ok(Vec::new()) };
-    if provider != "hetzner" {
-        anyhow::bail!(
-            "--server-type is for Hetzner VMs only, and this pod is on {provider} — size a GPU pod with --gpu / --gpus"
-        );
-    }
+    let support = |op| Backend::named(provider).map_or(Support::Yes, |b| capability::support(b, op));
+    crate::pods::capable::ignored_flags(provider, &[("--server-type", Op::ServerType)], support)?;
     let types = arena_core::placement::split_list(raw);
     if types.is_empty() {
         anyhow::bail!("--server-type lists no server type");
@@ -143,29 +143,6 @@ pub(crate) fn server_types(provider: &str, raw: Option<&str>) -> Result<Vec<Stri
         }
     }
     Ok(out)
-}
-
-/// The flags that don't apply to a Hetzner VM (no GPU, no tier, its disk is its server
-/// type's), refused rather than dropped, naming what does. Pure.
-pub(crate) fn vm_flags_refusal(ov: &SpecOverrides) -> Option<String> {
-    let given: Vec<&str> = [
-        ov.gpu.as_ref().map(|_| "--gpu"),
-        ov.gpus.map(|_| "--gpus"),
-        ov.cloud.as_ref().map(|_| "--cloud"),
-        ov.disk.map(|_| "--disk"),
-        ov.volume.map(|_| "--volume"),
-        ov.bootstrap.then_some("--bootstrap"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    (!given.is_empty()).then(|| {
-        format!(
-            "{} doesn't apply to a Hetzner VM (no GPU or tier; its disk is its server type's) — pass --server-type (e.g. \
-             cx43, or a comma list to fall back; `arena offers hetzner` lists them)",
-            given.join(" / ")
-        )
-    })
 }
 
 /// The source pod's GPU type as a create id, from its (enriched) listing — for when its spec
@@ -237,10 +214,9 @@ pub(crate) async fn plan_replacement(
     let vm = owner.name() == "hetzner";
     let types = server_types(owner.name(), place.server_type.as_deref())?;
     let mut ov = ov.clone();
+    // (A flag a VM can't take — `--gpu`, `--disk`, … — was refused before this, by the
+    // capability table: `replace_on` / `migrate_copy_on`.)
     if vm {
-        if let Some(r) = vm_flags_refusal(&ov) {
-            anyhow::bail!("{r}");
-        }
         // `--image` on a VM is what it boots (`arena`, a snapshot id, an image name).
         let (_, vm_image) = crate::pods::create::image_flag("hetzner", ov.image.take())?;
         ov.vm_image = vm_image;
@@ -601,6 +577,19 @@ pub(crate) async fn handle_replace(
     replace_on(remote, fleet, cfg, &owner, src_id, src_label, job).await
 }
 
+/// The flags of a replace (or `migrate copy`) only some providers honour, as given — checked
+/// against the source's provider, where the new pod is made ([`CreateFlags::check`]).
+pub(crate) fn replacement_flags<'a>(ov: &'a SpecOverrides, place: &PlaceFlags) -> CreateFlags<'a> {
+    CreateFlags {
+        cloud: ov.cloud.as_deref(),
+        disk: ov.disk,
+        volume: ov.volume,
+        image: ov.image.as_deref(),
+        bootstrap: ov.bootstrap,
+        max_price: place.max_price,
+    }
+}
+
 /// `pods replace`'s switches, passed through to [`replace_on`] as one value.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ReplaceOpts {
@@ -718,6 +707,14 @@ pub(crate) async fn replace_on(
         );
     }
     let (new_name, old_name) = replace_stage_names(&canonical);
+    // A provider that can't replace (the capability table: it needs the pod's spec read back and
+    // two renames) is refused before anything is read or created — dry run or not; so is a flag
+    // the new pod's provider would ignore.
+    if let Some(r) = crate::pods::capable::refusal(owner, Op::Replace, "replace", &[&src]) {
+        anyhow::bail!("{r}");
+    }
+    replacement_flags(job.ov, job.place).check(owner, Some(&src))?;
+    sizing_flags(&src.provider, job.ov.gpu.as_deref(), job.ov.gpus, None)?;
     // Replace renames the pod and (unless --keep-old) terminates it: a locked one is refused
     // before anything is read or created — never unlocked here.
     let locked = arena_core::lock::refusal("replace", &[&src], LOCKED_REPLACEMENT_NOTE);

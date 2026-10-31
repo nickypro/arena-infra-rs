@@ -54,6 +54,7 @@ use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Value};
 
 use super::Provider;
+use crate::capability::Backend;
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::config::Config;
 use crate::error::{Error, ProviderErrorKind, Result};
@@ -244,6 +245,14 @@ impl VastProvider {
             verified_only: true,
             attach_budget: KEY_ATTACH_BUDGET,
         }
+    }
+
+    /// This backend with `client` for every request — under test, [`crate::http::offline_client`]:
+    /// nothing it sends can reach the real API.
+    #[cfg(test)]
+    pub(crate) fn with_client(mut self, client: Client) -> Self {
+        self.client = client;
+        self
     }
 
     /// The provider as config sets it up: `VAST_API_KEY`, and whether unverified hosts may
@@ -1123,6 +1132,10 @@ impl Provider for VastProvider {
         "vast"
     }
 
+    fn backend(&self) -> Option<Backend> {
+        Some(Backend::Vast)
+    }
+
     fn describe(&self, spec: &PodSpec) -> String {
         let cuda = match (spec.bad_cuda(), cuda_floor(spec)) {
             (Some(bad), _) => format!(", CUDA `{bad}` — not a version: creates are refused"),
@@ -1286,10 +1299,6 @@ impl Provider for VastProvider {
         let rb = self.auth(self.client.put(format!("{}/instances/{id}/", self.base)).json(&json!({ "label": new_name })));
         let (status, text) = crate::http::send_text(rb).await?;
         judge_label(status, &text)
-    }
-
-    fn rename_support(&self, _pod: &Pod) -> Result<()> {
-        Ok(())
     }
 
     /// The per-instance attach, as at create (idempotent): the repair path for a pod that
@@ -2166,7 +2175,7 @@ mod tests {
             canned(200, "text/plain", ""),
         ]);
         let p = provider(&srv.base);
-        assert!(p.rename_support(&Pod { provider: "vast".into(), ..Default::default() }).is_ok());
+        assert!(p.supports(crate::capability::Op::Rename, Some(&Pod { provider: "vast".into(), ..Default::default() })).works());
         p.rename_pod("26001001", "devtest-bravo").await.unwrap();
         assert_eq!(body(&srv, 0), json!({"label": "devtest-bravo"}));
         let e = p.rename_pod("26001001", "devtest-bravo").await.unwrap_err().to_string();

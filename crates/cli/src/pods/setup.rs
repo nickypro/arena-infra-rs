@@ -42,9 +42,14 @@ pub(crate) async fn repair_pod_keys(
     cfg: &Config,
     pod: &arena_core::Pod,
 ) -> std::result::Result<usize, Option<String>> {
+    // A provider that authorizes keys only at create (the capability table: RunPod, Hetzner,
+    // Shadeform) has nothing to repair with — the pod's report stands, and nothing is asked.
+    if !provider.supports(arena_core::capability::Op::KeyRepair, Some(pod)).works() {
+        return Err(None);
+    }
     let keys = arena_core::ssh::authorized_pubkeys(cfg);
     // Asked even with no key to send (it then sends nothing): the answer still says whether
-    // this provider could repair at all — `NotImplemented` keeps a RunPod pod's report as is.
+    // this provider could repair at all — `NotImplemented` keeps the report as is.
     let attach = provider.authorize_ssh_keys(pod, &keys);
     match arena_core::ratelimit::bounded(KEY_REPAIR_TIMEOUT, attach).await {
         Err(_) => {

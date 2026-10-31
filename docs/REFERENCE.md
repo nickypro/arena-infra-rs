@@ -16,6 +16,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [Targeting & concurrency](#targeting--concurrency)
   - [Overriding config without editing it](#overriding-config-without-editing-it)
 - [Providers](#providers)
+  - [What works where](#what-works-where)
   - [RunPod (REST v2, the default)](#runpod-rest-v2-the-default)
   - [RunPod rate limits](#runpod-rate-limits)
   - [RunPod REST v1 (retiring)](#runpod-rest-v1-retiring)
@@ -308,6 +309,109 @@ GIT_SSH_KEY_LOCAL=~/.ssh/arena_infra_key arena pods setup
 ```
 
 ## Providers
+
+### What works where
+
+Not every operation works on every provider. One table in `arena-core`
+(`crates/core/src/capability.rs`) says which, and everything reads it:
+
+- **Commands** check every pod they were given before they ask anything or touch anything. A pod
+  whose provider can't do it is named, with why and what to do instead. A command that acts on
+  all of its pods or none (`reimage`, `rename`, `terminate`, `replace`, `migrate`) refuses the
+  whole selection, and says how to leave those pods out (`--exclude`). A batch that already
+  skipped pods it can't act on (`stop`, `start`, `lock`/`unlock`) still does the rest, names the
+  skipped ones and exits non-zero.
+- **Create flags** (`pods create`/`up`, and `replace`/`migrate copy` where they take the flag) that
+  the provider would ignore are refused before anything is listed, priced or created: `--disk`
+  on Hetzner, `--bootstrap` on Vast, `--volume` on Vast. `--volume 0` means "no volume", so it is
+  accepted everywhere. Config values (`DISK_GB`, `VOLUME_GB`, …) still apply only where the
+  provider uses them.
+- **The dashboard** greys out what the pod's provider can't do, with the reason, and refuses
+  the pick with the full sentence. Its add-pod form shows (and sends) only the fields the
+  provider's create takes.
+- **Commands that only reach a pod over SSH** work on every provider: setup, backup, pull, run,
+  test, restore, cp, set-branch and init-branches.
+
+RunPod is REST v2, the default. RunPod v1 is `RUNPOD_API=v1`.
+
+<!-- capability matrix: generated from crates/core/src/capability.rs (its module doc says how) — don't edit by hand -->
+| | RunPod | RunPod v1 | Vast | Hetzner | Shadeform |
+|---|:-:|:-:|:-:|:-:|:-:|
+| `pods start` | ✓ | ✓ | ✓ | ✓ | ✗ [1] |
+| `pods stop` | ✓ [2] | ✓ [2] | ✓ [3] | ✓ [4] | ✗ [5] |
+| `pods restart` | ✓ [6] | ✓ [7] | ✓ [8] | ✓ [9] | ✓ [10] |
+| `pods terminate` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `pods rename` | ✓ | ✓ | ✓ | ✓ [11] | ✓ [12] |
+| `pods reimage` | ✓ | ✓ | ✗ [13] | ✗ [14] | ✗ [15] |
+| `pods lock / unlock` | ✓ | ✗ [16] | ✗ [17] | ✗ [18] | ✗ [19] |
+| `pods replace` | ✓ | ✓ | ✗ [20] | ✓ [21] | ✓ [22] |
+| `pods migrate` | ✓ | ✓ | ✗ [23] | ✓ [24] | ✗ [25] |
+| setup's SSH key repair (via the API) | ✗ [26] | ✗ [26] | ✓ | ✗ [27] | ✗ [28] |
+| the auto-reaper | ✓ | ✗ [29] | ✗ [30] | ✓ | ✗ [31] |
+| **create flags** (`pods create`/`up`; `replace` and `migrate copy` take --gpu, --gpus, --cloud, --disk, --volume, --image, --max-price) | | | | | |
+| `--gpu / --gpus` | ✓ | ✓ | ✓ | ✗ [32] | ✓ [33] |
+| `--server-type` | ✗ [34] | ✗ [34] | ✗ [34] | ✓ | ✗ [34] |
+| `--cloud` | ✓ [35] | ✓ [35] | ✓ [36] | ✗ [37] | ✗ [38] |
+| `--disk` | ✓ | ✓ | ✓ [39] | ✗ [40] | ✗ [41] |
+| `--volume` | ✓ [42] | ✓ [42] | ✗ [43] | ✗ [44] | ✗ [45] |
+| `--image` | ✓ | ✓ | ✓ | ✓ [46] | ✗ [47] |
+| `--bootstrap` | ✓ | ✓ | ✗ [48] | ✗ [49] | ✗ [50] |
+| `--max-price` | ✓ | ✓ | ✓ | ✗ [51] | ✓ [52] |
+| `--api-json` | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+1. `pods start` on Shadeform: no — Shadeform has no stop: an instance bills until it's deleted, idle or not. Instead: nothing is ever stopped there, so there's nothing to start.
+2. `pods stop` on RunPod, RunPod v1: a stopped pod keeps no container disk: only a /workspace volume survives (`--wipe-ok` gate).
+3. `pods stop` on Vast: may lose the container disk (unverified): gated like a wipe.
+4. `pods stop` on Hetzner: keeps the disk: a graceful shutdown, powered off after 90 s if it doesn't.
+5. `pods stop` on Shadeform: no — Shadeform has no stop: an instance bills until it's deleted, idle or not. Instead: back it up (`arena pods backup <name>`), then `arena pods terminate <name>`.
+6. `pods restart` on RunPod: resets the container to its image: only a /workspace volume survives (`--wipe-ok` gate).
+7. `pods restart` on RunPod v1: may reset the container (seen keeping it): gated like a wipe.
+8. `pods restart` on Vast: may reset the container (a stop + start, unverified): gated like a wipe.
+9. `pods restart` on Hetzner: keeps the disk: a hard reset of the VM.
+10. `pods restart` on Shadeform: may reset the instance (unverified): gated like a wipe.
+11. `pods rename` on Hetzner: also sets the VM's hostname.
+12. `pods rename` on Shadeform: the new name must keep the `<prefix>-` prefix.
+13. `pods reimage` on Vast: no — Vast can't swap an instance's image in place. Instead: back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then `arena --provider vast pods up <name> --volume 0` (its --gpu) and `arena pods restore <name>`.
+14. `pods reimage` on Hetzner: no — arena can't reimage a Hetzner VM yet (Hetzner's rebuild action could). Instead: back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then `arena --provider hetzner pods up <name> --volume 0` (its --server-type) and `arena pods restore <name>`.
+15. `pods reimage` on Shadeform: no — Shadeform can't swap an instance's image in place. Instead: back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then `arena --provider shadeform pods up <name> --volume 0` (its --gpu) and `arena pods restore <name>`.
+16. `pods lock / unlock` on RunPod v1: no — only RunPod REST v2 can lock a pod. Instead: remove RUNPOD_API=v1 (v2 is the default).
+17. `pods lock / unlock` on Vast: no — Vast can't lock an instance. Nothing to use instead.
+18. `pods lock / unlock` on Hetzner: no — arena can't lock a Hetzner VM yet (Hetzner's delete/rebuild protection could). Nothing to use instead.
+19. `pods lock / unlock` on Shadeform: no — Shadeform can't lock an instance. Nothing to use instead.
+20. `pods replace` on Vast: no — arena can't read a Vast instance's spec back yet. Instead: back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then `arena --provider vast pods up <name> --volume 0` (its --gpu) and `arena pods restore <name>`.
+21. `pods replace` on Hetzner: --server-type moves it to a bigger type; the new VM goes wherever HETZNER_LOCATION allows, maybe another location.
+22. `pods replace` on Shadeform: not live-tested.
+23. `pods migrate` on Vast: no — arena can't read a Vast instance's spec back yet. Instead: back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then `arena --provider vast pods up <name> --volume 0` (its --gpu) and `arena pods restore <name>`.
+24. `pods migrate` on Hetzner: --server-type moves it to a bigger type; the new VM goes wherever HETZNER_LOCATION allows, maybe another location.
+25. `pods migrate` on Shadeform: no — the cutover's proxy check reads RunPod's pod id, so it can't pass on Shadeform (it reverts itself). Instead: `arena pods replace <name>`.
+26. setup's SSH key repair (via the API) on RunPod, RunPod v1: no — RunPod authorizes keys only at create. Instead: `arena pods replace <name>` (a new pod gets today's keys).
+27. setup's SSH key repair (via the API) on Hetzner: no — Hetzner authorizes keys only at create (cloud-init). Instead: back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then `arena --provider hetzner pods up <name> --volume 0` (its --server-type) and `arena pods restore <name>`.
+28. setup's SSH key repair (via the API) on Shadeform: no — Shadeform authorizes keys only at create (its bootstrap script). Instead: `arena pods replace <name>` (a new pod gets today's keys).
+29. the auto-reaper on RunPod v1: no — the reaper acts on RunPod pods only through REST v2 (their lock state). Instead: remove RUNPOD_API=v1 (v2 is the default).
+30. the auto-reaper on Vast: no — the reaper never terminates a Vast instance: no lock state, no verified identity. Nothing to use instead.
+31. the auto-reaper on Shadeform: no — the reaper doesn't read a Shadeform instance's identity (its create nonce) yet. Nothing to use instead.
+32. `--gpu / --gpus` on Hetzner: no — Hetzner creates CPU VMs sized by server type. Instead: pass --server-type (e.g. cx23, cpx42; `arena offers hetzner` lists them) or set HETZNER_SERVER_TYPE.
+33. `--gpu / --gpus` on Shadeform: each GPU type must be one Shadeform sells.
+34. `--server-type` on RunPod, RunPod v1, Vast, Shadeform: no — only Hetzner VMs are sized by server type. Instead: pass --provider hetzner, or size a GPU pod with --gpu / --gpus.
+35. `--cloud` on RunPod, RunPod v1: COMMUNITY or SECURE.
+36. `--cloud` on Vast: host classes: datacenter, verified, unverified.
+37. `--cloud` on Hetzner: no — Hetzner has no tiers. Instead: HETZNER_LOCATION picks where it runs.
+38. `--cloud` on Shadeform: no — Shadeform picks the cheapest cloud in stock. Instead: set SHADEFORM_CLOUDS.
+39. `--disk` on Vast: the offer's disk is at least this.
+40. `--disk` on Hetzner: no — a Hetzner VM's disk comes with its server type. Instead: pick a bigger --server-type (`arena offers hetzner`).
+41. `--disk` on Shadeform: no — a Shadeform instance's disk comes with its type. Nothing to use instead.
+42. `--volume` on RunPod, RunPod v1: a /workspace volume: what survives a stop, restart or reimage.
+43. `--volume` on Vast: no — arena's Vast create takes no volume. Instead: work survives through `arena pods backup` (and the archive).
+44. `--volume` on Hetzner: no — arena can't attach a volume to a Hetzner VM yet (a VM keeps its disk across a stop and a restart). Instead: work survives through `arena pods backup` (and the archive).
+45. `--volume` on Shadeform: no — Shadeform's CUDA-13 cloud has no volumes. Instead: work survives through `arena pods backup` (and the archive).
+46. `--image` on Hetzner: the VM image: `arena` (the newest arena-built snapshot), a snapshot id or a name like ubuntu-24.04.
+47. `--image` on Shadeform: no — Shadeform picks the OS image by the CUDA floor. Nothing to use instead.
+48. `--bootstrap` on Vast: no — not needed on Vast: its launcher brings up SSH on any image. Instead: leave it out.
+49. `--bootstrap` on Hetzner: no — a Hetzner VM runs no container start script: setup installs what it needs. Instead: leave it out.
+50. `--bootstrap` on Shadeform: no — Shadeform instances come up through arena's own bootstrap script. Instead: leave it out.
+51. `--max-price` on Hetzner: no — Hetzner quotes no price before a create. Instead: `arena offers hetzner` lists each server type's price: pick the --server-type.
+52. `--max-price` on Shadeform: capped at SHADEFORM_MAX_PRICE too.
+<!-- end of the capability matrix -->
 
 ### RunPod (REST v2, the default)
 
@@ -892,7 +996,8 @@ it).
 
 #### `pods reimage`
 
-**`reimage`** (RunPod only: the other backends answer "reimage not supported") gets the same
+**`reimage`** (RunPod only: a selection with a pod on another provider is refused whole, before
+the wipe gate and the confirm — [What works where](#what-works-where)) gets the same
 `--wipe-ok` gate as restart/stop (a reimage is a fresh container; the dry run says when it would be
 refused) and the same come-back: settled endpoint, **setup again** (`--no-setup`), proxy sync.
 
@@ -939,8 +1044,8 @@ lists every step.
 — a **locked** pod is refused stop, restart and terminate by RunPod itself, from **any** client
 (this tool, scripts, RunPod's web console; live-verified 2026-10-08) — the protection for a running
 cohort. Setup, backups, `run` and SSH are unaffected. Already-locked pods are left alone; a pod on a
-backend that can't lock (`RUNPOD_API=v1`, Vast, Hetzner, Shadeform) is reported (`not supported on … — …`; on
-v1 `remove RUNPOD_API=v1 (v2 is the default) to lock RunPod pods`) and makes the exit non-zero.
+backend that can't lock (`RUNPOD_API=v1`, Vast, Hetzner, Shadeform) is reported with why (on v1: `only
+RunPod REST v2 can lock a pod — remove RUNPOD_API=v1 (v2 is the default)`) and makes the exit non-zero.
 
 `pods up --lock` locks each pod as the pipeline's **last** step (after `--check`, whose replacement
 needs to terminate; a lock that fails is `FAILED lock`, the pod left running, unlocked); `--lock` is

@@ -172,12 +172,6 @@ impl Provider for Fleet {
         self.pods.lock().unwrap().retain(|p| p.id != id);
         Ok(())
     }
-    fn lock_support(&self, pod: &Pod) -> Result<()> {
-        match pod.provider.as_str() {
-            "runpod" => Ok(()),
-            other => Err(Error::NotImplemented(format!("not supported on {other} — only RunPod pods can be locked (on RunPod REST v2, the default)"))),
-        }
-    }
     async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {
         if !locked && self.fail_unlock.contains(&id) {
             return Err(Error::provider("unlock pod HTTP 500 Internal Server Error: boom"));
@@ -206,11 +200,13 @@ impl Provider for Fleet {
         }
         Ok(())
     }
-    /// Every backend here renames; a `lambda` pod stands for one that can't.
-    fn rename_support(&self, pod: &Pod) -> Result<()> {
-        match pod.provider.as_str() {
-            "lambda" => Err(Error::NotImplemented("rename not supported on provider `lambda`".into())),
-            _ => Ok(()),
+    /// As the fleet routes it: the capability table's answer for the pod's provider. A `lambda`
+    /// pod stands for a backend that can't rename (nor anything else).
+    fn supports(&self, op: arena_core::capability::Op, pod: Option<&Pod>) -> arena_core::capability::Support {
+        use arena_core::capability::{support, Backend, Support};
+        match pod.map(|p| p.provider.as_str()) {
+            Some("lambda") => Support::No { why: "rename not supported on provider `lambda`", instead: "rename it in its console" },
+            p => p.and_then(Backend::named).map_or(Support::Yes, |b| support(b, op)),
         }
     }
     async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
@@ -527,7 +523,7 @@ fn the_machine_name_note_is_for_pods_with_that_env_var() {
     assert!(mixed.starts_with("note: the MACHINE_NAME env var of devtest-echo, devtest-india keeps the old name"), "{mixed}");
 }
 
-/// A pod whose backend can't rename ([`Provider::rename_support`]) is refused before
+/// A pod whose backend can't rename ([`Provider::supports`]) is refused before
 /// anything is asked, renamed or reached — the whole batch, as `plan_renames`' problems are.
 #[tokio::test]
 async fn a_pod_its_backend_cannot_rename_is_refused_up_front() {
@@ -540,7 +536,7 @@ async fn a_pod_its_backend_cannot_rename_is_refused_up_front() {
     ]);
     let remote = Arc::new(FakeRemote::new());
     let e = handle_rename(&f, remote.clone(), &cfg, &no_api(&csv), one("bravo", "echo"), true, false, true).await.unwrap_err();
-    assert_eq!(e.to_string(), "refusing to rename anything:\n  devtest-bravo: rename not supported on provider `lambda`");
+    assert_eq!(e.to_string(), "refusing to rename anything:\n  devtest-bravo (lambda): rename not supported on provider `lambda` — rename it in its console");
     // The dry run says so too.
     let e = handle_rename(&f, remote.clone(), &cfg, &no_api(&csv), one("bravo", "echo"), true, true, true).await.unwrap_err();
     assert!(e.to_string().contains("rename not supported on provider `lambda`"), "{e}");

@@ -87,9 +87,6 @@ impl Provider for Vms {
         }
         Ok(())
     }
-    fn rename_support(&self, _pod: &Pod) -> Result<()> {
-        Ok(())
-    }
     fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
         false
     }
@@ -296,7 +293,10 @@ async fn replace_doesnt_swap_when_someone_came_on_during_the_copy() {
     assert_eq!(probes.load(Ordering::SeqCst), 2);
 }
 
-/// `--server-type` is Hetzner's; GPU flags aren't a VM's — each refused before anything.
+/// `--server-type` is Hetzner's; GPU flags aren't a VM's — each refused before anything, by the
+/// capability table (this fake is "hetzner" by name only, so the table's answers for its
+/// provider name are what's asked: `--gpu`'s; `--disk`'s needs the real backend, and is the
+/// table's own test).
 #[tokio::test(start_paused = true)]
 async fn flags_a_vm_cant_take_and_a_server_type_off_hetzner_are_refused() {
     let dir = tmpdir("replace-flags");
@@ -307,12 +307,13 @@ async fn flags_a_vm_cant_take_and_a_server_type_off_hetzner_are_refused() {
     let interrupt = Interrupt::manual();
     let keys = dir.0.display().to_string();
     let place = PlaceFlags::default();
-    let ov = SpecOverrides { gpu: Some("A4000".into()), disk: Some(80), ..Default::default() };
+    let ov = SpecOverrides { gpu: Some("A4000".into()), ..Default::default() };
     let job = replace_job(&ov, &place, &interrupt, &keys, Source::Create, None, false, &cfg);
     let e = replace_on(remote.clone(), &f, &cfg, &f, "101".into(), "devtest-alpha".into(), job).await.unwrap_err().to_string();
-    assert!(e.contains("--gpu / --disk doesn't apply to a Hetzner VM") && e.contains("--server-type"), "{e}");
+    assert!(e.contains("--gpu") && e.contains("Hetzner creates CPU VMs sized by server type") && e.contains("--server-type"), "{e}");
     assert!(f.calls().is_empty());
-    assert!(crate::pods::replace::server_types("runpod", Some("cx43")).unwrap_err().to_string().contains("Hetzner VMs only"));
+    let e = crate::pods::replace::server_types("runpod", Some("cx43")).unwrap_err().to_string();
+    assert!(e.contains("--server-type") && e.contains("only Hetzner VMs are sized by server type"), "{e}");
     assert_eq!(crate::pods::replace::server_types("hetzner", Some("CX43, cx53,cx43")).unwrap(), ["cx43", "cx53"]);
     assert!(crate::pods::replace::server_types("hetzner", Some("cx43;rm")).is_err());
     assert!(crate::pods::replace::server_types("hetzner", None).unwrap().is_empty());
