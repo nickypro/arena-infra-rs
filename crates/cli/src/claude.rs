@@ -45,7 +45,7 @@ pub(crate) enum ClaudeCmd {
     #[command(verbatim_doc_comment)]
     Assign {
         /// The pods (names, ids, ranges), then the account: its number, its email, or `none`
-        #[arg(value_name = "TARGET… ACCOUNT")]
+        #[arg(value_name = "POD|ACCOUNT")]
         args: Vec<String>,
         /// Spread them (the account with the fewest people first) instead of naming an account
         #[arg(long)]
@@ -67,7 +67,7 @@ pub(crate) enum ClaudeCmd {
     /// With no pods named: every cohort pod whose box may not have its account's current token —
     /// never pushed, moved, its token rotated in CLAUDE_TOKENS_FILE, or not on an account yet (it
     /// gets one by spread). Named pods (or --all) are pushed whatever their state. A re-push
-    /// changes nothing on a pod already right. The token goes by scp, never in a command.
+    /// changes nothing on a pod already right. The token goes on ssh's stdin, never in a command.
     #[command(verbatim_doc_comment)]
     Push {
         /// Preview only: say what each pod would get, change nothing
@@ -340,7 +340,7 @@ async fn apply(
         println!("Recorded.");
         return Ok(());
     }
-    let failed = push_pods(remote, cfg, &path, pool, &state, &pushing, &changes, now).await?;
+    let failed = push_pods(remote, cfg, &path, pool, &pushing, &changes, now).await;
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) didn't get their Claude Code token");
     }
@@ -349,8 +349,7 @@ async fn apply(
 
 /// Push `pods` (their SSH targets; a stopped or unreachable one is said and left for its next
 /// setup) and print each outcome: how many failed.
-#[allow(clippy::too_many_arguments)]
-async fn push_pods(remote: &dyn Remote, cfg: &Config, path: &std::path::Path, pool: &Pool, state: &State, pods: &[Pod], changes: &[Change], now: u64) -> Result<usize> {
+async fn push_pods(remote: &dyn Remote, cfg: &Config, path: &std::path::Path, pool: &Pool, pods: &[Pod], changes: &[Change], now: u64) -> usize {
     let mut reach = Vec::new();
     for p in pods {
         if arena_core::status::is_stopped(&p.status) {
@@ -368,10 +367,9 @@ async fn push_pods(remote: &dyn Remote, cfg: &Config, path: &std::path::Path, po
         }
     }
     if reach.is_empty() {
-        return Ok(0);
+        return 0;
     }
-    let outcomes = claude::push_all(remote, path, pool, state, &reach, changes, now).await.map_err(|e| anyhow::anyhow!(e))?;
-    Ok(print_outcomes(&outcomes))
+    print_outcomes(&claude::push_all(remote, path, pool, &reach, changes, now).await)
 }
 
 /// Each outcome on its own line, then the tally: how many failed.
@@ -446,7 +444,7 @@ async fn assign_owner(
         println!("Recorded.");
         return Ok(());
     }
-    let failed = push_pods(remote, cfg, &path, pool, &state, &pushing, &changes, now).await?;
+    let failed = push_pods(remote, cfg, &path, pool, &pushing, &changes, now).await;
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) didn't get their Claude Code token");
     }

@@ -509,8 +509,8 @@ pub(crate) async fn handle_copy_keys(
         }
     }
     println!("\nDone: {ok} updated, {failed} failed.");
-    // Each pod's own Claude Code account's token (one by spread for a pod with none), by scp —
-    // never in the command above.
+    // Each pod's own Claude Code account's token (one by spread for a pod with none), on ssh's
+    // stdin — never in the command above.
     let claude_failed = match claude_plan {
         Ok(Some(_)) => crate::claude::stage(remote.as_ref(), cfg, &claude_jobs, cc_token.as_deref()).await,
         Ok(None) => 0,

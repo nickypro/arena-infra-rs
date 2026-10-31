@@ -32,10 +32,11 @@ earlier).
   least-loaded account); `arena claude push` puts each pod's own token on it (with no pods named,
   only the ones out of date: new, moved, or their token rotated in the file); `arena claude off`
   takes it off. Setup, `up` and `copy-keys` put a new machine on the account with the fewest people.
-- The token goes to the pod by scp, never in a command line, and replaces every
+- The token goes to the pod on ssh's stdin, never in a command line or a file, and replaces every
   `export CLAUDE_CODE_OAUTH_TOKEN=` line in `~/.bashrc` and `~/.zshrc` (copy-keys added a line for
-  each new token, leaving the old ones above it). Setup no longer writes the token in its config step; Hetzner VMs, which got it only
-  from `copy-keys`, now get it with every setup.
+  each new token, leaving the old ones above it); each file is rewritten beside itself and renamed
+  over, so a failure leaves it whole. Setup no longer writes the token in its config step; Hetzner
+  VMs, which got it only from `copy-keys`, now get it with every setup.
 - The dashboard's detail pane shows a pod's account on its `tokens:` line, and `c` in its menu moves
   it to another (a number, an email, `none` or `spread`).
 - `config check` has a "Claude Code accounts" section: how many accounts the file holds, or why it

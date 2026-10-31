@@ -24,11 +24,16 @@
 //! **The push** ([`push_command`], [`push`]): the machine's own token only, as
 //! `export CLAUDE_CODE_OAUTH_TOKEN="…"` in `~/.bashrc` and `~/.zshrc` — the channel copy-keys
 //! always used — with every earlier such line taken out, so a moved machine has the new token and
-//! nothing else; `none` takes the lines out. The token travels by scp in a file of its own (made
-//! owner-only, deleted on the pod by the command that reads it, and here once the push is done:
-//! [`TokenFiles`]), never in a command line — so never in `ps` here or on the pod, or in a log or a
-//! dry run. What went is recorded ([`Pushed`]: the account and a fingerprint of its token), so a
-//! moved machine or a rotated token shows as out of date until it's pushed again ([`out_of_date`]).
+//! nothing else; `none` takes the lines out. The token travels on the ssh command's stdin
+//! ([`Remote::exec_input`]): never in a command line (so never in `ps` here or on the pod, or in a
+//! log or a dry run), and never in a file, here or there, that a dropped connection could leave
+//! behind. The rc files are rewritten beside themselves and renamed over, so a failure leaves the
+//! old file whole. Pushes to one machine take its lock and read what it should get afresh, so two
+//! that meet run one after the other and the record says what the last one put there. What went is
+//! recorded ([`Pushed`]: the account and a fingerprint of its token), so a moved machine or a
+//! rotated token shows as out of date until it's pushed again ([`out_of_date`]). Machines a
+//! complete listing no longer shows, or that arena terminated, are forgotten
+//! ([`record_listing`], [`record_terminated`]), so they stop counting as load.
 //!
 //! Usage per account isn't shown: a `claude setup-token` token is inference-only, and Anthropic
 //! publishes no usage API for subscription tokens (checked 2026-10-31).
@@ -107,7 +112,7 @@ impl Account {
         Account { num, email: email.into(), token: token.into() }
     }
 
-    /// The token itself — only ever written to a [`TokenFiles`] file.
+    /// The token itself — only ever sent on a push's stdin ([`push`]).
     pub fn token(&self) -> &str {
         &self.token
     }
@@ -925,138 +930,166 @@ pub fn record<T>(path: &Path, f: impl FnOnce(State) -> (State, T)) -> Result<(St
     Ok((next, out))
 }
 
+/// Record a complete listing quietly: the machines it shows are gone are forgotten
+/// ([`prune`]), with their push locks — what `pods list`, the dashboard, teardown, `arena
+/// balance` and the snapshot cron line do after they listed, so a terminated machine stops
+/// counting as load within minutes, whoever terminated it. Nothing is written when nothing
+/// changed; a failure changes nothing else (spend's listings record the same way).
+pub fn record_listing(path: Option<&Path>, listing: &Listing) {
+    let Some(path) = path else { return };
+    // Only a fleet that has assignments: no state dir made, no lock taken, for one that doesn't.
+    if !path.exists() {
+        return;
+    }
+    if let Ok((_, gone)) = record(path, |s| {
+        let before: Vec<(String, String)> = s.machines.iter().map(|m| (m.provider.clone(), m.id.clone())).collect();
+        let next = prune(s, listing);
+        let gone: Vec<(String, String)> = before.into_iter().filter(|(p, id)| next.get(p, id).is_none()).collect();
+        (next, gone)
+    }) {
+        forget_locks(path, &gone);
+    }
+}
+
+/// Forget a machine arena just terminated (`provider`: when known; else the one open record with
+/// that id) — quietly, as spend records the terminate.
+pub fn record_terminated(path: Option<&Path>, provider: Option<&str>, id: &str) {
+    let Some(path) = path.filter(|p| p.exists()) else { return };
+    if let Ok((_, gone)) = record(path, |mut s| {
+        let hits: Vec<usize> =
+            s.machines.iter().enumerate().filter(|(_, m)| m.id == id && provider.is_none_or(|p| m.provider == p)).map(|(i, _)| i).collect();
+        let gone = match hits.as_slice() {
+            [i] => {
+                let m = s.machines.remove(*i);
+                vec![(m.provider, m.id)]
+            }
+            _ => vec![],
+        };
+        (s, gone)
+    }) {
+        forget_locks(path, &gone);
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // The push
 // ---------------------------------------------------------------------------------------
 
-/// The command a machine runs to have exactly `token_file`'s token in its shells — the file (a
-/// name in `$HOME`, copied up just before) read and deleted at once — or, with `None`, no token.
-/// In `~/.bashrc` and `~/.zshrc`, every `export CLAUDE_CODE_OAUTH_TOKEN=…` line is taken out and,
-/// with a token, one put at the end; a file already so isn't rewritten (a re-push changes
-/// nothing), and one that doesn't exist isn't made just to say "none". The token reaches `awk`
-/// through its environment, never its arguments. With a token, Claude Code's onboarding is marked
-/// done in `~/.claude.json` (it ignores the token until it is), as copy-keys did. Pure.
-pub fn push_command(token_file: Option<&str>) -> String {
-    let take = match token_file {
-        Some(name) => format!(
-            "f=\"$HOME/{name}\"; [ -s \"$f\" ] || {{ echo \"the token didn't arrive ($f)\" >&2; exit 3; }}; \
-             ARENA_CC=$(cat \"$f\"); rm -f \"$f\""
-        ),
-        None => "ARENA_CC=".to_string(),
+/// How long a push waits for another push to the same machine to end (one takes at most
+/// [`PUSH_TIMEOUT`], and its record a moment).
+pub const MACHINE_LOCK_WAIT: Duration = Duration::from_secs(90);
+
+/// The command a machine runs to have exactly the token on its stdin in its shells (`token`), or
+/// none. In `~/.bashrc` and `~/.zshrc` — through a symlink to the file it points at — every
+/// `export CLAUDE_CODE_OAUTH_TOKEN=…` line is taken out and, with a token, one put at the end.
+/// Each file is rewritten whole beside itself (a copy keeping its mode) and renamed over it, so a
+/// full disk or a dropped connection leaves the old file, never a cut one; a file already so isn't
+/// touched (a re-push changes nothing), and one that doesn't exist isn't made just to say "none".
+/// The token is read with `read` (a builtin) and reaches `awk` through its environment: never an
+/// argument, so never in `ps` on the pod. With a token, Claude Code's onboarding is marked done in
+/// `~/.claude.json` (it ignores the token until it is), as copy-keys did. Pure.
+pub fn push_command(token: bool) -> String {
+    let take = if token {
+        "IFS= read -r ARENA_CC || true; [ -n \"$ARENA_CC\" ] || { echo 'no token arrived on stdin' >&2; exit 3; }"
+    } else {
+        "ARENA_CC="
     };
     format!(
-        "set -e; umask 077; f=; tmp=; trap 'rm -f -- \"$f\" \"$tmp\"' EXIT; {take}; export ARENA_CC; \
+        "set -e; umask 077; tmp=; trap 'rm -f -- \"$tmp\"' EXIT; {take}; export ARENA_CC; \
          for rc in \"$HOME/.bashrc\" \"$HOME/.zshrc\"; do \
          if [ ! -e \"$rc\" ]; then [ -n \"$ARENA_CC\" ] || continue; : > \"$rc\"; fi; \
-         tmp=$(mktemp \"$HOME/.arena-claude-rc.XXXXXX\"); \
+         f=$(readlink -f -- \"$rc\" 2>/dev/null || printf '%s' \"$rc\"); \
+         tmp=$(mktemp \"$f.arena-XXXXXX\"); cp -p -- \"$f\" \"$tmp\"; \
          awk 'BEGIN {{ t = ENVIRON[\"ARENA_CC\"] }} /^[[:space:]]*export[[:space:]]+{TOKEN_KEY}=/ {{ next }} {{ print }} \
-         END {{ if (t != \"\") print \"export {TOKEN_KEY}=\\\"\" t \"\\\"\" }}' \"$rc\" > \"$tmp\"; \
-         cmp -s \"$tmp\" \"$rc\" || cat \"$tmp\" > \"$rc\"; rm -f \"$tmp\"; tmp=; done; \
+         END {{ if (t != \"\") print \"export {TOKEN_KEY}=\\\"\" t \"\\\"\" }}' \"$f\" > \"$tmp\"; \
+         if cmp -s \"$tmp\" \"$f\"; then rm -f -- \"$tmp\"; else mv -f -- \"$tmp\" \"$f\"; fi; tmp=; done; \
          if [ -n \"$ARENA_CC\" ]; then {ONBOARDED}; fi; \
          if [ -n \"$ARENA_CC\" ]; then echo 'claude: token set'; else echo 'claude: token removed'; fi"
     )
 }
 
 /// Mark Claude Code's onboarding done in `~/.claude.json` (it ignores `CLAUDE_CODE_OAUTH_TOKEN`
-/// until it is): merged into the file with python3, or the file written when there's none.
-const ONBOARDED: &str = "if command -v python3 >/dev/null 2>&1; then python3 -c 'import json,os; p=os.path.expanduser(\"~/.claude.json\"); \
-     d=json.load(open(p)) if os.path.isfile(p) and os.path.getsize(p) else {}; \
-     d[\"hasCompletedOnboarding\"]=True; json.dump(d,open(p,\"w\"))'; \
-     elif [ ! -s \"$HOME/.claude.json\" ]; then printf '{\"hasCompletedOnboarding\": true}\\n' > \"$HOME/.claude.json\"; \
+/// until it is): with python3, merged into the file and only when it isn't so already, written
+/// beside it and renamed over it (its mode kept); with no python3, the file written when there's
+/// none.
+const ONBOARDED: &str = "if command -v python3 >/dev/null 2>&1; then python3 -c '
+import json, os
+p = os.path.realpath(os.path.expanduser(\"~/.claude.json\"))
+d = json.load(open(p)) if os.path.isfile(p) and os.path.getsize(p) else {}
+if d.get(\"hasCompletedOnboarding\") is not True:
+    d[\"hasCompletedOnboarding\"] = True
+    t = p + \".arena-tmp\"
+    with open(t, \"w\") as f:
+        json.dump(d, f)
+    if os.path.exists(p):
+        os.chmod(t, os.stat(p).st_mode & 0o7777)
+    os.replace(t, p)
+'; elif [ ! -s \"$HOME/.claude.json\" ]; then printf '{\"hasCompletedOnboarding\": true}\\n' > \"$HOME/.claude.json\"; \
      else echo 'no python3 to mark the onboarding done in ~/.claude.json' >&2; fi";
 
-/// A name for a token's file on a machine, in its `$HOME`: this run's and this push's own, so two
-/// pushes never share one.
-fn remote_token_name() -> String {
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
-    format!(".arena-claude-token-{}-{nanos}-{n}", std::process::id())
-}
-
-/// The local copies of the tokens a run pushes: one file per account, owner-only, in a directory of
-/// their own (0700) under the temp dir — all of it deleted when this goes, so no token is left
-/// behind here, whatever became of a push.
-pub struct TokenFiles {
-    dir: PathBuf,
-    made: HashMap<String, PathBuf>,
-}
-
-impl TokenFiles {
-    pub fn new() -> std::io::Result<Self> {
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("arena-claude-{}-{nanos}-{n}", std::process::id()));
-        let mut b = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            b.mode(0o700);
-        }
-        b.create(&dir)?;
-        Ok(TokenFiles { dir, made: HashMap::new() })
-    }
-
-    /// The file holding `account`'s token (written the first time).
-    pub fn file(&mut self, account: &Account) -> std::io::Result<PathBuf> {
-        if let Some(p) = self.made.get(&account.email) {
-            return Ok(p.clone());
-        }
-        let path = self.dir.join(format!("{}.token", self.made.len() + 1));
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&path)?;
-        std::io::Write::write_all(&mut f, format!("{}\n", account.token()).as_bytes())?;
-        self.made.insert(account.email.clone(), path.clone());
-        Ok(path)
-    }
-
-    /// Where they are (tests check it's gone).
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-}
-
-impl Drop for TokenFiles {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Push one machine: `local` (its token's file, from [`TokenFiles`]) copied up by scp, then
-/// [`push_command`] — or, with `None`, only the command, which takes the token off. A copy that
-/// failed, or a command that didn't run, is followed by a best-effort delete of the copied file.
-pub async fn push(remote: &dyn Remote, t: &SshTarget, local: Option<&Path>, timeout: Duration) -> Result<(), String> {
-    let name = local.map(|_| remote_token_name());
-    let cleanup = |name: &str| format!("rm -f \"$HOME/{name}\"");
-    if let (Some(local), Some(name)) = (local, &name) {
-        let copied = remote.copy(t, &local.display().to_string(), name, Some(timeout)).await;
-        let failed = match copied {
-            Ok(o) if o.success => None,
-            Ok(o) => Some(format!("copying the token: {}", o.stderr.trim())),
-            Err(e) => Some(format!("copying the token: {}", describe_error(&e))),
-        };
-        if let Some(why) = failed {
-            let _ = remote.exec(t, &cleanup(name), Some(timeout)).await;
-            return Err(why);
-        }
-    }
-    match remote.exec(t, &push_command(name.as_deref()), Some(timeout)).await {
+/// Push one machine: [`push_command`] with `token` on its stdin — or, with `None`, the command
+/// alone, which takes the token off. Nothing with a token is written anywhere on the way: not a
+/// file here, not one on the pod, not an argument.
+pub async fn push(remote: &dyn Remote, t: &SshTarget, token: Option<&str>, timeout: Duration) -> Result<(), String> {
+    let cmd = push_command(token.is_some());
+    let done = match token {
+        Some(tok) => remote.exec_input(t, &cmd, format!("{tok}\n").as_bytes(), Some(timeout)).await,
+        None => remote.exec(t, &cmd, Some(timeout)).await,
+    };
+    match done {
         Ok(o) if o.success => Ok(()),
-        done => {
-            if let Some(name) = &name {
-                let _ = remote.exec(t, &cleanup(name), Some(timeout)).await;
+        Ok(o) => Err(format!("{}: {}", o.exit_label(), o.stderr.trim())),
+        Err(e) => Err(describe_error(&e)),
+    }
+}
+
+/// A file name part from a provider name or an id: what isn't a letter, a digit, `-`, `_` or `.`
+/// becomes `_`.
+fn file_part(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' }).collect()
+}
+
+/// A machine's push lock (`claude-locks/<provider>-<id>.lock` beside the state file).
+fn lock_path(path: &Path, provider: &str, id: &str) -> PathBuf {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    dir.join("claude-locks").join(format!("{}-{}.lock", file_part(provider), file_part(id)))
+}
+
+/// Remove the push locks of machines that are gone (nothing pushes to them any more).
+fn forget_locks(path: &Path, gone: &[(String, String)]) {
+    for (provider, id) in gone {
+        let _ = std::fs::remove_file(lock_path(path, provider, id));
+    }
+}
+
+/// Take a machine's push lock, waiting up to `wait` for another push to it to end: held across
+/// one push — what it should get read afresh, the push, its record — so two pushes to one machine
+/// (a `claude off` meeting a setup's push) happen one after the other, and the record says what
+/// the last of them put there. `Ok(None)`: no lock to be had here (no flock): the push goes on.
+async fn lock_machine(path: &Path, provider: &str, id: &str, wait: Duration) -> Result<Option<std::fs::File>, String> {
+    let lock = lock_path(path, provider, id);
+    if let Some(dir) = lock.parent() {
+        crate::snapshot::create_private_dir(dir).map_err(|e| format!("can't make {}: {e}", dir.display()))?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts.open(&lock).map_err(|e| format!("can't open {}: {e}", lock.display()))?;
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(Some(f)),
+            Err(std::fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            Err(match done {
-                Ok(o) => format!("{}: {}", o.exit_label(), o.stderr.trim()),
-                Err(e) => describe_error(&e),
-            })
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(format!("another push to it was still going after {}s", wait.as_secs()));
+            }
+            Err(std::fs::TryLockError::Error(_)) => return Ok(None),
         }
     }
 }
@@ -1067,8 +1100,9 @@ pub struct Outcome {
     pub name: String,
     pub provider: String,
     pub id: String,
-    /// What it was to get: an account's label (`#2 bob@x`), or `None` (no token).
-    pub label: Option<String>,
+    /// What it got: an account's label (`#2 bob@x`), `token taken off`, or — for a push that
+    /// didn't get as far as knowing — `not pushed`.
+    pub label: String,
     /// Its change of account, if this run made one.
     pub change: Option<Change>,
     pub result: Result<(), String>,
@@ -1077,9 +1111,8 @@ pub struct Outcome {
 impl Outcome {
     /// `#2 bob@x (new, by spread)`, `token taken off (pinned)`.
     pub fn what(&self) -> String {
-        let what = self.label.clone().unwrap_or_else(|| "token taken off".into());
         let why = self.change.as_ref().map(|c| format!(" ({})", c.because())).unwrap_or_default();
-        format!("{what}{why}")
+        format!("{}{why}", self.label)
     }
 
     /// `✓ apple: #2 bob@x (new, by spread)` / `✗ apple: #2 bob@x — timed out after 60s`.
@@ -1115,73 +1148,59 @@ async fn join_all<F: Future>(futs: Vec<F>) -> Vec<F::Output> {
     out.into_iter().map(|o| o.expect("every future finished")).collect()
 }
 
-/// Push each of `pods` what the state says (`pool`'s accounts: its account's token, or none for a
-/// machine that's off; with a [`Source::Flag`] pool, its one token to every pod), side by side, each
-/// within [`PUSH_TIMEOUT`], then record what went. A pod with no assignment (with a pool that isn't
-/// `--cc-token`'s) is skipped. `changes` are the assignments this run made, said beside each.
-pub async fn push_all(
-    remote: &dyn Remote,
-    path: &Path,
-    pool: &Pool,
-    state: &State,
-    pods: &[(Pod, SshTarget)],
-    changes: &[Change],
-    now: u64,
-) -> Result<Vec<Outcome>, String> {
-    let mut files = TokenFiles::new().map_err(|e| format!("can't make a private temp dir for the tokens: {e}"))?;
-    // Per pod: the account it gets (`Some(None)`: none), or `None` to skip it.
-    let mut jobs: Vec<(&Pod, &SshTarget, Option<&Account>, Option<PathBuf>)> = Vec::new();
-    for (pod, t) in pods {
-        let account = if pool.source == Source::Flag {
-            pool.accounts.first()
-        } else {
-            match state.of(pod) {
-                None => continue,
-                Some(a) => match &a.account {
-                    None => None,
-                    Some(e) => match pool.get(e) {
-                        Some(acc) => Some(acc),
-                        None => continue,
-                    },
-                },
-            }
+/// One machine's push under its lock ([`lock_machine`]): what it should have read afresh from the
+/// state — its account's token (`pool`'s), or none when it's off; with a [`Source::Flag`] pool, that
+/// one token — pushed, and recorded once it went. `None`: nothing to push (no assignment, or an
+/// account no longer in the pool: its next `claude push` spreads it).
+async fn push_one(remote: &dyn Remote, path: &Path, pool: &Pool, pod: &Pod, t: &SshTarget, now: u64) -> Option<(String, Result<(), String>)> {
+    let failed = |e: String| Some(("not pushed".to_string(), Err(e)));
+    let _lock = match lock_machine(path, &pod.provider, &pod.id, MACHINE_LOCK_WAIT).await {
+        Ok(l) => l,
+        Err(e) => return failed(e),
+    };
+    let account: Option<&Account> = if pool.source == Source::Flag {
+        pool.accounts.first()
+    } else {
+        let state = match load(path) {
+            Ok(s) => s,
+            Err(e) => return failed(e),
         };
-        let file = match account {
-            Some(acc) => Some(files.file(acc).map_err(|e| format!("can't write a token's temp file: {e}"))?),
+        match &state.of(pod)?.account {
             None => None,
-        };
-        jobs.push((pod, t, account, file));
+            Some(e) => Some(pool.get(e)?),
+        }
+    };
+    let label = account.map_or_else(|| "token taken off".to_string(), Account::label);
+    let mut result = push(remote, t, account.map(Account::token), PUSH_TIMEOUT).await;
+    if result.is_ok() {
+        let (email, fp) = (account.map(|a| a.email.clone()), account.map(Account::fingerprint));
+        if let Err(e) = record(path, |s| (record_push(s, &pod.provider, &pod.id, email.as_deref(), fp.as_deref(), now), ())) {
+            result = Err(format!("pushed, but not recorded: {e}"));
+        }
     }
-    let pushes: Vec<_> = jobs.iter().map(|(_, t, _, file)| push(remote, t, file.as_deref(), PUSH_TIMEOUT)).collect();
+    Some((label, result))
+}
+
+/// Push each of `pods` what the state says it should have when its turn comes ([`push_one`]), side
+/// by side, each within [`PUSH_TIMEOUT`]. `changes` are the assignments this run made, said beside
+/// each. A pod with nothing to push isn't in the outcomes.
+pub async fn push_all(remote: &dyn Remote, path: &Path, pool: &Pool, pods: &[(Pod, SshTarget)], changes: &[Change], now: u64) -> Vec<Outcome> {
+    let pushes: Vec<_> = pods.iter().map(|(pod, t)| push_one(remote, path, pool, pod, t, now)).collect();
     let results = join_all(pushes).await;
-    drop(files);
-    let outcomes: Vec<Outcome> = jobs
-        .iter()
+    pods.iter()
         .zip(results)
-        .map(|((pod, _, account, _), result)| Outcome {
-            name: pod.name.clone(),
-            provider: pod.provider.clone(),
-            id: pod.id.clone(),
-            label: account.map(Account::label),
-            change: changes.iter().find(|c| c.provider == pod.provider && c.id == pod.id).cloned(),
-            result,
+        .filter_map(|((pod, _), r)| {
+            let (label, result) = r?;
+            Some(Outcome {
+                name: pod.name.clone(),
+                provider: pod.provider.clone(),
+                id: pod.id.clone(),
+                label,
+                change: changes.iter().find(|c| c.provider == pod.provider && c.id == pod.id).cloned(),
+                result,
+            })
         })
-        .collect();
-    let went: Vec<(String, String, Option<String>, Option<String>)> = jobs
-        .iter()
-        .zip(&outcomes)
-        .filter(|(_, o)| o.result.is_ok())
-        .map(|((pod, _, account, _), _)| (pod.provider.clone(), pod.id.clone(), account.map(|a| a.email.clone()), account.map(Account::fingerprint)))
-        .collect();
-    if !went.is_empty() {
-        record(path, |mut s| {
-            for (provider, id, account, fp) in &went {
-                s = record_push(s, provider, id, account.as_deref(), fp.as_deref(), now);
-            }
-            (s, ())
-        })?;
-    }
-    Ok(outcomes)
+        .collect()
 }
 
 /// The Claude Code stage of setup, `up` and `copy-keys`, for `pods` (each with its SSH target): the
@@ -1198,14 +1217,14 @@ pub async fn stage(remote: &dyn Remote, cfg: &Config, pods: &[(Pod, SshTarget)],
         return Ok(None);
     }
     let path = state_path(cfg)?;
-    let (state, changes) = if pool.source == Source::Flag {
-        (load(&path)?, Vec::new())
+    let changes = if pool.source == Source::Flag {
+        Vec::new()
     } else {
         let owners = owners_for(cfg);
         let machines: Vec<Machine> = pods.iter().map(|(p, _)| Machine::new(p, &owners)).collect();
-        record(&path, |s| assign(s, &pool, &owners, &machines, &Want::Ensure, now))?
+        record(&path, |s| assign(s, &pool, &owners, &machines, &Want::Ensure, now))?.1
     };
-    push_all(remote, &path, &pool, &state, pods, &changes, now).await.map(Some)
+    Ok(Some(push_all(remote, &path, &pool, pods, &changes, now).await))
 }
 
 #[cfg(test)]

@@ -395,22 +395,26 @@ fn the_state_file_is_private_and_a_broken_one_is_left_alone() {
 
 // ---- the push command, run for real ---------------------------------------------------
 
-/// Run [`push_command`] with bash in `home` as `$HOME`, `token` copied there first (as scp
-/// would) when given: (exit code, stdout, stderr).
+/// Run [`push_command`] with bash in `home` as `$HOME`, `token` on its stdin (as ssh would hand
+/// it over) when given: (exit code, stdout, stderr).
 fn run_push(home: &Path, token: Option<&str>) -> (i32, String, String) {
-    let name = ".arena-claude-token-test";
-    if let Some(t) = token {
-        std::fs::write(home.join(name), format!("{t}\n")).unwrap();
-    }
-    let cmd = push_command(token.map(|_| name));
-    let out = std::process::Command::new("bash")
+    use std::io::Write;
+    let mut child = std::process::Command::new("bash")
         .arg("-c")
-        .arg(&cmd)
+        .arg(push_command(token.is_some()))
         .env("HOME", home)
         .env_remove("ARENA_CC")
-        .stdin(std::process::Stdio::null())
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("bash");
+    let mut stdin = child.stdin.take().unwrap();
+    if let Some(t) = token {
+        stdin.write_all(format!("{t}\n").as_bytes()).unwrap();
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
     (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into(), String::from_utf8_lossy(&out.stderr).into())
 }
 
@@ -422,12 +426,12 @@ fn token_lines(text: &str) -> Vec<&str> {
     text.lines().filter(|l| l.contains("CLAUDE_CODE_OAUTH_TOKEN")).collect()
 }
 
-/// What's in `home` besides the rc files and `~/.claude.json`: nothing should be.
-fn leftovers(home: &Path) -> Vec<String> {
+/// What's in `home` besides the rc files, `~/.claude.json` and `keep`: nothing should be.
+fn leftovers(home: &Path, keep: &[&str]) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(home)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| ![".bashrc", ".zshrc", ".claude.json"].contains(&n.as_str()))
+        .filter(|n| ![".bashrc", ".zshrc", ".claude.json"].contains(&n.as_str()) && !keep.contains(&n.as_str()))
         .collect();
     v.sort();
     v
@@ -458,13 +462,14 @@ fn the_push_replaces_every_old_token_line_keeps_the_rest_and_a_repush_changes_no
     assert_eq!(read(home, ".zshrc"), format!("source ~/.p10k.zsh\n{want}\n"));
     let cj: serde_json::Value = serde_json::from_str(&read(home, ".claude.json")).unwrap();
     assert_eq!((cj["theme"].as_str(), cj["hasCompletedOnboarding"].as_bool()), (Some("dark"), Some(true)));
-    assert_eq!(leftovers(home), Vec::<String>::new(), "the token's file and the temp files are gone");
+    assert_eq!(leftovers(home, &[]), Vec::<String>::new(), "no temp file is left");
 
-    // The same again: byte for byte the same files, not rewritten.
-    let before = (read(home, ".bashrc"), std::fs::metadata(home.join(".bashrc")).unwrap().modified().unwrap());
+    // The same again: byte for byte the same files, not rewritten (nor ~/.claude.json).
+    let mtime = |f: &str| std::fs::metadata(home.join(f)).unwrap().modified().unwrap();
+    let before = (read(home, ".bashrc"), mtime(".bashrc"), mtime(".claude.json"));
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(run_push(home, Some(&tok(1))).0, 0);
-    assert_eq!((read(home, ".bashrc"), std::fs::metadata(home.join(".bashrc")).unwrap().modified().unwrap()), before);
+    assert_eq!((read(home, ".bashrc"), mtime(".bashrc"), mtime(".claude.json")), before);
 
     // Moved to another account: that token, and only that one.
     assert_eq!(run_push(home, Some(&tok(2))).0, 0);
@@ -477,7 +482,7 @@ fn the_push_replaces_every_old_token_line_keeps_the_rest_and_a_repush_changes_no
     assert_eq!((code, out.trim()), (0, "claude: token removed"));
     assert_eq!(read(home, ".bashrc"), "alias ll='ls -l'\nexport HF_TOKEN=\"hf\"\n# mine\n");
     assert_eq!(read(home, ".zshrc"), "source ~/.p10k.zsh\n");
-    assert_eq!(leftovers(home), Vec::<String>::new());
+    assert_eq!(leftovers(home, &[]), Vec::<String>::new());
 }
 
 #[test]
@@ -485,17 +490,18 @@ fn off_on_a_machine_with_no_rc_files_makes_none_and_a_missing_token_changes_noth
     let d = tmp("push-none");
     let home = &d.0;
     assert_eq!(run_push(home, None).0, 0);
-    assert!(leftovers(home).is_empty() && !home.join(".bashrc").exists() && !home.join(".zshrc").exists());
-    // A token that didn't arrive (an scp that failed quietly): exit 3, nothing written.
+    assert!(leftovers(home, &[]).is_empty() && !home.join(".bashrc").exists() && !home.join(".zshrc").exists());
+    // A token that didn't arrive on stdin: exit 3, nothing written.
     std::fs::write(home.join(".bashrc"), format!("export CLAUDE_CODE_OAUTH_TOKEN=\"{}\"\n", tok(1))).unwrap();
     let out = std::process::Command::new("bash")
         .arg("-c")
-        .arg(push_command(Some(".arena-claude-token-never")))
+        .arg(push_command(true))
         .env("HOME", home)
+        .stdin(std::process::Stdio::null())
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("the token didn't arrive"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no token arrived on stdin"));
     assert_eq!(token_lines(&read(home, ".bashrc")).len(), 1);
     // A fresh machine (no rc files, no ~/.claude.json): both made, with the token.
     std::fs::remove_file(home.join(".bashrc")).unwrap();
@@ -504,35 +510,76 @@ fn off_on_a_machine_with_no_rc_files_makes_none_and_a_missing_token_changes_noth
     assert!(read(home, ".claude.json").contains("hasCompletedOnboarding"));
 }
 
+/// Review r1: an rc file that's a link (dotfiles) stays a link, its file rewritten with its mode;
+/// a rewrite that can't be made leaves the old file whole — never a cut one.
+#[cfg(unix)]
+#[test]
+fn the_rewrite_goes_through_links_keeps_the_mode_and_a_failure_leaves_the_old_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmp("push-links");
+    let home = &d.0;
+    std::fs::create_dir_all(home.join("dotfiles")).unwrap();
+    write_mode(&home.join("dotfiles/zshrc"), "source ~/.p10k.zsh\n", 0o644);
+    std::os::unix::fs::symlink(home.join("dotfiles/zshrc"), home.join(".zshrc")).unwrap();
+    write_mode(&home.join(".bashrc"), "# mine\n", 0o640);
+    assert_eq!(run_push(home, Some(&tok(1))).0, 0);
+    assert!(std::fs::symlink_metadata(home.join(".zshrc")).unwrap().file_type().is_symlink(), "still a link");
+    assert_eq!(token_lines(&read(home, "dotfiles/zshrc")).len(), 1);
+    assert_eq!(std::fs::metadata(home.join("dotfiles/zshrc")).unwrap().permissions().mode() & 0o777, 0o644);
+    assert_eq!(std::fs::metadata(home.join(".bashrc")).unwrap().permissions().mode() & 0o777, 0o640);
+    assert_eq!(leftovers(home, &["dotfiles"]), Vec::<String>::new());
+    assert!(std::fs::read_dir(home.join("dotfiles")).unwrap().count() == 1, "no temp file beside the link's file");
+
+    // Root reads anything: the read-only case only means something for another user.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    // Its directory read-only: no temp file can be made beside it — the push fails, the file is
+    // as it was (the old token still in it).
+    let before = read(home, "dotfiles/zshrc");
+    std::fs::set_permissions(home.join("dotfiles"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (code, _, _) = run_push(home, Some(&tok(2)));
+    std::fs::set_permissions(home.join("dotfiles"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_ne!(code, 0);
+    assert_eq!(read(home, "dotfiles/zshrc"), before);
+}
+
 #[test]
 fn the_push_command_never_carries_a_token() {
-    for cmd in [push_command(Some(".arena-claude-token-1")), push_command(None)] {
+    for cmd in [push_command(true), push_command(false)] {
         assert!(!cmd.contains("sk-ant"), "{cmd}");
         assert!(cmd.contains("ENVIRON[\"ARENA_CC\"]"), "the token reaches awk through its environment");
     }
+    assert!(push_command(true).contains("IFS= read -r ARENA_CC"), "read from stdin, by the shell's builtin");
 }
 
 // ---- the push, through a scripted remote ---------------------------------------------
 
-/// A [`FakeRemote`] that also keeps what each copied file held when it was copied (it's deleted
-/// right after), and where it was.
+/// A [`FakeRemote`] whose calls also say when they started and ended (the order two pushes to
+/// one machine ran in).
 #[derive(Default)]
-struct Capture {
+struct Timed {
     fake: FakeRemote,
-    copied: std::sync::Mutex<Vec<(String, String, String)>>,
-    locals: std::sync::Mutex<Vec<PathBuf>>,
+    spans: std::sync::Mutex<Vec<(String, tokio::time::Instant, tokio::time::Instant)>>,
 }
 
 #[async_trait::async_trait]
-impl Remote for Capture {
+impl Remote for Timed {
     async fn exec(&self, t: &SshTarget, cmd: &str, timeout: Option<Duration>) -> crate::Result<SshOutput> {
-        self.fake.exec(t, cmd, timeout).await
+        let from = tokio::time::Instant::now();
+        let r = self.fake.exec(t, cmd, timeout).await;
+        self.spans.lock().unwrap().push(("exec".into(), from, tokio::time::Instant::now()));
+        r
+    }
+
+    async fn exec_input(&self, t: &SshTarget, cmd: &str, input: &[u8], timeout: Option<Duration>) -> crate::Result<SshOutput> {
+        let from = tokio::time::Instant::now();
+        let r = self.fake.exec_input(t, cmd, input, timeout).await;
+        self.spans.lock().unwrap().push(("exec_input".into(), from, tokio::time::Instant::now()));
+        r
     }
 
     async fn copy(&self, t: &SshTarget, local: &str, remote: &str, timeout: Option<Duration>) -> crate::Result<SshOutput> {
-        let held = std::fs::read_to_string(local).unwrap_or_default();
-        self.locals.lock().unwrap().push(PathBuf::from(local));
-        self.copied.lock().unwrap().push((format!("{}:{}", t.host, t.port), remote.to_string(), held));
         self.fake.copy(t, local, remote, timeout).await
     }
 
@@ -564,37 +611,30 @@ fn config_in(d: &TmpDir, n: u32) -> Config {
     Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR={}\nCLAUDE_TOKENS_FILE={}\n", d.0.join("state").display(), file.display()))
 }
 
+/// What each host was sent on stdin.
+fn inputs(fake: &FakeRemote) -> Vec<(String, String)> {
+    fake.inputs().into_iter().map(|(h, i)| (h, String::from_utf8(i).unwrap())).collect()
+}
+
 #[cfg(unix)]
 #[tokio::test]
-async fn each_pod_gets_its_own_accounts_token_and_nothing_with_a_token_is_left() {
+async fn each_pod_gets_its_own_accounts_token_on_stdin_and_never_in_a_command_or_a_file() {
     let d = tmp("stage");
     let cfg = config_in(&d, 2);
     let pods = [pod("apple", "1", "10.0.0.1"), pod("bloom", "2", "10.0.0.2")];
-    let r = Capture::default();
+    let r = FakeRemote::new();
     let out = stage(&r, &cfg, &pods, None, T0).await.unwrap().expect("a pool");
     let lines: Vec<String> = out.iter().map(Outcome::line).collect();
     assert_eq!(lines, ["✓ apple: #1 u1@x (new, by spread)", "✓ bloom: #2 u2@x (new, by spread)"]);
 
-    // apple got #1's token, bloom #2's — one copy each, never the other's.
-    let copied = r.copied.lock().unwrap().clone();
-    assert_eq!(copied.len(), 2);
-    for (host, held) in [("10.0.0.1:22", tok(1)), ("10.0.0.2:22", tok(2))] {
-        let mine: Vec<_> = copied.iter().filter(|(h, _, _)| h == host).collect();
-        assert_eq!(mine.len(), 1, "{host}");
-        assert_eq!(mine[0].2, format!("{held}\n"), "{host}");
-        assert!(mine[0].1.starts_with(".arena-claude-token-"), "into $HOME, a name of its own");
-    }
-    // No token in any command: it went by scp only.
-    for c in r.fake.calls() {
-        if let RemoteCall::Exec { cmd, .. } = c {
-            assert!(!cmd.contains("sk-ant"), "{cmd}");
+    // apple got #1's token, bloom #2's — on stdin, once each, never the other's.
+    assert_eq!(inputs(&r), [("10.0.0.1:22".to_string(), format!("{}\n", tok(1))), ("10.0.0.2:22".to_string(), format!("{}\n", tok(2)))]);
+    // No token in any command, and nothing copied: no file to leave behind.
+    for c in r.calls() {
+        match c {
+            RemoteCall::Exec { cmd, .. } => assert!(!cmd.contains("sk-ant"), "{cmd}"),
+            RemoteCall::Copy { .. } => panic!("a token never goes by file: {c:?}"),
         }
-    }
-    // The local copies are gone, their private dir with them.
-    let locals = r.locals.lock().unwrap().clone();
-    assert_eq!(locals.len(), 2);
-    for l in &locals {
-        assert!(!l.exists() && !l.parent().unwrap().exists(), "{}", l.display());
     }
 
     // Recorded: assigned and pushed, with the token's fingerprint.
@@ -602,44 +642,71 @@ async fn each_pod_gets_its_own_accounts_token_and_nothing_with_a_token_is_left()
     let a = s.get("hetzner", "1").unwrap();
     assert_eq!(a.account, acct("u1@x"));
     assert_eq!(a.pushed.as_ref().map(|p| (p.account.clone(), p.fp.clone())), Some((acct("u1@x"), Some(fingerprint(&tok(1))))));
-    let p = load_pool(&cfg).unwrap();
-    assert!(!out_of_date(a, &p));
+    assert!(!out_of_date(a, &load_pool(&cfg).unwrap()));
 
     // Again: the same accounts (nothing new), pushed again.
-    let r2 = Capture::default();
-    let again = stage(&r2, &cfg, &pods, None, T0 + 60).await.unwrap().unwrap();
+    let again = stage(&FakeRemote::new(), &cfg, &pods, None, T0 + 60).await.unwrap().unwrap();
     assert_eq!(again.iter().map(Outcome::line).collect::<Vec<_>>(), ["✓ apple: #1 u1@x", "✓ bloom: #2 u2@x"]);
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn a_failed_copy_cleans_up_and_records_nothing_and_off_sends_no_file() {
+async fn a_failed_push_records_nothing_and_off_sends_no_token() {
     let d = tmp("stage-fail");
     let cfg = config_in(&d, 2);
     let pods = [pod("apple", "1", "10.0.0.1"), pod("bloom", "2", "10.0.0.2")];
-    let r = Capture::default();
-    r.fake.script("10.0.0.2:22", [crate::remote::FakeReply::exit(1, "scp: disk full")]);
+    let r = FakeRemote::new();
+    r.script("10.0.0.2:22", [crate::remote::FakeReply::exit(255, "ssh: connect to host 10.0.0.2 port 22: Connection refused")]);
     let out = stage(&r, &cfg, &pods, None, T0).await.unwrap().unwrap();
-    assert_eq!(out[1].line(), "✗ bloom: #2 u2@x (new, by spread) — copying the token: scp: disk full");
-    let bloom: Vec<RemoteCall> = r.fake.calls_to("10.0.0.2:22");
-    assert!(matches!(&bloom[1], RemoteCall::Exec { cmd, .. } if cmd.starts_with("rm -f \"$HOME/.arena-claude-token-")), "{bloom:?}");
-    assert_eq!(bloom.len(), 2, "no push command after a failed copy");
+    assert_eq!(out[1].line(), "✗ bloom: #2 u2@x (new, by spread) — exit 255: ssh: connect to host 10.0.0.2 port 22: Connection refused");
     let s = load(&state_path(&cfg).unwrap()).unwrap();
     assert!(s.get("hetzner", "1").unwrap().pushed.is_some());
     assert!(s.get("hetzner", "2").unwrap().pushed.is_none(), "a failed push isn't recorded");
 
-    // apple off: only the command (no file), which takes the token off; recorded as none.
+    // apple off: the command alone (nothing on stdin), which takes the token off; recorded as none.
     let path = state_path(&cfg).unwrap();
     let pool = load_pool(&cfg).unwrap();
     let ms = [Machine::new(&pods[0].0, &Owners::new())];
-    let (s, changes) = record(&path, |s| assign(s, &pool, &Owners::new(), &ms, &Want::Pin(None), T0 + 1)).unwrap();
-    let r = Capture::default();
-    let out = push_all(&r, &path, &pool, &s, &pods[..1], &changes, T0 + 1).await.unwrap();
+    let (_, changes) = record(&path, |s| assign(s, &pool, &Owners::new(), &ms, &Want::Pin(None), T0 + 1)).unwrap();
+    let r = FakeRemote::new();
+    let out = push_all(&r, &path, &pool, &pods[..1], &changes, T0 + 1).await;
     assert_eq!(out[0].line(), "✓ apple: token taken off (pinned)");
-    assert!(r.copied.lock().unwrap().is_empty());
-    assert!(matches!(&r.fake.calls()[..], [RemoteCall::Exec { cmd, .. }] if cmd.contains("ARENA_CC=;")));
+    assert!(r.inputs().is_empty());
+    assert!(matches!(&r.calls()[..], [RemoteCall::Exec { cmd, .. }] if cmd.contains("ARENA_CC=;")));
     let a = load(&path).unwrap().get("hetzner", "1").cloned().unwrap();
     assert_eq!(a.pushed.map(|p| p.account), Some(None));
+}
+
+/// Review r1: two pushes to one machine that meet — a slow one, and a `claude off` made while it
+/// runs — go one after the other (its lock), the second reading what the machine should have when
+/// its turn comes: the box ends with no token, and the record says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn two_pushes_to_one_machine_take_turns_and_the_record_says_what_the_last_put_there() {
+    let d = tmp("stage-race");
+    let cfg = config_in(&d, 2);
+    let path = state_path(&cfg).unwrap();
+    let pool = load_pool(&cfg).unwrap();
+    let apple = [pod("apple", "1", "10.0.0.1")];
+    let ms = [Machine::new(&apple[0].0, &Owners::new())];
+    record(&path, |s| assign(s, &pool, &Owners::new(), &ms, &Want::Ensure, T0)).unwrap();
+    let r = Timed::default();
+    // The first push takes 300 ms on the pod.
+    r.fake.script("10.0.0.1:22", [crate::remote::FakeReply::ok().after(Duration::from_millis(300))]);
+    let first = push_all(&r, &path, &pool, &apple, &[], T0);
+    let second = async {
+        // Off, decided while the first push is on its way; then its push.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        record(&path, |s| assign(s, &pool, &Owners::new(), &ms, &Want::Pin(None), T0 + 1)).unwrap();
+        push_all(&r, &path, &pool, &apple, &[], T0 + 1).await
+    };
+    let (a, b) = tokio::join!(first, second);
+    assert_eq!((a[0].line(), b[0].line()), ("✓ apple: #1 u1@x".to_string(), "✓ apple: token taken off".to_string()));
+    let spans = r.spans.lock().unwrap().clone();
+    assert_eq!(spans.iter().map(|(k, _, _)| k.as_str()).collect::<Vec<_>>(), ["exec_input", "exec"]);
+    assert!(spans[1].1 >= spans[0].2, "the second push began after the first ended: {spans:?}");
+    let a = load(&path).unwrap().get("hetzner", "1").cloned().unwrap();
+    assert_eq!((a.account, a.pushed.map(|p| p.account)), (None, Some(None)));
 }
 
 #[cfg(unix)]
@@ -653,12 +720,43 @@ async fn cc_token_goes_to_every_pod_and_moves_no_one() {
         assign(s, &load_pool(&cfg).unwrap(), &Owners::new(), &[Machine::new(&pods[0].0, &Owners::new())], &Want::Pin(acct("u2@x")), T0)
     })
     .unwrap();
-    let r = Capture::default();
+    let r = FakeRemote::new();
     let out = stage(&r, &cfg, &pods, Some(&tok(5)), T0 + 1).await.unwrap().unwrap();
-    assert!(out.iter().all(|o| o.result.is_ok() && o.label.as_deref() == Some("#1 --cc-token")), "{out:?}");
-    assert!(r.copied.lock().unwrap().iter().all(|(_, _, held)| *held == format!("{}\n", tok(5))));
+    assert!(out.iter().all(|o| o.result.is_ok() && o.label == "#1 --cc-token"), "{out:?}");
+    assert!(inputs(&r).iter().all(|(_, i)| *i == format!("{}\n", tok(5))) && inputs(&r).len() == 2);
     let after = load(&state_path(&cfg).unwrap()).unwrap();
     assert_eq!(after.get("hetzner", "1").unwrap().account, s.get("hetzner", "1").unwrap().account, "no one moved");
     assert!(after.get("hetzner", "2").is_none(), "an unassigned pod stays so: its next push spreads it");
     assert!(out_of_date(after.get("hetzner", "1").unwrap(), &load_pool(&cfg).unwrap()), "apple has --cc-token's, not #2's");
+}
+
+/// Review r1: a machine terminated — by arena, or seen gone by any complete listing — stops
+/// counting as load (and its push lock goes); a listing that failed forgets nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn listings_and_terminates_forget_gone_machines_and_their_locks() {
+    let d = tmp("forget");
+    let cfg = config_in(&d, 2);
+    let path = state_path(&cfg).unwrap();
+    let pods = [pod("apple", "1", "10.0.0.1"), pod("bloom", "2", "10.0.0.2"), pod("cloud", "3", "10.0.0.3")];
+    stage(&FakeRemote::new(), &cfg, &pods, None, T0).await.unwrap();
+    assert!(lock_path(&path, "hetzner", "1").exists());
+    record_terminated(Some(&path), Some("hetzner"), "1");
+    assert!(load(&path).unwrap().get("hetzner", "1").is_none() && !lock_path(&path, "hetzner", "1").exists());
+    let failed = Listing::from_results(vec![("hetzner".into(), Err(crate::Error::provider("boom")))]);
+    record_listing(Some(&path), &failed);
+    assert_eq!(load(&path).unwrap().machines.len(), 2);
+    let only_cloud = Listing::from_results(vec![("hetzner".into(), Ok(vec![pods[2].0.clone()]))]);
+    record_listing(Some(&path), &only_cloud);
+    assert_eq!(load(&path).unwrap().machines.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["3"]);
+    assert!(!lock_path(&path, "hetzner", "2").exists() && lock_path(&path, "hetzner", "3").exists());
+    // A new machine now: the load is cloud's alone (#3 → u1, so it goes to u2).
+    let new = [pod("dune", "4", "10.0.0.4")];
+    let out = stage(&FakeRemote::new(), &cfg, &new, None, T0 + 60).await.unwrap().unwrap();
+    assert_eq!(out[0].line(), "✓ dune: #2 u2@x (new, by spread)");
+    // No state file yet: a listing makes none.
+    let empty = tmp("forget-none");
+    let none = empty.0.join("devtest").join(STATE_FILE);
+    record_listing(Some(&none), &only_cloud);
+    assert!(!none.exists() && !empty.0.join("devtest").exists());
 }

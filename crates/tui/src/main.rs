@@ -841,6 +841,9 @@ async fn refresh(
     // rewritten more than once a minute. Only the providers that listed this time count
     // (`fresh`): a rate-limited one's carried rows say nothing new.
     arena_core::spend::record_listing(spend_path(cfg).as_deref(), &fresh, &pods, &Naming::from_config(cfg), listed_at);
+    // The Claude Code accounts forget the machines this listing shows are gone, then are read for
+    // the detail pane.
+    arena_core::claude::record_listing(claude_path(cfg).as_deref(), &fresh);
     let claude = claude_path(cfg).and_then(|p| arena_core::claude::load(&p).ok());
     // The balance's runway is judged against what is billing as listed (not the pending
     // placeholders, and after the details filled the prices), a provider that failed to
@@ -2582,6 +2585,7 @@ async fn execute(
         Action::Terminate => match provider.terminate_pod(&pod.id).await {
             Ok(()) => {
                 record_spend(cfg, &arena_core::spend::Event::Terminated { provider: Some(&pod.provider), id: &pod.id });
+                arena_core::claude::record_terminated(claude_path(cfg).as_deref(), Some(&pod.provider), &pod.id);
                 format!("✓ terminated {name}")
             }
             Err(e) => format!("✗ terminate {name} failed: {}", lock::explain(name, &e)),

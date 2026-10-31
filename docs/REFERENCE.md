@@ -1955,12 +1955,17 @@ under the old email until then.
 **The push.** A machine gets its own account's token and nothing else, as
 `export CLAUDE_CODE_OAUTH_TOKEN="…"` in `~/.bashrc` and `~/.zshrc` — the channel copy-keys always
 used — with every earlier such line taken out (a moved machine has the new token only; `off` takes
-them all out), and Claude Code's onboarding marked done in `~/.claude.json`. The token goes **by scp
-in a file of its own** (owner-only, deleted on the pod by the command that reads it, and here once
-the push is done), never in a command line: not in `ps` at either end, nor in any log or dry run. A
-re-push changes nothing on a box that's already right. Each push has 60 s. What went is recorded
-(the account and a fingerprint of its token), so a moved machine or a rotated token shows as out of
-date. Shells already open keep their old token until they start again.
+them all out), and Claude Code's onboarding marked done in `~/.claude.json`. The token goes **on the
+ssh command's stdin**: never in a command line (not in `ps` at either end, nor in any log or dry
+run) and never in a file, here or on the pod, that a dropped connection could leave behind. Each rc
+file is rewritten beside itself (keeping its mode; a link's file, not the link) and renamed over
+it, so a full disk or a lost connection leaves the old file whole. A re-push changes nothing on a
+box that's already right. Each push has 60 s. Two pushes to one machine take turns (a lock per
+machine), each reading what the machine should have when its turn comes. What went is recorded (the
+account and a fingerprint of its token), so a moved machine or a rotated token shows as out of
+date. Shells already open keep their old token until they start again. A machine terminated by
+arena, or missing from a complete listing (`pods list`, the dashboard, the snapshot cron line,
+`teardown --check`, `balance`), is forgotten, so it stops counting as its account's load.
 
 - `arena claude accounts [--json]` — the pool: each account's number, email, machines and people;
   `*` marks a machine whose box may not have its account's current token yet; the machines that are

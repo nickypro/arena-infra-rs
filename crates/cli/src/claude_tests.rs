@@ -93,18 +93,23 @@ async fn run(args: &[&str], fleet: &Listed, fake: &Arc<FakeRemote>, cfg: &Config
     handle_claude(c, fleet, fake.clone(), cfg, true).await
 }
 
-/// Per pod: how many token files were copied to it, and the commands run there.
+/// Per pod: how many tokens it was sent (on stdin), and the commands run there.
 fn sent(fake: &FakeRemote, n: u16) -> (usize, Vec<String>) {
-    let calls = fake.calls_to(&host(n));
-    let copies = calls.iter().filter(|c| matches!(c, RemoteCall::Copy { remote, .. } if remote.starts_with(".arena-claude-token-"))).count();
-    let cmds = calls.into_iter().filter_map(|c| if let RemoteCall::Exec { cmd, .. } = c { Some(cmd) } else { None }).collect();
-    (copies, cmds)
+    let tokens = fake.inputs().iter().filter(|(h, _)| *h == host(n)).count();
+    let cmds = fake.calls_to(&host(n)).into_iter().filter_map(|c| if let RemoteCall::Exec { cmd, .. } = c { Some(cmd) } else { None }).collect();
+    (tokens, cmds)
+}
+
+/// The token pod `n` was last sent.
+fn token_sent(fake: &FakeRemote, n: u16) -> Option<String> {
+    fake.inputs().into_iter().rev().find(|(h, _)| *h == host(n)).map(|(_, i)| String::from_utf8(i).unwrap().trim().to_string())
 }
 
 fn no_token_in_any_command(fake: &FakeRemote) {
     for c in fake.calls() {
-        if let RemoteCall::Exec { cmd, .. } = c {
-            assert!(!cmd.contains("sk-ant"), "a token in a command: {cmd}");
+        match c {
+            RemoteCall::Exec { cmd, .. } => assert!(!cmd.contains("sk-ant"), "a token in a command: {cmd}"),
+            RemoteCall::Copy { local, .. } => assert!(!local.contains("claude"), "a token in a file: {local}"),
         }
     }
 }
@@ -134,7 +139,8 @@ async fn push_spreads_assign_moves_off_removes_and_each_pod_gets_only_its_own_to
     let fake = Arc::new(FakeRemote::new());
     run(&["push"], &fleet, &fake, &cfg).await.unwrap();
     for (n, acct) in [(1, 1), (2, 2), (3, 1)] {
-        assert_eq!(sent(&fake, n).0, 1, "one token file to pod {n}");
+        assert_eq!(sent(&fake, n).0, 1, "one token to pod {n}");
+        assert_eq!(token_sent(&fake, n), Some(tok(acct)), "pod {n} gets its own account's");
         assert_eq!(on(&cfg, &fleet.0[n as usize - 1]), (Some(format!("u{acct}@x")), Some((Some(format!("u{acct}@x")), fp(acct)))));
     }
     no_token_in_any_command(&fake);
@@ -151,6 +157,7 @@ async fn push_spreads_assign_moves_off_removes_and_each_pod_gets_only_its_own_to
     let fake = Arc::new(FakeRemote::new());
     run(&["assign", "apple", "u2@x"], &fleet, &fake, &cfg).await.unwrap();
     assert_eq!((sent(&fake, 1).0, sent(&fake, 2).0, sent(&fake, 3).0), (1, 0, 0));
+    assert_eq!(token_sent(&fake, 1), Some(tok(2)));
     assert_eq!(on(&cfg, &fleet.0[0]), (Some("u2@x".into()), Some((Some("u2@x".into()), fp(2)))));
     assert_eq!(state(&cfg).of(&fleet.0[0]).unwrap().how, claude::How::Pinned);
     no_token_in_any_command(&fake);
@@ -159,11 +166,11 @@ async fn push_spreads_assign_moves_off_removes_and_each_pod_gets_only_its_own_to
     run(&["assign", "apple", "2"], &fleet, &fake, &cfg).await.unwrap();
     assert!(fake.calls().is_empty());
 
-    // Off: no file, just the command that takes the lines out; recorded as none.
+    // Off: no token, just the command that takes the lines out; recorded as none.
     let fake = Arc::new(FakeRemote::new());
     run(&["off", "bloom"], &fleet, &fake, &cfg).await.unwrap();
-    let (copies, cmds) = sent(&fake, 2);
-    assert_eq!(copies, 0);
+    let (tokens, cmds) = sent(&fake, 2);
+    assert_eq!(tokens, 0);
     assert!(matches!(&cmds[..], [c] if c.contains("ARENA_CC=;")), "{cmds:?}");
     assert_eq!(on(&cfg, &fleet.0[1]), (None, Some((None, None))));
     // A default push leaves it off; spread puts it back on one.
@@ -179,6 +186,7 @@ async fn push_spreads_assign_moves_off_removes_and_each_pod_gets_only_its_own_to
     let fake = Arc::new(FakeRemote::new());
     run(&["push"], &fleet, &fake, &cfg).await.unwrap();
     assert_eq!((sent(&fake, 1).0, sent(&fake, 2).0, sent(&fake, 3).0), (1, 0, 0), "only apple is on u2@x");
+    assert_eq!(token_sent(&fake, 1), Some(tok(22)));
     assert_eq!(on(&cfg, &fleet.0[0]).1, Some((Some("u2@x".into()), fp(22))));
 
     // u2@x leaves the file: apple is spread again at the next push.
@@ -228,8 +236,8 @@ async fn copy_keys_puts_each_pods_own_token_on_by_scp_never_in_its_command() {
     let no_csv = d.0.join("no-keys").display().to_string();
     crate::handle_copy_keys(fake.clone(), &cfg, &no_csv, None, None, &sel, false, true).await.unwrap();
     for (n, acct) in [(1, "u1@x"), (2, "u2@x")] {
-        let (copies, cmds) = sent(&fake, n);
-        assert_eq!(copies, 1, "pod {n}");
+        let (tokens, cmds) = sent(&fake, n);
+        assert_eq!(tokens, 1, "pod {n}");
         // The keys write first (no Claude line in it any more), then the push.
         assert!(!cmds[0].contains("CLAUDE_CODE_OAUTH_TOKEN"), "{}", cmds[0]);
         assert!(cmds.last().unwrap().contains("ENVIRON[\"ARENA_CC\"]"));
@@ -247,7 +255,7 @@ async fn copy_keys_puts_each_pods_own_token_on_by_scp_never_in_its_command() {
 
     // A failed push fails copy-keys, after the rest is written.
     let fake = Arc::new(FakeRemote::new());
-    fake.script(&host(2), [arena_core::remote::FakeReply::ok(), arena_core::remote::FakeReply::exit(1, "scp: lost connection")]);
+    fake.script(&host(2), [arena_core::remote::FakeReply::ok(), arena_core::remote::FakeReply::exit(255, "ssh: lost connection")]);
     let e = crate::handle_copy_keys(fake.clone(), &cfg, &no_csv, None, None, &sel, false, true).await.unwrap_err().to_string();
     assert_eq!(e, "1 pod(s) didn't get their Claude Code token (`arena claude push` retries)");
 }

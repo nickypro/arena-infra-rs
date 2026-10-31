@@ -30,6 +30,10 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 pub(crate) struct SpendCtx {
     /// `None`: no state directory (or a unit test that didn't ask for one) — nothing recorded.
     path: Option<std::result::Result<PathBuf, String>>,
+    /// The Claude Code accounts' state (`arena_core::claude`), kept in step with the same
+    /// listings and terminates: a machine gone stops counting as an account's load. `None` as
+    /// `path` is.
+    claude: Option<PathBuf>,
     pub api: Arc<dyn SpendApi>,
     /// The fleet's names (`MACHINE_NAME_PREFIX`, `MACHINE_NAME_LIST`): which machines and keys
     /// are this fleet's.
@@ -45,9 +49,11 @@ impl SpendCtx {
         let api_cfg = if cfg!(test) { Config::parse("") } else { cfg.clone() };
         let path = (!cfg!(test) || cfg.get("ARENA_STATE_DIR").is_some())
             .then(|| arena_core::snapshot::state_file_path_for(cfg, spend::SPEND_FILE));
+        let claude = path.is_some().then(|| arena_core::claude::state_path(cfg).ok()).flatten();
         let naming = Naming::from_config(cfg);
         SpendCtx {
             path,
+            claude,
             api: Arc::new(HttpSpendApi::from_config(&api_cfg)),
             prefix: naming.prefix.to_string(),
             list: naming.list.to_vec(),
@@ -74,6 +80,7 @@ impl SpendCtx {
     /// meanwhile is newer than what the listing saw, and the fold keeps it.
     pub(crate) fn listing(&self, listing: &Listing, pods: &[Pod], at: u64) {
         spend::record_listing(self.path(), listing, pods, &self.naming(), at);
+        arena_core::claude::record_listing(self.claude.as_deref(), listing);
     }
 
     /// Record a complete key listing begun `at`: each key's usage, read before anything
@@ -234,12 +241,15 @@ impl Provider for Tracked<'_> {
     }
     async fn terminate_pod(&self, id: &str) -> arena_core::Result<()> {
         self.inner.terminate_pod(id).await?;
-        self.spend.event(&Event::Terminated { provider: self.provider_of(id).as_deref(), id });
+        let provider = self.provider_of(id);
+        self.spend.event(&Event::Terminated { provider: provider.as_deref(), id });
+        arena_core::claude::record_terminated(self.spend.claude.as_deref(), provider.as_deref(), id);
         Ok(())
     }
     async fn terminate_pod_on(&self, provider: &str, id: &str) -> arena_core::Result<()> {
         self.inner.terminate_pod_on(provider, id).await?;
         self.spend.event(&Event::Terminated { provider: Some(provider), id });
+        arena_core::claude::record_terminated(self.spend.claude.as_deref(), Some(provider), id);
         Ok(())
     }
     async fn rename_pod(&self, id: &str, new_name: &str) -> arena_core::Result<()> {
