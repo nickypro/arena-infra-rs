@@ -93,7 +93,8 @@ pub struct PullConfig {
     /// (worse than its default), so the caller then leaves it `None`. Nothing else changes: the
     /// same files land in the same places with the same links.
     pub temp_dir: Option<String>,
-    /// rsync `--dry-run --itemize-changes`: transfer nothing, say per item what would change —
+    /// rsync `--dry-run --itemize-changes --info=backup`: transfer nothing, say per item what
+    /// would change and which of the receiver's files it would move aside —
     /// how `pods copy-home` finds the receiver's own files a sync would move aside
     /// ([`crate::replica::moved_aside`]) before it asks. `false` for every real transfer.
     pub dry_run: bool,
@@ -823,6 +824,10 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
     if pc.dry_run {
         a.push("--dry-run".into());
         a.push("--itemize-changes".into());
+        // Every file the transfer would move into --backup-dir, named — a type change (a file
+        // where the receiver has a symlink, a dir where it has a file) included, which the
+        // itemized line shows as new (review r2). The receiver's messages reach the sender.
+        a.push("--info=backup".into());
     }
     if let Some(t) = pc.io_timeout_secs {
         a.push(format!("--timeout={t}"));

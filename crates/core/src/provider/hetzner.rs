@@ -601,7 +601,7 @@ impl crate::spare::SpareCloud for HetznerProvider {
     /// renamed meanwhile is refused, nothing changed), then ONE `PUT /servers/{id}` with the new
     /// name and its labels minus the spare mark ([`adopt_payload`]); the answer must name it as
     /// asked ([`judge_rename`]). The caller holds [`crate::spare::claim_lock`] across both.
-    async fn adopt(&self, id: &str, name: &str, new_name: &str) -> Result<()> {
+    async fn adopt(&self, id: &str, name: &str, new_name: &str, retry: bool) -> Result<()> {
         if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
             return Err(Error::Config(format!("hetzner: `{id}` isn't a server id")));
         }
@@ -613,8 +613,9 @@ impl crate::spare::SpareCloud for HetznerProvider {
         let ours = crate::spare::label_value(&self.opts.image_scope.prefix);
         let mark = server.pointer(&format!("/labels/{SPARE_LABEL}")).and_then(Value::as_str);
         let now_named = server.get("name").and_then(Value::as_str).unwrap_or_default();
-        // Already done: a retried call whose first PUT went through but whose answer was lost.
-        if mark.is_none() && now_named == new_name {
+        // Already done: this claim's retry, after a PUT that went through with its answer lost
+        // (never a first attempt: another run's claim of the same spare looks the same).
+        if retry && mark.is_none() && now_named == new_name {
             return Ok(());
         }
         if mark != Some(ours.as_str()) || now_named != name {
@@ -2936,7 +2937,7 @@ mod tests {
         let srv = serve(vec![canned(200, "application/json", &spare.to_string()), canned(200, "application/json", &renamed_server("arena9-apple-new"))]);
         let arena9 = || HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=arena9\n"));
         let p = provider(&srv.base, arena9());
-        p.adopt("7", "arena9-spare-2", "arena9-apple-new").await.unwrap();
+        p.adopt("7", "arena9-spare-2", "arena9-apple-new", false).await.unwrap();
         assert_eq!(*srv.requests.lock().unwrap(), ["GET /servers/7 HTTP/1.1", "PUT /servers/7 HTTP/1.1"]);
         assert_eq!(
             serde_json::from_str::<Value>(&srv.bodies.lock().unwrap()[1]).unwrap(),
@@ -2949,16 +2950,19 @@ mod tests {
             json!({"server": {"id": 7, "name": "arena9-spare-9", "labels": {"arena-spare": "arena9"}}}),
         ] {
             let srv = serve(vec![canned(200, "application/json", &server.to_string())]);
-            let e = provider(&srv.base, arena9()).adopt("7", "arena9-spare-2", "arena9-apple-new").await.unwrap_err();
+            let e = provider(&srv.base, arena9()).adopt("7", "arena9-spare-2", "arena9-apple-new", false).await.unwrap_err();
             assert_eq!(e.kind(), Some(crate::error::ProviderErrorKind::Rejected));
             assert!(e.to_string().contains("isn't this cohort's spare arena9-spare-2 any more"), "{e}");
             assert_eq!(srv.requests.lock().unwrap().len(), 1, "no PUT");
         }
-        // A retry after a PUT whose answer was lost: already done, no second PUT.
+        // A retry after a PUT whose answer was lost: already done, no second PUT. A first
+        // attempt that finds it so is another run's claim: refused.
         let done = json!({"server": {"id": 7, "name": "arena9-apple-new", "labels": {"team": "red"}}});
-        let srv = serve(vec![canned(200, "application/json", &done.to_string())]);
-        provider(&srv.base, arena9()).adopt("7", "arena9-spare-2", "arena9-apple-new").await.unwrap();
-        assert_eq!(srv.requests.lock().unwrap().len(), 1, "no PUT");
+        let srv = serve(vec![canned(200, "application/json", &done.to_string()), canned(200, "application/json", &done.to_string())]);
+        provider(&srv.base, arena9()).adopt("7", "arena9-spare-2", "arena9-apple-new", true).await.unwrap();
+        let e = provider(&srv.base, arena9()).adopt("7", "arena9-spare-2", "arena9-apple-new", false).await.unwrap_err();
+        assert!(e.to_string().contains("another run took"), "{e}");
+        assert_eq!(srv.requests.lock().unwrap().len(), 2, "no PUT");
         assert_eq!(adopt_payload("x", None), json!({"name": "x", "labels": {}}));
     }
 }

@@ -101,7 +101,7 @@ impl SpareCloud for Vms {
     async fn spares(&self) -> Result<Vec<Pod>> {
         Ok(self.spares.lock().unwrap().clone())
     }
-    async fn adopt(&self, id: &str, name: &str, new_name: &str) -> Result<()> {
+    async fn adopt(&self, id: &str, name: &str, new_name: &str, _retry: bool) -> Result<()> {
         let mut spares = self.spares.lock().unwrap();
         let Some(i) = spares.iter().position(|p| p.id == id && p.name == name) else { return Err(Error::provider("isn't a spare")) };
         let mut p = spares.remove(i);
@@ -219,8 +219,10 @@ async fn replace_moves_a_vm_to_a_bigger_type_and_its_hostname_follows() {
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(90), "no settle/persist wait on a VM: {:?}", started.elapsed());
     let (on_old, on_new) = (execs(&remote, OLD), execs(&remote, NEW));
-    // Asked who's on it before anything was made, and again before the swap.
-    assert_eq!(on_old.iter().filter(|c| c.contains("ARENA_IDLE_NOW")).count(), 2, "{on_old:?}");
+    // Asked who's on it before anything was made, before the prompt and again after it.
+    assert_eq!(on_old.iter().filter(|c| c.contains("ARENA_IDLE_NOW")).count(), 3, "{on_old:?}");
+    // The copy, then the final sync of what changed since, right before the swap.
+    assert_eq!(on_old.iter().filter(|c| c.contains("\nrsync ") && !c.contains("--dry-run")).count(), 2, "{on_old:?}");
     // The copy ran on the old VM, its remote rsync only on the new VM itself (by server id).
     assert!(
         on_old.iter().any(|c| c.contains("\nrsync ") && c.contains("--rsync-path=") && c.contains("instance-id") && c.contains("202")),
@@ -264,33 +266,39 @@ async fn replace_refuses_a_vm_someone_is_on() {
     }
 }
 
-/// Someone came on while it copied: no swap — the original untouched, `-new` built — and the
-/// way on is `migrate cutover` (it checks again).
+/// Someone came on while it copied — or while its prompt waited (review r2: asked again after
+/// it): no swap — the original untouched, `-new` built — and the way on is `migrate cutover` (it
+/// checks again).
 #[tokio::test(start_paused = true)]
 async fn replace_doesnt_swap_when_someone_came_on_during_the_copy() {
-    let dir = tmpdir("replace-came-on");
-    let cfg = cfg(&dir.0);
-    let f = Vms::new(vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1")], vec![]);
-    *f.to_create.lock().unwrap() = vec![vm("202", "", "", "10.0.0.2", "nbg1")];
-    let remote = Arc::new(FakeRemote::new());
-    let probes = Arc::new(AtomicUsize::new(0));
-    let seen = probes.clone();
-    remote.on(
-        OLD,
-        "ARENA_IDLE_NOW",
-        FakeReply::from_cmd(move |_| {
-            let sessions = if seen.fetch_add(1, Ordering::SeqCst) == 0 { vec![] } else { vec![[10, 9, 9, 9]] };
-            FakeReply::stdout(&Reply { gpu: None, sessions, ..Reply::default() }.render())
-        }),
-    );
-    scripted(&remote, "101", NEW, "202");
-    let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
-    let keys = dir.0.display().to_string();
-    let job = replace_job(&ov, &place, &interrupt, &keys, Source::Create, None, false, &cfg);
-    let e = replace_on(remote.clone(), &f, &cfg, &f, "101".into(), "devtest-alpha".into(), job).await.unwrap_err().to_string();
-    assert!(e.contains("NOT swapping") && e.contains("1 SSH session") && e.contains("arena pods migrate cutover devtest-alpha"), "{e}");
-    assert_eq!(f.calls(), ["create devtest-alpha-new cx33"], "no rename, no terminate");
-    assert_eq!(probes.load(Ordering::SeqCst), 2);
+    for (busy_from, when) in [(1, "while it copied"), (2, "while the prompt waited")] {
+        let dir = tmpdir(&format!("replace-came-on-{busy_from}"));
+        let cfg = cfg(&dir.0);
+        let f = Vms::new(vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1")], vec![]);
+        *f.to_create.lock().unwrap() = vec![vm("202", "", "", "10.0.0.2", "nbg1")];
+        let remote = Arc::new(FakeRemote::new());
+        let probes = Arc::new(AtomicUsize::new(0));
+        let seen = probes.clone();
+        remote.on(
+            OLD,
+            "ARENA_IDLE_NOW",
+            FakeReply::from_cmd(move |_| {
+                let sessions = if seen.fetch_add(1, Ordering::SeqCst) < busy_from { vec![] } else { vec![[10, 9, 9, 9]] };
+                FakeReply::stdout(&Reply { gpu: None, sessions, ..Reply::default() }.render())
+            }),
+        );
+        scripted(&remote, "101", NEW, "202");
+        let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
+        let keys = dir.0.display().to_string();
+        let job = replace_job(&ov, &place, &interrupt, &keys, Source::Create, None, false, &cfg);
+        let e = replace_on(remote.clone(), &f, &cfg, &f, "101".into(), "devtest-alpha".into(), job).await.unwrap_err().to_string();
+        assert!(e.contains("NOT swapping") && e.contains("1 SSH session") && e.contains(when), "{e}");
+        assert!(e.contains("arena pods migrate cutover devtest-alpha"), "{e}");
+        assert_eq!(f.calls(), ["create devtest-alpha-new cx33"], "no rename, no terminate");
+        assert_eq!(probes.load(Ordering::SeqCst), busy_from + 1);
+        // No final sync once someone's on it: only the copy ran.
+        assert_eq!(execs(&remote, OLD).iter().filter(|c| c.contains("\nrsync ") && !c.contains("--dry-run")).count(), 1);
+    }
 }
 
 /// `--server-type` is Hetzner's; GPU flags aren't a VM's — each refused before anything, by the
@@ -439,6 +447,29 @@ async fn the_cutover_waits_for_no_one_on_the_original() {
     migrate_cutover_on(remote.clone(), &f, &cfg, &f, "devtest-alpha", &pods, opts(true), "/nonexistent").await.unwrap();
     assert_eq!(f.calls(), ["rename 101 devtest-alpha-old", "rename 202 devtest-alpha"]);
     assert!(execs(&remote, NEW).iter().any(|c| c.contains("n='devtest-alpha'") && c.contains("hostnamectl")), "the hostname follows");
+
+    // No one on it at first, someone by the time the swap comes (review r2): asked again then.
+    let f = Vms::new(
+        vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1"), vm("202", "devtest-alpha-new", "cx43", "10.0.0.2", "nbg1")],
+        vec![],
+    );
+    let remote = Arc::new(FakeRemote::new());
+    let probes = Arc::new(AtomicUsize::new(0));
+    let seen = probes.clone();
+    remote.on(
+        OLD,
+        "ARENA_IDLE_NOW",
+        FakeReply::from_cmd(move |_| {
+            let sessions = if seen.fetch_add(1, Ordering::SeqCst) == 0 { vec![] } else { vec![[10, 9, 9, 9]] };
+            FakeReply::stdout(&Reply { gpu: None, sessions, ..Reply::default() }.render())
+        }),
+    );
+    scripted(&remote, "101", NEW, "202");
+    let pods = f.list_pods().await.unwrap();
+    let e = migrate_cutover_on(remote.clone(), &f, &cfg, &f, "devtest-alpha", &pods, opts(false), "/nonexistent").await.unwrap_err().to_string();
+    assert!(e.contains("NOT swapping") && e.contains("1 SSH session") && e.contains("nothing was renamed"), "{e}");
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
+    assert_eq!(probes.load(Ordering::SeqCst), 2);
 }
 
 /// The cutover's through-the-proxy check on a VM reads its server id (cloud-init's instance id),
@@ -532,4 +563,20 @@ async fn copy_home_moves_a_person_without_renaming_anything() {
     let e = copy_home_on(busy.clone(), &cfg, &f, &src, &dest, opts(true, false)).await.unwrap_err().to_string();
     assert!(e.contains("devtest-bravo — someone is on it (1 SSH session)") && e.contains("--force"), "{e}");
     copy_home_on(busy, &cfg, &f, &src, &dest, opts(true, true)).await.unwrap();
+}
+
+/// Two moves that picked the same spare (review r2): the first takes it; the second is refused
+/// — never handed the machine the first is copying onto — and renames nothing.
+#[tokio::test]
+async fn two_claims_on_one_spare_take_it_once() {
+    use crate::pods::adopt::{take, Onto};
+    let dir = tmpdir("two-claims");
+    let cfg = cfg(&dir.0);
+    let spare = vm("301", "devtest-spare-1", "cx43", "10.0.0.3", "fsn1");
+    let f = Vms::new(vec![], vec![spare.clone()]);
+    let onto = Onto { pod: spare, spare: true };
+    take(&f, Some(&f), &cfg, &onto, "devtest-alpha-new").await.unwrap();
+    let e = take(&f, Some(&f), &cfg, &onto, "devtest-bravo-new").await.unwrap_err();
+    assert!(format!("{e:#}").contains("taking devtest-spare-1 as devtest-bravo-new — nothing was renamed"), "{e:#}");
+    assert_eq!(f.calls(), ["adopt 301 devtest-alpha-new"]);
 }

@@ -40,8 +40,11 @@ pub trait SpareCloud: Send + Sync {
     async fn spares(&self) -> Result<Vec<Pod>>;
     /// Take spare `id` — listed as `name` — into the fleet as `new_name`: renamed and its spare
     /// label dropped, in one request. Refused (nothing changed) when `id` isn't this cohort's
-    /// spare called `name` any more (taken meanwhile). Call it under [`claim_lock`].
-    async fn adopt(&self, id: &str, name: &str, new_name: &str) -> Result<()>;
+    /// spare called `name` any more (taken meanwhile). `retry`: this claim's earlier attempt may
+    /// have gone through with its answer lost — a server already `new_name` and unmarked is then
+    /// this claim's own, done. A first attempt never takes that as done: another run's claim
+    /// would look the same. Call it under [`claim_lock`], held across the retries.
+    async fn adopt(&self, id: &str, name: &str, new_name: &str, retry: bool) -> Result<()>;
 }
 
 /// The lock file, in the cohort's state dir, that every claim on a spare holds: an adoption

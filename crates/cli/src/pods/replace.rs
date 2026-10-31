@@ -681,6 +681,24 @@ pub(crate) fn presence_refusal(verb: &str, pod: &str, presence: &arena_core::idl
     adopt::presence_words(presence).map(|why| format!("refusing to {verb} {pod}: {why}. {alternative} Or pass --force."))
 }
 
+/// The refusal to swap `src` for `new_name` with someone on it (`--force`: none): what they write
+/// from now would stay behind on the parked pod. `when`: when they came on, for the message.
+async fn swap_presence_refusal(remote: &dyn Remote, cfg: &Config, src: &arena_core::Pod, new_name: &str, force: bool, when: &str) -> Option<String> {
+    if force {
+        return None;
+    }
+    let canonical = &src.name;
+    let presence = arena_core::idle::presence(&adopt::probe(remote, cfg, src).await);
+    adopt::presence_words(&presence).map(|why| {
+        format!(
+            "NOT swapping: {canonical} — {why} (they came on {when}). {new_name} is built and copied, and {canonical} is \
+             untouched. Once they're off, `arena pods migrate cutover {canonical}` syncs what changed and swaps (it checks \
+             again; --force swaps anyway), then `arena pods migrate finish {canonical}`; or drop it with `arena pods \
+             terminate {new_name}`."
+        )
+    })
+}
+
 /// [`handle_replace`] once the source pod (`src_id`) and the backend that owns it are
 /// known — the seam tests drive with a fake owner.
 pub(crate) async fn replace_on(
@@ -955,16 +973,8 @@ pub(crate) async fn replace_on(
         );
     }
     // Someone may have come on while it copied: what they write from now would stay behind.
-    if !force {
-        let presence = arena_core::idle::presence(&adopt::probe(remote.as_ref(), cfg, &src).await);
-        if let Some(why) = adopt::presence_words(&presence) {
-            anyhow::bail!(
-                "NOT swapping: {canonical} — {why} (they came on while it copied). {new_name} is built and copied, and \
-                 {canonical} is untouched. Once they're off, `arena pods migrate cutover {canonical}` syncs what changed \
-                 and swaps (it checks again; --force swaps anyway), then `arena pods migrate finish {canonical}`; or drop \
-                 it with `arena pods terminate {new_name}`."
-            );
-        }
+    if let Some(r) = swap_presence_refusal(remote.as_ref(), cfg, &src, &new_name, force, "while it copied").await {
+        anyhow::bail!("{r}");
     }
 
     // Manual gate: nothing destructive has happened yet. A "no" leaves the built+copied
@@ -983,6 +993,21 @@ pub(crate) async fn replace_on(
         );
         return Ok(());
     }
+
+    // Asked again after the prompt (review r2: someone may come on while it waits), then what
+    // changed on the original since the copy goes over — the same copy, incremental — right
+    // before the swap, so a write in that gap isn't left behind on the parked pod.
+    if let Some(r) = swap_presence_refusal(remote.as_ref(), cfg, &src, &new_name, force, "while the prompt waited").await {
+        anyhow::bail!("{r}");
+    }
+    println!("      final sync of what changed on {canonical} since the copy…");
+    copy_pod_files(cfg, owner, remote.as_ref(), &src_id, &created.id, &CopyOpts::new(false)).await.with_context(|| {
+        format!(
+            "the final sync {canonical} -> {new_name} — NOT swapping; {canonical} is untouched. `arena pods migrate cutover \
+             {canonical}` syncs again and swaps, or drop {new_name} with `arena pods terminate {new_name}`"
+        )
+    })?;
+    clean_marker(owner, remote.as_ref(), &created.id, cfg).await;
 
     // [6/7] swap. Old-first so the canonical name is never held by two pods at once. If the
     // promote fails after parking the source, roll the source's name back so the canonical

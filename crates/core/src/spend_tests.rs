@@ -1185,3 +1185,17 @@ fn spares_are_counted_until_deleted_and_go_on_once_taken() {
     let s = observe_spares(s, "hetzner", &[theirs], &naming(), T0 + 4 * H);
     assert!(s.machines.iter().all(|m| m.id != "9"));
 }
+
+/// A spare first seen by a spare listing with no price listed (review r2) still gets its row —
+/// unpriced, from now — and a later priced listing prices it.
+#[test]
+fn an_unpriced_spare_first_seen_by_a_spare_listing_gets_its_row() {
+    let mut spare = running("hetzner", "11", "devtest-spare-4", 0.02);
+    spare.cost_per_hr = None;
+    let s = observe_spares(tracked(), "hetzner", std::slice::from_ref(&spare), &naming(), T0);
+    let m = machine(&s, "hetzner", "11");
+    assert!(m.spare && m.is_open(), "{m:#?}");
+    let priced = running("hetzner", "11", "devtest-spare-4", 0.02);
+    let s = observe_spares(s, "hetzner", &[priced], &naming(), T0 + H);
+    assert!(machine(&s, "hetzner", "11").accrued > 0.0);
+}

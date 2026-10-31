@@ -98,6 +98,25 @@ pub(crate) fn files_refusal(src: &str, dest: &str, files: &[String], overwrite: 
     ))
 }
 
+/// The refusals for someone on `src` or `dest` (none with `force`), `src`'s first. Read-only.
+async fn busy_refusal(remote: &dyn Remote, cfg: &Config, src: &Pod, dest: &Pod, force: bool) -> Vec<String> {
+    let (from, to) = (src.name.as_str(), dest.name.as_str());
+    let mut busy = Vec::new();
+    if force {
+        return busy;
+    }
+    for (pod, alternative) in [
+        (src, format!("What they write after the copy wouldn't be on {to}: re-run once they're off.")),
+        (dest, format!("The copy writes into {to}'s home under them: re-run once they're off.")),
+    ] {
+        let presence = arena_core::idle::presence(&adopt::probe(remote, cfg, pod).await);
+        if let Some(why) = adopt::presence_words(&presence) {
+            busy.push(format!("refusing to copy {from}'s home onto {to}: {} — {why}. {alternative} Or pass --force.", pod.name));
+        }
+    }
+    busy
+}
+
 /// [`handle_copy_home`] once both machines are known (`owner` lists and holds both) — the seam
 /// tests drive with a fake owner.
 pub(crate) async fn copy_home_on(remote: Arc<dyn Remote>, cfg: &Config, owner: &dyn Provider, src: &Pod, dest: &Pod, opts: CopyHomeOpts) -> Result<()> {
@@ -112,18 +131,7 @@ pub(crate) async fn copy_home_on(remote: Arc<dyn Remote>, cfg: &Config, owner: &
     }
     // No one on either: what they'd write on `from` after the copy wouldn't reach `to`, and
     // someone on `to` is working in the home it overwrites.
-    let mut busy = Vec::new();
-    if !force {
-        for (pod, alternative) in [
-            (src, format!("What they write after the copy wouldn't be on {to}: re-run once they're off.")),
-            (dest, format!("The copy writes into {to}'s home under them: re-run once they're off.")),
-        ] {
-            let presence = arena_core::idle::presence(&adopt::probe(remote.as_ref(), cfg, pod).await);
-            if let Some(why) = adopt::presence_words(&presence) {
-                busy.push(format!("refusing to copy {from}'s home onto {to}: {} — {why}. {alternative} Or pass --force.", pod.name));
-            }
-        }
-    }
+    let busy = busy_refusal(remote.as_ref(), cfg, src, dest, force).await;
     if let (Some(r), false) = (busy.first(), dry_run) {
         anyhow::bail!("{r}");
     }
@@ -166,6 +174,10 @@ pub(crate) async fn copy_home_on(remote: Arc<dyn Remote>, cfg: &Config, owner: &
     if !confirm(yes, &format!("Will {plan}"))? {
         println!("aborted.");
         return Ok(());
+    }
+    // Asked again after the dry run and the prompt (review r2: someone may have come on).
+    if let Some(r) = busy_refusal(remote.as_ref(), cfg, src, dest, force).await.into_iter().next() {
+        anyhow::bail!("{r} (nothing was copied)");
     }
     println!("copying {from} → {to}…");
     copy_pod_files(cfg, owner, remote.as_ref(), &src.id, &dest.id, &CopyOpts::new(false))

@@ -736,9 +736,11 @@ itself, waiting up to an hour for room (`--retry-mins` for another window).
 - **No one on it.** `replace` first runs the `pods idle` probe on the box: an SSH session besides its
   own, another inbound connection (a Jupyter tab), a VS Code (or Cursor, Windsurf) server process.
   Someone there, or no telling, and it refuses before anything is made, pointing at `migrate`. It
-  asks again right before the swap: if someone came on during the copy, the new box stays built
-  and copied as `<name>-new`, and `migrate cutover <name>` finishes later. `migrate cutover` asks
-  the same. `--force` skips the check.
+  asks again before its prompt and after it: if someone came on meanwhile, the new box stays built
+  and copied as `<name>-new`, and `migrate cutover <name>` finishes later. Then a final sync of
+  what changed since the copy, and the swap. `migrate cutover` asks before its final sync and
+  again after it; `copy-home` before its dry run and again after its prompt. `--force` skips the
+  check.
 - **The copy is direct**: rsync runs on the old box and pushes to the new one with the deploy key
   every VM holds and authorizes, so nothing is staged on the control box. Only when the direct copy
   can't run does it go through a staging dir here, sized against `CONTROL_MIN_FREE_GB` first. It's

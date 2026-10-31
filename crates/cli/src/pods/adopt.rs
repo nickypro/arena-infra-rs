@@ -257,7 +257,13 @@ pub(crate) async fn take(owner: &dyn Provider, spares: Option<&dyn SpareCloud>, 
         let spares = spares.context("a spare can only be taken through its provider's spare API (Hetzner)")?;
         // Under the claim lock: no other run takes or deletes it between the look and the rename.
         let _claim = claim_spares(cfg)?;
-        arena_core::retry::retrying(&policy, || spares.adopt(id, &onto.pod.name, new_name)).await
+        // A retry may find its own earlier PUT done (its answer lost); only a retry may.
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        arena_core::retry::retrying(&policy, || {
+            let retry = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0;
+            spares.adopt(id, &onto.pod.name, new_name, retry)
+        })
+        .await
     } else {
         arena_core::retry::retrying(&policy, || owner.rename_pod(id, new_name)).await
     };

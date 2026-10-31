@@ -163,26 +163,47 @@ pub fn pod_identity(provider: &str, id: &str) -> Option<String> {
 }
 
 /// The receiver's own files a mirroring sync would move aside ([`crate::pull::Mirror::Replica`]),
-/// read from its `--dry-run --itemize-changes` output: each it would delete (`*deleting`) or
-/// overwrite — a file it sends that exists there (`<f`: the direct copy runs on the source and
-/// pushes, so the sender itemizes; `>f` from a pull's receiver), or a symlink it replaces
-/// (`cL`); either with flags that aren't all `+` (new). Files only (a deleted directory's files
-/// are listed one by one), in the order rsync names them, as paths in the home: the repo tree's
-/// items, after [`crate::volume::TREE_ITEMS_MARK`], are named relative to the repo at `rel`.
-/// Pure.
+/// read from its dry run (`--dry-run --itemize-changes --info=backup`, [`crate::pull::PullConfig::dry_run`]):
+/// - each `backed up <path> to <backup dir>/<path>` line — rsync's own word for every item it
+///   would move into the backup dir, a type change included (a file where the receiver has a
+///   symlink, a directory where it has a file: itemized as new, review r2);
+/// - and, should a receiver's rsync not say those, each item it would delete (`*deleting`) or
+///   overwrite — a file it sends that exists there (`<f`: the direct copy runs on the source and
+///   pushes, so the sender itemizes; `>f` from a pull's receiver), or a symlink it replaces
+///   (`cL`); either with flags that aren't all `+` (new).
+///
+/// Files only (a deleted directory's files are listed one by one), each once, in the order rsync
+/// names them, as paths in the home: the repo tree's items, after
+/// [`crate::volume::TREE_ITEMS_MARK`], are named relative to the repo at `rel`. Pure.
 pub fn moved_aside(itemized: &str, rel: Option<&str>) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     let mut prefix = String::new();
+    let mut add = |path: &str, prefix: &str| {
+        let path = path.trim_end_matches('/');
+        if path.is_empty() || path == "." {
+            return;
+        }
+        let full = format!("{prefix}{path}");
+        if !out.contains(&full) {
+            out.push(full);
+        }
+    };
     for line in itemized.lines() {
         let line = line.trim_end_matches('\r');
         if line.trim() == crate::volume::TREE_ITEMS_MARK {
             prefix = rel.map(|r| format!("{}/", r.trim_end_matches('/'))).unwrap_or_default();
             continue;
         }
+        if let Some(rest) = line.strip_prefix("backed up ") {
+            if let Some(path) = backed_up_path(rest) {
+                add(path, &prefix);
+            }
+            continue;
+        }
         if let Some(path) = line.strip_prefix("*deleting") {
             let path = path.trim_start();
-            if !path.is_empty() && !path.ends_with('/') {
-                out.push(format!("{prefix}{path}"));
+            if !path.ends_with('/') {
+                add(path, &prefix);
             }
             continue;
         }
@@ -192,10 +213,20 @@ pub fn moved_aside(itemized: &str, rel: Option<&str>) -> Vec<String> {
         let b = flags.as_bytes();
         let replaced = matches!((b.first(), b.get(1)), (Some(b'<' | b'>'), Some(b'f')) | (Some(b'<' | b'>' | b'c'), Some(b'L')));
         if b.len() >= 11 && replaced && !flags[2..].starts_with('+') {
-            out.push(format!("{prefix}{}", path.trim_start()));
+            // A symlink's line ends ` -> target`.
+            let path = path.trim_start();
+            let path = if b[1] == b'L' { path.split(" -> ").next().unwrap_or(path) } else { path };
+            add(path, &prefix);
         }
     }
     out
+}
+
+/// The `<path>` of rsync's `backed up <path> to <backup dir>/<path>` (what follows `backed up
+/// `): the split on ` to ` whose right side ends with `/<path>` — a name with ` to ` in it
+/// included. `None` when no split fits. Pure.
+fn backed_up_path(rest: &str) -> Option<&str> {
+    rest.match_indices(" to ").map(|(i, _)| (&rest[..i], &rest[i + 4..])).find(|(p, to)| !p.is_empty() && to.ends_with(&format!("/{p}"))).map(|(p, _)| p)
 }
 
 /// `script` preceded by `cond` (when there is one): on any other pod it says so on stderr
@@ -582,8 +613,15 @@ mod tests {
         assert!(moved_aside("", None).is_empty());
         // What the direct copy prints (it runs on the source and pushes: the sender's view):
         // a file it would overwrite there, a symlink it would replace — never what's new there.
-        let push = "<f.st...... notes/differs.md\n<f+++++++++ fresh.py\ncLc.t...... link-to-data\ncL+++++++++ new-link\n";
+        let push = "<f.st...... notes/differs.md\n<f+++++++++ fresh.py\ncLc.t...... link-to-data -> /data\ncL+++++++++ new-link -> x\n";
         assert_eq!(moved_aside(push, None), ["notes/differs.md", "link-to-data"]);
+        // rsync's own `backed up` lines name every item it moves aside — a type change too
+        // (itemized as new) — each once, a name with ` to ` in it whole.
+        let backed = "(new) backup_dir is arena-sync-kept/S\nbacked up notes.py to arena-sync-kept/S/notes.py\n\
+                      backed up a to b.txt to arena-sync-kept/S/a to b.txt\ncL+++++++++ notes.py -> real.py\n\
+                      backed up dir_over_file to arena-sync-kept/S/dir_over_file\nbacked up dir_over_file to arena-sync-kept/S/dir_over_file\n";
+        assert_eq!(moved_aside(backed, None), ["notes.py", "a to b.txt", "dir_over_file"]);
+        assert_eq!(backed_up_path("x to y"), None, "no backup path that ends with it");
         // The repo's tree, copied on its own after the home, names its items from the repo.
         let split = "*deleting   notes/old.txt\nARENA_TREE_ITEMS\n*deleting   day1/gone.py\n>f.st...... day2/x.py\n";
         assert_eq!(moved_aside(split, Some("ARENA_materials")), ["notes/old.txt", "ARENA_materials/day1/gone.py", "ARENA_materials/day2/x.py"]);

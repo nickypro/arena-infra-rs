@@ -1187,6 +1187,87 @@ mod tests {
         assert_eq!(push_jobs(&pc, "/stage", None, true).len(), 1);
     }
 
+    /// `pods copy-home`'s dry run, through the real rsync and the direct copy's own command (run
+    /// on the "source", pushing to the "destination" through the fake transport): every one of
+    /// the destination's own files the copy would move aside is named — a differing file, one
+    /// only it has, and the type changes rsync itemizes as new (a file over its symlink, a
+    /// symlink over its file, a directory over its file; review r2) — in the repo's tree as home
+    /// paths; and nothing on the destination changes.
+    #[cfg(unix)]
+    #[test]
+    fn copy_homes_dry_run_names_every_file_it_would_move_aside() {
+        use crate::pull::PullConfig;
+        use std::os::unix::fs::symlink;
+        if !fake_ssh::have_rsync() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-volume-dryrun-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let put = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        // The source's home…
+        put("src/same.txt", "same\n");
+        put("src/differs.txt", "the source's, longer\n");
+        put("src/link_over_file_target.txt", "t\n");
+        symlink("link_over_file_target.txt", root.join("src/link_over_file")).unwrap();
+        put("src/file_over_link", "a file now\n");
+        put("src/dir_over_file/inside.txt", "x\n");
+        put("src/ARENA_materials/day1/work.py", "the source's work, longer\n");
+        put("src/new.py", "new\n");
+        // …and the destination's own.
+        put("dst/same.txt", "same\n");
+        put("dst/differs.txt", "theirs\n");
+        put("dst/link_over_file", "their file\n");
+        symlink("/etc/hostname", root.join("dst/file_over_link")).unwrap();
+        put("dst/dir_over_file", "their file\n");
+        put("dst/only_theirs.txt", "mine\n");
+        put("dst/ARENA_materials/day1/work.py", "theirs\n");
+        put("dst/ARENA_materials/day1/theirs_only.py", "mine\n");
+        // Same mtimes where the content is the same, so only what differs is sent.
+        let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for f in ["src/same.txt", "dst/same.txt"] {
+            std::fs::File::options().write(true).open(root.join(f)).unwrap().set_modified(t).unwrap();
+        }
+        let pc = PullConfig { mirror: crate::replica::home_mirror("S"), dry_run: true, ..PullConfig::replication() };
+        let bin = fake_ssh::install_as_ssh(&root);
+        let cmd = pod_to_pod_copy("10.0.0.2", 22, "root", "/k", &pc, Some("ARENA_materials"));
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("HOME", root.join("src"))
+            .env("PATH", path)
+            .env("FAKE_HOME", root.join("dst"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(out.status.success(), "{}\n{stdout}", String::from_utf8_lossy(&out.stderr));
+        let mut got = crate::replica::moved_aside(&stdout, Some("ARENA_materials"));
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "ARENA_materials/day1/theirs_only.py",
+                "ARENA_materials/day1/work.py",
+                "differs.txt",
+                "dir_over_file",
+                "file_over_link",
+                "link_over_file",
+                "only_theirs.txt",
+            ],
+            "{stdout}"
+        );
+        // A dry run: the destination is as it was.
+        assert_eq!(std::fs::read_to_string(root.join("dst/differs.txt")).unwrap(), "theirs\n");
+        assert!(std::fs::symlink_metadata(root.join("dst/file_over_link")).unwrap().file_type().is_symlink());
+        assert!(!root.join("dst/new.py").exists() && !root.join("dst").join(crate::replica::KEPT_DIR).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Both copies of `pods replace`, through the real rsync between two temp-dir "pods" whose
     /// repos are links onto their own volumes: the work lands in the destination's volume copy,
     /// its link stays a link, and nothing on it is deleted. (A plain push of the staged home

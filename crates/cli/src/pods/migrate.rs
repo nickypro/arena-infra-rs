@@ -693,6 +693,11 @@ pub(crate) async fn migrate_cutover_on(
     }
     println!("[2/4] verifying {new_name} health…");
     verify_replacement(owner, remote.as_ref(), &new_id, cfg).await?;
+    // Asked again right before the swap (review r2): someone who came on during the prompt or
+    // the final sync would leave what they write next behind on the parked original.
+    if let Some(r) = cutover_presence_refusal(remote.as_ref(), cfg, &src, force).await {
+        anyhow::bail!("NOT swapping — {r} (they came on during the final sync; {new_name} has the copy, nothing was renamed)");
+    }
 
     // 3. swap names (old-first so the canonical name is never on two pods).
     println!("[3/4] swapping names…");
