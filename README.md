@@ -423,6 +423,34 @@ total       4 instance(s)  49.5  ~$11.88 + €0.43 $3.50  ~$15.38 + €0.43
 the same box (not needed for a project week):
 [Running a second fleet](docs/REFERENCE.md#running-a-second-fleet-from-the-same-control-box).
 
+## Claude Code accounts
+
+Each machine on its own Claude Code account from a pool, so one heavy user doesn't throttle the
+cohort and a leaked token is one account's, not everyone's.
+
+1. **A token per account.** Logged in as each account, run `claude setup-token`, and put the
+   tokens in one file, one per line (the `clods` format: its `tokens` file works as is):
+   ```text
+   alice@arena.education -> sk-ant-oat01-…
+   bob@arena.education -> sk-ant-oat01-…
+   ```
+   `chmod 600` it, then `arena config set CLAUDE_TOKENS_FILE /root/claude-tokens` (an absolute
+   path) and `arena config check`: it counts the accounts and never shows a token.
+2. **Spread the fleet.** `arena claude push --dry-run`, then `arena claude push`: each cohort pod
+   gets the account with the fewest people on it (spend owners count once) and only that
+   account's token, replacing the old one. New pods get one when they're set up. `arena claude
+   accounts` shows who's on which.
+3. **Move a heavy user.** `arena claude assign apple 3` (their machine), or `arena claude assign
+   --owner alice 3` (all of alice's machines, and the ones she gets later). In the dashboard: `c`
+   on the pod.
+4. **Rotate a leaked token.** Put the account's new token (`claude setup-token` as that account) in
+   its line, keeping the email, then `arena claude push`: exactly the machines on that account get
+   it. To drop the account instead, delete its line: the next `arena claude push` spreads its
+   machines over the others. `arena claude off <pods>` takes a token off at once.
+
+Without a tokens file, `CLAUDE_CODE_OAUTH_TOKEN` is a pool of one, as before.
+[Everything about it](docs/REFERENCE.md#claude-code-accounts-claude).
+
 ## Safety
 
 `arena` runs against a live cohort, so it is careful with the participants' work:

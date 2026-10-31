@@ -322,8 +322,8 @@ async fn apply(
     } else {
         let names: Vec<&str> = pushing.iter().map(|p| p.name.as_str()).collect();
         format!(
-            "Will record {} change(s) and put each pod's own Claude Code token in ~/.bashrc & ~/.zshrc (replacing any \
-             there) on {} pod(s): {}",
+            "Will record {} change(s) and set the Claude Code token in ~/.bashrc & ~/.zshrc (each pod its own account's, \
+             or none; replacing any there) on {} pod(s): {}",
             changes.len(),
             pushing.len(),
             names.join(", ")

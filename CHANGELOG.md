@@ -19,6 +19,36 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-31 · arena 2.4: Claude Code accounts per machine — `arena claude`
+- This is **arena 2.4** (a minor bump: a new command, `arena claude`, and `--cc-token` replaces a
+  pod's Claude Code token instead of adding a line).
+- Each machine is on **one Claude Code account** from a pool and gets only that account's token,
+  so one heavy user no longer throttles the whole cohort, a leaked token is one account's, and you
+  can see which machine uses what. The pool is a tokens file (`CLAUDE_TOKENS_FILE`, one
+  `email -> sk-ant-oat01-…` per line, the `clods` format: its `tokens` file works as is); without
+  one, `CLAUDE_CODE_OAUTH_TOKEN` is a pool of one and everything works as before.
+- `arena claude accounts` shows each account's machines and people; `arena claude assign apple 2`
+  moves a pod (`--owner alice 2`: all of a person's machines, and their next ones; `--spread`: the
+  least-loaded account); `arena claude push` puts each pod's own token on it (with no pods named,
+  only the ones out of date: new, moved, or their token rotated in the file); `arena claude off`
+  takes it off. Setup, `up` and `copy-keys` put a new machine on the account with the fewest people.
+- The token goes to the pod by scp, never in a command line, and replaces every
+  `export CLAUDE_CODE_OAUTH_TOKEN=` line in `~/.bashrc` and `~/.zshrc` (copy-keys added a line for
+  each new token, leaving the old ones above it). Setup no longer writes the token in its config step; Hetzner VMs, which got it only
+  from `copy-keys`, now get it with every setup.
+- The dashboard's detail pane shows a pod's account on its `tokens:` line, and `c` in its menu moves
+  it to another (a number, an email, `none` or `spread`).
+- `config check` has a "Claude Code accounts" section: how many accounts the file holds, or why it
+  can't be used (it must be `chmod 600`); never a token.
+- [Claude Code accounts](README.md#claude-code-accounts): setting up the file, spreading, moving a
+  heavy user, rotating a leaked token.
+
+### Config
+- `CLAUDE_TOKENS_FILE` (new, optional): the Claude Code accounts' tokens file, owner-only (a file
+  other users can read is refused). Settable from the environment for one run.
+- `CLAUDE_CODE_OAUTH_TOKEN`: a pool of one when there's no tokens file; beside one it's unused, and
+  `config check` says so.
+
 ## 2026-10-30 · The backups screen says when it can't read a copy; "backing up", not "backuping"
 - `arena backups` and the dashboard's backups screen: a snapshot folder entry whose type can't be
   read now makes the home-copy cell unknown (with the path and the error), instead of quietly
