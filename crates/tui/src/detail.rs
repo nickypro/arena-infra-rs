@@ -432,7 +432,8 @@ mod tests {
     use crate::actions::cli_action_args;
     use crate::state::{dashboard_snapshot, Action};
     use crate::tests::{cfg, draw, fixture_shared, pod, screen, ui, NOW};
-    use crate::{runs, view, Mode};
+    use crate::view::view;
+    use crate::{runs, Mode};
 
     /// `c` (Claude Code account): runs `arena claude assign` — `spread` as its flag, anything else as
     /// the account — and the detail pane's `tokens:` line says which account the pod is on, and

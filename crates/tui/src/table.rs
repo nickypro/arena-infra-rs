@@ -559,7 +559,8 @@ mod tests {
     use crate::refresh::owners_by_key;
     use crate::state::{dashboard_snapshot, Rtts};
     use crate::tests::{cfg, draw, fixture_shared, pod, row, screen, ui, NOW};
-    use crate::{view, Mode};
+    use crate::view::view;
+    use crate::Mode;
 
     #[test]
     fn rows_show_cost_maintenance_health_and_proxy_from_the_snapshot() {
