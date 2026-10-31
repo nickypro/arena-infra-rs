@@ -19,6 +19,7 @@ pub mod capability;
 pub mod claude;
 pub mod config;
 pub mod cron;
+pub mod datavol;
 pub mod disk;
 pub mod error;
 pub mod fleet;

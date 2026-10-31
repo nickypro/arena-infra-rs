@@ -579,6 +579,13 @@ impl ArchiveCloud for HetznerArchiveCloud {
     }
 }
 
+#[async_trait]
+impl crate::datavol::VolumeCloud for HetznerArchiveCloud {
+    async fn all_volumes(&self) -> Result<Vec<CloudVolume>> {
+        self.list_all("volumes", "volumes", &[]).await?.iter().map(parse_volume).collect()
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // The fake
 // ---------------------------------------------------------------------------------------
@@ -729,6 +736,17 @@ mod fake {
 
     fn protected(what: &str, id: u64) -> Error {
         Error::provider(format!("hetzner delete {what} HTTP 423: {{\"error\":{{\"code\":\"protected\",\"message\":\"{what} {id} is protected\"}}}}"))
+    }
+
+    #[async_trait]
+    impl crate::datavol::VolumeCloud for FakeArchiveCloud {
+        async fn all_volumes(&self) -> Result<Vec<CloudVolume>> {
+            let w = self.record(CloudCall::Inventory(Some("*volumes".into())));
+            if let Some(why) = &w.fail_inventory {
+                return Err(Error::provider(why.clone()));
+            }
+            Ok(w.inv.volumes.clone())
+        }
     }
 
     #[async_trait]

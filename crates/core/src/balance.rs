@@ -1673,6 +1673,13 @@ pub struct AccountView {
     /// Hetzner: how many billing spares had no price listed (their share isn't in `burn`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spares_unpriced: Option<usize>,
+    /// Hetzner: the fleet VMs' volumes' share of `burn` (`pods volume add`: billed by the
+    /// GB-month whether attached or not), when `arena balance` read them and there are some.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volumes_per_hr: Option<f64>,
+    /// Hetzner: why the volumes couldn't be read (they then aren't in `burn`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volumes_unread: Option<String>,
 }
 
 impl AccountView {
@@ -1708,6 +1715,8 @@ impl AccountView {
             spares_per_hr: None,
             spares_unread: None,
             spares_unpriced: None,
+            volumes_per_hr: None,
+            volumes_unread: None,
         }
     }
 
@@ -1825,6 +1834,22 @@ pub fn add_archive(v: &mut AccountView, read: Result<Option<f64>, String>) {
         }
         Ok(_) => {}
         Err(e) => v.archive_unread = Some(e),
+    }
+}
+
+/// Add the fleet VMs' volumes' cost ([`BalanceApi::volumes_eur_per_hr`]) to Hetzner's row, as
+/// [`add_archive`] does the archive's. None (or no cost) changes nothing; a failed read is said
+/// and left out.
+pub fn add_volumes(v: &mut AccountView, read: Result<f64, String>) {
+    match read {
+        Ok(per_hr) if per_hr.is_finite() && per_hr > 0.0 => {
+            v.volumes_per_hr = Some(per_hr);
+            if let Some(b) = v.burn.as_mut() {
+                b.per_hr += per_hr;
+            }
+        }
+        Ok(_) => {}
+        Err(e) => v.volumes_unread = Some(e),
     }
 }
 
@@ -2364,6 +2389,12 @@ pub fn notes(views: &[AccountView], policy: &BalancePolicy, now: u64) -> Vec<Str
             }
             if let Some(e) = &v.spares_unread {
                 out.push(format!("{name}: the capacity spares couldn't be read ({e}) — not included"));
+            }
+            if let Some(x) = v.volumes_per_hr {
+                out.push(format!("{name}: includes the VMs' volumes, {}/month (`arena pods volume list`)", money(v, x * 730.0)));
+            }
+            if let Some(e) = &v.volumes_unread {
+                out.push(format!("{name}: the volumes couldn't be read ({e}) — not included"));
             }
         }
     }
@@ -3085,6 +3116,11 @@ pub trait BalanceApi: Send + Sync {
     async fn spares_eur_per_hr(&self) -> Option<Result<(f64, usize), String>> {
         None
     }
+    /// The fleet VMs' volumes' cost (`pods volume add`: EUR/h, this cohort's by their label)
+    /// — Hetzner spend in no server listing. `None`: no Hetzner key, not asked. Reads only.
+    async fn volumes_eur_per_hr(&self) -> Option<Result<f64, String>> {
+        None
+    }
 }
 
 /// A reader's memory of its own live attempts.
@@ -3119,6 +3155,9 @@ pub struct HttpBalanceApi {
     archive: Option<(crate::archive::HetznerArchiveCloud, crate::archive::ArchiveNames)>,
     /// The fleet's Hetzner project, for its capacity spares (`HETZNER_API_KEY`).
     spares: Option<crate::provider::hetzner::HetznerProvider>,
+    /// The fleet's Hetzner project, for this cohort's volumes (`HETZNER_API_KEY`; the prefix
+    /// their label names).
+    volumes: Option<(crate::archive::HetznerArchiveCloud, String)>,
 }
 
 impl HttpBalanceApi {
@@ -3140,6 +3179,11 @@ impl HttpBalanceApi {
             spares: cfg.get("HETZNER_API_KEY").map(str::trim).filter(|k| !k.is_empty()).map(|k| {
                 crate::provider::hetzner::HetznerProvider::new(k, crate::provider::hetzner::HetznerOpts::from_config(cfg))
             }),
+            volumes: cfg
+                .get("HETZNER_API_KEY")
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(|k| (crate::archive::HetznerArchiveCloud::new(k), cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string())),
         }
     }
 
@@ -3159,6 +3203,7 @@ impl HttpBalanceApi {
             shadeform_base: String::new(),
             archive: None,
             spares: None,
+            volumes: None,
         }
     }
 
@@ -3206,6 +3251,24 @@ impl BalanceApi for HttpBalanceApi {
     async fn archive_eur_per_hr(&self) -> Option<Result<Option<f64>, String>> {
         let (cloud, names) = self.archive.as_ref()?;
         Some(crate::archive::cloud::eur_per_hr(cloud, names).await.map_err(|e| e.to_string()))
+    }
+
+    async fn volumes_eur_per_hr(&self) -> Option<Result<f64, String>> {
+        use crate::datavol::VolumeCloud;
+        let (cloud, prefix) = self.volumes.as_ref()?;
+        // This cohort's: its label, or attached to one of its servers (named `<prefix>-…`, from
+        // the fleet project's listing) — a shared project's other volumes aren't its spend.
+        let servers = match self.spares.as_ref() {
+            Some(p) => match crate::provider::Provider::list_pods(p).await {
+                Ok(ps) => ps.into_iter().filter(|p| p.name.starts_with(&format!("{prefix}-"))).map(|p| p.id).collect(),
+                Err(e) => return Some(Err(format!("listing the servers: {e}"))),
+            },
+            None => Vec::new(),
+        };
+        Some(match cloud.all_volumes().await {
+            Ok(all) => Ok(crate::datavol::per_hr(&crate::datavol::cohort_volumes(&all, prefix, &servers), crate::datavol::price_gb_month(cloud).await)),
+            Err(e) => Err(e.to_string()),
+        })
     }
 
     async fn spares_eur_per_hr(&self) -> Option<Result<(f64, usize), String>> {
@@ -3594,6 +3657,12 @@ mod tests {
         // Billing with no price listed: not a quiet zero — said, and the burn reads low.
         add_spares(&mut none, Ok((0.0, 2)));
         assert!(notes(&[none.clone()], &BalancePolicy::default(), 0).join("\n").contains("2 capacity spare(s) bill with no price listed"));
+        // The VMs' volumes, likewise.
+        let mut vv = none.clone();
+        add_volumes(&mut vv, Ok(0.0006));
+        assert!(vv.volumes_per_hr == Some(0.0006) && notes(&[vv.clone()], &BalancePolicy::default(), 0).join("\n").contains("includes the VMs' volumes"));
+        add_volumes(&mut vv, Err("hetzner volumes HTTP 503".into()));
+        assert!(notes(&[vv], &BalancePolicy::default(), 0).join("\n").contains("the volumes couldn't be read (hetzner volumes HTTP 503)"));
         add_spares(&mut none, Err("hetzner servers HTTP 503".into()));
         assert!(notes(&[none], &BalancePolicy::default(), 0).join("\n").contains("the capacity spares couldn't be read (hetzner servers HTTP 503)"));
     }
