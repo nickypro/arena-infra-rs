@@ -437,7 +437,7 @@ pub(crate) async fn after_swap(
 /// keys CSVs are re-distributed to it as `copy-keys <name>` would; when that fails, the
 /// command to run is said. Nothing to carry without key files.
 async fn rekey_promoted(remote: Arc<dyn Remote>, cfg: &Config, owner: &dyn Provider, id: &str, canonical: &str, keys_dir: &str) {
-    let keys = KeySources::load(cfg, keys_dir, None, None);
+    let keys = KeySources::load(cfg, keys_dir, None);
     if keys.per_host.is_empty() && keys.broadcast.is_empty() && archive::pod_archive(cfg).ready().is_none() {
         return;
     }

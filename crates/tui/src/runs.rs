@@ -107,6 +107,8 @@ pub(crate) enum Kind {
     Up,
     Start,
     Rename,
+    /// `claude assign <pod> <account>`: its Claude Code account moved, the token pushed.
+    Claude,
     Jobs,
     Logs,
     /// `pods pull <pod>`: a copy of its home (the backups screen's "copy home now").
@@ -125,6 +127,7 @@ impl Kind {
             Kind::Up => "pods up",
             Kind::Start => "pods start",
             Kind::Rename => "pods rename",
+            Kind::Claude => "claude assign",
             Kind::Jobs => "pods jobs",
             Kind::Logs => "pods logs",
             Kind::Pull => "pods pull",

@@ -53,6 +53,14 @@ pub trait Remote: Send + Sync {
     /// `success == false`; `Err` means the call itself failed (spawn error, timeout).
     async fn exec(&self, t: &SshTarget, cmd: &str, timeout: Option<Duration>) -> Result<SshOutput>;
 
+    /// [`Remote::exec`] with `input` on the command's stdin, then end of file — for a secret that
+    /// must reach the pod in neither a command line (`ps`, at either end) nor a file left behind
+    /// on it (`arena claude`'s token). A remote that can't send input says so (the default).
+    async fn exec_input(&self, t: &SshTarget, cmd: &str, input: &[u8], timeout: Option<Duration>) -> Result<SshOutput> {
+        let _ = (cmd, input, timeout);
+        Err(Error::provider(format!("{}:{}: this remote can't send input to a command", t.host, t.port)))
+    }
+
     /// Copy the local file `local` to `remote` on the target. Same `Ok`/`Err` contract
     /// as [`Remote::exec`] (a refused connection is a failed `Ok`, as scp exits 255).
     async fn copy(
@@ -128,6 +136,14 @@ impl Remote for SshRemote {
     async fn exec(&self, t: &SshTarget, cmd: &str, timeout: Option<Duration>) -> Result<SshOutput> {
         let what = format!("ssh {}:{}", t.host, t.port);
         output_within(Self::exec_command(t, cmd), &what, timeout).await
+    }
+
+    async fn exec_input(&self, t: &SshTarget, cmd: &str, input: &[u8], timeout: Option<Duration>) -> Result<SshOutput> {
+        let what = format!("ssh {}:{}", t.host, t.port);
+        let mut c = Self::exec_command(t, cmd);
+        // ssh forwards its stdin to the command's (no `-n` in `ssh_args`).
+        c.stdin(Stdio::piped());
+        output_feeding(c, Some(input.to_vec()), &what, timeout, false).await
     }
 
     async fn copy(
@@ -978,6 +994,9 @@ mod fake {
         script: Mutex<HashMap<String, VecDeque<FakeReply>>>,
         rules: Mutex<Vec<(String, String, FakeReply)>>,
         calls: Mutex<Vec<RemoteCall>>,
+        /// What each [`Remote::exec_input`] sent on stdin, as `(host:port, input)` in call order
+        /// (the call itself is in `calls` as an `Exec`).
+        inputs: Mutex<Vec<(String, Vec<u8>)>>,
     }
 
     impl FakeRemote {
@@ -1001,6 +1020,11 @@ mod fake {
         /// Every call so far, in the order they started.
         pub fn calls(&self) -> Vec<RemoteCall> {
             self.calls.lock().unwrap().clone()
+        }
+
+        /// What each [`Remote::exec_input`] sent, as `(host:port, input)`, in call order.
+        pub fn inputs(&self) -> Vec<(String, Vec<u8>)> {
+            self.inputs.lock().unwrap().clone()
         }
 
         /// The calls made to one `host:port`, in order.
@@ -1067,6 +1091,14 @@ mod fake {
     impl Remote for FakeRemote {
         async fn exec(&self, t: &SshTarget, cmd: &str, timeout: Option<Duration>) -> Result<SshOutput> {
             let host = format!("{}:{}", t.host, t.port);
+            let what = format!("ssh {host}");
+            let reply = self.begin(RemoteCall::Exec { host, cmd: cmd.to_string(), timeout });
+            Self::answer(&what, reply, timeout).await
+        }
+
+        async fn exec_input(&self, t: &SshTarget, cmd: &str, input: &[u8], timeout: Option<Duration>) -> Result<SshOutput> {
+            let host = format!("{}:{}", t.host, t.port);
+            self.inputs.lock().unwrap().push((host.clone(), input.to_vec()));
             let what = format!("ssh {host}");
             let reply = self.begin(RemoteCall::Exec { host, cmd: cmd.to_string(), timeout });
             Self::answer(&what, reply, timeout).await

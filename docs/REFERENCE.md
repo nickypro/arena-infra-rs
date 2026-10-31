@@ -45,6 +45,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [`pods copy-keys`](#pods-copy-keys)
   - [`pods cp` (`pods copy`)](#pods-cp-pods-copy)
   - [`keys` (OpenRouter)](#keys-openrouter)
+  - [Claude Code accounts (`claude`)](#claude-code-accounts-claude)
 - [Running commands and checking health](#running-commands-and-checking-health)
   - [`pods run` / `pods test`](#pods-run--pods-test)
   - [Background jobs: `run --background`, `jobs`, `logs`](#background-jobs-run---background-jobs-logs)
@@ -296,7 +297,7 @@ Notes / sharp edges to know:
 
 Any key in `config.env` but the file-only `REAP_*` ones can be overridden by an **environment
 variable of the same name** (env wins; it can't introduce brand-new keys — except a short allowlist such as
-`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `DISCARD_MAX_GB`, `CONTROL_MIN_FREE_GB`, `NEAR`/`NEAR_MAX_EXTRA_PCT` and the `ASK_<AI>_MODEL`/`_EFFORT` keys, e.g. `RUNPOD_API=v1 arena pods
+`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `DISCARD_MAX_GB`, `CONTROL_MIN_FREE_GB`, `NEAR`/`NEAR_MAX_EXTRA_PCT`, `CLAUDE_TOKENS_FILE` and the `ASK_<AI>_MODEL`/`_EFFORT` keys, e.g. `RUNPOD_API=v1 arena pods
 list` to use the retiring RunPod v1 backend for one command, until 2026-11-16; v2 is the default). This is how you point at an SSH
 key the current user can actually read, without editing the shared, read-only prod
 config — e.g. when the dashboard's metrics show `ssh connect failed … key unreadable`
@@ -332,7 +333,7 @@ Not every operation works on every provider. One table in `arena-core`
   the pick with the full sentence. Its add-pod form shows (and sends) only the fields the
   provider's create takes.
 - **Commands that only reach a pod over SSH** work on every provider: setup, backup, pull, run,
-  test, restore, cp, set-branch and init-branches.
+  test, restore, cp, set-branch, init-branches, copy-keys and `claude assign`/`push`/`off`.
 
 RunPod is REST v2, the default. RunPod v1 is `RUNPOD_API=v1`.
 
@@ -1777,13 +1778,16 @@ construction, so no auth is needed; health shows `unknown` until a `pods test --
 `pods setup` — provision pods over SSH (ordered steps in `--help`): copy the git deploy key, write
 `~/.ssh/config` + `authorized_keys` (every machine's keys: shared, deploy and the admin key — a
 bare VM in a step of its own, `authorize keys`, before its script), **put the repo on the persistent volume** when the pod has one,
-point the repo at GitHub, update submodules, write `~/.name`, and export any set **broadcast
-tokens** (Hugging Face for gated-repo access, Claude Code; via config or `--hf-token`/`--cc-token`)
-— else those steps are skipped and it says so.
+point the repo at GitHub, update submodules, write `~/.name`, and export the Hugging Face
+**broadcast token** for gated-repo access (via config or `--hf-token`) — else that step is skipped
+and it says so.
 
 It also **auto-distributes per-host API keys** if any `keys/*_api_keys.csv` exist (reporting what it
-added, or that none are set up) — to exactly the pods that just provisioned successfully, never one
-that failed or timed out — so a `setup` (or `up`, per pod) makes pods fully ready.
+added, or that none are set up), and puts each pod on its own **Claude Code account** with that
+account's token ([`claude`](#claude-code-accounts-claude): the least-loaded account for a pod with
+none; `--cc-token` puts one token on every pod instead) — to exactly the pods that just provisioned
+successfully, never one that failed or timed out — so a `setup` (or `up`, per pod) makes pods fully
+ready.
 
 A pod that refuses our key (`Permission denied (publickey)`) on a provider with a key API (Vast)
 gets the cohort keys re-attached to it and is set up again (up to 3×, 20s apart); elsewhere the
@@ -1936,10 +1940,11 @@ is caught and the move undone, but only between checks.
 ### `pods copy-keys`
 
 `pods copy-keys` — distribute API keys into each pod's `~/.bashrc`/`~/.zshrc` (idempotent): per-host
-keys from `<keys-dir>/<provider>_api_keys.csv` (openai/anthropic/openrouter) **plus broadcast
-tokens** — a Hugging Face token (`--hf-token`/`HF_TOKEN`, sets `HF_TOKEN` +
-`HUGGING_FACE_HUB_TOKEN`) for **gated repos** (Llama 3, …) and a **Claude Code token**
-(`--cc-token`/`CLAUDE_CODE_OAUTH_TOKEN`).
+keys from `<keys-dir>/<provider>_api_keys.csv` (openai/anthropic/openrouter) **plus a broadcast
+token** — a Hugging Face token (`--hf-token`/`HF_TOKEN`, sets `HF_TOKEN` +
+`HUGGING_FACE_HUB_TOKEN`) for **gated repos** (Llama 3, …) — and each pod's own **Claude Code
+account's token** ([`claude`](#claude-code-accounts-claude); `--cc-token` puts one token on every
+selected pod instead, moving nobody).
 
 Every reachable target also gets the **fleet's ssh**, keys or not: every machine's keys authorized
 (shared, deploy, admin) and the host map in `~/.ssh/config` (pods reach each other with their deploy
@@ -1947,9 +1952,10 @@ key). So `copy-keys` is how machines that already exist come to let in a key add
 key, say — staff boxes included; with no key file, token or archive, that is all it writes.
 
 Targets / `--exclude` scope it to specific pods. Confirms first; `--dry-run` lists what would be set
-(values redacted). Both broadcast tokens are env-introducible (e.g. `CLAUDE_CODE_OAUTH_TOKEN=… arena
-pods copy-keys`). Each pod's write has a 60s budget, so a wedged pod reports `✗ <name>: … timed out`
-instead of hanging the command.
+(values redacted; each pod's Claude Code account by name). `HF_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` and
+`CLAUDE_TOKENS_FILE` are env-introducible (e.g. `HF_TOKEN=… arena pods copy-keys`). Each pod's write
+has a 60s budget, so a wedged pod reports `✗ <name>: … timed out` instead of hanging the command; a
+pod whose Claude Code token didn't go fails the run too (`arena claude push` retries it).
 
 ### `pods cp` (`pods copy`)
 
@@ -2073,6 +2079,98 @@ Keys are found by name, so no local hash bookkeeping; a machine that left the li
 key (or a CSV row) can still be targeted by name. Dry-runs show each key name and whether it exists.
 `keys which` shows the local keys file. (`copy-keys` is the *distributor*; `keys` is the
 *generator*.)
+
+### Claude Code accounts (`claude`)
+
+`claude accounts | assign | push | off` — each machine on **one Claude Code account** from a pool,
+with only its own account's token on it. One token broadcast to every pod put the whole cohort on
+one account's usage limits (one heavy user throttled everyone), made a leaked token everyone's
+rotation, and said nothing about which machine used what.
+
+**The pool.** `CLAUDE_TOKENS_FILE` names a tokens file in the format of `clods` (its `tokens` file
+works as is; a relative path is beside the config): one account per line, its token made by `claude
+setup-token` while logged in as it.
+
+```text
+# email -> token
+alice@arena.education -> sk-ant-oat01-…
+bob@arena.education = sk-ant-oat01-…
+7 carol@arena.education -> sk-ant-oat01-…    # a leading number pins clods' profile number
+```
+
+`=` or plain spaces work as well as `->`; `#` lines are comments; a line without a number is the
+number after the line before. The file must be **owner-only** (`chmod 600`): one other users can
+read is refused, as is a number or an email twice. A line that can't be read is skipped and named by
+its first word (never its token). An account is its **email**: clods numbers lines in order, so a
+number moves when a line above it goes, and assignments are kept by email; the number is for typing
+(`assign apple 2`). Without a tokens file, config's single `CLAUDE_CODE_OAUTH_TOKEN` is a pool of
+one — every machine on it, as before (beside a tokens file it's unused, and `config check` says
+so). `config check` counts the accounts, or says why the file can't be used; never a token.
+
+**Who's on which.** Each machine *instance* — provider + id, as spend's owners: a name created again
+is a new machine and inherits nothing — has one account, recorded in `claude.json` in the state dir
+(0600, under the state dir's lock):
+
+- **spread**: the account with the fewest *people*. A spend owner (`pods up --owner`, `spend
+  assign`) counts once however many machines they have, and a person's next machine joins the
+  account their others are on; a machine with no owner counts as one, so without owners it's the
+  fewest machines. Ties go to the lowest number. A new machine is spread when it's set up (`pods
+  setup`, `up`, `start`, `restart`, `replace`, `copy-keys`); `assign --spread` spreads again.
+- **pinned**: `arena claude assign apple bloom 2` (a number, an email, or `none`).
+- **its owner's pin**: `arena claude assign --owner alice 3` — alice's machines now, and the ones she
+  gets later; `--owner alice --spread` takes the pin off and spreads hers again.
+- **off**: `arena claude off apple` (= `assign apple none`): no token on it, and it stays so.
+
+A machine whose account has left the file is spread again at its next push; `accounts` lists it
+under the old email until then.
+
+**The push.** A machine gets its own account's token and nothing else, as
+`export CLAUDE_CODE_OAUTH_TOKEN="…"` in `~/.bashrc` and `~/.zshrc` — the channel copy-keys always
+used — with every earlier such line taken out (a moved machine has the new token only; `off` takes
+them all out), and Claude Code's onboarding marked done in `~/.claude.json`. The token goes **on the
+ssh command's stdin**: never in a command line (not in `ps` at either end, nor in any log or dry
+run) and never in a file, here or on the pod, that a dropped connection could leave behind. Each rc
+file is rewritten beside itself (keeping its mode; a link's file, not the link) and renamed over
+it, so a full disk or a lost connection leaves the old file whole. A re-push changes nothing on a
+box that's already right. Each push has 60 s. Two pushes to one machine take turns — a lock here
+per machine, and one on the pod (`~/.arena-claude.lock`, `flock`; the file holds only the last
+push's generation, so an older push that arrives late, past its timeout, changes nothing) — each
+reading the machine's assignment and the tokens file afresh when its turn comes (an old read never
+puts a rotated token back; a machine that's off needs no tokens file at all). A push that fails
+leaves the machine out of date, so the next `claude push` picks it. Tracing is
+turned off before the token is read, and anything token-like in what a pod says back is masked. What
+went is recorded (the account and a fingerprint of its token), so a moved machine or a rotated
+token shows as out of date. Shells already open keep their old token until they start again. A
+machine terminated by arena, or missing from a complete listing begun after its last change (`pods
+list`, the dashboard, the snapshot cron line, `teardown --check`, `balance`), is forgotten, so it
+stops counting as its account's load. A pod with no python3 whose `~/.claude.json` can't be marked
+onboarded fails its push (Claude Code would ignore the token). Setup, `up` and `copy-keys` take a
+pending token off a machine that's off even when no pool is configured any more.
+
+- `arena claude accounts [--json]` — the pool: each account's number, email, machines and people;
+  `*` marks a machine whose box may not have its account's current token yet; the machines that are
+  off or not on an account yet; owner pins. Lists the fleet, and forgets machines that are gone (only
+  from a provider that listed).
+- `arena claude assign <pods> <N|email|none>`, `assign <pods> --spread`, `assign --owner NAME
+  <N|email|none>` / `--owner NAME --spread` (`--no-push`: record only) — then pushes the pods that
+  moved; a stopped one gets its token at its next setup.
+- `arena claude push [pods | --all]` — with no pods named, every cohort pod that's out of date:
+  never pushed, moved, its account's token changed in the file, its account gone from the file, or
+  not on an account yet (it's spread first). Named pods, or `--all` (this cohort's), are pushed
+  whatever their state.
+- `arena claude off <pods>`.
+
+Every change confirms first (`--yes` skips it; `--dry-run` previews) and works on every provider:
+it's SSH only. In `up`, each pod's line says `[apple] claude ✓ #2 bob@arena.education (new, by
+spread)`; a push that fails is a warning with the retry (`arena claude push apple`), and the pod is
+still READY. `--cc-token TOKEN` on `pods setup`/`copy-keys` puts that one token on every selected pod
+instead and moves nobody (`accounts` then shows them out of date). The dashboard's detail pane shows
+a pod's account on its `tokens:` line (`(not on it yet)` when the last push was another's), and `c`
+in its menu moves it (`arena claude assign` in the runs panel: a number, an email, `none` or
+`spread`).
+
+**Usage per account** isn't shown: a `claude setup-token` token is inference-only, and Anthropic
+publishes no usage API for subscription tokens (Claude Code's own `/usage` needs a full login).
 
 ## Running commands and checking health
 
@@ -3110,7 +3208,9 @@ stop and terminate only on a **marked** set, which `a` acts on while pods are ma
 pods whose provider has no stop (Shadeform), and refuses a set of only those, as `pods stop` does),
 or **add pods** with `n` ([Adding pods](#adding-pods)). The cursor pod's menu also runs four CLI
 commands as they are — `start` (a stopped pod, after a confirm), `rename` (type the new name),
-`jobs` and `logs` (read-only: the newest job's last 100 lines) — as `arena pods …` children, their
+`claude` (type its new Claude Code account: a number, an email, `none` or `spread` —
+[`arena claude assign`](#claude-code-accounts-claude)), `jobs` and `logs` (read-only: the newest
+job's last 100 lines) — as `arena pods …` children, their
 output in the runs panel (below); with a provisioning key, also the pod's AI key: `ai cap`, `ai
 pause`/`ai resume`, `ai rotate` ([keys](#keys-openrouter): `arena keys …` children too, a marked set's
 cap/pause/resume as one run). `run` and `set-branch` pop a

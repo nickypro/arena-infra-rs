@@ -29,7 +29,7 @@ type Groups = &'static [(&'static str, &'static [&'static str])];
 /// `arena --help`. Every visible top-level command is in exactly one group (a test checks).
 pub(crate) const TOP: Groups = &[
     ("Fleet", &["pods", "tui", "snapshot"]),
-    ("Access", &["proxy", "ssh-config", "keys"]),
+    ("Access", &["proxy", "ssh-config", "keys", "claude"]),
     ("Money", &["offers", "balance", "spend", "teardown"]),
     ("Automation", &["cron", "plan", "archive", "backups"]),
     ("Setup", &["config", "image", "update", "api"]),

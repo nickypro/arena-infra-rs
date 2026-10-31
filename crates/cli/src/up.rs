@@ -190,6 +190,9 @@ pub(crate) struct UpRun<'a> {
     pub check: Option<CheckStage>,
     /// The per-host keys to hand out — only when setup runs and a keys CSV has rows.
     pub keys: Option<KeySources>,
+    /// Each pod's own Claude Code account (one by spread if it has none) and its token, after the
+    /// keys — whenever setup runs; with no pool, only a pending removal (`arena_core::claude::stage`).
+    pub claude: bool,
     /// `--lock`: lock each pod as its last step (checked lockable before the create).
     pub lock: bool,
     /// `--retry-bad-hosts`: ignore the machines earlier runs remember as bad (a machine that
@@ -214,7 +217,7 @@ pub(crate) struct UpRun<'a> {
 /// The per-pod part of `up`'s plan, for the dry-run and the confirm prompt. `endpoint`: the
 /// `--endpoint-timeout` minutes and the placements per name that bound replacing a pod that
 /// never gets an endpoint.
-pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, lock: bool, endpoint: (u64, u32)) -> String {
+pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, claude: bool, lock: bool, endpoint: (u64, u32)) -> String {
     let (mins, placements) = endpoint;
     let mut steps = vec![
         format!(
@@ -241,6 +244,9 @@ pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, lock: b
     }
     if setup && keys {
         steps.push("copy its API keys".into());
+    }
+    if setup && claude {
+        steps.push("put it on a Claude Code account (the least-loaded, if it has none) and push that token".into());
     }
     if lock {
         steps.push("lock it (RunPod then refuses stop/restart/terminate until `arena pods unlock`)".into());
@@ -978,6 +984,26 @@ impl Shared<'_, '_> {
                     say(to, &line);
                     run.fleet_ssh = fleet_ssh;
                 }
+            }
+        }
+
+        // 5b. Its Claude Code account: one by spread if it has none, and that account's token.
+        // Best effort: a pod without it is still READY — said, with the retry.
+        if self.run.claude {
+            let one = [(pod.clone(), target.clone())];
+            let staged = arena_core::claude::stage(self.run.remote.as_ref(), self.run.cfg, &one, None, snapshot::unix_now());
+            match self.or_stop(staged).await {
+                None => return self.end(run, Verdict::Stopped { stage: Stage::Keys }),
+                Some(Ok(None)) => {}
+                Some(Ok(Some(outcomes))) => {
+                    for o in outcomes {
+                        match &o.result {
+                            Ok(()) => say(To::Out, &format!("[{name}] claude ✓ {}", o.what())),
+                            Err(e) => say(To::Err, &format!("[{name}] claude ✗ {} — {e} (retry: `arena claude push {name}`)", o.what())),
+                        }
+                    }
+                }
+                Some(Err(e)) => say(To::Err, &format!("[{name}] claude: not pushed — {e} (retry: `arena claude push {name}`)")),
             }
         }
 
@@ -2365,6 +2391,7 @@ mod tests {
                 cmd: health::deep_check_command(Some("arena-env")),
             }),
             keys: keys.and_then(|d| crate::up_keys_stage(cfg, &d.to_string_lossy(), true)),
+            claude: false,
             lock: false,
             retry_bad_hosts: false,
             balance: None,
@@ -5033,7 +5060,7 @@ mod tests {
 
     #[test]
     fn the_plan_text_names_every_stage_it_will_run() {
-        assert!(pipeline_text(true, None, false, true, (5, 2)).contains(
+        assert!(pipeline_text(true, None, false, false, true, (5, 2)).contains(
             "provision it, lock it (RunPod then refuses stop/restart/terminate until `arena pods unlock`) — then READY/FAILED"
         ));
         let endpoint = |mins: u64, n: u32| {
@@ -5044,7 +5071,7 @@ mod tests {
             )
         };
         assert_eq!(
-            pipeline_text(true, Some(3), true, false, (5, 3)),
+            pipeline_text(true, Some(3), true, false, false, (5, 3)),
             format!(
                 "per pod, as soon as it can: {}, sync the proxy (if nginx is set up), provision it, \
                  deep-check it — a pod that FAILs on its host is TERMINATED and its name recreated (up to 3 placement(s) \
@@ -5055,7 +5082,7 @@ mod tests {
             )
         );
         assert_eq!(
-            pipeline_text(false, None, true, false, (8, 2)),
+            pipeline_text(false, None, true, false, false, (8, 2)),
             format!(
                 "per pod, as soon as it can: {}, sync the proxy (if nginx is set up), wait for SSH to answer — then \
                  READY/FAILED per pod",
