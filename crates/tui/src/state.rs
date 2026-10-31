@@ -1353,7 +1353,9 @@ impl Action {
     /// The operation of the capability table ([`arena_core::capability`]) this action is, where
     /// its support differs between providers: the menus grey it out (with why) for a pod whose
     /// provider can't do it, from the same answer the CLI refuses on. `None`: it only reaches the
-    /// pod over SSH (or the AI key), which every provider allows.
+    /// pod over SSH (or the AI key), which every provider allows. Every action is listed — no
+    /// catch-all — so a new one can't skip the question (`Pull`, the backups screen's "copy home
+    /// now", is an rsync over SSH, like the dashboard's setup and backup).
     pub fn op(&self) -> Option<Op> {
         match self {
             Action::Start => Some(Op::Start),
@@ -1361,7 +1363,18 @@ impl Action {
             Action::Restart => Some(Op::Restart),
             Action::Terminate => Some(Op::Terminate),
             Action::Rename => Some(Op::Rename),
-            _ => None,
+            Action::Backup
+            | Action::Setup
+            | Action::Test
+            | Action::Run
+            | Action::SetBranch
+            | Action::Jobs
+            | Action::Logs
+            | Action::Pull
+            | Action::KeyLimit
+            | Action::KeyPause
+            | Action::KeyResume
+            | Action::KeyRotate => None,
         }
     }
 
