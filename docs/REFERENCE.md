@@ -55,6 +55,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [`balance`](#balance)
   - [`balance set`](#balance-set)
   - [`spend`](#spend)
+  - [A project week, start to end](#a-project-week-start-to-end)
   - [Running a second fleet from the same control box](#running-a-second-fleet-from-the-same-control-box)
 - [Config, plans and the provider APIs](#config-plans-and-the-provider-apis)
   - [`config check | set | which`](#config-check--set--which)
@@ -940,6 +941,10 @@ after a prefix change, *into* the current prefix's file, repointing the symlink 
 other live pods' rows, so the next `keys gen` doesn't strand them) and renames its key on OpenRouter
 in place (`PATCH /keys/{hash}` `name`; skipped quietly with no CSV / no provisioning key; a new name
 that already has its own row or key is left alone and warned about), then syncs the proxy.
+A proxy port is its name's place in `MACHINE_NAME_LIST`, so a rename to another name moves the
+machine to that name's port, and whoever works on it connects as the new name from then on (their
+old `Host` reaches nothing): the plan and the output say so, `devtest-echo :9504 → devtest-bravo
+:9501`. A prefix change keeps each short name's port.
 
 A RunPod or Vast container's `MACHINE_NAME` env var keeps the old name (env only changes with a
 reimage) — the output says so; bare VMs (Hetzner, Shadeform) have no such variable. `--dry-run`
@@ -982,7 +987,9 @@ provider holds one).
 
 `create` also takes **explicit names** (`pods create apple bloom`) and an **`--image`** override,
 alongside `-n` (target number on `--provider`; pods on other providers don't count) / `-a` (add).
-Bare names get the configured prefix; names already present are skipped.
+Bare names get the configured prefix; names already present are skipped. `-n`/`-a` (and the
+dashboard's add form) take free cohort names in `MACHINE_NAME_LIST` order and never a staff `@`
+entry, which is made only by name (`pods create @box`).
 
 Every name-picking listing — `-n`/`-a`, explicit names, placement's retry rounds, `rename`, the
 TUI's add-pod form — must come from **every** configured provider: if one fails to list, the command
@@ -2600,6 +2607,39 @@ currency,cost,source,estimate,estimated`). `--json`: the whole report. A source 
 read (a provider's listing, the keys, RunPod's billing, Hetzner's currency) is one warning line;
 the exit is 0.
 
+### A project week, start to end
+
+On the normal fleet: an owner per machine, then `arena spend`. Budgets are only to watch: nothing
+stops a machine at a figure, and participants see none of it. In order (rehearsed on the sandbox
+2026-10-31):
+
+1. **Before the first machine.** `arena config check`: `OPENROUTER_KEY_LIMIT` is the cap every new
+   key gets (a handover's too). `arena cron show`: the backup line copies homes (no `--no-pull`) —
+   project work outside the course repo is only in the home copy.
+2. **Keys, then machines.** `arena keys gen apple bloom` mints each name's OpenRouter key (names
+   with no pod yet are fine); then `arena pods up apple --owner alice` (one owner per run;
+   `--provider hetzner` for a VM). `up` copies a name's key on as it sets the machine up, but
+   never mints one: a name without a key gets none until `arena keys gen <name> --copy`. A
+   machine that already exists: `arena spend assign <machine> <owner>` (it says when the machine's
+   key was someone else's; `arena keys rotate <machine> --copy` gives a fresh one).
+3. **Who's on what:** `arena spend --by machine` — `pods list` and the dashboard don't show owners.
+4. **During the week:** `arena keys limit apple +5` (the dashboard: `a a`) raises a cap in place;
+   `arena keys pause apple` / `resume`. `arena spend` any time.
+5. **A machine for someone else:** `arena pods terminate apple --revoke-key`, then `arena pods up
+   apple --owner bob`. The old instance keeps alice's hours and AI spend and bob's starts at 0; a
+   key still alice's is rotated first (`--keep-key` keeps it). `spend assign` on a running machine
+   moves its whole instance, earlier hours included: for a new person, make a new instance.
+6. **A rename** (`arena pods rename apple cedar`) moves the machine to cedar's proxy port: its
+   person connects as `<prefix>-cedar` from then on. Its spend, key and keys-CSV row follow.
+7. **Backups.** A machine's git backup needs its day branch (`arena pods init-branches`, or the
+   morning's `set-branch main --all --init-branches`); the home copy runs on any branch. `arena
+   backups`, or `b` in the dashboard (Enter on a machine: back up now, copy home now).
+8. **End of the week.** There's no `--final`: `arena pods backup <names>` once more (git, then the
+   home copy); `arena spend --since <first day> --csv > spend.csv` (`--by machine --csv` per
+   instance, `--json` the whole report); then `arena pods terminate <name> --revoke-key` per
+   machine — one at a time, since `--all` is every pod on the account — and `arena teardown
+   --check`.
+
 ### Running a second fleet from the same control box
 
 Optional, and **not needed for a project week**: that runs on the normal fleet, with `--owner`
@@ -2960,7 +3000,9 @@ RunPod v1 and Vast; Hetzner: "the disk is kept"); whole-fleet mutations
 require typing **ALL** (a marked set: its count, or `ALL` as above); every confirm says what will
 happen in plain words (`alpha: commit + push the current branch`), never the generated `ssh …` line
 — `v` shows that for backup/setup/test — and backup/setup/test take a single `y`. The dashboard's
-reads stay reads.
+reads stay reads. Its `setup` runs the steps `arena pods setup` runs for the pod's provider — on a
+Hetzner or Shadeform VM the VM script (swap included), the keys authorized and (Hetzner) the
+hostname — but neither the VS Code warm-up nor the API keys: those are `arena pods setup`'s.
 
 ### Adding pods
 

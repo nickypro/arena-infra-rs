@@ -50,6 +50,18 @@ earlier).
 - `CLAUDE_CODE_OAUTH_TOKEN`: a pool of one when there's no tokens file; beside one it's unused, and
   `config check` says so.
 
+## 2026-10-31 · Project week: the dashboard's setup on a Hetzner VM, staff names, renames say the new port
+- The dashboard's **setup** on a Hetzner (or Shadeform) VM now runs what `arena pods setup` runs
+  there: the VM setup script with its swap, the keys authorized and the hostname. It ran the
+  RunPod/Vast steps on every pod before, so a Hetzner VM got no script and no swap.
+- `pods up -n`/`-a` (and the dashboard's add form) never pick a staff `@` name from
+  `MACHINE_NAME_LIST` for a new pod. A staff box is made by name only.
+- `pods rename` says where the machine's proxy port goes (`devtest-echo :9504 → devtest-bravo
+  :9501`): a port belongs to a name, so whoever works on the machine connects as the new name.
+- Docs: [A project week, start to end](docs/REFERENCE.md#a-project-week-start-to-end), the
+  organisers' flow in order: keys before machines, owners, a name for someone else, renames,
+  backups and the end-of-week report.
+
 ## 2026-10-31 · arena 2.4: what works where — refused up front, greyed out in the dashboard
 - One table says which commands and create flags work on which provider (RunPod, RunPod v1, Vast,
   Hetzner, Shadeform). Every command checks it for each selected pod before it asks anything, the

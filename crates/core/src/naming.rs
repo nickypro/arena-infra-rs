@@ -49,7 +49,11 @@ pub fn canonical_name(prefix: &str, candidates: &[String], token: &str) -> Strin
     if t.starts_with(&pre) { t.to_string() } else { format!("{pre}{t}") }
 }
 
-/// Return up to `count` fully-qualified names not already taken by `existing`.
+/// Return up to `count` fully-qualified cohort names not already taken by `existing` — what
+/// `pods up/create -n/-a` (and the dashboard's add form) make. Never an absolute `@` entry: those
+/// are staff boxes, made by name (`pods create @box`) and left out of every cohort count — a
+/// top-up that picked one would make a participant's pod under a staff box's name and port, and
+/// (not counted as the cohort's) another the next time.
 pub fn next_free_names(
     prefix: &str,
     candidates: &[String],
@@ -59,6 +63,7 @@ pub fn next_free_names(
     let taken: HashSet<&str> = existing.iter().map(|p| p.name.as_str()).collect();
     candidates
         .iter()
+        .filter(|n| !is_absolute(n))
         .map(|n| qualify(prefix, n))
         .filter(|fq| !taken.contains(fq.as_str()))
         .take(count)
@@ -100,12 +105,15 @@ mod tests {
     }
 
     #[test]
-    fn next_free_names_emits_bare_absolute_names() {
-        let candidates = vec!["apple".to_string(), "@james-gpu".into(), "bloom".into()];
-        // apple taken; the absolute entry must come out bare (no `arena8-`), not skipped.
+    fn next_free_names_never_picks_a_staff_entry() {
+        let candidates = vec!["apple".to_string(), "@james-gpu".into(), "bloom".into(), "cedar".into()];
+        // apple taken, james-gpu free (its box is down): a top-up skips the staff entry.
         let existing = vec![pod("arena8-apple")];
-        let got = next_free_names("arena8", &candidates, &existing, 2);
-        assert_eq!(got, vec!["james-gpu", "arena8-bloom"]);
+        assert_eq!(next_free_names("arena8", &candidates, &existing, 2), vec!["arena8-bloom", "arena8-cedar"]);
+        // Every free name, as the dashboard's add form lists them: still none of the staff's.
+        assert_eq!(next_free_names("arena8", &candidates, &[], usize::MAX), vec!["arena8-apple", "arena8-bloom", "arena8-cedar"]);
+        // Only staff entries left: nothing to make.
+        assert!(next_free_names("arena8", &["@james-gpu".to_string()], &[], 1).is_empty());
     }
 
     #[test]
