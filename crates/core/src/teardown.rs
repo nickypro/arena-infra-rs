@@ -128,6 +128,9 @@ pub struct Inputs {
     /// This cohort's capacity spares ([`crate::spare`]): Hetzner servers in no fleet listing,
     /// billing like any; skipped without `HETZNER_API_KEY`.
     pub spares: Probe<Vec<Pod>>,
+    /// The Hetzner project's volumes but the archive's ([`crate::datavol::fleet_volumes`]):
+    /// a fleet VM's extra disk outlives the VM; skipped without `HETZNER_API_KEY`.
+    pub hetzner_volumes: Probe<Vec<crate::archive::cloud::CloudVolume>>,
 }
 
 /// One checklist line's outcome.
@@ -344,6 +347,7 @@ pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
         items.push(pods_item(provider, listing.as_ref().map(Vec::as_slice), naming, &all));
     }
     items.push(volumes_item(&inputs.volumes));
+    items.push(hetzner_volumes_item(&inputs.hetzner_volumes, inputs.archive_prices.volume_gb_month));
     if inputs.listings.iter().any(|(p, _)| p == "shadeform") {
         items.push(shadeform_volumes_item(&inputs.shadeform_volumes));
     }
@@ -657,6 +661,51 @@ pub fn volumes_item(volumes: &Probe<Vec<NetworkVolume>>) -> Item {
     item.notes.push(
         "deleting a volume is irreversible and destroys its data — confirm the groups are finished first (export RUNPOD_API_KEY \
          for the commands, or delete it in the RunPod console)"
+            .into(),
+    );
+    item
+}
+
+/// The Hetzner volumes of the fleet's VMs (`pods volume add`; any but the archive's): each bills
+/// by the GB-month, attached or not, until deleted — a terminate keeps it unless
+/// `--delete-volumes`. Priced at `gb_month` (Hetzner's `/pricing`, the archive's list figure
+/// when that can't be read), in EUR.
+pub fn hetzner_volumes_item(volumes: &Probe<Vec<crate::archive::cloud::CloudVolume>>, gb_month: f64) -> Item {
+    const SCOPE: &str = "hetzner";
+    let vols = match volumes {
+        Probe::Skipped(why) => return Item::new(Area::Volumes, SCOPE, Verdict::Skipped, why.clone()),
+        Probe::Failed(e) => {
+            let mut item = Item::new(Area::Volumes, SCOPE, Verdict::Unknown, format!("couldn't check ({e}) — NOT known to be empty"));
+            item.notes.push("look in the Hetzner console (Volumes) before calling the teardown done".into());
+            return item;
+        }
+        Probe::Got(v) if v.is_empty() => return Item::new(Area::Volumes, SCOPE, Verdict::Clear, "none"),
+        Probe::Got(v) => v,
+    };
+    let gb: u32 = vols.iter().map(|v| v.size_gb).sum();
+    let monthly = crate::datavol::monthly(vols, gb_month);
+    let detached = vols.iter().filter(|v| v.server.is_none()).count();
+    let mut summary = format!("{}, {gb} GB — {}/month", remain(vols.len()), fmt_money(currency_symbol("hetzner"), monthly));
+    if detached > 0 {
+        summary.push_str(&format!(" ({detached} detached: billing for nothing)"));
+    }
+    let mut item = Item::new(Area::Volumes, SCOPE, Verdict::Remaining, summary);
+    let mut sorted: Vec<&crate::archive::cloud::CloudVolume> = vols.iter().collect();
+    sorted.sort_by(|a, b| (&a.name, a.id).cmp(&(&b.name, b.id)));
+    for v in sorted {
+        item.entries.push(Entry::Volume {
+            id: v.id.to_string(),
+            name: v.name.clone(),
+            size_gb: Some(v.size_gb),
+            data_center: Some(v.location.clone()),
+            tier: None,
+            est_usd_per_month: None,
+        });
+        item.fix.push(format!("arena pods volume delete {} --yes", sh_word(&v.name)));
+    }
+    item.notes.push(
+        "deleting a volume is irreversible and destroys its files (it's in no backup) — copy off what's wanted first; a VM's \
+         terminate never deletes one (`--delete-volumes` does)"
             .into(),
     );
     item
@@ -1528,6 +1577,7 @@ mod tests {
             images: Probe::Got(crate::image::Inventory::default()),
             leftovers: Probe::Got(Vec::new()),
             spares: Probe::Got(Vec::new()),
+            hetzner_volumes: Probe::Got(Vec::new()),
             now: 20_000 * 86_400,
         }
     }
@@ -1634,6 +1684,7 @@ mod tests {
                 (Area::Pods, "hetzner", Verdict::Clear),
                 (Area::Pods, "shadeform", Verdict::Skipped), // likewise
                 (Area::Volumes, "runpod", Verdict::Clear),
+                (Area::Volumes, "hetzner", Verdict::Clear),
                 (Area::Keys, "", Verdict::Clear), // another cohort's key isn't ours
                 (Area::Cron, "dev", Verdict::Clear),
                 (Area::At, "dev", Verdict::Skipped),

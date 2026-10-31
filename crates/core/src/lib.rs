@@ -18,6 +18,7 @@ pub(crate) mod base64;
 pub mod capability;
 pub mod config;
 pub mod cron;
+pub mod datavol;
 pub mod disk;
 pub mod error;
 pub mod fleet;
