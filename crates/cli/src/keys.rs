@@ -740,9 +740,11 @@ fn keys_table(keys: &[&arena_core::openrouter::KeyInfo]) -> String {
     let (mut today, mut month, mut all) = (0.0, 0.0, 0.0);
     for k in keys {
         let u = arena_core::openrouter::KeyUsage::of(k);
+        // A cap as it was set (`$0.05`, not the hourly prices' `$0.050`).
         let lim = match (k.limit, u.reset.as_deref()) {
-            (Some(l), Some(r)) => format!("{}/{}", fmt_money("$", l), &r[..1]),
-            (l, _) => money(l),
+            (Some(l), Some(r)) => format!("{}/{}", arena_core::openrouter::exact_money(l), &r[..1]),
+            (Some(l), None) => arena_core::openrouter::exact_money(l),
+            (None, _) => "-".into(),
         };
         let short = &k.hash[..k.hash.len().min(12)];
         let dis = if k.disabled { "  (disabled)" } else { "" };

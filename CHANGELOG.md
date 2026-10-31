@@ -24,6 +24,9 @@ earlier).
   OWNER column after NAME, per instance, empty for a machine with no owner, and no column at all
   while no machine has one. In the dashboard it's a short column that a narrow terminal drops;
   the detail view has an `owner:` line.
+- A key's cap prints as it was set, `$0.05` (it read `$0.050`): `keys list`, `keys limit`, the
+  dashboard. A key handed over to a new owner says the new key's cap
+  (`… a fresh key 4de6426ea4a4, cap $0.10)`).
 
 ## 2026-10-31 · arena 2.5: move a Hetzner box to a bigger type, keeping its files
 - `arena pods replace apple --server-type cx43` and `pods migrate copy apple --server-type cx43`

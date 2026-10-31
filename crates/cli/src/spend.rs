@@ -414,7 +414,12 @@ pub(crate) async fn hand_over(ctx: &SpendCtx, cfg: &Config, api: Option<&dyn Key
                 let short = ck.hash[..ck.hash.len().min(12)].to_string();
                 match super::write_openrouter_key(dir, &h.name, &ck.secret, &prefix) {
                     Ok(()) => {
-                        done.lines.push(format!("✓ {}: OpenRouter key handed over ({} → {owner}, a fresh key {short})", h.name, h.from));
+                        done.lines.push(format!(
+                            "✓ {}: OpenRouter key handed over ({} → {owner}, a fresh key {short}, cap {})",
+                            h.name,
+                            h.from,
+                            arena_core::openrouter::exact_money(limit)
+                        ));
                         done.csv_changed = true;
                         (deleted, true)
                     }
@@ -854,6 +859,7 @@ mod tests {
         assert!(plan[1].contains("would rotate devtest-alpha's OpenRouter key first: it was alice's"), "{plan:?}");
         let said = hand_over(&ctx, &cfg, Some(&api as &dyn KeyApi), &keys_dir, &h, "bob").await;
         assert!(said.lines[0].starts_with("✓ devtest-alpha: OpenRouter key handed over (alice → bob"), "{said:?}");
+        assert!(said.lines[0].ends_with(", cap $1.00)"), "the new key's cap (OPENROUTER_KEY_LIMIT): {said:?}");
         assert_eq!(api.deleted.lock().unwrap().as_slice(), std::slice::from_ref(&ck.hash));
         let csv = std::fs::read_to_string(keys_dir.join("openrouter_api_keys.csv")).unwrap();
         assert!(csv.contains("devtest-alpha,sk-or-v1-2"), "{csv}");

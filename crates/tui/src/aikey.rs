@@ -168,7 +168,7 @@ pub(crate) fn choose(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, pod: Pod, shown: 
     if action == Action::KeyRotate {
         let cap = ui.cfg.get_parsed::<f64>("OPENROUTER_KEY_LIMIT").unwrap_or(5.0);
         let at = std::env::current_dir().map(|d| d.join("keys").display().to_string()).unwrap_or_else(|_| "./keys".into());
-        note.push_str(&format!("\nthe new key: cap {} (OPENROUTER_KEY_LIMIT), saved in {at}", arena_core::fleet::fmt_money("$", cap)));
+        note.push_str(&format!("\nthe new key: cap {} (OPENROUTER_KEY_LIMIT), saved in {at}", arena_core::openrouter::exact_money(cap)));
     }
     let mut c = Confirm::new(action, shown, pod.id, preview);
     c.note = Some(note);
