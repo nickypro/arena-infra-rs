@@ -121,10 +121,13 @@ pub fn text(s: &Status) -> String {
     }
     if !s.without_machine.is_empty() {
         let n = s.without_machine.len();
+        // One with a `(not listed)` row: the record's last backups of an earlier machine of that name.
+        let earlier = s.pods.iter().any(|p| !p.listed && s.without_machine.contains(&p.name));
         out.push_str(&format!(
-            "{n} configured name{} with no machine (nothing to back up): {}\n",
-            if n == 1 { "" } else { "s" },
-            names(&s.without_machine, 8)
+            "{n} configured name{} no machine now: {}{}\n",
+            if n == 1 { " has" } else { "s have" },
+            names(&s.without_machine, 8),
+            if earlier { " (a `(not listed)` row is an earlier machine's last backups)" } else { "" }
         ));
     }
     out.push_str("\nWhere the copies live:\n");

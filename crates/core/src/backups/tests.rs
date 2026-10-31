@@ -725,13 +725,20 @@ fn listed_machines_are_the_rows_and_names_without_one_a_line() {
     let mut s = judge(&Inputs { pods: live, ..inputs() });
     s.without_machine = without_machine(&cfg, &s.pods.iter().map(|p| PodIn { name: p.name.clone(), ..PodIn::default() }).collect::<Vec<_>>());
     let text = render::text(&s);
-    assert!(text.contains("1 configured name with no machine (nothing to back up): devtest-charlie\n"), "{text}");
+    assert!(text.contains("1 configured name has no machine now: devtest-charlie\n"), "{text}");
     assert!(!text.contains("?  devtest-charlie"), "no row for it: {text}");
+    // An earlier charlie backed up lately keeps its row (`not listed`), and the line says what it is.
+    let r = record_with(5 * MIN, &[("charlie", Outcome::Pushed, "")], &[]);
+    let mut s = judge(&Inputs { pods: listed_pods(&pods, &naming, |_| None), record: Ok(Some(r)), ..inputs() });
+    s.without_machine = vec!["devtest-charlie".into()];
+    let text = render::text(&s);
+    assert!(text.contains("devtest-charlie (not listed)"), "{text}");
+    assert!(text.contains("1 configured name has no machine now: devtest-charlie (a `(not listed)` row is an earlier machine's last backups)\n"), "{text}");
     // No machine at all yet: said, then the line.
     let mut s = judge(&Inputs { pods: Vec::new(), ..inputs() });
     s.without_machine = vec!["devtest-alpha".into(), "devtest-bravo".into()];
     let text = render::text(&s);
-    assert!(text.contains("Pods: no machine yet\n2 configured names with no machine (nothing to back up): devtest-alpha, devtest-bravo\n"), "{text}");
+    assert!(text.contains("Pods: no machine yet\n2 configured names have no machine now: devtest-alpha, devtest-bravo\n"), "{text}");
     assert!(serde_json::to_string(&s).unwrap().contains("\"without_machine\":[\"devtest-alpha\",\"devtest-bravo\"]"));
 }
 

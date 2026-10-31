@@ -415,7 +415,7 @@ mod tests {
         let mut s = backups::judge(&backups::read(&cfg, Some("/c"), Ok(String::new()), pods, arena_core::snapshot::unix_now()));
         s.without_machine = without;
         let text = backups::render::text(&s);
-        assert!(text.contains("2 configured names with no machine (nothing to back up): devtest-apple, devtest-cedar"), "{text}");
+        assert!(text.contains("2 configured names have no machine now: devtest-apple, devtest-cedar"), "{text}");
         assert!(!text.contains("devtest-apple  ?"), "{text}");
         // A provider down: the configured names, as before, and why.
         let down = Listed(vec![("hetzner", Ok(vec![hz("bloom")])), ("runpod", Err("HTTP 503"))]);

@@ -108,8 +108,8 @@ pub(crate) fn check_csv_keys(keys: &mut KeySources, hosts: &[String], listed: Op
         let s = short(naming, &host);
         out.push(match why {
             Stale::Gone => format!(
-                "⚠ {host}: the keys CSV's OpenRouter key is gone from OpenRouter (deleted outside this keys folder) — \
-                 not copied. `arena keys gen {s} --copy` mints a fresh one"
+                "⚠ {host}: the keys CSV's OpenRouter key is gone from OpenRouter (revoked, or deleted elsewhere) — not \
+                 copied. `arena keys gen {s} --copy` mints a fresh one"
             ),
             Stale::Replaced => format!(
                 "⚠ {host}: the keys CSV's OpenRouter key isn't the one OpenRouter has for it (rotated elsewhere) — not \
