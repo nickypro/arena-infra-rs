@@ -71,6 +71,9 @@ impl Config {
         // environment avoids editing the shared, read-only prod config for a run.
         "HF_TOKEN",
         "CLAUDE_CODE_OAUTH_TOKEN",
+        // The Claude Code accounts' tokens file (`arena_core::claude`): a path, not a secret — so a
+        // test pool (or a different file for one run) needs no edit to the shared config.
+        "CLAUDE_TOKENS_FILE",
         // `SSH_PROXY_RELOAD_CMD=` (empty) = write the proxy config, never reload nginx. A
         // wrapper sharing a box with the production nginx (the sandbox's `arena-dev`) exports
         // it empty so no lifecycle sync can reload the system nginx, whatever its config file

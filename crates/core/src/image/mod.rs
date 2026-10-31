@@ -524,6 +524,8 @@ pub fn scrub_script() -> String {
         .iter()
         .flat_map(|(_, _, envs)| envs.iter().copied())
         .chain(crate::apikeys::BROADCAST_TOKENS.iter().flat_map(|(_, _, envs)| envs.iter().copied()))
+        // Each machine's own Claude Code token (`crate::claude`), no longer a broadcast one.
+        .chain(std::iter::once(crate::claude::TOKEN_KEY))
         .collect();
     let mut uniq: Vec<&str> = Vec::new();
     for v in vars {

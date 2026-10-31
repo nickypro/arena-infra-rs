@@ -105,6 +105,15 @@ pub(crate) enum Cmd {
     /// Needs OPENROUTER_PROVISIONING_KEY in the config.
     #[command(subcommand, infer_subcommands = true)]
     Keys(KeysCmd),
+    /// Claude Code accounts: one per machine, from a pool of tokens
+    ///
+    /// The pool is CLAUDE_TOKENS_FILE (`email -> sk-ant-oat01-…` per line, chmod 600), else
+    /// config's one CLAUDE_CODE_OAUTH_TOKEN. `accounts` shows who's on which; `assign` moves pods
+    /// (or a person's) to an account; `push` puts each pod's own token on it; `off` takes it off.
+    /// setup, `up` and copy-keys put a new machine on the least-loaded account.
+    #[command(verbatim_doc_comment)]
+    #[command(subcommand, infer_subcommands = true)]
+    Claude(crate::claude::ClaudeCmd),
     /// RunPod's GPU types as before (`offers runpod`: per tier)
     ///
     /// Live from RunPod where available, else the local presets. Hidden: `offers` covers it.
@@ -660,8 +669,9 @@ pub(crate) enum PodCmd {
     /// Provision pods over SSH: keys, repo, tokens, VS Code
     ///
     /// Per pod: deploy key + GitHub SSH config, authorized keys, the ARENA repo (fetch the
-    /// default branch, update the current one), submodules, ~/.name, broadcast tokens (HF, Claude
-    /// Code), a VS Code server warm-up, then API keys if keys/*_api_keys.csv exist. With a
+    /// default branch, update the current one), submodules, ~/.name, the HF token, a VS Code server
+    /// warm-up, then API keys if keys/*_api_keys.csv exist and each pod's own Claude Code account
+    /// (`arena claude`: the least-loaded one if it has none). With a
     /// /workspace volume the repo is moved onto it, so a restart keeps the work. Confirms first;
     /// no targets = every pod.
     #[command(verbatim_doc_comment)]
@@ -676,7 +686,7 @@ pub(crate) enum PodCmd {
         /// Hugging Face token to broadcast (overrides config HF_TOKEN).
         #[arg(long)]
         hf_token: Option<String>,
-        /// Claude Code OAuth token to broadcast (overrides config CLAUDE_CODE_OAUTH_TOKEN).
+        /// One Claude Code token for every pod, instead of each pod's own account (`arena claude`)
         #[arg(long)]
         cc_token: Option<String>,
         /// Also install zsh, oh-my-zsh, powerlevel10k and dotfiles (for bare images)
@@ -1229,8 +1239,8 @@ pub(crate) enum PodCmd {
     Reap(reap::ReapCmd),
     /// Copy API keys and tokens into pods' shells
     ///
-    /// Per-host keys from `<keys-dir>/<provider>_api_keys.csv`, plus the HF and Claude Code
-    /// tokens. No targets = every reachable pod.
+    /// Per-host keys from `<keys-dir>/<provider>_api_keys.csv`, plus the HF token and each pod's
+    /// own Claude Code account's token (`arena claude`). No targets = every reachable pod.
     #[command(verbatim_doc_comment)]
     CopyKeys {
         /// Directory holding the per-host `<provider>_api_keys.csv` files [default: keys/ beside
@@ -1240,7 +1250,7 @@ pub(crate) enum PodCmd {
         /// Hugging Face token for every pod (overrides config HF_TOKEN)
         #[arg(long)]
         hf_token: Option<String>,
-        /// Claude Code OAuth token for every pod (overrides config CLAUDE_CODE_OAUTH_TOKEN)
+        /// One Claude Code token for every pod, instead of each pod's own account (`arena claude`)
         #[arg(long)]
         cc_token: Option<String>,
         /// Preview only: print what would be set per pod (key values redacted).
