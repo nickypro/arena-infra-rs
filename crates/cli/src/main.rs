@@ -467,9 +467,10 @@ async fn run() -> Result<()> {
             let ctx = spend::SpendCtx::from_config(&cfg);
             let now = arena_core::snapshot::unix_now();
             let fleet = provider.unwrap();
-            if let Some(spend::SpendCmd::Assign { target, owner, clear }) = cmd {
+            if let Some(spend::SpendCmd::Assign { target, owner, clear, dry_run, force }) = cmd {
                 let owner = if clear { None } else { owner.as_deref() };
-                print!("{}", spend::spend_assign(fleet.as_ref(), &cfg, &ctx, &target, owner, now).await?);
+                let opts = spend::AssignOpts { dry_run, force };
+                print!("{}", spend::spend_assign(fleet.as_ref(), &cfg, &ctx, &target, owner, now, opts).await?);
                 return Ok(());
             }
             let keys = openrouter_client(&cfg);

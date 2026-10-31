@@ -2515,7 +2515,12 @@ under an hour's credit for them, over the spend limit, `underBalance` — never 
 `spend [--by owner|machine] [--since DATE] [--csv|--json]` — what each machine instance cost and
 who it was for, compute and AI, for the organisers (read-only towards the providers; it records
 what it read in the local ledger). `spend assign <machine|instance id|key hash> <owner>` (or
-`--clear`) sets or fixes an owner.
+`--clear`) sets or fixes an owner; `--dry-run` says what it would change and move. A row has one
+owner for its whole life, so assigning a machine that has run up spend under someone else would
+move all of it to the new person: that's refused, saying what would move and what to do instead
+(`pods backup`, `pods terminate --revoke-key`, `pods up --owner <new>`: a new instance, so each
+keeps their own). `--force` does it anyway, for an owner that was wrong from the start. A machine
+with no owner yet (a forgotten `--owner`) is assigned as always.
 
 **On the fleet you already run** — a project week included: it needs no fleet of its own. Give
 new machines an owner as you make them, existing ones afterwards, then ask:

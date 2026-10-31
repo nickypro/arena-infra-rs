@@ -40,6 +40,11 @@ earlier).
   name is matched exactly, as one is (a typo stops them all, before anything); one confirm lists
   them and wants their count typed back (`ALL` past five, or for every listed pod), as the
   dashboard's marked set asks. `--all` now wants `ALL` typed too. `--yes` answers both.
+- `arena spend assign` has `--dry-run`, and refuses to move a machine's history from one person
+  to another: on a machine that has run up spend under alice, `spend assign apple bob` says what
+  would move (`2.0 h, €0.020 since …`) and what to do instead (back up, terminate, `up --owner
+  bob`). `--force` assigns it anyway (an owner that was wrong from the start). A machine with no
+  owner is assigned as before.
 - `arena backups` shows the fleet's live machines, as the dashboard's `b` does (it lists the
   providers, read-only), and one line counting the configured names with no machine. Those names
   were `?` rows at the top. A provider that doesn't answer brings the old list back, with a note.

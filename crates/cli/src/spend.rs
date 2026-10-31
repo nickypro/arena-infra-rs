@@ -477,7 +477,20 @@ pub(crate) enum SpendCmd {
         /// Remove the owner instead (the row goes back to "(no owner)")
         #[arg(long, conflicts_with = "owner")]
         clear: bool,
+        /// Say what would change and what it moves; change nothing
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+        /// Move a machine's history from one owner to another all the same (fixing a wrong owner)
+        #[arg(long)]
+        force: bool,
     },
+}
+
+/// `spend assign`'s switches.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AssignOpts {
+    pub dry_run: bool,
+    pub force: bool,
 }
 
 /// What `arena spend` shows.
@@ -620,6 +633,11 @@ pub(crate) async fn spend_report(
     Ok(Printed { stdout, stderr, code: 0 })
 }
 
+/// A machine's name without the fleet prefix, as commands take it (`apple`).
+fn naming_short(naming: &Naming, name: &str) -> String {
+    name.strip_prefix(naming.prefix).and_then(|s| s.strip_prefix('-')).filter(|s| !s.is_empty()).unwrap_or(name).to_string()
+}
+
 /// `f`, within [`READ_TIMEOUT`] (its rate-limit waits included).
 async fn within<F: std::future::Future>(f: F) -> std::result::Result<F::Output, ()> {
     arena_core::ratelimit::bounded(READ_TIMEOUT, f).await.map_err(|_| ())
@@ -628,7 +646,13 @@ async fn within<F: std::future::Future>(f: F) -> std::result::Result<F::Output, 
 /// `arena spend assign <target> <owner>` / `--clear`: list the fleet first (a machine made a
 /// moment ago is in the ledger then), set the owner, and say what changed — with a hint when
 /// the machine's AI key is someone else's.
-pub(crate) async fn spend_assign(provider: &dyn Provider, cfg: &Config, ctx: &SpendCtx, target: &str, owner: Option<&str>, now: u64) -> Result<String> {
+///
+/// A row has one owner for its whole life, so giving a machine that has run up spend under one
+/// person to another moves all of it ([`spend::Moves`]): refused unless `--force`, saying what
+/// would move and what to do instead (back up, terminate, `up --owner` — a new instance each).
+/// An unowned machine (a forgotten `--owner`) is assigned as before. `--dry-run` says what would
+/// change and move, and writes nothing (the listing isn't recorded either).
+pub(crate) async fn spend_assign(provider: &dyn Provider, cfg: &Config, ctx: &SpendCtx, target: &str, owner: Option<&str>, now: u64, opts: AssignOpts) -> Result<String> {
     let path = match &ctx.path {
         Some(Ok(p)) => p.clone(),
         Some(Err(e)) => anyhow::bail!("no spend ledger: {e}"),
@@ -639,9 +663,45 @@ pub(crate) async fn spend_assign(provider: &dyn Provider, cfg: &Config, ctx: &Sp
     let pods = listing.pods();
     let bare = target.strip_prefix('@').unwrap_or(target);
     let names = vec![target.to_string(), bare.to_string(), arena_core::naming::canonical_name(naming.prefix, naming.list, target)];
+    let short = naming_short(&naming, bare);
+    if opts.dry_run {
+        let state = spend::observe(spend::load(&path).0, &listing, &pods, &naming, now);
+        let moves = spend::assign_moves(&state, &names, target, now).map_err(|e| anyhow::anyhow!(e))?;
+        let (_, what) = spend::assign(state.clone(), &names, target, owner, now).map_err(|e| anyhow::anyhow!(e))?;
+        let new = owner.unwrap_or(spend::NO_OWNER);
+        let mut out = match what {
+            spend::Assigned::Machine { name, provider, id, was } => {
+                format!("[dry-run] would set {name} ({provider} {id}): owner {} → {new}\n", was.as_deref().unwrap_or(spend::NO_OWNER))
+            }
+            spend::Assigned::Key { name, hash, was } => format!(
+                "[dry-run] would set AI key {} ({name}): owner {} → {new}\n",
+                &hash[..hash.len().min(12)],
+                was.as_deref().unwrap_or(spend::NO_OWNER)
+            ),
+        };
+        if let Some(m) = &moves {
+            if m.from.as_deref() != owner {
+                out.push_str(&format!("  its whole history goes with it: {}\n", m.words()));
+            }
+            if m.takes_from(owner) {
+                out.push_str(&format!("  refused without --force: {}\n", m.refusal(owner, &short)));
+            }
+        }
+        out.push_str("Dry-run only — nothing changed.\n");
+        return Ok(out);
+    }
     let mut outcome = None;
     let (state, warning) = spend::record(&path, now, |s| {
         let s = spend::observe(s, &listing, &pods, &naming, now);
+        // Spend under one person moved to another: refused unless --force (the listing is
+        // recorded all the same).
+        match spend::assign_moves(&s, &names, target, now) {
+            Ok(Some(m)) if m.takes_from(owner) && !opts.force => {
+                outcome = Some(Err(m.refusal(owner, &short)));
+                return s;
+            }
+            _ => {}
+        }
         match spend::assign(s.clone(), &names, target, owner, now) {
             Ok((next, what)) => {
                 outcome = Some(Ok(what));
@@ -824,7 +884,7 @@ mod tests {
         assert!(out.stdout.lines().nth(1).unwrap().starts_with("alice"), "{}", out.stdout);
         assert!(out.stdout.lines().nth(2).unwrap().starts_with("(no owner)") && out.stdout.contains("bravo"), "{}", out.stdout);
         assert_eq!(out.code, 0);
-        let said = spend_assign(&fake, &cfg, &ctx, "bravo", Some("bob"), unix_now()).await.unwrap();
+        let said = spend_assign(&fake, &cfg, &ctx, "bravo", Some("bob"), unix_now(), AssignOpts::default()).await.unwrap();
         assert!(said.contains("devtest-bravo") && said.contains("(no owner) → bob"), "{said}");
         let out = spend_report(&fake, &cfg, &ctx, None, &SpendFlags { csv: true, by_machine: true, ..Default::default() }, unix_now()).await.unwrap();
         assert!(out.stdout.starts_with("name,id,provider"), "{}", out.stdout);
@@ -832,7 +892,45 @@ mod tests {
         let json = spend_report(&fake, &cfg, &ctx, None, &SpendFlags { json: true, ..Default::default() }, unix_now()).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
         assert_eq!(v["owners"].as_array().unwrap().len(), 2);
-        assert!(spend_assign(&fake, &cfg, &ctx, "nope", Some("x"), unix_now()).await.is_err());
+        assert!(spend_assign(&fake, &cfg, &ctx, "nope", Some("x"), unix_now(), AssignOpts::default()).await.is_err());
+    }
+
+    /// `spend assign` on a machine that has run up spend under someone else would move its whole
+    /// history: `--dry-run` says so and writes nothing; without `--force` it's refused, saying what
+    /// moves and what to do instead; `--force` does it. An unowned machine, or the same owner, is
+    /// assigned as before.
+    #[tokio::test]
+    async fn assigning_a_machine_with_someone_elses_spend_is_refused_unless_forced() {
+        let d = tmp("assign-moves");
+        let cfg = cfg(&d.0);
+        let ctx = SpendCtx { api: Arc::new(spend::FakeSpendApi::default()), ..SpendCtx::from_config(&cfg) };
+        let fake = FakeProvider::default();
+        Tracked::new(&fake, &ctx, OwnerRule::Given("alice".into())).create_pod(&PodSpec { name: "devtest-alpha".into(), ..PodSpec::default() }).await.unwrap();
+        let later = unix_now() + 2 * 3_600;
+        let dry = AssignOpts { dry_run: true, force: false };
+        let said = spend_assign(&fake, &cfg, &ctx, "alpha", Some("bob"), later, dry).await.unwrap();
+        assert!(said.starts_with("[dry-run] would set devtest-alpha (hetzner 1001): owner alice → bob\n"), "{said}");
+        assert!(said.contains("  its whole history goes with it: 2.0 h, €0.020 since "), "{said}");
+        assert!(said.contains("  refused without --force: devtest-alpha (hetzner 1001) is alice's and has run up 2.0 h"), "{said}");
+        assert!(said.ends_with("Dry-run only — nothing changed.\n"), "{said}");
+        assert_eq!(spend::owner_of(&ctx.state(), "hetzner", "1001"), Some("alice"), "a dry run writes nothing");
+        let e = spend_assign(&fake, &cfg, &ctx, "alpha", Some("bob"), later, AssignOpts::default()).await.unwrap_err().to_string();
+        assert!(e.contains("is alice's and has run up 2.0 h, €0.020 since") && e.contains("would move all of that to bob"), "{e}");
+        assert!(e.contains("`arena pods backup alpha`, `arena pods terminate alpha --revoke-key`, then `arena pods up alpha --owner bob`"), "{e}");
+        assert!(e.contains("pass --force"), "{e}");
+        assert_eq!(spend::owner_of(&ctx.state(), "hetzner", "1001"), Some("alice"));
+        // The same owner moves nothing; --clear is a move too.
+        assert!(spend_assign(&fake, &cfg, &ctx, "alpha", Some("alice"), later, AssignOpts::default()).await.is_ok());
+        let e = spend_assign(&fake, &cfg, &ctx, "alpha", None, later, AssignOpts::default()).await.unwrap_err().to_string();
+        assert!(e.contains("would move all of that to (no owner)"), "{e}");
+        let said = spend_assign(&fake, &cfg, &ctx, "alpha", Some("bob"), later, AssignOpts { force: true, ..AssignOpts::default() }).await.unwrap();
+        assert!(said.contains("owner alice → bob"), "{said}");
+        assert_eq!(spend::owner_of(&ctx.state(), "hetzner", "1001"), Some("bob"));
+        // An unowned machine is what assign is for: no refusal, and the dry run says no moves.
+        Tracked::new(&fake, &ctx, OwnerRule::None).create_pod(&PodSpec { name: "devtest-bravo".into(), ..PodSpec::default() }).await.unwrap();
+        let said = spend_assign(&fake, &cfg, &ctx, "bravo", Some("carol"), later, dry).await.unwrap();
+        assert!(said.contains("owner (no owner) → carol") && !said.contains("refused"), "{said}");
+        assert!(spend_assign(&fake, &cfg, &ctx, "bravo", Some("carol"), later, AssignOpts::default()).await.is_ok());
     }
 
     #[tokio::test]

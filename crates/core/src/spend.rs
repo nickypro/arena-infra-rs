@@ -892,24 +892,7 @@ pub fn assign(mut state: SpendState, full_names: &[String], target: &str, owner:
     if target.is_empty() {
         return Err("no machine, instance id or key hash given".into());
     }
-    let by_name: Vec<usize> = state
-        .machines
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.is_open() && full_names.contains(&m.name))
-        .map(|(i, _)| i)
-        .collect();
-    let by_id: Vec<usize> = state.machines.iter().enumerate().filter(|(_, m)| m.id == target).map(|(i, _)| i).collect();
-    let pick = match (by_name.as_slice(), by_id.as_slice()) {
-        ([i], _) => Some(*i),
-        ([], [i]) => Some(*i),
-        ([_, _, ..], _) => {
-            let ids: Vec<String> = by_name.iter().map(|i| format!("{} {}", state.machines[*i].provider, state.machines[*i].id)).collect();
-            return Err(format!("{target} names {} running instances ({}) — give the instance id", by_name.len(), ids.join(", ")));
-        }
-        ([], [_, _, ..]) => return Err(format!("instance id {target} is on several providers — rename one apart first")),
-        ([], []) => None,
-    };
+    let pick = pick_machine(&state, full_names, target)?;
     state.begin(now);
     if let Some(i) = pick {
         let m = &mut state.machines[i];
@@ -942,6 +925,105 @@ pub fn assign(mut state: SpendState, full_names: &[String], target: &str, owner:
         )),
         _ => Err(format!("`{target}` is the start of {} key hashes — give more of it", keys.len())),
     }
+}
+
+/// The machine instance `target` names for [`assign`]: the open instance of that name (bare or
+/// full: `full_names`), else the instance with that id; `None` when it's neither (a key hash,
+/// or nothing). Errs when it's ambiguous.
+fn pick_machine(state: &SpendState, full_names: &[String], target: &str) -> Result<Option<usize>, String> {
+    let by_name: Vec<usize> = state
+        .machines
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.is_open() && full_names.contains(&m.name))
+        .map(|(i, _)| i)
+        .collect();
+    let by_id: Vec<usize> = state.machines.iter().enumerate().filter(|(_, m)| m.id == target).map(|(i, _)| i).collect();
+    match (by_name.as_slice(), by_id.as_slice()) {
+        ([i], _) => Ok(Some(*i)),
+        ([], [i]) => Ok(Some(*i)),
+        ([_, _, ..], _) => {
+            let ids: Vec<String> = by_name.iter().map(|i| format!("{} {}", state.machines[*i].provider, state.machines[*i].id)).collect();
+            Err(format!("{target} names {} running instances ({}) — give the instance id", by_name.len(), ids.join(", ")))
+        }
+        ([], [_, _, ..]) => Err(format!("instance id {target} is on several providers — rename one apart first")),
+        ([], []) => Ok(None),
+    }
+}
+
+/// What assigning a machine instance to a new owner moves: everything it has run up so far goes
+/// with the owner field — a row has one owner, for its whole life ([`assign_moves`]).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Moves {
+    pub name: String,
+    pub provider: String,
+    pub id: String,
+    pub open: bool,
+    /// Its owner now (`None`: no owner).
+    pub from: Option<String>,
+    pub start: u64,
+    /// Running hours and cost so far, metered as `arena spend` shows them.
+    pub hours: f64,
+    pub currency: String,
+    pub amount: f64,
+}
+
+impl Moves {
+    /// Whether giving it to `to` moves spend from one person to another: it has an owner, a
+    /// different one, and has run up anything. An unowned instance (a forgotten `--owner`) is
+    /// what `assign` is for, and the same owner moves nothing.
+    pub fn takes_from(&self, to: Option<&str>) -> bool {
+        self.from.is_some() && self.from.as_deref() != to && (self.hours > 0.0 || self.amount > 0.0)
+    }
+
+    /// `12.3 h, €0.12 since 2026-11-02 09:00`.
+    pub fn words(&self) -> String {
+        format!("{} h, {} since {} UTC", hours(self.hours), fmt_money(&symbol(&self.currency), self.amount), ymd_hm(self.start))
+    }
+
+    /// Why `assign` refuses giving it to `to` without `--force` ([`Self::takes_from`]), and what to
+    /// do instead: a machine that goes to someone else is a new instance, so each keeps their own.
+    pub fn refusal(&self, to: Option<&str>, short: &str) -> String {
+        let from = self.from.as_deref().unwrap_or(NO_OWNER);
+        let new = to.unwrap_or(NO_OWNER);
+        let head = format!(
+            "{} ({} {}) is {from}'s and has run up {}: assigning it to {new} would move all of that to {new}",
+            self.name,
+            self.provider,
+            self.id,
+            self.words()
+        );
+        let instead = match (self.open, to) {
+            (true, Some(to)) => format!(
+                "For a machine that now goes to {to}: `arena pods backup {short}`, `arena pods terminate {short} --revoke-key`, \
+                 then `arena pods up {short} --owner {to}` — {from} keeps their hours, {to} starts at 0. If {from} was never \
+                 its owner (a typo, a wrong --owner), pass --force"
+            ),
+            (true, None) => format!("If {from} was never its owner (a wrong --owner), pass --force"),
+            (false, _) => format!("It has ended: if {from} was never its owner, pass --force"),
+        };
+        format!("{head}. {instead}")
+    }
+}
+
+/// What [`assign`] would move for `target` (as it picks it): the instance with its owner and
+/// what it has run up to `now`. `Ok(None)`: `target` isn't a machine (a key hash, or nothing —
+/// `assign` says which). Pure.
+pub fn assign_moves(state: &SpendState, full_names: &[String], target: &str, now: u64) -> Result<Option<Moves>, String> {
+    let Some(i) = pick_machine(state, full_names, target.trim())? else { return Ok(None) };
+    let m = &state.machines[i];
+    let row = machine_row(state, m, m.start, now.max(m.start), None);
+    Ok(Some(Moves {
+        name: m.name.clone(),
+        provider: m.provider.clone(),
+        id: m.id.clone(),
+        open: m.is_open(),
+        from: m.owner.clone(),
+        start: m.start,
+        hours: row.hours,
+        currency: row.currency,
+        amount: row.amount,
+    }))
 }
 
 /// An owner name as typed: trimmed, at most [`OWNER_MAX`] characters, printable, no comma
