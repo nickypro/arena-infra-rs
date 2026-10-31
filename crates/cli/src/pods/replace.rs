@@ -162,7 +162,7 @@ pub(crate) fn vm_flags_refusal(ov: &SpecOverrides) -> Option<String> {
     (!given.is_empty()).then(|| {
         format!(
             "{} doesn't apply to a Hetzner VM (no GPU or tier; its disk is its server type's) — pass --server-type (e.g. \
-             cx43, or a comma list to fall back; `arena offers hetzner --all` lists them)",
+             cx43, or a comma list to fall back; `arena offers hetzner` lists them)",
             given.join(" / ")
         )
     })
