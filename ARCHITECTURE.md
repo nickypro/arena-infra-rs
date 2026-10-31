@@ -15,7 +15,7 @@ flowchart TD
 
     subgraph present[presentation layer · thin, swappable]
         CLI["arena (CLI) · crates/cli<br/>main.rs: entry + dispatch · cli.rs: the clap tree<br/>pods.rs + pods/: a module per pods family · cron.rs, keys.rs,<br/>proxy.rs, config_cmd.rs, ssh_config.rs, plan.rs, snapshot.rs<br/>up.rs: per-pod pipelines<br/>jobs.rs: run --background / jobs / logs · teardown.rs<br/>money.rs: balance · pods idle<br/>spend.rs: arena spend · owner tracking"]
-        TUI["arena-tui · crates/tui<br/>ratatui dashboard · state.rs (pure)"]
+        TUI["arena-tui · crates/tui<br/>ratatui dashboard · state.rs (pure)<br/>main.rs: entry + the shared state · event_loop.rs, input.rs<br/>view.rs, table.rs, detail.rs, modals.rs, info.rs<br/>refresh.rs · actions.rs, ssh_actions.rs · deep_check.rs<br/>terminal.rs · a module per screen (ask, runs, newpod, backups)"]
         WEB["web/fleet.html<br/>static page, read-only"]
     end
 
