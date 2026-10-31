@@ -975,8 +975,8 @@ pub(crate) async fn copies_ready(cloud: &dyn VolumeCloud, record: &MoveRecord, t
 }
 
 /// Keep in `record.moved` only the volumes not verifiably back on `src` — attached to it AND
-/// mounted where the record says (a running `src`; made sure of here, the mount step being
-/// idempotent): one unmounted but not yet detached when a move stopped counts as unresolved until
+/// mounted where the record says (made sure of here, the mount step being idempotent; a stopped
+/// `src` can't be checked, so its volumes stay recorded): one unmounted but not yet detached when a move stopped counts as unresolved until
 /// it's mounted again (fix-check). The ones still unresolved, by name; a listing that fails keeps
 /// them all.
 pub(crate) async fn keep_unresolved(
@@ -1004,12 +1004,16 @@ pub(crate) async fn keep_unresolved(
             still.push(id);
             continue;
         }
-        if up {
-            let at = record.mounts.get(&id).cloned().unwrap_or_else(|| datavol::DEFAULT_MOUNT.to_string());
-            if let Err(e) = ensure_mounted(remote, cfg, owner, src, v, &at).await {
-                unresolved.push(format!("{} (attached, not mounted at {at}: {e:#})", v.name));
-                still.push(id);
-            }
+        if !up {
+            // Can't be checked on a stopped VM (its fstab line may be gone): kept until it runs.
+            unresolved.push(format!("{} (attached; {} is {} — start it, then run this again to mount and check it)", v.name, src.name, src.status));
+            still.push(id);
+            continue;
+        }
+        let at = record.mounts.get(&id).cloned().unwrap_or_else(|| datavol::DEFAULT_MOUNT.to_string());
+        if let Err(e) = ensure_mounted(remote, cfg, owner, src, v, &at).await {
+            unresolved.push(format!("{} (attached, not mounted at {at}: {e:#})", v.name));
+            still.push(id);
         }
     }
     record.moved = still;

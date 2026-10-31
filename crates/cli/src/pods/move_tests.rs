@@ -914,6 +914,11 @@ async fn an_unresolved_volume_stays_recorded() {
     let left = keep_unresolved(stuck.as_ref(), &cfg, &f, &cloud, &mut record, &old).await;
     assert!(left[0].contains("not mounted"), "{left:?}");
     assert_eq!(record.moved, [900]);
+    // Attached to a stopped original: can't be checked — kept (fix-check).
+    let off = Pod { status: "OFF".into(), ..old.clone() };
+    let left = keep_unresolved(remote.as_ref(), &cfg, &f, &cloud, &mut record, &off).await;
+    assert!(left[0].contains("start it"), "{left:?}");
+    assert_eq!(record.moved, [900]);
     // Attached and mounted: resolved.
     let left = keep_unresolved(remote.as_ref(), &cfg, &f, &cloud, &mut record, &old).await;
     assert!(left.is_empty() && record.moved.is_empty() && record.moved_to.is_none(), "{left:?}");
