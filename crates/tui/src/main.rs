@@ -5274,6 +5274,51 @@ deep_check_end=1
         assert!(pane.contains("gpu:      1×B300 MIG 34GB (MIG slice of B300 SXM6 AC)"), "{pane}");
     }
 
+    /// `c` (Claude Code account): runs `arena claude assign` — `spread` as its flag, anything else as
+    /// the account — and the detail pane's `tokens:` line says which account the pod is on, and
+    /// when its box may not have it yet.
+    #[test]
+    fn the_claude_action_runs_claude_assign_and_the_detail_names_the_account() {
+        let args = |a: Option<&str>| cli_action_args(Action::Claude, "devtest-alpha", a).map(|(k, v)| (k, v.join(" ")));
+        assert_eq!(args(Some(" 2 ")), Some((runs::Kind::Claude, "claude assign devtest-alpha 2 --yes".into())));
+        assert_eq!(args(Some("Spread")), Some((runs::Kind::Claude, "claude assign devtest-alpha --spread --yes".into())));
+        assert_eq!(args(Some("none")), Some((runs::Kind::Claude, "claude assign devtest-alpha none --yes".into())));
+        assert_eq!(args(Some("  ")), None);
+        assert!(Action::Claude.cli() && Action::Claude.needs_input() && Action::Claude.op().is_none());
+
+        use arena_core::claude::{Assignment, How, Pushed, State};
+        let alpha = pod("alpha", "runpod", "rp1", 1, Some(22001));
+        let on = |account: Option<&str>, pushed: Option<Option<&str>>| State {
+            machines: vec![Assignment {
+                provider: "runpod".into(),
+                id: "rp1".into(),
+                name: alpha.name.clone(),
+                account: account.map(String::from),
+                how: How::Spread,
+                at: NOW,
+                pushed: pushed.map(|p| Pushed { account: p.map(String::from), fp: None, at: NOW }),
+            }],
+            ..State::default()
+        };
+        for (state, want) in [
+            (on(Some("bob@x"), Some(Some("bob@x"))), Some(("bob@x".to_string(), Tone::Good))),
+            (on(Some("bob@x"), Some(Some("alice@x"))), Some(("bob@x (not on it yet: `arena claude push`)".to_string(), Tone::Warn))),
+            (on(Some("bob@x"), None), Some(("bob@x (not on it yet: `arena claude push`)".to_string(), Tone::Warn))),
+            (on(None, Some(None)), Some(("none".to_string(), Tone::Dim))),
+            (State::default(), None),
+        ] {
+            assert_eq!(claude_account(Some(&state), &alpha), want);
+        }
+        let snap = dashboard_snapshot(std::slice::from_ref(&alpha), &[], None, &HealthCache::new(), &Naming::from_config(&cfg("")), NOW);
+        let mut shared = Shared::default();
+        shared.publish(snap);
+        shared.claude = Some(on(Some("bob@x"), Some(Some("bob@x"))));
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        ui.mode = Mode::Detail;
+        let pane = draw(160, 40, &shared, &ui).join("\n");
+        assert!(pane.contains("tokens:   HF ·   Claude-Code ·  bob@x"), "{pane}");
+    }
+
     /// SAVED's header is a floppy disk: two cells wide (as `unicode-width`, tmux and the common
     /// terminals count it), the cell after it blank, and every column after it starts in the
     /// header where it starts in the rows. The column is as wide as its cells (`↑23h`).
