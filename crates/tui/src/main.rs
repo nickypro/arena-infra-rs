@@ -2842,39 +2842,63 @@ fn backup_repo_path(cfg: &Config) -> String {
     })
 }
 
-/// Provision the pod over SSH — the image-based steps of `arena pods setup` (non-force,
-/// matching the CLI default): copy the deploy key, move the repo onto the pod's volume when it
-/// has one, run the config. Through core's runner, so each step keeps its own budget (core
-/// `SetupTimeouts`: `SETUP_TIMEOUT_SECS` honoured) and a step's `arena-warning:` lines — the
-/// only sign that the repo did NOT go onto the volume, and why — reach the result line
-/// (`✓ set up <pod> (warning: …)`) instead of being dropped with its stdout.
+/// Provision the pod over SSH — the steps `arena pods setup` runs for its provider (non-force,
+/// matching the CLI default): on an image-based pod, copy the deploy key, move the repo onto
+/// the pod's volume when it has one, run the config; on a bare VM (Hetzner, Shadeform), copy
+/// the deploy key, authorize the keys, set the hostname and run the VM script (swap included).
+/// Through core's runner, so each step keeps its own budget (core `SetupTimeouts`:
+/// `SETUP_TIMEOUT_SECS` honoured) and a step's `arena-warning:` lines — the only sign that the
+/// repo did NOT go onto the volume, and why — reach the result line (`✓ set up <pod> (warning:
+/// …)`) instead of being dropped with its stdout.
 async fn run_setup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
     use arena_core::setup::{provision, BootRetry, ProvisionOutcome};
     let target = match SshTarget::from_pod(pod, cfg) {
         Ok(t) => t,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
-    let steps = match setup_steps(cfg, pod) {
+    let script = vm_script_path(pod);
+    let steps = match setup_steps(cfg, pod, &script.to_string_lossy()) {
         Ok(s) => s,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
+    // A bare VM's steps scp the script from this staged copy, removed once the steps are done.
+    let staged = arena_core::setup::is_bare_vm(&pod.provider);
+    if staged {
+        if let Err(e) = std::fs::write(&script, arena_core::setup::HETZNER_SETUP) {
+            return format!("✗ {}: writing the VM setup script to {}: {e}", pod.name, script.display());
+        }
+    }
     // No boot-race retries: the operator presses Setup on a pod that is already up.
     let no_wait = BootRetry { window: Duration::ZERO, every: Duration::ZERO };
-    match provision(remote, &target, &steps, no_wait).await {
+    let outcome = provision(remote, &target, &steps, no_wait).await;
+    if staged {
+        let _ = std::fs::remove_file(&script);
+    }
+    match outcome {
         ProvisionOutcome::Done { warnings, .. } if warnings.is_empty() => format!("✓ set up {}", pod.name),
         ProvisionOutcome::Done { warnings, .. } => format!("✓ set up {} (warning: {})", pod.name, warnings.join("; ")),
         failed => format!("✗ setup {}: {}", pod.name, failed.describe()),
     }
 }
 
-/// The TUI's setup steps: core's image-based list (as before: no hetzner script, and no VS
-/// Code warm-up — that's `arena pods setup`'s).
-fn setup_steps(cfg: &Config, pod: &Pod) -> arena_core::Result<Vec<arena_core::setup::ProvisionStep>> {
+/// The TUI's setup steps: core's list for the pod's own provider, as `arena pods setup` builds
+/// it — a bare VM's script (`script`: the local copy its scp sends, [`vm_script_path`]) and its
+/// swap, key and hostname steps included; until 2026-10-31 it was the image-based list for every
+/// pod, so a Hetzner VM got no script and no swap. No VS Code warm-up: that stays `arena pods
+/// setup`'s, as do its API keys.
+fn setup_steps(cfg: &Config, pod: &Pod, script: &str) -> arena_core::Result<Vec<arena_core::setup::ProvisionStep>> {
     use arena_core::setup::{provisioning_steps, SetupConfig, SetupTimeouts};
     let mut scfg = SetupConfig::from_config(cfg)?;
     scfg.vscode = None;
     let budget = SetupTimeouts::from_config(cfg, None)?;
-    Ok(provisioning_steps("image", &scfg, &pod.name, false, "", &budget))
+    Ok(provisioning_steps(&pod.provider, &scfg, &pod.name, false, script, &budget))
+}
+
+/// Where this dashboard stages the bare-VM script for `pod`'s setup: per process and pod, so
+/// setups running at once (a marked set) never write over or remove each other's copy.
+fn vm_script_path(pod: &Pod) -> std::path::PathBuf {
+    let name: String = pod.name.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')).collect();
+    std::env::temp_dir().join(format!("arena-tui-vm-setup-{}-{name}.sh", std::process::id()))
 }
 
 /// The exact command(s) a safe (non-typed) action will run, for the confirm modal's `v` (it
@@ -2892,7 +2916,7 @@ fn build_preview(cfg: &Config, action: Action, pod: &Pod) -> Option<String> {
             }
             Err(e) => format!("⚠ {e}"),
         }),
-        Action::Setup => Some(match (&target, setup_steps(cfg, pod)) {
+        Action::Setup => Some(match (&target, setup_steps(cfg, pod, &vm_script_path(pod).to_string_lossy())) {
             (Ok(t), Ok(steps)) => steps
                 .iter()
                 .map(|step| {
@@ -6627,6 +6651,63 @@ deep_check_end=1
         let _ = std::fs::remove_dir_all(&dir);
         assert!(fake.calls().is_empty());
     }
+
+    /// The dashboard's setup on a Hetzner VM runs what `arena pods setup` runs there — the deploy
+    /// key, the keys authorized, the hostname, then the VM script with its swap — not the
+    /// image-based steps it gave every pod before (2026-10-31, the project-week rehearsal: no
+    /// script, no swap, on the provider organisers use most). The script goes from a copy staged
+    /// for this pod and removed afterwards; a RunPod pod's steps are unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn the_dashboards_setup_runs_a_bare_vms_own_steps() {
+        let cfg = cfg("ARENA_REPO_OWNER=nickypro\nARENA_REPO_NAME=arena-sandbox-materials\nGIT_SSH_KEY_LOCAL=/nonexistent/deploy_key\n");
+        let t = arena_core::setup::SetupTimeouts::default();
+        let hetzner = pod("hzbox", "hetzner", "4242", 7, Some(22));
+        let script = vm_script_path(&hetzner);
+        let fake = FakeRemote::new();
+        assert_eq!(run_setup(&fake, &cfg, &hetzner).await, "✓ set up devtest-hzbox");
+        let calls = fake.calls();
+        let budgets: Vec<Option<Duration>> = calls
+            .iter()
+            .map(|c| match c {
+                RemoteCall::Exec { timeout, .. } | RemoteCall::Copy { timeout, .. } => *timeout,
+            })
+            .collect();
+        // deploy key, authorize keys, hostname, the script's copy, repo update, the script.
+        let want = [t.copy, t.config, t.config, t.copy, t.config, t.bare_vm];
+        assert_eq!(budgets, want.map(Some).to_vec(), "{calls:?}");
+        let copied = calls.iter().find_map(|c| match c {
+            RemoteCall::Copy { local, remote, .. } if remote == "/root/hetzner_setup.sh" => Some(local.clone()),
+            _ => None,
+        });
+        assert_eq!(copied.as_deref(), Some(script.to_string_lossy().as_ref()), "{calls:?}");
+        let run = calls.iter().find_map(|c| match c {
+            RemoteCall::Exec { cmd, .. } if cmd.ends_with("bash /root/hetzner_setup.sh") => Some(cmd.clone()),
+            _ => None,
+        });
+        assert!(run.as_deref().is_some_and(|c| c.starts_with("ARENA_SWAP_GB=8 ")), "{calls:?}");
+        assert!(calls.iter().any(|c| matches!(c, RemoteCall::Exec { cmd, .. } if cmd.contains("hostnamectl set-hostname"))), "{calls:?}");
+        assert!(!script.exists(), "the staged script is removed: {}", script.display());
+        // Its confirm's `v` shows the same steps, the script's copy among them.
+        let preview = build_preview(&cfg, Action::Setup, &hetzner).unwrap();
+        assert!(preview.contains("/root/hetzner_setup.sh") && preview.contains("# hostname (best-effort)"), "{preview}");
+        assert!(!script.exists(), "a preview stages nothing");
+
+        // A RunPod pod: the image-based steps, as before, and nothing staged.
+        let runpod = pod("alpha", "runpod", "rp1", 1, Some(22001));
+        let fake = FakeRemote::new();
+        assert_eq!(run_setup(&fake, &cfg, &runpod).await, "✓ set up devtest-alpha");
+        let budgets: Vec<Option<Duration>> = fake
+            .calls()
+            .into_iter()
+            .map(|c| match c {
+                RemoteCall::Exec { timeout, .. } | RemoteCall::Copy { timeout, .. } => timeout,
+            })
+            .collect();
+        assert_eq!(budgets, vec![Some(t.copy), Some(t.relocate), Some(t.config)]);
+        assert!(!fake.calls().iter().any(|c| matches!(c, RemoteCall::Copy { remote, .. } if remote == "/root/hetzner_setup.sh")));
+        assert!(!vm_script_path(&runpod).exists());
+    }
+
     /// Review ai-review claude #6, checked: does the TUI's set-branch honour `DISCARD_MAX_GB`, the
     /// most a `--hard` save copies? It has nothing to honour: the TUI only ever switches gently —
     /// `--hard` is the CLI's — and a gentle switch saves nothing. Pinned: the switch it sends is
