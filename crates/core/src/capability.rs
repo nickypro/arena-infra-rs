@@ -130,6 +130,8 @@ pub enum Op {
     /// ([`crate::reap::judge::provider_supported`]); a yes also needs the reaper's identity and
     /// lock checks to know the backend (`reap::identity_condition`, `reap::lock_state`).
     Reap,
+    /// `pods volume add|grow|detach|delete`: extra disk on a running machine ([`crate::datavol`]).
+    DataVolume,
     /// `--gpu` / `--gpus`.
     Gpu,
     /// `--server-type`.
@@ -166,7 +168,7 @@ pub enum Call {
 
 impl Op {
     /// Every operation, in the matrix's order: the commands on a pod, then the create flags.
-    pub const ALL: [Op; 20] = [
+    pub const ALL: [Op; 21] = [
         Op::Start,
         Op::Stop,
         Op::Restart,
@@ -178,6 +180,7 @@ impl Op {
         Op::Migrate,
         Op::KeyRepair,
         Op::Reap,
+        Op::DataVolume,
         Op::Gpu,
         Op::ServerType,
         Op::Cloud,
@@ -203,6 +206,7 @@ impl Op {
             Op::Migrate => "pods migrate",
             Op::KeyRepair => "setup's SSH key repair (via the API)",
             Op::Reap => "the auto-reaper",
+            Op::DataVolume => "pods volume",
             Op::Gpu => "--gpu / --gpus",
             Op::ServerType => "--server-type",
             Op::Cloud => "--cloud",
@@ -394,6 +398,17 @@ const fn row(op: Op) -> [Support; 5] {
             no("Hetzner authorizes keys only at create (cloud-init)", REMAKE_HETZNER), // Hetzner
             no("Shadeform authorizes keys only at create (its bootstrap script)", "`arena pods replace <name>` (a new pod gets today's keys)"), // Shadeform
         ],
+        Op::DataVolume => [
+            no(RUNPOD_VOLUME, "`arena pods replace <name> --volume <GB>` (a new pod with that volume, its files copied)"), // RunPod
+            no(RUNPOD_VOLUME, "`arena pods replace <name> --volume <GB>` (a new pod with that volume, its files copied)"), // RunPod v1
+            no(
+                "a Vast instance's disk is fixed at its create",
+                "back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then `arena --provider vast pods up <name> --volume 0` \
+                 with --disk <GB> (and its --gpu), and `arena pods restore <name>`",
+            ), // Vast
+            note("a Hetzner volume in the VM's own location (10 GB–10 TB), mounted at /mnt/data; it bills until deleted — a terminate keeps it unless --delete-volumes"), // Hetzner
+            no("arena can't attach a volume to a Shadeform instance", KEEP_WORK), // Shadeform
+        ],
         Op::Reap => [
             YES, // RunPod
             no("the reaper acts on RunPod pods only through REST v2 (their lock state)", crate::provider::RUNPOD_V1_REMEDY), // RunPod v1
@@ -440,7 +455,10 @@ const fn row(op: Op) -> [Support; 5] {
             note("a /workspace volume: what survives a stop, restart or reimage"), // RunPod
             note("a /workspace volume: what survives a stop, restart or reimage"), // RunPod v1
             no("arena's Vast create takes no volume", KEEP_WORK), // Vast
-            no("arena can't attach a volume to a Hetzner VM yet (a VM keeps its disk across a stop and a restart)", KEEP_WORK), // Hetzner
+            no(
+                "a Hetzner VM's create takes no volume (a VM keeps its disk across a stop and a restart)",
+                "`arena pods volume add <name> <GB>` once it's up",
+            ), // Hetzner
             no("Shadeform's CUDA-13 cloud has no volumes", KEEP_WORK), // Shadeform
         ],
         Op::Image => [
@@ -473,6 +491,7 @@ const fn row(op: Op) -> [Support; 5] {
 const HETZNER_MOVE: &str =
     "--server-type moves it to a bigger type; the new VM goes wherever HETZNER_LOCATION allows, maybe another location";
 
+const RUNPOD_VOLUME: &str = "a RunPod pod's volume is sized at its create, and resizing it resets the pod";
 const SERVER_TYPE_IS_HETZNERS: &str = "only Hetzner VMs are sized by server type";
 const SIZE_A_GPU_POD: &str = "pass --provider hetzner, or size a GPU pod with --gpu / --gpus";
 const KEEP_WORK: &str = "work survives through `arena pods backup` (and the archive)";
@@ -595,7 +614,7 @@ mod tests {
 
     /// The operations made of no provider call and no create field: decided in arena's own code,
     /// which asks the table itself (the reaper's judge: `reap::judge::provider_supported`).
-    const DECIDED_BY_ARENA: &[Op] = &[Op::Reap];
+    const DECIDED_BY_ARENA: &[Op] = &[Op::Reap, Op::DataVolume];
 
     /// The drift test: for every backend and every operation, the provider calls the operation is
     /// made of ([`Op::needs`]) are made on the real backend, offline. A cell that says no gets

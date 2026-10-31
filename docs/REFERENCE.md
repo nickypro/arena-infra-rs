@@ -24,6 +24,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [Hetzner Cloud](#hetzner-cloud)
   - [Hetzner: pre-built images](#hetzner-pre-built-images)
   - [Hetzner: a bigger type, capacity spares, moving a person](#hetzner-a-bigger-type-capacity-spares-moving-a-person)
+  - [Hetzner: extra disk (volumes)](#hetzner-extra-disk-volumes)
   - [Shadeform](#shadeform)
 - [Library modules (`arena-core`)](#library-modules-arena-core)
 - [Pods: create, list and the lifecycle](#pods-create-list-and-the-lifecycle)
@@ -350,15 +351,16 @@ RunPod is REST v2, the default. RunPod v1 is `RUNPOD_API=v1`.
 | `pods migrate` | ✓ | ✓ | ✗ [23] | ✓ [24] | ✗ [25] |
 | setup's SSH key repair (via the API) | ✗ [26] | ✗ [26] | ✓ | ✗ [27] | ✗ [28] |
 | the auto-reaper | ✓ | ✗ [29] | ✗ [30] | ✓ | ✗ [31] |
+| `pods volume` | ✗ [32] | ✗ [32] | ✗ [33] | ✓ [34] | ✗ [35] |
 | **create flags** (`pods create`/`up`; `replace` and `migrate copy` take --gpu, --gpus, --cloud, --disk, --volume, --image, --max-price) | | | | | |
-| `--gpu / --gpus` | ✓ | ✓ | ✓ | ✗ [32] | ✓ [33] |
-| `--server-type` | ✗ [34] | ✗ [34] | ✗ [34] | ✓ | ✗ [34] |
-| `--cloud` | ✓ [35] | ✓ [35] | ✓ [36] | ✗ [37] | ✗ [38] |
-| `--disk` | ✓ | ✓ | ✓ [39] | ✗ [40] | ✗ [41] |
-| `--volume` | ✓ [42] | ✓ [42] | ✗ [43] | ✗ [44] | ✗ [45] |
-| `--image` | ✓ | ✓ | ✓ | ✓ [46] | ✗ [47] |
-| `--bootstrap` | ✓ | ✓ | ✗ [48] | ✗ [49] | ✗ [50] |
-| `--max-price` | ✓ | ✓ | ✓ | ✗ [51] | ✓ [52] |
+| `--gpu / --gpus` | ✓ | ✓ | ✓ | ✗ [36] | ✓ [37] |
+| `--server-type` | ✗ [38] | ✗ [38] | ✗ [38] | ✓ | ✗ [38] |
+| `--cloud` | ✓ [39] | ✓ [39] | ✓ [40] | ✗ [41] | ✗ [42] |
+| `--disk` | ✓ | ✓ | ✓ [43] | ✗ [44] | ✗ [45] |
+| `--volume` | ✓ [46] | ✓ [46] | ✗ [47] | ✗ [48] | ✗ [49] |
+| `--image` | ✓ | ✓ | ✓ | ✓ [50] | ✗ [51] |
+| `--bootstrap` | ✓ | ✓ | ✗ [52] | ✗ [53] | ✗ [54] |
+| `--max-price` | ✓ | ✓ | ✓ | ✗ [55] | ✓ [56] |
 | `--api-json` | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 1. `pods start` on Shadeform: no — Shadeform has no stop: an instance bills until it's deleted, idle or not. Instead: nothing is ever stopped there, so there's nothing to start.
@@ -392,27 +394,31 @@ RunPod is REST v2, the default. RunPod v1 is `RUNPOD_API=v1`.
 29. the auto-reaper on RunPod v1: no — the reaper acts on RunPod pods only through REST v2 (their lock state). Instead: remove RUNPOD_API=v1 (v2 is the default).
 30. the auto-reaper on Vast: no — the reaper never terminates a Vast instance: no lock state, no verified identity. Nothing to use instead.
 31. the auto-reaper on Shadeform: no — the reaper doesn't read a Shadeform instance's identity (its create nonce) yet. Nothing to use instead.
-32. `--gpu / --gpus` on Hetzner: no — Hetzner creates CPU VMs sized by server type. Instead: pass --server-type (e.g. cx23, cpx42; `arena offers hetzner` lists them) or set HETZNER_SERVER_TYPE.
-33. `--gpu / --gpus` on Shadeform: each GPU type must be one Shadeform sells.
-34. `--server-type` on RunPod, RunPod v1, Vast, Shadeform: no — only Hetzner VMs are sized by server type. Instead: pass --provider hetzner, or size a GPU pod with --gpu / --gpus.
-35. `--cloud` on RunPod, RunPod v1: COMMUNITY or SECURE.
-36. `--cloud` on Vast: host classes: datacenter, verified, unverified.
-37. `--cloud` on Hetzner: no — Hetzner has no tiers. Instead: HETZNER_LOCATION picks where it runs.
-38. `--cloud` on Shadeform: no — Shadeform picks the cheapest cloud in stock. Instead: set SHADEFORM_CLOUDS.
-39. `--disk` on Vast: the offer's disk is at least this.
-40. `--disk` on Hetzner: no — a Hetzner VM's disk comes with its server type. Instead: pick a bigger --server-type (`arena offers hetzner`).
-41. `--disk` on Shadeform: no — a Shadeform instance's disk comes with its type. Nothing to use instead.
-42. `--volume` on RunPod, RunPod v1: a /workspace volume: what survives a stop, restart or reimage.
-43. `--volume` on Vast: no — arena's Vast create takes no volume. Instead: work survives through `arena pods backup` (and the archive).
-44. `--volume` on Hetzner: no — arena can't attach a volume to a Hetzner VM yet (a VM keeps its disk across a stop and a restart). Instead: work survives through `arena pods backup` (and the archive).
-45. `--volume` on Shadeform: no — Shadeform's CUDA-13 cloud has no volumes. Instead: work survives through `arena pods backup` (and the archive).
-46. `--image` on Hetzner: the VM image: `arena` (the newest arena-built snapshot), a snapshot id or a name like ubuntu-24.04.
-47. `--image` on Shadeform: no — Shadeform picks the OS image by the CUDA floor. Nothing to use instead.
-48. `--bootstrap` on Vast: no — not needed on Vast: its launcher brings up SSH on any image. Instead: leave it out.
-49. `--bootstrap` on Hetzner: no — a Hetzner VM runs no container start script: setup installs what it needs. Instead: leave it out.
-50. `--bootstrap` on Shadeform: no — Shadeform instances come up through arena's own bootstrap script. Instead: leave it out.
-51. `--max-price` on Hetzner: no — Hetzner quotes no price before a create. Instead: `arena offers hetzner` lists each server type's price: pick the --server-type.
-52. `--max-price` on Shadeform: capped at SHADEFORM_MAX_PRICE too.
+32. `pods volume` on RunPod, RunPod v1: no — a RunPod pod's volume is sized at its create, and resizing it resets the pod. Instead: `arena pods replace <name> --volume <GB>` (a new pod with that volume, its files copied).
+33. `pods volume` on Vast: no — a Vast instance's disk is fixed at its create. Instead: back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then `arena --provider vast pods up <name> --volume 0` with --disk <GB> (and its --gpu), and `arena pods restore <name>`.
+34. `pods volume` on Hetzner: a Hetzner volume in the VM's own location (10 GB–10 TB), mounted at /mnt/data; it bills until deleted — a terminate keeps it unless --delete-volumes.
+35. `pods volume` on Shadeform: no — arena can't attach a volume to a Shadeform instance. Instead: work survives through `arena pods backup` (and the archive).
+36. `--gpu / --gpus` on Hetzner: no — Hetzner creates CPU VMs sized by server type. Instead: pass --server-type (e.g. cx23, cpx42; `arena offers hetzner` lists them) or set HETZNER_SERVER_TYPE.
+37. `--gpu / --gpus` on Shadeform: each GPU type must be one Shadeform sells.
+38. `--server-type` on RunPod, RunPod v1, Vast, Shadeform: no — only Hetzner VMs are sized by server type. Instead: pass --provider hetzner, or size a GPU pod with --gpu / --gpus.
+39. `--cloud` on RunPod, RunPod v1: COMMUNITY or SECURE.
+40. `--cloud` on Vast: host classes: datacenter, verified, unverified.
+41. `--cloud` on Hetzner: no — Hetzner has no tiers. Instead: HETZNER_LOCATION picks where it runs.
+42. `--cloud` on Shadeform: no — Shadeform picks the cheapest cloud in stock. Instead: set SHADEFORM_CLOUDS.
+43. `--disk` on Vast: the offer's disk is at least this.
+44. `--disk` on Hetzner: no — a Hetzner VM's disk comes with its server type. Instead: pick a bigger --server-type (`arena offers hetzner`).
+45. `--disk` on Shadeform: no — a Shadeform instance's disk comes with its type. Nothing to use instead.
+46. `--volume` on RunPod, RunPod v1: a /workspace volume: what survives a stop, restart or reimage.
+47. `--volume` on Vast: no — arena's Vast create takes no volume. Instead: work survives through `arena pods backup` (and the archive).
+48. `--volume` on Hetzner: no — a Hetzner VM's create takes no volume (a VM keeps its disk across a stop and a restart). Instead: `arena pods volume add <name> <GB>` once it's up.
+49. `--volume` on Shadeform: no — Shadeform's CUDA-13 cloud has no volumes. Instead: work survives through `arena pods backup` (and the archive).
+50. `--image` on Hetzner: the VM image: `arena` (the newest arena-built snapshot), a snapshot id or a name like ubuntu-24.04.
+51. `--image` on Shadeform: no — Shadeform picks the OS image by the CUDA floor. Nothing to use instead.
+52. `--bootstrap` on Vast: no — not needed on Vast: its launcher brings up SSH on any image. Instead: leave it out.
+53. `--bootstrap` on Hetzner: no — a Hetzner VM runs no container start script: setup installs what it needs. Instead: leave it out.
+54. `--bootstrap` on Shadeform: no — Shadeform instances come up through arena's own bootstrap script. Instead: leave it out.
+55. `--max-price` on Hetzner: no — Hetzner quotes no price before a create. Instead: `arena offers hetzner` lists each server type's price: pick the --server-type.
+56. `--max-price` on Shadeform: capped at SHADEFORM_MAX_PRICE too.
 <!-- end of the capability matrix -->
 
 ### RunPod (REST v2, the default)
@@ -785,6 +791,68 @@ keys, and `<from>` is untouched. Both machines on one provider. Refused while so
 delete; if there are any it's refused, naming them, unless `--overwrite` (they're moved aside to
 `~/arena-sync-kept/<time>/` on `<to>`, never deleted). It ends with what's next: point the person at
 `<to>`, `arena spend assign <to> <owner>`, then back up and terminate `<from>`.
+
+### Hetzner: extra disk (volumes)
+
+A Hetzner VM's disk comes with its server type. For more room without a bigger type, attach a
+**volume**: 10 GB to 10 TB, billed by the GB-month whether attached or not, until it's deleted
+(`volume list` prices each from Hetzner's `/pricing`).
+
+```bash
+arena pods volume add apple 50                 # 50 GB, ext4, mounted at /mnt/data (--mount PATH)
+arena pods volume grow apple 80                # online: Hetzner's resize, then resize2fs/xfs_growfs
+arena pods volume list                         # name, size, location, VM, €/month (--json)
+arena pods volume mount apple                  # mount it again (after a power cycle, a fix)
+arena pods volume detach apple-data            # unmount, detach: its files stay, it bills on
+arena pods volume delete apple-data            # DELETE it and its files (unmounted, detached first)
+arena pods terminate apple --delete-volumes    # the VM and its volumes; without the flag they're kept
+```
+
+- **add**: created in the VM's own location (a volume attaches only to servers there), formatted
+  ext4 by Hetzner, attached, then mounted over SSH through an fstab line by its stable device path
+  (`/dev/disk/by-id/scsi-0HC_Volume_<id>`) with `nofail`, so a missing volume never stops a boot.
+  Named `<vm>-data` (`-data-2`, …) and labelled `arena-volume=<prefix>`. The mount point must be
+  empty or new, outside the system's directories, and **not inside a home**: `pods pull`, backups
+  and moves copy the home, and would copy the volume whole (`ln -s /mnt/data ~/data` links it in).
+  A volume attaches to a running VM without a reboot, but a server that has run a long time may
+  not see its first one until **one full power cycle**: then `add` says so, and `arena pods stop
+  <vm>` + `arena pods start <vm>` mounts it (its fstab line is already in place; `volume mount`
+  checks).
+- **grow** only grows (Hetzner never shrinks a volume), and grows the filesystem online after.
+  `grow` to the size it already has retries the filesystem step alone.
+- Every command acts on **this cohort's** volumes only, and only on the ones arena made (labelled
+  with its prefix). One attached to a cohort VM by hand is listed and counted, but never
+  unmounted, moved, grown or deleted: its layout (partitions, filesystem, fstab line) is someone
+  else's. A VM with one is refused by `replace`/`migrate` until it's detached. A shared project's
+  other volumes are listed apart, and teardown never prints their delete.
+- **detach / delete** unmount it on the VM first. One in use is refused, with `fuser -vm <path>`
+  to see who holds it. A VM that can't be reached is refused unless `--force`. Delete wants the
+  volume's own name or id, never the VM's, and refuses one with Hetzner's delete protection on.
+- **terminate** says which volumes are attached. Hetzner keeps a volume when its server is deleted,
+  so it goes on billing, detached. `--delete-volumes` deletes them once the server's deletion
+  has detached them.
+- **replace / migrate**: a volume on the source **moves** with the box when the new VM is in the
+  same location. At the swap, after the final sync and the last "no one on it" check, it's
+  unmounted on the old VM, detached, attached to the new one and mounted where it was. If a step
+  fails, it's put back on the original and nothing is swapped. In **another location** a volume
+  can't follow, so it's **copied** instead: a volume of the same size is made on the new VM
+  (`<name>-data-2`, labelled as the copy), mounted at the same place, and synced straight from
+  the old VM (mirrored, incremental) with the copy and again right before the swap. Each side
+  runs only with its own volume mounted there, and whatever a sync would overwrite or delete on
+  the copy is moved into `<mount>/arena-sync-kept/<time>/`. The original is kept, and the run
+  says so, with the `volume delete` for once the copy is checked. A migration remembers in the
+  state dir where each volume is mounted (a cutover from a stopped original can't ask), which
+  copies finished (`--no-final-sync` won't promote onto a copy that didn't; a sync under way
+  doesn't count), and what it moves (saved before the first unmount, so an interrupted move is
+  known): `migrate revert` moves back exactly that, and says so, keeping the record, when a
+  volume won't go back.
+- **Money**: `arena balance` adds the volumes to Hetzner's burn, and `teardown --check` lists each
+  volume with its cost (the archive's own volumes are the archive's line). `arena spend` counts
+  machines, not volumes.
+- **No backup** copies a volume (they copy the home): copy off what matters yourself.
+- RunPod and Vast are refused up front with what to do instead: a RunPod pod's volume is sized at
+  its create and resizing it resets the pod (`arena pods replace <name> --volume <GB>`). A Vast
+  instance's disk is fixed at its create.
 
 ### Shadeform
 
