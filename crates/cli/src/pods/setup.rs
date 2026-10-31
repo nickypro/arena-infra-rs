@@ -234,20 +234,11 @@ pub(crate) async fn handle_setup(
     let (scfg, tokens_line) = setup_config(cfg, hf_token, zsh_install, no_vscode)?;
     println!("{tokens_line}");
     // Claude Code: each pod its own account's token, once it's set up.
-    let claude_on = match crate::claude::plan_line(cfg, cc_token.as_deref()) {
-        Ok(Some(line)) => {
-            println!("{line}");
-            true
-        }
-        Ok(None) => {
-            println!("Claude Code: no accounts ({} / {} unset) — skipped", arena_core::claude::TOKENS_FILE_KEY, arena_core::claude::TOKEN_KEY);
-            false
-        }
-        Err(e) => {
-            println!("Claude Code: ✗ {e} — skipped");
-            false
-        }
-    };
+    match crate::claude::plan_line(cfg, cc_token.as_deref()) {
+        Ok(Some(line)) => println!("{line}"),
+        Ok(None) => println!("Claude Code: no accounts ({} / {} unset) — skipped", arena_core::claude::TOKENS_FILE_KEY, arena_core::claude::TOKEN_KEY),
+        Err(e) => println!("Claude Code: ✗ {e} — no token goes out"),
+    }
     // Carry each pod's provider so we can pick bare-VM vs image-based provisioning. A named
     // pod without an endpoint is reported; if none of the named pods is reachable, it fails.
     let targets: Vec<(String, String, SshTarget)> =
@@ -404,7 +395,8 @@ pub(crate) async fn handle_setup(
     }
     // No copy-keys to do it: the Claude Code stage on its own, for the pods that set up OK.
     let copied_keys = (!csv_sources.is_empty() || archive_ready) && !provisioned.is_empty();
-    if claude_on && !copied_keys && !provisioned.is_empty() {
+    // Even with no pool: a pod that's off still gets a pending removal (review r3).
+    if !copied_keys && !provisioned.is_empty() {
         let pods: Vec<(arena_core::Pod, SshTarget)> = sel
             .pods
             .iter()

@@ -996,14 +996,14 @@ pub const MACHINE_LOCK_WAIT: Duration = Duration::from_secs(90);
 /// ([`POD_LOCK`]), so a push whose connection timed out while it ran there can't land after the
 /// next one. With a token, Claude Code's onboarding is marked done in `~/.claude.json` (it ignores
 /// the token until it is), as copy-keys did; a push that can't do that fails. Pure.
-pub fn push_command(token: bool) -> String {
+pub fn push_command(token: bool, generation: u64) -> String {
     let take = if token {
         "IFS= read -r ARENA_CC || true; [ -n \"$ARENA_CC\" ] || { echo 'no token arrived on stdin' >&2; exit 3; }"
     } else {
         "ARENA_CC="
     };
     format!(
-        "{{ set +x; }} 2>/dev/null; set -e; umask 077; tmp=; trap 'rm -f -- \"$tmp\"' EXIT; {take}; export ARENA_CC; {POD_LOCK} \
+        "{{ set +x; }} 2>/dev/null; set -e; umask 077; tmp=; trap 'rm -f -- \"$tmp\"' EXIT; {take}; export ARENA_CC; gen={generation}; {POD_LOCK} \
          for rc in \"$HOME/.bashrc\" \"$HOME/.zshrc\"; do \
          if [ ! -e \"$rc\" ]; then [ -n \"$ARENA_CC\" ] || continue; : > \"$rc\"; fi; \
          f=$(readlink -f -- \"$rc\" 2>/dev/null || printf '%s' \"$rc\"); \
@@ -1018,9 +1018,31 @@ pub fn push_command(token: bool) -> String {
 
 /// The pod's side of a push's lock (`~/.arena-claude.lock`, `flock` from util-linux), held until
 /// the command ends: a push that timed out here — its ssh killed, its command still running on the
-/// pod — finishes before the next one starts, never after it. Without `flock`, no lock.
+/// pod — finishes before the next one starts, never after it. Without `flock`, no lock. Under it,
+/// the push's generation ([`next_generation`]) is checked against the last one that ran here (the
+/// file holds that number and nothing else): an older push that only reaches this point after a
+/// newer one ran — stuck in a startup file past its timeout — changes nothing (review r3).
 const POD_LOCK: &str = "if command -v flock >/dev/null 2>&1; then exec 9>>\"$HOME/.arena-claude.lock\"; \
-     flock -w 45 9 || { echo 'another push is still running on this machine' >&2; exit 4; }; fi;";
+     flock -w 45 9 || { echo 'another push is still running on this machine' >&2; exit 4; }; fi; \
+     last=$(cat \"$HOME/.arena-claude.lock\" 2>/dev/null || true); case \"$last\" in ''|*[!0-9]*) last=0;; esac; \
+     if [ \"$gen\" -le \"$last\" ]; then echo 'a newer push has already run on this machine' >&2; exit 6; fi; \
+     printf '%s\\n' \"$gen\" > \"$HOME/.arena-claude.lock\";";
+
+/// A push's generation: microseconds since the epoch, taken under the machine's lock, and never
+/// less than one more than the last this process gave out — so each push to a machine is newer
+/// than the one before it ([`POD_LOCK`]).
+fn next_generation() -> u64 {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
+    let mut prev = LAST.load(std::sync::atomic::Ordering::SeqCst);
+    loop {
+        let next = now.max(prev + 1);
+        match LAST.compare_exchange(prev, next, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst) {
+            Ok(_) => return next,
+            Err(p) => prev = p,
+        }
+    }
+}
 
 /// Mark Claude Code's onboarding done in `~/.claude.json` (it ignores `CLAUDE_CODE_OAUTH_TOKEN`
 /// until it is): with python3, merged into the file and only when it isn't so already, written
@@ -1047,7 +1069,7 @@ if d.get(\"hasCompletedOnboarding\") is not True:
 /// alone, which takes the token off. Nothing with a token is written anywhere on the way: not a
 /// file here, not one on the pod, not an argument.
 pub async fn push(remote: &dyn Remote, t: &SshTarget, token: Option<&str>, timeout: Duration) -> Result<(), String> {
-    let cmd = push_command(token.is_some());
+    let cmd = push_command(token.is_some(), next_generation());
     let done = match token {
         Some(tok) => remote.exec_input(t, &cmd, format!("{tok}\n").as_bytes(), Some(timeout)).await,
         None => remote.exec(t, &cmd, Some(timeout)).await,
@@ -1175,18 +1197,35 @@ async fn join_all<F: Future>(futs: Vec<F>) -> Vec<F::Output> {
 }
 
 /// One machine's push under its lock ([`lock_machine`]): what it should have read afresh — its
-/// assignment from the state and its account's token from the tokens file (a pool from config
-/// as it is), or none when it's off; with a [`Source::Flag`] pool, that one token — pushed, and
-/// recorded once it went. `None`: nothing to push (no assignment); an account no longer in the
-/// pool is a failed outcome that says so.
+/// assignment from the state, then its account's token from the tokens file (a pool from config
+/// as it is); none when it's off, whatever the pool; with a [`Source::Flag`] pool, that one token —
+/// pushed, and recorded ([`finish`]). `None`: nothing to push (no assignment); an account no longer
+/// in the pool is a failed outcome that says so.
 async fn push_one(remote: &dyn Remote, path: &Path, pool: &Pool, pod: &Pod, t: &SshTarget, now: u64) -> Option<(String, Result<(), String>)> {
     let failed = |e: String| Some(("not pushed".to_string(), Err(e)));
     let _lock = match lock_machine(path, &pod.provider, &pod.id, MACHINE_LOCK_WAIT).await {
         Ok(l) => l,
         Err(e) => return failed(e),
     };
-    // The tokens as they are now: a file rotated since this run read it (a command that waited at
-    // its confirm) must never put the old token back (review r2).
+    // What it should have now: its assignment first — a machine that's off needs no token, so its
+    // removal never waits on the tokens file (review r3) — then that account's token as the file has
+    // it now: a file rotated since this run read it (a command that waited at its confirm) must
+    // never put the old token back (review r2).
+    let wanted: Option<String> = if pool.source == Source::Flag {
+        None
+    } else {
+        let state = match load(path) {
+            Ok(s) => s,
+            Err(e) => return failed(e),
+        };
+        match &state.of(pod)?.account {
+            None => {
+                let label = "token taken off".to_string();
+                return Some((label, finish(remote, path, pod, t, None, now).await));
+            }
+            Some(e) => Some(e.clone()),
+        }
+    };
     let fresh = match &pool.source {
         Source::File(f) => match read_tokens_file(f) {
             Ok(p) => Pool::of(p.accounts, pool.source.clone()),
@@ -1194,30 +1233,34 @@ async fn push_one(remote: &dyn Remote, path: &Path, pool: &Pool, pod: &Pod, t: &
         },
         _ => pool.clone(),
     };
-    let account: Option<&Account> = if fresh.source == Source::Flag {
-        fresh.accounts.first()
-    } else {
-        let state = match load(path) {
-            Ok(s) => s,
-            Err(e) => return failed(e),
-        };
-        match &state.of(pod)?.account {
-            None => None,
-            Some(e) => match fresh.get(e) {
-                Some(a) => Some(a),
-                None => return Some((e.clone(), Err("its account is no longer in the pool: `arena claude push` spreads it".into()))),
-            },
-        }
+    let account = match &wanted {
+        None => fresh.accounts.first()?,
+        Some(e) => match fresh.get(e) {
+            Some(a) => a,
+            None => return Some((e.clone(), Err("its account is no longer in the pool: `arena claude push` spreads it".into()))),
+        },
     };
-    let label = account.map_or_else(|| "token taken off".to_string(), Account::label);
-    let mut result = push(remote, t, account.map(Account::token), PUSH_TIMEOUT).await;
-    if result.is_ok() {
-        let (email, fp) = (account.map(|a| a.email.clone()), account.map(Account::fingerprint));
-        if let Err(e) = record(path, |s| (record_push(s, &pod.provider, &pod.id, email.as_deref(), fp.as_deref(), now), ())) {
-            result = Err(format!("pushed, but not recorded: {e}"));
+    Some((account.label(), finish(remote, path, pod, t, Some(account), now).await))
+}
+
+/// The push itself and its record, under the machine's lock: what went on success; on a failure,
+/// the machine marked as not known to have it (`pushed` cleared) — its box may be anything now, so
+/// the next default `claude push` picks it (review r3).
+async fn finish(remote: &dyn Remote, path: &Path, pod: &Pod, t: &SshTarget, account: Option<&Account>, now: u64) -> Result<(), String> {
+    let result = push(remote, t, account.map(Account::token), PUSH_TIMEOUT).await;
+    let (email, fp) = (account.map(|a| a.email.clone()), account.map(Account::fingerprint));
+    let recorded = record(path, |mut s| {
+        if result.is_ok() {
+            s = record_push(s, &pod.provider, &pod.id, email.as_deref(), fp.as_deref(), now);
+        } else if let Some(a) = s.get_mut(&pod.provider, &pod.id) {
+            a.pushed = None;
         }
+        (s, ())
+    });
+    match (result, recorded) {
+        (Ok(()), Err(e)) => Err(format!("pushed, but not recorded: {e}")),
+        (result, _) => result,
     }
-    Some((label, result))
 }
 
 /// Push each of `pods` what the state says it should have when its turn comes ([`push_one`]), side
@@ -1245,16 +1288,30 @@ pub async fn push_all(remote: &dyn Remote, path: &Path, pool: &Pool, pods: &[(Po
 /// The Claude Code stage of setup, `up` and `copy-keys`, for `pods` (each with its SSH target): the
 /// ones with no account (or one no longer in the pool) get one by spread, then every pod gets its
 /// account's token (or none, if it's off) and what went is recorded. With `token` (`--cc-token`)
-/// that one token goes to every pod instead, and no assignment changes. `Ok(None)`: no pool and no
-/// token — nothing to do. `Err`: the pool or the state can't be read — nothing pushed.
+/// that one token goes to every pod instead, and no assignment changes. With no pool — unset, or
+/// one that can't be read (then still the `Err`) — only the pods that are off and may still have a
+/// token get it taken off. `Ok(None)`: nothing to do. `Err`: the pool or the state can't be read.
 pub async fn stage(remote: &dyn Remote, cfg: &Config, pods: &[(Pod, SshTarget)], token: Option<&str>, now: u64) -> Result<Option<Vec<Outcome>>, String> {
-    let pool = match token {
-        Some(t) => Pool::flag(t)?,
-        None => load_pool(cfg)?,
-    };
-    if pool.is_empty() || pods.is_empty() {
+    if pods.is_empty() {
         return Ok(None);
     }
+    let pool = match token {
+        Some(t) => Pool::flag(t),
+        None => load_pool(cfg),
+    };
+    let pool = match pool {
+        Ok(p) if !p.is_empty() => p,
+        // No pool (unset, or one that can't be read): the machines that are off still get their
+        // token taken off when it's pending (review r3) — that needs no pool; nothing else is
+        // pushed, and a pool that can't be read is still the error.
+        other => {
+            let removals = pending_removals(remote, cfg, pods, now).await?;
+            return match other {
+                Err(e) => Err(e),
+                Ok(_) => Ok(removals),
+            };
+        }
+    };
     let path = state_path(cfg)?;
     let changes = if pool.source == Source::Flag {
         Vec::new()
@@ -1264,6 +1321,25 @@ pub async fn stage(remote: &dyn Remote, cfg: &Config, pods: &[(Pod, SshTarget)],
         record(&path, |s| assign(s, &pool, &owners, &machines, &Want::Ensure, now))?.1
     };
     Ok(Some(push_all(remote, &path, &pool, pods, &changes, now).await))
+}
+
+/// [`stage`] with no pool: of `pods`, the ones that are off with a token perhaps still on them get
+/// it taken off. `Ok(None)`: none is (no state file is made for a fleet that has none).
+async fn pending_removals(remote: &dyn Remote, cfg: &Config, pods: &[(Pod, SshTarget)], now: u64) -> Result<Option<Vec<Outcome>>, String> {
+    let path = state_path(cfg)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let state = load(&path)?;
+    let off: Vec<(Pod, SshTarget)> = pods
+        .iter()
+        .filter(|(p, _)| state.of(p).is_some_and(|a| a.account.is_none() && out_of_date(a, &Pool::empty())))
+        .cloned()
+        .collect();
+    if off.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(push_all(remote, &path, &Pool::empty(), &off, &[], now).await))
 }
 
 #[cfg(test)]

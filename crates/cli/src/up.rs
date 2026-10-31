@@ -191,7 +191,7 @@ pub(crate) struct UpRun<'a> {
     /// The per-host keys to hand out — only when setup runs and a keys CSV has rows.
     pub keys: Option<KeySources>,
     /// Each pod's own Claude Code account (one by spread if it has none) and its token, after the
-    /// keys — when setup runs and there is a pool (`arena_core::claude::stage`).
+    /// keys — whenever setup runs; with no pool, only a pending removal (`arena_core::claude::stage`).
     pub claude: bool,
     /// `--lock`: lock each pod as its last step (checked lockable before the create).
     pub lock: bool,

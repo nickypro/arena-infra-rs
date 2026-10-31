@@ -445,9 +445,27 @@ async fn assign_owner(
         println!("aborted.");
         return Ok(());
     }
-    let (state, changes) =
-        claude::record(&path, |s| claude::pin_owner(s, pool, &fleet.owners, &owner, pin, &machines, now)).map_err(|e| anyhow::anyhow!(e))?;
-    let pushing: Vec<Pod> = pushing.into_iter().filter(|p| state.of(p).is_some_and(|a| claude::out_of_date(a, pool))).collect();
+    // Planned again under the lock, with the owners as they are now: a machine of theirs assigned
+    // since the preview (an `up --owner` meanwhile) takes the pin too (review r3).
+    let (state, changes) = claude::record(&path, |s| {
+        let owners = claude::owners_for(cfg);
+        let live: Vec<Machine> = fleet.pods.iter().map(|p| Machine::new(p, &owners)).collect();
+        let machines = claude::owner_machines(&s, &owners, &owner, &live);
+        claude::pin_owner(s, pool, &owners, &owner, pin, &machines, now)
+    })
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let pushing: Vec<Pod> = if no_push {
+        vec![]
+    } else {
+        let owners = claude::owners_for(cfg);
+        fleet
+            .pods
+            .iter()
+            .filter(|p| owners.get(&(p.provider.clone(), p.id.clone())) == Some(&owner))
+            .filter(|p| state.of(p).is_some_and(|a| claude::out_of_date(a, pool)))
+            .cloned()
+            .collect()
+    };
     if pushing.is_empty() {
         println!("Recorded.");
         return Ok(());
@@ -508,9 +526,9 @@ pub(crate) fn plan_line(cfg: &Config, token: Option<&str>) -> std::result::Resul
 }
 
 /// The Claude Code stage for `pods` (each reachable, with its target): the ones with no account get
-/// one by spread, then each its own account's token (`token`: `--cc-token`'s, to every pod). Prints
-/// a line per pod; nothing when there's no pool. How many failed — a pool or state that can't be
-/// read counts every pod.
+/// one by spread, then each its own account's token (`token`: `--cc-token`'s, to every pod); with no
+/// pool, only a pending removal goes. Prints a line per pod; nothing when there's nothing to do. How
+/// many failed — a pool or state that can't be read counts every pod.
 pub(crate) async fn stage(remote: &dyn Remote, cfg: &Config, pods: &[(Pod, SshTarget)], token: Option<&str>) -> usize {
     match claude::stage(remote, cfg, pods, token, unix_now()).await {
         Ok(None) => 0,

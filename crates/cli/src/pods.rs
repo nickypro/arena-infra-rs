@@ -453,12 +453,11 @@ async fn handle_pods_bal(
             let keys = up_keys_stage(cfg, KEYS_DIR, !no_setup);
             // Each pod's own Claude Code account, after setup — when there's a pool.
             let claude_line = if no_setup { Ok(None) } else { crate::claude::plan_line(cfg, None) };
-            let claude = matches!(claude_line, Ok(Some(_)));
             let per_pod = up::pipeline_text(
                 !no_setup,
                 check.then_some(check_attempts),
                 keys.is_some(),
-                claude,
+                matches!(claude_line, Ok(Some(_))),
                 lock,
                 (endpoint_mins, check_attempts),
             );
@@ -598,7 +597,8 @@ async fn handle_pods_bal(
                     cmd: arena_core::health::deep_check_command(Some(cfg.get("CONDA_ENV").unwrap_or("arena-env"))),
                 }),
                 keys,
-                claude,
+                // With setup, always: with no pool it only delivers a pending removal (review r3).
+                claude: !no_setup,
                 lock,
                 retry_bad_hosts,
                 balance: Some(bal),

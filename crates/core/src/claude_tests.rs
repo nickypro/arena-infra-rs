@@ -424,7 +424,7 @@ fn run_push(home: &Path, token: Option<&str>) -> (i32, String, String) {
     use std::io::Write;
     let mut child = std::process::Command::new("bash")
         .arg("-c")
-        .arg(push_command(token.is_some()))
+        .arg(push_command(token.is_some(), next_generation()))
         .env("HOME", home)
         .env_remove("ARENA_CC")
         .stdin(std::process::Stdio::piped())
@@ -452,8 +452,8 @@ fn token_lines(text: &str) -> Vec<&str> {
 /// What's in `home` besides the rc files, `~/.claude.json`, the push's (empty) lock and `keep`:
 /// nothing should be.
 fn leftovers(home: &Path, keep: &[&str]) -> Vec<String> {
-    if let Ok(lock) = std::fs::read(home.join(".arena-claude.lock")) {
-        assert!(lock.is_empty(), "the lock file holds nothing");
+    if let Ok(lock) = std::fs::read_to_string(home.join(".arena-claude.lock")) {
+        assert!(lock.trim().chars().all(|c| c.is_ascii_digit()), "the lock file holds a generation and nothing else: {lock:?}");
     }
     let mut v: Vec<String> = std::fs::read_dir(home)
         .unwrap()
@@ -522,7 +522,7 @@ fn off_on_a_machine_with_no_rc_files_makes_none_and_a_missing_token_changes_noth
     std::fs::write(home.join(".bashrc"), format!("export CLAUDE_CODE_OAUTH_TOKEN=\"{}\"\n", tok(1))).unwrap();
     let out = std::process::Command::new("bash")
         .arg("-c")
-        .arg(push_command(true))
+        .arg(push_command(true, next_generation()))
         .env("HOME", home)
         .stdin(std::process::Stdio::null())
         .output()
@@ -583,7 +583,7 @@ fn tracing_never_shows_the_token_and_errors_are_masked() {
         let d = tmp(&format!("push-trace-{shell}"));
         let mut child = std::process::Command::new(shell)
             .arg("-c")
-            .arg(format!("set -x; {}", push_command(true)))
+            .arg(format!("set -x; {}", push_command(true, next_generation())))
             .env("HOME", &d.0)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -616,7 +616,7 @@ fn a_push_on_the_pod_waits_for_one_still_running_there() {
     held.lock().unwrap();
     let mut child = std::process::Command::new("bash")
         .arg("-c")
-        .arg(push_command(true))
+        .arg(push_command(true, next_generation()))
         .env("HOME", home)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -634,13 +634,48 @@ fn a_push_on_the_pod_waits_for_one_still_running_there() {
     assert_eq!(leftovers(home, &[]), Vec::<String>::new());
 }
 
+/// Review r3: an older push that reaches the pod's lock only after a newer one ran changes nothing;
+/// a newer one goes ahead.
+#[test]
+fn an_older_push_reaching_the_pod_after_a_newer_one_changes_nothing() {
+    use std::io::Write;
+    if std::process::Command::new("flock").arg("--version").output().is_err() {
+        return; // no util-linux here
+    }
+    let d = tmp("push-gen");
+    let home = &d.0;
+    let run = |gen: u64, token: &str| {
+        let mut child = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(push_command(true, gen))
+            .env("HOME", home)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(format!("{token}\n").as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    assert_eq!(run(200, &tok(2)).0, Some(0));
+    let (code, err) = run(100, &tok(1));
+    assert_eq!(code, Some(6));
+    assert!(err.contains("a newer push has already run on this machine"), "{err}");
+    assert!(read(home, ".zshrc").contains(&tok(2)) && !read(home, ".zshrc").contains(&tok(1)), "the newer token stays");
+    assert_eq!(read(home, ".arena-claude.lock").trim(), "200");
+    assert_eq!(run(300, &tok(3)).0, Some(0));
+    assert!(read(home, ".zshrc").contains(&tok(3)));
+    assert!(next_generation() < next_generation(), "each push is newer than the one before");
+}
+
 #[test]
 fn the_push_command_never_carries_a_token() {
-    for cmd in [push_command(true), push_command(false)] {
+    for cmd in [push_command(true, 7), push_command(false, 7)] {
         assert!(!cmd.contains("sk-ant"), "{cmd}");
         assert!(cmd.contains("ENVIRON[\"ARENA_CC\"]"), "the token reaches awk through its environment");
     }
-    assert!(push_command(true).contains("IFS= read -r ARENA_CC"), "read from stdin, by the shell's builtin");
+    assert!(push_command(true, 7).contains("IFS= read -r ARENA_CC"), "read from stdin, by the shell's builtin");
 }
 
 // ---- the push, through a scripted remote ---------------------------------------------
@@ -722,6 +757,48 @@ async fn a_push_reads_the_tokens_again_so_an_old_read_never_undoes_a_rotation() 
     assert_eq!(out[1].line(), "✓ bloom: #1 u2@x");
     let s = load(&path).unwrap();
     assert_eq!(s.get("hetzner", "2").unwrap().pushed.as_ref().unwrap().fp, Some(fingerprint(&tok(22))));
+}
+
+/// Review r3: a removal needs no pool — not the tokens file (deleted while `off` waited), and not
+/// a pool at all (setup with none still takes a pending token off); a push that fails leaves the
+/// machine out of date, so the next default push picks it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_removal_needs_no_pool_and_a_failed_push_is_never_taken_as_done() {
+    let d = tmp("stage-nopool");
+    let cfg = config_in(&d, 2);
+    let path = state_path(&cfg).unwrap();
+    let pods = [pod("apple", "1", "10.0.0.1"), pod("bloom", "2", "10.0.0.2")];
+    stage(&FakeRemote::new(), &cfg, &pods, None, T0).await.unwrap();
+    let pool = load_pool(&cfg).unwrap();
+    // A failed re-push (an rc reset, say): the machine is no longer taken as having it.
+    let r = FakeRemote::new();
+    r.script("10.0.0.2:22", [crate::remote::FakeReply::exit(1, "disk full")]);
+    let out = push_all(&r, &path, &pool, &pods[1..], &[], T0 + 1).await;
+    assert!(out[0].result.is_err());
+    let bloom = load(&path).unwrap().get("hetzner", "2").cloned().unwrap();
+    assert!(bloom.pushed.is_none() && out_of_date(&bloom, &pool));
+    // apple off, then the tokens file gone: the removal still goes.
+    let ms = [Machine::new(&pods[0].0, &Owners::new())];
+    record(&path, |s| assign(s, &pool, &Owners::new(), &ms, &Want::Pin(None), T0 + 2)).unwrap();
+    std::fs::remove_file(d.0.join("tokens")).unwrap();
+    let r = FakeRemote::new();
+    let out = push_all(&r, &path, &pool, &pods[..1], &[], T0 + 3).await;
+    assert_eq!(out[0].line(), "✓ apple: token taken off");
+    // No pool configured at all: setup's stage still delivers a pending removal, and nothing else.
+    let ms = [Machine::new(&pods[1].0, &Owners::new())];
+    record(&path, |s| assign(s, &pool, &Owners::new(), &ms, &Want::Pin(None), T0 + 4)).unwrap();
+    let no_pool = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR={}\n", d.0.join("state").display()));
+    let r = FakeRemote::new();
+    let out = stage(&r, &no_pool, &pods, None, T0 + 5).await.unwrap().expect("bloom's removal");
+    assert_eq!(out.iter().map(Outcome::line).collect::<Vec<_>>(), ["✓ bloom: token taken off"]);
+    assert!(r.inputs().is_empty());
+    // Done: nothing more to do, and a fleet with no state file gets none made.
+    assert!(stage(&FakeRemote::new(), &no_pool, &pods, None, T0 + 6).await.unwrap().is_none());
+    let fresh = tmp("stage-nopool-fresh");
+    let none = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR={}\n", fresh.0.display()));
+    assert!(stage(&FakeRemote::new(), &none, &pods, None, T0).await.unwrap().is_none());
+    assert!(!fresh.0.join("devtest").exists());
 }
 
 /// What each host was sent on stdin.

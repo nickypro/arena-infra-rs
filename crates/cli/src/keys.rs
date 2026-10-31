@@ -511,11 +511,8 @@ pub(crate) async fn handle_copy_keys(
     println!("\nDone: {ok} updated, {failed} failed.");
     // Each pod's own Claude Code account's token (one by spread for a pod with none), on ssh's
     // stdin — never in the command above.
-    let claude_failed = match claude_plan {
-        Ok(Some(_)) => crate::claude::stage(remote.as_ref(), cfg, &claude_jobs, cc_token.as_deref()).await,
-        Ok(None) => 0,
-        Err(_) => claude_jobs.len(),
-    };
+    // With no pool too: a pod that's off still gets a pending removal (review r3).
+    let claude_failed = crate::claude::stage(remote.as_ref(), cfg, &claude_jobs, cc_token.as_deref()).await;
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed");
     }
