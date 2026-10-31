@@ -3446,7 +3446,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 let (sync, sync_style) = sync_marker(m);
                 cells.push(Cell::from(Line::from(vec![
                     Span::styled(sync, sync_style),
-                    Span::styled(rel_time_short(m), saved_style(m)),
+                    Span::styled(rel_time_short(saved_commit(p, m)), saved_style(p, m)),
                 ])));
             }
             if c.ai {
@@ -3581,11 +3581,16 @@ fn status_style(label: &str) -> Style {
     }
 }
 
+/// The repo's last commit as a save on `p` itself: none while it's older than the machine (a
+/// fresh box's course-repo checkout — `metrics::saved_on_machine`).
+fn saved_commit(p: &Pod, m: Option<&PodMetrics>) -> Option<i64> {
+    arena_core::metrics::saved_on_machine(m?.last_commit, p.created_at)
+}
+
 /// SAVED's time colour: yellow when there's uncommitted work; grey when unknown OR when it's a
 /// clean tree that's been quiet for a day+ (nothing to do); plain otherwise.
-fn saved_style(m: Option<&PodMetrics>) -> Style {
-    let stale = m
-        .and_then(|m| m.last_commit)
+fn saved_style(p: &Pod, m: Option<&PodMetrics>) -> Style {
+    let stale = saved_commit(p, m)
         .map(|ts| now_unix().saturating_sub(ts) > 86_400)
         .unwrap_or(false);
     match m.and_then(|m| m.dirty_files) {
@@ -3597,9 +3602,13 @@ fn saved_style(m: Option<&PodMetrics>) -> Style {
 }
 
 /// When the pod's repo was last committed (= last backup, since `pods backup` commits +
-/// pushes), plus whether there's uncommitted work since. `-` if not reported yet.
-fn backup_summary(m: Option<&PodMetrics>) -> String {
+/// pushes), plus whether there's uncommitted work since. `-` if not reported yet, or when the
+/// last commit is older than the machine (nothing saved on it yet).
+fn backup_summary(p: &Pod, m: Option<&PodMetrics>) -> String {
     let Some(m) = m else { return "-".into() };
+    if m.last_commit.is_some() && saved_commit(p, Some(m)).is_none() {
+        return "- (none on this machine yet: its repo's last commit predates it)".into();
+    }
     match m.last_commit {
         Some(ts) => {
             let state = match m.dirty_files {
@@ -3633,8 +3642,8 @@ fn rel_time(unix_secs: i64) -> String {
 }
 
 /// A compact relative time for the table cell: "3h", "2d", "12m", "now", or "-".
-fn rel_time_short(m: Option<&PodMetrics>) -> String {
-    match m.and_then(|m| m.last_commit) {
+fn rel_time_short(saved: Option<i64>) -> String {
+    match saved {
         None => "-".into(),
         Some(ts) => {
             let d = now_unix() - ts;
@@ -3885,7 +3894,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         fact("disk:", disk),
         fact("host:", host),
         fact("branch:", or_dim(m.and_then(|m| m.branch.clone()).unwrap_or_else(|| "-".into()), plain)),
-        fact("backup:", or_dim(backup_summary(m), saved_style(m))),
+        fact("backup:", or_dim(fit(backup_summary(pod, m)), saved_style(pod, m))),
         fact("sync:", sync),
         fact("origin:", vec![Span::raw(truncate(&origin, 32)), Span::raw(" "), glyph(origin_ok)]),
         fact(
@@ -5307,6 +5316,34 @@ deep_check_end=1
             assert_eq!(row[cpu], "-", "row {y}: {}", row.concat());
             assert_eq!(row[cpu - 1], " ", "row {y}: {}", row.concat());
         }
+    }
+
+    /// On a fresh box the repo's last commit is the course repo's (the image's checkout, days old):
+    /// not a save on that machine, so SAVED says `-` and the detail view says why — until a commit
+    /// made after the machine was. Without a creation time, the commit as reported.
+    #[test]
+    fn a_fresh_boxs_course_repo_commit_isnt_its_last_save() {
+        let mut shared = fixture_shared();
+        let idx = shared.pods.iter().position(|p| p.name.ends_with("alpha")).unwrap();
+        let name = shared.pods[idx].name.clone();
+        let made = now_unix() - 3_600;
+        shared.pods[idx].created_at = Some(made as u64);
+        let mut m = PodMetrics { last_commit: Some(made - 3 * 86_400), dirty_files: Some(0), ..Default::default() };
+        shared.metrics.insert(name.clone(), m.clone());
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let saved = |shared: &Shared| rel_time_short(saved_commit(&shared.pods[idx], shared.metrics.get(&name)));
+        assert_eq!(saved(&shared), "-", "the course repo's 3-day-old commit");
+        ui.mode = Mode::Detail;
+        ui.selected = idx;
+        let pane = draw(200, 40, &shared, &ui).join("\n");
+        assert!(pane.contains("backup:   - (none on this machine yet: its repo's last commit predates it)"), "{pane}");
+        m.last_commit = Some(made + 600);
+        shared.metrics.insert(name.clone(), m.clone());
+        assert_eq!(saved(&shared), "50m", "a backup on it");
+        shared.pods[idx].created_at = None;
+        m.last_commit = Some(made - 3 * 86_400);
+        shared.metrics.insert(name.clone(), m);
+        assert_eq!(saved(&shared), "3d", "no creation time: as reported");
     }
 
     /// The top line is one line — no title box — with the fleet in short words and, at its right

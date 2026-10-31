@@ -1949,7 +1949,8 @@ pub fn notes(r: &Report) -> Vec<String> {
             x.aside
         ));
     }
-    if let Some(a) = r.runpod {
+    // Nothing billed and nothing counted (a fleet with no RunPod pods): no line to say it.
+    if let Some(a) = r.runpod.filter(|a| a.rows.abs() >= 0.005 || a.account.abs() >= 0.005) {
         out.push(format!(
             "runpod: accounted for {} of {} billed on the account in this window (billing lags ~1 h; the rest is other pods, \
              volumes or serverless)",

@@ -799,6 +799,12 @@ fn settled_runpod_hours_are_what_runpod_billed_and_younger_ones_the_higher_readi
     let a = r.runpod.unwrap();
     assert!(close(a.rows, 0.69) && close(a.account, 1.09), "{a:?}");
     assert!(notes(&r).iter().any(|n| n.contains("accounted for $0.69 of $1.09")), "{:?}", notes(&r));
+    // No RunPod spend at all in the window (an all-Hetzner week): no `$0.00 of $0.00` line.
+    let quiet = Billed { buckets: vec![], from: T0, to: now };
+    let none = PodBilled { from: T0, to: now, pods: BTreeMap::new(), at: now - M };
+    let r = report(&SpendState::default(), &naming(), None, now, Some(&none), Some(&quiet));
+    assert!(r.runpod.is_some(), "still in --json");
+    assert!(!notes(&r).iter().any(|n| n.starts_with("runpod:")), "{:?}", notes(&r));
 }
 
 #[test]

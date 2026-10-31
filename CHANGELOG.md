@@ -48,6 +48,10 @@ earlier).
 - `arena backups` shows the fleet's live machines, as the dashboard's `b` does (it lists the
   providers, read-only), and one line counting the configured names with no machine. Those names
   were `?` rows at the top. A provider that doesn't answer brings the old list back, with a note.
+- Wording: a fleet that's all Hetzner reads `fleet: €0.030/h hetzner across 3 billing pod(s)`,
+  not `$0.00/h across 3` first; `arena spend` leaves out RunPod's `accounted for $0.00 of $0.00`
+  line when nothing ran there; the dashboard's 💾 (and its backups screen) no longer shows the
+  course repo's age on a fresh box — a commit older than the machine isn't a save on it.
 - A key's cap prints as it was set, `$0.05` (it read `$0.050`): `keys list`, `keys limit`, the
   dashboard. A key handed over to a new owner says the new key's cap
   (`… a fresh key 4de6426ea4a4, cap $0.10)`).

@@ -98,7 +98,9 @@ pub(crate) fn open(ui: &mut Ui, shared: &Arc<Mutex<Shared>>) {
 pub(crate) fn pods_in(s: &Shared, cfg: &arena_core::Config) -> Vec<PodIn> {
     let naming = arena_core::selector::Naming::from_config(cfg);
     // As `arena backups` has them (`listed_pods`), with the repo's last commit each pod reported.
-    backups::listed_pods(&s.pods, &naming, |p| s.metrics.get(&p.name).and_then(|m| m.last_commit).and_then(|t| u64::try_from(t).ok()))
+    // A commit older than the machine (a fresh box's course repo) isn't a save on it.
+    let saved = |p: &arena_core::Pod| s.metrics.get(&p.name).and_then(|m| arena_core::metrics::saved_on_machine(m.last_commit, p.created_at));
+    backups::listed_pods(&s.pods, &naming, |p| saved(p).and_then(|t| u64::try_from(t).ok()))
 }
 
 /// Each pass of the loop: read the status again when the screen is open and it's due (or asked
