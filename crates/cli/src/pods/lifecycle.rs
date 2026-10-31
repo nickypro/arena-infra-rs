@@ -638,6 +638,9 @@ async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: 
     // Each key's usage before any is deleted: a revoked key's spend stays its owner's.
     tracking.keys(&keys, listed_at);
     let mut csv = book.read_csv();
+    // Each row as read before any key goes: at the write, only a row still holding this secret is
+    // dropped (one another arena saved meanwhile — a parallel `up`'s fresh key — is kept).
+    let as_read: std::collections::HashMap<String, String> = csv.as_deref().map(arena_core::apikeys::parse_csv).unwrap_or_default().into_iter().collect();
     let mut dropped = Vec::new();
     let mut deleted: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for m in machines {
@@ -677,16 +680,29 @@ async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: 
         }
     }
     if csv.is_some() && !dropped.is_empty() {
-        // The rows go from the CSV as it is now, under the keys folder's lock: a key another arena
-        // saved while these were revoked (a parallel `up`'s mint) keeps its row.
+        // The rows go from the CSV as it is now, under the keys folder's lock — each only while it
+        // still holds the secret read before the revoke: a key another arena saved meanwhile (a
+        // parallel `up`'s mint for this name, or another's) keeps its row.
+        let mut changed: Vec<String> = Vec::new();
         let written = book.lock().and_then(|_held| {
             let Some(now) = book.read_csv() else { return Ok(()) };
-            let rest = dropped.iter().fold(now.clone(), |t, m| arena_core::apikeys::remove_csv_host(&t, m).unwrap_or(t));
+            let rows: std::collections::HashMap<String, String> = arena_core::apikeys::parse_csv(&now).into_iter().collect();
+            let mut rest = now.clone();
+            for m in &dropped {
+                if rows.get(m) != as_read.get(m) {
+                    changed.push(m.clone());
+                } else if let Some(t) = arena_core::apikeys::remove_csv_host(&rest, m) {
+                    rest = t;
+                }
+            }
             if rest == now {
                 return Ok(());
             }
             book.write_csv(&rest)
         });
+        for m in &changed {
+            println!("[keys] = {m}: its CSV row changed while its key was revoked (a key saved meanwhile) — kept");
+        }
         if let Err(e) = written {
             eprintln!("[keys] ✗ couldn't update {}: {e} — rows kept for {}", book.csv.display(), dropped.join(", "));
             out.stale_rows = Some((dropped, e.to_string()));

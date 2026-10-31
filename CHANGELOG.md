@@ -39,10 +39,12 @@ earlier).
   listing can't be read, the CSV is copied as before, and the copy says it's unchecked.
 - Keys minted at once (several `pods up` in parallel terminals, `keys gen` beside an `up`) all
   land in the keys CSV: each write holds the keys folder. The second write used to drop the
-  first's row, and that key's secret with it. `up`, `keys gen|rotate` and a handover also read
-  OpenRouter's keys again under that hold, so a name that got a key meanwhile keeps it (`= …
-  has an OpenRouter key now`), never a second one; `terminate --revoke-key` and `rename` change
-  the CSV under it too.
+  first's row, and that key's secret with it. `up`, `keys gen|rotate|revoke` and a handover also
+  read OpenRouter's keys again under that hold, one name at a time, so a name that got a key
+  meanwhile keeps it (`= … has an OpenRouter key now`) — not copied onto this machine if it's
+  another owner's — never a second one. `up` reads the keys CSV again after its prompt. `terminate
+  --revoke-key` drops only a row still holding the revoked key, and `rename` moves rows under the
+  hold.
 - `pods terminate apple bloom ember --revoke-key` terminates several machines in one run. Each
   name is matched exactly, as one is (a typo stops them all, before anything); one confirm lists
   them and wants their count typed back (`ALL` past five, or for every listed pod), as the

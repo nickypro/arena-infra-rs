@@ -398,31 +398,24 @@ pub(crate) async fn hand_over(ctx: &SpendCtx, cfg: &Config, api: Option<&dyn Key
         done.failed = names();
         return done;
     };
-    // The keys folder is held from the listing to the last saved secret: another arena minting
-    // for one of these names meanwhile (`keys gen`, another `up`) waits, never mints beside it.
-    let _ = std::fs::create_dir_all(dir);
-    let _held = match super::lock_keys_dir(dir) {
-        Ok(h) => h,
-        Err(e) => {
-            done.lines.push(format!("✗ key handover: the keys folder {} stayed locked ({e})", dir.display()));
-            done.failed = names();
-            return done;
-        }
-    };
-    let listed_at = unix_now();
-    let keys = match api.list_keys().await {
-        Ok(k) => k,
-        Err(e) => {
-            done.lines.push(format!("✗ key handover: listing OpenRouter keys failed ({e})"));
-            done.failed = names();
-            return done;
-        }
-    };
-    ctx.keys(&keys, listed_at);
     let naming = Naming::from_config(cfg);
     let prefix = naming.prefix.to_string();
     let limit = cfg.get_parsed::<f64>("OPENROUTER_KEY_LIMIT").unwrap_or(5.0);
     for h in handovers {
+        // One name at a time under a hold (`keys::checked::hold_name`): its keys read again with the
+        // keys folder locked and rotated before it's free — another arena minting for this name
+        // meanwhile (`keys gen`, another `up`) waits, never mints beside it.
+        let hold = match super::hold_name(api, dir, &h.name).await {
+            Ok(hold) => hold,
+            Err(why) => {
+                done.lines.push(format!("✗ {}: key handover failed ({why})", h.name));
+                done.failed.push(h.name.clone());
+                continue;
+            }
+        };
+        // Every key's usage, recorded before any is deleted: the old owner keeps what it spent.
+        ctx.keys(&hold.listed, hold.listed_at);
+        let keys = &hold.listed;
         let theirs: Vec<&KeyInfo> = super::machine_key_names(&naming, &h.name)
             .iter()
             .flat_map(|n| keys.iter().filter(move |k| k.name.as_deref() == Some(n.as_str())))

@@ -822,6 +822,14 @@ async fn a_row_saved_while_keys_are_revoked_is_kept() {
     assert_eq!(keys.calls(), ["delete h-a"]);
     let text = cohort_csv(&dir.0);
     assert!(!text.contains("devtest-alpha") && text.contains("devtest-bravo,sk-b") && text.contains("devtest-zulu,sk-z"), "{text}");
+    // The same name's row replaced meanwhile (a parallel `up` minted bravo a fresh key after its
+    // old one was revoked): that fresh row is kept — only the revoked key's row goes.
+    let file = dir.0.join("devtest_openrouter_keys.csv");
+    let keys = FakeKeys { row_meanwhile: Some((file.clone(), "devtest-bravo,sk-fresh".into())), ..FakeKeys::with(&[("h-b", "devtest-bravo")]) };
+    let book = KeyBook::new(&csv, Some(&keys));
+    handle_terminate(&f, &cfg, &book, Some(&["bravo"]), topts(true, true, false, true)).await.unwrap();
+    let text = cohort_csv(&dir.0);
+    assert!(text.contains("devtest-bravo,sk-fresh"), "the fresh key's row is kept: {text}");
 }
 
 #[tokio::test]

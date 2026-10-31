@@ -26,7 +26,7 @@ use std::time::Duration;
 use arena_core::openrouter::{exact_money, key_name, KeyApi, KeyInfo};
 use arena_core::selector::Naming;
 
-use super::{lock_keys_dir, machine_key_names, write_openrouter_key_held, KeySources};
+use super::{lock_keys_dir, machine_key_names, write_openrouter_key_held, KeySources, OPENROUTER_KEYS_LINK};
 use crate::spend::SpendCtx;
 
 /// The variable a machine's OpenRouter key is exported as (`apikeys::PROVIDERS`).
@@ -61,17 +61,33 @@ pub(crate) enum Stale {
 /// labels can't tell. A key renamed on OpenRouter (a name is only a label there) is still found by
 /// its label. Pure.
 pub(crate) fn stale(naming: &Naming, host: &str, secret: &str, listed: &[KeyInfo]) -> Option<Stale> {
-    let names = machine_key_names(naming, host);
-    let theirs: Vec<&KeyInfo> = listed.iter().filter(|k| k.name.as_deref().is_some_and(|n| names.iter().any(|w| w == n))).collect();
+    // Listed under any name (renamed on OpenRouter, or another name's key now): live.
+    if listed_by_label(secret, listed) {
+        return None;
+    }
+    let theirs = named_for(naming, host, listed);
     if theirs.is_empty() {
-        return (!listed_under_another_name(secret, listed)).then_some(Stale::Gone);
+        return Some(Stale::Gone);
     }
     theirs.iter().all(|k| label_says(k.label.as_deref(), secret) == Some(false)).then_some(Stale::Replaced)
 }
 
 /// Whether some listed key's label says it is `secret` — whatever it's named now.
-fn listed_under_another_name(secret: &str, listed: &[KeyInfo]) -> bool {
+fn listed_by_label(secret: &str, listed: &[KeyInfo]) -> bool {
     listed.iter().any(|k| label_says(k.label.as_deref(), secret) == Some(true))
+}
+
+/// The listed keys that go by machine `host`'s name (as `keys gen` names it, or the pod's own).
+fn named_for<'k>(naming: &Naming, host: &str, listed: &'k [KeyInfo]) -> Vec<&'k KeyInfo> {
+    let names = machine_key_names(naming, host);
+    listed.iter().filter(|k| k.name.as_deref().is_some_and(|n| names.iter().any(|w| w == n))).collect()
+}
+
+/// Whether machine `host` has a key on OpenRouter: one that goes by its name, or — renamed there —
+/// the one its keys CSV row (`secret`) holds, by its label. What `up` decides a mint by, before the
+/// prompt and again under the keys folder's lock. Pure.
+pub(crate) fn has_key(naming: &Naming, host: &str, secret: Option<&str>, listed: &[KeyInfo]) -> bool {
+    !named_for(naming, host, listed).is_empty() || secret.is_some_and(|s| listed_by_label(s, listed))
 }
 
 /// A machine's name without the fleet prefix, as commands take it (`apple`).
@@ -161,11 +177,7 @@ pub(crate) fn plan_mints(
              `arena keys gen <name> --copy` once it answers"
         )),
         Some(Ok(keys)) => {
-            let has_key = |n: &str| {
-                let names = machine_key_names(naming, n);
-                keys.iter().any(|k| k.name.as_deref().is_some_and(|kn| names.iter().any(|w| w == kn)))
-                    || csv.and_then(|c| c.openrouter_secret(n)).is_some_and(|secret| listed_under_another_name(secret, keys))
-            };
+            let has_key = |n: &str| has_key(naming, n, csv.and_then(|c| c.openrouter_secret(n)), keys);
             for n in names.iter().filter(|n| !handing.contains(n) && !has_key(n)) {
                 if naming.is_cohort(n) {
                     plan.mint.push(n.clone());
@@ -193,60 +205,80 @@ pub(crate) fn plan_mints(
     plan
 }
 
+/// One machine name's keys, held: the keys folder locked ([`lock_keys_dir`]), OpenRouter's whole
+/// listing read under the lock, and the keys CSV's row for the name as it is now. Every mint and
+/// delete for a name decides by a hold and acts before dropping it, so two arenas (an `up` that
+/// waited at its prompt, a `keys gen`, a handover) never both mint for one name, and none acts on a
+/// listing older than another's change. One name at a time: a hold lasts one listing and one
+/// name's requests, never a whole batch's.
+pub(crate) struct NameHold {
+    _held: Option<std::fs::File>,
+    pub listed: Vec<KeyInfo>,
+    pub listed_at: u64,
+    /// The keys CSV's OpenRouter key for the name, as the file has it now.
+    pub secret: Option<String>,
+}
+
+/// Take a [`NameHold`] for `host` over the keys folder `dir`: `Err` says why (the folder stayed
+/// locked, the listing failed or took too long).
+pub(crate) async fn hold_name(api: &dyn KeyApi, dir: &std::path::Path, host: &str) -> Result<NameHold, String> {
+    let _ = std::fs::create_dir_all(dir);
+    let held = lock_keys_dir(dir).map_err(|e| format!("the keys folder {} stayed locked: {e}", dir.display()))?;
+    let listed_at = arena_core::snapshot::unix_now();
+    let listed = match arena_core::ratelimit::bounded(LIST_TIMEOUT, api.list_keys()).await {
+        Ok(Ok(k)) => k,
+        Ok(Err(e)) => return Err(format!("listing OpenRouter keys failed: {e}")),
+        Err(_) => return Err(format!("OpenRouter's keys didn't list within {}s", LIST_TIMEOUT.as_secs())),
+    };
+    let secret = std::fs::read_to_string(dir.join(OPENROUTER_KEYS_LINK))
+        .ok()
+        .and_then(|t| arena_core::apikeys::parse_csv(&t).into_iter().find(|(h, _)| h == host).map(|(_, k)| k));
+    Ok(NameHold { _held: held, listed, listed_at, secret })
+}
+
 /// What [`mint_missing`] did.
 #[derive(Debug, Default)]
 pub(crate) struct Minted {
-    /// `✓`/`✗` lines, one per name.
+    /// `✓`/`=`/`✗` lines, one per name.
     pub lines: Vec<String>,
     /// The names that got a key (in the CSV now).
     pub names: Vec<String>,
-    /// OpenRouter's listing as read under the lock, before the mints: newer than the plan's, for
-    /// the copy's check ([`check_csv_keys`]) of the names not minted.
-    pub listed: Option<Vec<KeyInfo>>,
+    /// Names whose key someone else's command made while this one waited, for another owner: not
+    /// to be copied onto this owner's machine.
+    pub left_out: Vec<String>,
 }
 
-/// Mint `plan`'s keys: each named after its machine, capped at the plan's limit, saved to the keys
-/// CSV in `dir` and recorded for `arena spend` as `owner`'s. The keys folder is held from a fresh
-/// listing to the last saved secret ([`lock_keys_dir`]), so a name that got a key while this `up`
-/// waited at its prompt (`keys gen`, another `up`) keeps that one: never two keys for a name. A
+/// Mint `plan`'s keys, one name at a time under a [`NameHold`]: each named after its machine,
+/// capped at the plan's limit, saved to the keys CSV in `dir` and recorded for `arena spend` as
+/// `owner`'s. A name that got a key while this `up` waited at its prompt (`keys gen`, another `up`;
+/// renamed since, too) keeps it — never two keys for a name — unless that key is another owner's:
+/// then it's left out of this machine's copy, with the `keys rotate` that gives this owner one. A
 /// failure is a `✗` line naming what to run, never an error: the machine comes up without a key,
 /// as it did before.
 pub(crate) async fn mint_missing(api: &dyn KeyApi, ctx: &SpendCtx, naming: &Naming<'_>, dir: &std::path::Path, plan: &MintPlan, owner: Option<&str>) -> Minted {
     let mut done = Minted::default();
-    if plan.mint.is_empty() {
-        return done;
-    }
-    let none_minted = |done: &mut Minted, why: String| {
-        for host in &plan.mint {
-            done.lines.push(format!("✗ {host}: no OpenRouter key minted ({why}) — `arena keys gen {} --copy` once it's up", short(naming, host)));
-        }
-    };
-    let _ = std::fs::create_dir_all(dir);
-    let _held = match lock_keys_dir(dir) {
-        Ok(h) => h,
-        Err(e) => {
-            none_minted(&mut done, format!("the keys folder {} stayed locked: {e}", dir.display()));
-            return done;
-        }
-    };
-    let listed = match arena_core::ratelimit::bounded(LIST_TIMEOUT, api.list_keys()).await {
-        Ok(Ok(k)) => k,
-        Ok(Err(e)) => {
-            none_minted(&mut done, format!("listing OpenRouter keys again failed: {e}"));
-            return done;
-        }
-        Err(_) => {
-            none_minted(&mut done, format!("OpenRouter's keys didn't list again within {}s", LIST_TIMEOUT.as_secs()));
-            return done;
-        }
-    };
     let whose = owner.map(|o| format!(", {o}'s")).unwrap_or_default();
-    done.listed = Some(listed.clone());
     for host in &plan.mint {
         let s = short(naming, host);
-        let names = machine_key_names(naming, host);
-        if listed.iter().any(|k| k.name.as_deref().is_some_and(|n| names.iter().any(|w| w == n))) {
-            done.lines.push(format!("= {host}: has an OpenRouter key now (made while this waited) — kept, none minted"));
+        let hold = match hold_name(api, dir, host).await {
+            Ok(h) => h,
+            Err(why) => {
+                done.lines.push(format!("✗ {host}: no OpenRouter key minted ({why}) — `arena keys gen {s} --copy` once it's up"));
+                continue;
+            }
+        };
+        if has_key(naming, host, hold.secret.as_deref(), &hold.listed) {
+            // Made while this one waited at its prompt. Another owner's isn't this owner's to use.
+            match owner.and_then(|o| arena_core::spend::handover_needed(&ctx.state(), host, o).map(|t| (o, t.to_string()))) {
+                Some((o, theirs)) => {
+                    done.lines.push(format!(
+                        "✗ {host}: an OpenRouter key was made for it meanwhile, {theirs}'s — not copied onto {o}'s machine. \
+                         `arena keys rotate {s} --copy` gives {o} a fresh one ({theirs} keeps what it spent)"
+                    ));
+                    done.left_out.push(host.clone());
+                }
+                None => done.lines.push(format!("= {host}: has an OpenRouter key now (made while this waited) — kept, none minted")),
+            }
             continue;
         }
         let kn = key_name(naming.prefix, naming.list, host);
@@ -277,8 +309,21 @@ pub(crate) async fn mint_missing(api: &dyn KeyApi, ctx: &SpendCtx, naming: &Nami
                 done.lines.push(format!("✗ {host}: a fresh OpenRouter key {short_hash} couldn't be saved ({e:#}) — {then}"));
             }
         }
+        drop(hold);
     }
     done
+}
+
+/// After `up`'s prompt, one consistent look under the keys folder's lock ([`lock_keys_dir`]): the
+/// keys stage's sources as the keys CSV has them now (`load`) and OpenRouter's listing for the
+/// copy's check — never the snapshot from before the prompt, which a `keys rotate` meanwhile could
+/// have made stale.
+pub(crate) async fn copy_snapshot<T>(api: Option<&dyn KeyApi>, dir: &std::path::Path, load: impl FnOnce() -> T) -> (T, Option<Result<Vec<KeyInfo>, String>>) {
+    let held = api.and_then(|_| lock_keys_dir(dir).ok());
+    let sources = load();
+    let listed = list_for_check(api).await;
+    drop(held);
+    (sources, listed)
 }
 
 #[cfg(test)]
@@ -321,6 +366,8 @@ mod tests {
             (&[key("devtest-apple", None)], None),
             (&[key("devtest-apple", Some("sk-or-v1-999...0000")), key("devtest-apple", Some("sk-or-v1-0e6...1c96"))], None),
             (&[key("devtest-apple", Some("sk-or-v1-999...0000")), key("devtest-apple", Some("odd"))], None),
+            // The row's key renamed on OpenRouter, a new one under apple's name: the row is live.
+            (&[key("devtest-apple", Some("sk-or-v1-999...0000")), key("apple (old)", Some("sk-or-v1-0e6...1c96"))], None),
         ];
         for (listed, want) in cases {
             assert_eq!(stale(&n, "devtest-apple", SECRET, listed), *want, "{listed:?}");
@@ -470,13 +517,27 @@ mod tests {
         let csv = std::fs::read_to_string(d.0.join("openrouter_api_keys.csv")).unwrap();
         assert!(csv.contains("devtest-apple,sk-or-v1-devtest-apple") && !csv.contains("bloom"), "{csv}");
         assert_eq!(arena_core::spend::key_owner(&ctx.state(), "devtest-apple"), Some("alice"));
-        assert!(done.listed.is_some(), "the listing it read under the lock, for the copy's check");
-        // A key made for a planned name while `up` waited at its prompt (`keys gen` elsewhere):
-        // seen in the listing read under the lock — kept, no second key.
+        // A key made for a planned name while `up` waited at its prompt (`keys gen` elsewhere, no
+        // owner): seen in the listing read under the hold — kept, no second key.
         let api = FakeKeys { listed: vec![key("devtest-cedar", None)], ..FakeKeys::default() };
         let plan = MintPlan { mint: vec!["devtest-cedar".into()], limit: 0.1, ..MintPlan::default() };
         let done = mint_missing(&api, &ctx, &n, &d.0, &plan, Some("alice")).await;
         assert_eq!(done.lines, ["= devtest-cedar: has an OpenRouter key now (made while this waited) — kept, none minted"]);
-        assert!(done.names.is_empty() && api.created.lock().unwrap().is_empty());
+        assert!(done.names.is_empty() && done.left_out.is_empty() && api.created.lock().unwrap().is_empty());
+        // Renamed on OpenRouter since, its secret in the CSV: found by its label — still kept.
+        std::fs::write(d.0.join("devtest_openrouter_keys.csv"), format!("devtest-dune,{SECRET}\n")).unwrap();
+        let api = FakeKeys { listed: vec![key("dune — renamed", Some("sk-or-v1-0e6...1c96"))], ..FakeKeys::default() };
+        let plan = MintPlan { mint: vec!["devtest-dune".into()], limit: 0.1, ..MintPlan::default() };
+        let done = mint_missing(&api, &ctx, &n, &d.0, &plan, Some("alice")).await;
+        assert!(done.lines[0].starts_with("= devtest-dune: has an OpenRouter key now"), "{:?}", done.lines);
+        assert!(api.created.lock().unwrap().is_empty());
+        // Another owner's (bob's `up` minted it meanwhile): left out of alice's machine, with the fix.
+        ctx.key_minted("hash-bob", "devtest-echo", Some("bob"));
+        let api = FakeKeys { listed: vec![key("devtest-echo", None)], ..FakeKeys::default() };
+        let plan = MintPlan { mint: vec!["devtest-echo".into()], limit: 0.1, ..MintPlan::default() };
+        let done = mint_missing(&api, &ctx, &n, &d.0, &plan, Some("alice")).await;
+        assert_eq!(done.left_out, ["devtest-echo"]);
+        assert!(done.lines[0].starts_with("✗ devtest-echo: an OpenRouter key was made for it meanwhile, bob's — not copied onto alice's machine"), "{:?}", done.lines);
+        assert!(api.created.lock().unwrap().is_empty());
     }
 }

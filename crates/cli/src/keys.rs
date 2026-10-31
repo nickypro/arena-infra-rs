@@ -15,7 +15,7 @@ use crate::cli::Select;
 use crate::pods::list::{enrich_best_effort, ENRICH_TIMEOUT};
 
 mod checked;
-pub(crate) use checked::{check_csv_keys, list_for_check, mint_missing, plan_mints};
+pub(crate) use checked::{check_csv_keys, copy_snapshot, hold_name, list_for_check, mint_missing, plan_mints};
 use crate::pods::selection::{all_stopped_error, stopped_skip, Selected};
 use crate::{archive, confirm, key_limits, shell_quote, spend};
 
@@ -1016,20 +1016,32 @@ pub(crate) async fn keys_with(
         println!("aborted.");
         return Ok(());
     }
-    // From here to the last saved secret the keys folder is held, and what OpenRouter has is read
-    // again under it: a key another arena minted while this one waited at its prompt (`pods up`,
-    // another `keys gen`) is seen — `gen` skips it rather than mint a second one for the name.
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let held = lock_keys_dir(dir).with_context(|| format!("locking {}", dir.display()))?;
-    let listed_at = arena_core::snapshot::unix_now();
-    let existing = api.list_keys().await.context("listing OpenRouter keys again")?;
-    let plan = resolve(&existing, plan_from(&existing));
-    // Each key's usage, recorded before anything is deleted: a rotated or revoked key's
-    // spend stays with whoever it was minted for (`arena spend`).
     let tracking = spend::SpendCtx::from_config(cfg);
-    tracking.keys(&existing, listed_at);
     let (mut ok, mut skipped, mut failed) = (0, 0, 0);
-    for (host, kn, theirs) in &plan {
+    for (host, kn, _) in &plan {
+        // One name at a time under a hold (`checked::hold_name`): what OpenRouter has for it is
+        // read again with the keys folder locked, and acted on before it's free — a key another
+        // arena made or deleted since the listing above (`pods up` at its prompt, another `keys
+        // gen`) is seen, and `gen` skips it rather than mint a second one for the name.
+        let hold = match hold_name(api, dir, host).await {
+            Ok(h) => h,
+            Err(why) => {
+                eprintln!("✗ {host}: {why} — nothing done for it");
+                failed += 1;
+                continue;
+            }
+        };
+        // Each key's usage, recorded before anything is deleted: a rotated or revoked key's
+        // spend stays with whoever it was minted for (`arena spend`).
+        tracking.keys(&hold.listed, hold.listed_at);
+        let mine = machine_key_names(&naming, host);
+        let theirs: Vec<&arena_core::openrouter::KeyInfo> = hold
+            .listed
+            .iter()
+            .filter(|k| k.name.as_deref().is_some_and(|n| mine.iter().any(|t| t == n)))
+            .filter(|k| action != KeysAction::Gen || !k.disabled)
+            .collect();
+        let theirs = &theirs;
         if action == KeysAction::Gen && !theirs.is_empty() {
             println!("= {host}: '{kn}' already exists — use `arena keys rotate {host}` to replace");
             skipped += 1;
@@ -1067,7 +1079,6 @@ pub(crate) async fn keys_with(
             }
         }
     }
-    drop(held);
     match action {
         KeysAction::Gen => println!("\nGenerated {ok}, skipped {skipped}, failed {failed} → {}", csv_path.display()),
         KeysAction::Rotate => println!("\nRotated {ok}, failed {failed}."),

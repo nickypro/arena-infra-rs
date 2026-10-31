@@ -12,7 +12,7 @@ use arena_core::Config;
 
 use crate::cli::{PodCmd, Select};
 use crate::cron::resolve_week_day;
-use crate::keys::{check_csv_keys, handle_copy_keys, keys_dir, list_for_check, mint_missing, openrouter_client, openrouter_keys_csv, plan_mints, up_keys_stage, KeyBook};
+use crate::keys::{check_csv_keys, copy_snapshot, handle_copy_keys, keys_dir, list_for_check, mint_missing, openrouter_client, openrouter_keys_csv, plan_mints, up_keys_stage, KeyBook};
 use crate::pods::backup::{handle_full_backup, RSYNC};
 use crate::pods::baseline::handle_baseline;
 use crate::pods::branch::{handle_init_branches, set_branch_and_init, SetBranchRun};
@@ -537,7 +537,7 @@ async fn handle_pods_bal(
                 return Ok(());
             }
             // The handed-over and the minted keys are in the CSV before the pipelines copy any.
-            let handed = hand_keys_over(&tracking, cfg, &owner, &handing).await?;
+            hand_keys_over(&tracking, cfg, &owner, &handing).await?;
             let minted = match key_api {
                 Some(api) if !mints.mint.is_empty() => {
                     let m = mint_missing(api, &tracking, &naming, std::path::Path::new(&keys_dir(cfg)), &mints, owner.owner.as_deref()).await;
@@ -552,15 +552,19 @@ async fn handle_pods_bal(
                 }
                 _ => Default::default(),
             };
-            // A key made by another arena while this one waited at its prompt is in the CSV too.
-            let reread = handed || !minted.names.is_empty() || minted.lines.iter().any(|l| l.starts_with('='));
-            let mut keys = if reread { up_keys_stage(cfg, &keys_dir(cfg), !no_setup) } else { keys };
-            // The other names' rows in the keys CSV, checked against the newest listing: a key
-            // deleted elsewhere isn't copied on (said, with what to run).
+            // What the keys stage copies, read again now — under the keys folder's lock, with a
+            // fresh listing — not as it was before the prompt: a key handed over, minted, made by
+            // another arena meanwhile or rotated since is the CSV's now. The names' rows are
+            // checked against that listing: a key deleted elsewhere isn't copied on (said, with
+            // what to run), nor one another owner's command made meanwhile.
+            let dir = keys_dir(cfg);
+            let (mut keys, listed) = copy_snapshot(key_api, std::path::Path::new(&dir), || up_keys_stage(cfg, &dir, !no_setup)).await;
             if let Some(k) = keys.as_mut() {
+                for host in &minted.left_out {
+                    k.leave_out_openrouter(host);
+                }
                 let fresh = |n: &String| minted.names.contains(n) || handing.iter().any(|h| h.name == *n);
                 let hosts: Vec<String> = names.iter().filter(|n| !fresh(n)).cloned().collect();
-                let listed = minted.listed.map(Ok).or(mints.listed);
                 for line in check_csv_keys(k, &hosts, listed.as_ref(), &naming) {
                     eprintln!("{line}");
                 }
