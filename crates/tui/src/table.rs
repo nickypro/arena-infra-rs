@@ -555,10 +555,11 @@ mod tests {
     use arena_core::selector::Naming;
     use arena_core::snapshot::HealthCache;
     use ratatui::backend::TestBackend;
+    use crate::detail::gpu_detail;
     use crate::refresh::owners_by_key;
     use crate::state::{dashboard_snapshot, Rtts};
     use crate::tests::{cfg, draw, fixture_shared, pod, row, screen, ui, NOW};
-    use crate::{gpu_detail, view, Mode};
+    use crate::{view, Mode};
 
     #[test]
     fn rows_show_cost_maintenance_health_and_proxy_from_the_snapshot() {
