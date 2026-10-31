@@ -173,6 +173,7 @@ their locks and logs.
 - pods that are stopped or unreachable when the cron runs, and staff (`@`) boxes unless named
 - pods on main/master: no git backup until `arena pods init-branches` (the home copy still runs)
 - this box's own state (`ARENA_STATE_DIR`: the archive's keys, the records) — back it up yourself
+- a Hetzner VM's volumes (`pods volume add`, mounted outside the home): no backup copies them — copy off what matters yourself
 
 ## `pods backup`: the full save
 

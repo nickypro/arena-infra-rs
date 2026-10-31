@@ -289,10 +289,14 @@ pub(crate) async fn handle_start(
 }
 
 /// `pods terminate`'s switches, passed through to [`handle_terminate`] as one value.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct TerminateOpts {
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TerminateOpts<'a> {
     pub unlock: bool,
     pub revoke_key: bool,
+    /// Also delete the Hetzner volumes attached to it (they outlive their server otherwise).
+    pub delete_volumes: bool,
+    /// The fleet's Hetzner volumes (`None`: no Hetzner key — none to look for).
+    pub volumes: Option<&'a dyn arena_core::datavol::VolumeCloud>,
     pub skip_proxy: bool,
     pub dry_run: bool,
     pub yes: bool,
@@ -330,9 +334,9 @@ pub(crate) async fn handle_terminate(
     book: &KeyBook<'_>,
     // The pods named (each by the shared single-pod matcher), or `None` = the whole fleet (`--all`).
     targets: Option<&[&str]>,
-    opts: TerminateOpts,
+    opts: TerminateOpts<'_>,
 ) -> Result<()> {
-    let TerminateOpts { unlock, revoke_key, skip_proxy, dry_run, yes } = opts;
+    let TerminateOpts { unlock, revoke_key, delete_volumes, volumes, skip_proxy, dry_run, yes } = opts;
     // Before anything is listed or touched: revoking needs the provisioning API.
     if revoke_key && book.api.is_none() {
         anyhow::bail!(
@@ -427,12 +431,51 @@ pub(crate) async fn handle_terminate(
         String::new()
     };
     let then_sync = if skip_proxy { "" } else { ", then sync the proxy" };
+    // A Hetzner volume outlives its server (and bills on): said for each, deleted only with
+    // --delete-volumes — whose listing must work before anything is terminated.
+    let attached: Vec<(String, arena_core::archive::cloud::CloudVolume)> = match volumes {
+        Some(cloud) => match crate::pods::datavol::attached_volumes(cloud, &pods.iter().collect::<Vec<_>>()).await {
+            Ok(v) => v,
+            Err(e) if delete_volumes => anyhow::bail!("--delete-volumes: {e:#} — nothing was terminated"),
+            Err(e) => {
+                eprintln!(
+                    "warning: {e:#} — can't say whether a volume is attached (a Hetzner volume outlives its server and bills on: \
+                     `arena pods volume list`)"
+                );
+                Vec::new()
+            }
+        },
+        None if delete_volumes && pods.iter().any(|p| p.provider == "hetzner") => {
+            anyhow::bail!("--delete-volumes: volumes are Hetzner's, and HETZNER_API_KEY isn't set — nothing was terminated")
+        }
+        None => Vec::new(),
+    };
+    let volume_lines = |p: &arena_core::Pod| -> Vec<String> {
+        attached
+            .iter()
+            .filter(|(id, _)| *id == p.id)
+            .map(|(_, v)| {
+                if delete_volumes {
+                    format!("then DELETE its volume {} ({} GB, id={}) and its files", v.name, v.size_gb, v.id)
+                } else {
+                    format!(
+                        "its volume {} ({} GB) is KEPT — Hetzner doesn't delete it with the server, and it bills until `arena pods \
+                         volume delete {}` (or pass --delete-volumes)",
+                        v.name, v.size_gb, v.name
+                    )
+                }
+            })
+            .collect()
+    };
     if dry_run {
         let leaving: Vec<&str> = pods.iter().map(|p| p.id.as_str()).collect();
         let staying = |p: &arena_core::Pod| shared_name_holder(&listed, &leaving, &p.name).map(|o| o.id.clone());
         for p in &pods {
             let how = if unlock && arena_core::lock::is_locked(p) { "unlock, then terminate" } else { "terminate" };
             println!("[dry-run] would {how} {}", label(p));
+            for l in volume_lines(p) {
+                println!("[dry-run]   {l}");
+            }
             if revoke_key {
                 match staying(p) {
                     Some(id) => println!("[dry-run]   key kept: pod id {id} (not being terminated) is also named {}", p.name),
@@ -471,12 +514,20 @@ pub(crate) async fn handle_terminate(
     } else {
         format!(" KEEPING {} (locked, not this cohort's — not unlocked).", kept_names.join(", "))
     };
+    let vols = match (attached.len(), delete_volumes) {
+        (0, _) => String::new(),
+        (n, true) => format!(" DELETING {n} attached volume(s) too: {}.", attached.iter().map(|(_, v)| v.name.as_str()).collect::<Vec<_>>().join(", ")),
+        (n, false) => format!(
+            " KEEPING {n} attached volume(s), billing: {} (--delete-volumes deletes them).",
+            attached.iter().map(|(_, v)| v.name.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+    };
     let go = if single {
-        confirm(yes, &format!("Will {unlocking}TERMINATE {} — irreversible{then_keys}{then_sync}.", label(&pods[0])))?
+        confirm(yes, &format!("Will {unlocking}TERMINATE {} — irreversible{then_keys}{then_sync}.{vols}", label(&pods[0])))?
     } else {
         let what = match targets {
-            None => format!("Will {unlocking}TERMINATE ALL {} pod(s) — irreversible{then_keys}{then_sync}.{keeping}", pods.len()),
-            Some(_) => format!("Will {unlocking}TERMINATE these {} pods — irreversible{then_keys}{then_sync}:", pods.len()),
+            None => format!("Will {unlocking}TERMINATE ALL {} pod(s) — irreversible{then_keys}{then_sync}.{keeping}{vols}", pods.len()),
+            Some(_) => format!("Will {unlocking}TERMINATE these {} pods — irreversible{then_keys}{then_sync}.{vols}", pods.len()),
         };
         let list: Vec<String> = pods.iter().map(|p| format!("  {}", label(p))).collect();
         let token = if targets.is_none() { "ALL".to_string() } else { arena_core::selector::set_confirm_token(pods.len(), listed.len()) };
@@ -552,6 +603,23 @@ pub(crate) async fn handle_terminate(
     if !gone.is_empty() && !skip_proxy {
         sync_proxy(cfg, provider, "terminate").await;
     }
+    // The volumes of what went: deleted (--delete-volumes) or said to be kept, billing.
+    let mut volumes_failed = Vec::new();
+    let gone_volumes: Vec<arena_core::archive::cloud::CloudVolume> =
+        attached.iter().filter(|(id, _)| gone.iter().any(|p| p.id == *id)).map(|(_, v)| v.clone()).collect();
+    // Only the volumes arena made are deleted; one attached by hand is someone else's to delete.
+    let (ours, by_hand): (Vec<_>, Vec<_>) =
+        gone_volumes.into_iter().partition(|v| arena_core::datavol::is_ours(v, naming.prefix) || !delete_volumes);
+    if let (Some(cloud), true, false) = (volumes, delete_volumes, ours.is_empty()) {
+        volumes_failed = crate::pods::datavol::delete_after_terminate(cloud, &ours).await;
+    } else {
+        for v in &ours {
+            println!("[kept] volume {} ({} GB) — detached, billing until `arena pods volume delete {}`", v.name, v.size_gb, v.name);
+        }
+    }
+    for v in &by_hand {
+        println!("[kept] volume {} ({} GB) — attached by hand, so not deleted here: delete it in the Hetzner console", v.name, v.size_gb);
+    }
     let mut revoked = KeyRevoke::default();
     if revoke_key && !gone.is_empty() {
         // Each machine name once (two pods sharing a name are one key), and none that a pod
@@ -576,6 +644,9 @@ pub(crate) async fn handle_terminate(
         }
     }
     let mut problems = Vec::new();
+    if !volumes_failed.is_empty() {
+        problems.push(format!("deleting volume(s) {} failed — the pod(s) ARE terminated", volumes_failed.join(", ")));
+    }
     if gone.len() < pods.len() {
         problems.push(format!("{} pod(s) failed to terminate", pods.len() - gone.len()));
     }

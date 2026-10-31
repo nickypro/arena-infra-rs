@@ -192,6 +192,7 @@ fn replace_job<'a>(
         balance: None,
         source,
         spares,
+        volumes: None,
     }
 }
 
@@ -350,6 +351,7 @@ fn copy_job<'a>(
         source,
         force,
         spares,
+        volumes: None,
     }
 }
 
@@ -442,7 +444,7 @@ async fn the_cutover_waits_for_no_one_on_the_original() {
     remote.on(OLD, "ARENA_IDLE_NOW", FakeReply::stdout(&Reply { gpu: None, editors: Some(2), ..Reply::default() }.render()));
     scripted(&remote, "101", NEW, "202");
     let pods = f.list_pods().await.unwrap();
-    let opts = |force| CutoverOpts { skip_proxy: false, no_final_sync: true, dry_run: false, yes: true, force };
+    let opts = |force| CutoverOpts { volumes: None, skip_proxy: false, no_final_sync: true, dry_run: false, yes: true, force };
     let e = migrate_cutover_on(remote.clone(), &f, &cfg, &f, "devtest-alpha", &pods, opts(false), "/nonexistent").await.unwrap_err().to_string();
     assert!(e.contains("refusing to cut over devtest-alpha") && e.contains("2 VS Code (or Cursor) server processes"), "{e}");
     assert!(f.calls().is_empty());
@@ -620,4 +622,304 @@ async fn two_claims_on_one_spare_take_it_once() {
     let e = take(&f, Some(&f), &cfg, &onto, "devtest-bravo-new").await.unwrap_err();
     assert!(format!("{e:#}").contains("taking devtest-spare-1 as devtest-bravo-new — nothing was renamed"), "{e:#}");
     assert_eq!(f.calls(), ["adopt 301 devtest-alpha-new"]);
+}
+
+/// A Hetzner project for the volume tests: the fleet's VMs as servers (a volume created
+/// attached takes its location from its server), and one volume of 10 GB on `on` (101).
+fn volume_project(servers: &[(&str, &str)], on: u64, location: &str) -> arena_core::archive::cloud::FakeArchiveCloud {
+    use arena_core::archive::cloud::{CloudServer, CloudVolume, FakeArchiveCloud, Inventory};
+    FakeArchiveCloud::with(Inventory {
+        servers: servers
+            .iter()
+            .map(|(id, loc)| CloudServer {
+                id: id.parse().unwrap(),
+                name: format!("s{id}"),
+                status: "running".into(),
+                location: loc.to_string(),
+                ipv4: None,
+                labels: Default::default(),
+                delete_protected: false,
+                server_type: "cx23".into(),
+            })
+            .collect(),
+        volumes: vec![CloudVolume {
+            id: 900,
+            name: "devtest-alpha-data".into(),
+            size_gb: 10,
+            location: location.into(),
+            server: Some(on),
+            format: Some("ext4".into()),
+            linux_device: "/dev/disk/by-id/scsi-0HC_Volume_900".into(),
+            labels: [("arena-volume".to_string(), "devtest".to_string())].into(),
+            delete_protected: false,
+        }],
+        ..Default::default()
+    })
+}
+
+/// The volume steps answer on both VMs: where it's mounted, unmounted, mounted (unless
+/// `mount_fails`). Registered before `scripted`'s rules (the first that matches wins: its
+/// identity rule would answer every guarded step).
+fn volume_steps(remote: &FakeRemote, mount_fails: bool) {
+    for host in [OLD, NEW] {
+        remote.on(host, "ARENA_VOL_AT", FakeReply::stdout("ARENA_VOL_AT /mnt/data\n"));
+        remote.on(host, "ARENA_VOL_UNMOUNTED", FakeReply::stdout("ARENA_VOL_UNMOUNTED\n"));
+    }
+    remote.on(OLD, "ARENA_VOL_NO_DEVICE", FakeReply::stdout("ARENA_VOL_MOUNTED 10501771264\n"));
+    let on_new = if mount_fails { "ARENA_VOL_FAIL /mnt/data holds files (x)\n" } else { "ARENA_VOL_MOUNTED 10501771264\n" };
+    remote.on(NEW, "ARENA_VOL_NO_DEVICE", FakeReply::stdout(on_new));
+    remote.on(OLD, "rsync -aHAX", FakeReply::stdout(""));
+}
+
+/// A volume on the old VM moves with it when the new one is in the same location: unmounted
+/// there, detached, attached to the new VM and mounted where it was — before the names swap.
+#[tokio::test(start_paused = true)]
+async fn replace_moves_a_volume_in_the_same_location() {
+    use arena_core::archive::cloud::CloudCall;
+    let dir = tmpdir("vol-move");
+    let cfg = cfg(&dir.0);
+    let f = Vms::new(vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1 (Nuremberg, DE)")], vec![]);
+    *f.to_create.lock().unwrap() = vec![vm("202", "", "", "10.0.0.2", "nbg1 (Nuremberg, DE)")];
+    let cloud = volume_project(&[("101", "nbg1"), ("202", "nbg1")], 101, "nbg1");
+    let remote = Arc::new(FakeRemote::new());
+    volume_steps(&remote, false);
+    scripted(&remote, "101", NEW, "202");
+    let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
+    let keys = dir.0.display().to_string();
+    let mut job = replace_job(&ov, &place, &interrupt, &keys, Source::Create, None, false, &cfg);
+    job.volumes = Some(&cloud);
+    replace_on(remote.clone(), &f, &cfg, &f, "101".into(), "devtest-alpha".into(), job).await.unwrap();
+    assert_eq!(cloud.mutations(), [CloudCall::Detach(900), CloudCall::Attach(900, 202)]);
+    assert_eq!(cloud.state().volumes[0].server, Some(202));
+    assert!(execs(&remote, OLD).iter().any(|c| c.contains("ARENA_VOL_UNMOUNTED") && c.contains("scsi-0HC_Volume_900")));
+    assert!(execs(&remote, NEW).iter().any(|c| c.contains("ARENA_VOL_NO_DEVICE") && c.contains("'/mnt/data'")), "mounted where it was");
+    assert_eq!(f.calls(), ["create devtest-alpha-new cx33", "rename 101 devtest-alpha-old", "rename 202 devtest-alpha", "terminate 101"]);
+}
+
+/// The move fails on the new VM (its mount point holds files): the volume goes back onto the
+/// original, mounted there, and nothing is swapped.
+#[tokio::test(start_paused = true)]
+async fn a_volume_that_wont_move_goes_back_and_nothing_swaps() {
+    let dir = tmpdir("vol-move-fail");
+    let cfg = cfg(&dir.0);
+    let f = Vms::new(vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1")], vec![]);
+    *f.to_create.lock().unwrap() = vec![vm("202", "", "", "10.0.0.2", "nbg1")];
+    let cloud = volume_project(&[("101", "nbg1"), ("202", "nbg1")], 101, "nbg1");
+    let remote = Arc::new(FakeRemote::new());
+    volume_steps(&remote, true);
+    scripted(&remote, "101", NEW, "202");
+    let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
+    let keys = dir.0.display().to_string();
+    let mut job = replace_job(&ov, &place, &interrupt, &keys, Source::Create, None, false, &cfg);
+    job.volumes = Some(&cloud);
+    let e = format!("{:#}", replace_on(remote.clone(), &f, &cfg, &f, "101".into(), "devtest-alpha".into(), job).await.unwrap_err());
+    assert!(e.contains("NOT swapping") && e.contains("holds files") && e.contains("back on devtest-alpha"), "{e}");
+    assert_eq!(cloud.state().volumes[0].server, Some(101), "back on the original");
+    assert!(execs(&remote, OLD).iter().any(|c| c.contains("ARENA_VOL_NO_DEVICE")), "mounted again on the original");
+    assert_eq!(f.calls(), ["create devtest-alpha-new cx33"], "no rename, no terminate");
+}
+
+/// In another location the volume can't move: a volume of the same size is made on the new VM
+/// (labelled as the copy), mounted at the same place, and synced straight from the old VM —
+/// with the copy, and again right before the swap. The original stays where it is.
+#[tokio::test(start_paused = true)]
+async fn replace_copies_a_volume_to_another_location() {
+    use arena_core::archive::cloud::CloudCall;
+    let dir = tmpdir("vol-copy");
+    let cfg = cfg(&dir.0);
+    let f = Vms::new(vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1")], vec![]);
+    *f.to_create.lock().unwrap() = vec![vm("202", "", "", "10.0.0.2", "fsn1 (Falkenstein, DE)")];
+    let cloud = volume_project(&[("101", "nbg1"), ("202", "fsn1")], 101, "nbg1");
+    let remote = Arc::new(FakeRemote::new());
+    volume_steps(&remote, false);
+    scripted(&remote, "101", NEW, "202");
+    let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
+    let keys = dir.0.display().to_string();
+    let mut job = replace_job(&ov, &place, &interrupt, &keys, Source::Create, None, false, &cfg);
+    job.volumes = Some(&cloud);
+    replace_on(remote.clone(), &f, &cfg, &f, "101".into(), "devtest-alpha".into(), job).await.unwrap();
+    let created: Vec<serde_json::Value> = cloud.mutations().into_iter().filter_map(|c| if let CloudCall::CreateVolume(b) = c { Some(b) } else { None }).collect();
+    assert_eq!(created.len(), 1, "made once, found again for the final sync");
+    assert_eq!((created[0]["size"].as_u64(), created[0]["server"].as_u64()), (Some(10), Some(202)));
+    assert_eq!(created[0]["name"], "devtest-alpha-data-2");
+    assert_eq!(created[0]["labels"]["arena-volume-copy-of"], "900");
+    let copies: Vec<String> = execs(&remote, OLD).into_iter().filter(|c| c.contains("rsync -aHAX")).collect();
+    assert_eq!(copies.len(), 2, "{copies:?}");
+    // (Run by /bin/sh: quoted once more, `'` as `'\''`.)
+    assert!(copies[0].starts_with("sh -c '"), "{}", copies[0]);
+    assert!(copies[0].contains("/mnt/data'\\''/ '\\''root@10.0.0.2:/mnt/data/'\\''") && copies[0].contains("--rsync-path="), "{}", copies[0]);
+    let state = cloud.state();
+    // The original stays (on its old VM — this fake project doesn't see that VM's terminate).
+    assert_eq!(state.volumes.iter().find(|v| v.id == 900).unwrap().server, Some(101));
+    assert!(state.volumes.iter().any(|v| v.name == "devtest-alpha-data-2" && v.server == Some(202)));
+}
+
+/// Two volumes, the second won't mount on the new VM (review r1): both go back — the first
+/// unmounted on the new VM before it's detached there — and nothing swaps.
+#[tokio::test(start_paused = true)]
+async fn a_failed_second_move_puts_both_back_unmounting_first() {
+    use arena_core::archive::cloud::{ArchiveCloud, CloudCall};
+    let dir = tmpdir("vol-move-two");
+    let cfg = cfg(&dir.0);
+    let f = Vms::new(vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1")], vec![]);
+    *f.to_create.lock().unwrap() = vec![vm("202", "", "", "10.0.0.2", "nbg1")];
+    let cloud = volume_project(&[("101", "nbg1"), ("202", "nbg1")], 101, "nbg1");
+    let mut body = arena_core::datavol::create_body("devtest-alpha-data-2", 10, 101, "devtest");
+    body["location"] = serde_json::Value::from("nbg1");
+    cloud.create_volume(&body).await.unwrap();
+    let second = cloud.state().volumes.iter().find(|v| v.name == "devtest-alpha-data-2").unwrap().id;
+    cloud.clear_calls();
+    let remote = Arc::new(FakeRemote::new());
+    // The second volume's mount on the new VM fails (its device named in the mount step).
+    remote.on(
+        NEW,
+        &format!("scsi-0HC_Volume_{second}'"),
+        FakeReply::from_cmd(|cmd| {
+            if cmd.contains("ARENA_VOL_NO_DEVICE") {
+                FakeReply::stdout("ARENA_VOL_FAIL /mnt/data2 holds files (x)\n")
+            } else {
+                FakeReply::stdout("ARENA_VOL_UNMOUNTED\n")
+            }
+        }),
+    );
+    volume_steps(&remote, false);
+    scripted(&remote, "101", NEW, "202");
+    let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
+    let keys = dir.0.display().to_string();
+    let mut job = replace_job(&ov, &place, &interrupt, &keys, Source::Create, None, false, &cfg);
+    job.volumes = Some(&cloud);
+    let e = format!("{:#}", replace_on(remote.clone(), &f, &cfg, &f, "101".into(), "devtest-alpha".into(), job).await.unwrap_err());
+    assert!(e.contains("NOT swapping") && e.contains("back on devtest-alpha"), "{e}");
+    assert!(cloud.state().volumes.iter().all(|v| v.server == Some(101)), "{:?}", cloud.state().volumes);
+    // The first was unmounted on the new VM before its detach from there.
+    let on_new = execs(&remote, NEW);
+    assert!(on_new.iter().any(|c| c.contains("ARENA_VOL_UNMOUNTED") && c.contains("scsi-0HC_Volume_900")), "{on_new:?}");
+    let m = cloud.mutations();
+    let attaches_to_new = m.iter().filter(|c| matches!(c, CloudCall::Attach(_, 202))).count();
+    assert_eq!(attaches_to_new, 2, "{m:?}");
+    assert_eq!(f.calls(), ["create devtest-alpha-new cx33"]);
+}
+
+/// A mount point that can't be read moves nothing (review r1: every mount point is read first).
+#[tokio::test(start_paused = true)]
+async fn a_mount_point_that_cant_be_read_moves_nothing() {
+    let dir = tmpdir("vol-move-noread");
+    let cfg = cfg(&dir.0);
+    let f = Vms::new(vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1")], vec![]);
+    *f.to_create.lock().unwrap() = vec![vm("202", "", "", "10.0.0.2", "nbg1")];
+    let cloud = volume_project(&[("101", "nbg1"), ("202", "nbg1")], 101, "nbg1");
+    let remote = Arc::new(FakeRemote::new());
+    remote.on(OLD, "ARENA_VOL_AT", FakeReply::exit(255, "ssh: connection reset"));
+    volume_steps(&remote, false);
+    scripted(&remote, "101", NEW, "202");
+    let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
+    let keys = dir.0.display().to_string();
+    let mut job = replace_job(&ov, &place, &interrupt, &keys, Source::Create, None, false, &cfg);
+    job.volumes = Some(&cloud);
+    replace_on(remote.clone(), &f, &cfg, &f, "101".into(), "devtest-alpha".into(), job).await.unwrap_err();
+    assert!(cloud.mutations().is_empty(), "{:?}", cloud.mutations());
+    assert_eq!(f.calls(), ["create devtest-alpha-new cx33"]);
+}
+
+/// A cutover's move is recorded, and a revert moves back exactly what it moved — never a copy
+/// (or anything else) attached to the new VM; a cutover without a final sync onto copies that
+/// never finished is refused (review r1).
+#[tokio::test(start_paused = true)]
+async fn revert_moves_back_only_what_the_cutover_moved() {
+    use crate::pods::datavol::{copies_ready, load_record, revert_moves, save_record, MoveRecord};
+    use arena_core::archive::cloud::ArchiveCloud;
+    let dir = tmpdir("vol-revert");
+    let cfg = cfg(&dir.0);
+    let old = vm("101", "devtest-alpha-new", "cx33", "10.0.0.1", "nbg1");
+    let new = vm("202", "devtest-alpha", "cx43", "10.0.0.2", "nbg1");
+    let cloud = volume_project(&[("101", "nbg1"), ("202", "nbg1")], 202, "nbg1");
+    let mut body = arena_core::datavol::create_body("devtest-alpha-data-2", 10, 202, "devtest");
+    body["labels"]["arena-volume-copy-of"] = serde_json::Value::from("77");
+    cloud.create_volume(&body).await.unwrap();
+    let remote = Arc::new(FakeRemote::new());
+    volume_steps(&remote, false);
+    scripted(&remote, "101", NEW, "202");
+    let record = MoveRecord { src: "101".into(), mounts: [(900, "/mnt/data".to_string())].into(), moved: vec![900], moved_to: Some("202".into()), ..Default::default() };
+    save_record(&cfg, "devtest-alpha", &record).unwrap();
+    assert_eq!(load_record(&cfg, "devtest-alpha", "101"), record);
+    assert_eq!(load_record(&cfg, "devtest-alpha", "999").moved, Vec::<u64>::new(), "another server's: none");
+    let f = Vms::new(vec![old.clone(), new.clone()], vec![]);
+    let mut record = record;
+    revert_moves(remote.as_ref(), &cfg, &f, &cloud, &new, &old, &mut record).await.unwrap();
+    let state = cloud.state();
+    assert_eq!(state.volumes.iter().find(|v| v.id == 900).unwrap().server, Some(101), "moved back");
+    assert_eq!(state.volumes.iter().find(|v| v.name == "devtest-alpha-data-2").unwrap().server, Some(202), "not moved by this cutover");
+    // Copies: ready only when the record says the copy finished and it's attached there.
+    let originals = vec![state.volumes.iter().find(|v| v.id == 900).unwrap().clone()];
+    let e = copies_ready(&cloud, &record, &new, &originals).await.unwrap_err().to_string();
+    assert!(e.contains("no finished copy") && e.contains("devtest-alpha-data"), "{e}");
+    let copy_id = state.volumes.iter().find(|v| v.name == "devtest-alpha-data-2").unwrap().id;
+    let done = MoveRecord { copied: [(900, copy_id)].into(), ..record };
+    copies_ready(&cloud, &done, &new, &originals).await.unwrap();
+}
+
+/// A cutover cut short after it moved a volume (review r3): the retry finds it on `-new` from
+/// the record, makes sure it's mounted there, and swaps — the record still names it for a revert.
+#[tokio::test(start_paused = true)]
+async fn a_cutover_cut_short_mid_move_is_reconciled_on_retry() {
+    use crate::pods::datavol::{load_record, save_record, MoveRecord};
+    let dir = tmpdir("vol-cutover-retry");
+    let cfg = cfg(&dir.0);
+    let f = Vms::new(
+        vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1"), vm("202", "devtest-alpha-new", "cx43", "10.0.0.2", "nbg1")],
+        vec![],
+    );
+    let cloud = volume_project(&[("101", "nbg1"), ("202", "nbg1")], 202, "nbg1");
+    let record = MoveRecord { src: "101".into(), mounts: [(900, "/srv/models".to_string())].into(), moved: vec![900], moved_to: Some("202".into()), ..Default::default() };
+    save_record(&cfg, "devtest-alpha", &record).unwrap();
+    let remote = Arc::new(FakeRemote::new());
+    volume_steps(&remote, false);
+    scripted(&remote, "101", NEW, "202");
+    let pods = f.list_pods().await.unwrap();
+    let opts = CutoverOpts { volumes: Some(&cloud), skip_proxy: false, no_final_sync: true, dry_run: false, yes: true, force: true };
+    migrate_cutover_on(remote.clone(), &f, &cfg, &f, "devtest-alpha", &pods, opts, "/nonexistent").await.unwrap();
+    assert_eq!(f.calls(), ["rename 101 devtest-alpha-old", "rename 202 devtest-alpha"]);
+    assert!(
+        execs(&remote, NEW).iter().any(|c| c.contains("ARENA_VOL_NO_DEVICE") && c.contains("/srv/models") && c.contains("scsi-0HC_Volume_900")),
+        "mounted on -new where the record says"
+    );
+    assert_eq!(load_record(&cfg, "devtest-alpha", "101").moved, [900], "still known for a revert");
+}
+
+/// A revert that can't bring a recorded volume back (it's detached now) fails and keeps it in
+/// the record (review r3); `keep_unresolved` keeps only what isn't back on the original.
+#[tokio::test(start_paused = true)]
+async fn an_unresolved_volume_stays_recorded() {
+    use crate::pods::datavol::{keep_unresolved, revert_moves, MoveRecord};
+    use arena_core::archive::cloud::ArchiveCloud;
+    let dir = tmpdir("vol-unresolved");
+    let cfg = cfg(&dir.0);
+    let old = vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1");
+    let new = vm("202", "devtest-alpha-new", "cx43", "10.0.0.2", "nbg1");
+    let cloud = volume_project(&[("101", "nbg1"), ("202", "nbg1")], 202, "nbg1");
+    cloud.detach(900).await.unwrap();
+    let remote = Arc::new(FakeRemote::new());
+    volume_steps(&remote, false);
+    scripted(&remote, "101", NEW, "202");
+    let f = Vms::new(vec![old.clone(), new.clone()], vec![]);
+    let mut record = MoveRecord { src: "101".into(), moved: vec![900], moved_to: Some("202".into()), ..Default::default() };
+    let e = format!("{:#}", revert_moves(remote.as_ref(), &cfg, &f, &cloud, &new, &old, &mut record).await.unwrap_err());
+    assert!(e.contains("not back on devtest-alpha") && e.contains("devtest-alpha-data (detached)"), "{e}");
+    assert_eq!(record.moved, [900], "kept");
+    // Attached to the original again but its mount won't come back: still unresolved.
+    cloud.attach(900, 101).await.unwrap();
+    let stuck = Arc::new(FakeRemote::new());
+    stuck.on(OLD, "ARENA_VOL_NO_DEVICE", FakeReply::stdout("ARENA_VOL_FAIL /mnt/data holds files (x)\n"));
+    scripted(&stuck, "101", NEW, "202");
+    let left = keep_unresolved(stuck.as_ref(), &cfg, &f, &cloud, &mut record, &old).await;
+    assert!(left[0].contains("not mounted"), "{left:?}");
+    assert_eq!(record.moved, [900]);
+    // Attached to a stopped original: can't be checked — kept (fix-check).
+    let off = Pod { status: "OFF".into(), ..old.clone() };
+    let left = keep_unresolved(remote.as_ref(), &cfg, &f, &cloud, &mut record, &off).await;
+    assert!(left[0].contains("start it"), "{left:?}");
+    assert_eq!(record.moved, [900]);
+    // Attached and mounted: resolved.
+    let left = keep_unresolved(remote.as_ref(), &cfg, &f, &cloud, &mut record, &old).await;
+    assert!(left.is_empty() && record.moved.is_empty() && record.moved_to.is_none(), "{left:?}");
 }
