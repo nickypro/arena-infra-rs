@@ -111,8 +111,7 @@ pub(crate) fn resolve_week_day(cfg: &Config, week: Option<u32>, day: Option<u32>
     Ok((week.unwrap_or(w), day.unwrap_or(d)))
 }
 
-pub(crate) const CRON_BEGIN: &str = "# >>> arena-infra-rs >>>";
-pub(crate) const CRON_END: &str = "# <<< arena-infra-rs <<<";
+pub(crate) use arena_core::cron::{BEGIN as CRON_BEGIN, END as CRON_END};
 
 /// Return `existing` crontab text with any arena-managed block removed.
 fn strip_arena_block(existing: &str) -> String {
@@ -137,19 +136,7 @@ fn strip_arena_block(existing: &str) -> String {
 /// arena's managed block(s) — what `cron remove` clears — and every job line outside them that
 /// mentions arena anyway (hand-added, so `cron remove` won't touch it).
 pub(crate) fn arena_cron_lines(crontab: &str) -> arena_core::teardown::CronLines {
-    let mut out = arena_core::teardown::CronLines::default();
-    let mut in_block = false;
-    for line in crontab.lines() {
-        match line.trim() {
-            CRON_BEGIN => in_block = true,
-            CRON_END => in_block = false,
-            "" => {}
-            _ if in_block => out.managed.push(line.to_string()),
-            _ if arena_core::teardown::cron_line_is_arena_job(line) => out.unmanaged.push(line.to_string()),
-            _ => {}
-        }
-    }
-    out
+    arena_core::cron::arena_lines(crontab)
 }
 
 /// Build new crontab text = existing (minus old arena block) + the new arena block
@@ -211,7 +198,7 @@ pub(crate) async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::p
         }
         CronCmd::Remove { backup, proxy, snapshot, archive, reap, health, dry_run } => {
             cron_home(home, effective_uid()?)?;
-            let mut kinds = CronKind::selected(backup, proxy, snapshot, archive);
+            let mut kinds = selected_kinds(backup, proxy, snapshot, archive);
             if reap {
                 kinds.push(CronKind::Reap);
             }
@@ -545,20 +532,12 @@ pub(crate) fn char_named(c: char) -> String {
     format!("{name} (U+{:04X})", u32::from(c))
 }
 
-/// A crontab line's log: `PATH` when the line ends in an append of its output to one file —
-/// `>> PATH 2>&1` as arena's lines do, or a hand edit's `>>PATH 2>&1`, `>> PATH` or `>>PATH`
-/// (review fb2 F8: those moved to the default log, said only by the diff). `None` for any other
-/// ending — none, `> PATH`, `2>>ERR`, a comment after it, a quoted path with a space — which
+/// A crontab line's log ([`arena_core::cron::log_target`]): `PATH` when the line ends in an
+/// append of its output to one file (review fb2 F8: a hand edit's `>>PATH 2>&1`, `>> PATH` or
+/// `>>PATH` moved to the default log, said only by the diff); `None` for any other ending, which
 /// [`unread_log`] tells apart from a line that logs nowhere. Pure.
 fn cron_log_target(line: &str) -> Option<&str> {
-    let words: Vec<&str> = line.split_whitespace().collect();
-    let words = words.strip_suffix(&["2>&1"]).unwrap_or(&words);
-    let path = match words {
-        [.., ">>", path] => *path,
-        [.., last] => last.strip_prefix(">>")?,
-        [] => return None,
-    };
-    Some(path).filter(|p| !p.is_empty() && !p.starts_with(['>', '&']))
+    arena_core::cron::log_target(line)
 }
 
 /// The output redirection of a crontab line whose log [`cron_log_target`] can't read (from its
@@ -599,8 +578,7 @@ fn unread_logs_note(before: &[String], kinds: &[CronKind]) -> Option<String> {
 
 /// A crontab line's `flock` file: the word after `flock` and its `-…` options.
 fn cron_lock_target(line: &str) -> Option<&str> {
-    let mut words = line.split_whitespace().skip_while(|w| *w != "flock").skip(1);
-    words.find(|w| !w.starts_with('-'))
+    arena_core::cron::lock_target(line)
 }
 
 /// The logs the installed lines chose themselves ([`arena_core::cron::LogPlace::Chosen`]), by
@@ -758,102 +736,24 @@ fn tidy_line(t: &CronTidy) -> Option<String> {
     (!parts.is_empty()).then(|| format!("· cron logs now in ~/{}/ ({})", arena_core::cron::DIR, parts.join("; ")))
 }
 
-/// Which arena-managed crontab line a line is. Each has a stable identity, so `cron
-/// install` replaces only the lines its flags name and `cron remove --<kind>` drops only
-/// those — a later `cron install --proxy` no longer wipes an earlier `--pull`,
+/// Which arena-managed crontab line a line is ([`arena_core::cron::Kind`]): each has a stable
+/// identity, so `cron install` replaces only the lines its flags name and `cron remove --<kind>`
+/// drops only those — a later `cron install --proxy` no longer wipes an earlier `--pull`,
 /// `--start-date` or `--snapshot` line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CronKind {
-    /// `pods backup` (git, and with `--pull` the rsync file backup).
-    Backup,
-    /// `proxy apply --yes`, the proxy re-sync.
-    Proxy,
-    /// `snapshot --public --out …`, the dashboard JSON.
-    Snapshot,
-    /// `archive sync --tier snap`, the archive's snapshot push.
-    ArchiveSnap,
-    /// `archive sync --tier big`, the archive's all-files push.
-    ArchiveBig,
-    /// `pods reap run`, the opt-in auto-reaper.
-    Reap,
-    /// `pods test --deep`, the daily health check.
-    Health,
-}
+pub(crate) use arena_core::cron::Kind as CronKind;
 
-impl CronKind {
-    fn label(self) -> &'static str {
-        match self {
-            CronKind::Backup => "backup",
-            CronKind::Proxy => "proxy",
-            CronKind::Snapshot => "snapshot",
-            CronKind::ArchiveSnap => "archive-snap",
-            CronKind::ArchiveBig => "archive-big",
-            CronKind::Reap => "reap",
-            CronKind::Health => "health",
-        }
-    }
-
-    /// The job whose files in the cron folder the line writes (both archive lines: the archive's).
-    fn job(self) -> arena_core::cron::Job {
-        use arena_core::cron::Job;
-        match self {
-            CronKind::Backup => Job::Backup,
-            CronKind::Proxy => Job::Proxy,
-            CronKind::Snapshot => Job::Snapshot,
-            CronKind::ArchiveSnap | CronKind::ArchiveBig => Job::Archive,
-            CronKind::Reap => Job::Reap,
-            CronKind::Health => Job::Health,
-        }
-    }
-
-    /// The kinds named by `cron remove`'s flags, in a fixed order (`--archive` is both of its lines).
-    fn selected(backup: bool, proxy: bool, snapshot: bool, archive: bool) -> Vec<CronKind> {
-        [
-            (backup, CronKind::Backup),
-            (proxy, CronKind::Proxy),
-            (snapshot, CronKind::Snapshot),
-            (archive, CronKind::ArchiveSnap),
-            (archive, CronKind::ArchiveBig),
-        ]
-        .into_iter()
-            .filter_map(|(on, k)| on.then_some(k))
-            .collect()
-    }
-
-    /// The kind of a crontab line, by the arena subcommand it runs — whole words, so the
-    /// lock/log file names (`cron/proxy.lock`, an older `.arena-proxy-cron.lock`) and the
-    /// leading `mkdir -p <dir> &&` never count: `pods backup`, `proxy apply`, `snapshot`. Read
-    /// from the command itself rather than from a tag we add, so the lines every earlier `cron
-    /// install` wrote are recognized too. A line that matches none — or more than one (a
-    /// hand-edited `a && b`) — is `None`: kept as it is by a targeted install/remove, never
-    /// guessed at. So is any comment: a paused (commented-out) backup line isn't a backup, and
-    /// an operator's note that mentions a snapshot isn't the snapshot line — neither is
-    /// replaced or removed by a targeted install/remove.
-    pub(crate) fn of(line: &str) -> Option<CronKind> {
-        if line.trim_start().starts_with('#') {
-            return None;
-        }
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let runs = |a: &str, b: Option<&str>| {
-            words.iter().enumerate().any(|(i, w)| *w == a && b.is_none_or(|b| words.get(i + 1) == Some(&b)))
-        };
-        let found: Vec<CronKind> = [
-            (runs("pods", Some("backup")), CronKind::Backup),
-            (runs("proxy", Some("apply")), CronKind::Proxy),
-            (runs("snapshot", None), CronKind::Snapshot),
-            (runs("archive", Some("sync")) && runs("--tier", Some("snap")), CronKind::ArchiveSnap),
-            (runs("archive", Some("sync")) && runs("--tier", Some("big")), CronKind::ArchiveBig),
-            (runs("reap", Some("run")), CronKind::Reap),
-            (runs("pods", Some("test")) && runs("--deep", None), CronKind::Health),
-        ]
-        .into_iter()
-        .filter_map(|(hit, k)| hit.then_some(k))
-        .collect();
-        match found.as_slice() {
-            [one] => Some(*one),
-            _ => None,
-        }
-    }
+/// The kinds named by `cron remove`'s flags, in a fixed order (`--archive` is both of its lines).
+fn selected_kinds(backup: bool, proxy: bool, snapshot: bool, archive: bool) -> Vec<CronKind> {
+    [
+        (backup, CronKind::Backup),
+        (proxy, CronKind::Proxy),
+        (snapshot, CronKind::Snapshot),
+        (archive, CronKind::ArchiveSnap),
+        (archive, CronKind::ArchiveBig),
+    ]
+    .into_iter()
+    .filter_map(|(on, k)| on.then_some(k))
+    .collect()
 }
 
 /// Whether `cron install` (re)writes the backup line: `--backup`, or any of the backup
@@ -1209,23 +1109,10 @@ pub(crate) fn env_assignment(line: &str, name: &str) -> Option<String> {
     words.iter().take_while(|w| w.contains('=') && !w.starts_with('-')).find_map(|w| w.strip_prefix(&format!("{name}="))).map(String::from)
 }
 
-/// A crontab line's schedule (five fields, or one `@…` macro) and its command's words — after
-/// the `mkdir -p <dir>… &&` arena's lines start with (their folders, recreated), so the inline
-/// env assignments before the command (`ARENA_START_DATE=…`) are read the same from every
-/// version's line. `None`: no schedule, or nothing after it. Pure.
+/// A crontab line's schedule and its command's words, after the `mkdir -p <dir>… &&` arena's
+/// lines start with ([`arena_core::cron::line_parts`]). Pure.
 fn cron_line_parts(line: &str) -> Option<(String, Vec<&str>)> {
-    let words: Vec<&str> = line.split_whitespace().collect();
-    let n = if words.first()?.starts_with('@') { 1 } else { 5 };
-    let command = words.get(n..)?;
-    let command = match command {
-        [] => return None,
-        ["mkdir", "-p", dirs @ ..] => match dirs.iter().position(|w| *w == "&&") {
-            Some(i) if i > 0 => &dirs[i + 1..],
-            _ => command,
-        },
-        _ => command,
-    };
-    Some((words[..n].join(" "), command.to_vec()))
+    arena_core::cron::line_parts(line)
 }
 
 /// When the archive's snap push runs: 7 minutes after each */15 backup tick.

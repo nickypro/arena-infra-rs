@@ -156,11 +156,11 @@ fn proxy(pods: &[Pod]) -> String {
     render_nginx(&forwards)
 }
 
-/// The demo's prepaid accounts, read "live": RunPod and Vast with about a week and three days
-/// left at the fleet's burn. Pure.
+/// The demo's prepaid accounts, read "live": RunPod with about a week left at its pods' burn,
+/// Vast with under two days — low, so the top line has a provider's warning to show. Pure.
 fn balances(pods: &[Pod], now: u64) -> Vec<AccountView> {
     let burn = |provider: &str| pods.iter().filter(|p| p.provider == provider && p.status == "RUNNING").filter_map(|p| p.cost_per_hr).sum::<f64>();
-    let fetched: Vec<Fetched> = [(Account::Runpod, 190.0), (Account::Vast, 80.0)]
+    let fetched: Vec<Fetched> = [(Account::Runpod, 190.0), (Account::Vast, 40.0)]
         .into_iter()
         .map(|(account, hours)| {
             let rate = burn(if account == Account::Runpod { "runpod" } else { "vast" });
@@ -238,6 +238,138 @@ pub(crate) async fn refresh_loop(shared: Arc<Mutex<Shared>>, cfg: Config, n: usi
             _ = nudge.notified() => {}
         }
     }
+}
+
+/// The demo's backups, as the backups screen shows them (`backups.rs`): the cron backing up and
+/// copying every 15 minutes, the archive pushing; most pods saved minutes ago, every sixth on
+/// `main` (not saved to git), one whose pushes time out, one whose copy keeps failing, the
+/// stopped ones quiet since they stopped; a copy run under way on two pods; the all-files volume
+/// near its floor. Made with the status model's own judge from made-up facts — pure.
+pub(crate) fn backups(cfg: &Config, pods: &[arena_core::backups::PodIn], now: u64) -> arena_core::backups::Status {
+    use arena_core::archive::state::{ArchiveHost, BigState, LabelRecord, RunRecord as SyncRun, SnapState};
+    use arena_core::backups::record::{Event, Outcome, Record};
+    use arena_core::backups::{judge, ArchiveIn, Held, Inputs, Job, StoreIn};
+    use std::collections::{BTreeMap, BTreeSet};
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
+    const PID: u32 = 4242;
+    // The last tick whose runs have ended: a quarter-hour at least 400 s ago.
+    let tick = now.saturating_sub(400) - now.saturating_sub(400) % 900;
+    let mut rec = Record::default();
+    let (mut git, mut copy) = (Vec::new(), Vec::new());
+    let mut snap = SnapState::default();
+    let mut big = BigState::default();
+    let (mut d4, mut d5) = (LabelRecord::default(), LabelRecord::default());
+    for (i, p) in pods.iter().enumerate() {
+        let stopped = p.up == Some(false);
+        // A stopped pod's last backups were before it stopped, a day ago.
+        let at = if stopped { tick.saturating_sub(86_400) } else { tick + 40 + i as u64 };
+        let (g, gd) = match i {
+            3 => (Outcome::Failed, "exit 255: ssh: connect to host 10.9.0.4 port 22: Connection timed out".to_string()),
+            _ if i % 6 == 1 => (Outcome::NotSaved, "on main".to_string()),
+            _ if i % 4 == 0 => (Outcome::Pushed, format!("→ autocommit-{prefix}-w3d5-{}", p.name.rsplit('-').next().unwrap_or(""))),
+            _ => (Outcome::NoChanges, format!("on autocommit-{prefix}-w3d5-{}", p.name.rsplit('-').next().unwrap_or(""))),
+        };
+        let bytes = 2_100_000_000 + (i as u64 % 7) * 310_000_000;
+        let (c, cd) = match i {
+            3 => (Outcome::Failed, "[snapshot] ssh: connect to host 10.9.0.4 port 22: Connection timed out".to_string()),
+            8 => (Outcome::Failed, "[big] rsync exit 24: some files vanished before they could be transferred".to_string()),
+            _ => (Outcome::Copied, format!("w3d5: {:.1}G in {} files, {}M new", bytes as f64 / 1e9, 6_600 + i * 13, 4 + i % 30)),
+        };
+        // An hour of history: the same results folded, and a failure's earlier successes.
+        let mut pr = arena_core::backups::record::PodRecord::default();
+        for k in (1..=4u64).rev() {
+            let earlier = at.saturating_sub(k * 900);
+            pr.add(Event::new(earlier, Job::Git, if g == Outcome::Failed && k > 2 { Outcome::NoChanges } else { g }, gd.clone()));
+            let o = if c == Outcome::Failed && k > 3 { Outcome::Copied } else { c };
+            pr.add(Event::new(earlier + 30, Job::Copy, o, cd.clone()).with_bytes((o == Outcome::Copied).then_some(bytes)));
+        }
+        rec.pods.insert(p.name.clone(), pr);
+        if !stopped {
+            git.push((p.name.clone(), Event::new(at, Job::Git, g, gd)));
+            copy.push((p.name.clone(), Event::new(at + 60, Job::Copy, c, cd).with_bytes((c == Outcome::Copied).then_some(bytes))));
+        }
+        d4.pods_ok.insert(p.name.clone());
+        if i != 5 && !stopped {
+            d5.pods_ok.insert(p.name.clone());
+            big.pods_ok_at.insert(p.name.clone(), tick.saturating_sub(1200));
+        }
+    }
+    let (n, ok) = (git.len(), |o: Outcome| git.iter().filter(|(_, e)| e.outcome == o).count());
+    let summary = format!("{} pushed, {} no changes, {} on main/master, {} failed", ok(Outcome::Pushed), ok(Outcome::NoChanges), ok(Outcome::NotSaved), ok(Outcome::Failed));
+    rec.start(Job::Git, PID - 1, n as u32, tick);
+    rec.finish(Job::Git, PID - 1, tick + 95, git, summary);
+    let copied = copy.iter().filter(|(_, e)| e.outcome == Outcome::Copied).count();
+    let summary = format!("{copied} copied, {} failed (w3d5)", copy.len() - copied);
+    rec.start(Job::Copy, PID - 1, n as u32, tick + 95);
+    rec.finish(Job::Copy, PID - 1, tick + 300, copy, summary);
+    // The next tick's copy is under way on two pods (as if it began a minute ago).
+    rec.start(Job::Copy, PID, n as u32, now.saturating_sub(70));
+    let busy: BTreeSet<String> = pods.iter().filter(|p| p.up != Some(false)).skip(10).take(2).map(|p| p.name.clone()).collect();
+    d4.ok_finished = tick.saturating_sub(20 * 3600);
+    d5.last_tried = tick.saturating_sub(1200);
+    snap.labels.insert("w3d4".into(), d4);
+    snap.labels.insert("w3d5".into(), d5);
+    if let Some(p) = pods.get(5) {
+        snap.pods_failing.insert(p.name.clone(), "w3d5: InTheWay: the archive has a directory where the backup now has a link (ARENA_3.0)".into());
+    }
+    let ran = Some(SyncRun { started: tick.saturating_sub(480), finished: tick.saturating_sub(300), ok: true, all_failed: false });
+    snap.last_run = ran;
+    big.last_run = ran;
+    let host = ArchiveHost {
+        version: 1,
+        prefix: prefix.clone(),
+        server_id: 1,
+        ipv4: "203.0.113.20".into(),
+        location: "nbg1".into(),
+        snap_device: "/dev/disk/by-id/scsi-0HC_Volume_1".into(),
+        big_device: "/dev/disk/by-id/scsi-0HC_Volume_2".into(),
+        access_on: true,
+        setup_version: 1,
+        snap_gb: 100,
+        big_gb: 500,
+        host_key_fingerprint: None,
+    };
+    let fs = |dev, mount: &str, free, total| Ok(arena_core::disk::Fs { dev, mount: mount.into(), free, total });
+    let gb = arena_core::disk::GB;
+    let line = |when: &str, cmd: &str, log: &str| format!("{when} mkdir -p /root/.local/state/arena-cron && /usr/local/bin/arena --config /root/config.env {cmd} >> /root/.local/state/arena-cron/{log}.log 2>&1");
+    let crontab = format!(
+        "{}
+{}
+{}
+{}
+{}
+",
+        arena_core::cron::BEGIN,
+        line("*/15 * * * *", "pods backup --yes", "backup"),
+        line("7,22,37,52 * * * *", "archive sync --tier snap", "archive"),
+        line("40 * * * *", "archive sync --tier big", "archive"),
+        arena_core::cron::END
+    );
+    let inputs = Inputs {
+        now,
+        offset: 0,
+        prefix: prefix.clone(),
+        config_path: Some("/root/config.env".into()),
+        cron_config: Some(("/root/config.env".into(), true)),
+        crontab: Ok(crontab),
+        record: Ok(Some(rec)),
+        record_path: format!("/root/.local/state/arena/{prefix}/backups.json"),
+        pods: pods.to_vec(),
+        backup_dir: "/mnt/backup".into(),
+        copied: Ok(BTreeMap::new()),
+        labels: Ok(pods.iter().map(|p| (p.name.clone(), "w3d5".to_string())).collect()),
+        archive: ArchiveIn::Up { host: Box::new(host), snap: Ok(snap), big: Ok(big) },
+        held: Held { cron: Some(Ok(true)), pods: Ok(busy), archive: BTreeMap::new(), alive: BTreeSet::from([PID]) },
+        logs: BTreeMap::new(),
+        storage: vec![
+            StoreIn { what: "snapshots".into(), path: "/mnt/backup".into(), fs: fs(1, "/mnt/backup", 141 * gb, 2000 * gb) },
+            StoreIn { what: "all files".into(), path: "/mnt/big/big".into(), fs: fs(2, "/mnt/big", 8 * gb, 500 * gb) },
+        ],
+        floor: Ok(5 * gb),
+        skips: Ok(Vec::new()),
+        repo: Some("example/ARENA_3.0".into()),
+    };
+    judge(&inputs)
 }
 
 /// The demo's provider: lists nothing (the refresh above makes the rows), refuses everything.
@@ -319,9 +451,10 @@ mod tests {
         assert_eq!(a[0].name, "devtest-demo01");
     }
 
-    /// Published, the demo has something in every column and the summary: a B300 MIG slice (its
+    /// Published, the demo has something in every column and the top line: a B300 MIG slice (its
     /// card as nvidia-smi names it, memory unread), deep checks (one running), live/stale/no
-    /// forwards, balances and OpenRouter keys — one at its cap.
+    /// forwards, balances — Vast's low — and OpenRouter keys — one at its cap; a group per
+    /// provider on the top line, two of them with a warning.
     #[test]
     fn the_published_demo_fills_every_column() {
         let shared = Mutex::new(Shared::default());
@@ -340,8 +473,12 @@ mod tests {
             assert!(s.snap.pods.iter().any(|p| p.health.as_ref().is_some_and(|h| h.status == status)), "{status:?}");
         }
         assert_eq!(s.deep.running(), 1);
-        assert_eq!(s.balance.len(), 2);
+        assert_eq!(s.balance.iter().map(|v| v.level).collect::<Vec<_>>(), [balance::Level::Ok, balance::Level::Low]);
         assert_eq!(s.ai_cohort.as_ref().map(|c| c.capped.len()), Some(1));
+        let top = crate::state::top_parts(&s.summary, &s.pods, &s.snap.partial, &s.balance, s.ai_cohort.as_ref(), None, 400).text();
+        for group in ["unreachable │ 51 RunPod $", "│ ⚠ 6 Vast $", "│ 3 Hetzner €", "│ ⚠ OpenRouter key at cap: devtest-demo05 (a → raise cap) · $"] {
+            assert!(top.contains(group), "{group:?} in {top}");
+        }
         assert_eq!(s.status.short, "demo");
     }
 }

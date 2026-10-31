@@ -19,7 +19,7 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
-## 2026-10-30 · arena 2.4: what works where — refused up front, greyed out in the dashboard
+## 2026-10-31 · arena 2.4: what works where — refused up front, greyed out in the dashboard
 - One table says which commands and create flags work on which provider (RunPod, RunPod v1, Vast,
   Hetzner, Shadeform). Every command checks it for each selected pod before it asks anything, the
   dashboard reads it, and so does the new "What works where" matrix in docs/REFERENCE.md and
@@ -47,6 +47,42 @@ earlier).
   sends `--volume` to Vast and `--disk` to Shadeform, and the new `arena` refuses those flags.
 - Check scripts and cron lines that pass one of the flags above to a provider that ignores it.
   They now fail before anything is created; drop the flag.
+
+## 2026-10-30 · The backups screen says when it can't read a copy; "backing up", not "backuping"
+- `arena backups` and the dashboard's backups screen: a snapshot folder entry whose type can't be
+  read now makes the home-copy cell unknown (with the path and the error), instead of quietly
+  leaving that pod out.
+- The dashboard's busy box while an action runs reads `backing up alpha…`, `stopping alpha…`,
+  `terminating alpha…` (it added `ing` to the action's name: `backuping`, `stoping`).
+
+## 2026-10-30 · Every backup in one place: `arena backups` and the dashboard's `b`
+- `arena backups` shows which backups happen and when, and how they're doing. For the git
+  backup, the home copy and the archive's two pushes: whether each is set up (if not, the command
+  that sets it up), how often, its last run and result, when it's next due, and whether it's
+  running now. Then every cohort pod's last git save, home copy and archive copy, failing pods
+  first, then the ones longest since a good backup. Last, where the copies live and how much room
+  is left. `--json` for scripts. It reads this box only, never a pod.
+- In the dashboard, `b` (or a click on the `💾` header) opens the same as a screen. Enter on a pod
+  shows its history and offers "back up now" and "copy home now", each with its confirm.
+- `pods backup`, `pods pull` and the dashboard's backup now record their results in
+  `backups.json` in the state dir. A cron still on an older arena shows "none recorded yet" until
+  it's updated.
+- Anything that can't be read shows as `?` with the reason, never as "ok" or "never".
+- New page section: [What gets backed up, where and when](docs/BACKUPS.md#what-gets-backed-up-where-and-when).
+## 2026-10-30 · The dashboard's top line, grouped by provider
+- The top line reads by provider now: `51 pods, 48 GPUs 37% │ 42 RunPod $520.30 ≈4.6d · $4.62/h │ ⚠
+  Vast $40.00 ≈40h │ 9 Hetzner €1.23/h │ OpenRouter $12.40 today · $422.09 left`. Each provider with
+  pods has its pod count, its balance and runway, and what its pods burn (Hetzner in €); OpenRouter
+  has the cohort's spend today and the credit left.
+- A provider's name is green while all is well. `⚠` and yellow mark a low balance; red marks a
+  critical one, or a provider that failed to list (`⚠ Vast: list failed`). OpenRouter's warnings
+  (credit under the keys' caps, a key at its cap, credit gone) work the same way. An account with no
+  pods and nothing wrong isn't on the line.
+- The line fits your terminal: on a narrow one the least needed words go first (GPU util, then the
+  GPU count, a runway that's fine, …) and a warning never does. With more warnings than fit, the red
+  ones come first and the rest are counted (`+2 more`). A click on it opens the info panel, which
+  still has every detail.
+- The footer's refresh age has a `↻` in front, cyan while a refresh runs.
 
 ## 2026-10-30 · Raise an AI key's cap, or pause it, from the CLI and the dashboard
 - `arena keys limit apple +5` raises a machine's OpenRouter cap by $5 where the key is: same

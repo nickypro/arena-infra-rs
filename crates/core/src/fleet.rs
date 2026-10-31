@@ -286,10 +286,11 @@ impl FleetCost {
     }
 }
 
-/// Sum the hourly cost of the billing pods (see [`FleetCost`]).
-pub fn fleet_cost(pods: &[Pod]) -> FleetCost {
+/// Sum the hourly cost of the billing pods (see [`FleetCost`]): the whole fleet's, or one
+/// provider's share of it (the TUI's top line, by provider) — one pricing path for both.
+pub fn fleet_cost<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> FleetCost {
     let mut c = FleetCost::default();
-    for p in pods.iter().filter(|p| bills_hourly(&p.provider, &p.status)) {
+    for p in pods.into_iter().filter(|p| bills_hourly(&p.provider, &p.status)) {
         c.billing += 1;
         match p.cost_per_hr {
             Some(v) if currency_symbol(&p.provider) == "€" => {

@@ -12,6 +12,7 @@ pub mod ask;
 pub mod apikeys;
 pub mod attest;
 pub mod backup;
+pub mod backups;
 pub mod balance;
 pub(crate) mod base64;
 pub mod capability;
