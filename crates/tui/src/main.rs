@@ -2861,20 +2861,14 @@ async fn run_setup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
         Ok(s) => s,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
-    // A bare VM's steps scp the script from this staged copy, removed once the steps are done.
-    let staged = arena_core::setup::is_bare_vm(&pod.provider);
-    if staged {
-        if let Err(e) = std::fs::write(&script, arena_core::setup::HETZNER_SETUP) {
-            return format!("✗ {}: writing the VM setup script to {}: {e}", pod.name, script.display());
-        }
-    }
+    // A bare VM's steps scp the script from this staged copy, held until the steps are done.
+    let _staged = match arena_core::setup::is_bare_vm(&pod.provider).then(|| StagedScript::write(&script)).transpose() {
+        Ok(staged) => staged,
+        Err(e) => return format!("✗ {}: staging the VM setup script at {}: {e}", pod.name, script.display()),
+    };
     // No boot-race retries: the operator presses Setup on a pod that is already up.
     let no_wait = BootRetry { window: Duration::ZERO, every: Duration::ZERO };
-    let outcome = provision(remote, &target, &steps, no_wait).await;
-    if staged {
-        let _ = std::fs::remove_file(&script);
-    }
-    match outcome {
+    match provision(remote, &target, &steps, no_wait).await {
         ProvisionOutcome::Done { warnings, .. } if warnings.is_empty() => format!("✓ set up {}", pod.name),
         ProvisionOutcome::Done { warnings, .. } => format!("✓ set up {} (warning: {})", pod.name, warnings.join("; ")),
         failed => format!("✗ setup {}: {}", pod.name, failed.describe()),
@@ -2899,6 +2893,30 @@ fn setup_steps(cfg: &Config, pod: &Pod, script: &str) -> arena_core::Result<Vec<
 fn vm_script_path(pod: &Pod) -> std::path::PathBuf {
     let name: String = pod.name.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')).collect();
     std::env::temp_dir().join(format!("arena-tui-vm-setup-{}-{name}.sh", std::process::id()))
+}
+
+/// The bare-VM script staged for one setup: a new file only this user can read, made with
+/// `create_new` — so never written through a link, or over a file someone else put at that
+/// predictable path (a second setup of the same pod at once is refused the same way) — and
+/// removed when dropped, however the setup ends. A file that was already there is left alone.
+struct StagedScript(std::path::PathBuf);
+
+impl StagedScript {
+    fn write(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+        // Ours from here on: removed on any return, the write's failure included.
+        let staged = StagedScript(path.to_path_buf());
+        file.write_all(arena_core::setup::HETZNER_SETUP.as_bytes())?;
+        Ok(staged)
+    }
+}
+
+impl Drop for StagedScript {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// The exact command(s) a safe (non-typed) action will run, for the confirm modal's `v` (it
@@ -6691,6 +6709,18 @@ deep_check_end=1
         let preview = build_preview(&cfg, Action::Setup, &hetzner).unwrap();
         assert!(preview.contains("/root/hetzner_setup.sh") && preview.contains("# hostname (best-effort)"), "{preview}");
         assert!(!script.exists(), "a preview stages nothing");
+        // A file (or a link) already at that path: refused before anything runs, and left alone.
+        let elsewhere = std::env::temp_dir().join(format!("arena-tui-vm-setup-target-{}", std::process::id()));
+        std::fs::write(&elsewhere, "keep me").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &script).unwrap();
+        let fake = FakeRemote::new();
+        let line = run_setup(&fake, &cfg, &hetzner).await;
+        assert!(line.starts_with("✗ devtest-hzbox: staging the VM setup script at ") && line.contains("exists"), "{line}");
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "keep me");
+        assert!(std::fs::symlink_metadata(&script).is_ok_and(|m| m.file_type().is_symlink()), "the link is left as it was");
+        std::fs::remove_file(&script).unwrap();
+        std::fs::remove_file(&elsewhere).unwrap();
 
         // A RunPod pod: the image-based steps, as before, and nothing staged.
         let runpod = pod("alpha", "runpod", "rp1", 1, Some(22001));
