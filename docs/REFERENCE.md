@@ -2656,29 +2656,35 @@ stops a machine at a figure, and participants see none of it. In order (rehearse
 1. **Before the first machine.** `arena config check`: `OPENROUTER_KEY_LIMIT` is the cap every new
    key gets (a handover's too). `arena cron show`: the backup line copies homes (no `--no-pull`) —
    project work outside the course repo is only in the home copy.
-2. **Keys, then machines.** `arena keys gen apple bloom` mints each name's OpenRouter key (names
-   with no pod yet are fine); then `arena pods up apple --owner alice` (one owner per run;
-   `--provider hetzner` for a VM). `up` copies a name's key on as it sets the machine up, but
-   never mints one: a name without a key gets none until `arena keys gen <name> --copy`. A
-   machine that already exists: `arena spend assign <machine> <owner>` (it says when the machine's
-   key was someone else's; `arena keys rotate <machine> --copy` gives a fresh one).
-3. **Who's on what:** `arena spend --by machine` — `pods list` and the dashboard don't show owners.
+2. **Machines, with their keys.** `arena pods up apple --owner alice` (one owner per run;
+   `--provider hetzner` for a VM). With `OPENROUTER_PROVISIONING_KEY` set, `up` mints a key for a
+   name that has none (capped at `OPENROUTER_KEY_LIMIT`, alice's) and copies it on as it sets the
+   machine up; a name that already has a key keeps it. (`arena keys gen apple bloom` ahead still
+   works, names with no pod yet included.) A dead key in the keys CSV (deleted elsewhere) isn't
+   copied: the copy says so and names the `keys gen` to run. A machine that already exists:
+   `arena spend assign <machine> <owner>` (it says when the machine's key was someone else's;
+   `arena keys rotate <machine> --copy` gives a fresh one).
+3. **Who's on what:** `arena pods list` and the dashboard have an OWNER column (the detail view an
+   `owner:` line); `arena spend --by machine` has each instance's cost.
 4. **During the week:** `arena keys limit apple +5` (the dashboard: `a a`) raises a cap in place;
    `arena keys pause apple` / `resume`. `arena spend` any time.
 5. **A machine for someone else:** `arena pods terminate apple --revoke-key`, then `arena pods up
    apple --owner bob`. The old instance keeps alice's hours and AI spend and bob's starts at 0; a
-   key still alice's is rotated first (`--keep-key` keeps it). `spend assign` on a running machine
-   moves its whole instance, earlier hours included: for a new person, make a new instance.
+   key still alice's is rotated first (`--keep-key` keeps it). `spend assign apple bob` on a
+   machine that has run up alice's spend would move its whole history: it refuses, says what would
+   move and points here (`--dry-run` shows it first; `--force` only for an owner that was wrong
+   from the start).
 6. **A rename** (`arena pods rename apple cedar`) moves the machine to cedar's proxy port: its
    person connects as `<prefix>-cedar` from then on. Its spend, key and keys-CSV row follow.
 7. **Backups.** A machine's git backup needs its day branch (`arena pods init-branches`, or the
    morning's `set-branch main --all --init-branches`); the home copy runs on any branch. `arena
-   backups`, or `b` in the dashboard (Enter on a machine: back up now, copy home now).
+   backups`, or `b` in the dashboard (Enter on a machine: back up now, copy home now): the live
+   machines, and one line for the names with no machine.
 8. **End of the week.** There's no `--final`: `arena pods backup <names>` once more (git, then the
    home copy); `arena spend --since <first day> --csv > spend.csv` (`--by machine --csv` per
-   instance, `--json` the whole report); then `arena pods terminate <name> --revoke-key` per
-   machine — one at a time, since `--all` is every pod on the account — and `arena teardown
-   --check`.
+   instance, `--json` the whole report); then `arena pods terminate apple bloom … --revoke-key`
+   (one confirm: type their count, or `ALL` past five; never `--all`, which is every pod on the
+   account) and `arena teardown --check`.
 
 ### Running a second fleet from the same control box
 

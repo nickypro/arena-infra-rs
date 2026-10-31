@@ -90,6 +90,7 @@ pub(crate) enum KeysCmd {
 /// Drop `host`'s row from the keys CSV in `dir` (its key was deleted, none replaced it):
 /// whether a row went (`Ok(false)`: no CSV, or no row for it).
 pub(crate) fn drop_key_row(dir: &std::path::Path, host: &str) -> std::io::Result<bool> {
+    let _held = lock_keys_dir(dir)?;
     let csv = dir.join(OPENROUTER_KEYS_LINK);
     let text = match std::fs::read_to_string(&csv) {
         Ok(t) => t,
@@ -622,6 +623,7 @@ async fn copy_new_keys(remote: Arc<dyn Remote>, cfg: &Config, dir: &std::path::P
 /// the CSV is self-documenting about which cohort the keys belong to.
 pub(crate) fn write_openrouter_key(dir: &std::path::Path, host: &str, secret: &str, prefix: &str) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let _held = lock_keys_dir(dir).with_context(|| format!("locking {}", dir.display()))?;
     let target = ensure_cohort_keys_file(dir, prefix)?;
     let mut existing = std::fs::read_to_string(&target).unwrap_or_default();
     if existing.trim().is_empty() {
@@ -630,6 +632,19 @@ pub(crate) fn write_openrouter_key(dir: &std::path::Path, host: &str, secret: &s
     let updated = arena_core::apikeys::upsert_csv(&existing, host, secret);
     write_secret_file(&target, &updated).with_context(|| format!("writing {}", target.display()))?;
     Ok(())
+}
+
+/// How long a change to the keys CSV waits for another arena's: each holds it for one read and
+/// one atomic write.
+const KEYS_CSV_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// An exclusive lock on the keys folder `dir` for one read-change-write of its CSV: two `pods up`
+/// minting at once (an organiser's parallel terminals) each read the CSV, added their row and
+/// wrote it back — the second write dropped the first's row, and that key's secret (OpenRouter
+/// shows it once) with it. `Ok(None)` where the folder can't be locked (the atomic write alone,
+/// as before); `Err` when another arena held it past [`KEYS_CSV_LOCK_WAIT`].
+fn lock_keys_dir(dir: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+    arena_core::snapshot::lock_dir_within(dir, KEYS_CSV_LOCK_WAIT)
 }
 
 /// Write a file of secrets (the OpenRouter keys CSV) atomically, readable by its owner
@@ -1027,6 +1042,27 @@ pub(crate) async fn rotate_key(
 
 #[cfg(test)]
 mod tests {
+    /// Keys minted at once (several `pods up` in parallel terminals) all land in the CSV: each
+    /// read-change-write holds the keys folder, so none drops another's row (and its secret).
+    #[test]
+    fn keys_written_at_once_all_land() {
+        let dir = std::env::temp_dir().join(format!("arena-keys-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hosts: Vec<String> = (0..12).map(|i| format!("devtest-m{i}")).collect();
+        std::thread::scope(|s| {
+            for h in &hosts {
+                let dir = &dir;
+                s.spawn(move || super::write_openrouter_key(dir, h, &format!("sk-or-v1-{h}"), "devtest").unwrap());
+            }
+        });
+        let text = std::fs::read_to_string(dir.join("devtest_openrouter_keys.csv")).unwrap();
+        for h in &hosts {
+            assert!(text.contains(&format!("{h},sk-or-v1-{h}\n")), "{h} lost:\n{text}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn minted_keys_are_written_owner_only() {
         use std::os::unix::fs::PermissionsExt;

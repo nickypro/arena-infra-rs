@@ -36,6 +36,9 @@ earlier).
   against OpenRouter's listing: a key deleted elsewhere (or rotated from another keys folder) is
   left out, with a ⚠ line naming `arena keys gen <name> --copy` (or `keys rotate`). When the
   listing can't be read, the CSV is copied as before, and the copy says it's unchecked.
+- Keys minted at once (several `pods up` in parallel terminals, `keys gen` beside an `up`) all
+  land in the keys CSV: each write holds the keys folder. The second write used to drop the
+  first's row, and that key's secret with it.
 - `pods terminate apple bloom ember --revoke-key` terminates several machines in one run. Each
   name is matched exactly, as one is (a typo stops them all, before anything); one confirm lists
   them and wants their count typed back (`ALL` past five, or for every listed pod), as the
