@@ -167,7 +167,9 @@ pub(crate) fn choose(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, pod: Pod, shown: 
     let mut note = format!("ai key now: {}", usage.detail());
     if action == Action::KeyRotate {
         let cap = ui.cfg.get_parsed::<f64>("OPENROUTER_KEY_LIMIT").unwrap_or(5.0);
-        let at = std::env::current_dir().map(|d| d.join("keys").display().to_string()).unwrap_or_else(|_| "./keys".into());
+        // Where `arena keys rotate` (run with this config) keeps it: the fleet's keys/.
+        let keys = ui.cfg.fleet_file(arena_core::config::KEYS_DIR).path;
+        let at = std::path::absolute(&keys).unwrap_or(keys).display().to_string();
         note.push_str(&format!("\nthe new key: cap {} (OPENROUTER_KEY_LIMIT), saved in {at}", arena_core::openrouter::exact_money(cap)));
     }
     let mut c = Confirm::new(action, shown, pod.id, preview);

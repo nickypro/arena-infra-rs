@@ -148,9 +148,10 @@ pub fn course_day(cfg: &Config, now: u64) -> Option<(u32, u32)> {
     Some(crate::schedule::week_day(start, crate::schedule::days_from_unix(now)))
 }
 
-/// `LOCAL_BACKUP_DIR`, else `./backup` — where `pods pull` and `pods backup` copy pods to.
-fn backup_dir(cfg: &Config) -> &str {
-    cfg.get("LOCAL_BACKUP_DIR").map(str::trim).filter(|s| !s.is_empty()).unwrap_or("./backup")
+/// `LOCAL_BACKUP_DIR`, else the fleet's `backup/` — where `pods pull` and `pods backup` copy
+/// pods to ([`Config::local_backup_dir`]).
+fn backup_dir(cfg: &Config) -> String {
+    cfg.local_backup_dir().0
 }
 
 /// The local file backups of `pod` (`pods pull`'s layout under `LOCAL_BACKUP_DIR`, else
@@ -158,7 +159,7 @@ fn backup_dir(cfg: &Config) -> &str {
 /// Directory listings only — no file is read.
 fn backups_line(cfg: &Config, pod: &str) -> String {
     let dir = backup_dir(cfg);
-    let base = Path::new(dir);
+    let base = Path::new(&dir);
     if !base.is_dir() {
         // Not the path itself: where this machine keeps things is none of the prompt's business.
         return "none found (LOCAL_BACKUP_DIR isn't a directory on this machine)".to_string();
@@ -167,7 +168,7 @@ fn backups_line(cfg: &Config, pod: &str) -> String {
         // There, but not readable here: unknown, never "no snapshot".
         return format!("{} (LOCAL_BACKUP_DIR can't be read on this machine)", bundle::UNKNOWN);
     }
-    let big = crate::pull::big_root(dir, cfg.get("LOCAL_BACKUP_BIG_DIR"));
+    let big = crate::pull::big_root(&dir, cfg.get("LOCAL_BACKUP_BIG_DIR"));
     let labels = crate::restore::all_labels(base, Path::new(&big), pod);
     let dated: Vec<&String> = labels.iter().filter(|l| crate::restore::parse_label(l).is_some()).collect();
     let snaps = match dated.as_slice() {
@@ -211,7 +212,7 @@ fn busy_copy_line(cfg: &Config, copies: Option<&BusyCopies>, pod: &str, now: u64
         "conflicts" => "a `git stash pop`'s conflicts".to_string(),
         _ => "an operation in progress".to_string(),
     };
-    let there = if crate::resolve::copy_still_there(c, backup_dir(cfg)) {
+    let there = if crate::resolve::copy_still_there(c, &backup_dir(cfg)) {
         "still on this machine"
     } else {
         "no longer on this machine (or LOCAL_BACKUP_DIR changed since)"

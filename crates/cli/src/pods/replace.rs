@@ -13,7 +13,7 @@ use arena_core::ssh::SshTarget;
 use arena_core::{Config, PodSpec};
 
 use crate::cli::PlaceFlags;
-use crate::keys::{handle_copy_keys, KeySources, KEYS_DIR};
+use crate::keys::{handle_copy_keys, keys_dir, KeySources};
 use crate::pods::adopt::{self, Source};
 use crate::pods::capable::CreateFlags;
 use crate::pods::create::{apply_spec_overrides, check_create_body, create_extra, sizing_flags, SpecOverrides};
@@ -563,13 +563,14 @@ pub(crate) async fn handle_replace(
     let tracking = crate::spend::SpendCtx::from_config(cfg);
     let owner = crate::spend::Tracked::new(owner.as_ref(), &tracking, arena_core::spend::OwnerRule::Inherit);
     let spares = adopt::spares_for(&owner, cfg);
+    let keys = keys_dir(cfg);
     let job = ReplaceJob {
         setup_timeouts,
         ov,
         place,
         opts,
         interrupt,
-        keys_dir: KEYS_DIR,
+        keys_dir: &keys,
         balance: Some(bal),
         source,
         spares: spares.as_deref(),
@@ -608,7 +609,7 @@ pub(crate) struct ReplaceJob<'a> {
     pub place: &'a PlaceFlags,
     pub opts: ReplaceOpts,
     pub interrupt: &'a Interrupt,
-    /// Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    /// Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
     pub keys_dir: &'a str,
     /// Where the new pod's price is remembered for the balance ([`create_replacement`]);
     /// `None`: not remembered.

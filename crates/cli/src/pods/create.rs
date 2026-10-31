@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use arena_core::provider::{ContainerReset, Provider};
 use arena_core::{Config, PodSpec};
 
-use crate::keys::{openrouter_client, KEYS_DIR};
+use crate::keys::{keys_dir, openrouter_client};
 use crate::pods::placement::{created_line, single_option_plan};
 use crate::{image, reap, spend, Interrupt};
 
@@ -128,7 +128,7 @@ pub(crate) fn owner_plan(tracking: &spend::SpendCtx, owner: &spend::OwnerArgs, n
 pub(crate) async fn hand_keys_over(tracking: &spend::SpendCtx, cfg: &Config, owner: &spend::OwnerArgs, handing: &[spend::Handover]) -> Result<bool> {
     let Some(o) = owner.owner.as_deref().filter(|_| !handing.is_empty()) else { return Ok(false) };
     let api = openrouter_client(cfg);
-    let done = spend::hand_over(tracking, cfg, api.as_ref().map(|a| a as &dyn arena_core::openrouter::KeyApi), std::path::Path::new(KEYS_DIR), handing, o).await;
+    let done = spend::hand_over(tracking, cfg, api.as_ref().map(|a| a as &dyn arena_core::openrouter::KeyApi), std::path::Path::new(&keys_dir(cfg)), handing, o).await;
     for l in &done.lines {
         if l.starts_with('✗') {
             eprintln!("{l}");
