@@ -190,11 +190,20 @@ pub struct GateCtx<'a> {
 /// The capability table's answer ([`Op::Reap`]), so the docs' matrix and every refusal say what
 /// the reaper does.
 pub fn provider_supported(pod: &Pod, runpod_v2: bool) -> bool {
-    let backend = match Backend::named(&pod.provider) {
-        Some(Backend::Runpod) if !runpod_v2 => Some(Backend::RunpodV1),
-        b => b,
+    provider_refusal(pod, runpod_v2).is_none()
+}
+
+/// Why the reaper never acts on `pod`'s provider, and what instead — the capability table's
+/// sentence for [`Op::Reap`] (a provider the table doesn't know: [`capability::UNKNOWN_BACKEND`]'s);
+/// `None`: it may. What `reap set` and `up --expire-in` refuse with, so no refusal keeps its own
+/// list of the providers the reaper acts on.
+pub fn provider_refusal(pod: &Pod, runpod_v2: bool) -> Option<String> {
+    let support = match Backend::named(&pod.provider) {
+        Some(Backend::Runpod) if !runpod_v2 => capability::support(Backend::RunpodV1, Op::Reap),
+        Some(b) => capability::support(b, Op::Reap),
+        None => capability::UNKNOWN_BACKEND,
     };
-    backend.is_some_and(|b| capability::support(b, Op::Reap).works())
+    support.refusal()
 }
 
 /// Why a policy on `pod` can't act (RR2), for the ENDS column: a provider the reaper doesn't

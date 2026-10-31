@@ -451,29 +451,15 @@ pub(crate) fn resolve_create_policy(
 /// `up`/`create --expire-in/--expire-at/--idle-after` on a provider the reaper never acts on
 /// (RR2): the refusal, before anything is created — the same rule (and words) as `reap set`'s.
 /// `provider` = where the pods would be created.
+/// Why not: the capability table's sentence ([`judge::provider_refusal`]).
 pub(crate) fn create_flags_refusal(cfg: &Config, provider: &str) -> Option<String> {
     let probe = Pod { provider: provider.to_string(), ..Default::default() };
-    (!judge::provider_supported(&probe, runpod_v2(cfg))).then(|| {
+    judge::provider_refusal(&probe, runpod_v2(cfg)).map(|why| {
         format!(
-            "refusing --expire-in/--expire-at/--idle-after: pods on {} are never reaped — the reaper only acts on RunPod \
-             ({ONLY_ON}) and Hetzner pods{}; nothing was created",
+            "refusing --expire-in/--expire-at/--idle-after: pods on {} are never reaped — {why}; nothing was created",
             if provider == "runpod" { "RunPod REST v1" } else { provider },
-            v1_remedy(provider)
         )
     })
-}
-
-/// The RunPod the reaper acts on, as its refusals word it (a RunPod pod's refusal then says
-/// v2 is the default — [`v1_remedy`]).
-const ONLY_ON: &str = "REST v2";
-
-/// What a refusal adds for a RunPod pod: it is on v1 only because the config says so.
-fn v1_remedy(provider: &str) -> String {
-    if provider == "runpod" {
-        format!(" — {}", arena_core::provider::RUNPOD_V1_REMEDY)
-    } else {
-        String::new()
-    }
 }
 
 /// Record `policy` for a pod the moment its create returned (`up`/`create`, `--check`
@@ -521,13 +507,8 @@ fn never_reaped(pod: &Pod, all: &[Pod], naming: &Naming, runpod_v2: bool) -> Opt
     if all.iter().any(|p| twins.contains(&p.name)) {
         return Some(format!("{} has a -old/-new twin listed (a replace/migrate in progress)", pod.name));
     }
-    if !judge::provider_supported(pod, runpod_v2) {
-        return Some(format!(
-            "{} is on {} — the reaper only acts on RunPod ({ONLY_ON}) and Hetzner pods{}",
-            pod.name,
-            if pod.provider == "runpod" { "RunPod REST v1" } else { &pod.provider },
-            v1_remedy(&pod.provider)
-        ));
+    if let Some(why) = judge::provider_refusal(pod, runpod_v2) {
+        return Some(format!("{} is on {} — {why}", pod.name, if pod.provider == "runpod" { "RunPod REST v1" } else { &pod.provider }));
     }
     None
 }

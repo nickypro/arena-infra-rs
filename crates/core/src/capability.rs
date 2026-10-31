@@ -310,13 +310,15 @@ pub const NOTHING_INSTEAD: &str = "nothing to use instead";
 
 /// The way off a backend for an operation it lacks: a new pod by the same name, on the same
 /// provider — `up` creates on `--provider`'s (else the configured one), so the command names it
-/// (review: a bare `pods up` would have made a Hetzner VM's replacement a RunPod pod).
+/// (review: a bare `pods up` would have made a Hetzner VM's replacement a RunPod pod) — with
+/// `--volume 0` where its create takes no volume: a configured VOLUME_GB above 0 (a RunPod
+/// fleet's) mustn't apply, and Shadeform's create refuses one — after the terminate (review r2).
 const REMAKE_VAST: &str = "back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then \
-     `arena --provider vast pods up <name>` (its --gpu) and `arena pods restore <name>`";
+     `arena --provider vast pods up <name> --volume 0` (its --gpu) and `arena pods restore <name>`";
 const REMAKE_HETZNER: &str = "back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then \
-     `arena --provider hetzner pods up <name>` (its --server-type) and `arena pods restore <name>`";
+     `arena --provider hetzner pods up <name> --volume 0` (its --server-type) and `arena pods restore <name>`";
 const REMAKE_SHADEFORM: &str = "back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then \
-     `arena --provider shadeform pods up <name>` (its --gpu) and `arena pods restore <name>`";
+     `arena --provider shadeform pods up <name> --volume 0` (its --gpu) and `arena pods restore <name>`";
 
 const SHADEFORM_NO_STOP: &str = "Shadeform has no stop: an instance bills until it's deleted, idle or not";
 
@@ -786,16 +788,26 @@ mod tests {
                 // A new pod in the alternative goes on this backend's provider: `up` creates on
                 // `--provider`'s, else the configured one (review: a Hetzner VM's "remake" would
                 // have come back a RunPod pod).
+                // And with `--volume 0` exactly where the backend takes no volume (review r2: a
+                // configured VOLUME_GB would otherwise apply — Shadeform's create refuses one, after
+                // the pod was terminated); where it does, the volume is the operator's to give.
                 if instead.contains("pods up") {
                     assert!(
                         instead.contains(&format!("`arena --provider {} pods up", b.provider())),
                         "{b:?} {op:?}: instead creates without --provider {}: {instead}",
                         b.provider()
                     );
+                    assert_eq!(
+                        instead.contains("pods up <name> --volume 0`"),
+                        !support(b, Op::Volume).works(),
+                        "{b:?} {op:?}: `--volume 0` where (only where) {b:?} takes no volume: {instead}"
+                    );
                 }
                 // A flag in the alternative is for a create on this backend (not another
                 // provider's: `--provider hetzner` named as the way to size by server type).
+                // `--volume 0` is "no volume", which every backend takes.
                 if !instead.contains("pass --provider") {
+                    let instead = instead.replace("--volume 0", "");
                     for (flag, needs) in flags {
                         if instead.contains(flag) {
                             assert!(support(b, needs).works(), "{b:?} {op:?}: instead names {flag}, which {b:?} ignores: {instead}");

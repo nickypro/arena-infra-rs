@@ -377,7 +377,8 @@ async fn reimage_reimages_exactly_the_selected_pods() {
         let f = fleet();
         let e = handle_pods(pods_cmd(argv), &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap_err().to_string();
         assert!(e.starts_with("refusing to reimage anything — 1 of the 2 pod(s) can't be:\n  arena8-vm (hetzner): arena can't reimage a Hetzner VM"), "{argv:?}: {e}");
-        assert!(e.contains("`arena pods up <name>`") && e.ends_with("leave these out: --exclude arena8-vm)"), "{argv:?}: {e}");
+        // The way off it makes the new VM on Hetzner, not on the configured provider (review r1).
+        assert!(e.contains("`arena --provider hetzner pods up <name> --volume 0`") && e.ends_with("leave these out: --exclude arena8-vm)"), "{argv:?}: {e}");
         assert!(f.calls().is_empty(), "{argv:?}");
     }
     let _ = std::fs::remove_dir_all(&dir);

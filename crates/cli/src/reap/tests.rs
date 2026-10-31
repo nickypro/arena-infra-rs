@@ -2402,21 +2402,25 @@ async fn rr_locks_make_only_their_own_folder() {
 }
 
 /// RR2: `up/create --expire-*/--idle-after` refuse a provider the reaper never acts on — before
-/// anything is created — with `reap set`'s words; RunPod v2 (the default) and Hetzner are
-/// fine. RunPod's refusal says how to leave v1; Vast's has nothing to say about RunPod's API.
+/// anything is created — with `reap set`'s words, the capability table's sentence; RunPod v2
+/// (the default) and Hetzner are fine. RunPod's refusal says how to leave v1; Vast's has nothing
+/// to say about RunPod's API.
 #[test]
 fn rr_create_flags_refuse_never_reaped_providers() {
+    use arena_core::capability::{support, Backend, Op};
     use arena_core::provider::RUNPOD_V1_REMEDY;
     let v1 = Config::parse("RUNPOD_API=v1");
     let v2 = Config::parse("RUNPOD_API=v2");
+    let table_v1 = support(Backend::RunpodV1, Op::Reap).refusal().unwrap();
     let r = super::create_flags_refusal(&v1, "runpod").unwrap();
     assert!(
-        r.contains("RunPod REST v1") && r.contains("only acts on RunPod (REST v2) and Hetzner") && r.contains(RUNPOD_V1_REMEDY)
-            && r.contains("nothing was created"),
+        r.contains("RunPod REST v1") && r.contains(&table_v1) && r.contains(RUNPOD_V1_REMEDY) && r.contains("nothing was created"),
         "{r}"
     );
     let r = super::create_flags_refusal(&v2, "vast").unwrap();
-    assert!(r.contains("pods on vast") && !r.contains("RUNPOD_API"), "{r}");
+    assert!(r.contains("pods on vast") && r.contains(&support(Backend::Vast, Op::Reap).refusal().unwrap()) && !r.contains("RUNPOD_API"), "{r}");
+    let r = super::create_flags_refusal(&v2, "shadeform").unwrap();
+    assert!(r.contains(&support(Backend::Shadeform, Op::Reap).refusal().unwrap()), "{r}");
     assert_eq!(super::create_flags_refusal(&v2, "runpod"), None);
     assert_eq!(super::create_flags_refusal(&Config::parse(""), "runpod"), None, "unset RUNPOD_API is v2");
     assert_eq!(super::create_flags_refusal(&v1, "hetzner"), None);
@@ -2425,7 +2429,7 @@ fn rr_create_flags_refuse_never_reaped_providers() {
     let naming = Naming::from_config(&cohort);
     let pod = rp("devtest-alpha", "pa", 22001);
     let why = never_reaped(&pod, std::slice::from_ref(&pod), &naming, false).unwrap_or_default();
-    assert!(why.contains("only acts on RunPod (REST v2) and Hetzner") && why.contains(RUNPOD_V1_REMEDY), "{why}");
+    assert!(why.contains(&table_v1) && why.contains(RUNPOD_V1_REMEDY), "{why}");
     // ENDS: a record made inert by a rename outside arena, or a shared name, says so too.
     let w = World::new("rr-inert", "");
     let a = rp("devtest-alpha", "pa", 22001);
