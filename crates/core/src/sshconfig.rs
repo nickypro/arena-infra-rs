@@ -1065,8 +1065,11 @@ mod tests {
         // The key at a path this test made, so it's read where it is: a path nobody can read falls
         // back to a key of the same file name under `$HOME/.ssh` (`ssh::resolve_key_path`), and a
         // box that holds a real `~/.ssh/arena_admin_key` (dev-nicky, the proxy box) would get that.
+        // A directory this test creates itself (`create_dir` fails on anything already there, a
+        // symlink planted at the predictable path included — review r3), never one it reuses.
         let dir = std::env::temp_dir().join(format!("arena-admin-config-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
         let key = dir.join("arena_admin_key");
         std::fs::write(&key, "not a real key\n").unwrap();
         let cfg = Config::parse(&format!(
