@@ -19,6 +19,20 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-31 · arena 2.6: extra disk for a Hetzner VM (volumes)
+- `arena pods volume add apple 50` attaches a 50 GB Hetzner volume to a VM and mounts it at
+  `/mnt/data` (`--mount` for another place; never inside a home). `volume grow apple 80` grows it
+  online, filesystem included. `volume list` shows each with its VM and cost. `volume detach` and
+  `volume delete` unmount it first. A VM that doesn't see a new volume yet is told to power-cycle
+  once (`pods stop` + `pods start`).
+- A volume outlives its VM and goes on billing: `pods terminate` says which are attached and keeps
+  them; `--delete-volumes` deletes them too. `teardown --check` lists every volume with its cost,
+  and `arena balance` counts them in Hetzner's burn.
+- `pods replace` / `migrate` carry a VM's volumes: moved to the new VM when it's in the same
+  location, else copied onto new volumes there (the originals kept until you delete them).
+- RunPod and Vast are refused up front with what to do instead (`pods replace <name> --volume
+  <GB>` on RunPod).
+
 ## 2026-10-31 · arena 2.5: move a Hetzner box to a bigger type, keeping its files
 - `arena pods replace apple --server-type cx43` and `pods migrate copy apple --server-type cx43`
   now work on Hetzner: a new server of that type (a comma list falls back), wherever

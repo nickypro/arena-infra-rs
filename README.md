@@ -110,6 +110,7 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 | `arena pods restore apple` | Push a backup back onto one pod (never deletes) |
 | `arena pods replace apple` | Move a pod to a fresh host, keeping its name and files |
 | `arena pods replace apple --server-type cx43` | Hetzner: move a box to a bigger type (`pods spare up` grabs room ahead; `pods copy-home` moves a person to another machine) |
+| `arena pods volume add apple 50` | Hetzner: 50 GB more disk on a VM, at `/mnt/data` (`grow`, `list`, `delete`; `terminate --delete-volumes`) |
 | `arena pods run -t apple 'nvidia-smi'` | Run a command on pods (all of them without `-t`) |
 | `arena balance` | Money left on each prepaid account, and how long it lasts |
 | `arena keys limit apple +5` | Raise a participant's AI (OpenRouter) cap by $5, in place (`10` sets it; `--all`); `keys pause`/`resume` stop and restart a key |
