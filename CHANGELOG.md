@@ -19,6 +19,16 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-31 · `arena claude push`: safe after a clock change, and never writes through a link
+- A push's order number is now kept per machine on the control box, so pushes made after the
+  box's clock went back (e.g. after it ran an hour ahead) aren't refused as "older" until the clock
+  catches up.
+- On the pod, a `~/.arena-claude.lock` that is a symlink or not a plain file is refused (the push
+  fails and says why), including one swapped in while the push waited for the lock: the push only
+  ever writes the lock file it opened, never through a link.
+- A push marks the machine as "not known to be current" before it changes anything there, so a push
+  that fails half-way is always picked up by the next `arena claude push`.
+
 ## 2026-10-31 · arena 2.8: extra disk for a Hetzner VM (volumes)
 - `arena pods volume add apple 50` attaches a 50 GB Hetzner volume to a VM and mounts it at
   `/mnt/data` (`--mount` for another place; never inside a home). `volume grow apple 80` grows it
