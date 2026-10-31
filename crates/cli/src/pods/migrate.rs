@@ -456,7 +456,7 @@ pub(crate) async fn migrate_copy_on(
         };
         println!("[2/3] waiting for {new_name} to come up{}…", if settle > 0 { " and stabilize" } else { "" });
         let up = wait_for_endpoint(owner, &new_id, 900).await.with_context(|| format!("{new_name} never came up"))?;
-        if let Some(n) = crate::pods::replace::moved_note(&src, &up, &new_name) {
+        if let Some(n) = crate::pods::replace::moved_note(&src, &up, &new_name, onto.is_some()) {
             println!("      {n}");
         }
         wait_for_stable_endpoint(owner, &new_id, settle, 600)

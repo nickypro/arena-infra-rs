@@ -220,6 +220,18 @@ pub(crate) fn take_line(onto: &Onto, new_name: &str) -> String {
     }
 }
 
+/// The spare-claim lock ([`arena_core::spare::claim_lock`]) in this fleet's state dir, held
+/// until dropped — in this crate's tests without `ARENA_STATE_DIR`, a temp dir of the process's
+/// (never the real state dir).
+pub(crate) fn claim_spares(cfg: &Config) -> Result<std::fs::File> {
+    let dir = if cfg!(test) && cfg.get("ARENA_STATE_DIR").is_none() {
+        std::env::temp_dir().join(format!("arena-spare-claims-{}", std::process::id()))
+    } else {
+        arena_core::snapshot::state_dir_for(cfg).map_err(anyhow::Error::msg)?
+    };
+    arena_core::spare::claim_lock(&dir, arena_core::spare::LOCK_WAIT).map_err(|e| anyhow::anyhow!("not taking or deleting a spare: {e}"))
+}
+
 /// The line once `onto` is taken as `new_name`: and for a machine that had a name of its own
 /// (not a spare), how to give it back if the move stops before the swap. Pure.
 pub(crate) fn taken_line(onto: &Onto, new_name: &str) -> String {
@@ -243,7 +255,9 @@ pub(crate) async fn take(owner: &dyn Provider, spares: Option<&dyn SpareCloud>, 
     let id = onto.pod.id.as_str();
     let done = if onto.spare {
         let spares = spares.context("a spare can only be taken through its provider's spare API (Hetzner)")?;
-        arena_core::retry::retrying(&policy, || spares.adopt(id, new_name)).await
+        // Under the claim lock: no other run takes or deletes it between the look and the rename.
+        let _claim = claim_spares(cfg)?;
+        arena_core::retry::retrying(&policy, || spares.adopt(id, &onto.pod.name, new_name)).await
     } else {
         arena_core::retry::retrying(&policy, || owner.rename_pod(id, new_name)).await
     };

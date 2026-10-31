@@ -104,9 +104,9 @@ impl SpareCloud for Vms {
     async fn spares(&self) -> Result<Vec<Pod>> {
         Ok(self.spares.lock().unwrap().clone())
     }
-    async fn adopt(&self, id: &str, new_name: &str) -> Result<()> {
+    async fn adopt(&self, id: &str, name: &str, new_name: &str) -> Result<()> {
         let mut spares = self.spares.lock().unwrap();
-        let Some(i) = spares.iter().position(|p| p.id == id) else { return Err(Error::provider("isn't a spare")) };
+        let Some(i) = spares.iter().position(|p| p.id == id && p.name == name) else { return Err(Error::provider("isn't a spare")) };
         let mut p = spares.remove(i);
         p.name = new_name.to_string();
         self.record(format!("adopt {id} {new_name}"));
@@ -511,7 +511,7 @@ async fn copy_home_moves_a_person_without_renaming_anything() {
     let remote = Arc::new(FakeRemote::new());
     // (Before `scripted`'s rules: the first rule that matches wins.) The repo (`~/r`) goes as its own
     // tree after the home, its items named from the repo.
-    remote.on(OLD, "--dry-run", FakeReply::stdout("*deleting   notes/mine.txt\n>f+++++++++ new.py\nARENA_TREE_ITEMS\n>f.st...... day1/x.py\n"));
+    remote.on(OLD, "--dry-run", FakeReply::stdout("*deleting   notes/mine.txt\n<f+++++++++ new.py\nARENA_TREE_ITEMS\n<f.st...... day1/x.py\n"));
     remote.on(NEW, "ARENA_IDLE_NOW", FakeReply::stdout(&Reply { gpu: None, ..Reply::default() }.render()));
     scripted(&remote, "101", NEW, "202");
     let opts = |overwrite, force| CopyHomeOpts { overwrite, force, dry_run: false, yes: true };

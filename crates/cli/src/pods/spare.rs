@@ -75,7 +75,7 @@ const READY_WAIT: Duration = Duration::from_secs(10 * 60);
 pub(crate) async fn handle_spare(cmd: SpareCmd, cfg: &Config, yes: bool, interrupt: &Interrupt) -> Result<()> {
     let cloud = crate::image::hetzner(cfg).context("capacity spares are Hetzner servers")?;
     let tracking = crate::spend::SpendCtx::from_config(cfg);
-    let tracked = crate::spend::Tracked::new(&cloud, &tracking, arena_core::spend::OwnerRule::None);
+    let tracked = crate::spend::Tracked::for_spares(&cloud, &tracking);
     spare_on(cmd, cfg, &tracked, &cloud, yes, interrupt).await
 }
 
@@ -131,10 +131,18 @@ pub(crate) async fn spare_on(cmd: SpareCmd, cfg: &Config, provider: &dyn Provide
                 println!("aborted.");
                 return Ok(());
             }
+            // Under the claim lock, from a fresh look: one a move took while this waited at its
+            // prompt is a fleet machine with someone's home on it now — never deleted here.
+            let _claim = crate::pods::adopt::claim_spares(cfg)?;
+            let now_spares = spares.spares().await.context("listing the capacity spares again before deleting")?;
             let policy = arena_core::retry::RetryPolicy::default();
             let mut failed = Vec::new();
             for p in &chosen {
-                // Still a spare? One taken since (`--onto-spare`) is a fleet machine now.
+                if !still_spare(&now_spares, p) {
+                    eprintln!("[kept] {} (id={}): no longer a spare (taken by a move meanwhile?) — not deleted", p.name, p.id);
+                    failed.push(p.name.clone());
+                    continue;
+                }
                 match arena_core::retry::retrying(&policy, || provider.terminate_pod(&p.id)).await {
                     Ok(()) => println!("[deleted] {} (id={})", p.name, p.id),
                     Err(e) => {
@@ -245,6 +253,12 @@ pub(crate) async fn spare_on(cmd: SpareCmd, cfg: &Config, provider: &dyn Provide
             Ok(())
         }
     }
+}
+
+/// Whether `p` (as listed before the prompt) is still one of `now` — this cohort's spares as
+/// listed under the claim lock — by id AND name. Pure.
+fn still_spare(now: &[Pod], p: &Pod) -> bool {
+    now.iter().any(|n| n.id == p.id && n.name == p.name)
 }
 
 /// What a spare's create merges in: `CREATE_EXTRA_JSON` (the cohort's create default, checked

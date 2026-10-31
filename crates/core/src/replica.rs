@@ -164,10 +164,12 @@ pub fn pod_identity(provider: &str, id: &str) -> Option<String> {
 
 /// The receiver's own files a mirroring sync would move aside ([`crate::pull::Mirror::Replica`]),
 /// read from its `--dry-run --itemize-changes` output: each it would delete (`*deleting`) or
-/// overwrite (a received file, `>f`, that exists there — its flags aren't all `+`). Files only
-/// (a deleted directory's files are listed one by one), in the order rsync names them, as paths
-/// in the home: the repo tree's items, after [`crate::volume::TREE_ITEMS_MARK`], are named
-/// relative to the repo at `rel`. Pure.
+/// overwrite — a file it sends that exists there (`<f`: the direct copy runs on the source and
+/// pushes, so the sender itemizes; `>f` from a pull's receiver), or a symlink it replaces
+/// (`cL`); either with flags that aren't all `+` (new). Files only (a deleted directory's files
+/// are listed one by one), in the order rsync names them, as paths in the home: the repo tree's
+/// items, after [`crate::volume::TREE_ITEMS_MARK`], are named relative to the repo at `rel`.
+/// Pure.
 pub fn moved_aside(itemized: &str, rel: Option<&str>) -> Vec<String> {
     let mut out = Vec::new();
     let mut prefix = String::new();
@@ -184,10 +186,12 @@ pub fn moved_aside(itemized: &str, rel: Option<&str>) -> Vec<String> {
             }
             continue;
         }
-        // `YXcstpoguax path`: Y `>` received, X `f` a file, then 9 change flags (`+` = new).
+        // `YXcstpoguax path`: Y `<` sent / `>` received / `c` changed there, X `f` a file or `L`
+        // a symlink, then 9 change flags (`+` = new).
         let Some((flags, path)) = line.split_once(' ') else { continue };
         let b = flags.as_bytes();
-        if b.len() >= 11 && b[0] == b'>' && b[1] == b'f' && !flags[2..].starts_with('+') {
+        let replaced = matches!((b.first(), b.get(1)), (Some(b'<' | b'>'), Some(b'f')) | (Some(b'<' | b'>' | b'c'), Some(b'L')));
+        if b.len() >= 11 && replaced && !flags[2..].starts_with('+') {
             out.push(format!("{prefix}{}", path.trim_start()));
         }
     }
@@ -576,6 +580,10 @@ mod tests {
                    sent 1,234 bytes  received 56 bytes\n";
         assert_eq!(moved_aside(out, None), ["notes/old.txt", "ARENA_materials/day1/solution.py", "has spaces in name.txt"]);
         assert!(moved_aside("", None).is_empty());
+        // What the direct copy prints (it runs on the source and pushes: the sender's view):
+        // a file it would overwrite there, a symlink it would replace — never what's new there.
+        let push = "<f.st...... notes/differs.md\n<f+++++++++ fresh.py\ncLc.t...... link-to-data\ncL+++++++++ new-link\n";
+        assert_eq!(moved_aside(push, None), ["notes/differs.md", "link-to-data"]);
         // The repo's tree, copied on its own after the home, names its items from the repo.
         let split = "*deleting   notes/old.txt\nARENA_TREE_ITEMS\n*deleting   day1/gone.py\n>f.st...... day2/x.py\n";
         assert_eq!(moved_aside(split, Some("ARENA_materials")), ["notes/old.txt", "ARENA_materials/day1/gone.py", "ARENA_materials/day2/x.py"]);

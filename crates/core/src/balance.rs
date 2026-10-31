@@ -1670,6 +1670,9 @@ pub struct AccountView {
     /// Hetzner: why the spares couldn't be read (they then aren't in `burn`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spares_unread: Option<String>,
+    /// Hetzner: how many billing spares had no price listed (their share isn't in `burn`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spares_unpriced: Option<usize>,
 }
 
 impl AccountView {
@@ -1704,6 +1707,7 @@ impl AccountView {
             archive_unread: None,
             spares_per_hr: None,
             spares_unread: None,
+            spares_unpriced: None,
         }
     }
 
@@ -1824,18 +1828,21 @@ pub fn add_archive(v: &mut AccountView, read: Result<Option<f64>, String>) {
     }
 }
 
-/// Add the capacity spares' cost ([`BalanceApi::spares_eur_per_hr`]) to Hetzner's row, as
-/// [`add_archive`] does the archive's: billed by the same account, in no fleet listing. None
-/// (or no cost) changes nothing; a failed read is said and left out.
-pub fn add_spares(v: &mut AccountView, read: Result<f64, String>) {
+/// Add the capacity spares' cost ([`BalanceApi::spares_eur_per_hr`]: the priced ones' sum, and
+/// how many bill with no price listed) to Hetzner's row, as [`add_archive`] does the archive's:
+/// billed by the same account, in no fleet listing. None (or no cost) changes nothing; unpriced
+/// spares and a failed read are said, and left out.
+pub fn add_spares(v: &mut AccountView, read: Result<(f64, usize), String>) {
     match read {
-        Ok(per_hr) if per_hr.is_finite() && per_hr > 0.0 => {
-            v.spares_per_hr = Some(per_hr);
-            if let Some(b) = v.burn.as_mut() {
-                b.per_hr += per_hr;
+        Ok((per_hr, unpriced)) => {
+            if per_hr.is_finite() && per_hr > 0.0 {
+                v.spares_per_hr = Some(per_hr);
+                if let Some(b) = v.burn.as_mut() {
+                    b.per_hr += per_hr;
+                }
             }
+            v.spares_unpriced = (unpriced > 0).then_some(unpriced);
         }
-        Ok(_) => {}
         Err(e) => v.spares_unread = Some(e),
     }
 }
@@ -2351,6 +2358,9 @@ pub fn notes(views: &[AccountView], policy: &BalancePolicy, now: u64) -> Vec<Str
             }
             if let Some(sp) = v.spares_per_hr {
                 out.push(format!("{name}: includes the capacity spares, {}/h (nobody's machines yet; `arena pods spare list`)", money(v, sp)));
+            }
+            if let Some(n) = v.spares_unpriced {
+                out.push(format!("{name}: {n} capacity spare(s) bill with no price listed — not included (the burn reads low)"));
             }
             if let Some(e) = &v.spares_unread {
                 out.push(format!("{name}: the capacity spares couldn't be read ({e}) — not included"));
@@ -3069,9 +3079,10 @@ pub trait BalanceApi: Send + Sync {
     async fn archive_eur_per_hr(&self) -> Option<Result<Option<f64>, String>> {
         None
     }
-    /// The capacity spares' cost (`pods spare up`: EUR/h, summed over the ones billing) —
-    /// Hetzner spend in no fleet listing. `None`: no Hetzner key, not asked. Reads only.
-    async fn spares_eur_per_hr(&self) -> Option<Result<f64, String>> {
+    /// The capacity spares' cost (`pods spare up`: EUR/h, summed over the ones billing, and how
+    /// many bill with no price listed) — Hetzner spend in no fleet listing. `None`: no Hetzner
+    /// key, not asked. Reads only.
+    async fn spares_eur_per_hr(&self) -> Option<Result<(f64, usize), String>> {
         None
     }
 }
@@ -3197,10 +3208,10 @@ impl BalanceApi for HttpBalanceApi {
         Some(crate::archive::cloud::eur_per_hr(cloud, names).await.map_err(|e| e.to_string()))
     }
 
-    async fn spares_eur_per_hr(&self) -> Option<Result<f64, String>> {
+    async fn spares_eur_per_hr(&self) -> Option<Result<(f64, usize), String>> {
         use crate::spare::SpareCloud;
         let cloud = self.spares.as_ref()?;
-        Some(cloud.spares().await.map(|s| crate::spare::cost_per_hr(&s).0).map_err(|e| e.to_string()))
+        Some(cloud.spares().await.map(|s| crate::spare::cost_per_hr(&s)).map_err(|e| e.to_string()))
     }
 
     fn last_live_attempt(&self, account: Account) -> Option<u64> {
@@ -3572,14 +3583,17 @@ mod tests {
         let hz = Pod { id: "1".into(), name: "x-apple".into(), provider: "hetzner".into(), status: "RUNNING".into(), cost_per_hr: Some(0.01), ..Default::default() };
         let listing = Listing::from_results(vec![("hetzner".into(), Ok(vec![hz.clone()]))]);
         let mut v = postpaid_view(&listing, &[hz]).unwrap();
-        add_spares(&mut v, Ok(0.031));
+        add_spares(&mut v, Ok((0.031, 0)));
         assert!((v.burn.unwrap().per_hr - 0.041).abs() < 1e-9 && v.spares_per_hr == Some(0.031));
         let lines = notes(&[v.clone()], &BalancePolicy::default(), 0).join("\n");
         assert!(lines.contains("includes the capacity spares, €0.031/h"), "{lines}");
         let mut none = v.clone();
         none.spares_per_hr = None;
-        add_spares(&mut none, Ok(0.0));
+        add_spares(&mut none, Ok((0.0, 0)));
         assert_eq!(none.spares_per_hr, None);
+        // Billing with no price listed: not a quiet zero — said, and the burn reads low.
+        add_spares(&mut none, Ok((0.0, 2)));
+        assert!(notes(&[none.clone()], &BalancePolicy::default(), 0).join("\n").contains("2 capacity spare(s) bill with no price listed"));
         add_spares(&mut none, Err("hetzner servers HTTP 503".into()));
         assert!(notes(&[none], &BalancePolicy::default(), 0).join("\n").contains("the capacity spares couldn't be read (hetzner servers HTTP 503)"));
     }

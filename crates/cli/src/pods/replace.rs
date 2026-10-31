@@ -641,19 +641,15 @@ pub(crate) fn settle_secs(provider: &str) -> u64 {
     }
 }
 
-/// The note when a new VM landed somewhere else than the one it replaces (Hetzner: a server
-/// can't move, and a create walks every location `HETZNER_LOCATION` allows). `None`: same
-/// place, or not known. Pure.
-pub(crate) fn moved_note(src: &arena_core::Pod, new: &arena_core::Pod, new_name: &str) -> Option<String> {
+/// The note when a new VM is somewhere else than the one it replaces (Hetzner: a server can't
+/// move; a create walks every location `HETZNER_LOCATION` allows, and a machine taken with
+/// `--onto`/`--onto-spare` is where it was made). `None`: same place, or not known. Pure.
+pub(crate) fn moved_note(src: &arena_core::Pod, new: &arena_core::Pod, new_name: &str, taken: bool) -> Option<String> {
     let (from, to) = (src.location.as_deref()?, new.location.as_deref()?);
     let key = |l: &str| l.split_whitespace().next().unwrap_or("").to_string();
-    (key(from) != key(to)).then(|| {
-        format!(
-            "note: {new_name} is in {to}, not {from} like {} — a server can't move, and HETZNER_LOCATION allowed it \
-             there (latency to it may differ)",
-            src.name
-        )
-    })
+    let why = if taken { "it was made there" } else { "HETZNER_LOCATION allowed it there" };
+    (key(from) != key(to))
+        .then(|| format!("note: {new_name} is in {to}, not {from} like {} — {why} (latency to it may differ)", src.name))
 }
 
 /// `--onto <pod>` / `--onto-spare` take a machine as it is: a flag that shapes a create is
@@ -814,7 +810,10 @@ pub(crate) async fn replace_on(
     }
     println!("    2. setup    {new_name}   (deploy key, ssh config, repo, ~/.name={} until the swap)", short_of(cfg, &new_name));
     println!("    3. copy     {canonical} -> {new_name}   ({})", copy_scope_line());
-    println!("    4. verify   {new_name}   (the copy read back on the right pod, ssh + GPU health check, maintenance window)");
+    println!(
+        "    4. verify   {new_name}   (the copy read back on the right pod, {}, maintenance window)",
+        if vm { "ssh health check" } else { "ssh + GPU health check" }
+    );
     println!(
         "    5. swap     {}rename {canonical} -> {old_name}, then {new_name} -> {canonical} (+ {names}, API keys under {canonical})",
         if force { "" } else { "no one on it? then " }
@@ -896,7 +895,7 @@ pub(crate) async fn replace_on(
     let up = wait_for_endpoint(owner, &created.id, 900)
         .await
         .with_context(|| format!("{new_name} never came up — left in place for inspection"))?;
-    if let Some(n) = moved_note(&src, &up, &new_name) {
+    if let Some(n) = moved_note(&src, &up, &new_name, onto.is_some()) {
         println!("      {n}");
     }
     wait_for_stable_endpoint(owner, &created.id, settle, 600)

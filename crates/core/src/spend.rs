@@ -734,6 +734,10 @@ pub enum Event<'a> {
     /// capacity spare): renamed `pod.name` (`<x>-new`), it gets the owner `owner` gives, as a
     /// create's pod would — its row (the same instance) goes on, under that owner.
     Adopted { pod: &'a Pod, owner: &'a OwnerRule },
+    /// A create of a capacity spare (`pods spare up`) returned this pod: a row of nobody's, marked
+    /// a spare from the start — so a fleet listing (which never shows a spare) can't end it
+    /// before the spare listing marks it.
+    SpareCreated { pod: &'a Pod },
     /// A terminate succeeded (`provider` when the caller knows it).
     Terminated { provider: Option<&'a str>, id: &'a str },
     /// A stop succeeded: from now it bills its disk only.
@@ -760,6 +764,12 @@ fn replaced_names(name: &str) -> Vec<String> {
 pub fn apply_event(mut state: SpendState, ev: &Event, now: u64) -> SpendState {
     state.begin(now);
     match ev {
+        Event::SpareCreated { pod } => {
+            state = apply_event(state, &Event::Created { pod, owner: &OwnerRule::None }, now);
+            if let Some(i) = state.open_index(Some(&pod.provider), &pod.id) {
+                state.machines[i].spare = true;
+            }
+        }
         Event::Created { pod, owner } | Event::Adopted { pod, owner } => {
             if pod.id.is_empty() {
                 return state;

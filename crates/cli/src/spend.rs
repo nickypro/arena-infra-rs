@@ -152,6 +152,8 @@ pub(crate) struct Tracked<'a> {
     pub inner: &'a dyn Provider,
     pub spend: &'a SpendCtx,
     pub owner: OwnerRule,
+    /// Its creates are capacity spares (`pods spare up`): recorded as spares from the start.
+    pub spares: bool,
     /// Which provider each id it listed or made is on (`None`: the same id on two), so a stop
     /// or terminate by id records against the right row.
     pub seen: std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
@@ -159,7 +161,13 @@ pub(crate) struct Tracked<'a> {
 
 impl<'a> Tracked<'a> {
     pub(crate) fn new(inner: &'a dyn Provider, spend: &'a SpendCtx, owner: OwnerRule) -> Self {
-        Tracked { inner, spend, owner, seen: Default::default() }
+        Tracked { inner, spend, owner, spares: false, seen: Default::default() }
+    }
+
+    /// The same, for `pods spare up`: each create is recorded as a spare's
+    /// ([`Event::SpareCreated`]), never as a fleet machine's.
+    pub(crate) fn for_spares(inner: &'a dyn Provider, spend: &'a SpendCtx) -> Self {
+        Tracked { spares: true, ..Self::new(inner, spend, OwnerRule::None) }
     }
 
     fn remember<'p>(&self, pods: impl IntoIterator<Item = &'p Pod>) {
@@ -201,7 +209,11 @@ impl Provider for Tracked<'_> {
     async fn create_pod(&self, spec: &PodSpec) -> arena_core::Result<Pod> {
         let pod = self.inner.create_pod(spec).await?;
         self.remember([&pod]);
-        self.spend.event(&Event::Created { pod: &pod, owner: &self.owner });
+        if self.spares {
+            self.spend.event(&Event::SpareCreated { pod: &pod });
+        } else {
+            self.spend.event(&Event::Created { pod: &pod, owner: &self.owner });
+        }
         Ok(pod)
     }
     async fn stop_pod(&self, id: &str) -> arena_core::Result<()> {

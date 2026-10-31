@@ -588,10 +588,11 @@ impl crate::spare::SpareCloud for HetznerProvider {
         Ok(self.get_all_where("servers", &[("label_selector", &sel)]).await?.iter().map(parse_server).collect())
     }
 
-    /// Read the server (it must still be a spare — one taken meanwhile is refused, nothing
-    /// changed), then ONE `PUT /servers/{id}` with the new name and its labels minus the spare
-    /// mark ([`adopt_payload`]); the answer must name it as asked ([`judge_rename`]).
-    async fn adopt(&self, id: &str, new_name: &str) -> Result<()> {
+    /// Read the server (it must still be this cohort's spare called `name` — one taken or
+    /// renamed meanwhile is refused, nothing changed), then ONE `PUT /servers/{id}` with the new
+    /// name and its labels minus the spare mark ([`adopt_payload`]); the answer must name it as
+    /// asked ([`judge_rename`]). The caller holds [`crate::spare::claim_lock`] across both.
+    async fn adopt(&self, id: &str, name: &str, new_name: &str) -> Result<()> {
         if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
             return Err(Error::Config(format!("hetzner: `{id}` isn't a server id")));
         }
@@ -600,10 +601,21 @@ impl crate::spare::SpareCloud for HetznerProvider {
             .await?
             .ok_or_else(|| Error::provider(format!("hetzner: spare {id} is gone")))?;
         let server = body.get("server").unwrap_or(&body);
-        if !is_spare_server(server) {
+        let ours = crate::spare::label_value(&self.opts.image_scope.prefix);
+        let mark = server.pointer(&format!("/labels/{SPARE_LABEL}")).and_then(Value::as_str);
+        let now_named = server.get("name").and_then(Value::as_str).unwrap_or_default();
+        // Already done: a retried call whose first PUT went through but whose answer was lost.
+        if mark.is_none() && now_named == new_name {
+            return Ok(());
+        }
+        if mark != Some(ours.as_str()) || now_named != name {
             return Err(Error::Provider {
                 kind: crate::error::ProviderErrorKind::Rejected,
-                message: format!("hetzner: server {id} isn't a spare (no `{SPARE_LABEL}` label) — taken already?"),
+                message: format!(
+                    "hetzner: server {id} isn't this cohort's spare {name} any more (now `{now_named}`, {}) — another run took \
+                     it? Nothing was changed",
+                    mark.map_or_else(|| format!("no `{SPARE_LABEL}` label"), |m| format!("`{SPARE_LABEL}={m}`"))
+                ),
             });
         }
         let payload = adopt_payload(new_name, server.get("labels").and_then(Value::as_object));
@@ -2913,18 +2925,30 @@ mod tests {
         use crate::spare::SpareCloud;
         let spare = json!({"server": {"id": 7, "name": "arena9-spare-2", "labels": {"arena-spare": "arena9", "team": "red"}}});
         let srv = serve(vec![canned(200, "application/json", &spare.to_string()), canned(200, "application/json", &renamed_server("arena9-apple-new"))]);
-        let p = provider(&srv.base, HetznerOpts::default());
-        p.adopt("7", "arena9-apple-new").await.unwrap();
+        let arena9 = || HetznerOpts::from_config(&crate::config::Config::parse("MACHINE_NAME_PREFIX=arena9\n"));
+        let p = provider(&srv.base, arena9());
+        p.adopt("7", "arena9-spare-2", "arena9-apple-new").await.unwrap();
         assert_eq!(*srv.requests.lock().unwrap(), ["GET /servers/7 HTTP/1.1", "PUT /servers/7 HTTP/1.1"]);
         assert_eq!(
             serde_json::from_str::<Value>(&srv.bodies.lock().unwrap()[1]).unwrap(),
             json!({"name": "arena9-apple-new", "labels": {"team": "red"}})
         );
-        let taken = json!({"server": {"id": 7, "name": "arena9-pear-new", "labels": {}}});
-        let srv = serve(vec![canned(200, "application/json", &taken.to_string())]);
-        let e = provider(&srv.base, HetznerOpts::default()).adopt("7", "arena9-apple-new").await.unwrap_err();
-        assert_eq!(e.kind(), Some(crate::error::ProviderErrorKind::Rejected));
-        assert!(e.to_string().contains("isn't a spare"), "{e}");
+        // Taken meanwhile (renamed, unmarked), another cohort's, or renamed: refused, no PUT.
+        for server in [
+            json!({"server": {"id": 7, "name": "arena9-pear-new", "labels": {}}}),
+            json!({"server": {"id": 7, "name": "arena9-spare-2", "labels": {"arena-spare": "arena8"}}}),
+            json!({"server": {"id": 7, "name": "arena9-spare-9", "labels": {"arena-spare": "arena9"}}}),
+        ] {
+            let srv = serve(vec![canned(200, "application/json", &server.to_string())]);
+            let e = provider(&srv.base, arena9()).adopt("7", "arena9-spare-2", "arena9-apple-new").await.unwrap_err();
+            assert_eq!(e.kind(), Some(crate::error::ProviderErrorKind::Rejected));
+            assert!(e.to_string().contains("isn't this cohort's spare arena9-spare-2 any more"), "{e}");
+            assert_eq!(srv.requests.lock().unwrap().len(), 1, "no PUT");
+        }
+        // A retry after a PUT whose answer was lost: already done, no second PUT.
+        let done = json!({"server": {"id": 7, "name": "arena9-apple-new", "labels": {"team": "red"}}});
+        let srv = serve(vec![canned(200, "application/json", &done.to_string())]);
+        provider(&srv.base, arena9()).adopt("7", "arena9-spare-2", "arena9-apple-new").await.unwrap();
         assert_eq!(srv.requests.lock().unwrap().len(), 1, "no PUT");
         assert_eq!(adopt_payload("x", None), json!({"name": "x", "labels": {}}));
     }

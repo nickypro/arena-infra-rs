@@ -1173,6 +1173,13 @@ fn spares_are_counted_until_deleted_and_go_on_once_taken() {
     let m8 = machine(&s, "hetzner", "8");
     assert_eq!((m8.spare, m8.ended.map(|e| e.how)), (true, Some(EndHow::Vanished)));
     assert!(close(m8.accrued, 0.06), "3 h at 0.02 (its last sighting carried to the end): {}", m8.accrued);
+    // A spare recorded at its create is a spare from the start: a fleet listing after the grace
+    // (a `spare up` still retrying the rest, or killed) doesn't end it.
+    let spare3 = running("hetzner", "10", "devtest-spare-3", 0.02);
+    let mut s2 = apply_event(tracked(), &Event::SpareCreated { pod: &spare3 }, T0);
+    assert!(machine(&s2, "hetzner", "10").spare);
+    s2 = watch(s2, &["hetzner"], std::slice::from_ref(&alpha), T0 + 20 * M, T0 + 2 * H);
+    assert!(machine(&s2, "hetzner", "10").is_open(), "{:#?}", s2.machines);
     // Another fleet's spare (another prefix) is never counted.
     let theirs = running("hetzner", "9", "other-spare-1", 0.02);
     let s = observe_spares(s, "hetzner", &[theirs], &naming(), T0 + 4 * H);

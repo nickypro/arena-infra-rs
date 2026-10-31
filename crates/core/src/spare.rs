@@ -38,9 +38,49 @@ pub const MAX_UP: usize = 20;
 pub trait SpareCloud: Send + Sync {
     /// This cohort's spares ([`selector`]), any state.
     async fn spares(&self) -> Result<Vec<Pod>>;
-    /// Take spare `id` into the fleet as `new_name`: renamed and its spare label dropped, in
-    /// one request. Refused (nothing changed) when `id` isn't a spare.
-    async fn adopt(&self, id: &str, new_name: &str) -> Result<()>;
+    /// Take spare `id` — listed as `name` — into the fleet as `new_name`: renamed and its spare
+    /// label dropped, in one request. Refused (nothing changed) when `id` isn't this cohort's
+    /// spare called `name` any more (taken meanwhile). Call it under [`claim_lock`].
+    async fn adopt(&self, id: &str, name: &str, new_name: &str) -> Result<()>;
+}
+
+/// The lock file, in the cohort's state dir, that every claim on a spare holds: an adoption
+/// (`--onto-spare`, `--onto <spare>`) from its last look to its rename, and `spare down` from
+/// its last look to its deletes. Hetzner has no conditional update, so a check-then-rename
+/// (or check-then-delete) is only safe against another arena on this box when they take turns:
+/// two runs never take the same spare, and a `spare down` waiting at its prompt never deletes
+/// one a move took meanwhile (it looks again under the lock). Runs on another control box
+/// aren't covered: one control box per cohort, as everywhere else.
+pub const LOCK_FILE: &str = "spares.lock";
+
+/// How long a claim waits for another run's: a claim is one or two requests per spare.
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Take the spare-claim lock in `dir` (created 0700 when missing; the file 0600), waiting up to
+/// `wait` for another run's. Held until the returned file is dropped. `Err`: why not.
+pub fn claim_lock(dir: &std::path::Path, wait: std::time::Duration) -> std::result::Result<std::fs::File, String> {
+    use std::fs::{OpenOptions, TryLockError};
+    crate::snapshot::create_private_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join(LOCK_FILE);
+    let mut opts = OpenOptions::new();
+    opts.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts.open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(f),
+            Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(TryLockError::WouldBlock) => {
+                return Err(format!("{} is held by another arena run (taking or deleting a spare) for over {}s", path.display(), wait.as_secs()))
+            }
+            Err(TryLockError::Error(e)) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
 }
 
 /// `<prefix>-spare-<n>`.
@@ -210,6 +250,21 @@ mod tests {
         let taken = ["arena9-spare-1", "arena9-spare-3", "arena9-apple"];
         assert_eq!(free_names("arena9", &taken, 3), ["arena9-spare-2", "arena9-spare-4", "arena9-spare-5"]);
         assert!(free_names("arena9", &taken, 0).is_empty());
+    }
+
+    /// One claim at a time: a second waits for the first (here: gives up at once), and goes
+    /// through once it's dropped. (It waits a little there: a test elsewhere in this process
+    /// forking a child holds a copy of the lock's descriptor until that child execs.)
+    #[test]
+    fn spare_claims_take_turns() {
+        let dir = std::env::temp_dir().join(format!("arena-spare-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = claim_lock(&dir, std::time::Duration::ZERO).unwrap();
+        let e = claim_lock(&dir, std::time::Duration::ZERO).unwrap_err();
+        assert!(e.contains("held by another arena run"), "{e}");
+        drop(first);
+        claim_lock(&dir, std::time::Duration::from_secs(10)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
