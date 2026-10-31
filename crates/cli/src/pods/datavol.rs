@@ -159,10 +159,17 @@ fn guard(pod: &Pod) -> Option<String> {
     arena_core::replica::pod_identity(&pod.provider, &pod.id)
 }
 
+/// `script` run by `/bin/sh`, whatever the login shell is: sshd hands a command to it, and root's
+/// on arena's VMs is zsh, which doesn't split an unquoted `$var` into words — the volume scripts'
+/// fstab reading needs POSIX (live: zsh kept every fstab line, ours twice).
+fn posix(script: &str) -> String {
+    format!("sh -c '{}'", script.replace('\'', "'\\''"))
+}
+
 /// Run `script` as root on `pod`, behind its own identity check; its stdout.
 async fn on_vm(remote: &dyn Remote, cfg: &Config, _fleet: &dyn Provider, pod: &Pod, script: &str) -> Result<String> {
     let target = SshTarget::from_pod(pod, cfg)?;
-    let cmd = arena_core::replica::guarded(guard(pod).as_deref(), script);
+    let cmd = posix(&arena_core::replica::guarded(guard(pod).as_deref(), script));
     let out = remote.exec(&target, &cmd, Some(STEP_TIMEOUT)).await.with_context(|| format!("reaching {}", pod.name))?;
     if out.code == Some(arena_core::replica::WRONG_POD_EXIT) {
         anyhow::bail!("{}'s address answered as another machine — nothing was done there", pod.name);
@@ -917,7 +924,7 @@ pub(crate) async fn copy_volumes(
             &stamp,
         );
         let target = SshTarget::from_pod(from, cfg)?;
-        let guarded = arena_core::replica::guarded(guard(from).as_deref(), &cmd);
+        let guarded = posix(&arena_core::replica::guarded(guard(from).as_deref(), &cmd));
         let out = remote.exec(&target, &guarded, Some(crate::pods::POD_COPY_TIMEOUT)).await.with_context(|| format!("copying {}", v.name))?;
         if !out.success {
             anyhow::bail!(

@@ -745,7 +745,9 @@ async fn replace_copies_a_volume_to_another_location() {
     assert_eq!(created[0]["labels"]["arena-volume-copy-of"], "900");
     let copies: Vec<String> = execs(&remote, OLD).into_iter().filter(|c| c.contains("rsync -aHAX")).collect();
     assert_eq!(copies.len(), 2, "{copies:?}");
-    assert!(copies[0].contains("'/mnt/data'/ 'root@10.0.0.2:/mnt/data/'") && copies[0].contains("--rsync-path="), "{}", copies[0]);
+    // (Run by /bin/sh: quoted once more, `'` as `'\''`.)
+    assert!(copies[0].starts_with("sh -c '"), "{}", copies[0]);
+    assert!(copies[0].contains("/mnt/data'\\''/ '\\''root@10.0.0.2:/mnt/data/'\\''") && copies[0].contains("--rsync-path="), "{}", copies[0]);
     let state = cloud.state();
     // The original stays (on its old VM — this fake project doesn't see that VM's terminate).
     assert_eq!(state.volumes.iter().find(|v| v.id == 900).unwrap().server, Some(101));
