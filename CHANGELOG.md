@@ -19,6 +19,13 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-31 · `arena backups` no longer misses a backup that's running
+- `arena backups` and the dashboard's backups screen tell a running backup by its lock (a pod's
+  backup lock, the cron line's, the archive's), read from `/proc/locks`. When another program on
+  the box let go of a lock during that read, a held lock could be skipped, and the backup running
+  then showed as not running. The list is now read in one go (one pass while up to some 70 locks
+  are held on the box at once).
+
 ## 2026-10-31 · arena 2.9: project week fixes — owners in the listing, a key from `up`, several machines per terminate
 - `pods list` and the dashboard show who each machine is for (`--owner`, `spend assign`): an
   OWNER column after NAME, per instance, empty for a machine with no owner, and no column at all
