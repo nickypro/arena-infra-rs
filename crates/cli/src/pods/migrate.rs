@@ -748,82 +748,104 @@ pub(crate) async fn migrate_cutover_on(
     }
     println!("[2/4] verifying {new_name} health…");
     verify_replacement(owner, remote.as_ref(), &new_id, cfg).await?;
-    // Asked again right before the swap (review r2): someone who came on during the prompt or
-    // the final sync would leave what they write next behind on the parked original.
-    if let Some(r) = cutover_presence_refusal(remote.as_ref(), cfg, &src, force).await {
-        anyhow::bail!("NOT swapping — {r} (they came on during the final sync; {new_name} has the copy, nothing was renamed)");
-    }
     // The original's volumes: their copies get a last sync (another location), or they move
     // now, before the names (same location) — one that doesn't is put back, nothing swapped.
     let new_pod = pods.iter().find(|p| p.id == new_id).cloned().context("-new vanished")?;
     let mut record = crate::pods::datavol::load_record(cfg, canonical, &src_id);
-    let moved = match (volumes, crate::pods::datavol::carry(src_volumes, new_pod.location.as_deref())) {
-        (Some(cloud), crate::pods::datavol::Carry::Copy(vols)) => {
-            if no_final_sync {
-                // Only onto copies that finished (review): an empty volume never goes live.
-                crate::pods::datavol::copies_ready(cloud, &record, &new_pod, &vols).await.context("nothing was swapped")?;
-                println!("      {canonical}'s volume(s): their copies on {new_name} are as of its last `migrate copy` (--no-final-sync)");
-            } else {
-                // Not "finished" while the final sync runs (review): saved before it starts.
-                for v in &vols {
-                    record.copied.remove(&v.id);
-                }
-                crate::pods::datavol::save_record(cfg, canonical, &record).context("nothing was swapped")?;
-                let done = crate::pods::datavol::copy_volumes(remote.as_ref(), cfg, owner, cloud, &src, &new_pod, canonical, &vols, &record.mounts)
-                    .await
-                    .with_context(|| format!("the final sync of {canonical}'s volume(s) — nothing was swapped"))?;
-                record.copied.extend(done);
-                crate::pods::datavol::save_record_or_say(cfg, canonical, &record);
+    // What an earlier cutover of this migration moved, accounted for before anything (review r3):
+    // on `-new` already (pending: moved, to be mounted), back on the original (moved again with
+    // the rest), anywhere else — refused, nothing done.
+    let mut pending: Vec<arena_core::archive::cloud::CloudVolume> = Vec::new();
+    if let (Some(cloud), true) = (volumes, record.moved_to.as_deref() == Some(new_id.as_str()) && !record.moved.is_empty()) {
+        let all = cloud.all_volumes().await.context("listing the volumes")?;
+        for id in &record.moved {
+            match all.iter().find(|v| v.id == *id) {
+                Some(v) if v.server.is_some_and(|s| s.to_string() == new_id) => pending.push(v.clone()),
+                Some(v) if v.server.is_some_and(|s| s.to_string() == src_id) => {}
+                Some(v) => anyhow::bail!(
+                    "volume {} (an earlier cutover of {canonical} moved it) is {} — put it back on {canonical} first (the Hetzner \
+                     console, then `arena pods volume mount {canonical}`); nothing was swapped",
+                    v.name,
+                    v.server.map_or_else(|| "detached".to_string(), |s| format!("attached to server {s}"))
+                ),
+                None => anyhow::bail!("volume id {id} (an earlier cutover of {canonical} moved it) is gone — `arena pods volume list`; nothing was swapped"),
             }
-            None
         }
-        (Some(cloud), crate::pods::datavol::Carry::Move(vols)) => {
-            // A cutover cut short mid-move left some on `-new` already (the record says which):
-            // they count as moved, and must be mounted there.
+    }
+    let mut carry_set = src_volumes;
+    for v in &pending {
+        if !carry_set.iter().any(|x| x.id == v.id) {
+            carry_set.push(v.clone());
+        }
+    }
+    let carry = crate::pods::datavol::carry(carry_set, new_pod.location.as_deref());
+    // Copies (another location): their last sync — the long step — before the last presence check.
+    if let (Some(cloud), crate::pods::datavol::Carry::Copy(vols)) = (volumes, &carry) {
+        if no_final_sync {
+            // Only onto copies that finished (review), each mounted where it belongs (review r3).
+            crate::pods::datavol::copies_ready(cloud, &record, &new_pod, vols).await.context("nothing was swapped")?;
             let all = cloud.all_volumes().await.context("listing the volumes")?;
-            let pending: Vec<arena_core::archive::cloud::CloudVolume> = all
-                .into_iter()
-                .filter(|v| record.moved.contains(&v.id) && record.moved_to.as_deref() == Some(new_id.as_str()))
-                .filter(|v| v.server.is_some_and(|s| s.to_string() == new_id))
-                .collect();
-            // The move's intent, saved before the first unmount (review): an interrupted move is
-            // then known, and a revert can bring them back. Not saved: not moved.
-            let mut all_moved: Vec<arena_core::archive::cloud::CloudVolume> = pending.clone();
-            all_moved.extend(vols.iter().cloned());
+            for v in vols {
+                let copy = record.copied.get(&v.id).and_then(|c| all.iter().find(|x| x.id == *c)).context("a copy vanished")?;
+                let at = record.mounts.get(&v.id).cloned().unwrap_or_else(|| arena_core::datavol::DEFAULT_MOUNT.to_string());
+                crate::pods::datavol::ensure_mounted(remote.as_ref(), cfg, owner, &new_pod, copy, &at).await.context("nothing was swapped")?;
+            }
+            println!("      {canonical}'s volume(s): their copies on {new_name} are as of its last `migrate copy` (--no-final-sync)");
+        } else {
+            // Not "finished" while the final sync runs (review): saved before it starts.
+            for v in vols {
+                record.copied.remove(&v.id);
+            }
+            crate::pods::datavol::save_record(cfg, canonical, &record).context("nothing was swapped")?;
+            let done = crate::pods::datavol::copy_volumes(remote.as_ref(), cfg, owner, cloud, &src, &new_pod, canonical, vols, &record.mounts)
+                .await
+                .with_context(|| format!("the final sync of {canonical}'s volume(s) — nothing was swapped"))?;
+            record.copied.extend(done);
+            crate::pods::datavol::save_record_or_say(cfg, canonical, &record);
+        }
+    }
+    // Asked again right before anything moves or is renamed (reviews r2, r3): someone who came on
+    // during the prompt or a sync would leave what they write next behind on the parked original.
+    if let Some(r) = cutover_presence_refusal(remote.as_ref(), cfg, &src, force).await {
+        anyhow::bail!("NOT swapping — {r} (they came on during the final sync; {new_name} has the copy, nothing was renamed)");
+    }
+    // Volumes in the same location move now, before the names: the intent and every mount point
+    // saved first (reviews r2, r3); one that doesn't move is put back, nothing swapped.
+    let moved = match (volumes, &carry) {
+        (Some(cloud), crate::pods::datavol::Carry::Move(all_moved)) => {
+            let to_move: Vec<arena_core::archive::cloud::CloudVolume> =
+                all_moved.iter().filter(|v| !pending.iter().any(|p| p.id == v.id)).cloned().collect();
+            if !arena_core::status::is_stopped(&src.status) {
+                for v in &to_move {
+                    let at = crate::pods::datavol::mount_point(remote.as_ref(), cfg, owner, &src, v).await.context("nothing was swapped")?;
+                    record.mounts.insert(v.id, at);
+                }
+            }
             record.moved = all_moved.iter().map(|v| v.id).collect();
             record.moved_to = Some(new_id.clone());
             crate::pods::datavol::save_record(cfg, canonical, &record).context("nothing was swapped (no volume moved)")?;
-            let mounts = match crate::pods::datavol::move_volumes(remote.as_ref(), cfg, owner, cloud, &src, &new_pod, &vols, &record.mounts).await {
-                Ok(m) => m,
-                Err(e) => {
-                    // Put back: not moved after all (the pending ones stay as the record says).
-                    record.moved = pending.iter().map(|v| v.id).collect();
-                    crate::pods::datavol::save_record_or_say(cfg, canonical, &record);
-                    return Err(e).context("nothing was swapped");
-                }
-            };
-            record.mounts.extend(mounts.clone());
+            if let Err(e) = crate::pods::datavol::move_volumes(remote.as_ref(), cfg, owner, cloud, &src, &new_pod, &to_move, &record.mounts).await {
+                // What isn't back on the original stays recorded (review r3).
+                crate::pods::datavol::keep_unresolved(cloud, &mut record, &src_id).await;
+                crate::pods::datavol::save_record_or_say(cfg, canonical, &record);
+                return Err(e).context("nothing was swapped");
+            }
             for v in &pending {
                 let at = record.mounts.get(&v.id).cloned().unwrap_or_else(|| arena_core::datavol::DEFAULT_MOUNT.to_string());
                 crate::pods::datavol::ensure_mounted(remote.as_ref(), cfg, owner, &new_pod, v, &at).await.context("nothing was swapped")?;
             }
-            crate::pods::datavol::save_record_or_say(cfg, canonical, &record);
-            let mut mounts = mounts;
-            mounts.extend(record.mounts.iter().filter(|(id, _)| pending.iter().any(|v| v.id == **id)).map(|(k, v)| (*k, v.clone())));
-            Some((cloud, all_moved, mounts))
+            Some((cloud, all_moved.clone(), record.mounts.clone()))
         }
         _ => None,
     };
     let move_back = || async {
         if let Some((cloud, vols, mounts)) = &moved {
-            match crate::pods::datavol::move_volumes(remote.as_ref(), cfg, owner, *cloud, &new_pod, &src, vols, mounts).await {
-                Ok(_) => {
-                    let mut r = crate::pods::datavol::load_record(cfg, canonical, &src_id);
-                    r.moved.clear();
-                    r.moved_to = None;
-                    crate::pods::datavol::save_record_or_say(cfg, canonical, &r);
-                }
-                Err(me) => eprintln!("      moving the volume(s) back to {canonical}: {me:#}"),
+            let back = crate::pods::datavol::move_volumes(remote.as_ref(), cfg, owner, *cloud, &new_pod, &src, vols, mounts).await;
+            let mut r = crate::pods::datavol::load_record(cfg, canonical, &src_id);
+            crate::pods::datavol::keep_unresolved(*cloud, &mut r, &src_id).await;
+            crate::pods::datavol::save_record_or_say(cfg, canonical, &r);
+            if let Err(me) = back {
+                eprintln!("      moving the volume(s) back to {canonical}: {me:#}");
             }
         }
     };

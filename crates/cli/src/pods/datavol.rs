@@ -974,22 +974,43 @@ pub(crate) async fn copies_ready(cloud: &dyn VolumeCloud, record: &MoveRecord, t
     )
 }
 
+/// Keep in `record.moved` only the volumes not verifiably back on `src` (attached there): a
+/// failed move-back leaves the rest — on `-new`, detached, elsewhere, gone — to recover, never
+/// forgotten (review r3). A listing that fails keeps them all.
+pub(crate) async fn keep_unresolved(cloud: &dyn VolumeCloud, record: &mut MoveRecord, src: &str) {
+    let Ok(all) = cloud.all_volumes().await else { return };
+    record.moved.retain(|id| !all.iter().any(|v| v.id == *id && v.server.is_some_and(|s| s.to_string() == src)));
+    if record.moved.is_empty() {
+        record.moved_to = None;
+    }
+}
+
 /// A revert's half for the volumes: exactly the ones the record says a cutover moved onto `new`
-/// (and still on it) go back to `old`, mounted where they were. Said; never an error (the names
-/// are back already).
+/// go back to `old`, mounted where they were. `Ok` only when every recorded one is attached to
+/// `old` again (review r3: one detached, elsewhere or gone is unresolved, never success).
 pub(crate) async fn revert_moves(remote: &dyn Remote, cfg: &Config, owner: &dyn Provider, cloud: &dyn VolumeCloud, new: &Pod, old: &Pod, record: &MoveRecord) -> Result<()> {
     if record.moved.is_empty() || record.moved_to.as_deref() != Some(new.id.as_str()) {
         return Ok(());
     }
     let all = cloud.all_volumes().await.context("listing the volumes (`arena pods volume list` shows where they are)")?;
-    let moved: Vec<CloudVolume> = all
-        .into_iter()
+    let on_new: Vec<CloudVolume> = all
+        .iter()
         .filter(|v| record.moved.contains(&v.id) && v.server.is_some_and(|s| s.to_string() == new.id))
+        .cloned()
         .collect();
-    if moved.is_empty() {
-        return Ok(());
+    let moved = if on_new.is_empty() { Ok(Default::default()) } else { move_volumes(remote, cfg, owner, cloud, new, old, &on_new, &record.mounts).await };
+    let now = cloud.all_volumes().await.context("listing the volumes again")?;
+    let unresolved: Vec<String> = record
+        .moved
+        .iter()
+        .filter(|id| !now.iter().any(|v| v.id == **id && v.server.is_some_and(|s| s.to_string() == old.id)))
+        .map(|id| now.iter().find(|v| v.id == *id).map_or_else(|| format!("id {id} (gone)"), |v| v.name.clone()))
+        .collect();
+    match (unresolved.is_empty(), moved) {
+        (true, _) => Ok(()),
+        (false, Err(e)) => Err(e).with_context(|| format!("not back on {}: {}", old.name, unresolved.join(", "))),
+        (false, Ok(_)) => anyhow::bail!("not back on {}: {} (detached or elsewhere — the Hetzner console)", old.name, unresolved.join(", ")),
     }
-    move_volumes(remote, cfg, owner, cloud, new, old, &moved, &record.mounts).await.map(|_| ())
 }
 
 /// After a move's swap: what became of the source's volumes, in words. Pure.
@@ -1231,7 +1252,7 @@ mod tests {
         let alpha = vm("11", "devtest-alpha", "RUNNING");
         let vast = Pod { provider: "vast".into(), name: "devtest-bravo".into(), ..vm("11", "devtest-bravo", "RUNNING") };
         let fleet = Fleet(vec![alpha.clone(), vast]);
-        let cloud = project(&[alpha.clone()]);
+        let cloud = project(std::slice::from_ref(&alpha));
         let (v, _) = cloud.create_volume(&serde_json::json!({"name": "by-hand", "size": 10, "server": 11, "labels": {}})).await.unwrap();
         let remote = Arc::new(FakeRemote::new());
         let c = cfg();

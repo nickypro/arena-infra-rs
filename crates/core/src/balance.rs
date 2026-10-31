@@ -3256,9 +3256,17 @@ impl BalanceApi for HttpBalanceApi {
     async fn volumes_eur_per_hr(&self) -> Option<Result<f64, String>> {
         use crate::datavol::VolumeCloud;
         let (cloud, prefix) = self.volumes.as_ref()?;
+        // This cohort's: its label, or attached to one of its servers (named `<prefix>-…`, from
+        // the fleet project's listing) — a shared project's other volumes aren't its spend.
+        let servers = match self.spares.as_ref() {
+            Some(p) => match crate::provider::Provider::list_pods(p).await {
+                Ok(ps) => ps.into_iter().filter(|p| p.name.starts_with(&format!("{prefix}-"))).map(|p| p.id).collect(),
+                Err(e) => return Some(Err(format!("listing the servers: {e}"))),
+            },
+            None => Vec::new(),
+        };
         Some(match cloud.all_volumes().await {
-            // This cohort's (by its label): a shared project's other volumes aren't its spend.
-            Ok(all) => Ok(crate::datavol::per_hr(&crate::datavol::cohort_volumes(&all, prefix, &[]), crate::datavol::price_gb_month(cloud).await)),
+            Ok(all) => Ok(crate::datavol::per_hr(&crate::datavol::cohort_volumes(&all, prefix, &servers), crate::datavol::price_gb_month(cloud).await)),
             Err(e) => Err(e.to_string()),
         })
     }

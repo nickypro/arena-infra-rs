@@ -199,6 +199,12 @@ fn prelude(device: &str) -> String {
     )
 }
 
+/// A volume arena made is one filesystem on the whole device; one partitioned since is
+/// someone's own layout, and arena never rewrites its fstab line nor unmounts it (review r3).
+/// Shell, after [`prelude`].
+const PARTITIONED: &str = "if [ -n \"$real\" ] && [ \"$(lsblk -nrpo NAME \"$real\" 2>/dev/null | wc -l)\" -gt 1 ]; then \
+     echo \"ARENA_VOL_FAIL the volume is partitioned now — its layout is someone's own: arena leaves it be\"; exit 1; fi";
+
 /// Rewrite /etc/fstab without any line for this volume (by any of its names: [`prelude`]'s
 /// `same`), then (`Some`) with `line` — atomically, through a temp file beside it. Comments and
 /// every other line kept as they are. Shell, after [`prelude`], under [`FSTAB_LOCK`].
@@ -239,6 +245,8 @@ pub fn mount_script(device: &str, mount: &str) -> String {
          {lock} || {{ echo \"ARENA_VOL_FAIL another volume step holds /etc/fstab\"; exit 1; }}\n\
          clash=; while IFS= read -r l || [ -n \"$l\" ]; do set -- $l; case \"${{1:-}}\" in ''|\\#*) ;; *) [ \"${{2:-}}\" = \"$mnt\" ] && ! same \"$1\" && clash=\"$1\" ;; esac; done < /etc/fstab\n\
          [ -z \"$clash\" ] || {{ echo \"ARENA_VOL_FAIL /etc/fstab mounts another device at $mnt ($clash)\"; exit 1; }}\n\
+         rp=$(readlink -m \"$mnt\" 2>/dev/null || echo \"$mnt\"); [ \"$rp\" = \"$mnt\" ] || {{ echo \"ARENA_VOL_FAIL $mnt goes through a symlink (to $rp): mount at a real path\"; exit 1; }}\n\
+         {partitioned}\n\
          if [ -n \"$real\" ] && [ \"$(findmnt -rn -o TARGET -T \"$mnt\" 2>/dev/null)\" = \"$mnt\" ] && same \"$(findmnt -rn -o SOURCE -T \"$mnt\")\"; then\n\
          \x20 {fstab} || {{ echo \"ARENA_VOL_FAIL couldn't rewrite /etc/fstab\"; exit 1; }}\n\
          \x20 echo \"ARENA_VOL_MOUNTED $(df -P -B1 \"$mnt\" | awk 'NR==2{{print $2}}')\"; exit 0\n\
@@ -256,6 +264,7 @@ pub fn mount_script(device: &str, mount: &str) -> String {
         prelude = prelude(device),
         mnt = q(mount),
         lock = FSTAB_LOCK,
+        partitioned = PARTITIONED,
         fstab = fstab_rewrite(Some(&line)),
         tries = DEVICE_WAIT_SECS / 2,
     )
@@ -353,6 +362,7 @@ pub fn unmount_script(device: &str) -> String {
     format!(
         "{prelude}\nsync\n\
          {lock} || {{ echo \"ARENA_VOL_FAIL another volume step holds /etc/fstab\"; exit 1; }}\n\
+         {partitioned}\n\
          for d in $(parts); do\n\
          \x20 for m in $(findmnt -rn -o TARGET -S \"$d\" 2>/dev/null); do\n\
          \x20   umount \"$m\" 2>/dev/null || {{ echo \"ARENA_VOL_BUSY $m $(fuser -m \"$m\" 2>/dev/null | wc -w) process(es)\"; exit 1; }}\n\
@@ -362,6 +372,7 @@ pub fn unmount_script(device: &str) -> String {
          echo ARENA_VOL_UNMOUNTED",
         prelude = prelude(device),
         lock = FSTAB_LOCK,
+        partitioned = PARTITIONED,
         fstab = fstab_rewrite(None),
     )
 }
@@ -634,6 +645,15 @@ mod tests {
         let out = std::process::Command::new("sh").arg("-c").arg(rewrite(mount_script(dev, &mnt.display().to_string()))).output().unwrap();
         let said = parse_mount(&String::from_utf8_lossy(&out.stdout));
         assert!(matches!(&said, Mounted::Failed(w) if w.contains("mounts another device")), "{said:?}");
+        // A mount point that's a symlink (into a home, say): refused (review r3).
+        std::fs::write(&fstab, "UUID=abc / ext4 defaults 0 1\n").unwrap();
+        let target = dir.join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = dir.join("linked");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let out = std::process::Command::new("sh").arg("-c").arg(rewrite(mount_script(dev, &link.display().to_string()))).output().unwrap();
+        let said = parse_mount(&String::from_utf8_lossy(&out.stdout));
+        assert!(matches!(&said, Mounted::Failed(w) if w.contains("goes through a symlink")), "{said:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

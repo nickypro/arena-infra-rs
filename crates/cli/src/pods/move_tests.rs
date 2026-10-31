@@ -856,3 +856,57 @@ async fn revert_moves_back_only_what_the_cutover_moved() {
     let done = MoveRecord { copied: [(900, copy_id)].into(), ..record };
     copies_ready(&cloud, &done, &new, &originals).await.unwrap();
 }
+
+/// A cutover cut short after it moved a volume (review r3): the retry finds it on `-new` from
+/// the record, makes sure it's mounted there, and swaps — the record still names it for a revert.
+#[tokio::test(start_paused = true)]
+async fn a_cutover_cut_short_mid_move_is_reconciled_on_retry() {
+    use crate::pods::datavol::{load_record, save_record, MoveRecord};
+    let dir = tmpdir("vol-cutover-retry");
+    let cfg = cfg(&dir.0);
+    let f = Vms::new(
+        vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1"), vm("202", "devtest-alpha-new", "cx43", "10.0.0.2", "nbg1")],
+        vec![],
+    );
+    let cloud = volume_project(&[("101", "nbg1"), ("202", "nbg1")], 202, "nbg1");
+    let record = MoveRecord { src: "101".into(), mounts: [(900, "/srv/models".to_string())].into(), moved: vec![900], moved_to: Some("202".into()), ..Default::default() };
+    save_record(&cfg, "devtest-alpha", &record).unwrap();
+    let remote = Arc::new(FakeRemote::new());
+    volume_steps(&remote, false);
+    scripted(&remote, "101", NEW, "202");
+    let pods = f.list_pods().await.unwrap();
+    let opts = CutoverOpts { volumes: Some(&cloud), skip_proxy: false, no_final_sync: true, dry_run: false, yes: true, force: true };
+    migrate_cutover_on(remote.clone(), &f, &cfg, &f, "devtest-alpha", &pods, opts, "/nonexistent").await.unwrap();
+    assert_eq!(f.calls(), ["rename 101 devtest-alpha-old", "rename 202 devtest-alpha"]);
+    assert!(
+        execs(&remote, NEW).iter().any(|c| c.contains("ARENA_VOL_NO_DEVICE") && c.contains("/srv/models") && c.contains("scsi-0HC_Volume_900")),
+        "mounted on -new where the record says"
+    );
+    assert_eq!(load_record(&cfg, "devtest-alpha", "101").moved, [900], "still known for a revert");
+}
+
+/// A revert that can't bring a recorded volume back (it's detached now) fails and keeps it in
+/// the record (review r3); `keep_unresolved` keeps only what isn't back on the original.
+#[tokio::test(start_paused = true)]
+async fn an_unresolved_volume_stays_recorded() {
+    use crate::pods::datavol::{keep_unresolved, revert_moves, MoveRecord};
+    use arena_core::archive::cloud::ArchiveCloud;
+    let dir = tmpdir("vol-unresolved");
+    let cfg = cfg(&dir.0);
+    let old = vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1");
+    let new = vm("202", "devtest-alpha-new", "cx43", "10.0.0.2", "nbg1");
+    let cloud = volume_project(&[("101", "nbg1"), ("202", "nbg1")], 202, "nbg1");
+    cloud.detach(900).await.unwrap();
+    let remote = Arc::new(FakeRemote::new());
+    volume_steps(&remote, false);
+    scripted(&remote, "101", NEW, "202");
+    let f = Vms::new(vec![old.clone(), new.clone()], vec![]);
+    let mut record = MoveRecord { src: "101".into(), moved: vec![900], moved_to: Some("202".into()), ..Default::default() };
+    let e = format!("{:#}", revert_moves(remote.as_ref(), &cfg, &f, &cloud, &new, &old, &record).await.unwrap_err());
+    assert!(e.contains("not back on devtest-alpha") && e.contains("devtest-alpha-data"), "{e}");
+    keep_unresolved(&cloud, &mut record, "101").await;
+    assert_eq!(record.moved, [900]);
+    cloud.attach(900, 101).await.unwrap();
+    keep_unresolved(&cloud, &mut record, "101").await;
+    assert!(record.moved.is_empty() && record.moved_to.is_none());
+}
