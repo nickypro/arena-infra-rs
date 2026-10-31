@@ -1070,11 +1070,15 @@ done
             assert!(kept().iter().all(|b| is_ours(b)));
 
             // An editor with the (empty) file open, writing after the swap: its save lands in the
-            // file kept, never in a deleted one.
+            // file kept, never in a deleted one. The test is the editor: it opens the file before
+            // the run and writes once the run is over. (It was a hook's background shell that slept
+            // 0.3 s: under load its open came after the swap, or its write before it — a flake.)
             std::fs::write(&file, "").unwrap();
-            let late = "(exec 3>\"$1\"; sleep 0.3; printf '{\"late\": true}' >&3) &";
-            let out = ok(&run(&[("ARENA_SETTINGS_RACE", late)]));
+            let mut editor = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+            let out = ok(&run(&[]));
             assert!(out.contains("; the old file is kept as "), "{out}");
+            std::io::Write::write_all(&mut editor, b"{\"late\": true}").unwrap();
+            drop(editor);
             assert!(is_ours(&pod.settings()));
             assert_eq!(kept(), ["{\"late\": true}"]);
 
