@@ -19,6 +19,29 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-10-31 · arena 2.5: move a Hetzner box to a bigger type, keeping its files
+- `arena pods replace apple --server-type cx43` and `pods migrate copy apple --server-type cx43`
+  now work on Hetzner: a new server of that type (a comma list falls back), wherever
+  `HETZNER_LOCATION` allows — it may land in another location, and the run says so — the home
+  copied straight from the old box, the names swapped by two renames (no delete-then-wait gap),
+  the hostname and `~/.name` following. `--keep-trying` waits for room as `up` does.
+- `arena pods spare up 4 --server-type cx43 --keep-trying` makes capacity spares ahead of need
+  (`<prefix>-spare-N`, nobody's machine: no proxy, backup or keys). `--onto-spare` on `replace` and
+  `migrate copy` takes one; `--onto <machine>` takes another machine arena has (a cohort machine
+  only with `--force`, saying what's on it). `pods spare list` / `spare down`. `pods list`,
+  `balance`, `spend` and `teardown --check` count the spares.
+- `arena pods copy-home rarity scoot` moves a person onto another machine that keeps its own
+  name: the same copy, nothing renamed; refused while someone is on either machine, and when
+  `scoot` has files of its own in the way (named) unless `--overwrite` (moved aside, never deleted).
+- `replace` and `migrate cutover` refuse a box someone is on (an SSH session, a Jupyter tab, a VS
+  Code server) unless `--force`; `replace` points at `migrate` for those.
+- The recipe that replaces a hand-made swapper script: [Hetzner: a bigger type, capacity spares,
+  moving a person](docs/REFERENCE.md#hetzner-a-bigger-type-capacity-spares-moving-a-person).
+
+### Action needed
+- A script that runs `arena pods replace` on pods people may be on now stops there (nothing
+  changed): add `--force`, or move those with `migrate copy` + `migrate cutover`.
+
 ## 2026-10-31 · Project week: the dashboard's setup on a Hetzner VM, staff names, renames say the new port
 - The dashboard's **setup** on a Hetzner (or Shadeform) VM now runs what `arena pods setup` runs
   there: the VM setup script with its swap, the keys authorized and the hostname. It ran the

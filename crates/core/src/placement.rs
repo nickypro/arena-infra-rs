@@ -119,6 +119,10 @@ pub struct Request {
     pub order: Order,
     /// Placement near the proxy ([`Self::with_near`]); `None` = off, or nothing it could do.
     pub near: Option<Near>,
+    /// Hetzner server types to try, in order (`pods replace`/`migrate copy --server-type
+    /// cx43,cx53`: one option each — a type with no room anywhere falls back to the next).
+    /// Empty = the one the base spec creates. Never on a GPU provider.
+    pub server_types: Vec<String>,
 }
 
 impl Request {
@@ -152,7 +156,7 @@ impl Request {
                 return Err(Error::Config(format!("--max-price must be a positive $/h (got {p})")));
             }
         }
-        Ok(Self { gpus, clouds, gpu_count: base.gpu_count, max_price, order, near: None })
+        Ok(Self { gpus, clouds, gpu_count: base.gpu_count, max_price, order, near: None, server_types: Vec::new() })
     }
 
     /// With placement near the proxy (`near`: config's [`Near::from_config`]), where it can
@@ -172,7 +176,14 @@ impl Request {
     /// single-spec path for this (same output, same `--keep-trying`), so nothing changes for an
     /// operator who doesn't use the new flags.
     pub fn is_single(&self) -> bool {
-        self.gpus.len() == 1 && self.clouds.len() == 1 && self.max_price.is_none() && self.near.is_none()
+        self.gpus.len() == 1 && self.clouds.len() == 1 && self.max_price.is_none() && self.near.is_none() && self.server_types.len() <= 1
+    }
+
+    /// With the Hetzner server types to try, in order ([`Self::server_types`]): deduped,
+    /// lowercased. Pure.
+    pub fn with_server_types(mut self, types: &[String]) -> Self {
+        self.server_types = dedup(types.iter().map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty()).collect());
+        self
     }
 
     /// Checks that need the target provider. On RunPod every tier must be COMMUNITY or
@@ -438,6 +449,10 @@ pub struct PlacementOption {
     /// and so the price, only at create. `None` = just `--max-price`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<f64>,
+    /// The Hetzner server type this option creates (`--server-type` lists, [`Request::server_types`]);
+    /// `None` = the base spec's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_type: Option<String>,
 }
 
 impl PlacementOption {
@@ -570,23 +585,38 @@ pub fn plan_options(req: &Request, provider: &str, prices: &PriceBook) -> Option
         req.gpus.iter().collect()
     };
 
+    // Hetzner's options are its server types (`--server-type cx43,cx53`), else the one the base
+    // spec creates; nowhere else is there a server type.
+    let types: Vec<Option<&String>> = if cpu_only && !req.server_types.is_empty() {
+        req.server_types.iter().map(Some).collect()
+    } else {
+        vec![None]
+    };
     let mut all = Vec::new();
     for g in gpus {
-        for c in &clouds {
-            let q = prices.quote(g, c.as_deref());
-            all.push(PlacementOption {
-                listed: all.len(),
-                gpu: g.clone(),
-                label: if cpu_only { "CPU VM".to_string() } else { format!("{}×{}", req.gpu_count, gpu_short(g, prices)) },
-                cloud: c.clone(),
-                gpu_count: req.gpu_count,
-                price_per_gpu: q.price_per_gpu,
-                price_per_pod: q.price_per_gpu.map(|p| p * f64::from(req.gpu_count.max(1))),
-                price_source: q.source,
-                stock: q.stock,
-                near: None,
-                cap: None,
-            });
+        for t in &types {
+            for c in &clouds {
+                let q = prices.quote(g, c.as_deref());
+                let label = match (cpu_only, t) {
+                    (true, Some(t)) => format!("{t} CPU VM"),
+                    (true, None) => "CPU VM".to_string(),
+                    (false, _) => format!("{}×{}", req.gpu_count, gpu_short(g, prices)),
+                };
+                all.push(PlacementOption {
+                    listed: all.len(),
+                    gpu: g.clone(),
+                    label,
+                    cloud: c.clone(),
+                    gpu_count: req.gpu_count,
+                    price_per_gpu: q.price_per_gpu,
+                    price_per_pod: q.price_per_gpu.map(|p| p * f64::from(req.gpu_count.max(1))),
+                    price_source: q.source,
+                    stock: q.stock,
+                    near: None,
+                    cap: None,
+                    server_type: t.cloned(),
+                });
+            }
         }
     }
 
@@ -992,6 +1022,9 @@ pub fn spec_for(base: &PodSpec, name: &str, option: &PlacementOption) -> PodSpec
     }
     spec.region = option.near;
     spec.max_price = lower_cap(spec.max_price, option.cap);
+    if let Some(t) = &option.server_type {
+        spec.server_type = Some(t.clone());
+    }
     spec
 }
 
@@ -1502,6 +1535,7 @@ mod tests {
             max_price: cap,
             order,
             near: None,
+            server_types: Vec::new(),
         }
     }
 
@@ -1752,6 +1786,20 @@ mod tests {
         let hz = plan_options(&r, "hetzner", &PriceBook::unpriced());
         assert_eq!(order_of(&hz), [opt("CPU VM", None)]);
         assert_eq!(hz.notes.len(), 2, "{:?}", hz.notes);
+        assert_eq!(hz.options[0].server_type, None, "the base spec's type");
+        // `--server-type cx43,CX53,cx43` (replace/migrate): one option per type, as listed, each
+        // creating its own — a type with no room anywhere falls back to the next.
+        let types = req(&[A4000], &["COMMUNITY"], 1, None, Order::Cheapest).with_server_types(&["cx43".into(), "CX53".into(), "cx43".into()]);
+        assert!(!types.is_single());
+        let hz = plan_options(&types, "hetzner", &PriceBook::unpriced());
+        assert_eq!(order_of(&hz), [opt("cx43 CPU VM", None), opt("cx53 CPU VM", None)]);
+        let spec = spec_for(&PodSpec { server_type: Some("cx33".into()), ..PodSpec::default() }, "devtest-apple-new", &hz.options[1]);
+        assert_eq!(spec.server_type.as_deref(), Some("cx53"));
+        assert!(req(&[A4000], &["COMMUNITY"], 1, None, Order::Cheapest).with_server_types(&["cx43".into()]).is_single());
+        // Never on a GPU provider: the types don't multiply its options.
+        let rp = plan_options(&types, "runpod", &PriceBook::unpriced());
+        assert_eq!(rp.options.len(), 1);
+        assert_eq!(rp.options[0].server_type, None);
         // A cap leaves nothing to try on an unpriced provider — reported, not risked.
         let capped = plan_options(&req(&[A4000], &["VERIFIED"], 1, Some(1.0), Order::Cheapest), "vast", &PriceBook::unpriced());
         assert!(capped.options.is_empty());

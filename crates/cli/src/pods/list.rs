@@ -70,6 +70,15 @@ pub(crate) async fn probe_gpus(remote: &Arc<dyn Remote>, cfg: &Config, pods: &mu
     }
 }
 
+/// The capacity spares' reader for this config (its Hetzner project), when there's a Hetzner
+/// key — never in this crate's unit tests (no key reaches the network).
+pub(crate) fn spare_reader(cfg: &Config) -> Option<Box<dyn arena_core::spare::SpareCloud>> {
+    if cfg!(test) {
+        return None;
+    }
+    crate::image::hetzner(cfg).ok().map(|h| Box::new(h) as Box<dyn arena_core::spare::SpareCloud>)
+}
+
 /// `pods list`, as (stdout, stderr lines) — returned rather than printed, so the contract
 /// is tested: every provider's pods (`Listing` from `list_by_provider`, so a provider that
 /// failed is known: a partial failure is one warning line, a total failure the same error
@@ -122,7 +131,13 @@ pub(crate) async fn list_with(
             balance::observe(bal.api.as_ref(), &state, mode, balance::INLINE_TIMEOUT, now).await
         }
     };
-    let (listed, fetched) = tokio::join!(listing, observing);
+    // The capacity spares (Hetzner): in no fleet listing, so read on their own — for the line
+    // under the table and the spend ledger. Never under `--json` (unchanged byte for byte).
+    let spares = async {
+        let cloud = if json { None } else { spare_reader(cfg) }?;
+        arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, cloud.spares()).await.ok()?.ok()
+    };
+    let (listed, fetched, spares) = tokio::join!(listing, observing, spares);
     let (listing, pods, mut warnings) = listed?;
     // What each machine costs, recorded for `arena spend` (quietly), as of when it listed.
     spend::SpendCtx::from_config(cfg).listing(&listing, &pods, now);
@@ -150,6 +165,12 @@ pub(crate) async fn list_with(
         let ends = reap::ends_column(cfg, &pods, now, reap::real::tz());
         out.push_str(&fleet::render_pods_table_with(&pods, ends.as_deref()));
         out.push_str(&format!("{}\n", fleet::listing_footer(&fleet::fleet_cost(&pods), &failed)));
+    }
+    if let Some(spares) = spares.filter(|_| listing.status("hetzner") == arena_core::proxy::ListingStatus::Ok) {
+        spend::SpendCtx::from_config(cfg).spares("hetzner", &spares, now);
+        if let Some(line) = arena_core::spare::footer(&spares) {
+            out.push_str(&format!("{line}\n"));
+        }
     }
     if !fetched.is_empty() {
         let (policy, _) = BalancePolicy::from_config(cfg);

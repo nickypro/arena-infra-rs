@@ -374,14 +374,14 @@ const fn row(op: Op) -> [Support; 5] {
             YES, // RunPod
             YES, // RunPod v1
             no("arena can't read a Vast instance's spec back yet", REMAKE_VAST), // Vast
-            no("arena can't read a Hetzner VM's spec back yet", REMAKE_HETZNER), // Hetzner
+            note(HETZNER_MOVE), // Hetzner
             note("not live-tested"), // Shadeform
         ],
         Op::Migrate => [
             YES, // RunPod
             YES, // RunPod v1
             no("arena can't read a Vast instance's spec back yet", REMAKE_VAST), // Vast
-            no("arena can't read a Hetzner VM's spec back yet", REMAKE_HETZNER), // Hetzner
+            note(HETZNER_MOVE), // Hetzner
             no(
                 "the cutover's proxy check reads RunPod's pod id, so it can't pass on Shadeform (it reverts itself)",
                 "`arena pods replace <name>`",
@@ -467,6 +467,11 @@ const fn row(op: Op) -> [Support; 5] {
         Op::ApiJson => [YES, YES, YES, YES, YES],
     }
 }
+
+/// What to know before moving a Hetzner VM (`replace`, `migrate`): a server can't change
+/// location, so the new one may land in another.
+const HETZNER_MOVE: &str =
+    "--server-type moves it to a bigger type; the new VM goes wherever HETZNER_LOCATION allows, maybe another location";
 
 const SERVER_TYPE_IS_HETZNERS: &str = "only Hetzner VMs are sized by server type";
 const SIZE_A_GPU_POD: &str = "pass --provider hetzner, or size a GPU pod with --gpu / --gpus";

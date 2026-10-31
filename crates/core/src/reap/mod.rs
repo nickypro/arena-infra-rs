@@ -981,14 +981,7 @@ impl ReapState {
 /// metadata service's. An unreadable or empty id fails it. `None` for a provider the reaper
 /// doesn't support.
 pub fn identity_condition(provider: &str, id: &str) -> Option<String> {
-    match provider {
-        "runpod" => Some(crate::replica::identity_condition(crate::replica::POD_ID_ENVIRON, id)),
-        "hetzner" => Some(format!(
-            "[ \"$(cat /var/lib/cloud/data/instance-id 2>/dev/null || curl -s -m 2 http://169.254.169.254/hetzner/v1/metadata/instance-id 2>/dev/null)\" = '{}' ]",
-            id.replace('\'', "'\\''")
-        )),
-        _ => None,
-    }
+    crate::replica::pod_identity(provider, id)
 }
 
 /// What a frozen copy under `reaped/<name>/` is, by its leaf's name (RS1): the verified backup
