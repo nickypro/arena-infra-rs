@@ -220,8 +220,9 @@ pub(crate) fn take_line(onto: &Onto, new_name: &str) -> String {
     }
 }
 
-/// The spare-claim lock ([`arena_core::spare::claim_lock`]) in this fleet's state dir, held
-/// until dropped — in this crate's tests without `ARENA_STATE_DIR`, a temp dir of the process's
+/// The claim lock ([`arena_core::spare::claim_lock`]) in this fleet's state dir — held by every
+/// take of a machine as `-new` (a spare's adoption, an `--onto` rename) and `spare down` — until
+/// dropped — in this crate's tests without `ARENA_STATE_DIR`, a temp dir of the process's
 /// (never the real state dir).
 pub(crate) fn claim_spares(cfg: &Config) -> Result<std::fs::File> {
     let dir = if cfg!(test) && cfg.get("ARENA_STATE_DIR").is_none() {
@@ -265,6 +266,21 @@ pub(crate) async fn take(owner: &dyn Provider, spares: Option<&dyn SpareCloud>, 
         })
         .await
     } else {
+        // Under the same lock, from a fresh listing (review r3): the machine must still be the
+        // one chosen, under the name it had — one another move has promoted meanwhile (renamed
+        // to someone's name) is never taken from a stale look.
+        let _claim = claim_spares(cfg)?;
+        let now = owner.list_pods().await.context("listing the machines again before taking one")?;
+        match now.iter().find(|p| p.id == onto.pod.id) {
+            Some(p) if p.name == onto.pod.name => {}
+            Some(p) => anyhow::bail!(
+                "taking {} as {new_name}: it's called {} now (another run took or renamed it meanwhile) — nothing was renamed; \
+                 run again to choose",
+                onto.pod.name,
+                p.name
+            ),
+            None => anyhow::bail!("taking {} as {new_name}: it's gone from the listing — nothing was renamed", onto.pod.name),
+        }
         arena_core::retry::retrying(&policy, || owner.rename_pod(id, new_name)).await
     };
     done.with_context(|| format!("taking {} as {new_name} — nothing was renamed", onto.pod.name))?;

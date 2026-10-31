@@ -1008,6 +1008,10 @@ pub(crate) async fn replace_on(
         )
     })?;
     clean_marker(owner, remote.as_ref(), &created.id, cfg).await;
+    // And once more after that transfer, right before the first rename (review r3).
+    if let Some(r) = swap_presence_refusal(remote.as_ref(), cfg, &src, &new_name, force, "during the final sync").await {
+        anyhow::bail!("{r}");
+    }
 
     // [6/7] swap. Old-first so the canonical name is never held by two pods at once. If the
     // promote fails after parking the source, roll the source's name back so the canonical

@@ -175,9 +175,23 @@ pub(crate) async fn copy_home_on(remote: Arc<dyn Remote>, cfg: &Config, owner: &
         println!("aborted.");
         return Ok(());
     }
-    // Asked again after the dry run and the prompt (review r2: someone may have come on).
+    // Asked again after the dry run and the prompt (review r2: someone may have come on) — and
+    // the dry run again (review r3: a file of `to`'s own may have appeared while it waited).
     if let Some(r) = busy_refusal(remote.as_ref(), cfg, src, dest, force).await.into_iter().next() {
         anyhow::bail!("{r} (nothing was copied)");
+    }
+    if !overwrite {
+        match would_move_aside(cfg, owner, remote.as_ref(), &src.id, &dest.id).await {
+            Ok(files) => {
+                if let Some(r) = files_refusal(from, to, &files, false) {
+                    anyhow::bail!("{r} (they appeared while the prompt waited; nothing was copied)");
+                }
+            }
+            Err(why) => anyhow::bail!(
+                "refusing to copy {from}'s home onto {to}: couldn't look again whether {to} has files of its own in the way \
+                 ({why}) — nothing was copied; --overwrite copies anyway (moved aside, never deleted)"
+            ),
+        }
     }
     println!("copying {from} → {to}…");
     copy_pod_files(cfg, owner, remote.as_ref(), &src.id, &dest.id, &CopyOpts::new(false))

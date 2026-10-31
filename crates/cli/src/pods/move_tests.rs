@@ -219,8 +219,9 @@ async fn replace_moves_a_vm_to_a_bigger_type_and_its_hostname_follows() {
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(90), "no settle/persist wait on a VM: {:?}", started.elapsed());
     let (on_old, on_new) = (execs(&remote, OLD), execs(&remote, NEW));
-    // Asked who's on it before anything was made, before the prompt and again after it.
-    assert_eq!(on_old.iter().filter(|c| c.contains("ARENA_IDLE_NOW")).count(), 3, "{on_old:?}");
+    // Asked who's on it before anything was made, before the prompt, after it and after the
+    // final sync.
+    assert_eq!(on_old.iter().filter(|c| c.contains("ARENA_IDLE_NOW")).count(), 4, "{on_old:?}");
     // The copy, then the final sync of what changed since, right before the swap.
     assert_eq!(on_old.iter().filter(|c| c.contains("\nrsync ") && !c.contains("--dry-run")).count(), 2, "{on_old:?}");
     // The copy ran on the old VM, its remote rsync only on the new VM itself (by server id).
@@ -266,12 +267,12 @@ async fn replace_refuses_a_vm_someone_is_on() {
     }
 }
 
-/// Someone came on while it copied — or while its prompt waited (review r2: asked again after
-/// it): no swap — the original untouched, `-new` built — and the way on is `migrate cutover` (it
+/// Someone came on while it copied — or while its prompt waited, or during the final sync
+/// (reviews r2, r3: asked again after each): no swap — the original untouched, `-new` built — and the way on is `migrate cutover` (it
 /// checks again).
 #[tokio::test(start_paused = true)]
 async fn replace_doesnt_swap_when_someone_came_on_during_the_copy() {
-    for (busy_from, when) in [(1, "while it copied"), (2, "while the prompt waited")] {
+    for (busy_from, when) in [(1, "while it copied"), (2, "while the prompt waited"), (3, "during the final sync")] {
         let dir = tmpdir(&format!("replace-came-on-{busy_from}"));
         let cfg = cfg(&dir.0);
         let f = Vms::new(vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1")], vec![]);
@@ -296,8 +297,9 @@ async fn replace_doesnt_swap_when_someone_came_on_during_the_copy() {
         assert!(e.contains("arena pods migrate cutover devtest-alpha"), "{e}");
         assert_eq!(f.calls(), ["create devtest-alpha-new cx33"], "no rename, no terminate");
         assert_eq!(probes.load(Ordering::SeqCst), busy_from + 1);
-        // No final sync once someone's on it: only the copy ran.
-        assert_eq!(execs(&remote, OLD).iter().filter(|c| c.contains("\nrsync ") && !c.contains("--dry-run")).count(), 1);
+        // No final sync once someone's on it before it: only the copy ran.
+        let syncs = if busy_from >= 3 { 2 } else { 1 };
+        assert_eq!(execs(&remote, OLD).iter().filter(|c| c.contains("\nrsync ") && !c.contains("--dry-run")).count(), syncs);
     }
 }
 
@@ -563,6 +565,45 @@ async fn copy_home_moves_a_person_without_renaming_anything() {
     let e = copy_home_on(busy.clone(), &cfg, &f, &src, &dest, opts(true, false)).await.unwrap_err().to_string();
     assert!(e.contains("devtest-bravo — someone is on it (1 SSH session)") && e.contains("--force"), "{e}");
     copy_home_on(busy, &cfg, &f, &src, &dest, opts(true, true)).await.unwrap();
+
+    // Nothing in the way at the preview, a file of bravo's own by the time it copies (review
+    // r3: the dry run runs again after the prompt): refused, nothing copied.
+    let later = Arc::new(FakeRemote::new());
+    let looks = Arc::new(AtomicUsize::new(0));
+    let seen = looks.clone();
+    later.on(
+        OLD,
+        "--dry-run",
+        FakeReply::from_cmd(move |_| {
+            FakeReply::stdout(if seen.fetch_add(1, Ordering::SeqCst) == 0 { "<f+++++++++ new.py\n" } else { "*deleting   appeared.txt\n" })
+        }),
+    );
+    later.on(NEW, "ARENA_IDLE_NOW", FakeReply::stdout(&Reply { gpu: None, ..Reply::default() }.render()));
+    scripted(&later, "101", NEW, "202");
+    let e = copy_home_on(later.clone(), &cfg, &f, &src, &dest, opts(false, false)).await.unwrap_err().to_string();
+    assert!(e.contains("appeared.txt") && e.contains("appeared while the prompt waited"), "{e}");
+    assert_eq!(looks.load(Ordering::SeqCst), 2);
+    assert!(!execs(&later, OLD).iter().any(|c| c.contains("\nrsync ") && !c.contains("--dry-run")), "nothing copied");
+}
+
+/// A machine taken with `--onto` that another move promoted meanwhile (review r3: renamed to a
+/// participant's name while this one waited at its prompt) is never taken from the stale look.
+#[tokio::test]
+async fn an_onto_machine_renamed_meanwhile_isnt_taken() {
+    use crate::pods::adopt::{take, Onto};
+    let dir = tmpdir("onto-stale");
+    let cfg = cfg(&dir.0);
+    let helper = vm("303", "devtest-helper", "cx43", "10.0.0.3", "nbg1");
+    let f = Vms::new(vec![helper.clone()], vec![]);
+    let onto = Onto { pod: helper, spare: false };
+    f.rename_pod("303", "devtest-alpha").await.unwrap();
+    let e = take(&f, Some(&f), &cfg, &onto, "devtest-bravo-new").await.unwrap_err();
+    assert!(format!("{e:#}").contains("it's called devtest-alpha now"), "{e:#}");
+    assert_eq!(f.calls(), ["rename 303 devtest-alpha"], "no second rename");
+    // Still under its name: taken.
+    let f = Vms::new(vec![vm("304", "devtest-helper", "cx43", "10.0.0.3", "nbg1")], vec![]);
+    take(&f, Some(&f), &cfg, &Onto { pod: vm("304", "devtest-helper", "cx43", "10.0.0.3", "nbg1"), spare: false }, "devtest-bravo-new").await.unwrap();
+    assert_eq!(f.calls(), ["rename 304 devtest-bravo-new"]);
 }
 
 /// Two moves that picked the same spare (review r2): the first takes it; the second is refused
