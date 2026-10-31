@@ -7,8 +7,9 @@ use arena_core::remote::{describe_error, Remote};
 use arena_core::ssh::SshTarget;
 use arena_core::{snapshot, Config, Pod};
 
+use crate::backups;
 use crate::state::Action;
-use crate::{backups, truncate};
+use crate::table::truncate;
 
 // Per-call SSH budgets for the actions (every pod call goes through `Remote` with one, so
 // a wedged pod ends its action with `timed out after Ns` instead of a `working…` modal
