@@ -1467,6 +1467,46 @@ async fn reimage_refuses_a_pod_someone_is_on_unless_forced() {
     assert!(e.contains("1 pod(s) failed to reimage: devtest-bravo"), "{e}");
     assert_eq!(f.calls(), ["reimage r-alpha img:9"]);
     assert_eq!(bravo_probes.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // Stopped at the start, started (and someone on it) while alpha was reimaged (review
+    // R2-1): its status is read again before its own reimage — probed, refused.
+    let f = Arc::new(fleet());
+    f.pods.lock().unwrap()[1].status = "EXITED".into();
+    let remote = Arc::new(FakeRemote::new());
+    let alpha_probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (seen, fleet_now) = (alpha_probes.clone(), f.clone());
+    remote.on(
+        "10.0.0.1:22001",
+        "ARENA_IDLE_NOW",
+        FakeReply::from_cmd(move |_| {
+            // Alpha's second look is right before its reimage: bravo gets started meanwhile.
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                fleet_now.pods.lock().unwrap()[1].status = "RUNNING".into();
+            }
+            FakeReply::stdout(&Reply::default().render())
+        }),
+    );
+    remote.on("10.0.0.1:22002", "ARENA_IDLE_NOW", FakeReply::stdout(&Reply { sessions: vec![[10, 9, 9, 9]], ..Reply::default() }.render()));
+    let pods = f.pods.lock().unwrap()[..2].to_vec();
+    let e = handle_reimage(f.as_ref(), remote.clone(), &cfg, &named(&pods), None, false, opts, FAST, &keys_dir).await.unwrap_err().to_string();
+    assert!(e.contains("1 pod(s) failed to reimage: devtest-bravo"), "{e}");
+    assert_eq!(f.calls(), ["reimage r-alpha img:9"]);
+    assert_eq!(remote.calls_to("10.0.0.1:22002").len(), 1, "bravo probed once: when it was running");
+    // A pod gone from the listing by then: refused (who's on it can't be known).
+    let f = Arc::new(fleet());
+    let remote = Arc::new(FakeRemote::new());
+    let fleet_now = f.clone();
+    remote.on(
+        "10.0.0.1:22001",
+        "ARENA_IDLE_NOW",
+        FakeReply::from_cmd(move |_| {
+            fleet_now.pods.lock().unwrap().retain(|p| p.id != "r-alpha"); // gone by the next listing
+            FakeReply::stdout(&Reply::default().render())
+        }),
+    );
+    let pods = f.pods.lock().unwrap()[..1].to_vec();
+    let e = handle_reimage(f.as_ref(), remote.clone(), &cfg, &named(&pods), None, false, opts, FAST, &keys_dir).await.unwrap_err().to_string();
+    assert!(e.contains("1 pod(s) failed to reimage: devtest-alpha"), "{e}");
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
     // A stopped pod: no one can be on it — not probed, not refused.
     let f = fleet();
     f.pods.lock().unwrap()[0].status = "EXITED".into();

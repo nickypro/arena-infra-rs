@@ -146,10 +146,11 @@ pub(crate) async fn handle_reimage(
     let policy = arena_core::retry::RetryPolicy::default();
     let mut failed = Vec::new();
     for pod in pods {
-        // Asked again right before its wipe (review F2): the prompt may have waited, and a
+        // Asked again right before its wipe (review F2), of the pod as it's listed NOW (R2-1: one
+        // stopped at the start may have been started since): the prompt may have waited, and a
         // rebuild before it may have taken 15 min — someone on it since isn't wiped unasked.
         if !force {
-            if let Some(r) = busy_refusals(&remote, cfg, &[pod]).await.pop() {
+            if let Some(r) = busy_now(provider, &remote, cfg, pod, &policy).await {
                 eprintln!("[not reimaged] {}: {r}", pod.name);
                 failed.push(pod.name.clone());
                 continue;
@@ -293,6 +294,30 @@ pub(crate) fn image_lines(container: Option<&str>, vms: &[VmImage]) -> Vec<Strin
         out.push(format!("VM image{ty}: {}", v.said));
     }
     out
+}
+
+/// [`busy_refusals`] for `pod` as the provider lists it now — its status and endpoint may have
+/// changed since the selection (started, restarted). Not listed now, or no listing: refused, as
+/// someone may be on it.
+async fn busy_now(
+    provider: &dyn Provider,
+    remote: &Arc<dyn Remote>,
+    cfg: &Config,
+    pod: &arena_core::Pod,
+    policy: &arena_core::retry::RetryPolicy,
+) -> Option<String> {
+    let now = match arena_core::retry::retrying(policy, || provider.list_pods()).await {
+        Ok(listed) => listed.into_iter().find(|p| p.id == pod.id && p.provider == pod.provider),
+        Err(_) => None,
+    };
+    match now {
+        Some(p) => busy_refusals(remote, cfg, &[&p]).await.pop(),
+        None => Some(format!(
+            "refusing to reimage {}: couldn't list it again right before its reimage, so whether anyone is on it now isn't \
+             known. Or pass --force.",
+            pod.name
+        )),
+    }
 }
 
 /// What a reimage tells the operator who'd wipe someone's session: wait, and keep their work.
