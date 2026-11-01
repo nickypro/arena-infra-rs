@@ -36,11 +36,13 @@ pub struct Pod {
     /// JSON when unknown, so other providers' `pods list --json` is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
-    /// Whether the provider has the pod **locked** (RunPod REST v2's `locked`; see
-    /// [`crate::lock`]): stop, restart and terminate are refused for it by the provider
-    /// itself — from any client, RunPod's own console included. `Some(false)` = reported
-    /// unlocked; `None` = the backend doesn't report a lock (Vast, Hetzner), which is never
-    /// read as "locked". Left out of the JSON when unknown, like `machine_id`.
+    /// Whether the provider has the pod **locked** (see [`crate::lock`]): RunPod REST v2's
+    /// `locked` — stop, restart and terminate refused by RunPod itself, from any client, its
+    /// own console included — or a Hetzner VM's delete + rebuild protection (a delete and a
+    /// rebuild refused by Hetzner the same way). arena refuses stop, restart, reimage and
+    /// terminate of either up front. `Some(false)` = reported unlocked; `None` = the backend
+    /// doesn't report a lock (Vast, Shadeform), which is never read as "locked". Left out of
+    /// the JSON when unknown, like `machine_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locked: Option<bool>,
     /// The provider reports the pod up — RunPod v2: `RUNNING` with a live `runtime` — yet it
@@ -67,13 +69,12 @@ pub struct Pod {
     /// Never written to JSON, like `disk_gb`.
     #[serde(default, skip_serializing)]
     pub volume_gb: Option<f64>,
-    /// Whether the provider refuses to DELETE this pod: Hetzner's `protection.delete` (set in
-    /// its console). A terminate fails until it's lifted there. Not a lock ([`Self::locked`]):
-    /// stop and restart still work, so the commands that refuse a locked pod don't read it —
-    /// only the auto-reaper does (`crate::reap::lock_state`: a protected server is never a
-    /// candidate, and nothing here ever lifts the protection). `None` = the backend doesn't
-    /// report one (RunPod, Vast), or the field was missing or odd. Left out of the JSON when
-    /// unknown.
+    /// Whether the provider refuses to DELETE this pod: Hetzner's `protection.delete` — set by
+    /// `pods lock` (which [`Self::locked`] reads back) or in its console. A terminate fails until
+    /// it's lifted (`pods unlock`). The auto-reaper reads it (`crate::reap::lock_state`: a
+    /// protected server is never a candidate, and the reaper never lifts it). `None` = the
+    /// backend doesn't report one (RunPod, Vast), or the field was missing or odd. Left out of
+    /// the JSON when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_protected: Option<bool>,
     /// When the provider created the pod (unix seconds; RunPod REST v2's `createdAt`,

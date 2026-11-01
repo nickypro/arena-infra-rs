@@ -19,6 +19,31 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-01 · arena 2.10: `pods reimage` and `pods lock` on Hetzner VMs
+- **`pods reimage` works on a Hetzner VM**: Hetzner's rebuild. The whole disk is written again from
+  the VM image, and the server keeps its id, name, IP and type. The image is `--image`, else
+  `HETZNER_IMAGE`: `arena`, a snapshot id or a name like `ubuntu-24.04`. It is never the RunPod
+  image. `arena` is resolved before the prompt and shown, e.g. `VM image (cx33): image arena →
+  snapshot 449743460 (…, built …, commit …)`. Today's keys go in by cloud-init, as at a create. It
+  waits for Hetzner to finish, then setup runs as on a new VM (swap, hostname, `~/.name`, the env)
+  and the proxy is synced. The `--wipe-ok` gate applies (a VM has no volume to keep the repo).
+  A `pods volume` keeps its files, but it comes back unmounted: `arena pods volume mount <name>`.
+  The VM's SSH host key changes. arena doesn't check it, but your own `known_hosts` may need
+  `ssh-keygen -R <ip>`.
+- **`pods reimage` refuses a pod someone is on**, as `replace` does: an SSH session, another
+  inbound connection or a VS Code server. It also refuses a pod it can't check (no endpoint,
+  unreachable). This applies on RunPod too. `--force` reimages anyway. A stopped pod isn't
+  checked. The dry run says which pods would be refused.
+- `--image` with RunPod pods and Hetzner VMs selected together is refused: it can't mean both a
+  container image and a VM image. Without `--image`, each pod gets its own configured image.
+- **`pods lock`/`unlock` work on a Hetzner VM**: they set its delete + rebuild protection.
+  Hetzner then refuses a delete or a rebuild from any client, its console included. arena's
+  stop, restart, reimage, terminate, replace and migrate refuse a locked VM up front, as they do a
+  locked RunPod pod. `terminate --unlock` lifts it. `up --lock` works on Hetzner too.
+- `pods list` (with `--json`: `locked`) and the dashboard's `L` show a Hetzner VM's lock. It's
+  read from the server's protection, so protection set in Hetzner's console shows as locked, and
+  `pods unlock` lifts it. The auto-reaper already left such a VM alone and still does.
+
 ## 2026-10-31 · `arena backups` no longer misses a backup that's running
 - `arena backups` and the dashboard's backups screen tell a running backup by its lock (a pod's
   backup lock, the cron line's, the archive's), read from `/proc/locks`. When another program on

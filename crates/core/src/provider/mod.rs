@@ -421,9 +421,10 @@ pub trait Provider: Send + Sync {
         Err(unsupported(self, Op::KeyRepair))
     }
 
-    /// Mutating, idempotent. Lock (`true`) or unlock a pod in place. A locked pod refuses
-    /// stop, restart and terminate — from any client, the provider's console included (see
-    /// [`crate::lock`]); nothing else about it changes. Default: unsupported.
+    /// Mutating, idempotent. Lock (`true`) or unlock a pod in place: RunPod v2's lock, which
+    /// refuses stop, restart and terminate from any client, its console included; Hetzner's
+    /// delete + rebuild protection, which refuses those two there (arena refuses the rest up
+    /// front — see [`crate::lock`]). Nothing else about the pod changes. Default: unsupported.
     async fn set_locked(&self, _id: &str, _locked: bool) -> Result<()> {
         Err(unsupported(self, Op::Lock))
     }
@@ -492,18 +493,18 @@ mod tests {
         }
     }
 
-    /// Locking is RunPod v2's alone (the default: an empty `RUNPOD_API` locks too); every other
-    /// backend says why not, before any request — v1 by saying how to get back to v2 — and its
-    /// `set_locked` fails with the same sentence.
+    /// RunPod v2 locks (the default: an empty `RUNPOD_API` locks too), and Hetzner (its delete +
+    /// rebuild protection); every other backend says why not, before any request — v1 by saying
+    /// how to get back to v2 — and its `set_locked` fails with the same sentence.
     #[tokio::test]
-    async fn only_runpod_v2_can_lock() {
+    async fn only_runpod_v2_and_hetzner_can_lock() {
         let keys = "RUNPOD_API_KEY=k\nVAST_API_KEY=v\nHETZNER_API_KEY=h\n";
         for (name, api, ok, why) in [
             ("runpod", "v2", true, ""),
             ("runpod", "", true, ""),
             ("runpod", "v1", false, RUNPOD_V1_REMEDY),
             ("vast", "v1", false, "Vast can't lock"),
-            ("hetzner", "v2", false, "can't lock a Hetzner VM"),
+            ("hetzner", "v2", true, ""),
         ] {
             let p = build(name, &Config::parse(&format!("{keys}RUNPOD_API={api}"))).unwrap();
             let pod = Pod { provider: name.into(), ..Default::default() };

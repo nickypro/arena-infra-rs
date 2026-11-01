@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arena_core::idle::fixture::Reply;
 use arena_core::openrouter::{CreatedKey, KeyApi, KeyInfo};
 use arena_core::provider::ContainerReset;
 use arena_core::remote::{FakeRemote, FakeReply, RemoteCall, PROBE_TIMEOUT};
@@ -161,9 +162,12 @@ impl Provider for Fleet {
         self.reset(id);
         Ok(())
     }
+    /// A container comes back on a new endpoint; a rebuilt Hetzner VM keeps its IP and port.
     async fn reimage_pod(&self, id: &str, image: &str, _env: &[(String, String)]) -> Result<()> {
         self.record(format!("reimage {id} {image}"));
-        self.reset(id);
+        if self.pods.lock().unwrap().iter().any(|p| p.id == id && p.provider != "hetzner") {
+            self.reset(id);
+        }
         Ok(())
     }
     async fn terminate_pod(&self, id: &str) -> Result<()> {
@@ -1370,20 +1374,24 @@ async fn reimage_is_gated_like_restart_and_sets_the_pod_up_again() {
     assert!(e.contains("refusing to reimage devtest-alpha, devtest-bravo without --wipe-ok"), "{e}");
     assert!(e.contains("--yes alone isn't enough") && e.contains("`arena pods backup devtest-alpha devtest-bravo`"), "{e}");
     assert!(f.calls().is_empty() && remote.calls().is_empty());
-    // The dry run says it would be refused (and changes nothing).
+    // The dry run says it would be refused (and changes nothing). No one is on it.
+    remote.on("10.0.0.1:22001", "ARENA_IDLE_NOW", FakeReply::stdout(&Reply::default().render()));
     take_would_refuse();
     let dry = RestartOpts { dry_run: true, yes: true, ..Default::default() };
     let pods = f.pods.lock().unwrap().clone();
-    handle_reimage(&f, remote.clone(), &cfg, &named(&pods[..1]), None, dry, FAST, &keys_dir).await.unwrap();
+    handle_reimage(&f, remote.clone(), &cfg, &named(&pods[..1]), None, false, dry, FAST, &keys_dir).await.unwrap();
     let notes = take_would_refuse();
     assert!(notes.len() == 1 && notes[0].contains("refusing to reimage devtest-alpha without --wipe-ok"), "{notes:?}");
     assert!(f.calls().is_empty());
-    // --wipe-ok: reimaged, set up again on the endpoint it came back on, proxied there.
+    // --wipe-ok: asked who's on it (no one), reimaged, set up again on the endpoint it came
+    // back on, proxied there.
     let opts = RestartOpts { wipe_ok: true, yes: true, ..Default::default() };
-    handle_reimage(&f, remote.clone(), &cfg, &named(&pods[..1]), None, opts, FAST, &keys_dir).await.unwrap();
+    let before = remote.calls().len();
+    handle_reimage(&f, remote.clone(), &cfg, &named(&pods[..1]), None, false, opts, FAST, &keys_dir).await.unwrap();
     assert_eq!(f.calls(), ["reimage r-alpha img:9"]);
-    let calls = remote.calls();
-    assert!(!calls.is_empty() && calls.iter().all(|c| c.host() == "10.0.0.1:23001"), "{calls:?}");
+    let calls = remote.calls()[before..].to_vec();
+    assert!(matches!(&calls[0], RemoteCall::Exec { host, cmd, .. } if host == "10.0.0.1:22001" && cmd.contains("ARENA_IDLE_NOW")), "{calls:?}");
+    assert!(calls.len() > 1 && calls[1..].iter().all(|c| c.host() == "10.0.0.1:23001"), "{calls:?}");
     assert!(calls.iter().any(|c| matches!(c, RemoteCall::Exec { cmd, .. } if cmd.contains(&name_file_command("alpha")))), "{calls:?}");
     let px = proxy_file(&dir.0);
     assert!(px.contains("name=devtest-alpha") && px.contains("23001") && !px.contains("22001"), "{px}");
@@ -1393,8 +1401,141 @@ async fn reimage_is_gated_like_restart_and_sets_the_pod_up_again() {
     let on_volume = keyed_cfg(&dir.0, "BACKUP_REPO_PATH=/workspace/r\n");
     let bravo = g.pods.lock().unwrap()[1].clone();
     let opts = RestartOpts { no_setup: true, skip_proxy: true, yes: true, ..Default::default() };
-    handle_reimage(&g, Arc::new(FakeRemote::new()), &on_volume, &named(&[bravo]), None, opts, FAST, &keys_dir).await.unwrap();
+    handle_reimage(&g, Arc::new(FakeRemote::new()), &on_volume, &named(&[bravo]), None, true, opts, FAST, &keys_dir).await.unwrap();
     assert_eq!(g.calls(), ["reimage r-bravo img:9"]);
+}
+
+/// Replace's busy check, for a reimage (it wipes what they're working on): a pod someone is on
+/// — SSH, a VS Code server — or that can't be read is refused, the whole command, before
+/// anything is reimaged, saying who and what to do; the dry run says it would be; `--force`
+/// goes on. A stopped pod has no one on it.
+#[tokio::test]
+async fn reimage_refuses_a_pod_someone_is_on_unless_forced() {
+    let dir = tmpdir("reimage-busy");
+    let cfg = keyed_cfg(&dir.0, "");
+    let keys_dir = dir.0.display().to_string();
+    let opts = RestartOpts { wipe_ok: true, no_setup: true, skip_proxy: true, yes: true, ..Default::default() };
+    for (reply, why) in [
+        (Some(Reply { sessions: vec![[10, 9, 9, 9]], ..Reply::default() }), "someone is on it (1 SSH session)"),
+        (Some(Reply { editors: Some(1), ..Reply::default() }), "a VS Code (or Cursor) server running"),
+        (None, "couldn't tell whether anyone is on it"),
+    ] {
+        let f = fleet();
+        let remote = Arc::new(FakeRemote::new());
+        remote.on("10.0.0.1:22002", "ARENA_IDLE_NOW", FakeReply::stdout(&Reply::default().render()));
+        match &reply {
+            Some(r) => remote.on("10.0.0.1:22001", "ARENA_IDLE_NOW", FakeReply::stdout(&r.render())),
+            None => remote.on("10.0.0.1:22001", "ARENA_IDLE_NOW", FakeReply::exit(255, "ssh: connect to host 10.0.0.1 port 22001: Connection timed out")),
+        };
+        let pods = f.pods.lock().unwrap()[..2].to_vec();
+        let e = handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, false, opts, FAST, &keys_dir).await.unwrap_err().to_string();
+        assert!(e.contains("refusing to reimage devtest-alpha") && e.contains(why), "{e}");
+        assert!(e.contains("`arena pods backup devtest-alpha`") && e.contains("--force"), "{e}");
+        assert!(!e.contains("devtest-bravo"), "no one is on bravo: {e}");
+        assert!(f.calls().is_empty(), "nothing reimaged: {:?}", f.calls());
+        // The dry run says so.
+        take_would_refuse();
+        let dry = RestartOpts { dry_run: true, ..opts };
+        handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, false, dry, FAST, &keys_dir).await.unwrap();
+        let notes = take_would_refuse();
+        assert!(notes.len() == 1 && notes[0].contains("refusing to reimage devtest-alpha") && notes[0].contains(why), "{notes:?}");
+        // --force: both go.
+        handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, true, opts, FAST, &keys_dir).await.unwrap();
+        assert_eq!(f.calls(), ["reimage r-alpha img:9", "reimage r-bravo img:9"]);
+    }
+    // A stopped pod: no one can be on it — not probed, not refused.
+    let f = fleet();
+    f.pods.lock().unwrap()[0].status = "EXITED".into();
+    let remote = Arc::new(FakeRemote::new());
+    let alpha = f.pods.lock().unwrap()[0].clone();
+    handle_reimage(&f, remote.clone(), &cfg, &named(&[alpha]), None, false, opts, FAST, &keys_dir).await.unwrap();
+    assert_eq!(f.calls(), ["reimage r-alpha img:9"]);
+    assert!(remote.calls().is_empty(), "{:?}", remote.calls());
+}
+
+/// Ops feedback #2: `reimage` on a Hetzner VM is its rebuild — HETZNER_IMAGE (or `--image`),
+/// never the RunPod image, named before the confirm — through the same gates: `--wipe-ok` (the
+/// whole disk goes: said as a VM's), the lock (its rebuild protection), the busy check; then it
+/// comes back set up on its own IP and proxied. `--image` can't mean both kinds at once.
+#[tokio::test]
+async fn reimage_rebuilds_a_hetzner_vm_from_its_vm_image() {
+    let dir = tmpdir("reimage-vm");
+    let cfg = keyed_cfg(&dir.0, "HETZNER_IMAGE=449743460\n");
+    let keys_dir = dir.0.display().to_string();
+    let f = fleet();
+    let delta = f.pods.lock().unwrap()[3].clone();
+    assert_eq!(delta.provider, "hetzner");
+    let remote = Arc::new(FakeRemote::new());
+    remote.on("10.0.0.9:22", "ARENA_IDLE_NOW", FakeReply::stdout(&Reply::default().render()));
+    // Without --wipe-ok: refused, in a VM's words.
+    let e = handle_pods(pods_cmd(&["reimage", "delta"]), &f, remote.clone(), &cfg, true).await.unwrap_err().to_string();
+    assert!(e.contains("refusing to reimage devtest-delta without --wipe-ok: this rebuilds the VM's whole disk from the image"), "{e}");
+    assert!(e.contains("is on that disk") && !e.contains("/workspace"), "{e}");
+    assert!(f.calls().is_empty());
+    // The dry run changes nothing; its line for the VM says what's lost, in a VM's words.
+    handle_pods(pods_cmd(&["reimage", "delta", "--dry-run"]), &f, remote.clone(), &cfg, true).await.unwrap();
+    assert!(f.calls().is_empty());
+    let line = DiskFate::Wiped { volume_gb: Some(0) }.describe(DiskOp::Rebuild, &RepoSite::configured("/root/r"));
+    assert!(line.starts_with("⚠ WIPES the VM's whole disk (rebuilt from the image; it keeps its IP): nothing on its disk survives"), "{line}");
+    assert!(line.contains("the ARENA repo at /root/r") && line.contains("`arena pods volume mount`") && !line.contains("/workspace"), "{line}");
+    // --wipe-ok: rebuilt, then set up again on its own IP and proxied.
+    let opts = RestartOpts { wipe_ok: true, yes: true, ..Default::default() };
+    handle_reimage(&f, remote.clone(), &cfg, &named(&[delta]), None, false, opts, FAST, &keys_dir).await.unwrap();
+    assert_eq!(f.calls(), ["reimage h-delta 449743460"]);
+    assert!(proxy_file(&dir.0).contains("name=devtest-delta"), "{}", proxy_file(&dir.0));
+    let setup = |c: &RemoteCall| matches!(c, RemoteCall::Exec { cmd, .. } if cmd.ends_with("bash /root/hetzner_setup.sh"));
+    assert!(remote.calls().iter().any(|c| c.host() == "10.0.0.9:22" && setup(c)), "the bare-VM setup (swap, hostname, ~/.name, the env): {:?}", remote.calls());
+    // `--image` there: the VM's image (validated as `up`'s); with a container pod beside it, refused.
+    let f = fleet();
+    handle_pods(pods_cmd(&["reimage", "delta", "--wipe-ok", "--image", "ubuntu-24.04", "--no-setup", "--skip-proxy"]), &f, remote.clone(), &cfg, true)
+        .await
+        .unwrap();
+    assert_eq!(f.calls(), ["reimage h-delta ubuntu-24.04"]);
+    let e = handle_pods(pods_cmd(&["reimage", "delta", "--wipe-ok", "--image", "a b"]), &f, remote.clone(), &cfg, true).await.unwrap_err().to_string();
+    assert!(e.contains("--image on Hetzner takes `arena`"), "{e}");
+    let e = handle_pods(pods_cmd(&["reimage", "alpha", "delta", "--wipe-ok", "--image", "img:2"]), &f, remote.clone(), &cfg, true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("--image is a container image for a RunPod pod and the VM's image for a Hetzner VM"), "{e}");
+    assert_eq!(f.calls().len(), 1);
+    // Without --image, each kind gets its own.
+    remote.on("10.0.0.1:22001", "ARENA_IDLE_NOW", FakeReply::stdout(&Reply::default().render()));
+    handle_pods(pods_cmd(&["reimage", "alpha", "delta", "--wipe-ok", "--no-setup", "--skip-proxy"]), &f, remote.clone(), &cfg, true)
+        .await
+        .unwrap();
+    assert_eq!(f.calls()[1..], ["reimage r-alpha img:9", "reimage h-delta 449743460"]);
+    // Locked (its rebuild protection): refused up front.
+    let f = fleet();
+    f.pods.lock().unwrap()[3].locked = Some(true);
+    let e = handle_pods(pods_cmd(&["reimage", "delta", "--wipe-ok"]), &f, remote.clone(), &cfg, true).await.unwrap_err().to_string();
+    assert!(e.contains("refusing to reimage: devtest-delta is locked — `arena pods unlock devtest-delta` first"), "{e}");
+    assert!(f.calls().is_empty());
+}
+
+/// What `reimage` gives each kind of pod, and when `--image` can't say which it means. Pure.
+#[test]
+fn reimage_images_are_per_kind_of_pod() {
+    let cfg = Config::parse("RUNPOD_DOCKER_IMAGE=img:9\nHETZNER_IMAGE=arena\n");
+    let f = fleet();
+    let pods = f.pods.lock().unwrap().clone();
+    let (gpu, vm) = (&pods[..1], &pods[3..]);
+    let both: Vec<Pod> = [gpu, vm].concat();
+    let got = |pods: &[Pod], image: Option<&str>| super::lifecycle::reimage_images(pods, image.map(String::from), &cfg).map_err(|e| e.to_string());
+    assert_eq!(got(gpu, None).unwrap(), (Some("img:9".into()), None));
+    assert_eq!(got(vm, None).unwrap(), (None, Some("arena".into())));
+    assert_eq!(got(&both, None).unwrap(), (Some("img:9".into()), Some("arena".into())));
+    assert_eq!(got(gpu, Some("img:2")).unwrap(), (Some("img:2".into()), None));
+    assert_eq!(got(vm, Some("448331072")).unwrap(), (None, Some("448331072".into())));
+    assert!(got(&both, Some("img:2")).unwrap_err().contains("reimage the two apart"));
+    assert!(got(vm, Some("nickypro/arena-env:9.1")).unwrap_err().contains("--image on Hetzner takes"));
+    // HETZNER_IMAGE unset: Hetzner's default system image. RUNPOD_DOCKER_IMAGE unset: refused.
+    let bare = Config::parse("RUNPOD_DOCKER_IMAGE=\n");
+    assert_eq!(super::lifecycle::reimage_images(vm, None, &bare).unwrap(), (None, Some("ubuntu-24.04".into())));
+    assert!(super::lifecycle::reimage_images(gpu, None, &bare).unwrap_err().to_string().contains("no image: pass --image"));
+    // The plan's lines.
+    let vms = [super::lifecycle::VmImage { server_type: Some("cx33".into()), ids: vec!["h-delta".into()], image: "11".into(), said: "image arena → snapshot 11 (new)".into() }];
+    assert_eq!(super::lifecycle::image_lines(Some("img:9"), &vms), ["image: img:9", "VM image (cx33): image arena → snapshot 11 (new)"]);
 }
 
 /// Live finding #15: a stopped pod had no way back — `restart` answered a raw 409 (v2)
@@ -2461,23 +2602,53 @@ async fn lock_and_unlock_act_on_what_can_be_locked_and_fail_on_the_rest() {
     let dir = tmpdir("lock-cmd");
     let cfg = cfg(&dir.0);
     let f = locked_fleet();
+    // echo: a Vast instance (Vast can't lock).
+    f.pods.lock().unwrap().push(pod("v-echo", "devtest-echo", "vast", Some(("10.0.0.5", 22005))));
     let run = |argv: &'static [&'static str]| handle_pods(pods_cmd(argv), &f, Arc::new(FakeRemote::new()), &cfg, true);
-    let e = run(&["lock", "alpha", "bravo", "delta"]).await.unwrap_err().to_string();
-    assert!(e.contains("1 pod(s) can't be locked: devtest-delta"), "{e}");
-    assert_eq!(f.calls(), ["lock r-bravo true"], "alpha already was; delta can't be");
+    let e = run(&["lock", "alpha", "bravo", "echo"]).await.unwrap_err().to_string();
+    assert!(e.contains("1 pod(s) can't be locked: devtest-echo"), "{e}");
+    assert_eq!(f.calls(), ["lock r-bravo true"], "alpha already was; echo can't be");
     run(&["lock", "bravo"]).await.unwrap();
     assert_eq!(f.calls().len(), 1, "already locked: nothing sent");
     run(&["unlock", "bravo", "--dry-run"]).await.unwrap();
     assert_eq!(f.calls().len(), 1);
     run(&["unlock", "alpha", "bravo"]).await.unwrap();
     assert_eq!(f.calls(), ["lock r-bravo true", "lock r-alpha false", "lock r-bravo false"]);
-    let e = run(&["lock", "delta"]).await.unwrap_err().to_string();
-    assert!(e.contains("can't be locked: devtest-delta (leave other providers' pods out with --on runpod)"), "{e}");
-    run(&["lock", "delta", "--dry-run"]).await.unwrap(); // says it would fail; changes nothing
+    let e = run(&["lock", "echo"]).await.unwrap_err().to_string();
+    assert!(e.contains("can't be locked: devtest-echo (leave other providers' pods out with --on runpod or --on hetzner)"), "{e}");
+    run(&["lock", "echo", "--dry-run"]).await.unwrap(); // says it would fail; changes nothing
     let e = run(&["lock"]).await.unwrap_err().to_string();
     assert!(e.contains("name the pods to lock"), "{e}");
     assert_eq!(f.calls().len(), 3);
     // The listing now says unlocked: a stop goes through again.
     run(&["stop", "alpha", "--wipe-ok"]).await.unwrap();
     assert_eq!(f.calls().last().unwrap(), "stop r-alpha");
+}
+
+/// A Hetzner VM locks (its delete + rebuild protection) and, locked, is refused like any locked
+/// pod — stop and restart too, which Hetzner itself would let through: the lock means the same
+/// in every arena command. `terminate --unlock` lifts it first; `unlock` lets it go.
+#[tokio::test]
+async fn a_hetzner_vm_locks_and_is_refused_like_any_locked_pod() {
+    let dir = tmpdir("lock-vm");
+    let cfg = cfg(&dir.0);
+    let f = fleet();
+    f.pods.lock().unwrap()[3].locked = Some(false); // as the Hetzner listing reports it
+    handle_pods(pods_cmd(&["lock", "delta"]), &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap();
+    assert_eq!(f.calls(), ["lock h-delta true"]);
+    let hint = "devtest-delta is locked — `arena pods unlock devtest-delta` first";
+    for (argv, want) in [
+        (&["stop", "delta"][..], format!("refusing to stop: {hint}")),
+        (&["restart", "delta"][..], format!("refusing to restart: {hint}")),
+        (&["reimage", "delta", "--wipe-ok"][..], format!("refusing to reimage: {hint}")),
+        (&["terminate", "delta"][..], format!("refusing to terminate: {hint}")),
+    ] {
+        let e = handle_pods(pods_cmd(argv), &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap_err().to_string();
+        assert!(e.contains(want.as_str()), "{argv:?}: `{want}` in {e}");
+    }
+    assert_eq!(f.calls().len(), 1, "nothing else sent: {:?}", f.calls());
+    handle_pods(pods_cmd(&["unlock", "delta"]), &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap();
+    handle_pods(pods_cmd(&["lock", "delta"]), &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap();
+    handle_pods(pods_cmd(&["terminate", "delta", "--unlock", "--skip-proxy"]), &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap();
+    assert_eq!(f.calls(), ["lock h-delta true", "lock h-delta false", "lock h-delta true", "lock h-delta false", "terminate h-delta"]);
 }

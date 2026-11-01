@@ -23,6 +23,10 @@
 //! own `user_data` authorizes every machine's keys (the deploy and admin keys beside the project's
 //! cohort key); one given there replaces it.
 //!
+//! `pods reimage` is Hetzner's rebuild ([`HetznerProvider::reimage_pod`]: the disk overwritten
+//! from an image, the server's id, name and IP kept), and `pods lock` its delete + rebuild
+//! protection ([`HetznerProvider::set_locked`], read back as [`Pod::locked`]).
+//!
 //! Responses are parsed defensively from `serde_json::Value`, as with the others.
 
 use async_trait::async_trait;
@@ -198,6 +202,14 @@ impl ShutdownWait {
         self.every * self.polls
     }
 }
+
+/// How long `pods reimage` waits for a rebuild to finish at Hetzner before it gives up (the
+/// rebuild goes on; it says so). The operator's rebuilds of ~40 GB arena snapshots (prod,
+/// 2026-10-29) took a few minutes each; a system image takes about one.
+pub const REBUILD_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// How long `pods lock`/`unlock` waits for a protection change to finish (Hetzner: at once).
+pub const PROTECTION_WAIT: Duration = Duration::from_secs(60);
 
 /// How far each Hetzner location is from here, for the `any` walk ([`location_walk`]): the
 /// fastest of [`PROBE_TRIES`] TCP connects to the location's speed-test host
@@ -478,6 +490,48 @@ impl HetznerProvider {
         Ok(items.iter().filter_map(crate::image::parse_snapshot).collect())
     }
 
+    /// Poll `GET /actions/{action}` every [`ShutdownWait::every`] until it succeeds (`Ok`), fails
+    /// or `limit` passes (`Err`). A poll that fails retryably (a 5xx, a dropped connection) is
+    /// "not done yet": a blip in the middle of a rebuild mustn't read as a failed one.
+    async fn await_action(&self, action: u64, limit: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            match send_json(self.auth(self.client.get(format!("{}/actions/{action}", self.base))), "hetzner action").await {
+                Ok(body) => match body.pointer("/action/status").and_then(Value::as_str) {
+                    Some("success") => return Ok(()),
+                    Some("error") => {
+                        let why = body.pointer("/action/error/message").and_then(Value::as_str).unwrap_or("no message");
+                        let cmd = body.pointer("/action/command").and_then(Value::as_str).unwrap_or("action");
+                        return Err(Error::provider(format!("hetzner {cmd} (action {action}) failed: {why}")));
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err(Error::provider(format!("hetzner action {action}: unexpected shape {}", super::body_excerpt(&body))))
+                    }
+                },
+                Err(e) if crate::retry::is_retryable(&e) && tokio::time::Instant::now() < deadline => {}
+                Err(e) => return Err(e),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::Timeout { what: format!("hetzner action {action}"), after: limit });
+            }
+            tokio::time::sleep(self.shutdown.every).await;
+        }
+    }
+
+    /// The server type of server `id` (`GET /servers/{id}`): what `arena` resolves against for a
+    /// rebuild, as for a create of that type.
+    async fn server_type_of(&self, id: &str) -> Result<String> {
+        let body = self
+            .get_one(&format!("servers/{id}"), "hetzner get server")
+            .await?
+            .ok_or_else(|| Error::provider(format!("hetzner get server: no server {id} in this project (gone?)")))?;
+        body.pointer("/server/server_type/name")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| Error::provider(format!("hetzner get server {id}: no server type in {}", super::body_excerpt(&body))))
+    }
+
     /// `GET {path}` → its JSON, `None` on a 404 (gone).
     async fn get_one(&self, path: &str, ctx: &str) -> Result<Option<Value>> {
         match send_json(self.auth(self.client.get(format!("{}/{path}", self.base))), ctx).await {
@@ -556,24 +610,7 @@ impl crate::image::cloud::ImageCloud for HetznerProvider {
     }
 
     async fn wait_action(&self, action: u64, limit: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + limit;
-        loop {
-            let body = send_json(self.auth(self.client.get(format!("{}/actions/{action}", self.base))), "hetzner action").await?;
-            match body.pointer("/action/status").and_then(Value::as_str) {
-                Some("success") => return Ok(()),
-                Some("error") => {
-                    let why = body.pointer("/action/error/message").and_then(Value::as_str).unwrap_or("no message");
-                    let cmd = body.pointer("/action/command").and_then(Value::as_str).unwrap_or("action");
-                    return Err(Error::provider(format!("hetzner {cmd} (action {action}) failed: {why}")));
-                }
-                Some(_) => {}
-                None => return Err(Error::provider(format!("hetzner action {action}: unexpected shape {}", super::body_excerpt(&body)))),
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(Error::Timeout { what: format!("hetzner action {action}"), after: limit });
-            }
-            tokio::time::sleep(self.shutdown.every).await;
-        }
+        self.await_action(action, limit).await
     }
 
     async fn image(&self, id: u64) -> Result<Option<crate::image::Snapshot>> {
@@ -754,6 +791,9 @@ pub(crate) async fn send_ok(rb: RequestBuilder, ctx: &str) -> Result<()> {
 /// - `maintenance` — "cannot perform operation due to maintenance": said as that, to try later;
 ///   not `Auth`, as a dead key isn't the thing to go and fix.
 ///
+/// And its `423 protected` (a delete or rebuild of a protected server: arena's lock on a VM) is
+/// [`ProviderErrorKind::Locked`](crate::error::ProviderErrorKind::Locked).
+///
 /// Every other answer is classified as before. Pure.
 pub(crate) fn api_error(status: StatusCode, text: &str, ctx: &str) -> Error {
     use crate::error::ProviderErrorKind as K;
@@ -771,6 +811,17 @@ pub(crate) fn api_error(status: StatusCode, text: &str, ctx: &str) -> Error {
         || (forbidden
             && !matches!(code, Some("forbidden" | "unauthorized" | "rate_limit_exceeded"))
             && (!limits.is_empty() || code.is_some_and(|c| c.ends_with("_limit_exceeded"))));
+    // `423 protected` — "the Action you are trying to start is protected for this resource":
+    // the server's delete/rebuild protection, which is arena's lock on a VM (`pods lock`). Tagged
+    // `Locked`, so the refusal reads as every lock's does (`crate::lock::explain`). Hetzner's
+    // other 423, `locked`, is an action still running there — no lock of arena's.
+    if code == Some("protected") {
+        let what = said.map(|m| format!(" ({})", crate::error::body_excerpt(m))).unwrap_or_default();
+        return Error::Provider {
+            kind: K::Locked,
+            message: format!("{ctx} HTTP {status}: Hetzner refused: the server is protected{what} — arena's lock on a VM"),
+        };
+    }
     if forbidden && code == Some("maintenance") {
         let what = said.map(|m| format!(" ({})", crate::error::body_excerpt(m))).unwrap_or_default();
         return Error::Provider {
@@ -1140,6 +1191,28 @@ fn authorized_keys_user_data(keys: &[String]) -> Option<String> {
     (!keys.is_empty()).then(|| format!("#cloud-config\n{}\n", json!({ "ssh_authorized_keys": keys })))
 }
 
+/// The rebuild's body: `image` (an id as a number, a name as a string —
+/// [`crate::image::Resolved::image`]) and, when `env` carries `PUBLIC_KEY` lines, the same
+/// `user_data` a create sends ([`authorized_keys_user_data`]): the rebuilt VM lets in today's
+/// keys, as a new one would — not whatever it was created with. Without keys, none: Hetzner then
+/// reuses the server's own (and an `--api-json` `user_data` of its create is kept). Pure.
+fn rebuild_payload(image: Value, env: &[(String, String)]) -> Value {
+    let spec = PodSpec { env: env.to_vec(), ..PodSpec::default() };
+    let mut body = json!({ "image": image });
+    if let Some(user_data) = authorized_keys_user_data(&super::vast::spec_pubkeys(&spec)) {
+        body["user_data"] = json!(user_data);
+    }
+    body
+}
+
+/// `id` as a server id (digits only), before it goes into a URL path. Pure.
+fn check_server_id(id: &str) -> Result<()> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Error::Config(format!("hetzner: `{id}` isn't a server id")));
+    }
+    Ok(())
+}
+
 fn parse_server(v: &Value) -> Pod {
     Pod {
         id: v
@@ -1194,9 +1267,10 @@ fn parse_server(v: &Value) -> Pod {
         gpu_count: None,
         maintenance: None,
         machine_id: None,
-        // Hetzner's delete/rebuild *protection* is a different thing; `pods lock` is
-        // RunPod v2 only.
-        locked: None,
+        // arena's lock on a VM is its delete + rebuild protection (`pods lock`,
+        // `HetznerProvider::set_locked`): either one on is locked — stop, restart, reimage and
+        // terminate refuse it up front — and `pods unlock` lifts both. Unknown as below.
+        locked: protection_of(v).map(|(delete, rebuild)| delete || rebuild == Some(true)),
         proxy_only: false,
         // A Hetzner server bills whole while it exists: its disk is never priced apart.
         disk_gb: None,
@@ -1204,7 +1278,7 @@ fn parse_server(v: &Value) -> Pod {
         // `protection.delete` (a bool on every server): the API refuses a DELETE while it's
         // set. Read for the auto-reaper, which never reaps a protected server; anything but a
         // bool there is `None` (unknown — never read as "unprotected").
-        delete_protected: v.get("protection").and_then(|p| p.get("delete")).and_then(Value::as_bool),
+        delete_protected: protection_of(v).map(|(delete, _)| delete),
         // `created`: ISO-8601 with an offset (`2016-01-30T23:50:00+00:00`).
         created_at: v
             .get("created")
@@ -1218,6 +1292,13 @@ fn parse_server(v: &Value) -> Pod {
         // `nbg1 (Nuremberg, DE)`: the location's name, with its city and country when given.
         location: hetzner_location(v),
     }
+}
+
+/// A server's `protection`: `delete` (a bool on every server, else `None`: unknown) and `rebuild`
+/// (`None` when it isn't a bool). Hetzner keeps the two equal; `pods lock` sets both. Pure.
+fn protection_of(v: &Value) -> Option<(bool, Option<bool>)> {
+    let p = v.get("protection")?;
+    Some((p.get("delete").and_then(Value::as_bool)?, p.get("rebuild").and_then(Value::as_bool)))
 }
 
 /// A server's location for people: its `location` (or an older answer's
@@ -1555,6 +1636,62 @@ impl Provider for HetznerProvider {
         Ok(spec_of_server(body.get("server").unwrap_or(&body)))
     }
 
+    /// `pods reimage` on a VM: Hetzner's rebuild (`POST /servers/{id}/actions/rebuild`) — the
+    /// whole disk overwritten from `image`, the server's id, name, IP and type kept. `image` takes
+    /// what HETZNER_IMAGE takes: `arena` (resolved here for the server's own type, as a create
+    /// resolves it — `pods reimage` resolves it first, says which snapshot, and passes its id), a
+    /// snapshot id or a system image name. `env`'s `PUBLIC_KEY` lines are authorized at the first
+    /// boot ([`rebuild_payload`]); nothing else in `env` means anything to a VM.
+    ///
+    /// Waits for the rebuild ([`REBUILD_WAIT`]) — setup must meet the new disk, not the old one —
+    /// and powers the VM on if it's off afterwards (a rebuild powers a server off first; setup
+    /// needs it up). Once the rebuild is sent, a failure is never retryable: sending it again
+    /// would wipe the VM again (and Hetzner refuses a second action while one runs).
+    async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
+        use crate::image::{Resolved, Setting};
+        check_server_id(id)?;
+        let image = match Setting::parse(image) {
+            Setting::Arena => self.resolve_image(&Setting::Arena, &self.server_type_of(id).await?).await?.image(),
+            given => Resolved::Given(given).image(),
+        };
+        let url = format!("{}/servers/{id}/actions/rebuild", self.base);
+        let sent = send_json(self.auth(self.client.post(url).json(&rebuild_payload(image, env))), "hetzner rebuild").await?;
+        let action = sent.pointer("/action/id").and_then(Value::as_u64);
+        let after = |why: String| Error::Provider {
+            kind: crate::error::ProviderErrorKind::Other,
+            message: format!(
+                "hetzner rebuild of server {id} was sent{}, but {why} — don't reimage it again: once `arena pods list` shows \
+                 it running, `arena pods setup` sets it up",
+                action.map(|a| format!(" (action {a})")).unwrap_or_default()
+            ),
+        };
+        let Some(action) = action else {
+            return Err(after(format!("its answer named no action ({})", super::body_excerpt(&sent))));
+        };
+        self.await_action(action, REBUILD_WAIT).await.map_err(|e| after(format!("waiting for it failed: {e}")))?;
+        match self.server_status(id).await {
+            Ok(s) if s == "off" => self.power_action(id, "poweron").await.map_err(|e| after(format!("powering it on failed: {e}"))),
+            _ => Ok(()),
+        }
+    }
+
+    /// `pods lock` / `unlock` on a VM: its delete + rebuild protection (`POST
+    /// /servers/{id}/actions/change_protection`, both at once — Hetzner wants them equal),
+    /// waited for. Hetzner then refuses a delete or a rebuild from any client, its console
+    /// included (`423 protected`: [`api_error`] tags it `Locked`). A shutdown, reset or power-off
+    /// it still allows, so arena's own stop and restart refuse a locked VM up front, from the
+    /// listing ([`crate::lock`]; [`Pod::locked`] reads the protection back). Idempotent.
+    async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {
+        check_server_id(id)?;
+        let url = format!("{}/servers/{id}/actions/change_protection", self.base);
+        let body = json!({"delete": locked, "rebuild": locked});
+        let sent = send_json(self.auth(self.client.post(url).json(&body)), "hetzner change protection").await?;
+        match sent.pointer("/action/id").and_then(Value::as_u64) {
+            Some(action) => self.await_action(action, PROTECTION_WAIT).await,
+            None => Ok(()),
+        }
+    }
+
     fn check_create_extra(&self, extra: &Extra) -> Result<()> {
         apiextra::check(extra, MANAGED, None)
     }
@@ -1804,11 +1941,11 @@ mod tests {
         }
     }
 
-    /// `protection.delete` is read for the reaper (on, off) — and anything else, a missing
-    /// block or a non-bool, is unknown, never "unprotected". It is not a lock: `locked` stays
-    /// `None`, so stop/restart's lock refusals don't read it.
+    /// `protection` is arena's lock on a VM (`pods lock` sets delete + rebuild): read back as
+    /// `locked` — either one on is locked — and `protection.delete` for the reaper. Anything else,
+    /// a missing block or a non-bool `delete`, is unknown for both, never "unprotected".
     #[test]
-    fn delete_protection_is_read_and_unknown_when_odd() {
+    fn protection_is_read_as_the_lock_and_unknown_when_odd() {
         let with = |protection: serde_json::Value| {
             let mut v = json!({"id": 9, "name": "devtest-alpha", "status": "running"});
             if !protection.is_null() {
@@ -1816,14 +1953,22 @@ mod tests {
             }
             parse_server(&v)
         };
-        assert_eq!(with(json!({"delete": true, "rebuild": true})).delete_protected, Some(true));
-        assert_eq!(with(json!({"delete": false, "rebuild": false})).delete_protected, Some(false));
-        for odd in [json!(null), json!({}), json!({"delete": "true"}), json!({"delete": 1}), json!("on")] {
+        for (protection, locked, delete) in [
+            (json!({"delete": true, "rebuild": true}), true, true),
+            (json!({"delete": false, "rebuild": false}), false, false),
+            (json!({"delete": true}), true, true),
+            (json!({"delete": false, "rebuild": true}), true, false),
+            (json!({"delete": false, "rebuild": "on"}), false, false),
+        ] {
+            let p = with(protection.clone());
+            assert_eq!((p.locked, p.delete_protected), (Some(locked), Some(delete)), "{protection}");
+            assert_eq!(crate::lock::is_locked(&p), locked, "{protection}");
+        }
+        for odd in [json!(null), json!({}), json!({"delete": "true"}), json!({"delete": 1}), json!({"rebuild": true}), json!("on")] {
             let p = with(odd.clone());
             assert_eq!(p.delete_protected, None, "{odd}");
             assert_eq!(p.locked, None, "{odd}");
         }
-        assert_eq!(with(json!({"delete": true})).locked, None, "protection is not a lock");
     }
 
     #[test]
@@ -2895,6 +3040,185 @@ mod tests {
         let bare = spec_of_server(&json!({"server_type": {"name": "cx23"}, "labels": {"arena-archive": "x"}}));
         assert!(bare.api_extra.is_none());
         assert_eq!(bare.server_type.as_deref(), Some("cx23"));
+    }
+
+    /// A provider whose action polls don't wait (a rebuild's "running" is read again at once).
+    fn quick(base: &str, opts: HetznerOpts) -> HetznerProvider {
+        HetznerProvider { shutdown: ShutdownWait { polls: 3, every: Duration::from_millis(5) }, ..provider(base, opts) }
+    }
+
+    fn action(id: u64, status: &str) -> String {
+        json!({"action": {"id": id, "command": "rebuild_server", "status": status, "error": null}}).to_string()
+    }
+
+    fn server_status(status: &str) -> String {
+        json!({"server": {"id": 42, "name": "devtest-alpha", "status": status, "server_type": {"name": "cx33"}}}).to_string()
+    }
+
+    /// Ops feedback #2 (prod 2026-10-29: `reimage` on Hetzner failed on the spec read, and the
+    /// operator rebuilt the boxes by hand): `pods reimage` is Hetzner's rebuild — the image as a
+    /// create sends it (an id as a number, a name as a string) and the keys a create authorizes
+    /// (cloud-init, today's) — then it waits for the rebuild, a poll's 5xx read as "not done yet",
+    /// over the real request path. A VM left off by it is powered on (setup needs it up).
+    #[tokio::test]
+    async fn a_reimage_rebuilds_the_vm_with_todays_keys_and_waits_for_it() {
+        use crate::http::test_server::{canned, serve};
+        let env = vec![
+            ("MACHINE_NAME".to_string(), "devtest-alpha".to_string()),
+            ("PUBLIC_KEY".to_string(), "ssh-ed25519 AAAAshared devtest\nssh-ed25519 AAAAadmin admin".to_string()),
+        ];
+        let srv = serve(vec![
+            canned(201, "application/json", &json!({"action": {"id": 7, "status": "running"}, "root_password": null}).to_string()),
+            canned(200, "application/json", &action(7, "running")),
+            canned(503, "text/html", "<html>Service Unavailable</html>"),
+            canned(200, "application/json", &action(7, "success")),
+            canned(200, "application/json", &server_status("running")),
+        ]);
+        quick(&srv.base, HetznerOpts::default()).reimage_pod("42", "449743460", &env).await.unwrap();
+        assert_eq!(
+            *srv.requests.lock().unwrap(),
+            [
+                "POST /servers/42/actions/rebuild HTTP/1.1",
+                "GET /actions/7 HTTP/1.1",
+                "GET /actions/7 HTTP/1.1",
+                "GET /actions/7 HTTP/1.1",
+                "GET /servers/42 HTTP/1.1"
+            ]
+        );
+        let body: Value = serde_json::from_str(&srv.bodies.lock().unwrap()[0]).unwrap();
+        assert_eq!(body["image"], json!(449743460), "a snapshot by id, as a number");
+        let user_data = body["user_data"].as_str().unwrap();
+        assert!(user_data.starts_with("#cloud-config\n"), "{user_data}");
+        assert!(user_data.contains("AAAAshared") && user_data.contains("AAAAadmin") && !user_data.contains("MACHINE_NAME"), "{user_data}");
+        assert_eq!(body.as_object().unwrap().len(), 2, "image and user_data only: {body}");
+
+        // A system image by name; no keys: Hetzner reuses the server's own user_data. Off after
+        // the rebuild: powered on.
+        let srv = serve(vec![
+            canned(201, "application/json", &action(8, "success")),
+            canned(200, "application/json", &action(8, "success")),
+            canned(200, "application/json", &server_status("off")),
+            canned(201, "application/json", &action(9, "running")),
+        ]);
+        quick(&srv.base, HetznerOpts::default()).reimage_pod("42", "ubuntu-24.04", &[]).await.unwrap();
+        assert_eq!(srv.requests.lock().unwrap().last().unwrap(), "POST /servers/42/actions/poweron HTTP/1.1");
+        assert_eq!(serde_json::from_str::<Value>(&srv.bodies.lock().unwrap()[0]).unwrap(), json!({"image": "ubuntu-24.04"}));
+
+        // Not a server id: refused before any request.
+        let srv = serve(vec![]);
+        let p = quick(&srv.base, HetznerOpts::default());
+        for id in ["", "..", "42/actions/poweroff"] {
+            assert!(matches!(p.reimage_pod(id, "ubuntu-24.04", &env).await, Err(Error::Config(_))), "{id:?}");
+            assert!(matches!(p.set_locked(id, true).await, Err(Error::Config(_))), "{id:?}");
+        }
+        assert!(srv.requests.lock().unwrap().is_empty());
+    }
+
+    /// `HETZNER_IMAGE=arena` (or `--image arena`): the newest arena image that fits the server's
+    /// own type, as a create picks it — the TUI and any caller that doesn't resolve it first.
+    #[tokio::test]
+    async fn a_reimage_onto_arena_resolves_the_snapshot_for_the_servers_type() {
+        use crate::http::test_server::{canned, serve};
+        let images = json!({"images": [
+            {"id": 10, "description": "old", "status": "available", "disk_size": 40, "architecture": "x86",
+             "labels": {"arena-image": "1", "arena-prefix": "devtest", "repo-id": crate::image::repo_id("o", "r"), "built": "1000"}},
+            {"id": 11, "description": "new", "status": "available", "disk_size": 40, "architecture": "x86",
+             "labels": {"arena-image": "1", "arena-prefix": "devtest", "repo-id": crate::image::repo_id("o", "r"), "built": "2000"}},
+        ]});
+        let types = json!({"server_types": [{"name": "cx33", "architecture": "x86", "disk": 80, "memory": 8.0, "cores": 4, "prices": []}]});
+        let opts = HetznerOpts { image_scope: crate::image::Scope::new("devtest", "o", "r"), ..HetznerOpts::default() };
+        let srv = serve(vec![
+            canned(200, "application/json", &server_status("running")),
+            canned(200, "application/json", &images.to_string()),
+            canned(200, "application/json", &types.to_string()),
+            canned(201, "application/json", &action(7, "running")),
+            canned(200, "application/json", &action(7, "success")),
+            canned(200, "application/json", &server_status("running")),
+        ]);
+        quick(&srv.base, opts).reimage_pod("42", "arena", &[]).await.unwrap();
+        let requests = srv.requests.lock().unwrap().clone();
+        assert_eq!(requests[0], "GET /servers/42 HTTP/1.1");
+        assert!(requests[1].starts_with("GET /images?type=snapshot&label_selector="), "{requests:?}");
+        assert_eq!(requests[3], "POST /servers/42/actions/rebuild HTTP/1.1");
+        assert_eq!(serde_json::from_str::<Value>(&srv.bodies.lock().unwrap()[3]).unwrap(), json!({"image": 11}));
+    }
+
+    /// Once the rebuild is sent, a failure is said as such — what to do, and not to reimage it
+    /// again — and is never retried (a second rebuild would wipe it again). One refused before it
+    /// went (the server is locked: `423 protected`) reads as a lock.
+    #[tokio::test]
+    async fn a_rebuild_that_was_sent_and_failed_is_never_retried() {
+        use crate::error::ProviderErrorKind as K;
+        use crate::http::test_server::{canned, serve};
+        let failed = json!({"action": {"id": 7, "command": "rebuild_server", "status": "error",
+            "error": {"code": "action_failed", "message": "Action failed"}}});
+        let srv = serve(vec![
+            canned(201, "application/json", &action(7, "running")),
+            canned(200, "application/json", &failed.to_string()),
+        ]);
+        let e = quick(&srv.base, HetznerOpts::default()).reimage_pod("42", "ubuntu-24.04", &[]).await.unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains("was sent (action 7)") && m.contains("Action failed") && m.contains("don't reimage it again"), "{m}");
+        assert!(m.contains("`arena pods setup`"), "{m}");
+        assert!(!crate::retry::is_retryable(&e), "{m}");
+        // A poll Hetzner refuses for good (the action gone) is the same: sent, not retried.
+        let srv = serve(vec![
+            canned(201, "application/json", &action(7, "running")),
+            canned(404, "application/json", r#"{"error":{"code":"not_found","message":"action not found"}}"#),
+        ]);
+        let e = quick(&srv.base, HetznerOpts::default()).reimage_pod("42", "ubuntu-24.04", &[]).await.unwrap_err();
+        assert!(e.to_string().contains("was sent (action 7)") && e.to_string().contains("action not found"), "{e}");
+        assert!(!crate::retry::is_retryable(&e), "{e}");
+        assert_eq!(srv.requests.lock().unwrap().len(), 2, "one rebuild, one poll");
+        // Refused up front: locked (rebuild protection) — the lock's error, not a sent rebuild.
+        let protected = r#"{"error":{"code":"protected","message":"server is rebuild protected"}}"#;
+        let srv = serve(vec![canned(423, "application/json", protected)]);
+        let e = quick(&srv.base, HetznerOpts::default()).reimage_pod("42", "ubuntu-24.04", &[]).await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Locked), "{e}");
+        assert!(!e.to_string().contains("was sent"), "{e}");
+        assert_eq!(crate::lock::explain("devtest-alpha", &e), "devtest-alpha is locked — `arena pods unlock devtest-alpha` first");
+    }
+
+    /// `pods lock`/`unlock` on a VM: its delete + rebuild protection, both at once (Hetzner wants
+    /// them equal), the action waited for; a protected server's delete is Hetzner's `423
+    /// protected`, which reads as a lock — `terminate` says to unlock it. Hetzner's other 423
+    /// (`locked`: an action running) is no lock.
+    #[tokio::test]
+    async fn a_lock_is_the_servers_delete_and_rebuild_protection() {
+        use crate::error::ProviderErrorKind as K;
+        use crate::http::test_server::{canned, serve};
+        let srv = serve(vec![
+            canned(201, "application/json", &action(5, "running")),
+            canned(200, "application/json", &action(5, "success")),
+            canned(201, "application/json", &action(6, "success")),
+            canned(200, "application/json", &action(6, "success")),
+        ]);
+        let p = quick(&srv.base, HetznerOpts::default());
+        assert!(p.supports(crate::capability::Op::Lock, Some(&Pod { provider: "hetzner".into(), ..Default::default() })).works());
+        p.set_locked("42", true).await.unwrap();
+        p.set_locked("42", false).await.unwrap();
+        assert_eq!(
+            *srv.requests.lock().unwrap(),
+            [
+                "POST /servers/42/actions/change_protection HTTP/1.1",
+                "GET /actions/5 HTTP/1.1",
+                "POST /servers/42/actions/change_protection HTTP/1.1",
+                "GET /actions/6 HTTP/1.1"
+            ]
+        );
+        let bodies: Vec<Value> = srv.bodies.lock().unwrap().iter().filter(|b| !b.is_empty()).map(|b| serde_json::from_str(b).unwrap()).collect();
+        assert_eq!(bodies, [json!({"delete": true, "rebuild": true}), json!({"delete": false, "rebuild": false})]);
+
+        let protected = r#"{"error":{"code":"protected","message":"server is delete protected","details":{}}}"#;
+        let running = r#"{"error":{"code":"locked","message":"server is locked","details":{}}}"#;
+        let srv = serve(vec![canned(423, "application/json", protected), canned(423, "application/json", running)]);
+        let p = quick(&srv.base, HetznerOpts::default());
+        let e = p.terminate_pod("42").await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Locked), "{e}");
+        assert!(e.to_string().contains("hetzner terminate HTTP 423") && e.to_string().contains("server is delete protected"), "{e}");
+        assert!(!crate::retry::is_retryable(&e));
+        let e = p.terminate_pod("42").await.unwrap_err();
+        assert_ne!(e.kind(), Some(K::Locked), "an action running is no lock: {e}");
     }
 
     /// Spares are no fleet machine: the fleet listing leaves out every `arena-spare` server (any

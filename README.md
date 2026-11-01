@@ -477,7 +477,8 @@ Without a tokens file, `CLAUDE_CODE_OAUTH_TOKEN` is a pool of one, as before.
   are additive, and nothing there is deleted automatically. [Restore](docs/BACKUPS.md#pods-restore)
 - **Never reaps without a backup**: the auto-reaper is opt-in, and terminates only after a
   verified backup. [The reaper](docs/BACKUPS.md#pods-reap)
-- **Locks**: `arena pods lock --all` makes RunPod refuse stop/restart/terminate from any client.
+- **Locks**: `arena pods lock --all` makes RunPod refuse stop/restart/terminate from any client
+  (a Hetzner VM: its delete + rebuild protection).
   [Locks](docs/REFERENCE.md#pods-lock--pods-unlock)
 
 ## Tell us what hurts
