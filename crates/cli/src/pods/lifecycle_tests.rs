@@ -1390,8 +1390,11 @@ async fn reimage_is_gated_like_restart_and_sets_the_pod_up_again() {
     handle_reimage(&f, remote.clone(), &cfg, &named(&pods[..1]), None, false, opts, FAST, &keys_dir).await.unwrap();
     assert_eq!(f.calls(), ["reimage r-alpha img:9"]);
     let calls = remote.calls()[before..].to_vec();
-    assert!(matches!(&calls[0], RemoteCall::Exec { host, cmd, .. } if host == "10.0.0.1:22001" && cmd.contains("ARENA_IDLE_NOW")), "{calls:?}");
-    assert!(calls.len() > 1 && calls[1..].iter().all(|c| c.host() == "10.0.0.1:23001"), "{calls:?}");
+    // Asked before the prompt, and again right before its reimage.
+    for c in &calls[..2] {
+        assert!(matches!(c, RemoteCall::Exec { host, cmd, .. } if host == "10.0.0.1:22001" && cmd.contains("ARENA_IDLE_NOW")), "{calls:?}");
+    }
+    assert!(calls.len() > 2 && calls[2..].iter().all(|c| c.host() == "10.0.0.1:23001"), "{calls:?}");
     assert!(calls.iter().any(|c| matches!(c, RemoteCall::Exec { cmd, .. } if cmd.contains(&name_file_command("alpha")))), "{calls:?}");
     let px = proxy_file(&dir.0);
     assert!(px.contains("name=devtest-alpha") && px.contains("23001") && !px.contains("22001"), "{px}");
@@ -1443,6 +1446,27 @@ async fn reimage_refuses_a_pod_someone_is_on_unless_forced() {
         handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, true, opts, FAST, &keys_dir).await.unwrap();
         assert_eq!(f.calls(), ["reimage r-alpha img:9", "reimage r-bravo img:9"]);
     }
+    // Someone comes on bravo while alpha is reimaged (review F2): asked again right before
+    // bravo's own — skipped, said, the exit fails; alpha's went ahead.
+    let f = fleet();
+    let remote = Arc::new(FakeRemote::new());
+    remote.on("10.0.0.1:22001", "ARENA_IDLE_NOW", FakeReply::stdout(&Reply::default().render()));
+    let bravo_probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = bravo_probes.clone();
+    remote.on(
+        "10.0.0.1:22002",
+        "ARENA_IDLE_NOW",
+        FakeReply::from_cmd(move |_| {
+            // The first look (before the prompt): no one; the second (before its reimage): one.
+            let sessions = if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 { vec![] } else { vec![[10, 9, 9, 9]] };
+            FakeReply::stdout(&Reply { sessions, ..Reply::default() }.render())
+        }),
+    );
+    let pods = f.pods.lock().unwrap()[..2].to_vec();
+    let e = handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, false, opts, FAST, &keys_dir).await.unwrap_err().to_string();
+    assert!(e.contains("1 pod(s) failed to reimage: devtest-bravo"), "{e}");
+    assert_eq!(f.calls(), ["reimage r-alpha img:9"]);
+    assert_eq!(bravo_probes.load(std::sync::atomic::Ordering::SeqCst), 2);
     // A stopped pod: no one can be on it — not probed, not refused.
     let f = fleet();
     f.pods.lock().unwrap()[0].status = "EXITED".into();

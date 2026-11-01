@@ -31,7 +31,9 @@ use crate::{confirm, confirm_typed, spend};
 /// its repo really is ([`repo_sites`]), and a pod whose work isn't on a confirmed volume is
 /// refused without `--wipe-ok`; the dry run says so. Then, unless `force`, a pod someone is on
 /// — or that can't be read — is refused, as `replace` refuses one ([`busy_refusals`]): the
-/// wipe would take what they're working on. And it re-runs setup afterwards (live
+/// wipe would take what they're working on. Asked of the whole selection before the prompt,
+/// and of each pod again right before its own reimage (one found busy then is skipped, and
+/// fails the exit). And it re-runs setup afterwards (live
 /// finding #8: a reimaged pod was left with no `~/.name`, the public git remote and no
 /// deploy key — backups then silently couldn't push).
 ///
@@ -144,6 +146,15 @@ pub(crate) async fn handle_reimage(
     let policy = arena_core::retry::RetryPolicy::default();
     let mut failed = Vec::new();
     for pod in pods {
+        // Asked again right before its wipe (review F2): the prompt may have waited, and a
+        // rebuild before it may have taken 15 min — someone on it since isn't wiped unasked.
+        if !force {
+            if let Some(r) = busy_refusals(&remote, cfg, &[pod]).await.pop() {
+                eprintln!("[not reimaged] {}: {r}", pod.name);
+                failed.push(pod.name.clone());
+                continue;
+            }
+        }
         let image = match reimage_op(pod) {
             DiskOp::Rebuild => vm_images.iter().find(|v| v.ids.contains(&pod.id)).map(|v| v.image.clone()),
             _ => container_image.clone(),

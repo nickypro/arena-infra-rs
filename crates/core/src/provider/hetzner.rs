@@ -1205,6 +1205,16 @@ fn rebuild_payload(image: Value, env: &[(String, String)]) -> Value {
     body
 }
 
+/// Whether a failed request certainly never reached Hetzner — no connection was made, or the
+/// rate limiter held it back — so sending it again can't do it twice. Pure.
+fn never_reached(e: &Error) -> bool {
+    match e {
+        Error::Http(re) => re.is_connect(),
+        Error::Provider { kind, .. } => *kind == crate::error::ProviderErrorKind::RateLimited,
+        _ => false,
+    }
+}
+
 /// `id` as a server id (digits only), before it goes into a URL path. Pure.
 fn check_server_id(id: &str) -> Result<()> {
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
@@ -1645,9 +1655,12 @@ impl Provider for HetznerProvider {
     ///
     /// Waits for the rebuild ([`REBUILD_WAIT`]) — setup must meet the new disk, not the old one —
     /// and powers the VM on if it's off afterwards (a rebuild powers a server off first; setup
-    /// needs it up). Once the rebuild is sent, a failure is never retryable: sending it again
-    /// would wipe the VM again (and Hetzner refuses a second action while one runs).
+    /// needs it up). Once the rebuild may have been sent, a failure is never retryable: sending
+    /// it again would wipe the VM again (and Hetzner refuses a second action while one runs). That
+    /// includes a request whose answer was lost (a 5xx, a dropped connection: Hetzner may have
+    /// started it); only one that never reached Hetzner (no connection, a throttle) may be retried.
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
+        use crate::error::ProviderErrorKind as K;
         use crate::image::{Resolved, Setting};
         check_server_id(id)?;
         let image = match Setting::parse(image) {
@@ -1655,7 +1668,20 @@ impl Provider for HetznerProvider {
             given => Resolved::Given(given).image(),
         };
         let url = format!("{}/servers/{id}/actions/rebuild", self.base);
-        let sent = send_json(self.auth(self.client.post(url).json(&rebuild_payload(image, env))), "hetzner rebuild").await?;
+        let sent = match send_json(self.auth(self.client.post(url).json(&rebuild_payload(image, env))), "hetzner rebuild").await {
+            Ok(sent) => sent,
+            Err(e) if crate::retry::is_retryable(&e) && !never_reached(&e) => {
+                return Err(Error::Provider {
+                    kind: K::Other,
+                    message: format!(
+                        "hetzner rebuild of server {id}: {e} — it may have started all the same: don't reimage it again until \
+                         `arena pods list` shows it running (not rebuilding), then `arena pods setup` (or reimage it if it wasn't \
+                         rebuilt)"
+                    ),
+                })
+            }
+            Err(e) => return Err(e),
+        };
         let action = sent.pointer("/action/id").and_then(Value::as_u64);
         let after = |why: String| Error::Provider {
             kind: crate::error::ProviderErrorKind::Other,
@@ -1669,9 +1695,13 @@ impl Provider for HetznerProvider {
             return Err(after(format!("its answer named no action ({})", super::body_excerpt(&sent))));
         };
         self.await_action(action, REBUILD_WAIT).await.map_err(|e| after(format!("waiting for it failed: {e}")))?;
-        match self.server_status(id).await {
+        // Whether it's on: read again through a blip (a VM left off would fail setup), never
+        // guessed — unknown is said, as a rebuilt VM that may be off.
+        let reads = crate::retry::RetryPolicy { max_retries: 4, base_delay: self.shutdown.every, max_delay: self.shutdown.every * 4 };
+        match crate::retry::retrying(&reads, || self.server_status(id)).await {
             Ok(s) if s == "off" => self.power_action(id, "poweron").await.map_err(|e| after(format!("powering it on failed: {e}"))),
-            _ => Ok(()),
+            Ok(_) => Ok(()),
+            Err(e) => Err(after(format!("reading whether it's on failed ({e}) — it may be off: `arena pods start` starts it"))),
         }
     }
 
@@ -1686,9 +1716,15 @@ impl Provider for HetznerProvider {
         let url = format!("{}/servers/{id}/actions/change_protection", self.base);
         let body = json!({"delete": locked, "rebuild": locked});
         let sent = send_json(self.auth(self.client.post(url).json(&body)), "hetzner change protection").await?;
+        // Done only once Hetzner's action says so: an answer without one can't say it took.
         match sent.pointer("/action/id").and_then(Value::as_u64) {
             Some(action) => self.await_action(action, PROTECTION_WAIT).await,
-            None => Ok(()),
+            None => Err(Error::provider(format!(
+                "hetzner change protection of server {id}: its answer named no action ({}) — whether it's {} isn't known: \
+                 `arena pods list` shows it",
+                super::body_excerpt(&sent),
+                if locked { "locked" } else { "unlocked" }
+            ))),
         }
     }
 
@@ -3103,6 +3139,23 @@ mod tests {
         quick(&srv.base, HetznerOpts::default()).reimage_pod("42", "ubuntu-24.04", &[]).await.unwrap();
         assert_eq!(srv.requests.lock().unwrap().last().unwrap(), "POST /servers/42/actions/poweron HTTP/1.1");
         assert_eq!(serde_json::from_str::<Value>(&srv.bodies.lock().unwrap()[0]).unwrap(), json!({"image": "ubuntu-24.04"}));
+        // Whether it's on is read again through a blip (review F4) — and never guessed: a read
+        // that keeps failing is said, as a sent rebuild (not retried).
+        let srv = serve(vec![
+            canned(201, "application/json", &action(8, "success")),
+            canned(200, "application/json", &action(8, "success")),
+            canned(503, "text/html", "down"),
+            canned(200, "application/json", &server_status("off")),
+            canned(201, "application/json", &action(9, "running")),
+        ]);
+        quick(&srv.base, HetznerOpts::default()).reimage_pod("42", "ubuntu-24.04", &[]).await.unwrap();
+        assert_eq!(srv.requests.lock().unwrap().last().unwrap(), "POST /servers/42/actions/poweron HTTP/1.1");
+        let mut answers = vec![canned(201, "application/json", &action(8, "success")), canned(200, "application/json", &action(8, "success"))];
+        answers.extend((0..5).map(|_| canned(503, "text/html", "down")));
+        let srv = serve(answers);
+        let e = quick(&srv.base, HetznerOpts::default()).reimage_pod("42", "ubuntu-24.04", &[]).await.unwrap_err();
+        assert!(e.to_string().contains("was sent (action 8)") && e.to_string().contains("it may be off"), "{e}");
+        assert!(!crate::retry::is_retryable(&e), "{e}");
 
         // Not a server id: refused before any request.
         let srv = serve(vec![]);
@@ -3170,6 +3223,16 @@ mod tests {
         assert!(e.to_string().contains("was sent (action 7)") && e.to_string().contains("action not found"), "{e}");
         assert!(!crate::retry::is_retryable(&e), "{e}");
         assert_eq!(srv.requests.lock().unwrap().len(), 2, "one rebuild, one poll");
+        // The rebuild's own answer lost (a 5xx; review F1): it may have started, so not retried
+        // either — one POST, and words that say so.
+        let srv = serve(vec![canned(503, "text/html", "<html>Service Unavailable</html>")]);
+        let e = quick(&srv.base, HetznerOpts::default()).reimage_pod("42", "ubuntu-24.04", &[]).await.unwrap_err();
+        assert!(!crate::retry::is_retryable(&e), "{e}");
+        assert!(e.to_string().contains("it may have started all the same: don't reimage it again"), "{e}");
+        assert_eq!(*srv.requests.lock().unwrap(), ["POST /servers/42/actions/rebuild HTTP/1.1"]);
+        // One that never reached Hetzner (no connection) is the caller's to retry, as ever.
+        let e = quick("http://127.0.0.1:9", HetznerOpts::default()).reimage_pod("42", "ubuntu-24.04", &[]).await.unwrap_err();
+        assert!(crate::retry::is_retryable(&e) && never_reached(&e), "{e}");
         // Refused up front: locked (rebuild protection) — the lock's error, not a sent rebuild.
         let protected = r#"{"error":{"code":"protected","message":"server is rebuild protected"}}"#;
         let srv = serve(vec![canned(423, "application/json", protected)]);
@@ -3208,6 +3271,15 @@ mod tests {
         );
         let bodies: Vec<Value> = srv.bodies.lock().unwrap().iter().filter(|b| !b.is_empty()).map(|b| serde_json::from_str(b).unwrap()).collect();
         assert_eq!(bodies, [json!({"delete": true, "rebuild": true}), json!({"delete": false, "rebuild": false})]);
+        // An answer that names no action can't say the lock took (review F3): an error.
+        let srv = serve(vec![canned(201, "application/json", "{}")]);
+        let e = quick(&srv.base, HetznerOpts::default()).set_locked("42", true).await.unwrap_err();
+        assert!(e.to_string().contains("named no action") && e.to_string().contains("whether it's locked isn't known"), "{e}");
+        // An action Hetzner says failed is a failed lock.
+        let failed = json!({"action": {"id": 5, "command": "change_protection", "status": "error", "error": {"code": "x", "message": "nope"}}});
+        let srv = serve(vec![canned(201, "application/json", &action(5, "running")), canned(200, "application/json", &failed.to_string())]);
+        let e = quick(&srv.base, HetznerOpts::default()).set_locked("42", true).await.unwrap_err();
+        assert!(e.to_string().contains("change_protection (action 5) failed: nope"), "{e}");
 
         let protected = r#"{"error":{"code":"protected","message":"server is delete protected","details":{}}}"#;
         let running = r#"{"error":{"code":"locked","message":"server is locked","details":{}}}"#;

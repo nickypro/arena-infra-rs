@@ -809,7 +809,7 @@ pub(crate) enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Reimage pods in place: new image, WIPES the container disk (a VM's whole disk)
+    /// Reimage pods in place: new image, WIPES the disk (container or VM)
     ///
     /// Same host and name, fresh container from --image; nothing is copied over (`replace` keeps
     /// files). A Hetzner VM is rebuilt from its image (HETZNER_IMAGE; `arena` = the newest arena
@@ -819,8 +819,7 @@ pub(crate) enum PodCmd {
     /// and syncs the proxy.
     #[command(verbatim_doc_comment)]
     Reimage {
-        /// Image to use (default: RUNPOD_DOCKER_IMAGE; a Hetzner VM's: HETZNER_IMAGE — `arena`, a
-        /// snapshot id or a name like ubuntu-24.04).
+        /// Image to use (default: RUNPOD_DOCKER_IMAGE; on a Hetzner VM: HETZNER_IMAGE, e.g. arena)
         #[arg(long)]
         image: Option<String>,
         /// Reimage even pods whose work isn't on a volume (required, even with --yes)
