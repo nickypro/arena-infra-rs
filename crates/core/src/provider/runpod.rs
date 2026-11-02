@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Value};
 
-use super::{ContainerReset, Provider, RUNPOD_V1_REMEDY, RUNPOD_V1_RETIREMENT};
+use super::{ContainerReset, Provider, Resize, RUNPOD_V1_REMEDY, RUNPOD_V1_RETIREMENT};
 use crate::capability::{Backend, Op};
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, ProviderErrorKind, Result};
@@ -441,7 +441,12 @@ impl Provider for RunpodProvider {
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
         // REST `PATCH /pods/{id}` resets the container (see `rename_pod`): exactly what a
         // reimage wants. `env` replaces the pod's env wholesale, so pass everything to keep.
-        let body = reimage_payload(image, env);
+        self.reimage_pod_resized(id, image, env, Resize::default()).await
+    }
+
+    async fn reimage_pod_resized(&self, id: &str, image: &str, env: &[(String, String)], resize: Resize) -> Result<()> {
+        // The same PATCH: `containerDiskInGb` / `volumeInGb` are fields of v1's `PodUpdateInput`.
+        let body = reimage_payload(image, env, resize);
         v1_ok(self.auth(self.client.patch(format!("{}/pods/{id}", self.base))).json(&body), "reimage pod").await
     }
 
@@ -531,11 +536,20 @@ async fn rename_via_graphql(client: &Client, api_key: &str, id: &str, new_name: 
     Ok(())
 }
 
-/// Build the REST `PATCH /pods/{id}` body for a reimage. Pure, for testing.
-fn reimage_payload(image: &str, env: &[(String, String)]) -> Value {
+/// Build the REST `PATCH /pods/{id}` body for a reimage, with the sizes `resize` changes
+/// (`containerDiskInGb`, `volumeInGb`; the volume keeps its `/workspace` mount, which arena's
+/// v1 creates always use). Pure, for testing.
+fn reimage_payload(image: &str, env: &[(String, String)], resize: Resize) -> Value {
     let env: serde_json::Map<String, Value> =
         env.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
-    json!({ "imageName": image, "env": env })
+    let mut body = json!({ "imageName": image, "env": env });
+    if let Some(gb) = resize.disk_gb {
+        body["containerDiskInGb"] = json!(gb);
+    }
+    if let Some(gb) = resize.volume_gb {
+        body["volumeInGb"] = json!(gb);
+    }
+    body
 }
 
 /// Recover a recreate-able `PodSpec` from a RunPod `GET /pods/{id}` body. Pure (no I/O) so
@@ -1249,10 +1263,24 @@ mod tests {
 
     #[test]
     fn reimage_payload_sets_image_and_full_env() {
-        let v = reimage_payload("img:9", &[("MACHINE_NAME".into(), "a-b".into()), ("PUBLIC_KEY".into(), "k1\nk2".into())]);
+        let v = reimage_payload("img:9", &[("MACHINE_NAME".into(), "a-b".into()), ("PUBLIC_KEY".into(), "k1\nk2".into())], Resize::default());
         assert_eq!(v["imageName"], "img:9");
         assert_eq!(v["env"]["MACHINE_NAME"], "a-b");
         assert_eq!(v["env"]["PUBLIC_KEY"], "k1\nk2");
+        // A plain reimage leaves the sizes alone: no size field at all.
+        assert_eq!(v.as_object().unwrap().len(), 2, "{v}");
+    }
+
+    /// `pods reimage --disk / --volume` on v1: the same PATCH with `PodUpdateInput`'s own size
+    /// fields, only the ones given.
+    #[test]
+    fn reimage_payload_resizes_the_disk_and_volume_given() {
+        let v = reimage_payload("img:9", &[], Resize { disk_gb: Some(500), volume_gb: None });
+        assert_eq!(v, json!({"imageName": "img:9", "env": {}, "containerDiskInGb": 500}));
+        let v = reimage_payload("img:9", &[], Resize { disk_gb: None, volume_gb: Some(80) });
+        assert_eq!(v, json!({"imageName": "img:9", "env": {}, "volumeInGb": 80}));
+        let v = reimage_payload("img:9", &[], Resize { disk_gb: Some(200), volume_gb: Some(80) });
+        assert_eq!((v["containerDiskInGb"].as_u64(), v["volumeInGb"].as_u64()), (Some(200), Some(80)));
     }
 
     #[test]

@@ -371,6 +371,17 @@ pub fn status_label(p: &Pod) -> String {
     }
 }
 
+/// The DISK column of `pods list`: the container disk, plus the volume where the pod has one —
+/// `500G`, `60+20G` — or `-` where the listing doesn't say (Hetzner, Shadeform). What `pods
+/// reimage --disk / --volume` changes, so it shows there. Pure.
+pub fn disk_label(p: &Pod) -> String {
+    match (p.disk_gb, p.volume_gb) {
+        (Some(total), Some(vol)) if vol > 0.0 => format!("{:.0}+{vol:.0}G", (total - vol).max(0.0)),
+        (Some(total), _) => format!("{total:.0}G"),
+        (None, _) => "-".to_string(),
+    }
+}
+
 /// One pod's cells under [`POD_HEADERS`] — shared with `arena snapshot`'s table, which adds
 /// its own columns, so a pod's labels read the same in both.
 pub fn pod_cells(p: &Pod) -> Vec<String> {
@@ -402,12 +413,20 @@ pub fn render_pods_table_with(pods: &[Pod], ends: Option<&[String]>) -> String {
 /// [`render_pods_table_with`] plus an `OWNER` column after NAME (`owners[i]` for `pods[i]`, from
 /// [`crate::spend::owners_column`]: `""` for none) — `None` = no column (no pod has an owner),
 /// so a fleet that doesn't use owners sees the table it always did. A column whose length
-/// doesn't match the pods is left out.
+/// doesn't match the pods is left out. A `DISK` column ([`disk_label`]) after GPU when some pod's
+/// listing says its disk (a fresh listing's: a snapshot's pods carry none).
 pub fn render_pods_table_full(pods: &[Pod], owners: Option<&[String]>, ends: Option<&[String]>) -> String {
     let owners = owners.filter(|o| o.len() == pods.len());
     let ends = ends.filter(|e| e.len() == pods.len());
+    let disks = pods.iter().any(|p| p.disk_gb.is_some());
     let mut headers: Vec<&str> = POD_HEADERS.to_vec();
     let mut align: Vec<Align> = POD_ALIGN.to_vec();
+    // After GPU, before $/H.
+    let disk_at = POD_HEADERS.iter().position(|h| *h == "GPU").map_or(headers.len(), |i| i + 1);
+    if disks {
+        headers.insert(disk_at, "DISK");
+        align.insert(disk_at, Align::Right);
+    }
     if ends.is_some() {
         headers.insert(headers.len() - 1, "ENDS");
         align.insert(align.len() - 1, Align::Left);
@@ -421,6 +440,9 @@ pub fn render_pods_table_full(pods: &[Pod], owners: Option<&[String]>, ends: Opt
         .enumerate()
         .map(|(i, p)| {
             let mut c = pod_cells(p);
+            if disks {
+                c.insert(disk_at, disk_label(p));
+            }
             if let Some(e) = ends {
                 c.insert(c.len() - 1, e[i].clone());
             }
@@ -802,6 +824,25 @@ devtest-flutter  hetzner   51234567  run     cx23         €0.006  5.6.7.8:22  
 fleet: $0.17/h across 2 billing pod(s) + €0.006/h hetzner
 ";
         assert_eq!(out, want, "\n--- got ---\n{out}");
+    }
+
+    /// `pods list` says each pod's disk where its listing does — the container disk plus the
+    /// volume (what `pods reimage --disk / --volume` changes) — in a DISK column after GPU, which
+    /// isn't there when no pod reports one (a snapshot's pods, a Hetzner-only fleet).
+    #[test]
+    fn the_disk_column_shows_where_a_listing_says_the_disk() {
+        let sized = |name: &str, disk: Option<f64>, vol: Option<f64>| Pod { disk_gb: disk, volume_gb: vol, ..pod(name, "runpod", "RUNNING") };
+        assert_eq!(disk_label(&sized("a", Some(520.0), Some(20.0))), "500+20G");
+        assert_eq!(disk_label(&sized("a", Some(60.0), Some(0.0))), "60G");
+        assert_eq!(disk_label(&sized("a", Some(60.0), None)), "60G", "Vast: no split");
+        assert_eq!(disk_label(&sized("a", None, None)), "-");
+        let pods = [sized("devtest-apple", Some(520.0), Some(20.0)), Pod { provider: "hetzner".into(), ..pod("devtest-vm", "hetzner", "RUNNING") }];
+        let out = render_pods_table_full(&pods, None, None);
+        let head = out.lines().next().unwrap();
+        assert!(head.contains("GPU") && head.find("DISK") > head.find("GPU") && head.find("DISK") < head.find("$/H"), "{out}");
+        assert!(out.lines().nth(1).unwrap().contains("500+20G") && out.lines().nth(2).unwrap().contains(" - "), "{out}");
+        let plain = [pod("devtest-apple", "runpod", "RUNNING")];
+        assert!(!render_pods_table_full(&plain, None, None).contains("DISK"));
     }
 
     #[test]

@@ -54,6 +54,7 @@ pub(crate) mod lock;
 pub(crate) mod migrate;
 pub(crate) mod placement;
 pub(crate) mod pull;
+pub(crate) mod reimage_disk;
 pub(crate) mod rename;
 pub(crate) mod replace;
 pub(crate) mod restore;
@@ -920,10 +921,11 @@ pub(crate) async fn handle_pods_bal(
             handle_lock(provider, &sel, false, dry_run, yes).await?;
         }
 
-        PodCmd::Reimage { sel, image, wipe_ok, force, no_setup, skip_proxy, dry_run } => {
+        PodCmd::Reimage { sel, image, disk, volume, wipe_ok, force, no_setup, skip_proxy, dry_run } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("reimage")).await?;
             let opts = RestartOpts { wipe_ok, no_setup, skip_proxy, dry_run, yes };
-            handle_reimage(provider, remote, cfg, &sel, image, force, opts, RESTART_SETTLE, &keys_dir(cfg)).await?;
+            let resize = arena_core::provider::Resize { disk_gb: disk, volume_gb: volume };
+            handle_reimage(provider, remote, cfg, &sel, image, resize, force, opts, RESTART_SETTLE, &keys_dir(cfg)).await?;
         }
 
         PodCmd::Replace { target, gpu, gpus, cloud, disk, volume, image, place, onto, force, keep_old, skip_proxy, dry_run } => {
@@ -1196,6 +1198,12 @@ pub(crate) mod remote_tests;
 /// API, temp dirs for the keys CSV and the (write-only) proxy file.
 #[cfg(test)]
 pub(crate) mod lifecycle_tests;
+
+/// `pods reimage --disk / --volume` end to end against a fake RunPod/Hetzner/Vast fleet: the
+/// refusals up front, the sizes in the prompt and the dry run, the request, the host without
+/// the room.
+#[cfg(test)]
+mod reimage_disk_tests;
 
 /// Moving a Hetzner VM (`replace`/`migrate` with `--server-type`, `--onto`, `--onto-spare`, the
 /// "anyone on it?" checks, a VM's own identity) over a fake Hetzner backend and `FakeRemote`.

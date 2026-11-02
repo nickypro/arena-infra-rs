@@ -132,6 +132,32 @@ impl ContainerReset {
     }
 }
 
+/// What `pods reimage --disk / --volume` resizes in the same request as the reimage
+/// ([`Provider::reimage_pod_resized`]); `None` keeps that size. Both empty: a plain reimage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Resize {
+    /// The container disk, GB: wiped by the reimage anyway, so any size goes.
+    pub disk_gb: Option<u32>,
+    /// The pod's own volume (RunPod's `/workspace`), GB: it keeps its files, and only grows.
+    pub volume_gb: Option<u32>,
+}
+
+impl Resize {
+    /// Whether anything is resized.
+    pub fn any(self) -> bool {
+        self.disk_gb.is_some() || self.volume_gb.is_some()
+    }
+
+    /// The operation it is, for a refusal: the disk's when it's resized, else the volume's.
+    pub fn op(self) -> Op {
+        if self.disk_gb.is_some() {
+            Op::ReimageDisk
+        } else {
+            Op::ReimageVolume
+        }
+    }
+}
+
 /// How a stop ended ([`Provider::stop_pod_outcome`]), for the line that reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopOutcome {
@@ -408,6 +434,18 @@ pub trait Provider: Send + Sync {
     /// Default: unsupported.
     async fn reimage_pod(&self, _id: &str, _image: &str, _env: &[(String, String)]) -> Result<()> {
         Err(unsupported(self, Op::Reimage))
+    }
+
+    /// DESTRUCTIVE. [`Self::reimage_pod`] that also resizes the container disk and/or the
+    /// pod's volume in the same request (`pods reimage --disk / --volume`): same host, same
+    /// id, the container disk wiped. A host without the room refuses it, and the pod is left
+    /// as it was. `resize` with nothing in it is a plain reimage. Default: unsupported (the
+    /// capability table's `pods reimage --disk` / `--volume` cells).
+    async fn reimage_pod_resized(&self, id: &str, image: &str, env: &[(String, String)], resize: Resize) -> Result<()> {
+        if !resize.any() {
+            return self.reimage_pod(id, image, env).await;
+        }
+        Err(unsupported(self, resize.op()))
     }
 
     /// Mutating, idempotent. Authorize `keys` (OpenSSH public keys, one per entry) for SSH on

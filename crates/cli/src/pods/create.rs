@@ -95,6 +95,9 @@ impl Provider for RecordingProvider<'_> {
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> arena_core::Result<()> {
         self.inner.reimage_pod(id, image, env).await
     }
+    async fn reimage_pod_resized(&self, id: &str, image: &str, env: &[(String, String)], resize: arena_core::provider::Resize) -> arena_core::Result<()> {
+        self.inner.reimage_pod_resized(id, image, env, resize).await
+    }
     async fn authorize_ssh_keys(&self, pod: &arena_core::Pod, keys: &[String]) -> arena_core::Result<()> {
         self.inner.authorize_ssh_keys(pod, keys).await
     }
