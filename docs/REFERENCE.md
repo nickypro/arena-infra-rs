@@ -1156,12 +1156,13 @@ shows RunPod's answer. On Hetzner, Vast and Shadeform it's refused up front with
 works there ([What works where](#what-works-where), and below).
 
 A RunPod reimage keeps the pod's `startedAt`, and for 15–50 s RunPod still reports the old
-container's SSH port (live 2026-11-02). Until the pod's detail shows the new container (an uptime
-that started since the reimage, on another SSH port than the old container's: RunPod gave a new
-one on each of 5 resets seen), arena lists the pod without an endpoint, so the settle wait and
-setup go to the new container, and from then on that endpoint is the pod's. A replacement that got
-the old port back, or a pod whose endpoint couldn't be read before (or that started under 3 min
-before), can't be told apart: the wait then times out and says to run `arena pods setup NAME`.
+container's SSH port (live 2026-11-02). So for the rest of the command arena looks the pod up at
+every listing, and gives it the endpoint only of a container started since the reimage (an uptime
+that fits, on another SSH port than the old container's: RunPod gave a new one on each of 5
+resets seen), else none: the settle wait and setup go to the new container. RunPod names no
+container, so this is evidence, not proof. A replacement that got the old port back, or a pod
+whose endpoint couldn't be read before (or that started under 3 min before), can't be told apart:
+the wait then times out and says to run `arena pods setup NAME`.
 
 #### Changing a pod's disk
 

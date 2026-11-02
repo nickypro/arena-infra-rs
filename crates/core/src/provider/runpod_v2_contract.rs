@@ -619,9 +619,9 @@ async fn a_lookup_soon_after_a_start_is_checked_again_until_it_settles() {
 /// The live reimages (2026-11-02): the PATCH leaves `startedAt` as it was, and the detail kept
 /// showing the old container — its SSH port, its uptime counting on — for 14 s (v1's PATCH)
 /// and 30–50 s (v2's, with a resize): the settle wait took the old port and setup failed on it.
-/// After this provider's reimage the pod is always looked up, and listed without an endpoint
-/// until its detail shows the new container on positive evidence ([`is_new_container`]: another
-/// SSH endpoint); from then on that endpoint is the pod's, whatever a listing names.
+/// After this provider's reimage the pod is looked up at every listing, whatever the listing
+/// names, and has the endpoint of a lookup that shows a container started since
+/// ([`is_new_container`]: another SSH endpoint), else none.
 #[tokio::test]
 async fn a_reimaged_pod_has_no_endpoint_until_its_new_container_shows() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -629,10 +629,10 @@ async fn a_reimaged_pod_has_no_endpoint_until_its_new_container_shows() {
     let at0 = 10_000;
     let ip = "157.157.221.29";
     let reset_to = |before: Before| {
-        memo.lock().unwrap().resets.insert("p1".into(), Reset { at: at0, before, new: None });
+        memo.lock().unwrap().resets.insert("p1".into(), Reset { at: at0, before });
     };
     let reset = |old_port: u16| reset_to(Before::Ssh(ip.into(), old_port));
-    let waiting = || memo.lock().unwrap().resets.get("p1").map(|r| r.new.is_none());
+    let reimaged = || memo.lock().unwrap().resets.contains_key("p1");
     let gets = std::sync::Arc::new(AtomicUsize::new(0));
     // The pod as listed (`status`, `started` — long before the reimage by default — naming
     // `listed_port`); its detail shows `ports` (SSH first, then HTTP) and `uptime`.
@@ -671,18 +671,19 @@ async fn a_reimaged_pod_has_no_endpoint_until_its_new_container_shows() {
     reset(59950);
     assert_eq!(at(at0 + 1, Some(59950), &old, Some(114)).await, None, "the old container: no endpoint yet");
     assert_eq!(at(at0 + 15, Some(59950), &old, Some(151)).await, None);
-    assert!(memo.lock().unwrap().by_id.is_empty() && waiting() == Some(true));
     assert_eq!(at(at0 + 45, Some(59950), &new, Some(26)).await, Some(59678), "the new container's");
-    assert_eq!(gets.load(Ordering::SeqCst), 3, "looked up every time, the listed endpoint notwithstanding");
-    // From then on it's the pod's, without a lookup, whatever a listing names: the old one, none
-    // — after one that listed the pod as not running (review r3) — the new one, then the old
-    // one again (review r6).
-    assert_eq!(at(at0 + 60, Some(59950), &old, Some(151)).await, Some(59678));
+    // Looked up at every listing — whatever it names, after one that listed the pod as not
+    // running too (r3) — and never remembered: a stale answer naming the old container again
+    // (r6) is no endpoint, not the old one...
+    assert_eq!(at(at0 + 60, Some(59950), &new, Some(41)).await, Some(59678));
     look(at0 + 65, "EXITED", 5_000, None, &old, None).await;
-    assert_eq!(at(at0 + 70, None, &old, Some(151)).await, Some(59678));
-    assert_eq!(at(at0 + 80, Some(59678), &new, Some(60)).await, Some(59678));
-    assert_eq!(at(at0 + 81, Some(59950), &old, Some(151)).await, Some(59678));
-    assert_eq!((gets.load(Ordering::SeqCst), waiting()), (3, Some(false)));
+    assert_eq!(at(at0 + 70, None, &new, Some(51)).await, Some(59678));
+    assert_eq!(at(at0 + 81, Some(59678), &old, Some(151)).await, None);
+    assert_eq!(at(at0 + 90, Some(59950), &new, Some(71)).await, Some(59678));
+    // ...and a later reimage elsewhere, keeping `startedAt` too (r7), shows as its container does.
+    assert_eq!(at(at0 + 400, Some(59678), &[59111, 60990, 60991], Some(20)).await, Some(59111));
+    assert_eq!(gets.load(Ordering::SeqCst), 8, "every listing of a running pod");
+    assert!(memo.lock().unwrap().by_id.is_empty() && reimaged());
     // Its answer came back late (review r2): the reset is timed from the request, so a new
     // container already 45 s up at the first look is still the new one.
     reset(59950);
@@ -719,16 +720,16 @@ async fn a_reimaged_pod_has_no_endpoint_until_its_new_container_shows() {
     // is forgotten...
     reset(59950);
     fill_endpoints(Vec::new(), |_| async { unreachable!() }, &memo, at0 + 1).await;
-    assert_eq!(waiting(), None);
+    assert!(!reimaged());
     reset(59950);
     let got = look(at0 + 31, "RUNNING", at0 + 30, Some(19700), &old, None).await;
-    assert_eq!((got[0].ssh_port, waiting()), (Some(19700), None));
+    assert_eq!((got[0].ssh_port, reimaged()), (Some(19700), false));
     reset(59950);
     assert_eq!(at(at0 + RESET_WAIT_SECS, Some(59950), &old, Some(2100)).await, Some(59950), "after the cap: as listed");
     // ...but not for a `startedAt` before the request — a stale listing (review r4).
     reset(59950);
     assert_eq!(look(at0 + 5, "RUNNING", at0 - 600, Some(59950), &old, Some(600)).await[0].ssh_port, None);
-    assert_eq!(waiting(), Some(true));
+    assert!(reimaged());
 }
 
 /// Rechecks share [`RECHECKS_PER_MINUTE`] per process (a cohort's new pods would otherwise all
