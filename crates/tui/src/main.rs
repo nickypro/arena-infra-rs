@@ -39,6 +39,7 @@ mod ask;
 mod backups;
 mod columns;
 mod demo;
+mod keytest;
 mod lag;
 mod newpod;
 mod offers;
@@ -2413,7 +2414,7 @@ fn skipped_words(s: &Skipped) -> String {
 /// (where `arena snapshot` and the next refresh read them) and shown at once.
 fn start_deep_check(shared: &Arc<Mutex<Shared>>, ui: &Ui, pods: Vec<Pod>) {
     // Config first: a malformed MIN_DRIVER_VERSION is said before any pod is touched.
-    let policy = match HealthPolicy::from_config(&ui.cfg) {
+    let policy = match HealthPolicy::for_fleet(&ui.cfg, spend_path(&ui.cfg).as_deref()) {
         Ok(p) => p,
         Err(e) => {
             shared.lock().unwrap().notify(format!("✗ deep check: {e}"), true);
@@ -2615,7 +2616,11 @@ async fn execute(
         },
         Action::Backup => run_backup(remote, cfg, pod).await,
         Action::Setup => run_setup(remote, cfg, pod).await,
-        Action::Test => run_ssh_oneline(remote, cfg, pod, TORCH_TEST_CMD, "torch", TEST_TIMEOUT).await,
+        Action::Test => {
+            let torch = run_ssh_oneline(remote, cfg, pod, TORCH_TEST_CMD, "torch", TEST_TIMEOUT);
+            let (torch, keys) = tokio::join!(torch, keytest::check(remote, cfg, pod));
+            keytest::with_keys(torch, keys.as_ref())
+        }
         Action::Run => match arg {
             Some(cmd) if !cmd.trim().is_empty() => run_ssh_output(remote, cfg, pod, cmd).await,
             _ => format!("✗ {name}: no command given"),
@@ -3781,7 +3786,14 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     });
     // Who the machine is for (`--owner`, `spend assign`), when it has an owner.
     let owner = shared.owners.get(&mark_key(pod));
-    let fact_lines = FACT_LINES + u16::from(ai.is_some()) + u16::from(caps.is_some()) + u16::from(owner.is_some());
+    // Its AI keys as its last deep check found them (`ok, $4.97 of $5.00 left`, or the FAIL and
+    // what to run): shown when that check judged them.
+    let key_check = shared.snap.pods.get(ui.selected).and_then(|sp| sp.health.as_ref()).and_then(|h| state::key_check_line(&h.keys));
+    let fact_lines = FACT_LINES
+        + u16::from(ai.is_some())
+        + u16::from(caps.is_some())
+        + u16::from(owner.is_some())
+        + u16::from(key_check.is_some());
     let show_graphs = inner.height >= fact_lines + 3 + procs_h + commits_h + 6;
 
     let mut constraints: Vec<Constraint> = vec![
@@ -3955,6 +3967,9 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     }
     if let Some(c) = caps {
         facts.push(fact("ai caps:", one(fit(c), tone_style(Tone::Warn))));
+    }
+    if let Some((text, tone)) = key_check {
+        facts.push(fact("ai check:", one(fit(text), tone_style(tone))));
     }
     facts.extend([
         fact("maint:", or_dim(maint, tone_style(Tone::Warn).add_modifier(Modifier::BOLD))),

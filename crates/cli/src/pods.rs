@@ -18,7 +18,7 @@ use crate::pods::baseline::handle_baseline;
 use crate::pods::branch::{handle_init_branches, set_branch_and_init, SetBranchRun};
 use crate::pods::copy::handle_copy;
 use crate::pods::create::{check_create_body, create_extra, create_policy_line, create_with_retry, hand_keys_over, image_flag, owner_plan, pin_vm_image, plan_create, print_create_body, replacement_rounds, resolve_explicit_names, resolve_want, sizing_flags, spec_with_overrides, warn_no_volume, CreateFailed, Made, RecordingProvider, SpecOverrides, NO_STREAM};
-use crate::pods::health::handle_deep_test;
+use crate::pods::health::{handle_deep_test, handle_keys_test};
 use crate::pods::lifecycle::{disk_fate, handle_reimage, handle_restart, handle_start, handle_terminate, names_of, no_stop_left, no_stop_refusal, repo_sites, split_no_stop, stop_lines, wipe_refusal, DiskOp, RestartOpts, TerminateOpts, RESTART_SETTLE};
 use crate::pods::list::list_with;
 use crate::pods::capable::CreateFlags;
@@ -1078,13 +1078,20 @@ async fn handle_pods_bal(
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
             money::handle_idle(provider, remote, cfg, &sel, hours, json, &mut |l| println!("{l}")).await?;
         }
-        PodCmd::Test { deep: true, sel, json, verbose, cohort } => {
+        PodCmd::Test { deep: true, sel, json, verbose, cohort, .. } => {
             // Read-only: no confirm. Config first: a malformed MIN_DRIVER_VERSION fails before
             // the fleet is even listed. Fleet-wide = this cohort's pods: the check runs CUDA, NCCL
             // and a download on each GPU, never on a staff box's (the daily cron line's run).
             arena_core::health::HealthPolicy::from_config(cfg)?;
             let sel = cohort_only(cfg, select(provider, cfg, &sel.args(), Unscoped::All).await?, cohort);
             handle_deep_test(provider, remote, cfg, &sel, json, verbose).await?;
+        }
+        PodCmd::Test { keys: true, sel, json, verbose, cohort, .. } => {
+            // Read-only, fast: this cohort's pods (a staff box's key is the organisers' choice),
+            // and no wait on a pod listed without an endpoint — it's skipped with a note, as for
+            // `--deep` (the ops stopgap `pods run '<curl …/key>'` waited 20 s on a staff box's).
+            let sel = cohort_only(cfg, select(provider, cfg, &sel.args(), Unscoped::All).await?, cohort);
+            handle_keys_test(remote, cfg, &sel, json, verbose).await?;
         }
         PodCmd::Test { deep: false, sel, cohort, .. } => {
             // Read-only: no confirm, compact one-line-per-pod output.

@@ -1552,6 +1552,10 @@ again; a replacement that lands on a machine that already failed (any name's; by
 machine id — RunPod's `machineId` from REST v1 or GraphQL — before the IP, which several RunPod
 hosts share) is rejected unseen and terminated (even with no attempt left).
 
+Once its keys are copied, each machine's AI keys are checked too ([`pods test
+--keys`](#ai-keys---keys)'s check). A dead key is said with what to run and folded into the
+machine's check, but the machine stays READY: a key is never a reason to replace one.
+
 #### Bad machines are remembered for 72 h
 
 A host FAIL on a machine the provider names (RunPod/Vast machine id — never an IP) is also
@@ -2284,11 +2288,59 @@ inside the conda env) measures: nvidia-smi GPUs + driver + CUDA version; torch i
 an NCCL `all_reduce` across the GPUs (else `skipped (1 GPU)`); a 32 MiB Hugging Face download (no
 token sent); free disk on `/` and `/workspace`; host load + uptime; what setup's VS Code warm-up
 left (newest server, extensions, default interpreter — an informational `vscode` line, Pass or Skip,
-never WARN/FAIL). The provider's maintenance window comes from the API.
+never WARN/FAIL); and the machine's **AI keys** ([below](#ai-keys---keys)). The provider's maintenance
+window comes from the API.
 
 **FAIL**: any CUDA/tensor/copy/NCCL error, count mismatch (torch's count against nvidia-smi's, and
 against the GPUs the provider reports for the pod: fewer fails), missing torch/nvidia-smi, driver
-below the floor, unreachable/timed out.
+below the floor, unreachable/timed out — and a dead AI key, which is never the machine's.
+
+#### AI keys (`--keys`)
+
+`pods test --keys [targets] [--json] [-v]` checks only the keys. It takes a few seconds per
+machine, does no torch or GPU work, and has the same targets and cohort scope as `--deep`. A machine
+listed without an SSH endpoint is skipped with a note, never waited on. `--deep` checks the same
+keys, from the same script.
+
+The script asks about `$OPENROUTER_API_KEY` and `$HF_TOKEN` as the participant's login shell exports
+them. It makes one bounded call each (15 s): OpenRouter's `GET /api/v1/key`, which is free, and
+Hugging Face's `whoami-v2`. It reports the HTTP status, the key's cap, what's left of it and whether
+it's paused. It also reports the key's fingerprint: the first 12 hex of its SHA-256, which the control
+box compares with the keys CSV's key and with `HF_TOKEN`. The secret is never printed, and neither is
+OpenRouter's redacted label of it. curl reads the header on its stdin (`-K -`), so the key is on no
+command line.
+
+| Verdict | `ai_key` (OpenRouter) | `hf_token` | What it says to run |
+|---|---|---|---|
+| **FAIL** | missing, though the keys CSV has a row for the machine | missing (an `HF_TOKEN` is configured) | `pods copy-keys <name>` |
+| **FAIL** | missing, no row, but the machine has an owner (`--owner`, `spend assign`) | | `keys gen <name> --copy` |
+| **FAIL** | rejected (401/403): deleted, or paused (see below) | rejected | `keys rotate <name> --copy` or `keys resume <name>` / a new `HF_TOKEN` (or its `huggingface_api_keys.csv` row), then `copy-keys` |
+| **FAIL** | out of money (none left of its cap) | | `keys limit <name> +5` |
+| **WARN** | not the keys CSV's key: an old one, from before a rotate or a handover | not the config's `HF_TOKEN` | `pods copy-keys <name>` (this also fixes a FAIL above) |
+| **WARN** | under a tenth of its cap left, and under $1 | | `keys limit <name> +5` |
+| **WARN** | missing, and no row and no owner | | `keys gen <name> --copy`, if it should have one |
+| **WARN** | the call failed (network, timeout, 5xx, 429) | the same | `pods test --keys <name>`, later |
+| **WARN** | works, but no `sha256sum` on the machine to compare it with, or the keys CSV can't be read | | `pods copy-keys <name>` to be sure |
+| PASS | `ok, $4.97 of $5.00 left` (or `no cap`) | `accepted by Hugging Face` | |
+| note | a staff `@` box, a fleet with no keys (no keys-CSV rows, no `OPENROUTER_PROVISIONING_KEY`), a check from an older script | no `HF_TOKEN` configured | |
+
+The under-a-tenth line leaves a day or so to raise the cap before calls fail. It stops at $1 so that
+a large cap doesn't warn while it still has plenty.
+
+From the machine, a paused key and a deleted one get the same answer: 401 `User not found.`
+(checked live). With `OPENROUTER_PROVISIONING_KEY` set, the check reads OpenRouter's listing once
+per run, beside the calls, and says which: `paused … — keys resume <name>`, or `deleted — keys
+rotate <name> --copy`. Without it, the verdict names both. A script that couldn't run at all (no
+temp dir) is a `script` FAIL, never a pass.
+
+**A key isn't the machine.** `--deep` exits non-zero on a key FAIL (so does the daily health
+line), and the summary says `AI key failure, not the machine: …`. But `up --check` never replaces
+a machine for its key, never retries it, and never remembers its host as bad. A check whose only
+FAILs are keys still clears a bad-host record. `up --check` copies the keys after its deep check,
+then runs this check (`[apple] AI key ✓ ok, $4.97 of $5.00 left`). A dead key is said with what to
+run, and the machine stays READY (`check pass, AI key fail`). The dashboard's test (`e`) adds the
+verdict to its torch line. Its deep check (`d`) judges the keys, and its detail view has an
+`ai check:` line.
 
 #### MIG slices
 
@@ -2332,13 +2384,15 @@ with 0 GPUs still gets them, plus a `provider` warning).
 
 #### Output
 
-Output: a `NAME RESULT GPUS DRIVER CUDA NET NOTES` table, `-v` lists every check, and a `same host?`
+Output: a `NAME RESULT GPUS DRIVER CUDA NET NOTES` table (with `AI KEY` before NOTES once a key was
+judged: `$4.97 left`, `rejected`, `missing`, `paused`), `-v` lists every check, and a `same host?`
 line when ≥2 failing pods share a machine (a bad host breaks every pod on it): its IP, or on Vast
 its `machine_id` — never a Vast IP, which several machines can share; `up --check` rejects a
 replacement on a failed machine by the same rule).
 
-`--json` prints per-pod `{id, name, provider, status, checks, facts}` (no IPs) — `[]` when no pod
-could be checked; summary/notes go to stderr. Exits non-zero if any pod FAILs; warnings don't.
+`--json` prints per-pod `{id, name, provider, status, checks, facts}` (no IPs; the keys as
+`facts.openrouter` / `facts.hf`, fingerprints only) — `[]` when no pod could be checked;
+summary/notes go to stderr. Exits non-zero if any pod FAILs; warnings don't.
 Targets scope the run (a named pod with no SSH endpoint is a FAIL; a typo is an error). With no
 targets (or `--all`) it checks **this cohort's pods**: `<prefix>-…`, never an `@` staff entry or
 another prefix's pod — a staff box may be running someone's job — with one `⊘ skipped N non-cohort
@@ -2362,7 +2416,8 @@ Each verdict (and `up --check`'s) is also kept in the **health cache** for `snap
 `${XDG_STATE_HOME:-~/.local/state}/arena/<prefix>/health.json` — per `MACHINE_NAME_PREFIX`, so the
 sandbox and prod never share one; owner-only, written atomically under a lock, keyed by provider +
 pod id; records of pods their provider listed OK without are dropped. A corrupt file is one warning
-and gets replaced.
+and gets replaced. Each record also keeps its AI-key checks, a pass included, for the dashboard's
+`ai check:` line. A `--keys` run isn't recorded: the cache holds each machine's last full check.
 
 It also holds `up --check`'s **bad machines** (`bad_hosts`: machine id → when, pod, failed checks),
 dropped 72 h after their failure or when a complete check on the machine passes, never by a listing;
