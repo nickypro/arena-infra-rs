@@ -349,8 +349,9 @@ async fn reimage_reimages_exactly_the_selected_pods() {
         dir.join("k").display()
     ));
     let cases: &[(&[&str], &[&str])] = &[
-        (&["reimage", "bloom", "zebra", "--skip-proxy", "--wipe-ok", "--no-setup"], &["bloom", "zebra"]),
-        (&["reimage", "--all", "--exclude", "apple..cloud,vm", "--skip-proxy", "--wipe-ok", "--no-setup"], &["zebra"]),
+        // (--force: these fakes list no SSH endpoint, so who's on them can't be told.)
+        (&["reimage", "bloom", "zebra", "--skip-proxy", "--wipe-ok", "--no-setup", "--force"], &["bloom", "zebra"]),
+        (&["reimage", "--all", "--exclude", "apple..cloud,vm", "--skip-proxy", "--wipe-ok", "--no-setup", "--force"], &["zebra"]),
         (&["reimage", "apple..bloom", "--dry-run", "--no-setup"], &[]),
     ];
     for (argv, reimaged) in cases {
@@ -367,18 +368,19 @@ async fn reimage_reimages_exactly_the_selected_pods() {
         assert!(handle_pods(pods_cmd(argv), &f, Arc::new(FakeRemote::new()), &cfg, true).await.is_err(), "{argv:?}");
         assert!(f.calls().is_empty(), "{argv:?}");
     }
-    // A selection with a pod its provider can't reimage (the Hetzner VM) is refused whole —
+    // A selection with a pod its provider can't reimage (a Vast instance) is refused whole —
     // dry run or not, before the wipe gate, the confirm or any provider call — naming it, why,
     // what instead, and how to leave it out.
     for argv in [
         &["reimage", "--all", "--exclude", "apple..cloud", "--skip-proxy", "--wipe-ok", "--no-setup"][..],
         &["reimage", "vm", "zebra", "--dry-run"],
     ] {
-        let f = fleet();
+        let mut f = fleet();
+        f.pods[4].provider = "vast".into();
         let e = handle_pods(pods_cmd(argv), &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap_err().to_string();
-        assert!(e.starts_with("refusing to reimage anything — 1 of the 2 pod(s) can't be:\n  arena8-vm (hetzner): arena can't reimage a Hetzner VM"), "{argv:?}: {e}");
-        // The way off it makes the new VM on Hetzner, not on the configured provider (review r1).
-        assert!(e.contains("`arena --provider hetzner pods up <name> --volume 0`") && e.ends_with("leave these out: --exclude arena8-vm)"), "{argv:?}: {e}");
+        assert!(e.starts_with("refusing to reimage anything — 1 of the 2 pod(s) can't be:\n  arena8-vm (vast): Vast can't swap an instance's image"), "{argv:?}: {e}");
+        // The way off it makes the new pod on Vast, not on the configured provider (review r1).
+        assert!(e.contains("`arena --provider vast pods up <name> --volume 0`") && e.ends_with("leave these out: --exclude arena8-vm)"), "{argv:?}: {e}");
         assert!(f.calls().is_empty(), "{argv:?}");
     }
     let _ = std::fs::remove_dir_all(&dir);

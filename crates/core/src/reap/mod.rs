@@ -1044,8 +1044,9 @@ pub fn reaped_leaf_of(attempt: &str) -> Option<String> {
 }
 
 /// Whether the provider reports `pod` protected against a terminate: RunPod's `locked`,
-/// Hetzner's delete protection. `None` = unknown (a backend that doesn't say, RunPod REST v1,
-/// a field missing) — the reaper treats unknown as "maybe" (rule R8: never reaped).
+/// Hetzner's delete protection (`pods lock` on a VM sets it). `None` = unknown (a backend that
+/// doesn't say, RunPod REST v1, a field missing) — the reaper treats unknown as "maybe" (rule
+/// R8: never reaped).
 pub fn lock_state(pod: &Pod) -> Option<bool> {
     match pod.provider.as_str() {
         "runpod" => pod.locked,

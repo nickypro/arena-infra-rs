@@ -250,7 +250,7 @@ pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, claude:
         steps.push("put it on a Claude Code account (the least-loaded, if it has none) and push that token".into());
     }
     if lock {
-        steps.push("lock it (RunPod then refuses stop/restart/terminate until `arena pods unlock`)".into());
+        steps.push("lock it (stop/restart/terminate refused until `arena pods unlock`)".into());
     }
     format!("per pod, as soon as it can: {} — then READY/FAILED per pod", steps.join(", "))
 }
@@ -5382,7 +5382,7 @@ mod tests {
     #[test]
     fn the_plan_text_names_every_stage_it_will_run() {
         assert!(pipeline_text(true, None, false, false, true, (5, 2)).contains(
-            "provision it, lock it (RunPod then refuses stop/restart/terminate until `arena pods unlock`) — then READY/FAILED"
+            "provision it, lock it (stop/restart/terminate refused until `arena pods unlock`) — then READY/FAILED"
         ));
         let endpoint = |mins: u64, n: u32| {
             format!(

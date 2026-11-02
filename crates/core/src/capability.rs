@@ -319,8 +319,6 @@ pub const NOTHING_INSTEAD: &str = "nothing to use instead";
 /// fleet's) mustn't apply, and Shadeform's create refuses one — after the terminate (review r2).
 const REMAKE_VAST: &str = "back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then \
      `arena --provider vast pods up <name> --volume 0` (its --gpu) and `arena pods restore <name>`";
-const REMAKE_HETZNER: &str = "back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then \
-     `arena --provider hetzner pods up <name> --volume 0` (its --server-type) and `arena pods restore <name>`";
 const REMAKE_SHADEFORM: &str = "back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then \
      `arena --provider shadeform pods up <name> --volume 0` (its --gpu) and `arena pods restore <name>`";
 
@@ -364,14 +362,14 @@ const fn row(op: Op) -> [Support; 5] {
             YES, // RunPod
             YES, // RunPod v1
             no("Vast can't swap an instance's image in place", REMAKE_VAST), // Vast
-            no("arena can't reimage a Hetzner VM yet (Hetzner's rebuild action could)", REMAKE_HETZNER), // Hetzner
+            note(HETZNER_REBUILD), // Hetzner
             no("Shadeform can't swap an instance's image in place", REMAKE_SHADEFORM), // Shadeform
         ],
         Op::Lock => [
             YES, // RunPod
             no("only RunPod REST v2 can lock a pod", crate::provider::RUNPOD_V1_REMEDY), // RunPod v1
             no("Vast can't lock an instance", NOTHING_INSTEAD), // Vast
-            no("arena can't lock a Hetzner VM yet (Hetzner's delete/rebuild protection could)", NOTHING_INSTEAD), // Hetzner
+            note(HETZNER_LOCK), // Hetzner
             no("Shadeform can't lock an instance", NOTHING_INSTEAD), // Shadeform
         ],
         Op::Replace => [
@@ -395,7 +393,11 @@ const fn row(op: Op) -> [Support; 5] {
             no("RunPod authorizes keys only at create", "`arena pods replace <name>` (a new pod gets today's keys)"), // RunPod
             no("RunPod authorizes keys only at create", "`arena pods replace <name>` (a new pod gets today's keys)"), // RunPod v1
             YES, // Vast: the per-instance key attach, as at create
-            no("Hetzner authorizes keys only at create (cloud-init)", REMAKE_HETZNER), // Hetzner
+            no(
+                "Hetzner authorizes keys only at a create or a rebuild (cloud-init)",
+                "back it up (`arena pods backup <name>`), then `arena pods reimage <name> --wipe-ok` (a rebuild authorizes \
+                 today's keys) and `arena pods restore <name>`",
+            ), // Hetzner
             no("Shadeform authorizes keys only at create (its bootstrap script)", "`arena pods replace <name>` (a new pod gets today's keys)"), // Shadeform
         ],
         Op::DataVolume => [
@@ -485,6 +487,16 @@ const fn row(op: Op) -> [Support; 5] {
         Op::ApiJson => [YES, YES, YES, YES, YES],
     }
 }
+
+/// What a reimage of a Hetzner VM is ([`crate::provider::hetzner::HetznerProvider::reimage_pod`]):
+/// Hetzner's rebuild, which overwrites the whole disk and keeps the server.
+const HETZNER_REBUILD: &str = "Hetzner's rebuild from HETZNER_IMAGE or --image (`arena`: the newest arena image): the whole disk \
+     is wiped, the IP, name and server type kept; a `pods volume` keeps its files but comes back unmounted";
+
+/// What a lock is on a Hetzner VM ([`crate::provider::hetzner::HetznerProvider::set_locked`]): its
+/// delete + rebuild protection, which Hetzner enforces for those two only.
+const HETZNER_LOCK: &str = "its delete + rebuild protection: Hetzner refuses a delete or rebuild from any client, its console \
+     included; a stop or restart only arena refuses";
 
 /// What to know before moving a Hetzner VM (`replace`, `migrate`): a server can't change
 /// location, so the new one may land in another.
