@@ -36,6 +36,9 @@ earlier).
   checked. The dry run says which pods would be refused.
 - `--image` with RunPod pods and Hetzner VMs selected together is refused: it can't mean both a
   container image and a VM image. Without `--image`, each pod gets its own configured image.
+- `pods reimage` says less by default: the image, then one line, `Reimage devtest-apple (wipes its
+  disk and the work on it)? [y/N]` (the dry run says the same). A pod someone came on since the
+  prompt is one line with its retry. `-v` adds the keys, each pod's plan and the whole refusal.
 - **`pods lock`/`unlock` work on a Hetzner VM**: they set its delete + rebuild protection.
   Hetzner then refuses a delete or a rebuild from any client, its console included. arena's
   stop, restart, reimage, terminate, replace and migrate refuse a locked VM up front, as they do a

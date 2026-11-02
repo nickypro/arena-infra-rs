@@ -1087,6 +1087,9 @@ before the wipe gate and the confirm — [What works where](#what-works-where)) 
 refused), refuses a pod someone is on — an SSH session, another inbound connection, a VS Code
 server — or that can't be checked, as `replace` does (`--force` goes on; a stopped pod isn't
 checked), and comes back the same way: settled endpoint, **setup again** (`--no-setup`), proxy sync.
+By default it says the image and asks in one line whose disk and work go (`Reimage devtest-apple
+(wipes its disk and the work on it)? [y/N]`; the dry run says the same line); a pod someone came on
+since is one line with its retry. `-v` adds the keys, each pod's plan and the whole refusal.
 
 On a **Hetzner VM** it's Hetzner's rebuild: the whole disk is overwritten from the VM image —
 `--image`, else `HETZNER_IMAGE` (`arena`, a snapshot id or a name like `ubuntu-24.04`; never

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arena_core::capability::Op;
+use arena_core::out;
 use arena_core::provider::{ContainerReset, Provider};
 use arena_core::remote::{Remote, PROBE_TIMEOUT};
 use arena_core::selector::Naming;
@@ -20,7 +21,7 @@ use crate::pods::replace::wait_for_stable_endpoint_every;
 use crate::pods::selection::{just_these, Selected};
 use crate::pods::setup::handle_setup;
 use crate::proxy::{sync_proxy, ProxySync};
-use crate::{confirm, confirm_typed, spend};
+use crate::{confirm, confirm_brief, confirm_typed, spend};
 
 /// `pods reimage`: swap image + re-seed keys in place — a fresh container (a Hetzner VM:
 /// rebuilt), so its disk is wiped — then bring the pods back usable like a restart does
@@ -40,6 +41,11 @@ use crate::{confirm, confirm_typed, spend};
 /// What each pod gets ([`reimage_images`]): a container pod `--image` / RUNPOD_DOCKER_IMAGE; a
 /// Hetzner VM `--image` / HETZNER_IMAGE, `arena` resolved now for its server type and said —
 /// the snapshot, its name and age (ops feedback #2: the dry run named the RunPod image).
+///
+/// What it says (docs/OUTPUT.md): by default the image lines, then the prompt or the dry run in
+/// one line ([`reimage_what`]: whose disk goes, and whose work), and a pod found busy right
+/// before its own reimage as one line with its retry. `-v` says what it said before: the keys,
+/// each pod's plan, the whole refusal.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_reimage(
     provider: &dyn Provider,
@@ -63,6 +69,8 @@ pub(crate) async fn handle_reimage(
         return Ok(());
     }
     let refs: Vec<&arena_core::Pod> = pods.iter().collect();
+    // `--image` as given, for a busy pod's retry.
+    let given_image = image.clone();
     // A pod whose provider can't reimage (Vast, Shadeform) refuses the whole selection, dry run
     // or not — before the wipe gate and the confirm, which would only mislead: it used to fail
     // there, after both, reading the pod's spec.
@@ -116,30 +124,38 @@ pub(crate) async fn handle_reimage(
     let blocked_op = if blocked.iter().all(|p| reimage_op(p) == DiskOp::Rebuild) { DiskOp::Rebuild } else { DiskOp::Reimage };
     let then = afterwards_line(ContainerReset::Yes, setup, skip_proxy);
     let onto = image_lines(container_image.as_deref(), &vm_images);
-    println!("{}\nkeys:  {}", onto.join("\n"), pubkeys.iter().map(|k| k.split_whitespace().last().unwrap_or("?")).collect::<Vec<_>>().join(", "));
+    // What each kind of pod goes onto, by default (ops feedback #2: the image, `arena` resolved,
+    // before anything is asked); the keys that go in are `-v`'s.
+    for l in &onto {
+        out!(Out, "{l}");
+    }
+    out!(Detail, "keys:  {}", pubkeys.iter().map(|k| k.split_whitespace().last().unwrap_or("?")).collect::<Vec<_>>().join(", "));
     if !(blocked.is_empty() || wipe_ok || dry_run) {
         anyhow::bail!("{}", wipe_refusal(blocked_op, false, &blocked_names, &repo));
     }
     // Who's on them: asked once the wipe is allowed (or for the dry run) — an SSH probe each.
     let busy = if force { Vec::new() } else { busy_refusals(&remote, cfg, &refs).await };
+    let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
+    let brief = reimage_what(&names, &blocked_names);
     if dry_run {
-        println!("[dry-run] would reimage {} pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
+        out!(Detail, "[dry-run] would reimage {} pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
+        out!(Brief, "[dry-run] would reimage {brief}");
         if let Some(r) = &locked {
             print_would_refuse(r);
         }
         if !blocked.is_empty() && !wipe_ok {
             print_would_refuse(&wipe_refusal(blocked_op, false, &blocked_names, &repo));
         }
-        for r in &busy {
-            print_would_refuse(r);
+        for b in &busy {
+            print_would_refuse(&b.refusal);
         }
         return Ok(());
     }
     if !busy.is_empty() {
-        anyhow::bail!("{}", busy.join("\n"));
+        anyhow::bail!("{}", busy.iter().map(|b| b.refusal.as_str()).collect::<Vec<_>>().join("\n"));
     }
     let what = onto.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n");
-    if !confirm(yes, &format!("Will reimage {} pod(s):\n{}\n{what}\n  {then}", pods.len(), lines.join("\n")))? {
+    if !confirm_brief(yes, &format!("Will reimage {} pod(s):\n{}\n{what}\n  {then}", pods.len(), lines.join("\n")), &format!("Reimage {brief}?"))? {
         println!("aborted.");
         return Ok(());
     }
@@ -150,8 +166,10 @@ pub(crate) async fn handle_reimage(
         // stopped at the start may have been started since): the prompt may have waited, and a
         // rebuild before it may have taken 15 min — someone on it since isn't wiped unasked.
         if !force {
-            if let Some(r) = busy_now(provider, &remote, cfg, pod, &policy).await {
-                eprintln!("[not reimaged] {}: {r}", pod.name);
+            if let Some(b) = busy_now(provider, &remote, cfg, pod, &policy).await {
+                out!(ErrDetail, "[not reimaged] {}: {}", pod.name, b.refusal);
+                let retry = reimage_retry(&pod.name, given_image.as_deref(), opts);
+                out!(ErrBrief, "[{}] {}: {} (retry: {retry}, or add --force)", out::bold(&pod.name), out::red("not reimaged"), b.why);
                 failed.push(pod.name.clone());
                 continue;
             }
@@ -296,6 +314,46 @@ pub(crate) fn image_lines(container: Option<&str>, vms: &[VmImage]) -> Vec<Strin
     out
 }
 
+/// The default output's words for what a reimage does to `names` (docs/OUTPUT.md): who, whose
+/// disk goes, and whose work with it (`lost`: the pods whose repo isn't on a confirmed volume) —
+/// `devtest-apple, devtest-bloom (wipes their disks and the work on devtest-bloom)`. The dry run
+/// says it and the prompt asks it; each pod's plan is `-v`'s. Pure (but for the styles).
+pub(crate) fn reimage_what(names: &[&str], lost: &[&str]) -> String {
+    let (disk, them, volume) = if names.len() == 1 { ("its disk", "it", "its volume") } else { ("their disks", "them", "their volumes") };
+    let work = if lost.is_empty() {
+        format!("; the repo stays on {volume}")
+    } else if lost.len() == names.len() {
+        format!(" and the work on {them}")
+    } else {
+        format!(" and the work on {}", lost.join(", "))
+    };
+    format!("{} (wipes {disk}{work})", crate::pods::setup::all_names(names))
+}
+
+/// The command that reimages `name` again as this run would (`--image` as given, and the
+/// switches): a busy pod's retry. Pure.
+pub(crate) fn reimage_retry(name: &str, image: Option<&str>, opts: RestartOpts) -> String {
+    let mut cmd = format!("arena pods reimage {name}");
+    if let Some(i) = image {
+        let plain = !i.is_empty() && i.chars().all(|c| c.is_ascii_alphanumeric() || "._:/@+-".contains(c));
+        cmd.push_str(&format!(" --image {}", if plain { i.to_string() } else { crate::shell_quote(i) }));
+    }
+    for (on, flag) in [(opts.wipe_ok, "--wipe-ok"), (opts.no_setup, "--no-setup"), (opts.skip_proxy, "--skip-proxy")] {
+        if on {
+            cmd.push_str(&format!(" {flag}"));
+        }
+    }
+    cmd
+}
+
+/// A pod a reimage won't wipe: someone is on it, or whether anyone is couldn't be told.
+struct Busy {
+    /// Why, in a few words (`someone is on it (1 SSH session)`): the default output's.
+    why: String,
+    /// The whole refusal, with what to do: the error's, and `-v`'s.
+    refusal: String,
+}
+
 /// [`busy_refusals`] for `pod` as the provider lists it now — its status and endpoint may have
 /// changed since the selection (started, restarted). Not listed now, or no listing: refused, as
 /// someone may be on it.
@@ -305,18 +363,21 @@ async fn busy_now(
     cfg: &Config,
     pod: &arena_core::Pod,
     policy: &arena_core::retry::RetryPolicy,
-) -> Option<String> {
+) -> Option<Busy> {
     let now = match arena_core::retry::retrying(policy, || provider.list_pods()).await {
         Ok(listed) => listed.into_iter().find(|p| p.id == pod.id && p.provider == pod.provider),
         Err(_) => None,
     };
     match now {
         Some(p) => busy_refusals(remote, cfg, &[&p]).await.pop(),
-        None => Some(format!(
-            "refusing to reimage {}: couldn't list it again right before its reimage, so whether anyone is on it now isn't \
-             known. Or pass --force.",
-            pod.name
-        )),
+        None => Some(Busy {
+            why: "couldn't list it again, so whether anyone is on it isn't known".into(),
+            refusal: format!(
+                "refusing to reimage {}: couldn't list it again right before its reimage, so whether anyone is on it now \
+                 isn't known. Or pass --force.",
+                pod.name
+            ),
+        }),
     }
 }
 
@@ -329,7 +390,7 @@ const REIMAGE_BUSY: &str = "A reimage wipes what they're working on: wait until 
 /// inbound connection, a VS Code server — or that couldn't be read (no endpoint, the probe
 /// failed), which a wipe doesn't take for "no one". A stopped pod has no one on it. Empty: no
 /// one is on any.
-async fn busy_refusals(remote: &Arc<dyn Remote>, cfg: &Config, pods: &[&arena_core::Pod]) -> Vec<String> {
+async fn busy_refusals(remote: &Arc<dyn Remote>, cfg: &Config, pods: &[&arena_core::Pod]) -> Vec<Busy> {
     use arena_core::idle::{self, Probe};
     let running: Vec<&arena_core::Pod> = pods.iter().copied().filter(|p| !arena_core::status::is_stopped(&p.status)).collect();
     let mut probes: Vec<Probe> = running.iter().map(|_| Probe::NoEndpoint).collect();
@@ -342,7 +403,10 @@ async fn busy_refusals(remote: &Arc<dyn Remote>, cfg: &Config, pods: &[&arena_co
         .zip(&probes)
         .filter_map(|(p, probe)| {
             let alternative = REIMAGE_BUSY.replace("<name>", &p.name);
-            crate::pods::replace::presence_refusal("reimage", &p.name, &idle::presence(probe), &alternative)
+            let presence = idle::presence(probe);
+            let why = crate::pods::adopt::presence_words(&presence)?;
+            let refusal = crate::pods::replace::presence_refusal("reimage", &p.name, &presence, &alternative)?;
+            Some(Busy { why, refusal })
         })
         .collect()
 }

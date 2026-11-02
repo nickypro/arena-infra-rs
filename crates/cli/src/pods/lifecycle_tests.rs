@@ -1602,6 +1602,87 @@ fn reimage_images_are_per_kind_of_pod() {
     assert_eq!(super::lifecycle::image_lines(Some("img:9"), &vms), ["image: img:9", "VM image (cx33): image arena → snapshot 11 (new)"]);
 }
 
+/// The default output's words for a reimage (docs/OUTPUT.md): whose disk goes and whose work
+/// with it; and a busy pod's retry, with this run's `--image` and switches. Pure.
+#[test]
+fn reimage_says_whose_disk_and_work_go_and_how_to_retry() {
+    use super::lifecycle::{reimage_retry, reimage_what};
+    assert_eq!(reimage_what(&["devtest-apple"], &["devtest-apple"]), "devtest-apple (wipes its disk and the work on it)");
+    assert_eq!(reimage_what(&["devtest-apple"], &[]), "devtest-apple (wipes its disk; the repo stays on its volume)");
+    assert_eq!(reimage_what(&["devtest-apple", "devtest-bloom"], &["devtest-apple", "devtest-bloom"]), "devtest-apple, devtest-bloom (wipes their disks and the work on them)");
+    assert_eq!(reimage_what(&["devtest-apple", "devtest-bloom"], &["devtest-bloom"]), "devtest-apple, devtest-bloom (wipes their disks and the work on devtest-bloom)");
+    assert_eq!(reimage_what(&["a", "b", "c", "d"], &[]), "4 pods: a, b, c, d (wipes their disks; the repo stays on their volumes)");
+    let opts = RestartOpts { wipe_ok: true, no_setup: true, yes: true, ..Default::default() };
+    assert_eq!(reimage_retry("devtest-bravo", None, RestartOpts::default()), "arena pods reimage devtest-bravo");
+    assert_eq!(reimage_retry("devtest-bravo", Some("nickypro/arena-env:9.1"), opts), "arena pods reimage devtest-bravo --image nickypro/arena-env:9.1 --wipe-ok --no-setup");
+    let all = RestartOpts { skip_proxy: true, dry_run: true, ..opts };
+    assert_eq!(reimage_retry("devtest-delta", Some("a b"), all), "arena pods reimage devtest-delta --image 'a b' --wipe-ok --no-setup --skip-proxy");
+}
+
+/// docs/OUTPUT.md, for reimage's own lines: by default the image and a one-line prompt (or the
+/// dry run's one line) saying whose disk and work go; `-v` says what it said before — the keys,
+/// each pod's plan and `Proceed?`. A pod found busy right before its own reimage: one line with
+/// its retry, the whole refusal with `-v`. (`[reimaged]` and what follows it — the endpoint, the
+/// setup, the proxy — are lifecycle's `println!`s, shared with restart and start; not here.)
+#[tokio::test]
+async fn reimage_says_its_image_and_one_line_by_default_and_its_plan_with_v() {
+    use crate::output_test::rendered;
+    let dir = tmpdir("reimage-output");
+    let cfg = keyed_cfg(&dir.0, "HETZNER_IMAGE=449743460\n");
+    let keys_dir = dir.0.display().to_string();
+    let opts = RestartOpts { wipe_ok: true, no_setup: true, skip_proxy: true, ..Default::default() };
+    let plan = DiskFate::Wiped { volume_gb: Some(0) }.describe(DiskOp::Rebuild, &RepoSite::configured("/root/r"));
+    let then = afterwards_line(ContainerReset::Yes, false, true);
+    let image = "VM image: image 449743460 (a snapshot or image id)";
+    for (verbose, dry_run, want) in [
+        (false, false, format!("{image}\nReimage devtest-delta (wipes its disk and the work on it)? [y/N] y\n")),
+        (
+            true,
+            false,
+            format!("{image}\nkeys:  devtest-test\nWill reimage 1 pod(s):\n  devtest-delta (id=h-delta, hetzner): {plan}\n  {image}\n  {then}\nProceed? [y/N] y\n"),
+        ),
+        (false, true, format!("{image}\n[dry-run] would reimage devtest-delta (wipes its disk and the work on it)\n")),
+        (true, true, format!("{image}\nkeys:  devtest-test\n[dry-run] would reimage 1 pod(s):\n  devtest-delta (id=h-delta, hetzner): {plan}\n  {then}\n")),
+    ] {
+        let f = fleet();
+        let remote = Arc::new(FakeRemote::new());
+        remote.on("10.0.0.9:22", "ARENA_IDLE_NOW", FakeReply::stdout(&Reply::default().render()));
+        let delta = f.pods.lock().unwrap()[3].clone();
+        let opts = RestartOpts { dry_run, ..opts };
+        let got = rendered(verbose, &["y"], handle_reimage(&f, remote.clone(), &cfg, &named(&[delta]), None, false, opts, FAST, &keys_dir)).await;
+        assert_eq!(got, want, "verbose {verbose}, dry run {dry_run}");
+        assert_eq!(f.calls().len(), usize::from(!dry_run), "{:?}", f.calls());
+    }
+    // Someone comes on bravo while alpha is reimaged: one line by default, with its retry.
+    for verbose in [false, true] {
+        let f = fleet();
+        let remote = Arc::new(FakeRemote::new());
+        remote.on("10.0.0.1:22001", "ARENA_IDLE_NOW", FakeReply::stdout(&Reply::default().render()));
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = probes.clone();
+        remote.on(
+            "10.0.0.1:22002",
+            "ARENA_IDLE_NOW",
+            FakeReply::from_cmd(move |_| {
+                let sessions = if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 { vec![] } else { vec![[10, 9, 9, 9]] };
+                FakeReply::stdout(&Reply { sessions, ..Reply::default() }.render())
+            }),
+        );
+        let pods = f.pods.lock().unwrap()[..2].to_vec();
+        let opts = RestartOpts { yes: true, ..opts };
+        let got = rendered(verbose, &[], handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, false, opts, FAST, &keys_dir)).await;
+        let busy = if verbose {
+            "keys:  devtest-test\n[not reimaged] devtest-bravo: refusing to reimage devtest-bravo: someone is on it (1 SSH session). A reimage \
+             wipes what they're working on: wait until they're off, and back it up first (`arena pods backup devtest-bravo`). Or pass --force."
+        } else {
+            "[devtest-bravo] not reimaged: someone is on it (1 SSH session) (retry: arena pods reimage devtest-bravo --wipe-ok --no-setup \
+             --skip-proxy, or add --force)"
+        };
+        assert_eq!(got, format!("image: img:9\n{busy}\nError: 1 pod(s) failed to reimage: devtest-bravo\n"), "verbose {verbose}");
+        assert_eq!(f.calls(), ["reimage r-alpha img:9"]);
+    }
+}
+
 /// Live finding #15: a stopped pod had no way back — `restart` answered a raw 409 (v2)
 /// or "restarted" it without starting it (v1), and `run` said "no SSH endpoint yet". Now
 /// `restart` points at `pods start`, which starts it, sets it up again (it's a fresh
