@@ -23,7 +23,9 @@
 //! untouched checkout ([`crate::volume::relocation_command`]) — so a restart keeps the
 //! participants' work and the repo update acts on the volume copy.
 //!
-//! Then, best-effort (never failing a pod's setup), the VS Code Remote-SSH warm-up
+//! Then, best-effort (never failing a pod's setup), the coding agents' notes
+//! ([`crate::agent_notes`]: which Python to use, in `~/.claude/CLAUDE.md` and
+//! `~/.codex/AGENTS.md`; uv linked onto every shell's PATH) and the VS Code Remote-SSH warm-up
 //! ([`crate::vscode`]): server + course extensions pre-installed, the arena env as the
 //! default interpreter.
 //!
@@ -74,6 +76,18 @@ pub struct SetupConfig {
     pub relocate: bool,
     /// GB of swap the bare-VM script makes (`VM_SWAP_GB`, [`swap_gb`]); 0 = none.
     pub swap_gb: u32,
+    /// The notes for the coding agents ([`crate::agent_notes`]): which Python to use. On by
+    /// default; `None` = no such step (`AGENT_NOTES=0`).
+    pub agent_notes: Option<crate::agent_notes::AgentNotes>,
+}
+
+/// The ARENA checkout's path on a machine: `BACKUP_REPO_PATH`, else `/root/<ARENA_REPO_NAME>`.
+pub fn repo_path(cfg: &Config) -> Result<String> {
+    if let Some(path) = cfg.get("BACKUP_REPO_PATH") {
+        return Ok(path.to_string());
+    }
+    let name = cfg.get("ARENA_REPO_NAME").ok_or_else(|| Error::Config("missing ARENA_REPO_NAME".into()))?;
+    Ok(format!("/root/{name}"))
 }
 
 impl SetupConfig {
@@ -88,13 +102,12 @@ impl SetupConfig {
             .get("GIT_SSH_KEY_LOCAL")
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Error::Config("missing GIT_SSH_KEY_LOCAL (the key to copy)".into()))?;
-        let repo_path = cfg
-            .get("BACKUP_REPO_PATH")
-            .map(String::from)
-            .unwrap_or_else(|| format!("/root/{name}"));
+        let repo_path = repo_path(cfg)?;
         let vscode = crate::vscode::VscodeSetup::from_config(cfg, &repo_path)?;
         let relocate = crate::volume::relocation_enabled(cfg.get("REPO_ON_VOLUME"))?;
         let swap_gb = swap_gb(cfg)?;
+        let agent_notes = crate::agent_notes::enabled(cfg.get("AGENT_NOTES"))?
+            .then(|| crate::agent_notes::AgentNotes::new(cfg.get("CONDA_ENV").unwrap_or("arena-env"), &repo_path));
         Ok(Self {
             // Resolve to a readable copy (prefer ~/.ssh/<name> if the configured path
             // isn't readable), same as the shared key — so `setup` works when run as a
@@ -112,6 +125,7 @@ impl SetupConfig {
             vscode,
             relocate,
             swap_gb,
+            agent_notes,
         })
     }
 
@@ -169,8 +183,9 @@ impl SetupConfig {
         // Coding agents (claude code + codex) + tmux. All idempotent; the whole block runs in
         // a `set +e` subshell ending in `|| true`, so a flaky installer never aborts setup.
         // Node-free curl installers drop into ~/.local/bin; symlink into /usr/local/bin since
-        // the dotfiles .zshrc doesn't put ~/.local/bin on PATH. Codex's official installer has
-        // a SHA-digest bug on some hosts, so fall back to the prebuilt GitHub release.
+        // the dotfiles .zshrc doesn't put ~/.local/bin on PATH — uv and uvx too, if an image has
+        // them there (only where nothing is: `agent_notes::LINK_UV_SH`). Codex's official
+        // installer has a SHA-digest bug on some hosts, so fall back to the prebuilt GitHub release.
         steps.push(
             r#"( set +e
 export PATH="$HOME/.local/bin:$PATH"
@@ -179,7 +194,9 @@ command -v claude >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | b
 command -v codex >/dev/null 2>&1 || curl -fsSL https://chatgpt.com/codex/install.sh | sh >/dev/null 2>&1
 if ! command -v codex >/dev/null 2>&1; then case "$(uname -m)" in aarch64|arm64) a=aarch64;; *) a=x86_64;; esac; mkdir -p "$HOME/.local/bin" /tmp/cx; url=$(curl -fsSL https://api.github.com/repos/openai/codex/releases/latest | grep -oE 'https://[^"]*codex-'"$a"'-unknown-linux-musl\.tar\.gz' | head -1); [ -n "$url" ] && curl -fsSL "$url" | tar xz -C /tmp/cx 2>/dev/null && bin=$(find /tmp/cx -type f -name 'codex*' | head -1) && [ -n "$bin" ] && install -m755 "$bin" "$HOME/.local/bin/codex"; fi
 for b in claude codex; do [ -e "$HOME/.local/bin/$b" ] && ln -sf "$HOME/.local/bin/$b" /usr/local/bin/$b; done
-) || true"#.to_string(),
+@LINK_UV@
+) || true"#
+                .replace("@LINK_UV@", crate::agent_notes::LINK_UV_SH),
         );
         // Optional (`--zsh-install`): the same shell the GPU pods get — zsh + oh-my-zsh +
         // powerlevel10k + the shared `nickypro/arena-infra` dotfiles, with zsh as the login
@@ -694,9 +711,10 @@ pub fn hostname_command(name: &str) -> Option<String> {
 /// Image-based pods move the repo onto their volume first (unless `REPO_ON_VOLUME=0`, and when
 /// the configured path can be relocated — see [`crate::volume::volume_repo_path`]; the script
 /// itself checks the pod has a volume), best-effort on its own budget, before the config step
-/// updates the repo. Both then get the VS Code warm-up (unless `scfg.vscode` is off) as a
-/// best-effort last step on its own budget: on hetzner it runs after the script has built the
-/// venv it points VS Code at.
+/// updates the repo. Both then get the agents' notes ([`crate::agent_notes`], unless
+/// `scfg.agent_notes` is `None`) and the VS Code warm-up (unless `scfg.vscode` is off), as
+/// best-effort last steps on their own budgets: on hetzner they run after the script has built
+/// the venv they point the agents and VS Code at.
 pub fn provisioning_steps(
     provider: &str,
     scfg: &SetupConfig,
@@ -804,6 +822,10 @@ pub fn provisioning_steps(
                 timeout: timeouts.config,
             },
         );
+    }
+    // The agents' notes, once the env and the agents are there (best-effort).
+    if let Some(notes) = &scfg.agent_notes {
+        steps.push(notes.step(provider, false));
     }
     if let Some(vscode) = &scfg.vscode {
         let low = low_memory(provider);
@@ -1278,6 +1300,7 @@ mod tests {
             vscode: None,
             relocate: true,
             swap_gb: DEFAULT_SWAP_GB,
+            agent_notes: None,
         }
     }
 
@@ -1561,6 +1584,7 @@ mod tests {
             vscode: None,
             relocate: true,
             swap_gb: DEFAULT_SWAP_GB,
+            agent_notes: None,
         }
     }
 

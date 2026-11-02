@@ -147,7 +147,7 @@ fn cfg(dir: &Path) -> Config {
     Config::parse(&format!(
         "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(alpha bravo charlie)\nARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\n\
          GIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\nSSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH={}\n\
-         SSH_PROXY_RELOAD_CMD=\"\"\nVSCODE_PREINSTALL=0\nREPO_ON_VOLUME=0\nSHARED_SSH_KEY_PATH={}\nHETZNER_LOCATION=nbg1,any\n",
+         SSH_PROXY_RELOAD_CMD=\"\"\nVSCODE_PREINSTALL=0\nAGENT_NOTES=0\nREPO_ON_VOLUME=0\nSHARED_SSH_KEY_PATH={}\nHETZNER_LOCATION=nbg1,any\n",
         dir.join("proxy.conf").display(),
         dir.join("k").display()
     ))

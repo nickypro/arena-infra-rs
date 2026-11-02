@@ -34,6 +34,7 @@ fn scfg() -> SetupConfig {
         // The fleet runner is under test here, not the move onto the volume.
         relocate: false,
         swap_gb: arena_core::setup::DEFAULT_SWAP_GB,
+        agent_notes: None,
     }
 }
 
@@ -133,7 +134,7 @@ fn everyone() -> Selected {
 fn setup_cfg(extra: &str) -> Config {
     Config::parse(&format!(
         "MACHINE_NAME_PREFIX=devtest\nARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\n\
-         GIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\nVSCODE_PREINSTALL=0\nREPO_ON_VOLUME=0\n{extra}"
+         GIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\nVSCODE_PREINSTALL=0\nAGENT_NOTES=0\nREPO_ON_VOLUME=0\n{extra}"
     ))
 }
 
@@ -141,7 +142,7 @@ fn setup_cfg(extra: &str) -> Config {
 fn vscode_cfg(extra: &str) -> Config {
     Config::parse(&format!(
         "MACHINE_NAME_PREFIX=devtest\nARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\n\
-         GIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\n{extra}"
+         GIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\nAGENT_NOTES=0\n{extra}"
     ))
 }
 
@@ -591,5 +592,59 @@ fn setup_takes_a_positive_timeout() {
     assert!(Cli::try_parse_from(["arena", "pods", "setup", "--timeout", "86400"]).is_ok());
     for big in ["86401", "18446744073709551615"] {
         assert!(Cli::try_parse_from(["arena", "pods", "setup", "--timeout", big]).is_err(), "{big}");
+    }
+}
+
+/// `pods setup --notes-only`, for machines already running: the agents' notes step on each
+/// selected pod and nothing else — one exec each, the notes command for that pod's provider (a
+/// Hetzner VM's venv looked for first), required (60s), and no copy, repo, keys or Claude Code
+/// stage; the pods not selected are untouched. The flag runs even with
+/// AGENT_NOTES=0 in config (the operator asked for it). A pod it fails on is a ✗ and fails the
+/// run, the others still get theirs; a dry run sends nothing.
+#[tokio::test(start_paused = true)]
+async fn notes_only_writes_the_notes_and_nothing_else() {
+    use arena_core::agent_notes::{AgentNotes, TIMEOUT};
+    let mut machines = fleet();
+    machines.0[2].provider = "hetzner".into();
+    let cfg = setup_cfg("MACHINE_NAME_LIST=(apple bloom cloud)\n");
+    assert!(cfg.get("AGENT_NOTES") == Some("0"), "off in config: the flag still runs");
+    let notes = AgentNotes::new("arena-env", "/root/r");
+    let fake = Arc::new(FakeRemote::new());
+    handle_pods(pods(&["setup", "--notes-only", "apple", "cloud"]), &machines, fake.clone(), &cfg, true).await.unwrap();
+    assert_eq!(hosts(&fake), ["10.0.0.1:22001", "10.0.0.1:22003"], "only the pods named");
+    for (port, provider) in [(22001, "runpod"), (22003, "hetzner")] {
+        let calls = fake.calls_to(&format!("10.0.0.1:{port}"));
+        let want = notes.command(provider);
+        assert!(
+            matches!(&calls[..], [RemoteCall::Exec { cmd, timeout, .. }] if *cmd == want && *timeout == Some(TIMEOUT)),
+            "port {port}: {calls:?}"
+        );
+    }
+    assert_ne!(notes.command("runpod"), notes.command("hetzner"), "each kind of machine its own env first");
+
+    // One pod's files can't be written: that pod fails, the others still get theirs.
+    let fake = Arc::new(FakeRemote::new());
+    fake.script("10.0.0.1:22002", [FakeReply::exit(1, "couldn't write the agent notes into /root/.claude/CLAUDE.md")]);
+    let err = handle_pods(pods(&["setup", "--notes-only", "-y"]), &machines, fake.clone(), &cfg, true).await.unwrap_err();
+    assert!(err.to_string().contains("1 pod(s) failed to get the agents' notes"), "{err}");
+    assert_eq!(hosts(&fake), ["10.0.0.1:22001", "10.0.0.1:22002", "10.0.0.1:22003"]);
+    assert_eq!(fake.calls().len(), 3, "one exec a pod, no retry: {:?}", fake.calls());
+
+    // A dry run: nothing sent.
+    let fake = Arc::new(FakeRemote::new());
+    handle_pods(pods(&["setup", "--notes-only", "--dry-run"]), &machines, fake.clone(), &cfg, true).await.unwrap();
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+/// `--notes-only` is the notes alone: the flags of a whole setup don't go with it.
+#[test]
+fn notes_only_takes_none_of_a_whole_setups_flags() {
+    use clap::Parser;
+    assert!(matches!(pods(&["setup", "--notes-only", "apple"]), crate::cli::PodCmd::Setup { notes_only: true, .. }));
+    assert!(matches!(pods(&["setup", "--notes-only", "--dry-run"]), crate::cli::PodCmd::Setup { notes_only: true, dry_run: true, .. }));
+    assert!(matches!(pods(&["setup"]), crate::cli::PodCmd::Setup { notes_only: false, .. }));
+    for flag in [&["--force"][..], &["--hf-token", "x"], &["--cc-token", "x"], &["--zsh-install"], &["--no-vscode"], &["--timeout", "60"]] {
+        let argv = ["arena", "pods", "setup", "--notes-only"].iter().chain(flag).copied();
+        assert!(Cli::try_parse_from(argv).is_err(), "{flag:?}");
     }
 }

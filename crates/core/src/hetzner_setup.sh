@@ -155,6 +155,11 @@ if ! command -v uv >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/uv" ]; then
 fi
 export PATH="$HOME/.local/bin:$PATH"
 uv --version || die "uv isn't installed (its installer failed?)"
+# ~/.local/bin is on no shell's PATH here (the dotfiles .zshrc doesn't add it): `uv` was "command
+# not found" for a participant. uv and uvx go into /usr/local/bin, which every shell has — only
+# where nothing is yet: a link already there is kept. (The same line as
+# arena_core::agent_notes::LINK_UV_SH; a test holds them together.)
+for arena_b in uv uvx; do if [ -x "$HOME/.local/bin/$arena_b" ] && [ ! -e "/usr/local/bin/$arena_b" ] && [ ! -L "/usr/local/bin/$arena_b" ]; then ln -s "$HOME/.local/bin/$arena_b" "/usr/local/bin/$arena_b" || echo "arena-warning: linking /usr/local/bin/$arena_b to $HOME/.local/bin/$arena_b failed"; fi; done
 
 echo "### 5/7 ARENA repo + Python env"
 # If a git deploy key was provided (REPO_KEY), wire github.com to it so we can clone — and
