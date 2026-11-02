@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use arena_core::provider::Provider;
+use arena_core::out::To;
 use arena_core::Config;
 use clap::Subcommand;
 
@@ -436,7 +437,7 @@ pub(crate) async fn sync_proxy(cfg: &Config, fleet: &dyn Provider, why: &str) ->
     };
     let outcome = report_sync(why, outcome);
     for line in ssh_config_after(cfg, fleet, why).await {
-        println!("{line}");
+        arena_core::out!(if line.starts_with("warning:") { To::Err } else { To::Detail }, "{line}");
     }
     outcome
 }
@@ -448,9 +449,9 @@ pub(crate) async fn sync_proxy_to_stderr(cfg: &Config, fleet: &dyn Provider, why
         Err(reason) => ProxySync::Skipped(reason),
         Ok(()) => proxy_sync_now(cfg, fleet).await,
     };
-    eprintln!("{}", sync_line(why, &outcome));
+    arena_core::out!(if matches!(outcome, ProxySync::Failed(_)) { To::Err } else { To::ErrDetail }, "{}", sync_line(why, &outcome));
     for line in ssh_config_after(cfg, fleet, why).await {
-        eprintln!("{line}");
+        arena_core::out!(if line.starts_with("warning:") { To::Err } else { To::ErrDetail }, "{line}");
     }
     outcome
 }
@@ -480,13 +481,10 @@ pub(crate) async fn proxy_sync_now(cfg: &Config, fleet: &dyn Provider) -> ProxyS
 }
 
 /// Print a sync's line (failures to stderr) and hand the outcome back.
+/// A sync that worked is a detail (`-v`); one that failed is what's wrong, with its retry.
 fn report_sync(why: &str, outcome: ProxySync) -> ProxySync {
     let line = sync_line(why, &outcome);
-    if matches!(outcome, ProxySync::Failed(_)) {
-        eprintln!("{line}");
-    } else {
-        println!("{line}");
-    }
+    arena_core::out!(if matches!(outcome, ProxySync::Failed(_)) { To::Err } else { To::Detail }, "{line}");
     outcome
 }
 

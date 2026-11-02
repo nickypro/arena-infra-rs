@@ -24,7 +24,7 @@ use crate::pods::list::list_with;
 use crate::pods::capable::CreateFlags;
 use crate::pods::lock::{handle_lock, print_would_refuse};
 use crate::pods::migrate::{handle_migrate_copy, handle_migrate_cutover, handle_migrate_finish, handle_migrate_revert, handle_migrate_status, CopyHow, CutoverOpts, FinishOpts, MigrateCmd};
-use crate::pods::placement::{checked_gpu, describe_create, first_create_spec, place_names, placement_prompt, placement_request, plan_placement, print_balance_preflight, print_placement_preview, single_option_plan};
+use crate::pods::placement::{checked_gpu, create_question, describe_create, first_create_spec, place_names, placement_prompt, placement_request, plan_cost, plan_placement, print_balance_preflight, print_placement_preview, show_plan, single_option_plan};
 use crate::pods::pull::{handle_pull, local_backup_dir, resolve_pull};
 use crate::pods::rename::{handle_rename, RenameRequest};
 use crate::pods::replace::{handle_replace, short_of, ReplaceOpts};
@@ -33,7 +33,9 @@ use crate::pods::run::{handle_run, misplaced_run_flags, pod_name_as_command};
 use crate::pods::selection::{cohort_only, hard_non_cohort_refusal, refresh_missing_endpoints, select, Unscoped, ENDPOINT_RETRY};
 use crate::pods::setup::{handle_setup, setup_config, stage_hetzner_script};
 use crate::proxy::{proxy_deployable, sync_proxy};
-use crate::{ask, confirm, jobs, money, reap, spend, up, Interrupt};
+use crate::{ask, confirm, confirm_brief, jobs, money, reap, spend, up, Interrupt};
+use arena_core::out;
+use arena_core::out::To;
 
 pub(crate) mod adopt;
 pub(crate) mod backup;
@@ -203,6 +205,36 @@ pub(crate) fn failure_line(done: usize, total: usize, name: &str, call: &PodCall
     }
 }
 
+/// The dry run's plan for `create`/`up`: the option table (or each name's create, described)
+/// with `-v`; the plan's one line or compact table and the names without.
+fn dry_run_plan(provider: &dyn Provider, options: Option<&arena_core::placement::OptionPlan>, spec: &arena_core::PodSpec, names: &[String]) {
+    match options {
+        Some(plan) => print_placement_preview(provider, plan, spec, names),
+        None => {
+            let desc = describe_create(provider, spec);
+            for name in names {
+                out!(Detail, "[dry-run] would create {name} on {} ({desc})", provider.name());
+            }
+            show_plan(provider, None, spec);
+            out!(Brief, "[dry-run] would create {}", names.join(", "));
+        }
+    }
+}
+
+/// What `up` will do about OpenRouter keys, before its prompt ([`crate::keys::plan_mints`]): the
+/// mint in a few words — `+ OpenRouter key for devtest-apple (cap $1.00)` — its whole line with
+/// `-v`, and anything else it says (a listing that failed, a staff box) at both.
+fn say_mints(mints: &crate::keys::MintPlan) {
+    for (i, line) in mints.lines.iter().enumerate() {
+        if i == 0 && !mints.mint.is_empty() {
+            out!(Detail, "{line}");
+            out!(Brief, "+ OpenRouter key for {} (cap {})", mints.mint.join(", "), arena_core::openrouter::exact_money(mints.limit));
+        } else {
+            out!(Out, "{line}");
+        }
+    }
+}
+
 pub(crate) async fn handle_pods(
     cmd: PodCmd,
     provider: &dyn Provider,
@@ -229,7 +261,7 @@ pub(crate) async fn handle_pods_with(
 
 /// [`handle_pods_with`] with the balance reads handed in (`pods list`'s footer, the
 /// `create`/`up` preflight) — the real ones, or a fake in tests.
-async fn handle_pods_bal(
+pub(crate) async fn handle_pods_bal(
     cmd: PodCmd,
     provider: &dyn Provider,
     remote: Arc<dyn Remote>,
@@ -271,7 +303,7 @@ async fn handle_pods_bal(
                 None => provider,
             };
             if let (Some((policy, _)), true) = (&reaping, dry_run) {
-                println!("[dry-run] each pod would get a reap policy: {}", create_policy_line(policy));
+                out!(Out, "[dry-run] each pod would get a reap policy: {}", create_policy_line(policy));
             }
             // Bad extra JSON (or a field arena sets itself) fails before any API call.
             let api_extra = create_extra(provider, cfg, api_json.as_deref())?;
@@ -301,7 +333,7 @@ async fn handle_pods_bal(
                 plan.names
             };
             if names.is_empty() {
-                eprintln!("nothing to create (target already met or no new names)");
+                out!(Err, "nothing to create (target already met or no new names)");
                 return Ok(());
             }
             let (mut spec, options) = match placing {
@@ -315,23 +347,18 @@ async fn handle_pods_bal(
             pin_vm_image(provider.name(), cfg, &mut spec).await?;
             check_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]))?;
             if dry_run {
-                match &options {
-                    Some(plan) => print_placement_preview(provider, plan, &spec, &names),
-                    None => {
-                        let desc = describe_create(provider, &spec);
-                        for name in &names {
-                            println!("[dry-run] would create {name} on {} ({desc})", provider.name());
-                        }
-                    }
-                }
+                dry_run_plan(provider, options.as_ref(), &spec, &names);
                 print_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]));
                 warn_no_volume(provider, &spec);
                 print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
                 owner_plan(&tracking, &owner, &names, true)?;
-                println!("\nDry-run only — no pods created (this is a preview).");
+                out!(Detail, "\nDry-run only — no pods created (this is a preview).");
+                out!(Brief, "Dry run: nothing created.");
                 return Ok(());
             }
             let then = if skip_proxy { "" } else { ", then sync the proxy" };
+            // The plan first: a plan with no option left is the table (and the refusal after it).
+            show_plan(provider, options.as_ref(), &spec);
             let what = match &options {
                 Some(plan) => placement_prompt(provider, plan, &spec, &names, then)?,
                 None => format!(
@@ -341,10 +368,11 @@ async fn handle_pods_bal(
             };
             // The account balance for these pods, next to the prompt: advisory (it never
             // blocks, and `--yes` changes nothing), quiet if the balance can't be read.
-            print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
+            let pre = print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
             let handing = owner_plan(&tracking, &owner, &names, false)?;
-            if !confirm(yes, &what)? {
-                println!("aborted.");
+            let cost = pre.cost.or_else(|| options.as_ref().and_then(|p| plan_cost(p, names.len())));
+            if !confirm_brief(yes, &what, &create_question(&names, cost.as_deref(), retry_mins))? {
+                out!(Out, "aborted.");
                 return Ok(());
             }
             hand_keys_over(&tracking, cfg, &owner, &handing).await?;
@@ -394,7 +422,7 @@ async fn handle_pods_bal(
                 None => provider,
             };
             if let (Some((policy, _)), true) = (&reaping, dry_run) {
-                println!("[dry-run] each pod would get a reap policy: {}", create_policy_line(policy));
+                out!(Out, "[dry-run] each pod would get a reap policy: {}", create_policy_line(policy));
             }
             let api_extra = create_extra(provider, cfg, api_json.as_deref())?;
             // Flags the create target would ignore, and --lock where pods can't be locked, fail
@@ -430,7 +458,7 @@ async fn handle_pods_bal(
                 plan.names
             };
             if names.is_empty() {
-                eprintln!("nothing to create (target already met or no free names)");
+                out!(Err, "nothing to create (target already met or no free names)");
                 return Ok(());
             }
 
@@ -478,27 +506,19 @@ async fn handle_pods_bal(
                 (endpoint_mins, check_attempts),
             );
             if dry_run {
-                match &options {
-                    Some(plan) => print_placement_preview(provider, plan, &spec, &names),
-                    None => {
-                        let desc = describe_create(provider, &spec);
-                        for name in &names {
-                            println!("[dry-run] would create {name} on {} ({desc})", provider.name());
-                        }
-                    }
-                }
+                dry_run_plan(provider, options.as_ref(), &spec, &names);
                 print_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]));
                 warn_no_volume(provider, &spec);
                 print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
                 owner_plan(&tracking, &owner, &names, true)?;
-                for line in &mints.lines {
-                    println!("{line}");
-                }
+                say_mints(&mints);
                 let retry = if retry_mins > 0 { format!(" (retrying up to {retry_mins}m for capacity)") } else { String::new() };
-                println!(
+                out!(
+                    Detail,
                     "\nDry-run only — no pods created (preview){retry}: would create the above, then {per_pod}. \
                      Each pod waits up to {timeout}s for its endpoint."
                 );
+                out!(Brief, "Dry run: nothing created.");
                 return Ok(());
             }
             // Provisioning settings too: a config without ARENA_REPO_* must fail before the
@@ -519,6 +539,8 @@ async fn handle_pods_bal(
                 "{}, then {per_pod}",
                 if retry_mins > 0 { format!(", retrying up to {retry_mins}m") } else { String::new() },
             );
+            // The plan first: a plan with no option left is the table (and the refusal after it).
+            show_plan(provider, options.as_ref(), &spec);
             let what = match &options {
                 Some(plan) => placement_prompt(provider, plan, &spec, &names, &then)?,
                 None => format!(
@@ -528,13 +550,12 @@ async fn handle_pods_bal(
             };
             // The account balance for these pods, next to the prompt: advisory (it never
             // blocks, and `--yes` changes nothing), quiet if the balance can't be read.
-            print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
+            let pre = print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
             let handing = owner_plan(&tracking, &owner, &names, false)?;
-            for line in &mints.lines {
-                println!("{line}");
-            }
-            if !confirm(yes, &what)? {
-                println!("aborted.");
+            say_mints(&mints);
+            let cost = pre.cost.or_else(|| options.as_ref().and_then(|p| plan_cost(p, names.len())));
+            if !confirm_brief(yes, &what, &create_question(&names, cost.as_deref(), retry_mins))? {
+                out!(Out, "aborted.");
                 return Ok(());
             }
             // The handed-over and the minted keys are in the CSV before the pipelines copy any.
@@ -542,12 +563,9 @@ async fn handle_pods_bal(
             let minted = match key_api {
                 Some(api) if !mints.mint.is_empty() => {
                     let m = mint_missing(api, &tracking, &naming, std::path::Path::new(&keys_dir(cfg)), &mints, owner.owner.as_deref()).await;
+                    // A key that couldn't be minted is what's wrong; one that was is the READY line's `keys ✓`.
                     for l in &m.lines {
-                        if l.starts_with('✗') {
-                            eprintln!("{l}");
-                        } else {
-                            println!("{l}");
-                        }
+                        out!(if l.starts_with('✗') { To::Err } else { To::Detail }, "{l}");
                     }
                     m
                 }
@@ -567,7 +585,7 @@ async fn handle_pods_bal(
                 let fresh = |n: &String| minted.names.contains(n) || handing.iter().any(|h| h.name == *n);
                 let hosts: Vec<String> = names.iter().filter(|n| !fresh(n)).cloned().collect();
                 for line in check_csv_keys(k, &hosts, listed.as_ref(), &naming) {
-                    eprintln!("{line}");
+                    out!(Err, "{line}");
                 }
             }
             // What the operator confirmed: a name of these that gets no pod is in the summary
@@ -603,7 +621,7 @@ async fn handle_pods_bal(
                 if created.is_empty() {
                     anyhow::bail!("no pods were created — nothing to bring up");
                 }
-                println!("\n--no-wait: not polling. Run `arena proxy apply` once endpoints are assigned.");
+                out!(Out, "--no-wait: not waiting for them — `arena proxy apply` once they have endpoints");
                 return Ok(());
             }
 
@@ -614,16 +632,18 @@ async fn handle_pods_bal(
             // that one spec as an option.
             let plan_for_run = options.clone().unwrap_or_else(|| single_option_plan(provider.name(), &spec));
             let setup = setup.map(|(stage, tokens)| {
-                println!("{tokens}");
+                out!(Detail, "{tokens}");
                 stage
             });
             match &keys {
-                Some(k) if k.csv.is_empty() => println!(
+                Some(k) if k.csv.is_empty() => out!(
+                    Detail,
                     "API keys: none generated in {}/ — each pod gets the backup archive's access once it's set up",
                     keys_dir(cfg)
                 ),
-                Some(k) => println!("API keys: {} — copied to each pod once it's set up", k.csv.join(", ")),
-                None if setup.is_some() => println!(
+                Some(k) => out!(Detail, "API keys: {} — copied to each pod once it's set up", k.csv.join(", ")),
+                None if setup.is_some() => out!(
+                    Detail,
                     "API keys: none generated in {}/ — skipping (run `arena keys gen --all` or drop in \
                      <provider>_api_keys.csv, then `pods copy-keys`).",
                     keys_dir(cfg)
@@ -631,9 +651,9 @@ async fn handle_pods_bal(
                 None => {}
             }
             match &claude_line {
-                Ok(Some(line)) => println!("{line}"),
+                Ok(Some(line)) => out!(Detail, "{line}"),
                 Ok(None) => {}
-                Err(e) => println!("Claude Code: ✗ {e} — skipped (fix it, then `arena claude push`)"),
+                Err(e) => out!(Err, "{}", arena_core::out::fail(format!("Claude Code: {e} — skipped (fix it, then `arena claude push`)"))),
             }
             let run = up::UpRun {
                 provider,
@@ -661,7 +681,8 @@ async fn handle_pods_bal(
                 placements: check_attempts,
                 endpoint_timeout: Duration::from_secs(endpoint_mins * 60),
             };
-            println!(
+            out!(
+                Detail,
                 "\nEach pod is brought up on its own the moment it's created (endpoint wait ≤{timeout}s per pod, one up \
                  without an endpoint for {endpoint_mins} min is replaced; Ctrl+C stops — nothing is terminated by it)…"
             );
@@ -690,7 +711,7 @@ async fn handle_pods_bal(
                 }
             };
             let (outcome, mut rows) =
-                tokio::join!(creating, up::run_up_streaming(&run, made_rx, interrupt.wait(), &up::console));
+                tokio::join!(creating, up::run_up_streaming(&run, made_rx, interrupt.wait(), &arena_core::out::emit));
             // A create that failed part-way still had its pods brought up (and the proxy synced
             // by the pipelines' final sync); the failure is reported after their summary.
             let (created, error) = match outcome {
@@ -705,7 +726,7 @@ async fn handle_pods_bal(
             }
             let made: Vec<String> = created.iter().map(|m| m.pod.name.clone()).collect();
             rows.extend(up::not_created_rows(&confirmed, &made, interrupt.is_set()));
-            let concluded = up::conclude(&rows, &up::console);
+            let concluded = up::conclude(&rows, &arena_core::out::emit);
             if let Some(e) = error {
                 return Err(e);
             }
@@ -1078,20 +1099,20 @@ async fn handle_pods_bal(
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
             money::handle_idle(provider, remote, cfg, &sel, hours, json, &mut |l| println!("{l}")).await?;
         }
-        PodCmd::Test { deep: true, sel, json, verbose, cohort, .. } => {
+        PodCmd::Test { deep: true, sel, json, cohort, .. } => {
             // Read-only: no confirm. Config first: a malformed MIN_DRIVER_VERSION fails before
             // the fleet is even listed. Fleet-wide = this cohort's pods: the check runs CUDA, NCCL
             // and a download on each GPU, never on a staff box's (the daily cron line's run).
             arena_core::health::HealthPolicy::from_config(cfg)?;
             let sel = cohort_only(cfg, select(provider, cfg, &sel.args(), Unscoped::All).await?, cohort);
-            handle_deep_test(provider, remote, cfg, &sel, json, verbose).await?;
+            handle_deep_test(provider, remote, cfg, &sel, json, arena_core::out::verbose()).await?;
         }
-        PodCmd::Test { keys: true, sel, json, verbose, cohort, .. } => {
+        PodCmd::Test { keys: true, sel, json, cohort, .. } => {
             // Read-only, fast: this cohort's pods (a staff box's key is the organisers' choice),
             // and no wait on a pod listed without an endpoint — it's skipped with a note, as for
             // `--deep` (the ops stopgap `pods run '<curl …/key>'` waited 20 s on a staff box's).
             let sel = cohort_only(cfg, select(provider, cfg, &sel.args(), Unscoped::All).await?, cohort);
-            handle_keys_test(remote, cfg, &sel, json, verbose).await?;
+            handle_keys_test(remote, cfg, &sel, json, arena_core::out::verbose()).await?;
         }
         PodCmd::Test { deep: false, sel, cohort, .. } => {
             // Read-only: no confirm, compact one-line-per-pod output.

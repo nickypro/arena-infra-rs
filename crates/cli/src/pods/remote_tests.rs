@@ -1451,7 +1451,7 @@ async fn pods_test_and_pods_run_carry_their_budgets_through_the_command() {
     let fake = Arc::new(FakeRemote::new());
     fake.script(&host(22003), [FakeReply::hang()]);
     let start = Instant::now();
-    let plain = PodCmd::Test { deep: false, keys: false, sel: Select::default(), json: false, verbose: false, cohort: crate::cli::CohortScope::default() };
+    let plain = PodCmd::Test { deep: false, keys: false, sel: Select::default(), json: false, cohort: crate::cli::CohortScope::default() };
     let err = handle_pods(plain, &fleet(), fake.clone(), &cfg(), true).await.unwrap_err();
     assert_eq!(err.to_string(), "1 pod(s) failed");
     assert_eq!(start.elapsed(), TEST_TIMEOUT);
@@ -3749,7 +3749,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
 #[tokio::test(start_paused = true)]
 async fn pods_test_deep_exit_status_follows_failures_not_warnings() {
     use arena_core::health::DEEP_CHECK_TIMEOUT;
-    let deep = |json: bool| PodCmd::Test { deep: true, keys: false, sel: Select::default(), json, verbose: false, cohort: crate::cli::CohortScope::default() };
+    let deep = |json: bool| PodCmd::Test { deep: true, keys: false, sel: Select::default(), json, cohort: crate::cli::CohortScope::default() };
     // Any FAIL fails the command (table or JSON), at the hung pod's budget.
     for json in [false, true] {
         let fake = Arc::new(FakeRemote::new());
@@ -3954,7 +3954,7 @@ AI key failure, not the machine: devtest-bloom, devtest-cloud — NOTES (or -v) 
     fake.script(&host(22001), [FakeReply::stdout(&keys_out(&or_facts(&or_key("apple"), 200, money), &hf_ok()))]);
     fake.script(&host(22002), [FakeReply::stdout(&keys_out(&or_facts(&or_key("bloom"), 401, ""), &hf_ok()))]);
     fake.script(&host(22003), [FakeReply::stdout(&keys_out(&or_facts(&or_key("cloud"), 200, money), &hf_ok()))]);
-    let cmd = PodCmd::Test { deep: false, keys: true, sel: Select::default(), json: false, verbose: false, cohort: crate::cli::CohortScope::default() };
+    let cmd = PodCmd::Test { deep: false, keys: true, sel: Select::default(), json: false, cohort: crate::cli::CohortScope::default() };
     let err = handle_pods(cmd, &fleet(), fake.clone(), &kf.cfg, true).await.unwrap_err();
     assert_eq!(err.to_string(), "1 pod(s) failed the key check");
 }
@@ -3978,7 +3978,7 @@ async fn pods_test_keys_never_waits_on_a_machine_outside_the_cohort() {
         let fake = Arc::new(FakeRemote::new());
         fake.script(&host(22001), [FakeReply::stdout(&keys_out(&or_facts(&or_key("apple"), 200, money), &hf_ok()))]);
         let start = Instant::now();
-        let cmd = PodCmd::Test { deep: !keys, keys, sel: Select::default(), json: false, verbose: false, cohort: crate::cli::CohortScope::default() };
+        let cmd = PodCmd::Test { deep: !keys, keys, sel: Select::default(), json: false, cohort: crate::cli::CohortScope::default() };
         let _ = handle_pods(cmd, &f, fake.clone(), &kf.cfg, true).await;
         assert!(start.elapsed() < Duration::from_secs(1), "keys={keys}: waited {:?}", start.elapsed());
         assert_eq!(fake.calls().len(), 1, "keys={keys}: only apple is asked: {:#?}", fake.calls());
@@ -4175,11 +4175,14 @@ fn pods_test_flags_parse() {
     let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.cmd);
     assert!(matches!(
         parse(&["arena", "pods", "test"]).unwrap(),
-        Cmd::Pods(PodCmd::Test { deep: false, ref sel, json: false, verbose: false, .. }) if sel.targets.is_empty()
+        Cmd::Pods(PodCmd::Test { deep: false, ref sel, json: false, .. }) if sel.targets.is_empty()
     ));
-    match parse(&["arena", "pods", "test", "--deep", "apple", "bloom", "--json", "-v"]).unwrap() {
-        Cmd::Pods(PodCmd::Test { deep, sel, json, verbose, .. }) => {
-            assert!(deep && json && verbose);
+    // `-v` is the global one now (`arena -v …` or after the command), as every command's.
+    let cli = Cli::try_parse_from(["arena", "pods", "test", "--deep", "apple", "bloom", "--json", "-v"]).unwrap();
+    assert!(cli.verbose);
+    match cli.cmd {
+        Cmd::Pods(PodCmd::Test { deep, sel, json, .. }) => {
+            assert!(deep && json);
             assert_eq!(sel.targets, ["apple", "bloom"]);
         }
         _ => panic!("not pods test"),
@@ -4191,14 +4194,12 @@ fn pods_test_flags_parse() {
         }
         _ => panic!("not pods test"),
     }
-    // … but --json/-v still belong to --deep (or --keys).
-    for args in [&["arena", "pods", "test", "--json"][..], &["arena", "pods", "test", "-v"]] {
-        assert!(parse(args).is_err(), "{args:?}");
-    }
+    // … but --json still belongs to --deep (or --keys).
+    assert!(parse(&["arena", "pods", "test", "--json"]).is_err());
     // --keys: the AI keys alone, with --json/-v too; never with --deep (one or the other).
     match parse(&["arena", "pods", "test", "--keys", "apple", "--json", "-v"]).unwrap() {
-        Cmd::Pods(PodCmd::Test { deep, keys, sel, json, verbose, .. }) => {
-            assert!(!deep && keys && json && verbose);
+        Cmd::Pods(PodCmd::Test { deep, keys, sel, json, .. }) => {
+            assert!(!deep && keys && json);
             assert_eq!(sel.targets, ["apple"]);
         }
         _ => panic!("not pods test"),
