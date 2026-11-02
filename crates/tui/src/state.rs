@@ -822,6 +822,33 @@ pub fn health_tone(s: Status, age: u64) -> Tone {
     }
 }
 
+/// The detail view's `ai check:` line from a health record's AI-key checks (`ai_key`,
+/// `hf_token`): the OpenRouter key's verdict (`✓ ok, $4.97 of $5.00 left`, `✗ rejected … — <what
+/// to run>`), then the HF token's when it isn't a pass, in the worst one's tone — `None` when
+/// the check judged neither (no keys configured, a staff box, an older check). Pure.
+pub fn key_check_line(keys: &[arena_core::health::Check]) -> Option<(String, Tone)> {
+    let judged: Vec<&arena_core::health::Check> = keys.iter().filter(|c| c.status != Status::Skip).collect();
+    if judged.is_empty() {
+        return None;
+    }
+    let mark = |s: Status| match s {
+        Status::Pass => "✓",
+        Status::Warn => "!",
+        _ => "✗",
+    };
+    let parts: Vec<String> = judged
+        .iter()
+        .filter(|c| c.name == arena_core::health::AI_KEY || c.status != Status::Pass)
+        .map(|c| {
+            let what = if c.name == arena_core::health::AI_KEY { "" } else { "HF token " };
+            format!("{what}{} {}", mark(c.status), c.detail)
+        })
+        .collect();
+    let worst = arena_core::health::overall(&judged.iter().map(|c| (*c).clone()).collect::<Vec<_>>());
+    let text = if parts.is_empty() { "✓ HF token accepted".to_string() } else { parts.join(" · ") };
+    Some((text, health_tone(worst, 0)))
+}
+
 /// How long a deep check's pass reads as current in the HEALTH column (then grey): the health
 /// cron's daily cadence plus two hours, as it checks the pods one by one and its run drifts —
 /// a working cron never leaves a pass grey.
@@ -920,7 +947,15 @@ impl DeepChecks {
             }
         }
         let tally = render_summary(results).into_iter().next().unwrap_or_default();
-        let failed: Vec<&str> = results.iter().filter(|h| h.status == Status::Fail).map(|h| h.name.as_str()).collect();
+        // A pod that failed for its AI keys alone says so: its machine is fine.
+        let failed: Vec<String> = results
+            .iter()
+            .filter(|h| h.status == Status::Fail)
+            .map(|h| match h.failure_kind() {
+                Some(arena_core::health::FailureKind::Key) => format!("{} (AI key)", h.name),
+                _ => h.name.clone(),
+            })
+            .collect();
         if failed.is_empty() {
             format!("deep check: {tally}")
         } else {
@@ -2541,6 +2576,33 @@ mod tests {
         let done = deep.finish(&second, &[verdict(&charlie, Status::Pass, &[])], NOW + 300, &mut snap);
         assert_eq!(done, "deep check: 1 pass, 0 warn, 0 fail");
         assert_eq!(deep.running(), 0);
+
+        // A pod that failed for its AI key alone says so: its machine is fine.
+        let claimed = deep.begin(vec![bravo.clone()]);
+        let line = deep.finish(&claimed, &[verdict(&bravo, Status::Fail, &["ai_key"])], NOW + 400, &mut snap);
+        assert_eq!(line, "deep check: 0 pass, 0 warn, 1 fail — failed: devtest-bravo (AI key)");
+        // …and the detail view's `ai check:` line reads the record's key checks.
+        let keys = &snap.pods[1].health.as_ref().unwrap().keys;
+        assert_eq!(key_check_line(keys), Some(("✗ x".to_string(), Tone::Bad)));
+    }
+
+    /// The detail view's `ai check:` line: the OpenRouter key's verdict, the HF token's only when
+    /// it isn't a pass, in the worst one's tone; nothing when neither was judged.
+    #[test]
+    fn the_ai_check_line_says_the_keys_verdicts() {
+        let c = |name: &str, status: Status, detail: &str| Check { name: name.into(), status, detail: detail.into() };
+        let ok = c("ai_key", Status::Pass, "ok, $4.97 of $5.00 left");
+        let hf_ok = c("hf_token", Status::Pass, "accepted by Hugging Face");
+        let hf_none = c("hf_token", Status::Skip, "no HF_TOKEN configured for this fleet (none here)");
+        assert_eq!(key_check_line(&[ok.clone(), hf_ok.clone()]), Some(("✓ ok, $4.97 of $5.00 left".into(), Tone::Good)));
+        assert_eq!(key_check_line(&[ok.clone(), hf_none.clone()]), Some(("✓ ok, $4.97 of $5.00 left".into(), Tone::Good)));
+        let hf_dead = c("hf_token", Status::Fail, "missing — `arena pods copy-keys apple`");
+        assert_eq!(
+            key_check_line(&[ok, hf_dead]),
+            Some(("✓ ok, $4.97 of $5.00 left · HF token ✗ missing — `arena pods copy-keys apple`".into(), Tone::Bad))
+        );
+        assert_eq!(key_check_line(&[c("ai_key", Status::Skip, "staff box"), hf_none]), None);
+        assert_eq!(key_check_line(&[]), None);
     }
 
     #[test]

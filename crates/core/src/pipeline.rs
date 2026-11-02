@@ -284,7 +284,11 @@ pub fn render_up_summary(rows: &[UpRow]) -> String {
             Verdict::Stopped { stage } => {
                 notes.push(format!("{}: stopped at {} (Ctrl+C) — left as it was", r.name, stage.label()))
             }
-            Verdict::Ready if r.health == Some(Status::Warn) => notes.push(format!("{}: warn — {}", r.name, r.health_notes)),
+            // A READY machine's check FAILs only for its AI keys (`up` never keeps one that fails
+            // on its host): said with the rest, what to run included.
+            Verdict::Ready if matches!(r.health, Some(Status::Warn | Status::Fail)) => {
+                notes.push(format!("{}: {} — {}", r.name, r.health.map(Status::label).unwrap_or_default(), r.health_notes))
+            }
             Verdict::Ready => {}
         }
     }

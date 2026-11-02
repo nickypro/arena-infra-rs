@@ -19,6 +19,10 @@
 //! The rendering helpers at the bottom (table, per-check lines, same-host summary) are
 //! here rather than in the CLI so the TUI and the `up --check` summary (PLAN 2.B / Phase
 //! 3) show a pod's health the same way.
+//!
+//! The machine's AI keys (its OpenRouter key, the Hugging Face token) are checked by the same
+//! script, judged in [`aikeys`] against the fleet's keys CSV ([`KeyBook`], in the policy) — and
+//! never counted against the machine ([`FailureKind::Key`]).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -34,6 +38,12 @@ use crate::pod::{Maintenance, Pod};
 use crate::ssh::SshOutput;
 use crate::table::{self, Align};
 
+mod aikeys;
+pub use aikeys::{
+    ai_key_cell, fingerprint, hf_token_cell, is_key_check, key_checks, ledger_owners, low_line, KeyBook, KeyFacts, Listed,
+    AI_KEY, HF_TOKEN_CHECK,
+};
+
 /// The on-pod fact gatherer. Embedded (like `hetzner_setup.sh`) so the binary is all an
 /// operator needs, and versioned with the parser that reads its output.
 pub const DEEP_CHECK_SCRIPT: &str = include_str!("deep_check.sh");
@@ -43,6 +53,10 @@ pub const DEEP_CHECK_SCRIPT: &str = include_str!("deep_check.sh");
 /// come the ssh connect (10s) and sourcing the participants' `~/.zshrc`. Past this the pod
 /// is wedged and counts as a FAIL — the fleet run never waits on it longer.
 pub const DEEP_CHECK_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// The keys-only run's budget (`pods test --keys`, `up --check` once its keys are copied, the
+/// dashboard's test): the login shell, then two calls bounded at 15 s each, side by side.
+pub const KEY_CHECK_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// Below this Hugging Face download speed a pod WARNs: course notebooks pull models and
 /// datasets, and at under 2 MB/s a 500 MB checkpoint takes minutes.
@@ -61,10 +75,27 @@ pub const DEFAULT_LOAD_FLOOR: f64 = 32.0;
 /// `$`). `</dev/null`: nothing in it may wait on input. Exposed so a test can run it
 /// locally against stub tools.
 pub fn deep_check_inner_command() -> String {
+    inner_command("")
+}
+
+/// [`deep_check_inner_command`] with the script's mode argument (`""`: everything; `" keys"`:
+/// the AI keys only).
+fn inner_command(mode: &str) -> String {
     format!(
-        "bash -c \"$(printf %s {} | base64 -d)\" arena-deep-check </dev/null",
+        "bash -c \"$(printf %s {} | base64 -d)\" arena-deep-check{mode} </dev/null",
         base64_encode(DEEP_CHECK_SCRIPT.as_bytes())
     )
+}
+
+/// The keys-only run of the same script (its `keys` mode: no torch, no GPU, a few seconds), in
+/// the same login wrap — the keys the participant's shell exports. Before the wrap, for tests.
+pub fn key_check_inner_command() -> String {
+    inner_command(" keys")
+}
+
+/// [`key_check_inner_command`] inside [`crate::ssh::login_shell_wrap`].
+pub fn key_check_command(conda_env: Option<&str>) -> String {
+    crate::ssh::login_shell_wrap(&key_check_inner_command(), conda_env)
 }
 
 /// The full remote command: [`deep_check_inner_command`] wrapped by
@@ -194,6 +225,13 @@ pub struct DeepFacts {
     pub vscode_extensions: BTreeMap<String, String>,
     /// `python.defaultInterpreterPath` in the machine settings (`unset` = absent).
     pub vscode_python: Option<String>,
+    /// The OpenRouter key the login shell exports (`openrouter.*`): set or not, its
+    /// fingerprint, what OpenRouter said of it. `None`: not reported (an older script).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openrouter: Option<KeyFacts>,
+    /// The Hugging Face token (`hf.*`), as `openrouter`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hf: Option<KeyFacts>,
     /// Any other `key=value` the script printed (a newer script, an `error=`): kept for
     /// `--json` rather than dropped.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -469,6 +507,7 @@ pub fn parse_deep(stdout: &str) -> DeepFacts {
             "vscode.server" => f.vscode_server = text(),
             "vscode.servers" => f.vscode_servers = small(),
             "vscode.python" => f.vscode_python = text(),
+            _ if aikeys::key_fact(&mut f, key, value) => {}
             _ => {
                 if let Some(v) = text() {
                     if !indexed_fact(&mut f, &mut gpus, &mut tgpus, key, v.clone()) {
@@ -581,6 +620,10 @@ pub struct HealthPolicy {
     /// The extensions setup's VS Code warm-up installs (`VSCODE_EXTENSIONS`; none when
     /// `VSCODE_PREINSTALL=0`), for the informational `vscode` line.
     pub vscode_extensions: Vec<String>,
+    /// What the machines' AI keys are held to ([`KeyBook`]); `None`: no `ai_key`/`hf_token`
+    /// lines at all — [`Self::from_config`]'s, and `up --check`'s check before its keys stage
+    /// (the keys aren't on the machine yet). [`Self::for_fleet`] fills it.
+    pub keys: Option<KeyBook>,
 }
 
 impl Default for HealthPolicy {
@@ -591,11 +634,19 @@ impl Default for HealthPolicy {
             min_free_gb: DEFAULT_MIN_FREE_GB,
             load_floor: DEFAULT_LOAD_FLOOR,
             vscode_extensions: crate::vscode::DEFAULT_EXTENSIONS.iter().map(|s| s.to_string()).collect(),
+            keys: None,
         }
     }
 }
 
 impl HealthPolicy {
+    /// [`Self::from_config`] with the fleet's [`KeyBook`] ([`KeyBook::load`]: the keys CSVs
+    /// beside the config, `HF_TOKEN`, and the owners in the spend ledger at `ledger`): what
+    /// `pods test --deep` and the dashboard's deep check judge by.
+    pub fn for_fleet(cfg: &Config, ledger: Option<&std::path::Path>) -> Result<Self> {
+        Ok(Self { keys: Some(KeyBook::load(cfg, ledger)), ..Self::from_config(cfg)? })
+    }
+
     /// The policy from config: `MIN_DRIVER_VERSION` (e.g. `580` or `580.65.06`; `none`
     /// turns the check off) wins; otherwise the floor is derived from the host CUDA floor
     /// pods are created with (`MIN_CUDA_VERSION`, else the lowest of `ALLOWED_CUDA_VERSIONS` /
@@ -738,7 +789,8 @@ impl Status {
 
 /// One named check of one pod: `name` is stable (`cuda`, `gpu1`, `peer_copy`, `network`,
 /// …) so scripts can key on it; `detail` is the human reason or measurement.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// (`Deserialize`: the health cache keeps the AI-key checks — see `snapshot`.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Check {
     pub name: String,
     pub status: Status,
@@ -767,6 +819,9 @@ pub enum FailureKind {
     /// failing (python said so), a CPU-only torch on a GPU pod, the check script itself not
     /// running. A new pod from the same image fails the same way.
     Software,
+    /// An AI key or token ([`aikeys`]: missing, rejected, paused, out of money): not the
+    /// machine at all. Reported with what to run; the machine is kept.
+    Key,
 }
 
 impl FailureKind {
@@ -774,6 +829,7 @@ impl FailureKind {
         match self {
             FailureKind::Host => "host",
             FailureKind::Software => "software/setup",
+            FailureKind::Key => "AI key",
         }
     }
 }
@@ -788,9 +844,14 @@ impl FailureKind {
 /// - `cuda`: torch imported but is a CPU-only build (`torch.version.cuda` is None) — on a GPU
 ///   pod every pod from that image fails the same way.
 ///
+/// - `ai_key`, `hf_token`: `Key` — the machine's AI keys, never the machine.
+///
 /// Everything else — the GPU/driver/CUDA checks, and any check this function doesn't know (a new
 /// one keeps the old "a FAIL is a bad host" meaning) — is `Host`.
 pub fn failure_kind_of(name: &str, facts: Option<&DeepFacts>) -> FailureKind {
+    if is_key_check(name) {
+        return FailureKind::Key;
+    }
     let software = match (name, facts) {
         ("script", _) => true,
         ("torch", Some(f)) => f.python.as_deref() == Some("missing") || f.torch.as_deref().is_some_and(|t| t != "ok"),
@@ -1439,6 +1500,36 @@ impl PodHealth {
         if expects_gpu(pod) && pod.gpu_count == Some(0) {
             checks.push(Check::new("provider", Status::Warn, "reports 0 GPUs for this pod (resumed without one?)"));
         }
+        // Its AI keys, when the policy holds them to the fleet's (and the script ran at all).
+        if let Some(book) = policy.keys.as_ref().filter(|_| facts.started) {
+            checks.extend(key_checks(&facts, pod, book));
+        }
+        Self::of(pod, checks, facts)
+    }
+
+    /// A keys-only run's verdict (`pods test --keys`: the script's `keys` mode): its `ai_key` and
+    /// `hf_token` checks held to `policy`'s [`KeyBook`] (a fleet with none configured without
+    /// one) — after a `script` FAIL when it never started, a WARN when it was cut off.
+    pub fn keys_checked(pod: &Pod, facts: DeepFacts, policy: &HealthPolicy) -> Self {
+        let mut checks = Vec::new();
+        if !facts.started {
+            checks.push(Check::new("script", Status::Fail, "no output from the check script"));
+            return Self::of(pod, checks, facts);
+        }
+        if !facts.complete {
+            checks.push(Check::new("script", Status::Warn, "output cut off before the end; later facts unknown"));
+        }
+        // The script said it couldn't run (`error=`: no temp dir, /tmp full): no key was asked
+        // about, and that's no pass.
+        if let Some(e) = facts.other.get("error") {
+            checks.push(Check::new("script", Status::Fail, e.clone()));
+            return Self::of(pod, checks, facts);
+        }
+        checks.extend(key_checks(&facts, pod, &policy.keys.clone().unwrap_or_default()));
+        Self::of(pod, checks, facts)
+    }
+
+    fn of(pod: &Pod, checks: Vec<Check>, facts: DeepFacts) -> Self {
         Self {
             id: pod.id.clone(),
             name: pod.name.clone(),
@@ -1448,6 +1539,32 @@ impl PodHealth {
             facts: Some(facts),
             host: host_key(pod),
         }
+    }
+
+    /// The verdict on the machine itself: [`overall`] of every check but its AI keys'. What
+    /// decides whether a check clears a bad-host record; `status` (keys included) is what
+    /// `pods test --deep` reports and exits by.
+    pub fn machine_status(&self) -> Status {
+        let machine: Vec<Check> = self.checks.iter().filter(|c| !is_key_check(&c.name)).cloned().collect();
+        overall(&machine)
+    }
+
+    /// The worst of its AI-key checks (`None`: it has none, or only Skips).
+    pub fn key_status(&self) -> Option<Status> {
+        let keys: Vec<Check> = self.checks.iter().filter(|c| is_key_check(&c.name) && c.status != Status::Skip).cloned().collect();
+        (!keys.is_empty()).then(|| overall(&keys))
+    }
+
+    /// Fold a later keys-only run's verdict in (`up --check` once its keys are copied): its
+    /// `ai_key`/`hf_token` checks and facts replace any this one had, and the verdict follows.
+    pub fn merge_keys(&mut self, keys: &PodHealth) {
+        self.checks.retain(|c| !is_key_check(&c.name));
+        self.checks.extend(keys.checks.iter().filter(|c| is_key_check(&c.name)).cloned());
+        if let (Some(f), Some(k)) = (self.facts.as_mut(), keys.facts.as_ref()) {
+            f.openrouter = k.openrouter.clone();
+            f.hf = k.hf.clone();
+        }
+        self.status = overall(&self.checks);
     }
 
     /// A pod that couldn't be checked (no SSH, timed out, no endpoint): a FAIL with why.
@@ -1464,15 +1581,15 @@ impl PodHealth {
     }
 
     /// What its failures say is broken: `Host` as soon as one failed check is about the
-    /// machine, `Software` when every one is about the image/setup ([`failure_kind_of`]),
-    /// `None` when nothing failed. A pod that couldn't be checked at all (`ssh`) is `Host` here
-    /// — `up --check` never judges such a pod by its checks (it re-runs the check instead).
+    /// machine, else `Software` as soon as one is about the image/setup, else `Key` — every one
+    /// is an AI key's ([`failure_kind_of`]); `None` when nothing failed. A pod that couldn't be
+    /// checked at all (`ssh`) is `Host` here — `up --check` never judges such a pod by its checks
+    /// (it re-runs the check instead).
     pub fn failure_kind(&self) -> Option<FailureKind> {
         let facts = self.facts.as_ref();
-        let mut kinds =
-            self.checks.iter().filter(|c| c.status == Status::Fail).map(|c| failure_kind_of(&c.name, facts)).peekable();
-        kinds.peek()?;
-        Some(if kinds.any(|k| k == FailureKind::Host) { FailureKind::Host } else { FailureKind::Software })
+        let kinds: Vec<FailureKind> =
+            self.checks.iter().filter(|c| c.status == Status::Fail).map(|c| failure_kind_of(&c.name, facts)).collect();
+        [FailureKind::Host, FailureKind::Software, FailureKind::Key].into_iter().find(|k| kinds.contains(k))
     }
 
     /// The NOTES column: failures first, then warnings, as `check: detail`.
@@ -1491,6 +1608,22 @@ impl PodHealth {
 /// `pods test --deep`, `up --check` and the dashboard, so a pod is judged the same way by
 /// all three.
 pub fn judge_deep_call(pod: &Pod, call: std::result::Result<SshOutput, String>, policy: &HealthPolicy) -> PodHealth {
+    judge_call(pod, call, policy, PodHealth::checked)
+}
+
+/// [`judge_deep_call`] for a keys-only run ([`key_check_command`]): the same ways of failing to
+/// get facts, the facts judged by [`PodHealth::keys_checked`]. Shared by `pods test --keys`,
+/// `up --check` (once its keys are copied) and the dashboard's test.
+pub fn judge_key_call(pod: &Pod, call: std::result::Result<SshOutput, String>, policy: &HealthPolicy) -> PodHealth {
+    judge_call(pod, call, policy, PodHealth::keys_checked)
+}
+
+fn judge_call(
+    pod: &Pod,
+    call: std::result::Result<SshOutput, String>,
+    policy: &HealthPolicy,
+    judge: fn(&Pod, DeepFacts, &HealthPolicy) -> PodHealth,
+) -> PodHealth {
     match call {
         Err(why) => PodHealth::unreachable(pod, why),
         Ok(out) => {
@@ -1500,7 +1633,7 @@ pub fn judge_deep_call(pod: &Pod, call: std::result::Result<SshOutput, String>, 
                 // No zsh to run it in: a bare VM before setup (live: Hetzner `up --check
                 // --no-setup`). SSH worked and the script never started — the pod's software,
                 // like a missing `base64` below: a `script` FAIL (software/setup), with the fix.
-                let mut health = PodHealth::checked(pod, facts, policy);
+                let mut health = judge(pod, facts, policy);
                 for c in health.checks.iter_mut().filter(|c| c.name == "script") {
                     c.detail = crate::ssh::login_shell_missing_hint(&pod.name);
                 }
@@ -1510,7 +1643,7 @@ pub fn judge_deep_call(pod: &Pod, call: std::result::Result<SshOutput, String>, 
                 PodHealth::unreachable(pod, format!("{}: {stderr}", out.exit_label()))
             } else {
                 let started = facts.started;
-                let mut health = PodHealth::checked(pod, facts, policy);
+                let mut health = judge(pod, facts, policy);
                 // The script never started (e.g. no `base64` on the pod): stderr says why.
                 if !started && !stderr.is_empty() {
                     for c in health.checks.iter_mut().filter(|c| c.name == "script") {
@@ -1527,10 +1660,13 @@ pub fn judge_deep_call(pod: &Pod, call: std::result::Result<SshOutput, String>, 
 const TORCH_CUDA_MARK: &str = "*";
 const TORCH_CUDA_NOTE: &str = "* from torch: nvidia-smi unavailable";
 
-/// `NAME  RESULT  GPUS  DRIVER  CUDA  NET  NOTES`, one row per pod in the given order. Where
-/// nvidia-smi can't answer, the columns are torch's and `/proc`'s facts ([`DeepFacts::gpu_label`],
-/// [`DeepFacts::driver`]); a CUDA version torch read is marked, with a footnote under the table.
+/// `NAME  RESULT  GPUS  DRIVER  CUDA  NET  [AI KEY]  NOTES`, one row per pod in the given order.
+/// Where nvidia-smi can't answer, the columns are torch's and `/proc`'s facts
+/// ([`DeepFacts::gpu_label`], [`DeepFacts::driver`]); a CUDA version torch read is marked, with a
+/// footnote under the table. AI KEY ([`ai_key_cell`]: `$0.42 left`, `rejected`, …) only when some
+/// pod's key was judged: a fleet with no keys gets the table it always had.
 pub fn render_health_table(results: &[PodHealth]) -> String {
+    let keyed = results.iter().any(|h| ai_key_cell(h).is_some());
     let mut marked = false;
     let rows: Vec<Vec<String>> = results
         .iter()
@@ -1545,22 +1681,30 @@ pub fn render_health_table(results: &[PodHealth]) -> String {
                     c.to_string()
                 }
             });
-            vec![
+            let mut row = vec![
                 h.name.clone(),
                 h.status.label().to_string(),
                 f.map(DeepFacts::gpu_label).unwrap_or_else(|| "-".into()),
                 or_dash(f.and_then(|f| f.driver().map(String::from))),
                 or_dash(cuda),
                 or_dash(f.and_then(DeepFacts::hf_mbps).map(|m| format!("{m:.1} MB/s"))),
-                h.notes(),
-            ]
+            ];
+            if keyed {
+                row.push(or_dash(ai_key_cell(h)));
+            }
+            row.push(h.notes());
+            row
         })
         .collect();
-    let mut out = table::render(
-        &["NAME", "RESULT", "GPUS", "DRIVER", "CUDA", "NET", "NOTES"],
-        &[Align::Left, Align::Left, Align::Left, Align::Left, Align::Left, Align::Right, Align::Left],
-        &rows,
-    );
+    let mut headers = vec!["NAME", "RESULT", "GPUS", "DRIVER", "CUDA", "NET"];
+    let mut aligns = vec![Align::Left, Align::Left, Align::Left, Align::Left, Align::Left, Align::Right];
+    if keyed {
+        headers.push("AI KEY");
+        aligns.push(Align::Left);
+    }
+    headers.push("NOTES");
+    aligns.push(Align::Left);
+    let mut out = table::render(&headers, &aligns, &rows);
     if marked {
         out.push_str(TORCH_CUDA_NOTE);
         out.push('\n');
@@ -1624,7 +1768,43 @@ pub fn render_summary(results: &[PodHealth]) -> Vec<String> {
             software.join(", ")
         ));
     }
+    let keys: Vec<&str> =
+        results.iter().filter(|h| h.failure_kind() == Some(FailureKind::Key)).map(|h| h.name.as_str()).collect();
+    if !keys.is_empty() {
+        lines.push(format!(
+            "AI key failure, not the machine: {} — NOTES (or -v) says what to run; a machine is never replaced for its key.",
+            keys.join(", ")
+        ));
+    }
     lines
+}
+
+/// `pods test --keys`: `NAME  RESULT  AI KEY  HF  NOTES` ([`ai_key_cell`], [`hf_token_cell`]),
+/// every check with `verbose`, then the summary lines. Pure.
+pub fn render_key_report(results: &[PodHealth], verbose: bool) -> String {
+    let or_dash = |s: Option<String>| s.unwrap_or_else(|| "-".into());
+    let rows: Vec<Vec<String>> = results
+        .iter()
+        .map(|h| vec![h.name.clone(), h.status.label().to_string(), or_dash(ai_key_cell(h)), or_dash(hf_token_cell(h)), h.notes()])
+        .collect();
+    let mut out = table::render(
+        &["NAME", "RESULT", "AI KEY", "HF", "NOTES"],
+        &[Align::Left, Align::Left, Align::Left, Align::Left, Align::Left],
+        &rows,
+    );
+    if verbose {
+        for h in results {
+            out.push('\n');
+            out.push_str(&render_checks(h));
+        }
+    }
+    out.push('\n');
+    // A shared IP among machines that couldn't be reached says nothing about their keys.
+    for line in render_summary(results).into_iter().filter(|l| !l.starts_with("same host?")) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
 }
 
 /// The whole human report: table, per-pod checks with `verbose`, then the summary lines.
@@ -3289,6 +3469,8 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
             .arg(deep_check_inner_command())
             .env("PATH", path)
             .env("HOME", &dir)
+            .env_remove("OPENROUTER_API_KEY")
+            .env_remove("HF_TOKEN")
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -3353,6 +3535,8 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
             .arg(deep_check_inner_command())
             .env("PATH", path)
             .env("HOME", &home)
+            .env_remove("OPENROUTER_API_KEY")
+            .env_remove("HF_TOKEN")
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -3392,6 +3576,8 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
             assert_eq!(check(&checks, name).status, Status::Pass, "{name}: {checks:#?}");
         }
         assert_eq!(check(&checks, "vscode").detail, "server 2a59476; 3 extensions; python /opt/arena-env/bin/python");
+        // The AI keys' section ran too: none exported here, so each says missing.
+        assert_eq!((f.openrouter.and_then(|k| k.set), f.hf.and_then(|k| k.set)), (Some(false), Some(false)), "{stdout}");
     }
 
     /// A stand-in `torch` for the script test (first on PYTHONPATH): one CUDA device that is a
@@ -3563,6 +3749,8 @@ class CDLL:
                 .arg(deep_check_inner_command())
                 .env("PATH", path)
                 .env("HOME", &dir)
+                .env_remove("OPENROUTER_API_KEY")
+                .env_remove("HF_TOKEN")
                 .env("PYTHONPATH", dir.join("pylib"))
                 .env("ARENA_TEST_NVIDIA_VERSION_FILE", &version)
                 .env_remove("FAKE_LIBCUDA")

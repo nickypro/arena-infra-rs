@@ -19,7 +19,7 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
-## 2026-11-02 · arena 2.10: the coding agents on each machine know which Python to use; `uv` on every shell's PATH
+## 2026-11-02 · arena 2.11: the coding agents on each machine know which Python to use; `uv` on every shell's PATH
 - Setup writes a short block into each machine's `~/.claude/CLAUDE.md` (Claude Code) and
   `~/.codex/AGENTS.md` (Codex): the course env it finds there (`/opt/arena-env` on RunPod and
   Vast, `/root/ARENA_materials/.venv` on Hetzner), how to install into it, and where the repo is.
@@ -39,6 +39,33 @@ earlier).
 
 ### Config
 - `AGENT_NOTES` (new; on by default): `0` leaves the notes out of setup.
+
+## 2026-11-02 · arena 2.10: `pods test` checks that each machine's AI key works
+- **`pods test --deep` now checks each machine's OpenRouter key and Hugging Face token**, as the
+  participant's shell has them: one free call each (OpenRouter's `GET /api/v1/key`, Hugging
+  Face's `whoami-v2`), compared with the keys CSV (and `HF_TOKEN`) by fingerprint. The secret
+  never leaves the machine and is printed nowhere. Each verdict says what to run:
+  - FAIL: the key is missing (but the keys CSV, or the machine's owner, should have one),
+    rejected (401), paused, or out of money. A paused key and a deleted one get the same 401,
+    so with a provisioning key the check reads OpenRouter's listing to say which fix it is.
+  - WARN: it isn't the keys CSV's key (an old one after a rotate or handover:
+    `pods copy-keys`), it has under a tenth of its cap left, or OpenRouter couldn't be reached.
+  - A staff `@` box, or a fleet with no keys, gets a note and no verdict.
+- The table gets an AI KEY column (`$4.97 left`, `rejected`, `missing`) once a key was judged;
+  `-v` and `--json` have `ai_key` and `hf_token` checks, and `facts.openrouter` / `facts.hf`.
+- **`pods test --deep` exits non-zero on a key FAIL**, so the daily health line fails on a dead
+  key too. A dead key is never the machine's fault: `up --check` never replaces a machine for it,
+  never retries it, never remembers its host as bad, and the machine's passing check still
+  clears a bad-host record.
+- **`pods test --keys`** checks only the keys: no torch, no GPU, a few seconds per machine. It
+  shows a `NAME RESULT AI KEY HF NOTES` table, exits non-zero on a FAIL, and nothing waits on a
+  machine outside the cohort.
+- `pods up --check` checks each machine's keys once it has copied them. It says
+  `[apple] AI key ✓ ok, $4.97 of $5.00 left`, or the FAIL and what to run, and keeps the machine.
+- The dashboard: its test (`e`) adds the key verdict to the torch line, its deep check (`d`)
+  judges the keys like `pods test --deep`, and the detail view has an `ai check:` line. The
+  public snapshot's issue for it is `AI key`.
+- `config check` says what the key checks compare with.
 
 ## 2026-10-31 · `arena backups` no longer misses a backup that's running
 - `arena backups` and the dashboard's backups screen tell a running backup by its lock (a pod's

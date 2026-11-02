@@ -1166,22 +1166,27 @@ pub(crate) enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Health check: torch version, or --deep GPU tests (read-only)
+    /// Health check: torch, --deep GPU tests, or --keys AI keys (read-only)
     ///
     /// --deep: per-GPU CUDA op, driver vs MIN_DRIVER_VERSION, device count, GPU↔GPU copy + NCCL,
-    /// HF download speed, disk, load, maintenance window. One pass/warn/fail row per pod; exits
-    /// non-zero on any FAIL. No targets (or --all) = this cohort's pods with an SSH endpoint
-    /// (not @ staff entries; --include-non-cohort: every pod).
-    #[command(verbatim_doc_comment)]
+    /// HF download speed, disk, load, maintenance window, and the AI keys. One pass/warn/fail row
+    /// per pod; exits non-zero on any FAIL. --keys: only whether each machine's OpenRouter key
+    /// and HF token work and are the keys CSV's / config's (seconds per machine, no GPU work).
+    /// No targets (or --all) = this cohort's pods with an SSH endpoint (not @ staff entries;
+    /// --include-non-cohort: every pod).
+    #[command(verbatim_doc_comment, group(clap::ArgGroup::new("checks").args(["deep", "keys"])))]
     Test {
         /// Run the deep check instead of the torch-version check.
         #[arg(long)]
         deep: bool,
+        /// Only check the machines' AI keys (OpenRouter key, HF token): fast, no torch or GPU.
+        #[arg(long)]
+        keys: bool,
         /// Emit per-pod `{name, provider, status, checks[], facts}` as JSON on stdout.
-        #[arg(long, requires = "deep")]
+        #[arg(long, requires = "checks")]
         json: bool,
         /// Print every check of every pod, not just the table.
-        #[arg(short, long, requires = "deep")]
+        #[arg(short, long, requires = "checks")]
         verbose: bool,
         #[command(flatten)]
         cohort: CohortScope,
