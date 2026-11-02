@@ -48,6 +48,8 @@ mod money;
 mod offers;
 #[cfg(test)]
 mod output_test;
+#[cfg(test)]
+mod update_output_tests;
 mod reap;
 mod resolve;
 mod spend;
@@ -238,13 +240,14 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<St
     let client = up::client();
     let found = up::check(&client, up::REPO_API, installed, CHANGELOG).await.map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
     if !found.newer {
-        println!("arena {installed} is up to date (the latest release is {}).", found.release.tag);
+        arena_core::out!(Out, "arena {installed} is up to date (the latest release is {}).", found.release.tag);
         return Ok(());
     }
-    println!("Update available: arena {installed} → {} ({})", found.release.version, found.release.tag);
+    arena_core::out!(Out, "Update available: arena {installed} → {} ({})", arena_core::out::bold(found.release.version), found.release.tag);
     if check_only {
-        println!("What changed, from the release's CHANGELOG.md (not verified: `arena update --dry-run` verifies it):\n");
-        print!("{}", found.changes);
+        arena_core::out!(Detail, "What changed, from the release's CHANGELOG.md (not verified: `arena update --dry-run` verifies it):\n");
+        arena_core::out!(Brief, "What changed (not verified; -v: each entry in full):");
+        say_changes(&found.changes);
         return Err(UpdateAvailable.into());
     }
     // Where this binary really is (`/usr/local/bin/arena` is a link into ~/.cargo/bin on prod).
@@ -258,29 +261,35 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<St
     let pinned = pins.is_some();
     let provenance = match pins {
         Some(pins) => {
-            eprintln!("\n{SKIP_ATTESTATION_WARNING}");
+            arena_core::out!(Err, "\n{SKIP_ATTESTATION_WARNING}");
             up::Provenance::Pinned(pins)
         }
         None => up::Provenance::Verify { source: &github, expected: attest::RELEASE },
     };
-    println!("\nDownloading {} for {target} …", found.release.tag);
+    arena_core::out!(Detail, "");
+    arena_core::out!(Out, "Downloading {} for {target} …", found.release.tag);
     let staged = up::fetch(&client, &found.release, target, dir, &provenance).await.map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
     // The changelog is shown only now, with what can be said of it: before, it was the
     // release's word alone, and its "Action needed" lines are instructions to an operator.
     let changelog = up::changelog_provenance(staged.proof.as_ref(), found.changelog_sha256.as_deref()).map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
     match &staged.proof {
         Some(proof) => {
-            println!("Both binaries match the release's SHA256SUMS, and one build-provenance attestation names both");
-            println!("(Sigstore, verified here): {proof}.");
+            arena_core::out!(Detail, "Both binaries match the release's SHA256SUMS, and one build-provenance attestation names both");
+            arena_core::out!(Detail, "(Sigstore, verified here): {proof}.");
+            arena_core::out!(Brief, "{}", arena_core::out::ok("verified: SHA256SUMS and the build-provenance attestation (Sigstore); it runs here"));
         }
-        None => println!("Both binaries match the release's SHA256SUMS and the SHA-256s given (provenance NOT checked here)."),
+        None => {
+            arena_core::out!(Detail, "Both binaries match the release's SHA256SUMS and the SHA-256s given (provenance NOT checked here).");
+            arena_core::out!(Brief, "{}", arena_core::out::warn("SHA256SUMS and the SHA-256s given match — provenance NOT checked here; it runs here"));
+        }
     }
-    println!("The new arena runs here.");
-    println!("\nWhat changed, from the release's CHANGELOG.md ({changelog}):\n");
-    print!("{}", found.changes);
-    println!();
+    arena_core::out!(Detail, "The new arena runs here.");
+    arena_core::out!(Detail, "\nWhat changed, from the release's CHANGELOG.md ({changelog}):\n");
+    arena_core::out!(Brief, "What changed ({changelog}; -v: each entry in full):");
+    say_changes(&found.changes);
+    arena_core::out!(Detail, "");
     if dry_run {
-        println!("--dry-run: nothing installed.");
+        arena_core::out!(Out, "--dry-run: nothing installed.");
         return Ok(());
     }
     let what = format!(
@@ -289,13 +298,13 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<St
         if pinned { " (provenance NOT checked here)" } else { "" },
         dir.display()
     );
-    if !confirm(yes, &what)? {
-        println!("Not installed.");
+    if !confirm_brief(yes, &what, &what)? {
+        arena_core::out!(Out, "Not installed.");
         return Ok(());
     }
     staged.install().map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
-    println!("Installed arena {} in {}.", found.release.version, dir.display());
-    println!("Roll back: cd {} && mv -f arena.prev arena && mv -f arena-tui.prev arena-tui", dir.display());
+    arena_core::out!(Out, "{}", arena_core::out::ok(format!("Installed arena {} in {}.", arena_core::out::bold(found.release.version), dir.display())));
+    arena_core::out!(Out, "Roll back: cd {} && mv -f arena.prev arena && mv -f arena-tui.prev arena-tui", dir.display());
     let stale = up::stale_processes(std::path::Path::new("/proc"), &dir.join("arena-tui"));
     if !stale.is_empty() {
         let started = |t: Option<std::time::SystemTime>| {
@@ -303,9 +312,32 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<St
                 .map_or_else(|| "start unknown".into(), |d| format!("started {}", arena_core::snapshot::rfc3339(d.as_secs())))
         };
         let list: Vec<String> = stale.iter().map(|(pid, t)| format!("pid {pid} ({})", started(*t))).collect();
-        println!("{} dashboard(s) still run the old build — restart them: {}", stale.len(), list.join(", "));
+        arena_core::out!(Out, "{}", arena_core::out::warn(format!("{} dashboard(s) still run the old build — restart them: {}", stale.len(), list.join(", "))));
     }
     Ok(())
+}
+
+/// `update`'s changelog of the release ([`arena_core::update::describe_changes`]): in full at
+/// `-v`; by default its action-needed and config lines, then each entry's heading alone.
+fn say_changes(changes: &str) {
+    changes.lines().for_each(|l| arena_core::out!(Detail, "{l}"));
+    brief_changes(changes).iter().for_each(|l| arena_core::out!(Brief, "{l}"));
+}
+
+/// [`say_changes`]'s default lines: what comes before the first entry (`Action needed:`,
+/// `Config changes:`, their bullets), then `  · HEADING` per entry. Pure.
+fn brief_changes(changes: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut entries = false;
+    for l in changes.lines() {
+        if let Some(h) = l.strip_prefix("## ") {
+            entries = true;
+            out.push(format!("  · {h}"));
+        } else if !entries && !l.trim().is_empty() {
+            out.push(l.to_string());
+        }
+    }
+    out
 }
 
 /// What `main` ends with for `result`: success, [`NO_TERMINAL_EXIT`] for a refused
@@ -491,8 +523,12 @@ async fn run() -> Result<()> {
             }
             let flags = money::BalanceFlags { json, check, no_live, verbose: cli.verbose };
             let out = money::balance_report(provider.unwrap().as_ref(), &cfg, &bal, flags, now).await?;
-            out.stderr.iter().for_each(|l| eprintln!("{l}"));
-            print!("{}", out.stdout);
+            out.stderr.iter().for_each(|l| arena_core::out!(Err, "{l}"));
+            if json {
+                print!("{}", out.stdout);
+            } else {
+                out.stdout.lines().for_each(|l| arena_core::out!(Out, "{l}"));
+            }
             if out.code != 0 {
                 use std::io::Write;
                 std::io::stdout().flush()?;
@@ -511,10 +547,14 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
             let keys = openrouter_client(&cfg);
-            let flags = spend::SpendFlags { by_machine: by == "machine", since, csv, json };
+            let flags = spend::SpendFlags { by_machine: by == "machine", since, csv, json, verbose: arena_core::out::verbose() };
             let out = spend::spend_report(fleet.as_ref(), &cfg, &ctx, keys.as_ref().map(|k| k as &dyn arena_core::openrouter::KeyApi), &flags, now).await?;
-            out.stderr.iter().for_each(|l| eprintln!("{l}"));
-            print!("{}", out.stdout);
+            out.stderr.iter().for_each(|l| arena_core::out!(Err, "{l}"));
+            if flags.json || flags.csv {
+                print!("{}", out.stdout);
+            } else {
+                out.stdout.lines().for_each(|l| arena_core::out!(Out, "{l}"));
+            }
             Ok(())
         }
         Cmd::Gpus { json } => offers::handle_gpus(&cfg, &provider_name, json).await,
@@ -540,7 +580,7 @@ async fn handle_api(cmd: ApiCmd, cfg: &Config) -> Result<()> {
                 .get(base.key)
                 .filter(|k| !k.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("{} isn't set (see `arena config check`)", base.key))?;
-            eprintln!("GET {url} ({}{})", base.provider, if raw { ", raw" } else { ", secrets redacted" });
+            arena_core::out!(ErrDetail, "GET {url} ({}{})", base.provider, if raw { ", raw" } else { ", secrets redacted" });
             let (status, body) = apiget::get_for(&base, url.clone(), key).await?;
             if limits {
                 // Counts only — the headers carry no secret, and the body isn't printed.

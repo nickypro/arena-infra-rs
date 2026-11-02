@@ -89,7 +89,7 @@ pub(crate) fn handle_config(cmd: ConfigCmd, cfg: &Config, picked: &Picked) -> Re
             std::fs::write(config_path, updated)
                 .with_context(|| format!("writing {}", config_path.display()))?;
             // Never echo the value (it may be a secret).
-            println!("set {key} in {}", config_path.display());
+            arena_core::out!(Out, "set {key} in {}", config_path.display());
             Ok(())
         }
     }
@@ -268,13 +268,6 @@ fn config_which(cfg: &Config, picked: &Picked) -> Result<()> {
         .map(|m| !m.permissions().readonly())
         .unwrap_or(false);
 
-    println!("Active config: {}", abs.display());
-    println!(
-        "  {}  ·  {}",
-        if readable { "✓ readable" } else { "✗ not readable" },
-        if writable { "writable" } else { "read-only (config set can't write here)" },
-    );
-    println!("  source: {}", picked.config_source.describe());
     let canonical = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let lost = arena_core::config::passed_over(
         config_path,
@@ -284,30 +277,101 @@ fn config_which(cfg: &Config, picked: &Picked) -> Result<()> {
         std::path::Path::is_file,
         |a, b| canonical(a) == canonical(b),
     );
-    for l in lost {
-        println!("  ⚠ {l}");
-    }
-    println!("\nLoaded: provider {} ({}) · {} key(s) · {} machine name(s)",
-        picked.provider, picked.provider_from(), cfg.values.len(), cfg.machine_names.len());
-
-    println!("\nFiles kept beside the config (else found in the current directory, as before):");
-    for line in fleet_file_rows(cfg) {
-        println!("{line}");
-    }
-
     let (from_env, ignored) = env_keys(cfg, |k| std::env::var(k).is_ok());
-    if !ignored.is_empty() {
-        println!("\nIgnored from the environment (file-only, {}*): {}", Config::FILE_ONLY_PREFIX, ignored.join(", "));
-    }
-    if from_env.is_empty() {
-        println!("\nEnvironment overrides: none (all values come from the file)");
-    } else {
-        println!("\nEnvironment overrides in effect (env wins over the file):");
-        for k in from_env {
-            println!("  • {k}");
-        }
+    let which = Which { abs: &abs, readable, writable, lost: &lost, from_env: &from_env, ignored: &ignored };
+    for (to, line) in which_lines(cfg, picked, &which) {
+        arena_core::out::emit(to, &line);
     }
     Ok(())
+}
+
+/// What `config which` read off this box: the config file's real path and access, the files
+/// that lost to it, and the keys the environment gives or is ignored for ([`env_keys`]).
+struct Which<'a> {
+    abs: &'a std::path::Path,
+    readable: bool,
+    writable: bool,
+    lost: &'a [String],
+    from_env: &'a [&'a str],
+    ignored: &'a [&'a str],
+}
+
+/// `config which`'s lines: at `-v` as before — the file, how it's reached, what loaded, the fleet's
+/// files, the environment — and by default the file, what loaded, and only what needs a look:
+/// a file that isn't readable or writable, one that lost to it, a fleet file's ⚠, the keys the
+/// environment overrides or is ignored for. Pure.
+fn which_lines(cfg: &Config, picked: &Picked, w: &Which) -> Vec<(arena_core::out::To, String)> {
+    use arena_core::out::{bold, fail, warn, To};
+    let mut out: Vec<(To, String)> = Vec::new();
+    let mut detail = |s: String| out.push((To::Detail, s));
+    detail(format!("Active config: {}", w.abs.display()));
+    detail(format!(
+        "  {}  ·  {}",
+        if w.readable { "✓ readable" } else { "✗ not readable" },
+        if w.writable { "writable" } else { "read-only (config set can't write here)" },
+    ));
+    detail(format!("  source: {}", picked.config_source.describe()));
+    for l in w.lost {
+        detail(format!("  ⚠ {l}"));
+    }
+    let names = cfg.machine_names.len();
+    detail(format!(
+        "\nLoaded: provider {} ({}) · {} key(s) · {names} machine name(s)",
+        picked.provider,
+        picked.provider_from(),
+        cfg.values.len()
+    ));
+    detail("\nFiles kept beside the config (else found in the current directory, as before):".into());
+    let files = fleet_file_rows(cfg);
+    for line in &files {
+        detail(line.clone());
+    }
+    if !w.ignored.is_empty() {
+        detail(format!("\nIgnored from the environment (file-only, {}*): {}", Config::FILE_ONLY_PREFIX, w.ignored.join(", ")));
+    }
+    if w.from_env.is_empty() {
+        detail("\nEnvironment overrides: none (all values come from the file)".into());
+    } else {
+        detail("\nEnvironment overrides in effect (env wins over the file):".into());
+        for k in w.from_env {
+            detail(format!("  • {k}"));
+        }
+    }
+    let mut brief = |s: String| out.push((To::Brief, s));
+    let access = match (w.readable, w.writable) {
+        (true, true) => String::new(),
+        (true, false) => " (read-only: `config set` can't write here)".into(),
+        (false, _) => format!(" {}", fail("not readable")),
+    };
+    let source = match picked.config_source {
+        ConfigSource::Flag | ConfigSource::Env => format!(" · {}", picked.config_source.describe()),
+        _ => String::new(),
+    };
+    brief(format!("{}{source}{access}", bold(w.abs.display())));
+    let from = match picked.provider_source {
+        ProviderSource::Default => " (default)",
+        _ => "",
+    };
+    brief(format!(
+        "provider {}{from} · {} key{} · {names} machine name{}",
+        bold(&picked.provider),
+        cfg.values.len(),
+        if cfg.values.len() == 1 { "" } else { "s" },
+        if names == 1 { "" } else { "s" }
+    ));
+    for l in w.lost {
+        brief(warn(l));
+    }
+    for f in files.iter().filter(|f| f.contains('⚠')) {
+        brief(warn(f.replacen('⚠', "", 1).split_whitespace().collect::<Vec<_>>().join(" ")));
+    }
+    if !w.from_env.is_empty() {
+        brief(format!("from the environment (wins over the file): {}", w.from_env.join(", ")));
+    }
+    if !w.ignored.is_empty() {
+        brief(format!("ignored from the environment (file-only): {}", w.ignored.join(", ")));
+    }
+    out
 }
 
 /// `config which`'s rows for the files a fleet keeps beside its config: `keys/`, the plan, and
@@ -758,19 +822,136 @@ fn ask_ai_rows(cfg: &Config, env: &arena_core::ask::AiEnv) -> (Vec<String>, Vec<
 /// Print a config checklist for the selected provider + proxy + backup, never showing
 /// secret values. Returns an error if a required key is missing.
 /// `extra`: rows looked up live before the check ([`hetzner_image_rows`]), after the report.
+/// By default only what's wrong — the ✗, ‼ (the report's ⚠) and `?` rows, each with its `└`
+/// lines — then the verdict; `-v` prints the whole report as before ([`check_lines`]).
 pub(crate) fn config_check(cfg: &Config, provider_name: &str, extra: &[String]) -> Result<()> {
-    let (report, missing) = config_report(cfg, provider_name);
-    print!("{report}");
+    use arena_core::out::{bold, emit, green, To};
+    let (mut report, missing) = config_report(cfg, provider_name);
     for l in extra {
-        println!("{l}");
+        report.push_str(l);
+        report.push('\n');
+    }
+    for (to, line) in check_lines(&report) {
+        emit(to, &line);
     }
     if missing.is_empty() {
-        println!("\nOK — required keys for provider `{provider_name}` are present.");
+        emit(To::Detail, "");
+        emit(To::Out, &format!("{} — required keys for provider `{provider_name}` are present.", bold(green("OK"))));
         Ok(())
     } else {
         // Set but invalid counts too (each such entry says why): "missing" alone misled.
         anyhow::bail!("missing or invalid keys: {}", missing.join(", "))
     }
+}
+
+/// How a `config check` row reads at a glance, by its mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    /// `✗`: fails the check (or a required value missing).
+    Fail,
+    /// `⚠`/`‼`/`warning:`: advice that needs action.
+    Warn,
+    /// `?`: couldn't be looked up.
+    Unknown,
+    /// `✓`, `·`, or no mark: fine, or just information.
+    Fine,
+}
+
+/// A line of `config check`'s report: a section heading, a blank, a row with its mark, or a
+/// `└` line under the row before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Row {
+    Head,
+    Blank,
+    Item(Mark),
+    Under,
+}
+
+/// What `line` is ([`Row`]): a heading starts at the margin, a row is indented, its mark first
+/// (`  ✓ KEY  value`) — or, in the create spec's rows (`  GPU_TYPE / …  ✗ (missing)`), after
+/// the label; a `warning:` row is a warning. Pure.
+fn row_of(line: &str) -> Row {
+    let t = line.trim_start();
+    if t.is_empty() {
+        return Row::Blank;
+    }
+    if t.len() == line.len() {
+        return Row::Head;
+    }
+    match t.chars().next() {
+        Some('└') => Row::Under,
+        Some('✗') => Row::Item(Mark::Fail),
+        Some('⚠' | '‼') => Row::Item(Mark::Warn),
+        Some('?') => Row::Item(Mark::Unknown),
+        Some('✓' | '·') => Row::Item(Mark::Fine),
+        _ if t.starts_with("warning:") => Row::Item(Mark::Warn),
+        _ if t.contains(" ✗ ") => Row::Item(Mark::Fail),
+        _ if t.contains(" ⚠ ") => Row::Item(Mark::Warn),
+        _ => Row::Item(Mark::Fine),
+    }
+}
+
+/// A problem row as the default output says it: its mark first (`✗`, `‼`, `?`), then its words
+/// with the mark taken out and the column padding closed up —
+/// `  ⚠ persistent volume          0GB — …` → `‼ persistent volume 0GB — …`. Pure.
+fn brief_row(line: &str, mark: Mark) -> String {
+    use arena_core::out::{bang, cross, yellow};
+    let t = line.trim();
+    let body = t
+        .strip_prefix("warning:")
+        .or_else(|| t.strip_prefix(['✗', '⚠', '‼', '?']))
+        .map(str::to_string)
+        .unwrap_or_else(|| t.replacen(" ✗ ", " ", 1).replacen(" ⚠ ", " ", 1));
+    let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sym = match mark {
+        Mark::Fail => cross(),
+        Mark::Unknown => yellow("?"),
+        Mark::Warn | Mark::Fine => bang(),
+    };
+    format!("{sym} {body}")
+}
+
+/// `line` with its mark coloured (✓ green, ✗ red, ⚠ ‼ ? yellow) and a heading bold — the same
+/// words; [`arena_core::out::emit`] takes the colour off where the stream has none. Pure but for
+/// whether colour is on.
+fn styled(line: &str) -> String {
+    use arena_core::out::{bold, green, red, yellow};
+    if row_of(line) == Row::Head {
+        return bold(line);
+    }
+    let indent = line.len() - line.trim_start().len();
+    let (pad, rest) = line.split_at(indent);
+    let mut chars = rest.chars();
+    let paint = match chars.next() {
+        Some('✓') => green("✓"),
+        Some('✗') => red("✗"),
+        Some(c @ ('⚠' | '‼' | '?')) => yellow(c),
+        _ => return line.to_string(),
+    };
+    format!("{pad}{paint}{}", chars.as_str())
+}
+
+/// `config check`'s report as it's printed, line by line: every line as before at `-v`
+/// ([`arena_core::out::To::Detail`]), and by default ([`arena_core::out::To::Brief`]) only the
+/// rows that are wrong ([`brief_row`]) with their `└` lines. Pure.
+fn check_lines(report: &str) -> Vec<(arena_core::out::To, String)> {
+    use arena_core::out::To;
+    let mut out = Vec::new();
+    // Whether the row the `└` lines hang off is shown by default.
+    let mut shown = false;
+    for line in report.lines() {
+        out.push((To::Detail, styled(line)));
+        match row_of(line) {
+            Row::Item(Mark::Fine) | Row::Head | Row::Blank => shown = false,
+            Row::Item(mark) => {
+                out.push((To::Brief, brief_row(line, mark)));
+                shown = true;
+            }
+            Row::Under if shown => out.push((To::Brief, format!("  {}", line.trim()))),
+            Row::Under => {}
+        }
+    }
+    out
 }
 
 /// [`config_check`]'s report — every section's rows — and what it fails on: the keys
@@ -1287,6 +1468,8 @@ pub(crate) fn bad_hosts_section(cfg: &Config, now: u64) -> Vec<String> {
 mod tests;
 #[cfg(test)]
 mod which_tests;
+#[cfg(test)]
+mod output_tests;
 
 #[cfg(test)]
 mod swap_row_tests {

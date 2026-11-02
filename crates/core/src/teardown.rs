@@ -160,6 +160,16 @@ impl Verdict {
             Verdict::Kept => "◷",
         }
     }
+
+    /// [`Verdict::glyph`] coloured: ✓ green, ✗ red, ? yellow (plain where colour is off).
+    pub fn styled(self) -> String {
+        match self {
+            Verdict::Clear => crate::out::green(self.glyph()),
+            Verdict::Remaining => crate::out::red(self.glyph()),
+            Verdict::Unknown => crate::out::yellow(self.glyph()),
+            Verdict::Skipped | Verdict::Kept => self.glyph().to_string(),
+        }
+    }
 }
 
 /// What a checklist item covers.
@@ -1509,35 +1519,74 @@ fn entry_lines(entries: &[Entry]) -> Vec<String> {
 }
 
 impl Report {
-    /// The checklist as text: one `✓ ✗ ? –` line per item, what's still there under it, its
-    /// notes and fix commands, then the verdict.
+    /// The checklist as text, as `-v` prints it: one `✓ ✗ ? – ◷` line per item, what's still
+    /// there under it, its notes and fix commands, then the verdict ([`Report::lines`]).
     pub fn render(&self) -> String {
-        let mut out = format!("Teardown check for cohort `{}` (read-only: nothing is changed)\n\n", self.cohort);
+        self.text(true)
+    }
+
+    /// The checklist as the default output prints it: only what's wrong — each item left (`✗`)
+    /// or that couldn't be checked (`?`) with what's there, its notes and its fix — the kept
+    /// (`◷`) and not applicable (`–`) ones a line each, cron and at with what they couldn't
+    /// see, then the verdict ([`Report::lines`]).
+    pub fn render_brief(&self) -> String {
+        self.text(false)
+    }
+
+    fn text(&self, verbose: bool) -> String {
+        self.lines().into_iter().filter(|(to, _)| to.shows(verbose)).map(|(_, l)| format!("{l}\n")).collect()
+    }
+
+    /// The checklist's lines, each at the level it shows at (docs/OUTPUT.md): [`Report::render`]'s
+    /// at `-v`, [`Report::render_brief`]'s by default. The marks and the verdict coloured where
+    /// the stream takes colour ([`crate::out`]).
+    pub fn lines(&self) -> Vec<(crate::out::To, String)> {
+        use crate::out::{bold, green, red, To};
+        let mut out = vec![
+            (To::Detail, format!("Teardown check for cohort `{}` (read-only: nothing is changed)", self.cohort)),
+            (To::Detail, String::new()),
+        ];
         for item in &self.items {
-            out.push_str(&format!("{} {}: {}\n", item.verdict.glyph(), item.title(), item.summary));
+            // What's wrong shows by default, under it what's there and how to clean it up; a
+            // kept item is a line (it's on purpose), and so is one not checked (`–`: no key,
+            // not installed — something could be there unseen, and the verdict counts them);
+            // the clear ones only at -v.
+            // The schedulers keep their line and its caveat even when clear: what this user's
+            // crontab and atq can't see (root's, /etc/cron.d) could still recreate a pod.
+            let wrong = matches!(item.verdict, Verdict::Remaining | Verdict::Unknown);
+            let scheduler = matches!(item.area, Area::Cron | Area::At);
+            let head = if item.verdict == Verdict::Clear && !scheduler { To::Detail } else { To::Out };
+            let under = if wrong { To::Out } else { To::Detail };
+            out.push((head, format!("{} {}: {}", item.verdict.styled(), item.title(), item.summary)));
             for l in entry_lines(&item.entries) {
-                out.push_str(&format!("      {l}\n"));
+                out.push((under, format!("      {l}")));
             }
             for n in &item.notes {
-                out.push_str(&format!("    note: {n}\n"));
+                out.push((if scheduler { To::Out } else { under }, format!("    note: {n}")));
             }
             for f in &item.fix {
-                out.push_str(&format!("    fix:  {f}\n"));
+                out.push((under, format!("    fix:  {f}")));
             }
         }
-        out.push('\n');
-        out.push_str(&self.verdict_line());
-        out.push('\n');
+        out.push((To::Detail, String::new()));
+        let verdict = self.verdict_line();
+        let verdict = match verdict.split_once(':') {
+            Some((word, rest)) if self.clear => format!("{}:{rest}", bold(green(word))),
+            Some((word, rest)) => format!("{}:{rest}", bold(red(word))),
+            None => verdict,
+        };
+        out.push((To::Out, verdict));
         for line in crate::balance::teardown_info(&self.balance, self.balance_at) {
-            out.push_str(&line);
-            out.push('\n');
+            out.push((To::Detail, line));
         }
         if !self.clear {
-            out.push_str(
+            out.push((
+                To::Detail,
                 "Suggested order: cron and at first (so nothing recreates a pod), then keys, pods, volumes, \
                  and `arena proxy apply` last — then re-run `arena teardown --check`. The backup archive goes \
-                 only after its retention date (ARCHIVE_KEEP_UNTIL).\n",
-            );
+                 only after its retention date (ARCHIVE_KEEP_UNTIL)."
+                    .into(),
+            ));
         }
         out
     }

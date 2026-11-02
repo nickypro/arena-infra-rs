@@ -191,7 +191,17 @@ pub(crate) async fn handle_list(
     let replies = each_reply(&remote, &targets, &jobs::list_command(), READ_TIMEOUT, jobs::parse_list).await;
     let pods: Vec<(String, Result<Vec<JobInfo>, String>)> = targets.into_iter().map(|(n, _)| n).zip(replies).collect();
     let (text, failed) = jobs::render_jobs(&pods, only);
-    text.lines().for_each(say);
+    // The tally adds nothing when every pod said it has none: `-v`'s then.
+    let none = failed == 0 && text.trim_end().ends_with("\n0 job(s), 0 running");
+    let lines: Vec<&str> = text.lines().collect();
+    let tally_at = if none { lines.len().saturating_sub(2) } else { lines.len() };
+    for (i, l) in lines.iter().enumerate() {
+        if i < tally_at {
+            say(l);
+        } else {
+            arena_core::out!(Detail, "{l}");
+        }
+    }
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed");
     }
@@ -228,7 +238,7 @@ pub(crate) async fn handle_kill(
     let pods: Vec<_> = targets.into_iter().map(|(n, _)| n).zip(replies).collect();
     let (lines, failed) = jobs::render_kill(&pods, id);
     lines.iter().for_each(|l| say(l));
-    say("A stopped job reads `exit 143 (SIGTERM)` in `arena pods jobs` once it has exited.");
+    arena_core::out!(Detail, "A stopped job reads `exit 143 (SIGTERM)` in `arena pods jobs` once it has exited.");
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed");
     }
@@ -682,6 +692,30 @@ mod tests {
         for port in [22001, 22002, 22003] {
             assert_eq!(execs(&fake, port), [(jobs::list_command(), Some(READ_TIMEOUT))]);
         }
+    }
+
+    /// Golden (docs/OUTPUT.md): `pods jobs` on pods that have none says so a line each; the
+    /// `0 job(s), 0 running` tally adds nothing then, so it's `-v`'s. With jobs, it stays.
+    #[tokio::test(start_paused = true)]
+    async fn jobs_output_default_and_verbose() {
+        let mut out = Vec::new();
+        for verbose in [false, true] {
+            let fake = Arc::new(FakeRemote::new());
+            for port in [22001, 22002] {
+                fake.script(&host(port), [FakeReply::stdout(&list_reply(&[]))]);
+            }
+            let sel = Selected::all(fleet()[..2].to_vec());
+            let run = async { handle_list(fake.clone(), &cfg(), &sel, None, &mut |l| arena_core::out!(Out, "{l}")).await };
+            out.push(crate::output_test::rendered(verbose, &[], run).await);
+        }
+        assert_eq!(out[0], "devtest-apple: no jobs\ndevtest-bloom: no jobs\n");
+        assert_eq!(out[1], "devtest-apple: no jobs\ndevtest-bloom: no jobs\n\n0 job(s), 0 running\n");
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout(&list_reply(&[job_line("20261008-120000-nvidia-smi", "exit", Some(0), Some(77), "nvidia-smi")]))]);
+        let sel = Selected::all(fleet()[..1].to_vec());
+        let run = async { handle_list(fake.clone(), &cfg(), &sel, None, &mut |l| arena_core::out!(Out, "{l}")).await };
+        let quiet = crate::output_test::rendered(false, &[], run).await;
+        assert!(quiet.ends_with("\n\n1 job(s), 0 running\n"), "{quiet}");
     }
 
     #[tokio::test(start_paused = true)]
