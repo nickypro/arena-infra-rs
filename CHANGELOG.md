@@ -19,6 +19,26 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-02 · Output, phase 2: the other commands say less by default
+- **`pods setup`** (and the setup in `start`, `restart`, `reimage`, `replace`, `migrate`): a line per
+  pod as it ends, `[devtest-apple] setup ✓ (3m02s)` or `[devtest-bloom] FAILED setup: <why>
+  (retry: arena pods setup devtest-bloom)`, and `✓ 3 of 3 set up`. A log also gets
+  `[devtest-apple] setup…` as each starts (the dashboard shows it); a terminal shows one line,
+  updated in place. The tokens, budgets and API-key lines are `-v`'s. The prompt is one line
+  naming every pod (`Set up devtest-apple over SSH? [y/N]`), and `--dry-run` says the steps in a
+  line instead of printing each script. `--notes-only` does the same.
+- **`proxy plan` / `proxy apply`**: the changes (`+ ~ -`) and the counts. `proxy plan`'s nginx
+  config and the forwards that stay as they are moved to `-v`. A provider that didn't list is one
+  line with its reason, and pods skipped for one reason share a line (an `apply` says them too).
+  An `apply` with nothing to write (the proxy cron, every 5 minutes) is one line: `✓ proxy config
+  up to date (30 forward(s))`.
+- **`image list|build|prune`**: `list` is the table and its cost, plus a line when the images
+  aren't in use or a note on them. `build` asks in one line what it makes and what it costs, and
+  its dry run is that line. `prune` lists what goes and asks what it saves; what stays is `-v`'s.
+- **`plan check|show`**: the notes about what isn't wired yet moved to `-v`.
+- For each of these, `-v` prints what it printed before. `--json`, exit codes and the lines the
+  dashboard reads are the same.
+
 ## 2026-11-02 · arena 2.12: shorter output by default; `-v` shows the rest
 - **`pods up` and `pods create` say much less.** By default they print the plan in one line
   (or a short table for several options), the balance in one line, a one-line prompt with what
