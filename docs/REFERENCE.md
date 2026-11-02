@@ -1135,8 +1135,10 @@ works there ([What works where](#what-works-where), and below).
 
 A RunPod reimage keeps the pod's `startedAt`, and for 15–50 s RunPod still reports the old
 container's SSH port (live 2026-11-02). Until the pod's detail shows the new container (an uptime
-that started since the reimage, and lower than the old one's or on another port), arena lists the
-pod without an endpoint, so the settle wait and setup go to the new container.
+that started since the reimage, and lower than the old one's or with other ports), arena lists the
+pod without an endpoint, so the settle wait and setup go to the new container. A container started
+seconds before the reimage that gets every port back can't be told apart: the wait then times out
+and says to run `arena pods setup NAME`.
 
 #### Changing a pod's disk
 
