@@ -2145,7 +2145,7 @@ Per pod it runs mkdir → scp → check and stops at the first failure; the scp'
 what's sent — 10 min plus 1s per MB × pods (all copies share your uplink; `-r` counts the tree), or
 `--timeout <secs>` — and the mkdir/check get 20s each. Confirms first, in one line saying the type
 and both paths (`Copy file ./notes.md → /root/notes.md on devtest-alpha?`); a folder adds the `-r`
-nesting warning. `--dry-run` says the same line. It ends with `✓ copied to …`, and a line per pod
+nesting warning. `--dry-run` says the same line. It ends with `✓ copied … → … to …`, and a line per pod
 that failed with the command that copies it again. `-v` prints the preview (with the budget), each
 pod's `[i/n]` line and the tally, and the dry run's `scp` commands.
 

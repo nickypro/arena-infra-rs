@@ -182,7 +182,7 @@ pub(crate) async fn handle_copy(
     out!(Detail, "\nDone: {} copied, {failed} failed.", ok.len());
     // By default the pods it reached in a line (a failure has said its own, above).
     if !ok.is_empty() {
-        out!(Brief, "{}", out::ok(format!("copied to {}", crate::pods::setup::all_names(&ok))));
+        out!(Brief, "{}", out::ok(format!("copied {} → {} to {}", plan.local, plan.remote, crate::pods::setup::all_names(&ok))));
     }
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed to receive the file");

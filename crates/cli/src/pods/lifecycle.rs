@@ -579,7 +579,7 @@ pub(crate) async fn handle_start(
         return Ok(());
     }
     let what = format!("Will start {} stopped pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
-    if !confirm_brief(yes, &what, &format!("Start {brief}, billing again?"))? {
+    if !confirm_brief(yes, &what, &format!("Start {brief} — billing again?"))? {
         out!(Out, "aborted.");
         return Ok(());
     }

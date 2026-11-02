@@ -103,7 +103,7 @@ async fn start_ends_each_pod_ready() {
 }
 
 const START_QUIET: &str = r#"
-Start devtest-alpha (a fresh image, set up again); devtest-delta (disk kept), billing again? [y/N] y
+Start devtest-alpha (a fresh image, set up again); devtest-delta (disk kept) — billing again? [y/N] y
 [started] devtest-alpha
 [started] devtest-delta
 [devtest-alpha] waiting for SSH…

@@ -34,7 +34,7 @@ async fn cp_says_what_goes_where_in_a_line() {
     let want = format!(
         "Copy file {local} → /root/x/hello.txt on devtest-apple, devtest-bloom? [y/N] y\n\
          ✗ devtest-bloom: scp: /root/x/hello.txt: No space left on device (retry: arena pods cp {local} /root/x/hello.txt -t devtest-bloom)\n\
-         ✓ copied to devtest-apple\n\
+         ✓ copied {local} → /root/x/hello.txt to devtest-apple\n\
          Error: 1 pod(s) failed to receive the file\n"
     );
     assert_eq!(quiet, want, "default:\n{quiet}");
