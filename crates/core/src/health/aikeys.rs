@@ -381,24 +381,33 @@ fn hf_token_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
     if book.staff.contains(&pod.name) {
         return Check::new(name, Skip, format!("staff box: its token is the organisers' choice ({})", k.seen()));
     }
-    let Some(want) = book.hf_csv.get(&pod.name).or(book.hf.as_ref()) else {
-        return Check::new(name, Skip, format!("no HF_TOKEN configured for this fleet ({})", k.seen()));
+    // The token it should have: its own row in huggingface_api_keys.csv (copied last, so it wins),
+    // else the fleet's HF_TOKEN — and where to put a new one.
+    let (want, own_row) = match (book.hf_csv.get(&pod.name), book.hf.as_ref()) {
+        (Some(row), _) => (row, true),
+        (None, Some(fleet)) => (fleet, false),
+        (None, None) => return Check::new(name, Skip, format!("no HF_TOKEN configured for this fleet ({})", k.seen())),
     };
     let copy = format!("`arena pods copy-keys {s}`");
     if k.set == Some(false) {
         return Check::new(name, Fail, format!("missing — {copy}"));
     }
     let stale = k.fingerprint.as_deref().is_some_and(|got| got != want);
-    const OLD: &str = "not the config's HF_TOKEN";
+    let old = if own_row { "not its huggingface_api_keys.csv row's" } else { "not the config's HF_TOKEN" };
+    let new_one = if own_row {
+        format!("a new token in its huggingface_api_keys.csv row, then {copy}")
+    } else {
+        "a new HF_TOKEN in the config, then `arena pods copy-keys`".to_string()
+    };
     let unchecked = |what: String| {
-        let then = if stale { format!("; {OLD} — {copy}") } else { format!(" — `arena pods test --keys {s}` later") };
+        let then = if stale { format!("; {old} — {copy}") } else { format!(" — `arena pods test --keys {s}` later") };
         Check::new(name, Warn, format!("not checked: {what}{then}"))
     };
     if k.curl_exit.as_deref() == Some("missing") {
         return unchecked("no curl on the machine".into());
     }
     if k.rejected() {
-        let fix = if stale { format!("{OLD} — {copy}") } else { "a new HF_TOKEN in the config, then `arena pods copy-keys`".into() };
+        let fix = if stale { format!("{old} — {copy}") } else { new_one };
         return Check::new(name, Fail, format!("rejected by Hugging Face (HTTP {}) — {fix}", k.http.unwrap_or_default()));
     }
     if !k.accepted() {
@@ -409,7 +418,7 @@ fn hf_token_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
         });
     }
     if stale {
-        Check::new(name, Warn, format!("works, but {OLD} — {copy}"))
+        Check::new(name, Warn, format!("works, but {old} — {copy}"))
     } else {
         Check::new(name, Pass, "accepted by Hugging Face")
     }

@@ -70,15 +70,29 @@ or_key=${OPENROUTER_API_KEY:-}
 hf_key=${HF_TOKEN:-}
 
 # `key_probe <tag> <secret> <url>`: one bounded GET with the secret as its Bearer token, the
-# header handed to curl on stdin (`printf` is a builtin: no process carries it either). Leaves
+# header handed to curl on stdin (`printf` is a builtin: no process carries it either). `-q`
+# first: no ~/.curlrc, whose `trace-ascii` or `verbose` would log the header. Leaves
 # $work/<tag>.code (the HTTP status), .body, .err and .rc.
 key_probe() {
   local s=${2//\\/\\\\}
   s=${s//\"/\\\"}
   printf 'header = "Authorization: Bearer %s"\n' "$s" |
-    bounded 15 curl -sS --connect-timeout 5 --max-time 10 -K - -o "$work/$1.body" -w '%{http_code}' "$3" \
+    bounded 15 curl -q -sS --connect-timeout 5 --max-time 10 -K - -o "$work/$1.body" -w '%{http_code}' "$3" \
       >"$work/$1.code" 2>"$work/$1.err"
   echo "$?" >"$work/$1.rc"
+}
+
+# A service's or curl's message, safe to print: both secrets out, then anything shaped like a
+# key, a redacted label of one or a bearer token (`sk-…`, `hf_…`, `Bearer …`) — before it is
+# clipped, so no part of a secret survives the cut — then clipped to 160 characters.
+scrub() {
+  local v=$1 s
+  for s in "$or_key" "$hf_key"; do
+    [ "${#s}" -lt 8 ] || v=${v//"$s"/[secret]}
+  done
+  printf '%s' "$v" | tr '\r\n\t' '   ' |
+    sed -E 's/[Bb]earer[[:space:]]+[^[:space:]"]+/Bearer [secret]/g; s/(^|[^A-Za-z0-9])(sk|hf)[-_][A-Za-z0-9._~-]+/\1[secret]/g' |
+    cut -c1-160
 }
 
 # The first 12 hex of the secret's SHA-256 (it goes to the hasher on stdin); nothing when no
@@ -139,7 +153,7 @@ key_facts() {
   kv "$1.http" "${code:-unknown}"
   if [ "${rc:-1}" != 0 ]; then
     msg=$(first_line "$(cat "$work/$1.err" 2>/dev/null)")
-    kv "$1.error" "${msg:-curl exit ${rc:-unknown}}"
+    kv "$1.error" "$(scrub "${msg:-curl exit ${rc:-unknown}}")"
     return 1
   fi
   case $code in
@@ -147,7 +161,7 @@ key_facts() {
   esac
   msg=$(json_value message "$work/$1.body")
   [ -n "$msg" ] || msg=$(json_value error "$work/$1.body")
-  [ -z "$msg" ] || kv "$1.error" "$(printf '%s' "$msg" | cut -c1-160)"
+  [ -z "$msg" ] || kv "$1.error" "$(scrub "$msg")"
   return 1
 }
 

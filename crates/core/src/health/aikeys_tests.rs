@@ -286,7 +286,18 @@ fn hf_token_verdicts() {
     assert_eq!(hf(&facts("hf.key=missing\n"), "devtest-apple", &none).status, Status::Skip);
     let own = KeyBook::new(&cfg, &[], Some(HF_GOOD), &[("devtest-apple".into(), "hf_own".into())]);
     assert_eq!(hf(&facts(&hf_lines("hf_own", 200)), "devtest-apple", &own).status, Status::Pass);
-    assert_eq!(hf(&facts(&hf_lines(HF_GOOD, 200)), "devtest-apple", &own).status, Status::Warn);
+    let c = hf(&facts(&hf_lines(HF_GOOD, 200)), "devtest-apple", &own);
+    assert_eq!(
+        (c.status, c.detail.as_str()),
+        (Status::Warn, "works, but not its huggingface_api_keys.csv row's — `arena pods copy-keys apple`")
+    );
+    // Its own row's token rejected: the fix is that row (a new HF_TOKEN would change nothing for
+    // it — the row is copied last), never the fleet's working token.
+    let c = hf(&facts(&hf_lines("hf_own", 401)), "devtest-apple", &own);
+    assert_eq!(
+        c.detail,
+        "rejected by Hugging Face (HTTP 401) — a new token in its huggingface_api_keys.csv row, then `arena pods copy-keys apple`"
+    );
 }
 
 /// The fleet's own files: the keys CSVs beside the config, its HF_TOKEN, the spend ledger's
@@ -400,7 +411,7 @@ devtest-bloom  fail    rejected    missing  ai_key: rejected by OpenRouter (HTTP
 AI key failure, not the machine: devtest-bloom — NOTES (or -v) says what to run; a machine is never replaced for its key.
 "
     );
-    let table = render_health_table(&[ok.clone()]);
+    let table = render_health_table(std::slice::from_ref(&ok));
     assert!(table.starts_with("NAME           RESULT  GPUS  DRIVER  CUDA  NET  AI KEY      NOTES\n"), "{table}");
     // Nothing judged (a fleet without keys): the table it always had.
     let unjudged = PodHealth::keys_checked(&pod("devtest-apple"), facts("openrouter.key=missing\n"), &HealthPolicy::default());
@@ -562,6 +573,44 @@ fn the_script_asks_each_service_and_never_prints_a_secret() {
     let h = PodHealth::keys_checked(&apple, parse_deep(&stdout), &policy);
     assert_eq!(h.checks[0].status, Status::Warn, "{stdout}\n{:#?}", h.checks);
     assert!(h.checks[0].detail.starts_with("not checked: couldn't reach OpenRouter (curl: (7)"), "{}", h.checks[0].detail);
+}
+
+/// Nothing the services or curl say can carry a secret out: a 401 whose message echoes the key
+/// (past where the message is clipped), OpenRouter's label of it, a bearer token and the HF
+/// token comes out scrubbed — and a `~/.curlrc` asking for a trace of the request (which would
+/// hold the Authorization header) is never read.
+#[cfg(target_os = "linux")]
+#[test]
+fn no_message_or_curl_config_leaks_a_secret() {
+    if !(have("bash") && have("curl") && have("sha256sum") && have("base64") && have("timeout")) {
+        eprintln!("bash/curl/sha256sum/base64/timeout missing — skipping");
+        return;
+    }
+    let pad = "x".repeat(150);
+    let echoed = format!(
+        r#"{{"error":{{"message":"{pad} bad key {GOOD}, label sk-or-v1-012...ood, sent Bearer {GOOD} with hf {HF_GOOD}","code":401}}}}"#
+    );
+    let server = stub_server(vec![(GOOD, 401, echoed.clone()), (HF_GOOD, 401, format!(r#"{{"error":"no such token {HF_GOOD}"}}"#))]);
+    // A home whose ~/.curlrc would trace every request (headers included) to a file.
+    let home = std::env::temp_dir().join(format!("arena-keys-curlrc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let trace = home.join("curl.trace");
+    std::fs::write(home.join(".curlrc"), format!("trace-ascii = \"{}\"\n", trace.display())).unwrap();
+    let (stdout, stderr) = run_keys(&server, &[("OPENROUTER_API_KEY", GOOD), ("HF_TOKEN", HF_GOOD), ("HOME", home.to_str().unwrap())], None);
+    let traced = trace.exists();
+    let _ = std::fs::remove_dir_all(&home);
+    assert!(!traced, "~/.curlrc was read: the request was traced");
+    let out = format!("{stdout}\n{stderr}");
+    for leak in [&GOOD[..12], &GOOD[GOOD.len() - 8..], &HF_GOOD[..10], "012...ood", "Bearer sk"] {
+        assert!(!out.contains(leak), "{leak:?} printed:\n{out}");
+    }
+    let f = parse_deep(&stdout);
+    let k = f.openrouter.unwrap();
+    assert_eq!(k.http, Some(401), "{stdout}");
+    let e = k.error.unwrap();
+    assert!(e.contains("bad key") && e.chars().count() <= 160, "{e}");
+    assert_eq!(f.hf.unwrap().error.as_deref(), Some("no such token [secret]"), "{stdout}");
 }
 
 /// The secret is on no command line: a `curl` first on PATH records its arguments and execs
