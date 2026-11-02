@@ -979,9 +979,10 @@ pub(crate) async fn handle_pods_bal(
             // Its settings first: a config without the repo's path fails before anything else.
             let notes = arena_core::agent_notes::AgentNotes::from_config(cfg)?;
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let names: Vec<&str> = sel.pods.iter().map(|p| p.name.as_str()).collect();
             if !dry_run
                 && !sel.pods.is_empty()
-                && !confirm(
+                && !confirm_brief(
                     yes,
                     &format!(
                         "Will write the agents' notes ({}) and link uv into /usr/local/bin on {} pod(s), nothing else: {}",
@@ -989,9 +990,10 @@ pub(crate) async fn handle_pods_bal(
                         sel.pods.len(),
                         sel.names()
                     ),
+                    &format!("Write the agents' notes on {}, nothing else?", crate::pods::setup::some_names(&names)),
                 )?
             {
-                println!("aborted.");
+                out!(Out, "aborted.");
                 return Ok(());
             }
             crate::pods::setup::handle_notes(remote, cfg, &notes, !dry_run, &sel).await?;
@@ -1005,9 +1007,10 @@ pub(crate) async fn handle_pods_bal(
             // Resolved before the prompt, so a typo fails before asking and the prompt names
             // exactly the pods that will be provisioned.
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let names: Vec<&str> = sel.pods.iter().map(|p| p.name.as_str()).collect();
             if !dry_run
                 && !sel.pods.is_empty()
-                && !confirm(
+                && !confirm_brief(
                     yes,
                     &format!(
                         "Will provision {} pod(s) over SSH (deploy key, ~/.name, repo{}): {}",
@@ -1015,9 +1018,10 @@ pub(crate) async fn handle_pods_bal(
                         if vscode { ", VS Code warm-up" } else { "" },
                         sel.names()
                     ),
+                    &format!("Set up {} over SSH?", crate::pods::setup::some_names(&names)),
                 )?
             {
-                println!("aborted.");
+                out!(Out, "aborted.");
                 return Ok(());
             }
             handle_setup(remote, cfg, !dry_run, force, hf_token, cc_token, zsh_install, no_vscode, timeouts, &sel, &keys_dir(cfg), Some(provider))
