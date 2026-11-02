@@ -209,7 +209,7 @@ async fn up_replacing_a_pod_with_no_endpoint() {
 const QUIET_UP_THAT_GOES_WELL: &str = r#"
 1×RTX A4000 · RunPod COMMUNITY
 Balance $120.00 → ≈4.3d left
-A pod without SSH is terminated and tried again (2 tries per name).
+A pod without SSH is terminated and its name tried again: 2 tries in all.
 Create devtest-apple, devtest-bloom (≤~$0.64/h)? [y/N] y
 [created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
 [created] devtest-bloom · 1×RTX A4000 COMMUNITY · $0.17/h
@@ -223,7 +223,7 @@ Create devtest-apple, devtest-bloom (≤~$0.64/h)? [y/N] y
 const QUIET_UP_WAITING_FOR_CAPACITY: &str = r#"
 1×RTX A4000 · RunPod COMMUNITY
 Balance $120.00 → ≈6.0d left
-A pod without SSH is terminated and tried again (2 tries per name).
+A pod without SSH is terminated and its name tried again: 2 tries in all.
 Create devtest-apple (≤~$0.32/h), retrying up to 10m? [y/N] y
 round 1: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…
 round 2: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…
@@ -237,7 +237,7 @@ round 3: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…
 const QUIET_UP_WITH_A_FAILED_SETUP: &str = r#"
 1×RTX A4000 · RunPod COMMUNITY
 Balance $120.00 → ≈4.3d left
-A pod without SSH is terminated and tried again (2 tries per name).
+A pod without SSH is terminated and its name tried again: 2 tries in all.
 Create devtest-apple, devtest-bloom (≤~$0.64/h)? [y/N] y
 [created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
 [created] devtest-bloom · 1×RTX A4000 COMMUNITY · $0.17/h
@@ -251,7 +251,7 @@ Error: 1 of 2 pod(s) not ready: devtest-bloom (FAILED setup)
 const QUIET_UP_REPLACING_A_POD_WITH_NO_ENDPOINT: &str = r#"
 1×RTX A4000 · RunPod COMMUNITY
 Balance $120.00 → ≈6.0d left
-A pod without SSH is terminated and tried again (2 tries per name).
+A pod without SSH is terminated and its name tried again: 2 tries in all.
 Create devtest-apple (≤~$0.32/h)? [y/N] y
 [created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
 [devtest-apple] no SSH endpoint — replacing it (attempt 2 of 2)
@@ -263,7 +263,7 @@ Create devtest-apple (≤~$0.32/h)? [y/N] y
 
 const LOUD_UP_WITH_A_FAILED_SETUP: &str = r#"
 balance: runpod $120.00 live · $0.50/h now + ≤~$0.64/h for 2 new pod(s) (a stand-in that errs high — no live price) → ≈4.3d
-Will create 2 pod(s) on runpod (NVIDIA RTX A4000 x1, COMMUNITY, disk 100GB), then per pod, as soon as it can: wait for its SSH endpoint — a pod up without one for 5 min (RunPod: behind its SSH proxy only), or a RunPod pod with no container at --timeout (10 min or more), is TERMINATED and its name recreated (up to 2 placement(s) per name), sync the proxy (if nginx is set up), provision it, copy its API keys — then READY/FAILED per pod:
+Will create 2 pod(s) on runpod (NVIDIA RTX A4000 x1, COMMUNITY, disk 100GB), then per pod, as soon as it can: wait for its SSH endpoint — a pod up without one for 5 min (RunPod: behind its SSH proxy only), or a RunPod pod with no container at --timeout (10 min or more), is TERMINATED and its name recreated (up to 2 placement(s) per name; the last one's pod is terminated too, leaving the name with none), sync the proxy (if nginx is set up), provision it, copy its API keys — then READY/FAILED per pod:
   devtest-apple, devtest-bloom
 Proceed? [y/N] y
 Broadcast tokens: Hugging Face ✗ (✓ exported on each pod; ✗ skipped)
@@ -294,7 +294,7 @@ Error: 1 of 2 pod(s) not ready: devtest-bloom (FAILED setup)
 
 const LOUD_UP_REPLACING_A_POD_WITH_NO_ENDPOINT: &str = r#"
 balance: runpod $120.00 live · $0.50/h now + ≤~$0.32/h for 1 new pod(s) (a stand-in that errs high — no live price) → ≈6.0d
-Will create 1 pod(s) on runpod (NVIDIA RTX A4000 x1, COMMUNITY, disk 100GB), then per pod, as soon as it can: wait for its SSH endpoint — a pod up without one for 5 min (RunPod: behind its SSH proxy only), or a RunPod pod with no container at --timeout (10 min or more), is TERMINATED and its name recreated (up to 2 placement(s) per name), sync the proxy (if nginx is set up), provision it, copy its API keys — then READY/FAILED per pod:
+Will create 1 pod(s) on runpod (NVIDIA RTX A4000 x1, COMMUNITY, disk 100GB), then per pod, as soon as it can: wait for its SSH endpoint — a pod up without one for 5 min (RunPod: behind its SSH proxy only), or a RunPod pod with no container at --timeout (10 min or more), is TERMINATED and its name recreated (up to 2 placement(s) per name; the last one's pod is terminated too, leaving the name with none), sync the proxy (if nginx is set up), provision it, copy its API keys — then READY/FAILED per pod:
   devtest-apple
 Proceed? [y/N] y
 Broadcast tokens: Hugging Face ✗ (✓ exported on each pod; ✗ skipped)
@@ -324,7 +324,7 @@ devtest-apple: #1 1×RTX A4000 COMMUNITY (id1): no public SSH endpoint (RunPod s
 
 const LOUD_UP_THAT_GOES_WELL: &str = r#"
 balance: runpod $120.00 live · $0.50/h now + ≤~$0.64/h for 2 new pod(s) (a stand-in that errs high — no live price) → ≈4.3d
-Will create 2 pod(s) on runpod (NVIDIA RTX A4000 x1, COMMUNITY, disk 100GB), then per pod, as soon as it can: wait for its SSH endpoint — a pod up without one for 5 min (RunPod: behind its SSH proxy only), or a RunPod pod with no container at --timeout (10 min or more), is TERMINATED and its name recreated (up to 2 placement(s) per name), sync the proxy (if nginx is set up), provision it, copy its API keys — then READY/FAILED per pod:
+Will create 2 pod(s) on runpod (NVIDIA RTX A4000 x1, COMMUNITY, disk 100GB), then per pod, as soon as it can: wait for its SSH endpoint — a pod up without one for 5 min (RunPod: behind its SSH proxy only), or a RunPod pod with no container at --timeout (10 min or more), is TERMINATED and its name recreated (up to 2 placement(s) per name; the last one's pod is terminated too, leaving the name with none), sync the proxy (if nginx is set up), provision it, copy its API keys — then READY/FAILED per pod:
   devtest-apple, devtest-bloom
 Proceed? [y/N] y
 Broadcast tokens: Hugging Face ✗ (✓ exported on each pod; ✗ skipped)
@@ -355,7 +355,7 @@ devtest-bloom  1×RTX A4000  $0.17           -  -       READY           30s
 
 const LOUD_UP_WAITING_FOR_CAPACITY: &str = r#"
 balance: runpod $120.00 live · $0.50/h now + ≤~$0.32/h for 1 new pod(s) (a stand-in that errs high — no live price) → ≈6.0d
-Will create 1 pod(s) on runpod (NVIDIA RTX A4000 x1, COMMUNITY, disk 100GB), retrying up to 10m, then per pod, as soon as it can: wait for its SSH endpoint — a pod up without one for 5 min (RunPod: behind its SSH proxy only), or a RunPod pod with no container at --timeout (10 min or more), is TERMINATED and its name recreated (up to 2 placement(s) per name), sync the proxy (if nginx is set up), provision it, copy its API keys — then READY/FAILED per pod:
+Will create 1 pod(s) on runpod (NVIDIA RTX A4000 x1, COMMUNITY, disk 100GB), retrying up to 10m, then per pod, as soon as it can: wait for its SSH endpoint — a pod up without one for 5 min (RunPod: behind its SSH proxy only), or a RunPod pod with no container at --timeout (10 min or more), is TERMINATED and its name recreated (up to 2 placement(s) per name; the last one's pod is terminated too, leaving the name with none), sync the proxy (if nginx is set up), provision it, copy its API keys — then READY/FAILED per pod:
   devtest-apple
 Proceed? [y/N] y
 Broadcast tokens: Hugging Face ✗ (✓ exported on each pod; ✗ skipped)
@@ -424,7 +424,7 @@ Placed 1 of 1.
 const QUIET_UP_WHEN_NO_TRY_IS_LEFT: &str = r#"
 1×RTX A4000 · RunPod COMMUNITY
 Balance $120.00 → ≈6.0d left
-A pod without SSH is terminated and tried again (2 tries per name).
+A pod without SSH is terminated and its name tried again: 2 tries in all.
 Create devtest-apple (≤~$0.32/h)? [y/N] y
 [created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
 [devtest-apple] no SSH endpoint — replacing it (attempt 2 of 2)
@@ -436,7 +436,7 @@ Error: 1 of 1 pod(s) not ready: devtest-apple (FAILED endpoint)
 
 const LOUD_UP_WHEN_NO_TRY_IS_LEFT: &str = r#"
 balance: runpod $120.00 live · $0.50/h now + ≤~$0.32/h for 1 new pod(s) (a stand-in that errs high — no live price) → ≈6.0d
-Will create 1 pod(s) on runpod (NVIDIA RTX A4000 x1, COMMUNITY, disk 100GB), then per pod, as soon as it can: wait for its SSH endpoint — a pod up without one for 5 min (RunPod: behind its SSH proxy only), or a RunPod pod with no container at --timeout (10 min or more), is TERMINATED and its name recreated (up to 2 placement(s) per name), sync the proxy (if nginx is set up), provision it, copy its API keys — then READY/FAILED per pod:
+Will create 1 pod(s) on runpod (NVIDIA RTX A4000 x1, COMMUNITY, disk 100GB), then per pod, as soon as it can: wait for its SSH endpoint — a pod up without one for 5 min (RunPod: behind its SSH proxy only), or a RunPod pod with no container at --timeout (10 min or more), is TERMINATED and its name recreated (up to 2 placement(s) per name; the last one's pod is terminated too, leaving the name with none), sync the proxy (if nginx is set up), provision it, copy its API keys — then READY/FAILED per pod:
   devtest-apple
 Proceed? [y/N] y
 Broadcast tokens: Hugging Face ✗ (✓ exported on each pod; ✗ skipped)

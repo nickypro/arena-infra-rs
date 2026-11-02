@@ -211,11 +211,20 @@ pub(crate) struct UpRun<'a> {
 /// never gets an endpoint.
 pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, claude: bool, lock: bool, endpoint: (u64, u32)) -> String {
     let (mins, placements) = endpoint;
+    // The last placement's pod is terminated too (review r3: said, so a name left with none is
+    // no surprise) — with one placement, at once.
+    let recreated = if placements > 1 {
+        format!(
+            "is TERMINATED and its name recreated (up to {placements} placement(s) per name; the last one's pod is \
+             terminated too, leaving the name with none)"
+        )
+    } else {
+        "is TERMINATED and its name not recreated (1 placement per name: --check-attempts)".to_string()
+    };
     let mut steps = vec![
         format!(
             "wait for its SSH endpoint — a pod up without one for {mins} min (RunPod: behind its SSH proxy \
-             only), or a RunPod pod with no container at --timeout ({} min or more), is TERMINATED and its name \
-             recreated (up to {placements} placement(s) per name)",
+             only), or a RunPod pod with no container at --timeout ({} min or more), {recreated}",
             NO_CONTAINER_LIMIT.as_secs() / 60
         ),
         "sync the proxy (if nginx is set up)".to_string(),
@@ -228,7 +237,7 @@ pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, claude:
     if let Some(n) = check {
         steps.push(format!(
             "deep-check it — a pod that FAILs on its host is TERMINATED and its name recreated (up to {n} \
-             placement(s) per name; options that haven't failed first; never on a machine that already \
+             placement(s) per name, the last one's left running; options that haven't failed first; never on a machine that already \
              failed — this run, or an `up --check` in the last {}h); a software/setup FAIL (e.g. torch \
              missing) is left running, not replaced",
             snapshot::BAD_HOST_TTL_SECS / 3600
@@ -5379,15 +5388,19 @@ mod tests {
             format!(
                 "wait for its SSH endpoint — a pod up without one for {mins} min (RunPod: behind its SSH proxy only), or \
                  a RunPod pod with no container at --timeout (10 min or more), is TERMINATED and its name recreated (up \
-                 to {n} placement(s) per name)"
+                 to {n} placement(s) per name; the last one's pod is terminated too, leaving the name with none)"
             )
         };
+        // One placement: terminated, not recreated (review r3).
+        assert!(pipeline_text(true, None, false, false, false, (5, 1)).contains(
+            "(10 min or more), is TERMINATED and its name not recreated (1 placement per name: --check-attempts), sync"
+        ));
         assert_eq!(
             pipeline_text(true, Some(3), true, false, false, (5, 3)),
             format!(
                 "per pod, as soon as it can: {}, sync the proxy (if nginx is set up), provision it, \
                  deep-check it — a pod that FAILs on its host is TERMINATED and its name recreated (up to 3 placement(s) \
-                 per name; options that haven't failed first; never on a machine that already failed — this run, or an \
+                 per name, the last one's left running; options that haven't failed first; never on a machine that already failed — this run, or an \
                  `up --check` in the last 72h); a software/setup FAIL (e.g. torch missing) is left running, not replaced, \
                  copy its API keys — then READY/FAILED per pod",
                 endpoint(5, 3)

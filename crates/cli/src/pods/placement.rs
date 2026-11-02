@@ -663,15 +663,16 @@ pub(crate) fn create_question(names: &[String], cost: Option<&str>, retry_mins: 
 /// host, and recreates its name while `tries` (`--check-attempts`) last — the last try's pod is
 /// terminated all the same. Nothing with `--no-wait`: no pipelines run. Pure.
 pub(crate) fn up_replaces(check: bool, no_wait: bool, tries: u32) -> Option<String> {
-    let what = match (no_wait, check) {
-        (true, _) => return None,
-        (false, true) => "without SSH or failing the check",
-        (false, false) => "without SSH",
-    };
-    // The last try's pod is terminated too: said, so a name left with none is no surprise.
-    Some(match tries {
-        0 | 1 => format!("A pod {what} is terminated (one try per name)."),
-        n => format!("A pod {what} is terminated and tried again ({n} tries per name)."),
+    if no_wait {
+        return None;
+    }
+    // Every pod without SSH is terminated, the last try's too: said, so a name left with none is
+    // no surprise. A host FAIL of the check is terminated only while a try is left.
+    Some(match (tries, check) {
+        (0 | 1, false) => "A pod without SSH is terminated; its name isn't tried again.".to_string(),
+        (0 | 1, true) => "A pod without SSH is terminated; its name isn't tried again (one failing the check is kept).".to_string(),
+        (n, false) => format!("A pod without SSH is terminated and its name tried again: {n} tries in all."),
+        (n, true) => format!("A pod without SSH, or failing the check (but the last), is terminated and its name tried again: {n} tries in all."),
     })
 }
 
@@ -862,6 +863,18 @@ pub(crate) async fn place_names(
         }
     }
     Ok(made)
+}
+
+#[cfg(test)]
+#[test]
+fn up_prompt_says_what_it_terminates_with_one_try_or_several() {
+    assert_eq!(up_replaces(false, false, 2).as_deref(), Some("A pod without SSH is terminated and its name tried again: 2 tries in all."));
+    assert_eq!(up_replaces(false, false, 1).as_deref(), Some("A pod without SSH is terminated; its name isn't tried again."));
+    assert!(up_replaces(true, false, 3).unwrap().contains("or failing the check (but the last)"));
+    assert!(up_replaces(true, false, 1).unwrap().ends_with("(one failing the check is kept)."));
+    assert_eq!(up_replaces(true, true, 2), None, "--no-wait: no pipelines, nothing terminated");
+    let q = create_question(&["devtest-apple".into()], Some("≤$0.17/h"), 0, up_replaces(false, false, 2).as_deref());
+    assert_eq!(q, "A pod without SSH is terminated and its name tried again: 2 tries in all.\nCreate devtest-apple (≤$0.17/h)?");
 }
 
 /// Why the names left unplaced weren't placed, as their last attempt said: `no capacity`, `no
