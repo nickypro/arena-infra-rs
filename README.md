@@ -292,6 +292,16 @@ flowchart LR
 every few seconds. Every action on a pod asks first; restart, stop and terminate need the pod's
 name typed back.
 
+![The dashboard during ARENA 9's project week: 55 machines on Hetzner, RunPod and Vast](docs/img/dashboard-2026-11-02.png)
+
+<sup>Live, ARENA 9's project week (2026-11-02). **Top line:** per provider, the machine count,
+balance, time left and $/h; `⚠` where something needs you. **Rows:** P = provider (H/R/V); SET =
+`.name`, deploy key, origin, API key (`✗` = missing); HLTH = last deep check; PROXY = the
+participant's port; 💾 = the course repo's last commit; AI$ = AI key spend / cap. Red or orange
+means look at it, e.g. a disk nearly full or RAM at 99%. `i` explains every column.</sup>
+
+The same layout from a made-up fleet, as text:
+
 ```text
  5 pods, 5 GPUs 45% │ 4 RunPod $214.30 ≈7.6d · $1.40/h │ 1 Vast $0.22/h                                    ./config.env
 ┌Pods──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐

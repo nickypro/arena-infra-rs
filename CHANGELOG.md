@@ -38,6 +38,15 @@ earlier).
   container's SSH port and fail (`Connection refused`, then `arena pods setup NAME` by hand). It
   now waits for the new container.
 
+## 2026-11-02 · the dashboard: jump to the first or last pod
+- `g` / `Home` / Shift+↑ go to the first pod, `G` / `End` / Shift+↓ to the last (`gg` works too).
+- The mouse wheel moves the cursor in the detail view as well as the list.
+
+## 2026-11-02 · the dashboard: marks of pods that are gone no longer count
+- After unmarking every pod you can see, `a` no longer offers actions on "0 marked pods", and `d`
+  no longer does nothing. Marks left by pods that have since left the list (terminated,
+  renamed, replaced) are dropped, and the key acts on the cursor pod.
+
 ## 2026-11-02 · arena 2.13: `pods reimage` and `pods lock` on Hetzner VMs
 - **`pods reimage` works on a Hetzner VM**: Hetzner's rebuild. The whole disk is written again from
   the VM image, and the server keeps its id, name, IP and type. The image is `--image`, else
