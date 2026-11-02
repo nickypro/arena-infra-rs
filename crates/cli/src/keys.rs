@@ -582,6 +582,9 @@ pub(crate) async fn handle_copy_keys(
         });
     }
     let (mut ok, mut failed, mut done) = (0, 0, 0);
+    // What retries one pod as this run made it: its keys folder, its token flags.
+    let own_dir = (keys_dir != crate::fleet_files::keys_dir(cfg)).then_some(keys_dir);
+    let retry = |name: &str| copy_keys_retry(name, own_dir, hf_given, cc_token.is_some());
     // A pod written is a line at `-v` (and counted in place on a terminal); a failure is a line
     // with its reason and the command that retries it.
     let _progress = arena_core::out::progress_guard("copy-keys");
@@ -604,7 +607,7 @@ pub(crate) async fn handle_copy_keys(
             Brief,
             "{} (retry: {})",
             arena_core::out::fail(format!("{}: {}", arena_core::out::bold(&name), arena_core::out::reason_text(&why))),
-            copy_keys_retry(&name, (keys_dir != crate::fleet_files::keys_dir(cfg)).then_some(keys_dir), hf_given, cc_token.is_some())
+            retry(&name)
         );
         arena_core::out::progress("copy-keys", Some(&format!("keys: {done} of {total}")));
     }
@@ -616,7 +619,7 @@ pub(crate) async fn handle_copy_keys(
     // Each pod's own Claude Code account's token (one by spread for a pod with none), on ssh's
     // stdin — never in the command above.
     // With no pool too: a pod that's off still gets a pending removal (review r3).
-    let claude_failed = crate::claude::stage(remote.as_ref(), cfg, &claude_jobs, cc_token.as_deref()).await;
+    let claude_failed = crate::claude::stage_with(remote.as_ref(), cfg, &claude_jobs, cc_token.as_deref(), &retry).await;
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed");
     }

@@ -387,5 +387,17 @@ async fn copy_keys_retry_keeps_the_runs_flags_but_never_a_token() {
         "{quiet}"
     );
     assert!(!quiet.contains("SECRETVALUE") && !quiet.contains(&tok(9)), "{quiet}");
+    // The keys written, the Claude Code token not: the same retry (the whole run's), never
+    // `claude push` (it can't put `--cc-token`'s token back), and never a token.
+    let fake = Arc::new(FakeRemote::new());
+    fake.script(&host(1), [arena_core::remote::FakeReply::ok(), arena_core::remote::FakeReply::exit(255, "ssh: lost connection")]);
+    let run = crate::handle_copy_keys(fake.clone(), &cfg, &no_csv, Some("hf_SECRETVALUE".into()), Some(tok(9)), &sel, false, true);
+    let quiet = crate::output_test::rendered(false, &[], run).await;
+    let line = quiet.lines().find(|l| l.starts_with("Claude Code ✗ devtest-apple")).unwrap_or_else(|| panic!("{quiet}"));
+    assert!(
+        line.ends_with(&format!("(retry: arena pods copy-keys devtest-apple --keys-dir {dir} --hf-token <the same token> --cc-token <the same token>)")),
+        "{quiet}"
+    );
+    assert!(quiet.contains("✓ keys on 1 of 1 pod(s)") && !quiet.contains("SECRETVALUE") && !quiet.contains(&tok(9)), "{quiet}");
     assert_eq!(crate::keys::copy_keys_retry("devtest-apple", None, false, false), "arena pods copy-keys devtest-apple");
 }

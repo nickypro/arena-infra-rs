@@ -1069,7 +1069,10 @@ mod tests {
                 teardown_with(fleet, cfg, std::future::ready(Probe::Got(vec![])), no_sf_volumes(), std::future::ready(no_archive()), no_images(), None, sched, false, bal).await
             })
         };
-        let quiet = run(false).await;
+        // The schedulers' lines name whoever runs the test (`dev` here, `runner` in CI).
+        let user = current_user();
+        let who = |t: String| t.replace(&format!("({user})"), "(USER)").replace(&format!("{user}'s"), "USER's");
+        let quiet = who(run(false).await);
         assert_eq!(
             quiet,
             "\
@@ -1083,6 +1086,10 @@ mod tests {
 – pods (shadeform): not configured (no SHADEFORM_API_KEY) — not checked
 – network volumes (hetzner): Hetzner volumes not read in this test
 – OpenRouter keys: OPENROUTER_PROVISIONING_KEY isn't set — OpenRouter keys not checked
+✓ cron (USER): no arena lines in USER's crontab
+    note: only USER's crontab is read — not root's, and not /etc/cron.d
+✓ at jobs (USER): no pending jobs
+    note: atq shows only USER's jobs unless run as root
 – backup archive (hetzner): no token
 – images (hetzner): Hetzner snapshots not read in this test
 – capacity spares (hetzner): Hetzner spares not read in this test
@@ -1092,7 +1099,7 @@ Error: teardown check: 1 item(s) remain, 1 couldn't be checked
         );
         let (report, _) = check(&fleet, &cfg, Probe::Got(vec![]), None, &sched).await;
         let loud = run(true).await;
-        let loud_text = loud.replace(&dir.0.display().to_string(), "DIR");
+        let loud_text = who(loud.replace(&dir.0.display().to_string(), "DIR"));
         assert_eq!(loud_text, "\
 Teardown check for cohort `devtest` (read-only: nothing is changed)
 
@@ -1107,10 +1114,10 @@ Teardown check for cohort `devtest` (read-only: nothing is changed)
 ✓ network volumes (runpod): none
 – network volumes (hetzner): Hetzner volumes not read in this test
 – OpenRouter keys: OPENROUTER_PROVISIONING_KEY isn't set — OpenRouter keys not checked
-✓ cron (dev): no arena lines in dev's crontab
-    note: only dev's crontab is read — not root's, and not /etc/cron.d
-✓ at jobs (dev): no pending jobs
-    note: atq shows only dev's jobs unless run as root
+✓ cron (USER): no arena lines in USER's crontab
+    note: only USER's crontab is read — not root's, and not /etc/cron.d
+✓ at jobs (USER): no pending jobs
+    note: atq shows only USER's jobs unless run as root
 ✓ proxy forwards (DIR/proxy.conf): none
 – backup archive (hetzner): no token
 – images (hetzner): Hetzner snapshots not read in this test

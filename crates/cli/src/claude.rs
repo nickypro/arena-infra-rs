@@ -544,6 +544,17 @@ pub(crate) fn plan_line(cfg: &Config, token: Option<&str>) -> std::result::Resul
 /// pool, only a pending removal goes. Prints a line per pod; nothing when there's nothing to do. How
 /// many failed — a pool or state that can't be read counts every pod.
 pub(crate) async fn stage(remote: &dyn Remote, cfg: &Config, pods: &[(Pod, SshTarget)], token: Option<&str>) -> usize {
+    // `--cc-token`'s token is no account's: `claude push` wouldn't put it back.
+    let retry = |name: &str| match token {
+        Some(_) => crate::keys::copy_keys_retry(name, None, false, true),
+        None => format!("arena claude push {name}"),
+    };
+    stage_with(remote, cfg, pods, token, &retry).await
+}
+
+/// [`stage`], a failed pod's line ending with `retry(name)`: the command that puts its token
+/// on as this run would have (copy-keys' passes its own keys folder and flags).
+pub(crate) async fn stage_with(remote: &dyn Remote, cfg: &Config, pods: &[(Pod, SshTarget)], token: Option<&str>, retry: &dyn Fn(&str) -> String) -> usize {
     match claude::stage(remote, cfg, pods, token, unix_now()).await {
         Ok(None) => 0,
         Ok(Some(outcomes)) => {
@@ -554,12 +565,7 @@ pub(crate) async fn stage(remote: &dyn Remote, cfg: &Config, pods: &[(Pod, SshTa
             for o in &outcomes {
                 arena_core::out!(Detail, "  {}", o.line());
                 if o.result.is_err() {
-                    // `--cc-token`'s token is no account's: `claude push` wouldn't put it back.
-                    let retry = match token {
-                        Some(_) => crate::keys::copy_keys_retry(&o.name, None, false, true),
-                        None => format!("arena claude push {}", o.name),
-                    };
-                    arena_core::out!(Brief, "Claude Code {} (retry: {retry})", o.line());
+                    arena_core::out!(Brief, "Claude Code {} (retry: {})", o.line(), retry(&o.name));
                     failed += 1;
                 }
             }

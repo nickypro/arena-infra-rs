@@ -1527,7 +1527,8 @@ impl Report {
 
     /// The checklist as the default output prints it: only what's wrong — each item left (`✗`)
     /// or that couldn't be checked (`?`) with what's there, its notes and its fix — the kept
-    /// (`◷`) and not applicable (`–`) ones a line each, then the verdict ([`Report::lines`]).
+    /// (`◷`) and not applicable (`–`) ones a line each, cron and at with what they couldn't
+    /// see, then the verdict ([`Report::lines`]).
     pub fn render_brief(&self) -> String {
         self.text(false)
     }
@@ -1550,15 +1551,18 @@ impl Report {
             // kept item is a line (it's on purpose), and so is one not checked (`–`: no key,
             // not installed — something could be there unseen, and the verdict counts them);
             // the clear ones only at -v.
+            // The schedulers keep their line and its caveat even when clear: what this user's
+            // crontab and atq can't see (root's, /etc/cron.d) could still recreate a pod.
             let wrong = matches!(item.verdict, Verdict::Remaining | Verdict::Unknown);
-            let head = if item.verdict == Verdict::Clear { To::Detail } else { To::Out };
+            let scheduler = matches!(item.area, Area::Cron | Area::At);
+            let head = if item.verdict == Verdict::Clear && !scheduler { To::Detail } else { To::Out };
             let under = if wrong { To::Out } else { To::Detail };
             out.push((head, format!("{} {}: {}", item.verdict.styled(), item.title(), item.summary)));
             for l in entry_lines(&item.entries) {
                 out.push((under, format!("      {l}")));
             }
             for n in &item.notes {
-                out.push((under, format!("    note: {n}")));
+                out.push((if scheduler { To::Out } else { under }, format!("    note: {n}")));
             }
             for f in &item.fix {
                 out.push((under, format!("    fix:  {f}")));
