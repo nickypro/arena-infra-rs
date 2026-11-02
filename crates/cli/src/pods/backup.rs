@@ -631,8 +631,14 @@ pub(crate) async fn backup_fleet(
                 let at_push = report.failed_at_push();
                 t.events.push((name.clone(), Outcome::Failed, failure_why(&call), arena_core::snapshot::unix_now()));
                 t.unpushed.push(Unpushed { pod: name.clone(), why: failure_why(&call), branch: report.branch.clone(), at_push, wrong_origin: false, busy: None });
-                // By default its telling line, not the whole of stderr: `-v` has that.
-                emit(To::Brief, &out::fail(format!("{}: {} (retry: arena pods backup {name} -v)", out::bold(name), failure_why(&call))));
+                // By default all it said on one line (a cron's log can't be asked again with `-v`),
+                // then the fix; `-v`'s line keeps stderr's own lines.
+                let said = match &call {
+                    Ok(out) if out.stderr.trim().is_empty() => out.exit_label(),
+                    Ok(out) => format!("{}: {}", out.exit_label(), crate::pods::pull::stderr_line(&out.stderr)),
+                    Err(why) => why.clone(),
+                };
+                emit(To::Brief, &out::fail(format!("{}: {said} (retry: arena pods backup {name})", out::bold(name))));
                 failure_line(done, total, name, &call)
             }
         };

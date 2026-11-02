@@ -163,6 +163,29 @@ async fn backup_that_goes_well_is_one_line() {
     assert_eq!(rendered(false, &[], run).await, "✓ git backup of 3 pods: 1 pushed, 2 no changes\n");
 }
 
+/// A backup that failed for a reason the script doesn't explain (here GitHub knows no such
+/// repo): by default all git and ssh said, on the pod's one line, then how to try again — a
+/// cron's log can't be asked again with `-v`.
+#[tokio::test]
+async fn backup_failure_keeps_all_it_said_by_default() {
+    let stub = StubRsync::new("golden-backup-fail");
+    let cfg = cfg_at(&stub);
+    let fake = Arc::new(FakeRemote::new());
+    let stderr = "Warning: Permanently added 'github.com' (ED25519) to the list of known hosts.\nERROR: Repository not found.\n\
+                  fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\n";
+    fake.script(&host(22001), [FakeReply::exit(128, stderr)]);
+    let (sel, rsync) = (everyone(&fleet_of(&[("apple", 22001)])), stub.path());
+    let run = handle_full_backup(fake.clone(), &cfg, &sel, true, None, false, true, &rsync);
+    assert_eq!(
+        rendered(false, &[], run).await,
+        "✗ devtest-apple: exit 128: Warning: Permanently added 'github.com' (ED25519) to the list of known hosts.; ERROR: Repository \
+         not found.; fatal: Could not read from remote repository.; Please make sure you have the correct access rights (retry: \
+         arena pods backup devtest-apple)\n\
+         ✗ git backup: 1 of 1 failed\n\
+         Error: 1 pod(s) failed to back up\n"
+    );
+}
+
 /// `pods backup --dry-run`: by default what would run, in a line; with `-v` each pod's ssh line
 /// and the whole script, as before.
 #[tokio::test]
@@ -465,7 +488,7 @@ async fn restore_dry_run_is_a_line() {
 /// in order — lines saying the same of different files as one, with how many more like it.
 #[test]
 fn a_failed_rsyncs_line_keeps_its_own_words() {
-    use crate::pods::pull::rsync_why;
+    use crate::pods::pull::stderr_line as rsync_why;
     let closed = "rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]\n\
                   rsync error: error in rsync protocol data stream (code 12) at io.c(232) [Receiver=3.2.7]\n";
     let closed_line = "rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]; rsync error: error in rsync protocol data \

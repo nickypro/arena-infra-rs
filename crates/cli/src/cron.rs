@@ -388,16 +388,8 @@ async fn apply_cron_change(
     yes: bool,
     crontab: &str,
 ) -> Result<bool> {
-    // A `note:` is `-v`'s; a warning (and anything else) is said by default too.
-    let say_notes = || {
-        for n in notes {
-            if n.starts_with("note:") {
-                out!(Detail, "{n}");
-            } else {
-                out!(Out, "{n}");
-            }
-        }
-    };
+    // Its notes are said at both levels: each is a warning or what the change keeps or loses.
+    let say_notes = || notes.iter().for_each(|n| out!(Out, "{n}"));
     if before == after {
         out!(Out, "The arena cron lines are already as asked — nothing to change.");
         say_notes();

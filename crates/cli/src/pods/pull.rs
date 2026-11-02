@@ -795,7 +795,7 @@ pub(crate) async fn pull_pods(
             }
             Err((git, Ok(o))) => {
                 let pass = if git { ", .git" } else { "" };
-                let why = rsync_why(&o.stderr);
+                let why = stderr_line(&o.stderr);
                 say_to(To::Brief, &out::fail(format!("{} [{tier}{pass}]: rsync {}: {why}{moved} {retry}", out::bold(&name), o.exit_label())));
                 say_to(To::Detail, &format!("[{done}/{jobs}] ✗ {name} [{tier}{pass}] (rsync {}): {}{moved}", o.exit_label(), o.stderr.trim()));
                 failed += 1;
@@ -943,12 +943,12 @@ fn copy_tally(pods: &[String], overdue: &[String], failed: &[(String, String)], 
     }
 }
 
-/// A failed rsync's stderr as the default output's line keeps it (docs/OUTPUT.md; a cron's log
-/// can't be asked again with `-v`): all of it, in order, on one line — ssh's notices and cause,
-/// rsync's own lines and its verdict — save that lines saying the same of different files
+/// A failed command's stderr as the default output's line keeps it — a failed rsync's, a failed
+/// backup's (docs/OUTPUT.md; a cron's log can't be asked again with `-v`): all of it, in order, on
+/// one line — ssh's notices and cause, rsync's or git's own lines and the verdict — save that lines saying the same of different files
 /// (`send_files failed to open "…": Permission denied (13)` for each of a thousand) are one line
 /// and how many more like it, and past [`WHY_KINDS`] kinds, how many lines more. Pure.
-pub(crate) fn rsync_why(stderr: &str) -> String {
+pub(crate) fn stderr_line(stderr: &str) -> String {
     // A line's kind: its words with any quoted path taken out.
     let kind = |l: &str| l.split('"').enumerate().filter(|(i, _)| i % 2 == 0).map(|(_, p)| p).collect::<Vec<_>>().join("\"\"");
     let mut kinds: Vec<(String, &str, usize)> = Vec::new();
@@ -969,7 +969,7 @@ pub(crate) fn rsync_why(stderr: &str) -> String {
     parts.join("; ")
 }
 
-/// How many kinds of line a failed rsync's default line keeps ([`rsync_why`]).
+/// How many kinds of line a failure's default line keeps ([`stderr_line`]).
 const WHY_KINDS: usize = 8;
 
 /// Why a selected pod wasn't pulled: no endpoint to reach it at.
