@@ -628,9 +628,10 @@ async fn a_reimaged_pod_has_no_endpoint_until_its_new_container_shows() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let memo = Mutex::new(EndpointMemo::default());
     let at0 = 10_000;
-    let reset = |old_ports: &[u16]| {
-        memo.lock().unwrap().resets.insert("p1".into(), Reset { at: at0, old_ports: old_ports.to_vec(), new: None });
+    let reset_to = |old_ports: Option<&[u16]>| {
+        memo.lock().unwrap().resets.insert("p1".into(), Reset { at: at0, old_ports: old_ports.map(<[u16]>::to_vec), new: None });
     };
+    let reset = |old_ports: &[u16]| reset_to(Some(old_ports));
     let waiting = || memo.lock().unwrap().resets.get("p1").map(|r| r.new.is_none());
     let gets = std::sync::Arc::new(AtomicUsize::new(0));
     // The pod as listed (`status`, `started` — long before the reimage by default — naming
@@ -686,9 +687,13 @@ async fn a_reimaged_pod_has_no_endpoint_until_its_new_container_shows() {
     // container already 45 s up at the first look is still the new one.
     reset(&old);
     assert_eq!(at(at0 + 50, Some(59950), &new, Some(45)).await, Some(59678));
-    // Another HTTP port is another container too.
+    // Another HTTP port is another container too...
     reset(&old);
     assert_eq!(at(at0 + 30, Some(59950), &[59950, 60938, 60939], Some(20)).await, Some(59950));
+    // ...but ports gone from a partial detail are no new one (review r5).
+    reset(&old);
+    assert_eq!(at(at0 + 40, Some(59950), &[59950], Some(3)).await, None);
+    assert_eq!(at(at0 + 41, Some(59950), &[], Some(3)).await, None);
     // The old container, however its uptime reads — just started at the reimage (review F2),
     // or an out-of-order answer lower than the last (review r4) — keeps its ports: not the new
     // one, however long. Nor is a replacement that got every port back: the wait times out.
@@ -701,10 +706,20 @@ async fn a_reimaged_pod_has_no_endpoint_until_its_new_container_shows() {
     assert_eq!(at(at0 + 10, Some(59950), &new, None).await, None);
     assert_eq!(at(at0 + 600, Some(59950), &new, None).await, None);
     assert_eq!(at(at0 + 10, Some(59950), &new, Some(300)).await, None);
-    // No container ran before the reimage: the uptime decides.
+    // No container ran before the reimage: the uptime decides. Its ports not shown though it
+    // ran (review r5): nothing tells.
     reset(&[]);
     assert_eq!(at(at0 + 10, None, &new, Some(300)).await, None);
     assert_eq!(at(at0 + 12, None, &new, Some(9)).await, Some(59678));
+    reset_to(None);
+    assert_eq!(at(at0 + 12, None, &new, Some(9)).await, None);
+    // What the read before the reimage says: a running pod's ports; a stopped pod's none; a
+    // running pod without them, not known.
+    let detail = |status: &str, ports: Value| json!({"id": "p1", "status": status, "runtime": ports});
+    let ports = json!({"uptime": 114, "ports": [{"ip": "157.157.221.29", "private": 22, "public": 59950, "type": "tcp"}, {"ip": "100.65.13.70", "private": 8888, "public": 60936, "type": "http"}]});
+    assert_eq!(Reset::of(&detail("RUNNING", ports), 1).old_ports, Some(vec![59950, 60936]));
+    assert_eq!(Reset::of(&detail("EXITED", Value::Null), 1).old_ports, Some(vec![]));
+    assert_eq!(Reset::of(&detail("RUNNING", Value::Null), 1).old_ports, None);
     // A reimaged pod gone from the listing, started after the reimage, or waited on too long,
     // is forgotten...
     reset(&old);

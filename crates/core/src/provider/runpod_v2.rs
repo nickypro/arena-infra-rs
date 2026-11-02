@@ -569,8 +569,10 @@ struct Reset {
     /// When the request went out (unix seconds): the new container started after it, and a
     /// `startedAt` after it is a start since, which makes the reset moot.
     at: u64,
-    /// The old container's public ports (`runtime.ports`, SSH and HTTP alike; empty: none ran).
-    old_ports: Vec<u16>,
+    /// The old container's public ports (`runtime.ports`, SSH and HTTP alike): empty when the
+    /// pod wasn't running (no container ran), `None` when it was but its ports weren't shown —
+    /// then nothing tells the new container (review r5).
+    old_ports: Option<Vec<u16>>,
     /// The new container's endpoint, once a lookup showed it. A listing that names none, or
     /// another, is overruled by it, until the listing names this one (review r2, r3).
     new: Option<(String, u16)>,
@@ -579,7 +581,13 @@ struct Reset {
 impl Reset {
     /// The reset sent at `at` of the container `before` (the pod's detail just before). Pure.
     fn of(before: &Value, at: u64) -> Self {
-        Reset { at, old_ports: public_ports(before), new: None }
+        let ports = public_ports(before);
+        let old_ports = if !parse_pod(before).status.eq_ignore_ascii_case("RUNNING") {
+            Some(Vec::new())
+        } else {
+            Some(ports).filter(|p| !p.is_empty())
+        };
+        Reset { at, old_ports, new: None }
     }
 }
 
@@ -609,19 +617,21 @@ const RESET_WAIT_SECS: u64 = 1800;
 const CLOCK_SLACK: u64 = 5;
 
 /// Whether a reimaged pod's detail (`body`) shows the new container, on positive evidence only
-/// (the API names no container): an endpoint whose uptime fits in the time since the reset, with
-/// other public ports than the old container's — RunPod gave every port anew, SSH and HTTP, on
+/// (the API names no container): an endpoint whose uptime fits in the time since the reset, on a
+/// public port the old container didn't have — RunPod gave every port anew, SSH and HTTP, on
 /// each of 5 resets seen live — or, where no container ran before, the uptime alone. An old
-/// container shows its own ports however stale its detail, and no uptime tells nothing. A
-/// replacement that got every port back can't be told from the old container (an uptime that
-/// went down could be an out-of-order answer, review r4): the settle wait then times out and
-/// says to run `pods setup` — better than setup on the container being replaced. Pure.
+/// container shows only its own ports however stale or partial its detail, and no uptime tells
+/// nothing. Where the old ports weren't known, and for a replacement that got every port back,
+/// nothing tells (an uptime that went down could be an out-of-order answer, review r4): the
+/// settle wait then times out and says to run `pods setup` — better than setup on the container
+/// being replaced. Pure.
 fn is_new_container(body: &Value, reset: &Reset, now: u64) -> bool {
     let since = now.saturating_sub(reset.at);
+    let Some(old) = &reset.old_ports else { return false };
     if parse_pod(body).ssh_port.is_none() || container_uptime(body).is_none_or(|u| u > since + CLOCK_SLACK) {
         return false;
     }
-    reset.old_ports.is_empty() || public_ports(body) != reset.old_ports
+    old.is_empty() || public_ports(body).iter().any(|p| !old.contains(p))
 }
 
 /// An endpoint looked up within this long of the pod's start may not be its new one yet.
@@ -2303,7 +2313,7 @@ mod tests {
             let m = p.endpoints.lock().unwrap();
             assert!(!m.by_id.contains_key("e"));
             let r = &m.resets["e"];
-            assert_eq!((r.at, r.old_ports.as_slice(), r.new.as_ref()), (1_000, &[19984][..], None));
+            assert_eq!((r.at, r.old_ports.as_deref(), r.new.as_ref()), (1_000, Some(&[19984][..]), None));
         }
         // This provider's own next stop, start, restart or terminate ends the wait.
         assert!(p.stop_pod("e").await.is_err());
