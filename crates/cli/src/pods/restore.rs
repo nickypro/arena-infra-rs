@@ -119,7 +119,8 @@ pub(crate) async fn handle_restore(
         ssh.port,
     );
     if opts.dry_run {
-        out!(Brief, "[dry-run] would {brief} — nothing deleted; what it replaces is kept on the pod in {kept} (-v: the plan and rsync)");
+        let policy = if opts.overwrite_newer { "files newer on the pod ARE replaced" } else { "files newer on the pod stay" };
+        out!(Brief, "[dry-run] would {brief} — nothing deleted; {policy}; what it replaces is kept on the pod in {kept} (-v: the plan and rsync)");
         warnings();
         // Shell-quoted, so the line pastes as exactly this argv (the `.claude*` exclude unquoted
         // would expand against the operator's directory).
@@ -127,7 +128,9 @@ pub(crate) async fn handle_restore(
         return Ok(());
     }
     warnings();
-    let mut question = format!("{brief} (nothing deleted; what it replaces is kept on the pod)?");
+    // What it does to newer work on the pod, said in the question either way (`--overwrite-newer`).
+    let policy = if opts.overwrite_newer { "files newer on the pod ARE replaced" } else { "files newer on the pod stay" };
+    let mut question = format!("{brief} (nothing deleted; {policy}; what it replaces is kept on the pod)?");
     question.replace_range(..1, "R");
     if !crate::confirm_brief(opts.yes, &format!("Will {plan}"), &question)? {
         out!(Out, "aborted.");

@@ -783,7 +783,7 @@ pub(crate) async fn pull_pods(
             }
             Err((git, Ok(o))) => {
                 let pass = if git { ", .git" } else { "" };
-                let why = crate::pods::backup::telling_line(&o.stderr).unwrap_or_default();
+                let why = rsync_why(&o.stderr);
                 say_to(To::Brief, &out::fail(format!("{} [{tier}{pass}]: rsync {}: {why}{moved} {retry}", out::bold(&name), o.exit_label())));
                 say_to(To::Detail, &format!("[{done}/{jobs}] ✗ {name} [{tier}{pass}] (rsync {}): {}{moved}", o.exit_label(), o.stderr.trim()));
                 failed += 1;
@@ -928,6 +928,19 @@ fn copy_tally(pods: &[String], overdue: &[String], failed: &[(String, String)], 
         out::ok(format!("{what} of {} → {dest}{size}{skipped}", pods_word(ok)))
     } else {
         out::fail(format!("{what}: {} of {} failed · {ok} copied → {dest}{skipped}", bad.len(), pods.len()))
+    }
+}
+
+/// A failed rsync's stderr as the default output's line keeps it (docs/OUTPUT.md; a cron's log
+/// can't be asked again with `-v`): its own `rsync: …` lines — what failed, where — the first two
+/// and how many more, else the line that tells most ([`crate::pods::backup::telling_line`]: its
+/// `rsync error: … (code N)` verdict, ssh's). Pure.
+pub(crate) fn rsync_why(stderr: &str) -> String {
+    let specific: Vec<&str> = stderr.lines().map(str::trim).filter(|l| l.starts_with("rsync: ") || l.starts_with("ssh: ")).collect();
+    match specific.len() {
+        0 => crate::pods::backup::telling_line(stderr).unwrap_or_default().to_string(),
+        1 | 2 => specific.join("; "),
+        n => format!("{}; {} (+{} more)", specific[0], specific[1], n - 2),
     }
 }
 

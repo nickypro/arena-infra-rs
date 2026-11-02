@@ -1193,7 +1193,7 @@ fn seed_note(tier: Tier, need: u64, ctx: &SyncCtx<'_>) {
 /// count, never their targets (a participant's text) — and which pods it can't carry at all.
 fn skip_note(ctx: &SyncCtx<'_>, what: &str, job: &PushJob) {
     if !job.skip.is_empty() {
-        (ctx.say)(To::Detail, &format!(
+        (ctx.say)(To::Out, &format!(
             "! {what}: {} symlink(s) left out — a target too long to store on the archive (over {} bytes)",
             job.skip.len(),
             push::PATH_MAX - push::MUNGE_PREFIX.len() - 1
@@ -1547,6 +1547,11 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
                 through.join(", "),
                 stats.summary()
             ));
+        } else {
+            // None through (its budget ran out, a push cut off, a pull still running, a failure):
+            // the label's line by default all the same, so a run that got nowhere says so — why,
+            // per pod, above it or with `-v`.
+            (ctx.say)(To::Brief, &format!("◐ snap {label} (0 of {} pod(s) through) — the label stays open; it continues next run", pods.len()));
         }
     }
     if o.dry_run {
@@ -1682,7 +1687,10 @@ async fn sync_big(ctx: &SyncCtx<'_>) -> Result<usize> {
                 st.pods_failing.remove(pod);
                 let stats = stats.unwrap_or_default();
                 sent_all = sent_all.add(stats);
-                (ctx.say)(To::Detail, &format!("✓ big {pod} ({}){}", stats.summary(), note.map(|n| format!(" — note: {n}")).unwrap_or_default()));
+                // By default only when it has a note (files that vanished mid-push): the tier's line
+                // says the rest.
+                let to = if note.is_some() { To::Out } else { To::Detail };
+                (ctx.say)(to, &format!("✓ big {pod} ({}){}", stats.summary(), note.map(|n| format!(" — note: {n}")).unwrap_or_default()));
             }
             Err((PushFailure::Timeout, msg)) if left < fair || sent > 0 => {
                 all_through = false;
@@ -3361,7 +3369,8 @@ mod tests {
         let run = |o: SyncOpts, at: u64| async move {
             let lines = Mutex::new(Vec::new());
             let say = |to: To, l: &str| lines.lock().unwrap().push((to, l.to_string()));
-            archive_sync_with(&w.cfg, &w.env().paths, o, stub, &clock(at), &say).await.unwrap();
+            // A push that fails fails the run: what it said is the point here.
+            let _ = archive_sync_with(&w.cfg, &w.env().paths, o, stub, &clock(at), &say).await;
             let lines = lines.into_inner().unwrap();
             let at = |verbose: bool| lines.iter().filter(|(to, _)| to.shows(verbose)).map(|(_, l)| format!("{l}\n")).collect::<String>();
             (at(false), at(true).replace(dir.as_str(), "<dir>"))
@@ -3380,6 +3389,14 @@ mod tests {
         assert!(brief.ends_with(ghost), "{brief}");
         assert!(verbose.starts_with("Pushing <dir>/") && verbose.contains("\n✓ big devtest-alpha (") && !verbose.contains("✓ big (1 pod(s)"), "{verbose}");
         assert_eq!(verbose.lines().filter(|l| l.starts_with("✓ snap ")).collect::<Vec<_>>(), snap, "the labels' lines at both");
+        // A label nobody got through still has its line by default (review r1 #3): here after
+        // the pod's own failure.
+        std::fs::write(w.dir.join("fail-pod-devtest-alpha"), "rsync: [sender] send_files failed to open \"/x\": Permission denied (13)\n").unwrap();
+        std::fs::write(w.dir.join("fail-pod-devtest-alpha.code"), "23").unwrap();
+        let (brief, _) = run(sync_opts("snap"), now + 900).await;
+        let lines: Vec<&str> = brief.lines().collect();
+        assert!(lines.first().is_some_and(|l| l.starts_with("✗ snap w0d2 devtest-alpha: ")), "{brief}");
+        assert!(lines.contains(&"◐ snap w0d2 (0 of 1 pod(s) through) — the label stays open; it continues next run"), "{brief}");
     }
 
     /// §14: the newest label first (behind it the backlog, oldest first), pod by pod — two

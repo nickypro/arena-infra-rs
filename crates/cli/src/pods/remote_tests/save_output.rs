@@ -14,24 +14,27 @@ fn after(ms: u64, reply: FakeReply) -> FakeReply {
     reply.after(Duration::from_millis(ms))
 }
 
-/// A stand-in rsync that takes its time by tier, so the copies end in the same order every run:
-/// each snapshot pass `snap` seconds, the big tier `big`; one whose destination holds `fail` fails
-/// after `big` seconds as rsync does when the connection drops (exit 12).
-fn paced_rsync(tag: &str, snap: &str, big: &str, fail: &str) -> StubRsync {
+/// A stand-in rsync that takes its time by destination, so the copies end in the same order
+/// every run, a few hundred milliseconds apart: the first `(pattern, seconds)` whose shell pattern
+/// matches the destination (its last argument); one matching `fail` then fails as rsync does when
+/// the connection drops (exit 12).
+fn paced_rsync(tag: &str, paces: &[(&str, &str)], fail: &str) -> StubRsync {
     let stub = StubRsync::new(tag);
+    let cases: String = paces.iter().map(|(pat, secs)| format!("  {pat}) sleep {secs};;\n")).collect();
     arena_core::remote::write_test_script(
         stub.0.join("rsync"),
         format!(
-            "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\n\
-             case \"$last\" in */big/*{fail}*) sleep {big}; \
-             echo 'rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]' >&2; \
-             echo 'rsync error: error in rsync protocol data stream (code 12)' >&2; exit 12;; \
-             */big/*) sleep {big};; *) sleep {snap};; esac\n"
+            "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\ncase \"$last\" in\n{cases}esac\n\
+             case \"$last\" in {fail}) echo 'rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]' >&2; \
+             echo 'rsync error: error in rsync protocol data stream (code 12)' >&2; exit 12;; esac\n"
         ),
     )
     .unwrap();
     stub
 }
+
+/// The copies of one pod: its snapshot's two passes first, its big tier after.
+const SNAPSHOT_FIRST: &[(&str, &str)] = &[("*/big/*", "0.5"), ("*", "0.05")];
 
 /// The run's text with its temp dir and today's snapshot label (from ARENA_START_DATE) made
 /// stable.
@@ -47,14 +50,14 @@ fn stable(text: &str, stub: &StubRsync, cfg: &Config) -> String {
 async fn backup_cron_run_says_failures_and_a_tally_by_default() {
     let mut out = Vec::new();
     for verbose in [false, true] {
-        let stub = paced_rsync(&format!("golden-backup-{verbose}"), "0.05", "0.4", "no-such-pod");
+        let stub = paced_rsync(&format!("golden-backup-{verbose}"), SNAPSHOT_FIRST, "no-such-pod");
         let cfg = cfg_at(&stub);
         let four = fleet_of(&[("apple", 22001), ("bloom", 22002), ("cloud", 22003), ("delta", 22004)]);
         let fake = Arc::new(FakeRemote::new());
-        fake.script(&host(22001), [after(10, FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"))]);
-        fake.script(&host(22002), [after(20, push_blocked("autocommit-b")), repo_in_place()]);
-        fake.script(&host(22003), [after(30, FakeReply::stdout("BRANCH autocommit-c\nNO_CHANGES autocommit-c\n"))]);
-        fake.script(&host(22004), [after(40, FakeReply::stdout("SKIP main\n"))]);
+        fake.script(&host(22001), [after(100, FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"))]);
+        fake.script(&host(22002), [after(200, push_blocked("autocommit-b")), repo_in_place()]);
+        fake.script(&host(22003), [after(300, FakeReply::stdout("BRANCH autocommit-c\nNO_CHANGES autocommit-c\n"))]);
+        fake.script(&host(22004), [after(400, FakeReply::stdout("SKIP main\n"))]);
         let (sel, rsync) = (everyone(&four), stub.path());
         let run = handle_full_backup(fake.clone(), &cfg, &sel, true, None, false, true, &rsync);
         out.push(stable(&rendered(verbose, &[], run).await, &stub, &cfg));
@@ -108,9 +111,9 @@ async fn backup_that_goes_well_is_one_line() {
     let stub = StubRsync::new("golden-backup-ok");
     let cfg = cfg_at(&stub);
     let fake = Arc::new(FakeRemote::new());
-    fake.script(&host(22001), [after(10, FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"))]);
-    fake.script(&host(22002), [after(20, FakeReply::stdout("BRANCH autocommit-b\nNO_CHANGES autocommit-b\n"))]);
-    fake.script(&host(22003), [after(30, FakeReply::stdout("BRANCH autocommit-c\nNO_CHANGES autocommit-c\n"))]);
+    fake.script(&host(22001), [after(100, FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"))]);
+    fake.script(&host(22002), [after(200, FakeReply::stdout("BRANCH autocommit-b\nNO_CHANGES autocommit-b\n"))]);
+    fake.script(&host(22003), [after(300, FakeReply::stdout("BRANCH autocommit-c\nNO_CHANGES autocommit-c\n"))]);
     let (sel, rsync) = (everyone(&fleet()), stub.path());
     let run = handle_full_backup(fake.clone(), &cfg, &sel, true, None, false, true, &rsync);
     assert_eq!(rendered(false, &[], run).await, "✓ git backup of 3 pods: 1 pushed, 2 no changes\n");
@@ -158,7 +161,9 @@ async fn backup_dry_run_is_a_line_and_the_script_is_for_v() {
 async fn pull_says_its_failures_and_a_tally_by_default() {
     let mut out = Vec::new();
     for verbose in [false, true] {
-        let stub = paced_rsync(&format!("golden-pull-{verbose}"), "0.05", "0.4", "devtest-bloom");
+        // apple's snapshot (0.1 s), apple's big (0.4 s), bloom's snapshot (0.7 s), bloom's big fails (1 s).
+        let paces = [("*/big/devtest-apple*", "0.4"), ("*/big/devtest-bloom*", "1"), ("*devtest-apple*", "0.05"), ("*devtest-bloom*", "0.35")];
+        let stub = paced_rsync(&format!("golden-pull-{verbose}"), &paces, "*/big/devtest-bloom*");
         let cfg = cfg_at(&stub);
         let two = fleet_of(&[("apple", 22001), ("bloom", 22002)]);
         let fake = Arc::new(FakeRemote::new());
@@ -172,8 +177,8 @@ async fn pull_says_its_failures_and_a_tally_by_default() {
     }
     assert_eq!(
         out[0],
-        "✗ devtest-bloom [big]: rsync exit 12: rsync error: error in rsync protocol data stream (code 12) (retry: arena pods pull \
-         devtest-bloom)\n\
+        "✗ devtest-bloom [big]: rsync exit 12: rsync: connection unexpectedly closed (0 bytes received so far) [Receiver] (retry: \
+         arena pods pull devtest-bloom)\n\
          ✗ home copy: 1 of 2 failed · 1 copied → <tmp>/backups/wNdM\n\
          Error: 1 rsync job(s) failed: devtest-bloom [big]\n"
     );
@@ -184,8 +189,8 @@ async fn pull_says_its_failures_and_a_tally_by_default() {
          \n\
          Pulling 2 pod(s) into <tmp>/backups/ (dated snapshot wNdM + the all-files big/)…\n\
          [1/4] ✓ devtest-apple [snapshot] (done)\n\
-         [2/4] ✓ devtest-bloom [snapshot] (done)\n\
-         [3/4] ✓ devtest-apple [big] (done)\n\
+         [2/4] ✓ devtest-apple [big] (done)\n\
+         [3/4] ✓ devtest-bloom [snapshot] (done)\n\
          [4/4] ✗ devtest-bloom [big] (rsync exit 12): rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]\n\
          rsync error: error in rsync protocol data stream (code 12)\n\
          \n\
@@ -226,12 +231,12 @@ async fn pull_dry_run_is_a_line() {
 async fn set_branch_says_what_needs_saying_and_a_tally() {
     let mut out = Vec::new();
     for verbose in [false, true] {
-        let stub = paced_rsync(&format!("golden-setbranch-{verbose}"), "0.05", "0.4", "no-such-pod");
+        let stub = paced_rsync(&format!("golden-setbranch-{verbose}"), SNAPSHOT_FIRST, "no-such-pod");
         let cfg = cfg_at(&stub);
         let two = fleet_of(&[("apple", 22001), ("bloom", 22002)]);
         let fake = Arc::new(FakeRemote::new());
-        fake.script(&host(22001), [after(10, FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n")), after(10, FakeReply::ok())]);
-        fake.script(&host(22002), [after(20, push_blocked("autocommit-b")), repo_in_place(), after(20, FakeReply::ok())]);
+        fake.script(&host(22001), [after(100, FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n")), after(100, FakeReply::ok())]);
+        fake.script(&host(22002), [after(200, push_blocked("autocommit-b")), repo_in_place(), after(200, FakeReply::ok())]);
         let (sel, rsync) = (everyone(&two), stub.path());
         let run = handle_set_branch(fake.clone(), &cfg, "main", &sel, true, false, false, &rsync);
         out.push(stable(&rendered(verbose, &["y"], run).await, &stub, &cfg));
@@ -338,8 +343,8 @@ async fn init_branches_is_its_question_and_a_tally() {
         let cfg = cfg_at(&stub);
         let two = fleet_of(&[("apple", 22001), ("bloom", 22002)]);
         let fake = Arc::new(FakeRemote::new());
-        fake.script(&host(22001), [after(10, FakeReply::stdout("SKIP main\n")), after(10, FakeReply::ok())]);
-        fake.script(&host(22002), [after(20, FakeReply::stdout("SKIP main\n")), after(20, FakeReply::ok())]);
+        fake.script(&host(22001), [after(100, FakeReply::stdout("SKIP main\n")), after(100, FakeReply::ok())]);
+        fake.script(&host(22002), [after(200, FakeReply::stdout("SKIP main\n")), after(200, FakeReply::ok())]);
         let (sel, rsync) = (everyone(&two), stub.path());
         let run = handle_init_branches(fake.clone(), &cfg, Some(1), Some(2), &sel, false, false, &rsync);
         out.push(stable(&rendered(verbose, &["y"], run).await, &stub, &cfg));
@@ -382,9 +387,28 @@ async fn restore_dry_run_is_a_line() {
     }
     assert_eq!(
         out[0],
-        "[dry-run] would restore devtest-apple from w1d2 (2 file(s), 11) into ~/ — nothing deleted; what it replaces is kept on \
-         the pod in ~/.arena-restore/20261008T050640Z/ (-v: the plan and rsync)\n"
+        "[dry-run] would restore devtest-apple from w1d2 (2 file(s), 11) into ~/ — nothing deleted; files newer on the pod stay; \
+         what it replaces is kept on the pod in ~/.arena-restore/20261008T050640Z/ (-v: the plan and rsync)\n"
     );
     assert!(out[1].starts_with("[dry-run] would restore devtest-apple (id=id-devtest-apple, runpod):\n  from:  <tmp>/backups/w1d2/devtest-apple (w1d2, a snapshot: files under the size cap) — 2 file(s), 11\n"), "{}", out[1]);
     assert!(out[1].lines().last().is_some_and(|l| l.starts_with("  ") && l.contains("rsync") && l.contains("--backup-dir=")), "{}", out[1]);
+}
+
+/// A failed rsync's default line keeps what rsync itself said went wrong (a cron's log can't be
+/// asked again with `-v`): its own `rsync:` lines, two and how many more; else its verdict line.
+#[test]
+fn a_failed_rsyncs_line_keeps_its_own_words() {
+    use crate::pods::pull::rsync_why;
+    let closed = "rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]\n\
+                  rsync error: error in rsync protocol data stream (code 12) at io.c(232) [Receiver=3.2.7]\n";
+    assert_eq!(rsync_why(closed), "rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]");
+    let denied: String = (1..=5).map(|i| format!("rsync: [sender] send_files failed to open \"/root/f{i}\": Permission denied (13)\n")).collect();
+    assert_eq!(
+        rsync_why(&format!("{denied}rsync error: some files/attrs were not transferred (code 23)\n")),
+        "rsync: [sender] send_files failed to open \"/root/f1\": Permission denied (13); rsync: [sender] send_files failed to open \
+         \"/root/f2\": Permission denied (13) (+3 more)"
+    );
+    assert_eq!(rsync_why("ssh: connect to host 10.0.0.1 port 22: Connection timed out\nrsync error: unexplained error (code 255)\n"), "ssh: connect to host 10.0.0.1 port 22: Connection timed out");
+    assert_eq!(rsync_why("some noise\nrsync error: error in file IO (code 11)\n"), "rsync error: error in file IO (code 11)");
+    assert_eq!(rsync_why(""), "");
 }
