@@ -22,7 +22,9 @@ round 1: 2 name(s) not placed (no capacity); retrying in 60s (Ctrl+C to stop)…
    plans, notes, explanations, ids, raw provider errors, and the chatter of each step.
 2. **One line per event.** No paragraphs. Aim for 80 columns.
 3. **Repeats collapse.** A failure that repeats every retry round gets one short line per round.
-   On a terminal that line is updated in place (`out::progress`).
+   On a terminal that line is updated in place (`out::progress`), and so is a long run's "where
+   is each pod" line; a log or a pipe gets a line when a long step starts instead
+   (`[devtest-apple] setup…`), since it has no line to update.
 4. **A provider error becomes a reason** (`out::reason`): `no capacity`, `rate limited`,
    `key rejected`. The HTTP status and the JSON body only show with `-v`.
 5. **Style:** bold for names and verdicts. A green ✓ for done, a red ✗ for failed, a yellow ‼
@@ -63,8 +65,9 @@ Prompts: `confirm_brief(yes, &what, &question)` asks `question [y/N]` on one lin
 asks `what` (the whole plan) and `Proceed? [y/N]` as before. Put what it acts on and what it costs
 in the question: `Create devtest-apple, devtest-bloom (≤$0.34/h)?`.
 
-Tests: `crate::output_test::rendered(verbose, &["y"], handler(…))` returns what a terminal would
-show, with colour off, the prompts answered as typed, and the error last as `main` prints it.
+Tests: `crate::output_test::rendered(verbose, &["y"], handler(…))` returns what the command
+printed as a log or a pipe gets it (no colour, no in-place line), the prompts answered as typed,
+and the error last as `main` prints it.
 Write a golden test for default and for `-v` (see `up/output_tests.rs`). Under `capture` nothing
 reaches the real terminal and `verbose()` is that capture's own. `-v` and `--color` are set once
 by `main` (`out::init`), so nothing needs a flag threaded to it.
@@ -73,7 +76,7 @@ by `main` (`out::init`), so nothing needs a flag threaded to it.
 
 - **The dashboard's runs panel** (`crates/tui/src/runs.rs`) runs `arena … --yes` with stdout to a
   log and reads: `[created] NAME`, `[NAME] READY…`, `[NAME] FAILED…`, `[NAME] STOPPED…`, and any
-  other `[NAME] …` as the pod's current step. It also reads `round N: …; retrying in Ns (Ctrl+C
+  other `[NAME] …` as the pod's current step (`up` keeps `[NAME] setup…` in logs for it). It also reads `round N: …; retrying in Ns (Ctrl+C
   to stop)…`, `interrupted — stopping retries`, and `retry window (`. `NOT_PODS` lists the tags
   that aren't pods. Styles are stripped in a log, so `[{bold(name)}]` still reads the same there.
 - **Cron logs** get what a pipe gets. `arena backups` reads only their size and age

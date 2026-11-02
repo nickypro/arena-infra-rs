@@ -554,7 +554,7 @@ pub(crate) async fn handle_pods_bal(
             let handing = owner_plan(&tracking, &owner, &names, false)?;
             say_mints(&mints);
             let cost = pre.cost.or_else(|| options.as_ref().and_then(|p| plan_cost(p, names.len())));
-            if !confirm_brief(yes, &what, &create_question(&names, cost.as_deref(), retry_mins, up_replaces(check, no_wait)))? {
+            if !confirm_brief(yes, &what, &create_question(&names, cost.as_deref(), retry_mins, up_replaces(check, no_wait, check_attempts).as_deref()))? {
                 out!(Out, "aborted.");
                 return Ok(());
             }

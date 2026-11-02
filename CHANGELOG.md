@@ -27,7 +27,9 @@ earlier).
   and a tally. A provider's raw error, the notes, the ids, each step and the summary table are
   gone from the default. The same no-capacity error every retry round becomes one round line,
   updated in place on a terminal. While pods are being set up, a terminal shows one line at the
-  bottom with where each pod is.
+  bottom with where each pod is; a log gets `[name] setup…` instead (the dashboard shows it). The
+  prompt says what `up` will terminate on its own: `A pod without SSH is terminated and tried
+  again (2 tries per name).`
 - **`-v` (`--verbose`) works on every command** and shows everything as before. `balance -v`,
   `offers -v` and `pods test --deep -v` work as they did.
 - **Colour on a terminal:** names and verdicts in bold, ✓ green, ✗ red, ‼ yellow. `--color

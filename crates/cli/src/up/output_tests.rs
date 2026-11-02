@@ -1,7 +1,9 @@
-//! Golden tests of `pods up`'s output (docs/OUTPUT.md): what a terminal shows, at default and
-//! at `-v`, for whole runs against fakes — one that goes well, capacity short for a few
-//! rounds, a setup that fails, and a pod that never gets an SSH endpoint and is replaced. The
-//! clock is paused, so every time in them is exact; the prompt is answered `y` as typed.
+//! Golden tests of `pods up`'s and `pods create`'s output (docs/OUTPUT.md), at default and at
+//! `-v`, for whole runs against fakes: one that goes well, capacity short for a few rounds, a
+//! setup that fails, a pod that never gets an SSH endpoint (replaced, then out of tries), and a
+//! create on its second option. What they show is what a log or a pipe gets — a terminal draws
+//! the round and step lines in place instead. The clock is paused, so every time in them is
+//! exact; the prompt is answered `y` as typed.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -170,6 +172,16 @@ async fn up_with_a_failed_setup() {
     assert_eq!(loud, LOUD_UP_WITH_A_FAILED_SETUP.trim_start(), "-v:\n{loud}");
 }
 
+/// Both of a name's tries come up without SSH: the second is terminated too, and said so; the
+/// name FAILs saying nothing of it is left.
+#[tokio::test(start_paused = true)]
+async fn up_when_no_try_is_left() {
+    let fleet = || Fleet::new(&[("apple", &[("proxy", 0, 5), ("proxy", 0, 5)])]);
+    let (quiet, loud) = both("no-try", || up(1, 0), fleet, FakeRemote::new).await;
+    assert_eq!(quiet, QUIET_UP_WHEN_NO_TRY_IS_LEFT.trim_start(), "default:\n{quiet}");
+    assert_eq!(loud, LOUD_UP_WHEN_NO_TRY_IS_LEFT.trim_start(), "-v:\n{loud}");
+}
+
 /// `pods create` with two options, the first out of capacity: the options as a compact table
 /// (their notes are `-v`'s), the prompt, and the pod — not the option that had no capacity.
 #[tokio::test(start_paused = true)]
@@ -197,10 +209,13 @@ async fn up_replacing_a_pod_with_no_endpoint() {
 const QUIET_UP_THAT_GOES_WELL: &str = r#"
 1×RTX A4000 · RunPod COMMUNITY
 Balance $120.00 → ≈4.3d left
-Create devtest-apple, devtest-bloom (≤~$0.64/h), replacing any without SSH? [y/N] y
+A pod without SSH is terminated and tried again (2 tries per name).
+Create devtest-apple, devtest-bloom (≤~$0.64/h)? [y/N] y
 [created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
 [created] devtest-bloom · 1×RTX A4000 COMMUNITY · $0.17/h
+[devtest-apple] setup…
 [devtest-apple] READY after 0s · keys ✓
+[devtest-bloom] setup…
 [devtest-bloom] READY after 30s · keys ✓
 ✓ 2 of 2 READY
 "#;
@@ -208,11 +223,13 @@ Create devtest-apple, devtest-bloom (≤~$0.64/h), replacing any without SSH? [y
 const QUIET_UP_WAITING_FOR_CAPACITY: &str = r#"
 1×RTX A4000 · RunPod COMMUNITY
 Balance $120.00 → ≈6.0d left
-Create devtest-apple (≤~$0.32/h), retrying up to 10m, replacing any without SSH? [y/N] y
+A pod without SSH is terminated and tried again (2 tries per name).
+Create devtest-apple (≤~$0.32/h), retrying up to 10m? [y/N] y
 round 1: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…
 round 2: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…
 round 3: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…
 [created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
+[devtest-apple] setup…
 [devtest-apple] READY after 0s · keys ✓
 ✓ 1 of 1 READY
 "#;
@@ -220,10 +237,13 @@ round 3: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…
 const QUIET_UP_WITH_A_FAILED_SETUP: &str = r#"
 1×RTX A4000 · RunPod COMMUNITY
 Balance $120.00 → ≈4.3d left
-Create devtest-apple, devtest-bloom (≤~$0.64/h), replacing any without SSH? [y/N] y
+A pod without SSH is terminated and tried again (2 tries per name).
+Create devtest-apple, devtest-bloom (≤~$0.64/h)? [y/N] y
 [created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
 [created] devtest-bloom · 1×RTX A4000 COMMUNITY · $0.17/h
+[devtest-apple] setup…
 [devtest-apple] READY after 0s · keys ✓
+[devtest-bloom] setup…
 [devtest-bloom] FAILED setup: failed at repo + keys config, exit 128: fatal: could not read from remote repository. — left running (retry: `arena pods setup devtest-bloom`)
 Error: 1 of 2 pod(s) not ready: devtest-bloom (FAILED setup)
 "#;
@@ -231,10 +251,12 @@ Error: 1 of 2 pod(s) not ready: devtest-bloom (FAILED setup)
 const QUIET_UP_REPLACING_A_POD_WITH_NO_ENDPOINT: &str = r#"
 1×RTX A4000 · RunPod COMMUNITY
 Balance $120.00 → ≈6.0d left
-Create devtest-apple (≤~$0.32/h), replacing any without SSH? [y/N] y
+A pod without SSH is terminated and tried again (2 tries per name).
+Create devtest-apple (≤~$0.32/h)? [y/N] y
 [created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
 [devtest-apple] no SSH endpoint — replacing it (attempt 2 of 2)
 [created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
+[devtest-apple] setup…
 [devtest-apple] READY after 5m10s · keys ✓
 ✓ 1 of 1 READY
 "#;
@@ -397,4 +419,48 @@ NAME           PLACEMENT
 devtest-apple  created on 1×RTX 3090 COMMUNITY (~$0.22/h) (after 1×RTX A4000 COMMUNITY: capacity)
 Placed 1 of 1.
 [proxy] after create: skipped — no proxy configured (SSH_PROXY_HOST unset)
+"#;
+
+const QUIET_UP_WHEN_NO_TRY_IS_LEFT: &str = r#"
+1×RTX A4000 · RunPod COMMUNITY
+Balance $120.00 → ≈6.0d left
+A pod without SSH is terminated and tried again (2 tries per name).
+Create devtest-apple (≤~$0.32/h)? [y/N] y
+[created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
+[devtest-apple] no SSH endpoint — replacing it (attempt 2 of 2)
+[created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
+[devtest-apple] no SSH endpoint — terminating it, no try left
+[devtest-apple] FAILED endpoint: no public endpoint (RunPod ssh proxy only) for 5m00s (its host has no public IP — no scp/rsync/port-forwards) — runpod names no machine or data centre for it — no attempts left (--check-attempts 2); terminated it — devtest-apple has no pod now, nothing of it left billing
+Error: 1 of 1 pod(s) not ready: devtest-apple (FAILED endpoint)
+"#;
+
+const LOUD_UP_WHEN_NO_TRY_IS_LEFT: &str = r#"
+balance: runpod $120.00 live · $0.50/h now + ≤~$0.32/h for 1 new pod(s) (a stand-in that errs high — no live price) → ≈6.0d
+Will create 1 pod(s) on runpod (NVIDIA RTX A4000 x1, COMMUNITY, disk 100GB), then per pod, as soon as it can: wait for its SSH endpoint — a pod up without one for 5 min (RunPod: behind its SSH proxy only), or a RunPod pod with no container at --timeout (10 min or more), is TERMINATED and its name recreated (up to 2 placement(s) per name), sync the proxy (if nginx is set up), provision it, copy its API keys — then READY/FAILED per pod:
+  devtest-apple
+Proceed? [y/N] y
+Broadcast tokens: Hugging Face ✗ (✓ exported on each pod; ✗ skipped)
+API keys: OpenAI (3 hosts) — copied to each pod once it's set up
+
+Each pod is brought up on its own the moment it's created (endpoint wait ≤600s per pod, one up without an endpoint for 5 min is replaced; Ctrl+C stops — nothing is terminated by it)…
+[created] devtest-apple id=id1 on 1×RTX A4000 COMMUNITY ($0.17/h)
+
+Created 1 of 1 requested.
+[devtest-apple] no public endpoint (RunPod ssh proxy only) for 5m00s (its host has no public IP — no scp/rsync/port-forwards) — runpod names no machine or data centre for it: a host failure
+[devtest-apple] terminating id1 to recreate devtest-apple (attempt 2 of 2)
+[devtest-apple] recreating it — trying 1×RTX A4000 COMMUNITY first
+[created] devtest-apple id=id2 on 1×RTX A4000 COMMUNITY (price unknown)
+[devtest-apple] no public endpoint (RunPod ssh proxy only) for 5m00s (its host has no public IP — no scp/rsync/port-forwards) — runpod names no machine or data centre for it: a host failure
+[devtest-apple] terminating id2 — no attempt left to replace it (--check-attempts 2)
+[devtest-apple] FAILED endpoint: no public endpoint (RunPod ssh proxy only) for 5m00s (its host has no public IP — no scp/rsync/port-forwards) — runpod names no machine or data centre for it — no attempts left (--check-attempts 2); terminated it — devtest-apple has no pod now, nothing of it left billing
+[proxy] after up: skipped — no proxy configured (SSH_PROXY_HOST unset)
+
+NAME           GPU  $/H  PROXY PORT  HEALTH  STATUS           READY AFTER
+devtest-apple  -      -           -  -       FAILED endpoint            -
+
+devtest-apple: #1 1×RTX A4000 COMMUNITY (id1): no public SSH endpoint (RunPod ssh proxy only); terminated → #2 1×RTX A4000 COMMUNITY (id2): no public SSH endpoint (RunPod ssh proxy only); terminated
+devtest-apple: FAILED endpoint — no public endpoint (RunPod ssh proxy only) for 5m00s (its host has no public IP — no scp/rsync/port-forwards) — runpod names no machine or data centre for it — no attempts left (--check-attempts 2); terminated it — devtest-apple has no pod now, nothing of it left billing
+
+0 ready, 1 failed (of 1)
+Error: 1 of 1 pod(s) not ready: devtest-apple (FAILED endpoint)
 "#;

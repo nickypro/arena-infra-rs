@@ -605,8 +605,10 @@ pub(crate) async fn create_with_retry(
     // still bounds the whole operation: a top-up never balloons past what was agreed to.
     let retry_secs = retry_secs.max(1);
     let every = std::time::Duration::from_secs(retry_secs);
-    // A terminal's in-place round line goes when the rounds do (a log has each round's own).
+    // A terminal's in-place round line goes when the rounds do (a log has each round's own) —
+    // on every way out (review r2: a failed relist left it promising another round).
     let end_rounds = || arena_core::out::progress(ROUNDS, None);
+    let _rounds = arena_core::out::progress_guard(ROUNDS);
     // tokio's clock (not std's), so the paused-clock tests drive the window.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(retry_mins * 60);
     let topup = (target > 0).then(|| TopUp {

@@ -332,6 +332,9 @@ struct Shared<'r, 'a> {
 /// The key of `up`'s in-place line on a terminal ([`arena_core::out::progress`]).
 const STAGES: &str = "up";
 
+/// The steps long enough that a log says when each starts ([`Shared::stage`]).
+const LOGGED_STAGES: &[&str] = &["setup", "deep check"];
+
 /// Bring every pod in `made` up through its own pipeline, concurrently; returns one row per
 /// name, in `made`'s order, after a final proxy sync. `interrupt` resolving (Ctrl+C in the
 /// CLI) stops every pipeline where it is: no new attempt, no terminate, just the report.
@@ -566,29 +569,47 @@ impl Shared<'_, '_> {
         *self.stop.borrow()
     }
 
-    /// Where `name`'s pipeline is now (`None`: it ended), for a terminal's in-place line.
+    /// Where `name`'s pipeline is now (`None`: it ended). On a terminal, the in-place line — drawn
+    /// at once, so a pod's READY line never has its last step redrawn under it. In a log or a
+    /// pipe, which has no such line, a long step's start is a line of its own at default
+    /// (`[devtest-apple] setup…`): the dashboard's runs panel shows it as the pod's step, as it
+    /// did each step's line before they moved to `-v` (review r2).
     fn stage(&self, name: &str, what: Option<&'static str>) {
-        let mut stages = self.stages.lock().unwrap();
-        stages.retain(|(n, ..)| n != name);
-        if let Some(w) = what {
-            stages.push((name.to_string(), w, Instant::now()));
+        {
+            let mut stages = self.stages.lock().unwrap();
+            stages.retain(|(n, ..)| n != name);
+            if let Some(w) = what {
+                stages.push((name.to_string(), w, Instant::now()));
+            }
+        }
+        if arena_core::out::live() {
+            self.draw_stages();
+        } else if let Some(w) = what.filter(|w| LOGGED_STAGES.contains(w)) {
+            (self.say)(To::Brief, &format!("[{name}] {w}…"));
         }
     }
 
-    /// On a terminal, the pipelines' in-place line, redrawn every second while any runs —
-    /// `devtest-apple setup 2m10s · devtest-bloom waiting for SSH 30s` — so the quiet between a
-    /// `[created]` and its READY isn't a hang. Nothing off a terminal or with `-v` (it only
-    /// waits). Never returns.
+    /// The pipelines' in-place line on a terminal: `devtest-apple setup 2m10s · devtest-bloom
+    /// waiting for SSH 30s`; none once none runs. Nothing off a terminal or with `-v`.
+    fn draw_stages(&self) {
+        if !arena_core::out::live() {
+            return;
+        }
+        let line = {
+            let stages = self.stages.lock().unwrap();
+            stages.iter().map(|(n, w, t)| format!("{n} {w} {}", pipeline::fmt_elapsed(t.elapsed()))).collect::<Vec<_>>().join(" · ")
+        };
+        arena_core::out::progress(STAGES, (!line.is_empty()).then_some(line.as_str()));
+    }
+
+    /// [`Self::draw_stages`] every second while the pipelines run, so the quiet between a
+    /// `[created]` and its READY isn't a hang. Off a terminal it only waits. Never returns.
     async fn show_stages(&self) {
         if !arena_core::out::live() {
             return std::future::pending().await;
         }
         loop {
-            let line = {
-                let stages = self.stages.lock().unwrap();
-                stages.iter().map(|(n, w, t)| format!("{n} {w} {}", pipeline::fmt_elapsed(t.elapsed()))).collect::<Vec<_>>().join(" · ")
-            };
-            arena_core::out::progress(STAGES, (!line.is_empty()).then_some(line.as_str()));
+            self.draw_stages();
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
@@ -1325,6 +1346,8 @@ impl Shared<'_, '_> {
         self.stage(&name, Some("replacing"));
         if last {
             say(To::ErrDetail, &format!("[{name}] terminating {} — no attempt left to replace it (--check-attempts {max})", pod.id));
+            let short = run.attempts.last().map_or("failed", |a| attempt_brief(&a.end));
+            say(To::ErrBrief, &format!("[{}] {short} — terminating it, no try left", arena_core::out::bold(&name)));
         } else {
             say(To::ErrDetail, &format!("[{name}] terminating {} to recreate {name} (attempt {} of {max})", pod.id, n + 1));
             let short = run.attempts.last().map_or("failed", |a| attempt_brief(&a.end));
@@ -1414,12 +1437,13 @@ impl Shared<'_, '_> {
         };
         // Its own in-place line on a terminal, taken away however the placement ends.
         let rounds = format!("{} {name}", crate::pods::placement::ROUNDS);
+        let rounds_line = arena_core::out::progress_guard(&rounds);
         let mut show = |p: &Progress| crate::pods::placement::say_progress(p, say, &rounds);
         let names = [name.clone()];
         let placed =
             placement::place(self.run.provider, &base, &names, &plan, self.run.rounds, None, interrupt, &mut show)
                 .await;
-        arena_core::out::progress(&rounds, None);
+        drop(rounds_line);
         if let Some(bal) = self.run.balance {
             bal.remember_prices(&placed.created);
         }

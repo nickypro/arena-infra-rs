@@ -644,8 +644,9 @@ pub(crate) fn show_plan(provider: &dyn Provider, options: Option<&arena_core::pl
 
 /// The default prompt: `Create devtest-apple, devtest-bloom (≤$0.34/h), retrying up to 20m?` —
 /// what it acts on and what it costs (`cost`: per hour, all of them), at most three names and
-/// how many more; `and` what else it will do unasked (`up`: replacing a pod without SSH). Pure.
-pub(crate) fn create_question(names: &[String], cost: Option<&str>, retry_mins: u64, and: Option<&str>) -> String {
+/// how many more — after `note`, on its own line, what else it will do unasked (`up`: terminate
+/// a pod without SSH). Pure.
+pub(crate) fn create_question(names: &[String], cost: Option<&str>, retry_mins: u64, note: Option<&str>) -> String {
     const SHOWN: usize = 3;
     let mut what = names.iter().take(SHOWN).map(arena_core::out::bold).collect::<Vec<_>>().join(", ");
     if names.len() > SHOWN {
@@ -653,19 +654,25 @@ pub(crate) fn create_question(names: &[String], cost: Option<&str>, retry_mins: 
     }
     let cost = cost.map(|c| format!(" ({c})")).unwrap_or_default();
     let retry = if retry_mins > 0 { format!(", retrying up to {retry_mins}m") } else { String::new() };
-    let and = and.map(|a| format!(", {a}")).unwrap_or_default();
-    format!("Create {what}{cost}{retry}{and}?")
+    let note = note.map(|n| format!("{n}\n")).unwrap_or_default();
+    format!("{note}Create {what}{cost}{retry}?")
 }
 
-/// What `up` does unasked once it's said yes, for its prompt: it terminates and recreates a pod
-/// that never gets a usable SSH endpoint (with or without `--check`), and with `--check` one that
-/// fails it on its host. Nothing with `--no-wait`: no pipelines run. Pure.
-pub(crate) fn up_replaces(check: bool, no_wait: bool) -> Option<&'static str> {
-    match (no_wait, check) {
-        (true, _) => None,
-        (false, true) => Some("replacing any without SSH or failing the check"),
-        (false, false) => Some("replacing any without SSH"),
-    }
+/// What `up` does unasked once it's said yes, for its prompt: it terminates a pod that never gets
+/// a usable SSH endpoint (with or without `--check`), and with `--check` one that fails it on its
+/// host, and recreates its name while `tries` (`--check-attempts`) last — the last try's pod is
+/// terminated all the same. Nothing with `--no-wait`: no pipelines run. Pure.
+pub(crate) fn up_replaces(check: bool, no_wait: bool, tries: u32) -> Option<String> {
+    let what = match (no_wait, check) {
+        (true, _) => return None,
+        (false, true) => "without SSH or failing the check",
+        (false, false) => "without SSH",
+    };
+    // The last try's pod is terminated too: said, so a name left with none is no surprise.
+    Some(match tries {
+        0 | 1 => format!("A pod {what} is terminated (one try per name)."),
+        n => format!("A pod {what} is terminated and tried again ({n} tries per name)."),
+    })
 }
 
 /// What `n` pods on `plan` cost per hour at most (the dearest option): `≤$1.98/h`,
@@ -793,9 +800,10 @@ pub(crate) async fn place_names(
         }
     };
     let start = tokio::time::Instant::now();
+    let rounds_line = arena_core::out::progress_guard(ROUNDS);
     let run =
         placement::place(provider, base, &names, plan, rounds, topup.as_ref(), || interrupt.wait(), &mut show).await;
-    arena_core::out::progress(ROUNDS, None);
+    drop(rounds_line);
     arena_core::out::emit(arena_core::out::To::Detail, "");
     for l in placement::render_summary(plan, &run).lines() {
         arena_core::out::emit(arena_core::out::To::Detail, l);

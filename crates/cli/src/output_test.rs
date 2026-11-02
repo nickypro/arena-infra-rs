@@ -5,7 +5,8 @@ use std::future::Future;
 
 /// Run `run`, capturing what it prints ([`arena_core::out::capture`]) at `verbose`, its prompts
 /// answered from `answers` as typed (none left: refused, as with no terminal), and render what
-/// a terminal would show — both streams in order, its error last as `main` prints it.
+/// it showed — both streams in order, its error last as `main` prints it — as a log or a pipe
+/// gets it (no in-place line: `arena_core::out::live` is false while capturing).
 pub(crate) async fn rendered(verbose: bool, answers: &[&str], run: impl Future<Output = anyhow::Result<()>>) -> String {
     let cap = arena_core::out::capture(verbose);
     for a in answers {

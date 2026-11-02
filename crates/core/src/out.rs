@@ -405,6 +405,21 @@ pub fn progress(key: &str, text: Option<&str>) {
     draw_progress(&parts);
 }
 
+/// Takes the [`progress`] part `key` away when dropped: however the code that set it ends.
+#[must_use = "the part goes when the guard is dropped"]
+pub struct ProgressGuard(String);
+
+/// A [`ProgressGuard`] for `key`.
+pub fn progress_guard(key: &str) -> ProgressGuard {
+    ProgressGuard(key.to_string())
+}
+
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        progress(&self.0, None);
+    }
+}
+
 /// Whether a [`progress`] line can be drawn: stderr is a terminal, nothing is captured, and
 /// it isn't `-v`.
 pub fn live() -> bool {
@@ -431,8 +446,13 @@ fn draw_progress(parts: &[(String, String)]) {
     if parts.is_empty() {
         return;
     }
-    let line = strip(&parts.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" · "));
-    let line = fit(&line, PROGRESS_WIDTH.min(columns().saturating_sub(1)).max(10));
+    // One column short of the terminal, so it never wraps (a wrapped line can't be cleared in
+    // place); none at all on a terminal too narrow for one.
+    let width = PROGRESS_WIDTH.min(columns().saturating_sub(1));
+    if width < 2 {
+        return;
+    }
+    let line = fit(&strip(&parts.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" · ")), width);
     let line = if COLOR_ERR.load(Ordering::SeqCst) { dim(&line) } else { line };
     let mut err = std::io::stderr().lock();
     let _ = write!(err, "{line}");
@@ -602,6 +622,7 @@ mod tests {
         assert_eq!(fit("round 1: no capacity", 40), "round 1: no capacity");
         assert_eq!(fit("devtest-apple setup 2m10s · devtest-bloom waiting for SSH 30s", 30), "devtest-apple setup 2m10s · d…");
         assert_eq!(fit("✓ ab", 3), "✓ …");
+        assert_eq!(fit("abc", 1), "…");
     }
 
     #[test]
