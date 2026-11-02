@@ -198,7 +198,7 @@ pub(crate) async fn handle_full_backup(
         };
         (
             format!("commit + push {scope} (git), then rsync the home(s) to {dest}"),
-            format!("Back up {shown} (git push, then copy each home into {base})?"),
+            format!("Back up {shown} (git push, then copy each home into {})?", crate::pods::pull::copy_places(&base, Some(&big_root))),
         )
     };
     if !dry_run && !crate::confirm_brief(yes, &format!("Will {what}."), &question)? {

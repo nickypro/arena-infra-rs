@@ -229,6 +229,17 @@ pub(crate) fn busy_line(name: &str, wait: Duration) -> String {
     format!("busy: another backup of {name} is running (waited {}s for its lock) — skipped this run", wait.as_secs())
 }
 
+/// Where a copy lands, for a one-line question: the backup dir, and the all-files tier's root
+/// too when it's elsewhere (`LOCAL_BACKUP_BIG_DIR`: another volume) — every place that receives
+/// the pods' files is named (review r3 #2). Pure.
+pub(crate) fn copy_places(dir: &str, big_root: Option<&str>) -> String {
+    let under = |big: &str| std::path::Path::new(big).starts_with(std::path::Path::new(dir));
+    match big_root {
+        Some(big) if !under(big) => format!("{dir} and {big}"),
+        _ => dir.to_string(),
+    }
+}
+
 /// Where a pull writes its big tier, and whether it's in two-volume mode: `LOCAL_BACKUP_BIG_DIR`
 /// set and the pull going to the configured `LOCAL_BACKUP_DIR` — then both roots must carry
 /// their tier marker ([`arena_core::pull::TIER_MARKER`]). An explicit `--dir` elsewhere is a
@@ -509,7 +520,8 @@ pub(crate) async fn pull_pods(
     let names = targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ");
     let shown = arena_core::backups::render::names_line(&targets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), crate::pods::backup::NAMES_SHOWN);
     let what = format!("Will rsync {} pod home(s) into {dest_msg}: {names}", targets.len());
-    if !crate::confirm_brief(yes, &what, &format!("Copy the home of {shown} into {dir}?"))? {
+    let into = copy_places(dir, (!no_big).then_some(big_root.as_str()));
+    if !crate::confirm_brief(yes, &what, &format!("Copy the home of {shown} into {into}?"))? {
         out!(Out, "aborted.");
         return Ok(Pulled::default());
     }
@@ -932,19 +944,33 @@ fn copy_tally(pods: &[String], overdue: &[String], failed: &[(String, String)], 
 }
 
 /// A failed rsync's stderr as the default output's line keeps it (docs/OUTPUT.md; a cron's log
-/// can't be asked again with `-v`): its own lines in order — what failed and where, ssh's cause
-/// (`Permission denied (publickey)`) before rsync's `connection unexpectedly closed` — the first
-/// two and how many more, without rsync's closing `rsync error: … (code N)` verdict, which is
-/// said only when it's all there is. Pure.
+/// can't be asked again with `-v`): all of it, in order, on one line — ssh's notices and cause,
+/// rsync's own lines and its verdict — save that lines saying the same of different files
+/// (`send_files failed to open "…": Permission denied (13)` for each of a thousand) are one line
+/// and how many more like it, and past [`WHY_KINDS`] kinds, how many lines more. Pure.
 pub(crate) fn rsync_why(stderr: &str) -> String {
-    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    let own: Vec<&str> = lines.iter().copied().filter(|l| !l.starts_with("rsync error: ")).collect();
-    match own.len() {
-        0 => lines.last().copied().unwrap_or_default().to_string(),
-        1 | 2 => own.join("; "),
-        n => format!("{}; {} (+{} more)", own[0], own[1], n - 2),
+    // A line's kind: its words with any quoted path taken out.
+    let kind = |l: &str| l.split('"').enumerate().filter(|(i, _)| i % 2 == 0).map(|(_, p)| p).collect::<Vec<_>>().join("\"\"");
+    let mut kinds: Vec<(String, &str, usize)> = Vec::new();
+    for line in stderr.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let k = kind(line);
+        match kinds.iter_mut().find(|(seen, _, _)| *seen == k) {
+            Some((_, _, n)) => *n += 1,
+            None => kinds.push((k, line, 0)),
+        }
     }
+    let shown = kinds.len().min(WHY_KINDS);
+    let mut parts: Vec<String> =
+        kinds[..shown].iter().map(|(_, line, more)| if *more == 0 { line.to_string() } else { format!("{line} (+{more} like it)") }).collect();
+    let hidden: usize = kinds[shown..].iter().map(|(_, _, more)| more + 1).sum();
+    if hidden > 0 {
+        parts.push(format!("(+{hidden} more line(s))"));
+    }
+    parts.join("; ")
 }
+
+/// How many kinds of line a failed rsync's default line keeps ([`rsync_why`]).
+const WHY_KINDS: usize = 8;
 
 /// Why a selected pod wasn't pulled: no endpoint to reach it at.
 const NO_ENDPOINT_TO_PULL: &str = "no SSH endpoint to pull from";

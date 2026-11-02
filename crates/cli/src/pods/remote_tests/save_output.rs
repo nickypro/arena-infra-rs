@@ -37,26 +37,47 @@ fn paced_rsync(tag: &str, paces: &[(&str, &str)], fail: &str) -> StubRsync {
 /// The copies of one pod: its snapshot's two passes first, its big tier after.
 const SNAPSHOT_FIRST: &[(&str, &str)] = &[("*/big/*", "0.5"), ("*", "0.05")];
 
-/// `text` with each run of `[i/n] …` lines — pods or copies that run at the same time, and so
+/// `text` with each run of `[i/n] …` records — pods or copies that run at the same time, and so
 /// may end in either order — sorted, their counters dropped: a golden that holds whichever
-/// finishes first.
+/// finishes first. A record is its `[i/n]` line and the lines under it (a failed rsync's stderr)
+/// up to the next one or a blank line.
 fn unordered(text: &str) -> String {
+    let counted = |l: &str| {
+        let (n, rest) = l.strip_prefix('[')?.split_once("] ")?;
+        let (_, total) = n.split_once('/')?;
+        (n.chars().all(|c| c.is_ascii_digit() || c == '/')).then(|| format!("[{total}] {rest}"))
+    };
     let mut out: Vec<String> = Vec::new();
     let mut block: Vec<String> = Vec::new();
-    let counted = |l: &str| l.strip_prefix('[').and_then(|r| r.split_once("] ")).filter(|(n, _)| n.contains('/') && n.chars().all(|c| c.is_ascii_digit() || c == '/')).map(|(n, rest)| format!("[{}] {rest}", n.split('/').nth(1).unwrap_or("")));
+    let flush = |block: &mut Vec<String>, out: &mut Vec<String>| {
+        block.sort();
+        out.append(block);
+    };
     for line in text.lines() {
         match counted(line) {
             Some(l) => block.push(l),
+            None if !line.is_empty() && !block.is_empty() => {
+                let last = block.last_mut().expect("a record");
+                last.push('\n');
+                last.push_str(line);
+            }
             None => {
-                block.sort();
-                out.append(&mut block);
+                flush(&mut block, &mut out);
                 out.push(line.to_string());
             }
         }
     }
-    block.sort();
-    out.append(&mut block);
+    flush(&mut block, &mut out);
     out.join("\n")
+}
+
+/// [`unordered`] holds either finishing order, a record of several lines included.
+#[test]
+fn unordered_holds_either_finishing_order() {
+    let a = "head\n[1/3] ✗ bloom: rsync exit 12\nrsync error: code 12\n[2/3] ✓ apple\n[3/3] ✓ cloud\n\nDone.\n";
+    let b = "head\n[1/3] ✓ cloud\n[2/3] ✓ apple\n[3/3] ✗ bloom: rsync exit 12\nrsync error: code 12\n\nDone.\n";
+    assert_eq!(unordered(a), unordered(b));
+    assert_ne!(unordered(a), unordered(&b.replace("code 12\n\n", "code 12\n\nmore\n")));
 }
 
 /// The run's text with its temp dir and today's snapshot label (from ARENA_START_DATE) made
@@ -200,8 +221,8 @@ async fn pull_says_its_failures_and_a_tally_by_default() {
     }
     assert_eq!(
         out[0],
-        "✗ devtest-bloom [big]: rsync exit 12: rsync: connection unexpectedly closed (0 bytes received so far) [Receiver] (retry: \
-         arena pods pull devtest-bloom)\n\
+        "✗ devtest-bloom [big]: rsync exit 12: rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]; rsync \
+         error: error in rsync protocol data stream (code 12) (retry: arena pods pull devtest-bloom)\n\
          ✗ home copy: 1 of 2 failed · 1 copied → <tmp>/backups/wNdM\n\
          Error: 1 rsync job(s) failed: devtest-bloom [big]\n"
     );
@@ -440,26 +461,64 @@ async fn restore_dry_run_is_a_line() {
     assert!(out[1].starts_with("Will restore devtest-apple (id=id-devtest-apple, runpod):\n  from:  ") && out[1].ends_with(&format!("\nProceed? [y/N] y\n{done}")), "{}", out[1]);
 }
 
-/// A failed rsync's default line keeps what rsync itself said went wrong (a cron's log can't be
-/// asked again with `-v`): its own `rsync:` lines, two and how many more; else its verdict line.
+/// A failed rsync's default line keeps all it said (a cron's log can't be asked again with `-v`),
+/// in order — lines saying the same of different files as one, with how many more like it.
 #[test]
 fn a_failed_rsyncs_line_keeps_its_own_words() {
     use crate::pods::pull::rsync_why;
     let closed = "rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]\n\
                   rsync error: error in rsync protocol data stream (code 12) at io.c(232) [Receiver=3.2.7]\n";
-    assert_eq!(rsync_why(closed), "rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]");
-    // ssh's cause first (review r2 #2).
-    let denied_key = format!("root@10.0.0.1: Permission denied (publickey).\n{closed}");
-    assert_eq!(rsync_why(&denied_key), "root@10.0.0.1: Permission denied (publickey).; rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]");
+    let closed_line = "rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]; rsync error: error in rsync protocol data \
+                       stream (code 12) at io.c(232) [Receiver=3.2.7]";
+    assert_eq!(rsync_why(closed), closed_line);
+    // ssh's cause, after notices and a banner (review r2 #2, r3 #1).
+    let denied_key = format!("Warning: Permanently added '10.0.0.1' (ED25519) to the list of known hosts.\nWelcome to the pod\nroot@10.0.0.1: Permission denied (publickey).\n{closed}");
+    assert_eq!(
+        rsync_why(&denied_key),
+        format!("Warning: Permanently added '10.0.0.1' (ED25519) to the list of known hosts.; Welcome to the pod; root@10.0.0.1: Permission denied (publickey).; {closed_line}")
+    );
     let denied: String = (1..=5).map(|i| format!("rsync: [sender] send_files failed to open \"/root/f{i}\": Permission denied (13)\n")).collect();
     assert_eq!(
         rsync_why(&format!("{denied}rsync error: some files/attrs were not transferred (code 23)\n")),
-        "rsync: [sender] send_files failed to open \"/root/f1\": Permission denied (13); rsync: [sender] send_files failed to open \
-         \"/root/f2\": Permission denied (13) (+3 more)"
+        "rsync: [sender] send_files failed to open \"/root/f1\": Permission denied (13) (+4 like it); rsync error: some files/attrs \
+         were not transferred (code 23)"
     );
-    assert_eq!(rsync_why("ssh: connect to host 10.0.0.1 port 22: Connection timed out\nrsync error: unexplained error (code 255)\n"), "ssh: connect to host 10.0.0.1 port 22: Connection timed out");
+    let many: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+    assert_eq!(rsync_why(&many), "line 1; line 2; line 3; line 4; line 5; line 6; line 7; line 8; (+2 more line(s))");
     assert_eq!(rsync_why("rsync error: error in file IO (code 11)\n"), "rsync error: error in file IO (code 11)");
     assert_eq!(rsync_why(""), "");
+}
+
+/// A copy's question names every place that receives the pods' files: the all-files tier's
+/// root too when it's on its own volume (review r3 #2).
+#[test]
+fn a_copys_question_names_where_both_tiers_go() {
+    use crate::pods::pull::copy_places;
+    assert_eq!(copy_places("/b", Some("/b/big")), "/b");
+    assert_eq!(copy_places("/b", None), "/b");
+    assert_eq!(copy_places("/b", Some("/mnt/big")), "/b and /mnt/big");
+    assert_eq!(copy_places("/b", Some("/bb/big")), "/b and /bb/big", "a prefix of the name isn't the dir");
+}
+
+
+
+/// A new day's branch that went to origin only in part is said by default (review r2 #1), not
+/// just with `-v`: its line, then the tally.
+#[tokio::test]
+async fn init_branches_says_by_default_what_it_left_unpushed() {
+    let stub = StubRsync::new("golden-init-unpushed");
+    let cfg = cfg_at(&stub);
+    let one = fleet_of(&[("apple", 22001)]);
+    let fake = Arc::new(FakeRemote::new());
+    fake.script(&host(22001), [FakeReply::stdout("SKIP main\n"), FakeReply::stdout("UNPUSHED 3 none\n")]);
+    let (sel, rsync) = (everyone(&one), stub.path());
+    let run = handle_init_branches(fake.clone(), &cfg, Some(1), Some(2), &sel, false, true, &rsync);
+    assert_eq!(
+        rendered(false, &[], run).await,
+        "[1/1] ✓ devtest-apple -> autocommit-devtest-w1d2-apple — not pushed: origin has none of its 3 commit(s); the next backup \
+         scans them for keys and pushes the branch\n\
+         ✓ on the w1d2 branch: 1 of 1 pod\n"
+    );
 }
 
 /// `pods baseline`: by default its question in a line and what it kept, in a line; with `-v` the
@@ -512,24 +571,5 @@ async fn baseline_is_its_question_and_a_line() {
              ✓ week 0's baseline from devtest-apple: 1 files, 3 that came with the image (in {dest}); left out 2 files, 11 written \
              or copied onto it since the container was created. Snapshots from now on hard-link to it.\n"
         )
-    );
-}
-
-/// A new day's branch that went to origin only in part is said by default (review r2 #1), not
-/// just with `-v`: its line, then the tally.
-#[tokio::test]
-async fn init_branches_says_by_default_what_it_left_unpushed() {
-    let stub = StubRsync::new("golden-init-unpushed");
-    let cfg = cfg_at(&stub);
-    let one = fleet_of(&[("apple", 22001)]);
-    let fake = Arc::new(FakeRemote::new());
-    fake.script(&host(22001), [FakeReply::stdout("SKIP main\n"), FakeReply::stdout("UNPUSHED 3 none\n")]);
-    let (sel, rsync) = (everyone(&one), stub.path());
-    let run = handle_init_branches(fake.clone(), &cfg, Some(1), Some(2), &sel, false, true, &rsync);
-    assert_eq!(
-        rendered(false, &[], run).await,
-        "[1/1] ✓ devtest-apple -> autocommit-devtest-w1d2-apple — not pushed: origin has none of its 3 commit(s); the next backup \
-         scans them for keys and pushes the branch\n\
-         ✓ on the w1d2 branch: 1 of 1 pod\n"
     );
 }

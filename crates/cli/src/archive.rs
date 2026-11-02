@@ -1047,7 +1047,7 @@ pub(crate) async fn archive_sync_with(
     }
     let off_list = off_list_present(&dir, big_seen, &local, &allowed, &c.current);
     if !off_list.is_empty() {
-        say(To::Detail, &format!("off MACHINE_NAME_LIST, still archived (they were on it): {} — `arena archive forget <pod>` stops that", off_list.join(", ")));
+        say(To::Out, &format!("off MACHINE_NAME_LIST, still archived (they were on it): {} — `arena archive forget <pod>` stops that", off_list.join(", ")));
     }
     if failed > 0 {
         bail!("{failed} archive push(es) failed");
