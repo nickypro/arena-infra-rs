@@ -185,6 +185,18 @@ pub(crate) fn list_key(ui: &mut Ui, code: KeyCode, len: usize) -> ListKey {
     ListKey::Done
 }
 
+/// Before `a`, `d` or `?` picks between the marked set and the cursor pod: clear the marks if
+/// none of them is a listed pod. A mark outlives its pod (terminated, renamed, replaced) and
+/// shows on no row, so a set of only those reads as nothing marked, and the key should act on
+/// the cursor pod. Live (2026-11-02): pods marked and unmarked back to none on screen, and `a`
+/// offered actions on "0 marked pods". Marks with a listed pod among them are kept as they
+/// are.
+pub(crate) fn forget_unlisted_marks(ui: &mut Ui, pods: &[arena_core::Pod]) {
+    if !ui.marked.is_empty() && crate::state::marked_pods(pods, &ui.marked).is_empty() {
+        ui.marked.clear();
+    }
+}
+
 /// The dashboard's parts the key handling needs besides `ui`.
 pub(crate) struct Ctx<'a> {
     pub shared: &'a Arc<Mutex<Shared>>,
@@ -250,6 +262,9 @@ fn handle_key_in(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui
     }
     if let Some(changed) = info_key(ui, code) {
         return Ok(if changed { Flow::Changed } else { Flow::Same });
+    }
+    if matches!(ui.mode, Mode::List | Mode::Detail) && matches!(code, KeyCode::Char('a' | 'd' | '?')) {
+        forget_unlisted_marks(ui, &shared.lock().unwrap().pods);
     }
     // `?` and its two popups (ask.rs); the add-pod form and its confirm (newpod.rs); the runs
     // panel, `p`, and the quit question (runs.rs).
@@ -561,6 +576,24 @@ mod tests {
         let n = shared.notice.clone().unwrap();
         assert_eq!((n.text.as_str(), n.error), ("marked 1 pod: bravo", false));
         assert!(matches!(ui.mode, Mode::List));
+    }
+
+    /// A mark whose pod left the list shows on no row, so with only such marks `a` acts on the
+    /// cursor pod instead of offering actions on "0 marked pods"; a listed mark keeps the set.
+    #[test]
+    fn marks_of_pods_no_longer_listed_dont_count_as_marked() {
+        let shared = fixture_shared();
+        let pods = shared.pods.clone();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let gone = "runpod:terminated-earlier".to_string();
+        ui.marked = HashSet::from([gone.clone(), "runpod:rp1".to_string()]);
+        forget_unlisted_marks(&mut ui, &pods);
+        assert_eq!(ui.marked.len(), 2, "one is listed: the set is kept as it is");
+        ui.marked.remove("runpod:rp1"); // unmarked: nothing marked on screen
+        forget_unlisted_marks(&mut ui, &pods);
+        assert!(ui.marked.is_empty(), "only unlisted marks: cleared");
+        list_key(&mut ui, KeyCode::Char('a'), pods.len());
+        assert!(matches!(ui.mode, Mode::Menu { sel: 0 }), "the cursor pod's menu, not a marked set's");
     }
 
     /// Esc steps back and never quits: from the detail view to the list (the marks kept), and
