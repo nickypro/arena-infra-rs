@@ -26,7 +26,7 @@ use crate::capability::{self, Backend, Op, Support};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::pod::{Pod, PodSpec};
-use crate::provider::{build, ContainerReset, Provider, StopOutcome};
+use crate::provider::{build, ContainerReset, Provider, Resize, StopOutcome};
 
 /// The known backends, in the order they're listed/built. `shadeform` is opt-in overflow: it
 /// joins the fleet's listing when `SHADEFORM_API_KEY` is set, and creates only when chosen.
@@ -232,6 +232,9 @@ impl Provider for MultiProvider {
     }
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
         self.backend_for(id).await?.reimage_pod(id, image, env).await
+    }
+    async fn reimage_pod_resized(&self, id: &str, image: &str, env: &[(String, String)], resize: Resize) -> Result<()> {
+        self.backend_for(id).await?.reimage_pod_resized(id, image, env, resize).await
     }
     async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
         self.backend_for(id).await?.pod_spec(id).await

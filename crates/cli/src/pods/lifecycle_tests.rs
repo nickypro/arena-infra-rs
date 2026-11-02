@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use arena_core::idle::fixture::Reply;
 use arena_core::openrouter::{CreatedKey, KeyApi, KeyInfo};
-use arena_core::provider::ContainerReset;
+use arena_core::provider::{ContainerReset, Resize};
 use arena_core::remote::{FakeRemote, FakeReply, RemoteCall, PROBE_TIMEOUT};
 use arena_core::setup::name_file_command;
 use arena_core::volume::{probe_command, RepoSite};
@@ -1379,7 +1379,7 @@ async fn reimage_is_gated_like_restart_and_sets_the_pod_up_again() {
     take_would_refuse();
     let dry = RestartOpts { dry_run: true, yes: true, ..Default::default() };
     let pods = f.pods.lock().unwrap().clone();
-    handle_reimage(&f, remote.clone(), &cfg, &named(&pods[..1]), None, false, dry, FAST, &keys_dir).await.unwrap();
+    handle_reimage(&f, remote.clone(), &cfg, &named(&pods[..1]), None, Resize::default(), false, dry, FAST, &keys_dir).await.unwrap();
     let notes = take_would_refuse();
     assert!(notes.len() == 1 && notes[0].contains("refusing to reimage devtest-alpha without --wipe-ok"), "{notes:?}");
     assert!(f.calls().is_empty());
@@ -1387,7 +1387,7 @@ async fn reimage_is_gated_like_restart_and_sets_the_pod_up_again() {
     // back on, proxied there.
     let opts = RestartOpts { wipe_ok: true, yes: true, ..Default::default() };
     let before = remote.calls().len();
-    handle_reimage(&f, remote.clone(), &cfg, &named(&pods[..1]), None, false, opts, FAST, &keys_dir).await.unwrap();
+    handle_reimage(&f, remote.clone(), &cfg, &named(&pods[..1]), None, Resize::default(), false, opts, FAST, &keys_dir).await.unwrap();
     assert_eq!(f.calls(), ["reimage r-alpha img:9"]);
     let calls = remote.calls()[before..].to_vec();
     // Asked before the prompt, and again right before its reimage.
@@ -1404,7 +1404,7 @@ async fn reimage_is_gated_like_restart_and_sets_the_pod_up_again() {
     let on_volume = keyed_cfg(&dir.0, "BACKUP_REPO_PATH=/workspace/r\n");
     let bravo = g.pods.lock().unwrap()[1].clone();
     let opts = RestartOpts { no_setup: true, skip_proxy: true, yes: true, ..Default::default() };
-    handle_reimage(&g, Arc::new(FakeRemote::new()), &on_volume, &named(&[bravo]), None, true, opts, FAST, &keys_dir).await.unwrap();
+    handle_reimage(&g, Arc::new(FakeRemote::new()), &on_volume, &named(&[bravo]), None, Resize::default(), true, opts, FAST, &keys_dir).await.unwrap();
     assert_eq!(g.calls(), ["reimage r-bravo img:9"]);
 }
 
@@ -1431,7 +1431,7 @@ async fn reimage_refuses_a_pod_someone_is_on_unless_forced() {
             None => remote.on("10.0.0.1:22001", "ARENA_IDLE_NOW", FakeReply::exit(255, "ssh: connect to host 10.0.0.1 port 22001: Connection timed out")),
         };
         let pods = f.pods.lock().unwrap()[..2].to_vec();
-        let e = handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, false, opts, FAST, &keys_dir).await.unwrap_err().to_string();
+        let e = handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, Resize::default(), false, opts, FAST, &keys_dir).await.unwrap_err().to_string();
         assert!(e.contains("refusing to reimage devtest-alpha") && e.contains(why), "{e}");
         assert!(e.contains("`arena pods backup devtest-alpha`") && e.contains("--force"), "{e}");
         assert!(!e.contains("devtest-bravo"), "no one is on bravo: {e}");
@@ -1439,11 +1439,11 @@ async fn reimage_refuses_a_pod_someone_is_on_unless_forced() {
         // The dry run says so.
         take_would_refuse();
         let dry = RestartOpts { dry_run: true, ..opts };
-        handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, false, dry, FAST, &keys_dir).await.unwrap();
+        handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, Resize::default(), false, dry, FAST, &keys_dir).await.unwrap();
         let notes = take_would_refuse();
         assert!(notes.len() == 1 && notes[0].contains("refusing to reimage devtest-alpha") && notes[0].contains(why), "{notes:?}");
         // --force: both go.
-        handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, true, opts, FAST, &keys_dir).await.unwrap();
+        handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, Resize::default(), true, opts, FAST, &keys_dir).await.unwrap();
         assert_eq!(f.calls(), ["reimage r-alpha img:9", "reimage r-bravo img:9"]);
     }
     // Someone comes on bravo while alpha is reimaged (review F2): asked again right before
@@ -1463,7 +1463,7 @@ async fn reimage_refuses_a_pod_someone_is_on_unless_forced() {
         }),
     );
     let pods = f.pods.lock().unwrap()[..2].to_vec();
-    let e = handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, false, opts, FAST, &keys_dir).await.unwrap_err().to_string();
+    let e = handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, Resize::default(), false, opts, FAST, &keys_dir).await.unwrap_err().to_string();
     assert!(e.contains("1 pod(s) failed to reimage: devtest-bravo"), "{e}");
     assert_eq!(f.calls(), ["reimage r-alpha img:9"]);
     assert_eq!(bravo_probes.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -1487,7 +1487,7 @@ async fn reimage_refuses_a_pod_someone_is_on_unless_forced() {
     );
     remote.on("10.0.0.1:22002", "ARENA_IDLE_NOW", FakeReply::stdout(&Reply { sessions: vec![[10, 9, 9, 9]], ..Reply::default() }.render()));
     let pods = f.pods.lock().unwrap()[..2].to_vec();
-    let e = handle_reimage(f.as_ref(), remote.clone(), &cfg, &named(&pods), None, false, opts, FAST, &keys_dir).await.unwrap_err().to_string();
+    let e = handle_reimage(f.as_ref(), remote.clone(), &cfg, &named(&pods), None, Resize::default(), false, opts, FAST, &keys_dir).await.unwrap_err().to_string();
     assert!(e.contains("1 pod(s) failed to reimage: devtest-bravo"), "{e}");
     assert_eq!(f.calls(), ["reimage r-alpha img:9"]);
     assert_eq!(remote.calls_to("10.0.0.1:22002").len(), 1, "bravo probed once: when it was running");
@@ -1504,7 +1504,7 @@ async fn reimage_refuses_a_pod_someone_is_on_unless_forced() {
         }),
     );
     let pods = f.pods.lock().unwrap()[..1].to_vec();
-    let e = handle_reimage(f.as_ref(), remote.clone(), &cfg, &named(&pods), None, false, opts, FAST, &keys_dir).await.unwrap_err().to_string();
+    let e = handle_reimage(f.as_ref(), remote.clone(), &cfg, &named(&pods), None, Resize::default(), false, opts, FAST, &keys_dir).await.unwrap_err().to_string();
     assert!(e.contains("1 pod(s) failed to reimage: devtest-alpha"), "{e}");
     assert!(f.calls().is_empty(), "{:?}", f.calls());
     // A stopped pod: no one can be on it — not probed, not refused.
@@ -1512,7 +1512,7 @@ async fn reimage_refuses_a_pod_someone_is_on_unless_forced() {
     f.pods.lock().unwrap()[0].status = "EXITED".into();
     let remote = Arc::new(FakeRemote::new());
     let alpha = f.pods.lock().unwrap()[0].clone();
-    handle_reimage(&f, remote.clone(), &cfg, &named(&[alpha]), None, false, opts, FAST, &keys_dir).await.unwrap();
+    handle_reimage(&f, remote.clone(), &cfg, &named(&[alpha]), None, Resize::default(), false, opts, FAST, &keys_dir).await.unwrap();
     assert_eq!(f.calls(), ["reimage r-alpha img:9"]);
     assert!(remote.calls().is_empty(), "{:?}", remote.calls());
 }
@@ -1544,7 +1544,7 @@ async fn reimage_rebuilds_a_hetzner_vm_from_its_vm_image() {
     assert!(line.contains("the ARENA repo at /root/r") && line.contains("`arena pods volume mount`") && !line.contains("/workspace"), "{line}");
     // --wipe-ok: rebuilt, then set up again on its own IP and proxied.
     let opts = RestartOpts { wipe_ok: true, yes: true, ..Default::default() };
-    handle_reimage(&f, remote.clone(), &cfg, &named(&[delta]), None, false, opts, FAST, &keys_dir).await.unwrap();
+    handle_reimage(&f, remote.clone(), &cfg, &named(&[delta]), None, Resize::default(), false, opts, FAST, &keys_dir).await.unwrap();
     assert_eq!(f.calls(), ["reimage h-delta 449743460"]);
     assert!(proxy_file(&dir.0).contains("name=devtest-delta"), "{}", proxy_file(&dir.0));
     let setup = |c: &RemoteCall| matches!(c, RemoteCall::Exec { cmd, .. } if cmd.ends_with("bash /root/hetzner_setup.sh"));
@@ -1607,11 +1607,11 @@ fn reimage_images_are_per_kind_of_pod() {
 #[test]
 fn reimage_says_whose_disk_and_work_go_and_how_to_retry() {
     use super::lifecycle::{reimage_retry, reimage_what};
-    assert_eq!(reimage_what(&["devtest-apple"], &["devtest-apple"]), "devtest-apple (wipes its disk and the work on it)");
-    assert_eq!(reimage_what(&["devtest-apple"], &[]), "devtest-apple (wipes its disk; the repo stays on its volume)");
-    assert_eq!(reimage_what(&["devtest-apple", "devtest-bloom"], &["devtest-apple", "devtest-bloom"]), "devtest-apple, devtest-bloom (wipes their disks and the work on them)");
-    assert_eq!(reimage_what(&["devtest-apple", "devtest-bloom"], &["devtest-bloom"]), "devtest-apple, devtest-bloom (wipes their disks and the work on devtest-bloom)");
-    assert_eq!(reimage_what(&["a", "b", "c", "d"], &[]), "4 pods: a, b, c, d (wipes their disks; the repo stays on their volumes)");
+    assert_eq!(reimage_what(&["devtest-apple"], "", &["devtest-apple"]), "devtest-apple (wipes its disk and the work on it)");
+    assert_eq!(reimage_what(&["devtest-apple"], "", &[]), "devtest-apple (wipes its disk; the repo stays on its volume)");
+    assert_eq!(reimage_what(&["devtest-apple", "devtest-bloom"], "", &["devtest-apple", "devtest-bloom"]), "devtest-apple, devtest-bloom (wipes their disks and the work on them)");
+    assert_eq!(reimage_what(&["devtest-apple", "devtest-bloom"], "", &["devtest-bloom"]), "devtest-apple, devtest-bloom (wipes their disks and the work on devtest-bloom)");
+    assert_eq!(reimage_what(&["a", "b", "c", "d"], "", &[]), "4 pods: a, b, c, d (wipes their disks; the repo stays on their volumes)");
     let opts = RestartOpts { wipe_ok: true, no_setup: true, yes: true, ..Default::default() };
     assert_eq!(reimage_retry("devtest-bravo", None, RestartOpts::default()), "arena pods reimage devtest-bravo");
     assert_eq!(reimage_retry("devtest-bravo", Some("nickypro/arena-env:9.1"), opts), "arena pods reimage devtest-bravo --image nickypro/arena-env:9.1 --wipe-ok --no-setup");
@@ -1649,7 +1649,7 @@ async fn reimage_says_its_image_and_one_line_by_default_and_its_plan_with_v() {
         remote.on("10.0.0.9:22", "ARENA_IDLE_NOW", FakeReply::stdout(&Reply::default().render()));
         let delta = f.pods.lock().unwrap()[3].clone();
         let opts = RestartOpts { dry_run, ..opts };
-        let got = rendered(verbose, &["y"], handle_reimage(&f, remote.clone(), &cfg, &named(&[delta]), None, false, opts, FAST, &keys_dir)).await;
+        let got = rendered(verbose, &["y"], handle_reimage(&f, remote.clone(), &cfg, &named(&[delta]), None, Resize::default(), false, opts, FAST, &keys_dir)).await;
         assert_eq!(got, want, "verbose {verbose}, dry run {dry_run}");
         assert_eq!(f.calls().len(), usize::from(!dry_run), "{:?}", f.calls());
     }
@@ -1670,7 +1670,7 @@ async fn reimage_says_its_image_and_one_line_by_default_and_its_plan_with_v() {
         );
         let pods = f.pods.lock().unwrap()[..2].to_vec();
         let opts = RestartOpts { yes: true, ..opts };
-        let got = rendered(verbose, &[], handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, false, opts, FAST, &keys_dir)).await;
+        let got = rendered(verbose, &[], handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, Resize::default(), false, opts, FAST, &keys_dir)).await;
         let busy = if verbose {
             "keys:  devtest-test\n[not reimaged] devtest-bravo: refusing to reimage devtest-bravo: someone is on it (1 SSH session). A reimage \
              wipes what they're working on: wait until they're off, and back it up first (`arena pods backup devtest-bravo`). Or pass --force."

@@ -39,7 +39,11 @@
 //!   restart-free (2026-10-08: PID 1's age kept counting, a marker file in `/root` and the
 //!   SSH endpoint survived) — unlike v1's REST PATCH, which restarted the container. Any
 //!   other PATCH field (`image`, `env`) DOES reset the container: that's [`reimage_payload`],
-//!   so the rename body is built by its own function and pinned by a test.
+//!   so the rename body is built by its own function and pinned by a test. The reimage PATCH
+//!   takes `disk` and `mounts.persistent` too (`pods reimage --disk / --volume`, live
+//!   2026-11-02; a host without the room answers `400 This machine does not have enough disk
+//!   available…` and the pod is left as it was). It keeps the pod's `startedAt`, and the detail
+//!   shows the old container's port for 15–40 s more: [`EndpointMemo::reset_at`].
 //! - **Error bodies are read once more** ([`v2_error`]): a `422` is a request the API
 //!   rejected as invalid (an unknown GPU type, a schema violation) — a config error, never
 //!   capacity, never retried; a `400 "Pod is locked"` is [`ProviderErrorKind::Locked`].
@@ -84,7 +88,7 @@ use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use serde_json::{json, Map, Value};
 
 use super::runpod::{self, loose_f64, loose_string, GpuType};
-use super::{ContainerReset, Provider};
+use super::{ContainerReset, Provider, Resize};
 use crate::capability::Backend;
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, ProviderErrorKind, Result};
@@ -133,6 +137,15 @@ impl RunpodV2Provider {
     /// reimage or terminate it, and a restart gets a new port.
     fn forget_endpoint(&self, id: &str) {
         self.endpoints.lock().unwrap_or_else(std::sync::PoisonError::into_inner).by_id.remove(id);
+    }
+
+    /// [`Self::forget_endpoint`] for a reset that keeps the pod's `startedAt` — a reimage — and
+    /// note when: until a lookup shows a container younger than that, the pod has no endpoint
+    /// ([`EndpointMemo::reset_at`]).
+    fn reset_endpoint(&self, id: &str) {
+        let mut m = self.endpoints.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        m.by_id.remove(id);
+        m.reset_at.insert(id.to_string(), crate::status::now_secs());
     }
 
     /// The listing from `page` (one list page per cursor) and `detail` (one pod's detail), with
@@ -536,6 +549,25 @@ impl Remembered {
 struct EndpointMemo {
     by_id: HashMap<String, Remembered>,
     lookups: std::collections::VecDeque<u64>,
+    /// Pods this provider reimaged, with when (unix seconds). A reimage's PATCH leaves
+    /// `startedAt` as it was, and the detail keeps the old container's port — and its
+    /// `runtime.uptime` — for a while (live 2026-11-02: 14 s on one, ~40 s on another; the
+    /// settle wait took the old port, and setup then failed on it). Until a lookup shows a
+    /// container younger than the reset ([`is_old_container`]), such a pod is always looked up
+    /// and listed without an endpoint; then the entry goes.
+    reset_at: HashMap<String, u64>,
+}
+
+/// How long a reimaged pod's endpoint waits for its new container before an old-looking one is
+/// trusted after all (an image pull can take minutes; never forever).
+const RESET_WAIT_SECS: u64 = 1800;
+
+/// Whether a reimaged pod's detail (`body`) still shows the container from before the reset
+/// at `reset_at`: one whose `runtime.uptime` is longer than the time since (and a few seconds
+/// of clock). No uptime: it can't be told, so not. Pure.
+fn is_old_container(body: &Value, reset_at: u64, now: u64) -> bool {
+    let since = now.saturating_sub(reset_at);
+    body.pointer("/runtime/uptime").and_then(Value::as_u64).is_some_and(|up| up > since + 5)
 }
 
 /// An endpoint looked up within this long of the pod's start may not be its new one yet.
@@ -577,12 +609,23 @@ where
     let remembered = |p: &Pod| lock().by_id.get(&p.id).filter(|r| p.started_at == Some(r.started_at)).cloned();
     {
         let up: HashSet<&str> = pods.iter().filter(|p| running(p)).map(|p| p.id.as_str()).collect();
+        let listed: HashSet<&str> = pods.iter().map(|p| p.id.as_str()).collect();
         let mut m = lock();
         m.by_id.retain(|id, _| up.contains(id.as_str()));
         m.lookups.retain(|&t| now.saturating_sub(t) < 60);
+        // A reimaged pod that's still coming up may list as not running for a moment: kept
+        // while it's listed at all, and for so long.
+        m.reset_at.retain(|id, at| listed.contains(id.as_str()) && now.saturating_sub(*at) < RESET_WAIT_SECS);
     }
+    let reset = |p: &Pod| lock().reset_at.get(&p.id).copied();
     let (mut unknown, mut due) = (Vec::new(), Vec::new());
     for (i, p) in pods.iter_mut().enumerate() {
+        // A reimaged pod's listed endpoint may be its old container's: looked up, always.
+        if running(p) && reset(p).is_some() {
+            (p.ssh_ip, p.ssh_port) = (None, None);
+            unknown.push(i);
+            continue;
+        }
         if !running(p) || (p.ssh_ip.is_some() && p.ssh_port.is_some()) {
             continue;
         }
@@ -608,6 +651,7 @@ where
         for &i in batch {
             let id = pods[i].id.clone();
             let future = fetch(id.clone());
+            let reset_at = lock().reset_at.get(&id).copied();
             // The caller's rate-limit wait bound goes with the lookup (a spawned task doesn't
             // inherit it), and the lookup's own 5 s bounds its waits, a margin left for the
             // request: a held quota fails it as rate-limited, saying so, not as a timeout.
@@ -617,11 +661,17 @@ where
                     let body = crate::ratelimit::bounded(five, future)
                         .await
                         .map_err(|_| Error::provider(format!("endpoint lookup for {id} timed out after 5s")))??;
-                    let detail = parse_pod(&body);
+                    let mut detail = parse_pod(&body);
                     if detail.id != id || detail.status == "UNKNOWN" {
                         return Err(Error::provider(format!("invalid detail for {id}: {}", shape_of(&body))));
                     }
-                    Ok(detail)
+                    // Reimaged: the old container's endpoint isn't the pod's any more; a new
+                    // container's ends the wait.
+                    if reset_at.is_some_and(|at| is_old_container(&body, at, now)) {
+                        (detail.ssh_ip, detail.ssh_port) = (None, None);
+                    }
+                    let new_container = reset_at.is_some() && detail.ssh_ip.is_some() && detail.ssh_port.is_some();
+                    Ok((detail, new_container))
                 };
                 (i, looked_up.await)
             }));
@@ -631,7 +681,10 @@ where
             let Ok((i, looked_up)) = joined else { continue };
             answered.insert(i);
             match looked_up {
-                Ok(detail) => {
+                Ok((detail, new_container)) => {
+                    if new_container {
+                        lock().reset_at.remove(&pods[i].id);
+                    }
                     let listed_start = pods[i].started_at;
                     match (listed_start, detail.ssh_ip.clone(), detail.ssh_port) {
                         (Some(started_at), Some(ip), Some(port)) => {
@@ -862,8 +915,31 @@ fn action_request(client: &Client, api_key: &str, id: &str, action: &str) -> Res
 /// pod's env wholesale (PATCH semantics on `env`, same contract as v1's reimage) — so the
 /// caller passes everything to keep, and the account keys are merged into `PUBLIC_KEY`
 /// exactly as on create (`startSsh` is create-only, so nothing would re-add them).
-fn reimage_payload(image: &str, env: &[(String, String)], account_keys: &[String]) -> Value {
-    json!({ "image": image, "env": env_object(env, account_keys) })
+///
+/// `pods reimage --disk / --volume` resize in the same PATCH (`UpdatePodRequest` takes both):
+/// `disk` is the container disk; `volume` is `(size, path)`, sent as the whole
+/// `mounts.persistent` entry — v2 takes no partial mount — with the path the pod has.
+fn reimage_payload(image: &str, env: &[(String, String)], account_keys: &[String], disk_gb: Option<u32>, volume: Option<(u32, &str)>) -> Value {
+    let mut body = json!({ "image": image, "env": env_object(env, account_keys) });
+    if let Some(gb) = disk_gb {
+        body["disk"] = json!(gb);
+    }
+    if let Some((gb, path)) = volume {
+        body["mounts"] = json!({ "persistent": { "size": gb, "path": path } });
+    }
+    body
+}
+
+/// Where the pod's own volume is mounted (`mounts.persistent.path`), from its `GET /v2/pods/{id}`
+/// body — what a resize sends back unchanged. None: the pod has no volume of its own (none, or
+/// a network volume), and v2 refuses to add one to a pod in place. Pure.
+fn volume_path(pod: &Value, id: &str) -> Result<String> {
+    match pod.pointer("/mounts/persistent/path").and_then(Value::as_str) {
+        Some(path) if !path.trim().is_empty() => Ok(path.to_string()),
+        _ => Err(Error::Config(format!(
+            "reimage pod: {id} has no volume of its own to grow, and RunPod adds none to a pod in place"
+        ))),
+    }
 }
 
 /// The `PATCH /v2/pods/{id}` body for a rename: `name` and NOTHING else. Live-verified
@@ -1283,11 +1359,24 @@ impl Provider for RunpodV2Provider {
     }
 
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
-        self.forget_endpoint(id);
+        self.reimage_pod_resized(id, image, env, Resize::default()).await
+    }
+
+    async fn reimage_pod_resized(&self, id: &str, image: &str, env: &[(String, String)], resize: Resize) -> Result<()> {
         let url = pod_url(id, None)?;
+        // A volume goes whole (size + path): its path is read first, and kept.
+        let volume = match resize.volume_gb {
+            Some(gb) => {
+                let pod = send(api_request(&self.client, &self.api_key, Method::GET, url.clone()), "get pod").await?;
+                Some((gb, volume_path(&pod, id)?))
+            }
+            None => None,
+        };
+        // Its `startedAt` stays, and the old container shows a while: see `reset_at`.
+        self.reset_endpoint(id);
         let keys = self.keys_to_merge(env).await?;
-        let rb = api_request(&self.client, &self.api_key, Method::PATCH, url).json(&reimage_payload(image, env, &keys));
-        send_ok(rb, "reimage pod").await
+        let body = reimage_payload(image, env, &keys, resize.disk_gb, volume.as_ref().map(|(gb, path)| (*gb, path.as_str())));
+        send_ok(api_request(&self.client, &self.api_key, Method::PATCH, url).json(&body), "reimage pod").await
     }
 
     async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
@@ -2019,13 +2108,37 @@ mod tests {
         assert_eq!(body, json!({"action": "start"}));
         assert!(action_request(&Client::new(), "rpa_K", " ", "start").is_err());
         let env = vec![("MACHINE_NAME".into(), "devtest-apple".into()), ("PUBLIC_KEY".into(), "ssh-ed25519 K1 k1".into())];
-        let v = reimage_payload("img:9", &env, &["ssh-ed25519 ADMIN admin".into()]);
+        let v = reimage_payload("img:9", &env, &["ssh-ed25519 ADMIN admin".into()], None, None);
         assert_eq!(
             v,
             json!({"image": "img:9", "env": {"MACHINE_NAME": "devtest-apple",
                                               "PUBLIC_KEY": "ssh-ed25519 K1 k1\nssh-ed25519 ADMIN admin"}})
         );
         assert!(v.get("imageName").is_none() && v.get("name").is_none()); // never a v1 key, never a rename
+    }
+
+    /// `pods reimage --disk / --volume` on v2: `UpdatePodRequest`'s `disk`, and the whole
+    /// `mounts.persistent` entry (v2 takes no partial mount) with the pod's own path. Never a
+    /// v1 key. The path comes from the pod; one without a volume of its own is refused.
+    #[test]
+    fn reimage_payload_resizes_the_disk_and_volume_given() {
+        let v = reimage_payload("img:9", &[], &[], Some(500), None);
+        assert_eq!(v, json!({"image": "img:9", "env": {}, "disk": 500}));
+        let v = reimage_payload("img:9", &[], &[], None, Some((80, "/workspace")));
+        assert_eq!(v, json!({"image": "img:9", "env": {}, "mounts": {"persistent": {"size": 80, "path": "/workspace"}}}));
+        let v = reimage_payload("img:9", &[], &[], Some(200), Some((80, "/data")));
+        assert_eq!((v["disk"].as_u64(), &v["mounts"]["persistent"]["path"]), (Some(200), &json!("/data")));
+        for v1_key in ["containerDiskInGb", "volumeInGb", "volumeMountPath"] {
+            assert!(v.get(v1_key).is_none(), "{v1_key}");
+        }
+        let mut pod = running_pod();
+        pod["mounts"] = json!({"persistent": {"size": 20, "path": "/workspace"}});
+        assert_eq!(volume_path(&pod, "p1").unwrap(), "/workspace");
+        for mounts in [json!(null), json!({}), json!({"network": [{"volumeId": "v1", "path": "/workspace"}]})] {
+            pod["mounts"] = mounts.clone();
+            let e = volume_path(&pod, "p1").unwrap_err();
+            assert!(matches!(&e, Error::Config(m) if m.contains("p1 has no volume of its own")), "{mounts}: {e}");
+        }
     }
 
     #[test]
@@ -2096,6 +2209,9 @@ mod tests {
         remember("e");
         assert!(p.reimage_pod("e", "img:1", &[]).await.is_err() && gone("e"));
         assert!(!gone("keep"), "only the pod acted on");
+        // A reimage keeps `startedAt`: its endpoint waits for the new container.
+        let reset = p.endpoints.lock().unwrap().reset_at.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(reset, ["e"]);
     }
 
     /// The guards fire before any request: a bad tier (which v2 would turn into SECURE if

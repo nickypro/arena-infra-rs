@@ -116,6 +116,10 @@ pub enum Op {
     Rename,
     /// `pods reimage`.
     Reimage,
+    /// `pods reimage --disk`: the container disk resized in the same reset, same pod and host.
+    ReimageDisk,
+    /// `pods reimage --volume`: the pod's own volume grown in the same reset, its files kept.
+    ReimageVolume,
     /// `pods lock` / `unlock`, `up --lock`, `terminate --unlock`.
     Lock,
     /// `pods replace`.
@@ -161,6 +165,10 @@ pub enum Call {
     TerminatePod,
     RenamePod,
     ReimagePod,
+    /// `reimage_pod_resized` with a new container disk size.
+    ReimagePodDisk,
+    /// `reimage_pod_resized` with a new volume size.
+    ReimagePodVolume,
     SetLocked,
     PodSpec,
     AuthorizeSshKeys,
@@ -168,13 +176,15 @@ pub enum Call {
 
 impl Op {
     /// Every operation, in the matrix's order: the commands on a pod, then the create flags.
-    pub const ALL: [Op; 21] = [
+    pub const ALL: [Op; 23] = [
         Op::Start,
         Op::Stop,
         Op::Restart,
         Op::Terminate,
         Op::Rename,
         Op::Reimage,
+        Op::ReimageDisk,
+        Op::ReimageVolume,
         Op::Lock,
         Op::Replace,
         Op::Migrate,
@@ -201,6 +211,8 @@ impl Op {
             Op::Terminate => "pods terminate",
             Op::Rename => "pods rename",
             Op::Reimage => "pods reimage",
+            Op::ReimageDisk => "pods reimage --disk",
+            Op::ReimageVolume => "pods reimage --volume",
             Op::Lock => "pods lock / unlock",
             Op::Replace => "pods replace",
             Op::Migrate => "pods migrate",
@@ -246,6 +258,9 @@ impl Op {
             Op::Rename => &[Call::RenamePod],
             // The pod's env is read first (`pods reimage` keeps it), then swapped.
             Op::Reimage => &[Call::PodSpec, Call::ReimagePod],
+            // And the sizes are read before the prompt, from the same spec.
+            Op::ReimageDisk => &[Call::PodSpec, Call::ReimagePodDisk],
+            Op::ReimageVolume => &[Call::PodSpec, Call::ReimagePodVolume],
             Op::Lock => &[Call::SetLocked],
             // The source's spec is read back for the new pod, and the two are renamed past each
             // other (`<name>-new` → `<name>`, `<name>` → `<name>-old`).
@@ -365,6 +380,27 @@ const fn row(op: Op) -> [Support; 5] {
             note(HETZNER_REBUILD), // Hetzner
             no("Shadeform can't swap an instance's image in place", REMAKE_SHADEFORM), // Shadeform
         ],
+        Op::ReimageDisk => [
+            note(RUNPOD_REIMAGE_DISK), // RunPod
+            note(RUNPOD_REIMAGE_DISK), // RunPod v1
+            no("a Vast instance's disk is fixed at its create", VAST_BIGGER_DISK), // Vast
+            no(
+                "a Hetzner VM's disk comes with its server type, and a rebuild keeps it",
+                "`arena pods volume add <name> <GB>` (in place, at /mnt/data), or `arena pods replace <name> --server-type <type>` \
+                 (a bigger type, files copied)",
+            ), // Hetzner
+            no("a Shadeform instance's disk comes with its type", NOTHING_INSTEAD), // Shadeform
+        ],
+        Op::ReimageVolume => [
+            note(RUNPOD_REIMAGE_VOLUME), // RunPod
+            note(RUNPOD_REIMAGE_VOLUME), // RunPod v1
+            no("arena's Vast create takes no volume", KEEP_WORK), // Vast
+            no(
+                "a Hetzner VM has no pod volume",
+                "`arena pods volume add <name> <GB>`, or `arena pods volume grow <name> <GB>` for one it has (in place, no reimage)",
+            ), // Hetzner
+            no("Shadeform's CUDA-13 cloud has no volumes", KEEP_WORK), // Shadeform
+        ],
         Op::Lock => [
             YES, // RunPod
             no("only RunPod REST v2 can lock a pod", crate::provider::RUNPOD_V1_REMEDY), // RunPod v1
@@ -401,13 +437,9 @@ const fn row(op: Op) -> [Support; 5] {
             no("Shadeform authorizes keys only at create (its bootstrap script)", "`arena pods replace <name>` (a new pod gets today's keys)"), // Shadeform
         ],
         Op::DataVolume => [
-            no(RUNPOD_VOLUME, "`arena pods replace <name> --volume <GB>` (a new pod with that volume, its files copied)"), // RunPod
-            no(RUNPOD_VOLUME, "`arena pods replace <name> --volume <GB>` (a new pod with that volume, its files copied)"), // RunPod v1
-            no(
-                "a Vast instance's disk is fixed at its create",
-                "back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then `arena --provider vast pods up <name> --volume 0` \
-                 with --disk <GB> (and its --gpu), and `arena pods restore <name>`",
-            ), // Vast
+            no(RUNPOD_VOLUME, RUNPOD_GROW_VOLUME), // RunPod
+            no(RUNPOD_VOLUME, RUNPOD_GROW_VOLUME), // RunPod v1
+            no("a Vast instance's disk is fixed at its create", VAST_BIGGER_DISK), // Vast
             note("a Hetzner volume in the VM's own location (10 GB–10 TB), mounted at /mnt/data; it bills until deleted — a terminate keeps it unless --delete-volumes"), // Hetzner
             no("arena can't attach a volume to a Shadeform instance", KEEP_WORK), // Shadeform
         ],
@@ -504,6 +536,25 @@ const HETZNER_MOVE: &str =
     "--server-type moves it to a bigger type; the new VM goes wherever HETZNER_LOCATION allows, maybe another location";
 
 const RUNPOD_VOLUME: &str = "a RunPod pod's volume is sized at its create, and resizing it resets the pod";
+
+/// How a RunPod pod's volume grows: in place with a reimage, or onto a new pod.
+const RUNPOD_GROW_VOLUME: &str = "`arena pods reimage <name> --volume <GB>` (in place: it wipes the container disk, the volume keeps \
+     its files) or `arena pods replace <name> --volume <GB>` (a new pod, files copied)";
+
+/// What `pods reimage --disk` is on RunPod ([`crate::provider::runpod_v2`]'s `reimage_payload`):
+/// the reimage's own PATCH, with the new size.
+const RUNPOD_REIMAGE_DISK: &str = "the same pod and host, its container disk wiped (`--wipe-ok` gate); where the host hasn't the \
+     room it's refused, and `arena pods replace <name> --disk <GB>` makes a new pod";
+
+/// What `pods reimage --volume` is on RunPod: the volume keeps its files; RunPod only grows one,
+/// and adds none to a pod made without.
+const RUNPOD_REIMAGE_VOLUME: &str = "grows the pod's /workspace volume, which keeps its files; it never shrinks, and a pod made \
+     without one gets none: `arena pods replace <name> --volume <GB>`";
+
+/// A bigger disk for a Vast instance: a new one (its disk is fixed at its create).
+const VAST_BIGGER_DISK: &str = "back it up (`arena pods backup <name>`), `arena pods terminate <name>`, then `arena --provider vast \
+     pods up <name> --volume 0` with --disk <GB> (and its --gpu), and `arena pods restore <name>`";
+
 const SERVER_TYPE_IS_HETZNERS: &str = "only Hetzner VMs are sized by server type";
 const SIZE_A_GPU_POD: &str = "pass --provider hetzner, or size a GPU pod with --gpu / --gpus";
 const KEEP_WORK: &str = "work survives through `arena pods backup` (and the archive)";
@@ -610,6 +661,8 @@ mod tests {
             Call::TerminatePod => p.terminate_pod("123").await,
             Call::RenamePod => p.rename_pod("123", "devtest-bravo").await,
             Call::ReimagePod => p.reimage_pod("123", "img:2", &[]).await,
+            Call::ReimagePodDisk => p.reimage_pod_resized("123", "img:2", &[], provider::Resize { disk_gb: Some(200), volume_gb: None }).await,
+            Call::ReimagePodVolume => p.reimage_pod_resized("123", "img:2", &[], provider::Resize { disk_gb: None, volume_gb: Some(80) }).await,
             Call::SetLocked => p.set_locked("123", true).await,
             Call::PodSpec => p.pod_spec("123").await.map(|_| ()),
             Call::AuthorizeSshKeys => p.authorize_ssh_keys(&pod, &["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAbc devtest".into()]).await,

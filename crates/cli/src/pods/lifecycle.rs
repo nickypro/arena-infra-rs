@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use arena_core::capability::Op;
 use arena_core::out;
-use arena_core::provider::{ContainerReset, Provider};
+use arena_core::provider::{ContainerReset, Provider, Resize};
 use arena_core::remote::{Remote, PROBE_TIMEOUT};
 use arena_core::selector::Naming;
 use arena_core::ssh::SshTarget;
@@ -17,6 +17,7 @@ use arena_core::{Config, PodSpec};
 use crate::keys::{machine_key_names, shared_name_holder, KeyBook};
 use crate::pods::exec_each_pod;
 use crate::pods::lock::print_would_refuse;
+use crate::pods::reimage_disk;
 use crate::pods::replace::wait_for_stable_endpoint_every;
 use crate::pods::selection::{just_these, Selected};
 use crate::pods::setup::handle_setup;
@@ -46,6 +47,9 @@ use crate::{confirm, confirm_brief, confirm_typed, spend};
 /// one line ([`reimage_what`]: whose disk goes, and whose work), and a pod found busy right
 /// before its own reimage as one line with its retry. `-v` says what it said before: the keys,
 /// each pod's plan, the whole refusal.
+///
+/// `resize` (`--disk` / `--volume`) resizes the pods in the same request: see
+/// [`crate::pods::reimage_disk`] for where it's refused, and what a host without the room says.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_reimage(
     provider: &dyn Provider,
@@ -55,6 +59,8 @@ pub(crate) async fn handle_reimage(
     // The pods to reimage, resolved by the caller (which demands names or --all).
     sel: &Selected,
     image: Option<String>,
+    // `--disk` / `--volume`: the sizes to give the pods (nothing: as they are).
+    resize: Resize,
     // Go on with someone on a pod (or a pod that couldn't be read).
     force: bool,
     opts: RestartOpts,
@@ -77,6 +83,9 @@ pub(crate) async fn handle_reimage(
     if let Some(r) = crate::pods::capable::refusal(provider, Op::Reimage, "reimage", &refs) {
         anyhow::bail!("{r}");
     }
+    if let Some(r) = reimage_disk::refusal(provider, resize, &refs) {
+        anyhow::bail!("{r}");
+    }
     // A reimage resets the container — exactly what a lock is for ("cannot be stopped or
     // reset"); a Hetzner VM's lock is its rebuild protection. Refused here, up front, rather
     // than left to an API refusal nobody has verified for the reimage PATCH.
@@ -84,6 +93,8 @@ pub(crate) async fn handle_reimage(
     if let (Some(r), false) = (&locked, dry_run) {
         anyhow::bail!("{r}");
     }
+    // Each pod's sizes now, for a resize: a volume that can't grow is refused here.
+    let sizes = reimage_disk::sizes(provider, resize, pods).await?;
     let (container_image, vm_setting) = reimage_images(pods, image, cfg)?;
     let pubkeys = arena_core::ssh::authorized_pubkeys(cfg);
     if pubkeys.is_empty() {
@@ -115,7 +126,10 @@ pub(crate) async fn handle_reimage(
     let lines: Vec<String> = pods
         .iter()
         .zip(fates.iter().zip(&sites))
-        .map(|(p, (f, site))| format!("  {} (id={}, {}): {}", p.name, p.id, p.provider, f.describe(reimage_op(p), site)))
+        .zip(&sizes)
+        .map(|((p, (f, site)), s)| {
+            format!("  {} (id={}, {}): {}{}", p.name, p.id, p.provider, f.describe(reimage_op(p), site), reimage_disk::plan_words(*s))
+        })
         .collect();
     let blocked: Vec<&arena_core::Pod> =
         pods.iter().zip(fates.iter().zip(&sites)).filter(|(_, (f, site))| f.needs_wipe_ok(site)).map(|(p, _)| p).collect();
@@ -136,7 +150,7 @@ pub(crate) async fn handle_reimage(
     // Who's on them: asked once the wipe is allowed (or for the dry run) — an SSH probe each.
     let busy = if force { Vec::new() } else { busy_refusals(&remote, cfg, &refs).await };
     let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
-    let brief = reimage_what(&names, &blocked_names);
+    let brief = reimage_what(&names, &reimage_disk::words(resize, names.len()), &blocked_names);
     if dry_run {
         out!(Detail, "[dry-run] would reimage {} pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
         out!(Brief, "[dry-run] would reimage {brief}");
@@ -168,7 +182,7 @@ pub(crate) async fn handle_reimage(
         if !force {
             if let Some(b) = busy_now(provider, &remote, cfg, pod, &policy).await {
                 out!(ErrDetail, "[not reimaged] {}: {}", pod.name, b.refusal);
-                let retry = reimage_retry(&pod.name, given_image.as_deref(), opts);
+                let retry = format!("{}{}", reimage_retry(&pod.name, given_image.as_deref(), opts), reimage_disk::flags(resize));
                 out!(ErrBrief, "[{}] {}: {} (retry: {retry}, or add --force)", out::bold(&pod.name), out::red("not reimaged"), b.why);
                 failed.push(pod.name.clone());
                 continue;
@@ -190,10 +204,17 @@ pub(crate) async fn handle_reimage(
         env.retain(|(k, _)| k != "PUBLIC_KEY" && k != "MACHINE_NAME");
         env.push(("MACHINE_NAME".into(), pod.name.clone()));
         env.push(("PUBLIC_KEY".into(), pubkeys.join("\n")));
-        match arena_core::retry::retrying(&policy, || provider.reimage_pod(&pod.id, &image, &env)).await {
+        match arena_core::retry::retrying(&policy, || provider.reimage_pod_resized(&pod.id, &image, &env, resize)).await {
             Ok(()) => println!("[reimaged] {}", pod.name),
             Err(e) => {
-                eprintln!("[failed] {}: {}", pod.name, arena_core::lock::explain(&pod.name, &e));
+                // A host without the room for the resize: one line, and the new pod instead.
+                match reimage_disk::no_room(&pod.name, resize, &e) {
+                    Some(line) => {
+                        out!(ErrDetail, "[failed] {}: {}", pod.name, arena_core::lock::explain(&pod.name, &e));
+                        out!(ErrBrief, "{line}");
+                    }
+                    None => eprintln!("[failed] {}: {}", pod.name, arena_core::lock::explain(&pod.name, &e)),
+                }
                 failed.push(pod.name.clone());
             }
         }
@@ -314,11 +335,12 @@ pub(crate) fn image_lines(container: Option<&str>, vms: &[VmImage]) -> Vec<Strin
     out
 }
 
-/// The default output's words for what a reimage does to `names` (docs/OUTPUT.md): who, whose
-/// disk goes, and whose work with it (`lost`: the pods whose repo isn't on a confirmed volume) —
-/// `devtest-apple, devtest-bloom (wipes their disks and the work on devtest-bloom)`. The dry run
-/// says it and the prompt asks it; each pod's plan is `-v`'s. Pure (but for the styles).
-pub(crate) fn reimage_what(names: &[&str], lost: &[&str]) -> String {
+/// The default output's words for what a reimage does to `names` (docs/OUTPUT.md): who, with
+/// what (`sized`: ` with a 500 GB disk`, or nothing), whose disk goes, and whose work with it
+/// (`lost`: the pods whose repo isn't on a confirmed volume) — `devtest-apple, devtest-bloom
+/// (wipes their disks and the work on devtest-bloom)`. The dry run says it and the prompt asks
+/// it; each pod's plan is `-v`'s. Pure (but for the styles).
+pub(crate) fn reimage_what(names: &[&str], sized: &str, lost: &[&str]) -> String {
     let (disk, them, volume) = if names.len() == 1 { ("its disk", "it", "its volume") } else { ("their disks", "them", "their volumes") };
     let work = if lost.is_empty() {
         format!("; the repo stays on {volume}")
@@ -327,7 +349,7 @@ pub(crate) fn reimage_what(names: &[&str], lost: &[&str]) -> String {
     } else {
         format!(" and the work on {}", lost.join(", "))
     };
-    format!("{} (wipes {disk}{work})", crate::pods::setup::all_names(names))
+    format!("{}{sized} (wipes {disk}{work})", crate::pods::setup::all_names(names))
 }
 
 /// The command that reimages `name` again as this run would (`--image` as given, and the

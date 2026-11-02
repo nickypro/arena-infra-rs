@@ -823,11 +823,19 @@ pub(crate) enum PodCmd {
     /// without --wipe-ok unless the repo is on a /workspace volume, even with --yes; refused
     /// while someone is on a pod (SSH, VS Code) unless --force. Then waits for SSH, re-runs setup
     /// and syncs the proxy.
+    /// --disk GB (RunPod) resizes the container disk in the same reset: destructive like any
+    /// reimage, and refused where the host hasn't the room (`replace --disk` makes a new pod).
     #[command(verbatim_doc_comment)]
     Reimage {
         /// Image to use (default: RUNPOD_DOCKER_IMAGE; on a Hetzner VM: HETZNER_IMAGE, e.g. arena)
         #[arg(long)]
         image: Option<String>,
+        /// RunPod: resize the container disk to GB in place. WIPES it, as any reimage does
+        #[arg(long, value_name = "GB", value_parser = clap::value_parser!(u32).range(1..))]
+        disk: Option<u32>,
+        /// RunPod: grow the /workspace volume to GB in place (it keeps its files; never shrinks)
+        #[arg(long, value_name = "GB", value_parser = clap::value_parser!(u32).range(1..))]
+        volume: Option<u32>,
         /// Reimage even pods whose work isn't on a volume (required, even with --yes)
         #[arg(long)]
         wipe_ok: bool,

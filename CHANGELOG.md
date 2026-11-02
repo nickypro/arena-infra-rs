@@ -19,6 +19,25 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-02 · arena 2.14: `pods reimage --disk GB` resizes a RunPod pod in place
+- **`arena pods reimage NAME --disk 500 --wipe-ok`** gives a RunPod pod a 500 GB container disk
+  without a new pod: the reimage's own request carries the size, so the pod keeps its id and host.
+  It is a reimage, so it's **destructive**: the container disk is wiped. `--wipe-ok`, the check for
+  someone on the pod (`--force`) and setup afterwards are as for any reimage, and the prompt says
+  it: `Reimage devtest-apple with a 500 GB disk (wipes its disk and the work on it)? [y/N]`.
+  Without `--image` the pod gets the image a plain reimage gives it (`RUNPOD_DOCKER_IMAGE`).
+- **`--volume GB`** grows the pod's `/workspace` volume the same way, and the volume keeps its files.
+  A smaller volume, or one for a pod made without a volume, is refused before anything is asked.
+- When the host hasn't the room, RunPod refuses and the pod is left as it was. arena says so in one
+  line and gives the command that makes a new pod instead: `pods replace NAME --disk 500`.
+- On Hetzner, Vast and Shadeform it's refused up front with what works there: on Hetzner,
+  `pods volume add` or `pods replace NAME --server-type TYPE`. The "What works where" matrix has
+  the two new rows, and REFERENCE has a "Changing a pod's disk" table.
+- `pods list` has a DISK column: the container disk plus the volume (`500G`, `60+20G`).
+- Fixed: after any reimage on RunPod (REST v2, the default), setup could go to the old
+  container's SSH port and fail (`Connection refused`, then `arena pods setup NAME` by hand). It
+  now waits for the new container.
+
 ## 2026-11-02 · arena 2.13: `pods reimage` and `pods lock` on Hetzner VMs
 - **`pods reimage` works on a Hetzner VM**: Hetzner's rebuild. The whole disk is written again from
   the VM image, and the server keeps its id, name, IP and type. The image is `--image`, else
