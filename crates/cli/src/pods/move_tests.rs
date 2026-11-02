@@ -923,3 +923,91 @@ async fn an_unresolved_volume_stays_recorded() {
     let left = keep_unresolved(remote.as_ref(), &cfg, &f, &cloud, &mut record, &old).await;
     assert!(left.is_empty() && record.moved.is_empty() && record.moved_to.is_none(), "{left:?}");
 }
+
+/// Golden tests of `spare up|down` and `copy-home` (docs/OUTPUT.md), at default and `-v`: what
+/// each spare is in a line and one question, then a line per spare; the copy in a line, its end
+/// and what's next. `-v` is what each printed before.
+#[tokio::test(start_paused = true)]
+async fn spares_and_copy_home_say_it_in_a_few_lines() {
+    use crate::output_test::rendered;
+    use crate::pods::copy_home::{copy_home_on, CopyHomeOpts};
+    use crate::pods::spare::{spare_on, SpareCmd};
+    let dir = tmpdir("out-spares");
+    let cfg = cfg(&dir.0);
+    let interrupt = Interrupt::manual();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for verbose in [false, true] {
+        let f = Vms::new(vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1")], vec![]);
+        *f.to_create.lock().unwrap() = vec![vm("302", "", "", "10.0.0.4", "fsn1")];
+        let up = SpareCmd::Up { count: 1, server_type: Some("cx43".into()), image: None, keep_trying: false, retry_mins: 0, retry_secs: 60, no_wait: false, dry_run: false };
+        out.push((format!("spare up v={verbose}"), rendered(verbose, &["y"], spare_on(up, &cfg, &f, &f, false, &interrupt)).await));
+        let down = SpareCmd::Down { names: vec!["spare-1".into()], all: false, dry_run: false };
+        out.push((format!("spare down v={verbose}"), rendered(verbose, &["y"], spare_on(down, &cfg, &f, &f, false, &interrupt)).await));
+    }
+    for verbose in [false, true] {
+        let f = Vms::new(vec![vm("101", "devtest-alpha", "cx33", "10.0.0.1", "nbg1"), vm("202", "devtest-bravo", "cx43", "10.0.0.2", "nbg1")], vec![]);
+        let listed = f.pods.lock().unwrap().clone();
+        let remote = Arc::new(FakeRemote::new());
+        remote.on(OLD, "--dry-run", FakeReply::stdout("<f+++++++++ new.py\n"));
+        remote.on(NEW, "ARENA_IDLE_NOW", FakeReply::stdout(&Reply { gpu: None, ..Reply::default() }.render()));
+        remote.on(NEW, "arena-replica-kept", FakeReply::stdout("arena-replica-kept=0\n"));
+        scripted(&remote, "101", NEW, "202");
+        let opts = CopyHomeOpts { overwrite: false, force: false, dry_run: false, yes: false };
+        let got = rendered(verbose, &["y"], copy_home_on(remote, &cfg, &f, &listed[0], &listed[1], opts)).await;
+        out.push((format!("copy-home v={verbose}"), got));
+    }
+    let want = [SPARE_UP_QUIET, SPARE_DOWN_QUIET, SPARE_UP_LOUD, SPARE_DOWN_LOUD, COPY_HOME_QUIET, COPY_HOME_LOUD];
+    assert_eq!(out.len(), want.len());
+    for ((label, got), want) in out.iter().zip(want) {
+        assert_eq!(got, want.strip_prefix('\n').unwrap(), "{label}:\n{got}");
+    }
+}
+
+const SPARE_UP_QUIET: &str = r#"
+cx43 CPU VM · Hetzner
+Create devtest-spare-1 (it bills until `arena pods spare down`)? [y/N] y
+[created] devtest-spare-1 · CPU VM
+waiting for devtest-spare-1 to come up…
+[ready] devtest-spare-1 10.0.0.4 (cx43)
+"#;
+
+const SPARE_DOWN_QUIET: &str = r#"
+Delete devtest-spare-1 (irreversible; nothing of anyone's is on a spare)? [y/N] y
+[deleted] devtest-spare-1
+"#;
+
+const SPARE_UP_LOUD: &str = r#"
+spare up 1: devtest-spare-1 — nbg1, then any
+  each: cx43 CPU VM
+  one try (--keep-trying / --retry-mins to wait for capacity); labelled arena-spare=devtest (no one's machine: no proxy, backup or keys)
+Create 1 spare(s) (devtest-spare-1)? They bill until `arena pods spare down`.
+Proceed? [y/N] y
+  [created] devtest-spare-1 id=302 on CPU VM (price unknown)
+[created] devtest-spare-1 id=302 in fsn1
+waiting for devtest-spare-1 to come up…
+[ready] devtest-spare-1 10.0.0.4 (cx43)
+take one with `arena pods migrate copy <name> --onto-spare` (or `pods replace <name> --onto-spare`).
+"#;
+
+const SPARE_DOWN_LOUD: &str = r#"
+Delete 1 spare(s): devtest-spare-1 (id=302)? (irreversible; nothing of anyone's is on a spare)
+Proceed? [y/N] y
+[deleted] devtest-spare-1 (id=302)
+"#;
+
+const COPY_HOME_QUIET: &str = r#"
+Copy devtest-alpha's home onto devtest-bravo (deletions mirrored; nothing renamed)? [y/N] y
+[devtest-bravo] copy from devtest-alpha…
+✓ devtest-bravo has devtest-alpha's home (verified on devtest-bravo itself). devtest-alpha is untouched.
+Next: point them at devtest-bravo; once they're settled, `arena pods backup devtest-alpha` then `arena pods terminate devtest-alpha`
+"#;
+
+const COPY_HOME_LOUD: &str = r#"
+Will copy devtest-alpha's home onto devtest-bravo (hetzner, ids 101 → 202): copies the home incl. .git, ~/.config, ~/.jupyter, ~/.ipython, ~/.local (bin, share); skips caches and other dot-dirs (.cache, .venv, .vscode-server, .ssh, .claude), venvs, site-packages and ~/.local/lib (pip --user), HF caches, ~/.local/share/uv, the claude/codex that setup installs and Claude Code's own state, shell rc files + history (the API keys follow by name), zsh's completion cache, ~/.name; deletions mirrored, and what it replaces of devtest-bravo's own (0 files) moved aside to ~/arena-sync-kept/ there. Nothing is renamed: devtest-alpha keeps its name and files.
+Proceed? [y/N] y
+copying devtest-alpha → devtest-bravo…
+      copied (direct pod-to-pod)
+✓ devtest-bravo has devtest-alpha's home (verified on devtest-bravo itself). devtest-alpha is untouched.
+  Next: point the person at devtest-bravo (`ssh devtest-bravo` via the proxy / ssh-config: its own name, port and keys).
+  Once they're settled: `arena pods terminate devtest-alpha` (back it up first: `arena pods backup devtest-alpha`).
+"#;

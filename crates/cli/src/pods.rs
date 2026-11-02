@@ -19,7 +19,7 @@ use crate::pods::branch::{handle_init_branches, set_branch_and_init, SetBranchRu
 use crate::pods::copy::handle_copy;
 use crate::pods::create::{check_create_body, create_extra, create_policy_line, create_with_retry, hand_keys_over, image_flag, owner_plan, pin_vm_image, plan_create, print_create_body, replacement_rounds, resolve_explicit_names, resolve_want, sizing_flags, spec_with_overrides, warn_no_volume, CreateFailed, Made, RecordingProvider, SpecOverrides, NO_STREAM};
 use crate::pods::health::{handle_deep_test, handle_keys_test};
-use crate::pods::lifecycle::{disk_fate, handle_reimage, handle_restart, handle_start, handle_terminate, names_of, no_stop_left, no_stop_refusal, repo_sites, split_no_stop, stop_lines, wipe_refusal, DiskOp, RestartOpts, TerminateOpts, RESTART_SETTLE};
+use crate::pods::lifecycle::{disk_brief, disk_fate, failed_on, handle_reimage, handle_restart, handle_start, handle_terminate, names_of, no_stop_left, no_stop_refusal, repo_sites, split_no_stop, stop_lines, wipe_refusal, DiskOp, RestartOpts, TerminateOpts, RESTART_SETTLE};
 use crate::pods::list::list_with;
 use crate::pods::capable::CreateFlags;
 use crate::pods::lock::{handle_lock, print_would_refuse};
@@ -747,7 +747,7 @@ pub(crate) async fn handle_pods_bal(
             // hidden, and left alone.
             let billing = |p: &arena_core::Pod| arena_core::status::is_billing(&p.status);
             for p in sel.pods.iter().filter(|p| !billing(p)) {
-                eprintln!("skip {} — not running or starting ({})", p.name, p.status);
+                out!(Err, "skip {} — not running or starting ({})", p.name, p.status);
             }
             let billing_pods: Vec<&arena_core::Pod> = sel.pods.iter().filter(|p| billing(p)).collect();
             // A billing pod whose backend has no stop (Shadeform: it bills until deleted) is
@@ -760,10 +760,10 @@ pub(crate) async fn handle_pods_bal(
                 anyhow::bail!("{}", no_stop_refusal(&no_stop, "stop"));
             }
             for (p, why) in &no_stop {
-                eprintln!("skip {} — {why}", p.name);
+                out!(Err, "skip {} — {why}", p.name);
             }
             if pods.is_empty() {
-                println!("(no running or starting pods to stop)");
+                out!(Out, "(no running or starting pods to stop)");
                 return Ok(());
             }
             // What each stop costs (a RunPod pod keeps no data across stop → start), and
@@ -783,6 +783,8 @@ pub(crate) async fn handle_pods_bal(
             // bounded, all at once.
             let sites = repo_sites(&remote, cfg, &pods, &fates, &repo).await;
             let lines = stop_lines(&pods, &fates, &sites);
+            // By default the pods and what the stop does to their disks, in a line.
+            let brief = disk_brief(DiskOp::Stop, &pods, &fates, &sites);
             let blocked: Vec<&str> = pods
                 .iter()
                 .zip(fates.iter().zip(&sites))
@@ -790,24 +792,25 @@ pub(crate) async fn handle_pods_bal(
                 .map(|(p, _)| p.name.as_str())
                 .collect();
             if dry_run {
-                println!("[dry-run] would stop {} pod(s):\n{}", pods.len(), lines.join("\n"));
+                out!(Detail, "[dry-run] would stop {} pod(s):\n{}", pods.len(), lines.join("\n"));
+                out!(Brief, "[dry-run] would stop {brief}");
                 if let Some(r) = &locked {
                     print_would_refuse(r);
                 }
                 if !blocked.is_empty() && !wipe_ok {
-                    println!("(would be refused without --wipe-ok: {})", blocked.join(", "));
+                    out!(Out, "(would be refused without --wipe-ok: {})", blocked.join(", "));
                 }
                 if !no_stop.is_empty() {
-                    println!("(would skip, still billing — no stop on their provider: {})", names_of(&no_stop).join(", "));
+                    out!(Out, "(would skip, still billing — no stop on their provider: {})", names_of(&no_stop).join(", "));
                 }
-                println!("\nDry-run only — would stop {} pod(s).", pods.len());
+                out!(Detail, "\nDry-run only — would stop {} pod(s).", pods.len());
                 return Ok(());
             }
             if !blocked.is_empty() && !wipe_ok {
                 anyhow::bail!("{}", wipe_refusal(DiskOp::Stop, false, &blocked, &repo));
             }
-            if !confirm(yes, &format!("Will stop {} running/starting pod(s):\n{}", pods.len(), lines.join("\n")))? {
-                println!("aborted.");
+            if !confirm_brief(yes, &format!("Will stop {} running/starting pod(s):\n{}", pods.len(), lines.join("\n")), &format!("Stop {brief}?"))? {
+                out!(Out, "aborted.");
                 return Ok(());
             }
             // The fleet provider routes each stop to the backend that owns the pod id. A Hetzner
@@ -816,16 +819,23 @@ pub(crate) async fn handle_pods_bal(
             for p in &pods {
                 match provider.stop_pod_outcome(&p.id).await {
                     Ok(outcome) => {
-                        println!("[stopped] {}", p.name);
+                        out!(Out, "[stopped] {}", arena_core::out::bold(&p.name));
                         if let Some(note) = outcome.note() {
-                            eprintln!("  ⚠ {}: {note}", p.name);
+                            out!(Err, "  ⚠ {}: {note}", p.name);
                         }
                         ok += 1;
                     }
-                    Err(e) => eprintln!("[FAILED] {}: {}", p.name, arena_core::lock::explain(&p.name, &e)),
+                    Err(e) => {
+                        out!(ErrDetail, "[FAILED] {}: {}", p.name, arena_core::lock::explain(&p.name, &e));
+                        out!(ErrBrief, "{}", failed_on(&p.name, "stop", &e, &format!("arena pods stop {}", p.name)));
+                    }
                 }
             }
-            println!("\nstopped {ok}/{total}");
+            out!(Detail, "\nstopped {ok}/{total}");
+            // One pod's line says it; several get the count.
+            if total > 1 {
+                out!(Brief, "{}", if ok == total { arena_core::out::ok(format!("stopped {ok} of {total}")) } else { format!("stopped {ok} of {total}") });
+            }
             if ok < total {
                 anyhow::bail!("{} pod(s) failed to stop", total - ok);
             }
@@ -1062,7 +1072,7 @@ pub(crate) async fn handle_pods_bal(
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
                 let id = arena_core::jobs::JobId::generate(now, &cmd);
                 let ask = &mut |what: &str| confirm(yes, what);
-                jobs::handle_start(remote, cfg, &sel, &cmd, id, dry_run, ask, &mut |l| println!("{l}")).await?;
+                jobs::handle_start(remote, cfg, &sel, &cmd, id, dry_run, ask, &mut |l| arena_core::out!(Out, "{l}")).await?;
             } else {
                 handle_run(remote, cfg, &sel, &cmd, budget, dry_run, yes, /*confirm*/ true, /*compact*/ false).await?;
             }
@@ -1106,7 +1116,7 @@ pub(crate) async fn handle_pods_bal(
                 rsync: RSYNC.to_string(),
                 nonce: reap::real::nonce(),
                 resolve_local: &reap::real::resolve_local,
-                out: &|l: &str| println!("{l}"),
+                out: &|l: &str| arena_core::out!(Out, "{l}"),
                 sync_proxy: true,
                 config_file: cfg.source().map(std::path::Path::to_path_buf),
             };

@@ -19,7 +19,8 @@ use arena_core::remote::Remote;
 use arena_core::selector::Naming;
 use arena_core::{Config, Pod};
 
-use crate::confirm;
+use crate::confirm_brief;
+use arena_core::out;
 use crate::pods::adopt;
 use crate::pods::home_copy::{copy_pod_files, would_move_aside, CopyOpts};
 use crate::pods::lock::print_would_refuse;
@@ -139,7 +140,7 @@ pub(crate) async fn copy_home_on(remote: Arc<dyn Remote>, cfg: &Config, owner: &
     let in_way = match would_move_aside(cfg, owner, remote.as_ref(), &src.id, &dest.id).await {
         Ok(files) => files,
         Err(why) if overwrite => {
-            eprintln!("note: couldn't tell what of {to}'s own the copy replaces ({why}) — --overwrite: whatever it is is moved aside");
+            out!(Err, "note: couldn't tell what of {to}'s own the copy replaces ({why}) — --overwrite: whatever it is is moved aside");
             Vec::new()
         }
         Err(why) => anyhow::bail!(
@@ -164,15 +165,22 @@ pub(crate) async fn copy_home_on(remote: Arc<dyn Remote>, cfg: &Config, owner: &
         if in_way.len() == 1 { "" } else { "s" },
         arena_core::replica::KEPT_DIR
     );
+    // In a line (docs/OUTPUT.md): what's copied onto what, and what of `to`'s own it moves aside.
+    let aside = match in_way.len() {
+        0 => String::new(),
+        n => format!("; {n} file{} of {to}'s own moved aside to ~/{}/", if n == 1 { "" } else { "s" }, arena_core::replica::KEPT_DIR),
+    };
+    let brief = format!("{}'s home onto {} (deletions mirrored{aside}; nothing renamed)", out::bold(from), out::bold(to));
     if dry_run {
         for r in busy.iter().chain(floor.iter()).chain(in_the_way.iter()) {
             print_would_refuse(r);
         }
-        println!("[dry-run] would {plan}\n[dry-run] nothing changed.");
+        out!(Detail, "[dry-run] would {plan}\n[dry-run] nothing changed.");
+        out!(Brief, "[dry-run] would copy {brief}");
         return Ok(());
     }
-    if !confirm(yes, &format!("Will {plan}"))? {
-        println!("aborted.");
+    if !confirm_brief(yes, &format!("Will {plan}"), &format!("Copy {brief}?"))? {
+        out!(Out, "aborted.");
         return Ok(());
     }
     // Asked again after the dry run and the prompt (review r2: someone may have come on) — and
@@ -193,15 +201,18 @@ pub(crate) async fn copy_home_on(remote: Arc<dyn Remote>, cfg: &Config, owner: &
             ),
         }
     }
-    println!("copying {from} → {to}…");
+    out!(Detail, "copying {from} → {to}…");
+    let mut steps = crate::pods::replace::Steps::new("copy-home");
+    steps.step(to, &format!("copy from {from}"));
     copy_pod_files(cfg, owner, remote.as_ref(), &src.id, &dest.id, &CopyOpts::new(false))
         .await
         .with_context(|| format!("copying {from}'s home onto {to} — nothing was renamed; re-run to continue (rsync picks up where it stopped)"))?;
     clean_marker(owner, remote.as_ref(), &dest.id, cfg).await;
-    println!("✓ {to} has {from}'s home (verified on {to} itself). {from} is untouched.");
+    steps.clear();
+    out!(Out, "✓ {to} has {from}'s home (verified on {to} itself). {from} is untouched.");
     let ledger = crate::spend::SpendCtx::from_config(cfg).state();
     let owner_of = arena_core::spend::owner_of(&ledger, &src.provider, &src.id).map(String::from);
-    println!("  Next: point the person at {to} (`ssh {to}` via the proxy / ssh-config: its own name, port and keys).");
+    out!(Detail, "  Next: point the person at {to} (`ssh {to}` via the proxy / ssh-config: its own name, port and keys).");
     if let Some(o) = owner_of {
         // `spend assign` refuses to move a machine's history from one person to another: when `to`
         // has run up someone else's spend, say so — and how to keep the two apart — rather than
@@ -211,7 +222,8 @@ pub(crate) async fn copy_home_on(remote: Arc<dyn Remote>, cfg: &Config, owner: &
         match theirs.filter(|m| m.takes_from(Some(&o))) {
             Some(m) => {
                 let other = m.from.as_deref().unwrap_or(arena_core::spend::NO_OWNER);
-                println!(
+                out!(
+                    Out,
                     "  Their spend: {to} has run up {} as {other}'s, so `arena spend assign {to} {o}` would move that to {o} \
                      too — it refuses. To keep each person's spend apart, give {o} a machine of their own (`arena pods up \
                      <name> --owner {o}`, then `arena pods copy-home {from} <name>`); `--force` only if {other} was never \
@@ -219,10 +231,11 @@ pub(crate) async fn copy_home_on(remote: Arc<dyn Remote>, cfg: &Config, owner: &
                     m.words()
                 );
             }
-            None => println!("  Their spend follows if you say so: `arena spend assign {to} {o}`."),
+            None => out!(Out, "  Their spend follows if you say so: `arena spend assign {to} {o}`."),
         }
     }
-    println!("  Once they're settled: `arena pods terminate {from}` (back it up first: `arena pods backup {from}`).");
+    out!(Detail, "  Once they're settled: `arena pods terminate {from}` (back it up first: `arena pods backup {from}`).");
+    out!(Brief, "Next: point them at {to}; once they're settled, `arena pods backup {from}` then `arena pods terminate {from}`");
     Ok(())
 }
 

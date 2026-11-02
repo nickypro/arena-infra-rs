@@ -473,7 +473,8 @@ pub(crate) fn record_created(store: &Store, pod: &Pod, policy: CreatePolicy, now
         Ok(())
     }) {
         Ok(()) => {}
-        Err(e) => eprintln!(
+        Err(e) => arena_core::out!(
+            Err,
             "⚠ {} ({key}) was created but its reap policy could NOT be recorded ({e}) — run `arena pods reap set {} …` once fixed",
             pod.name, pod.name
         ),
@@ -729,11 +730,11 @@ pub(crate) async fn reassert_notices(remote: &dyn Remote, cfg: &Config, pods: &[
         match reassert_notice(remote, cfg, p, &t).await {
             Ok(true) => n += 1,
             Ok(false) => {}
-            Err(why) => eprintln!("warning: {}: its reap notice wasn't written ({why})", p.name),
+            Err(why) => arena_core::out!(Err, "warning: {}: its reap notice wasn't written ({why})", p.name),
         }
     }
     if n > 0 {
-        println!("Reap notice (the pod's end time / idle window) written on {n} pod(s) with a reap policy.");
+        arena_core::out!(Detail, "Reap notice (the pod's end time / idle window) written on {n} pod(s) with a reap policy.");
     }
 }
 
@@ -750,8 +751,8 @@ async fn write_notice(env: &ReapEnv<'_>, pod: &Pod, policy: Option<&PodPolicy>) 
     };
     match env.remote.exec(&t, &cmd, Some(arena_core::remote::PROBE_TIMEOUT)).await {
         Ok(o) if o.success => {}
-        Ok(o) => eprintln!("warning: {}: the notice wasn't updated ({})", pod.name, o.exit_label()),
-        Err(e) => eprintln!("warning: {}: the notice wasn't updated ({})", pod.name, arena_core::remote::describe_error(&e)),
+        Ok(o) => arena_core::out!(Err, "warning: {}: the notice wasn't updated ({})", pod.name, o.exit_label()),
+        Err(e) => arena_core::out!(Err, "warning: {}: the notice wasn't updated ({})", pod.name, arena_core::remote::describe_error(&e)),
     }
 }
 
@@ -1052,7 +1053,7 @@ impl RunCtx<'_, '_> {
     fn flush_log(&self) {
         let lines: Vec<String> = std::mem::take(&mut *self.log.lock().unwrap());
         if let Err(e) = self.store.append_log(&lines) {
-            eprintln!("warning: can't write the reap log {}: {e}", self.store.log_path().display());
+            arena_core::out!(Err, "warning: can't write the reap log {}: {e}", self.store.log_path().display());
             self.attention();
         }
     }
@@ -1103,7 +1104,7 @@ async fn send_notifications(ctx: &RunCtx<'_, '_>) {
 /// One notification: `cmd` under `sh -c`, `line` on its stdin, killed after 10 s.
 async fn notify_one(cmd: Option<&str>, line: &str) {
     use tokio::io::AsyncWriteExt;
-    eprintln!("notify: {line}");
+    arena_core::out!(Err, "notify: {line}");
     let Some(cmd) = cmd else { return };
     let spawned = tokio::process::Command::new("sh")
         .arg("-c")
@@ -1116,7 +1117,7 @@ async fn notify_one(cmd: Option<&str>, line: &str) {
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("warning: REAP_NOTIFY_CMD couldn't start: {e}");
+            arena_core::out!(Err, "warning: REAP_NOTIFY_CMD couldn't start: {e}");
             return;
         }
     };
@@ -1128,9 +1129,9 @@ async fn notify_one(cmd: Option<&str>, line: &str) {
     };
     match tokio::time::timeout(Duration::from_secs(core_reap::NOTIFY_TIMEOUT_SECS), work).await {
         Ok(Ok(st)) if st.success() => {}
-        Ok(Ok(st)) => eprintln!("warning: REAP_NOTIFY_CMD exited {st}"),
-        Ok(Err(e)) => eprintln!("warning: REAP_NOTIFY_CMD failed: {e}"),
-        Err(_) => eprintln!("warning: REAP_NOTIFY_CMD timed out after {}s — killed", core_reap::NOTIFY_TIMEOUT_SECS),
+        Ok(Ok(st)) => arena_core::out!(Err, "warning: REAP_NOTIFY_CMD exited {st}"),
+        Ok(Err(e)) => arena_core::out!(Err, "warning: REAP_NOTIFY_CMD failed: {e}"),
+        Err(_) => arena_core::out!(Err, "warning: REAP_NOTIFY_CMD timed out after {}s — killed", core_reap::NOTIFY_TIMEOUT_SECS),
     }
 }
 
@@ -1461,7 +1462,7 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
                 // the write-ahead recorded — takes the reap's name.
                 let frozen = state.reaped.get(&e.key).map(|t| (t.snapshot_dir.clone(), t.big_dir.clone())).unwrap_or_default();
                 let promote = |d: &Option<String>| d.as_deref().map(|d| promote_dir(d).unwrap_or_else(|why| {
-                    eprintln!("warning: {}'s frozen copy keeps its attempt name ({why})", e.name);
+                    arena_core::out!(Err, "warning: {}'s frozen copy keeps its attempt name ({why})", e.name);
                     d.to_string()
                 }));
                 let (snap, big) = (promote(&frozen.0), promote(&frozen.1));
@@ -1477,7 +1478,7 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
                         Ok(())
                     });
                     if let Err(err) = saved {
-                        eprintln!("warning: couldn't record {}'s renamed copy in its tombstone: {err}", e.name);
+                        arena_core::out!(Err, "warning: couldn't record {}'s renamed copy in its tombstone: {err}", e.name);
                     }
                     let paths: Vec<&str> = [snap.as_deref(), big.as_deref()].into_iter().flatten().collect();
                     format!("found gone with its terminate sent (the run that sent it was interrupted) — its last verified backup: {}", paths.join(" + "))
@@ -1881,7 +1882,7 @@ fn end_attempt(ctx: &RunCtx<'_, '_>, key: &str, retry_after: Option<u64>, obs: O
         Ok(())
     });
     if let Err(e) = r {
-        eprintln!("warning: couldn't record the end of {key}'s reap attempt: {e}");
+        arena_core::out!(Err, "warning: couldn't record the end of {key}'s reap attempt: {e}");
         ctx.attention();
     }
 }
@@ -1897,7 +1898,7 @@ fn record_observation(ctx: &RunCtx<'_, '_>, key: &str, obs: &Observation) {
         Ok(())
     });
     if let Err(e) = r {
-        eprintln!("warning: couldn't record {key}'s post-backup look: {e}");
+        arena_core::out!(Err, "warning: couldn't record {key}'s post-backup look: {e}");
         ctx.attention();
     }
 }
@@ -2195,7 +2196,7 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
             if let Err(e) = saved {
                 // I14: a failed post-terminate save — the write-ahead record still names the
                 // pod (the next run finds it gone: recovered). Say so; try to hold.
-                eprintln!("warning: {name} was terminated but the state couldn't be saved: {e}");
+                arena_core::out!(Err, "warning: {name} was terminated but the state couldn't be saved: {e}");
                 let _ = ctx.store.set_hold(Some(&Hold { reason: format!("the state couldn't be saved after reaping {name}"), set_at: now, auto: true }));
                 ctx.queue(None, NotifyKind::HoldSet, Some(&name), "terminated, but the state couldn't be saved — hold set");
                 ctx.attention();
@@ -2345,7 +2346,7 @@ async fn backup(
     let snap = pull::snapshot_tier_for(base, &dest.label, &pod.name, &small);
     for d in [snapshot_dir, big_dir] {
         if let Err(e) = std::fs::create_dir_all(d) {
-            eprintln!("warning: creating {d}: {e}");
+            arena_core::out!(Err, "warning: creating {d}: {e}");
             ev.dest_ok = false;
             return ev;
         }
@@ -2443,7 +2444,7 @@ fn freeze(dest: &Dest, pod: &Pod, now: u64, snapshot_dir: &str, big_dir: &str, k
         if !made.iter().any(|m| m == leaf) {
             let fresh = leaf.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::create_dir(leaf));
             if let Err(e) = fresh {
-                eprintln!("warning: freezing {from}: can't make {} ({e})", leaf.display());
+                arena_core::out!(Err, "warning: freezing {from}: can't make {} ({e})", leaf.display());
                 return false;
             }
             made.push(leaf.to_path_buf());
@@ -2452,7 +2453,7 @@ fn freeze(dest: &Dest, pod: &Pod, now: u64, snapshot_dir: &str, big_dir: &str, k
         match (tree_count(src), link_tree(src, to)) {
             (Ok(a), Ok(b)) if a == b => true,
             (a, b) => {
-                eprintln!("warning: freezing {from} into {}: {a:?} vs {b:?}", to.display());
+                arena_core::out!(Err, "warning: freezing {from} into {}: {a:?} vs {b:?}", to.display());
                 false
             }
         }
@@ -2462,7 +2463,7 @@ fn freeze(dest: &Dest, pod: &Pod, now: u64, snapshot_dir: &str, big_dir: &str, k
         // Only what this attempt made — never anything else under `reaped/`.
         for leaf in &made {
             if let Err(e) = std::fs::remove_dir_all(leaf) {
-                eprintln!("warning: removing the partial frozen copy {}: {e}", leaf.display());
+                arena_core::out!(Err, "warning: removing the partial frozen copy {}: {e}", leaf.display());
             }
         }
     }
@@ -2491,7 +2492,7 @@ fn promote_dir(tier_dir: &str) -> std::result::Result<String, String> {
 /// with a warning (and attention), when the rename didn't happen.
 fn promote_tier(ctx: &RunCtx<'_, '_>, tier_dir: &str) -> String {
     promote_dir(tier_dir).unwrap_or_else(|e| {
-        eprintln!("warning: the reaped pod's frozen copy keeps its attempt name ({e})");
+        arena_core::out!(Err, "warning: the reaped pod's frozen copy keeps its attempt name ({e})");
         ctx.attention();
         tier_dir.to_string()
     })
@@ -2566,7 +2567,7 @@ pub(crate) fn ends_column(cfg: &Config, pods: &[Pod], now: u64, tz: i64) -> Opti
         Ok(Some(s)) => s,
         Ok(None) => return None,
         Err(e) => {
-            eprintln!("warning: the reaper's state can't be read ({e}) — ENDS shows ?");
+            arena_core::out!(Err, "warning: the reaper's state can't be read ({e}) — ENDS shows ?");
             return Some(vec!["?".into(); pods.len()]);
         }
     };
@@ -2603,7 +2604,7 @@ pub(crate) fn renamed(cfg: &Config, provider: &str, id: &str, new_name: &str) {
         Ok(())
     });
     if let Err(e) = r {
-        eprintln!("warning: the reaper's record of {id} wasn't renamed ({e}) — it now stays inert until `arena pods reap set` again");
+        arena_core::out!(Err, "warning: the reaper's record of {id} wasn't renamed ({e}) — it now stays inert until `arena pods reap set` again");
     }
 }
 

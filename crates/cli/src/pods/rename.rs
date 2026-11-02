@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arena_core::capability::Op;
+use arena_core::out;
+use arena_core::out::To;
 use arena_core::provider::Provider;
 use arena_core::remote::{describe_error, Remote, PROBE_TIMEOUT};
 use arena_core::selector::Naming;
@@ -14,7 +16,7 @@ use arena_core::Config;
 
 use crate::keys::{cohort_keys_file, cohort_keys_header, ensure_cohort_keys_file, machine_key_names, write_secret_file, KeyBook};
 use crate::proxy::{sync_proxy, ProxySync};
-use crate::{confirm, reap};
+use crate::{confirm_brief, reap};
 
 /// The one thing that can't follow a name, for the renamed pods that have it: a RunPod or Vast
 /// container's `MACHINE_NAME` env var ([`arena_core::setup::machine_name_in_env`]) — not a
@@ -62,7 +64,7 @@ pub(crate) async fn handle_rename(
     let pods = arena_core::provider::list_complete(provider).await.context("listing pods")?;
     let plan = plan_renames(prefix, &cfg.machine_names, &pods, &request)?;
     if plan.is_empty() {
-        println!("nothing to rename.");
+        out!(Out, "nothing to rename.");
         return Ok(());
     }
     // Before anything is asked: a batch with a pod its backend can't rename would stop there.
@@ -81,16 +83,18 @@ pub(crate) async fn handle_rename(
     let ports = port_moves(cfg, &plan);
     steps.extend(ports.iter().map(|moves| format!("     ports follow names: {moves} (its person connects as the new name once the proxy is synced)")));
     let what = format!("rename {} pod(s):\n{}\nthen:\n{}", plan.len(), summary.join("\n"), steps.join("\n"));
+    let brief = rename_brief(cfg, &plan, skip_proxy);
     if dry_run {
-        println!("[dry-run] would {what}");
+        out!(Detail, "[dry-run] would {what}");
+        out!(Brief, "[dry-run] would rename {brief}");
         if let Some(note) = machine_name_note(&plan.iter().collect::<Vec<_>>(), &pods) {
-            println!("{note}");
+            out!(Detail, "{note}");
         }
-        println!("[dry-run] nothing changed.");
+        out!(Detail, "[dry-run] nothing changed.");
         return Ok(());
     }
-    if !confirm(yes, &format!("Will {what}"))? {
-        println!("aborted.");
+    if !confirm_brief(yes, &format!("Will {what}"), &format!("Rename {brief}?"))? {
+        out!(Out, "aborted.");
         return Ok(());
     }
     let policy = arena_core::retry::RetryPolicy::default();
@@ -107,7 +111,7 @@ pub(crate) async fn handle_rename(
             ));
             break;
         }
-        println!("[renamed] {} → {}", r.old, r.new);
+        out!(Out, "[renamed] {} → {}", r.old, out::bold(&r.new));
         // The reaper's record (and a pin by this id) follows the new name.
         if let Some(p) = pods.iter().find(|p| p.id == r.id) {
             reap::renamed(cfg, &p.provider, &r.id, &r.new);
@@ -125,21 +129,23 @@ pub(crate) async fn handle_rename(
         // sync would drop their forwards. Left alone, every old forward keeps routing (a
         // renamed pod keeps its port: same list index), until the re-run.
         for line in rename_report(note.as_deref(), &missed, &key_warnings) {
-            eprintln!("{line}");
+            out!(if line.starts_with("note:") { To::ErrDetail } else { To::Err }, "{line}");
         }
         anyhow::bail!("{failure}");
     }
     let synced = if skip_proxy {
-        println!("(proxy not synced — run `arena proxy apply`)");
+        out!(Out, "(proxy not synced — run `arena proxy apply`)");
         false
     } else {
         matches!(sync_proxy(cfg, provider, "rename").await, ProxySync::Synced { .. })
     };
     if let Some(moves) = &ports {
-        println!("{}", port_note(moves, synced));
+        out!(Detail, "{}", port_note(moves, synced));
+        out!(Brief, "{}", port_brief(moves, synced));
     }
+    // The MACHINE_NAME note is `-v`'s; what's still to fix (a `~/.name`, a key) is said by default.
     for line in rename_report(note.as_deref(), &missed, &key_warnings) {
-        println!("{line}");
+        out!(if line.starts_with("note:") { To::Detail } else { To::Out }, "{line}");
     }
     Ok(())
 }
@@ -151,20 +157,49 @@ pub(crate) async fn handle_rename(
 /// "redeploy the proxy"). `None` without a proxy, or when no port moves — a prefix change keeps
 /// each short name's place, and a name that had no port gets no "from". Pure.
 pub(crate) fn port_moves(cfg: &Config, plan: &[PlannedRename]) -> Option<String> {
-    let proxy = arena_core::proxy::ProxyConfig::from_config(cfg).ok()?;
+    let moves: Vec<String> = ports_moved(cfg, plan).iter().map(|(r, old, new)| format!("{} :{old} → {} :{new}", r.old, r.new)).collect();
+    (!moves.is_empty()).then(|| moves.join(", "))
+}
+
+/// Each renamed machine whose proxy port moves, with its old and new port ([`port_moves`]).
+fn ports_moved<'a>(cfg: &Config, plan: &'a [PlannedRename]) -> Vec<(&'a PlannedRename, u16, u16)> {
+    let Ok(proxy) = arena_core::proxy::ProxyConfig::from_config(cfg) else { return Vec::new() };
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let port = |name: &str| {
         let at = cfg.machine_names.iter().position(|e| arena_core::naming::qualify(prefix, e) == name)?;
         u16::try_from(usize::from(proxy.starting_port) + at).ok()
     };
-    let moves: Vec<String> = plan
-        .iter()
+    plan.iter()
         .filter_map(|r| match (port(&r.old), port(&r.new)) {
-            (Some(old), Some(new)) if old != new => Some(format!("{} :{old} → {} :{new}", r.old, r.new)),
+            (Some(old), Some(new)) if old != new => Some((r, old, new)),
             _ => None,
         })
-        .collect();
-    (!moves.is_empty()).then(|| moves.join(", "))
+        .collect()
+}
+
+/// [`port_note`] as the default output says it: where the port went, and — not synced — what
+/// still forwards. Pure.
+pub(crate) fn port_brief(moves: &str, synced: bool) -> String {
+    if synced {
+        format!("proxy port moved: {moves} — whoever is on it connects as the new name now")
+    } else {
+        format!("proxy port moves: {moves} — once the proxy is synced (`arena proxy apply`); the old port forwards until then")
+    }
+}
+
+/// A rename in a line, for the default output's question and dry run: each pod's old and new
+/// name, and what follows them — `devtest-alpha → devtest-bravo (~/.name, its keys and the proxy
+/// follow; port :9500 → :9501)`. Pure (but for the bold).
+pub(crate) fn rename_brief(cfg: &Config, plan: &[PlannedRename], skip_proxy: bool) -> String {
+    let pairs: Vec<String> = plan.iter().map(|r| format!("{} → {}", r.old, out::bold(&r.new))).collect();
+    let pairs = if pairs.len() > 3 { format!("{} pods: {}", pairs.len(), pairs.join(", ")) } else { pairs.join(", ") };
+    let follow = if skip_proxy { "~/.name and the keys follow; the proxy isn't synced" } else { "~/.name, the keys and the proxy follow" };
+    let ports = match ports_moved(cfg, plan).as_slice() {
+        [] => String::new(),
+        [(_, old, new)] if plan.len() == 1 => format!("; its proxy port :{old} → :{new}"),
+        _ => "; their proxy ports move".to_string(),
+    };
+    format!("{pairs} ({follow}{ports})")
 }
 
 /// The line after a rename whose ports moved ([`port_moves`]): the person connects as the new name
@@ -281,9 +316,10 @@ pub(crate) async fn rewrite_name_files(
     }
     fn report(missed: &mut Vec<(String, String)>, what: &str, name: String, res: std::result::Result<(), String>) {
         match res {
-            Ok(()) => println!("[{what}] ✓ {name}"),
+            Ok(()) => out!(Detail, "[{what}] ✓ {name}"),
             Err(why) => {
-                eprintln!("[{what}] ✗ {name}: {why}");
+                // The summary's `⚠ … still has the old name` line says it by default, with its fix.
+                out!(ErrDetail, "[{what}] ✗ {name}: {why}");
                 missed.push((name, why));
             }
         }
@@ -506,7 +542,7 @@ async fn move_key_mappings(
         for (old, new) in pairs.iter().filter(|(_, n)| !plan.taken.iter().any(|t| t == n)) {
             for k in named(&machine_key_names(naming, old)) {
                 match api.rename_key(&k.hash, new).await {
-                    Ok(()) => println!("[keys] OpenRouter key {} → {new}", k.name.as_deref().unwrap_or(old)),
+                    Ok(()) => out!(Detail, "[keys] OpenRouter key {} → {new}", k.name.as_deref().unwrap_or(old)),
                     Err(e) => warnings.push(format!("renaming the OpenRouter key {old} → {new} failed: {e}")),
                 }
             }
@@ -526,7 +562,7 @@ fn write_csv_move(book: &KeyBook<'_>, prefix: &str, dst: Option<&std::path::Path
     let Some(dst) = dst else {
         return match book.write_csv(text) {
             Ok(()) => {
-                println!("[keys] {}: {moved}", book.csv.display());
+                out!(Detail, "[keys] {}: {moved}", book.csv.display());
                 None
             }
             Err(e) => Some(format!("couldn't update {} ({e}) — its rows still use the old names: {moved}", book.csv.display())),
@@ -547,7 +583,7 @@ fn write_csv_move(book: &KeyBook<'_>, prefix: &str, dst: Option<&std::path::Path
         ));
     }
     let carried = if plan.carried.is_empty() { String::new() } else { format!(" (carried along: {})", plan.carried.join(", ")) };
-    println!("[keys] moved into {} (this cohort's keys file): {moved}{carried}", dst.display());
+    out!(Detail, "[keys] moved into {} (this cohort's keys file): {moved}{carried}", dst.display());
     if let Some(src) = &plan.src {
         if let Err(e) = write_secret_file(&old_real, src) {
             return Some(format!(
