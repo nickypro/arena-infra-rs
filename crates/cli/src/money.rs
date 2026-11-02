@@ -324,7 +324,8 @@ pub(crate) type SpecQuote<'a> = std::pin::Pin<Box<dyn std::future::Future<Output
 /// tier read live alongside (`quote`, within the same bound; remembered like any plan's
 /// prices) — an option with no live price at the one read for that GPU and tier under a day
 /// ago, else at a stand-in that errs high (`~`), never free. Advisory and quiet: lines to
-/// print, never an error.
+/// print, never an error. (The commands use [`preflight`], which has the short forms too.)
+#[cfg(test)]
 pub(crate) async fn balance_preflight(
     provider: &dyn Provider,
     cfg: &Config,
@@ -334,10 +335,34 @@ pub(crate) async fn balance_preflight(
     spec: &arena_core::PodSpec,
     quote: Option<SpecQuote<'_>>,
 ) -> Vec<String> {
-    let Some(account) = Account::from_name(provider.name()) else { return Vec::new() };
+    preflight(provider, cfg, bal, new_pods, options, spec, quote).await.lines
+}
+
+/// [`balance_preflight`], with the default output's forms beside its lines.
+#[derive(Debug, Default)]
+pub(crate) struct Preflight {
+    /// The whole preflight (`-v`; its warnings at both).
+    pub lines: Vec<String>,
+    /// `Balance $491.57 → ≈22h left ‼` ([`balance::preflight_brief`]).
+    pub brief: Option<String>,
+    /// What the new pods add per hour, as the prompt says it: `≤$1.98/h`, `≤~$0.34/h`.
+    pub cost: Option<String>,
+}
+
+/// [`balance_preflight`]'s reading as a [`Preflight`].
+pub(crate) async fn preflight(
+    provider: &dyn Provider,
+    cfg: &Config,
+    bal: &BalanceCtx,
+    new_pods: usize,
+    options: Option<&OptionPlan>,
+    spec: &arena_core::PodSpec,
+    quote: Option<SpecQuote<'_>>,
+) -> Preflight {
+    let Some(account) = Account::from_name(provider.name()) else { return Preflight::default() };
     // No balance to show: no catalog request either.
     if !bal.api.accounts().iter().any(|(a, _)| *a == account) {
-        return Vec::new();
+        return Preflight::default();
     }
     let now = unix_now();
     let mode = bal.inline_mode();
@@ -350,7 +375,7 @@ pub(crate) async fn balance_preflight(
     };
     let observing = balance::observe_account(bal.api.as_ref(), &state, account, mode, balance::INLINE_TIMEOUT, now);
     let (fetched, quoted) = tokio::join!(observing, quoting);
-    let Some(fetched) = fetched else { return Vec::new() };
+    let Some(fetched) = fetched else { return Preflight::default() };
     let fetched = [fetched];
     let burns = balance::Burns::new();
     let (state, _) = balance::commit(bal.state_path(), state, &fetched, &burns, mode, now);
@@ -360,7 +385,18 @@ pub(crate) async fn balance_preflight(
     let (policy, _) = BalancePolicy::from_config(cfg);
     let views = balance::views(&state, &fetched, &burns, &policy, mode, now);
     let new = new_pod_price(new_pods, options.or(quoted.as_ref()), spec, provider.name(), &policy, &state, now);
-    views.first().map(|v| balance::preflight_lines_with(v, new, &policy, now)).unwrap_or_default()
+    let cost = new.per_pod.filter(|p| p.is_finite() && *p > 0.0).map(|p| {
+        let tilde = if new.stand_in || new.quoted.is_some() { "~" } else { "" };
+        format!("≤{tilde}{}/h", arena_core::fleet::fmt_money("$", p * new_pods as f64))
+    });
+    match views.first() {
+        Some(v) => Preflight {
+            lines: balance::preflight_lines_with(v, new, &policy, now),
+            brief: Some(balance::preflight_brief(v, new, &policy)),
+            cost,
+        },
+        None => Preflight::default(),
+    }
 }
 
 /// What the new pods cost per pod at most: the dearest placement option (on the single-spec
@@ -711,10 +747,11 @@ mod tests {
         let parse = |argv: &[&str]| Cli::try_parse_from(["arena"].iter().chain(argv).copied()).map(|c| c.cmd);
         assert!(matches!(
             parse(&["balance"]).unwrap(),
-            Cmd::Balance { cmd: None, json: false, check: false, no_live: false, verbose: false }
+            Cmd::Balance { cmd: None, json: false, check: false, no_live: false }
         ));
         assert!(matches!(parse(&["balance", "--check", "--json"]).unwrap(), Cmd::Balance { cmd: None, json: true, check: true, .. }));
-        assert!(matches!(parse(&["balance", "--no-live", "-v"]).unwrap(), Cmd::Balance { no_live: true, verbose: true, .. }));
+        let cli = Cli::try_parse_from(["arena", "balance", "--no-live", "-v"]).unwrap();
+        assert!(cli.verbose && matches!(cli.cmd, Cmd::Balance { no_live: true, .. }), "-v: the global one, after the command too");
         match parse(&["balance", "set", "runpod", "12.5"]).unwrap() {
             Cmd::Balance { cmd: Some(BalanceCmd::Set { account, usd }), .. } => assert_eq!((account, usd), (Account::Runpod, 12.5)),
             _ => panic!("wrong parse"),

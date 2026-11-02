@@ -224,8 +224,8 @@ skip it.
 ### 5. The first pods
 
 ```bash
-arena pods up -n 4 --dry-run     # preview: the names and the pipeline; nothing is created
-arena pods up -n 4 --check       # [arena-apple] READY after 4m10s — … as each pod finishes
+arena pods up -n 4 --dry-run     # preview: what and the names (-v: every step); nothing is created
+arena pods up -n 4 --check       # [arena-apple] READY after 4m10s · keys ✓ … as each pod finishes
 arena ssh-config --proxy         # the ~/.ssh/config to hand to the participants
 ```
 

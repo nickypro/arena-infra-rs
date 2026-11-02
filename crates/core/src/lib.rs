@@ -36,6 +36,7 @@ pub mod naming;
 pub mod near;
 pub mod offers;
 pub mod openrouter;
+pub mod out;
 pub mod pipeline;
 pub mod placement;
 pub mod plan;

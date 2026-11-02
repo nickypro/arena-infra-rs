@@ -8,7 +8,8 @@ use arena_core::provider::{ContainerReset, Provider};
 use arena_core::{Config, PodSpec};
 
 use crate::keys::{keys_dir, openrouter_client};
-use crate::pods::placement::{created_line, single_option_plan};
+use crate::pods::placement::{created_brief, created_line, pod_price, single_option_plan, ROUNDS};
+use arena_core::out::To;
 use crate::{image, reap, spend, Interrupt};
 
 /// The policy `up`/`create` records, in words.
@@ -117,7 +118,7 @@ impl Provider for RecordingProvider<'_> {
 pub(crate) fn owner_plan(tracking: &spend::SpendCtx, owner: &spend::OwnerArgs, names: &[String], dry_run: bool) -> Result<Vec<spend::Handover>> {
     let handing = spend::handovers(tracking, names, owner.owner.as_deref(), owner.keep_key)?;
     for line in spend::owner_lines(owner.owner.as_deref(), names, &handing, owner.keep_key, dry_run) {
-        println!("{line}");
+        arena_core::out!(Out, "{line}");
     }
     Ok(handing)
 }
@@ -130,11 +131,7 @@ pub(crate) async fn hand_keys_over(tracking: &spend::SpendCtx, cfg: &Config, own
     let api = openrouter_client(cfg);
     let done = spend::hand_over(tracking, cfg, api.as_ref().map(|a| a as &dyn arena_core::openrouter::KeyApi), std::path::Path::new(&keys_dir(cfg)), handing, o).await;
     for l in &done.lines {
-        if l.starts_with('✗') {
-            eprintln!("{l}");
-        } else {
-            println!("{l}");
-        }
+        arena_core::out!(if l.starts_with('✗') { To::Err } else { To::Out }, "{l}");
     }
     if !done.failed.is_empty() {
         anyhow::bail!(
@@ -157,10 +154,14 @@ pub(crate) fn warn_no_volume(provider: &dyn Provider, spec: &PodSpec) {
     let volumes = provider.supports(Op::Volume, None).works();
     if !volumes && !provider.supports(Op::Stop, None).works() {
         // No volumes there, and no stop (Shadeform): say both.
-        eprintln!(
-            "⚠ {}: no persistent volume and no stop — work survives only through backups \
-             (`arena pods backup`), and each VM bills until it's terminated.",
-            provider_label(provider)
+        arena_core::out!(
+            Err,
+            "{}",
+            arena_core::out::warn(format!(
+                "{}: no persistent volume and no stop — work survives only through backups \
+                 (`arena pods backup`), and each VM bills until it's terminated.",
+                provider_label(provider)
+            ))
         );
         return;
     }
@@ -168,15 +169,20 @@ pub(crate) fn warn_no_volume(provider: &dyn Provider, spec: &PodSpec) {
         return;
     }
     if !volumes {
-        eprintln!(
-            "⚠ {}: no persistent volume — a restart or a stop may wipe the container disk; work survives \
-             only through backups (`arena pods backup`).",
-            provider_label(provider)
+        arena_core::out!(
+            Err,
+            "{}",
+            arena_core::out::warn(format!(
+                "{}: no persistent volume — a restart or a stop may wipe the container disk; work survives \
+                 only through backups (`arena pods backup`).",
+                provider_label(provider)
+            ))
         );
     } else if spec.volume_gb == 0 {
-        eprintln!(
-            "⚠ no persistent volume (VOLUME_GB=0): work is lost when a pod restarts. \
-             Set VOLUME_GB to keep it."
+        arena_core::out!(
+            Err,
+            "{}",
+            arena_core::out::warn("no persistent volume (VOLUME_GB=0): work is lost when a pod restarts. Set VOLUME_GB to keep it.")
         );
     }
 }
@@ -262,17 +268,14 @@ pub(crate) async fn plan_create(provider: &dyn Provider, cfg: &Config, want: Wan
     let target = target_total(want, &existing, provider.name(), prefix);
     if let Want::Total(n) = want {
         if n <= have {
-            eprintln!("already have {have} {} pod(s) (target {n}) — nothing to create", provider.name());
+            arena_core::out!(Err, "already have {have} {} pod(s) (target {n}) — nothing to create", provider.name());
         }
     }
     let to_create = target.saturating_sub(have);
     // `existing` spans every provider, so a name live on another backend won't be reused.
     let names = arena_core::naming::next_free_names(prefix, &cfg.machine_names, &existing, to_create);
     if names.len() < to_create {
-        eprintln!(
-            "warning: need {to_create} but only {} free machine name(s) available",
-            names.len()
-        );
+        arena_core::out!(Err, "{}", arena_core::out::warn(format!("need {to_create} but only {} free machine name(s) available", names.len())));
     }
     Ok(CreatePlan { target, names })
 }
@@ -306,10 +309,10 @@ pub(crate) async fn resolve_explicit_names(
         // (`@james-gpu` → `james-gpu`) and prefixed entries both match without false warnings.
         let known = cfg.machine_names.iter().any(|m| arena_core::naming::qualify(prefix, m) == full);
         if !known {
-            eprintln!("warning: '{full}' is not in MACHINE_NAME_LIST (creating anyway)");
+            arena_core::out!(Err, "{}", arena_core::out::warn(format!("'{full}' is not in MACHINE_NAME_LIST (creating anyway)")));
         }
         if taken.contains(full.as_str()) {
-            eprintln!("skip {full} — already exists");
+            arena_core::out!(Err, "skip {full} — already exists");
             continue;
         }
         if !out.contains(&full) {
@@ -437,7 +440,7 @@ pub(crate) async fn pin_vm_image(provider: &str, cfg: &Config, spec: &mut PodSpe
     let (resolved, _) = tokio::time::timeout(image::LOOKUP_TIMEOUT, image::resolve(&cloud, cfg, &setting, &ty))
         .await
         .map_err(|_| anyhow::anyhow!("looking up the arena image took over {}s", image::LOOKUP_TIMEOUT.as_secs()))??;
-    println!("{}", resolved.describe(arena_core::snapshot::unix_now()));
+    arena_core::out!(Detail, "{}", resolved.describe(arena_core::snapshot::unix_now()));
     spec.vm_image = Some(resolved.as_setting());
     Ok(())
 }
@@ -498,7 +501,7 @@ fn create_body_text(provider: &dyn Provider, spec: &PodSpec) -> Option<String> {
 
 pub(crate) fn print_create_body(provider: &dyn Provider, spec: &PodSpec) {
     if let Some(text) = create_body_text(provider, spec) {
-        println!("{text}");
+        arena_core::out!(Detail, "{text}");
     }
 }
 
@@ -602,6 +605,10 @@ pub(crate) async fn create_with_retry(
     // still bounds the whole operation: a top-up never balloons past what was agreed to.
     let retry_secs = retry_secs.max(1);
     let every = std::time::Duration::from_secs(retry_secs);
+    // A terminal's in-place round line goes when the rounds do (a log has each round's own) —
+    // on every way out (review r2: a failed relist left it promising another round).
+    let end_rounds = || arena_core::out::progress(ROUNDS, None);
+    let _rounds = arena_core::out::progress_guard(ROUNDS);
     // tokio's clock (not std's), so the paused-clock tests drive the window.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(retry_mins * 60);
     let topup = (target > 0).then(|| TopUp {
@@ -618,9 +625,11 @@ pub(crate) async fn create_with_retry(
         if names.is_empty() {
             break; // target reached (or no free names left)
         }
+        // The round starts: its creates' lines take the place of the waiting line.
+        end_rounds();
         // In retry mode the *loop* is the keep-trying, so each round is one-shot.
         let kt = retry_mins == 0 && keep_trying;
-        let made = match create_pods(provider, cfg, &names, kt, ov, on_made).await {
+        let made = match create_pods(provider, cfg, &names, kt, retry_mins > 0, ov, on_made).await {
             Ok(made) => made,
             Err(CreateFailed { created, error }) => {
                 all.extend(created);
@@ -638,21 +647,26 @@ pub(crate) async fn create_with_retry(
             // A round starts only inside the window: if the next one (`retry_secs` from now)
             // would start past it, stop here — not sleep, then create (bill) after the window
             // the operator agreed to. Decided before the sleep, as the placement executor does.
+            let why = if listing_missing { "fleet listing incomplete" } else { "capacity" };
             if !next_round_in_window(tokio::time::Instant::now(), every, deadline) {
-                eprintln!("retry window ({retry_mins}m) has no room for another round — have {} of {shown}", all.len());
+                end_rounds();
+                arena_core::out!(Err, "retry window ({retry_mins}m) has no room for another round — have {} of {shown} ({why})", all.len());
                 break 'rounds;
             }
-            let why = if listing_missing { "fleet listing incomplete" } else { "capacity" };
-            eprintln!(
-                "round {round}: {} short of target {shown} ({why}); retrying in {retry_secs}s (Ctrl+C to stop)…",
-                names.len()
-            );
+            // One line per round in a log (the dashboard reads it); updated in place on a terminal.
+            let line = format!("round {round}: {} short of target {shown} ({why}); retrying in {retry_secs}s (Ctrl+C to stop)…", names.len());
+            if arena_core::out::live() {
+                arena_core::out::progress(ROUNDS, Some(&line));
+            } else {
+                arena_core::out!(Err, "{line}");
+            }
             let interrupted = tokio::select! {
                 _ = tokio::time::sleep(every) => false,
                 _ = interrupt.wait() => true,
             };
             if interrupted {
-                eprintln!("interrupted — stopping retries with {} of {shown}", all.len());
+                end_rounds();
+                arena_core::out!(Err, "interrupted — stopping retries with {} of {shown}", all.len());
                 break 'rounds;
             }
             // The whole fleet first (as placement's rounds do): a confirmed name that exists
@@ -667,18 +681,20 @@ pub(crate) async fn create_with_retry(
                 r = relist(provider) => Some(r),
             };
             let Some(relisted) = relisted else {
-                eprintln!("interrupted — stopping retries with {} of {shown}", all.len());
+                end_rounds();
+                arena_core::out!(Err, "interrupted — stopping retries with {} of {shown}", all.len());
                 break 'rounds;
             };
             match relisted {
                 Relisted::Whole(fleet) => {
                     if tokio::time::Instant::now() > deadline {
-                        eprintln!("retry window ({retry_mins}m) elapsed while listing — have {} of {shown}", all.len());
+                        end_rounds();
+                        arena_core::out!(Err, "retry window ({retry_mins}m) elapsed while listing — have {} of {shown}", all.len());
                         break 'rounds;
                     }
                     let (keep, dropped) = still_needed(&names, &fleet, topup.as_ref());
                     for (name, why) in dropped {
-                        eprintln!("skip {name} — {why}");
+                        arena_core::out!(Err, "skip {name} — {why}");
                     }
                     names = keep;
                     break;
@@ -686,7 +702,8 @@ pub(crate) async fn create_with_retry(
                 Relisted::Partial(e) => {
                     round += 1;
                     listing_missing = true;
-                    eprintln!("round {round}: nothing created — {e}");
+                    arena_core::out!(ErrDetail, "round {round}: nothing created — {e}");
+                    arena_core::out!(ErrBrief, "round {round}: nothing created — {}", arena_core::out::reason(&e));
                 }
                 Relisted::Failed(e) => {
                     let error = anyhow::anyhow!(
@@ -712,6 +729,8 @@ async fn create_pods(
     cfg: &Config,
     names: &[String],
     keep_trying: bool,
+    // Inside `--retry-mins` rounds: a capacity stop is the round line's to say (once a round).
+    rounds: bool,
     ov: &SpecOverrides,
     on_made: OnMade<'_>,
 ) -> std::result::Result<Vec<Made>, CreateFailed> {
@@ -720,6 +739,11 @@ async fn create_pods(
     let base = spec_with_overrides(cfg, ov);
     // What the `[created]` lines say it was created on (as the placement path's do).
     let on = single_option_plan(provider.name(), &base).options.first().map(|o| o.describe());
+    // … and the default output's (`cx23 CPU VM` where the option is just `CPU VM`).
+    let on_brief = match &on {
+        Some(o) if o == "CPU VM" => provider.describe(&base).split(',').next().map(|d| d.trim().to_string()),
+        o => o.clone(),
+    };
     let policy = arena_core::retry::RetryPolicy::default();
     let mut created = Vec::new();
     'names: for name in names {
@@ -734,7 +758,8 @@ async fn create_pods(
             // through immediately to the classification below.
             match arena_core::retry::retrying(&policy, || provider.create_pod(&spec)).await {
                 Ok(pod) => {
-                    println!("{}", created_line(&pod, on.as_deref()));
+                    arena_core::out!(Detail, "{}", created_line(&pod, on.as_deref()));
+                    arena_core::out!(Brief, "{}", created_brief(&pod.name, on_brief.as_deref(), pod_price(&pod)));
                     let made = Made { pod, at: tokio::time::Instant::now(), option: None };
                     on_made(&made);
                     created.push(made);
@@ -743,16 +768,24 @@ async fn create_pods(
                 Err(e) => match e.kind() {
                     Some(K::Capacity) if keep_trying && cap_attempts < MAX_CAPACITY_ATTEMPTS => {
                         cap_attempts += 1;
-                        eprintln!(
+                        let line = format!(
                             "[waiting] no capacity for {name}; retry {cap_attempts}/{MAX_CAPACITY_ATTEMPTS} in {CAPACITY_RETRY_SECS}s (have {}/{})",
                             created.len(),
                             names.len()
                         );
+                        // Each retry in a log; one line updated in place on a terminal.
+                        if arena_core::out::live() {
+                            arena_core::out::progress(ROUNDS, Some(&line));
+                        } else {
+                            arena_core::out!(Err, "{line}");
+                        }
                         tokio::time::sleep(std::time::Duration::from_secs(CAPACITY_RETRY_SECS)).await;
                         // loop: retry the same name
                     }
                     Some(K::Capacity) if keep_trying => {
-                        eprintln!(
+                        arena_core::out::progress(ROUNDS, None);
+                        arena_core::out!(
+                            Err,
                             "[stop] still no capacity for {name} after {MAX_CAPACITY_ATTEMPTS} attempts (created {}/{}).",
                             created.len(),
                             names.len()
@@ -760,12 +793,21 @@ async fn create_pods(
                         break 'names;
                     }
                     Some(K::Capacity) => {
-                        eprintln!(
+                        arena_core::out!(
+                            ErrDetail,
                             "[stop] no capacity for this GPU right now: {e} (created {}/{}). \
                              Re-run with --retry-mins N (or --keep-trying) to wait for it to free up.",
                             created.len(),
                             names.len()
                         );
+                        if !rounds {
+                            arena_core::out!(
+                                ErrBrief,
+                                "[stop] no capacity right now (created {}/{}) — --retry-mins N waits for it",
+                                created.len(),
+                                names.len()
+                            );
+                        }
                         break 'names;
                     }
                     Some(K::Auth) => {
@@ -773,14 +815,15 @@ async fn create_pods(
                         return Err(CreateFailed::new(created, error));
                     }
                     _ => {
-                        eprintln!("created {}/{} before failure", created.len(), names.len());
+                        arena_core::out!(Err, "created {}/{} before failure", created.len(), names.len());
                         return Err(CreateFailed::new(created, anyhow::anyhow!("creating {name}: {e}")));
                     }
                 },
             }
         }
     }
-    println!("\nCreated {} of {} requested.", created.len(), names.len());
+    arena_core::out::progress(ROUNDS, None);
+    arena_core::out!(Detail, "\nCreated {} of {} requested.", created.len(), names.len());
     Ok(created)
 }
 

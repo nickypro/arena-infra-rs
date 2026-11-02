@@ -956,9 +956,11 @@ fn placement_flags_parse() {
     // A view is a provider (or `all`), and takes the filters; `--all` is `all`'s old
     // spelling, never beside a view; `-v` the notes.
     for view in offers::VIEWS {
-        match parse(&["arena", "offers", view, "--gpu", "A4000", "--cloud", "secure", "--max-price", "1", "-v"]).unwrap() {
-            Cmd::Offers { view: v, gpu, cloud, max_price, verbose, all, .. } => {
-                assert_eq!((v.as_deref(), gpu.as_deref(), cloud.as_deref(), max_price, verbose, all), (Some(view), Some("A4000"), Some("secure"), Some(1.0), true, false));
+        let cli = Cli::try_parse_from(["arena", "offers", view, "--gpu", "A4000", "--cloud", "secure", "--max-price", "1", "-v"]).unwrap();
+        assert!(cli.verbose, "-v: the global one");
+        match cli.cmd {
+            Cmd::Offers { view: v, gpu, cloud, max_price, all, .. } => {
+                assert_eq!((v.as_deref(), gpu.as_deref(), cloud.as_deref(), max_price, all), (Some(view), Some("A4000"), Some("secure"), Some(1.0), false));
             }
             _ => panic!("not offers"),
         }

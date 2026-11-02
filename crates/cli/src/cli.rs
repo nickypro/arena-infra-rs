@@ -48,6 +48,14 @@ pub(crate) struct Cli {
     #[arg(long, short = 'y', global = true)]
     pub yes: bool,
 
+    /// Show the details too: plans, notes, ids, raw provider errors, each step
+    #[arg(long, short = 'v', global = true)]
+    pub verbose: bool,
+
+    /// Colour: auto (on a terminal, unless NO_COLOR is set), always or never
+    #[arg(long, global = true, value_name = "WHEN", default_value = "auto", value_parser = ["auto", "always", "never"], hide_possible_values = true)]
+    pub color: String,
+
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -162,9 +170,6 @@ pub(crate) enum Cmd {
         /// `offers all`'s old spelling
         #[arg(long, hide = true, conflicts_with = "view")]
         all: bool,
-        /// The notes under the table too
-        #[arg(long, short = 'v')]
-        verbose: bool,
         /// JSON instead of a table
         #[arg(long)]
         json: bool,
@@ -237,9 +242,6 @@ pub(crate) enum Cmd {
         /// No live read: show only the fallback estimate (writes nothing)
         #[arg(long)]
         no_live: bool,
-        /// Also print the burn's parts, spend limit, billing history and last failures
-        #[arg(long, short = 'v')]
-        verbose: bool,
     },
     /// What each machine instance cost and who it was for (compute + AI)
     ///
@@ -1185,9 +1187,6 @@ pub(crate) enum PodCmd {
         /// Emit per-pod `{name, provider, status, checks[], facts}` as JSON on stdout.
         #[arg(long, requires = "checks")]
         json: bool,
-        /// Print every check of every pod, not just the table.
-        #[arg(short, long, requires = "checks")]
-        verbose: bool,
         #[command(flatten)]
         cohort: CohortScope,
         #[command(flatten)]

@@ -46,6 +46,8 @@ mod jobs;
 mod key_limits;
 mod money;
 mod offers;
+#[cfg(test)]
+mod output_test;
 mod reap;
 mod resolve;
 mod spend;
@@ -128,38 +130,60 @@ use ssh_config::{ssh_config_after, ssh_config_check_row_as};
 /// refusal is an error ([`NoTerminal`], exit status 2): it used to exit 0 after "aborted.",
 /// so a script or cron job couldn't tell "refused" from "done" (finding #25).
 fn confirm(assume_yes: bool, what: &str) -> Result<bool> {
-    use std::io::{IsTerminal, Write};
     if assume_yes {
         return Ok(true);
     }
-    if !std::io::stdin().is_terminal() {
-        eprintln!("{what}");
-        return Err(NoTerminal.into());
+    let answer = ask(what, &format!("{what}\nProceed? [y/N] "))?;
+    Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+/// [`confirm`] as the default output asks it (docs/OUTPUT.md): one line, `question [y/N] `,
+/// the question saying what it acts on and what it costs. With `-v`, `what` — the whole plan —
+/// and `Proceed? [y/N]`, as before. The same answers, `--yes` and refusal without a terminal.
+fn confirm_brief(assume_yes: bool, what: &str, question: &str) -> Result<bool> {
+    if arena_core::out::verbose() {
+        return confirm(assume_yes, what);
     }
-    eprint!("{what}\nProceed? [y/N] ");
-    std::io::stderr().flush().ok();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    if assume_yes {
+        return Ok(true);
+    }
+    let answer = ask(question, &format!("{question} [y/N] "))?;
+    Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
 /// [`confirm`] for what a `y` is too easy for (terminating several machines, or all of them):
 /// `token` (the count, or `ALL`: [`arena_core::selector::set_confirm_token`]) must be typed back,
 /// as the dashboard's marked-set confirm asks. `--yes` still answers it; no terminal refuses.
 fn confirm_typed(assume_yes: bool, what: &str, token: &str) -> Result<bool> {
-    use std::io::{IsTerminal, Write};
     if assume_yes {
         return Ok(true);
     }
+    let answer = ask(what, &format!("{what}\nType {token} to proceed (anything else aborts): "))?;
+    Ok(answer.trim() == token)
+}
+
+/// `prompt` on stderr and the line typed back. With no terminal to ask at, `what` is said and
+/// the answer is [`NoTerminal`]; a test capturing the output ([`arena_core::out::capture`])
+/// answers as it scripted, and refuses the same way when it scripted nothing.
+fn ask(what: &str, prompt: &str) -> Result<String> {
+    use std::io::{IsTerminal, Write};
+    use arena_core::out::{self, To};
+    out::end_progress();
+    if out::capturing() {
+        return out::ask(&out::strip(prompt)).ok_or_else(|| {
+            out::emit(To::Err, what);
+            NoTerminal.into()
+        });
+    }
     if !std::io::stdin().is_terminal() {
-        eprintln!("{what}");
+        out::emit(To::Err, what);
         return Err(NoTerminal.into());
     }
-    eprint!("{what}\nType {token} to proceed (anything else aborts): ");
+    eprint!("{}", out::for_stream(To::Err, prompt));
     std::io::stderr().flush().ok();
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
-    Ok(line.trim() == token)
+    Ok(line)
 }
 
 /// The refusal [`confirm`] fails with when there's no terminal to ask at and no `--yes`.
@@ -376,12 +400,14 @@ impl Interrupt {
 async fn main() -> std::process::ExitCode {
     let result = run().await;
     unstage_hetzner_script(&std::env::temp_dir());
+    arena_core::out::end_progress();
     if let Err(e) = &result {
         match e.downcast_ref::<reap::ReapExit>() {
             // Already said in the reaper's own words.
             Some(r) => eprintln!("{}", r.why),
-            // As `fn main() -> Result` printed it (the error and its causes).
-            None => eprintln!("Error: {e:?}"),
+            // As `fn main() -> Result` printed it (the error and its causes); `Error:` in red
+            // on a terminal.
+            None => arena_core::out::emit(arena_core::out::To::Err, &format!("{} {e:?}", arena_core::out::red(arena_core::out::bold("Error:")))),
         }
     }
     exit_code(&result)
@@ -389,6 +415,8 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<()> {
     let (cli, provider_named) = help::parse();
+    // `-v` and `--color`, for every line the run prints (docs/OUTPUT.md).
+    arena_core::out::init(cli.verbose, cli.color.parse().unwrap_or_default());
     // Before the config: an update needs none, and must work where it's broken.
     if let Cmd::Update { check, dry_run, skip_attestation } = cli.cmd {
         return handle_update(check, dry_run, skip_attestation, cli.yes).await;
@@ -454,14 +482,14 @@ async fn run() -> Result<()> {
         Cmd::Keys(k) => handle_keys(k, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Claude(c) => claude::handle_claude(c, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Teardown { check, json } => teardown::handle_teardown(provider.unwrap().as_ref(), &cfg, check, json).await,
-        Cmd::Balance { cmd, json, check, no_live, verbose } => {
+        Cmd::Balance { cmd, json, check, no_live } => {
             let bal = money::BalanceCtx::from_config(&cfg);
             let now = arena_core::snapshot::unix_now();
             if let Some(BalanceCmd::Set { account, usd }) = cmd {
                 print!("{}", money::balance_set(&cfg, &bal, account, usd, now)?);
                 return Ok(());
             }
-            let flags = money::BalanceFlags { json, check, no_live, verbose };
+            let flags = money::BalanceFlags { json, check, no_live, verbose: cli.verbose };
             let out = money::balance_report(provider.unwrap().as_ref(), &cfg, &bal, flags, now).await?;
             out.stderr.iter().for_each(|l| eprintln!("{l}"));
             print!("{}", out.stdout);
@@ -491,10 +519,10 @@ async fn run() -> Result<()> {
         }
         Cmd::Gpus { json } => offers::handle_gpus(&cfg, &provider_name, json).await,
         Cmd::Api(c) => handle_api(c, &cfg).await,
-        Cmd::Offers { view, gpu, cloud, max_price, gpus, server_type, order, all, verbose, json } => {
+        Cmd::Offers { view, gpu, cloud, max_price, gpus, server_type, order, all, json } => {
             let flags = offers::Flags { gpu, cloud, max_price, gpus, server_type, order };
             let view = if all { Some("all") } else { view.as_deref() };
-            offers::handle_offers(&cfg, provider_named.then_some(provider_name.as_str()), view, flags, json, verbose).await
+            offers::handle_offers(&cfg, provider_named.then_some(provider_name.as_str()), view, flags, json, cli.verbose).await
         }
     }
 }

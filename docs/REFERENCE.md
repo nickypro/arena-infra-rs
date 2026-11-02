@@ -12,6 +12,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
 - [Running arena](#running-arena)
   - [From a checkout](#from-a-checkout)
   - [`update`: installing a newer release](#update-installing-a-newer-release)
+  - [Output: `-v` and `--color`](#output--v-and---color)
   - [Command shorthands](#command-shorthands)
   - [Targeting & concurrency](#targeting--concurrency)
   - [Overriding config without editing it](#overriding-config-without-editing-it)
@@ -96,8 +97,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
 - **Read-only by default.** `pods list`, `offers` and the TUI only ever read from the providers: REST GETs plus
   read-only GraphQL queries (a POST, but a query, never a mutation). The RunPod key is sent
   only as an `Authorization: Bearer` header — never in a URL, which errors would print.
-- **Mutating commands act, but confirm first.** `create`/`stop`/`terminate`/… print
-  what they'll do and prompt `Proceed? [y/N]` at a terminal. `-y`/`--yes` skips the
+- **Mutating commands act, but confirm first.** `create`/`stop`/`terminate`/… say
+  what they'll do and ask `[y/N]` at a terminal (`up`/`create`: `Create … (≤$0.34/h)? [y/N]`). `-y`/`--yes` skips the
   prompt. With **no terminal** (cron, pipes) they *refuse* unless `--yes` is given — so
   nothing mutates non-interactively by accident — and exit with status **2** (a declined
   prompt at a terminal is `aborted.`, status 0). (`cron install`/`remove` confirm too, and
@@ -205,6 +206,15 @@ sudo arena update        # where root runs arena from someone else's ~/.cargo/bi
   restart. Cron picks the new `arena` up on its next run.
 - It needs no config and no GitHub login (the API allows 60 unauthenticated requests an hour;
   an update makes 2: the latest release, and its attestation).
+
+### Output: `-v` and `--color`
+
+Commands say little by default: what they will do, what they did, and what's wrong with the
+command that fixes it. **`-v`** (`--verbose`, on any command, before or after it) adds the rest:
+plans, notes, ids, the providers' own errors, each step. Colour is for a terminal only
+(`--color auto`, the default); `--color always|never` and `NO_COLOR` override it, and pipes and
+cron logs get the same words without it. `--json` output is the same either way. The rules,
+for anyone changing what a command prints: [OUTPUT.md](OUTPUT.md).
 
 ### Command shorthands
 
@@ -1457,8 +1467,11 @@ other names under `--retry-mins` (placed pods used to sit idle, billing, until t
 wait for *its* SSH endpoint and sshd answering (`--timeout`, default 600s, per pod) → sync the
 proxy (one writer at a time) →
 provision it (`--no-setup` skips) → [`--check`: deep check] → copy its API keys (when
-`keys/*_api_keys.csv` exist) → [`--lock`: lock it] → `[name] READY after 4m10s — …` or `[name] FAILED <stage>: …`, printed
-the moment that pod is done — a slow pod never holds up another.
+`keys/*_api_keys.csv` exist) → [`--lock`: lock it] → `[name] READY after 4m10s · keys ✓ · Claude ✓` or
+`[name] FAILED <stage>: … (retry: …)`, printed the moment that pod is done — a slow pod never holds up
+another. That, the `[created]` lines and a pod being replaced are all `up` prints by default (on a
+terminal, one line at the bottom shows where each pod is); `-v` prints every step, the plan, the
+provider's errors and the summary table, as before ([how arena prints](OUTPUT.md)).
 
 **A name with no OpenRouter key gets one.** With `OPENROUTER_PROVISIONING_KEY` set (and setup
 running), `up` lists the keys once before the prompt: each cohort name with no key on OpenRouter

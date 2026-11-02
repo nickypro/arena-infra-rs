@@ -15,7 +15,7 @@ use crate::cli::Select;
 use crate::pods::list::{enrich_best_effort, ENRICH_TIMEOUT};
 
 mod checked;
-pub(crate) use checked::{check_csv_keys, copy_snapshot, hold_name, keys_of, list_for_check, listed_states, mint_missing, plan_mints};
+pub(crate) use checked::{check_csv_keys, copy_snapshot, hold_name, keys_of, list_for_check, listed_states, mint_missing, plan_mints, MintPlan};
 use crate::pods::selection::{all_stopped_error, stopped_skip, Selected};
 use crate::{archive, confirm, key_limits, shell_quote, spend};
 
