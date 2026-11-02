@@ -99,7 +99,7 @@ async fn start_ends_each_pod_ready() {
     let opts = RestartOpts { yes: true, ..Default::default() };
     let got = rendered(false, &[], handle_start(&f, Arc::new(FakeRemote::new()), &cfg, &named(&[delta]), opts, FAST, &keys_dir)).await;
     assert_eq!(got, "[started] devtest-delta
-[devtest-delta] READY after 0s · disk kept
+[devtest-delta] READY after 0s · disk kept · proxy written, nginx not reloaded (reload it)
 ");
 
     let (quiet, loud) = both(&["start", "alpha", "--dry-run"], &cfg, &[], stopped).await;
@@ -118,7 +118,7 @@ Start devtest-alpha (a fresh image, set up again); devtest-delta (disk kept) —
 [devtest-alpha] waiting for SSH…
 [devtest-alpha] setup…
 [devtest-alpha] setup ✓ (0s)
-[devtest-alpha] READY after 0s
+[devtest-alpha] READY after 0s · proxy written, nginx not reloaded (reload it)
 "#;
 
 /// restart: a line before the prompt (the pod, what goes, that it's set up again) and the
@@ -323,7 +323,7 @@ async fn replace_says_the_new_pod_the_steps_and_the_end() {
 
 const REPLACE_DRY_QUIET: &str = r#"
 devtest-alpha → a new 1×RTX A4000 · RunPod COMMUNITY
-Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, .ssh, .vscode-server, shell rc files and history — what's only there goes when devtest-alpha-old is terminated
+Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, other dot-dirs (.ssh, .vscode-server, ~/.claude and Claude Code's state), shell rc files and history — what's only there goes when devtest-alpha-old is terminated
 [dry-run] would replace devtest-alpha (its home copied onto the new one, swapped in; the old one terminated)
 "#;
 
@@ -345,7 +345,7 @@ Replace devtest-alpha  (id=r-alpha, runpod)
 
 const REPLACE_QUIET: &str = r#"
 devtest-alpha → a new 1×RTX A4000 · RunPod COMMUNITY
-Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, .ssh, .vscode-server, shell rc files and history — what's only there goes when devtest-alpha-old is terminated
+Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, other dot-dirs (.ssh, .vscode-server, ~/.claude and Claude Code's state), shell rc files and history — what's only there goes when devtest-alpha-old is terminated
 Replace devtest-alpha (its home copied onto the new one, swapped in; the old one terminated)? [y/N] y
 [created] devtest-alpha-new · 1×RTX A4000 COMMUNITY · $0.29/h
 [devtest-alpha-new] waiting for SSH…
@@ -583,7 +583,7 @@ Proceed? [y/N] y
 "#;
 
 const FINISH_DRY_QUIET: &str = r#"
-Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, .ssh, .vscode-server, shell rc files and history — what's only there goes when devtest-alpha-old is terminated
+Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, other dot-dirs (.ssh, .vscode-server, ~/.claude and Claude Code's state), shell rc files and history — what's only there goes when devtest-alpha-old is terminated
 [dry-run] would terminate devtest-alpha-old (the original pod; irreversible, once the proxy routes devtest-alpha to the live pod)
 "#;
 
@@ -592,7 +592,7 @@ migrate finish devtest-alpha (dry-run): would sync the proxy, confirm devtest-al
 "#;
 
 const FINISH_QUIET: &str = r#"
-Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, .ssh, .vscode-server, shell rc files and history — what's only there goes when devtest-alpha-old is terminated
+Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, other dot-dirs (.ssh, .vscode-server, ~/.claude and Claude Code's state), shell rc files and history — what's only there goes when devtest-alpha-old is terminated
 Terminate devtest-alpha-old (the original pod; irreversible, once the proxy routes devtest-alpha to the live pod)? [y/N] y
 ✓ Terminated devtest-alpha-old. Migration of devtest-alpha complete.
 "#;
@@ -738,4 +738,19 @@ async fn a_restart_that_skips_the_proxy_is_set_up_not_ready() {
     let got = rendered(false, &[], handle_restart(&f, Arc::new(FakeRemote::new()), &cfg, "alpha", opts, FAST, &dir.0.display().to_string())).await;
     assert!(got.ends_with("[devtest-alpha] set up · proxy not synced (--skip-proxy): run `arena proxy apply`\n"), "{got}");
     assert!(!got.contains("READY"), "{got}");
+}
+
+/// Review r4: READY says when the proxy is write-only (the forward written, nginx not reloaded by
+/// arena), as the port may still lead to the old endpoint until it is; with a proxy arena reloads,
+/// or for a name with no proxy port, nothing is added.
+#[test]
+fn ready_says_a_write_only_proxy() {
+    use crate::pods::lifecycle::ready_notes;
+    let dir = tmpdir("out-ready-notes");
+    let write_only = cfg(&dir.0);
+    assert_eq!(ready_notes(&write_only, "devtest-alpha", "disk kept"), "disk kept · proxy written, nginx not reloaded (reload it)");
+    assert_eq!(ready_notes(&write_only, "devtest-zulu", ""), "", "no proxy port");
+    let reloads = Config::parse(&cfg_text(&dir.0).replace("SSH_PROXY_RELOAD_CMD=\"\"", "SSH_PROXY_RELOAD_CMD=\"true\""));
+    assert_eq!(ready_notes(&reloads, "devtest-alpha", "disk kept"), "disk kept");
+    assert_eq!(ready_notes(&reloads, "devtest-alpha", ""), "");
 }

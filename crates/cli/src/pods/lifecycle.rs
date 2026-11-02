@@ -613,7 +613,7 @@ pub(crate) async fn handle_start(
         for p in &kept {
             match missed.iter().find(|(id, _)| *id == p.id) {
                 Some((_, why)) => out!(ErrBrief, "{}", failed_line(&p.name, why.0, why.1, "arena proxy apply, once it answers")),
-                None => out!(Brief, "{}", ready_line(&p.name, since.elapsed(), Some("disk kept"))),
+                None => out!(Brief, "{}", ready_line(&p.name, since.elapsed(), Some(&ready_notes(cfg, &p.name, "disk kept")))),
             }
         }
     }
@@ -646,6 +646,17 @@ fn start_brief(provider: &dyn Provider, pods: &[arena_core::Pod], setup: bool) -
         parts.push(format!("{} (disk kept)", names(&kept)));
     }
     parts.join("; ")
+}
+
+/// What a READY line adds after `first` (`disk kept`): a pod with a proxy port behind a
+/// write-only proxy has its forward written but nginx not reloaded by arena (review r4: the port
+/// may still lead to its old endpoint until it is) — said, as `up`'s READY doesn't. Pure.
+pub(crate) fn ready_notes(cfg: &Config, name: &str, first: &str) -> String {
+    let mut notes: Vec<&str> = [first].into_iter().filter(|n| !n.is_empty()).collect();
+    if proxied_name(cfg, name) && crate::pods::replace::write_only_proxy(cfg).is_some() {
+        notes.push("proxy written, nginx not reloaded (reload it)");
+    }
+    notes.join(" · ")
 }
 
 /// A pod that came back from a start, a restart or a reimage, set up again (or a VM that kept
@@ -1722,7 +1733,8 @@ async fn come_back(
             if !how.sync && proxied_name(cfg, name) {
                 out!(Brief, "[{}] set up · proxy not synced (--skip-proxy): run `arena proxy apply`", out::bold(name));
             } else {
-                out!(Brief, "{}", ready_line(name, since.elapsed(), None));
+                let notes = ready_notes(cfg, name, "");
+                out!(Brief, "{}", ready_line(name, since.elapsed(), (!notes.is_empty()).then_some(notes.as_str())));
             }
         }
     }

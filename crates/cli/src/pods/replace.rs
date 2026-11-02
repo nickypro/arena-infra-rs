@@ -570,7 +570,10 @@ pub(crate) fn copy_scope_line() -> String {
 /// `copy_scope_line` has the whole list (`-v`). Pure.
 pub(crate) fn left_behind_line(original: &str, kept: bool) -> String {
     let fate = if kept { format!("stays on {original} only") } else { format!("goes when {original} is terminated") };
-    format!("Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, .ssh, .vscode-server, shell rc files and history — what's only there {fate}")
+    format!(
+        "Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, other dot-dirs (.ssh, \
+         .vscode-server, ~/.claude and Claude Code's state), shell rc files and history — what's only there {fate}"
+    )
 }
 
 /// The plan / confirm note on a locked original: copying only reads it, but what retires it

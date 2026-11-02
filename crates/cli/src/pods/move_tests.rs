@@ -996,7 +996,7 @@ Proceed? [y/N] y
 "#;
 
 const COPY_HOME_QUIET: &str = r#"
-Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, .ssh, .vscode-server, shell rc files and history — what's only there stays on devtest-alpha only
+Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, other dot-dirs (.ssh, .vscode-server, ~/.claude and Claude Code's state), shell rc files and history — what's only there stays on devtest-alpha only
 Copy devtest-alpha's home onto devtest-bravo (deletions mirrored; nothing renamed)? [y/N] y
 [devtest-bravo] copy from devtest-alpha…
 ✓ devtest-bravo has devtest-alpha's home (verified on devtest-bravo itself). devtest-alpha is untouched.
