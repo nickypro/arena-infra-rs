@@ -974,7 +974,28 @@ pub(crate) async fn handle_pods_bal(
             refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             handle_full_backup(remote, cfg, &sel, no_pull, message, dry_run, yes, RSYNC).await?;
         }
-        PodCmd::Setup { sel, dry_run, force, hf_token, cc_token, zsh_install, no_vscode, timeout } => {
+        PodCmd::Setup { sel, dry_run, notes_only: true, .. } => {
+            // Its settings first: a config without the repo's path fails before anything else.
+            let notes = arena_core::agent_notes::AgentNotes::from_config(cfg)?;
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            if !dry_run
+                && !sel.pods.is_empty()
+                && !confirm(
+                    yes,
+                    &format!(
+                        "Will write the agents' notes ({}) and link uv into /usr/local/bin on {} pod(s), nothing else: {}",
+                        arena_core::agent_notes::FILES.join(", "),
+                        sel.pods.len(),
+                        sel.names()
+                    ),
+                )?
+            {
+                println!("aborted.");
+                return Ok(());
+            }
+            crate::pods::setup::handle_notes(remote, cfg, &notes, !dry_run, &sel).await?;
+        }
+        PodCmd::Setup { sel, dry_run, force, hf_token, cc_token, zsh_install, no_vscode, timeout, notes_only: false } => {
             // Budgets first: a malformed SETUP_TIMEOUT_SECS fails before anything else.
             let timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, timeout)?;
             // Likewise the VS Code warm-up's settings (VSCODE_PREINSTALL / VSCODE_EXTENSIONS).

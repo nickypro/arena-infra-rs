@@ -673,8 +673,9 @@ pub(crate) enum PodCmd {
     /// default branch, update the current one), submodules, ~/.name, the HF token, a VS Code server
     /// warm-up, then API keys if keys/*_api_keys.csv exist and each pod's own Claude Code account
     /// (`arena claude`: the least-loaded one if it has none). With a
-    /// /workspace volume the repo is moved onto it, so a restart keeps the work. Confirms first;
-    /// no targets = every pod.
+    /// /workspace volume the repo is moved onto it, so a restart keeps the work. Then the agents'
+    /// notes (which Python to use, in ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md; AGENT_NOTES=0
+    /// turns them off): --notes-only does just that. Confirms first; no targets = every pod.
     #[command(verbatim_doc_comment)]
     #[allow(clippy::doc_lazy_continuation)] // verbatim `--help` text: its layout is the output, not Markdown
     Setup {
@@ -696,6 +697,9 @@ pub(crate) enum PodCmd {
         /// Skip the VS Code warm-up (VSCODE_PREINSTALL=0 turns it off everywhere)
         #[arg(long)]
         no_vscode: bool,
+        /// Only the agents' notes (which Python to use) and uv on PATH, for running machines
+        #[arg(long, conflicts_with_all = ["force", "hf_token", "cc_token", "zsh_install", "no_vscode", "timeout"])]
+        notes_only: bool,
         /// Per-pod budget in seconds for the main step (default 300; Hetzner VMs 1800)
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=arena_core::setup::MAX_STEP_TIMEOUT_SECS))]
         timeout: Option<u64>,

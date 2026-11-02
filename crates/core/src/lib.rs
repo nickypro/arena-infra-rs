@@ -5,6 +5,7 @@
 //! existing bash/python tooling, and a safety posture where nothing here mutates
 //! remote state unless a caller explicitly asks it to.
 
+pub mod agent_notes;
 pub mod apiextra;
 pub mod archive;
 pub mod apiget;

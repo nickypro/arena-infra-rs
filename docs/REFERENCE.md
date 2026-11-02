@@ -1834,6 +1834,9 @@ A pod that refuses our key (`Permission denied (publickey)`) on a provider with 
 gets the cohort keys re-attached to it and is set up again (up to 3×, 20s apart); elsewhere the
 refusal is reported as before.
 
+Then it tells the coding agents on the machine which Python to use ([the agents'
+notes](#the-agents-notes-claude-code-and-codex)) and warms up VS Code.
+
 Confirms first (`--dry-run` previews, token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`,
 `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
 
@@ -1905,6 +1908,63 @@ the deploy key is wired to github.com and the checkout updated as an image-based
 default branch fast-forwards; `--force` resets it). A fresh VM has no checkout yet: the script
 clones it. A fresh install records what it was built from (`.venv/.arena-req`: the hash of
 `install_uv.sh` and `requirements.txt`).
+
+#### The agents' notes (Claude Code and Codex)
+
+Setup installs Claude Code and Codex on every machine, and they didn't know the course env: on
+project week's first day a Claude asked to run GPT-2 on a GPU pod used `/usr/bin/python3`, found
+transformers missing and pip-installed it there, while `/opt/arena-env` had it all along. A shell
+started over ssh or by a tool may not have the env active:
+
+| on 2026-11-02 | `ssh host 'cmd'` | `zsh -lc` | interactive login, `pods run` |
+|---|---|---|---|
+| Hetzner VM | `python3` = `/usr/bin/python3` (no torch), no `python`, no `pip` | the same | the venv |
+| arena image, sshd's own PATH (RunPod) | `python3` = `/usr/bin/python3` (3.11 with torch, no transformers), `pip` = `/usr/local/bin/pip` (its pip) | the same | `/opt/arena-env` |
+| arena image on Vast (its ssh passes the image's PATH) | `/opt/arena-env` | the same | `/opt/arena-env` |
+
+So setup's **`agent notes`** step (after the env is there, before the VS Code warm-up;
+best-effort, 60s) writes this machine's facts into Claude Code's user memory
+(`~/.claude/CLAUDE.md`) and Codex's (`~/.codex/AGENTS.md`), between `<!-- BEGIN arena-infra
+python -->` and `<!-- END arena-infra python -->`. On a Hetzner VM:
+
+```
+<!-- BEGIN arena-infra python -->
+## Python on this machine (arena setup rewrites this block; write your own notes outside it)
+- Use the course env, /root/ARENA_materials/.venv: torch (a CPU build: this machine has no GPU), transformers, transformer_lens and the other course packages are in it. Run /root/ARENA_materials/.venv/bin/python, or `source /root/ARENA_materials/.venv/bin/activate` first.
+- Shells started over ssh, by scripts or by your tools may not have it active, and their `python3` is then the system one (/usr/bin/python3), without those packages. Check `which python` before running anything.
+- Missing a package? Check first: `/root/ARENA_materials/.venv/bin/python -m pip show PACKAGE`. Install into the env: `uv pip install --python /root/ARENA_materials/.venv/bin/python PACKAGE`. Never pip install into the system Python, and don't make another venv or conda env for the course.
+- The course repo (the exercises, and the participants' work) is /root/ARENA_materials.
+<!-- END arena-infra python -->
+```
+
+- **The env** is the first of these with a `bin/python` on the machine: on RunPod/Vast the image's
+  conda env (`/opt/<CONDA_ENV>`, then `/opt/conda/envs/…`, `~/miniconda3/envs/…`, …), then the
+  repo's `.venv`; on a bare VM (Hetzner, Shadeform) the repo's `.venv` first. None (a non-arena
+  image): a warning, nothing written. A GPU machine's line says "torch with CUDA".
+- **Installing:** `uv pip install --python <env>/bin/python PACKAGE` where `uv` is on PATH, else
+  `<env>/bin/python -m pip install PACKAGE`.
+- **uv on PATH:** the step first links `uv` and `uvx` from `~/.local/bin` into `/usr/local/bin`,
+  which every shell has (a Hetzner VM had uv only in `~/.local/bin`, on no shell's PATH: `uv` →
+  "command not found"). Only where nothing is there yet: a link already there is kept. The
+  Hetzner script and the image pods' agents step do the same.
+- **The files:** only the marked block is rewritten (the first one; a second is dropped); a file
+  without one gets it at the end, after a blank line; no file: one with just the block. Everything
+  else stays as it was, byte for byte. An unchanged file isn't written at all. A changed one is
+  swapped for the new one in one step (`renameat2`, as the VS Code warm-up's settings merge), with
+  its mode and owner, and through a link the file it points at; the file it replaces is kept
+  beside it (`CLAUDE.md.arena-XXXXXX`: an editor holding it open may still write into it). If
+  that isn't what was read (a save landed meanwhile), it goes straight back and the file is read
+  again; saved once more in that instant, and that save is kept beside it too, with a warning. A
+  file that isn't there is made only if it still isn't. Where no such swap can be made (no
+  `python3`), a file that's there is left alone, with a warning. A `BEGIN` line with no `END`
+  after it: the file is left alone, with a warning.
+- **Activating:** `source <env>/bin/activate` for a venv (the arena image's `/opt/arena-env` is a
+  uv venv, as is a VM's); `export PATH="<env>/bin:$PATH"` for an env without that script.
+
+**Running machines:** `arena pods setup --notes-only [targets]` runs just this step (no repo
+update, keys, tokens or VS Code; no targets = every pod), and a failure there is a ✗. It replaces
+a block a stopgap wrote by hand between the same markers. `AGENT_NOTES=0` turns the step off in
+setup (`--notes-only` still runs it).
 
 #### VS Code warm-up
 
