@@ -96,6 +96,19 @@ earlier).
   the changelog's action-needed and config lines and each entry's heading. `-v` prints all of it
   as before. The verdict lines (`OK — …`, `ALL CLEAR`/`NOT CLEAR: …`), `--json` and the exit
   statuses are unchanged.
+- **Change, move and stop** (`pods stop`, `start`, `restart`, `reimage`, `terminate`, `lock`/`unlock`,
+  `replace`, `migrate`, `copy-home`, `rename`, `cp`, `run`, `test`, `spare`, `volume`): the plan
+  before a prompt is one line naming every pod and what it costs (`Stop devtest-alpha (discards
+  its container disk and the work on it)? [y/N]`); a dry run says that line. Then a line per pod
+  (`[stopped] devtest-alpha`), a failure with its retry (`[devtest-bravo] FAILED terminate: locked
+  (retry: arena pods terminate devtest-bravo --unlock)`), and a count when there are several.
+  `terminate`'s typed count and `ALL`, `--wipe-ok` and migrate's confirms ask as before.
+  `replace` and `migrate` drop the 7-step plan for the new pod in a line; a log gets a line as
+  each long step starts (`[devtest-alpha-new] copy from devtest-alpha…`), a terminal one line in
+  place. `start`, `restart` and `reimage` end each pod with `[devtest-alpha] READY after 2m31s`,
+  so a `start` from the dashboard counts its pods as ready instead of "unfinished". `rename` says
+  where the proxy port went. `cp` says in one line what goes where. `run` and `test` print the tally
+  only for several pods.
 - For each of these, `-v` prints what it printed before. `--json`, exit codes and the lines the
   dashboard reads are the same.
 

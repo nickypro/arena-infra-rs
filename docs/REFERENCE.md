@@ -745,6 +745,14 @@ arena pods spare down --all
 Without spares, `arena pods replace apple --server-type cx43 --keep-trying` makes the new box
 itself, waiting up to an hour for room (`--retry-mins` for another window).
 
+What `replace` and `migrate` print: by default the new box in a line (`devtest-alpha → a new cx43
+CPU VM · Hetzner`) and one question (`Replace devtest-alpha (its home copied onto the new one,
+swapped in; the old one terminated)?`); then `[created]`, setup's lines, a line as each long step
+starts in a log (`[devtest-alpha-new] copy from devtest-alpha…`; a terminal shows one line in place
+with its clock), the swap and the end (`✓ devtest-alpha replaced; devtest-alpha-old terminated`).
+`-v` prints the 7-step plan, each step's lines and the notes, as before. `migrate copy`, `cutover`
+and `finish` work the same way; `spare up` says what each spare is in a line.
+
 - **`--server-type`** on `replace` and `migrate copy` (Hetzner only: a GPU pod is sized by `--gpu`,
   and `--gpu`, `--gpus`, `--cloud`, `--disk`, `--volume`, `--bootstrap` are refused on a VM). A
   comma list (`cx43,cx53`) falls back in its order. Default: the old box's type and its own labels.
@@ -1064,6 +1072,13 @@ A Hetzner `stop` asks the VM to shut down (ACPI, so it flushes its writes) and w
 it to be off; only one that isn't is powered off, and the output says so (`⚠ … powered off — writes
 not yet on its disk may be lost`).
 
+By default `stop`, `restart` and `terminate` ask in one line what they act on and what it costs
+(`Stop devtest-alpha (discards its container disk and the work on it); devtest-delta (disk kept)?
+[y/N]`); the dry run says the same line. Then a line per pod (`[stopped] devtest-alpha`), a failure
+with its retry (`[devtest-bravo] FAILED stop: <why> (retry: arena pods stop devtest-bravo)`), and a
+count for several. `-v` prints each pod's whole plan (ids, what survives where) and `Proceed?`, as
+before.
+
 #### `pods start`
 
 **`pods start <targets>`** (targets or `--all`) is the way back from a stop (RunPod v1 `POST
@@ -1072,6 +1087,11 @@ are started (others skipped with a note), each comes back as a fresh image, so i
 endpoint to settle, **re-runs setup** (`--no-setup`) and syncs the proxy (`--skip-proxy`); a Hetzner
 VM kept its disk (no setup). A start the provider refuses (no free GPU left on the host) is reported
 per pod, exit non-zero.
+
+Each pod that comes back ends in `[devtest-alpha] READY after 2m31s` (a VM that kept its disk:
+`· disk kept`), the line the dashboard's runs panel reads as the pod's end; a log also gets
+`[devtest-alpha] waiting for SSH…` and setup's lines as they start. `restart` and `reimage` end the
+same way.
 
 The SSH commands (`run`, `test`, `setup`, `backup`, `pull`…) skip a stopped pod saying so — `skip X
 — stopped (EXITED); arena pods start X brings it back` — even when the listing still shows its last
@@ -1112,7 +1132,10 @@ matched exactly as a single target is (no ranges or `all`; a name two pods share
 pass the id), and every one before anything is asked: a name that matches nothing stops them all.
 One machine confirms with `y`; several list themselves in one confirm that wants their count typed
 back (`3`), or `ALL` past five or for every listed pod, as the dashboard's marked set asks. A
-failure among several is said and the others still go; the exit fails after.
+failure among several is said and the others still go; the exit fails after. By default the confirm
+is one line naming every pod and what it costs (`TERMINATE devtest-alpha, devtest-bravo
+(irreversible; volume devtest-alpha-1 (10 GB) stays, billing).`), then the token to type; `-v`
+lists each with its id and provider.
 
 `terminate --all` tears down the **whole fleet** (confirms first, `ALL` typed back; `--dry-run`
 lists every pod without touching them) — for end-of-program teardown (names with `--all` are
@@ -1152,8 +1175,11 @@ old `Host` reaches nothing): the plan and the output say so, `devtest-echo :9504
 :9501`. A prefix change keeps each short name's port.
 
 A RunPod or Vast container's `MACHINE_NAME` env var keeps the old name (env only changes with a
-reimage) — the output says so; bare VMs (Hetzner, Shadeform) have no such variable. `--dry-run`
-lists every step.
+reimage) — the output says so with `-v`; bare VMs (Hetzner, Shadeform) have no such variable.
+By default the dry run and the confirm are one line (`Rename devtest-alpha → devtest-echo (~/.name,
+the keys and the proxy follow; its proxy port :7000 → :7004)?`), then `[renamed] …`, where the port
+went, and what's still to fix; `-v` (and `--dry-run -v`) lists every step, each `~/.name` and key
+move.
 
 ### `pods lock` / `pods unlock`
 
@@ -2117,8 +2143,11 @@ than trusting scp's exit code.
 
 Per pod it runs mkdir → scp → check and stops at the first failure; the scp's budget scales with
 what's sent — 10 min plus 1s per MB × pods (all copies share your uplink; `-r` counts the tree), or
-`--timeout <secs>` — and the mkdir/check get 20s each. Confirms first (the preview shows the
-budget); `--dry-run` previews.
+`--timeout <secs>` — and the mkdir/check get 20s each. Confirms first, in one line saying the type
+and both paths (`Copy file ./notes.md → /root/notes.md on devtest-alpha?`); a folder adds the `-r`
+nesting warning. `--dry-run` says the same line. It ends with `✓ copied to …`, and a line per pod
+that failed with the command that copies it again. `-v` prints the preview (with the budget), each
+pod's `[i/n]` line and the tally, and the dry run's `scp` commands.
 
 ### `keys` (OpenRouter)
 
@@ -2335,7 +2364,10 @@ fails shows what it printed on stdout too, then `exit N: <stderr>` — never `So
 no zsh yet — a bare VM before setup — it says so and to run `arena pods setup`) / the read-only
 torch-version health check (90s per pod; with no targets this cohort's pods, as `--deep`). Every dry run's `ssh`/`scp`/`rsync` line is shell-quoted,
 so it pastes as exactly what would run (globs like `'**/.git/**'` don't expand) where the login
-shell is a POSIX one; the remote command is shown as written (see below).
+shell is a POSIX one; the remote command is shown as written (see below). By default the confirm
+and the dry run are one line (``Run `nvidia-smi -L` on devtest-alpha, devtest-bravo?``) and the
+`N ok, M failed` tally shows only for several pods; `-v` shows the shell it's wrapped in and the
+tally always.
 
 **Login shells: POSIX ones and fish.** sshd hands a remote command to the user's login shell, and
 arena's commands are written for bash, zsh and sh. fish reads them its own way: an `if …; then`,
