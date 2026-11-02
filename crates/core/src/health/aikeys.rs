@@ -352,8 +352,12 @@ fn ai_key_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
     if !book.openrouter && row.is_none() && owner.is_none() {
         return Check::new(name, Skip, format!("no OpenRouter keys configured for this fleet ({})", k.seen()));
     }
+    // A keys CSV that can't be read: no row is known, so no "it has none" either — the fix
+    // starts with making it readable (it may hold this machine's newest key).
+    let unreadable = book.unreadable.is_some() && row.is_none();
     if k.set == Some(false) {
         return match (row, owner) {
+            _ if unreadable => Check::new(name, Fail, format!("missing; the keys CSV is unreadable — fix it, then `arena pods copy-keys {s}`")),
             (Some(_), _) => Check::new(name, Fail, format!("missing, though the keys CSV has one for it — `arena pods copy-keys {s}`")),
             (None, Some(o)) => Check::new(name, Fail, format!("missing, and its owner ({o}) should have one — `arena keys gen {s} --copy`")),
             (None, None) => Check::new(name, Warn, format!("missing, nor in the keys CSV — `arena keys gen {s} --copy` if it should have one")),
@@ -397,6 +401,7 @@ fn ai_key_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
             // Listed enabled, yet turned away: a resume (or a new cap) takes a minute or so to
             // reach the key endpoint (live, 2026-11-02).
             Some(Listed::Live) => format!("rejected (HTTP {h}), listed enabled: just resumed? Wait a minute — `arena pods test --keys {s}`"),
+            None if unreadable => format!("rejected (HTTP {h}); the keys CSV is unreadable — fix it, then `arena pods test --keys {s}`"),
             // No row: arena's own `rotate`/`terminate --revoke-key` drop it, a pause never does.
             None if row.is_none() => format!("rejected (HTTP {h}), and no keys-CSV row for it — `arena keys gen {s} --copy`"),
             None => format!("rejected (HTTP {h}): paused? `arena keys resume {s}`, else `arena keys rotate {s} --copy`"),

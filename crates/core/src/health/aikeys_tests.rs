@@ -314,7 +314,16 @@ fn an_unreadable_csv_or_a_script_error_is_never_a_quiet_pass() {
     let c = ai(&facts(&or_lines(GOOD, 200, "")), "devtest-apple", &b);
     assert_eq!(c.status, Status::Warn, "{c:?}");
     assert!(c.detail.starts_with("ok, but not compared: openrouter_api_keys.csv: "), "{}", c.detail);
-    assert_eq!(ai(&facts(&or_lines(GOOD, 401, "")), "devtest-apple", &b).status, Status::Fail);
+    // Missing or rejected: still a FAIL, but no "it has no row" advice (`keys gen` would mint a
+    // second key while the unreadable file may hold its newest): make the file readable first.
+    let c = ai(&facts(&or_lines(GOOD, 401, "")), "devtest-apple", &b);
+    assert_eq!(c.status, Status::Fail);
+    assert!(c.detail == "rejected (HTTP 401); the keys CSV is unreadable — fix it, then `arena pods test --keys apple`", "{}", c.detail);
+    assert!(command_fits(&format!("ai_key: {}", c.detail).replace("apple", "lightning")), "{}", c.detail);
+    let c = ai(&facts("openrouter.key=missing\n"), "devtest-apple", &b);
+    assert!(c.status == Status::Fail && c.detail.starts_with("missing; the keys CSV is unreadable"), "{c:?}");
+    assert!(c.detail.ends_with("— fix it, then `arena pods copy-keys apple`"), "{}", c.detail);
+    assert!(command_fits(&format!("ai_key: {}", c.detail).replace("apple", "lightning")), "{}", c.detail);
     // HF: a rejected token still FAILs; a working one isn't compared; a missing one can't be judged.
     assert_eq!(hf(&facts(&hf_lines(HF_GOOD, 401)), "devtest-apple", &b).status, Status::Fail);
     let c = hf(&facts(&hf_lines(HF_GOOD, 200)), "devtest-apple", &b);
