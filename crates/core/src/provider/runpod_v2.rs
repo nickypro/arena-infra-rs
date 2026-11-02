@@ -562,44 +562,47 @@ struct EndpointMemo {
     resets: HashMap<String, Reset>,
 }
 
-/// A reimage this provider sent: when, and the container it replaced as the pod's detail
-/// showed it just before — its SSH port and `runtime.uptime` — where known.
+/// A reimage this provider sent: when, what the pod ran before it, and — once a lookup showed
+/// it — the new container's endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Reset {
     /// When the request went out (unix seconds): the new container started after it, and a
     /// `startedAt` after it is a start since, which makes the reset moot.
     at: u64,
-    /// The old container's public ports (`runtime.ports`, SSH and HTTP alike): empty when the
-    /// pod wasn't running (no container ran), `None` when it was but its ports weren't shown —
-    /// then nothing tells the new container (review r5).
-    old_ports: Option<Vec<u16>>,
-    /// The new container's endpoint, once a lookup showed it. A listing that names none, or
-    /// another, is overruled by it, until the listing names this one (review r2, r3).
+    /// What ran before ([`Before`]).
+    before: Before,
+    /// The new container's endpoint, once a lookup showed it: the pod's, whatever a listing
+    /// names, for as long as the reset is remembered (reviews r2, r3, r6).
     new: Option<(String, u16)>,
 }
 
-impl Reset {
-    /// The reset sent at `at` of the container `before` (the pod's detail just before). Pure.
-    fn of(before: &Value, at: u64) -> Self {
-        let ports = public_ports(before);
-        let old_ports = if !parse_pod(before).status.eq_ignore_ascii_case("RUNNING") {
-            Some(Vec::new())
-        } else {
-            Some(ports).filter(|p| !p.is_empty())
-        };
-        Reset { at, old_ports, new: None }
-    }
+/// What the pod ran when it was reimaged, as its detail said just before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Before {
+    /// Not running: no container, so any that shows since is the new one.
+    NoneRan,
+    /// A container settled on this SSH endpoint: any detail naming it is the old container's,
+    /// however stale or partial.
+    Ssh(String, u16),
+    /// Not known: running with no SSH endpoint shown, or started too recently for its detail to
+    /// be trusted ([`SETTLE_SECS`]). Nothing then tells the new container (review r5, r6).
+    Unknown,
 }
 
-/// A detail's public ports (`runtime.ports[].public`), sorted. Pure.
-fn public_ports(body: &Value) -> Vec<u16> {
-    let mut ports: Vec<u16> = body
-        .pointer("/runtime/ports")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|p| p.get("public").and_then(Value::as_u64)).filter_map(|p| u16::try_from(p).ok()).collect())
-        .unwrap_or_default();
-    ports.sort_unstable();
-    ports
+impl Reset {
+    /// The reset sent at `at` of what the pod's detail `before` (just before) shows. Pure.
+    fn of(before: &Value, at: u64) -> Self {
+        let p = parse_pod(before);
+        let before = if !p.status.eq_ignore_ascii_case("RUNNING") {
+            Before::NoneRan
+        } else {
+            match (p.ssh_ip, p.ssh_port, p.started_at) {
+                (Some(ip), Some(port), Some(start)) if at.saturating_sub(start) >= SETTLE_SECS => Before::Ssh(ip, port),
+                _ => Before::Unknown,
+            }
+        };
+        Reset { at, before, new: None }
+    }
 }
 
 /// A detail's `runtime.uptime`: how long its container has run, in seconds (RunPod refreshes it
@@ -617,21 +620,25 @@ const RESET_WAIT_SECS: u64 = 1800;
 const CLOCK_SLACK: u64 = 5;
 
 /// Whether a reimaged pod's detail (`body`) shows the new container, on positive evidence only
-/// (the API names no container): an endpoint whose uptime fits in the time since the reset, on a
-/// public port the old container didn't have — RunPod gave every port anew, SSH and HTTP, on
-/// each of 5 resets seen live — or, where no container ran before, the uptime alone. An old
-/// container shows only its own ports however stale or partial its detail, and no uptime tells
-/// nothing. Where the old ports weren't known, and for a replacement that got every port back,
-/// nothing tells (an uptime that went down could be an out-of-order answer, review r4): the
-/// settle wait then times out and says to run `pods setup` — better than setup on the container
-/// being replaced. Pure.
+/// (the API names no container): an SSH endpoint other than the old container's — RunPod gave a
+/// new one on each of 5 resets seen live — with an uptime that fits in the time since the
+/// reset; where no container ran before, the uptime alone. A detail naming the old endpoint is
+/// the old container's however stale; no uptime tells nothing (nor does one that went down: it
+/// could be an out-of-order answer, review r4). Where the old endpoint wasn't known, and for a
+/// replacement that got it back, nothing tells: the settle wait then times out and says to run
+/// `pods setup` — better than setup on the container being replaced. Pure.
 fn is_new_container(body: &Value, reset: &Reset, now: u64) -> bool {
     let since = now.saturating_sub(reset.at);
-    let Some(old) = &reset.old_ports else { return false };
-    if parse_pod(body).ssh_port.is_none() || container_uptime(body).is_none_or(|u| u > since + CLOCK_SLACK) {
+    let p = parse_pod(body);
+    let (Some(ip), Some(port)) = (p.ssh_ip, p.ssh_port) else { return false };
+    if container_uptime(body).is_none_or(|u| u > since + CLOCK_SLACK) {
         return false;
     }
-    old.is_empty() || public_ports(body).iter().any(|p| !old.contains(p))
+    match &reset.before {
+        Before::NoneRan => true,
+        Before::Ssh(old_ip, old_port) => (old_ip.as_str(), *old_port) != (ip.as_str(), port),
+        Before::Unknown => false,
+    }
 }
 
 /// An endpoint looked up within this long of the pod's start may not be its new one yet.
@@ -689,25 +696,17 @@ where
     let (mut unknown, mut due) = (Vec::new(), Vec::new());
     for (i, p) in pods.iter_mut().enumerate() {
         if let Some(r) = reset(p).filter(|_| running(p)) {
-            let listed = p.ssh_ip.clone().zip(p.ssh_port);
             match r.new {
                 // A reimaged pod's listed endpoint may be its old container's: looked up, always.
                 None => {
                     (p.ssh_ip, p.ssh_port) = (None, None);
                     unknown.push(i);
-                    continue;
                 }
-                // The new container's, shown: the listing has caught up — done.
-                Some(new) if listed.as_ref() == Some(&new) => {
-                    lock().resets.remove(&p.id);
-                }
-                // A listing naming another, or none, is overruled: a lookup could still get
-                // the old container's detail.
-                Some((ip, port)) => {
-                    (p.ssh_ip, p.ssh_port, p.proxy_only) = (Some(ip), Some(port), false);
-                    continue;
-                }
+                // The new container's, whatever the listing names: a later listing or lookup
+                // could still name the old one (reviews r3, r6).
+                Some((ip, port)) => (p.ssh_ip, p.ssh_port, p.proxy_only) = (Some(ip), Some(port), false),
             }
+            continue;
         }
         if !running(p) || (p.ssh_ip.is_some() && p.ssh_port.is_some()) {
             continue;
@@ -2306,14 +2305,16 @@ mod tests {
         // as the pod's (review F1): no wait for a new one.
         assert!(p.endpoints.lock().unwrap().resets.is_empty());
         // One that did: its endpoint waits for the new container, told by the old one's facts.
-        let before = json!({"id": "e", "status": "RUNNING", "runtime": {"uptime": 315, "ports": [{"ip": "203.0.113.9", "private": 22, "public": 19984, "type": "tcp"}]}});
+        let before = json!({"id": "e", "status": "RUNNING", "startedAt": "1970-01-01T00:00:00Z",
+                            "runtime": {"uptime": 315, "ports": [{"ip": "203.0.113.9", "private": 22, "public": 19984, "type": "tcp"}]}});
         remember("e");
         p.note_reset("e", &before, 1_000);
         {
             let m = p.endpoints.lock().unwrap();
             assert!(!m.by_id.contains_key("e"));
             let r = &m.resets["e"];
-            assert_eq!((r.at, r.old_ports.as_deref(), r.new.as_ref()), (1_000, Some(&[19984][..]), None));
+            // Started at 0: long settled by 1000.
+            assert_eq!((r.at, &r.before, r.new.as_ref()), (1_000, &Before::Ssh("203.0.113.9".into(), 19984), None));
         }
         // This provider's own next stop, start, restart or terminate ends the wait.
         assert!(p.stop_pod("e").await.is_err());
