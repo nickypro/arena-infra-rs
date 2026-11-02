@@ -17,7 +17,7 @@ use crate::pods::list::{enrich_best_effort, ENRICH_TIMEOUT};
 mod checked;
 pub(crate) use checked::{check_csv_keys, copy_snapshot, hold_name, keys_of, list_for_check, listed_states, mint_missing, plan_mints, MintPlan};
 use crate::pods::selection::{all_stopped_error, stopped_skip, Selected};
-use crate::{archive, confirm, key_limits, shell_quote, spend};
+use crate::{archive, key_limits, shell_quote, spend};
 
 #[derive(Subcommand)]
 pub(crate) enum KeysCmd {
@@ -391,7 +391,7 @@ pub(crate) async fn handle_copy_keys(
         let or = openrouter_client(cfg);
         let listed = list_for_check(or.as_ref().map(|a| a as &dyn arena_core::openrouter::KeyApi)).await;
         for line in check_csv_keys(&mut keys, &hosts, listed.as_ref(), &Naming::from_config(cfg)) {
-            eprintln!("{line}");
+            arena_core::out!(Err, "{line}");
         }
     }
     let mut sources = keys.csv.clone();
@@ -406,7 +406,7 @@ pub(crate) async fn handle_copy_keys(
     match &claude_plan {
         Ok(Some(line)) => sources.push(line.clone()),
         Ok(None) => {}
-        Err(e) => eprintln!("⚠ Claude Code: {e} — no Claude Code token goes out"),
+        Err(e) => arena_core::out!(Err, "⚠ Claude Code: {e} — no Claude Code token goes out"),
     }
     let claude_on = matches!(claude_plan, Ok(Some(_)));
 
@@ -414,15 +414,18 @@ pub(crate) async fn handle_copy_keys(
     let pod_archive = archive::pod_archive(cfg);
     let archive_access = pod_archive.ready().cloned();
     let no_keys = sources.is_empty();
+    // The sources and what else goes on each pod are `-v`'s: by default one line before the
+    // writes says what goes where ([`copy_keys_brief`]).
     if no_keys && archive_access.is_none() {
-        println!(
+        arena_core::out!(
+            Detail,
             "Key sources: none — writing only the fleet's ssh (API keys: put `<provider>_api_keys.csv` in {keys_dir}/ \
              (openai/anthropic/openrouter), set HF_TOKEN / CLAUDE_TOKENS_FILE, or pass --hf-token)\n"
         );
     } else if no_keys {
-        println!("Key sources: none — writing only the fleet's ssh and the backup archive's access\n");
+        arena_core::out!(Detail, "Key sources: none — writing only the fleet's ssh and the backup archive's access\n");
     } else {
-        println!("Key sources: {}\n", sources.join(", "));
+        arena_core::out!(Detail, "Key sources: {}\n", sources.join(", "));
     }
 
     // Build the per-pod var set (broadcast HF merged into every reachable selected pod).
@@ -442,7 +445,7 @@ pub(crate) async fn handle_copy_keys(
         // A pod with no key of its own still gets the fleet's ssh (every machine's keys).
         let (vars, matched_per_host) = keys.vars_for(&pod.name);
         if arena_core::status::is_stopped(&pod.status) {
-            eprintln!("{}", stopped_skip(pod));
+            arena_core::out!(Err, "{}", stopped_skip(pod));
             unreachable += 1;
             stopped.push(pod.name.as_str());
             continue;
@@ -457,7 +460,7 @@ pub(crate) async fn handle_copy_keys(
             }
             Err(_) => {
                 let why = arena_core::fleet::no_endpoint_reason(pod).unwrap_or_else(|| "no SSH endpoint yet".into());
-                eprintln!("skip {} — {why}", pod.name);
+                arena_core::out!(Err, "skip {} — {why}", pod.name);
                 unreachable += 1;
             }
         }
@@ -471,23 +474,33 @@ pub(crate) async fn handle_copy_keys(
             }
             anyhow::bail!("none of the selected pods ({}) has an SSH endpoint yet — check `arena pods list`", sel.names());
         }
-        println!("(no reachable pods)");
+        arena_core::out!(Out, "(no reachable pods)");
         return Ok(());
     }
     if !broadcast_only.is_empty() {
-        eprintln!(
+        arena_core::out!(
+            ErrDetail,
             "⚠ {} reachable pod(s) matched NO per-host key — broadcast tokens only: {}\n  \
              (per-host keys come from <provider>_api_keys.csv, matched on exact pod name; \
              check that file actually lists these hosts)\n",
             broadcast_only.len(),
             broadcast_only.join(", ")
         );
+        arena_core::out!(
+            ErrBrief,
+            "{}",
+            arena_core::out::warn(format!(
+                "no per-host key for {} (broadcast tokens only) — <provider>_api_keys.csv must list them by exact name",
+                broadcast_only.join(", ")
+            ))
+        );
     }
 
     // Also wire fleet SSH on every reachable pod (see `fleet_ssh_for`). Built once — same
     // on every pod.
     let (fleet_ssh, fleet_keys) = fleet_ssh_for(cfg, pods);
-    println!(
+    arena_core::out!(
+        Detail,
         "Also on each target ({} pod(s)): authorize {} fleet key(s) + write that pod's own \
          ~/.ssh/config (the fleet host map, so it can ssh the others).",
         jobs.len(),
@@ -495,10 +508,11 @@ pub(crate) async fn handle_copy_keys(
     );
 
     if let Some(w) = pod_archive.warning() {
-        eprintln!("{w}");
+        arena_core::out!(Err, "{w}");
     }
     if let Some(a) = &archive_access {
-        println!(
+        arena_core::out!(
+            Detail,
             "Also the backup archive's access on each: the `{}` ssh block, its pinned host key, and the read key \
              (copied by scp to ~/{}).",
             a.block.lines().next().unwrap_or("Host archive").trim_start_matches("Host "),
@@ -506,8 +520,11 @@ pub(crate) async fn handle_copy_keys(
         );
     }
 
+    let names = jobs.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>();
+    let brief = copy_keys_brief(&sources, archive_access.is_some(), &names);
     if dry_run {
-        println!("Dry-run — would set on {} pod(s) (values redacted):\n", jobs.len());
+        arena_core::out!(Detail, "Dry-run — would set on {} pod(s) (values redacted):\n", jobs.len());
+        arena_core::out!(Brief, "Dry run: {brief}");
         let claude_pods: Vec<arena_core::Pod> = claude_jobs.iter().map(|(p, _)| p.clone()).collect();
         let claude_would = if claude_on { crate::claude::preview(cfg, &claude_pods, cc_token.as_deref()).unwrap_or_default() } else { vec![] };
         for (name, _, vars) in &jobs {
@@ -520,12 +537,12 @@ pub(crate) async fn handle_copy_keys(
                 (true, true) => "(no keys — the fleet's ssh and the backup archive's access)".to_string(),
                 (true, false) => "(no keys — the fleet's ssh)".to_string(),
             };
-            println!("  {name:<22} {what}");
+            arena_core::out!(Out, "  {name:<22} {what}");
         }
-        println!("\nPreview only — run without --dry-run to write to ~/.bashrc & ~/.zshrc.");
+        arena_core::out!(Detail, "\nPreview only — run without --dry-run to write to ~/.bashrc & ~/.zshrc.");
         return Ok(());
     }
-    let names = jobs.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>().join(", ");
+    let names = names.join(", ");
     let what = if no_keys && archive_access.is_some() {
         "authorize the fleet keys and write ~/.ssh/config (the fleet map and the backup archive's block)"
     } else if no_keys {
@@ -536,8 +553,11 @@ pub(crate) async fn handle_copy_keys(
     } else {
         "export API keys into ~/.bashrc & ~/.zshrc, authorize the fleet keys, and write ~/.ssh/config"
     };
-    if !confirm(yes, &format!("Will {what} on {} pod(s): {names}", jobs.len()))? {
-        println!("aborted.");
+    if yes {
+        arena_core::out!(Brief, "{brief}");
+    }
+    if !crate::confirm_brief(yes, &format!("Will {what} on {} pod(s): {names}", jobs.len()), &format!("{brief}?"))? {
+        arena_core::out!(Out, "aborted.");
         return Ok(());
     }
 
@@ -561,25 +581,32 @@ pub(crate) async fn handle_copy_keys(
         });
     }
     let (mut ok, mut failed, mut done) = (0, 0, 0);
+    // A pod written is a line at `-v` (and counted in place on a terminal); a failure is a line
+    // with its reason and the command that retries it.
+    let _progress = arena_core::out::progress_guard("copy-keys");
     while let Some(joined) = set.join_next().await {
         done += 1;
         let Ok((name, res)) = joined else { continue };
-        match res {
+        let why = match res {
             Ok(o) if o.success => {
-                println!("[{done}/{total}] ✓ {name}");
+                arena_core::out!(Detail, "[{done}/{total}] ✓ {name}");
                 ok += 1;
+                arena_core::out::progress("copy-keys", Some(&format!("keys: {done} of {total}")));
+                continue;
             }
-            Ok(o) => {
-                println!("[{done}/{total}] ✗ {name}: {}", o.stderr.trim());
-                failed += 1;
-            }
-            Err(e) => {
-                println!("[{done}/{total}] ✗ {name}: {e}");
-                failed += 1;
-            }
-        }
+            Ok(o) => o.stderr.trim().to_string(),
+            Err(e) => e.to_string(),
+        };
+        failed += 1;
+        arena_core::out!(Detail, "[{done}/{total}] ✗ {name}: {why}");
+        arena_core::out!(Brief, "{} (retry: arena pods copy-keys {name})", arena_core::out::fail(format!("{}: {}", arena_core::out::bold(&name), arena_core::out::reason_text(&why))));
+        arena_core::out::progress("copy-keys", Some(&format!("keys: {done} of {total}")));
     }
-    println!("\nDone: {ok} updated, {failed} failed.");
+    drop(_progress);
+    arena_core::out!(Detail, "\nDone: {ok} updated, {failed} failed.");
+    if ok > 0 {
+        arena_core::out!(Brief, "{}", arena_core::out::ok(format!("keys on {ok} of {total} pod(s)")));
+    }
     // Each pod's own Claude Code account's token (one by spread for a pod with none), on ssh's
     // stdin — never in the command above.
     // With no pool too: a pod that's off still gets a pending removal (review r3).
@@ -591,6 +618,29 @@ pub(crate) async fn handle_copy_keys(
         anyhow::bail!("{claude_failed} pod(s) didn't get their Claude Code token (`arena claude push` retries)");
     }
     Ok(())
+}
+
+/// `copy-keys`' one line before it writes (docs/OUTPUT.md): what goes to which pods —
+/// `Copy OpenRouter (1 host), HF_TOKEN + the fleet's ssh to devtest-alpha` — each source cut to
+/// its name (`-v` has the rest), the pods named up to four (`… and 26 more`). Pure.
+pub(crate) fn copy_keys_brief(sources: &[String], archive: bool, names: &[&str]) -> String {
+    let cut = |s: &String| -> String {
+        let s = s.split(" — ").next().unwrap_or(s);
+        s.split(" (broadcast").next().unwrap_or(s).to_string()
+    };
+    let mut what: Vec<String> = Vec::new();
+    if !sources.is_empty() {
+        what.push(sources.iter().map(cut).collect::<Vec<_>>().join(", "));
+    }
+    what.push("the fleet's ssh".into());
+    if archive {
+        what.push("the backup archive's access".into());
+    }
+    let pods = match names.len() {
+        0..=4 => names.join(", "),
+        n => format!("{} and {} more", names[..3].join(", "), n - 3),
+    };
+    format!("Copy {} to {}", what.join(" + "), arena_core::out::bold(pods))
 }
 
 /// Where generated OpenRouter keys are persisted (also where `copy-keys` reads them): the
@@ -627,7 +677,7 @@ pub(crate) async fn keys_targets(
     // without this, `--gpus N` would silently skip such pods.
     if selector.gpus.is_some() {
         if let Some(warning) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
-            eprintln!("{warning}");
+            arena_core::out!(Err, "{warning}");
         }
     }
     let mut universe = pods.clone();
@@ -671,7 +721,7 @@ pub(crate) fn key_holders(naming: &Naming, keys: &[arena_core::openrouter::KeyIn
 /// (a name without a pod has nowhere to go yet — `setup`/`copy-keys` deliver it later).
 async fn copy_new_keys(remote: Arc<dyn Remote>, cfg: &Config, dir: &std::path::Path, live: &Selected, yes: bool) -> Result<()> {
     if live.pods.is_empty() {
-        println!("(--copy: none of these machines has a pod yet — run `arena pods copy-keys` once they're up)");
+        arena_core::out!(Out, "(--copy: none of these machines has a pod yet — run `arena pods copy-keys` once they're up)");
         return Ok(());
     }
     handle_copy_keys(remote, cfg, &dir.display().to_string(), None, None, live, false, yes).await
@@ -765,7 +815,7 @@ pub(crate) fn write_secret_file(path: &std::path::Path, text: &str) -> std::io::
     // The rename is done (the new text is what's there); a folder that can't be synced is
     // said, not returned as a failure — a caller would take that for "not written".
     if let Err(e) = std::fs::File::open(&dir).and_then(|d| d.sync_all()) {
-        eprintln!("warning: wrote {}, but its folder couldn't be synced ({e}): a crash now could undo it", real.display());
+        arena_core::out!(Err, "warning: wrote {}, but its folder couldn't be synced ({e}): a crash now could undo it", real.display());
     }
     Ok(())
 }
@@ -794,14 +844,14 @@ pub(crate) fn ensure_cohort_keys_file(dir: &std::path::Path, prefix: &str) -> Re
             if std::fs::read_link(&link)?.file_name() != Some(std::ffi::OsStr::new(&file)) {
                 std::fs::remove_file(&link)?;
                 std::os::unix::fs::symlink(&file, &link)?;
-                println!("(keys) {} now → {file}", link.display());
+                arena_core::out!(Out, "(keys) {} now → {file}", link.display());
             }
         }
         Ok(_) => {
             let bak = PathBuf::from(format!("{}.pre-{prefix}.bak", link.display()));
             anyhow::ensure!(!bak.exists(), "{} already exists — sort out {} by hand", bak.display(), link.display());
             std::fs::rename(&link, &bak)?;
-            println!("(keys) moved old {} aside to {}", link.display(), bak.display());
+            arena_core::out!(Out, "(keys) moved old {} aside to {}", link.display(), bak.display());
             std::os::unix::fs::symlink(&file, &link)?;
         }
         Err(_) => std::os::unix::fs::symlink(&file, &link)?,
@@ -832,19 +882,19 @@ pub(crate) async fn handle_keys(
             .unwrap_or_else(|_| csv.display().to_string());
         let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
         if let Some(note) = csv.parent().and_then(|dir| arena_core::config::keys_link_note(dir, prefix)) {
-            println!("⚠ {note}");
+            arena_core::out!(Out, "⚠ {note}");
         }
         match std::fs::read_to_string(&csv) {
             Ok(text) => {
                 let rows = arena_core::apikeys::parse_csv(&text);
-                println!("OpenRouter keys file: {abs}");
-                println!("  ✓ exists · {} key(s) for: {}", rows.len(),
+                arena_core::out!(Out, "OpenRouter keys file: {abs}");
+                arena_core::out!(Out, "  ✓ exists · {} key(s) for: {}", rows.len(),
                     rows.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>().join(", "));
-                println!("\n(distribute with `arena pods copy-keys`; values not shown)");
+                arena_core::out!(Detail, "\n(distribute with `arena pods copy-keys`; values not shown)");
             }
             Err(_) => {
-                println!("OpenRouter keys file: {abs}");
-                println!("  · not created yet — run `arena keys gen --all` to mint keys");
+                arena_core::out!(Out, "OpenRouter keys file: {abs}");
+                arena_core::out!(Out, "  · not created yet — run `arena keys gen --all` to mint keys");
             }
         }
         return Ok(());
@@ -955,7 +1005,7 @@ pub(crate) async fn keys_with(
             let mut keys = api.list_keys().await.context("listing OpenRouter keys")?;
             keys.sort_by(|a, b| a.name.cmp(&b.name));
             if keys.is_empty() {
-                println!("(no provisioned OpenRouter keys)");
+                arena_core::out!(Out, "(no provisioned OpenRouter keys)");
                 return Ok(());
             }
             // Default to this iteration's keys (named `<prefix>-…`); count the rest.
@@ -971,12 +1021,13 @@ pub(crate) async fn keys_with(
             let excluded = total - shown.len();
 
             if shown.is_empty() {
-                println!("(no {prefix}-* keys; {excluded} other key(s) hidden — use --all to show all)");
+                arena_core::out!(Out, "(no {prefix}-* keys; {excluded} other key(s) hidden — use --all to show all)");
                 return Ok(());
             }
-            print!("{}", keys_table(&shown));
+            keys_table(&shown).lines().for_each(|l| arena_core::out!(Out, "{l}"));
             if !all && excluded > 0 {
-                println!("\n(excluded {excluded} non-{prefix} key(s) — use --all to show all)");
+                arena_core::out!(Detail, "");
+                arena_core::out!(Out, "(excluded {excluded} non-{prefix} key(s) — use --all to show all)");
             }
             return Ok(());
         }
@@ -992,7 +1043,7 @@ pub(crate) async fn keys_with(
     let known = key_holders(&naming, &existing, std::fs::read_to_string(&csv_path).ok().as_deref());
     let (names, live) = keys_targets(provider, cfg, &sel.args(), &known).await?;
     if names.is_empty() {
-        println!("(no target machines)");
+        arena_core::out!(Out, "(no target machines)");
         return Ok(());
     }
     // Per machine: the name its new key gets, and the existing keys that are its (gen skips
@@ -1021,7 +1072,7 @@ pub(crate) async fn keys_with(
     if dry_run {
         let rows: Vec<(String, String, usize)> = plan.iter().map(|(h, kn, ks)| (h.clone(), kn.clone(), ks.len())).collect();
         for line in keys_preview(action, limit, &rows) {
-            println!("{line}");
+            arena_core::out!(Out, "{line}");
         }
         return Ok(());
     }
@@ -1030,8 +1081,14 @@ pub(crate) async fn keys_with(
         KeysAction::Rotate => format!("Will DELETE + re-mint {} OpenRouter key(s) (cap ${limit:.2})", names.len()),
         KeysAction::Revoke => format!("Will DELETE {} OpenRouter key(s) — no regenerate", names.len()),
     };
-    if !confirm(yes, &format!("{what}: {}", names.join(", ")))? {
-        println!("aborted.");
+    let who = arena_core::out::bold(names.join(", "));
+    let question = match action {
+        KeysAction::Gen => format!("Mint a key (cap ${limit:.2}) for {who}?"),
+        KeysAction::Rotate => format!("Delete and re-mint the key (cap ${limit:.2}) of {who}?"),
+        KeysAction::Revoke => format!("Delete the key of {who}?"),
+    };
+    if !crate::confirm_brief(yes, &format!("{what}: {}", names.join(", ")), &question)? {
+        arena_core::out!(Out, "aborted.");
         return Ok(());
     }
     let tracking = spend::SpendCtx::from_config(cfg);
@@ -1044,7 +1101,7 @@ pub(crate) async fn keys_with(
         let hold = match hold_name(api, dir, host).await {
             Ok(h) => h,
             Err(why) => {
-                eprintln!("✗ {host}: {why} — nothing done for it");
+                arena_core::out!(Err, "✗ {host}: {why} — nothing done for it");
                 failed += 1;
                 continue;
             }
@@ -1059,23 +1116,23 @@ pub(crate) async fn keys_with(
             .collect();
         let theirs = &theirs;
         if action == KeysAction::Gen && !theirs.is_empty() {
-            println!("= {host}: '{kn}' already exists — use `arena keys rotate {host}` to replace");
+            arena_core::out!(Out, "= {host}: '{kn}' already exists — use `arena keys rotate {host}` to replace");
             skipped += 1;
             continue;
         }
         if action == KeysAction::Revoke {
             if theirs.is_empty() {
-                println!("= {host}: no key named '{kn}'");
+                arena_core::out!(Out, "= {host}: no key named '{kn}'");
                 skipped += 1;
                 continue;
             }
             let (deleted, errs) = delete_keys(api, theirs).await;
             tracking.keys_deleted(theirs, &deleted);
             if errs.is_empty() {
-                println!("✓ {host}: revoked");
+                arena_core::out!(Out, "✓ {host}: revoked");
                 ok += 1;
             } else {
-                eprintln!("✗ {host}: delete: {}", errs.join("; "));
+                arena_core::out!(Err, "✗ {host}: delete: {}", errs.join("; "));
                 failed += 1;
             }
             continue;
@@ -1085,25 +1142,26 @@ pub(crate) async fn keys_with(
                 tracking.keys_deleted(theirs, &deleted);
                 tracking.key_minted(&ck.hash, host, None);
                 write_openrouter_key_held(dir, host, &ck.secret, &prefix)?;
-                println!("✓ {host}: {} {}", if action == KeysAction::Gen { "minted" } else { "rotated" }, &ck.hash[..ck.hash.len().min(12)]);
+                arena_core::out!(Out, "✓ {host}: {} {}", if action == KeysAction::Gen { "minted" } else { "rotated" }, &ck.hash[..ck.hash.len().min(12)]);
                 ok += 1;
             }
             Err((deleted, why)) => {
                 tracking.keys_deleted(theirs, &deleted);
-                eprintln!("✗ {host}: {why}");
+                arena_core::out!(Err, "✗ {host}: {why}");
                 failed += 1;
             }
         }
     }
-    match action {
-        KeysAction::Gen => println!("\nGenerated {ok}, skipped {skipped}, failed {failed} → {}", csv_path.display()),
-        KeysAction::Rotate => println!("\nRotated {ok}, failed {failed}."),
-        KeysAction::Revoke => {
-            println!("\nRevoked {ok}, none-found {skipped}, failed {failed}. (The CSV is left as-is; rotate to refresh.)")
-        }
-    }
+    // The tally adds something past one key: how many of each, and where the keys went.
+    arena_core::out!(Detail, "");
+    let tally = match action {
+        KeysAction::Gen => format!("Generated {ok}, skipped {skipped}, failed {failed} → {}", csv_path.display()),
+        KeysAction::Rotate => format!("Rotated {ok}, failed {failed}."),
+        KeysAction::Revoke => format!("Revoked {ok}, none-found {skipped}, failed {failed}. (The CSV is left as-is; rotate to refresh.)"),
+    };
+    arena_core::out!(if plan.len() > 1 || action == KeysAction::Gen { arena_core::out::To::Out } else { arena_core::out::To::Detail }, "{tally}");
     if copy && ok > 0 {
-        println!();
+        arena_core::out!(Detail, "");
         copy_new_keys(remote.clone(), cfg, dir, &live, yes).await?;
     }
     Ok(())

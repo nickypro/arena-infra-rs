@@ -32,16 +32,16 @@ pub(crate) async fn handle_deep_test(
     use arena_core::health::Status;
     let results = deep_check_fleet(provider, &remote, cfg, sel).await?;
     let (stdout, stderr) = render_deep_test(&results, json, verbose)?;
-    print!("{stdout}");
+    say_stdout(&stdout, json);
     for line in stderr {
-        eprintln!("{line}");
+        arena_core::out!(Err, "{line}");
     }
     // For `arena snapshot` (and the dashboard): remember each verdict with its time. One more
     // read-only list (each backend bounded) lets the cache drop pods since terminated.
     if !results.is_empty() && health_cache_path(cfg).is_some() {
         let listing = arena_core::proxy::Listing::from_results(provider.list_by_provider().await);
         if let Some(warning) = record_health(cfg, &results, Some(&listing)) {
-            eprintln!("{warning}");
+            arena_core::out!(Err, "{warning}");
         }
     }
     let failed = results.iter().filter(|h| h.status == Status::Fail).count();
@@ -52,9 +52,9 @@ pub(crate) async fn handle_deep_test(
     if let Some(h) = &box_health {
         for line in &h.lines {
             if json {
-                eprintln!("{line}");
+                arena_core::out!(Err, "{line}");
             } else {
-                println!("{line}");
+                arena_core::out!(Out, "{line}");
             }
         }
     }
@@ -79,9 +79,9 @@ pub(crate) async fn handle_keys_test(remote: Arc<dyn Remote>, cfg: &Config, sel:
     use arena_core::health::Status;
     let results = check_fleet(None, &remote, cfg, sel, Kind::Keys).await?;
     let (stdout, stderr) = render_keys_test(&results, json, verbose)?;
-    print!("{stdout}");
+    say_stdout(&stdout, json);
     for line in stderr {
-        eprintln!("{line}");
+        arena_core::out!(Err, "{line}");
     }
     match results.iter().filter(|h| h.status == Status::Fail).count() {
         0 => Ok(()),
@@ -99,6 +99,15 @@ pub(crate) fn render_keys_test(results: &[arena_core::health::PodHealth], json: 
         (false, true) => (format!("{NONE}\n"), vec![]),
         (false, false) => (render_key_report(results, verbose), vec![]),
     })
+}
+
+/// A report's stdout, line by line ([`arena_core::out`]); `--json`'s as it is.
+fn say_stdout(stdout: &str, json: bool) {
+    if json {
+        print!("{stdout}");
+    } else {
+        stdout.lines().for_each(|l| arena_core::out!(Out, "{l}"));
+    }
 }
 
 /// What the AI-key checks hold machines to: the fleet's keys CSVs and `HF_TOKEN`, and the owners
@@ -225,7 +234,8 @@ pub(crate) async fn check_fleet(
     let mut pods = sel.pods.clone();
     pods.sort_by(|a, b| a.name.cmp(&b.name));
     for (name, ids) in duplicate_names(&pods) {
-        eprintln!(
+        arena_core::out!(
+            Err,
             "warning: {} pods are named {name} (ids {}) — each is checked and reported separately",
             ids.len(),
             ids.join(", ")
@@ -259,12 +269,12 @@ pub(crate) async fn check_fleet(
             }
             None if sel.named => Slot::NoEndpoint,
             None if arena_core::status::is_stopped(&pod.status) => {
-                eprintln!("{}", stopped_skip(pod));
+                arena_core::out!(Err, "{}", stopped_skip(pod));
                 Slot::Skipped
             }
             None => {
                 let why = arena_core::fleet::no_endpoint_reason(pod).unwrap_or_else(|| "no SSH endpoint yet".into());
-                eprintln!("skip {} — {why}", pod.name);
+                arena_core::out!(Err, "skip {} — {why}", pod.name);
                 Slot::Skipped
             }
         });
@@ -274,14 +284,18 @@ pub(crate) async fn check_fleet(
             Kind::Deep => "Deep-checking",
             Kind::Keys => "Checking the AI keys of",
         };
-        eprintln!("{what} {} pod(s) ({}s budget each)…", jobs.len(), budget.as_secs());
+        arena_core::out!(Err, "{what} {} pod(s) ({}s budget each)…", jobs.len(), budget.as_secs());
     }
     let mut calls: std::collections::HashMap<usize, PodCall> = std::collections::HashMap::new();
+    // A pod checked is a line at `-v`; by default a terminal counts them in place, and only a
+    // failure is a line of its own.
+    let _progress = arena_core::out::progress_guard("test");
     let probe = exec_each_pod(remote, jobs, budget, |done, total, (i, name), call| {
         match &call {
-            Ok(out) if out.success => eprintln!("[{done}/{total}] {name}: checked"),
-            failed => eprintln!("{}", failure_line(done, total, name, failed)),
+            Ok(out) if out.success => arena_core::out!(ErrDetail, "[{done}/{total}] {name}: checked"),
+            failed => arena_core::out!(Err, "{}", failure_line(done, total, name, failed)),
         }
+        arena_core::out::progress("test", Some(&format!("checked {done} of {total}")));
         calls.insert(*i, call);
     });
     // `enrich` fills fields in place (a slice: it can't add, drop or move pods), so the
@@ -292,7 +306,7 @@ pub(crate) async fn check_fleet(
         Some(provider) => {
             let (warning, (), listed) = tokio::join!(enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT), probe, key_listing(cfg));
             if let Some(warning) = warning {
-                eprintln!("{warning}");
+                arena_core::out!(Err, "{warning}");
             }
             listed
         }

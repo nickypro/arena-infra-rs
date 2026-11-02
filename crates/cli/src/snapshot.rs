@@ -31,7 +31,7 @@ pub(crate) async fn handle_snapshot(
     let bal = money::BalanceCtx::from_config(cfg);
     let (snap, warnings) = collect_snapshot(provider, cfg, arena_core::snapshot::unix_now(), reach, &bal).await?;
     for w in warnings {
-        eprintln!("{w}");
+        arena_core::out!(Err, "{w}");
     }
     let naming = Naming::from_config(cfg);
     let text = render_snapshot(&snap, &naming, json, public)?;
@@ -39,7 +39,8 @@ pub(crate) async fn handle_snapshot(
         None => print!("{text}"),
         Some(path) => {
             if !public {
-                eprintln!(
+                arena_core::out!(
+                    Err,
                     "warning: {} gets the INTERNAL snapshot (ids, endpoints, costs) — publish only `--public` output",
                     path.display()
                 );

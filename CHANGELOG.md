@@ -19,6 +19,20 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-02 · Output, phase 2: the other commands say less by default
+- **Look, money and access** (`config check`/`which`, `teardown --check`, `offers`, `balance`,
+  `spend`, `pods idle`/`jobs`/`test`, `copy-keys`, `keys`, `claude`, `update`): `config check` prints
+  only what's wrong (✗, ‼, `?` rows with their `└` lines) and its `OK — …` line; `teardown --check`
+  the items left or not checked, with their fixes, the kept ones a line each, and the verdict; an
+  `offers <provider>` table leaves out what nobody can buy and folds its notes into one line;
+  `balance` and `spend` keep their tables and only the notes that need a look; `pods idle`'s
+  legend and `pods jobs`' empty tally are `-v`'s; `pods test --deep`/`--keys` counts the pods in
+  place on a terminal; `copy-keys` says in one line what goes to which pods, then a line per pod
+  that failed (with its retry) and a tally (setup's and replace's key step too); `update` shows
+  the changelog's action-needed and config lines and each entry's heading. `-v` prints all of it
+  as before. The verdict lines (`OK — …`, `ALL CLEAR`/`NOT CLEAR: …`), `--json` and the exit
+  statuses are unchanged.
+
 ## 2026-11-02 · arena 2.12: shorter output by default; `-v` shows the rest
 - **`pods up` and `pods create` say much less.** By default they print the plan in one line
   (or a short table for several options), the balance in one line, a one-line prompt with what

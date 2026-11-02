@@ -322,3 +322,48 @@ fn an_account_is_a_number_an_email_or_none() {
     assert_eq!(account_arg("None", &pool).unwrap(), None);
     assert_eq!(account_arg("2", &pool).unwrap_err().to_string(), "no account 2 in the pool — there are: #1 a@x, #4 b@x, or `none`");
 }
+
+/// Golden (docs/OUTPUT.md): `pods copy-keys --yes` by default says what goes where in one line,
+/// a failure with its retry, and a tally each for the keys and the Claude Code tokens; `-v` the
+/// key sources, what else goes on each pod, a line per pod and `Done:`, as before.
+#[tokio::test]
+async fn copy_keys_output_default_and_verbose() {
+    let d = tmp("copykeys-golden");
+    let cfg = config_in(&d, 2, "");
+    let pods = vec![pod(1, "apple", "running"), pod(2, "bloom", "running")];
+    let sel = Selected { pods, named: false };
+    let no_csv = d.0.join("no-keys").display().to_string();
+    let mut out = Vec::new();
+    for verbose in [false, true] {
+        // Each run from the same state: no account assigned yet.
+        let _ = std::fs::remove_dir_all(d.0.join("state"));
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(2), [arena_core::remote::FakeReply::exit(255, "ssh: connect to host 10.0.0.1 port 22002: Connection timed out")]);
+        let run = crate::handle_copy_keys(fake.clone(), &cfg, &no_csv, None, None, &sel, false, true);
+        out.push(crate::output_test::rendered(verbose, &[], run).await);
+    }
+    let tokens = d.0.join("tokens").display().to_string();
+    assert_eq!(
+        out[0].replace(&tokens, "TOKENS"),
+        "\
+Copy Claude Code: 2 accounts in TOKENS + the fleet's ssh to devtest-apple, devtest-bloom
+✗ devtest-bloom: timed out (retry: arena pods copy-keys devtest-bloom)
+✓ keys on 1 of 2 pod(s)
+✓ Claude Code token on 2 of 2 pod(s)
+Error: 1 pod(s) failed
+"
+    );
+    assert_eq!(out[1].replace(&tokens, "TOKENS"), "\
+Key sources: Claude Code: 2 accounts in TOKENS — each pod on its own account (new ones by spread)
+
+Also on each target (2 pod(s)): authorize 0 fleet key(s) + write that pod's own ~/.ssh/config (the fleet host map, so it can ssh the others).
+[1/2] ✓ devtest-apple
+[2/2] ✗ devtest-bloom: ssh: connect to host 10.0.0.1 port 22002: Connection timed out
+
+Done: 1 updated, 1 failed.
+Claude Code (each pod its own account's token):
+  ✓ devtest-apple: #1 u1@x (new, by spread)
+  ✓ devtest-bloom: #2 u2@x (new, by spread)
+Error: 1 pod(s) failed
+");
+}

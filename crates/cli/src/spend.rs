@@ -512,6 +512,8 @@ pub(crate) struct SpendFlags {
     pub since: Option<u64>,
     pub csv: bool,
     pub json: bool,
+    /// `-v`: every note under the table (by default only the `!` ones).
+    pub verbose: bool,
 }
 
 /// `--by`'s values.
@@ -639,10 +641,25 @@ pub(crate) async fn spend_report(
         (true, _, _) => format!("{}\n", serde_json::to_string_pretty(&report)?),
         (_, true, true) => spend::csv_machines(&report),
         (_, true, false) => spend::csv_owners(&report),
-        (_, false, true) => spend::render_machines(&report, &naming),
-        (_, false, false) => spend::render_owners(&report),
+        (_, false, true) => brief_notes(spend::render_machines(&report, &naming), &report, flags.verbose),
+        (_, false, false) => brief_notes(spend::render_owners(&report), &report, flags.verbose),
     };
     Ok(Printed { stdout, stderr, code: 0 })
+}
+
+/// A spend table as the default output prints it (docs/OUTPUT.md): its notes (`spend::notes`,
+/// the lines it ends with) cut to the ones that need a look (`!`: a ledger started afresh);
+/// the window, the estimates and RunPod's footer are `-v`'s. `verbose`: the table as it is.
+fn brief_notes(table: String, report: &spend::Report, verbose: bool) -> String {
+    let notes = spend::notes(report);
+    let said: String = notes.iter().map(|n| format!("  {n}\n")).collect();
+    match table.strip_suffix(&said) {
+        Some(head) if !verbose => {
+            let kept: String = notes.iter().filter(|n| n.starts_with('!')).map(|n| format!("  {n}\n")).collect();
+            format!("{head}{kept}")
+        }
+        _ => table,
+    }
 }
 
 /// A machine's name without the fleet prefix, as commands take it (`apple`).
@@ -905,6 +922,29 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
         assert_eq!(v["owners"].as_array().unwrap().len(), 2);
         assert!(spend_assign(&fake, &cfg, &ctx, "nope", Some("x"), unix_now(), AssignOpts::default()).await.is_err());
+    }
+
+    /// docs/OUTPUT.md: by default the table alone (and a `!` note: a ledger started afresh); the
+    /// window, the estimates and RunPod's footer are `-v`'s, which prints the table as before.
+    #[tokio::test]
+    async fn spend_notes_are_verbose_but_a_restart() {
+        let d = tmp("notes");
+        let cfg = cfg(&d.0);
+        let ctx = SpendCtx { api: Arc::new(spend::FakeSpendApi::default()), ..SpendCtx::from_config(&cfg) };
+        let fake = FakeProvider::default();
+        Tracked::new(&fake, &ctx, OwnerRule::Given("alice".into())).create_pod(&PodSpec { name: "devtest-alpha".into(), ..PodSpec::default() }).await.unwrap();
+        let quiet = spend_report(&fake, &cfg, &ctx, None, &report_flags(), unix_now()).await.unwrap().stdout;
+        let loud = spend_report(&fake, &cfg, &ctx, None, &SpendFlags { verbose: true, ..report_flags() }, unix_now()).await.unwrap().stdout;
+        assert!(loud.contains("  tracked since "), "{loud}");
+        assert!(!quiet.contains("tracked since"), "{quiet}");
+        assert!(loud.starts_with(&quiet), "the table is the same:\n{quiet}\n{loud}");
+        // The pure cut: a `!` note stays.
+        let report = spend::report(&spend::load(&ctx.path().unwrap()).0, &Naming::from_config(&cfg), None, unix_now(), None, None);
+        let table = spend::render_owners(&report);
+        let notes = spend::notes(&report);
+        let head = table.strip_suffix(&notes.iter().map(|n| format!("  {n}\n")).collect::<String>()).unwrap();
+        assert_eq!(brief_notes(table.clone(), &report, false), head);
+        assert_eq!(brief_notes(table.clone(), &report, true), table);
     }
 
     /// `spend assign` on a machine that has run up spend under someone else would move its whole

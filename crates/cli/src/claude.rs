@@ -108,7 +108,7 @@ pub(crate) async fn handle_claude(cmd: ClaudeCmd, provider: &dyn Provider, remot
             let picked = fleet.select(provider, cfg, &args, Unscoped::All).await?;
             let (picked, left_out) = split_cohort(&Naming::from_config(cfg), picked);
             if let Some(line) = crate::pods::selection::non_cohort_line(Naming::from_config(cfg).prefix, &left_out) {
-                println!("{line}");
+                arena_core::out!(Out, "{line}");
             }
             // Nothing named and no --all (filters alone don't scope it, as everywhere).
             let unscoped = Selector::parse(&args, &Naming::from_config(cfg))?.is_unscoped();
@@ -117,7 +117,7 @@ pub(crate) async fn handle_claude(cmd: ClaudeCmd, provider: &dyn Provider, remot
                 // The default: only the pods that need it.
                 let due: Vec<Pod> = picked.pods.into_iter().filter(|p| due(&state, &pool, p)).collect();
                 if due.is_empty() {
-                    println!("Every cohort pod is up to date with its Claude Code account (name pods, or --all, to push again).");
+                    arena_core::out!(Out, "Every cohort pod is up to date with its Claude Code account (name pods, or --all, to push again).");
                     return Ok(());
                 }
                 Selected { pods: due, named: false }
@@ -140,7 +140,7 @@ pub(crate) async fn handle_claude(cmd: ClaudeCmd, provider: &dyn Provider, remot
 fn pool_or_bail(cfg: &Config) -> Result<Pool> {
     let pool = claude::load_pool(cfg).map_err(|e| anyhow::anyhow!(e))?;
     for n in &pool.notes {
-        eprintln!("⚠ {n}");
+        arena_core::out!(Err, "⚠ {n}");
     }
     if pool.is_empty() {
         anyhow::bail!(
@@ -182,7 +182,7 @@ impl Fleet {
         let listed_at = unix_now();
         let listing = Listing::from_results(provider.list_by_provider().await);
         for (p, e) in listing.errors() {
-            eprintln!("⚠ {p}: listing failed ({e}) — its pods aren't here");
+            arena_core::out!(Err, "⚠ {p}: listing failed ({e}) — its pods aren't here");
         }
         if !listing.any_ok() {
             anyhow::bail!("no provider listed its pods");
@@ -202,7 +202,7 @@ impl Fleet {
         let mut pods = self.pods.clone();
         if selector.gpus.is_some() {
             if let Some(warning) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
-                eprintln!("{warning}");
+                arena_core::out!(Err, "{warning}");
             }
         }
         let picked = selector.resolve(&naming, &pods)?;
@@ -301,25 +301,31 @@ async fn apply(
     };
     let width = sel.pods.iter().map(|p| p.name.chars().count()).max().unwrap_or(0);
     if changes.is_empty() {
-        println!("No assignment changes ({} pod(s) already so).", sel.pods.len());
+        arena_core::out!(Out, "No assignment changes ({} pod(s) already so).", sel.pods.len());
     } else {
-        println!("Claude Code accounts ({}):", pool.describe());
+        arena_core::out!(Out, "Claude Code accounts ({}):", pool.describe());
         for c in &changes {
-            println!("{}", change_line(pool, c, width));
+            arena_core::out!(Out, "{}", change_line(pool, c, width));
         }
     }
     let pushing = to_push(&planned);
     if dry_run {
         for p in &pushing {
             let to = planned.of(p).and_then(|a| a.account.as_deref());
-            println!("  would push to {}: {}", p.name, if to.is_some() { label(pool, to) } else { "token taken off".into() });
+            arena_core::out!(Out, "  would push to {}: {}", p.name, if to.is_some() { label(pool, to) } else { "token taken off".into() });
         }
-        println!("Preview only — run without --dry-run to {}.", if pushing.is_empty() { "record it" } else { "record it and push" });
+        arena_core::out!(Detail, "Preview only — run without --dry-run to {}.", if pushing.is_empty() { "record it" } else { "record it and push" });
         return Ok(());
     }
     if changes.is_empty() && pushing.is_empty() {
         return Ok(());
     }
+    let question = if pushing.is_empty() {
+        format!("Record {} change(s) (push later)?", changes.len())
+    } else {
+        let names: Vec<&str> = pushing.iter().map(|p| p.name.as_str()).collect();
+        format!("Record {} change(s) and push to {}?", changes.len(), arena_core::out::bold(names.join(", ")))
+    };
     let what = if pushing.is_empty() {
         format!("Will record {} change(s) (no push now: `arena claude push` later)", changes.len())
     } else {
@@ -332,8 +338,8 @@ async fn apply(
             names.join(", ")
         )
     };
-    if !confirm(yes, &what)? {
-        println!("aborted.");
+    if !crate::confirm_brief(yes, &what, &question)? {
+        arena_core::out!(Out, "aborted.");
         return Ok(());
     }
     let (state, changes) =
@@ -341,7 +347,7 @@ async fn apply(
         .map_err(|e| anyhow::anyhow!(e))?;
     let pushing = to_push(&state);
     if pushing.is_empty() {
-        println!("Recorded.");
+        arena_core::out!(Out, "Recorded.");
         return Ok(());
     }
     let failed = push_pods(remote, cfg, &path, pool, &pushing, &changes, now).await;
@@ -357,12 +363,12 @@ async fn push_pods(remote: &dyn Remote, cfg: &Config, path: &std::path::Path, po
     let mut reach = Vec::new();
     for p in pods {
         if arena_core::status::is_stopped(&p.status) {
-            println!("  {} — its token goes on when it's set up again (`arena pods start` does it)", stopped_skip(p));
+            arena_core::out!(Out, "  {} — its token goes on when it's set up again (`arena pods start` does it)", stopped_skip(p));
             continue;
         }
         match SshTarget::from_pod(p, cfg) {
             Ok(t) => reach.push((p.clone(), t)),
-            Err(_) => println!(
+            Err(_) => arena_core::out!(Out, 
                 "  skip {} — {} (`arena claude push {}` once it has one)",
                 p.name,
                 arena_core::fleet::no_endpoint_reason(p).unwrap_or_else(|| "no SSH endpoint yet".into()),
@@ -377,14 +383,22 @@ async fn push_pods(remote: &dyn Remote, cfg: &Config, path: &std::path::Path, po
 }
 
 /// Each outcome on its own line, then the tally: how many failed.
+/// By default a failure is a line with what retries it, and the rest one tally (`-v`: a line
+/// each, as before).
 fn print_outcomes(outcomes: &[Outcome]) -> usize {
     let total = outcomes.len();
     let mut failed = 0;
     for (i, o) in outcomes.iter().enumerate() {
-        println!("[{}/{total}] {}", i + 1, o.line());
-        failed += usize::from(o.result.is_err());
+        arena_core::out!(Detail, "[{}/{total}] {}", i + 1, o.line());
+        if o.result.is_err() {
+            arena_core::out!(Brief, "{} (retry: arena claude push {})", o.line(), o.name);
+            failed += 1;
+        }
     }
-    println!("Done: {} pushed, {failed} failed. (Shells already open keep their old token until they start again.)", total - failed);
+    arena_core::out!(Detail, "Done: {} pushed, {failed} failed. (Shells already open keep their old token until they start again.)", total - failed);
+    if failed < total {
+        arena_core::out!(Brief, "{} (open shells keep the old one until they restart)", arena_core::out::ok(format!("pushed to {} of {total} pod(s)", total - failed)));
+    }
     failed
 }
 
@@ -419,7 +433,7 @@ async fn assign_owner(
     // Theirs that this listing doesn't show (a provider that failed) are pinned too.
     let machines = claude::owner_machines(&load_state(cfg)?, &fleet.owners, &owner, &fleet.machines(&theirs));
     if machines.len() > theirs.len() {
-        println!("  (and {} more of theirs not listed now: pushed when they're next listed, by `arena claude push`)", machines.len() - theirs.len());
+        arena_core::out!(Out, "  (and {} more of theirs not listed now: pushed when they're next listed, by `arena claude push`)", machines.len() - theirs.len());
     }
     let path = claude::state_path(cfg).map_err(|e| anyhow::anyhow!("no state dir for claude.json: {e}"))?;
     let shown = match &pin {
@@ -427,22 +441,22 @@ async fn assign_owner(
         Some(a) => label(pool, a.as_deref()),
     };
     let (planned, changes) = claude::pin_owner(load_state(cfg)?, pool, &fleet.owners, &owner, pin.clone(), &machines, now);
-    println!("{owner}: {shown} — for their {} machine(s) now and the ones they get later", theirs.len());
+    arena_core::out!(Out, "{owner}: {shown} — for their {} machine(s) now and the ones they get later", theirs.len());
     let width = theirs.iter().map(|p| p.name.chars().count()).max().unwrap_or(0);
     for c in &changes {
-        println!("{}", change_line(pool, c, width));
+        arena_core::out!(Out, "{}", change_line(pool, c, width));
     }
     if theirs.is_empty() {
-        println!("  (no machine of theirs is up now: spend knows owners from `pods up --owner` and `arena spend assign`)");
+        arena_core::out!(Out, "  (no machine of theirs is up now: spend knows owners from `pods up --owner` and `arena spend assign`)");
     }
     let pushing: Vec<Pod> =
         if no_push { vec![] } else { theirs.iter().filter(|p| planned.of(p).is_some_and(|a| claude::out_of_date(a, pool))).cloned().collect() };
     if dry_run {
-        println!("Preview only — run without --dry-run to record it{}.", if pushing.is_empty() { "" } else { " and push" });
+        arena_core::out!(Detail, "Preview only — run without --dry-run to record it{}.", if pushing.is_empty() { "" } else { " and push" });
         return Ok(());
     }
     if !confirm(yes, &format!("Will pin {owner} to {shown} and push to {} pod(s)", pushing.len()))? {
-        println!("aborted.");
+        arena_core::out!(Out, "aborted.");
         return Ok(());
     }
     // Planned again under the lock, with the owners as they are now: a machine of theirs assigned
@@ -467,7 +481,7 @@ async fn assign_owner(
             .collect()
     };
     if pushing.is_empty() {
-        println!("Recorded.");
+        arena_core::out!(Out, "Recorded.");
         return Ok(());
     }
     let failed = push_pods(remote, cfg, &path, pool, &pushing, &changes, now).await;
@@ -482,12 +496,12 @@ async fn accounts(provider: &dyn Provider, cfg: &Config, json: bool) -> Result<(
     let pool = match claude::load_pool(cfg) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("✗ {e}");
+            arena_core::out!(Err, "✗ {e}");
             Pool::empty()
         }
     };
     for n in &pool.notes {
-        eprintln!("⚠ {n}");
+        arena_core::out!(Err, "⚠ {n}");
     }
     let fleet = Fleet::list(provider, cfg).await?;
     let path = claude::state_path(cfg).map_err(|e| anyhow::anyhow!("no state dir for claude.json: {e}"))?;
@@ -499,7 +513,7 @@ async fn accounts(provider: &dyn Provider, cfg: &Config, json: bool) -> Result<(
         return Ok(());
     }
     if pool.is_empty() && state.machines.is_empty() {
-        println!(
+        arena_core::out!(Out, 
             "Claude Code accounts: {}.\nSet {} to a tokens file (`email -> sk-ant-oat01-…` per line, chmod 600) for one account \
              per machine; `arena claude push` then spreads them.",
             pool.describe(),
@@ -533,16 +547,24 @@ pub(crate) async fn stage(remote: &dyn Remote, cfg: &Config, pods: &[(Pod, SshTa
     match claude::stage(remote, cfg, pods, token, unix_now()).await {
         Ok(None) => 0,
         Ok(Some(outcomes)) => {
-            println!("Claude Code (each pod its own account's token):");
+            // By default a failure is a line (with what retries it) and the rest one tally;
+            // `-v` each pod's account, as before.
+            arena_core::out!(Detail, "Claude Code (each pod its own account's token):");
             let mut failed = 0;
             for o in &outcomes {
-                println!("  {}", o.line());
-                failed += usize::from(o.result.is_err());
+                arena_core::out!(Detail, "  {}", o.line());
+                if o.result.is_err() {
+                    arena_core::out!(Brief, "Claude Code {} (retry: arena claude push {})", o.line(), o.name);
+                    failed += 1;
+                }
+            }
+            if failed < outcomes.len() {
+                arena_core::out!(Brief, "{}", arena_core::out::ok(format!("Claude Code token on {} of {} pod(s)", outcomes.len() - failed, outcomes.len())));
             }
             failed
         }
         Err(e) => {
-            println!("Claude Code: not pushed — {e}");
+            arena_core::out!(Out, "Claude Code: not pushed — {e}");
             pods.len()
         }
     }

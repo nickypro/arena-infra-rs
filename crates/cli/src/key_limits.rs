@@ -168,7 +168,7 @@ async fn keys_lock(cfg: &Config) -> Result<Option<std::fs::File>> {
     let dir = match arena_core::snapshot::state_dir_for(cfg) {
         Ok(d) => d,
         Err(why) => {
-            eprintln!("warning: no state directory ({why}) — key changes from other arena commands aren't kept apart");
+            arena_core::out!(Err, "warning: no state directory ({why}) — key changes from other arena commands aren't kept apart");
             return Ok(None);
         }
     };
@@ -532,12 +532,12 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
     let existing = api.list_keys().await.context("listing OpenRouter keys")?;
     let known = crate::key_holders(&naming, &existing, csv.as_deref());
     let (names, _) = crate::keys_targets(provider, cfg, &sel, &known).await?;
-    let say = |s: &str| if json_out { eprintln!("{s}") } else { println!("{s}") };
+    let say = |s: &str| if json_out { arena_core::out!(Err, "{s}") } else { arena_core::out!(Out, "{s}") };
     if names.is_empty() {
         if json_out {
             println!("{}", serde_json::to_string_pretty(&json(&verb, dry_run, &[], None))?);
         } else {
-            println!("(no target machines)");
+            arena_core::out!(Out, "(no target machines)");
         }
         return Ok(());
     }
@@ -560,12 +560,12 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
             println!("{}", serde_json::to_string_pretty(&json(&verb, dry_run, &done, None))?);
         } else {
             if dry_run {
-                println!("Dry-run — would change {} key(s):", todo.len());
+                arena_core::out!(Out, "Dry-run — would change {} key(s):", todo.len());
             } else {
-                println!("(nothing to change)");
+                arena_core::out!(Out, "(nothing to change)");
             }
             for r in &rows {
-                println!("  {}", line(r));
+                arena_core::out!(Out, "  {}", line(r));
             }
         }
         return Ok(());
@@ -674,17 +674,18 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
     } else {
         for (r, outcome, _) in &done {
             match outcome {
-                Outcome::Changed => println!("✓ {}", line(r)),
-                Outcome::Unverified => println!("? {} — asked, but not read back to check", line(r)),
-                Outcome::Failed(e) => eprintln!("✗ {}: {e}", r.machine),
-                _ => println!("= {}", line(r)),
+                Outcome::Changed => arena_core::out!(Out, "✓ {}", line(r)),
+                Outcome::Unverified => arena_core::out!(Out, "? {} — asked, but not read back to check", line(r)),
+                Outcome::Failed(e) => arena_core::out!(Err, "✗ {}: {e}", r.machine),
+                _ => arena_core::out!(Out, "= {}", line(r)),
             }
         }
         let changed = count(|o| *o == Outcome::Changed);
         let unchecked = if unverified > 0 { format!(", not checked {unverified}") } else { String::new() };
-        println!("\nChanged {changed}, unchanged {}, failed {failed}{unchecked}.", done.len() - changed - failed - unverified);
+        arena_core::out!(Detail, "");
+        arena_core::out!(Out, "Changed {changed}, unchanged {}, failed {failed}{unchecked}.", done.len() - changed - failed - unverified);
         if let Err(e) = &reread {
-            eprintln!("warning: the keys couldn't be read back ({e}) — `arena keys list` shows what they say now");
+            arena_core::out!(Err, "warning: the keys couldn't be read back ({e}) — `arena keys list` shows what they say now");
         }
     }
     if failed > 0 {
@@ -880,6 +881,32 @@ mod tests {
         crate::keys_with(k, &Fleet, std::sync::Arc::new(arena_core::remote::FakeRemote::new()), &cfg(), api, &dir, true)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Golden (docs/OUTPUT.md): what the dashboard's runs panel shows of `keys limit … --yes` —
+    /// a line per key and the tally — at default and at `-v`, where the blank line before the
+    /// tally is as before.
+    #[tokio::test]
+    async fn limit_output_default_and_verbose() {
+        let mut out = Vec::new();
+        for verbose in [false, true] {
+            let api = Keys::with(fleet_keys());
+            out.push(crate::output_test::rendered(verbose, &[], async { keys_cmd(&["limit", "alpha", "bravo", "+1"], &api).await.map_err(anyhow::Error::msg) }).await);
+        }
+        assert_eq!(
+            out[0],
+            "\
+✓ devtest-alpha: cap $0.10 → $1.10 · spent $0.00 in all
+✓ devtest-bravo: cap $5.00 → $6.00 · spent $4.90 in all
+Changed 2, unchanged 0, failed 0.
+"
+        );
+        assert_eq!(out[1], "\
+✓ devtest-alpha: cap $0.10 → $1.10 · spent $0.00 in all
+✓ devtest-bravo: cap $5.00 → $6.00 · spent $4.90 in all
+
+Changed 2, unchanged 0, failed 0.
+");
     }
 
     /// `keys limit`: an absolute cap and a raise, each on exactly the machines named, each a

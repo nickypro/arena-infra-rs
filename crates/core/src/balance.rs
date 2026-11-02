@@ -2180,12 +2180,13 @@ pub fn render_table(views: &[AccountView], now: u64) -> String {
         })
         .collect();
     let mut out = table::render(&headers, &align, &rows);
-    out.push_str(
-        "burn = the higher of the provider's own rate and this fleet's billing pods there; runway = balance ÷ burn; \
-         est. = the last reading − max(billed, metered) spend since (errs low)\n",
-    );
+    out.push_str(TABLE_LEGEND);
     out
 }
+
+/// How to read [`render_table`]'s columns: its last line (`-v`'s only in `arena balance`).
+pub const TABLE_LEGEND: &str = "burn = the higher of the provider's own rate and this fleet's billing pods there; runway = balance ÷ burn; \
+                                est. = the last reading − max(billed, metered) spend since (errs low)\n";
 
 /// `drift, HTTP 400: Cannot query field "clientBalance"…`
 fn fail_text(f: &FailRecord) -> String {
