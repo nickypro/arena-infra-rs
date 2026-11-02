@@ -258,7 +258,9 @@ fn the_notes_land_between_the_markers_and_keep_the_rest() {
             // The participant's last line has no newline: it still hasn't, block before it or not.
             (format!("{}mine", stopgap(&env)), format!("{want}mine")),
             (format!("x\n{}\nmine", stopgap(&env)), format!("x\n{want}\nmine")),
-            // Two blocks (whatever wrote them): one, where the first was.
+            // Two blocks (whatever wrote them): one, where the first was — and the participant's
+            // line between them keeps its newline, though the file ends without one.
+            (format!("a\n{}mine\n{}", stopgap(&env), stopgap(&env).trim_end()), format!("a\n{want}mine\n")),
             (format!("a\n{}b\n{}c\n", stopgap(&env), stopgap(&env)), format!("a\n{want}b\nc\n")),
         ] {
             m.put(codex, &start);
@@ -350,39 +352,104 @@ fn a_file_that_cannot_be_written_fails_the_step() {
     }
 }
 
-/// A file saved while the notes are being written (by the participant, Claude Code's `#` memory,
-/// another setup) keeps that save: the step reads it again before it replaces anything. Here a
-/// stand-in `cksum` saves the file just before the step's check that nothing changed.
-#[test]
-fn a_save_made_meanwhile_is_kept() {
-    let real = Command::new("sh").arg("-c").arg("command -v cksum").output().unwrap();
-    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
-    if real.is_empty() {
-        return; // no cksum here
+/// `name`'s path on this box, if it has one.
+fn which(name: &str) -> Option<String> {
+    let out = Command::new("sh").arg("-c").arg(format!("command -v {name}")).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|p| p.starts_with('/'))
+}
+
+impl Machine {
+    /// A stand-in for `name` on PATH: counts its calls, runs `<name>.hook<N>` (if this test wrote
+    /// one) before the Nth, then runs `real` — a save landing at that very moment.
+    fn hooked(&self, name: &str, real: &str) {
+        let d = self.dir.display();
+        let stub = self.path(&format!("bin/{name}"));
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nc={d}/{name}.calls; n=$(($(cat \"$c\" 2>/dev/null || echo 0) + 1)); echo $n > \"$c\"\n\
+                 [ -f {d}/{name}.hook$n ] && sh {d}/{name}.hook$n\n{real}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let m = Machine::new("meanwhile");
-    let repo = m.path("r").display().to_string();
+
+    fn kept(&self, dir: &str) -> Vec<String> {
+        let mut kept: Vec<String> = std::fs::read_dir(self.path(dir))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".arena-"))
+            .collect();
+        kept.sort();
+        kept
+    }
+}
+
+/// Nothing a participant saves while the notes are being written is lost — they, Claude Code's own
+/// `#` memory or another setup may save at any moment. Stand-ins for `python3` (the swap) and
+/// `ln` (the create) save at the worst moments: between the read and the swap (it goes back, and
+/// round again: the save and the block both end up there); again before the swap back (what came
+/// out is kept beside the file, and said); a file made between the check that there's none and
+/// the create (that one is updated instead). Where no swap in one step can be made, a file that's
+/// there is left as it is, with a warning.
+#[test]
+fn saves_made_meanwhile_are_never_lost() {
+    let (Some(python), Some(ln)) = (which("python3"), which("ln")) else {
+        return; // no python3 here: the swap's own test can't run
+    };
+    let notes = |m: &Machine| AgentNotes::new("arena-env", &m.path("r").display().to_string()).command("hetzner");
+    let want = |m: &Machine| {
+        let repo = m.path("r").display().to_string();
+        block(&format!("{repo}/.venv"), false, &repo, false)
+    };
+    let claude = "home/.claude/CLAUDE.md";
+
+    // Saved between the read and the swap.
+    let m = Machine::new("race-swap");
     m.exe("r/.venv/bin/python");
-    let file = m.path("home/.claude/CLAUDE.md");
-    m.put("home/.claude/CLAUDE.md", "mine\n");
-    m.put("home/.codex/AGENTS.md", "codex\n");
-    // The 2nd cksum is the check before the replace: the participant saves just before it.
-    let stub = m.path("bin/cksum");
-    let calls = m.path("calls");
-    std::fs::write(
-        &stub,
-        format!(
-            "#!/bin/sh\nn=$(($(cat '{c}' 2>/dev/null || echo 0) + 1)); echo $n > '{c}'\n\
-             [ $n = 2 ] && printf 'saved meanwhile\\n' >> '{f}'\nexec '{real}'\n",
-            c = calls.display(),
-            f = file.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let said = ok(&m.run("sh", &AgentNotes::new("arena-env", &repo).command("hetzner"), false));
+    m.put(claude, "mine\n");
+    m.hooked("python3", &format!("exec {python} \"$@\""));
+    m.put("python3.hook1", &format!("printf 'saved meanwhile\\n' >> {}\n", m.path(claude).display()));
+    let said = ok(&m.run("sh", &notes(&m), false));
     assert!(!said.contains("arena-warning"), "{said}");
-    let want = block(&format!("{repo}/.venv"), false, &repo, false);
-    assert_eq!(m.read("home/.claude/CLAUDE.md"), format!("mine\nsaved meanwhile\n\n{want}"));
-    assert_eq!(m.read("home/.codex/AGENTS.md"), format!("codex\n\n{want}"));
+    assert_eq!(m.read(claude), format!("mine\nsaved meanwhile\n\n{}", want(&m)));
+    assert_eq!(m.read("python3.calls"), "3\n", "swap, swap back, swap (AGENTS.md is made, not swapped)");
+    assert!(m.kept("home/.claude").is_empty());
+
+    // …and again before the swap back: the participant's first save is in place, the second is
+    // kept beside it (with the block it landed in), and said.
+    let m = Machine::new("race-twice");
+    m.exe("r/.venv/bin/python");
+    m.put(claude, "mine\n");
+    m.hooked("python3", &format!("exec {python} \"$@\""));
+    m.put("python3.hook1", &format!("printf 'first save\\n' >> {}\n", m.path(claude).display()));
+    m.put("python3.hook2", &format!("printf 'second save\\n' >> {}\n", m.path(claude).display()));
+    let said = ok(&m.run("sh", &notes(&m), false));
+    assert_eq!(m.read(claude), "mine\nfirst save\n");
+    let kept = m.kept("home/.claude");
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(m.read(&format!("home/.claude/{}", kept[0])), format!("mine\n\n{}second save\n", want(&m)));
+    assert!(said.contains("CLAUDE.md changed while the notes were being written - what it held is kept as ") && said.contains(&kept[0]), "{said}");
+
+    // A file made between the check that there's none and the create: that one gets the block.
+    let m = Machine::new("race-create");
+    m.exe("r/.venv/bin/python");
+    m.hooked("ln", &format!("exec {ln} \"$@\""));
+    m.put("ln.hook1", &format!("printf 'theirs\\n' > {}\n", m.path(claude).display()));
+    ok(&m.run("sh", &notes(&m), false));
+    assert_eq!(m.read(claude), format!("theirs\n\n{}", want(&m)));
+    assert_eq!(m.read("home/.codex/AGENTS.md"), want(&m));
+
+    // No swap in one step here: a file that's there is left as it is; one that isn't is made.
+    let m = Machine::new("no-swap");
+    m.exe("r/.venv/bin/python");
+    m.put(claude, "mine\n");
+    m.hooked("python3", "exit 2");
+    let said = ok(&m.run("sh", &notes(&m), false));
+    assert_eq!(m.read(claude), "mine\n");
+    assert!(said.contains("CLAUDE.md can't be swapped for the new one in one step here"), "{said}");
+    assert_eq!(m.read("home/.codex/AGENTS.md"), want(&m));
+    assert!(m.kept("home/.claude").is_empty() && m.kept("home/.codex").is_empty());
 }

@@ -2,7 +2,8 @@
 # machine's Python facts in Claude Code's user memory (~/.claude/CLAUDE.md) and Codex's
 # (~/.codex/AGENTS.md), between the markers: the block is replaced, or appended once, and
 # everything else in the file stays as it was (an unchanged file isn't written at all; a changed
-# one is replaced in one step, with its mode and owner, and through a link the file it points at).
+# one is swapped for the new one in one step, with its mode and owner, and through a link the file
+# it points at).
 # Run by `sh -c`, whatever the login shell. The @…@ placeholders are filled in by Rust; the
 # block's text is Rust's too.
 @LINK_UV@
@@ -22,17 +23,42 @@ trap 'rm -f "$t"' EXIT
 trap 'rm -f "$t"; exit 1' HUP INT TERM
 if command -v uv >/dev/null 2>&1; then I=@INSTALL_UV@; else I=@INSTALL_PIP@; fi
 B=$(printf '%s\n' @BLOCK@)
+# renameat2(2) with RENAME_EXCHANGE: $1 and $2 swapped in one step (as the VS Code warm-up's
+# settings merge does). Status 2: no such swap here (no python3, a system or filesystem without
+# it); 1: it failed.
+arena_swap() {
+    command -v python3 >/dev/null 2>&1 || return 2
+    python3 - "$1" "$2" <<'PY'
+import ctypes, errno, os, sys
+try:
+    fn = ctypes.CDLL(None, use_errno=True).renameat2
+except (OSError, AttributeError):
+    sys.exit(2)
+fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+if fn(-100, os.fsencode(sys.argv[1]), -100, os.fsencode(sys.argv[2]), 2) == 0:
+    sys.exit(0)
+sys.exit(2 if ctypes.get_errno() in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP) else 1)
+PY
+}
+# The block into file $1. Nothing of the participant's is ever overwritten: a file that isn't
+# there is created only if it still isn't; one that is gets the new text swapped in, and if what
+# came out isn't what was read (a save landed meanwhile: the participant, Claude Code's own
+# memory, another setup), that goes straight back and it's read again.
 arena_notes_write() {
     f=$1
     mkdir -p "${f%/*}" || return 1
-    if [ ! -e "$f" ] && [ ! -L "$f" ]; then
-        printf '%s\n' "$B" > "$f"
-        return
-    fi
     # Through a link, the file it points at is rewritten (the link stays a link).
     if [ -L "$f" ]; then r=$(readlink -f "$f") || return 1; else r=$f; fi
     for arena_try in 1 2 3; do
         t=$(mktemp "$r.arena-XXXXXX") || return 1
+        if [ ! -e "$r" ]; then
+            # A hard link never replaces a file: one made meanwhile is updated next time round.
+            if printf '%s\n' "$B" > "$t" && chmod 644 "$t" && ln "$t" "$r" 2>/dev/null; then s=0; else s=1; fi
+            rm -f "$t"
+            t=
+            if [ "$s" = 1 ] && [ -e "$r" ]; then continue; fi
+            return "$s"
+        fi
         was=$(cksum < "$r") || { rm -f "$t"; t=; return 1; }
         # The first marked block becomes the new one, any later one goes (one block, however many
         # runs wrote one); none: the block goes at the end, after a blank line. A BEGIN line with
@@ -40,32 +66,39 @@ arena_notes_write() {
         # unknown. Every other byte is kept, a last line without a newline too (ARENA_NL: 0).
         ARENA_NL=$(tail -c 1 "$r" | wc -l) ARENA_BEGIN=@BEGIN@ ARENA_END=@END@ ARENA_BLOCK=$B awk '
             BEGIN { b = ENVIRON["ARENA_BEGIN"]; e = ENVIRON["ARENA_END"]; blk = ENVIRON["ARENA_BLOCK"]; nonl = ENVIRON["ARENA_NL"] + 0 == 0 }
-            function out(s, text) { if (have) print pend; pend = s; pendtext = text; have = 1 }
+            function out(s, nr) { if (have) print pend; pend = s; pendnr = nr; have = 1 }
             { l = $0; sub(/^[ \t]+/, "", l); sub(/[ \t\r]+$/, "", l) }
             inb { if (l == e) inb = 0; next }
             l == b { if (!done) out(blk, 0); done = 1; inb = 1; next }
-            { out($0, 1); n = NR; last = l }
+            { out($0, NR); n = NR; last = l }
             END {
                 if (inb) exit 3
                 if (!done) { if (n && last != "") out("", 0); out(blk, 0) }
-                if (have) { if (pendtext && nonl) printf "%s", pend; else print pend }
+                if (have) { if (nonl && pendnr && pendnr == NR) printf "%s", pend; else print pend }
             }' "$r" > "$t"
         s=$?
         if [ "$s" = 3 ]; then
             echo "@WARN@$f has a BEGIN arena-infra python line with no END line after it - left as it is"
             s=0
         elif [ "$s" = 0 ] && ! cmp -s "$t" "$r"; then
-            # Saved meanwhile (the participant, Claude Code's own memory, another setup): read
-            # it again, so that edit isn't lost.
-            if [ "$(cksum < "$r")" != "$was" ]; then
-                rm -f "$t"
-                t=
-                continue
-            fi
-            # The new text takes the file's place in one step (a run cut short leaves the old one
-            # whole), with its mode and owner.
-            chmod --reference="$r" "$t" && { chown --reference="$r" "$t" 2>/dev/null || true; } && mv -f "$t" "$r"
+            ours=$(cksum < "$t")
+            chmod --reference="$r" "$t" && { chown --reference="$r" "$t" 2>/dev/null || true; } && arena_swap "$t" "$r"
             s=$?
+            if [ "$s" = 2 ]; then
+                echo "@WARN@$f can't be swapped for the new one in one step here (no python3 or renameat2) - left as it is"
+                s=0
+            elif [ "$s" = 0 ] && [ "$(cksum < "$t")" != "$was" ]; then
+                # A save landed between the read and the swap: it goes back, and round again.
+                if arena_swap "$t" "$r" && [ "$(cksum < "$t")" = "$ours" ]; then
+                    rm -f "$t"
+                    t=
+                    continue
+                fi
+                # Saved again meanwhile (or the swap back failed): what came out is kept.
+                echo "@WARN@$f changed while the notes were being written - what it held is kept as $t"
+                t=
+                return 0
+            fi
         fi
         rm -f "$t"
         t=
