@@ -2,8 +2,9 @@
 //! `set-branch`, `init-branches`, `restore`, `baseline` — at default and at `-v`, from fakes: the
 //! pods a `FakeRemote`, rsync a stand-in script. What they show is what a log or a pipe gets (the
 //! cron's log among them): by default each failure with its fix and a line of tally, with `-v`
-//! every line the command printed before. Pods answer a few milliseconds apart, so they finish in
-//! the same order every run.
+//! every line the command printed before. Pods answer and copies end some hundred milliseconds
+//! apart, so a run reads the same each time; the `-v` goldens also hold whichever of the pods or
+//! copies running at once ends first ([`unordered`]).
 
 use super::*;
 use crate::output_test::rendered;
@@ -35,6 +36,28 @@ fn paced_rsync(tag: &str, paces: &[(&str, &str)], fail: &str) -> StubRsync {
 
 /// The copies of one pod: its snapshot's two passes first, its big tier after.
 const SNAPSHOT_FIRST: &[(&str, &str)] = &[("*/big/*", "0.5"), ("*", "0.05")];
+
+/// `text` with each run of `[i/n] …` lines — pods or copies that run at the same time, and so
+/// may end in either order — sorted, their counters dropped: a golden that holds whichever
+/// finishes first.
+fn unordered(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut block: Vec<String> = Vec::new();
+    let counted = |l: &str| l.strip_prefix('[').and_then(|r| r.split_once("] ")).filter(|(n, _)| n.contains('/') && n.chars().all(|c| c.is_ascii_digit() || c == '/')).map(|(n, rest)| format!("[{}] {rest}", n.split('/').nth(1).unwrap_or("")));
+    for line in text.lines() {
+        match counted(line) {
+            Some(l) => block.push(l),
+            None => {
+                block.sort();
+                out.append(&mut block);
+                out.push(line.to_string());
+            }
+        }
+    }
+    block.sort();
+    out.append(&mut block);
+    out.join("\n")
+}
 
 /// The run's text with its temp dir and today's snapshot label (from ARENA_START_DATE) made
 /// stable.
@@ -79,8 +102,8 @@ async fn backup_cron_run_says_failures_and_a_tally_by_default() {
         )
     );
     assert_eq!(
-        out[1],
-        format!(
+        unordered(&out[1]),
+        unordered(&format!(
             "Backing up 4 pod(s) over SSH (current branch; main/master skipped; 300s budget each)…\n\
              [1/4] ✓ devtest-apple -> autocommit-a\n\
              [2/4] ✗ devtest-bloom: {blocked}\n\
@@ -101,7 +124,7 @@ async fn backup_cron_run_says_failures_and_a_tally_by_default() {
              \n\
              {fallback}\n\
              Error: 1 pod(s) failed to back up\n"
-        )
+        ))
     );
 }
 
@@ -183,8 +206,9 @@ async fn pull_says_its_failures_and_a_tally_by_default() {
          Error: 1 rsync job(s) failed: devtest-bloom [big]\n"
     );
     assert_eq!(
-        out[1],
-        "Source ~/ (home) · snapshot < 50M -> <tmp>/backups/wNdM/<pod>/ · all files -> <tmp>/backups/big/<pod>/ · incl .git · \
+        unordered(&out[1]),
+        unordered(
+            "Source ~/ (home) · snapshot < 50M -> <tmp>/backups/wNdM/<pod>/ · all files -> <tmp>/backups/big/<pod>/ · incl .git · \
          each pod ≤ 7200s (BACKUP_TIMEOUT_SECS), ≤ 300s without I/O\n\
          \n\
          Pulling 2 pod(s) into <tmp>/backups/ (dated snapshot wNdM + the all-files big/)…\n\
@@ -196,6 +220,7 @@ async fn pull_says_its_failures_and_a_tally_by_default() {
          \n\
          Done: 3 rsync job(s) ok, 1 failed across 2 pod(s).\n\
          Error: 1 rsync job(s) failed: devtest-bloom [big]\n"
+        )
     );
 }
 
@@ -263,8 +288,8 @@ async fn set_branch_says_what_needs_saying_and_a_tally() {
         )
     );
     assert_eq!(
-        out[1],
-        format!(
+        unordered(&out[1]),
+        unordered(&format!(
             "Will HARD-reset 2 pod(s) to 'origin/main' — DISCARDS local commits/changes (each pod's current branch committed + \
              pushed first): devtest-apple, devtest-bloom\n\
              Proceed? [y/N] y\n\
@@ -291,7 +316,7 @@ async fn set_branch_says_what_needs_saying_and_a_tally() {
              switched 2/2\n\
              {reminder}\n\
              {error}"
-        )
+        ))
     );
 }
 
@@ -355,8 +380,9 @@ async fn init_branches_is_its_question_and_a_tally() {
          ✓ on the w1d2 branch: 2 of 2 pods\n"
     );
     assert_eq!(
-        out[1],
-        "Iteration: w1d2\n\n\
+        unordered(&out[1]),
+        unordered(
+            "Iteration: w1d2\n\n\
          Will create + push the w1d2 autocommit branch on 2 pod(s): devtest-apple, devtest-bloom\n\
          Proceed? [y/N] y\n\
          Backing up the branch each pod is on before the switch (commit + push; main/master skipped; 300s budget each)…\n\
@@ -366,6 +392,7 @@ async fn init_branches_is_its_question_and_a_tally() {
          [2/2] ✓ devtest-bloom -> autocommit-devtest-w1d2-bloom\n\
          \n\
          Done: 2 initialized, 0 failed, 0 not switched (of 2).\n"
+        )
     );
 }
 
@@ -392,6 +419,25 @@ async fn restore_dry_run_is_a_line() {
     );
     assert!(out[1].starts_with("[dry-run] would restore devtest-apple (id=id-devtest-apple, runpod):\n  from:  <tmp>/backups/w1d2/devtest-apple (w1d2, a snapshot: files under the size cap) — 2 file(s), 11\n"), "{}", out[1]);
     assert!(out[1].lines().last().is_some_and(|l| l.starts_with("  ") && l.contains("rsync") && l.contains("--backup-dir=")), "{}", out[1]);
+    // The restore itself: its question in a line (what it does to newer files on the pod, too),
+    // then what it did; with `-v` the whole plan as the question, as before.
+    let mut out = Vec::new();
+    for verbose in [false, true] {
+        fake.script(&host(22001), [repo_in_place()]);
+        let opts = RestoreOpts { yes: false, ..restore_opts(&dir) };
+        let (f, c, rsync) = (fleet(), cfg(), stub.path());
+        let run = handle_restore(&f, &remote, &c, "apple", opts, &rsync, NOW);
+        out.push(rendered(verbose, &["y"], run).await.replace(&stub.0.display().to_string(), "<tmp>"));
+    }
+    let done = "✓ restored devtest-apple from w1d2 (done); anything it replaced is under ~/.arena-restore/20261008T050640Z/ on the pod\n";
+    assert_eq!(
+        out[0],
+        format!(
+            "Restore devtest-apple from w1d2 (2 file(s), 11) into ~/ (nothing deleted; files newer on the pod stay; what it replaces \
+             is kept on the pod)? [y/N] y\n{done}"
+        )
+    );
+    assert!(out[1].starts_with("Will restore devtest-apple (id=id-devtest-apple, runpod):\n  from:  ") && out[1].ends_with(&format!("\nProceed? [y/N] y\n{done}")), "{}", out[1]);
 }
 
 /// A failed rsync's default line keeps what rsync itself said went wrong (a cron's log can't be
@@ -402,6 +448,9 @@ fn a_failed_rsyncs_line_keeps_its_own_words() {
     let closed = "rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]\n\
                   rsync error: error in rsync protocol data stream (code 12) at io.c(232) [Receiver=3.2.7]\n";
     assert_eq!(rsync_why(closed), "rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]");
+    // ssh's cause first (review r2 #2).
+    let denied_key = format!("root@10.0.0.1: Permission denied (publickey).\n{closed}");
+    assert_eq!(rsync_why(&denied_key), "root@10.0.0.1: Permission denied (publickey).; rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]");
     let denied: String = (1..=5).map(|i| format!("rsync: [sender] send_files failed to open \"/root/f{i}\": Permission denied (13)\n")).collect();
     assert_eq!(
         rsync_why(&format!("{denied}rsync error: some files/attrs were not transferred (code 23)\n")),
@@ -409,6 +458,78 @@ fn a_failed_rsyncs_line_keeps_its_own_words() {
          \"/root/f2\": Permission denied (13) (+3 more)"
     );
     assert_eq!(rsync_why("ssh: connect to host 10.0.0.1 port 22: Connection timed out\nrsync error: unexplained error (code 255)\n"), "ssh: connect to host 10.0.0.1 port 22: Connection timed out");
-    assert_eq!(rsync_why("some noise\nrsync error: error in file IO (code 11)\n"), "rsync error: error in file IO (code 11)");
+    assert_eq!(rsync_why("rsync error: error in file IO (code 11)\n"), "rsync error: error in file IO (code 11)");
     assert_eq!(rsync_why(""), "");
+}
+
+/// `pods baseline`: by default its question in a line and what it kept, in a line; with `-v` the
+/// plan, the old baseline moved aside and the whole result, as before. A dry run is a line.
+#[cfg(unix)]
+#[tokio::test]
+async fn baseline_is_its_question_and_a_line() {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let created = now - 600;
+    let reply = |fake: &FakeRemote| {
+        let probe = format!("arena-repo-home=/root\narena-repo-real={REPO}\narena-repo-mount=no\narena-repo-container={created}\n");
+        fake.script(&host(22001), [FakeReply::stdout(&probe), FakeReply::stdout("arena-copied-begin\0./carried.txt\0arena-copied-end\0")]);
+    };
+    let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nBACKUP_REPO_PATH={REPO}\n"));
+    let mut out = Vec::new();
+    for verbose in [false, true] {
+        let stub = writing_rsync(&format!("golden-baseline-{verbose}"));
+        let dir = stub.0.join("backups").display().to_string();
+        let (f, rsync) = (fleet(), stub.path());
+        for dry in [true, false] {
+            let fake = Arc::new(FakeRemote::new());
+            reply(&fake);
+            let remote: Arc<dyn Remote> = fake.clone();
+            let run = handle_baseline(&f, &remote, &cfg, "apple", Some(0), &dir, false, dry, false, &rsync, now);
+            out.push(rendered(verbose, &["y"], run).await.replace(&stub.0.display().to_string(), "<tmp>"));
+        }
+    }
+    let dest = "<tmp>/backups/baseline/w0/fleet";
+    assert_eq!(out[0], format!("[dry-run] would capture week 0's fleet baseline from devtest-apple into {dest} (-v: the plan and rsync)\n"));
+    assert_eq!(
+        out[1],
+        format!(
+            "Capture week 0's fleet baseline from devtest-apple into {dest}? [y/N] y\n\
+             ✓ week 0's baseline from devtest-apple: 1 files, 3 → {dest}\n"
+        )
+    );
+    let plan = format!(
+        "capture week 0's fleet baseline from devtest-apple (id=id-devtest-apple, container created {}, 0h10m ago) into {dest}: \
+         rsync its home (the snapshot tier's filters, .git complete), then keep only the files older than the container — the \
+         image's own — and none of the 1 file(s) copied onto it since with an older mtime (`pods replace`/`restore`, setup) — for \
+         every pod's snapshots to hard-link to",
+        arena_core::restore::stamp(created)
+    );
+    assert!(out[2].starts_with(&format!("[dry-run] would {plan}\n  ")), "{}", out[2]);
+    assert_eq!(out[2].lines().count(), 3, "the plan and the two passes: {}", out[2]);
+    assert_eq!(
+        out[3],
+        format!(
+            "Will {plan}.\nProceed? [y/N] y\n\
+             ✓ week 0's baseline from devtest-apple: 1 files, 3 that came with the image (in {dest}); left out 2 files, 11 written \
+             or copied onto it since the container was created. Snapshots from now on hard-link to it.\n"
+        )
+    );
+}
+
+/// A new day's branch that went to origin only in part is said by default (review r2 #1), not
+/// just with `-v`: its line, then the tally.
+#[tokio::test]
+async fn init_branches_says_by_default_what_it_left_unpushed() {
+    let stub = StubRsync::new("golden-init-unpushed");
+    let cfg = cfg_at(&stub);
+    let one = fleet_of(&[("apple", 22001)]);
+    let fake = Arc::new(FakeRemote::new());
+    fake.script(&host(22001), [FakeReply::stdout("SKIP main\n"), FakeReply::stdout("UNPUSHED 3 none\n")]);
+    let (sel, rsync) = (everyone(&one), stub.path());
+    let run = handle_init_branches(fake.clone(), &cfg, Some(1), Some(2), &sel, false, true, &rsync);
+    assert_eq!(
+        rendered(false, &[], run).await,
+        "[1/1] ✓ devtest-apple -> autocommit-devtest-w1d2-apple — not pushed: origin has none of its 3 commit(s); the next backup \
+         scans them for keys and pushes the branch\n\
+         ✓ on the w1d2 branch: 1 of 1 pod\n"
+    );
 }

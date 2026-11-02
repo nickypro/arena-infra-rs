@@ -714,9 +714,10 @@ pub(crate) async fn handle_init_branches(
     // A day branch that already exists gets back the real keys set aside on it (the morning's
     // `set-branch main` run twice): said as set-branch says it.
     let run = switch_guarded(&remote, cfg, sel, targets, rsync, None, cmd_for, BRANCH_TIMEOUT, &doing, |name, out, note| {
-        let line = format!("✓ {name} -> {}{}{}{note}", bcfg.branch_for(name), unpushed_note(&out.stdout), unredacted_note(&out.stdout));
-        // Said by default when its branch wasn't pushed first.
-        (line, !note.is_empty())
+        let unpushed = unpushed_note(&out.stdout);
+        let line = format!("✓ {name} -> {}{unpushed}{}{note}", bcfg.branch_for(name), unredacted_note(&out.stdout));
+        // Said by default when its branch wasn't pushed first, or the new one wasn't all pushed.
+        (line, !note.is_empty() || !unpushed.is_empty())
     })
     .await;
     out!(Detail, "\nDone: {} initialized, {} failed, {} not switched (of {total}).", run.ok, run.failed.len(), run.not_switched.len());

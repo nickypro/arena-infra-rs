@@ -644,7 +644,7 @@ pub(crate) async fn pull_pods(
                 Ok(true) => {}
                 Ok(false) => {
                     out!(
-                        Detail,
+                        Out,
                         "({name} [{tier}]: {dest} is on another filesystem than {tmp} — rsync keeps its temp files beside \
                          each file there, so an archive push running at the same time can see one)"
                     );
@@ -932,15 +932,17 @@ fn copy_tally(pods: &[String], overdue: &[String], failed: &[(String, String)], 
 }
 
 /// A failed rsync's stderr as the default output's line keeps it (docs/OUTPUT.md; a cron's log
-/// can't be asked again with `-v`): its own `rsync: …` lines — what failed, where — the first two
-/// and how many more, else the line that tells most ([`crate::pods::backup::telling_line`]: its
-/// `rsync error: … (code N)` verdict, ssh's). Pure.
+/// can't be asked again with `-v`): its own lines in order — what failed and where, ssh's cause
+/// (`Permission denied (publickey)`) before rsync's `connection unexpectedly closed` — the first
+/// two and how many more, without rsync's closing `rsync error: … (code N)` verdict, which is
+/// said only when it's all there is. Pure.
 pub(crate) fn rsync_why(stderr: &str) -> String {
-    let specific: Vec<&str> = stderr.lines().map(str::trim).filter(|l| l.starts_with("rsync: ") || l.starts_with("ssh: ")).collect();
-    match specific.len() {
-        0 => crate::pods::backup::telling_line(stderr).unwrap_or_default().to_string(),
-        1 | 2 => specific.join("; "),
-        n => format!("{}; {} (+{} more)", specific[0], specific[1], n - 2),
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let own: Vec<&str> = lines.iter().copied().filter(|l| !l.starts_with("rsync error: ")).collect();
+    match own.len() {
+        0 => lines.last().copied().unwrap_or_default().to_string(),
+        1 | 2 => own.join("; "),
+        n => format!("{}; {} (+{} more)", own[0], own[1], n - 2),
     }
 }
 
