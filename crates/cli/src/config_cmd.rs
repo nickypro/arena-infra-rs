@@ -1082,6 +1082,8 @@ pub(crate) fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<S
         _ => cfg_row(&mut out, cfg, &mut missing, "OPENROUTER_WORKSPACE", false, false),
     }
     cfg_row(&mut out, cfg, &mut missing, "OPENROUTER_KEY_LIMIT", false, false); // USD cap per generated key
+    // What `pods test --deep`/`--keys` hold each machine's keys to (local files only).
+    println!("{}", key_check_row(&crate::pods::health::key_book(cfg)));
 
     // The balance sources as last seen (the state file only — no request): ⚠ rows are
     // advice, never missing keys; a ✗ row (a balance key set but invalid) fails the check.
@@ -1222,6 +1224,20 @@ pub(crate) fn balance_section(cfg: &Config, bal: &money::BalanceCtx, now: u64, m
     out.extend(money::balance_config_rows(cfg, bal, now));
     missing.extend(arena_core::balance::invalid_keys(cfg));
     out
+}
+
+/// `config check`'s row on what the AI-key checks (`pods test --deep`, `--keys`) compare each
+/// machine's keys with: how many machines the keys CSV has an OpenRouter key for, and whether
+/// there's an `HF_TOKEN` — or that a kind isn't judged (none configured). Advice only. Pure.
+pub(crate) fn key_check_row(book: &arena_core::health::KeyBook) -> String {
+    let or = match (book.openrouter, book.csv.len()) {
+        (false, _) => "OpenRouter: none configured (not judged)".to_string(),
+        (true, 0) => "OpenRouter: no keys CSV rows yet (only working or not)".to_string(),
+        (true, 1) => "OpenRouter: the keys CSV's key for 1 machine".to_string(),
+        (true, n) => format!("OpenRouter: the keys CSV's keys for {n} machines"),
+    };
+    let hf = if book.hf.is_some() || !book.hf_csv.is_empty() { "HF_TOKEN: set" } else { "HF_TOKEN: unset (not judged)" };
+    format!("  · {:<28} {or}; {hf} — `arena pods test --keys`", "AI key check")
 }
 
 /// `config check`'s section on the machines `up --check` remembers as bad, from the health

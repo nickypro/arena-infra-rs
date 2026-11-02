@@ -105,6 +105,9 @@ pub enum Issue {
     Unreachable,
     #[serde(rename = "check incomplete")]
     CheckIncomplete,
+    /// Its AI key or Hugging Face token (`ai_key`, `hf_token`): the machine itself may be fine.
+    #[serde(rename = "AI key")]
+    AiKey,
     #[serde(rename = "other issue", other)]
     Other,
 }
@@ -123,6 +126,7 @@ impl Issue {
             Issue::MaintenanceScheduled => "maintenance scheduled",
             Issue::Unreachable => "unreachable",
             Issue::CheckIncomplete => "check incomplete",
+            Issue::AiKey => "AI key",
             Issue::Other => "other issue",
         }
     }
@@ -131,7 +135,8 @@ impl Issue {
     /// `health::evaluate`): `ssh` → unreachable, the GPU checks (`nvidia-smi`, `cuda`,
     /// `device_count`, `gpu<i>`, `peer_copy`, `nccl`, `provider`) → GPU error, `driver` →
     /// too old (FAIL) / unknown (WARN), `torch` → software error, `network`, `disk`, `load`,
-    /// `maintenance`, and `script` (no or cut-off output) → check incomplete.
+    /// `maintenance`, `script` (no or cut-off output) → check incomplete, and the AI keys'
+    /// (`ai_key`, `hf_token`) → AI key.
     pub fn from_check(c: &Check) -> Issue {
         let gpu_index = |n: &str| n.strip_prefix("gpu").is_some_and(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit()));
         match c.name.as_str() {
@@ -146,6 +151,7 @@ impl Issue {
             "disk" => Issue::LowDisk,
             "load" => Issue::BusyHost,
             "maintenance" => Issue::MaintenanceScheduled,
+            n if crate::health::is_key_check(n) => Issue::AiKey,
             _ => Issue::Other,
         }
     }
@@ -174,6 +180,10 @@ pub struct HealthRecord {
     /// What the machine itself reported (`2×RTX A4000`), when the check got that far.
     #[serde(default)]
     pub gpu: Option<String>,
+    /// Its AI keys' checks (`ai_key`, `hf_token`) whatever their verdict — a pass too, so the
+    /// dashboard's detail can say `ok, $4.97 of $5.00 left`. Additive: an older cache has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<Check>,
 }
 
 /// Longest `reasons` line kept: enough for any check's detail, short enough that a
@@ -202,6 +212,7 @@ impl HealthRecord {
             reasons: worst.iter().map(|c| clip(&flat(&format!("{}: {}", c.name, c.detail)), REASON_MAX)).collect(),
             issues,
             gpu: h.facts.as_ref().map(|f| f.gpu_label()).filter(|g| g != "-"),
+            keys: h.checks.iter().filter(|c| crate::health::is_key_check(&c.name)).cloned().collect(),
         }
     }
 }
@@ -289,12 +300,13 @@ pub fn bad_host_record(pod: &Pod, h: &PodHealth, now: u64) -> Option<(String, Ba
 }
 
 /// Whether `h` clears its machine's bad record: a check that ran to the end and didn't FAIL
-/// (a WARN is a working machine too). Recorded through [`record_health`] — `pods test
-/// --deep`, `up --check`, the dashboard — so a machine found bad, then fine, is forgotten at
-/// once. By [`PodHealth::host`]: a machine id clears its record; an IP matches none. Pure.
+/// (a WARN is a working machine too) — its AI keys aside ([`PodHealth::machine_status`]: a dead
+/// key says nothing of the machine). Recorded through [`record_health`] — `pods test --deep`,
+/// `up --check`, the dashboard — so a machine found bad, then fine, is forgotten at once. By
+/// [`PodHealth::host`]: a machine id clears its record; an IP matches none. Pure.
 pub fn clears_bad_host(h: &PodHealth) -> Option<&str> {
     let ran = h.facts.as_ref().is_some_and(|f| f.started && f.complete);
-    (ran && h.status != Status::Fail).then_some(h.host.as_deref()).flatten()
+    (ran && h.machine_status() != Status::Fail).then_some(h.host.as_deref()).flatten()
 }
 
 /// The `provider`'s own machine ids among `bad` (`vast machine 31540` → `31540`): what a

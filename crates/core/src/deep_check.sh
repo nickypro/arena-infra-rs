@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # `arena pods test --deep`: gather one pod's health facts and print them as `key=value`.
+# `… keys` (its first argument; `pods test --keys`): only the AI keys' facts, in a few seconds.
 #
 # Contract with the parser (arena_core::health::parse_deep):
 #   * stdout carries ONLY `key=value` lines: one fact per line, single-line values. The
@@ -10,19 +11,25 @@
 #   * every sub-step is bounded with `timeout` and the network probe runs alongside the
 #     GPU checks, so a run ends in under ~2 minutes even on a sick host (worst case ≈
 #     10+10+10 nvidia-smi, 5 driver file, 75 python, 5+5 df; the caller's budget is
-#     DEEP_CHECK_TIMEOUT).
+#     DEEP_CHECK_TIMEOUT). The AI keys' calls run alongside too (15s each).
+#   * no secret is ever printed: an AI key or token is reported by its fingerprint only.
 # Read-only apart from its own temp dir (removed on exit). Needs no TTY, reads no stdin.
 # The caller runs it inside the participants' login env (conda env active), so `python`
-# is the interpreter participants actually use.
+# is the interpreter participants actually use, and the keys are those their shell exports.
 set -u
 export LC_ALL=C
+mode=${1:-deep}
 
-echo "deep_check=1"
+echo "deep_check=2"
 
-# One fact per line: newlines/tabs flattened, clipped to 300 chars.
+# One fact per line: newlines/tabs flattened, clipped to 300 chars — and either secret the
+# keys section handles scrubbed out of it, whatever printed it (a belt to the braces there).
 kv() {
-  local v
-  v=$(printf '%s' "$2" | tr '\r\n\t' '   ' | cut -c1-300)
+  local v=$2 s
+  for s in "${OPENROUTER_API_KEY:-}" "${HF_TOKEN:-}"; do
+    [ "${#s}" -lt 8 ] || v=${v//"$s"/[secret]}
+  done
+  v=$(printf '%s' "$v" | tr '\r\n\t' '   ' | cut -c1-300)
   printf '%s=%s\n' "$1" "$v"
 }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -48,6 +55,123 @@ if [ -z "$work" ]; then
 fi
 trap 'rm -rf "$work"' EXIT
 
+# ---- AI keys: does the participant's OpenRouter key work, and their Hugging Face token? ----
+# `$OPENROUTER_API_KEY` and `$HF_TOKEN` as the login shell exports them, each asked of its
+# service once, in the background: OpenRouter's `GET /api/v1/key` (free, spends nothing: the
+# key's cap, what's left of it, whether it's disabled; a bad key gets 401) and Hugging Face's
+# `whoami-v2`. The secret never leaves this script: curl reads its header on stdin (`-K -`), so
+# it is on no command line (`ps` shows those), and only its fingerprint is printed — the first
+# 12 hex of its SHA-256, which the control box compares with its keys CSV — never the key, nor
+# OpenRouter's redacted label of it. ARENA_TEST_OPENROUTER_URL / ARENA_TEST_HF_URL: tests only
+# (a local stub server).
+OR_KEY_URL=${ARENA_TEST_OPENROUTER_URL:-https://openrouter.ai/api/v1/key}
+HF_WHOAMI_URL=${ARENA_TEST_HF_URL:-https://huggingface.co/api/whoami-v2}
+or_key=${OPENROUTER_API_KEY:-}
+hf_key=${HF_TOKEN:-}
+
+# `key_probe <tag> <secret> <url>`: one bounded GET with the secret as its Bearer token, the
+# header handed to curl on stdin (`printf` is a builtin: no process carries it either). Leaves
+# $work/<tag>.code (the HTTP status), .body, .err and .rc.
+key_probe() {
+  local s=${2//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf 'header = "Authorization: Bearer %s"\n' "$s" |
+    bounded 15 curl -sS --connect-timeout 5 --max-time 10 -K - -o "$work/$1.body" -w '%{http_code}' "$3" \
+      >"$work/$1.code" 2>"$work/$1.err"
+  echo "$?" >"$work/$1.rc"
+}
+
+# The first 12 hex of the secret's SHA-256 (it goes to the hasher on stdin); nothing when no
+# hasher is installed.
+fingerprint() {
+  local h=""
+  if have sha256sum; then
+    h=$(printf '%s' "$1" | sha256sum 2>/dev/null)
+  elif have shasum; then
+    h=$(printf '%s' "$1" | shasum -a 256 2>/dev/null)
+  elif have openssl; then
+    h=$(printf '%s' "$1" | openssl dgst -sha256 -r 2>/dev/null)
+  fi
+  h=${h%% *}
+  case $h in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) printf '%s' "${h:0:12}" ;;
+  esac
+}
+
+# One scalar of a small JSON answer (`"name": value`, the first one): a string's text, a
+# number, `true`/`false`, `none` for null; nothing when absent. For OpenRouter's flat `data`
+# object and an error's `message`, not JSON at large.
+json_value() {
+  head -c 16384 "$2" 2>/dev/null | tr '\r\n\t' '   ' |
+    grep -oE "\"$1\"[[:space:]]*:[[:space:]]*(\"[^\"]*\"|-?[0-9][0-9.eE+-]*|true|false|null)" | head -n 1 |
+    sed -E 's/^"[^"]*"[[:space:]]*:[[:space:]]*//; s/^"(.*)"$/\1/; s/^null$/none/'
+}
+
+keys_pids=""
+keys_start() {
+  if [ -n "$or_key" ] && have curl; then
+    (key_probe openrouter "$or_key" "$OR_KEY_URL") </dev/null &
+    keys_pids="$keys_pids $!"
+  fi
+  if [ -n "$hf_key" ] && have curl; then
+    (key_probe hf "$hf_key" "$HF_WHOAMI_URL") </dev/null &
+    keys_pids="$keys_pids $!"
+  fi
+}
+
+# `key_facts <tag> <secret>`: `<tag>.key=missing|set`, its fingerprint, and what its service
+# answered (`.curl_exit`, `.http`, `.error` — curl's, or the answer's `message`/`error`).
+key_facts() {
+  local rc code msg
+  if [ -z "$2" ]; then
+    kv "$1.key" missing
+    return 1
+  fi
+  kv "$1.key" set
+  kv "$1.fingerprint" "$(fingerprint "$2")"
+  if ! have curl; then
+    kv "$1.curl_exit" missing
+    return 1
+  fi
+  rc=$(cat "$work/$1.rc" 2>/dev/null)
+  code=$(cut -c1-3 "$work/$1.code" 2>/dev/null)
+  kv "$1.curl_exit" "${rc:-unknown}"
+  kv "$1.http" "${code:-unknown}"
+  if [ "${rc:-1}" != 0 ]; then
+    msg=$(first_line "$(cat "$work/$1.err" 2>/dev/null)")
+    kv "$1.error" "${msg:-curl exit ${rc:-unknown}}"
+    return 1
+  fi
+  case $code in
+    2??) return 0 ;;
+  esac
+  msg=$(json_value message "$work/$1.body")
+  [ -n "$msg" ] || msg=$(json_value error "$work/$1.body")
+  [ -z "$msg" ] || kv "$1.error" "$(printf '%s' "$msg" | cut -c1-160)"
+  return 1
+}
+
+keys_report() {
+  local p f v
+  for p in $keys_pids; do
+    wait "$p" 2>/dev/null
+  done
+  if key_facts openrouter "$or_key"; then
+    for f in limit limit_remaining limit_reset usage disabled; do
+      v=$(json_value "$f" "$work/openrouter.body")
+      [ -z "$v" ] || kv "openrouter.$f" "$v"
+    done
+  fi
+  key_facts hf "$hf_key"
+}
+
+if [ "$mode" = keys ]; then
+  keys_start
+  keys_report
+  echo "deep_check_end=1"
+  exit 0
+fi
+
 # ---- network, in the background: a 32 MiB byte range of a public Hugging Face file ----
 # No token is sent (the file is public), so this never spends the shared HF rate limit.
 HF_URL="https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors"
@@ -62,6 +186,7 @@ if have curl; then
   ) </dev/null &
   net_pid=$!
 fi
+keys_start
 
 # ---- host: load is the *host's* (containers share the kernel), so is uptime ----
 if read -r l1 l5 l15 _rest 2>/dev/null </proc/loadavg; then
@@ -445,5 +570,8 @@ if [ -n "$net_pid" ]; then
 else
   kv net.curl_exit missing
 fi
+
+# ---- AI keys' results (their calls have been running alongside; 15s each at most) ----
+keys_report
 
 echo "deep_check_end=1"

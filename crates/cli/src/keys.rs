@@ -262,6 +262,24 @@ impl KeySources {
         (vars, matched)
     }
 
+    /// What a machine's AI keys are held to, from these sources ([`arena_core::health::KeyBook`]:
+    /// fingerprints of the OpenRouter and per-host HF rows, the broadcast `HF_TOKEN`), with the
+    /// owners in the spend ledger at `ledger` — `up --check`'s look at a machine's keys once it
+    /// has copied them.
+    pub(crate) fn key_book(&self, cfg: &Config, ledger: Option<&std::path::Path>) -> arena_core::health::KeyBook {
+        let rows = |env: &str| -> Vec<(String, String)> {
+            let mut rows: Vec<(String, String)> = self
+                .per_host
+                .iter()
+                .filter_map(|(h, vars)| vars.iter().find(|(e, _)| e == env).map(|(_, v)| (h.clone(), v.clone())))
+                .collect();
+            rows.sort();
+            rows
+        };
+        let hf = self.broadcast.iter().find(|(e, _)| e == "HF_TOKEN").map(|(_, v)| v.as_str());
+        arena_core::health::KeyBook::new(cfg, &rows(checked::OPENROUTER_ENV), hf, &rows("HF_TOKEN")).with_owners(ledger)
+    }
+
     /// The OpenRouter key the keys CSV holds for `host` (its exact name), if any.
     pub(crate) fn openrouter_secret(&self, host: &str) -> Option<&str> {
         self.per_host.get(host)?.iter().find(|(env, _)| env == checked::OPENROUTER_ENV).map(|(_, v)| v.as_str())

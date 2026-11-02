@@ -42,6 +42,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -953,6 +954,11 @@ impl Shared<'_, '_> {
                     );
                     return self.end(run, Verdict::Failed { stage: Stage::Check, reason });
                 }
+                // Only its AI keys failed (a policy that holds them — not this check's, which runs
+                // before the keys are copied): never the machine. Said, and kept.
+                Status::Fail if kind == Some(health::FailureKind::Key) => {
+                    say(To::Err, &format!("[{name}] check: FAIL (AI key, not the machine: kept) — {notes}"));
+                }
                 Status::Fail => {
                     if let Some(ip) = &host {
                         self.failed_hosts.lock().unwrap().push(ip.clone());
@@ -983,6 +989,19 @@ impl Shared<'_, '_> {
                 Some(Ok((to, line, fleet_ssh))) => {
                     say(to, &line);
                     run.fleet_ssh = fleet_ssh;
+                }
+            }
+            // 5a. --check: do its AI keys work, now they're on it? (The deep check ran before
+            // they were copied.) Whatever the answer, never a replace, a retry or a bad host: a
+            // key isn't the machine. Said with what to run, folded into its check; kept.
+            if self.run.check.is_some() {
+                let ledger = crate::spend::SpendCtx::from_config(self.run.cfg).path().map(Path::to_path_buf);
+                let book = keys.key_book(self.run.cfg, ledger.as_deref());
+                if book.any() {
+                    let Some(k) = self.or_stop(self.key_check(&pod, &target, book)).await else {
+                        return self.end(run, Verdict::Stopped { stage: Stage::Keys });
+                    };
+                    self.say_keys(&name, &k, run);
                 }
             }
         }
@@ -1176,7 +1195,9 @@ impl Shared<'_, '_> {
                     what.push(format!("proxy port {port}"));
                 }
                 if let Some(h) = &run.health {
-                    what.push(format!("check {}", h.status.label()));
+                    // The machine's verdict; its AI keys' beside it when they aren't a pass.
+                    let keys = h.key_status().filter(|k| *k != Status::Pass).map(|k| format!(", AI key {}", k.label()));
+                    what.push(format!("check {}{}", h.machine_status().label(), keys.unwrap_or_default()));
                 }
                 if run.locked {
                     what.push("locked".into());
@@ -1562,6 +1583,38 @@ impl Shared<'_, '_> {
             ..pod.clone()
         };
         judge_deep_call(&pod, call.map_err(|e| describe_error(&e)), &check.policy)
+    }
+
+    /// The keys-only check on one pod (`pods test --keys`'s: one bounded exec), held to `book`.
+    async fn key_check(&self, pod: &Pod, target: &SshTarget, book: health::KeyBook) -> PodHealth {
+        let cmd = health::key_check_command(Some(self.run.cfg.get("CONDA_ENV").unwrap_or("arena-env")));
+        let call = self.run.remote.exec(target, &cmd, Some(health::KEY_CHECK_TIMEOUT)).await;
+        let policy = HealthPolicy { keys: Some(book), ..HealthPolicy::default() };
+        health::judge_key_call(pod, call.map_err(|e| describe_error(&e)), &policy)
+    }
+
+    /// Say a keys-only check's verdict — a line per key it judged (`[apple] AI key ✓ ok, $4.97 of
+    /// $5.00 left`; `✗ … — <what to run>` on stderr) — and fold it into the name's check, so the
+    /// report and the health cache have it. One that couldn't run is said, with the command
+    /// that runs it again, and changes nothing.
+    fn say_keys(&self, name: &str, k: &PodHealth, run: &mut NameRun) {
+        let reported = k.facts.as_ref().is_some_and(|f| f.started && (f.openrouter.is_some() || f.hf.is_some()));
+        if !reported {
+            (self.say)(To::Err, &format!("[{name}] AI key: not checked ({}) — `arena pods test --keys {name}`", k.notes()));
+            return;
+        }
+        for c in k.checks.iter().filter(|c| health::is_key_check(&c.name) && c.status != Status::Skip) {
+            let what = if c.name == health::AI_KEY { "AI key" } else { "HF token" };
+            let (to, mark) = match c.status {
+                Status::Pass => (To::Out, "✓"),
+                Status::Warn => (To::Err, "!"),
+                _ => (To::Err, "✗"),
+            };
+            (self.say)(to, &format!("[{name}] {what} {mark} {}", c.detail));
+        }
+        if let Some(h) = run.health.as_mut() {
+            h.merge_keys(k);
+        }
     }
 
     /// `pod` with the machine id from the provider's best-effort details when its listing
@@ -2719,6 +2772,61 @@ mod tests {
         let summary = pipeline::render_up_summary(&rows);
         assert!(summary.contains("devtest-apple: FAILED check — software/setup failure, not the host — torch: "), "{summary}");
         assert!(conclude(&rows, &|_, _| {}).is_err());
+    }
+
+    /// A dead AI key is not a sick host: `up --check` copies the keys after the deep check, then
+    /// asks the machine whether its key works (the keys-only check). Here OpenRouter turns it
+    /// away (401): said with what to run, folded into its check — and the machine is kept:
+    /// READY, never terminated, replaced or remembered as a bad host.
+    #[tokio::test(start_paused = true)]
+    async fn up_check_keeps_a_machine_whose_only_problem_is_its_key() {
+        const SECRET: &str = "sk-or-v1-0123456789abcdef-apple";
+        let keys = keys_dir("deadkey");
+        std::fs::write(keys.0.join("openrouter_api_keys.csv"), format!("host,key\ndevtest-apple,{SECRET}\n")).unwrap();
+        let rejected = format!(
+            "deep_check=2\nopenrouter.key=set\nopenrouter.fingerprint={}\nopenrouter.curl_exit=0\nopenrouter.http=401\n\
+             openrouter.error=User not found.\nhf.key=missing\ndeep_check_end=1\n",
+            health::fingerprint(SECRET)
+        );
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.2", 22002, 30)])]);
+        let fake = Arc::new(FakeRemote::new());
+        // copy, config, the deep check (healthy), the keys copy, the keys-only check (401).
+        fake.script(
+            &host("10.0.0.1", 22001),
+            [FakeReply::ok(), FakeReply::ok(), healthy(), FakeReply::ok(), FakeReply::stdout(&rejected)],
+        );
+        let cfg = cfg(None);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(3), Some(&keys.0)).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "never terminated nor recreated");
+        assert!(fake.calls_to(&host("10.0.0.2", 22002)).is_empty(), "no replacement was placed");
+        let (pass, _) = lines.find("[devtest-apple] check: pass");
+        let (copied, _) = lines.find("[devtest-apple] keys ✓");
+        let (dead, _) = lines.find("[devtest-apple] AI key ✗ rejected by OpenRouter (HTTP 401) — `arena keys rotate apple --copy`");
+        let (ready, _) = lines.find("[devtest-apple] READY after ");
+        assert!(pass < copied && copied < dead && dead < ready, "{:#?}", lines.all());
+        assert!(lines.all()[ready].ends_with("check pass, AI key fail"), "{}", lines.all()[ready]);
+        assert!(!lines.all().iter().any(|l| l.contains("terminating") || l.contains("(host)")), "{:#?}", lines.all());
+        // The keys-only check ran once, after the copy, within its own budget.
+        let key_cmd = health::key_check_command(Some("arena-env"));
+        let calls = fake.calls_to(&host("10.0.0.1", 22001));
+        assert!(
+            matches!(calls.last(), Some(RemoteCall::Exec { cmd, timeout, .. }) if *cmd == key_cmd && *timeout == Some(health::KEY_CHECK_TIMEOUT)),
+            "{calls:#?}"
+        );
+        let row = &rows[0];
+        assert_eq!((row.verdict.clone(), row.health), (Verdict::Ready, Some(Status::Fail)));
+        assert_eq!(row.attempts.len(), 1);
+        assert_eq!((row.attempts[0].end.clone(), row.attempts[0].terminated), (AttemptEnd::Kept, false));
+        let summary = pipeline::render_up_summary(&rows);
+        assert!(
+            summary.contains("devtest-apple: fail — ai_key: rejected by OpenRouter (HTTP 401) — `arena keys rotate apple --copy`"),
+            "{summary}"
+        );
+        assert!(conclude(&rows, &|_, _| {}).is_ok(), "a READY machine: the run succeeds");
     }
 
     /// python killed by its 75s timeout before `import torch` could report (a hung or overloaded
