@@ -135,7 +135,8 @@ pub(crate) async fn handle_reimage(
     }
     // Who's on them: asked once the wipe is allowed (or for the dry run) — an SSH probe each.
     let busy = if force { Vec::new() } else { busy_refusals(&remote, cfg, &refs).await };
-    let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
+    let shown: Vec<String> = pods.iter().map(|p| who_among(p, &refs)).collect();
+    let names: Vec<&str> = shown.iter().map(String::as_str).collect();
     let brief = reimage_what(&names, &blocked_names);
     if dry_run {
         out!(Detail, "[dry-run] would reimage {} pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
@@ -404,12 +405,12 @@ fn fate_words(op: DiskOp, fate: DiskFate, site: &RepoSite, n: usize) -> String {
 /// ([`fate_words`]): `devtest-alpha (disk kept)`, `devtest-a, devtest-b (discards their
 /// container disks and the work on them); devtest-delta (disk kept)`. Pure (but for the bold).
 pub(crate) fn disk_brief(op: DiskOp, pods: &[&arena_core::Pod], fates: &[DiskFate], sites: &[RepoSite]) -> String {
-    let mut groups: Vec<(String, Vec<&str>, DiskFate, &RepoSite)> = Vec::new();
+    let mut groups: Vec<(String, Vec<String>, DiskFate, &RepoSite)> = Vec::new();
     for ((p, f), site) in pods.iter().zip(fates).zip(sites) {
         let key = fate_words(op, *f, site, 1);
         match groups.iter_mut().find(|(k, ..)| *k == key) {
-            Some((_, names, ..)) => names.push(&p.name),
-            None => groups.push((key, vec![&p.name], *f, site)),
+            Some((_, names, ..)) => names.push(who_among(p, pods)),
+            None => groups.push((key, vec![who_among(p, pods)], *f, site)),
         }
     }
     groups
@@ -636,8 +637,9 @@ pub(crate) async fn handle_start(
 /// the bold).
 fn start_brief(provider: &dyn Provider, pods: &[arena_core::Pod], setup: bool) -> String {
     let fresh = if setup { "a fresh image, set up again" } else { "a fresh image, not set up: --no-setup" };
+    let all: Vec<&arena_core::Pod> = pods.iter().collect();
     let (wiped, kept): (Vec<&arena_core::Pod>, Vec<&arena_core::Pod>) = pods.iter().partition(|p| provider.restart_wipes_container_disk(p));
-    let names = |ps: &[&arena_core::Pod]| names_brief(&ps.iter().map(|p| p.name.as_str()).collect::<Vec<_>>());
+    let names = |ps: &[&arena_core::Pod]| names_brief(&ps.iter().map(|p| who_among(p, &all)).collect::<Vec<_>>());
     let mut parts = Vec::new();
     if !wiped.is_empty() {
         parts.push(format!("{} ({fresh})", names(&wiped)));
@@ -701,6 +703,17 @@ pub(crate) fn start_retry(name: &str, opts: RestartOpts) -> String {
 /// says which one (review r5). Pure.
 pub(crate) fn who(pod: &arena_core::Pod, listed: &[arena_core::Pod]) -> String {
     if listed.iter().filter(|p| p.name == pod.name).count() > 1 {
+        format!("{} (id={}, {})", pod.name, pod.id, pod.provider)
+    } else {
+        pod.name.clone()
+    }
+}
+
+/// [`who`] among the pods a command acts on (`stop`, `start`, `lock`, `reimage` don't keep the
+/// listing): its id and provider when another of them has its name (`--all` with a double
+/// create). A twin left out was picked by its id, which the operator typed. Pure.
+pub(crate) fn who_among(pod: &arena_core::Pod, pods: &[&arena_core::Pod]) -> String {
+    if pods.iter().filter(|p| p.name == pod.name).count() > 1 {
         format!("{} (id={}, {})", pod.name, pod.id, pod.provider)
     } else {
         pod.name.clone()

@@ -127,7 +127,8 @@ pub(crate) async fn handle_lock(provider: &dyn Provider, sel: &Selected, lock: b
     let providers: Vec<&str> = plan.act.iter().map(|p| p.provider.as_str()).collect();
     let what = format!("{verb} {} pod(s): {}\n  ({})", names.len(), names.join(", "), lock::consequence(lock, &providers));
     // By default the pods and what the lock does, in a line (docs/OUTPUT.md).
-    let brief = format!("{} ({})", crate::pods::setup::all_names(&names), lock_brief(lock));
+    let shown: Vec<String> = plan.act.iter().map(|p| crate::pods::lifecycle::who_among(p, &plan.act)).collect();
+    let brief = format!("{} ({})", crate::pods::setup::all_names(&shown), lock_brief(lock));
     if dry_run {
         if !names.is_empty() {
             out!(Detail, "[dry-run] would {what}");

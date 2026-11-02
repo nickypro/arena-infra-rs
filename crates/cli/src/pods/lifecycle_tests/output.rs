@@ -800,3 +800,27 @@ async fn twins_with_a_failed_setup_are_not_ready() {
     assert!(got.contains("[devtest-alpha] FAILED setup: "), "{got}");
     assert!(!got.contains("READY"), "{got}");
 }
+
+/// Review r7: `stop`, `start` and `lock` of two pods sharing a name (`--all` after a double
+/// create) name each with its id in the question.
+#[tokio::test]
+async fn stop_start_and_lock_name_twins_with_their_ids() {
+    let dir = tmpdir("out-twins");
+    let cfg = cfg(&dir.0);
+    let twins = |status: &str| {
+        let f = Fleet::new(vec![
+            pod("h-1", "devtest-delta", "hetzner", Some(("10.0.0.8", 22))),
+            pod("h-2", "devtest-delta", "hetzner", Some(("10.0.0.9", 22))),
+        ]);
+        for p in f.pods.lock().unwrap().iter_mut() {
+            p.status = status.into();
+        }
+        f
+    };
+    let (quiet, _) = both(&["stop", "--all", "--dry-run"], &cfg, &[], || twins("RUNNING")).await;
+    assert_eq!(quiet, "[dry-run] would stop devtest-delta (id=h-1, hetzner), devtest-delta (id=h-2, hetzner) (disk kept)\n");
+    let (quiet, _) = both(&["start", "--all", "--dry-run"], &cfg, &[], || twins("off")).await;
+    assert_eq!(quiet, "[dry-run] would start devtest-delta (id=h-1, hetzner), devtest-delta (id=h-2, hetzner) (disk kept)\n");
+    let (quiet, _) = both(&["lock", "--all", "--dry-run"], &cfg, &[], || twins("RUNNING")).await;
+    assert!(quiet.starts_with("[dry-run] would lock devtest-delta (id=h-1, hetzner), devtest-delta (id=h-2, hetzner) ("), "{quiet}");
+}
