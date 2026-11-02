@@ -428,7 +428,8 @@ async fn build(cloud: &dyn ImageCloud, remote: &dyn Remote, cfg: &Config, how: B
     let started = tokio::time::Instant::now();
     // A line as each long step starts (create, setup ~10 min, scrub, snapshot): what a log needs.
     let report = bake::build(cloud, remote, &plan, &target, interrupt.wait(), &|l| out!(Out, "{l}")).await;
-    let _ = std::fs::remove_file(&script);
+    // The staged script stays until `main` removes it (`unstage_hetzner_script`): its path is
+    // the process's, and another user of it in this process (a test's setup) may still need it.
     let took = started.elapsed().as_secs();
     if let Some(why) = &report.orphan_image {
         out!(Err, "⚠ {why}");
