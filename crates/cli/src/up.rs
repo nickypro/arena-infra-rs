@@ -2818,7 +2818,7 @@ mod tests {
         let (pass, _) = lines.find("[devtest-apple] check: pass");
         let (copied, _) = lines.find("[devtest-apple] keys ✓");
         let (dead, _) =
-            lines.find("[devtest-apple] AI key ✗ rejected (HTTP 401) — `arena keys resume apple` if paused, else `arena keys rotate apple --copy`");
+            lines.find("[devtest-apple] AI key ✗ rejected (HTTP 401): paused? `arena keys resume apple`, else `arena keys rotate apple --copy`");
         let (ready, _) = lines.find("[devtest-apple] READY after ");
         assert!(pass < copied && copied < dead && dead < ready, "{:#?}", lines.all());
         assert!(lines.all()[ready].ends_with("check pass, AI key fail"), "{}", lines.all()[ready]);
@@ -2836,7 +2836,7 @@ mod tests {
         assert_eq!((row.attempts[0].end.clone(), row.attempts[0].terminated), (AttemptEnd::Kept, false));
         let summary = pipeline::render_up_summary(&rows);
         assert!(
-            summary.contains("devtest-apple: fail — ai_key: rejected (HTTP 401) — `arena keys resume apple` if paused"),
+            summary.contains("devtest-apple: fail — ai_key: rejected (HTTP 401): paused? `arena keys resume apple`"),
             "{summary}"
         );
         assert!(conclude(&rows, &|_, _| {}).is_ok(), "a READY machine: the run succeeds");

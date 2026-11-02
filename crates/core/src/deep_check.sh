@@ -16,6 +16,9 @@
 # Read-only apart from its own temp dir (removed on exit). Needs no TTY, reads no stdin.
 # The caller runs it inside the participants' login env (conda env active), so `python`
 # is the interpreter participants actually use, and the keys are those their shell exports.
+# No tracing, whatever the login environment says (an exported SHELLOPTS=xtrace, a `set -x`
+# left on an image): a trace would print the keys this script expands.
+set +xv
 set -u
 export LC_ALL=C
 mode=${1:-deep}

@@ -79,13 +79,7 @@ fn ai_key_verdicts() {
     let money = "openrouter.limit=1\nopenrouter.limit_remaining=0.42\nopenrouter.usage=0.58\n";
     let cases: Vec<(&str, String, &str, Status, &str)> = vec![
         ("ok, money left", or_lines(GOOD, 200, money), "devtest-apple", Pass, "ok, $0.42 of $1.00 left"),
-        (
-            "ok, no cap",
-            or_lines(GOOD, 200, "openrouter.limit=none\nopenrouter.usage=0.12\n"),
-            "devtest-apple",
-            Pass,
-            "ok, no cap, $0.12 spent",
-        ),
+        ("ok, no cap", or_lines(GOOD, 200, "openrouter.limit=none\nopenrouter.usage=0.12\n"), "devtest-apple", Pass, "ok, no cap, $0.12 spent"),
         (
             "ok, daily cap",
             or_lines(GOOD, 200, "openrouter.limit=0.05\nopenrouter.limit_remaining=0.05\nopenrouter.limit_reset=daily\n"),
@@ -105,14 +99,21 @@ fn ai_key_verdicts() {
             or_lines(GOOD, 401, "openrouter.error=User not found.\n"),
             "devtest-apple",
             Fail,
-            "rejected (HTTP 401) — `arena keys resume apple` if paused, else `arena keys rotate apple --copy`",
+            "rejected (HTTP 401): paused? `arena keys resume apple`, else `arena keys rotate apple --copy`",
+        ),
+        (
+            "rejected, no keys-CSV row: deleted",
+            or_lines(OLD, 401, ""),
+            "devtest-bloom",
+            Fail,
+            "rejected (HTTP 401), and no keys-CSV row for it — `arena keys gen bloom --copy`",
         ),
         (
             "rejected, an old key: the CSV's is the fix",
             or_lines(OLD, 401, ""),
             "devtest-apple",
             Fail,
-            "rejected by OpenRouter (HTTP 401) — an old key, not the keys CSV's (rotated or handed over since?) — `arena pods copy-keys apple`",
+            "rejected (HTTP 401): an old key, not the keys CSV's — `arena pods copy-keys apple`",
         ),
         (
             "paused, as a 403 says it",
@@ -136,6 +137,13 @@ fn ai_key_verdicts() {
             "out of money ($0.00 of $0.050 left) — `arena keys limit apple +5`",
         ),
         (
+            "out of money, an old key",
+            or_lines(OLD, 200, "openrouter.limit=0.05\nopenrouter.limit_remaining=0\n"),
+            "devtest-apple",
+            Fail,
+            "out of money: an old key, not the keys CSV's — `arena pods copy-keys apple`",
+        ),
+        (
             "overdrawn counts as out",
             or_lines(GOOD, 200, "openrouter.limit=5\nopenrouter.limit_remaining=-0.01\n"),
             "devtest-apple",
@@ -149,34 +157,22 @@ fn ai_key_verdicts() {
             Warn,
             "only $0.40 of $5.00 left (<10% of its cap) — `arena keys limit apple +5`",
         ),
+        ("a big cap warns only under $1", or_lines(GOOD, 200, "openrouter.limit=100\nopenrouter.limit_remaining=2\n"), "devtest-apple", Pass, "ok, $2.00 of $100.00 left"),
         (
-            "a big cap warns only under $1",
-            or_lines(GOOD, 200, "openrouter.limit=100\nopenrouter.limit_remaining=2\n"),
+            "an old key that works: stale",
+            or_lines(OLD, 200, money),
             "devtest-apple",
-            Pass,
-            "ok, $2.00 of $100.00 left",
+            Warn,
+            "works, but an old key, not the keys CSV's (rotated since?) — `arena pods copy-keys apple`",
         ),
         (
             "no fingerprint from the machine: whose key it is can't be said",
             "openrouter.key=set\nopenrouter.curl_exit=0\nopenrouter.http=200\nopenrouter.limit=1\nopenrouter.limit_remaining=1\n".into(),
             "devtest-apple",
             Warn,
-            "works, but not compared with the keys CSV's (no sha256sum on the machine) — `arena pods copy-keys apple` to be sure",
+            "works, not compared (no sha256sum there) — `arena pods copy-keys apple` to be sure",
         ),
-        (
-            "an old key that works: stale",
-            or_lines(OLD, 200, money),
-            "devtest-apple",
-            Warn,
-            "works, but an old key, not the keys CSV's (rotated or handed over since?) — `arena pods copy-keys apple`",
-        ),
-        (
-            "missing, the CSV has one",
-            "openrouter.key=missing\n".into(),
-            "devtest-apple",
-            Fail,
-            "missing, though the keys CSV has one for it — `arena pods copy-keys apple`",
-        ),
+        ("missing, the CSV has one", "openrouter.key=missing\n".into(), "devtest-apple", Fail, "missing, though the keys CSV has one for it — `arena pods copy-keys apple`"),
         (
             "missing, no row, no owner",
             "openrouter.key=missing\n".into(),
@@ -186,25 +182,25 @@ fn ai_key_verdicts() {
         ),
         (
             "couldn't reach OpenRouter",
-            "openrouter.key=set\nopenrouter.curl_exit=28\nopenrouter.http=000\nopenrouter.error=curl: (28) Connection timed out after 5001 milliseconds\n"
-                .into(),
+            "openrouter.key=set\nopenrouter.curl_exit=28\nopenrouter.http=000\nopenrouter.error=curl: (28) Connection timed out after 5001 milliseconds\n".into(),
             "devtest-apple",
             Warn,
-            "not checked: couldn't reach OpenRouter (curl: (28) Connection timed out after 5001 mill…) — `arena pods test --keys apple` later",
+            "not checked (unreachable: curl: (28) Connection timed out…) — `arena pods test --keys apple`",
         ),
         (
-            "a 5xx",
-            or_lines(GOOD, 502, ""),
+            "a 200 whose body was cut off says nothing of the money",
+            or_lines(GOOD, 200, "").replace("curl_exit=0", "curl_exit=18") + "openrouter.error=curl: (18) transfer closed with 120 bytes remaining\n",
             "devtest-apple",
             Warn,
-            "not checked: OpenRouter answered HTTP 502 — `arena pods test --keys apple` later",
+            "not checked (unreachable: curl: (18) transfer closed with…) — `arena pods test --keys apple`",
         ),
+        ("a 5xx", or_lines(GOOD, 502, ""), "devtest-apple", Warn, "not checked (HTTP 502 from OpenRouter) — `arena pods test --keys apple`"),
         (
             "no curl",
             format!("openrouter.key=set\nopenrouter.fingerprint={}\nopenrouter.curl_exit=missing\n", fingerprint(GOOD)),
             "devtest-apple",
             Warn,
-            "not checked: no curl on the machine — `arena pods test --keys apple` later",
+            "not checked (no curl on the machine) — `arena pods test --keys apple`",
         ),
         (
             "a staff box: a note, never a verdict",
@@ -221,6 +217,63 @@ fn ai_key_verdicts() {
     }
 }
 
+/// Every verdict's command fits the table's NOTES cell (clipped at 110 characters, `ai_key: `
+/// included), for a long machine name too — a clipped command is no command. (A note after it,
+/// as a not-checked old key's, may be cut.)
+#[test]
+fn every_verdict_fits_the_notes_cell() {
+    let mut b = book();
+    let long = "devtest-lightning";
+    b.csv.insert(long.into(), fingerprint(GOOD));
+    b.owners.insert(format!("runpod:id-{long}"), "someone-with-a-long-name".into());
+    let or = [
+        "openrouter.key=missing\n".to_string(),
+        or_lines(GOOD, 401, ""),
+        or_lines(OLD, 401, ""),
+        or_lines(GOOD, 403, "openrouter.error=Key is disabled\n"),
+        or_lines(GOOD, 200, "openrouter.disabled=true\n"),
+        or_lines(GOOD, 200, "openrouter.limit=0.05\nopenrouter.limit_remaining=0\nopenrouter.limit_reset=monthly\n"),
+        or_lines(OLD, 200, "openrouter.limit=0.05\nopenrouter.limit_remaining=0\n"),
+        or_lines(GOOD, 200, "openrouter.limit=5\nopenrouter.limit_remaining=0.40\nopenrouter.limit_reset=weekly\n"),
+        or_lines(OLD, 200, "openrouter.limit=5\nopenrouter.limit_remaining=0.40\n"),
+        or_lines(OLD, 200, ""),
+        "openrouter.key=set\nopenrouter.curl_exit=0\nopenrouter.http=200\n".into(),
+        "openrouter.key=set\nopenrouter.curl_exit=28\nopenrouter.http=000\nopenrouter.error=curl: (28) Connection timed out after 5001 milliseconds\n".into(),
+        or_lines(OLD, 502, ""),
+    ];
+    let hf = [
+        "hf.key=missing\n".to_string(),
+        hf_lines(HF_GOOD, 401),
+        hf_lines("hf_old", 401),
+        hf_lines("hf_old", 200),
+        hf_lines(HF_GOOD, 429),
+        "hf.key=set\nhf.curl_exit=6\nhf.http=000\nhf.error=curl: (6) Could not resolve host: huggingface.co\n".into(),
+    ];
+    let mut listed = b.clone();
+    for state in [Listed::Paused, Listed::Gone, Listed::Live] {
+        listed.listed = Some([(long.to_string(), state)].into_iter().collect());
+        let c = ai(&facts(&or[1]), long, &listed);
+        assert!(command_fits(&format!("{}: {}", c.name, c.detail)), "{state:?}: {}", c.detail);
+    }
+    let mut own = b.clone();
+    own.hf_csv.insert(long.into(), fingerprint("hf_own"));
+    for lines in or.iter().chain(hf.iter()) {
+        for book in [&b, &own] {
+            for c in key_checks(&facts(lines), &pod(long), book) {
+                let cell = format!("{}: {}", c.name, c.detail);
+                assert!(command_fits(&cell), "{} chars: {cell}", cell.chars().count());
+            }
+        }
+    }
+}
+
+/// Whether `cell` keeps everything up to its last command (its closing backtick) within the
+/// NOTES clip (109 characters and `…`).
+fn command_fits(cell: &str) -> bool {
+    let upto = cell.rfind('`').map_or(cell.chars().count(), |i| cell[..=i].chars().count());
+    upto <= 109
+}
+
 /// OpenRouter's listing tells a paused key from a deleted one (from the machine both are a 401
 /// `User not found.`), for the keys CSV's key on the machine; an old key's fix stays the CSV's.
 #[test]
@@ -230,6 +283,8 @@ fn the_listing_names_a_rejected_keys_fix() {
     for (state, detail) in [
         (Listed::Paused, "paused on OpenRouter (HTTP 401) — `arena keys resume apple`"),
         (Listed::Gone, "rejected by OpenRouter (HTTP 401): deleted — `arena keys rotate apple --copy`"),
+        // Listed enabled, yet rejected: a resume that hasn't reached it yet (live: about a minute).
+        (Listed::Live, "rejected (HTTP 401), listed enabled: just resumed? Wait a minute — `arena pods test --keys apple`"),
     ] {
         b.listed = Some([("devtest-apple".to_string(), state)].into_iter().collect());
         let c = ai(&rejected, "devtest-apple", &b);
@@ -238,36 +293,40 @@ fn the_listing_names_a_rejected_keys_fix() {
     // An old key on the machine: whatever the listing says of the CSV's, copying that is the fix.
     b.listed = Some([("devtest-apple".to_string(), Listed::Paused)].into_iter().collect());
     let c = ai(&facts(&or_lines(OLD, 401, "")), "devtest-apple", &b);
-    assert!(c.detail.ends_with("an old key, not the keys CSV's (rotated or handed over since?) — `arena pods copy-keys apple`"), "{}", c.detail);
+    assert_eq!(c.detail, "rejected (HTTP 401): an old key, not the keys CSV's — `arena pods copy-keys apple`");
 }
 
-/// A keys CSV that's there but can't be read: keys are expected, never "none configured"; and a
+/// A keys CSV that's there but can't be read (here a directory where the file should be — an
+/// error whoever reads it, root included): keys are expected, never "none configured"; and a
 /// script that said it couldn't run (`error=`) is a FAIL, never two quiet Skips.
-#[cfg(unix)]
 #[test]
 fn an_unreadable_csv_or_a_script_error_is_never_a_quiet_pass() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("arena-keybook-unreadable-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("keys")).unwrap();
+    std::fs::create_dir_all(dir.join("keys/openrouter_api_keys.csv")).unwrap();
+    std::fs::create_dir_all(dir.join("keys/huggingface_api_keys.csv")).unwrap();
     std::fs::write(dir.join("config.env"), "MACHINE_NAME_PREFIX=devtest\n").unwrap();
-    let csv = dir.join("keys/openrouter_api_keys.csv");
-    std::fs::write(&csv, format!("devtest-apple,{GOOD}\n")).unwrap();
-    std::fs::set_permissions(&csv, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let readable = std::fs::read_to_string(&csv).is_ok(); // root reads it anyway
     let b = KeyBook::load(&Config::load(&dir.join("config.env")).unwrap(), None);
     let _ = std::fs::remove_dir_all(&dir);
-    if !readable {
-        assert!(b.openrouter && b.unreadable.as_deref().is_some_and(|e| e.starts_with("openrouter_api_keys.csv: ")), "{b:?}");
-        let c = ai(&facts(&or_lines(GOOD, 200, "")), "devtest-apple", &b);
-        assert_eq!(c.status, Status::Warn, "{c:?}");
-        assert!(c.detail.starts_with("ok, but not compared: openrouter_api_keys.csv: "), "{}", c.detail);
-        assert_eq!(ai(&facts(&or_lines(GOOD, 401, "")), "devtest-apple", &b).status, Status::Fail);
-    }
+    assert!(b.openrouter && b.any(), "{b:?}");
+    assert!(b.unreadable.as_deref().is_some_and(|e| e.starts_with("openrouter_api_keys.csv: ")), "{b:?}");
+    assert!(b.hf_unreadable.as_deref().is_some_and(|e| e.starts_with("huggingface_api_keys.csv: ")), "{b:?}");
+    let c = ai(&facts(&or_lines(GOOD, 200, "")), "devtest-apple", &b);
+    assert_eq!(c.status, Status::Warn, "{c:?}");
+    assert!(c.detail.starts_with("ok, but not compared: openrouter_api_keys.csv: "), "{}", c.detail);
+    assert_eq!(ai(&facts(&or_lines(GOOD, 401, "")), "devtest-apple", &b).status, Status::Fail);
+    // HF: a rejected token still FAILs; a working one isn't compared; a missing one can't be judged.
+    assert_eq!(hf(&facts(&hf_lines(HF_GOOD, 401)), "devtest-apple", &b).status, Status::Fail);
+    let c = hf(&facts(&hf_lines(HF_GOOD, 200)), "devtest-apple", &b);
+    assert!(c.status == Status::Warn && c.detail.starts_with("works, not compared: huggingface_api_keys.csv: "), "{c:?}");
+    assert_eq!(hf(&facts("hf.key=missing\n"), "devtest-apple", &b).status, Status::Warn);
     let policy = HealthPolicy { keys: Some(book()), ..HealthPolicy::default() };
     let h = PodHealth::keys_checked(&pod("devtest-apple"), facts("error=mktemp failed (is /tmp full or read-only?)\n"), &policy);
     assert_eq!(h.status, Status::Fail);
-    assert_eq!(h.checks.iter().map(|c| (c.name.as_str(), c.detail.as_str())).collect::<Vec<_>>(), [("script", "mktemp failed (is /tmp full or read-only?)")]);
+    assert_eq!(
+        h.checks.iter().map(|c| (c.name.as_str(), c.detail.as_str())).collect::<Vec<_>>(),
+        [("script", "mktemp failed (is /tmp full or read-only?)")]
+    );
 }
 
 /// Owners and fleets: a machine whose owner should have a key FAILs without one; a fleet with
@@ -278,10 +337,7 @@ fn who_should_have_a_key() {
     b.owners.insert("runpod:id-devtest-bloom".into(), "alice".into());
     let missing = facts("openrouter.key=missing\n");
     let c = ai(&missing, "devtest-bloom", &b);
-    assert_eq!(
-        (c.status, c.detail.as_str()),
-        (Status::Fail, "missing, and its owner (alice) should have one — `arena keys gen bloom --copy`")
-    );
+    assert_eq!((c.status, c.detail.as_str()), (Status::Fail, "missing, and its owner (alice) should have one — `arena keys gen bloom --copy`"));
     // No keys anywhere for this fleet: a short note, never a verdict.
     let none = KeyBook::new(&Config::parse("MACHINE_NAME_PREFIX=devtest\n"), &[], None, &[]);
     assert!(!none.any());
@@ -308,29 +364,23 @@ fn hf_token_verdicts() {
             hf_lines(HF_GOOD, 401),
             "devtest-apple",
             Fail,
-            "rejected by Hugging Face (HTTP 401) — a new HF_TOKEN in the config, then `arena pods copy-keys`",
+            "rejected (HTTP 401) — a new HF_TOKEN in the config, then `arena pods copy-keys`",
         ),
         (
             "an old token, rejected",
             hf_lines("hf_old", 401),
             "devtest-apple",
             Fail,
-            "rejected by Hugging Face (HTTP 401) — not the config's HF_TOKEN — `arena pods copy-keys apple`",
+            "rejected (HTTP 401): not the config's HF_TOKEN — `arena pods copy-keys apple`",
         ),
-        (
-            "an old token that works",
-            hf_lines("hf_old", 200),
-            "devtest-apple",
-            Warn,
-            "works, but not the config's HF_TOKEN — `arena pods copy-keys apple`",
-        ),
+        ("an old token that works", hf_lines("hf_old", 200), "devtest-apple", Warn, "works, but not the config's HF_TOKEN — `arena pods copy-keys apple`"),
         ("missing", "hf.key=missing\n".into(), "devtest-apple", Fail, "missing — `arena pods copy-keys apple`"),
         (
             "rate-limited",
             hf_lines(HF_GOOD, 429),
             "devtest-apple",
             Warn,
-            "not checked: Hugging Face is rate-limiting (HTTP 429) — `arena pods test --keys apple` later",
+            "not checked (Hugging Face is rate-limiting: HTTP 429) — `arena pods test --keys apple`",
         ),
         ("a staff box", "hf.key=missing\n".into(), "bob", Skip, "staff box: its token is the organisers' choice (none here)"),
     ];
@@ -352,10 +402,12 @@ fn hf_token_verdicts() {
     // Its own row's token rejected: the fix is that row (a new HF_TOKEN would change nothing for
     // it — the row is copied last), never the fleet's working token.
     let c = hf(&facts(&hf_lines("hf_own", 401)), "devtest-apple", &own);
-    assert_eq!(
-        c.detail,
-        "rejected by Hugging Face (HTTP 401) — a new token in its huggingface_api_keys.csv row, then `arena pods copy-keys apple`"
-    );
+    assert_eq!(c.detail, "rejected (HTTP 401) — renew its huggingface_api_keys.csv row, then `arena pods copy-keys apple`");
+    // The HF cell: `stale` only for a token shown to be another; one not compared is `?`.
+    let policy = HealthPolicy { keys: Some(b.clone()), ..HealthPolicy::default() };
+    let cell = |lines: &str| hf_token_cell(&PodHealth::keys_checked(&pod("devtest-apple"), facts(lines), &policy));
+    assert_eq!(cell(&hf_lines("hf_old", 200)).as_deref(), Some("stale"));
+    assert_eq!(cell("hf.key=set\nhf.curl_exit=0\nhf.http=200\n").as_deref(), Some("?"));
 }
 
 /// The fleet's own files: the keys CSVs beside the config, its HF_TOKEN, the spend ledger's
@@ -405,7 +457,7 @@ fn a_dead_key_fails_the_check_but_not_the_machine() {
     assert_eq!(h.key_status(), Some(Status::Fail));
     assert_eq!(h.failure_kind(), Some(FailureKind::Key));
     assert_eq!((failure_kind_of(AI_KEY, None), failure_kind_of(HF_TOKEN_CHECK, None)), (FailureKind::Key, FailureKind::Key));
-    assert!(h.notes().starts_with("ai_key: rejected (HTTP 401) — `arena keys resume apple` if paused"), "{}", h.notes());
+    assert!(h.notes().starts_with("ai_key: rejected (HTTP 401): paused? `arena keys resume apple`"), "{}", h.notes());
     // Never a bad host: no machine-level evidence, and a check that ran clears an old record.
     assert!(h.checks.iter().all(|c| !crate::health::condemns_machine(c, h.facts.as_ref().unwrap())));
     let h = PodHealth { host: Some("hetzner machine 1".into()), ..h };
@@ -463,7 +515,7 @@ fn the_reports_show_the_key() {
         "\
 NAME           RESULT  AI KEY      HF       NOTES
 devtest-apple  pass    $0.42 left  ok
-devtest-bloom  fail    rejected    missing  ai_key: rejected (HTTP 401) — `arena keys resume bloom` if paused, else `arena keys rotate bloom --copy`; hf_…
+devtest-bloom  fail    rejected    missing  ai_key: rejected (HTTP 401), and no keys-CSV row for it — `arena keys gen bloom --copy`; hf_token: missing — …
 
 1 pass, 0 warn, 1 fail
 AI key failure, not the machine: devtest-bloom — NOTES (or -v) says what to run; a machine is never replaced for its key.
@@ -630,7 +682,7 @@ fn the_script_asks_each_service_and_never_prints_a_secret() {
     let (stdout, _) = run_keys(&dead, &[("OPENROUTER_API_KEY", GOOD)], None);
     let h = PodHealth::keys_checked(&apple, parse_deep(&stdout), &policy);
     assert_eq!(h.checks[0].status, Status::Warn, "{stdout}\n{:#?}", h.checks);
-    assert!(h.checks[0].detail.starts_with("not checked: couldn't reach OpenRouter (curl: (7)"), "{}", h.checks[0].detail);
+    assert!(h.checks[0].detail.starts_with("not checked (unreachable: curl: (7)"), "{}", h.checks[0].detail);
 }
 
 /// Nothing the services or curl say can carry a secret out: a 401 whose message echoes the key
@@ -669,6 +721,24 @@ fn no_message_or_curl_config_leaks_a_secret() {
     let e = k.error.unwrap();
     assert!(e.contains("bad key") && e.chars().count() <= 160, "{e}");
     assert_eq!(f.hf.unwrap().error.as_deref(), Some("no such token [secret]"), "{stdout}");
+}
+
+/// A login environment that turns bash tracing on (an exported `SHELLOPTS=xtrace`, as a
+/// debugging session can leave behind) traces nothing of the script: it would print the keys.
+#[cfg(target_os = "linux")]
+#[test]
+fn inherited_tracing_prints_no_secret() {
+    if !(have("bash") && have("curl") && have("sha256sum") && have("base64") && have("timeout")) {
+        eprintln!("bash/curl/sha256sum/base64/timeout missing — skipping");
+        return;
+    }
+    let server = stub_server(vec![(GOOD, 200, key_answer("sk-or-v1-012...ood", "1", "1")), (HF_GOOD, 200, "{}".into())]);
+    let (stdout, stderr) = run_keys(&server, &[("OPENROUTER_API_KEY", GOOD), ("HF_TOKEN", HF_GOOD), ("SHELLOPTS", "xtrace")], None);
+    assert!(stderr.lines().any(|l| l.starts_with('+')), "tracing was on at the start (or the test proves nothing): {stderr}");
+    for secret in [GOOD, HF_GOOD] {
+        assert!(!stdout.contains(secret) && !stderr.contains(secret), "traced:\n{stderr}");
+    }
+    assert_eq!(parse_deep(&stdout).openrouter.and_then(|k| k.http), Some(200), "{stdout}");
 }
 
 /// The secret is on no command line: a `curl` first on PATH records its arguments and execs

@@ -80,9 +80,15 @@ pub struct KeyFacts {
 }
 
 impl KeyFacts {
-    /// The service answered 2xx.
+    /// The whole answer arrived: curl exited 0 (or didn't say). A 200 whose body was cut off
+    /// says the key exists, nothing of its money.
+    fn transferred(&self) -> bool {
+        self.curl_exit.as_deref().is_none_or(|c| c == "0")
+    }
+
+    /// The service answered 2xx, in full.
     fn accepted(&self) -> bool {
-        self.http.is_some_and(|h| (200..300).contains(&h))
+        self.transferred() && self.http.is_some_and(|h| (200..300).contains(&h))
     }
 
     /// The service turned the key away (401/403).
@@ -189,9 +195,12 @@ pub struct KeyBook {
     /// 401 `User not found.` (checked live 2026-11-02), and only the listing tells which fix it
     /// is. `None`: not read — a rejected key then names both fixes.
     pub listed: Option<BTreeMap<String, Listed>>,
-    /// A keys CSV that exists but couldn't be read (`openrouter_api_keys.csv: Permission
+    /// The OpenRouter keys CSV exists but couldn't be read (`openrouter_api_keys.csv: Permission
     /// denied`): its keys are then expected but can't be compared — never "no keys configured".
     pub unreadable: Option<String>,
+    /// The same for `huggingface_api_keys.csv`: whose HF token a machine should have can't be
+    /// said, so a token is expected, and a working one isn't compared.
+    pub hf_unreadable: Option<String>,
 }
 
 /// A keys-CSV key as OpenRouter's listing has it.
@@ -221,6 +230,7 @@ impl KeyBook {
             staff: cfg.machine_names.iter().filter(|e| is_absolute(e)).map(|e| qualify(&prefix, e)).collect(),
             listed: None,
             unreadable: None,
+            hf_unreadable: None,
             prefix,
         }
     }
@@ -231,24 +241,20 @@ impl KeyBook {
     /// can't be read holds no rows.
     pub fn load(cfg: &Config, ledger: Option<&Path>) -> Self {
         let dir = cfg.fleet_file(KEYS_DIR).path;
-        let mut unreadable = None;
-        let mut rows = |base: &str| {
+        // A file's rows; an error but "not there" is said (`Err`), never read as no rows.
+        let rows = |base: &str| -> (Vec<(String, String)>, Option<String>) {
             let file = format!("{base}_api_keys.csv");
             match std::fs::read_to_string(dir.join(&file)) {
-                Ok(t) => crate::apikeys::parse_csv(&t),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                Err(e) => {
-                    unreadable.get_or_insert(format!("{file}: {e}"));
-                    Vec::new()
-                }
+                Ok(t) => (crate::apikeys::parse_csv(&t), None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
+                Err(e) => (Vec::new(), Some(format!("{file}: {e}"))),
             }
         };
-        let (openrouter, hf) = (rows("openrouter"), rows("huggingface"));
+        let ((openrouter, or_err), (hf, hf_err)) = (rows("openrouter"), rows("huggingface"));
         let mut book = Self::new(cfg, &openrouter, cfg.get("HF_TOKEN"), &hf).with_owners(ledger);
-        if unreadable.is_some() {
-            book.openrouter = true;
-            book.unreadable = unreadable;
-        }
+        book.openrouter |= or_err.is_some();
+        book.unreadable = or_err;
+        book.hf_unreadable = hf_err;
         book
     }
 
@@ -261,7 +267,7 @@ impl KeyBook {
     /// Whether there's anything to hold a machine's keys to: OpenRouter keys, an owner who
     /// should have one, or an HF token.
     pub fn any(&self) -> bool {
-        self.openrouter || !self.owners.is_empty() || self.hf.is_some() || !self.hf_csv.is_empty()
+        self.openrouter || !self.owners.is_empty() || self.hf.is_some() || !self.hf_csv.is_empty() || self.hf_unreadable.is_some()
     }
 
     /// `apple` for `devtest-apple`: the machine as commands take it.
@@ -318,15 +324,19 @@ fn money(k: &KeyFacts) -> String {
 /// curl's error or the service's message, cut for a NOTES cell.
 fn short_why(s: &str) -> String {
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if s.chars().count() > 48 {
-        format!("{}…", s.chars().take(47).collect::<String>())
+    if s.chars().count() > 32 {
+        format!("{}…", s.chars().take(31).collect::<String>())
     } else {
         s
     }
 }
 
-// The details are kept short — the table's NOTES cell is clipped — with the command to run
-// last; `-v` and `--json` say the same, the facts in full.
+/// An old key on the machine: not the one the keys CSV has for it — from before a rotate (a
+/// handover is one) — whose fix is copying the CSV's on, whatever else is wrong with the old one.
+const OLD: &str = "an old key, not the keys CSV's";
+
+// Each detail is short enough for the table's NOTES cell (110 characters, `ai_key: ` included —
+// held by a test), the command to run last; `-v` and `--json` say the same, the facts in full.
 fn ai_key_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
     use Status::*;
     let name = AI_KEY;
@@ -344,86 +354,83 @@ fn ai_key_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
     }
     if k.set == Some(false) {
         return match (row, owner) {
-            (Some(_), _) => {
-                Check::new(name, Fail, format!("missing, though the keys CSV has one for it — `arena pods copy-keys {s}`"))
-            }
-            (None, Some(o)) => {
-                Check::new(name, Fail, format!("missing, and its owner ({o}) should have one — `arena keys gen {s} --copy`"))
-            }
-            (None, None) => Check::new(
-                name,
-                Warn,
-                format!("missing, nor in the keys CSV — `arena keys gen {s} --copy` if it should have one"),
-            ),
+            (Some(_), _) => Check::new(name, Fail, format!("missing, though the keys CSV has one for it — `arena pods copy-keys {s}`")),
+            (None, Some(o)) => Check::new(name, Fail, format!("missing, and its owner ({o}) should have one — `arena keys gen {s} --copy`")),
+            (None, None) => Check::new(name, Warn, format!("missing, nor in the keys CSV — `arena keys gen {s} --copy` if it should have one")),
         };
     }
-    // Not the key the keys CSV has for it: an old one, from before a rotate or a handover. The
-    // CSV's is then the one to put on — whatever else is wrong with the old one.
     let stale = matches!((row, k.fingerprint.as_deref()), (Some(want), Some(got)) if want != got);
     // A row to compare with, but no fingerprint from the machine (no hasher there): it works or
     // not, but whose key it is can't be said.
     let uncompared = row.is_some() && k.fingerprint.is_none();
     let copy = format!("`arena pods copy-keys {s}`");
-    const OLD: &str = "an old key, not the keys CSV's (rotated or handed over since?)";
-    let fix = |own: String| if stale { format!("{OLD} — {copy}") } else { own };
-    let unchecked = |what: String| {
-        let then = if stale { format!("; {OLD} — {copy}") } else { format!(" — `arena pods test --keys {s}` later") };
-        Check::new(name, Warn, format!("not checked: {what}{then}"))
+    // What's wrong, then the fix: the CSV's key when this one is old, else `own`.
+    let fail = |what: &str, own: String| {
+        if stale {
+            Check::new(name, Fail, format!("{what}: {OLD} — {copy}"))
+        } else {
+            Check::new(name, Fail, format!("{what} — {own}"))
+        }
+    };
+    // Couldn't ask: say so — after the fix when the key is an old one (a clipped cell then
+    // cuts the note, never the command).
+    let unchecked = |what: String| match stale {
+        true => Check::new(name, Warn, format!("{OLD} — {copy} (not checked: {what})")),
+        false => Check::new(name, Warn, format!("not checked ({what}) — `arena pods test --keys {s}`")),
     };
     if k.curl_exit.as_deref() == Some("missing") {
         return unchecked("no curl on the machine".into());
     }
     if k.rejected() {
         let h = k.http.unwrap_or_default();
+        if stale {
+            return fail(&format!("rejected (HTTP {h})"), String::new());
+        }
         // Paused or deleted: the answer is the same 401 for both. Which it is, the listing says
         // of the keys CSV's key — when that's the one on the machine.
         let said = k.error.as_deref().is_some_and(|e| e.to_ascii_lowercase().contains("disabled"));
-        let listed = (row.is_some() && !stale && !uncompared).then(|| book.listed.as_ref().and_then(|l| l.get(&pod.name))).flatten();
-        return match listed {
-            _ if said => Check::new(name, Fail, format!("paused on OpenRouter (HTTP {h}) — {}", fix(format!("`arena keys resume {s}`")))),
-            Some(Listed::Paused) => Check::new(name, Fail, format!("paused on OpenRouter (HTTP {h}) — `arena keys resume {s}`")),
-            Some(Listed::Gone) => {
-                Check::new(name, Fail, format!("rejected by OpenRouter (HTTP {h}): deleted — `arena keys rotate {s} --copy`"))
-            }
-            _ if stale => Check::new(name, Fail, format!("rejected by OpenRouter (HTTP {h}) — {OLD} — {copy}")),
-            _ => Check::new(
-                name,
-                Fail,
-                format!("rejected (HTTP {h}) — `arena keys resume {s}` if paused, else `arena keys rotate {s} --copy`"),
-            ),
+        let listed = (row.is_some() && !uncompared).then(|| book.listed.as_ref().and_then(|l| l.get(&pod.name))).flatten();
+        let what = match listed {
+            _ if said => format!("paused on OpenRouter (HTTP {h}) — `arena keys resume {s}`"),
+            Some(Listed::Paused) => format!("paused on OpenRouter (HTTP {h}) — `arena keys resume {s}`"),
+            Some(Listed::Gone) => format!("rejected by OpenRouter (HTTP {h}): deleted — `arena keys rotate {s} --copy`"),
+            // Listed enabled, yet turned away: a resume (or a new cap) takes a minute or so to
+            // reach the key endpoint (live, 2026-11-02).
+            Some(Listed::Live) => format!("rejected (HTTP {h}), listed enabled: just resumed? Wait a minute — `arena pods test --keys {s}`"),
+            // No row: arena's own `rotate`/`terminate --revoke-key` drop it, a pause never does.
+            None if row.is_none() => format!("rejected (HTTP {h}), and no keys-CSV row for it — `arena keys gen {s} --copy`"),
+            None => format!("rejected (HTTP {h}): paused? `arena keys resume {s}`, else `arena keys rotate {s} --copy`"),
         };
+        return Check::new(name, Fail, what);
     }
     if !k.accepted() {
-        return unchecked(match k.http.filter(|&h| h != 0) {
-            Some(h) => format!("OpenRouter answered HTTP {h}"),
-            None => format!("couldn't reach OpenRouter ({})", short_why(&k.unreached())),
+        return unchecked(match k.http.filter(|&h| h != 0 && k.transferred()) {
+            Some(h) => format!("HTTP {h} from OpenRouter"),
+            None => format!("unreachable: {}", short_why(&k.unreached())),
         });
     }
     let money = money(k);
     if k.disabled == Some(true) {
-        return Check::new(name, Fail, format!("paused on OpenRouter — {}", fix(format!("`arena keys resume {s}`"))));
+        return fail("paused on OpenRouter", format!("`arena keys resume {s}`"));
     }
     let raise = format!("`arena keys limit {s} +5`");
     if let (Some(_), Some(left)) = (k.limit, k.limit_remaining) {
         if left <= 0.0 {
-            return Check::new(name, Fail, format!("out of money ({money}) — {}", fix(raise)));
+            let what = if stale { "out of money".to_string() } else { format!("out of money ({money})") };
+            return fail(&what, raise);
         }
     }
     let low = matches!((k.limit, k.limit_remaining), (Some(l), Some(r)) if l > 0.0 && r < low_line(l));
     let ok = if money.is_empty() { "ok".to_string() } else { format!("ok, {money}") };
     match (stale, low) {
-        (false, false) if uncompared => {
-            Check::new(name, Warn, format!("works, but not compared with the keys CSV's (no sha256sum on the machine) — {copy} to be sure"))
+        (false, false) if uncompared => Check::new(name, Warn, format!("works, not compared (no sha256sum there) — {copy} to be sure")),
+        (false, false) if row.is_none() && book.unreadable.is_some() => {
+            Check::new(name, Warn, format!("{ok}, but not compared: {}", short_why(book.unreadable.as_deref().unwrap_or_default())))
         }
-        (false, false) if row.is_none() && book.unreadable.is_some() => Check::new(
-            name,
-            Warn,
-            format!("{ok}, but not compared: {}", book.unreadable.as_deref().unwrap_or_default()),
-        ),
         (false, false) if row.is_none() => Check::new(name, Pass, format!("{ok} (no keys-CSV row to compare)")),
         (false, false) => Check::new(name, Pass, ok),
         (false, true) => Check::new(name, Warn, format!("only {money} (<10% of its cap) — {raise}")),
-        (true, false) => Check::new(name, Warn, format!("works, but {OLD} — {copy}")),
+        (true, false) => Check::new(name, Warn, format!("works, but {OLD} (rotated since?) — {copy}")),
         (true, true) => Check::new(name, Warn, format!("only {money}, and {OLD} — {copy}")),
     }
 }
@@ -439,46 +446,57 @@ fn hf_token_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
         return Check::new(name, Skip, format!("staff box: its token is the organisers' choice ({})", k.seen()));
     }
     // The token it should have: its own row in huggingface_api_keys.csv (copied last, so it wins),
-    // else the fleet's HF_TOKEN — and where to put a new one.
+    // else the fleet's HF_TOKEN — and where a new one goes.
+    // An unreadable huggingface_api_keys.csv: a token is expected, but which one can't be said.
+    let unreadable = book.hf_unreadable.as_deref();
     let (want, own_row) = match (book.hf_csv.get(&pod.name), book.hf.as_ref()) {
-        (Some(row), _) => (row, true),
-        (None, Some(fleet)) => (fleet, false),
+        _ if unreadable.is_some() => (None, true),
+        (Some(row), _) => (Some(row), true),
+        (None, Some(fleet)) => (Some(fleet), false),
         (None, None) => return Check::new(name, Skip, format!("no HF_TOKEN configured for this fleet ({})", k.seen())),
     };
     let copy = format!("`arena pods copy-keys {s}`");
     if k.set == Some(false) {
-        return Check::new(name, Fail, format!("missing — {copy}"));
+        return match unreadable {
+            Some(e) if book.hf.is_none() => Check::new(name, Warn, format!("missing; who should have one can't be said: {}", short_why(e))),
+            _ => Check::new(name, Fail, format!("missing — {copy}")),
+        };
     }
-    let stale = k.fingerprint.as_deref().is_some_and(|got| got != want);
-    let uncompared = k.fingerprint.is_none();
+    let stale = matches!((want, k.fingerprint.as_deref()), (Some(want), Some(got)) if got != want);
+    let uncompared = want.is_none() || k.fingerprint.is_none();
     let old = if own_row { "not its huggingface_api_keys.csv row's" } else { "not the config's HF_TOKEN" };
-    let new_one = if own_row {
-        format!("a new token in its huggingface_api_keys.csv row, then {copy}")
-    } else {
-        "a new HF_TOKEN in the config, then `arena pods copy-keys`".to_string()
-    };
-    let unchecked = |what: String| {
-        let then = if stale { format!("; {old} — {copy}") } else { format!(" — `arena pods test --keys {s}` later") };
-        Check::new(name, Warn, format!("not checked: {what}{then}"))
+    let unchecked = |what: String| match stale {
+        true => Check::new(name, Warn, format!("{old} — {copy} (not checked: {what})")),
+        false => Check::new(name, Warn, format!("not checked ({what}) — `arena pods test --keys {s}`")),
     };
     if k.curl_exit.as_deref() == Some("missing") {
         return unchecked("no curl on the machine".into());
     }
     if k.rejected() {
-        let fix = if stale { format!("{old} — {copy}") } else { new_one };
-        return Check::new(name, Fail, format!("rejected by Hugging Face (HTTP {}) — {fix}", k.http.unwrap_or_default()));
+        let h = k.http.unwrap_or_default();
+        return Check::new(
+            name,
+            Fail,
+            match (stale, own_row) {
+                (true, _) => format!("rejected (HTTP {h}): {old} — {copy}"),
+                (false, true) => format!("rejected (HTTP {h}) — renew its huggingface_api_keys.csv row, then {copy}"),
+                (false, false) => format!("rejected (HTTP {h}) — a new HF_TOKEN in the config, then `arena pods copy-keys`"),
+            },
+        );
     }
     if !k.accepted() {
-        return unchecked(match k.http.filter(|&h| h != 0) {
-            Some(429) => "Hugging Face is rate-limiting (HTTP 429)".to_string(),
-            Some(h) => format!("Hugging Face answered HTTP {h}"),
-            None => format!("couldn't reach Hugging Face ({})", short_why(&k.unreached())),
+        return unchecked(match k.http.filter(|&h| h != 0 && k.transferred()) {
+            Some(429) => "Hugging Face is rate-limiting: HTTP 429".to_string(),
+            Some(h) => format!("HTTP {h} from Hugging Face"),
+            None => format!("unreachable: {}", short_why(&k.unreached())),
         });
     }
     if stale {
         Check::new(name, Warn, format!("works, but {old} — {copy}"))
+    } else if let (true, Some(e)) = (uncompared, unreadable) {
+        Check::new(name, Warn, format!("works, not compared: {}", short_why(e)))
     } else if uncompared {
-        Check::new(name, Warn, format!("works, but not compared (no sha256sum on the machine) — {copy} to be sure"))
+        Check::new(name, Warn, format!("works, not compared (no sha256sum there) — {copy} to be sure"))
     } else {
         Check::new(name, Pass, "accepted by Hugging Face")
     }
@@ -513,7 +531,8 @@ pub fn hf_token_cell(h: &PodHealth) -> Option<String> {
         _ if k.set == Some(false) => "missing".into(),
         _ if k.rejected() => "rejected".into(),
         _ if !k.accepted() => "?".into(),
-        _ if c.status == Status::Warn => "stale".into(),
+        _ if c.status == Status::Warn && c.detail.starts_with("works, but") => "stale".into(),
+        _ if c.status == Status::Warn => "?".into(),
         _ => "ok".into(),
     })
 }

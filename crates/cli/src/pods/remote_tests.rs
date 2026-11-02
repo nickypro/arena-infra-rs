@@ -3937,7 +3937,7 @@ async fn pods_test_keys_checks_each_machines_keys() {
         "\
 NAME           RESULT  AI KEY      HF  NOTES
 devtest-apple  pass    $4.97 left  ok
-devtest-bloom  fail    rejected    ok  ai_key: rejected (HTTP 401) — `arena keys resume bloom` if paused, else `arena keys rotate bloom --copy`
+devtest-bloom  fail    rejected    ok  ai_key: rejected (HTTP 401): paused? `arena keys resume bloom`, else `arena keys rotate bloom --copy`
 devtest-cloud  fail    missing     ok  ai_key: missing, though the keys CSV has one for it — `arena pods copy-keys cloud`
 
 1 pass, 0 warn, 2 fail
@@ -4011,7 +4011,7 @@ async fn pods_test_deep_shows_and_fails_on_a_dead_key() {
     assert!(report.starts_with("NAME           RESULT  GPUS         DRIVER     CUDA        NET  AI KEY      NOTES\n"), "{report}");
     assert!(report.contains("devtest-apple  pass    2×RTX A4000  580.65.06  13.0  47.1 MB/s  $4.97 left\n"), "{report}");
     assert!(
-        report.contains("devtest-bloom  fail    2×RTX A4000  580.65.06  13.0  47.1 MB/s  rejected    ai_key: rejected (HTTP 401) — `arena keys resume bloom` if paused, else `arena keys rotate bloom --copy`\n"),
+        report.contains("devtest-bloom  fail    2×RTX A4000  580.65.06  13.0  47.1 MB/s  rejected    ai_key: rejected (HTTP 401): paused? `arena keys resume bloom`, else `arena keys rotate bloom --copy`\n"),
         "{report}"
     );
     // An older script (cloud: no key facts) reads as not reported — never a FAIL.
