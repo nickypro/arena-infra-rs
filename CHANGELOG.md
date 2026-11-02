@@ -36,8 +36,20 @@ earlier).
   aren't in use or a note on them. `build` asks in one line what it makes and what it costs, and
   its dry run is that line. `prune` lists what goes and asks what it saves; what stays is `-v`'s.
 - **`plan check|show`**: the notes about what isn't wired yet moved to `-v`.
-- For each of these, `-v` prints what it printed before. `--json`, exit codes and the lines the
-  dashboard reads are the same.
+- **Backups and branches** (`pods backup`, `pull`, `set-branch`, `init-branches`, `restore`,
+  `baseline`, `backups`, `archive sync`/`status`, `cron install`/`remove`). The */15 cron's log
+  gets each failure with its fix and one line per run: `✓ git backup of 20 pods: 3 pushed, 16 no
+  changes, 1 on main/master` (and `✓ home copy of 20 pods → <dir>/w1d2 · 1.8G (12.0M new)` with
+  `--pull`). Each pod's `[3/20] ✓ …` line, the `⊘ skipped … non-cohort` line and the copy's sizes
+  need `-v`. A failed push or copy keeps all git, rsync and ssh said on its one line, then its
+  retry. A dry run says in one line what it would do; the backup script, each pod's switch
+  command and each rsync need `-v`. Prompts are one line (`Back up devtest-apple, devtest-bloom
+  (git push, then copy the home of each into …)? [y/N]`). `set-branch`/`init-branches` print a
+  pod's line only when it has news (not pushed first, what a `--hard` reset saved), then a tally.
+  `arena backups` drops `Running now: nothing`, the "Not covered"/"Restore" paragraphs and a note
+  repeated under two jobs. `archive status` shows only the rows that need something, then its
+  verdict. `archive sync` prints a line per label and one for big. `cron install` shows each
+  changed line as its schedule and command.
 - **Look, money and access** (`config check`/`which`, `teardown --check`, `offers`, `balance`,
   `spend`, `pods idle`/`jobs`/`test`, `copy-keys`, `keys`, `claude`, `update`): `config check` prints
   only what's wrong (✗, ‼, `?` rows with their `└` lines) and its `OK — …` line; `teardown --check`
@@ -51,6 +63,8 @@ earlier).
   the changelog's action-needed and config lines and each entry's heading. `-v` prints all of it
   as before. The verdict lines (`OK — …`, `ALL CLEAR`/`NOT CLEAR: …`), `--json` and the exit
   statuses are unchanged.
+- For each of these, `-v` prints what it printed before. `--json`, exit codes and the lines the
+  dashboard reads are the same.
 
 ## 2026-11-02 · arena 2.12: shorter output by default; `-v` shows the rest
 - **`pods up` and `pods create` say much less.** By default they print the plan in one line

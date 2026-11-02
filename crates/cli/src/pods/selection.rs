@@ -200,13 +200,19 @@ pub(crate) async fn select(provider: &dyn Provider, cfg: &Config, sel: &SelectAr
 /// out ([`split_cohort`], [`non_cohort_line`]). A selection that named pods comes back as it was,
 /// and so does every selection with `--include-non-cohort` (nothing left out, nothing said).
 pub(crate) fn cohort_only(cfg: &Config, sel: Selected, scope: CohortScope) -> Selected {
+    cohort_only_to(cfg, sel, scope, arena_core::out::To::Out)
+}
+
+/// [`cohort_only`], its line at a level: `pods backup` and `pods pull` — the cron's, every 15
+/// minutes — say it with `-v` only (the left-out pods are on purpose, never a failure).
+pub(crate) fn cohort_only_to(cfg: &Config, sel: Selected, scope: CohortScope, to: arena_core::out::To) -> Selected {
     if scope.include_non_cohort {
         return sel;
     }
     let naming = Naming::from_config(cfg);
     let (kept, left_out) = split_cohort(&naming, sel);
     if let Some(line) = non_cohort_line(naming.prefix, &left_out) {
-        say(&line);
+        say_to(to, &line);
     }
     kept
 }
@@ -265,9 +271,18 @@ pub(crate) fn non_cohort_line(prefix: &str, names: &[String]) -> Option<String> 
 /// Print a line the operator reads (a summary, a reminder, a per-pod result). Under test it's
 /// also kept, so a scenario test can see what was said ([`take_said`]).
 pub(crate) fn say(line: &str) {
+    say_to(arena_core::out::To::Out, line);
+}
+
+/// [`say`] at a level (docs/OUTPUT.md): stdout or stderr, always, only with `-v`, or only
+/// without it. Under test it's kept as `-v` shows it — every line but a `Brief` one — so a
+/// scenario test sees what the command said before the default output got shorter.
+pub(crate) fn say_to(to: arena_core::out::To, line: &str) {
     #[cfg(test)]
-    SAID.with(|n| n.borrow_mut().push(line.to_string()));
-    println!("{line}");
+    if to.shows(true) {
+        SAID.with(|n| n.borrow_mut().push(line.to_string()));
+    }
+    arena_core::out::emit(to, line);
 }
 
 #[cfg(test)]

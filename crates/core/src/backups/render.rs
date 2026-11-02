@@ -72,8 +72,16 @@ pub fn names_line(v: &[String], max: usize) -> String {
     names(v, max)
 }
 
-/// `arena backups`' whole text.
+/// `arena backups`' whole text, as `-v` shows it.
 pub fn text(s: &Status) -> String {
+    text_at(s, true)
+}
+
+/// `arena backups`' text: `verbose` (`-v`) is all of it; the default leaves out what a look at
+/// the backups doesn't need each time (docs/OUTPUT.md) — a job's note when the job above had the
+/// same one and neither is failing (the not-set-up fix two jobs share), `Running now: nothing`,
+/// and the paragraphs on what isn't covered and how to restore.
+pub fn text_at(s: &Status, verbose: bool) -> String {
     let now = s.generated_at;
     let mut out = String::new();
     out.push_str(&format!("Backups — {} · {}\n\n", s.prefix, clock(now)));
@@ -83,23 +91,28 @@ pub fn text(s: &Status) -> String {
         .map(|j| vec![j.health.mark().to_string(), j.name.to_string(), how_often(j), last_run(j, now), next_run(j, now)])
         .collect();
     let lines = table(&["", "JOB", "HOW OFTEN", "LAST RUN", "NEXT"], &[], &rows);
+    let mut said: Option<&String> = None;
     for (line, j) in lines.lines().zip(std::iter::once(None).chain(s.jobs.iter().map(Some))) {
         out.push_str(line);
         out.push('\n');
-        if let Some(why) = j.and_then(|j| j.why.as_ref()) {
-            out.push_str(&format!("    └ {why}\n"));
+        if let Some((j, why)) = j.and_then(|j| j.why.as_ref().map(|w| (j, w))) {
+            let failing = matches!(j.health, Health::Fail | Health::Warn | Health::Unknown);
+            if verbose || failing || said != Some(why) {
+                out.push_str(&format!("    └ {why}\n"));
+            }
+            said = Some(why);
         }
     }
     out.push('\n');
     match (&s.running_unknown, s.running.is_empty()) {
-        (Some(why), _) => out.push_str(&format!("Running now: unknown ({why})\n")),
-        (None, true) => out.push_str("Running now: nothing\n"),
+        (Some(why), _) => out.push_str(&format!("Running now: unknown ({why})\n\n")),
+        (None, true) if !verbose => {}
+        (None, true) => out.push_str("Running now: nothing\n\n"),
         (None, false) => {
             let parts: Vec<String> = s.running.iter().map(|r| r.since.map_or_else(|| r.what.clone(), |t| format!("{} since {}", r.what, ago(now, t)))).collect();
-            out.push_str(&format!("Running now: {}\n", parts.join(" · ")));
+            out.push_str(&format!("Running now: {}\n\n", parts.join(" · ")));
         }
     }
-    out.push('\n');
     if s.pods.is_empty() && !s.without_machine.is_empty() {
         out.push_str("Pods: no machine yet\n");
     } else if s.pods.is_empty() {
@@ -149,6 +162,9 @@ pub fn text(s: &Status) -> String {
     }
     for n in &s.notes {
         out.push_str(&format!("\nnote: {n}\n"));
+    }
+    if !verbose {
+        return out;
     }
     out.push_str("\nNot covered: ");
     out.push_str(&NOT_COVERED.join("; "));
