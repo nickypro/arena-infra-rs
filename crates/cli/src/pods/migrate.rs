@@ -1304,8 +1304,9 @@ pub(crate) async fn migrate_finish_on(
     // Without a proxy no sync ran above, and `SSH_CONFIG_FILE` (each pod's own endpoint) would
     // keep `-old`'s block: rewritten from the listing after the terminate.
     if !proxied {
+        // On stdout, as before: a warning at both levels, a rewrite with -v.
         for line in ssh_config_after(cfg, fleet, "migrate finish").await {
-            out!(if line.starts_with("warning:") { To::Err } else { To::Detail }, "{line}");
+            out!(if line.starts_with("warning:") { To::Out } else { To::Detail }, "{line}");
         }
     }
     remove_staging_for(&std::env::temp_dir(), &old.id);

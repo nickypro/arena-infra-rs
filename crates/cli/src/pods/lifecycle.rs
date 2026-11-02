@@ -602,13 +602,20 @@ pub(crate) async fn handle_start(
         started.into_iter().partition(|p| provider.restart_wipes_container_disk(p));
     let back = Comeback { setup, sync: !skip_proxy, settle, timeouts, reset: ContainerReset::Yes };
     let outcome = come_back(provider, remote, cfg, &fresh, back, keys_dir, "start").await;
+    // A VM that kept its disk is back once its endpoint has settled (and its forward is synced):
+    // nothing to set up — its READY line, as the dashboard's runs panel reads one (a `start` from
+    // there is of one pod, synced). One whose endpoint never settled is FAILED there, with the
+    // warning above it; one not waited for (`--skip-proxy`, or with pods to set up) has only its
+    // `[started]` line.
     if !kept.is_empty() && fresh.is_empty() && !skip_proxy {
-        settled_sync(cfg, provider, &kept, settle, "start").await;
-    }
-    // A VM that kept its disk is back once it's started (and its forward synced): nothing to set
-    // up — its READY line, as the dashboard's runs panel reads one.
-    for p in &kept {
-        out!(Brief, "{}", ready_line(&p.name, since.elapsed(), Some("disk kept")));
+        let (_, dead) = settled_sync(cfg, provider, &kept, settle, "start").await;
+        for p in &kept {
+            if dead.contains(&p.id) {
+                out!(ErrBrief, "{}", failed_line(&p.name, "waiting for SSH", "its endpoint never settled", "arena proxy apply, once it answers"));
+            } else {
+                out!(Brief, "{}", ready_line(&p.name, since.elapsed(), Some("disk kept")));
+            }
+        }
     }
     if !failed.is_empty() {
         if let Err(e) = &outcome {
@@ -1746,8 +1753,9 @@ fn unrouted<'a>(cfg: &Config, sync: &ProxySync, pods: &'a [arena_core::Pod]) -> 
 /// old endpoint). Waits for each pod to hold one endpoint for `settle.stable_secs`
 /// (bounded), syncs, and if a pod's forward still isn't routed to it, waits for THAT pod
 /// again and syncs once more — not for one whose first wait already ran out (it has no
-/// endpoint to wait for). One still not routed is named with the command to run later.
-async fn settled_sync(cfg: &Config, provider: &dyn Provider, pods: &[arena_core::Pod], settle: SettleWait, why: &str) -> ProxySync {
+/// endpoint to wait for). One still not routed is named with the command to run later. Also
+/// returns the ids of the pods whose first wait ran out (said as a warning).
+async fn settled_sync(cfg: &Config, provider: &dyn Provider, pods: &[arena_core::Pod], settle: SettleWait, why: &str) -> (ProxySync, Vec<String>) {
     /// Waits for each of `pods`; the ids whose wait ran out.
     async fn wait(provider: &dyn Provider, pods: &[&arena_core::Pod], settle: SettleWait) -> Vec<String> {
         let mut timed_out = Vec::new();
@@ -1776,7 +1784,7 @@ async fn settled_sync(cfg: &Config, provider: &dyn Provider, pods: &[arena_core:
             missing.join(", ")
         );
     }
-    sync
+    (sync, dead)
 }
 
 #[cfg(test)]

@@ -60,7 +60,8 @@ Stop devtest-alpha (discards its container disk and the work on it); devtest-del
 
 /// start: a stopped GPU pod comes back as a fresh image, set up again, and ends in a READY line
 /// (the dashboard's runs panel reads it as the pod's end — before, a `start` from there ended
-/// "unfinished"); a VM that kept its disk is READY once started.
+/// "unfinished"); a VM that kept its disk is READY once its endpoint settled (started alone, as
+/// the dashboard starts one: beside pods to set up, it isn't waited for).
 #[tokio::test(start_paused = true)]
 async fn start_ends_each_pod_ready() {
     let dir = tmpdir("out-start");
@@ -93,6 +94,14 @@ async fn start_ends_each_pod_ready() {
     assert!(out[1].contains("[1/1] ✓ devtest-alpha\n\nDone: 1 provisioned, 0 failed.\n"), "-v:\n{}", out[1]);
     assert!(!out[1].contains("READY"), "-v says what it said before:\n{}", out[1]);
 
+    let f = stopped();
+    let delta = f.pods.lock().unwrap()[3].clone();
+    let opts = RestartOpts { yes: true, ..Default::default() };
+    let got = rendered(false, &[], handle_start(&f, Arc::new(FakeRemote::new()), &cfg, &named(&[delta]), opts, FAST, &keys_dir)).await;
+    assert_eq!(got, "[started] devtest-delta
+[devtest-delta] READY after 0s · disk kept
+");
+
     let (quiet, loud) = both(&["start", "alpha", "--dry-run"], &cfg, &[], stopped).await;
     assert_eq!(quiet, "[dry-run] would start devtest-alpha (a fresh image, set up again)\n");
     let want = format!(
@@ -110,7 +119,6 @@ Start devtest-alpha (a fresh image, set up again); devtest-delta (disk kept) —
 [devtest-alpha] setup…
 [devtest-alpha] setup ✓ (0s)
 [devtest-alpha] READY after 0s
-[devtest-delta] READY after 0s · disk kept
 "#;
 
 /// restart: a line before the prompt (the pod, what goes, that it's set up again) and the
@@ -592,3 +600,72 @@ Proceed? [y/N] y
 ✓ Terminated devtest-alpha-old. Migration of devtest-alpha complete.
 "#;
 
+
+/// Review r1: a VM that kept its disk is READY only once its endpoint settled; one that never
+/// did is FAILED (its warning above it), never READY — the exit is as before (0).
+#[tokio::test]
+async fn a_started_vm_whose_endpoint_never_settles_is_not_ready() {
+    let dir = tmpdir("out-start-dead");
+    let cfg = cfg(&dir.0);
+    let f = fleet();
+    {
+        let mut pods = f.pods.lock().unwrap();
+        pods[3].status = "off".into();
+        (pods[3].ssh_ip, pods[3].ssh_port) = (None, None);
+    }
+    let delta = f.pods.lock().unwrap()[3].clone();
+    let settle = SettleWait { stable_secs: 0, timeout_secs: 1, poll: Duration::from_millis(50) };
+    let opts = RestartOpts { yes: true, ..Default::default() };
+    let got = rendered(false, &[], handle_start(&f, Arc::new(FakeRemote::new()), &cfg, &named(&[delta]), opts, settle, "/nonexistent")).await;
+    assert!(got.starts_with("[started] devtest-delta\nwarning: devtest-delta has no settled SSH endpoint ("), "{got}");
+    assert!(got.contains("\n[devtest-delta] FAILED waiting for SSH: its endpoint never settled (retry: arena proxy apply, once it answers)\n"), "{got}");
+    assert!(!got.contains("READY") && !got.contains("Error"), "{got}");
+}
+
+/// Review r1: `replace --skip-proxy` says so before it asks (both questions) and in its dry run:
+/// the old pod may go while the proxy still leads to it.
+#[tokio::test(start_paused = true)]
+async fn a_replace_that_skips_the_proxy_says_so_up_front() {
+    let dir = tmpdir("out-replace-skip");
+    let cfg = keyed_cfg(&dir.0, "");
+    let keys_dir = dir.0.display().to_string();
+    let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
+    let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
+    let skip = "; the proxy left alone: `arena proxy apply` yourself)";
+    for dry_run in [true, false] {
+        let (f, remote) = replace_fixture();
+        let opts = ReplaceOpts { keep_old: false, skip_proxy: true, dry_run, yes: false, force: true };
+        let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: &keys_dir, balance: None, source: crate::pods::adopt::Source::Create, spares: None, volumes: None };
+        let got = rendered(false, &["y", "y"], replace_on(remote, &f, &cfg, &f, "r-alpha".into(), "devtest-alpha".into(), job)).await;
+        if dry_run {
+            assert!(got.contains(&format!("[dry-run] would replace devtest-alpha (its home copied onto the new one, swapped in; the old one terminated{skip}\n")), "{got}");
+        } else {
+            assert!(got.contains(&format!("Replace devtest-alpha (its home copied onto the new one, swapped in; the old one terminated{skip}? [y/N] y\n")), "{got}");
+            assert!(got.contains(&format!("(devtest-alpha → devtest-alpha-old{skip}? [y/N] y\n")), "{got}");
+        }
+    }
+}
+
+/// Review r1: `migrate finish` without a proxy says the SSH config file's warning on stdout, as
+/// before (a `-v` log of stdout keeps it), at both levels.
+#[tokio::test]
+async fn finish_says_the_ssh_config_warning_on_stdout() {
+    let dir = tmpdir("out-finish-sshconfig");
+    std::fs::write(dir.0.join("not-a-dir"), "").unwrap();
+    let cfg = Config::parse(&format!(
+        "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(alpha bravo)\nSSH_CONFIG_FILE={}\n",
+        dir.0.join("not-a-dir/arena.conf").display()
+    ));
+    for verbose in [false, true] {
+        let f = Fleet::new(vec![
+            pod("r-bravo-new", "devtest-bravo", "runpod", Some(("10.0.0.3", 22009))),
+            pod("r-bravo", "devtest-bravo-old", "runpod", Some(("10.0.0.1", 22002))),
+        ]);
+        let listed = f.pods.lock().unwrap().clone();
+        let cap = arena_core::out::capture(verbose);
+        migrate_finish_on(&FakeRemote::new(), &f, &cfg, &f, "devtest-bravo", &listed, FinishOpts { yes: true, ..Default::default() }).await.unwrap();
+        let warned: Vec<(arena_core::out::To, String)> = cap.lines().into_iter().filter(|(_, l)| l.starts_with("warning: [ssh-config]")).collect();
+        assert_eq!(warned.len(), 1, "{:?}", cap.lines());
+        assert_eq!(warned[0].0, arena_core::out::To::Out, "stdout at both levels: {warned:?}");
+    }
+}

@@ -950,7 +950,9 @@ pub(crate) async fn replace_on(
     }
     // What happens, in the default output's question and dry run.
     let then = if keep_old { format!("{old_name} kept") } else { "the old one terminated".to_string() };
-    let brief = format!("{} (its home copied onto the new one, swapped in; {then})", out::bold(&canonical));
+    // --skip-proxy is said up front: the old pod may go while the proxy still leads to it.
+    let proxy = if skip_proxy { "; the proxy left alone: `arena proxy apply` yourself" } else { "" };
+    let brief = format!("{} (its home copied onto the new one, swapped in; {then}{proxy})", out::bold(&canonical));
 
     if dry_run {
         for r in [&locked, &stopped, &reaping, &bad_floor, &busy, &someones].into_iter().flatten() {
@@ -1124,7 +1126,7 @@ pub(crate) async fn replace_on(
             "{new_name} is built, copied and verified.{warn} Swap it in as {canonical} now? \
              (renames {canonical} -> {old_name}, then {new_name} -> {canonical})"
         ),
-        &format!("{} is built, copied and checked.{warn} Swap it in as {} ({canonical} → {old_name})?", out::bold(&new_name), out::bold(&canonical)),
+        &format!("{} is built, copied and checked.{warn} Swap it in as {} ({canonical} → {old_name}{proxy})?", out::bold(&new_name), out::bold(&canonical)),
     )? {
         out!(
             Err,
