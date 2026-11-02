@@ -6,6 +6,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arena_core::out;
+use arena_core::out::To;
 use arena_core::provider::Provider;
 use arena_core::spare::{self, SpareCloud};
 use arena_core::{Config, Pod, PodSpec};
@@ -13,7 +15,7 @@ use clap::Subcommand;
 
 use crate::pods::create::{create_extra, pin_vm_image};
 use crate::pods::lock::print_would_refuse;
-use crate::{confirm, Interrupt};
+use crate::{confirm_brief, Interrupt};
 
 #[derive(Subcommand)]
 pub(crate) enum SpareCmd {
@@ -91,9 +93,9 @@ pub(crate) async fn spare_on(cmd: SpareCmd, cfg: &Config, provider: &dyn Provide
             if json {
                 println!("{}", serde_json::to_string_pretty(&all)?);
             } else if all.is_empty() {
-                println!("no spares (make some: `arena pods spare up 2 --server-type cx43 --keep-trying`)");
+                out!(Out, "no spares (make some: `arena pods spare up 2 --server-type cx43 --keep-trying`)");
             } else {
-                print!("{}", spare::render(&all, now));
+                spare::render(&all, now).lines().for_each(|l| out!(Out, "{l}"));
             }
             Ok(())
         }
@@ -119,16 +121,20 @@ pub(crate) async fn spare_on(cmd: SpareCmd, cfg: &Config, provider: &dyn Provide
                 out
             };
             if chosen.is_empty() {
-                println!("no spares to delete.");
+                out!(Out, "no spares to delete.");
                 return Ok(());
             }
             let list = chosen.iter().map(|p| format!("{} (id={})", p.name, p.id)).collect::<Vec<_>>().join(", ");
+            let names: Vec<&str> = chosen.iter().map(|p| p.name.as_str()).collect();
+            let brief = format!("{} (irreversible; nothing of anyone's is on a spare)", crate::pods::setup::all_names(&names));
             if dry_run {
-                println!("[dry-run] would delete {} spare(s): {list}\n[dry-run] nothing changed.", chosen.len());
+                out!(Detail, "[dry-run] would delete {} spare(s): {list}\n[dry-run] nothing changed.", chosen.len());
+                out!(Brief, "[dry-run] would delete {brief}");
                 return Ok(());
             }
-            if !confirm(yes, &format!("Delete {} spare(s): {list}? (irreversible; nothing of anyone's is on a spare)", chosen.len()))? {
-                println!("aborted.");
+            let what = format!("Delete {} spare(s): {list}? (irreversible; nothing of anyone's is on a spare)", chosen.len());
+            if !confirm_brief(yes, &what, &format!("Delete {brief}?"))? {
+                out!(Out, "aborted.");
                 return Ok(());
             }
             // Under the claim lock, from a fresh look: one a move took while this waited at its
@@ -139,14 +145,18 @@ pub(crate) async fn spare_on(cmd: SpareCmd, cfg: &Config, provider: &dyn Provide
             let mut failed = Vec::new();
             for p in &chosen {
                 if !still_spare(&now_spares, p) {
-                    eprintln!("[kept] {} (id={}): no longer a spare (taken by a move meanwhile?) — not deleted", p.name, p.id);
+                    out!(Err, "[kept] {} (id={}): no longer a spare (taken by a move meanwhile?) — not deleted", p.name, p.id);
                     failed.push(p.name.clone());
                     continue;
                 }
                 match arena_core::retry::retrying(&policy, || provider.terminate_pod(&p.id)).await {
-                    Ok(()) => println!("[deleted] {} (id={})", p.name, p.id),
+                    Ok(()) => {
+                        out!(Detail, "[deleted] {} (id={})", p.name, p.id);
+                        out!(Brief, "[deleted] {}", out::bold(&p.name));
+                    }
                     Err(e) => {
-                        eprintln!("[failed] {}: {e}", p.name);
+                        out!(ErrDetail, "[failed] {}: {e}", p.name);
+                        out!(ErrBrief, "{}", crate::pods::lifecycle::failed_line(&p.name, "delete", &out::reason(&e), &format!("arena pods spare down {}", p.name)));
                         failed.push(p.name.clone());
                     }
                 }
@@ -193,7 +203,8 @@ pub(crate) async fn spare_on(cmd: SpareCmd, cfg: &Config, provider: &dyn Provide
             } else {
                 format!("retried every {}s for up to {} min while no location has room", rounds.every.as_secs(), rounds.window.as_secs() / 60)
             };
-            println!(
+            out!(
+                Detail,
                 "spare up {count}: {} — {}\n  each: {}\n  {}; labelled {}={} (no one's machine: no proxy, backup or keys)",
                 names.join(", "),
                 opts.locations.describe(),
@@ -202,43 +213,64 @@ pub(crate) async fn spare_on(cmd: SpareCmd, cfg: &Config, provider: &dyn Provide
                 spare::SPARE_LABEL,
                 spare::label_value(&prefix)
             );
-            if !have.is_empty() {
-                println!("  ({} spare(s) already: `arena pods spare list`)", have.len());
+            // By default what each one is, in a line (several options: the compact table).
+            if req.is_single() {
+                out!(Brief, "{}", crate::pods::placement::spec_brief(provider, &base, Some(&plan)));
+            } else {
+                crate::pods::placement::plan_brief(&plan).iter().for_each(|l| out!(Brief, "{l}"));
             }
+            if !have.is_empty() {
+                out!(Out, "  ({} spare(s) already: `arena pods spare list`)", have.len());
+            }
+            let wait = if rounds.window.is_zero() { String::new() } else { format!(", retrying up to {}m", rounds.window.as_secs() / 60) };
+            let bill = if names.len() == 1 { "it bills" } else { "they bill" };
+            let brief = format!("{} ({bill} until `arena pods spare down`{wait})", crate::pods::setup::all_names(&names));
             if dry_run {
                 if plan.options.is_empty() {
                     print_would_refuse("nothing to create: no option left to try");
                 }
-                println!("[dry-run] nothing created.");
+                out!(Detail, "[dry-run] nothing created.");
+                out!(Brief, "[dry-run] would create {brief}");
                 return Ok(());
             }
-            if !confirm(yes, &format!("Create {count} spare(s) ({})? They bill until `arena pods spare down`.", names.join(", ")))? {
-                println!("aborted.");
+            let question = format!("Create {count} spare(s) ({})? They bill until `arena pods spare down`.", names.join(", "));
+            if !confirm_brief(yes, &question, &format!("Create {brief}?"))? {
+                out!(Out, "aborted.");
                 return Ok(());
             }
-            let mut show = |p: &arena_core::placement::Progress| {
-                if p.is_created() {
-                    println!("  {}", p.line());
+            // `-v` says each event as before (indented); the default, `up`'s short lines.
+            let say = |to: To, line: &str| {
+                if to.shows(true) {
+                    out::emit(to, &format!("  {line}"));
                 } else {
-                    eprintln!("  {}", p.line());
+                    out::emit(to, line);
                 }
             };
+            let _rounds = out::progress_guard(crate::pods::placement::ROUNDS);
+            let mut show = |p: &arena_core::placement::Progress| crate::pods::placement::say_progress(p, &say, crate::pods::placement::ROUNDS);
             let run = arena_core::placement::place(provider, &base, &names, &plan, rounds, None, || interrupt.wait(), &mut show).await;
             let made = run.created.clone();
             for p in &made {
-                println!("[created] {} id={}{}", p.name, p.id, p.location.as_deref().map(|l| format!(" in {l}")).unwrap_or_default());
+                out!(Detail, "[created] {} id={}{}", p.name, p.id, p.location.as_deref().map(|l| format!(" in {l}")).unwrap_or_default());
             }
             if let Ok(all) = spares.spares().await {
                 crate::spend::SpendCtx::from_config(cfg).spares(provider.name(), &all, arena_core::snapshot::unix_now());
             }
             let missing = names.len() - made.len();
             if !no_wait && !made.is_empty() {
-                println!("waiting for {} to come up…", made.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "));
+                let waiting = made.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ");
+                out!(Detail, "waiting for {waiting} to come up…");
+                let _line = out::progress_guard("spares");
+                if out::live() {
+                    out::progress("spares", Some(&format!("waiting for {waiting} to come up…")));
+                } else {
+                    out!(Brief, "waiting for {waiting} to come up…");
+                }
                 let ready = wait_ready(spares, &made, READY_WAIT).await;
                 for p in &made {
                     match ready.iter().find(|r| r.id == p.id) {
-                        Some(r) => println!("[ready] {} {} ({})", r.name, r.ssh_ip.as_deref().unwrap_or("?"), r.gpu_type.as_deref().unwrap_or("?")),
-                        None => eprintln!("[not up yet] {} — `arena pods spare list` shows it", p.name),
+                        Some(r) => out!(Out, "[ready] {} {} ({})", r.name, r.ssh_ip.as_deref().unwrap_or("?"), r.gpu_type.as_deref().unwrap_or("?")),
+                        None => out!(Err, "[not up yet] {} — `arena pods spare list` shows it", p.name),
                     }
                 }
             }
@@ -249,7 +281,7 @@ pub(crate) async fn spare_on(cmd: SpareCmd, cfg: &Config, provider: &dyn Provide
                     made.len()
                 );
             }
-            println!("take one with `arena pods migrate copy <name> --onto-spare` (or `pods replace <name> --onto-spare`).");
+            out!(Detail, "take one with `arena pods migrate copy <name> --onto-spare` (or `pods replace <name> --onto-spare`).");
             Ok(())
         }
     }

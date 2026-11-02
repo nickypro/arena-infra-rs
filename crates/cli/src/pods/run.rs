@@ -8,7 +8,8 @@ use arena_core::remote::Remote;
 use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
-use crate::confirm;
+use crate::confirm_brief;
+use arena_core::out;
 use crate::pods::exec_each_pod;
 use crate::pods::selection::Selected;
 
@@ -91,7 +92,7 @@ pub(crate) async fn handle_run(
     if targets.is_empty() && !missing.is_empty() { anyhow::bail!("no SSH endpoint for running pods: {}", missing.join(", ")); }
     targets.sort_by(|a, b| a.0.cmp(&b.0));
     if targets.is_empty() {
-        println!("(no pods with an SSH endpoint)");
+        out!(Out, "(no pods with an SSH endpoint)");
         return Ok(());
     }
 
@@ -102,21 +103,33 @@ pub(crate) async fn handle_run(
     let remote_cmd = arena_core::ssh::login_shell_wrap(cmd, Some(conda_env));
 
     let names: Vec<&str> = targets.iter().map(|(n, _)| n.as_str()).collect();
+    // By default the command and every pod in a line; the shell it's wrapped in is `-v`'s.
+    let brief = format!("`{cmd}` on {}", crate::pods::setup::all_names(&names));
     if dry_run {
-        println!("{}", run_preview(true, cmd, &remote_cmd, &names, timeout));
+        out!(Detail, "{}", run_preview(true, cmd, &remote_cmd, &names, timeout));
+        out!(Brief, "[dry-run] would run {brief}");
         if !missing.is_empty() { anyhow::bail!("no SSH endpoint for running pods: {}", missing.join(", ")); }
         return Ok(());
     }
-    if confirm_needed && !confirm(yes, &run_preview(false, cmd, &remote_cmd, &names, timeout))? {
-        println!("aborted.");
+    if confirm_needed && !confirm_brief(yes, &run_preview(false, cmd, &remote_cmd, &names, timeout), &format!("Run {brief}?"))? {
+        out!(Out, "aborted.");
         return Ok(());
     }
 
     let results = run_fleet(&remote, targets, &remote_cmd, timeout).await;
     let (lines, bad) = render_run(&results, compact);
     let bad = bad + missing.len();
-    for line in lines {
-        println!("{line}");
+    // The pods' output as before; its last line (the tally) only with -v, or — by default — when
+    // there are several pods (one pod's block says it all; a failure ends in the error).
+    let (tally, blocks) = lines.split_last().map_or((None, &lines[..]), |(t, b)| (Some(t), b));
+    for line in blocks {
+        out!(Out, "{line}");
+    }
+    if let Some(t) = tally {
+        out!(Detail, "{t}");
+        if results.len() > 1 {
+            out!(Brief, "{t}");
+        }
     }
     // Propagate partial failure to the exit code, like the mutating sibling handlers — so
     // a scripted `pods test` / `pods run` can't pass while the command failed on pods.

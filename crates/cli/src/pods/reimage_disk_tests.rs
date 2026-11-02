@@ -296,6 +296,10 @@ async fn reimage_disk_says_the_size_and_the_wipe_in_one_line_and_the_host_withou
         let alpha = one(&f, "devtest-alpha");
         let run = handle_reimage(&f, idle_remote(), &cfg, &alpha, None, resize, false, opts, FAST, &keys_dir);
         let got = rendered(verbose, &["y"], run).await;
+        // What follows a reimage that went through is reimage's own, as without a resize.
+        let after = "[reimaged] devtest-alpha\n(--no-setup: devtest-alpha back as the bare image — `arena pods setup devtest-alpha` \
+                     restores ~/.name, the git remote and keys)\n";
+        let want = if dry_run { want } else { format!("{want}{after}") };
         assert_eq!(got, want, "verbose {verbose}, dry run {dry_run}");
         assert_eq!(f.calls().len(), usize::from(!dry_run), "{:?}", f.calls());
     }
@@ -311,7 +315,7 @@ async fn reimage_disk_says_the_size_and_the_wipe_in_one_line_and_the_host_withou
         let line = if verbose {
             format!("[failed] devtest-alpha: {}", Error::provider(NO_ROOM))
         } else {
-            "[devtest-alpha] not reimaged with a 500 GB disk: its host hasn't the room for it (instead: arena pods replace devtest-alpha --disk 500)".to_string()
+            "[devtest-alpha] FAILED reimage: its host hasn't the room for a 500 GB disk (instead: arena pods replace devtest-alpha --disk 500)".to_string()
         };
         assert!(got.contains(&format!("\n{line}\n")), "verbose {verbose}:\n{got}");
         assert!(got.ends_with("Error: 1 pod(s) failed to reimage: devtest-alpha\n"), "{got}");

@@ -87,13 +87,19 @@ pub(crate) fn volume_refusal(name: &str, now_gb: u32, resize: Resize) -> Option<
 /// What the prompt and the dry run add after the names: ` with a 500 GB disk`, ` with 500 GB
 /// disks and 100 GB volumes`; empty when nothing is resized. Pure.
 pub(crate) fn words(resize: Resize, pods: usize) -> String {
-    let part = |gb: u32, what: &str| if pods == 1 { format!("{} {gb} GB {what}", article(gb)) } else { format!("{gb} GB {what}s") };
-    let parts: Vec<String> = [resize.disk_gb.map(|gb| part(gb, "disk")), resize.volume_gb.map(|gb| part(gb, "volume"))].into_iter().flatten().collect();
-    if parts.is_empty() {
+    let sizes = sizes_said(resize, pods);
+    if sizes.is_empty() {
         String::new()
     } else {
-        format!(" with {}", parts.join(" and "))
+        format!(" with {sizes}")
     }
+}
+
+/// The sizes, said: `a 500 GB disk`, `500 GB disks and 100 GB volumes`; empty for none. Pure.
+fn sizes_said(resize: Resize, pods: usize) -> String {
+    let part = |gb: u32, what: &str| if pods == 1 { format!("{} {gb} GB {what}", article(gb)) } else { format!("{gb} GB {what}s") };
+    let parts: Vec<String> = [resize.disk_gb.map(|gb| part(gb, "disk")), resize.volume_gb.map(|gb| part(gb, "volume"))].into_iter().flatten().collect();
+    parts.join(" and ")
 }
 
 /// `a` or `an` before `n` as it's read: an 8, 11, 18, 80–89, 800–899, 8000, 11000 … GB disk. Pure.
@@ -127,17 +133,18 @@ pub(crate) fn flags(resize: Resize) -> String {
 }
 
 /// The one line for a resize the host hadn't the room for — the pod is left as it was — with
-/// the command that makes a new pod instead (`pods replace`, which takes the same sizes); `None`
-/// for any other failure. Pure (but for the styles).
+/// the command that makes a new pod instead (`pods replace`, which takes the same sizes), as
+/// reimage's other failures read (`[NAME] FAILED reimage: …`); `None` for any other failure.
+/// Pure (but for the styles).
 pub(crate) fn no_room(name: &str, resize: Resize, e: &arena_core::Error) -> Option<String> {
     if !resize.any() || !host_lacks_room(&e.to_string()) {
         return None;
     }
-    let what = words(resize, 1);
     Some(format!(
-        "[{}] {}: its host hasn't the room for it (instead: arena pods replace {name}{})",
+        "[{}] {} reimage: its host hasn't the room for {} (instead: arena pods replace {name}{})",
         out::bold(name),
-        out::red(format!("not reimaged{what}")),
+        out::red("FAILED"),
+        sizes_said(resize, 1),
         flags(resize)
     ))
 }

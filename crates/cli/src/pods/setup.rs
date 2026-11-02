@@ -321,8 +321,43 @@ fn step_preview(step: &arena_core::setup::ProvisionStep, target: &arena_core::ss
     }
 }
 
+/// [`setup_pods`], failing — after the rest are set up — when any pod wasn't.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_setup(
+    remote: std::sync::Arc<dyn arena_core::remote::Remote>,
+    cfg: &Config,
+    apply: bool,
+    force: bool,
+    hf_token: Option<String>,
+    cc_token: Option<String>,
+    zsh_install: bool,
+    no_vscode: bool,
+    timeouts: arena_core::setup::SetupTimeouts,
+    sel: &Selected,
+    keys_dir: &str,
+    repair: Option<&dyn Provider>,
+) -> Result<()> {
+    let done = setup_pods(remote, cfg, apply, force, hf_token, cc_token, zsh_install, no_vscode, timeouts, sel, keys_dir, repair).await?;
+    if done.failed > 0 {
+        anyhow::bail!("{} pod(s) failed to set up", done.failed);
+    }
+    Ok(())
+}
+
+/// What [`setup_pods`] did: the pods set up (by name, in the order they finished) and how many
+/// weren't — so a caller can say which are back (`start`'s READY lines).
+#[derive(Debug, Default)]
+pub(crate) struct SetupDone {
+    pub provisioned: Vec<String>,
+    pub failed: usize,
+}
+
+/// Set up the selected pods over SSH (or, without `apply`, say what it would do): each one's
+/// line as it ends, then the API keys and Claude Code for the ones set up. `Err` only for what
+/// stops the whole run (config, no pod reachable); a pod that failed is counted in
+/// [`SetupDone::failed`], said on its own line.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn setup_pods(
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
     remote: std::sync::Arc<dyn arena_core::remote::Remote>,
     cfg: &Config,
@@ -347,7 +382,7 @@ pub(crate) async fn handle_setup(
     // key gets it re-attached through its provider's API (Vast), then setup re-runs on it.
     // `None` = no repair (tests that don't exercise it).
     repair: Option<&dyn Provider>,
-) -> Result<()> {
+) -> Result<SetupDone> {
     use arena_core::setup::{provisioning_steps, BootRetry};
     use arena_core::ssh::SshTarget;
 
@@ -365,7 +400,7 @@ pub(crate) async fn handle_setup(
         sel.ssh_targets(cfg)?.into_iter().map(|(p, t)| (p.name.clone(), p.provider.clone(), t)).collect();
     if targets.is_empty() {
         out!(Out, "(no pods with an SSH endpoint to set up)");
-        return Ok(());
+        return Ok(SetupDone::default());
     }
 
     let hetzner_script = stage_hetzner_script(targets.iter().any(|(_, prov, _)| arena_core::setup::is_bare_vm(prov)))?;
@@ -415,7 +450,7 @@ pub(crate) async fn handle_setup(
             out!(Brief, "Would set up {}: {labels}{keys}", all_names(names));
         }
         out!(Detail, "Preview only — run without --dry-run to execute over SSH.");
-        return Ok(());
+        return Ok(SetupDone::default());
     }
 
     // Provision concurrently across the fleet, one line per pod as it finishes; a stuck
@@ -561,10 +596,7 @@ pub(crate) async fn handle_setup(
     let set_up: Vec<arena_core::Pod> = sel.pods.iter().filter(|p| provisioned.contains(&p.name)).cloned().collect();
     reap::reassert_notices(remote.as_ref(), cfg, &set_up).await;
 
-    if failed > 0 {
-        anyhow::bail!("{failed} pod(s) failed to set up");
-    }
-    Ok(())
+    Ok(SetupDone { provisioned, failed })
 }
 
 /// `pods setup --notes-only`: just the agents' notes step ([`arena_core::agent_notes`]) on each

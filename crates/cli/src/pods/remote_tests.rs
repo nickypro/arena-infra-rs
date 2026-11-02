@@ -4880,3 +4880,6 @@ mod cohort_scope {
 
 /// Golden tests of the save commands' output (docs/OUTPUT.md), with these fixtures.
 mod save_output;
+
+/// Golden tests of `pods cp`, `run` and `test`'s output (docs/OUTPUT.md), at default and `-v`.
+mod change_output;
