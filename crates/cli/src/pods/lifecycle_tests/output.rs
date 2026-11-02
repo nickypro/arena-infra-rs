@@ -754,3 +754,22 @@ fn ready_says_a_write_only_proxy() {
     assert_eq!(ready_notes(&reloads, "devtest-alpha", "disk kept"), "disk kept");
     assert_eq!(ready_notes(&reloads, "devtest-alpha", ""), "");
 }
+
+/// Review r5: a terminate's question names a pod by its id too when another listed pod has its
+/// name (a replacement and its original): the operator can tell which one goes.
+#[tokio::test]
+async fn a_shared_name_is_said_with_its_id() {
+    let dir = tmpdir("out-terminate-twins");
+    let cfg = cfg(&dir.0);
+    let twins = || {
+        let f = fleet();
+        f.pods.lock().unwrap().push(pod("r-alpha-2", "devtest-alpha", "runpod", Some(("10.0.0.2", 22001))));
+        f
+    };
+    let (quiet, _) = both(&["terminate", "r-alpha-2", "--skip-proxy"], &cfg, &["y"], twins).await;
+    assert_eq!(
+        quiet,
+        "Terminate devtest-alpha (id=r-alpha-2, runpod) (irreversible)? [y/N] y\n[terminated] devtest-alpha (id=r-alpha-2, runpod)\n",
+        "default:\n{quiet}"
+    );
+}

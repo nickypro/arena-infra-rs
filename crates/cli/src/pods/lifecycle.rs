@@ -696,18 +696,30 @@ pub(crate) fn start_retry(name: &str, opts: RestartOpts) -> String {
     cmd
 }
 
+/// A pod as the default output names it: its name, and — when another listed pod has that name too
+/// (a replacement and its original, a double create) — its id and provider, so a confirm still
+/// says which one (review r5). Pure.
+pub(crate) fn who(pod: &arena_core::Pod, listed: &[arena_core::Pod]) -> String {
+    if listed.iter().filter(|p| p.name == pod.name).count() > 1 {
+        format!("{} (id={}, {})", pod.name, pod.id, pod.provider)
+    } else {
+        pod.name.clone()
+    }
+}
+
 /// What a terminate does, in a line, for the default output's dry run and question: every pod
 /// named, then what it costs — `devtest-alpha (irreversible; volume devtest-alpha-1 stays,
 /// billing)`, `devtest-a, devtest-b (irreversible; unlocks devtest-b first; revokes their
 /// OpenRouter keys)`. Pure (but for the bold).
 fn terminate_brief(
     pods: &[arena_core::Pod],
+    listed: &[arena_core::Pod],
     locked: &[&str],
     revoke_key: bool,
     attached: &[(String, arena_core::archive::cloud::CloudVolume)],
     delete_volumes: bool,
 ) -> String {
-    let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
+    let names: Vec<String> = pods.iter().map(|p| who(p, listed)).collect();
     let mut costs = vec!["irreversible".to_string()];
     if !locked.is_empty() {
         costs.push(format!("unlocks {} first", locked.join(", ")));
@@ -907,7 +919,7 @@ pub(crate) async fn handle_terminate(
             })
             .collect()
     };
-    let brief = terminate_brief(&pods, &locked, revoke_key, &attached, delete_volumes);
+    let brief = terminate_brief(&pods, &listed, &locked, revoke_key, &attached, delete_volumes);
     if dry_run {
         let leaving: Vec<&str> = pods.iter().map(|p| p.id.as_str()).collect();
         let staying = |p: &arena_core::Pod| shared_name_holder(&listed, &leaving, &p.name).map(|o| o.id.clone());
@@ -1034,7 +1046,7 @@ pub(crate) async fn handle_terminate(
         match outcome {
             Ok(()) => {
                 out!(Detail, "[terminated] {}", if targets.is_some() { label(p) } else { p.name.clone() });
-                out!(Brief, "[terminated] {}", out::bold(&p.name));
+                out!(Brief, "[terminated] {}", out::bold(who(p, &listed)));
                 gone.push(p);
             }
             Err((mut why, brief_why)) => {
@@ -1550,7 +1562,7 @@ pub(crate) async fn handle_restart(
     let what = format!("restart {label}:\n  {}\n  {then}", fate.describe(DiskOp::Restart, &site));
     // By default the pod and what the restart does to it, in a line (docs/OUTPUT.md).
     let again = if setup { "; set up again" } else { "" };
-    let brief = format!("{} ({}{again})", out::bold(&pod.name), fate_words(DiskOp::Restart, fate, &site, 1));
+    let brief = format!("{} ({}{again})", out::bold(who(&pod, &pods)), fate_words(DiskOp::Restart, fate, &site, 1));
     if opts.dry_run {
         out!(Detail, "[dry-run] would {what}");
         out!(Brief, "[dry-run] would restart {brief}");
