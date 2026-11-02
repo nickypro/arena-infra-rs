@@ -101,11 +101,11 @@ fn ai_key_verdicts() {
             "ok, $0.42 of $1.00 left (no keys-CSV row to compare)",
         ),
         (
-            "rejected: deleted",
+            "rejected, no listing to say why: paused and deleted both get 401",
             or_lines(GOOD, 401, "openrouter.error=User not found.\n"),
             "devtest-apple",
             Fail,
-            "rejected by OpenRouter (HTTP 401) — `arena keys rotate apple --copy`",
+            "rejected (HTTP 401) — `arena keys resume apple` if paused, else `arena keys rotate apple --copy`",
         ),
         (
             "rejected, an old key: the CSV's is the fix",
@@ -155,6 +155,13 @@ fn ai_key_verdicts() {
             "devtest-apple",
             Pass,
             "ok, $2.00 of $100.00 left",
+        ),
+        (
+            "no fingerprint from the machine: whose key it is can't be said",
+            "openrouter.key=set\nopenrouter.curl_exit=0\nopenrouter.http=200\nopenrouter.limit=1\nopenrouter.limit_remaining=1\n".into(),
+            "devtest-apple",
+            Warn,
+            "works, but not compared with the keys CSV's (no sha256sum on the machine) — `arena pods copy-keys apple` to be sure",
         ),
         (
             "an old key that works: stale",
@@ -214,6 +221,55 @@ fn ai_key_verdicts() {
     }
 }
 
+/// OpenRouter's listing tells a paused key from a deleted one (from the machine both are a 401
+/// `User not found.`), for the keys CSV's key on the machine; an old key's fix stays the CSV's.
+#[test]
+fn the_listing_names_a_rejected_keys_fix() {
+    let mut b = book();
+    let rejected = facts(&or_lines(GOOD, 401, "openrouter.error=User not found.\n"));
+    for (state, detail) in [
+        (Listed::Paused, "paused on OpenRouter (HTTP 401) — `arena keys resume apple`"),
+        (Listed::Gone, "rejected by OpenRouter (HTTP 401): deleted — `arena keys rotate apple --copy`"),
+    ] {
+        b.listed = Some([("devtest-apple".to_string(), state)].into_iter().collect());
+        let c = ai(&rejected, "devtest-apple", &b);
+        assert_eq!((c.status, c.detail.as_str()), (Status::Fail, detail), "{state:?}");
+    }
+    // An old key on the machine: whatever the listing says of the CSV's, copying that is the fix.
+    b.listed = Some([("devtest-apple".to_string(), Listed::Paused)].into_iter().collect());
+    let c = ai(&facts(&or_lines(OLD, 401, "")), "devtest-apple", &b);
+    assert!(c.detail.ends_with("an old key, not the keys CSV's (rotated or handed over since?) — `arena pods copy-keys apple`"), "{}", c.detail);
+}
+
+/// A keys CSV that's there but can't be read: keys are expected, never "none configured"; and a
+/// script that said it couldn't run (`error=`) is a FAIL, never two quiet Skips.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_csv_or_a_script_error_is_never_a_quiet_pass() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("arena-keybook-unreadable-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("keys")).unwrap();
+    std::fs::write(dir.join("config.env"), "MACHINE_NAME_PREFIX=devtest\n").unwrap();
+    let csv = dir.join("keys/openrouter_api_keys.csv");
+    std::fs::write(&csv, format!("devtest-apple,{GOOD}\n")).unwrap();
+    std::fs::set_permissions(&csv, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = std::fs::read_to_string(&csv).is_ok(); // root reads it anyway
+    let b = KeyBook::load(&Config::load(&dir.join("config.env")).unwrap(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+    if !readable {
+        assert!(b.openrouter && b.unreadable.as_deref().is_some_and(|e| e.starts_with("openrouter_api_keys.csv: ")), "{b:?}");
+        let c = ai(&facts(&or_lines(GOOD, 200, "")), "devtest-apple", &b);
+        assert_eq!(c.status, Status::Warn, "{c:?}");
+        assert!(c.detail.starts_with("ok, but not compared: openrouter_api_keys.csv: "), "{}", c.detail);
+        assert_eq!(ai(&facts(&or_lines(GOOD, 401, "")), "devtest-apple", &b).status, Status::Fail);
+    }
+    let policy = HealthPolicy { keys: Some(book()), ..HealthPolicy::default() };
+    let h = PodHealth::keys_checked(&pod("devtest-apple"), facts("error=mktemp failed (is /tmp full or read-only?)\n"), &policy);
+    assert_eq!(h.status, Status::Fail);
+    assert_eq!(h.checks.iter().map(|c| (c.name.as_str(), c.detail.as_str())).collect::<Vec<_>>(), [("script", "mktemp failed (is /tmp full or read-only?)")]);
+}
+
 /// Owners and fleets: a machine whose owner should have a key FAILs without one; a fleet with
 /// no keys configured gets a note whatever it finds.
 #[test]
@@ -229,6 +285,8 @@ fn who_should_have_a_key() {
     // No keys anywhere for this fleet: a short note, never a verdict.
     let none = KeyBook::new(&Config::parse("MACHINE_NAME_PREFIX=devtest\n"), &[], None, &[]);
     assert!(!none.any());
+    let owned = KeyBook { owners: b.owners.clone(), ..none.clone() };
+    assert!(owned.any(), "an owner who should have a key is something to check");
     for (lines, seen) in [("openrouter.key=missing\n".to_string(), "none here"), (or_lines(GOOD, 200, ""), "one here, accepted")] {
         let c = ai(&facts(&lines), "devtest-apple", &none);
         assert_eq!((c.status, c.detail), (Status::Skip, format!("no OpenRouter keys configured for this fleet ({seen})")));
@@ -347,7 +405,7 @@ fn a_dead_key_fails_the_check_but_not_the_machine() {
     assert_eq!(h.key_status(), Some(Status::Fail));
     assert_eq!(h.failure_kind(), Some(FailureKind::Key));
     assert_eq!((failure_kind_of(AI_KEY, None), failure_kind_of(HF_TOKEN_CHECK, None)), (FailureKind::Key, FailureKind::Key));
-    assert!(h.notes().starts_with("ai_key: rejected by OpenRouter (HTTP 401) — `arena keys rotate apple --copy`"), "{}", h.notes());
+    assert!(h.notes().starts_with("ai_key: rejected (HTTP 401) — `arena keys resume apple` if paused"), "{}", h.notes());
     // Never a bad host: no machine-level evidence, and a check that ran clears an old record.
     assert!(h.checks.iter().all(|c| !crate::health::condemns_machine(c, h.facts.as_ref().unwrap())));
     let h = PodHealth { host: Some("hetzner machine 1".into()), ..h };
@@ -405,7 +463,7 @@ fn the_reports_show_the_key() {
         "\
 NAME           RESULT  AI KEY      HF       NOTES
 devtest-apple  pass    $0.42 left  ok
-devtest-bloom  fail    rejected    missing  ai_key: rejected by OpenRouter (HTTP 401) — `arena keys rotate bloom --copy`; hf_token: missing — `arena pods…
+devtest-bloom  fail    rejected    missing  ai_key: rejected (HTTP 401) — `arena keys resume bloom` if paused, else `arena keys rotate bloom --copy`; hf_…
 
 1 pass, 0 warn, 1 fail
 AI key failure, not the machine: devtest-bloom — NOTES (or -v) says what to run; a machine is never replaced for its key.

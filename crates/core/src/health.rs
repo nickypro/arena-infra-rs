@@ -40,8 +40,8 @@ use crate::table::{self, Align};
 
 mod aikeys;
 pub use aikeys::{
-    ai_key_cell, fingerprint, hf_token_cell, is_key_check, key_checks, ledger_owners, low_line, KeyBook, KeyFacts, AI_KEY,
-    HF_TOKEN_CHECK,
+    ai_key_cell, fingerprint, hf_token_cell, is_key_check, key_checks, ledger_owners, low_line, KeyBook, KeyFacts, Listed,
+    AI_KEY, HF_TOKEN_CHECK,
 };
 
 /// The on-pod fact gatherer. Embedded (like `hetzner_setup.sh`) so the binary is all an
@@ -1518,6 +1518,12 @@ impl PodHealth {
         }
         if !facts.complete {
             checks.push(Check::new("script", Status::Warn, "output cut off before the end; later facts unknown"));
+        }
+        // The script said it couldn't run (`error=`: no temp dir, /tmp full): no key was asked
+        // about, and that's no pass.
+        if let Some(e) = facts.other.get("error") {
+            checks.push(Check::new("script", Status::Fail, e.clone()));
+            return Self::of(pod, checks, facts);
         }
         checks.extend(key_checks(&facts, pod, &policy.keys.clone().unwrap_or_default()));
         Self::of(pod, checks, facts)

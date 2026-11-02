@@ -2314,17 +2314,24 @@ command line.
 |---|---|---|---|
 | **FAIL** | missing, though the keys CSV has a row for the machine | missing (an `HF_TOKEN` is configured) | `pods copy-keys <name>` |
 | **FAIL** | missing, no row, but the machine has an owner (`--owner`, `spend assign`) | | `keys gen <name> --copy` |
-| **FAIL** | rejected (401/403: deleted, or not a key) | rejected | `keys rotate <name> --copy` / a new `HF_TOKEN`, then `copy-keys` |
-| **FAIL** | paused, or out of money (none left of its cap) | | `keys resume <name>` / `keys limit <name> +5` |
+| **FAIL** | rejected (401/403): deleted, or paused (see below) | rejected | `keys rotate <name> --copy` or `keys resume <name>` / a new `HF_TOKEN` (or its `huggingface_api_keys.csv` row), then `copy-keys` |
+| **FAIL** | out of money (none left of its cap) | | `keys limit <name> +5` |
 | **WARN** | not the keys CSV's key: an old one, from before a rotate or a handover | not the config's `HF_TOKEN` | `pods copy-keys <name>` (this also fixes a FAIL above) |
 | **WARN** | under a tenth of its cap left, and under $1 | | `keys limit <name> +5` |
 | **WARN** | missing, and no row and no owner | | `keys gen <name> --copy`, if it should have one |
 | **WARN** | the call failed (network, timeout, 5xx, 429) | the same | `pods test --keys <name>`, later |
+| **WARN** | works, but no `sha256sum` on the machine to compare it with, or the keys CSV can't be read | | `pods copy-keys <name>` to be sure |
 | PASS | `ok, $4.97 of $5.00 left` (or `no cap`) | `accepted by Hugging Face` | |
 | note | a staff `@` box, a fleet with no keys (no keys-CSV rows, no `OPENROUTER_PROVISIONING_KEY`), a check from an older script | no `HF_TOKEN` configured | |
 
 The under-a-tenth line leaves a day or so to raise the cap before calls fail. It stops at $1 so that
 a large cap doesn't warn while it still has plenty.
+
+From the machine, a paused key and a deleted one get the same answer: 401 `User not found.`
+(checked live). With `OPENROUTER_PROVISIONING_KEY` set, the check reads OpenRouter's listing once
+per run, beside the calls, and says which: `paused … — keys resume <name>`, or `deleted — keys
+rotate <name> --copy`. Without it, the verdict names both. A script that couldn't run at all (no
+temp dir) is a `script` FAIL, never a pass.
 
 **A key isn't the machine.** `--deep` exits non-zero on a key FAIL (so does the daily health
 line), and the summary says `AI key failure, not the machine: …`. But `up --check` never replaces

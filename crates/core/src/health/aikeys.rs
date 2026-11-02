@@ -184,6 +184,25 @@ pub struct KeyBook {
     pub hf_csv: BTreeMap<String, String>,
     /// Staff `@` boxes, by full name: their keys are the organisers' choice.
     pub staff: BTreeSet<String>,
+    /// What OpenRouter's own listing says of each machine's keys-CSV key ([`Listed`]), when it was
+    /// read (with a provisioning key): from the machine a paused key and a deleted one both get
+    /// 401 `User not found.` (checked live 2026-11-02), and only the listing tells which fix it
+    /// is. `None`: not read — a rejected key then names both fixes.
+    pub listed: Option<BTreeMap<String, Listed>>,
+    /// A keys CSV that exists but couldn't be read (`openrouter_api_keys.csv: Permission
+    /// denied`): its keys are then expected but can't be compared — never "no keys configured".
+    pub unreadable: Option<String>,
+}
+
+/// A keys-CSV key as OpenRouter's listing has it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listed {
+    /// There and enabled.
+    Live,
+    /// There, disabled (`keys pause`).
+    Paused,
+    /// Not there: deleted, or rotated away elsewhere.
+    Gone,
 }
 
 impl KeyBook {
@@ -200,6 +219,8 @@ impl KeyBook {
             hf: hf.map(str::trim).filter(|t| !t.is_empty()).map(fingerprint),
             hf_csv: hf_rows.iter().map(|(h, k)| (h.clone(), fingerprint(k))).collect(),
             staff: cfg.machine_names.iter().filter(|e| is_absolute(e)).map(|e| qualify(&prefix, e)).collect(),
+            listed: None,
+            unreadable: None,
             prefix,
         }
     }
@@ -210,12 +231,25 @@ impl KeyBook {
     /// can't be read holds no rows.
     pub fn load(cfg: &Config, ledger: Option<&Path>) -> Self {
         let dir = cfg.fleet_file(KEYS_DIR).path;
-        let rows = |base: &str| {
-            std::fs::read_to_string(dir.join(format!("{base}_api_keys.csv")))
-                .map(|t| crate::apikeys::parse_csv(&t))
-                .unwrap_or_default()
+        let mut unreadable = None;
+        let mut rows = |base: &str| {
+            let file = format!("{base}_api_keys.csv");
+            match std::fs::read_to_string(dir.join(&file)) {
+                Ok(t) => crate::apikeys::parse_csv(&t),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(e) => {
+                    unreadable.get_or_insert(format!("{file}: {e}"));
+                    Vec::new()
+                }
+            }
         };
-        Self::new(cfg, &rows("openrouter"), cfg.get("HF_TOKEN"), &rows("huggingface")).with_owners(ledger)
+        let (openrouter, hf) = (rows("openrouter"), rows("huggingface"));
+        let mut book = Self::new(cfg, &openrouter, cfg.get("HF_TOKEN"), &hf).with_owners(ledger);
+        if unreadable.is_some() {
+            book.openrouter = true;
+            book.unreadable = unreadable;
+        }
+        book
     }
 
     /// With the owners in the spend ledger at `ledger` ([`ledger_owners`]).
@@ -224,9 +258,10 @@ impl KeyBook {
         self
     }
 
-    /// Whether there's anything to hold a machine's keys to: OpenRouter keys or an HF token.
+    /// Whether there's anything to hold a machine's keys to: OpenRouter keys, an owner who
+    /// should have one, or an HF token.
     pub fn any(&self) -> bool {
-        self.openrouter || self.hf.is_some() || !self.hf_csv.is_empty()
+        self.openrouter || !self.owners.is_empty() || self.hf.is_some() || !self.hf_csv.is_empty()
     }
 
     /// `apple` for `devtest-apple`: the machine as commands take it.
@@ -325,6 +360,9 @@ fn ai_key_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
     // Not the key the keys CSV has for it: an old one, from before a rotate or a handover. The
     // CSV's is then the one to put on — whatever else is wrong with the old one.
     let stale = matches!((row, k.fingerprint.as_deref()), (Some(want), Some(got)) if want != got);
+    // A row to compare with, but no fingerprint from the machine (no hasher there): it works or
+    // not, but whose key it is can't be said.
+    let uncompared = row.is_some() && k.fingerprint.is_none();
     let copy = format!("`arena pods copy-keys {s}`");
     const OLD: &str = "an old key, not the keys CSV's (rotated or handed over since?)";
     let fix = |own: String| if stale { format!("{OLD} — {copy}") } else { own };
@@ -337,11 +375,22 @@ fn ai_key_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
     }
     if k.rejected() {
         let h = k.http.unwrap_or_default();
-        let paused = k.error.as_deref().is_some_and(|e| e.to_ascii_lowercase().contains("disabled"));
-        return if paused {
-            Check::new(name, Fail, format!("paused on OpenRouter (HTTP {h}) — {}", fix(format!("`arena keys resume {s}`"))))
-        } else {
-            Check::new(name, Fail, format!("rejected by OpenRouter (HTTP {h}) — {}", fix(format!("`arena keys rotate {s} --copy`"))))
+        // Paused or deleted: the answer is the same 401 for both. Which it is, the listing says
+        // of the keys CSV's key — when that's the one on the machine.
+        let said = k.error.as_deref().is_some_and(|e| e.to_ascii_lowercase().contains("disabled"));
+        let listed = (row.is_some() && !stale && !uncompared).then(|| book.listed.as_ref().and_then(|l| l.get(&pod.name))).flatten();
+        return match listed {
+            _ if said => Check::new(name, Fail, format!("paused on OpenRouter (HTTP {h}) — {}", fix(format!("`arena keys resume {s}`")))),
+            Some(Listed::Paused) => Check::new(name, Fail, format!("paused on OpenRouter (HTTP {h}) — `arena keys resume {s}`")),
+            Some(Listed::Gone) => {
+                Check::new(name, Fail, format!("rejected by OpenRouter (HTTP {h}): deleted — `arena keys rotate {s} --copy`"))
+            }
+            _ if stale => Check::new(name, Fail, format!("rejected by OpenRouter (HTTP {h}) — {OLD} — {copy}")),
+            _ => Check::new(
+                name,
+                Fail,
+                format!("rejected (HTTP {h}) — `arena keys resume {s}` if paused, else `arena keys rotate {s} --copy`"),
+            ),
         };
     }
     if !k.accepted() {
@@ -363,6 +412,14 @@ fn ai_key_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
     let low = matches!((k.limit, k.limit_remaining), (Some(l), Some(r)) if l > 0.0 && r < low_line(l));
     let ok = if money.is_empty() { "ok".to_string() } else { format!("ok, {money}") };
     match (stale, low) {
+        (false, false) if uncompared => {
+            Check::new(name, Warn, format!("works, but not compared with the keys CSV's (no sha256sum on the machine) — {copy} to be sure"))
+        }
+        (false, false) if row.is_none() && book.unreadable.is_some() => Check::new(
+            name,
+            Warn,
+            format!("{ok}, but not compared: {}", book.unreadable.as_deref().unwrap_or_default()),
+        ),
         (false, false) if row.is_none() => Check::new(name, Pass, format!("{ok} (no keys-CSV row to compare)")),
         (false, false) => Check::new(name, Pass, ok),
         (false, true) => Check::new(name, Warn, format!("only {money} (<10% of its cap) — {raise}")),
@@ -393,6 +450,7 @@ fn hf_token_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
         return Check::new(name, Fail, format!("missing — {copy}"));
     }
     let stale = k.fingerprint.as_deref().is_some_and(|got| got != want);
+    let uncompared = k.fingerprint.is_none();
     let old = if own_row { "not its huggingface_api_keys.csv row's" } else { "not the config's HF_TOKEN" };
     let new_one = if own_row {
         format!("a new token in its huggingface_api_keys.csv row, then {copy}")
@@ -419,6 +477,8 @@ fn hf_token_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
     }
     if stale {
         Check::new(name, Warn, format!("works, but {old} — {copy}"))
+    } else if uncompared {
+        Check::new(name, Warn, format!("works, but not compared (no sha256sum on the machine) — {copy} to be sure"))
     } else {
         Check::new(name, Pass, "accepted by Hugging Face")
     }

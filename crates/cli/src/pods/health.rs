@@ -108,6 +108,21 @@ pub(crate) fn key_book(cfg: &Config) -> KeyBook {
     KeyBook::load(cfg, crate::spend::SpendCtx::from_config(cfg).path())
 }
 
+/// What OpenRouter's listing says of the keys CSV's keys ([`crate::keys::listed_states`]: there,
+/// paused or gone) — so a rejected key's verdict names its fix — when a provisioning key is set
+/// and the CSV has OpenRouter rows; `None` otherwise, or when the listing couldn't be read in its
+/// bound (the verdict then names both fixes).
+pub(crate) async fn key_listing(cfg: &Config) -> Option<std::collections::BTreeMap<String, arena_core::health::Listed>> {
+    let keys = crate::keys::KeySources::load(cfg, &crate::keys::keys_dir(cfg), None);
+    let hosts: Vec<String> = keys.per_host.keys().filter(|h| keys.openrouter_secret(h).is_some()).cloned().collect();
+    if hosts.is_empty() {
+        return None;
+    }
+    let api = crate::keys::openrouter_client(cfg)?;
+    let listed = crate::keys::list_for_check(Some(&api as &dyn arena_core::openrouter::KeyApi)).await?.ok()?;
+    Some(crate::keys::listed_states(&keys, &arena_core::selector::Naming::from_config(cfg), &listed))
+}
+
 /// Where this fleet's health cache lives ([`arena_core::snapshot::health_cache_path`]):
 /// under `ARENA_STATE_DIR` (config.env or the environment), else the XDG state dir — per
 /// `MACHINE_NAME_PREFIX`. `None` in this crate's unit tests unless the test's config sets
@@ -271,14 +286,21 @@ pub(crate) async fn check_fleet(
     });
     // `enrich` fills fields in place (a slice: it can't add, drop or move pods), so the
     // indices the jobs carry still point at the same pods afterwards.
-    match provider {
+    // OpenRouter's listing alongside (one bounded read, when there's a provisioning key): what
+    // tells a paused key from a deleted one.
+    let listed = match provider {
         Some(provider) => {
-            let (warning, ()) = tokio::join!(enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT), probe);
+            let (warning, (), listed) = tokio::join!(enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT), probe, key_listing(cfg));
             if let Some(warning) = warning {
                 eprintln!("{warning}");
             }
+            listed
         }
-        None => probe.await,
+        None => tokio::join!(probe, key_listing(cfg)).1,
+    };
+    let mut policy = policy;
+    if let Some(book) = policy.keys.as_mut() {
+        book.listed = listed;
     }
 
     let mut results = Vec::new();

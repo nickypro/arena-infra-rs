@@ -1586,11 +1586,23 @@ impl Shared<'_, '_> {
     }
 
     /// The keys-only check on one pod (`pods test --keys`'s: one bounded exec), held to `book`.
+    /// A key OpenRouter turned away is judged again with its listing ([`crate::pods::health::key_listing`]),
+    /// which tells a paused key (`keys resume`) from a deleted one (`keys rotate`).
     async fn key_check(&self, pod: &Pod, target: &SshTarget, book: health::KeyBook) -> PodHealth {
         let cmd = health::key_check_command(Some(self.run.cfg.get("CONDA_ENV").unwrap_or("arena-env")));
         let call = self.run.remote.exec(target, &cmd, Some(health::KEY_CHECK_TIMEOUT)).await;
-        let policy = HealthPolicy { keys: Some(book), ..HealthPolicy::default() };
-        health::judge_key_call(pod, call.map_err(|e| describe_error(&e)), &policy)
+        let mut policy = HealthPolicy { keys: Some(book), ..HealthPolicy::default() };
+        let h = health::judge_key_call(pod, call.map_err(|e| describe_error(&e)), &policy);
+        let rejected = h.facts.as_ref().and_then(|f| f.openrouter.as_ref()).is_some_and(|k| matches!(k.http, Some(401 | 403)));
+        match (rejected, h.facts.clone()) {
+            (true, Some(facts)) => {
+                if let Some(book) = policy.keys.as_mut() {
+                    book.listed = crate::pods::health::key_listing(self.run.cfg).await;
+                }
+                PodHealth::keys_checked(pod, facts, &policy)
+            }
+            _ => h,
+        }
     }
 
     /// Say a keys-only check's verdict — a line per key it judged (`[apple] AI key ✓ ok, $4.97 of
@@ -2805,7 +2817,8 @@ mod tests {
         assert!(fake.calls_to(&host("10.0.0.2", 22002)).is_empty(), "no replacement was placed");
         let (pass, _) = lines.find("[devtest-apple] check: pass");
         let (copied, _) = lines.find("[devtest-apple] keys ✓");
-        let (dead, _) = lines.find("[devtest-apple] AI key ✗ rejected by OpenRouter (HTTP 401) — `arena keys rotate apple --copy`");
+        let (dead, _) =
+            lines.find("[devtest-apple] AI key ✗ rejected (HTTP 401) — `arena keys resume apple` if paused, else `arena keys rotate apple --copy`");
         let (ready, _) = lines.find("[devtest-apple] READY after ");
         assert!(pass < copied && copied < dead && dead < ready, "{:#?}", lines.all());
         assert!(lines.all()[ready].ends_with("check pass, AI key fail"), "{}", lines.all()[ready]);
@@ -2823,7 +2836,7 @@ mod tests {
         assert_eq!((row.attempts[0].end.clone(), row.attempts[0].terminated), (AttemptEnd::Kept, false));
         let summary = pipeline::render_up_summary(&rows);
         assert!(
-            summary.contains("devtest-apple: fail — ai_key: rejected by OpenRouter (HTTP 401) — `arena keys rotate apple --copy`"),
+            summary.contains("devtest-apple: fail — ai_key: rejected (HTTP 401) — `arena keys resume apple` if paused"),
             "{summary}"
         );
         assert!(conclude(&rows, &|_, _| {}).is_ok(), "a READY machine: the run succeeds");

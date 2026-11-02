@@ -25,7 +25,8 @@ earlier).
   Face's `whoami-v2`), compared with the keys CSV (and `HF_TOKEN`) by fingerprint. The secret
   never leaves the machine and is printed nowhere. Each verdict says what to run:
   - FAIL: the key is missing (but the keys CSV, or the machine's owner, should have one),
-    rejected (401: deleted), paused, or out of money.
+    rejected (401), paused, or out of money. A paused key and a deleted one get the same 401,
+    so with a provisioning key the check reads OpenRouter's listing to say which fix it is.
   - WARN: it isn't the keys CSV's key (an old one after a rotate or handover:
     `pods copy-keys`), it has under a tenth of its cap left, or OpenRouter couldn't be reached.
   - A staff `@` box, or a fleet with no keys, gets a note and no verdict.
