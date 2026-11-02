@@ -629,7 +629,7 @@ minutes a VM. From an **arena image** — a snapshot of a VM that setup built, w
 machine's scrubbed off — setup takes about a minute.
 
 ```bash
-arena image build --dry-run      # the plan: VM type, what's scrubbed, cost
+arena image build --dry-run      # the plan in a line: VM type, cost (-v: what's scrubbed, …)
 arena image build                # ~20 min; asks first (-y: doesn't); --server-type picks the bake VM
 arena image list                 # this cohort's images; which one `arena` picks; are they current?
 arena image prune [--keep 1]     # delete older ones (and any build VM left behind); asks first
@@ -1652,8 +1652,8 @@ an unexpected shape are errors, never "zero pods".
 
 `proxy plan` — read-only; shows the merge against the current config (`+` added, `~` changed —
 including a kept entry whose port moved with the list —, `-` removed, `=` kept-stale, plus a `+N
-added, ~N changed, …` summary) and prints the nginx `stream` config (`--out` saves it locally; never
-connects to the proxy).
+added, ~N changed, …` summary); `-v` adds the forwards that stay as they are and prints the nginx
+`stream` config (`--out` saves it locally; never connects to the proxy).
 
 Without the current config (remote proxy, unreadable file) it's labelled a **listing-only preview**
 and `--out` is refused — deployed by hand it would drop every kept forward.
@@ -1661,6 +1661,8 @@ and `--out` is refused — deployed by hand it would drop every kept forward.
 `proxy apply` prints the same changes, confirms, then **deploys** the config (locally, or over SSH
 when `PROXY_LOCAL=false`) and runs `SSH_PROXY_RELOAD_CMD` — default `nginx -t && nginx -s reload`;
 set it **empty** (in the file, or exported empty by a wrapper) for write-only (never reloads nginx).
+A config already up to date is one line, `✓ proxy config up to date (30 forward(s))`: what the
+proxy cron logs every 5 minutes.
 
 Writes are serialized (`flock`), refuse to overwrite a config another run changed since it was read
 (the merge is redone), and are atomic locally (temp + rename).
@@ -1839,8 +1841,15 @@ refusal is reported as before.
 Then it tells the coding agents on the machine which Python to use ([the agents'
 notes](#the-agents-notes-claude-code-and-codex)) and warms up VS Code.
 
-Confirms first (`--dry-run` previews, token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`,
-`ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
+Confirms first (`--dry-run` previews: its steps in a line; `-v` prints each step's command, token
+redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
+
+It prints a line per pod as it ends — `[NAME] setup ✓ (3m02s)`, or `[NAME] FAILED setup: <why>
+(retry: arena pods setup NAME)` — and, for several, `✓ 3 of 3 set up`. A log or a pipe also gets
+`[NAME] setup…` as each starts (the dashboard's runs panel shows it as the pod's step); a terminal
+shows one line, updated in place, instead. `-v` adds the tokens, the budgets, `[2/3] ✓ NAME (…)`
+with what built the env, and the tallies. `start`, `restart`, `reimage` and `replace` print the
+same lines for the setup they run.
 
 #### The repo: `origin`, `upstream` and the update
 

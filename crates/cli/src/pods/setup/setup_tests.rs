@@ -12,7 +12,16 @@ use crate::cli::{Cli, Cmd};
 use crate::keys::{handle_copy_keys, COPY_KEYS_TIMEOUT};
 use crate::pods::handle_pods;
 use crate::pods::selection::Selected;
-use super::{handle_setup, provision_fleet, SetupJob};
+use super::{handle_setup, provision_fleet, SetupJob, SETUP};
+
+/// What `-v` shows of a fleet run's lines (`[done/total] ✓ name …`), kept in `lines`.
+fn detail(lines: &mut Vec<String>) -> impl FnMut(arena_core::out::To, &str) + '_ {
+    |to, l| {
+        if to == arena_core::out::To::Detail {
+            lines.push(l.to_string());
+        }
+    }
+}
 
 fn target(port: u16) -> SshTarget {
     SshTarget { user: "root".into(), host: "10.0.0.1".into(), port, key_paths: vec![], connect_timeout_secs: 10, host_keys: Default::default() }
@@ -56,7 +65,7 @@ async fn one_hung_pod_times_out_while_the_others_finish() {
     let mut lines = Vec::new();
     let start = Instant::now();
     let (mut provisioned, failed, _) =
-        provision_fleet(fake.clone(), jobs, BootRetry::default(), |l| lines.push(l.to_string())).await;
+        provision_fleet(fake.clone(), jobs, BootRetry::default(), SETUP, false, detail(&mut lines)).await;
 
     provisioned.sort();
     assert_eq!((provisioned, failed), (vec!["devtest-apple".to_string(), "devtest-cloud".to_string()], 1));
@@ -79,12 +88,12 @@ async fn failures_are_counted_and_described() {
     fake.script("10.0.0.1:22001", [FakeReply::exit(1, "scp: /root/.ssh: Permission denied")]);
     let mut lines = Vec::new();
     let (provisioned, failed, _) =
-        provision_fleet(fake, vec![job("devtest-apple", 22001)], BootRetry::default(), |l| lines.push(l.to_string())).await;
+        provision_fleet(fake, vec![job("devtest-apple", 22001)], BootRetry::default(), SETUP, false, detail(&mut lines)).await;
     assert_eq!((provisioned.len(), failed), (0, 1));
     assert_eq!(lines, ["[1/1] ✗ devtest-apple (failed at copy deploy key, exit 1): scp: /root/.ssh: Permission denied"]);
 }
 
-struct Fleet(Vec<Pod>);
+pub(super) struct Fleet(pub(super) Vec<Pod>);
 
 #[async_trait]
 impl Provider for Fleet {
@@ -111,7 +120,7 @@ impl Provider for Fleet {
     }
 }
 
-fn fleet() -> Fleet {
+pub(super) fn fleet() -> Fleet {
     let pod = |name: &str, port: u16| Pod {
         id: format!("id-{name}"),
         name: name.into(),
@@ -131,7 +140,7 @@ fn everyone() -> Selected {
 
 /// Setup's config, VS Code warm-up off: these tests script each pod's exact replies
 /// (the warm-up has its own, below — `vscode_cfg`).
-fn setup_cfg(extra: &str) -> Config {
+pub(super) fn setup_cfg(extra: &str) -> Config {
     Config::parse(&format!(
         "MACHINE_NAME_PREFIX=devtest\nARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\n\
          GIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\nVSCODE_PREINSTALL=0\nAGENT_NOTES=0\nREPO_ON_VOLUME=0\n{extra}"
@@ -169,7 +178,9 @@ async fn a_crashed_setup_task_is_a_named_failure() {
         Arc::new(PanickyRemote),
         vec![job("devtest-apple", 22001)],
         BootRetry::default(),
-        |l| lines.push(l.to_string()),
+        SETUP,
+        false,
+        detail(&mut lines),
     )
     .await;
     assert_eq!((provisioned.len(), failed), (0, 1));
@@ -226,7 +237,7 @@ async fn handle_setup_timeout_flag_wins_and_names_scope_the_run() {
 /// The test fleet behind a provider with a key API (like Vast): records which pods it
 /// was asked to re-attach keys to.
 #[derive(Default)]
-struct KeyApi {
+pub(super) struct KeyApi {
     seen: std::sync::Mutex<Vec<String>>,
 }
 
@@ -260,7 +271,7 @@ impl Provider for KeyApi {
 }
 
 /// A temp dir holding a readable cohort key with its `.pub` — something to re-attach.
-fn pubkey_dir(tag: &str) -> std::path::PathBuf {
+pub(super) fn pubkey_dir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("arena-setup-pubkey-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
@@ -421,7 +432,7 @@ async fn create_then_setup_commands_reject_a_bad_budget_before_doing_anything() 
 }
 
 /// `pods <args…>` parsed as the CLI would.
-fn pods(args: &[&str]) -> crate::cli::PodCmd {
+pub(super) fn pods(args: &[&str]) -> crate::cli::PodCmd {
     use clap::Parser;
     let argv = ["arena", "pods"].iter().chain(args).copied();
     match Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{args:?}: {e}")).cmd {

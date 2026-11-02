@@ -1,16 +1,88 @@
 //! `pods setup`: provision pods over SSH (keys, repo, tokens, VS Code; bare VMs run
 //! hetzner_setup.sh), each step within its budget.
+//!
+//! What it prints (docs/OUTPUT.md): by default a line per pod as it ends — `[NAME] setup ✓
+//! (3m02s)` or `[NAME] FAILED setup: <why> (retry: arena pods setup NAME)` — which the
+//! dashboard's runs panel reads as the pod's state (a `pods start`'s setup); a log also gets
+//! `[NAME] setup…` as each starts, and a terminal an in-place line instead. `-v` prints what it
+//! printed before: the plan, the budgets, `[done/total] ✓ NAME (…)`, the `Done:` tally.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arena_core::out;
+use arena_core::out::To;
 use arena_core::provider::Provider;
+use arena_core::setup::ProvisionOutcome;
 use arena_core::Config;
 
 use crate::keys::handle_copy_keys;
 use crate::pods::selection::Selected;
 use crate::{archive, reap};
+
+/// What a fleet run is called in its lines (`setup`, `notes`) and the command that runs it
+/// again on one pod: the fix each failure line ends with.
+#[derive(Debug, Clone, Copy)]
+struct Says {
+    what: &'static str,
+    retry: &'static str,
+}
+
+/// `pods setup`'s lines.
+const SETUP: Says = Says { what: "setup", retry: "arena pods setup" };
+/// `pods setup --notes-only`'s lines.
+const NOTES: Says = Says { what: "notes", retry: "arena pods setup --notes-only" };
+
+/// The key of a fleet run's in-place line on a terminal ([`out::progress`]).
+const PROGRESS: &str = "setup";
+
+/// Every name, bold — with how many first when there are more than three: `devtest-a,
+/// devtest-b`, `5 pods: devtest-a, devtest-b, devtest-c, devtest-d, devtest-e`. A prompt names
+/// every pod it acts on, never `+N more` (review r1: a fourth pod set up unnamed). Pure (but for
+/// the bold).
+pub(crate) fn all_names<S: AsRef<str>>(names: &[S]) -> String {
+    let all = names.iter().map(|n| out::bold(n.as_ref())).collect::<Vec<_>>().join(", ");
+    if names.len() > 3 {
+        format!("{} pods: {all}", names.len())
+    } else {
+        all
+    }
+}
+
+/// A pod's default line once its run ends: `[NAME] setup ✓ (3m02s)`, or `[NAME] FAILED setup:
+/// <why> (retry: arena pods setup NAME)` — the dashboard's runs panel reads `[NAME] FAILED…` as a
+/// failed pod and any other `[NAME] …` as its step. Pure (but for the styles).
+fn ended_line(says: Says, name: &str, outcome: &ProvisionOutcome, took: Duration) -> String {
+    if outcome.is_done() {
+        format!("[{}] {} {} ({})", out::bold(name), says.what, out::tick(), arena_core::pipeline::fmt_elapsed(took))
+    } else {
+        failed_line(says, name, &outcome.describe())
+    }
+}
+
+/// `[NAME] FAILED setup: <why> (retry: arena pods setup NAME)`. Pure (but for the styles).
+fn failed_line(says: Says, name: &str, why: &str) -> String {
+    format!("[{}] {} {}: {why} (retry: {} {name})", out::bold(name), out::red("FAILED"), says.what, says.retry)
+}
+
+/// `name` gone from the pods still running (one of them: two pods may share a name).
+fn take_one(left: &mut Vec<String>, name: &str) {
+    if let Some(i) = left.iter().position(|n| n == name) {
+        left.remove(i);
+    }
+}
+
+/// The in-place line while a fleet run goes: `setup 1m10s · devtest-alpha` (one pod), `setup
+/// 1m10s · 1 of 3 done · devtest-bravo, devtest-cloud`. Pure.
+fn progress_text(says: Says, took: Duration, done: usize, left: &[String]) -> String {
+    let took = arena_core::pipeline::fmt_elapsed(took);
+    if done == 0 && left.len() == 1 {
+        format!("{} {took} · {}", says.what, left[0])
+    } else {
+        format!("{} {took} · {done} of {} done · {}", says.what, done + left.len(), left.join(", "))
+    }
+}
 
 /// Bare-VM provisioning script ([`arena_core::setup::HETZNER_SETUP`], in core so the
 /// dashboard's setup pushes the same one) — `arena pods setup` stages and runs it.
@@ -63,28 +135,40 @@ pub(crate) async fn repair_pod_keys(
     }
 }
 
-/// Provision every job concurrently over `remote`, emitting a `[done/total] ✓/✗ name`
-/// line as each pod finishes (scp+ssh is slow serially). Each pod runs under its own
-/// per-step budgets (see `arena_core::setup::provision`), so a wedged pod reports
-/// `timed out at <step>` and never holds up the others — the whole run takes as long as
-/// the slowest pod's budget, not forever. The flow is *data* (`provisioning_steps`) run
-/// by a generic runner — nothing here names a provider. Returns the names of the pods
-/// that were fully provisioned (in finishing order), the number that failed — the
-/// caller only follows up (API keys) on the former, never on a pod that just timed out —
-/// and the names of those whose failure was the pod refusing our key (a provider may be
-/// able to repair that: [`repair_pod_keys`]).
+/// Provision every job concurrently over `remote`, saying each pod's end as it comes (scp+ssh
+/// is slow serially): `[done/total] ✓/✗ name` with `-v`, [`ended_line`] by default. A log gets
+/// `[name] setup…` as each starts, a terminal an in-place line instead ([`progress_text`]).
+/// Each pod runs under its own per-step budgets (see `arena_core::setup::provision`), so a
+/// wedged pod reports `timed out at <step>` and never holds up the others — the whole run
+/// takes as long as the slowest pod's budget, not forever. The flow is *data*
+/// (`provisioning_steps`) run by a generic runner — nothing here names a provider. Returns
+/// the names of the pods that were fully provisioned (in finishing order), the number that
+/// failed — the caller only follows up (API keys) on the former, never on a pod that just
+/// timed out — and those whose failure was the pod refusing our key, with what happened (a
+/// provider may be able to repair that: [`repair_pod_keys`]). With `hold_rejected` their
+/// default line is the caller's to say once it has tried: a `FAILED` line now would stand on
+/// the dashboard against the `✓` of a setup that works after the repair.
 async fn provision_fleet(
     remote: std::sync::Arc<dyn arena_core::remote::Remote>,
     jobs: Vec<SetupJob>,
     boot: arena_core::setup::BootRetry,
-    mut emit: impl FnMut(&str),
-) -> (Vec<String>, usize, Vec<String>) {
+    says: Says,
+    hold_rejected: bool,
+    mut emit: impl FnMut(To, &str),
+) -> (Vec<String>, usize, Vec<(String, String)>) {
     use arena_core::setup::{key_rejected, progress_line, provision, provision_after_key_repair};
     let total = jobs.len();
+    let started = tokio::time::Instant::now();
+    let live = out::live();
+    let mut left: Vec<String> = jobs.iter().map(|j| j.name.clone()).collect();
     let mut set = tokio::task::JoinSet::new();
     // Task id -> pod name, so even a task that panicked is reported by name.
     let mut names = std::collections::HashMap::new();
     for job in jobs {
+        // A retry after a key repair has had its line (`… re-attached it, trying again`).
+        if !live && !job.after_repair {
+            emit(To::Brief, &format!("[{}] {}…", out::bold(&job.name), says.what));
+        }
         let remote = remote.clone();
         let name = job.name.clone();
         let handle = set.spawn(async move {
@@ -97,26 +181,62 @@ async fn provision_fleet(
         });
         names.insert(handle.id(), name);
     }
+    let _line = out::progress_guard(PROGRESS);
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     let (mut provisioned, mut failed, mut rejected, mut done) = (Vec::new(), 0, Vec::new(), 0);
-    while let Some(joined) = set.join_next().await {
+    loop {
+        // On a terminal the in-place line is redrawn every second (its clock); elsewhere the
+        // run only waits for the next pod to end.
+        let joined = if live {
+            tokio::select! {
+                j = set.join_next() => j,
+                _ = tick.tick() => {
+                    out::progress(PROGRESS, Some(&progress_text(says, started.elapsed(), done, &left)));
+                    continue;
+                }
+            }
+        } else {
+            set.join_next().await
+        };
+        let Some(joined) = joined else { break };
         done += 1;
+        // Which pod ended (a crashed task by its id), out of the in-place line before its own
+        // line is said: none left, none drawn.
+        let ended = match &joined {
+            Ok((name, _)) => name.clone(),
+            Err(e) => names.get(&e.id()).cloned().unwrap_or_else(|| "?".into()),
+        };
+        take_one(&mut left, &ended);
+        if live {
+            let line = (!left.is_empty()).then(|| progress_text(says, started.elapsed(), done, &left));
+            out::progress(PROGRESS, line.as_deref());
+        }
         match joined {
             Ok((name, outcome)) => {
-                emit(&progress_line(done, total, &name, &outcome));
+                emit(To::Detail, &progress_line(done, total, &name, &outcome));
+                let held = hold_rejected && key_rejected(&outcome);
+                if !held {
+                    emit(To::Brief, &ended_line(says, &name, &outcome, started.elapsed()));
+                }
+                // A best-effort step that didn't work out: said, never a failure (`-v`'s line
+                // has it in brackets) — as `up` says it.
+                for w in outcome.warnings() {
+                    emit(To::ErrBrief, &format!("[{}] {} warning: {w}", out::bold(&name), says.what));
+                }
                 if outcome.is_done() {
                     provisioned.push(name);
                 } else {
                     failed += 1;
                     if key_rejected(&outcome) {
-                        rejected.push(name);
+                        rejected.push((name, outcome.describe()));
                     }
                 }
             }
             // A panicked task still counts — as a failure, never silently.
             Err(e) => {
                 failed += 1;
-                let name = names.get(&e.id()).map(String::as_str).unwrap_or("?");
-                emit(&format!("[{done}/{total}] ✗ {name} (its setup task crashed: {e})"));
+                emit(To::Detail, &format!("[{done}/{total}] ✗ {ended} (its setup task crashed: {e})"));
+                emit(To::Brief, &failed_line(says, &ended, &format!("its task crashed: {e}")));
             }
         }
     }
@@ -232,19 +352,19 @@ pub(crate) async fn handle_setup(
     use arena_core::ssh::SshTarget;
 
     let (scfg, tokens_line) = setup_config(cfg, hf_token, zsh_install, no_vscode)?;
-    println!("{tokens_line}");
+    out!(Detail, "{tokens_line}");
     // Claude Code: each pod its own account's token, once it's set up.
     match crate::claude::plan_line(cfg, cc_token.as_deref()) {
-        Ok(Some(line)) => println!("{line}"),
-        Ok(None) => println!("Claude Code: no accounts ({} / {} unset) — skipped", arena_core::claude::TOKENS_FILE_KEY, arena_core::claude::TOKEN_KEY),
-        Err(e) => println!("Claude Code: ✗ {e} — no token goes out"),
+        Ok(Some(line)) => out!(Detail, "{line}"),
+        Ok(None) => out!(Detail, "Claude Code: no accounts ({} / {} unset) — skipped", arena_core::claude::TOKENS_FILE_KEY, arena_core::claude::TOKEN_KEY),
+        Err(e) => out!(Out, "Claude Code: {} {e} — no token goes out", out::cross()),
     }
     // Carry each pod's provider so we can pick bare-VM vs image-based provisioning. A named
     // pod without an endpoint is reported; if none of the named pods is reachable, it fails.
     let targets: Vec<(String, String, SshTarget)> =
         sel.ssh_targets(cfg)?.into_iter().map(|(p, t)| (p.name.clone(), p.provider.clone(), t)).collect();
     if targets.is_empty() {
-        println!("(no pods with an SSH endpoint to set up)");
+        out!(Out, "(no pods with an SSH endpoint to set up)");
         return Ok(());
     }
 
@@ -258,22 +378,31 @@ pub(crate) async fn handle_setup(
         for (name, value) in display_scfg.broadcast_exports.iter_mut() {
             *value = format!("<{name}>");
         }
-        println!("Dry-run — would provision {} pod(s):\n", targets.len());
+        out!(Detail, "Dry-run — would provision {} pod(s):\n", targets.len());
+        // By default a line per set of steps (bare VMs and images differ), naming its pods.
+        let mut plans: Vec<(String, Vec<&str>)> = Vec::new();
         for (name, provider_name, target) in &targets {
-            println!("# {name}");
-            for step in provisioning_steps(provider_name, &display_scfg, name, force, &hetzner_script, &timeouts) {
-                for line in step_preview(&step, target) {
-                    println!("  {line}");
+            out!(Detail, "# {name}");
+            let steps = provisioning_steps(provider_name, &display_scfg, name, force, &hetzner_script, &timeouts);
+            for step in &steps {
+                for line in step_preview(step, target) {
+                    out!(Detail, "  {line}");
                 }
             }
-            println!();
+            out!(Detail, "");
+            let labels = steps.iter().map(|s| s.label()).collect::<Vec<_>>().join(" → ");
+            match plans.iter_mut().find(|(l, _)| *l == labels) {
+                Some((_, names)) => names.push(name),
+                None => plans.push((labels, vec![name])),
+            }
         }
         let keys_present = arena_core::apikeys::PROVIDERS.iter().any(|(base, _, _)| {
             std::fs::read_to_string(format!("{keys_dir}/{base}_api_keys.csv"))
                 .map(|t| !arena_core::apikeys::parse_csv(&t).is_empty())
                 .unwrap_or(false)
         });
-        println!(
+        out!(
+            Detail,
             "API keys: {}",
             if keys_present {
                 format!("found in {keys_dir} — would distribute to each pod above that provisions successfully")
@@ -281,7 +410,11 @@ pub(crate) async fn handle_setup(
                 format!("none in {keys_dir} — would skip")
             }
         );
-        println!("Preview only — run without --dry-run to execute over SSH.");
+        let keys = if keys_present { " → API keys" } else { "" };
+        for (labels, names) in &plans {
+            out!(Brief, "Would set up {}: {labels}{keys}", all_names(names));
+        }
+        out!(Detail, "Preview only — run without --dry-run to execute over SSH.");
         return Ok(());
     }
 
@@ -292,7 +425,8 @@ pub(crate) async fn handle_setup(
         Some(_) => format!(", vscode warm-up {}s", timeouts.vscode.as_secs()),
         None => String::new(),
     };
-    println!(
+    out!(
+        Detail,
         "Provisioning {total} pod(s) over SSH (budgets: copy {}s, config {}s, hetzner script {}s{vscode})…",
         timeouts.copy.as_secs(),
         timeouts.config.as_secs(),
@@ -305,43 +439,56 @@ pub(crate) async fn handle_setup(
         after_repair,
     };
     let jobs = targets.iter().cloned().map(|t| job(t, false)).collect();
+    // A pod refusing our key may yet be set up after a repair: its default line waits for it.
     let (mut provisioned, mut failed, rejected) =
-        provision_fleet(remote.clone(), jobs, BootRetry::default(), |line| println!("{line}")).await;
+        provision_fleet(remote.clone(), jobs, BootRetry::default(), SETUP, repair.is_some(), out::emit).await;
 
     // A pod that refused our key: its provider may re-attach the keys (Vast). Then those pods
     // run setup again, waiting for the attach to land (bounded); the rest stand as reported.
     if let Some(provider) = repair.filter(|_| !rejected.is_empty()) {
         let mut retry = Vec::new();
-        for (name, provider_name, target) in targets.iter().filter(|(n, _, _)| rejected.contains(n)) {
+        for (name, provider_name, target) in targets.iter().filter(|(n, _, _)| rejected.iter().any(|(r, _)| r == n)) {
+            // What happened to it, for its default line (held back by `provision_fleet`).
+            let why = rejected.iter().find(|(r, _)| r == name).map_or("", |(_, w)| w.as_str());
+            let failed_now = || out!(Brief, "{}", failed_line(SETUP, name, why));
             // The pod behind this target (by its endpoint: two pods may share a name).
             let Some(pod) = sel.pods.iter().find(|p| {
                 &p.name == name && p.ssh_ip.as_deref() == Some(target.host.as_str()) && p.ssh_port == Some(target.port)
             }) else {
+                failed_now();
                 continue;
             };
             match repair_pod_keys(provider, cfg, pod).await {
                 Ok(n) => {
-                    println!("  {name} refused our SSH key — re-attached {n} key(s) through the {} API", pod.provider);
+                    out!(Detail, "  {name} refused our SSH key — re-attached {n} key(s) through the {} API", pod.provider);
+                    out!(Brief, "[{}] setup: it refused our SSH key — re-attached it, trying again", out::bold(name));
                     retry.push(job((name.clone(), provider_name.clone(), target.clone()), true));
                 }
-                Err(Some(why)) => println!("  {name} refused our SSH key; {why}"),
-                Err(None) => {}
+                Err(Some(repair_why)) => {
+                    out!(Detail, "  {name} refused our SSH key; {repair_why}");
+                    out!(Brief, "{}", failed_line(SETUP, name, &format!("{why}; {repair_why}")));
+                }
+                Err(None) => failed_now(),
             }
         }
         if !retry.is_empty() {
-            println!(
+            out!(
+                Detail,
                 "Retrying setup on {} pod(s) whose keys were re-attached (up to {}×, {}s apart)…",
                 retry.len(),
                 arena_core::setup::KEY_REPAIR_TRIES,
                 arena_core::setup::KEY_REPAIR_EVERY.as_secs()
             );
-            let (fixed, _, _) =
-                provision_fleet(remote.clone(), retry, BootRetry::default(), |line| println!("{line}")).await;
+            let (fixed, _, _) = provision_fleet(remote.clone(), retry, BootRetry::default(), SETUP, false, out::emit).await;
             failed = failed.saturating_sub(fixed.len());
             provisioned.extend(fixed);
         }
     }
-    println!("\nDone: {} provisioned, {failed} failed.", provisioned.len());
+    out!(Detail, "\nDone: {} provisioned, {failed} failed.", provisioned.len());
+    // One pod's line says it all; several get the count (a failure ends in the error instead).
+    if total > 1 && failed == 0 {
+        out!(Brief, "{}", out::ok(format!("{} of {total} set up", provisioned.len())));
+    }
 
     // Auto-handle API keys: if per-host CSVs have been generated, distribute them and say
     // so; otherwise report they're not set up (rather than silently doing nothing). HF is
@@ -358,13 +505,14 @@ pub(crate) async fn handle_setup(
         .map(|(_, display, _)| *display)
         .collect();
     if csv_sources.is_empty() && !archive_ready {
-        println!(
+        out!(
+            Detail,
             "API keys: none generated in {keys_dir}/ — skipping (run `arena keys gen --all` \
              or drop in <provider>_api_keys.csv, then re-run setup / `pods copy-keys`)."
         );
     } else if provisioned.is_empty() {
         if !csv_sources.is_empty() {
-            println!("API keys: found {} — skipped, no pod provisioned successfully.", csv_sources.join(", "));
+            out!(Detail, "API keys: found {} — skipped, no pod provisioned successfully.", csv_sources.join(", "));
         }
     } else {
         // Scope key distribution to exactly the pods that just provisioned OK: never the
@@ -373,12 +521,14 @@ pub(crate) async fn handle_setup(
         // pod's write is bounded by COPY_KEYS_TIMEOUT anyway.
         let skipped = if failed > 0 { format!(" (skipping the {failed} that failed)") } else { String::new() };
         if csv_sources.is_empty() {
-            println!(
+            out!(
+                Detail,
                 "API keys: none generated in {keys_dir}/ — writing the backup archive's access to the {} provisioned pod(s){skipped}…",
                 provisioned.len()
             );
         } else {
-            println!(
+            out!(
+                Detail,
                 "API keys: found {} — distributing to the {} provisioned pod(s){skipped}…",
                 csv_sources.join(", "),
                 provisioned.len()
@@ -390,7 +540,8 @@ pub(crate) async fn handle_setup(
         };
         // copy-keys runs the Claude Code stage too (with `--cc-token`, if given).
         if let Err(e) = handle_copy_keys(remote.clone(), cfg, keys_dir, None, cc_token.clone(), &done, false, true).await {
-            eprintln!("  (API-key distribution failed: {e})");
+            out!(ErrDetail, "  (API-key distribution failed: {e})");
+            out!(ErrBrief, "{}", out::warn(format!("API keys: {e} (retry: arena pods copy-keys {})", provisioned.join(" "))));
         }
     }
     // No copy-keys to do it: the Claude Code stage on its own, for the pods that set up OK.
@@ -434,29 +585,36 @@ pub(crate) async fn handle_notes(
     let targets: Vec<(String, String, arena_core::ssh::SshTarget)> =
         sel.ssh_targets(cfg)?.into_iter().map(|(p, t)| (p.name.clone(), p.provider.clone(), t)).collect();
     if targets.is_empty() {
-        println!("(no pods with an SSH endpoint)");
+        out!(Out, "(no pods with an SSH endpoint)");
         return Ok(());
     }
     if !apply {
-        println!("Dry-run — would write the agents' notes on {} pod(s):\n", targets.len());
+        out!(Detail, "Dry-run — would write the agents' notes on {} pod(s):\n", targets.len());
         for (name, provider, _) in &targets {
-            println!("# {name}\n  {}\n", notes.summary(provider));
+            out!(Detail, "# {name}\n  {}\n", notes.summary(provider));
         }
-        println!("Preview only — run without --dry-run to execute over SSH.");
+        let names: Vec<&str> = targets.iter().map(|(n, _, _)| n.as_str()).collect();
+        out!(Brief, "Would write the agents' notes ({}) and link uv into /usr/local/bin on {}", arena_core::agent_notes::FILES.join(", "), all_names(&names));
+        out!(Detail, "Preview only — run without --dry-run to execute over SSH.");
         return Ok(());
     }
-    println!(
+    out!(
+        Detail,
         "Writing the agents' notes on {} pod(s) over SSH (budget {}s each)…",
         targets.len(),
         arena_core::agent_notes::TIMEOUT.as_secs()
     );
+    let total = targets.len();
     let jobs = targets
         .into_iter()
         .map(|(name, provider, target)| SetupJob { steps: vec![notes.step(&provider, true)], name, target, after_repair: false })
         .collect();
     let no_boot = BootRetry { window: Duration::ZERO, every: Duration::ZERO };
-    let (written, failed, _) = provision_fleet(remote, jobs, no_boot, |line| println!("{line}")).await;
-    println!("\nDone: {} up to date, {failed} failed.", written.len());
+    let (written, failed, _) = provision_fleet(remote, jobs, no_boot, NOTES, false, out::emit).await;
+    out!(Detail, "\nDone: {} up to date, {failed} failed.", written.len());
+    if total > 1 && failed == 0 {
+        out!(Brief, "{}", out::ok(format!("{} of {total} up to date", written.len())));
+    }
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed to get the agents' notes");
     }
@@ -468,3 +626,7 @@ pub(crate) async fn handle_notes(
 /// budget — not at the hang.
 #[cfg(test)]
 mod setup_tests;
+
+/// Golden tests of `pods setup`'s output (docs/OUTPUT.md), at default and at `-v`.
+#[cfg(test)]
+mod output_tests;
