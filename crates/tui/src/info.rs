@@ -36,6 +36,7 @@ const ALL_KEYS: &[(&str, &str)] = &[
     ("q / ctrl-c", "quit (asks first while a run that changes pods is going)"),
     ("esc", "back to the list from the detail view; on the list, clear the marks"),
     ("↑↓ / j k", "move the cursor"),
+    ("g G / home end / shift-↑↓", "the first / last pod"),
     ("enter", "the detail view of the cursor pod"),
     ("i  (or click [i] info)", "this panel"),
     ("space", "mark / unmark the cursor pod"),
