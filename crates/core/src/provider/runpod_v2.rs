@@ -136,17 +136,20 @@ impl RunpodV2Provider {
     /// Forget `id`'s remembered endpoint: this provider is about to stop, start, restart,
     /// reimage or terminate it, and a restart gets a new port.
     fn forget_endpoint(&self, id: &str) {
-        self.endpoints.lock().unwrap_or_else(std::sync::PoisonError::into_inner).by_id.remove(id);
-    }
-
-    /// Note a reimage of `id` that went through: it keeps the pod's `startedAt`, so until a
-    /// lookup shows the new container ([`is_new_container`]) the pod has no endpoint
-    /// ([`EndpointMemo::resets`]). `before`: the pod's detail just before the request, if read.
-    /// Only after the request succeeded: a refused one left the old container as the pod's.
-    fn note_reset(&self, id: &str, before: Option<&Value>) {
         let mut m = self.endpoints.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         m.by_id.remove(id);
-        m.resets.insert(id.to_string(), Reset::of(before, crate::status::now_secs()));
+        m.resets.remove(id);
+    }
+
+    /// Note a reimage of `id` that went through, sent at `sent_at`: it keeps the pod's
+    /// `startedAt`, so until a lookup shows the new container ([`is_new_container`]) the pod
+    /// has no endpoint ([`EndpointMemo::resets`]). `before`: the pod's detail just before the
+    /// request, if read. Only after the request succeeded: a refused one left the old container
+    /// as the pod's.
+    fn note_reset(&self, id: &str, before: Option<&Value>, sent_at: u64) {
+        let mut m = self.endpoints.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        m.by_id.remove(id);
+        m.resets.insert(id.to_string(), Reset::of(before, sent_at));
     }
 
     /// The listing from `page` (one list page per cursor) and `detail` (one pod's detail), with
@@ -559,22 +562,32 @@ struct EndpointMemo {
     resets: HashMap<String, Reset>,
 }
 
-/// A reimage this provider sent: when (unix seconds), and the container it replaced as the
-/// pod's detail showed it just before — its SSH port and `runtime.uptime` — where known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A reimage this provider sent: when, and the container it replaced as the pod's detail
+/// showed it just before — its SSH port and `runtime.uptime` — where known.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Reset {
+    /// When the request went out (unix seconds): the new container started after it.
     at: u64,
+    /// The pod's `startedAt` then: a start or restart since makes the reset moot.
+    started_at: Option<u64>,
     old_port: Option<u16>,
     old_uptime: Option<u64>,
+    /// The new container's endpoint, once a lookup showed it. A listing that still names
+    /// another is overruled by it, until the listing names this one (review r2).
+    new: Option<(String, u16)>,
 }
 
 impl Reset {
-    /// The reset at `at` of the container `before` (the pod's detail; `None`: not read). Pure.
+    /// The reset sent at `at` of the container `before` (the pod's detail; `None`: not read).
+    /// Pure.
     fn of(before: Option<&Value>, at: u64) -> Self {
+        let old = before.map(parse_pod);
         Reset {
             at,
-            old_port: before.and_then(|b| parse_pod(b).ssh_port),
+            started_at: old.as_ref().and_then(|p| p.started_at),
+            old_port: old.as_ref().and_then(|p| p.ssh_port),
             old_uptime: before.and_then(container_uptime),
+            new: None,
         }
     }
 }
@@ -586,33 +599,27 @@ fn container_uptime(body: &Value) -> Option<u64> {
 }
 
 /// How long a reimaged pod's endpoint waits for its new container at most (an image pull can
-/// take minutes; never forever). Then the pod is listed as RunPod lists it.
+/// take minutes; never forever). Then the pod is listed as RunPod lists it — long after any
+/// caller's own wait has given up (the settle wait's is 10 min).
 const RESET_WAIT_SECS: u64 = 1800;
-
-/// After this long a reimaged pod's detail no longer shows the old container (live: ≤ 50 s), so
-/// an endpoint whose uptime fits in the time since is the new one even without other evidence.
-const RESET_FALLBACK_SECS: u64 = 120;
 
 /// The seconds of clock between RunPod's uptime and ours that still count as "since the reset".
 const CLOCK_SLACK: u64 = 5;
 
-/// Whether a reimaged pod's detail (`body`) shows the new container, on positive evidence: an
-/// endpoint whose container started since the reset by its uptime (none: can't tell) and, as
-/// well, an uptime lower than the old container's, or another SSH port than the old one's, or
-/// [`RESET_FALLBACK_SECS`] gone by — or, where nothing of the old container was known, an
-/// uptime that says so. A just-started old container keeps its port and counts on, so it isn't
-/// taken for the new one. Pure.
-fn is_new_container(body: &Value, reset: Reset, now: u64) -> bool {
+/// Whether a reimaged pod's detail (`body`) shows the new container, on positive evidence only:
+/// an endpoint whose uptime fits in the time since the reset and, as well, is lower than the old
+/// container's was, or is on another SSH port than the old one's — or, where nothing of the old
+/// container was known, the uptime alone. Nothing else, however long it takes: a just-started
+/// old container keeps its port and counts on, and no uptime tells nothing (review r2: a wait
+/// that times out is better than setup on the container being replaced). Pure.
+fn is_new_container(body: &Value, reset: &Reset, now: u64) -> bool {
     let since = now.saturating_sub(reset.at);
-    let up = container_uptime(body);
     let Some(port) = parse_pod(body).ssh_port else { return false };
-    if up.is_some_and(|u| u > since + CLOCK_SLACK) {
-        return false;
-    }
-    let uptime_went_back = matches!((up, reset.old_uptime), (Some(u), Some(old)) if u + CLOCK_SLACK < old);
+    let Some(up) = container_uptime(body).filter(|&u| u <= since + CLOCK_SLACK) else { return false };
+    let uptime_went_back = reset.old_uptime.is_some_and(|old| up + CLOCK_SLACK < old);
     let port_moved = reset.old_port.is_some_and(|old| old != port);
-    let nothing_known = reset.old_port.is_none() && reset.old_uptime.is_none() && up.is_some();
-    uptime_went_back || port_moved || nothing_known || since >= RESET_FALLBACK_SECS
+    let nothing_known = reset.old_port.is_none() && reset.old_uptime.is_none();
+    uptime_went_back || port_moved || nothing_known
 }
 
 /// An endpoint looked up within this long of the pod's start may not be its new one yet.
@@ -654,22 +661,41 @@ where
     let remembered = |p: &Pod| lock().by_id.get(&p.id).filter(|r| p.started_at == Some(r.started_at)).cloned();
     {
         let up: HashSet<&str> = pods.iter().filter(|p| running(p)).map(|p| p.id.as_str()).collect();
-        let listed: HashSet<&str> = pods.iter().map(|p| p.id.as_str()).collect();
         let mut m = lock();
         m.by_id.retain(|id, _| up.contains(id.as_str()));
         m.lookups.retain(|&t| now.saturating_sub(t) < 60);
         // A reimaged pod that's still coming up may list as not running for a moment: kept
-        // while it's listed at all, and for so long.
-        m.resets.retain(|id, r| listed.contains(id.as_str()) && now.saturating_sub(r.at) < RESET_WAIT_SECS);
+        // while it's listed at all, for so long, and until it's started again.
+        let starts: HashMap<&str, Option<u64>> = pods.iter().map(|p| (p.id.as_str(), p.started_at)).collect();
+        m.resets.retain(|id, r| {
+            let restarted = matches!((starts.get(id.as_str()), r.started_at), (Some(Some(now_start)), Some(then)) if *now_start != then);
+            starts.contains_key(id.as_str()) && !restarted && now.saturating_sub(r.at) < RESET_WAIT_SECS
+        });
     }
-    let reset = |p: &Pod| lock().resets.get(&p.id).copied();
+    let reset = |p: &Pod| lock().resets.get(&p.id).cloned();
     let (mut unknown, mut due) = (Vec::new(), Vec::new());
     for (i, p) in pods.iter_mut().enumerate() {
-        // A reimaged pod's listed endpoint may be its old container's: looked up, always.
-        if running(p) && reset(p).is_some() {
-            (p.ssh_ip, p.ssh_port) = (None, None);
-            unknown.push(i);
-            continue;
+        if let Some(r) = reset(p).filter(|_| running(p)) {
+            let listed = p.ssh_ip.clone().zip(p.ssh_port);
+            match r.new {
+                // A reimaged pod's listed endpoint may be its old container's: looked up, always.
+                None => {
+                    (p.ssh_ip, p.ssh_port) = (None, None);
+                    unknown.push(i);
+                    continue;
+                }
+                // The new container's, shown: the listing has caught up — done.
+                Some(new) if listed.as_ref() == Some(&new) => {
+                    lock().resets.remove(&p.id);
+                }
+                // A listing still naming the old one is overruled.
+                Some((ip, port)) if listed.is_some() => {
+                    (p.ssh_ip, p.ssh_port, p.proxy_only) = (Some(ip), Some(port), false);
+                    continue;
+                }
+                // No endpoint listed: the remembered one, as for any pod.
+                Some(_) => {}
+            }
         }
         if !running(p) || (p.ssh_ip.is_some() && p.ssh_port.is_some()) {
             continue;
@@ -696,7 +722,8 @@ where
         for &i in batch {
             let id = pods[i].id.clone();
             let future = fetch(id.clone());
-            let reset = lock().resets.get(&id).copied();
+            // Still waiting for its new container: the detail must show it.
+            let reset = lock().resets.get(&id).filter(|r| r.new.is_none()).cloned();
             // The caller's rate-limit wait bound goes with the lookup (a spawned task doesn't
             // inherit it), and the lookup's own 5 s bounds its waits, a margin left for the
             // request: a held quota fails it as rate-limited, saying so, not as a timeout.
@@ -712,7 +739,7 @@ where
                     }
                     // Reimaged: until the new container shows, the pod has no endpoint (the
                     // old container's isn't its any more); once it does, the wait is over.
-                    let new_container = reset.is_some_and(|r| is_new_container(&body, r, now));
+                    let new_container = reset.as_ref().is_some_and(|r| is_new_container(&body, r, now));
                     if reset.is_some() && !new_container {
                         (detail.ssh_ip, detail.ssh_port) = (None, None);
                     }
@@ -727,8 +754,10 @@ where
             answered.insert(i);
             match looked_up {
                 Ok((detail, new_container)) => {
-                    if new_container {
-                        lock().resets.remove(&pods[i].id);
+                    if let (true, Some(ip), Some(port)) = (new_container, detail.ssh_ip.clone(), detail.ssh_port) {
+                        if let Some(r) = lock().resets.get_mut(&pods[i].id) {
+                            r.new = Some((ip, port));
+                        }
                     }
                     let listed_start = pods[i].started_at;
                     match (listed_start, detail.ssh_ip.clone(), detail.ssh_port) {
@@ -1421,9 +1450,11 @@ impl Provider for RunpodV2Provider {
         self.forget_endpoint(id);
         let keys = self.keys_to_merge(env).await?;
         let body = reimage_payload(image, env, &keys, resize.disk_gb, volume.as_ref().map(|(gb, path)| (*gb, path.as_str())));
+        // The new container may start before the answer comes back: timed from the request.
+        let sent_at = crate::status::now_secs();
         send_ok(api_request(&self.client, &self.api_key, Method::PATCH, url.clone()).json(&body), "reimage pod").await?;
         // Its `startedAt` stays, and the old container shows a while: see `resets`.
-        self.note_reset(id, before.as_ref());
+        self.note_reset(id, before.as_ref(), sent_at);
         Ok(())
     }
 
@@ -2263,11 +2294,16 @@ mod tests {
         // One that did: its endpoint waits for the new container, told by the old one's facts.
         let before = json!({"id": "e", "status": "RUNNING", "runtime": {"uptime": 315, "ports": [{"ip": "203.0.113.9", "private": 22, "public": 19984, "type": "tcp"}]}});
         remember("e");
-        p.note_reset("e", Some(&before));
-        let m = p.endpoints.lock().unwrap();
-        assert!(!m.by_id.contains_key("e"));
-        let r = m.resets["e"];
-        assert_eq!((r.old_port, r.old_uptime), (Some(19984), Some(315)));
+        p.note_reset("e", Some(&before), 1_000);
+        {
+            let m = p.endpoints.lock().unwrap();
+            assert!(!m.by_id.contains_key("e"));
+            let r = &m.resets["e"];
+            assert_eq!((r.at, r.old_port, r.old_uptime, r.new.as_ref()), (1_000, Some(19984), Some(315), None));
+        }
+        // This provider's own next stop, start, restart or terminate ends the wait.
+        assert!(p.stop_pod("e").await.is_err());
+        assert!(p.endpoints.lock().unwrap().resets.is_empty());
     }
 
     /// The guards fire before any request: a bad tier (which v2 would turn into SECURE if
