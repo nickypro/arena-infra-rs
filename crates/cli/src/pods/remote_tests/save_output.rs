@@ -201,7 +201,6 @@ async fn backup_dry_run_is_a_line_and_the_script_is_for_v() {
         out.push(stable(&rendered(verbose, &[], run).await, &stub, &cfg));
         assert!(fake.calls().is_empty());
     }
-    assert_eq!(out[0], "[dry-run] would commit + push the current branch of 1 pod(s): devtest-apple (main/master skipped; -v: the script)\n");
     let target = targets(&one).remove(0).1;
     let line = arena_core::backup::backup_dry_run_line(&target, REPO, Some(KEY), "arena backup devtest-apple", None);
     assert!(
@@ -215,10 +214,14 @@ async fn backup_dry_run_is_a_line_and_the_script_is_for_v() {
         "{}",
         out[1]
     );
-    assert!(out[1].ends_with(
-        "(a pod whose git push fails at the push itself, or whose origin isn't the configured repo, is then copied into <tmp>/backups \
-         by rsync — even under --no-pull)\n"
-    ));
+    let copied = "(a pod whose git push fails at the push itself, or whose origin isn't the configured repo, is then copied into \
+                  <tmp>/backups by rsync — even under --no-pull)\n";
+    assert!(out[1].ends_with(copied));
+    // That a pod whose push fails is copied all the same is said by default too: it writes here.
+    assert_eq!(
+        out[0],
+        format!("[dry-run] would commit + push the current branch of 1 pod(s): devtest-apple (main/master skipped; -v: the script)\n{copied}")
+    );
     assert!(out[1].lines().count() > 300, "the script is there with -v");
 }
 
@@ -285,8 +288,8 @@ async fn pull_dry_run_is_a_line() {
     }
     assert_eq!(
         out[0],
-        "[dry-run] would copy 1 pod(s) into <tmp>/backups/wNdM/<pod> (files < 50M) + <tmp>/backups/big/<pod> (all files): \
-         devtest-apple (-v: each rsync)\n"
+        "[dry-run] would copy the home of 1 pod(s) into <tmp>/backups/wNdM/<pod> (files < 50M) + <tmp>/backups/big/<pod> (all \
+         files): devtest-apple (-v: each rsync)\n"
     );
     assert!(out[1].contains("Dry-run — would rsync 1 pod(s), 2 tier(s) each:\n\n# devtest-apple\n  [snapshot] rsync -avz"), "{}", out[1]);
     assert!(out[1].ends_with("Preview only — run without --dry-run to copy.\n"), "{}", out[1]);
@@ -321,8 +324,8 @@ async fn set_branch_says_what_needs_saying_and_a_tally() {
     assert_eq!(
         out[0],
         format!(
-            "HARD-reset devtest-apple, devtest-bloom to origin/main (each one's branch pushed first; local changes discarded, \
-             saved on the pod)? [y/N] y\n\
+            "HARD-reset devtest-apple, devtest-bloom to origin/main (each one's branch pushed first; local commits and changes \
+             discarded, saved on the pod)? [y/N] y\n\
              ✗ devtest-bloom: {blocked}\n\
              ✓ home copy of 1 pod → <tmp>/backups/wNdM\n\
              [1/1] {switched}\n\
@@ -506,8 +509,10 @@ fn a_failed_rsyncs_line_keeps_its_own_words() {
         "rsync: [sender] send_files failed to open \"/root/f1\": Permission denied (13) (+4 like it); rsync error: some files/attrs \
          were not transferred (code 23)"
     );
-    let many: String = (1..=10).map(|i| format!("line {i}\n")).collect();
-    assert_eq!(rsync_why(&many), "line 1; line 2; line 3; line 4; line 5; line 6; line 7; line 8; (+2 more line(s))");
+    // Every line that isn't one like it, however many (review r4 #2): a banner, then ssh's cause.
+    let banner: String = (1..=10).map(|i| format!("banner line {i}\n")).collect();
+    let all = rsync_why(&format!("{banner}root@10.0.0.1: Permission denied (publickey).\n"));
+    assert!(all.starts_with("banner line 1; banner line 2; ") && all.ends_with("; banner line 10; root@10.0.0.1: Permission denied (publickey)."), "{all}");
     assert_eq!(rsync_why("rsync error: error in file IO (code 11)\n"), "rsync error: error in file IO (code 11)");
     assert_eq!(rsync_why(""), "");
 }

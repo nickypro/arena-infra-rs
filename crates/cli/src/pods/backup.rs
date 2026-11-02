@@ -198,7 +198,11 @@ pub(crate) async fn handle_full_backup(
         };
         (
             format!("commit + push {scope} (git), then rsync the home(s) to {dest}"),
-            format!("Back up {shown} (git push, then copy each home into {})?", crate::pods::pull::copy_places(&base, Some(&big_root))),
+            format!(
+                "Back up {shown} (git push, then copy {} of each into {})?",
+                crate::pods::pull::copy_source(cfg.get("BACKUP_REMOTE_PATH").unwrap_or_default()),
+                crate::pods::pull::copy_places(&base, Some(&big_root))
+            ),
         )
     };
     if !dry_run && !crate::confirm_brief(yes, &format!("Will {what}."), &question)? {
@@ -259,8 +263,9 @@ pub(crate) async fn handle_full_backup(
         return both_failures(settled.git(git_result), pulled.and_then(Pulled::result), &locks.busy);
     }
     if no_pull && dry_run {
+        // By default too: under --no-pull it's the one way the run writes onto this box.
         out!(
-            Detail,
+            Out,
             "(a pod whose git push fails at the push itself, or whose origin isn't the configured repo, is then copied into \
              {dir} by rsync — even under --no-pull)"
         );

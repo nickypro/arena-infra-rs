@@ -229,6 +229,16 @@ pub(crate) fn busy_line(name: &str, wait: Duration) -> String {
     format!("busy: another backup of {name} is running (waited {}s for its lock) — skipped this run", wait.as_secs())
 }
 
+/// What a copy takes from each pod, for a one-line question or dry run: `the home`, or the
+/// `--remote-path` / `BACKUP_REMOTE_PATH` it's told (review r4 #1). Pure.
+pub(crate) fn copy_source(remote_path: &str) -> String {
+    if remote_path.is_empty() {
+        "the home".to_string()
+    } else {
+        remote_path.to_string()
+    }
+}
+
 /// Where a copy lands, for a one-line question: the backup dir, and the all-files tier's root
 /// too when it's elsewhere (`LOCAL_BACKUP_BIG_DIR`: another volume) — every place that receives
 /// the pods' files is named (review r3 #2). Pure.
@@ -474,9 +484,11 @@ pub(crate) async fn pull_pods(
         // By default where the copies would go, in a line; each rsync's argv with `-v`.
         let names: Vec<String> = targets.iter().map(|(n, _)| n.clone()).collect();
         let big_too = if no_big { String::new() } else { format!(" + {big_root}/<pod> (all files)") };
+        let git = if no_git { ", no .git" } else { "" };
         out!(
             Brief,
-            "[dry-run] would copy {} pod(s) into {dir}/{label}/<pod> (files < {threshold}){big_too}: {} (-v: each rsync)",
+            "[dry-run] would copy {} of {} pod(s) into {dir}/{label}/<pod> (files < {threshold}){big_too}{git}: {} (-v: each rsync)",
+            copy_source(&remote_path),
             names.len(),
             arena_core::backups::render::names_line(&names, crate::pods::backup::NAMES_SHOWN)
         );
@@ -521,7 +533,15 @@ pub(crate) async fn pull_pods(
     let shown = arena_core::backups::render::names_line(&targets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), crate::pods::backup::NAMES_SHOWN);
     let what = format!("Will rsync {} pod home(s) into {dest_msg}: {names}", targets.len());
     let into = copy_places(dir, (!no_big).then_some(big_root.as_str()));
-    if !crate::confirm_brief(yes, &what, &format!("Copy the home of {shown} into {into}?"))? {
+    // What's copied, from where, and anything it leaves out — as the question says it.
+    let only = match (no_big, no_git) {
+        (true, true) => format!(" (files < {threshold} only, no .git)"),
+        (true, false) => format!(" (files < {threshold} only)"),
+        (false, true) => " (no .git)".to_string(),
+        (false, false) => String::new(),
+    };
+    let question = format!("Copy {} of {shown} into {into}{only}?", copy_source(&remote_path));
+    if !crate::confirm_brief(yes, &what, &question)? {
         out!(Out, "aborted.");
         return Ok(Pulled::default());
     }
@@ -947,7 +967,8 @@ fn copy_tally(pods: &[String], overdue: &[String], failed: &[(String, String)], 
 /// backup's (docs/OUTPUT.md; a cron's log can't be asked again with `-v`): all of it, in order, on
 /// one line — ssh's notices and cause, rsync's or git's own lines and the verdict — save that lines saying the same of different files
 /// (`send_files failed to open "…": Permission denied (13)` for each of a thousand) are one line
-/// and how many more like it, and past [`WHY_KINDS`] kinds, how many lines more. Pure.
+/// and how many more like it. Every other line is kept (review r4 #2: a banner of eight lines
+/// would have hidden ssh's cause). Pure.
 pub(crate) fn stderr_line(stderr: &str) -> String {
     // A line's kind: its words with any quoted path taken out.
     let kind = |l: &str| l.split('"').enumerate().filter(|(i, _)| i % 2 == 0).map(|(_, p)| p).collect::<Vec<_>>().join("\"\"");
@@ -959,18 +980,8 @@ pub(crate) fn stderr_line(stderr: &str) -> String {
             None => kinds.push((k, line, 0)),
         }
     }
-    let shown = kinds.len().min(WHY_KINDS);
-    let mut parts: Vec<String> =
-        kinds[..shown].iter().map(|(_, line, more)| if *more == 0 { line.to_string() } else { format!("{line} (+{more} like it)") }).collect();
-    let hidden: usize = kinds[shown..].iter().map(|(_, _, more)| more + 1).sum();
-    if hidden > 0 {
-        parts.push(format!("(+{hidden} more line(s))"));
-    }
-    parts.join("; ")
+    kinds.iter().map(|(_, line, more)| if *more == 0 { line.to_string() } else { format!("{line} (+{more} like it)") }).collect::<Vec<_>>().join("; ")
 }
-
-/// How many kinds of line a failure's default line keeps ([`stderr_line`]).
-const WHY_KINDS: usize = 8;
 
 /// Why a selected pod wasn't pulled: no endpoint to reach it at.
 const NO_ENDPOINT_TO_PULL: &str = "no SSH endpoint to pull from";

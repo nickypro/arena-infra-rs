@@ -146,7 +146,7 @@ async fn switch_branch(remote: Arc<dyn Remote>, cfg: &Config, sel: &Selected, ho
     let shown = names_line(&targets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), NAMES_SHOWN);
     // What a switch does, in a few words: the default's dry run and question.
     let (doing_brief, how_brief) = if hard {
-        (format!("HARD-reset {shown} to origin/{branch}"), "each one's branch pushed first; local changes discarded, saved on the pod")
+        (format!("HARD-reset {shown} to origin/{branch}"), "each one's branch pushed first; local commits and changes discarded, saved on the pod")
     } else {
         (format!("switch {shown} to {branch}"), "each one's branch pushed first")
     };
