@@ -43,7 +43,7 @@
 //!   takes `disk` and `mounts.persistent` too (`pods reimage --disk / --volume`, live
 //!   2026-11-02; a host without the room answers `400 This machine does not have enough disk
 //!   available…` and the pod is left as it was). It keeps the pod's `startedAt`, and the detail
-//!   shows the old container's port for 15–40 s more: [`EndpointMemo::reset_at`].
+//!   shows the old container's port for 15–50 s more: [`EndpointMemo::resets`].
 //! - **Error bodies are read once more** ([`v2_error`]): a `422` is a request the API
 //!   rejected as invalid (an unknown GPU type, a schema violation) — a config error, never
 //!   capacity, never retried; a `400 "Pod is locked"` is [`ProviderErrorKind::Locked`].
@@ -139,13 +139,14 @@ impl RunpodV2Provider {
         self.endpoints.lock().unwrap_or_else(std::sync::PoisonError::into_inner).by_id.remove(id);
     }
 
-    /// [`Self::forget_endpoint`] for a reset that keeps the pod's `startedAt` — a reimage — and
-    /// note when: until a lookup shows a container younger than that, the pod has no endpoint
-    /// ([`EndpointMemo::reset_at`]).
-    fn reset_endpoint(&self, id: &str) {
+    /// Note a reimage of `id` that went through: it keeps the pod's `startedAt`, so until a
+    /// lookup shows the new container ([`is_new_container`]) the pod has no endpoint
+    /// ([`EndpointMemo::resets`]). `before`: the pod's detail just before the request, if read.
+    /// Only after the request succeeded: a refused one left the old container as the pod's.
+    fn note_reset(&self, id: &str, before: Option<&Value>) {
         let mut m = self.endpoints.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         m.by_id.remove(id);
-        m.reset_at.insert(id.to_string(), crate::status::now_secs());
+        m.resets.insert(id.to_string(), Reset::of(before, crate::status::now_secs()));
     }
 
     /// The listing from `page` (one list page per cursor) and `detail` (one pod's detail), with
@@ -549,25 +550,69 @@ impl Remembered {
 struct EndpointMemo {
     by_id: HashMap<String, Remembered>,
     lookups: std::collections::VecDeque<u64>,
-    /// Pods this provider reimaged, with when (unix seconds). A reimage's PATCH leaves
-    /// `startedAt` as it was, and the detail keeps the old container's port — and its
-    /// `runtime.uptime` — for a while (live 2026-11-02: 14 s on one, ~40 s on another; the
-    /// settle wait took the old port, and setup then failed on it). Until a lookup shows a
-    /// container younger than the reset ([`is_old_container`]), such a pod is always looked up
-    /// and listed without an endpoint; then the entry goes.
-    reset_at: HashMap<String, u64>,
+    /// Pods this provider reimaged ([`Reset`]). A reimage's PATCH leaves `startedAt` as it
+    /// was, and the detail keeps showing the old container — its port, its `runtime.uptime`
+    /// still counting — for a while (live 2026-11-02: 14 s on one, ~50 s on another; the settle
+    /// wait took the old port, and setup then failed on it). Until a lookup shows the new
+    /// container ([`is_new_container`]), such a pod is always looked up and listed without an
+    /// endpoint; then the entry goes.
+    resets: HashMap<String, Reset>,
 }
 
-/// How long a reimaged pod's endpoint waits for its new container before an old-looking one is
-/// trusted after all (an image pull can take minutes; never forever).
+/// A reimage this provider sent: when (unix seconds), and the container it replaced as the
+/// pod's detail showed it just before — its SSH port and `runtime.uptime` — where known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reset {
+    at: u64,
+    old_port: Option<u16>,
+    old_uptime: Option<u64>,
+}
+
+impl Reset {
+    /// The reset at `at` of the container `before` (the pod's detail; `None`: not read). Pure.
+    fn of(before: Option<&Value>, at: u64) -> Self {
+        Reset {
+            at,
+            old_port: before.and_then(|b| parse_pod(b).ssh_port),
+            old_uptime: before.and_then(container_uptime),
+        }
+    }
+}
+
+/// A detail's `runtime.uptime`: how long its container has run, in seconds (RunPod refreshes it
+/// about every 30 s). Pure.
+fn container_uptime(body: &Value) -> Option<u64> {
+    body.pointer("/runtime/uptime").and_then(Value::as_u64)
+}
+
+/// How long a reimaged pod's endpoint waits for its new container at most (an image pull can
+/// take minutes; never forever). Then the pod is listed as RunPod lists it.
 const RESET_WAIT_SECS: u64 = 1800;
 
-/// Whether a reimaged pod's detail (`body`) still shows the container from before the reset
-/// at `reset_at`: one whose `runtime.uptime` is longer than the time since (and a few seconds
-/// of clock). No uptime: it can't be told, so not. Pure.
-fn is_old_container(body: &Value, reset_at: u64, now: u64) -> bool {
-    let since = now.saturating_sub(reset_at);
-    body.pointer("/runtime/uptime").and_then(Value::as_u64).is_some_and(|up| up > since + 5)
+/// After this long a reimaged pod's detail no longer shows the old container (live: ≤ 50 s), so
+/// an endpoint whose uptime fits in the time since is the new one even without other evidence.
+const RESET_FALLBACK_SECS: u64 = 120;
+
+/// The seconds of clock between RunPod's uptime and ours that still count as "since the reset".
+const CLOCK_SLACK: u64 = 5;
+
+/// Whether a reimaged pod's detail (`body`) shows the new container, on positive evidence: an
+/// endpoint whose container started since the reset by its uptime (none: can't tell) and, as
+/// well, an uptime lower than the old container's, or another SSH port than the old one's, or
+/// [`RESET_FALLBACK_SECS`] gone by — or, where nothing of the old container was known, an
+/// uptime that says so. A just-started old container keeps its port and counts on, so it isn't
+/// taken for the new one. Pure.
+fn is_new_container(body: &Value, reset: Reset, now: u64) -> bool {
+    let since = now.saturating_sub(reset.at);
+    let up = container_uptime(body);
+    let Some(port) = parse_pod(body).ssh_port else { return false };
+    if up.is_some_and(|u| u > since + CLOCK_SLACK) {
+        return false;
+    }
+    let uptime_went_back = matches!((up, reset.old_uptime), (Some(u), Some(old)) if u + CLOCK_SLACK < old);
+    let port_moved = reset.old_port.is_some_and(|old| old != port);
+    let nothing_known = reset.old_port.is_none() && reset.old_uptime.is_none() && up.is_some();
+    uptime_went_back || port_moved || nothing_known || since >= RESET_FALLBACK_SECS
 }
 
 /// An endpoint looked up within this long of the pod's start may not be its new one yet.
@@ -615,9 +660,9 @@ where
         m.lookups.retain(|&t| now.saturating_sub(t) < 60);
         // A reimaged pod that's still coming up may list as not running for a moment: kept
         // while it's listed at all, and for so long.
-        m.reset_at.retain(|id, at| listed.contains(id.as_str()) && now.saturating_sub(*at) < RESET_WAIT_SECS);
+        m.resets.retain(|id, r| listed.contains(id.as_str()) && now.saturating_sub(r.at) < RESET_WAIT_SECS);
     }
-    let reset = |p: &Pod| lock().reset_at.get(&p.id).copied();
+    let reset = |p: &Pod| lock().resets.get(&p.id).copied();
     let (mut unknown, mut due) = (Vec::new(), Vec::new());
     for (i, p) in pods.iter_mut().enumerate() {
         // A reimaged pod's listed endpoint may be its old container's: looked up, always.
@@ -651,7 +696,7 @@ where
         for &i in batch {
             let id = pods[i].id.clone();
             let future = fetch(id.clone());
-            let reset_at = lock().reset_at.get(&id).copied();
+            let reset = lock().resets.get(&id).copied();
             // The caller's rate-limit wait bound goes with the lookup (a spawned task doesn't
             // inherit it), and the lookup's own 5 s bounds its waits, a margin left for the
             // request: a held quota fails it as rate-limited, saying so, not as a timeout.
@@ -665,12 +710,12 @@ where
                     if detail.id != id || detail.status == "UNKNOWN" {
                         return Err(Error::provider(format!("invalid detail for {id}: {}", shape_of(&body))));
                     }
-                    // Reimaged: the old container's endpoint isn't the pod's any more; a new
-                    // container's ends the wait.
-                    if reset_at.is_some_and(|at| is_old_container(&body, at, now)) {
+                    // Reimaged: until the new container shows, the pod has no endpoint (the
+                    // old container's isn't its any more); once it does, the wait is over.
+                    let new_container = reset.is_some_and(|r| is_new_container(&body, r, now));
+                    if reset.is_some() && !new_container {
                         (detail.ssh_ip, detail.ssh_port) = (None, None);
                     }
-                    let new_container = reset_at.is_some() && detail.ssh_ip.is_some() && detail.ssh_port.is_some();
                     Ok((detail, new_container))
                 };
                 (i, looked_up.await)
@@ -683,7 +728,7 @@ where
             match looked_up {
                 Ok((detail, new_container)) => {
                     if new_container {
-                        lock().reset_at.remove(&pods[i].id);
+                        lock().resets.remove(&pods[i].id);
                     }
                     let listed_start = pods[i].started_at;
                     match (listed_start, detail.ssh_ip.clone(), detail.ssh_port) {
@@ -1364,19 +1409,22 @@ impl Provider for RunpodV2Provider {
 
     async fn reimage_pod_resized(&self, id: &str, image: &str, env: &[(String, String)], resize: Resize) -> Result<()> {
         let url = pod_url(id, None)?;
-        // A volume goes whole (size + path): its path is read first, and kept.
-        let volume = match resize.volume_gb {
-            Some(gb) => {
-                let pod = send(api_request(&self.client, &self.api_key, Method::GET, url.clone()), "get pod").await?;
-                Some((gb, volume_path(&pod, id)?))
-            }
-            None => None,
+        // The pod as it is: the container the reimage replaces (best-effort: what tells the new
+        // one apart afterwards, `note_reset`) and, for a volume, its path — a volume goes whole
+        // (size + path), so it's read first, and kept.
+        let get = || send(api_request(&self.client, &self.api_key, Method::GET, url.clone()), "get pod");
+        let before = if resize.volume_gb.is_some() { Some(get().await?) } else { get().await.ok() };
+        let volume = match (resize.volume_gb, &before) {
+            (Some(gb), Some(pod)) => Some((gb, volume_path(pod, id)?)),
+            _ => None,
         };
-        // Its `startedAt` stays, and the old container shows a while: see `reset_at`.
-        self.reset_endpoint(id);
+        self.forget_endpoint(id);
         let keys = self.keys_to_merge(env).await?;
         let body = reimage_payload(image, env, &keys, resize.disk_gb, volume.as_ref().map(|(gb, path)| (*gb, path.as_str())));
-        send_ok(api_request(&self.client, &self.api_key, Method::PATCH, url).json(&body), "reimage pod").await
+        send_ok(api_request(&self.client, &self.api_key, Method::PATCH, url.clone()).json(&body), "reimage pod").await?;
+        // Its `startedAt` stays, and the old container shows a while: see `resets`.
+        self.note_reset(id, before.as_ref());
+        Ok(())
     }
 
     async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
@@ -2209,9 +2257,17 @@ mod tests {
         remember("e");
         assert!(p.reimage_pod("e", "img:1", &[]).await.is_err() && gone("e"));
         assert!(!gone("keep"), "only the pod acted on");
-        // A reimage keeps `startedAt`: its endpoint waits for the new container.
-        let reset = p.endpoints.lock().unwrap().reset_at.keys().cloned().collect::<Vec<_>>();
-        assert_eq!(reset, ["e"]);
+        // A reimage that didn't go through leaves the old container as the pod's (review F1):
+        // no wait for a new one.
+        assert!(p.endpoints.lock().unwrap().resets.is_empty());
+        // One that did: its endpoint waits for the new container, told by the old one's facts.
+        let before = json!({"id": "e", "status": "RUNNING", "runtime": {"uptime": 315, "ports": [{"ip": "203.0.113.9", "private": 22, "public": 19984, "type": "tcp"}]}});
+        remember("e");
+        p.note_reset("e", Some(&before));
+        let m = p.endpoints.lock().unwrap();
+        assert!(!m.by_id.contains_key("e"));
+        let r = m.resets["e"];
+        assert_eq!((r.old_port, r.old_uptime), (Some(19984), Some(315)));
     }
 
     /// The guards fire before any request: a bad tier (which v2 would turn into SECURE if

@@ -362,7 +362,14 @@ fn reimage_disk_words() {
     assert!(volume_refusal("devtest-a", 200, both).unwrap().contains("from 200 GB to 100 GB"));
     assert!(volume_refusal("devtest-a", 0, both).unwrap().contains("it has none of its own"));
     assert!(host_lacks_room(NO_ROOM));
-    for other in ["reimage pod: HTTP 400 Bad Request: Pod is locked", "reimage pod: HTTP 500", "can't reach the provider"] {
+    assert!(host_lacks_room("reimage pod HTTP 400: insufficient disk space on host"));
+    for other in [
+        "reimage pod: HTTP 400 Bad Request: Pod is locked",
+        "reimage pod: HTTP 500",
+        "can't reach the provider",
+        "reimage pod HTTP 403 Forbidden: insufficient permissions",
+        "reimage pod HTTP 402: not enough balance to resize",
+    ] {
         assert!(!host_lacks_room(other), "{other}");
     }
     let e = Error::provider(NO_ROOM);

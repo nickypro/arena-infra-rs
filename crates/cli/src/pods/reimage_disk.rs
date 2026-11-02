@@ -144,8 +144,9 @@ pub(crate) fn no_room(name: &str, resize: Resize, e: &arena_core::Error) -> Opti
 
 /// Whether a refused resize's error says the host hasn't the disk for it: RunPod's `400 This
 /// machine does not have enough disk available, please try to allocate less container or volume
-/// disk.` (live 2026-11-02, a 9000 GB disk asked of a pod in EUR-IS-1), or words like it. Pure.
+/// disk.` (live 2026-11-02, a 9000 GB disk asked of a pod in EUR-IS-1), or words like it — about
+/// the disk, so an unrelated "insufficient permissions" or "not enough balance" isn't. Pure.
 pub(crate) fn host_lacks_room(message: &str) -> bool {
     let m = message.to_lowercase();
-    ["enough disk", "not enough", "insufficient", "no space", "disk space", "out of space"].iter().any(|w| m.contains(w))
+    m.contains("disk") && ["not have enough", "not enough", "insufficient", "no space", "out of space"].iter().any(|w| m.contains(w))
 }

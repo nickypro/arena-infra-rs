@@ -1133,9 +1133,10 @@ a 500 GB disk: its host hasn't the room for it (instead: arena pods replace devt
 500)`; `-v` shows RunPod's answer. On Hetzner, Vast and Shadeform it's refused up front with what
 works there ([What works where](#what-works-where), and below).
 
-A RunPod reimage keeps the pod's `startedAt`, and for 15–40 s RunPod still reports the old
-container's SSH port (live 2026-11-02). Until a lookup shows a container younger than the reimage,
-arena lists the pod without an endpoint, so the settle wait and setup go to the new container.
+A RunPod reimage keeps the pod's `startedAt`, and for 15–50 s RunPod still reports the old
+container's SSH port (live 2026-11-02). Until the pod's detail shows the new container (an uptime
+that started since the reimage, and lower than the old one's or on another port), arena lists the
+pod without an endpoint, so the settle wait and setup go to the new container.
 
 #### Changing a pod's disk
 
