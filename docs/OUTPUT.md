@@ -9,6 +9,7 @@ in `crates/cli/src/up/output_tests.rs`.
 $ arena pods up -a 2 --gpu "RTX 6000 Ada" --retry-mins 20
 1×RTX 6000 Ada · RunPod SECURE · $0.99/h (none in Europe)
 Balance $491.57 → ≈22h left ‼
+A pod without SSH is terminated and its name tried again: 2 tries in all.
 Create arena9-spike, arena9-spitfire (≤$1.98/h), retrying up to 20m? [y/N] y
 round 1: 2 name(s) not placed (no capacity); retrying in 60s (Ctrl+C to stop)…
 [created] arena9-spike · 1×RTX 6000 Ada SECURE · $0.99/h
@@ -47,7 +48,8 @@ round 1: 2 name(s) not placed (no capacity); retrying in 60s (Ctrl+C to stop)…
 | `bold` `dim` `green` `red` `yellow` | styles; plain when colour is off |
 | `reason(&err)` / `reason_text(&str)` | `no capacity`, `key rejected`, `provider error (HTTP 502)` |
 | `verbose()` | `-v`, for code that branches on it (`balance`, `offers`, `pods test`) |
-| `progress(key, Some(line))` / `progress(key, None)` | the in-place line on a terminal; nothing elsewhere |
+| `progress(key, Some(line))` / `progress(key, None)` | the in-place line on a terminal; nothing elsewhere (`live()` says which) |
+| `progress_guard(key)` | takes that line away when dropped, however the code ends |
 
 Each line has a level, `To::…`:
 
@@ -76,8 +78,9 @@ by `main` (`out::init`), so nothing needs a flag threaded to it.
 
 - **The dashboard's runs panel** (`crates/tui/src/runs.rs`) runs `arena … --yes` with stdout to a
   log and reads: `[created] NAME`, `[NAME] READY…`, `[NAME] FAILED…`, `[NAME] STOPPED…`, and any
-  other `[NAME] …` as the pod's current step (`up` keeps `[NAME] setup…` in logs for it). It also reads `round N: …; retrying in Ns (Ctrl+C
-  to stop)…`, `interrupted — stopping retries`, and `retry window (`. `NOT_PODS` lists the tags
+  other `[NAME] …` as the pod's current step (`up` keeps `[NAME] setup…` in logs for it). It also
+  reads `round N: …; retrying in Ns (Ctrl+C to stop)…`, `interrupted — stopping retries`, and
+  `retry window (`. `NOT_PODS` lists the tags
   that aren't pods. Styles are stripped in a log, so `[{bold(name)}]` still reads the same there.
 - **Cron logs** get what a pipe gets. `arena backups` reads only their size and age
   (`crates/core/src/backups.rs`), and the backup run's facts come from its record file, not its
@@ -93,8 +96,8 @@ by `main` (`out::init`), so nothing needs a flag threaded to it.
 2. Replace each `println!`/`eprintln!` with `out!(…)`. Keep each line on the stream it used.
 3. Plans and long prompts: one line plus `confirm_brief`. Provider errors: `reason` at default,
    the whole error at `-v`.
-4. Successes are one line each, failures carry their fix (`… (retry: \`arena pods setup NAME\`)`),
-   and a run ends with a tally only when that adds something (`✓ 2 of 2 READY`).
+4. Successes are one line each, and failures carry their fix (`… (retry: arena pods setup NAME)`).
+   A run ends with a tally only when that adds something (`✓ 2 of 2 READY`).
 5. Write golden tests with `rendered`, at default and at `-v`. `-v` should match the old output.
 6. Grep `crates/tui`, `crates/core/src/backups.rs`, `bin/`, `docs/` and the tests for every line
    you changed.
