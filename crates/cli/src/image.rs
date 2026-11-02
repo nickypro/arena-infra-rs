@@ -312,7 +312,7 @@ async fn prune(cloud: &dyn ImageCloud, cfg: &Config, keep: usize, dry_run: bool,
             Err(e) => {
                 failed += 1;
                 out!(ErrDetail, "✗ image {}: {e}", s.id);
-                out!(ErrBrief, "{}", out::fail(format!("image {}: {} (retry: arena image prune)", s.id, out::reason(&e))));
+                out!(ErrBrief, "{}", out::fail(format!("image {}: {} (retry: arena image prune --keep {keep})", s.id, out::reason(&e))));
             }
         }
     }
@@ -323,7 +323,7 @@ async fn prune(cloud: &dyn ImageCloud, cfg: &Config, keep: usize, dry_run: bool,
                 failed += 1;
                 out!(ErrDetail, "✗ build VM {} (id {}): {e}", p.name, p.id);
                 // It bills by the hour until it goes: the retry, and the console as the way round.
-                let fix = format!("retry: arena image prune, or delete server {} in the Hetzner console", p.id);
+                let fix = format!("retry: arena image prune --keep {keep}, or delete server {} in the Hetzner console", p.id);
                 out!(ErrBrief, "{}", out::fail(format!("build VM {} (id {}): {} — it bills by the hour ({fix})", p.name, p.id, out::reason(&e))));
             }
         }

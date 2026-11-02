@@ -137,7 +137,8 @@ async fn prune_a_build_vm_that_wont_go() {
         c
     };
     let cfg = &cfg("HETZNER_IMAGE=arena\n");
-    let (quiet, loud) = both(cloud, |c| async move { prune(c.as_ref(), cfg, 1, false, false, NOW).await }).await;
+    // `--keep 2`: the retry it says keeps what this run kept.
+    let (quiet, loud) = both(cloud, |c| async move { prune(c.as_ref(), cfg, 2, false, false, NOW).await }).await;
     assert_eq!(quiet, QUIET_PRUNE_VM.strip_prefix('\n').unwrap(), "default:\n{quiet}");
     assert_eq!(loud, LOUD_PRUNE_VM.strip_prefix('\n').unwrap(), "-v:\n{loud}");
 }
@@ -235,7 +236,7 @@ Proceed? [y/N] y
 const QUIET_PRUNE_VM: &str = r#"
   delete  build VM devtest-image-261028-0900 (id 61234567) — left behind by a bake
 Delete 1 build VM(s)? [y/N] y
-✗ build VM devtest-image-261028-0900 (id 61234567): hetzner delete server — it bills by the hour (retry: arena image prune, or delete server 61234567 in the Hetzner console)
+✗ build VM devtest-image-261028-0900 (id 61234567): hetzner delete server — it bills by the hour (retry: arena image prune --keep 2, or delete server 61234567 in the Hetzner console)
 Error: 1 delete(s) failed
 "#;
 
