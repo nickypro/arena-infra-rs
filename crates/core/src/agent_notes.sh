@@ -31,33 +31,47 @@ arena_notes_write() {
     fi
     # Through a link, the file it points at is rewritten (the link stays a link).
     if [ -L "$f" ]; then r=$(readlink -f "$f") || return 1; else r=$f; fi
-    t=$(mktemp "$r.arena-XXXXXX") || return 1
-    # The first marked block becomes the new one, any later one goes (one block, however many
-    # runs wrote one); none: the block goes at the end, after a blank line. A BEGIN line with no
-    # END after it leaves the file alone: where the participant's text starts again is unknown.
-    ARENA_BEGIN=@BEGIN@ ARENA_END=@END@ ARENA_BLOCK=$B awk '
-        BEGIN { b = ENVIRON["ARENA_BEGIN"]; e = ENVIRON["ARENA_END"]; blk = ENVIRON["ARENA_BLOCK"] }
-        { l = $0; sub(/^[ \t]+/, "", l); sub(/[ \t\r]+$/, "", l) }
-        inb { if (l == e) inb = 0; next }
-        l == b { if (!done) print blk; done = 1; inb = 1; next }
-        { print; n = NR; last = l }
-        END {
-            if (inb) exit 3
-            if (!done) { if (n && last != "") print ""; print blk }
-        }' "$r" > "$t"
-    s=$?
-    if [ "$s" = 3 ]; then
-        echo "@WARN@$f has a BEGIN arena-infra python line with no END line after it - left as it is"
-        s=0
-    elif [ "$s" = 0 ] && ! cmp -s "$t" "$r"; then
-        # The new text takes the file's place in one step (a run cut short leaves the old one
-        # whole), with its mode and owner.
-        chmod --reference="$r" "$t" && { chown --reference="$r" "$t" 2>/dev/null || true; } && mv -f "$t" "$r"
+    for arena_try in 1 2 3; do
+        t=$(mktemp "$r.arena-XXXXXX") || return 1
+        was=$(cksum < "$r") || { rm -f "$t"; t=; return 1; }
+        # The first marked block becomes the new one, any later one goes (one block, however many
+        # runs wrote one); none: the block goes at the end, after a blank line. A BEGIN line with
+        # no END after it leaves the file alone: where the participant's text starts again is
+        # unknown. Every other byte is kept, a last line without a newline too (ARENA_NL: 0).
+        ARENA_NL=$(tail -c 1 "$r" | wc -l) ARENA_BEGIN=@BEGIN@ ARENA_END=@END@ ARENA_BLOCK=$B awk '
+            BEGIN { b = ENVIRON["ARENA_BEGIN"]; e = ENVIRON["ARENA_END"]; blk = ENVIRON["ARENA_BLOCK"]; nonl = ENVIRON["ARENA_NL"] + 0 == 0 }
+            function out(s, text) { if (have) print pend; pend = s; pendtext = text; have = 1 }
+            { l = $0; sub(/^[ \t]+/, "", l); sub(/[ \t\r]+$/, "", l) }
+            inb { if (l == e) inb = 0; next }
+            l == b { if (!done) out(blk, 0); done = 1; inb = 1; next }
+            { out($0, 1); n = NR; last = l }
+            END {
+                if (inb) exit 3
+                if (!done) { if (n && last != "") out("", 0); out(blk, 0) }
+                if (have) { if (pendtext && nonl) printf "%s", pend; else print pend }
+            }' "$r" > "$t"
         s=$?
-    fi
-    rm -f "$t"
-    t=
-    return "$s"
+        if [ "$s" = 3 ]; then
+            echo "@WARN@$f has a BEGIN arena-infra python line with no END line after it - left as it is"
+            s=0
+        elif [ "$s" = 0 ] && ! cmp -s "$t" "$r"; then
+            # Saved meanwhile (the participant, Claude Code's own memory, another setup): read
+            # it again, so that edit isn't lost.
+            if [ "$(cksum < "$r")" != "$was" ]; then
+                rm -f "$t"
+                t=
+                continue
+            fi
+            # The new text takes the file's place in one step (a run cut short leaves the old one
+            # whole), with its mode and owner.
+            chmod --reference="$r" "$t" && { chown --reference="$r" "$t" 2>/dev/null || true; } && mv -f "$t" "$r"
+            s=$?
+        fi
+        rm -f "$t"
+        t=
+        return "$s"
+    done
+    echo "@WARN@$f kept changing while the notes were being written - left as it is (pods setup --notes-only writes them)"
 }
 rc=0
 for f in "$HOME/.claude/CLAUDE.md" "$HOME/.codex/AGENTS.md"; do

@@ -1931,9 +1931,10 @@ python -->` and `<!-- END arena-infra python -->`. On a Hetzner VM:
   Hetzner script and the image pods' agents step do the same.
 - **The files:** only the marked block is rewritten (the first one; a second is dropped); a file
   without one gets it at the end, after a blank line; no file: one with just the block. Everything
-  else stays as it was. An unchanged file isn't written at all; a changed one is replaced in one
-  step (a run cut short leaves the old one whole) with its mode and owner, and through a link the
-  file it points at. A `BEGIN` line with no `END` after it: the file is left alone, with a warning.
+  else stays as it was, byte for byte. An unchanged file isn't written at all; a changed one is
+  replaced in one step (a run cut short leaves the old one whole) with its mode and owner, and
+  through a link the file it points at. A file saved meanwhile is read again, so that save stays.
+  A `BEGIN` line with no `END` after it: the file is left alone, with a warning.
 
 **Running machines:** `arena pods setup --notes-only [targets]` runs just this step (no repo
 update, keys, tokens or VS Code; no targets = every pod), and a failure there is a ✗. It replaces

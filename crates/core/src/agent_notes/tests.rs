@@ -255,6 +255,9 @@ fn the_notes_land_between_the_markers_and_keep_the_rest() {
             (want.clone(), want.clone()),
             ("mine".to_string(), format!("mine\n\n{want}")),
             ("mine\n\n".to_string(), format!("mine\n\n{want}")),
+            // The participant's last line has no newline: it still hasn't, block before it or not.
+            (format!("{}mine", stopgap(&env)), format!("{want}mine")),
+            (format!("x\n{}\nmine", stopgap(&env)), format!("x\n{want}\nmine")),
             // Two blocks (whatever wrote them): one, where the first was.
             (format!("a\n{}b\n{}c\n", stopgap(&env), stopgap(&env)), format!("a\n{want}b\nc\n")),
         ] {
@@ -333,4 +336,53 @@ fn a_file_that_cannot_be_written_fails_the_step() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.trim_end().ends_with(&format!("couldn't write the agent notes into {}", m.path("home/.claude/CLAUDE.md").display())), "{err}");
     assert_eq!(m.read("home/.codex/AGENTS.md"), block(&format!("{repo}/.venv"), false, &repo, false));
+    // A file there that can't be replaced (its folder is read-only; not as root, which writes
+    // anyway): it fails, and the file is left whole.
+    let root = Command::new("id").arg("-u").output().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0").unwrap_or(true);
+    if !root {
+        m.put("home/.codex/AGENTS.md", "mine\n");
+        std::fs::set_permissions(m.path("home/.codex"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let out = m.run("sh", &AgentNotes::new("arena-env", &repo).command("hetzner"), false);
+        std::fs::set_permissions(m.path("home/.codex"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("couldn't write the agent notes into"), "{out:?}");
+        assert_eq!(m.read("home/.codex/AGENTS.md"), "mine\n");
+    }
+}
+
+/// A file saved while the notes are being written (by the participant, Claude Code's `#` memory,
+/// another setup) keeps that save: the step reads it again before it replaces anything. Here a
+/// stand-in `cksum` saves the file just before the step's check that nothing changed.
+#[test]
+fn a_save_made_meanwhile_is_kept() {
+    let real = Command::new("sh").arg("-c").arg("command -v cksum").output().unwrap();
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    if real.is_empty() {
+        return; // no cksum here
+    }
+    let m = Machine::new("meanwhile");
+    let repo = m.path("r").display().to_string();
+    m.exe("r/.venv/bin/python");
+    let file = m.path("home/.claude/CLAUDE.md");
+    m.put("home/.claude/CLAUDE.md", "mine\n");
+    m.put("home/.codex/AGENTS.md", "codex\n");
+    // The 2nd cksum is the check before the replace: the participant saves just before it.
+    let stub = m.path("bin/cksum");
+    let calls = m.path("calls");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nn=$(($(cat '{c}' 2>/dev/null || echo 0) + 1)); echo $n > '{c}'\n\
+             [ $n = 2 ] && printf 'saved meanwhile\\n' >> '{f}'\nexec '{real}'\n",
+            c = calls.display(),
+            f = file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let said = ok(&m.run("sh", &AgentNotes::new("arena-env", &repo).command("hetzner"), false));
+    assert!(!said.contains("arena-warning"), "{said}");
+    let want = block(&format!("{repo}/.venv"), false, &repo, false);
+    assert_eq!(m.read("home/.claude/CLAUDE.md"), format!("mine\nsaved meanwhile\n\n{want}"));
+    assert_eq!(m.read("home/.codex/AGENTS.md"), format!("codex\n\n{want}"));
 }
