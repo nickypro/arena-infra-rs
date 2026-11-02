@@ -24,7 +24,7 @@ use crate::pods::list::list_with;
 use crate::pods::capable::CreateFlags;
 use crate::pods::lock::{handle_lock, print_would_refuse};
 use crate::pods::migrate::{handle_migrate_copy, handle_migrate_cutover, handle_migrate_finish, handle_migrate_revert, handle_migrate_status, CopyHow, CutoverOpts, FinishOpts, MigrateCmd};
-use crate::pods::placement::{checked_gpu, create_question, describe_create, first_create_spec, place_names, placement_prompt, placement_request, plan_cost, plan_placement, print_balance_preflight, print_placement_preview, show_plan, single_option_plan};
+use crate::pods::placement::{checked_gpu, create_question, describe_create, first_create_spec, place_names, placement_prompt, placement_request, plan_cost, plan_placement, print_balance_preflight, print_placement_preview, show_plan, single_option_plan, up_replaces};
 use crate::pods::pull::{handle_pull, local_backup_dir, resolve_pull};
 use crate::pods::rename::{handle_rename, RenameRequest};
 use crate::pods::replace::{handle_replace, short_of, ReplaceOpts};
@@ -371,7 +371,7 @@ pub(crate) async fn handle_pods_bal(
             let pre = print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
             let handing = owner_plan(&tracking, &owner, &names, false)?;
             let cost = pre.cost.or_else(|| options.as_ref().and_then(|p| plan_cost(p, names.len())));
-            if !confirm_brief(yes, &what, &create_question(&names, cost.as_deref(), retry_mins))? {
+            if !confirm_brief(yes, &what, &create_question(&names, cost.as_deref(), retry_mins, None))? {
                 out!(Out, "aborted.");
                 return Ok(());
             }
@@ -554,7 +554,7 @@ pub(crate) async fn handle_pods_bal(
             let handing = owner_plan(&tracking, &owner, &names, false)?;
             say_mints(&mints);
             let cost = pre.cost.or_else(|| options.as_ref().and_then(|p| plan_cost(p, names.len())));
-            if !confirm_brief(yes, &what, &create_question(&names, cost.as_deref(), retry_mins))? {
+            if !confirm_brief(yes, &what, &create_question(&names, cost.as_deref(), retry_mins, up_replaces(check, no_wait)))? {
                 out!(Out, "aborted.");
                 return Ok(());
             }

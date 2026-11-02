@@ -351,8 +351,37 @@ fn first_clause(message: &str) -> String {
 /// The progress line's parts, by key, drawn joined at the foot of a terminal.
 static PROGRESS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
-/// The widest progress line drawn (a wider one would wrap, and couldn't be cleared in place).
+/// The widest progress line drawn (a wider one would wrap, and couldn't be cleared in place):
+/// one column short of the terminal, at most this.
 const PROGRESS_WIDTH: usize = 79;
+
+/// stderr's terminal width in columns, asked each time (a pane can be resized); 80 when it can't
+/// be told.
+#[cfg(unix)]
+fn columns() -> usize {
+    // SAFETY: TIOCGWINSZ fills the winsize we own; nothing else is read or written.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
+    if ok && ws.ws_col > 0 {
+        usize::from(ws.ws_col)
+    } else {
+        80
+    }
+}
+
+#[cfg(not(unix))]
+fn columns() -> usize {
+    80
+}
+
+/// `line` cut to fit `width` columns with a `…`: every character one column (arena's lines are,
+/// the few symbols included). Pure.
+fn fit(line: &str, width: usize) -> String {
+    if line.chars().count() <= width {
+        return line.to_string();
+    }
+    line.chars().take(width.saturating_sub(1)).chain(std::iter::once('…')).collect()
+}
 
 /// Set (`Some`) or take away (`None`) the part `key` of the line a terminal shows in place at
 /// its foot — `round 3: no capacity · retrying in 60s` — until the next part replaces it.
@@ -403,11 +432,7 @@ fn draw_progress(parts: &[(String, String)]) {
         return;
     }
     let line = strip(&parts.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" · "));
-    let line: String = if line.chars().count() > PROGRESS_WIDTH {
-        line.chars().take(PROGRESS_WIDTH - 1).chain(std::iter::once('…')).collect()
-    } else {
-        line
-    };
+    let line = fit(&line, PROGRESS_WIDTH.min(columns().saturating_sub(1)).max(10));
     let line = if COLOR_ERR.load(Ordering::SeqCst) { dim(&line) } else { line };
     let mut err = std::io::stderr().lock();
     let _ = write!(err, "{line}");
@@ -570,6 +595,13 @@ mod tests {
         assert_eq!(ask("Create apple? [y/N] ").as_deref(), Some("y"));
         assert_eq!(ask("again? "), None, "no answer left: refused");
         assert!(loud.text().ends_with("Create apple? [y/N] y\n"));
+    }
+
+    #[test]
+    fn a_progress_line_fits_its_width() {
+        assert_eq!(fit("round 1: no capacity", 40), "round 1: no capacity");
+        assert_eq!(fit("devtest-apple setup 2m10s · devtest-bloom waiting for SSH 30s", 30), "devtest-apple setup 2m10s · d…");
+        assert_eq!(fit("✓ ab", 3), "✓ …");
     }
 
     #[test]

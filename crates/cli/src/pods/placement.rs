@@ -539,13 +539,14 @@ pub(crate) fn progress_lines(p: &arena_core::placement::Progress) -> Vec<(arena_
 pub(crate) const ROUNDS: &str = "rounds";
 
 /// Say a placement progress event ([`progress_lines`]) through `say`. A round's line between
-/// retries is also the terminal's in-place line ([`arena_core::out::progress`]): one line updated
-/// there, not one more per round; logs and pipes keep each (the dashboard reads them).
-pub(crate) fn say_progress(p: &arena_core::placement::Progress, say: &dyn Fn(arena_core::out::To, &str)) {
+/// retries is instead the terminal's in-place line `key` ([`arena_core::out::progress`]): one
+/// line updated there, not one more per round (the caller takes it away when placement ends);
+/// logs and pipes keep each (the dashboard reads them).
+pub(crate) fn say_progress(p: &arena_core::placement::Progress, say: &dyn Fn(arena_core::out::To, &str), key: &str) {
     use arena_core::placement::Progress;
     for (to, line) in progress_lines(p) {
         if matches!(p, Progress::Waiting { .. }) && arena_core::out::live() {
-            arena_core::out::progress(ROUNDS, Some(&line));
+            arena_core::out::progress(key, Some(&line));
             continue;
         }
         say(to, &line);
@@ -643,8 +644,8 @@ pub(crate) fn show_plan(provider: &dyn Provider, options: Option<&arena_core::pl
 
 /// The default prompt: `Create devtest-apple, devtest-bloom (≤$0.34/h), retrying up to 20m?` —
 /// what it acts on and what it costs (`cost`: per hour, all of them), at most three names and
-/// how many more. Pure.
-pub(crate) fn create_question(names: &[String], cost: Option<&str>, retry_mins: u64) -> String {
+/// how many more; `and` what else it will do unasked (`up`: replacing a pod without SSH). Pure.
+pub(crate) fn create_question(names: &[String], cost: Option<&str>, retry_mins: u64, and: Option<&str>) -> String {
     const SHOWN: usize = 3;
     let mut what = names.iter().take(SHOWN).map(arena_core::out::bold).collect::<Vec<_>>().join(", ");
     if names.len() > SHOWN {
@@ -652,7 +653,19 @@ pub(crate) fn create_question(names: &[String], cost: Option<&str>, retry_mins: 
     }
     let cost = cost.map(|c| format!(" ({c})")).unwrap_or_default();
     let retry = if retry_mins > 0 { format!(", retrying up to {retry_mins}m") } else { String::new() };
-    format!("Create {what}{cost}{retry}?")
+    let and = and.map(|a| format!(", {a}")).unwrap_or_default();
+    format!("Create {what}{cost}{retry}{and}?")
+}
+
+/// What `up` does unasked once it's said yes, for its prompt: it terminates and recreates a pod
+/// that never gets a usable SSH endpoint (with or without `--check`), and with `--check` one that
+/// fails it on its host. Nothing with `--no-wait`: no pipelines run. Pure.
+pub(crate) fn up_replaces(check: bool, no_wait: bool) -> Option<&'static str> {
+    match (no_wait, check) {
+        (true, _) => None,
+        (false, true) => Some("replacing any without SSH or failing the check"),
+        (false, false) => Some("replacing any without SSH"),
+    }
 }
 
 /// What `n` pods on `plan` cost per hour at most (the dearest option): `≤$1.98/h`,
@@ -773,7 +786,7 @@ pub(crate) async fn place_names(
         prefix: cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string(),
     });
     let mut show = |p: &Progress| {
-        say_progress(p, &arena_core::out::emit);
+        say_progress(p, &arena_core::out::emit, ROUNDS);
         // Hand the pod on the moment it exists (`up` starts its pipeline now).
         if let Progress::Attempt { pod: Some(pod), index, .. } = p {
             on_made(&Made { pod: (*pod).clone(), at: tokio::time::Instant::now(), option: Some(*index) });

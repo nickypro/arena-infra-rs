@@ -246,6 +246,17 @@ pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, claude:
     format!("per pod, as soon as it can: {} — then READY/FAILED per pod", steps.join(", "))
 }
 
+/// What a pod's keys stage did ([`Shared::copy_keys`]): its line, the fleet-SSH write it made
+/// (none if there was nothing to send), and the READY line's `keys` badge — `Some(true)` its
+/// keys are on it, `Some(false)` some it should have aren't, `None` there were none to copy
+/// (the backup archive's access only).
+struct KeysCopied {
+    to: To,
+    line: String,
+    fleet_ssh: Option<String>,
+    badge: Option<bool>,
+}
+
 /// What one name's pipeline came to (it becomes an [`UpRow`]).
 struct NameRun {
     name: String,
@@ -267,7 +278,7 @@ struct NameRun {
     ready_at: Option<Instant>,
     /// `--lock` locked its pod.
     locked: bool,
-    /// Its keys stage: copied (`true`), or said why not (`false`); `None` when it had none.
+    /// Its keys stage's badge ([`KeysCopied::badge`]); `None` too when it had none.
     keys: Option<bool>,
     /// Its Claude Code stage, as `keys`.
     claude: Option<bool>,
@@ -1026,10 +1037,10 @@ impl Shared<'_, '_> {
                     let reason = format!("{why} — left running (retry: `arena pods copy-keys {name}`)");
                     return self.end(run, Verdict::Failed { stage: Stage::Keys, reason });
                 }
-                Some(Ok((to, line, fleet_ssh))) => {
-                    run.keys = Some(to == To::Detail);
-                    say(to, &line);
-                    run.fleet_ssh = fleet_ssh;
+                Some(Ok(copied)) => {
+                    run.keys = copied.badge;
+                    say(copied.to, &copied.line);
+                    run.fleet_ssh = copied.fleet_ssh;
                 }
             }
             // 5a. --check: do its AI keys work, now they're on it? (The deep check ran before
@@ -1401,11 +1412,14 @@ impl Shared<'_, '_> {
                 let _ = stop.wait_for(|s| *s).await;
             }
         };
-        let mut show = |p: &Progress| crate::pods::placement::say_progress(p, say);
+        // Its own in-place line on a terminal, taken away however the placement ends.
+        let rounds = format!("{} {name}", crate::pods::placement::ROUNDS);
+        let mut show = |p: &Progress| crate::pods::placement::say_progress(p, say, &rounds);
         let names = [name.clone()];
         let placed =
             placement::place(self.run.provider, &base, &names, &plan, self.run.rounds, None, interrupt, &mut show)
                 .await;
+        arena_core::out::progress(&rounds, None);
         if let Some(bal) = self.run.balance {
             bal.remember_prices(&placed.created);
         }
@@ -1726,12 +1740,16 @@ impl Shared<'_, '_> {
         pod: &Pod,
         target: &SshTarget,
         keys: &KeySources,
-    ) -> std::result::Result<(To, String, Option<String>), String> {
+    ) -> std::result::Result<KeysCopied, String> {
         let (vars, matched) = keys.vars_for(&pod.name);
         let archive = super::archive::pod_archive(self.run.cfg);
         let none_for_it = format!("keys: none for it (no per-host key matched {name}, no broadcast token set)");
+        // The READY line's `keys` badge: the keys it should have are on it (✓), some or all of
+        // them aren't (‼); none when there were none to copy (only the archive's access).
+        let some_missing = if keys.per_host.is_empty() { None } else { Some(false) };
+        let done = |to, line: String, fleet_ssh, badge| KeysCopied { to, line, fleet_ssh, badge };
         if vars.is_empty() && archive.ready().is_none() {
-            return Ok((To::Err, format!("[{name}] {none_for_it}"), None));
+            return Ok(done(To::Err, format!("[{name}] {none_for_it}"), None, Some(false)));
         }
         let fleet_pods = self.listing.borrow().clone();
         let (fleet_ssh, _) = fleet_ssh_for(self.run.cfg, &fleet_pods);
@@ -1745,8 +1763,8 @@ impl Shared<'_, '_> {
             _ => None,
         };
         if let Some(e) = archive_note {
-            let done = if vars.is_empty() { "fleet ssh" } else { "keys" };
-            return Ok((To::Err, format!("[{name}] {done} ✓ — backup archive: {e}"), Some(fleet_ssh)));
+            let (what, badge) = if vars.is_empty() { ("fleet ssh", some_missing) } else { ("keys", Some(matched || keys.per_host.is_empty())) };
+            return Ok(done(To::Err, format!("[{name}] {what} ✓ — backup archive: {e}"), Some(fleet_ssh), badge));
         }
         match written {
             // No key for it, only the archive's access: said as such — a warning only when a key
@@ -1754,13 +1772,16 @@ impl Shared<'_, '_> {
             Ok(o) if o.success && vars.is_empty() => {
                 let to = if keys.per_host.is_empty() { To::Detail } else { To::Err };
                 let why = if keys.per_host.is_empty() { "keys: none generated".to_string() } else { none_for_it };
-                Ok((to, format!("[{name}] backup archive access ✓ ({why})"), Some(fleet_ssh)))
+                Ok(done(to, format!("[{name}] backup archive access ✓ ({why})"), Some(fleet_ssh), some_missing))
             }
-            Ok(o) if o.success && (matched || keys.per_host.is_empty()) => Ok((To::Detail, format!("[{name}] keys ✓"), Some(fleet_ssh))),
-            Ok(o) if o.success => Ok((
+            Ok(o) if o.success && (matched || keys.per_host.is_empty()) => {
+                Ok(done(To::Detail, format!("[{name}] keys ✓"), Some(fleet_ssh), Some(true)))
+            }
+            Ok(o) if o.success => Ok(done(
                 To::Err,
                 format!("[{name}] keys ✓ — broadcast tokens only: no per-host key in keys/*_api_keys.csv matched {name}"),
                 Some(fleet_ssh),
+                Some(false),
             )),
             Ok(o) => Err(format!("copying its keys: {}: {}", o.exit_label(), o.stderr.trim())),
             Err(e) => Err(format!("copying its keys: {}", describe_error(&e))),
@@ -5206,6 +5227,33 @@ mod tests {
         assert!(bloom_ready < refreshed, "{:#?}", lines.all());
     }
 
+    /// The default READY line's keys badge says what the keys stage did: ✓ when its own key went
+    /// on, ‼ when the keys CSV has none for it (only the broadcast tokens, or nothing) — said
+    /// why on its own line too.
+    #[tokio::test(start_paused = true)]
+    async fn the_ready_lines_keys_badge_is_what_the_keys_stage_did() {
+        for (csv, want, warned) in [
+            ("host,key\ndevtest-apple,sk-a\n", "[devtest-apple] READY after 0s · keys ✓", None),
+            ("host,key\ndevtest-bloom,sk-b\n", "[devtest-apple] READY after 0s · keys ‼", Some("[devtest-apple] keys: none for it")),
+        ] {
+            let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+            let fake = Arc::new(FakeRemote::new());
+            let keys = tmp_dir("keys-badge");
+            std::fs::write(keys.0.join("openai_api_keys.csv"), csv).unwrap();
+            let cfg = cfg(None);
+            let run = up_run(&fleet, fake.clone(), &cfg, true, None, Some(&keys.0)).await;
+            let made = make(&fleet, &["apple"]).await;
+            let said = Mutex::new(Vec::new());
+            let rows = run_up(&run, made, std::future::pending(), &|to, l| said.lock().unwrap().push((to, l.to_string()))).await;
+            assert_eq!(rows[0].verdict, Verdict::Ready);
+            let said = said.into_inner().unwrap();
+            assert!(said.contains(&(To::Brief, want.to_string())), "{said:#?}");
+            if let Some(w) = warned {
+                assert!(said.iter().any(|(to, l)| *to == To::Err && l.starts_with(w)), "{said:#?}");
+            }
+        }
+    }
+
     /// W7 live (A-ckl9): with a backup archive and no key file at all, the keys stage still runs
     /// — each pod gets the archive's access (its block in the one exec, no key exported; the read
     /// key by scp), said as such. Without an archive (or without setup) there is no keys stage.
@@ -5224,8 +5272,17 @@ mod tests {
         assert!(run.keys.is_some());
         let made = make(&fleet, &["apple"]).await;
         let lines = Lines::new();
-        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        let brief = Mutex::new(Vec::new());
+        let say = |to: To, l: &str| {
+            lines.say(to, l);
+            if to == To::Brief {
+                brief.lock().unwrap().push(l.to_string());
+            }
+        };
+        let rows = run_up(&run, made, std::future::pending(), &say).await;
         assert!(rows.iter().all(|r| r.verdict == Verdict::Ready), "{:#?}", lines.all());
+        // No API key went on it: the default READY line says nothing of keys (review r1: it said ✓).
+        assert!(brief.lock().unwrap().contains(&"[devtest-apple] READY after 0s".to_string()), "{brief:?}");
         let calls = fake.calls_to(&host("10.0.0.1", 22001));
         assert!(
             calls.iter().any(|c| matches!(c, RemoteCall::Exec { cmd, .. } if cmd.contains("# BEGIN arena-archive") && !cmd.contains("export "))),

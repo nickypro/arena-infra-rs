@@ -197,7 +197,7 @@ async fn up_replacing_a_pod_with_no_endpoint() {
 const QUIET_UP_THAT_GOES_WELL: &str = r#"
 1×RTX A4000 · RunPod COMMUNITY
 Balance $120.00 → ≈4.3d left
-Create devtest-apple, devtest-bloom (≤~$0.64/h)? [y/N] y
+Create devtest-apple, devtest-bloom (≤~$0.64/h), replacing any without SSH? [y/N] y
 [created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
 [created] devtest-bloom · 1×RTX A4000 COMMUNITY · $0.17/h
 [devtest-apple] READY after 0s · keys ✓
@@ -208,7 +208,7 @@ Create devtest-apple, devtest-bloom (≤~$0.64/h)? [y/N] y
 const QUIET_UP_WAITING_FOR_CAPACITY: &str = r#"
 1×RTX A4000 · RunPod COMMUNITY
 Balance $120.00 → ≈6.0d left
-Create devtest-apple (≤~$0.32/h), retrying up to 10m? [y/N] y
+Create devtest-apple (≤~$0.32/h), retrying up to 10m, replacing any without SSH? [y/N] y
 round 1: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…
 round 2: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…
 round 3: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…
@@ -220,7 +220,7 @@ round 3: 1 short of target 1 (capacity); retrying in 60s (Ctrl+C to stop)…
 const QUIET_UP_WITH_A_FAILED_SETUP: &str = r#"
 1×RTX A4000 · RunPod COMMUNITY
 Balance $120.00 → ≈4.3d left
-Create devtest-apple, devtest-bloom (≤~$0.64/h)? [y/N] y
+Create devtest-apple, devtest-bloom (≤~$0.64/h), replacing any without SSH? [y/N] y
 [created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
 [created] devtest-bloom · 1×RTX A4000 COMMUNITY · $0.17/h
 [devtest-apple] READY after 0s · keys ✓
@@ -231,7 +231,7 @@ Error: 1 of 2 pod(s) not ready: devtest-bloom (FAILED setup)
 const QUIET_UP_REPLACING_A_POD_WITH_NO_ENDPOINT: &str = r#"
 1×RTX A4000 · RunPod COMMUNITY
 Balance $120.00 → ≈6.0d left
-Create devtest-apple (≤~$0.32/h)? [y/N] y
+Create devtest-apple (≤~$0.32/h), replacing any without SSH? [y/N] y
 [created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
 [devtest-apple] no SSH endpoint — replacing it (attempt 2 of 2)
 [created] devtest-apple · 1×RTX A4000 COMMUNITY · $0.17/h
