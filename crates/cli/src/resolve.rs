@@ -89,7 +89,7 @@ impl Busy {
     /// ([`core_resolve::copy_needed`]). Nothing BUSY: nothing done.
     pub(crate) async fn look(remote: &Arc<dyn Remote>, cfg: &Config, dir: &str, sel: &Selected, unpushed: &[Unpushed]) -> Busy {
         let hours = core_resolve::auto_resolve_hours(cfg.get(core_resolve::AUTO_RESOLVE_KEY)).unwrap_or_else(|e| {
-            eprintln!("warning: {e} — no operation left in progress is finished this run");
+            arena_core::out!(Err, "warning: {e} — no operation left in progress is finished this run");
             None
         });
         let busy: Vec<(String, SshTarget)> = sel
@@ -105,7 +105,7 @@ impl Busy {
         }
         if let Some(path) = &out.record {
             let (copies, warning) = BusyCopies::load(path);
-            warning.iter().for_each(|w| eprintln!("{w}"));
+            warning.iter().for_each(|w| arena_core::out!(Err, "{w}"));
             out.copies = copies;
         }
         let names: Vec<String> = busy.iter().map(|(n, _)| n.clone()).collect();
@@ -268,9 +268,9 @@ async fn save(path: Option<PathBuf>, changes: Vec<(String, Option<BusyCopy>)>, n
     let shown = path.display().to_string();
     let wrote = tokio::task::spawn_blocking(move || core_resolve::record_busy_copies(&path, &changes, now, core_resolve::RECORD_LOCK_WAIT)).await;
     match wrote {
-        Ok(Ok(warning)) => warning.iter().for_each(|w| eprintln!("{w}")),
-        Ok(Err(e)) => eprintln!("warning: couldn't record the BUSY pods' copies in {shown} ({e}) — they're copied again next run"),
-        Err(e) => eprintln!("warning: couldn't record the BUSY pods' copies in {shown} ({e}) — they're copied again next run"),
+        Ok(Ok(warning)) => warning.iter().for_each(|w| arena_core::out!(Err, "{w}")),
+        Ok(Err(e)) => arena_core::out!(Err, "warning: couldn't record the BUSY pods' copies in {shown} ({e}) — they're copied again next run"),
+        Err(e) => arena_core::out!(Err, "warning: couldn't record the BUSY pods' copies in {shown} ({e}) — they're copied again next run"),
     }
 }
 
@@ -316,7 +316,7 @@ impl Settled {
     /// Say what [`Busy::settle`] did, after the copies' lines.
     pub(crate) fn print(&self) {
         if !self.lines.is_empty() {
-            println!();
+            arena_core::out!(Detail, "");
             self.lines.iter().for_each(|l| crate::say(l));
         }
     }

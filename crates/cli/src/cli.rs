@@ -48,6 +48,14 @@ pub(crate) struct Cli {
     #[arg(long, short = 'y', global = true)]
     pub yes: bool,
 
+    /// Show the details too: plans, notes, ids, raw provider errors, each step
+    #[arg(long, short = 'v', global = true)]
+    pub verbose: bool,
+
+    /// Colour: auto (on a terminal, unless NO_COLOR is set), always or never
+    #[arg(long, global = true, value_name = "WHEN", default_value = "auto", value_parser = ["auto", "always", "never"], hide_possible_values = true)]
+    pub color: String,
+
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -162,9 +170,6 @@ pub(crate) enum Cmd {
         /// `offers all`'s old spelling
         #[arg(long, hide = true, conflicts_with = "view")]
         all: bool,
-        /// The notes under the table too
-        #[arg(long, short = 'v')]
-        verbose: bool,
         /// JSON instead of a table
         #[arg(long)]
         json: bool,
@@ -237,9 +242,6 @@ pub(crate) enum Cmd {
         /// No live read: show only the fallback estimate (writes nothing)
         #[arg(long)]
         no_live: bool,
-        /// Also print the burn's parts, spend limit, billing history and last failures
-        #[arg(long, short = 'v')]
-        verbose: bool,
     },
     /// What each machine instance cost and who it was for (compute + AI)
     ///
@@ -671,8 +673,9 @@ pub(crate) enum PodCmd {
     /// default branch, update the current one), submodules, ~/.name, the HF token, a VS Code server
     /// warm-up, then API keys if keys/*_api_keys.csv exist and each pod's own Claude Code account
     /// (`arena claude`: the least-loaded one if it has none). With a
-    /// /workspace volume the repo is moved onto it, so a restart keeps the work. Confirms first;
-    /// no targets = every pod.
+    /// /workspace volume the repo is moved onto it, so a restart keeps the work. Then the agents'
+    /// notes (which Python to use, in ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md; AGENT_NOTES=0
+    /// turns them off): --notes-only does just that. Confirms first; no targets = every pod.
     #[command(verbatim_doc_comment)]
     #[allow(clippy::doc_lazy_continuation)] // verbatim `--help` text: its layout is the output, not Markdown
     Setup {
@@ -694,6 +697,9 @@ pub(crate) enum PodCmd {
         /// Skip the VS Code warm-up (VSCODE_PREINSTALL=0 turns it off everywhere)
         #[arg(long)]
         no_vscode: bool,
+        /// Only the agents' notes (which Python to use) and uv on PATH, for running machines
+        #[arg(long, conflicts_with_all = ["force", "hf_token", "cc_token", "zsh_install", "no_vscode", "timeout"])]
+        notes_only: bool,
         /// Per-pod budget in seconds for the main step (default 300; Hetzner VMs 1800)
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=arena_core::setup::MAX_STEP_TIMEOUT_SECS))]
         timeout: Option<u64>,
@@ -1169,23 +1175,25 @@ pub(crate) enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Health check: torch version, or --deep GPU tests (read-only)
+    /// Health check: torch, --deep GPU tests, or --keys AI keys (read-only)
     ///
     /// --deep: per-GPU CUDA op, driver vs MIN_DRIVER_VERSION, device count, GPU↔GPU copy + NCCL,
-    /// HF download speed, disk, load, maintenance window. One pass/warn/fail row per pod; exits
-    /// non-zero on any FAIL. No targets (or --all) = this cohort's pods with an SSH endpoint
-    /// (not @ staff entries; --include-non-cohort: every pod).
-    #[command(verbatim_doc_comment)]
+    /// HF download speed, disk, load, maintenance window, and the AI keys. One pass/warn/fail row
+    /// per pod; exits non-zero on any FAIL. --keys: only whether each machine's OpenRouter key
+    /// and HF token work and are the keys CSV's / config's (seconds per machine, no GPU work).
+    /// No targets (or --all) = this cohort's pods with an SSH endpoint (not @ staff entries;
+    /// --include-non-cohort: every pod).
+    #[command(verbatim_doc_comment, group(clap::ArgGroup::new("checks").args(["deep", "keys"])))]
     Test {
         /// Run the deep check instead of the torch-version check.
         #[arg(long)]
         deep: bool,
+        /// Only check the machines' AI keys (OpenRouter key, HF token): fast, no torch or GPU.
+        #[arg(long)]
+        keys: bool,
         /// Emit per-pod `{name, provider, status, checks[], facts}` as JSON on stdout.
-        #[arg(long, requires = "deep")]
+        #[arg(long, requires = "checks")]
         json: bool,
-        /// Print every check of every pod, not just the table.
-        #[arg(short, long, requires = "deep")]
-        verbose: bool,
         #[command(flatten)]
         cohort: CohortScope,
         #[command(flatten)]

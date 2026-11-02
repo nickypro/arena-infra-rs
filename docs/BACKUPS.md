@@ -194,11 +194,18 @@ origin's main each run).
 Selected pods, or — none named (no targets, `all`/`--all`) — **this cohort's**: `<prefix>-…` pods
 (one off `MACHINE_NAME_LIST` too: an extra pod made for someone, a parked `-old` twin), never an `@`
 staff entry. The rest (staff boxes, another prefix, a pod the provider named) get one `⊘ skipped N
-non-cohort pods (…): a, b — name one to include it, or pass --include-non-cohort` line, never a
-failure; named, they're backed up like any pod (list a staff box that wears the prefix as
+non-cohort pods (…): a, b — name one to include it, or pass --include-non-cohort` line (`backup` and
+`pull`, which cron runs every 15 minutes: with `-v`), never a failure; named, they're backed up like
+any pod (list a staff box that wears the prefix as
 `@<prefix>-name` to leave it out).
 
 `--include-non-cohort` (on `backup`, `pull`, `init-branches`, `set-branch`) takes every pod instead.
+
+What a run prints by default (the cron's log): each pod that failed, with what fixes it, and one
+line for the run — `✓ git backup of 20 pods: 3 pushed, 16 no changes, 1 on main/master`, or `✗ git
+backup: 1 of 20 failed · …`; the home copy's own line (`✓ home copy of 20 pods → <dir>/w1d2 · 1.8G
+(12.0M new)`) when it runs. Each pod's line (`[3/20] ✓ …`, `= … (no changes …)`), the sizes and the
+`⊘ skipped … non-cohort` line are `-v`'s.
 
 Cohort pods on `main`/`master` (after `set-branch main`, until `init-branches`) get one line after
 the run, not a SKIP each: ``⚠ 12 cohort pods on main: not backed up until `arena pods init-branches`
@@ -235,10 +242,10 @@ exactly as it is, kept out of the commit (a managed block in `.git/info/exclude`
 run (the rsync tiers have it). A gitlink an earlier backup committed is replaced by the files. A
 file over the limit staged by hand (`git add`) is taken back out of the index the same way.
 
-The script runs under `sh` whatever the login shell; `--dry-run` prints each pod's line — `ssh … 'sh
--s <exact arguments>' < arena-backup.sh` — and, once, the here-doc that writes `arena-backup.sh`:
-paste that first and every line runs as the backup would (without it the shell refuses to start,
-never a silent no-op).
+The script runs under `sh` whatever the login shell; `--dry-run` says which pods it would back up,
+and `--dry-run -v` prints each pod's line — `ssh … 'sh -s <exact arguments>' < arena-backup.sh` —
+and, once, the here-doc that writes `arena-backup.sh`: paste that first and every line runs as the
+backup would (without it the shell refuses to start, never a silent no-op).
 
 ### Pasted keys are redacted
 
@@ -748,7 +755,8 @@ Knobs come from flags else config: `LOCAL_BACKUP_DIR` (`--dir`), `BACKUP_MAX_SIZ
 `BACKUP_REMOTE_PATH` (`--remote-path`, default `~/`). Label defaults to the `wNdM` iteration
 (`big`/`baseline`/`reaped` are refused).
 
-Confirms first; `--dry-run` prints the exact rsync commands, shell-quoted.
+Confirms first; `--dry-run` says where the copies would go, and `--dry-run -v` prints the exact
+rsync commands, shell-quoted.
 
 **Per-pod backup lock** (in an existing absolute `LOCAL_BACKUP_DIR`: `.arena-locks/<name>.lock`, the
 folder 0700 — a missing backup dir is never created for it, and the run goes as before without

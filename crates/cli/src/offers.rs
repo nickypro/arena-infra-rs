@@ -14,6 +14,8 @@ use arena_core::offers::{self, Catalog, Catalogs, Offers, ProviderOffers, RowFil
 use arena_core::provider::hetzner::{HetznerOpts, HetznerProvider, ServerType};
 use arena_core::{Config, PodSpec};
 
+use arena_core::out::To;
+
 use super::{checked_gpu, live_gpu_catalog, money, plan_placement, sizing_flags, spec_with_overrides, v2_catalog, SpecOverrides, PRICE_TIMEOUT};
 
 /// The placement flags `offers` shares with `create`/`up`.
@@ -72,7 +74,7 @@ pub(crate) async fn handle_offers(cfg: &Config, named: Option<&str>, view: Optio
     if json {
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
-        print!("{}", offers::render(&out, verbose));
+        say(To::Out, &offers::render(&out, verbose));
     }
     if !out.failed.is_empty() {
         let names: Vec<&str> = out.failed.iter().map(|f| f.provider.as_str()).collect();
@@ -194,13 +196,20 @@ async fn handle_catalogs(cfg: &Config, scope: &[&'static str], named: bool, left
     if json {
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
-        let text: Vec<String> = out.catalogs.iter().map(|c| offers::render_catalog(c, &configured)).collect();
-        print!("{}", text.join("\n"));
+        // By default each table without the rows nobody can buy, and its notes as one line
+        // (`render_catalog_brief`); `-v` everything, as before.
+        let verbose = arena_core::out::verbose();
+        let text: Vec<String> = out
+            .catalogs
+            .iter()
+            .map(|c| if verbose { offers::render_catalog(c, &configured) } else { offers::render_catalog_brief(c, &configured) })
+            .collect();
+        say(To::Out, &text.join("\n"));
         for s in &out.skipped {
-            println!("skipped: {}: {}", s.provider, s.why);
+            arena_core::out!(Detail, "skipped: {}: {}", s.provider, s.why);
         }
         for s in &out.failed {
-            println!("failed: {}: {}", s.provider, s.why);
+            arena_core::out!(Out, "failed: {}: {}", s.provider, s.why);
         }
     }
     if !out.failed.is_empty() {
@@ -275,7 +284,7 @@ async fn runpod_catalog_view(cfg: &Config, flags: &Flags, c: &mut Catalog) -> Re
     let gpu = checked_gpu(cfg, "runpod", flags.gpu.clone()).await?;
     let (cat, warning) = runpod_catalog(cfg).await?;
     if let Some(w) = warning {
-        eprint!("{w}");
+        arena_core::out!(Err, "{}", w.trim_end());
     }
     let (plan, why) = marks(cfg, "runpod", flags, gpu.as_deref()).await?;
     let seen = seen_gpu_types(cfg).await;
@@ -442,6 +451,11 @@ pub(crate) async fn handle_gpus(cfg: &Config, provider: &str, json: bool) -> Res
     print!("{}", offers::render_runpod_catalog(&cat));
     eprintln!("(`arena gpus` is RunPod's GPU list; `arena offers runpod` shows each tier, `arena offers all` every provider.)");
     Ok(())
+}
+
+/// Each line of `text` [`To`] its stream, at its level ([`arena_core::out::emit`]).
+fn say(to: To, text: &str) {
+    text.lines().for_each(|l| arena_core::out::emit(to, l));
 }
 
 #[cfg(test)]

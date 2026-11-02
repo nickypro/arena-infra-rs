@@ -89,7 +89,7 @@ pub(crate) fn handle_config(cmd: ConfigCmd, cfg: &Config, picked: &Picked) -> Re
             std::fs::write(config_path, updated)
                 .with_context(|| format!("writing {}", config_path.display()))?;
             // Never echo the value (it may be a secret).
-            println!("set {key} in {}", config_path.display());
+            arena_core::out!(Out, "set {key} in {}", config_path.display());
             Ok(())
         }
     }
@@ -268,13 +268,6 @@ fn config_which(cfg: &Config, picked: &Picked) -> Result<()> {
         .map(|m| !m.permissions().readonly())
         .unwrap_or(false);
 
-    println!("Active config: {}", abs.display());
-    println!(
-        "  {}  ·  {}",
-        if readable { "✓ readable" } else { "✗ not readable" },
-        if writable { "writable" } else { "read-only (config set can't write here)" },
-    );
-    println!("  source: {}", picked.config_source.describe());
     let canonical = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let lost = arena_core::config::passed_over(
         config_path,
@@ -284,30 +277,101 @@ fn config_which(cfg: &Config, picked: &Picked) -> Result<()> {
         std::path::Path::is_file,
         |a, b| canonical(a) == canonical(b),
     );
-    for l in lost {
-        println!("  ⚠ {l}");
-    }
-    println!("\nLoaded: provider {} ({}) · {} key(s) · {} machine name(s)",
-        picked.provider, picked.provider_from(), cfg.values.len(), cfg.machine_names.len());
-
-    println!("\nFiles kept beside the config (else found in the current directory, as before):");
-    for line in fleet_file_rows(cfg) {
-        println!("{line}");
-    }
-
     let (from_env, ignored) = env_keys(cfg, |k| std::env::var(k).is_ok());
-    if !ignored.is_empty() {
-        println!("\nIgnored from the environment (file-only, {}*): {}", Config::FILE_ONLY_PREFIX, ignored.join(", "));
-    }
-    if from_env.is_empty() {
-        println!("\nEnvironment overrides: none (all values come from the file)");
-    } else {
-        println!("\nEnvironment overrides in effect (env wins over the file):");
-        for k in from_env {
-            println!("  • {k}");
-        }
+    let which = Which { abs: &abs, readable, writable, lost: &lost, from_env: &from_env, ignored: &ignored };
+    for (to, line) in which_lines(cfg, picked, &which) {
+        arena_core::out::emit(to, &line);
     }
     Ok(())
+}
+
+/// What `config which` read off this box: the config file's real path and access, the files
+/// that lost to it, and the keys the environment gives or is ignored for ([`env_keys`]).
+struct Which<'a> {
+    abs: &'a std::path::Path,
+    readable: bool,
+    writable: bool,
+    lost: &'a [String],
+    from_env: &'a [&'a str],
+    ignored: &'a [&'a str],
+}
+
+/// `config which`'s lines: at `-v` as before — the file, how it's reached, what loaded, the fleet's
+/// files, the environment — and by default the file, what loaded, and only what needs a look:
+/// a file that isn't readable or writable, one that lost to it, a fleet file's ⚠, the keys the
+/// environment overrides or is ignored for. Pure.
+fn which_lines(cfg: &Config, picked: &Picked, w: &Which) -> Vec<(arena_core::out::To, String)> {
+    use arena_core::out::{bold, fail, warn, To};
+    let mut out: Vec<(To, String)> = Vec::new();
+    let mut detail = |s: String| out.push((To::Detail, s));
+    detail(format!("Active config: {}", w.abs.display()));
+    detail(format!(
+        "  {}  ·  {}",
+        if w.readable { "✓ readable" } else { "✗ not readable" },
+        if w.writable { "writable" } else { "read-only (config set can't write here)" },
+    ));
+    detail(format!("  source: {}", picked.config_source.describe()));
+    for l in w.lost {
+        detail(format!("  ⚠ {l}"));
+    }
+    let names = cfg.machine_names.len();
+    detail(format!(
+        "\nLoaded: provider {} ({}) · {} key(s) · {names} machine name(s)",
+        picked.provider,
+        picked.provider_from(),
+        cfg.values.len()
+    ));
+    detail("\nFiles kept beside the config (else found in the current directory, as before):".into());
+    let files = fleet_file_rows(cfg);
+    for line in &files {
+        detail(line.clone());
+    }
+    if !w.ignored.is_empty() {
+        detail(format!("\nIgnored from the environment (file-only, {}*): {}", Config::FILE_ONLY_PREFIX, w.ignored.join(", ")));
+    }
+    if w.from_env.is_empty() {
+        detail("\nEnvironment overrides: none (all values come from the file)".into());
+    } else {
+        detail("\nEnvironment overrides in effect (env wins over the file):".into());
+        for k in w.from_env {
+            detail(format!("  • {k}"));
+        }
+    }
+    let mut brief = |s: String| out.push((To::Brief, s));
+    let access = match (w.readable, w.writable) {
+        (true, true) => String::new(),
+        (true, false) => " (read-only: `config set` can't write here)".into(),
+        (false, _) => format!(" {}", fail("not readable")),
+    };
+    let source = match picked.config_source {
+        ConfigSource::Flag | ConfigSource::Env => format!(" · {}", picked.config_source.describe()),
+        _ => String::new(),
+    };
+    brief(format!("{}{source}{access}", bold(w.abs.display())));
+    let from = match picked.provider_source {
+        ProviderSource::Default => " (default)",
+        _ => "",
+    };
+    brief(format!(
+        "provider {}{from} · {} key{} · {names} machine name{}",
+        bold(&picked.provider),
+        cfg.values.len(),
+        if cfg.values.len() == 1 { "" } else { "s" },
+        if names == 1 { "" } else { "s" }
+    ));
+    for l in w.lost {
+        brief(warn(l));
+    }
+    for f in files.iter().filter(|f| f.contains('⚠')) {
+        brief(warn(f.replacen('⚠', "", 1).split_whitespace().collect::<Vec<_>>().join(" ")));
+    }
+    if !w.from_env.is_empty() {
+        brief(format!("from the environment (wins over the file): {}", w.from_env.join(", ")));
+    }
+    if !w.ignored.is_empty() {
+        brief(format!("ignored from the environment (file-only): {}", w.ignored.join(", ")));
+    }
+    out
 }
 
 /// `config which`'s rows for the files a fleet keeps beside its config: `keys/`, the plan, and
@@ -691,6 +755,29 @@ fn swap_row(cfg: &Config) -> (String, Option<arena_core::Error>) {
     }
 }
 
+/// `config check`'s `AGENT_NOTES` row: whether setup writes the agents' notes (which Python to
+/// use, for Claude Code and Codex), `(default)` when unset, or a ✗ row and the error the check
+/// fails on. Pure.
+fn agent_notes_row(cfg: &Config) -> (String, Option<arena_core::Error>) {
+    let raw = cfg.get("AGENT_NOTES");
+    let set = raw.is_some_and(|v| !v.trim().is_empty());
+    match arena_core::agent_notes::enabled(raw) {
+        Ok(true) => {
+            let (mark, default) = if set { ("✓", "") } else { ("·", " (default)") };
+            let files = arena_core::agent_notes::FILES.join(", ");
+            (format!("  {mark} {:<28} on{default} — setup writes which Python to use into {files}", "AGENT_NOTES"), None)
+        }
+        Ok(false) => (format!("  ✓ {:<28} off — setup writes no agent notes (`pods setup --notes-only` still does)", "AGENT_NOTES"), None),
+        Err(e) => {
+            let why = match &e {
+                arena_core::Error::Config(m) => m.clone(),
+                other => other.to_string(),
+            };
+            (format!("  ✗ {:<28} {why}", "AGENT_NOTES"), Some(e))
+        }
+    }
+}
+
 /// `config check`'s rows for `ASK_AI`: which AI `pods ask` (and the dashboard's `?`) sends to
 /// — `(default)` when unset — or `off`; where its binary is, or a ⚠ when it isn't installed for
 /// this user (advice: nothing fails until it's used). Then each AI's model and effort that is set
@@ -735,19 +822,136 @@ fn ask_ai_rows(cfg: &Config, env: &arena_core::ask::AiEnv) -> (Vec<String>, Vec<
 /// Print a config checklist for the selected provider + proxy + backup, never showing
 /// secret values. Returns an error if a required key is missing.
 /// `extra`: rows looked up live before the check ([`hetzner_image_rows`]), after the report.
+/// By default only what's wrong — the ✗, ‼ (the report's ⚠) and `?` rows, each with its `└`
+/// lines — then the verdict; `-v` prints the whole report as before ([`check_lines`]).
 pub(crate) fn config_check(cfg: &Config, provider_name: &str, extra: &[String]) -> Result<()> {
-    let (report, missing) = config_report(cfg, provider_name);
-    print!("{report}");
+    use arena_core::out::{bold, emit, green, To};
+    let (mut report, missing) = config_report(cfg, provider_name);
     for l in extra {
-        println!("{l}");
+        report.push_str(l);
+        report.push('\n');
+    }
+    for (to, line) in check_lines(&report) {
+        emit(to, &line);
     }
     if missing.is_empty() {
-        println!("\nOK — required keys for provider `{provider_name}` are present.");
+        emit(To::Detail, "");
+        emit(To::Out, &format!("{} — required keys for provider `{provider_name}` are present.", bold(green("OK"))));
         Ok(())
     } else {
         // Set but invalid counts too (each such entry says why): "missing" alone misled.
         anyhow::bail!("missing or invalid keys: {}", missing.join(", "))
     }
+}
+
+/// How a `config check` row reads at a glance, by its mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    /// `✗`: fails the check (or a required value missing).
+    Fail,
+    /// `⚠`/`‼`/`warning:`: advice that needs action.
+    Warn,
+    /// `?`: couldn't be looked up.
+    Unknown,
+    /// `✓`, `·`, or no mark: fine, or just information.
+    Fine,
+}
+
+/// A line of `config check`'s report: a section heading, a blank, a row with its mark, or a
+/// `└` line under the row before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Row {
+    Head,
+    Blank,
+    Item(Mark),
+    Under,
+}
+
+/// What `line` is ([`Row`]): a heading starts at the margin, a row is indented, its mark first
+/// (`  ✓ KEY  value`) — or, in the create spec's rows (`  GPU_TYPE / …  ✗ (missing)`), after
+/// the label; a `warning:` row is a warning. Pure.
+fn row_of(line: &str) -> Row {
+    let t = line.trim_start();
+    if t.is_empty() {
+        return Row::Blank;
+    }
+    if t.len() == line.len() {
+        return Row::Head;
+    }
+    match t.chars().next() {
+        Some('└') => Row::Under,
+        Some('✗') => Row::Item(Mark::Fail),
+        Some('⚠' | '‼') => Row::Item(Mark::Warn),
+        Some('?') => Row::Item(Mark::Unknown),
+        Some('✓' | '·') => Row::Item(Mark::Fine),
+        _ if t.starts_with("warning:") => Row::Item(Mark::Warn),
+        _ if t.contains(" ✗ ") => Row::Item(Mark::Fail),
+        _ if t.contains(" ⚠ ") => Row::Item(Mark::Warn),
+        _ => Row::Item(Mark::Fine),
+    }
+}
+
+/// A problem row as the default output says it: its mark first (`✗`, `‼`, `?`), then its words
+/// with the mark taken out and the column padding closed up —
+/// `  ⚠ persistent volume          0GB — …` → `‼ persistent volume 0GB — …`. Pure.
+fn brief_row(line: &str, mark: Mark) -> String {
+    use arena_core::out::{bang, cross, yellow};
+    let t = line.trim();
+    let body = t
+        .strip_prefix("warning:")
+        .or_else(|| t.strip_prefix(['✗', '⚠', '‼', '?']))
+        .map(str::to_string)
+        .unwrap_or_else(|| t.replacen(" ✗ ", " ", 1).replacen(" ⚠ ", " ", 1));
+    let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sym = match mark {
+        Mark::Fail => cross(),
+        Mark::Unknown => yellow("?"),
+        Mark::Warn | Mark::Fine => bang(),
+    };
+    format!("{sym} {body}")
+}
+
+/// `line` with its mark coloured (✓ green, ✗ red, ⚠ ‼ ? yellow) and a heading bold — the same
+/// words; [`arena_core::out::emit`] takes the colour off where the stream has none. Pure but for
+/// whether colour is on.
+fn styled(line: &str) -> String {
+    use arena_core::out::{bold, green, red, yellow};
+    if row_of(line) == Row::Head {
+        return bold(line);
+    }
+    let indent = line.len() - line.trim_start().len();
+    let (pad, rest) = line.split_at(indent);
+    let mut chars = rest.chars();
+    let paint = match chars.next() {
+        Some('✓') => green("✓"),
+        Some('✗') => red("✗"),
+        Some(c @ ('⚠' | '‼' | '?')) => yellow(c),
+        _ => return line.to_string(),
+    };
+    format!("{pad}{paint}{}", chars.as_str())
+}
+
+/// `config check`'s report as it's printed, line by line: every line as before at `-v`
+/// ([`arena_core::out::To::Detail`]), and by default ([`arena_core::out::To::Brief`]) only the
+/// rows that are wrong ([`brief_row`]) with their `└` lines. Pure.
+fn check_lines(report: &str) -> Vec<(arena_core::out::To, String)> {
+    use arena_core::out::To;
+    let mut out = Vec::new();
+    // Whether the row the `└` lines hang off is shown by default.
+    let mut shown = false;
+    for line in report.lines() {
+        out.push((To::Detail, styled(line)));
+        match row_of(line) {
+            Row::Item(Mark::Fine) | Row::Head | Row::Blank => shown = false,
+            Row::Item(mark) => {
+                out.push((To::Brief, brief_row(line, mark)));
+                shown = true;
+            }
+            Row::Under if shown => out.push((To::Brief, format!("  {}", line.trim()))),
+            Row::Under => {}
+        }
+    }
+    out
 }
 
 /// [`config_check`]'s report — every section's rows — and what it fails on: the keys
@@ -1082,6 +1286,8 @@ pub(crate) fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<S
         _ => cfg_row(&mut out, cfg, &mut missing, "OPENROUTER_WORKSPACE", false, false),
     }
     cfg_row(&mut out, cfg, &mut missing, "OPENROUTER_KEY_LIMIT", false, false); // USD cap per generated key
+    // What `pods test --deep`/`--keys` hold each machine's keys to (local files only).
+    println!("{}", key_check_row(&crate::pods::health::key_book(cfg)));
 
     // The balance sources as last seen (the state file only — no request): ⚠ rows are
     // advice, never missing keys; a ✗ row (a balance key set but invalid) fails the check.
@@ -1137,6 +1343,12 @@ pub(crate) fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<S
             println!("  ✗ setup step budgets        {e}");
             note_invalid(&mut missing, &e);
         }
+    }
+    // The agents' notes setup writes (AGENT_NOTES).
+    let (line, bad) = agent_notes_row(cfg);
+    println!("{line}");
+    if let Some(e) = bad {
+        note_invalid(&mut missing, &e);
     }
     // The driver floor `pods test --deep` holds pods to (MIN_DRIVER_VERSION, else derived
     // from ALLOWED_CUDA_VERSIONS).
@@ -1224,6 +1436,20 @@ pub(crate) fn balance_section(cfg: &Config, bal: &money::BalanceCtx, now: u64, m
     out
 }
 
+/// `config check`'s row on what the AI-key checks (`pods test --deep`, `--keys`) compare each
+/// machine's keys with: how many machines the keys CSV has an OpenRouter key for, and whether
+/// there's an `HF_TOKEN` — or that a kind isn't judged (none configured). Advice only. Pure.
+pub(crate) fn key_check_row(book: &arena_core::health::KeyBook) -> String {
+    let or = match (book.openrouter, book.csv.len()) {
+        (false, _) => "OpenRouter: none configured (not judged)".to_string(),
+        (true, 0) => "OpenRouter: no keys CSV rows yet (only working or not)".to_string(),
+        (true, 1) => "OpenRouter: the keys CSV's key for 1 machine".to_string(),
+        (true, n) => format!("OpenRouter: the keys CSV's keys for {n} machines"),
+    };
+    let hf = if book.hf.is_some() || !book.hf_csv.is_empty() { "HF_TOKEN: set" } else { "HF_TOKEN: unset (not judged)" };
+    format!("  · {:<28} {or}; {hf} — `arena pods test --keys`", "AI key check")
+}
+
 /// `config check`'s section on the machines `up --check` remembers as bad, from the health
 /// cache — which shares its state directory (and its lock) with the balance state file.
 /// Nothing when there is no state directory.
@@ -1242,6 +1468,8 @@ pub(crate) fn bad_hosts_section(cfg: &Config, now: u64) -> Vec<String> {
 mod tests;
 #[cfg(test)]
 mod which_tests;
+#[cfg(test)]
+mod output_tests;
 
 #[cfg(test)]
 mod swap_row_tests {
@@ -1262,6 +1490,26 @@ mod swap_row_tests {
         let mut missing = Vec::new();
         note_invalid(&mut missing, &bad.unwrap());
         assert!(missing.iter().any(|m| m.starts_with("VM_SWAP_GB")), "{missing:?}");
+    }
+
+    /// `config check`'s `AGENT_NOTES` row: on by default (marked), off, and a bad value a ✗ row
+    /// with the error the check fails on.
+    #[test]
+    fn the_agent_notes_row_says_on_off_or_why_not() {
+        let row = |text: &str| agent_notes_row(&Config::parse(text));
+        let (line, bad) = row("");
+        assert_eq!(
+            line,
+            "  · AGENT_NOTES                  on (default) — setup writes which Python to use into ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md"
+        );
+        assert!(bad.is_none());
+        assert!(row("AGENT_NOTES=1\n").0.starts_with("  ✓ AGENT_NOTES                  on — "));
+        assert!(row("AGENT_NOTES=0\n").0.starts_with("  ✓ AGENT_NOTES                  off — "));
+        let (line, bad) = row("AGENT_NOTES=sometimes\n");
+        assert_eq!(line, "  ✗ AGENT_NOTES                  AGENT_NOTES must be 1 or 0 (got `sometimes`)");
+        let mut missing = Vec::new();
+        note_invalid(&mut missing, &bad.unwrap());
+        assert!(missing.iter().any(|m| m.starts_with("AGENT_NOTES")), "{missing:?}");
     }
 
     /// `config check`'s `ENDPOINT_TIMEOUT_MINS` row: the default (5) marked, a set value ✓, and

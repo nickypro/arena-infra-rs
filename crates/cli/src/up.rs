@@ -42,6 +42,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -133,23 +134,14 @@ enum Gone {
 /// fleet checked pod by pod shouldn't make one per pod.
 const DETAILS_TTL: Duration = Duration::from_secs(60);
 
-/// Which stream a line belongs on: progress to stdout, trouble to stderr (as everywhere).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum To {
-    Out,
-    Err,
-}
+/// Which stream a line belongs on — progress to stdout, trouble to stderr (as everywhere) —
+/// and whether it shows always, only with `-v` (the steps), or only without (the short form
+/// of what `-v` says at length): docs/OUTPUT.md.
+pub(crate) use arena_core::out::To;
 
-/// Where the run's lines go: the terminal ([`console`]), or a recorder in tests — which is
-/// how the tests see *when* each pod reported, on the paused clock.
+/// Where the run's lines go: the terminal ([`arena_core::out::emit`]), or a recorder in tests —
+/// which is how the tests see *when* each pod reported, on the paused clock.
 pub(crate) type Say<'a> = &'a (dyn Fn(To, &str) + Sync);
-
-pub(crate) fn console(to: To, line: &str) {
-    match to {
-        To::Out => println!("{line}"),
-        To::Err => eprintln!("{line}"),
-    }
-}
 
 /// Provisioning, resolved before anything was created.
 pub(crate) struct SetupStage {
@@ -219,11 +211,20 @@ pub(crate) struct UpRun<'a> {
 /// never gets an endpoint.
 pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, claude: bool, lock: bool, endpoint: (u64, u32)) -> String {
     let (mins, placements) = endpoint;
+    // The last placement's pod is terminated too (review r3: said, so a name left with none is
+    // no surprise) — with one placement, at once.
+    let recreated = if placements > 1 {
+        format!(
+            "is TERMINATED and its name recreated (up to {placements} placement(s) per name; the last one's pod is \
+             terminated too, leaving the name with none)"
+        )
+    } else {
+        "is TERMINATED and its name not recreated (1 placement per name: --check-attempts)".to_string()
+    };
     let mut steps = vec![
         format!(
             "wait for its SSH endpoint — a pod up without one for {mins} min (RunPod: behind its SSH proxy \
-             only), or a RunPod pod with no container at --timeout ({} min or more), is TERMINATED and its name \
-             recreated (up to {placements} placement(s) per name)",
+             only), or a RunPod pod with no container at --timeout ({} min or more), {recreated}",
             NO_CONTAINER_LIMIT.as_secs() / 60
         ),
         "sync the proxy (if nginx is set up)".to_string(),
@@ -236,7 +237,7 @@ pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, claude:
     if let Some(n) = check {
         steps.push(format!(
             "deep-check it — a pod that FAILs on its host is TERMINATED and its name recreated (up to {n} \
-             placement(s) per name; options that haven't failed first; never on a machine that already \
+             placement(s) per name, the last one's left running; options that haven't failed first; never on a machine that already \
              failed — this run, or an `up --check` in the last {}h); a software/setup FAIL (e.g. torch \
              missing) is left running, not replaced",
             snapshot::BAD_HOST_TTL_SECS / 3600
@@ -252,6 +253,17 @@ pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, claude:
         steps.push("lock it (stop/restart/terminate refused until `arena pods unlock`)".into());
     }
     format!("per pod, as soon as it can: {} — then READY/FAILED per pod", steps.join(", "))
+}
+
+/// What a pod's keys stage did ([`Shared::copy_keys`]): its line, the fleet-SSH write it made
+/// (none if there was nothing to send), and the READY line's `keys` badge — `Some(true)` its
+/// keys are on it, `Some(false)` some it should have aren't, `None` there were none to copy
+/// (the backup archive's access only).
+struct KeysCopied {
+    to: To,
+    line: String,
+    fleet_ssh: Option<String>,
+    badge: Option<bool>,
 }
 
 /// What one name's pipeline came to (it becomes an [`UpRow`]).
@@ -275,6 +287,10 @@ struct NameRun {
     ready_at: Option<Instant>,
     /// `--lock` locked its pod.
     locked: bool,
+    /// Its keys stage's badge ([`KeysCopied::badge`]); `None` too when it had none.
+    keys: Option<bool>,
+    /// Its Claude Code stage, as `keys`.
+    claude: Option<bool>,
 }
 
 /// Counts a pipeline as waiting on the endpoint poller for as long as it's alive.
@@ -317,7 +333,16 @@ struct Shared<'r, 'a> {
     known_bad: Mutex<BTreeMap<String, BadHost>>,
     /// The provider's pod details for the deep checks, and when they were fetched.
     details: tokio::sync::Mutex<Option<(Instant, Vec<Pod>)>>,
+    /// Where each running pipeline is, and since when — a terminal's in-place line
+    /// ([`Shared::show_stages`]).
+    stages: Mutex<Vec<(String, &'static str, Instant)>>,
 }
+
+/// The key of `up`'s in-place line on a terminal ([`arena_core::out::progress`]).
+const STAGES: &str = "up";
+
+/// The steps long enough that a log says when each starts ([`Shared::stage`]).
+const LOGGED_STAGES: &[&str] = &["setup", "deep check"];
 
 /// Bring every pod in `made` up through its own pipeline, concurrently; returns one row per
 /// name, in `made`'s order, after a final proxy sync. `interrupt` resolving (Ctrl+C in the
@@ -371,6 +396,7 @@ where
         failed_hosts: Mutex::new(Vec::new()),
         known_bad: Mutex::new(known_bad),
         details: tokio::sync::Mutex::new(None),
+        stages: Mutex::new(Vec::new()),
     };
     let shared = &shared;
     let pipelines = join_streamed(&mut made, |i, m| async move { (i, shared.pipeline(m).await) });
@@ -390,7 +416,9 @@ where
         () = watcher => unreachable!("the interrupt watcher never returns"),
         names = pipelines => names,
         () = shared.poll_endpoints() => unreachable!("the endpoint poller never returns"),
+        () = shared.show_stages() => unreachable!("the stages line never ends"),
     };
+    arena_core::out::progress(STAGES, None);
     if names.is_empty() {
         return Vec::new();
     }
@@ -464,14 +492,16 @@ pub(crate) fn not_created_rows(confirmed: &[String], made: &[String], interrupte
         .collect()
 }
 
-/// The summary table, then `Err` (non-zero exit) unless every pod is READY.
+/// The summary table (`-v`; without, `✓ 2 of 2 READY` when they all are — the error says
+/// which aren't), then `Err` (non-zero exit) unless every pod is READY.
 pub(crate) fn conclude(rows: &[UpRow], say: Say<'_>) -> anyhow::Result<()> {
-    say(To::Out, &format!("\n{}", pipeline::render_up_summary(rows).trim_end()));
+    say(To::Detail, &format!("\n{}", pipeline::render_up_summary(rows).trim_end()));
     let not_ready: Vec<String> =
         rows.iter().filter(|r| !r.verdict.is_ready()).map(|r| format!("{} ({})", r.name, r.verdict.status_label())).collect();
     if !not_ready.is_empty() {
         anyhow::bail!("{} of {} pod(s) not ready: {}", not_ready.len(), rows.len(), not_ready.join(", "));
     }
+    say(To::Brief, &arena_core::out::ok(format!("{} of {} {}", rows.len(), rows.len(), arena_core::out::bold("READY"))));
     Ok(())
 }
 
@@ -548,6 +578,51 @@ impl Shared<'_, '_> {
         *self.stop.borrow()
     }
 
+    /// Where `name`'s pipeline is now (`None`: it ended). On a terminal, the in-place line — drawn
+    /// at once, so a pod's READY line never has its last step redrawn under it. In a log or a
+    /// pipe, which has no such line, a long step's start is a line of its own at default
+    /// (`[devtest-apple] setup…`): the dashboard's runs panel shows it as the pod's step, as it
+    /// did each step's line before they moved to `-v` (review r2).
+    fn stage(&self, name: &str, what: Option<&'static str>) {
+        {
+            let mut stages = self.stages.lock().unwrap();
+            stages.retain(|(n, ..)| n != name);
+            if let Some(w) = what {
+                stages.push((name.to_string(), w, Instant::now()));
+            }
+        }
+        if arena_core::out::live() {
+            self.draw_stages();
+        } else if let Some(w) = what.filter(|w| LOGGED_STAGES.contains(w)) {
+            (self.say)(To::Brief, &format!("[{name}] {w}…"));
+        }
+    }
+
+    /// The pipelines' in-place line on a terminal: `devtest-apple setup 2m10s · devtest-bloom
+    /// waiting for SSH 30s`; none once none runs. Nothing off a terminal or with `-v`.
+    fn draw_stages(&self) {
+        if !arena_core::out::live() {
+            return;
+        }
+        let line = {
+            let stages = self.stages.lock().unwrap();
+            stages.iter().map(|(n, w, t)| format!("{n} {w} {}", pipeline::fmt_elapsed(t.elapsed()))).collect::<Vec<_>>().join(" · ")
+        };
+        arena_core::out::progress(STAGES, (!line.is_empty()).then_some(line.as_str()));
+    }
+
+    /// [`Self::draw_stages`] every second while the pipelines run, so the quiet between a
+    /// `[created]` and its READY isn't a hang. Off a terminal it only waits. Never returns.
+    async fn show_stages(&self) {
+        if !arena_core::out::live() {
+            return std::future::pending().await;
+        }
+        loop {
+            self.draw_stages();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
     /// One name, start to finish: its first pod's pipeline, then a replacement's, until one
     /// ends it (READY, FAILED, STOPPED).
     async fn pipeline(&self, made: Made) -> NameRun {
@@ -563,6 +638,8 @@ impl Shared<'_, '_> {
             verdict: Verdict::Stopped { stage: Stage::Endpoint },
             ready_at: None,
             locked: false,
+            keys: None,
+            claude: None,
         };
         // Options whose pods failed a check for this name — a replacement tries them last.
         let mut failed_options = Vec::new();
@@ -596,6 +673,7 @@ impl Shared<'_, '_> {
         run.port = None;
         run.fleet_ssh = None;
         run.pod = Some(pod.clone());
+        self.stage(&name, Some("waiting for SSH"));
 
         // 1. Its SSH endpoint, within its own deadline — or, on a backend whose creates can fail
         // after they succeeded (Shadeform: an instance goes to `error`, or sits pending, maybe
@@ -695,7 +773,7 @@ impl Shared<'_, '_> {
                             let grace = self.grace_for(&p);
                             deadline = Instant::now() + grace;
                             say(
-                                To::Err,
+                                To::ErrDetail,
                                 &format!(
                                     "[{name}] no SSH endpoint after {secs}s, and only now up without one: giving it its {} \
                                      (--endpoint-timeout)",
@@ -753,7 +831,7 @@ impl Shared<'_, '_> {
         }
         run.pod = Some(pod.clone());
         say(
-            To::Out,
+            To::Detail,
             &format!(
                 "[{name}] endpoint {} (after {})",
                 fleet::endpoint_label(&pod),
@@ -771,7 +849,7 @@ impl Shared<'_, '_> {
                 a.end = AttemptEnd::SameHost;
             }
             failed_options.push(option);
-            say(To::Err, &format!("[{name}] landed on {ip}, a machine that already failed the deep check — rejecting it"));
+            say(To::ErrDetail, &format!("[{name}] landed on {ip}, a machine that already failed the deep check — rejecting it"));
             let why = format!("attempt {n} landed on {ip}, a machine that already failed the deep check");
             return self.replace(run, &pod, failed_options, why, Stage::Check).await;
         }
@@ -788,8 +866,9 @@ impl Shared<'_, '_> {
                 say(
                     To::Err,
                     &format!(
-                        "[{name}] ⚠ landed on {machine}, which failed the deep check {when} — kept: without --check \
-                         nothing is checked or replaced (`arena pods test --deep {name}`)"
+                        "[{name}] {} landed on {machine}, which failed the deep check {when} — kept: without --check \
+                         nothing is checked or replaced (`arena pods test --deep {name}`)",
+                        arena_core::out::bang()
                     ),
                 );
             } else {
@@ -798,7 +877,7 @@ impl Shared<'_, '_> {
                 }
                 failed_options.push(option);
                 say(
-                    To::Err,
+                    To::ErrDetail,
                     &format!(
                         "[{name}] landed on {machine}, which failed the deep check {when} — rejecting it \
                          (`--retry-bad-hosts` tries such machines anyway)"
@@ -826,6 +905,7 @@ impl Shared<'_, '_> {
 
         // 3. Setup — this pod only, through the same runner as `pods setup`.
         if let Some(setup) = &self.run.setup {
+            self.stage(&name, Some("setup"));
             let steps = provisioning_steps(&pod.provider, &setup.scfg, &name, false, &setup.hetzner_script, &setup.timeouts);
             let t = Instant::now();
             let mut outcome = self.or_stop(provision(self.run.remote.as_ref(), &target, &steps, boot)).await;
@@ -836,7 +916,7 @@ impl Shared<'_, '_> {
                     None => return self.end(run, Verdict::Stopped { stage: Stage::Setup }),
                     Some(Ok(n)) => {
                         say(
-                            To::Err,
+                            To::ErrDetail,
                             &format!(
                                 "[{name}] setup: the pod refused our SSH key — re-attached {n} key(s) through the {} API; \
                                  retrying setup",
@@ -846,14 +926,14 @@ impl Shared<'_, '_> {
                         let remote = self.run.remote.as_ref();
                         outcome = self.or_stop(provision_after_key_repair(remote, &target, &steps, boot)).await;
                     }
-                    Some(Err(Some(why))) => say(To::Err, &format!("[{name}] setup: the pod refused our SSH key; {why}")),
+                    Some(Err(Some(why))) => say(To::ErrDetail, &format!("[{name}] setup: the pod refused our SSH key; {why}")),
                     Some(Err(None)) => {}
                 }
             }
             match outcome {
                 None => return self.end(run, Verdict::Stopped { stage: Stage::Setup }),
                 Some(outcome) if !outcome.is_done() => {
-                    let reason = format!("{} — left running", outcome.describe());
+                    let reason = format!("{} — left running (retry: `arena pods setup {name}`)", outcome.describe());
                     return self.end(run, Verdict::Failed { stage: Stage::Setup, reason });
                 }
                 Some(outcome) => {
@@ -862,7 +942,7 @@ impl Shared<'_, '_> {
                     let installer = outcome.installer().map(|i| format!(", installer: {i}")).unwrap_or_default();
                     // A VM from an arena image: which one, and how old (`HETZNER_IMAGE=arena`).
                     let image = outcome.image().map(|i| format!(", image: {i}")).unwrap_or_default();
-                    say(To::Out, &format!("[{name}] setup ✓ ({}{installer}{image})", pipeline::fmt_elapsed(t.elapsed())));
+                    say(To::Detail, &format!("[{name}] setup ✓ ({}{installer}{image})", pipeline::fmt_elapsed(t.elapsed())));
                     // A best-effort step (the move onto the volume, the VS Code warm-up) that didn't
                     // work out: said, not fatal.
                     for w in outcome.warnings() {
@@ -891,7 +971,7 @@ impl Shared<'_, '_> {
         // setup, whose rc files the banner goes into. Best effort — said, never fatal.
         if self.run.reap_notice {
             match crate::reap::reassert_notice(self.run.remote.as_ref(), self.run.cfg, &pod, &target).await {
-                Ok(true) => say(To::Out, &format!("[{name}] reap notice ✓")),
+                Ok(true) => say(To::Detail, &format!("[{name}] reap notice ✓")),
                 Ok(false) => {}
                 Err(why) => say(To::Err, &format!("[{name}] reap notice not written ({why}) — `arena pods reap set {name} …` writes it")),
             }
@@ -899,6 +979,7 @@ impl Shared<'_, '_> {
 
         // 4. The deep check: a FAIL is a bad host — replace it while attempts remain.
         if let Some(check) = &self.run.check {
+            self.stage(&name, Some("deep check"));
             let Some(mut h) = self.or_stop(self.deep_check(&name, &pod, &target, check)).await else {
                 return self.end(run, Verdict::Stopped { stage: Stage::Check });
             };
@@ -911,7 +992,7 @@ impl Shared<'_, '_> {
             // zsh on a bare VM before setup, no `base64`) is no dropped session: the pod's
             // software, the same on a retry — judged below as software/setup.
             if !script_ran(&h) && !never_started(&h) {
-                say(To::Err, &format!("[{name}] check: couldn't run it ({}) — once more when SSH answers", h.notes()));
+                say(To::ErrDetail, &format!("[{name}] check: couldn't run it ({}) — once more when SSH answers", h.notes()));
                 match self.or_stop(self.ssh_answers(&target, BootRetry::default())).await {
                     None => return self.end(run, Verdict::Stopped { stage: Stage::Check }),
                     Some(Err(why)) => {
@@ -946,12 +1027,17 @@ impl Shared<'_, '_> {
                 // running): a new pod boots the same image and runs the same setup, so it would
                 // fail the same way — never replaced, and its machine isn't counted as bad.
                 Status::Fail if kind == Some(health::FailureKind::Software) => {
-                    say(To::Err, &format!("[{name}] check: FAIL (software/setup, not the host) — {notes}"));
+                    say(To::ErrDetail, &format!("[{name}] check: FAIL (software/setup, not the host) — {notes}"));
                     let reason = format!(
                         "software/setup failure, not the host — {notes}. Not replaced: a new pod from the same image \
                          fails the same way. Left running — fix the setup/image, then `arena pods test --deep {name}`"
                     );
                     return self.end(run, Verdict::Failed { stage: Stage::Check, reason });
+                }
+                // Only its AI keys failed (a policy that holds them — not this check's, which runs
+                // before the keys are copied): never the machine. Said, and kept.
+                Status::Fail if kind == Some(health::FailureKind::Key) => {
+                    say(To::Err, &format!("[{name}] check: FAIL (AI key, not the machine: kept) — {notes}"));
                 }
                 Status::Fail => {
                     if let Some(ip) = &host {
@@ -964,25 +1050,40 @@ impl Shared<'_, '_> {
                     if let Some(a) = run.attempts.last_mut() {
                         a.end = AttemptEnd::CheckFailed(notes.clone());
                     }
-                    say(To::Err, &format!("[{name}] check: FAIL (host) — {notes}"));
+                    say(To::ErrDetail, &format!("[{name}] check: FAIL (host) — {notes}"));
                     return self.replace(run, &pod, failed_options, format!("deep check failed (host): {notes}"), Stage::Check).await;
                 }
-                Status::Warn => say(To::Out, &format!("[{name}] check: warn — {notes}")),
-                _ => say(To::Out, &format!("[{name}] check: pass")),
+                Status::Warn => say(To::Detail, &format!("[{name}] check: warn — {notes}")),
+                _ => say(To::Detail, &format!("[{name}] check: pass")),
             }
         }
 
         // 5. Its API keys — only ever to a pod that got this far.
         if let Some(keys) = &self.run.keys {
+            self.stage(&name, Some("keys"));
             match self.or_stop(self.copy_keys(&name, &pod, &target, keys)).await {
                 None => return self.end(run, Verdict::Stopped { stage: Stage::Keys }),
                 Some(Err(why)) => {
                     let reason = format!("{why} — left running (retry: `arena pods copy-keys {name}`)");
                     return self.end(run, Verdict::Failed { stage: Stage::Keys, reason });
                 }
-                Some(Ok((to, line, fleet_ssh))) => {
-                    say(to, &line);
-                    run.fleet_ssh = fleet_ssh;
+                Some(Ok(copied)) => {
+                    run.keys = copied.badge;
+                    say(copied.to, &copied.line);
+                    run.fleet_ssh = copied.fleet_ssh;
+                }
+            }
+            // 5a. --check: do its AI keys work, now they're on it? (The deep check ran before
+            // they were copied.) Whatever the answer, never a replace, a retry or a bad host: a
+            // key isn't the machine. Said with what to run, folded into its check; kept.
+            if self.run.check.is_some() {
+                let ledger = crate::spend::SpendCtx::from_config(self.run.cfg).path().map(Path::to_path_buf);
+                let book = keys.key_book(self.run.cfg, ledger.as_deref());
+                if book.any() {
+                    let Some(k) = self.or_stop(self.key_check(&pod, &target, book)).await else {
+                        return self.end(run, Verdict::Stopped { stage: Stage::Keys });
+                    };
+                    self.say_keys(&name, &k, run);
                 }
             }
         }
@@ -990,6 +1091,7 @@ impl Shared<'_, '_> {
         // 5b. Its Claude Code account: one by spread if it has none, and that account's token.
         // Best effort: a pod without it is still READY — said, with the retry.
         if self.run.claude {
+            self.stage(&name, Some("Claude"));
             let one = [(pod.clone(), target.clone())];
             let staged = arena_core::claude::stage(self.run.remote.as_ref(), self.run.cfg, &one, None, snapshot::unix_now());
             match self.or_stop(staged).await {
@@ -998,12 +1100,16 @@ impl Shared<'_, '_> {
                 Some(Ok(Some(outcomes))) => {
                     for o in outcomes {
                         match &o.result {
-                            Ok(()) => say(To::Out, &format!("[{name}] claude ✓ {}", o.what())),
+                            Ok(()) => say(To::Detail, &format!("[{name}] claude ✓ {}", o.what())),
                             Err(e) => say(To::Err, &format!("[{name}] claude ✗ {} — {e} (retry: `arena claude push {name}`)", o.what())),
                         }
+                        run.claude = Some(run.claude.unwrap_or(true) && o.result.is_ok());
                     }
                 }
-                Some(Err(e)) => say(To::Err, &format!("[{name}] claude: not pushed — {e} (retry: `arena claude push {name}`)")),
+                Some(Err(e)) => {
+                    run.claude = Some(false);
+                    say(To::Err, &format!("[{name}] claude: not pushed — {e} (retry: `arena claude push {name}`)"));
+                }
             }
         }
 
@@ -1012,6 +1118,7 @@ impl Shared<'_, '_> {
         // throttled or transient failure is retried; a lock that doesn't take fails the name
         // (the operator asked for a protected pod), the pod left running, unlocked.
         if self.run.lock {
+            self.stage(&name, Some("lock"));
             let policy = arena_core::retry::RetryPolicy::default();
             match self.or_stop(arena_core::retry::retrying(&policy, || self.run.provider.set_locked(&pod.id, true))).await {
                 None => return self.end(run, Verdict::Stopped { stage: Stage::Lock }),
@@ -1034,7 +1141,7 @@ impl Shared<'_, '_> {
     /// the name's placements (`--check-attempts`, with or without `--check`); with none left
     /// it is still terminated, and the name fails at `endpoint`.
     async fn dead(&self, run: &mut NameRun, pod: &Pod, option: usize, failed_options: &mut Vec<usize>, why: String) -> Option<(Pod, usize)> {
-        (self.say)(To::Err, &format!("[{}] {why} — before it came up: a failed placement", run.name));
+        (self.say)(To::ErrDetail, &format!("[{}] {why} — before it came up: a failed placement", run.name));
         if let Some(a) = run.attempts.last_mut() {
             a.end = AttemptEnd::Dead(why.clone());
         }
@@ -1101,12 +1208,12 @@ impl Shared<'_, '_> {
                 return Err(self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason }));
             }
             Now::Reachable(p) => {
-                (self.say)(To::Out, &format!("[{name}] {why} — but it has an endpoint now; going on"));
+                (self.say)(To::Detail, &format!("[{name}] {why} — but it has an endpoint now; going on"));
                 return Ok(Look::Found(p));
             }
             Now::NotUp(p) if in_time => {
                 let now = p.status.trim();
-                (self.say)(To::Err, &format!("[{name}] {why} — but it's listed {now}, not up, now (restarting?): waiting on"));
+                (self.say)(To::ErrDetail, &format!("[{name}] {why} — but it's listed {now}, not up, now (restarting?): waiting on"));
                 return Ok(Look::WaitOn(p));
             }
             Now::NotUp(p) => {
@@ -1115,7 +1222,7 @@ impl Shared<'_, '_> {
             }
             Now::Unknown(e) if in_time => {
                 (self.say)(
-                    To::Err,
+                    To::ErrDetail,
                     &format!("[{name}] {why} — but it can't be looked at again just now ({e}): waiting on, nothing terminated"),
                 );
                 return Ok(Look::WaitOn(pod));
@@ -1140,7 +1247,7 @@ impl Shared<'_, '_> {
             Some(p) => format!(" — on {p}"),
             None => format!(" — {} names no machine or data centre for it", pod.provider),
         };
-        (self.say)(To::Err, &format!("[{name}] {why}{on}: a host failure"));
+        (self.say)(To::ErrDetail, &format!("[{name}] {why}{on}: a host failure"));
         if let Some(a) = run.attempts.last_mut() {
             a.end = AttemptEnd::NoEndpoint(what);
             a.host = place;
@@ -1169,6 +1276,7 @@ impl Shared<'_, '_> {
     /// and record the verdict.
     fn end(&self, run: &mut NameRun, verdict: Verdict) -> Option<(Pod, usize)> {
         let name = &run.name;
+        self.stage(name, None);
         match &verdict {
             Verdict::Ready => {
                 let mut what = vec![self.option(run.option).map(PlacementOption::describe).unwrap_or_default()];
@@ -1176,18 +1284,25 @@ impl Shared<'_, '_> {
                     what.push(format!("proxy port {port}"));
                 }
                 if let Some(h) = &run.health {
-                    what.push(format!("check {}", h.status.label()));
+                    // The machine's verdict; its AI keys' beside it when they aren't a pass.
+                    let keys = h.key_status().filter(|k| *k != Status::Pass).map(|k| format!(", AI key {}", k.label()));
+                    what.push(format!("check {}{}", h.machine_status().label(), keys.unwrap_or_default()));
                 }
                 if run.locked {
                     what.push("locked".into());
                 }
                 let after = run.ready_at.map(|t| pipeline::fmt_elapsed(t - run.first_at)).unwrap_or_default();
                 what.retain(|w| !w.is_empty());
-                (self.say)(To::Out, &format!("[{name}] READY after {after} — {}", what.join(", ")));
+                (self.say)(To::Detail, &format!("[{name}] READY after {after} — {}", what.join(", ")));
+                (self.say)(To::Brief, &ready_brief(run, &after));
             }
-            Verdict::Failed { stage, reason } => (self.say)(To::Err, &format!("[{name}] FAILED {}: {reason}", stage.label())),
+            Verdict::Failed { stage, reason } => {
+                let failed = arena_core::out::red(arena_core::out::bold("FAILED"));
+                (self.say)(To::Err, &format!("[{}] {failed} {}: {reason}", arena_core::out::bold(name), stage.label()))
+            }
             Verdict::Stopped { stage } => {
-                (self.say)(To::Err, &format!("[{name}] STOPPED at {} (Ctrl+C) — left as it is", stage.label()))
+                let stopped = arena_core::out::yellow(arena_core::out::bold("STOPPED"));
+                (self.say)(To::Err, &format!("[{}] {stopped} at {} (Ctrl+C) — left as it is", arena_core::out::bold(name), stage.label()))
             }
         }
         run.verdict = verdict;
@@ -1237,10 +1352,15 @@ impl Shared<'_, '_> {
             let reason = format!("{why} — not replaced (interrupted); left running, still billing{}", price_of(pod));
             return self.end(run, Verdict::Failed { stage, reason });
         }
+        self.stage(&name, Some("replacing"));
         if last {
-            say(To::Err, &format!("[{name}] terminating {} — no attempt left to replace it (--check-attempts {max})", pod.id));
+            say(To::ErrDetail, &format!("[{name}] terminating {} — no attempt left to replace it (--check-attempts {max})", pod.id));
+            let short = run.attempts.last().map_or("failed", |a| attempt_brief(&a.end));
+            say(To::ErrBrief, &format!("[{}] {short} — terminating it, no try left", arena_core::out::bold(&name)));
         } else {
-            say(To::Err, &format!("[{name}] terminating {} to recreate {name} (attempt {} of {max})", pod.id, n + 1));
+            say(To::ErrDetail, &format!("[{name}] terminating {} to recreate {name} (attempt {} of {max})", pod.id, n + 1));
+            let short = run.attempts.last().map_or("failed", |a| attempt_brief(&a.end));
+            say(To::ErrBrief, &format!("[{}] {short} — replacing it (attempt {} of {max})", arena_core::out::bold(&name), n + 1));
         }
         // On the backend that listed it, by name (as the reaper does): never routed by the id
         // alone, which another backend's pod may share (Vast and Hetzner ids are both numbers).
@@ -1315,7 +1435,7 @@ impl Shared<'_, '_> {
             ..self.run.options.clone()
         };
         if let Some(first) = plan.options.first() {
-            say(To::Out, &format!("[{name}] recreating it — trying {} first", first.describe()));
+            say(To::Detail, &format!("[{name}] recreating it — trying {} first", first.describe()));
         }
         let stop = self.stop.clone();
         let interrupt = move || {
@@ -1324,11 +1444,15 @@ impl Shared<'_, '_> {
                 let _ = stop.wait_for(|s| *s).await;
             }
         };
-        let mut show = |p: &Progress| say(if p.is_created() { To::Out } else { To::Err }, &p.line());
+        // Its own in-place line on a terminal, taken away however the placement ends.
+        let rounds = format!("{} {name}", crate::pods::placement::ROUNDS);
+        let rounds_line = arena_core::out::progress_guard(&rounds);
+        let mut show = |p: &Progress| crate::pods::placement::say_progress(p, say, &rounds);
         let names = [name.clone()];
         let placed =
             placement::place(self.run.provider, &base, &names, &plan, self.run.rounds, None, interrupt, &mut show)
                 .await;
+        drop(rounds_line);
         if let Some(bal) = self.run.balance {
             bal.remember_prices(&placed.created);
         }
@@ -1353,7 +1477,7 @@ impl Shared<'_, '_> {
                     Ok(pods) => {
                         self.listing.send_replace(Arc::new(pods));
                     }
-                    Err(e) => (self.say)(To::Err, &format!("  endpoint poll failed ({e}); retrying in {}s", every.as_secs())),
+                    Err(e) => (self.say)(To::ErrDetail, &format!("  endpoint poll failed ({e}); retrying in {}s", every.as_secs())),
                 }
                 tokio::time::sleep(every).await;
             } else {
@@ -1533,7 +1657,7 @@ impl Shared<'_, '_> {
             ProxySync::Synced { routed, .. } => match routed.iter().find(|f| &f.name == name) {
                 Some(f) => {
                     run.port = Some(f.public_port);
-                    (self.say)(To::Out, &format!("[{name}] proxy: port {} → {}", f.public_port, f.target()));
+                    (self.say)(To::Detail, &format!("[{name}] proxy: port {} → {}", f.public_port, f.target()));
                 }
                 None => (self.say)(
                     To::Err,
@@ -1541,10 +1665,10 @@ impl Shared<'_, '_> {
                 ),
             },
             ProxySync::Failed(e) => (self.say)(
-                To::Err,
+                To::ErrDetail,
                 &format!("[{name}] proxy NOT synced — {} (the final sync retries; or `arena proxy apply`)", one_line(e)),
             ),
-            ProxySync::Skipped(why) => (self.say)(To::Out, &format!("[{name}] proxy skipped — {why}")),
+            ProxySync::Skipped(why) => (self.say)(To::Detail, &format!("[{name}] proxy skipped — {why}")),
         }
     }
 
@@ -1562,6 +1686,50 @@ impl Shared<'_, '_> {
             ..pod.clone()
         };
         judge_deep_call(&pod, call.map_err(|e| describe_error(&e)), &check.policy)
+    }
+
+    /// The keys-only check on one pod (`pods test --keys`'s: one bounded exec), held to `book`.
+    /// A key OpenRouter turned away is judged again with its listing ([`crate::pods::health::key_listing`]),
+    /// which tells a paused key (`keys resume`) from a deleted one (`keys rotate`).
+    async fn key_check(&self, pod: &Pod, target: &SshTarget, book: health::KeyBook) -> PodHealth {
+        let cmd = health::key_check_command(Some(self.run.cfg.get("CONDA_ENV").unwrap_or("arena-env")));
+        let call = self.run.remote.exec(target, &cmd, Some(health::KEY_CHECK_TIMEOUT)).await;
+        let mut policy = HealthPolicy { keys: Some(book), ..HealthPolicy::default() };
+        let h = health::judge_key_call(pod, call.map_err(|e| describe_error(&e)), &policy);
+        let rejected = h.facts.as_ref().and_then(|f| f.openrouter.as_ref()).is_some_and(|k| matches!(k.http, Some(401 | 403)));
+        match (rejected, h.facts.clone()) {
+            (true, Some(facts)) => {
+                if let Some(book) = policy.keys.as_mut() {
+                    book.listed = crate::pods::health::key_listing(self.run.cfg).await;
+                }
+                PodHealth::keys_checked(pod, facts, &policy)
+            }
+            _ => h,
+        }
+    }
+
+    /// Say a keys-only check's verdict — a line per key it judged (`[apple] AI key ✓ ok, $4.97 of
+    /// $5.00 left`; `✗ … — <what to run>` on stderr) — and fold it into the name's check, so the
+    /// report and the health cache have it. One that couldn't run is said, with the command
+    /// that runs it again, and changes nothing.
+    fn say_keys(&self, name: &str, k: &PodHealth, run: &mut NameRun) {
+        let reported = k.facts.as_ref().is_some_and(|f| f.started && (f.openrouter.is_some() || f.hf.is_some()));
+        if !reported {
+            (self.say)(To::Err, &format!("[{name}] AI key: not checked ({}) — `arena pods test --keys {name}`", k.notes()));
+            return;
+        }
+        for c in k.checks.iter().filter(|c| health::is_key_check(&c.name) && c.status != Status::Skip) {
+            let what = if c.name == health::AI_KEY { "AI key" } else { "HF token" };
+            let (to, mark) = match c.status {
+                Status::Pass => (To::Detail, "✓"),
+                Status::Warn => (To::Err, "!"),
+                _ => (To::Err, "✗"),
+            };
+            (self.say)(to, &format!("[{name}] {what} {mark} {}", c.detail));
+        }
+        if let Some(h) = run.health.as_mut() {
+            h.merge_keys(k);
+        }
     }
 
     /// `pod` with the machine id from the provider's best-effort details when its listing
@@ -1588,7 +1756,7 @@ impl Shared<'_, '_> {
                 pods.push(pod.clone());
             }
             if let Some(w) = enrich_best_effort(self.run.provider, &mut pods, ENRICH_TIMEOUT).await {
-                (self.say)(To::Err, &format!("[{name}] {w}"));
+                (self.say)(To::ErrDetail, &format!("[{name}] {w}"));
             }
             *cache = Some((Instant::now(), pods));
         }
@@ -1605,12 +1773,16 @@ impl Shared<'_, '_> {
         pod: &Pod,
         target: &SshTarget,
         keys: &KeySources,
-    ) -> std::result::Result<(To, String, Option<String>), String> {
+    ) -> std::result::Result<KeysCopied, String> {
         let (vars, matched) = keys.vars_for(&pod.name);
         let archive = super::archive::pod_archive(self.run.cfg);
         let none_for_it = format!("keys: none for it (no per-host key matched {name}, no broadcast token set)");
+        // The READY line's `keys` badge: the keys it should have are on it (✓), some or all of
+        // them aren't (‼); none when there were none to copy (only the archive's access).
+        let some_missing = if keys.per_host.is_empty() { None } else { Some(false) };
+        let done = |to, line: String, fleet_ssh, badge| KeysCopied { to, line, fleet_ssh, badge };
         if vars.is_empty() && archive.ready().is_none() {
-            return Ok((To::Err, format!("[{name}] {none_for_it}"), None));
+            return Ok(done(To::Err, format!("[{name}] {none_for_it}"), None, Some(false)));
         }
         let fleet_pods = self.listing.borrow().clone();
         let (fleet_ssh, _) = fleet_ssh_for(self.run.cfg, &fleet_pods);
@@ -1624,22 +1796,25 @@ impl Shared<'_, '_> {
             _ => None,
         };
         if let Some(e) = archive_note {
-            let done = if vars.is_empty() { "fleet ssh" } else { "keys" };
-            return Ok((To::Err, format!("[{name}] {done} ✓ — backup archive: {e}"), Some(fleet_ssh)));
+            let (what, badge) = if vars.is_empty() { ("fleet ssh", some_missing) } else { ("keys", Some(matched || keys.per_host.is_empty())) };
+            return Ok(done(To::Err, format!("[{name}] {what} ✓ — backup archive: {e}"), Some(fleet_ssh), badge));
         }
         match written {
             // No key for it, only the archive's access: said as such — a warning only when a key
             // file exists that didn't name it.
             Ok(o) if o.success && vars.is_empty() => {
-                let to = if keys.per_host.is_empty() { To::Out } else { To::Err };
+                let to = if keys.per_host.is_empty() { To::Detail } else { To::Err };
                 let why = if keys.per_host.is_empty() { "keys: none generated".to_string() } else { none_for_it };
-                Ok((to, format!("[{name}] backup archive access ✓ ({why})"), Some(fleet_ssh)))
+                Ok(done(to, format!("[{name}] backup archive access ✓ ({why})"), Some(fleet_ssh), some_missing))
             }
-            Ok(o) if o.success && (matched || keys.per_host.is_empty()) => Ok((To::Out, format!("[{name}] keys ✓"), Some(fleet_ssh))),
-            Ok(o) if o.success => Ok((
+            Ok(o) if o.success && (matched || keys.per_host.is_empty()) => {
+                Ok(done(To::Detail, format!("[{name}] keys ✓"), Some(fleet_ssh), Some(true)))
+            }
+            Ok(o) if o.success => Ok(done(
                 To::Err,
                 format!("[{name}] keys ✓ — broadcast tokens only: no per-host key in keys/*_api_keys.csv matched {name}"),
                 Some(fleet_ssh),
+                Some(false),
             )),
             Ok(o) => Err(format!("copying its keys: {}: {}", o.exit_label(), o.stderr.trim())),
             Err(e) => Err(format!("copying its keys: {}", describe_error(&e))),
@@ -1672,7 +1847,7 @@ impl Shared<'_, '_> {
         for (name, written) in join_unordered(writes).await {
             match written {
                 Ok(o) if o.success => {
-                    (self.say)(To::Out, &format!("[{name}] fleet SSH map updated with the pods that came up after it"))
+                    (self.say)(To::Detail, &format!("[{name}] fleet SSH map updated with the pods that came up after it"))
                 }
                 Ok(o) => (self.say)(
                     To::Err,
@@ -1700,7 +1875,7 @@ impl Shared<'_, '_> {
             Err(why) => ProxySync::Skipped(why.clone()),
             Ok(()) => proxy_sync_now(self.run.cfg, self.run.provider).await,
         };
-        say(if matches!(synced, ProxySync::Failed(_)) { To::Err } else { To::Out }, &sync_line("up", &synced));
+        say(if matches!(synced, ProxySync::Failed(_)) { To::Err } else { To::Detail }, &sync_line("up", &synced));
         let routed: HashMap<String, u16> = match &synced {
             ProxySync::Synced { routed, .. } => routed.iter().map(|f| (f.name.clone(), f.public_port)).collect(),
             _ => HashMap::new(),
@@ -1722,7 +1897,7 @@ impl Shared<'_, '_> {
             let home = if cfg!(test) { None } else { std::env::var("HOME").ok() };
             let synced = arena_core::sshconfig::sync_all(self.run.cfg, &pods, home.as_deref());
             for line in crate::ssh_config_lines("up", synced) {
-                say(if line.starts_with("warning:") { To::Err } else { To::Out }, &line);
+                say(if line.starts_with("warning:") { To::Err } else { To::Detail }, &line);
             }
         }
         // The standing pods' checks, for `arena snapshot` (a pod terminated for its FAIL is
@@ -1737,7 +1912,7 @@ impl Shared<'_, '_> {
             }
         }
         if let Some(w) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
-            say(To::Err, &w);
+            say(To::ErrDetail, &w);
         }
         names
             .into_iter()
@@ -1776,6 +1951,46 @@ impl Shared<'_, '_> {
                 }
             })
             .collect()
+    }
+}
+
+/// The default output's READY line: `[apple] READY after 6m12s · keys ✓ · Claude ✓ · check ✓`
+/// — what it waited and how each optional stage went (a stage that failed said why above; the
+/// full line with the option and proxy port is `-v`'s). The dashboard's runs panel reads
+/// `[NAME] READY`. Pure.
+fn ready_brief(run: &NameRun, after: &str) -> String {
+    use arena_core::out::{bang, bold, cross, green, tick};
+    let mut parts = vec![format!("[{}] {} after {after}", bold(&run.name), green(bold("READY")))];
+    // Keys copied with a warning (no per-host key for it, the archive's access) is `‼`; a
+    // Claude Code token that wasn't pushed `✗`. Each said why, with its command, above.
+    if let Some(ok) = run.keys {
+        parts.push(format!("keys {}", if ok { tick() } else { bang() }));
+    }
+    if let Some(ok) = run.claude {
+        parts.push(format!("Claude {}", if ok { tick() } else { cross() }));
+    }
+    if let Some(h) = &run.health {
+        let machine = h.machine_status();
+        parts.push(if machine == Status::Pass { format!("check {}", tick()) } else { format!("check {}", machine.label()) });
+        if let Some(k) = h.key_status().filter(|k| *k != Status::Pass) {
+            parts.push(format!("AI key {}", k.label()));
+        }
+    }
+    if run.locked {
+        parts.push("locked".into());
+    }
+    parts.join(" · ")
+}
+
+/// Why a pod is being replaced, in a few words (the full reason is `-v`'s). Pure.
+fn attempt_brief(end: &AttemptEnd) -> &'static str {
+    match end {
+        AttemptEnd::Dead(_) => "never came up",
+        AttemptEnd::NoEndpoint(_) => "no SSH endpoint",
+        AttemptEnd::SameHost => "on a machine that failed the check",
+        AttemptEnd::KnownBad(_) => "on a machine known bad",
+        AttemptEnd::CheckFailed(_) => "failed the deep check",
+        AttemptEnd::Kept => "failed",
     }
 }
 
@@ -1950,6 +2165,9 @@ fn never_started(h: &PodHealth) -> bool {
 /// clock: every endpoint delay, budget and poll interval elapses instantly and exactly, so
 /// "A was READY before B's endpoint existed" is a statement about tokio time.
 #[cfg(test)]
+mod output_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::remote_tests::{DEEP_CUINIT_999, DEEP_HEALTHY};
@@ -1971,7 +2189,7 @@ mod tests {
     /// order, counts list calls, and how many `list_by_provider` calls overlap (the proxy
     /// test makes each take `sync_delay`, so overlapping proxy writers would show).
     #[derive(Default)]
-    struct Fleet {
+    pub(super) struct Fleet {
         endpoints: Mutex<Endpoints>,
         pods: Mutex<Vec<Slot>>,
         events: Mutex<Vec<String>>,
@@ -2038,10 +2256,12 @@ mod tests {
         /// from the create, as in the script — so a pod can first be up without an endpoint
         /// (`proxy`, `bare`), restart (`bare` on RunPod: RUNNING with no container; `pending`:
         /// listed PENDING), and get one.
-        later: Mutex<Phases>,
+        pub(super) later: Mutex<Phases>,
         /// Until then RunPod's endpoint lookups fail: a pod without an endpoint is listed with
         /// `status_detail` saying so and no proxy-only flag, as `runpod_v2::fill_endpoints` lists it.
         lookups_fail_until: Mutex<Option<Instant>>,
+        /// This many creates first find no capacity (RunPod v2's 400, its body and all).
+        pub(super) dry_creates: AtomicUsize,
     }
 
     /// A pod in the fake: its endpoint from `from` (and each of `later`'s from its time);
@@ -2059,14 +2279,14 @@ mod tests {
     type Endpoints = HashMap<String, VecDeque<(String, u16, Duration)>>;
 
     /// Per pod name: what its next create is listed as later, phase by phase — `(ip, port, after)`.
-    type Phases = HashMap<String, Vec<(String, u16, Duration)>>;
+    pub(super) type Phases = HashMap<String, Vec<(String, u16, Duration)>>;
 
     /// One name's script: `(name, [(ip, port, endpoint after N s)])`.
-    type Script<'a> = (&'a str, &'a [(&'a str, u16, u64)]);
+    pub(super) type Script<'a> = (&'a str, &'a [(&'a str, u16, u64)]);
 
     impl Fleet {
         /// `(name, [(ip, port, endpoint after N s)])` — one endpoint per create of that name.
-        fn new(script: &[Script<'_>]) -> Self {
+        pub(super) fn new(script: &[Script<'_>]) -> Self {
             let fleet = Fleet::default();
             for (name, eps) in script {
                 let q = eps.iter().map(|(ip, port, s)| (ip.to_string(), *port, Duration::from_secs(*s))).collect();
@@ -2125,8 +2345,8 @@ mod tests {
         fn name(&self) -> &'static str {
             "runpod"
         }
-        fn describe(&self, _spec: &PodSpec) -> String {
-            String::new()
+        fn describe(&self, spec: &PodSpec) -> String {
+            format!("{} x{}, {}, disk {}GB", spec.gpu_type, spec.gpu_count, spec.cloud_type, spec.disk_gb)
         }
         async fn list_pods(&self) -> CoreResult<Vec<Pod>> {
             self.lists.fetch_add(1, Ordering::SeqCst);
@@ -2162,6 +2382,11 @@ mod tests {
             // The invariant `--check` must keep: a pod it terminated is gone from the listing
             // before the name is created again — never two pods under one name.
             assert!(!self.listed().iter().any(|p| p.name == spec.name), "a second pod named {} while one is listed", spec.name);
+            if self.dry_creates.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+                return Err(Error::capacity(
+                    r#"create pod HTTP 400 Bad Request: {"detail":"There are no longer any instances available with the requested specifications. Please refresh and try again.","status":400,"title":"Bad Request"}"#,
+                ));
+            }
             if self.dry_until.lock().unwrap().as_ref().is_some_and(|(n, t)| *n == spec.name && Instant::now() < *t) {
                 return Err(Error::capacity("create pod HTTP 500: There are no instances currently available"));
             }
@@ -2291,8 +2516,12 @@ mod tests {
         fn new() -> Self {
             Lines { start: Instant::now(), lines: Mutex::new(Vec::new()) }
         }
-        fn say(&self, _to: To, line: &str) {
-            self.lines.lock().unwrap().push((self.start.elapsed(), line.to_string()));
+        /// What `-v` shows — every line, as before the default output got short forms (those
+        /// are the golden tests', `up_output_tests`).
+        fn say(&self, to: To, line: &str) {
+            if to.shows(true) {
+                self.lines.lock().unwrap().push((self.start.elapsed(), line.to_string()));
+            }
         }
         fn all(&self) -> Vec<String> {
             self.lines.lock().unwrap().iter().map(|(_, l)| l.clone()).collect()
@@ -2306,13 +2535,13 @@ mod tests {
     }
 
     /// A temp dir of its own (the proxy lock is on the config's directory), removed on drop.
-    struct TmpDir(PathBuf);
+    pub(super) struct TmpDir(pub(super) PathBuf);
     impl Drop for TmpDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    fn tmp_dir(tag: &str) -> TmpDir {
+    pub(super) fn tmp_dir(tag: &str) -> TmpDir {
         let d = std::env::temp_dir().join(format!("arena-up-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -2325,11 +2554,11 @@ mod tests {
         Config::parse(&cfg_text(proxy))
     }
 
-    fn cfg_text(proxy: Option<&Path>) -> String {
+    pub(super) fn cfg_text(proxy: Option<&Path>) -> String {
         let mut text = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(\n  \"apple\"\n  \"bloom\"\n  \"cloud\"\n)\n\
                         ARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\nGIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\n\
                         SHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nALLOWED_CUDA_VERSIONS=\"13.0\"\n\
-                        GPU_TYPE=\"NVIDIA RTX A4000\"\nCLOUD_TYPE=COMMUNITY\nVSCODE_PREINSTALL=0\nREPO_ON_VOLUME=0\n"
+                        GPU_TYPE=\"NVIDIA RTX A4000\"\nCLOUD_TYPE=COMMUNITY\nVSCODE_PREINSTALL=0\nAGENT_NOTES=0\nREPO_ON_VOLUME=0\n"
             .to_string();
         if let Some(p) = proxy {
             text.push_str(&format!(
@@ -2413,7 +2642,7 @@ mod tests {
         made
     }
 
-    fn host(ip: &str, port: u16) -> String {
+    pub(super) fn host(ip: &str, port: u16) -> String {
         format!("{ip}:{port}")
     }
 
@@ -2721,6 +2950,62 @@ mod tests {
         assert!(conclude(&rows, &|_, _| {}).is_err());
     }
 
+    /// A dead AI key is not a sick host: `up --check` copies the keys after the deep check, then
+    /// asks the machine whether its key works (the keys-only check). Here OpenRouter turns it
+    /// away (401): said with what to run, folded into its check — and the machine is kept:
+    /// READY, never terminated, replaced or remembered as a bad host.
+    #[tokio::test(start_paused = true)]
+    async fn up_check_keeps_a_machine_whose_only_problem_is_its_key() {
+        const SECRET: &str = "sk-or-v1-0123456789abcdef-apple";
+        let keys = keys_dir("deadkey");
+        std::fs::write(keys.0.join("openrouter_api_keys.csv"), format!("host,key\ndevtest-apple,{SECRET}\n")).unwrap();
+        let rejected = format!(
+            "deep_check=2\nopenrouter.key=set\nopenrouter.fingerprint={}\nopenrouter.curl_exit=0\nopenrouter.http=401\n\
+             openrouter.error=User not found.\nhf.key=missing\ndeep_check_end=1\n",
+            health::fingerprint(SECRET)
+        );
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.2", 22002, 30)])]);
+        let fake = Arc::new(FakeRemote::new());
+        // copy, config, the deep check (healthy), the keys copy, the keys-only check (401).
+        fake.script(
+            &host("10.0.0.1", 22001),
+            [FakeReply::ok(), FakeReply::ok(), healthy(), FakeReply::ok(), FakeReply::stdout(&rejected)],
+        );
+        let cfg = cfg(None);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(3), Some(&keys.0)).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "never terminated nor recreated");
+        assert!(fake.calls_to(&host("10.0.0.2", 22002)).is_empty(), "no replacement was placed");
+        let (pass, _) = lines.find("[devtest-apple] check: pass");
+        let (copied, _) = lines.find("[devtest-apple] keys ✓");
+        let (dead, _) =
+            lines.find("[devtest-apple] AI key ✗ rejected (HTTP 401): paused? `arena keys resume apple`, else `arena keys rotate apple --copy`");
+        let (ready, _) = lines.find("[devtest-apple] READY after ");
+        assert!(pass < copied && copied < dead && dead < ready, "{:#?}", lines.all());
+        assert!(lines.all()[ready].ends_with("check pass, AI key fail"), "{}", lines.all()[ready]);
+        assert!(!lines.all().iter().any(|l| l.contains("terminating") || l.contains("(host)")), "{:#?}", lines.all());
+        // The keys-only check ran once, after the copy, within its own budget.
+        let key_cmd = health::key_check_command(Some("arena-env"));
+        let calls = fake.calls_to(&host("10.0.0.1", 22001));
+        assert!(
+            matches!(calls.last(), Some(RemoteCall::Exec { cmd, timeout, .. }) if *cmd == key_cmd && *timeout == Some(health::KEY_CHECK_TIMEOUT)),
+            "{calls:#?}"
+        );
+        let row = &rows[0];
+        assert_eq!((row.verdict.clone(), row.health), (Verdict::Ready, Some(Status::Fail)));
+        assert_eq!(row.attempts.len(), 1);
+        assert_eq!((row.attempts[0].end.clone(), row.attempts[0].terminated), (AttemptEnd::Kept, false));
+        let summary = pipeline::render_up_summary(&rows);
+        assert!(
+            summary.contains("devtest-apple: fail — ai_key: rejected (HTTP 401): paused? `arena keys resume apple`"),
+            "{summary}"
+        );
+        assert!(conclude(&rows, &|_, _| {}).is_ok(), "a READY machine: the run succeeds");
+    }
+
     /// python killed by its 75s timeout before `import torch` could report (a hung or overloaded
     /// host as likely as the image; OOM kills and SIGILL on an old CPU look the same): a host
     /// failure, so the pod is replaced — it used to count as software (torch FAILed) and was left
@@ -3015,7 +3300,7 @@ mod tests {
         assert_eq!(verdict, Verdict::Ready);
         let warned: Vec<&String> = lines.iter().filter(|l| l.contains("landed on runpod machine mbad")).collect();
         assert!(
-            matches!(&warned[..], [l] if l.starts_with("[devtest-apple] ⚠ landed on runpod machine mbad, which failed the deep check 1h ago")
+            matches!(&warned[..], [l] if l.starts_with("[devtest-apple] ‼ landed on runpod machine mbad, which failed the deep check 1h ago")
                 && l.ends_with("— kept: without --check nothing is checked or replaced (`arena pods test --deep devtest-apple`)")),
             "{lines:#?}"
         );
@@ -4975,6 +5260,33 @@ mod tests {
         assert!(bloom_ready < refreshed, "{:#?}", lines.all());
     }
 
+    /// The default READY line's keys badge says what the keys stage did: ✓ when its own key went
+    /// on, ‼ when the keys CSV has none for it (only the broadcast tokens, or nothing) — said
+    /// why on its own line too.
+    #[tokio::test(start_paused = true)]
+    async fn the_ready_lines_keys_badge_is_what_the_keys_stage_did() {
+        for (csv, want, warned) in [
+            ("host,key\ndevtest-apple,sk-a\n", "[devtest-apple] READY after 0s · keys ✓", None),
+            ("host,key\ndevtest-bloom,sk-b\n", "[devtest-apple] READY after 0s · keys ‼", Some("[devtest-apple] keys: none for it")),
+        ] {
+            let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+            let fake = Arc::new(FakeRemote::new());
+            let keys = tmp_dir("keys-badge");
+            std::fs::write(keys.0.join("openai_api_keys.csv"), csv).unwrap();
+            let cfg = cfg(None);
+            let run = up_run(&fleet, fake.clone(), &cfg, true, None, Some(&keys.0)).await;
+            let made = make(&fleet, &["apple"]).await;
+            let said = Mutex::new(Vec::new());
+            let rows = run_up(&run, made, std::future::pending(), &|to, l| said.lock().unwrap().push((to, l.to_string()))).await;
+            assert_eq!(rows[0].verdict, Verdict::Ready);
+            let said = said.into_inner().unwrap();
+            assert!(said.contains(&(To::Brief, want.to_string())), "{said:#?}");
+            if let Some(w) = warned {
+                assert!(said.iter().any(|(to, l)| *to == To::Err && l.starts_with(w)), "{said:#?}");
+            }
+        }
+    }
+
     /// W7 live (A-ckl9): with a backup archive and no key file at all, the keys stage still runs
     /// — each pod gets the archive's access (its block in the one exec, no key exported; the read
     /// key by scp), said as such. Without an archive (or without setup) there is no keys stage.
@@ -4993,8 +5305,17 @@ mod tests {
         assert!(run.keys.is_some());
         let made = make(&fleet, &["apple"]).await;
         let lines = Lines::new();
-        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        let brief = Mutex::new(Vec::new());
+        let say = |to: To, l: &str| {
+            lines.say(to, l);
+            if to == To::Brief {
+                brief.lock().unwrap().push(l.to_string());
+            }
+        };
+        let rows = run_up(&run, made, std::future::pending(), &say).await;
         assert!(rows.iter().all(|r| r.verdict == Verdict::Ready), "{:#?}", lines.all());
+        // No API key went on it: the default READY line says nothing of keys (review r1: it said ✓).
+        assert!(brief.lock().unwrap().contains(&"[devtest-apple] READY after 0s".to_string()), "{brief:?}");
         let calls = fake.calls_to(&host("10.0.0.1", 22001));
         assert!(
             calls.iter().any(|c| matches!(c, RemoteCall::Exec { cmd, .. } if cmd.contains("# BEGIN arena-archive") && !cmd.contains("export "))),
@@ -5067,15 +5388,19 @@ mod tests {
             format!(
                 "wait for its SSH endpoint — a pod up without one for {mins} min (RunPod: behind its SSH proxy only), or \
                  a RunPod pod with no container at --timeout (10 min or more), is TERMINATED and its name recreated (up \
-                 to {n} placement(s) per name)"
+                 to {n} placement(s) per name; the last one's pod is terminated too, leaving the name with none)"
             )
         };
+        // One placement: terminated, not recreated (review r3).
+        assert!(pipeline_text(true, None, false, false, false, (5, 1)).contains(
+            "(10 min or more), is TERMINATED and its name not recreated (1 placement per name: --check-attempts), sync"
+        ));
         assert_eq!(
             pipeline_text(true, Some(3), true, false, false, (5, 3)),
             format!(
                 "per pod, as soon as it can: {}, sync the proxy (if nginx is set up), provision it, \
                  deep-check it — a pod that FAILs on its host is TERMINATED and its name recreated (up to 3 placement(s) \
-                 per name; options that haven't failed first; never on a machine that already failed — this run, or an \
+                 per name, the last one's left running; options that haven't failed first; never on a machine that already failed — this run, or an \
                  `up --check` in the last 72h); a software/setup FAIL (e.g. torch missing) is left running, not replaced, \
                  copy its API keys — then READY/FAILED per pod",
                 endpoint(5, 3)

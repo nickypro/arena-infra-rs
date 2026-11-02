@@ -19,7 +19,7 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
-## 2026-11-01 · arena 2.10: `pods reimage` and `pods lock` on Hetzner VMs
+## 2026-11-02 · arena 2.13: `pods reimage` and `pods lock` on Hetzner VMs
 - **`pods reimage` works on a Hetzner VM**: Hetzner's rebuild. The whole disk is written again from
   the VM image, and the server keeps its id, name, IP and type. The image is `--image`, else
   `HETZNER_IMAGE`: `arena`, a snapshot id or a name like `ubuntu-24.04`. It is never the RunPod
@@ -43,6 +43,125 @@ earlier).
 - `pods list` (with `--json`: `locked`) and the dashboard's `L` show a Hetzner VM's lock. It's
   read from the server's protection, so protection set in Hetzner's console shows as locked, and
   `pods unlock` lifts it. The auto-reaper already left such a VM alone and still does.
+
+## 2026-11-02 · Output, phase 2: the other commands say less by default
+- **`pods setup`** (and the setup in `start`, `restart`, `reimage`, `replace`, `migrate`): a line per
+  pod as it ends, `[devtest-apple] setup ✓ (3m02s)` or `[devtest-bloom] FAILED setup: <why>
+  (retry: arena pods setup devtest-bloom)`, and `✓ 3 of 3 set up`. A log also gets
+  `[devtest-apple] setup…` as each starts (the dashboard shows it); a terminal shows one line,
+  updated in place. The tokens, budgets and API-key lines are `-v`'s. The prompt is one line
+  naming every pod (`Set up devtest-apple over SSH? [y/N]`), and `--dry-run` says the steps in a
+  line instead of printing each script. `--notes-only` does the same.
+- **`proxy plan` / `proxy apply`**: the changes (`+ ~ -`) and the counts. `proxy plan`'s nginx
+  config and the forwards that stay as they are moved to `-v`. A provider that didn't list is one
+  line with its reason, and pods skipped for one reason share a line (an `apply` says them too).
+  An `apply` with nothing to write (the proxy cron, every 5 minutes) is one line: `✓ proxy config
+  up to date (30 forward(s))`.
+- **`image list|build|prune`**: `list` is the table and its cost, plus a line when the images
+  aren't in use or a note on them. `build` asks in one line what it makes and what it costs, and
+  its dry run is that line. `prune` lists what goes and asks what it saves; what stays is `-v`'s.
+- **`plan check|show`**: the notes about what isn't wired yet moved to `-v`.
+- **Backups and branches** (`pods backup`, `pull`, `set-branch`, `init-branches`, `restore`,
+  `baseline`, `backups`, `archive sync`/`status`, `cron install`/`remove`). The */15 cron's log
+  gets each failure with its fix and one line per run: `✓ git backup of 20 pods: 3 pushed, 16 no
+  changes, 1 on main/master` (and `✓ home copy of 20 pods → <dir>/w1d2 · 1.8G (12.0M new)` with
+  `--pull`). Each pod's `[3/20] ✓ …` line, the `⊘ skipped … non-cohort` line and the copy's sizes
+  need `-v`. A failed push or copy keeps all git, rsync and ssh said on its one line, then its
+  retry. A dry run says in one line what it would do; the backup script, each pod's switch
+  command and each rsync need `-v`. Prompts are one line (`Back up devtest-apple, devtest-bloom
+  (git push, then copy the home of each into …)? [y/N]`). `set-branch`/`init-branches` print a
+  pod's line only when it has news (not pushed first, what a `--hard` reset saved), then a tally.
+  `arena backups` drops `Running now: nothing`, the "Not covered"/"Restore" paragraphs and a note
+  repeated under two jobs. `archive status` shows only the rows that need something, then its
+  verdict. `archive sync` prints a line per label and one for big. `cron install` shows each
+  changed line as its schedule and command.
+- **Look, money and access** (`config check`/`which`, `teardown --check`, `offers`, `balance`,
+  `spend`, `pods idle`/`jobs`/`test`, `copy-keys`, `keys`, `claude`, `update`): `config check` prints
+  only what's wrong (✗, ‼, `?` rows with their `└` lines) and its `OK — …` line; `teardown --check`
+  the items left or that couldn't be checked, with their fixes, the kept and not-applicable ones a
+  line each, cron and `at` with what they can't see, and the verdict; an
+  `offers <provider>` table leaves out what nobody can buy and folds its notes into one line;
+  `balance` and `spend` keep their tables and only the notes that need a look; `pods idle`'s
+  legend and `pods jobs`' empty tally are `-v`'s; `pods test --deep`/`--keys` counts the pods in
+  place on a terminal; `copy-keys` says in one line what goes to which pods, then a line per pod
+  that failed (with its retry) and a tally (setup's and replace's key step too); `update` shows
+  the changelog's action-needed and config lines and each entry's heading. `-v` prints all of it
+  as before. The verdict lines (`OK — …`, `ALL CLEAR`/`NOT CLEAR: …`), `--json` and the exit
+  statuses are unchanged.
+- For each of these, `-v` prints what it printed before. `--json`, exit codes and the lines the
+  dashboard reads are the same.
+
+## 2026-11-02 · arena 2.12: shorter output by default; `-v` shows the rest
+- **`pods up` and `pods create` say much less.** By default they print the plan in one line
+  (or a short table for several options), the balance in one line, a one-line prompt with what
+  it creates and what it costs (`Create devtest-apple, devtest-bloom (≤$0.34/h)? [y/N]`), a
+  `[created]` line per pod, a `[name] READY after 6m12s · keys ✓ · Claude ✓` or `FAILED` line,
+  and a tally. A provider's raw error, the notes, the ids, each step and the summary table are
+  gone from the default. The same no-capacity error every retry round becomes one round line,
+  updated in place on a terminal. While pods are being set up, a terminal shows one line at the
+  bottom with where each pod is; a log gets `[name] setup…` instead (the dashboard shows it). The
+  prompt says what `up` will terminate on its own: `A pod without SSH is terminated and its name
+  tried again: 2 tries in all.` (the last try's pod is terminated too, at any verbosity).
+- **`-v` (`--verbose`) works on every command** and shows everything as before. `balance -v`,
+  `offers -v` and `pods test --deep -v` work as they did.
+- **Colour on a terminal:** names and verdicts in bold, ✓ green, ✗ red, ‼ yellow. `--color
+  auto|always|never` and `NO_COLOR` turn it on or off. Pipes and cron logs get the same words
+  and no colour.
+- After any command that changes pods, the proxy's `[proxy] after …` line now shows only with
+  `-v`, unless the sync failed.
+- A failed setup in `up` says what to run: `(retry: arena pods setup NAME)`.
+
+### Changed
+- Output is shorter by default, and `-v` shows the rest. `--json`, exit codes and the lines the
+  dashboard reads are the same. The other commands get the same treatment next.
+
+## 2026-11-02 · arena 2.11: the coding agents on each machine know which Python to use; `uv` on every shell's PATH
+- Setup writes a short block into each machine's `~/.claude/CLAUDE.md` (Claude Code) and
+  `~/.codex/AGENTS.md` (Codex): the course env it finds there (`/opt/arena-env` on RunPod and
+  Vast, `/root/ARENA_materials/.venv` on Hetzner), how to install into it, and where the repo is.
+  Before, a Claude asked to run a model used the system Python and pip-installed transformers into
+  it. Only the block between `<!-- BEGIN arena-infra python -->` and `<!-- END arena-infra python
+  -->` is written: the rest of each file stays as it was (its mode too), and a second run changes
+  nothing. A file that changes is swapped for the new one in one step, and the old one is kept
+  beside it (`CLAUDE.md.arena-XXXXXX`), so nothing saved meanwhile is lost.
+- `uv` and `uvx` are linked into `/usr/local/bin`, so `uv` works in every shell on a Hetzner VM
+  (it was "command not found": it was only in `~/.local/bin`). A link already there is kept.
+- **`pods setup --notes-only`** does just that on machines that are running, and nothing else. It
+  replaces a block written by hand between the same markers. Its dry run shows where it looks.
+
+### Action needed
+- Machines set up before this have neither: `arena pods setup --notes-only` (no targets = every
+  machine).
+
+### Config
+- `AGENT_NOTES` (new; on by default): `0` leaves the notes out of setup.
+
+## 2026-11-02 · arena 2.10: `pods test` checks that each machine's AI key works
+- **`pods test --deep` now checks each machine's OpenRouter key and Hugging Face token**, as the
+  participant's shell has them: one free call each (OpenRouter's `GET /api/v1/key`, Hugging
+  Face's `whoami-v2`), compared with the keys CSV (and `HF_TOKEN`) by fingerprint. The secret
+  never leaves the machine and is printed nowhere. Each verdict says what to run:
+  - FAIL: the key is missing (but the keys CSV, or the machine's owner, should have one),
+    rejected (401), paused, or out of money. A paused key and a deleted one get the same 401,
+    so with a provisioning key the check reads OpenRouter's listing to say which fix it is.
+  - WARN: it isn't the keys CSV's key (an old one after a rotate or handover:
+    `pods copy-keys`), it has under a tenth of its cap left, or OpenRouter couldn't be reached.
+  - A staff `@` box, or a fleet with no keys, gets a note and no verdict.
+- The table gets an AI KEY column (`$4.97 left`, `rejected`, `missing`) once a key was judged;
+  `-v` and `--json` have `ai_key` and `hf_token` checks, and `facts.openrouter` / `facts.hf`.
+- **`pods test --deep` exits non-zero on a key FAIL**, so the daily health line fails on a dead
+  key too. A dead key is never the machine's fault: `up --check` never replaces a machine for it,
+  never retries it, never remembers its host as bad, and the machine's passing check still
+  clears a bad-host record.
+- **`pods test --keys`** checks only the keys: no torch, no GPU, a few seconds per machine. It
+  shows a `NAME RESULT AI KEY HF NOTES` table, exits non-zero on a FAIL, and nothing waits on a
+  machine outside the cohort.
+- `pods up --check` checks each machine's keys once it has copied them. It says
+  `[apple] AI key ✓ ok, $4.97 of $5.00 left`, or the FAIL and what to run, and keeps the machine.
+- The dashboard: its test (`e`) adds the key verdict to the torch line, its deep check (`d`)
+  judges the keys like `pods test --deep`, and the detail view has an `ai check:` line. The
+  public snapshot's issue for it is `AI key`.
+- `config check` says what the key checks compare with.
 
 ## 2026-10-31 · `arena backups` no longer misses a backup that's running
 - `arena backups` and the dashboard's backups screen tell a running backup by its lock (a pod's

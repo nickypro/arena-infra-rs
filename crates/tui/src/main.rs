@@ -39,6 +39,7 @@ mod ask;
 mod backups;
 mod columns;
 mod demo;
+mod keytest;
 mod lag;
 mod newpod;
 mod offers;
@@ -2413,7 +2414,7 @@ fn skipped_words(s: &Skipped) -> String {
 /// (where `arena snapshot` and the next refresh read them) and shown at once.
 fn start_deep_check(shared: &Arc<Mutex<Shared>>, ui: &Ui, pods: Vec<Pod>) {
     // Config first: a malformed MIN_DRIVER_VERSION is said before any pod is touched.
-    let policy = match HealthPolicy::from_config(&ui.cfg) {
+    let policy = match HealthPolicy::for_fleet(&ui.cfg, spend_path(&ui.cfg).as_deref()) {
         Ok(p) => p,
         Err(e) => {
             shared.lock().unwrap().notify(format!("✗ deep check: {e}"), true);
@@ -2615,7 +2616,11 @@ async fn execute(
         },
         Action::Backup => run_backup(remote, cfg, pod).await,
         Action::Setup => run_setup(remote, cfg, pod).await,
-        Action::Test => run_ssh_oneline(remote, cfg, pod, TORCH_TEST_CMD, "torch", TEST_TIMEOUT).await,
+        Action::Test => {
+            let torch = run_ssh_oneline(remote, cfg, pod, TORCH_TEST_CMD, "torch", TEST_TIMEOUT);
+            let (torch, keys) = tokio::join!(torch, keytest::check(remote, cfg, pod));
+            keytest::with_keys(torch, keys.as_ref())
+        }
         Action::Run => match arg {
             Some(cmd) if !cmd.trim().is_empty() => run_ssh_output(remote, cfg, pod, cmd).await,
             _ => format!("✗ {name}: no command given"),
@@ -2960,8 +2965,8 @@ async fn run_setup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
 /// The TUI's setup steps: core's list for the pod's own provider, as `arena pods setup` builds
 /// it — a bare VM's script (`script`: the local copy its scp sends, [`vm_script_path`]) and its
 /// swap, key and hostname steps included; until 2026-10-31 it was the image-based list for every
-/// pod, so a Hetzner VM got no script and no swap. No VS Code warm-up: that stays `arena pods
-/// setup`'s, as do its API keys.
+/// pod, so a Hetzner VM got no script and no swap. The agents' notes too (a reset container has
+/// lost them). No VS Code warm-up: that stays `arena pods setup`'s, as do its API keys.
 fn setup_steps(cfg: &Config, pod: &Pod, script: &str) -> arena_core::Result<Vec<arena_core::setup::ProvisionStep>> {
     use arena_core::setup::{provisioning_steps, SetupConfig, SetupTimeouts};
     let mut scfg = SetupConfig::from_config(cfg)?;
@@ -3781,7 +3786,14 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     });
     // Who the machine is for (`--owner`, `spend assign`), when it has an owner.
     let owner = shared.owners.get(&mark_key(pod));
-    let fact_lines = FACT_LINES + u16::from(ai.is_some()) + u16::from(caps.is_some()) + u16::from(owner.is_some());
+    // Its AI keys as its last deep check found them (`ok, $4.97 of $5.00 left`, or the FAIL and
+    // what to run): shown when that check judged them.
+    let key_check = shared.snap.pods.get(ui.selected).and_then(|sp| sp.health.as_ref()).and_then(|h| state::key_check_line(&h.keys));
+    let fact_lines = FACT_LINES
+        + u16::from(ai.is_some())
+        + u16::from(caps.is_some())
+        + u16::from(owner.is_some())
+        + u16::from(key_check.is_some());
     let show_graphs = inner.height >= fact_lines + 3 + procs_h + commits_h + 6;
 
     let mut constraints: Vec<Constraint> = vec![
@@ -3955,6 +3967,9 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     }
     if let Some(c) = caps {
         facts.push(fact("ai caps:", one(fit(c), tone_style(Tone::Warn))));
+    }
+    if let Some((text, tone)) = key_check {
+        facts.push(fact("ai check:", one(fit(text), tone_style(tone))));
     }
     facts.extend([
         fact("maint:", or_dim(maint, tone_style(Tone::Warn).add_modifier(Modifier::BOLD))),
@@ -6756,6 +6771,8 @@ deep_check_end=1
         };
         // (what, the scripted replies, the outcome line starts with, budgets used)
         let setup = arena_core::setup::SetupTimeouts::default();
+        // The agents' notes, last (best-effort; the dashboard's setup writes them too).
+        let notes = arena_core::agent_notes::TIMEOUT;
         type Case = (&'static str, Vec<FakeReply>, &'static str, Vec<Duration>);
         let cases: Vec<Case> = vec![
             ("test", vec![FakeReply::stdout("noise\n2.9.0+cu130\n")], "✓ devtest-alpha torch: 2.9.0+cu130", vec![TEST_TIMEOUT]),
@@ -6820,7 +6837,7 @@ deep_check_end=1
                  configured nickypro/arena-sandbox-materials — not backed up to git; run `arena pods setup devtest-alpha`",
                 vec![BACKUP_TIMEOUT],
             ),
-            ("setup", vec![FakeReply::ok(), FakeReply::ok(), FakeReply::ok()], "✓ set up devtest-alpha", vec![setup.copy, setup.relocate, setup.config]),
+            ("setup", vec![FakeReply::ok(), FakeReply::ok(), FakeReply::ok()], "✓ set up devtest-alpha", vec![setup.copy, setup.relocate, setup.config, notes]),
             (
                 "setup-hung",
                 vec![FakeReply::ok(), FakeReply::ok(), FakeReply::hang()],
@@ -6836,14 +6853,14 @@ deep_check_end=1
                     FakeReply::ok(),
                 ],
                 "✓ set up devtest-alpha (warning: repo onto volume: repo not moved onto the /workspace volume: in use (pid 42) - re-run setup when it is idle)",
-                vec![setup.copy, setup.relocate, setup.config],
+                vec![setup.copy, setup.relocate, setup.config, notes],
             ),
             // …and so does what the config step says.
             (
                 "setup-config-warns",
                 vec![FakeReply::ok(), FakeReply::ok(), FakeReply::stdout("arena-warning: another setup is still moving the repo onto the volume - the update ran anyway\n")],
                 "✓ set up devtest-alpha (warning: repo + keys config: another setup is still moving the repo onto the volume - the update ran anyway)",
-                vec![setup.copy, setup.relocate, setup.config],
+                vec![setup.copy, setup.relocate, setup.config, notes],
             ),
         ];
         for (what, replies, want, budget) in cases {
@@ -6906,8 +6923,9 @@ deep_check_end=1
                 RemoteCall::Exec { timeout, .. } | RemoteCall::Copy { timeout, .. } => *timeout,
             })
             .collect();
-        // deploy key, authorize keys, hostname, the script's copy, repo update, the script.
-        let want = [t.copy, t.config, t.config, t.copy, t.config, t.bare_vm];
+        // deploy key, authorize keys, hostname, the script's copy, repo update, the script, the
+        // agents' notes.
+        let want = [t.copy, t.config, t.config, t.copy, t.config, t.bare_vm, arena_core::agent_notes::TIMEOUT];
         assert_eq!(budgets, want.map(Some).to_vec(), "{calls:?}");
         let copied = calls.iter().find_map(|c| match c {
             RemoteCall::Copy { local, remote, .. } if remote == "/root/hetzner_setup.sh" => Some(local.clone()),
@@ -6949,7 +6967,7 @@ deep_check_end=1
                 RemoteCall::Exec { timeout, .. } | RemoteCall::Copy { timeout, .. } => timeout,
             })
             .collect();
-        assert_eq!(budgets, vec![Some(t.copy), Some(t.relocate), Some(t.config)]);
+        assert_eq!(budgets, vec![Some(t.copy), Some(t.relocate), Some(t.config), Some(arena_core::agent_notes::TIMEOUT)]);
         assert!(!fake.calls().iter().any(|c| matches!(c, RemoteCall::Copy { remote, .. } if remote == "/root/hetzner_setup.sh")));
         assert!(!vm_script_path(&runpod).exists());
     }

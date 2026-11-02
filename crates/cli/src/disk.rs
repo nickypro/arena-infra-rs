@@ -100,7 +100,7 @@ pub(crate) fn judge_copies(cfg: &Config, floor: Floor, copies: &[(String, Vec<(P
     let now = arena_core::snapshot::unix_now();
     let mut held = match core_disk::Reservations::load(&path) {
         Ok((held, warning)) => {
-            warning.iter().for_each(|w| eprintln!("{w}"));
+            warning.iter().for_each(|w| arena_core::out!(Err, "{w}"));
             held
         }
         Err(e) => return refuse(e),
@@ -215,7 +215,7 @@ pub(crate) async fn watched<T>(watch: Option<&Watch>, copy: impl std::future::Fu
 pub(crate) async fn children_stopped() {
     let wait = arena_core::remote::TERM_GRACE + std::time::Duration::from_secs(1);
     if !arena_core::remote::children_done(wait).await {
-        eprintln!("warning: a copy stopped for space was still running after {}s", wait.as_secs());
+        arena_core::out!(Err, "warning: a copy stopped for space was still running after {}s", wait.as_secs());
     }
 }
 
@@ -254,8 +254,8 @@ pub(crate) fn tier_size(base: &Path, pod: &str, snapshot: bool, dest: &Path) -> 
 pub(crate) fn seed_copied(base: &Path) {
     match core_disk::seed_copied(base) {
         Ok(0) => {}
-        Ok(n) => eprintln!("note: {n} pod(s) already backed up in {} marked as copied whole (their next copies count as later ones)", base.display()),
-        Err(e) => eprintln!("warning: couldn't start marking whole copies in {} ({e}) — every pod's copy counts as a first one", base.display()),
+        Ok(n) => arena_core::out!(ErrDetail, "note: {n} pod(s) already backed up in {} marked as copied whole (their next copies count as later ones)", base.display()),
+        Err(e) => arena_core::out!(Err, "warning: couldn't start marking whole copies in {} ({e}) — every pod's copy counts as a first one", base.display()),
     }
 }
 
@@ -278,12 +278,12 @@ pub(crate) fn note_skips(cfg: &Config, what: &str, skipped: &[(String, String)])
     let path = match skips_path(cfg) {
         None => return,
         Some(Ok(p)) => p,
-        Some(Err(e)) => return eprintln!("warning: the skipped copies aren't recorded for the health check: {e}"),
+        Some(Err(e)) => return arena_core::out!(Err, "warning: the skipped copies aren't recorded for the health check: {e}"),
     };
     let new: Vec<(String, String, String)> = skipped.iter().map(|(pod, why)| (pod.clone(), what.to_string(), reason(why))).collect();
     match core_disk::record_skips(&path, &new, arena_core::snapshot::unix_now(), core_disk::RECORD_LOCK_WAIT) {
-        Ok(warning) => warning.iter().for_each(|w| eprintln!("{w}")),
-        Err(e) => eprintln!("warning: couldn't record the skipped copies in {} ({e})", path.display()),
+        Ok(warning) => warning.iter().for_each(|w| arena_core::out!(Err, "{w}")),
+        Err(e) => arena_core::out!(Err, "warning: couldn't record the skipped copies in {} ({e})", path.display()),
     }
 }
 

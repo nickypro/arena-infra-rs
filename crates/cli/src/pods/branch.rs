@@ -10,11 +10,14 @@ use arena_core::selector::Naming;
 use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
-use crate::confirm;
 use crate::cron::resolve_week_day;
+use crate::pods::backup::NAMES_SHOWN;
+use arena_core::backups::render::names_line;
+use arena_core::out;
+use arena_core::out::To;
 use crate::pods::backup::{backup_fleet, copy_outcome, copy_unpushed, is_protected_branch, on_protected_line, Unpushed};
 use crate::pods::pull::{busy_line, local_backup_dir, switch_unlocked_line, take_pod_locks, LockMode, PodLocks, POD_LOCK_WAIT};
-use crate::pods::selection::{say, Selected};
+use crate::pods::selection::{say, say_to, Selected};
 use crate::pods::{exec_each_pod, failure_line, BACKUP_TIMEOUT, BRANCH_TIMEOUT};
 
 /// What `pods set-branch` was asked: the branch, `--hard`, `--dry-run`, `--yes`, and
@@ -50,7 +53,7 @@ enum SwitchEnd {
 pub(crate) async fn set_branch_and_init(remote: Arc<dyn Remote>, cfg: &Config, sel: &Selected, how: &SetBranchRun<'_>, rsync: &str) -> Result<()> {
     let (landed, verdict) = match switch_branch(remote.clone(), cfg, sel, how, rsync).await? {
         SwitchEnd::Previewed if how.init_branches => {
-            println!();
+            out!(Detail, "");
             return handle_init_branches(remote, cfg, None, None, sel, true, how.yes, rsync).await;
         }
         SwitchEnd::Previewed | SwitchEnd::Stopped => return Ok(()),
@@ -59,7 +62,7 @@ pub(crate) async fn set_branch_and_init(remote: Arc<dyn Remote>, cfg: &Config, s
     if !how.init_branches {
         return verdict;
     }
-    println!();
+    out!(Detail, "");
     let init = match init_selection(sel, &landed) {
         None => {
             say("init-branches NOT run: no pod switched");
@@ -137,17 +140,30 @@ async fn switch_branch(remote: Arc<dyn Remote>, cfg: &Config, sel: &Selected, ho
     // (especially under --hard) is exactly what we don't want.
     let targets = sel.named_targets(cfg)?;
     if targets.is_empty() {
-        println!("(no pods with an SSH endpoint to switch)");
+        out!(Out, "(no pods with an SSH endpoint to switch)");
         return Ok(SwitchEnd::Stopped);
     }
+    let shown = names_line(&targets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), NAMES_SHOWN);
+    // What a switch does, in a few words: the default's dry run and question.
+    let (doing_brief, how_brief) = if hard {
+        (format!("HARD-reset {shown} to origin/{branch}"), "each one's branch pushed first; local commits and changes discarded, saved on the pod")
+    } else {
+        (format!("switch {shown} to {branch}"), "each one's branch pushed first")
+    };
 
     if dry_run {
-        println!("{}\n", push_first_note(cfg, hard));
-        for (name, t) in &targets {
-            println!("# {name}");
-            println!("{}\n", t.display_command(&cmd));
+        // By default what would happen, in a line (and a lock warning); the note and each pod's
+        // command with `-v`.
+        out!(Brief, "[dry-run] would {doing_brief} ({how_brief}; -v: the commands)");
+        if let Some(line) = switch_unlocked_line(cfg) {
+            out!(Brief, "{line}");
         }
-        println!("Dry-run only — nothing changed (preview).");
+        out!(Detail, "{}\n", push_first_note(cfg, hard));
+        for (name, t) in &targets {
+            out!(Detail, "# {name}");
+            out!(Detail, "{}\n", t.display_command(&cmd));
+        }
+        out!(Detail, "Dry-run only — nothing changed (preview).");
         return Ok(SwitchEnd::Previewed);
     }
     let what = if hard {
@@ -160,8 +176,9 @@ async fn switch_branch(remote: Arc<dyn Remote>, cfg: &Config, sel: &Selected, ho
     if let Some(line) = switch_unlocked_line(cfg) {
         say(&line);
     }
-    if !confirm(yes, &format!("Will {what} (each pod's current branch committed + pushed first): {names}"))? {
-        println!("aborted.");
+    let question = format!("{}{} ({how_brief})?", doing_brief[..1].to_uppercase(), &doing_brief[1..]);
+    if !crate::confirm_brief(yes, &format!("Will {what} (each pod's current branch committed + pushed first): {names}"), &question)? {
+        out!(Out, "aborted.");
         return Ok(SwitchEnd::Stopped);
     }
     let total = targets.len();
@@ -172,15 +189,15 @@ async fn switch_branch(remote: Arc<dyn Remote>, cfg: &Config, sel: &Selected, ho
         // disk (staged) so their exercises keep working.
         let restored: Vec<&str> = out.stdout.lines().filter_map(|l| l.trim_end_matches('\r').strip_prefix("RESTORED ")).collect();
         landed.push(name.to_string());
-        format!(
-            "✓ {name} (on {branch}){}{}{note}{}",
-            restored_note(&restored, branch),
-            unredacted_note(&out.stdout),
-            discarded_note(&out.stdout)
-        )
+        let discarded = discarded_note(&out.stdout);
+        // Said by default when it wasn't pushed first, or a --hard reset saved what it discarded.
+        let notable = !note.is_empty() || !discarded.is_empty();
+        let line = format!("✓ {name} (on {branch}){}{}{note}{discarded}", restored_note(&restored, branch), unredacted_note(&out.stdout));
+        (line, notable)
     })
     .await;
-    println!("\nswitched {}/{total}", run.ok);
+    out!(Detail, "\nswitched {}/{total}", run.ok);
+    out!(Brief, "{}", switch_tally(&format!("switched to {branch}"), run.ok, total));
     if let Some(line) = run.ended_line() {
         say(&line);
     }
@@ -225,6 +242,17 @@ pub(crate) fn push_first_note(cfg: &Config, hard: bool) -> String {
         note.push_str(&line);
     }
     note
+}
+
+/// A switch's one line by default, after each pod's that has something to say: `✓ switched to
+/// main: 3 of 3 pods`, `✗ on the w1d2 branch: 2 of 3 pods` (the error after it says why). Pure.
+fn switch_tally(what: &str, ok: usize, total: usize) -> String {
+    let line = format!("{}: {ok} of {total} pod{}", out::bold(what), if total == 1 { "" } else { "s" });
+    if ok == total {
+        out::ok(line)
+    } else {
+        out::fail(line)
+    }
 }
 
 /// How a guarded branch switch went ([`switch_guarded`]).
@@ -334,8 +362,10 @@ async fn switch_guarded(
     // Where the pods go, for the line before each batch (`Switching 3 pod(s) to 'main' …`).
     doing: &str,
     // A switched pod's line after `[done/total] `: from its name, the switch's output and the
-    // note about its push (empty when it was pushed).
-    mut ok_line: impl FnMut(&str, &arena_core::ssh::SshOutput, &str) -> String,
+    // note about its push (empty when it was pushed) — and whether it's said by default (it says
+    // something the operator needs: the push that didn't happen, what a reset saved); a plain
+    // switch is `-v`'s, the run's tally says it.
+    mut ok_line: impl FnMut(&str, &arena_core::ssh::SshOutput, &str) -> (String, bool),
 ) -> Switched {
     let dir = local_backup_dir(cfg);
     let repo = arena_core::backup::repo_path(cfg);
@@ -345,7 +375,7 @@ async fn switch_guarded(
     let mut locks = take_pod_locks(&dir, &names, POD_LOCK_WAIT).await;
     for b in &locks.busy {
         let why = format!("{} — nothing could be pushed or copied first", busy_line(b, POD_LOCK_WAIT));
-        println!("✗ {b} not switched: {why}");
+        out!(Out, "✗ {b} not switched: {why}");
         run.not_switched.push((b.clone(), why));
     }
     let targets: Vec<(String, SshTarget)> = targets.into_iter().filter(|(n, _)| !locks.busy.contains(n)).collect();
@@ -356,7 +386,8 @@ async fn switch_guarded(
     if targets.is_empty() {
         return run;
     }
-    println!(
+    out!(
+        Detail,
         "Backing up the branch each pod is on before the switch (commit + push; main/master skipped; {}s budget each)…",
         BACKUP_TIMEOUT.as_secs()
     );
@@ -371,7 +402,7 @@ async fn switch_guarded(
     // Each pod's lock stays held through its push: it goes as that pod's switch ends. Recorded as
     // any git backup is (`arena backups`).
     let record = crate::backups::Run::start(cfg, arena_core::backups::Job::Git, targets.len(), crate::backups::scope_of(sel.named));
-    let t = backup_fleet(remote, jobs, &repo, |l| println!("{l}"), |_| {}).await;
+    let t = backup_fleet(remote, jobs, &repo, out::emit, |_| {}).await;
     record.finish(t.record_events(&[]), t.summary(0));
     // Before a --hard reset, a pod on a branch no backup commits (main, …) with work there — an
     // operation in progress, changes to tracked files, commits no remote has, untracked files — is
@@ -434,14 +465,15 @@ async fn switch_batch(
     budget: Duration,
     doing: &str,
     notes: &std::collections::HashMap<String, String>,
-    ok_line: &mut impl FnMut(&str, &arena_core::ssh::SshOutput, &str) -> String,
+    ok_line: &mut impl FnMut(&str, &arena_core::ssh::SshOutput, &str) -> (String, bool),
     locks: &mut PodLocks,
     run: &mut Switched,
 ) {
     if pods.is_empty() {
         return;
     }
-    println!("\nSwitching {} pod(s) {doing} over SSH ({}s budget each)…", pods.len(), budget.as_secs());
+    out!(Detail, "\nSwitching {} pod(s) {doing} over SSH ({}s budget each)…", pods.len(), budget.as_secs());
+    let _progress = out::progress_guard("switch");
     let jobs = pods
         .into_iter()
         .map(|(n, t)| {
@@ -451,9 +483,11 @@ async fn switch_batch(
         .collect();
     exec_each_pod(remote, jobs, budget, |done, total, name, call| {
         let note = notes.get(name).map_or("", String::as_str);
+        out::progress("switch", Some(&format!("switch {done}/{total}")));
         match &call {
-            Ok(out) if out.success => {
-                say(&format!("[{done}/{total}] {}", ok_line(name, out, note)));
+            Ok(output) if output.success => {
+                let (line, notable) = ok_line(name, output, note);
+                say_to(if notable { To::Out } else { To::Detail }, &format!("[{done}/{total}] {line}"));
                 run.ok += 1;
             }
             _ => {
@@ -633,35 +667,44 @@ pub(crate) async fn handle_init_branches(
 ) -> Result<()> {
     let (week, day) = resolve_week_day(cfg, week, day)?;
     let bcfg = arena_core::backup::BackupConfig::from_config(cfg, week, day);
-    println!("Iteration: w{week}d{day}\n");
+    out!(Detail, "Iteration: w{week}d{day}\n");
 
     let targets = sel.named_targets(cfg)?;
     if targets.is_empty() {
-        println!("(no pods with an SSH endpoint)");
+        out!(Out, "(no pods with an SSH endpoint)");
         return Ok(());
     }
+    let shown = names_line(&targets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), NAMES_SHOWN);
 
     if dry_run {
-        println!("{}\n", push_first_note(cfg, false));
-        println!("Dry-run — would init the w{week}d{day} branch on {} pod(s):\n", targets.len());
+        // By default what would happen, in a line (and a lock warning); the note and each pod's
+        // command with `-v`.
+        let example = targets.first().map(|(n, _)| format!(" ({n} → {})", bcfg.branch_for(n))).unwrap_or_default();
+        out!(Brief, "[dry-run] would create + push the w{week}d{day} branch on {shown}{example} (each one's branch pushed first; -v: the commands)");
+        if let Some(line) = switch_unlocked_line(cfg) {
+            out!(Brief, "{line}");
+        }
+        out!(Detail, "{}\n", push_first_note(cfg, false));
+        out!(Detail, "Dry-run — would init the w{week}d{day} branch on {} pod(s):\n", targets.len());
         for (name, t) in &targets {
             let cmd = arena_core::backup::init_branch_command(&bcfg, name);
-            println!("# {name}  ->  branch {}", bcfg.branch_for(name));
-            println!("{}\n", t.display_command(&cmd));
+            out!(Detail, "# {name}  ->  branch {}", bcfg.branch_for(name));
+            out!(Detail, "{}\n", t.display_command(&cmd));
         }
-        println!("Preview only — run without --dry-run to execute over SSH.");
+        out!(Detail, "Preview only — run without --dry-run to execute over SSH.");
         return Ok(());
     }
     // Before the question, so it's read before the answer (and in the run's output with --yes).
     if let Some(line) = switch_unlocked_line(cfg) {
         say(&line);
     }
-    if !confirm(yes, &format!(
+    let what = format!(
         "Will create + push the w{week}d{day} autocommit branch on {} pod(s): {}",
         targets.len(),
         targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
-    ))? {
-        println!("aborted.");
+    );
+    if !crate::confirm_brief(yes, &what, &format!("Create + push the w{week}d{day} branch on {shown} (each one's branch pushed first)?"))? {
+        out!(Out, "aborted.");
         return Ok(());
     }
 
@@ -671,9 +714,13 @@ pub(crate) async fn handle_init_branches(
     // A day branch that already exists gets back the real keys set aside on it (the morning's
     // `set-branch main` run twice): said as set-branch says it.
     let run = switch_guarded(&remote, cfg, sel, targets, rsync, None, cmd_for, BRANCH_TIMEOUT, &doing, |name, out, note| {
-        format!("✓ {name} -> {}{}{}{note}", bcfg.branch_for(name), unpushed_note(&out.stdout), unredacted_note(&out.stdout))
+        let unpushed = unpushed_note(&out.stdout);
+        let line = format!("✓ {name} -> {}{unpushed}{}{note}", bcfg.branch_for(name), unredacted_note(&out.stdout));
+        // Said by default when its branch wasn't pushed first, or the new one wasn't all pushed.
+        (line, !note.is_empty() || !unpushed.is_empty())
     })
     .await;
-    println!("\nDone: {} initialized, {} failed, {} not switched (of {total}).", run.ok, run.failed.len(), run.not_switched.len());
+    out!(Detail, "\nDone: {} initialized, {} failed, {} not switched (of {total}).", run.ok, run.failed.len(), run.not_switched.len());
+    out!(Brief, "{}", switch_tally(&format!("on the w{week}d{day} branch"), run.ok, total));
     run.result("init branch")
 }
