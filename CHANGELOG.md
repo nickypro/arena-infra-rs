@@ -19,6 +19,10 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-02 · the dashboard: jump to the first or last pod
+- `g` / `Home` / Shift+↑ go to the first pod, `G` / `End` / Shift+↓ to the last (`gg` works too).
+- The mouse wheel moves the cursor in the detail view as well as the list.
+
 ## 2026-11-02 · the dashboard: marks of pods that are gone no longer count
 - After unmarking every pod you can see, `a` no longer offers actions on "0 marked pods", and `d`
   no longer does nothing. Marks left by pods that have since left the list (terminated,
