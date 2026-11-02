@@ -2683,7 +2683,7 @@ file (the page shows it going stale, never "No machines.").
 `teardown --check [--json]` — the **end-of-program audit** (read-only; deletes nothing): a `✓ ✗ ? –`
 checklist of what is still billing or scheduled, each with the exact command that cleans it up.
 By default it prints what's wrong — each ✗ and `?` item with what's there, its notes and its fix,
-each kept ◷ item as a line — and the `ALL CLEAR` / `NOT CLEAR` verdict; `-v` adds the ✓ items, the
+each kept ◷ and not-checked – item as a line — and the `ALL CLEAR` / `NOT CLEAR` verdict; `-v` adds the ✓ items, the
 balances and the suggested order. The verdict line and the exit status are the same either way.
 
 - Every pod on every configured provider in **any** state (a stopped pod keeps its name and still

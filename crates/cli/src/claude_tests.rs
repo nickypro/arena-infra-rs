@@ -344,10 +344,10 @@ async fn copy_keys_output_default_and_verbose() {
     }
     let tokens = d.0.join("tokens").display().to_string();
     assert_eq!(
-        out[0].replace(&tokens, "TOKENS"),
+        out[0].replace(&tokens, "TOKENS").replace(&d.0.display().to_string(), "D"),
         "\
 Copy Claude Code: 2 accounts in TOKENS + the fleet's ssh to devtest-apple, devtest-bloom
-✗ devtest-bloom: timed out (retry: arena pods copy-keys devtest-bloom)
+✗ devtest-bloom: timed out (retry: arena pods copy-keys devtest-bloom --keys-dir 'D/no-keys')
 ✓ keys on 1 of 2 pod(s)
 ✓ Claude Code token on 2 of 2 pod(s)
 Error: 1 pod(s) failed
@@ -366,4 +366,26 @@ Claude Code (each pod its own account's token):
   ✓ devtest-bloom: #2 u2@x (new, by spread)
 Error: 1 pod(s) failed
 ");
+}
+
+/// A failed pod's retry is the run it was part of: the keys folder it read and the token flags
+/// it was given — never a token itself — in copy-keys' line, and in the Claude Code stage's
+/// (`--cc-token`'s token is no account's: `claude push` wouldn't put it back).
+#[tokio::test]
+async fn copy_keys_retry_keeps_the_runs_flags_but_never_a_token() {
+    let d = tmp("copykeys-retry");
+    let cfg = config_in(&d, 2, "");
+    let sel = Selected { pods: vec![pod(1, "apple", "running")], named: true };
+    let no_csv = d.0.join("no-keys").display().to_string();
+    let fake = Arc::new(FakeRemote::new());
+    fake.script(&host(1), [arena_core::remote::FakeReply::exit(255, "ssh: Connection timed out")]);
+    let run = crate::handle_copy_keys(fake.clone(), &cfg, &no_csv, Some("hf_SECRETVALUE".into()), Some(tok(9)), &sel, false, true);
+    let quiet = crate::output_test::rendered(false, &[], run).await;
+    let dir = format!("'{no_csv}'");
+    assert!(
+        quiet.contains(&format!("(retry: arena pods copy-keys devtest-apple --keys-dir {dir} --hf-token <the same token> --cc-token <the same token>)")),
+        "{quiet}"
+    );
+    assert!(!quiet.contains("SECRETVALUE") && !quiet.contains(&tok(9)), "{quiet}");
+    assert_eq!(crate::keys::copy_keys_retry("devtest-apple", None, false, false), "arena pods copy-keys devtest-apple");
 }

@@ -554,7 +554,12 @@ pub(crate) async fn stage(remote: &dyn Remote, cfg: &Config, pods: &[(Pod, SshTa
             for o in &outcomes {
                 arena_core::out!(Detail, "  {}", o.line());
                 if o.result.is_err() {
-                    arena_core::out!(Brief, "Claude Code {} (retry: arena claude push {})", o.line(), o.name);
+                    // `--cc-token`'s token is no account's: `claude push` wouldn't put it back.
+                    let retry = match token {
+                        Some(_) => crate::keys::copy_keys_retry(&o.name, None, false, true),
+                        None => format!("arena claude push {}", o.name),
+                    };
+                    arena_core::out!(Brief, "Claude Code {} (retry: {retry})", o.line());
                     failed += 1;
                 }
             }

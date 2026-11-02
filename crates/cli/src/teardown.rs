@@ -1052,9 +1052,10 @@ mod tests {
     }
 
     /// Golden (docs/OUTPUT.md): by default what's wrong — the item left with what's there and its
-    /// fix, the item that couldn't be checked — and the verdict; the clear items, the notes under
-    /// them and the suggested order only with `-v`, which prints the checklist as before. The exit
-    /// is the same either way.
+    /// fix, the item that couldn't be checked — a line for each one not checked here (no key: it
+    /// could hide something), and the verdict; the clear items, the notes under them and the
+    /// suggested order only with `-v`, which prints the checklist as before. The exit is the same
+    /// either way.
     #[tokio::test]
     async fn the_check_by_default_shows_whats_wrong_and_the_verdict() {
         let dir = tmp("golden");
@@ -1078,6 +1079,13 @@ mod tests {
     fix:  arena pods terminate id-devtest-bloom
 ? pods (vast): couldn't list (provider error: list pods HTTP 429) — NOT known to be empty
     note: re-run the check (a rate limit or outage passes); if it keeps failing, look in the vast console
+– pods (hetzner): not configured (no HETZNER_API_KEY) — not checked
+– pods (shadeform): not configured (no SHADEFORM_API_KEY) — not checked
+– network volumes (hetzner): Hetzner volumes not read in this test
+– OpenRouter keys: OPENROUTER_PROVISIONING_KEY isn't set — OpenRouter keys not checked
+– backup archive (hetzner): no token
+– images (hetzner): Hetzner snapshots not read in this test
+– capacity spares (hetzner): Hetzner spares not read in this test
 NOT CLEAR: 1 item(s) still remain, 1 couldn't be checked.
 Error: teardown check: 1 item(s) remain, 1 couldn't be checked
 "

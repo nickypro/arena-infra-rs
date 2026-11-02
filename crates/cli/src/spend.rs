@@ -938,13 +938,14 @@ mod tests {
         assert!(loud.contains("  tracked since "), "{loud}");
         assert!(!quiet.contains("tracked since"), "{quiet}");
         assert!(loud.starts_with(&quiet), "the table is the same:\n{quiet}\n{loud}");
-        // The pure cut: a `!` note stays.
-        let report = spend::report(&spend::load(&ctx.path().unwrap()).0, &Naming::from_config(&cfg), None, unix_now(), None, None);
-        let table = spend::render_owners(&report);
-        let notes = spend::notes(&report);
-        let head = table.strip_suffix(&notes.iter().map(|n| format!("  {n}\n")).collect::<String>()).unwrap();
-        assert_eq!(brief_notes(table.clone(), &report, false), head);
-        assert_eq!(brief_notes(table.clone(), &report, true), table);
+        // A ledger that couldn't be used is started afresh: its `!` note stays by default, the
+        // other notes still go.
+        std::fs::write(ctx.path().unwrap(), "{not json").unwrap();
+        let printed = spend_report(&fake, &cfg, &ctx, None, &report_flags(), unix_now()).await.unwrap();
+        assert!(printed.stdout.contains("\n  ! the ledger started afresh at "), "{}", printed.stdout);
+        assert!(!printed.stdout.contains("tracked since"), "{}", printed.stdout);
+        let loud = spend_report(&fake, &cfg, &ctx, None, &SpendFlags { verbose: true, ..report_flags() }, unix_now()).await.unwrap();
+        assert!(loud.stdout.contains("tracked since") && loud.stdout.contains("! the ledger started afresh"), "{}", loud.stdout);
     }
 
     /// `spend assign` on a machine that has run up spend under someone else would move its whole

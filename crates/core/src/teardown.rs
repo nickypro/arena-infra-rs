@@ -1526,8 +1526,8 @@ impl Report {
     }
 
     /// The checklist as the default output prints it: only what's wrong — each item left (`✗`)
-    /// or not checked (`?`) with what's there, its notes and its fix — the kept ones (`◷`) a
-    /// line each, then the verdict ([`Report::lines`]).
+    /// or that couldn't be checked (`?`) with what's there, its notes and its fix — the kept
+    /// (`◷`) and not applicable (`–`) ones a line each, then the verdict ([`Report::lines`]).
     pub fn render_brief(&self) -> String {
         self.text(false)
     }
@@ -1547,9 +1547,11 @@ impl Report {
         ];
         for item in &self.items {
             // What's wrong shows by default, under it what's there and how to clean it up; a
-            // kept item is a line (it's on purpose); the clear and skipped ones only at -v.
+            // kept item is a line (it's on purpose), and so is one not checked (`–`: no key,
+            // not installed — something could be there unseen, and the verdict counts them);
+            // the clear ones only at -v.
             let wrong = matches!(item.verdict, Verdict::Remaining | Verdict::Unknown);
-            let head = if wrong || item.verdict == Verdict::Kept { To::Out } else { To::Detail };
+            let head = if item.verdict == Verdict::Clear { To::Detail } else { To::Out };
             let under = if wrong { To::Out } else { To::Detail };
             out.push((head, format!("{} {}: {}", item.verdict.styled(), item.title(), item.summary)));
             for l in entry_lines(&item.entries) {

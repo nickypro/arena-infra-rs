@@ -23,7 +23,8 @@ earlier).
 - **Look, money and access** (`config check`/`which`, `teardown --check`, `offers`, `balance`,
   `spend`, `pods idle`/`jobs`/`test`, `copy-keys`, `keys`, `claude`, `update`): `config check` prints
   only what's wrong (✗, ‼, `?` rows with their `└` lines) and its `OK — …` line; `teardown --check`
-  the items left or not checked, with their fixes, the kept ones a line each, and the verdict; an
+  the items left or that couldn't be checked, with their fixes, the kept and not-applicable ones a
+  line each, and the verdict; an
   `offers <provider>` table leaves out what nobody can buy and folds its notes into one line;
   `balance` and `spend` keep their tables and only the notes that need a look; `pods idle`'s
   legend and `pods jobs`' empty tally are `-v`'s; `pods test --deep`/`--keys` counts the pods in

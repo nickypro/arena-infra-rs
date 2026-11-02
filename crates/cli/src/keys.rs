@@ -382,6 +382,7 @@ pub(crate) async fn handle_copy_keys(
 ) -> Result<()> {
     use arena_core::ssh::SshTarget;
 
+    let hf_given = hf_token.is_some();
     let mut keys = KeySources::load(cfg, keys_dir, hf_token);
     // The selected pods' OpenRouter rows, checked against OpenRouter's listing first: a key
     // deleted elsewhere is left out and said, not handed on (`checked`). Listed only when one
@@ -599,7 +600,12 @@ pub(crate) async fn handle_copy_keys(
         };
         failed += 1;
         arena_core::out!(Detail, "[{done}/{total}] ✗ {name}: {why}");
-        arena_core::out!(Brief, "{} (retry: arena pods copy-keys {name})", arena_core::out::fail(format!("{}: {}", arena_core::out::bold(&name), arena_core::out::reason_text(&why))));
+        arena_core::out!(
+            Brief,
+            "{} (retry: {})",
+            arena_core::out::fail(format!("{}: {}", arena_core::out::bold(&name), arena_core::out::reason_text(&why))),
+            copy_keys_retry(&name, (keys_dir != crate::fleet_files::keys_dir(cfg)).then_some(keys_dir), hf_given, cc_token.is_some())
+        );
         arena_core::out::progress("copy-keys", Some(&format!("keys: {done} of {total}")));
     }
     drop(_progress);
@@ -641,6 +647,23 @@ pub(crate) fn copy_keys_brief(sources: &[String], archive: bool, names: &[&str])
         n => format!("{} and {} more", names[..3].join(", "), n - 3),
     };
     format!("Copy {} to {}", what.join(" + "), arena_core::out::bold(pods))
+}
+
+/// The command that retries `copy-keys` on one pod as this run made it: its keys folder when it
+/// isn't the fleet's, and the token flags it was given — never their values, which the operator
+/// passes again (`--hf-token <the same token>`). Pure.
+pub(crate) fn copy_keys_retry(name: &str, keys_dir: Option<&str>, hf_token: bool, cc_token: bool) -> String {
+    let mut cmd = format!("arena pods copy-keys {name}");
+    if let Some(dir) = keys_dir {
+        cmd.push_str(&format!(" --keys-dir {}", crate::shell_quote(dir)));
+    }
+    if hf_token {
+        cmd.push_str(" --hf-token <the same token>");
+    }
+    if cc_token {
+        cmd.push_str(" --cc-token <the same token>");
+    }
+    cmd
 }
 
 /// Where generated OpenRouter keys are persisted (also where `copy-keys` reads them): the
