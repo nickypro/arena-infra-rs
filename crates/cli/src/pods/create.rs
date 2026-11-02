@@ -645,12 +645,12 @@ pub(crate) async fn create_with_retry(
             // A round starts only inside the window: if the next one (`retry_secs` from now)
             // would start past it, stop here — not sleep, then create (bill) after the window
             // the operator agreed to. Decided before the sleep, as the placement executor does.
+            let why = if listing_missing { "fleet listing incomplete" } else { "capacity" };
             if !next_round_in_window(tokio::time::Instant::now(), every, deadline) {
                 end_rounds();
-                arena_core::out!(Err, "retry window ({retry_mins}m) has no room for another round — have {} of {shown}", all.len());
+                arena_core::out!(Err, "retry window ({retry_mins}m) has no room for another round — have {} of {shown} ({why})", all.len());
                 break 'rounds;
             }
-            let why = if listing_missing { "fleet listing incomplete" } else { "capacity" };
             // One line per round in a log (the dashboard reads it); updated in place on a terminal.
             let line = format!("round {round}: {} short of target {shown} ({why}); retrying in {retry_secs}s (Ctrl+C to stop)…", names.len());
             if arena_core::out::live() {

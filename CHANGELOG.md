@@ -19,6 +19,28 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-02 · arena 2.12: shorter output by default; `-v` shows the rest
+- **`pods up` and `pods create` say much less.** By default they print the plan in one line
+  (or a short table for several options), the balance in one line, a one-line prompt with what
+  it creates and what it costs (`Create devtest-apple, devtest-bloom (≤$0.34/h)? [y/N]`), a
+  `[created]` line per pod, a `[name] READY after 6m12s · keys ✓ · Claude ✓` or `FAILED` line,
+  and a tally. A provider's raw error, the notes, the ids, each step and the summary table are
+  gone from the default. The same no-capacity error every retry round becomes one round line,
+  updated in place on a terminal. While pods are being set up, a terminal shows one line at the
+  bottom with where each pod is.
+- **`-v` (`--verbose`) works on every command** and shows everything as before. `balance -v`,
+  `offers -v` and `pods test --deep -v` work as they did.
+- **Colour on a terminal:** names and verdicts in bold, ✓ green, ✗ red, ‼ yellow. `--color
+  auto|always|never` and `NO_COLOR` turn it on or off. Pipes and cron logs get the same words
+  and no colour.
+- After any command that changes pods, the proxy's `[proxy] after …` line now shows only with
+  `-v`, unless the sync failed.
+- A failed setup in `up` says what to run: `(retry: arena pods setup NAME)`.
+
+### Changed
+- Output is shorter by default, and `-v` shows the rest. `--json`, exit codes and the lines the
+  dashboard reads are the same. The other commands get the same treatment next.
+
 ## 2026-11-02 · arena 2.11: the coding agents on each machine know which Python to use; `uv` on every shell's PATH
 - Setup writes a short block into each machine's `~/.claude/CLAUDE.md` (Claude Code) and
   `~/.codex/AGENTS.md` (Codex): the course env it finds there (`/opt/arena-env` on RunPod and

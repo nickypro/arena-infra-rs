@@ -814,7 +814,9 @@ pub(crate) async fn place_names(
             ),
         ),
         End::WindowElapsed => {
-            arena_core::out::emit(arena_core::out::To::Err, &format!("retry window ({retry_mins}m) elapsed — placed {placed} of {total}"))
+            // The round lines said why (a terminal's only in place, now gone): said once more.
+            let why = last_refusal(&run).map(|w| format!(" ({w})")).unwrap_or_default();
+            arena_core::out::emit(arena_core::out::To::Err, &format!("retry window ({retry_mins}m) elapsed — placed {placed} of {total}{why}"))
         }
         End::Interrupted => {
             arena_core::out::emit(arena_core::out::To::Err, &format!("interrupted — stopping retries with {placed} of {total}"))
@@ -839,6 +841,20 @@ pub(crate) async fn place_names(
         }
     }
     Ok(made)
+}
+
+/// Why the names left unplaced weren't placed, as their last attempt said: `no capacity`, `no
+/// access`, `rejected`, `over the limit`; `None` without an attempt. Pure.
+fn last_refusal(run: &arena_core::placement::Placement) -> Option<&'static str> {
+    use arena_core::placement::Outcome;
+    run.log.iter().filter(|l| l.placed.is_none()).filter_map(|l| l.attempts.last()).map(|a| match a.outcome {
+        Outcome::Capacity(_) => "no capacity",
+        Outcome::Denied(_) => "no access",
+        Outcome::Rejected(_) => "rejected",
+        Outcome::Quota(_) => "over the limit",
+        Outcome::Auth(_) => "key rejected",
+        Outcome::Failed(_) | Outcome::Created { .. } => "failed",
+    }).next()
 }
 
 #[cfg(test)]
