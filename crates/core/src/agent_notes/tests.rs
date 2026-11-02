@@ -297,7 +297,7 @@ fn the_notes_land_between_the_markers_and_keep_the_rest() {
         std::fs::set_permissions(m.path(claude), std::fs::Permissions::from_mode(0o600)).unwrap();
         ok(&m.run(outer, &pod, false));
         assert_eq!(m.read(claude), format!("{before}{want}{after}"), "{inner}: replaced where it was");
-        assert_eq!(m.kept("home/.claude"), [theirs.clone()], "{inner}: the file it replaced is kept beside it");
+        assert_eq!(m.kept("home/.claude"), std::slice::from_ref(&theirs), "{inner}: the file it replaced is kept beside it");
         let mode = |rel: &str| std::fs::metadata(m.path(rel)).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(claude), 0o600, "{inner}: mode kept");
         // Again: nothing changes, nothing is written, nothing more is kept.
