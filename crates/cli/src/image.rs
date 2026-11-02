@@ -234,7 +234,9 @@ async fn list(cloud: &dyn ImageCloud, cfg: &Config, now: u64, repo: std::result:
     // By default: what new VMs boot when the table can't say it (the images aren't in use, or
     // none fits), and each note on the image (old, requirements changed).
     if !arena {
-        out!(Brief, "Not in use: HETZNER_IMAGE={} (set it to arena for the newest that fits)", opts.image);
+        if !ours.is_empty() {
+            out!(Brief, "Not in use: HETZNER_IMAGE={} (set it to arena for the newest that fits)", opts.image);
+        }
     } else if !matches!(resolved, Resolved::Snapshot(_)) {
         out!(Brief, "For {}: {}", opts.server_type, lines[0]);
     }

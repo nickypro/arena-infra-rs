@@ -199,9 +199,19 @@ async fn provision_fleet(
         };
         let Some(joined) = joined else { break };
         done += 1;
+        // Which pod ended (a crashed task by its id), out of the in-place line before its own
+        // line is said: none left, none drawn.
+        let ended = match &joined {
+            Ok((name, _)) => name.clone(),
+            Err(e) => names.get(&e.id()).cloned().unwrap_or_else(|| "?".into()),
+        };
+        take_one(&mut left, &ended);
+        if live {
+            let line = (!left.is_empty()).then(|| progress_text(says, started.elapsed(), done, &left));
+            out::progress(PROGRESS, line.as_deref());
+        }
         match joined {
             Ok((name, outcome)) => {
-                take_one(&mut left, &name);
                 emit(To::Detail, &progress_line(done, total, &name, &outcome));
                 let held = hold_rejected && key_rejected(&outcome);
                 if !held {
@@ -224,14 +234,9 @@ async fn provision_fleet(
             // A panicked task still counts — as a failure, never silently.
             Err(e) => {
                 failed += 1;
-                let name = names.get(&e.id()).cloned().unwrap_or_else(|| "?".into());
-                take_one(&mut left, &name);
-                emit(To::Detail, &format!("[{done}/{total}] ✗ {name} (its setup task crashed: {e})"));
-                emit(To::Brief, &failed_line(says, &name, &format!("its task crashed: {e}")));
+                emit(To::Detail, &format!("[{done}/{total}] ✗ {ended} (its setup task crashed: {e})"));
+                emit(To::Brief, &failed_line(says, &ended, &format!("its task crashed: {e}")));
             }
-        }
-        if live && !left.is_empty() {
-            out::progress(PROGRESS, Some(&progress_text(says, started.elapsed(), done, &left)));
         }
     }
     (provisioned, failed, rejected)
@@ -441,16 +446,14 @@ pub(crate) async fn handle_setup(
     // run setup again, waiting for the attach to land (bounded); the rest stand as reported.
     if let Some(provider) = repair.filter(|_| !rejected.is_empty()) {
         let mut retry = Vec::new();
-        for (name, why) in &rejected {
+        for (name, provider_name, target) in targets.iter().filter(|(n, _, _)| rejected.iter().any(|(r, _)| r == n)) {
+            // What happened to it, for its default line (held back by `provision_fleet`).
+            let why = rejected.iter().find(|(r, _)| r == name).map_or("", |(_, w)| w.as_str());
             let failed_now = || out!(Brief, "{}", failed_line(SETUP, name, why));
             // The pod behind this target (by its endpoint: two pods may share a name).
-            let found = targets.iter().filter(|(n, _, _)| n == name).find_map(|(_, provider_name, target)| {
-                let pod = sel.pods.iter().find(|p| {
-                    &p.name == name && p.ssh_ip.as_deref() == Some(target.host.as_str()) && p.ssh_port == Some(target.port)
-                })?;
-                Some((pod, provider_name, target))
-            });
-            let Some((pod, provider_name, target)) = found else {
+            let Some(pod) = sel.pods.iter().find(|p| {
+                &p.name == name && p.ssh_ip.as_deref() == Some(target.host.as_str()) && p.ssh_port == Some(target.port)
+            }) else {
                 failed_now();
                 continue;
             };
