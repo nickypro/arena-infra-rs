@@ -168,13 +168,16 @@ server {
 const QUIET_APPLY: &str = r#"
 ‼ vast didn't list (rate limited): its forwards are kept
   + arena8-autumn            localhost:7001         -> 2.2.2.2:22001          (runpod)
+warning: skipped arena8-zz-staff, arena8-yy-staff — name not in MACHINE_NAME_LIST (no stable port slot)
 [dry-run] would write 2 forward(s) (+1 ~0 -0 =0) to this host:<conf> (write-only: no reload)
 ‼ vast didn't list (rate limited): its forwards are kept
   + arena8-autumn            localhost:7001         -> 2.2.2.2:22001          (runpod)
+warning: skipped arena8-zz-staff, arena8-yy-staff — name not in MACHINE_NAME_LIST (no stable port slot)
 Write 2 forward(s) (+1 ~0 -0 =0) to this host:<conf> (write-only: no reload)? [y/N] y
 [proxy] wrote 2 forward(s) to <conf> (write-only: nginx not reloaded)
 ‼ vast didn't list (rate limited): its forwards are kept
-✓ proxy config up to date (2 forward(s), 2 pod(s) skipped)
+warning: skipped arena8-zz-staff, arena8-yy-staff — name not in MACHINE_NAME_LIST (no stable port slot)
+✓ proxy config up to date (2 forward(s))
 "#;
 
 const LOUD_APPLY: &str = r#"

@@ -990,7 +990,7 @@ pub(crate) async fn handle_pods_bal(
                         sel.pods.len(),
                         sel.names()
                     ),
-                    &format!("Write the agents' notes on {}, nothing else?", crate::pods::setup::some_names(&names)),
+                    &format!("Write the agents' notes and link uv on {}, nothing else?", crate::pods::setup::all_names(&names)),
                 )?
             {
                 out!(Out, "aborted.");
@@ -1018,7 +1018,7 @@ pub(crate) async fn handle_pods_bal(
                         if vscode { ", VS Code warm-up" } else { "" },
                         sel.names()
                     ),
-                    &format!("Set up {} over SSH?", crate::pods::setup::some_names(&names)),
+                    &format!("Set up {} over SSH?", crate::pods::setup::all_names(&names)),
                 )?
             {
                 out!(Out, "aborted.");

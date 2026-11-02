@@ -228,17 +228,7 @@ pub(crate) fn emit_proxy_plan(listing: &arena_core::proxy::Listing, cfg: &Config
     for s in &plan.skipped {
         out!(ErrDetail, "warning: skipped {} — {}", s.name, s.reason);
     }
-    // Pods skipped for the same reason: one line.
-    let mut reasons: Vec<(&str, Vec<&str>)> = Vec::new();
-    for s in &plan.skipped {
-        match reasons.iter_mut().find(|(r, _)| *r == s.reason) {
-            Some((_, names)) => names.push(&s.name),
-            None => reasons.push((&s.reason, vec![&s.name])),
-        }
-    }
-    for (reason, names) in &reasons {
-        out!(ErrBrief, "warning: skipped {} — {reason}", crate::pods::setup::some_names(names));
-    }
+    crate::proxy::skipped_warnings(&plan);
 
     let nginx = arena_core::proxy::render_nginx(&plan.forwards);
     out!(Detail, "\n{}", plan_config_header(&pxcfg.nginx_path, prev.is_some()));

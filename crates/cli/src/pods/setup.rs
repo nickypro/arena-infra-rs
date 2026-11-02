@@ -37,15 +37,16 @@ const NOTES: Says = Says { what: "notes", retry: "arena pods setup --notes-only"
 /// The key of a fleet run's in-place line on a terminal ([`out::progress`]).
 const PROGRESS: &str = "setup";
 
-/// Up to three names, bold, then how many more: `devtest-a, devtest-b, devtest-c +2 more` — the
-/// pods a one-line prompt or plan acts on. Pure (but for the bold).
-pub(crate) fn some_names<S: AsRef<str>>(names: &[S]) -> String {
-    const SHOWN: usize = 3;
-    let shown = names.iter().take(SHOWN).map(|n| out::bold(n.as_ref())).collect::<Vec<_>>().join(", ");
-    if names.len() > SHOWN {
-        format!("{} pods: {shown} +{} more", names.len(), names.len() - SHOWN)
+/// Every name, bold — with how many first when there are more than three: `devtest-a,
+/// devtest-b`, `5 pods: devtest-a, devtest-b, devtest-c, devtest-d, devtest-e`. A prompt names
+/// every pod it acts on, never `+N more` (review r1: a fourth pod set up unnamed). Pure (but for
+/// the bold).
+pub(crate) fn all_names<S: AsRef<str>>(names: &[S]) -> String {
+    let all = names.iter().map(|n| out::bold(n.as_ref())).collect::<Vec<_>>().join(", ");
+    if names.len() > 3 {
+        format!("{} pods: {all}", names.len())
     } else {
-        shown
+        all
     }
 }
 
@@ -411,7 +412,7 @@ pub(crate) async fn handle_setup(
         );
         let keys = if keys_present { " → API keys" } else { "" };
         for (labels, names) in &plans {
-            out!(Brief, "Would set up {}: {labels}{keys}", some_names(names));
+            out!(Brief, "Would set up {}: {labels}{keys}", all_names(names));
         }
         out!(Detail, "Preview only — run without --dry-run to execute over SSH.");
         return Ok(());
@@ -561,8 +562,7 @@ pub(crate) async fn handle_setup(
     reap::reassert_notices(remote.as_ref(), cfg, &set_up).await;
 
     if failed > 0 {
-        let not: Vec<&str> = targets.iter().map(|(n, _, _)| n.as_str()).filter(|n| !provisioned.iter().any(|p| p == n)).collect();
-        anyhow::bail!("{failed} pod(s) failed to set up: {}", not.join(", "));
+        anyhow::bail!("{failed} pod(s) failed to set up");
     }
     Ok(())
 }
@@ -594,7 +594,7 @@ pub(crate) async fn handle_notes(
             out!(Detail, "# {name}\n  {}\n", notes.summary(provider));
         }
         let names: Vec<&str> = targets.iter().map(|(n, _, _)| n.as_str()).collect();
-        out!(Brief, "Would write the agents' notes ({}) and link uv on {}", arena_core::agent_notes::FILES.join(", "), some_names(&names));
+        out!(Brief, "Would write the agents' notes ({}) and link uv into /usr/local/bin on {}", arena_core::agent_notes::FILES.join(", "), all_names(&names));
         out!(Detail, "Preview only — run without --dry-run to execute over SSH.");
         return Ok(());
     }

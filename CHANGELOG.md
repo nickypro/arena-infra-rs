@@ -26,13 +26,14 @@ the same.
   pod as it ends, `[devtest-apple] setup ✓ (3m02s)` or `[devtest-bloom] FAILED setup: <why>
   (retry: arena pods setup devtest-bloom)`, and `✓ 3 of 3 set up`. A log also gets
   `[devtest-apple] setup…` as each starts (the dashboard shows it); a terminal shows one line,
-  updated in place. The tokens, budgets and API-key lines are `-v`'s. The error names the pods
-  that failed. The prompt is one line (`Set up devtest-apple over SSH? [y/N]`), and `--dry-run`
-  says the steps in a line instead of printing each script. `--notes-only` does the same.
+  updated in place. The tokens, budgets and API-key lines are `-v`'s. The prompt is one line
+  naming every pod (`Set up devtest-apple over SSH? [y/N]`), and `--dry-run` says the steps in a
+  line instead of printing each script. `--notes-only` does the same.
 - **`proxy plan` / `proxy apply`**: the changes (`+ ~ -`) and the counts. `proxy plan`'s nginx
   config and the forwards that stay as they are moved to `-v`. A provider that didn't list is one
-  line with its reason, and pods skipped for one reason share a line. An `apply` with nothing to
-  write (the proxy cron, every 5 minutes) is one line: `✓ proxy config up to date (30 forward(s))`.
+  line with its reason, and pods skipped for one reason share a line (an `apply` says them too).
+  An `apply` with nothing to write (the proxy cron, every 5 minutes) is one line: `✓ proxy config
+  up to date (30 forward(s))`.
 - **`image list|build|prune`**: `list` is the table and its cost, plus a line when the images
   aren't in use or a note on them. `build` asks in one line what it makes and what it costs, and
   its dry run is that line. `prune` lists what goes and asks what it saves; what stays is `-v`'s.

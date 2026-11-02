@@ -59,7 +59,7 @@ pub(crate) async fn handle_proxy(cmd: ProxyCmd, provider: &dyn Provider, cfg: &C
             if prepared.up_to_date() {
                 out!(Detail, "proxy config already up to date — nothing to write.");
                 // The proxy cron's line every 5 minutes: one, and short.
-                out!(Brief, "{}", out::ok(format!("proxy config up to date ({})", forwards_said(&prepared.plan))));
+                out!(Brief, "{}", out::ok(format!("proxy config up to date ({} forward(s))", prepared.plan.forwards.len())));
                 return Ok(());
             }
             let question = format!("{}?", capitalized(&proxy_action_brief(&prepared)));
@@ -196,6 +196,23 @@ fn print_proxy_review(p: &PreparedProxy, listing: &arena_core::proxy::Listing) {
         format!("; {} pod(s) skipped (`arena proxy plan` lists why)", p.plan.skipped.len())
     };
     out!(Detail, "proxy: {}{skipped}", p.plan.summary());
+    // A pod that gets no forward is said whatever else happens (review r1).
+    skipped_warnings(&p.plan);
+}
+
+/// The pods the plan skipped (no forward for them), by default: a line per reason, naming them.
+/// (`-v` says them one a line, or counts them.)
+pub(crate) fn skipped_warnings(plan: &arena_core::proxy::ProxyPlan) {
+    let mut reasons: Vec<(&str, Vec<&str>)> = Vec::new();
+    for s in &plan.skipped {
+        match reasons.iter_mut().find(|(r, _)| *r == s.reason) {
+            Some((_, names)) => names.push(&s.name),
+            None => reasons.push((&s.reason, vec![&s.name])),
+        }
+    }
+    for (reason, names) in &reasons {
+        out!(ErrBrief, "warning: skipped {} — {reason}", crate::pods::setup::all_names(names));
+    }
 }
 
 /// A provider whose listing failed (its forwards are kept as they were): the whole error with
@@ -205,15 +222,6 @@ pub(crate) fn listing_warnings(listing: &arena_core::proxy::Listing) {
         out!(ErrDetail, "warning: {prov} listing failed: {e}");
         out!(ErrBrief, "{}", out::warn(format!("{prov} didn't list ({}): its forwards are kept", out::reason_text(e))));
     }
-}
-
-/// `30 forwards`, `30 forwards, 3 pods skipped` — a plan's size in a few words. Pure.
-fn forwards_said(plan: &arena_core::proxy::ProxyPlan) -> String {
-    let skipped = match plan.skipped.len() {
-        0 => String::new(),
-        n => format!(", {n} pod(s) skipped"),
-    };
-    format!("{} forward(s){skipped}", plan.forwards.len())
 }
 
 /// What an apply will do, as its one-line question says it: `write 3 forward(s) (+1 ~0 -0 =0)

@@ -118,6 +118,9 @@ fn the_progress_and_end_lines() {
         "[devtest-apple] FAILED setup: timed out at repo + keys config after 300s (retry: arena pods setup devtest-apple)"
     );
     assert_eq!(failed_line(super::NOTES, "a", "x"), "[a] FAILED notes: x (retry: arena pods setup --notes-only a)");
+    // A prompt names every pod it acts on.
+    assert_eq!(super::all_names(&["a", "b", "c"]), "a, b, c");
+    assert_eq!(super::all_names(&["a", "b", "c", "d"]), "4 pods: a, b, c, d");
     drop(cap);
 }
 
@@ -151,7 +154,7 @@ Set up devtest-apple, devtest-bloom, devtest-cloud over SSH? [y/N] y
 [devtest-apple] setup ✓ (0s)
 [devtest-bloom] FAILED setup: failed at repo + keys config, exit 128: fatal: could not read from remote repository. (retry: arena pods setup devtest-bloom)
 [devtest-cloud] setup ✓ (0s)
-Error: 1 pod(s) failed to set up: devtest-bloom
+Error: 1 pod(s) failed to set up
 "#;
 
 const LOUD_FAIL: &str = r#"
@@ -166,7 +169,7 @@ Provisioning 3 pod(s) over SSH (budgets: copy 60s, config 300s, hetzner script 1
 
 Done: 2 provisioned, 1 failed.
 API keys: none generated in ./keys/ — skipping (run `arena keys gen --all` or drop in <provider>_api_keys.csv, then re-run setup / `pods copy-keys`).
-Error: 1 pod(s) failed to set up: devtest-bloom
+Error: 1 pod(s) failed to set up
 "#;
 
 const QUIET_REPAIR: &str = r#"
@@ -201,7 +204,7 @@ Would set up devtest-apple, devtest-bloom: copy deploy key → repo + keys confi
 "#;
 
 const QUIET_NOTES: &str = r#"
-Write the agents' notes on devtest-apple, devtest-bloom, nothing else? [y/N] y
+Write the agents' notes and link uv on devtest-apple, devtest-bloom, nothing else? [y/N] y
 [devtest-apple] notes…
 [devtest-bloom] notes…
 [devtest-apple] notes ✓ (0s)
@@ -220,7 +223,7 @@ Done: 2 up to date, 0 failed.
 "#;
 
 const QUIET_NOTES_DRY: &str = r#"
-Would write the agents' notes (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md) and link uv on devtest-apple
+Would write the agents' notes (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md) and link uv into /usr/local/bin on devtest-apple
 "#;
 
 const LOUD_NOTES_DRY: &str = r#"
