@@ -823,4 +823,21 @@ async fn stop_start_and_lock_name_twins_with_their_ids() {
     assert_eq!(quiet, "[dry-run] would start devtest-delta (id=h-1, hetzner), devtest-delta (id=h-2, hetzner) (disk kept)\n");
     let (quiet, _) = both(&["lock", "--all", "--dry-run"], &cfg, &[], || twins("RUNNING")).await;
     assert!(quiet.starts_with("[dry-run] would lock devtest-delta (id=h-1, hetzner), devtest-delta (id=h-2, hetzner) ("), "{quiet}");
+    // Review r8: one twin skipped (stopped already, or locked already) — its namesake keeps its id.
+    let mixed = || {
+        let f = twins("RUNNING");
+        f.pods.lock().unwrap()[1].status = "off".into();
+        f
+    };
+    let (quiet, _) = both(&["stop", "--all", "--dry-run"], &cfg, &[], mixed).await;
+    assert!(quiet.ends_with("[dry-run] would stop devtest-delta (id=h-1, hetzner) (disk kept)\n"), "{quiet}");
+    let (quiet, _) = both(&["start", "--all", "--dry-run"], &cfg, &[], mixed).await;
+    assert!(quiet.ends_with("[dry-run] would start devtest-delta (id=h-2, hetzner) (disk kept)\n"), "{quiet}");
+    let one_locked = || {
+        let f = twins("RUNNING");
+        f.pods.lock().unwrap()[1].locked = Some(true);
+        f
+    };
+    let (quiet, _) = both(&["lock", "--all", "--dry-run"], &cfg, &[], one_locked).await;
+    assert!(quiet.contains("[dry-run] would lock devtest-delta (id=h-1, hetzner) ("), "{quiet}");
 }

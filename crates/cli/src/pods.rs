@@ -784,7 +784,8 @@ pub(crate) async fn handle_pods_bal(
             let sites = repo_sites(&remote, cfg, &pods, &fates, &repo).await;
             let lines = stop_lines(&pods, &fates, &sites);
             // By default the pods and what the stop does to their disks, in a line.
-            let brief = disk_brief(DiskOp::Stop, &pods, &fates, &sites);
+            let given: Vec<&arena_core::Pod> = sel.pods.iter().collect();
+            let brief = disk_brief(DiskOp::Stop, &pods, &given, &fates, &sites);
             let blocked: Vec<&str> = pods
                 .iter()
                 .zip(fates.iter().zip(&sites))

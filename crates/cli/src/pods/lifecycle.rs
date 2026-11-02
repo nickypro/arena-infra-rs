@@ -404,13 +404,15 @@ fn fate_words(op: DiskOp, fate: DiskFate, site: &RepoSite, n: usize) -> String {
 /// The pods of a stop or a restart grouped by what it does to them, each group with its words
 /// ([`fate_words`]): `devtest-alpha (disk kept)`, `devtest-a, devtest-b (discards their
 /// container disks and the work on them); devtest-delta (disk kept)`. Pure (but for the bold).
-pub(crate) fn disk_brief(op: DiskOp, pods: &[&arena_core::Pod], fates: &[DiskFate], sites: &[RepoSite]) -> String {
+/// `among`: the pods the command was given, before any were filtered out (a twin skipped as not
+/// running still makes its namesake's id worth saying).
+pub(crate) fn disk_brief(op: DiskOp, pods: &[&arena_core::Pod], among: &[&arena_core::Pod], fates: &[DiskFate], sites: &[RepoSite]) -> String {
     let mut groups: Vec<(String, Vec<String>, DiskFate, &RepoSite)> = Vec::new();
     for ((p, f), site) in pods.iter().zip(fates).zip(sites) {
         let key = fate_words(op, *f, site, 1);
         match groups.iter_mut().find(|(k, ..)| *k == key) {
-            Some((_, names, ..)) => names.push(who_among(p, pods)),
-            None => groups.push((key, vec![who_among(p, pods)], *f, site)),
+            Some((_, names, ..)) => names.push(who_among(p, among)),
+            None => groups.push((key, vec![who_among(p, among)], *f, site)),
         }
     }
     groups
@@ -573,7 +575,9 @@ pub(crate) async fn handle_start(
         .collect();
     let wiped = pods.iter().any(|p| provider.restart_wipes_container_disk(p));
     let then = afterwards_line(if wiped { ContainerReset::Yes } else { ContainerReset::No }, setup, skip_proxy);
-    let brief = start_brief(provider, &pods, setup);
+    // Named with their ids where another selected pod has the name (one skipped as running too).
+    let given: Vec<&arena_core::Pod> = sel.pods.iter().collect();
+    let brief = start_brief(provider, &pods, &given, setup);
     if dry_run {
         out!(Detail, "[dry-run] would start {} pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
         out!(Brief, "[dry-run] would start {brief}");
@@ -635,11 +639,10 @@ pub(crate) async fn handle_start(
 /// What a start does to `pods`, grouped, for the default output's dry run and question:
 /// `devtest-alpha (a fresh image, set up again)`, `devtest-delta (disk kept)`. Pure (but for
 /// the bold).
-fn start_brief(provider: &dyn Provider, pods: &[arena_core::Pod], setup: bool) -> String {
+fn start_brief(provider: &dyn Provider, pods: &[arena_core::Pod], all: &[&arena_core::Pod], setup: bool) -> String {
     let fresh = if setup { "a fresh image, set up again" } else { "a fresh image, not set up: --no-setup" };
-    let all: Vec<&arena_core::Pod> = pods.iter().collect();
     let (wiped, kept): (Vec<&arena_core::Pod>, Vec<&arena_core::Pod>) = pods.iter().partition(|p| provider.restart_wipes_container_disk(p));
-    let names = |ps: &[&arena_core::Pod]| names_brief(&ps.iter().map(|p| who_among(p, &all)).collect::<Vec<_>>());
+    let names = |ps: &[&arena_core::Pod]| names_brief(&ps.iter().map(|p| who_among(p, all)).collect::<Vec<_>>());
     let mut parts = Vec::new();
     if !wiped.is_empty() {
         parts.push(format!("{} ({fresh})", names(&wiped)));
@@ -709,9 +712,10 @@ pub(crate) fn who(pod: &arena_core::Pod, listed: &[arena_core::Pod]) -> String {
     }
 }
 
-/// [`who`] among the pods a command acts on (`stop`, `start`, `lock`, `reimage` don't keep the
-/// listing): its id and provider when another of them has its name (`--all` with a double
-/// create). A twin left out was picked by its id, which the operator typed. Pure.
+/// [`who`] among the pods a command was given (`stop`, `start`, `lock`, `reimage` don't keep the
+/// listing) — all of them, those it then skips too: its id and provider when another of them has
+/// its name (`--all` after a double create). A twin not selected at all was left out by its id,
+/// which the operator typed. Pure.
 pub(crate) fn who_among(pod: &arena_core::Pod, pods: &[&arena_core::Pod]) -> String {
     if pods.iter().filter(|p| p.name == pod.name).count() > 1 {
         format!("{} (id={}, {})", pod.name, pod.id, pod.provider)
