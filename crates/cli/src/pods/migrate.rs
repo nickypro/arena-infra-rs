@@ -1265,6 +1265,8 @@ pub(crate) async fn migrate_finish_on(
         out::bold(&old_name),
         if proxied { format!(", once the proxy routes {canonical} to the live pod") } else { String::new() }
     );
+    // What the syncs never copied lives only there (review r2).
+    out!(Brief, "{}", crate::pods::replace::left_behind_line(&old_name, false));
     if dry_run {
         out!(Detail, "migrate finish {canonical} (dry-run): would {first}terminate {old_name} (id={}).", old.id);
         out!(Brief, "[dry-run] would terminate {brief}");

@@ -608,12 +608,12 @@ pub(crate) async fn handle_start(
     // warning above it; one not waited for (`--skip-proxy`, or with pods to set up) has only its
     // `[started]` line.
     if !kept.is_empty() && fresh.is_empty() && !skip_proxy {
-        let (_, dead) = settled_sync(cfg, provider, &kept, settle, "start").await;
+        let (sync, dead) = settled_sync(cfg, provider, &kept, settle, "start").await;
+        let missed = not_back(cfg, &sync, &kept, &dead);
         for p in &kept {
-            if dead.contains(&p.id) {
-                out!(ErrBrief, "{}", failed_line(&p.name, "waiting for SSH", "its endpoint never settled", "arena proxy apply, once it answers"));
-            } else {
-                out!(Brief, "{}", ready_line(&p.name, since.elapsed(), Some("disk kept")));
+            match missed.iter().find(|(id, _)| *id == p.id) {
+                Some((_, why)) => out!(ErrBrief, "{}", failed_line(&p.name, why.0, why.1, "arena proxy apply, once it answers")),
+                None => out!(Brief, "{}", ready_line(&p.name, since.elapsed(), Some("disk kept"))),
             }
         }
     }
@@ -1668,8 +1668,19 @@ async fn come_back(
         // Only the pods that settled are waited for again: one that never got an endpoint has
         // had its wait (and is named below) — another one, or two, per pod would only make a
         // dead pod cost the whole command half an hour.
-        let back: Vec<arena_core::Pod> = pods.iter().filter(|p| settled.contains(&p.id)).cloned().collect();
-        settled_sync(cfg, provider, &back, s, why).await;
+        let settled_pods: Vec<arena_core::Pod> = pods.iter().filter(|p| settled.contains(&p.id)).cloned().collect();
+        let (sync, dead) = settled_sync(cfg, provider, &settled_pods, s, why).await;
+        // A pod set up but not reachable after all (its endpoint gone again, its forward not
+        // routed) isn't READY: its FAILED line, with the warning above it (the exit is as before).
+        if how.setup {
+            for (id, (what, why)) in not_back(cfg, &sync, &settled_pods, &dead) {
+                let Some(p) = settled_pods.iter().find(|p| p.id == id) else { continue };
+                if back.contains(&p.name) {
+                    back.retain(|n| *n != p.name);
+                    out!(ErrBrief, "{}", failed_line(&p.name, what, why, "arena proxy apply, once it answers"));
+                }
+            }
+        }
     }
     if !how.setup {
         no_setup_note(pods, how.reset);
@@ -1744,6 +1755,27 @@ fn unrouted<'a>(cfg: &Config, sync: &ProxySync, pods: &'a [arena_core::Pod]) -> 
     pods.iter()
         .filter(|p| proxied_name(cfg, &p.name))
         .filter(|p| !routed.iter().any(|f| f.name == p.name && f.pod_id.as_deref() == Some(p.id.as_str())))
+        .collect()
+}
+
+/// The pods of `pods` a [`settled_sync`] didn't bring back, by id, with what and why for a FAILED
+/// line: no settled endpoint (`dead`: its wait ran out), or — one with a stable port on the
+/// proxy — no forward routed to it (the sync didn't route it, or wasn't made). Pure.
+fn not_back(cfg: &Config, sync: &ProxySync, pods: &[arena_core::Pod], dead: &[String]) -> Vec<(String, (&'static str, &'static str))> {
+    let routed = |p: &arena_core::Pod| match sync {
+        ProxySync::Synced { routed, .. } => routed.iter().any(|f| f.name == p.name && f.pod_id.as_deref() == Some(p.id.as_str())),
+        _ => false,
+    };
+    pods.iter()
+        .filter_map(|p| {
+            if dead.contains(&p.id) {
+                Some((p.id.clone(), ("waiting for SSH", "its endpoint never settled")))
+            } else if proxied_name(cfg, &p.name) && !routed(p) {
+                Some((p.id.clone(), ("proxy", "its forward isn't routed to it yet")))
+            } else {
+                None
+            }
+        })
         .collect()
 }
 

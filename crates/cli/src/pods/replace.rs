@@ -496,6 +496,8 @@ pub(crate) async fn after_swap(
         .is_some_and(|p| !arena_core::status::is_stopped(&p.status) && p.ssh_ip.is_some());
     if old_up && !write_name_file(remote.as_ref(), cfg, owner, old_id, parked, 30).await {
         out!(ErrDetail, "      note: {parked}'s {what} still say(s) {} (harmless once it's terminated)", short_of(cfg, canonical));
+        // Kept (a cutover, --keep-old, a cleanup that's blocked), it would claim the name too.
+        out!(ErrBrief, "{}", out::warn(format!("{parked}'s {what} still say(s) {} — if it's kept, `arena pods setup {parked}` fixes it", short_of(cfg, canonical))));
     }
     if arena_core::setup::machine_name_in_env(owner.name()) {
         out!(
@@ -561,6 +563,14 @@ pub(crate) fn write_only_proxy(cfg: &Config) -> Option<String> {
 /// The config line a plan prints for the copy: what it carries and what it leaves (#27).
 pub(crate) fn copy_scope_line() -> String {
     format!("copies {}; {}", arena_core::pull::REPLICATION_KEEPS, arena_core::pull::REPLICATION_SKIPS)
+}
+
+/// What a copy leaves behind, in a line for the default output before a step that retires the
+/// original (`replace`'s question, `migrate finish`'s): what only lives there goes with it.
+/// `copy_scope_line` has the whole list (`-v`). Pure.
+pub(crate) fn left_behind_line(original: &str, kept: bool) -> String {
+    let fate = if kept { format!("stays on {original} only") } else { format!("goes when {original} is terminated") };
+    format!("Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, .ssh, .vscode-server, shell rc files and history — what's only there {fate}")
 }
 
 /// The plan / confirm note on a locked original: copying only reads it, but what retires it
@@ -954,6 +964,8 @@ pub(crate) async fn replace_on(
     let proxy = if skip_proxy { "; the proxy left alone: `arena proxy apply` yourself" } else { "" };
     let brief = format!("{} (its home copied onto the new one, swapped in; {then}{proxy})", out::bold(&canonical));
 
+    // Before a step that retires the original: what the copy leaves on it (review r2).
+    out!(Brief, "{}", left_behind_line(&old_name, keep_old));
     if dry_run {
         for r in [&locked, &stopped, &reaping, &bad_floor, &busy, &someones].into_iter().flatten() {
             out!(Detail, "");

@@ -1088,10 +1088,11 @@ endpoint to settle, **re-runs setup** (`--no-setup`) and syncs the proxy (`--ski
 VM kept its disk (no setup). A start the provider refuses (no free GPU left on the host) is reported
 per pod, exit non-zero.
 
-Each pod that comes back ends in `[devtest-alpha] READY after 2m31s` (a VM that kept its disk:
-`· disk kept`), the line the dashboard's runs panel reads as the pod's end; a log also gets
-`[devtest-alpha] waiting for SSH…` and setup's lines as they start. `restart` and `reimage` end the
-same way.
+Each pod that comes back — set up, its endpoint settled and, where it has a proxy port, its
+forward routed — ends in `[devtest-alpha] READY after 2m31s` (a VM that kept its disk: `· disk
+kept`), the line the dashboard's runs panel reads as the pod's end; one that isn't reachable after
+all is `[NAME] FAILED proxy: …` (or `waiting for SSH`) with its fix. A log also gets `[devtest-alpha]
+waiting for SSH…` and setup's lines as they start. `restart` and `reimage` end the same way.
 
 The SSH commands (`run`, `test`, `setup`, `backup`, `pull`…) skip a stopped pod saying so — `skip X
 — stopped (EXITED); arena pods start X brings it back` — even when the listing still shows its last

@@ -323,6 +323,7 @@ async fn replace_says_the_new_pod_the_steps_and_the_end() {
 
 const REPLACE_DRY_QUIET: &str = r#"
 devtest-alpha → a new 1×RTX A4000 · RunPod COMMUNITY
+Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, .ssh, .vscode-server, shell rc files and history — what's only there goes when devtest-alpha-old is terminated
 [dry-run] would replace devtest-alpha (its home copied onto the new one, swapped in; the old one terminated)
 "#;
 
@@ -344,6 +345,7 @@ Replace devtest-alpha  (id=r-alpha, runpod)
 
 const REPLACE_QUIET: &str = r#"
 devtest-alpha → a new 1×RTX A4000 · RunPod COMMUNITY
+Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, .ssh, .vscode-server, shell rc files and history — what's only there goes when devtest-alpha-old is terminated
 Replace devtest-alpha (its home copied onto the new one, swapped in; the old one terminated)? [y/N] y
 [created] devtest-alpha-new · 1×RTX A4000 COMMUNITY · $0.29/h
 [devtest-alpha-new] waiting for SSH…
@@ -581,6 +583,7 @@ Proceed? [y/N] y
 "#;
 
 const FINISH_DRY_QUIET: &str = r#"
+Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, .ssh, .vscode-server, shell rc files and history — what's only there goes when devtest-alpha-old is terminated
 [dry-run] would terminate devtest-alpha-old (the original pod; irreversible, once the proxy routes devtest-alpha to the live pod)
 "#;
 
@@ -589,6 +592,7 @@ migrate finish devtest-alpha (dry-run): would sync the proxy, confirm devtest-al
 "#;
 
 const FINISH_QUIET: &str = r#"
+Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, .ssh, .vscode-server, shell rc files and history — what's only there goes when devtest-alpha-old is terminated
 Terminate devtest-alpha-old (the original pod; irreversible, once the proxy routes devtest-alpha to the live pod)? [y/N] y
 ✓ Terminated devtest-alpha-old. Migration of devtest-alpha complete.
 "#;
@@ -668,4 +672,24 @@ async fn finish_says_the_ssh_config_warning_on_stdout() {
         assert_eq!(warned.len(), 1, "{:?}", cap.lines());
         assert_eq!(warned[0].0, arena_core::out::To::Out, "stdout at both levels: {warned:?}");
     }
+}
+
+/// Review r2: settled but not routed — the proxy's syncs listed it without its endpoint — is no
+/// READY either: FAILED with `arena proxy apply`, the warning above it, the exit as before.
+#[tokio::test(start_paused = true)]
+async fn a_started_vm_the_proxy_doesnt_route_is_not_ready() {
+    let dir = tmpdir("out-start-unrouted");
+    let cfg = cfg(&dir.0);
+    let mut f = fleet();
+    f.pods.lock().unwrap()[3].status = "off".into();
+    // Lists 1-2 and 4-5 are the settle waits; 3 and 6 the syncs, which see no endpoint.
+    f.blank_lists = vec![3, 6];
+    let delta = f.pods.lock().unwrap()[3].clone();
+    let opts = RestartOpts { yes: true, ..Default::default() };
+    let got = rendered(false, &[], handle_start(&f, Arc::new(FakeRemote::new()), &cfg, &named(&[delta]), opts, FAST, "/nonexistent")).await;
+    assert_eq!(
+        got,
+        "[started] devtest-delta\nwarning: the proxy doesn't route devtest-delta to the new endpoint yet (listed without one) — run `arena proxy apply` \
+         once it answers\n[devtest-delta] FAILED proxy: its forward isn't routed to it yet (retry: arena proxy apply, once it answers)\n"
+    );
 }
