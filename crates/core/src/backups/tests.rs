@@ -743,6 +743,36 @@ fn the_text_says_each_job_pod_and_place() {
     }
 }
 
+/// `arena backups` by default (docs/OUTPUT.md): the jobs, a note once where two jobs share it,
+/// the pods with what's wrong, where the copies live — not `Running now: nothing`, the
+/// paragraphs on what isn't covered and how to restore, or the record's path (the CLI's `-v`
+/// line). `-v`'s text is the whole one, as before.
+#[test]
+fn the_default_text_is_the_jobs_pods_and_places() {
+    let r = record_with(5 * MIN, &[("alpha", Outcome::Pushed, ""), ("bravo", Outcome::Failed, "exit 255: ssh: connect timed out")], &[("alpha", Outcome::Copied, "", Some(3_300_000_000))]);
+    let s = judge(&Inputs { crontab: tab(&[GIT_ONLY_LINE]), record: Ok(Some(r)), ..inputs() });
+    assert_eq!(render::text_at(&s, true), render::text(&s));
+    assert_eq!(
+        render::text_at(&s, false),
+        "Backups — devtest · 2026-10-30 21:34 UTC\n\
+         \n   JOB                 HOW OFTEN     LAST RUN               NEXT\n\
+         ✗  git backup          every 15 min  ✗ 5 min ago: 2 pod(s)  in 10 min\n    └ 1 failed: devtest-bravo\n\
+         -  home copy           not set up    ✓ 5 min ago: 1 pod(s)  -\n    └ not set up (the backup line runs `--no-pull`: only a \
+         pod git couldn't back up is copied) — `arena cron install --backup --pull`\n\
+         -  archive: snapshots  not set up    -                      -\n    └ not set up (no backup archive) — `arena archive up, then \
+         arena cron install --archive`\n\
+         -  archive: all files  not set up    -                      -\n\
+         \n\
+         Pods (failing first, then the longest since a good backup):\n\
+         \x20  POD            GIT                     HOME COPY    ARCHIVE\n\
+         ✗  devtest-bravo  ✗ failed 5m (never ok)  -            -\n    └ git: exit 255: ssh: connect timed out\n\
+         ✓  devtest-alpha  ✓ pushed 5m             ✓ 3.3 GB 5m  -\n\
+         \n\
+         Where the copies live:\n\
+         ✓  git   github.com/owner/repo  each pod's branch (autocommit-devtest-wNdM-<pod>)\n"
+    );
+}
+
 /// From a fleet listing (`arena backups`, the dashboard's `b`): each live machine — a staff box
 /// too, never late — up when running, paused when stopped; this cohort's configured names with no
 /// machine are one line under the pods, never a `?` row each.

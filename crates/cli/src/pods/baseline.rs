@@ -12,7 +12,8 @@ use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
 use crate::cron::resolve_week_day;
-use crate::{confirm, disk};
+use crate::disk;
+use arena_core::out;
 
 /// The oldest a pod's container may be for `pods baseline` to capture the fleet baseline from
 /// it: the pod should come straight from `up`, before anyone has used it.
@@ -149,15 +150,21 @@ pub(crate) async fn handle_baseline(
         dest.display(),
         if exists { format!(" (the current one is moved aside to {}/fleet.replaced-<time>/)", dest.parent().unwrap_or(base).display()) } else { String::new() },
     );
+    // What it does, in a line: the default's dry run and question.
+    let aside = if exists { " (the current one moved aside)" } else { "" };
+    let brief = format!("capture week {week}'s fleet baseline from {} into {}{aside}", pod.name, dest.display());
     if dry_run {
-        println!("[dry-run] would {plan}");
+        out!(Brief, "[dry-run] would {brief} (-v: the plan and rsync)");
+        out!(Detail, "[dry-run] would {plan}");
         for args in &passes {
-            println!("  {}", pull::display_argv(rsync, args));
+            out!(Detail, "  {}", pull::display_argv(rsync, args));
         }
         return Ok(());
     }
-    if !confirm(yes, &format!("Will {plan}."))? {
-        println!("aborted.");
+    let mut question = format!("{brief}?");
+    question.replace_range(..1, "C");
+    if !crate::confirm_brief(yes, &format!("Will {plan}."), &question)? {
+        out!(Out, "aborted.");
         return Ok(());
     }
     // Room on this box first (a fresh pod's home, not measured: a first copy), held against
@@ -205,10 +212,16 @@ pub(crate) async fn handle_baseline(
     if exists {
         let aside = dest.with_file_name(format!("fleet.replaced-{}", arena_core::restore::stamp(now)));
         std::fs::rename(&dest, &aside).with_context(|| format!("moving the old baseline aside to {}", aside.display()))?;
-        println!("(the previous baseline is now {} — delete it yourself when you like)", aside.display());
+        out!(Detail, "(the previous baseline is now {} — delete it yourself when you like)", aside.display());
     }
     std::fs::rename(&partial, &dest).with_context(|| format!("moving the baseline into {}", dest.display()))?;
-    println!(
+    out!(
+        Brief,
+        "{}",
+        out::ok(format!("week {week}'s baseline from {}: {} files, {} → {}", out::bold(&pod.name), kept.kept_files, pull::human_bytes(kept.kept_bytes), dest.display()))
+    );
+    out!(
+        Detail,
         "✓ week {week}'s baseline from {}: {} files, {} that came with the image (in {}); left out {} files, {} written \
          or copied onto it since the container was created. Snapshots from now on hard-link to it.",
         pod.name,

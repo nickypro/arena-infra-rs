@@ -15,7 +15,7 @@ pub(crate) fn warn(f: &FleetFile) {
     let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
     if !said.contains(&f.path) {
         said.push(f.path.clone());
-        eprintln!("{w}");
+        arena_core::out!(Err, "{w}");
     }
 }
 

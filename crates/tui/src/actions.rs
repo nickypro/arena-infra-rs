@@ -12,7 +12,7 @@ use tokio::task::JoinSet;
 use crate::refresh::{claude_path, spend_path};
 use crate::ssh_actions::{build_preview, run_backup, run_set_branch, run_setup, run_ssh_oneline, run_ssh_output, TEST_TIMEOUT, TORCH_TEST_CMD};
 use crate::state::{marked_pods, Action, Confirm};
-use crate::{aikey, runs, selected_pod, InputScope, Mode, Scope, Shared, Ui};
+use crate::{aikey, keytest, runs, selected_pod, InputScope, Mode, Scope, Shared, Ui};
 
 /// Run a pod/fleet action off the UI thread: mark busy, spawn it, and stash the result
 /// in `Shared` for the loop to pick up. This keeps the dashboard live during slow SSH
@@ -333,7 +333,11 @@ pub(crate) async fn execute(
         },
         Action::Backup => run_backup(remote, cfg, pod).await,
         Action::Setup => run_setup(remote, cfg, pod).await,
-        Action::Test => run_ssh_oneline(remote, cfg, pod, TORCH_TEST_CMD, "torch", TEST_TIMEOUT).await,
+        Action::Test => {
+            let torch = run_ssh_oneline(remote, cfg, pod, TORCH_TEST_CMD, "torch", TEST_TIMEOUT);
+            let (torch, keys) = tokio::join!(torch, keytest::check(remote, cfg, pod));
+            keytest::with_keys(torch, keys.as_ref())
+        }
         Action::Run => match arg {
             Some(cmd) if !cmd.trim().is_empty() => run_ssh_output(remote, cfg, pod, cmd).await,
             _ => format!("✗ {name}: no command given"),

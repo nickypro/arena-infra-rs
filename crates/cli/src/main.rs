@@ -46,6 +46,10 @@ mod jobs;
 mod key_limits;
 mod money;
 mod offers;
+#[cfg(test)]
+mod output_test;
+#[cfg(test)]
+mod update_output_tests;
 mod reap;
 mod resolve;
 mod spend;
@@ -128,38 +132,60 @@ use ssh_config::{ssh_config_after, ssh_config_check_row_as};
 /// refusal is an error ([`NoTerminal`], exit status 2): it used to exit 0 after "aborted.",
 /// so a script or cron job couldn't tell "refused" from "done" (finding #25).
 fn confirm(assume_yes: bool, what: &str) -> Result<bool> {
-    use std::io::{IsTerminal, Write};
     if assume_yes {
         return Ok(true);
     }
-    if !std::io::stdin().is_terminal() {
-        eprintln!("{what}");
-        return Err(NoTerminal.into());
+    let answer = ask(what, &format!("{what}\nProceed? [y/N] "))?;
+    Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+/// [`confirm`] as the default output asks it (docs/OUTPUT.md): one line, `question [y/N] `,
+/// the question saying what it acts on and what it costs. With `-v`, `what` — the whole plan —
+/// and `Proceed? [y/N]`, as before. The same answers, `--yes` and refusal without a terminal.
+fn confirm_brief(assume_yes: bool, what: &str, question: &str) -> Result<bool> {
+    if arena_core::out::verbose() {
+        return confirm(assume_yes, what);
     }
-    eprint!("{what}\nProceed? [y/N] ");
-    std::io::stderr().flush().ok();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    if assume_yes {
+        return Ok(true);
+    }
+    let answer = ask(question, &format!("{question} [y/N] "))?;
+    Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
 /// [`confirm`] for what a `y` is too easy for (terminating several machines, or all of them):
 /// `token` (the count, or `ALL`: [`arena_core::selector::set_confirm_token`]) must be typed back,
 /// as the dashboard's marked-set confirm asks. `--yes` still answers it; no terminal refuses.
 fn confirm_typed(assume_yes: bool, what: &str, token: &str) -> Result<bool> {
-    use std::io::{IsTerminal, Write};
     if assume_yes {
         return Ok(true);
     }
+    let answer = ask(what, &format!("{what}\nType {token} to proceed (anything else aborts): "))?;
+    Ok(answer.trim() == token)
+}
+
+/// `prompt` on stderr and the line typed back. With no terminal to ask at, `what` is said and
+/// the answer is [`NoTerminal`]; a test capturing the output ([`arena_core::out::capture`])
+/// answers as it scripted, and refuses the same way when it scripted nothing.
+fn ask(what: &str, prompt: &str) -> Result<String> {
+    use std::io::{IsTerminal, Write};
+    use arena_core::out::{self, To};
+    out::end_progress();
+    if out::capturing() {
+        return out::ask(&out::strip(prompt)).ok_or_else(|| {
+            out::emit(To::Err, what);
+            NoTerminal.into()
+        });
+    }
     if !std::io::stdin().is_terminal() {
-        eprintln!("{what}");
+        out::emit(To::Err, what);
         return Err(NoTerminal.into());
     }
-    eprint!("{what}\nType {token} to proceed (anything else aborts): ");
+    eprint!("{}", out::for_stream(To::Err, prompt));
     std::io::stderr().flush().ok();
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
-    Ok(line.trim() == token)
+    Ok(line)
 }
 
 /// The refusal [`confirm`] fails with when there's no terminal to ask at and no `--yes`.
@@ -214,13 +240,14 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<St
     let client = up::client();
     let found = up::check(&client, up::REPO_API, installed, CHANGELOG).await.map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
     if !found.newer {
-        println!("arena {installed} is up to date (the latest release is {}).", found.release.tag);
+        arena_core::out!(Out, "arena {installed} is up to date (the latest release is {}).", found.release.tag);
         return Ok(());
     }
-    println!("Update available: arena {installed} → {} ({})", found.release.version, found.release.tag);
+    arena_core::out!(Out, "Update available: arena {installed} → {} ({})", arena_core::out::bold(found.release.version), found.release.tag);
     if check_only {
-        println!("What changed, from the release's CHANGELOG.md (not verified: `arena update --dry-run` verifies it):\n");
-        print!("{}", found.changes);
+        arena_core::out!(Detail, "What changed, from the release's CHANGELOG.md (not verified: `arena update --dry-run` verifies it):\n");
+        arena_core::out!(Brief, "What changed (not verified; -v: each entry in full):");
+        say_changes(&found.changes);
         return Err(UpdateAvailable.into());
     }
     // Where this binary really is (`/usr/local/bin/arena` is a link into ~/.cargo/bin on prod).
@@ -234,29 +261,35 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<St
     let pinned = pins.is_some();
     let provenance = match pins {
         Some(pins) => {
-            eprintln!("\n{SKIP_ATTESTATION_WARNING}");
+            arena_core::out!(Err, "\n{SKIP_ATTESTATION_WARNING}");
             up::Provenance::Pinned(pins)
         }
         None => up::Provenance::Verify { source: &github, expected: attest::RELEASE },
     };
-    println!("\nDownloading {} for {target} …", found.release.tag);
+    arena_core::out!(Detail, "");
+    arena_core::out!(Out, "Downloading {} for {target} …", found.release.tag);
     let staged = up::fetch(&client, &found.release, target, dir, &provenance).await.map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
     // The changelog is shown only now, with what can be said of it: before, it was the
     // release's word alone, and its "Action needed" lines are instructions to an operator.
     let changelog = up::changelog_provenance(staged.proof.as_ref(), found.changelog_sha256.as_deref()).map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
     match &staged.proof {
         Some(proof) => {
-            println!("Both binaries match the release's SHA256SUMS, and one build-provenance attestation names both");
-            println!("(Sigstore, verified here): {proof}.");
+            arena_core::out!(Detail, "Both binaries match the release's SHA256SUMS, and one build-provenance attestation names both");
+            arena_core::out!(Detail, "(Sigstore, verified here): {proof}.");
+            arena_core::out!(Brief, "{}", arena_core::out::ok("verified: SHA256SUMS and the build-provenance attestation (Sigstore); it runs here"));
         }
-        None => println!("Both binaries match the release's SHA256SUMS and the SHA-256s given (provenance NOT checked here)."),
+        None => {
+            arena_core::out!(Detail, "Both binaries match the release's SHA256SUMS and the SHA-256s given (provenance NOT checked here).");
+            arena_core::out!(Brief, "{}", arena_core::out::warn("SHA256SUMS and the SHA-256s given match — provenance NOT checked here; it runs here"));
+        }
     }
-    println!("The new arena runs here.");
-    println!("\nWhat changed, from the release's CHANGELOG.md ({changelog}):\n");
-    print!("{}", found.changes);
-    println!();
+    arena_core::out!(Detail, "The new arena runs here.");
+    arena_core::out!(Detail, "\nWhat changed, from the release's CHANGELOG.md ({changelog}):\n");
+    arena_core::out!(Brief, "What changed ({changelog}; -v: each entry in full):");
+    say_changes(&found.changes);
+    arena_core::out!(Detail, "");
     if dry_run {
-        println!("--dry-run: nothing installed.");
+        arena_core::out!(Out, "--dry-run: nothing installed.");
         return Ok(());
     }
     let what = format!(
@@ -265,13 +298,13 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<St
         if pinned { " (provenance NOT checked here)" } else { "" },
         dir.display()
     );
-    if !confirm(yes, &what)? {
-        println!("Not installed.");
+    if !confirm_brief(yes, &what, &what)? {
+        arena_core::out!(Out, "Not installed.");
         return Ok(());
     }
     staged.install().map_err(|e| anyhow::anyhow!("update: {}", up::printable(&e)))?;
-    println!("Installed arena {} in {}.", found.release.version, dir.display());
-    println!("Roll back: cd {} && mv -f arena.prev arena && mv -f arena-tui.prev arena-tui", dir.display());
+    arena_core::out!(Out, "{}", arena_core::out::ok(format!("Installed arena {} in {}.", arena_core::out::bold(found.release.version), dir.display())));
+    arena_core::out!(Out, "Roll back: cd {} && mv -f arena.prev arena && mv -f arena-tui.prev arena-tui", dir.display());
     let stale = up::stale_processes(std::path::Path::new("/proc"), &dir.join("arena-tui"));
     if !stale.is_empty() {
         let started = |t: Option<std::time::SystemTime>| {
@@ -279,9 +312,32 @@ async fn handle_update(check_only: bool, dry_run: bool, skip_attestation: Vec<St
                 .map_or_else(|| "start unknown".into(), |d| format!("started {}", arena_core::snapshot::rfc3339(d.as_secs())))
         };
         let list: Vec<String> = stale.iter().map(|(pid, t)| format!("pid {pid} ({})", started(*t))).collect();
-        println!("{} dashboard(s) still run the old build — restart them: {}", stale.len(), list.join(", "));
+        arena_core::out!(Out, "{}", arena_core::out::warn(format!("{} dashboard(s) still run the old build — restart them: {}", stale.len(), list.join(", "))));
     }
     Ok(())
+}
+
+/// `update`'s changelog of the release ([`arena_core::update::describe_changes`]): in full at
+/// `-v`; by default its action-needed and config lines, then each entry's heading alone.
+fn say_changes(changes: &str) {
+    changes.lines().for_each(|l| arena_core::out!(Detail, "{l}"));
+    brief_changes(changes).iter().for_each(|l| arena_core::out!(Brief, "{l}"));
+}
+
+/// [`say_changes`]'s default lines: what comes before the first entry (`Action needed:`,
+/// `Config changes:`, their bullets), then `  · HEADING` per entry. Pure.
+fn brief_changes(changes: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut entries = false;
+    for l in changes.lines() {
+        if let Some(h) = l.strip_prefix("## ") {
+            entries = true;
+            out.push(format!("  · {h}"));
+        } else if !entries && !l.trim().is_empty() {
+            out.push(l.to_string());
+        }
+    }
+    out
 }
 
 /// What `main` ends with for `result`: success, [`NO_TERMINAL_EXIT`] for a refused
@@ -376,12 +432,14 @@ impl Interrupt {
 async fn main() -> std::process::ExitCode {
     let result = run().await;
     unstage_hetzner_script(&std::env::temp_dir());
+    arena_core::out::end_progress();
     if let Err(e) = &result {
         match e.downcast_ref::<reap::ReapExit>() {
             // Already said in the reaper's own words.
             Some(r) => eprintln!("{}", r.why),
-            // As `fn main() -> Result` printed it (the error and its causes).
-            None => eprintln!("Error: {e:?}"),
+            // As `fn main() -> Result` printed it (the error and its causes); `Error:` in red
+            // on a terminal.
+            None => arena_core::out::emit(arena_core::out::To::Err, &format!("{} {e:?}", arena_core::out::red(arena_core::out::bold("Error:")))),
         }
     }
     exit_code(&result)
@@ -389,6 +447,8 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<()> {
     let (cli, provider_named) = help::parse();
+    // `-v` and `--color`, for every line the run prints (docs/OUTPUT.md).
+    arena_core::out::init(cli.verbose, cli.color.parse().unwrap_or_default());
     // Before the config: an update needs none, and must work where it's broken.
     if let Cmd::Update { check, dry_run, skip_attestation } = cli.cmd {
         return handle_update(check, dry_run, skip_attestation, cli.yes).await;
@@ -454,17 +514,21 @@ async fn run() -> Result<()> {
         Cmd::Keys(k) => handle_keys(k, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Claude(c) => claude::handle_claude(c, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Teardown { check, json } => teardown::handle_teardown(provider.unwrap().as_ref(), &cfg, check, json).await,
-        Cmd::Balance { cmd, json, check, no_live, verbose } => {
+        Cmd::Balance { cmd, json, check, no_live } => {
             let bal = money::BalanceCtx::from_config(&cfg);
             let now = arena_core::snapshot::unix_now();
             if let Some(BalanceCmd::Set { account, usd }) = cmd {
                 print!("{}", money::balance_set(&cfg, &bal, account, usd, now)?);
                 return Ok(());
             }
-            let flags = money::BalanceFlags { json, check, no_live, verbose };
+            let flags = money::BalanceFlags { json, check, no_live, verbose: cli.verbose };
             let out = money::balance_report(provider.unwrap().as_ref(), &cfg, &bal, flags, now).await?;
-            out.stderr.iter().for_each(|l| eprintln!("{l}"));
-            print!("{}", out.stdout);
+            out.stderr.iter().for_each(|l| arena_core::out!(Err, "{l}"));
+            if json {
+                print!("{}", out.stdout);
+            } else {
+                out.stdout.lines().for_each(|l| arena_core::out!(Out, "{l}"));
+            }
             if out.code != 0 {
                 use std::io::Write;
                 std::io::stdout().flush()?;
@@ -483,18 +547,22 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
             let keys = openrouter_client(&cfg);
-            let flags = spend::SpendFlags { by_machine: by == "machine", since, csv, json };
+            let flags = spend::SpendFlags { by_machine: by == "machine", since, csv, json, verbose: arena_core::out::verbose() };
             let out = spend::spend_report(fleet.as_ref(), &cfg, &ctx, keys.as_ref().map(|k| k as &dyn arena_core::openrouter::KeyApi), &flags, now).await?;
-            out.stderr.iter().for_each(|l| eprintln!("{l}"));
-            print!("{}", out.stdout);
+            out.stderr.iter().for_each(|l| arena_core::out!(Err, "{l}"));
+            if flags.json || flags.csv {
+                print!("{}", out.stdout);
+            } else {
+                out.stdout.lines().for_each(|l| arena_core::out!(Out, "{l}"));
+            }
             Ok(())
         }
         Cmd::Gpus { json } => offers::handle_gpus(&cfg, &provider_name, json).await,
         Cmd::Api(c) => handle_api(c, &cfg).await,
-        Cmd::Offers { view, gpu, cloud, max_price, gpus, server_type, order, all, verbose, json } => {
+        Cmd::Offers { view, gpu, cloud, max_price, gpus, server_type, order, all, json } => {
             let flags = offers::Flags { gpu, cloud, max_price, gpus, server_type, order };
             let view = if all { Some("all") } else { view.as_deref() };
-            offers::handle_offers(&cfg, provider_named.then_some(provider_name.as_str()), view, flags, json, verbose).await
+            offers::handle_offers(&cfg, provider_named.then_some(provider_name.as_str()), view, flags, json, cli.verbose).await
         }
     }
 }
@@ -512,7 +580,7 @@ async fn handle_api(cmd: ApiCmd, cfg: &Config) -> Result<()> {
                 .get(base.key)
                 .filter(|k| !k.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("{} isn't set (see `arena config check`)", base.key))?;
-            eprintln!("GET {url} ({}{})", base.provider, if raw { ", raw" } else { ", secrets redacted" });
+            arena_core::out!(ErrDetail, "GET {url} ({}{})", base.provider, if raw { ", raw" } else { ", secrets redacted" });
             let (status, body) = apiget::get_for(&base, url.clone(), key).await?;
             if limits {
                 // Counts only — the headers carry no secret, and the body isn't printed.

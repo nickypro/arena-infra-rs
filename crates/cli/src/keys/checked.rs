@@ -108,6 +108,29 @@ fn short<'a>(naming: &Naming, host: &'a str) -> &'a str {
     host.strip_prefix(naming.prefix).and_then(|s| s.strip_prefix('-')).filter(|s| !s.is_empty()).unwrap_or(host)
 }
 
+/// What OpenRouter's listing says of each keys-CSV row's OpenRouter key, found by its redacted
+/// label as [`stale`] finds it: there and enabled, paused, or gone — for the AI-key check, which
+/// from the machine gets the same 401 for a paused key as for a deleted one (live, 2026-11-02),
+/// and so can't tell `keys resume` from `keys rotate` itself. A row the labels can't place is
+/// left out. Pure.
+pub(crate) fn listed_states(
+    keys: &KeySources,
+    naming: &Naming,
+    listed: &[KeyInfo],
+) -> std::collections::BTreeMap<String, arena_core::health::Listed> {
+    use arena_core::health::Listed;
+    keys.per_host
+        .keys()
+        .filter_map(|host| {
+            let secret = keys.openrouter_secret(host)?;
+            if let Some(k) = listed.iter().find(|k| label_says(k.label.as_deref(), secret) == Some(true)) {
+                return Some((host.clone(), if k.disabled { Listed::Paused } else { Listed::Live }));
+            }
+            stale(naming, host, secret, listed).map(|_| (host.clone(), Listed::Gone))
+        })
+        .collect()
+}
+
 /// OpenRouter's listing for a check, read within [`LIST_TIMEOUT`]: `None` without a
 /// provisioning key (nothing to check against), `Some(Err)` when it couldn't be read.
 pub(crate) async fn list_for_check(api: Option<&dyn KeyApi>) -> Option<Result<Vec<KeyInfo>, String>> {

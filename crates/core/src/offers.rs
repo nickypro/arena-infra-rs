@@ -741,14 +741,7 @@ pub fn render_rows(rows: &[CatalogRow]) -> String {
 /// A catalogue as `arena offers <provider>` prints it: a heading, the table (Hetzner's server
 /// types grouped, [`render_server_types`]), then its notes on one line each. Pure.
 pub fn render_catalog(c: &Catalog, configured_server_type: &str) -> String {
-    let what = match c.provider.as_str() {
-        "runpod" => "GPU types on every tier".to_string(),
-        "vast" => "GPUs on the market now, the cheapest offer per host class".to_string(),
-        "hetzner" => "server types".to_string(),
-        _ => "no list".to_string(),
-    };
-    let per = if c.gpu_count > 1 && c.provider != "hetzner" { format!(" (for {}-GPU pods)", c.gpu_count) } else { String::new() };
-    let mut out = format!("{} — {what}{per}\n", c.provider);
+    let mut out = catalog_heading(c);
     match (&c.server_types, c.rows.is_empty()) {
         (Some(types), _) => out.push_str(&render_server_types(types, configured_server_type)),
         (None, false) => out.push_str(&render_rows(&c.rows)),
@@ -757,6 +750,67 @@ pub fn render_catalog(c: &Catalog, configured_server_type: &str) -> String {
     }
     for n in &c.notes {
         out.push_str(&format!("{n}\n"));
+    }
+    out
+}
+
+/// `runpod — GPU types on every tier`: what a catalogue lists, and for how many GPUs.
+fn catalog_heading(c: &Catalog) -> String {
+    let what = match c.provider.as_str() {
+        "runpod" => "GPU types on every tier".to_string(),
+        "vast" => "GPUs on the market now, the cheapest offer per host class".to_string(),
+        "hetzner" => "server types".to_string(),
+        _ => "no list".to_string(),
+    };
+    let per = if c.gpu_count > 1 && c.provider != "hetzner" { format!(" (for {}-GPU pods)", c.gpu_count) } else { String::new() };
+    format!("{} — {what}{per}\n", c.provider)
+}
+
+/// A row nobody can buy now: sold on no tier (`not sold now`), or a type RunPod's create
+/// rejects (`v1: not creatable`). A `None` stock is not one: RunPod's hint misses pools that
+/// still take pods (finding #31).
+pub fn unbuyable(row: &CatalogRow) -> bool {
+    matches!(row.note.as_deref(), Some("not sold now" | "v1: not creatable"))
+}
+
+/// A catalogue note that says something went wrong — a search that failed, a list that
+/// couldn't be read, no plan to mark `#` with: the default output keeps it.
+fn trouble(note: &str) -> bool {
+    ["failed", "couldn't", "can't"].iter().any(|w| note.contains(w))
+}
+
+/// [`render_catalog`] as the default output prints it (docs/OUTPUT.md): the heading and the
+/// table without the rows nobody can buy ([`unbuyable`]); the notes that say something went
+/// wrong; then one line — the `#` legend, and what `-v` adds (the other notes, the rows left
+/// out). Pure.
+pub fn render_catalog_brief(c: &Catalog, configured_server_type: &str) -> String {
+    let mut out = catalog_heading(c);
+    let shown: Vec<CatalogRow> = c.rows.iter().filter(|r| !unbuyable(r)).cloned().collect();
+    let hidden = c.rows.len() - shown.len();
+    match (&c.server_types, shown.is_empty()) {
+        (Some(types), _) => out.push_str(&render_server_types(types, configured_server_type)),
+        (None, false) => out.push_str(&render_rows(&shown)),
+        (None, true) if hidden > 0 => out.push_str("(nothing on sale now)\n"),
+        (None, true) if c.provider == "runpod" || c.provider == "vast" => out.push_str("(nothing matches)\n"),
+        (None, true) => {}
+    }
+    // A provider with no list (Shadeform): its note is what there is to say.
+    let listless = !matches!(c.provider.as_str(), "runpod" | "vast" | "hetzner");
+    let (said, rest): (Vec<&String>, Vec<&String>) = c.notes.iter().partition(|n| listless || trouble(n));
+    said.iter().for_each(|n| out.push_str(&format!("{n}\n")));
+    let legend = rest.iter().find_map(|n| n.strip_prefix("# = ")).map(|l| format!("# = {}", l.split(" · ").next().unwrap_or(l)));
+    let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut more = Vec::new();
+    if !rest.is_empty() {
+        more.push(count(rest.len(), "note", "notes"));
+    }
+    if hidden > 0 {
+        more.push(format!("{hidden} not on sale"));
+    }
+    let more = (!more.is_empty()).then(|| format!("-v: {}", more.join(", ")));
+    let foot: Vec<String> = legend.into_iter().chain(more).collect();
+    if !foot.is_empty() {
+        out.push_str(&format!("{}\n", foot.join(" · ")));
     }
     out
 }
@@ -1209,6 +1263,68 @@ mod tests {
         assert!(vast_rows(&market, 2, Host::Unverified, None, &f)[0].note.is_none(), "allowed: no note");
         let f = RowFilter { gpus: Some(vec!["3090".into()]), gpu_count: 2, ..RowFilter::default() };
         assert!(vast_rows(&market, 2, Host::Verified, None, &f).is_empty());
+    }
+
+    /// Golden (docs/OUTPUT.md): `offers runpod` by default keeps its table but the rows nobody
+    /// can buy (not sold on any tier; `v1: not creatable`), and its notes become one line — the
+    /// `#` legend and what `-v` adds; a note that something failed stays. A `None` stock stays
+    /// (finding #31). `-v` prints [`render_catalog`], as before.
+    #[test]
+    fn a_catalogue_by_default_drops_what_nobody_can_buy_and_folds_its_notes() {
+        let book = PriceBook::runpod(Vec::new());
+        let req = Request::from_flags(Some("A4000"), Some("secure,community"), &PodSpec::from_config(&crate::config::Config::parse("")), None, Order::Listed).unwrap();
+        let plan = plan_options(&req, "runpod", &book);
+        let mut cat = live_catalog();
+        cat.rows[3].creatable = Some(false); // B300: listed, but RunPod v1's create rejects it
+        let all = RowFilter { gpu_count: 1, ..RowFilter::default() };
+        let notes = vec![
+            "# = what `up` would try · unlisted = not in RunPod's public catalog: --gpu takes it, RunPod's create decides".to_string(),
+            "Not listed: RunPod's CPU pods (arena creates GPU pods only)".to_string(),
+        ];
+        let c = Catalog { provider: "runpod".into(), gpu_count: 1, rows: runpod_rows(&cat, &[], Some(&plan), &all), notes, ..Catalog::default() };
+        assert_eq!(
+            render_catalog_brief(&c, ""),
+            "\
+runpod — GPU types on every tier
+#  GPU                VRAM  CLOUD      PER GPU  STOCK  --gpu
+2  RTX A4000           16G  COMMUNITY  $0.17/h  None   NVIDIA RTX A4000
+1  RTX A4000           16G  SECURE     $0.25/h  Low    NVIDIA RTX A4000
+   PRO 6000 MIG 24GB   24G  SECURE     $0.69/h  Low    NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb
+# = what `up` would try · -v: 2 notes, 3 not on sale
+"
+        );
+        assert_eq!(
+            render_catalog(&c, ""),
+            "\
+runpod — GPU types on every tier
+#  GPU                VRAM  CLOUD      PER GPU  STOCK  NOTE               --gpu
+   Old                  8G  -                ?  -      not sold now       NVIDIA Old
+2  RTX A4000           16G  COMMUNITY  $0.17/h  None                      NVIDIA RTX A4000
+1  RTX A4000           16G  SECURE     $0.25/h  Low                       NVIDIA RTX A4000
+   PRO 6000 MIG 24GB   24G  SECURE     $0.69/h  Low                       NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb
+   B300               288G  COMMUNITY  $6.94/h  High   v1: not creatable  NVIDIA B300 SXM6 AC
+   B300               288G  SECURE     $8.99/h  Low    v1: not creatable  NVIDIA B300 SXM6 AC
+# = what `up` would try · unlisted = not in RunPod's public catalog: --gpu takes it, RunPod's create decides
+Not listed: RunPod's CPU pods (arena creates GPU pods only)
+"
+        );
+        // A note that says something failed stays by default; a provider with no list keeps its
+        // note (it's all there is); Hetzner's table and footer are as they were.
+        let vast = Catalog {
+            provider: "vast".into(),
+            gpu_count: 1,
+            notes: vec!["vast: searching verified hosts failed (HTTP 429)".into(), "# = what `up` would rent · cheapest offer now per class".into()],
+            ..Catalog::default()
+        };
+        assert_eq!(
+            render_catalog_brief(&vast, ""),
+            "vast — GPUs on the market now, the cheapest offer per host class\n(nothing matches)\n\
+             vast: searching verified hosts failed (HTTP 429)\n# = what `up` would rent · -v: 1 note\n"
+        );
+        let sf = Catalog { provider: "shadeform".into(), gpu_count: 1, notes: vec![no_catalog("shadeform")], ..Catalog::default() };
+        assert_eq!(render_catalog_brief(&sf, ""), render_catalog(&sf, ""));
+        let h = Catalog { provider: "hetzner".into(), gpu_count: 1, server_types: Some(vec![cx23()]), ..Catalog::default() };
+        assert_eq!(render_catalog_brief(&h, "cx23"), render_catalog(&h, "cx23"));
     }
 
     /// A catalogue's text: heading, table, notes; Hetzner's grouped; `--json` as documented.

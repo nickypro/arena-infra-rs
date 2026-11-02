@@ -1,11 +1,11 @@
-//! `pods test` (torch, or `--deep` GPU checks) and the health cache it writes for `snapshot`, `up`
-//! and `config check`.
+//! `pods test` (torch, `--deep` GPU checks, or `--keys`: the machines' AI keys alone) and the
+//! health cache `--deep` writes for `snapshot`, `up` and `config check`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use arena_core::health::judge_deep_call;
+use arena_core::health::{judge_deep_call, judge_key_call, KeyBook};
 use arena_core::provider::Provider;
 use arena_core::remote::Remote;
 use arena_core::ssh::SshTarget;
@@ -32,16 +32,16 @@ pub(crate) async fn handle_deep_test(
     use arena_core::health::Status;
     let results = deep_check_fleet(provider, &remote, cfg, sel).await?;
     let (stdout, stderr) = render_deep_test(&results, json, verbose)?;
-    print!("{stdout}");
+    say_stdout(&stdout, json);
     for line in stderr {
-        eprintln!("{line}");
+        arena_core::out!(Err, "{line}");
     }
     // For `arena snapshot` (and the dashboard): remember each verdict with its time. One more
     // read-only list (each backend bounded) lets the cache drop pods since terminated.
     if !results.is_empty() && health_cache_path(cfg).is_some() {
         let listing = arena_core::proxy::Listing::from_results(provider.list_by_provider().await);
         if let Some(warning) = record_health(cfg, &results, Some(&listing)) {
-            eprintln!("{warning}");
+            arena_core::out!(Err, "{warning}");
         }
     }
     let failed = results.iter().filter(|h| h.status == Status::Fail).count();
@@ -52,9 +52,9 @@ pub(crate) async fn handle_deep_test(
     if let Some(h) = &box_health {
         for line in &h.lines {
             if json {
-                eprintln!("{line}");
+                arena_core::out!(Err, "{line}");
             } else {
-                println!("{line}");
+                arena_core::out!(Out, "{line}");
             }
         }
     }
@@ -69,6 +69,67 @@ pub(crate) async fn handle_deep_test(
         (n, None) => anyhow::bail!("{n} pod(s) failed the deep check"),
         (n, Some(r)) => anyhow::bail!("{n} pod(s) failed the deep check; {r}"),
     }
+}
+
+/// `pods test --keys`: only the machines' AI keys (their OpenRouter key and HF token: there,
+/// accepted, the keys CSV's / config's — `arena_core::health` `aikeys`), a few seconds per
+/// machine and no GPU work. The `NAME RESULT AI KEY HF NOTES` table (or JSON); fails the command
+/// if any FAILs. Not recorded in the health cache, which holds each machine's last full check.
+pub(crate) async fn handle_keys_test(remote: Arc<dyn Remote>, cfg: &Config, sel: &Selected, json: bool, verbose: bool) -> Result<()> {
+    use arena_core::health::Status;
+    let results = check_fleet(None, &remote, cfg, sel, Kind::Keys).await?;
+    let (stdout, stderr) = render_keys_test(&results, json, verbose)?;
+    say_stdout(&stdout, json);
+    for line in stderr {
+        arena_core::out!(Err, "{line}");
+    }
+    match results.iter().filter(|h| h.status == Status::Fail).count() {
+        0 => Ok(()),
+        n => anyhow::bail!("{n} pod(s) failed the key check"),
+    }
+}
+
+/// What `pods test --keys` prints, as [`render_deep_test`] (JSON on stdout, `[]` for none).
+pub(crate) fn render_keys_test(results: &[arena_core::health::PodHealth], json: bool, verbose: bool) -> Result<(String, Vec<String>)> {
+    use arena_core::health::{render_key_report, render_summary};
+    const NONE: &str = "(no pods with an SSH endpoint)";
+    Ok(match (json, results.is_empty()) {
+        (true, true) => ("[]\n".into(), vec![NONE.into()]),
+        (true, false) => (format!("{}\n", serde_json::to_string_pretty(results)?), render_summary(results)),
+        (false, true) => (format!("{NONE}\n"), vec![]),
+        (false, false) => (render_key_report(results, verbose), vec![]),
+    })
+}
+
+/// A report's stdout, line by line ([`arena_core::out`]); `--json`'s as it is.
+fn say_stdout(stdout: &str, json: bool) {
+    if json {
+        print!("{stdout}");
+    } else {
+        stdout.lines().for_each(|l| arena_core::out!(Out, "{l}"));
+    }
+}
+
+/// What the AI-key checks hold machines to: the fleet's keys CSVs and `HF_TOKEN`, and the owners
+/// in its spend ledger (none under this crate's unit tests unless the test's config sets
+/// `ARENA_STATE_DIR`, as `SpendCtx`).
+pub(crate) fn key_book(cfg: &Config) -> KeyBook {
+    KeyBook::load(cfg, crate::spend::SpendCtx::from_config(cfg).path())
+}
+
+/// What OpenRouter's listing says of the keys CSV's keys ([`crate::keys::listed_states`]: there,
+/// paused or gone) — so a rejected key's verdict names its fix — when a provisioning key is set
+/// and the CSV has OpenRouter rows; `None` otherwise, or when the listing couldn't be read in its
+/// bound (the verdict then names both fixes).
+pub(crate) async fn key_listing(cfg: &Config) -> Option<std::collections::BTreeMap<String, arena_core::health::Listed>> {
+    let keys = crate::keys::KeySources::load(cfg, &crate::keys::keys_dir(cfg), None);
+    let hosts: Vec<String> = keys.per_host.keys().filter(|h| keys.openrouter_secret(h).is_some()).cloned().collect();
+    if hosts.is_empty() {
+        return None;
+    }
+    let api = crate::keys::openrouter_client(cfg)?;
+    let listed = crate::keys::list_for_check(Some(&api as &dyn arena_core::openrouter::KeyApi)).await?.ok()?;
+    Some(crate::keys::listed_states(&keys, &arena_core::selector::Naming::from_config(cfg), &listed))
 }
 
 /// Where this fleet's health cache lives ([`arena_core::snapshot::health_cache_path`]):
@@ -138,13 +199,43 @@ pub(crate) async fn deep_check_fleet(
     cfg: &Config,
     sel: &Selected,
 ) -> Result<Vec<arena_core::health::PodHealth>> {
-    use arena_core::health::{deep_check_command, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT};
-    // Config first: a malformed MIN_DRIVER_VERSION fails before any pod is touched.
-    let policy = HealthPolicy::from_config(cfg)?;
+    check_fleet(Some(provider), remote, cfg, sel, Kind::Deep).await
+}
+
+/// Which check a fleet run makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// The deep check (its AI keys included), with the provider's maintenance windows.
+    Deep,
+    /// The AI keys only: the script's `keys` mode, judged by `judge_key_call` — and nothing
+    /// looked up from the provider (no details call to wait on).
+    Keys,
+}
+
+/// [`deep_check_fleet`], or the keys-only run of the same shape ([`Kind`]).
+pub(crate) async fn check_fleet(
+    provider: Option<&dyn Provider>,
+    remote: &Arc<dyn Remote>,
+    cfg: &Config,
+    sel: &Selected,
+    kind: Kind,
+) -> Result<Vec<arena_core::health::PodHealth>> {
+    use arena_core::health::{deep_check_command, key_check_command, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT, KEY_CHECK_TIMEOUT};
+    // Config first: a malformed MIN_DRIVER_VERSION fails before any pod is touched (a keys-only
+    // run judges no driver).
+    let policy = match kind {
+        Kind::Deep => HealthPolicy { keys: Some(key_book(cfg)), ..HealthPolicy::from_config(cfg)? },
+        Kind::Keys => HealthPolicy { keys: Some(key_book(cfg)), ..HealthPolicy::default() },
+    };
+    let (budget, judge): (_, fn(&arena_core::Pod, PodCall, &HealthPolicy) -> PodHealth) = match kind {
+        Kind::Deep => (DEEP_CHECK_TIMEOUT, judge_deep_call),
+        Kind::Keys => (KEY_CHECK_TIMEOUT, judge_key_call),
+    };
     let mut pods = sel.pods.clone();
     pods.sort_by(|a, b| a.name.cmp(&b.name));
     for (name, ids) in duplicate_names(&pods) {
-        eprintln!(
+        arena_core::out!(
+            Err,
             "warning: {} pods are named {name} (ids {}) — each is checked and reported separately",
             ids.len(),
             ids.join(", ")
@@ -161,7 +252,11 @@ pub(crate) async fn deep_check_fleet(
     }
     // `CONDA_ENV=""` disables activation (like `pods run`); python is then whatever the
     // rc puts on PATH.
-    let cmd = deep_check_command(Some(cfg.get("CONDA_ENV").unwrap_or("arena-env")));
+    let conda = Some(cfg.get("CONDA_ENV").unwrap_or("arena-env"));
+    let cmd = match kind {
+        Kind::Deep => deep_check_command(conda),
+        Kind::Keys => key_check_command(conda),
+    };
     let mut jobs = Vec::new();
     let mut slots = Vec::with_capacity(pods.len());
     for (i, pod) in pods.iter().enumerate() {
@@ -174,36 +269,52 @@ pub(crate) async fn deep_check_fleet(
             }
             None if sel.named => Slot::NoEndpoint,
             None if arena_core::status::is_stopped(&pod.status) => {
-                eprintln!("{}", stopped_skip(pod));
+                arena_core::out!(Err, "{}", stopped_skip(pod));
                 Slot::Skipped
             }
             None => {
                 let why = arena_core::fleet::no_endpoint_reason(pod).unwrap_or_else(|| "no SSH endpoint yet".into());
-                eprintln!("skip {} — {why}", pod.name);
+                arena_core::out!(Err, "skip {} — {why}", pod.name);
                 Slot::Skipped
             }
         });
     }
     if !jobs.is_empty() {
-        eprintln!(
-            "Deep-checking {} pod(s) ({}s budget each)…",
-            jobs.len(),
-            DEEP_CHECK_TIMEOUT.as_secs()
-        );
+        let what = match kind {
+            Kind::Deep => "Deep-checking",
+            Kind::Keys => "Checking the AI keys of",
+        };
+        arena_core::out!(Err, "{what} {} pod(s) ({}s budget each)…", jobs.len(), budget.as_secs());
     }
     let mut calls: std::collections::HashMap<usize, PodCall> = std::collections::HashMap::new();
-    let probe = exec_each_pod(remote, jobs, DEEP_CHECK_TIMEOUT, |done, total, (i, name), call| {
+    // A pod checked is a line at `-v`; by default a terminal counts them in place, and only a
+    // failure is a line of its own.
+    let _progress = arena_core::out::progress_guard("test");
+    let probe = exec_each_pod(remote, jobs, budget, |done, total, (i, name), call| {
         match &call {
-            Ok(out) if out.success => eprintln!("[{done}/{total}] {name}: checked"),
-            failed => eprintln!("{}", failure_line(done, total, name, failed)),
+            Ok(out) if out.success => arena_core::out!(ErrDetail, "[{done}/{total}] {name}: checked"),
+            failed => arena_core::out!(Err, "{}", failure_line(done, total, name, failed)),
         }
+        arena_core::out::progress("test", Some(&format!("checked {done} of {total}")));
         calls.insert(*i, call);
     });
     // `enrich` fills fields in place (a slice: it can't add, drop or move pods), so the
     // indices the jobs carry still point at the same pods afterwards.
-    let (warning, ()) = tokio::join!(enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT), probe);
-    if let Some(warning) = warning {
-        eprintln!("{warning}");
+    // OpenRouter's listing alongside (one bounded read, when there's a provisioning key): what
+    // tells a paused key from a deleted one.
+    let listed = match provider {
+        Some(provider) => {
+            let (warning, (), listed) = tokio::join!(enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT), probe, key_listing(cfg));
+            if let Some(warning) = warning {
+                arena_core::out!(Err, "{warning}");
+            }
+            listed
+        }
+        None => tokio::join!(probe, key_listing(cfg)).1,
+    };
+    let mut policy = policy;
+    if let Some(book) = policy.keys.as_mut() {
+        book.listed = listed;
     }
 
     let mut results = Vec::new();
@@ -227,7 +338,7 @@ pub(crate) async fn deep_check_fleet(
             results.push(PodHealth::unreachable(pod, "no result from the check"));
             continue;
         };
-        results.push(judge_deep_call(pod, call, &policy));
+        results.push(judge(pod, call, &policy));
     }
     Ok(results)
 }

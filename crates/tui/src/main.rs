@@ -45,6 +45,7 @@ mod detail;
 mod event_loop;
 mod info;
 mod input;
+mod keytest;
 mod lag;
 mod modals;
 mod newpod;

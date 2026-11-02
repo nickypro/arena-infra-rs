@@ -1451,7 +1451,7 @@ async fn pods_test_and_pods_run_carry_their_budgets_through_the_command() {
     let fake = Arc::new(FakeRemote::new());
     fake.script(&host(22003), [FakeReply::hang()]);
     let start = Instant::now();
-    let plain = PodCmd::Test { deep: false, sel: Select::default(), json: false, verbose: false, cohort: crate::cli::CohortScope::default() };
+    let plain = PodCmd::Test { deep: false, keys: false, sel: Select::default(), json: false, cohort: crate::cli::CohortScope::default() };
     let err = handle_pods(plain, &fleet(), fake.clone(), &cfg(), true).await.unwrap_err();
     assert_eq!(err.to_string(), "1 pod(s) failed");
     assert_eq!(start.elapsed(), TEST_TIMEOUT);
@@ -1506,7 +1506,7 @@ async fn backup_classifies_each_pods_reply_and_a_wedged_pod_fails_at_the_budget(
     let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
     let mut lines = Vec::new();
     let start = Instant::now();
-    let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
+    let tally = backup_fleet(&remote, jobs, REPO, |to: arena_core::out::To, l: &str| if to.shows(true) { lines.push(l.to_string()) }, |_| {}).await;
     let on_main = vec![("devtest-delta".to_string(), "main".to_string())];
     let failed = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: None, at_push: false, wrong_origin: false, busy: None };
     assert_eq!(
@@ -1780,7 +1780,7 @@ async fn a_key_left_after_the_redaction_fails_at_the_push_and_is_copied() {
     let remote: Arc<dyn Remote> = fake.clone();
     let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
     let mut lines = Vec::new();
-    let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
+    let tally = backup_fleet(&remote, jobs, REPO, |to: arena_core::out::To, l: &str| if to.shows(true) { lines.push(l.to_string()) }, |_| {}).await;
     assert_eq!(
         lines,
         ["[1/1] ✗ devtest-bloom: a key is still in the unpushed commits of autocommit-b after the redaction — in a commit's \
@@ -1831,7 +1831,7 @@ async fn a_pod_whose_origin_isnt_the_configured_repo_fails_says_how_to_fix_it_an
     let remote: Arc<dyn Remote> = fake.clone();
     let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
     let mut lines = Vec::new();
-    let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
+    let tally = backup_fleet(&remote, jobs, REPO, |to: arena_core::out::To, l: &str| if to.shows(true) { lines.push(l.to_string()) }, |_| {}).await;
     assert_eq!((tally.pushed, tally.failed.len()), (1, 1));
     let bloom = Unpushed { pod: "devtest-bloom".into(), why: WRONG_WHY.into(), branch: None, at_push: false, wrong_origin: true, busy: None };
     assert_eq!(tally.unpushed, std::slice::from_ref(&bloom));
@@ -2161,7 +2161,7 @@ async fn a_pod_mid_merge_is_left_as_it_is_said_how_to_end_it_and_copied() {
     let remote: Arc<dyn Remote> = fake.clone();
     let jobs = targets(&fleet()).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
     let mut lines = Vec::new();
-    let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
+    let tally = backup_fleet(&remote, jobs, REPO, |to: arena_core::out::To, l: &str| if to.shows(true) { lines.push(l.to_string()) }, |_| {}).await;
     assert_eq!((tally.pushed, tally.unchanged, tally.failed.len()), (1, 1, 1));
     let mut got = unnumbered(&lines);
     got.sort();
@@ -3693,6 +3693,90 @@ fn script_deep(fake: &FakeRemote) {
     fake.script(&host(22003), [FakeReply::hang()]);
 }
 
+/// Golden (docs/OUTPUT.md): `pods test --deep` by default says what it will check and how long
+/// it may take, a line for each pod that failed to answer, then the table and the tally; a pod
+/// checked is a line only at `-v` (a terminal counts them in place instead).
+#[tokio::test(start_paused = true)]
+async fn pods_test_deep_output_default_and_verbose() {
+    let mut out = Vec::new();
+    for verbose in [false, true] {
+        let fake = Arc::new(FakeRemote::new());
+        script_deep(&fake);
+        let remote: Arc<dyn Remote> = fake.clone();
+        // Named: no look at this box's disk (the cohort-wide run's), which this test can't fix.
+        let (f, cfg) = (fleet(), deep_cfg());
+        let sel = Selected { pods: f.pods.clone(), named: true };
+        let run = crate::pods::health::handle_deep_test(&f, remote, &cfg, &sel, false, verbose);
+        out.push(crate::output_test::rendered(verbose, &[], run).await);
+    }
+    assert_eq!(
+        out[0],
+        "\
+Deep-checking 3 pod(s) (150s budget each)…
+[3/3] ✗ devtest-cloud: timed out after 150s
+NAME           RESULT  GPUS         DRIVER     CUDA        NET  NOTES
+devtest-apple  pass    2×RTX A4000  580.65.06  13.0  47.1 MB/s
+devtest-bloom  fail    1×RTX A4000  580.65.06  13.0  47.1 MB/s  cuda: RuntimeError: Unexpected error from cudaGetDeviceCount(). Error 999: unknown error
+devtest-cloud  fail    -            -          -             -  ssh: timed out after 150s
+
+1 pass, 0 warn, 2 fail
+same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks every pod on it; a different GPU type draws a different host.
+Error: 2 pod(s) failed the deep check
+"
+    );
+    assert_eq!(out[1], "\
+Deep-checking 3 pod(s) (150s budget each)…
+[1/3] devtest-bloom: checked
+[2/3] devtest-apple: checked
+[3/3] ✗ devtest-cloud: timed out after 150s
+NAME           RESULT  GPUS         DRIVER     CUDA        NET  NOTES
+devtest-apple  pass    2×RTX A4000  580.65.06  13.0  47.1 MB/s
+devtest-bloom  fail    1×RTX A4000  580.65.06  13.0  47.1 MB/s  cuda: RuntimeError: Unexpected error from cudaGetDeviceCount(). Error 999: unknown error
+devtest-cloud  fail    -            -          -             -  ssh: timed out after 150s
+
+── devtest-apple (pass)
+  ✓ nvidia-smi    2×RTX A4000
+  ✓ driver        580.65.06 ≥ 580 (CUDA 13.0)
+  ✓ torch         2.9.0+cu130 (CUDA 13.0)
+  ✓ cuda          available
+  ✓ device_count  2 (matches nvidia-smi)
+  ✓ gpu0          tensor op ok
+  ✓ gpu1          tensor op ok
+  ✓ peer_copy     ok (0→1, 1→0)
+  ✓ nccl          all_reduce ok (2 ranks)
+  ✓ network       47.1 MB/s from huggingface.co
+  ✓ disk          / 107 GB free
+  ✓ load          load 0.8 on 64 CPUs, host up 14d
+  ✓ maintenance   none reported
+  - vscode        not reported
+  - ai_key        not reported (a check from before key checks, or cut off)
+  - hf_token      not reported (a check from before key checks, or cut off)
+
+── devtest-bloom (fail)
+  ✓ nvidia-smi    1×RTX A4000
+  ✓ driver        580.65.06 ≥ 580 (CUDA 13.0)
+  ✓ torch         2.9.0+cu130 (CUDA 13.0)
+  ✗ cuda          RuntimeError: Unexpected error from cudaGetDeviceCount(). Error 999: unknown error
+  - device_count  needs CUDA
+  - peer_copy     needs CUDA
+  - nccl          needs CUDA
+  ✓ network       47.1 MB/s from huggingface.co
+  ✓ disk          / 107 GB free
+  ✓ load          load 1.2 on 64 CPUs
+  ✓ maintenance   none reported
+  - vscode        not reported
+  - ai_key        not reported (a check from before key checks, or cut off)
+  - hf_token      not reported (a check from before key checks, or cut off)
+
+── devtest-cloud (fail)
+  ✗ ssh  timed out after 150s
+
+1 pass, 0 warn, 2 fail
+same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks every pod on it; a different GPU type draws a different host.
+Error: 2 pod(s) failed the deep check
+");
+}
+
 #[tokio::test(start_paused = true)]
 async fn pods_test_deep_reports_pass_fail_and_timeout() {
     use arena_core::health::{deep_check_command, render_report, Status, DEEP_CHECK_TIMEOUT};
@@ -3749,7 +3833,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
 #[tokio::test(start_paused = true)]
 async fn pods_test_deep_exit_status_follows_failures_not_warnings() {
     use arena_core::health::DEEP_CHECK_TIMEOUT;
-    let deep = |json: bool| PodCmd::Test { deep: true, sel: Select::default(), json, verbose: false, cohort: crate::cli::CohortScope::default() };
+    let deep = |json: bool| PodCmd::Test { deep: true, keys: false, sel: Select::default(), json, cohort: crate::cli::CohortScope::default() };
     // Any FAIL fails the command (table or JSON), at the hung pod's budget.
     for json in [false, true] {
         let fake = Arc::new(FakeRemote::new());
@@ -3854,6 +3938,173 @@ async fn pods_test_deep_records_verdicts_in_the_health_cache() {
     assert!(cache.get(&gone).is_none(), "pruned: runpod listed OK without it");
     assert_eq!(cache.pods.len(), 3);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A fleet whose config sits in a temp dir with its keys folder beside it: apple, bloom and
+/// cloud each with an OpenRouter key in the keys CSV, and the fleet's HF token — what the AI-key
+/// checks hold the machines to. Removed on drop.
+struct KeyedFleet {
+    dir: std::path::PathBuf,
+    cfg: Config,
+}
+
+impl Drop for KeyedFleet {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+const HF_FLEET: &str = "hf_fleet0123456789abcdef";
+
+fn or_key(name: &str) -> String {
+    format!("sk-or-v1-0123456789abcdef-{name}")
+}
+
+fn keyed_fleet(tag: &str) -> KeyedFleet {
+    let dir = std::env::temp_dir().join(format!("arena-keyed-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("keys")).unwrap();
+    std::fs::write(
+        dir.join("config.env"),
+        format!(
+            "MACHINE_NAME_PREFIX=devtest\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nALLOWED_CUDA_VERSIONS=\"13.0\"\n\
+             HF_TOKEN={HF_FLEET}\nMACHINE_NAME_LIST=( apple bloom cloud @gpu-james )\n"
+        ),
+    )
+    .unwrap();
+    let rows: String = ["apple", "bloom", "cloud"].iter().map(|n| format!("devtest-{n},{}\n", or_key(n))).collect();
+    std::fs::write(dir.join("keys/openrouter_api_keys.csv"), format!("host,key\n{rows}")).unwrap();
+    let cfg = Config::load(&dir.join("config.env")).unwrap();
+    KeyedFleet { dir, cfg }
+}
+
+/// The keys-only script's output for a machine: its OpenRouter key's facts then the HF token's.
+fn keys_out(or: &str, hf: &str) -> String {
+    format!("Welcome back!\ndeep_check=2\n{or}{hf}deep_check_end=1\n")
+}
+
+fn or_facts(secret: &str, http: u16, extra: &str) -> String {
+    format!(
+        "openrouter.key=set\nopenrouter.fingerprint={}\nopenrouter.curl_exit=0\nopenrouter.http={http}\n{extra}",
+        arena_core::health::fingerprint(secret)
+    )
+}
+
+fn hf_ok() -> String {
+    format!("hf.key=set\nhf.fingerprint={}\nhf.curl_exit=0\nhf.http=200\n", arena_core::health::fingerprint(HF_FLEET))
+}
+
+/// `pods test --keys`: one short exec per machine (the script's `keys` mode, in the login wrap,
+/// within its own budget), judged against the keys CSV and HF_TOKEN beside the config — apple's
+/// key works, bloom's was deleted (401), cloud never got its key — and the command fails.
+#[tokio::test(start_paused = true)]
+async fn pods_test_keys_checks_each_machines_keys() {
+    use arena_core::health::{key_check_command, render_key_report, Status, KEY_CHECK_TIMEOUT};
+    let kf = keyed_fleet("keys");
+    let fake = Arc::new(FakeRemote::new());
+    let money = "openrouter.limit=5\nopenrouter.limit_remaining=4.97\nopenrouter.usage=0.03\n";
+    fake.script(&host(22001), [FakeReply::stdout(&keys_out(&or_facts(&or_key("apple"), 200, money), &hf_ok()))]);
+    fake.script(&host(22002), [FakeReply::stdout(&keys_out(&or_facts(&or_key("bloom"), 401, "openrouter.error=User not found.\n"), &hf_ok()))]);
+    fake.script(&host(22003), [FakeReply::stdout(&keys_out("openrouter.key=missing\n", &hf_ok()))]);
+    let remote: Arc<dyn Remote> = fake.clone();
+    let start = Instant::now();
+    let results = crate::pods::health::check_fleet(None, &remote, &kf.cfg, &everyone(&fleet()), crate::pods::health::Kind::Keys).await.unwrap();
+    assert_eq!(start.elapsed(), Duration::ZERO);
+    let want = key_check_command(Some("arena-env"));
+    for port in [22001, 22002, 22003] {
+        assert_eq!(execs(&fake, port), [(want.clone(), Some(KEY_CHECK_TIMEOUT))], "port {port}");
+    }
+    let statuses: Vec<(&str, Status)> = results.iter().map(|h| (h.name.as_str(), h.status)).collect();
+    assert_eq!(statuses, [("devtest-apple", Status::Pass), ("devtest-bloom", Status::Fail), ("devtest-cloud", Status::Fail)]);
+    assert_eq!(
+        render_key_report(&results, false),
+        "\
+NAME           RESULT  AI KEY      HF  NOTES
+devtest-apple  pass    $4.97 left  ok
+devtest-bloom  fail    rejected    ok  ai_key: rejected (HTTP 401): paused? `arena keys resume bloom`, else `arena keys rotate bloom --copy`
+devtest-cloud  fail    missing     ok  ai_key: missing, though the keys CSV has one for it — `arena pods copy-keys cloud`
+
+1 pass, 0 warn, 2 fail
+AI key failure, not the machine: devtest-bloom, devtest-cloud — NOTES (or -v) says what to run; a machine is never replaced for its key.
+"
+    );
+    // --json: the checks and the facts — fingerprints, never a key.
+    let v = serde_json::to_value(&results).unwrap();
+    assert_eq!(v[0]["checks"][0], serde_json::json!({"name": "ai_key", "status": "pass", "detail": "ok, $4.97 of $5.00 left"}));
+    assert_eq!(v[1]["facts"]["openrouter"]["http"], 401);
+    assert!(!v.to_string().contains("sk-or-v1-0123456789abcdef"), "{v}");
+    // The command fails on them, and records nothing (the health cache holds full checks).
+    let fake = Arc::new(FakeRemote::new());
+    fake.script(&host(22001), [FakeReply::stdout(&keys_out(&or_facts(&or_key("apple"), 200, money), &hf_ok()))]);
+    fake.script(&host(22002), [FakeReply::stdout(&keys_out(&or_facts(&or_key("bloom"), 401, ""), &hf_ok()))]);
+    fake.script(&host(22003), [FakeReply::stdout(&keys_out(&or_facts(&or_key("cloud"), 200, money), &hf_ok()))]);
+    let cmd = PodCmd::Test { deep: false, keys: true, sel: Select::default(), json: false, cohort: crate::cli::CohortScope::default() };
+    let err = handle_pods(cmd, &fleet(), fake.clone(), &kf.cfg, true).await.unwrap_err();
+    assert_eq!(err.to_string(), "1 pod(s) failed the key check");
+}
+
+/// The fast check never waits on a machine outside the cohort (ops 2026-11-02: the stopgap `pods
+/// run '<curl …/key>'` stopped 20 s at "gpu-james listed running without an SSH endpoint —
+/// asking again in 20s…" — a staff box). Unnamed, `--keys` (as `--deep`) takes this cohort's
+/// machines only, skips one with no endpoint with a note, and asks nothing again: done at once.
+#[tokio::test(start_paused = true)]
+async fn pods_test_keys_never_waits_on_a_machine_outside_the_cohort() {
+    let kf = keyed_fleet("nowait");
+    let mut james = pod("x", 22009);
+    james.name = "gpu-james".into();
+    james.id = "id-gpu-james".into();
+    (james.ssh_ip, james.ssh_port) = (None, None);
+    let mut bloom = pod("bloom", 22002);
+    (bloom.ssh_ip, bloom.ssh_port) = (None, None);
+    let f = Fleet { kind: "runpod", pods: vec![pod("apple", 22001), bloom, james] };
+    let money = "openrouter.limit=5\nopenrouter.limit_remaining=4.97\n";
+    for keys in [true, false] {
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout(&keys_out(&or_facts(&or_key("apple"), 200, money), &hf_ok()))]);
+        let start = Instant::now();
+        let cmd = PodCmd::Test { deep: !keys, keys, sel: Select::default(), json: false, cohort: crate::cli::CohortScope::default() };
+        let _ = handle_pods(cmd, &f, fake.clone(), &kf.cfg, true).await;
+        assert!(start.elapsed() < Duration::from_secs(1), "keys={keys}: waited {:?}", start.elapsed());
+        assert_eq!(fake.calls().len(), 1, "keys={keys}: only apple is asked: {:#?}", fake.calls());
+    }
+}
+
+/// `pods test --deep` judges the keys too: an AI KEY column, and a key FAIL fails the command
+/// (a script notices) — while the machine's own checks all pass.
+#[tokio::test(start_paused = true)]
+async fn pods_test_deep_shows_and_fails_on_a_dead_key() {
+    use arena_core::health::{render_report, Status};
+    let kf = keyed_fleet("deepkeys");
+    let with = |or: String| DEEP_HEALTHY.replace("deep_check_end=1\n", &format!("{or}{}deep_check_end=1\n", hf_ok()));
+    let money = "openrouter.limit=5\nopenrouter.limit_remaining=4.97\n";
+    let script = |fake: &FakeRemote| {
+        fake.script(&host(22001), [FakeReply::stdout(&with(or_facts(&or_key("apple"), 200, money)))]);
+        fake.script(&host(22002), [FakeReply::stdout(&with(or_facts(&or_key("bloom"), 401, "")))]);
+        fake.script(&host(22003), [FakeReply::stdout(DEEP_HEALTHY)]);
+    };
+    let fake = Arc::new(FakeRemote::new());
+    script(&fake);
+    let remote: Arc<dyn Remote> = fake.clone();
+    let results = deep_check_fleet(&fleet(), &remote, &kf.cfg, &everyone(&fleet())).await.unwrap();
+    let statuses: Vec<(&str, Status, Status)> = results.iter().map(|h| (h.name.as_str(), h.status, h.machine_status())).collect();
+    assert_eq!(
+        statuses,
+        [("devtest-apple", Status::Pass, Status::Pass), ("devtest-bloom", Status::Fail, Status::Pass), ("devtest-cloud", Status::Pass, Status::Pass)]
+    );
+    let report = render_report(&results, false);
+    assert!(report.starts_with("NAME           RESULT  GPUS         DRIVER     CUDA        NET  AI KEY      NOTES\n"), "{report}");
+    assert!(report.contains("devtest-apple  pass    2×RTX A4000  580.65.06  13.0  47.1 MB/s  $4.97 left\n"), "{report}");
+    assert!(
+        report.contains("devtest-bloom  fail    2×RTX A4000  580.65.06  13.0  47.1 MB/s  rejected    ai_key: rejected (HTTP 401): paused? `arena keys resume bloom`, else `arena keys rotate bloom --copy`\n"),
+        "{report}"
+    );
+    // An older script (cloud: no key facts) reads as not reported — never a FAIL.
+    assert!(report.contains("devtest-cloud  pass    2×RTX A4000  580.65.06  13.0  47.1 MB/s  -\n"), "{report}");
+    assert!(!report.contains("same host?"), "a key failure says nothing of the host: {report}");
+    let fake = Arc::new(FakeRemote::new());
+    script(&fake);
+    let err = handle_deep_test(&fleet(), fake.clone(), &kf.cfg, &everyone(&fleet()), false, false).await.unwrap_err();
+    assert!(err.to_string().starts_with("1 pod(s) failed the deep check"), "{err}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -4008,11 +4259,14 @@ fn pods_test_flags_parse() {
     let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.cmd);
     assert!(matches!(
         parse(&["arena", "pods", "test"]).unwrap(),
-        Cmd::Pods(PodCmd::Test { deep: false, ref sel, json: false, verbose: false, .. }) if sel.targets.is_empty()
+        Cmd::Pods(PodCmd::Test { deep: false, ref sel, json: false, .. }) if sel.targets.is_empty()
     ));
-    match parse(&["arena", "pods", "test", "--deep", "apple", "bloom", "--json", "-v"]).unwrap() {
-        Cmd::Pods(PodCmd::Test { deep, sel, json, verbose, .. }) => {
-            assert!(deep && json && verbose);
+    // `-v` is the global one now (`arena -v …` or after the command), as every command's.
+    let cli = Cli::try_parse_from(["arena", "pods", "test", "--deep", "apple", "bloom", "--json", "-v"]).unwrap();
+    assert!(cli.verbose);
+    match cli.cmd {
+        Cmd::Pods(PodCmd::Test { deep, sel, json, .. }) => {
+            assert!(deep && json);
             assert_eq!(sel.targets, ["apple", "bloom"]);
         }
         _ => panic!("not pods test"),
@@ -4024,10 +4278,17 @@ fn pods_test_flags_parse() {
         }
         _ => panic!("not pods test"),
     }
-    // … but --json/-v still belong to --deep.
-    for args in [&["arena", "pods", "test", "--json"][..], &["arena", "pods", "test", "-v"]] {
-        assert!(parse(args).is_err(), "{args:?}");
+    // … but --json still belongs to --deep (or --keys).
+    assert!(parse(&["arena", "pods", "test", "--json"]).is_err());
+    // --keys: the AI keys alone, with --json/-v too; never with --deep (one or the other).
+    match parse(&["arena", "pods", "test", "--keys", "apple", "--json", "-v"]).unwrap() {
+        Cmd::Pods(PodCmd::Test { deep, keys, sel, json, .. }) => {
+            assert!(!deep && keys && json);
+            assert_eq!(sel.targets, ["apple"]);
+        }
+        _ => panic!("not pods test"),
     }
+    assert!(parse(&["arena", "pods", "test", "--keys", "--deep"]).is_err());
 }
 
 /// Which pods a fleet-wide git backup command reaches, and the one-line summaries for the
@@ -4616,3 +4877,6 @@ mod cohort_scope {
         assert!(fake.calls().is_empty());
     }
 }
+
+/// Golden tests of the save commands' output (docs/OUTPUT.md), with these fixtures.
+mod save_output;

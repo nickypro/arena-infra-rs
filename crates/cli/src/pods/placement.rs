@@ -50,7 +50,7 @@ pub(crate) fn placement_request(
     let single = arena_core::placement::Request { near: None, ..req.clone() };
     if keep_trying && req.near.is_some() && single.is_single() {
         let near = req.near.map(|n| n.region.label()).unwrap_or_default();
-        eprintln!("note: --keep-trying waits on one pool, so this run doesn't try {near} first (NEAR) — --retry-mins N keeps that");
+        arena_core::out!(ErrDetail, "note: --keep-trying waits on one pool, so this run doesn't try {near} first (NEAR) — --retry-mins N keeps that");
     }
     let req = if keep_trying && single.is_single() { single } else { req };
     if req.is_single() {
@@ -201,7 +201,7 @@ pub(crate) async fn checked_gpu(cfg: &Config, provider_name: &str, gpu: Option<S
         }
     };
     for w in warnings {
-        eprintln!("{w}");
+        arena_core::out!(Err, "{w}");
     }
     // REST v1 only: its create validates against an OpenAPI enum that lags the catalog.
     let v1 = matches!(RunpodApi::from_config(cfg), Ok(RunpodApi::V1));
@@ -422,8 +422,10 @@ pub(crate) fn single_option_plan(provider_name: &str, spec: &PodSpec) -> arena_c
     arena_core::placement::plan_options(&single_request(spec), provider_name, &arena_core::placement::PriceBook::unpriced())
 }
 
-/// Print the `create`/`up` balance preflight ([`money::balance_preflight`]) — on the
-/// single-spec path with the spec's live price read alongside ([`single_spec_quote`]).
+/// Say the `create`/`up` balance preflight ([`money::balance_preflight`]) — on the single-spec
+/// path with the spec's live price read alongside ([`single_spec_quote`]): its first line with
+/// `-v`, the one-line `Balance $491.57 → ≈22h left` without, its warnings at both. Returns it,
+/// for the prompt's cost.
 pub(crate) async fn print_balance_preflight(
     provider: &dyn Provider,
     cfg: &Config,
@@ -431,9 +433,17 @@ pub(crate) async fn print_balance_preflight(
     new_pods: usize,
     options: Option<&arena_core::placement::OptionPlan>,
     spec: &PodSpec,
-) {
+) -> money::Preflight {
+    use arena_core::out::{emit, To};
     let quote = single_spec_quote(cfg, provider.name(), spec);
-    money::balance_preflight(provider, cfg, bal, new_pods, options, spec, Some(quote)).await.iter().for_each(|l| println!("{l}"));
+    let pre = money::preflight(provider, cfg, bal, new_pods, options, spec, Some(quote)).await;
+    for (i, l) in pre.lines.iter().enumerate() {
+        emit(if i == 0 { To::Detail } else { To::Out }, l);
+    }
+    if let Some(b) = &pre.brief {
+        emit(To::Brief, b);
+    }
+    pre
 }
 
 /// The single spec's live price for the `create`/`up` preflight: its one option priced the
@@ -477,10 +487,201 @@ pub(crate) fn created_line(pod: &arena_core::Pod, on: Option<&str>) -> String {
     if let Some(on) = on {
         line.push_str(&format!(" on {on}"));
     }
-    if let Some(c) = pod.cost_per_hr.filter(|c| c.is_finite() && *c > 0.0) {
-        line.push_str(&format!(" ({}/h)", arena_core::fleet::fmt_money(arena_core::fleet::currency_symbol(&pod.provider), c)));
+    if let Some(c) = pod_price(pod) {
+        line.push_str(&format!(" ({c})"));
     }
     line
+}
+
+/// [`created_line`] as the default output says it: `[created] devtest-apple · 1×RTX 3070
+/// COMMUNITY · $0.17/h` — no id (`-v`). The dashboard's runs panel reads the name after
+/// `[created] `. Pure.
+pub(crate) fn created_brief(name: &str, on: Option<&str>, price: Option<String>) -> String {
+    let mut line = format!("[created] {}", arena_core::out::bold(name));
+    for part in [on.map(str::to_string), price].into_iter().flatten() {
+        line.push_str(&format!(" · {part}"));
+    }
+    line
+}
+
+/// `$0.17/h` (`€0.010/h` on Hetzner) as the create answered it; `None` unpriced. Pure.
+pub(crate) fn pod_price(pod: &arena_core::Pod) -> Option<String> {
+    let c = pod.cost_per_hr.filter(|c| c.is_finite() && *c > 0.0)?;
+    Some(format!("{}/h", arena_core::fleet::fmt_money(arena_core::fleet::currency_symbol(&pod.provider), c)))
+}
+
+/// What a placement progress event says ([`arena_core::placement::Progress`]): its full line
+/// with `-v`; without, a created pod's short line, a refused option's with the error as a
+/// reason (`[rejected] devtest-apple on 1×RTX A4000 SECURE: request rejected`), and nothing
+/// for an option out of capacity — the round's line says that once for every name.
+pub(crate) fn progress_lines(p: &arena_core::placement::Progress) -> Vec<(arena_core::out::To, String)> {
+    use arena_core::out::{reason_text, To};
+    use arena_core::placement::{Outcome, Progress};
+    let full = p.line();
+    match p {
+        Progress::Attempt { name, option, outcome, pod, .. } => match outcome {
+            Outcome::Created { .. } => {
+                let price = pod.and_then(pod_price).or_else(|| option.price_per_pod.map(|_| option.price_label()));
+                vec![(To::Detail, full), (To::Brief, created_brief(name, Some(&option.describe()), price))]
+            }
+            Outcome::Capacity(_) => vec![(To::ErrDetail, full)],
+            Outcome::Denied(e) | Outcome::Rejected(e) | Outcome::Quota(e) | Outcome::Auth(e) | Outcome::Failed(e) => {
+                let tag = full.split_once(']').map_or("[failed", |(t, _)| t);
+                let brief = format!("{tag}] {name} on {}: {}", option.describe(), reason_text(e));
+                vec![(To::ErrDetail, full), (To::ErrBrief, brief)]
+            }
+        },
+        Progress::Waiting { .. } | Progress::Skipped { .. } | Progress::Unlisted { .. } => vec![(To::Err, full)],
+    }
+}
+
+/// The key of the in-place line a terminal shows for capacity rounds ([`arena_core::out::progress`]).
+pub(crate) const ROUNDS: &str = "rounds";
+
+/// Say a placement progress event ([`progress_lines`]) through `say`. A round's line between
+/// retries is instead the terminal's in-place line `key` ([`arena_core::out::progress`]): one
+/// line updated there, not one more per round (the caller takes it away when placement ends);
+/// logs and pipes keep each (the dashboard reads them).
+pub(crate) fn say_progress(p: &arena_core::placement::Progress, say: &dyn Fn(arena_core::out::To, &str), key: &str) {
+    use arena_core::placement::Progress;
+    for (to, line) in progress_lines(p) {
+        if matches!(p, Progress::Waiting { .. }) && arena_core::out::live() {
+            arena_core::out::progress(key, Some(&line));
+            continue;
+        }
+        say(to, &line);
+    }
+}
+
+/// The default output's look at a plan (docs/OUTPUT.md): one option on one line — `1×RTX 6000
+/// Ada · RunPod SECURE · $0.99/h (none in Europe)` — several as a compact table (no notes:
+/// `-v`). A plan with nothing left to try is the whole table and its notes: that's what's wrong.
+/// Pure.
+pub(crate) fn plan_brief(plan: &arena_core::placement::OptionPlan) -> Vec<String> {
+    use arena_core::table::{render, Align};
+    let backend = arena_core::capability::Backend::named(&plan.provider).map_or(plan.provider.as_str(), |b| b.label());
+    let price = |o: &arena_core::placement::PlacementOption| o.price_per_pod.map(|_| o.price_label());
+    // In the table the header says per hour.
+    let cell = |o: &arena_core::placement::PlacementOption| {
+        let tilde = if o.price_source == Some(arena_core::placement::PriceSource::Estimate) { "~" } else { "" };
+        o.price_per_pod.map(|p| format!("{tilde}{}", arena_core::fleet::fmt_money("$", p)))
+    };
+    let none_near = match plan.near {
+        Some(n) if plan.options.iter().all(|o| o.near.is_none()) => format!(" (none in {})", n.region.label()),
+        _ => String::new(),
+    };
+    match plan.options.as_slice() {
+        [] => {
+            let mut lines = vec![plan_header(plan)];
+            lines.extend(arena_core::placement::render_plan(plan).lines().map(str::to_string));
+            lines
+        }
+        [o] => {
+            let near = o.near.map(|r| format!(" in {}", r.label())).unwrap_or_default();
+            let mut line = format!("{} · {backend}{}{near}", arena_core::out::bold(&o.label), o.cloud.as_deref().map(|c| format!(" {c}")).unwrap_or_default());
+            if let Some(p) = price(o) {
+                line.push_str(&format!(" · {p}"));
+            }
+            line.push_str(&none_near);
+            vec![line]
+        }
+        options => {
+            let near = plan.near.is_some();
+            let rows: Vec<Vec<String>> = options
+                .iter()
+                .enumerate()
+                .map(|(i, o)| {
+                    let mut row = vec![(i + 1).to_string(), o.label.clone(), o.cloud.clone().unwrap_or_else(|| "-".into())];
+                    if near {
+                        row.push(o.near.map_or("any", |r| r.label()).to_string());
+                    }
+                    row.push(cell(o).unwrap_or_else(|| "-".into()));
+                    row.push(o.stock.clone().unwrap_or_else(|| "-".into()));
+                    row
+                })
+                .collect();
+            let (headers, aligns): (&[&str], &[Align]) = if near {
+                (&["#", "OPTION", "CLOUD", "WHERE", "$/H", "STOCK"], &[Align::Right, Align::Left, Align::Left, Align::Left, Align::Right, Align::Left])
+            } else {
+                (&["#", "OPTION", "CLOUD", "$/H", "STOCK"], &[Align::Right, Align::Left, Align::Left, Align::Right, Align::Left])
+            };
+            let mut lines = vec![format!("{backend}, {} options, tried in order{none_near}:", options.len())];
+            lines.extend(render(headers, aligns, &rows).lines().map(|l| l.trim_end().to_string()));
+            lines
+        }
+    }
+}
+
+/// The single-spec path's plan, as [`plan_brief`] says one option: `1×RTX A4000 · RunPod
+/// COMMUNITY`, `cx23 CPU VM · Hetzner` — priced when `quote` read one. Pure.
+pub(crate) fn spec_brief(provider: &dyn Provider, spec: &PodSpec, quote: Option<&arena_core::placement::OptionPlan>) -> String {
+    let mut plan = quote.cloned().unwrap_or_else(|| single_option_plan(provider.name(), spec));
+    // Hetzner's option is a `CPU VM`; its describe names the server type (`cx23 CPU VM, …`).
+    for o in plan.options.iter_mut().filter(|o| o.label == "CPU VM") {
+        o.label = provider.describe(spec).split(',').next().unwrap_or("CPU VM").trim().to_string();
+    }
+    plan.near = None;
+    plan_brief(&plan).join("\n")
+}
+
+/// Say the plan before a `create`/`up` prompt or dry run: the option table and notes (or the
+/// single spec described) with `-v`, [`plan_brief`] / [`spec_brief`] without.
+pub(crate) fn show_plan(provider: &dyn Provider, options: Option<&arena_core::placement::OptionPlan>, spec: &PodSpec) {
+    use arena_core::out::{emit, To};
+    match options {
+        Some(plan) => {
+            emit(To::Detail, &plan_header(plan));
+            for l in arena_core::placement::render_plan(plan).lines() {
+                emit(To::Detail, l);
+            }
+            for l in plan_brief(plan) {
+                emit(To::Brief, &l);
+            }
+        }
+        None => emit(To::Brief, &spec_brief(provider, spec, None)),
+    }
+}
+
+/// The default prompt: `Create devtest-apple, devtest-bloom (≤$0.34/h), retrying up to 20m?` —
+/// what it acts on and what it costs (`cost`: per hour, all of them), at most three names and
+/// how many more — after `note`, on its own line, what else it will do unasked (`up`: terminate
+/// a pod without SSH). Pure.
+pub(crate) fn create_question(names: &[String], cost: Option<&str>, retry_mins: u64, note: Option<&str>) -> String {
+    const SHOWN: usize = 3;
+    let mut what = names.iter().take(SHOWN).map(arena_core::out::bold).collect::<Vec<_>>().join(", ");
+    if names.len() > SHOWN {
+        what = format!("{} pods: {what} +{} more", names.len(), names.len() - SHOWN);
+    }
+    let cost = cost.map(|c| format!(" ({c})")).unwrap_or_default();
+    let retry = if retry_mins > 0 { format!(", retrying up to {retry_mins}m") } else { String::new() };
+    let note = note.map(|n| format!("{n}\n")).unwrap_or_default();
+    format!("{note}Create {what}{cost}{retry}?")
+}
+
+/// What `up` does unasked once it's said yes, for its prompt: it terminates a pod that never gets
+/// a usable SSH endpoint (with or without `--check`), and with `--check` one that fails it on its
+/// host, and recreates its name while `tries` (`--check-attempts`) last — the last try's pod is
+/// terminated all the same. Nothing with `--no-wait`: no pipelines run. Pure.
+pub(crate) fn up_replaces(check: bool, no_wait: bool, tries: u32) -> Option<String> {
+    if no_wait {
+        return None;
+    }
+    // Every pod without SSH is terminated, the last try's too: said, so a name left with none is
+    // no surprise. A host FAIL of the check is terminated only while a try is left.
+    Some(match (tries, check) {
+        (0 | 1, false) => "A pod without SSH is terminated; its name isn't tried again.".to_string(),
+        (0 | 1, true) => "A pod without SSH is terminated; its name isn't tried again (one failing the check is kept).".to_string(),
+        (n, false) => format!("A pod without SSH is terminated and its name tried again: {n} tries in all."),
+        (n, true) => format!("A pod without SSH, or failing the check (but the last), is terminated and its name tried again: {n} tries in all."),
+    })
+}
+
+/// What `n` pods on `plan` cost per hour at most (the dearest option): `≤$1.98/h`,
+/// `≤~$0.68/h` with an estimate; `None` when an option has no price. Pure.
+pub(crate) fn plan_cost(plan: &arena_core::placement::OptionPlan, n: usize) -> Option<String> {
+    let dearest = plan.options.iter().map(|o| o.price_per_pod).collect::<Option<Vec<f64>>>()?.into_iter().fold(None, |m: Option<f64>, p| Some(m.map_or(p, |m| m.max(p))))?;
+    let tilde = if plan.options.iter().any(|o| o.price_source == Some(arena_core::placement::PriceSource::Estimate)) { "~" } else { "" };
+    Some(format!("≤{tilde}{}/h", arena_core::fleet::fmt_money("$", dearest * n as f64)))
 }
 
 /// The spec the first create would use: the first name, on placement's first option (or the
@@ -519,21 +720,25 @@ pub(crate) fn print_placement_preview(
     base: &PodSpec,
     names: &[String],
 ) {
-    println!("{}", plan_header(plan));
-    print!("{}", arena_core::placement::render_plan(plan));
+    use arena_core::out::{emit, To};
+    show_plan(provider, Some(plan), base);
     let Some(first) = plan.options.first() else {
-        println!("[dry-run] nothing would be attempted for {} — no option left to try", names.join(", "));
+        emit(To::Out, &format!("[dry-run] nothing would be attempted for {} — no option left to try", names.join(", ")));
         return;
     };
-    println!(
-        "[dry-run] would place {} pod(s) on {}: each name tries options 1→{} in order, one create \
-         at a time, keeping the first that has capacity:\n  {}",
-        names.len(),
-        provider.name(),
-        plan.options.len(),
-        names.join(", ")
+    emit(
+        To::Detail,
+        &format!(
+            "[dry-run] would place {} pod(s) on {}: each name tries options 1→{} in order, one create \
+             at a time, keeping the first that has capacity:\n  {}",
+            names.len(),
+            provider.name(),
+            plan.options.len(),
+            names.join(", ")
+        ),
     );
-    println!("[dry-run] option 1 is: {}", provider.describe(&arena_core::placement::spec_for(base, "", first)));
+    emit(To::Detail, &format!("[dry-run] option 1 is: {}", provider.describe(&arena_core::placement::spec_for(base, "", first))));
+    emit(To::Brief, &format!("[dry-run] would create {}", names.join(", ")));
 }
 
 /// The `[y/N]` text for a multi-option create (the option table is printed just above it).
@@ -545,8 +750,6 @@ pub(crate) fn placement_prompt(
     names: &[String],
     then: &str,
 ) -> Result<String> {
-    println!("{}", plan_header(plan));
-    print!("{}", arena_core::placement::render_plan(plan));
     let Some(first) = plan.options.first() else {
         anyhow::bail!("nothing to create: no option left to try (see the table above, or `arena offers`)");
     };
@@ -591,20 +794,21 @@ pub(crate) async fn place_names(
         prefix: cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string(),
     });
     let mut show = |p: &Progress| {
-        if p.is_created() {
-            println!("{}", p.line());
-        } else {
-            eprintln!("{}", p.line());
-        }
+        say_progress(p, &arena_core::out::emit, ROUNDS);
         // Hand the pod on the moment it exists (`up` starts its pipeline now).
         if let Progress::Attempt { pod: Some(pod), index, .. } = p {
             on_made(&Made { pod: (*pod).clone(), at: tokio::time::Instant::now(), option: Some(*index) });
         }
     };
     let start = tokio::time::Instant::now();
+    let rounds_line = arena_core::out::progress_guard(ROUNDS);
     let run =
         placement::place(provider, base, &names, plan, rounds, topup.as_ref(), || interrupt.wait(), &mut show).await;
-    print!("\n{}", placement::render_summary(plan, &run));
+    drop(rounds_line);
+    arena_core::out::emit(arena_core::out::To::Detail, "");
+    for l in placement::render_summary(plan, &run).lines() {
+        arena_core::out::emit(arena_core::out::To::Detail, l);
+    }
     let (placed, total) = (run.created.len(), names.len());
     // Each pod with its option and create time, from the attempt that made it.
     let made: Vec<Made> = run
@@ -623,13 +827,22 @@ pub(crate) async fn place_names(
         })
         .collect();
     match run.end {
-        End::Filled => println!("Placed {placed} of {total}."),
-        End::Exhausted => eprintln!(
-            "[stop] no capacity on any option right now (placed {placed}/{total}). \
-             Re-run with --retry-mins N to wait for it to free up."
+        End::Filled => arena_core::out::emit(arena_core::out::To::Detail, &format!("Placed {placed} of {total}.")),
+        End::Exhausted => arena_core::out::emit(
+            arena_core::out::To::Err,
+            &format!(
+                "[stop] no capacity on any option right now (placed {placed}/{total}). \
+                 Re-run with --retry-mins N to wait for it to free up."
+            ),
         ),
-        End::WindowElapsed => eprintln!("retry window ({retry_mins}m) elapsed — placed {placed} of {total}"),
-        End::Interrupted => eprintln!("interrupted — stopping retries with {placed} of {total}"),
+        End::WindowElapsed => {
+            // The round lines said why (a terminal's only in place, now gone): said once more.
+            let why = last_refusal(&run).map(|w| format!(" ({w})")).unwrap_or_default();
+            arena_core::out::emit(arena_core::out::To::Err, &format!("retry window ({retry_mins}m) elapsed — placed {placed} of {total}{why}"))
+        }
+        End::Interrupted => {
+            arena_core::out::emit(arena_core::out::To::Err, &format!("interrupted — stopping retries with {placed} of {total}"))
+        }
         End::Aborted { name, error } => {
             // Every option refused (RunPod v2 403s) is about the key's access, not a bad key.
             let what = if error.kind() == Some(arena_core::ProviderErrorKind::Denied) {
@@ -641,7 +854,7 @@ pub(crate) async fn place_names(
             return Err(CreateFailed::new(made, error));
         }
         End::Failed { name, error } => {
-            eprintln!("placed {placed}/{total} before failure");
+            arena_core::out::emit(arena_core::out::To::Err, &format!("placed {placed}/{total} before failure"));
             let error = match name {
                 Some(name) => anyhow::anyhow!("creating {name}: {error}"),
                 None => anyhow::Error::new(error),
@@ -650,6 +863,32 @@ pub(crate) async fn place_names(
         }
     }
     Ok(made)
+}
+
+#[cfg(test)]
+#[test]
+fn up_prompt_says_what_it_terminates_with_one_try_or_several() {
+    assert_eq!(up_replaces(false, false, 2).as_deref(), Some("A pod without SSH is terminated and its name tried again: 2 tries in all."));
+    assert_eq!(up_replaces(false, false, 1).as_deref(), Some("A pod without SSH is terminated; its name isn't tried again."));
+    assert!(up_replaces(true, false, 3).unwrap().contains("or failing the check (but the last)"));
+    assert!(up_replaces(true, false, 1).unwrap().ends_with("(one failing the check is kept)."));
+    assert_eq!(up_replaces(true, true, 2), None, "--no-wait: no pipelines, nothing terminated");
+    let q = create_question(&["devtest-apple".into()], Some("≤$0.17/h"), 0, up_replaces(false, false, 2).as_deref());
+    assert_eq!(q, "A pod without SSH is terminated and its name tried again: 2 tries in all.\nCreate devtest-apple (≤$0.17/h)?");
+}
+
+/// Why the names left unplaced weren't placed, as their last attempt said: `no capacity`, `no
+/// access`, `rejected`, `over the limit`; `None` without an attempt. Pure.
+fn last_refusal(run: &arena_core::placement::Placement) -> Option<&'static str> {
+    use arena_core::placement::Outcome;
+    run.log.iter().filter(|l| l.placed.is_none()).filter_map(|l| l.attempts.last()).map(|a| match a.outcome {
+        Outcome::Capacity(_) => "no capacity",
+        Outcome::Denied(_) => "no access",
+        Outcome::Rejected(_) => "rejected",
+        Outcome::Quota(_) => "over the limit",
+        Outcome::Auth(_) => "key rejected",
+        Outcome::Failed(_) | Outcome::Created { .. } => "failed",
+    }).next()
 }
 
 #[cfg(test)]

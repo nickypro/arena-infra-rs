@@ -11,7 +11,7 @@ use arena_core::remote::{describe_error, Remote};
 use arena_core::ssh::SshTarget;
 use arena_core::{snapshot, Config, Pod};
 
-use crate::refresh::health_cache_path;
+use crate::refresh::{health_cache_path, spend_path};
 use crate::state::mark_key;
 use crate::{Shared, Ui};
 
@@ -120,7 +120,7 @@ pub(crate) fn skipped_words(s: &Skipped) -> String {
 /// (where `arena snapshot` and the next refresh read them) and shown at once.
 pub(crate) fn start_deep_check(shared: &Arc<Mutex<Shared>>, ui: &Ui, pods: Vec<Pod>) {
     // Config first: a malformed MIN_DRIVER_VERSION is said before any pod is touched.
-    let policy = match HealthPolicy::from_config(&ui.cfg) {
+    let policy = match HealthPolicy::for_fleet(&ui.cfg, spend_path(&ui.cfg).as_deref()) {
         Ok(p) => p,
         Err(e) => {
             shared.lock().unwrap().notify(format!("✗ deep check: {e}"), true);

@@ -112,7 +112,7 @@ impl Provider for MultiProvider {
             )));
         }
         if !errs.is_empty() && self.warn_on_partial {
-            eprintln!("warning: some providers failed to list ({})", errs.join("; "));
+            crate::out!(Err, "warning: some providers failed to list ({})", errs.join("; "));
         }
         Ok(out)
     }

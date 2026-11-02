@@ -2180,12 +2180,13 @@ pub fn render_table(views: &[AccountView], now: u64) -> String {
         })
         .collect();
     let mut out = table::render(&headers, &align, &rows);
-    out.push_str(
-        "burn = the higher of the provider's own rate and this fleet's billing pods there; runway = balance ÷ burn; \
-         est. = the last reading − max(billed, metered) spend since (errs low)\n",
-    );
+    out.push_str(TABLE_LEGEND);
     out
 }
+
+/// How to read [`render_table`]'s columns: its last line (`-v`'s only in `arena balance`).
+pub const TABLE_LEGEND: &str = "burn = the higher of the provider's own rate and this fleet's billing pods there; runway = balance ÷ burn; \
+                                est. = the last reading − max(billed, metered) spend since (errs low)\n";
 
 /// `drift, HTTP 400: Cannot query field "clientBalance"…`
 fn fail_text(f: &FailRecord) -> String {
@@ -2640,26 +2641,18 @@ pub fn preflight_lines_with(v: &AccountView, new: NewPods, policy: &BalancePolic
         None => format!("{n} new pod(s) (price unknown)"),
     };
     let unpriced_new = n > 0 && added.is_none();
-    let burn_floor = v.burn.is_some_and(|b| b.floor());
-    let after = v.balance.zip(now_burn).map(|(bal, b)| (bal, b + added.unwrap_or(0.0)));
-    let (runway, flag) = match after {
+    let (runway, flag) = match runway_after(v, &new, policy) {
         _ if unpriced_new => ("? (the new pods aren't priced — no warning can be judged)".to_string(), String::new()),
-        Some((_, total)) if total < NO_BURN && burn_floor => ("?".into(), String::new()),
-        Some((_, total)) if total < NO_BURN => ("no burn".to_string(), String::new()),
-        Some((bal, total)) => {
-            let h = bal.max(0.0) / total;
-            let flag = if policy.warn_hours > 0.0 && h < CRITICAL_HOURS {
-                " ‼ under 24h".to_string()
-            } else if h < policy.warn_hours {
-                format!(" ⚠ below BALANCE_WARN_HOURS={}", num(policy.warn_hours))
-            } else {
-                String::new()
+        Runway::Hours(h, low) => {
+            let flag = match low {
+                Some(Low::Critical) => " ‼ under 24h".to_string(),
+                Some(Low::Warn) => format!(" ⚠ below BALANCE_WARN_HOURS={}", num(policy.warn_hours)),
+                None => String::new(),
             };
-            let h = fmt_hours(h);
-            let h = if burn_floor { h.replacen('≈', "≤", 1) } else { h };
             (h, flag)
         }
-        None => ("?".into(), String::new()),
+        Runway::NoBurn => ("no burn".to_string(), String::new()),
+        Runway::Unknown => ("?".into(), String::new()),
     };
     let mut out = vec![format!("{head} · {now_part} + {new_part} → {runway}{flag}")];
     let runpod = v.account == Account::Runpod.name();
@@ -2688,6 +2681,63 @@ pub fn preflight_lines_with(v: &AccountView, new: NewPods, policy: &BalancePolic
         out.push(format!("‼ {title} reports the account under its minimum balance — creates will likely fail"));
     }
     out
+}
+
+/// How long the account lasts with the new pods added: [`preflight_lines_with`]'s judgement.
+enum Runway {
+    /// `≈22h` (`≤` while the burn is a floor), and whether that's low.
+    Hours(String, Option<Low>),
+    NoBurn,
+    /// No balance or burn to judge by, a floor near zero, or new pods nobody priced.
+    Unknown,
+}
+
+/// A runway under 24 h ([`CRITICAL_HOURS`]), or under `BALANCE_WARN_HOURS`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Low {
+    Critical,
+    Warn,
+}
+
+fn runway_after(v: &AccountView, new: &NewPods, policy: &BalancePolicy) -> Runway {
+    let added = new.per_pod.filter(|p| p.is_finite() && *p >= 0.0).map(|p| p * new.count as f64);
+    if new.count > 0 && added.is_none() {
+        return Runway::Unknown;
+    }
+    let burn_floor = v.burn.is_some_and(|b| b.floor());
+    match v.balance.zip(v.burn.map(|b| b.per_hr)).map(|(bal, b)| (bal, b + added.unwrap_or(0.0))) {
+        Some((_, total)) if total < NO_BURN && burn_floor => Runway::Unknown,
+        Some((_, total)) if total < NO_BURN => Runway::NoBurn,
+        Some((bal, total)) => {
+            let h = bal.max(0.0) / total;
+            let low = if policy.warn_hours > 0.0 && h < CRITICAL_HOURS {
+                Some(Low::Critical)
+            } else if h < policy.warn_hours {
+                Some(Low::Warn)
+            } else {
+                None
+            };
+            let h = fmt_hours(h);
+            Runway::Hours(if burn_floor { h.replacen('≈', "≤", 1) } else { h }, low)
+        }
+        None => Runway::Unknown,
+    }
+}
+
+/// The default output's preflight, one line: `Balance $491.57 → ≈22h left ‼` (the runway with
+/// the new pods added; `‼` when under 24 h or BALANCE_WARN_HOURS), `Balance $29.12` with no
+/// burn, `Balance ?` with no reading. [`preflight_lines_with`]'s first line has it all (`-v`);
+/// its warnings show at both. Pure.
+pub fn preflight_brief(v: &AccountView, new: NewPods, policy: &BalancePolicy) -> String {
+    if v.source == Source::Unknown {
+        return format!("Balance ? — `arena balance set {} <USD>`", v.account);
+    }
+    let bal = balance_label(v);
+    match runway_after(v, &new, policy) {
+        Runway::Hours(h, None) => format!("Balance {bal} → {h} left"),
+        Runway::Hours(h, Some(_)) => format!("Balance {bal} → {h} left {}", crate::out::bang()),
+        Runway::NoBurn | Runway::Unknown => format!("Balance {bal}"),
+    }
 }
 
 /// `teardown --check`'s lines, after its verdict — informational, never part of it: what

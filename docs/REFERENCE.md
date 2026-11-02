@@ -12,6 +12,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
 - [Running arena](#running-arena)
   - [From a checkout](#from-a-checkout)
   - [`update`: installing a newer release](#update-installing-a-newer-release)
+  - [Output: `-v` and `--color`](#output--v-and---color)
   - [Command shorthands](#command-shorthands)
   - [Targeting & concurrency](#targeting--concurrency)
   - [Overriding config without editing it](#overriding-config-without-editing-it)
@@ -96,8 +97,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
 - **Read-only by default.** `pods list`, `offers` and the TUI only ever read from the providers: REST GETs plus
   read-only GraphQL queries (a POST, but a query, never a mutation). The RunPod key is sent
   only as an `Authorization: Bearer` header — never in a URL, which errors would print.
-- **Mutating commands act, but confirm first.** `create`/`stop`/`terminate`/… print
-  what they'll do and prompt `Proceed? [y/N]` at a terminal. `-y`/`--yes` skips the
+- **Mutating commands act, but confirm first.** `create`/`stop`/`terminate`/… say
+  what they'll do and ask `[y/N]` at a terminal (`up`/`create`: `Create … (≤$0.34/h)? [y/N]`). `-y`/`--yes` skips the
   prompt. With **no terminal** (cron, pipes) they *refuse* unless `--yes` is given — so
   nothing mutates non-interactively by accident — and exit with status **2** (a declined
   prompt at a terminal is `aborted.`, status 0). (`cron install`/`remove` confirm too, and
@@ -142,7 +143,7 @@ habit notices, a major for a config or on-pod layout break that needs action; ot
 stamp alone tells releases apart. A newer base is always newer: a 2.0 build updates to 2.1.
 
 ```bash
-arena update --check     # newer release? what changed? (exit 10 = yes, 0 = up to date, 1 = couldn't tell)
+arena update --check     # newer release? what changed? (exit 10 = yes, 0 = up to date, 1 = couldn't tell; -v: each entry in full)
 arena update --dry-run   # also download and check it (provenance included), install nothing
 arena update             # … then ask, and swap both binaries in (--yes to skip the question)
 sudo arena update        # where root runs arena from someone else's ~/.cargo/bin (prod)
@@ -205,6 +206,15 @@ sudo arena update        # where root runs arena from someone else's ~/.cargo/bi
   restart. Cron picks the new `arena` up on its next run.
 - It needs no config and no GitHub login (the API allows 60 unauthenticated requests an hour;
   an update makes 2: the latest release, and its attestation).
+
+### Output: `-v` and `--color`
+
+Commands say little by default: what they will do, what they did, and what's wrong with the
+command that fixes it. **`-v`** (`--verbose`, on any command, before or after it) adds the rest:
+plans, notes, ids, the providers' own errors, each step. Colour is for a terminal only
+(`--color auto`, the default); `--color always|never` and `NO_COLOR` override it, and pipes and
+cron logs get the same words without it. `--json` output is the same either way. The rules,
+for anyone changing what a command prints: [OUTPUT.md](OUTPUT.md).
 
 ### Command shorthands
 
@@ -619,7 +629,7 @@ minutes a VM. From an **arena image** — a snapshot of a VM that setup built, w
 machine's scrubbed off — setup takes about a minute.
 
 ```bash
-arena image build --dry-run      # the plan: VM type, what's scrubbed, cost
+arena image build --dry-run      # the plan in a line: VM type, cost (-v: what's scrubbed, …)
 arena image build                # ~20 min; asks first (-y: doesn't); --server-type picks the bake VM
 arena image list                 # this cohort's images; which one `arena` picks; are they current?
 arena image prune [--keep 1]     # delete older ones (and any build VM left behind); asks first
@@ -1359,6 +1369,8 @@ body".
 `offers [PROVIDER|all] [--gpu …] [--cloud …] [--max-price …] [--gpus N] [--server-type T] [--order …]
 [-v] [--json]` — read-only. Two views: with no provider, what `create`/`up` would try, on every
 provider at once; with one (`runpod`, `vast`, `hetzner`, `shadeform`) or `all`, everything it sells.
+A catalogue's rows nobody can buy (`not sold now`, `v1: not creatable`) and its notes are `-v`'s:
+by default one line under the table says how many (a note that something failed still shows).
 
 **`arena offers`**: one table over the providers with a key in the config, in the fleet's order
 (RunPod, Vast, Hetzner): PROVIDER, `#` (the order `create`/`up` would try that provider's options in),
@@ -1457,8 +1469,11 @@ other names under `--retry-mins` (placed pods used to sit idle, billing, until t
 wait for *its* SSH endpoint and sshd answering (`--timeout`, default 600s, per pod) → sync the
 proxy (one writer at a time) →
 provision it (`--no-setup` skips) → [`--check`: deep check] → copy its API keys (when
-`keys/*_api_keys.csv` exist) → [`--lock`: lock it] → `[name] READY after 4m10s — …` or `[name] FAILED <stage>: …`, printed
-the moment that pod is done — a slow pod never holds up another.
+`keys/*_api_keys.csv` exist) → [`--lock`: lock it] → `[name] READY after 4m10s · keys ✓ · Claude ✓` or
+`[name] FAILED <stage>: … (retry: …)`, printed the moment that pod is done — a slow pod never holds up
+another. That, the `[created]` lines and a pod being replaced are all `up` prints by default (on a
+terminal, one line at the bottom shows where each pod is); `-v` prints every step, the plan, the
+provider's errors and the summary table, as before ([how arena prints](OUTPUT.md)).
 
 **A name with no OpenRouter key gets one.** With `OPENROUTER_PROVISIONING_KEY` set (and setup
 running), `up` lists the keys once before the prompt: each cohort name with no key on OpenRouter
@@ -1552,6 +1567,10 @@ again; a replacement that lands on a machine that already failed (any name's; by
 machine id — RunPod's `machineId` from REST v1 or GraphQL — before the IP, which several RunPod
 hosts share) is rejected unseen and terminated (even with no attempt left).
 
+Once its keys are copied, each machine's AI keys are checked too ([`pods test
+--keys`](#ai-keys---keys)'s check). A dead key is said with what to run and folded into the
+machine's check, but the machine stays READY: a key is never a reason to replace one.
+
 #### Bad machines are remembered for 72 h
 
 A host FAIL on a machine the provider names (RunPod/Vast machine id — never an IP) is also
@@ -1633,8 +1652,8 @@ an unexpected shape are errors, never "zero pods".
 
 `proxy plan` — read-only; shows the merge against the current config (`+` added, `~` changed —
 including a kept entry whose port moved with the list —, `-` removed, `=` kept-stale, plus a `+N
-added, ~N changed, …` summary) and prints the nginx `stream` config (`--out` saves it locally; never
-connects to the proxy).
+added, ~N changed, …` summary); `-v` adds the forwards that stay as they are and prints the nginx
+`stream` config (`--out` saves it locally; never connects to the proxy).
 
 Without the current config (remote proxy, unreadable file) it's labelled a **listing-only preview**
 and `--out` is refused — deployed by hand it would drop every kept forward.
@@ -1642,6 +1661,8 @@ and `--out` is refused — deployed by hand it would drop every kept forward.
 `proxy apply` prints the same changes, confirms, then **deploys** the config (locally, or over SSH
 when `PROXY_LOCAL=false`) and runs `SSH_PROXY_RELOAD_CMD` — default `nginx -t && nginx -s reload`;
 set it **empty** (in the file, or exported empty by a wrapper) for write-only (never reloads nginx).
+A config already up to date is one line, `✓ proxy config up to date (30 forward(s))`: what the
+proxy cron logs every 5 minutes.
 
 Writes are serialized (`flock`), refuse to overwrite a config another run changed since it was read
 (the merge is redone), and are atomic locally (temp + rename).
@@ -1817,8 +1838,18 @@ A pod that refuses our key (`Permission denied (publickey)`) on a provider with 
 gets the cohort keys re-attached to it and is set up again (up to 3×, 20s apart); elsewhere the
 refusal is reported as before.
 
-Confirms first (`--dry-run` previews, token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`,
-`ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
+Then it tells the coding agents on the machine which Python to use ([the agents'
+notes](#the-agents-notes-claude-code-and-codex)) and warms up VS Code.
+
+Confirms first (`--dry-run` previews: its steps in a line; `-v` prints each step's command, token
+redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
+
+It prints a line per pod as it ends — `[NAME] setup ✓ (3m02s)`, or `[NAME] FAILED setup: <why>
+(retry: arena pods setup NAME)` — and, for several, `✓ 3 of 3 set up`. A log or a pipe also gets
+`[NAME] setup…` as each starts (the dashboard's runs panel shows it as the pod's step); a terminal
+shows one line, updated in place, instead. `-v` adds the tokens, the budgets, `[2/3] ✓ NAME (…)`
+with what built the env, and the tallies. `start`, `restart`, `reimage` and `replace` print the
+same lines for the setup they run.
 
 #### The repo: `origin`, `upstream` and the update
 
@@ -1888,6 +1919,63 @@ the deploy key is wired to github.com and the checkout updated as an image-based
 default branch fast-forwards; `--force` resets it). A fresh VM has no checkout yet: the script
 clones it. A fresh install records what it was built from (`.venv/.arena-req`: the hash of
 `install_uv.sh` and `requirements.txt`).
+
+#### The agents' notes (Claude Code and Codex)
+
+Setup installs Claude Code and Codex on every machine, and they didn't know the course env: on
+project week's first day a Claude asked to run GPT-2 on a GPU pod used `/usr/bin/python3`, found
+transformers missing and pip-installed it there, while `/opt/arena-env` had it all along. A shell
+started over ssh or by a tool may not have the env active:
+
+| on 2026-11-02 | `ssh host 'cmd'` | `zsh -lc` | interactive login, `pods run` |
+|---|---|---|---|
+| Hetzner VM | `python3` = `/usr/bin/python3` (no torch), no `python`, no `pip` | the same | the venv |
+| arena image, sshd's own PATH (RunPod) | `python3` = `/usr/bin/python3` (3.11 with torch, no transformers), `pip` = `/usr/local/bin/pip` (its pip) | the same | `/opt/arena-env` |
+| arena image on Vast (its ssh passes the image's PATH) | `/opt/arena-env` | the same | `/opt/arena-env` |
+
+So setup's **`agent notes`** step (after the env is there, before the VS Code warm-up;
+best-effort, 60s) writes this machine's facts into Claude Code's user memory
+(`~/.claude/CLAUDE.md`) and Codex's (`~/.codex/AGENTS.md`), between `<!-- BEGIN arena-infra
+python -->` and `<!-- END arena-infra python -->`. On a Hetzner VM:
+
+```
+<!-- BEGIN arena-infra python -->
+## Python on this machine (arena setup rewrites this block; write your own notes outside it)
+- Use the course env, /root/ARENA_materials/.venv: torch (a CPU build: this machine has no GPU), transformers, transformer_lens and the other course packages are in it. Run /root/ARENA_materials/.venv/bin/python, or `source /root/ARENA_materials/.venv/bin/activate` first.
+- Shells started over ssh, by scripts or by your tools may not have it active, and their `python3` is then the system one (/usr/bin/python3), without those packages. Check `which python` before running anything.
+- Missing a package? Check first: `/root/ARENA_materials/.venv/bin/python -m pip show PACKAGE`. Install into the env: `uv pip install --python /root/ARENA_materials/.venv/bin/python PACKAGE`. Never pip install into the system Python, and don't make another venv or conda env for the course.
+- The course repo (the exercises, and the participants' work) is /root/ARENA_materials.
+<!-- END arena-infra python -->
+```
+
+- **The env** is the first of these with a `bin/python` on the machine: on RunPod/Vast the image's
+  conda env (`/opt/<CONDA_ENV>`, then `/opt/conda/envs/…`, `~/miniconda3/envs/…`, …), then the
+  repo's `.venv`; on a bare VM (Hetzner, Shadeform) the repo's `.venv` first. None (a non-arena
+  image): a warning, nothing written. A GPU machine's line says "torch with CUDA".
+- **Installing:** `uv pip install --python <env>/bin/python PACKAGE` where `uv` is on PATH, else
+  `<env>/bin/python -m pip install PACKAGE`.
+- **uv on PATH:** the step first links `uv` and `uvx` from `~/.local/bin` into `/usr/local/bin`,
+  which every shell has (a Hetzner VM had uv only in `~/.local/bin`, on no shell's PATH: `uv` →
+  "command not found"). Only where nothing is there yet: a link already there is kept. The
+  Hetzner script and the image pods' agents step do the same.
+- **The files:** only the marked block is rewritten (the first one; a second is dropped); a file
+  without one gets it at the end, after a blank line; no file: one with just the block. Everything
+  else stays as it was, byte for byte. An unchanged file isn't written at all. A changed one is
+  swapped for the new one in one step (`renameat2`, as the VS Code warm-up's settings merge), with
+  its mode and owner, and through a link the file it points at; the file it replaces is kept
+  beside it (`CLAUDE.md.arena-XXXXXX`: an editor holding it open may still write into it). If
+  that isn't what was read (a save landed meanwhile), it goes straight back and the file is read
+  again; saved once more in that instant, and that save is kept beside it too, with a warning. A
+  file that isn't there is made only if it still isn't. Where no such swap can be made (no
+  `python3`), a file that's there is left alone, with a warning. A `BEGIN` line with no `END`
+  after it: the file is left alone, with a warning.
+- **Activating:** `source <env>/bin/activate` for a venv (the arena image's `/opt/arena-env` is a
+  uv venv, as is a VM's); `export PATH="<env>/bin:$PATH"` for an env without that script.
+
+**Running machines:** `arena pods setup --notes-only [targets]` runs just this step (no repo
+update, keys, tokens or VS Code; no targets = every pod), and a failure there is a ✗. It replaces
+a block a stopgap wrote by hand between the same markers. `AGENT_NOTES=0` turns the step off in
+setup (`--notes-only` still runs it).
 
 #### VS Code warm-up
 
@@ -1968,7 +2056,9 @@ keys from `<keys-dir>/<provider>_api_keys.csv` (openai/anthropic/openrouter) **p
 token** — a Hugging Face token (`--hf-token`/`HF_TOKEN`, sets `HF_TOKEN` +
 `HUGGING_FACE_HUB_TOKEN`) for **gated repos** (Llama 3, …) — and each pod's own **Claude Code
 account's token** ([`claude`](#claude-code-accounts-claude); `--cc-token` puts one token on every
-selected pod instead, moving nobody).
+selected pod instead, moving nobody). By default it says in one line what goes to which pods, a line
+per pod that failed with the command that retries it, and a tally; `-v` lists the key sources, what
+else goes on each pod and a line per pod.
 
 Every reachable target also gets the **fleet's ssh**, keys or not: every machine's keys authorized
 (shared, deploy, admin) and the host map in `~/.ssh/config` (pods reach each other with their deploy
@@ -2284,11 +2374,59 @@ inside the conda env) measures: nvidia-smi GPUs + driver + CUDA version; torch i
 an NCCL `all_reduce` across the GPUs (else `skipped (1 GPU)`); a 32 MiB Hugging Face download (no
 token sent); free disk on `/` and `/workspace`; host load + uptime; what setup's VS Code warm-up
 left (newest server, extensions, default interpreter — an informational `vscode` line, Pass or Skip,
-never WARN/FAIL). The provider's maintenance window comes from the API.
+never WARN/FAIL); and the machine's **AI keys** ([below](#ai-keys---keys)). The provider's maintenance
+window comes from the API.
 
 **FAIL**: any CUDA/tensor/copy/NCCL error, count mismatch (torch's count against nvidia-smi's, and
 against the GPUs the provider reports for the pod: fewer fails), missing torch/nvidia-smi, driver
-below the floor, unreachable/timed out.
+below the floor, unreachable/timed out — and a dead AI key, which is never the machine's.
+
+#### AI keys (`--keys`)
+
+`pods test --keys [targets] [--json] [-v]` checks only the keys. It takes a few seconds per
+machine, does no torch or GPU work, and has the same targets and cohort scope as `--deep`. A machine
+listed without an SSH endpoint is skipped with a note, never waited on. `--deep` checks the same
+keys, from the same script.
+
+The script asks about `$OPENROUTER_API_KEY` and `$HF_TOKEN` as the participant's login shell exports
+them. It makes one bounded call each (15 s): OpenRouter's `GET /api/v1/key`, which is free, and
+Hugging Face's `whoami-v2`. It reports the HTTP status, the key's cap, what's left of it and whether
+it's paused. It also reports the key's fingerprint: the first 12 hex of its SHA-256, which the control
+box compares with the keys CSV's key and with `HF_TOKEN`. The secret is never printed, and neither is
+OpenRouter's redacted label of it. curl reads the header on its stdin (`-K -`), so the key is on no
+command line.
+
+| Verdict | `ai_key` (OpenRouter) | `hf_token` | What it says to run |
+|---|---|---|---|
+| **FAIL** | missing, though the keys CSV has a row for the machine | missing (an `HF_TOKEN` is configured) | `pods copy-keys <name>` |
+| **FAIL** | missing, no row, but the machine has an owner (`--owner`, `spend assign`) | | `keys gen <name> --copy` |
+| **FAIL** | rejected (401/403): deleted, or paused (see below) | rejected | `keys rotate <name> --copy` or `keys resume <name>` / a new `HF_TOKEN` (or its `huggingface_api_keys.csv` row), then `copy-keys` |
+| **FAIL** | out of money (none left of its cap) | | `keys limit <name> +5` |
+| **WARN** | not the keys CSV's key: an old one, from before a rotate or a handover | not the config's `HF_TOKEN` | `pods copy-keys <name>` (this also fixes a FAIL above) |
+| **WARN** | under a tenth of its cap left, and under $1 | | `keys limit <name> +5` |
+| **WARN** | missing, and no row and no owner | | `keys gen <name> --copy`, if it should have one |
+| **WARN** | the call failed (network, timeout, 5xx, 429) | the same | `pods test --keys <name>`, later |
+| **WARN** | works, but no `sha256sum` on the machine to compare it with, or the keys CSV can't be read | | `pods copy-keys <name>` to be sure |
+| PASS | `ok, $4.97 of $5.00 left` (or `no cap`) | `accepted by Hugging Face` | |
+| note | a staff `@` box, a fleet with no keys (no keys-CSV rows, no `OPENROUTER_PROVISIONING_KEY`), a check from an older script | no `HF_TOKEN` configured | |
+
+The under-a-tenth line leaves a day or so to raise the cap before calls fail. It stops at $1 so that
+a large cap doesn't warn while it still has plenty.
+
+From the machine, a paused key and a deleted one get the same answer: 401 `User not found.`
+(checked live). With `OPENROUTER_PROVISIONING_KEY` set, the check reads OpenRouter's listing once
+per run, beside the calls, and says which: `paused … — keys resume <name>`, or `deleted — keys
+rotate <name> --copy`. Without it, the verdict names both. A script that couldn't run at all (no
+temp dir) is a `script` FAIL, never a pass.
+
+**A key isn't the machine.** `--deep` exits non-zero on a key FAIL (so does the daily health
+line), and the summary says `AI key failure, not the machine: …`. But `up --check` never replaces
+a machine for its key, never retries it, and never remembers its host as bad. A check whose only
+FAILs are keys still clears a bad-host record. `up --check` copies the keys after its deep check,
+then runs this check (`[apple] AI key ✓ ok, $4.97 of $5.00 left`). A dead key is said with what to
+run, and the machine stays READY (`check pass, AI key fail`). The dashboard's test (`e`) adds the
+verdict to its torch line. Its deep check (`d`) judges the keys, and its detail view has an
+`ai check:` line.
 
 #### MIG slices
 
@@ -2332,13 +2470,15 @@ with 0 GPUs still gets them, plus a `provider` warning).
 
 #### Output
 
-Output: a `NAME RESULT GPUS DRIVER CUDA NET NOTES` table, `-v` lists every check, and a `same host?`
+Output: a `NAME RESULT GPUS DRIVER CUDA NET NOTES` table (with `AI KEY` before NOTES once a key was
+judged: `$4.97 left`, `rejected`, `missing`, `paused`), `-v` lists every check, and a `same host?`
 line when ≥2 failing pods share a machine (a bad host breaks every pod on it): its IP, or on Vast
 its `machine_id` — never a Vast IP, which several machines can share; `up --check` rejects a
 replacement on a failed machine by the same rule).
 
-`--json` prints per-pod `{id, name, provider, status, checks, facts}` (no IPs) — `[]` when no pod
-could be checked; summary/notes go to stderr. Exits non-zero if any pod FAILs; warnings don't.
+`--json` prints per-pod `{id, name, provider, status, checks, facts}` (no IPs; the keys as
+`facts.openrouter` / `facts.hf`, fingerprints only) — `[]` when no pod could be checked;
+summary/notes go to stderr. Exits non-zero if any pod FAILs; warnings don't.
 Targets scope the run (a named pod with no SSH endpoint is a FAIL; a typo is an error). With no
 targets (or `--all`) it checks **this cohort's pods**: `<prefix>-…`, never an `@` staff entry or
 another prefix's pod — a staff box may be running someone's job — with one `⊘ skipped N non-cohort
@@ -2362,7 +2502,8 @@ Each verdict (and `up --check`'s) is also kept in the **health cache** for `snap
 `${XDG_STATE_HOME:-~/.local/state}/arena/<prefix>/health.json` — per `MACHINE_NAME_PREFIX`, so the
 sandbox and prod never share one; owner-only, written atomically under a lock, keyed by provider +
 pod id; records of pods their provider listed OK without are dropped. A corrupt file is one warning
-and gets replaced.
+and gets replaced. Each record also keeps its AI-key checks, a pass included, for the dashboard's
+`ai check:` line. A `--keys` run isn't recorded: the cache holds each machine's last full check.
 
 It also holds `up --check`'s **bad machines** (`bad_hosts`: machine id → when, pod, failed checks),
 dropped 72 h after their failure or when a complete check on the machine passes, never by a listing;
@@ -2550,6 +2691,10 @@ file (the page shows it going stale, never "No machines.").
 
 `teardown --check [--json]` — the **end-of-program audit** (read-only; deletes nothing): a `✓ ✗ ? –`
 checklist of what is still billing or scheduled, each with the exact command that cleans it up.
+By default it prints what's wrong — each ✗ and `?` item with what's there, its notes and its fix,
+each kept ◷ and not-checked – item as a line, cron and `at` with what they can't see (root's
+crontab, `/etc/cron.d`) — and the `ALL CLEAR` / `NOT CLEAR` verdict; `-v` adds the ✓ items, the
+balances and the suggested order. The verdict line and the exit status are the same either way.
 
 - Every pod on every configured provider in **any** state (a stopped pod keeps its name and still
   bills its disk; only `TERMINATED` is left out) — fix `pods terminate --all` only when every
@@ -2604,7 +2749,9 @@ or the exit; `--json` carries them as a top-level `balance`.
 ### `balance`
 
 `balance [--json] [--check] [--no-live] [-v]` — money left on each prepaid account, how long it
-lasts and **where the number comes from** (read-only). A balance is
+lasts and **where the number comes from** (read-only). By default the table and the notes that need a
+look (‼ ⚠ `?`, a read that failed); `-v` adds the legend, every account's notes and the parts behind
+each number. A balance is
 
 - **live** — **RunPod** GraphQL `myself { clientBalance currentSpendPerHr spendLimit underBalance }`
   (a field RunPod drops costs that field: the query is retried with `clientBalance` alone), **Vast**
@@ -2706,7 +2853,8 @@ under an hour's credit for them, over the spend limit, `underBalance` — never 
 
 `spend [--by owner|machine] [--since DATE] [--csv|--json]` — what each machine instance cost and
 who it was for, compute and AI, for the organisers (read-only towards the providers; it records
-what it read in the local ledger). `spend assign <machine|instance id|key hash> <owner>` (or
+what it read in the local ledger). The notes under the table (the window, the estimates, RunPod's
+footer) are `-v`'s. `spend assign <machine|instance id|key hash> <owner>` (or
 `--clear`) sets or fixes an owner; `--dry-run` says what it would change and move. A row has one
 owner for its whole life, so assigning a machine that has run up spend under someone else would
 move all of it to the new person: that's refused, saying what would move and what to do instead
@@ -2966,7 +3114,8 @@ in `/root`. `config which` lists all three with where each was found. An explici
 (never prints secret values; exits non-zero if a required key is missing or any key is set to a
 value it can't use — every such key is a ✗ row and is named in the error; ⚠ rows, e.g. a key file
 this user can't read, an admin key that is the shared one, or no `ARENA_START_DATE`, are advice). Copy `config.env.example` to get
-started.
+started. By default it prints only the ✗, ‼ (the report's ⚠) and `?` rows, each with its `└`
+lines, then the `OK — …` line or the error; `-v` prints every section and row.
 
 `config check | set | which` — `check` is the read-only doctor (keys + setup readiness); `config set
 KEY VALUE` writes a key (e.g. an API key) into config.env — or give just `KEY` and **pipe the value

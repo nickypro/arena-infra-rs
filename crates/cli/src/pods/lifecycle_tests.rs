@@ -275,7 +275,7 @@ fn cfg_text(dir: &Path) -> String {
     format!(
         "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(alpha bravo charlie delta echo @solo-gpu)\n\
          ARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\nGIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\n\
-         SSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH={}\nSSH_PROXY_RELOAD_CMD=\"\"\nVSCODE_PREINSTALL=0\nREPO_ON_VOLUME=0\n",
+         SSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH={}\nSSH_PROXY_RELOAD_CMD=\"\"\nVSCODE_PREINSTALL=0\nAGENT_NOTES=0\nREPO_ON_VOLUME=0\n",
         dir.join("proxy.conf").display()
     )
 }

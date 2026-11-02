@@ -4,20 +4,22 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use arena_core::out;
+use arena_core::out::To;
 use arena_core::provider::Provider;
 use arena_core::Config;
 use clap::Subcommand;
 
 use crate::plan::emit_proxy_plan;
 use crate::ssh_config::ssh_config_after;
-use crate::{confirm, expand_tilde, shell_quote};
+use crate::{confirm_brief, expand_tilde, shell_quote};
 
 #[derive(Subcommand)]
 pub(crate) enum ProxyCmd {
     /// Preview the proxy forwards and nginx config (read-only)
     ///
-    /// Merges the current config with every provider's listing (`+ ~ - =` per machine) and prints
-    /// the nginx `stream` config. Never connects to the proxy host.
+    /// Merges the current config with every provider's listing (`+ ~ - =` per machine); `-v` also
+    /// prints the nginx `stream` config. Never connects to the proxy host.
     #[command(verbatim_doc_comment)]
     Plan {
         /// Also write the rendered nginx config to this local file (never to the proxy)
@@ -55,16 +57,19 @@ pub(crate) async fn handle_proxy(cmd: ProxyCmd, provider: &dyn Provider, cfg: &C
                 return Ok(());
             }
             if prepared.up_to_date() {
-                println!("proxy config already up to date — nothing to write.");
+                out!(Detail, "proxy config already up to date — nothing to write.");
+                // The proxy cron's line every 5 minutes: one, and short.
+                out!(Brief, "{}", out::ok(format!("proxy config up to date ({} forward(s))", prepared.plan.forwards.len())));
                 return Ok(());
             }
-            if !confirm(yes, &format!("Will {}.", proxy_action(&prepared.pxcfg)))? {
-                println!("aborted.");
+            let question = format!("{}?", capitalized(&proxy_action_brief(&prepared)));
+            if !confirm_brief(yes, &format!("Will {}.", proxy_action(&prepared.pxcfg)), &question)? {
+                out!(Out, "aborted.");
                 return Ok(());
             }
             let written = write_proxy(cfg, &prepared).await?;
             if let Some(line) = written_line(&prepared.pxcfg, prepared.plan.forwards.len(), written) {
-                println!("{line}");
+                out!(Out, "{line}");
             }
         }
     }
@@ -127,7 +132,8 @@ async fn prepare_proxy(cfg: &Config, listing: &arena_core::proxy::Listing) -> Re
     let current = read_current_proxy(cfg, &pxcfg).await?;
     let parsed = current.as_deref().map(arena_core::proxy::parse_nginx_detailed).unwrap_or_default();
     if parsed.ignored_blocks > 0 {
-        eprintln!(
+        out!(
+            Err,
             "warning: {} server block(s) in the current proxy config aren't in a format arena can read \
              back — they'll be dropped when it's rewritten",
             parsed.ignored_blocks
@@ -175,20 +181,62 @@ async fn read_current_proxy(cfg: &Config, pxcfg: &arena_core::proxy::ProxyConfig
 }
 
 /// Print a prepared merge for review: provider failures, one `+ ~ - =` line per change
-/// (unchanged lines omitted), and the summary.
+/// (unchanged lines omitted), and the summary. By default a failure is its reason, and the
+/// changes show only when something will be written (the cron's run every 5 minutes is then
+/// one line); `-v` has it all.
 fn print_proxy_review(p: &PreparedProxy, listing: &arena_core::proxy::Listing) {
-    for (prov, e) in listing.errors() {
-        eprintln!("warning: {prov} listing failed: {e}");
-    }
+    listing_warnings(listing);
+    let level = if p.up_to_date() { To::Detail } else { To::Out };
     for line in p.plan.change_lines(&p.pxcfg.proxy_host, false) {
-        println!("  {line}");
+        out!(level, "  {line}");
     }
     let skipped = if p.plan.skipped.is_empty() {
         String::new()
     } else {
         format!("; {} pod(s) skipped (`arena proxy plan` lists why)", p.plan.skipped.len())
     };
-    println!("proxy: {}{skipped}", p.plan.summary());
+    out!(Detail, "proxy: {}{skipped}", p.plan.summary());
+    // A pod that gets no forward is said whatever else happens (review r1).
+    skipped_warnings(&p.plan);
+}
+
+/// The pods the plan skipped (no forward for them), by default: a line per reason, naming them.
+/// (`-v` says them one a line, or counts them.)
+pub(crate) fn skipped_warnings(plan: &arena_core::proxy::ProxyPlan) {
+    let mut reasons: Vec<(&str, Vec<&str>)> = Vec::new();
+    for s in &plan.skipped {
+        match reasons.iter_mut().find(|(r, _)| *r == s.reason) {
+            Some((_, names)) => names.push(&s.name),
+            None => reasons.push((&s.reason, vec![&s.name])),
+        }
+    }
+    for (reason, names) in &reasons {
+        out!(ErrBrief, "warning: skipped {} — {reason}", crate::pods::setup::all_names(names));
+    }
+}
+
+/// A provider whose listing failed (its forwards are kept as they were): the whole error with
+/// `-v`, its reason by default.
+pub(crate) fn listing_warnings(listing: &arena_core::proxy::Listing) {
+    for (prov, e) in listing.errors() {
+        out!(ErrDetail, "warning: {prov} listing failed: {e}");
+        out!(ErrBrief, "{}", out::warn(format!("{prov} didn't list ({}): its forwards are kept", out::reason_text(e))));
+    }
+}
+
+/// What an apply will do, as its one-line question says it: `write 3 forward(s) (+1 ~0 -0 =0)
+/// to this host:/etc/nginx/arena.conf and reload nginx`. Pure.
+fn proxy_action_brief(p: &PreparedProxy) -> String {
+    let px = &p.pxcfg;
+    let dest = if px.local { format!("this host:{}", expand_tilde(&px.nginx_path)) } else { format!("{}:{}", px.proxy_host, px.nginx_path) };
+    let then = if px.write_only() { " (write-only: no reload)" } else { " and reload nginx" };
+    format!("write {} forward(s) ({}) to {dest}{then}", p.plan.forwards.len(), p.plan.counts().compact())
+}
+
+/// `s` with its first letter upper-case.
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 /// `proxy apply --dry-run`: exactly what a real apply would write and run.
@@ -196,18 +244,21 @@ fn print_proxy_dry_run(cfg: &Config, p: &PreparedProxy) {
     let px = &p.pxcfg;
     let dest = if px.local { "this host".into() } else { format!("{}@{}", px.proxy_user, px.proxy_host) };
     if p.up_to_date() {
-        println!("[dry-run] {dest}:{} already matches — nothing would be written", px.nginx_path);
+        out!(Out, "[dry-run] {dest}:{} already matches — nothing would be written", px.nginx_path);
         return;
     }
-    println!("[dry-run] would write {} forward(s) to {dest}:{}", p.plan.forwards.len(), px.nginx_path);
+    out!(Detail, "[dry-run] would write {} forward(s) to {dest}:{}", p.plan.forwards.len(), px.nginx_path);
+    out!(Brief, "[dry-run] would {}", proxy_action_brief(p));
     if px.local {
         if px.write_only() {
-            println!(
+            out!(
+                Detail,
                 "  write {} only — SSH_PROXY_RELOAD_CMD is empty, so nginx is never reloaded",
                 expand_tilde(&px.nginx_path)
             );
         } else {
-            println!(
+            out!(
+                Detail,
                 "  write {} + run `{}` locally (the previous config is put back if that fails)",
                 expand_tilde(&px.nginx_path),
                 px.reload_cmd
@@ -215,17 +266,20 @@ fn print_proxy_dry_run(cfg: &Config, p: &PreparedProxy) {
         }
     } else {
         let target = arena_core::ssh::SshTarget::for_host(&px.proxy_user, &px.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
-        println!("  {}", target.display_scp("<rendered nginx>", "/tmp/.arena-proxy-<unique>.conf"));
+        out!(Detail, "  {}", target.display_scp("<rendered nginx>", "/tmp/.arena-proxy-<unique>.conf"));
         if px.write_only() {
-            println!("  then over SSH: install it as {} (no reload — SSH_PROXY_RELOAD_CMD is empty)", px.nginx_path);
+            out!(Detail, "  then over SSH: install it as {} (no reload — SSH_PROXY_RELOAD_CMD is empty)", px.nginx_path);
         } else {
-            println!(
+            out!(
+                Detail,
                 "  then over SSH: install it as {}, run `{}` (the previous config is put back if that fails)",
-                px.nginx_path, px.reload_cmd
+                px.nginx_path,
+                px.reload_cmd
             );
         }
     }
-    println!(
+    out!(
+        Detail,
         "(preview only — run without --dry-run to {})",
         if px.write_only() { "write it" } else { "deploy and reload nginx" }
     );
@@ -342,7 +396,7 @@ async fn deploy_proxy(
         };
         if review {
             if let Some(line) = written_line(&prepared.pxcfg, prepared.plan.forwards.len(), written) {
-                println!("{line}");
+                out!(Out, "{line}");
             }
         }
         return Ok((prepared, written));
@@ -436,7 +490,7 @@ pub(crate) async fn sync_proxy(cfg: &Config, fleet: &dyn Provider, why: &str) ->
     };
     let outcome = report_sync(why, outcome);
     for line in ssh_config_after(cfg, fleet, why).await {
-        println!("{line}");
+        arena_core::out!(if line.starts_with("warning:") { To::Err } else { To::Detail }, "{line}");
     }
     outcome
 }
@@ -448,9 +502,9 @@ pub(crate) async fn sync_proxy_to_stderr(cfg: &Config, fleet: &dyn Provider, why
         Err(reason) => ProxySync::Skipped(reason),
         Ok(()) => proxy_sync_now(cfg, fleet).await,
     };
-    eprintln!("{}", sync_line(why, &outcome));
+    arena_core::out!(if matches!(outcome, ProxySync::Failed(_)) { To::Err } else { To::ErrDetail }, "{}", sync_line(why, &outcome));
     for line in ssh_config_after(cfg, fleet, why).await {
-        eprintln!("{line}");
+        arena_core::out!(if line.starts_with("warning:") { To::Err } else { To::ErrDetail }, "{line}");
     }
     outcome
 }
@@ -480,13 +534,10 @@ pub(crate) async fn proxy_sync_now(cfg: &Config, fleet: &dyn Provider) -> ProxyS
 }
 
 /// Print a sync's line (failures to stderr) and hand the outcome back.
+/// A sync that worked is a detail (`-v`); one that failed is what's wrong, with its retry.
 fn report_sync(why: &str, outcome: ProxySync) -> ProxySync {
     let line = sync_line(why, &outcome);
-    if matches!(outcome, ProxySync::Failed(_)) {
-        eprintln!("{line}");
-    } else {
-        println!("{line}");
-    }
+    arena_core::out!(if matches!(outcome, ProxySync::Failed(_)) { To::Err } else { To::Detail }, "{line}");
     outcome
 }
 
@@ -889,3 +940,8 @@ mod tests {
 /// — so they can never run nginx or SSH anywhere.
 #[cfg(test)]
 mod proxy_deploy_tests;
+
+/// Golden tests of `proxy plan` and `proxy apply`'s output (docs/OUTPUT.md), at default and at
+/// `-v`, on a write-only local proxy file.
+#[cfg(test)]
+mod output_tests;

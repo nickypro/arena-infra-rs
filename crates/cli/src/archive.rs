@@ -29,6 +29,8 @@ use arena_core::ssh::{HostKeyPolicy, SshTarget};
 use arena_core::Config;
 
 use super::confirm;
+use arena_core::out;
+use arena_core::out::To;
 
 /// `arena archive …`.
 #[derive(clap::Subcommand, Debug)]
@@ -854,8 +856,11 @@ pub(crate) async fn archive_status(env: &Env<'_>, cloud: Option<&dyn ArchiveClou
     if json {
         println!("{}", serde_json::to_string_pretty(&r)?);
     } else {
-        println!("Backup archive {} (read-only check)\n", names.server());
-        print!("{}", r.render());
+        out!(Out, "Backup archive {} (read-only check)\n", names.server());
+        // By default the rows that need something, then the verdict; every row with `-v`.
+        for line in r.render_at(out::verbose()).lines() {
+            out!(Out, "{line}");
+        }
     }
     if !r.ok() {
         bail!("archive status: {} fail, {} unknown", r.count(report::Level::Fail), r.count(report::Level::Unknown));
@@ -936,10 +941,12 @@ async fn lock_within(path: &Path, patience: Duration) -> Result<Option<Lock>> {
 
 /// `archive sync` (§7.5), printing as it goes. Takes no `ArchiveCloud`: S13.
 pub(crate) async fn archive_sync(cfg: &Config, paths: &ArchivePaths, o: SyncOpts, rsync: &str, clock: &dyn Fn() -> u64) -> Result<()> {
-    archive_sync_with(cfg, paths, o, rsync, clock, &|line: &str| println!("{line}")).await
+    archive_sync_with(cfg, paths, o, rsync, clock, &out::emit).await
 }
 
-/// [`archive_sync`] with its output going to `say`. `rsync` is the program (a recording stub in
+/// [`archive_sync`] with its output going to `say`, each line at its level (docs/OUTPUT.md: by
+/// default — the cron's log — each tier's one line and what failed or needs doing; each pod's
+/// push and what waits for the next run with `-v`). `rsync` is the program (a recording stub in
 /// tests); `clock` the time each push starts and ends (sealing reads it).
 pub(crate) async fn archive_sync_with(
     cfg: &Config,
@@ -947,7 +954,7 @@ pub(crate) async fn archive_sync_with(
     o: SyncOpts,
     rsync: &str,
     clock: &dyn Fn() -> u64,
-    say: &dyn Fn(&str),
+    say: &dyn Fn(To, &str),
 ) -> Result<()> {
     let tiers: Vec<Tier> = match o.tier.as_str() {
         "both" => Tier::ALL.to_vec(),
@@ -982,7 +989,7 @@ pub(crate) async fn archive_sync_with(
     let raw_dir = o.dir.clone().unwrap_or_else(|| PathBuf::from(super::local_backup_dir(cfg)));
     let dir = std::fs::canonicalize(&raw_dir).with_context(|| format!("the backup dir {} doesn't exist (LOCAL_BACKUP_DIR / --dir)", raw_dir.display()))?;
     let big_root = big_root_for(cfg, &dir);
-    say(&format!("Pushing {} → {} ({}){}", dir.display(), host.ipv4, names.server(), if o.dry_run { " — dry run" } else { "" }));
+    say(To::Detail, &format!("Pushing {} → {} ({}){}", dir.display(), host.ipv4, names.server(), if o.dry_run { " — dry run" } else { "" }));
     if tiers.contains(&Tier::Snap) && !o.dry_run {
         if let Some(v) = rsync_without_mkpath(rsync) {
             bail!("this machine's rsync is {v}: the snap push needs 3.2.3 or newer (--mkpath) — upgrade rsync");
@@ -1014,7 +1021,7 @@ pub(crate) async fn archive_sync_with(
         match r {
             Ok(n) => failed += n,
             Err(e) => {
-                say(&format!("✗ {tier}: {e:#}"));
+                say(To::Out, &format!("✗ {tier}: {e:#}"));
                 failed += 1;
             }
         }
@@ -1030,17 +1037,17 @@ pub(crate) async fn archive_sync_with(
     let (not_listed, other) = push::control_box_only_in(&dir, big_seen, &local, &allowed, &names.prefix, &cfg.machine_names);
     let (forgotten_here, not_listed): (Vec<String>, Vec<String>) = not_listed.into_iter().partition(|d| c.forgotten.contains(d));
     if !not_listed.is_empty() {
-        say(&format!("not pushed — named like this cohort's pods but not on MACHINE_NAME_LIST: {} (add them to the list to archive them)", not_listed.join(", ")));
+        say(To::Out, &format!("not pushed — named like this cohort's pods but not on MACHINE_NAME_LIST: {} (add them to the list to archive them)", not_listed.join(", ")));
     }
     if !forgotten_here.is_empty() {
-        say(&format!("not pushed — forgotten (`arena archive forget`): {}", forgotten_here.join(", ")));
+        say(To::Detail, &format!("not pushed — forgotten (`arena archive forget`): {}", forgotten_here.join(", ")));
     }
     if !other.is_empty() {
-        say(&format!("kept on the control box only (staff boxes, other cohorts): {}", other.join(", ")));
+        say(To::Detail, &format!("kept on the control box only (staff boxes, other cohorts): {}", other.join(", ")));
     }
     let off_list = off_list_present(&dir, big_seen, &local, &allowed, &c.current);
     if !off_list.is_empty() {
-        say(&format!("off MACHINE_NAME_LIST, still archived (they were on it): {} — `arena archive forget <pod>` stops that", off_list.join(", ")));
+        say(To::Out, &format!("off MACHINE_NAME_LIST, still archived (they were on it): {} — `arena archive forget <pod>` stops that", off_list.join(", ")));
     }
     if failed > 0 {
         bail!("{failed} archive push(es) failed");
@@ -1062,7 +1069,7 @@ struct SyncCtx<'a> {
     host: &'a ArchiveHost,
     rsync: &'a str,
     clock: &'a dyn Fn() -> u64,
-    say: &'a dyn Fn(&str),
+    say: &'a dyn Fn(To, &str),
 }
 
 /// Who may be pushed right now, read from the state dir: the forgotten pods (A2-3) and today's
@@ -1177,21 +1184,23 @@ fn seed_note(tier: Tier, need: u64, ctx: &SyncCtx<'_>) {
         }
         None => String::new(),
     };
-    (ctx.say)(&format!("  first {tier} push: ≈ {} to send{room}{time}", arena_core::pull::human_bytes(need)));
+    // Said by default when the volume is too small for it (its fix); its size and time with `-v`.
+    let to = if room.is_empty() { To::Detail } else { To::Out };
+    (ctx.say)(to, &format!("  first {tier} push: ≈ {} to send{room}{time}", arena_core::pull::human_bytes(need)));
 }
 
 /// Say how many symlinks a push leaves out because the archive can't store them (A2-1) — the
 /// count, never their targets (a participant's text) — and which pods it can't carry at all.
 fn skip_note(ctx: &SyncCtx<'_>, what: &str, job: &PushJob) {
     if !job.skip.is_empty() {
-        (ctx.say)(&format!(
+        (ctx.say)(To::Out, &format!(
             "! {what}: {} symlink(s) left out — a target too long to store on the archive (over {} bytes)",
             job.skip.len(),
             push::PATH_MAX - push::MUNGE_PREFIX.len() - 1
         ));
     }
     for p in &job.left_out {
-        (ctx.say)(&format!(
+        (ctx.say)(To::Out, &format!(
             "! {what}: {p} left out of this push — over {} symlinks too long to store on the archive (or their rules couldn't be \
              written); remove them from the pod",
             push::MAX_SKIP_RULES
@@ -1264,7 +1273,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
         match lock_within(&ctx.paths.sync_lock(Tier::Snap), LOCK_PATIENCE).await? {
             Some(l) => Some(l),
             None => {
-                (ctx.say)("= snap: another `archive sync` is pushing it — skipped");
+                (ctx.say)(To::Out, "= snap: another `archive sync` is pushing it — skipped");
                 return Ok(0);
             }
         }
@@ -1273,7 +1282,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
     let start = start_days(ctx.cfg)?;
     let (mut st, reset) = state::load_snap(&ctx.paths.sync_state(Tier::Snap)).map_err(anyhow::Error::msg)?.for_volume(&ctx.host.snap_device);
     if reset {
-        (ctx.say)(&format!("! the snap volume is a different one now ({}): its sync state starts over — every label is pushed again", ctx.host.snap_device));
+        (ctx.say)(To::Out, &format!("! the snap volume is a different one now ({}): its sync state starts over — every label is pushed again", ctx.host.snap_device));
     }
     st.allowed_ever.extend(c.current.iter().cloned());
     // Whether a seed here proves its tree absent (R1): the state began with its volume, empty.
@@ -1286,7 +1295,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
     let plan = push::plan_snap(&local, &o.labels, &st, start);
     let base_todo: Vec<push::LocalBaseline> = baselines.iter().copied().filter(|b| !push::baseline_pushed(*b, &st)).collect();
     if plan.labels.is_empty() && base_todo.is_empty() {
-        (ctx.say)("= snap: nothing to push (every label is final)");
+        (ctx.say)(To::Out, "= snap: nothing to push (every label is final)");
         save_snap(ctx, &st)?;
         return Ok(0);
     }
@@ -1312,8 +1321,10 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
         let jobs = push::baseline_jobs(ctx.dir, &weeks);
         skip_note(ctx, "snap baseline", &jobs[0]);
         if o.dry_run {
+            let weeks: Vec<String> = base_todo.iter().map(|b| format!("w{}", b.week)).collect();
+            (ctx.say)(To::Brief, &format!("[dry-run] would push the snap baseline {} (-v: each rsync)", weeks.join(", ")));
             for j in &jobs {
-                (ctx.say)(&format!("[snap baseline{}] {}", if j.pass == SnapPass::Git { " .git" } else { "" }, arena_core::pull::display_argv(ctx.rsync, &push::push_args(j, &ctx.transport, ctx.settings))));
+                (ctx.say)(To::Detail, &format!("[snap baseline{}] {}", if j.pass == SnapPass::Git { " .git" } else { "" }, arena_core::pull::display_argv(ctx.rsync, &push::push_args(j, &ctx.transport, ctx.settings))));
             }
             for b in &base_todo {
                 st.baselines.insert(format!("w{}", b.week), b.mtime);
@@ -1321,7 +1332,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
         } else if !jobs[0].left_out.is_empty() {
             failed += 1;
             baseline_failed = true;
-            (ctx.say)("✗ snap baseline: left out of this run (labels are pushed without it and stay open until it's there)");
+            (ctx.say)(To::Out, "✗ snap baseline: left out of this run (labels are pushed without it and stay open until it's there)");
         } else {
             tried += 1;
             let root = ctx.dir.join(arena_core::pull::BASELINE_DIR);
@@ -1332,7 +1343,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
                     }
                     st.baseline_fails = 0;
                     baseline_ok = true;
-                    (ctx.say)(&format!("✓ snap baseline {} ({})", base_todo.iter().map(|b| format!("w{}", b.week)).collect::<Vec<_>>().join(", "), s.unwrap_or_default().summary()));
+                    (ctx.say)(To::Detail, &format!("✓ snap baseline {} ({})", base_todo.iter().map(|b| format!("w{}", b.week)).collect::<Vec<_>>().join(", "), s.unwrap_or_default().summary()));
                 }
                 Err((class, msg)) => {
                     failed += 1;
@@ -1340,7 +1351,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
                     st.last_error = Some(ErrRecord { at: (ctx.clock)(), label: Some("baseline".into()), class, message: msg.clone() });
                     let hint = push::failure_hint(class, Tier::Snap, ctx.host.snap_gb);
                     let hint = if hint.is_empty() { String::new() } else { format!("{hint}; ") };
-                    (ctx.say)(&format!("✗ snap baseline: {class} — {hint}{msg} (labels are pushed without it and stay open until it's there)"));
+                    (ctx.say)(To::Out, &format!("✗ snap baseline: {class} — {hint}{msg} (labels are pushed without it and stay open until it's there)"));
                     if push::archive_wide(class) {
                         outage = true;
                     } else {
@@ -1362,7 +1373,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
         let end = push::label_end(label, start);
         let src = ctx.dir.join(label);
         if !src.is_dir() {
-            (ctx.say)(&format!("✗ snap {label}: no such label in {}", ctx.dir.display()));
+            (ctx.say)(To::Out, &format!("✗ snap {label}: no such label in {}", ctx.dir.display()));
             failed += 1;
             continue;
         }
@@ -1404,7 +1415,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
             if o.dry_run {
                 if jobs[0].left_out.is_empty() {
                     for j in &jobs {
-                        (ctx.say)(&format!("[snap {label} {pod}{}] {}", if j.pass == SnapPass::Git { " .git" } else { "" }, arena_core::pull::display_argv(ctx.rsync, &push::push_args(j, &ctx.transport, ctx.settings))));
+                        (ctx.say)(To::Detail, &format!("[snap {label} {pod}{}] {}", if j.pass == SnapPass::Git { " .git" } else { "" }, arena_core::pull::display_argv(ctx.rsync, &push::push_args(j, &ctx.transport, ctx.settings))));
                     }
                 }
                 rec.pods_tried.insert(pod.clone());
@@ -1423,7 +1434,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
             }
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             if left.is_zero() {
-                (ctx.say)(&format!("… snap {label}: its {} s budget is used up — {pod} and the rest wait for the next run", budget.as_secs()));
+                (ctx.say)(To::Detail, &format!("… snap {label}: its {} s budget is used up — {pod} and the rest wait for the next run", budget.as_secs()));
                 not_started = Some(pod.clone());
                 complete = false;
                 break;
@@ -1435,7 +1446,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
             // is final and never waits ([`push::holds_for_pull`]).
             if push::holds_for_pull(how, could_seal) {
                 if pull_running(ctx.dir, pod) {
-                    (ctx.say)(&format!("… snap {label} {pod}: its pull is running (the pod's backup lock is held) — its first push waits for the next run"));
+                    (ctx.say)(To::Detail, &format!("… snap {label} {pod}: its pull is running (the pod's backup lock is held) — its first push waits for the next run"));
                     pull_waited.insert(pod.clone());
                     complete = false;
                     continue;
@@ -1471,7 +1482,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
                     complete = false;
                     cut_mid.get_or_insert(pod.clone());
                     let why = if sent > 0 { format!("it had sent {}", arena_core::pull::human_bytes(sent)) } else { format!("{} s of its {} s share left", left.as_secs(), fair.as_secs()) };
-                    (ctx.say)(&format!("… snap {label} {pod}: cut off by the label's budget ({why}; {msg}) — it continues next run, first"));
+                    (ctx.say)(To::Detail, &format!("… snap {label} {pod}: cut off by the label's budget ({why}; {msg}) — it continues next run, first"));
                 }
                 Err((class, msg)) => {
                     failed += 1;
@@ -1484,7 +1495,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
                     }
                     let hint = push::failure_hint(class, Tier::Snap, ctx.host.snap_gb);
                     let hint = if hint.is_empty() { String::new() } else { format!("{hint}; ") };
-                    (ctx.say)(&format!("✗ snap {label} {pod}: {class} — {hint}{msg}"));
+                    (ctx.say)(To::Out, &format!("✗ snap {label} {pod}: {class} — {hint}{msg}"));
                     if push::archive_wide(class) {
                         // The archive's failure, not the pod's (A3-2): stop, charge nobody.
                         outage = true;
@@ -1499,6 +1510,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
             save_snap(ctx, &st)?;
         }
         if o.dry_run {
+            (ctx.say)(To::Brief, &format!("[dry-run] would push snap {label}: {} pod(s) (-v: each rsync)", order.len()));
             // What the real run would leave, so the next labels show the links it would use.
             st.labels.insert(label.clone(), LabelRecord { ok_finished: 1, linked: true, ..rec });
             continue;
@@ -1525,21 +1537,26 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
                 String::new()
             };
             let note = if notes.is_empty() { String::new() } else { format!(" — note: {}", notes.join("; ")) };
-            (ctx.say)(&format!("✓ snap {label} ({} pod(s), {}{final_}){note}", pods.len(), stats.summary()));
+            (ctx.say)(To::Out, &format!("✓ snap {label} ({} pod(s), {}{final_}){note}", pods.len(), stats.summary()));
         } else if !through.is_empty() {
             // W7 live: a label one pod failed printed nothing for the pods that went through.
-            (ctx.say)(&format!(
+            (ctx.say)(To::Out, &format!(
                 "◐ snap {label} ({} of {} pod(s) through: {}; {}) — the label stays open for the rest",
                 through.len(),
                 pods.len(),
                 through.join(", "),
                 stats.summary()
             ));
+        } else {
+            // None through (its budget ran out, a push cut off, a pull still running, a failure):
+            // the label's line by default all the same, so a run that got nowhere says so — why,
+            // per pod, above it or with `-v`.
+            (ctx.say)(To::Brief, &format!("◐ snap {label} (0 of {} pod(s) through) — the label stays open; it continues next run", pods.len()));
         }
     }
     if o.dry_run {
         if !plan.deferred.is_empty() {
-            (ctx.say)(&format!("(then the next runs: {})", plan.deferred.join(", ")));
+            (ctx.say)(To::Detail, &format!("(then the next runs: {})", plan.deferred.join(", ")));
         }
         return Ok(0);
     }
@@ -1547,7 +1564,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
     //    failure every pod shares, or one in a run the archive itself failed, is nobody's.
     if outage {
         if !charges.is_empty() || baseline_failed {
-            (ctx.say)("  (the archive failed: none of this run's failures counts against a pod)");
+            (ctx.say)(To::Out, "  (the archive failed: none of this run's failures counts against a pod)");
         }
     } else {
         for ch in charges {
@@ -1557,7 +1574,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
             }
             let rec = st.labels.entry(ch.label.clone()).or_default();
             if push::note_push_failed(rec, &ch.pod, ch.class, ch.started, ch.end) {
-                (ctx.say)(&format!(
+                (ctx.say)(To::Out, &format!(
                     "! snap {} {}: failed {} runs in a row — sealed partial: kept as it is on the archive, later labels link to it \
                      (`arena archive sync --label {}` retries it)",
                     ch.label,
@@ -1572,7 +1589,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
         if baseline_failed && !ok_pods.is_empty() {
             st.baseline_fails += 1;
             if push::baseline_given_up(&st) {
-                (ctx.say)(&format!(
+                (ctx.say)(To::Out, &format!(
                     "! snap baseline: failed {} runs in a row — labels now seal without it (each pod keeps its own copy of the image's files)",
                     st.baseline_fails
                 ));
@@ -1580,11 +1597,11 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
         }
     }
     if !plan.deferred.is_empty() {
-        (ctx.say)(&format!("… {} older label(s) wait for the next runs: {}", plan.deferred.len(), plan.deferred.join(", ")));
+        (ctx.say)(To::Detail, &format!("… {} older label(s) wait for the next runs: {}", plan.deferred.len(), plan.deferred.join(", ")));
     }
     push::note_pull_waits(&mut st, &pull_waited, &pull_went, run_started);
     for (pod, w) in st.pull_waits.iter().filter(|(_, w)| push::pull_wait_overdue(w, run_started)) {
-        (ctx.say)(&format!(
+        (ctx.say)(To::Out, &format!(
             "! snap {pod}: its first push of today's label has waited for its running pull {} runs in a row — `arena archive status`",
             w.runs
         ));
@@ -1606,7 +1623,7 @@ async fn sync_big(ctx: &SyncCtx<'_>) -> Result<usize> {
         match lock_within(&ctx.paths.sync_lock(Tier::Big), LOCK_PATIENCE).await? {
             Some(l) => Some(l),
             None => {
-                (ctx.say)("= big: another `archive sync` is pushing it — skipped");
+                (ctx.say)(To::Out, "= big: another `archive sync` is pushing it — skipped");
                 return Ok(0);
             }
         }
@@ -1614,13 +1631,13 @@ async fn sync_big(ctx: &SyncCtx<'_>) -> Result<usize> {
     let c = cohort(ctx.cfg, ctx.names, ctx.paths)?;
     let (mut st, reset) = state::load_big(&ctx.paths.sync_state(Tier::Big)).map_err(anyhow::Error::msg)?.for_volume(&ctx.host.big_device);
     if reset {
-        (ctx.say)(&format!("! the big volume is a different one now ({}): its sync state starts over", ctx.host.big_device));
+        (ctx.say)(To::Out, &format!("! the big volume is a different one now ({}): its sync state starts over", ctx.host.big_device));
     }
     st.allowed_ever.extend(c.current.iter().cloned());
     let allowed = push::push_set(&ctx.names.prefix, &ctx.cfg.machine_names, &st.allowed_ever, &c.forgotten);
     let src = ctx.big.to_path_buf();
     if !src.is_dir() {
-        (ctx.say)(&format!("= big: nothing to push yet (no {})", src.display()));
+        (ctx.say)(To::Out, &format!("= big: nothing to push yet (no {})", src.display()));
         save_big(ctx, &st)?;
         return Ok(0);
     }
@@ -1636,12 +1653,14 @@ async fn sync_big(ctx: &SyncCtx<'_>) -> Result<usize> {
     let deadline = tokio::time::Instant::now() + budget;
     let fair = budget / u32::try_from(pods.len().max(1)).unwrap_or(u32::MAX);
     let (mut failed, mut ok, mut tried, mut real_failures, mut outage, mut all_through) = (0usize, 0usize, 0usize, 0usize, false, true);
+    // What the pods that went through sent, for the tier's one line.
+    let mut sent_all = arena_core::pull::RsyncStats::default();
     for pod in &pods {
         let job = push::big_job_in(ctx.big, std::slice::from_ref(pod));
         skip_note(ctx, &format!("big {pod}"), &job);
         if o.dry_run {
             if job.left_out.is_empty() {
-                (ctx.say)(&format!("[big {pod}] {}", arena_core::pull::display_argv(ctx.rsync, &push::push_args(&job, &ctx.transport, ctx.settings))));
+                (ctx.say)(To::Detail, &format!("[big {pod}] {}", arena_core::pull::display_argv(ctx.rsync, &push::push_args(&job, &ctx.transport, ctx.settings))));
             }
             continue;
         }
@@ -1654,7 +1673,7 @@ async fn sync_big(ctx: &SyncCtx<'_>) -> Result<usize> {
         }
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
-            (ctx.say)(&format!("… big: its {} s budget is used up — {pod} and the rest go first next run", budget.as_secs()));
+            (ctx.say)(To::Detail, &format!("… big: its {} s budget is used up — {pod} and the rest go first next run", budget.as_secs()));
             all_through = false;
             break;
         }
@@ -1666,12 +1685,17 @@ async fn sync_big(ctx: &SyncCtx<'_>) -> Result<usize> {
                 ok += 1;
                 st.pods_ok_at.insert(pod.clone(), at.max(1));
                 st.pods_failing.remove(pod);
-                (ctx.say)(&format!("✓ big {pod} ({}){}", stats.unwrap_or_default().summary(), note.map(|n| format!(" — note: {n}")).unwrap_or_default()));
+                let stats = stats.unwrap_or_default();
+                sent_all = sent_all.add(stats);
+                // By default only when it has a note (files that vanished mid-push): the tier's line
+                // says the rest.
+                let to = if note.is_some() { To::Out } else { To::Detail };
+                (ctx.say)(to, &format!("✓ big {pod} ({}){}", stats.summary(), note.map(|n| format!(" — note: {n}")).unwrap_or_default()));
             }
             Err((PushFailure::Timeout, msg)) if left < fair || sent > 0 => {
                 all_through = false;
                 let why = if sent > 0 { format!("it had sent {}", arena_core::pull::human_bytes(sent)) } else { format!("{} s of its {} s share left", left.as_secs(), fair.as_secs()) };
-                (ctx.say)(&format!("… big {pod}: cut off by the budget ({why}; {msg}) — it continues next run"));
+                (ctx.say)(To::Detail, &format!("… big {pod}: cut off by the budget ({why}; {msg}) — it continues next run"));
             }
             Err((class, msg)) => {
                 failed += 1;
@@ -1679,7 +1703,7 @@ async fn sync_big(ctx: &SyncCtx<'_>) -> Result<usize> {
                 all_through = false;
                 st.last_error = Some(ErrRecord { at, label: Some(pod.clone()), class, message: format!("{pod}: {msg}") });
                 let hint = push::failure_hint(class, Tier::Big, ctx.host.big_gb);
-                (ctx.say)(&format!("✗ big {pod}: {class} — {}{msg}", if hint.is_empty() { String::new() } else { format!("{hint}; ") }));
+                (ctx.say)(To::Out, &format!("✗ big {pod}: {class} — {}{msg}", if hint.is_empty() { String::new() } else { format!("{hint}; ") }));
                 if push::archive_wide(class) {
                     outage = true;
                     save_big(ctx, &st)?;
@@ -1691,8 +1715,21 @@ async fn sync_big(ctx: &SyncCtx<'_>) -> Result<usize> {
         save_big(ctx, &st)?;
     }
     if o.dry_run {
+        (ctx.say)(To::Brief, &format!("[dry-run] would push big: {} pod(s) (-v: each rsync)", pods.len()));
         return Ok(0);
     }
+    // The tier's one line by default (each pod's with `-v`), after its failures' own.
+    let n = pods.len();
+    let tally = if all_through && n > 0 {
+        format!("✓ big ({n} pod(s), {})", sent_all.summary())
+    } else if failed == 0 && n > 0 {
+        format!("◐ big ({ok} of {n} pod(s) through, {}) — the rest go first next run", sent_all.summary())
+    } else if n > 0 {
+        format!("✗ big: {failed} of {n} pod(s) failed · {ok} through ({})", sent_all.summary())
+    } else {
+        "= big: nothing to push (no pod's copy here)".to_string()
+    };
+    (ctx.say)(To::Brief, &tally);
     let finished = (ctx.clock)();
     let run = RunRecord { started, finished, ok: failed == 0, all_failed: outage || (tried > 0 && ok == 0 && real_failures > 0) };
     st.last_run = Some(run);
@@ -3308,8 +3345,58 @@ mod tests {
 
     async fn sync_said_cfg(cfg: &Config, w: &World, o: SyncOpts, stub: &str, now: u64) -> (Result<()>, Vec<String>) {
         let lines = Mutex::new(Vec::new());
-        let r = archive_sync_with(cfg, &w.env().paths, o, stub, &clock(now), &|l: &str| lines.lock().unwrap().push(l.to_string())).await;
+        // What `-v` shows: every line the sync said before its default got shorter.
+        let say = |to: To, l: &str| {
+            if to.shows(true) {
+                lines.lock().unwrap().push(l.to_string());
+            }
+        };
+        let r = archive_sync_with(cfg, &w.env().paths, o, stub, &clock(now), &say).await;
         (r, lines.into_inner().unwrap())
+    }
+
+    /// `archive sync` — the cron's, every 15 minutes — by default (docs/OUTPUT.md): a line per
+    /// label pushed and one for big; with `-v` (as before) where it pushes, each big pod, and what
+    /// it left on the control box. A dry run: what it would push, a line each; the rsyncs with `-v`.
+    #[tokio::test]
+    async fn sync_by_default_is_a_line_per_tier() {
+        let w = world("sync-golden");
+        seed(&w);
+        let stub = rsync_stub(&w.dir);
+        let now = day_end("w0d1") + 3 * 3600;
+        let dir = w.dir.display().to_string();
+        let (w, stub, dir) = (&w, &stub, &dir);
+        let run = |o: SyncOpts, at: u64| async move {
+            let lines = Mutex::new(Vec::new());
+            let say = |to: To, l: &str| lines.lock().unwrap().push((to, l.to_string()));
+            // A push that fails fails the run: what it said is the point here.
+            let _ = archive_sync_with(&w.cfg, &w.env().paths, o, stub, &clock(at), &say).await;
+            let lines = lines.into_inner().unwrap();
+            let at = |verbose: bool| lines.iter().filter(|(to, _)| to.shows(verbose)).map(|(_, l)| format!("{l}\n")).collect::<String>();
+            (at(false), at(true).replace(dir.as_str(), "<dir>"))
+        };
+        let (dry, dry_v) = run(SyncOpts { dry_run: true, ..sync_opts("both") }, now).await;
+        // The pod named like the cohort's but off the list is said by default: it's the one fix here.
+        let ghost = "not pushed — named like this cohort's pods but not on MACHINE_NAME_LIST: devtest-ghost (add them to the list to archive them)\n";
+        assert_eq!(dry, format!("[dry-run] would push snap w0d2: 1 pod(s) (-v: each rsync)\n[dry-run] would push snap w0d1: 1 pod(s) (-v: each rsync)\n[dry-run] would push big: 1 pod(s) (-v: each rsync)\n{ghost}"));
+        assert!(dry_v.starts_with("Pushing <dir>/") && dry_v.contains("\n[snap w0d2 devtest-alpha] ") && dry_v.contains("\n[big devtest-alpha] "), "{dry_v}");
+        let (brief, verbose) = run(sync_opts("both"), now).await;
+        let snap: Vec<&str> = brief.lines().filter(|l| l.starts_with("✓ snap ")).collect();
+        assert_eq!(snap.len(), 2, "{brief}");
+        assert!(snap[0].starts_with("✓ snap w0d2 (1 pod(s), ") && snap[1].starts_with("✓ snap w0d1 (1 pod(s), ") && snap[1].ends_with(", final)"), "{brief}");
+        assert_eq!(brief.lines().count(), 4, "{brief}");
+        assert!(brief.lines().nth(2).is_some_and(|l| l.starts_with("✓ big (1 pod(s), ")), "{brief}");
+        assert!(brief.ends_with(ghost), "{brief}");
+        assert!(verbose.starts_with("Pushing <dir>/") && verbose.contains("\n✓ big devtest-alpha (") && !verbose.contains("✓ big (1 pod(s)"), "{verbose}");
+        assert_eq!(verbose.lines().filter(|l| l.starts_with("✓ snap ")).collect::<Vec<_>>(), snap, "the labels' lines at both");
+        // A label nobody got through still has its line by default (review r1 #3): here after
+        // the pod's own failure.
+        std::fs::write(w.dir.join("fail-pod-devtest-alpha"), "rsync: [sender] send_files failed to open \"/x\": Permission denied (13)\n").unwrap();
+        std::fs::write(w.dir.join("fail-pod-devtest-alpha.code"), "23").unwrap();
+        let (brief, _) = run(sync_opts("snap"), now + 900).await;
+        let lines: Vec<&str> = brief.lines().collect();
+        assert!(lines.first().is_some_and(|l| l.starts_with("✗ snap w0d2 devtest-alpha: ")), "{brief}");
+        assert!(lines.contains(&"◐ snap w0d2 (0 of 1 pod(s) through) — the label stays open; it continues next run"), "{brief}");
     }
 
     /// §14: the newest label first (behind it the backlog, oldest first), pod by pod — two
