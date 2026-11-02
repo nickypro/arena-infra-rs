@@ -10,6 +10,12 @@
 //! and a rename (metadata only, restart-free) assumed allowed — neither is live-verified,
 //! which is why the commands below don't lean on the API for them (see [`refusal`]).
 //!
+//! A Hetzner VM's lock is its delete + rebuild protection (`POST
+//! /servers/{id}/actions/change_protection`, read back from `protection`): Hetzner refuses a
+//! delete or a rebuild of it from any client, its console included (`423 protected`), but not a
+//! shutdown, reset or power-off. arena's own stop and restart refuse it up front all the same —
+//! the lock means the same thing in every arena command, whichever backend holds it.
+//!
 //! Lifting a lock is always an explicit step: `arena pods unlock`, or `pods terminate
 //! --unlock` (which says so in its confirm text). Nothing here ever unlocks on its own.
 //!
@@ -91,14 +97,25 @@ pub fn plan<'a>(pods: &'a [Pod], lock: bool, support: impl Fn(&Pod) -> Result<()
     out
 }
 
-/// What a lock or unlock does, for the confirm text and the dry run.
-pub fn consequence(lock: bool) -> &'static str {
-    if lock {
-        "a locked pod refuses stop, restart and terminate — from any client, RunPod's console included — \
-         until `arena pods unlock` (setup, backups, run, SSH: all unaffected)"
-    } else {
-        "an unlocked pod can be stopped, restarted and terminated again — from any client"
+/// What a lock or unlock does, for the confirm text and the dry run, on the backends of
+/// `providers` (the pods' provider names): RunPod's lock and Hetzner's protection don't hold
+/// against the same things outside arena.
+pub fn consequence(lock: bool, providers: &[&str]) -> String {
+    if !lock {
+        return "an unlocked pod can be stopped, restarted and terminated again — from any client".into();
     }
+    let mut outside = Vec::new();
+    if providers.contains(&"runpod") {
+        outside.push("RunPod refuses them from any client, its console included");
+    }
+    if providers.contains(&"hetzner") {
+        outside.push("Hetzner refuses a delete or rebuild from any client, its console included (a stop or restart only arena refuses)");
+    }
+    let outside = if outside.is_empty() { String::new() } else { format!("; {}", outside.join("; ")) };
+    format!(
+        "a locked pod refuses stop, restart and terminate until `arena pods unlock`{outside} (setup, backups, run, SSH: \
+         all unaffected)"
+    )
 }
 
 #[cfg(test)]
@@ -169,7 +186,22 @@ mod tests {
                 "lock={lock}: a backend that can't lock is reported whatever its pod claims"
             );
         }
-        assert!(consequence(true).contains("refuses stop, restart and terminate"));
-        assert!(consequence(false).contains("can be stopped"));
+        assert!(consequence(true, &["runpod"]).contains("refuses stop, restart and terminate"));
+        assert!(consequence(false, &["runpod"]).contains("can be stopped"));
+    }
+
+    /// The confirm says what holds outside arena on each backend in the selection: RunPod's lock
+    /// refuses all three from any client, Hetzner's protection only a delete (and a rebuild).
+    #[test]
+    fn the_consequence_says_what_each_backend_refuses_outside_arena() {
+        let rp = consequence(true, &["runpod"]);
+        assert!(rp.contains("RunPod refuses them from any client, its console included") && !rp.contains("Hetzner"), "{rp}");
+        let hz = consequence(true, &["hetzner"]);
+        assert!(hz.starts_with("a locked pod refuses stop, restart and terminate until `arena pods unlock`"), "{hz}");
+        assert!(hz.contains("Hetzner refuses a delete or rebuild") && hz.contains("a stop or restart only arena refuses"), "{hz}");
+        assert!(!hz.contains("RunPod"), "{hz}");
+        let both = consequence(true, &["hetzner", "runpod"]);
+        assert!(both.contains("RunPod refuses") && both.contains("Hetzner refuses"), "{both}");
+        assert_eq!(consequence(false, &["hetzner"]), consequence(false, &["runpod"]));
     }
 }

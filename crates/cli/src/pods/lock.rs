@@ -73,7 +73,7 @@ pub(crate) fn lock_settles(mut lock: std::fs::File) -> Option<arena_core::pull::
 }
 
 /// The providers some of whose pods can be locked (a backend of theirs can, in the capability
-/// table — RunPod: on REST v2), for the hint that leaves the others out. Pure.
+/// table — RunPod on REST v2, Hetzner), for the hint that leaves the others out. Pure.
 fn lockable_providers() -> Vec<&'static str> {
     use arena_core::capability::{support, Backend};
     let mut out: Vec<&str> = Backend::ALL.into_iter().filter(|b| support(*b, Op::Lock).works()).map(Backend::provider).collect();
@@ -83,7 +83,7 @@ fn lockable_providers() -> Vec<&'static str> {
 
 /// `pods lock` / `pods unlock` (`lock` says which). The selection is sorted first
 /// ([`arena_core::lock::plan`]): pods already in that state are said and left alone; pods
-/// whose backend can't lock (the capability table: RUNPOD_API=v1, Vast, Hetzner, Shadeform)
+/// whose backend can't lock (the capability table: RUNPOD_API=v1, Vast, Shadeform)
 /// are reported one by one and make the exit non-zero — the operator asked for them to be
 /// (un)protected and they aren't; the rest are set one at a time after one confirm, a failure
 /// reported and carried on from.
@@ -113,7 +113,8 @@ pub(crate) async fn handle_lock(provider: &dyn Provider, sel: &Selected, lock: b
         )
     });
     let names: Vec<&str> = plan.act.iter().map(|p| p.name.as_str()).collect();
-    let what = format!("{verb} {} pod(s): {}\n  ({})", names.len(), names.join(", "), lock::consequence(lock));
+    let providers: Vec<&str> = plan.act.iter().map(|p| p.provider.as_str()).collect();
+    let what = format!("{verb} {} pod(s): {}\n  ({})", names.len(), names.join(", "), lock::consequence(lock, &providers));
     if dry_run {
         if !names.is_empty() {
             println!("[dry-run] would {what}");

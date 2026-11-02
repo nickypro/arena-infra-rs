@@ -23,7 +23,7 @@ pub(crate) fn split_by<'a>(provider: &dyn Provider, op: Op, pods: impl IntoItera
 }
 
 /// The pods that can't, one line per reason (pods with the same reason together): `apple, bloom
-/// (hetzner): arena can't reimage a Hetzner VM yet (…) — back it up …`. Pure.
+/// (vast): Vast can't swap an instance's image in place — back it up …`. Pure.
 pub(crate) fn cant_lines(cant: &[(&Pod, String)]) -> Vec<String> {
     let mut groups: Vec<(&str, Vec<&Pod>)> = Vec::new();
     for (p, why) in cant {
@@ -175,23 +175,24 @@ mod tests {
     /// instead and how to leave them out; one pod alone reads as one line; all able: nothing.
     #[test]
     fn a_refusal_names_each_pod_that_cant_and_why() {
-        let (a, b, c) = (pod("apple", "runpod"), pod("bloom", "hetzner"), pod("cloud", "hetzner"));
+        let (a, b, c) = (pod("apple", "runpod"), pod("bloom", "vast"), pod("cloud", "vast"));
         let r = refusal(&Fleet, Op::Reimage, "reimage", &[&a, &b, &c]).unwrap();
-        let why = capability::support(Backend::Hetzner, Op::Reimage).refusal().unwrap();
+        let why = capability::support(Backend::Vast, Op::Reimage).refusal().unwrap();
         assert_eq!(
             r,
             format!(
-                "refusing to reimage anything — 2 of the 3 pod(s) can't be:\n  devtest-bloom, devtest-cloud (hetzner): {why}\n  \
+                "refusing to reimage anything — 2 of the 3 pod(s) can't be:\n  devtest-bloom, devtest-cloud (vast): {why}\n  \
                  (to reimage the others, leave these out: --exclude devtest-bloom,devtest-cloud)"
             )
         );
-        assert_eq!(refusal(&Fleet, Op::Reimage, "reimage", &[&b]).unwrap(), format!("refusing to reimage devtest-bloom (hetzner): {why}"));
+        assert_eq!(refusal(&Fleet, Op::Reimage, "reimage", &[&b]).unwrap(), format!("refusing to reimage devtest-bloom (vast): {why}"));
         assert_eq!(refusal(&Fleet, Op::Reimage, "reimage", &[&a]), None);
+        assert_eq!(refusal(&Fleet, Op::Reimage, "reimage", &[&a, &pod("vm", "hetzner")]), None, "a Hetzner VM is rebuilt");
         // Two reasons, two lines (no "leave out" when none could).
-        let v = pod("delta", "vast");
+        let v = pod("delta", "shadeform");
         let r = refusal(&Fleet, Op::Reimage, "reimage", &[&b, &v]).unwrap();
         assert_eq!(r.lines().count(), 3, "{r}");
-        assert!(r.contains("devtest-delta (vast): Vast can't swap") && !r.contains("--exclude"), "{r}");
+        assert!(r.contains("devtest-delta (shadeform): Shadeform can't swap") && !r.contains("--exclude"), "{r}");
         let e = pod("echo", "shadeform");
         let (cant, can) = split_by(&Fleet, Op::Stop, [&a, &e]);
         assert_eq!((cant.len(), can.len()), (1, 1));

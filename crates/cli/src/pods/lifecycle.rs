@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arena_core::capability::Op;
+use arena_core::out;
 use arena_core::provider::{ContainerReset, Provider};
 use arena_core::remote::{Remote, PROBE_TIMEOUT};
 use arena_core::selector::Naming;
@@ -20,18 +21,31 @@ use crate::pods::replace::wait_for_stable_endpoint_every;
 use crate::pods::selection::{just_these, Selected};
 use crate::pods::setup::handle_setup;
 use crate::proxy::{sync_proxy, ProxySync};
-use crate::{confirm, confirm_typed, spend};
+use crate::{confirm, confirm_brief, confirm_typed, spend};
 
-/// `pods reimage`: swap image + re-seed keys in place — a fresh container, so its disk is
-/// wiped — then bring the pods back usable like a restart does ([`come_back`]): settled
-/// endpoints, setup again, the proxy.
+/// `pods reimage`: swap image + re-seed keys in place — a fresh container (a Hetzner VM:
+/// rebuilt), so its disk is wiped — then bring the pods back usable like a restart does
+/// ([`come_back`]): settled endpoints, setup again, the proxy.
 ///
 /// Gated exactly like restart/stop (live finding #2: a reimage wiped participants' files
 /// with only `-y`, and `--all -y` would wipe the cohort): each pod's fate is judged by where
 /// its repo really is ([`repo_sites`]), and a pod whose work isn't on a confirmed volume is
-/// refused without `--wipe-ok`; the dry run says so. And it re-runs setup afterwards (live
+/// refused without `--wipe-ok`; the dry run says so. Then, unless `force`, a pod someone is on
+/// — or that can't be read — is refused, as `replace` refuses one ([`busy_refusals`]): the
+/// wipe would take what they're working on. Asked of the whole selection before the prompt,
+/// and of each pod again right before its own reimage (one found busy then is skipped, and
+/// fails the exit). And it re-runs setup afterwards (live
 /// finding #8: a reimaged pod was left with no `~/.name`, the public git remote and no
 /// deploy key — backups then silently couldn't push).
+///
+/// What each pod gets ([`reimage_images`]): a container pod `--image` / RUNPOD_DOCKER_IMAGE; a
+/// Hetzner VM `--image` / HETZNER_IMAGE, `arena` resolved now for its server type and said —
+/// the snapshot, its name and age (ops feedback #2: the dry run named the RunPod image).
+///
+/// What it says (docs/OUTPUT.md): by default the image lines, then the prompt or the dry run in
+/// one line ([`reimage_what`]: whose disk goes, and whose work), and a pod found busy right
+/// before its own reimage as one line with its retry. `-v` says what it said before: the keys,
+/// each pod's plan, the whole refusal.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_reimage(
     provider: &dyn Provider,
@@ -41,6 +55,8 @@ pub(crate) async fn handle_reimage(
     // The pods to reimage, resolved by the caller (which demands names or --all).
     sel: &Selected,
     image: Option<String>,
+    // Go on with someone on a pod (or a pod that couldn't be read).
+    force: bool,
     opts: RestartOpts,
     settle: SettleWait,
     // Where the per-host API-key CSVs live (`keys_dir`; a temp dir in tests).
@@ -53,23 +69,22 @@ pub(crate) async fn handle_reimage(
         return Ok(());
     }
     let refs: Vec<&arena_core::Pod> = pods.iter().collect();
-    // A pod whose provider can't reimage (only RunPod can) refuses the whole selection, dry run
+    // `--image` as given, for a busy pod's retry.
+    let given_image = image.clone();
+    // A pod whose provider can't reimage (Vast, Shadeform) refuses the whole selection, dry run
     // or not — before the wipe gate and the confirm, which would only mislead: it used to fail
     // there, after both, reading the pod's spec.
     if let Some(r) = crate::pods::capable::refusal(provider, Op::Reimage, "reimage", &refs) {
         anyhow::bail!("{r}");
     }
     // A reimage resets the container — exactly what a lock is for ("cannot be stopped or
-    // reset"). Refused here, up front, rather than left to an API refusal nobody has
-    // verified for the reimage PATCH.
+    // reset"); a Hetzner VM's lock is its rebuild protection. Refused here, up front, rather
+    // than left to an API refusal nobody has verified for the reimage PATCH.
     let locked = arena_core::lock::refusal("reimage", &refs, "");
     if let (Some(r), false) = (&locked, dry_run) {
         anyhow::bail!("{r}");
     }
-    let image = image.unwrap_or_else(|| PodSpec::from_config(cfg).image);
-    if image.is_empty() {
-        anyhow::bail!("no image: pass --image or set RUNPOD_DOCKER_IMAGE");
-    }
+    let (container_image, vm_setting) = reimage_images(pods, image, cfg)?;
     let pubkeys = arena_core::ssh::authorized_pubkeys(cfg);
     if pubkeys.is_empty() {
         anyhow::bail!("no readable public keys from SHARED_SSH_KEY_PATH/GIT_SSH_KEY_LOCAL/ADMIN_SSH_KEY_PATH — refusing to lock pods out");
@@ -84,6 +99,11 @@ pub(crate) async fn handle_reimage(
     } else {
         arena_core::setup::SetupTimeouts::default()
     };
+    // Each VM's image, `arena` resolved for its server type — before anything is asked.
+    let vm_images = match &vm_setting {
+        Some(setting) => vm_images(cfg, pods, setting).await?,
+        None => Vec::new(),
+    };
     // What the reimage costs each pod, by where its repo really is (asked of pods with a
     // volume only, bounded, all at once).
     let mut fates = Vec::with_capacity(pods.len());
@@ -95,36 +115,70 @@ pub(crate) async fn handle_reimage(
     let lines: Vec<String> = pods
         .iter()
         .zip(fates.iter().zip(&sites))
-        .map(|(p, (f, site))| format!("  {} (id={}, {}): {}", p.name, p.id, p.provider, f.describe(DiskOp::Reimage, site)))
+        .map(|(p, (f, site))| format!("  {} (id={}, {}): {}", p.name, p.id, p.provider, f.describe(reimage_op(p), site)))
         .collect();
-    let blocked: Vec<&str> = pods
-        .iter()
-        .zip(fates.iter().zip(&sites))
-        .filter(|(_, (f, site))| f.needs_wipe_ok(site))
-        .map(|(p, _)| p.name.as_str())
-        .collect();
+    let blocked: Vec<&arena_core::Pod> =
+        pods.iter().zip(fates.iter().zip(&sites)).filter(|(_, (f, site))| f.needs_wipe_ok(site)).map(|(p, _)| p).collect();
+    let blocked_names: Vec<&str> = blocked.iter().map(|p| p.name.as_str()).collect();
+    // The refusal's words: a VM's rebuild when only VMs are refused, a container's otherwise.
+    let blocked_op = if blocked.iter().all(|p| reimage_op(p) == DiskOp::Rebuild) { DiskOp::Rebuild } else { DiskOp::Reimage };
     let then = afterwards_line(ContainerReset::Yes, setup, skip_proxy);
-    println!("image: {image}\nkeys:  {}", pubkeys.iter().map(|k| k.split_whitespace().last().unwrap_or("?")).collect::<Vec<_>>().join(", "));
+    let onto = image_lines(container_image.as_deref(), &vm_images);
+    // What each kind of pod goes onto, by default (ops feedback #2: the image, `arena` resolved,
+    // before anything is asked); the keys that go in are `-v`'s.
+    for l in &onto {
+        out!(Out, "{l}");
+    }
+    out!(Detail, "keys:  {}", pubkeys.iter().map(|k| k.split_whitespace().last().unwrap_or("?")).collect::<Vec<_>>().join(", "));
+    if !(blocked.is_empty() || wipe_ok || dry_run) {
+        anyhow::bail!("{}", wipe_refusal(blocked_op, false, &blocked_names, &repo));
+    }
+    // Who's on them: asked once the wipe is allowed (or for the dry run) — an SSH probe each.
+    let busy = if force { Vec::new() } else { busy_refusals(&remote, cfg, &refs).await };
+    let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
+    let brief = reimage_what(&names, &blocked_names);
     if dry_run {
-        println!("[dry-run] would reimage {} pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
+        out!(Detail, "[dry-run] would reimage {} pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
+        out!(Brief, "[dry-run] would reimage {brief}");
         if let Some(r) = &locked {
             print_would_refuse(r);
         }
         if !blocked.is_empty() && !wipe_ok {
-            print_would_refuse(&wipe_refusal(DiskOp::Reimage, false, &blocked, &repo));
+            print_would_refuse(&wipe_refusal(blocked_op, false, &blocked_names, &repo));
+        }
+        for b in &busy {
+            print_would_refuse(&b.refusal);
         }
         return Ok(());
     }
-    if !blocked.is_empty() && !wipe_ok {
-        anyhow::bail!("{}", wipe_refusal(DiskOp::Reimage, false, &blocked, &repo));
+    if !busy.is_empty() {
+        anyhow::bail!("{}", busy.iter().map(|b| b.refusal.as_str()).collect::<Vec<_>>().join("\n"));
     }
-    if !confirm(yes, &format!("Will reimage {} pod(s) onto {image}:\n{}\n  {then}", pods.len(), lines.join("\n")))? {
+    let what = onto.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n");
+    if !confirm_brief(yes, &format!("Will reimage {} pod(s):\n{}\n{what}\n  {then}", pods.len(), lines.join("\n")), &format!("Reimage {brief}?"))? {
         println!("aborted.");
         return Ok(());
     }
     let policy = arena_core::retry::RetryPolicy::default();
     let mut failed = Vec::new();
     for pod in pods {
+        // Asked again right before its wipe (review F2), of the pod as it's listed NOW (R2-1: one
+        // stopped at the start may have been started since): the prompt may have waited, and a
+        // rebuild before it may have taken 15 min — someone on it since isn't wiped unasked.
+        if !force {
+            if let Some(b) = busy_now(provider, &remote, cfg, pod, &policy).await {
+                out!(ErrDetail, "[not reimaged] {}: {}", pod.name, b.refusal);
+                let retry = reimage_retry(&pod.name, given_image.as_deref(), opts);
+                out!(ErrBrief, "[{}] {}: {} (retry: {retry}, or add --force)", out::bold(&pod.name), out::red("not reimaged"), b.why);
+                failed.push(pod.name.clone());
+                continue;
+            }
+        }
+        let image = match reimage_op(pod) {
+            DiskOp::Rebuild => vm_images.iter().find(|v| v.ids.contains(&pod.id)).map(|v| v.image.clone()),
+            _ => container_image.clone(),
+        }
+        .expect("every pod has an image: reimage_images and vm_images cover the selection");
         let mut env = match provider.pod_spec(&pod.id).await {
             Ok(spec) => spec.env,
             Err(e) => {
@@ -144,8 +198,8 @@ pub(crate) async fn handle_reimage(
             }
         }
     }
-    // The reimaged pods come back on a new SSH port: settle, set up, sync (nothing to do
-    // if every reimage failed).
+    // The reimaged pods come back on a new SSH port (a VM on its own IP, freshly booted):
+    // settle, set up, sync (nothing to do if every reimage failed).
     let done: Vec<arena_core::Pod> = pods.iter().filter(|p| !failed.contains(&p.name)).cloned().collect();
     let back = Comeback { setup, sync: !skip_proxy, settle, timeouts, reset: ContainerReset::Yes };
     let outcome = come_back(provider, remote, cfg, &done, back, keys_dir, "reimage").await;
@@ -156,6 +210,205 @@ pub(crate) async fn handle_reimage(
         anyhow::bail!("{} pod(s) failed to reimage: {}", failed.len(), failed.join(" "));
     }
     outcome
+}
+
+/// Whether `pod` is reimaged as a VM — Hetzner's rebuild of its whole disk — or as a container.
+fn reimage_op(pod: &arena_core::Pod) -> DiskOp {
+    if pod.provider == "hetzner" {
+        DiskOp::Rebuild
+    } else {
+        DiskOp::Reimage
+    }
+}
+
+/// What `pods reimage` puts on `pods`: `(container image, VM image setting)` — the container
+/// image for the RunPod (and any container) pods among them, `--image` else RUNPOD_DOCKER_IMAGE;
+/// the VM image for the Hetzner VMs, `--image` else HETZNER_IMAGE (`arena`, a snapshot id or a
+/// system image name). `None` where no such pod is selected. `--image` is one of the two kinds,
+/// so with both kinds selected it's refused: which one it meant can't be known. Pure.
+pub(crate) fn reimage_images(pods: &[arena_core::Pod], image: Option<String>, cfg: &Config) -> Result<(Option<String>, Option<String>)> {
+    let vms = pods.iter().filter(|p| reimage_op(p) == DiskOp::Rebuild).count();
+    let containers = pods.len() - vms;
+    if image.is_some() && vms > 0 && containers > 0 {
+        anyhow::bail!(
+            "--image is a container image for a RunPod pod and the VM's image for a Hetzner VM — reimage the two apart \
+             (`--on hetzner`, then the others with `--on` their provider), or leave --image out: each then gets its configured \
+             image (RUNPOD_DOCKER_IMAGE, HETZNER_IMAGE)"
+        );
+    }
+    let container = if containers == 0 {
+        None
+    } else {
+        let image = image.clone().unwrap_or_else(|| PodSpec::from_config(cfg).image);
+        if image.is_empty() {
+            anyhow::bail!("no image: pass --image or set RUNPOD_DOCKER_IMAGE");
+        }
+        Some(image)
+    };
+    let vm = if vms == 0 {
+        None
+    } else {
+        let (_, given) = crate::pods::create::image_flag("hetzner", image)?;
+        Some(given.unwrap_or_else(|| arena_core::provider::hetzner::HetznerOpts::from_config(cfg).image))
+    };
+    Ok((container, vm))
+}
+
+/// The image a reimage sends the VMs of one server type, and what to say about it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VmImage {
+    /// The VMs' server type (`None`: the listing didn't say — `arena` is then resolved at the
+    /// rebuild, for the server's own type).
+    pub server_type: Option<String>,
+    /// Their pod ids.
+    pub ids: Vec<String>,
+    /// What goes to the rebuild: a snapshot id or an image name.
+    pub image: String,
+    /// The line that says it (`image arena → snapshot 449743460 (…)`).
+    pub said: String,
+}
+
+/// Each VM's image from `setting`, per server type (a Hetzner VM lists its type where a GPU pod
+/// lists its GPU): `arena` is resolved against the project's snapshots for each type, as `up`
+/// resolves it (bounded; a failed lookup stops the reimage before anything is asked — never a
+/// quiet fall back to a 10-minute Ubuntu setup); anything else goes as given.
+async fn vm_images(cfg: &Config, pods: &[arena_core::Pod], setting: &str) -> Result<Vec<VmImage>> {
+    use arena_core::image::{Resolved, Setting};
+    let parsed = Setting::parse(setting);
+    let now = arena_core::snapshot::unix_now();
+    let mut out: Vec<VmImage> = Vec::new();
+    for p in pods.iter().filter(|p| reimage_op(p) == DiskOp::Rebuild) {
+        let ty = p.gpu_type.clone().filter(|t| !t.trim().is_empty());
+        if let Some(v) = out.iter_mut().find(|v| v.server_type == ty) {
+            v.ids.push(p.id.clone());
+            continue;
+        }
+        let resolved = match (&parsed, &ty) {
+            (Setting::Arena, Some(t)) => {
+                let cloud = crate::image::hetzner(cfg)?;
+                tokio::time::timeout(crate::image::LOOKUP_TIMEOUT, crate::image::resolve(&cloud, cfg, &parsed, t))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("looking up the arena image took over {}s", crate::image::LOOKUP_TIMEOUT.as_secs()))??
+                    .0
+            }
+            _ => Resolved::Given(parsed.clone()),
+        };
+        let said = match (&parsed, &ty) {
+            (Setting::Arena, None) => format!("image {setting} (resolved for its server type at the rebuild)"),
+            _ => resolved.describe(now),
+        };
+        let image = if parsed == Setting::Arena && ty.is_none() { setting.to_string() } else { resolved.as_setting() };
+        out.push(VmImage { server_type: ty, ids: vec![p.id.clone()], image, said });
+    }
+    Ok(out)
+}
+
+/// The plan's lines about what the pods get: `image: <container image>` and, per server type
+/// of the VMs, `VM image (cx33): image arena → snapshot …`. Pure.
+pub(crate) fn image_lines(container: Option<&str>, vms: &[VmImage]) -> Vec<String> {
+    let mut out: Vec<String> = container.map(|i| format!("image: {i}")).into_iter().collect();
+    for v in vms {
+        let ty = v.server_type.as_deref().map(|t| format!(" ({t})")).unwrap_or_default();
+        out.push(format!("VM image{ty}: {}", v.said));
+    }
+    out
+}
+
+/// The default output's words for what a reimage does to `names` (docs/OUTPUT.md): who, whose
+/// disk goes, and whose work with it (`lost`: the pods whose repo isn't on a confirmed volume) —
+/// `devtest-apple, devtest-bloom (wipes their disks and the work on devtest-bloom)`. The dry run
+/// says it and the prompt asks it; each pod's plan is `-v`'s. Pure (but for the styles).
+pub(crate) fn reimage_what(names: &[&str], lost: &[&str]) -> String {
+    let (disk, them, volume) = if names.len() == 1 { ("its disk", "it", "its volume") } else { ("their disks", "them", "their volumes") };
+    let work = if lost.is_empty() {
+        format!("; the repo stays on {volume}")
+    } else if lost.len() == names.len() {
+        format!(" and the work on {them}")
+    } else {
+        format!(" and the work on {}", lost.join(", "))
+    };
+    format!("{} (wipes {disk}{work})", crate::pods::setup::all_names(names))
+}
+
+/// The command that reimages `name` again as this run would (`--image` as given, and the
+/// switches): a busy pod's retry. Pure.
+pub(crate) fn reimage_retry(name: &str, image: Option<&str>, opts: RestartOpts) -> String {
+    let mut cmd = format!("arena pods reimage {name}");
+    if let Some(i) = image {
+        let plain = !i.is_empty() && i.chars().all(|c| c.is_ascii_alphanumeric() || "._:/@+-".contains(c));
+        cmd.push_str(&format!(" --image {}", if plain { i.to_string() } else { crate::shell_quote(i) }));
+    }
+    for (on, flag) in [(opts.wipe_ok, "--wipe-ok"), (opts.no_setup, "--no-setup"), (opts.skip_proxy, "--skip-proxy")] {
+        if on {
+            cmd.push_str(&format!(" {flag}"));
+        }
+    }
+    cmd
+}
+
+/// A pod a reimage won't wipe: someone is on it, or whether anyone is couldn't be told.
+struct Busy {
+    /// Why, in a few words (`someone is on it (1 SSH session)`): the default output's.
+    why: String,
+    /// The whole refusal, with what to do: the error's, and `-v`'s.
+    refusal: String,
+}
+
+/// [`busy_refusals`] for `pod` as the provider lists it now — its status and endpoint may have
+/// changed since the selection (started, restarted). Not listed now, or no listing: refused, as
+/// someone may be on it.
+async fn busy_now(
+    provider: &dyn Provider,
+    remote: &Arc<dyn Remote>,
+    cfg: &Config,
+    pod: &arena_core::Pod,
+    policy: &arena_core::retry::RetryPolicy,
+) -> Option<Busy> {
+    let now = match arena_core::retry::retrying(policy, || provider.list_pods()).await {
+        Ok(listed) => listed.into_iter().find(|p| p.id == pod.id && p.provider == pod.provider),
+        Err(_) => None,
+    };
+    match now {
+        Some(p) => busy_refusals(remote, cfg, &[&p]).await.pop(),
+        None => Some(Busy {
+            why: "couldn't list it again, so whether anyone is on it isn't known".into(),
+            refusal: format!(
+                "refusing to reimage {}: couldn't list it again right before its reimage, so whether anyone is on it now \
+                 isn't known. Or pass --force.",
+                pod.name
+            ),
+        }),
+    }
+}
+
+/// What a reimage tells the operator who'd wipe someone's session: wait, and keep their work.
+const REIMAGE_BUSY: &str = "A reimage wipes what they're working on: wait until they're off, and back it up first \
+     (`arena pods backup <name>`).";
+
+/// Who is on each of `pods` right now, asked as `replace` asks its source ([`adopt::probe`]'s
+/// probe, all at once, each bounded): the refusal for each one someone is on — SSH, another
+/// inbound connection, a VS Code server — or that couldn't be read (no endpoint, the probe
+/// failed), which a wipe doesn't take for "no one". A stopped pod has no one on it. Empty: no
+/// one is on any.
+async fn busy_refusals(remote: &Arc<dyn Remote>, cfg: &Config, pods: &[&arena_core::Pod]) -> Vec<Busy> {
+    use arena_core::idle::{self, Probe};
+    let running: Vec<&arena_core::Pod> = pods.iter().copied().filter(|p| !arena_core::status::is_stopped(&p.status)).collect();
+    let mut probes: Vec<Probe> = running.iter().map(|_| Probe::NoEndpoint).collect();
+    let cmd = idle::probe_command(&arena_core::backup::repo_path(cfg));
+    let jobs: Vec<(usize, SshTarget, String)> =
+        running.iter().enumerate().filter_map(|(i, p)| SshTarget::from_pod(p, cfg).ok().map(|t| (i, t, cmd.clone()))).collect();
+    exec_each_pod(remote, jobs, crate::money::IDLE_TIMEOUT, |_, _, &i, call| probes[i] = crate::money::read_probe(call)).await;
+    running
+        .iter()
+        .zip(&probes)
+        .filter_map(|(p, probe)| {
+            let alternative = REIMAGE_BUSY.replace("<name>", &p.name);
+            let presence = idle::presence(probe);
+            let why = crate::pods::adopt::presence_words(&presence)?;
+            let refusal = crate::pods::replace::presence_refusal("reimage", &p.name, &presence, &alternative)?;
+            Some(Busy { why, refusal })
+        })
+        .collect()
 }
 
 /// `pods start`: start the selected STOPPED pods again ([`Provider::start_pod`]), then bring
@@ -819,6 +1072,9 @@ pub(crate) enum DiskOp {
     Stop,
     /// A fresh container from an image (`pods reimage`) — a wipe on every backend.
     Reimage,
+    /// A VM's whole disk rebuilt from an image (`pods reimage` on Hetzner): the server, its IP
+    /// and any volume of its own kept, everything on its disk gone.
+    Rebuild,
 }
 
 impl DiskFate {
@@ -855,21 +1111,28 @@ impl DiskFate {
             DiskOp::Restart => "⚠ WIPES the container disk (reset to the image)",
             DiskOp::Stop => "⚠ discards the container disk (it starts again as a fresh image)",
             DiskOp::Reimage => "⚠ WIPES the container disk (a fresh container from the image)",
+            DiskOp::Rebuild => "⚠ WIPES the VM's whole disk (rebuilt from the image; it keeps its IP)",
         };
         let rest = "~/.name, setup's git remote, the distributed keys";
         let repo = site.describe();
         let work = format!("the ARENA repo at {repo} (participants' work)");
         // A stopped pod comes back only when someone starts it — no automatic re-setup then.
         let relink = match op {
-            DiskOp::Restart | DiskOp::Reimage => "",
+            DiskOp::Restart | DiskOp::Reimage | DiskOp::Rebuild => "",
             DiskOp::Stop => " (`arena pods start` brings it back and re-links the repo)",
         };
         match self {
             DiskFate::Kept => match op {
                 DiskOp::Restart => "disk kept — a hard reset (power-cycle): running processes die, files stay".into(),
                 DiskOp::Stop => "disk kept — shut down (powered off only if it hangs), files stay".into(),
-                DiskOp::Reimage => "disk kept".into(),
+                DiskOp::Reimage | DiskOp::Rebuild => "disk kept".into(),
             },
+            // A VM has no /workspace volume to keep the repo: all of its disk goes. A Hetzner
+            // volume of its own is another disk, kept — but its mount (an fstab line) isn't.
+            _ if op == DiskOp::Rebuild => format!(
+                "{wipe}: nothing on its disk survives — {work}, {rest} (a volume of its own, `arena pods volume`, keeps \
+                 its files but comes back unmounted: `arena pods volume mount` mounts it again)"
+            ),
             DiskFate::Wiped { volume_gb: Some(v) } | DiskFate::MayWipe { volume_gb: Some(v) } if v > 0 && site.on_volume() => format!(
                 "{wipe}: everything outside {VOL} is lost ({rest}, files outside the repo); the repo at \
                  {repo} is on the {v} GB volume at {VOL} and survives{relink}"
@@ -947,9 +1210,10 @@ pub(crate) async fn restart_fate(provider: &dyn Provider, pod: &arena_core::Pod)
     }
 }
 
-/// What a reimage does to a pod's disk: on every backend a fresh container (a VM would be
+/// What a reimage does to a pod's disk: on every backend a fresh container (a Hetzner VM is
 /// rebuilt), so only a persistent volume survives — whatever `restart_wipes_container_disk`
-/// says about a restart. The volume is read from the pod's spec (bounded; unknown = none).
+/// says about a restart. The volume is read from the pod's spec (bounded; unknown = none; a VM
+/// has none: its spec says 0).
 async fn reimage_fate(provider: &dyn Provider, pod: &arena_core::Pod) -> DiskFate {
     let spec = arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, provider.pod_spec(&pod.id)).await;
     DiskFate::Wiped { volume_gb: match spec {
@@ -971,16 +1235,22 @@ pub(crate) fn wipe_refusal(op: DiskOp, maybe: bool, names: &[&str], repo: &str) 
         DiskOp::Restart => ("restart", "resets the container disk to the image"),
         DiskOp::Stop => ("stop", "discards the container disk (a stopped RunPod pod keeps no data)"),
         DiskOp::Reimage => ("reimage", "replaces the container — and its disk — with a fresh one from the image"),
+        DiskOp::Rebuild => ("reimage", "rebuilds the VM's whole disk from the image"),
     };
     let alt = match op {
-        DiskOp::Restart | DiskOp::Reimage => "",
+        DiskOp::Restart | DiskOp::Reimage | DiskOp::Rebuild => "",
         DiskOp::Stop => " If the group is done, terminate instead.",
+    };
+    // A VM has no volume the repo could be on: all of its disk goes.
+    let lost = match op {
+        DiskOp::Rebuild => "is on that disk",
+        _ => "isn't on a confirmed persistent volume (there's no volume, none could be confirmed, or the repo lives \
+              outside /workspace)",
     };
     format!(
         "refusing to {verb} {} without --wipe-ok: this {done}, and the participants' work — the repo \
-         at {repo} — isn't on a confirmed persistent volume (there's no volume, none could be \
-         confirmed, or the repo lives outside /workspace), so it would be lost. Back up first \
-         (`arena pods backup {}`), then re-run with --wipe-ok (--yes alone isn't enough).{alt}",
+         at {repo} — {lost}, so it would be lost. Back up first (`arena pods backup {}`), then re-run with \
+         --wipe-ok (--yes alone isn't enough).{alt}",
         names.join(", "),
         names.join(" ")
     )

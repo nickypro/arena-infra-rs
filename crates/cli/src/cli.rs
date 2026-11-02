@@ -792,10 +792,11 @@ pub(crate) enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Lock pods so nothing can stop or delete them (RunPod v2)
+    /// Lock pods so nothing can stop or delete them (RunPod v2, Hetzner)
     ///
     /// RunPod then refuses stop, restart and terminate from any client, its web console included,
-    /// until `pods unlock`; setup, backups, `run` and SSH still work. arena's own stop, restart,
+    /// until `pods unlock`; Hetzner (a VM's delete + rebuild protection) refuses a delete or a
+    /// rebuild that way. Setup, backups, `run` and SSH still work. arena's own stop, restart,
     /// reimage, terminate, replace and migrate refuse a locked pod (`terminate --unlock` lifts
     /// it). Pods on a backend that can't lock make the exit non-zero.
     #[command(verbatim_doc_comment)]
@@ -814,19 +815,25 @@ pub(crate) enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Reimage pods in place: new image, WIPES the container disk
+    /// Reimage pods in place: new image, WIPES the disk (container or VM)
     ///
     /// Same host and name, fresh container from --image; nothing is copied over (`replace` keeps
-    /// files). Refused without --wipe-ok unless the repo is on a /workspace volume, even with
-    /// --yes. Then waits for SSH, re-runs setup and syncs the proxy.
+    /// files). A Hetzner VM is rebuilt from its image (HETZNER_IMAGE; `arena` = the newest arena
+    /// image, said before the confirm): same server and IP, today's keys by cloud-init. Refused
+    /// without --wipe-ok unless the repo is on a /workspace volume, even with --yes; refused
+    /// while someone is on a pod (SSH, VS Code) unless --force. Then waits for SSH, re-runs setup
+    /// and syncs the proxy.
     #[command(verbatim_doc_comment)]
     Reimage {
-        /// Image to use (default: RUNPOD_DOCKER_IMAGE from config).
+        /// Image to use (default: RUNPOD_DOCKER_IMAGE; on a Hetzner VM: HETZNER_IMAGE, e.g. arena)
         #[arg(long)]
         image: Option<String>,
         /// Reimage even pods whose work isn't on a volume (required, even with --yes)
         #[arg(long)]
         wipe_ok: bool,
+        /// Reimage even a pod someone is on (SSH, VS Code) or that can't be checked
+        #[arg(long)]
+        force: bool,
         /// Don't re-run setup on the reimaged pods (they come back as the bare image).
         #[arg(long)]
         no_setup: bool,

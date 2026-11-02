@@ -909,10 +909,10 @@ pub(crate) async fn handle_pods_bal(
             handle_lock(provider, &sel, false, dry_run, yes).await?;
         }
 
-        PodCmd::Reimage { sel, image, wipe_ok, no_setup, skip_proxy, dry_run } => {
+        PodCmd::Reimage { sel, image, wipe_ok, force, no_setup, skip_proxy, dry_run } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("reimage")).await?;
             let opts = RestartOpts { wipe_ok, no_setup, skip_proxy, dry_run, yes };
-            handle_reimage(provider, remote, cfg, &sel, image, opts, RESTART_SETTLE, &keys_dir(cfg)).await?;
+            handle_reimage(provider, remote, cfg, &sel, image, force, opts, RESTART_SETTLE, &keys_dir(cfg)).await?;
         }
 
         PodCmd::Replace { target, gpu, gpus, cloud, disk, volume, image, place, onto, force, keep_old, skip_proxy, dry_run } => {
