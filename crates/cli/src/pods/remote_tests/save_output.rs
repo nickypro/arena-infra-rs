@@ -517,6 +517,18 @@ fn a_failed_rsyncs_line_keeps_its_own_words() {
     assert_eq!(rsync_why(""), "");
 }
 
+/// A failed copy's retry copies the same thing into the same place (review r5): the configured
+/// backup's has no flags; another's repeats its own.
+#[test]
+fn a_failed_copys_retry_repeats_its_flags() {
+    use crate::pods::pull::{retry_flags, PullRun};
+    let plain = PullRun { label: None, max_size: None, remote_path: None, no_git: false, no_big: false, dry_run: false, yes: true };
+    assert_eq!(retry_flags("/b", "/b", &plain), "");
+    assert_eq!(retry_flags("/b", "/b/", &plain), "", "the same dir");
+    let aside = PullRun { label: Some("w1d2".into()), remote_path: Some("/workspace/my project".into()), no_big: true, ..plain };
+    assert_eq!(retry_flags("/b", "/mnt/recovery", &aside), " --dir '/mnt/recovery' --label 'w1d2' --remote-path '/workspace/my project' --no-big");
+}
+
 /// A copy's question names every place that receives the pods' files: the all-files tier's
 /// root too when it's on its own volume (review r3 #2).
 #[test]

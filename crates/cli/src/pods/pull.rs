@@ -229,6 +229,28 @@ pub(crate) fn busy_line(name: &str, wait: Duration) -> String {
     format!("busy: another backup of {name} is running (waited {}s for its lock) — skipped this run", wait.as_secs())
 }
 
+/// The flags of a pull that its retry line repeats (`arena pods pull NAME …`): `--dir` when it
+/// isn't the configured backup dir (`configured`), and every option given — the label, the
+/// remote path, the size cap, `--no-git`, `--no-big` — shell-quoted. Empty for the configured
+/// backup. Pure.
+pub(crate) fn retry_flags(configured: &str, dir: &str, args: &PullRun) -> String {
+    let mut f = String::new();
+    if absolute_path(std::path::Path::new(dir)) != absolute_path(std::path::Path::new(configured)) {
+        f.push_str(&format!(" --dir {}", crate::shell_quote(dir)));
+    }
+    for (flag, value) in [("--label", &args.label), ("--remote-path", &args.remote_path), ("--max-size", &args.max_size)] {
+        if let Some(v) = value {
+            f.push_str(&format!(" {flag} {}", crate::shell_quote(v)));
+        }
+    }
+    for (flag, on) in [("--no-git", args.no_git), ("--no-big", args.no_big)] {
+        if on {
+            f.push_str(&format!(" {flag}"));
+        }
+    }
+    f
+}
+
 /// What a copy takes from each pod, for a one-line question or dry run: `the home`, or the
 /// `--remote-path` / `BACKUP_REMOTE_PATH` it's told (review r4 #1). Pure.
 pub(crate) fn copy_source(remote_path: &str) -> String {
@@ -328,6 +350,9 @@ pub(crate) async fn pull_pods(
 ) -> Result<Pulled> {
     use arena_core::pull::{self, PullConfig};
     let PullRun { label, max_size, remote_path, no_git, no_big, dry_run, yes } = args;
+    // The flags a failed copy's retry repeats, so it copies the same thing into the same place
+    // (review r5): none for the configured backup.
+    let retry_flags = retry_flags(&local_backup_dir(cfg), dir, &PullRun { label: label.clone(), max_size: max_size.clone(), remote_path: remote_path.clone(), no_git, no_big, dry_run, yes });
     // Whether this is the configured backup — the cron's: into LOCAL_BACKUP_DIR, both tiers, `.git`,
     // the day's label, the configured path. Anything else is recorded aside (`arena backups`).
     let aside = if absolute_path(std::path::Path::new(dir)) != absolute_path(std::path::Path::new(&local_backup_dir(cfg))) {
@@ -802,7 +827,7 @@ pub(crate) async fn pull_pods(
         let moved = made.note();
         out::progress("pull", Some(&format!("copy {done}/{jobs}")));
         // A failure's short line by default (its fix at the end), its whole line with `-v`.
-        let retry = format!("(retry: arena pods pull {name})");
+        let retry = format!("(retry: arena pods pull {name}{retry_flags})");
         match out {
             Ok(stats) => {
                 // Report what actually moved, so a pull isn't "silent" — with `-v`; by default the
