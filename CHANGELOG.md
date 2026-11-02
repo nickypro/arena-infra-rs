@@ -26,7 +26,8 @@ earlier).
   Before, a Claude asked to run a model used the system Python and pip-installed transformers into
   it. Only the block between `<!-- BEGIN arena-infra python -->` and `<!-- END arena-infra python
   -->` is written: the rest of each file stays as it was (its mode too), and a second run changes
-  nothing.
+  nothing. A file that changes is swapped for the new one in one step, and the old one is kept
+  beside it (`CLAUDE.md.arena-XXXXXX`), so nothing saved meanwhile is lost.
 - `uv` and `uvx` are linked into `/usr/local/bin`, so `uv` works in every shell on a Hetzner VM
   (it was "command not found": it was only in `~/.local/bin`). A link already there is kept.
 - **`pods setup --notes-only`** does just that on machines that are running, and nothing else. It

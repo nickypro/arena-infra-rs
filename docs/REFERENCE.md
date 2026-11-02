@@ -1901,8 +1901,9 @@ started over ssh or by a tool may not have the env active:
 
 | on 2026-11-02 | `ssh host 'cmd'` | `zsh -lc` | interactive login, `pods run` |
 |---|---|---|---|
-| Hetzner VM | `python3` = `/usr/bin/python3`, no `python`, no `pip` | the same | the venv |
-| RunPod pod | `python3` = `/usr/bin/python3` | the same | `/opt/arena-env` |
+| Hetzner VM | `python3` = `/usr/bin/python3` (no torch), no `python`, no `pip` | the same | the venv |
+| arena image, sshd's own PATH (RunPod) | `python3` = `/usr/bin/python3` (3.11 with torch, no transformers), `pip` = `/usr/local/bin/pip` (its pip) | the same | `/opt/arena-env` |
+| arena image on Vast (its ssh passes the image's PATH) | `/opt/arena-env` | the same | `/opt/arena-env` |
 
 So setup's **`agent notes`** step (after the env is there, before the VS Code warm-up;
 best-effort, 60s) writes this machine's facts into Claude Code's user memory
@@ -1933,12 +1934,15 @@ python -->` and `<!-- END arena-infra python -->`. On a Hetzner VM:
   without one gets it at the end, after a blank line; no file: one with just the block. Everything
   else stays as it was, byte for byte. An unchanged file isn't written at all. A changed one is
   swapped for the new one in one step (`renameat2`, as the VS Code warm-up's settings merge), with
-  its mode and owner, and through a link the file it points at; if what came out isn't what was
-  read (a save landed meanwhile), it goes straight back and the file is read again — saved once
-  more in that instant, and what came out is kept beside it (`CLAUDE.md.arena-…`), with a warning.
-  A file that isn't there is made only if it still isn't. Where no such swap can be made (no
+  its mode and owner, and through a link the file it points at; the file it replaces is kept
+  beside it (`CLAUDE.md.arena-XXXXXX`: an editor holding it open may still write into it). If
+  that isn't what was read (a save landed meanwhile), it goes straight back and the file is read
+  again; saved once more in that instant, and that save is kept beside it too, with a warning. A
+  file that isn't there is made only if it still isn't. Where no such swap can be made (no
   `python3`), a file that's there is left alone, with a warning. A `BEGIN` line with no `END`
   after it: the file is left alone, with a warning.
+- **Activating:** `source <env>/bin/activate` for a venv (the arena image's `/opt/arena-env` is a
+  uv venv, as is a VM's); `export PATH="<env>/bin:$PATH"` for an env without that script.
 
 **Running machines:** `arena pods setup --notes-only [targets]` runs just this step (no repo
 update, keys, tokens or VS Code; no targets = every pod), and a failure there is a ✗. It replaces

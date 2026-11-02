@@ -54,32 +54,41 @@ const SCRIPT: &str = include_str!("agent_notes.sh");
 
 /// How to install into the env when `uv` is on PATH…
 const INSTALL_UV: &str = "uv pip install --python {env}/bin/python PACKAGE";
-/// …and when it isn't (both envs have pip: the image's conda env, and the venv the bare-VM script
-/// builds, which installs pip into it).
+/// …and when it isn't (the envs have pip: the image's, and the venv the bare-VM script builds,
+/// which installs pip into it).
 const INSTALL_PIP: &str = "{env}/bin/python -m pip install PACKAGE";
 
-/// The block, a line each, `{env}` / `{install}` / `{repo}` filled in per machine. Under about 10
-/// lines: it's read at the start of every session.
+/// How to make the env a shell's own: a venv's activate script (the arena image's env is a uv
+/// venv, as is a bare VM's)…
+const ACTIVATE_VENV: &str = "source {env}/bin/activate";
+/// …or, for an env without one (a plain conda env: `conda activate` needs conda's shell hook),
+/// its `bin` first on PATH.
+const ACTIVATE_PATH: &str = "export PATH=\"{env}/bin:$PATH\"";
+
+/// The block, a line each, `{env}` / `{activate}` / `{install}` / `{repo}` filled in per machine.
+/// Under about 10 lines: it's read at the start of every session.
 fn template(gpu: bool) -> [&'static str; 7] {
     [
         BEGIN,
         "## Python on this machine (arena setup rewrites this block; write your own notes outside it)",
         if gpu {
-            "- Use the course env, {env}: torch with CUDA, transformers, transformer_lens and the other course packages are in it. Run {env}/bin/python, or `source {env}/bin/activate` first."
+            "- Use the course env, {env}: torch with CUDA, transformers, transformer_lens and the other course packages are in it. Run {env}/bin/python, or `{activate}` first."
         } else {
-            "- Use the course env, {env}: torch (a CPU build: this machine has no GPU), transformers, transformer_lens and the other course packages are in it. Run {env}/bin/python, or `source {env}/bin/activate` first."
+            "- Use the course env, {env}: torch (a CPU build: this machine has no GPU), transformers, transformer_lens and the other course packages are in it. Run {env}/bin/python, or `{activate}` first."
         },
-        "- Shells started over ssh, by scripts or by your tools may not have it active, and their `python3` is then the system one (/usr/bin/python3), without those packages. Check `which python` before running anything.",
+        "- Shells started over ssh, by scripts or by your tools may not have it active: there `python3` and `pip` can be the system's (/usr/bin/python3 may even have torch, but not the course packages). Check `which python` before running anything.",
         "- Missing a package? Check first: `{env}/bin/python -m pip show PACKAGE`. Install into the env: `{install}`. Never pip install into the system Python, and don't make another venv or conda env for the course.",
         "- The course repo (the exercises, and the participants' work) is {repo}.",
         END,
     ]
 }
 
-/// `t` with each `{env}` / `{install}` / `{repo}` replaced by `var(name)` and the text between by
-/// `text(piece)` — the one walk both renderings share, so they can't drift apart.
+/// The placeholders, each `{name}` in the text.
+const VARS: [&str; 4] = ["env", "activate", "install", "repo"];
+
+/// `t` with each placeholder replaced by `var(name)` and the text between by `text(piece)` — the
+/// one walk both renderings share, so they can't drift apart.
 fn render(t: &str, text: impl Fn(&str) -> String, var: impl Fn(&str) -> String) -> String {
-    const VARS: [&str; 3] = ["env", "install", "repo"];
     let mut out = String::new();
     let mut rest = t;
     while let Some((at, name)) =
@@ -97,23 +106,41 @@ fn render(t: &str, text: impl Fn(&str) -> String, var: impl Fn(&str) -> String) 
     out
 }
 
-/// The block as it lands on a machine whose env is `env` (`uv`: uv is on PATH there), its course
-/// repo `repo`, with a GPU or not. Lines end in `\n`. Pure.
-pub fn block(env: &str, uv: bool, repo: &str, gpu: bool) -> String {
-    let install = render(if uv { INSTALL_UV } else { INSTALL_PIP }, str::to_string, |_| env.to_string());
+/// What the block says about a machine — each read on the machine itself by the step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Facts<'a> {
+    /// The course env: the first of [`env_candidates`] with a `bin/python`.
+    pub env: &'a str,
+    /// It has a `bin/activate` (a venv; a plain conda env has none).
+    pub venv: bool,
+    /// `uv` is on PATH (after the step's [`LINK_UV_SH`]).
+    pub uv: bool,
+    /// The course checkout.
+    pub repo: &'a str,
+    /// The machine has a GPU (all but a Hetzner VM).
+    pub gpu: bool,
+}
+
+/// The block as it lands on a machine. Lines end in `\n`. Pure.
+pub fn block(f: Facts) -> String {
+    let with_env = |t: &str| render(t, str::to_string, |_| f.env.to_string());
+    let activate = with_env(if f.venv { ACTIVATE_VENV } else { ACTIVATE_PATH });
+    let install = with_env(if f.uv { INSTALL_UV } else { INSTALL_PIP });
     let value = |name: &str| match name {
-        "env" => env.to_string(),
+        "env" => f.env.to_string(),
+        "activate" => activate.clone(),
         "install" => install.clone(),
-        _ => repo.to_string(),
+        _ => f.repo.to_string(),
     };
-    template(gpu).into_iter().map(|l| render(l, str::to_string, value) + "\n").collect()
+    template(f.gpu).into_iter().map(|l| render(l, str::to_string, value) + "\n").collect()
 }
 
 /// `t` as one shell word: the text single-quoted, each placeholder its shell variable ($E the
-/// env, $I the install command, $R the repo), double-quoted.
+/// env, $A how to activate it, $I how to install into it, $R the repo), double-quoted.
 fn shell_word(t: &str) -> String {
     render(t, shell_quote, |name| match name {
         "env" => "\"$E\"".into(),
+        "activate" => "\"$A\"".into(),
         "install" => "\"$I\"".into(),
         _ => "\"$R\"".into(),
     })
@@ -193,6 +220,8 @@ impl AgentNotes {
             .replace("@REPO@", &shell_quote(&self.repo_path))
             .replace("@INSTALL_UV@", &shell_word(INSTALL_UV))
             .replace("@INSTALL_PIP@", &shell_word(INSTALL_PIP))
+            .replace("@ACTIVATE_VENV@", &shell_word(ACTIVATE_VENV))
+            .replace("@ACTIVATE_PATH@", &shell_word(ACTIVATE_PATH))
             .replace("@BLOCK@", &block.join(" "))
             .replace("@BEGIN@", &shell_quote(BEGIN))
             .replace("@END@", &shell_quote(END))
