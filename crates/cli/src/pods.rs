@@ -30,7 +30,7 @@ use crate::pods::rename::{handle_rename, RenameRequest};
 use crate::pods::replace::{handle_replace, short_of, ReplaceOpts};
 use crate::pods::restore::{handle_restore, RestoreOpts};
 use crate::pods::run::{handle_run, misplaced_run_flags, pod_name_as_command};
-use crate::pods::selection::{cohort_only, hard_non_cohort_refusal, refresh_missing_endpoints, select, Unscoped, ENDPOINT_RETRY};
+use crate::pods::selection::{cohort_only, cohort_only_to, hard_non_cohort_refusal, refresh_missing_endpoints, select, Unscoped, ENDPOINT_RETRY};
 use crate::pods::setup::{handle_setup, setup_config, stage_hetzner_script};
 use crate::proxy::{proxy_deployable, sync_proxy};
 use crate::{ask, confirm, confirm_brief, jobs, money, reap, spend, up, Interrupt};
@@ -840,9 +840,9 @@ pub(crate) async fn handle_pods_bal(
             let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
             let (label, sel, note) = resolve_pull(provider, cfg, label, sel, &target_flag).await?;
             if let Some(note) = &note {
-                eprintln!("{note}");
+                out!(Err, "{note}");
             }
-            let mut sel = cohort_only(cfg, sel, cohort);
+            let mut sel = cohort_only_to(cfg, sel, cohort, To::Detail);
             refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             handle_pull(&remote, cfg, label, &dir, max_size, remote_path, no_git, no_big, &sel, dry_run, yes, RSYNC).await?;
         }
@@ -971,7 +971,7 @@ pub(crate) async fn handle_pods_bal(
             // Resolved once, before the prompt (a typo fails before asking), and shared by the
             // git push and the pull.
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
-            let mut sel = cohort_only(cfg, sel, cohort);
+            let mut sel = cohort_only_to(cfg, sel, cohort, To::Detail);
             refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             handle_full_backup(remote, cfg, &sel, no_pull, message, dry_run, yes, RSYNC).await?;
         }

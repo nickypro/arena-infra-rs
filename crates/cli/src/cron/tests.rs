@@ -1634,3 +1634,37 @@ fn cron_flags_parse() {
     assert_eq!(super::selected_kinds(true, false, true, false), [super::CronKind::Backup, super::CronKind::Snapshot]);
     assert_eq!(super::selected_kinds(false, false, false, true), [super::CronKind::ArchiveSnap, super::CronKind::ArchiveBig]);
 }
+
+/// `cron install` by default (docs/OUTPUT.md): each line it changes as what it runs and when —
+/// not its folders, lock, binary, config and log — its notes with `-v`, and the question in a
+/// line; with `-v` the whole lines, as before.
+#[cfg(unix)]
+#[tokio::test]
+async fn cron_install_says_each_change_in_a_line() {
+    let mut out = Vec::new();
+    for verbose in [false, true] {
+        let s = CronStub::new(&format!("golden-{verbose}"));
+        let run = s.run_as(&["install", "--start-date", "2026-01-05"], false, Some(&s.home));
+        let text = crate::output_test::rendered(verbose, &["y"], run).await;
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        let config = std::fs::canonicalize(&s.config).unwrap().display().to_string();
+        out.push(text.replace(&s.home, "<home>").replace(&exe, "<arena>").replace(&config, "<config>"));
+    }
+    assert_eq!(
+        out[0],
+        "+ [backup] */15 * * * * ARENA_START_DATE=2026-01-05 arena pods backup --no-pull --yes\n\
+         Write this crontab change? [y/N] y\n\
+         Crontab updated (view with `arena cron show`).\n"
+    );
+    assert_eq!(
+        out[1],
+        "arena cron lines, before → after (- removed, + added):\n  \
+         + */15 * * * * mkdir -p <home>/.local/state/arena-cron && ARENA_START_DATE=2026-01-05 flock -n -o \
+         <home>/.local/state/arena-cron/backup.lock <arena> --config <config> pods backup --no-pull --yes >> \
+         <home>/.local/state/arena-cron/backup.log 2>&1\n\
+         \n\
+         Write this crontab change?\n\
+         Proceed? [y/N] y\n\
+         Crontab updated (view with `arena cron show`).\n"
+    );
+}

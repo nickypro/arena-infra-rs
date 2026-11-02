@@ -23,8 +23,8 @@ fn record_path(cfg: &Config) -> Option<Result<PathBuf, String>> {
 /// Change the record at `path`, saying (on stderr) what went wrong if anything did.
 fn write(path: &Path, f: impl FnOnce(&mut record::Record)) {
     match record::update(path, arena_core::disk::RECORD_LOCK_WAIT, f) {
-        Ok(warning) => warning.iter().for_each(|w| eprintln!("{w}")),
-        Err(e) => eprintln!("warning: couldn't write the backups record {} ({e}) — `arena backups` won't show this run", path.display()),
+        Ok(warning) => warning.iter().for_each(|w| arena_core::out!(Err, "{w}")),
+        Err(e) => arena_core::out!(Err, "warning: couldn't write the backups record {} ({e}) — `arena backups` won't show this run", path.display()),
     }
 }
 
@@ -57,7 +57,7 @@ impl Run {
             None => None,
             Some(Ok(p)) => Some(p),
             Some(Err(e)) => {
-                eprintln!("warning: this {} isn't recorded for `arena backups`: {e}", job.name());
+                arena_core::out!(Err, "warning: this {} isn't recorded for `arena backups`: {e}", job.name());
                 None
             }
         };
@@ -166,8 +166,11 @@ pub(crate) async fn handle_backups(
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
-        print!("{}", backups::render::text(&status));
-        println!("(record: {})", inputs.record_path);
+        // The default leaves out the paragraphs and repeated notes (`render::text_at`); `-v` has them.
+        for line in backups::render::text_at(&status, arena_core::out::verbose()).lines() {
+            arena_core::out!(Out, "{line}");
+        }
+        arena_core::out!(Detail, "(record: {})", inputs.record_path);
     }
     Ok(())
 }
@@ -260,8 +263,16 @@ mod tests {
         for want in ["git backup          every 15 min", "home copy           with each git backup (every 15 min)", "└ git: exit 255: ssh: connect to host", "✓ pushed now"] {
             assert!(text.contains(want), "no {want:?} in\n{text}");
         }
-        // The command itself, text and JSON.
-        super::handle_backups(&cfg, std::path::Path::new("/c"), false, Ok(tab.clone()), Err("no providers".into())).await.unwrap();
+        // The command itself, text and JSON. By default without the paragraphs and the record's
+        // path (docs/OUTPUT.md); with `-v`, all of it.
+        for verbose in [false, true] {
+            let run = super::handle_backups(&cfg, std::path::Path::new("/c"), false, Ok(tab.clone()), Err("no providers".into()));
+            let text = crate::output_test::rendered(verbose, &[], run).await;
+            assert!(text.contains("└ git: exit 255: ssh: connect to host"), "{text}");
+            for v in ["Not covered: ", "Restore: `arena pods restore <pod>`", "(record: ", "Running now: nothing"] {
+                assert_eq!(text.contains(v), verbose, "{v:?} with -v only:\n{text}");
+            }
+        }
         super::handle_backups(&cfg, std::path::Path::new("/c"), true, Ok(tab), Err("no providers".into())).await.unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }

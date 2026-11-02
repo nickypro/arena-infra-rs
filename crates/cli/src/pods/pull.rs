@@ -15,8 +15,10 @@ use arena_core::Config;
 use crate::cli::Select;
 use crate::cron::resolve_week_day;
 use crate::pods::exec_each_pod;
-use crate::pods::selection::{say, select, Selected, Unscoped};
-use crate::{confirm, disk};
+use crate::disk;
+use crate::pods::selection::{say, say_to, select, Selected, Unscoped};
+use arena_core::out;
+use arena_core::out::To;
 
 /// `pods pull`: rsync each pod's home directory to `<dir>/<label>/<pod-name>/`. The file
 /// backup (legacy `backup.sh`), complementing the git autocommit `backup`. It spawns
@@ -156,13 +158,16 @@ pub(crate) async fn take_pod_locks(dir: &str, names: &[String], wait: Duration) 
             Ok(f) => pending.push((name.clone(), f)),
             Err(e) if !warned => {
                 warned = true;
-                eprintln!("warning: can't take the per-pod backup locks in {dir}/.arena-locks ({e}) — going ahead without them");
+                out!(Err, "warning: can't take the per-pod backup locks in {dir}/.arena-locks ({e}) — going ahead without them");
             }
             Err(_) => {}
         }
     }
     let deadline = tokio::time::Instant::now() + wait;
     let mut said = false;
+    // On a terminal the wait is said in place while it lasts; a log hears of it only if the lock
+    // stays busy (the pod's `✗ … busy` line), or with `-v`.
+    let _waiting = out::progress_guard("pod-locks");
     loop {
         let mut still = Vec::new();
         for (name, f) in pending {
@@ -172,7 +177,7 @@ pub(crate) async fn take_pod_locks(dir: &str, names: &[String], wait: Duration) 
                 }
                 Ok(Err(f)) => still.push((name, f)),
                 Err(e) => {
-                    eprintln!("warning: locking {name}'s backup failed ({e}) — going ahead without its lock");
+                    out!(Err, "warning: locking {name}'s backup failed ({e}) — going ahead without its lock");
                 }
             }
         }
@@ -183,7 +188,9 @@ pub(crate) async fn take_pod_locks(dir: &str, names: &[String], wait: Duration) 
         if !said {
             said = true;
             let busy: Vec<&str> = pending.iter().map(|(n, _)| n.as_str()).collect();
-            eprintln!("waiting up to {}s: another backup of {} is running", wait.as_secs(), busy.join(", "));
+            let line = format!("waiting up to {}s: another backup of {} is running", wait.as_secs(), busy.join(", "));
+            out::progress("pod-locks", Some(&line));
+            out!(ErrDetail, "{line}");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -380,13 +387,14 @@ pub(crate) async fn pull_pods(
         let bad: Vec<String> = bad.into_iter().filter_map(|r| r.err()).collect();
         if !bad.is_empty() {
             if dry_run {
-                bad.iter().for_each(|b| println!("⚠ {b} — a real pull would refuse"));
+                bad.iter().for_each(|b| out!(Out, "⚠ {b} — a real pull would refuse"));
             } else {
                 anyhow::bail!("refusing to pull (LOCAL_BACKUP_BIG_DIR is set, so both backup volumes must be there): {}", bad.join("; "));
             }
         }
     }
-    println!(
+    out!(
+        Detail,
         "Source {src} · snapshot < {threshold} -> {dir}/{label}/<pod>/ · {big_note} · {} · {}\n",
         if no_git { "no .git" } else { "incl .git" },
         pull_budget_note(budget),
@@ -399,10 +407,10 @@ pub(crate) async fn pull_pods(
         .pods
         .iter()
         .filter(|p| !targets.iter().any(|(n, _)| *n == p.name))
-        .map(|p| (p.name.clone(), "no SSH endpoint to pull from".to_string()))
+        .map(|p| (p.name.clone(), NO_ENDPOINT_TO_PULL.to_string()))
         .collect();
     if targets.is_empty() {
-        println!("(no pods with an SSH endpoint to pull)");
+        out!(Out, "(no pods with an SSH endpoint to pull)");
         return Ok(Pulled { failures: sel.endpoint_failures().into_iter().map(|n| format!("{n}: no SSH endpoint after 10 minutes running")).collect(), failed: unreachable, ..Pulled::default() });
     }
 
@@ -452,33 +460,43 @@ pub(crate) async fn pull_pods(
 
     if dry_run {
         let n = if no_big { 1 } else { 2 };
-        println!("Dry-run — would rsync {} pod(s), {n} tier(s) each:\n", targets.len());
+        // By default where the copies would go, in a line; each rsync's argv with `-v`.
+        let names: Vec<String> = targets.iter().map(|(n, _)| n.clone()).collect();
+        let big_too = if no_big { String::new() } else { format!(" + {big_root}/<pod> (all files)") };
+        out!(
+            Brief,
+            "[dry-run] would copy {} pod(s) into {dir}/{label}/<pod> (files < {threshold}){big_too}: {} (-v: each rsync)",
+            names.len(),
+            arena_core::backups::render::names_line(&names, crate::pods::backup::NAMES_SHOWN)
+        );
+        out!(Detail, "Dry-run — would rsync {} pod(s), {n} tier(s) each:\n", targets.len());
         for (name, t) in &targets {
-            println!("# {name}");
+            out!(Detail, "# {name}");
             for (tier, dest, pc) in tiers_for(name) {
                 for pass in pc.passes() {
                     let tier = if pass.git_only { format!("{tier} .git") } else { tier.to_string() };
-                    println!("  [{tier}] {}", pull::display_rsync(t, &pass, &dest));
+                    out!(Detail, "  [{tier}] {}", pull::display_rsync(t, &pass, &dest));
                 }
             }
-            println!();
+            out!(Detail, "");
         }
         for (name, skip) in room(&targets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), false).0 {
-            println!("⚠ {name}, if pulled now: {skip}");
+            out!(Out, "⚠ {name}, if pulled now: {skip}");
         }
         // What the pods would be asked, judged from the configured paths alone.
         let guessed: Vec<_> =
             targets.iter().map(|(_, t)| arena_core::volume::repo_pull_from(&remote_path, &repo, &t.user, None)).collect();
         if guessed.iter().any(|g| matches!(g, Ok(Some(_)))) {
-            println!(
+            out!(
+                Detail,
                 "(each pod is first asked where {repo} really is: if it's a link — onto the /workspace \
                  volume — the link is left out of the pull and its tree pulled into the same place)"
             );
         }
         if let Some(Err(why)) = guessed.iter().find(|g| g.is_err()) {
-            println!("⚠ {why}: where {repo} is a link (setup links it onto the /workspace volume), this pull would hold only the link");
+            out!(Out, "⚠ {why}: where {repo} is a link (setup links it onto the /workspace volume), this pull would hold only the link");
         }
-        println!("Preview only — run without --dry-run to copy.");
+        out!(Detail, "Preview only — run without --dry-run to copy.");
         return Ok(Pulled { failures: sel.endpoint_failures().into_iter().map(|n| format!("{n}: no SSH endpoint after 10 minutes running")).collect(), ..Pulled::default() });
     }
     let dest_msg = if no_big {
@@ -489,8 +507,10 @@ pub(crate) async fn pull_pods(
         format!("{dir}/ (dated snapshot {label} + the all-files big/)")
     };
     let names = targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ");
-    if !confirm(yes, &format!("Will rsync {} pod home(s) into {dest_msg}: {names}", targets.len()))? {
-        println!("aborted.");
+    let shown = arena_core::backups::render::names_line(&targets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), crate::pods::backup::NAMES_SHOWN);
+    let what = format!("Will rsync {} pod home(s) into {dest_msg}: {names}", targets.len());
+    if !crate::confirm_brief(yes, &what, &format!("Copy the home of {shown} into {dir}?"))? {
+        out!(Out, "aborted.");
         return Ok(Pulled::default());
     }
     // The run record (`arena backups`): started now, each pod's copy as the run ends — stamped when
@@ -510,7 +530,7 @@ pub(crate) async fn pull_pods(
             let names: Vec<String> = targets.iter().map(|(n, _)| n.clone()).collect();
             let locks = take_pod_locks(dir, &names, wait).await;
             for b in &locks.busy {
-                println!("✗ {b}: {}", busy_line(b, wait));
+                out!(Out, "✗ {b}: {}", busy_line(b, wait));
                 not_pulled.push(format!("{b} (busy)"));
                 by_pod.push((b.clone(), busy_line(b, wait)));
             }
@@ -552,7 +572,8 @@ pub(crate) async fn pull_pods(
             Err(why) => {
                 let linked = answer.as_ref().and_then(|p| p.real.as_deref()).filter(|r| r.trim_end_matches('/') != repo.trim_end_matches('/'));
                 if let Some(real) = linked {
-                    println!(
+                    out!(
+                        Out,
                         "⚠ {name}: {repo} is a link to {real} and {why} — this pull may hold only the link: \
                          pull the home (no --remote-path), or --remote-path {real}/"
                     );
@@ -562,7 +583,7 @@ pub(crate) async fn pull_pods(
     })
     .await;
     if total_pods > 0 {
-        println!("Pulling {total_pods} pod(s) into {dest_msg}…");
+        out!(Detail, "Pulling {total_pods} pod(s) into {dest_msg}…");
     }
     // Every rsync: per pod, per tier, the home job — plus the repo job when it's split out.
     let mut planned = Vec::new();
@@ -595,9 +616,9 @@ pub(crate) async fn pull_pods(
         if job.repo {
             match clear_stale_link(dest) {
                 Ok(false) => {}
-                Ok(true) => println!("({name}: the backed-up link at {dest} is replaced by the repo's tree)"),
+                Ok(true) => out!(Detail, "({name}: the backed-up link at {dest} is replaced by the repo's tree)"),
                 Err(e) => {
-                    eprintln!("[FAILED] {name} [{tier}]: {dest} is a symlink and couldn't be removed: {e}");
+                    out!(Err, "[FAILED] {name} [{tier}]: {dest} is a symlink and couldn't be removed: {e}");
                     failed += 1;
                     failures.push(format!("{name} [{tier}] (removing the stale link {dest})"));
                     by_pod.push((name.clone(), format!("[{tier}] removing the stale link {dest}: {e}")));
@@ -607,7 +628,7 @@ pub(crate) async fn pull_pods(
         }
         // rsync needs the destination directory to exist.
         if let Err(e) = std::fs::create_dir_all(dest) {
-            eprintln!("[FAILED] {name} [{tier}]: creating {dest}: {e}");
+            out!(Err, "[FAILED] {name} [{tier}]: creating {dest}: {e}");
             failed += 1;
             failures.push(format!("{name} [{tier}] (creating {dest})"));
             by_pod.push((name.clone(), format!("[{tier}] creating {dest}: {e}")));
@@ -622,14 +643,15 @@ pub(crate) async fn pull_pods(
             match same_filesystem(std::path::Path::new(&tmp), std::path::Path::new(dest)) {
                 Ok(true) => {}
                 Ok(false) => {
-                    println!(
+                    out!(
+                        Detail,
                         "({name} [{tier}]: {dest} is on another filesystem than {tmp} — rsync keeps its temp files beside \
                          each file there, so an archive push running at the same time can see one)"
                     );
                     job.config.temp_dir = None;
                 }
                 Err(e) => {
-                    eprintln!("[FAILED] {name} [{tier}]: creating {tmp}: {e}");
+                    out!(Err, "[FAILED] {name} [{tier}]: creating {tmp}: {e}");
                     failed += 1;
                     failures.push(format!("{name} [{tier}] (creating {tmp})"));
                     by_pod.push((name.clone(), format!("[{tier}] creating {tmp}: {e}")));
@@ -684,6 +706,8 @@ pub(crate) async fn pull_pods(
     failed += missing.len();
     failures.extend(missing.into_iter().map(|n| format!("{n}: no SSH endpoint after 10 minutes running")));
     let (mut ok, mut done) = (0, 0);
+    // On a terminal, how many copies are done, in place.
+    let _progress = out::progress_guard("pull");
     // The floor as a hard line while the copies write (`disk::Watch`): under it, every job still
     // running is stopped, its pod's copy a failure — said, and recorded for the health check.
     let watched_dirs: Vec<&std::path::Path> =
@@ -736,7 +760,7 @@ pub(crate) async fn pull_pods(
                     locks.done(&pod);
                     by_pod.push((pod, format!("an rsync task crashed: {e}")));
                 }
-                println!("[{done}/{jobs}] ✗ an rsync task crashed: {e}");
+                out!(Out, "[{done}/{jobs}] ✗ an rsync task crashed: {e}");
                 failed += 1;
                 failures.push("(a crashed task)".into());
                 continue;
@@ -744,17 +768,24 @@ pub(crate) async fn pull_pods(
         };
         // A directory moved aside (or refused) is said on the job's line, whatever the outcome.
         let moved = made.note();
+        out::progress("pull", Some(&format!("copy {done}/{jobs}")));
+        // A failure's short line by default (its fix at the end), its whole line with `-v`.
+        let retry = format!("(retry: arena pods pull {name})");
         match out {
             Ok(stats) => {
-                // Report what actually moved, so a pull isn't "silent".
+                // Report what actually moved, so a pull isn't "silent" — with `-v`; by default the
+                // run's tally says it, unless a directory had to move aside.
                 let summary = stats.map_or_else(|| "done".into(), |s| s.summary());
-                say(&format!("[{done}/{jobs}] ✓ {name} [{tier}] ({summary}){moved}"));
+                let to = if moved.is_empty() { To::Detail } else { To::Out };
+                say_to(to, &format!("[{done}/{jobs}] ✓ {name} [{tier}] ({summary}){moved}"));
                 ok += 1;
                 jobs_of.entry(name.clone()).or_default().1 += 1;
             }
             Err((git, Ok(o))) => {
                 let pass = if git { ", .git" } else { "" };
-                say(&format!("[{done}/{jobs}] ✗ {name} [{tier}{pass}] (rsync {}): {}{moved}", o.exit_label(), o.stderr.trim()));
+                let why = crate::pods::backup::telling_line(&o.stderr).unwrap_or_default();
+                say_to(To::Brief, &out::fail(format!("{} [{tier}{pass}]: rsync {}: {why}{moved} {retry}", out::bold(&name), o.exit_label())));
+                say_to(To::Detail, &format!("[{done}/{jobs}] ✗ {name} [{tier}{pass}] (rsync {}): {}{moved}", o.exit_label(), o.stderr.trim()));
                 failed += 1;
                 failures.push(format!("{name} [{tier}]"));
                 by_pod.push((name.clone(), format!("[{tier}{pass}] rsync {}", o.exit_label())));
@@ -763,7 +794,8 @@ pub(crate) async fn pull_pods(
             // run continues incrementally), or rsync couldn't be started.
             Err((git, Err(e))) => {
                 let pass = if git { ", .git" } else { "" };
-                say(&format!("[{done}/{jobs}] ✗ {name} [{tier}{pass}]: {}{moved}", describe_error(&e)));
+                say_to(To::Brief, &out::fail(format!("{} [{tier}{pass}]: {}{moved} {retry}", out::bold(&name), describe_error(&e))));
+                say_to(To::Detail, &format!("[{done}/{jobs}] ✗ {name} [{tier}{pass}]: {}{moved}", describe_error(&e)));
                 failed += 1;
                 failures.push(format!("{name} [{tier}] ({})", describe_error(&e)));
                 by_pod.push((name.clone(), format!("[{tier}{pass}] {}", describe_error(&e))));
@@ -798,10 +830,12 @@ pub(crate) async fn pull_pods(
         }
     }
     if !used.is_empty() {
-        println!("\nSnapshot {label} on disk (`du` over every snapshot counts a hard-linked file once):\n{}", used.join("\n"));
+        out!(Detail, "\nSnapshot {label} on disk (`du` over every snapshot counts a hard-linked file once):\n{}", used.join("\n"));
     }
     let no_room = if skipped.is_empty() { String::new() } else { format!("; {} pod(s) skipped — no room on this box", skipped.len()) };
-    println!("\nDone: {ok} rsync job(s) ok, {failed} failed across {total_pods} pod(s){no_room}.");
+    out!(Detail, "\nDone: {ok} rsync job(s) ok, {failed} failed across {total_pods} pod(s){no_room}.");
+    let pods: Vec<String> = sel.pods.iter().map(|p| p.name.clone()).collect();
+    out!(Brief, "{}", copy_tally(&pods, &sel.endpoint_failures(), &by_pod, &sizes, &format!("{dir}/{label}")));
     failures.splice(0..0, not_pulled.iter().cloned());
     let whole: Vec<String> = if no_big || no_git {
         Vec::new()
@@ -871,6 +905,34 @@ fn copy_summary(sel: &Selected, failed: &[(String, String)], label: &str) -> Str
     let ok = sel.pods.iter().filter(|p| !bad.contains(&p.name.as_str())).count();
     format!("{ok} copied, {} failed ({label})", bad.len())
 }
+
+/// The copy's one line by default (docs/OUTPUT.md), after its failures' own lines: `✓ home copy
+/// of 3 pods → backup/w1d2 · 1.8G (12.0M new)` or `✗ home copy: 1 of 3 failed · 2 copied →
+/// backup/w1d2`. A pod listed without an SSH endpoint yet isn't a failure (the selection said
+/// so), unless it has gone without one too long (`overdue`); `failed` is every other pod's
+/// failure (`(pod, why)`). The sizes are the snapshot's, hard links counted once. Pure.
+fn copy_tally(pods: &[String], overdue: &[String], failed: &[(String, String)], sizes: &std::collections::HashMap<String, arena_core::pull::DiskUse>, dest: &str) -> String {
+    use arena_core::pull::human_bytes;
+    let unreached = |why: &str| why == NO_ENDPOINT_TO_PULL;
+    let mut bad: Vec<&str> = failed.iter().filter(|(_, why)| !unreached(why)).map(|(p, _)| p.as_str()).chain(overdue.iter().map(String::as_str)).collect();
+    bad.sort();
+    bad.dedup();
+    let skipped = pods.iter().filter(|p| !bad.contains(&p.as_str()) && failed.iter().any(|(q, w)| q == *p && unreached(w))).count();
+    let ok = pods.len() - bad.len() - skipped;
+    let (bytes, new) = sizes.values().fold((0, 0), |(b, n), d| (b + d.bytes, n + d.own_bytes));
+    let size = if sizes.is_empty() { String::new() } else { format!(" · {} ({} new)", human_bytes(bytes), human_bytes(new)) };
+    let pods_word = |n: usize| if n == 1 { "1 pod".to_string() } else { format!("{n} pods") };
+    let skipped = if skipped == 0 { String::new() } else { format!(" · {} without SSH skipped", pods_word(skipped)) };
+    let what = out::bold("home copy");
+    if bad.is_empty() {
+        out::ok(format!("{what} of {} → {dest}{size}{skipped}", pods_word(ok)))
+    } else {
+        out::fail(format!("{what}: {} of {} failed · {ok} copied → {dest}{skipped}", bad.len(), pods.len()))
+    }
+}
+
+/// Why a selected pod wasn't pulled: no endpoint to reach it at.
+const NO_ENDPOINT_TO_PULL: &str = "no SSH endpoint to pull from";
 
 /// `p` absolute: canonical once it exists, else made absolute against the working directory (the
 /// same place, before the first pull creates it).

@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use arena_core::Config;
 use clap::Subcommand;
 
-use crate::{archive, confirm, shell_quote};
+use crate::{archive, shell_quote};
+use arena_core::out;
 
 #[derive(Subcommand)]
 pub(crate) enum CronCmd {
@@ -183,14 +184,14 @@ pub(crate) async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::p
     match cmd {
         CronCmd::Show => {
             if before.is_empty() {
-                println!("(no arena-managed cron lines)");
+                out!(Out, "(no arena-managed cron lines)");
             } else {
                 for l in &before {
                     let kind = CronKind::of(l);
-                    println!("[{}] {l}", kind.map_or("other", CronKind::label));
+                    out!(Out, "[{}] {l}", kind.map_or("other", CronKind::label));
                     // The health line's time is cron's, this box's zone: said, not left to guess.
                     if let Some(at) = HealthAt::of_line(l).filter(|_| kind == Some(CronKind::Health)) {
-                        println!("  ↳ {}", health_when(at, box_zone().as_deref(), cron_tz(&current)));
+                        out!(Out, "  ↳ {}", health_when(at, box_zone().as_deref(), cron_tz(&current)));
                     }
                 }
             }
@@ -366,7 +367,7 @@ pub(crate) async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::p
                 // Only once it's written: until then, the old lines still use their old files.
                 let plan = tidy_plan(&kinds, &before, &after, home, &with_arena_block(&current, &after));
                 if let Some(line) = tidy_line(&tidy_old_cron_files(&plan, home, euid)) {
-                    println!("{line}");
+                    out!(Out, "{line}");
                 }
             }
             Ok(())
@@ -387,31 +388,56 @@ async fn apply_cron_change(
     yes: bool,
     crontab: &str,
 ) -> Result<bool> {
-    if before == after {
-        println!("The arena cron lines are already as asked — nothing to change.");
+    // A `note:` is `-v`'s; a warning (and anything else) is said by default too.
+    let say_notes = || {
         for n in notes {
-            println!("{n}");
+            if n.starts_with("note:") {
+                out!(Detail, "{n}");
+            } else {
+                out!(Out, "{n}");
+            }
         }
+    };
+    if before == after {
+        out!(Out, "The arena cron lines are already as asked — nothing to change.");
+        say_notes();
         return Ok(false);
     }
-    println!("arena cron lines, before → after (- removed, + added):");
+    out!(Detail, "arena cron lines, before → after (- removed, + added):");
     for l in cron_diff(before, after) {
-        println!("  {l}");
+        out!(Detail, "  {l}");
+        // By default the lines that change, each as what it runs and when (`cron_brief`).
+        if let Some((sign, line)) = l.split_at_checked(2).filter(|(sign, _)| *sign != "  ") {
+            out!(Brief, "{sign}{}", cron_brief(line));
+        }
     }
-    for n in notes {
-        println!("{n}");
-    }
+    say_notes();
     if dry_run {
-        println!("\nPreview only — run without --dry-run to change the crontab.");
+        out!(Detail, "\nPreview only — run without --dry-run to change the crontab.");
+        out!(Brief, "(dry run: nothing written; -v: the whole lines)");
         return Ok(false);
     }
-    if !confirm(yes, "\nWrite this crontab change?")? {
-        println!("aborted.");
+    if !crate::confirm_brief(yes, "\nWrite this crontab change?", "Write this crontab change?")? {
+        out!(Out, "aborted.");
         return Ok(false);
     }
     write_crontab(&with_arena_block(current, after), crontab).await?;
-    println!("Crontab updated (view with `arena cron show`).");
+    out!(Out, "Crontab updated (view with `arena cron show`).");
     Ok(true)
+}
+
+/// A crontab line as the default output shows it in a change: its kind, when it runs, its inline
+/// env and the arena command — `[backup] */15 * * * * ARENA_START_DATE=2026-10-05 arena pods
+/// backup --no-pull --yes` — without the folders, lock, binary, config and log `-v` shows. Any
+/// other line (no `--config`: a hand edit) as it is. Pure.
+fn cron_brief(line: &str) -> String {
+    let Some((schedule, words)) = cron_line_parts(line) else { return line.to_string() };
+    let Some(at) = words.iter().position(|w| *w == "--config") else { return line.to_string() };
+    let env: Vec<&str> = words.iter().take_while(|w| w.contains('=') && !w.starts_with('-')).copied().collect();
+    let args: Vec<&str> = words.iter().skip(at + 2).take_while(|w| !w.starts_with(">>")).copied().collect();
+    let kind = CronKind::of(line).map_or("other", CronKind::label);
+    let env = if env.is_empty() { String::new() } else { format!("{} ", env.join(" ")) };
+    format!("[{kind}] {schedule} {env}arena {}", args.join(" "))
 }
 
 /// The home `cron install`/`remove` writes lines for: `$HOME`, checked — set, absolute, free

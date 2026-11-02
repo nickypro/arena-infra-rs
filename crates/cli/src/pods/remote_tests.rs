@@ -1506,7 +1506,7 @@ async fn backup_classifies_each_pods_reply_and_a_wedged_pod_fails_at_the_budget(
     let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
     let mut lines = Vec::new();
     let start = Instant::now();
-    let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
+    let tally = backup_fleet(&remote, jobs, REPO, |to: arena_core::out::To, l: &str| if to.shows(true) { lines.push(l.to_string()) }, |_| {}).await;
     let on_main = vec![("devtest-delta".to_string(), "main".to_string())];
     let failed = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: None, at_push: false, wrong_origin: false, busy: None };
     assert_eq!(
@@ -1780,7 +1780,7 @@ async fn a_key_left_after_the_redaction_fails_at_the_push_and_is_copied() {
     let remote: Arc<dyn Remote> = fake.clone();
     let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
     let mut lines = Vec::new();
-    let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
+    let tally = backup_fleet(&remote, jobs, REPO, |to: arena_core::out::To, l: &str| if to.shows(true) { lines.push(l.to_string()) }, |_| {}).await;
     assert_eq!(
         lines,
         ["[1/1] ✗ devtest-bloom: a key is still in the unpushed commits of autocommit-b after the redaction — in a commit's \
@@ -1831,7 +1831,7 @@ async fn a_pod_whose_origin_isnt_the_configured_repo_fails_says_how_to_fix_it_an
     let remote: Arc<dyn Remote> = fake.clone();
     let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
     let mut lines = Vec::new();
-    let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
+    let tally = backup_fleet(&remote, jobs, REPO, |to: arena_core::out::To, l: &str| if to.shows(true) { lines.push(l.to_string()) }, |_| {}).await;
     assert_eq!((tally.pushed, tally.failed.len()), (1, 1));
     let bloom = Unpushed { pod: "devtest-bloom".into(), why: WRONG_WHY.into(), branch: None, at_push: false, wrong_origin: true, busy: None };
     assert_eq!(tally.unpushed, std::slice::from_ref(&bloom));
@@ -2161,7 +2161,7 @@ async fn a_pod_mid_merge_is_left_as_it_is_said_how_to_end_it_and_copied() {
     let remote: Arc<dyn Remote> = fake.clone();
     let jobs = targets(&fleet()).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
     let mut lines = Vec::new();
-    let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
+    let tally = backup_fleet(&remote, jobs, REPO, |to: arena_core::out::To, l: &str| if to.shows(true) { lines.push(l.to_string()) }, |_| {}).await;
     assert_eq!((tally.pushed, tally.unchanged, tally.failed.len()), (1, 1, 1));
     let mut got = unnumbered(&lines);
     got.sort();
@@ -4793,3 +4793,6 @@ mod cohort_scope {
         assert!(fake.calls().is_empty());
     }
 }
+
+/// Golden tests of the save commands' output (docs/OUTPUT.md), with these fixtures.
+mod save_output;

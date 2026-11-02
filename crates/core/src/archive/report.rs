@@ -214,11 +214,32 @@ impl StatusReport {
         self.items.iter().filter(|i| i.level == l).count()
     }
 
+    /// The whole checklist and its verdict (`-v`'s).
     pub fn render(&self) -> String {
-        let w = self.items.iter().map(|i| i.name.chars().count()).max().unwrap_or(0);
+        self.render_at(true)
+    }
+
+    /// The checklist at a verbosity: `verbose` every row; by default the ones that aren't ✓ —
+    /// each with its fix — and then the verdict, which counts what isn't shown. Pure.
+    pub fn render_at(&self, verbose: bool) -> String {
+        let shown: Vec<&StatusItem> = self.items.iter().filter(|i| verbose || i.level != Level::Ok).collect();
+        let w = shown.iter().map(|i| i.name.chars().count()).max().unwrap_or(0);
         let mut s = String::new();
-        for i in &self.items {
+        for i in &shown {
             s.push_str(&format!("{} {:<w$}  {}\n", i.level.glyph(), i.name, i.msg));
+        }
+        if !verbose {
+            let ok = self.count(Level::Ok);
+            s.push_str(&format!(
+                "{}{}: {} fail, {} unknown, {} warning(s), {ok} ok{}.\n",
+                if shown.is_empty() { "" } else { "\n" },
+                if self.ok() { "OK" } else { "NOT OK" },
+                self.count(Level::Fail),
+                self.count(Level::Unknown),
+                self.count(Level::Warn),
+                if ok > 0 { " (-v: every check)" } else { "" }
+            ));
+            return s;
         }
         s.push_str(&format!(
             "\n{}: {} fail, {} unknown, {} warning(s).\n",
@@ -946,6 +967,33 @@ mod tests {
         let r = judge(|_| {}, &snap, &big_ok(), &host(), Some(Ok(&inv())));
         assert_eq!(level_of(&r, "snap failing"), Level::Warn);
         assert!(r.render().contains("snap pushes failing: arena9-charlie (w0d2: left out: over 1000 unstorable symlinks)"), "{}", r.render());
+    }
+
+    /// `archive status` by default (docs/OUTPUT.md): the rows that need something, each with its
+    /// fix, then the verdict, counting the ✓ rows it left out; `-v` every row, as before.
+    #[test]
+    fn status_by_default_is_what_needs_doing_and_the_verdict() {
+        let mut snap = snap_ok();
+        snap.pods_failing.insert("arena9-charlie".into(), "w0d2: left out: over 1000 unstorable symlinks".into());
+        let r = judge(|_| {}, &snap, &big_ok(), &host(), Some(Ok(&inv())));
+        assert_eq!(r.render_at(true), r.render());
+        let brief = r.render_at(false);
+        let not_ok: Vec<String> = r.items.iter().filter(|i| i.level != Level::Ok).map(|i| i.name.clone()).collect();
+        assert_eq!(not_ok, ["snap failing"], "{}", r.render());
+        let w = "snap failing".len();
+        let item = r.items.iter().find(|i| i.name == "snap failing").unwrap();
+        assert_eq!(
+            brief,
+            format!(
+                "⚠ {:<w$}  {}\n\nOK: 0 fail, 0 unknown, 1 warning(s), {} ok (-v: every check).\n",
+                item.name,
+                item.msg,
+                r.count(Level::Ok)
+            )
+        );
+        // All well: the verdict alone.
+        let r = judge(|_| {}, &snap_ok(), &big_ok(), &host(), Some(Ok(&inv())));
+        assert_eq!(r.render_at(false), format!("OK: 0 fail, 0 unknown, 0 warning(s), {} ok (-v: every check).\n", r.count(Level::Ok)));
     }
 
     fn level_of(r: &StatusReport, name: &str) -> Level {

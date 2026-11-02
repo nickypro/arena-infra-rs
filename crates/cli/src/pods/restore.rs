@@ -10,8 +10,8 @@ use arena_core::selector::Naming;
 use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
-use crate::confirm;
 use crate::pods::pull::pull_roots;
+use arena_core::out;
 
 /// `pods restore`'s switches, resolved (the backup dir and budget defaulted).
 #[derive(Debug, Clone)]
@@ -94,7 +94,11 @@ pub(crate) async fn handle_restore(
     let tier = if label == restore::BIG { "the all-files tier" } else { "a snapshot: files under the size cap" };
     let into = sub.as_ref().map_or_else(|| "~/".to_string(), |p| format!("~/{p}"));
     let backup = RestoreSource { base, pod: &pod.name, label: &label, src: &src, sub: sub.as_deref(), last_written: stats.last_written };
-    let note = restore_notes(&repo, &ssh.user, probe.as_ref(), &backup, git).iter().map(|n| format!("\n         {n}")).collect::<String>();
+    let notes = restore_notes(&repo, &ssh.user, probe.as_ref(), &backup, git);
+    let note = notes.iter().map(|n| format!("\n         {n}")).collect::<String>();
+    // What the default output says before acting: the restore in a line, and its warnings.
+    let brief = format!("restore {} from {label} ({} file(s), {}) into {into}", pod.name, stats.files, pull::human_bytes(stats.bytes));
+    let warnings = || notes.iter().filter(|n| n.starts_with('⚠')).for_each(|w| out!(Brief, "{w}"));
     let newer = if opts.overwrite_newer {
         "files on the pod newer than the backup's ARE replaced"
     } else {
@@ -115,13 +119,18 @@ pub(crate) async fn handle_restore(
         ssh.port,
     );
     if opts.dry_run {
+        out!(Brief, "[dry-run] would {brief} — nothing deleted; what it replaces is kept on the pod in {kept} (-v: the plan and rsync)");
+        warnings();
         // Shell-quoted, so the line pastes as exactly this argv (the `.claude*` exclude unquoted
         // would expand against the operator's directory).
-        println!("[dry-run] would {plan}\n  {}", pull::display_argv(rsync, &args));
+        out!(Detail, "[dry-run] would {plan}\n  {}", pull::display_argv(rsync, &args));
         return Ok(());
     }
-    if !confirm(opts.yes, &format!("Will {plan}"))? {
-        println!("aborted.");
+    warnings();
+    let mut question = format!("{brief} (nothing deleted; what it replaces is kept on the pod)?");
+    question.replace_range(..1, "R");
+    if !crate::confirm_brief(opts.yes, &format!("Will {plan}"), &question)? {
+        out!(Out, "aborted.");
         return Ok(());
     }
     let what_run = format!("rsync to {}", pod.name);
@@ -141,12 +150,13 @@ pub(crate) async fn handle_restore(
     };
     let moved = pull::parse_rsync_stats(&out.stdout)
         .map_or_else(|| "done".into(), |s| format!("{} file(s), {} sent", s.files_sent, pull::human_bytes(s.bytes_sent)));
-    println!("✓ restored {} from {label} ({moved}); anything it replaced is under {kept} on the pod", pod.name);
+    out!(Out, "✓ restored {} from {label} ({moved}); anything it replaced is under {kept} on the pod", pod.name);
     let kept_newer = restore::newer_on_pod(&out.stdout);
     if !kept_newer.is_empty() {
         let shown: Vec<&str> = kept_newer.iter().take(10).map(String::as_str).collect();
         let more = if kept_newer.len() > shown.len() { format!(" (+{} more)", kept_newer.len() - shown.len()) } else { String::new() };
-        println!(
+        out!(
+            Out,
             "  {} file(s) on the pod are newer than the backup's and were left as they are{more}: {} — --overwrite-newer replaces them",
             kept_newer.len(),
             shown.join(", ")
@@ -165,7 +175,7 @@ pub(crate) async fn handle_restore(
                     Ok(o) => o.exit_label(),
                     Err(e) => describe_error(&e),
                 };
-                println!("  ⚠ couldn't check {repo} on {} after pushing its .git ({why}) — run `git -C {repo} fsck` there", pod.name);
+                out!(Out, "  ⚠ couldn't check {repo} on {} after pushing its .git ({why}) — run `git -C {repo} fsck` there", pod.name);
             }
         }
     }

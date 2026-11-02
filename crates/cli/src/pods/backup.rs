@@ -15,7 +15,9 @@ use crate::pods::selection::{say, Selected};
 use arena_core::backups::record::Outcome;
 use arena_core::backups::Job;
 use crate::pods::{exec_each_pod, failure_line, PodCall, BACKUP_TIMEOUT};
-use crate::{confirm, resolve};
+use crate::resolve;
+use arena_core::out;
+use arena_core::out::To;
 
 pub(crate) async fn handle_backup(
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
@@ -47,14 +49,24 @@ pub(crate) async fn handle_backup(
     // Back up only pods that actually have an SSH endpoint; report the rest.
     let targets = sel.named_targets(cfg)?;
     if targets.is_empty() {
-        println!("(no pods with an SSH endpoint to back up)");
+        out!(Out, "(no pods with an SSH endpoint to back up)");
         if !missing.is_empty() { return Err(BackupFailed { pods: missing }.into()); }
         return Ok(());
     }
 
     if !apply {
+        // By default what would happen, in a line; the script (~400 lines) and each pod's exact
+        // ssh line with `-v`.
+        let names: Vec<String> = targets.iter().map(|(n, _)| n.clone()).collect();
+        out!(
+            Brief,
+            "[dry-run] would commit + push the current branch of {} pod(s): {} (main/master skipped; -v: the script)",
+            names.len(),
+            arena_core::backups::render::names_line(&names, NAMES_SHOWN)
+        );
         let checked = origin.as_deref().map_or_else(String::new, |o| format!("; a pod whose origin isn't {o} is refused"));
-        println!(
+        out!(
+            Detail,
             "Dry-run — would commit + push the current branch on {} pod(s) (skips main/master; files over {} MB \
              and nested repos with their own history stay out of git{checked}), running the backup script below on each:\n",
             targets.len(),
@@ -63,15 +75,16 @@ pub(crate) async fn handle_backup(
         // The script is the same for every pod — printed once, at the end, as a here-doc that
         // writes the file each pod's line reads (so both paste); the arguments are exact.
         for (name, target) in &targets {
-            println!("# {name}");
-            println!("{}\n", backup::backup_dry_run_line(target, &repo_path, key.as_deref(), &msg_for(name), origin.as_deref()));
+            out!(Detail, "# {name}");
+            out!(Detail, "{}\n", backup::backup_dry_run_line(target, &repo_path, key.as_deref(), &msg_for(name), origin.as_deref()));
         }
-        println!(
+        out!(
+            Detail,
             "# The backup script, run under sh on each pod — paste this first: it writes ./{}, which the lines above read\n{}",
             backup::BACKUP_SCRIPT_FILE,
             backup::backup_script_heredoc()
         );
-        println!("\nPreview only — run without --dry-run to execute over SSH.");
+        out!(Detail, "\nPreview only — run without --dry-run to execute over SSH.");
         if !missing.is_empty() { return Err(BackupFailed { pods: missing }.into()); }
         return Ok(());
     }
@@ -84,7 +97,8 @@ pub(crate) async fn handle_backup(
     }
     locks.release_idle();
     let total = targets.len();
-    println!(
+    out!(
+        Detail,
         "Backing up {total} pod(s) over SSH (current branch; main/master skipped; {}s budget each)…",
         BACKUP_TIMEOUT.as_secs()
     );
@@ -97,7 +111,7 @@ pub(crate) async fn handle_backup(
         .collect();
     // The run record (`arena backups`): started now, each pod's outcome as it ended.
     let run = crate::backups::Run::start(cfg, Job::Git, total + missing.len(), crate::backups::scope_of(sel.named));
-    let mut t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}"), |name| locks.done(name)).await;
+    let mut t = backup_fleet(&remote, jobs, &repo_path, out::emit, |name| locks.done(name)).await;
     // Its failures besides the pushes: no endpoint, and (review r2 #3) the pods the caller left out
     // because another backup held their lock — the run isn't OK without them.
     let unreached: Vec<(String, String)> = missing
@@ -107,13 +121,15 @@ pub(crate) async fn handle_backup(
         .collect();
     run.finish(t.record_events(&unreached), t.summary(unreached.len()));
     t.failed.extend(missing);
-    println!(
+    out!(
+        Detail,
         "\nDone: {} pushed, {} unchanged, {} skipped (main/master), {} failed.",
         t.pushed,
         t.unchanged,
         t.skipped,
         t.failed.len()
     );
+    out!(Brief, "{}", git_tally(&t, locks.busy.len()));
     // The pods on main/master, after the counts — the line the operator acts on (never a failure).
     let fleet_wide = !sel.named && t.pushed + t.unchanged == 0;
     on_protected_lines(&Naming::from_config(cfg), &t.on_protected, fleet_wide).iter().for_each(|l| say(l));
@@ -159,12 +175,17 @@ pub(crate) async fn handle_full_backup(
     rsync: &str,
 ) -> Result<()> {
     if sel.pods.is_empty() {
-        println!("(no pods to back up)");
+        out!(Out, "(no pods to back up)");
         return Ok(());
     }
     let scope = format!("the ARENA tree of {} pod(s) ({})", sel.pods.len(), sel.names());
-    let what = if no_pull {
-        format!("commit + push {scope}, each on its current branch (main/master skipped)")
+    let names: Vec<String> = sel.pods.iter().map(|p| p.name.clone()).collect();
+    let shown = arena_core::backups::render::names_line(&names, NAMES_SHOWN);
+    let (what, question) = if no_pull {
+        (
+            format!("commit + push {scope}, each on its current branch (main/master skipped)"),
+            format!("Commit + push the branch of {shown}?"),
+        )
     } else {
         // Show the real destination subfolder (base/<wNdM>/<pod>) so it's clear where
         // the rsync lands; fall back to just the base if the wNdM label can't be
@@ -173,12 +194,15 @@ pub(crate) async fn handle_full_backup(
         let (big_root, _) = pull_roots(cfg, &base);
         let dest = match resolve_week_day(cfg, None, None) {
             Ok((w, d)) => format!("{base}/w{w}d{d}/<pod> (snapshot) + {big_root}/<pod> (all files)"),
-            Err(_) => base,
+            Err(_) => base.clone(),
         };
-        format!("commit + push {scope} (git), then rsync the home(s) to {dest}")
+        (
+            format!("commit + push {scope} (git), then rsync the home(s) to {dest}"),
+            format!("Back up {shown} (git push, then copy each home into {base})?"),
+        )
     };
-    if !dry_run && !confirm(yes, &format!("Will {what}."))? {
-        println!("aborted.");
+    if !dry_run && !crate::confirm_brief(yes, &format!("Will {what}."), &question)? {
+        out!(Out, "aborted.");
         return Ok(());
     }
     // 1) git push, then 2) rsync file backup (unless --no-pull). The file backup is
@@ -200,7 +224,7 @@ pub(crate) async fn handle_full_backup(
         (kept, locks)
     };
     for b in &locks.busy {
-        println!("✗ {b}: {}", busy_line(b, POD_LOCK_WAIT));
+        out!(Out, "✗ {b}: {}", busy_line(b, POD_LOCK_WAIT));
     }
     // Left out of both steps (`arena backups`): the git run records them with its own failures;
     // the copy run, once it has ended (below). With no pod left to back up there's no git run.
@@ -223,7 +247,7 @@ pub(crate) async fn handle_full_backup(
     // and, after it, finishes the ones left alone long enough (`resolve`).
     let busy = resolve::Busy::look(&remote, cfg, &dir, &sel, &unpushed).await;
     if !no_pull && !sel.pods.is_empty() {
-        println!();
+        out!(Detail, "");
         let args = PullRun { label: None, max_size: None, remote_path: None, no_git: false, no_big: false, dry_run, yes: true };
         let pulled = pull_pods(&remote, cfg, &dir, args, &sel, rsync, LockMode::Take(POD_LOCK_WAIT)).await;
         if !dry_run {
@@ -235,7 +259,8 @@ pub(crate) async fn handle_full_backup(
         return both_failures(settled.git(git_result), pulled.and_then(Pulled::result), &locks.busy);
     }
     if no_pull && dry_run {
-        println!(
+        out!(
+            Detail,
             "(a pod whose git push fails at the push itself, or whose origin isn't the configured repo, is then copied into \
              {dir} by rsync — even under --no-pull)"
         );
@@ -284,7 +309,8 @@ pub(crate) async fn copy_unpushed(
     if pods.is_empty() {
         return Ok(Pulled::default());
     }
-    println!(
+    out!(
+        Detail,
         "\nCopying the {} pod(s) git didn't back up into {dir} instead (rsync, both tiers): {}",
         pods.len(),
         pods.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
@@ -324,7 +350,8 @@ pub(crate) fn fallback_lines(unpushed: &[Unpushed], pulled: &Result<Pulled>) -> 
 fn print_fallback_copies(unpushed: &[Unpushed], pulled: &Result<Pulled>) {
     let lines = fallback_lines(unpushed, pulled);
     if !lines.is_empty() {
-        println!("\n{}", lines.join("\n"));
+        out!(Detail, "");
+        lines.iter().for_each(|l| out!(Out, "{l}"));
     }
 }
 
@@ -344,6 +371,33 @@ fn both_failures(git: Result<()>, pull: Result<()>, busy: &[String]) -> Result<(
 
 /// The rsync binary `pull`/`backup` run (from PATH).
 pub(crate) const RSYNC: &str = "rsync";
+
+/// How many pods a one-line prompt or dry run names before `(+N more)`.
+pub(crate) const NAMES_SHOWN: usize = 6;
+
+/// The git backup's one line by default (docs/OUTPUT.md): its verdict and counts —
+/// `✓ git backup of 3 pods: 1 pushed, 2 no changes` or `✗ git backup: 1 of 3 failed · 1 pushed,
+/// 1 no changes`. `busy`: pods left out because another backup held them (failures too). The
+/// cron's log gets this and the failures' own lines; each pod's ✓ is for `-v`. Pure.
+pub(crate) fn git_tally(t: &BackupTally, busy: usize) -> String {
+    let failed = t.failed.len() + busy;
+    let total = t.pushed + t.unchanged + t.skipped + failed;
+    let mut parts = Vec::new();
+    for (n, what) in [(t.pushed, "pushed"), (t.unchanged, "no changes"), (t.skipped, "on main/master")] {
+        if n > 0 {
+            parts.push(format!("{n} {what}"));
+        }
+    }
+    let counts = parts.join(", ");
+    if failed == 0 {
+        let pods = if total == 1 { "1 pod".to_string() } else { format!("{total} pods") };
+        out::ok(format!("{} of {pods}: {counts}", out::bold("git backup")))
+    } else if counts.is_empty() {
+        out::fail(format!("{}: {failed} of {total} failed", out::bold("git backup")))
+    } else {
+        out::fail(format!("{}: {failed} of {total} failed · {counts}", out::bold("git backup")))
+    }
+}
 
 /// What a fleet `backup` did, per outcome.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -514,13 +568,17 @@ pub(crate) async fn backup_fleet(
     remote: &Arc<dyn Remote>,
     jobs: Vec<(String, SshTarget, String)>,
     repo: &str,
-    mut emit: impl FnMut(&str),
+    // Where each line goes, at its level (docs/OUTPUT.md): a pod's ✓ is `-v`'s, its failure always.
+    mut emit: impl FnMut(To, &str),
     // Each pod's name as its push ends (its backup lock is released there).
     mut ended: impl FnMut(&str),
 ) -> BackupTally {
     use arena_core::backup::{self, parse_backup_report};
     let mut t = BackupTally::default();
+    // On a terminal, how far the run is, in place (nothing in a log: its failures and tally say it).
+    let _progress = out::progress_guard("git-backup");
     exec_each_pod(remote, jobs, BACKUP_TIMEOUT, |done, total, name, call| {
+        out::progress("git-backup", Some(&format!("git backup {done}/{total}")));
         let report = call.as_ref().map(|out| parse_backup_report(&out.stdout)).unwrap_or_default();
         let notes = report.notes();
         let also = if notes.is_empty() { String::new() } else { format!(" — {}", notes.join("; ")) };
@@ -562,18 +620,26 @@ pub(crate) async fn backup_fleet(
                 let busy = report.in_progress(out.code).map(String::from);
                 t.events.push((name.clone(), Outcome::Failed, why.clone(), arena_core::snapshot::unix_now()));
                 t.unpushed.push(Unpushed { pod: name.clone(), why, branch: report.branch.clone(), at_push: report.failed_at_push(), wrong_origin, busy });
-                format!("[{done}/{total}] ✗ {name}: {}", report.failure(repo, name, out.code).unwrap_or_default())
+                // Its own words carry the fix (the setup, the commands that end a merge or drop a
+                // big file); by default without the counter.
+                let failure = report.failure(repo, name, out.code).unwrap_or_default();
+                emit(To::Brief, &out::fail(format!("{}: {failure}", out::bold(name))));
+                format!("[{done}/{total}] ✗ {name}: {failure}")
             }
             _ => {
                 t.failed.push(name.clone());
                 let at_push = report.failed_at_push();
                 t.events.push((name.clone(), Outcome::Failed, failure_why(&call), arena_core::snapshot::unix_now()));
                 t.unpushed.push(Unpushed { pod: name.clone(), why: failure_why(&call), branch: report.branch.clone(), at_push, wrong_origin: false, busy: None });
+                // By default its telling line, not the whole of stderr: `-v` has that.
+                emit(To::Brief, &out::fail(format!("{}: {} (retry: arena pods backup {name} -v)", out::bold(name), failure_why(&call))));
                 failure_line(done, total, name, &call)
             }
         };
         if !line.is_empty() {
-            emit(&line);
+            // A failure's whole line with `-v` (its short form went by default, above); a pod
+            // that went well is `-v`'s alone.
+            emit(To::Detail, &line);
         }
         ended(name);
     })

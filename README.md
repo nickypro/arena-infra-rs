@@ -263,16 +263,19 @@ flowchart LR
    then a pod on `main` isn't backed up, and the run says so.
 3. **Backups run themselves.** Every 15 minutes cron runs `pods backup`; its log is
    `~/.local/state/arena-cron/backup.log`, and `arena backups` (the dashboard's `b`) says
-   whether each run is on time and which pods are failing. Each pod gets one line in the log:
+   whether each run is on time and which pods are failing. Each run logs its failures, each with
+   what to do, and one line of tally:
 
    | Line | Meaning |
    | --- | --- |
-   | `[3/20] ✓ arena-apple -> autocommit-arena-w1d2-apple` | Committed and pushed |
-   | `[4/20] = arena-bloom (no changes, on autocommit-…)` | Nothing new since the last push |
+   | `✓ git backup of 20 pods: 3 pushed, 16 no changes, 1 on main/master` | The run: nothing failed |
+   | `✗ git backup: 1 of 20 failed · 3 pushed, 15 no changes, 1 on main/master` | The run: the failed pods' lines are above it |
    | `✗ <pod>: a merge is in progress on <branch> — …` | Not pushed: the line says why and what to do. A refused push or a half-done merge gets the pod's files rsynced instead |
-   | `⊘ skipped N non-cohort pods (…)` | Left out on purpose (staff boxes, other prefixes), not a failure |
    | `⊘ <pod>: not finished automatically — notes.py changed 40 min ago — …` | A half-done merge waits for 3 h of quiet, then finishes by itself |
    | `⚠ 12 cohort pods on main: not backed up until …` | Pods on `main`: run `arena pods init-branches` |
+
+   `arena pods backup -v` by hand prints a line per pod (`[3/20] ✓ arena-apple -> autocommit-…`,
+   `= arena-bloom (no changes, …)`) and the `⊘ skipped N non-cohort pods` line.
 
 4. **Getting a pod back.**
 

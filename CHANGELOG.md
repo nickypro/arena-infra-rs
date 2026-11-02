@@ -19,6 +19,21 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-02 · Output, phase 2: more commands say less by default
+- **Backups and branches** (`pods backup`, `pull`, `set-branch`, `init-branches`, `restore`,
+  `baseline`, `backups`, `archive sync`/`status`, `cron install`/`remove`). The */15 cron's log
+  gets each failure with its fix and one line per run: `✓ git backup of 20 pods: 3 pushed, 16 no
+  changes, 1 on main/master` (and `✓ home copy of 20 pods → <dir>/w1d2 · 1.8G (12.0M new)` with
+  `--pull`). Each pod's `[3/20] ✓ …` line, the `⊘ skipped … non-cohort` line and the copy's sizes
+  need `-v`. A dry run says in one line what it would do; the backup script, each pod's switch
+  command and each rsync need `-v`. Prompts are one line (`Back up devtest-apple, devtest-bloom (git
+  push, then copy each home into …)? [y/N]`). `set-branch`/`init-branches` print a pod's line only
+  when it has news (not pushed first, what a `--hard` reset saved), then a tally. `arena backups`
+  drops `Running now: nothing`, the "Not covered"/"Restore" paragraphs and a note repeated under
+  two jobs. `archive status` shows only the rows that need something, then its verdict. `archive
+  sync` prints a line per label and one for big. `cron install` shows each changed line as its
+  schedule and command.
+
 ## 2026-11-02 · arena 2.12: shorter output by default; `-v` shows the rest
 - **`pods up` and `pods create` say much less.** By default they print the plan in one line
   (or a short table for several options), the balance in one line, a one-line prompt with what
