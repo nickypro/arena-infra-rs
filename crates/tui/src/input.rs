@@ -66,18 +66,20 @@ pub(crate) fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared
         ui.mode = Mode::Info { scroll: scroll_by(scroll, ui.result_max.get(), delta), detail };
         return true;
     }
+    // The wheel moves the cursor in the detail view too, as ↑↓ do there.
+    let wheel_moves = matches!(ui.mode, Mode::List | Mode::Detail);
     match m.kind {
         MouseEventKind::ScrollUp => {
             if in_result {
                 ui.result_scroll = scroll_by(ui.result_scroll, ui.result_max.get(), -1);
-            } else if in_list {
+            } else if wheel_moves {
                 ui.selected = ui.selected.saturating_sub(1);
             }
         }
         MouseEventKind::ScrollDown => {
             if in_result {
                 ui.result_scroll = scroll_by(ui.result_scroll, ui.result_max.get(), 1);
-            } else if in_list {
+            } else if wheel_moves {
                 let len = shared.lock().unwrap().pods.len();
                 if len > 0 {
                     ui.selected = (ui.selected + 1).min(len - 1);
@@ -153,6 +155,16 @@ pub(crate) enum ListKey {
     Other,
 }
 
+/// What the list and detail views read a key as: Shift+↑/↓ are Home/End (the first / last pod).
+/// The other keys are themselves.
+pub(crate) fn list_code(code: KeyCode, mods: KeyModifiers) -> KeyCode {
+    match code {
+        KeyCode::Up if mods.contains(KeyModifiers::SHIFT) => KeyCode::Home,
+        KeyCode::Down if mods.contains(KeyModifiers::SHIFT) => KeyCode::End,
+        c => c,
+    }
+}
+
 /// The list and detail views' keys that need nothing but `ui` and the row count `len`. Only
 /// `q` quits (and Ctrl+C, from anywhere); Esc steps back and never quits — from the detail view
 /// to the list, and on the list it clears the marks if there are any, else does nothing. Live:
@@ -163,6 +175,10 @@ pub(crate) fn list_key(ui: &mut Ui, code: KeyCode, len: usize) -> ListKey {
         KeyCode::Esc if matches!(ui.mode, Mode::Detail) => ui.mode = Mode::List,
         KeyCode::Esc | KeyCode::Char('x') => ui.marked.clear(),
         KeyCode::Up | KeyCode::Char('k') => ui.selected = ui.selected.saturating_sub(1),
+        // The first / last pod (`gg` works too: the second `g` stays there). Shift+↑/↓ arrive
+        // here as Home/End ([`list_code`]).
+        KeyCode::Home | KeyCode::Char('g') => ui.selected = 0,
+        KeyCode::End | KeyCode::Char('G') => ui.selected = len.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => {
             if ui.selected + 1 < len {
                 ui.selected += 1;
@@ -278,7 +294,7 @@ fn handle_key_in(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui
     }
     let len = shared.lock().unwrap().pods.len();
     match ui.mode.clone() {
-        Mode::List | Mode::Detail => match list_key(ui, code, len) {
+        Mode::List | Mode::Detail => match list_key(ui, list_code(code, mods), len) {
             ListKey::Quit => return Ok(if runs::quit_or_ask(ui, shared) { Flow::Quit(Vec::new()) } else { Flow::Changed }),
             ListKey::Done => {}
             ListKey::Other => match code {
@@ -576,6 +592,37 @@ mod tests {
         let n = shared.notice.clone().unwrap();
         assert_eq!((n.text.as_str(), n.error), ("marked 1 pod: bravo", false));
         assert!(matches!(ui.mode, Mode::List));
+    }
+
+    /// g / Home / Shift+↑ go to the first pod, G / End / Shift+↓ to the last; the wheel moves the
+    /// cursor in the detail view as in the list.
+    #[test]
+    fn first_and_last_pod_keys_and_the_wheel_in_the_detail_view() {
+        let shared = Arc::new(Mutex::new(fixture_shared()));
+        let len = shared.lock().unwrap().pods.len();
+        assert!(len > 2);
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        for (code, mods, want) in [
+            (KeyCode::Char('G'), KeyModifiers::SHIFT, len - 1),
+            (KeyCode::Char('g'), KeyModifiers::NONE, 0),
+            (KeyCode::End, KeyModifiers::NONE, len - 1),
+            (KeyCode::Home, KeyModifiers::NONE, 0),
+            (KeyCode::Down, KeyModifiers::SHIFT, len - 1),
+            (KeyCode::Up, KeyModifiers::SHIFT, 0),
+            (KeyCode::Down, KeyModifiers::NONE, 1),
+        ] {
+            assert_eq!(list_key(&mut ui, list_code(code, mods), len), ListKey::Done, "{code:?} {mods:?}");
+            assert_eq!(ui.selected, want, "{code:?} {mods:?}");
+        }
+        ui.selected = 0;
+        assert_eq!(list_key(&mut ui, KeyCode::Char('G'), 0), ListKey::Done);
+        assert_eq!(ui.selected, 0, "no pods: stays at 0");
+        ui.mode = Mode::Detail;
+        let wheel = |kind| MouseEvent { kind, column: 0, row: 0, modifiers: KeyModifiers::NONE };
+        assert!(handle_mouse(wheel(MouseEventKind::ScrollDown), &mut ui, &shared));
+        assert!(handle_mouse(wheel(MouseEventKind::ScrollDown), &mut ui, &shared));
+        assert!(handle_mouse(wheel(MouseEventKind::ScrollUp), &mut ui, &shared));
+        assert_eq!(ui.selected, 1, "the wheel moved the cursor in the detail view");
     }
 
     /// A mark whose pod left the list shows on no row, so with only such marks `a` acts on the
