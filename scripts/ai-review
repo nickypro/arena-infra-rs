@@ -260,7 +260,10 @@ risk_rank() {
       */teardown.rs | crates/core/src/lock.rs | crates/core/src/pull.rs | crates/core/src/restore.rs) echo 30 ;;
     crates/cli/src/main.rs | crates/cli/src/pods.rs | crates/cli/src/pods/* | crates/cli/src/cli.rs | \
       crates/cli/src/cron.rs | crates/cli/src/keys.rs | crates/cli/src/proxy.rs | crates/cli/src/config_cmd.rs | \
-      crates/cli/src/ssh_config.rs | crates/cli/src/plan.rs | crates/cli/src/snapshot.rs | crates/tui/src/main.rs) echo 40 ;;
+      crates/cli/src/ssh_config.rs | crates/cli/src/plan.rs | crates/cli/src/snapshot.rs | crates/tui/src/main.rs | \
+      crates/tui/src/actions.rs | crates/tui/src/ssh_actions.rs | crates/tui/src/refresh.rs | crates/tui/src/deep_check.rs | \
+      crates/tui/src/terminal.rs | crates/tui/src/event_loop.rs | crates/tui/src/input.rs | crates/tui/src/view.rs | \
+      crates/tui/src/table.rs | crates/tui/src/detail.rs | crates/tui/src/modals.rs | crates/tui/src/info.rs) echo 40 ;;
     crates/*/src/*) echo 50 ;;
     Cargo.toml | */Cargo.toml | */build.rs | .github/* | scripts/* | *.toml) echo 60 ;;
     *) echo 70 ;;
