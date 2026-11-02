@@ -773,3 +773,30 @@ async fn a_shared_name_is_said_with_its_id() {
         "default:\n{quiet}"
     );
 }
+
+/// Review r6: two pods sharing a name (a double create), one whose setup fails — neither is said
+/// to be READY (setup names its pods, so which one worked can't be told).
+#[tokio::test(start_paused = true)]
+async fn twins_with_a_failed_setup_are_not_ready() {
+    let dir = tmpdir("out-start-twins");
+    // No proxy: nothing else keeps a twin from READY.
+    let text: String = cfg_text(&dir.0).lines().filter(|l| !l.starts_with("SSH_PROXY_")).map(|l| format!("{l}\n")).collect();
+    let cfg = Config::parse(&text);
+    let f = fleet();
+    {
+        let mut pods = f.pods.lock().unwrap();
+        pods[0].status = "EXITED".into();
+        let mut twin = pod("r-alpha-2", "devtest-alpha", "runpod", Some(("10.0.0.2", 22001)));
+        twin.status = "EXITED".into();
+        pods.push(twin);
+    }
+    let remote = FakeRemote::new();
+    // The twin comes back on 10.0.0.2:23001 (a reset moves the port): its setup fails.
+    remote.script("10.0.0.2:23001", [FakeReply::exit(128, "fatal: could not read from remote repository.")]);
+    let pods = f.pods.lock().unwrap().clone();
+    let sel = named(&[pods[0].clone(), pods[4].clone()]);
+    let opts = RestartOpts { yes: true, ..Default::default() };
+    let got = rendered(false, &[], handle_start(&f, Arc::new(remote), &cfg, &sel, opts, FAST, &dir.0.display().to_string())).await;
+    assert!(got.contains("[devtest-alpha] FAILED setup: "), "{got}");
+    assert!(!got.contains("READY"), "{got}");
+}

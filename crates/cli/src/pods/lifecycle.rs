@@ -1705,7 +1705,10 @@ async fn come_back(
         };
         match setup {
             Ok(done) => {
-                back.retain(|n| done.provisioned.contains(n));
+                // Setup says its pods by name: two pods sharing one (a double create) can't be
+                // told apart there, so after a failure neither is said to be READY (review r6).
+                let shared = |n: &str| pods.iter().filter(|p| p.name == n).count() > 1;
+                back.retain(|n| done.provisioned.contains(n) && (done.failed == 0 || !shared(n)));
                 if done.failed > 0 {
                     problems.push(format!("{} pod(s) failed to set up", done.failed));
                 }
