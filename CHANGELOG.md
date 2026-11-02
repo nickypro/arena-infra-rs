@@ -19,6 +19,26 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-02 · arena 2.10: the coding agents on each machine know which Python to use; `uv` on every shell's PATH
+- Setup writes a short block into each machine's `~/.claude/CLAUDE.md` (Claude Code) and
+  `~/.codex/AGENTS.md` (Codex): the course env it finds there (`/opt/arena-env` on RunPod and
+  Vast, `/root/ARENA_materials/.venv` on Hetzner), how to install into it, and where the repo is.
+  Before, a Claude asked to run a model used the system Python and pip-installed transformers into
+  it. Only the block between `<!-- BEGIN arena-infra python -->` and `<!-- END arena-infra python
+  -->` is written: the rest of each file stays as it was (its mode too), and a second run changes
+  nothing.
+- `uv` and `uvx` are linked into `/usr/local/bin`, so `uv` works in every shell on a Hetzner VM
+  (it was "command not found": it was only in `~/.local/bin`). A link already there is kept.
+- **`pods setup --notes-only`** does just that on machines that are running, and nothing else. It
+  replaces a block written by hand between the same markers. Its dry run shows where it looks.
+
+### Action needed
+- Machines set up before this have neither: `arena pods setup --notes-only` (no targets = every
+  machine).
+
+### Config
+- `AGENT_NOTES` (new; on by default): `0` leaves the notes out of setup.
+
 ## 2026-10-31 · `arena backups` no longer misses a backup that's running
 - `arena backups` and the dashboard's backups screen tell a running backup by its lock (a pod's
   backup lock, the cron line's, the archive's), read from `/proc/locks`. When another program on

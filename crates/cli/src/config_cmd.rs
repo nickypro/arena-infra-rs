@@ -691,6 +691,29 @@ fn swap_row(cfg: &Config) -> (String, Option<arena_core::Error>) {
     }
 }
 
+/// `config check`'s `AGENT_NOTES` row: whether setup writes the agents' notes (which Python to
+/// use, for Claude Code and Codex), `(default)` when unset, or a ✗ row and the error the check
+/// fails on. Pure.
+fn agent_notes_row(cfg: &Config) -> (String, Option<arena_core::Error>) {
+    let raw = cfg.get("AGENT_NOTES");
+    let set = raw.is_some_and(|v| !v.trim().is_empty());
+    match arena_core::agent_notes::enabled(raw) {
+        Ok(true) => {
+            let (mark, default) = if set { ("✓", "") } else { ("·", " (default)") };
+            let files = arena_core::agent_notes::FILES.join(", ");
+            (format!("  {mark} {:<28} on{default} — setup writes which Python to use into {files}", "AGENT_NOTES"), None)
+        }
+        Ok(false) => (format!("  ✓ {:<28} off — setup writes no agent notes (`pods setup --notes-only` still does)", "AGENT_NOTES"), None),
+        Err(e) => {
+            let why = match &e {
+                arena_core::Error::Config(m) => m.clone(),
+                other => other.to_string(),
+            };
+            (format!("  ✗ {:<28} {why}", "AGENT_NOTES"), Some(e))
+        }
+    }
+}
+
 /// `config check`'s rows for `ASK_AI`: which AI `pods ask` (and the dashboard's `?`) sends to
 /// — `(default)` when unset — or `off`; where its binary is, or a ⚠ when it isn't installed for
 /// this user (advice: nothing fails until it's used). Then each AI's model and effort that is set
@@ -1138,6 +1161,12 @@ pub(crate) fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<S
             note_invalid(&mut missing, &e);
         }
     }
+    // The agents' notes setup writes (AGENT_NOTES).
+    let (line, bad) = agent_notes_row(cfg);
+    println!("{line}");
+    if let Some(e) = bad {
+        note_invalid(&mut missing, &e);
+    }
     // The driver floor `pods test --deep` holds pods to (MIN_DRIVER_VERSION, else derived
     // from ALLOWED_CUDA_VERSIONS).
     match arena_core::health::HealthPolicy::from_config(cfg) {
@@ -1262,6 +1291,26 @@ mod swap_row_tests {
         let mut missing = Vec::new();
         note_invalid(&mut missing, &bad.unwrap());
         assert!(missing.iter().any(|m| m.starts_with("VM_SWAP_GB")), "{missing:?}");
+    }
+
+    /// `config check`'s `AGENT_NOTES` row: on by default (marked), off, and a bad value a ✗ row
+    /// with the error the check fails on.
+    #[test]
+    fn the_agent_notes_row_says_on_off_or_why_not() {
+        let row = |text: &str| agent_notes_row(&Config::parse(text));
+        let (line, bad) = row("");
+        assert_eq!(
+            line,
+            "  · AGENT_NOTES                  on (default) — setup writes which Python to use into ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md"
+        );
+        assert!(bad.is_none());
+        assert!(row("AGENT_NOTES=1\n").0.starts_with("  ✓ AGENT_NOTES                  on — "));
+        assert!(row("AGENT_NOTES=0\n").0.starts_with("  ✓ AGENT_NOTES                  off — "));
+        let (line, bad) = row("AGENT_NOTES=sometimes\n");
+        assert_eq!(line, "  ✗ AGENT_NOTES                  AGENT_NOTES must be 1 or 0 (got `sometimes`)");
+        let mut missing = Vec::new();
+        note_invalid(&mut missing, &bad.unwrap());
+        assert!(missing.iter().any(|m| m.starts_with("AGENT_NOTES")), "{missing:?}");
     }
 
     /// `config check`'s `ENDPOINT_TIMEOUT_MINS` row: the default (5) marked, a set value ✓, and

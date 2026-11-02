@@ -2960,8 +2960,8 @@ async fn run_setup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
 /// The TUI's setup steps: core's list for the pod's own provider, as `arena pods setup` builds
 /// it — a bare VM's script (`script`: the local copy its scp sends, [`vm_script_path`]) and its
 /// swap, key and hostname steps included; until 2026-10-31 it was the image-based list for every
-/// pod, so a Hetzner VM got no script and no swap. No VS Code warm-up: that stays `arena pods
-/// setup`'s, as do its API keys.
+/// pod, so a Hetzner VM got no script and no swap. The agents' notes too (a reset container has
+/// lost them). No VS Code warm-up: that stays `arena pods setup`'s, as do its API keys.
 fn setup_steps(cfg: &Config, pod: &Pod, script: &str) -> arena_core::Result<Vec<arena_core::setup::ProvisionStep>> {
     use arena_core::setup::{provisioning_steps, SetupConfig, SetupTimeouts};
     let mut scfg = SetupConfig::from_config(cfg)?;
@@ -6756,6 +6756,8 @@ deep_check_end=1
         };
         // (what, the scripted replies, the outcome line starts with, budgets used)
         let setup = arena_core::setup::SetupTimeouts::default();
+        // The agents' notes, last (best-effort; the dashboard's setup writes them too).
+        let notes = arena_core::agent_notes::TIMEOUT;
         type Case = (&'static str, Vec<FakeReply>, &'static str, Vec<Duration>);
         let cases: Vec<Case> = vec![
             ("test", vec![FakeReply::stdout("noise\n2.9.0+cu130\n")], "✓ devtest-alpha torch: 2.9.0+cu130", vec![TEST_TIMEOUT]),
@@ -6820,7 +6822,7 @@ deep_check_end=1
                  configured nickypro/arena-sandbox-materials — not backed up to git; run `arena pods setup devtest-alpha`",
                 vec![BACKUP_TIMEOUT],
             ),
-            ("setup", vec![FakeReply::ok(), FakeReply::ok(), FakeReply::ok()], "✓ set up devtest-alpha", vec![setup.copy, setup.relocate, setup.config]),
+            ("setup", vec![FakeReply::ok(), FakeReply::ok(), FakeReply::ok()], "✓ set up devtest-alpha", vec![setup.copy, setup.relocate, setup.config, notes]),
             (
                 "setup-hung",
                 vec![FakeReply::ok(), FakeReply::ok(), FakeReply::hang()],
@@ -6836,14 +6838,14 @@ deep_check_end=1
                     FakeReply::ok(),
                 ],
                 "✓ set up devtest-alpha (warning: repo onto volume: repo not moved onto the /workspace volume: in use (pid 42) - re-run setup when it is idle)",
-                vec![setup.copy, setup.relocate, setup.config],
+                vec![setup.copy, setup.relocate, setup.config, notes],
             ),
             // …and so does what the config step says.
             (
                 "setup-config-warns",
                 vec![FakeReply::ok(), FakeReply::ok(), FakeReply::stdout("arena-warning: another setup is still moving the repo onto the volume - the update ran anyway\n")],
                 "✓ set up devtest-alpha (warning: repo + keys config: another setup is still moving the repo onto the volume - the update ran anyway)",
-                vec![setup.copy, setup.relocate, setup.config],
+                vec![setup.copy, setup.relocate, setup.config, notes],
             ),
         ];
         for (what, replies, want, budget) in cases {
@@ -6906,8 +6908,9 @@ deep_check_end=1
                 RemoteCall::Exec { timeout, .. } | RemoteCall::Copy { timeout, .. } => *timeout,
             })
             .collect();
-        // deploy key, authorize keys, hostname, the script's copy, repo update, the script.
-        let want = [t.copy, t.config, t.config, t.copy, t.config, t.bare_vm];
+        // deploy key, authorize keys, hostname, the script's copy, repo update, the script, the
+        // agents' notes.
+        let want = [t.copy, t.config, t.config, t.copy, t.config, t.bare_vm, arena_core::agent_notes::TIMEOUT];
         assert_eq!(budgets, want.map(Some).to_vec(), "{calls:?}");
         let copied = calls.iter().find_map(|c| match c {
             RemoteCall::Copy { local, remote, .. } if remote == "/root/hetzner_setup.sh" => Some(local.clone()),
@@ -6949,7 +6952,7 @@ deep_check_end=1
                 RemoteCall::Exec { timeout, .. } | RemoteCall::Copy { timeout, .. } => timeout,
             })
             .collect();
-        assert_eq!(budgets, vec![Some(t.copy), Some(t.relocate), Some(t.config)]);
+        assert_eq!(budgets, vec![Some(t.copy), Some(t.relocate), Some(t.config), Some(arena_core::agent_notes::TIMEOUT)]);
         assert!(!fake.calls().iter().any(|c| matches!(c, RemoteCall::Copy { remote, .. } if remote == "/root/hetzner_setup.sh")));
         assert!(!vm_script_path(&runpod).exists());
     }

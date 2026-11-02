@@ -416,6 +416,53 @@ pub(crate) async fn handle_setup(
     Ok(())
 }
 
+/// `pods setup --notes-only`: just the agents' notes step ([`arena_core::agent_notes`]) on each
+/// selected machine — uv and uvx linked into /usr/local/bin where missing, and which Python to use
+/// in `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` — and nothing else: no deploy key, repo
+/// update, tokens, API keys, Claude Code account or VS Code. For machines that were running when
+/// the notes came out: a whole setup in the middle of a programme does far more than that. The
+/// step is required here (it's all the run does), so a machine it fails on is a ✗. A machine that
+/// doesn't answer fails at once: these are running machines, there's no boot to wait out.
+pub(crate) async fn handle_notes(
+    remote: std::sync::Arc<dyn arena_core::remote::Remote>,
+    cfg: &Config,
+    notes: &arena_core::agent_notes::AgentNotes,
+    apply: bool,
+    sel: &Selected,
+) -> Result<()> {
+    use arena_core::setup::BootRetry;
+    let targets: Vec<(String, String, arena_core::ssh::SshTarget)> =
+        sel.ssh_targets(cfg)?.into_iter().map(|(p, t)| (p.name.clone(), p.provider.clone(), t)).collect();
+    if targets.is_empty() {
+        println!("(no pods with an SSH endpoint)");
+        return Ok(());
+    }
+    if !apply {
+        println!("Dry-run — would write the agents' notes on {} pod(s):\n", targets.len());
+        for (name, provider, _) in &targets {
+            println!("# {name}\n  {}\n", notes.summary(provider));
+        }
+        println!("Preview only — run without --dry-run to execute over SSH.");
+        return Ok(());
+    }
+    println!(
+        "Writing the agents' notes on {} pod(s) over SSH (budget {}s each)…",
+        targets.len(),
+        arena_core::agent_notes::TIMEOUT.as_secs()
+    );
+    let jobs = targets
+        .into_iter()
+        .map(|(name, provider, target)| SetupJob { steps: vec![notes.step(&provider, true)], name, target, after_repair: false })
+        .collect();
+    let no_boot = BootRetry { window: Duration::ZERO, every: Duration::ZERO };
+    let (written, failed, _) = provision_fleet(remote, jobs, no_boot, |line| println!("{line}")).await;
+    println!("\nDone: {} up to date, {failed} failed.", written.len());
+    if failed > 0 {
+        anyhow::bail!("{failed} pod(s) failed to get the agents' notes");
+    }
+    Ok(())
+}
+
 /// `pods setup` over a scripted `FakeRemote` on a paused clock: one wedged pod must time
 /// out at its step while the rest finish, and the whole run must end at that pod's
 /// budget — not at the hang.
