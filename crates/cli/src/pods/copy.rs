@@ -4,13 +4,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use arena_core::out;
 use arena_core::remote::{describe_error, Remote, PROBE_TIMEOUT};
 use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
 use crate::pods::selection::Selected;
 use crate::pods::{cp_timeout, each_pod, local_size};
-use crate::{confirm, shell_quote};
+use crate::{confirm_brief, shell_quote};
 
 /// Resolve where a copied file should land on the pod. With an explicit `dest`, use it
 /// verbatim. Otherwise, if the local path runs through the repo dir (`<repo_name>/…`),
@@ -81,7 +82,7 @@ pub(crate) async fn handle_copy(
 
     let targets = sel.named_targets(cfg)?;
     if targets.is_empty() {
-        println!("(no pods with an SSH endpoint to copy to)");
+        out!(Out, "(no pods with an SSH endpoint to copy to)");
         return Ok(());
     }
 
@@ -90,44 +91,56 @@ pub(crate) async fn handle_copy(
     // Clear input→output preview before the confirm. Label the *type* (file vs folder)
     // explicitly — that's the thing people get wrong — and, for folders, spell out the
     // scp -r nesting rule (an existing dest dir, or a trailing slash, lands the folder
-    // INSIDE → <dest>/<name>) that quietly produces a `name/name` mess.
+    // INSIDE → <dest>/<name>) that quietly produces a `name/name` mess. By default the type
+    // goes in the one line (docs/OUTPUT.md), and the nesting rule stays: it's what goes wrong.
     let is_dir = file.is_dir();
     let kind = if is_dir { "folder" } else { "file" };
     let base = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    println!("Copy preview (same on every pod):");
-    println!("  input  [{kind} — check the type!]: {local}");
-    println!("  output [{kind}]:                   {remote}");
-    println!(
+    out!(Detail, "Copy preview (same on every pod):");
+    out!(Detail, "  input  [{kind} — check the type!]: {local}");
+    out!(Detail, "  output [{kind}]:                   {remote}");
+    out!(
+        Detail,
         "  budget: {}s per pod{}",
         budget.as_secs(),
         if timeout.is_some() { " (--timeout)" } else { " (scales with size × pods; --timeout to change)" }
     );
     // Surface a flag/type mismatch: -r on a file is harmless but usually a mistake.
     if recursive && !is_dir {
-        println!("  note: -r was passed but '{local}' is a FILE on disk, not a folder — copying it as a single file.");
+        out!(Out, "  note: -r was passed but '{local}' is a FILE on disk, not a folder — copying it as a single file.");
     }
     if is_dir {
         let nested = format!("{}/{base}", remote.trim_end_matches('/'));
-        println!(
+        out!(
+            Detail,
             "  ⚠ -r nesting: scp drops the folder AT that path, but if {dest} already exists \
              on the pod (or {dest} has a trailing slash) it lands INSIDE → {nested}\n  \
              To overwrite a folder's contents, copy to its PARENT (or `rm -rf` the remote dir first).",
             dest = remote.trim_end_matches('/'),
         );
+        out!(
+            Brief,
+            "{}",
+            out::warn(format!("if {} exists on the pod, the folder lands INSIDE it → {nested} (copy to its parent instead)", remote.trim_end_matches('/')))
+        );
     }
+    let names: Vec<&str> = targets.iter().map(|(n, _)| n.as_str()).collect();
+    // What goes where, in a line: the type, both paths, the pods.
+    let brief = format!("{kind} {local} → {remote} on {}", crate::pods::setup::all_names(&names));
     if dry_run {
-        println!("\nDry-run — would scp to {} pod(s):\n", targets.len());
+        out!(Detail, "\nDry-run — would scp to {} pod(s):\n", targets.len());
         for (name, t) in &targets {
-            println!("# {name}");
+            out!(Detail, "# {name}");
             let args: Vec<String> = t.scp_args(&local, &remote).iter().map(|a| arena_core::ssh::shell_word(a)).collect();
-            println!("scp {rflag}{}\n", args.join(" "));
+            out!(Detail, "scp {rflag}{}\n", args.join(" "));
         }
-        println!("Preview only — run without --dry-run to copy.");
+        out!(Detail, "Preview only — run without --dry-run to copy.");
+        out!(Brief, "[dry-run] would copy {brief}");
         return Ok(());
     }
-    let names = targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ");
-    if !confirm(yes, &format!("Will copy {local} to {} on {} pod(s): {names}", remote, targets.len()))? {
-        println!("aborted.");
+    let names = names.join(", ");
+    if !confirm_brief(yes, &format!("Will copy {local} to {} on {} pod(s): {names}", remote, targets.len()), &format!("Copy {brief}?"))? {
+        out!(Out, "aborted.");
         return Ok(());
     }
 
@@ -150,19 +163,27 @@ pub(crate) async fn handle_copy(
             (name, async move { copy_to_pod(remote_ssh.as_ref(), &t, &plan).await })
         })
         .collect();
-    let (mut ok, mut failed) = (0, 0);
+    // The command that copies it again onto one pod: a failure's fix.
+    let word = arena_core::ssh::shell_word;
+    let retry = |name: &str| format!("arena pods cp {} {} -t {name}{}", word(&plan.local), word(&plan.remote), if recursive { " -r" } else { "" });
+    let (mut ok, mut failed) = (Vec::new(), 0);
     each_pod(jobs, |done, total, name, result| match result.and_then(|copied| copied) {
         Ok(()) => {
-            println!("[{done}/{total}] ✓ {name}");
-            ok += 1;
+            out!(Detail, "[{done}/{total}] ✓ {name}");
+            ok.push(name.to_string());
         }
         Err(e) => {
-            println!("[{done}/{total}] ✗ {name}: {e}");
+            out!(Detail, "[{done}/{total}] ✗ {name}: {e}");
+            out!(ErrBrief, "{} {}: {e} (retry: {})", out::cross(), out::bold(name), retry(name));
             failed += 1;
         }
     })
     .await;
-    println!("\nDone: {ok} copied, {failed} failed.");
+    out!(Detail, "\nDone: {} copied, {failed} failed.", ok.len());
+    // By default the pods it reached in a line (a failure has said its own, above).
+    if !ok.is_empty() {
+        out!(Brief, "{}", out::ok(format!("copied {} → {} to {}", plan.local, plan.remote, crate::pods::setup::all_names(&ok))));
+    }
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed to receive the file");
     }

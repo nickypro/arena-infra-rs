@@ -7,7 +7,8 @@ use anyhow::Result;
 use arena_core::capability::Op;
 use arena_core::provider::Provider;
 
-use crate::confirm;
+use arena_core::out;
+
 use crate::pods::selection::Selected;
 
 /// Appended to a replace/cutover refused over a lock: the replacement isn't locked by itself.
@@ -24,7 +25,7 @@ pub(crate) fn print_would_refuse(r: &str) {
     let line = format!("(without --dry-run: {r})");
     #[cfg(test)]
     WOULD_REFUSE.with(|n| n.borrow_mut().push(line.clone()));
-    println!("{line}");
+    arena_core::out!(Out, "{line}");
 }
 
 #[cfg(test)]
@@ -81,6 +82,16 @@ fn lockable_providers() -> Vec<&'static str> {
     out
 }
 
+/// What a lock (or an unlock) does, in a few words, for the default output's dry run and
+/// question (the whole of it, [`arena_core::lock::consequence`], is `-v`'s). Pure.
+fn lock_brief(lock: bool) -> &'static str {
+    if lock {
+        "stop, restart, reimage and terminate refused until `arena pods unlock`"
+    } else {
+        "it can be stopped, restarted and terminated again"
+    }
+}
+
 /// `pods lock` / `pods unlock` (`lock` says which). The selection is sorted first
 /// ([`arena_core::lock::plan`]): pods already in that state are said and left alone; pods
 /// whose backend can't lock (the capability table: RUNPOD_API=v1, Vast, Shadeform)
@@ -92,10 +103,10 @@ pub(crate) async fn handle_lock(provider: &dyn Provider, sel: &Selected, lock: b
     let (verb, done) = if lock { ("lock", "locked") } else { ("unlock", "unlocked") };
     let plan = lock::plan(&sel.pods, lock, |p| provider.supports(Op::Lock, Some(p)).check());
     for p in &plan.already {
-        println!("= {} already {done}", p.name);
+        out!(Out, "= {} already {done}", p.name);
     }
     for (p, why) in &plan.unsupported {
-        eprintln!("✗ {} can't be {done}: {why}", p.name);
+        out!(Err, "✗ {} can't be {done}: {why}", p.name);
     }
     let unsupported: Vec<&str> = plan.unsupported.iter().map(|(p, _)| p.name.as_str()).collect();
     // The command fails for these: they were asked to be (un)protected and can't be. Other
@@ -115,39 +126,53 @@ pub(crate) async fn handle_lock(provider: &dyn Provider, sel: &Selected, lock: b
     let names: Vec<&str> = plan.act.iter().map(|p| p.name.as_str()).collect();
     let providers: Vec<&str> = plan.act.iter().map(|p| p.provider.as_str()).collect();
     let what = format!("{verb} {} pod(s): {}\n  ({})", names.len(), names.join(", "), lock::consequence(lock, &providers));
+    // By default the pods and what the lock does, in a line (docs/OUTPUT.md).
+    let given: Vec<&arena_core::Pod> = sel.pods.iter().collect();
+    let shown: Vec<String> = plan.act.iter().map(|p| crate::pods::lifecycle::who_among(p, &given)).collect();
+    let brief = format!("{} ({})", crate::pods::setup::all_names(&shown), lock_brief(lock));
     if dry_run {
         if !names.is_empty() {
-            println!("[dry-run] would {what}");
+            out!(Detail, "[dry-run] would {what}");
+            out!(Brief, "[dry-run] would {verb} {brief}");
         }
         if let Some(c) = &cant {
-            println!("(without --dry-run this fails: {c})");
+            out!(Out, "(without --dry-run this fails: {c})");
         }
-        println!("\nDry-run only — nothing {done}.");
+        out!(Detail, "\nDry-run only — nothing {done}.");
         return Ok(());
     }
     if names.is_empty() {
         if let Some(c) = cant {
             anyhow::bail!("{c}");
         }
-        println!("nothing to {verb}.");
+        out!(Out, "nothing to {verb}.");
         return Ok(());
     }
-    if !confirm(yes, &format!("Will {what}"))? {
-        println!("aborted.");
+    let question = format!("{} {brief}?", if lock { "Lock" } else { "Unlock" });
+    if !crate::confirm_brief(yes, &format!("Will {what}"), &question)? {
+        out!(Out, "aborted.");
         return Ok(());
     }
     let policy = arena_core::retry::RetryPolicy::default();
     let mut failed: Vec<&str> = Vec::new();
     for p in &plan.act {
         match arena_core::retry::retrying(&policy, || provider.set_locked(&p.id, lock)).await {
-            Ok(()) => println!("[{done}] {}", p.name),
+            Ok(()) => out!(Out, "[{done}] {}", out::bold(&p.name)),
             Err(e) => {
-                eprintln!("[FAILED] {}: {e}", p.name);
+                out!(ErrDetail, "[FAILED] {}: {e}", p.name);
+                let retry = format!("arena pods {verb} {}", p.name);
+                out!(ErrBrief, "{}", crate::pods::lifecycle::failed_line(&p.name, verb, &out::reason(&e), &retry));
                 failed.push(p.name.as_str());
             }
         }
     }
-    println!("\n{done} {}/{}", names.len() - failed.len(), names.len());
+    out!(Detail, "\n{done} {}/{}", names.len() - failed.len(), names.len());
+    // One pod's line says it; several get the count.
+    if names.len() > 1 {
+        let n = names.len() - failed.len();
+        let tally = format!("{done} {n} of {}", names.len());
+        out!(Brief, "{}", if failed.is_empty() { out::ok(tally) } else { tally });
+    }
     let mut problems = Vec::new();
     if !failed.is_empty() {
         problems.push(format!("{} pod(s) failed to {verb}: {}", failed.len(), failed.join(", ")));

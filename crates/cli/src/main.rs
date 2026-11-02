@@ -164,6 +164,13 @@ fn confirm_typed(assume_yes: bool, what: &str, token: &str) -> Result<bool> {
     Ok(answer.trim() == token)
 }
 
+/// [`confirm_typed`] as the default output asks it (docs/OUTPUT.md): `brief` — one line naming
+/// what it acts on and what it costs — then the same token to type back. With `-v`, `what` (the
+/// whole plan), as before. The same token, `--yes` and refusal without a terminal.
+fn confirm_typed_brief(assume_yes: bool, what: &str, brief: &str, token: &str) -> Result<bool> {
+    confirm_typed(assume_yes, if arena_core::out::verbose() { what } else { brief }, token)
+}
+
 /// `prompt` on stderr and the line typed back. With no terminal to ask at, `what` is said and
 /// the answer is [`NoTerminal`]; a test capturing the output ([`arena_core::out::capture`])
 /// answers as it scripted, and refuses the same way when it scripted nothing.

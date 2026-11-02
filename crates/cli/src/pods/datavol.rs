@@ -15,7 +15,9 @@ use arena_core::ssh::SshTarget;
 use arena_core::{Config, Pod};
 use clap::Subcommand;
 
-use crate::confirm;
+use arena_core::out;
+
+use crate::confirm_brief;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum VolumeCmd {
@@ -286,14 +288,15 @@ pub(crate) async fn volume_on(cmd: VolumeCmd, remote: Arc<dyn Remote>, fleet: &d
                 return Ok(());
             }
             if all.is_empty() {
-                println!("no volumes (`arena pods volume add <name> <GB>` makes one)");
+                out!(Out, "no volumes (`arena pods volume add <name> <GB>` makes one)");
             } else {
                 let names = |id: u64| pods.iter().find(|p| p.provider == "hetzner" && p.id == id.to_string()).map(|p| p.name.clone());
                 let price = datavol::price_gb_month(cloud).await;
-                print!("{}", datavol::render(&all, &names, price));
+                datavol::render(&all, &names, price).lines().for_each(|l| out!(Out, "{l}"));
             }
             if !others.is_empty() {
-                println!(
+                out!(
+                    Detail,
                     "({} other volume(s) in the project aren't this cohort's — no `{}={prefix}` label, not on its VMs: {})",
                     others.len(),
                     datavol::LABEL,
@@ -323,20 +326,22 @@ pub(crate) async fn volume_on(cmd: VolumeCmd, remote: Arc<dyn Remote>, fleet: &d
                 if already.is_empty() { String::new() } else { format!("; it has {} already", already.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(", ")) }
             );
             if dry_run {
-                println!("[dry-run] would {plan}\n[dry-run] nothing changed.");
+                out!(Out, "[dry-run] would {plan}");
+                out!(Detail, "[dry-run] nothing changed.");
                 return Ok(());
             }
-            if !confirm(yes, &format!("Will {plan}."))? {
-                println!("aborted.");
+            if !confirm_brief(yes, &format!("Will {plan}."), &format!("{}?", capitalized(&plan)))? {
+                out!(Out, "aborted.");
                 return Ok(());
             }
             let (v, actions) = cloud.create_volume(&datavol::create_body(&vname, gb, server, &prefix)).await.context("creating the volume")?;
-            println!("[created] {} (id={}, {gb} GB) — attaching to {}…", v.name, v.id, pod.name);
+            out!(Out, "[created] {} (id={}, {gb} GB) — attaching to {}…", v.name, v.id, pod.name);
             wait_all(cloud, &actions, "create and attach the volume").await?;
             let said = on_vm(remote.as_ref(), cfg, fleet, &pod, &datavol::mount_script(&datavol::device(&v), &mount)).await?;
             match datavol::parse_mount(&said) {
                 Mounted::Yes { bytes } => {
-                    println!(
+                    out!(
+                        Out,
                         "[mounted] {} at {mount} on {}{}",
                         v.name,
                         pod.name,
@@ -363,7 +368,7 @@ pub(crate) async fn volume_on(cmd: VolumeCmd, remote: Arc<dyn Remote>, fleet: &d
             };
             match datavol::parse_mount(&on_vm(remote.as_ref(), cfg, fleet, &pod, &datavol::mount_script(&datavol::device(&v), &mount)).await?) {
                 Mounted::Yes { .. } => {
-                    println!("[mounted] {} at {mount} on {}", v.name, pod.name);
+                    out!(Out, "[mounted] {} at {mount} on {}", v.name, pod.name);
                     Ok(())
                 }
                 other => Err(not_mounted(&pod.name, &v, other)),
@@ -407,22 +412,23 @@ pub(crate) async fn volume_on(cmd: VolumeCmd, remote: Arc<dyn Remote>, fleet: &d
                 }
             );
             if dry_run {
-                println!("[dry-run] would {plan}\n[dry-run] nothing changed.");
+                out!(Out, "[dry-run] would {plan}");
+                out!(Detail, "[dry-run] nothing changed.");
                 return Ok(());
             }
-            if !confirm(yes, &format!("Will {plan}. A volume never shrinks."))? {
-                println!("aborted.");
+            if !confirm_brief(yes, &format!("Will {plan}. A volume never shrinks."), &format!("{}? A volume never shrinks.", capitalized(&plan)))? {
+                out!(Out, "aborted.");
                 return Ok(());
             }
             if !fs_only {
                 let a = cloud.resize(v.id, gb).await.context("resizing the volume")?;
                 wait_all(cloud, &[a], "resize the volume").await?;
-                println!("[resized] {} to {gb} GB at Hetzner", v.name);
+                out!(Out, "[resized] {} to {gb} GB at Hetzner", v.name);
             }
             let Some(p) = pod else { return Ok(()) };
             match datavol::parse_grow(&on_vm(remote.as_ref(), cfg, fleet, &p, &datavol::grow_script(&datavol::device(&v))).await?) {
                 Ok(bytes) => {
-                    println!("[grown] the filesystem on {}{}", p.name, bytes.map(|b| format!(": {:.1} GB", b as f64 / 1e9)).unwrap_or_default());
+                    out!(Out, "[grown] the filesystem on {}{}", p.name, bytes.map(|b| format!(": {:.1} GB", b as f64 / 1e9)).unwrap_or_default());
                     Ok(())
                 }
                 Err(why) => anyhow::bail!(
@@ -440,7 +446,7 @@ pub(crate) async fn volume_on(cmd: VolumeCmd, remote: Arc<dyn Remote>, fleet: &d
             let v = find_volume(cfg, &all, &pods, &name, true)?;
             ours_only(&v, &prefix, "detaching")?;
             let Some(server) = v.server else {
-                println!("{} isn't attached to anything — nothing to do.", v.name);
+                out!(Out, "{} isn't attached to anything — nothing to do.", v.name);
                 return Ok(());
             };
             let price = datavol::price_gb_month(cloud).await;
@@ -452,15 +458,16 @@ pub(crate) async fn volume_on(cmd: VolumeCmd, remote: Arc<dyn Remote>, fleet: &d
                 v.name
             );
             if dry_run {
-                println!("[dry-run] would {plan}\n[dry-run] nothing changed.");
+                out!(Out, "[dry-run] would {plan}");
+                out!(Detail, "[dry-run] nothing changed.");
                 return Ok(());
             }
-            if !confirm(yes, &format!("Will {plan}."))? {
-                println!("aborted.");
+            if !confirm_brief(yes, &format!("Will {plan}."), &format!("{}?", capitalized(&plan)))? {
+                out!(Out, "aborted.");
                 return Ok(());
             }
             unmount_and_detach(remote.as_ref(), cfg, fleet, cloud, &pods, &v, force).await?;
-            println!("[detached] {} (still billing; `arena pods volume delete {}` deletes it)", v.name, v.name);
+            out!(Out, "[detached] {} (still billing; `arena pods volume delete {}` deletes it)", v.name, v.name);
             Ok(())
         }
         VolumeCmd::Delete { name, force, dry_run } => {
@@ -482,21 +489,33 @@ pub(crate) async fn volume_on(cmd: VolumeCmd, remote: Arc<dyn Remote>, fleet: &d
                 v.id
             );
             if dry_run {
-                println!("[dry-run] would {plan}\n[dry-run] nothing changed.");
+                out!(Out, "[dry-run] would {plan}");
+                out!(Detail, "[dry-run] nothing changed.");
                 return Ok(());
             }
-            if !confirm(yes, &format!("Will {plan}. Back up what's wanted first (it's in no backup)."))? {
-                println!("aborted.");
+            if !confirm_brief(
+                yes,
+                &format!("Will {plan}. Back up what's wanted first (it's in no backup)."),
+                &format!("{}? It's in no backup.", capitalized(&plan)),
+            )? {
+                out!(Out, "aborted.");
                 return Ok(());
             }
             if v.server.is_some() {
                 unmount_and_detach(remote.as_ref(), cfg, fleet, cloud, &pods, &v, force).await?;
             }
             cloud.delete_volume(v.id).await.with_context(|| format!("deleting {}", v.name))?;
-            println!("[deleted] volume {} ({} GB)", v.name, v.size_gb);
+            out!(Out, "[deleted] volume {} ({} GB)", v.name, v.size_gb);
             Ok(())
         }
     }
+}
+
+/// `plan` as a question: its first letter in capitals (`create volume …` → `Create volume …`).
+/// Pure.
+fn capitalized(plan: &str) -> String {
+    let mut c = plan.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 /// Unmount `v` on the fleet VM it's attached to (over SSH), then detach it and wait. A VM that's
@@ -516,18 +535,18 @@ pub(crate) async fn unmount_and_detach(
         Some(p) if !arena_core::status::is_stopped(&p.status) => {
             let said = on_vm(remote, cfg, fleet, p, &datavol::unmount_script(&datavol::device(v))).await;
             match said.map(|s| datavol::parse_unmount(&s)) {
-                Ok(Ok(())) => println!("[unmounted] {} on {}", v.name, p.name),
+                Ok(Ok(())) => out!(Detail, "[unmounted] {} on {}", v.name, p.name),
                 Ok(Err(why)) if !force => anyhow::bail!("not detaching {}: {why} (nothing was changed)", v.name),
                 Err(e) if !force => anyhow::bail!(
                     "not detaching {}: couldn't unmount it on {} ({e:#}) — --force detaches anyway (unsafe while it's in use)",
                     v.name,
                     p.name
                 ),
-                Ok(Err(why)) => eprintln!("warning: {why} — detaching anyway (--force)"),
-                Err(e) => eprintln!("warning: couldn't unmount it on {} ({e:#}) — detaching anyway (--force)", p.name),
+                Ok(Err(why)) => out!(Err, "warning: {why} — detaching anyway (--force)"),
+                Err(e) => out!(Err, "warning: couldn't unmount it on {} ({e:#}) — detaching anyway (--force)", p.name),
             }
         }
-        Some(p) => println!("      {} is {} — nothing mounted to unmount", p.name, p.status),
+        Some(p) => out!(Detail, "      {} is {} — nothing mounted to unmount", p.name, p.status),
         None if !force => anyhow::bail!(
             "not detaching {}: it's attached to server {server}, which isn't one of the fleet's (arena can't unmount it there) \
              — --force detaches anyway",
@@ -569,9 +588,9 @@ pub(crate) async fn delete_after_terminate(cloud: &dyn VolumeCloud, volumes: &[C
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
         match cloud.delete_volume(v.id).await {
-            Ok(()) => println!("[deleted volume] {} ({} GB)", v.name, v.size_gb),
+            Ok(()) => out!(Out, "[deleted volume] {} ({} GB)", v.name, v.size_gb),
             Err(e) => {
-                eprintln!("[FAILED] deleting volume {}: {e} — `arena pods volume delete {}`", v.name, v.name);
+                out!(Err, "[FAILED] deleting volume {}: {e} — `arena pods volume delete {}`", v.name, v.name);
                 failed.push(v.name.clone());
             }
         }
@@ -685,7 +704,7 @@ pub(crate) fn save_record(cfg: &Config, canonical: &str, r: &MoveRecord) -> Resu
 /// [`save_record`] where a failure only weakens what a later step knows: said, not fatal.
 pub(crate) fn save_record_or_say(cfg: &Config, canonical: &str, r: &MoveRecord) {
     if let Err(e) = save_record(cfg, canonical, r) {
-        eprintln!("warning: {e:#} — a later cutover/revert won't know where the volumes are mounted");
+        out!(Err, "warning: {e:#} — a later cutover/revert won't know where the volumes are mounted");
     }
 }
 
@@ -817,7 +836,7 @@ pub(crate) async fn move_volumes(
                 }
             );
         }
-        println!("      volume {} moved: {} → {} (mounted at {mount})", v.name, from.name, to.name);
+        out!(Out, "      volume {} moved: {} → {} (mounted at {mount})", v.name, from.name, to.name);
     }
     Ok(mounts)
 }
@@ -904,7 +923,7 @@ pub(crate) async fn copy_volumes(
                 body["labels"][COPY_OF_LABEL] = serde_json::Value::from(v.id.to_string());
                 let (c, actions) = cloud.create_volume(&body).await.with_context(|| format!("creating {name}, the copy of {}", v.name))?;
                 wait_all(cloud, &actions, "create and attach the copy").await?;
-                println!("      volume {} made on {} ({} GB) for the copy of {}", c.name, to.name, c.size_gb, v.name);
+                out!(Detail, "      volume {} made on {} ({} GB) for the copy of {}", c.name, to.name, c.size_gb, v.name);
                 c
             }
         };
@@ -935,7 +954,8 @@ pub(crate) async fn copy_volumes(
                 crate::pods::home_copy::copy_failure_reason(&out.stderr)
             );
         }
-        println!(
+        out!(
+            Out,
             "      volume {} copied {} → {} ({mount}, onto {}; anything it replaced there is kept in {mount}/{}/{stamp}/)",
             v.name,
             from.name,

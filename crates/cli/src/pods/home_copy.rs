@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arena_core::out;
 use arena_core::provider::Provider;
 use arena_core::remote::{describe_error, Remote, PROBE_TIMEOUT};
 use arena_core::ssh::SshTarget;
@@ -41,6 +42,15 @@ pub(crate) fn staging_dir(root: &std::path::Path, src_id: &str) -> PathBuf {
     arena_core::disk::staging_dir(root, src_id)
 }
 
+/// The key of the health check's in-place line on a terminal ([`out::progress`]).
+const VERIFY: &str = "verify";
+
+/// The default output's line when a copy onto `dest` goes through this machine instead of pod to
+/// pod (slower, and it takes room here): why, in a few words — `-v` has the whole of it.
+fn via_local(dest: &str, why: &str) {
+    out!(ErrBrief, "[{}] copying via this machine ({why})", out::bold(dest));
+}
+
 /// Remove a leftover via-local staging copy of `src_id` (the participant's whole home), once
 /// it can't be needed again: the source pod is gone. Under the stage's lock, held through the
 /// removal: one another run is copying through is left alone, said. Says so when there was one.
@@ -50,14 +60,14 @@ pub(crate) fn remove_staging_for(root: &std::path::Path, src_id: &str) {
         Ok(held) => held,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            return eprintln!("      the local staging copy {} is in use by another arena run — left as it is", stage.display())
+            return out!(Err, "      the local staging copy {} is in use by another arena run — left as it is", stage.display())
         }
-        Err(e) => return eprintln!("      warning: couldn't lock the local staging copy {} to remove it ({e}) — left as it is", stage.display()),
+        Err(e) => return out!(Err, "      warning: couldn't lock the local staging copy {} to remove it ({e}) — left as it is", stage.display()),
     };
     let size = arena_core::pull::human_bytes(local_size(&stage));
     match std::fs::remove_dir_all(&stage) {
-        Ok(()) => println!("      removed the leftover local staging copy {} ({size})", stage.display()),
-        Err(e) => eprintln!("      warning: couldn't remove the local staging copy {} ({size}): {e}", stage.display()),
+        Ok(()) => out!(Detail, "      removed the leftover local staging copy {} ({size})", stage.display()),
+        Err(e) => out!(Err, "      warning: couldn't remove the local staging copy {} ({size}): {e}", stage.display()),
     }
 }
 
@@ -307,10 +317,12 @@ pub(crate) async fn copy_pod_files(
         // --- direct attempt: rsync ON the source, pushing to the dest's fresh endpoint ---
         let dest_ip = dest_pod.ssh_ip.clone().unwrap_or_default();
         let direct_ok = if dest_ip == src_target.host {
-            eprintln!(
+            out!(
+                ErrDetail,
                 "      both pods are behind {dest_ip} — a pod can't reach its neighbour through their shared IP, \
                  so copying via local staging…"
             );
+            via_local(&dest_pod.name, "the two share an IP");
             false
         } else {
             let direct = volume::pod_to_pod_copy(&dest_ip, dest_pod.ssh_port.unwrap_or(22), &user, &remote_key, &pc, rel.as_deref());
@@ -322,7 +334,8 @@ pub(crate) async fn copy_pod_files(
             match remote.exec(&src_target, &direct, Some(POD_COPY_TIMEOUT)).await {
                 Ok(o) if o.success => true,
                 Ok(o) => {
-                    eprintln!("      direct pod-to-pod copy failed ({}) — copying via local staging…", copy_failure_reason(&o.stderr));
+                    out!(ErrDetail, "      direct pod-to-pod copy failed ({}) — copying via local staging…", copy_failure_reason(&o.stderr));
+                    via_local(&dest_pod.name, &format!("pod to pod failed: {}", copy_failure_reason(&o.stderr)));
                     false
                 }
                 // A copy that ran out of its budget was under way (a missing pod-to-pod key fails at
@@ -336,13 +349,14 @@ pub(crate) async fn copy_pod_files(
                     describe_error(&e)
                 ),
                 Err(e) => {
-                    eprintln!("      direct pod-to-pod copy couldn't run ({}) — copying via local staging…", describe_error(&e));
+                    out!(ErrDetail, "      direct pod-to-pod copy couldn't run ({}) — copying via local staging…", describe_error(&e));
+                    via_local(&dest_pod.name, &format!("pod to pod couldn't run: {}", out::reason(&e)));
                     false
                 }
             }
         };
         if direct_ok {
-            println!("      copied (direct pod-to-pod)");
+            out!(Detail, "      copied (direct pod-to-pod)");
             return Ok(());
         }
         // Refused for room: recorded for the health check, said with how much to free where,
@@ -493,8 +507,8 @@ pub(crate) async fn copy_pod_files(
             Ok(()) => {
                 let size = arena_core::pull::human_bytes(local_size(&stage));
                 match std::fs::remove_dir_all(&stage) {
-                    Ok(()) => println!("      copied (via local staging; the staging copy, {size}, is removed)"),
-                    Err(e) => eprintln!("      copied via local staging, but couldn't remove {} ({size}): {e}", stage.display()),
+                    Ok(()) => out!(Detail, "      copied (via local staging; the staging copy, {size}, is removed)"),
+                    Err(e) => out!(Err, "      copied via local staging, but couldn't remove {} ({size}): {e}", stage.display()),
                 }
                 Ok(())
             }
@@ -525,18 +539,19 @@ pub(crate) async fn copy_pod_files(
             Ok(o) if o.success => match replica::parse_settle(&o.stdout) {
                 Some(s) => {
                     for line in replica::settle_lines(&dest_pod.name, &s, mode) {
-                        eprintln!("      {line}");
+                        out!(Err, "      {line}");
                     }
                 }
-                None => eprintln!("      warning: couldn't read what the sync moved aside on {} (see {kept_at} there)", dest_pod.name),
+                None => out!(Err, "      warning: couldn't read what the sync moved aside on {} (see {kept_at} there)", dest_pod.name),
             },
-            Ok(o) if o.code == Some(WRONG_POD_EXIT) => eprintln!(
+            Ok(o) if o.code == Some(WRONG_POD_EXIT) => out!(
+                Err,
                 "      warning: {}'s endpoint no longer answers as it — what the sync moved aside there ({kept_at}) wasn't sorted",
                 dest_pod.name
             ),
-            _ => eprintln!("      warning: couldn't sort what the sync moved aside on {} (it's in {kept_at} there)", dest_pod.name),
+            _ => out!(Err, "      warning: couldn't sort what the sync moved aside on {} (it's in {kept_at} there)", dest_pod.name),
         },
-        Err(_) => eprintln!("      warning: couldn't reach {} to sort what the sync moved aside ({kept_at})", dest_pod.name),
+        Err(_) => out!(Err, "      warning: couldn't reach {} to sort what the sync moved aside ({kept_at})", dest_pod.name),
     }
     transfer?;
     if !landed {
@@ -647,6 +662,7 @@ impl CopyLeg {
 /// check is approximated by rsync's own success in `copy_pod_files`, plus the manual swap
 /// confirm; the post-swap `~/.name` write re-resolves its own endpoint.)
 pub(crate) async fn verify_replacement(provider: &dyn Provider, remote: &dyn Remote, id: &str, cfg: &Config) -> Result<()> {
+    let _line = out::progress_guard(VERIFY);
     // A freshly-provisioned pod can take a while to settle into a stable SSH state (it may
     // restart once post-setup), so be patient: ~10 tries over ~100s, re-resolving each time.
     let attempts = 10;
@@ -666,14 +682,21 @@ pub(crate) async fn verify_replacement(provider: &dyn Provider, remote: &dyn Rem
         match remote.exec(&target, probe, Some(PROBE_TIMEOUT)).await {
             Ok(o) if o.success && o.stdout.contains("SSH_OK") => {
                 let gpu = o.stdout.lines().find(|l| !l.contains("SSH_OK")).unwrap_or("").trim();
-                println!("      ssh ok; gpu: {}", if gpu.is_empty() { "(none reported)" } else { gpu });
+                out!(Detail, "      ssh ok; gpu: {}", if gpu.is_empty() { "(none reported)" } else { gpu });
                 return Ok(());
             }
             Ok(o) => last = format!("ssh connected but health check unhappy: {}", o.stderr.trim()),
             Err(e) => last = e.to_string(),
         }
         if attempt < attempts {
-            eprintln!("      verify {attempt}/{attempts} failed ({last}); retrying in 10s…");
+            out!(ErrDetail, "      verify {attempt}/{attempts} failed ({last}); retrying in 10s…");
+            // By default one line per round (in place on a terminal): its reason, not the error.
+            let line = format!("health check {attempt}/{attempts} failed ({}); retrying in 10s…", out::reason_text(&last));
+            if out::live() {
+                out::progress(VERIFY, Some(&line));
+            } else {
+                out!(ErrBrief, "{line}");
+            }
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     }

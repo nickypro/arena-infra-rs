@@ -1622,8 +1622,8 @@ fn reimage_says_whose_disk_and_work_go_and_how_to_retry() {
 /// docs/OUTPUT.md, for reimage's own lines: by default the image and a one-line prompt (or the
 /// dry run's one line) saying whose disk and work go; `-v` says what it said before — the keys,
 /// each pod's plan and `Proceed?`. A pod found busy right before its own reimage: one line with
-/// its retry, the whole refusal with `-v`. (`[reimaged]` and what follows it — the endpoint, the
-/// setup, the proxy — are lifecycle's `println!`s, shared with restart and start; not here.)
+/// its retry, the whole refusal with `-v`. `[reimaged]` and the `--no-setup` reminder say the
+/// same at both (the come-back's lines: `lifecycle_tests/output.rs`).
 #[tokio::test]
 async fn reimage_says_its_image_and_one_line_by_default_and_its_plan_with_v() {
     use crate::output_test::rendered;
@@ -1634,12 +1634,13 @@ async fn reimage_says_its_image_and_one_line_by_default_and_its_plan_with_v() {
     let plan = DiskFate::Wiped { volume_gb: Some(0) }.describe(DiskOp::Rebuild, &RepoSite::configured("/root/r"));
     let then = afterwards_line(ContainerReset::Yes, false, true);
     let image = "VM image: image 449743460 (a snapshot or image id)";
+    let back = "[reimaged] devtest-delta\n(--no-setup: devtest-delta back as the bare image — `arena pods setup devtest-delta` restores ~/.name, the git remote and keys)\n";
     for (verbose, dry_run, want) in [
-        (false, false, format!("{image}\nReimage devtest-delta (wipes its disk and the work on it)? [y/N] y\n")),
+        (false, false, format!("{image}\nReimage devtest-delta (wipes its disk and the work on it)? [y/N] y\n{back}")),
         (
             true,
             false,
-            format!("{image}\nkeys:  devtest-test\nWill reimage 1 pod(s):\n  devtest-delta (id=h-delta, hetzner): {plan}\n  {image}\n  {then}\nProceed? [y/N] y\n"),
+            format!("{image}\nkeys:  devtest-test\nWill reimage 1 pod(s):\n  devtest-delta (id=h-delta, hetzner): {plan}\n  {image}\n  {then}\nProceed? [y/N] y\n{back}"),
         ),
         (false, true, format!("{image}\n[dry-run] would reimage devtest-delta (wipes its disk and the work on it)\n")),
         (true, true, format!("{image}\nkeys:  devtest-test\n[dry-run] would reimage 1 pod(s):\n  devtest-delta (id=h-delta, hetzner): {plan}\n  {then}\n")),
@@ -1672,13 +1673,15 @@ async fn reimage_says_its_image_and_one_line_by_default_and_its_plan_with_v() {
         let opts = RestartOpts { yes: true, ..opts };
         let got = rendered(verbose, &[], handle_reimage(&f, remote.clone(), &cfg, &named(&pods), None, false, opts, FAST, &keys_dir)).await;
         let busy = if verbose {
-            "keys:  devtest-test\n[not reimaged] devtest-bravo: refusing to reimage devtest-bravo: someone is on it (1 SSH session). A reimage \
+            "[not reimaged] devtest-bravo: refusing to reimage devtest-bravo: someone is on it (1 SSH session). A reimage \
              wipes what they're working on: wait until they're off, and back it up first (`arena pods backup devtest-bravo`). Or pass --force."
         } else {
             "[devtest-bravo] not reimaged: someone is on it (1 SSH session) (retry: arena pods reimage devtest-bravo --wipe-ok --no-setup \
              --skip-proxy, or add --force)"
         };
-        assert_eq!(got, format!("image: img:9\n{busy}\nError: 1 pod(s) failed to reimage: devtest-bravo\n"), "verbose {verbose}");
+        let back = "(--no-setup: devtest-alpha back as the bare image — `arena pods setup devtest-alpha` restores ~/.name, the git remote and keys)";
+        let keys = if verbose { "keys:  devtest-test\n" } else { "" };
+        assert_eq!(got, format!("image: img:9\n{keys}[reimaged] devtest-alpha\n{busy}\n{back}\nError: 1 pod(s) failed to reimage: devtest-bravo\n"), "verbose {verbose}");
         assert_eq!(f.calls(), ["reimage r-alpha img:9"]);
     }
 }
@@ -2797,3 +2800,6 @@ async fn a_hetzner_vm_locks_and_is_refused_like_any_locked_pod() {
     handle_pods(pods_cmd(&["terminate", "delta", "--unlock", "--skip-proxy"]), &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap();
     assert_eq!(f.calls(), ["lock h-delta true", "lock h-delta false", "lock h-delta true", "lock h-delta false", "terminate h-delta"]);
 }
+
+/// Golden tests of the change/move/stop commands' output (docs/OUTPUT.md), at default and `-v`.
+mod output;

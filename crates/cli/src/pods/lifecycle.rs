@@ -19,9 +19,9 @@ use crate::pods::exec_each_pod;
 use crate::pods::lock::print_would_refuse;
 use crate::pods::replace::wait_for_stable_endpoint_every;
 use crate::pods::selection::{just_these, Selected};
-use crate::pods::setup::handle_setup;
+use crate::pods::setup::setup_pods;
 use crate::proxy::{sync_proxy, ProxySync};
-use crate::{confirm, confirm_brief, confirm_typed, spend};
+use crate::{confirm_brief, spend};
 
 /// `pods reimage`: swap image + re-seed keys in place — a fresh container (a Hetzner VM:
 /// rebuilt), so its disk is wiped — then bring the pods back usable like a restart does
@@ -65,7 +65,7 @@ pub(crate) async fn handle_reimage(
     let RestartOpts { wipe_ok, no_setup, skip_proxy, dry_run, yes } = opts;
     let pods = &sel.pods;
     if pods.is_empty() {
-        println!("(no pods to reimage)");
+        out!(Out, "(no pods to reimage)");
         return Ok(());
     }
     let refs: Vec<&arena_core::Pod> = pods.iter().collect();
@@ -135,7 +135,8 @@ pub(crate) async fn handle_reimage(
     }
     // Who's on them: asked once the wipe is allowed (or for the dry run) — an SSH probe each.
     let busy = if force { Vec::new() } else { busy_refusals(&remote, cfg, &refs).await };
-    let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
+    let shown: Vec<String> = pods.iter().map(|p| who_among(p, &refs)).collect();
+    let names: Vec<&str> = shown.iter().map(String::as_str).collect();
     let brief = reimage_what(&names, &blocked_names);
     if dry_run {
         out!(Detail, "[dry-run] would reimage {} pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
@@ -156,7 +157,7 @@ pub(crate) async fn handle_reimage(
     }
     let what = onto.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n");
     if !confirm_brief(yes, &format!("Will reimage {} pod(s):\n{}\n{what}\n  {then}", pods.len(), lines.join("\n")), &format!("Reimage {brief}?"))? {
-        println!("aborted.");
+        out!(Out, "aborted.");
         return Ok(());
     }
     let policy = arena_core::retry::RetryPolicy::default();
@@ -179,10 +180,12 @@ pub(crate) async fn handle_reimage(
             _ => container_image.clone(),
         }
         .expect("every pod has an image: reimage_images and vm_images cover the selection");
+        let retry = || reimage_retry(&pod.name, given_image.as_deref(), opts);
         let mut env = match provider.pod_spec(&pod.id).await {
             Ok(spec) => spec.env,
             Err(e) => {
-                eprintln!("[failed] {}: reading current env: {e}", pod.name);
+                out!(ErrDetail, "[failed] {}: reading current env: {e}", pod.name);
+                out!(ErrBrief, "{}", failed_line(&pod.name, "reimage", &format!("reading its env: {}", out::reason(&e)), &retry()));
                 failed.push(pod.name.clone());
                 continue;
             }
@@ -191,9 +194,10 @@ pub(crate) async fn handle_reimage(
         env.push(("MACHINE_NAME".into(), pod.name.clone()));
         env.push(("PUBLIC_KEY".into(), pubkeys.join("\n")));
         match arena_core::retry::retrying(&policy, || provider.reimage_pod(&pod.id, &image, &env)).await {
-            Ok(()) => println!("[reimaged] {}", pod.name),
+            Ok(()) => out!(Out, "[reimaged] {}", out::bold(&pod.name)),
             Err(e) => {
-                eprintln!("[failed] {}: {}", pod.name, arena_core::lock::explain(&pod.name, &e));
+                out!(ErrDetail, "[failed] {}: {}", pod.name, arena_core::lock::explain(&pod.name, &e));
+                out!(ErrBrief, "{}", failed_on(&pod.name, "reimage", &e, &retry()));
                 failed.push(pod.name.clone());
             }
         }
@@ -205,7 +209,7 @@ pub(crate) async fn handle_reimage(
     let outcome = come_back(provider, remote, cfg, &done, back, keys_dir, "reimage").await;
     if !failed.is_empty() {
         if let Err(e) = &outcome {
-            eprintln!("{e:#}");
+            out!(Err, "{e:#}");
         }
         anyhow::bail!("{} pod(s) failed to reimage: {}", failed.len(), failed.join(" "));
     }
@@ -346,6 +350,78 @@ pub(crate) fn reimage_retry(name: &str, image: Option<&str>, opts: RestartOpts) 
     cmd
 }
 
+/// A pod's failure as the default output says it (docs/OUTPUT.md): `[NAME] FAILED stop: <why>
+/// (retry: <cmd>)` — the dashboard's runs panel reads `[NAME] FAILED…` as a failed pod. Pure
+/// (but for the styles).
+pub(crate) fn failed_line(name: &str, what: &str, why: &str, retry: &str) -> String {
+    format!("[{}] {} {what}: {why} (retry: {retry})", out::bold(name), out::red("FAILED"))
+}
+
+/// [`failed_line`] for a provider's error `e`: a locked pod's refusal names the unlock it needs
+/// first, anything else is its reason ([`out::reason`]; the whole error is `-v`'s). Pure.
+pub(crate) fn failed_on(name: &str, what: &str, e: &arena_core::Error, retry: &str) -> String {
+    if e.is_locked() {
+        format!("[{}] {} {what}: locked — `arena pods unlock {name}` first", out::bold(name), out::red("FAILED"))
+    } else {
+        failed_line(name, what, &out::reason(e), retry)
+    }
+}
+
+/// An error as the default output's reason: a provider's ([`out::reason`]) wherever it is in the
+/// chain, else what its words say ([`out::reason_text`]). Pure.
+pub(crate) fn reason_of(e: &anyhow::Error) -> String {
+    match e.chain().find_map(|c| c.downcast_ref::<arena_core::Error>()) {
+        Some(core) => out::reason(core),
+        None => out::reason_text(&format!("{e:#}")),
+    }
+}
+
+/// `devtest-a, devtest-b`, bold, for a one-line plan or question. Pure (but for the bold).
+fn names_brief<S: AsRef<str>>(names: &[S]) -> String {
+    crate::pods::setup::all_names(names)
+}
+
+/// What `op` does to a group of pods' disks, in a few words, for the default output's plan or
+/// question (each pod's whole line is `-v`'s: [`DiskFate::describe`]). `n`: how many pods
+/// (its/their). Pure.
+fn fate_words(op: DiskOp, fate: DiskFate, site: &RepoSite, n: usize) -> String {
+    let (its, it, s) = if n == 1 { ("its", "it", "") } else { ("their", "them", "s") };
+    let verb = match (op, fate) {
+        (DiskOp::Stop, _) => "discards",
+        (_, DiskFate::MayWipe { .. }) => "may wipe",
+        _ => "wipes",
+    };
+    match fate {
+        DiskFate::Kept => match op {
+            DiskOp::Restart => "disk kept: a power-cycle".into(),
+            _ => "disk kept".into(),
+        },
+        _ if !fate.needs_wipe_ok(site) => format!("{verb} {its} container disk{s}; the repo stays on {its} volume{s}"),
+        _ => format!("{verb} {its} container disk{s} and the work on {it}"),
+    }
+}
+
+/// The pods of a stop or a restart grouped by what it does to them, each group with its words
+/// ([`fate_words`]): `devtest-alpha (disk kept)`, `devtest-a, devtest-b (discards their
+/// container disks and the work on them); devtest-delta (disk kept)`. Pure (but for the bold).
+/// `among`: the pods the command was given, before any were filtered out (a twin skipped as not
+/// running still makes its namesake's id worth saying).
+pub(crate) fn disk_brief(op: DiskOp, pods: &[&arena_core::Pod], among: &[&arena_core::Pod], fates: &[DiskFate], sites: &[RepoSite]) -> String {
+    let mut groups: Vec<(String, Vec<String>, DiskFate, &RepoSite)> = Vec::new();
+    for ((p, f), site) in pods.iter().zip(fates).zip(sites) {
+        let key = fate_words(op, *f, site, 1);
+        match groups.iter_mut().find(|(k, ..)| *k == key) {
+            Some((_, names, ..)) => names.push(who_among(p, among)),
+            None => groups.push((key, vec![who_among(p, among)], *f, site)),
+        }
+    }
+    groups
+        .iter()
+        .map(|(_, names, f, site)| format!("{} ({})", names_brief(names), fate_words(op, *f, site, names.len())))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// A pod a reimage won't wipe: someone is on it, or whether anyone is couldn't be told.
 struct Busy {
     /// Why, in a few words (`someone is on it (1 SSH session)`): the default output's.
@@ -468,14 +544,14 @@ pub(crate) async fn handle_start(
         anyhow::bail!("{}", no_stop_refusal(&no_stop, "start"));
     }
     for (p, why) in &no_stop {
-        eprintln!("skip {} — {why}", p.name);
+        out!(Err, "skip {} — {why}", p.name);
     }
     for p in startable.iter().filter(|p| !arena_core::status::is_stopped(&p.status)) {
-        eprintln!("skip {} — not stopped ({})", p.name, p.status);
+        out!(Err, "skip {} — not stopped ({})", p.name, p.status);
     }
     let pods: Vec<arena_core::Pod> = startable.iter().filter(|p| arena_core::status::is_stopped(&p.status)).map(|p| (*p).clone()).collect();
     if pods.is_empty() {
-        println!("(no stopped pods to start)");
+        out!(Out, "(no stopped pods to start)");
         return Ok(());
     }
     let setup = !no_setup;
@@ -499,23 +575,30 @@ pub(crate) async fn handle_start(
         .collect();
     let wiped = pods.iter().any(|p| provider.restart_wipes_container_disk(p));
     let then = afterwards_line(if wiped { ContainerReset::Yes } else { ContainerReset::No }, setup, skip_proxy);
+    // Named with their ids where another selected pod has the name (one skipped as running too).
+    let given: Vec<&arena_core::Pod> = sel.pods.iter().collect();
+    let brief = start_brief(provider, &pods, &given, setup);
     if dry_run {
-        println!("[dry-run] would start {} pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
+        out!(Detail, "[dry-run] would start {} pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
+        out!(Brief, "[dry-run] would start {brief}");
         return Ok(());
     }
-    if !confirm(yes, &format!("Will start {} stopped pod(s):\n{}\n  {then}", pods.len(), lines.join("\n")))? {
-        println!("aborted.");
+    let what = format!("Will start {} stopped pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
+    if !confirm_brief(yes, &what, &format!("Start {brief} — billing again?"))? {
+        out!(Out, "aborted.");
         return Ok(());
     }
+    let since = tokio::time::Instant::now();
     let (mut started, mut failed) = (Vec::new(), Vec::new());
     for p in &pods {
         match provider.start_pod(&p.id).await {
             Ok(()) => {
-                println!("[started] {}", p.name);
+                out!(Out, "[started] {}", out::bold(&p.name));
                 started.push(p.clone());
             }
             Err(e) => {
-                eprintln!("[FAILED] {}: {}", p.name, arena_core::lock::explain(&p.name, &e));
+                out!(ErrDetail, "[FAILED] {}: {}", p.name, arena_core::lock::explain(&p.name, &e));
+                out!(ErrBrief, "{}", failed_on(&p.name, "start", &e, &start_retry(&p.name, opts)));
                 failed.push(p.name.clone());
             }
         }
@@ -524,12 +607,24 @@ pub(crate) async fn handle_start(
         started.into_iter().partition(|p| provider.restart_wipes_container_disk(p));
     let back = Comeback { setup, sync: !skip_proxy, settle, timeouts, reset: ContainerReset::Yes };
     let outcome = come_back(provider, remote, cfg, &fresh, back, keys_dir, "start").await;
+    // A VM that kept its disk is back once its endpoint has settled (and its forward is synced):
+    // nothing to set up — its READY line, as the dashboard's runs panel reads one (a `start` from
+    // there is of one pod, synced). One whose endpoint never settled is FAILED there, with the
+    // warning above it; one not waited for (`--skip-proxy`, or with pods to set up) has only its
+    // `[started]` line.
     if !kept.is_empty() && fresh.is_empty() && !skip_proxy {
-        settled_sync(cfg, provider, &kept, settle, "start").await;
+        let (sync, dead) = settled_sync(cfg, provider, &kept, settle, "start").await;
+        let missed = not_back(cfg, &sync, &kept, &dead);
+        for p in &kept {
+            match missed.iter().find(|(id, _)| *id == p.id) {
+                Some((_, why)) => out!(ErrBrief, "{}", failed_line(&p.name, why.0, why.1, "arena proxy apply, once it answers")),
+                None => out!(Brief, "{}", ready_line(&p.name, since.elapsed(), Some(&ready_notes(cfg, &p.name, "disk kept")))),
+            }
+        }
     }
     if !failed.is_empty() {
         if let Err(e) = &outcome {
-            eprintln!("{e:#}");
+            out!(Err, "{e:#}");
         }
         anyhow::bail!(
             "{} pod(s) failed to start: {} — still stopped (a host with no free GPU left can't start it: \
@@ -539,6 +634,125 @@ pub(crate) async fn handle_start(
         );
     }
     outcome
+}
+
+/// What a start does to `pods`, grouped, for the default output's dry run and question:
+/// `devtest-alpha (a fresh image, set up again)`, `devtest-delta (disk kept)`. Pure (but for
+/// the bold).
+fn start_brief(provider: &dyn Provider, pods: &[arena_core::Pod], all: &[&arena_core::Pod], setup: bool) -> String {
+    let fresh = if setup { "a fresh image, set up again" } else { "a fresh image, not set up: --no-setup" };
+    let (wiped, kept): (Vec<&arena_core::Pod>, Vec<&arena_core::Pod>) = pods.iter().partition(|p| provider.restart_wipes_container_disk(p));
+    let names = |ps: &[&arena_core::Pod]| names_brief(&ps.iter().map(|p| who_among(p, all)).collect::<Vec<_>>());
+    let mut parts = Vec::new();
+    if !wiped.is_empty() {
+        parts.push(format!("{} ({fresh})", names(&wiped)));
+    }
+    if !kept.is_empty() {
+        parts.push(format!("{} (disk kept)", names(&kept)));
+    }
+    parts.join("; ")
+}
+
+/// What a READY line adds after `first` (`disk kept`): a pod with a proxy port behind a
+/// write-only proxy has its forward written but nginx not reloaded by arena (review r4: the port
+/// may still lead to its old endpoint until it is) — said, as `up`'s READY doesn't. Pure.
+pub(crate) fn ready_notes(cfg: &Config, name: &str, first: &str) -> String {
+    let mut notes: Vec<&str> = [first].into_iter().filter(|n| !n.is_empty()).collect();
+    if proxied_name(cfg, name) && crate::pods::replace::write_only_proxy(cfg).is_some() {
+        notes.push("proxy written, nginx not reloaded (reload it)");
+    }
+    notes.join(" · ")
+}
+
+/// A pod that came back from a start, a restart or a reimage, set up again (or a VM that kept
+/// its disk): `[NAME] READY after 2m31s`, as `up` says one — the dashboard's runs panel reads it
+/// as the pod's end. Pure (but for the styles).
+pub(crate) fn ready_line(name: &str, after: Duration, note: Option<&str>) -> String {
+    let note = note.map(|n| format!(" · {n}")).unwrap_or_default();
+    format!("[{}] {} after {}{note}", out::bold(name), out::green(out::bold("READY")), arena_core::pipeline::fmt_elapsed(after))
+}
+
+/// The command that terminates `name` again as this run would (review r3: a retry that dropped
+/// `--delete-volumes` or `--revoke-key` would leave a volume billing or a key working). Pure.
+pub(crate) fn terminate_retry(name: &str, opts: TerminateOpts<'_>) -> String {
+    let mut cmd = format!("arena pods terminate {name}");
+    for (on, flag) in [(opts.unlock, "--unlock"), (opts.revoke_key, "--revoke-key"), (opts.delete_volumes, "--delete-volumes"), (opts.skip_proxy, "--skip-proxy")] {
+        if on {
+            cmd.push_str(&format!(" {flag}"));
+        }
+    }
+    cmd
+}
+
+/// The command that stops `name` again as this run would: with `--wipe-ok` when it was given
+/// (without, the same stop would be refused). Pure.
+pub(crate) fn stop_retry(name: &str, wipe_ok: bool) -> String {
+    format!("arena pods stop {name}{}", if wipe_ok { " --wipe-ok" } else { "" })
+}
+
+/// The command that starts `name` again as this run would (its switches kept). Pure.
+pub(crate) fn start_retry(name: &str, opts: RestartOpts) -> String {
+    let mut cmd = format!("arena pods start {name}");
+    for (on, flag) in [(opts.no_setup, "--no-setup"), (opts.skip_proxy, "--skip-proxy")] {
+        if on {
+            cmd.push_str(&format!(" {flag}"));
+        }
+    }
+    cmd
+}
+
+/// A pod as the default output names it: its name, and — when another listed pod has that name too
+/// (a replacement and its original, a double create) — its id and provider, so a confirm still
+/// says which one (review r5). Pure.
+pub(crate) fn who(pod: &arena_core::Pod, listed: &[arena_core::Pod]) -> String {
+    if listed.iter().filter(|p| p.name == pod.name).count() > 1 {
+        format!("{} (id={}, {})", pod.name, pod.id, pod.provider)
+    } else {
+        pod.name.clone()
+    }
+}
+
+/// [`who`] among the pods a command was given (`stop`, `start`, `lock`, `reimage` don't keep the
+/// listing) — all of them, those it then skips too: its id and provider when another of them has
+/// its name (`--all` after a double create). A twin not selected at all was left out by its id,
+/// which the operator typed. Pure.
+pub(crate) fn who_among(pod: &arena_core::Pod, pods: &[&arena_core::Pod]) -> String {
+    if pods.iter().filter(|p| p.name == pod.name).count() > 1 {
+        format!("{} (id={}, {})", pod.name, pod.id, pod.provider)
+    } else {
+        pod.name.clone()
+    }
+}
+
+/// What a terminate does, in a line, for the default output's dry run and question: every pod
+/// named, then what it costs — `devtest-alpha (irreversible; volume devtest-alpha-1 stays,
+/// billing)`, `devtest-a, devtest-b (irreversible; unlocks devtest-b first; revokes their
+/// OpenRouter keys)`. Pure (but for the bold).
+fn terminate_brief(
+    pods: &[arena_core::Pod],
+    listed: &[arena_core::Pod],
+    locked: &[&str],
+    revoke_key: bool,
+    attached: &[(String, arena_core::archive::cloud::CloudVolume)],
+    delete_volumes: bool,
+) -> String {
+    let names: Vec<String> = pods.iter().map(|p| who(p, listed)).collect();
+    let mut costs = vec!["irreversible".to_string()];
+    if !locked.is_empty() {
+        costs.push(format!("unlocks {} first", locked.join(", ")));
+    }
+    if revoke_key {
+        costs.push(if pods.len() == 1 { "revokes its OpenRouter key".into() } else { "revokes their OpenRouter keys".into() });
+    }
+    let vols: Vec<String> = attached.iter().map(|(_, v)| format!("{} ({} GB)", v.name, v.size_gb)).collect();
+    match (vols.as_slice(), delete_volumes) {
+        ([], _) => {}
+        ([one], true) => costs.push(format!("deletes volume {one} and its files")),
+        (many, true) => costs.push(format!("deletes volumes {} and their files", many.join(", "))),
+        ([one], false) => costs.push(format!("volume {one} stays, billing")),
+        (many, false) => costs.push(format!("volumes {} stay, billing", many.join(", "))),
+    }
+    format!("{} ({})", names_brief(&names), costs.join("; "))
 }
 
 /// `pods terminate`'s switches, passed through to [`handle_terminate`] as one value.
@@ -631,7 +845,7 @@ pub(crate) async fn handle_terminate(
     // `--all`: each failure is said and the rest go on, and the confirm wants a typed token.
     let single = targets.is_some_and(|t| t.len() == 1);
     if pods.is_empty() {
-        println!("(no pods to terminate)");
+        out!(Out, "(no pods to terminate)");
         return Ok(());
     }
     // Every provider can terminate today; asked all the same, as every command asks.
@@ -691,10 +905,12 @@ pub(crate) async fn handle_terminate(
             Ok(v) => v,
             Err(e) if delete_volumes => anyhow::bail!("--delete-volumes: {e:#} — nothing was terminated"),
             Err(e) => {
-                eprintln!(
+                out!(
+                    ErrDetail,
                     "warning: {e:#} — can't say whether a volume is attached (a Hetzner volume outlives its server and bills on: \
                      `arena pods volume list`)"
                 );
+                out!(ErrBrief, "{}", out::warn(format!("volumes not listed ({}): one attached outlives its server and bills on (`arena pods volume list`)", reason_of(&e))));
                 Vec::new()
             }
         },
@@ -720,19 +936,21 @@ pub(crate) async fn handle_terminate(
             })
             .collect()
     };
+    let brief = terminate_brief(&pods, &listed, &locked, revoke_key, &attached, delete_volumes);
     if dry_run {
         let leaving: Vec<&str> = pods.iter().map(|p| p.id.as_str()).collect();
         let staying = |p: &arena_core::Pod| shared_name_holder(&listed, &leaving, &p.name).map(|o| o.id.clone());
         for p in &pods {
             let how = if unlock && arena_core::lock::is_locked(p) { "unlock, then terminate" } else { "terminate" };
-            println!("[dry-run] would {how} {}", label(p));
+            out!(Detail, "[dry-run] would {how} {}", label(p));
             for l in volume_lines(p) {
-                println!("[dry-run]   {l}");
+                out!(Detail, "[dry-run]   {l}");
             }
             if revoke_key {
                 match staying(p) {
-                    Some(id) => println!("[dry-run]   key kept: pod id {id} (not being terminated) is also named {}", p.name),
-                    None => println!(
+                    Some(id) => out!(Out, "[dry-run]   key kept: pod id {id} (not being terminated) is also named {}", p.name),
+                    None => out!(
+                        Detail,
                         "[dry-run]   then revoke OpenRouter key(s) named {} and drop its row from {}",
                         machine_key_names(&naming, &p.name).join(" / "),
                         book.csv.display()
@@ -740,16 +958,17 @@ pub(crate) async fn handle_terminate(
                 }
             }
         }
+        out!(Brief, "[dry-run] would {}{brief}", if unlock && !locked.is_empty() { "unlock and terminate " } else { "terminate " });
         if let Some(r) = &refused {
             print_would_refuse(r);
         }
         for p in &kept {
-            println!("[dry-run] would KEEP {} — locked, not this cohort's", label(p));
+            out!(Out, "[dry-run] would KEEP {} — locked, not this cohort's", label(p));
         }
         if !kept.is_empty() {
             print_would_refuse(&format!("{} — the exit fails", kept_why(&kept_names)));
         }
-        println!("\nDry-run only — would terminate {} pod(s){then_keys}{then_sync} (preview).", pods.len());
+        out!(Detail, "\nDry-run only — would terminate {} pod(s){then_keys}{then_sync} (preview).", pods.len());
         return Ok(());
     }
     if let Some(r) = refused {
@@ -775,8 +994,10 @@ pub(crate) async fn handle_terminate(
             attached.iter().map(|(_, v)| v.name.as_str()).collect::<Vec<_>>().join(", ")
         ),
     };
+    let verb = if unlocking.is_empty() { "Terminate" } else { "Unlock and terminate" };
     let go = if single {
-        confirm(yes, &format!("Will {unlocking}TERMINATE {} — irreversible{then_keys}{then_sync}.{vols}", label(&pods[0])))?
+        let what = format!("Will {unlocking}TERMINATE {} — irreversible{then_keys}{then_sync}.{vols}", label(&pods[0]));
+        confirm_brief(yes, &what, &format!("{verb} {brief}?"))?
     } else {
         let what = match targets {
             None => format!("Will {unlocking}TERMINATE ALL {} pod(s) — irreversible{then_keys}{then_sync}.{keeping}{vols}", pods.len()),
@@ -784,15 +1005,19 @@ pub(crate) async fn handle_terminate(
         };
         let list: Vec<String> = pods.iter().map(|p| format!("  {}", label(p))).collect();
         let token = if targets.is_none() { "ALL".to_string() } else { arena_core::selector::set_confirm_token(pods.len(), listed.len()) };
-        confirm_typed(yes, &format!("{what}\n{}", list.join("\n")), &token)?
+        // The default output's question is one line, every pod named (the token is the same).
+        let all = if targets.is_none() { "ALL " } else { "" };
+        let short = format!("{} {all}{brief}.{}", verb.to_uppercase(), keeping);
+        crate::confirm_typed_brief(yes, &format!("{what}\n{}", list.join("\n")), &short, &token)?
     };
     if !go {
-        println!("aborted.");
+        out!(Out, "aborted.");
         return Ok(());
     }
     // The fleet provider routes each terminate (and unlock) to the backend that owns the pod.
     let mut gone: Vec<&arena_core::Pod> = Vec::new();
     for p in &pods {
+        let retry = terminate_retry(&p.name, opts);
         let mut unlocked = false;
         if unlock && arena_core::lock::is_locked(p) {
             if let Err(e) = arena_core::retry::retrying(&policy, || provider.set_locked(&p.id, false)).await {
@@ -800,57 +1025,74 @@ pub(crate) async fn handle_terminate(
                 if single {
                     anyhow::bail!("{why}");
                 }
-                eprintln!("[FAILED] {why}");
+                out!(ErrDetail, "[FAILED] {why}");
+                out!(ErrBrief, "{}", failed_line(&p.name, "unlock", &format!("{}, so it was NOT terminated", out::reason(&e)), &retry));
                 continue;
             }
-            println!("[unlocked] {}", p.name);
+            out!(Out, "[unlocked] {}", p.name);
             unlocked = true;
         }
-        let outcome: std::result::Result<(), String> = match provider.terminate_pod(&p.id).await {
+        // An error: the whole of it (`-v`, and a single pod's error), and its reason.
+        let failed = |full: String, e: &arena_core::Error| {
+            let why = if e.is_locked() { "locked".to_string() } else { out::reason(e) };
+            (full, why)
+        };
+        let outcome: std::result::Result<(), (String, String)> = match provider.terminate_pod(&p.id).await {
             Ok(()) => Ok(()),
             // Locked since the listing (which said unlocked, or didn't say): under --unlock
             // that is the lock the operator asked to lift — once, then one more terminate.
             // (Not a pod `--all --unlock` may not unlock: that one reads as the hint.)
             Err(e) if e.is_locked() && unlock && !unlocked && may_unlock(p) => {
                 match arena_core::retry::retrying(&policy, || provider.set_locked(&p.id, false)).await {
-                    Err(ue) => Err(format!(
-                        "{}: locked since it was listed, and unlocking failed, so it was NOT terminated: {ue}",
-                        p.name
+                    Err(ue) => Err((
+                        format!("{}: locked since it was listed, and unlocking failed, so it was NOT terminated: {ue}", p.name),
+                        format!("locked since it was listed, and unlocking failed ({})", out::reason(&ue)),
                     )),
                     Ok(()) => {
-                        println!("[unlocked] {} (locked since it was listed)", p.name);
+                        out!(Out, "[unlocked] {} (locked since it was listed)", p.name);
                         unlocked = true;
-                        provider.terminate_pod(&p.id).await.map_err(|e| format!("{}: {}", p.name, arena_core::lock::explain(&p.name, &e)))
+                        provider
+                            .terminate_pod(&p.id)
+                            .await
+                            .map_err(|e| failed(format!("{}: {}", p.name, arena_core::lock::explain(&p.name, &e)), &e))
                     }
                 }
             }
-            Err(e) => Err(format!("{}: {}", p.name, arena_core::lock::explain(&p.name, &e))),
+            Err(e) => Err(failed(format!("{}: {}", p.name, arena_core::lock::explain(&p.name, &e)), &e)),
         };
         match outcome {
             Ok(()) => {
-                println!("[terminated] {}", if targets.is_some() { label(p) } else { p.name.clone() });
+                out!(Detail, "[terminated] {}", if targets.is_some() { label(p) } else { p.name.clone() });
+                out!(Brief, "[terminated] {}", out::bold(who(p, &listed)));
                 gone.push(p);
             }
-            Err(mut why) => {
+            Err((mut why, brief_why)) => {
+                // A lock is lifted by --unlock: the retry says so.
+                let retry = if brief_why == "locked" && !unlock { terminate_retry(&p.name, TerminateOpts { unlock: true, ..opts }) } else { retry.clone() };
+                let mut brief_line = failed_line(&p.name, "terminate", &brief_why, &retry);
                 if unlocked {
                     why.push_str(&format!(
                         " — it is now UNLOCKED: `arena pods lock {}` to protect it again, or retry the terminate",
                         p.name
                     ));
+                    brief_line.push_str(&format!(" — it is now UNLOCKED (`arena pods lock {}` protects it again)", p.name));
                 }
                 // One named pod: its failure is the command's error (nothing else to do).
                 if single {
                     anyhow::bail!("{why}");
                 }
-                eprintln!("[FAILED] {why}");
+                out!(ErrDetail, "[FAILED] {why}");
+                out!(ErrBrief, "{brief_line}");
             }
         }
     }
     for p in &kept {
-        eprintln!("[KEPT] {} — locked, not this cohort's: not unlocked, not terminated", p.name);
+        out!(Err, "[KEPT] {} — locked, not this cohort's: not unlocked, not terminated", p.name);
     }
     if !single {
-        println!("\nterminated {}/{}", gone.len(), pods.len() + kept.len());
+        let (n, of) = (gone.len(), pods.len() + kept.len());
+        out!(Detail, "\nterminated {n}/{of}");
+        out!(Brief, "{}", if n == of { out::ok(format!("terminated {n} of {of}")) } else { format!("terminated {n} of {of}") });
     }
     // Sync whatever did go (the merge only drops what the providers confirm gone).
     if !gone.is_empty() && !skip_proxy {
@@ -867,11 +1109,11 @@ pub(crate) async fn handle_terminate(
         volumes_failed = crate::pods::datavol::delete_after_terminate(cloud, &ours).await;
     } else {
         for v in &ours {
-            println!("[kept] volume {} ({} GB) — detached, billing until `arena pods volume delete {}`", v.name, v.size_gb, v.name);
+            out!(Out, "[kept] volume {} ({} GB) — detached, billing until `arena pods volume delete {}`", v.name, v.size_gb, v.name);
         }
     }
     for v in &by_hand {
-        println!("[kept] volume {} ({} GB) — attached by hand, so not deleted here: delete it in the Hetzner console", v.name, v.size_gb);
+        out!(Out, "[kept] volume {} ({} GB) — attached by hand, so not deleted here: delete it in the Hetzner console", v.name, v.size_gb);
     }
     let mut revoked = KeyRevoke::default();
     if revoke_key && !gone.is_empty() {
@@ -885,7 +1127,8 @@ pub(crate) async fn handle_terminate(
             }
             seen.push(&p.name);
             match shared_name_holder(&listed, &leaving, &p.name) {
-                Some(other) => println!(
+                Some(other) => out!(
+                    Out,
                     "[keys] = {}: key and CSV row kept — pod id {} still has that name (not terminated)",
                     p.name, other.id
                 ),
@@ -953,7 +1196,7 @@ async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: 
         Ok(k) => k,
         Err(e) => {
             for m in machines {
-                eprintln!("[keys] ✗ {m}: listing OpenRouter keys failed: {e}");
+                out!(Err, "[keys] ✗ {m}: listing OpenRouter keys failed: {e}");
             }
             out.failed = machines.to_vec();
             return out;
@@ -985,7 +1228,7 @@ async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: 
         }
         tracking.keys_deleted(&mine, &mine.iter().filter(|k| deleted.contains(k.hash.as_str())).map(|k| k.hash.clone()).collect::<Vec<_>>());
         if !errs.is_empty() {
-            eprintln!("[keys] ✗ {m}: revoke failed ({}) — its CSV row is kept", errs.join("; "));
+            out!(Err, "[keys] ✗ {m}: revoke failed ({}) — its CSV row is kept", errs.join("; "));
             out.failed.push(m.clone());
             continue;
         }
@@ -998,9 +1241,9 @@ async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: 
             None => "",
         };
         match mine.len() {
-            0 if row.is_empty() => println!("[keys] = {m}: no OpenRouter key ({}), no CSV row", names.join(" / ")),
-            0 => println!("[keys] ✓ {m}: no OpenRouter key named {} (already revoked?){row}", names.join(" / ")),
-            n => println!("[keys] ✓ {m}: revoked {n} OpenRouter key(s){row}"),
+            0 if row.is_empty() => out!(Detail, "[keys] = {m}: no OpenRouter key ({}), no CSV row", names.join(" / ")),
+            0 => out!(Detail, "[keys] ✓ {m}: no OpenRouter key named {} (already revoked?){row}", names.join(" / ")),
+            n => out!(Out, "[keys] ✓ {m}: revoked {n} OpenRouter key(s){row}"),
         }
     }
     if csv.is_some() && !dropped.is_empty() {
@@ -1025,10 +1268,10 @@ async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: 
             book.write_csv(&rest)
         });
         for m in &changed {
-            println!("[keys] = {m}: its CSV row changed while its key was revoked (a key saved meanwhile) — kept");
+            out!(Out, "[keys] = {m}: its CSV row changed while its key was revoked (a key saved meanwhile) — kept");
         }
         if let Err(e) = written {
-            eprintln!("[keys] ✗ couldn't update {}: {e} — rows kept for {}", book.csv.display(), dropped.join(", "));
+            out!(Err, "[keys] ✗ couldn't update {}: {e} — rows kept for {}", book.csv.display(), dropped.join(", "));
             out.stale_rows = Some((dropped, e.to_string()));
         }
     }
@@ -1334,13 +1577,17 @@ pub(crate) async fn handle_restart(
     }
     let then = afterwards_line(fate.reset(), setup, opts.skip_proxy);
     let what = format!("restart {label}:\n  {}\n  {then}", fate.describe(DiskOp::Restart, &site));
+    // By default the pod and what the restart does to it, in a line (docs/OUTPUT.md).
+    let again = if setup { "; set up again" } else { "" };
+    let brief = format!("{} ({}{again})", out::bold(who(&pod, &pods)), fate_words(DiskOp::Restart, fate, &site, 1));
     if opts.dry_run {
-        println!("[dry-run] would {what}");
+        out!(Detail, "[dry-run] would {what}");
+        out!(Brief, "[dry-run] would restart {brief}");
         if let Some(r) = &locked {
             print_would_refuse(r);
         }
         if fate.needs_wipe_ok(&site) && !opts.wipe_ok {
-            println!("(would be refused without --wipe-ok)");
+            out!(Out, "(would be refused without --wipe-ok)");
         }
         return Ok(());
     }
@@ -1348,13 +1595,14 @@ pub(crate) async fn handle_restart(
         let maybe = matches!(fate, DiskFate::MayWipe { .. });
         anyhow::bail!("{}", wipe_refusal(DiskOp::Restart, maybe, &[pod.name.as_str()], &repo));
     }
-    if !confirm(opts.yes, &format!("Will {what}"))? {
-        println!("aborted.");
+    if !confirm_brief(opts.yes, &format!("Will {what}"), &format!("Restart {brief}?"))? {
+        out!(Out, "aborted.");
         return Ok(());
     }
     // The fleet provider routes it to the backend that owns the pod id.
     provider.restart_pod(&pod.id).await.map_err(|e| anyhow::anyhow!("{}", arena_core::lock::explain(&pod.name, &e)))?;
-    println!("[restarted] {label}");
+    out!(Detail, "[restarted] {label}");
+    out!(Brief, "[restarted] {}", out::bold(&pod.name));
 
     let back = Comeback { setup, sync: !opts.skip_proxy, settle, timeouts, reset: fate.reset() };
     if wiped {
@@ -1438,35 +1686,89 @@ async fn come_back(
         }
         return Ok(());
     }
+    let since = tokio::time::Instant::now();
     let s = how.settle;
     let mut settled = Vec::new();
     let mut problems: Vec<String> = Vec::new();
-    for pod in pods {
-        println!("waiting for {}'s SSH endpoint to settle…", pod.name);
-        match wait_for_stable_endpoint_every(provider, &pod.id, s.stable_secs, s.timeout_secs, s.poll).await {
-            Ok(_) => settled.push(pod.id.clone()),
-            Err(e) => problems.push(format!("{}: no SSH endpoint ({e})", pod.name)),
+    {
+        // A terminal shows the wait in place; a log gets `[NAME] waiting for SSH…` as it starts
+        // (the dashboard's runs panel shows it as the pod's step).
+        let _line = out::progress_guard(SETTLE);
+        for pod in pods {
+            out!(Detail, "waiting for {}'s SSH endpoint to settle…", pod.name);
+            if out::live() {
+                out::progress(SETTLE, Some(&format!("{} waiting for its SSH endpoint to settle…", pod.name)));
+            } else {
+                out!(Brief, "[{}] waiting for SSH…", out::bold(&pod.name));
+            }
+            match wait_for_stable_endpoint_every(provider, &pod.id, s.stable_secs, s.timeout_secs, s.poll).await {
+                Ok(_) => settled.push(pod.id.clone()),
+                Err(e) => {
+                    out!(ErrBrief, "{}", failed_line(&pod.name, "waiting for SSH", &format!("{e:#}"), &format!("arena pods setup {} once it answers", pod.name)));
+                    problems.push(format!("{}: no SSH endpoint ({e})", pod.name));
+                }
+            }
         }
     }
+    // The pods back by the end (by name): settled, and set up when setup runs.
+    let mut back: Vec<String> = pods.iter().filter(|p| settled.contains(&p.id)).map(|p| p.name.clone()).collect();
     if how.setup && !settled.is_empty() {
-        println!("\n{}", reprovision_line(settled.len(), why, how.reset));
+        out!(Detail, "\n{}", reprovision_line(settled.len(), why, how.reset));
         let setup = match just_these(provider, &settled).await {
-            Ok(sel) => handle_setup(remote, cfg, true, false, None, None, false, false, how.timeouts, &sel, keys_dir, Some(provider)).await,
+            Ok(sel) => {
+                setup_pods(remote, cfg, true, false, None, None, false, false, how.timeouts, &sel, keys_dir, Some(provider)).await
+            }
             Err(e) => Err(e),
         };
-        if let Err(e) = setup {
-            problems.push(format!("{e:#}"));
+        match setup {
+            Ok(done) => {
+                // Setup says its pods by name: two pods sharing one (a double create) can't be
+                // told apart there, so after a failure neither is said to be READY (review r6).
+                let shared = |n: &str| pods.iter().filter(|p| p.name == n).count() > 1;
+                back.retain(|n| done.provisioned.contains(n) && (done.failed == 0 || !shared(n)));
+                if done.failed > 0 {
+                    problems.push(format!("{} pod(s) failed to set up", done.failed));
+                }
+            }
+            Err(e) => {
+                back.clear();
+                problems.push(format!("{e:#}"));
+            }
         }
     }
     if how.sync {
         // Only the pods that settled are waited for again: one that never got an endpoint has
         // had its wait (and is named below) — another one, or two, per pod would only make a
         // dead pod cost the whole command half an hour.
-        let back: Vec<arena_core::Pod> = pods.iter().filter(|p| settled.contains(&p.id)).cloned().collect();
-        settled_sync(cfg, provider, &back, s, why).await;
+        let settled_pods: Vec<arena_core::Pod> = pods.iter().filter(|p| settled.contains(&p.id)).cloned().collect();
+        let (sync, dead) = settled_sync(cfg, provider, &settled_pods, s, why).await;
+        // A pod set up but not reachable after all (its endpoint gone again, its forward not
+        // routed) isn't READY: its FAILED line, with the warning above it (the exit is as before).
+        if how.setup {
+            for (id, (what, why)) in not_back(cfg, &sync, &settled_pods, &dead) {
+                let Some(p) = settled_pods.iter().find(|p| p.id == id) else { continue };
+                if back.contains(&p.name) {
+                    back.retain(|n| *n != p.name);
+                    out!(ErrBrief, "{}", failed_line(&p.name, what, why, "arena proxy apply, once it answers"));
+                }
+            }
+        }
     }
     if !how.setup {
         no_setup_note(pods, how.reset);
+    } else {
+        // Each pod back and set up, as `up` ends one: the dashboard's runs panel reads it as the
+        // pod's end (a `start` from there). Not with --no-setup: a bare image isn't ready. Nor,
+        // with --skip-proxy, one whose proxy port still leads to its old endpoint: set up, with
+        // what's left to do (review r3).
+        for name in &back {
+            if !how.sync && proxied_name(cfg, name) {
+                out!(Brief, "[{}] set up · proxy not synced (--skip-proxy): run `arena proxy apply`", out::bold(name));
+            } else {
+                let notes = ready_notes(cfg, name, "");
+                out!(Brief, "{}", ready_line(name, since.elapsed(), (!notes.is_empty()).then_some(notes.as_str())));
+            }
+        }
     }
     if problems.is_empty() {
         return Ok(());
@@ -1488,6 +1790,9 @@ async fn come_back(
     )
 }
 
+/// The key of [`come_back`]'s in-place line on a terminal ([`out::progress`]).
+const SETTLE: &str = "settle";
+
 /// The line before [`come_back`] re-runs setup (pure, tested): a reset is said to have
 /// happened only when it is known to (a RunPod v1 restart may have kept the disk).
 pub(crate) fn reprovision_line(n: usize, why: &str, reset: ContainerReset) -> String {
@@ -1499,7 +1804,7 @@ pub(crate) fn reprovision_line(n: usize, why: &str, reset: ContainerReset) -> St
 
 /// `--no-setup`'s reminder after a reset (or a possible one: `reset`).
 fn no_setup_note(pods: &[arena_core::Pod], reset: ContainerReset) {
-    println!("{}", no_setup_line(pods, reset));
+    out!(Out, "{}", no_setup_line(pods, reset));
 }
 
 /// [`no_setup_note`]'s words (pure, tested).
@@ -1532,14 +1837,36 @@ fn unrouted<'a>(cfg: &Config, sync: &ProxySync, pods: &'a [arena_core::Pod]) -> 
         .collect()
 }
 
+/// The pods of `pods` a [`settled_sync`] didn't bring back, by id, with what and why for a FAILED
+/// line: no settled endpoint (`dead`: its wait ran out), or — one with a stable port on the
+/// proxy — no forward routed to it (the sync didn't route it, or wasn't made). Pure.
+fn not_back(cfg: &Config, sync: &ProxySync, pods: &[arena_core::Pod], dead: &[String]) -> Vec<(String, (&'static str, &'static str))> {
+    let routed = |p: &arena_core::Pod| match sync {
+        ProxySync::Synced { routed, .. } => routed.iter().any(|f| f.name == p.name && f.pod_id.as_deref() == Some(p.id.as_str())),
+        _ => false,
+    };
+    pods.iter()
+        .filter_map(|p| {
+            if dead.contains(&p.id) {
+                Some((p.id.clone(), ("waiting for SSH", "its endpoint never settled")))
+            } else if proxied_name(cfg, &p.name) && !routed(p) {
+                Some((p.id.clone(), ("proxy", "its forward isn't routed to it yet")))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// The proxy sync after a container reset, made once the pods' endpoints have SETTLED: a
 /// reset container's endpoint can flap after it first settles (live: the post-restart sync
 /// hit a moment the listing showed the pod without one, so its forward stayed on the dead
 /// old endpoint). Waits for each pod to hold one endpoint for `settle.stable_secs`
 /// (bounded), syncs, and if a pod's forward still isn't routed to it, waits for THAT pod
 /// again and syncs once more — not for one whose first wait already ran out (it has no
-/// endpoint to wait for). One still not routed is named with the command to run later.
-async fn settled_sync(cfg: &Config, provider: &dyn Provider, pods: &[arena_core::Pod], settle: SettleWait, why: &str) -> ProxySync {
+/// endpoint to wait for). One still not routed is named with the command to run later. Also
+/// returns the ids of the pods whose first wait ran out (said as a warning).
+async fn settled_sync(cfg: &Config, provider: &dyn Provider, pods: &[arena_core::Pod], settle: SettleWait, why: &str) -> (ProxySync, Vec<String>) {
     /// Waits for each of `pods`; the ids whose wait ran out.
     async fn wait(provider: &dyn Provider, pods: &[&arena_core::Pod], settle: SettleWait) -> Vec<String> {
         let mut timed_out = Vec::new();
@@ -1547,7 +1874,7 @@ async fn settled_sync(cfg: &Config, provider: &dyn Provider, pods: &[arena_core:
             if let Err(e) =
                 wait_for_stable_endpoint_every(provider, &pod.id, settle.stable_secs, settle.timeout_secs, settle.poll).await
             {
-                eprintln!("warning: {} has no settled SSH endpoint ({e})", pod.name);
+                out!(Err, "warning: {} has no settled SSH endpoint ({e})", pod.name);
                 timed_out.push(pod.id.clone());
             }
         }
@@ -1562,12 +1889,13 @@ async fn settled_sync(cfg: &Config, provider: &dyn Provider, pods: &[arena_core:
     }
     let missing: Vec<&str> = unrouted(cfg, &sync, pods).iter().map(|p| p.name.as_str()).collect();
     if !missing.is_empty() {
-        eprintln!(
+        out!(
+            Err,
             "warning: the proxy doesn't route {} to the new endpoint yet (listed without one) — run `arena proxy apply` once it answers",
             missing.join(", ")
         );
     }
-    sync
+    (sync, dead)
 }
 
 #[cfg(test)]

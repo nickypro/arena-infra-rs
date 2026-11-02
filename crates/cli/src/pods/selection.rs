@@ -36,7 +36,7 @@ pub(crate) async fn resolve_target_any(
                 pods.extend(listed);
                 backends.push((name, p));
             }
-            Err(e) => eprintln!("warning: couldn't list {name} pods ({e})"),
+            Err(e) => arena_core::out!(Err, "warning: couldn't list {name} pods ({e})"),
         }
     }
     let i = arena_core::selector::resolve_one(&Naming::from_config(cfg), &pods, target)?;
@@ -73,7 +73,7 @@ pub(crate) async fn refresh_missing_endpoints(provider: &dyn Provider, sel: &mut
     if names.is_empty() {
         return;
     }
-    eprintln!("{} listed running without an SSH endpoint — asking again in {}s…", names.join(", "), wait.as_secs());
+    arena_core::out!(Err, "{} listed running without an SSH endpoint — asking again in {}s…", names.join(", "), wait.as_secs());
     tokio::time::sleep(wait).await;
     let Ok(Ok(fresh)) = arena_core::ratelimit::bounded(arena_core::provider::LIST_TIMEOUT, provider.list_pods()).await else {
         return;
@@ -82,7 +82,7 @@ pub(crate) async fn refresh_missing_endpoints(provider: &dyn Provider, sel: &mut
         if let Some(now) = fresh.iter().find(|f| f.id == pod.id && f.ssh_ip.is_some() && f.ssh_port.is_some()) {
             pod.ssh_ip = now.ssh_ip.clone();
             pod.ssh_port = now.ssh_port;
-            eprintln!("  {} has an endpoint now", pod.name);
+            arena_core::out!(Err, "  {} has an endpoint now", pod.name);
         }
     }
 }
@@ -134,14 +134,15 @@ impl Selected {
         let mut stopped = Vec::new();
         for pod in &self.pods {
             if arena_core::status::is_stopped(&pod.status) {
-                eprintln!("{}", stopped_skip(pod));
+                arena_core::out!(Err, "{}", stopped_skip(pod));
                 stopped.push(pod.name.as_str());
                 continue;
             }
             match SshTarget::from_pod(pod, cfg) {
                 Ok(t) => targets.push((pod, t)),
                 // A stopped or proxy-only pod says so, not "yet" (it won't get one by waiting).
-                Err(_) => eprintln!(
+                Err(_) => arena_core::out!(
+                    Err,
                     "{} {} — {}",
                     if arena_core::status::endpoint_overdue(pod, arena_core::status::now_secs()) { "⚠ FAILED" } else { "skip" },
                     pod.name,
@@ -188,7 +189,7 @@ pub(crate) async fn select(provider: &dyn Provider, cfg: &Config, sel: &SelectAr
     let mut pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
     if selector.gpus.is_some() {
         if let Some(warning) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
-            eprintln!("{warning}");
+            arena_core::out!(Err, "{warning}");
         }
     }
     let picked = selector.resolve(&naming, &pods)?;
@@ -306,7 +307,7 @@ pub(crate) async fn just_these(provider: &dyn Provider, ids: &[String]) -> Resul
     let pods: Vec<arena_core::Pod> = listed.into_iter().filter(|p| ids.contains(&p.id)).collect();
     let missing: Vec<&str> = ids.iter().map(String::as_str).filter(|id| !pods.iter().any(|p| p.id == *id)).collect();
     if !missing.is_empty() {
-        eprintln!("warning: not in the listing (gone?): id {}", missing.join(", "));
+        arena_core::out!(Err, "warning: not in the listing (gone?): id {}", missing.join(", "));
     }
     if pods.is_empty() {
         anyhow::bail!("none of the new pods (id {}) is in the listing — check `arena pods list`", ids.join(", "));

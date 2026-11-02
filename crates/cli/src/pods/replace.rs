@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arena_core::capability::Op;
+use arena_core::out;
+use arena_core::out::To;
 use arena_core::provider::Provider;
 use arena_core::remote::{Remote, PROBE_TIMEOUT};
 use arena_core::spare::SpareCloud;
@@ -26,7 +28,7 @@ use crate::pods::rename::replace_stage_names;
 use crate::pods::selection::{just_these, resolve_target_any};
 use crate::pods::setup::handle_setup;
 use crate::proxy::{sync_proxy, ProxySync};
-use crate::{archive, confirm, disk, money, reap, up, Interrupt};
+use crate::{archive, confirm_brief, disk, money, reap, up, Interrupt};
 
 /// Build the base spec for a replacement pod: snapshot the source's spec, fall back for what
 /// it doesn't report — the GPU type to the source's own (enriched) listing first
@@ -283,21 +285,90 @@ fn vm_notes(cfg: &Config, src: &arena_core::Pod, base: &PodSpec, types: &[String
     out
 }
 
-/// The replacement's target in a plan: the spec of a single option, or the option table.
+/// The replacement's target in a plan: the spec of a single option, or the option table, with
+/// the notes on where it came from — `-v`'s ([`replacement_brief`] is the default's).
 pub(crate) fn print_replacement_plan(owner: &dyn Provider, rep: &Replacement, name: &str) {
     if rep.is_placement() {
-        println!("  {}", plan_header(&rep.plan));
+        out!(Detail, "  {}", plan_header(&rep.plan));
         for line in arena_core::placement::render_plan(&rep.plan).lines() {
-            println!("    {line}");
+            out!(Detail, "    {line}");
         }
     } else {
-        println!("  target spec: {}", owner.describe(&rep.first_spec(name)));
+        out!(Detail, "  target spec: {}", owner.describe(&rep.first_spec(name)));
     }
     for n in &rep.notes {
-        println!("  note: {n}");
+        out!(Detail, "  note: {n}");
     }
     if let Some(line) = extra_keys_line(&rep.base) {
-        println!("               {line}");
+        out!(Detail, "               {line}");
+    }
+}
+
+/// The replacement as the default output says it before a prompt (docs/OUTPUT.md): one
+/// option on a line — `cx23 CPU VM · Hetzner`, `1×RTX A4000 · RunPod COMMUNITY · $0.17/h` —
+/// or several as the compact table (`plan_brief`). The notes are `-v`'s.
+pub(crate) fn replacement_brief(owner: &dyn Provider, rep: &Replacement, name: &str) -> Vec<String> {
+    if rep.is_placement() {
+        crate::pods::placement::plan_brief(&rep.plan)
+    } else {
+        vec![crate::pods::placement::spec_brief(owner, &rep.first_spec(name), Some(&rep.plan))]
+    }
+}
+
+/// A long run's steps on one pod (`replace`, `migrate`), as docs/OUTPUT.md has a long run say
+/// them: on a terminal one line updated in place — `devtest-alpha-new copy 1m10s` — and off one
+/// a `[NAME] copy…` line as each starts (the dashboard's runs panel reads that as the pod's
+/// step). Nothing more with `-v`: its own lines say each step. The line goes when it's dropped.
+pub(crate) struct Steps {
+    key: &'static str,
+    /// The in-place line's clock (a terminal only), and whether it may still draw: cleared
+    /// under the lock, so a tick that was under way can't draw a step that's over.
+    clock: Option<(tokio::task::JoinHandle<()>, Arc<std::sync::Mutex<bool>>)>,
+}
+
+impl Steps {
+    pub(crate) fn new(key: &'static str) -> Self {
+        Steps { key, clock: None }
+    }
+
+    /// `name` starts `what` (`copy from devtest-alpha`).
+    pub(crate) fn step(&mut self, name: &str, what: &str) {
+        self.clear();
+        if out::live() {
+            let (key, line, started) = (self.key, format!("{name} {what}"), tokio::time::Instant::now());
+            let on = Arc::new(std::sync::Mutex::new(true));
+            let drawing = on.clone();
+            let clock = tokio::spawn(async move {
+                loop {
+                    {
+                        let on = drawing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if !*on {
+                            return;
+                        }
+                        out::progress(key, Some(&format!("{line} {}", arena_core::pipeline::fmt_elapsed(started.elapsed()))));
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            });
+            self.clock = Some((clock, on));
+        } else {
+            out!(Brief, "[{}] {what}…", out::bold(name));
+        }
+    }
+
+    /// No step shows: the run's next line is its own (setup draws its own in-place line).
+    pub(crate) fn clear(&mut self) {
+        if let Some((clock, on)) = self.clock.take() {
+            *on.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+            clock.abort();
+        }
+        out::progress(self.key, None);
+    }
+}
+
+impl Drop for Steps {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
@@ -316,13 +387,17 @@ pub(crate) async fn create_replacement(
     balance: Option<&money::BalanceCtx>,
 ) -> Result<arena_core::Pod> {
     use arena_core::placement::{self, End, Progress};
-    let mut show = |p: &Progress| {
-        if p.is_created() {
-            println!("      {}", p.line());
+    // `-v` says each event as before (indented under the step); the default, `up`'s short lines
+    // (`[created] NAME · …`), a round's on a terminal in place.
+    let say = |to: To, line: &str| {
+        if to.shows(true) {
+            out::emit(to, &format!("      {line}"));
         } else {
-            eprintln!("      {}", p.line());
+            out::emit(to, line);
         }
     };
+    let _rounds = out::progress_guard(crate::pods::placement::ROUNDS);
+    let mut show = |p: &Progress| crate::pods::placement::say_progress(p, &say, crate::pods::placement::ROUNDS);
     let names = [name.to_string()];
     let run = placement::place(owner, &rep.base, &names, &rep.plan, place.rounds(), None, || interrupt.wait(), &mut show).await;
     if let Some(pod) = run.created.into_iter().next() {
@@ -403,7 +478,8 @@ pub(crate) async fn after_swap(
     let vm = arena_core::setup::hostname_is_machine_name(owner.name());
     let what = if vm { "~/.name and the hostname" } else { "~/.name" };
     if !write_name_file(remote.as_ref(), cfg, owner, new_id, canonical, 60).await {
-        eprintln!(
+        out!(
+            Err,
             "      warning: couldn't update {what} on {canonical} — `arena pods setup {canonical}` writes {} \
              (until then backups/metrics label it {})",
             if vm { "them" } else { "it" },
@@ -419,10 +495,13 @@ pub(crate) async fn after_swap(
         .and_then(|ps| ps.into_iter().find(|p| p.id == old_id))
         .is_some_and(|p| !arena_core::status::is_stopped(&p.status) && p.ssh_ip.is_some());
     if old_up && !write_name_file(remote.as_ref(), cfg, owner, old_id, parked, 30).await {
-        eprintln!("      note: {parked}'s {what} still say(s) {} (harmless once it's terminated)", short_of(cfg, canonical));
+        out!(ErrDetail, "      note: {parked}'s {what} still say(s) {} (harmless once it's terminated)", short_of(cfg, canonical));
+        // Kept (a cutover, --keep-old, a cleanup that's blocked), it would claim the name too.
+        out!(ErrBrief, "{}", out::warn(format!("{parked}'s {what} still say(s) {} — if it's kept, `arena pods setup {parked}` fixes it", short_of(cfg, canonical))));
     }
     if arena_core::setup::machine_name_in_env(owner.name()) {
-        println!(
+        out!(
+            Detail,
             "      note: {canonical}'s MACHINE_NAME env var still says {staging} — env is fixed at create (only a \
              reimage, which wipes the disk, resets it); ~/.name carries {}.",
             short_of(cfg, canonical)
@@ -441,7 +520,7 @@ async fn rekey_promoted(remote: Arc<dyn Remote>, cfg: &Config, owner: &dyn Provi
     if keys.per_host.is_empty() && keys.broadcast.is_empty() && archive::pod_archive(cfg).ready().is_none() {
         return;
     }
-    println!("      giving {canonical} its API keys under its new name…");
+    out!(Detail, "      giving {canonical} its API keys under its new name…");
     let sel = match just_these(owner, &[id.to_string()]).await {
         Ok(mut sel) => {
             // Whatever the listing says this instant: the keys are for the canonical name.
@@ -451,12 +530,12 @@ async fn rekey_promoted(remote: Arc<dyn Remote>, cfg: &Config, owner: &dyn Provi
             sel
         }
         Err(e) => {
-            eprintln!("      warning: {canonical}'s API keys weren't re-distributed ({e:#}) — run `arena pods copy-keys {canonical}`");
+            out!(Err, "      warning: {canonical}'s API keys weren't re-distributed ({e:#}) — run `arena pods copy-keys {canonical}`");
             return;
         }
     };
     if let Err(e) = handle_copy_keys(remote, cfg, keys_dir, None, None, &sel, false, true).await {
-        eprintln!("      warning: {canonical}'s API keys weren't re-distributed ({e:#}) — run `arena pods copy-keys {canonical}`");
+        out!(Err, "      warning: {canonical}'s API keys weren't re-distributed ({e:#}) — run `arena pods copy-keys {canonical}`");
     }
 }
 
@@ -484,6 +563,17 @@ pub(crate) fn write_only_proxy(cfg: &Config) -> Option<String> {
 /// The config line a plan prints for the copy: what it carries and what it leaves (#27).
 pub(crate) fn copy_scope_line() -> String {
     format!("copies {}; {}", arena_core::pull::REPLICATION_KEEPS, arena_core::pull::REPLICATION_SKIPS)
+}
+
+/// What a copy leaves behind, in a line for the default output before a step that retires the
+/// original (`replace`'s question, `migrate finish`'s): what only lives there goes with it.
+/// `copy_scope_line` has the whole list (`-v`). Pure.
+pub(crate) fn left_behind_line(original: &str, kept: bool) -> String {
+    let fate = if kept { format!("stays on {original} only") } else { format!("goes when {original} is terminated") };
+    format!(
+        "Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, other dot-dirs (.ssh, \
+         .vscode-server, ~/.claude and Claude Code's state), shell rc files and history — what's only there {fate}"
+    )
 }
 
 /// The plan / confirm note on a locked original: copying only reads it, but what retires it
@@ -809,7 +899,8 @@ pub(crate) async fn replace_on(
     // fresh start — flag it so the operator cleans up rather than colliding.
     for staging in [&new_name, &old_name] {
         if let Some(p) = pods.iter().find(|p| &p.name == staging) {
-            eprintln!(
+            out!(
+                Err,
                 "warning: {staging} already exists (id={}) — likely a leftover from an \
                  interrupted replace. Resolve it before proceeding.",
                 p.id
@@ -817,50 +908,74 @@ pub(crate) async fn replace_on(
         }
     }
 
-    // Print the plan.
-    println!("Replace {canonical}  (id={src_id}, {})", owner.name());
+    // The plan: the whole pipeline with `-v`; by default what the new pod is, in a line, and
+    // the volumes' fate (docs/OUTPUT.md).
+    out!(Detail, "Replace {canonical}  (id={src_id}, {})", owner.name());
     match (&rep, &onto) {
-        (Some(rep), _) => print_replacement_plan(owner, rep, &new_name),
-        (None, Some(o)) => println!("  target: {}", adopt::take_line(o, &new_name)),
+        (Some(rep), _) => {
+            print_replacement_plan(owner, rep, &new_name);
+            let lines = replacement_brief(owner, rep, &new_name);
+            match lines.as_slice() {
+                [one] => out!(Brief, "{} → a new {one}", out::bold(&canonical)),
+                many => {
+                    out!(Brief, "{} → a new pod on the first of:", out::bold(&canonical));
+                    many.iter().for_each(|l| out!(Brief, "{l}"));
+                }
+            }
+        }
+        (None, Some(o)) => {
+            out!(Detail, "  target: {}", adopt::take_line(o, &new_name));
+            out!(Brief, "{} → {}", out::bold(&canonical), adopt::take_line(o, &new_name));
+        }
         (None, None) => {}
     }
     let vm = arena_core::setup::hostname_is_machine_name(owner.name());
     let names = if vm { "~/.name, hostname" } else { "~/.name" };
-    println!("  pipeline:");
+    out!(Detail, "  pipeline:");
     match &onto {
-        None => println!("    1. create   {new_name}"),
-        Some(o) => println!("    1. take     {} as {new_name}", o.pod.name),
+        None => out!(Detail, "    1. create   {new_name}"),
+        Some(o) => out!(Detail, "    1. take     {} as {new_name}", o.pod.name),
     }
-    println!("    2. setup    {new_name}   (deploy key, ssh config, repo, ~/.name={} until the swap)", short_of(cfg, &new_name));
-    println!("    3. copy     {canonical} -> {new_name}   ({})", copy_scope_line());
-    println!(
+    out!(Detail, "    2. setup    {new_name}   (deploy key, ssh config, repo, ~/.name={} until the swap)", short_of(cfg, &new_name));
+    out!(Detail, "    3. copy     {canonical} -> {new_name}   ({})", copy_scope_line());
+    out!(
+        Detail,
         "    4. verify   {new_name}   (the copy read back on the right pod, {}, maintenance window)",
         if vm { "ssh health check" } else { "ssh + GPU health check" }
     );
-    println!(
+    out!(
+        Detail,
         "    5. swap     {}rename {canonical} -> {old_name}, then {new_name} -> {canonical} (+ {names}, API keys under {canonical})",
         if force { "" } else { "no one on it? then " }
     );
     if skip_proxy {
-        println!("    6. proxy    SKIPPED (--skip-proxy) — run `arena proxy apply` yourself");
+        out!(Detail, "    6. proxy    SKIPPED (--skip-proxy) — run `arena proxy apply` yourself");
     } else {
-        println!("    6. proxy    apply (repoint nginx; stable port reclaimed by the canonical name)");
+        out!(Detail, "    6. proxy    apply (repoint nginx; stable port reclaimed by the canonical name)");
     }
     if keep_old {
-        println!("    7. cleanup  keep {old_name} (--keep-old) — terminate it yourself once happy");
+        out!(Detail, "    7. cleanup  keep {old_name} (--keep-old) — terminate it yourself once happy");
     } else {
-        println!("    7. cleanup  terminate {old_name} once the proxy routes {canonical} to the new pod");
+        out!(Detail, "    7. cleanup  terminate {old_name} once the proxy routes {canonical} to the new pod");
     }
     if let Some(l) = crate::pods::datavol::plan_line(&src_volumes) {
-        println!("  {l}");
+        out!(Out, "  {l}");
     }
+    // What happens, in the default output's question and dry run.
+    let then = if keep_old { format!("{old_name} kept") } else { "the old one terminated".to_string() };
+    // --skip-proxy is said up front: the old pod may go while the proxy still leads to it.
+    let proxy = if skip_proxy { "; the proxy left alone: `arena proxy apply` yourself" } else { "" };
+    let brief = format!("{} (its home copied onto the new one, swapped in; {then}{proxy})", out::bold(&canonical));
 
+    // Before a step that retires the original: what the copy leaves on it (review r2).
+    out!(Brief, "{}", left_behind_line(&old_name, keep_old));
     if dry_run {
         for r in [&locked, &stopped, &reaping, &bad_floor, &busy, &someones].into_iter().flatten() {
-            println!();
+            out!(Detail, "");
             print_would_refuse(r);
         }
-        println!("\n[dry-run] nothing changed.");
+        out!(Detail, "\n[dry-run] nothing changed.");
+        out!(Brief, "[dry-run] would replace {brief}");
         return Ok(());
     }
 
@@ -878,17 +993,19 @@ pub(crate) async fn replace_on(
         None => format!("build {new_name}"),
         Some(o) => format!("take {} as {new_name}", o.pod.name),
     };
-    if !confirm(
+    if !confirm_brief(
         yes,
         &format!(
             "Will {first}, copy {canonical}'s files onto it, verify, then swap it in as \
              {canonical} (old parked as {old_name}{}).",
             if keep_old { ", kept" } else { ", then terminated" }
         ),
+        &format!("Replace {brief}?"),
     )? {
-        println!("aborted.");
+        out!(Out, "aborted.");
         return Ok(());
     }
+    let mut steps = Steps::new("replace");
 
     let policy = arena_core::retry::RetryPolicy::default();
 
@@ -897,15 +1014,16 @@ pub(crate) async fn replace_on(
     // --keep-trying allows — or take the machine named.
     let (created, fresh) = match (&rep, &onto) {
         (Some(rep), _) => {
-            println!("[1/7] creating {new_name}…");
+            out!(Detail, "[1/7] creating {new_name}…");
             let created = create_replacement(owner, rep, &new_name, job.place, job.interrupt, job.balance).await?;
-            println!("      created {new_name} id={}", created.id);
+            out!(Detail, "      created {new_name} id={}", created.id);
             (created, true)
         }
         (None, Some(o)) => {
-            println!("[1/7] taking {} as {new_name}…", o.pod.name);
+            out!(Detail, "[1/7] taking {} as {new_name}…", o.pod.name);
             adopt::take(owner, job.spares, cfg, o, &new_name).await?;
-            println!("      {}", adopt::taken_line(o, &new_name));
+            out!(Detail, "      {}", adopt::taken_line(o, &new_name));
+            out!(Brief, "[taken] {} as {}", o.pod.name, out::bold(&new_name));
             (arena_core::Pod { name: new_name.clone(), ..o.pod.clone() }, o.spare)
         }
         (None, None) => anyhow::bail!("nothing to create or take"),
@@ -915,14 +1033,15 @@ pub(crate) async fn replace_on(
     // ip:port churns while RunPod places it, and a still-moving pod can migrate and reset its
     // container disk — wiping any setup+copy. Provisioning a *settled* pod avoids most of that.
     let settle = settle_secs(owner.name());
-    println!("[2/7] waiting for {new_name} to come up{}…", if settle > 0 { " and stabilize" } else { "" });
+    out!(Detail, "[2/7] waiting for {new_name} to come up{}…", if settle > 0 { " and stabilize" } else { "" });
+    steps.step(&new_name, "waiting for SSH");
     // RunPod can be slow to assign a fresh pod's SSH endpoint — 5+ min is not unusual,
     // especially on the secure tier — so give it a generous window before giving up.
     let up = wait_for_endpoint(owner, &created.id, 900)
         .await
         .with_context(|| format!("{new_name} never came up — left in place for inspection"))?;
     if let Some(n) = moved_note(&src, &up, &new_name, onto.is_some()) {
-        println!("      {n}");
+        out!(Detail, "      {n}");
     }
     wait_for_stable_endpoint(owner, &created.id, settle, 600)
         .await
@@ -935,29 +1054,34 @@ pub(crate) async fn replace_on(
     let copy_attempts = 3;
     let mut persisted = false;
     for attempt in 1..=copy_attempts {
-        println!("[3/7] provisioning {new_name}… (attempt {attempt}/{copy_attempts}; its per-host API keys follow at the swap)");
+        out!(Detail, "[3/7] provisioning {new_name}… (attempt {attempt}/{copy_attempts}; its per-host API keys follow at the swap)");
+        // Setup says its own `[NAME] setup…` (and draws its own line on a terminal).
+        steps.clear();
         // By id (a fresh listing each attempt, for the current endpoint): the pod we made.
         let new = just_these(owner, std::slice::from_ref(&created.id)).await?;
         handle_setup(remote.clone(), cfg, true, false, None, None, false, false, job.setup_timeouts, &new, job.keys_dir, Some(owner))
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
-        println!("[4/7] copying {canonical} → {new_name} ({})…", copy_scope_line());
+        out!(Detail, "[4/7] copying {canonical} → {new_name} ({})…", copy_scope_line());
+        steps.step(&new_name, &format!("copy from {canonical}"));
         // A pod made for this replace (or a spare): its copy baseline starts now. A machine
         // taken with --onto keeps everything the copy replaces on it, moved aside.
         copy_pod_files(cfg, owner, remote.as_ref(), &src_id, &created.id, &CopyOpts::new(fresh))
             .await
             .with_context(|| replace_copy_failed(&canonical, &new_name))?;
         if settle > 0 {
-            println!("[5/7] confirming the copy persists (~90s — pods can reset while still settling)…");
+            out!(Detail, "[5/7] confirming the copy persists (~90s — pods can reset while still settling)…");
+            steps.step(&new_name, "checking the copy stays (90s)");
             tokio::time::sleep(std::time::Duration::from_secs(90)).await;
         } else {
-            println!("[5/7] confirming the copy is there…");
+            out!(Detail, "[5/7] confirming the copy is there…");
         }
         if marker_present(owner, remote.as_ref(), &created.id, cfg).await {
             persisted = true;
             break;
         }
-        eprintln!("      {new_name} reset to image state (lost setup+copy) — re-provisioning…");
+        out!(ErrDetail, "      {new_name} reset to image state (lost setup+copy) — re-provisioning…");
+        out!(ErrBrief, "[{}] reset to its image (setup and copy lost): setting it up again ({}/{copy_attempts})", out::bold(&new_name), attempt + 1);
         let _ = wait_for_stable_endpoint(owner, &created.id, settle, 600).await;
     }
     if !persisted {
@@ -974,27 +1098,31 @@ pub(crate) async fn replace_on(
     let carry = crate::pods::datavol::carry(src_volumes.clone(), new_pod.location.as_deref());
     match (&carry, job.volumes) {
         (crate::pods::datavol::Carry::Copy(vols), Some(cloud)) => {
-            println!("      copying {canonical}'s volume(s) onto new ones on {new_name} (another location: a volume can't move there)…");
+            out!(Detail, "      copying {canonical}'s volume(s) onto new ones on {new_name} (another location: a volume can't move there)…");
+            steps.step(&new_name, &format!("copy {canonical}'s volumes"));
             crate::pods::datavol::copy_volumes(remote.as_ref(), cfg, owner, cloud, &src, &new_pod, &canonical, vols, &std::collections::BTreeMap::new())
                 .await
                 .with_context(|| replace_copy_failed(&canonical, &new_name))?;
         }
         (crate::pods::datavol::Carry::Move(vols), Some(_)) => {
-            println!("      {canonical}'s volume(s) {} move to {new_name} at the swap (same location)", vols.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(", "));
+            out!(Detail, "      {canonical}'s volume(s) {} move to {new_name} at the swap (same location)", vols.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(", "));
         }
         _ => {}
     }
 
     // Health check before the swap (re-resolves the endpoint fresh and retries).
-    println!("      verifying health of {new_name}…");
+    out!(Detail, "      verifying health of {new_name}…");
+    steps.step(&new_name, "health check");
     verify_replacement(owner, remote.as_ref(), &created.id, cfg)
         .await
         .with_context(|| format!("verifying {new_name}"))?;
     // A host going into maintenance will stop the new pod (wiping it): say so before the
     // swap, and keep the original rather than terminate it.
     let maintenance = maintenance_window(owner, &created.id).await;
+    steps.clear();
     if let Some(w) = &maintenance {
-        eprintln!(
+        out!(
+            Err,
             "      ⚠ {new_name}'s host has a scheduled maintenance window ({w}): the provider will stop it \
              then, wiping its container disk. {old_name} will be KEPT after the swap."
         );
@@ -1007,14 +1135,16 @@ pub(crate) async fn replace_on(
     // Manual gate: nothing destructive has happened yet. A "no" leaves the built+copied
     // replacement in place under its staging name for inspection.
     let warn = maintenance.as_ref().map(|w| format!(" ⚠ Its host has a maintenance window ({w}).")).unwrap_or_default();
-    if !confirm(
+    if !confirm_brief(
         yes,
         &format!(
             "{new_name} is built, copied and verified.{warn} Swap it in as {canonical} now? \
              (renames {canonical} -> {old_name}, then {new_name} -> {canonical})"
         ),
+        &format!("{} is built, copied and checked.{warn} Swap it in as {} ({canonical} → {old_name}{proxy})?", out::bold(&new_name), out::bold(&canonical)),
     )? {
-        eprintln!(
+        out!(
+            Err,
             "aborted before swap. {new_name} is left in place (no swap). Inspect it, then either \
              re-run or remove it with `arena pods terminate {new_name}`."
         );
@@ -1027,7 +1157,8 @@ pub(crate) async fn replace_on(
     if let Some(r) = swap_presence_refusal(remote.as_ref(), cfg, &src, &new_name, force, "while the prompt waited").await {
         anyhow::bail!("{r}");
     }
-    println!("      final sync of what changed on {canonical} since the copy…");
+    out!(Detail, "      final sync of what changed on {canonical} since the copy…");
+    steps.step(&new_name, &format!("final sync from {canonical}"));
     copy_pod_files(cfg, owner, remote.as_ref(), &src_id, &created.id, &CopyOpts::new(false)).await.with_context(|| {
         format!(
             "the final sync {canonical} -> {new_name} — NOT swapping; {canonical} is untouched. `arena pods migrate cutover \
@@ -1059,12 +1190,13 @@ pub(crate) async fn replace_on(
     // [6/7] swap. Old-first so the canonical name is never held by two pods at once. If the
     // promote fails after parking the source, roll the source's name back so the canonical
     // name still resolves to the (untouched) original.
-    println!("[6/7] swapping…");
+    steps.clear();
+    out!(Detail, "[6/7] swapping…");
     // Volumes moved for the swap go back if it doesn't happen.
     let move_back = || async {
         if let Some((cloud, vols, mounts)) = &moved {
             if let Err(me) = crate::pods::datavol::move_volumes(remote.as_ref(), cfg, owner, *cloud, &new_pod, &src, vols, mounts).await {
-                eprintln!("      moving the volume(s) back to {canonical}: {me:#}");
+                out!(Err, "      moving the volume(s) back to {canonical}: {me:#}");
             }
         }
     };
@@ -1072,29 +1204,30 @@ pub(crate) async fn replace_on(
         move_back().await;
         return Err(e).with_context(|| format!("renaming {canonical} -> {old_name}"));
     }
-    println!("      {canonical} -> {old_name}");
+    out!(Detail, "      {canonical} -> {old_name}");
     if let Err(e) =
         arena_core::retry::retrying(&policy, || owner.rename_pod(&created.id, &canonical)).await
     {
-        eprintln!("      promote failed ({e}); rolling back {old_name} -> {canonical}");
+        out!(Err, "      promote failed ({e}); rolling back {old_name} -> {canonical}");
         let _ = owner.rename_pod(&src_id, &canonical).await;
         move_back().await;
         return Err(e).with_context(|| {
             format!("promoting {new_name} -> {canonical} (rolled back; original {canonical} intact)")
         });
     }
-    println!("      {new_name} -> {canonical}");
+    out!(Detail, "      {new_name} -> {canonical}");
+    out!(Brief, "[swapped] {} is the new pod; the old one is {old_name}", out::bold(&canonical));
     after_swap(remote.clone(), cfg, owner, &canonical, &created.id, &new_name, &old_name, &src_id, job.keys_dir).await;
     if let Some(n) = reap::policy_not_carried_note(cfg, owner.name(), &src_id, &created.id) {
-        println!("      {n}");
+        out!(Out, "      {n}");
     }
 
     // [7/7] proxy + cleanup.
     let mut blocker = if skip_proxy {
-        println!("[7/7] proxy skipped (--skip-proxy) — run `arena proxy apply` to repoint nginx.");
+        out!(Out, "[7/7] proxy skipped (--skip-proxy) — run `arena proxy apply` to repoint nginx.");
         None
     } else {
-        println!("[7/7] re-pointing proxy…");
+        out!(Detail, "[7/7] re-pointing proxy…");
         // Fleet-wide (not just `owner`'s pods): a single-provider list here used to drop
         // every other provider's forwards, and a failed list (`unwrap_or_default`) all of them.
         let sync = sync_proxy(cfg, fleet, "replace").await;
@@ -1104,26 +1237,30 @@ pub(crate) async fn replace_on(
         blocker = Some(format!("the new pod's host has a maintenance window ({w}) — keep the original until it's past"));
     }
     if keep_old {
-        println!(
+        out!(
+            Detail,
             "done — {canonical} is the fresh pod. {old_name} kept (--keep-old); terminate it with \
              `arena pods terminate {old_name}` once you're happy."
         );
+        out!(Brief, "{}", out::ok(format!("{} replaced; {old_name} kept (`arena pods terminate {old_name}` once you're happy)", out::bold(&canonical))));
     } else if let Some(why) = blocker {
-        eprintln!(
+        out!(
+            Err,
             "{canonical} is the fresh pod, but {old_name} is NOT terminated: {why}. Once {canonical} is safely \
              on the new pod (`arena proxy apply` routes it there), remove it with `arena pods terminate {old_name}`."
         );
     } else {
-        println!("terminating parked {old_name}…");
+        out!(Detail, "terminating parked {old_name}…");
         if let Err(e) = arena_core::retry::retrying(&policy, || owner.terminate_pod(&src_id)).await {
-            eprintln!("      couldn't terminate {old_name}: {} — remove it manually.", arena_core::lock::explain(&old_name, &e));
+            out!(Err, "      couldn't terminate {old_name}: {} — remove it manually.", arena_core::lock::explain(&old_name, &e));
         } else {
-            println!("done — {canonical} replaced; {old_name} terminated.");
+            out!(Detail, "done — {canonical} replaced; {old_name} terminated.");
+            out!(Brief, "{}", out::ok(format!("{} replaced; {old_name} terminated", out::bold(&canonical))));
             remove_staging_for(&std::env::temp_dir(), &src_id);
         }
     }
     if let Some(l) = crate::pods::datavol::after_line(&carry, &old_name, keep_old) {
-        println!("  {l}");
+        out!(Out, "  {l}");
     }
     Ok(())
 }
