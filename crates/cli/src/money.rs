@@ -242,10 +242,15 @@ pub(crate) async fn balance_report(
         format!("{}\n", serde_json::to_string_pretty(&views)?)
     } else {
         let mut out = balance::render_table(&views, now);
+        if !flags.verbose {
+            // By default the table and what needs action (docs/OUTPUT.md); how to read it and
+            // each account's notes are `-v`'s.
+            out.truncate(out.strip_suffix(balance::TABLE_LEGEND).map_or(out.len(), str::len));
+        }
         if flags.no_live {
             out.push_str("  --no-live: no live call — this is what the fallback estimate says (nothing was written)\n");
         }
-        for n in balance::notes(&views, &policy, now) {
+        for n in balance::notes(&views, &policy, now).iter().filter(|n| flags.verbose || needs_action(n)) {
             out.push_str(&format!("  {n}\n"));
         }
         if flags.verbose {
@@ -257,6 +262,13 @@ pub(crate) async fn balance_report(
     };
     let code = if flags.check { balance::check_exit(&views) } else { 0 };
     Ok(Printed { stdout, stderr, code })
+}
+
+/// A balance note that needs a look — `‼` critical, `⚠` low or overstated, `?` unknown, or a
+/// read that failed (`couldn't`, `failing`, `can't`) — the ones `arena balance` shows without
+/// `-v`. Pure.
+fn needs_action(note: &str) -> bool {
+    note.starts_with(['‼', '⚠', '?']) || ["couldn't", "failing", "can't"].iter().any(|w| note.contains(w))
 }
 
 /// `arena balance set <runpod|vast|shadeform> <USD>`: record the balance read off the provider's
@@ -506,13 +518,20 @@ pub(crate) async fn handle_idle(
     let probing = exec_each_pod(&remote, work, IDLE_TIMEOUT, |_, _, &i, call| probes[i] = read_probe(call));
     let (_, note) = tokio::join!(probing, super::enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT));
     if let Some(n) = note {
-        eprintln!("{n}");
+        arena_core::out!(Err, "{n}");
     }
     let report = idle::report(&pods, &probes, hours, &arena_core::selector::Naming::from_config(cfg));
     if json {
         say(&serde_json::to_string_pretty(&report)?);
     } else {
-        idle::render(&report).lines().for_each(say);
+        // How to read the columns is `-v`'s: by default the table and the verdict.
+        for l in idle::render(&report).lines() {
+            if l == idle::LEGEND {
+                arena_core::out!(Detail, "{l}");
+            } else {
+                say(l);
+            }
+        }
     }
     Ok(())
 }
@@ -772,6 +791,90 @@ mod tests {
         }
     }
 
+    /// Golden (docs/OUTPUT.md): `arena balance` by default is the table and what needs action
+    /// (the ⚠ low runway); how to read it and each account's notes are `-v`'s, with the parts
+    /// behind the numbers, as before.
+    #[tokio::test]
+    async fn balance_output_default_and_verbose() {
+        let mut out = Vec::new();
+        for verbose in [false, true] {
+            let dir = StateDir::new(if verbose { "golden-v" } else { "golden" });
+            let api = FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(32.54, 0.47)).live_ok(Account::Vast, vast_live(136.87));
+            let (_, bal) = ctx(api, Some(&dir));
+            let printed = balance_report(&mixed_fleet(), &dir.cfg(""), &bal, BalanceFlags { verbose, ..Default::default() }, T0).await.unwrap();
+            out.push(printed.stdout.replace(&dir.file().display().to_string(), "STATE"));
+        }
+        assert_eq!(
+            out[0],
+            "\
+ACCOUNT   BALANCE  SOURCE        BURN  RUNWAY  RUNS OUT (UTC)    LEVEL
+runpod     $32.54  live       $0.47/h  ≈2.8d   2026-10-11 09:14  ⚠ low
+vast      $136.87  live             ?  ?       -                 ? unknown
+hetzner  postpaid  postpaid  €0.006/h  -       -                 -
+  ⚠ runpod: ≈2.8d of runway at $0.47/h (≈ 2026-10-11 09:14 UTC), under BALANCE_WARN_HOURS=72 — top up (or enable auto-pay)
+  ? vast: burn unknown: its listing didn't answer, and there is no rate or recent sample to go by — the runway can't be judged
+"
+        );
+        assert_eq!(out[1], "\
+ACCOUNT   BALANCE  SOURCE        BURN  RUNWAY  RUNS OUT (UTC)    LEVEL
+runpod     $32.54  live       $0.47/h  ≈2.8d   2026-10-11 09:14  ⚠ low
+vast      $136.87  live             ?  ?       -                 ? unknown
+hetzner  postpaid  postpaid  €0.006/h  -       -                 -
+burn = the higher of the provider's own rate and this fleet's billing pods there; runway = balance ÷ burn; est. = the last reading − max(billed, metered) spend since (errs low)
+  ⚠ runpod: ≈2.8d of runway at $0.47/h (≈ 2026-10-11 09:14 UTC), under BALANCE_WARN_HOURS=72 — top up (or enable auto-pay)
+  ? vast: burn unknown: its listing didn't answer, and there is no rate or recent sample to go by — the runway can't be judged
+  hetzner: postpaid — billed monthly in arrears, no balance to run out
+runpod:
+  burn: provider $0.47/h · listed $0.25/h — gap $0.22/h, not yet confirmed (the provider's rate lags a create, stop or terminate: it counts once a reading 5m later still shows it) · judged at $0.47/h
+  spendLimit $80.00/h · underBalance false
+  anchor: live $32.54, 0s ago · check anchor: live $32.54, 0s ago
+  billing: not fetched (no usable anchor)
+  last live failure: none
+  samples: 1 (listing-only 1), 1 remembered pod price(s)
+vast:
+  burn: provider ? · listed ? · judged at ?
+  spendLimit ? · underBalance ?
+  anchor: live $136.87, 0s ago · check anchor: live $136.87, 0s ago
+  billing: none (this provider has no billing history API)
+  last live failure: none
+  samples: 0 (listing-only 0), 0 remembered pod price(s)
+hetzner:
+  postpaid €0.006/h — servers only: volumes not counted
+state file: STATE
+");
+    }
+
+    /// Golden: `pods idle` by default is the table and the verdict; the line on how to read the
+    /// columns is `-v`'s.
+    #[tokio::test]
+    async fn idle_output_default_and_verbose() {
+        let pods = vec![pod("devtest-apple", "RUNNING", 0.25, 22001)];
+        let fleet = Fleet { backends: vec![("runpod", Ok(pods))] };
+        let mut out = Vec::new();
+        for verbose in [false, true] {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script("203.0.113.7:22001", [FakeReply::stdout(&Reply { sessions: vec![[198, 51, 100, 7]], ..Default::default() }.render())]);
+            let cmd = PodCmd::Idle { hours: 6.0, json: false, sel: Select::default() };
+            out.push(crate::output_test::rendered(verbose, &[], handle_pods(cmd, &fleet, fake, &cfg(), true)).await);
+        }
+        assert_eq!(
+            out[0],
+            "\
+NAME           PROVIDER    $/H  SSH  OTHER  GPU%  GPU MEM  NEWEST FILE  REPO  UP  VERDICT
+devtest-apple  runpod    $0.25    1      0    0%     0.0G           9h   10h  3d  in use: 1 SSH session
+
+No cohort machine is idle for ≥6h by every measure — nothing to suggest.
+"
+        );
+        assert_eq!(out[1], "\
+NAME           PROVIDER    $/H  SSH  OTHER  GPU%  GPU MEM  NEWEST FILE  REPO  UP  VERDICT
+devtest-apple  runpod    $0.25    1      0    0%     0.0G           9h   10h  3d  in use: 1 SSH session
+SSH/OTHER = live inbound connections (this probe's own left out; `?` = couldn't tell it apart, or too many sockets to read them all) · GPU% = busiest of 3 samples · NEWEST FILE/REPO = age of the newest change (caches, .git and editor servers skipped)
+
+No cohort machine is idle for ≥6h by every measure — nothing to suggest.
+");
+    }
+
     #[tokio::test]
     async fn balance_table_and_json() {
         let dir = StateDir::new("table");
@@ -787,10 +890,11 @@ mod tests {
             "vast      $136.87  live             ?  ?       -                 ? unknown",
             "hetzner  postpaid  postpaid  €0.006/h  -       -                 -",
             "  ⚠ runpod: ≈2.8d of runway at $0.47/h (≈ 2026-10-11 09:14 UTC), under BALANCE_WARN_HOURS=72",
-            "  hetzner: postpaid",
         ] {
             assert!(out.stdout.contains(needle), "`{needle}` missing:\n{}", out.stdout);
         }
+        // By default the table and what needs action: how to read it and the other notes are -v's.
+        assert!(!out.stdout.contains("  hetzner: postpaid") && !out.stdout.contains("burn = the higher of"), "{}", out.stdout);
         // One reading isn't a gap yet: RunPod's rate lags a terminate by minutes (live
         // follow-up 5) — the next one, 10 min on, confirms it.
         assert!(!out.stdout.contains("more than arena lists"), "{}", out.stdout);
@@ -803,6 +907,8 @@ mod tests {
             .await
             .unwrap();
         for needle in [
+            "burn = the higher of",
+            "  hetzner: postpaid",
             "  runpod: RunPod reports $0.22/h more than arena lists",
             "  burn: provider $0.47/h · listed $0.25/h — gap $0.22/h not in the listing",
             "  spendLimit $80.00/h · underBalance false",

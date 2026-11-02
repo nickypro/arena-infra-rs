@@ -696,6 +696,10 @@ fn cells(row: &IdleRow) -> Vec<String> {
     out
 }
 
+/// How to read [`render`]'s columns, the line under its table (`-v`'s in `pods idle`).
+pub const LEGEND: &str = "SSH/OTHER = live inbound connections (this probe's own left out; `?` = couldn't tell it apart, or too many sockets \
+                          to read them all) · GPU% = busiest of 3 samples · NEWEST FILE/REPO = age of the newest change (caches, .git and editor servers skipped)";
+
 /// The report as text: the table, then the candidates with their commands (printed, never
 /// run), or a line saying there are none.
 pub fn render(report: &IdleReport) -> String {
@@ -719,10 +723,8 @@ pub fn render(report: &IdleReport) -> String {
     let rows: Vec<Vec<String>> = report.pods.iter().map(cells).collect();
     let mut out = table::render(&headers, &align, &rows);
     let h = fmt_hours(report.hours);
-    out.push_str(
-        "SSH/OTHER = live inbound connections (this probe's own left out; `?` = couldn't tell it apart, or too many sockets \
-         to read them all) · GPU% = busiest of 3 samples · NEWEST FILE/REPO = age of the newest change (caches, .git and editor servers skipped)\n",
-    );
+    out.push_str(LEGEND);
+    out.push('\n');
     let idle: Vec<&IdleRow> = report.pods.iter().filter(|r| r.is_candidate()).collect();
     if idle.is_empty() {
         out.push_str(&format!("\nNo cohort machine is idle for ≥{h} by every measure — nothing to suggest.\n"));

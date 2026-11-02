@@ -50,6 +50,19 @@ earlier).
   repeated under two jobs. `archive status` shows only the rows that need something, then its
   verdict. `archive sync` prints a line per label and one for big. `cron install` shows each
   changed line as its schedule and command.
+- **Look, money and access** (`config check`/`which`, `teardown --check`, `offers`, `balance`,
+  `spend`, `pods idle`/`jobs`/`test`, `copy-keys`, `keys`, `claude`, `update`): `config check` prints
+  only what's wrong (✗, ‼, `?` rows with their `└` lines) and its `OK — …` line; `teardown --check`
+  the items left or that couldn't be checked, with their fixes, the kept and not-applicable ones a
+  line each, cron and `at` with what they can't see, and the verdict; an
+  `offers <provider>` table leaves out what nobody can buy and folds its notes into one line;
+  `balance` and `spend` keep their tables and only the notes that need a look; `pods idle`'s
+  legend and `pods jobs`' empty tally are `-v`'s; `pods test --deep`/`--keys` counts the pods in
+  place on a terminal; `copy-keys` says in one line what goes to which pods, then a line per pod
+  that failed (with its retry) and a tally (setup's and replace's key step too); `update` shows
+  the changelog's action-needed and config lines and each entry's heading. `-v` prints all of it
+  as before. The verdict lines (`OK — …`, `ALL CLEAR`/`NOT CLEAR: …`), `--json` and the exit
+  statuses are unchanged.
 - For each of these, `-v` prints what it printed before. `--json`, exit codes and the lines the
   dashboard reads are the same.
 

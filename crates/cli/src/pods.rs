@@ -286,8 +286,12 @@ pub(crate) async fn handle_pods_bal(
             // Probe GPU by default for the human table; JSON stays fast/scriptable unless
             // asked. `--no-probe` always wins.
             let (out, warnings) = list_with(provider, &remote, cfg, bal, json, !no_probe && (probe || !json)).await?;
-            warnings.iter().for_each(|w| eprintln!("{w}"));
-            print!("{out}");
+            warnings.iter().for_each(|w| arena_core::out!(Err, "{w}"));
+            if json {
+                print!("{out}");
+            } else {
+                out.lines().for_each(|l| arena_core::out!(Out, "{l}"));
+            }
         }
 
         PodCmd::Create { names, count, add, gpu, gpus, server_type, cloud, max_price, order, disk, volume, image, bootstrap, api_json, reap, owner, skip_proxy, dry_run, keep_trying, retry_mins, retry_secs } => {
@@ -1076,9 +1080,9 @@ pub(crate) async fn handle_pods_bal(
             match kill {
                 Some(id) => {
                     let ask = &mut |what: &str| confirm(yes, what);
-                    jobs::handle_kill(remote, cfg, &sel, &id, ask, &mut |l| println!("{l}")).await?
+                    jobs::handle_kill(remote, cfg, &sel, &id, ask, &mut |l| arena_core::out!(Out, "{l}")).await?
                 }
-                None => jobs::handle_list(remote, cfg, &sel, only.as_ref(), &mut |l| println!("{l}")).await?,
+                None => jobs::handle_list(remote, cfg, &sel, only.as_ref(), &mut |l| arena_core::out!(Out, "{l}")).await?,
             }
         }
         PodCmd::Logs { tail, follow, sel } => {
@@ -1087,7 +1091,7 @@ pub(crate) async fn handle_pods_bal(
             // Ctrl+C is only taken over once following starts; until then it ends the command.
             let stop = || interrupt.wait();
             let tail = usize::try_from(tail).unwrap_or(usize::MAX);
-            jobs::handle_logs(remote, cfg, &sel, job.as_ref(), tail, follow, jobs::FOLLOW_INTERVAL, stop, &mut |l| println!("{l}"))
+            jobs::handle_logs(remote, cfg, &sel, job.as_ref(), tail, follow, jobs::FOLLOW_INTERVAL, stop, &mut |l| arena_core::out!(Out, "{l}"))
                 .await?;
         }
         PodCmd::Reap(cmd) => {
@@ -1118,12 +1122,12 @@ pub(crate) async fn handle_pods_bal(
             let run = ask::AskRun { pick, timeout: Duration::from_secs(timeout), dry_run, question };
             let env = arena_core::ask::AiEnv::from_process();
             let stop = || ask::stop_signals(interrupt.wait());
-            ask::handle_ask(remote, cfg, &sel, run, &env, stop, &mut |l| println!("{l}"), &mut |l| eprintln!("{l}")).await?;
+            ask::handle_ask(remote, cfg, &sel, run, &env, stop, &mut |l| arena_core::out!(Out, "{l}"), &mut |l| arena_core::out!(Err, "{l}")).await?;
         }
         PodCmd::Idle { hours, json, sel } => {
             // Read-only: no confirm. The report prints commands; it never runs them.
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
-            money::handle_idle(provider, remote, cfg, &sel, hours, json, &mut |l| println!("{l}")).await?;
+            money::handle_idle(provider, remote, cfg, &sel, hours, json, &mut |l| arena_core::out!(Out, "{l}")).await?;
         }
         PodCmd::Test { deep: true, sel, json, cohort, .. } => {
             // Read-only: no confirm. Config first: a malformed MIN_DRIVER_VERSION fails before

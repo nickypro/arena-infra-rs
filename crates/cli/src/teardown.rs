@@ -69,7 +69,14 @@ pub(crate) async fn teardown_with(
     bal: &BalanceCtx,
 ) -> Result<()> {
     let report = collect(provider, cfg, volumes, sf_volumes, archive, hetzner, keys, sched, bal).await;
-    print!("{}", render_output(&report, json)?);
+    if json {
+        print!("{}", render_output(&report, json)?);
+    } else {
+        // By default what's wrong and the verdict; `-v` the whole checklist (`Report::lines`).
+        for (to, line) in report.lines() {
+            arena_core::out::emit(to, &line);
+        }
+    }
     exit_status(&report)
 }
 
@@ -149,7 +156,7 @@ async fn collect(
     }
     // A malformed ARCHIVE_KEEP_UNTIL keeps nothing (the archive then shows as remaining).
     let archive_keep_until = arena_core::archive::keep_until_from_config(cfg).unwrap_or_else(|e| {
-        eprintln!("warning: {e} — the archive is judged as if no retention date were set");
+        arena_core::out!(Err, "warning: {e} — the archive is judged as if no retention date were set");
         None
     });
     let inputs = Inputs {
@@ -1042,5 +1049,87 @@ mod tests {
         ] {
             assert!(text.contains(needle), "`{needle}` missing:\n{text}");
         }
+    }
+
+    /// Golden (docs/OUTPUT.md): by default what's wrong — the item left with what's there and its
+    /// fix, the item that couldn't be checked — a line for each one not checked here (no key: it
+    /// could hide something), and the verdict; the clear items, the notes under them and the
+    /// suggested order only with `-v`, which prints the checklist as before. The exit is the same
+    /// either way.
+    #[tokio::test]
+    async fn the_check_by_default_shows_whats_wrong_and_the_verdict() {
+        let dir = tmp("golden");
+        let cfg = cfg(&dir.0);
+        let fleet = Fleet { backends: vec![("runpod", Ok(vec![pod("devtest-bloom", "EXITED")])), ("vast", Err("list pods HTTP 429"))] };
+        let sched = FakeSched::with(&[("crontab -l", ran("")), ("atq", ran(""))]);
+        let bal = BalanceCtx::from_config(&cfg);
+        let run = |verbose| {
+            let (fleet, cfg, sched, bal) = (&fleet, &cfg, &sched, &bal);
+            crate::output_test::rendered(verbose, &[], async move {
+                teardown_with(fleet, cfg, std::future::ready(Probe::Got(vec![])), no_sf_volumes(), std::future::ready(no_archive()), no_images(), None, sched, false, bal).await
+            })
+        };
+        // The schedulers' lines name whoever runs the test (`dev` here, `runner` in CI).
+        let user = current_user();
+        let who = |t: String| t.replace(&format!("({user})"), "(USER)").replace(&format!("{user}'s"), "USER's");
+        let quiet = who(run(false).await);
+        assert_eq!(
+            quiet,
+            "\
+✗ pods (runpod): 1 remains — 0 billing, 1 stopped (a stopped pod keeps its name and still bills its disk)
+      devtest-bloom  id=id-devtest-bloom  EXITED  stopped — still bills its disk
+    note: one command per pod, not `arena pods terminate --all`: that would also reach pods on another provider that aren't this cohort's (or that couldn't be listed)
+    fix:  arena pods terminate id-devtest-bloom
+? pods (vast): couldn't list (provider error: list pods HTTP 429) — NOT known to be empty
+    note: re-run the check (a rate limit or outage passes); if it keeps failing, look in the vast console
+– pods (hetzner): not configured (no HETZNER_API_KEY) — not checked
+– pods (shadeform): not configured (no SHADEFORM_API_KEY) — not checked
+– network volumes (hetzner): Hetzner volumes not read in this test
+– OpenRouter keys: OPENROUTER_PROVISIONING_KEY isn't set — OpenRouter keys not checked
+✓ cron (USER): no arena lines in USER's crontab
+    note: only USER's crontab is read — not root's, and not /etc/cron.d
+✓ at jobs (USER): no pending jobs
+    note: atq shows only USER's jobs unless run as root
+– backup archive (hetzner): no token
+– images (hetzner): Hetzner snapshots not read in this test
+– capacity spares (hetzner): Hetzner spares not read in this test
+NOT CLEAR: 1 item(s) still remain, 1 couldn't be checked.
+Error: teardown check: 1 item(s) remain, 1 couldn't be checked
+"
+        );
+        let (report, _) = check(&fleet, &cfg, Probe::Got(vec![]), None, &sched).await;
+        let loud = run(true).await;
+        let loud_text = who(loud.replace(&dir.0.display().to_string(), "DIR"));
+        assert_eq!(loud_text, "\
+Teardown check for cohort `devtest` (read-only: nothing is changed)
+
+✗ pods (runpod): 1 remains — 0 billing, 1 stopped (a stopped pod keeps its name and still bills its disk)
+      devtest-bloom  id=id-devtest-bloom  EXITED  stopped — still bills its disk
+    note: one command per pod, not `arena pods terminate --all`: that would also reach pods on another provider that aren't this cohort's (or that couldn't be listed)
+    fix:  arena pods terminate id-devtest-bloom
+? pods (vast): couldn't list (provider error: list pods HTTP 429) — NOT known to be empty
+    note: re-run the check (a rate limit or outage passes); if it keeps failing, look in the vast console
+– pods (hetzner): not configured (no HETZNER_API_KEY) — not checked
+– pods (shadeform): not configured (no SHADEFORM_API_KEY) — not checked
+✓ network volumes (runpod): none
+– network volumes (hetzner): Hetzner volumes not read in this test
+– OpenRouter keys: OPENROUTER_PROVISIONING_KEY isn't set — OpenRouter keys not checked
+✓ cron (USER): no arena lines in USER's crontab
+    note: only USER's crontab is read — not root's, and not /etc/cron.d
+✓ at jobs (USER): no pending jobs
+    note: atq shows only USER's jobs unless run as root
+✓ proxy forwards (DIR/proxy.conf): none
+– backup archive (hetzner): no token
+– images (hetzner): Hetzner snapshots not read in this test
+– capacity spares (hetzner): Hetzner spares not read in this test
+✓ left on this box (copies and temp files): none
+
+NOT CLEAR: 1 item(s) still remain, 1 couldn't be checked.
+Suggested order: cron and at first (so nothing recreates a pod), then keys, pods, volumes, and `arena proxy apply` last — then re-run `arena teardown --check`. The backup archive goes only after its retention date (ARCHIVE_KEEP_UNTIL).
+Error: teardown check: 1 item(s) remain, 1 couldn't be checked
+");
+        assert_eq!(loud, format!("{}Error: teardown check: 1 item(s) remain, 1 couldn't be checked\n", report.render()));
+        assert!(loud.starts_with("Teardown check for cohort `devtest` (read-only: nothing is changed)\n\n"), "{loud}");
+        assert!(loud.contains("\nSuggested order: cron and at first"), "{loud}");
     }
 }

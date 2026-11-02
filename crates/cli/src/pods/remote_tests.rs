@@ -3693,6 +3693,90 @@ fn script_deep(fake: &FakeRemote) {
     fake.script(&host(22003), [FakeReply::hang()]);
 }
 
+/// Golden (docs/OUTPUT.md): `pods test --deep` by default says what it will check and how long
+/// it may take, a line for each pod that failed to answer, then the table and the tally; a pod
+/// checked is a line only at `-v` (a terminal counts them in place instead).
+#[tokio::test(start_paused = true)]
+async fn pods_test_deep_output_default_and_verbose() {
+    let mut out = Vec::new();
+    for verbose in [false, true] {
+        let fake = Arc::new(FakeRemote::new());
+        script_deep(&fake);
+        let remote: Arc<dyn Remote> = fake.clone();
+        // Named: no look at this box's disk (the cohort-wide run's), which this test can't fix.
+        let (f, cfg) = (fleet(), deep_cfg());
+        let sel = Selected { pods: f.pods.clone(), named: true };
+        let run = crate::pods::health::handle_deep_test(&f, remote, &cfg, &sel, false, verbose);
+        out.push(crate::output_test::rendered(verbose, &[], run).await);
+    }
+    assert_eq!(
+        out[0],
+        "\
+Deep-checking 3 pod(s) (150s budget each)…
+[3/3] ✗ devtest-cloud: timed out after 150s
+NAME           RESULT  GPUS         DRIVER     CUDA        NET  NOTES
+devtest-apple  pass    2×RTX A4000  580.65.06  13.0  47.1 MB/s
+devtest-bloom  fail    1×RTX A4000  580.65.06  13.0  47.1 MB/s  cuda: RuntimeError: Unexpected error from cudaGetDeviceCount(). Error 999: unknown error
+devtest-cloud  fail    -            -          -             -  ssh: timed out after 150s
+
+1 pass, 0 warn, 2 fail
+same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks every pod on it; a different GPU type draws a different host.
+Error: 2 pod(s) failed the deep check
+"
+    );
+    assert_eq!(out[1], "\
+Deep-checking 3 pod(s) (150s budget each)…
+[1/3] devtest-bloom: checked
+[2/3] devtest-apple: checked
+[3/3] ✗ devtest-cloud: timed out after 150s
+NAME           RESULT  GPUS         DRIVER     CUDA        NET  NOTES
+devtest-apple  pass    2×RTX A4000  580.65.06  13.0  47.1 MB/s
+devtest-bloom  fail    1×RTX A4000  580.65.06  13.0  47.1 MB/s  cuda: RuntimeError: Unexpected error from cudaGetDeviceCount(). Error 999: unknown error
+devtest-cloud  fail    -            -          -             -  ssh: timed out after 150s
+
+── devtest-apple (pass)
+  ✓ nvidia-smi    2×RTX A4000
+  ✓ driver        580.65.06 ≥ 580 (CUDA 13.0)
+  ✓ torch         2.9.0+cu130 (CUDA 13.0)
+  ✓ cuda          available
+  ✓ device_count  2 (matches nvidia-smi)
+  ✓ gpu0          tensor op ok
+  ✓ gpu1          tensor op ok
+  ✓ peer_copy     ok (0→1, 1→0)
+  ✓ nccl          all_reduce ok (2 ranks)
+  ✓ network       47.1 MB/s from huggingface.co
+  ✓ disk          / 107 GB free
+  ✓ load          load 0.8 on 64 CPUs, host up 14d
+  ✓ maintenance   none reported
+  - vscode        not reported
+  - ai_key        not reported (a check from before key checks, or cut off)
+  - hf_token      not reported (a check from before key checks, or cut off)
+
+── devtest-bloom (fail)
+  ✓ nvidia-smi    1×RTX A4000
+  ✓ driver        580.65.06 ≥ 580 (CUDA 13.0)
+  ✓ torch         2.9.0+cu130 (CUDA 13.0)
+  ✗ cuda          RuntimeError: Unexpected error from cudaGetDeviceCount(). Error 999: unknown error
+  - device_count  needs CUDA
+  - peer_copy     needs CUDA
+  - nccl          needs CUDA
+  ✓ network       47.1 MB/s from huggingface.co
+  ✓ disk          / 107 GB free
+  ✓ load          load 1.2 on 64 CPUs
+  ✓ maintenance   none reported
+  - vscode        not reported
+  - ai_key        not reported (a check from before key checks, or cut off)
+  - hf_token      not reported (a check from before key checks, or cut off)
+
+── devtest-cloud (fail)
+  ✗ ssh  timed out after 150s
+
+1 pass, 0 warn, 2 fail
+same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks every pod on it; a different GPU type draws a different host.
+Error: 2 pod(s) failed the deep check
+");
+}
+
 #[tokio::test(start_paused = true)]
 async fn pods_test_deep_reports_pass_fail_and_timeout() {
     use arena_core::health::{deep_check_command, render_report, Status, DEEP_CHECK_TIMEOUT};

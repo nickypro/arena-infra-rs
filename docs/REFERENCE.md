@@ -143,7 +143,7 @@ habit notices, a major for a config or on-pod layout break that needs action; ot
 stamp alone tells releases apart. A newer base is always newer: a 2.0 build updates to 2.1.
 
 ```bash
-arena update --check     # newer release? what changed? (exit 10 = yes, 0 = up to date, 1 = couldn't tell)
+arena update --check     # newer release? what changed? (exit 10 = yes, 0 = up to date, 1 = couldn't tell; -v: each entry in full)
 arena update --dry-run   # also download and check it (provenance included), install nothing
 arena update             # … then ask, and swap both binaries in (--yes to skip the question)
 sudo arena update        # where root runs arena from someone else's ~/.cargo/bin (prod)
@@ -1369,6 +1369,8 @@ body".
 `offers [PROVIDER|all] [--gpu …] [--cloud …] [--max-price …] [--gpus N] [--server-type T] [--order …]
 [-v] [--json]` — read-only. Two views: with no provider, what `create`/`up` would try, on every
 provider at once; with one (`runpod`, `vast`, `hetzner`, `shadeform`) or `all`, everything it sells.
+A catalogue's rows nobody can buy (`not sold now`, `v1: not creatable`) and its notes are `-v`'s:
+by default one line under the table says how many (a note that something failed still shows).
 
 **`arena offers`**: one table over the providers with a key in the config, in the fleet's order
 (RunPod, Vast, Hetzner): PROVIDER, `#` (the order `create`/`up` would try that provider's options in),
@@ -2054,7 +2056,9 @@ keys from `<keys-dir>/<provider>_api_keys.csv` (openai/anthropic/openrouter) **p
 token** — a Hugging Face token (`--hf-token`/`HF_TOKEN`, sets `HF_TOKEN` +
 `HUGGING_FACE_HUB_TOKEN`) for **gated repos** (Llama 3, …) — and each pod's own **Claude Code
 account's token** ([`claude`](#claude-code-accounts-claude); `--cc-token` puts one token on every
-selected pod instead, moving nobody).
+selected pod instead, moving nobody). By default it says in one line what goes to which pods, a line
+per pod that failed with the command that retries it, and a tally; `-v` lists the key sources, what
+else goes on each pod and a line per pod.
 
 Every reachable target also gets the **fleet's ssh**, keys or not: every machine's keys authorized
 (shared, deploy, admin) and the host map in `~/.ssh/config` (pods reach each other with their deploy
@@ -2687,6 +2691,10 @@ file (the page shows it going stale, never "No machines.").
 
 `teardown --check [--json]` — the **end-of-program audit** (read-only; deletes nothing): a `✓ ✗ ? –`
 checklist of what is still billing or scheduled, each with the exact command that cleans it up.
+By default it prints what's wrong — each ✗ and `?` item with what's there, its notes and its fix,
+each kept ◷ and not-checked – item as a line, cron and `at` with what they can't see (root's
+crontab, `/etc/cron.d`) — and the `ALL CLEAR` / `NOT CLEAR` verdict; `-v` adds the ✓ items, the
+balances and the suggested order. The verdict line and the exit status are the same either way.
 
 - Every pod on every configured provider in **any** state (a stopped pod keeps its name and still
   bills its disk; only `TERMINATED` is left out) — fix `pods terminate --all` only when every
@@ -2741,7 +2749,9 @@ or the exit; `--json` carries them as a top-level `balance`.
 ### `balance`
 
 `balance [--json] [--check] [--no-live] [-v]` — money left on each prepaid account, how long it
-lasts and **where the number comes from** (read-only). A balance is
+lasts and **where the number comes from** (read-only). By default the table and the notes that need a
+look (‼ ⚠ `?`, a read that failed); `-v` adds the legend, every account's notes and the parts behind
+each number. A balance is
 
 - **live** — **RunPod** GraphQL `myself { clientBalance currentSpendPerHr spendLimit underBalance }`
   (a field RunPod drops costs that field: the query is retried with `clientBalance` alone), **Vast**
@@ -2843,7 +2853,8 @@ under an hour's credit for them, over the spend limit, `underBalance` — never 
 
 `spend [--by owner|machine] [--since DATE] [--csv|--json]` — what each machine instance cost and
 who it was for, compute and AI, for the organisers (read-only towards the providers; it records
-what it read in the local ledger). `spend assign <machine|instance id|key hash> <owner>` (or
+what it read in the local ledger). The notes under the table (the window, the estimates, RunPod's
+footer) are `-v`'s. `spend assign <machine|instance id|key hash> <owner>` (or
 `--clear`) sets or fixes an owner; `--dry-run` says what it would change and move. A row has one
 owner for its whole life, so assigning a machine that has run up spend under someone else would
 move all of it to the new person: that's refused, saying what would move and what to do instead
@@ -3103,7 +3114,8 @@ in `/root`. `config which` lists all three with where each was found. An explici
 (never prints secret values; exits non-zero if a required key is missing or any key is set to a
 value it can't use — every such key is a ✗ row and is named in the error; ⚠ rows, e.g. a key file
 this user can't read, an admin key that is the shared one, or no `ARENA_START_DATE`, are advice). Copy `config.env.example` to get
-started.
+started. By default it prints only the ✗, ‼ (the report's ⚠) and `?` rows, each with its `└`
+lines, then the `OK — …` line or the error; `-v` prints every section and row.
 
 `config check | set | which` — `check` is the read-only doctor (keys + setup readiness); `config set
 KEY VALUE` writes a key (e.g. an API key) into config.env — or give just `KEY` and **pipe the value

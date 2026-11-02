@@ -40,7 +40,7 @@ pub(crate) async fn handle_ssh_config(
         Ok(Some(block)) => format!("{rendered}\n{block}"),
         Ok(None) => rendered,
         Err(why) => {
-            eprintln!("warning: the backup archive's state isn't readable here ({why}) — its block is left out");
+            arena_core::out!(Err, "warning: the backup archive's state isn't readable here ({why}) — its block is left out");
             rendered
         }
     };
@@ -48,14 +48,14 @@ pub(crate) async fn handle_ssh_config(
     print!("{rendered}");
     if let Some(path) = out {
         std::fs::write(path, &rendered).with_context(|| format!("writing {}", path.display()))?;
-        eprintln!("\n(wrote {})", path.display());
+        arena_core::out!(Err, "\n(wrote {})", path.display());
         // The archive block reads its host key from a file of its own (W7 A9): written beside
         // the config, so handing out both again is the whole re-pin after a rebuild.
         if let Ok(Some(kh)) = archive::laptop_known_hosts_for(cfg) {
             let name = arena_core::archive::render::LAPTOP_KNOWN_HOSTS.trim_start_matches("~/.ssh/");
             let file = path.parent().unwrap_or(std::path::Path::new(".")).join(name);
             std::fs::write(&file, kh).with_context(|| format!("writing {}", file.display()))?;
-            eprintln!("(wrote {} — the archive's pinned host key; it belongs in ~/.ssh/ beside the config)", file.display());
+            arena_core::out!(Err, "(wrote {} — the archive's pinned host key; it belongs in ~/.ssh/ beside the config)", file.display());
         }
     }
     Ok(())
@@ -76,17 +76,17 @@ pub(crate) async fn handle_ssh_config_admin(provider: &dyn Provider, cfg: &Confi
         )
     })?;
     if arena_core::ssh::readable_admin_key(cfg).is_none() {
-        eprintln!("warning: the admin key {key} isn't readable by this user — these entries work only where it is (the proxy box)");
+        arena_core::out!(Err, "warning: the admin key {key} isn't readable by this user — these entries work only where it is (the proxy box)");
     }
     let listing = fleet_listing(provider).await;
     for (p, e) in listing.errors() {
-        eprintln!("warning: {p} failed to list ({e}) — its machines are missing below");
+        arena_core::out!(Err, "warning: {p} failed to list ({e}) — its machines are missing below");
     }
     let rendered = arena_core::sshconfig::render_admin_for(cfg, &listing.pods()).map_err(anyhow::Error::msg)?;
     print!("{rendered}");
     if let Some(path) = out {
         arena_core::sshconfig::write_atomic(path, &rendered, 0o600).map_err(anyhow::Error::msg)?;
-        eprintln!("\n(wrote {}, owner-only)", path.display());
+        arena_core::out!(Err, "\n(wrote {}, owner-only)", path.display());
     }
     Ok(())
 }
@@ -348,7 +348,7 @@ pub(crate) async fn handle_ssh_config_install(
             "add `Include {shown}` as the first line of ~/.ssh/config — the old one is kept as ~/.ssh/config.arena-bak-{stamp}"
         )),
         IncludeAt::Global => {}
-        IncludeAt::InBlock(n) => println!(
+        IncludeAt::InBlock(n) => arena_core::out!(Out, 
             "note: ~/.ssh/config includes {shown} on line {n}, inside a Host/Match block, where it applies to that block only — \
              left as it is: move it above the first Host/Match line yourself"
         ),
@@ -358,21 +358,21 @@ pub(crate) async fn handle_ssh_config_install(
         _ => Some(format!("to keep it current after every pod change: arena config set {} '{shown}'", audience.key())),
     };
     if todo.is_empty() {
-        println!("{shown} is current and ~/.ssh/config includes it — nothing to change.");
+        arena_core::out!(Out, "{shown} is current and ~/.ssh/config includes it — nothing to change.");
         if let Some(h) = &hint {
-            println!("{h}");
+            arena_core::out!(Out, "{h}");
         }
         return Ok(());
     }
     for t in &todo {
-        println!("  · {t}");
+        arena_core::out!(Out, "  · {t}");
     }
     if dry_run {
-        println!("\nPreview only — run without --dry-run to make these changes.");
+        arena_core::out!(Detail, "\nPreview only — run without --dry-run to make these changes.");
         return Ok(());
     }
     if !confirm(yes, "\nMake these changes?")? {
-        println!("aborted.");
+        arena_core::out!(Out, "aborted.");
         return Ok(());
     }
     // What was shown is what gets written: checked again after the prompt — a file edited, or
@@ -386,21 +386,21 @@ pub(crate) async fn handle_ssh_config_install(
     );
     if plan != FilePlan::Unchanged {
         if plan == FilePlan::NotOurs {
-            println!("kept {}", keep_copy(&target, &stamp, &shown)?);
+            arena_core::out!(Out, "kept {}", keep_copy(&target, &stamp, &shown)?);
         }
         sshconfig::write_atomic(&target, &want, 0o600).map_err(anyhow::Error::msg)?;
-        println!("wrote {shown}");
+        arena_core::out!(Out, "wrote {shown}");
     }
     if at == IncludeAt::Absent {
         if config.is_some() {
-            println!("kept {}", keep_copy(&config_path, &stamp, "~/.ssh/config")?);
+            arena_core::out!(Out, "kept {}", keep_copy(&config_path, &stamp, "~/.ssh/config")?);
         }
         let text = sshconfig::with_include_first(config.as_deref().unwrap_or(""), &shown);
         sshconfig::write_atomic(&config_path, &text, mode_or(&config_path, 0o600)).map_err(anyhow::Error::msg)?;
-        println!("~/.ssh/config now starts with `Include {shown}`");
+        arena_core::out!(Out, "~/.ssh/config now starts with `Include {shown}`");
     }
     if let Some(h) = hint {
-        println!("{h}");
+        arena_core::out!(Out, "{h}");
     }
     Ok(())
 }
@@ -426,36 +426,36 @@ pub(crate) fn handle_ssh_config_uninstall(cfg: &Config, audience: Audience, path
     };
     let Some(new) = config.as_deref().and_then(|c| without_include(c, &forms)) else {
         match config.as_deref().and_then(in_block) {
-            Some(n) => println!(
+            Some(n) => arena_core::out!(Out, 
                 "~/.ssh/config includes {shown} only inside a Host/Match block (line {n}) — left as it is: --install never puts \
                  it there, so it's yours"
             ),
-            None => println!("~/.ssh/config doesn't include {shown} — nothing to take out."),
+            None => arena_core::out!(Out, "~/.ssh/config doesn't include {shown} — nothing to take out."),
         }
         return Ok(());
     };
     let stamp = arena_core::restore::stamp(arena_core::snapshot::unix_now());
-    println!("  · take `Include {shown}` out of ~/.ssh/config — the old one is kept as ~/.ssh/config.arena-bak-{stamp}; {shown} stays");
+    arena_core::out!(Out, "  · take `Include {shown}` out of ~/.ssh/config — the old one is kept as ~/.ssh/config.arena-bak-{stamp}; {shown} stays");
     if dry_run {
-        println!("\nPreview only — run without --dry-run to make this change.");
+        arena_core::out!(Detail, "\nPreview only — run without --dry-run to make this change.");
         return Ok(());
     }
     if let Some(n) = in_block(&new) {
-        println!("    (the one inside a Host/Match block, line {n} after this, is left as it is)");
+        arena_core::out!(Out, "    (the one inside a Host/Match block, line {n} after this, is left as it is)");
     }
     if !confirm(yes, "\nMake this change?")? {
-        println!("aborted.");
+        arena_core::out!(Out, "aborted.");
         return Ok(());
     }
     if let Some(why) = ssh_setup_refusal(&home, &config_path, None) {
         anyhow::bail!("not changed: {why}");
     }
     anyhow::ensure!(read_opt(&config_path)? == config, "not changed: ~/.ssh/config changed while asking — nothing written; run it again");
-    println!("kept {}", keep_copy(&config_path, &stamp, "~/.ssh/config")?);
+    arena_core::out!(Out, "kept {}", keep_copy(&config_path, &stamp, "~/.ssh/config")?);
     arena_core::sshconfig::write_atomic(&config_path, &new, mode_or(&config_path, 0o600)).map_err(anyhow::Error::msg)?;
-    println!("took `Include {shown}` out of ~/.ssh/config");
+    arena_core::out!(Out, "took `Include {shown}` out of ~/.ssh/config");
     if audience.path(cfg, home.to_str()).is_some() {
-        println!("note: {} is still set, so pod changes keep rewriting it — take that line out of the config to stop", audience.key());
+        arena_core::out!(Out, "note: {} is still set, so pod changes keep rewriting it — take that line out of the config to stop", audience.key());
     }
     Ok(())
 }
