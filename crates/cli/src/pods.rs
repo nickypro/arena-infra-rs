@@ -621,7 +621,8 @@ pub(crate) async fn handle_pods_bal(
                 if created.is_empty() {
                     anyhow::bail!("no pods were created — nothing to bring up");
                 }
-                out!(Out, "--no-wait: not waiting for them — `arena proxy apply` once they have endpoints");
+                out!(Detail, "\n--no-wait: not polling. Run `arena proxy apply` once endpoints are assigned.");
+                out!(Brief, "--no-wait: `arena proxy apply` once they have SSH endpoints");
                 return Ok(());
             }
 
