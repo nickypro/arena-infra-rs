@@ -566,15 +566,11 @@ struct EndpointMemo {
 /// showed it just before — its SSH port and `runtime.uptime` — where known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Reset {
-    /// When the request went out (unix seconds): the new container started after it.
+    /// When the request went out (unix seconds): the new container started after it, and a
+    /// `startedAt` after it is a start since, which makes the reset moot.
     at: u64,
-    /// The pod's `startedAt` then: a start or restart since makes the reset moot.
-    started_at: Option<u64>,
     /// The old container's public ports (`runtime.ports`, SSH and HTTP alike; empty: none ran).
     old_ports: Vec<u16>,
-    /// The highest uptime the old container showed: before the request, and in any detail
-    /// taken for it since.
-    old_uptime: Option<u64>,
     /// The new container's endpoint, once a lookup showed it. A listing that names none, or
     /// another, is overruled by it, until the listing names this one (review r2, r3).
     new: Option<(String, u16)>,
@@ -583,13 +579,7 @@ struct Reset {
 impl Reset {
     /// The reset sent at `at` of the container `before` (the pod's detail just before). Pure.
     fn of(before: &Value, at: u64) -> Self {
-        Reset {
-            at,
-            started_at: parse_pod(before).started_at,
-            old_ports: public_ports(before),
-            old_uptime: container_uptime(before),
-            new: None,
-        }
+        Reset { at, old_ports: public_ports(before), new: None }
     }
 }
 
@@ -619,23 +609,19 @@ const RESET_WAIT_SECS: u64 = 1800;
 const CLOCK_SLACK: u64 = 5;
 
 /// Whether a reimaged pod's detail (`body`) shows the new container, on positive evidence only
-/// (the API names no container): an endpoint whose uptime fits in the time since the reset and,
-/// as well, is lower than the old container's highest, or comes with other public ports than the
-/// old one's (RunPod gave every port anew on each of 5 resets seen live) — or, where no container
-/// ran before, the uptime alone. Nothing else, however long it takes: no uptime tells nothing,
-/// and a container started seconds before the reimage that got every port back can't be told
-/// from its replacement — the settle wait then times out and says to run `pods setup` (review
-/// r2, r3: better than setup on the container being replaced). Pure.
+/// (the API names no container): an endpoint whose uptime fits in the time since the reset, with
+/// other public ports than the old container's — RunPod gave every port anew, SSH and HTTP, on
+/// each of 5 resets seen live — or, where no container ran before, the uptime alone. An old
+/// container shows its own ports however stale its detail, and no uptime tells nothing. A
+/// replacement that got every port back can't be told from the old container (an uptime that
+/// went down could be an out-of-order answer, review r4): the settle wait then times out and
+/// says to run `pods setup` — better than setup on the container being replaced. Pure.
 fn is_new_container(body: &Value, reset: &Reset, now: u64) -> bool {
     let since = now.saturating_sub(reset.at);
-    if parse_pod(body).ssh_port.is_none() {
+    if parse_pod(body).ssh_port.is_none() || container_uptime(body).is_none_or(|u| u > since + CLOCK_SLACK) {
         return false;
     }
-    let Some(up) = container_uptime(body).filter(|&u| u <= since + CLOCK_SLACK) else { return false };
-    let uptime_went_back = reset.old_uptime.is_some_and(|old| up + CLOCK_SLACK < old);
-    let ports_moved = !reset.old_ports.is_empty() && public_ports(body) != reset.old_ports;
-    let none_ran = reset.old_ports.is_empty() && reset.old_uptime.is_none();
-    uptime_went_back || ports_moved || none_ran
+    reset.old_ports.is_empty() || public_ports(body) != reset.old_ports
 }
 
 /// An endpoint looked up within this long of the pod's start may not be its new one yet.
@@ -681,11 +667,12 @@ where
         m.by_id.retain(|id, _| up.contains(id.as_str()));
         m.lookups.retain(|&t| now.saturating_sub(t) < 60);
         // A reimaged pod that's still coming up may list as not running for a moment: kept
-        // while it's listed at all, for so long, and until it's started again.
+        // while it's listed at all, for so long, and until it's started after the reimage (a
+        // `startedAt` after the request; an older or unchanged one is no news, review r4).
         let starts: HashMap<&str, Option<u64>> = pods.iter().map(|p| (p.id.as_str(), p.started_at)).collect();
         m.resets.retain(|id, r| {
-            let restarted = matches!((starts.get(id.as_str()), r.started_at), (Some(Some(now_start)), Some(then)) if *now_start != then);
-            starts.contains_key(id.as_str()) && !restarted && now.saturating_sub(r.at) < RESET_WAIT_SECS
+            let started_since = matches!(starts.get(id.as_str()), Some(Some(start)) if *start > r.at);
+            starts.contains_key(id.as_str()) && !started_since && now.saturating_sub(r.at) < RESET_WAIT_SECS
         });
     }
     let reset = |p: &Pod| lock().resets.get(&p.id).cloned();
@@ -758,10 +745,7 @@ where
                     if reset.is_some() && !new_container {
                         (detail.ssh_ip, detail.ssh_port) = (None, None);
                     }
-                    // Taken for the old container: its uptime raises the bar a new one must
-                    // come in under.
-                    let old_uptime = if reset.is_some() && !new_container { container_uptime(&body) } else { None };
-                    Ok((detail, new_container, old_uptime))
+                    Ok((detail, new_container))
                 };
                 (i, looked_up.await)
             }));
@@ -771,13 +755,10 @@ where
             let Ok((i, looked_up)) = joined else { continue };
             answered.insert(i);
             match looked_up {
-                Ok((detail, new_container, old_uptime)) => {
-                    if let Some(r) = lock().resets.get_mut(&pods[i].id) {
-                        if let (true, Some(ip), Some(port)) = (new_container, detail.ssh_ip.clone(), detail.ssh_port) {
+                Ok((detail, new_container)) => {
+                    if let (true, Some(ip), Some(port)) = (new_container, detail.ssh_ip.clone(), detail.ssh_port) {
+                        if let Some(r) = lock().resets.get_mut(&pods[i].id) {
                             r.new = Some((ip, port));
-                        }
-                        if let Some(up) = old_uptime {
-                            r.old_uptime = Some(r.old_uptime.map_or(up, |o| o.max(up)));
                         }
                     }
                     let listed_start = pods[i].started_at;
@@ -2322,7 +2303,7 @@ mod tests {
             let m = p.endpoints.lock().unwrap();
             assert!(!m.by_id.contains_key("e"));
             let r = &m.resets["e"];
-            assert_eq!((r.at, r.old_ports.as_slice(), r.old_uptime, r.new.as_ref()), (1_000, &[19984][..], Some(315), None));
+            assert_eq!((r.at, r.old_ports.as_slice(), r.new.as_ref()), (1_000, &[19984][..], None));
         }
         // This provider's own next stop, start, restart or terminate ends the wait.
         assert!(p.stop_pod("e").await.is_err());
