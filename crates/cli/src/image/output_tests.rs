@@ -118,6 +118,30 @@ async fn prune_one() {
     assert_eq!(loud, LOUD_PRUNE.strip_prefix('\n').unwrap(), "-v:\n{loud}");
 }
 
+/// A build VM left behind that won't delete: its reason and the fix (it bills by the hour); the
+/// whole error with `-v`.
+#[tokio::test(start_paused = true)]
+async fn prune_a_build_vm_that_wont_go() {
+    let cloud = || {
+        let c = FakeImageCloud::new(types());
+        ours(&c, 449623170, 3 * DAY, "6f6144f01222");
+        let vm = arena_core::Pod {
+            id: "61234567".into(),
+            name: "devtest-image-261028-0900".into(),
+            provider: "hetzner".into(),
+            created_at: Some(NOW - DAY),
+            ..Default::default()
+        };
+        c.add_server(vm, json!({"arena-image-build": "devtest", "arena-prefix": "devtest"}));
+        *c.fail_server_deletes.lock().unwrap() = 1;
+        c
+    };
+    let cfg = &cfg("HETZNER_IMAGE=arena\n");
+    let (quiet, loud) = both(cloud, |c| async move { prune(c.as_ref(), cfg, 1, false, false, NOW).await }).await;
+    assert_eq!(quiet, QUIET_PRUNE_VM.strip_prefix('\n').unwrap(), "default:\n{quiet}");
+    assert_eq!(loud, LOUD_PRUNE_VM.strip_prefix('\n').unwrap(), "-v:\n{loud}");
+}
+
 /// The dry run: one line with what it makes and costs; the plan is `-v`'s.
 #[tokio::test(start_paused = true)]
 async fn build_dry_run() {
@@ -206,6 +230,22 @@ const LOUD_PRUNE: &str = r#"
 Delete 1 image(s) and 0 build VM(s)?
 Proceed? [y/N] y
 ✓ deleted image 449600001
+"#;
+
+const QUIET_PRUNE_VM: &str = r#"
+  delete  build VM devtest-image-261028-0900 (id 61234567) — left behind by a bake
+Delete 1 build VM(s)? [y/N] y
+✗ build VM devtest-image-261028-0900 (id 61234567): hetzner delete server — it bills by the hour (retry: arena image prune, or delete server 61234567 in the Hetzner console)
+Error: 1 delete(s) failed
+"#;
+
+const LOUD_PRUNE_VM: &str = r#"
+  keep    449623170 (devtest-image-449623170, built 2026-10-26, 3d old, commit 3eed962b9bd8)
+  delete  build VM devtest-image-261028-0900 (id 61234567) — left behind by a bake
+Delete 0 image(s) and 1 build VM(s)?
+Proceed? [y/N] y
+✗ build VM devtest-image-261028-0900 (id 61234567): provider error: hetzner delete server: 503 unavailable
+Error: 1 delete(s) failed
 "#;
 
 const QUIET_BUILD_DRY: &str = r#"
