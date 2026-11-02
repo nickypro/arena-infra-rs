@@ -171,6 +171,8 @@ pub(crate) async fn copy_home_on(remote: Arc<dyn Remote>, cfg: &Config, owner: &
         n => format!("; {n} file{} of {to}'s own moved aside to ~/{}/", if n == 1 { "" } else { "s" }, arena_core::replica::KEPT_DIR),
     };
     let brief = format!("{}'s home onto {} (deletions mirrored{aside}; nothing renamed)", out::bold(from), out::bold(to));
+    // What the copy leaves on `from` (review r3): retiring it later loses that.
+    out!(Brief, "{}", crate::pods::replace::left_behind_line(from, true));
     if dry_run {
         for r in busy.iter().chain(floor.iter()).chain(in_the_way.iter()) {
             print_would_refuse(r);
@@ -235,7 +237,10 @@ pub(crate) async fn copy_home_on(remote: Arc<dyn Remote>, cfg: &Config, owner: &
         }
     }
     out!(Detail, "  Once they're settled: `arena pods terminate {from}` (back it up first: `arena pods backup {from}`).");
-    out!(Brief, "Next: point them at {to}; once they're settled, `arena pods backup {from}` then `arena pods terminate {from}`");
+    out!(
+        Brief,
+        "Next: point them at {to}; once they're settled, `arena pods backup {from}` then `arena pods terminate {from}` (what wasn't copied goes with it)"
+    );
     Ok(())
 }
 

@@ -213,7 +213,7 @@ const TERMINATE_LOCKED_QUIET: &str = r#"
 TERMINATE devtest-alpha, devtest-bravo (irreversible).
 Type 2 to proceed (anything else aborts): 2
 [terminated] devtest-alpha
-[devtest-bravo] FAILED terminate: locked (retry: arena pods terminate devtest-bravo --unlock)
+[devtest-bravo] FAILED terminate: locked (retry: arena pods terminate devtest-bravo --unlock --skip-proxy)
 terminated 1 of 2
 Error: 1 pod(s) failed to terminate
 "#;
@@ -692,4 +692,50 @@ async fn a_started_vm_the_proxy_doesnt_route_is_not_ready() {
         "[started] devtest-delta\nwarning: the proxy doesn't route devtest-delta to the new endpoint yet (listed without one) — run `arena proxy apply` \
          once it answers\n[devtest-delta] FAILED proxy: its forward isn't routed to it yet (retry: arena proxy apply, once it answers)\n"
     );
+}
+
+/// Review r3: a failure's retry is the command as this run was asked — a terminate keeps
+/// `--revoke-key`, `--delete-volumes`, `--unlock` and `--skip-proxy` (dropped, a volume would
+/// bill on and a key keep working), a stop its `--wipe-ok`, a start its switches.
+#[test]
+fn retries_keep_the_runs_switches() {
+    use crate::pods::lifecycle::{start_retry, stop_retry, terminate_retry};
+    let all = TerminateOpts { unlock: true, revoke_key: true, delete_volumes: true, volumes: None, skip_proxy: true, dry_run: false, yes: true };
+    assert_eq!(terminate_retry("devtest-a", all), "arena pods terminate devtest-a --unlock --revoke-key --delete-volumes --skip-proxy");
+    assert_eq!(terminate_retry("devtest-a", topts(false, false, false, true)), "arena pods terminate devtest-a");
+    assert_eq!(stop_retry("devtest-a", true), "arena pods stop devtest-a --wipe-ok");
+    assert_eq!(stop_retry("devtest-a", false), "arena pods stop devtest-a");
+    let opts = RestartOpts { no_setup: true, skip_proxy: true, ..Default::default() };
+    assert_eq!(start_retry("devtest-a", opts), "arena pods start devtest-a --no-setup --skip-proxy");
+    assert_eq!(start_retry("devtest-a", RestartOpts::default()), "arena pods start devtest-a");
+}
+
+/// Review r3: a terminate among several that fails says the retry with the run's own switches.
+#[tokio::test]
+async fn a_failed_terminate_among_several_retries_with_its_switches() {
+    let dir = tmpdir("out-terminate-retry");
+    let cfg = cfg(&dir.0);
+    let mut f = fleet();
+    f.server_locked.lock().unwrap().push("r-bravo".into());
+    f.fail_unlock.push("r-bravo");
+    let mut opts = topts(false, true, false, true);
+    opts.unlock = true;
+    let got = rendered(false, &[], handle_terminate(&f, &cfg, &no_api(&dir.0.join("none.csv")), Some(&["alpha", "bravo"]), opts)).await;
+    assert!(
+        got.contains("[devtest-bravo] FAILED terminate: locked since it was listed, and unlocking failed (provider error (HTTP 500)) (retry: arena pods terminate devtest-bravo --unlock --skip-proxy)"),
+        "{got}"
+    );
+}
+
+/// Review r3: with --skip-proxy a pod set up again isn't READY while its proxy port may still lead
+/// to its old endpoint — it says what's left to do instead.
+#[tokio::test]
+async fn a_restart_that_skips_the_proxy_is_set_up_not_ready() {
+    let dir = tmpdir("out-restart-skip");
+    let cfg = cfg(&dir.0);
+    let f = fleet();
+    let opts = RestartOpts { wipe_ok: true, skip_proxy: true, yes: true, ..Default::default() };
+    let got = rendered(false, &[], handle_restart(&f, Arc::new(FakeRemote::new()), &cfg, "alpha", opts, FAST, &dir.0.display().to_string())).await;
+    assert!(got.ends_with("[devtest-alpha] set up · proxy not synced (--skip-proxy): run `arena proxy apply`\n"), "{got}");
+    assert!(!got.contains("READY"), "{got}");
 }

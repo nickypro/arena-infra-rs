@@ -996,10 +996,11 @@ Proceed? [y/N] y
 "#;
 
 const COPY_HOME_QUIET: &str = r#"
+Not copied: caches, venvs and installed packages (site-packages, ~/.local/lib, uv), HF caches, .ssh, .vscode-server, shell rc files and history — what's only there stays on devtest-alpha only
 Copy devtest-alpha's home onto devtest-bravo (deletions mirrored; nothing renamed)? [y/N] y
 [devtest-bravo] copy from devtest-alpha…
 ✓ devtest-bravo has devtest-alpha's home (verified on devtest-bravo itself). devtest-alpha is untouched.
-Next: point them at devtest-bravo; once they're settled, `arena pods backup devtest-alpha` then `arena pods terminate devtest-alpha`
+Next: point them at devtest-bravo; once they're settled, `arena pods backup devtest-alpha` then `arena pods terminate devtest-alpha` (what wasn't copied goes with it)
 "#;
 
 const COPY_HOME_LOUD: &str = r#"

@@ -593,7 +593,7 @@ pub(crate) async fn handle_start(
             }
             Err(e) => {
                 out!(ErrDetail, "[FAILED] {}: {}", p.name, arena_core::lock::explain(&p.name, &e));
-                out!(ErrBrief, "{}", failed_on(&p.name, "start", &e, &format!("arena pods start {}", p.name)));
+                out!(ErrBrief, "{}", failed_on(&p.name, "start", &e, &start_retry(&p.name, opts)));
                 failed.push(p.name.clone());
             }
         }
@@ -654,6 +654,35 @@ fn start_brief(provider: &dyn Provider, pods: &[arena_core::Pod], setup: bool) -
 pub(crate) fn ready_line(name: &str, after: Duration, note: Option<&str>) -> String {
     let note = note.map(|n| format!(" · {n}")).unwrap_or_default();
     format!("[{}] {} after {}{note}", out::bold(name), out::green(out::bold("READY")), arena_core::pipeline::fmt_elapsed(after))
+}
+
+/// The command that terminates `name` again as this run would (review r3: a retry that dropped
+/// `--delete-volumes` or `--revoke-key` would leave a volume billing or a key working). Pure.
+pub(crate) fn terminate_retry(name: &str, opts: TerminateOpts<'_>) -> String {
+    let mut cmd = format!("arena pods terminate {name}");
+    for (on, flag) in [(opts.unlock, "--unlock"), (opts.revoke_key, "--revoke-key"), (opts.delete_volumes, "--delete-volumes"), (opts.skip_proxy, "--skip-proxy")] {
+        if on {
+            cmd.push_str(&format!(" {flag}"));
+        }
+    }
+    cmd
+}
+
+/// The command that stops `name` again as this run would: with `--wipe-ok` when it was given
+/// (without, the same stop would be refused). Pure.
+pub(crate) fn stop_retry(name: &str, wipe_ok: bool) -> String {
+    format!("arena pods stop {name}{}", if wipe_ok { " --wipe-ok" } else { "" })
+}
+
+/// The command that starts `name` again as this run would (its switches kept). Pure.
+pub(crate) fn start_retry(name: &str, opts: RestartOpts) -> String {
+    let mut cmd = format!("arena pods start {name}");
+    for (on, flag) in [(opts.no_setup, "--no-setup"), (opts.skip_proxy, "--skip-proxy")] {
+        if on {
+            cmd.push_str(&format!(" {flag}"));
+        }
+    }
+    cmd
 }
 
 /// What a terminate does, in a line, for the default output's dry run and question: every pod
@@ -948,7 +977,7 @@ pub(crate) async fn handle_terminate(
     // The fleet provider routes each terminate (and unlock) to the backend that owns the pod.
     let mut gone: Vec<&arena_core::Pod> = Vec::new();
     for p in &pods {
-        let retry = format!("arena pods terminate {}{}", p.name, if unlock { " --unlock" } else { "" });
+        let retry = terminate_retry(&p.name, opts);
         let mut unlocked = false;
         if unlock && arena_core::lock::is_locked(p) {
             if let Err(e) = arena_core::retry::retrying(&policy, || provider.set_locked(&p.id, false)).await {
@@ -999,7 +1028,7 @@ pub(crate) async fn handle_terminate(
             }
             Err((mut why, brief_why)) => {
                 // A lock is lifted by --unlock: the retry says so.
-                let retry = if brief_why == "locked" && !unlock { format!("{retry} --unlock") } else { retry.clone() };
+                let retry = if brief_why == "locked" && !unlock { terminate_retry(&p.name, TerminateOpts { unlock: true, ..opts }) } else { retry.clone() };
                 let mut brief_line = failed_line(&p.name, "terminate", &brief_why, &retry);
                 if unlocked {
                     why.push_str(&format!(
@@ -1686,9 +1715,15 @@ async fn come_back(
         no_setup_note(pods, how.reset);
     } else {
         // Each pod back and set up, as `up` ends one: the dashboard's runs panel reads it as the
-        // pod's end (a `start` from there). Not with --no-setup: a bare image isn't ready.
+        // pod's end (a `start` from there). Not with --no-setup: a bare image isn't ready. Nor,
+        // with --skip-proxy, one whose proxy port still leads to its old endpoint: set up, with
+        // what's left to do (review r3).
         for name in &back {
-            out!(Brief, "{}", ready_line(name, since.elapsed(), None));
+            if !how.sync && proxied_name(cfg, name) {
+                out!(Brief, "[{}] set up · proxy not synced (--skip-proxy): run `arena proxy apply`", out::bold(name));
+            } else {
+                out!(Brief, "{}", ready_line(name, since.elapsed(), None));
+            }
         }
     }
     if problems.is_empty() {

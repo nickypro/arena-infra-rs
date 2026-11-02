@@ -19,7 +19,7 @@ use crate::pods::branch::{handle_init_branches, set_branch_and_init, SetBranchRu
 use crate::pods::copy::handle_copy;
 use crate::pods::create::{check_create_body, create_extra, create_policy_line, create_with_retry, hand_keys_over, image_flag, owner_plan, pin_vm_image, plan_create, print_create_body, replacement_rounds, resolve_explicit_names, resolve_want, sizing_flags, spec_with_overrides, warn_no_volume, CreateFailed, Made, RecordingProvider, SpecOverrides, NO_STREAM};
 use crate::pods::health::{handle_deep_test, handle_keys_test};
-use crate::pods::lifecycle::{disk_brief, disk_fate, failed_on, handle_reimage, handle_restart, handle_start, handle_terminate, names_of, no_stop_left, no_stop_refusal, repo_sites, split_no_stop, stop_lines, wipe_refusal, DiskOp, RestartOpts, TerminateOpts, RESTART_SETTLE};
+use crate::pods::lifecycle::{disk_brief, disk_fate, failed_on, handle_reimage, handle_restart, handle_start, handle_terminate, names_of, no_stop_left, no_stop_refusal, repo_sites, split_no_stop, stop_lines, stop_retry, wipe_refusal, DiskOp, RestartOpts, TerminateOpts, RESTART_SETTLE};
 use crate::pods::list::list_with;
 use crate::pods::capable::CreateFlags;
 use crate::pods::lock::{handle_lock, print_would_refuse};
@@ -827,7 +827,7 @@ pub(crate) async fn handle_pods_bal(
                     }
                     Err(e) => {
                         out!(ErrDetail, "[FAILED] {}: {}", p.name, arena_core::lock::explain(&p.name, &e));
-                        out!(ErrBrief, "{}", failed_on(&p.name, "stop", &e, &format!("arena pods stop {}", p.name)));
+                        out!(ErrBrief, "{}", failed_on(&p.name, "stop", &e, &stop_retry(&p.name, wipe_ok)));
                     }
                 }
             }
