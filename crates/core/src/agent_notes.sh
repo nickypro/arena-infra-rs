@@ -2,8 +2,9 @@
 # machine's Python facts in Claude Code's user memory (~/.claude/CLAUDE.md) and Codex's
 # (~/.codex/AGENTS.md), between the markers: the block is replaced, or appended once, and
 # everything else in the file stays as it was (an unchanged file isn't written at all; a changed
-# one is rewritten in place, so its mode, owner and links stay). Run by `sh -c`, whatever the
-# login shell. The @…@ placeholders are filled in by Rust; the block's text is Rust's too.
+# one is replaced in one step, with its mode and owner, and through a link the file it points at).
+# Run by `sh -c`, whatever the login shell. The @…@ placeholders are filled in by Rust; the
+# block's text is Rust's too.
 @LINK_UV@
 E=
 for c in @ENVS@; do
@@ -15,6 +16,10 @@ if [ -z "$E" ]; then
     exit 0
 fi
 R=@REPO@
+# A temp file a run cut short (its ssh dropped) would be left beside the participant's file.
+t=
+trap 'rm -f "$t"' EXIT
+trap 'rm -f "$t"; exit 1' HUP INT TERM
 if command -v uv >/dev/null 2>&1; then I=@INSTALL_UV@; else I=@INSTALL_PIP@; fi
 B=$(printf '%s\n' @BLOCK@)
 arena_notes_write() {
@@ -24,7 +29,9 @@ arena_notes_write() {
         printf '%s\n' "$B" > "$f"
         return
     fi
-    t=$(mktemp "$f.arena-XXXXXX") || return 1
+    # Through a link, the file it points at is rewritten (the link stays a link).
+    if [ -L "$f" ]; then r=$(readlink -f "$f") || return 1; else r=$f; fi
+    t=$(mktemp "$r.arena-XXXXXX") || return 1
     # The first marked block becomes the new one, any later one goes (one block, however many
     # runs wrote one); none: the block goes at the end, after a blank line. A BEGIN line with no
     # END after it leaves the file alone: where the participant's text starts again is unknown.
@@ -37,20 +44,19 @@ arena_notes_write() {
         END {
             if (inb) exit 3
             if (!done) { if (n && last != "") print ""; print blk }
-        }' "$f" > "$t"
+        }' "$r" > "$t"
     s=$?
     if [ "$s" = 3 ]; then
-        rm -f "$t"
         echo "@WARN@$f has a BEGIN arena-infra python line with no END line after it - left as it is"
-        return 0
+        s=0
+    elif [ "$s" = 0 ] && ! cmp -s "$t" "$r"; then
+        # The new text takes the file's place in one step (a run cut short leaves the old one
+        # whole), with its mode and owner.
+        chmod --reference="$r" "$t" && { chown --reference="$r" "$t" 2>/dev/null || true; } && mv -f "$t" "$r"
+        s=$?
     fi
-    if [ "$s" != 0 ] || cmp -s "$t" "$f"; then
-        rm -f "$t"
-        return "$s"
-    fi
-    cat "$t" > "$f"
-    s=$?
     rm -f "$t"
+    t=
     return "$s"
 }
 rc=0

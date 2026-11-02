@@ -206,10 +206,10 @@ fn stopgap(env: &str) -> String {
 /// The notes command on a scratch machine, under sh, dash and bash (it runs `sh -c` whatever the
 /// login shell; the inner shell is swapped to cover each) and from a zsh login shell: the env
 /// found where each kind of machine has it, the block written into both files, the stopgap's block
-/// replaced in place with the participant's text around it kept byte for byte, a second run
+/// replaced where it was with the participant's text around it kept byte for byte, a second run
 /// changing nothing (not even the file's time), the file's mode kept, no file / an empty file /
-/// a file of only the block, two blocks made one, a BEGIN with no END left alone, and no env: a
-/// warning and nothing written. uv and uvx are linked into /usr/local/bin where nothing is there,
+/// a file of only the block, two blocks made one, a file that's a link (the link kept), a BEGIN
+/// with no END left alone, and no env: a warning and nothing written. No temp file is left. uv and uvx are linked into /usr/local/bin where nothing is there,
 /// and a link or a file already there is kept.
 #[test]
 fn the_notes_land_between_the_markers_and_keep_the_rest() {
@@ -264,12 +264,25 @@ fn the_notes_land_between_the_markers_and_keep_the_rest() {
             ok(&m.run(outer, &pod, false));
             assert_eq!(m.read(codex), end, "{inner}: idempotent from {start:?}");
         }
+        // A file that's a link (to a dotfiles checkout, say): the file it points at gets the
+        // block, and the link stays a link.
+        m.put("dotfiles/AGENTS.md", "from my dotfiles\n");
+        std::fs::remove_file(m.path(codex)).unwrap();
+        std::os::unix::fs::symlink(m.path("dotfiles/AGENTS.md"), m.path(codex)).unwrap();
+        ok(&m.run(outer, &pod, false));
+        assert!(std::fs::symlink_metadata(m.path(codex)).unwrap().file_type().is_symlink(), "{inner}");
+        assert_eq!(m.read("dotfiles/AGENTS.md"), format!("from my dotfiles\n\n{want}"), "{inner}");
+        std::fs::remove_file(m.path(codex)).unwrap();
         // A BEGIN line with no END: left as it is, and said.
         let open = format!("mine\n{BEGIN}\nhalf a block\n");
         m.put(codex, &open);
         let said = ok(&m.run(outer, &pod, false));
         assert_eq!(m.read(codex), open, "{inner}");
         assert!(said.contains("arena-warning: ") && said.contains("AGENTS.md has a BEGIN arena-infra python line with no END"), "{said}");
+        for d in ["home/.claude", "home/.codex", "dotfiles"] {
+            let left: Vec<_> = std::fs::read_dir(m.path(d)).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+            assert!(left.iter().all(|n| !n.to_string_lossy().contains(".arena-")), "{inner}: {d}: {left:?}");
+        }
 
         // A Hetzner VM: the repo's venv (an env at /opt too is not the one), uv in ~/.local/bin.
         let m = Machine::new(&format!("vm-{inner}-{outer}"));
