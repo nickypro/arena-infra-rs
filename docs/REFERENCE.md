@@ -47,6 +47,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [`pods cp` (`pods copy`)](#pods-cp-pods-copy)
   - [`keys` (OpenRouter)](#keys-openrouter)
   - [Claude Code accounts (`claude`)](#claude-code-accounts-claude)
+  - [clods: every account on each pod (`clods`)](#clods-every-account-on-each-pod-clods)
 - [Running commands and checking health](#running-commands-and-checking-health)
   - [`pods run` / `pods test`](#pods-run--pods-test)
   - [Background jobs: `run --background`, `jobs`, `logs`](#background-jobs-run---background-jobs-logs)
@@ -307,7 +308,7 @@ Notes / sharp edges to know:
 
 Any key in `config.env` but the file-only `REAP_*` ones can be overridden by an **environment
 variable of the same name** (env wins; it can't introduce brand-new keys — except a short allowlist such as
-`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `DISCARD_MAX_GB`, `CONTROL_MIN_FREE_GB`, `NEAR`/`NEAR_MAX_EXTRA_PCT`, `CLAUDE_TOKENS_FILE` and the `ASK_<AI>_MODEL`/`_EFFORT` keys, e.g. `RUNPOD_API=v1 arena pods
+`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `DISCARD_MAX_GB`, `CONTROL_MIN_FREE_GB`, `NEAR`/`NEAR_MAX_EXTRA_PCT`, `CLAUDE_TOKENS_FILE`, `CLODS_DIR` and the `ASK_<AI>_MODEL`/`_EFFORT` keys, e.g. `RUNPOD_API=v1 arena pods
 list` to use the retiring RunPod v1 backend for one command, until 2026-11-16; v2 is the default). This is how you point at an SSH
 key the current user can actually read, without editing the shared, read-only prod
 config — e.g. when the dashboard's metrics show `ssh connect failed … key unreadable`
@@ -1937,9 +1938,10 @@ and it says so.
 It also **auto-distributes per-host API keys** if any `keys/*_api_keys.csv` exist (reporting what it
 added, or that none are set up), and puts each pod on its own **Claude Code account** with that
 account's token ([`claude`](#claude-code-accounts-claude): the least-loaded account for a pod with
-none; `--cc-token` puts one token on every pod instead) — to exactly the pods that just provisioned
-successfully, never one that failed or timed out — so a `setup` (or `up`, per pod) makes pods fully
-ready.
+none; `--cc-token` puts one token on every pod instead) and, with `CLODS_DIR` set, every
+[clods](#clods-every-account-on-each-pod-clods) account (`[NAME] claude: clods, 3 accounts`;
+`--clods-only` does just that) — to exactly the pods that just provisioned successfully, never one
+that failed or timed out — so a `setup` (or `up`, per pod) makes pods fully ready.
 
 A pod that refuses our key (`Permission denied (publickey)`) on a provider with a key API (Vast)
 gets the cohort keys re-attached to it and is set up again (up to 3×, 20s apart); elsewhere the
@@ -2414,6 +2416,50 @@ in its menu moves it (`arena claude assign` in the runs panel: a number, an emai
 
 **Usage per account** isn't shown: a `claude setup-token` token is inference-only, and Anthropic
 publishes no usage API for subscription tokens (Claude Code's own `/usage` needs a full login).
+
+### clods: every account on each pod (`clods`)
+
+[clods](../clods/README.md) (`clods/` in this repo) gives a machine one Claude Code profile per
+account (`~/.clods/profiles/claudeN`; `CLAUDE_CONFIG_DIR` picks it, the token is in its
+`settings.json`), `clodN` and `clods` in its shells, and a default for plain `claude`. With
+**`CLODS_DIR`** set to the folder holding clods' `tokens` (e.g. `~/.clods`; a path, so the
+environment can set it for one run), every pod that `pods setup`, `up`, `replace`, `migrate copy`,
+`start`/`restart`/`reimage` or the dashboard sets up gets **every account**, and a default by
+spread: the next account in turn (a counter in the state dir, `clods-spread`), unless the pod has a
+default already. So a re-push moves nobody and changes nothing, and an account taken out of
+`tokens` loses its token on every pod it reaches (its history stays; a pod whose default it was
+gets the next turn). Unset, or no `tokens` there: nothing happens and nothing is said.
+`pods setup --clods-only [pods]` pushes to running pods and does nothing else (confirms first;
+`--dry-run` says what would go).
+
+**How it gets there.** The binary carries clods' scripts, built from `clods/`. Per pod, one `bash
+-s` over arena's own SSH (any provider) with an installer on its stdin: the scripts and the tokens
+file as it is, then clods' `setup.sh --prune --keep-default --summary --spread T`. What a pod gets is
+clods' call, as on any machine clods sets up: the profiles (0600 files in 0700 folders), the
+numbering, the hook in `~/.zshrc` and `~/.bashrc`. The tokens are never in a command line, a log or
+a file here; on the pod they're only in a 0600 file in a 0700 temp dir, which the installer removes
+when it ends. The tokens file must be owner-only, as `CLAUDE_TOKENS_FILE` must. If other users can
+read it, it doesn't parse, or it holds no account, setup prints a warning and pushes nothing. Each
+push has 90 s.
+
+**What it prints.** A line per pod, `[apple] claude: clods, 3 accounts` (`-v`: `…, default claude2
+(unchanged)`); in `up`, `clods ✓` on the READY line. A push that fails is a warning with its fix,
+`‼ [apple] claude: clods not pushed — exit 1: setup.sh: needs python3 … (retry: arena pods setup
+--clods-only apple)`. It never fails a setup, replaces a pod or marks its machine bad (`up`'s READY
+line: `clods ‼`). Only `--clods-only`, which does nothing else, fails the command for it. `pods test
+--course` reports the profile the pod's login shell is on (`clods profile 2, token …`): its default.
+
+**clods or `arena claude`?** `arena claude` gives each machine one account and only its token,
+exported in the shell rc files: spread by person, and a leaked token is one rotation. clods gives
+every machine every account as profiles: a participant at one account's limit switches with
+`clod3`, and anyone who is root on the pod can read every token. Both can be on. On a pod with a
+clods default, the profile's token wins over the exported one (a settings file's `env` beats the
+shell's).
+
+**A local clods folder.** `arena clods install [DIR]` (default `CLODS_DIR`, else `~/.clods`) writes
+the scripts this build carries into it where they differ (`--dry-run` says which), and never
+touches `tokens`, `fleet` or `profiles/`. That's how a box's own clods gets updates; `DIR/setup.sh`
+then sets that box's profiles up again, when they should change.
 
 ## Running commands and checking health
 

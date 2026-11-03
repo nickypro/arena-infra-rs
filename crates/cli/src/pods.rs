@@ -507,6 +507,7 @@ pub(crate) async fn handle_pods_bal(
                 check.then_some(check_attempts),
                 keys.is_some() || !mints.mint.is_empty(),
                 matches!(claude_line, Ok(Some(_))),
+                !no_setup && arena_core::clods::Clods::from_config(cfg).is_some(),
                 lock,
                 (endpoint_mins, check_attempts),
             );
@@ -661,6 +662,9 @@ pub(crate) async fn handle_pods_bal(
                 Ok(None) => {}
                 Err(e) => out!(Err, "{}", arena_core::out::fail(format!("Claude Code: {e} — skipped (fix it, then `arena claude push`)"))),
             }
+            if let Some(line) = crate::clods::plan_line(cfg).filter(|_| setup.is_some()) {
+                out!(Detail, "{line}");
+            }
             let run = up::UpRun {
                 provider,
                 remote: remote.clone(),
@@ -676,6 +680,7 @@ pub(crate) async fn handle_pods_bal(
                 keys,
                 // With setup, always: with no pool it only delivers a pending removal (review r3).
                 claude: !no_setup,
+                clods: !no_setup && arena_core::clods::Clods::from_config(cfg).is_some(),
                 lock,
                 retry_bad_hosts,
                 balance: Some(bal),
@@ -988,6 +993,34 @@ pub(crate) async fn handle_pods_bal(
             refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             handle_full_backup(remote, cfg, &sel, no_pull, message, dry_run, yes, RSYNC).await?;
         }
+        PodCmd::Setup { sel, dry_run, clods_only: true, .. } => {
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let names: Vec<&str> = sel.pods.iter().map(|p| p.name.as_str()).collect();
+            // What it would push, before the prompt: an unconfigured clods fails first.
+            let accounts = arena_core::clods::Clods::from_config(cfg).and_then(|c| c.read().ok()).map(|t| t.accounts.len() as u32);
+            if !dry_run
+                && !sel.pods.is_empty()
+                && accounts.is_some()
+                && !confirm_brief(
+                    yes,
+                    &format!(
+                        "Will push clods ({}, defaults spread) to {} pod(s), nothing else: {}",
+                        arena_core::clods::accounts(accounts.unwrap_or(0)),
+                        sel.pods.len(),
+                        sel.names()
+                    ),
+                    &format!(
+                        "Push clods ({}) to {}, nothing else?",
+                        arena_core::clods::accounts(accounts.unwrap_or(0)),
+                        crate::pods::setup::all_names(&names)
+                    ),
+                )?
+            {
+                out!(Out, "aborted.");
+                return Ok(());
+            }
+            crate::clods::handle_clods_only(remote.as_ref(), cfg, !dry_run, &sel).await?;
+        }
         PodCmd::Setup { sel, dry_run, notes_only: true, .. } => {
             // Its settings first: a config without the repo's path fails before anything else.
             let notes = arena_core::agent_notes::AgentNotes::from_config(cfg)?;
@@ -1011,7 +1044,7 @@ pub(crate) async fn handle_pods_bal(
             }
             crate::pods::setup::handle_notes(remote, cfg, &notes, !dry_run, &sel).await?;
         }
-        PodCmd::Setup { sel, dry_run, force, hf_token, cc_token, zsh_install, no_vscode, timeout, notes_only: false } => {
+        PodCmd::Setup { sel, dry_run, force, hf_token, cc_token, zsh_install, no_vscode, timeout, notes_only: false, clods_only: false } => {
             // Budgets first: a malformed SETUP_TIMEOUT_SECS fails before anything else.
             let timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, timeout)?;
             // Likewise the VS Code warm-up's settings (VSCODE_PREINSTALL / VSCODE_EXTENSIONS).

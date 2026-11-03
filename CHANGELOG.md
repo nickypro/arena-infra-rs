@@ -19,6 +19,29 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-03 · arena 2.18: setup puts every clods account on each pod (`CLODS_DIR`)
+- **clods now lives in this repo** (`clods/`), and the binary carries it. It's the tool that gives
+  a machine one Claude Code profile per account (`clod1`…`clodN`, `clods`). It has tests and CI now.
+- **With `CLODS_DIR` set** to the folder holding your clods `tokens`, `pods setup`, `up`, `replace`,
+  `start`/`restart` and the dashboard's setup push every account to each pod they set up. A pod
+  that has no default gets the next account in turn; one that has a default keeps it. They print a
+  line per pod: `[apple] claude: clods, 3 accounts` (in `up`: `clods ✓` on the READY line). No more
+  `push.sh --arena` by hand after setup.
+- **A push that fails** is a warning with its fix (`retry: arena pods setup --clods-only apple`). It
+  never fails the setup or replaces the pod.
+- **`arena pods setup --clods-only [pods]`** pushes to running pods, and nothing else.
+- **`arena clods install [DIR]`** writes the scripts into a local clods folder (default `CLODS_DIR`,
+  else `~/.clods`), and leaves `tokens`, `fleet` and `profiles/` alone.
+- Unset, or no `tokens` in that folder: nothing changes, and nothing is said.
+- clods itself: a re-push writes nothing when nothing changed. `push.sh -k` keeps the defaults the
+  machines have, and `-q` prints a line per machine. `MACHINE=none` takes every token off with
+  `-a` too. A `claude` alias in an rc file no longer stops `clods.sh` loading, and `clods default`
+  takes an email.
+
+### Config
+- `CLODS_DIR` (new, optional): the clods folder, e.g. `/root/.clods`. It must hold `tokens`
+  (owner-only); the scripts come from arena. The environment can set it for one run.
+
 ## 2026-11-03 · dependencies updated; no change in behaviour
 - The libraries arena is built on are updated, the dashboard's drawing and terminal libraries
   included. Commands, their output and the dashboard work and look as before.

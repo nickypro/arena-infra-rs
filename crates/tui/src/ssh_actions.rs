@@ -304,14 +304,28 @@ pub(crate) async fn run_setup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> S
     };
     // Its own Claude Code account's token, as `pods setup` puts on (one by spread if it has none).
     let one = [(pod.clone(), target)];
-    match arena_core::claude::stage(remote, cfg, &one, None, snapshot::unix_now()).await {
+    let mut said = match arena_core::claude::stage(remote, cfg, &one, None, snapshot::unix_now()).await {
         Ok(None) => done,
         Ok(Some(outcomes)) => {
             let said: Vec<String> = outcomes.iter().map(|o| o.line()).collect();
             format!("{done}\nClaude Code: {}", said.join("; "))
         }
         Err(e) => format!("{done}\n✗ Claude Code: not pushed — {e}"),
+    };
+    // clods, when CLODS_DIR is set: every account, as `pods setup` pushes it (a warning if not).
+    match arena_core::clods::stage(remote, cfg, &one).await {
+        None => {}
+        Some(arena_core::clods::Staged::Unusable(why)) => said.push_str(&format!("\n‼ clods: not pushed — {why}")),
+        Some(arena_core::clods::Staged::Pushed(outcomes)) => {
+            for o in outcomes {
+                match &o.result {
+                    Ok(s) => said.push_str(&format!("\nclods: {}", arena_core::clods::accounts(s.accounts))),
+                    Err(e) => said.push_str(&format!("\n‼ clods: not pushed — {e} (retry: {})", arena_core::clods::retry(&o.name))),
+                }
+            }
+        }
     }
+    said
 }
 
 /// The TUI's setup steps: core's list for the pod's own provider, as `arena pods setup` builds

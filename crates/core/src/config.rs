@@ -75,6 +75,9 @@ impl Config {
         // The Claude Code accounts' tokens file (`arena_core::claude`): a path, not a secret — so a
         // test pool (or a different file for one run) needs no edit to the shared config.
         "CLAUDE_TOKENS_FILE",
+        // The clods folder (`arena_core::clods`): a path, not a secret — so a live test (or a
+        // scratch folder for one run) needs no edit to the shared config.
+        "CLODS_DIR",
         // `SSH_PROXY_RELOAD_CMD=` (empty) = write the proxy config, never reload nginx. A
         // wrapper sharing a box with the production nginx (the sandbox's `arena-dev`) exports
         // it empty so no lifecycle sync can reload the system nginx, whatever its config file
