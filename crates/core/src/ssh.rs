@@ -474,12 +474,13 @@ fn resolve_key_with<R: Fn(&str) -> bool>(configured: &str, home: Option<&str>, r
 /// (the deep check's script is ~30 KB). The wrap is POSIX: every login shell
 /// [`for_any_login_shell`] serves runs it, and a job's `sh` too.
 pub fn login_shell_wrap(cmd: &str, conda_env: Option<&str>) -> String {
-    let env = conda_env.filter(|e| !e.is_empty());
-    let zsh = match env {
+    // One word to the shell that activates it (`arena-env` as is), whatever `CONDA_ENV` holds.
+    let env = conda_env.filter(|e| !e.is_empty()).map(shell_word);
+    let zsh = match &env {
         Some(env) => format!("source ~/.zshrc 2>/dev/null; conda activate {env} >/dev/null 2>&1; "),
         None => "source ~/.zshrc 2>/dev/null; ".to_string(),
     };
-    let bash = match env {
+    let bash = match &env {
         Some(env) => format!("source ~/.bashrc 2>/dev/null; command -v conda >/dev/null 2>&1 && conda activate {env} >/dev/null 2>&1; "),
         None => "source ~/.bashrc 2>/dev/null; ".to_string(),
     };
@@ -774,8 +775,9 @@ mod tests {
                 r#""$__arena_sh" -c "$__arena_rc"'python -c '\''import torch'\'''"#,
             )
         );
-        // A quote in the env name stays inside its quotes too.
-        assert!(login_shell_wrap("true", Some("it's")).contains("conda activate it'\\''s >/dev/null"));
+        // An env name that isn't one plain word is quoted for the shell that activates it, then
+        // again for the wrap (run for real below).
+        assert!(login_shell_wrap("true", Some("it's")).contains(r#"conda activate '\''it'\''\'\'''\''s'\'' >/dev/null"#));
     }
 
     #[test]
@@ -833,7 +835,7 @@ mod tests {
             let bin = dir.join(shells.join("-"));
             std::fs::create_dir_all(&bin).unwrap();
             for sh in shells {
-                crate::remote::write_test_script(&bin.join(sh), format!("#!/bin/sh\nprintf '%s|%s|%s' {sh} \"$1\" \"$2\"\n")).unwrap();
+                crate::remote::write_test_script(bin.join(sh), format!("#!/bin/sh\nprintf '%s|%s|%s' {sh} \"$1\" \"$2\"\n")).unwrap();
             }
             let o = std::process::Command::new("/bin/sh").arg("-c").arg(&w).env_clear().env("PATH", &bin).output().unwrap();
             assert_eq!(String::from_utf8_lossy(&o.stdout), want);
@@ -1001,6 +1003,36 @@ echo \"été ✓\"
             }
         }
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `CONDA_ENV` reaches `conda` as one argument, under zsh and under bash — spaces, quotes and
+    /// `$` as they are — and the command runs (review ai-review codex r1 #2: it went as shell
+    /// source, so `it's` broke the command and `my env` was two arguments).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_conda_env_is_one_argument_to_conda_under_zsh_and_bash() {
+        let dir = std::env::temp_dir().join(format!("arena-wrap-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let record = "conda() { printf '%s|' \"$#\" \"$@\" > \"$HOME/conda.args\"; }\n";
+        std::fs::write(home.join(".zshrc"), record).unwrap();
+        std::fs::write(home.join(".bashrc"), record).unwrap();
+        for (name, shell) in installed(&["zsh", "bash"]) {
+            let bin = dir.join(format!("bin-{name}"));
+            std::fs::create_dir_all(&bin).unwrap();
+            std::os::unix::fs::symlink(&shell[0], bin.join(name)).unwrap();
+            let path = bin.display().to_string();
+            for env in ["arena-env", "my env", "it's", "a\"b $HOME `x` \\n"] {
+                let _ = std::fs::remove_file(home.join("conda.args"));
+                let sh = ["/bin/sh".to_string()];
+                let (out, code, err) = as_sshd(&sh, &home, &login_shell_wrap("echo ran", Some(env)), &[("PATH", path.as_str())]);
+                assert_eq!((out.as_str(), code), ("ran\n", Some(0)), "{name} {env:?}: {err}");
+                let args = std::fs::read_to_string(home.join("conda.args")).unwrap_or_default();
+                assert_eq!(args, format!("2|activate|{env}|"), "{name} {env:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A command too big to encode (over 128 KiB as a line): a POSIX login shell runs it bare, as

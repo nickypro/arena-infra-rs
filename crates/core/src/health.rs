@@ -1633,12 +1633,14 @@ fn judge_call(
         Err(why) => PodHealth::unreachable(pod, why),
         Ok(out) => {
             // No zsh, so the check ran under bash or sh (`ssh::login_shell_wrap`): a bare VM before
-            // setup (live: Hetzner `up --check --no-setup`). SSH worked (the wrap said so), its
-            // facts are judged as any pod's, and a [`NO_ZSH`] FAIL first says it isn't set up.
+            // setup (live: Hetzner `up --check --no-setup`). Its facts are judged as any pod's, and
+            // a [`NO_ZSH`] FAIL first says it isn't set up. The wrap's note says the session got
+            // that far, so a script that never started is the pod's software (no `bash` for it) —
+            // unless ssh's own 255 says the session dropped after the note.
             let (fallback, stderr) = crate::ssh::take_fallback_note(&out.stderr);
             let facts = parse_deep(&out.stdout);
             let stderr = stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-            if !facts.started && !out.success && fallback.is_none() {
+            if !facts.started && !out.success && (fallback.is_none() || out.code == Some(255)) {
                 // ssh itself failed (255 = refused/auth/…): say that, not "no output".
                 PodHealth::unreachable(pod, format!("{}: {stderr}", out.exit_label()))
             } else {
@@ -2656,6 +2658,11 @@ deep_check_end=1
         assert_eq!(h.checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), [NO_ZSH, "script"], "{:#?}", h.checks);
         assert!(h.checks[1].detail.ends_with("(sh: 1: bash: not found)"), "{:#?}", h.checks);
         assert!(h.facts.as_ref().is_some_and(|f| !f.started) && h.failure_kind() == Some(FailureKind::Software), "{h:#?}");
+        // The session dropped after the note (review ai-review codex r1 #1): ssh's 255 is still
+        // unreachable — no facts, so `up --check` reruns it — never a setup failure.
+        let h = judge_deep_call(&vm, call(255, "", "Connection to 5.6.7.8 closed by remote host.\n"), &cuda13());
+        assert_eq!(h.checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["ssh"], "{:#?}", h.checks);
+        assert!(h.checks[0].detail.contains("exit 255: Connection to 5.6.7.8 closed") && h.facts.is_none(), "{h:#?}");
         // The keys-only run alike: its keys judged, the missing zsh first.
         let keys = judge_key_call(&vm, call(0, "deep_check=2\nopenrouter.key=missing\nhf.key=missing\ndeep_check_end=1\n", ""), &HealthPolicy::default());
         assert_eq!((keys.checks[0].name.as_str(), keys.failure_kind()), (NO_ZSH, Some(FailureKind::Software)), "{:#?}", keys.checks);
