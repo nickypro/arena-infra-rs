@@ -5572,4 +5572,57 @@ done
             assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "hard={hard}");
         }
     }
+
+    /// A switch stopped while it sets the real keys aside (its bound's TERM: mid-copy; right
+    /// before a file is put back to git's version, the redacted one; while `git checkout` does it —
+    /// the file removed, or written part-way; right after) puts the key back and leaves nothing set
+    /// aside, the index as it was, with or without `--hard`. Found as a flaky test: the run's branch
+    /// was written once every file was set aside, and a run with none is never restored — stopped
+    /// after a file was put back, its key was only in `.git/arena-unredacted/`, for good; and a
+    /// file the checkout was writing matched neither the copy nor git's version (review codex r1).
+    #[cfg(unix)]
+    #[test]
+    fn a_switch_stopped_while_it_sets_the_keys_aside_puts_them_back() {
+        let s = GitSandbox::new("aside-stopped", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let ex = format!("KEY = \"{}\"\n", openrouter_key(31));
+        std::fs::write(s.work.join("ex.py"), &ex).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.redacted.len()), (Some(0), 1), "{err}");
+        let aside = s.work.join(".git/arena-unredacted");
+        let index = s.git(&s.work, &["ls-files", "-s", "ex.py"]);
+        let status = s.git(&s.work, &["status", "--porcelain"]);
+        let real = |tool: &str| {
+            let o = std::process::Command::new("sh").args(["-c", &format!("command -v {tool}")]).output().unwrap();
+            shell_quote(String::from_utf8_lossy(&o.stdout).trim())
+        };
+        // Each stand-in stops the run once (`$0.fired`): the restore in the EXIT trap goes through
+        // the same tools, and a second ALRM would be `timeout`'s KILL.
+        let once = |action: String| format!("[ -e \"$0.fired\" ] || {{ : > \"$0.fired\"; {action}; }};;");
+        let stop = format!("{BOUND_NOW_SH}; sleep 30; exit 1");
+        let checkout = "*\"checkout -q -- :(literal)ex.py\")";
+        let stops = [
+            ("mid-copy", "cp", format!("*arena-unredacted/*) {}", once(format!("for a; do :; done; printf 'KEY = ' > \"$a\"; {stop}")))),
+            ("right before its checkout", "git", format!("{checkout} {}", once(stop.clone()))),
+            ("in its checkout, the file removed", "git", format!("{checkout} {}", once(format!("rm -f ex.py; {stop}")))),
+            ("in its checkout, the file written part-way", "git", format!("{checkout} {}", once(format!("printf 'KEY = ' > ex.py; {stop}")))),
+            ("right after its checkout", "git", format!("{checkout} {}", once(format!("{} \"$@\"; {stop}", real("git"))))),
+        ];
+        for (i, (when, tool, case)) in stops.iter().enumerate() {
+            let bin = s.base.join(format!("bin-stop-{i}"));
+            std::fs::create_dir_all(&bin).unwrap();
+            crate::remote::write_test_script(bin.join(tool), format!("#!/bin/sh\ncase \"$*\" in {case} esac\nexec {} \"$@\"\n", real(tool))).unwrap();
+            let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+            for hard in [false, true] {
+                let _ = std::fs::remove_file(bin.join(format!("{tool}.fired")));
+                let (code, out, err) = run_on_path(&bounded_switch(&switch_script(repo, "main", None, hard, KB_DEFAULT), 600, 60), &path);
+                assert_eq!(code, Some(124), "{when} hard={hard}: {out}{err}");
+                assert!(bin.join(format!("{tool}.fired")).exists(), "{when} hard={hard}: stopped there");
+                assert_eq!(s.read("ex.py"), ex.as_bytes(), "{when} hard={hard}: the real key put back");
+                assert!(!aside.exists(), "{when} hard={hard}: nothing left set aside");
+                assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "{when} hard={hard}");
+                assert_eq!((s.git(&s.work, &["ls-files", "-s", "ex.py"]), s.git(&s.work, &["status", "--porcelain"])), (index.clone(), status.clone()), "{when} hard={hard}");
+            }
+        }
+    }
 }

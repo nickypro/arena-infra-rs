@@ -17,20 +17,37 @@
 # Each tracked file whose only difference from the index is keys the redaction knows: set aside.
 # A file with any other uncommitted change is left alone — the switch treats it as it always did —
 # and so is one that can't be copied (said on stderr): the loop never stops halfway.
+# Stopped anywhere in it (the bound's TERM; the EXIT trap then restores), nothing is lost or left:
+# the run's branch is written before its first copy (a run is restored by its branch: written at
+# the end, a file already put back to git's version lost its key); a copy is made beside the run
+# and renamed in, whole or not there; and the restore drops a copy the file still matches, and
+# puts back one whose file this switch's `git checkout` left gone or cut short (it removes the
+# file, then writes it).
 unredacted_aside() {
     UR_RUN=$(date -u +%Y%m%dT%H%M%SZ)-$$
+    UR_BRANCH=$(git rev-parse --abbrev-ref HEAD) || UR_BRANCH=
     git diff --name-only -z | tr '\0' '\n' | while IFS= read -r f; do
         if [ ! -f "$f" ] || [ -L "$f" ]; then continue; fi
         i=$(git ls-files -s -- ":(literal)$f" | awk '$1 == "100644" || $1 == "100755" { print $2 }')
         if [ -z "$i" ] || [ "$(git hash-object -- "$f")" = "$i" ]; then continue; fi
         if [ "$(LC_ALL=C sed -E "$REDACT_SED" < "$f" | git hash-object --path="$f" --stdin)" != "$i" ]; then continue; fi
-        if mkdir -p -- "$1/$UR_RUN/$(dirname -- "$f")" && cp -p -- "$f" "$1/$UR_RUN/$f" && git checkout -q -- ":(literal)$f"; then
+        if mkdir -p -- "$1/$UR_RUN/$(dirname -- "$f")" \
+            && { [ -f "$1/$UR_RUN.branch" ] || printf '%s\n' "$UR_BRANCH" > "$1/$UR_RUN.branch"; } \
+            && cp -p -- "$f" "$1/$UR_RUN.part" && mv -f -- "$1/$UR_RUN.part" "$1/$UR_RUN/$f" \
+            && git checkout -q -- ":(literal)$f"; then
             :
         else
             echo "arena set-branch: couldn't set $f aside - left as it is" >&2
         fi
     done
-    if [ -d "$1/$UR_RUN" ]; then git rev-parse --abbrev-ref HEAD > "$1/$UR_RUN.branch"; fi
+}
+
+# Whether file $2 is git's version of the copy $1 (its redacted text, through the path's
+# filters), cut short: what a `git checkout` stopped while it wrote the file leaves.
+unredacted_cut_short() {
+    _b=$(LC_ALL=C sed -E "$REDACT_SED" < "$1" | git hash-object --path="$2" --stdin) || return 1
+    _n=$(($(wc -c < "$2")))
+    git cat-file --filters --path="$2" "$_b" 2>/dev/null | head -c "$_n" | cmp -s - "$2"
 }
 
 # After the switch: the copies set aside on the branch now checked out, newest first and one per
@@ -44,12 +61,18 @@ unredacted_restore() {
         if [ ! -d "$1/$run" ] || [ "$(cat "$1/$run.branch" 2>/dev/null)" != "$cur" ]; then continue; fi
         (cd "$1/$run" && find . -type f) | sed 's#^\./##' | while IFS= read -r f; do
             if grep -qxF -- "$f" "$1.done"; then continue; fi
-            if [ -f "$f" ] && [ ! -L "$f" ] \
-                && [ "$(LC_ALL=C sed -E "$REDACT_SED" < "$1/$run/$f" | git hash-object --path="$f" --stdin)" = "$(git hash-object -- "$f")" ]; then
+            if [ -f "$f" ] && [ ! -L "$f" ] && cmp -s -- "$1/$run/$f" "$f"; then
+                # Its keys are in the file already (a switch stopped before it put it back).
+                rm -f -- "$1/$run/$f" && printf '%s\n' "$f" >> "$1.done"
+            elif { [ -f "$f" ] && [ ! -L "$f" ] \
+                && [ "$(LC_ALL=C sed -E "$REDACT_SED" < "$1/$run/$f" | git hash-object --path="$f" --stdin)" = "$(git hash-object -- "$f")" ]; } \
+                || { [ "$run" = "${UR_RUN:-}" ] && [ ! -L "$f" ] && { [ ! -e "$f" ] || { [ -f "$f" ] && unredacted_cut_short "$1/$run/$f" "$f"; }; }; }; then
                 cp -p -- "$1/$run/$f" "$f" && rm -f -- "$1/$run/$f" && printf '%s\n' "$f" >> "$1.done" && echo "UNREDACTED_RESTORED $f"
             fi
         done
     done
+    # A copy cut short (stopped before its rename in): its file is still as it was.
+    rm -f -- "$1"/*.part
     if [ -n "${UR_RUN:-}" ] && [ -d "$1/$UR_RUN" ]; then
         (cd "$1/$UR_RUN" && find . -type f) | sed 's#^\./##' | while IFS= read -r f; do echo "UNREDACTED_KEPT $f"; done
     fi

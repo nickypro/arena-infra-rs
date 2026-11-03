@@ -19,6 +19,15 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-03 · `set-branch`: a switch stopped part-way never takes a participant's real key out of their file
+- A branch switch sets aside the real keys in files the backup committed redacted, and puts them
+  back after the switch, or when it's stopped. If it was stopped just after it set a file aside
+  (its time limit on the pod, a dropped connection), the file was left with the redacted
+  placeholder, and the real key stayed only in `.git/arena-unredacted/`, where no later switch
+  looked. Now the key goes back however early the switch is stopped, and nothing is left in
+  `.git/arena-unredacted/`.
+- Found by a sweep for flaky tests.
+
 ## 2026-11-03 · the dashboard: the pod list keeps two pods in view past the cursor
 - Moving down a list that doesn't fit, the view scrolls before the cursor reaches the bottom, so
   the next two pods are always in view. Only on the last pod does the cursor reach the edge, so
