@@ -654,17 +654,22 @@ to that branch.
 
 A gentle switch that refuses a pod mid-merge does so before setting anything aside, and the putting
 back is the command's exit trap: a switch that fails, stops on an error, or gets a hangup, an
-interrupt or a TERM puts the keys back first. That holds however early it's stopped, in the middle
-of setting a file aside too: the set-aside's branch is noted before its first copy (it was noted
-last, so a file already put back to git's version kept the placeholder, its key only in
-`.git/arena-unredacted/`), and every file it writes — the copy, the file's git version, the key
-put back — is made in `.git` and renamed into place, so a file is only ever the participant's
-version or git's. A later switch's restore puts back what a KILL left. The restore only ever
-replaces a file that is exactly git's version of its copy (or drops a copy the file already
-matches): a file the participant changed or removed since, or one under a directory that is now a
-link, keeps what they did, and its copy stays (`UNREDACTED_KEPT`). A file whose mode changed too,
-or whose directory is on another filesystem than `.git`, isn't set aside: the switch treats it as
-any local change.
+interrupt or a TERM puts the keys back first. That holds however the switch ends, a KILL included
+(the next switch's restore, or init-branches', puts back what it left):
+- the set-aside's branch is noted before its first copy (it was noted last, so a file already put
+  back to git's version kept the placeholder, its key only in `.git/arena-unredacted/`);
+- a copy lands whole or not at all;
+- a file is replaced only from its own directory, entered once and checked to be the work tree's
+  (a link swapped in for it later is never followed): the live file is first moved aside into
+  `.git`, recorded with its path, and the new one linked in only if what was moved aside is
+  exactly what was expected (bytes and mode) and nothing took its place meanwhile — else it goes
+  back. So no version of a file is ever lost, and a file is only ever the participant's version
+  or git's.
+
+A file the participant changed, removed, made executable or moved under a link while the switch
+ran keeps what they did; its copy stays, and every switch on that branch says so (`UNREDACTED_KEPT`,
+on the pod's line, a failed switch's too). A file whose mode changed too, or whose directory is on
+another filesystem than `.git`, isn't set aside: the switch treats it as any local change.
 
 arena's own 2-minute timeout kills only its ssh client — a non-pty session's shell is usually never
 signalled, and ran on (review ai-review claude #13) — so the switch bounds itself on the pod: it

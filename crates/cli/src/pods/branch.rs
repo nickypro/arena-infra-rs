@@ -491,7 +491,10 @@ async fn switch_batch(
                 run.ok += 1;
             }
             _ => {
-                say(&format!("{}{note}", failure_line(done, total, name, &call)));
+                // What it did with the real keys is said either way: a switch stopped part-way
+                // puts them back, or says each one it couldn't (KEPT).
+                let keys = call.as_ref().map_or_else(|_| String::new(), |o| unredacted_note(&o.stdout));
+                say(&format!("{}{note}{keys}", failure_line(done, total, name, &call)));
                 run.failed.push(name.clone());
             }
         }
@@ -565,8 +568,8 @@ pub(crate) fn unredacted_note(stdout: &str) -> String {
     let mut note = String::new();
     if !kept.is_empty() {
         note.push_str(&format!(
-            " — the real key(s) in {} file(s) git has redacted are set aside in .git/arena-unredacted/ (a switch back puts \
-             them back): {}",
+            " — the real key(s) in {} file(s) git has redacted are kept in .git/arena-unredacted/ (a switch back to their \
+             branch puts each back whose file is as the switch left it; one changed since stays there): {}",
             kept.len(),
             kept.join(", ")
         ));

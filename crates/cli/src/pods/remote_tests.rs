@@ -2188,8 +2188,8 @@ async fn set_branch_pushes_each_branch_first_and_copies_a_pod_whose_branch_cant_
     // What the switch did with the real keys of files git has redacted.
     assert_eq!(
         unredacted_note("RESTORED Grokking\nUNREDACTED_KEPT part4/exercises.py\nUNREDACTED_KEPT joep.py\n"),
-        " — the real key(s) in 2 file(s) git has redacted are set aside in .git/arena-unredacted/ (a switch back puts them \
-         back): part4/exercises.py, joep.py"
+        " — the real key(s) in 2 file(s) git has redacted are kept in .git/arena-unredacted/ (a switch back to their branch \
+         puts each back whose file is as the switch left it; one changed since stays there): part4/exercises.py, joep.py"
     );
     assert_eq!(unredacted_note("UNREDACTED_RESTORED joep.py\n"), " — real key(s) back in 1 file(s) git has redacted: joep.py");
     assert_eq!(unredacted_note("RESTORED Grokking\n"), "");

@@ -19,18 +19,20 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
-## 2026-11-03 · `set-branch`: a switch stopped part-way never takes a participant's real key out of their file
+## 2026-11-03 · `set-branch`: an interrupted switch never strands a participant's key
 - A branch switch sets aside the real keys in files the backup committed redacted, and puts them
   back after the switch, or when it's stopped. If it was stopped just after it set a file aside
   (its time limit on the pod, a dropped connection), the file was left with the redacted
   placeholder, and the real key stayed only in `.git/arena-unredacted/`, where no later switch
-  looked. Now the key goes back however early the switch is stopped, and nothing is left in
-  `.git/arena-unredacted/`. If the participant changed or removed the file while the switch ran,
-  their version stays, and so does the copy.
+  looked. Now the key goes back however the switch ends, a KILL included (the next switch puts
+  it back), and nothing is left in `.git/arena-unredacted/`.
+- A file the participant changes while a switch runs keeps their version. Its key stays set aside,
+  and every later switch on that branch says so (`kept in .git/arena-unredacted/ … : <file>`),
+  where before only the switch that set it aside did. A failed switch's line says it too.
 - A file whose only change is a key but whose mode changed too (`chmod +x`) is no longer set
   aside. A switch now treats it like any other local change, where before it set the file's mode
   back.
-- Found by a sweep for flaky tests.
+- Found by a sweep for flaky tests (#81), and tested live on a Hetzner VM.
 
 ## 2026-11-03 · the backup's copy: files vanishing on a pod mid-copy no longer fail it
 - If files on a pod are removed or renamed while `pods pull` (or the backup's copy) reads them,
