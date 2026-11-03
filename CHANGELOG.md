@@ -49,6 +49,17 @@ earlier).
 - `CLODS_DIR` (new, optional): the clods folder, e.g. `/root/.clods`. It must hold `tokens`
   (owner-only); the scripts come from arena. The environment can set it for one run.
 
+## 2026-11-03 · macOS binaries in every release; the README installs from the release
+- **Every release has `arena` and `arena-tui` for macOS 11 or newer**, Apple silicon
+  (`aarch64-apple-darwin`) and Intel (`x86_64-apple-darwin`), beside the Linux ones. On a Mac,
+  `arena update` takes the Mac's. It can't list the dashboards still running the old build
+  there (macOS has no `/proc`). The control box's side (cron backups, the proxy) is tested on
+  Linux only.
+- **The README installs from the latest release.** Its block picks your platform, checks
+  `SHA256SUMS`, and puts `arena`, `arena-tui` and `config.env.example` in `~/arena`. Releases now
+  carry `config.env.example` for it. Building from source is the alternative. On Windows, use WSL
+  with the Linux binaries.
+
 ## 2026-11-03 · dependencies updated; no change in behaviour
 - The libraries arena is built on are updated, the dashboard's drawing and terminal libraries
   included. Commands, their output and the dashboard work and look as before.

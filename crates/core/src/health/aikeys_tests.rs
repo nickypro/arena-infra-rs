@@ -624,6 +624,7 @@ AI key failure, not the machine: devtest-bloom — NOTES (or -v) says what to ru
 
 // ---- the script itself, against a local stub server (real curl; no network) ----
 
+#[cfg(target_os = "linux")]
 fn have(tool: &str) -> bool {
     std::process::Command::new("sh").args(["-c", &format!("command -v {tool}")]).output().is_ok_and(|o| o.status.success())
 }
@@ -631,11 +632,13 @@ fn have(tool: &str) -> bool {
 /// A stand-in for OpenRouter's `GET /api/v1/key` and Hugging Face's `whoami-v2` on 127.0.0.1:
 /// answers by the Bearer token it's sent (`answers`: token → status and body; any other gets
 /// OpenRouter's 401), and keeps each request's head — so a test sees what curl actually sent.
+#[cfg(target_os = "linux")]
 struct StubServer {
     url: String,
     requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
+#[cfg(target_os = "linux")]
 fn stub_server(answers: Vec<(&'static str, u16, String)>) -> StubServer {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -677,6 +680,7 @@ fn stub_server(answers: Vec<(&'static str, u16, String)>) -> StubServer {
 
 /// The OpenRouter answer for a live key, its redacted label included (the script must never
 /// print it): the shape `GET /api/v1/key` returned on 2026-11-02.
+#[cfg(target_os = "linux")]
 fn key_answer(label: &str, limit: &str, left: &str) -> String {
     format!(
         r#"{{"data":{{"label":"{label}","limit":{limit},"usage":0.0021,"is_free_tier":false,"limit_remaining":{left},"limit_reset":null,"is_provisioning_key":false,"rate_limit":{{"requests":-1,"interval":"10s"}}}}}}"#
@@ -685,6 +689,7 @@ fn key_answer(label: &str, limit: &str, left: &str) -> String {
 
 /// Run the delivered keys-only command (`key_check_inner_command`) with `env` set (the keys
 /// unset unless given), its calls pointed at `server`, with `path_first` first on PATH.
+#[cfg(target_os = "linux")]
 fn run_keys(server: &StubServer, env: &[(&str, &str)], path_first: Option<&std::path::Path>) -> (String, String) {
     let home = std::env::temp_dir().join(format!("arena-keys-home-{}", std::process::id()));
     std::fs::create_dir_all(&home).unwrap();

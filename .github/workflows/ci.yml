@@ -54,6 +54,46 @@ jobs:
           ARENA_TEST_ALL_SHELLS: "1"
         run: cargo test --release --locked
 
+  # The macOS build release.yml ships, tested on Apple silicon alongside the Linux job. Tests of
+  # what only Linux has (`/proc`, `script`'s flags, …) are gated off macOS: docs/REFERENCE.md,
+  # "On macOS", lists them. The macOS jobs run once per commit, on its push (macOS runners are
+  # few); a fork's pull request has no push here, so it runs them itself.
+  test-macos:
+    name: build + test (macOS)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustc --version
+      # rsync 3: macOS's own is openrsync, without the `--info` and `-J` arena's pulls use (a Mac
+      # pulling backups needs it too: README). GNU coreutils, sed, grep and find, first on PATH,
+      # and bash 5: the tests run the pods' scripts here as a stand-in pod, and a pod is Linux.
+      # The temp dir by its real path (macOS's is behind /var → /private/var): tests compare the
+      # paths they made with the ones git and `pwd` give back.
+      - name: Tools
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install rsync coreutils gnu-sed grep findutils bash
+          for f in coreutils gnu-sed grep findutils; do echo "$(brew --prefix "$f")/libexec/gnubin" >> "$GITHUB_PATH"; done
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          echo "TMPDIR=$(cd "${TMPDIR:-/tmp}" && pwd -P)" >> "$GITHUB_ENV"
+          git config --global user.name "arena CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Test
+        run: |
+          rsync --version | head -1 && sed --version | head -1 && bash --version | head -1 && echo "TMPDIR=$TMPDIR"
+          cargo test --release --locked --no-fail-fast
+
   # Blocking: any clippy warning fails the run. The lint set is the pinned toolchain's
   # (RUSTUP_TOOLCHAIN), so a newer clippy's new lints arrive only with a deliberate bump.
   clippy:
@@ -71,5 +111,21 @@ jobs:
       # dashboard's dev-dependencies, so neither the test build nor the run above compiles the
       # code as shipped: this does, as `cargo build --release` would (a test double used by
       # shipped code fails here, as does code only the doubles use).
+      - name: Clippy, as shipped
+        run: cargo clippy --locked -- -D warnings
+
+  # The same on macOS: its `#[cfg]`s compile other code.
+  clippy-macos:
+    name: clippy (macOS)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Clippy, as shipped
         run: cargo clippy --locked -- -D warnings

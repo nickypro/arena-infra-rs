@@ -632,6 +632,7 @@ mod tests {
     /// The argv, run by the REAL rsync into a temp-dir "pod" (the transport swapped for a fake
     /// that runs rsync's server side locally): the pod's repo is a symlink onto its volume.
     #[cfg(unix)]
+    #[cfg_attr(target_os = "macos", ignore = "the stand-in pod's rsync here is Homebrew's 3.5, which won't write through the --keep-dirlinks link (ELOOP)")]
     #[test]
     fn a_restore_lands_in_the_volume_copy_through_the_link_and_deletes_nothing() {
         use crate::volume::fake_ssh;
@@ -694,6 +695,7 @@ mod tests {
     /// A restore of an older backup over a pod that has moved on: the pod's newer files are
     /// left alone (and reported), unless asked — then replaced, the newer copy kept.
     #[cfg(unix)]
+    #[cfg_attr(target_os = "macos", ignore = "the stand-in pod's rsync here is Homebrew's 3.5, which won't write through the --keep-dirlinks link (ELOOP)")]
     #[test]
     fn newer_work_on_the_pod_is_never_reverted_unless_asked() {
         use crate::volume::fake_ssh;

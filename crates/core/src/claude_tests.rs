@@ -468,6 +468,7 @@ fn leftovers(home: &Path, keep: &[&str]) -> Vec<String> {
     v
 }
 
+#[cfg_attr(target_os = "macos", ignore = "the script checks its lock through /dev/fd/9, which on macOS isn't the file")]
 #[test]
 fn the_push_replaces_every_old_token_line_keeps_the_rest_and_a_repush_changes_nothing() {
     let d = tmp("push");
@@ -516,6 +517,7 @@ fn the_push_replaces_every_old_token_line_keeps_the_rest_and_a_repush_changes_no
     assert_eq!(leftovers(home, &[]), Vec::<String>::new());
 }
 
+#[cfg_attr(target_os = "macos", ignore = "the script checks its lock through /dev/fd/9, which on macOS isn't the file")]
 #[test]
 fn off_on_a_machine_with_no_rc_files_makes_none_and_a_missing_token_changes_nothing() {
     let d = tmp("push-none");
@@ -544,6 +546,7 @@ fn off_on_a_machine_with_no_rc_files_makes_none_and_a_missing_token_changes_noth
 /// Review r1: an rc file that's a link (dotfiles) stays a link, its file rewritten with its mode;
 /// a rewrite that can't be made leaves the old file whole — never a cut one.
 #[cfg(unix)]
+#[cfg_attr(target_os = "macos", ignore = "the script checks its lock through /dev/fd/9, which on macOS isn't the file")]
 #[test]
 fn the_rewrite_goes_through_links_keeps_the_mode_and_a_failure_leaves_the_old_file() {
     use std::os::unix::fs::PermissionsExt;
@@ -577,6 +580,7 @@ fn the_rewrite_goes_through_links_keeps_the_mode_and_a_failure_leaves_the_old_fi
 
 /// Review r2: a startup file that turns tracing on (`set -x`, zsh's `.zshenv`) never gets the token
 /// printed: tracing goes off before it's read. And what a pod says back is masked anyway.
+#[cfg_attr(target_os = "macos", ignore = "the script checks its lock through /dev/fd/9, which on macOS isn't the file")]
 #[test]
 fn tracing_never_shows_the_token_and_errors_are_masked() {
     use std::io::Write;

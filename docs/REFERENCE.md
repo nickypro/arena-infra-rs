@@ -10,6 +10,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
 - [Overview](#overview)
 - [Safety model (this is developed against live production)](#safety-model-this-is-developed-against-live-production)
 - [Running arena](#running-arena)
+  - [Installing](#installing)
   - [From a checkout](#from-a-checkout)
   - [`update`: installing a newer release](#update-installing-a-newer-release)
   - [Output: `-v` and `--color`](#output--v-and---color)
@@ -77,6 +78,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [Acting on pods](#acting-on-pods)
   - [Adding pods](#adding-pods)
 - [Testing](#testing)
+  - [On macOS](#on-macos)
   - [The live smoke test](#the-live-smoke-test)
 - [AI review before merging](#ai-review-before-merging)
 
@@ -109,6 +111,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
 
 ## Running arena
 
+### Installing
+
+Each release has `arena` and `arena-tui` for Linux (x86_64 and arm64, glibc 2.35 or newer) and
+macOS 11 or newer (Apple silicon and Intel). [The README's install block](../README.md#1-install)
+picks this platform's pair by `uname`, checks it against the release's `SHA256SUMS`, and puts it
+in `~/arena` with `config.env.example`. On Windows, run the Linux pair in WSL. Keep `arena-tui`
+beside `arena`: `arena tui` starts the one next to it, and `update` replaces both there. From
+source: `cargo build --release` (Rust 1.96) builds both into `target/release/`.
+
 ### From a checkout
 
 ```bash
@@ -136,7 +147,10 @@ cargo run -p arena-cli -- --config ./config.env pods list
 
 Every green master commit is published as a GitHub release (`.github/workflows/release.yml`):
 `arena` and `arena-tui` for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, built
-on Ubuntu 22.04 (glibc 2.35 or newer), with `CHANGELOG.md` and `SHA256SUMS`. The tag is the
+on Ubuntu 22.04 (glibc 2.35 or newer), and for `aarch64-apple-darwin` and `x86_64-apple-darwin`
+(macOS 11 or newer), with `CHANGELOG.md`, `config.env.example` and `SHA256SUMS`. Each binary is
+named after its Rust target (`arena-aarch64-apple-darwin`), and `update` downloads the pair
+named after the target it was built for. The tag is the
 version, `v<base>.YYMMDD.HHMM`: the base (`BASE` in `crates/cli/build.rs`, e.g. `2.3`) and the
 commit's time in UTC. `arena --version` prints it with the commit: `arena 2.3.261030.1500
 (5274b7a1c2)`. The base goes up a minor (2.0 → 2.1) when a command, flag or `--json` shape changes in a way a script or
@@ -204,7 +218,7 @@ sudo arena update        # where root runs arena from someone else's ~/.cargo/bi
   one's mode and owner, and lands by rename, so the path always holds a whole binary.
   Roll back with `mv -f arena.prev arena && mv -f arena-tui.prev arena-tui`.
 - **Afterwards:** it lists the `arena-tui` dashboards still running the replaced build, to
-  restart. Cron picks the new `arena` up on its next run.
+  restart (Linux: read from `/proc`; macOS has none, so it lists none there). Cron picks the new `arena` up on its next run.
 - It needs no config and no GitHub login (the API allows 60 unauthenticated requests an hour;
   an update makes 2: the latest release, and its attestation).
 
@@ -3733,6 +3747,35 @@ times, in µs) and each input event, to measure lag (see [Testing](#testing)).
 ```bash
 cargo test --release   # everything offline: pure planners, fake providers, FakeRemote, fixtures
 ```
+
+### On macOS
+
+CI runs the suite on Apple silicon too (`build + test (macOS)`), with what a Linux pod has
+first on `PATH`: many tests run the pods' scripts here, as a stand-in pod. So the job installs
+rsync 3 (macOS's own is openrsync), GNU coreutils, sed, grep and find, and bash 5 (Homebrew),
+and points `TMPDIR` at its real path (macOS's is behind `/var` → `/private/var`). To run it
+on a Mac, do the same.
+
+Tests written as `#[cfg(target_os = "linux")]` don't compile there at all (`/proc`, `prctl`,
+pty pairs, process groups; most of them were Linux-only before macOS builds). These skip on
+macOS (`ignored`, with why):
+
+| Test | Why |
+| --- | --- |
+| `backups::tests::a_backup_run_is_recorded_and_arena_backups_says_it` | whether a backup is running is read from `/proc/locks` |
+| `disk::tests::other_runs_reservations_count_against_the_free_space` | whether a reservation's process still runs is read from `/proc` |
+| `resolve::tests::recent_activity_or_a_change_since_the_copy_leaves_it_busy` | it reads its session from `/proc/self/stat` |
+| `setup::tests::real_git::the_update_acts_on_the_volume_copy_through_the_link`, and `volume::tests::sim` (12 tests, compiled out) | the move onto the volume finds the repo's users through `/proc` |
+| `agent_notes::tests::saves_made_meanwhile_are_never_lost`, `…::the_notes_land_between_the_markers_and_keep_the_rest` | the notes are swapped in with `renameat2`, which macOS lacks |
+| `claude::tests::` `the_push_replaces_every_old_token_line_…`, `off_on_a_machine_with_no_rc_files_…`, `the_rewrite_goes_through_links_…`, `tracing_never_shows_the_token_…` | the script checks its lock through `/dev/fd/9`, which on macOS isn't the file |
+| `archive::tests::a_symlink_too_long_to_store_is_left_out_with_a_warning`, `…::too_many_unstorable_links_leave_only_that_pod_out`, `archive::sync::tests::skip_rules_go_through_a_private_file_…` | macOS caps a symlink's target at 1023 bytes |
+| `disk::tests::a_walk_counts_blocks_hard_links_once_and_stops_at_its_cap` | APFS gives a directory no blocks |
+| `replica::tests::the_tidy_up_guesses_nothing` | on APFS the stamp file turns up in its own `find -cnewer` scan |
+| `backup::tests::a_key_left_after_the_redaction_is_never_pushed` | it wraps `/usr/bin/sed`, BSD's on macOS |
+| `restore::tests::a_restore_lands_in_the_volume_copy_through_the_link_and_deletes_nothing`, `…::newer_work_on_the_pod_is_never_reverted_unless_asked` | the stand-in pod's rsync is Homebrew's 3.5, which won't write through the `--keep-dirlinks` link (ELOOP); the Linux runs' is 3.2 |
+| `setup::tests::real_git::the_checkout_gets_the_backups_identity_…`, `hetzner_setup_tests::the_checkout_gets_a_git_identity_…` | git makes an identity up from a macOS host name (`*.local`), so no commit fails for want of one |
+
+`tests/color.rs` skips its terminal half where `script` isn't util-linux's.
 
 ### The live smoke test
 

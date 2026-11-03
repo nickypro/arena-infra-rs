@@ -3781,6 +3781,7 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
     /// driver's CUDA) run for real. Just enough tensor for `tensor_check`: `arange(n) * 2 + 1`
     /// sums to n², a matmul's sum is finite. `FAKE_TORCH_DRIVER_API=gone`: no private
     /// `_cuda_getDriverVersion`, as in torch 2.14.
+    #[cfg(target_os = "linux")]
     const FAKE_TORCH: &str = r#"
 import os
 
@@ -3865,6 +3866,7 @@ class cuda:
     /// script's libcuda read, without a GPU or a libcuda — and none of the test machine's own,
     /// which would make the result the machine's. `FAKE_LIBCUDA`: the version
     /// `cuDriverGetVersion` reports, or `error` for a call that fails; unset, no libcuda.
+    #[cfg(target_os = "linux")]
     const FAKE_CTYPES: &str = r#"
 import os
 
