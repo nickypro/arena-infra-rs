@@ -191,7 +191,11 @@ fn hand_over(terminal: &mut Terminal<CrosstermBackend<Stdout>>, banner: &str, cm
     println!("{banner}");
     let status = arena_core::remote::run_foreground(cmd, "ssh");
     *terminal = setup_terminal()?;
-    while_ours(terminal, |t| t.clear())?;
+    // The screen cleared, the way `Terminal::clear` did before ratatui 0.30. Since 0.30 it also
+    // keeps the cursor where it was, so it asks the terminal where that is and waits up to 2 s for
+    // the answer. A terminal that doesn't answer in time ended the dashboard on the way back
+    // from ssh. The new terminal's buffers are empty, so its next frame draws everything.
+    while_ours(terminal, |t| t.backend_mut().clear_region(ratatui::backend::ClearType::All))?;
     Ok(status)
 }
 
