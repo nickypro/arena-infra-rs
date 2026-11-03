@@ -1672,6 +1672,11 @@ Once its keys are copied, each machine's AI keys are checked too ([`pods test
 --keys`](#ai-keys---keys)'s check). A dead key is said with what to run and folded into the
 machine's check, but the machine stays READY: a key is never a reason to replace one.
 
+The deep check holds the course too ([`--course`](#the-course---course)'s checks: its proxy port, the
+deploy key, the repo's branch, Claude Code, the notebook kernel, uv). A course FAIL is said with what
+to run and the machine stays READY (`check pass, course setup fail`), never replaced or remembered as
+bad. A kernel that can't import torch is the image's or setup's: the name FAILs, left running.
+
 #### Bad machines are remembered for 72 h
 
 A host FAIL on a machine the provider names (RunPod/Vast machine id — never an IP) is also
@@ -2473,20 +2478,22 @@ per pod; the start may have happened if it timed out — the report says so).
 
 ### `pods test --deep`
 
-`pods test --deep [targets] [--json] [-v]` — the **is-this-pod-usable** check (read-only), for what
-a plain `import torch` misses on a bad host. One embedded script per pod (one SSH exec, 150s budget,
-inside the conda env) measures: nvidia-smi GPUs + driver + CUDA version; torch import,
+`pods test --deep [targets] [--json] [-v] [--claude-call]` — the **is-this-pod-usable** check
+(read-only), for what a plain `import torch` misses on a bad host. One embedded script per pod (one
+SSH exec, 150s budget, inside the conda env) measures: nvidia-smi GPUs + driver + CUDA version; torch import,
 `cuda.is_available()`, device count vs nvidia-smi; a small tensor op on **every GPU** (catches
 `cuInit` 999 / `CUDA error: unknown error`); with >1 GPU a GPU→GPU copy that must arrive intact and
 an NCCL `all_reduce` across the GPUs (else `skipped (1 GPU)`); a 32 MiB Hugging Face download (no
 token sent); free disk on `/` and `/workspace`; host load + uptime; what setup's VS Code warm-up
 left (newest server, extensions, default interpreter — an informational `vscode` line, Pass or Skip,
-never WARN/FAIL); and the machine's **AI keys** ([below](#ai-keys---keys)). The provider's maintenance
-window comes from the API.
+never WARN/FAIL); the machine's **keys** ([below](#ai-keys---keys)); and **what a participant uses
+beside the machine** ([the course](#the-course---course)). The provider's maintenance window comes from
+the API.
 
 **FAIL**: any CUDA/tensor/copy/NCCL error, count mismatch (torch's count against nvidia-smi's, and
 against the GPUs the provider reports for the pod: fewer fails), missing torch/nvidia-smi, driver
-below the floor, unreachable/timed out — and a dead AI key, which is never the machine's.
+below the floor, unreachable/timed out — and a dead key or a course FAIL, which are never the
+machine's.
 
 #### AI keys (`--keys`)
 
@@ -2495,9 +2502,10 @@ machine, does no torch or GPU work, and has the same targets and cohort scope as
 listed without an SSH endpoint is skipped with a note, never waited on. `--deep` checks the same
 keys, from the same script.
 
-The script asks about `$OPENROUTER_API_KEY` and `$HF_TOKEN` as the participant's login shell exports
-them. It makes one bounded call each (15 s): OpenRouter's `GET /api/v1/key`, which is free, and
-Hugging Face's `whoami-v2`. It reports the HTTP status, the key's cap, what's left of it and whether
+The script asks about `$OPENROUTER_API_KEY`, `$HF_TOKEN` and `$WANDB_API_KEY` as the participant's
+login shell exports them. It makes one bounded call each (15 s): OpenRouter's `GET /api/v1/key`, which
+is free, Hugging Face's `whoami-v2`, and W&B's GraphQL `viewer` (free; W&B answers a key it doesn't
+know with 200 and no user, which counts as rejected). It reports the HTTP status, the key's cap, what's left of it and whether
 it's paused. It also reports the key's fingerprint: the first 12 hex of its SHA-256, which the control
 box compares with the keys CSV's key and with `HF_TOKEN`. The secret is never printed, and neither is
 OpenRouter's redacted label of it. curl reads the header on its stdin (`-K -`), so the key is on no
@@ -2517,6 +2525,11 @@ command line.
 | PASS | `ok, $4.97 of $5.00 left` (or `no cap`) | `accepted by Hugging Face` | |
 | note | a staff `@` box, a fleet with no keys (no keys-CSV rows, no `OPENROUTER_PROVISIONING_KEY`), a check from an older script | no `HF_TOKEN` configured | |
 
+**W&B** (`wandb`) follows the `hf_token` column's rules, held to the config's `WANDB_API_KEY` (or the
+machine's own row in `keys/wandb_api_keys.csv`, which wins). Both are optional: `pods copy-keys` (and
+setup) export `WANDB_API_KEY` on each machine once either is set. A fleet with neither gets a note,
+never a verdict. The `--keys` table gains a `W&B` column once some machine's key was judged.
+
 The under-a-tenth line leaves a day or so to raise the cap before calls fail. It stops at $1 so that
 a large cap doesn't warn while it still has plenty.
 
@@ -2534,6 +2547,47 @@ then runs this check (`[apple] AI key ✓ ok, $4.97 of $5.00 left`). A dead key 
 run, and the machine stays READY (`check pass, AI key fail`). The dashboard's test (`e`) adds the
 verdict to its torch line. Its deep check (`d`) judges the keys, and its detail view has an
 `ai check:` line.
+
+#### The course (`--course`)
+
+`pods test --course [targets] [--json] [-v] [--claude-call]` checks only what a participant uses beside
+the machine. It takes seconds per machine (the notebook kernel's start is most of it), does no GPU
+work, and has the same targets and cohort scope as `--deep`, which checks the same things from the
+same script. Everything is read-only:
+
+- the course repo is read through git's metadata (refs, config, the operation markers) with no
+  optional locks, never a file of the work;
+- the push is a dry run, with no hooks, and a host key ssh hasn't seen goes to a temp file;
+- the kernel runs with its runtime and IPython files in the script's temp dir, and is stopped before
+  the script ends;
+- the proxy is only connected through.
+
+| Check | What it looks at | FAIL | WARN | What it says to run |
+|---|---|---|---|---|
+| `proxy` | from this box, one SSH connection through the machine's proxy port (`SSH_PROXY_HOST`, its stable port), compared with the machine itself: `~/.name`, the hostname, the sshd host keys' fingerprint | it reaches another machine (a route left on the old pod after a replace); the proxy file forwards to an old endpoint; the port doesn't answer | no forward for it; it answers but the machine reported no identity; a write-only proxy (`SSH_PROXY_RELOAD_CMD=""`, the sandbox) whose port doesn't answer | `proxy apply` |
+| `backup` | `git push --dry-run` with the deploy key (`GIT_SSH_KEY_REMOTE`): GitHub's answer for the key; then the last git backup as `arena backups` judges it | no deploy key; GitHub refuses it (read-only, not on the repo, unknown host key); the last backup failed | the push couldn't be asked (network); the last backup is late (twice the cron's gap) | `pods setup <name>`, `pods backup <name>`, or write access for the key on GitHub |
+| `repo` | the course repo (`BACKUP_REPO_PATH`): there, `origin` the configured repo, its branch | no repo; `origin` isn't `ARENA_REPO_OWNER/ARENA_REPO_NAME` (backups refuse to push) | on `main`/`master` or a detached HEAD (no backup commits); not today's autocommit branch (`init-branches`' name, from `ARENA_START_DATE`); a merge, rebase, cherry-pick… in progress | `pods setup <name>`, `pods init-branches <name>`, or the git command that ends the operation |
+| `claude` | `claude --version` for root, and which auth Claude Code would use, by kind and fingerprint: an `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` pair, `ANTHROPIC_API_KEY`, an apiKeyHelper, `CLAUDE_CODE_OAUTH_TOKEN` (`arena claude`'s export, or a clods profile's `settings.json`), a /login | not installed; `--version` fails; the auth is rejected | not `arena claude`'s token (moved, rotated); no token though `arena claude` pushed one; at its limit; not checked | `pods setup <name>`, `claude push <name>`, `pods copy-keys <name>` |
+| `kernel` | the course env the agent notes name (`/opt/arena-env` on GPU images, `<repo>/.venv` on bare VMs): its Jupyter kernels for that python, one started, `import torch` in it (20 + 25 s) | no course env; the kernel can't import torch (software/setup, never the host) | no ipykernel in it; no kernel registered for it; it didn't start or import in time | `pods setup <name>`, or the `pods run` line that installs or registers it |
+| `uv` | `uv` on PATH in a login shell | | missing | `pods setup <name> --notes-only` |
+
+Having no Claude Code auth is a note, never a FAIL. Which auth wins follows Claude Code's own order:
+a settings file's `env` beats the shell's (how a clods profile's token beats an exported one). An API
+key is checked with the free models list, and a Bearer token to OpenRouter with the AI key's free call.
+An OAuth token (`arena claude`, clods) is checked only by comparing its fingerprint with what `arena
+claude` pushed, because the only call that proves it works uses the account. **`--claude-call`** makes
+that call: one Messages request per machine, 1 token from `claude-haiku-5-5`, which counts against
+the account's limits (or its money, for an API key).
+
+A course FAIL is never the machine's. `up --check` never replaces a machine for one, never retries
+it and never remembers its host as bad. It says the FAIL with what to run and keeps the machine:
+`READY … check pass, course setup fail`. The kernel's FAIL is the exception: a course env whose kernel
+can't import torch is the image's or setup's (software/setup: left running, not replaced). A new
+machine is on `main` until `init-branches`, so `up`'s check says that only with `-v`. The output is a
+`NAME RESULT PROXY BACKUP REPO CLAUDE KERNEL NOTES` table, every check with `-v`, and per machine
+`{…, facts.identity, facts.repo, facts.push, facts.claude, facts.kernel, facts.uv}` with `--json`
+(fingerprints only). `--course` exits non-zero on a FAIL, and isn't recorded in the health cache.
+`--deep` is, with its course checks, and the dashboard's detail view has a `course:` line from them.
 
 #### MIG slices
 
@@ -2584,7 +2638,9 @@ its `machine_id` — never a Vast IP, which several machines can share; `up --ch
 replacement on a failed machine by the same rule).
 
 `--json` prints per-pod `{id, name, provider, status, checks, facts}` (no IPs; the keys as
-`facts.openrouter` / `facts.hf`, fingerprints only) — `[]` when no pod could be checked;
+`facts.openrouter` / `facts.hf` / `facts.wandb`, the course as `facts.identity` / `facts.repo` /
+`facts.push` / `facts.claude` / `facts.kernel` / `facts.uv`, fingerprints only) — `[]` when no pod
+could be checked;
 summary/notes go to stderr. Exits non-zero if any pod FAILs; warnings don't.
 Targets scope the run (a named pod with no SSH endpoint is a FAIL; a typo is an error). With no
 targets (or `--all`) it checks **this cohort's pods**: `<prefix>-…`, never an `@` staff entry or

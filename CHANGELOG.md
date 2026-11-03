@@ -19,6 +19,39 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-03 · arena 2.15: `pods test` checks the course: proxy, backups, branch, Claude, kernel, W&B
+- **`arena pods test --course`** checks what a participant uses beside the machine, in seconds per
+  machine and with no GPU work. `--deep` checks the same things too. Each FAIL or WARN says what to
+  run:
+  - **proxy**: the machine's proxy port, tried from this box, reaches *this* machine (its `~/.name`,
+    hostname and sshd host keys). It catches a route left on the old pod after a replace
+    (`arena proxy apply`).
+  - **backup**: GitHub accepts a push with its deploy key (a dry run, nothing is sent), and the last
+    git backup's age as `arena backups` judges it (WARN when late).
+  - **repo**: the course repo is there, its `origin` is the cohort repo, and it's on today's branch
+    (`init-branches`' name). WARN on `main`, a detached HEAD, an older day's branch or a merge/rebase
+    in progress. Only git's metadata is read, never the work.
+  - **claude**: `claude --version` runs for root, and which auth it would use, by kind and
+    fingerprint: `arena claude`'s token, a clods profile, an API key, an `ANTHROPIC_AUTH_TOKEN`
+    pair. Having none is a note.
+  - **kernel**: the course env's Jupyter kernel starts and imports torch.
+  - **uv**: on PATH in a login shell.
+- **W&B**: once the config sets `WANDB_API_KEY` (or `keys/wandb_api_keys.csv` has rows),
+  `pods copy-keys` exports it and `pods test --keys` checks it (a free call, fingerprints only).
+- **`--claude-call`** (with `--course` or `--deep`) makes one tiny Claude request per machine with
+  its own auth. It uses that account's limits or money, so it's opt-in. Without it an OAuth token is
+  only compared with what `arena claude` pushed.
+- None of these is the machine's fault: `up --check` keeps the machine (`READY … check pass, course
+  setup fail`) and never replaces or remembers it for one. A kernel that can't import torch is the
+  image's: the name FAILs as software/setup, left running.
+- The dashboard's detail view has a `course:` line from the last deep check.
+- `--json` gains `facts.identity`, `facts.repo`, `facts.push`, `facts.claude`, `facts.kernel`,
+  `facts.uv` and `facts.wandb`, and the checks `proxy`, `backup`, `repo`, `claude`, `kernel`, `uv`,
+  `wandb`. `--deep` now exits non-zero on a course FAIL.
+
+### Config
+- `WANDB_API_KEY` (optional, new): the W&B key every machine gets.
+
 ## 2026-11-02 · arena 2.14: `pods reimage --disk GB` resizes a RunPod pod in place
 - **`arena pods reimage NAME --disk 500 --wipe-ok`** gives a RunPod pod a 500 GB container disk
   without a new pod: the reimage's own request carries the size, so the pod keeps its id and host.

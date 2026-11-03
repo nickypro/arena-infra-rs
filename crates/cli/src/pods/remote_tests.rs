@@ -4898,3 +4898,121 @@ mod save_output;
 
 /// Golden tests of `pods cp`, `run` and `test`'s output (docs/OUTPUT.md), at default and `-v`.
 mod change_output;
+
+// ---- `pods test --course` ----
+
+/// A fleet with a (remote) proxy, today's day, the cohort repo and a deploy key: what the course
+/// checks hold machines to.
+fn course_cfg() -> Config {
+    Config::parse(
+        "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=( apple bloom cloud )\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\n\
+         SSH_PROXY_HOST=proxy.test\nSSH_PROXY_STARTING_PORT=9500\nPROXY_LOCAL=false\nSSH_PROXY_RELOAD_CMD=true\n\
+         ARENA_REPO_OWNER=nickypro\nARENA_REPO_NAME=arena-sandbox-materials\nGIT_SSH_KEY_REMOTE=/root/.ssh/id_ed25519\n",
+    )
+}
+
+/// One machine's course facts: who it is, its repo on `branch`, the push's exit, the kernel's
+/// `import torch`.
+fn course_out(name: &str, hostkey: &str, branch: &str, push: &str, torch: &str) -> String {
+    format!(
+        "deep_check=3\nid.name=devtest-{name}\nid.hostname=h-{name}\nid.hostkey={hostkey}\n\
+         repo.path=/root/ARENA_materials\nrepo.state=ok\nrepo.branch={branch}\nrepo.op=none\n\
+         repo.origin=github.com:nickypro/arena-sandbox-materials.git\nrepo.origin_keys=github.com/nickypro/arena-sandbox-materials\n\
+         push.key=set\n{push}\nclaude.path=/usr/local/bin/claude\nclaude.version=2.1.30 (Claude Code)\nclaude.auth=none\n\
+         kernel.env=/opt/arena-env\nkernel.ipykernel=yes\nkernel.specs=arena-env\nkernel.registered=arena-env\nkernel.name=arena-env\n\
+         kernel.start_secs=1.0\nkernel.torch={torch}\nkernel.torch_version=2.9.0\nkernel.torch_secs=2.0\n\
+         uv.path=/usr/local/bin/uv\nuv.version=uv 0.9.5\ndeep_check_end=1\n"
+    )
+}
+
+fn identity(name: &str, hostkey: &str) -> String {
+    format!("deep_check=3\nid.name=devtest-{name}\nid.hostname=h-{name}\nid.hostkey={hostkey}\ndeep_check_end=1\n")
+}
+
+/// `pods test --course`: one exec per machine (the script's course mode with the repo, the envs
+/// and the deploy key as its arguments, in the login wrap, within its budget) and one connection
+/// through each machine's proxy port (its slot in MACHINE_NAME_LIST: the proxy is remote here),
+/// judged together. apple is fine; bloom's port reaches another machine (the route left on its
+/// old pod) and GitHub refuses its deploy key; cloud's port doesn't answer and its kernel can't
+/// import torch — and the command fails, never as the machines' fault.
+#[tokio::test(start_paused = true)]
+async fn pods_test_course_checks_what_each_participant_uses() {
+    use arena_core::health::course::{identity_command, PROXY_PROBE_TIMEOUT};
+    use arena_core::health::{course_check_command, render_course_report, CheckArgs, FailureKind, Status, COURSE_CHECK_TIMEOUT};
+    let cfg = course_cfg();
+    let fake = Arc::new(FakeRemote::new());
+    // Today's branch, as `init-branches` would name it (no ARENA_START_DATE here: none, so any
+    // branch but main passes).
+    let branch = |n: &str| format!("autocommit-devtest-w1d1-{n}");
+    let ok = "push.exit=0";
+    fake.script(&host(22001), [FakeReply::stdout(&course_out("apple", "0123456789aa", &branch("apple"), ok, "ok"))]);
+    fake.script(
+        &host(22002),
+        [FakeReply::stdout(&course_out("bloom", "0123456789bb", &branch("bloom"), "push.exit=128\npush.error=git@github.com: Permission denied (publickey).", "ok"))],
+    );
+    fake.script(&host(22003), [FakeReply::stdout(&course_out("cloud", "0123456789cc", &branch("cloud"), ok, "error: ModuleNotFoundError: No module named 'torch'"))]);
+    fake.script("proxy.test:9500", [FakeReply::stdout(&identity("apple", "0123456789aa"))]);
+    // bloom's port: still its old pod (the same name, another host key).
+    fake.script("proxy.test:9501", [FakeReply::stdout(&identity("bloom", "0123456789ff"))]);
+    fake.script("proxy.test:9502", [FakeReply::exit(255, "ssh: connect to host proxy.test port 9502: Connection refused")]);
+    let remote: Arc<dyn Remote> = fake.clone();
+    let start = Instant::now();
+    let kind = crate::pods::health::Kind::Course { claude_call: false };
+    let results = crate::pods::health::check_fleet(None, &remote, &cfg, &everyone(&fleet()), kind).await.unwrap();
+    assert_eq!(start.elapsed(), Duration::ZERO);
+    for (port, pod) in [22001, 22002, 22003].into_iter().zip(&fleet().pods) {
+        let want = course_check_command(Some("arena-env"), &CheckArgs::for_pod(&cfg, pod));
+        assert_eq!(execs(&fake, port), [(want, Some(COURSE_CHECK_TIMEOUT))], "port {port}");
+    }
+    for port in [9500, 9501, 9502] {
+        let calls = fake.calls_to(&format!("proxy.test:{port}"));
+        assert!(
+            matches!(&calls[..], [RemoteCall::Exec { cmd, timeout, .. }] if *cmd == identity_command() && *timeout == Some(PROXY_PROBE_TIMEOUT)),
+            "{port}: {calls:#?}"
+        );
+    }
+    let got: Vec<(&str, Status, Option<FailureKind>)> = results.iter().map(|h| (h.name.as_str(), h.status, h.failure_kind())).collect();
+    assert_eq!(
+        got,
+        [
+            ("devtest-apple", Status::Pass, None),
+            ("devtest-bloom", Status::Fail, Some(FailureKind::Course)),
+            ("devtest-cloud", Status::Fail, Some(FailureKind::Software))
+        ]
+    );
+    let report = render_course_report(&results, false);
+    let rows: Vec<&str> = report.lines().collect();
+    assert_eq!(rows[0], "NAME           RESULT  PROXY        BACKUP   REPO  CLAUDE  KERNEL    NOTES", "{report}");
+    assert_eq!(rows[1], "devtest-apple  pass    :9500        ok       ok    none    3.0s", "{report}");
+    assert!(rows[2].starts_with("devtest-bloom  fail    :9501 other  no push  ok    none    3.0s      proxy: port 9501 reaches another machine (devtest-bloom) — `arena proxy apply`"), "{report}");
+    assert!(rows[3].starts_with("devtest-cloud  fail    :9502 down   ok       ok    none    no torch  proxy: port 9502 doesn't reach it: connection refused — `arena proxy apply`"), "{report}");
+    assert!(report.contains("course setup failure, not the machine: devtest-bloom"), "{report}");
+    // --json: the course facts and checks, no secret anywhere.
+    let v = serde_json::to_value(&results).unwrap();
+    assert_eq!(v[1]["facts"]["push"]["exit"], 128);
+    assert_eq!(v[0]["facts"]["repo"]["branch"], serde_json::json!(branch("apple")));
+    assert!(v[2]["checks"].as_array().unwrap().iter().any(|c| c["name"] == "kernel" && c["status"] == "fail"), "{v}");
+
+    // The command: fails on them, says so.
+    let fake2 = Arc::new(FakeRemote::new());
+    fake2.script(&host(22001), [FakeReply::stdout(&course_out("apple", "0123456789aa", &branch("apple"), ok, "ok"))]);
+    fake2.script(&host(22002), [FakeReply::stdout(&course_out("bloom", "0123456789bb", "main", ok, "ok"))]);
+    fake2.script(&host(22003), [FakeReply::stdout(&course_out("cloud", "0123456789cc", &branch("cloud"), ok, "error: x"))]);
+    for (port, n, k) in [(9500, "apple", "0123456789aa"), (9501, "bloom", "0123456789bb"), (9502, "cloud", "0123456789cc")] {
+        fake2.script(&format!("proxy.test:{port}"), [FakeReply::stdout(&identity(n, k))]);
+    }
+    let cmd = PodCmd::Test { deep: false, keys: false, course: true, claude_call: true, sel: Select::default(), json: false, cohort: crate::cli::CohortScope::default() };
+    let err = handle_pods(cmd, &fleet(), fake2.clone(), &cfg, true).await.unwrap_err();
+    assert_eq!(err.to_string(), "1 pod(s) failed the course check");
+    // `--claude-call` reached the script (its last argument), and nothing else was asked of the pod.
+    let calls = execs(&fake2, 22001);
+    assert_eq!(calls.len(), 1);
+    let paid = course_check_command(Some("arena-env"), &CheckArgs { claude_call: true, ..CheckArgs::for_pod(&cfg, &fleet().pods[0]) });
+    assert_eq!(calls[0].0, paid);
+    // Alone, `--claude-call` is refused before anything is asked.
+    let fake3 = Arc::new(FakeRemote::new());
+    let cmd = PodCmd::Test { deep: false, keys: true, course: false, claude_call: true, sel: Select::default(), json: false, cohort: crate::cli::CohortScope::default() };
+    let err = handle_pods(cmd, &fleet(), fake3.clone(), &cfg, true).await.unwrap_err();
+    assert!(err.to_string().contains("--claude-call goes with --course or --deep"), "{err}");
+    assert!(fake3.calls().is_empty());
+}

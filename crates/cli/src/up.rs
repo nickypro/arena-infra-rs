@@ -3021,6 +3021,37 @@ mod tests {
         assert!(conclude(&rows, &|_, _| {}).is_ok(), "a READY machine: the run succeeds");
     }
 
+    /// A course FAIL (here: no course repo on the machine) is not a sick host either: said with
+    /// what to run, and the machine is kept — READY, never terminated, replaced or remembered as
+    /// a bad host. The deep check carries the course facts' arguments (the repo, the envs).
+    #[tokio::test(start_paused = true)]
+    async fn up_check_keeps_a_machine_whose_only_problem_is_its_course_setup() {
+        let missing = DEEP_HEALTHY.replace("deep_check_end=1", "repo.path=/root/ARENA_materials\nrepo.state=missing\nuv.path=missing\ndeep_check_end=1");
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.2", 22002, 30)])]);
+        let fake = Arc::new(FakeRemote::new());
+        // copy, config, the deep check (the machine healthy, its repo gone).
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(&missing)]);
+        let cfg = cfg(None);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(3), None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "never terminated nor recreated");
+        assert!(fake.calls_to(&host("10.0.0.2", 22002)).is_empty(), "no replacement was placed");
+        lines.find("[devtest-apple] check: FAIL (course setup, not the machine: kept) — repo: no course repo at /root/ARENA_materials — `arena pods setup apple`");
+        let (ready, _) = lines.find("[devtest-apple] READY after ");
+        assert!(lines.all()[ready].ends_with("check pass, course setup fail"), "{}", lines.all()[ready]);
+        assert!(!lines.all().iter().any(|l| l.contains("terminating") || l.contains("(host)")), "{:#?}", lines.all());
+        let pod = Pod { provider: "runpod".into(), ..Pod::default() };
+        let deep = health::deep_check_command_for(Some("arena-env"), &health::CheckArgs::for_pod(&cfg, &pod));
+        assert!(fake.calls_to(&host("10.0.0.1", 22001)).iter().any(|c| matches!(c, RemoteCall::Exec { cmd, .. } if *cmd == deep)));
+        let row = &rows[0];
+        assert_eq!((row.verdict.clone(), row.health), (Verdict::Ready, Some(Status::Fail)));
+        assert_eq!((row.attempts[0].end.clone(), row.attempts[0].terminated), (AttemptEnd::Kept, false));
+        assert!(conclude(&rows, &|_, _| {}).is_ok(), "a READY machine: the run succeeds");
+    }
+
     /// python killed by its 75s timeout before `import torch` could report (a hung or overloaded
     /// host as likely as the image; OOM kills and SIGILL on an old CPU look the same): a host
     /// failure, so the pod is replaced — it used to count as software (torch FAILed) and was left

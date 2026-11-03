@@ -2613,6 +2613,30 @@ mod tests {
         assert_eq!(key_check_line(keys), Some(("✗ x".to_string(), Tone::Bad)));
     }
 
+    /// The detail view's `course:` line: each FAIL then WARN of the course checks with what to
+    /// run, in the worst one's tone; `✓` and the checks that passed; nothing when none was judged.
+    /// A deep check that failed for its course alone says so in the footer.
+    #[test]
+    fn the_course_line_says_what_the_participant_uses() {
+        let c = |name: &str, status: Status, detail: &str| Check { name: name.into(), status, detail: detail.into() };
+        let pass = [c("proxy", Status::Pass, "port 9500 reaches it"), c("claude", Status::Skip, "v2, no auth"), c("uv", Status::Pass, "/usr/local/bin/uv")];
+        assert_eq!(course_check_line(&pass), Some(("✓ proxy · uv".into(), Tone::Good)));
+        let mixed = [
+            c("repo", Status::Warn, "on main: no backups — `arena pods init-branches apple`"),
+            c("proxy", Status::Fail, "port 9500 reaches another machine (x) — `arena proxy apply`"),
+            c("uv", Status::Pass, "/usr/local/bin/uv"),
+        ];
+        assert_eq!(
+            course_check_line(&mixed),
+            Some((
+                "✗ proxy: port 9500 reaches another machine (x) — `arena proxy apply` · ! repo: on main: no backups — `arena pods init-branches apple`".into(),
+                Tone::Bad
+            ))
+        );
+        assert_eq!(course_check_line(&[c("kernel", Status::Skip, "not reported")]), None);
+        assert_eq!(course_check_line(&[]), None);
+    }
+
     /// The detail view's `ai check:` line: the OpenRouter key's verdict, the HF token's only when
     /// it isn't a pass, in the worst one's tone; nothing when neither was judged.
     #[test]
