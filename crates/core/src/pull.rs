@@ -1266,7 +1266,9 @@ pub const RSYNC_VANISHED_EXIT: i32 = 24;
 
 /// Whether an rsync that exited [`RSYNC_VANISHED_EXIT`] lost only what a copy can do without:
 /// every `file has vanished: "<path>"` line on its stderr names a file outside any `.git/`, or one
-/// of git's lock files in one (`*.lock`, `gc.pid`: there only while a git command runs). A pack,
+/// of git's lock files in one: a `*.lock` (no ref may end so: git refuses the name), or the git
+/// dir's own `gc.pid` — there only while a git command runs (never one deeper: `refs/tags/gc.pid`
+/// is a ref, review codex r4). A pack,
 /// object or ref that vanished under `.git/` (review codex r3: maintenance replacing a pack, the
 /// new one not in rsync's list) can leave the copy's refs naming objects it hasn't got, so that
 /// copy still fails. No such line at all: not known, so not.
@@ -1278,7 +1280,8 @@ pub fn vanished_only_disposable(stderr: &str) -> bool {
         any = true;
         let in_git = path.starts_with(".git/") || path.contains("/.git/");
         let name = path.rsplit('/').next().unwrap_or(path);
-        if in_git && !(name.ends_with(".lock") || name == "gc.pid") {
+        let gc_pid = path == ".git/gc.pid" || path.ends_with("/.git/gc.pid");
+        if in_git && !(name.ends_with(".lock") || gc_pid) {
             return false;
         }
     }
@@ -1606,6 +1609,9 @@ mod tests {
             (&["/root/runs/ckpt.pt", "/root/ARENA_materials/.git/objects/ab/cdef0123"], false),
             (&["/root/ARENA_materials/sub/.git/refs/heads/main"], false),
             (&["/root/ARENA_materials/.git/packed-refs"], false),
+            (&["/root/ARENA_materials/.git/refs/tags/gc.pid"], false),
+            (&["/root/ARENA_materials/.git/refs/heads/gc.pid"], false),
+            (&[".git/gc.pid"], true),
             (&[], false),
         ] {
             assert_eq!(vanished_only_disposable(&v(paths)), ok, "{paths:?}");

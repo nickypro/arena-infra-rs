@@ -795,7 +795,7 @@ Everything else arrived, so the copy counts: the pod's line says `some files van
 while they were copied (the next pull takes them)`, and the next pull takes what the pod has then
 (live: one cohort pod's copy failed every run on it). rsync exits 24 only when that was all that
 went wrong; any other trouble is exit 23, and fails the copy. So does a 24 for a file under a repo's
-`.git/` other than git's lock files (`*.lock`, `gc.pid`): a pack replaced mid-copy can leave the
+`.git/` other than git's lock files (`*.lock`, the git dir's own `gc.pid`): a pack replaced mid-copy can leave the
 copy's refs naming objects it hasn't got. The reaper's own copy, which must be whole before a pod
 is deleted, still needs exit 0.
 
