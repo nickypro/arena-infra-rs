@@ -28,6 +28,7 @@ mod admin_key_tests;
 mod archive;
 mod backups;
 mod claude;
+mod clods;
 mod disk;
 mod fleet_files;
 mod image;
@@ -460,6 +461,11 @@ async fn run() -> Result<()> {
     if let Cmd::Update { check, dry_run, skip_attestation } = cli.cmd {
         return handle_update(check, dry_run, skip_attestation, cli.yes).await;
     }
+    // A local folder: no provider, and a config only for CLODS_DIR (a box with none can install).
+    if let Cmd::Clods(c) = cli.cmd {
+        let (path, _) = arena_core::config::find_config(cli.config.as_deref());
+        return clods::handle_clods(c, Config::load(&path).ok().as_ref());
+    }
     // `--config`, else ARENA_CONFIG, else ~/.config/arena/config.env, else the built-in default;
     // then the fleet's provider: `--provider`, else the config's PROVIDER, else runpod.
     let (config_path, config_source) = arena_core::config::find_config(cli.config.as_deref());
@@ -471,7 +477,7 @@ async fn run() -> Result<()> {
     // for), so build the provider lazily — only for commands that actually talk to one.
     let provider = match cli.cmd {
         // The archive builds its own Hetzner client (its own token), and its cron path none.
-        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Update { .. } | Cmd::Gpus { .. } | Cmd::Offers { .. } | Cmd::Api(_) | Cmd::Archive(_) | Cmd::Image(_) | Cmd::Backups { .. } => None,
+        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Update { .. } | Cmd::Clods(_) | Cmd::Gpus { .. } | Cmd::Offers { .. } | Cmd::Api(_) | Cmd::Archive(_) | Cmd::Image(_) | Cmd::Backups { .. } => None,
         // Fleet-wide: every command spans all configured providers (create still targets
         // --provider). One configured backend behaves like that single provider.
         _ => Some(picked.fleet(&cfg)?),
@@ -482,7 +488,7 @@ async fn run() -> Result<()> {
 
     match cli.cmd {
         Cmd::Tui => launch_tui(&provider_name, &config_path),
-        Cmd::Update { .. } => unreachable!("handled before the config is read"),
+        Cmd::Update { .. } | Cmd::Clods(_) => unreachable!("handled before the config is read"),
         Cmd::Plan(c) => handle_plan(c, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Config(ConfigCmd::Check) => config_check(&cfg, &provider_name, &[hetzner_image_rows(&cfg).await, disk::check_rows(&cfg)].concat()),
         Cmd::Config(c) => handle_config(c, &cfg, &picked),

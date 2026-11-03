@@ -18,6 +18,7 @@ pub mod balance;
 pub(crate) mod base64;
 pub mod capability;
 pub mod claude;
+pub mod clods;
 pub mod config;
 pub mod cron;
 pub mod datavol;

@@ -358,14 +358,14 @@ pub fn read_tokens_file(path: &Path) -> Result<Parsed, String> {
 
 /// Why a tokens file's mode won't do, if it won't: anyone but its owner may read or write it.
 #[cfg(unix)]
-fn mode_problem(meta: &std::fs::Metadata) -> Option<String> {
+pub(crate) fn mode_problem(meta: &std::fs::Metadata) -> Option<String> {
     use std::os::unix::fs::PermissionsExt;
     let mode = meta.permissions().mode() & 0o777;
     (mode & 0o077 != 0).then(|| format!("is mode {mode:04o}: other users of this box can get at its tokens"))
 }
 
 #[cfg(not(unix))]
-fn mode_problem(_meta: &std::fs::Metadata) -> Option<String> {
+pub(crate) fn mode_problem(_meta: &std::fs::Metadata) -> Option<String> {
     None
 }
 
