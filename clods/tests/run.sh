@@ -11,6 +11,11 @@
 set -uo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
+# Checked here, not in a test: a failure inside `$(shells)` would only end that subshell.
+if [ -n "${CLODS_TEST_ZSH:-}" ] && ! command -v zsh >/dev/null; then
+  echo "✗ no zsh, and CLODS_TEST_ZSH=1 wants clods.sh tested under it" >&2
+  exit 1
+fi
 work=$(mktemp -d "${TMPDIR:-/tmp}/clods-tests.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 only=${1:-}
@@ -123,6 +128,44 @@ test_setup_installs_profiles() {
   gone "$HOME/.clods/tokens"
   eq "$(grep -c '\.clods/clods\.sh' "$HOME/.zshrc")" 1 "hook lines in .zshrc"
   eq "$(grep -c '\.clods/clods\.sh' "$HOME/.bashrc")" 1 "hook lines in .bashrc"
+}
+
+test_a_new_profile_takes_no_other_credential() {
+  tokens "${FOUR[@]:0:2}"
+  # The normal login's settings: a theme to copy, credentials that would beat a profile's token,
+  # and account 1's own token already there.
+  mkdir -p "$HOME/.claude"
+  cat > "$HOME/.claude/settings.json" <<'JSON'
+{"theme": "dark", "apiKeyHelper": "/bin/helper", "env": {"ANTHROPIC_API_KEY": "sk-ant-api03-FAKEkey",
+ "ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": "https://gw.example.com", "CLAUDE_CODE_USE_BEDROCK": "1",
+ "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-FAKEaaaa", "DISABLE_TELEMETRY": "1"}}
+JSON
+  out=$(bash "$T/clods/setup.sh" --summary "$T/clods/tokens")
+  eq "$out" "clods: accounts=2 default=none changed=1"
+  for n in 1 2; do
+    got=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("theme"), d.get("apiKeyHelper"), sorted(d["env"]))' "$(P)/claude$n/settings.json")
+    eq "$got" "dark None ['CLAUDE_CODE_OAUTH_TOKEN', 'DISABLE_TELEMETRY']" "claude$n's settings"
+  done
+  eq "$(token_of "$(P)/claude1")" sk-ant-oat01-FAKEaaaa
+}
+
+test_installs_at_once_take_turns() {
+  # Two pushes that meet (one with a rotated token): each finishes, and each file is whole.
+  host box
+  printf '%s\n' "a@example.com -> sk-ant-oat01-FAKEold1" "b@example.com -> sk-ant-oat01-FAKEold2" > "$T/old"
+  printf '%s\n' "a@example.com -> sk-ant-oat01-FAKEnew1" "b@example.com -> sk-ant-oat01-FAKEnew2" > "$T/new"
+  chmod 600 "$T/old" "$T/new"
+  for round in 1 2 3 4; do
+    pids=()
+    for t in old new old new; do
+      HOME=$T/hosts/box bash "$T/clods/setup.sh" --summary "$T/$t" > "$T/out.$round.$t.$RANDOM" 2>&1 &
+      pids+=($!)
+    done
+    for p in "${pids[@]}"; do wait "$p" || fail "an install failed in round $round: $(cat "$T"/out.$round.* )"; done
+  done
+  got=$(token_of "$(HP box)/claude1")
+  case "$got" in sk-ant-oat01-FAKEold1|sk-ant-oat01-FAKEnew1) ;; *) fail "claude1's token: [$got]" ;; esac
+  eq "$(find "$(HP box)" -name '.settings.json.*' -o -name '.claude.json.*' | wc -l)" 0 "temp files left"
 }
 
 test_rerun_changes_nothing() {
@@ -309,9 +352,7 @@ test_push_arena() {
 # ---- clods.sh, under bash and zsh -------------------------------------------------------------
 shells() {
   echo bash
-  if command -v zsh >/dev/null; then echo zsh
-  elif [ -n "${CLODS_TEST_ZSH:-}" ]; then fail "no zsh (CLODS_TEST_ZSH=1)"
-  fi
+  if command -v zsh >/dev/null; then echo zsh; fi
 }
 # Run $2 in shell $1, as a new login of this machine would: $3 (an rc file's lines), then the
 # hook. A script file, read line by line as an rc file is (an alias applies to the lines after).

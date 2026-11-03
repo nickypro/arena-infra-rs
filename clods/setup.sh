@@ -153,6 +153,12 @@ say() { if [ -z "$summary" ]; then printf '%s\n' "$*"; fi; }
 [ -d "$profiles" ] || changed=1
 mkdir -p "$profiles"
 chmod 700 "$profiles"
+# One install at a time on a machine: two pushes that meet (a setup and a re-push) take turns,
+# and the second sees what the first wrote. Without flock (util-linux), no lock.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>>"$clods/.lock"
+  flock -w 60 9 || die "another clods install is still running on this machine"
+fi
 # Run from anywhere else (a bundle, a clone), put the tool in ~/.clods so this machine has it.
 if [ "$here" != "$(cd "$clods" && pwd)" ]; then
   for f in $tool_files; do
@@ -166,7 +172,7 @@ fi
 # Prints "changed" when it changed a file.
 write_profile() {
   CLOD_TOKEN="$2" python3 - "$1" <<'PY'
-import json, os, sys
+import json, os, sys, tempfile
 
 profile = sys.argv[1]
 token = os.environ["CLOD_TOKEN"]
@@ -181,12 +187,18 @@ def load(path):
         return None
 
 def save(path, data):
+    # Beside it under a name of its own (0600, made new), then renamed over it: never half a file.
     global changed
-    tmp = path + ".tmp"
-    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix="." + os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
     changed = True
 
 def done():
@@ -201,11 +213,22 @@ if not token:
         save(path, settings)
     done()
 
-# A new profile starts from this machine's normal settings (theme, permission prefs...).
-if settings is None:
+# A new profile starts from this machine's normal settings (theme, permission prefs...), but not
+# their credentials: an API key, a gateway's token or address, a key helper or a cloud provider
+# there would beat the profile's own token (Claude Code's order), and every profile would use it.
+OTHER_AUTH = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+              "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"]
+new = settings is None
+if new:
     settings = load(os.path.join(home, ".claude", "settings.json")) or {}
-env = settings.setdefault("env", {})
-if env.get("CLAUDE_CODE_OAUTH_TOKEN") != token:
+    settings.pop("apiKeyHelper", None)
+    if isinstance(settings.get("env"), dict):
+        for k in OTHER_AUTH:
+            settings["env"].pop(k, None)
+if not isinstance(settings.get("env"), dict):
+    settings["env"] = {}
+env = settings["env"]
+if new or env.get("CLAUDE_CODE_OAUTH_TOKEN") != token:
     env["CLAUDE_CODE_OAUTH_TOKEN"] = token
     save(path, settings)
 if os.stat(path).st_mode & 0o777 != 0o600:

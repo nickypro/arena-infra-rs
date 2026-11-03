@@ -374,6 +374,9 @@ impl PullConfig {
 ///   the VS Code server's own binaries and extensions (setup reinstalls them; its `data/` —
 ///   settings, local history — IS kept);
 /// - `.ssh/` (keys: setup's, and secrets a backup volume shouldn't hold);
+/// - clods' tokens (`crate::clods`): each profile's `settings.json` (every account's token, on
+///   every pod; setup writes them again) and a `/login`'s `.credentials.json`. Its transcripts
+///   (`~/.clods/profiles/claudeN/projects/`) are kept, as `~/.claude`'s are;
 /// - the image's checkout setup moved aside when the repo went onto `/workspace` (a copy from the
 ///   image, as the regular tiers skip it; a pod with work on `/workspace` is never reaped).
 ///
@@ -411,6 +414,9 @@ pub const REAP_NOT_KEPT: &[&str] = &[
     "/.vscode-server/cli/",
     "/.vscode-server/extensions/",
     ".ssh/",
+    "/.clods/tokens",
+    "/.clods/profiles/*/settings.json",
+    "/.clods/profiles/*/.credentials.json",
     "*.arena-aside-*/",
 ];
 
@@ -421,7 +427,8 @@ pub const REAP_NOT_KEPT: &[&str] = &[
 pub const REAP_NOT_KEPT_SUMMARY: &str = "not kept: only what can be downloaded or installed again — Python environments and \
      installed packages (venvs, site-packages, ~/.local/lib, conda envs, node_modules), download and build caches (pip, uv, \
      npm, the Hugging Face and torch hubs, compiled kernels, Python bytecode, matplotlib's), the VS Code server's binaries \
-     and extensions, and arena's moved-aside copy of the image's repo — and every .ssh folder; the rest of ~/.cache is kept";
+     and extensions, and arena's moved-aside copy of the image's repo — and every .ssh folder and the Claude Code tokens in \
+     ~/.clods; the rest of ~/.cache is kept";
 
 /// What a reap's backup never copies AND never loses: sweep/RLVR run folders (large; "do all
 /// run work here"). A pod with any file there at all (a placeholder aside) is `NotCovered` —
@@ -1854,6 +1861,10 @@ mod tests {
             ".local/share/Trash/files/t",
             ".claude.json",
             ".claude/projects/p.jsonl",
+            // clods' profiles (`arena_core::clods`): each holds an account's token.
+            ".clods/profiles/claude1/settings.json",
+            ".clods/profiles/claude1/.claude.json",
+            ".clods/tokens",
             ".ssh/id_ed25519",
             ".bashrc",
             ".zsh_history",
@@ -2414,6 +2425,8 @@ mod tests {
             ".local/share/jupyter/kernels/k.json",
             ".vscode-server/data/User/History/1/entry.py",
             ".claude/projects/p.jsonl",
+            ".clods/profiles/claude1/projects/p.jsonl",
+            ".clods/profiles/claude1/.account",
             ".arena/jobs/20261012-1/out.log",
             ".bashrc",
             ".hidden_scratch/run.py",
@@ -2453,6 +2466,9 @@ mod tests {
             ".vscode-server/bin/abc/node",
             ".vscode-server/extensions/ms-python/x",
             ".ssh/id_ed25519",
+            ".clods/tokens",
+            ".clods/profiles/claude1/settings.json",
+            ".clods/profiles/claude1/.credentials.json",
             ".triton/cache/x",
             "ARENA_materials/TEMP_FOLDER_FOR_SWEEPS/run1/ckpt.pt",
             "ARENA_materials.arena-aside-20261001T000000Z/README.md",

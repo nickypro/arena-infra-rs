@@ -36,7 +36,11 @@ earlier).
 - clods itself: a re-push writes nothing when nothing changed. `push.sh -k` keeps the defaults the
   machines have, and `-q` prints a line per machine. `MACHINE=none` takes every token off with
   `-a` too. A `claude` alias in an rc file no longer stops `clods.sh` loading, and `clods default`
-  takes an email.
+  takes an email. A new profile no longer inherits an API key or a gateway from the normal
+  settings. Two installs on one machine take turns.
+- **The reaper's last backup** of a pod leaves out clods' tokens (each profile's `settings.json`);
+  the transcripts beside them are kept. The archive never takes `~/.clods`. The pod's reap notice
+  says so.
 
 ### Config
 - `CLODS_DIR` (new, optional): the clods folder, e.g. `/root/.clods`. It must hold `tokens`

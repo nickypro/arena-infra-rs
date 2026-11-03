@@ -89,8 +89,11 @@ set up, with the defaults spread (a pod that has a default keeps it), and `arena
   exported `CLAUDE_CODE_OAUTH_TOKEN` (e.g. from `arena pods copy-keys`) doesn't.
 - Profiles show "Claude API" and default to Sonnet: the token doesn't tell Claude Code the plan.
   Use `/model`, or set `"model"` in the profile's `settings.json`.
-- A new profile copies `~/.claude/settings.json` and the folders your normal login trusts. It
-  also symlinks `CLAUDE.md`, `agents/` and `commands/` from `~/.claude`.
+- A new profile copies `~/.claude/settings.json` and the folders your normal login trusts, but no
+  other credential (an API key, a gateway, a key helper or a cloud provider there would beat the
+  profile's token). It also symlinks `CLAUDE.md`, `agents/` and `commands/` from `~/.claude`.
+- Installs on one machine take turns (`flock` on `~/.clods/.lock`), so two pushes that meet both
+  finish, and the second has the last word.
 - A `claude` alias or function in your rc file keeps working: `clods.sh` wraps it.
 
 ## Tests
