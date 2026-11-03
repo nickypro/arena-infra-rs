@@ -396,6 +396,11 @@ pub(crate) async fn setup_pods(
         Ok(None) => out!(Detail, "Claude Code: no accounts ({} / {} unset) — skipped", arena_core::claude::TOKENS_FILE_KEY, arena_core::claude::TOKEN_KEY),
         Err(e) => out!(Out, "Claude Code: {} {e} — no token goes out", out::cross()),
     }
+    // clods: every account to each pod set up, when CLODS_DIR is (nothing said otherwise).
+    let clods_line = crate::clods::plan_line(cfg);
+    if let Some(line) = &clods_line {
+        out!(Detail, "{line}");
+    }
     // Carry each pod's provider so we can pick bare-VM vs image-based provisioning. A named
     // pod without an endpoint is reported; if none of the named pods is reachable, it fails.
     let targets: Vec<(String, String, SshTarget)> =
@@ -448,8 +453,9 @@ pub(crate) async fn setup_pods(
             }
         );
         let keys = if keys_present { " → API keys" } else { "" };
+        let clods = if clods_line.is_some() { " → clods" } else { "" };
         for (labels, names) in &plans {
-            out!(Brief, "Would set up {}: {labels}{keys}", all_names(names));
+            out!(Brief, "Would set up {}: {labels}{keys}{clods}", all_names(names));
         }
         out!(Detail, "Preview only — run without --dry-run to execute over SSH.");
         return Ok(SetupDone::default());
@@ -581,18 +587,22 @@ pub(crate) async fn setup_pods(
             out!(ErrBrief, "{}", out::warn(format!("API keys: {e} (retry: arena pods copy-keys {})", provisioned.join(" "))));
         }
     }
+    // The pods set up OK, each with its target: the Claude Code stages' pods.
+    let done_pods: Vec<(arena_core::Pod, SshTarget)> = sel
+        .pods
+        .iter()
+        .filter(|p| provisioned.contains(&p.name))
+        .filter_map(|p| SshTarget::from_pod(p, cfg).ok().map(|t| (p.clone(), t)))
+        .collect();
     // No copy-keys to do it: the Claude Code stage on its own, for the pods that set up OK.
     let copied_keys = (!csv_sources.is_empty() || archive_ready) && !provisioned.is_empty();
     // Even with no pool: a pod that's off still gets a pending removal (review r3).
     if !copied_keys && !provisioned.is_empty() {
-        let pods: Vec<(arena_core::Pod, SshTarget)> = sel
-            .pods
-            .iter()
-            .filter(|p| provisioned.contains(&p.name))
-            .filter_map(|p| SshTarget::from_pod(p, cfg).ok().map(|t| (p.clone(), t)))
-            .collect();
-        crate::claude::stage(remote.as_ref(), cfg, &pods, cc_token.as_deref()).await;
+        crate::claude::stage(remote.as_ref(), cfg, &done_pods, cc_token.as_deref()).await;
     }
+    // clods: every account to each pod set up, a line each; one that didn't get it is a warning
+    // with its fix, never a failed setup (it isn't the machine's fault).
+    crate::clods::stage(remote.as_ref(), cfg, &done_pods).await;
     // The reap notice on each pod set up that has a policy (RR11): setup has just written its
     // shell rc files (where the banner goes), and a restart that reset the container lost it.
     let set_up: Vec<arena_core::Pod> = sel.pods.iter().filter(|p| provisioned.contains(&p.name)).cloned().collect();

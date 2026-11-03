@@ -183,6 +183,9 @@ pub(crate) struct UpRun<'a> {
     /// Each pod's own Claude Code account (one by spread if it has none) and its token, after the
     /// keys — whenever setup runs; with no pool, only a pending removal (`arena_core::claude::stage`).
     pub claude: bool,
+    /// clods (`CLODS_DIR` set, with a tokens file): every account to each pod, after the Claude
+    /// Code token — whenever setup runs (`arena_core::clods::stage`).
+    pub clods: bool,
     /// `--lock`: lock each pod as its last step (checked lockable before the create).
     pub lock: bool,
     /// `--retry-bad-hosts`: ignore the machines earlier runs remember as bad (a machine that
@@ -207,7 +210,7 @@ pub(crate) struct UpRun<'a> {
 /// The per-pod part of `up`'s plan, for the dry-run and the confirm prompt. `endpoint`: the
 /// `--endpoint-timeout` minutes and the placements per name that bound replacing a pod that
 /// never gets an endpoint.
-pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, claude: bool, lock: bool, endpoint: (u64, u32)) -> String {
+pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, claude: bool, clods: bool, lock: bool, endpoint: (u64, u32)) -> String {
     let (mins, placements) = endpoint;
     // The last placement's pod is terminated too (review r3: said, so a name left with none is
     // no surprise) — with one placement, at once.
@@ -246,6 +249,9 @@ pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, claude:
     }
     if setup && claude {
         steps.push("put it on a Claude Code account (the least-loaded, if it has none) and push that token".into());
+    }
+    if setup && clods {
+        steps.push("push every clods account to it (a default by spread, if it has none)".into());
     }
     if lock {
         steps.push("lock it (stop/restart/terminate refused until `arena pods unlock`)".into());
@@ -289,6 +295,8 @@ struct NameRun {
     keys: Option<bool>,
     /// Its Claude Code stage, as `keys`.
     claude: Option<bool>,
+    /// Its clods push, as `keys` (`None`: clods isn't configured).
+    clods: Option<bool>,
 }
 
 /// Counts a pipeline as waiting on the endpoint poller for as long as it's alive.
@@ -638,6 +646,7 @@ impl Shared<'_, '_> {
             locked: false,
             keys: None,
             claude: None,
+            clods: None,
         };
         // Options whose pods failed a check for this name — a replacement tries them last.
         let mut failed_options = Vec::new();
@@ -1112,6 +1121,30 @@ impl Shared<'_, '_> {
                 Some(Err(e)) => {
                     run.claude = Some(false);
                     say(To::Err, &format!("[{name}] claude: not pushed — {e} (retry: `arena claude push {name}`)"));
+                }
+            }
+        }
+
+        // 5c. clods: every account, and a default by spread if it has none. Best effort, as the
+        // token above: a pod without it is still READY — said, with the retry.
+        if self.run.clods {
+            self.stage(&name, Some("clods"));
+            let one = [(pod.clone(), target.clone())];
+            match self.or_stop(arena_core::clods::stage(self.run.remote.as_ref(), self.run.cfg, &one)).await {
+                None => return self.end(run, Verdict::Stopped { stage: Stage::Keys }),
+                Some(None) => {}
+                Some(Some(arena_core::clods::Staged::Unusable(why))) => {
+                    run.clods = Some(false);
+                    say(To::Err, &arena_core::out::warn(format!("[{name}] claude: clods not pushed — {why}")));
+                }
+                Some(Some(arena_core::clods::Staged::Pushed(outcomes))) => {
+                    for o in outcomes {
+                        match &o.result {
+                            Ok(_) => say(To::Detail, &o.detail()),
+                            Err(_) => say(To::Err, &o.brief()),
+                        }
+                        run.clods = Some(run.clods.unwrap_or(true) && o.result.is_ok());
+                    }
                 }
             }
         }
@@ -1983,6 +2016,10 @@ fn ready_brief(run: &NameRun, after: &str) -> String {
     if let Some(ok) = run.claude {
         parts.push(format!("Claude {}", if ok { tick() } else { cross() }));
     }
+    // clods not pushed is a warning (`‼`): said why, with its retry, above.
+    if let Some(ok) = run.clods {
+        parts.push(format!("clods {}", if ok { tick() } else { bang() }));
+    }
     if let Some(h) = &run.health {
         let machine = h.machine_status();
         parts.push(if machine == Status::Pass { format!("check {}", tick()) } else { format!("check {}", machine.label()) });
@@ -2636,6 +2673,7 @@ mod tests {
             check: check.map(|attempts| CheckStage { policy: HealthPolicy::from_config(cfg).unwrap(), attempts }),
             keys: keys.and_then(|d| crate::up_keys_stage(cfg, &d.to_string_lossy(), true)),
             claude: false,
+            clods: false,
             lock: false,
             retry_bad_hosts: false,
             balance: None,
@@ -5334,6 +5372,43 @@ mod tests {
         }
     }
 
+    /// clods configured: after setup each pod gets every account (one `bash -s`, the installer on
+    /// its stdin), and the READY line says so — `clods ✓`, or `clods ‼` with the warning and its
+    /// retry on its own line. A failed push never stops the pod being READY.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn the_ready_lines_clods_badge_is_what_the_push_did() {
+        use std::os::unix::fs::PermissionsExt;
+        let ok = FakeReply::stdout("clods: accounts=2 default=1 changed=1\n");
+        let bad = FakeReply::exit(1, "setup.sh: needs python3 (to edit the JSON config files)\n");
+        for (reply, want, warned) in [
+            (ok, "[devtest-apple] READY after 0s · clods ✓", None),
+            (bad, "[devtest-apple] READY after 0s · clods ‼", Some("‼ [devtest-apple] claude: clods not pushed — exit 1: setup.sh: needs python3")),
+        ] {
+            let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+            let fake = Arc::new(FakeRemote::new());
+            fake.on(&host("10.0.0.1", 22001), arena_core::clods::COMMAND, reply);
+            let d = tmp_dir("clods-badge");
+            let tokens = d.0.join("tokens");
+            std::fs::write(&tokens, "a@example.com -> sk-ant-oat01-FAKE-a\nb@example.com -> sk-ant-oat01-FAKE-b\n").unwrap();
+            std::fs::set_permissions(&tokens, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let cfg = Config::parse(&format!("{}ARENA_STATE_DIR={}/state\nCLODS_DIR={}\n", cfg_text(None), d.0.display(), d.0.display()));
+            let run = UpRun { clods: true, ..up_run(&fleet, fake.clone(), &cfg, true, None, None).await };
+            let made = make(&fleet, &["apple"]).await;
+            let said = Mutex::new(Vec::new());
+            let rows = run_up(&run, made, std::future::pending(), &|to, l| said.lock().unwrap().push((to, l.to_string()))).await;
+            assert_eq!(rows[0].verdict, Verdict::Ready);
+            let said = said.into_inner().unwrap();
+            assert!(said.contains(&(To::Brief, want.to_string())), "{said:#?}");
+            if let Some(w) = warned {
+                assert!(said.iter().any(|(to, l)| *to == To::Err && l.starts_with(w) && l.ends_with("(retry: arena pods setup --clods-only devtest-apple)")), "{said:#?}");
+            }
+            let input = fake.inputs().into_iter().map(|(_, i)| String::from_utf8(i).unwrap()).find(|i| i.contains("clod_tmp")).unwrap();
+            assert!(input.contains("sk-ant-oat01-FAKE-b"), "the tokens go on stdin");
+            assert!(fake.calls().iter().all(|c| !format!("{c:?}").contains("sk-ant")), "never on a command line");
+        }
+    }
+
     /// W7 live (A-ckl9): with a backup archive and no key file at all, the keys stage still runs
     /// — each pod gets the archive's access (its block in the one exec, no key exported; the read
     /// key by scp), said as such. Without an archive (or without setup) there is no keys stage.
@@ -5428,7 +5503,7 @@ mod tests {
 
     #[test]
     fn the_plan_text_names_every_stage_it_will_run() {
-        assert!(pipeline_text(true, None, false, false, true, (5, 2)).contains(
+        assert!(pipeline_text(true, None, false, false, false, true, (5, 2)).contains(
             "provision it, lock it (stop/restart/terminate refused until `arena pods unlock`) — then READY/FAILED"
         ));
         let endpoint = |mins: u64, n: u32| {
@@ -5439,11 +5514,11 @@ mod tests {
             )
         };
         // One placement: terminated, not recreated (review r3).
-        assert!(pipeline_text(true, None, false, false, false, (5, 1)).contains(
+        assert!(pipeline_text(true, None, false, false, false, false, (5, 1)).contains(
             "(10 min or more), is TERMINATED and its name not recreated (1 placement per name: --check-attempts), sync"
         ));
         assert_eq!(
-            pipeline_text(true, Some(3), true, false, false, (5, 3)),
+            pipeline_text(true, Some(3), true, false, false, false, (5, 3)),
             format!(
                 "per pod, as soon as it can: {}, sync the proxy (if nginx is set up), provision it, \
                  deep-check it — a pod that FAILs on its host is TERMINATED and its name recreated (up to 3 placement(s) \
@@ -5454,7 +5529,7 @@ mod tests {
             )
         );
         assert_eq!(
-            pipeline_text(false, None, true, false, false, (8, 2)),
+            pipeline_text(false, None, true, false, false, false, (8, 2)),
             format!(
                 "per pod, as soon as it can: {}, sync the proxy (if nginx is set up), wait for SSH to answer — then \
                  READY/FAILED per pod",
