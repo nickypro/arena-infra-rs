@@ -664,7 +664,8 @@ mod tests {
         );
         let dry = start_preview(true, &job, "nvidia-smi", "", &["devtest-apple"]);
         assert_eq!(dry[1], "  files: ~/.arena/jobs/20261008-142301-nvidia-smi/ (cmd, run, log, pid, started_at, exit); `run` is:");
-        assert!(dry.iter().any(|l| l == "    zsh -c 'source ~/.zshrc 2>/dev/null; nvidia-smi'"), "{dry:?}");
+        let wrapped = format!("    {}", arena_core::ssh::login_shell_wrap("nvidia-smi", None));
+        assert!(wrapped.contains("__arena_sh=zsh __arena_rc='source ~/.zshrc 2>/dev/null; '") && dry.contains(&wrapped), "{dry:?}");
     }
 
     #[tokio::test(start_paused = true)]
