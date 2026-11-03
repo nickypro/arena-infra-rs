@@ -1,0 +1,4 @@
+# Secrets and this machine's state: never commit these.
+/tokens
+/fleet
+/profiles/

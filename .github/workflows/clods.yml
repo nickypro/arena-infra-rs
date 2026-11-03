@@ -1,0 +1,39 @@
+# clods (clods/: Claude Code account profiles, which `arena` carries to the pods): shellcheck on its
+# scripts and tests, and its tests, which run setup.sh, push.sh and clods.sh for real in a scratch
+# $HOME with fake tokens and a fake claude, ssh and arena (clods/tests/run.sh). Hermetic: no network,
+# no real token. Its own workflow, so it runs in a minute beside the Rust build.
+name: clods
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clods-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clods:
+    name: clods shellcheck + tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # zsh: clods.sh's tests run under bash and zsh (CLODS_TEST_ZSH=1: a missing zsh fails).
+      - name: Tools
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q zsh shellcheck
+          shellcheck --version
+      - name: shellcheck
+        run: |
+          shellcheck clods/setup.sh clods/push.sh clods/tests/run.sh
+          shellcheck -s bash clods/clods.sh
+      - name: Tests
+        env:
+          CLODS_TEST_ZSH: "1"
+        run: clods/tests/run.sh

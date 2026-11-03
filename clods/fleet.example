@@ -1,0 +1,11 @@
+# Which machine uses which account. Copy this to `fleet` (git-ignored) and run ./push.sh.
+#
+# MACHINE: anything `ssh` reaches, e.g. pod names once `arena ssh-config` is installed
+#          (with ./push.sh --arena: an arena pod selector such as apple, apple..mayor or all).
+# ACCOUNT: a profile number or email from ./setup.sh --list, or "none" (take tokens off it).
+#
+# MACHINE           ACCOUNT
+arena9-apple        1
+arena9-bloom        someone@example.com
+arena9-wish         3
+old-box             none
