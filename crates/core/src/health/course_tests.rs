@@ -619,6 +619,19 @@ fn a_course_failure_is_not_the_machines() {
     assert!(none.checks.iter().all(|c| !is_course_check(&c.name)));
 }
 
+/// With no zsh the course run goes under bash (`ssh::login_shell_wrap`): its checks are judged as
+/// ever, after the `shell` FAIL that says to run setup — software/setup, not the course's.
+#[test]
+fn a_course_run_with_no_zsh_is_judged_after_the_shell_fail() {
+    let policy = HealthPolicy { course: Some(book()), ..HealthPolicy::default() };
+    let stdout = format!("deep_check=3\n{}deep_check_end=1\n", with("repo.state", "repo.state=missing"));
+    let call = Ok(crate::ssh::SshOutput { success: true, code: Some(0), stdout, stderr: "arena: no zsh: running under bash\n".into() });
+    let h = crate::health::judge_course_call(&pod("devtest-apple"), call, &policy);
+    assert_eq!(h.checks[0].name, crate::health::NO_ZSH, "{:#?}", h.checks);
+    assert!(h.checks.iter().any(|c| c.name == REPO && c.status == Status::Fail), "{:#?}", h.checks);
+    assert_eq!((h.status, h.failure_kind(), h.course_status()), (Status::Fail, Some(FailureKind::Software), Some(Status::Fail)));
+}
+
 #[test]
 fn the_course_report_has_a_cell_each() {
     let book = proxied(ProxyState::Live, Some(9500), Some(Ok(id("devtest-apple", "0123456789ab"))), false);

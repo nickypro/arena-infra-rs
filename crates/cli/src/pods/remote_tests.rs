@@ -171,7 +171,7 @@ async fn pods_run_partial_failure_is_non_zero_with_a_line_per_pod() {
     script(&fake);
     let remote: Arc<dyn Remote> = fake.clone();
     let results = run_fleet(&remote, targets(&fleet()), &wrapped, Duration::from_secs(60)).await;
-    let ok = |name: &str, text: &str| RunResult { name: name.into(), text: text.into(), ok: true, why: None };
+    let ok = |name: &str, text: &str| RunResult { name: name.into(), text: text.into(), ok: true, why: None, shell: None };
     assert_eq!(
         results,
         [
@@ -181,6 +181,7 @@ async fn pods_run_partial_failure_is_non_zero_with_a_line_per_pod() {
                 text: "exit 127: zsh: command not found: nvidia-smi".into(),
                 ok: false,
                 why: Some("exit 127: zsh: command not found: nvidia-smi".into()),
+                shell: None,
             },
             ok("devtest-cloud", ""),
         ]
@@ -203,27 +204,56 @@ async fn pods_run_partial_failure_is_non_zero_with_a_line_per_pod() {
     assert_eq!(lines[1], "devtest-bloom          ✗ exit 127: zsh: command not found: nvidia-smi");
 }
 
-/// Live BPF S9: `pods run` on a bare Hetzner VM (no zsh until setup) said only `exit 127:
-/// bash: line 1: zsh: command not found`. It says the command never ran, and the fix.
+/// Live BPF S9 and project week: `pods run` on a box with no zsh (a bare Hetzner VM before
+/// setup; 2 of 28 prod VMs, staff boxes arena never set up) failed `exit 127: bash: line 1: zsh:
+/// command not found`. It runs under bash, else sh: the command's output and exit stay its
+/// own, the wrap's note comes off stderr, and the pod's result says the shell once.
 #[tokio::test(start_paused = true)]
-async fn pods_run_on_a_pod_without_zsh_says_to_set_it_up() {
+async fn pods_run_on_a_pod_without_zsh_runs_under_bash_or_sh_and_says_so() {
     let fake = Arc::new(FakeRemote::new());
-    fake.script(&host(22002), [FakeReply::exit(127, "bash: line 1: zsh: command not found")]);
+    fake.script(&host(22002), [FakeReply::exit(0, "arena: no zsh: running under bash\n").with_stdout("x\n")]);
+    fake.script(&host(22003), [FakeReply::exit(2, "arena: no zsh: running under sh\nsh: 1: nvidia-smi: not found\n")]);
     let remote: Arc<dyn Remote> = fake.clone();
-    let wrapped = login_shell_wrap("echo x > ~/unsynced.txt", Some("arena-env"));
+    let wrapped = login_shell_wrap("nvidia-smi -L", Some("arena-env"));
     let results = run_fleet(&remote, targets(&fleet()), &wrapped, Duration::from_secs(60)).await;
-    let bloom = &results[1];
-    assert_eq!(bloom.name, "devtest-bloom");
-    assert!(!bloom.ok);
+    let ok = |name: &str, text: &str, shell| RunResult { name: name.into(), text: text.into(), ok: true, why: None, shell };
     assert_eq!(
-        bloom.why.as_deref(),
-        Some(
-            "no zsh on the pod (setup installs it) — not set up yet? `arena pods setup devtest-bloom` \
-             (exit 127: bash: line 1: zsh: command not found)"
-        )
+        results,
+        [
+            ok("devtest-apple", "", None),
+            ok("devtest-bloom", "x", Some("bash")),
+            RunResult {
+                name: "devtest-cloud".into(),
+                text: "exit 2: sh: 1: nvidia-smi: not found".into(),
+                ok: false,
+                why: Some("exit 2: sh: 1: nvidia-smi: not found".into()),
+                shell: Some("sh"),
+            },
+        ]
     );
-    assert!(bloom.text.starts_with("no zsh on the pod") && bloom.text.ends_with("exit 127: bash: line 1: zsh: command not found"), "{}", bloom.text);
-    assert!(results[0].ok && results[2].ok, "{results:?}");
+    let (lines, bad) = render_run(&results, false);
+    assert_eq!(bad, 1);
+    assert_eq!(
+        lines,
+        [
+            "\n── devtest-apple ",
+            "",
+            "\n── devtest-bloom (no zsh: ran under bash)",
+            "x",
+            "\n── devtest-cloud (FAILED) (no zsh: ran under sh)",
+            "exit 2: sh: 1: nvidia-smi: not found",
+            "\n2 ok, 1 failed",
+        ]
+    );
+    let (lines, _) = render_run(&results, true);
+    assert_eq!(
+        lines[..3],
+        [
+            "devtest-apple          ",
+            "devtest-bloom          x (no zsh: ran under bash)",
+            "devtest-cloud          ✗ exit 2: sh: 1: nvidia-smi: not found (no zsh: ran under sh)",
+        ]
+    );
 }
 
 /// A failing command's stdout is part of its report (live: `pods run` showed only stderr,
@@ -248,7 +278,7 @@ fn a_failed_run_keeps_its_stdout_and_says_exit_n() {
         assert_eq!(run_failure(o), (text.to_string(), why.to_string()), "{o:?}");
         assert!(!text.contains("Some(") && !why.contains("Some("));
     }
-    let results = vec![RunResult { name: "devtest-bloom".into(), text: cases[0].1.into(), ok: false, why: Some(cases[0].2.into()) }];
+    let results = vec![RunResult { name: "devtest-bloom".into(), text: cases[0].1.into(), ok: false, why: Some(cases[0].2.into()), shell: None }];
     let (full, bad) = render_run(&results, false);
     assert_eq!((bad, full[1].as_str()), (1, "step 1 ok\nstep 2 ok\nexit 1: Traceback…\nValueError: bad"));
     let (compact, _) = render_run(&results, true);

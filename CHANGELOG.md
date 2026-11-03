@@ -19,6 +19,20 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-03 · arena 2.16: `pods run` on a machine with no zsh runs the command under bash, else sh
+- **`arena pods run`** on a machine with no zsh (a bare VM before setup, a staff box arena never
+  set up) runs the command anyway. It used to fail with `exit 127: … zsh: command not found`. It
+  uses bash, after `~/.bashrc` and `conda activate arena-env` if there's a `conda`; with no bash it
+  uses `/bin/sh`. The command's output and exit code are its own, and that machine's result says
+  it once, dimmed: `── errata (no zsh: ran under bash)`.
+- The same goes for `pods test`, `run --background` (the job's log starts with `arena: no zsh:
+  running under bash`), and the deep and key checks.
+- **`pods test --deep`, `--keys`, `--course` and `up --check`** still FAIL such a pod as not set up. A first
+  `shell` check says `no zsh on the pod (setup installs it)` and gives `arena pods setup NAME`, and
+  the rest of the checks now run under bash and show beside it. It counts as software/setup, never
+  the machine: `up --check` doesn't replace the pod or remember its machine as bad. In `--json`
+  that check is named `shell`; before, it was a `script` check.
+
 ## 2026-11-03 · arena 2.15: `pods test` checks the course: proxy, backups, branch, Claude, kernel, W&B
 - **`arena pods test --course`** checks what a participant uses beside the machine, in seconds per
   machine and with no GPU work. `--deep` checks the same things too. Each FAIL or WARN says what to

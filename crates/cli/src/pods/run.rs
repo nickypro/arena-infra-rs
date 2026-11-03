@@ -97,7 +97,8 @@ pub(crate) async fn handle_run(
     }
 
     // Source the participants' ~/.zshrc and activate the conda env, so commands see the
-    // participants' `arena-env` (python/packages) and the token exports from setup.
+    // participants' `arena-env` (python/packages) and the token exports from setup — on a box
+    // with no zsh, bash's ~/.bashrc, else plain /bin/sh, said beside that pod's result.
     // `CONDA_ENV=""` in config disables activation (still sources the rc for tokens).
     let conda_env = cfg.get("CONDA_ENV").unwrap_or("arena-env");
     let remote_cmd = arena_core::ssh::login_shell_wrap(cmd, Some(conda_env));
@@ -165,6 +166,8 @@ pub(crate) struct RunResult {
     /// A failure on one line, for the compact layout: `exit 1: <last stderr line>` (or the last
     /// stdout line when stderr is empty), `timed out after 90s`. `None` = it worked.
     pub why: Option<String>,
+    /// The shell it ran under when the pod has no zsh (`bash`, `sh`: `ssh::take_fallback_note`).
+    pub shell: Option<&'static str>,
 }
 
 /// A failed command's [`RunResult`] text and one-line reason. stdout is kept — what a command
@@ -197,24 +200,24 @@ pub(crate) async fn run_fleet(
     use arena_core::ssh::strip_interactive_noise;
     let jobs = targets.into_iter().map(|(name, t)| (name, t, remote_cmd.to_string())).collect();
     let mut results = Vec::new();
-    exec_each_pod(remote, jobs, timeout, |_, _, name, call| {
+    exec_each_pod(remote, jobs, timeout, |_, _, name, mut call| {
+        // No zsh on the pod (a bare VM before setup, a staff box): it ran under bash or sh. The
+        // wrap's note comes off stderr, to be said once beside the pod's result.
+        let shell = call.as_mut().ok().and_then(|out| {
+            let (shell, stderr) = arena_core::ssh::take_fallback_note(&out.stderr);
+            out.stderr = stderr;
+            shell
+        });
         // a no-PTY shell can emit harmless job-control chatter; strip it.
         let (text, why) = match call {
             Ok(out) if out.success => (strip_interactive_noise(out.stdout.trim()).trim().to_string(), None),
-            // No zsh to run it in (a bare VM before setup, live BPF S9): the command never ran,
-            // so say that — and the fix — rather than a bare `exit 127`.
-            Ok(out) if arena_core::ssh::login_shell_missing(out.code, &out.stderr) => {
-                let (text, why) = run_failure(&out);
-                let hint = arena_core::ssh::login_shell_missing_hint(name);
-                (format!("{hint}\n{text}"), Some(format!("{hint} ({why})")))
-            }
             Ok(out) => {
                 let (text, why) = run_failure(&out);
                 (text, Some(why))
             }
             Err(why) => (why.clone(), Some(why)),
         };
-        results.push(RunResult { name: name.to_string(), text, ok: why.is_none(), why });
+        results.push(RunResult { name: name.to_string(), text, ok: why.is_none(), why, shell });
     })
     .await;
     results.sort_by(|a, b| a.name.cmp(&b.name));
@@ -223,8 +226,9 @@ pub(crate) async fn run_fleet(
 
 /// The `pods run` / `pods test` report: `compact` = one `<name>  <last line>` row per pod
 /// (`✗ <why>` on failure, e.g. `✗ timed out after 90s`), else a `── <name>` block with the
-/// full output; then the `N ok, M failed` tally. Returns the lines and the failure count.
-/// Pure, so per-pod reporting is tested without a terminal.
+/// full output; then the `N ok, M failed` tally. A pod with no zsh has a dim `(no zsh: ran
+/// under bash)` at the end of its row, or of its block's `──` line. Returns the lines and the
+/// failure count. Pure, so per-pod reporting is tested without a terminal.
 pub(crate) fn render_run(results: &[RunResult], compact: bool) -> (Vec<String>, usize) {
     let (mut lines, mut ok, mut bad) = (Vec::new(), 0, 0);
     for r in results {
@@ -233,14 +237,18 @@ pub(crate) fn render_run(results: &[RunResult], compact: bool) -> (Vec<String>, 
         } else {
             bad += 1
         }
+        let note = r.shell.map(|s| out::dim(format!("(no zsh: ran under {s})")));
         if compact {
             let shown = match &r.why {
                 None => r.text.lines().last().unwrap_or("").trim().to_string(),
                 Some(why) => format!("✗ {why}"),
             };
-            lines.push(format!("{:<22} {shown}", r.name));
+            let note = note.map(|n| if shown.is_empty() { n } else { format!(" {n}") }).unwrap_or_default();
+            lines.push(format!("{:<22} {shown}{note}", r.name));
         } else {
-            lines.push(format!("\n── {} {}", r.name, if r.ok { "" } else { "(FAILED)" }));
+            let failed = if r.ok { "" } else { "(FAILED)" };
+            let note = note.map(|n| if r.ok { n } else { format!(" {n}") }).unwrap_or_default();
+            lines.push(format!("\n── {} {failed}{note}", r.name));
             lines.push(r.text.clone());
         }
     }

@@ -77,6 +77,25 @@ async fn run_says_the_command_and_the_pods_in_a_line() {
     assert!(loud.starts_with("[dry-run] would run on 1 pod(s) (1800s budget each): devtest-apple\n  "), "-v:\n{loud}");
 }
 
+/// run on a box with no zsh: the command's output as ever, and its pod's `──` line says the
+/// shell it ran under, once — the same at `-v`.
+#[tokio::test]
+async fn run_on_a_box_with_no_zsh_says_the_shell_beside_its_output() {
+    let f = fleet_of(&[("apple", 22001)]);
+    let remote = || {
+        let fake = FakeRemote::new();
+        fake.on(&host(22001), "hostname", FakeReply::exit(0, "arena: no zsh: running under bash\n").with_stdout("apple-host\n"));
+        fake
+    };
+    let (quiet, loud) = both(&["run", "-t", "apple", "hostname"], &f, remote).await;
+    assert_eq!(quiet, "Run `hostname` on devtest-apple? [y/N] y\n\n── devtest-apple (no zsh: ran under bash)\napple-host\n", "default:\n{quiet}");
+    assert_eq!(
+        loud,
+        "Run `hostname` on 1 pod(s) over SSH: devtest-apple\nProceed? [y/N] y\n\n── devtest-apple (no zsh: ran under bash)\napple-host\n\n1 ok, 0 failed\n",
+        "-v:\n{loud}"
+    );
+}
+
 /// `pods test` (plain): a row per pod as before; the tally only for several (or with `-v`).
 #[tokio::test]
 async fn pods_test_is_a_row_per_pod() {
