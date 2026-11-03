@@ -670,9 +670,14 @@ interrupt or a TERM puts the keys back first. That holds however the switch ends
 could still save into it. Each switch says how many such versions are kept (`… earlier version(s)
 of files it replaced are kept in .git/arena-unredacted/recover.*`). `arena pods clean-kept [pods]`
 drops the ones a file now holds byte for byte: the work tree's file at that path, or git's own blob
-at HEAD (the redacted version a restore moved aside). It never drops one a program has open, and
-never one with anything of its own. Each pod's line says how many it dropped and which it kept.
-`--dry-run` says what it would drop. It runs under each pod's backup lock, as a switch does.
+at HEAD (the redacted version a restore moved aside). It never drops one with anything of its
+own, nor one a program has open as far as `/proc` shows (by device and inode, at one moment: run
+it when the pod is quiet). Each pod's line says how many it dropped and which it kept. `--dry-run`
+says what it would drop. It runs under the control box's backup lock for each pod, as a switch
+does.
+
+If a switch can't mark a replacement as done (a full disk), it stops before its checkout: the
+keys go back, and what it moved aside is kept, said.
 
 A file the participant changed, removed, made executable or moved under a link while the switch
 ran keeps what they did; its copy stays, and every switch on that branch says so (`UNREDACTED_KEPT`,

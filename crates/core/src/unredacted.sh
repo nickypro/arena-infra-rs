@@ -46,6 +46,8 @@ unredacted_aside() {
     UR_RUN=$(date -u +%Y%m%dT%H%M%SZ)-$$
     UR_TOP=$(pwd -P)
     UR_BRANCH=$(git rev-parse --abbrev-ref HEAD) || UR_BRANCH=
+    UR_HERE=$UR_BRANCH
+    _ur=
     UR_MODES=$(git config --bool core.fileMode 2>/dev/null) || UR_MODES=true
     unredacted_settle "$1"
     git diff --name-only -z | tr '\0' '\n' | while IFS= read -r f; do
@@ -58,28 +60,39 @@ unredacted_aside() {
         if [ "$UR_MODES" != false ] && [ "$m" != "$x" ]; then continue; fi
         if [ "$(LC_ALL=C sed -E "$REDACT_SED" < "$f" | git hash-object --path="$f" --stdin)" != "$i" ]; then continue; fi
         c=$1/$UR_RUN/$f
+        # Its git version in a temp folder of its own, made for this file alone: a name a KILL
+        # left linked into the work tree is never written to again.
+        t=
         if ! { mkdir -p -- "$1/$UR_RUN/$(dirname -- "$f")" \
             && { [ -f "$1/$UR_RUN.branch" ] || printf '%s\n' "$UR_BRANCH" > "$1/$UR_RUN.branch"; } \
             && cp -p -- "$f" "$1/$UR_RUN.part" && mv -f -- "$1/$UR_RUN.part" "$c" \
-            && cp -p -- "$c" "$1/$UR_RUN.redacted" && LC_ALL=C sed -E "$REDACT_SED" < "$c" > "$1/$UR_RUN.redacted" \
-            && [ "$(git hash-object --path="$f" -- "$1/$UR_RUN.redacted")" = "$i" ]; }; then
-            rm -f -- "$c" "$1/$UR_RUN.redacted"
+            && t=$(mktemp -d "$1/tmp.XXXXXX") \
+            && cp -p -- "$c" "$t/redacted" && LC_ALL=C sed -E "$REDACT_SED" < "$c" > "$t/redacted" \
+            && [ "$(git hash-object --path="$f" -- "$t/redacted")" = "$i" ]; }; then
+            rm -f -- "$c"
+            [ -z "$t" ] || rm -rf -- "$t"
             echo "arena set-branch: couldn't set $f aside - left as it is" >&2
             continue
         fi
-        if unredacted_place "$1" "$f" "$1/$UR_RUN.redacted" "$c"; then r=0; else r=$?; fi
+        if unredacted_place "$1" "$f" "$t/redacted" "$c"; then r=0; else r=$?; fi
+        rm -rf -- "$t"
         case $r in
-            0 | 4) ;;
+            0) ;;
+            4)
+                # Replaced, but its folder couldn't be marked (no room?): no switch on top of that.
+                echo "arena set-branch: couldn't mark $f's set-aside (is the disk full?) - not switched; the keys go back" >&2
+                exit 4
+                ;;
             3) echo "arena set-branch: $f changed while it was set aside, or couldn't go back: its versions are kept in $1" >&2 ;;
             *)
                 rm -f -- "$c"
                 echo "arena set-branch: couldn't set $f aside (it changed meanwhile, or its place moved) - left as it is" >&2
                 ;;
         esac
-        rm -f -- "$1/$UR_RUN.redacted"
-    done
+    done || _ur=$?
     git update-index -q --refresh > /dev/null 2>&1 || :
     unredacted_settle "$1"
+    return "${_ur:-0}"
 }
 
 # Whether the work tree's $2 can be replaced from the folder $1 (in the git dir), as far as a look
@@ -113,7 +126,7 @@ unredacted_place() {
     [ "$_dir" = . ] || _want=$UR_TOP/$_dir
     mkdir -p -- "$1" || return 1
     _rd=$(mktemp -d "$1/recover.XXXXXX") || return 1
-    if ! printf '%s\n' "$2" > "$_rd/path"; then
+    if ! { printf '%s\n' "$2" > "$_rd/path" && printf '%s\n' "${UR_HERE:-}" > "$_rd/branch"; }; then
         rm -rf -- "$_rd"
         return 1
     fi
@@ -164,20 +177,39 @@ unredacted_link_in() {
     (cd -P -- "$_dir" 2> /dev/null && [ "$(pwd -P)" = "$_want" ] && ln -T -- "$1" "${2##*/}" 2> /dev/null)
 }
 
-# Every file under $1 that a process has open or mapped, a line each (it could still write to
-# it): from /proc, the pod's own. Without /proc, none known.
+# The identities of every file a process has open (device:inode) or mapped (M:inode), a line
+# each — and `?` when, as root (a pod's cleanup), a process still there couldn't be looked at:
+# then nothing counts as free. As another user (a test), a process it may not look at is passed
+# over. From /proc; without it, `?`. Only a look at one moment: the cleanup that uses it is the
+# operator's, run when the pod is quiet.
 unredacted_held() {
-    [ -d /proc/self/fd ] || return 0
-    {
-        find /proc/[0-9]*/fd -lname "$1/*" 2> /dev/null | while IFS= read -r _l; do readlink -- "$_l" || :; done
-        cat /proc/[0-9]*/maps 2> /dev/null | awk '{ print $6 }' | grep -F -- "$1/" || :
-    } | sort -u
+    if [ ! -d /proc/self/fd ]; then
+        echo '?'
+        return 0
+    fi
+    _me=$(id -u)
+    for _p in /proc/[0-9]*; do
+        if ! ls -- "$_p/fd" > /dev/null 2>&1; then
+            if [ "$_me" = 0 ] && [ -d "$_p" ]; then echo '?'; fi
+            continue
+        fi
+        for _fd in "$_p"/fd/*; do
+            stat -L -c '%d:%i' -- "$_fd" 2> /dev/null || :
+        done
+        awk '$5 != 0 { print "M:" $5 }' "$_p/maps" 2> /dev/null || :
+    done | sort -u
+}
+
+# Whether the file $1 is held, by [`unredacted_held`]'s list $2.
+unredacted_is_held() {
+    _id=$(stat -c '%d:%i' -- "$1" 2> /dev/null) || return 0
+    printf '%s\n' "$2" | grep -qx -e "$_id" -e "M:${_id#*:}" -e '?'
 }
 
 # The recover.* folders [`unredacted_place`] left that need no one to decide: one with nothing in
 # it (a KILL before the move) goes; one whose replacement never went in (a KILL between moving the
-# file aside and linking its replacement in), its place still empty, puts the file back and goes
-# — checked to be back. Every other one stays, said ([`unredacted_restore`]), for
+# file aside and linking its replacement in), its place still empty and on the branch it was moved
+# aside on, puts the file back and goes — checked to be back. Every other one stays, said ([`unredacted_restore`]), for
 # [`unredacted_clean`]: never one whose replacement went in, whatever it holds.
 unredacted_settle() {
     for _rd in "$1"/recover.*; do
@@ -188,6 +220,8 @@ unredacted_settle() {
             continue
         fi
         _f=$(cat "$_rd/path" 2> /dev/null) || _f=
+        # Only on the branch it was moved aside on: elsewhere an empty place proves nothing.
+        [ "$(cat "$_rd/branch" 2> /dev/null)" = "${UR_HERE:-}" ] || continue
         if [ -n "$_f" ] && [ ! -e "$_f" ] && [ ! -L "$_f" ] && unredacted_link_in "$_rd/file" "$_f" && unredacted_is_back "$_rd/file" "$_f"; then
             rm -rf -- "$_rd"
         fi
@@ -208,7 +242,7 @@ unredacted_clean() {
         _why=
         if [ ! -e "$_rd/file" ] && [ ! -L "$_rd/file" ]; then
             _why=empty
-        elif [ -f "$_rd/file" ] && [ ! -L "$_rd/file" ] && ! printf '%s\n' "$_held" | grep -qxF -- "$_rd/file" && [ -n "$_f" ]; then
+        elif [ -f "$_rd/file" ] && [ ! -L "$_rd/file" ] && ! unredacted_is_held "$_rd/file" "$_held" && [ -n "$_f" ]; then
             if [ -f "$_f" ] && [ ! -L "$_f" ] && unredacted_in_place "$1" "$_f" && cmp -s -- "$_rd/file" "$_f"; then
                 _why=file
             elif git cat-file blob "HEAD:$_f" 2> /dev/null | cmp -s - "$_rd/file"; then
@@ -235,6 +269,7 @@ unredacted_restore() {
     if [ ! -d "$1" ]; then return 0; fi
     UR_TOP=$(pwd -P)
     cur=$(git rev-parse --abbrev-ref HEAD)
+    UR_HERE=$cur
     unredacted_settle "$1"
     : > "$1.done"
     for run in $(ls -1 "$1" | sort -r); do
@@ -248,19 +283,24 @@ unredacted_restore() {
                 rm -f -- "$1/$run/$f" && printf '%s\n' "$f" >> "$1.done"
                 continue
             fi
-            # What the set-aside left there, and the copy to put back, both beside the runs.
-            if cp -p -- "$1/$run/$f" "$1/$run.redacted" && LC_ALL=C sed -E "$REDACT_SED" < "$1/$run/$f" > "$1/$run.redacted" \
-                && cp -p -- "$1/$run/$f" "$1/$run.back"; then
-                if unredacted_place "$1" "$f" "$1/$run.back" "$1/$run.redacted"; then r=0; else r=$?; fi
-                if [ "$r" = 0 ] || [ "$r" = 4 ]; then
-                    rm -f -- "$1/$run/$f" && printf '%s\n' "$f" >> "$1.done" && echo "UNREDACTED_RESTORED $f"
+            # What the set-aside left there, and the copy to put back, in a temp folder made for
+            # this file alone (a name a KILL left linked into the work tree is never written to).
+            if t=$(mktemp -d "$1/tmp.XXXXXX"); then
+                if cp -p -- "$1/$run/$f" "$t/redacted" && LC_ALL=C sed -E "$REDACT_SED" < "$1/$run/$f" > "$t/redacted" \
+                    && cp -p -- "$1/$run/$f" "$t/back"; then
+                    if unredacted_place "$1" "$f" "$t/back" "$t/redacted"; then r=0; else r=$?; fi
+                    if [ "$r" = 0 ] || [ "$r" = 4 ]; then
+                        rm -f -- "$1/$run/$f" && printf '%s\n' "$f" >> "$1.done" && echo "UNREDACTED_RESTORED $f"
+                    fi
                 fi
+                rm -rf -- "$t"
             fi
-            rm -f -- "$1/$run.redacted" "$1/$run.back"
         done
     done
-    # A copy cut short (stopped before its rename into place): what it was for is as it was.
-    rm -f -- "$1"/*.part "$1"/*.redacted "$1"/*.back
+    # A copy cut short (stopped before its rename into place): what it was for is as it was. A
+    # temp folder a KILL left: only its names go (a name in it may be a link to a file in place).
+    rm -f -- "$1"/*.part
+    rm -rf -- "$1"/tmp.*
     unredacted_settle "$1"
     # Every key still set aside here and not going back on its own: this switch's, this branch's,
     # and every version a recover.* folder keeps.
