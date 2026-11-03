@@ -51,29 +51,15 @@ pub(crate) fn result_key(ui: &mut Ui, code: KeyCode) -> bool {
 /// their confirm: Enter runs it. On top, what Enter will do as typed so far ([`action_summary`]:
 /// `alpha: switch to branch w3d2 (fast-forward only)`, the command itself for `run`; several
 /// pods named once), wrapped by the widget.
-pub(crate) fn render_input(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action, scope: &InputScope, value: &str) {
+pub(crate) fn render_input(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action, scope: &InputScope, value: &str, prefilled: bool) {
     let names = match scope {
         InputScope::Pod { name, .. } => vec![name.clone()],
         InputScope::Set(sc) => scope_names(shared, ui, *sc),
     };
-    // The raise-cap box: what the key spent of its cap and the new cap as typed — or why Enter
-    // won't run it.
-    let preview = match action {
-        Action::KeyLimit => match aikey::limit_preview(&ui.ai_set, value) {
-            Ok(lines) => format!("{}\n\n", lines.join("\n")),
-            Err(why) => format!("✗ {}\n\n", why.join("\n")),
-        },
-        _ => String::new(),
-    };
-    let text = format!(
-        "{}\n\n{preview}{}\n\n  > {value}\n\n[enter] run  [esc] cancel",
-        action_summary(action, &names, Some(value), CONFIRM_NAMES_MAX).join("\n"),
-        action.input_prompt(),
-    );
     let area = centered_rect(70, 40, f.area());
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(input_body(ui, action, &names, value, prefilled))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
@@ -83,6 +69,35 @@ pub(crate) fn render_input(f: &mut Frame, shared: &Shared, ui: &Ui, action: Acti
             ),
         area,
     );
+}
+
+/// The input modal's lines for `action` on `names` with `value` typed: what Enter does, the
+/// raise-cap box's preview, the prompt, the value — an untouched default shown selected
+/// (`prefilled`: the first key typed replaces it) — and the action's forms, dim
+/// ([`Action::input_hint`]).
+pub(crate) fn input_body(ui: &Ui, action: Action, names: &[String], value: &str, prefilled: bool) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = action_summary(action, names, Some(value), CONFIRM_NAMES_MAX).into_iter().map(Line::from).collect();
+    lines.push(Line::from(""));
+    // The raise-cap box: what the key spent of its cap and the new cap as typed — or why Enter
+    // won't run it (nothing yet for an empty box).
+    if action == Action::KeyLimit && !value.trim().is_empty() {
+        let preview = match aikey::limit_preview(&ui.ai_set, value) {
+            Ok(preview) => preview,
+            Err(why) => why.iter().enumerate().map(|(i, w)| if i == 0 { format!("✗ {w}") } else { w.clone() }).collect(),
+        };
+        lines.extend(preview.into_iter().map(Line::from));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(action.input_prompt()));
+    lines.push(Line::from(""));
+    let typed = if prefilled { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
+    lines.push(Line::from(vec![Span::raw("  > "), Span::styled(value.to_string(), typed)]));
+    if let Some(hint) = action.input_hint() {
+        lines.push(Line::from(Span::styled(format!("    {hint}"), Style::default().fg(Color::DarkGray))));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("[enter] run  [esc] cancel"));
+    lines
 }
 
 /// The `/` modal: type a selection in the CLI's selector syntax.
@@ -673,12 +688,39 @@ mod tests {
         let all = draw(180, 30, &shared, &ui).join("\n");
         assert!(all.contains("3 pods: alpha, bravo, charlie") && all.contains("commit + push the current branch"), "{all}");
         // run / set-branch: the input modal says what Enter does, the command verbatim.
-        ui.mode = Mode::Input { action: Action::Run, scope: InputScope::Set(Scope::Marked), value: "nvidia-smi -L; hostname".into() };
+        ui.mode = Mode::Input { action: Action::Run, scope: InputScope::Set(Scope::Marked), value: "nvidia-smi -L; hostname".into(), prefilled: false };
         let all = draw(180, 30, &shared, &ui).join("\n");
         assert!(all.contains("3 pods: alpha, bravo, charlie") && all.contains("nvidia-smi -L; hostname"), "{all}");
-        ui.mode = Mode::Input { action: Action::SetBranch, scope: InputScope::Pod { name: "alpha".into(), id: "rp1".into() }, value: "w3d2".into() };
+        ui.mode = Mode::Input { action: Action::SetBranch, scope: InputScope::Pod { name: "alpha".into(), id: "rp1".into() }, value: "w3d2".into(), prefilled: false };
         let all = draw(180, 30, &shared, &ui).join("\n");
         assert!(all.contains("alpha: switch to branch w3d2 (fast-forward only)"), "{all}");
+    }
+
+    /// The raise-cap box: its forms in a dim line under the value, the untouched default shown
+    /// selected; the preview for a set, a raise and a lowering; nothing to refuse in an empty box.
+    #[test]
+    fn the_cap_box_hints_its_forms_and_shows_the_default_selected() {
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let key = arena_core::openrouter::KeyInfo { hash: "ha".into(), name: Some("alpha".into()), limit: Some(5.0), usage: Some(1.0), ..Default::default() };
+        ui.ai_set = vec![("alpha".into(), Some(key))];
+        let names = ["alpha".to_string()];
+        let text = |lines: &[Line]| lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        let body = input_body(&ui, Action::KeyLimit, &names, "+5", true);
+        let at = text(&body).iter().position(|l| l == "  > +5").unwrap_or_else(|| panic!("{:?}", text(&body)));
+        assert_eq!(body[at].spans[1].style.add_modifier, Modifier::REVERSED, "the default, selected");
+        assert_eq!(body[at + 1].to_string(), "    10 sets · +5 raises · -2 lowers");
+        assert_eq!(body[at + 1].spans[0].style.fg, Some(Color::DarkGray), "dim");
+        assert!(text(&body).contains(&"new cap: $10.00".to_string()), "{:?}", text(&body));
+        let typed = input_body(&ui, Action::KeyLimit, &names, "-2", false);
+        assert!(typed.iter().any(|l| l.to_string() == "  > -2" && l.spans[1].style == Style::default()));
+        assert!(text(&typed).contains(&"new cap: $3.00".to_string()), "{:?}", text(&typed));
+        assert!(text(&input_body(&ui, Action::KeyLimit, &names, "10", false)).contains(&"new cap: $10.00".to_string()));
+        let refused = text(&input_body(&ui, Action::KeyLimit, &names, "-5", false));
+        assert!(refused.iter().any(|l| l.starts_with("✗ its $5.00 cap lowered by $5.00 is $0 or less")), "{refused:?}");
+        let empty = text(&input_body(&ui, Action::KeyLimit, &names, "", false));
+        assert!(!empty.iter().any(|l| l.contains('✗')) && empty.contains(&"  > ".to_string()), "{empty:?}");
+        // Other boxes: no hint.
+        assert!(!text(&input_body(&ui, Action::SetBranch, &names, "w3d2", false)).iter().any(|l| l.contains("sets")));
     }
 
     /// The text wrappers the confirm counts its rows with (pure).

@@ -465,18 +465,13 @@ fn handle_key_in(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui
                 _ => ui.mode = Mode::FleetConfirm { action, typed, scope, note },
             }
         }
-        Mode::Input { action, scope, mut value } => match code {
+        Mode::Input { action, scope, mut value, mut prefilled } => match code {
             KeyCode::Esc => ui.mode = Mode::List,
-            KeyCode::Enter if !value.trim().is_empty() => submit_input(shared, ui, provider, action, scope, value),
-            KeyCode::Backspace => {
-                value.pop();
-                ui.mode = Mode::Input { action, scope, value };
+            KeyCode::Enter if !value.trim().is_empty() => submit_input(shared, ui, provider, action, scope, value, prefilled),
+            _ => {
+                type_into(&mut value, &mut prefilled, code);
+                ui.mode = Mode::Input { action, scope, value, prefilled };
             }
-            KeyCode::Char(ch) => {
-                value.push(ch);
-                ui.mode = Mode::Input { action, scope, value };
-            }
-            _ => ui.mode = Mode::Input { action, scope, value },
         },
         Mode::Select { mut value } => match code {
             KeyCode::Esc => ui.mode = Mode::List,
@@ -506,14 +501,36 @@ fn handle_key_in(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cx: &Ctx, ui
     Ok(Flow::Changed)
 }
 
+/// A key typed into an input box ([`Mode::Input`]), Enter and Esc aside: `value` after it. The
+/// untouched default (`prefilled`, the raise-cap box's `+5`) goes whole — the first character
+/// typed replaces it, Backspace clears it (the human, 2026-11-03: `10` typed after `+5` made
+/// `+510`); then the box is as any other. Pure.
+pub(crate) fn type_into(value: &mut String, prefilled: &mut bool, code: KeyCode) {
+    match code {
+        KeyCode::Backspace if *prefilled => value.clear(),
+        KeyCode::Backspace => {
+            value.pop();
+        }
+        KeyCode::Char(ch) => {
+            if *prefilled {
+                value.clear();
+            }
+            value.push(ch);
+        }
+        _ => return,
+    }
+    *prefilled = false;
+}
+
 /// Enter in an input box: `action` with `value` on its pod or its set — one of the CLI's commands
 /// as a run (`runs.rs`), the rest in the background. A cap the box shows as refused (an amount
-/// that isn't one, a cap under the spend) stays in the box, which says why.
-pub(crate) fn submit_input(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Provider>, action: Action, scope: InputScope, value: String) {
+/// that isn't one, a cap under the spend) stays in the box as it was (`prefilled`: the default
+/// still the default), saying why.
+pub(crate) fn submit_input(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Provider>, action: Action, scope: InputScope, value: String, prefilled: bool) {
     if action.ai_key() {
         // The box's own pods and keys (`Ui::ai_set`), as previewed.
         if aikey::limit_preview(&ui.ai_set, &value).is_err() {
-            ui.mode = Mode::Input { action, scope, value };
+            ui.mode = Mode::Input { action, scope, value, prefilled };
             return;
         }
         let keyed = aikey::keyed(&std::mem::take(&mut ui.ai_set));
@@ -568,6 +585,31 @@ mod tests {
     use std::collections::HashSet;
     use arena_core::remote::FakeRemote;
     use crate::tests::{cfg, draw, fixture_shared, ui};
+
+    /// An input box's keys: the untouched default (the raise-cap box's `+5`) is replaced by the
+    /// first character typed — whichever form it starts (`10`, `$10`, `+1`, `-2`, `.5`) — and
+    /// cleared by Backspace; once touched, typing adds to it. A key that types nothing leaves it.
+    #[test]
+    fn the_first_key_typed_replaces_the_default() {
+        let typed = |start: &str, prefilled: bool, keys: &[KeyCode]| {
+            let (mut value, mut prefilled) = (start.to_string(), prefilled);
+            for k in keys {
+                type_into(&mut value, &mut prefilled, *k);
+            }
+            (value, prefilled)
+        };
+        let chars = |s: &str| s.chars().map(KeyCode::Char).collect::<Vec<_>>();
+        for (keys, want) in [("10", "10"), ("$10", "$10"), ("+1", "+1"), ("-2", "-2"), ("-$2", "-$2"), (".5", ".5"), ("x", "x")] {
+            assert_eq!(typed("+5", true, &chars(keys)), (want.to_string(), false), "{keys}");
+        }
+        assert_eq!(typed("+5", true, &[KeyCode::Backspace]), (String::new(), false));
+        assert_eq!(typed("+5", true, &[KeyCode::Backspace, KeyCode::Char('7')]), ("7".into(), false));
+        assert_eq!(typed("+5", true, &[KeyCode::Left, KeyCode::Tab]), ("+5".into(), true), "nothing typed: still the default");
+        // Touched (or never a default): as before.
+        assert_eq!(typed("+5", false, &chars("0")), ("+50".into(), false));
+        assert_eq!(typed("+5", false, &[KeyCode::Backspace]), ("+".into(), false));
+        assert_eq!(typed("", false, &chars("w3d2")), ("w3d2".into(), false));
+    }
 
     /// `/` then Enter, through the handler the key loop calls: a valid selection replaces the
     /// marks (not adds to them) and says what it marked; a typo leaves the marks as they were

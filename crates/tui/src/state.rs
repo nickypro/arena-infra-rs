@@ -1355,7 +1355,8 @@ pub enum Action {
     /// home now" (`backups.rs`); in no menu of its own.
     Pull,
     // Its OpenRouter key's, offered when a provisioning key is configured (`keys …`).
-    /// `keys limit <pod> <amount>`: raise or set its cap (the operator types the amount first).
+    /// `keys limit <pod> <amount>`: set, raise or lower its cap (the operator types the amount
+    /// first).
     KeyLimit,
     /// `keys pause`: its AI calls fail until it's resumed.
     KeyPause,
@@ -1503,7 +1504,7 @@ impl Action {
             Action::Jobs => "its background jobs (read-only)",
             Action::Logs => "its newest job's log (read-only)",
             Action::Pull => "copy its home here (rsync)",
-            Action::KeyLimit => "AI key: raise or set its cap",
+            Action::KeyLimit => "AI key: set, raise or lower its cap",
             Action::KeyPause => "AI key: pause (calls fail until resumed)",
             Action::KeyResume => "AI key: resume",
             Action::KeyRotate => "AI key: a new one, copied onto it",
@@ -1669,8 +1670,8 @@ impl Action {
             Action::Logs => "show its newest job's log (read-only)".into(),
             Action::Pull => "copy its home into LOCAL_BACKUP_DIR now (`arena pods pull`: today's snapshot and the all-files tier)".into(),
             Action::KeyLimit => match arg {
-                Some(a) => format!("set its AI key's cap: {a} (`arena keys limit`)"),
-                None => "raise or set its AI key's cap (`arena keys limit`)".into(),
+                Some(a) => format!("change its AI key's cap: {a} (`arena keys limit`)"),
+                None => "set, raise or lower its AI key's cap (`arena keys limit`)".into(),
             },
             Action::KeyPause => "pause its AI key: OpenRouter refuses its calls until it's resumed (`arena keys pause`)".into(),
             Action::KeyResume => "resume its AI key (`arena keys resume`)".into(),
@@ -1685,8 +1686,17 @@ impl Action {
             Action::SetBranch => "branch to switch to (fetch + checkout + fast-forward):",
             Action::Rename => "new name — a free MACHINE_NAME_LIST name (bare names get the prefix):",
             Action::Claude => "Claude Code account — its number or email (`arena claude accounts`), none, or spread:",
-            Action::KeyLimit => "the cap in USD — `10` sets it, `+5` raises it by $5:",
+            Action::KeyLimit => "the cap, in USD:",
             _ => "",
+        }
+    }
+
+    /// The dim line under the input modal's value, for [`Self::needs_input`] actions that take
+    /// more than one form.
+    pub fn input_hint(&self) -> Option<&'static str> {
+        match self {
+            Action::KeyLimit => Some("10 sets · +5 raises · -2 lowers"),
+            _ => None,
         }
     }
 }
@@ -2349,7 +2359,8 @@ mod tests {
             (Action::Claude, Some("2"), "tuiprobe: put it on Claude Code account 2 and push that token (`arena claude assign`)"),
             (Action::Jobs, None, "tuiprobe: list its background jobs (read-only)"),
             (Action::Logs, None, "tuiprobe: show its newest job's log (read-only)"),
-            (Action::KeyLimit, Some("+5"), "tuiprobe: set its AI key's cap: +5 (`arena keys limit`)"),
+            (Action::KeyLimit, Some("+5"), "tuiprobe: change its AI key's cap: +5 (`arena keys limit`)"),
+            (Action::KeyLimit, Some("-2"), "tuiprobe: change its AI key's cap: -2 (`arena keys limit`)"),
             (Action::KeyPause, None, "tuiprobe: pause its AI key: OpenRouter refuses its calls until it's resumed (`arena keys pause`)"),
             (Action::KeyResume, None, "tuiprobe: resume its AI key (`arena keys resume`)"),
             (Action::KeyRotate, None, "tuiprobe: replace its AI key with a new one and copy that onto the pod (`arena keys rotate --copy`)"),

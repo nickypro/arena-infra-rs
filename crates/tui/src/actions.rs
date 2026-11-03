@@ -192,7 +192,7 @@ pub(crate) fn choose_pod_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provid
         _ => {}
     }
     ui.mode = if action.needs_input() {
-        Mode::Input { action, scope: InputScope::Pod { name: shown, id: pod.id }, value: String::new() }
+        Mode::Input { action, scope: InputScope::Pod { name: shown, id: pod.id }, value: String::new(), prefilled: false }
     } else {
         let preview = build_preview(&ui.cfg, action, &pod);
         let wipes_disk = provider.restart_wipes_container_disk(&pod);
@@ -230,7 +230,7 @@ pub(crate) fn choose_fleet_action(
             });
         }
         Action::Run | Action::SetBranch => {
-            ui.mode = Mode::Input { action, scope: InputScope::Set(scope), value: String::new() };
+            ui.mode = Mode::Input { action, scope: InputScope::Set(scope), value: String::new(), prefilled: false };
         }
         _ => {
             // A restart or terminate of a set with a pod its provider can't do it for (none can't
@@ -853,30 +853,38 @@ mod tests {
         ui.selected = at("devtest-alpha");
         ui.mode = Mode::Menu { sel: 0 };
         let menu = draw(120, 40, &shared.lock().unwrap(), &ui).join("\n");
-        assert!(menu.contains("[a] ai cap     AI key: raise or set its cap") && menu.contains("[o] ai pause"), "{menu}");
+        assert!(menu.contains("[a] ai cap     AI key: set, raise or lower its cap") && menu.contains("[o] ai pause"), "{menu}");
         let i = at("devtest-alpha");
         let alpha = shared.lock().unwrap().pods[i].clone();
         let rows = aikey::pod_rows(&shared.lock().unwrap(), &ui, Some(&alpha)).0;
         let pick = rows.iter().find(|(k, _)| *k == 'a').unwrap().1;
         choose_pod_action(&shared, &mut ui, &provider, pick);
-        let Mode::Input { action: Action::KeyLimit, scope, value } = ui.mode.clone() else { panic!("{:?}", ui.mode) };
+        let Mode::Input { action: Action::KeyLimit, scope, value, prefilled: true } = ui.mode.clone() else { panic!("{:?}", ui.mode) };
         assert_eq!(value, "+5");
         let boxed = draw(120, 40, &shared.lock().unwrap(), &ui).join("\n");
         assert!(boxed.contains("spent $0.42 of $5.00 this month") && boxed.contains("new cap: $10.00"), "{boxed}");
         // Under the spend: refused in the box, Enter keeps it.
-        ui.mode = Mode::Input { action: Action::KeyLimit, scope: scope.clone(), value: "0.1".into() };
+        ui.mode = Mode::Input { action: Action::KeyLimit, scope: scope.clone(), value: "0.1".into(), prefilled: false };
         assert!(draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("✗ a $0.10 cap is under what it has spent this month ($0.42)"));
-        submit_input(&shared, &mut ui, &provider, Action::KeyLimit, scope.clone(), "0.1".into());
-        assert!(matches!(&ui.mode, Mode::Input { value, .. } if value == "0.1"), "{:?}", ui.mode);
+        submit_input(&shared, &mut ui, &provider, Action::KeyLimit, scope.clone(), "0.1".into(), false);
+        assert!(matches!(&ui.mode, Mode::Input { value, prefilled: false, .. } if value == "0.1"), "{:?}", ui.mode);
+        // A lowering under the spend too; one above it shows the new cap.
+        ui.mode = Mode::Input { action: Action::KeyLimit, scope: scope.clone(), value: "-4.60".into(), prefilled: false };
+        assert!(draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("✗ a $0.40 cap is under what it has spent this month ($0.42)"));
+        ui.mode = Mode::Input { action: Action::KeyLimit, scope: scope.clone(), value: "-2".into(), prefilled: false };
+        assert!(draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("new cap: $3.00"));
+        // The default refused stays the default (the first key typed still replaces it).
+        submit_input(&shared, &mut ui, &provider, Action::KeyLimit, scope.clone(), "-9".into(), true);
+        assert!(matches!(&ui.mode, Mode::Input { value, prefilled: true, .. } if value == "-9"), "{:?}", ui.mode);
         assert!(shared.lock().unwrap().runs.is_empty());
         // A refresh while the box is open (another operator raised the cap to $25) changes neither
         // the preview nor what Enter runs on (review codex r4 #2): the CLI then refuses the moved key.
         let before = shared.lock().unwrap().ai.clone();
         shared.lock().unwrap().ai = Some(UsageView::from_keys(&[KeyInfo { limit: Some(25.0), ..key("devtest-alpha", 0.42, Some("monthly"), false) }], None));
-        ui.mode = Mode::Input { action: Action::KeyLimit, scope: scope.clone(), value: "+5".into() };
+        ui.mode = Mode::Input { action: Action::KeyLimit, scope: scope.clone(), value: "+5".into(), prefilled: true };
         assert!(draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("spent $0.42 of $5.00 this month"));
         // Enter on +5: `arena keys limit devtest-alpha +5 --yes`, then the keys are read again.
-        submit_input(&shared, &mut ui, &provider, Action::KeyLimit, scope, "+5".into());
+        submit_input(&shared, &mut ui, &provider, Action::KeyLimit, scope, "+5".into(), true);
         shared.lock().unwrap().ai = before;
         let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
         assert_eq!(first_line_when_ended(&shared, id).await.as_deref(), Some("args: --config /test/config.env --provider runpod keys limit devtest-alpha +5 --expect hdevtestalpha=5/monthly/on --yes"));
@@ -930,7 +938,7 @@ mod tests {
         assert!(matches!(&ui.mode, Mode::FleetConfirm { action: Action::KeyPause, note, .. } if note == "Left out (no AI key that was read): charlie"), "{:?}", ui.mode);
         choose_fleet_action(&shared, &mut ui, &provider, Action::KeyLimit, Scope::Marked);
         let Mode::Input { action: Action::KeyLimit, scope, .. } = ui.mode.clone() else { panic!("{:?}", ui.mode) };
-        submit_input(&shared, &mut ui, &provider, Action::KeyLimit, scope, "+1".into());
+        submit_input(&shared, &mut ui, &provider, Action::KeyLimit, scope, "+1".into(), true);
         let Mode::Runs { id, .. } = ui.mode else { panic!("{:?}", ui.mode) };
         let line = first_line_when_ended(&shared, id).await.unwrap();
         let mut named: Vec<&str> = line.split(' ').filter(|w| w.starts_with("devtest-")).collect();
