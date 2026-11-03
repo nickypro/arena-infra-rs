@@ -1143,7 +1143,7 @@ pub(crate) enum PodCmd {
         /// The command to run (everything after the flags)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
-        /// Start it detached and return a job id (stop it with `pods jobs --kill`)
+        /// Detach and return a job id (`pods jobs --kill` stops it)
         #[arg(long, visible_alias = "bg", conflicts_with = "timeout")]
         background: bool,
         /// Per-pod budget in seconds; a pod over it counts as failed
