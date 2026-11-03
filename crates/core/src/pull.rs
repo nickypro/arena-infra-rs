@@ -1257,6 +1257,12 @@ const MAKE_WAY: &str = "could not make way for new ";
 /// one its [`MAKE_WAY`] message comes with. A line like it under any other exit is not acted on.
 pub const RSYNC_PARTIAL_EXIT: i32 = 23;
 
+/// rsync's exit when the only thing wrong was source files that vanished before they could be
+/// sent — removed or renamed on the pod while it read them (a program writing its files, git's
+/// detached maintenance and its `objects/maintenance.lock` since 2.47). Any other trouble makes
+/// it 23. Everything else was copied, and the next pull takes what the pod has then.
+pub const RSYNC_VANISHED_EXIT: i32 = 24;
+
 /// The kinds of entry a [`MAKE_WAY`] line names where a directory can be what's in the way,
 /// in rsync's own words. `directory` is not one of them: rsync replaces a file in a new
 /// directory's way by itself.

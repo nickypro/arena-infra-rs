@@ -28,6 +28,14 @@ earlier).
   `.git/arena-unredacted/`.
 - Found by a sweep for flaky tests.
 
+## 2026-11-03 · the backup's copy: files vanishing on a pod mid-copy no longer fail it
+- If files on a pod are removed or renamed while `pods pull` (or the backup's copy) reads them,
+  rsync exits 24 and the pod's copy was counted as failed. Everything else was copied, so it now
+  counts as copied, and the pod's line says `some files vanished on the pod while they were
+  copied (the next pull takes them)`. Other rsync errors still fail the copy.
+- This happened on every run for one cohort pod. On a pod with git 2.47 or newer it's more
+  likely: git then runs background maintenance after a commit, including the backup's own.
+
 ## 2026-11-03 · dependencies updated; no change in behaviour
 - The libraries arena is built on are updated, the dashboard's drawing and terminal libraries
   included. Commands, their output and the dashboard work and look as before.
