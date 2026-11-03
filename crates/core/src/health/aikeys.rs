@@ -108,6 +108,7 @@ impl KeyFacts {
         match self.set {
             Some(false) => "none here".into(),
             _ if self.accepted() => "one here, accepted".into(),
+            _ if self.viewer == Some(false) => "one here, rejected (no user for it)".into(),
             _ if self.rejected() => format!("one here, rejected (HTTP {})", self.http.unwrap_or_default()),
             _ => "one here, not checked".into(),
         }

@@ -70,10 +70,11 @@ def main():
         if not runs_this_python(argv, bindir):
             continue
         mine.append(name)
-        # Registered: an `ipykernel install` wrote it (an absolute path to this python), not the
-        # one ipykernel itself carries, which only this env's own Jupyter sees.
+        # Registered: a kernel.json on disk (the user's, the system's, or the env's own share dir,
+        # where pip puts ipykernel's) — not the one jupyter_client makes up from ipykernel's own
+        # resources when there is none.
         where = os.path.realpath(s.get("resource_dir") or "")
-        if os.path.isabs(argv[0]) and not where.startswith(builtin):
+        if not where.startswith(builtin):
             registered.append(name)
     kv("specs", ",".join(mine) or "none")
     kv("registered", ",".join(registered) or "none")

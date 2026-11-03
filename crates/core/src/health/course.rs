@@ -640,10 +640,11 @@ fn proxy_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
             }
             None => Check::new(name, Warn, format!("port {n} answers; not compared (no identity reported) — `arena pods test --deep {}`", book.short(&pod.name))),
         },
+        // The file forwards it to an old endpoint: wrong whether or not nginx runs it.
+        Some(Err(why)) if stale => Check::new(name, Fail, format!("port {n} forwards to an old endpoint ({}) — {apply}", clip_why(why, 30))),
         Some(Err(why)) if px.write_only => {
             Check::new(name, Warn, format!("port {n}: {} — write-only proxy here: SSH_PROXY_RELOAD_CMD reloads it", clip_why(why, 40)))
         }
-        Some(Err(why)) if stale => Check::new(name, Fail, format!("port {n} forwards to an old endpoint ({}) — {apply}", clip_why(why, 30))),
         Some(Err(why)) => Check::new(name, Fail, format!("port {n} doesn't reach it: {} — {apply}", clip_why(why, 40))),
         None if stale => Check::new(name, Fail, format!("port {n} forwards to an old endpoint — {apply}")),
         None => Check::new(name, Skip, format!("port {n} not tried")),
@@ -813,20 +814,20 @@ fn claude_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
             };
         }
         Some("oauth") => match (c.source.as_deref(), c.profile.as_deref()) {
-            (Some("clods"), Some(n)) => format!("clods profile {n} (token {fp})"),
-            (Some("settings"), _) => format!("a token in settings.json ({fp})"),
+            (Some("clods"), Some(n)) => format!("clods profile {n}, token {fp}"),
+            (Some("settings"), _) => format!("a token in settings.json, {fp}"),
             _ => match (pushed, pool_account) {
                 (Some((Some(acct), Some(want))), _) if Some(want.as_str()) == c.fingerprint.as_deref() => format!("arena claude's {acct}"),
                 (Some((Some(acct), _)), _) => {
                     return Check::new(name, Warn, format!("v{v}: not the token arena claude pushed — {push} ({acct})"));
                 }
                 (_, Some(acct)) => format!("arena claude's {acct}"),
-                _ => format!("a token ({fp}), not arena claude's"),
+                _ => format!("a token {fp}, not arena claude's"),
             },
         },
         Some("bearer") if c.same_as.as_deref() == Some("openrouter") => "OpenRouter: the AI key".to_string(),
-        Some("bearer") => format!("ANTHROPIC_AUTH_TOKEN to {} ({fp})", c.base_host.as_deref().unwrap_or("?")),
-        Some("api_key") => format!("ANTHROPIC_API_KEY ({fp})"),
+        Some("bearer") => format!("ANTHROPIC_AUTH_TOKEN to {}, {fp}", c.base_host.as_deref().unwrap_or("?")),
+        Some("api_key") => format!("ANTHROPIC_API_KEY {fp}"),
         Some("helper") => "an apiKeyHelper".to_string(),
         Some("login") => "a /login".to_string(),
         Some("cloud") => "a cloud provider".to_string(),
@@ -843,24 +844,32 @@ fn claude_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
         Some(other) => (other, format!("`arena pods test --course {s}` later")),
         None => ("?", String::new()),
     };
+    // Which one exactly, after the fix (where the NOTES cell may cut): the parts `short` didn't say.
+    let which = match c.auth.as_deref() {
+        Some("api_key") => fp.to_string(),
+        Some("bearer") if c.same_as.as_deref() == Some("openrouter") => "OpenRouter".to_string(),
+        Some("bearer") => format!("{}, {fp}", c.base_host.as_deref().unwrap_or("?")),
+        _ => what.clone(),
+    };
+    let what = &what;
     let answered = |h: u16| (200..300).contains(&h);
     let claude_code_only = c.error.as_deref().is_some_and(|e| e.contains("Claude Code"));
     let again = format!("`arena pods test --course {s}`");
     match (c.call.as_deref(), c.http) {
         (Some("models" | "openrouter" | "messages"), Some(h)) if answered(h) => Check::new(name, Pass, format!("v{v}, {what}: accepted")),
         (Some("messages"), Some(400 | 403)) if claude_code_only => Check::new(name, Pass, format!("v{v}, {what}: accepted (for Claude Code only)")),
-        (Some(_), Some(h @ (401 | 403))) => Check::new(name, Fail, format!("v{v}: {short} rejected (HTTP {h}) — {fix} ({what})")),
+        (Some(_), Some(h @ (401 | 403))) => Check::new(name, Fail, format!("v{v}: {short} rejected (HTTP {h}) — {fix} ({which})")),
         (Some(_), Some(429)) if c.auth.as_deref() == Some("oauth") => {
-            Check::new(name, Warn, format!("v{v}: {short} at its limit (HTTP 429) — wait, or `arena claude assign {s} N` ({what})"))
+            Check::new(name, Warn, format!("v{v}: {short} at its limit (HTTP 429) — wait, or `arena claude assign {s} N` ({which})"))
         }
-        (Some(_), Some(429)) => Check::new(name, Warn, format!("v{v}: {short} at its limit (HTTP 429) — wait for it to reset ({what})")),
+        (Some(_), Some(429)) => Check::new(name, Warn, format!("v{v}: {short} at its limit (HTTP 429) — wait for it to reset ({which})")),
         (Some(_), Some(0)) | (Some("models" | "openrouter" | "messages"), None) => Check::new(
             name,
             Warn,
-            format!("v{v}: {short} not checked ({}) — {again} ({what})", clip_why(c.error.as_deref().unwrap_or("no answer"), 16)),
+            format!("v{v}: {short} not checked ({}) — {again} ({which})", clip_why(c.error.as_deref().unwrap_or("no answer"), 16)),
         ),
         (Some(_), Some(h)) => {
-            Check::new(name, Warn, format!("v{v}: {short} answered HTTP {h} — {again} ({what}: {})", clip_why(c.error.as_deref().unwrap_or("?"), 40)))
+            Check::new(name, Warn, format!("v{v}: {short} answered HTTP {h} — {again} ({which}: {})", clip_why(c.error.as_deref().unwrap_or("?"), 40)))
         }
         _ => Check::new(name, Pass, format!("v{v}, {what}")),
     }

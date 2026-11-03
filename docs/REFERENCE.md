@@ -2527,8 +2527,10 @@ command line.
 
 **W&B** (`wandb`) follows the `hf_token` column's rules, held to the config's `WANDB_API_KEY` (or the
 machine's own row in `keys/wandb_api_keys.csv`, which wins). Both are optional: `pods copy-keys` (and
-setup) export `WANDB_API_KEY` on each machine once either is set. A fleet with neither gets a note,
-never a verdict. The `--keys` table gains a `W&B` column once some machine's key was judged.
+setup) export `WANDB_API_KEY` on each machine once either is set, and the environment may supply it
+for one run, as `HF_TOKEN`. A fleet with neither gets a note, never a verdict. W&B answers 200 to any
+key, so only a user in its answer passes; an answer with no user and no error is a WARN. The `--keys`
+table gains a `W&B` column once some machine's key was judged.
 
 The under-a-tenth line leaves a day or so to raise the cap before calls fail. It stops at $1 so that
 a large cap doesn't warn while it still has plenty.
@@ -2557,18 +2559,20 @@ same script. Everything is read-only:
 
 - the course repo is read through git's metadata (refs, config, the operation markers) with no
   optional locks, never a file of the work;
-- the push is a dry run, with no hooks, and a host key ssh hasn't seen goes to a temp file;
+- the push is a dry run to the cohort repo's SSH URL (never `origin`'s own URL, which could carry a
+  credential), with no hooks and no credential helper, and a host key ssh hasn't seen goes to a temp
+  file;
 - the kernel runs with its runtime and IPython files in the script's temp dir, and is stopped before
   the script ends;
 - the proxy is only connected through.
 
 | Check | What it looks at | FAIL | WARN | What it says to run |
 |---|---|---|---|---|
-| `proxy` | from this box, one SSH connection through the machine's proxy port (`SSH_PROXY_HOST`, its stable port), compared with the machine itself: `~/.name`, the hostname, the sshd host keys' fingerprint | it reaches another machine (a route left on the old pod after a replace); the proxy file forwards to an old endpoint; the port doesn't answer | no forward for it; it answers but the machine reported no identity; a write-only proxy (`SSH_PROXY_RELOAD_CMD=""`, the sandbox) whose port doesn't answer | `proxy apply` |
-| `backup` | `git push --dry-run` with the deploy key (`GIT_SSH_KEY_REMOTE`): GitHub's answer for the key; then the last git backup as `arena backups` judges it | no deploy key; GitHub refuses it (read-only, not on the repo, unknown host key); the last backup failed | the push couldn't be asked (network); the last backup is late (twice the cron's gap) | `pods setup <name>`, `pods backup <name>`, or write access for the key on GitHub |
+| `proxy` | from this box, one SSH connection through the machine's proxy port (`SSH_PROXY_HOST`, its stable port), compared with the machine itself: `~/.name`, the hostname, the sshd host keys' fingerprint | it reaches another machine (a route left on the old pod after a replace); the proxy file forwards to an old endpoint (a write-only proxy's too); the port doesn't answer | no forward for it; it answers but the machine reported no identity; a write-only proxy (`SSH_PROXY_RELOAD_CMD=""`, the sandbox) whose port doesn't answer | `proxy apply` |
+| `backup` | `git push --dry-run` with the deploy key (`GIT_SSH_KEY_REMOTE`) to `git@github.com:ARENA_REPO_OWNER/ARENA_REPO_NAME.git`: GitHub's answer for the key; then the last git backup as `arena backups` judges it (by name) | no deploy key; GitHub refuses it (read-only, not on the repo, unknown host key); the last backup failed | the push couldn't be asked (network, or no cohort repo configured); the last backup is late (twice the cron's gap) | `pods setup <name>`, `pods backup <name>`, or write access for the key on GitHub |
 | `repo` | the course repo (`BACKUP_REPO_PATH`): there, `origin` the configured repo, its branch | no repo; `origin` isn't `ARENA_REPO_OWNER/ARENA_REPO_NAME` (backups refuse to push) | on `main`/`master` or a detached HEAD (no backup commits); not today's autocommit branch (`init-branches`' name, from `ARENA_START_DATE`); a merge, rebase, cherry-pick… in progress | `pods setup <name>`, `pods init-branches <name>`, or the git command that ends the operation |
 | `claude` | `claude --version` for root, and which auth Claude Code would use, by kind and fingerprint: an `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` pair, `ANTHROPIC_API_KEY`, an apiKeyHelper, `CLAUDE_CODE_OAUTH_TOKEN` (`arena claude`'s export, or a clods profile's `settings.json`), a /login | not installed; `--version` fails; the auth is rejected | not `arena claude`'s token (moved, rotated); no token though `arena claude` pushed one; at its limit; not checked | `pods setup <name>`, `claude push <name>`, `pods copy-keys <name>` |
-| `kernel` | the course env the agent notes name (`/opt/arena-env` on GPU images, `<repo>/.venv` on bare VMs): its Jupyter kernels for that python, one started, `import torch` in it (20 + 25 s) | no course env; the kernel can't import torch (software/setup, never the host) | no ipykernel in it; no kernel registered for it; it didn't start or import in time | `pods setup <name>`, or the `pods run` line that installs or registers it |
+| `kernel` | the course env the agent notes name (`/opt/arena-env` on GPU images, `<repo>/.venv` on bare VMs): the ipykernel kernels that run a python in its `bin`, one started in the temp dir, `import torch` and its `sys.prefix` in it (20 + 25 s) | no course env; the kernel can't import torch (software/setup, never the host) | no ipykernel in it; no kernel.json for it on disk (only ipykernel's built-in one); the kernel runs another env; it didn't start or import in time | `pods setup <name>`, or the `pods run` line that installs or registers it |
 | `uv` | `uv` on PATH in a login shell | | missing | `pods setup <name> --notes-only` |
 
 Having no Claude Code auth is a note, never a FAIL. Which auth wins follows Claude Code's own order:
@@ -2576,8 +2580,9 @@ a settings file's `env` beats the shell's (how a clods profile's token beats an 
 key is checked with the free models list, and a Bearer token to OpenRouter with the AI key's free call.
 An OAuth token (`arena claude`, clods) is checked only by comparing its fingerprint with what `arena
 claude` pushed, because the only call that proves it works uses the account. **`--claude-call`** makes
-that call: one Messages request per machine, 1 token from `claude-haiku-5-5`, which counts against
-the account's limits (or its money, for an API key).
+that call: one Messages request per machine (an OAuth token, an API key, a Bearer token to another
+base URL), 1 token from `claude-haiku-5-5`, which counts against the account's limits (or its money,
+for an API key). OpenRouter's key check stays the free one: it's exact, and its money is `ai_key`'s.
 
 A course FAIL is never the machine's. `up --check` never replaces a machine for one, never retries
 it and never remembers its host as bad. It says the FAIL with what to run and keeps the machine:

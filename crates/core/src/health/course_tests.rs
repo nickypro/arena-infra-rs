@@ -154,6 +154,12 @@ fn proxy_verdicts() {
             "port 9500: connection refused — write-only proxy here: SSH_PROXY_RELOAD_CMD reloads it".into(),
         ),
         (proxied(ProxyState::Live, Some(9500), None, false), Status::Skip, "port 9500 not tried".into()),
+        // A write-only proxy's stale file is still wrong (live: it read as the write-only WARN).
+        (
+            proxied(ProxyState::Stale, Some(9500), Some(Err("connection refused".into())), true),
+            Status::Fail,
+            format!("port 9500 forwards to an old endpoint (connection refused) — {apply}"),
+        ),
     ];
     for (b, status, detail) in cases {
         assert_eq!(verdict(&f, &b, PROXY), (status, detail.clone()), "{detail}");
@@ -325,12 +331,12 @@ fn claude_verdicts() {
         (facts(&good_lines()), pushed(&fp), Status::Warn, format!("v2.1.30: no token, though arena claude pushed one — {push} (a@x)")),
         (oauth(""), pushed(&fp), Status::Pass, "v2.1.30, arena claude's a@x".into()),
         (oauth(""), pushed("000000000000"), Status::Warn, format!("v2.1.30: not the token arena claude pushed — {push} (a@x)")),
-        (oauth(""), book(), Status::Pass, format!("v2.1.30, a token ({fp}), not arena claude's")),
+        (oauth(""), book(), Status::Pass, format!("v2.1.30, a token {fp}, not arena claude's")),
         (
             claude_lines(&format!("claude.auth=oauth\nclaude.source=clods\nclaude.profile=2\nclaude.fingerprint={fp}\n")),
             pushed(&fp),
             Status::Pass,
-            format!("v2.1.30, clods profile 2 (token {fp})"),
+            format!("v2.1.30, clods profile 2, token {fp}"),
         ),
         (
             claude_lines("claude.auth=bearer\nclaude.source=shell\nclaude.base_host=openrouter.ai\nclaude.same_as=openrouter\nclaude.call=openrouter\nclaude.http=200\n"),
@@ -342,25 +348,25 @@ fn claude_verdicts() {
             claude_lines("claude.auth=bearer\nclaude.base_host=openrouter.ai\nclaude.same_as=openrouter\nclaude.call=openrouter\nclaude.http=401\nclaude.error=User not found.\n"),
             book(),
             Status::Fail,
-            "v2.1.30: the AI key rejected (HTTP 401) — `arena pods test --keys apple` says why (OpenRouter: the AI key)".into(),
+            "v2.1.30: the AI key rejected (HTTP 401) — `arena pods test --keys apple` says why (OpenRouter)".into(),
         ),
         (
             claude_lines("claude.auth=api_key\nclaude.fingerprint=aa4dca9da125\nclaude.call=models\nclaude.http=401\nclaude.error=invalid x-api-key\n"),
             book(),
             Status::Fail,
-            "v2.1.30: ANTHROPIC_API_KEY rejected (HTTP 401) — `arena pods copy-keys apple` (ANTHROPIC_API_KEY (aa4dca9da125))".into(),
+            "v2.1.30: ANTHROPIC_API_KEY rejected (HTTP 401) — `arena pods copy-keys apple` (aa4dca9da125)".into(),
         ),
         (
             claude_lines("claude.auth=api_key\nclaude.fingerprint=aa4dca9da125\nclaude.call=models\nclaude.http=200\n"),
             book(),
             Status::Pass,
-            "v2.1.30, ANTHROPIC_API_KEY (aa4dca9da125): accepted".into(),
+            "v2.1.30, ANTHROPIC_API_KEY aa4dca9da125: accepted".into(),
         ),
         (
             claude_lines("claude.auth=api_key\nclaude.fingerprint=aa4dca9da125\nclaude.call=models\nclaude.http=0\nclaude.error=timed out\n"),
             book(),
             Status::Warn,
-            "v2.1.30: ANTHROPIC_API_KEY not checked (timed out) — `arena pods test --course apple` (ANTHROPIC_API_KEY (aa4dca9da125))".into(),
+            "v2.1.30: ANTHROPIC_API_KEY not checked (timed out) — `arena pods test --course apple` (aa4dca9da125)".into(),
         ),
         // `--claude-call`: one Messages call on the account.
         (oauth("claude.call=messages\nclaude.http=200\n"), pushed(&fp), Status::Pass, "v2.1.30, arena claude's a@x: accepted".into()),
