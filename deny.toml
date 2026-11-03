@@ -7,7 +7,7 @@
 [graph]
 # The platforms the releases are built for: crates only another platform pulls in (Windows,
 # wasm, UEFI) don't ship, so their advisories and licences don't matter here.
-targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin"]
 
 [advisories]
 # RustSec advisories (vulnerabilities, unsound, unmaintained) fail the check; so does a yanked
