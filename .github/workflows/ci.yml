@@ -54,6 +54,30 @@ jobs:
           ARENA_TEST_ALL_SHELLS: "1"
         run: cargo test --release --locked
 
+  # The macOS build release.yml ships, tested on Apple silicon alongside the Linux job. Tests of
+  # what only Linux has (`/proc`, flock(1), setsid(1), …) are gated off macOS with `#[cfg]`:
+  # docs/REFERENCE.md, "macOS", lists them.
+  test-macos:
+    name: build + test (macOS)
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustc --version
+      - name: Tools
+        run: |
+          git config --global user.name "arena CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Test
+        run: cargo test --release --locked --no-fail-fast
+
   # Blocking: any clippy warning fails the run. The lint set is the pinned toolchain's
   # (RUSTUP_TOOLCHAIN), so a newer clippy's new lints arrive only with a deliberate bump.
   clippy:
@@ -71,5 +95,20 @@ jobs:
       # dashboard's dev-dependencies, so neither the test build nor the run above compiles the
       # code as shipped: this does, as `cargo build --release` would (a test double used by
       # shipped code fails here, as does code only the doubles use).
+      - name: Clippy, as shipped
+        run: cargo clippy --locked -- -D warnings
+
+  # The same on macOS: its `#[cfg]`s compile other code.
+  clippy-macos:
+    name: clippy (macOS)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Clippy, as shipped
         run: cargo clippy --locked -- -D warnings
