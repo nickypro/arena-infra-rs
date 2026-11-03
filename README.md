@@ -60,8 +60,9 @@ the four keys below in (`config set` prompts, and never echoes the value). Built
 
 ```bash
 alias arena="$HOME/arena/arena --config $HOME/arena/config.env"
+mkdir -p -m 700 ~/.ssh
 ssh-keygen -t ed25519 -N "" -f ~/.ssh/arena_key
-cp -n ~/arena/config.env.example ~/arena/config.env
+[ -e ~/arena/config.env ] || cp ~/arena/config.env.example ~/arena/config.env
 arena config set RUNPOD_API_KEY
 ```
 
