@@ -1440,6 +1440,7 @@ mod tests {
     }
 
     /// The tracked children's pids, and how many spawns are under way.
+    #[cfg(target_os = "linux")]
     fn tracked() -> (Vec<u32>, usize) {
         let c = children();
         (c.live.iter().map(|&(pid, _)| pid).collect(), c.starting)

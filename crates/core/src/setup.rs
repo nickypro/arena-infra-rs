@@ -2732,6 +2732,7 @@ mod tests {
         /// sh, bash and zsh (pods' login shell), with the step's `set -e` — and the backup's own
         /// identity lines, run after it, change nothing (no flip-flop); a global one the
         /// participant sets later takes over at the next setup, and the backup leaves it so.
+        #[cfg_attr(target_os = "macos", ignore = "git makes an identity up from a macOS host name (`*.local`), so no commit fails for want of one")]
         #[test]
         fn the_checkout_gets_the_backups_identity_only_where_git_finds_none() {
             let Some(f) = Fixture::new("identity") else { return };
@@ -2927,6 +2928,7 @@ mod tests {
         /// On a pod with a volume: setup's relocation puts the clone on the (fake) volume and
         /// the repo update that follows acts on THAT copy, through the symlink — the configured
         /// path stays a link, the volume copy gets the new commits.
+        #[cfg_attr(target_os = "macos", ignore = "the move onto the volume finds the repo's users through /proc")]
         #[test]
         fn the_update_acts_on_the_volume_copy_through_the_link() {
             let Some(f) = Fixture::new("volume") else { return };

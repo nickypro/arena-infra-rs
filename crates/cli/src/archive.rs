@@ -4473,6 +4473,7 @@ mod tests {
     /// A2-1 (a): a pod whose tree holds a symlink the archive can't store is pushed without it —
     /// by an exact anchored rule — and the run says how many were left out (never the target).
     #[cfg(unix)]
+    #[cfg_attr(target_os = "macos", ignore = "macOS caps a symlink's target at 1023 bytes")]
     #[tokio::test]
     async fn a_symlink_too_long_to_store_is_left_out_with_a_warning() {
         let w = world("longlink");
@@ -4751,6 +4752,7 @@ mod tests {
     /// push (its failure, charged like any) and of big, which goes pod by pod: every other pod's
     /// big push still goes, and the run names the pod.
     #[cfg(unix)]
+    #[cfg_attr(target_os = "macos", ignore = "macOS caps a symlink's target at 1023 bytes")]
     #[tokio::test]
     async fn too_many_unstorable_links_leave_only_that_pod_out() {
         let w = world("toomany");

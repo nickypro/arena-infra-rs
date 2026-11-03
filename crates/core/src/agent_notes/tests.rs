@@ -264,6 +264,7 @@ fn stopgap(env: &str) -> String {
 /// (the link kept), a BEGIN with no END left alone, and no env: a warning and nothing written. uv
 /// and uvx are linked into /usr/local/bin where nothing is there, and a link or a file already
 /// there is kept.
+#[cfg_attr(target_os = "macos", ignore = "the notes are swapped in with renameat2, which macOS lacks")]
 #[test]
 fn the_notes_land_between_the_markers_and_keep_the_rest() {
     let claude = "home/.claude/CLAUDE.md";
@@ -430,6 +431,7 @@ fn a_file_that_cannot_be_written_fails_the_step() {
 /// - a writer holding the file open across the swap: its write lands in the file kept beside it;
 /// - the step stopped (TERM) right after a swap that took out a save: that save is kept;
 /// - no swap in one step here: a file that's there is left as it is, with a warning.
+#[cfg_attr(target_os = "macos", ignore = "the notes are swapped in with renameat2, which macOS lacks")]
 #[test]
 fn saves_made_meanwhile_are_never_lost() {
     let (Some(python), Some(ln)) = (which("python3"), which("ln")) else {

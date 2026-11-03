@@ -201,6 +201,7 @@ mod tests {
     /// A real `pods backup` (scripted pods, a stand-in rsync) leaves its record — the git run and
     /// the copy run, each pod's outcome — and `arena backups` judges and says it: apple pushed and
     /// copied, bloom's push and copy failed with their reasons, failing first.
+    #[cfg_attr(target_os = "macos", ignore = "whether a backup is running is read from /proc/locks")]
     #[tokio::test]
     async fn a_backup_run_is_recorded_and_arena_backups_says_it() {
         let base = std::env::temp_dir().join(format!("arena-cli-backups-{}", std::process::id()));

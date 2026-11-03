@@ -1330,6 +1330,7 @@ fn am_a_rebase_and_a_sequence_are_left_alone() {
 /// isn't git's. And a change after the look the copy followed (even one that keeps the file's old
 /// mtime): refused.
 #[cfg(unix)]
+#[cfg_attr(target_os = "macos", ignore = "it reads its session from /proc/self/stat")]
 #[test]
 fn recent_activity_or_a_change_since_the_copy_leaves_it_busy() {
     let r = Repo::new("recent");

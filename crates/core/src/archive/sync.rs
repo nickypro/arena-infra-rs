@@ -3254,6 +3254,7 @@ mod tests {
     /// MAX_SKIP_RULES unstorable links is left out of its push (a pod's push isn't made; a big
     /// push of several pods leaves only that dir back); dirs every push leaves out aren't walked.
     #[cfg(unix)]
+    #[cfg_attr(target_os = "macos", ignore = "macOS caps a symlink's target at 1023 bytes")]
     #[test]
     fn skip_rules_go_through_a_private_file_and_too_many_leave_only_that_pod_out() {
         use std::os::unix::fs::PermissionsExt;

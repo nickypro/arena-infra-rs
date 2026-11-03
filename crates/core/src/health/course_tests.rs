@@ -666,6 +666,7 @@ fn the_identity_command_reads_back_through_the_parser() {
 
 // ---- the script's course mode, run for real in a scratch $HOME (no network) ----
 
+#[cfg(target_os = "linux")]
 fn have(tool: &str) -> bool {
     std::process::Command::new("sh").args(["-c", &format!("command -v {tool}")]).output().is_ok_and(|o| o.status.success())
 }
@@ -675,6 +676,7 @@ fn have(tool: &str) -> bool {
 /// `http.client` sends a POST's head and body apart. So a stub could close with the body still
 /// unread, Linux resets a connection closed that way, and the helper got `ConnectionResetError`
 /// instead of the answer (CI on #77, 2026-11-03).
+#[cfg(target_os = "linux")]
 fn read_request(conn: &mut std::net::TcpStream) -> String {
     use std::io::Read;
     let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(10)));
@@ -703,6 +705,7 @@ fn read_request(conn: &mut std::net::TcpStream) -> String {
 
 /// Send `answer` and close gently: shut the write half, then read until the client closes, so
 /// nothing it sent late turns the close into a reset ([`read_request`]).
+#[cfg(target_os = "linux")]
 fn answer_and_close(mut conn: std::net::TcpStream, answer: &str) {
     use std::io::{Read, Write};
     let _ = conn.write_all(answer.as_bytes());
@@ -714,6 +717,7 @@ fn answer_and_close(mut conn: std::net::TcpStream, answer: &str) {
 /// No auto maintenance (git 2.47+ leaves one detached after a commit): its
 /// `.git/objects/maintenance.lock`, there for the "before" listing and gone by the "after", read as
 /// the run changing `$HOME`.
+#[cfg(target_os = "linux")]
 fn git(dir: &std::path::Path, args: &[&str]) {
     let ok = std::process::Command::new("git")
         .args(["-c", "user.email=t@t", "-c", "user.name=t", "-c", "init.defaultBranch=main", "-c", "maintenance.auto=false", "-c", "gc.auto=0"])
@@ -725,6 +729,7 @@ fn git(dir: &std::path::Path, args: &[&str]) {
 }
 
 /// Every file under `dir` with its size and mtime: what a read-only run must leave as it was.
+#[cfg(target_os = "linux")]
 fn listing(dir: &std::path::Path) -> Vec<(std::path::PathBuf, u64, std::time::SystemTime)> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];

@@ -697,4 +697,15 @@ mod tests {
         assert!(log.len() >= 3, "the compiled-in changelog has its entries");
         assert!(log.iter().all(|e| e.heading.len() > 13 && e.heading.as_bytes()[4] == b'-' && e.heading.contains(" · ")), "headings are `YYYY-MM-DD · …`");
     }
+
+    /// `update` fetches the release's binaries named after this build's target (`ARENA_TARGET`),
+    /// which is the platform it runs on: a Mac's build takes `arena-aarch64-apple-darwin`, a
+    /// Linux one `arena-x86_64-unknown-linux-gnu` (each fetching only its own:
+    /// `update_tests.rs`).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn this_build_updates_from_its_own_platforms_binaries() {
+        let os = if cfg!(target_os = "macos") { "apple-darwin" } else { "unknown-linux-gnu" };
+        assert_eq!(env!("ARENA_TARGET"), format!("{}-{os}", std::env::consts::ARCH));
+    }
 }
