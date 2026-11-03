@@ -90,7 +90,7 @@ pub(crate) fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared
             if !in_list {
                 return false;
             }
-            let (area, offset) = ui.last_table.get();
+            let (area, offset) = ui.last_table.at.get();
             // Data rows sit below the top border (1) + header (1), above the bottom border.
             let rows_top = area.y.saturating_add(2);
             let rows_bot = area.y.saturating_add(area.height).saturating_sub(1);
@@ -108,6 +108,8 @@ pub(crate) fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared
                 mark_key(&s.pods[idx])
             };
             ui.selected = idx;
+            // The view stays put: the row stays under the pointer.
+            ui.last_table.clicked.set(Some(idx));
             // Far-left of the row, or shift-click, toggles the multi-select mark.
             let left_zone = mx < area.x.saturating_add(5);
             let shift = m.modifiers.contains(KeyModifiers::SHIFT);

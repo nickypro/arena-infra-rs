@@ -35,6 +35,7 @@ use arena_core::pod::Maintenance;
 use arena_core::remote::FakeRemote;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::prelude::*;
 
 pub(crate) const NOW: u64 = 1_791_460_800; // 2026-10-08T12:00:00Z
 
@@ -120,7 +121,7 @@ pub(crate) fn ui(cfg: Config, remote: Arc<dyn Remote>) -> Ui {
         marked: HashSet::new(),
         result_scroll: 0,
         result_max: std::cell::Cell::new(0),
-        last_table: std::cell::Cell::new((Rect::default(), 0)),
+        last_table: crate::table::ListView::default(),
         asker: fake_asker(Arc::default()),
         ask_ai: None,
         deep_all_armed: None,

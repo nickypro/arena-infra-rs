@@ -19,6 +19,15 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-03 · the dashboard: the pod list keeps two pods in view past the cursor
+- Moving down a list that doesn't fit, the view scrolls before the cursor reaches the bottom, so
+  the next two pods are always in view. Only on the last pod does the cursor reach the edge, so
+  you can tell when you're at the end. Moving up works the same way at the top. On a list only a
+  few rows high, it keeps one pod in view instead.
+- Otherwise the view stays still: moving back up from the bottom moves the cursor, not the list.
+- A click doesn't scroll the list, so the pod you clicked stays under the pointer.
+- The backups screen's pod list (`b`) scrolls the same way.
+
 ## 2026-11-03 · arena 2.17: `keys limit` lowers a cap with `-2` and changes a batch of keys at once
 - **`arena keys limit apple -2`** lowers the cap by $2. A result under what the key has spent is
   refused, as for a set, unless you add `--force`. A result of $0 or less is always refused: give
