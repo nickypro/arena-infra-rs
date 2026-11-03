@@ -192,6 +192,7 @@ fn a_runs_copies_add_up_and_a_pod_goes_whole_or_not_at_all() {
 
 /// Other runs' copies under way count as taken: their reservations, per device, are pruned of
 /// processes gone and of ones too old, and an admission holds (then lets go of) its own.
+#[cfg_attr(target_os = "macos", ignore = "whether a reservation's process still runs is read from /proc")]
 #[test]
 fn other_runs_reservations_count_against_the_free_space() {
     let mut r = Reservations::default();
@@ -307,6 +308,7 @@ fn a_reading_is_of_the_nearest_existing_dir_and_names_its_mount() {
     assert_eq!(reading(Path::new("/")).unwrap().mount, PathBuf::from("/"));
 }
 
+#[cfg_attr(target_os = "macos", ignore = "APFS gives a directory no blocks, so `a` counts nothing")]
 #[test]
 fn a_walk_counts_blocks_hard_links_once_and_stops_at_its_cap() {
     let d = TmpDir::new("walk");

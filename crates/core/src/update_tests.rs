@@ -245,6 +245,30 @@ async fn an_update_installs_both_binaries_and_keeps_the_old_ones() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A release has every platform's binaries, named after the Rust target they were built for
+/// (release.yml's matrix; a build updates as its own `ARENA_TARGET`, cli's build.rs): each
+/// platform fetches and installs its own two. A Mac takes `arena-aarch64-apple-darwin` (or
+/// `x86_64-apple-darwin`) and never a Linux build, nor the other way round.
+#[tokio::test]
+async fn each_platform_fetches_its_own_binaries_from_a_release_of_all() {
+    const TARGETS: [&str; 4] = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin"];
+    let arena = |t: &str| format!("{}# {t}\n", fake_arena("2.0.261101.0900"));
+    let tui = |t: &str| format!("tui for {t}");
+    let sums: String = TARGETS.iter().map(|t| format!("{}  arena-tui-{t}\n{}  arena-{t}\n", sha256_hex(tui(t).as_bytes()), sha256_hex(arena(t).as_bytes()))).collect();
+    let mut names: Vec<String> = TARGETS.iter().flat_map(|t| [format!("arena-{t}"), format!("arena-tui-{t}")]).collect();
+    names.extend(["CHANGELOG.md", "SHA256SUMS", "config.env.example"].map(String::from));
+    for t in TARGETS {
+        let dir = temp_dir(&format!("platform-{t}"));
+        let (tui, arena) = (tui(t), arena(t));
+        let srv = serve(vec![canned(200, "text/plain", &sums), canned(200, "application/octet-stream", &tui), canned(200, "application/octet-stream", &arena)]);
+        let release = parse_release(&release_json(&srv.base, &names.iter().map(String::as_str).collect::<Vec<_>>())).unwrap();
+        fetch(&test_client(), &release, t, &dir, &pinned(&[&tui, &arena])).await.unwrap().install().unwrap();
+        assert_eq!(*srv.requests.lock().unwrap(), ["GET /dl/SHA256SUMS HTTP/1.1".to_string(), format!("GET /dl/arena-tui-{t} HTTP/1.1"), format!("GET /dl/arena-{t} HTTP/1.1")]);
+        assert_eq!((std::fs::read_to_string(dir.join("arena")).unwrap(), std::fs::read_to_string(dir.join("arena-tui")).unwrap()), (arena, tui));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
 /// Any doubt stops before the swap and leaves nothing behind: a checksum mismatch, a new
 /// `arena` of another version (refused before it runs: it would leave `ran` behind), one that
 /// carries the version but doesn't say it when run (another platform's, a cut-short one), no

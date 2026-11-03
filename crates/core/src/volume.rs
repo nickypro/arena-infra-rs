@@ -1698,7 +1698,8 @@ mod tests {
     /// checkout is a real git repo, a fake `/workspace`, a stub `mountpoint` on PATH that says
     /// whether that dir is mounted, and a container mark made after the image's files. Stubs
     /// for `df`, `cp`, `mv` and `ln` play the failures. Each case is a state a real pod can be in.
-    #[cfg(unix)]
+    /// Linux only: the script finds the repo's users through `/proc`.
+    #[cfg(target_os = "linux")]
     mod sim {
         use super::super::{probe_script, relocation_script, RelocationSite, WARNING_PREFIX};
         use std::path::{Path, PathBuf};

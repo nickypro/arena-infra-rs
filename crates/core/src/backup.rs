@@ -2909,6 +2909,7 @@ done
     /// the scan's grep; here one that leaves the text as it was): the key is committed, never
     /// pushed.
     #[cfg(unix)]
+    #[cfg_attr(target_os = "macos", ignore = "it wraps /usr/bin/sed, BSD's on macOS")]
     #[test]
     fn a_key_left_after_the_redaction_is_never_pushed() {
         let s = GitSandbox::new("key-left", 1_000_000);

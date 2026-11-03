@@ -49,7 +49,7 @@ pub fn park_stdin() {
 #[cfg(not(unix))]
 pub fn park_stdin() {}
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
@@ -57,7 +57,6 @@ mod tests {
     /// closed has: a pty pair, its master closed (what an SSH session dropping, or tmux's server
     /// killed, does to the dashboard's terminal). Both ends close-on-exec from the start: a
     /// process another test forks and execs meanwhile mustn't keep the master open.
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_terminal_whose_other_end_closed_has_hung_up() {
         let os = || std::io::Error::last_os_error();
