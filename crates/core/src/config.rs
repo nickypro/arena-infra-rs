@@ -70,6 +70,7 @@ impl Config {
         // Broadcast tokens (distributed by `copy-keys`/`setup`): supplying them via the
         // environment avoids editing the shared, read-only prod config for a run.
         "HF_TOKEN",
+        "WANDB_API_KEY",
         "CLAUDE_CODE_OAUTH_TOKEN",
         // The Claude Code accounts' tokens file (`arena_core::claude`): a path, not a secret — so a
         // test pool (or a different file for one run) needs no edit to the shared config.

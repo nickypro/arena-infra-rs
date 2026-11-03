@@ -82,11 +82,15 @@ pub(crate) fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     // Its AI keys as its last deep check found them (`ok, $4.97 of $5.00 left`, or the FAIL and
     // what to run): shown when that check judged them.
     let key_check = shared.snap.pods.get(ui.selected).and_then(|sp| sp.health.as_ref()).and_then(|h| state::key_check_line(&h.keys));
+    // What the participant uses beside it (proxy port, backups, branch, Claude, kernel, uv), as
+    // that check found it: each FAIL and WARN with what to run.
+    let course_check = shared.snap.pods.get(ui.selected).and_then(|sp| sp.health.as_ref()).and_then(|h| state::course_check_line(&h.course));
     let fact_lines = FACT_LINES
         + u16::from(ai.is_some())
         + u16::from(caps.is_some())
         + u16::from(owner.is_some())
-        + u16::from(key_check.is_some());
+        + u16::from(key_check.is_some())
+        + u16::from(course_check.is_some());
     let show_graphs = inner.height >= fact_lines + 3 + procs_h + commits_h + 6;
 
     let mut constraints: Vec<Constraint> = vec![
@@ -263,6 +267,9 @@ pub(crate) fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     }
     if let Some((text, tone)) = key_check {
         facts.push(fact("ai check:", one(fit(text), tone_style(tone))));
+    }
+    if let Some((text, tone)) = course_check {
+        facts.push(fact("course:", one(fit(text), tone_style(tone))));
     }
     facts.extend([
         fact("maint:", or_dim(maint, tone_style(Tone::Warn).add_modifier(Modifier::BOLD))),

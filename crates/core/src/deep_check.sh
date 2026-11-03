@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # `arena pods test --deep`: gather one pod's health facts and print them as `key=value`.
-# `… keys` (its first argument; `pods test --keys`): only the AI keys' facts, in a few seconds.
+# Its first argument is the mode: `deep` (everything), `keys` (`pods test --keys`: only the keys'
+# facts, in a few seconds) or `course` (`pods test --course`: what a participant uses beside the
+# machine, no GPU work). Then, for the course facts (`deep` and `course` only; without them none
+# are gathered): the course repo's path, the course env's candidates (`:`-separated, most likely
+# first), the deploy key's path (`GIT_SSH_KEY_REMOTE`, may be empty), `1` to make the one Claude
+# call that uses the machine's account (`pods test --claude-call`; else `0`), and the cohort repo
+# (`owner/name`, may be empty) the dry-run push goes to.
 #
 # Contract with the parser (arena_core::health::parse_deep):
 #   * stdout carries ONLY `key=value` lines: one fact per line, single-line values. The
@@ -11,10 +17,14 @@
 #   * every sub-step is bounded with `timeout` and the network probe runs alongside the
 #     GPU checks, so a run ends in under ~2 minutes even on a sick host (worst case ≈
 #     10+10+10 nvidia-smi, 5 driver file, 75 python, 5+5 df; the caller's budget is
-#     DEEP_CHECK_TIMEOUT). The AI keys' calls run alongside too (15s each).
-#   * no secret is ever printed: an AI key or token is reported by its fingerprint only.
-# Read-only apart from its own temp dir (removed on exit). Needs no TTY, reads no stdin.
-# The caller runs it inside the participants' login env (conda env active), so `python`
+#     DEEP_CHECK_TIMEOUT). The keys' calls run alongside too (15s each), and so do all of the
+#     course's probes, from the start: the repo's metadata and the dry-run push (25s + 20s),
+#     Claude Code (10s + 25s), the notebook kernel (50s), uv (5s).
+#   * no secret is ever printed: a key or token is reported by its fingerprint only.
+# Read-only apart from its own temp dir (removed on exit): the course repo's git metadata is read
+# (never its files, never its index written), the push is a dry run, the kernel runs with its
+# runtime and IPython dirs in the temp dir and is stopped before the end. Needs no TTY, reads no
+# stdin. The caller runs it inside the participants' login env (conda env active), so `python`
 # is the interpreter participants actually use, and the keys are those their shell exports.
 # No tracing, whatever the login environment says (an exported SHELLOPTS=xtrace, a `set -x`
 # left on an image): a trace would print the keys this script expands.
@@ -22,14 +32,22 @@ set +xv
 set -u
 export LC_ALL=C
 mode=${1:-deep}
+course=0
+if [ "$#" -ge 3 ] && { [ "$mode" = deep ] || [ "$mode" = course ]; }; then course=1; fi
+course_repo=${2:-}
+course_envs=${3:-}
+course_key=${4:-}
+claude_call=${5:-0}
+course_origin=${6:-}
 
-echo "deep_check=2"
+echo "deep_check=3"
 
-# One fact per line: newlines/tabs flattened, clipped to 300 chars — and either secret the
-# keys section handles scrubbed out of it, whatever printed it (a belt to the braces there).
+# One fact per line: newlines/tabs flattened, clipped to 300 chars — and every secret the
+# shell exports that this script handles scrubbed out of it, whatever printed it (a belt to the
+# braces there).
 kv() {
   local v=$2 s
-  for s in "${OPENROUTER_API_KEY:-}" "${HF_TOKEN:-}"; do
+  for s in "${OPENROUTER_API_KEY:-}" "${HF_TOKEN:-}" "${WANDB_API_KEY:-}" "${ANTHROPIC_API_KEY:-}" "${ANTHROPIC_AUTH_TOKEN:-}" "${CLAUDE_CODE_OAUTH_TOKEN:-}"; do
     [ "${#s}" -lt 8 ] || v=${v//"$s"/[secret]}
   done
   v=$(printf '%s' "$v" | tr '\r\n\t' '   ' | cut -c1-300)
@@ -56,41 +74,65 @@ if [ -z "$work" ]; then
   echo "deep_check_end=1"
   exit 0
 fi
-trap 'rm -rf "$work"' EXIT
-
-# ---- AI keys: does the participant's OpenRouter key work, and their Hugging Face token? ----
-# `$OPENROUTER_API_KEY` and `$HF_TOKEN` as the login shell exports them, each asked of its
-# service once, in the background: OpenRouter's `GET /api/v1/key` (free, spends nothing: the
-# key's cap, what's left of it, whether it's disabled; a bad key gets 401) and Hugging Face's
-# `whoami-v2`. The secret never leaves this script: curl reads its header on stdin (`-K -`), so
-# it is on no command line (`ps` shows those), and only its fingerprint is printed — the first
-# 12 hex of its SHA-256, which the control box compares with its keys CSV — never the key, nor
-# OpenRouter's redacted label of it. ARENA_TEST_OPENROUTER_URL / ARENA_TEST_HF_URL: tests only
-# (a local stub server).
-OR_KEY_URL=${ARENA_TEST_OPENROUTER_URL:-https://openrouter.ai/api/v1/key}
-HF_WHOAMI_URL=${ARENA_TEST_HF_URL:-https://huggingface.co/api/whoami-v2}
-or_key=${OPENROUTER_API_KEY:-}
-hf_key=${HF_TOKEN:-}
-
-# `key_probe <tag> <secret> <url>`: one bounded GET with the secret as its Bearer token, the
-# header handed to curl on stdin (`printf` is a builtin: no process carries it either). `-q`
-# first: no ~/.curlrc, whose `trace-ascii` or `verbose` would log the header. Leaves
-# $work/<tag>.code (the HTTP status), .body, .err and .rc.
-key_probe() {
-  local s=${2//\\/\\\\}
-  s=${s//\"/\\\"}
-  printf 'header = "Authorization: Bearer %s"\n' "$s" |
-    bounded 15 curl -q -sS --connect-timeout 5 --max-time 10 -K - -o "$work/$1.body" -w '%{http_code}' "$3" \
-      >"$work/$1.code" 2>"$work/$1.err"
-  echo "$?" >"$work/$1.rc"
+# The notebook kernel the course probe starts (its own session: `kernel_stop`) goes with the temp
+# dir, however the run ends — a timeout's TERM included.
+trap 'kernel_stop; rm -rf "$work"' EXIT
+trap 'exit 1' HUP INT TERM
+kernel_stop() {
+  local p
+  p=$(cat "$work/kernel.pid" 2>/dev/null)
+  case $p in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  kill -9 -- "-$p" 2>/dev/null
+  kill -9 "$p" 2>/dev/null
+  rm -f "$work/kernel.pid"
+  return 0
 }
 
-# A service's or curl's message, safe to print: both secrets out, then anything shaped like a
+# ---- keys: do the participant's OpenRouter key, Hugging Face token and W&B key work? ----
+# `$OPENROUTER_API_KEY`, `$HF_TOKEN` and `$WANDB_API_KEY` as the login shell exports them, each
+# asked of its service once, in the background: OpenRouter's `GET /api/v1/key` (free, spends
+# nothing: the key's cap, what's left of it, whether it's disabled; a bad key gets 401), Hugging
+# Face's `whoami-v2`, and W&B's GraphQL `viewer` (free; a bad key gets 200 with no viewer). The
+# secret never leaves this script: curl reads it on stdin (`-K -`), so it is on no command line
+# (`ps` shows those), and only its fingerprint is printed — the first 12 hex of its SHA-256,
+# which the control box compares with its keys CSV and config — never the key, nor OpenRouter's
+# redacted label of it. ARENA_TEST_OPENROUTER_URL / ARENA_TEST_HF_URL / ARENA_TEST_WANDB_URL:
+# tests only (a local stub server).
+OR_KEY_URL=${ARENA_TEST_OPENROUTER_URL:-https://openrouter.ai/api/v1/key}
+HF_WHOAMI_URL=${ARENA_TEST_HF_URL:-https://huggingface.co/api/whoami-v2}
+WANDB_URL=${ARENA_TEST_WANDB_URL:-${WANDB_BASE_URL:-https://api.wandb.ai}/graphql}
+or_key=${OPENROUTER_API_KEY:-}
+hf_key=${HF_TOKEN:-}
+wb_key=${WANDB_API_KEY:-}
+
+# `secret_probe <tag> <name> <secret> <url> [curl args…]`: one bounded call carrying the secret
+# as curl's config option `name` (`header` for a Bearer token, `user` for basic auth), the
+# option handed to curl on stdin (`printf` is a builtin: no process carries it either). `-q`
+# first: no ~/.curlrc, whose `trace-ascii` or `verbose` would log it. Leaves $work/<tag>.code (the
+# HTTP status), .body, .err and .rc.
+secret_probe() {
+  local tag=$1 name=$2 s=${3//\\/\\\\} url=$4
+  shift 4
+  s=${s//\"/\\\"}
+  printf '%s = "%s"\n' "$name" "$s" |
+    bounded 15 curl -q -sS --connect-timeout 5 --max-time 10 -K - -o "$work/$tag.body" -w '%{http_code}' "$@" "$url" \
+      >"$work/$tag.code" 2>"$work/$tag.err"
+  echo "$?" >"$work/$tag.rc"
+}
+
+# `key_probe <tag> <secret> <url>`: a GET with the secret as its Bearer token.
+key_probe() {
+  secret_probe "$1" header "Authorization: Bearer $2" "$3"
+}
+
+# A service's or curl's message, safe to print: the secrets out, then anything shaped like a
 # key, a redacted label of one or a bearer token (`sk-…`, `hf_…`, `Bearer …`) — before it is
 # clipped, so no part of a secret survives the cut — then clipped to 160 characters.
 scrub() {
   local v=$1 s
-  for s in "$or_key" "$hf_key"; do
+  for s in "$or_key" "$hf_key" "$wb_key" "${ANTHROPIC_API_KEY:-}" "${ANTHROPIC_AUTH_TOKEN:-}" "${CLAUDE_CODE_OAUTH_TOKEN:-}"; do
     [ "${#s}" -lt 8 ] || v=${v//"$s"/[secret]}
   done
   printf '%s' "$v" | tr '\r\n\t' '   ' |
@@ -132,6 +174,11 @@ keys_start() {
   fi
   if [ -n "$hf_key" ] && have curl; then
     (key_probe hf "$hf_key" "$HF_WHOAMI_URL") </dev/null &
+    keys_pids="$keys_pids $!"
+  fi
+  if [ -n "$wb_key" ] && have curl; then
+    (secret_probe wandb user "api:$wb_key" "$WANDB_URL" -H 'Content-Type: application/json' \
+      --data '{"query":"query { viewer { id } }"}') </dev/null &
     keys_pids="$keys_pids $!"
   fi
 }
@@ -180,11 +227,306 @@ keys_report() {
     done
   fi
   key_facts hf "$hf_key"
+  # W&B answers a key it doesn't know with 200 and `"viewer": null`.
+  if key_facts wandb "$wb_key"; then
+    v=$(json_value viewer "$work/wandb.body")
+    if [ "$v" = none ]; then
+      kv wandb.viewer no
+    elif [ -n "$(json_value id "$work/wandb.body")" ]; then
+      kv wandb.viewer yes
+    else
+      # Neither: a GraphQL error (HTTP 200 too), an empty answer — not a verdict on the key.
+      kv wandb.viewer unknown
+      v=$(json_value message "$work/wandb.body")
+      kv wandb.error "$(scrub "${v:-no viewer in the answer}")"
+    fi
+  fi
+}
+
+# ---- the course: what a participant uses beside the machine (`deep` and `course` modes) ----
+# The machine's identity (what `pods test` compares with what the proxy port reaches), the
+# course repo's git metadata, a dry-run push with the deploy key, Claude Code, the notebook
+# kernel of the course env, and uv. The repo is read through git's metadata only — refs, config,
+# the operation markers, never a file of the work — with no optional locks, so the participant's
+# own git never meets a lock of ours. `ARENA_TEST_ANTHROPIC_URL`: tests only.
+# @ARENA_IDENTITY_SH@
+# @ARENA_ORIGIN_SH@
+# @ARENA_BUSY_OP_SH@
+export GIT_OPTIONAL_LOCKS=0
+ANTHROPIC_URL=${ARENA_TEST_ANTHROPIC_URL:-https://api.anthropic.com}
+course_pids=""
+
+# `in_repo git …`: a git command in the course repo, bounded (fsmonitor hooks off: none runs).
+in_repo() {
+  (cd "$course_repo" 2>/dev/null && bounded 5 git -c core.fsmonitor=false "$@")
+}
+
+# Git's repo-local environment (GIT_DIR, GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY, …: what `git
+# rev-parse --local-env-vars` lists, and the namespace) unset: a login shell exporting one would
+# point our reads at another repo, and the probe's writes into it.
+git_env_clean() {
+  local v
+  # Tracing first (it writes wherever it points, from the first git call on): every GIT_TRACE*
+  # unset, and trace2's targets off over whatever the global or system config says.
+  for v in $(env | sed -n 's/^\(GIT_TRACE[A-Za-z0-9_]*\)=.*/\1/p'); do
+    unset "$v"
+  done
+  export GIT_TRACE2=0 GIT_TRACE2_EVENT=0 GIT_TRACE2_PERF=0
+  for v in $(git rev-parse --local-env-vars 2>/dev/null) GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_NAMESPACE; do
+    unset "$v"
+  done
+}
+
+# The repo's metadata, then the dry-run push, in one background job (git can be slow on a big
+# checkout or a network-mounted one): `repo.*` lines into $work/repo.facts, and the push's files.
+# Run in a subshell of its own (`(repo_job) &`): what it unsets stays there.
+repo_job() {
+  local gd branch op urls u keys=""
+  git_env_clean
+  {
+    printf 'repo.path=%s\n' "$course_repo"
+    if [ ! -e "$course_repo" ]; then
+      echo "repo.state=missing"
+      return 0
+    fi
+    if ! have git; then
+      echo "repo.state=error: no git on PATH"
+      return 0
+    fi
+    if ! gd=$(in_repo rev-parse --absolute-git-dir 2>"$work/git.err"); then
+      printf 'repo.state=error: %s\n' "$(first_line "$(cat "$work/git.err" 2>/dev/null)")"
+      return 0
+    fi
+    echo "repo.state=ok"
+    branch=$(in_repo symbolic-ref -q --short HEAD 2>/dev/null)
+    if [ -n "$branch" ]; then
+      printf 'repo.branch=%s\n' "$branch"
+    else
+      printf 'repo.detached=%s\n' "$(in_repo rev-parse --short HEAD 2>/dev/null)"
+    fi
+    op=$(cd "$course_repo" 2>/dev/null && busy_op "$gd" 2>/dev/null | head -n 1)
+    printf 'repo.op=%s\n' "${op:-none}"
+    urls=$({ in_repo remote get-url --all origin; in_repo remote get-url --push --all origin; } 2>/dev/null)
+    u=$(first_line "$urls")
+    printf 'repo.origin=%s\n' "$(origin_shown "${u:-}")"
+    while IFS= read -r u; do
+      [ -z "$u" ] || keys="$keys $(origin_key "$u")"
+    done <<URLS
+$urls
+URLS
+    printf 'repo.origin_keys=%s\n' "$(trim "$keys")"
+    : >"$work/repo.ok"
+  } >"$work/repo.facts"
+  push_probe
+}
+
+# A dry run of a push to the cohort repo's SSH URL with the deploy key: GitHub answers a push for
+# the key (a read-only key, or one not on the repo, is refused) and nothing is sent. It runs from an
+# empty repo of its own in the temp dir, with git's global and system config off — never in the
+# participant's repo, never with their config, whose `insteadOf` could turn the URL into one that
+# carries a credential (to a command line, or a helper); ssh with none of the machine's config
+# either. No hook runs, and a host key ssh hasn't seen goes into the temp dir's known-hosts file,
+# never the machine's.
+push_probe() {
+  local key=$course_key s p=$work/push-probe
+  [ -e "$work/repo.ok" ] || return 0
+  if [ -z "$course_origin" ]; then
+    echo none >"$work/push.key"
+    return 0
+  fi
+  case $key in "~/"*) key=$HOME/${key#"~/"} ;; esac
+  if [ -n "$key" ] && [ ! -r "$key" ]; then
+    echo missing >"$work/push.key"
+    return 0
+  fi
+  # ssh with no config of the machine's (`-F /dev/null`: root's and the system's could multiplex
+  # into a socket that outlives the probe, or run a local command), and nothing kept: no control
+  # master, no local command.
+  s="ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+  s="$s -o ControlMaster=no -o ControlPath=none -o PermitLocalCommand=no -o ForwardAgent=no"
+  s="$s -o 'UserKnownHostsFile=$work/known_hosts $HOME/.ssh/known_hosts'"
+  [ -z "$key" ] || s="$s -i '$key' -o IdentitiesOnly=yes"
+  (
+    # HOME too, for a git older than GIT_CONFIG_GLOBAL (2.32); ssh finds ~/.ssh by the passwd entry.
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND=$s HOME=$work XDG_CONFIG_HOME=$work
+    git_env_clean
+    unset GIT_ASKPASS SSH_ASKPASS
+    git -c init.defaultBranch=probe init -q "$p" &&
+      git -C "$p" -c core.hooksPath=/dev/null -c user.name=arena -c user.email=arena@check commit -q --no-verify --allow-empty -m probe &&
+      bounded 20 git -C "$p" -c core.hooksPath=/dev/null -c credential.helper= push --dry-run --no-verify --porcelain \
+        "git@github.com:$course_origin.git" "HEAD:refs/heads/arena-push-check" >"$work/push.out" 2>"$work/push.err"
+    echo "$?" >"$work/push.rc"
+  )
+}
+
+push_report() {
+  local rc msg
+  [ -e "$work/repo.ok" ] || return 0
+  case $(cat "$work/push.key" 2>/dev/null) in
+    missing)
+      kv push.key missing
+      return 0
+      ;;
+    none)
+      kv push.key none
+      return 0
+      ;;
+  esac
+  kv push.key "$([ -n "$course_key" ] && echo set || echo default)"
+  rc=$(cat "$work/push.rc" 2>/dev/null)
+  kv push.exit "${rc:-unknown}"
+  if [ "${rc:-1}" != 0 ]; then
+    # GitHub's own words first (`ERROR: …`, `… denied …`), else ssh's or git's first line.
+    msg=$(grep -m 1 -iE 'error|denied|not found|read only|could not|timed out|refused' "$work/push.err" 2>/dev/null)
+    [ -n "$msg" ] || msg=$(first_line "$(cat "$work/push.err" 2>/dev/null)")
+    kv push.error "$(scrub "${msg:-git push exit ${rc:-unknown}}")"
+  fi
+}
+
+# Claude Code as root's login shell finds it: `claude --version`, and which auth it would use
+# (the python below, isolated: `-I`, the standard library alone; kinds and fingerprints only),
+# asked of its service where that is free.
+claude_start() {
+  local py
+  py=$(command -v python3 2>/dev/null || command -v python 2>/dev/null)
+  (
+    if have claude; then
+      bounded 10 claude --version >"$work/claude.ver" 2>"$work/claude.err"
+      echo "$?" >"$work/claude.rc"
+    fi
+    if [ -n "$py" ]; then
+      cat >"$work/claude_auth.py" <<'CLAUDEPY'
+@ARENA_CLAUDE_PY@
+CLAUDEPY
+      ARENA_ANTHROPIC_URL=$ANTHROPIC_URL ARENA_OPENROUTER_URL=$OR_KEY_URL \
+        bounded 25 "$py" -I "$work/claude_auth.py" "$claude_call" >"$work/claude.auth" 2>"$work/claude.pyerr"
+    else
+      echo "claude.auth=unknown" >"$work/claude.auth"
+      echo "claude.auth_error=no python3 to read Claude Code's settings" >>"$work/claude.auth"
+    fi
+  ) </dev/null &
+  course_pids="$course_pids $!"
+}
+
+# Only the python's own `claude.*` facts, through `kv` (one line each, clipped, scrubbed).
+pass_facts() {
+  local line
+  while IFS= read -r line; do
+    case $line in
+      "$2".*=*) kv "${line%%=*}" "${line#*=}" ;;
+    esac
+  done <"$1"
+}
+
+claude_report() {
+  local rc
+  if ! have claude; then
+    kv claude.path missing
+  else
+    kv claude.path "$(command -v claude)"
+    rc=$(cat "$work/claude.rc" 2>/dev/null)
+    if [ "${rc:-1}" = 0 ]; then
+      kv claude.version "$(first_line "$(cat "$work/claude.ver" 2>/dev/null)")"
+    elif [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+      kv claude.version_error "timed out after 10s"
+    else
+      kv claude.version_error "$(scrub "$(first_line "$(cat "$work/claude.err" "$work/claude.ver" 2>/dev/null)")") (exit ${rc:-unknown})"
+    fi
+  fi
+  [ ! -f "$work/claude.auth" ] || pass_facts "$work/claude.auth" claude
+}
+
+# The notebook kernel of the course env: the first candidate with a `bin/python`, its Jupyter's
+# kernels for that python, and one of them started, `import torch` run in it, and stopped (the
+# python below). Its runtime files and IPython's go into the temp dir; its process group is
+# killed at the end whatever happened (`kernel_stop`).
+kernel_env=""
+kernel_start() {
+  local c rest=$course_envs
+  while [ -n "$rest" ]; do
+    c=${rest%%:*}
+    if [ "$c" = "$rest" ]; then rest=""; else rest=${rest#*:}; fi
+    case $c in "~/"*) c=$HOME/${c#"~/"} ;; esac
+    if [ -n "$c" ] && [ -x "$c/bin/python" ]; then
+      kernel_env=$c
+      break
+    fi
+  done
+  [ -n "$kernel_env" ] || return 0
+  mkdir -p "$work/jupyter-runtime" "$work/ipython"
+  cat >"$work/kernel.py" <<'KERNELPY'
+@ARENA_KERNEL_PY@
+KERNELPY
+  (
+    JUPYTER_RUNTIME_DIR=$work/jupyter-runtime IPYTHONDIR=$work/ipython PYTHONDONTWRITEBYTECODE=1 \
+      bounded 50 "$kernel_env/bin/python" "$work/kernel.py" "$kernel_env/bin/python" "$work/kernel.pid" \
+      >"$work/kernel.out" 2>"$work/kernel.err"
+    echo "$?" >"$work/kernel.rc"
+  ) </dev/null &
+  course_pids="$course_pids $!"
+}
+
+kernel_report() {
+  local rc
+  kernel_stop
+  if [ -z "$kernel_env" ]; then
+    kv kernel.env none
+    return 0
+  fi
+  kv kernel.env "$kernel_env"
+  pass_facts "$work/kernel.out" kernel
+  rc=$(cat "$work/kernel.rc" 2>/dev/null)
+  case $rc in
+    0) ;;
+    124 | 137) kv kernel.error "the kernel check timed out after 50s" ;;
+    *) kv kernel.error "$(scrub "$(tail -n 1 "$work/kernel.err" 2>/dev/null)") (exit ${rc:-unknown})" ;;
+  esac
+}
+
+# Every course probe starts here, in the background, alongside the machine's checks.
+course_start() {
+  [ "$course" = 1 ] || return 0
+  (repo_job) </dev/null &
+  course_pids="$course_pids $!"
+  claude_start
+  kernel_start
+  (
+    u=$(command -v uv 2>/dev/null)
+    printf 'uv.path=%s\n' "${u:-missing}"
+    [ -z "$u" ] || printf 'uv.version=%s\n' "$(first_line "$(bounded 5 uv --version 2>/dev/null)")"
+  ) </dev/null >"$work/uv.facts" &
+  course_pids="$course_pids $!"
+}
+
+course_report() {
+  local p
+  [ "$course" = 1 ] || return 0
+  arena_identity
+  for p in $course_pids; do
+    wait "$p" 2>/dev/null
+  done
+  if [ -s "$work/repo.facts" ]; then
+    pass_facts "$work/repo.facts" repo
+  else
+    kv repo.path "$course_repo"
+    kv repo.state "error: the repo check didn't finish"
+  fi
+  push_report
+  claude_report
+  kernel_report
+  [ ! -s "$work/uv.facts" ] || pass_facts "$work/uv.facts" uv
 }
 
 if [ "$mode" = keys ]; then
   keys_start
   keys_report
+  echo "deep_check_end=1"
+  exit 0
+fi
+if [ "$mode" = course ]; then
+  course_start
+  course_report
   echo "deep_check_end=1"
   exit 0
 fi
@@ -204,6 +546,7 @@ if have curl; then
   net_pid=$!
 fi
 keys_start
+course_start
 
 # ---- host: load is the *host's* (containers share the kernel), so is uptime ----
 if read -r l1 l5 l15 _rest 2>/dev/null </proc/loadavg; then
@@ -588,7 +931,10 @@ else
   kv net.curl_exit missing
 fi
 
-# ---- AI keys' results (their calls have been running alongside; 15s each at most) ----
+# ---- the keys' results (their calls have been running alongside; 15s each at most) ----
 keys_report
+
+# ---- the course's (its probes too: the push 20s, Claude 25s, the kernel 50s at most) ----
+course_report
 
 echo "deep_check_end=1"

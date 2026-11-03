@@ -9,6 +9,7 @@ use crate::health::{
 const GOOD: &str = "sk-or-v1-0123456789abcdef-good";
 const OLD: &str = "sk-or-v1-0123456789abcdef-old";
 const HF_GOOD: &str = "hf_0123456789abcdefGOOD";
+const WB_GOOD: &str = "0123456789abcdef0123456789abcdef01234567";
 
 fn facts(lines: &str) -> DeepFacts {
     parse_deep(&format!("deep_check=2\n{lines}deep_check_end=1\n"))
@@ -39,6 +40,15 @@ fn ai(f: &DeepFacts, name: &str, book: &KeyBook) -> Check {
 
 fn hf(f: &DeepFacts, name: &str, book: &KeyBook) -> Check {
     key_checks(f, &pod(name), book).remove(1)
+}
+
+fn wb(f: &DeepFacts, name: &str, book: &KeyBook) -> Check {
+    key_checks(f, &pod(name), book).remove(2)
+}
+
+/// `wandb.*` lines for `secret`, answered `http` naming a user or not (`viewer`).
+fn wb_lines(secret: &str, http: u16, viewer: &str) -> String {
+    format!("wandb.key=set\nwandb.fingerprint={}\nwandb.curl_exit=0\nwandb.http={http}\nwandb.viewer={viewer}\n", fingerprint(secret))
 }
 
 #[test]
@@ -419,6 +429,80 @@ fn hf_token_verdicts() {
     assert_eq!(cell("hf.key=set\nhf.curl_exit=0\nhf.http=200\n").as_deref(), Some("?"));
 }
 
+/// The W&B key follows the HF token's rules: the config's `WANDB_API_KEY` (or the machine's own
+/// row in `wandb_api_keys.csv`), fingerprints only — and W&B answers a key it doesn't know with
+/// 200 and no user, which is a rejection.
+#[test]
+fn wandb_verdicts() {
+    use Status::*;
+    let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=( apple bloom @bob )\nWANDB_API_KEY={WB_GOOD}\n"));
+    let b = KeyBook::new(&cfg, &[], None, &[]);
+    let cases: Vec<(&str, String, &str, Status, &str)> = vec![
+        ("accepted", wb_lines(WB_GOOD, 200, "yes"), "devtest-apple", Pass, "accepted by W&B"),
+        (
+            "rejected: no user for it",
+            wb_lines(WB_GOOD, 200, "no"),
+            "devtest-apple",
+            Fail,
+            "rejected (W&B names no user for it) — a new WANDB_API_KEY in the config, then `arena pods copy-keys`",
+        ),
+        (
+            "an old key, rejected",
+            wb_lines("old-wandb-key", 200, "no"),
+            "devtest-apple",
+            Fail,
+            "rejected (W&B names no user for it): not the config's WANDB_API_KEY — `arena pods copy-keys apple`",
+        ),
+        ("an old key that works", wb_lines("old-wandb-key", 200, "yes"), "devtest-apple", Warn, "works, but not the config's WANDB_API_KEY — `arena pods copy-keys apple`"),
+        ("missing", "wandb.key=missing\n".into(), "devtest-apple", Fail, "missing — `arena pods copy-keys apple`"),
+        // A GraphQL error (HTTP 200 too), an empty answer: no user, so nothing said of the key.
+        (
+            "200 with no user",
+            wb_lines(WB_GOOD, 200, "unknown") + "wandb.error=permission denied\n",
+            "devtest-apple",
+            Warn,
+            "not checked (no user in W&B's answer: permission denied) — `arena pods test --keys apple`",
+        ),
+        (
+            "200 from an older script, no viewer said",
+            format!("wandb.key=set\nwandb.fingerprint={}\nwandb.curl_exit=0\nwandb.http=200\n", fingerprint(WB_GOOD)),
+            "devtest-apple",
+            Warn,
+            "not checked (no user in W&B's answer: ?) — `arena pods test --keys apple`",
+        ),
+        (
+            "unreachable",
+            "wandb.key=set\nwandb.curl_exit=6\nwandb.http=000\nwandb.error=curl: (6) Could not resolve host: api.wandb.ai\n".into(),
+            "devtest-apple",
+            Warn,
+            "not checked (unreachable: curl: (6) Could not resolve hos…) — `arena pods test --keys apple`",
+        ),
+        ("a staff box", "wandb.key=missing\n".into(), "bob", Skip, "staff box: its token is the organisers' choice (none here)"),
+    ];
+    for (what, lines, name, status, detail) in cases {
+        let c = wb(&facts(&lines), name, &b);
+        assert_eq!((c.name.as_str(), c.status, c.detail.as_str()), (WANDB_CHECK, status, detail), "{what}");
+    }
+    // No W&B key configured: a note whatever the machine has, never a verdict.
+    let none = KeyBook::new(&Config::parse("MACHINE_NAME_PREFIX=devtest\n"), &[], None, &[]);
+    let c = wb(&facts(&wb_lines(WB_GOOD, 200, "yes")), "devtest-apple", &none);
+    assert_eq!((c.status, c.detail.as_str()), (Skip, "no WANDB_API_KEY configured for this fleet (one here, accepted)"));
+    assert!(!none.any());
+    // A machine's own row wins.
+    let own = KeyBook::new(&cfg, &[], None, &[]).with_wandb_rows(&[("devtest-apple".into(), "own-wandb-key".into())]);
+    assert_eq!(wb(&facts(&wb_lines("own-wandb-key", 200, "yes")), "devtest-apple", &own).status, Pass);
+    assert_eq!(
+        wb(&facts(&wb_lines(WB_GOOD, 200, "yes")), "devtest-apple", &own).detail,
+        "works, but not its wandb_api_keys.csv row's — `arena pods copy-keys apple`"
+    );
+    // The W&B column shows once a machine's key was judged.
+    let policy = HealthPolicy { keys: Some(b), ..HealthPolicy::default() };
+    let h = PodHealth::keys_checked(&pod("devtest-apple"), facts(&wb_lines(WB_GOOD, 200, "no")), &policy);
+    assert_eq!(wandb_cell(&h).as_deref(), Some("rejected"));
+    assert!(render_key_report(&[h], false).starts_with("NAME           RESULT  AI KEY  HF  W&B       NOTES\n"));
+    assert_eq!(failure_kind_of(WANDB_CHECK, None), FailureKind::Key);
+}
+
 /// The fleet's own files: the keys CSVs beside the config, its HF_TOKEN, the spend ledger's
 /// owners — fingerprints only.
 #[test]
@@ -496,12 +580,12 @@ fn a_keys_run_merges_into_the_machines_check() {
     machine.merge_keys(&keys);
     assert_eq!(machine.status, Status::Fail);
     assert_eq!(machine.machine_status(), before);
-    assert_eq!(machine.checks.iter().filter(|c| is_key_check(&c.name)).count(), 2);
+    assert_eq!(machine.checks.iter().filter(|c| is_key_check(&c.name)).count(), 3);
     assert_eq!(machine.facts.as_ref().unwrap().openrouter.as_ref().unwrap().http, Some(401));
     // Merged again (a second run): replaced, not doubled.
     let fixed = PodHealth::keys_checked(&apple, facts(&(or_lines(GOOD, 200, "") + &hf_lines(HF_GOOD, 200))), &policy);
     machine.merge_keys(&fixed);
-    assert_eq!(machine.checks.iter().filter(|c| is_key_check(&c.name)).count(), 2);
+    assert_eq!(machine.checks.iter().filter(|c| is_key_check(&c.name)).count(), 3);
     assert_eq!(machine.key_status(), Some(Status::Pass));
     // A keys run whose script never started: one `script` FAIL, nothing else.
     let none = PodHealth::keys_checked(&apple, parse_deep(""), &policy);
@@ -573,7 +657,7 @@ fn stub_server(answers: Vec<(&'static str, u16, String)>) -> StubServer {
             let token = head
                 .lines()
                 .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("authorization")).map(|(_, v)| v.trim().to_string()))
-                .and_then(|v| v.strip_prefix("Bearer ").map(str::to_string))
+                .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("Basic ")).map(str::to_string))
                 .unwrap_or_default();
             seen.lock().unwrap().push(head);
             let (status, body) = answers
@@ -617,8 +701,10 @@ fn run_keys(server: &StubServer, env: &[(&str, &str)], path_first: Option<&std::
         .env("NO_PROXY", "*")
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("HF_TOKEN")
+        .env_remove("WANDB_API_KEY")
         .env("ARENA_TEST_OPENROUTER_URL", format!("{}/api/v1/key", server.url))
-        .env("ARENA_TEST_HF_URL", format!("{}/api/whoami-v2", server.url));
+        .env("ARENA_TEST_HF_URL", format!("{}/api/whoami-v2", server.url))
+        .env("ARENA_TEST_WANDB_URL", format!("{}/graphql", server.url));
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -678,7 +764,10 @@ fn the_script_asks_each_service_and_never_prints_a_secret() {
     assert_eq!((k.http, k.error.as_deref()), (Some(401), Some("User not found.")), "{stdout}");
     assert_eq!(f.hf.as_ref().and_then(|h| h.set), Some(false));
     let h = PodHealth::keys_checked(&apple, f, &policy);
-    assert_eq!(h.checks.iter().map(|c| (c.name.as_str(), c.status)).collect::<Vec<_>>(), [(AI_KEY, Status::Fail), (HF_TOKEN_CHECK, Status::Fail)]);
+    assert_eq!(
+        h.checks.iter().map(|c| (c.name.as_str(), c.status)).collect::<Vec<_>>(),
+        [(AI_KEY, Status::Fail), (HF_TOKEN_CHECK, Status::Fail), (WANDB_CHECK, Status::Skip)]
+    );
 
     // Nothing exported: both missing, nothing asked.
     let before = server.requests.lock().unwrap().len();
@@ -785,7 +874,40 @@ fn the_secret_is_on_no_command_line() {
 fn the_keys_command_is_the_deep_script_in_its_keys_mode() {
     let cmd = crate::health::key_check_command(Some("arena-env"));
     assert!(cmd.contains("conda activate arena-env"), "{cmd}");
-    assert!(cmd.contains(&crate::base64::encode(crate::health::DEEP_CHECK_SCRIPT.as_bytes())));
+    assert!(cmd.contains(&crate::base64::encode(crate::health::deep_check_script().as_bytes())));
     assert!(crate::health::key_check_inner_command().ends_with("arena-deep-check keys </dev/null"));
     assert!(crate::health::deep_check_inner_command().ends_with("arena-deep-check </dev/null"));
+}
+
+/// W&B's check end to end: the key goes as basic auth from curl's stdin config (never on its
+/// command line, never printed), a user in the answer is accepted, `"viewer": null` rejected.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_script_asks_wandb_with_the_key_on_stdin() {
+    if !(have("bash") && have("curl") && have("sha256sum") && have("base64") && have("timeout")) {
+        eprintln!("bash/curl/sha256sum/base64/timeout missing — skipping");
+        return;
+    }
+    let basic = |k: &str| crate::base64::encode(format!("api:{k}").as_bytes());
+    let good: &'static str = Box::leak(basic(WB_GOOD).into_boxed_str());
+    let bad: &'static str = Box::leak(basic("not-a-wandb-key-0000000000000000000000").into_boxed_str());
+    let server = stub_server(vec![
+        (good, 200, r#"{"data":{"viewer":{"id":"VXNlcjoxMjM0"}}}"#.into()),
+        (bad, 200, r#"{"data":{"viewer":null}}"#.into()),
+    ]);
+    let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nWANDB_API_KEY={WB_GOOD}\n"));
+    let policy = HealthPolicy { keys: Some(KeyBook::new(&cfg, &[], None, &[])), ..HealthPolicy::default() };
+    let (stdout, stderr) = run_keys(&server, &[("WANDB_API_KEY", WB_GOOD)], None);
+    assert!(!stdout.contains(WB_GOOD) && !stderr.contains(WB_GOOD), "{stdout}\n{stderr}");
+    let f = parse_deep(&stdout);
+    assert_eq!(f.wandb.as_ref().map(|k| (k.http, k.viewer)), Some((Some(200), Some(true))), "{stdout}");
+    let h = PodHealth::keys_checked(&pod("devtest-apple"), f, &policy);
+    assert_eq!(h.checks.iter().find(|c| c.name == WANDB_CHECK).map(|c| c.status), Some(Status::Pass), "{:#?}", h.checks);
+    let requests = server.requests.lock().unwrap().clone();
+    assert!(requests.iter().any(|r| r.starts_with("POST /graphql ") && r.contains(&format!("Basic {good}"))), "{requests:#?}");
+    let (stdout, _) = run_keys(&server, &[("WANDB_API_KEY", "not-a-wandb-key-0000000000000000000000")], None);
+    let f = parse_deep(&stdout);
+    assert_eq!(f.wandb.as_ref().and_then(|k| k.viewer), Some(false), "{stdout}");
+    let h = PodHealth::keys_checked(&pod("devtest-apple"), f, &policy);
+    assert_eq!(h.checks.iter().find(|c| c.name == WANDB_CHECK).map(|c| c.status), Some(Status::Fail));
 }

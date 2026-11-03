@@ -277,7 +277,9 @@ impl KeySources {
             rows
         };
         let hf = self.broadcast.iter().find(|(e, _)| e == "HF_TOKEN").map(|(_, v)| v.as_str());
-        arena_core::health::KeyBook::new(cfg, &rows(checked::OPENROUTER_ENV), hf, &rows("HF_TOKEN")).with_owners(ledger)
+        arena_core::health::KeyBook::new(cfg, &rows(checked::OPENROUTER_ENV), hf, &rows("HF_TOKEN"))
+            .with_owners(ledger)
+            .with_wandb_rows(&rows("WANDB_API_KEY"))
     }
 
     /// The OpenRouter key the keys CSV holds for `host` (its exact name), if any.

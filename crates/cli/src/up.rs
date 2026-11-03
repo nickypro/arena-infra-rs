@@ -156,8 +156,6 @@ pub(crate) struct CheckStage {
     pub policy: HealthPolicy,
     /// `--check-attempts`: placements per name, the first create included.
     pub attempts: u32,
-    /// The deep-check command (the script inside the conda login wrap).
-    pub cmd: String,
 }
 
 /// Everything the pipelines run with — all decided (and confirmed) before the create.
@@ -1039,6 +1037,11 @@ impl Shared<'_, '_> {
                 Status::Fail if kind == Some(health::FailureKind::Key) => {
                     say(To::Err, &format!("[{name}] check: FAIL (AI key, not the machine: kept) — {notes}"));
                 }
+                // Only what a participant uses beside it failed (its proxy port, backups, branch,
+                // Claude Code): never the machine either. Said, and kept.
+                Status::Fail if kind == Some(health::FailureKind::Course) => {
+                    say(To::Err, &format!("[{name}] check: FAIL (course setup, not the machine: kept) — {notes}"));
+                }
                 Status::Fail => {
                     if let Some(ip) = &host {
                         self.failed_hosts.lock().unwrap().push(ip.clone());
@@ -1286,7 +1289,8 @@ impl Shared<'_, '_> {
                 if let Some(h) = &run.health {
                     // The machine's verdict; its AI keys' beside it when they aren't a pass.
                     let keys = h.key_status().filter(|k| *k != Status::Pass).map(|k| format!(", AI key {}", k.label()));
-                    what.push(format!("check {}{}", h.machine_status().label(), keys.unwrap_or_default()));
+                    let course = h.course_status().filter(|c| *c == Status::Fail).map(|_| ", course setup fail");
+                    what.push(format!("check {}{}{}", h.machine_status().label(), keys.unwrap_or_default(), course.unwrap_or_default()));
                 }
                 if run.locked {
                     what.push("locked".into());
@@ -1677,15 +1681,21 @@ impl Shared<'_, '_> {
     /// the host's maintenance window, and the GPU's display name — so a MIG slice is labelled
     /// as `pods list` labels it (`B300 MIG 34GB`), not by the catalog id REST v2 lists (live
     /// BPF S6). Never fails a check: no details, no window, the listed name.
+    /// The deep check on one pod (the script inside the conda login wrap, its course facts
+    /// too), with the provider's details and what its proxy port reaches from here alongside.
     async fn deep_check(&self, name: &str, pod: &Pod, target: &SshTarget, check: &CheckStage) -> PodHealth {
-        let call = self.run.remote.exec(target, &check.cmd, Some(DEEP_CHECK_TIMEOUT));
-        let (details, call) = tokio::join!(self.details_of(name, pod), call);
+        let cfg = self.run.cfg;
+        let cmd = health::deep_check_command_for(Some(cfg.get("CONDA_ENV").unwrap_or("arena-env")), &health::CheckArgs::for_pod(cfg, pod));
+        let call = self.run.remote.exec(target, &cmd, Some(DEEP_CHECK_TIMEOUT));
+        let course = crate::pods::health::course_book(&self.run.remote, cfg, std::slice::from_ref(pod));
+        let (details, call, course) = tokio::join!(self.details_of(name, pod), call, course);
         let pod = Pod {
             maintenance: details.as_ref().and_then(|d| d.maintenance.clone()),
             gpu_type: details.and_then(|d| d.gpu_type).or_else(|| pod.gpu_type.clone()),
             ..pod.clone()
         };
-        judge_deep_call(&pod, call.map_err(|e| describe_error(&e)), &check.policy)
+        let policy = HealthPolicy { course: Some(course), ..check.policy.clone() };
+        judge_deep_call(&pod, call.map_err(|e| describe_error(&e)), &policy)
     }
 
     /// The keys-only check on one pod (`pods test --keys`'s: one bounded exec), held to `book`.
@@ -1713,13 +1723,17 @@ impl Shared<'_, '_> {
     /// report and the health cache have it. One that couldn't run is said, with the command
     /// that runs it again, and changes nothing.
     fn say_keys(&self, name: &str, k: &PodHealth, run: &mut NameRun) {
-        let reported = k.facts.as_ref().is_some_and(|f| f.started && (f.openrouter.is_some() || f.hf.is_some()));
+        let reported = k.facts.as_ref().is_some_and(|f| f.started && (f.openrouter.is_some() || f.hf.is_some() || f.wandb.is_some()));
         if !reported {
             (self.say)(To::Err, &format!("[{name}] AI key: not checked ({}) — `arena pods test --keys {name}`", k.notes()));
             return;
         }
         for c in k.checks.iter().filter(|c| health::is_key_check(&c.name) && c.status != Status::Skip) {
-            let what = if c.name == health::AI_KEY { "AI key" } else { "HF token" };
+            let what = match c.name.as_str() {
+                health::AI_KEY => "AI key",
+                health::WANDB_CHECK => "W&B key",
+                _ => "HF token",
+            };
             let (to, mark) = match c.status {
                 Status::Pass => (To::Detail, "✓"),
                 Status::Warn => (To::Err, "!"),
@@ -1974,6 +1988,11 @@ fn ready_brief(run: &NameRun, after: &str) -> String {
         parts.push(if machine == Status::Pass { format!("check {}", tick()) } else { format!("check {}", machine.label()) });
         if let Some(k) = h.key_status().filter(|k| *k != Status::Pass) {
             parts.push(format!("AI key {}", k.label()));
+        }
+        // A course FAIL (its proxy port, backups, branch, Claude Code) was said with its fix
+        // above; a WARN (a new machine is on main until `init-branches`) only with `-v`.
+        if h.course_status() == Some(Status::Fail) {
+            parts.push("course setup fail".into());
         }
     }
     if run.locked {
@@ -2614,11 +2633,7 @@ mod tests {
                 timeouts: SetupTimeouts::default(),
                 hetzner_script: String::new(),
             }),
-            check: check.map(|attempts| CheckStage {
-                policy: HealthPolicy::from_config(cfg).unwrap(),
-                attempts,
-                cmd: health::deep_check_command(Some("arena-env")),
-            }),
+            check: check.map(|attempts| CheckStage { policy: HealthPolicy::from_config(cfg).unwrap(), attempts }),
             keys: keys.and_then(|d| crate::up_keys_stage(cfg, &d.to_string_lossy(), true)),
             claude: false,
             lock: false,
@@ -3003,6 +3018,37 @@ mod tests {
             summary.contains("devtest-apple: fail — ai_key: rejected (HTTP 401): paused? `arena keys resume apple`"),
             "{summary}"
         );
+        assert!(conclude(&rows, &|_, _| {}).is_ok(), "a READY machine: the run succeeds");
+    }
+
+    /// A course FAIL (here: no course repo on the machine) is not a sick host either: said with
+    /// what to run, and the machine is kept — READY, never terminated, replaced or remembered as
+    /// a bad host. The deep check carries the course facts' arguments (the repo, the envs).
+    #[tokio::test(start_paused = true)]
+    async fn up_check_keeps_a_machine_whose_only_problem_is_its_course_setup() {
+        let missing = DEEP_HEALTHY.replace("deep_check_end=1", "repo.path=/root/ARENA_materials\nrepo.state=missing\nuv.path=missing\ndeep_check_end=1");
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.2", 22002, 30)])]);
+        let fake = Arc::new(FakeRemote::new());
+        // copy, config, the deep check (the machine healthy, its repo gone).
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(&missing)]);
+        let cfg = cfg(None);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(3), None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "never terminated nor recreated");
+        assert!(fake.calls_to(&host("10.0.0.2", 22002)).is_empty(), "no replacement was placed");
+        lines.find("[devtest-apple] check: FAIL (course setup, not the machine: kept) — repo: no course repo at /root/ARENA_materials — `arena pods setup apple`");
+        let (ready, _) = lines.find("[devtest-apple] READY after ");
+        assert!(lines.all()[ready].ends_with("check pass, course setup fail"), "{}", lines.all()[ready]);
+        assert!(!lines.all().iter().any(|l| l.contains("terminating") || l.contains("(host)")), "{:#?}", lines.all());
+        let pod = Pod { provider: "runpod".into(), ..Pod::default() };
+        let deep = health::deep_check_command_for(Some("arena-env"), &health::CheckArgs::for_pod(&cfg, &pod));
+        assert!(fake.calls_to(&host("10.0.0.1", 22001)).iter().any(|c| matches!(c, RemoteCall::Exec { cmd, .. } if *cmd == deep)));
+        let row = &rows[0];
+        assert_eq!((row.verdict.clone(), row.health), (Verdict::Ready, Some(Status::Fail)));
+        assert_eq!((row.attempts[0].end.clone(), row.attempts[0].terminated), (AttemptEnd::Kept, false));
         assert!(conclude(&rows, &|_, _| {}).is_ok(), "a READY machine: the run succeeds");
     }
 

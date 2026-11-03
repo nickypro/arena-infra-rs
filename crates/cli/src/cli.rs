@@ -1183,22 +1183,30 @@ pub(crate) enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Health check: torch, --deep GPU tests, or --keys AI keys (read-only)
+    /// Health check: torch, --deep, --keys or --course (read-only)
     ///
     /// --deep: per-GPU CUDA op, driver vs MIN_DRIVER_VERSION, device count, GPU↔GPU copy + NCCL,
-    /// HF download speed, disk, load, maintenance window, and the AI keys. One pass/warn/fail row
-    /// per pod; exits non-zero on any FAIL. --keys: only whether each machine's OpenRouter key
-    /// and HF token work and are the keys CSV's / config's (seconds per machine, no GPU work).
+    /// HF download speed, disk, load, maintenance window, the keys and the course. One
+    /// pass/warn/fail row per pod; exits non-zero on any FAIL. --keys: only the OpenRouter key,
+    /// HF token and W&B key (works, the keys CSV's / config's). --course: only what a participant
+    /// uses beside the machine: proxy port, deploy key + last backup, repo branch, Claude Code,
+    /// notebook kernel, uv. Both take seconds per machine, no GPU work.
     /// No targets (or --all) = this cohort's pods with an SSH endpoint (not @ staff entries;
     /// --include-non-cohort: every pod).
-    #[command(verbatim_doc_comment, group(clap::ArgGroup::new("checks").args(["deep", "keys"])))]
+    #[command(verbatim_doc_comment, group(clap::ArgGroup::new("checks").args(["deep", "keys", "course"])))]
     Test {
         /// Run the deep check instead of the torch-version check.
         #[arg(long)]
         deep: bool,
-        /// Only check the machines' AI keys (OpenRouter key, HF token): fast, no torch or GPU.
+        /// Only check the machines' keys (OpenRouter key, HF token, W&B key): fast, no torch or GPU.
         #[arg(long)]
         keys: bool,
+        /// Only check what a participant uses beside the machine: proxy, backups, branch, Claude, kernel, uv.
+        #[arg(long)]
+        course: bool,
+        /// Also make one tiny Claude request per machine with its auth (uses its account's limits or money).
+        #[arg(long)]
+        claude_call: bool,
         /// Emit per-pod `{name, provider, status, checks[], facts}` as JSON on stdout.
         #[arg(long, requires = "checks")]
         json: bool,

@@ -25,6 +25,8 @@ pub const PROVIDERS: &[(&str, &str, &[&str])] = &[
     // honored if present. Both env names are set: `transformers`/`hub` read `HF_TOKEN`;
     // older code reads `HUGGING_FACE_HUB_TOKEN`.
     ("huggingface", "Hugging Face", &["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]),
+    // W&B too: a machine's own row wins over the broadcast `WANDB_API_KEY` (copied after it).
+    ("wandb", "W&B", &["WANDB_API_KEY"]),
 ];
 
 /// Tokens broadcast identically to *every* pod (same value everywhere), as
@@ -32,8 +34,10 @@ pub const PROVIDERS: &[(&str, &str, &[&str])] = &[
 /// config key (or a CLI override); each listed env var is set to it. Hugging Face sets
 /// two names (`transformers`/`hub` read `HF_TOKEN`, older code `HUGGING_FACE_HUB_TOKEN`).
 /// Claude Code's token isn't one any more: each machine gets its own account's
-/// ([`crate::claude`]), which a broadcast appended after it would override.
-pub const BROADCAST_TOKENS: &[(&str, &str, &[&str])] = &[("HF_TOKEN", "Hugging Face", &["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"])];
+/// ([`crate::claude`]), which a broadcast appended after it would override. W&B's is one
+/// (`WANDB_API_KEY`), for a fleet that sets it: what `pods test --keys` holds a machine's to.
+pub const BROADCAST_TOKENS: &[(&str, &str, &[&str])] =
+    &[("HF_TOKEN", "Hugging Face", &["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]), ("WANDB_API_KEY", "W&B", &["WANDB_API_KEY"])];
 
 /// Build the `(env name, value)` exports for every [`BROADCAST_TOKENS`] entry that
 /// `lookup(config_key)` returns a non-empty value for. `lookup` is where the value comes

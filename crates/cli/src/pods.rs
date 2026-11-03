@@ -18,7 +18,7 @@ use crate::pods::baseline::handle_baseline;
 use crate::pods::branch::{handle_init_branches, set_branch_and_init, SetBranchRun};
 use crate::pods::copy::handle_copy;
 use crate::pods::create::{check_create_body, create_extra, create_policy_line, create_with_retry, hand_keys_over, image_flag, owner_plan, pin_vm_image, plan_create, print_create_body, replacement_rounds, resolve_explicit_names, resolve_want, sizing_flags, spec_with_overrides, warn_no_volume, CreateFailed, Made, RecordingProvider, SpecOverrides, NO_STREAM};
-use crate::pods::health::{handle_deep_test, handle_keys_test};
+use crate::pods::health::{handle_course_test, handle_deep_test, handle_keys_test};
 use crate::pods::lifecycle::{disk_brief, disk_fate, failed_on, handle_reimage, handle_restart, handle_start, handle_terminate, names_of, no_stop_left, no_stop_refusal, repo_sites, split_no_stop, stop_lines, stop_retry, wipe_refusal, DiskOp, RestartOpts, TerminateOpts, RESTART_SETTLE};
 use crate::pods::list::list_with;
 use crate::pods::capable::CreateFlags;
@@ -672,11 +672,7 @@ pub(crate) async fn handle_pods_bal(
                 interval: Duration::from_secs(interval.max(1)),
                 proxy: proxy_deployable(cfg).await,
                 setup,
-                check: policy.map(|policy| up::CheckStage {
-                    policy,
-                    attempts: check_attempts,
-                    cmd: arena_core::health::deep_check_command(Some(cfg.get("CONDA_ENV").unwrap_or("arena-env"))),
-                }),
+                check: policy.map(|policy| up::CheckStage { policy, attempts: check_attempts }),
                 keys,
                 // With setup, always: with no pool it only delivers a pending removal (review r3).
                 claude: !no_setup,
@@ -1142,13 +1138,21 @@ pub(crate) async fn handle_pods_bal(
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
             money::handle_idle(provider, remote, cfg, &sel, hours, json, &mut |l| arena_core::out!(Out, "{l}")).await?;
         }
-        PodCmd::Test { deep: true, sel, json, cohort, .. } => {
+        PodCmd::Test { claude_call: true, deep: false, course: false, .. } => {
+            anyhow::bail!("--claude-call goes with --course or --deep (it's one more call of the Claude check)")
+        }
+        PodCmd::Test { deep: true, sel, json, cohort, claude_call, .. } => {
             // Read-only: no confirm. Config first: a malformed MIN_DRIVER_VERSION fails before
             // the fleet is even listed. Fleet-wide = this cohort's pods: the check runs CUDA, NCCL
             // and a download on each GPU, never on a staff box's (the daily cron line's run).
             arena_core::health::HealthPolicy::from_config(cfg)?;
             let sel = cohort_only(cfg, select(provider, cfg, &sel.args(), Unscoped::All).await?, cohort);
-            handle_deep_test(provider, remote, cfg, &sel, json, arena_core::out::verbose()).await?;
+            handle_deep_test(provider, remote, cfg, &sel, json, arena_core::out::verbose(), claude_call).await?;
+        }
+        PodCmd::Test { course: true, sel, json, cohort, claude_call, .. } => {
+            // Read-only, no GPU work: this cohort's pods, as `--keys`.
+            let sel = cohort_only(cfg, select(provider, cfg, &sel.args(), Unscoped::All).await?, cohort);
+            handle_course_test(remote, cfg, &sel, json, arena_core::out::verbose(), claude_call).await?;
         }
         PodCmd::Test { keys: true, sel, json, cohort, .. } => {
             // Read-only, fast: this cohort's pods (a staff box's key is the organisers' choice),

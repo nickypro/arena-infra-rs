@@ -36,10 +36,12 @@ use crate::pod::Pod;
 pub const AI_KEY: &str = "ai_key";
 /// The Hugging Face token's check.
 pub const HF_TOKEN_CHECK: &str = "hf_token";
+/// The W&B key's check.
+pub const WANDB_CHECK: &str = "wandb";
 
 /// Whether the check named `name` is about an AI key or token, not the machine.
 pub fn is_key_check(name: &str) -> bool {
-    name == AI_KEY || name == HF_TOKEN_CHECK
+    name == AI_KEY || name == HF_TOKEN_CHECK || name == WANDB_CHECK
 }
 
 /// One key or token as the machine's login shell exports it, and what its service answered —
@@ -77,6 +79,10 @@ pub struct KeyFacts {
     /// Whether OpenRouter says it's disabled (paused), where it says.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
+    /// W&B: whether its answer named a user (`viewer`). It answers a key it doesn't know with 200
+    /// and no viewer, so `Some(false)` is a rejection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer: Option<bool>,
 }
 
 impl KeyFacts {
@@ -86,14 +92,14 @@ impl KeyFacts {
         self.curl_exit.as_deref().is_none_or(|c| c == "0")
     }
 
-    /// The service answered 2xx, in full.
+    /// The service answered 2xx, in full (and, for W&B, named a user).
     fn accepted(&self) -> bool {
-        self.transferred() && self.http.is_some_and(|h| (200..300).contains(&h))
+        self.transferred() && self.http.is_some_and(|h| (200..300).contains(&h)) && self.viewer != Some(false)
     }
 
-    /// The service turned the key away (401/403).
+    /// The service turned the key away (401/403, or W&B's answer with no user).
     fn rejected(&self) -> bool {
-        matches!(self.http, Some(401 | 403))
+        matches!(self.http, Some(401 | 403)) || (self.viewer == Some(false) && self.transferred() && self.http.is_some_and(|h| (200..300).contains(&h)))
     }
 
     /// What was found, in a few words, for a line that judges nothing (a staff box, a fleet
@@ -102,6 +108,7 @@ impl KeyFacts {
         match self.set {
             Some(false) => "none here".into(),
             _ if self.accepted() => "one here, accepted".into(),
+            _ if self.viewer == Some(false) => "one here, rejected (no user for it)".into(),
             _ if self.rejected() => format!("one here, rejected (HTTP {})", self.http.unwrap_or_default()),
             _ => "one here, not checked".into(),
         }
@@ -128,10 +135,11 @@ pub(super) fn key_fact(f: &mut DeepFacts, key: &str, value: &str) -> bool {
     let (slot, field) = match key.split_once('.') {
         Some(("openrouter", field)) => (&mut f.openrouter, field),
         Some(("hf", field)) => (&mut f.hf, field),
+        Some(("wandb", field)) => (&mut f.wandb, field),
         _ => return false,
     };
     const FIELDS: &[&str] =
-        &["key", "fingerprint", "curl_exit", "http", "error", "limit", "limit_remaining", "limit_reset", "usage", "disabled"];
+        &["key", "fingerprint", "curl_exit", "http", "error", "limit", "limit_remaining", "limit_reset", "usage", "disabled", "viewer"];
     if !FIELDS.contains(&field) {
         return false;
     }
@@ -159,6 +167,13 @@ pub(super) fn key_fact(f: &mut DeepFacts, key: &str, value: &str) -> bool {
         "limit_remaining" => k.limit_remaining = num(),
         "limit_reset" => k.limit_reset = text().filter(|v| v != "none"),
         "usage" => k.usage = num(),
+        "viewer" => {
+            k.viewer = match value {
+                "yes" => Some(true),
+                "no" => Some(false),
+                _ => None,
+            }
+        }
         _ => {
             k.disabled = match value {
                 "true" => Some(true),
@@ -201,6 +216,12 @@ pub struct KeyBook {
     /// The same for `huggingface_api_keys.csv`: whose HF token a machine should have can't be
     /// said, so a token is expected, and a working one isn't compared.
     pub hf_unreadable: Option<String>,
+    /// The fingerprint of the W&B key every machine gets (`WANDB_API_KEY`), when set.
+    pub wandb: Option<String>,
+    /// A machine's own row in `wandb_api_keys.csv` (copied after the broadcast key, so it wins).
+    pub wandb_csv: BTreeMap<String, String>,
+    /// `wandb_api_keys.csv` exists but couldn't be read.
+    pub wandb_unreadable: Option<String>,
 }
 
 /// A keys-CSV key as OpenRouter's listing has it.
@@ -231,8 +252,17 @@ impl KeyBook {
             listed: None,
             unreadable: None,
             hf_unreadable: None,
+            wandb: cfg.get("WANDB_API_KEY").map(str::trim).filter(|t| !t.is_empty()).map(fingerprint),
+            wandb_csv: BTreeMap::new(),
+            wandb_unreadable: None,
             prefix,
         }
+    }
+
+    /// With the W&B keys CSV's `(machine, secret)` rows, kept as fingerprints.
+    pub fn with_wandb_rows(mut self, rows: &[(String, String)]) -> Self {
+        self.wandb_csv = rows.iter().map(|(h, k)| (h.clone(), fingerprint(k))).collect();
+        self
     }
 
     /// The fleet's: `openrouter_api_keys.csv` and `huggingface_api_keys.csv` in its keys folder
@@ -250,11 +280,12 @@ impl KeyBook {
                 Err(e) => (Vec::new(), Some(format!("{file}: {e}"))),
             }
         };
-        let ((openrouter, or_err), (hf, hf_err)) = (rows("openrouter"), rows("huggingface"));
-        let mut book = Self::new(cfg, &openrouter, cfg.get("HF_TOKEN"), &hf).with_owners(ledger);
+        let ((openrouter, or_err), (hf, hf_err), (wandb, wb_err)) = (rows("openrouter"), rows("huggingface"), rows("wandb"));
+        let mut book = Self::new(cfg, &openrouter, cfg.get("HF_TOKEN"), &hf).with_owners(ledger).with_wandb_rows(&wandb);
         book.openrouter |= or_err.is_some();
         book.unreadable = or_err;
         book.hf_unreadable = hf_err;
+        book.wandb_unreadable = wb_err;
         book
     }
 
@@ -267,7 +298,14 @@ impl KeyBook {
     /// Whether there's anything to hold a machine's keys to: OpenRouter keys, an owner who
     /// should have one, or an HF token.
     pub fn any(&self) -> bool {
-        self.openrouter || !self.owners.is_empty() || self.hf.is_some() || !self.hf_csv.is_empty() || self.hf_unreadable.is_some()
+        self.openrouter
+            || !self.owners.is_empty()
+            || self.hf.is_some()
+            || !self.hf_csv.is_empty()
+            || self.hf_unreadable.is_some()
+            || self.wandb.is_some()
+            || !self.wandb_csv.is_empty()
+            || self.wandb_unreadable.is_some()
     }
 
     /// `apple` for `devtest-apple`: the machine as commands take it.
@@ -289,10 +327,40 @@ pub fn ledger_owners(path: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The machine's AI-key checks: its OpenRouter key (`ai_key`) and its Hugging Face token
-/// (`hf_token`), from the facts the script reported, held to `book`. Pure.
+/// The machine's key checks: its OpenRouter key (`ai_key`), its Hugging Face token (`hf_token`)
+/// and its W&B key (`wandb`), from the facts the script reported, held to `book`. Pure.
 pub fn key_checks(f: &DeepFacts, pod: &Pod, book: &KeyBook) -> Vec<Check> {
-    vec![ai_key_check(f.openrouter.as_ref(), pod, book), hf_token_check(f.hf.as_ref(), pod, book)]
+    let hf = Token {
+        check: HF_TOKEN_CHECK,
+        service: "Hugging Face",
+        csv: "huggingface_api_keys.csv",
+        key: "HF_TOKEN",
+        row: book.hf_csv.get(&pod.name),
+        fleet: book.hf.as_ref(),
+        unreadable: book.hf_unreadable.as_deref(),
+    };
+    let wandb = Token {
+        check: WANDB_CHECK,
+        service: "W&B",
+        csv: "wandb_api_keys.csv",
+        key: "WANDB_API_KEY",
+        row: book.wandb_csv.get(&pod.name),
+        fleet: book.wandb.as_ref(),
+        unreadable: book.wandb_unreadable.as_deref(),
+    };
+    vec![ai_key_check(f.openrouter.as_ref(), pod, book), token_check(&hf, f.hf.as_ref(), pod, book), token_check(&wandb, f.wandb.as_ref(), pod, book)]
+}
+
+/// A token every machine gets (Hugging Face's, W&B's): its check, its service, the keys CSV a
+/// machine's own row is in, the config key of the fleet's, and what the book holds of each.
+struct Token<'a> {
+    check: &'static str,
+    service: &'static str,
+    csv: &'static str,
+    key: &'static str,
+    row: Option<&'a String>,
+    fleet: Option<&'a String>,
+    unreadable: Option<&'a str>,
 }
 
 /// Facts from a script that didn't say (older than these checks, or cut off before them).
@@ -440,9 +508,9 @@ fn ai_key_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
     }
 }
 
-fn hf_token_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
+fn token_check(t: &Token, k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
     use Status::*;
-    let name = HF_TOKEN_CHECK;
+    let (name, service, csv, key) = (t.check, t.service, t.csv, t.key);
     let Some(k) = k.filter(|k| k.set.is_some()) else {
         return Check::new(name, Skip, NOT_REPORTED);
     };
@@ -450,26 +518,30 @@ fn hf_token_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
     if book.staff.contains(&pod.name) {
         return Check::new(name, Skip, format!("staff box: its token is the organisers' choice ({})", k.seen()));
     }
-    // The token it should have: its own row in huggingface_api_keys.csv (copied last, so it wins),
-    // else the fleet's HF_TOKEN — and where a new one goes.
-    // An unreadable huggingface_api_keys.csv: a token is expected, but which one can't be said.
-    let unreadable = book.hf_unreadable.as_deref();
-    let (want, own_row) = match (book.hf_csv.get(&pod.name), book.hf.as_ref()) {
+    // The token it should have: its own row in the keys CSV (copied last, so it wins), else the
+    // fleet's config key — and where a new one goes.
+    // An unreadable keys CSV: a token is expected, but which one can't be said.
+    let unreadable = t.unreadable;
+    let (want, own_row) = match (t.row, t.fleet) {
         _ if unreadable.is_some() => (None, true),
         (Some(row), _) => (Some(row), true),
         (None, Some(fleet)) => (Some(fleet), false),
-        (None, None) => return Check::new(name, Skip, format!("no HF_TOKEN configured for this fleet ({})", k.seen())),
+        (None, None) => return Check::new(name, Skip, format!("no {key} configured for this fleet ({})", k.seen())),
     };
     let copy = format!("`arena pods copy-keys {s}`");
     if k.set == Some(false) {
         return match unreadable {
-            Some(e) if book.hf.is_none() => Check::new(name, Warn, format!("missing; who should have one can't be said: {}", short_why(e))),
+            Some(e) if t.fleet.is_none() => Check::new(
+                name,
+                Warn,
+                format!("missing; who should have one can't be said: {} — fix {csv}, then {copy}", short_why(e)),
+            ),
             _ => Check::new(name, Fail, format!("missing — {copy}")),
         };
     }
     let stale = matches!((want, k.fingerprint.as_deref()), (Some(want), Some(got)) if got != want);
     let uncompared = want.is_none() || k.fingerprint.is_none();
-    let old = if own_row { "not its huggingface_api_keys.csv row's" } else { "not the config's HF_TOKEN" };
+    let old = if own_row { format!("not its {csv} row's") } else { format!("not the config's {key}") };
     let unchecked = |what: String| match stale {
         true => Check::new(name, Warn, format!("{old} — {copy} (not checked: {what})")),
         false => Check::new(name, Warn, format!("not checked ({what}) — `arena pods test --keys {s}`")),
@@ -478,23 +550,31 @@ fn hf_token_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
         return unchecked("no curl on the machine".into());
     }
     if k.rejected() {
-        let h = k.http.unwrap_or_default();
+        let h = match k.http.unwrap_or_default() {
+            h if (200..300).contains(&h) => format!("{service} names no user for it"),
+            h => format!("HTTP {h}"),
+        };
         return Check::new(
             name,
             Fail,
             match (stale, own_row) {
-                (true, _) => format!("rejected (HTTP {h}): {old} — {copy}"),
-                (false, true) => format!("rejected (HTTP {h}) — renew its huggingface_api_keys.csv row, then {copy}"),
-                (false, false) => format!("rejected (HTTP {h}) — a new HF_TOKEN in the config, then `arena pods copy-keys`"),
+                (true, _) => format!("rejected ({h}): {old} — {copy}"),
+                (false, true) => format!("rejected ({h}) — renew its {csv} row, then {copy}"),
+                (false, false) => format!("rejected ({h}) — a new {key} in the config, then `arena pods copy-keys`"),
             },
         );
     }
     if !k.accepted() {
         return unchecked(match k.http.filter(|&h| h != 0 && k.transferred()) {
-            Some(429) => "Hugging Face is rate-limiting: HTTP 429".to_string(),
-            Some(h) => format!("HTTP {h} from Hugging Face"),
+            Some(429) => format!("{service} is rate-limiting: HTTP 429"),
+            Some(h) => format!("HTTP {h} from {service}"),
             None => format!("unreachable: {}", short_why(&k.unreached())),
         });
+    }
+    // W&B answers 200 to anything: only a user in its answer says the key works (a GraphQL error,
+    // an empty answer says nothing of it).
+    if name == WANDB_CHECK && k.viewer != Some(true) {
+        return unchecked(format!("no user in W&B's answer: {}", short_why(k.error.as_deref().unwrap_or("?"))));
     }
     if stale {
         Check::new(name, Warn, format!("works, but {old} — {copy}"))
@@ -503,7 +583,7 @@ fn hf_token_check(k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Check {
     } else if uncompared {
         Check::new(name, Warn, format!("works, not compared (no sha256sum there) — {copy} to be sure"))
     } else {
-        Check::new(name, Pass, "accepted by Hugging Face")
+        Check::new(name, Pass, format!("accepted by {service}"))
     }
 }
 
@@ -530,8 +610,17 @@ pub fn ai_key_cell(h: &PodHealth) -> Option<String> {
 /// The HF column's cell for `h` (`pods test --keys`): `ok`, `missing`, `rejected`, `?`, `stale`
 /// — `None` as [`ai_key_cell`].
 pub fn hf_token_cell(h: &PodHealth) -> Option<String> {
-    let c = h.checks.iter().find(|c| c.name == HF_TOKEN_CHECK && c.status != Status::Skip)?;
-    let Some(k) = h.facts.as_ref().and_then(|f| f.hf.as_ref()) else { return Some(c.status.label().to_string()) };
+    token_cell(h, HF_TOKEN_CHECK, h.facts.as_ref().and_then(|f| f.hf.as_ref()))
+}
+
+/// The W&B column's cell for `h`, as [`hf_token_cell`].
+pub fn wandb_cell(h: &PodHealth) -> Option<String> {
+    token_cell(h, WANDB_CHECK, h.facts.as_ref().and_then(|f| f.wandb.as_ref()))
+}
+
+fn token_cell(h: &PodHealth, check: &str, k: Option<&KeyFacts>) -> Option<String> {
+    let c = h.checks.iter().find(|c| c.name == check && c.status != Status::Skip)?;
+    let Some(k) = k else { return Some(c.status.label().to_string()) };
     Some(match () {
         _ if k.set == Some(false) => "missing".into(),
         _ if k.rejected() => "rejected".into(),

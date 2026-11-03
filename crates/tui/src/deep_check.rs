@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arena_core::health::{deep_check_command, judge_deep_call, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT};
+use arena_core::health::{deep_check_command_for, judge_deep_call, CheckArgs, CourseBook, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT};
 use arena_core::metrics::PodMetrics;
 use arena_core::remote::{describe_error, Remote};
 use arena_core::ssh::SshTarget;
@@ -154,29 +154,32 @@ pub(crate) fn start_deep_check(shared: &Arc<Mutex<Shared>>, ui: &Ui, pods: Vec<P
 }
 
 /// Run the deep check on each pod concurrently over `remote` — the script `pods test
-/// --deep` runs, one exec within [`DEEP_CHECK_TIMEOUT`], judged by the same core function
-/// (`health::judge_deep_call`). A pod with no SSH endpoint is a FAIL: it was asked for. A
-/// pod whose check task died is a FAIL too, never dropped. Results in `pods` order.
+/// --deep` runs (its course facts too), one exec within [`DEEP_CHECK_TIMEOUT`], judged by the
+/// same core function (`health::judge_deep_call`) with the same course book (`CourseBook::gather`:
+/// the proxy ports tried from here alongside). A pod with no SSH endpoint is a FAIL: it was asked
+/// for. A pod whose check task died is a FAIL too, never dropped. Results in `pods` order.
 async fn deep_check_pods(remote: &Arc<dyn Remote>, cfg: &Config, policy: &HealthPolicy, pods: &[Pod]) -> Vec<PodHealth> {
     // `CONDA_ENV=""` disables activation, as for the CLI.
-    let cmd = deep_check_command(Some(cfg.get("CONDA_ENV").unwrap_or("arena-env")));
+    let conda = cfg.get("CONDA_ENV").unwrap_or("arena-env").to_string();
+    let course = CourseBook::gather(remote, cfg, pods, !cfg!(test));
     let jobs: Vec<_> = pods
         .iter()
         .map(|pod| {
             SshTarget::from_pod(pod, cfg).ok().map(|target| {
-                let (remote, cmd) = (remote.clone(), cmd.clone());
+                let (remote, cmd) = (remote.clone(), deep_check_command_for(Some(&conda), &CheckArgs::for_pod(cfg, pod)));
                 tokio::spawn(async move {
                     remote.exec(&target, &cmd, Some(DEEP_CHECK_TIMEOUT)).await.map_err(|e| describe_error(&e))
                 })
             })
         })
         .collect();
+    let policy = HealthPolicy { course: Some(course.await), ..policy.clone() };
     let mut results = Vec::with_capacity(pods.len());
     for (pod, job) in pods.iter().zip(jobs) {
         results.push(match job {
             None => PodHealth::unreachable(pod, format!("no SSH endpoint yet (status {})", pod.status)),
             Some(handle) => match handle.await {
-                Ok(call) => judge_deep_call(pod, call, policy),
+                Ok(call) => judge_deep_call(pod, call, &policy),
                 Err(e) => PodHealth::unreachable(pod, format!("the check task failed: {e}")),
             },
         });
@@ -356,12 +359,12 @@ mod tests {
                 ("devtest-charlie", Status::Fail, "no SSH endpoint yet (status RUNNING)".to_string()),
             ]
         );
-        let want = RemoteCall::Exec {
-            host: String::new(),
-            cmd: deep_check_command(Some("arena-env")),
-            timeout: Some(DEEP_CHECK_TIMEOUT),
-        };
-        for host in ["10.0.0.1:22001", "10.0.0.2:22002"] {
+        for (host, pod) in [("10.0.0.1:22001", &pods[0]), ("10.0.0.2:22002", &pods[1])] {
+            let want = RemoteCall::Exec {
+                host: String::new(),
+                cmd: arena_core::health::deep_check_command_for(Some("arena-env"), &CheckArgs::for_pod(&cfg, pod)),
+                timeout: Some(DEEP_CHECK_TIMEOUT),
+            };
             let calls = fake.calls_to(host);
             assert_eq!(calls.len(), 1, "{host}");
             assert!(matches!((&calls[0], &want), (RemoteCall::Exec { cmd, timeout, .. }, RemoteCall::Exec { cmd: w, timeout: wt, .. }) if cmd == w && timeout == wt));

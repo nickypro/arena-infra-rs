@@ -155,6 +155,7 @@ const SETTABLE_KEYS: &[(&str, bool)] = &[
     ("HETZNER_API_KEY", true),
     ("SHADEFORM_API_KEY", true), // opt-in overflow GPU VMs (`--provider shadeform`)
     ("HF_TOKEN", true), // broadcast to pods for gated repos (Llama 3 …)
+    ("WANDB_API_KEY", true), // optional: broadcast to pods for W&B (`pods test --keys` checks it)
     ("CLAUDE_TOKENS_FILE", false), // Claude Code accounts, one per machine (`arena claude`)
     ("CLAUDE_CODE_OAUTH_TOKEN", true), // one Claude Code account for every pod (without CLAUDE_TOKENS_FILE)
     ("OPENROUTER_PROVISIONING_KEY", true), // mints per-machine OpenRouter keys (`arena keys`)
@@ -1274,6 +1275,9 @@ pub(crate) fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<S
 
     println!("\nEvals / model access (optional, `pods copy-keys` / `arena keys`):");
     cfg_row(&mut out, cfg, &mut missing, "HF_TOKEN", false, true); // broadcast for gated repos (Llama 3 …)
+    if cfg.get("WANDB_API_KEY").is_some_and(|k| !k.trim().is_empty()) {
+        cfg_row(&mut out, cfg, &mut missing, "WANDB_API_KEY", false, true); // broadcast for W&B
+    }
     cfg_row(&mut out, cfg, &mut missing, "OPENROUTER_PROVISIONING_KEY", false, true); // mints runtime keys
     // The workspace every key call is scoped to: a value that's neither an id nor a slug
     // would fail each call, so it's a ✗ here.
@@ -1447,7 +1451,8 @@ pub(crate) fn key_check_row(book: &arena_core::health::KeyBook) -> String {
         (true, n) => format!("OpenRouter: the keys CSV's keys for {n} machines"),
     };
     let hf = if book.hf.is_some() || !book.hf_csv.is_empty() { "HF_TOKEN: set" } else { "HF_TOKEN: unset (not judged)" };
-    format!("  · {:<28} {or}; {hf} — `arena pods test --keys`", "AI key check")
+    let wandb = if book.wandb.is_some() || !book.wandb_csv.is_empty() { "; WANDB_API_KEY: set" } else { "" };
+    format!("  · {:<28} {or}; {hf}{wandb} — `arena pods test --keys`", "AI key check")
 }
 
 /// `config check`'s section on the machines `up --check` remembers as bad, from the health

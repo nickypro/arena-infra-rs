@@ -267,9 +267,11 @@ pub(crate) fn setup_config(
     if no_vscode {
         scfg.vscode = None;
     }
-    // Which broadcast tokens (HF, Claude Code) will be exported (an optional step).
+    // Which broadcast tokens (HF; W&B when the fleet sets one) will be exported (an optional
+    // step).
     let token_summary: Vec<String> = arena_core::apikeys::BROADCAST_TOKENS
         .iter()
+        .filter(|(key, _, _)| *key == "HF_TOKEN" || token_value(key).is_some())
         .map(|(key, display, _)| format!("{display} {}", if token_value(key).is_some() { "✓" } else { "✗" }))
         .collect();
     let line = format!("Broadcast tokens: {} (✓ exported on each pod; ✗ skipped)", token_summary.join(", "));

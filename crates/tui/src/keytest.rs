@@ -6,7 +6,9 @@
 
 use std::path::PathBuf;
 
-use arena_core::health::{is_key_check, judge_key_call, key_check_command, HealthPolicy, KeyBook, PodHealth, Status, AI_KEY, KEY_CHECK_TIMEOUT};
+use arena_core::health::{
+    is_key_check, judge_key_call, key_check_command, HealthPolicy, KeyBook, PodHealth, Status, AI_KEY, KEY_CHECK_TIMEOUT, WANDB_CHECK,
+};
 use arena_core::remote::{describe_error, Remote};
 use arena_core::ssh::SshTarget;
 use arena_core::{Config, Pod};
@@ -43,7 +45,11 @@ pub(crate) fn with_keys(torch: String, keys: Option<&PodHealth>) -> String {
         .iter()
         .filter(|c| is_key_check(&c.name) && c.status != Status::Skip)
         .map(|c| {
-            let what = if c.name == AI_KEY { "AI key" } else { "HF token" };
+            let what = match c.name.as_str() {
+                AI_KEY => "AI key",
+                WANDB_CHECK => "W&B key",
+                _ => "HF token",
+            };
             let mark = match c.status {
                 Status::Pass => "✓",
                 Status::Warn => "!",
@@ -52,7 +58,7 @@ pub(crate) fn with_keys(torch: String, keys: Option<&PodHealth>) -> String {
             format!("{what} {mark} {}", c.detail)
         })
         .collect();
-    let reported = k.facts.as_ref().is_some_and(|f| f.started && (f.openrouter.is_some() || f.hf.is_some()));
+    let reported = k.facts.as_ref().is_some_and(|f| f.started && (f.openrouter.is_some() || f.hf.is_some() || f.wandb.is_some()));
     let tail = match (reported, judged.is_empty()) {
         (false, _) => format!("AI key not checked ({})", k.notes()),
         (true, true) => return torch,
