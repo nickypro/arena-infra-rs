@@ -21,11 +21,11 @@ fn piped(args: &[&str], env: &[(&str, &str)]) -> String {
 }
 
 /// The same on a terminal (`script` gives it one): what the terminal got, both streams. `None`
-/// without `script`.
+/// without util-linux's `script` (macOS's has no `-c`).
 fn on_terminal(args: &str, env: &[(&str, &str)]) -> Option<String> {
-    let has_script = Command::new("sh").args(["-c", "command -v script"]).output().is_ok_and(|o| o.status.success());
+    let has_script = Command::new("script").args(["-qec", "true", "/dev/null"]).stdin(Stdio::null()).output().is_ok_and(|o| o.status.success());
     if !has_script {
-        eprintln!("no `script` here: the terminal half of this test is skipped");
+        eprintln!("no util-linux `script` here: the terminal half of this test is skipped");
         return None;
     }
     let cmd = format!("{} {args}", env!("CARGO_BIN_EXE_arena"));

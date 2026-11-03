@@ -158,8 +158,9 @@ grep -e "-$t\$" -e " config.env.example\$" SHA256SUMS | $c -c &&
 
 Put `~/arena` on your `PATH`, or alias `arena` as the TL;DR does: `arena tui` starts the
 `arena-tui` beside it. On Windows, run the block in [WSL](https://learn.microsoft.com/windows/wsl/install)
-(Ubuntu): the Linux binaries work there. The control box's side (cron backups, the proxy) is
-tested on Linux only.
+(Ubuntu): the Linux binaries work there. On a Mac, pulling backups (`pods pull`, `pods backup`)
+needs rsync 3 (`brew install rsync`): macOS's own lacks options arena uses. The control box's
+side (cron backups, the proxy) is tested on Linux only.
 
 To check the build provenance as well (`arena update` does it by itself), each file must print
 the same run:

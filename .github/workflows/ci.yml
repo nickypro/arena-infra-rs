@@ -55,10 +55,12 @@ jobs:
         run: cargo test --release --locked
 
   # The macOS build release.yml ships, tested on Apple silicon alongside the Linux job. Tests of
-  # what only Linux has (`/proc`, flock(1), setsid(1), …) are gated off macOS with `#[cfg]`:
-  # docs/REFERENCE.md, "macOS", lists them.
+  # what only Linux has (`/proc`, `script`'s flags, …) are gated off macOS: docs/REFERENCE.md,
+  # "On macOS", lists them. The macOS jobs run once per commit, on its push (macOS runners are
+  # few); a fork's pull request has no push here, so it runs them itself.
   test-macos:
     name: build + test (macOS)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: macos-15
     timeout-minutes: 60
     env:
@@ -69,14 +71,25 @@ jobs:
         run: |
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
           rustc --version
+      # rsync 3: macOS's own is openrsync, without the `--info` and `-J` arena's pulls use (a Mac
+      # pulling backups needs it too: README). GNU coreutils, sed, grep and find, first on PATH:
+      # the tests run the pods' scripts here as a stand-in pod, and a pod is Linux.
       - name: Tools
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: |
+          brew install rsync coreutils gnu-sed grep findutils
+          for f in coreutils gnu-sed grep findutils; do echo "$(brew --prefix "$f")/libexec/gnubin" >> "$GITHUB_PATH"; done
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
           git config --global user.name "arena CI"
           git config --global user.email "ci@example.invalid"
           git config --global init.defaultBranch main
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Test
-        run: cargo test --release --locked --no-fail-fast
+        run: |
+          rsync --version | head -1 && sed --version | head -1
+          cargo test --release --locked --no-fail-fast
 
   # Blocking: any clippy warning fails the run. The lint set is the pinned toolchain's
   # (RUSTUP_TOOLCHAIN), so a newer clippy's new lints arrive only with a deliberate bump.
@@ -101,6 +114,7 @@ jobs:
   # The same on macOS: its `#[cfg]`s compile other code.
   clippy-macos:
     name: clippy (macOS)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: macos-15
     timeout-minutes: 60
     steps:

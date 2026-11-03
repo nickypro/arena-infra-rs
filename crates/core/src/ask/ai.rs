@@ -1225,7 +1225,10 @@ pub(crate) mod tests {
         let argv: Vec<String> = rec(&t.0, "codex.argv").lines().map(String::from).collect();
         let at = |flag: &str| argv.iter().position(|a| a == flag).map(|i| argv[i + 1].clone()).unwrap();
         let (cwd, out) = (at("-C"), at("-o"));
-        assert_eq!(cwd, rec(&t.0, "codex.cwd").trim(), "-C is where it runs: the empty dir");
+        // The stub's `pwd` is the physical path, and the temp dir can be behind a link (macOS:
+        // /var → /private/var).
+        let physical = cwd.replacen(&t.0.display().to_string(), &t.0.canonicalize().unwrap().display().to_string(), 1);
+        assert_eq!(physical, rec(&t.0, "codex.cwd").trim(), "-C is where it runs: the empty dir");
         let disabled = codex_disabled(&parse_features(&codex_features(&[])).unwrap());
         assert_eq!(argv, codex_args(Path::new(&cwd), Path::new(&out), None, Some(Effort::Low), &disabled), "exactly the no-tools argv, the MCP override and the effort included");
         assert_eq!(rec(&t.0, "codex.stdin"), "PROMPT");

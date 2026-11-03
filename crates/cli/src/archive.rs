@@ -3365,7 +3365,9 @@ mod tests {
         let stub = rsync_stub(&w.dir);
         let now = day_end("w0d1") + 3 * 3600;
         let dir = w.dir.display().to_string();
-        let (w, stub, dir) = (&w, &stub, &dir);
+        // The backup dir is said as its real path: the temp dir can be behind a link (macOS).
+        let real = w.dir.canonicalize().unwrap().display().to_string();
+        let (w, stub, dir, real) = (&w, &stub, &dir, &real);
         let run = |o: SyncOpts, at: u64| async move {
             let lines = Mutex::new(Vec::new());
             let say = |to: To, l: &str| lines.lock().unwrap().push((to, l.to_string()));
@@ -3373,7 +3375,7 @@ mod tests {
             let _ = archive_sync_with(&w.cfg, &w.env().paths, o, stub, &clock(at), &say).await;
             let lines = lines.into_inner().unwrap();
             let at = |verbose: bool| lines.iter().filter(|(to, _)| to.shows(verbose)).map(|(_, l)| format!("{l}\n")).collect::<String>();
-            (at(false), at(true).replace(dir.as_str(), "<dir>"))
+            (at(false), at(true).replace(real.as_str(), "<dir>").replace(dir.as_str(), "<dir>"))
         };
         let (dry, dry_v) = run(SyncOpts { dry_run: true, ..sync_opts("both") }, now).await;
         // The pod named like the cohort's but off the list is said by default: it's the one fix here.
@@ -4473,6 +4475,7 @@ mod tests {
     /// A2-1 (a): a pod whose tree holds a symlink the archive can't store is pushed without it —
     /// by an exact anchored rule — and the run says how many were left out (never the target).
     #[cfg(unix)]
+    #[cfg_attr(target_os = "macos", ignore = "macOS caps a symlink's target at 1023 bytes")]
     #[tokio::test]
     async fn a_symlink_too_long_to_store_is_left_out_with_a_warning() {
         let w = world("longlink");
@@ -4751,6 +4754,7 @@ mod tests {
     /// push (its failure, charged like any) and of big, which goes pod by pod: every other pod's
     /// big push still goes, and the run names the pod.
     #[cfg(unix)]
+    #[cfg_attr(target_os = "macos", ignore = "macOS caps a symlink's target at 1023 bytes")]
     #[tokio::test]
     async fn too_many_unstorable_links_leave_only_that_pod_out() {
         let w = world("toomany");
