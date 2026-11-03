@@ -2510,7 +2510,7 @@ machine's.
 pod, after a first `shell` FAIL, `no zsh on the pod (setup installs it)`, with the fix: `arena pods
 setup NAME`. It is software/setup whatever else failed: checks run before setup are no evidence
 against the machine, so `up --check` never replaces such a pod or counts its machine as bad.
-`--keys` says the same.
+`--keys` and `--course` say the same.
 
 #### AI keys (`--keys`)
 

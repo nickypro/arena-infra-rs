@@ -27,7 +27,7 @@ earlier).
   it once, dimmed: `── errata (no zsh: ran under bash)`.
 - The same goes for `pods test`, `run --background` (the job's log starts with `arena: no zsh:
   running under bash`), and the deep and key checks.
-- **`pods test --deep`, `--keys` and `up --check`** still FAIL such a pod as not set up. A first
+- **`pods test --deep`, `--keys`, `--course` and `up --check`** still FAIL such a pod as not set up. A first
   `shell` check says `no zsh on the pod (setup installs it)` and gives `arena pods setup NAME`, and
   the rest of the checks now run under bash and show beside it. It counts as software/setup, never
   the machine: `up --check` doesn't replace the pod or remember its machine as bad. In `--json`
