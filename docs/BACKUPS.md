@@ -657,8 +657,14 @@ back is the command's exit trap: a switch that fails, stops on an error, or gets
 interrupt or a TERM puts the keys back first. That holds however early it's stopped, in the middle
 of setting a file aside too: the set-aside's branch is noted before its first copy (it was noted
 last, so a file already put back to git's version kept the placeholder, its key only in
-`.git/arena-unredacted/`), a copy lands whole or not at all, and the trap puts back a file the
-switch's `git checkout` left gone or half-written, and drops a copy the file still matches.
+`.git/arena-unredacted/`), and every file it writes — the copy, the file's git version, the key
+put back — is made in `.git` and renamed into place, so a file is only ever the participant's
+version or git's. A later switch's restore puts back what a KILL left. The restore only ever
+replaces a file that is exactly git's version of its copy (or drops a copy the file already
+matches): a file the participant changed or removed since, or one under a directory that is now a
+link, keeps what they did, and its copy stays (`UNREDACTED_KEPT`). A file whose mode changed too,
+or whose directory is on another filesystem than `.git`, isn't set aside: the switch treats it as
+any local change.
 
 arena's own 2-minute timeout kills only its ssh client — a non-pty session's shell is usually never
 signalled, and ran on (review ai-review claude #13) — so the switch bounds itself on the pod: it
@@ -788,8 +794,10 @@ commit (the backup's own commit included), whose `.git/objects/maintenance.lock`
 Everything else arrived, so the copy counts: the pod's line says `some files vanished on the pod
 while they were copied (the next pull takes them)`, and the next pull takes what the pod has then
 (live: one cohort pod's copy failed every run on it). rsync exits 24 only when that was all that
-went wrong; any other trouble is exit 23, and fails the copy. The reaper's own copy, which must be
-whole before a pod is deleted, still needs exit 0.
+went wrong; any other trouble is exit 23, and fails the copy. So does a 24 for a file under a repo's
+`.git/` other than git's lock files (`*.lock`, `gc.pid`): a pack replaced mid-copy can leave the
+copy's refs naming objects it hasn't got. The reaper's own copy, which must be whole before a pod
+is deleted, still needs exit 0.
 
 ### A directory that became a symlink
 

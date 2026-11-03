@@ -729,7 +729,8 @@ pub(crate) async fn pull_pods(
             let started = tokio::time::Instant::now();
             let mut stats: Option<pull::RsyncStats> = None;
             // A pass whose only trouble was files vanishing on the pod meanwhile copied the rest:
-            // copied, and said (prod 2026-10-30: one pod's pull failed every run on it).
+            // copied, and said (prod 2026-10-30: one pod's pull failed every run on it) — unless
+            // what vanished was a repo's pack, object or ref (`vanished_only_disposable`).
             let mut vanished = false;
             // Directories moved out of the way of what the pod has now: said on the job's line.
             let mut made = pull::MadeWay::default();
@@ -746,7 +747,7 @@ pub(crate) async fn pull_pods(
                 let (out, m) = pull::rsync_making_way(&rsync, &args, &into, &what, left, &day).await;
                 made.extend(m);
                 match out {
-                    Ok(o) if o.success || o.code == Some(pull::RSYNC_VANISHED_EXIT) => {
+                    Ok(o) if o.success || (o.code == Some(pull::RSYNC_VANISHED_EXIT) && pull::vanished_only_disposable(&o.stderr)) => {
                         vanished |= !o.success;
                         let s = pull::parse_rsync_stats(&o.stdout);
                         stats = match (stats, s) {

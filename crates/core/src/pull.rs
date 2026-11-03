@@ -1260,8 +1260,30 @@ pub const RSYNC_PARTIAL_EXIT: i32 = 23;
 /// rsync's exit when the only thing wrong was source files that vanished before they could be
 /// sent — removed or renamed on the pod while it read them (a program writing its files, git's
 /// detached maintenance and its `objects/maintenance.lock` since 2.47). Any other trouble makes
-/// it 23. Everything else was copied, and the next pull takes what the pod has then.
+/// it 23. Everything else was copied, and the next pull takes what the pod has then — when what
+/// vanished could be done without: [`vanished_only_disposable`].
 pub const RSYNC_VANISHED_EXIT: i32 = 24;
+
+/// Whether an rsync that exited [`RSYNC_VANISHED_EXIT`] lost only what a copy can do without:
+/// every `file has vanished: "<path>"` line on its stderr names a file outside any `.git/`, or one
+/// of git's lock files in one (`*.lock`, `gc.pid`: there only while a git command runs). A pack,
+/// object or ref that vanished under `.git/` (review codex r3: maintenance replacing a pack, the
+/// new one not in rsync's list) can leave the copy's refs naming objects it hasn't got, so that
+/// copy still fails. No such line at all: not known, so not.
+pub fn vanished_only_disposable(stderr: &str) -> bool {
+    let mut any = false;
+    for line in stderr.lines() {
+        let Some(rest) = line.trim_end().strip_prefix("file has vanished: \"") else { continue };
+        let Some(path) = rest.strip_suffix('"') else { return false };
+        any = true;
+        let in_git = path.starts_with(".git/") || path.contains("/.git/");
+        let name = path.rsplit('/').next().unwrap_or(path);
+        if in_git && !(name.ends_with(".lock") || name == "gc.pid") {
+            return false;
+        }
+    }
+    any
+}
 
 /// The kinds of entry a [`MAKE_WAY`] line names where a directory can be what's in the way,
 /// in rsync's own words. `directory` is not one of them: rsync replaces a file in a new
@@ -1568,6 +1590,28 @@ mod tests {
             connect_timeout_secs: 10,
             host_keys: Default::default(),
         }
+    }
+
+    /// rsync's exit 24 counts as a copy only when what vanished is outside `.git/` or one of git's
+    /// lock files there: never a pack, an object or a ref.
+    #[test]
+    fn a_vanished_file_is_disposable_outside_git_or_as_a_lock() {
+        let v = |paths: &[&str]| paths.iter().map(|p| format!("file has vanished: \"{p}\"\n")).collect::<String>() + "rsync warning: some files vanished before they could be transferred (code 24) at main.c(1356) [sender=3.2.7]\n";
+        for (paths, ok) in [
+            (&["/root/ARENA_materials/.git/objects/maintenance.lock"][..], true),
+            (&["/root/ARENA_materials/.git/index.lock", "/root/ARENA_materials/.git/gc.pid"], true),
+            (&["/root/runs/ckpt-0001.pt", "/root/ARENA_materials/notes.ipynb"], true),
+            (&[".git/refs/heads/main.lock"], true),
+            (&["/root/ARENA_materials/.git/objects/pack/pack-1a2b.pack"], false),
+            (&["/root/runs/ckpt.pt", "/root/ARENA_materials/.git/objects/ab/cdef0123"], false),
+            (&["/root/ARENA_materials/sub/.git/refs/heads/main"], false),
+            (&["/root/ARENA_materials/.git/packed-refs"], false),
+            (&[], false),
+        ] {
+            assert_eq!(vanished_only_disposable(&v(paths)), ok, "{paths:?}");
+        }
+        assert!(!vanished_only_disposable("file has vanished: \"/root/a.git/x\n"), "a line cut short");
+        assert!(vanished_only_disposable("file has vanished: \"/root/x.git/objects/y\"\n"), "x.git isn't .git");
     }
 
     /// The big tier's root: its own volume when configured, else today's `<dir>/big`.

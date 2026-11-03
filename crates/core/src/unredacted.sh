@@ -15,44 +15,62 @@
 #   UNREDACTED_KEPT <path>       set aside by this switch and kept (the branch has its own version)
 
 # Each tracked file whose only difference from the index is keys the redaction knows: set aside.
-# A file with any other uncommitted change is left alone — the switch treats it as it always did —
-# and so is one that can't be copied (said on stderr): the loop never stops halfway.
-# Stopped anywhere in it (the bound's TERM; the EXIT trap then restores), nothing is lost or left:
-# the run's branch is written before its first copy (a run is restored by its branch: written at
-# the end, a file already put back to git's version lost its key); a copy is made beside the run
-# and renamed in, whole or not there; and the restore drops a copy the file still matches, and
-# puts back one whose file this switch's `git checkout` left gone or cut short (it removes the
-# file, then writes it).
+# A file with any other uncommitted change is left alone — the switch treats it as it always did,
+# a chmod included — and so is one that can't be copied (said on stderr), one under a symlinked
+# directory, and one whose directory isn't on the git dir's filesystem: the loop never stops
+# halfway. The file is put back to git's version — its redacted text, which was just checked to
+# be that — by a rename, so it's whole either way; then the index's stat data is refreshed, which
+# stages nothing.
+# Stopped anywhere (the bound's TERM, the EXIT trap then restoring; or a KILL, and a later
+# switch's restore), nothing is lost: the run's branch is written before its first copy (a run is
+# restored by its branch: written at the end, a file already put back lost its key); every copy,
+# here and in the restore, is made beside the runs and renamed into place, so a file is only ever
+# the participant's version or git's, both of which any later restore recognises.
 unredacted_aside() {
     UR_RUN=$(date -u +%Y%m%dT%H%M%SZ)-$$
     UR_BRANCH=$(git rev-parse --abbrev-ref HEAD) || UR_BRANCH=
+    UR_MODES=$(git config --bool core.fileMode 2>/dev/null) || UR_MODES=true
     git diff --name-only -z | tr '\0' '\n' | while IFS= read -r f; do
-        if [ ! -f "$f" ] || [ -L "$f" ]; then continue; fi
-        i=$(git ls-files -s -- ":(literal)$f" | awk '$1 == "100644" || $1 == "100755" { print $2 }')
-        if [ -z "$i" ] || [ "$(git hash-object -- "$f")" = "$i" ]; then continue; fi
+        if [ ! -f "$f" ] || [ -L "$f" ] || ! unredacted_in_place "$1" "$f"; then continue; fi
+        e=$(git ls-files -s -- ":(literal)$f" | awk '$1 == "100644" || $1 == "100755" { print $1, $2 }')
+        m=${e%% *}
+        i=${e#* }
+        if [ -z "$e" ] || [ "$(git hash-object -- "$f")" = "$i" ]; then continue; fi
+        if [ -x "$f" ]; then x=100755; else x=100644; fi
+        if [ "$UR_MODES" != false ] && [ "$m" != "$x" ]; then continue; fi
         if [ "$(LC_ALL=C sed -E "$REDACT_SED" < "$f" | git hash-object --path="$f" --stdin)" != "$i" ]; then continue; fi
         if mkdir -p -- "$1/$UR_RUN/$(dirname -- "$f")" \
             && { [ -f "$1/$UR_RUN.branch" ] || printf '%s\n' "$UR_BRANCH" > "$1/$UR_RUN.branch"; } \
             && cp -p -- "$f" "$1/$UR_RUN.part" && mv -f -- "$1/$UR_RUN.part" "$1/$UR_RUN/$f" \
-            && git checkout -q -- ":(literal)$f"; then
+            && cp -p -- "$f" "$1/$UR_RUN.part" && LC_ALL=C sed -E "$REDACT_SED" < "$f" > "$1/$UR_RUN.part" \
+            && mv -f -- "$1/$UR_RUN.part" "$f"; then
             :
         else
             echo "arena set-branch: couldn't set $f aside - left as it is" >&2
         fi
     done
+    git update-index -q --refresh > /dev/null 2>&1 || :
 }
 
-# Whether file $2 is git's version of the copy $1 (its redacted text, through the path's
-# filters), cut short: what a `git checkout` stopped while it wrote the file leaves.
-unredacted_cut_short() {
-    _b=$(LC_ALL=C sed -E "$REDACT_SED" < "$1" | git hash-object --path="$2" --stdin) || return 1
-    _n=$(($(wc -c < "$2")))
-    git cat-file --filters --path="$2" "$_b" 2>/dev/null | head -c "$_n" | cmp -s - "$2"
+# Whether the work tree's $2 can be replaced in place from the folder $1 (in the git dir): no
+# directory on its way is a symlink (a copy would land where it points), and its directory is on
+# the git dir's filesystem (a rename there is one step; across filesystems `mv` copies).
+unredacted_in_place() {
+    _d=$(dirname -- "$2")
+    _p=$_d
+    while [ "$_p" != . ] && [ "$_p" != / ]; do
+        if [ -L "$_p" ]; then return 1; fi
+        _p=$(dirname -- "$_p")
+    done
+    [ -d "$_d" ] && [ "$(stat -c %d -- "$(dirname -- "$1")")" = "$(stat -c %d -- "$_d")" ]
 }
 
 # After the switch: the copies set aside on the branch now checked out, newest first and one per
-# path, go back where the path holds exactly their redacted version; this switch's own copies
-# that didn't are said (KEPT). Copies from other branches wait for a switch back to theirs.
+# path, go back where the path holds exactly their redacted version — renamed into place — and a
+# copy the file already matches is dropped; this switch's own copies that did neither are said
+# (KEPT). Nothing else is ever overwritten: a file the participant changed, removed or moved under
+# a link since keeps what they did, and its copy stays. Copies from other branches wait for a
+# switch back to theirs.
 unredacted_restore() {
     if [ ! -d "$1" ]; then return 0; fi
     cur=$(git rev-parse --abbrev-ref HEAD)
@@ -61,17 +79,17 @@ unredacted_restore() {
         if [ ! -d "$1/$run" ] || [ "$(cat "$1/$run.branch" 2>/dev/null)" != "$cur" ]; then continue; fi
         (cd "$1/$run" && find . -type f) | sed 's#^\./##' | while IFS= read -r f; do
             if grep -qxF -- "$f" "$1.done"; then continue; fi
-            if [ -f "$f" ] && [ ! -L "$f" ] && cmp -s -- "$1/$run/$f" "$f"; then
+            if [ ! -f "$f" ] || [ -L "$f" ] || ! unredacted_in_place "$1" "$f"; then continue; fi
+            if cmp -s -- "$1/$run/$f" "$f"; then
                 # Its keys are in the file already (a switch stopped before it put it back).
                 rm -f -- "$1/$run/$f" && printf '%s\n' "$f" >> "$1.done"
-            elif { [ -f "$f" ] && [ ! -L "$f" ] \
-                && [ "$(LC_ALL=C sed -E "$REDACT_SED" < "$1/$run/$f" | git hash-object --path="$f" --stdin)" = "$(git hash-object -- "$f")" ]; } \
-                || { [ "$run" = "${UR_RUN:-}" ] && [ ! -L "$f" ] && { [ ! -e "$f" ] || { [ -f "$f" ] && unredacted_cut_short "$1/$run/$f" "$f"; }; }; }; then
-                cp -p -- "$1/$run/$f" "$f" && rm -f -- "$1/$run/$f" && printf '%s\n' "$f" >> "$1.done" && echo "UNREDACTED_RESTORED $f"
+            elif [ "$(LC_ALL=C sed -E "$REDACT_SED" < "$1/$run/$f" | git hash-object --path="$f" --stdin)" = "$(git hash-object -- "$f")" ]; then
+                cp -p -- "$1/$run/$f" "$1/$run.part" && mv -f -- "$1/$run.part" "$f" \
+                    && rm -f -- "$1/$run/$f" && printf '%s\n' "$f" >> "$1.done" && echo "UNREDACTED_RESTORED $f"
             fi
         done
     done
-    # A copy cut short (stopped before its rename in): its file is still as it was.
+    # A copy cut short (stopped before its rename into place): what it was for is as it was.
     rm -f -- "$1"/*.part
     if [ -n "${UR_RUN:-}" ] && [ -d "$1/$UR_RUN" ]; then
         (cd "$1/$UR_RUN" && find . -type f) | sed 's#^\./##' | while IFS= read -r f; do echo "UNREDACTED_KEPT $f"; done
