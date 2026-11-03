@@ -1,5 +1,5 @@
-//! `arena keys limit|pause|resume`: raise or set machines' OpenRouter key caps (or take one away,
-//! `--no-cap`; or change when it starts over, `--reset`), pause keys and resume them — in place
+//! `arena keys limit|pause|resume`: raise, lower or set machines' OpenRouter key caps (or take one
+//! away, `--no-cap`; or change when it starts over, `--reset`), pause keys and resume them — in place
 //! (`PATCH /keys/{hash}`: the secret, the usage and the pod's copy of the key all stay), so a
 //! participant who hit their cap is back in seconds, with nothing to copy onto the pod. The
 //! dashboard's action menu runs these very commands (its "ai …" rows), so the CLI and the TUI
@@ -21,10 +21,12 @@ use arena_core::Config;
 /// `keys limit`'s arguments.
 #[derive(clap::Args, Debug)]
 pub(crate) struct LimitArgs {
-    /// The machines (as for `gen`), then the cap: `10` (USD) sets it, `+5` raises it by $5
+    /// The machines (as for `gen`), then the cap: `10` (USD) sets it, `+5` raises it, `-2` lowers it
     ///
     /// The amount is always the last one; with --no-cap there is none.
-    #[arg(value_name = "TARGET… USD|+USD")]
+    // `-2` is the amount, not a flag (`-$2` isn't a number to clap: `-- '-$2'`, or just `-2`).
+    // Never `allow_hyphen_values`: after a first value it takes `--yes`, `--expect` as more.
+    #[arg(value_name = "TARGET… USD|+USD|-USD", allow_negative_numbers = true)]
     args: Vec<String>,
     /// Take the cap away (give no amount): nothing then bounds what the key spends
     #[arg(long)]
@@ -152,10 +154,75 @@ async fn reconcile_resumes(api: &dyn KeyApi, naming: &Naming<'_>, attempted: &[S
     }
 }
 
-/// How old the keys a machine's plan is made again from may be ([`run`]): a listing serves the
-/// machines whose changes start within it, so a fleet-wide run re-reads every few machines, never
-/// once per machine nor once for all.
+/// How old the keys a machine is planned again from may be when its turn comes ([`run`]): one
+/// listing serves the machines that start within it, so a long batch reads them again every few
+/// machines — a machine waiting for room still sees a key added under its name meanwhile (r2 #1
+/// of the batch) — never once a machine (a resume aside) nor once for all.
 const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The keys a machine is planned again from as its turn comes ([`run`]): a listing read at most
+/// `max_age` before, read again when it's older — once, the machines that want it meanwhile then
+/// waiting for it. `None`: they couldn't be read (the next machine tries again). A zero age (a
+/// resume) reads them for each machine, side by side.
+struct Fresh<'a> {
+    api: &'a dyn KeyApi,
+    max_age: std::time::Duration,
+    last: tokio::sync::Mutex<Option<(tokio::time::Instant, std::sync::Arc<Vec<KeyInfo>>)>>,
+}
+
+impl Fresh<'_> {
+    async fn keys(&self) -> Option<std::sync::Arc<Vec<KeyInfo>>> {
+        if self.max_age.is_zero() {
+            return self.api.list_keys().await.ok().map(std::sync::Arc::new);
+        }
+        let mut last = self.last.lock().await;
+        if let Some((at, keys)) = last.as_ref() {
+            if at.elapsed() < self.max_age {
+                return Some(keys.clone());
+            }
+        }
+        let at = tokio::time::Instant::now();
+        let keys = std::sync::Arc::new(self.api.list_keys().await.ok()?);
+        *last = Some((at, keys.clone()));
+        Some(keys)
+    }
+}
+
+/// How many machines' changes are under way at once ([`run`]): a machine's is usually one key's,
+/// a read and a `PATCH` (a resume's a listing first), a few hundred ms — so a cohort's caps take
+/// a few seconds, not one round trip after another, without a burst OpenRouter would turn away.
+const AT_ONCE: usize = 8;
+
+/// Drive `futs` on this task, at most `n` at a time (they borrow the `&dyn KeyApi`, which a
+/// `JoinSet` can't spawn), and give their outputs in `futs`' order, whatever order they finish in.
+async fn at_most<F: std::future::Future>(n: usize, futs: Vec<F>) -> Vec<F::Output> {
+    use std::task::Poll;
+    let n = n.max(1);
+    let mut out: Vec<Option<F::Output>> = futs.iter().map(|_| None).collect();
+    let mut waiting = futs.into_iter().enumerate();
+    let mut running: Vec<(usize, std::pin::Pin<Box<F>>)> = Vec::new();
+    std::future::poll_fn(|cx| loop {
+        // Start the next ones in the room the finished left, and poll them at once: that sets up
+        // their own wake-ups.
+        running.extend(waiting.by_ref().take(n - running.len()).map(|(i, f)| (i, Box::pin(f))));
+        if running.is_empty() {
+            return Poll::Ready(());
+        }
+        let before = running.len();
+        running.retain_mut(|(i, f)| match f.as_mut().poll(cx) {
+            Poll::Ready(v) => {
+                out[*i] = Some(v);
+                false
+            }
+            Poll::Pending => true,
+        });
+        if running.len() == before {
+            return Poll::Pending;
+        }
+    })
+    .await;
+    out.into_iter().map(|o| o.expect("every one ran to the end")).collect()
+}
 
 /// How long a key change waits for another arena's on this box ([`keys_lock`]).
 const KEYS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -253,7 +320,7 @@ fn split_amount(mut args: Vec<String>, no_cap: bool) -> Result<(Vec<String>, Cap
         return Ok((args, CapChange::NoCap));
     }
     let Some(last) = args.pop() else {
-        anyhow::bail!("give the cap after the machines: `arena keys limit apple 10` sets it, `+5` raises it (--no-cap takes it away)");
+        anyhow::bail!("give the cap after the machines: `arena keys limit apple 10` sets it, `+5` raises it, `-2` lowers it (--no-cap takes it away)");
     };
     let change = or::parse_cap(&last).map_err(|e| anyhow::anyhow!("the last argument is the cap: {e}"))?;
     Ok((args, change))
@@ -576,45 +643,51 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
         return Ok(());
     }
     // One arena changing keys at a time on this box (another operator's command, the dashboard's
-    // runs). Then machine by machine — every one named, a skipped one too (review codex r6 #1:
-    // resumed meanwhile, a pause's "already off" would have stood) — its plan made again from
-    // keys read at most [`FRESH_FOR`] before its changes ([`moved`]: a change confirmed against
-    // keys that have moved since isn't made), and each key checked once more in the request just
-    // before its change ([`just_before`]). OpenRouter has no conditional update to close the rest.
+    // runs). Then the machines' changes go out together, [`AT_ONCE`] machines at a time. As its
+    // turn comes, every machine named — a skipped one too (review codex r6 #1: resumed meanwhile,
+    // a pause's "already off" would have stood) — is planned again from keys read at most
+    // [`FRESH_FOR`] before ([`moved`]: a change confirmed against keys that have moved since
+    // isn't made), and each key checked once more in the request just before its change
+    // ([`just_before`]); OpenRouter has no conditional update to close the rest. The lines keep
+    // the plan's order, whatever order the answers come in.
+    //
+    // A resume reads the keys right before each machine's: it can wake a rotated-out key, the one
+    // a newer key under the name replaced (review codex r7 #1; r1 #1 of the batch).
     let _lock = keys_lock(cfg).await?;
     let mut machines: Vec<&str> = rows.iter().map(|r| r.machine.as_str()).collect();
     machines.dedup();
-    let mut fresh: Option<(std::time::Instant, Vec<KeyInfo>)> = None;
+    let max_age = if verb == Verb::Resume { std::time::Duration::ZERO } else { FRESH_FOR };
+    let fresh = Fresh { api, max_age, last: tokio::sync::Mutex::new(None) };
+    let (verb_ref, naming_ref, fresh_ref, rows_ref) = (&verb, &naming, &fresh, &rows);
+    let jobs = machines.iter().map(|&m| async move {
+        let theirs: Vec<&Row> = rows_ref.iter().filter(|r| r.machine == m).collect();
+        let stale = match fresh_ref.keys().await {
+            Some(keys) => moved(verb_ref, m, &theirs, &keys, naming_ref),
+            None => Some("the keys couldn't be read again before changing them — nothing done".into()),
+        };
+        // Each row, how it came out, and whether a change was sent for it.
+        let mut out = Vec::new();
+        for r in theirs {
+            let (outcome, sent) = match (&r.key, &r.update, &stale) {
+                (_, _, Some(why)) => (Outcome::Failed(why.clone()), false),
+                (Some(k), Some(u), None) => match api.update_key(&k.hash, u, Some(&just_before(verb_ref, k))).await {
+                    Ok(()) => (Outcome::Changed, true),
+                    Err(e) => (Outcome::Failed(e.to_string()), true),
+                },
+                _ => (skipped(r), false),
+            };
+            out.push((r, outcome, sent));
+        }
+        out
+    });
     let mut done: Vec<(Row, Outcome, Option<KeyInfo>)> = Vec::new();
     // The keys a change was sent for — answered OK or not (an error may have landed).
     let mut attempted: Vec<String> = Vec::new();
-    // A resume reads the keys right before each machine's: it can wake a rotated-out key, the one
-    // a newer key under the name replaced (review codex r7 #1).
-    let fresh_for = if verb == Verb::Resume { std::time::Duration::ZERO } else { FRESH_FOR };
-    for m in machines {
-        if fresh.as_ref().is_none_or(|(at, _)| at.elapsed() >= fresh_for) {
-            let at = std::time::Instant::now();
-            fresh = api.list_keys().await.ok().map(|keys| (at, keys));
+    for (r, outcome, sent) in at_most(AT_ONCE, jobs.collect()).await.into_iter().flatten() {
+        if sent {
+            attempted.extend(r.key.as_ref().map(|k| k.hash.clone()));
         }
-        let theirs: Vec<&Row> = rows.iter().filter(|r| r.machine == m).collect();
-        let stale = match &fresh {
-            Some((_, keys)) => moved(&verb, m, &theirs, keys, &naming),
-            None => Some("the keys couldn't be read again before changing them — nothing done".into()),
-        };
-        for r in theirs {
-            let outcome = match (&r.key, &r.update, &stale) {
-                (_, _, Some(why)) => Outcome::Failed(why.clone()),
-                (Some(k), Some(u), None) => {
-                    attempted.push(k.hash.clone());
-                    match api.update_key(&k.hash, u, Some(&just_before(&verb, k))).await {
-                        Ok(()) => Outcome::Changed,
-                        Err(e) => Outcome::Failed(e.to_string()),
-                    }
-                }
-                _ => skipped(r),
-            };
-            done.push((r.clone(), outcome, None));
-        }
+        done.push((r.clone(), outcome, None));
     }
     // What OpenRouter says now: each changed key read back, and a change it didn't take said.
     let reread = api.list_keys().await.map_err(|e| e.to_string());
@@ -767,6 +840,15 @@ mod tests {
         /// an error (a timeout after it landed).
         ignored_updates: Vec<usize>,
         landed_then_failed: Vec<usize>,
+        /// How many times a key's update gives way before it's answered, by its name (none: it
+        /// isn't) — the answers then come in another order than asked, the same every run.
+        turns: Vec<(&'static str, usize)>,
+        /// How long a key's update takes, by its name, in ms (tokio's clock: a test with it
+        /// paused waits for nothing).
+        waits: Vec<(&'static str, u64)>,
+        /// The updates under way now, and the most there were at once.
+        in_flight: Mutex<usize>,
+        peak: Mutex<usize>,
     }
 
     impl Keys {
@@ -824,6 +906,28 @@ mod tests {
                 *n
             };
             self.someone_else(&self.on_update, n);
+            {
+                let mut now = self.in_flight.lock().unwrap();
+                *now += 1;
+                let mut peak = self.peak.lock().unwrap();
+                *peak = (*peak).max(*now);
+            }
+            let name = self.keys.lock().unwrap().iter().find(|k| k.hash == hash).and_then(|k| k.name.clone()).unwrap_or_default();
+            for _ in 0..self.turns.iter().find(|(n, _)| *n == name).map_or(0, |(_, t)| *t) {
+                tokio::task::yield_now().await;
+            }
+            if let Some((_, ms)) = self.waits.iter().find(|(n, _)| *n == name) {
+                tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
+            }
+            let answer = self.update_now(n, hash, u, check);
+            *self.in_flight.lock().unwrap() -= 1;
+            answer
+        }
+    }
+
+    impl Keys {
+        /// The `n`-th update, made (or not) and answered as the fake's settings say.
+        fn update_now(&self, n: usize, hash: &str, u: &KeyUpdate, check: Option<or::KeyCheck<'_>>) -> arena_core::Result<()> {
             let mut keys = self.keys.lock().unwrap();
             let k = keys.iter_mut().find(|k| k.hash == hash).expect("a listed key");
             if let Some(Err(why)) = check.map(|c| c(k)) {
@@ -968,6 +1072,19 @@ Changed 2, unchanged 0, failed 0.
             };
             assert!(e.contains(says), "{argv:?}: {e}");
         }
+        // A lowering: under the spend refused as a set is (bravo, at $4 now: $3 is under its
+        // $4.90), forced made; to $0 or less refused, forced too.
+        api.calls.lock().unwrap().clear();
+        let e = keys_cmd(&["limit", "alpha", "bravo", "-1"], &api).await.unwrap_err();
+        assert!(e.contains("devtest-bravo: a $3.00 cap is under what it has spent in all ($4.90)") && e.contains("--force"), "{e}");
+        assert!(e.contains("devtest-alpha: its $0.10 cap lowered by $1.00 is $0 or less"), "{e}");
+        let e = keys_cmd(&["limit", "alpha", "-0.1", "--force"], &api).await.unwrap_err();
+        assert!(e.contains("devtest-alpha: its $0.10 cap lowered by $0.10 is $0 or less — give the cap itself (`0`), or `arena keys pause`"), "{e}");
+        assert!(api.calls().is_empty());
+        keys_cmd(&["limit", "bravo", "-1", "--force"], &api).await.unwrap();
+        keys_cmd(&["limit", "alpha", "-0.05"], &api).await.unwrap();
+        assert_eq!(api.calls(), [r#"hb {"limit":3.0}"#, r#"ha {"limit":0.05}"#], "bravo forced to $3; alpha lowered by $0.05");
+        api.calls.lock().unwrap().clear();
         let open = Keys::with(vec![key("hn", "devtest-alpha", None, 1.0, false, "2026-10-30T10:00:00Z")]);
         let e = keys_cmd(&["limit", "alpha", "+5"], &open).await.unwrap_err();
         assert!(e.contains("devtest-alpha: it has no cap to raise"), "{e}");
@@ -1017,6 +1134,81 @@ Changed 2, unchanged 0, failed 0.
         // A $0.004 change it didn't make is seen too (review codex r1 #2: a cent's slack hid it).
         let e = keys_cmd(&["limit", "bravo", "5.004"], &api).await.unwrap_err();
         assert_eq!(e, "1 key(s) failed");
+    }
+
+    /// The batch (the human, 2026-11-03: "pretty slow, can it be batched?"): twelve keys' changes
+    /// go out together, never more than [`AT_ONCE`] under way at once; the answers come back in
+    /// another order (the first key's last) and the lines keep the machines' order; one that fails
+    /// doesn't stop the rest. The keys are read three times in all — the plan, once more as the
+    /// first machine's turn comes (fresh for the rest: tokio's clock is paused), the read-back.
+    #[tokio::test(start_paused = true)]
+    async fn the_batch_is_bounded_keeps_its_order_and_goes_on_past_a_failure() {
+        let names: Vec<&'static str> = (1..=12).map(|i| &*format!("devtest-k{i:02}").leak()).collect();
+        let keys = names.iter().enumerate().map(|(i, n)| key(&format!("h{:02}", i + 1), n, Some(1.0), 0.0, false, "2026-10-30T10:00:00Z")).collect();
+        let turns = names.iter().enumerate().map(|(i, n)| (*n, 12 - i)).collect();
+        let api = Keys { broken: vec!["devtest-k05"], turns, ..Keys::with(keys) };
+        let argv: Vec<&str> = [&["limit"][..], &names, &["+1"]].concat();
+        let out = crate::output_test::rendered(false, &[], async { keys_cmd(&argv, &api).await.map_err(anyhow::Error::msg) }).await;
+        assert_eq!(*api.peak.lock().unwrap(), AT_ONCE, "bounded, and the bound reached");
+        assert_eq!(*api.lists.lock().unwrap(), 3);
+        let calls = api.calls();
+        assert_eq!(calls.len(), 12);
+        assert!(!calls[0].starts_with("h01 "), "answered out of order: {calls:?}");
+        let mut want: Vec<String> = names
+            .iter()
+            .map(|n| if *n == "devtest-k05" { format!("✗ {n}: provider error: openrouter update key HTTP 500") } else { format!("✓ {n}: cap $1.00 → $2.00 · spent $0.00 in all") })
+            .collect();
+        want.push("Changed 11, unchanged 0, failed 1.".into());
+        want.push("Error: 1 key(s) failed".into());
+        assert_eq!(out.lines().collect::<Vec<_>>(), want);
+        assert!((1..=12).all(|i| api.key(&format!("h{i:02}")).limit == Some(if i == 5 { 1.0 } else { 2.0 })));
+    }
+
+    /// A resume reads the keys for each machine as its turn comes (r1 #1 of the batch): a key
+    /// rotated while its machine waited for room is refused before its change — never woken, to be
+    /// turned off again after.
+    #[tokio::test]
+    async fn a_resume_waiting_for_room_reads_the_keys_when_its_turn_comes() {
+        let names: Vec<&'static str> = (1..=9).map(|i| &*format!("devtest-k{i:02}").leak()).collect();
+        let mut keys: Vec<KeyInfo> = names.iter().enumerate().map(|(i, n)| key(&format!("h{:02}", i + 1), n, Some(1.0), 0.0, true, "2026-10-30T10:00:00Z")).collect();
+        keys.push(key("h09-old", "devtest-k09", Some(1.0), 0.0, true, "2026-10-01T10:00:00Z"));
+        let turns = names.iter().take(8).map(|n| (*n, 3)).collect();
+        // k09's key rotated while the first eight are under way.
+        let rotated: Meanwhile = ("h09-old", |k| {
+            k.hash = "h09-new".into();
+            k.disabled = false;
+            k.created_at = Some("2026-10-31T10:00:00Z".into());
+        });
+        let api = Keys { turns, ..Keys::with(keys).meanwhile(vec![], vec![(1, rotated)]) };
+        let argv = [&["resume"][..], &names].concat();
+        assert_eq!(keys_cmd(&argv, &api).await.unwrap_err(), "1 key(s) failed");
+        let calls = api.calls();
+        assert!(calls.len() == 8 && !calls.iter().any(|c| c.starts_with("h09 ")), "{calls:?}");
+        assert!(api.key("h09").disabled, "never woken");
+        assert_eq!(*api.peak.lock().unwrap(), AT_ONCE);
+    }
+
+    /// A cap change or a pause plans a machine again from keys at most [`FRESH_FOR`] old as its
+    /// turn comes (r2 #1 of the batch): a newer key under its name, made while it waited for room
+    /// behind the first eight, is seen — and the old key, as it was, isn't changed.
+    #[tokio::test(start_paused = true)]
+    async fn a_machine_waiting_for_room_is_planned_from_keys_read_lately() {
+        let names: Vec<&'static str> = (1..=9).map(|i| &*format!("devtest-k{i:02}").leak()).collect();
+        let mut keys: Vec<KeyInfo> = names.iter().enumerate().map(|(i, n)| key(&format!("h{:02}", i + 1), n, Some(5.0), 0.0, false, "2026-10-30T10:00:00Z")).collect();
+        keys.push(key("h09-old", "devtest-k09", Some(5.0), 0.0, true, "2026-10-01T10:00:00Z"));
+        let waits = names.iter().take(8).map(|n| (*n, 3_000)).collect();
+        let newer: Meanwhile = ("h09-old", |k| {
+            k.hash = "h09-new".into();
+            k.disabled = false;
+            k.created_at = Some("2026-10-31T10:00:00Z".into());
+        });
+        let api = Keys { waits, ..Keys::with(keys).meanwhile(vec![], vec![(1, newer)]) };
+        let argv = [&["limit"][..], &names, &["-1"]].concat();
+        assert_eq!(keys_cmd(&argv, &api).await.unwrap_err(), "1 key(s) failed");
+        let calls = api.calls();
+        assert!(calls.len() == 8 && !calls.iter().any(|c| c.starts_with("h09 ")), "{calls:?}");
+        assert_eq!(api.key("h09").limit, Some(5.0));
+        assert_eq!(*api.lists.lock().unwrap(), 4, "the plan, the first turn, k09's turn 3 s on, the read-back");
     }
 
     /// A key that moved between the listing the plan was made from and the change (review codex
@@ -1204,6 +1396,10 @@ Changed 2, unchanged 0, failed 0.
         assert!(e.contains("devtest-bravo: its key isn't the one the dashboard showed"), "{e}");
         assert!(keys_cmd(&["pause", "bravo", "--expect", "hb=5/nope/on"], &api).await.unwrap_err().contains("`hb=5/nope/on` isn't HASH=CAP/RESET/ON|OFF"));
         assert!(api.calls().is_empty());
+        // Of a batch, one key moved since it was shown: none of them is changed.
+        let e = keys_cmd(&["limit", "alpha", "bravo", "cloud", "-0.05", "--expect", "ha=0.1/never/on", "--expect", "hb=4/never/on", "--expect", "hc=5/never/on"], &api).await.unwrap_err();
+        assert!(e.contains("nothing changed") && e.contains("devtest-bravo: its key changed since the dashboard showed it") && !e.contains("alpha"), "{e}");
+        assert!(api.calls().is_empty());
         keys_cmd(&["limit", "bravo", "10", "--expect", "hb=5/never/on"], &api).await.unwrap();
         assert_eq!(api.calls(), [r#"hb {"limit":10.0}"#]);
         // Two enabled keys under one name: the dashboard showed one, a pause would act on both.
@@ -1230,6 +1426,10 @@ Changed 2, unchanged 0, failed 0.
         assert_eq!(expected(&a.expect).unwrap().iter().map(|e| e.token()).collect::<Vec<_>>(), ["ab12=5/monthly/on", "cd34=none/never/off"]);
         let (targets, change) = split_amount(a.args, a.no_cap).unwrap();
         assert_eq!((targets, change), (vec!["devtest-alpha".to_string(), "devtest-bravo".into()], CapChange::Raise(5.0)));
+        let c = full(&["keys", "limit", "devtest-alpha", "devtest-bravo", "-0.5", "--expect", "ab12=5/monthly/on", "--yes"]);
+        let crate::Cmd::Keys(crate::KeysCmd::Limit(a)) = c.cmd else { panic!() };
+        assert!(c.yes && a.expect == ["ab12=5/monthly/on"]);
+        assert_eq!(split_amount(a.args, a.no_cap).unwrap(), (vec!["devtest-alpha".to_string(), "devtest-bravo".into()], CapChange::Lower(0.5)));
         for (verb, resume) in [("pause", false), ("resume", true)] {
             let c = full(&["keys", verb, "devtest-alpha", "--expect", "ab12=5/never/off", "--yes"]);
             let (a, is_resume) = match c.cmd {
@@ -1242,6 +1442,31 @@ Changed 2, unchanged 0, failed 0.
         let c = full(&["keys", "rotate", "devtest-alpha", "--copy", "--yes"]);
         let crate::Cmd::Keys(crate::KeysCmd::Rotate { copy, dry_run, sel, limit }) = c.cmd else { panic!() };
         assert!(c.yes && copy && !dry_run && limit.is_none() && sel.targets == ["devtest-alpha"]);
+    }
+
+    /// `keys limit apple -5`: the amount, not a flag — with targets or `--all`, and the flags
+    /// after it still flags (`allow_negative_numbers`; `allow_hyphen_values` would take `--force`
+    /// and `-v` as more targets). `-$5` isn't a number to clap: after `--` it is the amount.
+    #[test]
+    fn a_lowering_is_the_amount_not_a_flag() {
+        use clap::Parser;
+        let parsed = |argv: &[&str]| -> std::result::Result<(bool, bool, Vec<String>, CapChange), String> {
+            let c = crate::Cli::try_parse_from(["arena", "keys"].iter().chain(argv).copied()).map_err(|e| e.to_string())?;
+            let crate::Cmd::Keys(crate::KeysCmd::Limit(a)) = c.cmd else { panic!("{argv:?}") };
+            let force = a.force;
+            let (targets, change) = split_amount(a.args, a.no_cap).map_err(|e| e.to_string())?;
+            Ok((c.verbose, force, targets, change))
+        };
+        let apple = || vec!["apple".to_string()];
+        assert_eq!(parsed(&["limit", "apple", "-5"]), Ok((false, false, apple(), CapChange::Lower(5.0))));
+        assert_eq!(parsed(&["limit", "apple", "bloom", "-0.5", "--force", "-v"]), Ok((true, true, vec!["apple".into(), "bloom".into()], CapChange::Lower(0.5))));
+        assert_eq!(parsed(&["limit", "--all", "-5"]), Ok((false, false, vec![], CapChange::Lower(5.0))));
+        assert_eq!(parsed(&["limit", "apple", "-0"]), Ok((false, false, apple(), CapChange::Lower(0.0))));
+        assert!(parsed(&["limit", "apple", "-$5"]).unwrap_err().contains("unexpected argument"));
+        assert_eq!(parsed(&["limit", "apple", "--", "-$5"]), Ok((false, false, apple(), CapChange::Lower(5.0))));
+        // Unchanged: a set and a raise; a flag that isn't one is still refused.
+        assert_eq!(parsed(&["limit", "apple", "+5"]), Ok((false, false, apple(), CapChange::Raise(5.0))));
+        assert!(parsed(&["limit", "apple", "-5", "--frce"]).unwrap_err().contains("unexpected argument '--frce'"));
     }
 
     /// The planner, row by row: words, skips and notes.
@@ -1262,6 +1487,8 @@ Changed 2, unchanged 0, failed 0.
                 "devtest-delta: no key (`arena keys gen devtest-delta` mints one)",
             ]
         );
+        let lower = Verb::Limit { change: Some(CapChange::Lower(0.05)), reset: None, force: false };
+        assert_eq!(lines_of(lower, &machines[..1], &fleet_keys()), ["devtest-alpha: cap $0.10 → $0.05 · spent $0.00 in all"]);
         // A paused key's cap can change; the line says it stays paused.
         let mut keys = fleet_keys();
         keys[0].disabled = true;

@@ -52,7 +52,7 @@ pub(crate) fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         Mode::UpConfirm(form) => newpod::render_confirm(f, form, &ui.offers),
         Mode::Runs { id, scroll, stop } => runs::render(f, shared, *id, *scroll, *stop, &ui.result_max),
         Mode::Quit => runs::render_quit(f, shared),
-        Mode::Input { action, scope, value } => render_input(f, shared, ui, *action, scope, value),
+        Mode::Input { action, scope, value, prefilled } => render_input(f, shared, ui, *action, scope, value, *prefilled),
         Mode::Select { value } => render_select(f, value),
         Mode::Working(msg) => render_result(f, msg, 0, &ui.result_max),
         Mode::Result(msg) => render_result(f, msg, ui.result_scroll, &ui.result_max),
