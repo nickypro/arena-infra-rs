@@ -1234,7 +1234,8 @@ participant's notice says exactly what it leaves out: "not kept: only what can b
 installed again — Python environments and installed packages (venvs, site-packages, ~/.local/lib,
 conda envs, node_modules), download and build caches (pip, uv, npm, the Hugging Face and torch hubs,
 compiled kernels, Python bytecode, matplotlib's), the VS Code server's binaries and extensions, and
-arena's moved-aside copy of the image's repo — and every .ssh folder; the rest of ~/.cache is kept"
+arena's moved-aside copy of the image's repo — and every .ssh folder and the Claude Code tokens in
+~/.clods; the rest of ~/.cache is kept"
 (`pull::REAP_NOT_KEPT` lists the paths: Hugging Face `datasets/`, W&B and any cache nobody listed
 are kept; conda's `envs/`/`pkgs/` only under a conda root in the home) — a dry-run verify (0 files
 pending), then the verified dirs **frozen**: hard-linked (same filesystem, no space) into

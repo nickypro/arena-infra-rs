@@ -234,3 +234,134 @@ Dry-run — would write the agents' notes on 1 pod(s):
 
 Preview only — run without --dry-run to execute over SSH.
 "#;
+
+// ---- clods (CLODS_DIR) -------------------------------------------------------------------
+
+/// A clods folder with two fake accounts (its tokens file at `mode`), and the config line naming it.
+#[cfg(unix)]
+fn clods_dir(tag: &str, mode: u32) -> (std::path::PathBuf, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let d = std::env::temp_dir().join(format!("arena-setup-clods-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let tokens = d.join("tokens");
+    std::fs::write(&tokens, "a@example.com -> sk-ant-oat01-FAKE-a\nb@example.com -> sk-ant-oat01-FAKE-b\n").unwrap();
+    std::fs::set_permissions(&tokens, std::fs::Permissions::from_mode(mode)).unwrap();
+    let line = format!("CLODS_DIR={}\n", d.display());
+    (d, line)
+}
+
+/// The pods' replies to clods' `bash -s`: apple's install went, bloom's didn't (no python3).
+fn clods_replies(fake: &FakeRemote) {
+    use arena_core::clods::COMMAND;
+    fake.on("10.0.0.1:22001", COMMAND, FakeReply::stdout("clods: accounts=2 default=1 changed=1\n"));
+    fake.on("10.0.0.1:22002", COMMAND, FakeReply::exit(1, "setup.sh: needs python3 (to edit the JSON config files)\n"));
+}
+
+/// Setup with clods configured: a line per pod after the setup's own, and a pod that didn't get it
+/// is a warning with its retry — the setup still succeeds.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn setup_with_clods() {
+    let remote = || {
+        let fake = FakeRemote::new();
+        fake.script("10.0.0.1:22002", [FakeReply::ok(), FakeReply::ok().after(Duration::from_secs(10))]);
+        clods_replies(&fake);
+        fake
+    };
+    let (dir, line) = clods_dir("setup", 0o600);
+    let (quiet, loud) = both("clods", &["setup", "apple", "bloom"], &fleet(), &line, remote).await;
+    let bad = "‼ [devtest-bloom] claude: clods not pushed — exit 1: setup.sh: needs python3 (to edit the JSON config files) \
+               (retry: arena pods setup --clods-only devtest-bloom)";
+    assert_eq!(
+        quiet,
+        format!(
+            "Set up devtest-apple, devtest-bloom over SSH? [y/N] y\n[devtest-apple] setup…\n[devtest-bloom] setup…\n\
+             [devtest-apple] setup ✓ (0s)\n[devtest-bloom] setup ✓ (10s)\n✓ 2 of 2 set up\n\
+             [devtest-apple] claude: clods, 2 accounts\n{bad}\n"
+        ),
+        "default:\n{quiet}"
+    );
+    let plan = format!("clods: 2 accounts from {}/tokens — every pod gets them all, a default by spread unless it has one", dir.display());
+    assert!(loud.contains(&format!("skipped\n{plan}\nProvisioning 2 pod(s)")), "-v:\n{loud}");
+    assert!(loud.ends_with(&format!("\n[devtest-apple] claude: clods, 2 accounts, default claude1 (updated)\n{bad}\n")), "-v:\n{loud}");
+    // Configured, but no tokens file there: nothing at all, as unconfigured.
+    std::fs::remove_file(dir.join("tokens")).unwrap();
+    let well = || {
+        let fake = FakeRemote::new();
+        fake.script("10.0.0.1:22002", [FakeReply::ok(), FakeReply::ok().after(Duration::from_secs(130))]);
+        fake
+    };
+    let (quiet, loud) = both("clods-none", &["setup", "apple", "bloom"], &fleet(), &line, well).await;
+    assert_eq!(quiet, QUIET_WELL.strip_prefix('\n').unwrap(), "default:\n{quiet}");
+    assert_eq!(loud, LOUD_WELL.strip_prefix('\n').unwrap(), "-v:\n{loud}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tokens file other users can read: nothing pushed, one warning with its fix; setup still ✓.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn setup_with_an_unusable_clods_tokens_file() {
+    let (dir, line) = clods_dir("unusable", 0o644);
+    let remote = || {
+        let fake = FakeRemote::new();
+        clods_replies(&fake);
+        fake
+    };
+    let (quiet, loud) = both("clods-bad", &["setup", "apple"], &fleet(), &line, remote).await;
+    let t = dir.join("tokens");
+    let why = format!("{} is mode 0644: other users of this box can get at its tokens (fix: chmod 600 {})", t.display(), t.display());
+    assert_eq!(
+        quiet,
+        format!("Set up devtest-apple over SSH? [y/N] y\n[devtest-apple] setup…\n[devtest-apple] setup ✓ (0s)\n‼ claude: clods not pushed — {why}\n"),
+        "default:\n{quiet}"
+    );
+    assert!(loud.contains(&format!("\nclods: ✗ {why} — nothing pushed\n")), "-v:\n{loud}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--clods-only`: the push alone, a line per pod; a failure fails the command (it's all the run
+/// does). The dry run says what would go; unconfigured, it says what to set.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn clods_only() {
+    let (dir, line) = clods_dir("only", 0o600);
+    let ok = || {
+        let fake = FakeRemote::new();
+        for port in [22001, 22002] {
+            fake.on(&format!("10.0.0.1:{port}"), arena_core::clods::COMMAND, FakeReply::stdout("clods: accounts=2 default=2 changed=0\n"));
+        }
+        fake
+    };
+    let (quiet, loud) = both("clods-only", &["setup", "--clods-only", "apple", "bloom"], &fleet(), &line, ok).await;
+    assert_eq!(
+        quiet,
+        "Push clods (2 accounts) to devtest-apple, devtest-bloom, nothing else? [y/N] y\n\
+         [devtest-apple] claude: clods, 2 accounts\n[devtest-bloom] claude: clods, 2 accounts\n✓ clods on 2 of 2 pods\n",
+        "default:\n{quiet}"
+    );
+    assert_eq!(
+        loud,
+        "Will push clods (2 accounts, defaults spread) to 2 pod(s), nothing else: devtest-apple, devtest-bloom\nProceed? [y/N] y\n\
+         [devtest-apple] claude: clods, 2 accounts, default claude2 (unchanged)\n\
+         [devtest-bloom] claude: clods, 2 accounts, default claude2 (unchanged)\n",
+        "-v:\n{loud}"
+    );
+    let bad = || {
+        let fake = FakeRemote::new();
+        clods_replies(&fake);
+        fake
+    };
+    let (quiet, _) = both("clods-only-bad", &["setup", "--clods-only", "apple", "bloom"], &fleet(), &line, bad).await;
+    assert!(quiet.ends_with("(retry: arena pods setup --clods-only devtest-bloom)\nError: 1 pod(s) didn't get clods\n"), "default:\n{quiet}");
+    let (quiet, loud) = both("clods-only-dry", &["setup", "--clods-only", "apple", "--dry-run"], &fleet(), &line, FakeRemote::new).await;
+    assert_eq!(quiet, "Would push clods (2 accounts, defaults spread) to devtest-apple\n", "default:\n{quiet}");
+    assert!(loud.starts_with("Would push clods (2 accounts, defaults spread) to devtest-apple\nclods: 2 accounts from "), "-v:\n{loud}");
+    let (quiet, _) = both("clods-only-unset", &["setup", "--clods-only", "apple"], &fleet(), "", FakeRemote::new).await;
+    assert_eq!(
+        quiet,
+        "Error: clods isn't configured: set CLODS_DIR to the folder holding your clods `tokens` (e.g. ~/.clods), then run this again\n",
+        "default:\n{quiet}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

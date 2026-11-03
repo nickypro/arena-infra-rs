@@ -123,6 +123,15 @@ pub(crate) enum Cmd {
     #[command(verbatim_doc_comment)]
     #[command(subcommand, infer_subcommands = true)]
     Claude(crate::claude::ClaudeCmd),
+    /// Every Claude Code account on each pod, as clods profiles (clodN)
+    ///
+    /// With CLODS_DIR set to the folder holding clods' `tokens`, setup, `up` and replace put
+    /// every account on each pod they set up, a default by spread unless it has one;
+    /// `pods setup --clods-only` pushes to running pods. `install` writes the scripts this
+    /// build carries into a clods folder.
+    #[command(verbatim_doc_comment)]
+    #[command(subcommand, infer_subcommands = true)]
+    Clods(crate::clods::ClodsCmd),
     /// RunPod's GPU types as before (`offers runpod`: per tier)
     ///
     /// Live from RunPod where available, else the local presets. Hidden: `offers` covers it.
@@ -672,7 +681,8 @@ pub(crate) enum PodCmd {
     /// Per pod: deploy key + GitHub SSH config, authorized keys, the ARENA repo (fetch the
     /// default branch, update the current one), submodules, ~/.name, the HF token, a VS Code server
     /// warm-up, then API keys if keys/*_api_keys.csv exist and each pod's own Claude Code account
-    /// (`arena claude`: the least-loaded one if it has none). With a
+    /// (`arena claude`: the least-loaded one if it has none), and with CLODS_DIR every clods
+    /// account (--clods-only does just that). With a
     /// /workspace volume the repo is moved onto it, so a restart keeps the work. Then the agents'
     /// notes (which Python to use, in ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md; AGENT_NOTES=0
     /// turns them off): --notes-only does just that. Confirms first; no targets = every pod.
@@ -700,6 +710,9 @@ pub(crate) enum PodCmd {
         /// Only the agents' notes (which Python to use) and uv on PATH, for running machines
         #[arg(long, conflicts_with_all = ["force", "hf_token", "cc_token", "zsh_install", "no_vscode", "timeout"])]
         notes_only: bool,
+        /// Only clods: every account in CLODS_DIR's tokens to each pod, for running machines
+        #[arg(long, conflicts_with_all = ["force", "hf_token", "cc_token", "zsh_install", "no_vscode", "timeout", "notes_only"])]
+        clods_only: bool,
         /// Per-pod budget in seconds for the main step (default 300; Hetzner VMs 1800)
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=arena_core::setup::MAX_STEP_TIMEOUT_SECS))]
         timeout: Option<u64>,

@@ -720,6 +720,8 @@ pub const SECRET_EXCLUDES: &[&str] = &[
     ".huggingface/",
     ".kube/",
     ".wandb/",
+    // clods' profiles: every Claude Code account's token (`crate::clods`)
+    ".clods/",
     // git configs hold remote URLs (which can embed tokens) and credential helpers — git
     // treats a missing config as all defaults; also the nested clones `pods backup` folded aside
     ".git/config",
@@ -2348,6 +2350,10 @@ mod tests {
         (".claude.json", false),
         (".claude/.credentials.json", false),
         (".claude/projects/x/session.jsonl", false),
+        (".clods/profiles/claude1/settings.json", false),
+        (".clods/profiles/claude1/.claude.json", false),
+        (".clods/tokens", false),
+        (".claude-profiles-install-0a1b2c3d.sh", false),
         (".ssh/id_ed25519", false),
         (".config/gh/hosts.yml", false),
         (".config/wandb/settings", false),

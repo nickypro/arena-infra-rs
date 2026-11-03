@@ -158,6 +158,7 @@ const SETTABLE_KEYS: &[(&str, bool)] = &[
     ("WANDB_API_KEY", true), // optional: broadcast to pods for W&B (`pods test --keys` checks it)
     ("CLAUDE_TOKENS_FILE", false), // Claude Code accounts, one per machine (`arena claude`)
     ("CLAUDE_CODE_OAUTH_TOKEN", true), // one Claude Code account for every pod (without CLAUDE_TOKENS_FILE)
+    ("CLODS_DIR", false), // the clods folder: every account in its tokens to each pod (`arena clods`)
     ("OPENROUTER_PROVISIONING_KEY", true), // mints per-machine OpenRouter keys (`arena keys`)
     ("OPENROUTER_WORKSPACE", false), // the OpenRouter workspace arena's keys live in (id or slug)
     ("ARENA_START_DATE", false),
@@ -1272,6 +1273,7 @@ pub(crate) fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<S
 
     println!("\nClaude Code accounts (optional, `arena claude`):");
     crate::claude::config_check_rows(cfg, &mut missing).iter().for_each(|l| println!("{l}"));
+    println!("{}", crate::clods::config_check_row(cfg, &mut missing));
 
     println!("\nEvals / model access (optional, `pods copy-keys` / `arena keys`):");
     cfg_row(&mut out, cfg, &mut missing, "HF_TOKEN", false, true); // broadcast for gated repos (Llama 3 …)
