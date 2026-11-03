@@ -37,16 +37,24 @@ flowchart LR
 
 ### Just want some GPU pods?
 
-Pods up, SSH in, pods down: no proxy, no backups, no day branches.
+Pods up, SSH in, pods down: no proxy, no backups, no day branches. Install the latest release
+(Linux or macOS; on Windows, in [WSL](https://learn.microsoft.com/windows/wsl/install)):
 
 ```bash
-git clone https://github.com/nickypro/arena-infra-rs.git && cd arena-infra-rs
-cargo build --release                              # target/release/arena
-alias arena="$PWD/target/release/arena --config $PWD/config.env"
+mkdir -p ~/arena && cd ~/arena                     # arena, arena-tui and config.env, side by side
+t=$(uname -m | sed s/arm64/aarch64/)-$(uname -s | sed 's/Linux/unknown-linux-gnu/;s/Darwin/apple-darwin/')
+for f in arena-$t arena-tui-$t SHA256SUMS config.env.example; do
+  curl -fsSLO https://github.com/nickypro/arena-infra-rs/releases/latest/download/$f || break; done
+c=shasum; command -v $c >/dev/null || c=sha256sum  # check them against SHA256SUMS
+grep -e "-$t\$" -e " config.env.example\$" SHA256SUMS | $c -c &&
+  mv arena-$t arena && mv arena-tui-$t arena-tui && chmod +x arena arena-tui && ./arena --version
+alias arena="$PWD/arena --config $PWD/config.env"
 ssh-keygen -t ed25519 -N "" -f ~/.ssh/arena_key    # the key your pods will let in
 cp config.env.example config.env                   # then set the four keys below
 arena config set RUNPOD_API_KEY                    # prompts; never echoes the value
 ```
+
+Or [build it from source](#1-install).
 
 | Key in `config.env` | Set it to |
 | --- | --- |
@@ -132,18 +140,29 @@ unambiguous prefix (`arena po li` = `arena pods list`). Pods are named
 
 The cohort route, in order. Only want pods? [The TL;DR](#just-want-some-gpu-pods) is all of it.
 
-### 1. Build
+### 1. Install
+
+Every release has `arena` and `arena-tui` for Linux (x86_64 and arm64; glibc 2.35 or newer, as
+on Ubuntu 22.04) and for macOS 11 or newer (Apple silicon and Intel). This picks yours, checks it
+against the release's `SHA256SUMS`, and puts both binaries and `config.env.example` in `~/arena`:
 
 ```bash
-git clone https://github.com/nickypro/arena-infra-rs.git && cd arena-infra-rs
-cargo build --release      # target/release/arena and target/release/arena-tui
+mkdir -p ~/arena && cd ~/arena
+t=$(uname -m | sed s/arm64/aarch64/)-$(uname -s | sed 's/Linux/unknown-linux-gnu/;s/Darwin/apple-darwin/')
+for f in arena-$t arena-tui-$t SHA256SUMS config.env.example; do
+  curl -fsSLO https://github.com/nickypro/arena-infra-rs/releases/latest/download/$f || break; done
+c=shasum; command -v $c >/dev/null || c=sha256sum
+grep -e "-$t\$" -e " config.env.example\$" SHA256SUMS | $c -c &&
+  mv arena-$t arena && mv arena-tui-$t arena-tui && chmod +x arena arena-tui && ./arena --version
 ```
 
-Keep the two binaries side by side on your `PATH`: `arena tui` starts the `arena-tui` next to it.
+Put `~/arena` on your `PATH`, or alias `arena` as the TL;DR does: `arena tui` starts the
+`arena-tui` beside it. On Windows, run the block in [WSL](https://learn.microsoft.com/windows/wsl/install)
+(Ubuntu): the Linux binaries work there. The control box's side (cron backups, the proxy) is
+tested on Linux only.
 
-Or skip the build on Linux (x86_64 or arm64): download `arena-<platform>` and
-`arena-tui-<platform>` from the [latest release](https://github.com/nickypro/arena-infra-rs/releases/latest),
-check their build provenance (each must print the same run):
+To check the build provenance as well (`arena update` does it by itself), each file must print
+the same run:
 
 ```bash
 gh attestation verify <file> --repo nickypro/arena-infra-rs --deny-self-hosted-runners \
@@ -151,7 +170,12 @@ gh attestation verify <file> --repo nickypro/arena-infra-rs --deny-self-hosted-r
   --source-ref refs/heads/master --format json --jq '.[0].verificationResult.signature.certificate.runInvocationURI'
 ```
 
-and make them executable, named `arena` and `arena-tui`.
+Or build from source (Rust 1.96), and keep the two binaries side by side:
+
+```bash
+git clone https://github.com/nickypro/arena-infra-rs.git && cd arena-infra-rs
+cargo build --release      # target/release/arena and target/release/arena-tui
+```
 
 Later, `arena update` shows what changed since your build (anything you must do first) and
 installs the newest release in place, keeping `arena.prev`, once it has verified that this
@@ -538,7 +562,7 @@ cargo test --release     # everything offline: pure planners, fake providers, Fa
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-CI runs the same gate on every push. The opt-in [live smoke test](docs/REFERENCE.md#the-live-smoke-test)
+CI runs the same gate on every push, on Linux and on macOS. The opt-in [live smoke test](docs/REFERENCE.md#the-live-smoke-test)
 creates, checks and terminates one cheap pod — run it before each cohort.
 
 <details>

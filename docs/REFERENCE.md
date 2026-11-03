@@ -10,6 +10,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
 - [Overview](#overview)
 - [Safety model (this is developed against live production)](#safety-model-this-is-developed-against-live-production)
 - [Running arena](#running-arena)
+  - [Installing](#installing)
   - [From a checkout](#from-a-checkout)
   - [`update`: installing a newer release](#update-installing-a-newer-release)
   - [Output: `-v` and `--color`](#output--v-and---color)
@@ -108,6 +109,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
 
 ## Running arena
 
+### Installing
+
+Each release has `arena` and `arena-tui` for Linux (x86_64 and arm64, glibc 2.35 or newer) and
+macOS 11 or newer (Apple silicon and Intel). [The README's install block](../README.md#1-install)
+picks this platform's pair by `uname`, checks it against the release's `SHA256SUMS`, and puts it
+in `~/arena` with `config.env.example`. On Windows, run the Linux pair in WSL. Keep `arena-tui`
+beside `arena`: `arena tui` starts the one next to it, and `update` replaces both there. From
+source: `cargo build --release` (Rust 1.96) builds both into `target/release/`.
+
 ### From a checkout
 
 ```bash
@@ -135,7 +145,10 @@ cargo run -p arena-cli -- --config ./config.env pods list
 
 Every green master commit is published as a GitHub release (`.github/workflows/release.yml`):
 `arena` and `arena-tui` for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, built
-on Ubuntu 22.04 (glibc 2.35 or newer), with `CHANGELOG.md` and `SHA256SUMS`. The tag is the
+on Ubuntu 22.04 (glibc 2.35 or newer), and for `aarch64-apple-darwin` and `x86_64-apple-darwin`
+(macOS 11 or newer), with `CHANGELOG.md`, `config.env.example` and `SHA256SUMS`. Each binary is
+named after its Rust target (`arena-aarch64-apple-darwin`), and `update` downloads the pair
+named after the target it was built for. The tag is the
 version, `v<base>.YYMMDD.HHMM`: the base (`BASE` in `crates/cli/build.rs`, e.g. `2.3`) and the
 commit's time in UTC. `arena --version` prints it with the commit: `arena 2.3.261030.1500
 (5274b7a1c2)`. The base goes up a minor (2.0 → 2.1) when a command, flag or `--json` shape changes in a way a script or
@@ -203,7 +216,7 @@ sudo arena update        # where root runs arena from someone else's ~/.cargo/bi
   one's mode and owner, and lands by rename, so the path always holds a whole binary.
   Roll back with `mv -f arena.prev arena && mv -f arena-tui.prev arena-tui`.
 - **Afterwards:** it lists the `arena-tui` dashboards still running the replaced build, to
-  restart. Cron picks the new `arena` up on its next run.
+  restart (Linux: read from `/proc`; macOS has none, so it lists none there). Cron picks the new `arena` up on its next run.
 - It needs no config and no GitHub login (the API allows 60 unauthenticated requests an hour;
   an update makes 2: the latest release, and its attestation).
 
