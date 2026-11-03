@@ -14,9 +14,7 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 # version in Cargo.lock (yanking is how a broken or unsafe release is withdrawn).
 yanked = "deny"
 # Advisories to ignore, each with why. Remove an entry once what it names is gone.
-ignore = [
-    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, with no fixed version; a proc-macro (compile time only) that ratatui 0.29 uses. ratatui 0.30 drops it: remove this with that bump" },
-]
+ignore = []
 
 [licenses]
 # The licences the tree has today (`cargo deny list -l license`), all permissive: a new one fails
