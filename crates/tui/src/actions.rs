@@ -796,13 +796,11 @@ mod tests {
     #[tokio::test]
     async fn the_ai_key_rows_run_the_clis_keys_commands() {
         use arena_core::openrouter::KeyInfo;
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("arena-tui-aikey-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let stub = dir.join("arena");
-        std::fs::write(&stub, "#!/bin/sh\necho \"args: $*\"\n").unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        arena_core::remote::write_test_script(&stub, "#!/bin/sh\necho \"args: $*\"\n").unwrap();
         let key = |name: &str, spent: f64, reset: Option<&str>, off: bool| KeyInfo {
             hash: format!("h{}", name.replace('-', "")),
             name: Some(name.into()),

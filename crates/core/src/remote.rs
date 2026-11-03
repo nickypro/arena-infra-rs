@@ -1236,30 +1236,28 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn timed_out_child_is_killed_not_leaked() {
-        let pidfile = std::env::temp_dir().join(format!("arena-remote-kill-{}", std::process::id()));
-        let _ = std::fs::remove_file(&pidfile);
+        // The child is found by a command line only it has (`sh -c 'exec sleep …'`, then that
+        // `sleep`) — never by a pid it writes: on a busy box the timeout came before it had, or
+        // after the redirect made the file and before the write (an empty pid: `/proc//stat`).
+        let mark = format!("sleep 30.{}", std::process::id());
         let mut c = child("sh");
-        c.arg("-c").arg(format!("echo $$ > '{}'; exec sleep 30", pidfile.display()));
+        c.arg("-c").arg(format!("exec {mark}"));
         let started = std::time::Instant::now();
         let err = output_within(c, "sh", Some(Duration::from_millis(500))).await.unwrap_err();
         assert!(matches!(err, Error::Timeout { .. }), "{err}");
         assert!(started.elapsed() < Duration::from_secs(10), "returned at the timeout, not at exit");
 
-        let pid = std::fs::read_to_string(&pidfile).expect("child wrote its pid").trim().to_string();
-        let _ = std::fs::remove_file(&pidfile);
         // Killed => gone (or a zombie awaiting tokio's reaper), never still `sleep`ing.
+        let running = || -> Vec<String> {
+            let pids = std::fs::read_dir("/proc").unwrap().flatten().filter_map(|e| e.file_name().to_str().filter(|n| n.bytes().all(|b| b.is_ascii_digit())).map(String::from));
+            pids.filter(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| String::from_utf8_lossy(&c).replace('\0', " ").contains(&mark)))
+                .filter(|pid| !matches!(proc_state(pid).as_deref(), None | Some("Z") | Some("X")))
+                .collect()
+        };
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                .ok()
-                .and_then(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().next()).map(String::from));
-            match state.as_deref() {
-                None | Some("Z") | Some("X") => break,
-                Some(s) if std::time::Instant::now() >= deadline => {
-                    panic!("child {pid} still alive (state {s}) after its timeout")
-                }
-                Some(_) => std::thread::sleep(Duration::from_millis(20)),
-            }
+        while let [pid, ..] = running().as_slice() {
+            assert!(std::time::Instant::now() < deadline, "child {pid} still alive after its timeout");
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -1355,20 +1353,29 @@ mod tests {
         // It answered and exited, leaving a process behind that ignores TERM (review ai-review
         // codex #5) — its pipes let go, or held: KILLed after the grace, before the call returns,
         // the answer whole either way.
+        // How long the call took after the script's last line (its `date`, into `ended`): the
+        // grace is what's measured, never the spawn and the script, which a busy box makes slow.
+        let ended = dir.join("ended");
+        let since_end = |ended: &std::path::Path| {
+            let ns: u128 = std::fs::read_to_string(ended).unwrap().trim().parse().unwrap();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            Duration::from_nanos(u64::try_from(now.saturating_sub(ns)).unwrap())
+        };
         for (name, redirect) in [("leaves", "> /dev/null 2>&1 < /dev/null"), ("holds", "")] {
             let _ = std::fs::remove_file(&left);
-            let leaves = script(name, &format!("(trap '' TERM; exec sleep 60) {redirect} & echo $! > '{}'\necho answered", left.display()));
-            let started = std::time::Instant::now();
+            let leaves =
+                script(name, &format!("(trap '' TERM; exec sleep 60) {redirect} & echo $! > '{}'\necho answered\ndate +%s%N > '{}'", left.display(), ended.display()));
             let out = run_it(leaves, Some(Duration::from_secs(10))).await.unwrap();
             assert_eq!((out.success, out.stdout.as_str()), (true, "answered\n"), "{name}");
-            assert!(started.elapsed() < TERM_GRACE + Duration::from_secs(3), "{name}: {:?}", started.elapsed());
+            let took = since_end(&ended);
+            assert!(took < TERM_GRACE + Duration::from_secs(3), "{name}: {took:?}");
             assert_dies(&pid_of(&left), Duration::from_millis(500), &format!("what the finished AI left ({name})")).await;
         }
         // Nothing left: no grace waited.
-        let quick = script("quick", "echo answered");
-        let started = std::time::Instant::now();
+        let quick = script("quick", &format!("echo answered\ndate +%s%N > '{}'", ended.display()));
         assert_eq!(run_it(quick, Some(Duration::from_secs(10))).await.unwrap().stdout, "answered\n");
-        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        let took = since_end(&ended);
+        assert!(took < TERM_GRACE, "{took:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1509,7 +1516,13 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             let pids: Vec<String> = ["plain", "stubborn", "left", "lone"].iter().map(|n| std::fs::read_to_string(pid_at(n)).unwrap().trim().to_string()).collect();
-            assert_eq!(tracked().0.len(), 3, "{:?}", tracked());
+            // All three tracked: a child can write its pid before its call, which a busy box runs
+            // later, has tracked it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while tracked().0.len() != 3 || tracked().1 != 0 {
+                assert!(std::time::Instant::now() < deadline, "{:?}", tracked());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             let started = std::time::Instant::now();
             stop_all_children().await;
             let took = started.elapsed();

@@ -476,7 +476,18 @@ fn the_script_lists_processes_and_sweep_folders() {
     // Two processes in sessions of their own: a dormant job, and a login shell waiting on input.
     let mut sleeper = Command::new("setsid").args(["sleep", "37"]).stdin(Stdio::null()).spawn().unwrap();
     let mut shell = Command::new("setsid").args(["bash", "-c", "exec -a -bash cat"]).stdin(Stdio::piped()).spawn().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // And one in this test's session, which the probe shares, that isn't the probe's ancestor: a
+    // command line no other process has.
+    let mine = format!("sleep 39.{}", std::process::id());
+    let mut session_mate = Command::new("sh").args(["-c", &format!("exec {mine}")]).stdin(Stdio::null()).spawn().unwrap();
+    // Each one probed once it runs what it's listed by (`setsid` and `sh` exec in place).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    for (c, cmdline) in [(&sleeper, "sleep 37 ".to_string()), (&shell, "-bash ".into()), (&session_mate, format!("{mine} "))] {
+        while std::fs::read(format!("/proc/{}/cmdline", c.id())).map(|b| String::from_utf8_lossy(&b).replace('\0', " ")).ok().as_deref() != Some(cmdline.as_str()) {
+            assert!(std::time::Instant::now() < deadline, "{cmdline:?} never started");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     let out = Command::new("env")
         .arg("-i")
         .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
@@ -487,10 +498,10 @@ fn the_script_lists_processes_and_sweep_folders() {
         .args(["sh", "-c", PROBE_SCRIPT, "arena-idle-probe", "T3ST", "-900", "", "runpod", "203.0.113.9 50000 10.0.0.2 22"])
         .output()
         .unwrap();
-    let _ = sleeper.kill();
-    let _ = shell.kill();
-    let _ = sleeper.wait();
-    let _ = shell.wait();
+    for c in [&mut sleeper, &mut shell, &mut session_mate] {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
     let _ = std::fs::remove_dir_all(&root);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let f = parse_probe(&stdout, "T3ST", Since::Back(900)).unwrap_or_else(|e| panic!("{e:?}\n{stdout}"));
@@ -504,10 +515,10 @@ fn the_script_lists_processes_and_sweep_folders() {
     let find = |cmdline: &str| procs.iter().find(|p| p.hash == cksum(cmdline.as_bytes())).copied();
     assert_eq!(find("sleep 37 ").map(|p| p.idle), Some(false), "the dormant job, a process of its own:\n{stdout}");
     assert_eq!(find("-bash ").map(|p| p.idle), Some(true), "a login shell, idle by itself:\n{stdout}");
-    // This test's own process (the probe's session) isn't listed.
-    let me = std::fs::read("/proc/self/cmdline").unwrap();
-    let me: String = String::from_utf8_lossy(&me).replace('\0', " ");
-    assert!(find(&me).is_none(), "the probe's own session is listed:\n{stdout}");
+    // The probe's own session isn't listed: told by a process of it no other has the command line
+    // of. (This test's own command line isn't: a copy of this test binary in another session, two
+    // test runs side by side, has it too and is listed — even its start, in clock ticks, can match.)
+    assert!(find(&format!("{mine} ")).is_none(), "a process of the probe's session is listed:\n{stdout}");
 }
 
 /// Review RR (robustness): on a VM with utmp (Hetzner), Ubuntu's tmux (linked with

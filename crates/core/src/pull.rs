@@ -2166,8 +2166,15 @@ mod tests {
         };
         let home = home_of("pod-a", "day 1\n");
         let repo = home.join("ARENA_materials");
+        // No auto maintenance (git 2.47+ leaves one detached after a commit): its
+        // `objects/maintenance.lock` could vanish under the pull's rsync.
         let git = |args: &[&str]| {
-            let o = std::process::Command::new("git").current_dir(&repo).args(args).output().unwrap();
+            let o = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
+                .args(args)
+                .output()
+                .unwrap();
             assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
             String::from_utf8_lossy(&o.stdout).trim().to_string()
         };

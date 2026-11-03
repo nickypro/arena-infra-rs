@@ -1728,12 +1728,9 @@ mod tests {
         let d = dir.display().to_string();
         let file = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
         let put = |f: &str, text: &str| std::fs::write(dir.join(f), text).unwrap();
-        let stub = |name: &str, body: &str| {
-            use std::os::unix::fs::PermissionsExt;
-            let p = dir.join("bin").join(name);
-            std::fs::write(&p, format!("#!/bin/sh\n{}\n", body.replace("$D", &d))).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        };
+        // Written by `write_test_script`: written here, a stub another thread's fork held open
+        // failed to run ("Text file busy"), and a step of the run below with it.
+        let stub = |name: &str, body: &str| crate::remote::write_test_script(dir.join("bin").join(name), format!("#!/bin/sh\n{}\n", body.replace("$D", &d))).unwrap();
         // Stand-ins: `hostname` prints (with an argument: sets) the running name, $D/name;
         // `hostnamectl set-hostname X` sets it and the static one, $D/etc-hostname, and logs.
         let hostname_ok = r#"if [ $# -gt 0 ]; then echo "$1" > $D/name; else cat $D/name; fi"#;

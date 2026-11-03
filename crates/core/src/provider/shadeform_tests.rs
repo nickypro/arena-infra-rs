@@ -499,9 +499,7 @@ async fn placement_stops_on_an_unsure_create() {
 /// after sending is unsure.
 #[tokio::test]
 async fn create_send_errors() {
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = closed.local_addr().unwrap();
-    drop(closed);
+    let (_held, addr) = crate::http::test_server::refusing();
     let e = client().post(format!("http://{addr}/instances/create")).send().await.unwrap_err();
     let plain = create_send_error(e).unwrap();
     assert!(matches!(plain, Error::Http(_)) && crate::retry::is_retryable(&plain), "{plain}");

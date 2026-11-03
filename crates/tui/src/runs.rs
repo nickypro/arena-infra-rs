@@ -1166,9 +1166,17 @@ pub(crate) mod tests {
     /// Only the newest `keep` output files stay — but never one a run is still writing: its
     /// child holds a shared lock on it (review ai-review codex #4, round 2 #5: a long `up`'s file
     /// went once enough jobs/logs runs came after it; by modification time alone, an earlier
-    /// dashboard's quiet run could lose its file).
+    /// dashboard's quiet run could lose its file). The run is a child here too (`flock -s`): a
+    /// lock this process took outlived its `drop` in any child another test's thread had forked
+    /// meanwhile (until that child's exec), so on a busy box the ended run's file stayed.
     #[test]
     fn old_run_files_are_pruned_but_never_one_being_written() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        if !Command::new("sh").args(["-c", "command -v flock"]).output().is_ok_and(|o| o.status.success()) {
+            eprintln!("flock missing — skipping");
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("arena-tui-prune-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1176,14 +1184,25 @@ pub(crate) mod tests {
             std::fs::write(dir.join(format!("{t}-up-1.log")), "").unwrap();
         }
         std::fs::write(dir.join("keep.txt"), "").unwrap();
-        // A run still writing 101 (its child's descriptor, locked as `start` locks it).
-        let writing = std::fs::OpenOptions::new().append(true).open(dir.join("101-up-1.log")).unwrap();
-        writing.lock_shared().unwrap();
+        // A run still writing 101: a child with a shared lock on it, as `start`'s run has. It says
+        // when it has the lock, and ends when its stdin does.
+        let mut writing = Command::new("flock")
+            .arg("-s")
+            .arg(dir.join("101-up-1.log"))
+            .args(["-c", "echo locked; exec cat"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut said = String::new();
+        std::io::BufReader::new(writing.stdout.take().unwrap()).read_line(&mut said).unwrap();
+        assert_eq!(said, "locked\n");
         prune(&dir, 2);
         let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         left.sort();
         assert_eq!(left, ["101-up-1.log", "104-up-1.log", "105-up-1.log", "keep.txt"], "101's run is going");
-        drop(writing);
+        drop(writing.stdin.take());
+        assert!(writing.wait().unwrap().success());
         prune(&dir, 2);
         assert!(!dir.join("101-up-1.log").exists(), "its run ended: it goes too");
         let _ = std::fs::remove_dir_all(&dir);

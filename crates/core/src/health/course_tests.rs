@@ -711,9 +711,12 @@ fn answer_and_close(mut conn: std::net::TcpStream, answer: &str) {
     while matches!(conn.read(&mut buf), Ok(n) if n > 0) {}
 }
 
+/// No auto maintenance (git 2.47+ leaves one detached after a commit): its
+/// `.git/objects/maintenance.lock`, there for the "before" listing and gone by the "after", read as
+/// the run changing `$HOME`.
 fn git(dir: &std::path::Path, args: &[&str]) {
     let ok = std::process::Command::new("git")
-        .args(["-c", "user.email=t@t", "-c", "user.name=t", "-c", "init.defaultBranch=main"])
+        .args(["-c", "user.email=t@t", "-c", "user.name=t", "-c", "init.defaultBranch=main", "-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(args)
         .current_dir(dir)
         .output()
@@ -810,7 +813,6 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
     std::fs::create_dir_all(gitdir.join("rebase-merge")).unwrap();
     let before = listing(&home);
     let origin_before = listing(&origin);
-    let tmp_before = std::fs::read_dir("/tmp").map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("arena_deep.")).count()).unwrap_or(0);
     let args = CheckArgs {
         repo: repo.display().to_string(),
         envs: vec!["~/nope".into(), env.display().to_string()],
@@ -846,7 +848,6 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
     let origin_after = listing(&origin);
     let sentinel_after = listing(&sentinel);
     let traced: Vec<&str> = ["git-trace.log", "git-trace-packet.log", "git-trace2.json"].into_iter().filter(|f| root.join(f).exists()).collect();
-    let tmp_after = std::fs::read_dir("/tmp").map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("arena_deep.")).count()).unwrap_or(0);
     let requests = seen.lock().unwrap().clone();
     let ssh_calls = std::fs::read_to_string(&ssh_log).unwrap_or_default();
     let _ = std::fs::remove_dir_all(&root);
@@ -868,7 +869,11 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
     assert_eq!(origin_before, origin_after, "the dry run sent something");
     assert_eq!(sentinel_before, sentinel_after, "an inherited GIT_* variable sent a write elsewhere");
     assert!(traced.is_empty(), "inherited git tracing wrote {traced:?}");
-    assert!(tmp_after <= tmp_before, "a temp dir left behind");
+    // The run's own temp dir is gone: the one the push's ssh was handed its known_hosts in (never a
+    // count of /tmp's `arena_deep.*`, which other test processes running at the same time change).
+    let work = ssh_calls.split_whitespace().find_map(|w| w.strip_prefix("UserKnownHostsFile=")?.strip_suffix("/known_hosts"));
+    let work = work.filter(|w| w.starts_with("/tmp/arena_deep.")).unwrap_or_else(|| panic!("no temp dir in {ssh_calls:?}"));
+    assert!(!std::path::Path::new(work).exists(), "a temp dir left behind: {work}");
     let f = parse_deep(&stdout);
     assert!(f.started && f.complete, "{stdout}\n{stderr}");
     assert_eq!(f.identity.as_ref().and_then(|i| i.name.as_deref()), Some("devtest-apple"));

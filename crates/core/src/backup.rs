@@ -1182,6 +1182,14 @@ pub fn bounded_sh(script: &str, name: &str, secs: u64, kill_after: u64, stopped:
     format!("sh -c {} {} {}", login_quote(&wrapper), login_quote(name), login_quote(script))
 }
 
+/// For a test's stand-in run under [`bounded_sh`] (a hook, a stub `git` or `cp`): the bound goes
+/// off here, now — an ALRM to `timeout`, which leads the process group it made and takes an ALRM as
+/// its own timer's — so its TERM lands at this point of the run however slowly a busy box got here.
+/// A short bound raced it (the TERM came before the stand-in was reached, or the KILL before the
+/// traps were done); with this, the tests' bounds are long and never go off by themselves.
+#[cfg(test)]
+pub(crate) const BOUND_NOW_SH: &str = "(read -r l < /proc/$$/stat; set -- ${l##*) }; kill -ALRM \"$3\")";
+
 /// `s` single-quoted for whichever login shell sshd hands a command to: the POSIX ones (sh, bash,
 /// zsh) and fish read it the same. Inside single quotes fish takes `\\` and `\'` as escapes, where
 /// a POSIX shell takes nothing — so a script with a backslash in it (the redaction's sed has many)
@@ -4894,8 +4902,8 @@ done
     /// cover a timeout, but arena's timeout kills only the local ssh client, and a non-pty
     /// session's shell is usually never signalled: the switch ran on, and could land after arena
     /// had reported a timeout and released the pod's lock. Now it bounds itself on the pod — under
-    /// `timeout`, TERM to its process group (here after 2 s, at a checkout that hangs): exit 124,
-    /// said, the real keys back, the pod on its branch. Under bash, zsh (the pods' login shell,
+    /// `timeout`, TERM to its process group (here at a checkout that hangs: [`BOUND_NOW_SH`]): exit
+    /// 124, said, the real keys back, the pod on its branch. Under bash, zsh (the pods' login shell,
     /// which `-c`s the command: sshd) and fish, so it starts the switch's script under `sh`: the
     /// real command switches and switches back, the keys with it. A pod whose `timeout` doesn't
     /// work runs it unbounded, as before.
@@ -4918,21 +4926,23 @@ done
             crate::remote::write_test_script(bin.join(name), text).unwrap();
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
         };
+        // The hang: the bound goes off in it; one the TERM didn't stop would mark `outlived`.
+        let outlived = s.base.join("outlived");
         let hang = stand_in(
             "bin-hang",
             &format!(
-                "git\n#!/bin/sh\ncase \"$*\" in *\" checkout main\" | \"checkout -f -B main origin/main\") sleep 30; exit 1;; esac\nexec {} \"$@\"\n",
+                "git\n#!/bin/sh\ncase \"$*\" in *\" checkout main\" | \"checkout -f -B main origin/main\") {BOUND_NOW_SH}; sleep 30; : > '{}'; exit 1;; esac\nexec {} \"$@\"\n",
+                outlived.display(),
                 shell_quote(&real_git())
             ),
         );
         let plain = std::env::var("PATH").unwrap_or_default();
         for shell in &shells {
             for hard in [false, true] {
-                let t0 = std::time::Instant::now();
-                let (code, out, err) = run_in(shell, &bounded_switch(&switch_script(repo, "main", None, hard, KB_DEFAULT), 2, 1), &hang);
+                let (code, out, err) = run_in(shell, &bounded_switch(&switch_script(repo, "main", None, hard, KB_DEFAULT), 600, 60), &hang);
                 assert_eq!(code, Some(124), "{shell} hard={hard}: {out}{err}");
-                assert!(t0.elapsed() < std::time::Duration::from_secs(20), "{shell} hard={hard}: bounded");
-                assert!(err.contains("the switch ran past its 2 s on the pod and was stopped there"), "{shell} hard={hard}: {err}");
+                assert!(!outlived.exists(), "{shell} hard={hard}: bounded");
+                assert!(err.contains("the switch ran past its 600 s on the pod and was stopped there"), "{shell} hard={hard}: {err}");
                 assert_eq!(s.read("ex.py"), ex.as_bytes(), "{shell} hard={hard}: the real key put back");
                 assert!(!aside.exists(), "{shell} hard={hard}");
                 assert_eq!(branch(), "autocommit-x", "{shell} hard={hard}");
@@ -5339,16 +5349,21 @@ done
             let o = std::process::Command::new("sh").args(["-c", &format!("command -v {tool}")]).output().unwrap();
             String::from_utf8_lossy(&o.stdout).trim().to_string()
         };
-        // Stopped mid-copy: a `cp` that copies into the save, then hangs; the bound's TERM at 2 s.
+        // Stopped mid-copy: a `cp` that copies into the save, then hangs, the bound going off there
+        // ([`BOUND_NOW_SH`]); one the TERM didn't stop would mark `outlived`.
+        let outlived = s.base.join("outlived");
         let slow = stand_in(
             "bin-slow-cp",
             "cp",
-            &format!("#!/bin/sh\ncase \"$*\" in *arena-discarded/*) {0} \"$@\"; sleep 30; exit 1;; esac\nexec {0} \"$@\"\n", real("cp")),
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in *arena-discarded/*) {0} \"$@\"; {BOUND_NOW_SH}; sleep 30; : > '{1}'; exit 1;; esac\nexec {0} \"$@\"\n",
+                real("cp"),
+                outlived.display()
+            ),
         );
-        let t0 = std::time::Instant::now();
-        let (code, out, err) = run_in("bash", &bounded_switch(&switch_script(repo, "main", None, true, KB_DEFAULT), 2, 1), &slow);
+        let (code, out, err) = run_in("bash", &bounded_switch(&switch_script(repo, "main", None, true, KB_DEFAULT), 600, 60), &slow);
         assert_eq!(code, Some(124), "{out}{err}");
-        assert!(t0.elapsed() < std::time::Duration::from_secs(20) && err.contains("was stopped there"), "{err}");
+        assert!(!outlived.exists() && err.contains("was stopped there"), "{err}");
         untouched("stopped mid-copy");
         // …and it said what it was copying, how big, and how to move it out of the way (review
         // ai-review claude #6), before the bound's own line.
@@ -5361,13 +5376,13 @@ done
         assert!(err.find(line).unwrap() < err.find("was stopped there").unwrap(), "{err}");
         // …and with no stderr to say it on (a dropped connection; review ai-review claude #4): the
         // save removed all the same — the words come after it, a failed write passed over.
-        let (code, out, err) = run_in("bash", &format!("{} 2>&-", bounded_switch(&switch_script(repo, "main", None, true, KB_DEFAULT), 2, 1)), &slow);
-        assert_eq!((code, err.as_str()), (Some(124), ""), "{out}");
+        let (code, out, err) = run_in("bash", &format!("{} 2>&-", bounded_switch(&switch_script(repo, "main", None, true, KB_DEFAULT), 600, 60)), &slow);
+        assert_eq!((code, err.as_str(), outlived.exists()), (Some(124), "", false), "{out}");
         untouched("stopped mid-copy, stderr closed");
         // Stopped while it totals the size first (a `du` that hangs): said, with no size to say yet.
-        let slow_du = stand_in("bin-slow-du", "du", "#!/bin/sh\nsleep 30\n");
-        let (code, out, err) = run_in("bash", &bounded_switch(&switch_script(repo, "main", None, true, KB_DEFAULT), 2, 1), &slow_du);
-        assert_eq!(code, Some(124), "{out}{err}");
+        let slow_du = stand_in("bin-slow-du", "du", &format!("#!/bin/sh\n{BOUND_NOW_SH}; sleep 30; : > '{}'\n", outlived.display()));
+        let (code, out, err) = run_in("bash", &bounded_switch(&switch_script(repo, "main", None, true, KB_DEFAULT), 600, 60), &slow_du);
+        assert_eq!((code, outlived.exists()), (Some(124), false), "{out}{err}");
         assert!(
             err.contains(
                 "arena set-branch: stopped while totalling the size of what the reset would remove (1 path(s)), before the --hard reset — \

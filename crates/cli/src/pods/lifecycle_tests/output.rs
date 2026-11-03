@@ -98,9 +98,12 @@ async fn start_ends_each_pod_ready() {
     let delta = f.pods.lock().unwrap()[3].clone();
     let opts = RestartOpts { yes: true, ..Default::default() };
     let got = rendered(false, &[], handle_start(&f, Arc::new(FakeRemote::new()), &cfg, &named(&[delta]), opts, FAST, &keys_dir)).await;
-    assert_eq!(got, "[started] devtest-delta
-[devtest-delta] READY after 0s · disk kept · proxy written, nginx not reloaded (reload it)
-");
+    // The line, not its time: the clock is paused (0s), but the proxy's lock, which this test's
+    // earlier syncs took, can stay held a moment past its drop by a child another test's thread
+    // forked meanwhile, and each 200 ms of its wait moves the paused clock on (once: 1m39s).
+    let (head, after) = got.split_once("READY after ").unwrap_or_else(|| panic!("{got}"));
+    let tail = after.split_once(' ').map(|(_, t)| t);
+    assert_eq!((head, tail), ("[started] devtest-delta\n[devtest-delta] ", Some("· disk kept · proxy written, nginx not reloaded (reload it)\n")), "{got}");
 
     let (quiet, loud) = both(&["start", "alpha", "--dry-run"], &cfg, &[], stopped).await;
     assert_eq!(quiet, "[dry-run] would start devtest-alpha (a fresh image, set up again)\n");

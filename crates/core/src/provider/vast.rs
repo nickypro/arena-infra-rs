@@ -1758,7 +1758,7 @@ mod tests {
     /// retryable transport error); anything after the request went out is "maybe rented".
     #[tokio::test]
     async fn rent_send_error_retries_only_what_never_reached_vast() {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap(); // dropped: refused
+        let (_held, closed) = crate::http::test_server::refusing();
         let refused = client().put(format!("http://{closed}/asks/1/")).send().await.unwrap_err();
         let e = rent_send_error(refused, 1, "arena8-apple");
         assert!(matches!(e, Error::Http(_)) && crate::retry::is_retryable(&e), "{e}");
