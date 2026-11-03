@@ -1188,7 +1188,7 @@ pub fn bounded_sh(script: &str, name: &str, secs: u64, kill_after: u64, stopped:
 /// A short bound raced it (the TERM came before the stand-in was reached, or the KILL before the
 /// traps were done); with this, the tests' bounds are long and never go off by themselves.
 #[cfg(test)]
-pub(crate) const BOUND_NOW_SH: &str = "(read -r l < /proc/$$/stat; set -- ${l##*) }; kill -ALRM \"$3\")";
+pub(crate) const BOUND_NOW_SH: &str = "kill -ALRM $(ps -o pgid= -p $$)";
 
 /// `s` single-quoted for whichever login shell sshd hands a command to: the POSIX ones (sh, bash,
 /// zsh) and fish read it the same. Inside single quotes fish takes `\\` and `\'` as escapes, where
@@ -5607,16 +5607,19 @@ done
         let nth = |n: u32, action: String| format!("c=$(($(cat \"$0.n\" 2>/dev/null || echo 0) + 1)); echo $c > \"$0.n\"; if [ $c = {n} ]; then {action}; fi;;");
         let stop = format!("{BOUND_NOW_SH}; sleep 30; exit 1");
         let rename_in = "*\".part ex.py\")";
-        let stops = [
+        let mut stops = vec![
             ("mid-copy", "cp", format!("*arena-unredacted/*) {}", nth(1, format!("for a; do :; done; printf 'KEY = ' > \"$a\"; {stop}")))),
-            (
-                "mid-write of its git version",
-                "sed",
-                format!("*) case $(readlink /proc/$$/fd/1) in *arena-unredacted/*.part) {} esac;;", nth(1, format!("printf 'KEY = '; {stop}"))),
-            ),
             ("right before that is renamed into place", "mv", format!("{rename_in} {}", nth(1, stop.clone()))),
             ("right after", "mv", format!("{rename_in} {}", nth(1, format!("{} \"$@\"; {stop}", real("mv"))))),
         ];
+        // The `sed` writing the file's git version, told by where its stdout goes (`/proc`).
+        if cfg!(target_os = "linux") {
+            stops.push((
+                "mid-write of its git version",
+                "sed",
+                format!("*) case $(readlink /proc/$$/fd/1) in *arena-unredacted/*.part) {} esac;;", nth(1, format!("printf 'KEY = '; {stop}"))),
+            ));
+        }
         let check = |when: &str| {
             assert_eq!(s.read("ex.py"), ex.as_bytes(), "{when}: the real key put back");
             assert!(!aside.exists(), "{when}: nothing left set aside");
