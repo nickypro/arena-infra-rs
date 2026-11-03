@@ -840,12 +840,38 @@ pub fn key_check_line(keys: &[arena_core::health::Check]) -> Option<(String, Ton
         .iter()
         .filter(|c| c.name == arena_core::health::AI_KEY || c.status != Status::Pass)
         .map(|c| {
-            let what = if c.name == arena_core::health::AI_KEY { "" } else { "HF token " };
+            let what = match c.name.as_str() {
+                arena_core::health::AI_KEY => "",
+                arena_core::health::WANDB_CHECK => "W&B key ",
+                _ => "HF token ",
+            };
             format!("{what}{} {}", mark(c.status), c.detail)
         })
         .collect();
     let worst = arena_core::health::overall(&judged.iter().map(|c| (*c).clone()).collect::<Vec<_>>());
     let text = if parts.is_empty() { "✓ HF token accepted".to_string() } else { parts.join(" · ") };
+    Some((text, health_tone(worst, 0)))
+}
+
+/// The detail view's `course:` line from a health record's course checks (`proxy`, `backup`,
+/// `repo`, `claude`, `kernel`, `uv`): each FAIL and WARN as `✗ repo: … — <what to run>`, worst
+/// first, in the worst one's tone, else `✓` and the checks that passed — `None` when the check
+/// judged none (an older check, a cache from before them). Pure.
+pub fn course_check_line(course: &[arena_core::health::Check]) -> Option<(String, Tone)> {
+    let judged: Vec<&arena_core::health::Check> = course.iter().filter(|c| c.status != Status::Skip).collect();
+    if judged.is_empty() {
+        return None;
+    }
+    let worst = arena_core::health::overall(&judged.iter().map(|c| (*c).clone()).collect::<Vec<_>>());
+    let bad = |s: Status| judged.iter().filter(move |c| c.status == s);
+    let parts: Vec<String> = bad(Status::Fail)
+        .map(|c| format!("✗ {}: {}", c.name, c.detail))
+        .chain(bad(Status::Warn).map(|c| format!("! {}: {}", c.name, c.detail)))
+        .collect();
+    let text = match parts.is_empty() {
+        true => format!("✓ {}", judged.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(" · ")),
+        false => parts.join(" · "),
+    };
     Some((text, health_tone(worst, 0)))
 }
 
@@ -953,6 +979,7 @@ impl DeepChecks {
             .filter(|h| h.status == Status::Fail)
             .map(|h| match h.failure_kind() {
                 Some(arena_core::health::FailureKind::Key) => format!("{} (AI key)", h.name),
+                Some(arena_core::health::FailureKind::Course) => format!("{} (course setup)", h.name),
                 _ => h.name.clone(),
             })
             .collect();
@@ -2584,6 +2611,30 @@ mod tests {
         // …and the detail view's `ai check:` line reads the record's key checks.
         let keys = &snap.pods[1].health.as_ref().unwrap().keys;
         assert_eq!(key_check_line(keys), Some(("✗ x".to_string(), Tone::Bad)));
+    }
+
+    /// The detail view's `course:` line: each FAIL then WARN of the course checks with what to
+    /// run, in the worst one's tone; `✓` and the checks that passed; nothing when none was judged.
+    /// A deep check that failed for its course alone says so in the footer.
+    #[test]
+    fn the_course_line_says_what_the_participant_uses() {
+        let c = |name: &str, status: Status, detail: &str| Check { name: name.into(), status, detail: detail.into() };
+        let pass = [c("proxy", Status::Pass, "port 9500 reaches it"), c("claude", Status::Skip, "v2, no auth"), c("uv", Status::Pass, "/usr/local/bin/uv")];
+        assert_eq!(course_check_line(&pass), Some(("✓ proxy · uv".into(), Tone::Good)));
+        let mixed = [
+            c("repo", Status::Warn, "on main: no backups — `arena pods init-branches apple`"),
+            c("proxy", Status::Fail, "port 9500 reaches another machine (x) — `arena proxy apply`"),
+            c("uv", Status::Pass, "/usr/local/bin/uv"),
+        ];
+        assert_eq!(
+            course_check_line(&mixed),
+            Some((
+                "✗ proxy: port 9500 reaches another machine (x) — `arena proxy apply` · ! repo: on main: no backups — `arena pods init-branches apple`".into(),
+                Tone::Bad
+            ))
+        );
+        assert_eq!(course_check_line(&[c("kernel", Status::Skip, "not reported")]), None);
+        assert_eq!(course_check_line(&[]), None);
     }
 
     /// The detail view's `ai check:` line: the OpenRouter key's verdict, the HF token's only when

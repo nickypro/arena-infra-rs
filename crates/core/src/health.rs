@@ -20,9 +20,12 @@
 //! here rather than in the CLI so the TUI and the `up --check` summary (PLAN 2.B / Phase
 //! 3) show a pod's health the same way.
 //!
-//! The machine's AI keys (its OpenRouter key, the Hugging Face token) are checked by the same
-//! script, judged in [`aikeys`] against the fleet's keys CSV ([`KeyBook`], in the policy) — and
-//! never counted against the machine ([`FailureKind::Key`]).
+//! The machine's keys (its OpenRouter key, the Hugging Face token, the W&B key) are checked by the
+//! same script, judged in [`aikeys`] against the fleet's keys CSV ([`KeyBook`], in the policy) —
+//! and never counted against the machine ([`FailureKind::Key`]). So is what a participant uses
+//! beside the machine (the proxy port, backups, the repo's branch, Claude Code, the notebook
+//! kernel, uv), judged in [`course`] against what the control box knows ([`CourseBook`]) — never
+//! the machine either ([`FailureKind::Course`]).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -39,14 +42,36 @@ use crate::ssh::SshOutput;
 use crate::table::{self, Align};
 
 mod aikeys;
+pub mod course;
 pub use aikeys::{
-    ai_key_cell, fingerprint, hf_token_cell, is_key_check, key_checks, ledger_owners, low_line, KeyBook, KeyFacts, Listed,
-    AI_KEY, HF_TOKEN_CHECK,
+    ai_key_cell, fingerprint, hf_token_cell, is_key_check, key_checks, ledger_owners, low_line, wandb_cell, KeyBook, KeyFacts,
+    Listed, AI_KEY, HF_TOKEN_CHECK, WANDB_CHECK,
 };
+pub use course::{course_checks, is_course_check, CheckArgs, CourseBook};
 
-/// The on-pod fact gatherer. Embedded (like `hetzner_setup.sh`) so the binary is all an
-/// operator needs, and versioned with the parser that reads its output.
+/// The on-pod fact gatherer, as written: its shared parts (the identity, the origin check, the
+/// operation markers, the Claude and kernel helpers) are rendered in by [`deep_check_script`].
+/// Embedded (like `hetzner_setup.sh`) so the binary is all an operator needs, and versioned with
+/// the parser that reads its output.
 pub const DEEP_CHECK_SCRIPT: &str = include_str!("deep_check.sh");
+
+/// [`DEEP_CHECK_SCRIPT`] with its shared parts rendered in, and its whole-line comments (the
+/// bash's and the python's) left out: what goes to the machine, inside one command argument —
+/// which must stay well under Linux's 128 KiB per-argument cap once base64-encoded and wrapped.
+pub fn deep_check_script() -> &'static str {
+    static SCRIPT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let full = DEEP_CHECK_SCRIPT
+            .replacen("# @ARENA_IDENTITY_SH@", course::IDENTITY_SH, 1)
+            .replacen("# @ARENA_ORIGIN_SH@", crate::backup::origin_sh().trim_end(), 1)
+            .replacen("# @ARENA_BUSY_OP_SH@", crate::backup::BUSY_OP_SH, 1)
+            .replacen("@ARENA_CLAUDE_PY@", course::CLAUDE_PY.trim_end(), 1)
+            .replacen("@ARENA_KERNEL_PY@", course::KERNEL_PY.trim_end(), 1);
+        let mut out: String = full.lines().filter(|l| !l.trim_start().starts_with('#')).collect::<Vec<_>>().join("\n");
+        out.push('\n');
+        out
+    });
+    &SCRIPT
+}
 
 /// The whole remote call's budget. The script bounds itself to ≈120s worst case (each
 /// sub-step under `timeout`, the network probe in parallel with the GPU checks); on top
@@ -55,8 +80,12 @@ pub const DEEP_CHECK_SCRIPT: &str = include_str!("deep_check.sh");
 pub const DEEP_CHECK_TIMEOUT: Duration = Duration::from_secs(150);
 
 /// The keys-only run's budget (`pods test --keys`, `up --check` once its keys are copied, the
-/// dashboard's test): the login shell, then two calls bounded at 15 s each, side by side.
+/// dashboard's test): the login shell, then three calls bounded at 15 s each, side by side.
 pub const KEY_CHECK_TIMEOUT: Duration = Duration::from_secs(40);
+
+/// The course-only run's budget (`pods test --course`): the login shell, then its probes side by
+/// side — the dry-run push (20 s), Claude Code (10 + 25 s), the notebook kernel (50 s).
+pub const COURSE_CHECK_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// Below this Hugging Face download speed a pod WARNs: course notebooks pull models and
 /// datasets, and at under 2 MB/s a 500 MB checkpoint takes minutes.
@@ -75,22 +104,44 @@ pub const DEFAULT_LOAD_FLOOR: f64 = 32.0;
 /// `$`). `</dev/null`: nothing in it may wait on input. Exposed so a test can run it
 /// locally against stub tools.
 pub fn deep_check_inner_command() -> String {
-    inner_command("")
+    inner_command("", None)
+}
+
+/// [`deep_check_inner_command`] with the course facts too ([`CheckArgs`]): what `pods test
+/// --deep`, `up --check` and the dashboard run.
+pub fn deep_check_inner_command_for(args: &CheckArgs) -> String {
+    inner_command(" deep", Some(args))
 }
 
 /// [`deep_check_inner_command`] with the script's mode argument (`""`: everything; `" keys"`:
-/// the AI keys only).
-fn inner_command(mode: &str) -> String {
+/// the keys only; `" course"`: the course only) and the course facts' arguments.
+fn inner_command(mode: &str, args: Option<&CheckArgs>) -> String {
     format!(
-        "bash -c \"$(printf %s {} | base64 -d)\" arena-deep-check{mode} </dev/null",
-        base64_encode(DEEP_CHECK_SCRIPT.as_bytes())
+        "bash -c \"$(printf %s {} | base64 -d)\" arena-deep-check{mode}{} </dev/null",
+        base64_encode(deep_check_script().as_bytes()),
+        args.map(CheckArgs::words).unwrap_or_default()
     )
 }
 
 /// The keys-only run of the same script (its `keys` mode: no torch, no GPU, a few seconds), in
 /// the same login wrap — the keys the participant's shell exports. Before the wrap, for tests.
 pub fn key_check_inner_command() -> String {
-    inner_command(" keys")
+    inner_command(" keys", None)
+}
+
+/// The course-only run (its `course` mode: no torch step, no GPU work), before the wrap.
+pub fn course_check_inner_command(args: &CheckArgs) -> String {
+    inner_command(" course", Some(args))
+}
+
+/// [`course_check_inner_command`] inside [`crate::ssh::login_shell_wrap`].
+pub fn course_check_command(conda_env: Option<&str>, args: &CheckArgs) -> String {
+    crate::ssh::login_shell_wrap(&course_check_inner_command(args), conda_env)
+}
+
+/// [`deep_check_inner_command_for`] inside [`crate::ssh::login_shell_wrap`].
+pub fn deep_check_command_for(conda_env: Option<&str>, args: &CheckArgs) -> String {
+    crate::ssh::login_shell_wrap(&deep_check_inner_command_for(args), conda_env)
 }
 
 /// [`key_check_inner_command`] inside [`crate::ssh::login_shell_wrap`].
@@ -232,6 +283,27 @@ pub struct DeepFacts {
     /// The Hugging Face token (`hf.*`), as `openrouter`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hf: Option<KeyFacts>,
+    /// The W&B key (`wandb.*`), as `openrouter`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wandb: Option<KeyFacts>,
+    /// Who the machine says it is (`id.*`): what the proxy port's answer is held to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<course::Identity>,
+    /// The course repo's git metadata (`repo.*`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<course::RepoFacts>,
+    /// The dry-run push with the deploy key (`push.*`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub push: Option<course::PushFacts>,
+    /// Claude Code and the auth it would use (`claude.*`): kinds and fingerprints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude: Option<course::ClaudeFacts>,
+    /// The course env's notebook kernel (`kernel.*`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<course::KernelFacts>,
+    /// `uv` in a login shell (`uv.*`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uv: Option<course::UvFacts>,
     /// Any other `key=value` the script printed (a newer script, an `error=`): kept for
     /// `--json` rather than dropped.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -508,6 +580,7 @@ pub fn parse_deep(stdout: &str) -> DeepFacts {
             "vscode.servers" => f.vscode_servers = small(),
             "vscode.python" => f.vscode_python = text(),
             _ if aikeys::key_fact(&mut f, key, value) => {}
+            _ if course::course_fact(&mut f, key, value) => {}
             _ => {
                 if let Some(v) = text() {
                     if !indexed_fact(&mut f, &mut gpus, &mut tgpus, key, v.clone()) {
@@ -624,6 +697,8 @@ pub struct HealthPolicy {
     /// lines at all — [`Self::from_config`]'s, and `up --check`'s check before its keys stage
     /// (the keys aren't on the machine yet). [`Self::for_fleet`] fills it.
     pub keys: Option<KeyBook>,
+    /// What the course checks are held to ([`CourseBook`]); `None`: no course lines at all.
+    pub course: Option<CourseBook>,
 }
 
 impl Default for HealthPolicy {
@@ -635,6 +710,7 @@ impl Default for HealthPolicy {
             load_floor: DEFAULT_LOAD_FLOOR,
             vscode_extensions: crate::vscode::DEFAULT_EXTENSIONS.iter().map(|s| s.to_string()).collect(),
             keys: None,
+            course: None,
         }
     }
 }
@@ -822,6 +898,10 @@ pub enum FailureKind {
     /// An AI key or token ([`aikeys`]: missing, rejected, paused, out of money): not the
     /// machine at all. Reported with what to run; the machine is kept.
     Key,
+    /// What a participant uses beside the machine ([`course`]: the proxy port, backups, the
+    /// repo's branch, Claude Code, uv): not the machine either. Reported with what to run; the
+    /// machine is kept.
+    Course,
 }
 
 impl FailureKind {
@@ -830,6 +910,7 @@ impl FailureKind {
             FailureKind::Host => "host",
             FailureKind::Software => "software/setup",
             FailureKind::Key => "AI key",
+            FailureKind::Course => "course setup",
         }
     }
 }
@@ -844,13 +925,19 @@ impl FailureKind {
 /// - `cuda`: torch imported but is a CPU-only build (`torch.version.cuda` is None) — on a GPU
 ///   pod every pod from that image fails the same way.
 ///
-/// - `ai_key`, `hf_token`: `Key` — the machine's AI keys, never the machine.
+/// - `ai_key`, `hf_token`, `wandb`: `Key` — the machine's keys, never the machine.
+/// - `proxy`, `backup`, `repo`, `claude`, `uv`: `Course` — what a participant uses beside the
+///   machine. `kernel`: `Software` — a course env whose kernel can't import torch is the image's
+///   or setup's, the same on a new machine.
 ///
 /// Everything else — the GPU/driver/CUDA checks, and any check this function doesn't know (a new
 /// one keeps the old "a FAIL is a bad host" meaning) — is `Host`.
 pub fn failure_kind_of(name: &str, facts: Option<&DeepFacts>) -> FailureKind {
     if is_key_check(name) {
         return FailureKind::Key;
+    }
+    if is_course_check(name) {
+        return if name == course::KERNEL { FailureKind::Software } else { FailureKind::Course };
     }
     let software = match (name, facts) {
         ("script", _) => true,
@@ -1504,6 +1591,30 @@ impl PodHealth {
         if let Some(book) = policy.keys.as_ref().filter(|_| facts.started) {
             checks.extend(key_checks(&facts, pod, book));
         }
+        // What the participant uses beside it, the same way.
+        if let Some(book) = policy.course.as_ref().filter(|_| facts.started) {
+            checks.extend(course_checks(&facts, pod, book));
+        }
+        Self::of(pod, checks, facts)
+    }
+
+    /// A course-only run's verdict (`pods test --course`: the script's `course` mode): its course
+    /// checks held to `policy`'s [`CourseBook`] (an empty one without) — after a `script` FAIL when
+    /// it never started or couldn't run, a WARN when it was cut off.
+    pub fn course_checked(pod: &Pod, facts: DeepFacts, policy: &HealthPolicy) -> Self {
+        let mut checks = Vec::new();
+        if !facts.started {
+            checks.push(Check::new("script", Status::Fail, "no output from the check script"));
+            return Self::of(pod, checks, facts);
+        }
+        if !facts.complete {
+            checks.push(Check::new("script", Status::Warn, "output cut off before the end; later facts unknown"));
+        }
+        if let Some(e) = facts.other.get("error") {
+            checks.push(Check::new("script", Status::Fail, e.clone()));
+            return Self::of(pod, checks, facts);
+        }
+        checks.extend(course_checks(&facts, pod, &policy.course.clone().unwrap_or_default()));
         Self::of(pod, checks, facts)
     }
 
@@ -1541,12 +1652,18 @@ impl PodHealth {
         }
     }
 
-    /// The verdict on the machine itself: [`overall`] of every check but its AI keys'. What
-    /// decides whether a check clears a bad-host record; `status` (keys included) is what
-    /// `pods test --deep` reports and exits by.
+    /// The verdict on the machine itself: [`overall`] of every check but its keys' and the
+    /// course's. What decides whether a check clears a bad-host record; `status` (keys and course
+    /// included) is what `pods test --deep` reports and exits by.
     pub fn machine_status(&self) -> Status {
-        let machine: Vec<Check> = self.checks.iter().filter(|c| !is_key_check(&c.name)).cloned().collect();
+        let machine: Vec<Check> = self.checks.iter().filter(|c| !is_key_check(&c.name) && !is_course_check(&c.name)).cloned().collect();
         overall(&machine)
+    }
+
+    /// The worst of its course checks (`None`: it has none, or only Skips).
+    pub fn course_status(&self) -> Option<Status> {
+        let course: Vec<Check> = self.checks.iter().filter(|c| is_course_check(&c.name) && c.status != Status::Skip).cloned().collect();
+        (!course.is_empty()).then(|| overall(&course))
     }
 
     /// The worst of its AI-key checks (`None`: it has none, or only Skips).
@@ -1563,6 +1680,7 @@ impl PodHealth {
         if let (Some(f), Some(k)) = (self.facts.as_mut(), keys.facts.as_ref()) {
             f.openrouter = k.openrouter.clone();
             f.hf = k.hf.clone();
+            f.wandb = k.wandb.clone();
         }
         self.status = overall(&self.checks);
     }
@@ -1581,15 +1699,16 @@ impl PodHealth {
     }
 
     /// What its failures say is broken: `Host` as soon as one failed check is about the
-    /// machine, else `Software` as soon as one is about the image/setup, else `Key` — every one
-    /// is an AI key's ([`failure_kind_of`]); `None` when nothing failed. A pod that couldn't be
+    /// machine, else `Software` as soon as one is about the image/setup, else `Key` as soon as one
+    /// is a key's, else `Course` — every one is the course's ([`failure_kind_of`]); `None` when
+    /// nothing failed. A pod that couldn't be
     /// checked at all (`ssh`) is `Host` here — `up --check` never judges such a pod by its checks
     /// (it re-runs the check instead).
     pub fn failure_kind(&self) -> Option<FailureKind> {
         let facts = self.facts.as_ref();
         let kinds: Vec<FailureKind> =
             self.checks.iter().filter(|c| c.status == Status::Fail).map(|c| failure_kind_of(&c.name, facts)).collect();
-        [FailureKind::Host, FailureKind::Software, FailureKind::Key].into_iter().find(|k| kinds.contains(k))
+        [FailureKind::Host, FailureKind::Software, FailureKind::Key, FailureKind::Course].into_iter().find(|k| kinds.contains(k))
     }
 
     /// The NOTES column: failures first, then warnings, as `check: detail`.
@@ -1616,6 +1735,12 @@ pub fn judge_deep_call(pod: &Pod, call: std::result::Result<SshOutput, String>, 
 /// `up --check` (once its keys are copied) and the dashboard's test.
 pub fn judge_key_call(pod: &Pod, call: std::result::Result<SshOutput, String>, policy: &HealthPolicy) -> PodHealth {
     judge_call(pod, call, policy, PodHealth::keys_checked)
+}
+
+/// [`judge_deep_call`] for a course-only run ([`course_check_command`]), judged by
+/// [`PodHealth::course_checked`]. `pods test --course`'s.
+pub fn judge_course_call(pod: &Pod, call: std::result::Result<SshOutput, String>, policy: &HealthPolicy) -> PodHealth {
+    judge_call(pod, call, policy, PodHealth::course_checked)
 }
 
 fn judge_call(
@@ -1776,22 +1901,47 @@ pub fn render_summary(results: &[PodHealth]) -> Vec<String> {
             keys.join(", ")
         ));
     }
+    let course: Vec<&str> =
+        results.iter().filter(|h| h.failure_kind() == Some(FailureKind::Course)).map(|h| h.name.as_str()).collect();
+    if !course.is_empty() {
+        lines.push(format!(
+            "course setup failure, not the machine: {} — NOTES (or -v) says what to run; a machine is never replaced for it.",
+            course.join(", ")
+        ));
+    }
     lines
 }
 
-/// `pods test --keys`: `NAME  RESULT  AI KEY  HF  NOTES` ([`ai_key_cell`], [`hf_token_cell`]),
-/// every check with `verbose`, then the summary lines. Pure.
+/// `pods test --keys`: `NAME  RESULT  AI KEY  HF  [W&B]  NOTES` ([`ai_key_cell`],
+/// [`hf_token_cell`], [`wandb_cell`] once some machine's W&B key was judged), every check with
+/// `verbose`, then the summary lines. Pure.
 pub fn render_key_report(results: &[PodHealth], verbose: bool) -> String {
     let or_dash = |s: Option<String>| s.unwrap_or_else(|| "-".into());
+    let wandb = results.iter().any(|h| wandb_cell(h).is_some());
     let rows: Vec<Vec<String>> = results
         .iter()
-        .map(|h| vec![h.name.clone(), h.status.label().to_string(), or_dash(ai_key_cell(h)), or_dash(hf_token_cell(h)), h.notes()])
+        .map(|h| {
+            let mut row = vec![h.name.clone(), h.status.label().to_string(), or_dash(ai_key_cell(h)), or_dash(hf_token_cell(h))];
+            if wandb {
+                row.push(or_dash(wandb_cell(h)));
+            }
+            row.push(h.notes());
+            row
+        })
         .collect();
-    let mut out = table::render(
-        &["NAME", "RESULT", "AI KEY", "HF", "NOTES"],
-        &[Align::Left, Align::Left, Align::Left, Align::Left, Align::Left],
-        &rows,
-    );
+    let mut headers = vec!["NAME", "RESULT", "AI KEY", "HF"];
+    if wandb {
+        headers.push("W&B");
+    }
+    headers.push("NOTES");
+    let mut out = table::render(&headers, &vec![Align::Left; headers.len()], &rows);
+    push_details(&mut out, results, verbose);
+    out
+}
+
+/// `-v`'s every check of each machine, then the summary lines — a shared IP among machines that
+/// couldn't be reached says nothing about their keys or course.
+fn push_details(out: &mut String, results: &[PodHealth], verbose: bool) {
     if verbose {
         for h in results {
             out.push('\n');
@@ -1799,11 +1949,33 @@ pub fn render_key_report(results: &[PodHealth], verbose: bool) -> String {
         }
     }
     out.push('\n');
-    // A shared IP among machines that couldn't be reached says nothing about their keys.
     for line in render_summary(results).into_iter().filter(|l| !l.starts_with("same host?")) {
         out.push_str(&line);
         out.push('\n');
     }
+}
+
+/// `pods test --course`: `NAME  RESULT  PROXY  BACKUP  REPO  CLAUDE  KERNEL  NOTES` (the cells in
+/// [`course`]), every check with `verbose`, then the summary lines. Pure.
+pub fn render_course_report(results: &[PodHealth], verbose: bool) -> String {
+    let rows: Vec<Vec<String>> = results
+        .iter()
+        .map(|h| {
+            vec![
+                h.name.clone(),
+                h.status.label().to_string(),
+                course::proxy_cell(h),
+                course::backup_cell(h),
+                course::repo_cell(h),
+                course::claude_cell(h),
+                course::kernel_cell(h),
+                h.notes(),
+            ]
+        })
+        .collect();
+    let headers = ["NAME", "RESULT", "PROXY", "BACKUP", "REPO", "CLAUDE", "KERNEL", "NOTES"];
+    let mut out = table::render(&headers, &[Align::Left; 8], &rows);
+    push_details(&mut out, results, verbose);
     out
 }
 
@@ -3425,7 +3597,7 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
     fn command_carries_the_script_base64_inside_the_login_wrap() {
         let cmd = deep_check_command(Some("arena-env"));
         assert_eq!(cmd, crate::ssh::login_shell_wrap(&deep_check_inner_command(), Some("arena-env")));
-        assert!(cmd.contains(&base64_encode(DEEP_CHECK_SCRIPT.as_bytes())));
+        assert!(cmd.contains(&base64_encode(deep_check_script().as_bytes())));
         assert!(cmd.contains("conda activate arena-env"));
         // One argv string on the remote side: stay far below Linux's 128 KiB per-arg cap.
         assert!(cmd.len() < 64 * 1024, "{} bytes", cmd.len());
