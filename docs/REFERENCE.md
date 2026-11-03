@@ -77,6 +77,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [Acting on pods](#acting-on-pods)
   - [Adding pods](#adding-pods)
 - [Testing](#testing)
+  - [On macOS](#on-macos)
   - [The live smoke test](#the-live-smoke-test)
 - [AI review before merging](#ai-review-before-merging)
 
@@ -3700,6 +3701,34 @@ times, in µs) and each input event, to measure lag (see [Testing](#testing)).
 ```bash
 cargo test --release   # everything offline: pure planners, fake providers, FakeRemote, fixtures
 ```
+
+### On macOS
+
+CI runs the suite on Apple silicon too (`build + test (macOS)`), with what a Linux pod has
+first on `PATH`: many tests run the pods' scripts here, as a stand-in pod. So the job installs
+rsync 3 (macOS's own is openrsync), GNU coreutils, sed, grep and find, and bash 5 (Homebrew),
+and points `TMPDIR` at its real path (macOS's is behind `/var` → `/private/var`). To run it
+on a Mac, do the same.
+
+Tests written as `#[cfg(target_os = "linux")]` don't compile there at all (`/proc`, `prctl`,
+pty pairs, process groups; most of them were Linux-only before macOS builds). These skip on
+macOS (`ignored`, with why):
+
+| Test | Why |
+| --- | --- |
+| `backups::tests::a_backup_run_is_recorded_and_arena_backups_says_it` | whether a backup is running is read from `/proc/locks` |
+| `disk::tests::other_runs_reservations_count_against_the_free_space` | whether a reservation's process still runs is read from `/proc` |
+| `resolve::tests::recent_activity_or_a_change_since_the_copy_leaves_it_busy` | it reads its session from `/proc/self/stat` |
+| `setup::tests::real_git::the_update_acts_on_the_volume_copy_through_the_link`, and `volume::tests::sim` (12 tests, compiled out) | the move onto the volume finds the repo's users through `/proc` |
+| `agent_notes::tests::saves_made_meanwhile_are_never_lost`, `…::the_notes_land_between_the_markers_and_keep_the_rest` | the notes are swapped in with `renameat2`, which macOS lacks |
+| `claude::tests::` `the_push_replaces_every_old_token_line_…`, `off_on_a_machine_with_no_rc_files_…`, `the_rewrite_goes_through_links_…`, `tracing_never_shows_the_token_…` | the script checks its lock through `/dev/fd/9`, which on macOS isn't the file |
+| `archive::tests::a_symlink_too_long_to_store_is_left_out_with_a_warning`, `…::too_many_unstorable_links_leave_only_that_pod_out`, `archive::sync::tests::skip_rules_go_through_a_private_file_…` | macOS caps a symlink's target at 1023 bytes |
+| `disk::tests::a_walk_counts_blocks_hard_links_once_and_stops_at_its_cap` | APFS gives a directory no blocks |
+| `replica::tests::the_tidy_up_guesses_nothing` | on APFS the stamp file turns up in its own `find -cnewer` scan |
+| `backup::tests::a_key_left_after_the_redaction_is_never_pushed` | it wraps `/usr/bin/sed`, BSD's on macOS |
+| `setup::tests::real_git::the_checkout_gets_the_backups_identity_…`, `hetzner_setup_tests::the_checkout_gets_a_git_identity_…` | git makes an identity up from a macOS host name (`*.local`), so no commit fails for want of one |
+
+`tests/color.rs` skips its terminal half where `script` isn't util-linux's.
 
 ### The live smoke test
 
