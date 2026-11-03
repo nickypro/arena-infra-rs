@@ -399,6 +399,16 @@ pub(crate) mod test_server {
         pub headers: Vec<(&'static str, String)>,
     }
 
+    /// A local address a connection to is refused, for as long as the returned socket lives:
+    /// bound, never listening (a SYN gets a reset). A port bound and let go, the old way, could be
+    /// another test process's by the time it was asked.
+    pub fn refusing() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
+        let s = tokio::net::TcpSocket::new_v4().unwrap();
+        s.bind(([127, 0, 0, 1], 0).into()).unwrap();
+        let addr = s.local_addr().unwrap();
+        (s, addr)
+    }
+
     pub fn canned(status: u16, content_type: &'static str, body: &str) -> Canned {
         Canned { status, content_type, body: body.to_string(), then: Then::Reply, headers: Vec::new() }
     }

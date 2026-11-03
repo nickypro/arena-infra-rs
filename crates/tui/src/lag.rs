@@ -263,9 +263,11 @@ mod tests {
             assert_eq!(got.len(), want, "{waiting} waiting, {step:?} a call, budget {budget:?}");
             assert_eq!(got[0], usize::MAX, "the first event leads");
         }
-        // A read that fails ends the pass with the error (the loop takes the terminal as gone).
+        // A read that fails ends the pass with the error (the loop takes the terminal as gone). The
+        // clock stands still: the real one, from `t0`, could be past the budget on a busy box, and
+        // nothing would be read.
         let failing = || Err::<Option<u8>, _>(std::io::Error::other("gone"));
-        assert!(drain(0u8, failing, t0, BATCH_BUDGET, Instant::now).is_err());
+        assert!(drain(0u8, failing, t0, BATCH_BUDGET, || t0).is_err());
     }
 
     /// A frame when something changed, the first time, or once the tick is up — never just

@@ -2309,11 +2309,14 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
+    /// No auto maintenance: from git 2.47 a commit leaves a detached `git maintenance run --auto`
+    /// behind, and its `.git/objects/maintenance.lock` came and went while a push read the repo
+    /// (CI's git 2.56: rsync's "file has vanished", exit 24).
     fn git(dir: &Path, args: &[&str]) -> std::process::Output {
         std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
-            .args(["-c", "user.name=a", "-c", "user.email=a@b", "-c", "init.defaultBranch=main"])
+            .args(["-c", "user.name=a", "-c", "user.email=a@b", "-c", "init.defaultBranch=main", "-c", "maintenance.auto=false", "-c", "gc.auto=0"])
             .args(args)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("HOME", dir)
@@ -2576,7 +2579,11 @@ mod tests {
         let tr = shim_transport(&t.0, "shim", &forced(rrsync, &push, true));
         let src = t.0.join("backup");
         for l in ["w0d1", "w0d2"] {
-            write(&src.join(format!("{l}/arena9-apple/a.py")), "same\n");
+            // The same file both days, its time too: written a second's tick apart, rsync's quick
+            // check saw a change, and no link.
+            let a = src.join(format!("{l}/arena9-apple/a.py"));
+            write(&a, "same\n");
+            std::fs::File::options().write(true).open(&a).unwrap().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_791_800_000)).unwrap();
             write(&src.join(format!("{l}/arena9-apple/.git/HEAD")), "ref: refs/heads/main\n");
         }
         write(&src.join("baseline/w0/fleet/image.py"), "image\n");
@@ -3051,7 +3058,15 @@ mod tests {
                 let to = src.join(label).join(pod).join("ARENA_materials");
                 std::fs::create_dir_all(&to).unwrap();
                 assert!(std::process::Command::new("cp").arg("-p").arg(src.join("baseline/w0/fleet").join(nb)).arg(&to).status().unwrap().success());
-                write(&src.join(label).join(pod).join("mine.py"), pod);
+                // The pod's own file, unchanged the next day: copied with its time, as the pulls
+                // keep it (written again, a second's tick between the two made rsync's quick
+                // check see a change, and no link).
+                let mine = src.join(label).join(pod).join("mine.py");
+                if label == "w0d1" {
+                    write(&mine, pod);
+                } else {
+                    assert!(std::process::Command::new("cp").arg("-p").arg(src.join("w0d1").join(pod).join("mine.py")).arg(&mine).status().unwrap().success());
+                }
             }
         }
         let s = settings("");

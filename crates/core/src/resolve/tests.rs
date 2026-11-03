@@ -708,6 +708,13 @@ impl Repo {
             .env("GIT_EDITOR", "true")
             .env("ARENA_TEST_PROC_DIR", self.base.join("proc"))
             .env("ARENA_TEST_PTS_DIR", self.base.join("pts"))
+            // No auto maintenance (as volume.rs's pods): from git 2.47 a commit leaves one
+            // detached, and its `objects/maintenance.lock` vanished under `age`'s touch (git 2.56).
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+            .env("GIT_CONFIG_VALUE_0", "false")
+            .env("GIT_CONFIG_KEY_1", "gc.auto")
+            .env("GIT_CONFIG_VALUE_1", "0")
             .env("PATH", path);
         c
     }
@@ -2268,10 +2275,11 @@ fn an_equal_size_replacement_that_keeps_the_mtime_is_a_change() {
 /// The resolve bounds itself on the pod (review ai-review claude #7): arena's own timeout kills only
 /// the local ssh client, and the resolve ran on — it could commit the merge after arena had said it
 /// failed and released the pod's lock. Under bash and under zsh, the pods' login shell (which `-c`s
-/// the command), it runs under `sh` and `timeout`: one stopped at its bound (here 6 s, while the
-/// pre-change hook sleeps) exits 124, says so, and its TERM trap removes its temporary files from
-/// the git dir — the merge as it was. The real command, under that shell, finishes it. (2 s was a
-/// flake: on a loaded box the resolve hadn't saved the state before by then.)
+/// the command), it runs under `sh` and `timeout`: one stopped at its bound (here going off in the
+/// pre-change hook, which then hangs: [`crate::backup::BOUND_NOW_SH`]) exits 124, says so, and its
+/// TERM trap removes its temporary files from the git dir — the merge as it was. The real command,
+/// under that shell, finishes it. (A 2 s bound, then a 6 s one, was a flake: on a loaded box the
+/// resolve hadn't saved the state before by then, or its trap wasn't done 1 s after the TERM.)
 #[cfg(unix)]
 #[test]
 fn the_resolve_bounds_itself_on_the_pod_under_any_login_shell() {
@@ -2294,12 +2302,14 @@ fn the_resolve_bounds_itself_on_the_pod_under_any_login_shell() {
         let conflicts = r.unmerged();
         let look = r.look();
         let work = r.work.to_str().unwrap();
-        let bounded = resolve_command_bounded(work, 3, &look.op_key(), &look.print, "w1d1/devtest-x", GIT_MAX_FILE_BYTES_FOR_TESTS, (6, 1));
-        let t0 = std::time::Instant::now();
-        let (code, out, err) = r.shell_with(shell, &bounded, &[("ARENA_TEST_HOOK_BEFORE_CHANGE", "sleep 30")]);
+        let bounded = resolve_command_bounded(work, 3, &look.op_key(), &look.print, "w1d1/devtest-x", GIT_MAX_FILE_BYTES_FOR_TESTS, (600, 60));
+        // One the TERM didn't stop would mark `outlived`.
+        let outlived = r.base.join("outlived");
+        let hook = format!("{}; sleep 30; : > '{}'", crate::backup::BOUND_NOW_SH, outlived.display());
+        let (code, out, err) = r.shell_with(shell, &bounded, &[("ARENA_TEST_HOOK_BEFORE_CHANGE", hook.as_str())]);
         assert_eq!(code, Some(124), "{shell}: {out}{err}");
-        assert!(t0.elapsed() < std::time::Duration::from_secs(20), "{shell}: bounded");
-        assert!(err.contains("arena resolve: it ran past its 6 s on the pod and was stopped there (TERM)"), "{shell}: {err}");
+        assert!(!outlived.exists(), "{shell}: bounded");
+        assert!(err.contains("arena resolve: it ran past its 600 s on the pod and was stopped there (TERM)"), "{shell}: {err}");
         assert!(out.contains("SAVED "), "{shell}: stopped after the state before was kept: {out}");
         assert_eq!(temp_files(&r), Vec::<String>::new(), "{shell}: its temporary files removed");
         assert!(r.work.join(".git/MERGE_HEAD").exists() && r.unmerged() == conflicts, "{shell}: the merge as it was");

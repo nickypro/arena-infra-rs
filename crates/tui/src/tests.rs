@@ -643,7 +643,7 @@ async fn the_form_runs_pods_up_and_the_panel_follows_it() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let stub = dir.join("arena");
-    std::fs::write(
+    arena_core::remote::write_test_script(
         &stub,
         "#!/bin/sh\n\
          echo \"args: $*\"\n\
@@ -664,7 +664,6 @@ async fn the_form_runs_pods_up_and_the_panel_follows_it() {
          exit 1\n",
     )
     .unwrap();
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     let shared = Arc::new(Mutex::new(fixture_shared()));
     let mut ui = ui(cfg("HETZNER_API_KEY=x\n"), Arc::new(FakeRemote::new()));
     ui.cli = Ok(runs::Cli { exe: stub.clone(), config: "/test/config.env".into(), dir: dir.join("runs") });
@@ -761,12 +760,11 @@ async fn the_form_runs_pods_up_and_the_panel_follows_it() {
 /// (`interrupted — stopping retries`), the run ending on its own.
 #[tokio::test]
 async fn a_retrying_up_from_the_form_says_so_and_s_stops_it() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("arena-tui-retry-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let stub = dir.join("arena");
-    std::fs::write(
+    arena_core::remote::write_test_script(
         &stub,
         "#!/bin/sh\n\
          echo \"args: $*\"\n\
@@ -776,7 +774,6 @@ async fn a_retrying_up_from_the_form_says_so_and_s_stops_it() {
          while :; do sleep 0.05; done\n",
     )
     .unwrap();
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     let shared = Arc::new(Mutex::new(fixture_shared()));
     let mut ui = ui(cfg("HETZNER_API_KEY=x\n"), Arc::new(FakeRemote::new()));
     ui.cli = Ok(runs::Cli { exe: stub.clone(), config: "/test/config.env".into(), dir: dir.join("runs") });

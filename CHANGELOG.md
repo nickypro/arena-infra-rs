@@ -19,6 +19,15 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-03 · the backup's copy: files vanishing on a pod mid-copy no longer fail it
+- If files on a pod are removed or renamed while `pods pull` (or the backup's copy) reads them,
+  rsync exits 24 and the pod's copy was counted as failed. Everything else was copied, so it now
+  counts as copied, and the pod's line says `some files vanished on the pod while they were
+  copied (the next pull takes them)`. Other rsync errors still fail the copy, and so does a file
+  that vanished from a repo's `.git/` other than git's lock files (a pack, an object, a ref).
+- This happened on every run for one cohort pod. On a pod with git 2.47 or newer it's more
+  likely: git then runs background maintenance after a commit, including the backup's own.
+
 ## 2026-11-03 · arena 2.18: setup puts every clods account on each pod (`CLODS_DIR`)
 - **clods now lives in this repo** (`clods/`), and the binary carries it. It's the tool that gives
   a machine one Claude Code profile per account (`clod1`…`clodN`, `clods`). It has tests and CI now.

@@ -907,14 +907,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_probe_counts_editor_servers_but_not_itself() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("arena-idle-ps-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let probe = probe_command("/nonexistent-repo");
         let run = |ps: &str| {
-            let stub = dir.join("ps");
-            std::fs::write(&stub, ps).unwrap();
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::remote::write_test_script(dir.join("ps"), ps).unwrap();
             let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
             let out = std::process::Command::new("sh").args(["-c", &probe]).env("PATH", path).output().unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();

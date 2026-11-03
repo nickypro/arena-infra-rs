@@ -2532,7 +2532,8 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
         let open = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (_held, closed) = crate::http::test_server::refusing();
+        let closed = closed.port();
         let open_port = open.local_addr().unwrap().port();
         let asked = Arc::new(AtomicUsize::new(0));
         let timing = |answers: bool| {

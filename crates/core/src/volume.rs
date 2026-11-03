@@ -1375,6 +1375,10 @@ mod tests {
         let exists = |rel: &str| root.join(rel).exists();
         let pod = |name: &str| {
             put(&format!("{name}/ws/ARENA_materials/chapter1/work.py"), "work\n");
+            // The same file on every pod, its time too (as an earlier copy left it): written in
+            // different seconds, rsync's quick check took it for changed and kept one aside.
+            let work = std::fs::File::options().write(true).open(root.join(format!("{name}/ws/ARENA_materials/chapter1/work.py"))).unwrap();
+            work.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)).unwrap();
             std::fs::create_dir_all(root.join(format!("{name}/home"))).unwrap();
             std::os::unix::fs::symlink(root.join(format!("{name}/ws/ARENA_materials")), root.join(format!("{name}/home/ARENA_materials"))).unwrap();
         };

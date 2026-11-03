@@ -140,16 +140,20 @@ fn tmpdir(tag: &str) -> TmpDir {
     TmpDir(d)
 }
 
-/// A Hetzner fleet's config with a write-only proxy in `dir` (never reloads nginx).
+/// A Hetzner fleet's config with a write-only proxy in `dir` (never reloads nginx), and its state
+/// there too: the volume-move record of `devtest-alpha` is this test's alone (without a state dir,
+/// a test process's tests share one, and a cutover beside this one rewrote or removed it).
 fn cfg(dir: &Path) -> Config {
     std::fs::write(dir.join("k"), "private").unwrap();
     std::fs::write(dir.join("k.pub"), "ssh-ed25519 AAAAtest devtest-test").unwrap();
     Config::parse(&format!(
         "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(alpha bravo charlie)\nARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\n\
          GIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\nSSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH={}\n\
-         SSH_PROXY_RELOAD_CMD=\"\"\nVSCODE_PREINSTALL=0\nAGENT_NOTES=0\nREPO_ON_VOLUME=0\nSHARED_SSH_KEY_PATH={}\nHETZNER_LOCATION=nbg1,any\n",
+         SSH_PROXY_RELOAD_CMD=\"\"\nVSCODE_PREINSTALL=0\nAGENT_NOTES=0\nREPO_ON_VOLUME=0\nSHARED_SSH_KEY_PATH={}\nHETZNER_LOCATION=nbg1,any\n\
+         ARENA_STATE_DIR={}\n",
         dir.join("proxy.conf").display(),
-        dir.join("k").display()
+        dir.join("k").display(),
+        dir.join("state").display()
     ))
 }
 

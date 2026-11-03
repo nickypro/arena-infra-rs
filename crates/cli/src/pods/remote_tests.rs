@@ -2041,6 +2041,50 @@ async fn a_directory_that_became_a_symlink_on_the_pod_is_moved_aside_and_the_pul
     let _ = std::fs::remove_dir_all(&pod);
 }
 
+/// Prod (2026-10-30): one pod's pull failed every run with rsync exit 24 — files that vanished
+/// on the pod while it read them (a program writing its files; since git 2.47 the detached
+/// maintenance a commit leaves, and its `objects/maintenance.lock`, the backup's own commit's
+/// included). That exit is rsync's for nothing else wrong: the pull counts it copied, every pass
+/// of it run, and the pod's line says so — but not when a repo's pack vanished (its refs could
+/// name objects the copy hasn't got: review codex r3), and a 23 still fails.
+#[cfg(unix)]
+#[tokio::test]
+async fn files_vanishing_on_the_pod_mid_pull_are_copied_with_a_note() {
+    let stub = StubRsync::new("vanished");
+    let script = |code: u8, gone: &str| {
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
+             echo 'file has vanished: \"{gone}\"' >&2\nexit {code}\n"
+        )
+    };
+    let lock = "/root/ARENA_materials/.git/objects/maintenance.lock";
+    arena_core::remote::write_test_script(stub.0.join("rsync"), script(24, lock)).unwrap();
+    let base = stub.0.join("backups").display().to_string();
+    let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\nSHARED_SSH_KEY_PATH=/nonexistent/k\n"));
+    let chosen = picked(&fleet(), &cfg, &["apple"]).await;
+    let pull = |remote: Arc<FakeRemote>| {
+        let (cfg, base, chosen, stub) = (cfg.clone(), base.clone(), chosen.clone(), stub.path());
+        async move {
+            remote.script(&host(22001), [repo_in_place()]);
+            let remote: Arc<dyn Remote> = remote;
+            handle_pull(&remote, &cfg, Some("w1d1".into()), &base, None, None, false, false, &chosen, false, true, &stub).await
+        }
+    };
+    let _ = crate::pods::selection::take_said();
+    pull(Arc::new(FakeRemote::new())).await.unwrap();
+    let said = crate::pods::selection::take_said();
+    assert_eq!(stub.take(), ["big/devtest-apple", "w1d1/devtest-apple", "w1d1/devtest-apple"], "every pass ran");
+    for tier in ["snapshot", "big"] {
+        let line = said.iter().find(|l| l.contains(&format!("✓ devtest-apple [{tier}] ("))).unwrap_or_else(|| panic!("{tier}: {said:#?}"));
+        assert!(line.ends_with(" — some files vanished on the pod while they were copied (the next pull takes them)"), "{line}");
+    }
+    for (code, gone) in [(24, "/root/ARENA_materials/.git/objects/pack/pack-1a2b.pack"), (23, lock)] {
+        arena_core::remote::write_test_script(stub.0.join("rsync"), script(code, gone)).unwrap();
+        let err = pull(Arc::new(FakeRemote::new())).await.unwrap_err();
+        assert!(err.to_string().starts_with("2 rsync job(s) failed"), "exit {code}, {gone}: {err}");
+    }
+}
+
 /// rsync's stderr is the only source of the path it couldn't replace, and a pod can put words
 /// there. A path outside the destination (`..`, absolute) or through a symlink in it is never
 /// acted on: everything stays where it was, the rsync isn't run again, the job fails as it

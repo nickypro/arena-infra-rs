@@ -1899,8 +1899,10 @@ mod tests {
         assert_eq!(g.upstream.as_deref(), Some(""), "no upstream: none, not unknown");
         assert!(x.df_root.is_some() && x.home_kb.is_some() && x.uptime.is_some() && x.nvidia_smi.is_some(), "{x:?}");
         assert_eq!(x.home.as_deref(), Some(home.display().to_string().as_str()));
+        // The probe's own `ps -eo pid=…`, never any `ps -eo`: on a busy box another process's
+        // (the idle probe's `ps -eo args=`, a test running beside this one) is listed, rightly.
         let ps = x.procs.as_ref().unwrap().as_ref().unwrap();
-        assert!(!ps.is_empty() && ps.iter().all(|p| !p.args.contains("arena-ask-probe") && !p.args.contains("ps -eo")), "{ps:?}");
+        assert!(!ps.is_empty() && ps.iter().all(|p| !p.args.contains("arena-ask-probe") && !p.args.contains("ps -eo pid=")), "{ps:?}");
         let m = r.metrics.as_ref().unwrap();
         assert_eq!((m.branch.as_deref(), m.dirty_files, m.has_name, m.has_key), (Some("autocommit-devtest-w1d2-alpha"), Some(3), Some(false), Some(false)));
         assert_eq!(m.origin.as_deref(), Some("https://github.com/x/y.git"));

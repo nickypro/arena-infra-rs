@@ -728,6 +728,10 @@ pub(crate) async fn pull_pods(
         let handle = set.spawn(async move {
             let started = tokio::time::Instant::now();
             let mut stats: Option<pull::RsyncStats> = None;
+            // A pass whose only trouble was files vanishing on the pod meanwhile copied the rest:
+            // copied, and said (prod 2026-10-30: one pod's pull failed every run on it) — unless
+            // what vanished was a repo's pack, object or ref (`vanished_only_disposable`).
+            let mut vanished = false;
             // Directories moved out of the way of what the pod has now: said on the job's line.
             let mut made = pull::MadeWay::default();
             for (i, (git, args)) in passes.into_iter().enumerate() {
@@ -743,7 +747,8 @@ pub(crate) async fn pull_pods(
                 let (out, m) = pull::rsync_making_way(&rsync, &args, &into, &what, left, &day).await;
                 made.extend(m);
                 match out {
-                    Ok(o) if o.success => {
+                    Ok(o) if o.success || (o.code == Some(pull::RSYNC_VANISHED_EXIT) && pull::vanished_only_disposable(&o.stderr)) => {
+                        vanished |= !o.success;
                         let s = pull::parse_rsync_stats(&o.stdout);
                         stats = match (stats, s) {
                             (Some(a), Some(b)) => Some(a.add(b)),
@@ -753,7 +758,7 @@ pub(crate) async fn pull_pods(
                     failed => return (name, tier, made, Err((git, failed))),
                 }
             }
-            (name, tier, made, Ok(stats))
+            (name, tier, made, Ok((stats, vanished)))
         });
         job_pod.insert(handle.id(), pod);
     }
@@ -829,12 +834,13 @@ pub(crate) async fn pull_pods(
         // A failure's short line by default (its fix at the end), its whole line with `-v`.
         let retry = format!("(retry: arena pods pull {name}{retry_flags})");
         match out {
-            Ok(stats) => {
+            Ok((stats, vanished)) => {
                 // Report what actually moved, so a pull isn't "silent" — with `-v`; by default the
-                // run's tally says it, unless a directory had to move aside.
+                // run's tally says it, unless a directory had to move aside or files vanished.
                 let summary = stats.map_or_else(|| "done".into(), |s| s.summary());
-                let to = if moved.is_empty() { To::Detail } else { To::Out };
-                say_to(to, &format!("[{done}/{jobs}] ✓ {name} [{tier}] ({summary}){moved}"));
+                let gone = if vanished { " — some files vanished on the pod while they were copied (the next pull takes them)" } else { "" };
+                let to = if moved.is_empty() && !vanished { To::Detail } else { To::Out };
+                say_to(to, &format!("[{done}/{jobs}] ✓ {name} [{tier}] ({summary}){moved}{gone}"));
                 ok += 1;
                 jobs_of.entry(name.clone()).or_default().1 += 1;
             }

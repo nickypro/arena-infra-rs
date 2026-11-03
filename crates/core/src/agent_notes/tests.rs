@@ -167,8 +167,7 @@ impl Machine {
     fn exe(&self, rel: &str) {
         let p = self.path(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(&p, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::remote::write_test_script(&p, "#!/bin/sh\n").unwrap();
     }
 
     /// A venv at `rel`: its python and its activate script.
@@ -218,7 +217,7 @@ impl Machine {
     fn hooked(&self, name: &str, body: &str) {
         let d = self.dir.display();
         let stub = self.path(&format!("bin/{name}"));
-        std::fs::write(
+        crate::remote::write_test_script(
             &stub,
             format!(
                 "#!/bin/sh\nc={d}/{name}.calls; n=$(($(cat \"$c\" 2>/dev/null || echo 0) + 1)); echo $n > \"$c\"\n\
@@ -227,7 +226,6 @@ impl Machine {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
 

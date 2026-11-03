@@ -753,6 +753,13 @@ mod tests {
                 .env("GIT_AUTHOR_EMAIL", "t@example.com")
                 .env("GIT_COMMITTER_NAME", "t")
                 .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                // No auto maintenance (git 2.47+ leaves one detached after a commit): its
+                // `objects/maintenance.lock` could vanish under the rsync below (exit 24).
+                .env("GIT_CONFIG_COUNT", "2")
+                .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+                .env("GIT_CONFIG_VALUE_0", "false")
+                .env("GIT_CONFIG_KEY_1", "gc.auto")
+                .env("GIT_CONFIG_VALUE_1", "0")
                 .output()
                 .unwrap();
             assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
