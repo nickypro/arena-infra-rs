@@ -261,10 +261,23 @@ in_repo() {
   (cd "$course_repo" 2>/dev/null && bounded 5 git -c core.fsmonitor=false "$@")
 }
 
+# Git's repo-local environment (GIT_DIR, GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY, …: what `git
+# rev-parse --local-env-vars` lists, and the namespace) unset: a login shell exporting one would
+# point our reads at another repo, and the probe's writes into it.
+git_env_clean() {
+  local v
+  for v in $(git rev-parse --local-env-vars 2>/dev/null) GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_NAMESPACE; do
+    unset "$v"
+  done
+}
+
 # The repo's metadata, then the dry-run push, in one background job (git can be slow on a big
 # checkout or a network-mounted one): `repo.*` lines into $work/repo.facts, and the push's files.
+# Run in a subshell of its own (`(repo_job) &`): what it unsets stays there.
 repo_job() {
   local gd branch op urls u keys=""
+  git_env_clean
   {
     printf 'repo.path=%s\n' "$course_repo"
     if [ ! -e "$course_repo" ]; then
@@ -331,7 +344,8 @@ push_probe() {
   (
     # HOME too, for a git older than GIT_CONFIG_GLOBAL (2.32); ssh finds ~/.ssh by the passwd entry.
     export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND=$s HOME=$work XDG_CONFIG_HOME=$work
-    unset GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_DIR GIT_WORK_TREE GIT_ASKPASS SSH_ASKPASS
+    git_env_clean
+    unset GIT_ASKPASS SSH_ASKPASS
     git -c init.defaultBranch=probe init -q "$p" &&
       git -C "$p" -c core.hooksPath=/dev/null -c user.name=arena -c user.email=arena@check commit -q --no-verify --allow-empty -m probe &&
       bounded 20 git -C "$p" -c core.hooksPath=/dev/null -c credential.helper= push --dry-run --no-verify --porcelain \

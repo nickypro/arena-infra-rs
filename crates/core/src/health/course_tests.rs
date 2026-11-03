@@ -475,7 +475,7 @@ fn kernel_verdicts() {
         (
             k("kernel.specs", "kernel.specs=none\nkernel.own_args=arena-env"),
             Status::Warn,
-            "not started: the arena-env kernel has its own arguments (its kernel.json) — `arena pods ask apple`".into(),
+            "not started: arena-env has its own arguments — `arena pods ask apple`".into(),
         ),
         (facts(&good_lines()), Status::Pass, "arena-env: torch 2.9.0+cu130 in 4.3s".into()),
     ];
@@ -539,6 +539,13 @@ fn every_verdict_fits_the_notes_cell() {
         ("claude.auth", "claude.auth=api_key\nclaude.call=messages\nclaude.http=429"),
         ("claude.auth", "claude.auth=bearer\nclaude.base_host=gateway.example\nclaude.call=messages\nclaude.http=502\nclaude.error=Bad gateway"),
         ("claude.auth", "claude.auth=none"),
+        // Kernels named by whoever registered them: any length.
+        ("kernel.specs", "kernel.specs=none\nkernel.own_args=course-week-4-kernel,another-custom-kernel,a-third-one-with-a-long-name"),
+        ("kernel.name", "kernel.name=a-participants-own-kernel-with-a-long-name"),
+        ("kernel.start_secs", "kernel.start=error: RuntimeError: Kernel died before replying to kernel_info\nkernel.name=a-participants-own-kernel-with-a-long-name"),
+        ("kernel.torch", "kernel.torch=timed out after 25s\nkernel.name=a-participants-own-kernel-with-a-long-name"),
+        ("kernel.torch", "kernel.torch=error: ImportError: libcudnn.so.9: cannot open shared object file\nkernel.name=a-participants-own-kernel-with-a-long-name"),
+        ("kernel.torch", "kernel.name=a-participants-own-kernel-with-a-long-name\nkernel.error=the kernel check timed out after 50s"),
     ] {
         lines.push(with(k, v).replace("/opt/arena-env", "/root/ARENA_materials/.venv"));
     }
@@ -740,6 +747,12 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
     // the push never reads it (its own empty repo, no global or system config).
     std::fs::write(home.join(".gitconfig"), "[url \"https://ghp_COURSE0TEST0PAT@127.0.0.1:9/\"]\n\tinsteadOf = git@github.com:\n").unwrap();
     git(&repo, &["config", "url.https://ghp_COURSE0TEST0PAT@127.0.0.1:9/.pushInsteadOf", "git@github.com:"]);
+    // A login environment pointing git's storage elsewhere: neither the reads nor the probe's
+    // writes may go there (the sentinel repo stays as it was).
+    let sentinel = root.join("sentinel");
+    std::fs::create_dir_all(&sentinel).unwrap();
+    git(&sentinel, &["init", "-q"]);
+    let sentinel_before = listing(&sentinel);
     let gitdir = repo.join(".git");
     std::fs::create_dir_all(gitdir.join("rebase-merge")).unwrap();
     let before = listing(&home);
@@ -760,6 +773,9 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
         .env("ANTHROPIC_API_KEY", KEY)
         .env("ARENA_TEST_ANTHROPIC_URL", &url)
         .env("PYTHONPATH", &fakes)
+        .env("GIT_OBJECT_DIRECTORY", sentinel.join(".git/objects"))
+        .env("GIT_INDEX_FILE", sentinel.join(".git/index"))
+        .env("GIT_COMMON_DIR", sentinel.join(".git"))
         .env("COURSE_TEST_API_KEY", "course-test-secret-0123456789abcdefghijklmnopqrstuvwxyz")
         .env("no_proxy", "*")
         .env("NO_PROXY", "*")
@@ -772,6 +788,7 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).to_string(), String::from_utf8_lossy(&out.stderr).to_string());
     let after = listing(&home);
     let origin_after = listing(&origin);
+    let sentinel_after = listing(&sentinel);
     let tmp_after = std::fs::read_dir("/tmp").map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("arena_deep.")).count()).unwrap_or(0);
     let requests = seen.lock().unwrap().clone();
     let ssh_calls = std::fs::read_to_string(&ssh_log).unwrap_or_default();
@@ -792,6 +809,7 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
     }
     assert_eq!(before, after, "the run changed something under $HOME:\n{stdout}");
     assert_eq!(origin_before, origin_after, "the dry run sent something");
+    assert_eq!(sentinel_before, sentinel_after, "an inherited GIT_* variable sent a write elsewhere");
     assert!(tmp_after <= tmp_before, "a temp dir left behind");
     let f = parse_deep(&stdout);
     assert!(f.started && f.complete, "{stdout}\n{stderr}");

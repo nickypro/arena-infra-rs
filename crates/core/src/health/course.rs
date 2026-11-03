@@ -922,7 +922,8 @@ fn kernel_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
     // Kernels for the env, but each with arguments (or a launcher) of its own: not started, since
     // they could reach the participant's profile.
     if let (Some("none"), Some(own)) = (k.specs.as_deref(), k.own_args.as_deref()) {
-        return Check::new(name, Warn, format!("not started: the {own} kernel has its own arguments (its kernel.json) — `arena pods ask {s}`"));
+        let own = clip_why(own, 24);
+        return Check::new(name, Warn, format!("not started: {own} has its own arguments — `arena pods ask {s}`"));
     }
     match k.specs.as_deref() {
         Some("none") => return Check::new(name, Warn, format!("{register} (no Jupyter kernel runs {env})")),
@@ -931,9 +932,10 @@ fn kernel_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
         }
         _ => {}
     }
-    let kname = k.name.as_deref().unwrap_or("?");
+    // A kernel's name is the participant's (or an image's) to choose: cut, so the fix still fits.
+    let kname = clip_why(k.name.as_deref().unwrap_or("?"), 12);
     if let Some(why) = &k.start {
-        return Check::new(name, Warn, format!("the {kname} kernel didn't start: {} — `arena pods test --course {s}`", clip_why(why, 28)));
+        return Check::new(name, Warn, format!("the {kname} kernel didn't start: {} — `arena pods test --course {s}`", clip_why(why, 22)));
     }
     let secs = k.start_secs.unwrap_or(0.0) + k.torch_secs.unwrap_or(0.0);
     match k.torch.as_deref() {
@@ -945,12 +947,12 @@ fn kernel_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
         Some(t) => {
             let t = t.strip_prefix("error: ").unwrap_or(t);
             // `ModuleNotFoundError: No module named 'torch'`: the module is the news.
-            let why = clip_why(t.find("No module named").map_or(t, |i| &t[i..]), 34);
+            let why = clip_why(t.find("No module named").map_or(t, |i| &t[i..]), 32);
             return Check::new(name, Fail, format!("can't import torch in {kname}: {why} — `arena pods setup {s}`"));
         }
         None => {
             let why = k.error.as_deref().unwrap_or("no answer");
-            return Check::new(name, Warn, format!("the {kname} kernel: not checked ({}) — `arena pods test --course {s}`", clip_why(why, 40)));
+            return Check::new(name, Warn, format!("the {kname} kernel: not checked ({}) — `arena pods test --course {s}`", clip_why(why, 20)));
         }
     }
     let torch = k.torch_version.as_deref().unwrap_or("?");
