@@ -13,8 +13,9 @@
 # left there. Prints, on stdout:
 #   UNREDACTED_RESTORED <path>   its real keys are back in the file
 #   UNREDACTED_KEPT <path>       its real keys are still set aside: this switch's own (the branch
-#                                has its own version), or one of this branch's that couldn't go back
-#                                (the file changed since) — every such one, every time
+#                                has its own version), one of this branch's that couldn't go back
+#                                (the file changed since), or a version of the file a recover.*
+#                                folder keeps — every such one, every time, until it's gone
 #
 # However a switch ends — a TERM (the bound's; the EXIT trap then restores) or a KILL anywhere (a
 # later switch's restore, or init-branches', recovers) — no version of a file is ever lost, and a
@@ -23,10 +24,12 @@
 # - a copy is made beside the runs and renamed in: whole, or not there;
 # - a file is only replaced through [`unredacted_place`]: in its own directory, entered once and
 #   checked to be the work tree's (a link swapped in for it later is never followed), the live
-#   file is first moved aside into the git dir — recorded with its path, so a KILL right then is
-#   recovered — and the new one linked in only if what was moved aside is exactly what was
-#   expected, bytes and mode, and nothing appeared in its place meanwhile; anything else goes
-#   back (or, its place taken again, is kept as a copy, said).
+#   file is first moved into a recover.* folder of its own — its path and what it should be
+#   written there before, so a KILL right then is recovered — and the new one linked in (`ln -T`:
+#   never over anything that took the name) only if what was moved aside is exactly what was
+#   expected, bytes and mode; else it goes back. What was moved aside is dropped only once it's
+#   back, or is still exactly what was expected while no process has it open or mapped (one could
+#   still write to it: `/proc`); until then its folder keeps it, and it's said.
 
 # Each tracked file whose only difference from the index is keys the redaction knows: set aside.
 # A file with any other uncommitted change is left alone — the switch treats it as it always did,
@@ -60,10 +63,10 @@ unredacted_aside() {
             echo "arena set-branch: couldn't set $f aside - left as it is" >&2
             continue
         fi
-        if unredacted_place "$1" "$f" "$1/$UR_RUN.redacted" "$c" "$UR_RUN"; then r=0; else r=$?; fi
+        if unredacted_place "$1" "$f" "$1/$UR_RUN.redacted" "$c"; then r=0; else r=$?; fi
         case $r in
             0) ;;
-            3) echo "arena set-branch: $f changed while it was set aside - it keeps its own version, and the one before is kept too" >&2 ;;
+            3) echo "arena set-branch: $f changed while it was set aside, or couldn't go back: its versions are kept in $1" >&2 ;;
             *)
                 rm -f -- "$c"
                 echo "arena set-branch: couldn't set $f aside (it changed meanwhile, or its place moved) - left as it is" >&2
@@ -72,6 +75,7 @@ unredacted_aside() {
         rm -f -- "$1/$UR_RUN.redacted"
     done
     git update-index -q --refresh > /dev/null 2>&1 || :
+    unredacted_settle "$1"
 }
 
 # Whether the work tree's $2 can be replaced from the folder $1 (in the git dir), as far as a look
@@ -88,71 +92,88 @@ unredacted_in_place() {
     [ -d "$_d" ] && [ "$(stat -c %d -- "$(dirname -- "$1")")" = "$(stat -c %d -- "$_d")" ]
 }
 
-# Replace the work tree's file $2 by $3 (in the folder $1, the git dir's), if it is now exactly
-# $4 (bytes and mode); $5 is the run it's for. In $2's own directory, entered once (`cd -P`) and
-# checked to be the work tree's: from there on only names in it are used, so a link swapped in for
-# that directory is never followed. The live file is moved aside first ($1/$5.displaced, its path
-# in $1/$5.displaced.path), so nothing it held is lost, and the new one hard-linked in, which never
-# replaces a file that appeared meanwhile. 0: replaced. 1: not tried, nothing changed (it isn't
-# where it was, or isn't a file). 2: left as it is (what was there wasn't $4, and went back; or the
-# place was taken meanwhile, and that stays). 3: what was there wasn't $4, and its place was taken
-# again before it could go back: it's kept as $1/$5/$2.displaced, said as KEPT.
+# Replace the work tree's file $2 by $3, if it is now exactly $4 (bytes and mode). In $2's own
+# directory, entered once (`cd -P`) and checked to be the work tree's: from there on only names in
+# it are used, so a link swapped in for that directory is never followed. The live file is moved
+# into a recover.* folder of its own in $1 first — its path, and the hash and mode it should have,
+# written there before — and the new one hard-linked in with `ln -T`, which never replaces
+# anything that took the name meanwhile (a file, a directory, a link to one). 0: replaced; what was
+# there waits in its folder for [`unredacted_settle`]. 1: not tried, nothing changed. 2: left as
+# it was (what was there wasn't $4, or the new one couldn't go in: it went back). 3: what was there
+# couldn't go back (its name was taken meanwhile, or the link failed): its folder keeps it, said.
 unredacted_place() {
     _dir=$(dirname -- "$2")
     _want=$UR_TOP
     [ "$_dir" = . ] || _want=$UR_TOP/$_dir
-    printf '%s\n' "$2" > "$1/$5.displaced.path" || return 1
+    mkdir -p -- "$1" || return 1
+    _rd=$(mktemp -d "$1/recover.XXXXXX") || return 1
+    if ! { printf '%s\n' "$2" > "$_rd/path" && git hash-object --no-filters -- "$4" > "$_rd/hash" && stat -c %a -- "$4" > "$_rd/mode"; }; then
+        rm -rf -- "$_rd"
+        return 1
+    fi
     _r=0
     (
         _base=${2##*/}
-        { cd -P -- "$_dir" 2>/dev/null && [ "$(pwd -P)" = "$_want" ]; } || exit 1
+        { cd -P -- "$_dir" 2> /dev/null && [ "$(pwd -P)" = "$_want" ]; } || exit 1
         { [ -f "$_base" ] && [ ! -L "$_base" ]; } || exit 1
-        mv -f -- "$_base" "$1/$5.displaced" || exit 1
-        if cmp -s -- "$1/$5.displaced" "$4" && [ "$(stat -c %a -- "$1/$5.displaced")" = "$(stat -c %a -- "$4")" ]; then
-            ln -- "$3" "$_base" 2> /dev/null && r=0 || r=2
-            rm -f -- "$1/$5.displaced"
-            exit $r
+        mv -f -- "$_base" "$_rd/file" || exit 1
+        if [ -f "$_rd/file" ] && [ ! -L "$_rd/file" ] && cmp -s -- "$_rd/file" "$4" \
+            && [ "$(stat -c %a -- "$_rd/file")" = "$(stat -c %a -- "$4")" ] && ln -T -- "$3" "$_base" 2> /dev/null; then
+            : > "$_rd/placed"
+            exit 0
         fi
-        if ln -- "$1/$5.displaced" "$_base" 2> /dev/null; then
-            rm -f -- "$1/$5.displaced"
-            exit 2
+        # Not what was expected, or the new one couldn't go in: what was there goes back.
+        if [ -f "$_rd/file" ] && [ ! -L "$_rd/file" ]; then
+            ln -T -- "$_rd/file" "$_base" 2> /dev/null || exit 3
+        else
+            { mv -n -T -- "$_rd/file" "$_base" 2> /dev/null && [ ! -e "$_rd/file" ] && [ ! -L "$_rd/file" ]; } || exit 3
         fi
-        mkdir -p -- "$1/$5/$(dirname -- "$2")" && mv -f -- "$1/$5.displaced" "$1/$5/$2.displaced"
-        exit 3
+        exit 2
     ) || _r=$?
-    rm -f -- "$1/$5.displaced.path"
+    case $_r in
+        1 | 2) rm -rf -- "$_rd" ;;
+    esac
     return $_r
 }
 
-# Link $1 in as the work tree's $2 if nothing is there: in $2's own directory, entered once and
-# checked to be the work tree's (as [`unredacted_place`] does).
+# Link $1 in as the work tree's $2 if nothing is there (`ln -T`): in $2's own directory, entered
+# once and checked to be the work tree's (as [`unredacted_place`] does).
 unredacted_link_in() {
     _dir=$(dirname -- "$2")
     _want=$UR_TOP
     [ "$_dir" = . ] || _want=$UR_TOP/$_dir
-    (cd -P -- "$_dir" 2> /dev/null && [ "$(pwd -P)" = "$_want" ] && ln -- "$1" "${2##*/}" 2> /dev/null)
+    (cd -P -- "$_dir" 2> /dev/null && [ "$(pwd -P)" = "$_want" ] && ln -T -- "$1" "${2##*/}" 2> /dev/null)
 }
 
-# What a KILL left between [`unredacted_place`]'s two steps: the live file moved aside, its path
-# recorded. Gone from its place: it goes back. Else it's dropped if it's the run's copy or the
-# version the set-aside left (nothing of its own), and kept as the run's `<path>.displaced` (said,
-# KEPT) if not.
+# Every file under $1 that a process has open or mapped, a line each (it could still write to
+# it): from /proc, the pod's own. Without /proc, none known.
+unredacted_held() {
+    [ -d /proc/self/fd ] || return 0
+    {
+        find /proc/[0-9]*/fd -lname "$1/*" 2> /dev/null | while IFS= read -r _l; do readlink -- "$_l" || :; done
+        cat /proc/[0-9]*/maps 2> /dev/null | awk '{ print $6 }' | grep -F -- "$1/" || :
+    } | sort -u
+}
+
+# The recover.* folders [`unredacted_place`] left. One whose replacement didn't happen (a KILL
+# between moving the file aside and linking its replacement in) goes back if its place is empty;
+# one whose file is still exactly what was expected and that no process holds (nothing of its
+# own, and nothing can write to it) is dropped; one with no file in it (a KILL before the move)
+# too. The rest stay, and are said (KEPT).
 unredacted_settle() {
-    for _d in "$1"/*.displaced; do
-        [ -f "$_d" ] || continue
-        _run=${_d##*/}
-        _run=${_run%.displaced}
-        _f=$(cat "$_d.path" 2> /dev/null) || _f=
-        if [ -z "$_f" ]; then
-            :
-        elif [ ! -e "$_f" ] && [ ! -L "$_f" ] && unredacted_link_in "$_d" "$_f"; then
-            rm -f -- "$_d"
-        elif [ -f "$1/$_run/$_f" ] && { cmp -s -- "$_d" "$1/$_run/$_f" || LC_ALL=C sed -E "$REDACT_SED" < "$1/$_run/$_f" | cmp -s - "$_d"; }; then
-            rm -f -- "$_d"
-        else
-            mkdir -p -- "$1/$_run/$(dirname -- "$_f")" && mv -f -- "$_d" "$1/$_run/$_f.displaced" || :
+    _held=$(unredacted_held "$1")
+    for _rd in "$1"/recover.*; do
+        [ -d "$_rd" ] || continue
+        _f=$(cat "$_rd/path" 2> /dev/null) || _f=
+        if [ ! -e "$_rd/file" ] && [ ! -L "$_rd/file" ]; then
+            rm -rf -- "$_rd"
+        elif [ ! -f "$_rd/placed" ] && [ -n "$_f" ] && [ ! -e "$_f" ] && [ ! -L "$_f" ] && unredacted_link_in "$_rd/file" "$_f"; then
+            rm -rf -- "$_rd"
+        elif [ -f "$_rd/file" ] && [ ! -L "$_rd/file" ] && ! printf '%s\n' "$_held" | grep -qxF -- "$_rd/file" \
+            && [ "$(git hash-object --no-filters -- "$_rd/file")" = "$(cat "$_rd/hash" 2> /dev/null)" ] \
+            && [ "$(stat -c %a -- "$_rd/file")" = "$(cat "$_rd/mode" 2> /dev/null)" ]; then
+            rm -rf -- "$_rd"
         fi
-        rm -f -- "$_d.path"
     done
 }
 
@@ -160,8 +181,8 @@ unredacted_settle() {
 # path, go back where the path holds exactly the version the set-aside left there (bytes and mode;
 # through [`unredacted_place`]), and a copy the file already matches is dropped. Nothing else is
 # ever overwritten: a file the participant changed, removed or moved under a link since keeps what
-# they did, and its copy stays — said (KEPT), as are this switch's own copies. Copies from other
-# branches wait for a switch back to theirs.
+# they did, and its copy stays — said (KEPT), as are this switch's own copies and every version a
+# recover.* folder keeps. Copies from other branches wait for a switch back to theirs.
 unredacted_restore() {
     if [ ! -d "$1" ]; then return 0; fi
     UR_TOP=$(pwd -P)
@@ -169,8 +190,9 @@ unredacted_restore() {
     unredacted_settle "$1"
     : > "$1.done"
     for run in $(ls -1 "$1" | sort -r); do
+        case $run in recover.*) continue ;; esac
         if [ ! -d "$1/$run" ] || [ "$(cat "$1/$run.branch" 2>/dev/null)" != "$cur" ]; then continue; fi
-        (cd "$1/$run" && find . -type f ! -name '*.displaced') | sed 's#^\./##' | while IFS= read -r f; do
+        (cd "$1/$run" && find . -type f) | sed 's#^\./##' | while IFS= read -r f; do
             if grep -qxF -- "$f" "$1.done"; then continue; fi
             if [ ! -f "$f" ] || [ -L "$f" ] || ! unredacted_in_place "$1" "$f"; then continue; fi
             if cmp -s -- "$1/$run/$f" "$f"; then
@@ -181,18 +203,29 @@ unredacted_restore() {
             # What the set-aside left there, and the copy to put back, both beside the runs.
             cp -p -- "$1/$run/$f" "$1/$run.redacted" && LC_ALL=C sed -E "$REDACT_SED" < "$1/$run/$f" > "$1/$run.redacted" \
                 && cp -p -- "$1/$run/$f" "$1/$run.back" \
-                && unredacted_place "$1" "$f" "$1/$run.back" "$1/$run.redacted" "$run" \
+                && unredacted_place "$1" "$f" "$1/$run.back" "$1/$run.redacted" \
                 && rm -f -- "$1/$run/$f" && printf '%s\n' "$f" >> "$1.done" && echo "UNREDACTED_RESTORED $f"
             rm -f -- "$1/$run.redacted" "$1/$run.back"
         done
     done
     # A copy cut short (stopped before its rename into place): what it was for is as it was.
     rm -f -- "$1"/*.part "$1"/*.redacted "$1"/*.back
-    # Every key still set aside here and not going back on its own: this switch's, and this branch's.
+    unredacted_settle "$1"
+    # Every key still set aside here and not going back on its own: this switch's, this branch's,
+    # and every version a recover.* folder keeps.
     for run in $(ls -1 "$1"); do
-        if [ -d "$1/$run" ] && { [ "$run" = "${UR_RUN:-}" ] || [ "$(cat "$1/$run.branch" 2>/dev/null)" = "$cur" ]; }; then
-            (cd "$1/$run" && find . -type f) | sed 's#^\./##'
-        fi
+        case $run in
+            recover.*)
+                if [ -d "$1/$run" ]; then
+                    echo "$(cat "$1/$run/path" 2> /dev/null || echo '(a file)') (a version of it in .git/arena-unredacted/$run)"
+                fi
+                ;;
+            *)
+                if [ -d "$1/$run" ] && { [ "$run" = "${UR_RUN:-}" ] || [ "$(cat "$1/$run.branch" 2>/dev/null)" = "$cur" ]; }; then
+                    (cd "$1/$run" && find . -type f) | sed 's#^\./##'
+                fi
+                ;;
+        esac
     done | sort -u | while IFS= read -r f; do echo "UNREDACTED_KEPT $f"; done
     rm -f "$1.done"
     find "$1" -mindepth 1 -depth -type d -empty -delete 2>/dev/null || true

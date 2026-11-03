@@ -660,11 +660,13 @@ interrupt or a TERM puts the keys back first. That holds however the switch ends
   back to git's version kept the placeholder, its key only in `.git/arena-unredacted/`);
 - a copy lands whole or not at all;
 - a file is replaced only from its own directory, entered once and checked to be the work tree's
-  (a link swapped in for it later is never followed): the live file is first moved aside into
-  `.git`, recorded with its path, and the new one linked in only if what was moved aside is
-  exactly what was expected (bytes and mode) and nothing took its place meanwhile — else it goes
-  back. So no version of a file is ever lost, and a file is only ever the participant's version
-  or git's.
+  (a link swapped in for it later is never followed): the live file is first moved into a
+  `recover.*` folder of its own in `.git/arena-unredacted/`, with its path, and the new one linked
+  in (never over anything that took the name) only if what was moved aside is exactly what was
+  expected (bytes and mode) — else it goes back. What was moved aside is dropped only once no
+  process has it open (an editor could still save into it) and it's still what was expected;
+  until then it's kept, and said. So no version of a file is ever lost, and a file is only ever
+  the participant's version or git's.
 
 A file the participant changed, removed, made executable or moved under a link while the switch
 ran keeps what they did; its copy stays, and every switch on that branch says so (`UNREDACTED_KEPT`,
