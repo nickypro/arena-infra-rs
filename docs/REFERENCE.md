@@ -3726,6 +3726,7 @@ macOS (`ignored`, with why):
 | `disk::tests::a_walk_counts_blocks_hard_links_once_and_stops_at_its_cap` | APFS gives a directory no blocks |
 | `replica::tests::the_tidy_up_guesses_nothing` | on APFS the stamp file turns up in its own `find -cnewer` scan |
 | `backup::tests::a_key_left_after_the_redaction_is_never_pushed` | it wraps `/usr/bin/sed`, BSD's on macOS |
+| `restore::tests::a_restore_lands_in_the_volume_copy_through_the_link_and_deletes_nothing`, `…::newer_work_on_the_pod_is_never_reverted_unless_asked` | the stand-in pod's rsync is Homebrew's 3.5, which won't write through the `--keep-dirlinks` link (ELOOP); the Linux runs' is 3.2 |
 | `setup::tests::real_git::the_checkout_gets_the_backups_identity_…`, `hetzner_setup_tests::the_checkout_gets_a_git_identity_…` | git makes an identity up from a macOS host name (`*.local`), so no commit fails for want of one |
 
 `tests/color.rs` skips its terminal half where `script` isn't util-linux's.
