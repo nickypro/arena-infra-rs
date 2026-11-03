@@ -65,7 +65,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use ratatui::prelude::*;
 use tokio::sync::Notify;
 
 use arena_core::balance::{AccountView, BalancePolicy, HttpBalanceApi};
@@ -316,10 +315,9 @@ struct Ui {
     /// How far the result or answer popup last drawn can scroll — its text's height less its
     /// view's — set as it's drawn, so a key never scrolls past the end ([`scroll_by`]).
     result_max: std::cell::Cell<u16>,
-    /// The pods table's last-rendered `(area, scroll_offset)`, set by `pods_table` each
-    /// frame so mouse clicks can be mapped back to a pod row. Cell because `view` borrows
-    /// `&Ui` (the TUI is single-threaded, so interior mutability is safe here).
-    last_table: std::cell::Cell<(Rect, usize)>,
+    /// The pods table's view: kept across frames so it scrolls with a margin past the cursor,
+    /// and where it was last drawn so a click maps back to a pod row.
+    last_table: table::ListView,
     /// What answers `?` ([`ask::real_asker`]; a fake in tests).
     asker: ask::Asker,
     /// The AI last picked in `?` (Tab, or a question asked): the next `?` opens with it.
@@ -484,7 +482,7 @@ async fn main() -> Result<()> {
         marked: std::collections::HashSet::new(),
         result_scroll: 0,
         result_max: std::cell::Cell::new(0),
-        last_table: std::cell::Cell::new((Rect::default(), 0)),
+        last_table: table::ListView::default(),
         ask_ai: None,
         deep_all_armed: None,
         trace,

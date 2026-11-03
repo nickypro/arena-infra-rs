@@ -18,9 +18,10 @@ use arena_core::backups::{self, render as words, Health, PodIn, PodStatus, Statu
 use arena_core::provider::Provider;
 use crossterm::event::KeyCode;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
 use crate::state::{Action, Tone};
+use crate::table::ListView;
 use crate::{centered_rect, demo, tone_style, Mode, Shared, Ui};
 
 /// How often the screen reads the status again while it's open.
@@ -72,8 +73,9 @@ pub(crate) struct State {
     pub back_to: Option<View>,
     pub seen: u64,
     pub saved_at: std::cell::Cell<Option<(u16, u16)>>,
-    /// The pods table as last drawn (area, scroll offset): a click picks a row.
-    pub table: std::cell::Cell<(Rect, usize)>,
+    /// The pods table's view, kept across frames (it scrolls with a margin past the cursor); a
+    /// click picks a row by where it was last drawn.
+    pub table: ListView,
 }
 
 /// The status as last read, in `Shared`.
@@ -236,18 +238,21 @@ pub(crate) fn mouse(m: crossterm::event::MouseEvent, ui: &mut Ui, shared: &Arc<M
         (MouseEventKind::ScrollUp, false) => view.pod = names.get(at.saturating_sub(1)).cloned().or(view.pod),
         (MouseEventKind::ScrollDown, false) => view.pod = names.get((at + 1).min(names.len().saturating_sub(1))).cloned().or(view.pod),
         (MouseEventKind::Down(MouseButton::Left), false) => {
-            let (area, offset) = ui.backups.table.get();
+            let (area, offset) = ui.backups.table.at.get();
             // Rows start under the header.
             let top = area.y.saturating_add(1);
             if m.row < top || m.row >= area.y.saturating_add(area.height) || m.column < area.x || m.column >= area.x.saturating_add(area.width) {
                 return false;
             }
-            let Some(name) = names.get(offset + (m.row - top) as usize).cloned() else { return false };
-            if view.pod.as_deref() == Some(name.as_str()) || (view.pod.is_none() && offset + ((m.row - top) as usize) == 0) {
+            let row = offset + (m.row - top) as usize;
+            let Some(name) = names.get(row).cloned() else { return false };
+            if view.pod.as_deref() == Some(name.as_str()) || (view.pod.is_none() && row == 0) {
                 view.history = true;
                 view.scroll = 0;
             }
             view.pod = Some(name);
+            // The view stays put, so a second click lands on the same pod.
+            ui.backups.table.clicked.set(Some(row));
         }
         _ => return false,
     }
@@ -463,12 +468,10 @@ fn pods_table(f: &mut Frame, status: &Status, ui: &Ui, view: &View, area: Rect, 
         .header(header)
         .row_highlight_style(Style::default().bg(Color::Indexed(237)).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
-    let mut ts = TableState::default();
-    if !pods.is_empty() {
-        ts.select(Some(cursor(&pods, view)));
-    }
+    // The rows sit under the header.
+    let mut ts = ui.backups.table.state((!pods.is_empty()).then(|| cursor(&pods, view)), pods.len(), area.height.saturating_sub(1) as usize);
     f.render_stateful_widget(table, area, &mut ts);
-    ui.backups.table.set((area, ts.offset()));
+    ui.backups.table.drawn(area, &ts);
 }
 
 /// A pod's history, over the screen: each backup's last result, then what the record holds
@@ -693,7 +696,7 @@ mod tests {
         assert!(matches!(ui.mode, Mode::Backups(_)));
         tick(&mut ui, &shared, Instant::now());
         let _ = draw(200, 40, &shared.lock().unwrap(), &ui);
-        let (area, _) = ui.backups.table.get();
+        let (area, _) = ui.backups.table.at.get();
         let names: Vec<String> = shared.lock().unwrap().backups.status.as_ref().unwrap().pods.iter().map(|p| p.name.clone()).collect();
         assert!(crate::handle_mouse(click(area.x + 3, area.y + 2), &mut ui, &shared));
         assert_eq!(view(&ui).pod.as_deref(), Some(names[1].as_str()));
@@ -704,6 +707,40 @@ mod tests {
         let wheel = MouseEvent { kind: MouseEventKind::ScrollDown, column: 0, row: 0, modifiers: KeyModifiers::NONE };
         assert!(crate::handle_mouse(wheel, &mut ui, &shared));
         assert_eq!(view(&ui).pod.as_deref(), Some(names[1].as_str()));
+    }
+
+    /// The screen's pod list scrolls as the dashboard's does: ↓ shows the next two pods before the
+    /// cursor gets to the edge. A click doesn't scroll it, so a second click on the bottom row
+    /// opens the pod the first one picked.
+    #[test]
+    fn the_pod_list_keeps_two_pods_past_the_cursor_and_a_click_stays_put() {
+        let (shared, mut ui) = demo_world(30);
+        let p = provider();
+        key(&mut ui, &shared, &p, KeyCode::Char('b'));
+        tick(&mut ui, &shared, Instant::now());
+        let names: Vec<String> = shared.lock().unwrap().backups.status.as_ref().unwrap().pods.iter().map(|p| p.name.clone()).collect();
+        let frame = |ui: &Ui| {
+            let _ = draw(170, 34, &shared.lock().unwrap(), ui);
+            ui.backups.table.at.get()
+        };
+        let (area, _) = frame(&ui);
+        let visible = area.height as usize - 1;
+        assert!((5..20).contains(&visible), "{area:?}");
+        for _ in 0..visible - 3 {
+            key(&mut ui, &shared, &p, KeyCode::Down);
+        }
+        assert_eq!(frame(&ui).1, 0, "two pods below the cursor still show");
+        key(&mut ui, &shared, &p, KeyCode::Down);
+        assert_eq!(frame(&ui).1, 1, "one more ↓: the view moves a row");
+        let click = |y| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: area.x + 3, row: y, modifiers: KeyModifiers::NONE };
+        let bottom = area.y + area.height - 1;
+        assert!(crate::handle_mouse(click(bottom), &mut ui, &shared));
+        let picked = names[visible].clone();
+        assert_eq!(view(&ui).pod.as_deref(), Some(picked.as_str()));
+        assert_eq!(frame(&ui).1, 1, "the click didn't scroll");
+        assert!(crate::handle_mouse(click(bottom), &mut ui, &shared));
+        assert!(view(&ui).history, "a second click opens its history");
+        assert_eq!(view(&ui).pod.as_deref(), Some(picked.as_str()));
     }
 
     /// The dashboard's own git backup is recorded for the screen and `arena backups` — the pod's

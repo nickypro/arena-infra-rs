@@ -190,6 +190,70 @@ pub(crate) fn gpu_text(p: &Pod, m: Option<&PodMetrics>, narrow: bool) -> String 
     gpu
 }
 
+/// Rows kept in view past the cursor, as vim's `scrolloff` keeps them: moving down shows the next
+/// pods before the cursor reaches the edge, so the end of the list is never a guess. Live (the
+/// human): with the cursor on the bottom row "its kinda hard to know if you are at the end or not".
+pub(crate) const SCROLLOFF: usize = 2;
+
+/// The first row a list of `len` rows shows in `visible` rows: the view stays at `prev` (the last
+/// frame's) until the cursor at `selected` comes within `margin` rows of an edge, then moves just
+/// enough to keep `margin` rows past it in view. On a short list `margin` is cut to
+/// `(visible - 1) / 2`, so a 3-row view still has a middle; at the first and last row there's
+/// nothing more to show. Never past the end: a list that shrank (or a view that grew) shows no
+/// empty rows below while there are rows above. Pure.
+pub(crate) fn scroll_offset(prev: usize, selected: usize, len: usize, visible: usize, margin: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if visible == 0 {
+        return prev.min(len - 1); // nothing shows: the view stays for when it's back
+    }
+    let selected = selected.min(len - 1);
+    let margin = margin.min((visible - 1) / 2);
+    // The rows that must show: `margin` each side of the cursor, as far as the list goes.
+    let (first, last) = (selected.saturating_sub(margin), (selected + margin).min(len - 1));
+    let prev = prev.min(len.saturating_sub(visible));
+    if first < prev {
+        first
+    } else if last >= prev + visible {
+        last + 1 - visible
+    } else {
+        prev
+    }
+}
+
+/// A list's view, kept across frames so it scrolls by [`scroll_offset`]: where it was last drawn
+/// and its first row (a click maps to a row by them), and the row a click put the cursor on. A
+/// click doesn't scroll the view — the row stays under the pointer, for a second click or a
+/// shift-click — until the cursor moves from it.
+#[derive(Debug, Default)]
+pub(crate) struct ListView {
+    /// `(area, first row)` as last drawn. Cells because `view` borrows `&Ui` (the TUI is
+    /// single-threaded).
+    pub(crate) at: std::cell::Cell<(Rect, usize)>,
+    pub(crate) clicked: std::cell::Cell<Option<usize>>,
+}
+
+impl ListView {
+    /// This frame's state for a table of `len` rows, `visible` of them in view, the cursor on
+    /// `selected` (none when there are no rows).
+    pub(crate) fn state(&self, selected: Option<usize>, len: usize, visible: usize) -> TableState {
+        let Some(sel) = selected else { return TableState::default() };
+        let margin = if self.clicked.get() == Some(sel) {
+            0
+        } else {
+            self.clicked.set(None);
+            SCROLLOFF
+        };
+        TableState::new().with_offset(scroll_offset(self.at.get().1, sel, len, visible, margin)).with_selected(sel)
+    }
+
+    /// After the draw: where the rows landed, so a click maps to the pod under it.
+    pub(crate) fn drawn(&self, area: Rect, ts: &TableState) {
+        self.at.set((area, ts.offset()));
+    }
+}
+
 pub(crate) fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: bool) {
     // Which columns show at this width, and how wide: `columns.rs` (its rules, in order, are
     // there). PROXY is as wide as its widest cell, never under its header.
@@ -441,14 +505,11 @@ pub(crate) fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, wi
         .highlight_symbol("▶ ")
         .block(Block::default().borders(Borders::ALL).title("Pods"));
 
-    let mut ts = TableState::default();
-    if !shared.pods.is_empty() {
-        ts.select(Some(ui.selected.min(shared.pods.len() - 1)));
-    }
+    // The rows sit inside the border, under the header.
+    let len = shared.pods.len();
+    let mut ts = ui.last_table.state((len > 0).then(|| ui.selected.min(len - 1)), len, area.height.saturating_sub(3) as usize);
     f.render_stateful_widget(table, area, &mut ts);
-    // Record where the rows landed (area + the scroll offset ratatui chose) so a mouse
-    // click can be mapped back to a pod index.
-    ui.last_table.set((area, ts.offset()));
+    ui.last_table.drawn(area, &ts);
     // And where the 💾 header landed: a click on it opens the backups screen.
     let header_y = area.y.saturating_add(1);
     let buf = f.buffer_mut();
@@ -560,7 +621,7 @@ mod tests {
     use crate::state::{dashboard_snapshot, Rtts};
     use crate::tests::{cfg, draw, fixture_shared, pod, row, screen, ui, NOW};
     use crate::view::view;
-    use crate::Mode;
+    use crate::{handle_mouse, Mode};
 
     #[test]
     fn rows_show_cost_maintenance_health_and_proxy_from_the_snapshot() {
@@ -890,5 +951,95 @@ mod tests {
         shared.ai = Some(UsageView::from_keys(&[key("devtest-alpha", 0.0, 0.0, 0.0)], None));
         shared.ai_cohort = Some(shared.ai.as_ref().unwrap().cohort("devtest", &[]));
         assert!(!draw(220, 50, &shared, &ui).join("\n").contains("ai caps:"));
+    }
+
+    /// The view's first row, as vim's `scrolloff` moves it (9 rows in view, 2 kept past the
+    /// cursor unless cut): still until the cursor comes within the margin of an edge, then just
+    /// enough; never past the end, so a fleet that shrank or a view that grew leaves no empty rows
+    /// below while there are pods above.
+    #[test]
+    fn the_view_keeps_rows_past_the_cursor_and_no_empty_rows() {
+        for (prev, sel, len, visible, margin, want, why) in [
+            (0, 0, 30, 9, 2, 0, "the first pod"),
+            (0, 6, 30, 9, 2, 0, "two pods below it still in view"),
+            (0, 7, 30, 9, 2, 1, "the next row comes into view a row early"),
+            (0, 29, 30, 9, 2, 21, "the last pod (G): the cursor reaches the edge"),
+            (21, 28, 30, 9, 2, 21, "up from the bottom: still"),
+            (21, 23, 30, 9, 2, 21, "still while two rows above it show"),
+            (21, 22, 30, 9, 2, 20, "then a row at a time"),
+            (21, 0, 30, 9, 2, 0, "g"),
+            (3, 11, 30, 9, 0, 3, "no margin (a click): the cursor may sit on the edge"),
+            (0, 1, 30, 3, 2, 0, "3 rows: the margin is cut to one"),
+            (0, 2, 30, 3, 2, 1, "3 rows: one past the cursor"),
+            (5, 5, 30, 3, 2, 4, "3 rows: one above it"),
+            (0, 1, 30, 2, 2, 0, "2 rows: no margin"),
+            (0, 2, 30, 2, 2, 1, "2 rows: the cursor on the edge"),
+            (0, 5, 30, 1, 2, 5, "1 row: the cursor's"),
+            (4, 9, 10, 20, 2, 0, "all in view"),
+            (21, 20, 25, 9, 2, 16, "five pods went: the view ends at the last pod"),
+            (21, 25, 30, 14, 2, 16, "a taller view: no empty rows"),
+            (0, 8, 30, 5, 2, 6, "a shorter view: the margin still shows"),
+            (0, 99, 30, 9, 2, 21, "a cursor past the end is the last pod"),
+            (7, 0, 0, 9, 2, 0, "no pods"),
+            (7, 3, 30, 0, 2, 7, "no rows to draw: the view stays"),
+        ] {
+            assert_eq!(scroll_offset(prev, sel, len, visible, margin), want, "{why}: {prev} {sel} {len} {visible} {margin}");
+        }
+    }
+
+    /// The human, on the dashboard: with the cursor on the bottom row "its kinda hard to know if
+    /// you are at the end or not". On a short terminal (the demo's 30 pods, 9 rows in view) ↓
+    /// shows the next two pods before the cursor gets to the edge; ↑ from the bottom keeps the
+    /// view still until the cursor is two from the top; a click (and a shift-click) moves the
+    /// cursor, never the view, so the row stays under the pointer.
+    #[test]
+    fn the_list_keeps_two_pods_in_view_past_the_cursor() {
+        use crate::input::list_key;
+        use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let conf = cfg("");
+        let shared = Arc::new(std::sync::Mutex::new(Shared::default()));
+        crate::demo::publish(&shared, &conf, 30, 0);
+        let mut ui = ui(conf, Arc::new(FakeRemote::new()));
+        let names: Vec<String> = shared.lock().unwrap().pods.iter().map(|p| p.name.trim_start_matches("devtest-").to_string()).collect();
+        assert_eq!(names.len(), 30);
+        // The pods the rows show, in order, and the cursor's row.
+        let frame = |ui: &Ui, height: u16| -> (Vec<usize>, usize) {
+            let lines = draw(160, height, &shared.lock().unwrap(), ui);
+            let (area, _) = ui.last_table.at.get();
+            let rows = &lines[area.y as usize + 2..(area.y + area.height) as usize - 1];
+            let shown = rows.iter().map(|l| names.iter().position(|n| l.contains(&format!(" {n} "))).unwrap_or_else(|| panic!("no pod in {l:?}"))).collect();
+            (shown, rows.iter().position(|l| l.contains('▶')).expect("the cursor's row"))
+        };
+        let (shown, cursor) = frame(&ui, 14);
+        assert_eq!((shown, cursor), ((0..9).collect(), 0));
+        for sel in 1..30 {
+            list_key(&mut ui, KeyCode::Down, 30);
+            let (shown, cursor) = frame(&ui, 14);
+            assert_eq!(shown[cursor], sel);
+            assert_eq!(shown[0], (sel + 3).saturating_sub(9).min(21), "↓ to {sel}: {shown:?}");
+            assert!(shown.contains(&(sel + 2).min(29)), "↓ to {sel}: the next two show: {shown:?}");
+        }
+        assert_eq!(frame(&ui, 14).1, 8, "the last pod: on the bottom edge, nothing below it");
+        for sel in (0..29).rev() {
+            list_key(&mut ui, KeyCode::Up, 30);
+            let (shown, cursor) = frame(&ui, 14);
+            assert_eq!(shown[cursor], sel);
+            assert_eq!(shown[0], sel.saturating_sub(2).min(21), "↑ to {sel}: still until two from the top: {shown:?}");
+        }
+        // A click on the bottom row: the cursor goes there, the view stays; a shift-click marks it.
+        let (area, _) = ui.last_table.at.get();
+        let bottom = area.y + area.height - 2;
+        let click = |mods| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: area.x + 30, row: bottom, modifiers: mods };
+        assert!(handle_mouse(click(KeyModifiers::NONE), &mut ui, &shared));
+        assert_eq!(ui.selected, 8);
+        assert_eq!(frame(&ui, 14), ((0..9).collect(), 8), "the click didn't scroll");
+        assert!(handle_mouse(click(KeyModifiers::SHIFT), &mut ui, &shared));
+        assert_eq!(ui.marked.len(), 1);
+        assert_eq!(frame(&ui, 14), ((0..9).collect(), 8), "nor did the shift-click");
+        // The next ↓ scrolls again, two past the cursor.
+        list_key(&mut ui, KeyCode::Down, 30);
+        assert_eq!(frame(&ui, 14), ((3..12).collect(), 6));
+        // A shorter terminal keeps the cursor two from its new edge.
+        assert_eq!(frame(&ui, 10), ((7..12).collect(), 2));
     }
 }
