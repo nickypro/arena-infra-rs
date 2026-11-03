@@ -26,7 +26,8 @@
 //! (util-linux < 2.31, busybox) falls back to `&`, with that limitation.
 //!
 //! The wrapper runs the command under the same login-shell/conda wrap as `pods run`
-//! ([`crate::ssh::login_shell_wrap`]), records its own pid first and the exit code last
+//! ([`crate::ssh::login_shell_wrap`]: on a pod with no zsh, bash or sh, and the log's first line
+//! says which — no one reads the start's stderr), records its own pid first and the exit code last
 //! (each via a rename, so a reader never sees half a file), and traps TERM so that killing
 //! the group stops the *command* while the wrapper lives on to record `143`. If it can't
 //! record its pid it doesn't run the command at all (exit `125`): a job nobody can see

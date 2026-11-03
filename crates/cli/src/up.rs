@@ -27,7 +27,7 @@
 //! check whose script actually ran can condemn a host: one that couldn't run (SSH dropped,
 //! timed out) is retried once, then FAILs the name with the pod left running. A FAIL that is
 //! only software/setup (python reporting that torch is missing or doesn't import, a CPU-only
-//! torch, no zsh to run the check in on a bare VM before setup) is never replaced — the new
+//! torch, no zsh on a bare VM before setup — the check runs under bash) is never replaced — the new
 //! pod would boot the same image and fail the same way — so
 //! the name FAILs at once, pod left running, its machine not counted as bad; python dying
 //! before it could report (timeout, OOM, crash) is a host failure. Ctrl+C stops every
@@ -989,8 +989,8 @@ impl Shared<'_, '_> {
             // says nothing about the machine ("confirm before alarming"): once SSH answers
             // again it's run once more, and if that can't run either the name FAILs with the
             // pod left running for a look. A script that never started although SSH worked (no
-            // zsh on a bare VM before setup, no `base64`) is no dropped session: the pod's
-            // software, the same on a retry — judged below as software/setup.
+            // `bash` or `base64` on a bare VM) is no dropped session: the pod's software, the
+            // same on a retry — judged below as software/setup.
             if !script_ran(&h) && !never_started(&h) {
                 say(To::ErrDetail, &format!("[{name}] check: couldn't run it ({}) — once more when SSH answers", h.notes()));
                 match self.or_stop(self.ssh_answers(&target, BootRetry::default())).await {
@@ -2156,7 +2156,7 @@ fn save_bad_host(cfg: &Config, key: &str, bad: &BadHost, now: u64) -> Option<Str
 }
 
 /// Whether SSH worked but the check script never started ([`health::judge_deep_call`] keeps
-/// facts only when the session did): the pod lacks what runs it — zsh before setup, `base64`.
+/// facts only when the session did): the pod lacks what runs it — `bash`, `base64`.
 fn never_started(h: &PodHealth) -> bool {
     h.facts.as_ref().is_some_and(|f| !f.started)
 }
@@ -5067,13 +5067,14 @@ mod tests {
 
     /// Live BPF F1: `up hz2 --check --no-setup` on a bare Hetzner VM — no zsh until setup —
     /// ended "FAILED check: couldn't run the deep check twice (ssh: exit 127: … zsh: command
-    /// not found)". That's the pod's software: a software/setup FAIL at once (no rerun, no
-    /// replacement, its machine not counted as bad), saying to run setup.
+    /// not found)". The check now runs under bash, and the missing zsh is still the pod's
+    /// software: a software/setup FAIL at once (no rerun, no replacement, its machine not
+    /// counted as bad), saying to run setup.
     #[tokio::test(start_paused = true)]
     async fn no_zsh_before_setup_is_a_software_failure_not_a_check_that_could_not_run() {
         let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
         let fake = Arc::new(FakeRemote::new());
-        let no_zsh = || FakeReply::exit(127, "bash: line 1: zsh: command not found");
+        let no_zsh = || FakeReply::exit(0, "arena: no zsh: running under bash\n").with_stdout(DEEP_HEALTHY);
         fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), no_zsh(), no_zsh()]);
         let cfg = cfg(None);
         let run = up_run(&fleet, fake.clone(), &cfg, false, Some(2), None).await;
@@ -5082,7 +5083,7 @@ mod tests {
         let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
 
         assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "never replaced");
-        lines.find("[devtest-apple] check: FAIL (software/setup, not the host) — script: no zsh on the pod");
+        lines.find("[devtest-apple] check: FAIL (software/setup, not the host) — shell: no zsh on the pod");
         match &rows[0].verdict {
             Verdict::Failed { stage: Stage::Check, reason } => assert!(
                 reason.starts_with("software/setup failure, not the host") && reason.contains("`arena pods setup devtest-apple`"),

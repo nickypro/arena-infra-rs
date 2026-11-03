@@ -1705,9 +1705,10 @@ Only a check whose script ran can condemn a host: one that couldn't run (SSH dro
 rerun once SSH answers, and if it still can't run the name FAILs with the pod left running.
 
 A FAIL that is only **software/setup** — as the facts show it: no python, python reporting that
-`import torch` fails, a CPU-only torch (`+cpu`, no CUDA in it) on a GPU pod, the check script never
-starting although SSH worked (no zsh to run it in on a bare VM before setup — `--no-setup` on
-Hetzner — which says to run `arena pods setup`; no `base64`) — is never replaced — a new pod boots
+`import torch` fails, a CPU-only torch (`+cpu`, no CUDA in it) on a GPU pod, no zsh (a bare VM
+before setup — `--no-setup` on Hetzner: the check runs under bash, and a `shell` FAIL says to run
+`arena pods setup`, whatever else failed), the check script never starting although SSH worked (no
+`bash`, no `base64`) — is never replaced — a new pod boots
 the same image and runs the same setup, so it would fail the same way: the name FAILs at once
 (`FAILED check — software/setup failure, not the host — …`), the pod is left running and its machine
 isn't counted as bad (`pods test --deep` says the same under its table).
@@ -2411,14 +2412,24 @@ command on every (selected) pod (concurrent, confirms first naming the pods; eac
 `-t`/`--exclude`/`--on`/`--gpus`/`--dry-run` after it is refused rather than run on every pod, so
 quote a command that takes one, `run 'tmux kill-session -t lab'`; on a timeout the local ssh is
 killed, and the remote command dies at its next write to the closed connection; a pod whose command
-fails shows what it printed on stdout too, then `exit N: <stderr>` — never `Some(N)`; on a pod with
-no zsh yet — a bare VM before setup — it says so and to run `arena pods setup`) / the read-only
+fails shows what it printed on stdout too, then `exit N: <stderr>` — never `Some(N)`) / the read-only
 torch-version health check (90s per pod; with no targets this cohort's pods, as `--deep`). Every dry run's `ssh`/`scp`/`rsync` line is shell-quoted,
 so it pastes as exactly what would run (globs like `'**/.git/**'` don't expand) where the login
 shell is a POSIX one; the remote command is shown as written (see below). By default the confirm
 and the dry run are one line (``Run `nvidia-smi -L` on devtest-alpha, devtest-bravo?``) and the
 `N ok, M failed` tally shows only for several pods; `-v` shows the shell it's wrapped in and the
 tally always.
+
+**The shell it runs in.** On each pod the command runs under zsh after the participants'
+`~/.zshrc` and `conda activate arena-env` (`CONDA_ENV`; empty: no activate), so it sees their env
+and the tokens setup exports. On a pod with **no zsh** (a bare VM before setup, a staff box arena
+never set up) it runs under **bash** after `~/.bashrc` and `conda activate` if there's a `conda`,
+else under `/bin/sh` with nothing sourced. Either way a failing rc or activate is silent and never
+stops the command. The command's output and exit status are its own; that pod's result says it
+once, dimmed: `── errata (no zsh: ran under bash)`, or at the end of its `pods test` row. A
+background job's log starts with the line `arena: no zsh: running under bash`. The checks still
+call such a cohort pod not set up ([`pods test --deep`](#pods-test---deep)). Before 2026-11-03 the
+command failed there (`exit 127: … zsh: command not found`).
 
 **Login shells: POSIX ones and fish.** sshd hands a remote command to the user's login shell, and
 arena's commands are written for bash, zsh and sh. fish reads them its own way: an `if …; then`,
@@ -2487,6 +2498,12 @@ window comes from the API.
 **FAIL**: any CUDA/tensor/copy/NCCL error, count mismatch (torch's count against nvidia-smi's, and
 against the GPUs the provider reports for the pod: fewer fails), missing torch/nvidia-smi, driver
 below the floor, unreachable/timed out — and a dead AI key, which is never the machine's.
+
+**No zsh** (a pod not set up yet): the script runs under bash, and every check is judged as on any
+pod, after a first `shell` FAIL, `no zsh on the pod (setup installs it)`, with the fix: `arena pods
+setup NAME`. It is software/setup whatever else failed: checks run before setup are no evidence
+against the machine, so `up --check` never replaces such a pod or counts its machine as bad.
+`--keys` says the same.
 
 #### AI keys (`--keys`)
 

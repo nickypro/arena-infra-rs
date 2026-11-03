@@ -450,36 +450,77 @@ fn resolve_key_with<R: Fn(&str) -> bool>(configured: &str, home: Option<&str>, r
 /// that never reads `~/.zshrc`, so none of that is present (a bare `bash -ic` reads
 /// `~/.bashrc`, which gets conda *base* but not the participants' `arena-env`). We
 /// therefore source `~/.zshrc` explicitly and then `conda activate <env>` so `python` and
-/// installed packages resolve to the participants' env (activation failure is left
-/// visible on stderr but never aborts the command). Pass `conda_env: None` to source the
-/// rc / tokens without an explicit activate. `~/.zshrc` has no non-interactive guard, so
-/// its init runs in full; using `zsh -c` (not `zsh -ic`) avoids the p10k/gitstatus
-/// chatter an interactive shell prints when it has no controlling TTY.
+/// installed packages resolve to the participants' env (a failed activation is silent and
+/// never aborts the command). Pass `conda_env: None` to source the rc / tokens without an
+/// explicit activate. `~/.zshrc` has no non-interactive guard, so its init runs in full;
+/// using `zsh -c` (not `zsh -ic`) avoids the p10k/gitstatus chatter an interactive shell
+/// prints when it has no controlling TTY.
 ///
-/// The inner command is single-quoted for `zsh -c`; history expansion doesn't apply to a
-/// `-c` string, so a literal `!` is safe.
+/// **No zsh** (a bare VM before setup, a staff box arena never set up): the command runs
+/// anyway, under **bash** when there is one — `~/.bashrc` sourced, then `conda activate <env>`
+/// if there's a `conda`, both as quiet and never aborting as zsh's — else under `/bin/sh`, with
+/// nothing sourced. Before, the wrap was zsh-only, so that a pod's missing shell (and with it
+/// its conda env and tokens) couldn't go unnoticed; but a fleet-wide `pods run` then failed on
+/// exactly the boxes no participant uses (live, project week: 2 of 28 prod VMs). Where it falls
+/// back, the wrap first puts one line on stderr, [`FALLBACK_NOTE`] and the shell, so the caller
+/// still knows: `pods run` takes it off and says `(no zsh: ran under bash)` beside that pod's
+/// result, and the deep and key checks still FAIL such a pod as not set up
+/// ([`login_shell_missing_hint`]). A `~/.bashrc` that returns early when not interactive
+/// (Ubuntu's does) gives the command nothing past that point, as a bare ssh command gets.
+///
+/// The command is single-quoted once (history expansion doesn't apply to a `-c` string, so a
+/// literal `!` is safe), after the chosen shell's startup lines in `$__arena_rc`: zsh is handed
+/// exactly the string it was before, and the command is in the wrap once, not once per shell
+/// (the deep check's script is ~30 KB). The wrap is POSIX: every login shell
+/// [`for_any_login_shell`] serves runs it, and a job's `sh` too.
 pub fn login_shell_wrap(cmd: &str, conda_env: Option<&str>) -> String {
-    let inner = match conda_env.filter(|e| !e.is_empty()) {
-        Some(env) => {
-            format!("source ~/.zshrc 2>/dev/null; conda activate {env} >/dev/null 2>&1; {cmd}")
-        }
-        None => format!("source ~/.zshrc 2>/dev/null; {cmd}"),
+    let env = conda_env.filter(|e| !e.is_empty());
+    let zsh = match env {
+        Some(env) => format!("source ~/.zshrc 2>/dev/null; conda activate {env} >/dev/null 2>&1; "),
+        None => "source ~/.zshrc 2>/dev/null; ".to_string(),
     };
-    format!("zsh -c '{}'", inner.replace('\'', "'\\''"))
+    let bash = match env {
+        Some(env) => format!("source ~/.bashrc 2>/dev/null; command -v conda >/dev/null 2>&1 && conda activate {env} >/dev/null 2>&1; "),
+        None => "source ~/.bashrc 2>/dev/null; ".to_string(),
+    };
+    let q = |s: &str| s.replace('\'', "'\\''");
+    format!(
+        "if command -v zsh >/dev/null 2>&1; then __arena_sh=zsh __arena_rc='{}'; \
+         elif command -v bash >/dev/null 2>&1; then __arena_sh=bash __arena_rc='{}'; echo '{FALLBACK_NOTE}bash' >&2; \
+         else __arena_sh=/bin/sh __arena_rc=; echo '{FALLBACK_NOTE}sh' >&2; fi; \"$__arena_sh\" -c \"$__arena_rc\"'{}'",
+        q(&zsh),
+        q(&bash),
+        q(cmd)
+    )
 }
 
-/// Whether a [`login_shell_wrap`]ped command failed because the pod has no zsh at all — a
-/// bare VM (Hetzner) before setup installs it: exit 127 with the outer shell's `zsh: command
-/// not found` (bash) or `zsh: not found` (dash). The command itself never ran, so its exit
-/// says nothing about it; a retry finds the same, and setup is the fix. Running it under
-/// bash instead would hide that the participants' own shell is missing (and with it their
-/// conda env and tokens), so the wrap stays zsh-only and the caller says this instead. Pure.
-pub fn login_shell_missing(code: Option<i32>, stderr: &str) -> bool {
-    code == Some(127)
-        && stderr.lines().map(str::trim).any(|l| l.ends_with("zsh: command not found") || l.ends_with("zsh: not found"))
+/// The line a [`login_shell_wrap`]ped command puts on stderr before it runs under another shell
+/// than zsh, followed by that shell's name (`bash`, `sh`). Also what a job's log starts with.
+pub const FALLBACK_NOTE: &str = "arena: no zsh: running under ";
+
+/// Which shell a [`login_shell_wrap`]ped command fell back to — `bash` or `sh`, from the
+/// wrap's [`FALLBACK_NOTE`] line in its stderr — and that stderr without the line. `None`: it
+/// ran under zsh (or never got as far as the wrap). Only the first such line is the wrap's; the
+/// rest of stderr, the command's own, stays as it was. Pure.
+pub fn take_fallback_note(stderr: &str) -> (Option<&'static str>, String) {
+    let mut shell = None;
+    let mut rest = String::with_capacity(stderr.len());
+    for line in stderr.split_inclusive('\n') {
+        if shell.is_none() {
+            let line = line.trim();
+            shell = ["bash", "sh"].into_iter().find(|s| line.strip_prefix(FALLBACK_NOTE) == Some(*s));
+            if shell.is_some() {
+                continue;
+            }
+        }
+        rest.push_str(line);
+    }
+    (shell, rest)
 }
 
-/// What to say when [`login_shell_missing`] on `pod` — short, as it lands in a NOTES cell.
+/// What the checks say of a pod with no zsh (a [`take_fallback_note`]) — short, as it lands in
+/// a NOTES cell. Its participants' shell, conda init and tokens are setup's, so on a cohort pod
+/// it is setup that's missing, whatever ran in its place.
 pub fn login_shell_missing_hint(pod: &str) -> String {
     format!("no zsh on the pod (setup installs it) — not set up yet? `arena pods setup {pod}`")
 }
@@ -717,42 +758,89 @@ mod tests {
 
     #[test]
     fn login_shell_wrap_activates_conda_and_quotes() {
-        // Sources ~/.zshrc (conda + token exports), activates the env, and single-quotes
-        // the whole inner command, escaping any embedded quotes.
+        // zsh when there is one: ~/.zshrc (conda + token exports), the env activated; else bash:
+        // ~/.bashrc, the env if there's a conda; else /bin/sh. The command single-quoted once,
+        // embedded quotes escaped.
         let w = login_shell_wrap("python -c 'import torch'", Some("arena-env"));
         assert_eq!(
             w,
-            r#"zsh -c 'source ~/.zshrc 2>/dev/null; conda activate arena-env >/dev/null 2>&1; python -c '\''import torch'\'''"#
+            concat!(
+                "if command -v zsh >/dev/null 2>&1; then __arena_sh=zsh ",
+                "__arena_rc='source ~/.zshrc 2>/dev/null; conda activate arena-env >/dev/null 2>&1; '; ",
+                "elif command -v bash >/dev/null 2>&1; then __arena_sh=bash ",
+                "__arena_rc='source ~/.bashrc 2>/dev/null; command -v conda >/dev/null 2>&1 && conda activate arena-env >/dev/null 2>&1; '; ",
+                "echo 'arena: no zsh: running under bash' >&2; ",
+                "else __arena_sh=/bin/sh __arena_rc=; echo 'arena: no zsh: running under sh' >&2; fi; ",
+                r#""$__arena_sh" -c "$__arena_rc"'python -c '\''import torch'\'''"#,
+            )
         );
+        // A quote in the env name stays inside its quotes too.
+        assert!(login_shell_wrap("true", Some("it's")).contains("conda activate it'\\''s >/dev/null"));
     }
 
     #[test]
     fn login_shell_wrap_without_env_just_sources_rc() {
-        // No conda env => still source ~/.zshrc (rc/tokens), but no explicit activation.
+        // No conda env => still source the rc (tokens), but no explicit activation.
         let w = login_shell_wrap("echo hi", None);
-        assert_eq!(w, r#"zsh -c 'source ~/.zshrc 2>/dev/null; echo hi'"#);
+        assert!(w.contains("__arena_sh=zsh __arena_rc='source ~/.zshrc 2>/dev/null; ';"), "{w}");
+        assert!(w.contains("__arena_sh=bash __arena_rc='source ~/.bashrc 2>/dev/null; ';"), "{w}");
+        assert!(!w.contains("conda") && w.ends_with(r#""$__arena_sh" -c "$__arena_rc"'echo hi'"#), "{w}");
         // Empty string is treated the same as None.
         assert_eq!(login_shell_wrap("echo hi", Some("")), w);
     }
 
-    /// Live BPF F1/S9: a bare Hetzner VM has no zsh until setup, so every wrapped command
-    /// ends `exit 127: bash: line 1: zsh: command not found`. Only the outer shell's own
-    /// "no zsh" counts — a command zsh couldn't find, or another exit, is the command's.
+    /// The fallback note is the wrap's first stderr line on a box with no zsh (after anything
+    /// ssh or the login shell's startup printed). Only an exact line counts, once; the rest of
+    /// stderr — the command's — stays byte for byte.
     #[test]
-    fn login_shell_missing_only_for_the_outer_shell_finding_no_zsh() {
-        for (code, stderr, missing) in [
-            (Some(127), "bash: line 1: zsh: command not found\n", true),
-            (Some(127), "sh: 1: zsh: not found", true),
-            (Some(127), "Warning: Permanently added '1.2.3.4' (ED25519) to the list of known hosts.\nbash: zsh: command not found", true),
-            (Some(127), "zsh:1: command not found: pytest", false), // zsh ran; the command is missing
-            (Some(1), "bash: line 1: zsh: command not found", false),
-            (None, "bash: line 1: zsh: command not found", false),
-            (Some(127), "", false),
+    fn the_fallback_note_is_read_off_stderr_and_only_it() {
+        for (stderr, shell, rest) in [
+            ("", None, ""),
+            ("boom\n", None, "boom\n"),
+            ("arena: no zsh: running under bash\n", Some("bash"), ""),
+            ("arena: no zsh: running under sh\nTraceback…\nValueError\n", Some("sh"), "Traceback…\nValueError\n"),
+            (
+                "Warning: Permanently added '1.2.3.4' (ED25519) to the list of known hosts.\r\narena: no zsh: running under bash\r\nx",
+                Some("bash"),
+                "Warning: Permanently added '1.2.3.4' (ED25519) to the list of known hosts.\r\nx",
+            ),
+            // The command's own copy of the line, after the wrap's, is the command's.
+            ("arena: no zsh: running under sh\narena: no zsh: running under sh\n", Some("sh"), "arena: no zsh: running under sh\n"),
+            // Not the note: another shell, more on the line, zsh's own errors.
+            ("arena: no zsh: running under fish\n", None, "arena: no zsh: running under fish\n"),
+            ("echo arena: no zsh: running under bash", None, "echo arena: no zsh: running under bash"),
+            ("zsh:1: command not found: pytest\n", None, "zsh:1: command not found: pytest\n"),
         ] {
-            assert_eq!(login_shell_missing(code, stderr), missing, "{code:?} {stderr:?}");
+            assert_eq!(take_fallback_note(stderr), (shell, rest.to_string()), "{stderr:?}");
         }
         let hint = login_shell_missing_hint("devtest-hz2");
         assert!(hint.contains("no zsh") && hint.contains("`arena pods setup devtest-hz2`"), "{hint}");
+    }
+
+    /// What each shell is handed, quotes and all, read back by stand-ins for zsh and bash (the
+    /// `/bin/sh` branch hands the bare command: run for real below). zsh is handed exactly what
+    /// the zsh-only wrap handed it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn each_fallback_hands_its_shell_the_command_quoted_once() {
+        let dir = std::env::temp_dir().join(format!("arena-wrap-argv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cmd = "python -c 'import torch; print(\"%d\" % 1)' && echo \\$HOME '!x'";
+        let w = login_shell_wrap(cmd, Some("arena-env"));
+        let old_zsh = format!("source ~/.zshrc 2>/dev/null; conda activate arena-env >/dev/null 2>&1; {cmd}");
+        let bash = format!("source ~/.bashrc 2>/dev/null; command -v conda >/dev/null 2>&1 && conda activate arena-env >/dev/null 2>&1; {cmd}");
+        for (shells, want, note) in [(&["zsh", "bash"][..], format!("zsh|-c|{old_zsh}"), ""), (&["bash"][..], format!("bash|-c|{bash}"), "bash")] {
+            let bin = dir.join(shells.join("-"));
+            std::fs::create_dir_all(&bin).unwrap();
+            for sh in shells {
+                crate::remote::write_test_script(&bin.join(sh), format!("#!/bin/sh\nprintf '%s|%s|%s' {sh} \"$1\" \"$2\"\n")).unwrap();
+            }
+            let o = std::process::Command::new("/bin/sh").arg("-c").arg(&w).env_clear().env("PATH", &bin).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&o.stdout), want);
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert_eq!(err, if note.is_empty() { String::new() } else { format!("{FALLBACK_NOTE}{note}\n") });
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -939,21 +1027,56 @@ echo \"été ✓\"
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// A pod with no zsh yet (before setup) is still said to be one through the transport: the
-    /// `zsh: … not found` that [`login_shell_missing`] reads comes from bash and from dash as from
-    /// a bare command (review ai-review claude pr18 #1), exit 127.
+    /// The wrap for real, sent as [`for_any_login_shell`] sends it, under each login shell
+    /// installed here, in a scratch `$HOME` whose rc files say they were read and give a `conda`
+    /// that says what it activated. On a PATH with zsh, zsh runs the command after `~/.zshrc`
+    /// and the activate; with bash but no zsh, bash after `~/.bashrc` and the activate (a noisy,
+    /// failing `conda` is silent; no `conda`, nothing is tried); with neither, `/bin/sh` with
+    /// nothing sourced. Each prints what that shell prints for the command bare, exit 3, and
+    /// on stderr only the note on a fallback.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_missing_zsh_still_reads_as_one_through_the_transport() {
-        let home = std::env::temp_dir().join(format!("arena-no-zsh-{}", std::process::id()));
+    fn the_wrap_runs_under_zsh_else_bash_else_sh_under_each_login_shell() {
+        let dir = std::env::temp_dir().join(format!("arena-wrap-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
-        let sent = for_any_login_shell(&login_shell_wrap("echo hi", Some("arena-env")));
-        for (name, shell) in installed(&["bash", "dash"]) {
-            let o = std::process::Command::new(&shell[0]).arg("-c").arg(&sent).env_clear().env("PATH", "/nonexistent").env("HOME", &home).output().unwrap();
-            let err = String::from_utf8_lossy(&o.stderr);
-            assert!(login_shell_missing(o.status.code(), &err), "{name}: {:?} {err}", o.status.code());
+        std::fs::write(home.join(".zshrc"), "export RC=zshrc\nconda() { export ENV_ON=\"$2\"; }\n").unwrap();
+        let bashrc = "echo rc-noise >&2\nexport RC=bashrc\nconda() { ENV_ON=\"$2\"; echo conda-noise; echo conda-err >&2; return 1; }\n";
+        let path = |names: &[&str]| {
+            let bin = dir.join(format!("bin-{}", names.join("-")));
+            std::fs::create_dir_all(&bin).unwrap();
+            for n in names {
+                let o = std::process::Command::new("sh").arg("-c").arg(format!("command -v {n}")).output().unwrap();
+                std::os::unix::fs::symlink(String::from_utf8_lossy(&o.stdout).trim(), bin.join(n)).unwrap();
+            }
+            bin.display().to_string()
+        };
+        let have_zsh = !installed(&["zsh"]).is_empty();
+        let cmd = format!("echo \"rc=$RC env=$ENV_ON\"\n{GNARLY}");
+        let sent = for_any_login_shell(&login_shell_wrap(&cmd, Some("arena-env")));
+        // (PATH, ~/.bashrc, the shell that runs it, the line the rc and conda give, the note)
+        let bash_only = path(&["bash", "cat"]);
+        let mut cases = vec![
+            (bash_only.clone(), bashrc, "bash", "rc=bashrc env=arena-env", Some("bash")),
+            (bash_only, "export RC=bashrc\n", "bash", "rc=bashrc env=", Some("bash")),
+            (path(&["cat"]), bashrc, "/bin/sh", "rc= env=", Some("sh")),
+        ];
+        if have_zsh {
+            cases.insert(0, (path(&["zsh", "bash", "cat"]), bashrc, "zsh", "rc=zshrc env=arena-env", None));
         }
-        let _ = std::fs::remove_dir_all(&home);
+        for (name, shell) in installed(&["bash", "zsh", "dash", "busybox", "fish"]) {
+            for (path, bashrc, runs, rc, note) in &cases {
+                std::fs::write(home.join(".bashrc"), bashrc).unwrap();
+                let runs = if *runs == "/bin/sh" { vec!["/bin/sh".to_string()] } else { installed(&[*runs]).remove(0).1 };
+                let bare = as_sshd(&runs, &home, GNARLY, &[("PATH", path.as_str())]);
+                assert_eq!(bare.1, Some(3), "{name} {runs:?} bare: {}", bare.2);
+                let got = as_sshd(&shell, &home, &sent, &[("PATH", path.as_str())]);
+                let err = note.map_or(String::new(), |n| format!("{FALLBACK_NOTE}{n}\n"));
+                assert_eq!(got, (format!("{rc}\n{}", bare.0), Some(3), err), "{name} on {path}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The login shell's startup runs once, as for a bare command: bash's `~/.bashrc` (sourced over

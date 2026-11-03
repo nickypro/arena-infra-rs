@@ -837,6 +837,7 @@ impl FailureKind {
 /// The kind of failure a FAILed check named `name` reports ([`FailureKind`]), from the facts it
 /// was judged by. `Software` only where those facts put it on the image/setup:
 /// - `script`: the check script never started.
+/// - `shell`: the pod has no zsh, so it isn't set up ([`judge_deep_call`]).
 /// - `torch`: python said so itself — no python on PATH, or `import torch` raised. When python
 ///   never got to say (killed by its timeout or the OOM killer, a crash — SIGILL on a CPU
 ///   without the instructions torch was built for, a segfault — or its output cut off), the
@@ -853,7 +854,7 @@ pub fn failure_kind_of(name: &str, facts: Option<&DeepFacts>) -> FailureKind {
         return FailureKind::Key;
     }
     let software = match (name, facts) {
-        ("script", _) => true,
+        ("script" | NO_ZSH, _) => true,
         ("torch", Some(f)) => f.python.as_deref() == Some("missing") || f.torch.as_deref().is_some_and(|t| t != "ok"),
         ("cuda", Some(f)) => f.cpu_only_torch(),
         _ => false,
@@ -1584,8 +1585,12 @@ impl PodHealth {
     /// machine, else `Software` as soon as one is about the image/setup, else `Key` — every one
     /// is an AI key's ([`failure_kind_of`]); `None` when nothing failed. A pod that couldn't be
     /// checked at all (`ssh`) is `Host` here — `up --check` never judges such a pod by its checks
-    /// (it re-runs the check instead).
+    /// (it re-runs the check instead). A pod with no zsh ([`NO_ZSH`]) is `Software` whatever else
+    /// failed: it isn't set up, and checks run before setup are no evidence against its machine.
     pub fn failure_kind(&self) -> Option<FailureKind> {
+        if self.checks.iter().any(|c| c.name == NO_ZSH && c.status == Status::Fail) {
+            return Some(FailureKind::Software);
+        }
         let facts = self.facts.as_ref();
         let kinds: Vec<FailureKind> =
             self.checks.iter().filter(|c| c.status == Status::Fail).map(|c| failure_kind_of(&c.name, facts)).collect();
@@ -1627,18 +1632,13 @@ fn judge_call(
     match call {
         Err(why) => PodHealth::unreachable(pod, why),
         Ok(out) => {
+            // No zsh, so the check ran under bash or sh (`ssh::login_shell_wrap`): a bare VM before
+            // setup (live: Hetzner `up --check --no-setup`). SSH worked (the wrap said so), its
+            // facts are judged as any pod's, and a [`NO_ZSH`] FAIL first says it isn't set up.
+            let (fallback, stderr) = crate::ssh::take_fallback_note(&out.stderr);
             let facts = parse_deep(&out.stdout);
-            let stderr = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-            if !facts.started && crate::ssh::login_shell_missing(out.code, &out.stderr) {
-                // No zsh to run it in: a bare VM before setup (live: Hetzner `up --check
-                // --no-setup`). SSH worked and the script never started — the pod's software,
-                // like a missing `base64` below: a `script` FAIL (software/setup), with the fix.
-                let mut health = judge(pod, facts, policy);
-                for c in health.checks.iter_mut().filter(|c| c.name == "script") {
-                    c.detail = crate::ssh::login_shell_missing_hint(&pod.name);
-                }
-                health
-            } else if !facts.started && !out.success {
+            let stderr = stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+            if !facts.started && !out.success && fallback.is_none() {
                 // ssh itself failed (255 = refused/auth/…): say that, not "no output".
                 PodHealth::unreachable(pod, format!("{}: {stderr}", out.exit_label()))
             } else {
@@ -1650,11 +1650,19 @@ fn judge_call(
                         c.detail = format!("{} ({stderr})", c.detail);
                     }
                 }
+                if fallback.is_some() {
+                    health.checks.insert(0, Check::new(NO_ZSH, Status::Fail, crate::ssh::login_shell_missing_hint(&pod.name)));
+                    health.status = overall(&health.checks);
+                }
                 health
             }
         }
     }
 }
+
+/// The check a pod with no zsh FAILs ([`judge_call`]): software/setup, whatever else failed
+/// ([`PodHealth::failure_kind`]).
+pub const NO_ZSH: &str = "shell";
 
 /// What marks a CUDA version read by torch rather than nvidia-smi, and the footnote saying so.
 const TORCH_CUDA_MARK: &str = "*";
@@ -2609,8 +2617,8 @@ deep_check_end=1
             (Err("timed out after 150s".into()), Status::Fail, "ssh", "timed out after 150s"),
             (Ok(out(false, 255, "", "\nssh: connect to host 1.1.1.1 port 22: Connection refused\n")), Status::Fail, "ssh", "exit 255: ssh: connect to host"),
             (Ok(out(true, 0, "", "bash: base64: command not found")), Status::Fail, "script", "(bash: base64: command not found)"),
-            // Live BPF F1: a bare VM before setup has no zsh to run the check in.
-            (Ok(out(false, 127, "", "bash: line 1: zsh: command not found")), Status::Fail, "script", "`arena pods setup devtest-apple`"),
+            // Live BPF F1: a bare VM before setup has no zsh: the check runs under bash and says so.
+            (Ok(out(true, 0, HEALTHY_2GPU, "arena: no zsh: running under bash\n")), Status::Fail, NO_ZSH, "`arena pods setup devtest-apple`"),
         ];
         for (call, want, name, detail) in cases {
             let what = format!("{call:?}");
@@ -2622,27 +2630,36 @@ deep_check_end=1
     }
 
     /// Live BPF F1: `up --check --no-setup` on a bare Hetzner VM ended "couldn't run the deep
-    /// check twice (ssh: exit 127: … zsh: command not found)". No zsh is the pod's software
-    /// (setup installs it), never its machine: one `script` FAIL, software/setup, saying the
-    /// fix — and SSH having worked, the facts are there (unstarted), unlike an unreachable pod.
+    /// check twice (ssh: exit 127: … zsh: command not found)". With no zsh the check runs under
+    /// bash (or sh), and its facts are judged as any pod's — but a missing zsh is still the pod's
+    /// setup (setup installs it), never its machine: a `shell` FAIL first, with the fix, and
+    /// software/setup whatever else failed. The wrap's note is no stderr of the script's.
     #[test]
-    fn no_login_shell_is_a_software_failure_with_the_setup_hint() {
+    fn no_zsh_is_a_software_failure_with_the_setup_hint_beside_the_checks_run_under_bash() {
         let vm = Pod { provider: "hetzner".into(), ..pod("hz2", "5.6.7.8") };
-        let call = Ok(SshOutput {
-            success: false,
-            code: Some(127),
-            stdout: String::new(),
-            stderr: "bash: line 1: zsh: command not found\n".into(),
-        });
-        let h = judge_deep_call(&vm, call, &cuda13());
+        let call = |code: i32, stdout: &str, stderr: &str| {
+            Ok(SshOutput { success: code == 0, code: Some(code), stdout: stdout.into(), stderr: format!("arena: no zsh: running under bash\n{stderr}") })
+        };
+        let h = judge_deep_call(&vm, call(0, HEALTHY_2GPU, ""), &cuda13());
         assert_eq!(h.status, Status::Fail);
-        assert_eq!(h.checks.len(), 1, "{:#?}", h.checks);
-        assert_eq!(h.checks[0].name, "script");
+        assert_eq!(h.checks[0].name, NO_ZSH);
         assert!(h.checks[0].detail.contains("no zsh") && h.checks[0].detail.contains("`arena pods setup devtest-hz2`"), "{:#?}", h.checks);
         assert_eq!(h.failure_kind(), Some(FailureKind::Software));
-        assert!(h.facts.as_ref().is_some_and(|f| !f.started), "{h:#?}");
-        assert!(h.notes().contains("`arena pods setup devtest-hz2`"), "the hint survives the NOTES clip: {}", h.notes());
-        // Any other exit 127 (ssh itself, a missing tool after zsh started) is not this.
+        assert!(h.checks[1..].iter().all(|c| c.status != Status::Fail) && h.checks.len() > 5, "the rest ran: {:#?}", h.checks);
+        assert!(h.notes().starts_with("shell: no zsh") && h.notes().contains("`arena pods setup devtest-hz2`"), "the hint survives the NOTES clip: {}", h.notes());
+        // A host fault found under bash is no evidence against the machine yet: software/setup.
+        let cuinit = edit(HEALTHY_2GPU, &[("cuda_available", Some("false")), ("cuda_error", Some("error: RuntimeError: Error 999: unknown error"))]);
+        let h = judge_deep_call(&pod("apple", "1.1.1.1"), call(0, &cuinit, ""), &cuda13());
+        assert_eq!((h.status, check(&h.checks, "cuda").status, h.failure_kind()), (Status::Fail, Status::Fail, Some(FailureKind::Software)), "{:#?}", h.checks);
+        // No bash either: /bin/sh can't start the script — no ssh failure, the script's stderr.
+        let h = judge_deep_call(&vm, call(127, "", "sh: 1: bash: not found\n"), &cuda13());
+        assert_eq!(h.checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), [NO_ZSH, "script"], "{:#?}", h.checks);
+        assert!(h.checks[1].detail.ends_with("(sh: 1: bash: not found)"), "{:#?}", h.checks);
+        assert!(h.facts.as_ref().is_some_and(|f| !f.started) && h.failure_kind() == Some(FailureKind::Software), "{h:#?}");
+        // The keys-only run alike: its keys judged, the missing zsh first.
+        let keys = judge_key_call(&vm, call(0, "deep_check=2\nopenrouter.key=missing\nhf.key=missing\ndeep_check_end=1\n", ""), &HealthPolicy::default());
+        assert_eq!((keys.checks[0].name.as_str(), keys.failure_kind()), (NO_ZSH, Some(FailureKind::Software)), "{:#?}", keys.checks);
+        // With zsh, nothing of this: an ssh failure is still one.
         let other = Ok(SshOutput { success: false, code: Some(255), stdout: String::new(), stderr: "zsh: command not found".into() });
         assert_eq!(judge_deep_call(&vm, other, &cuda13()).checks[0].name, "ssh");
     }
