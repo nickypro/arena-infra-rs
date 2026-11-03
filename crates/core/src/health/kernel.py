@@ -8,6 +8,7 @@ IPYTHONDIR, set into the kernel's own environment over whatever its spec says): 
 participant's is written."""
 
 import os
+import re
 import signal
 import sys
 import time
@@ -20,8 +21,21 @@ def one(v, n=300):
     return " ".join(str(v).split())[:n]
 
 
+# Values an error could echo, scrubbed before anything is clipped: the environment's secrets (by
+# their names) and whatever the kernel's spec sets.
+SECRETISH = re.compile(r"KEY|TOKEN|SECRET|PASSW|CREDENTIAL", re.I)
+secrets = [v for k, v in os.environ.items() if SECRETISH.search(k) and len(v) >= 8]
+
+
+def scrub(text):
+    for s in sorted(secrets, key=len, reverse=True):
+        text = text.replace(s, "[secret]")
+    text = re.sub(r"[Bb]earer\s+[^\s\"]+", "Bearer [secret]", text)
+    return re.sub(r"(^|[^A-Za-z0-9])(sk|hf)[-_][A-Za-z0-9._~-]+", r"\1[secret]", text)
+
+
 def kv(k, v):
-    print(f"kernel.{k}={one(v)}", flush=True)
+    print(f"kernel.{k}={one(scrub(str(v)))}", flush=True)
 
 
 def err(e):
@@ -33,13 +47,29 @@ ISOLATION = ("JUPYTER_RUNTIME_DIR", "IPYTHONDIR", "PYTHONDONTWRITEBYTECODE")
 
 
 def runs_this_python(argv, bindir):
-    """A spec runs this env's ipykernel: argv[0] is a python in this env's `bin` (the directory
+    """A spec runs this env's python: argv[0] is a python in this env's `bin` (the directory
     compared, never the interpreter it links to — two venvs share one), or a bare `python`
-    jupyter_client launches as the python that starts it (this one); and it starts ipykernel."""
+    jupyter_client launches as the python that starts it (this one)."""
     exe = argv[0] if argv else ""
     bare = exe in ("python", "python3", f"python{sys.version_info[0]}.{sys.version_info[1]}")
     ours = os.path.isabs(exe) and os.path.realpath(os.path.dirname(exe)) == bindir
-    return (bare or ours) and any(a.startswith("ipykernel") for a in argv[1:])
+    return bare or ours
+
+
+def plain(spec):
+    """A spec this check may start without giving up its read-only promise: python's own `-X`
+    flags, then `-m ipykernel_launcher` (or `ipykernel`), then `-f {connection_file}` — nothing
+    else, which could point IPython at the participant's profile or run their startup code — and
+    no provisioner of its own."""
+    argv = spec.get("argv") or []
+    rest = argv[1:]
+    while rest and rest[0].startswith("-X"):
+        rest = rest[1:]
+    launcher = rest[:2] in (["-m", "ipykernel_launcher"], ["-m", "ipykernel"])
+    tail = rest[2:] in (["-f", "{connection_file}"], [f"--f={{connection_file}}"])
+    provisioner = (spec.get("metadata") or {}).get("kernel_provisioner")
+    local = not provisioner or provisioner.get("provisioner_name") in (None, "local-provisioner")
+    return launcher and tail and local
 
 
 def main():
@@ -64,11 +94,16 @@ def main():
     except BaseException as e:
         kv("specs", err(e))
         return
-    mine, registered = [], []
+    mine, registered, own = [], [], []
     for name, s in sorted(specs.items()):
-        argv = (s.get("spec") or {}).get("argv") or []
+        spec = s.get("spec") or {}
+        argv = spec.get("argv") or []
         if not runs_this_python(argv, bindir):
             continue
+        if not plain(spec):
+            own.append(name)
+            continue
+        secrets.extend(v for v in (spec.get("env") or {}).values() if isinstance(v, str) and len(v) >= 8)
         mine.append(name)
         # Registered: a kernel.json on disk (the user's, the system's, or the env's own share dir,
         # where pip puts ipykernel's) — not the one jupyter_client makes up from ipykernel's own
@@ -78,6 +113,8 @@ def main():
             registered.append(name)
     kv("specs", ",".join(mine) or "none")
     kv("registered", ",".join(registered) or "none")
+    if own:
+        kv("own_args", ",".join(own))
     if not mine:
         return
     name = (registered or mine)[0]

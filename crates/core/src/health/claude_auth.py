@@ -71,12 +71,24 @@ def settings(path):
     return env, bool(data.get("apiKeyHelper"))
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an answer, never followed: urllib would carry the credential's header to
+    wherever it points (another host, plain HTTP)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
 def call(url, headers, body=None):
-    """(HTTP status, the answer's message): 0 and why when nothing answered."""
+    """(HTTP status, the answer's message): 0 and why when nothing answered. A redirect's 3xx is
+    an answer (not followed)."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+        with OPENER.open(req, timeout=TIMEOUT) as r:
             return r.status, ""
     except urllib.error.HTTPError as e:
         try:
@@ -85,6 +97,9 @@ def call(url, headers, body=None):
             ans = {}
         err = ans.get("error") if isinstance(ans, dict) else None
         msg = (err.get("message") if isinstance(err, dict) else err) or (ans.get("message") if isinstance(ans, dict) else "")
+        if 300 <= e.code < 400:
+            where = urllib.parse.urlsplit(e.headers.get("Location") or "").hostname or "?"
+            return e.code, f"redirects to {where} (not followed)"
         return e.code, str(msg or e.reason)[:16384]
     except Exception as e:  # unreachable, a timeout, TLS
         return 0, str(getattr(e, "reason", e))[:16384]
@@ -134,7 +149,11 @@ def main():
     if base:
         kv("base_host", urllib.parse.urlsplit(base).hostname or "?")
     if not var:
-        if kind == "login":
+        # A /login's token refreshes itself, a helper is the participant's program, a cloud
+        # provider's credentials are its own: none is asked here, `--claude-call` or not.
+        if paid and kind in ("login", "helper", "cloud"):
+            kv("call", "skipped")
+        elif kind == "login":
             kv("call", "none")
         return
     secret = eff[var]

@@ -297,19 +297,19 @@ repo_job() {
 $urls
 URLS
     printf 'repo.origin_keys=%s\n' "$(trim "$keys")"
-    printf '%s' "$branch" >"$work/repo.branch"
     : >"$work/repo.ok"
   } >"$work/repo.facts"
   push_probe
 }
 
-# A dry run of the push the backup makes, with its deploy key, to the cohort repo's SSH URL —
-# never origin's own URL, which could carry a credential to a command line or a credential
-# helper: GitHub answers a push for the key (a read-only key, or one not on the repo, is refused)
-# and nothing is sent. No hook runs (`--no-verify`, no hooks path), no credential helper, and a
-# host key ssh hasn't seen goes into the temp dir's known-hosts file, never the machine's.
+# A dry run of a push to the cohort repo's SSH URL with the deploy key: GitHub answers a push for
+# the key (a read-only key, or one not on the repo, is refused) and nothing is sent. It runs from an
+# empty repo of its own in the temp dir, with git's global and system config off — never in the
+# participant's repo, never with their config, whose `insteadOf` could turn the URL into one that
+# carries a credential (to a command line, or a helper). No hook runs, and a host key ssh hasn't
+# seen goes into the temp dir's known-hosts file, never the machine's.
 push_probe() {
-  local key=$course_key ref s
+  local key=$course_key s p=$work/push-probe
   [ -e "$work/repo.ok" ] || return 0
   if [ -z "$course_origin" ]; then
     echo none >"$work/push.key"
@@ -320,15 +320,17 @@ push_probe() {
     echo missing >"$work/push.key"
     return 0
   fi
-  ref=$(cat "$work/repo.branch" 2>/dev/null)
   s="ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
   s="$s -o 'UserKnownHostsFile=$work/known_hosts $HOME/.ssh/known_hosts'"
   [ -z "$key" ] || s="$s -i '$key' -o IdentitiesOnly=yes"
   (
-    cd "$course_repo" &&
-      GIT_SSH_COMMAND=$s GIT_TERMINAL_PROMPT=0 bounded 20 git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-        -c credential.helper= push --dry-run --no-verify --porcelain "git@github.com:$course_origin.git" \
-        "HEAD:refs/heads/${ref:-arena-push-check}" >"$work/push.out" 2>"$work/push.err"
+    # HOME too, for a git older than GIT_CONFIG_GLOBAL (2.32); ssh finds ~/.ssh by the passwd entry.
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND=$s HOME=$work XDG_CONFIG_HOME=$work
+    unset GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_DIR GIT_WORK_TREE GIT_ASKPASS SSH_ASKPASS
+    git -c init.defaultBranch=probe init -q "$p" &&
+      git -C "$p" -c core.hooksPath=/dev/null -c user.name=arena -c user.email=arena@check commit -q --no-verify --allow-empty -m probe &&
+      bounded 20 git -C "$p" -c core.hooksPath=/dev/null -c credential.helper= push --dry-run --no-verify --porcelain \
+        "git@github.com:$course_origin.git" "HEAD:refs/heads/arena-push-check" >"$work/push.out" 2>"$work/push.err"
     echo "$?" >"$work/push.rc"
   )
 }

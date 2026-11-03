@@ -531,7 +531,11 @@ fn token_check(t: &Token, k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Ch
     let copy = format!("`arena pods copy-keys {s}`");
     if k.set == Some(false) {
         return match unreadable {
-            Some(e) if t.fleet.is_none() => Check::new(name, Warn, format!("missing; who should have one can't be said: {}", short_why(e))),
+            Some(e) if t.fleet.is_none() => Check::new(
+                name,
+                Warn,
+                format!("missing; who should have one can't be said: {} — fix {csv}, then {copy}", short_why(e)),
+            ),
             _ => Check::new(name, Fail, format!("missing — {copy}")),
         };
     }

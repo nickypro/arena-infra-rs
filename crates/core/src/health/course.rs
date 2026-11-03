@@ -207,7 +207,8 @@ pub struct ClaudeFacts {
     /// `openrouter`: the token is the machine's OpenRouter key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub same_as: Option<String>,
-    /// The call made: `models` (free), `openrouter` (free), `messages` (`--claude-call`), `none`.
+    /// The call made: `models` (free), `openrouter` (free), `messages` (`--claude-call`), `none`,
+    /// `skipped` (`--claude-call` for an auth it can't ask about: a /login, a helper, a cloud).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -230,9 +231,12 @@ pub struct KernelFacts {
     /// The kernels that run the env's python (`none`), or why they couldn't be listed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub specs: Option<String>,
-    /// Those an `ipykernel install` registered (`none`).
+    /// Those with a kernel.json on disk (`none`: only ipykernel's built-in one).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registered: Option<String>,
+    /// Kernels for the env with arguments or a launcher of their own: never started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub own_args: Option<String>,
     /// The one started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -344,6 +348,7 @@ pub(super) fn course_fact(f: &mut DeepFacts, key: &str, value: &str) -> bool {
                 "ipykernel" => k.ipykernel = text(),
                 "specs" => k.specs = text(),
                 "registered" => k.registered = text(),
+                "own_args" => k.own_args = text(),
                 "name" => k.name = text(),
                 "start" => k.start = text(),
                 "start_secs" => k.start_secs = num(),
@@ -853,9 +858,17 @@ fn claude_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
     };
     let what = &what;
     let answered = |h: u16| (200..300).contains(&h);
-    let claude_code_only = c.error.as_deref().is_some_and(|e| e.contains("Claude Code"));
+    // A subscription token answers a plain Messages call with this, past its authentication:
+    // only that, and only for one (a gateway's "not permitted to use Claude Code" is a refusal).
+    let claude_code_only = c.auth.as_deref() == Some("oauth")
+        && c.error.as_deref().is_some_and(|e| e.contains("only authorized for use with Claude Code"));
     let again = format!("`arena pods test --course {s}`");
     match (c.call.as_deref(), c.http) {
+        (Some("skipped"), _) => Check::new(
+            name,
+            Warn,
+            format!("v{v}, {what}: not asked (--claude-call can't for it) — there, `claude -p hi` (uses the account)"),
+        ),
         (Some("models" | "openrouter" | "messages"), Some(h)) if answered(h) => Check::new(name, Pass, format!("v{v}, {what}: accepted")),
         (Some("messages"), Some(400 | 403)) if claude_code_only => Check::new(name, Pass, format!("v{v}, {what}: accepted (for Claude Code only)")),
         (Some(_), Some(h @ (401 | 403))) => Check::new(name, Fail, format!("v{v}: {short} rejected (HTTP {h}) — {fix} ({which})")),
@@ -906,6 +919,14 @@ fn kernel_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
         }
     }
     let register = run(format!("{env}/bin/python -m ipykernel install --user"));
+    match (k.specs.as_deref(), k.own_args.as_deref()) {
+        // Kernels for the env, but each with arguments (or a launcher) of its own: not started,
+        // since they could reach the participant's profile.
+        (Some("none"), Some(own)) => {
+            return Check::new(name, Warn, format!("not started: the {own} kernel has its own arguments (its kernel.json) — `arena pods ask {s}`"))
+        }
+        _ => {}
+    }
     match k.specs.as_deref() {
         Some("none") => return Check::new(name, Warn, format!("{register} (no Jupyter kernel runs {env})")),
         Some(e) if e.starts_with("error") => {

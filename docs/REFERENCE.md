@@ -2559,11 +2559,16 @@ same script. Everything is read-only:
 
 - the course repo is read through git's metadata (refs, config, the operation markers) with no
   optional locks, never a file of the work;
-- the push is a dry run to the cohort repo's SSH URL (never `origin`'s own URL, which could carry a
-  credential), with no hooks and no credential helper, and a host key ssh hasn't seen goes to a temp
-  file;
-- the kernel runs with its runtime and IPython files in the script's temp dir, and is stopped before
-  the script ends;
+- the push is a dry run to the cohort repo's SSH URL from an empty repo of its own in the temp dir,
+  with git's global and system config off: never the participant's repo or config, whose `origin`
+  or `insteadOf` could carry a credential. No hook, no credential helper, and a host key ssh hasn't
+  seen goes to a temp file;
+- the kernel runs with its runtime and IPython files in the script's temp dir (set over its spec's
+  own `env`), and is stopped before the script ends. Only a plain ipykernel spec is started (`-m
+  ipykernel_launcher -f {connection_file}`, no arguments or provisioner of its own, which could
+  reach the participant's profile);
+- what a service or the kernel says is scrubbed of every secret before it is clipped, and the Claude
+  check never follows a redirect (it would carry the credential's header elsewhere);
 - the proxy is only connected through.
 
 | Check | What it looks at | FAIL | WARN | What it says to run |
@@ -2583,6 +2588,8 @@ claude` pushed, because the only call that proves it works uses the account. **`
 that call: one Messages request per machine (an OAuth token, an API key, a Bearer token to another
 base URL), 1 token from `claude-haiku-5-5`, which counts against the account's limits (or its money,
 for an API key). OpenRouter's key check stays the free one: it's exact, and its money is `ai_key`'s.
+A /login, an apiKeyHelper and a cloud provider are never asked: with `--claude-call` that's a WARN
+saying so.
 
 A course FAIL is never the machine's. `up --check` never replaces a machine for one, never retries
 it and never remembers its host as bad. It says the FAIL with what to run and keeps the machine:

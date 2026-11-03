@@ -389,6 +389,32 @@ fn claude_verdicts() {
             "v2.1.30, arena claude's a@x: accepted (for Claude Code only)".into(),
         ),
         (claude_lines("claude.auth=login\nclaude.call=none\n"), book(), Status::Pass, "v2.1.30, a /login".into()),
+        // `--claude-call` for an auth it can't ask about: said, never a quiet pass.
+        (
+            claude_lines("claude.auth=login\nclaude.call=skipped\n"),
+            book(),
+            Status::Warn,
+            "v2.1.30, a /login: not asked (--claude-call can't for it) — there, `claude -p hi` (uses the account)".into(),
+        ),
+        // "Claude Code" in a refusal is a refusal: only the subscription token's own answer passes.
+        (
+            claude_lines("claude.auth=api_key\nclaude.fingerprint=aa4dca9da125\nclaude.call=messages\nclaude.http=403\nclaude.error=Your organization is not permitted to use Claude Code\n"),
+            book(),
+            Status::Fail,
+            "v2.1.30: ANTHROPIC_API_KEY rejected (HTTP 403) — `arena pods copy-keys apple` (aa4dca9da125)".into(),
+        ),
+        (
+            oauth("claude.call=messages\nclaude.http=403\nclaude.error=Your organization is not permitted to use Claude Code\n"),
+            pushed(&fp),
+            Status::Fail,
+            format!("v2.1.30: its token rejected (HTTP 403) — renew it, then {push} (arena claude's a@x)"),
+        ),
+        (
+            claude_lines("claude.auth=bearer\nclaude.base_host=gw.example\nclaude.fingerprint=aa4dca9da125\nclaude.call=models\nclaude.http=302\nclaude.error=redirects to evil.example (not followed)\n"),
+            book(),
+            Status::Warn,
+            "v2.1.30: ANTHROPIC_AUTH_TOKEN answered HTTP 302 — `arena pods test --course apple` (gw.example, aa4dca9da125: redirects to evil.example (not followed))".into(),
+        ),
         (
             claude_lines("claude.auth_error=no python3 to read Claude Code's settings\n"),
             book(),
@@ -445,6 +471,11 @@ fn kernel_verdicts() {
             k("kernel.done", "kernel.prefix=/root/other-venv"),
             Status::Warn,
             format!("{register} (the arena-env kernel runs /root/other-venv, not /opt/arena-env)"),
+        ),
+        (
+            k("kernel.specs", "kernel.specs=none\nkernel.own_args=arena-env"),
+            Status::Warn,
+            "not started: the arena-env kernel has its own arguments (its kernel.json) — `arena pods ask apple`".into(),
         ),
         (facts(&good_lines()), Status::Pass, "arena-env: torch 2.9.0+cu130 in 4.3s".into()),
     ];
@@ -675,6 +706,18 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
     std::fs::write(home.join(".name"), "devtest-apple\n").unwrap();
     crate::remote::write_test_script(bin.join("claude"), "#!/bin/sh\necho '2.1.30 (Claude Code)'\n").unwrap();
     crate::remote::write_test_script(bin.join("uv"), "#!/bin/sh\necho 'uv 0.9.5'\n").unwrap();
+    // ssh as git runs it for the push: its arguments logged, GitHub's refusal for the key said.
+    let ssh_log = root.join("ssh.log");
+    crate::remote::write_test_script(
+        bin.join("ssh"),
+        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho 'git@github.com: Permission denied (publickey).' >&2\nexit 255\n", ssh_log.display()),
+    )
+    .unwrap();
+    // The kernel helper's errors scrubbed before they're clipped: a fake ipykernel whose import
+    // error echoes a secret the environment holds, across the 300-character clip.
+    let fakes = root.join("pylib");
+    std::fs::create_dir_all(fakes.join("ipykernel")).unwrap();
+    std::fs::write(fakes.join("ipykernel/__init__.py"), format!("raise ImportError('{} ' + __import__('os').environ['COURSE_TEST_API_KEY'])\n", "y".repeat(250))).unwrap();
     // The course env: a python with no ipykernel.
     std::os::unix::fs::symlink(String::from_utf8(std::process::Command::new("sh").args(["-c", "command -v python3"]).output().unwrap().stdout).unwrap().trim(), env.join("bin/python")).unwrap();
     // The Anthropic models list, answering this key 401.
@@ -693,9 +736,10 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
             let _ = write!(conn, "HTTP/1.1 401 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
         }
     });
-    // The push goes to the cohort repo's SSH URL; here git sends that URL to the local bare repo
-    // (the machine's own config, as a participant's could say anything), so nothing leaves the box.
-    std::fs::write(home.join(".gitconfig"), format!("[url \"{}\"]\n\tinsteadOf = git@github.com:nickypro/arena-sandbox-materials.git\n", origin.display())).unwrap();
+    // A participant's git config that rewrites GitHub's SSH URL into one carrying a credential:
+    // the push never reads it (its own empty repo, no global or system config).
+    std::fs::write(home.join(".gitconfig"), "[url \"https://ghp_COURSE0TEST0PAT@127.0.0.1:9/\"]\n\tinsteadOf = git@github.com:\n").unwrap();
+    git(&repo, &["config", "url.https://ghp_COURSE0TEST0PAT@127.0.0.1:9/.pushInsteadOf", "git@github.com:"]);
     let gitdir = repo.join(".git");
     std::fs::create_dir_all(gitdir.join("rebase-merge")).unwrap();
     let before = listing(&home);
@@ -715,6 +759,8 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
         .env("HOME", &home)
         .env("ANTHROPIC_API_KEY", KEY)
         .env("ARENA_TEST_ANTHROPIC_URL", &url)
+        .env("PYTHONPATH", &fakes)
+        .env("COURSE_TEST_API_KEY", "course-test-secret-0123456789abcdefghijklmnopqrstuvwxyz")
         .env("no_proxy", "*")
         .env("NO_PROXY", "*")
         .env_remove("CLAUDE_CONFIG_DIR")
@@ -728,9 +774,15 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
     let origin_after = listing(&origin);
     let tmp_after = std::fs::read_dir("/tmp").map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("arena_deep.")).count()).unwrap_or(0);
     let requests = seen.lock().unwrap().clone();
+    let ssh_calls = std::fs::read_to_string(&ssh_log).unwrap_or_default();
     let _ = std::fs::remove_dir_all(&root);
 
     assert!(!stdout.contains(KEY) && !stderr.contains(KEY), "the key printed:\n{stdout}\n{stderr}");
+    for piece in ["ghp_COURSE0TEST0PAT", "course-test-secret", "ijklmnopqrstuvwxyz"] {
+        assert!(!stdout.contains(piece) && !stderr.contains(piece), "{piece} printed:\n{stdout}\n{stderr}");
+    }
+    // The push went over ssh to GitHub's own URL, the rewrites never read.
+    assert!(ssh_calls.contains("git@github.com") && ssh_calls.contains("git-receive-pack 'nickypro/arena-sandbox-materials.git'"), "{ssh_calls:?}");
     for line in stdout.lines() {
         assert!(line.contains('='), "stray stdout line {line:?}");
     }
@@ -742,7 +794,9 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
     assert_eq!(f.identity.as_ref().and_then(|i| i.name.as_deref()), Some("devtest-apple"));
     let r = f.repo.clone().unwrap();
     assert_eq!((r.state.as_deref(), r.branch.as_deref(), r.op.as_deref()), (Some("ok"), Some(TODAY), Some("rebase")), "{stdout}");
-    assert_eq!(f.push.as_ref().map(|p| (p.key.as_deref(), p.exit)), Some((Some("default"), Some(0))), "{stdout}\n{stderr}");
+    let p = f.push.clone().unwrap();
+    assert_eq!((p.key.as_deref(), p.exit), (Some("default"), Some(128)), "{stdout}\n{stderr}");
+    assert!(p.error.as_deref().is_some_and(|e| e.contains("Permission denied (publickey)")), "{stdout}");
     let c = f.claude.clone().unwrap();
     assert_eq!(
         (c.version.as_deref(), c.auth.as_deref(), c.fingerprint.as_deref(), c.call.as_deref(), c.http),
@@ -752,14 +806,14 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
     assert!(requests.iter().any(|r| r.starts_with("GET /v1/models") && r.to_ascii_lowercase().contains(&format!("x-api-key: {}", KEY.to_ascii_lowercase()))), "{requests:?}");
     let k = f.kernel.clone().unwrap();
     assert_eq!(k.env.as_deref(), Some(env.display().to_string().as_str()), "the first env with a python");
-    assert!(k.ipykernel.as_deref().is_some_and(|i| i.contains("ModuleNotFoundError")), "{stdout}");
+    assert!(k.ipykernel.as_deref().is_some_and(|i| i.contains("ImportError") && i.contains("[secret]")), "{stdout}");
     assert_eq!(f.uv.as_ref().and_then(|u| u.version.as_deref()), Some("uv 0.9.5"));
     // Judged: the rebase WARNs, the rejected key FAILs, the kernel WARNs; the machine is fine.
     let h = PodHealth::course_checked(&pod("devtest-apple"), f, &HealthPolicy { course: Some(CourseBook { origin: None, ..book() }), ..HealthPolicy::default() });
     let got: Vec<(&str, Status)> = h.checks.iter().map(|c| (c.name.as_str(), c.status)).collect();
     assert_eq!(
         got,
-        [(PROXY, Status::Skip), (BACKUP, Status::Pass), (REPO, Status::Warn), (CLAUDE, Status::Fail), (KERNEL, Status::Warn), (UV, Status::Pass)],
+        [(PROXY, Status::Skip), (BACKUP, Status::Fail), (REPO, Status::Warn), (CLAUDE, Status::Fail), (KERNEL, Status::Warn), (UV, Status::Pass)],
         "{:#?}",
         h.checks
     );
@@ -868,4 +922,59 @@ fn the_claude_helper_never_prints_an_echoed_secret() {
     let _ = std::fs::remove_dir_all(&root);
     assert!(requests.iter().any(|r| r.starts_with("POST /v1/messages") && r.to_ascii_lowercase().contains("x-api-key: sk-ant-api03-paid-call-test")), "{requests:?}");
     assert!(requests.iter().any(|r| r.starts_with("POST /v1/messages") && r.contains(&format!("Bearer {OPAQUE}"))), "{requests:?}");
+}
+
+/// The Claude helper never follows a redirect: it would carry the credential's header wherever
+/// it points (another host, plain HTTP). The 3xx is its answer, the second host asked nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_claude_helper_never_follows_a_redirect() {
+    if !(have("bash") && have("python3") && have("base64") && have("timeout")) {
+        eprintln!("bash/python3/base64/timeout missing — skipping");
+        return;
+    }
+    use std::io::{Read, Write};
+    let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let there = format!("http://{}/v1/models", elsewhere.local_addr().unwrap());
+    let reached = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = reached.clone();
+    std::thread::spawn(move || {
+        for conn in elsewhere.incoming() {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(conn);
+        }
+    });
+    let gateway = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", gateway.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for conn in gateway.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf);
+            let _ = write!(conn, "HTTP/1.1 302 Found\r\nLocation: {there}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    });
+    let home = std::env::temp_dir().join(format!("arena-claude-redirect-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let args = CheckArgs { repo: "/nonexistent".into(), envs: vec![], git_key: None, claude_call: false, origin: None };
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(crate::health::course_check_inner_command(&args))
+        .env("HOME", &home)
+        .env("no_proxy", "*")
+        .env("NO_PROXY", "*")
+        .env("ANTHROPIC_API_KEY", "sk-ant-api03-REDIRECT-TEST-0123456789")
+        .env("ARENA_TEST_ANTHROPIC_URL", &url)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("ANTHROPIC_BASE_URL")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&home);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let c = parse_deep(&stdout).claude.unwrap();
+    assert_eq!((c.call.as_deref(), c.http), (Some("models"), Some(302)), "{stdout}");
+    assert!(c.error.as_deref().is_some_and(|e| e.contains("not followed")), "{stdout}");
+    assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 0, "the redirect was followed");
 }
