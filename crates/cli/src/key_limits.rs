@@ -21,11 +21,10 @@ use arena_core::Config;
 /// `keys limit`'s arguments.
 #[derive(clap::Args, Debug)]
 pub(crate) struct LimitArgs {
-    /// The machines (as for `gen`), then the cap: `10` (USD) sets it, `+5` raises it by $5, `-2`
-    /// lowers it by $2
+    /// The machines (as for `gen`), then the cap: `10` (USD) sets it, `+5` raises it, `-2` lowers it
     ///
     /// The amount is always the last one; with --no-cap there is none.
-    // `-2` is the amount, not a flag (`-$2` isn't a number to clap: `-- -$2`, or just `-2`).
+    // `-2` is the amount, not a flag (`-$2` isn't a number to clap: `-- '-$2'`, or just `-2`).
     // Never `allow_hyphen_values`: after a first value it takes `--yes`, `--expect` as more.
     #[arg(value_name = "TARGET… USD|+USD|-USD", allow_negative_numbers = true)]
     args: Vec<String>,
@@ -155,9 +154,9 @@ async fn reconcile_resumes(api: &dyn KeyApi, naming: &Naming<'_>, attempted: &[S
     }
 }
 
-/// How many keys' changes are under way at once ([`run`]): each is a read and a `PATCH`, a few
-/// hundred ms, so a cohort's caps take a few seconds, not one round trip after another — without
-/// a burst OpenRouter would turn away.
+/// How many machines' changes are under way at once ([`run`]): a machine's is usually one key's,
+/// a read and a `PATCH` (a resume's a listing first), a few hundred ms — so a cohort's caps take
+/// a few seconds, not one round trip after another, without a burst OpenRouter would turn away.
 const AT_ONCE: usize = 8;
 
 /// Drive `futs` on this task, at most `n` at a time (they borrow the `&dyn KeyApi`, which a
@@ -613,45 +612,58 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
     // runs). Then the keys are read once more, and every machine named — a skipped one too (review
     // codex r6 #1: resumed meanwhile, a pause's "already off" would have stood) — is planned again
     // from them ([`moved`]: a change confirmed against keys that have moved since isn't made).
-    // The changes then go out together, [`AT_ONCE`] at a time, each key checked once more in the
-    // request just before its change ([`just_before`]); OpenRouter has no conditional update to
-    // close the rest. The lines keep the plan's order, whatever order the answers come in.
+    // The machines' changes then go out together, [`AT_ONCE`] machines at a time, each key checked
+    // once more in the request just before its change ([`just_before`]); OpenRouter has no
+    // conditional update to close the rest. The lines keep the plan's order, whatever order the
+    // answers come in.
     //
-    // A resume too: it can wake a rotated-out key, the one a newer key under the name replaced
-    // (review codex r7 #1), which is why it used to read the keys right before each machine's
-    // change. Read right before all of them now go out, they're as fresh for every machine as
-    // that was for one (later ones wait a round trip or two for room); a newer key made after the
-    // read is the read-back's to find ([`reconcile_resumes`]), as it always was.
+    // A resume reads the keys again for each machine as its turn comes, right before its change:
+    // it can wake a rotated-out key, the one a newer key under the name replaced (review codex r7
+    // #1), and a machine waiting for room would miss a rotation made meanwhile (r1 #1 of the
+    // batch). Those reads go out together too.
     let _lock = keys_lock(cfg).await?;
     let mut machines: Vec<&str> = rows.iter().map(|r| r.machine.as_str()).collect();
     machines.dedup();
-    let fresh = api.list_keys().await.ok();
-    let stale: Vec<(&str, Option<String>)> = machines
-        .iter()
-        .map(|&m| {
-            let why = match &fresh {
-                Some(keys) => moved(&verb, m, &rows.iter().filter(|r| r.machine == m).collect::<Vec<_>>(), keys, &naming),
-                None => Some("the keys couldn't be read again before changing them — nothing done".into()),
+    let fresh = if verb == Verb::Resume { None } else { Some(api.list_keys().await.ok()) };
+    let (verb_ref, naming_ref, fresh_ref, rows_ref) = (&verb, &naming, &fresh, &rows);
+    let jobs = machines.iter().map(|&m| async move {
+        let theirs: Vec<&Row> = rows_ref.iter().filter(|r| r.machine == m).collect();
+        let read;
+        let keys = match fresh_ref {
+            Some(keys) => keys.as_ref(),
+            None => {
+                read = api.list_keys().await.ok();
+                read.as_ref()
+            }
+        };
+        let stale = match keys {
+            Some(keys) => moved(verb_ref, m, &theirs, keys, naming_ref),
+            None => Some("the keys couldn't be read again before changing them — nothing done".into()),
+        };
+        // Each row, how it came out, and whether a change was sent for it.
+        let mut out = Vec::new();
+        for r in theirs {
+            let (outcome, sent) = match (&r.key, &r.update, &stale) {
+                (_, _, Some(why)) => (Outcome::Failed(why.clone()), false),
+                (Some(k), Some(u), None) => match api.update_key(&k.hash, u, Some(&just_before(verb_ref, k))).await {
+                    Ok(()) => (Outcome::Changed, true),
+                    Err(e) => (Outcome::Failed(e.to_string()), true),
+                },
+                _ => (skipped(r), false),
             };
-            (m, why)
-        })
-        .collect();
-    let why = |m: &str| stale.iter().find(|(n, _)| *n == m).and_then(|(_, w)| w.clone());
-    // The keys a change is sent for — answered OK or not (an error may have landed).
-    let attempted: Vec<String> = rows.iter().filter(|r| r.update.is_some() && why(&r.machine).is_none()).filter_map(|r| r.key.as_ref().map(|k| k.hash.clone())).collect();
-    let verb_ref = &verb;
-    let changes = rows.iter().map(|r| async move {
-        match (&r.key, &r.update, why(&r.machine)) {
-            (_, _, Some(reason)) => Outcome::Failed(reason),
-            (Some(k), Some(u), None) => match api.update_key(&k.hash, u, Some(&just_before(verb_ref, k))).await {
-                Ok(()) => Outcome::Changed,
-                Err(e) => Outcome::Failed(e.to_string()),
-            },
-            _ => skipped(r),
+            out.push((r, outcome, sent));
         }
+        out
     });
-    let outcomes = at_most(AT_ONCE, changes.collect()).await;
-    let mut done: Vec<(Row, Outcome, Option<KeyInfo>)> = rows.iter().cloned().zip(outcomes).map(|(r, o)| (r, o, None)).collect();
+    let mut done: Vec<(Row, Outcome, Option<KeyInfo>)> = Vec::new();
+    // The keys a change was sent for — answered OK or not (an error may have landed).
+    let mut attempted: Vec<String> = Vec::new();
+    for (r, outcome, sent) in at_most(AT_ONCE, jobs.collect()).await.into_iter().flatten() {
+        if sent {
+            attempted.extend(r.key.as_ref().map(|k| k.hash.clone()));
+        }
+        done.push((r.clone(), outcome, None));
+    }
     // What OpenRouter says now: each changed key read back, and a change it didn't take said.
     let reread = api.list_keys().await.map_err(|e| e.to_string());
     for (r, outcome, now) in &mut done {
@@ -1121,6 +1133,30 @@ Changed 2, unchanged 0, failed 0.
         assert!((1..=12).all(|i| api.key(&format!("h{i:02}")).limit == Some(if i == 5 { 1.0 } else { 2.0 })));
     }
 
+    /// A resume reads the keys for each machine as its turn comes (r1 #1 of the batch): a key
+    /// rotated while its machine waited for room is refused before its change — never woken, to be
+    /// turned off again after.
+    #[tokio::test]
+    async fn a_resume_waiting_for_room_reads_the_keys_when_its_turn_comes() {
+        let names: Vec<&'static str> = (1..=9).map(|i| &*format!("devtest-k{i:02}").leak()).collect();
+        let mut keys: Vec<KeyInfo> = names.iter().enumerate().map(|(i, n)| key(&format!("h{:02}", i + 1), n, Some(1.0), 0.0, true, "2026-10-30T10:00:00Z")).collect();
+        keys.push(key("h09-old", "devtest-k09", Some(1.0), 0.0, true, "2026-10-01T10:00:00Z"));
+        let turns = names.iter().take(8).map(|n| (*n, 3)).collect();
+        // k09's key rotated while the first eight are under way.
+        let rotated: Meanwhile = ("h09-old", |k| {
+            k.hash = "h09-new".into();
+            k.disabled = false;
+            k.created_at = Some("2026-10-31T10:00:00Z".into());
+        });
+        let api = Keys { turns, ..Keys::with(keys).meanwhile(vec![], vec![(1, rotated)]) };
+        let argv = [&["resume"][..], &names].concat();
+        assert_eq!(keys_cmd(&argv, &api).await.unwrap_err(), "1 key(s) failed");
+        let calls = api.calls();
+        assert!(calls.len() == 8 && !calls.iter().any(|c| c.starts_with("h09 ")), "{calls:?}");
+        assert!(api.key("h09").disabled, "never woken");
+        assert_eq!(*api.peak.lock().unwrap(), AT_ONCE);
+    }
+
     /// A key that moved between the listing the plan was made from and the change (review codex
     /// r1 #1: `+5` confirmed as `$5 → $10` set $10 over a cap raised to $25 meanwhile) isn't
     /// changed; the others are.
@@ -1169,14 +1205,14 @@ Changed 2, unchanged 0, failed 0.
             k.disabled = false;
             k.created_at = Some("2026-10-31T10:00:00Z".into());
         });
-        // Made before the keys are read again (right before the changes go out): refused there
-        // (r7 #1).
-        let api = Keys::with(keys.clone()).meanwhile(vec![(1, newer)], vec![]);
+        // Made before cloud's keys are read again (a resume reads them right before each machine's):
+        // refused there (r7 #1).
+        let api = Keys::with(keys.clone()).meanwhile(vec![(2, newer)], vec![]);
         assert_eq!(keys_cmd(&["resume", "alpha", "cloud"], &api).await.unwrap_err(), "1 key(s) failed");
         assert_eq!(api.calls(), [r#"ha {"disabled":false}"#]);
         // Made after that read, before the change: the old key is woken, then found beside the newer
         // one and turned off again (r7 #1).
-        let api = Keys::with(keys.clone()).meanwhile(vec![(2, newer)], vec![]);
+        let api = Keys::with(keys.clone()).meanwhile(vec![(3, newer)], vec![]);
         assert_eq!(keys_cmd(&["resume", "alpha", "cloud"], &api).await.unwrap_err(), "1 key(s) failed");
         assert_eq!(api.calls(), [r#"ha {"disabled":false}"#, r#"hc {"disabled":false}"#, r#"hc {"disabled":true}"#]);
         assert!(api.key("hc").disabled && !api.key("hc-new").disabled);
@@ -1185,15 +1221,15 @@ Changed 2, unchanged 0, failed 0.
             k.hash = "hc-new".into();
             k.created_at = Some("2026-10-31T10:00:00Z".into());
         });
-        let api = Keys::with(keys.clone()).meanwhile(vec![(2, off_newer)], vec![]);
+        let api = Keys::with(keys.clone()).meanwhile(vec![(3, off_newer)], vec![]);
         assert_eq!(keys_cmd(&["resume", "alpha", "cloud"], &api).await.unwrap_err(), "1 key(s) failed");
         assert!(api.key("hc").disabled, "turned off again");
         // A resume that landed but was answered with an error (r8 #2) is reconciled too.
-        let api = Keys { landed_then_failed: vec![2], ..Keys::with(keys.clone()).meanwhile(vec![(2, newer)], vec![]) };
+        let api = Keys { landed_then_failed: vec![2], ..Keys::with(keys.clone()).meanwhile(vec![(3, newer)], vec![]) };
         assert_eq!(keys_cmd(&["resume", "alpha", "cloud"], &api).await.unwrap_err(), "1 key(s) failed");
         assert!(api.key("hc").disabled, "turned off again");
         // Turning it off again answered OK but not made (r8 #3): said as it is — still on.
-        let api = Keys { ignored_updates: vec![3], ..Keys::with(keys.clone()).meanwhile(vec![(2, newer)], vec![]) };
+        let api = Keys { ignored_updates: vec![3], ..Keys::with(keys.clone()).meanwhile(vec![(3, newer)], vec![]) };
         let e = keys_cmd(&["resume", "alpha", "cloud", "--json"], &api).await.unwrap_err();
         assert_eq!(e, "1 key(s) failed");
         assert!(!api.key("hc").disabled, "still on: said so, never 'turned off again'");

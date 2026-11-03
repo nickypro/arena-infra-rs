@@ -2224,8 +2224,8 @@ ones included — the listing walks every page).
 cap where it is (`PATCH /keys/{hash}`: the secret, its spend and the pod's copy of the key all stay —
 nothing to copy, the participant's next call works): `10` sets the cap, `+5` raises each key's own
 cap by $5, `-2` lowers it by $2 (`arena keys limit apple +5`, `arena keys limit --all -2`). The amount
-is always the last argument (`-$2` only after `--`: `arena keys limit apple -- -$2`; `-2` needs
-nothing). A lowering that would leave $0 or less is refused, `--force` too (`0` sets a $0 cap;
+is always the last argument (`-$2` only after `--`, and quoted for the shell: `arena keys limit
+apple -- '-$2'`; `-2` needs neither). A lowering that would leave $0 or less is refused, `--force` too (`0` sets a $0 cap;
 `keys pause` stops a key). `--reset daily|weekly|monthly|never` changes when the cap starts over (00:00 UTC, weeks
 from Monday; `+0 --reset daily` keeps the cap); `--no-cap` takes the cap away — never an amount. A
 change that tightens a cap (lower, a first cap, another reset period) under what the key has spent
