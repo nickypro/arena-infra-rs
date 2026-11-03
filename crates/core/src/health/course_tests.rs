@@ -670,6 +670,47 @@ fn have(tool: &str) -> bool {
     std::process::Command::new("sh").args(["-c", &format!("command -v {tool}")]).output().is_ok_and(|o| o.status.success())
 }
 
+/// One HTTP request off `conn`, read in full: the head up to its blank line, then the body its
+/// `Content-Length` gives. The stubs used to answer after a single `read`, and Python's
+/// `http.client` sends a POST's head and body apart. So a stub could close with the body still
+/// unread, Linux resets a connection closed that way, and the helper got `ConnectionResetError`
+/// instead of the answer (CI on #77, 2026-11-03).
+fn read_request(conn: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+    let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    let (mut got, mut buf) = (Vec::new(), [0u8; 4096]);
+    let head_end = loop {
+        if let Some(i) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        match conn.read(&mut buf) {
+            Ok(0) | Err(_) => return String::from_utf8_lossy(&got).into(),
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    };
+    let body_len = String::from_utf8_lossy(&got[..head_end])
+        .lines()
+        .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")).and_then(|(_, v)| v.trim().parse::<usize>().ok()))
+        .unwrap_or(0);
+    while got.len() < head_end + body_len {
+        match conn.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    String::from_utf8_lossy(&got).into()
+}
+
+/// Send `answer` and close gently: shut the write half, then read until the client closes, so
+/// nothing it sent late turns the close into a reset ([`read_request`]).
+fn answer_and_close(mut conn: std::net::TcpStream, answer: &str) {
+    use std::io::{Read, Write};
+    let _ = conn.write_all(answer.as_bytes());
+    let _ = conn.shutdown(std::net::Shutdown::Write);
+    let mut buf = [0u8; 1024];
+    while matches!(conn.read(&mut buf), Ok(n) if n > 0) {}
+}
+
 fn git(dir: &std::path::Path, args: &[&str]) {
     let ok = std::process::Command::new("git")
         .args(["-c", "user.email=t@t", "-c", "user.name=t", "-c", "init.defaultBranch=main"])
@@ -748,14 +789,11 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let log = seen.clone();
     std::thread::spawn(move || {
-        use std::io::{Read, Write};
         for conn in listener.incoming() {
             let Ok(mut conn) = conn else { continue };
-            let mut buf = [0u8; 4096];
-            let n = conn.read(&mut buf).unwrap_or(0);
-            log.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).into());
+            log.lock().unwrap().push(read_request(&mut conn));
             let body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
-            let _ = write!(conn, "HTTP/1.1 401 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            answer_and_close(conn, &format!("HTTP/1.1 401 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()));
         }
     });
     // A participant's git config that rewrites GitHub's SSH URL into one carrying a credential:
@@ -909,16 +947,13 @@ fn the_claude_helper_never_prints_an_echoed_secret() {
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let log = seen.clone();
     std::thread::spawn(move || {
-        use std::io::{Read, Write};
         for conn in listener.incoming() {
             let Ok(mut conn) = conn else { continue };
-            let mut buf = [0u8; 8192];
-            let n = conn.read(&mut buf).unwrap_or(0);
-            log.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).into());
+            log.lock().unwrap().push(read_request(&mut conn));
             // The first echo straddles the helper's 160-character clip, the second the script's 300.
             let pad = "x".repeat(110);
             let body = format!(r#"{{"error":{{"message":"{pad} bad token {OPAQUE} {pad} {OPAQUE}"}}}}"#);
-            let _ = write!(conn, "HTTP/1.1 401 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            answer_and_close(conn, &format!("HTTP/1.1 401 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()));
         }
     });
     let root = std::env::temp_dir().join(format!("arena-claude-scrub-{}", std::process::id()));
@@ -975,7 +1010,6 @@ fn the_claude_helper_never_follows_a_redirect() {
         eprintln!("bash/python3/base64/timeout missing — skipping");
         return;
     }
-    use std::io::{Read, Write};
     let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let there = format!("http://{}/v1/models", elsewhere.local_addr().unwrap());
     let reached = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -991,9 +1025,8 @@ fn the_claude_helper_never_follows_a_redirect() {
     std::thread::spawn(move || {
         for conn in gateway.incoming() {
             let Ok(mut conn) = conn else { continue };
-            let mut buf = [0u8; 4096];
-            let _ = conn.read(&mut buf);
-            let _ = write!(conn, "HTTP/1.1 302 Found\r\nLocation: {there}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            read_request(&mut conn);
+            answer_and_close(conn, &format!("HTTP/1.1 302 Found\r\nLocation: {there}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"));
         }
     });
     let home = std::env::temp_dir().join(format!("arena-claude-redirect-{}", std::process::id()));
@@ -1032,17 +1065,15 @@ fn a_secret_past_every_clip_is_still_scrubbed() {
         return;
     }
     const OPAQUE: &str = "OPAQUE0long0gateway0token0abcdefghijklmnopqrstuvwxyz0123456789";
-    use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(mut conn) = conn else { continue };
-            let mut buf = [0u8; 8192];
-            let _ = conn.read(&mut buf);
+            read_request(&mut conn);
             // 6 + 16360 = 16366: a cut at 16384 would keep 18 of the token's characters.
             let reason = format!("Denied{}{OPAQUE}", " ".repeat(16_360));
-            let _ = write!(conn, "HTTP/1.1 401 {reason}\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno");
+            answer_and_close(conn, &format!("HTTP/1.1 401 {reason}\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno"));
         }
     });
     let home = std::env::temp_dir().join(format!("arena-claude-clip-{}", std::process::id()));
