@@ -266,6 +266,12 @@ in_repo() {
 # point our reads at another repo, and the probe's writes into it.
 git_env_clean() {
   local v
+  # Tracing first (it writes wherever it points, from the first git call on): every GIT_TRACE*
+  # unset, and trace2's targets off over whatever the global or system config says.
+  for v in $(env | sed -n 's/^\(GIT_TRACE[A-Za-z0-9_]*\)=.*/\1/p'); do
+    unset "$v"
+  done
+  export GIT_TRACE2=0 GIT_TRACE2_EVENT=0 GIT_TRACE2_PERF=0
   for v in $(git rev-parse --local-env-vars 2>/dev/null) GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
     GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_NAMESPACE; do
     unset "$v"
@@ -379,7 +385,8 @@ push_report() {
 }
 
 # Claude Code as root's login shell finds it: `claude --version`, and which auth it would use
-# (the python below; kinds and fingerprints only), asked of its service where that is free.
+# (the python below, isolated: `-I`, the standard library alone; kinds and fingerprints only),
+# asked of its service where that is free.
 claude_start() {
   local py
   py=$(command -v python3 2>/dev/null || command -v python 2>/dev/null)
@@ -393,7 +400,7 @@ claude_start() {
 @ARENA_CLAUDE_PY@
 CLAUDEPY
       ARENA_ANTHROPIC_URL=$ANTHROPIC_URL ARENA_OPENROUTER_URL=$OR_KEY_URL \
-        bounded 25 "$py" "$work/claude_auth.py" "$claude_call" >"$work/claude.auth" 2>"$work/claude.pyerr"
+        bounded 25 "$py" -I "$work/claude_auth.py" "$claude_call" >"$work/claude.auth" 2>"$work/claude.pyerr"
     else
       echo "claude.auth=unknown" >"$work/claude.auth"
       echo "claude.auth_error=no python3 to read Claude Code's settings" >>"$work/claude.auth"

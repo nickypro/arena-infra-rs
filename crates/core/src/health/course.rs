@@ -724,12 +724,13 @@ fn repo_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
     let name = REPO;
     let s = book.short(&pod.name);
     let Some(r) = f.repo.as_ref().filter(|r| r.state.is_some()) else { return Check::new(name, Skip, NOT_REPORTED) };
-    let path = r.path.as_deref().unwrap_or("?");
+    // Cut: a long path would push the fix out of the NOTES cell.
+    let path = clip_why(r.path.as_deref().unwrap_or("?"), 32);
     match r.state.as_deref() {
         Some("ok") => {}
         Some("missing") => return Check::new(name, Fail, format!("no course repo at {path} — `arena pods setup {s}`")),
         Some(e) => {
-            return Check::new(name, Warn, format!("can't read {path}: {} — `arena pods ask {s}`", clip_why(e.strip_prefix("error: ").unwrap_or(e), 40)))
+            return Check::new(name, Warn, format!("can't read {path}: {} — `arena pods ask {s}`", clip_why(e.strip_prefix("error: ").unwrap_or(e), 26)))
         }
         None => unreachable!(),
     }

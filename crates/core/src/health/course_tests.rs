@@ -257,7 +257,7 @@ fn repo_verdicts() {
             facts(&with("repo.state", "repo.state=error: fatal: detected dubious ownership in repository at '/root/ARENA_materials'")),
             book(),
             Status::Warn,
-            "can't read /root/ARENA_materials: fatal: detected dubious ownership in re… — `arena pods ask apple`".into(),
+            "can't read /root/ARENA_materials: fatal: detected dubious o… — `arena pods ask apple`".into(),
         ),
         (
             facts(&with("repo.origin_keys", "repo.origin_keys=github.com/arena-education/arena_materials").replace("repo.origin=github.com:nickypro", "repo.origin=github.com:ARENA-education")),
@@ -539,7 +539,9 @@ fn every_verdict_fits_the_notes_cell() {
         ("claude.auth", "claude.auth=api_key\nclaude.call=messages\nclaude.http=429"),
         ("claude.auth", "claude.auth=bearer\nclaude.base_host=gateway.example\nclaude.call=messages\nclaude.http=502\nclaude.error=Bad gateway"),
         ("claude.auth", "claude.auth=none"),
-        // Kernels named by whoever registered them: any length.
+        // A repo path, kernels named by whoever registered them: any length.
+        ("repo.state", "repo.state=missing\nrepo.path=/root/a-course-repo-under-a-very-long-directory-name-that-someone-chose-for-their-materials"),
+        ("repo.state", "repo.state=error: fatal: not a git repository\nrepo.path=/root/a-course-repo-under-a-very-long-directory-name-that-someone-chose"),
         ("kernel.specs", "kernel.specs=none\nkernel.own_args=course-week-4-kernel,another-custom-kernel,a-third-one-with-a-long-name"),
         ("kernel.name", "kernel.name=a-participants-own-kernel-with-a-long-name"),
         ("kernel.start_secs", "kernel.start=error: RuntimeError: Kernel died before replying to kernel_info\nkernel.name=a-participants-own-kernel-with-a-long-name"),
@@ -776,6 +778,9 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
         .env("GIT_OBJECT_DIRECTORY", sentinel.join(".git/objects"))
         .env("GIT_INDEX_FILE", sentinel.join(".git/index"))
         .env("GIT_COMMON_DIR", sentinel.join(".git"))
+        .env("GIT_TRACE", root.join("git-trace.log"))
+        .env("GIT_TRACE_PACKET", root.join("git-trace-packet.log"))
+        .env("GIT_TRACE2_EVENT", root.join("git-trace2.json"))
         .env("COURSE_TEST_API_KEY", "course-test-secret-0123456789abcdefghijklmnopqrstuvwxyz")
         .env("no_proxy", "*")
         .env("NO_PROXY", "*")
@@ -789,6 +794,7 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
     let after = listing(&home);
     let origin_after = listing(&origin);
     let sentinel_after = listing(&sentinel);
+    let traced: Vec<&str> = ["git-trace.log", "git-trace-packet.log", "git-trace2.json"].into_iter().filter(|f| root.join(f).exists()).collect();
     let tmp_after = std::fs::read_dir("/tmp").map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("arena_deep.")).count()).unwrap_or(0);
     let requests = seen.lock().unwrap().clone();
     let ssh_calls = std::fs::read_to_string(&ssh_log).unwrap_or_default();
@@ -810,6 +816,7 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
     assert_eq!(before, after, "the run changed something under $HOME:\n{stdout}");
     assert_eq!(origin_before, origin_after, "the dry run sent something");
     assert_eq!(sentinel_before, sentinel_after, "an inherited GIT_* variable sent a write elsewhere");
+    assert!(traced.is_empty(), "inherited git tracing wrote {traced:?}");
     assert!(tmp_after <= tmp_before, "a temp dir left behind");
     let f = parse_deep(&stdout);
     assert!(f.started && f.complete, "{stdout}\n{stderr}");
