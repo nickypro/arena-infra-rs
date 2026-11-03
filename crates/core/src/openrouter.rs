@@ -602,32 +602,52 @@ pub enum CapChange {
     To(f64),
     /// Raise the cap it has by this many USD (`+5`).
     Raise(f64),
+    /// Lower the cap it has by this many USD (`-2`) — never to $0 or under ([`plan_cap`]).
+    Lower(f64),
     /// No cap at all: only from `--no-cap`, never from an amount typed.
     NoCap,
 }
 
+impl CapChange {
+    /// The amount as `keys limit` takes it — `10`, `+5`, `-2` — what the dashboard passes for what
+    /// was typed: no `$`, which clap would read in `-$2` as flags (only a plain negative number is
+    /// a value there). `None`: no cap, which is `--no-cap`, never an amount.
+    pub fn arg(&self) -> Option<String> {
+        match self {
+            CapChange::To(x) => Some(format!("{x}")),
+            CapChange::Raise(x) => Some(format!("+{x}")),
+            CapChange::Lower(x) => Some(format!("-{x}")),
+            CapChange::NoCap => None,
+        }
+    }
+}
+
 /// An amount as typed: `10` or `2.50` (USD, a `$` allowed) sets the cap, `+5` raises the one the
-/// key has by $5 (`+0` keeps it: with `--reset`, only when it starts over changes). Digits and
-/// one `.` only — no `1e3`, `inf` or `nan` — and under OpenRouter's ceiling. Words for "no cap"
-/// are refused with the flag that does it: a cap is never lifted by an amount. Pure.
+/// key has by $5 (`+0` keeps it: with `--reset`, only when it starts over changes), `-2` (`-$2`)
+/// lowers it by $2. Digits and one `.` only — no `1e3`, `inf` or `nan` — and under OpenRouter's
+/// ceiling. Words for "no cap" are refused with the flag that does it: a cap is never lifted by
+/// an amount. Pure.
 pub fn parse_cap(s: &str) -> std::result::Result<CapChange, String> {
     let t = s.trim();
-    let (raise, rest) = match t.strip_prefix('+') {
-        Some(r) => (true, r.trim_start()),
-        None => (false, t),
+    let (sign, rest) = match t.as_bytes().first() {
+        Some(c @ (b'+' | b'-')) => (Some(*c), t[1..].trim_start()),
+        _ => (None, t),
     };
     let num = rest.strip_prefix('$').unwrap_or(rest);
     let plain = num.bytes().any(|c| c.is_ascii_digit())
         && num.bytes().all(|c| c.is_ascii_digit() || c == b'.')
         && num.bytes().filter(|&c| c == b'.').count() <= 1;
     match plain.then(|| num.parse::<f64>().ok()).flatten() {
-        Some(x) if x < MAX_LIMIT => Ok(if raise { CapChange::Raise(x) } else { CapChange::To(x) }),
+        Some(x) if x < MAX_LIMIT => Ok(match sign {
+            Some(b'+') => CapChange::Raise(x),
+            Some(_) => CapChange::Lower(x),
+            None => CapChange::To(x),
+        }),
         Some(_) => Err(format!("`{t}`: OpenRouter caps a key under ${MAX_LIMIT:.0}")),
         None if ["none", "no", "off", "unlimited", "nocap", "no-cap", "inf", "infinite", "∞"].contains(&t.to_ascii_lowercase().as_str()) => {
             Err("no cap is `--no-cap` (the CLI's), never an amount".into())
         }
-        None if t.starts_with('-') => Err(format!("`{t}`: to lower a cap, give the new cap itself (`2`), not a negative raise")),
-        None => Err(format!("`{t}` isn't an amount — USD as `10` or `2.50` sets the cap, `+5` raises it by $5")),
+        None => Err(format!("`{t}` isn't an amount — `10` sets the cap, `+5` raises it by $5, `-2` lowers it by $2")),
     }
 }
 
@@ -715,12 +735,14 @@ impl CapPlan {
 }
 
 /// Plan `change` (none: the cap stays) and `reset` (none: as it is; `Some(None)`: never) for
-/// `k`. Refused — the why, for the caller to put after the key's name — when a raise meets a key
-/// with no cap, the cap would reach OpenRouter's ceiling, or (unless `force`) the change
-/// tightens the cap (lower, a first cap, or another reset period) below what the key has spent
-/// against it, or what it spent isn't known: its calls would fail at once, which is a pause, not
-/// a cap. A raise that leaves it under what it spent goes ahead ([`CapPlan::still_at_cap`] says
-/// so). The new cap is rounded to the millionth (no `0.25000000000000006`). Pure.
+/// `k`. Refused — the why, for the caller to put after the key's name — when a raise or a lowering
+/// meets a key with no cap, a lowering would leave $0 or less (even forced: `0` itself, or a
+/// pause, is how to stop a key), the cap would reach OpenRouter's ceiling, or (unless `force`)
+/// the change tightens the cap (lower, a first cap, or another reset period) below what the key
+/// has spent against it, or what it spent isn't known: its calls would fail at once, which is a
+/// pause, not a cap. A raise that leaves it under what it spent goes ahead
+/// ([`CapPlan::still_at_cap`] says so). The new cap is rounded to the millionth (no
+/// `0.25000000000000006`). Pure.
 pub fn plan_cap(k: &KeyInfo, change: Option<CapChange>, reset: Option<Option<LimitReset>>, force: bool) -> std::result::Result<CapPlan, String> {
     let money = exact_money;
     let before = k.limit;
@@ -733,9 +755,18 @@ pub fn plan_cap(k: &KeyInfo, change: Option<CapChange>, reset: Option<Option<Lim
             Some(b) => Some(b + x),
             None => return Err("it has no cap to raise — give the cap itself (`10`)".into()),
         },
+        Some(CapChange::Lower(x)) => match before {
+            Some(b) => Some(b - x),
+            None => return Err("it has no cap to lower — give the cap itself (`10`)".into()),
+        },
         Some(CapChange::NoCap) => None,
     }
     .map(|x| (x * 1e6).round() / 1e6);
+    if let (Some(CapChange::Lower(x)), Some(b), Some(a)) = (change, before, after) {
+        if x > 0.0 && a <= 0.0 {
+            return Err(format!("its {} cap lowered by {} is $0 or less — give the cap itself (`0`), or `arena keys pause`", money(b), money(x)));
+        }
+    }
     if let Some(a) = after.filter(|a| !(a.is_finite() && *a >= 0.0 && *a < MAX_LIMIT)) {
         return Err(format!("{} is past OpenRouter's ceiling for a cap (under ${MAX_LIMIT:.0})", money(a)));
     }
@@ -1950,28 +1981,44 @@ mod tests {
         assert_eq!(LimitReset::of(&k(None)), None);
     }
 
-    /// `10`, `2.50`, `$3` set the cap, `+5` raises it; words for "no cap", negatives, exponents
-    /// and the ceiling are refused, each saying what to give instead.
+    /// `10`, `2.50`, `$3` set the cap, `+5` raises it, `-5` lowers it; words for "no cap",
+    /// exponents and the ceiling are refused, each saying what to give instead. What the dashboard
+    /// passes on for each ([`CapChange::arg`]) parses back to it.
     #[test]
-    fn parse_cap_takes_amounts_and_raises_only() {
-        for (typed, want) in [
-            ("10", CapChange::To(10.0)),
-            (" 2.50 ", CapChange::To(2.5)),
-            ("$3", CapChange::To(3.0)),
-            ("0", CapChange::To(0.0)),
-            (".5", CapChange::To(0.5)),
-            ("+5", CapChange::Raise(5.0)),
-            ("+0.05", CapChange::Raise(0.05)),
-            ("+ 5", CapChange::Raise(5.0)),
-            ("+$2", CapChange::Raise(2.0)),
-            ("+0", CapChange::Raise(0.0)),
+    fn parse_cap_takes_amounts_raises_and_lowerings() {
+        for (typed, want, arg) in [
+            ("10", CapChange::To(10.0), "10"),
+            ("$10", CapChange::To(10.0), "10"),
+            (" 2.50 ", CapChange::To(2.5), "2.5"),
+            ("$3", CapChange::To(3.0), "3"),
+            ("0", CapChange::To(0.0), "0"),
+            (".5", CapChange::To(0.5), "0.5"),
+            ("+5", CapChange::Raise(5.0), "+5"),
+            ("+0.05", CapChange::Raise(0.05), "+0.05"),
+            ("+ 5", CapChange::Raise(5.0), "+5"),
+            ("+$2", CapChange::Raise(2.0), "+2"),
+            ("+0", CapChange::Raise(0.0), "+0"),
+            ("-5", CapChange::Lower(5.0), "-5"),
+            ("-$5", CapChange::Lower(5.0), "-5"),
+            ("- $0.25", CapChange::Lower(0.25), "-0.25"),
+            ("-.5", CapChange::Lower(0.5), "-0.5"),
+            ("-0", CapChange::Lower(0.0), "-0"),
+            ("0.000001", CapChange::To(0.000001), "0.000001"),
         ] {
             assert_eq!(parse_cap(typed), Ok(want), "{typed}");
+            assert_eq!(want.arg().as_deref(), Some(arg), "{typed}");
+            assert_eq!(parse_cap(arg), Ok(want), "{typed} passed on as {arg}");
         }
+        assert_eq!(CapChange::NoCap.arg(), None);
         for (typed, says) in [
             ("none", "--no-cap"),
             ("unlimited", "--no-cap"),
-            ("-1", "not a negative raise"),
+            ("-", "isn't an amount — `10` sets the cap, `+5` raises it by $5, `-2` lowers it by $2"),
+            ("--5", "isn't an amount"),
+            ("+-5", "isn't an amount"),
+            ("-$", "isn't an amount"),
+            ("$-5", "isn't an amount"),
+            ("-five", "isn't an amount"),
             ("1e3", "isn't an amount"),
             ("inf", "--no-cap"),
             ("nan", "isn't an amount"),
@@ -2071,6 +2118,24 @@ mod tests {
         assert_eq!(ok(&unknown, Some(CapChange::Raise(1.0)), None).words(), "cap $5.00 → $6.00 (monthly) · spent ? this month");
         // The ceiling.
         assert!(plan_cap(&capped(Some(999_999.0), Some(999_999.0), None), Some(CapChange::Raise(5.0)), None, false).unwrap_err().contains("ceiling"));
+        // A lowering: by its amount, the cap it has; under the spend refused as a set is, unless
+        // forced; to $0 or less refused even forced; a key with no cap has none to lower.
+        let p = ok(&monthly, Some(CapChange::Lower(2.0)), None);
+        assert_eq!((p.after, p.words()), (Some(3.0), "cap $5.00 → $3.00 (monthly) · spent $2.60 this month".to_string()));
+        assert_eq!(p.update(), KeyUpdate { limit: Some(Some(3.0)), ..Default::default() });
+        assert_eq!(plan_cap(&tiny, Some(CapChange::Lower(0.05)), None, true).unwrap().after, Some(0.15), "no float noise");
+        let e = plan_cap(&monthly, Some(CapChange::Lower(3.0)), None, false).unwrap_err();
+        assert_eq!(e, plan_cap(&monthly, Some(CapChange::To(2.0)), None, false).unwrap_err(), "the same refusal as `2`");
+        assert_eq!(plan_cap(&monthly, Some(CapChange::Lower(3.0)), None, true).unwrap().after, Some(2.0));
+        for (by, force) in [(5.0, false), (5.0, true), (6.0, true), (4.9999999, true)] {
+            let e = plan_cap(&monthly, Some(CapChange::Lower(by)), None, force).unwrap_err();
+            assert!(e.starts_with("its $5.00 cap lowered by") && e.contains("is $0 or less — give the cap itself (`0`), or `arena keys pause`"), "-{by}: {e}");
+        }
+        assert!(plan_cap(&open, Some(CapChange::Lower(1.0)), None, true).unwrap_err().contains("no cap to lower"));
+        // `-0` changes nothing, a $0 cap's too.
+        assert!(!ok(&monthly, Some(CapChange::Lower(0.0)), None).changes());
+        let zero = capped(Some(0.0), Some(0.0), None);
+        assert!(!plan_cap(&zero, Some(CapChange::Lower(0.0)), None, false).unwrap().changes());
         // No cent's slack (review codex r1 #2): $0.004 under the spend is under it, said exactly;
         // a cap a little over the spend has room.
         let spent = KeyInfo { usage: Some(1.004), ..capped(Some(5.0), None, None) };

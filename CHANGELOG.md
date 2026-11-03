@@ -19,6 +19,17 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-03 · arena 2.17: `keys limit` lowers a cap with `-2` and changes a batch of keys at once
+- **`arena keys limit apple -2`** lowers the cap by $2. A result under what the key has spent is
+  refused, as for a set, unless you add `--force`. A result of $0 or less is always refused: give
+  `0`, or run `arena keys pause`.
+- **`keys limit`, `pause` and `resume` are faster on a batch.** They change 8 machines' keys at once
+  instead of one at a time: 10 keys took about 16 s and now take about 5 s. The output is still in machine
+  order, and every check on a key stays.
+- **The dashboard's cap box** (`a a`) still opens with `+5`, and Enter still runs it. Typing now
+  replaces it, where before it added to it (`10` became `+510`), and Backspace clears it. A dim
+  line under it says `10 sets · +5 raises · -2 lowers`.
+
 ## 2026-11-03 · arena 2.16: `pods run` on a machine with no zsh runs the command under bash, else sh
 - **`arena pods run`** on a machine with no zsh (a bare VM before setup, a staff box arena never
   set up) runs the command anyway. It used to fail with `exit 127: … zsh: command not found`. It

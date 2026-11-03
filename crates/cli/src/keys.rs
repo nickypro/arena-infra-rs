@@ -77,7 +77,7 @@ pub(crate) enum KeysCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Raise or set machines' key caps in place (`limit apple +5`)
+    /// Set, raise or lower key caps in place (`limit apple +5`, `-2`, `10`)
     Limit(key_limits::LimitArgs),
     /// Pause machines' keys: their AI calls fail until `resume`
     #[command(visible_alias = "disable")]

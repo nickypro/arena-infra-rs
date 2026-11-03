@@ -137,8 +137,10 @@ enum Mode {
     /// quit, or stay (`runs.rs`).
     Quit,
     /// Collect a free-text argument (a command, or a branch) for `Run`/`SetBranch`,
-    /// against one pod or a multi-pod scope, then execute on Enter.
-    Input { action: Action, scope: InputScope, value: String },
+    /// against one pod or a multi-pod scope, then execute on Enter. `prefilled`: `value` is the
+    /// box's default, untouched (the raise-cap box's `+5`) — the first key typed replaces it,
+    /// Backspace clears it, Enter runs it.
+    Input { action: Action, scope: InputScope, value: String, prefilled: bool },
     /// `/`: type a selection in the CLI's selector syntax; Enter marks what it resolves to
     /// (a typo marks nothing and says why in the footer).
     Select { value: String },

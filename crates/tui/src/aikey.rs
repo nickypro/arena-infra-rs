@@ -1,6 +1,6 @@
-//! The AI key's rows in the action menus: raise or set a pod's OpenRouter cap (`a`), pause or
-//! resume its key (`o`), rotate it (`n`, the cursor pod only) — for the cursor pod, and cap,
-//! pause and resume for a marked set. Each runs the CLI's own command as a child (`runs.rs`):
+//! The AI key's rows in the action menus: set, raise or lower a pod's OpenRouter cap (`a`),
+//! pause or resume its key (`o`), rotate it (`n`, the cursor pod only) — for the cursor pod, and
+//! cap, pause and resume for a marked set. Each runs the CLI's own command as a child (`runs.rs`):
 //! `arena keys limit <pods> <amount> --yes`, `keys pause|resume <pods> --yes`, `keys rotate <pod>
 //! --copy --yes` — so the dashboard and the CLI share one path (the plan, the refusals, the
 //! workspace guard, the read-back). Once a run ends the `AI$` column is read again
@@ -65,11 +65,12 @@ pub(crate) fn prefill(cfg: &Config) -> String {
     format!("+{x}")
 }
 
-/// The `arena` arguments for the AI key's `action` on `names` (`arg`: the amount for a cap), and
-/// the run's kind. The dashboard has confirmed, so `--yes`, and the keys it showed go along as
-/// they were (`--expect HASH=STATE` each, `keys`): the command refuses one that has been replaced
-/// or has moved since (review codex r2 #3). Rotate copies the new key onto the pod (`--copy`).
-/// `None`: not one of them, or a cap with no amount. Pure.
+/// The `arena` arguments for the AI key's `action` on `names` (`arg`: the amount for a cap, as
+/// typed — passed as the CLI takes it, [`or::CapChange::arg`]: `-$2` as `-2`, which clap reads as
+/// a value, not flags), and the run's kind. The dashboard has confirmed, so `--yes`, and the keys
+/// it showed go along as they were (`--expect HASH=STATE` each, `keys`): the command refuses one
+/// that has been replaced or has moved since (review codex r2 #3). Rotate copies the new key onto
+/// the pod (`--copy`). `None`: not one of them, or a cap with no amount, or one that isn't. Pure.
 pub(crate) fn args(action: Action, names: &[String], arg: Option<&str>, keys: &[KeyInfo]) -> Option<(runs::Kind, Vec<String>)> {
     let (kind, verb) = match action {
         Action::KeyLimit => (runs::Kind::KeyLimit, "limit"),
@@ -81,7 +82,7 @@ pub(crate) fn args(action: Action, names: &[String], arg: Option<&str>, keys: &[
     let mut out = vec!["keys".to_string(), verb.to_string()];
     out.extend(names.iter().cloned());
     match action {
-        Action::KeyLimit => out.push(arg.map(str::trim).filter(|a| !a.is_empty())?.to_string()),
+        Action::KeyLimit => out.push(or::parse_cap(arg?).ok()?.arg()?),
         Action::KeyRotate => out.push("--copy".into()),
         _ => {}
     }
@@ -160,7 +161,7 @@ pub(crate) fn choose(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, pod: Pod, shown: 
     let action = action.for_key(usage.disabled);
     if action == Action::KeyLimit {
         ui.ai_set = vec![(pod.name.clone(), Some(info))];
-        ui.mode = Mode::Input { action, scope: InputScope::Pod { name: shown, id: pod.id }, value: prefill(&ui.cfg) };
+        ui.mode = Mode::Input { action, scope: InputScope::Pod { name: shown, id: pod.id }, value: prefill(&ui.cfg), prefilled: true };
         return;
     }
     let preview = args(action, std::slice::from_ref(&pod.name), None, std::slice::from_ref(&info)).map(|(_, a)| format!("arena {}", a.join(" ")));
@@ -197,7 +198,7 @@ pub(crate) fn choose_set(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, action: Actio
     }
     let note = if left_out.is_empty() { String::new() } else { format!("Left out (no AI key that was read): {}", left_out.join(", ")) };
     ui.mode = match action {
-        Action::KeyLimit => Mode::Input { action, scope: InputScope::Set(scope), value: prefill(&ui.cfg) },
+        Action::KeyLimit => Mode::Input { action, scope: InputScope::Set(scope), value: prefill(&ui.cfg), prefilled: true },
         _ => Mode::FleetConfirm { action, typed: String::new(), scope, note },
     };
 }
@@ -286,7 +287,10 @@ mod tests {
         assert_eq!(line(Action::KeyPause, &two, None), Some((runs::Kind::KeyPause, "keys pause devtest-alpha devtest-bravo --yes".into())));
         assert_eq!(line(Action::KeyResume, &one, None), Some((runs::Kind::KeyResume, "keys resume devtest-alpha --yes".into())));
         assert_eq!(line(Action::KeyRotate, &one, None), Some((runs::Kind::KeyRotate, "keys rotate devtest-alpha --copy --yes".into())));
+        assert_eq!(line(Action::KeyLimit, &one, Some("-$2")), Some((runs::Kind::KeyLimit, "keys limit devtest-alpha -2 --yes".into())), "as the CLI takes it");
+        assert_eq!(line(Action::KeyLimit, &one, Some("$2.50")), Some((runs::Kind::KeyLimit, "keys limit devtest-alpha 2.5 --yes".into())));
         assert_eq!(line(Action::KeyLimit, &one, Some("  ")), None, "no amount, no run");
+        assert_eq!(line(Action::KeyLimit, &one, Some("ten")), None, "not an amount, no run");
         assert_eq!(line(Action::Backup, &one, None), None);
         // The keys as shown go along; rotate takes none.
         let shown = [KeyInfo { hash: "ab12".into(), limit: Some(5.0), ..Default::default() }, KeyInfo { hash: "cd34".into(), disabled: true, ..Default::default() }];
@@ -332,5 +336,21 @@ mod tests {
             ]
         );
         assert!(limit_preview(&set, "4.5").unwrap_err()[0].starts_with("devtest-bravo: a $4.50 cap"));
+        // A lowering, as the CLI plans it: by the amount, each key's own cap; under the spend
+        // refused as a set is; to $0 or less refused, with nothing the CLI could force.
+        assert_eq!(limit_preview(&alpha, "-2").unwrap(), ["spent $0.42 of $5.00 this month", "new cap: $3.00"]);
+        assert_eq!(limit_preview(&alpha, "-$2").unwrap(), limit_preview(&alpha, "-2").unwrap());
+        assert_eq!(
+            limit_preview(&set, "-0.05").unwrap(),
+            [
+                "devtest-alpha: cap $5.00 → $4.95 (monthly) · spent $0.42 this month",
+                "devtest-bravo: cap $5.00 → $4.95 · spent $4.90 in all",
+                "devtest-cloud: no AI key — left out",
+            ]
+        );
+        let e = limit_preview(&set, "-1").unwrap_err();
+        assert!(e[0].starts_with("devtest-bravo: a $4.00 cap is under what it has spent in all ($4.90)") && e[1].contains("never forces"), "{e:?}");
+        let e = limit_preview(&alpha, "-5").unwrap_err();
+        assert_eq!(e, ["its $5.00 cap lowered by $5.00 is $0 or less — give the cap itself (`0`), or `arena keys pause`"]);
     }
 }
