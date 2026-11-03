@@ -22,8 +22,9 @@ earlier).
 ## 2026-11-03 · dependencies updated; no change in behaviour
 - The libraries arena is built on are updated, the dashboard's drawing and terminal libraries
   included. Commands, their output and the dashboard work and look as before.
-- `arena pods run --help` says what `--background` does in fewer words, and lists its short
-  form as `[alias: --bg]` instead of `[aliases: --bg]`.
+- In `--help`, a flag or command with one other name lists it as `[alias: --bg]` instead of
+  `[aliases: --bg]` (`pods run --background`; `keys pause` and `keys resume`), and `pods run
+  --help` says what `--background` does in fewer words.
 
 ## 2026-11-03 · the dashboard: the pod list keeps two pods in view past the cursor
 - Moving down a list that doesn't fit, the view scrolls before the cursor reaches the bottom, so
