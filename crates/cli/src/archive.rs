@@ -3365,9 +3365,7 @@ mod tests {
         let stub = rsync_stub(&w.dir);
         let now = day_end("w0d1") + 3 * 3600;
         let dir = w.dir.display().to_string();
-        // The backup dir is said as its real path: the temp dir can be behind a link (macOS).
-        let real = w.dir.canonicalize().unwrap().display().to_string();
-        let (w, stub, dir, real) = (&w, &stub, &dir, &real);
+        let (w, stub, dir) = (&w, &stub, &dir);
         let run = |o: SyncOpts, at: u64| async move {
             let lines = Mutex::new(Vec::new());
             let say = |to: To, l: &str| lines.lock().unwrap().push((to, l.to_string()));
@@ -3375,7 +3373,7 @@ mod tests {
             let _ = archive_sync_with(&w.cfg, &w.env().paths, o, stub, &clock(at), &say).await;
             let lines = lines.into_inner().unwrap();
             let at = |verbose: bool| lines.iter().filter(|(to, _)| to.shows(verbose)).map(|(_, l)| format!("{l}\n")).collect::<String>();
-            (at(false), at(true).replace(real.as_str(), "<dir>").replace(dir.as_str(), "<dir>"))
+            (at(false), at(true).replace(dir.as_str(), "<dir>"))
         };
         let (dry, dry_v) = run(SyncOpts { dry_run: true, ..sync_opts("both") }, now).await;
         // The pod named like the cohort's but off the list is said by default: it's the one fix here.

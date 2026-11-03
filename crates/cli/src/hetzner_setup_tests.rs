@@ -645,6 +645,7 @@ fn the_public_course_repo_becomes_upstream_when_the_checkout_has_none() {
 /// checkout the backup's, repo-local, where git finds none; never over a participant's own
 /// (repo-local, global or system), and hands back to one they set globally later. Real git
 /// (`REAL_GIT`), a real checkout; the global and system config in the test's own dir.
+#[cfg_attr(target_os = "macos", ignore = "git makes an identity up from a macOS host name (`*.local`), so no commit fails for want of one")]
 #[test]
 fn the_checkout_gets_a_git_identity_only_where_there_is_none() {
     use arena_core::setup::{GIT_IDENTITY_EMAIL, GIT_IDENTITY_NAME};

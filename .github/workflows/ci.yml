@@ -72,23 +72,26 @@ jobs:
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
           rustc --version
       # rsync 3: macOS's own is openrsync, without the `--info` and `-J` arena's pulls use (a Mac
-      # pulling backups needs it too: README). GNU coreutils, sed, grep and find, first on PATH:
-      # the tests run the pods' scripts here as a stand-in pod, and a pod is Linux.
+      # pulling backups needs it too: README). GNU coreutils, sed, grep and find, first on PATH,
+      # and bash 5: the tests run the pods' scripts here as a stand-in pod, and a pod is Linux.
+      # The temp dir by its real path (macOS's is behind /var → /private/var): tests compare the
+      # paths they made with the ones git and `pwd` give back.
       - name: Tools
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: |
-          brew install rsync coreutils gnu-sed grep findutils
+          brew install rsync coreutils gnu-sed grep findutils bash
           for f in coreutils gnu-sed grep findutils; do echo "$(brew --prefix "$f")/libexec/gnubin" >> "$GITHUB_PATH"; done
           echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          echo "TMPDIR=$(cd "${TMPDIR:-/tmp}" && pwd -P)" >> "$GITHUB_ENV"
           git config --global user.name "arena CI"
           git config --global user.email "ci@example.invalid"
           git config --global init.defaultBranch main
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Test
         run: |
-          rsync --version | head -1 && sed --version | head -1
+          rsync --version | head -1 && sed --version | head -1 && bash --version | head -1 && echo "TMPDIR=$TMPDIR"
           cargo test --release --locked --no-fail-fast
 
   # Blocking: any clippy warning fails the run. The lint set is the pinned toolchain's
