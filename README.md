@@ -38,23 +38,31 @@ flowchart LR
 ### Just want some GPU pods?
 
 Pods up, SSH in, pods down: no proxy, no backups, no day branches. Install the latest release
-(Linux or macOS; on Windows, in [WSL](https://learn.microsoft.com/windows/wsl/install)):
+(Linux or macOS; on Windows, in [WSL](https://learn.microsoft.com/windows/wsl/install)) into
+`~/arena`: it picks your platform's `arena` and `arena-tui`, and installs them only if they and
+`config.env.example` match the release's `SHA256SUMS`.
 
 ```bash
-mkdir -p ~/arena && cd ~/arena                     # arena, arena-tui and config.env, side by side
-t=$(uname -m | sed s/arm64/aarch64/)-$(uname -s | sed 's/Linux/unknown-linux-gnu/;s/Darwin/apple-darwin/')
-for f in arena-$t arena-tui-$t SHA256SUMS config.env.example; do
-  curl -fsSLO https://github.com/nickypro/arena-infra-rs/releases/latest/download/$f || break; done
-c=shasum; command -v $c >/dev/null || c=sha256sum  # check them against SHA256SUMS
-grep -e "-$t\$" -e " config.env.example\$" SHA256SUMS | $c -c &&
-  mv arena-$t arena && mv arena-tui-$t arena-tui && chmod +x arena arena-tui && ./arena --version
-alias arena="$PWD/arena --config $PWD/config.env"
-ssh-keygen -t ed25519 -N "" -f ~/.ssh/arena_key    # the key your pods will let in
-cp config.env.example config.env                   # then set the four keys below
-arena config set RUNPOD_API_KEY                    # prompts; never echoes the value
+(set -eu; mkdir -p ~/arena; cd ~/arena
+  t=$(uname -m | sed s/arm64/aarch64/)-$(uname -s | sed 's/Linux/unknown-linux-gnu/;s/Darwin/apple-darwin/')
+  for f in arena-$t arena-tui-$t SHA256SUMS config.env.example; do
+    curl -fsSLO https://github.com/nickypro/arena-infra-rs/releases/latest/download/$f; done
+  grep -e "-$t\$" -e " config.env.example\$" SHA256SUMS > sums
+  [ $(wc -l < sums) -eq 3 ] || { echo "SHA256SUMS doesn't list all three" >&2; exit 1; }
+  c=shasum; command -v $c >/dev/null || c=sha256sum; $c -c sums
+  mv arena-$t arena; mv arena-tui-$t arena-tui; chmod +x arena arena-tui; rm sums; ./arena --version)
 ```
 
-Or [build it from source](#1-install).
+Once it prints `arena <version>` (or [build it from source](#1-install)), make the key your pods
+will let in and a `config.env` to set the four keys below in (`config set` prompts, and never
+echoes the value):
+
+```bash
+alias arena="$HOME/arena/arena --config $HOME/arena/config.env"
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/arena_key
+cp -n ~/arena/config.env.example ~/arena/config.env
+arena config set RUNPOD_API_KEY
+```
 
 | Key in `config.env` | Set it to |
 | --- | --- |
@@ -144,17 +152,22 @@ The cohort route, in order. Only want pods? [The TL;DR](#just-want-some-gpu-pods
 
 Every release has `arena` and `arena-tui` for Linux (x86_64 and arm64; glibc 2.35 or newer, as
 on Ubuntu 22.04) and for macOS 11 or newer (Apple silicon and Intel). This picks yours, checks it
-against the release's `SHA256SUMS`, and puts both binaries and `config.env.example` in `~/arena`:
+against the release's `SHA256SUMS`, and puts both binaries and `config.env.example` in `~/arena`
+(the same block as the TL;DR's):
 
 ```bash
-mkdir -p ~/arena && cd ~/arena
-t=$(uname -m | sed s/arm64/aarch64/)-$(uname -s | sed 's/Linux/unknown-linux-gnu/;s/Darwin/apple-darwin/')
-for f in arena-$t arena-tui-$t SHA256SUMS config.env.example; do
-  curl -fsSLO https://github.com/nickypro/arena-infra-rs/releases/latest/download/$f || break; done
-c=shasum; command -v $c >/dev/null || c=sha256sum
-grep -e "-$t\$" -e " config.env.example\$" SHA256SUMS | $c -c &&
-  mv arena-$t arena && mv arena-tui-$t arena-tui && chmod +x arena arena-tui && ./arena --version
+(set -eu; mkdir -p ~/arena; cd ~/arena
+  t=$(uname -m | sed s/arm64/aarch64/)-$(uname -s | sed 's/Linux/unknown-linux-gnu/;s/Darwin/apple-darwin/')
+  for f in arena-$t arena-tui-$t SHA256SUMS config.env.example; do
+    curl -fsSLO https://github.com/nickypro/arena-infra-rs/releases/latest/download/$f; done
+  grep -e "-$t\$" -e " config.env.example\$" SHA256SUMS > sums
+  [ $(wc -l < sums) -eq 3 ] || { echo "SHA256SUMS doesn't list all three" >&2; exit 1; }
+  c=shasum; command -v $c >/dev/null || c=sha256sum; $c -c sums
+  mv arena-$t arena; mv arena-tui-$t arena-tui; chmod +x arena arena-tui; rm sums; ./arena --version)
 ```
+
+Nothing is installed unless all three match. Run again, it installs the latest release over the
+one there (`arena update` does that too, and verifies more: below).
 
 Put `~/arena` on your `PATH`, or alias `arena` as the TL;DR does: `arena tui` starts the
 `arena-tui` beside it. On Windows, run the block in [WSL](https://learn.microsoft.com/windows/wsl/install)
