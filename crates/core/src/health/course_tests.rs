@@ -781,8 +781,12 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
     for piece in ["ghp_COURSE0TEST0PAT", "course-test-secret", "ijklmnopqrstuvwxyz"] {
         assert!(!stdout.contains(piece) && !stderr.contains(piece), "{piece} printed:\n{stdout}\n{stderr}");
     }
-    // The push went over ssh to GitHub's own URL, the rewrites never read.
+    // The push went over ssh to GitHub's own URL, the rewrites never read — and ssh read no config
+    // of the machine's (its multiplexing or local commands could write outside the temp dir).
     assert!(ssh_calls.contains("git@github.com") && ssh_calls.contains("git-receive-pack 'nickypro/arena-sandbox-materials.git'"), "{ssh_calls:?}");
+    for opt in ["-F /dev/null", "ControlMaster=no", "ControlPath=none", "PermitLocalCommand=no"] {
+        assert!(ssh_calls.contains(opt), "{opt}: {ssh_calls:?}");
+    }
     for line in stdout.lines() {
         assert!(line.contains('='), "stray stdout line {line:?}");
     }
@@ -977,4 +981,113 @@ fn the_claude_helper_never_follows_a_redirect() {
     assert_eq!((c.call.as_deref(), c.http), (Some("models"), Some(302)), "{stdout}");
     assert!(c.error.as_deref().is_some_and(|e| e.contains("not followed")), "{stdout}");
     assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 0, "the redirect was followed");
+}
+
+/// The Claude helper scrubs a whole answer before it's clipped anywhere: an opaque token from a
+/// settings file at the end of a reason phrase longer than any clip, past a run of spaces (which
+/// the clip's whitespace folding would otherwise close up), prints none of it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_secret_past_every_clip_is_still_scrubbed() {
+    if !(have("bash") && have("python3") && have("base64") && have("timeout")) {
+        eprintln!("bash/python3/base64/timeout missing — skipping");
+        return;
+    }
+    const OPAQUE: &str = "OPAQUE0long0gateway0token0abcdefghijklmnopqrstuvwxyz0123456789";
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            let mut buf = [0u8; 8192];
+            let _ = conn.read(&mut buf);
+            // 6 + 16360 = 16366: a cut at 16384 would keep 18 of the token's characters.
+            let reason = format!("Denied{}{OPAQUE}", " ".repeat(16_360));
+            let _ = write!(conn, "HTTP/1.1 401 {reason}\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno");
+        }
+    });
+    let home = std::env::temp_dir().join(format!("arena-claude-clip-{}", std::process::id()));
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::write(home.join(".claude/settings.json"), format!(r#"{{"env":{{"ANTHROPIC_AUTH_TOKEN":"{OPAQUE}","ANTHROPIC_BASE_URL":"{url}"}}}}"#)).unwrap();
+    let args = CheckArgs { repo: "/nonexistent".into(), envs: vec![], git_key: None, claude_call: true, origin: None };
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(crate::health::course_check_inner_command(&args))
+        .env("HOME", &home)
+        .env("no_proxy", "*")
+        .env("NO_PROXY", "*")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("ANTHROPIC_BASE_URL")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&home);
+    let all = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    for piece in [OPAQUE, &OPAQUE[..16], "gateway0token", &OPAQUE[OPAQUE.len() - 16..]] {
+        assert!(!all.contains(piece), "{piece} printed:\n{all}");
+    }
+    assert_eq!(parse_deep(&all).claude.and_then(|c| c.http), Some(401), "{all}");
+}
+
+/// The kernel helper starts only a plain ipykernel spec that runs a python of the course env: a
+/// launcher in the env's own `bin` (which could do anything before python starts), a spec with
+/// arguments of its own and one with a provisioner are never started. Run against stand-ins for
+/// ipykernel and jupyter_client that record what would be started.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_kernel_helper_starts_only_a_plain_kernel_of_the_env() {
+    if !have("python3") {
+        eprintln!("python3 missing — skipping");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("arena-kernel-filter-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (lib, env) = (root.join("lib"), root.join("env/bin"));
+    for d in [lib.join("ipykernel"), lib.join("jupyter_client"), env.clone()] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let python = String::from_utf8(std::process::Command::new("sh").args(["-c", "command -v python3"]).output().unwrap().stdout).unwrap();
+    std::os::unix::fs::symlink(python.trim(), env.join("python")).unwrap();
+    std::fs::write(lib.join("ipykernel/__init__.py"), "").unwrap();
+    std::fs::write(lib.join("jupyter_client/__init__.py"), "").unwrap();
+    std::fs::write(
+        lib.join("jupyter_client/kernelspec.py"),
+        "import json, os\nclass KernelSpecManager:\n    def get_all_specs(self):\n        return json.load(open(os.environ['FAKE_SPECS']))\n",
+    )
+    .unwrap();
+    std::fs::write(
+        lib.join("jupyter_client/manager.py"),
+        "import os\nclass Spec:\n    env = {}\nclass KernelManager:\n    def __init__(self, kernel_name):\n        open(os.environ['FAKE_LOG'], 'a').write(kernel_name + '\\n')\n        self.kernel_spec = Spec()\n    def start_kernel(self, **kw):\n        raise RuntimeError('fake: not started')\n    def shutdown_kernel(self, now=False):\n        pass\n    def is_alive(self):\n        return False\n",
+    )
+    .unwrap();
+    let e = env.display().to_string();
+    let spec = |argv: Vec<String>, extra: &str| format!(r#"{{"resource_dir": "/x", "spec": {{"argv": {}{extra}}}}}"#, serde_json::to_string(&argv).unwrap());
+    let plain = |exe: &str| vec![exe.to_string(), "-Xfrozen_modules=off".into(), "-m".into(), "ipykernel_launcher".into(), "-f".into(), "{connection_file}".into()];
+    let specs = format!(
+        "{{\"a-wrapper\": {}, \"b-args\": {}, \"c-provisioner\": {}, \"d-plain\": {}}}",
+        spec(plain(&format!("{e}/course-launcher")), ""),
+        spec(vec![format!("{e}/python"), "-m".into(), "ipykernel_launcher".into(), "--IPKernelApp.ipython_dir=/root/.ipython".into(), "-f".into(), "{connection_file}".into()], ""),
+        spec(plain(&format!("{e}/python")), r#", "metadata": {"kernel_provisioner": {"provisioner_name": "docker-provisioner"}}"#),
+        spec(plain(&format!("{e}/python")), ""),
+    );
+    std::fs::write(root.join("specs.json"), specs).unwrap();
+    std::fs::write(root.join("kernel.py"), KERNEL_PY).unwrap();
+    let out = std::process::Command::new(env.join("python"))
+        .arg(root.join("kernel.py"))
+        .arg(env.join("python"))
+        .arg(root.join("kernel.pid"))
+        .env("PYTHONPATH", &lib)
+        .env("FAKE_SPECS", root.join("specs.json"))
+        .env("FAKE_LOG", root.join("started.log"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let started = std::fs::read_to_string(root.join("started.log")).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&root);
+    let k = parse_deep(&format!("deep_check=3\n{stdout}deep_check_end=1\n")).kernel.unwrap_or_default();
+    assert_eq!((k.specs.as_deref(), k.own_args.as_deref()), (Some("d-plain"), Some("b-args,c-provisioner")), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(started, "d-plain\n", "only the plain kernel of the env");
 }

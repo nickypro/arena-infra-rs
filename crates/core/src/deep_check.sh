@@ -306,8 +306,9 @@ URLS
 # the key (a read-only key, or one not on the repo, is refused) and nothing is sent. It runs from an
 # empty repo of its own in the temp dir, with git's global and system config off — never in the
 # participant's repo, never with their config, whose `insteadOf` could turn the URL into one that
-# carries a credential (to a command line, or a helper). No hook runs, and a host key ssh hasn't
-# seen goes into the temp dir's known-hosts file, never the machine's.
+# carries a credential (to a command line, or a helper); ssh with none of the machine's config
+# either. No hook runs, and a host key ssh hasn't seen goes into the temp dir's known-hosts file,
+# never the machine's.
 push_probe() {
   local key=$course_key s p=$work/push-probe
   [ -e "$work/repo.ok" ] || return 0
@@ -320,7 +321,11 @@ push_probe() {
     echo missing >"$work/push.key"
     return 0
   fi
-  s="ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+  # ssh with no config of the machine's (`-F /dev/null`: root's and the system's could multiplex
+  # into a socket that outlives the probe, or run a local command), and nothing kept: no control
+  # master, no local command.
+  s="ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+  s="$s -o ControlMaster=no -o ControlPath=none -o PermitLocalCommand=no -o ForwardAgent=no"
   s="$s -o 'UserKnownHostsFile=$work/known_hosts $HOME/.ssh/known_hosts'"
   [ -z "$key" ] || s="$s -i '$key' -o IdentitiesOnly=yes"
   (

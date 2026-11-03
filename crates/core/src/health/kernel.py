@@ -52,7 +52,10 @@ def runs_this_python(argv, bindir):
     jupyter_client launches as the python that starts it (this one)."""
     exe = argv[0] if argv else ""
     bare = exe in ("python", "python3", f"python{sys.version_info[0]}.{sys.version_info[1]}")
-    ours = os.path.isabs(exe) and os.path.realpath(os.path.dirname(exe)) == bindir
+    # A python, by name: any other program in that `bin` (a launcher, a wrapper) could do anything
+    # before python starts.
+    python = re.fullmatch(r"python(\d+(\.\d+)?)?", os.path.basename(exe)) is not None
+    ours = os.path.isabs(exe) and python and os.path.realpath(os.path.dirname(exe)) == bindir
     return bare or ours
 
 

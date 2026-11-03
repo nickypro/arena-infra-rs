@@ -100,9 +100,10 @@ def call(url, headers, body=None):
         if 300 <= e.code < 400:
             where = urllib.parse.urlsplit(e.headers.get("Location") or "").hostname or "?"
             return e.code, f"redirects to {where} (not followed)"
-        return e.code, str(msg or e.reason)[:16384]
+        # Whole: scrubbed before anything clips it (`kv`), so no cut can keep part of a secret.
+        return e.code, str(msg or e.reason)
     except Exception as e:  # unreachable, a timeout, TLS
-        return 0, str(getattr(e, "reason", e))[:16384]
+        return 0, str(getattr(e, "reason", e))
 
 
 def main():
