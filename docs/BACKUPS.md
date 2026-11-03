@@ -114,7 +114,7 @@ why.
 - **Each pod**: its last git save, home copy (size and snapshot label) and archive copy, with how
   long ago, failing pods first, then the ones longest since a good backup. The screen's `o`
   switches to oldest first, or by name. A failure names the job and its reason (`home copy:
-  [big] rsync exit 24 …`). A cohort pod that's up and hasn't been backed up for twice the job's
+  [big] rsync exit 12 …`). A cohort pod that's up and hasn't been backed up for twice the job's
   interval is late. On the screen, Enter opens a pod's history, newest first. A run of the same
   result is one line (`no changes ×12 since 09:00`). The history offers **back up now** (`b`:
   the action menu's git backup, with its confirm) and **copy home now** (`h`: `arena pods pull
@@ -654,7 +654,11 @@ to that branch.
 
 A gentle switch that refuses a pod mid-merge does so before setting anything aside, and the putting
 back is the command's exit trap: a switch that fails, stops on an error, or gets a hangup, an
-interrupt or a TERM puts the keys back first.
+interrupt or a TERM puts the keys back first. That holds however early it's stopped, in the middle
+of setting a file aside too: the set-aside's branch is noted before its first copy (it was noted
+last, so a file already put back to git's version kept the placeholder, its key only in
+`.git/arena-unredacted/`), a copy lands whole or not at all, and the trap puts back a file the
+switch's `git checkout` left gone or half-written, and drops a copy the file still matches.
 
 arena's own 2-minute timeout kills only its ssh client — a non-pty session's shell is usually never
 signalled, and ran on (review ai-review claude #13) — so the switch bounds itself on the pod: it
@@ -775,6 +779,17 @@ pod that runs out is stopped (SIGTERM, so rsync takes its ssh and receiver down 
 later) before the failure is reported — so nothing is left running even when it was the last job and
 arena exits right after — and named in the failure (`✗ arena9-bloom [big]: timed out after 7200s`);
 the other pods finish, and the next run continues incrementally.
+
+### Files that vanish while they're copied
+
+**rsync's exit 24** means some files were removed or renamed on the pod while rsync read them: a
+program writing its files, or, from git 2.47 on, the background maintenance git runs after a
+commit (the backup's own commit included), whose `.git/objects/maintenance.lock` comes and goes.
+Everything else arrived, so the copy counts: the pod's line says `some files vanished on the pod
+while they were copied (the next pull takes them)`, and the next pull takes what the pod has then
+(live: one cohort pod's copy failed every run on it). rsync exits 24 only when that was all that
+went wrong; any other trouble is exit 23, and fails the copy. The reaper's own copy, which must be
+whole before a pod is deleted, still needs exit 0.
 
 ### A directory that became a symlink
 
