@@ -1,11 +1,12 @@
-//! `pods test` (torch, `--deep` GPU checks, or `--keys`: the machines' AI keys alone) and the
-//! health cache `--deep` writes for `snapshot`, `up` and `config check`.
+//! `pods test` (torch, `--deep` GPU checks, `--keys`: the machines' keys alone, or `--course`:
+//! what a participant uses beside the machine) and the health cache `--deep` writes for
+//! `snapshot`, `up` and `config check`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use arena_core::health::{judge_deep_call, judge_key_call, KeyBook};
+use arena_core::health::{judge_course_call, judge_deep_call, judge_key_call, CheckArgs, CourseBook, KeyBook};
 use arena_core::provider::Provider;
 use arena_core::remote::Remote;
 use arena_core::ssh::SshTarget;
@@ -16,7 +17,7 @@ use crate::pods::list::{enrich_best_effort, ENRICH_TIMEOUT};
 use crate::pods::selection::{stopped_skip, Selected};
 use crate::pods::{exec_each_pod, failure_line, PodCall};
 
-/// `pods test --deep`: run the deep check on the pods (see [`deep_check_fleet`]), print
+/// `pods test --deep`: run the deep check on the pods (see [`check_fleet`]), print
 /// the pass/warn/fail table (or JSON), and fail the command if any pod FAILed — so a
 /// script or `up --check` can gate on it. Warnings (slow network, maintenance, …) are
 /// reported but don't change the exit status.
@@ -28,9 +29,10 @@ pub(crate) async fn handle_deep_test(
     sel: &Selected,
     json: bool,
     verbose: bool,
+    claude_call: bool,
 ) -> Result<()> {
     use arena_core::health::Status;
-    let results = deep_check_fleet(provider, &remote, cfg, sel).await?;
+    let results = check_fleet(Some(provider), &remote, cfg, sel, Kind::Deep { claude_call }).await?;
     let (stdout, stderr) = render_deep_test(&results, json, verbose)?;
     say_stdout(&stdout, json);
     for line in stderr {
@@ -91,13 +93,49 @@ pub(crate) async fn handle_keys_test(remote: Arc<dyn Remote>, cfg: &Config, sel:
 
 /// What `pods test --keys` prints, as [`render_deep_test`] (JSON on stdout, `[]` for none).
 pub(crate) fn render_keys_test(results: &[arena_core::health::PodHealth], json: bool, verbose: bool) -> Result<(String, Vec<String>)> {
-    use arena_core::health::{render_key_report, render_summary};
+    render_with(results, json, verbose, arena_core::health::render_key_report)
+}
+
+/// `pods test --course`: what a participant uses beside each machine (`arena_core::health`
+/// `course`: the proxy port reaches it, the deploy key pushes and the last backup's age, the
+/// repo's branch, Claude Code, the notebook kernel, uv), seconds per machine and no GPU work. The
+/// `NAME RESULT PROXY BACKUP REPO CLAUDE KERNEL NOTES` table (or JSON); fails the command if any
+/// FAILs. Not recorded in the health cache, which holds each machine's last full check.
+pub(crate) async fn handle_course_test(
+    remote: Arc<dyn Remote>,
+    cfg: &Config,
+    sel: &Selected,
+    json: bool,
+    verbose: bool,
+    claude_call: bool,
+) -> Result<()> {
+    use arena_core::health::Status;
+    let results = check_fleet(None, &remote, cfg, sel, Kind::Course { claude_call }).await?;
+    let (stdout, stderr) = render_with(&results, json, verbose, arena_core::health::render_course_report)?;
+    say_stdout(&stdout, json);
+    for line in stderr {
+        arena_core::out!(Err, "{line}");
+    }
+    match results.iter().filter(|h| h.status == Status::Fail).count() {
+        0 => Ok(()),
+        n => anyhow::bail!("{n} pod(s) failed the course check"),
+    }
+}
+
+/// A keys or course report, as [`render_deep_test`] (JSON on stdout, `[]` for none).
+fn render_with(
+    results: &[arena_core::health::PodHealth],
+    json: bool,
+    verbose: bool,
+    report: fn(&[arena_core::health::PodHealth], bool) -> String,
+) -> Result<(String, Vec<String>)> {
+    use arena_core::health::render_summary;
     const NONE: &str = "(no pods with an SSH endpoint)";
     Ok(match (json, results.is_empty()) {
         (true, true) => ("[]\n".into(), vec![NONE.into()]),
         (true, false) => (format!("{}\n", serde_json::to_string_pretty(results)?), render_summary(results)),
         (false, true) => (format!("{NONE}\n"), vec![]),
-        (false, false) => (render_key_report(results, verbose), vec![]),
+        (false, false) => (report(results, verbose), vec![]),
     })
 }
 
@@ -193,23 +231,44 @@ pub(crate) fn render_deep_test(
 /// double create, a leftover), and each must get its own row and verdict — keyed by name,
 /// one would take the other's result and the other would vanish from the report (and from
 /// the exit status). A pod that was probed but has no result is a FAIL, never dropped.
+#[cfg(test)]
 pub(crate) async fn deep_check_fleet(
     provider: &dyn Provider,
     remote: &Arc<dyn Remote>,
     cfg: &Config,
     sel: &Selected,
 ) -> Result<Vec<arena_core::health::PodHealth>> {
-    check_fleet(Some(provider), remote, cfg, sel, Kind::Deep).await
+    check_fleet(Some(provider), remote, cfg, sel, Kind::Deep { claude_call: false }).await
 }
 
 /// Which check a fleet run makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
-    /// The deep check (its AI keys included), with the provider's maintenance windows.
-    Deep,
-    /// The AI keys only: the script's `keys` mode, judged by `judge_key_call` — and nothing
+    /// The deep check (its keys and the course included), with the provider's maintenance
+    /// windows; `claude_call`: `--claude-call`.
+    Deep { claude_call: bool },
+    /// The keys only: the script's `keys` mode, judged by `judge_key_call` — and nothing
     /// looked up from the provider (no details call to wait on).
     Keys,
+    /// The course only: the script's `course` mode, judged by `judge_course_call`, with the
+    /// proxy ports tried from here.
+    Course { claude_call: bool },
+}
+
+impl Kind {
+    /// Whether the run judges the course (and so tries the proxy ports and reads the backups).
+    fn course(self) -> bool {
+        matches!(self, Kind::Deep { .. } | Kind::Course { .. })
+    }
+}
+
+/// What the course checks hold `pods` to ([`CourseBook::load`]: today's branch, the configured
+/// repo, the backups' record, `arena claude`'s pushes), with what each one's proxy port reached
+/// from here ([`arena_core::health::course::probe_ports`]).
+/// Under this crate's unit tests the box's state isn't read (as [`health_cache_path`]): a test
+/// that wants it builds the book itself.
+pub(crate) async fn course_book(remote: &Arc<dyn Remote>, cfg: &Config, pods: &[arena_core::Pod]) -> CourseBook {
+    CourseBook::gather(remote, cfg, pods, !cfg!(test)).await
 }
 
 /// [`deep_check_fleet`], or the keys-only run of the same shape ([`Kind`]).
@@ -220,16 +279,21 @@ pub(crate) async fn check_fleet(
     sel: &Selected,
     kind: Kind,
 ) -> Result<Vec<arena_core::health::PodHealth>> {
-    use arena_core::health::{deep_check_command, key_check_command, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT, KEY_CHECK_TIMEOUT};
+    use arena_core::health::{
+        course_check_command, deep_check_command_for, key_check_command, HealthPolicy, PodHealth, COURSE_CHECK_TIMEOUT, DEEP_CHECK_TIMEOUT,
+        KEY_CHECK_TIMEOUT,
+    };
     // Config first: a malformed MIN_DRIVER_VERSION fails before any pod is touched (a keys-only
-    // run judges no driver).
+    // or course-only run judges no driver).
     let policy = match kind {
-        Kind::Deep => HealthPolicy { keys: Some(key_book(cfg)), ..HealthPolicy::from_config(cfg)? },
+        Kind::Deep { .. } => HealthPolicy { keys: Some(key_book(cfg)), ..HealthPolicy::from_config(cfg)? },
         Kind::Keys => HealthPolicy { keys: Some(key_book(cfg)), ..HealthPolicy::default() },
+        Kind::Course { .. } => HealthPolicy::default(),
     };
     let (budget, judge): (_, fn(&arena_core::Pod, PodCall, &HealthPolicy) -> PodHealth) = match kind {
-        Kind::Deep => (DEEP_CHECK_TIMEOUT, judge_deep_call),
+        Kind::Deep { .. } => (DEEP_CHECK_TIMEOUT, judge_deep_call),
         Kind::Keys => (KEY_CHECK_TIMEOUT, judge_key_call),
+        Kind::Course { .. } => (COURSE_CHECK_TIMEOUT, judge_course_call),
     };
     let mut pods = sel.pods.clone();
     pods.sort_by(|a, b| a.name.cmp(&b.name));
@@ -253,9 +317,11 @@ pub(crate) async fn check_fleet(
     // `CONDA_ENV=""` disables activation (like `pods run`); python is then whatever the
     // rc puts on PATH.
     let conda = Some(cfg.get("CONDA_ENV").unwrap_or("arena-env"));
-    let cmd = match kind {
-        Kind::Deep => deep_check_command(conda),
+    // Each pod's own: where its course env may be depends on its provider.
+    let cmd_for = |pod: &arena_core::Pod| match kind {
+        Kind::Deep { claude_call } => deep_check_command_for(conda, &CheckArgs { claude_call, ..CheckArgs::for_pod(cfg, pod) }),
         Kind::Keys => key_check_command(conda),
+        Kind::Course { claude_call } => course_check_command(conda, &CheckArgs { claude_call, ..CheckArgs::for_pod(cfg, pod) }),
     };
     let mut jobs = Vec::new();
     let mut slots = Vec::with_capacity(pods.len());
@@ -264,7 +330,7 @@ pub(crate) async fn check_fleet(
         let target = if arena_core::status::is_stopped(&pod.status) { None } else { SshTarget::from_pod(pod, cfg).ok() };
         slots.push(match target {
             Some(t) => {
-                jobs.push(((i, pod.name.clone()), t, cmd.clone()));
+                jobs.push(((i, pod.name.clone()), t, cmd_for(pod)));
                 Slot::Probed
             }
             None if sel.named => Slot::NoEndpoint,
@@ -281,8 +347,9 @@ pub(crate) async fn check_fleet(
     }
     if !jobs.is_empty() {
         let what = match kind {
-            Kind::Deep => "Deep-checking",
-            Kind::Keys => "Checking the AI keys of",
+            Kind::Deep { .. } => "Deep-checking",
+            Kind::Keys => "Checking the keys of",
+            Kind::Course { .. } => "Checking the course setup of",
         };
         arena_core::out!(Err, "{what} {} pod(s) ({}s budget each)…", jobs.len(), budget.as_secs());
     }
@@ -301,21 +368,39 @@ pub(crate) async fn check_fleet(
     // `enrich` fills fields in place (a slice: it can't add, drop or move pods), so the
     // indices the jobs carry still point at the same pods afterwards.
     // OpenRouter's listing alongside (one bounded read, when there's a provisioning key): what
-    // tells a paused key from a deleted one.
-    let listed = match provider {
+    // tells a paused key from a deleted one. The course's book too: the proxy ports tried from
+    // here, the backups' record read.
+    let probed: Vec<arena_core::Pod> = pods.iter().zip(&slots).filter(|(_, s)| matches!(s, Slot::Probed)).map(|(p, _)| p.clone()).collect();
+    let course = async {
+        match kind.course() {
+            true => Some(course_book(remote, cfg, &probed).await),
+            false => None,
+        }
+    };
+    let listed = async {
+        match kind {
+            Kind::Course { .. } => None,
+            _ => key_listing(cfg).await,
+        }
+    };
+    let (listed, course) = match provider {
         Some(provider) => {
-            let (warning, (), listed) = tokio::join!(enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT), probe, key_listing(cfg));
+            let (warning, (), listed, course) = tokio::join!(enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT), probe, listed, course);
             if let Some(warning) = warning {
                 arena_core::out!(Err, "{warning}");
             }
-            listed
+            (listed, course)
         }
-        None => tokio::join!(probe, key_listing(cfg)).1,
+        None => {
+            let ((), listed, course) = tokio::join!(probe, listed, course);
+            (listed, course)
+        }
     };
     let mut policy = policy;
     if let Some(book) = policy.keys.as_mut() {
         book.listed = listed;
     }
+    policy.course = course;
 
     let mut results = Vec::new();
     for (i, pod) in pods.iter().enumerate() {

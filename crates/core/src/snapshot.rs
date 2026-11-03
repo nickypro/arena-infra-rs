@@ -105,9 +105,14 @@ pub enum Issue {
     Unreachable,
     #[serde(rename = "check incomplete")]
     CheckIncomplete,
-    /// Its AI key or Hugging Face token (`ai_key`, `hf_token`): the machine itself may be fine.
+    /// Its AI key, Hugging Face token or W&B key (`ai_key`, `hf_token`, `wandb`): the machine
+    /// itself may be fine.
     #[serde(rename = "AI key")]
     AiKey,
+    /// What a participant uses beside the machine (`proxy`, `backup`, `repo`, `claude`, `uv`):
+    /// the machine itself may be fine.
+    #[serde(rename = "course setup")]
+    CourseSetup,
     #[serde(rename = "other issue", other)]
     Other,
 }
@@ -127,6 +132,7 @@ impl Issue {
             Issue::Unreachable => "unreachable",
             Issue::CheckIncomplete => "check incomplete",
             Issue::AiKey => "AI key",
+            Issue::CourseSetup => "course setup",
             Issue::Other => "other issue",
         }
     }
@@ -135,8 +141,9 @@ impl Issue {
     /// `health::evaluate`): `ssh` → unreachable, the GPU checks (`nvidia-smi`, `cuda`,
     /// `device_count`, `gpu<i>`, `peer_copy`, `nccl`, `provider`) → GPU error, `driver` →
     /// too old (FAIL) / unknown (WARN), `torch` → software error, `network`, `disk`, `load`,
-    /// `maintenance`, `script` (no or cut-off output) → check incomplete, and the AI keys'
-    /// (`ai_key`, `hf_token`) → AI key.
+    /// `maintenance`, `script` (no or cut-off output) → check incomplete, the keys' (`ai_key`,
+    /// `hf_token`, `wandb`) → AI key, the notebook kernel (`kernel`) → software error, and the
+    /// rest of the course's (`proxy`, `backup`, `repo`, `claude`, `uv`) → course setup.
     pub fn from_check(c: &Check) -> Issue {
         let gpu_index = |n: &str| n.strip_prefix("gpu").is_some_and(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit()));
         match c.name.as_str() {
@@ -146,12 +153,13 @@ impl Issue {
             "driver" => Issue::DriverUnknown,
             "nvidia-smi" | "cuda" | "device_count" | "peer_copy" | "nccl" | "provider" => Issue::GpuError,
             n if gpu_index(n) => Issue::GpuError,
-            "torch" => Issue::SoftwareError,
+            "torch" | "kernel" => Issue::SoftwareError,
             "network" => Issue::SlowNetwork,
             "disk" => Issue::LowDisk,
             "load" => Issue::BusyHost,
             "maintenance" => Issue::MaintenanceScheduled,
             n if crate::health::is_key_check(n) => Issue::AiKey,
+            n if crate::health::is_course_check(n) => Issue::CourseSetup,
             _ => Issue::Other,
         }
     }
@@ -184,6 +192,10 @@ pub struct HealthRecord {
     /// dashboard's detail can say `ok, $4.97 of $5.00 left`. Additive: an older cache has none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<Check>,
+    /// Its course checks (`proxy`, `backup`, `repo`, `claude`, `kernel`, `uv`) whatever their
+    /// verdict, for the dashboard's detail. Additive, as `keys`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub course: Vec<Check>,
 }
 
 /// Longest `reasons` line kept: enough for any check's detail, short enough that a
@@ -213,6 +225,7 @@ impl HealthRecord {
             issues,
             gpu: h.facts.as_ref().map(|f| f.gpu_label()).filter(|g| g != "-"),
             keys: h.checks.iter().filter(|c| crate::health::is_key_check(&c.name)).cloned().collect(),
+            course: h.checks.iter().filter(|c| crate::health::is_course_check(&c.name)).cloned().collect(),
         }
     }
 }
@@ -750,18 +763,7 @@ pub fn build(
     let pods_out = sorted
         .into_iter()
         .map(|pod| {
-            let (proxy_port, proxy) = match &forwards {
-                None => (None, ProxyState::Unknown),
-                Some(fs) => match fs.iter().find(|f| f.name == pod.name) {
-                    None => (None, ProxyState::None),
-                    Some(f) => {
-                        let live = endpoint(pod).is_some_and(|(host, port)| {
-                            host.eq_ignore_ascii_case(f.target_ip.trim()) && port == f.target_port
-                        });
-                        (Some(f.public_port), if live { ProxyState::Live } else { ProxyState::Stale })
-                    }
-                },
-            };
+            let (proxy_port, proxy) = proxy_state(pod, forwards.as_deref());
             let entry = list_entry(naming, &pod.name);
             SnapshotPod {
                 pod: pod.clone(),
@@ -924,6 +926,22 @@ pub fn local_proxy_text(cfg: &Config) -> (Option<String>, Option<String>) {
         Ok(text) => (Some(text), None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Some(String::new()), None),
         Err(e) => (None, Some(format!("warning: can't read the proxy config {path} ({e}) — PROXY shows `?`"))),
+    }
+}
+
+/// The proxy config's forward for `pod`'s name (`forwards`: [`parse_nginx`]'s, `None` when the
+/// config wasn't read): its stable port, and whether it forwards to the pod's current SSH
+/// endpoint. What the PROXY column shows and `pods test`'s proxy check starts from. Pure.
+pub fn proxy_state(pod: &Pod, forwards: Option<&[crate::proxy::Forward]>) -> (Option<u16>, ProxyState) {
+    match forwards {
+        None => (None, ProxyState::Unknown),
+        Some(fs) => match fs.iter().find(|f| f.name == pod.name) {
+            None => (None, ProxyState::None),
+            Some(f) => {
+                let live = endpoint(pod).is_some_and(|(host, port)| host.eq_ignore_ascii_case(f.target_ip.trim()) && port == f.target_port);
+                (Some(f.public_port), if live { ProxyState::Live } else { ProxyState::Stale })
+            }
+        },
     }
 }
 
