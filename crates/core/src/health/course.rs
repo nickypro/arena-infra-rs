@@ -919,13 +919,10 @@ fn kernel_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
         }
     }
     let register = run(format!("{env}/bin/python -m ipykernel install --user"));
-    match (k.specs.as_deref(), k.own_args.as_deref()) {
-        // Kernels for the env, but each with arguments (or a launcher) of its own: not started,
-        // since they could reach the participant's profile.
-        (Some("none"), Some(own)) => {
-            return Check::new(name, Warn, format!("not started: the {own} kernel has its own arguments (its kernel.json) — `arena pods ask {s}`"))
-        }
-        _ => {}
+    // Kernels for the env, but each with arguments (or a launcher) of its own: not started, since
+    // they could reach the participant's profile.
+    if let (Some("none"), Some(own)) = (k.specs.as_deref(), k.own_args.as_deref()) {
+        return Check::new(name, Warn, format!("not started: the {own} kernel has its own arguments (its kernel.json) — `arena pods ask {s}`"));
     }
     match k.specs.as_deref() {
         Some("none") => return Check::new(name, Warn, format!("{register} (no Jupyter kernel runs {env})")),
