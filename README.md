@@ -113,7 +113,7 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 | `arena pods volume add apple 50` | Hetzner: 50 GB more disk on a VM, at `/mnt/data` (`grow`, `list`, `delete`; `terminate --delete-volumes`) |
 | `arena pods run -t apple 'nvidia-smi'` | Run a command on pods (all of them without `-t`) |
 | `arena balance` | Money left on each prepaid account, and how long it lasts |
-| `arena keys limit apple +5` | Raise a participant's AI (OpenRouter) cap by $5, in place (`10` sets it; `--all`); `keys pause`/`resume` stop and restart a key |
+| `arena keys limit apple +5` | Raise a participant's AI (OpenRouter) cap by $5, in place (`10` sets it, `-2` lowers it; `--all`); `keys pause`/`resume` stop and restart a key |
 | `arena spend` | What each machine cost and who it was for (`--owner` on `pods up`) |
 | `arena config check` | Which config keys are set, missing or unusable (never prints values) |
 | `arena teardown --check` | End of the program: what's still billing, with the command that cleans it up |

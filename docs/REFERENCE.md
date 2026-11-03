@@ -2220,11 +2220,13 @@ weekly or monthly), what it spent in the cap's period, today, this month (UTC) a
 total row — noting how many others were hidden (`--all` shows every key in the workspace, disabled
 ones included — the listing walks every page).
 
-**Caps, pause, resume — in place.** `limit <targets|--all> <USD|+USD>` changes each machine's key cap
-where it is (`PATCH /keys/{hash}`: the secret, its spend and the pod's copy of the key all stay —
+**Caps, pause, resume — in place.** `limit <targets|--all> <USD|+USD|-USD>` changes each machine's key
+cap where it is (`PATCH /keys/{hash}`: the secret, its spend and the pod's copy of the key all stay —
 nothing to copy, the participant's next call works): `10` sets the cap, `+5` raises each key's own
-cap by $5 (`arena keys limit apple +5`, `arena keys limit --all +5`). The amount is always the last
-argument. `--reset daily|weekly|monthly|never` changes when the cap starts over (00:00 UTC, weeks
+cap by $5, `-2` lowers it by $2 (`arena keys limit apple +5`, `arena keys limit --all -2`). The amount
+is always the last argument (`-$2` only after `--`: `arena keys limit apple -- -$2`; `-2` needs
+nothing). A lowering that would leave $0 or less is refused, `--force` too (`0` sets a $0 cap;
+`keys pause` stops a key). `--reset daily|weekly|monthly|never` changes when the cap starts over (00:00 UTC, weeks
 from Monday; `+0 --reset daily` keeps the cap); `--no-cap` takes the cap away — never an amount. A
 change that tightens a cap (lower, a first cap, another reset period) under what the key has spent
 in the new cap's period — today's for a daily cap, …, its whole life's without a reset — or when that
@@ -2238,13 +2240,15 @@ already as asked is left alone. Each command: `--dry-run`, a confirm (`--yes`), 
 — `devtest-alpha: cap $0.10 → $0.20 · spent $0.00 in all`, `on → off` — and `--json` (below).
 
 **Changes made meanwhile.** One of these commands changes keys at a time on a box (a lock in the
-state directory, `openrouter-keys.lock`; a second waits up to 60 s). After the confirm, machine by
-machine — every one named, a skipped one too — the plan is made again from keys read at most 2 s
-before that machine's changes (a resume: right before): a machine whose keys moved since the preview (another operator, the
-dashboard: a cap, reset or on/off changed; a key replaced, added or renamed away), or whose spend now
-makes the cap one it would refuse, is left alone and fails the command — run it again. Each key is
-read once more in the request just before its change and refused if it moved, or (a cap) has spent
-past the new cap; OpenRouter has no conditional update, so that moment is all that's left.
+state directory, `openrouter-keys.lock`; a second waits up to 60 s). After the confirm the keys are
+read once more and every machine named — a skipped one too — is planned again from them: a machine
+whose keys moved since the preview (another operator, the dashboard: a cap, reset or on/off changed;
+a key replaced, added or renamed away), or whose spend now makes the cap one it would refuse, is left
+alone and fails the command — run it again. The changes then go out together, 8 at a time (10 keys:
+about 5 s, where one after another took about 16 s), the lines in the machines' order whatever order
+the answers come in. Each key is read once more in the request just before its change and refused if
+it moved, or (a cap) has spent past the new cap; OpenRouter has no conditional update, so that moment
+is all that's left.
 Afterwards each key is checked against what OpenRouter lists (a change it answered OK for but didn't
 make fails; caps compared exactly, not to the cent), and by name: a key still on under a paused
 machine's name is said, and a key a resume woke that sits beside a newer one under its name (made
@@ -2291,9 +2295,12 @@ warning leaves it out. The credit is the account's (an organization's whole), wh
 
 **Acting on a key from the dashboard.** With a provisioning key set, the action menu (`a`) has the
 pod's key rows: **`ai cap`** (`a`, so `a a` from the list) opens a box prefilled `+` one new key's
-cap (`OPENROUTER_KEY_LIMIT`, else `+5`) that shows what the key spent of its cap and the new cap as
-you type — a cap the CLI would refuse stays in the box, saying why (the dashboard never forces) —
-and Enter runs `arena keys limit <pod> <amount> --yes`; **`ai pause`** / **`ai resume`** (`o`,
+cap (`OPENROUTER_KEY_LIMIT`, else `+5`), shown selected: Enter runs it, the first key typed replaces
+it and Backspace clears it. A dim line under it says the forms — `10 sets · +5 raises · -2 lowers` —
+and the box shows what the key spent of its cap and the new cap as you type (for a set, each pod's
+before → after) — a cap the CLI would refuse stays in the box, saying why (the dashboard never
+forces) — and Enter runs `arena keys limit <pod> <amount> --yes` (the amount as the CLI takes it:
+`-$2` as `-2`); **`ai pause`** / **`ai resume`** (`o`,
 whichever the key needs) a `y` confirm with the key's state now; **`ai rotate`** (`n`, red) runs
 `arena keys rotate <pod> --copy --yes` — the old key stops at once, the new one (cap
 `OPENROUTER_KEY_LIMIT`) is saved in `./keys` where the dashboard was started and copied onto the
