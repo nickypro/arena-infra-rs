@@ -2193,6 +2193,12 @@ async fn set_branch_pushes_each_branch_first_and_copies_a_pod_whose_branch_cant_
     );
     assert_eq!(unredacted_note("UNREDACTED_RESTORED joep.py\n"), " — real key(s) back in 1 file(s) git has redacted: joep.py");
     assert_eq!(unredacted_note("RESTORED Grokking\n"), "");
+    // What the replacements moved aside, kept until the cleanup: counted, with the command.
+    assert_eq!(
+        unredacted_note("UNREDACTED_RESTORED joep.py\nUNREDACTED_RECOVERED recover.a1.placed joep.py\nUNREDACTED_RECOVERED recover.b2.placed joep.py\n"),
+        " — real key(s) back in 1 file(s) git has redacted: joep.py — 2 earlier version(s) of files it replaced are kept in \
+         .git/arena-unredacted/recover.* (`arena pods clean-kept` drops those a file or git now holds byte for byte)"
+    );
     // What init-branches left for the next backup to scan and push (FIX9B item 2).
     assert_eq!(
         unpushed_note("Switched to a new branch 'x'\nUNPUSHED 2 0123456789abcdef0123456789abcdef01234567\n"),
@@ -5089,4 +5095,29 @@ async fn pods_test_course_checks_what_each_participant_uses() {
     let err = handle_pods(cmd, &fleet(), fake3.clone(), &cfg, true).await.unwrap_err();
     assert!(err.to_string().contains("--claude-call goes with --course or --deep"), "{err}");
     assert!(fake3.calls().is_empty());
+}
+
+/// `pods clean-kept`: each pod's line says what was dropped (a file holds it, or git) and what
+/// was kept; --dry-run says "would drop" and runs the command's dry form.
+#[tokio::test]
+async fn clean_kept_says_what_it_dropped_and_kept_per_pod() {
+    let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\nSHARED_SSH_KEY_PATH=/nonexistent/k\n"));
+    let chosen = picked(&fleet(), &cfg, &["apple"]).await;
+    for dry in [true, false] {
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(
+            &host(22001),
+            [FakeReply::stdout("RECOVERED_DROP file recover.a1.placed ex.py\nRECOVERED_DROP git recover.b2.placed ex.py\nRECOVERED_KEEP recover.c3 notes.py\n")],
+        );
+        let _ = crate::pods::selection::take_said();
+        crate::pods::branch::handle_clean_kept(fake.clone(), &cfg, &chosen, dry, true).await.unwrap();
+        let said = crate::pods::selection::take_said();
+        let verb = if dry { "would drop" } else { "dropped" };
+        assert!(
+            said.iter().any(|l| l.ends_with(&format!("✓ devtest-apple: {verb} 2 kept version(s) (1 a file holds, 1 git does); kept 1 (no file holds them): notes.py"))),
+            "{said:#?}"
+        );
+        let cmds: Vec<String> = fake.calls().into_iter().filter_map(|c| if let RemoteCall::Exec { cmd, .. } = c { Some(cmd) } else { None }).collect();
+        assert_eq!(cmds, [arena_core::backup::clean_recovered_command(REPO, dry)]);
+    }
 }

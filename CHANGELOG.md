@@ -32,6 +32,11 @@ earlier).
 - A file whose only change is a key but whose mode changed too (`chmod +x`) is no longer set
   aside. A switch now treats it like any other local change, where before it set the file's mode
   back.
+- **New: `arena pods clean-kept [pods] [--dry-run]`.** A switch now keeps every earlier version of
+  a file it replaced, in `.git/arena-unredacted/recover.*`, and never deletes one on its own: a
+  program that had the file open could still save into it. Each switch's line says how many are
+  kept. `clean-kept` drops the ones a file or git now holds byte for byte, and never one a program
+  has open.
 - Found by a sweep for flaky tests (#81), and tested live on a Hetzner VM.
 
 ## 2026-11-03 · the backup's copy: files vanishing on a pod mid-copy no longer fail it

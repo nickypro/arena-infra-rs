@@ -1021,6 +1021,50 @@ pub fn parse_init_unpushed(stdout: &str) -> Option<(u64, Option<String>)> {
     })
 }
 
+/// `arena pods clean-kept`: on the pod, the versions of files a switch's replacement moved
+/// aside (`.git/arena-unredacted/recover.*`, which nothing deletes on its own: a process that had
+/// the file open could still write to it) that a file now holds byte for byte — the work tree's at
+/// that path, or git's own blob at HEAD — are dropped, none a process holds; `dry` only says which.
+/// Prints `RECOVERED_DROP <file|git|empty> <folder> <path>` and `RECOVERED_KEEP <folder> <path>`
+/// lines ([`parse_clean_recovered`]). Under `sh` and bounded, as a switch is.
+pub fn clean_recovered_command(repo_path: &str, dry: bool) -> String {
+    let script = format!(
+        "cd {} || exit 3\ncd \"$(git rev-parse --show-toplevel)\" || exit 3\nG=$(git rev-parse --absolute-git-dir) || exit 3\n{}\nunredacted_clean \"$G/arena-unredacted\" {}\n",
+        shell_quote(repo_path),
+        unredacted_sh(),
+        if dry { "dry" } else { "\"\"" }
+    );
+    let stopped = "arena clean-kept: it ran past its 120 s on the pod and was stopped there (TERM) — some kept versions may be left: run it again";
+    let killed = "arena clean-kept: it ran past its 120 s on the pod and was killed there — some kept versions may be left: run it again";
+    bounded_sh(&script, "arena-clean-kept", 120, 10, stopped, killed)
+}
+
+/// What [`clean_recovered_command`] said: the versions dropped (or, dry, to drop) with why — a
+/// file at the path holds it (`file`), git's HEAD does (`git`), or the folder was empty — and the
+/// paths of those kept.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CleanRecovered {
+    pub dropped: Vec<(String, String)>,
+    pub kept: Vec<String>,
+}
+
+pub fn parse_clean_recovered(stdout: &str) -> CleanRecovered {
+    let mut out = CleanRecovered::default();
+    for line in stdout.lines().map(|l| l.trim_end_matches('\r')) {
+        if let Some(rest) = line.strip_prefix("RECOVERED_DROP ") {
+            let mut w = rest.splitn(3, ' ');
+            if let (Some(why), Some(_folder), Some(path)) = (w.next(), w.next(), w.next()) {
+                out.dropped.push((why.to_string(), path.to_string()));
+            }
+        } else if let Some(rest) = line.strip_prefix("RECOVERED_KEEP ") {
+            if let Some((_folder, path)) = rest.split_once(' ') {
+                out.kept.push(path.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Render the remote command that switches a pod's ARENA checkout to `branch`.
 ///
 /// `hard == false` (default): **gentle** — fetch origin, checkout, then fast-forward to
@@ -2801,7 +2845,7 @@ done
             assert!(ok, "hard={hard}: {out}{err}");
             assert!(out.contains("UNREDACTED_RESTORED README.md") && out.contains("UNREDACTED_RESTORED joep.py"), "{out}");
             assert_eq!((s.read("README.md"), s.read("joep.py")), (ex.clone().into_bytes(), joep.clone().into_bytes()), "hard={hard}");
-            assert!(!aside.exists(), "hard={hard}");
+            assert!(nothing_left_aside(&s), "hard={hard}");
             assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "M README.md\n M joep.py");
         }
         // A gentle switch to the branch it's on keeps them where they are.
@@ -3132,16 +3176,16 @@ done
         // …and the second init of the day lands on the branch that exists: the key comes back.
         let (out, err) = run(init_branch_command(&day(2), "devtest-x"));
         assert_eq!(head(), "autocommit-devtest-w1d2-x");
-        assert_eq!(out.lines().filter(|l| l.starts_with("UNREDACTED_")).collect::<Vec<_>>(), ["UNREDACTED_RESTORED README.md"], "{out}");
+        assert_eq!(out.lines().filter(|l| l.starts_with("UNREDACTED_") && !l.starts_with("UNREDACTED_RECOVERED ")).collect::<Vec<_>>(), ["UNREDACTED_RESTORED README.md"], "{out}");
         assert_eq!(s.read("README.md"), readme.as_bytes());
-        assert!(!aside.exists(), "nothing left set aside");
+        assert!(nothing_left_aside(&s), "nothing left set aside");
         assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "M README.md");
         assert!(!out.contains(&key) && !err.contains(&key));
         // A new day: the key stays set aside for its own branch, and nothing is said.
         assert!(run(checkout_command(repo, "main", None, true)).0.contains("UNREDACTED_KEPT README.md"));
         let (out, _) = run(init_branch_command(&day(3), "devtest-x"));
         assert_eq!(head(), "autocommit-devtest-w1d3-x");
-        assert!(!out.contains("UNREDACTED_"), "{out}");
+        assert!(!out.lines().any(|l| l.starts_with("UNREDACTED_") && !l.starts_with("UNREDACTED_RECOVERED ")), "{out}");
         assert_eq!(s.read("README.md").len(), 5);
         assert_eq!(aside_copies(&aside, "README.md"), [readme.clone().into_bytes()]);
         // …until a switch back to that branch.
@@ -4945,7 +4989,7 @@ done
                 assert!(!outlived.exists(), "{shell} hard={hard}: bounded");
                 assert!(err.contains("the switch ran past its 600 s on the pod and was stopped there"), "{shell} hard={hard}: {err}");
                 assert_eq!(s.read("ex.py"), ex.as_bytes(), "{shell} hard={hard}: the real key put back");
-                assert!(!aside.exists(), "{shell} hard={hard}");
+                assert!(nothing_left_aside(&s), "{shell} hard={hard}");
                 assert_eq!(branch(), "autocommit-x", "{shell} hard={hard}");
             }
             // The real command under that login shell: to main (ex.py's key kept aside: main has
@@ -5569,7 +5613,7 @@ done
             let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, hard), &path);
             assert_eq!(code, Some(143), "hard={hard}: {out}{err}");
             assert_eq!(s.read("ex.py"), ex.as_bytes(), "hard={hard}: the real key put back");
-            assert!(!aside.exists(), "hard={hard}");
+            assert!(nothing_left_aside(&s), "hard={hard}");
             assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "hard={hard}");
         }
     }
@@ -5610,14 +5654,17 @@ done
         (s, ex)
     }
 
-    /// The copies left set aside under `.git/arena-unredacted/` (paths, every run).
+    /// The copies left set aside under `.git/arena-unredacted/` (paths, every run; not the
+    /// recover.* folders: [`recovered`]).
     #[cfg(unix)]
     fn set_aside(s: &GitSandbox) -> Vec<String> {
         fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
             for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
                 let p = e.path();
                 if p.is_dir() {
-                    walk(root, &p, out);
+                    if !(dir == root && e.file_name().to_string_lossy().starts_with("recover.")) {
+                        walk(root, &p, out);
+                    }
                 } else if p.parent() != Some(root) {
                     out.push(p.strip_prefix(root).unwrap().display().to_string());
                 }
@@ -5628,6 +5675,39 @@ done
         walk(&root, &root, &mut v);
         v.sort();
         v
+    }
+
+    /// No key left set aside, and nothing of the participant's only in `.git`: every version the
+    /// replacements kept is one a file or git holds, so the cleanup drops them all.
+    #[cfg(unix)]
+    fn nothing_left_aside(s: &GitSandbox) -> bool {
+        set_aside(s).is_empty() && clean_recovered(s, false).1.kept.is_empty() && recovered(s).is_empty()
+    }
+
+    /// The versions recover.* folders keep: (folder, the path it was at, its bytes).
+    #[cfg(unix)]
+    fn recovered(s: &GitSandbox) -> Vec<(String, String, Vec<u8>)> {
+        let root = s.work.join(".git/arena-unredacted");
+        let mut v: Vec<(String, String, Vec<u8>)> = std::fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("recover."))
+            .map(|e| {
+                let path = std::fs::read_to_string(e.path().join("path")).unwrap_or_default().trim_end().to_string();
+                (e.file_name().to_string_lossy().into_owned(), path, std::fs::read(e.path().join("file")).unwrap_or_default())
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// `pods clean-kept` on the sandbox (`dry`: what it would drop): (exit, what it said).
+    #[cfg(unix)]
+    fn clean_recovered(s: &GitSandbox, dry: bool) -> (Option<i32>, CleanRecovered) {
+        let (code, out, err) = run_on_path(&clean_recovered_command(s.work.to_str().unwrap(), dry), &std::env::var("PATH").unwrap_or_default());
+        assert!(err.is_empty() || code == Some(0), "{out}{err}");
+        (code, parse_clean_recovered(&out))
     }
 
     /// A switch stopped while it sets the real keys aside — its bound's TERM mid-copy, mid-write of
@@ -5650,6 +5730,11 @@ done
             assert_eq!(set_aside(&s), Vec::<String>::new(), "{when}: nothing left set aside");
             assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "{when}");
             assert_eq!((s.git(&s.work, &["ls-files", "-s", "ex.py"]), s.git(&s.work, &["status", "--porcelain"])), (index.clone(), status.clone()), "{when}");
+            // What the replacements moved aside is kept, never deleted on its own — and each version
+            // is one a file or git holds byte for byte, so the cleanup drops them all.
+            let (code, cleaned) = clean_recovered(&s, false);
+            assert_eq!((code, cleaned.kept.len()), (Some(0), 0), "{when}: {cleaned:?}");
+            assert_eq!(recovered(&s), Vec::new(), "{when}: nothing of its own was left");
         };
         let capture = "*\"ex.py \"*\"/recover.\"*\"/file\")";
         let mut stops = vec![
@@ -5874,13 +5959,17 @@ done
         let _ = editor.wait();
         assert_eq!(code, Some(124), "{out}{err}");
         assert_eq!(s.read("ex.py"), ex.as_bytes(), "the key back in the file: {out}");
-        let saved = set_aside(&s).iter().map(|c| std::fs::read_to_string(s.work.join(".git/arena-unredacted").join(c)).unwrap()).find(|t| t.contains("saved = 1"));
+        let saved = recovered(&s).into_iter().map(|(_, _, b)| String::from_utf8(b).unwrap()).find(|t| t.contains("saved = 1"));
         assert_eq!(saved.as_deref(), Some(format!("{ex}saved = 1\n").as_str()), "the save kept");
-        assert!(out.contains("UNREDACTED_KEPT ex.py (a version of it in .git/arena-unredacted/recover."), "and said: {out}");
-        // Nobody holds it now, but it isn't what was expected: a later switch keeps it, and says so.
+        assert!(out.contains("UNREDACTED_RECOVERED recover."), "and said: {out}");
+        // Nobody holds it now, but no file holds it either: the cleanup keeps it, and a later
+        // switch still says so.
+        let (_, cleaned) = clean_recovered(&s, false);
+        assert_eq!(cleaned.kept, ["ex.py"], "{cleaned:?}");
+        assert!(recovered(&s).iter().any(|(_, _, b)| String::from_utf8_lossy(b).contains("saved = 1")));
         let (code, out, err) = run_on_path(&checkout_command(repo, "autocommit-x", None, false), &std::env::var("PATH").unwrap_or_default());
         assert_eq!(code, Some(0), "{out}{err}");
-        assert!(out.contains("UNREDACTED_KEPT ex.py (a version of it in"), "{out}");
+        assert!(out.contains("UNREDACTED_RECOVERED recover."), "{out}");
     }
 
     /// Something that takes a file's name while it's moved aside — here a link to a directory —
@@ -5903,6 +5992,85 @@ done
         assert!(std::fs::symlink_metadata(s.work.join("ex.py")).unwrap().file_type().is_symlink(), "what took the name stays");
         assert!(set_aside(&s).iter().any(|c| std::fs::read(s.work.join(".git/arena-unredacted").join(c)).unwrap() == ex.as_bytes()), "the key kept");
         assert!(out.contains("UNREDACTED_KEPT ex.py"), "{out}");
+    }
+
+    /// A replacement whose mark can't be made — the rename of its folder, after the file went in
+    /// (review codex s3: a failed `:` redirect there read as "put back", and both copies went) —
+    /// keeps what it moved, unmarked, and said; the key comes back all the same, and once a file
+    /// holds those versions the cleanup drops them.
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_whose_mark_cant_be_made_keeps_what_it_moved() {
+        let (s, ex) = keyed("aside-nomark", "ex.py", 100);
+        let repo = s.work.to_str().unwrap();
+        let bin = s.base.join("bin");
+        stand_in_tool(&bin, "mv", "*\"/recover.\"*\".placed\") exit 1;;");
+        stand_in_tool(&bin, "git", &format!("*\" checkout main\") {STOP_SH};;"));
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let (code, out, err) = run_on_path(&bounded_switch(&switch_script(repo, "main", None, false, KB_DEFAULT), 600, 60), &path);
+        assert_eq!(code, Some(124), "{out}{err}");
+        assert_eq!(s.read("ex.py"), ex.as_bytes(), "the key back: {out}");
+        assert!(out.contains("UNREDACTED_RESTORED ex.py"), "{out}");
+        let kept = recovered(&s);
+        assert_eq!(kept.len(), 2, "what the set-aside and the restore moved, both kept: {kept:?}");
+        assert!(kept.iter().all(|(f, p, _)| !f.ends_with(".placed") && p == "ex.py"), "{kept:?}");
+        assert!(out.contains("UNREDACTED_KEPT ex.py (a version of it in .git/arena-unredacted/recover."), "said: {out}");
+        let (_, cleaned) = clean_recovered(&s, false);
+        assert_eq!((cleaned.dropped.len(), cleaned.kept.len()), (2, 0), "{cleaned:?}");
+        assert_eq!(recovered(&s), Vec::new());
+    }
+
+    /// A switch never deletes what its replacements moved aside (review codex s3, the lead: a
+    /// process could still write to it), and says so; `pods clean-kept` drops the versions a
+    /// file now holds byte for byte — the file's at that path, or git's — saying first, with
+    /// `--dry-run`, what it would drop, and keeps the rest: one with something of its own, one a
+    /// program has open.
+    #[cfg(unix)]
+    #[test]
+    fn what_a_switch_moved_aside_is_kept_until_the_cleanup_finds_it_held_elsewhere() {
+        let (s, ex) = keyed("aside-kept-moved", "ex.py", 101);
+        let repo = s.work.to_str().unwrap();
+        let plain = std::env::var("PATH").unwrap_or_default();
+        let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, false), &plain);
+        assert_eq!(code, Some(0), "{out}{err}");
+        assert!(out.contains("UNREDACTED_KEPT ex.py") && out.contains("UNREDACTED_RECOVERED recover."), "{out}");
+        let (code, out, err) = run_on_path(&checkout_command(repo, "autocommit-x", None, false), &plain);
+        assert_eq!(code, Some(0), "{out}{err}");
+        assert_eq!(s.read("ex.py"), ex.as_bytes());
+        let kept = recovered(&s);
+        assert_eq!(kept.len(), 2, "the original the set-aside moved, the placeholder the restore did: {kept:?}");
+        assert!(kept.iter().any(|(_, _, b)| b == ex.as_bytes()) && kept.iter().any(|(_, _, b)| b != ex.as_bytes()), "{kept:?}");
+        assert_eq!(out.matches("UNREDACTED_RECOVERED recover.").count(), 2, "{out}");
+        // Dry: said, nothing dropped.
+        let (code, dry) = clean_recovered(&s, true);
+        assert_eq!(code, Some(0));
+        let mut whys: Vec<&str> = dry.dropped.iter().map(|(w, _)| w.as_str()).collect();
+        whys.sort();
+        assert_eq!((whys, dry.kept.len()), (vec!["file", "git"], 0), "{dry:?}");
+        assert_eq!(recovered(&s), kept, "a dry run drops nothing");
+        // One with something of its own is kept.
+        let own = s.work.join(".git/arena-unredacted").join(&kept[0].0).join("file");
+        std::fs::write(&own, "mine = 4\n").unwrap();
+        let (_, cleaned) = clean_recovered(&s, false);
+        assert_eq!((cleaned.dropped.len(), cleaned.kept.clone()), (1, vec!["ex.py".to_string()]), "{cleaned:?}");
+        assert_eq!(recovered(&s).len(), 1);
+        // Once a file holds it byte for byte — and while no program has it open (Linux: /proc) —
+        // it goes too.
+        std::fs::write(s.work.join("ex.py"), "mine = 4\n").unwrap();
+        if cfg!(target_os = "linux") {
+            let own = s.work.join(".git/arena-unredacted").join(&recovered(&s)[0].0).join("file");
+            let mut held = std::process::Command::new("sh").args(["-c", "exec 3<\"$1\"; read -r _ ", "sh"]).arg(&own).stdin(std::process::Stdio::piped()).spawn().unwrap();
+            while !std::fs::read_dir(format!("/proc/{}/fd", held.id())).is_ok_and(|d| d.flatten().any(|e| std::fs::read_link(e.path()).is_ok_and(|l| l == own))) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let (_, cleaned) = clean_recovered(&s, false);
+            assert_eq!((cleaned.dropped.len(), cleaned.kept.len()), (0, 1), "held: kept: {cleaned:?}");
+            drop(held.stdin.take());
+            let _ = held.wait();
+        }
+        let (_, cleaned) = clean_recovered(&s, false);
+        assert_eq!((cleaned.dropped.clone(), cleaned.kept.len()), (vec![("file".to_string(), "ex.py".to_string())], 0), "{cleaned:?}");
+        assert_eq!(recovered(&s), Vec::new());
     }
 
     /// A file whose only difference is keys is still left as it is — not set aside — when putting

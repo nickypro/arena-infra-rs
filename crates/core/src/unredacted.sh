@@ -14,8 +14,11 @@
 #   UNREDACTED_RESTORED <path>   its real keys are back in the file
 #   UNREDACTED_KEPT <path>       its real keys are still set aside: this switch's own (the branch
 #                                has its own version), one of this branch's that couldn't go back
-#                                (the file changed since), or a version of the file a recover.*
-#                                folder keeps — every such one, every time, until it's gone
+#                                (the file changed since), or a version of the file a replacement
+#                                couldn't finish with — every such one, every time, until it's gone
+#   UNREDACTED_RECOVERED <folder> <path>   a version of the file a replacement moved aside, kept
+#                                (never deleted on its own: a process could still write to it) until
+#                                `arena pods clean-kept` drops it, once a file holds it byte for byte
 #
 # However a switch ends — a TERM (the bound's; the EXIT trap then restores) or a KILL anywhere (a
 # later switch's restore, or init-branches', recovers) — no version of a file is ever lost, and a
@@ -27,9 +30,10 @@
 #   file is first moved into a recover.* folder of its own — its path and what it should be
 #   written there before, so a KILL right then is recovered — and the new one linked in (`ln -T`:
 #   never over anything that took the name) only if what was moved aside is exactly what was
-#   expected, bytes and mode; else it goes back. What was moved aside is dropped only once it's
-#   back, or is still exactly what was expected while no process has it open or mapped (one could
-#   still write to it: `/proc`); until then its folder keeps it, and it's said.
+#   expected, bytes and mode; else it goes back. What was moved aside is never deleted on its own
+#   (a process that had it open could still write to it): its folder keeps it, said, until the
+#   operator's `clean-kept` drops it, once a file holds it byte for byte ([`unredacted_clean`]).
+#   A folder goes on its own only when nothing in it is unique — checked, never taken from a status.
 
 # Each tracked file whose only difference from the index is keys the redaction knows: set aside.
 # A file with any other uncommitted change is left alone — the switch treats it as it always did,
@@ -65,7 +69,7 @@ unredacted_aside() {
         fi
         if unredacted_place "$1" "$f" "$1/$UR_RUN.redacted" "$c"; then r=0; else r=$?; fi
         case $r in
-            0) ;;
+            0 | 4) ;;
             3) echo "arena set-branch: $f changed while it was set aside, or couldn't go back: its versions are kept in $1" >&2 ;;
             *)
                 rm -f -- "$c"
@@ -95,19 +99,21 @@ unredacted_in_place() {
 # Replace the work tree's file $2 by $3, if it is now exactly $4 (bytes and mode). In $2's own
 # directory, entered once (`cd -P`) and checked to be the work tree's: from there on only names in
 # it are used, so a link swapped in for that directory is never followed. The live file is moved
-# into a recover.* folder of its own in $1 first — its path, and the hash and mode it should have,
-# written there before — and the new one hard-linked in with `ln -T`, which never replaces
-# anything that took the name meanwhile (a file, a directory, a link to one). 0: replaced; what was
-# there waits in its folder for [`unredacted_settle`]. 1: not tried, nothing changed. 2: left as
-# it was (what was there wasn't $4, or the new one couldn't go in: it went back). 3: what was there
-# couldn't go back (its name was taken meanwhile, or the link failed): its folder keeps it, said.
+# into a recover.* folder of its own in $1 first (its path written there before), and the new one
+# hard-linked in with `ln -T`, which never replaces anything that took the name meanwhile (a file,
+# a directory, a link to one). 0: replaced; the folder, renamed `<folder>.placed`, keeps what was
+# there. 4: replaced, but that rename failed: the folder keeps it unmarked. 1: nothing moved. 2:
+# left as it was (what was there wasn't $4, or the new one couldn't go in: it went back). 3: what
+# was there couldn't go back (its name taken, or the link failed): its folder keeps it, said. A
+# folder goes here only for 1 and 2, and only once that's checked: nothing in it, or its file the
+# very one in its place again.
 unredacted_place() {
     _dir=$(dirname -- "$2")
     _want=$UR_TOP
     [ "$_dir" = . ] || _want=$UR_TOP/$_dir
     mkdir -p -- "$1" || return 1
     _rd=$(mktemp -d "$1/recover.XXXXXX") || return 1
-    if ! { printf '%s\n' "$2" > "$_rd/path" && git hash-object --no-filters -- "$4" > "$_rd/hash" && stat -c %a -- "$4" > "$_rd/mode"; }; then
+    if ! printf '%s\n' "$2" > "$_rd/path"; then
         rm -rf -- "$_rd"
         return 1
     fi
@@ -119,21 +125,34 @@ unredacted_place() {
         mv -f -- "$_base" "$_rd/file" || exit 1
         if [ -f "$_rd/file" ] && [ ! -L "$_rd/file" ] && cmp -s -- "$_rd/file" "$4" \
             && [ "$(stat -c %a -- "$_rd/file")" = "$(stat -c %a -- "$4")" ] && ln -T -- "$3" "$_base" 2> /dev/null; then
-            : > "$_rd/placed"
+            mv -T -- "$_rd" "$_rd.placed" 2> /dev/null || exit 4
             exit 0
         fi
         # Not what was expected, or the new one couldn't go in: what was there goes back.
         if [ -f "$_rd/file" ] && [ ! -L "$_rd/file" ]; then
-            ln -T -- "$_rd/file" "$_base" 2> /dev/null || exit 3
+            { ln -T -- "$_rd/file" "$_base" 2> /dev/null && [ "$_rd/file" -ef "$_base" ]; } || exit 3
         else
             { mv -n -T -- "$_rd/file" "$_base" 2> /dev/null && [ ! -e "$_rd/file" ] && [ ! -L "$_rd/file" ]; } || exit 3
         fi
         exit 2
     ) || _r=$?
-    case $_r in
-        1 | 2) rm -rf -- "$_rd" ;;
-    esac
+    if [ "$_r" = 1 ] || [ "$_r" = 2 ]; then
+        if { [ ! -e "$_rd/file" ] && [ ! -L "$_rd/file" ]; } || unredacted_is_back "$_rd/file" "$2"; then
+            rm -rf -- "$_rd"
+        else
+            _r=3
+        fi
+    fi
     return $_r
+}
+
+# Whether $1 is the very file (one inode) the work tree's $2 is now: looked at from $2's own
+# directory, entered once and checked to be the work tree's.
+unredacted_is_back() {
+    _dir=$(dirname -- "$2")
+    _want=$UR_TOP
+    [ "$_dir" = . ] || _want=$UR_TOP/$_dir
+    (cd -P -- "$_dir" 2> /dev/null && [ "$(pwd -P)" = "$_want" ] && [ -f "${2##*/}" ] && [ ! -L "${2##*/}" ] && [ "$1" -ef "${2##*/}" ])
 }
 
 # Link $1 in as the work tree's $2 if nothing is there (`ln -T`): in $2's own directory, entered
@@ -155,26 +174,55 @@ unredacted_held() {
     } | sort -u
 }
 
-# The recover.* folders [`unredacted_place`] left. One whose replacement didn't happen (a KILL
-# between moving the file aside and linking its replacement in) goes back if its place is empty;
-# one whose file is still exactly what was expected and that no process holds (nothing of its
-# own, and nothing can write to it) is dropped; one with no file in it (a KILL before the move)
-# too. The rest stay, and are said (KEPT).
+# The recover.* folders [`unredacted_place`] left that need no one to decide: one with nothing in
+# it (a KILL before the move) goes; one whose replacement never went in (a KILL between moving the
+# file aside and linking its replacement in), its place still empty, puts the file back and goes
+# — checked to be back. Every other one stays, said ([`unredacted_restore`]), for
+# [`unredacted_clean`]: never one whose replacement went in, whatever it holds.
 unredacted_settle() {
+    for _rd in "$1"/recover.*; do
+        [ -d "$_rd" ] || continue
+        case $_rd in *.placed) continue ;; esac
+        if [ ! -e "$_rd/file" ] && [ ! -L "$_rd/file" ]; then
+            rm -rf -- "$_rd"
+            continue
+        fi
+        _f=$(cat "$_rd/path" 2> /dev/null) || _f=
+        if [ -n "$_f" ] && [ ! -e "$_f" ] && [ ! -L "$_f" ] && unredacted_link_in "$_rd/file" "$_f" && unredacted_is_back "$_rd/file" "$_f"; then
+            rm -rf -- "$_rd"
+        fi
+    done
+}
+
+# `arena pods clean-kept`: of the versions recover.* folders keep, drop the ones a file now
+# holds byte for byte — the work tree's at that path, or git's (HEAD's blob, as stored: no filter
+# the repository configures is run) — and none a process has open or mapped; say each (dropped, or
+# with $2 = dry what would be), and each one kept. A folder with nothing in it goes too.
+unredacted_clean() {
+    [ -d "$1" ] || return 0
+    UR_TOP=$(pwd -P)
     _held=$(unredacted_held "$1")
     for _rd in "$1"/recover.*; do
         [ -d "$_rd" ] || continue
         _f=$(cat "$_rd/path" 2> /dev/null) || _f=
+        _why=
         if [ ! -e "$_rd/file" ] && [ ! -L "$_rd/file" ]; then
-            rm -rf -- "$_rd"
-        elif [ ! -f "$_rd/placed" ] && [ -n "$_f" ] && [ ! -e "$_f" ] && [ ! -L "$_f" ] && unredacted_link_in "$_rd/file" "$_f"; then
-            rm -rf -- "$_rd"
-        elif [ -f "$_rd/file" ] && [ ! -L "$_rd/file" ] && ! printf '%s\n' "$_held" | grep -qxF -- "$_rd/file" \
-            && [ "$(git hash-object --no-filters -- "$_rd/file")" = "$(cat "$_rd/hash" 2> /dev/null)" ] \
-            && [ "$(stat -c %a -- "$_rd/file")" = "$(cat "$_rd/mode" 2> /dev/null)" ]; then
-            rm -rf -- "$_rd"
+            _why=empty
+        elif [ -f "$_rd/file" ] && [ ! -L "$_rd/file" ] && ! printf '%s\n' "$_held" | grep -qxF -- "$_rd/file" && [ -n "$_f" ]; then
+            if [ -f "$_f" ] && [ ! -L "$_f" ] && unredacted_in_place "$1" "$_f" && cmp -s -- "$_rd/file" "$_f"; then
+                _why=file
+            elif git cat-file blob "HEAD:$_f" 2> /dev/null | cmp -s - "$_rd/file"; then
+                _why=git
+            fi
+        fi
+        if [ -n "$_why" ]; then
+            [ "$2" = dry ] || rm -rf -- "$_rd"
+            echo "RECOVERED_DROP $_why ${_rd##*/} ${_f:-?}"
+        else
+            echo "RECOVERED_KEEP ${_rd##*/} ${_f:-?}"
         fi
     done
+    [ "$2" = dry ] || rmdir "$1" 2> /dev/null || true
 }
 
 # After the switch: the copies set aside on the branch now checked out, newest first and one per
@@ -201,10 +249,13 @@ unredacted_restore() {
                 continue
             fi
             # What the set-aside left there, and the copy to put back, both beside the runs.
-            cp -p -- "$1/$run/$f" "$1/$run.redacted" && LC_ALL=C sed -E "$REDACT_SED" < "$1/$run/$f" > "$1/$run.redacted" \
-                && cp -p -- "$1/$run/$f" "$1/$run.back" \
-                && unredacted_place "$1" "$f" "$1/$run.back" "$1/$run.redacted" \
-                && rm -f -- "$1/$run/$f" && printf '%s\n' "$f" >> "$1.done" && echo "UNREDACTED_RESTORED $f"
+            if cp -p -- "$1/$run/$f" "$1/$run.redacted" && LC_ALL=C sed -E "$REDACT_SED" < "$1/$run/$f" > "$1/$run.redacted" \
+                && cp -p -- "$1/$run/$f" "$1/$run.back"; then
+                if unredacted_place "$1" "$f" "$1/$run.back" "$1/$run.redacted"; then r=0; else r=$?; fi
+                if [ "$r" = 0 ] || [ "$r" = 4 ]; then
+                    rm -f -- "$1/$run/$f" && printf '%s\n' "$f" >> "$1.done" && echo "UNREDACTED_RESTORED $f"
+                fi
+            fi
             rm -f -- "$1/$run.redacted" "$1/$run.back"
         done
     done
@@ -215,6 +266,7 @@ unredacted_restore() {
     # and every version a recover.* folder keeps.
     for run in $(ls -1 "$1"); do
         case $run in
+            recover.*.placed) ;;
             recover.*)
                 if [ -d "$1/$run" ]; then
                     echo "$(cat "$1/$run/path" 2> /dev/null || echo '(a file)') (a version of it in .git/arena-unredacted/$run)"
@@ -227,6 +279,9 @@ unredacted_restore() {
                 ;;
         esac
     done | sort -u | while IFS= read -r f; do echo "UNREDACTED_KEPT $f"; done
+    for run in "$1"/recover.*.placed; do
+        if [ -d "$run" ]; then echo "UNREDACTED_RECOVERED ${run##*/} $(cat "$run/path" 2> /dev/null || echo '?')"; fi
+    done
     rm -f "$1.done"
     find "$1" -mindepth 1 -depth -type d -empty -delete 2>/dev/null || true
     for b in "$1"/*.branch; do

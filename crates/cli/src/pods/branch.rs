@@ -577,7 +577,73 @@ pub(crate) fn unredacted_note(stdout: &str) -> String {
     if !back.is_empty() {
         note.push_str(&format!(" — real key(s) back in {} file(s) git has redacted: {}", back.len(), back.join(", ")));
     }
+    let recovered = stdout.lines().filter(|l| l.starts_with("UNREDACTED_RECOVERED ")).count();
+    if recovered > 0 {
+        note.push_str(&format!(
+            " — {recovered} earlier version(s) of files it replaced are kept in .git/arena-unredacted/recover.* (`arena pods \
+             clean-kept` drops those a file or git now holds byte for byte)"
+        ));
+    }
     note
+}
+
+/// `pods clean-kept`: on each pod, under its backup lock as a switch is, the versions of
+/// files a switch's replacements moved aside ([`arena_core::backup::clean_recovered_command`]) that
+/// a file or git now holds byte for byte are dropped; `--dry-run` says which, and each pod's line
+/// says what was kept.
+pub(crate) async fn handle_clean_kept(remote: Arc<dyn Remote>, cfg: &Config, sel: &Selected, dry_run: bool, yes: bool) -> Result<()> {
+    let targets = sel.named_targets(cfg)?;
+    if targets.is_empty() {
+        out!(Out, "(no pods with an SSH endpoint)");
+        return Ok(());
+    }
+    let names: Vec<String> = targets.iter().map(|(n, _)| n.clone()).collect();
+    let shown = names_line(&names, NAMES_SHOWN);
+    if !dry_run
+        && !crate::confirm_brief(
+            yes,
+            &format!("Will drop, on {}, the kept earlier versions of files that a file or git now holds byte for byte", names.join(", ")),
+            &format!("Drop the kept versions a file or git now holds, on {shown}?"),
+        )?
+    {
+        out!(Out, "aborted.");
+        return Ok(());
+    }
+    let repo = arena_core::backup::repo_path(cfg);
+    let cmd = arena_core::backup::clean_recovered_command(&repo, dry_run);
+    let dir = local_backup_dir(cfg);
+    let mut locks = take_pod_locks(&dir, &names, POD_LOCK_WAIT).await;
+    let mut failed = locks.busy.clone();
+    for b in &locks.busy {
+        out!(Out, "✗ {b}: {}", busy_line(b, POD_LOCK_WAIT));
+    }
+    let jobs: Vec<(String, SshTarget, String)> = targets.into_iter().filter(|(n, _)| !locks.busy.contains(n)).map(|(n, t)| (n, t, cmd.clone())).collect();
+    for (n, _, _) in &jobs {
+        locks.expect(n);
+    }
+    locks.release_idle();
+    let verb = if dry_run { "would drop" } else { "dropped" };
+    exec_each_pod(&remote, jobs, Duration::from_secs(150), |done, total, name, call| {
+        match &call {
+            Ok(o) if o.success => {
+                let r = arena_core::backup::parse_clean_recovered(&o.stdout);
+                let (file, git) = (r.dropped.iter().filter(|(w, _)| w == "file").count(), r.dropped.iter().filter(|(w, _)| w == "git").count());
+                let kept = if r.kept.is_empty() { String::new() } else { format!("; kept {} (no file holds them): {}", r.kept.len(), r.kept.join(", ")) };
+                say(&format!("[{done}/{total}] ✓ {name}: {verb} {} kept version(s) ({file} a file holds, {git} git does){kept}", r.dropped.len()));
+            }
+            _ => {
+                say(&failure_line(done, total, name, &call));
+                failed.push(name.clone());
+            }
+        }
+        locks.done(name);
+    })
+    .await;
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{} pod(s) failed: {}", failed.len(), failed.join(", "))
+    }
 }
 
 /// What `init-branches` left unpushed on the new branch ([`arena_core::backup::parse_init_unpushed`]):

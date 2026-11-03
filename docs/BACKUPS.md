@@ -663,10 +663,16 @@ interrupt or a TERM puts the keys back first. That holds however the switch ends
   (a link swapped in for it later is never followed): the live file is first moved into a
   `recover.*` folder of its own in `.git/arena-unredacted/`, with its path, and the new one linked
   in (never over anything that took the name) only if what was moved aside is exactly what was
-  expected (bytes and mode) — else it goes back. What was moved aside is dropped only once no
-  process has it open (an editor could still save into it) and it's still what was expected;
-  until then it's kept, and said. So no version of a file is ever lost, and a file is only ever
-  the participant's version or git's.
+  expected (bytes and mode) — else it goes back. So no version of a file is ever lost, and a file
+  is only ever the participant's version or git's.
+
+**What a switch moved aside is never deleted on its own:** a program that had the file open
+could still save into it. Each switch says how many such versions are kept (`… earlier version(s)
+of files it replaced are kept in .git/arena-unredacted/recover.*`). `arena pods clean-kept [pods]`
+drops the ones a file now holds byte for byte: the work tree's file at that path, or git's own blob
+at HEAD (the redacted version a restore moved aside). It never drops one a program has open, and
+never one with anything of its own. Each pod's line says how many it dropped and which it kept.
+`--dry-run` says what it would drop. It runs under each pod's backup lock, as a switch does.
 
 A file the participant changed, removed, made executable or moved under a link while the switch
 ran keeps what they did; its copy stays, and every switch on that branch says so (`UNREDACTED_KEPT`,

@@ -842,6 +842,11 @@ pub(crate) async fn handle_pods_bal(
             }
         }
 
+        PodCmd::CleanKept { sel, dry_run } => {
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            crate::pods::branch::handle_clean_kept(remote, cfg, &sel, dry_run, yes).await?;
+        }
+
         PodCmd::InitBranches { sel, cohort, week, day, dry_run } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
             let sel = cohort_only(cfg, sel, cohort);
