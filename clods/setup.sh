@@ -209,8 +209,13 @@ def done():
 path = os.path.join(profile, "settings.json")
 settings = load(path)
 if not token:
+    # The account is off this machine: its token, and a /login made in the profile, go.
     if settings and settings.get("env", {}).pop("CLAUDE_CODE_OAUTH_TOKEN", None):
         save(path, settings)
+    login = os.path.join(profile, ".credentials.json")
+    if os.path.exists(login):
+        os.unlink(login)
+        changed = True
     done()
 
 # A new profile starts from this machine's normal settings (theme, permission prefs...), but not
@@ -283,7 +288,7 @@ for dir in "$profiles"/claude*; do
   case "$kept" in *" $k "*) continue ;; esac
   if [ -n "$prune" ]; then
     w=$(write_profile "$dir" "")
-    say "  pruned claude$k ($(cat "$dir/.account")): token removed, history kept"
+    say "  pruned claude$k ($(cat "$dir/.account")): token and any /login removed, history kept"
     rm -f "$dir/.account"
     changed=1
   else

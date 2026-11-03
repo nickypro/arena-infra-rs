@@ -375,8 +375,10 @@ impl PullConfig {
 ///   settings, local history — IS kept);
 /// - `.ssh/` (keys: setup's, and secrets a backup volume shouldn't hold);
 /// - clods' tokens (`crate::clods`): each profile's `settings.json` (every account's token, on
-///   every pod; setup writes them again) and a `/login`'s `.credentials.json`. Its transcripts
-///   (`~/.clods/profiles/claudeN/projects/`) are kept, as `~/.claude`'s are;
+///   every pod; setup writes them again), the temp file an install cut short left beside it, a
+///   `/login`'s `.credentials.json`, and the installer `push.sh --arena` leaves when its run step
+///   never ran. The profiles' transcripts (`~/.clods/profiles/claudeN/projects/`) are kept, as
+///   `~/.claude`'s are;
 /// - the image's checkout setup moved aside when the repo went onto `/workspace` (a copy from the
 ///   image, as the regular tiers skip it; a pod with work on `/workspace` is never reaped).
 ///
@@ -416,7 +418,9 @@ pub const REAP_NOT_KEPT: &[&str] = &[
     ".ssh/",
     "/.clods/tokens",
     "/.clods/profiles/*/settings.json",
+    "/.clods/profiles/*/.settings.json.*",
     "/.clods/profiles/*/.credentials.json",
+    "/.claude-profiles-install*.sh",
     "*.arena-aside-*/",
 ];
 
@@ -2468,7 +2472,10 @@ mod tests {
             ".ssh/id_ed25519",
             ".clods/tokens",
             ".clods/profiles/claude1/settings.json",
+            ".clods/profiles/claude1/.settings.json.k2j4a9",
             ".clods/profiles/claude1/.credentials.json",
+            ".claude-profiles-install.sh",
+            ".claude-profiles-install-0a1b2c3d.sh",
             ".triton/cache/x",
             "ARENA_materials/TEMP_FOLDER_FOR_SWEEPS/run1/ckpt.pt",
             "ARENA_materials.arena-aside-20261001T000000Z/README.md",

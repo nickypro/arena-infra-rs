@@ -156,7 +156,8 @@ else
   ARENA=${ARENA:-arena}
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
-  remote=.claude-profiles-install.sh
+  # A name of this run's own: two pushes at once never run (or remove) each other's installer.
+  remote=.claude-profiles-install-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n').sh
   run="f=\$HOME/$remote; bash \"\$f\"; rc=\$?; rm -f \"\$f\"; exit \$rc"
   done_keys=" "
   for i in "${!machines[@]}"; do

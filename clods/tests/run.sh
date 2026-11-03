@@ -223,6 +223,7 @@ test_tokens_change() {
   tokens "${FOUR[@]}"
   bash "$T/clods/setup.sh" --default 2 "$T/clods/tokens" >/dev/null
   mkdir -p "$(P)/claude2/projects"; echo history > "$(P)/claude2/projects/s.jsonl"
+  echo '{"claudeAiOauth": "a /login"}' > "$(P)/claude2/.credentials.json"
   # A rotated token, and an account added at the end.
   tokens "a@example.com -> sk-ant-oat01-FAKEnewa" "${FOUR[@]:1}" "e@example.com -> sk-ant-oat01-FAKEeeee"
   out=$(bash "$T/clods/setup.sh" --summary "$T/clods/tokens")
@@ -235,10 +236,11 @@ test_tokens_change() {
   has "$(cat "$T/err")" "claude2 has no token in"
   eq "$(token_of "$(P)/claude2")" sk-ant-oat01-FAKEbbbb "a token not pruned"
   out=$(bash "$T/clods/setup.sh" --prune "$T/clods/tokens")
-  has "$out" "pruned claude2 (b@example.com)"
+  has "$out" "pruned claude2 (b@example.com): token and any /login removed"
   has "$out" "default claude2 is gone"
   eq "$(token_of "$(P)/claude2")" "" "the pruned token"
   gone "$(P)/claude2/.account"
+  gone "$(P)/claude2/.credentials.json"
   gone "$(P)/default"
   eq "$(cat "$(P)/claude2/projects/s.jsonl")" history "the pruned profile's history"
 }
@@ -343,10 +345,29 @@ test_push_arena() {
   eq "$(grep -c '^pods cp --yes -t p1 ' "$T/arena.log")" 1 "p1's copies"
   has "$(cat "$T/arena.log")" "pods run --yes -t p2 "
   hasnt "$(cat "$T/arena.log")" "sk-ant" "arena's command lines"
-  gone "$T/hosts/p1/.claude-profiles-install.sh"
+  eq "$(cd "$T/hosts/p1" && find . -name '.claude-profiles-install*')" "" "installers left on p1"
   eq "$(token_files "$T/hosts")" "" "token files outside the profiles"
   if ARENA_FAIL="pod not found" bash "$T/clods/push.sh" --arena -y -d 1 p1 > "$T/out" 2>&1; then fail "a failed arena push should fail"; fi
   has "$(cat "$T/out")" "✗ p1: failed"
+}
+
+test_push_arena_at_once() {
+  # Two arena pushes to one pod at once, with other accounts: each runs its own installer (never
+  # the other's, which it might also delete), both finish, and none is left behind.
+  tokens "${FOUR[@]:0:2}"
+  printf '%s\n' "c@example.com -> sk-ant-oat01-FAKEcccc" > "$T/other"
+  chmod 600 "$T/other"
+  host p1
+  for round in 1 2 3; do
+    bash "$T/clods/push.sh" --arena -y -a -d 1 p1 > "$T/a.$round" 2>&1 &
+    a=$!
+    bash "$T/clods/push.sh" --arena -y -a -d 1 -t "$T/other" p1 > "$T/b.$round" 2>&1 &
+    b=$!
+    wait "$a" || fail "push a, round $round: $(cat "$T/a.$round")"
+    wait "$b" || fail "push b, round $round: $(cat "$T/b.$round")"
+  done
+  eq "$(cd "$T/hosts/p1" && find . -name '.claude-profiles-install*')" "" "installers left"
+  eq "$(grep -o 'cp --yes -t p1 [^ ]* [^ ]*' "$T/arena.log" | awk '{print $NF}' | sort -u | wc -l)" 6 "distinct installer names"
 }
 
 # ---- clods.sh, under bash and zsh -------------------------------------------------------------

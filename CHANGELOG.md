@@ -37,9 +37,12 @@ earlier).
   machines have, and `-q` prints a line per machine. `MACHINE=none` takes every token off with
   `-a` too. A `claude` alias in an rc file no longer stops `clods.sh` loading, and `clods default`
   takes an email. A new profile no longer inherits an API key or a gateway from the normal
-  settings. Two installs on one machine take turns.
-- **The reaper's last backup** of a pod leaves out clods' tokens (each profile's `settings.json`);
-  the transcripts beside them are kept. The archive never takes `~/.clods`. The pod's reap notice
+  settings. Two installs on one machine take turns, and two `push.sh --arena` runs at once each
+  run their own installer. Taking an account off a machine also takes off a `/login` made in its
+  profile.
+- **The reaper's last backup** of a pod leaves out clods' tokens (each profile's `settings.json`,
+  a temp file an install cut short left, a `/login`, an installer `push.sh --arena` left); the
+  transcripts beside them are kept. The archive never takes `~/.clods`. The pod's reap notice
   says so.
 
 ### Config

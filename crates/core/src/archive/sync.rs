@@ -2350,6 +2350,7 @@ mod tests {
         (".clods/profiles/claude1/settings.json", false),
         (".clods/profiles/claude1/.claude.json", false),
         (".clods/tokens", false),
+        (".claude-profiles-install-0a1b2c3d.sh", false),
         (".ssh/id_ed25519", false),
         (".config/gh/hosts.yml", false),
         (".config/wandb/settings", false),

@@ -67,7 +67,7 @@ set up, with the defaults spread (a pod that has a default keeps it), and `arena
 
 - **Each push sets a machine's whole state.** It installs the scripts in that machine's
   `~/.clods`, its accounts and its default. An account no longer sent to a machine loses its
-  token there, though its history stays. `machine=none` takes every token off it, `-a` or not
+  token (and any `/login` made in its profile) there, though its history stays. `machine=none` takes every token off it, `-a` or not
   (`-d none` only means no default). Re-push to rotate tokens or move machines to other
   accounts.
 - **`-k` keeps the defaults machines have.** Only a machine without one gets the spread's turn
@@ -77,7 +77,7 @@ set up, with the defaults spread (a pod that has a default keeps it), and `arena
   read every token on it.
 - **Nothing with a token is left behind.** Over ssh the installer goes through stdin. Through
   arena, the run step deletes the copied installer. If that step didn't run, delete
-  `~/.claude-profiles-install.sh` on the pod yourself.
+  `~/.claude-profiles-install-*.sh` on the pod yourself.
 - **A re-push with nothing new writes nothing.** `setup.sh --summary` (what `push.sh -q` and
   arena read) ends with `clods: accounts=N default=K changed=0`.
 

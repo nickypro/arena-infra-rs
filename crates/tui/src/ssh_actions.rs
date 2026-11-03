@@ -639,6 +639,37 @@ mod tests {
         assert!(!vm_script_path(&runpod).exists());
     }
 
+    /// With clods configured, the dashboard's setup pushes it too (as `pods setup` does): its line
+    /// says how many accounts, or the warning with the retry — the setup itself is still ✓.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn the_dashboards_setup_pushes_clods_when_configured() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("arena-tui-clods-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tokens = dir.join("tokens");
+        std::fs::write(&tokens, "a@example.com -> sk-ant-oat01-FAKE-a\nb@example.com -> sk-ant-oat01-FAKE-b\n").unwrap();
+        std::fs::set_permissions(&tokens, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let cfg = cfg(&format!(
+            "ARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\nGIT_SSH_KEY_LOCAL=/nonexistent/deploy_key\nARENA_STATE_DIR={0}/state\nCLODS_DIR={0}\n",
+            dir.display()
+        ));
+        let runpod = pod("alpha", "runpod", "rp1", 1, Some(22001));
+        let host = format!("{}:22001", runpod.ssh_ip.as_deref().unwrap());
+        let fake = FakeRemote::new();
+        fake.on(&host, arena_core::clods::COMMAND, FakeReply::stdout("clods: accounts=2 default=1 changed=1\n"));
+        assert_eq!(run_setup(&fake, &cfg, &runpod).await, "✓ set up devtest-alpha\nclods: 2 accounts");
+        let fake = FakeRemote::new();
+        fake.on(&host, arena_core::clods::COMMAND, FakeReply::exit(1, "setup.sh: needs python3 (to edit the JSON config files)\n"));
+        assert_eq!(
+            run_setup(&fake, &cfg, &runpod).await,
+            "✓ set up devtest-alpha\n‼ clods: not pushed — exit 1: setup.sh: needs python3 (to edit the JSON config files) \
+             (retry: arena pods setup --clods-only devtest-alpha)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Review ai-review claude #6, checked: does the TUI's set-branch honour `DISCARD_MAX_GB`, the
     /// most a `--hard` save copies? It has nothing to honour: the TUI only ever switches gently —
     /// `--hard` is the CLI's — and a gentle switch saves nothing. Pinned: the switch it sends is
