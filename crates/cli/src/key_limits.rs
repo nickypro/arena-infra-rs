@@ -154,6 +154,40 @@ async fn reconcile_resumes(api: &dyn KeyApi, naming: &Naming<'_>, attempted: &[S
     }
 }
 
+/// How old the keys a machine is planned again from may be when its turn comes ([`run`]): one
+/// listing serves the machines that start within it, so a long batch reads them again every few
+/// machines — a machine waiting for room still sees a key added under its name meanwhile (r2 #1
+/// of the batch) — never once a machine (a resume aside) nor once for all.
+const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The keys a machine is planned again from as its turn comes ([`run`]): a listing read at most
+/// `max_age` before, read again when it's older — once, the machines that want it meanwhile then
+/// waiting for it. `None`: they couldn't be read (the next machine tries again). A zero age (a
+/// resume) reads them for each machine, side by side.
+struct Fresh<'a> {
+    api: &'a dyn KeyApi,
+    max_age: std::time::Duration,
+    last: tokio::sync::Mutex<Option<(tokio::time::Instant, std::sync::Arc<Vec<KeyInfo>>)>>,
+}
+
+impl Fresh<'_> {
+    async fn keys(&self) -> Option<std::sync::Arc<Vec<KeyInfo>>> {
+        if self.max_age.is_zero() {
+            return self.api.list_keys().await.ok().map(std::sync::Arc::new);
+        }
+        let mut last = self.last.lock().await;
+        if let Some((at, keys)) = last.as_ref() {
+            if at.elapsed() < self.max_age {
+                return Some(keys.clone());
+            }
+        }
+        let at = tokio::time::Instant::now();
+        let keys = std::sync::Arc::new(self.api.list_keys().await.ok()?);
+        *last = Some((at, keys.clone()));
+        Some(keys)
+    }
+}
+
 /// How many machines' changes are under way at once ([`run`]): a machine's is usually one key's,
 /// a read and a `PATCH` (a resume's a listing first), a few hundred ms — so a cohort's caps take
 /// a few seconds, not one round trip after another, without a burst OpenRouter would turn away.
@@ -609,35 +643,26 @@ async fn run(verb: Verb, sel: SelectArgs, expect: &[or::Expected], dry_run: bool
         return Ok(());
     }
     // One arena changing keys at a time on this box (another operator's command, the dashboard's
-    // runs). Then the keys are read once more, and every machine named — a skipped one too (review
-    // codex r6 #1: resumed meanwhile, a pause's "already off" would have stood) — is planned again
-    // from them ([`moved`]: a change confirmed against keys that have moved since isn't made).
-    // The machines' changes then go out together, [`AT_ONCE`] machines at a time, each key checked
-    // once more in the request just before its change ([`just_before`]); OpenRouter has no
-    // conditional update to close the rest. The lines keep the plan's order, whatever order the
-    // answers come in.
+    // runs). Then the machines' changes go out together, [`AT_ONCE`] machines at a time. As its
+    // turn comes, every machine named — a skipped one too (review codex r6 #1: resumed meanwhile,
+    // a pause's "already off" would have stood) — is planned again from keys read at most
+    // [`FRESH_FOR`] before ([`moved`]: a change confirmed against keys that have moved since
+    // isn't made), and each key checked once more in the request just before its change
+    // ([`just_before`]); OpenRouter has no conditional update to close the rest. The lines keep
+    // the plan's order, whatever order the answers come in.
     //
-    // A resume reads the keys again for each machine as its turn comes, right before its change:
-    // it can wake a rotated-out key, the one a newer key under the name replaced (review codex r7
-    // #1), and a machine waiting for room would miss a rotation made meanwhile (r1 #1 of the
-    // batch). Those reads go out together too.
+    // A resume reads the keys right before each machine's: it can wake a rotated-out key, the one
+    // a newer key under the name replaced (review codex r7 #1; r1 #1 of the batch).
     let _lock = keys_lock(cfg).await?;
     let mut machines: Vec<&str> = rows.iter().map(|r| r.machine.as_str()).collect();
     machines.dedup();
-    let fresh = if verb == Verb::Resume { None } else { Some(api.list_keys().await.ok()) };
+    let max_age = if verb == Verb::Resume { std::time::Duration::ZERO } else { FRESH_FOR };
+    let fresh = Fresh { api, max_age, last: tokio::sync::Mutex::new(None) };
     let (verb_ref, naming_ref, fresh_ref, rows_ref) = (&verb, &naming, &fresh, &rows);
     let jobs = machines.iter().map(|&m| async move {
         let theirs: Vec<&Row> = rows_ref.iter().filter(|r| r.machine == m).collect();
-        let read;
-        let keys = match fresh_ref {
-            Some(keys) => keys.as_ref(),
-            None => {
-                read = api.list_keys().await.ok();
-                read.as_ref()
-            }
-        };
-        let stale = match keys {
-            Some(keys) => moved(verb_ref, m, &theirs, keys, naming_ref),
+        let stale = match fresh_ref.keys().await {
+            Some(keys) => moved(verb_ref, m, &theirs, &keys, naming_ref),
             None => Some("the keys couldn't be read again before changing them — nothing done".into()),
         };
         // Each row, how it came out, and whether a change was sent for it.
@@ -818,6 +843,9 @@ mod tests {
         /// How many times a key's update gives way before it's answered, by its name (none: it
         /// isn't) — the answers then come in another order than asked, the same every run.
         turns: Vec<(&'static str, usize)>,
+        /// How long a key's update takes, by its name, in ms (tokio's clock: a test with it
+        /// paused waits for nothing).
+        waits: Vec<(&'static str, u64)>,
         /// The updates under way now, and the most there were at once.
         in_flight: Mutex<usize>,
         peak: Mutex<usize>,
@@ -887,6 +915,9 @@ mod tests {
             let name = self.keys.lock().unwrap().iter().find(|k| k.hash == hash).and_then(|k| k.name.clone()).unwrap_or_default();
             for _ in 0..self.turns.iter().find(|(n, _)| *n == name).map_or(0, |(_, t)| *t) {
                 tokio::task::yield_now().await;
+            }
+            if let Some((_, ms)) = self.waits.iter().find(|(n, _)| *n == name) {
+                tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
             }
             let answer = self.update_now(n, hash, u, check);
             *self.in_flight.lock().unwrap() -= 1;
@@ -1108,9 +1139,9 @@ Changed 2, unchanged 0, failed 0.
     /// The batch (the human, 2026-11-03: "pretty slow, can it be batched?"): twelve keys' changes
     /// go out together, never more than [`AT_ONCE`] under way at once; the answers come back in
     /// another order (the first key's last) and the lines keep the machines' order; one that fails
-    /// doesn't stop the rest. The keys are read three times in all — the plan, once more right
-    /// before the changes, the read-back — never again machine by machine.
-    #[tokio::test]
+    /// doesn't stop the rest. The keys are read three times in all — the plan, once more as the
+    /// first machine's turn comes (fresh for the rest: tokio's clock is paused), the read-back.
+    #[tokio::test(start_paused = true)]
     async fn the_batch_is_bounded_keeps_its_order_and_goes_on_past_a_failure() {
         let names: Vec<&'static str> = (1..=12).map(|i| &*format!("devtest-k{i:02}").leak()).collect();
         let keys = names.iter().enumerate().map(|(i, n)| key(&format!("h{:02}", i + 1), n, Some(1.0), 0.0, false, "2026-10-30T10:00:00Z")).collect();
@@ -1155,6 +1186,29 @@ Changed 2, unchanged 0, failed 0.
         assert!(calls.len() == 8 && !calls.iter().any(|c| c.starts_with("h09 ")), "{calls:?}");
         assert!(api.key("h09").disabled, "never woken");
         assert_eq!(*api.peak.lock().unwrap(), AT_ONCE);
+    }
+
+    /// A cap change or a pause plans a machine again from keys at most [`FRESH_FOR`] old as its
+    /// turn comes (r2 #1 of the batch): a newer key under its name, made while it waited for room
+    /// behind the first eight, is seen — and the old key, as it was, isn't changed.
+    #[tokio::test(start_paused = true)]
+    async fn a_machine_waiting_for_room_is_planned_from_keys_read_lately() {
+        let names: Vec<&'static str> = (1..=9).map(|i| &*format!("devtest-k{i:02}").leak()).collect();
+        let mut keys: Vec<KeyInfo> = names.iter().enumerate().map(|(i, n)| key(&format!("h{:02}", i + 1), n, Some(5.0), 0.0, false, "2026-10-30T10:00:00Z")).collect();
+        keys.push(key("h09-old", "devtest-k09", Some(5.0), 0.0, true, "2026-10-01T10:00:00Z"));
+        let waits = names.iter().take(8).map(|n| (*n, 3_000)).collect();
+        let newer: Meanwhile = ("h09-old", |k| {
+            k.hash = "h09-new".into();
+            k.disabled = false;
+            k.created_at = Some("2026-10-31T10:00:00Z".into());
+        });
+        let api = Keys { waits, ..Keys::with(keys).meanwhile(vec![], vec![(1, newer)]) };
+        let argv = [&["limit"][..], &names, &["-1"]].concat();
+        assert_eq!(keys_cmd(&argv, &api).await.unwrap_err(), "1 key(s) failed");
+        let calls = api.calls();
+        assert!(calls.len() == 8 && !calls.iter().any(|c| c.starts_with("h09 ")), "{calls:?}");
+        assert_eq!(api.key("h09").limit, Some(5.0));
+        assert_eq!(*api.lists.lock().unwrap(), 4, "the plan, the first turn, k09's turn 3 s on, the read-back");
     }
 
     /// A key that moved between the listing the plan was made from and the change (review codex
