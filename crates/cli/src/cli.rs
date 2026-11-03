@@ -1122,6 +1122,19 @@ pub(crate) enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
+    /// Drop kept file versions that a file or git now holds
+    ///
+    /// A switch never deletes what its replacements moved aside (.git/arena-unredacted/recover.*):
+    /// a program that had the file open could still save into it. This drops, on each pod, those
+    /// a file at that path or git's HEAD now holds byte for byte, and none a program has open.
+    #[command(verbatim_doc_comment)]
+    CleanKept {
+        /// Preview only: say what would be dropped, drop nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+        #[command(flatten)]
+        sel: Select,
+    },
     /// Switch pods' git branch (ff-only; --hard force-resets)
     ///
     /// --all = this cohort's pods (`<prefix>-*`, not @ staff entries); name a staff box to

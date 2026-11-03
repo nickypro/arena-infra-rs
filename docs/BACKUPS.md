@@ -654,7 +654,35 @@ to that branch.
 
 A gentle switch that refuses a pod mid-merge does so before setting anything aside, and the putting
 back is the command's exit trap: a switch that fails, stops on an error, or gets a hangup, an
-interrupt or a TERM puts the keys back first.
+interrupt or a TERM puts the keys back first. That holds however the switch ends, a KILL included
+(the next switch's restore, or init-branches', puts back what it left):
+- the set-aside's branch is noted before its first copy (it was noted last, so a file already put
+  back to git's version kept the placeholder, its key only in `.git/arena-unredacted/`);
+- a copy lands whole or not at all;
+- a file is replaced only from its own directory, entered once and checked to be the work tree's
+  (a link swapped in for it later is never followed): the live file is first moved into a
+  `recover.*` folder of its own in `.git/arena-unredacted/`, with its path, and the new one linked
+  in (never over anything that took the name) only if what was moved aside is exactly what was
+  expected (bytes and mode) — else it goes back. So no version of a file is ever lost, and a file
+  is only ever the participant's version or git's.
+
+**What a switch moved aside is never deleted on its own:** a program that had the file open
+could still save into it. Each switch says how many such versions are kept (`… earlier version(s)
+of files it replaced are kept in .git/arena-unredacted/recover.*`). `arena pods clean-kept [pods]`
+drops the ones a file now holds byte for byte: the work tree's file at that path, or git's own blob
+at HEAD (the redacted version a restore moved aside). It never drops one with anything of its
+own, nor one a program has open as far as `/proc` shows (by device and inode, at one moment: run
+it when the pod is quiet). Each pod's line says how many it dropped and which it kept. `--dry-run`
+says what it would drop. It runs under the control box's backup lock for each pod, as a switch
+does.
+
+If a switch can't mark a replacement as done (a full disk), it stops before its checkout: the
+keys go back, and what it moved aside is kept, said.
+
+A file the participant changed, removed, made executable or moved under a link while the switch
+ran keeps what they did; its copy stays, and every switch on that branch says so (`UNREDACTED_KEPT`,
+on the pod's line, a failed switch's too). A file whose mode changed too, or whose directory is on
+another filesystem than `.git`, isn't set aside: the switch treats it as any local change.
 
 arena's own 2-minute timeout kills only its ssh client — a non-pty session's shell is usually never
 signalled, and ran on (review ai-review claude #13) — so the switch bounds itself on the pod: it

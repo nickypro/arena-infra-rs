@@ -1021,6 +1021,50 @@ pub fn parse_init_unpushed(stdout: &str) -> Option<(u64, Option<String>)> {
     })
 }
 
+/// `arena pods clean-kept`: on the pod, the versions of files a switch's replacement moved
+/// aside (`.git/arena-unredacted/recover.*`, which nothing deletes on its own: a process that had
+/// the file open could still write to it) that a file now holds byte for byte — the work tree's at
+/// that path, or git's own blob at HEAD — are dropped, none a process holds; `dry` only says which.
+/// Prints `RECOVERED_DROP <file|git|empty> <folder> <path>` and `RECOVERED_KEEP <folder> <path>`
+/// lines ([`parse_clean_recovered`]). Under `sh` and bounded, as a switch is.
+pub fn clean_recovered_command(repo_path: &str, dry: bool) -> String {
+    let script = format!(
+        "cd {} || exit 3\ncd \"$(git rev-parse --show-toplevel)\" || exit 3\nG=$(git rev-parse --absolute-git-dir) || exit 3\n{}\nunredacted_clean \"$G/arena-unredacted\" {}\n",
+        shell_quote(repo_path),
+        unredacted_sh(),
+        if dry { "dry" } else { "\"\"" }
+    );
+    let stopped = "arena clean-kept: it ran past its 120 s on the pod and was stopped there (TERM) — some kept versions may be left: run it again";
+    let killed = "arena clean-kept: it ran past its 120 s on the pod and was killed there — some kept versions may be left: run it again";
+    bounded_sh(&script, "arena-clean-kept", 120, 10, stopped, killed)
+}
+
+/// What [`clean_recovered_command`] said: the versions dropped (or, dry, to drop) with why — a
+/// file at the path holds it (`file`), git's HEAD does (`git`), or the folder was empty — and the
+/// paths of those kept.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CleanRecovered {
+    pub dropped: Vec<(String, String)>,
+    pub kept: Vec<String>,
+}
+
+pub fn parse_clean_recovered(stdout: &str) -> CleanRecovered {
+    let mut out = CleanRecovered::default();
+    for line in stdout.lines().map(|l| l.trim_end_matches('\r')) {
+        if let Some(rest) = line.strip_prefix("RECOVERED_DROP ") {
+            let mut w = rest.splitn(3, ' ');
+            if let (Some(why), Some(_folder), Some(path)) = (w.next(), w.next(), w.next()) {
+                out.dropped.push((why.to_string(), path.to_string()));
+            }
+        } else if let Some(rest) = line.strip_prefix("RECOVERED_KEEP ") {
+            if let Some((_folder, path)) = rest.split_once(' ') {
+                out.kept.push(path.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Render the remote command that switches a pod's ARENA checkout to `branch`.
 ///
 /// `hard == false` (default): **gentle** — fetch origin, checkout, then fast-forward to
@@ -2801,7 +2845,7 @@ done
             assert!(ok, "hard={hard}: {out}{err}");
             assert!(out.contains("UNREDACTED_RESTORED README.md") && out.contains("UNREDACTED_RESTORED joep.py"), "{out}");
             assert_eq!((s.read("README.md"), s.read("joep.py")), (ex.clone().into_bytes(), joep.clone().into_bytes()), "hard={hard}");
-            assert!(!aside.exists(), "hard={hard}");
+            assert!(nothing_left_aside(&s), "hard={hard}");
             assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "M README.md\n M joep.py");
         }
         // A gentle switch to the branch it's on keeps them where they are.
@@ -3132,16 +3176,16 @@ done
         // …and the second init of the day lands on the branch that exists: the key comes back.
         let (out, err) = run(init_branch_command(&day(2), "devtest-x"));
         assert_eq!(head(), "autocommit-devtest-w1d2-x");
-        assert_eq!(out.lines().filter(|l| l.starts_with("UNREDACTED_")).collect::<Vec<_>>(), ["UNREDACTED_RESTORED README.md"], "{out}");
+        assert_eq!(out.lines().filter(|l| l.starts_with("UNREDACTED_") && !l.starts_with("UNREDACTED_RECOVERED ")).collect::<Vec<_>>(), ["UNREDACTED_RESTORED README.md"], "{out}");
         assert_eq!(s.read("README.md"), readme.as_bytes());
-        assert!(!aside.exists(), "nothing left set aside");
+        assert!(nothing_left_aside(&s), "nothing left set aside");
         assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "M README.md");
         assert!(!out.contains(&key) && !err.contains(&key));
         // A new day: the key stays set aside for its own branch, and nothing is said.
         assert!(run(checkout_command(repo, "main", None, true)).0.contains("UNREDACTED_KEPT README.md"));
         let (out, _) = run(init_branch_command(&day(3), "devtest-x"));
         assert_eq!(head(), "autocommit-devtest-w1d3-x");
-        assert!(!out.contains("UNREDACTED_"), "{out}");
+        assert!(!out.lines().any(|l| l.starts_with("UNREDACTED_") && !l.starts_with("UNREDACTED_RECOVERED ")), "{out}");
         assert_eq!(s.read("README.md").len(), 5);
         assert_eq!(aside_copies(&aside, "README.md"), [readme.clone().into_bytes()]);
         // …until a switch back to that branch.
@@ -4917,7 +4961,6 @@ done
         std::fs::write(s.work.join("ex.py"), &ex).unwrap();
         let (code, r, err) = s.backup();
         assert_eq!((code, r.redacted.len()), (Some(0), 1), "{err}");
-        let aside = s.work.join(".git/arena-unredacted");
         let branch = || s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]);
         let shells = login_shells();
         let stand_in = |dir: &str, body: &str| {
@@ -4945,7 +4988,7 @@ done
                 assert!(!outlived.exists(), "{shell} hard={hard}: bounded");
                 assert!(err.contains("the switch ran past its 600 s on the pod and was stopped there"), "{shell} hard={hard}: {err}");
                 assert_eq!(s.read("ex.py"), ex.as_bytes(), "{shell} hard={hard}: the real key put back");
-                assert!(!aside.exists(), "{shell} hard={hard}");
+                assert!(nothing_left_aside(&s), "{shell} hard={hard}");
                 assert_eq!(branch(), "autocommit-x", "{shell} hard={hard}");
             }
             // The real command under that login shell: to main (ex.py's key kept aside: main has
@@ -5569,8 +5612,571 @@ done
             let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, hard), &path);
             assert_eq!(code, Some(143), "hard={hard}: {out}{err}");
             assert_eq!(s.read("ex.py"), ex.as_bytes(), "hard={hard}: the real key put back");
-            assert!(!aside.exists(), "hard={hard}");
+            assert!(nothing_left_aside(&s), "hard={hard}");
             assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "hard={hard}");
+        }
+    }
+
+    /// The real `tool`'s path, quoted, for a stand-in to hand on to.
+    #[cfg(unix)]
+    fn real_tool(tool: &str) -> String {
+        let o = std::process::Command::new("sh").args(["-c", &format!("command -v {tool}")]).output().unwrap();
+        shell_quote(String::from_utf8_lossy(&o.stdout).trim())
+    }
+
+    /// A stand-in `tool` in `bin`: `case "$*" in <arms> esac`, then the real one.
+    #[cfg(unix)]
+    fn stand_in_tool(bin: &std::path::Path, tool: &str, arms: &str) {
+        std::fs::create_dir_all(bin).unwrap();
+        crate::remote::write_test_script(bin.join(tool), format!("#!/bin/sh\ncase \"$*\" in {arms} esac\nexec {} \"$@\"\n", real_tool(tool))).unwrap();
+    }
+
+    /// A case arm's action, on the stand-in's `n`th matching call only (`$0.n` counts them): the
+    /// restore in the EXIT trap goes through the same tools.
+    fn on_call(n: u32, action: &str) -> String {
+        format!("c=$(($(cat \"$0.n\" 2>/dev/null || echo 0) + 1)); echo $c > \"$0.n\"; if [ $c = {n} ]; then {action}; fi;;")
+    }
+
+    /// The bound's TERM here, and a hang it ends; or a KILL of the whole switch.
+    const STOP_SH: &str = "kill -ALRM $(ps -o pgid= -p $$); sleep 30; exit 1";
+    const KILL_SH: &str = "kill -s KILL -- -$(ps -o pgid= -p $$ | tr -d ' ')";
+
+    /// A sandbox whose `rel` holds a real key the backup committed redacted: (it, the key's text).
+    #[cfg(unix)]
+    fn keyed(tag: &str, rel: &str, seed: usize) -> (GitSandbox, String) {
+        let s = GitSandbox::new(tag, 1_000_000);
+        let ex = format!("KEY = \"{}\"\n", openrouter_key(seed));
+        std::fs::create_dir_all(s.work.join(rel).parent().unwrap()).unwrap();
+        std::fs::write(s.work.join(rel), &ex).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.redacted.len()), (Some(0), 1), "{tag}: {err}");
+        (s, ex)
+    }
+
+    /// The copies left set aside under `.git/arena-unredacted/` (paths, every run; not the
+    /// recover.* folders: [`recovered`]).
+    #[cfg(unix)]
+    fn set_aside(s: &GitSandbox) -> Vec<String> {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if !(dir == root && e.file_name().to_string_lossy().starts_with("recover.")) {
+                        walk(root, &p, out);
+                    }
+                } else if p.parent() != Some(root) {
+                    out.push(p.strip_prefix(root).unwrap().display().to_string());
+                }
+            }
+        }
+        let root = s.work.join(".git/arena-unredacted");
+        let mut v = Vec::new();
+        walk(&root, &root, &mut v);
+        v.sort();
+        v
+    }
+
+    /// No key left set aside, and nothing of the participant's only in `.git`: every version the
+    /// replacements kept is one a file or git holds, so the cleanup drops them all.
+    #[cfg(unix)]
+    fn nothing_left_aside(s: &GitSandbox) -> bool {
+        set_aside(s).is_empty() && clean_recovered(s, false).1.kept.is_empty() && recovered(s).is_empty()
+    }
+
+    /// The versions recover.* folders keep: (folder, the path it was at, its bytes).
+    #[cfg(unix)]
+    fn recovered(s: &GitSandbox) -> Vec<(String, String, Vec<u8>)> {
+        let root = s.work.join(".git/arena-unredacted");
+        let mut v: Vec<(String, String, Vec<u8>)> = std::fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("recover."))
+            .map(|e| {
+                let path = std::fs::read_to_string(e.path().join("path")).unwrap_or_default().trim_end().to_string();
+                (e.file_name().to_string_lossy().into_owned(), path, std::fs::read(e.path().join("file")).unwrap_or_default())
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// `pods clean-kept` on the sandbox (`dry`: what it would drop): (exit, what it said).
+    #[cfg(unix)]
+    fn clean_recovered(s: &GitSandbox, dry: bool) -> (Option<i32>, CleanRecovered) {
+        let (code, out, err) = run_on_path(&clean_recovered_command(s.work.to_str().unwrap(), dry), &std::env::var("PATH").unwrap_or_default());
+        assert!(err.is_empty() || code == Some(0), "{out}{err}");
+        (code, parse_clean_recovered(&out))
+    }
+
+    /// A switch stopped while it sets the real keys aside — its bound's TERM mid-copy, mid-write of
+    /// the file's git version, right before and right after the file is moved aside, right after
+    /// the git version is linked in — puts the key back and leaves nothing set aside, the index as
+    /// it was, with or without `--hard`. One KILLed in its restore, the file moved aside and none
+    /// in its place, leaves what a later switch (another process) puts back. Found as a flaky
+    /// test: the run's branch was written once every file was set aside, and a run with none is
+    /// never restored — stopped after a file was put back, its key was only in
+    /// `.git/arena-unredacted/`, for good. And `git checkout`, then the restore's `cp`, rewrote the
+    /// file in place (review codex r1, r3): stopped part-way, it was neither version.
+    #[cfg(unix)]
+    #[test]
+    fn a_switch_stopped_while_it_sets_the_keys_aside_puts_them_back() {
+        let (s, ex) = keyed("aside-stopped", "ex.py", 31);
+        let repo = s.work.to_str().unwrap();
+        let (index, status) = (s.git(&s.work, &["ls-files", "-s", "ex.py"]), s.git(&s.work, &["status", "--porcelain"]));
+        let check = |when: &str| {
+            assert_eq!(s.read("ex.py"), ex.as_bytes(), "{when}: the real key put back");
+            assert_eq!(set_aside(&s), Vec::<String>::new(), "{when}: nothing left set aside");
+            assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "{when}");
+            assert_eq!((s.git(&s.work, &["ls-files", "-s", "ex.py"]), s.git(&s.work, &["status", "--porcelain"])), (index.clone(), status.clone()), "{when}");
+            // What the replacements moved aside is kept, never deleted on its own — and each version
+            // is one a file or git holds byte for byte, so the cleanup drops them all.
+            let (code, cleaned) = clean_recovered(&s, false);
+            assert_eq!((code, cleaned.kept.len()), (Some(0), 0), "{when}: {cleaned:?}");
+            assert_eq!(recovered(&s), Vec::new(), "{when}: nothing of its own was left");
+        };
+        let capture = "*\"ex.py \"*\"/recover.\"*\"/file\")";
+        let mut stops = vec![
+            ("mid-copy", "cp", format!("*arena-unredacted/*) {}", on_call(1, &format!("for a; do :; done; printf 'KEY = ' > \"$a\"; {STOP_SH}")))),
+            ("right before it's moved aside", "mv", format!("{capture} {}", on_call(1, STOP_SH))),
+            ("right after it's moved aside", "mv", format!("{capture} {}", on_call(1, &format!("{} \"$@\"; {STOP_SH}", real_tool("mv"))))),
+            ("right after its git version is linked in", "ln", format!("*\" ex.py\") {}", on_call(1, &format!("{} \"$@\"; {STOP_SH}", real_tool("ln"))))),
+        ];
+        // The `sed` writing the file's git version, told by where its stdout goes (`/proc`).
+        if cfg!(target_os = "linux") {
+            let arm = format!("*) case $(readlink /proc/$$/fd/1) in *arena-unredacted/tmp.*/redacted) {} esac;;", on_call(1, &format!("printf 'KEY = '; {STOP_SH}")));
+            stops.push(("mid-write of its git version", "sed", arm));
+        }
+        for (i, (when, tool, arms)) in stops.iter().enumerate() {
+            let bin = s.base.join(format!("bin-stop-{i}"));
+            stand_in_tool(&bin, tool, arms);
+            let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+            for hard in [false, true] {
+                let _ = std::fs::remove_file(bin.join(format!("{tool}.n")));
+                let (code, out, err) = run_on_path(&bounded_switch(&switch_script(repo, "main", None, hard, KB_DEFAULT), 600, 60), &path);
+                assert_eq!(code, Some(124), "{when} hard={hard}: {out}{err}");
+                assert!(bin.join(format!("{tool}.n")).exists(), "{when} hard={hard}: stopped there");
+                check(&format!("{when} hard={hard}"));
+            }
+        }
+        // TERMed at the checkout (a `git` that hangs there), then KILLed in the restore right after
+        // it moved the file aside: none in its place, its git version and the copy in .git — and a
+        // later switch (to the branch it's on, a process of its own) puts it all back.
+        let bin = s.base.join("bin-kill");
+        stand_in_tool(&bin, "git", &format!("*\" checkout main\") {STOP_SH};;"));
+        stand_in_tool(&bin, "mv", &format!("{capture} {}", on_call(2, &format!("{} \"$@\"; {KILL_SH}", real_tool("mv")))));
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let (code, out, err) = run_on_path(&bounded_switch(&switch_script(repo, "main", None, false, KB_DEFAULT), 600, 60), &path);
+        assert_eq!(code, Some(137), "{out}{err}");
+        assert!(!s.work.join("ex.py").exists(), "killed with the file moved aside");
+        let (code, out, err) = run_on_path(&checkout_command(repo, "autocommit-x", None, false), &std::env::var("PATH").unwrap_or_default());
+        assert_eq!(code, Some(0), "{out}{err}");
+        assert!(out.contains("UNREDACTED_RESTORED ex.py"), "{out}");
+        check("killed in its restore, then a later switch");
+    }
+
+    /// A restore puts a key back only where the file is still exactly what the set-aside left
+    /// there, bytes and mode (review codex r3, s1): one the participant removed, rewrote, made
+    /// executable or moved under a link while the switch ran keeps what they did, and never gets
+    /// the key through a link; the copy stays, and is said (KEPT) — by that switch and, after a
+    /// KILL, by every later switch on the branch (review codex s1: only the killed one's said it).
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_never_undoes_newer_work_nor_writes_through_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let cases = [
+            ("removed", "ex.py", "rm -f ex.py"),
+            ("rewritten", "ex.py", "printf 'mine = 2\\n' > ex.py"),
+            ("made executable", "ex.py", "chmod +x ex.py"),
+            ("its directory a link now", "sub/ex.py", "mv sub sub.moved && mkdir -p ../elsewhere && cp sub.moved/ex.py ../elsewhere/ && ln -s ../elsewhere sub"),
+        ];
+        for (i, (when, rel, then)) in cases.into_iter().enumerate() {
+            let (s, ex) = keyed(&format!("aside-newer-{i}"), rel, 40 + i);
+            let repo = s.work.to_str().unwrap();
+            let bin = s.base.join("bin");
+            stand_in_tool(&bin, "git", &format!("*\" checkout main\") {then}; {STOP_SH};;"));
+            let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+            let (code, out, err) = run_on_path(&bounded_switch(&switch_script(repo, "main", None, false, KB_DEFAULT), 600, 60), &path);
+            assert_eq!(code, Some(124), "{when}: {out}{err}");
+            assert!(out.contains(&format!("UNREDACTED_KEPT {rel}")), "{when}: {out}");
+            let kept = set_aside(&s);
+            assert_eq!(kept.len(), 1, "{when}: the copy stays: {kept:?}");
+            assert_eq!(std::fs::read(s.work.join(".git/arena-unredacted").join(&kept[0])).unwrap(), ex.as_bytes(), "{when}");
+            match i {
+                0 => assert!(!s.work.join("ex.py").exists(), "{when}: not brought back"),
+                1 => assert_eq!(s.read("ex.py"), b"mine = 2\n", "{when}: the participant's version"),
+                2 => {
+                    assert_ne!(s.read("ex.py"), ex.as_bytes(), "{when}: not put back over the new mode");
+                    assert_eq!(std::fs::metadata(s.work.join("ex.py")).unwrap().permissions().mode() & 0o111, 0o111, "{when}");
+                }
+                _ => assert_ne!(std::fs::read(s.base.join("elsewhere/ex.py")).unwrap(), ex.as_bytes(), "{when}: no key through the link"),
+            }
+        }
+        // KILLed in the restore with the file moved aside; the participant writes a new one before
+        // the next switch: theirs stays, and that switch says the copy is kept.
+        let (s, ex) = keyed("aside-newer-killed", "ex.py", 49);
+        let repo = s.work.to_str().unwrap();
+        let bin = s.base.join("bin");
+        stand_in_tool(&bin, "git", &format!("*\" checkout main\") {STOP_SH};;"));
+        stand_in_tool(&bin, "mv", &format!("*\"ex.py \"*\"/recover.\"*\"/file\") {}", on_call(2, &format!("{} \"$@\"; {KILL_SH}", real_tool("mv")))));
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let (code, out, err) = run_on_path(&bounded_switch(&switch_script(repo, "main", None, false, KB_DEFAULT), 600, 60), &path);
+        assert_eq!(code, Some(137), "{out}{err}");
+        std::fs::write(s.work.join("ex.py"), "mine = 3\n").unwrap();
+        let (code, out, err) = run_on_path(&checkout_command(repo, "autocommit-x", None, false), &std::env::var("PATH").unwrap_or_default());
+        assert_eq!(code, Some(0), "{out}{err}");
+        assert!(out.contains("UNREDACTED_KEPT ex.py"), "an earlier run's copy is said too: {out}");
+        assert_eq!(s.read("ex.py"), b"mine = 3\n");
+        let kept = set_aside(&s);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read(s.work.join(".git/arena-unredacted").join(&kept[0])).unwrap(), ex.as_bytes());
+    }
+
+    /// A file the participant saves while the switch is replacing it keeps their version (review
+    /// codex s1): one changed between its copy and its replacement goes back as they left it, not
+    /// set aside; one changed right before the restore puts the key back stays theirs, its copy
+    /// kept (KEPT). Nothing they saved is ever overwritten.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_saved_while_it_is_replaced_keeps_the_participants_version() {
+        // Saved while its git version is made (after the copy, before the file is moved aside).
+        let (s, ex) = keyed("aside-saved-0", "ex.py", 61);
+        let repo = s.work.to_str().unwrap();
+        let bin = s.base.join("bin");
+        let edit = "printf '# saved meanwhile\\n' >> ex.py";
+        stand_in_tool(&bin, "cp", &format!("*/redacted) {}", on_call(1, edit)));
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, false), &path);
+        assert_ne!(code, Some(0), "not set aside: the gentle switch refuses it as a local change: {out}{err}");
+        assert!(err.contains("ex.py changed meanwhile") || err.contains("couldn't set ex.py aside"), "{err}");
+        assert_eq!(s.read("ex.py"), format!("{ex}# saved meanwhile\n").as_bytes());
+        assert_eq!(set_aside(&s), Vec::<String>::new());
+        // Saved right before the restore puts the key back (after the switch was stopped).
+        let (s, ex) = keyed("aside-saved-1", "ex.py", 62);
+        let repo = s.work.to_str().unwrap();
+        let bin = s.base.join("bin");
+        stand_in_tool(&bin, "git", &format!("*\" checkout main\") {STOP_SH};;"));
+        stand_in_tool(&bin, "cp", &format!("*/back) {}", on_call(1, edit)));
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let (code, out, err) = run_on_path(&bounded_switch(&switch_script(repo, "main", None, false, KB_DEFAULT), 600, 60), &path);
+        assert_eq!(code, Some(124), "{out}{err}");
+        assert!(out.contains("UNREDACTED_KEPT ex.py"), "{out}");
+        let now = String::from_utf8(s.read("ex.py")).unwrap();
+        assert!(now.ends_with("# saved meanwhile\n") && !now.contains(&ex), "theirs, unchanged: {now}");
+        let kept = set_aside(&s);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read(s.work.join(".git/arena-unredacted").join(&kept[0])).unwrap(), ex.as_bytes());
+    }
+
+    /// A directory swapped for a link while the switch acts in it never gets the key through the
+    /// link (review codex s1): swapped before the switch enters it, the file isn't set aside; swapped
+    /// after, the switch goes on in the directory it entered (moved now, still the work tree's).
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_for_a_link_mid_switch_never_gets_the_key() {
+        for (i, (when, tool, arms)) in [
+            ("before the switch enters it", "cp", "*arena-unredacted/*.part) SWAP;;"),
+            ("after it entered it", "mv", "*\"ex.py \"*\"/recover.\"*\"/file\") SWAP;;"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (s, ex) = keyed(&format!("aside-swapped-{i}"), "sub/ex.py", 70 + i);
+            let repo = s.work.to_str().unwrap();
+            let elsewhere = s.base.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::fs::write(elsewhere.join("ex.py"), "outside\n").unwrap();
+            let swap = format!(
+                "[ -e {0}.swapped ] || {{ : > {0}.swapped; mv {1}/sub {1}/sub.moved && ln -s {2} {1}/sub; }}",
+                shell_quote(&s.base.join("swap").display().to_string()),
+                shell_quote(repo),
+                shell_quote(&elsewhere.display().to_string())
+            );
+            let bin = s.base.join("bin");
+            stand_in_tool(&bin, tool, &arms.replace("SWAP", &swap));
+            let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+            let (_code, out, err) = run_on_path(&checkout_command(repo, "main", None, false), &path);
+            assert!(s.base.join("swap.swapped").exists(), "{when}: swapped");
+            assert_eq!(std::fs::read_to_string(elsewhere.join("ex.py")).unwrap(), "outside\n", "{when}: written through the link: {out}{err}");
+            assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1, "{when}: nothing else written there");
+            // The key is in the moved directory's file or in a copy set aside — never lost.
+            let moved = std::fs::read(s.work.join("sub.moved/ex.py")).unwrap_or_default();
+            let copies: Vec<Vec<u8>> = set_aside(&s).iter().map(|c| std::fs::read(s.work.join(".git/arena-unredacted").join(c)).unwrap()).collect();
+            assert!(moved == ex.as_bytes() || copies.iter().any(|c| c == ex.as_bytes()), "{when}: the key lost: {out}{err}");
+        }
+    }
+
+    /// A replacement that can't go in never costs a version (review codex s2): its link failing, what
+    /// was moved aside goes back; that failing too (the file gone), the copy is kept, and said
+    /// (KEPT) — never both dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_that_cant_go_in_keeps_every_version() {
+        for (i, (when, arms)) in [("its link fails", "*\"/redacted ex.py\") exit 1;;"), ("putting it back fails too", "*\" ex.py\") exit 1;;")].into_iter().enumerate() {
+            let (s, ex) = keyed(&format!("aside-nolink-{i}"), "ex.py", 80 + i);
+            let repo = s.work.to_str().unwrap();
+            let bin = s.base.join("bin");
+            stand_in_tool(&bin, "ln", arms);
+            let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+            let (_code, out, err) = run_on_path(&checkout_command(repo, "main", None, false), &path);
+            let copies: Vec<Vec<u8>> = set_aside(&s).iter().map(|c| std::fs::read(s.work.join(".git/arena-unredacted").join(c)).unwrap()).collect();
+            if i == 0 {
+                assert_eq!(s.read("ex.py"), ex.as_bytes(), "{when}: it went back: {out}{err}");
+                assert!(copies.is_empty(), "{when}: nothing kept: {copies:?}");
+                assert!(err.contains("couldn't set ex.py aside"), "{when}: {err}");
+            } else {
+                assert!(!s.work.join("ex.py").exists(), "{when}: {out}{err}");
+                // What was there was the copy, byte for byte: one of the two is enough.
+                assert!(copies.iter().any(|c| c == ex.as_bytes()), "{when}: the key kept");
+                assert!(out.contains("UNREDACTED_KEPT ex.py"), "{when}: and said: {out}");
+            }
+        }
+    }
+
+    /// A save through a descriptor opened before the switch, landing after the file was replaced
+    /// (review codex s2: the moved inode was deleted with it), is kept: what was moved aside is
+    /// dropped only once no process holds it, and only if it's still what was expected. Linux:
+    /// who holds what is read from /proc.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_through_a_descriptor_opened_before_the_switch_is_kept() {
+        let (s, ex) = keyed("aside-held", "ex.py", 90);
+        let repo = s.work.to_str().unwrap();
+        let go = s.base.join("go");
+        // An editor of sorts: the file open before the switch, its save when told, held till done.
+        let mut editor = std::process::Command::new("sh")
+            .args(["-c", "exec 3>>\"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done; echo 'saved = 1' >&3; while [ -e \"$2\" ]; do sleep 0.05; done", "sh", "ex.py"])
+            .arg(&go)
+            .current_dir(&s.work)
+            .spawn()
+            .unwrap();
+        let bin = s.base.join("bin");
+        stand_in_tool(&bin, "git", &format!("*\" checkout main\") : > {}; sleep 0.5; {STOP_SH};;", shell_quote(&go.display().to_string())));
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let (code, out, err) = run_on_path(&bounded_switch(&switch_script(repo, "main", None, false, KB_DEFAULT), 600, 60), &path);
+        std::fs::remove_file(&go).unwrap();
+        let _ = editor.wait();
+        assert_eq!(code, Some(124), "{out}{err}");
+        assert_eq!(s.read("ex.py"), ex.as_bytes(), "the key back in the file: {out}");
+        let saved = recovered(&s).into_iter().map(|(_, _, b)| String::from_utf8(b).unwrap()).find(|t| t.contains("saved = 1"));
+        assert_eq!(saved.as_deref(), Some(format!("{ex}saved = 1\n").as_str()), "the save kept");
+        assert!(out.contains("UNREDACTED_RECOVERED recover."), "and said: {out}");
+        // Nobody holds it now, but no file holds it either: the cleanup keeps it, and a later
+        // switch still says so.
+        let (_, cleaned) = clean_recovered(&s, false);
+        assert_eq!(cleaned.kept, ["ex.py"], "{cleaned:?}");
+        assert!(recovered(&s).iter().any(|(_, _, b)| String::from_utf8_lossy(b).contains("saved = 1")));
+        let (code, out, err) = run_on_path(&checkout_command(repo, "autocommit-x", None, false), &std::env::var("PATH").unwrap_or_default());
+        assert_eq!(code, Some(0), "{out}{err}");
+        assert!(out.contains("UNREDACTED_RECOVERED recover."), "{out}");
+    }
+
+    /// Something that takes a file's name while it's moved aside — here a link to a directory —
+    /// never gets the key (review codex s2: a plain `ln` put it inside): the link refuses
+    /// (`ln -T`), what was there can't go back either, and every version is kept, said.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_taken_while_the_file_is_moved_aside_never_gets_the_key() {
+        let (s, ex) = keyed("aside-taken", "ex.py", 95);
+        let repo = s.work.to_str().unwrap();
+        let dir = s.base.join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = s.base.join("bin");
+        stand_in_tool(&bin, "git", &format!("*\" checkout main\") {STOP_SH};;"));
+        stand_in_tool(&bin, "ln", &format!("*\"/back ex.py\") ln -s {} ex.py;;", shell_quote(&dir.display().to_string())));
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let (code, out, err) = run_on_path(&bounded_switch(&switch_script(repo, "main", None, false, KB_DEFAULT), 600, 60), &path);
+        assert_eq!(code, Some(124), "{out}{err}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing written into the directory");
+        assert!(std::fs::symlink_metadata(s.work.join("ex.py")).unwrap().file_type().is_symlink(), "what took the name stays");
+        assert!(set_aside(&s).iter().any(|c| std::fs::read(s.work.join(".git/arena-unredacted").join(c)).unwrap() == ex.as_bytes()), "the key kept");
+        assert!(out.contains("UNREDACTED_KEPT ex.py"), "{out}");
+    }
+
+    /// A replacement whose mark can't be made — the rename of its folder, after the file went in
+    /// (review codex s3: a failed `:` redirect there read as "put back", and both copies went) —
+    /// stops the switch before its checkout (review codex s4: an unmarked folder proves nothing, so
+    /// nothing is switched on top of one): the keys go back, what was moved is kept, unmarked, and
+    /// said; once a file holds those versions the cleanup drops them.
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_whose_mark_cant_be_made_stops_the_switch_and_keeps_what_it_moved() {
+        let (s, ex) = keyed("aside-nomark", "ex.py", 100);
+        let repo = s.work.to_str().unwrap();
+        let bin = s.base.join("bin");
+        stand_in_tool(&bin, "mv", "*\"/recover.\"*\".placed\") exit 1;;");
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let (code, out, err) = run_on_path(&bounded_switch(&switch_script(repo, "main", None, false, KB_DEFAULT), 600, 60), &path);
+        assert_eq!(code, Some(4), "{out}{err}");
+        assert!(err.contains("couldn't mark ex.py's set-aside") && err.contains("not switched"), "{err}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "never switched");
+        assert_eq!(s.read("ex.py"), ex.as_bytes(), "the key back: {out}");
+        assert!(out.contains("UNREDACTED_RESTORED ex.py"), "{out}");
+        let kept = recovered(&s);
+        assert_eq!(kept.len(), 2, "what the set-aside and the restore moved, both kept: {kept:?}");
+        assert!(kept.iter().all(|(f, p, _)| !f.ends_with(".placed") && p == "ex.py"), "{kept:?}");
+        assert!(out.contains("UNREDACTED_KEPT ex.py (a version of it in .git/arena-unredacted/recover."), "said: {out}");
+        let (_, cleaned) = clean_recovered(&s, false);
+        assert_eq!((cleaned.dropped.len(), cleaned.kept.len()), (2, 0), "{cleaned:?}");
+        assert_eq!(recovered(&s), Vec::new());
+    }
+
+    /// A temp file a KILL left linked into the work tree is never written to again (review codex
+    /// s4: the restore reused `<run>.back` and `<run>.redacted`, and its `cp` went through the link
+    /// into the live file): KILLed right after the restore linked the key back in, or right after
+    /// the set-aside linked the git version in, then the participant edits the file — the next
+    /// switch keeps their edit, and the copy, said.
+    #[cfg(unix)]
+    #[test]
+    fn a_temp_file_a_kill_left_linked_in_is_never_written_through() {
+        for (i, (when, arms)) in [
+            ("right after the restore linked the key back in", "*\"/back ex.py\")"),
+            ("right after the set-aside linked the git version in", "*\"/redacted ex.py\")"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (s, ex) = keyed(&format!("aside-stale-{i}"), "ex.py", 110 + i);
+            let repo = s.work.to_str().unwrap();
+            let bin = s.base.join("bin");
+            stand_in_tool(&bin, "git", &format!("*\" checkout main\") {STOP_SH};;"));
+            stand_in_tool(&bin, "ln", &format!("{arms} {}", on_call(1, &format!("{} \"$@\"; {KILL_SH}", real_tool("ln")))));
+            let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+            let (code, out, err) = run_on_path(&bounded_switch(&switch_script(repo, "main", None, false, KB_DEFAULT), 600, 60), &path);
+            assert_eq!(code, Some(137), "{when}: {out}{err}");
+            let mut mine = s.read("ex.py");
+            mine.extend_from_slice(b"mine = 5\n");
+            std::fs::write(s.work.join("ex.py"), &mine).unwrap();
+            let (code, out, err) = run_on_path(&checkout_command(repo, "autocommit-x", None, false), &std::env::var("PATH").unwrap_or_default());
+            assert_eq!(code, Some(0), "{when}: {out}{err}");
+            assert_eq!(s.read("ex.py"), mine, "{when}: the participant's edit survives: {out}");
+            assert!(set_aside(&s).iter().any(|c| std::fs::read(s.work.join(".git/arena-unredacted").join(c)).unwrap() == ex.as_bytes()) || s.read("ex.py").starts_with(ex.as_bytes()), "{when}: the key kept");
+        }
+    }
+
+    /// A folder a KILL left between moving a file aside and linking its replacement in only puts
+    /// the file back on the branch it was moved aside on (review codex s4: an empty place on
+    /// another branch put that branch's file, key and all, there): on `main` it stays kept, said;
+    /// back on its branch the key comes back.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_moved_aside_by_a_killed_switch_only_comes_back_on_its_own_branch() {
+        let (s, ex) = keyed("aside-otherbranch", "ex.py", 120);
+        let repo = s.work.to_str().unwrap();
+        let bin = s.base.join("bin");
+        stand_in_tool(&bin, "mv", &format!("*\"ex.py \"*\"/recover.\"*\"/file\") {}", on_call(1, &format!("{} \"$@\"; {KILL_SH}", real_tool("mv")))));
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let (code, out, err) = run_on_path(&bounded_switch(&switch_script(repo, "main", None, false, KB_DEFAULT), 600, 60), &path);
+        assert_eq!(code, Some(137), "{out}{err}");
+        assert!(!s.work.join("ex.py").exists());
+        // Someone moves the pod to main by hand; then a switch there (to main, where it is).
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        let plain = std::env::var("PATH").unwrap_or_default();
+        let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, false), &plain);
+        assert_eq!(code, Some(0), "{out}{err}");
+        assert!(!s.work.join("ex.py").exists(), "not put on main: {out}");
+        assert!(out.contains("UNREDACTED_KEPT ex.py (a version of it in .git/arena-unredacted/recover."), "said: {out}");
+        // Back on its branch: the key comes back.
+        let (code, out, err) = run_on_path(&checkout_command(repo, "autocommit-x", None, false), &plain);
+        assert_eq!(code, Some(0), "{out}{err}");
+        assert_eq!(s.read("ex.py"), ex.as_bytes(), "{out}");
+        assert!(nothing_left_aside(&s), "{:?} {:?}", set_aside(&s), recovered(&s));
+    }
+
+    /// A switch never deletes what its replacements moved aside (review codex s3, the lead: a
+    /// process could still write to it), and says so; `pods clean-kept` drops the versions a
+    /// file now holds byte for byte — the file's at that path, or git's — saying first, with
+    /// `--dry-run`, what it would drop, and keeps the rest: one with something of its own, one a
+    /// program has open.
+    #[cfg(unix)]
+    #[test]
+    fn what_a_switch_moved_aside_is_kept_until_the_cleanup_finds_it_held_elsewhere() {
+        let (s, ex) = keyed("aside-kept-moved", "ex.py", 101);
+        let repo = s.work.to_str().unwrap();
+        let plain = std::env::var("PATH").unwrap_or_default();
+        let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, false), &plain);
+        assert_eq!(code, Some(0), "{out}{err}");
+        assert!(out.contains("UNREDACTED_KEPT ex.py") && out.contains("UNREDACTED_RECOVERED recover."), "{out}");
+        let (code, out, err) = run_on_path(&checkout_command(repo, "autocommit-x", None, false), &plain);
+        assert_eq!(code, Some(0), "{out}{err}");
+        assert_eq!(s.read("ex.py"), ex.as_bytes());
+        let kept = recovered(&s);
+        assert_eq!(kept.len(), 2, "the original the set-aside moved, the placeholder the restore did: {kept:?}");
+        assert!(kept.iter().any(|(_, _, b)| b == ex.as_bytes()) && kept.iter().any(|(_, _, b)| b != ex.as_bytes()), "{kept:?}");
+        assert_eq!(out.matches("UNREDACTED_RECOVERED recover.").count(), 2, "{out}");
+        // Dry: said, nothing dropped.
+        let (code, dry) = clean_recovered(&s, true);
+        assert_eq!(code, Some(0));
+        let mut whys: Vec<&str> = dry.dropped.iter().map(|(w, _)| w.as_str()).collect();
+        whys.sort();
+        assert_eq!((whys, dry.kept.len()), (vec!["file", "git"], 0), "{dry:?}");
+        assert_eq!(recovered(&s), kept, "a dry run drops nothing");
+        // One with something of its own is kept.
+        let own = s.work.join(".git/arena-unredacted").join(&kept[0].0).join("file");
+        std::fs::write(&own, "mine = 4\n").unwrap();
+        let (_, cleaned) = clean_recovered(&s, false);
+        assert_eq!((cleaned.dropped.len(), cleaned.kept.clone()), (1, vec!["ex.py".to_string()]), "{cleaned:?}");
+        assert_eq!(recovered(&s).len(), 1);
+        // Once a file holds it byte for byte — and while no program has it open (Linux: /proc) —
+        // it goes too.
+        std::fs::write(s.work.join("ex.py"), "mine = 4\n").unwrap();
+        if cfg!(target_os = "linux") {
+            // Open through another link to it, since removed (review codex s4: a look by path
+            // missed it): told by its device and inode.
+            let own = s.work.join(".git/arena-unredacted").join(&recovered(&s)[0].0).join("file");
+            let alias = s.base.join("alias.py");
+            std::fs::hard_link(&own, &alias).unwrap();
+            let mut held = std::process::Command::new("sh").args(["-c", "exec 3<\"$1\"; read -r _ ", "sh"]).arg(&alias).stdin(std::process::Stdio::piped()).spawn().unwrap();
+            while !std::fs::read_dir(format!("/proc/{}/fd", held.id())).is_ok_and(|d| d.flatten().any(|e| std::fs::read_link(e.path()).is_ok_and(|l| l == alias))) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            std::fs::remove_file(&alias).unwrap();
+            let (_, cleaned) = clean_recovered(&s, false);
+            assert_eq!((cleaned.dropped.len(), cleaned.kept.len()), (0, 1), "held: kept: {cleaned:?}");
+            drop(held.stdin.take());
+            let _ = held.wait();
+        }
+        let (_, cleaned) = clean_recovered(&s, false);
+        assert_eq!((cleaned.dropped.clone(), cleaned.kept.len()), (vec![("file".to_string(), "ex.py".to_string())], 0), "{cleaned:?}");
+        assert_eq!(recovered(&s), Vec::new());
+    }
+
+    /// A file whose only difference is keys is still left as it is — not set aside — when putting
+    /// it back to git's version would change more, or not in one step: its mode changed too (a
+    /// rename keeps the mode, and refreshing the index never stages it: review codex r2), or its
+    /// directory is on another filesystem than the git dir (`mv` then copies). The gentle switch
+    /// then refuses as it would for any local change; nothing is staged.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_only_file_that_cant_be_put_back_in_one_step_is_left_as_it_is() {
+        use std::os::unix::fs::PermissionsExt;
+        for (i, how) in ["its mode changed too", "its directory on another filesystem"].into_iter().enumerate() {
+            let s = GitSandbox::new(&format!("aside-left-{i}"), 1_000_000);
+            let repo = s.work.to_str().unwrap();
+            let ex = format!("KEY = \"{}\"\n", openrouter_key(50 + i));
+            std::fs::write(s.work.join("ex.py"), &ex).unwrap();
+            let (code, r, err) = s.backup();
+            assert_eq!((code, r.redacted.len()), (Some(0), 1), "{how}: {err}");
+            let mut path = std::env::var("PATH").unwrap_or_default();
+            if i == 0 {
+                std::fs::set_permissions(s.work.join("ex.py"), std::fs::Permissions::from_mode(0o755)).unwrap();
+            } else {
+                // A `stat` that puts the work tree on a filesystem of its own.
+                let bin = s.base.join("bin");
+                std::fs::create_dir_all(&bin).unwrap();
+                let o = std::process::Command::new("sh").args(["-c", "command -v stat"]).output().unwrap();
+                let stat = shell_quote(String::from_utf8_lossy(&o.stdout).trim());
+                crate::remote::write_test_script(bin.join("stat"), format!("#!/bin/sh\ncase \"$*\" in *.git*) exec {stat} \"$@\";; *) echo 4242;; esac\n")).unwrap();
+                path = format!("{}:{path}", bin.display());
+            }
+            let (index, status) = (s.git(&s.work, &["ls-files", "-s", "ex.py"]), s.git(&s.work, &["status", "--porcelain"]));
+            let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, false), &path);
+            assert_ne!(code, Some(0), "{how}: refused, as for any local change: {out}{err}");
+            assert!(!out.contains("UNREDACTED_"), "{how}: never set aside: {out}");
+            assert_eq!(s.read("ex.py"), ex.as_bytes(), "{how}");
+            assert!(!s.work.join(".git/arena-unredacted").exists(), "{how}: nothing set aside");
+            assert_eq!((s.git(&s.work, &["ls-files", "-s", "ex.py"]), s.git(&s.work, &["status", "--porcelain"])), (index, status), "{how}: nothing staged");
+            assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "{how}");
         }
     }
 }
