@@ -654,7 +654,17 @@ to that branch.
 
 A gentle switch that refuses a pod mid-merge does so before setting anything aside, and the putting
 back is the command's exit trap: a switch that fails, stops on an error, or gets a hangup, an
-interrupt or a TERM puts the keys back first.
+interrupt or a TERM puts the keys back first. That holds however early it's stopped, in the middle
+of setting a file aside too: the set-aside's branch is noted before its first copy (it was noted
+last, so a file already put back to git's version kept the placeholder, its key only in
+`.git/arena-unredacted/`), and every file it writes — the copy, the file's git version, the key
+put back — is made in `.git` and renamed into place, so a file is only ever the participant's
+version or git's. A later switch's restore puts back what a KILL left. The restore only ever
+replaces a file that is exactly git's version of its copy (or drops a copy the file already
+matches): a file the participant changed or removed since, or one under a directory that is now a
+link, keeps what they did, and its copy stays (`UNREDACTED_KEPT`). A file whose mode changed too,
+or whose directory is on another filesystem than `.git`, isn't set aside: the switch treats it as
+any local change.
 
 arena's own 2-minute timeout kills only its ssh client — a non-pty session's shell is usually never
 signalled, and ran on (review ai-review claude #13) — so the switch bounds itself on the pod: it
