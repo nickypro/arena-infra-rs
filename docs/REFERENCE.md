@@ -2240,13 +2240,14 @@ already as asked is left alone. Each command: `--dry-run`, a confirm (`--yes`), 
 — `devtest-alpha: cap $0.10 → $0.20 · spent $0.00 in all`, `on → off` — and `--json` (below).
 
 **Changes made meanwhile.** One of these commands changes keys at a time on a box (a lock in the
-state directory, `openrouter-keys.lock`; a second waits up to 60 s). After the confirm the keys are
-read once more and every machine named — a skipped one too — is planned again from them: a machine
-whose keys moved since the preview (another operator, the dashboard: a cap, reset or on/off changed;
-a key replaced, added or renamed away), or whose spend now makes the cap one it would refuse, is left
-alone and fails the command — run it again. The changes then go out together, 8 at a time (10 keys:
-about 5 s, where one after another took about 16 s), the lines in the machines' order whatever order
-the answers come in. Each key is read once more in the request just before its change and refused if
+state directory, `openrouter-keys.lock`; a second waits up to 60 s). After the confirm the machines'
+changes go out together, 8 machines at a time (10 keys: about 5 s, where one after another took about
+16 s), the lines in the machines' order whatever order the answers come in. As each machine's turn
+comes — every one named, a skipped one too — it's planned again from keys read at most 2 s before
+(one listing serves the machines that start within it; a resume reads them right before each
+machine's): a machine whose keys moved since the preview (another operator, the dashboard: a cap,
+reset or on/off changed; a key replaced, added or renamed away), or whose spend now makes the cap one
+it would refuse, is left alone and fails the command — run it again. Each key is read once more in the request just before its change and refused if
 it moved, or (a cap) has spent past the new cap; OpenRouter has no conditional update, so that moment
 is all that's left.
 Afterwards each key is checked against what OpenRouter lists (a change it answered OK for but didn't
